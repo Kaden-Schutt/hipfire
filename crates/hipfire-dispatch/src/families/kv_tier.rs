@@ -17,8 +17,8 @@ pub struct KvTierInputs {
     pub quant_asym2: bool,
     pub quant_q8: bool,
     pub quant_fwht: bool,
-    pub quant_hfq4: bool,   // llama legacy HFQ4 KV mode
-    pub quant_q4: bool,     // llama legacy Q4 KV mode
+    pub quant_hfq4: bool, // llama legacy HFQ4 KV mode
+    pub quant_q4: bool,   // llama legacy Q4 KV mode
     pub v_mode_bits: i32,
     // q8 use_flash heuristic inputs (moved from qwen35.rs:12885)
     pub pos: usize,
@@ -98,10 +98,18 @@ impl KvTierPlan {
 
         // At most one quant tier flag should be set.
         debug_assert!(
-            [quant_asym4, quant_asym3, quant_asym2, quant_q8, quant_hfq4, quant_q4]
-                .iter()
-                .filter(|&&b| b)
-                .count() <= 1,
+            [
+                quant_asym4,
+                quant_asym3,
+                quant_asym2,
+                quant_q8,
+                quant_hfq4,
+                quant_q4
+            ]
+            .iter()
+            .filter(|&&b| b)
+            .count()
+                <= 1,
             "at most one KV quant tier flag should be set"
         );
 
@@ -111,19 +119,31 @@ impl KvTierPlan {
             (KernelKey::KvWriteQ8_0, attend, false)
         } else if quant_asym4 {
             if quant_fwht {
-                (KernelKey::KvWriteAsym4Fwht, KernelKey::AttnFlashAsym4Fwht, true)
+                (
+                    KernelKey::KvWriteAsym4Fwht,
+                    KernelKey::AttnFlashAsym4Fwht,
+                    true,
+                )
             } else {
                 (KernelKey::KvWriteAsym4, KernelKey::AttnFlashAsym4, true)
             }
         } else if quant_asym3 {
             if quant_fwht {
-                (KernelKey::KvWriteAsym3Fwht, KernelKey::AttnFlashAsym3Fwht, true)
+                (
+                    KernelKey::KvWriteAsym3Fwht,
+                    KernelKey::AttnFlashAsym3Fwht,
+                    true,
+                )
             } else {
                 (KernelKey::KvWriteAsym3, KernelKey::AttnFlashAsym3, true)
             }
         } else if quant_asym2 {
             if quant_fwht {
-                (KernelKey::KvWriteAsym2Fwht, KernelKey::AttnFlashAsym2Fwht, true)
+                (
+                    KernelKey::KvWriteAsym2Fwht,
+                    KernelKey::AttnFlashAsym2Fwht,
+                    true,
+                )
             } else {
                 (KernelKey::KvWriteAsym2, KernelKey::AttnFlashAsym2, true)
             }
@@ -169,10 +189,8 @@ impl KvTierPlan {
 /// attention based on context length and capture mode. Shared between the
 /// `is_boundary` and `quant_q8` branches of `derive`.
 fn q8_attend_key(pos: usize, flash_mode: usize, capture_mode: bool) -> KernelKey {
-    let use_flash = capture_mode
-        || flash_mode == 2
-        || (flash_mode == 1 && pos + 1 >= 2048)
-        || pos + 1 > 15000;
+    let use_flash =
+        capture_mode || flash_mode == 2 || (flash_mode == 1 && pos + 1 >= 2048) || pos + 1 > 15000;
     if use_flash {
         KernelKey::AttnFlashQ8_0
     } else {
@@ -191,16 +209,12 @@ fn batched_keys(
     use KernelKey::*;
     match (write_single, attend_single) {
         // asym4 → batched-masked (serves both causal and tree-verify)
-        (KvWriteAsym4, AttnFlashAsym4) => {
-            Ok((KvWriteAsym4Batched, AttnFlashAsym4BatchedMasked))
-        }
+        (KvWriteAsym4, AttnFlashAsym4) => Ok((KvWriteAsym4Batched, AttnFlashAsym4BatchedMasked)),
         (KvWriteAsym4Fwht, AttnFlashAsym4Fwht) => {
             Ok((KvWriteAsym4FwhtBatched, AttnFlashAsym4FwhtBatchedMasked))
         }
         // asym3 → batched-masked
-        (KvWriteAsym3, AttnFlashAsym3) => {
-            Ok((KvWriteAsym3Batched, AttnFlashAsym3BatchedMasked))
-        }
+        (KvWriteAsym3, AttnFlashAsym3) => Ok((KvWriteAsym3Batched, AttnFlashAsym3BatchedMasked)),
         (KvWriteAsym3Fwht, AttnFlashAsym3Fwht) => {
             Ok((KvWriteAsym3FwhtBatched, AttnFlashAsym3FwhtBatchedMasked))
         }
@@ -235,9 +249,7 @@ fn batched_keys(
         // batch_size > 1 will cause MissingImpl at resolve (BatchEq(1) gate).
         // Intentionally fall through to the default arm rather than silently
         // returning single-token keys that can never resolve batched.
-        (KvWriteF32, AttnF32) => {
-            Ok((KvWriteF32, AttnF32))
-        }
+        (KvWriteF32, AttnF32) => Ok((KvWriteF32, AttnF32)),
         _ => Ok((write_single, attend_single)),
     }
 }
@@ -632,9 +644,7 @@ mod tests {
     #[test]
     fn batched_f32_returns_single_token_keys() {
         // F32 has no batched keys — returns single-token for per-token fallback.
-        let inputs = KvTierInputs {
-            ..batched_inputs()
-        };
+        let inputs = KvTierInputs { ..batched_inputs() };
         let plan = KvTierPlan::derive(inputs).unwrap();
         assert_eq!(plan.write_key, KernelKey::KvWriteF32);
         assert_eq!(plan.attend_key, KernelKey::AttnF32);
@@ -674,25 +684,64 @@ mod tests {
     #[test]
     fn tiers_match_valid_pairs() {
         assert!(tiers_match(KernelKey::KvWriteF32, KernelKey::AttnF32));
-        assert!(tiers_match(KernelKey::KvWriteQ8_0, KernelKey::AttnFlashQ8_0));
+        assert!(tiers_match(
+            KernelKey::KvWriteQ8_0,
+            KernelKey::AttnFlashQ8_0
+        ));
         assert!(tiers_match(KernelKey::KvWriteQ8_0, KernelKey::AttnQ8_0Kv));
-        assert!(tiers_match(KernelKey::KvWriteAsym4, KernelKey::AttnFlashAsym4));
-        assert!(tiers_match(KernelKey::KvWriteAsym4Fwht, KernelKey::AttnFlashAsym4Fwht));
-        assert!(tiers_match(KernelKey::KvWriteAsym3, KernelKey::AttnFlashAsym3));
-        assert!(tiers_match(KernelKey::KvWriteAsym3Fwht, KernelKey::AttnFlashAsym3Fwht));
-        assert!(tiers_match(KernelKey::KvWriteAsym2, KernelKey::AttnFlashAsym2));
-        assert!(tiers_match(KernelKey::KvWriteAsym2Fwht, KernelKey::AttnFlashAsym2Fwht));
+        assert!(tiers_match(
+            KernelKey::KvWriteAsym4,
+            KernelKey::AttnFlashAsym4
+        ));
+        assert!(tiers_match(
+            KernelKey::KvWriteAsym4Fwht,
+            KernelKey::AttnFlashAsym4Fwht
+        ));
+        assert!(tiers_match(
+            KernelKey::KvWriteAsym3,
+            KernelKey::AttnFlashAsym3
+        ));
+        assert!(tiers_match(
+            KernelKey::KvWriteAsym3Fwht,
+            KernelKey::AttnFlashAsym3Fwht
+        ));
+        assert!(tiers_match(
+            KernelKey::KvWriteAsym2,
+            KernelKey::AttnFlashAsym2
+        ));
+        assert!(tiers_match(
+            KernelKey::KvWriteAsym2Fwht,
+            KernelKey::AttnFlashAsym2Fwht
+        ));
         // batched
-        assert!(tiers_match(KernelKey::KvWriteAsym4Batched, KernelKey::AttnFlashAsym4BatchedMasked));
-        assert!(tiers_match(KernelKey::KvWriteAsym3Batched, KernelKey::AttnFlashAsym3BatchedMasked));
-        assert!(tiers_match(KernelKey::KvWriteAsym2Batched, KernelKey::AttnFlashAsym2Batched));
-        assert!(tiers_match(KernelKey::KvWriteQ8_0Batched, KernelKey::AttnQ8_0KvBatchedMasked));
+        assert!(tiers_match(
+            KernelKey::KvWriteAsym4Batched,
+            KernelKey::AttnFlashAsym4BatchedMasked
+        ));
+        assert!(tiers_match(
+            KernelKey::KvWriteAsym3Batched,
+            KernelKey::AttnFlashAsym3BatchedMasked
+        ));
+        assert!(tiers_match(
+            KernelKey::KvWriteAsym2Batched,
+            KernelKey::AttnFlashAsym2Batched
+        ));
+        assert!(tiers_match(
+            KernelKey::KvWriteQ8_0Batched,
+            KernelKey::AttnQ8_0KvBatchedMasked
+        ));
     }
 
     #[test]
     fn tiers_match_rejects_cross_tier() {
-        assert!(!tiers_match(KernelKey::KvWriteAsym3, KernelKey::AttnFlashAsym4));
+        assert!(!tiers_match(
+            KernelKey::KvWriteAsym3,
+            KernelKey::AttnFlashAsym4
+        ));
         assert!(!tiers_match(KernelKey::KvWriteQ8_0, KernelKey::AttnF32));
-        assert!(!tiers_match(KernelKey::KvWriteF32, KernelKey::AttnFlashAsym3Fwht));
+        assert!(!tiers_match(
+            KernelKey::KvWriteF32,
+            KernelKey::AttnFlashAsym3Fwht
+        ));
     }
 }

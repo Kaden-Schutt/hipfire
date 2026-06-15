@@ -10,7 +10,7 @@ Identical context dict fed to both engines (`jinja_render_dump` emits the exact
 ctx the daemon's `render_messages` builds; `hf_render_ref.py` replicates
 `ImmutableSandboxedEnvironment(trim_blocks,lstrip_blocks)` + HF tojson/raise).
 
-"embedded" = the chat_template actually inside qwen3.5-9b.mq4 (dumped via
+"embedded" = the chat_template actually inside qwen3.5-9b-mq4.hfq (dumped via
 `examples/dump_embedded_template`), NOT a fixture.
 
 **CONFOUND CAUGHT + CORRECTED (the embedded jinja WAS confounding):** the daemon's
@@ -60,7 +60,7 @@ Fix: register an HF-compatible `tojson` filter on the render env
 (`": "`/`", "` separators) AND build serde_json with `features=["preserve_order"]`
 so request tool-key order survives to the template.
 
-## ②③ Real-forward A/B (qwen3.5-9b.mq4, temp 0 greedy, daemon stdin one-shot)
+## ②③ Real-forward A/B (qwen3.5-9b-mq4.hfq, temp 0 greedy, daemon stdin one-shot)
 
 Identical request JSONL, only daemon env (template) differs. mt1-3 = 3-turn
 sheep-math with reasoning-in-history; ag1-3 = tool-call → ERROR → retry → success.

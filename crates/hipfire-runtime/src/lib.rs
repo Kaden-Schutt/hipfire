@@ -19,6 +19,12 @@ pub mod bf16_loader;
 pub mod cask;
 pub mod coherence_runtime;
 pub mod config;
+#[cfg(feature = "deltanet")]
+pub mod cpu_router;
+#[cfg(feature = "deltanet")]
+pub mod ddtree;
+#[cfg(feature = "deltanet")]
+pub mod dflash;
 pub mod env_docs;
 pub mod eos_filter;
 pub mod ep;
@@ -28,7 +34,6 @@ pub mod gguf;
 pub mod hfq;
 pub mod hfq_modules;
 pub mod host_profile;
-pub mod kv_adaptive;
 pub mod llama;
 pub mod logging;
 pub mod loop_guard;
@@ -41,12 +46,6 @@ pub mod speed_bench;
 pub mod tokenizer;
 pub mod tool_call;
 pub mod tp_shard;
-#[cfg(feature = "deltanet")]
-pub mod cpu_router;
-#[cfg(feature = "deltanet")]
-pub mod ddtree;
-#[cfg(feature = "deltanet")]
-pub mod dflash;
 #[cfg(feature = "deltanet")]
 pub mod triattn;
 #[cfg(feature = "deltanet")]

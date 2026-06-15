@@ -76,7 +76,7 @@ synchronized to the decode-only assumption by convention only `[D-F4]`.
 - `coherence-gate-dflash.sh` targets **dense 27B** only — it has **no MoE model**, so it never
   exercises `moe_ffn_decode_impl` `[D-F1,A6]`. A3B MoE DFlash *does* work (AGENTS.md §"Pinned A3B
   MoE DFlash fixtures": 3.5-A3B τ=4.91; target md5 `edde51ec`, draft md5 `8254bbe1`). The pinned
-  **draft** model `qwen36-35b-a3b-dflash-mq4.hfq` is **missing locally** `[G-F7]`.
+  **draft** model `qwen3.6-35b-a3b-mq4.dflash.hfq` is **missing locally** `[G-F7]`.
 - `coherence-gate.sh` A3B cells are gated on `--full` (`FULL_EXTRA`, only when `FULL=1`) `[D-F6]`.
 - A3B is **k=8 → `use_gpu_topk`** (`moe.rs:83`) — an A3B-only fixture never exercises the
   **k≠8 CPU-top-K fallback** the change also routes `[A5,G-F6]`.
@@ -175,14 +175,14 @@ land together if the workspace must stay green between commits).
 
 **Verify (on-GPU, linchpin — Phase 0.6, gfx1100 + gfx1201) `[A5,A7,D-F1,D-F6,G-F6,G-F7]`:**
 - **Byte-identical committed-token IDs vs the pre-4.1 tip** (`HIPFIRE_EMIT_TOKEN_IDS=1`, temp 0.0)
-  on A3B (`qwen3.6-35b-a3b.mq4`, k=8) — load-bearing (resolution moved + ctx rebuilt). Prompt md5
+  on A3B (`qwen3.6-35b-a3b-mq4.hfq`, k=8) — load-bearing (resolution moved + ctx rebuilt). Prompt md5
   + binary md5 recorded. Same-binary parity via git-checkout toggle (no `HIPFIRE_DISPATCH` selector
   — that's a program gap, not 4.1's `[G-F5]`).
 - **k≠8 / non-indexable fixture** byte-parity to exercise the **CPU-top-K fallback** the change
   re-plumbs (A3B alone is k=8 only) `[A5,G-F6]`.
 - `coherence-gate.sh **--full**` (A3B cells are `--full`-gated) `[D-F6]`.
 - **A3B MoE DFlash** pinned-fixture run (the dflash gate script has no MoE model `[D-F1]`):
-  acquire the missing draft `qwen36-35b-a3b-dflash-mq4.hfq` (md5 `8254bbe1`) `[G-F7]`, run the
+  acquire the missing draft `qwen3.6-35b-a3b-mq4.dflash.hfq` (md5 `8254bbe1`) `[G-F7]`, run the
   AGENTS.md pinned fixture, record prompt+binary md5 + τ + acceptance. If the draft can't be
   obtained, **document the gap and gate on the AR `--full` A3B cells** — do not silently skip.
 - `probe_commits.sh <pre-4.1> HEAD` ±1–3% on gfx1100 **and** gfx1201 (ctx-threading should *reduce*

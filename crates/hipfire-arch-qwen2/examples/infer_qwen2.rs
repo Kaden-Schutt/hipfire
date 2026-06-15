@@ -59,7 +59,11 @@ fn parse_args() -> Args {
         max_new_tokens: 16,
         ..Default::default()
     };
-    let mut out = Args { max_new_tokens: 16, max_seq: 512, ..Default::default() };
+    let mut out = Args {
+        max_new_tokens: 16,
+        max_seq: 512,
+        ..Default::default()
+    };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -69,12 +73,10 @@ fn parse_args() -> Args {
             "--max-new-tokens" => {
                 out.max_new_tokens = it.next().and_then(|s| s.parse().ok()).unwrap_or(16)
             }
-            "--max-new-tokens" => out.max_new_tokens = it.next()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(16),
-            "--max-seq" => out.max_seq = it.next()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(512),
+            "--max-new-tokens" => {
+                out.max_new_tokens = it.next().and_then(|s| s.parse().ok()).unwrap_or(16)
+            }
+            "--max-seq" => out.max_seq = it.next().and_then(|s| s.parse().ok()).unwrap_or(512),
             "--no-load" => out.no_load = true,
             "-h" | "--help" => {
                 print_help();

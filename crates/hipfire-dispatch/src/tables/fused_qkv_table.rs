@@ -13,7 +13,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         // `HasWmma` gate was a dead-gate that rejected RDNA1/RDNA2/CDNA even
         // though the kernel runs there. `Always` matches the kernel's true
         // cross-arch availability (mirrors the FusedQkvQ4K row).
-        (KernelKey::FusedQkvHfq4G256,     ArchPredicate::Always),
+        (KernelKey::FusedQkvHfq4G256, ArchPredicate::Always),
         (KernelKey::FusedQkvMq3G256Lloyd, ArchPredicate::HasWmma),
         (KernelKey::FusedQkvMq4G256Lloyd, ArchPredicate::HasWmma),
         // HFQ6G256 fused QKV: batched run-arm `gpu.gemm_qkv_hfq6g256` carries the
@@ -21,8 +21,8 @@ pub fn populate(registry: &mut KernelRegistry) {
         // gfx906-only `HasDp4a` — the old gate dead-gated HFQ6-promoted qkv layers
         // on RDNA3/4 (AWQ A3B trunk batched-prefill panic). Run-arm keeps the
         // gfx906 dp4a decode fast-path, cross-arch gemm (n=1) decode elsewhere.
-        (KernelKey::FusedQkvHfq6G256,     ArchPredicate::Always),
-        (KernelKey::FusedQkvQ4K,          ArchPredicate::Always),
+        (KernelKey::FusedQkvHfq6G256, ArchPredicate::Always),
+        (KernelKey::FusedQkvQ4K, ArchPredicate::Always),
         // Q8_0 fused QKV (#397 Ship 5.2 slice 3). WMMA-only: the run-arm calls
         // `gpu.gemm_qkv_q8_0_wmma`, which routes to the gfx12 WMMA sibling on
         // RDNA4 else the gfx11 `_w32` WMMA kernel — there is NO scalar/dp4a
@@ -33,7 +33,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         // stays as three plain GemmQ8_0BatchedChunked GEMMs (slice 1). HasWmma
         // (= has_wmma(), includes gfx12) is the correct gate; the gfx12 sibling
         // is reached INSIDE the method, so HasWmmaW32 (gfx12-excluding) is wrong.
-        (KernelKey::FusedQkvQ8_0,         ArchPredicate::HasWmma),
+        (KernelKey::FusedQkvQ8_0, ArchPredicate::HasWmma),
         // HFQ3G256 fused QKV (#397 Ship 5.2 slice 3). Always — the qwen35 prefill
         // site picks `gpu.gemm_qkv_hfq3g256_wmma` on has_wmma() archs and the base
         // `gpu.gemm_qkv_hfq3g256` otherwise, and the base method itself carries a
@@ -41,7 +41,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         // gfx1010 fallback). So the dtype runs on every arch (the run-arm picks
         // WMMA vs base by arch, mirroring the call site). Mirrors the
         // FusedGateUpHfq3G256 row; NOT HasWmma (the base has a non-WMMA body).
-        (KernelKey::FusedQkvHfq3G256,     ArchPredicate::Always),
+        (KernelKey::FusedQkvHfq3G256, ArchPredicate::Always),
         // HFP4G32 fused QKV (#397 Ship 5.2 FINAL). WMMA-only: the run-arm calls
         // `gpu.gemm_qkv_hfp4g32`, which dispatches ONLY to WMMA kernels (gfx12 FP8/
         // WMMA siblings on has_wmma_w32_gfx12() RDNA4 else the gfx11 `_wmma`
@@ -49,7 +49,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         // includes gfx12) is correct; the gfx12 sibling is reached INSIDE the
         // method, so HasWmmaW32 (gfx12-excluding) would be wrong. Mirrors the
         // FusedGateUpHfp4G32 row.
-        (KernelKey::FusedQkvHfp4G32,      ArchPredicate::HasWmma),
+        (KernelKey::FusedQkvHfp4G32, ArchPredicate::HasWmma),
     ];
     for &(key, arch) in qkv_variants {
         registry.register(KernelVariant {
@@ -70,7 +70,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         // gfx906/gfx1030/gfx1031 even though the kernel runs there. `Always`
         // matches the true cross-arch availability (mirrors FusedQkvHfq4G256
         // and FusedGateUpHfq4G256 rows above).
-        (KernelKey::FusedQkvzaHfq4G256,     ArchPredicate::Always),
+        (KernelKey::FusedQkvzaHfq4G256, ArchPredicate::Always),
         (KernelKey::FusedQkvzaMq3G256Lloyd, ArchPredicate::HasWmma),
         (KernelKey::FusedQkvzaMq4G256Lloyd, ArchPredicate::HasWmma),
         // HFQ6G256 fused QKVZA. The batched run-arm calls `gpu.gemm_qkvza_hfq6g256`,
@@ -83,22 +83,22 @@ pub fn populate(registry: &mut KernelRegistry) {
         // cross-arch availability (mirrors FusedQkvzaHfq4G256 / FusedQkvzaHfq3G256);
         // the run-arm keeps the gfx906 dp4a decode fast-path and falls to the
         // cross-arch gemm (n=1) for decode on other archs.
-        (KernelKey::FusedQkvzaHfq6G256,     ArchPredicate::Always),
+        (KernelKey::FusedQkvzaHfq6G256, ArchPredicate::Always),
         // Q8_0 fused QKVZA (#397 Ship 5.2 slice 3). WMMA-only — the run-arm calls
         // `gpu.gemm_qkvza_q8_0_wmma` (gfx12 sibling on RDNA4 else gfx11 `_w32`
         // WMMA), no scalar/dp4a fallback; no `fused_qkvza_q8_0` decode method
         // exists. Mirrors the FusedQkvQ8_0 row above. HasWmma (includes gfx12).
-        (KernelKey::FusedQkvzaQ8_0,         ArchPredicate::HasWmma),
+        (KernelKey::FusedQkvzaQ8_0, ArchPredicate::HasWmma),
         // HFQ3G256 fused QKVZA (#397 Ship 5.2 slice 3). Always — base
         // `gpu.gemm_qkvza_hfq3g256` carries the full cross-arch ladder
         // (MMQ → dot2 → fp16 → scalar); the run-arm picks `_wmma` vs base by arch.
         // Mirrors FusedQkvHfq3G256 / FusedGateUpHfq3G256.
-        (KernelKey::FusedQkvzaHfq3G256,     ArchPredicate::Always),
+        (KernelKey::FusedQkvzaHfq3G256, ArchPredicate::Always),
         // HFP4G32 fused QKVZA (#397 Ship 5.2 FINAL). WMMA-only — the run-arm calls
         // `gpu.gemm_qkvza_hfp4g32` (gfx12 WMMA sibling on RDNA4 else gfx11 `_wmma`),
         // NO scalar/dp4a fallback. Mirrors the FusedQkvHfp4G32 row above.
         // HasWmma (includes gfx12).
-        (KernelKey::FusedQkvzaHfp4G32,      ArchPredicate::HasWmma),
+        (KernelKey::FusedQkvzaHfp4G32, ArchPredicate::HasWmma),
     ];
     for &(key, arch) in qkvza_variants {
         registry.register(KernelVariant {
@@ -119,7 +119,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         // RDNA1/RDNA2/CDNA even though the kernel runs there. `Always` matches
         // the kernel's true cross-arch availability (mirrors FusedQkvHfq4G256
         // and FusedGateUpQ4K rows).
-        (KernelKey::FusedGateUpHfq4G256,     ArchPredicate::Always),
+        (KernelKey::FusedGateUpHfq4G256, ArchPredicate::Always),
         (KernelKey::FusedGateUpMq3G256Lloyd, ArchPredicate::HasWmma),
         (KernelKey::FusedGateUpMq4G256Lloyd, ArchPredicate::HasWmma),
         // HFQ6G256 fused gate+up: batched run-arm `gpu.gemm_gate_up_hfq6g256` is
@@ -127,8 +127,8 @@ pub fn populate(registry: &mut KernelRegistry) {
         // gfx906-only `HasDp4a` — the old gate dead-gated HFQ6-promoted gate_up
         // layers on RDNA3/4 (AWQ A3B trunk batched-prefill panic). Run-arm keeps
         // the gfx906 dp4a decode fast-path, cross-arch gemm (n=1) decode elsewhere.
-        (KernelKey::FusedGateUpHfq6G256,     ArchPredicate::Always),
-        (KernelKey::FusedGateUpQ4K,          ArchPredicate::Always),
+        (KernelKey::FusedGateUpHfq6G256, ArchPredicate::Always),
+        (KernelKey::FusedGateUpQ4K, ArchPredicate::Always),
         // HFQ3G256 fused gate+up (#397 Ship 5.2 slice 2). The qwen35 prefill
         // site routes this dtype to `gpu.gemm_gate_up_hfq3g256_wmma` on
         // has_wmma() archs and to the base `gpu.gemm_gate_up_hfq3g256` otherwise
@@ -138,7 +138,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         // the call site). `Always` matches that true cross-arch availability —
         // NOT HasWmma: unlike the GEMV-side MQ3 key (which has no scalar GEMM
         // fallback), the gate_up prefill kernel has a non-WMMA body.
-        (KernelKey::FusedGateUpHfq3G256,     ArchPredicate::Always),
+        (KernelKey::FusedGateUpHfq3G256, ArchPredicate::Always),
         // HFP4G32 fused gate+up (#397 Ship 5.2 slice 2). FLAGGED: differs from the
         // sibling FusedGateUpHfq4G256 (`Always`) row. `gpu.gemm_gate_up_hfp4g32`
         // dispatches ONLY to WMMA kernels — `gemm_gate_up_hfp4g32_wmma_gfx12` on
@@ -147,13 +147,13 @@ pub fn populate(registry: &mut KernelRegistry) {
         // WMMA-only (RDNA3 + RDNA4). HasWmma (= has_wmma(), which includes gfx12)
         // is the correct gate; the gfx12 sibling is reached inside the method, so
         // HasWmmaW32 (gfx12-excluding) would be wrong.
-        (KernelKey::FusedGateUpHfp4G32,      ArchPredicate::HasWmma),
+        (KernelKey::FusedGateUpHfp4G32, ArchPredicate::HasWmma),
         // Paro4G128T fused: generic wave32 kernels, no ISA-specific intrinsics.
         // Previously gated on HasDp4a (has_dot2_f32_f16) which excluded gfx906/gfx1010.
-        (KernelKey::FusedGateUpParo4G128T,   ArchPredicate::Always),
+        (KernelKey::FusedGateUpParo4G128T, ArchPredicate::Always),
         // Q8_0 gate+up: plain wave32 kernel (`gpu.fused_gate_up_q8_0`),
         // no arch gate — mirrors the Q4K row. Used by qwen2 FFN.
-        (KernelKey::FusedGateUpQ8_0,         ArchPredicate::Always),
+        (KernelKey::FusedGateUpQ8_0, ArchPredicate::Always),
     ];
     for &(key, arch) in gate_up_variants {
         registry.register(KernelVariant {

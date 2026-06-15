@@ -64,11 +64,13 @@ fn bench_shape(gpu: &mut rdna_compute::Gpu, name: &str, m: usize, k: usize, roof
         })
         .collect();
     for i in 0..n_warm {
-        gpu.gemv_q8_0(&slots[i % n_slots], &d_x, &d_y, m, k).unwrap();
+        gpu.gemv_q8_0(&slots[i % n_slots], &d_x, &d_y, m, k)
+            .unwrap();
     }
     gpu.hip.event_record(&start, None).unwrap();
     for i in 0..n_iter {
-        gpu.gemv_q8_0(&slots[i % n_slots], &d_x, &d_y, m, k).unwrap();
+        gpu.gemv_q8_0(&slots[i % n_slots], &d_x, &d_y, m, k)
+            .unwrap();
     }
     gpu.hip.event_record(&stop, None).unwrap();
     gpu.hip.event_synchronize(&stop).unwrap();
@@ -96,7 +98,10 @@ fn main() {
 
     // Use a conservative 256 GB/s LPDDR5x theoretical as the % denominator.
     let roof = 256.0;
-    eprintln!("--- MiniMax-M2.7 decode dense-Q8 shapes (% of {:.0} GB/s theoretical) ---", roof);
+    eprintln!(
+        "--- MiniMax-M2.7 decode dense-Q8 shapes (% of {:.0} GB/s theoretical) ---",
+        roof
+    );
     bench_shape(&mut gpu, "q_proj", 6144, 3072, roof);
     bench_shape(&mut gpu, "k_proj", 1024, 3072, roof);
     bench_shape(&mut gpu, "v_proj", 1024, 3072, roof);

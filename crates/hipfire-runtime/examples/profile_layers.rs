@@ -7,10 +7,8 @@
 //! Usage: cargo run --release --example profile_layers <model.hfq> [n_tokens]
 
 use hipfire_runtime::hfq::{self, HfqFile};
-use hipfire_runtime::llama::{self, weight_gemv, ForwardScratch, KvCache};
+use hipfire_runtime::llama::{self, gemv_family, DispatchCtx, ForwardScratch, KvCache};
 use rdna_compute::Gpu;
-use hipfire_runtime::llama::{self, KvCache, ForwardScratch, gemv_family, DispatchCtx};
-use rdna_compute::{DType, Gpu};
 use std::path::Path;
 use std::time::Instant;
 
@@ -231,15 +229,36 @@ fn profile_token(
         lt.attn_norm_us = sync_us(gpu, t);
 
         let t = Instant::now();
-        gemv.run_auto(&ctx, gpu, &layer.wq.dispatch_ref(), &scratch.tmp, &scratch.q).unwrap();
+        gemv.run_auto(
+            &ctx,
+            gpu,
+            &layer.wq.dispatch_ref(),
+            &scratch.tmp,
+            &scratch.q,
+        )
+        .unwrap();
         lt.q_proj_us = sync_us(gpu, t);
 
         let t = Instant::now();
-        gemv.run_auto(&ctx, gpu, &layer.wk.dispatch_ref(), &scratch.tmp, &scratch.k).unwrap();
+        gemv.run_auto(
+            &ctx,
+            gpu,
+            &layer.wk.dispatch_ref(),
+            &scratch.tmp,
+            &scratch.k,
+        )
+        .unwrap();
         lt.k_proj_us = sync_us(gpu, t);
 
         let t = Instant::now();
-        gemv.run_auto(&ctx, gpu, &layer.wv.dispatch_ref(), &scratch.tmp, &scratch.v).unwrap();
+        gemv.run_auto(
+            &ctx,
+            gpu,
+            &layer.wv.dispatch_ref(),
+            &scratch.tmp,
+            &scratch.v,
+        )
+        .unwrap();
         lt.v_proj_us = sync_us(gpu, t);
 
         let t = Instant::now();
@@ -316,7 +335,14 @@ fn profile_token(
         lt.attention_us = sync_us(gpu, t);
 
         let t = Instant::now();
-        gemv.run_auto(&ctx, gpu, &layer.wo.dispatch_ref(), &scratch.attn_out, &scratch.o).unwrap();
+        gemv.run_auto(
+            &ctx,
+            gpu,
+            &layer.wo.dispatch_ref(),
+            &scratch.attn_out,
+            &scratch.o,
+        )
+        .unwrap();
         lt.o_proj_us = sync_us(gpu, t);
 
         let t = Instant::now();
@@ -329,11 +355,25 @@ fn profile_token(
         lt.ffn_norm_us = sync_us(gpu, t);
 
         let t = Instant::now();
-        gemv.run_auto(&ctx, gpu, &layer.w_gate.dispatch_ref(), &scratch.tmp, &scratch.gate).unwrap();
+        gemv.run_auto(
+            &ctx,
+            gpu,
+            &layer.w_gate.dispatch_ref(),
+            &scratch.tmp,
+            &scratch.gate,
+        )
+        .unwrap();
         lt.gate_proj_us = sync_us(gpu, t);
 
         let t = Instant::now();
-        gemv.run_auto(&ctx, gpu, &layer.w_up.dispatch_ref(), &scratch.tmp, &scratch.up).unwrap();
+        gemv.run_auto(
+            &ctx,
+            gpu,
+            &layer.w_up.dispatch_ref(),
+            &scratch.tmp,
+            &scratch.up,
+        )
+        .unwrap();
         lt.up_proj_us = sync_us(gpu, t);
 
         let t = Instant::now();
@@ -342,7 +382,14 @@ fn profile_token(
         lt.silu_mul_us = sync_us(gpu, t);
 
         let t = Instant::now();
-        gemv.run_auto(&ctx, gpu, &layer.w_down.dispatch_ref(), &scratch.ffn_hidden, &scratch.ffn_out).unwrap();
+        gemv.run_auto(
+            &ctx,
+            gpu,
+            &layer.w_down.dispatch_ref(),
+            &scratch.ffn_hidden,
+            &scratch.ffn_out,
+        )
+        .unwrap();
         lt.down_proj_us = sync_us(gpu, t);
 
         let t = Instant::now();
@@ -366,7 +413,14 @@ fn profile_token(
     timings.output_norm_us = sync_us(gpu, t);
 
     let t = Instant::now();
-    gemv.run_auto(&ctx, gpu, &weights.output.dispatch_ref(), &scratch.tmp, &scratch.logits).unwrap();
+    gemv.run_auto(
+        &ctx,
+        gpu,
+        &weights.output.dispatch_ref(),
+        &scratch.tmp,
+        &scratch.logits,
+    )
+    .unwrap();
     timings.output_proj_us = sync_us(gpu, t);
 
     let t = Instant::now();

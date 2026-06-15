@@ -17,7 +17,7 @@
 #   ./scripts/ab-dispatch-validation.sh --gpu 1
 #   ./scripts/ab-dispatch-validation.sh --correctness-only  # skip speed
 #   ./scripts/ab-dispatch-validation.sh --speed-only        # skip correctness
-#   ./scripts/ab-dispatch-validation.sh --model qwen3.5-4b.mq4  # single model
+#   ./scripts/ab-dispatch-validation.sh --model qwen3.5-4b-mq4.hfq  # single model
 #   ./scripts/ab-dispatch-validation.sh --long-prefill      # prefill=512 (default: 16)
 #
 # Env vars:
@@ -54,9 +54,9 @@ read -ra GPUS_TO_TEST <<< "${HIPFIRE_GPUS:-0 1}"
 GPU_BIG="${HIPFIRE_GPU_0_BIG:-0}"
 
 # Models for correctness + speed (must fit on all tested GPUs)
-MODELS=("qwen3.5-0.8b.mq4" "qwen3.5-4b.mq4")
+MODELS=("qwen3.5-0.8b-mq4.hfq" "qwen3.5-4b-mq4.hfq")
 # 9B only on GPUs with >= 24 GB VRAM
-MODELS_BIG=("qwen3.5-9b.mq4")
+MODELS_BIG=("qwen3.5-9b-mq4.hfq")
 
 # Fixed prompts (byte-identical — AGENTS.md §2 rule 2)
 PROMPT_SHORT="What is the capital of France? Answer in one short sentence."

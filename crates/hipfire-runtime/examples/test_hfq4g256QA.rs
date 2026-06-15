@@ -225,9 +225,6 @@ fn run() -> Result<String, Outcome> {
 }
 
 fn supports_mmq_i8_wmma(arch: &str) -> bool {
-    matches!(
-        arch,
-        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151" | "gfx1152"
     // RDNA3 (gfx11xx) i8-WMMA MMQ + RDNA4 (gfx12xx) i8-WMMA MMQ. gfx1200/gfx1201
     // route through the gfx12 MMQ source (distinct module name) — exercise them
     // here so the project QA covers the gfx12 path, not just RDNA3.

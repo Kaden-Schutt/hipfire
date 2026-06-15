@@ -304,7 +304,8 @@ impl FeatureFlags {
 
             // Interpreter Phase 2a
             force_unfused: std::env::var("HIPFIRE_FORCE_UNFUSED")
-                .map(|v| v == "1").unwrap_or(false),
+                .map(|v| v == "1")
+                .unwrap_or(false),
         }
     }
 

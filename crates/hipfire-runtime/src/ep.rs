@@ -35,7 +35,9 @@
 use crate::multi_gpu::Gpus;
 use hip_bridge::{DeviceBuffer, HipError};
 use hipfire_dispatch::context::DispatchCtx;
-use hipfire_dispatch::pipeline::superop::{dispatch_super_op, ForwardBindings, LayerProgram, SuperOpKind};
+use hipfire_dispatch::pipeline::superop::{
+    dispatch_super_op, ForwardBindings, LayerProgram, SuperOpKind,
+};
 use hipfire_dispatch::types::DispatchError;
 use rdna_compute::GpuTensor;
 
@@ -76,8 +78,16 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
     residual_dim: usize,
 ) -> Result<(), DispatchError> {
     let n = gpus.devices.len();
-    assert_eq!(bindings.len(), n, "run_layer_program_ep: bindings.len() != n_ranks");
-    assert_eq!(partials.len(), n, "run_layer_program_ep: partials.len() != n_ranks");
+    assert_eq!(
+        bindings.len(),
+        n,
+        "run_layer_program_ep: bindings.len() != n_ranks"
+    );
+    assert_eq!(
+        partials.len(),
+        n,
+        "run_layer_program_ep: partials.len() != n_ranks"
+    );
 
     for op in program {
         if matches!(op.kind, SuperOpKind::Moe) {
@@ -121,12 +131,15 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
             //    peer-direct with HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1 if needed.
             let refs: Vec<&DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
             static PEER_DECODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            let use_peer = *PEER_DECODE
-                .get_or_init(|| std::env::var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE").as_deref() == Ok("1"));
+            let use_peer = *PEER_DECODE.get_or_init(|| {
+                std::env::var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE").as_deref() == Ok("1")
+            });
             if use_peer {
-                gpus.all_reduce_sum_f32_peer(&refs, residual_dim).map_err(hip_err)?;
+                gpus.all_reduce_sum_f32_peer(&refs, residual_dim)
+                    .map_err(hip_err)?;
             } else {
-                gpus.all_reduce_sum_f32(&refs, residual_dim).map_err(hip_err)?;
+                gpus.all_reduce_sum_f32(&refs, residual_dim)
+                    .map_err(hip_err)?;
             }
 
             // 4. Each rank adds the reduced partial into its residual stream.

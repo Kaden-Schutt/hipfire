@@ -28,15 +28,16 @@
 //! crate shares one implementation. Marked individually below.
 
 use hip_bridge::{DeviceBuffer, HipResult};
-use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{f16_to_f32, weight_gemm, weight_gemv, EmbeddingFormat, WeightTensor};
-use hipfire_runtime::llama::{f16_to_f32, gemv_family, weight_gemm, EmbeddingFormat, WeightTensor};
 use hipfire_dispatch::context::DispatchCtx;
-use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::pipeline::superop::{
     self, EscapeKind, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind, WeightSlot,
 };
+use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::{dtype_rotation_plan, DispatchError};
+use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::llama::{
+    f16_to_f32, gemv_family, weight_gemm, weight_gemv, EmbeddingFormat, WeightTensor,
+};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Qwen2 model-shape constants parsed from `HfqFile::metadata_json`.
@@ -709,7 +710,7 @@ fn load_weight_tensor(
 pub struct Qwen2State {
     pub x: GpuTensor,
     pub tmp: GpuTensor,
-    pub x_rot: GpuTensor,  // rotation output scratch (rmsnorm output for non-MQ dtypes)
+    pub x_rot: GpuTensor, // rotation output scratch (rmsnorm output for non-MQ dtypes)
     pub q: GpuTensor,
     pub k: GpuTensor,
     pub v: GpuTensor,
@@ -771,6 +772,7 @@ impl Qwen2State {
         Ok(Self {
             x: gpu.alloc_tensor(&[dim], DType::F32)?,
             tmp: gpu.alloc_tensor(&[dim], DType::F32)?,
+            x_rot: gpu.alloc_tensor(&[x_rot_len], DType::F32)?,
             q: gpu.alloc_tensor(&[q_dim], DType::F32)?,
             k: gpu.alloc_tensor(&[kv_dim], DType::F32)?,
             v: gpu.alloc_tensor(&[kv_dim], DType::F32)?,
@@ -781,19 +783,6 @@ impl Qwen2State {
             ffn_hidden: gpu.alloc_tensor(&[hidden_dim], DType::F32)?,
             ffn_out: gpu.alloc_tensor(&[dim], DType::F32)?,
             logits: gpu.alloc_tensor(&[cfg.vocab_size], DType::F32)?,
-            x:           gpu.alloc_tensor(&[dim], DType::F32)?,
-            tmp:         gpu.alloc_tensor(&[dim], DType::F32)?,
-            x_rot:       gpu.alloc_tensor(&[x_rot_len], DType::F32)?,
-            q:           gpu.alloc_tensor(&[q_dim], DType::F32)?,
-            k:           gpu.alloc_tensor(&[kv_dim], DType::F32)?,
-            v:           gpu.alloc_tensor(&[kv_dim], DType::F32)?,
-            attn_out:    gpu.alloc_tensor(&[q_dim], DType::F32)?,
-            o:           gpu.alloc_tensor(&[dim], DType::F32)?,
-            gate:        gpu.alloc_tensor(&[hidden_dim], DType::F32)?,
-            up:          gpu.alloc_tensor(&[hidden_dim], DType::F32)?,
-            ffn_hidden:  gpu.alloc_tensor(&[hidden_dim], DType::F32)?,
-            ffn_out:     gpu.alloc_tensor(&[dim], DType::F32)?,
-            logits:      gpu.alloc_tensor(&[cfg.vocab_size], DType::F32)?,
             attn_partials: gpu.alloc_tensor(&[attn_partials_len], DType::F32)?,
             pos_buf: gpu.hip.malloc(4)?,
             k_cache,
@@ -821,6 +810,7 @@ impl Qwen2State {
         for t in [
             self.x,
             self.tmp,
+            self.x_rot,
             self.q,
             self.k,
             self.v,
@@ -839,9 +829,6 @@ impl Qwen2State {
             let _ = gpu.free_tensor(t);
         }
         for t in self.v_cache {
-        for t in [self.x, self.tmp, self.x_rot, self.q, self.k, self.v, self.attn_out,
-                  self.o, self.gate, self.up, self.ffn_hidden,
-                  self.ffn_out, self.logits, self.attn_partials] {
             let _ = gpu.free_tensor(t);
         }
         let _ = gpu.hip.free(self.pos_buf);
@@ -1059,17 +1046,38 @@ fn forward_step_after_x(
         let wrq = layer.wq.dispatch_ref();
         let wrk = layer.wk.dispatch_ref();
         let wrv = layer.wv.dispatch_ref();
-        execute_steps(gpu, &ctx, &[
-            Step::RmsnormAutomatic {
-                x: &state.x, norm_weight: &layer.attn_norm,
-                x_plain: &state.tmp, out: &state.x_rot,
-                awq_scale: layer.wq.awq_scale.as_ref(),
-                k: layer.wq.k, eps: cfg.rms_norm_eps, rotation: qkv_rot,
-            },
-            Step::Gemv { w: &wrq, input: GemvInput::Prerotated(&state.x_rot), out: &state.q },
-            Step::Gemv { w: &wrk, input: GemvInput::Prerotated(&state.x_rot), out: &state.k },
-            Step::Gemv { w: &wrv, input: GemvInput::Prerotated(&state.x_rot), out: &state.v },
-        ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+        execute_steps(
+            gpu,
+            &ctx,
+            &[
+                Step::RmsnormAutomatic {
+                    x: &state.x,
+                    norm_weight: &layer.attn_norm,
+                    x_plain: &state.tmp,
+                    out: &state.x_rot,
+                    awq_scale: layer.wq.awq_scale.as_ref(),
+                    k: layer.wq.k,
+                    eps: cfg.rms_norm_eps,
+                    rotation: qkv_rot,
+                },
+                Step::Gemv {
+                    w: &wrq,
+                    input: GemvInput::Prerotated(&state.x_rot),
+                    out: &state.q,
+                },
+                Step::Gemv {
+                    w: &wrk,
+                    input: GemvInput::Prerotated(&state.x_rot),
+                    out: &state.k,
+                },
+                Step::Gemv {
+                    w: &wrv,
+                    input: GemvInput::Prerotated(&state.x_rot),
+                    out: &state.v,
+                },
+            ],
+        )
+        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
 
         // (3) QKV bias. attention_bias=true on Qwen2 — three small adds
         // per layer (batch=1, n=q_dim or kv_dim). This is **option (a)**
@@ -1161,28 +1169,50 @@ fn forward_step_after_x(
 
         // (7–8) o_proj + residual via execute_steps.
         let wro = layer.wo.dispatch_ref();
-        execute_steps(gpu, &ctx, &[
-            Step::GemvResidual {
-                w: &wro, input: GemvInput::Raw(&state.attn_out),
-                residual: &state.x, out: &state.o,
-            },
-        ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+        execute_steps(
+            gpu,
+            &ctx,
+            &[Step::GemvResidual {
+                w: &wro,
+                input: GemvInput::Raw(&state.attn_out),
+                residual: &state.x,
+                out: &state.o,
+            }],
+        )
+        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
 
         // (9–10) FFN norm + gate/up via execute_steps.
         // The interpreter selects FusedGateUpQ8_0 / FusedGateUpHfq4G256 / per-op.
         let ffn_rot = dtype_rotation_plan(layer.w_gate.gpu_dtype);
         let wrg = layer.w_gate.dispatch_ref();
         let wru = layer.w_up.dispatch_ref();
-        execute_steps(gpu, &ctx, &[
-            Step::RmsnormAutomatic {
-                x: &state.x, norm_weight: &layer.ffn_norm,
-                x_plain: &state.tmp, out: &state.x_rot,
-                awq_scale: layer.w_gate.awq_scale.as_ref(),
-                k: layer.w_gate.k, eps: cfg.rms_norm_eps, rotation: ffn_rot,
-            },
-            Step::Gemv { w: &wrg, input: GemvInput::Prerotated(&state.x_rot), out: &state.gate },
-            Step::Gemv { w: &wru, input: GemvInput::Prerotated(&state.x_rot), out: &state.up },
-        ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+        execute_steps(
+            gpu,
+            &ctx,
+            &[
+                Step::RmsnormAutomatic {
+                    x: &state.x,
+                    norm_weight: &layer.ffn_norm,
+                    x_plain: &state.tmp,
+                    out: &state.x_rot,
+                    awq_scale: layer.w_gate.awq_scale.as_ref(),
+                    k: layer.w_gate.k,
+                    eps: cfg.rms_norm_eps,
+                    rotation: ffn_rot,
+                },
+                Step::Gemv {
+                    w: &wrg,
+                    input: GemvInput::Prerotated(&state.x_rot),
+                    out: &state.gate,
+                },
+                Step::Gemv {
+                    w: &wru,
+                    input: GemvInput::Prerotated(&state.x_rot),
+                    out: &state.up,
+                },
+            ],
+        )
+        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
 
         // (10) SwiGLU: gate = silu(w_gate(x)) * w_up(x); down(...).
         weight_gemv(gpu, &layer.w_gate, &state.tmp, &state.gate)?;
@@ -1190,20 +1220,32 @@ fn forward_step_after_x(
         // SwiGLU activation + w_down + residual.
         gpu.silu_mul_f32(&state.gate, &state.up, &state.ffn_hidden)?;
         let wrd = layer.w_down.dispatch_ref();
-        execute_steps(gpu, &ctx, &[
-            Step::GemvResidual {
-                w: &wrd, input: GemvInput::Raw(&state.ffn_hidden),
-                residual: &state.x, out: &state.ffn_out,
-            },
-        ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+        execute_steps(
+            gpu,
+            &ctx,
+            &[Step::GemvResidual {
+                w: &wrd,
+                input: GemvInput::Raw(&state.ffn_hidden),
+                residual: &state.x,
+                out: &state.ffn_out,
+            }],
+        )
+        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
     }
 
     // Final RMSNorm + lm_head.
     gpu.rmsnorm_f32(&state.x, &weights.output_norm, &state.tmp, cfg.rms_norm_eps)?;
     let wr_out = weights.output.dispatch_ref();
-    execute_steps(gpu, &ctx, &[
-        Step::Gemv { w: &wr_out, input: GemvInput::Raw(&state.tmp), out: &state.logits },
-    ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+    execute_steps(
+        gpu,
+        &ctx,
+        &[Step::Gemv {
+            w: &wr_out,
+            input: GemvInput::Raw(&state.tmp),
+            out: &state.logits,
+        }],
+    )
+    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
 
     state.next_pos = pos + 1;
     Ok(())
@@ -1263,8 +1305,12 @@ pub fn forward_prefill_batch_embeds(
     let gemv = gemv_family();
     let ctx = DispatchCtx::new(gpu);
 
-    assert_eq!(embeds.len() % dim, 0,
-        "forward_prefill_batch_embeds: embeds.len()={} not a multiple of dim={dim}", embeds.len());
+    assert_eq!(
+        embeds.len() % dim,
+        0,
+        "forward_prefill_batch_embeds: embeds.len()={} not a multiple of dim={dim}",
+        embeds.len()
+    );
     let batch = embeds.len() / dim;
     let base = state.next_pos;
     if base + batch > state.max_seq {
@@ -1425,7 +1471,14 @@ pub fn forward_prefill_batch_embeds(
     gpu.hip
         .memcpy_dtod_at(&state.x.buf, 0, &x_batch.buf, last_off, dim * 4)?;
     gpu.rmsnorm_f32(&state.x, &weights.output_norm, &state.tmp, cfg.rms_norm_eps)?;
-    gemv.run_auto(&ctx, gpu, &weights.output.dispatch_ref(), &state.tmp, &state.logits).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+    gemv.run_auto(
+        &ctx,
+        gpu,
+        &weights.output.dispatch_ref(),
+        &state.tmp,
+        &state.logits,
+    )
+    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
 
     state.next_pos = base + batch;
 
@@ -1453,7 +1506,6 @@ pub fn forward_prefill_batch_embeds(
     }
     Ok(())
 }
-
 
 // ─────────────────────────────────────────────────────────────────────────
 // #397 Ship 6 — forward-as-pipeline: Qwen2 lowered decode.
@@ -1530,7 +1582,12 @@ struct Qwen2Bindings<'a> {
 }
 
 impl<'a> ForwardBindings for Qwen2Bindings<'a> {
-    fn run_proj(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError> {
+    fn run_proj(
+        &mut self,
+        gpu: &mut Gpu,
+        ctx: &DispatchCtx,
+        op: &OpBinding,
+    ) -> Result<(), DispatchError> {
         match op_code(op) {
             q2_op::PROJ_QKV => {
                 // Hand-path: rmsnorm + QKV projection via execute_steps.
@@ -1538,39 +1595,84 @@ impl<'a> ForwardBindings for Qwen2Bindings<'a> {
                 let wrq = self.layer.wq.dispatch_ref();
                 let wrk = self.layer.wk.dispatch_ref();
                 let wrv = self.layer.wv.dispatch_ref();
-                execute_steps(gpu, ctx, &[
-                    Step::RmsnormAutomatic {
-                        x: &self.state.x, norm_weight: &self.layer.attn_norm,
-                        x_plain: &self.state.tmp, out: &self.state.x_rot,
-                        awq_scale: self.layer.wq.awq_scale.as_ref(),
-                        k: self.layer.wq.k, eps: self.cfg.rms_norm_eps, rotation: qkv_rot,
-                    },
-                    Step::Gemv { w: &wrq, input: GemvInput::Prerotated(&self.state.x_rot), out: &self.state.q },
-                    Step::Gemv { w: &wrk, input: GemvInput::Prerotated(&self.state.x_rot), out: &self.state.k },
-                    Step::Gemv { w: &wrv, input: GemvInput::Prerotated(&self.state.x_rot), out: &self.state.v },
-                ]).map_err(|e| DispatchError::Hip(format!("qwen2 L{}: qkv proj: {e}", self.l)))
+                execute_steps(
+                    gpu,
+                    ctx,
+                    &[
+                        Step::RmsnormAutomatic {
+                            x: &self.state.x,
+                            norm_weight: &self.layer.attn_norm,
+                            x_plain: &self.state.tmp,
+                            out: &self.state.x_rot,
+                            awq_scale: self.layer.wq.awq_scale.as_ref(),
+                            k: self.layer.wq.k,
+                            eps: self.cfg.rms_norm_eps,
+                            rotation: qkv_rot,
+                        },
+                        Step::Gemv {
+                            w: &wrq,
+                            input: GemvInput::Prerotated(&self.state.x_rot),
+                            out: &self.state.q,
+                        },
+                        Step::Gemv {
+                            w: &wrk,
+                            input: GemvInput::Prerotated(&self.state.x_rot),
+                            out: &self.state.k,
+                        },
+                        Step::Gemv {
+                            w: &wrv,
+                            input: GemvInput::Prerotated(&self.state.x_rot),
+                            out: &self.state.v,
+                        },
+                    ],
+                )
+                .map_err(|e| DispatchError::Hip(format!("qwen2 L{}: qkv proj: {e}", self.l)))
             }
             q2_op::PROJ_GATE_UP => {
                 // Hand-path: ffn norm + gate/up projection via execute_steps.
                 let ffn_rot = dtype_rotation_plan(self.layer.w_gate.gpu_dtype);
                 let wrg = self.layer.w_gate.dispatch_ref();
                 let wru = self.layer.w_up.dispatch_ref();
-                execute_steps(gpu, ctx, &[
-                    Step::RmsnormAutomatic {
-                        x: &self.state.x, norm_weight: &self.layer.ffn_norm,
-                        x_plain: &self.state.tmp, out: &self.state.x_rot,
-                        awq_scale: self.layer.w_gate.awq_scale.as_ref(),
-                        k: self.layer.w_gate.k, eps: self.cfg.rms_norm_eps, rotation: ffn_rot,
-                    },
-                    Step::Gemv { w: &wrg, input: GemvInput::Prerotated(&self.state.x_rot), out: &self.state.gate },
-                    Step::Gemv { w: &wru, input: GemvInput::Prerotated(&self.state.x_rot), out: &self.state.up },
-                ]).map_err(|e| DispatchError::Hip(format!("qwen2 L{}: gate_up proj: {e}", self.l)))
+                execute_steps(
+                    gpu,
+                    ctx,
+                    &[
+                        Step::RmsnormAutomatic {
+                            x: &self.state.x,
+                            norm_weight: &self.layer.ffn_norm,
+                            x_plain: &self.state.tmp,
+                            out: &self.state.x_rot,
+                            awq_scale: self.layer.w_gate.awq_scale.as_ref(),
+                            k: self.layer.w_gate.k,
+                            eps: self.cfg.rms_norm_eps,
+                            rotation: ffn_rot,
+                        },
+                        Step::Gemv {
+                            w: &wrg,
+                            input: GemvInput::Prerotated(&self.state.x_rot),
+                            out: &self.state.gate,
+                        },
+                        Step::Gemv {
+                            w: &wru,
+                            input: GemvInput::Prerotated(&self.state.x_rot),
+                            out: &self.state.up,
+                        },
+                    ],
+                )
+                .map_err(|e| DispatchError::Hip(format!("qwen2 L{}: gate_up proj: {e}", self.l)))
             }
-            c => Err(DispatchError::Hip(format!("qwen2: run_proj bad opcode {c}"))),
+            c => Err(DispatchError::Hip(format!(
+                "qwen2: run_proj bad opcode {c}"
+            ))),
         }
     }
 
-    fn run_attend(&mut self, gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
+    fn run_attend(
+        &mut self,
+        gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
         let l = self.l;
         let n_heads = self.cfg.num_attention_heads;
         let n_kv_heads = self.cfg.num_key_value_heads;
@@ -1587,87 +1689,170 @@ impl<'a> ForwardBindings for Qwen2Bindings<'a> {
             .map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: v bias: {e:?}")))?;
 
         // (4) RoPE
-        gpu.rope_f32(&self.state.q, &self.state.k, &self.state.pos_buf,
-                     n_heads, n_kv_heads, head_dim, self.cfg.rope_theta)
-            .map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: rope: {e:?}")))?;
+        gpu.rope_f32(
+            &self.state.q,
+            &self.state.k,
+            &self.state.pos_buf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            self.cfg.rope_theta,
+        )
+        .map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: rope: {e:?}")))?;
 
         // (5) KV write
-        gpu.kv_cache_write(&self.state.k_cache[l], &self.state.k, &self.state.pos_buf, kv_dim)
-            .map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: kv write k: {e:?}")))?;
-        gpu.kv_cache_write(&self.state.v_cache[l], &self.state.v, &self.state.pos_buf, kv_dim)
-            .map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: kv write v: {e:?}")))?;
+        gpu.kv_cache_write(
+            &self.state.k_cache[l],
+            &self.state.k,
+            &self.state.pos_buf,
+            kv_dim,
+        )
+        .map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: kv write k: {e:?}")))?;
+        gpu.kv_cache_write(
+            &self.state.v_cache[l],
+            &self.state.v,
+            &self.state.pos_buf,
+            kv_dim,
+        )
+        .map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: kv write v: {e:?}")))?;
 
         // (6) Attention — 4-way select (exact hand-path mirror)
-        let use_fused = std::env::var("HIPFIRE_GQA_FUSED").map(|v| v == "1").unwrap_or(false);
+        let use_fused = std::env::var("HIPFIRE_GQA_FUSED")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         if use_fused && n_kv_heads < n_heads {
             gpu.attention_flash_gqa_fused(
-                &self.state.q, &self.state.k_cache[l], &self.state.v_cache[l],
+                &self.state.q,
+                &self.state.k_cache[l],
+                &self.state.v_cache[l],
                 &self.state.attn_out,
-                self.seq_len, n_heads, n_kv_heads, head_dim, self.state.max_seq,
-            )
-        } else if n_kv_heads < n_heads && head_dim == 128 && self.seq_len >= 4096 {
-            gpu.attention_gqa_warp(
-                &self.state.q, &self.state.k_cache[l], &self.state.v_cache[l],
-                &self.state.attn_out, &self.state.attn_partials,
-                self.seq_len, n_heads, n_kv_heads, head_dim, self.state.max_seq,
+                self.seq_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                self.state.max_seq,
             )
         } else if n_kv_heads < n_heads && self.seq_len >= 4096 {
-            Gpu::attention_flash_gqa(gpu,
-                &self.state.q, &self.state.k_cache[l], &self.state.v_cache[l],
-                &self.state.attn_out, &self.state.attn_partials,
-                self.seq_len, n_heads, n_kv_heads, head_dim, self.state.max_seq,
+            Gpu::attention_flash_gqa(
+                gpu,
+                &self.state.q,
+                &self.state.k_cache[l],
+                &self.state.v_cache[l],
+                &self.state.attn_out,
+                &self.state.attn_partials,
+                self.seq_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                self.state.max_seq,
             )
         } else {
-            Gpu::attention_flash(gpu,
-                &self.state.q, &self.state.k_cache[l], &self.state.v_cache[l],
-                &self.state.attn_out, &self.state.attn_partials,
-                self.seq_len, n_heads, n_kv_heads, head_dim, self.state.max_seq,
+            Gpu::attention_flash(
+                gpu,
+                &self.state.q,
+                &self.state.k_cache[l],
+                &self.state.v_cache[l],
+                &self.state.attn_out,
+                &self.state.attn_partials,
+                self.seq_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                self.state.max_seq,
             )
-        }.map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: attention: {e:?}")))?;
+        }
+        .map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: attention: {e:?}")))?;
 
         Ok(())
     }
 
-    fn run_residual_gemv(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError> {
+    fn run_residual_gemv(
+        &mut self,
+        gpu: &mut Gpu,
+        ctx: &DispatchCtx,
+        op: &OpBinding,
+    ) -> Result<(), DispatchError> {
         match op_code(op) {
             q2_op::RESID_WO => {
                 let wro = self.layer.wo.dispatch_ref();
-                execute_steps(gpu, ctx, &[
-                    Step::GemvResidual {
-                        w: &wro, input: GemvInput::Raw(&self.state.attn_out),
-                        residual: &self.state.x, out: &self.state.o,
-                    },
-                ]).map_err(|e| DispatchError::Hip(format!("qwen2 L{}: wo: {e}", self.l)))
+                execute_steps(
+                    gpu,
+                    ctx,
+                    &[Step::GemvResidual {
+                        w: &wro,
+                        input: GemvInput::Raw(&self.state.attn_out),
+                        residual: &self.state.x,
+                        out: &self.state.o,
+                    }],
+                )
+                .map_err(|e| DispatchError::Hip(format!("qwen2 L{}: wo: {e}", self.l)))
             }
             q2_op::RESID_DOWN => {
                 // silu_mul + w_down residual (always paired in qwen2).
                 gpu.silu_mul_f32(&self.state.gate, &self.state.up, &self.state.ffn_hidden)
-                    .map_err(|e| DispatchError::Hip(format!("qwen2 L{}: silu_mul: {e:?}", self.l)))?;
+                    .map_err(|e| {
+                        DispatchError::Hip(format!("qwen2 L{}: silu_mul: {e:?}", self.l))
+                    })?;
                 let wrd = self.layer.w_down.dispatch_ref();
-                execute_steps(gpu, ctx, &[
-                    Step::GemvResidual {
-                        w: &wrd, input: GemvInput::Raw(&self.state.ffn_hidden),
-                        residual: &self.state.x, out: &self.state.ffn_out,
-                    },
-                ]).map_err(|e| DispatchError::Hip(format!("qwen2 L{}: down: {e}", self.l)))
+                execute_steps(
+                    gpu,
+                    ctx,
+                    &[Step::GemvResidual {
+                        w: &wrd,
+                        input: GemvInput::Raw(&self.state.ffn_hidden),
+                        residual: &self.state.x,
+                        out: &self.state.ffn_out,
+                    }],
+                )
+                .map_err(|e| DispatchError::Hip(format!("qwen2 L{}: down: {e}", self.l)))
             }
-            c => Err(DispatchError::Hip(format!("qwen2: run_residual_gemv bad opcode {c}"))),
+            c => Err(DispatchError::Hip(format!(
+                "qwen2: run_residual_gemv bad opcode {c}"
+            ))),
         }
     }
 
-    fn run_norm(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
-        Err(DispatchError::Hip("qwen2 has no standalone Norm super-op".into()))
+    fn run_norm(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::Hip(
+            "qwen2 has no standalone Norm super-op".into(),
+        ))
     }
-    fn run_moe(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
+    fn run_moe(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
         Err(DispatchError::Hip("qwen2 has no MoE".into()))
     }
-    fn run_recurrent(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
+    fn run_recurrent(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
         Err(DispatchError::Hip("qwen2 has no Recurrent super-op".into()))
     }
-    fn run_conv(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
+    fn run_conv(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
         Err(DispatchError::Hip("qwen2 has no Conv super-op".into()))
     }
-    fn run_escape(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding, _kind: EscapeKind) -> Result<(), DispatchError> {
+    fn run_escape(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+        _kind: EscapeKind,
+    ) -> Result<(), DispatchError> {
         Err(DispatchError::Hip("qwen2 has no Escape super-op".into()))
     }
 }
@@ -1700,16 +1885,29 @@ fn forward_step_after_x_lowered(
     let ctx = DispatchCtx::new(gpu);
     let program = qwen2_lower_program();
     for (l, layer) in weights.layers.iter().enumerate() {
-        let mut bind = Qwen2Bindings { cfg, layer, state, l, seq_len: pos + 1 };
+        let mut bind = Qwen2Bindings {
+            cfg,
+            layer,
+            state,
+            l,
+            seq_len: pos + 1,
+        };
         superop::run_layer_program(gpu, &ctx, &program, &mut bind)
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
     }
     // Final RMSNorm + lm_head (outside layer loop).
     gpu.rmsnorm_f32(&state.x, &weights.output_norm, &state.tmp, cfg.rms_norm_eps)?;
     let wr_out = weights.output.dispatch_ref();
-    execute_steps(gpu, &ctx, &[
-        Step::Gemv { w: &wr_out, input: GemvInput::Raw(&state.tmp), out: &state.logits },
-    ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+    execute_steps(
+        gpu,
+        &ctx,
+        &[Step::Gemv {
+            w: &wr_out,
+            input: GemvInput::Raw(&state.tmp),
+            out: &state.logits,
+        }],
+    )
+    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
     state.next_pos = pos + 1;
     Ok(())
 }

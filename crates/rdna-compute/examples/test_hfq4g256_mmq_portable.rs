@@ -64,8 +64,12 @@ fn run() -> Result<(), Outcome> {
     //   -  16×256× 16  : minimal full tile on gfx12
     //   - 130×256× 70  : PARTIAL tile (bounds-clamped, non-`_full`) on both archs
     //   - 256×512×48   : multi-K-block (K=512 → 2 G256 blocks), partial N
-    let shapes: [(usize, usize, usize); 4] =
-        [(128, 256, 128), (16, 256, 16), (130, 256, 70), (256, 512, 48)];
+    let shapes: [(usize, usize, usize); 4] = [
+        (128, 256, 128),
+        (16, 256, 16),
+        (130, 256, 70),
+        (256, 512, 48),
+    ];
 
     let mut any_fail = false;
     for &(m, k, n) in &shapes {
@@ -92,9 +96,8 @@ fn check_shape(gpu: &mut rdna_compute::Gpu, m: usize, k: usize, n: usize) -> Res
     let mut w = vec![0.0f32; m * k];
     for row in 0..m {
         for col in 0..k {
-            w[row * k + col] = ((row * 31 + col * 17) as f32 * 0.013).sin() * 0.7
-                + (row as f32 * 0.005)
-                - 0.35;
+            w[row * k + col] =
+                ((row * 31 + col * 17) as f32 * 0.013).sin() * 0.7 + (row as f32 * 0.005) - 0.35;
         }
     }
     let mut x = vec![0.0f32; n * k];
@@ -265,8 +268,16 @@ fn quantize_hfq4g256(f32_data: &[f32], _k: usize) -> Vec<u8> {
         for i in 0..128 {
             let lo_idx = 2 * i;
             let hi_idx = 2 * i + 1;
-            let lo_val = if lo_idx < actual_len { grp[lo_idx] } else { min_val };
-            let hi_val = if hi_idx < actual_len { grp[hi_idx] } else { min_val };
+            let lo_val = if lo_idx < actual_len {
+                grp[lo_idx]
+            } else {
+                min_val
+            };
+            let hi_val = if hi_idx < actual_len {
+                grp[hi_idx]
+            } else {
+                min_val
+            };
             let lo_q = ((lo_val - min_val) * inv_scale + 0.5) as u8;
             let hi_q = ((hi_val - min_val) * inv_scale + 0.5) as u8;
             out[off + 8 + i] = lo_q.min(15) | (hi_q.min(15) << 4);

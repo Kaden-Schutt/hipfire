@@ -49,8 +49,8 @@ Test results: **190/190 pass** (123 dispatch + 66 dispatch-tests + 1 golden).
 
 | Fixture | Model | Prompt | Result |
 |---|---|---|---|
-| A3B k=8 (GPU fast path) | `qwen3.6-35b-a3b.mq4` | "What is 2+2?" | **Coherent** — output "4" |
-| A3B k=8 (GPU fast path) | `qwen3.6-35b-a3b.mq4` | sheep reasoning (60 tok) | **Coherent** — correct answer "9" with reasoning |
+| A3B k=8 (GPU fast path) | `qwen3.6-35b-a3b-mq4.hfq` | "What is 2+2?" | **Coherent** — output "4" |
+| A3B k=8 (GPU fast path) | `qwen3.6-35b-a3b-mq4.hfq` | sheep reasoning (60 tok) | **Coherent** — correct answer "9" with reasoning |
 | coherence-gate (dense) | 0.8B/4B/9B/27B MQ4/MQ3 | standard battery | **All coherent** (cap/code/reason/tool-call) |
 
 **Note on coherence-gate A3B:** The first two coherence-gate runs produced garbled A3B

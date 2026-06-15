@@ -162,36 +162,71 @@ impl Llama {
             let wrq = layer.wq.dispatch_ref();
             let wrk = layer.wk.dispatch_ref();
             let wrv = layer.wv.dispatch_ref();
-            execute_steps(gpu, &ctx, &[
-                Step::RmsnormAutomatic {
-                    x: &scratch.x, norm_weight: &layer.attn_norm,
-                    x_plain: &scratch.tmp, out: &scratch.x_rot,
-                    awq_scale: layer.wq.awq_scale.as_ref(),
-                    k: layer.wq.k, eps: config.norm_eps, rotation: qkv_rot,
-                },
-                Step::Gemv { w: &wrq, input: GemvInput::Prerotated(&scratch.x_rot), out: &scratch.q },
-                Step::Gemv { w: &wrk, input: GemvInput::Prerotated(&scratch.x_rot), out: &scratch.k },
-                Step::Gemv { w: &wrv, input: GemvInput::Prerotated(&scratch.x_rot), out: &scratch.v },
-            ])?;
+            execute_steps(
+                gpu,
+                &ctx,
+                &[
+                    Step::RmsnormAutomatic {
+                        x: &scratch.x,
+                        norm_weight: &layer.attn_norm,
+                        x_plain: &scratch.tmp,
+                        out: &scratch.x_rot,
+                        awq_scale: layer.wq.awq_scale.as_ref(),
+                        k: layer.wq.k,
+                        eps: config.norm_eps,
+                        rotation: qkv_rot,
+                    },
+                    Step::Gemv {
+                        w: &wrq,
+                        input: GemvInput::Prerotated(&scratch.x_rot),
+                        out: &scratch.q,
+                    },
+                    Step::Gemv {
+                        w: &wrk,
+                        input: GemvInput::Prerotated(&scratch.x_rot),
+                        out: &scratch.k,
+                    },
+                    Step::Gemv {
+                        w: &wrv,
+                        input: GemvInput::Prerotated(&scratch.x_rot),
+                        out: &scratch.v,
+                    },
+                ],
+            )?;
 
             // ── QK norm (optional per config) ───────────────────
             if config.has_qk_norm {
                 if let Some(ref qn) = layer.q_norm {
                     gpu.rmsnorm_batched(
-                        &scratch.q, qn, &scratch.q, n_heads, head_dim, config.norm_eps,
+                        &scratch.q,
+                        qn,
+                        &scratch.q,
+                        n_heads,
+                        head_dim,
+                        config.norm_eps,
                     )?;
                 }
                 if let Some(ref kn) = layer.k_norm {
                     gpu.rmsnorm_batched(
-                        &scratch.k, kn, &scratch.k, n_kv_heads, head_dim, config.norm_eps,
+                        &scratch.k,
+                        kn,
+                        &scratch.k,
+                        n_kv_heads,
+                        head_dim,
+                        config.norm_eps,
                     )?;
                 }
             }
 
             // ── RoPE ────────────────────────────────────────────
             gpu.rope_f32(
-                &scratch.q, &scratch.k, &scratch.pos_buf,
-                n_heads, n_kv_heads, head_dim, config.rope_freq_base,
+                &scratch.q,
+                &scratch.k,
+                &scratch.pos_buf,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                config.rope_freq_base,
             )?;
 
             // ── KV cache write + attention (dispatched) ────────
@@ -220,7 +255,8 @@ impl Llama {
                     batch_size: 1,
                     is_tree: false,
                     is_boundary: false,
-                }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+                })
+                .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
                 let io = AttnParams {
                     q: &scratch.q,
                     k: &scratch.k,
@@ -246,18 +282,23 @@ impl Llama {
                     block_cols: 0,
                     output: &scratch.attn_out,
                 };
-                family.run_attention(&ctx, gpu, &plan, &io)
+                family
+                    .run_attention(&ctx, gpu, &plan, &io)
                     .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
             }
 
             // ── Attention output projection + residual ─────────
             let wro = layer.wo.dispatch_ref();
-            execute_steps(gpu, &ctx, &[
-                Step::GemvResidual {
-                    w: &wro, input: GemvInput::Raw(&scratch.attn_out),
-                    residual: &scratch.x, out: &scratch.o,
-                },
-            ])?;
+            execute_steps(
+                gpu,
+                &ctx,
+                &[Step::GemvResidual {
+                    w: &wro,
+                    input: GemvInput::Raw(&scratch.attn_out),
+                    residual: &scratch.x,
+                    out: &scratch.o,
+                }],
+            )?;
 
             // ── FFN path ────────────────────────────────────────
             // Single dynamic sequence via execute_steps — no model-side dtype
@@ -265,40 +306,76 @@ impl Llama {
             let ffn_rot = dtype_rotation_plan(layer.w_gate.gpu_dtype);
             let wrg = layer.w_gate.dispatch_ref();
             let wru = layer.w_up.dispatch_ref();
-            execute_steps(gpu, &ctx, &[
-                Step::RmsnormAutomatic {
-                    x: &scratch.x, norm_weight: &layer.ffn_norm,
-                    x_plain: &scratch.tmp, out: &scratch.x_rot,
-                    awq_scale: layer.w_gate.awq_scale.as_ref(),
-                    k: layer.w_gate.k, eps: config.norm_eps, rotation: ffn_rot,
-                },
-                Step::Gemv { w: &wrg, input: GemvInput::Prerotated(&scratch.x_rot), out: &scratch.gate },
-                Step::Gemv { w: &wru, input: GemvInput::Prerotated(&scratch.x_rot), out: &scratch.up },
-            ])?;
+            execute_steps(
+                gpu,
+                &ctx,
+                &[
+                    Step::RmsnormAutomatic {
+                        x: &scratch.x,
+                        norm_weight: &layer.ffn_norm,
+                        x_plain: &scratch.tmp,
+                        out: &scratch.x_rot,
+                        awq_scale: layer.w_gate.awq_scale.as_ref(),
+                        k: layer.w_gate.k,
+                        eps: config.norm_eps,
+                        rotation: ffn_rot,
+                    },
+                    Step::Gemv {
+                        w: &wrg,
+                        input: GemvInput::Prerotated(&scratch.x_rot),
+                        out: &scratch.gate,
+                    },
+                    Step::Gemv {
+                        w: &wru,
+                        input: GemvInput::Prerotated(&scratch.x_rot),
+                        out: &scratch.up,
+                    },
+                ],
+            )?;
 
             // ── SwiGLU + down projection + residual ─────────────
             gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.ffn_hidden)?;
             let wrd = layer.w_down.dispatch_ref();
-            execute_steps(gpu, &ctx, &[
-                Step::GemvResidual {
-                    w: &wrd, input: GemvInput::Raw(&scratch.ffn_hidden),
-                    residual: &scratch.x, out: &scratch.ffn_out,
-                },
-            ])?;
+            execute_steps(
+                gpu,
+                &ctx,
+                &[Step::GemvResidual {
+                    w: &wrd,
+                    input: GemvInput::Raw(&scratch.ffn_hidden),
+                    residual: &scratch.x,
+                    out: &scratch.ffn_out,
+                }],
+            )?;
         }
 
         // ── Final norm + logits + sampling ──────────────────────
-        gpu.rmsnorm_f32(&scratch.x, &weights.output_norm, &scratch.tmp, config.norm_eps)?;
+        gpu.rmsnorm_f32(
+            &scratch.x,
+            &weights.output_norm,
+            &scratch.tmp,
+            config.norm_eps,
+        )?;
         let wr_out = weights.output.dispatch_ref();
-        execute_steps(gpu, &ctx, &[
-            Step::Gemv { w: &wr_out, input: GemvInput::Raw(&scratch.tmp), out: &scratch.logits },
-        ])?;
+        execute_steps(
+            gpu,
+            &ctx,
+            &[Step::Gemv {
+                w: &wr_out,
+                input: GemvInput::Raw(&scratch.tmp),
+                out: &scratch.logits,
+            }],
+        )?;
 
         gpu.sample_top_p(
-            &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
-            config.vocab_size, temperature, top_p, rng_state,
-            repeat_window, repeat_penalty,
+            &scratch.logits,
+            &scratch.sample_buf,
+            &scratch.repeat_buf,
+            config.vocab_size,
+            temperature,
+            top_p,
+            rng_state,
+            repeat_window,
+            repeat_penalty,
         )
     }
-
 }

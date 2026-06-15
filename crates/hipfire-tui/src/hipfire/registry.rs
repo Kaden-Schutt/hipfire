@@ -297,10 +297,7 @@ fn group_key(tag: &str) -> String {
 }
 
 fn normalized_file_key(file: &str) -> String {
-    file.replace(".q4.hfq", ".hf4")
-        .replace(".hfq6.hfq", ".hf6")
-        .replace("-hfq4.hfq", ".hf4")
-        .replace(".hfq", ".hf4")
+    file.to_string()
 }
 
 fn is_selectable_model_file(file: &str) -> bool {
@@ -313,7 +310,8 @@ fn is_selectable_model_file(file: &str) -> bool {
         return false;
     }
     [
-        ".hf4", ".hf6", ".hfq", ".mq2", ".mq3", ".mq4", ".mq6", ".q8", ".q8f16", ".hfp4", ".mfp4",
+        "-hf4.hfq", "-hf6.hfq", "-mq2.hfq", "-mq3.hfq", "-mq4.hfq", "-mq6.hfq",
+        "-q8.hfq", "-q8f16.hfq", "-hfp4.hfq", "-mfp4.hfq",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -361,26 +359,26 @@ mod tests {
     #[test]
     fn groups_registry_tags_and_local_files_by_family() {
         assert_eq!(group_key("qwopus:27b-mq6"), "qwopus");
-        assert_eq!(group_key("qwopus-27b.mq6"), "qwopus");
+        assert_eq!(group_key("qwopus-27b-mq6.hfq"), "qwopus");
         assert_eq!(group_key("qwen3.5:9b"), "qwen3.5");
         assert_eq!(group_key("deepseek-v4-flash"), "deepseek");
     }
 
     #[test]
     fn filters_model_files_without_showing_sidecars() {
-        assert!(is_selectable_model_file("qwopus-27b.mq6"));
-        assert!(is_selectable_model_file("qwen3.5-9b.hfp4"));
-        assert!(is_selectable_model_file("lfm2.5-350m.q8"));
-        assert!(!is_selectable_model_file("qwen3.5-27b.mq4.triattn.bin"));
-        assert!(!is_selectable_model_file("qwen3.6-27b.mq4-mtp"));
+        assert!(is_selectable_model_file("qwopus-27b-mq6.hfq"));
+        assert!(is_selectable_model_file("qwen3.5-9b-hfp4.hfq"));
+        assert!(is_selectable_model_file("lfm2.5-350m-q8.hfq"));
+        assert!(!is_selectable_model_file("qwen3.5-27b-mq4.triattn.hfq"));
+        assert!(!is_selectable_model_file("qwen3.6-27b-mq4.mtp.hfq"));
     }
 
     #[test]
-    fn normalizes_legacy_hfq_names_for_duplicate_detection() {
+    fn keeps_canonical_hfq_names_for_duplicate_detection() {
         assert_eq!(
-            normalized_file_key("qwen35-27b-dflash-mq4.hfq"),
-            "qwen35-27b-dflash-mq4.hf4"
+            normalized_file_key("qwen3.5-27b-mq4.dflash.hfq"),
+            "qwen3.5-27b-mq4.dflash.hfq"
         );
-        assert_eq!(normalized_file_key("qwen3.5-9b.q4.hfq"), "qwen3.5-9b.hf4");
+        assert_eq!(normalized_file_key("qwen3.5-9b-hf4.hfq"), "qwen3.5-9b-hf4.hfq");
     }
 }

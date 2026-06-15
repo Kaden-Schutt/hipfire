@@ -13,7 +13,9 @@ fn build_hfq4g256(m: usize, k: usize, seed: u8) -> Vec<u8> {
     let bpr = gpr * 136;
     let mut out = vec![0u8; m * bpr];
     let mix = |x: u64| {
-        let h = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let h = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((h ^ (h >> 33)).wrapping_mul(0xff51afd7ed558ccd)) ^ (h >> 28)
     };
     let s0 = seed as u64;
@@ -45,43 +47,74 @@ fn main() {
     let up_m = 16384usize;
     let k = 5120usize;
 
-    let a_gate = gpu.upload_raw(&build_hfq4g256(gate_m, k, 0xD4), &[gate_m, k]).unwrap();
-    let a_up = gpu.upload_raw(&build_hfq4g256(up_m, k, 0xE5), &[up_m, k]).unwrap();
+    let a_gate = gpu
+        .upload_raw(&build_hfq4g256(gate_m, k, 0xD4), &[gate_m, k])
+        .unwrap();
+    let a_up = gpu
+        .upload_raw(&build_hfq4g256(up_m, k, 0xE5), &[up_m, k])
+        .unwrap();
 
     for &n in &[64usize, 256, 512] {
         let total_m = gate_m + up_m;
         let flop = 2.0 * n as f64 * k as f64 * total_m as f64;
         let x_f32: Vec<f32> = (0..(n * k))
-            .map(|i| { let b = (i / k) as i32; let kk = (i % k) as i32; ((b * 7 + kk * 11) % 31 - 15) as f32 * 0.05 })
+            .map(|i| {
+                let b = (i / k) as i32;
+                let kk = (i % k) as i32;
+                ((b * 7 + kk * 11) % 31 - 15) as f32 * 0.05
+            })
             .collect();
         let x = gpu.upload_f32(&x_f32, &[n, k]).unwrap();
         let y_g = gpu.alloc_tensor(&[n, gate_m], DType::F32).unwrap();
         let y_u = gpu.alloc_tensor(&[n, up_m], DType::F32).unwrap();
 
         // reference
-        gpu.gemm_gate_up_hfq4g256_dot2(&a_gate, &a_up, &x, &y_g, &y_u, gate_m, up_m, k, n).unwrap();
+        gpu.gemm_gate_up_hfq4g256_dot2(&a_gate, &a_up, &x, &y_g, &y_u, gate_m, up_m, k, n)
+            .unwrap();
         let ref_g = gpu.download_f32(&y_g).unwrap();
 
         eprintln!("\n=== N={n}  (gate=up={gate_m} K={k})  FLOP={flop:.2e} ===");
-        eprintln!("{:<14} {:>10} {:>9} {:>7} {:>10}", "variant", "us/call", "TFLOPS", "%peak", "max_rel");
+        eprintln!(
+            "{:<14} {:>10} {:>9} {:>7} {:>10}",
+            "variant", "us/call", "TFLOPS", "%peak", "max_rel"
+        );
 
         macro_rules! bench {
             ($label:expr, $m:ident) => {{
-                let ok = gpu.$m(&a_gate, &a_up, &x, &y_g, &y_u, gate_m, up_m, k, n).is_ok();
-                if !ok { eprintln!("{:<14} (call failed/skipped)", $label); }
-                else {
-                    for _ in 0..3 { let _ = gpu.$m(&a_gate, &a_up, &x, &y_g, &y_u, gate_m, up_m, k, n); }
+                let ok = gpu
+                    .$m(&a_gate, &a_up, &x, &y_g, &y_u, gate_m, up_m, k, n)
+                    .is_ok();
+                if !ok {
+                    eprintln!("{:<14} (call failed/skipped)", $label);
+                } else {
+                    for _ in 0..3 {
+                        let _ = gpu.$m(&a_gate, &a_up, &x, &y_g, &y_u, gate_m, up_m, k, n);
+                    }
                     gpu.hip.device_synchronize().unwrap();
                     let runs = 30;
                     let t0 = Instant::now();
-                    for _ in 0..runs { let _ = gpu.$m(&a_gate, &a_up, &x, &y_g, &y_u, gate_m, up_m, k, n); }
+                    for _ in 0..runs {
+                        let _ = gpu.$m(&a_gate, &a_up, &x, &y_g, &y_u, gate_m, up_m, k, n);
+                    }
                     gpu.hip.device_synchronize().unwrap();
                     let us = t0.elapsed().as_secs_f64() * 1e6 / runs as f64;
                     let tflops = flop / (us * 1e-6) / 1e12;
                     let cg = gpu.download_f32(&y_g).unwrap();
                     let mut mr = 0f32;
-                    for (a, b) in cg.iter().zip(ref_g.iter()) { let r = (a - b).abs() / b.abs().max(1e-3); if r > mr { mr = r; } }
-                    eprintln!("{:<14} {:>10.1} {:>9.1} {:>6.1}% {:>10.2e}", $label, us, tflops, tflops / peak * 100.0, mr);
+                    for (a, b) in cg.iter().zip(ref_g.iter()) {
+                        let r = (a - b).abs() / b.abs().max(1e-3);
+                        if r > mr {
+                            mr = r;
+                        }
+                    }
+                    eprintln!(
+                        "{:<14} {:>10.1} {:>9.1} {:>6.1}% {:>10.2e}",
+                        $label,
+                        us,
+                        tflops,
+                        tflops / peak * 100.0,
+                        mr
+                    );
                 }
             }};
         }

@@ -254,7 +254,10 @@ impl KernelCompiler {
         let hot_dir = cache_dir.clone();
         if let Some(ref cold) = precompiled_dir {
             if let Err(e) = seed_hot_from_cold(cold, &hot_dir) {
-                eprintln!("  hot-path seed failed at {} ({e}) — falling back to install dir reads", hot_dir.display());
+                eprintln!(
+                    "  hot-path seed failed at {} ({e}) — falling back to install dir reads",
+                    hot_dir.display()
+                );
             }
         }
         // Prefer the hot-path (tmpfs) dir when it exists and has contents.

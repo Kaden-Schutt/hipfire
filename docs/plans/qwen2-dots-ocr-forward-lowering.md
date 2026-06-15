@@ -387,7 +387,7 @@ Pre-built HFQ files on `/data/hipfire/`:
 | File | Size | n_kv_heads | GQA? | Validates |
 |---|---|---|---|---|
 | `/data/hipfire/qwen2-1.5b.hfq4-q8ffn.hfq` | 1.5 GB | == n_heads | no | Non-GQA attention, QKV bias, all projection paths |
-| `/data/hipfire/dots-ocr.q8.hfq` | 4.4 GB | 2 (< n_heads=12) | **yes** | GQA attention, QKV bias, text decode + embedding splice |
+| `/data/hipfire/dots-ocr-q8.hfq` | 4.4 GB | 2 (< n_heads=12) | **yes** | GQA attention, QKV bias, text decode + embedding splice |
 
 The qwen2-1.5b model has `n_kv == n_heads` → **cannot validate GQA branches at any context length**. dots-ocr has `n_kv=2` and exercises GQA — but only when context ≥ 4096 tokens (see §6.4 attention branch matrix).
 

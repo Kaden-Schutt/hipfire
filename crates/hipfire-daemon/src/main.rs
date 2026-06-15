@@ -4680,6 +4680,7 @@ impl Qwen35RequestSessionState {
             s_matrices: Self::clone_gpu_tensor_vec(gpu, &dn.s_matrices, "dn.s_matrices")?,
             s_scales: Self::clone_gpu_tensor_vec(gpu, &dn.s_scales, "dn.s_scales")?,
             conv_states: Self::clone_gpu_tensor_vec(gpu, &dn.conv_states, "dn.conv_states")?,
+            s_ef_residual: Self::clone_gpu_tensor_vec(gpu, &dn.s_ef_residual, "dn.s_ef_residual")?,
             quant: dn.quant,
         })
     }

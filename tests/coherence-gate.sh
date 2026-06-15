@@ -234,9 +234,9 @@ FULL_EXTRA=(
     "qwen3.5-35b-a3b-mq3.hfq|moe-mq3-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
     "qwen3.6-35b-a3b-mq3.hfq|moe36-mq3-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|800"
     "qwen3.6-27b-mq4.hfq|tool-call-27b|What does the file /tmp/fibonacci.c contain?|220|tool_call_system.txt"
-    #   ln -s /data/hipfire/qwen3.5-9b.mq4-awq-gptq-f2-lmhead-a100.hfq \
-    #         "${HIPFIRE_DIR:-$HOME/.hipfire}/models/qwen3.5-9b.mq4-awq-gptq-f2-lmhead"
-    "qwen3.5-9b.mq4-awq-gptq-f2-lmhead|lmhead-awq-paris|What is the capital of France? Answer in one short sentence.|300"
+    #   ln -s /data/hipfire/qwen3.5-9b-awq-gptq-f2-lmhead-a100-mq4.hfq \
+    #         "${HIPFIRE_DIR:-$HOME/.hipfire}/models/qwen3.5-9b-awq-gptq-f2-lmhead-mq4.hfq"
+    "qwen3.5-9b-awq-gptq-f2-lmhead-mq4.hfq|lmhead-awq-paris|What is the capital of France? Answer in one short sentence.|300"
     # ParoQ4G128 dispatch smoke — regression catcher for the GemvResidual
     # Givens-rotation fix (0912c73a): steps.rs GemvResidual else-branch was
     # calling gemv.run(Plain) which skipped Givens rotation for Paro weights,
@@ -254,7 +254,7 @@ FULL_EXTRA=(
     "qwen3.6-35b-a3b-paro.hfq|paro-a3b-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
 )
 FULL_EXTRA=(
-    "qwen3.5-35b-a3b.mq4|moe-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
+    "qwen3.5-35b-a3b-mq4.hfq|moe-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
     # gfx12/RDNA4 Q8_0-wo MoE coverage — the gate gap that let a9e8dfda
     # corrupt RDNA4 MoE output for ~100 commits before ae13aa75 fixed it.
     # a9e8dfda aliased the GemvResidual fallback's `out` onto the residual
@@ -272,8 +272,8 @@ FULL_EXTRA=(
     #   ln -s /data/hipfire-models/qwen3.5-35b-a3b.q8f16.hfq \
     #         "${HIPFIRE_DIR:-$HOME/.hipfire}/models/qwen3.5-35b-a3b.q8f16"
     "qwen3.5-35b-a3b.q8f16|moe-q8-wo-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
-    "qwen3.6-35b-a3b.mq4|moe36-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|800"
-    "qwen3.6-27b.mq4|tool-call-27b|What does the file /tmp/fibonacci.c contain?|220|tool_call_system.txt"
+    "qwen3.6-35b-a3b-mq4.hfq|moe36-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|800"
+    "qwen3.6-27b-mq4.hfq|tool-call-27b|What does the file /tmp/fibonacci.c contain?|220|tool_call_system.txt"
     # DeepSeek V4 Flash (arch_id=9, hipfire-arch-deepseek4). Loads the
     # 80 GB base from the MTP-sidecar split + the MTP addon via
     # HIPFIRE_DEEPSEEK4_MTP_ADDON. Skipped unless the symlink is present in

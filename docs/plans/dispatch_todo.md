@@ -25,7 +25,7 @@ gfx1100 verified 2026-06-06 by Kevin Read (unverbraucht). Results:
 | Binary md5s | bench_A=`0bdde243` bench_B=`99175bc` |
 
 Pre-existing quality issues confirmed on master (not dispatch regressions):
-`qwen3.5-9b.mq3` attractor loop in thinking, `qwen3.5-9b.mq4-lloyd` incoherent.
+`qwen3.5-9b-mq3.hfq` attractor loop in thinking, `qwen3.5-9b-lloyd-mq4.hfq` incoherent.
 
 Full report: `/tmp/dispatch_validation_gfx1100.md`
 Coherence report: `/tmp/coherence-20260606-211357.md`
@@ -194,7 +194,7 @@ non-MQ4/MQ6/Paro routed-expert model, and run through coherence-gate.sh.
 ### SF-4.1.3 · LOW — A3B DFlash draft model missing locally
 
 The pinned A3B MoE DFlash fixture (AGENTS.md §"Pinned A3B MoE DFlash fixtures")
-requires `qwen36-35b-a3b-dflash-mq4.hfq` (md5 `8254bbe1`). This file is not present
+requires `qwen3.6-35b-a3b-mq4.dflash.hfq` (md5 `8254bbe1`). This file is not present
 locally; the coherence-gate.sh DFlash gate is skipped.
 
 **Action:** Acquire the draft or document the DFlash coverage gap permanently.
@@ -225,7 +225,7 @@ builtin port — follow `gemm_hfq4g256_moe_grouped_wmma_k2` as template).
 
 ### SF-4.2.2 · HIGH — gfx1201 verification for MQ6 grouped prefill
 
-`qwen3.6-35b-a3b.mq4` has MQ6 FFN weights. The MQ6 grouped-WMMA path (Path 2)
+`qwen3.6-35b-a3b-mq4.hfq` has MQ6 FFN weights. The MQ6 grouped-WMMA path (Path 2)
 was never exercised in batched prefill because `mq6_batched_admit_enabled_from_env`
 defaults false on gfx11. On gfx12 it defaults true — but no gfx12 hardware has
 validated this path end-to-end.

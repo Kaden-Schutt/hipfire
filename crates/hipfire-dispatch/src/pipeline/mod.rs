@@ -5,10 +5,10 @@ use crate::context::DispatchCtx;
 use crate::families::gemv::{GemvFamily, WeightRef};
 use crate::tables::KernelRegistry;
 use crate::types::*;
-use rdna_compute::{DType, Gpu, GpuTensor};
-use std::sync::OnceLock;
 #[allow(unused_imports)]
 use hip_bridge;
+use rdna_compute::{DType, Gpu, GpuTensor};
+use std::sync::OnceLock;
 
 pub(crate) mod steps;
 pub use steps::{execute_steps, FusedPattern, GemvInput, Step};
@@ -22,10 +22,14 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    pub fn new(ops: &'static [PipelineOp]) -> Self { Self { ops } }
+    pub fn new(ops: &'static [PipelineOp]) -> Self {
+        Self { ops }
+    }
 
     pub fn can_satisfy(&self, requested: &[PipelineOp]) -> bool {
-        if self.ops.len() > requested.len() { return false; }
+        if self.ops.len() > requested.len() {
+            return false;
+        }
         self.ops.iter().zip(requested.iter()).all(|(a, b)| a == b)
     }
 }
@@ -66,7 +70,8 @@ pub fn execute_pipeline(
             PipelineOp::RotateFwht => {
                 use crate::families::rotation::{RotationFamily, RotationParams};
                 let rot = RotationFamily::new();
-                gpu.ensure_mq_signs().map_err(|e| DispatchError::Hip(e.to_string()))?;
+                gpu.ensure_mq_signs()
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
                 let x_rot = unsafe {
                     GpuTensor {
                         buf: gpu.mq_x_rot.as_ref().unwrap().buf.alias(),
@@ -74,17 +79,27 @@ pub fn execute_pipeline(
                         dtype: rdna_compute::DType::F32,
                     }
                 };
-                rot.run(ctx, gpu, RotationParams {
-                    x: params.x, x_up: None, w_norm: None,
-                    x_plain: &x_rot, x_rot: &x_rot,
-                    awq_scale: None, k: params.k,
-                    eps: 1e-6, batch_size: 1,
-                    variant: RotationVariant::Plain,
-                    givens_pairs: None,
-                    givens_theta: None,
-                    givens_scales: None,
-                    givens_krot: None,
-                }).map_err(|e| DispatchError::Hip(e.to_string()))?;
+                rot.run(
+                    ctx,
+                    gpu,
+                    RotationParams {
+                        x: params.x,
+                        x_up: None,
+                        w_norm: None,
+                        x_plain: &x_rot,
+                        x_rot: &x_rot,
+                        awq_scale: None,
+                        k: params.k,
+                        eps: 1e-6,
+                        batch_size: 1,
+                        variant: RotationVariant::Plain,
+                        givens_pairs: None,
+                        givens_theta: None,
+                        givens_scales: None,
+                        givens_krot: None,
+                    },
+                )
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
             }
             PipelineOp::Gemv => {
                 static GEMV_PIPELINE: OnceLock<GemvFamily> = OnceLock::new();
@@ -102,8 +117,10 @@ pub fn execute_pipeline(
             }
             _ => {
                 return Err(DispatchError::UnsupportedVariant {
-                    family: "pipeline", variant: "step",
-                    arch: "", quant: "",
+                    family: "pipeline",
+                    variant: "step",
+                    arch: "",
+                    quant: "",
                 });
             }
         }
@@ -124,7 +141,9 @@ fn find_fused(
         && requested[1] == PipelineOp::Gemv
     {
         let key = KernelKey::GemvMfp4G32Fused;
-        if registry.resolve(key, ctx, None).is_ok() { return Some(key); }
+        if registry.resolve(key, ctx, None).is_ok() {
+            return Some(key);
+        }
     }
     None
 }
@@ -146,8 +165,10 @@ unsafe fn slice_moe_f32_view(src: &GpuTensor, offset_elems: usize, len_elems: us
 pub fn check_moe_decode_batch_size(batch_size: usize) -> Result<(), DispatchError> {
     if batch_size != 1 {
         return Err(DispatchError::UnsupportedVariant {
-            family: "moe", variant: "decode-requires-batch-1",
-            arch: "", quant: "",
+            family: "moe",
+            variant: "decode-requires-batch-1",
+            arch: "",
+            quant: "",
         });
     }
     Ok(())
@@ -184,8 +205,10 @@ pub fn check_moe_decode_supported(
     // `select_nth_unstable_by(k-1)`. Universal precondition, not a k==8 check.
     if k == 0 || k > n_exp {
         return Err(DispatchError::UnsupportedVariant {
-            family: "moe", variant: "decode-k-out-of-range",
-            arch: "", quant: "",
+            family: "moe",
+            variant: "decode-k-out-of-range",
+            arch: "",
+            quant: "",
         });
     }
     // (b) routed dtype on neither path: not GPU-top-K-indexable AND no resident
@@ -193,8 +216,10 @@ pub fn check_moe_decode_supported(
     // experts is a valid fallback case (do not reject it here).
     if !use_gpu_topk && !routed_experts_resident {
         return Err(DispatchError::UnsupportedVariant {
-            family: "moe", variant: "decode-routed-dtype-unsupported-no-fallback",
-            arch: "", quant: "",
+            family: "moe",
+            variant: "decode-routed-dtype-unsupported-no-fallback",
+            arch: "",
+            quant: "",
         });
     }
     Ok(())
@@ -211,7 +236,9 @@ pub fn run_moe_decode(
 ) -> Result<(), DispatchError> {
     use crate::families::moe::MoeResolution;
     macro_rules! hip {
-        ($e:expr) => { $e.map_err(|e| DispatchError::Hip(e.to_string())) };
+        ($e:expr) => {
+            $e.map_err(|e| DispatchError::Hip(e.to_string()))
+        };
     }
 
     // Runtime guard matching the bias-aware decode guard (not debug_assert —
@@ -229,9 +256,7 @@ pub fn run_moe_decode(
     // deep `select_nth_unstable_by` panic in the fallback into a clean error.
     // NOTE: k != 8 is intentionally NOT rejected — the fallback handles k ∈
     // [1, n_exp] (MQ4 k=4, F32 k=2, …).
-    check_moe_decode_supported(
-        res.use_gpu_topk, p.k, p.n_exp, !p.routed_experts.is_empty(),
-    )?;
+    check_moe_decode_supported(res.use_gpu_topk, p.k, p.n_exp, !p.routed_experts.is_empty())?;
 
     // EP (Ship 6 substrate-EP): when `routed_out` is set, the shared-down and
     // routed-combine accumulate into that zeroed partial (all-reduced by the EP
@@ -246,12 +271,19 @@ pub fn run_moe_decode(
         }
         if !p.x_rot_prerotated {
             if res.routed_indexable_paro {
-                let paro = p.routed_gate_up_paro.as_ref()
+                let paro = p
+                    .routed_gate_up_paro
+                    .as_ref()
                     .expect("routed_indexable_paro implies gate_up paro sidecar");
                 hip!(gpu.givens_rotate_to(
-                    p.x_norm, p.x_rot_local,
-                    &paro.pairs, &paro.theta, &paro.scales,
-                    1, p.hidden, paro.krot,
+                    p.x_norm,
+                    p.x_rot_local,
+                    &paro.pairs,
+                    &paro.theta,
+                    &paro.scales,
+                    1,
+                    p.hidden,
+                    paro.krot,
                 ))?;
             } else if res.gate_side_mq4 {
                 if let Some(awq) = p.router.awq_scale {
@@ -273,25 +305,36 @@ pub fn run_moe_decode(
     // ── Gate-side GEMV ───────────────────────────────────────────────────────
     // SAFETY: all slice views alias device memory owned by MoEParams' scratch tensors.
     let shared_gate = unsafe { slice_moe_f32_view(p.gate_buf, 0, p.smi) };
-    let shared_up   = unsafe { slice_moe_f32_view(p.up_buf,   0, p.smi) };
+    let shared_up = unsafe { slice_moe_f32_view(p.up_buf, 0, p.smi) };
     if res.gate_side_mq4 {
         let xr = x_rot_local.expect("gate_side_mq4 implies x_rot_local");
         hip!(gpu.fused_qkvza_hfq4g256(
-            &p.router.buf, &p.shared_expert_gate.buf,
-            &p.shared_gate_w.buf, &p.shared_up_w.buf,
+            &p.router.buf,
+            &p.shared_expert_gate.buf,
+            &p.shared_gate_w.buf,
+            &p.shared_up_w.buf,
             xr,
-            p.router_logits, p.scalar_buf,
-            &shared_gate, &shared_up,
-            p.router.m, p.shared_expert_gate.m, p.shared_gate_w.m, p.shared_up_w.m,
+            p.router_logits,
+            p.scalar_buf,
+            &shared_gate,
+            &shared_up,
+            p.router.m,
+            p.shared_expert_gate.m,
+            p.shared_gate_w.m,
+            p.shared_up_w.m,
             p.router.k,
         ))?;
     } else {
         static GEMV_GATE: OnceLock<GemvFamily> = OnceLock::new();
         let gemv = GEMV_GATE.get_or_init(GemvFamily::new);
-        gemv.run_auto(ctx, gpu, &p.router,            p.x_norm, p.router_logits).map_err(|e| DispatchError::Hip(e.to_string()))?;
-        gemv.run_auto(ctx, gpu, &p.shared_expert_gate,p.x_norm, p.scalar_buf).map_err(|e| DispatchError::Hip(e.to_string()))?;
-        gemv.run_auto(ctx, gpu, &p.shared_gate_w,     p.x_norm, &shared_gate).map_err(|e| DispatchError::Hip(e.to_string()))?;
-        gemv.run_auto(ctx, gpu, &p.shared_up_w,       p.x_norm, &shared_up).map_err(|e| DispatchError::Hip(e.to_string()))?;
+        gemv.run_auto(ctx, gpu, &p.router, p.x_norm, p.router_logits)
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        gemv.run_auto(ctx, gpu, &p.shared_expert_gate, p.x_norm, p.scalar_buf)
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        gemv.run_auto(ctx, gpu, &p.shared_gate_w, p.x_norm, &shared_gate)
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        gemv.run_auto(ctx, gpu, &p.shared_up_w, p.x_norm, &shared_up)
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
     }
 
     // ── Top-K + routed experts: CPU-top-K generic fallback ───────────────────
@@ -315,7 +358,11 @@ pub fn run_moe_decode(
             if let Ok(all) = gpu.download_f32(p.router_logits) {
                 use std::io::Write;
                 let path = format!("{dump_path}.router_raw_p");
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
                     let _ = f.write_all(&(0u32).to_le_bytes());
                     for v in &all[..all.len().min(p.n_exp * 4 / 4)] {
                         let _ = f.write_all(&v.to_le_bytes());
@@ -325,7 +372,13 @@ pub fn run_moe_decode(
         }
     }
     hip!(gpu.softmax_f32(p.router_logits))?;
-    hip!(gpu.moe_topk_renorm_k8(p.router_logits, p.topk_indices, p.topk_weights, p.n_exp, p.norm_topk_prob))?;
+    hip!(gpu.moe_topk_renorm_k8(
+        p.router_logits,
+        p.topk_indices,
+        p.topk_weights,
+        p.n_exp,
+        p.norm_topk_prob
+    ))?;
 
     // ── Shared expert down ───────────────────────────────────────────────────
     // EP: on rank>0 `skip_shared` is set so the replicated shared expert is
@@ -336,19 +389,31 @@ pub fn run_moe_decode(
     if !p.skip_shared {
         if p.shared_down_w.dtype == DType::MQ4G256 {
             hip!(gpu.ensure_mq_signs())?;
-            let x_rot_alias = unsafe { GpuTensor {
-                buf: gpu.mq_x_rot.as_ref().unwrap().buf.alias(),
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            }};
+            let x_rot_alias = unsafe {
+                GpuTensor {
+                    buf: gpu.mq_x_rot.as_ref().unwrap().buf.alias(),
+                    shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                    dtype: DType::F32,
+                }
+            };
             if let Some(awq) = p.shared_down_w.awq_scale {
-                hip!(gpu.fused_silu_mul_rotate_mq_awq(&shared_gate, &shared_up, awq, &x_rot_alias, p.smi))?;
+                hip!(gpu.fused_silu_mul_rotate_mq_awq(
+                    &shared_gate,
+                    &shared_up,
+                    awq,
+                    &x_rot_alias,
+                    p.smi
+                ))?;
             } else {
                 hip!(gpu.fused_silu_mul_rotate_mq(&shared_gate, &shared_up, &x_rot_alias, p.smi))?;
             }
             hip!(gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu(
-                &p.shared_down_w.buf, &x_rot_alias, out_target, p.scalar_buf,
-                p.shared_down_w.m, p.shared_down_w.k,
+                &p.shared_down_w.buf,
+                &x_rot_alias,
+                out_target,
+                p.scalar_buf,
+                p.shared_down_w.m,
+                p.shared_down_w.k,
             ))?;
         } else {
             // Non-MQ4 shared expert down: only reached when A3B shared expert
@@ -362,13 +427,16 @@ pub fn run_moe_decode(
                 hip!(gpu.silu_mul_f32(&shared_gate, &shared_up, &shared_hid))?;
                 static GEMV_DOWN: OnceLock<GemvFamily> = OnceLock::new();
                 let gemv = GEMV_DOWN.get_or_init(GemvFamily::new);
-                gemv.run_auto(ctx, gpu, &p.shared_down_w, &shared_hid, p.ffn_out).map_err(|e| DispatchError::Hip(e.to_string()))?;
+                gemv.run_auto(ctx, gpu, &p.shared_down_w, &shared_hid, p.ffn_out)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
                 hip!(gpu.scaled_add_inplace_gpu_scalar_f32(out_target, p.ffn_out, p.scalar_buf))?;
             }
             #[cfg(not(feature = "deltanet"))]
             return Err(DispatchError::UnsupportedVariant {
-                family: "moe", variant: "shared-down-non-mq4-requires-deltanet",
-                arch: "", quant: "",
+                family: "moe",
+                variant: "shared-down-non-mq4-requires-deltanet",
+                arch: "",
+                quant: "",
             });
         }
     }
@@ -379,58 +447,105 @@ pub fn run_moe_decode(
     }
     let xr = x_rot_local.expect("use_gpu_topk implies x_rot_local is Some");
     let gate_up_k = p.routed_gate_up_k;
-    let down_m    = p.routed_down_m;
-    let down_k    = p.routed_down_k;
+    let down_m = p.routed_down_m;
+    let down_k = p.routed_down_k;
 
     if res.routed_indexable_mq4 {
         hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
-            p.expert_gate_up_ptrs, p.topk_indices, xr,
-            p.gate_batch, p.up_batch, 2 * p.mi, gate_up_k,
+            p.expert_gate_up_ptrs,
+            p.topk_indices,
+            xr,
+            p.gate_batch,
+            p.up_batch,
+            2 * p.mi,
+            gate_up_k,
         ))?;
     } else if res.routed_indexable_mq6 {
         hip!(gpu.gemv_hfq6g256_moe_gate_up_k8_indexed(
-            p.expert_gate_up_ptrs, p.topk_indices, xr,
-            p.gate_batch, p.up_batch, 2 * p.mi, gate_up_k,
+            p.expert_gate_up_ptrs,
+            p.topk_indices,
+            xr,
+            p.gate_batch,
+            p.up_batch,
+            2 * p.mi,
+            gate_up_k,
         ))?;
     } else {
         // routed_indexable_paro
         hip!(gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed(
-            p.expert_gate_up_ptrs, p.topk_indices, xr,
-            p.gate_batch, p.up_batch, 2 * p.mi, gate_up_k,
+            p.expert_gate_up_ptrs,
+            p.topk_indices,
+            xr,
+            p.gate_batch,
+            p.up_batch,
+            2 * p.mi,
+            gate_up_k,
         ))?;
     }
 
     // Gate→down: fused silu+mul+rotate
     if res.routed_indexable_paro {
-        let paro_down = p.routed_down_paro.as_ref()
+        let paro_down = p
+            .routed_down_paro
+            .as_ref()
             .expect("routed_indexable_paro implies down paro sidecar");
         hip!(gpu.fused_silu_mul_givens_rotate_f32(
-            p.gate_batch, p.up_batch, p.rot_batch,
-            &paro_down.pairs, &paro_down.theta, &paro_down.scales,
-            p.k, p.mi, paro_down.krot,
+            p.gate_batch,
+            p.up_batch,
+            p.rot_batch,
+            &paro_down.pairs,
+            &paro_down.theta,
+            &paro_down.scales,
+            p.k,
+            p.mi,
+            paro_down.krot,
         ))?;
     } else {
         // MQ4/MQ6: no AWQ on expert down weights for Phase 1 targets (A3B)
-        hip!(gpu.fused_silu_mul_rotate_mq_batched(p.gate_batch, p.up_batch, p.rot_batch, p.mi, p.k))?;
+        hip!(gpu.fused_silu_mul_rotate_mq_batched(
+            p.gate_batch,
+            p.up_batch,
+            p.rot_batch,
+            p.mi,
+            p.k
+        ))?;
     }
 
     // Expanded write
     // FIXME(Step 8): replace hardcoded 1 with p.batch_size when grouped prefill lands
     if res.routed_indexable_mq4 {
         hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-            p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
-            down_m, down_k, p.k, 1,
+            p.expert_down_ptrs,
+            p.topk_indices,
+            p.rot_batch,
+            p.down_expanded,
+            down_m,
+            down_k,
+            p.k,
+            1,
         ))?;
     } else if res.routed_indexable_mq6 {
         hip!(gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
-            p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
-            down_m, down_k, p.k, 1,
+            p.expert_down_ptrs,
+            p.topk_indices,
+            p.rot_batch,
+            p.down_expanded,
+            down_m,
+            down_k,
+            p.k,
+            1,
         ))?;
     } else {
         // paro
         hip!(gpu.gemv_paro_q4g128_moe_down_k8_indexed_batched(
-            p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
-            down_m, down_k, p.k, 1,
+            p.expert_down_ptrs,
+            p.topk_indices,
+            p.rot_batch,
+            p.down_expanded,
+            down_m,
+            down_k,
+            p.k,
+            1,
         ))?;
     }
 
@@ -439,7 +554,14 @@ pub fn run_moe_decode(
     // `routed_out` is set, else `x_residual`). Under EP each rank's non-owned
     // experts read zeroed weights (load-time dummy-fill) → contribute 0, so the
     // all-reduced sum of partials equals the full single-GPU combine.
-    hip!(gpu.moe_down_combine_k8_batched(p.down_expanded, p.topk_weights, out_target, down_m, p.k, 1))?;
+    hip!(gpu.moe_down_combine_k8_batched(
+        p.down_expanded,
+        p.topk_weights,
+        out_target,
+        down_m,
+        p.k,
+        1
+    ))?;
 
     Ok(())
 }
@@ -471,7 +593,9 @@ fn run_moe_decode_cpu_fallback(
     shared_up: &GpuTensor,
 ) -> Result<(), DispatchError> {
     macro_rules! hip {
-        ($e:expr) => { $e.map_err(|e| DispatchError::Hip(e.to_string())) };
+        ($e:expr) => {
+            $e.map_err(|e| DispatchError::Hip(e.to_string()))
+        };
     }
 
     // EP (Ship 6 substrate-EP) is not wired through the generic CPU-top-K
@@ -493,8 +617,10 @@ fn run_moe_decode_cpu_fallback(
     // only the indexed GPU-top-K path is supported — same invariant as master.
     if p.routed_experts.is_empty() {
         return Err(DispatchError::UnsupportedVariant {
-            family: "moe", variant: "cpu-topk-fallback-needs-resident-experts",
-            arch: "", quant: "",
+            family: "moe",
+            variant: "cpu-topk-fallback-needs-resident-experts",
+            arch: "",
+            quant: "",
         });
     }
 
@@ -506,8 +632,10 @@ fn run_moe_decode_cpu_fallback(
     // No known model violates k ∈ [1, n_exp], but Step 8 brings new families.
     if k == 0 || k > n_exp {
         return Err(DispatchError::UnsupportedVariant {
-            family: "moe", variant: "cpu-topk-k-out-of-range",
-            arch: "", quant: "",
+            family: "moe",
+            variant: "cpu-topk-k-out-of-range",
+            arch: "",
+            quant: "",
         });
     }
 
@@ -516,36 +644,54 @@ fn run_moe_decode_cpu_fallback(
     let probs = hip!(gpu.download_f32(p.router_logits))?;
     let mut indices: Vec<usize> = (0..n_exp).collect();
     indices.select_nth_unstable_by(k - 1, |&a, &b| {
-        probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
+        probs[b]
+            .partial_cmp(&probs[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut topk_indices: Vec<usize> = indices.into_iter().take(k).collect();
     topk_indices.sort_by(|&a, &b| {
-        probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
+        probs[b]
+            .partial_cmp(&probs[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut topk_weights: Vec<f32> = topk_indices.iter().map(|&i| probs[i]).collect();
     if p.norm_topk_prob {
         let sum: f32 = topk_weights.iter().sum();
         if sum > 0.0 {
-            for w in topk_weights.iter_mut() { *w /= sum; }
+            for w in topk_weights.iter_mut() {
+                *w /= sum;
+            }
         }
     }
 
     // ── 3. Shared-expert down (identical to the GPU-top-K shared-down block) ──
     if p.shared_down_w.dtype == DType::MQ4G256 {
         hip!(gpu.ensure_mq_signs())?;
-        let x_rot_alias = unsafe { GpuTensor {
-            buf: gpu.mq_x_rot.as_ref().unwrap().buf.alias(),
-            shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-            dtype: DType::F32,
-        }};
+        let x_rot_alias = unsafe {
+            GpuTensor {
+                buf: gpu.mq_x_rot.as_ref().unwrap().buf.alias(),
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            }
+        };
         if let Some(awq) = p.shared_down_w.awq_scale {
-            hip!(gpu.fused_silu_mul_rotate_mq_awq(shared_gate, shared_up, awq, &x_rot_alias, p.smi))?;
+            hip!(gpu.fused_silu_mul_rotate_mq_awq(
+                shared_gate,
+                shared_up,
+                awq,
+                &x_rot_alias,
+                p.smi
+            ))?;
         } else {
             hip!(gpu.fused_silu_mul_rotate_mq(shared_gate, shared_up, &x_rot_alias, p.smi))?;
         }
         hip!(gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu(
-            &p.shared_down_w.buf, &x_rot_alias, p.x_residual, p.scalar_buf,
-            p.shared_down_w.m, p.shared_down_w.k,
+            &p.shared_down_w.buf,
+            &x_rot_alias,
+            p.x_residual,
+            p.scalar_buf,
+            p.shared_down_w.m,
+            p.shared_down_w.k,
         ))?;
     } else {
         #[cfg(feature = "deltanet")]
@@ -560,8 +706,10 @@ fn run_moe_decode_cpu_fallback(
         }
         #[cfg(not(feature = "deltanet"))]
         return Err(DispatchError::UnsupportedVariant {
-            family: "moe", variant: "shared-down-non-mq4-requires-deltanet",
-            arch: "", quant: "",
+            family: "moe",
+            variant: "shared-down-non-mq4-requires-deltanet",
+            arch: "",
+            quant: "",
         });
     }
 
@@ -606,32 +754,52 @@ pub fn run_moe_decode_bias_aware(
     p: &crate::families::moe::MoeBiasAwareParams,
 ) -> Result<(), DispatchError> {
     macro_rules! hip {
-        ($e:expr) => { $e.map_err(|e| DispatchError::Hip(e.to_string())) };
+        ($e:expr) => {
+            $e.map_err(|e| DispatchError::Hip(e.to_string()))
+        };
     }
     if p.batch_size != 1 {
         return Err(DispatchError::UnsupportedVariant {
-            family: "moe", variant: "bias-aware-decode-requires-batch-1",
-            arch: "", quant: "",
+            family: "moe",
+            variant: "bias-aware-decode-requires-batch-1",
+            arch: "",
+            quant: "",
         });
     }
 
     // 1. Bias-aware top-K: select on (scores + bias), weight on the unbiased
     //    scores, normalize, then fold in route_scale — all in one launch.
     hip!(gpu.deepseek4_moe_topk_bias_aware_f32(
-        p.scores, p.gate_bias, p.topk_indices, p.topk_weights,
-        p.n_exp as i32, p.k_top as i32, p.route_scale,
+        p.scores,
+        p.gate_bias,
+        p.topk_indices,
+        p.topk_weights,
+        p.n_exp as i32,
+        p.k_top as i32,
+        p.route_scale,
     ))?;
 
     // 2. Indexed MQ2-Lloyd gate_up: all k_top experts in one launch
     //    (M = 2*mi; the kernel splits rows r<mi → gate, r>=mi → up).
     hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
-        p.expert_gate_up_ptrs, p.topk_indices, p.x_rot,
-        p.gate_batch, p.up_batch, 2 * p.mi, p.hidden, p.k_top,
+        p.expert_gate_up_ptrs,
+        p.topk_indices,
+        p.x_rot,
+        p.gate_batch,
+        p.up_batch,
+        2 * p.mi,
+        p.hidden,
+        p.k_top,
     ))?;
 
     // 3. Batched silu·mul·clamp (in-place into gate_batch) then batched FWHT rotate.
     hip!(gpu.deepseek4_silu_mul_clamp_f32_batched(
-        p.gate_batch, p.up_batch, p.gate_batch, p.mi, p.k_top, p.swiglu_limit,
+        p.gate_batch,
+        p.up_batch,
+        p.gate_batch,
+        p.mi,
+        p.k_top,
+        p.swiglu_limit,
     ))?;
     hip!(gpu.rotate_x_mq_batched(p.gate_batch, p.rot_batch, p.mi, p.k_top))?;
 
@@ -639,21 +807,39 @@ pub fn run_moe_decode_bias_aware(
     //    write + fixed-order non-atomic combine into ffn_out — bit-reproducible
     //    for greedy/spec-decode. MOE_DETERMINISTIC=0 uses the faster
     //    atomicAdd-fused path (nondeterministic; bench only).
-    let deterministic =
-        std::env::var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
+    let deterministic = std::env::var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
     if deterministic {
         hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
-            p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
-            p.hidden, p.mi, p.k_top, 1,
+            p.expert_down_ptrs,
+            p.topk_indices,
+            p.rot_batch,
+            p.down_expanded,
+            p.hidden,
+            p.mi,
+            p.k_top,
+            1,
         ))?;
         hip!(gpu.moe_down_combine_k8_batched(
-            p.down_expanded, p.topk_weights, p.ffn_out, p.hidden, p.k_top, 1,
+            p.down_expanded,
+            p.topk_weights,
+            p.ffn_out,
+            p.hidden,
+            p.k_top,
+            1,
         ))?;
     } else {
-        hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
-            p.expert_down_ptrs, p.topk_indices, p.topk_weights, p.rot_batch,
-            p.ffn_out, p.hidden, p.mi, p.k_top,
-        ))?;
+        hip!(
+            gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.topk_weights,
+                p.rot_batch,
+                p.ffn_out,
+                p.hidden,
+                p.mi,
+                p.k_top,
+            )
+        )?;
     }
 
     Ok(())
@@ -721,13 +907,90 @@ fn dispatch_grouped_lloyd(
 ) -> Result<(), DispatchError> {
     use GroupedLloydVariant as V;
     let r = match variant {
-        V::N32 => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(ptrs, tile_ids, slot_index, x, y, m, k, x_row_div, m_total_max, rows),
-        V::Cnd => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_cnd(ptrs, tile_ids, slot_index, x, y, m, k, x_row_div, m_total_max, rows),
-        V::EightW => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2(ptrs, tile_ids, slot_index, x, y, m, k, x_row_div, m_total_max, rows),
-        V::Nosync => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync(ptrs, tile_ids, slot_index, x, y, m, k, x_row_div, m_total_max, rows),
-        V::Mmqload => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload(ptrs, tile_ids, slot_index, x, y, m, k, x_row_div, m_total_max, rows),
-        V::Lloyd4w => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(ptrs, tile_ids, slot_index, x, y, m, k, x_row_div, m_total_max, rows),
-        V::Base => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(ptrs, tile_ids, slot_index, x, y, m, k, x_row_div, m_total_max, rows),
+        V::N32 => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(
+            ptrs,
+            tile_ids,
+            slot_index,
+            x,
+            y,
+            m,
+            k,
+            x_row_div,
+            m_total_max,
+            rows,
+        ),
+        V::Cnd => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_cnd(
+            ptrs,
+            tile_ids,
+            slot_index,
+            x,
+            y,
+            m,
+            k,
+            x_row_div,
+            m_total_max,
+            rows,
+        ),
+        V::EightW => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2(
+            ptrs,
+            tile_ids,
+            slot_index,
+            x,
+            y,
+            m,
+            k,
+            x_row_div,
+            m_total_max,
+            rows,
+        ),
+        V::Nosync => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync(
+            ptrs,
+            tile_ids,
+            slot_index,
+            x,
+            y,
+            m,
+            k,
+            x_row_div,
+            m_total_max,
+            rows,
+        ),
+        V::Mmqload => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload(
+            ptrs,
+            tile_ids,
+            slot_index,
+            x,
+            y,
+            m,
+            k,
+            x_row_div,
+            m_total_max,
+            rows,
+        ),
+        V::Lloyd4w => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
+            ptrs,
+            tile_ids,
+            slot_index,
+            x,
+            y,
+            m,
+            k,
+            x_row_div,
+            m_total_max,
+            rows,
+        ),
+        V::Base => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
+            ptrs,
+            tile_ids,
+            slot_index,
+            x,
+            y,
+            m,
+            k,
+            x_row_div,
+            m_total_max,
+            rows,
+        ),
     };
     r.map_err(|e| DispatchError::Hip(e.to_string()))
 }
@@ -743,7 +1006,9 @@ pub fn run_moe_prefill_bias_aware(
 ) -> Result<(), DispatchError> {
     use crate::families::moe::MoePrefillRouting;
     macro_rules! hip {
-        ($e:expr) => { $e.map_err(|e| DispatchError::Hip(e.to_string())) };
+        ($e:expr) => {
+            $e.map_err(|e| DispatchError::Hip(e.to_string()))
+        };
     }
     let (hidden, im, n_exp, k_top, batch_size) = (p.hidden, p.mi, p.n_exp, p.k_top, p.batch_size);
 
@@ -751,16 +1016,27 @@ pub fn run_moe_prefill_bias_aware(
     match &p.routing {
         MoePrefillRouting::Hash { tid2eid, tokens } => {
             hip!(gpu.hash_router_normalize_f32_batched(
-                tid2eid, p.scores, tokens,
-                p.topk_indices, p.topk_weights,
-                n_exp as i32, k_top as i32, p.route_scale, batch_size as i32,
+                tid2eid,
+                p.scores,
+                tokens,
+                p.topk_indices,
+                p.topk_weights,
+                n_exp as i32,
+                k_top as i32,
+                p.route_scale,
+                batch_size as i32,
             ))?;
         }
         MoePrefillRouting::BiasAware { gate_bias } => {
             hip!(gpu.deepseek4_moe_topk_bias_aware_batched_f32(
-                p.scores, gate_bias,
-                p.topk_indices, p.topk_weights,
-                n_exp as i32, k_top as i32, p.route_scale, batch_size as i32,
+                p.scores,
+                gate_bias,
+                p.topk_indices,
+                p.topk_weights,
+                n_exp as i32,
+                k_top as i32,
+                p.route_scale,
+                batch_size as i32,
             ))?;
         }
     }
@@ -774,13 +1050,19 @@ pub fn run_moe_prefill_bias_aware(
         for i in 0..n {
             indices.push(raw[i].to_bits() as i32);
         }
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
             .map_err(|e| DispatchError::Hip(format!("dump_topk open {path}: {e:?}")))?;
         let header = [p.layer_idx as i32, batch_size as i32, k_top as i32];
         let header_bytes = unsafe { std::slice::from_raw_parts(header.as_ptr() as *const u8, 12) };
-        f.write_all(header_bytes).map_err(|e| DispatchError::Hip(format!("dump_topk header: {e:?}")))?;
-        let data_bytes = unsafe { std::slice::from_raw_parts(indices.as_ptr() as *const u8, indices.len() * 4) };
-        f.write_all(data_bytes).map_err(|e| DispatchError::Hip(format!("dump_topk data: {e:?}")))?;
+        f.write_all(header_bytes)
+            .map_err(|e| DispatchError::Hip(format!("dump_topk header: {e:?}")))?;
+        let data_bytes =
+            unsafe { std::slice::from_raw_parts(indices.as_ptr() as *const u8, indices.len() * 4) };
+        f.write_all(data_bytes)
+            .map_err(|e| DispatchError::Hip(format!("dump_topk data: {e:?}")))?;
     }
 
     // ── Grouped vs scalar gate ────────────────────────────────────────────────
@@ -810,19 +1092,44 @@ pub fn run_moe_prefill_bias_aware(
 
         // Scatter: histogram + offsets + permute (single launch).
         hip!(gpu.moe_scatter_fused_k8(
-            p.topk_indices, p.expert_token_counts, p.expert_offsets,
-            p.sorted_slot_index, p.expert_tile_ids, p.inverse_perm,
-            batch_size * k_top, n_exp, m_total_max, BLOCK_M,
+            p.topk_indices,
+            p.expert_token_counts,
+            p.expert_offsets,
+            p.sorted_slot_index,
+            p.expert_tile_ids,
+            p.inverse_perm,
+            batch_size * k_top,
+            n_exp,
+            m_total_max,
+            BLOCK_M,
         ))?;
 
         // Grouped gate_up GEMM (M=2*im, K=hidden, x_row_div=k_top, rows=B).
-        let use_lloyd_4w_gu = lloyd_4w_base.unwrap_or(arch_4w) && (2 * im) % 64 == 0 && hidden % 256 == 0;
+        let use_lloyd_4w_gu =
+            lloyd_4w_base.unwrap_or(arch_4w) && (2 * im) % 64 == 0 && hidden % 256 == 0;
         let use_mmqload_gu = use_lloyd_4w_gu && mmqload_env;
         let use_nosync_gu = use_mmqload_gu && nosync_env;
-        let v_gu = select_grouped_lloyd_variant(use_lloyd_4w_gu, n32, cnd, eightw, use_mmqload_gu, use_nosync_gu);
+        let v_gu = select_grouped_lloyd_variant(
+            use_lloyd_4w_gu,
+            n32,
+            cnd,
+            eightw,
+            use_mmqload_gu,
+            use_nosync_gu,
+        );
         dispatch_grouped_lloyd(
-            gpu, v_gu, p.expert_gate_up_ptrs, p.expert_tile_ids, p.sorted_slot_index,
-            p.x_rot, p.y_gate_up_grouped, 2 * im, hidden, k_top, m_total_max, batch_size,
+            gpu,
+            v_gu,
+            p.expert_gate_up_ptrs,
+            p.expert_tile_ids,
+            p.sorted_slot_index,
+            p.x_rot,
+            p.y_gate_up_grouped,
+            2 * im,
+            hidden,
+            k_top,
+            m_total_max,
+            batch_size,
         )?;
 
         // Unscatter + SwiGLU·clamp.
@@ -831,16 +1138,31 @@ pub fn run_moe_prefill_bias_aware(
             .unwrap_or(false);
         if use_fused_unscatter_silu {
             hip!(gpu.moe_unscatter_silu_clamp_k8(
-                p.y_gate_up_grouped, p.sorted_slot_index, p.gate_batch,
-                im, k_top, m_total_max, p.swiglu_limit,
+                p.y_gate_up_grouped,
+                p.sorted_slot_index,
+                p.gate_batch,
+                im,
+                k_top,
+                m_total_max,
+                p.swiglu_limit,
             ))?;
         } else {
             hip!(gpu.moe_gate_up_unscatter_k8(
-                p.y_gate_up_grouped, p.sorted_slot_index, p.gate_batch, p.up_batch,
-                im, k_top, m_total_max,
+                p.y_gate_up_grouped,
+                p.sorted_slot_index,
+                p.gate_batch,
+                p.up_batch,
+                im,
+                k_top,
+                m_total_max,
             ))?;
             hip!(gpu.deepseek4_silu_mul_clamp_f32_batched(
-                p.gate_batch, p.up_batch, p.gate_batch, im, batch_size * k_top, p.swiglu_limit,
+                p.gate_batch,
+                p.up_batch,
+                p.gate_batch,
+                im,
+                batch_size * k_top,
+                p.swiglu_limit,
             ))?;
         }
 
@@ -851,25 +1173,61 @@ pub fn run_moe_prefill_bias_aware(
         let use_lloyd_4w_dn = lloyd_4w_base.unwrap_or(arch_4w) && hidden % 64 == 0 && im % 256 == 0;
         let use_mmqload_dn = use_lloyd_4w_dn && mmqload_env;
         let use_nosync_dn = use_mmqload_dn && nosync_env;
-        let v_dn = select_grouped_lloyd_variant(use_lloyd_4w_dn, n32, cnd, eightw, use_mmqload_dn, use_nosync_dn);
+        let v_dn = select_grouped_lloyd_variant(
+            use_lloyd_4w_dn,
+            n32,
+            cnd,
+            eightw,
+            use_mmqload_dn,
+            use_nosync_dn,
+        );
         dispatch_grouped_lloyd(
-            gpu, v_dn, p.expert_down_ptrs, p.expert_tile_ids, p.sorted_slot_index,
-            p.rot_batch, p.y_down_grouped, hidden, im, 1, m_total_max, batch_size * k_top,
+            gpu,
+            v_dn,
+            p.expert_down_ptrs,
+            p.expert_tile_ids,
+            p.sorted_slot_index,
+            p.rot_batch,
+            p.y_down_grouped,
+            hidden,
+            im,
+            1,
+            m_total_max,
+            batch_size * k_top,
         )?;
 
         // Down-combine: weighted Σ over k_top slots, per (token, m), into ffn_out.
         hip!(gpu.moe_down_combine_grouped_k8(
-            p.y_down_grouped, p.inverse_perm, p.topk_weights, p.ffn_out,
-            hidden, k_top, batch_size,
+            p.y_down_grouped,
+            p.inverse_perm,
+            p.topk_weights,
+            p.ffn_out,
+            hidden,
+            k_top,
+            batch_size,
         ))?;
     } else {
         // ── Scalar K4 path (batch_size < gate, or grouped opt-out) ──
-        hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4(
-            p.expert_gate_up_ptrs, p.topk_indices, p.x_rot,
-            p.gate_batch, p.up_batch, 2 * im, hidden, k_top, batch_size,
-        ))?;
+        hip!(
+            gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4(
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                p.x_rot,
+                p.gate_batch,
+                p.up_batch,
+                2 * im,
+                hidden,
+                k_top,
+                batch_size,
+            )
+        )?;
         hip!(gpu.deepseek4_silu_mul_clamp_f32_batched(
-            p.gate_batch, p.up_batch, p.gate_batch, im, batch_size * k_top, p.swiglu_limit,
+            p.gate_batch,
+            p.up_batch,
+            p.gate_batch,
+            im,
+            batch_size * k_top,
+            p.swiglu_limit,
         ))?;
         hip!(gpu.rotate_x_mq_batched(p.gate_batch, p.rot_batch, im, batch_size * k_top))?;
 
@@ -879,17 +1237,37 @@ pub fn run_moe_prefill_bias_aware(
             std::env::var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
         if deterministic {
             hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
-                p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expert_outputs,
-                hidden, im, k_top, batch_size,
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.rot_batch,
+                p.down_expert_outputs,
+                hidden,
+                im,
+                k_top,
+                batch_size,
             ))?;
             hip!(gpu.moe_down_combine_k8_batched(
-                p.down_expert_outputs, p.topk_weights, p.ffn_out, hidden, k_top, batch_size,
+                p.down_expert_outputs,
+                p.topk_weights,
+                p.ffn_out,
+                hidden,
+                k_top,
+                batch_size,
             ))?;
         } else {
-            hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_batched_k4(
-                p.expert_down_ptrs, p.topk_indices, p.topk_weights, p.rot_batch, p.ffn_out,
-                hidden, im, k_top, batch_size,
-            ))?;
+            hip!(
+                gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_batched_k4(
+                    p.expert_down_ptrs,
+                    p.topk_indices,
+                    p.topk_weights,
+                    p.rot_batch,
+                    p.ffn_out,
+                    hidden,
+                    im,
+                    k_top,
+                    batch_size,
+                )
+            )?;
         }
     }
 
@@ -931,33 +1309,82 @@ fn dispatch_grouped_gemm(
     paro_i8_k8: bool,
 ) -> Result<(), DispatchError> {
     macro_rules! hip {
-        ($e:expr) => { $e.map_err(|e| DispatchError::Hip(e.to_string())) };
+        ($e:expr) => {
+            $e.map_err(|e| DispatchError::Hip(e.to_string()))
+        };
     }
     match dtype {
         DType::MQ4G256 => hip!(gpu.gemm_hfq4g256_moe_grouped_wmma_k2(
-            ptrs, tile_ids, sorted_slot_index, x, y, m, k, x_row_div, m_total, rows,
+            ptrs,
+            tile_ids,
+            sorted_slot_index,
+            x,
+            y,
+            m,
+            k,
+            x_row_div,
+            m_total,
+            rows,
         )),
         DType::MQ6G256 => hip!(gpu.gemm_hfq6g256_moe_grouped_wmma(
-            ptrs, tile_ids, sorted_slot_index, x, y, m, k, x_row_div, m_total, rows,
+            ptrs,
+            tile_ids,
+            sorted_slot_index,
+            x,
+            y,
+            m,
+            k,
+            x_row_div,
+            m_total,
+            rows,
         )),
         DType::ParoQ4G128 => {
             if paro_i8_k8 {
                 hip!(gpu.gemm_paro_q4g128_moe_grouped_mmq_k8_gfx1151(
-                    ptrs, tile_ids, sorted_slot_index, x, y, m, k, x_row_div, m_total, rows,
+                    ptrs,
+                    tile_ids,
+                    sorted_slot_index,
+                    x,
+                    y,
+                    m,
+                    k,
+                    x_row_div,
+                    m_total,
+                    rows,
                 ))
             } else if paro_i8 {
                 hip!(gpu.gemm_paro_q4g128_moe_grouped_mmq_gfx1151(
-                    ptrs, tile_ids, sorted_slot_index, x, y, m, k, x_row_div, m_total, rows,
+                    ptrs,
+                    tile_ids,
+                    sorted_slot_index,
+                    x,
+                    y,
+                    m,
+                    k,
+                    x_row_div,
+                    m_total,
+                    rows,
                 ))
             } else {
                 hip!(gpu.gemm_paro_q4g128_moe_grouped_wmma_k2(
-                    ptrs, tile_ids, sorted_slot_index, x, y, m, k, x_row_div, m_total, rows,
+                    ptrs,
+                    tile_ids,
+                    sorted_slot_index,
+                    x,
+                    y,
+                    m,
+                    k,
+                    x_row_div,
+                    m_total,
+                    rows,
                 ))
             }
         }
         _other => Err(DispatchError::UnsupportedVariant {
-            family: "moe", variant: "prefill-grouped-gemm-dtype",
-            arch: "", quant: "other",
+            family: "moe",
+            variant: "prefill-grouped-gemm-dtype",
+            arch: "",
+            quant: "other",
         }),
     }
 }
@@ -978,7 +1405,9 @@ pub fn run_moe_prefill(
 ) -> Result<(), DispatchError> {
     use crate::families::moe::MoePrefillResolution;
     macro_rules! hip {
-        ($e:expr) => { $e.map_err(|e| DispatchError::Hip(e.to_string())) };
+        ($e:expr) => {
+            $e.map_err(|e| DispatchError::Hip(e.to_string()))
+        };
     }
 
     let res = MoePrefillResolution::resolve(&p.dtypes, &ctx.arch, &ctx.flags);
@@ -1020,57 +1449,109 @@ pub fn run_moe_prefill(
         // Path 2: grouped-WMMA-GEMM. Paro gate_up Givens preamble in-line
         // (above the helper — D3).
         if res.paro_mode {
-            let paro = p.paro_gate_up.as_ref()
+            let paro = p
+                .paro_gate_up
+                .as_ref()
                 .expect("paro_mode implies paro_gate_up sidecar");
             hip!(gpu.givens_rotate_to(
-                p.x_norm_batch, p.x_rot_batch,
-                paro.pairs, paro.theta, paro.scales,
-                n, gate_up_k /* hidden dim */, paro.krot,
+                p.x_norm_batch,
+                p.x_rot_batch,
+                paro.pairs,
+                paro.theta,
+                paro.scales,
+                n,
+                gate_up_k, /* hidden dim */
+                paro.krot,
             ))?;
         }
         dispatch_grouped_gemm(
-            gpu, p.dtypes.routed_gate_up,
-            p.expert_gate_up_ptrs, p.expert_tile_ids, p.sorted_slot_index,
-            p.x_rot_batch, p.y_gate_up_grouped,
-            2 * mi, gate_up_k, k_top, path2_m_total, n,
-            res.use_paro_i8, res.use_paro_i8_k8,
+            gpu,
+            p.dtypes.routed_gate_up,
+            p.expert_gate_up_ptrs,
+            p.expert_tile_ids,
+            p.sorted_slot_index,
+            p.x_rot_batch,
+            p.y_gate_up_grouped,
+            2 * mi,
+            gate_up_k,
+            k_top,
+            path2_m_total,
+            n,
+            res.use_paro_i8,
+            res.use_paro_i8_k8,
         )?;
         // Stage 3 unscatter combine: Y_grouped → gate_batch + up_batch.
         hip!(gpu.moe_gate_up_unscatter_k8(
-            p.y_gate_up_grouped, p.sorted_slot_index,
-            p.gate_batch, p.up_batch,
-            mi, k_top, path2_m_total,
+            p.y_gate_up_grouped,
+            p.sorted_slot_index,
+            p.gate_batch,
+            p.up_batch,
+            mi,
+            k_top,
+            path2_m_total,
         ))?;
     } else {
         // Path 1 fallback: per-token indexed GEMV, batched over N tokens.
         if res.paro_mode {
-            let paro = p.paro_gate_up.as_ref()
+            let paro = p
+                .paro_gate_up
+                .as_ref()
                 .expect("paro_mode implies paro_gate_up sidecar");
             hip!(gpu.givens_rotate_to(
-                p.x_norm_batch, p.x_rot_batch,
-                paro.pairs, paro.theta, paro.scales,
-                n, gate_up_k, paro.krot,
+                p.x_norm_batch,
+                p.x_rot_batch,
+                paro.pairs,
+                paro.theta,
+                paro.scales,
+                n,
+                gate_up_k,
+                paro.krot,
             ))?;
             hip!(gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed_batched(
-                p.expert_gate_up_ptrs, p.topk_indices, p.x_rot_batch,
-                p.gate_batch, p.up_batch, 2 * mi, gate_up_k, k_top, n,
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                p.x_rot_batch,
+                p.gate_batch,
+                p.up_batch,
+                2 * mi,
+                gate_up_k,
+                k_top,
+                n,
             ))?;
         } else {
             // MQ4/MQ6 indexed batched GEMV (x_rot_batch is already FWHT-rotated
             // by the model).
             let gate_up_result = match p.dtypes.routed_gate_up {
                 DType::MQ4G256 => hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
-                    p.expert_gate_up_ptrs, p.topk_indices, p.x_rot_batch,
-                    p.gate_batch, p.up_batch, 2 * mi, gate_up_k, k_top, n,
+                    p.expert_gate_up_ptrs,
+                    p.topk_indices,
+                    p.x_rot_batch,
+                    p.gate_batch,
+                    p.up_batch,
+                    2 * mi,
+                    gate_up_k,
+                    k_top,
+                    n,
                 )),
                 DType::MQ6G256 => hip!(gpu.gemv_hfq6g256_moe_gate_up_k8_indexed_batched(
-                    p.expert_gate_up_ptrs, p.topk_indices, p.x_rot_batch,
-                    p.gate_batch, p.up_batch, 2 * mi, gate_up_k, k_top, n,
+                    p.expert_gate_up_ptrs,
+                    p.topk_indices,
+                    p.x_rot_batch,
+                    p.gate_batch,
+                    p.up_batch,
+                    2 * mi,
+                    gate_up_k,
+                    k_top,
+                    n,
                 )),
-                _other => return Err(DispatchError::UnsupportedVariant {
-                    family: "moe", variant: "prefill-gate-up-path1-dtype",
-                    arch: "", quant: "other",
-                }),
+                _other => {
+                    return Err(DispatchError::UnsupportedVariant {
+                        family: "moe",
+                        variant: "prefill-gate-up-path1-dtype",
+                        arch: "",
+                        quant: "other",
+                    })
+                }
             };
             gate_up_result?;
         }
@@ -1078,12 +1559,20 @@ pub fn run_moe_prefill(
 
     // ── SwiGLU + rotate over [N*K_TOP × mi] ────────────────────────────
     if res.paro_mode {
-        let paro = p.paro_down.as_ref()
+        let paro = p
+            .paro_down
+            .as_ref()
             .expect("paro_mode implies paro_down sidecar");
         hip!(gpu.fused_silu_mul_givens_rotate_f32(
-            p.gate_batch, p.up_batch, p.rot_batch,
-            paro.pairs, paro.theta, paro.scales,
-            total_slots, mi, paro.krot,
+            p.gate_batch,
+            p.up_batch,
+            p.rot_batch,
+            paro.pairs,
+            paro.theta,
+            paro.scales,
+            total_slots,
+            mi,
+            paro.krot,
         ))?;
     } else {
         // MQ4/MQ6: the silu+rotate kernel is weight-agnostic (reads only
@@ -1092,18 +1581,31 @@ pub fn run_moe_prefill(
             DType::MQ4G256 | DType::MQ6G256 => {
                 if let Some(awq) = p.down_awq_scale {
                     hip!(gpu.fused_silu_mul_rotate_mq_awq_batched(
-                        p.gate_batch, p.up_batch, awq, p.rot_batch, mi, total_slots,
+                        p.gate_batch,
+                        p.up_batch,
+                        awq,
+                        p.rot_batch,
+                        mi,
+                        total_slots,
                     ))?;
                 } else {
                     hip!(gpu.fused_silu_mul_rotate_mq_batched(
-                        p.gate_batch, p.up_batch, p.rot_batch, mi, total_slots,
+                        p.gate_batch,
+                        p.up_batch,
+                        p.rot_batch,
+                        mi,
+                        total_slots,
                     ))?;
                 }
             }
-            _other => return Err(DispatchError::UnsupportedVariant {
-                family: "moe", variant: "prefill-silu-rotate-dtype",
-                arch: "", quant: "other",
-            }),
+            _other => {
+                return Err(DispatchError::UnsupportedVariant {
+                    family: "moe",
+                    variant: "prefill-silu-rotate-dtype",
+                    arch: "",
+                    quant: "other",
+                })
+            }
         }
     }
 
@@ -1111,28 +1613,55 @@ pub fn run_moe_prefill(
     if res.use_path2 {
         // Path 2: grouped-WMMA-GEMM + non-atomic combine via inverse_perm.
         dispatch_grouped_gemm(
-            gpu, p.dtypes.routed_down,
-            p.expert_down_ptrs, p.expert_tile_ids, p.sorted_slot_index,
-            p.rot_batch, p.y_down_grouped,
-            down_m, down_k, 1 /* x_row_div */, path2_m_total, total_slots,
-            res.use_paro_i8, res.use_paro_i8_k8,
+            gpu,
+            p.dtypes.routed_down,
+            p.expert_down_ptrs,
+            p.expert_tile_ids,
+            p.sorted_slot_index,
+            p.rot_batch,
+            p.y_down_grouped,
+            down_m,
+            down_k,
+            1, /* x_row_div */
+            path2_m_total,
+            total_slots,
+            res.use_paro_i8,
+            res.use_paro_i8_k8,
         )?;
         hip!(gpu.moe_down_combine_grouped_k8(
-            p.y_down_grouped, p.inverse_perm, p.topk_weights, out_target,
-            down_m, k_top, n,
+            p.y_down_grouped,
+            p.inverse_perm,
+            p.topk_weights,
+            out_target,
+            down_m,
+            k_top,
+            n,
         ))?;
     } else if res.down_path0 {
         // Path 0: gfx9* wave64 — residual-scaled atomic GEMV (MQ4 only;
         // MQ6/Paro never reach here — their admit predicates require WMMA).
         let down_result = match p.dtypes.routed_down {
-            DType::MQ4G256 => hip!(gpu.gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched(
-                p.expert_down_ptrs, p.topk_indices, p.topk_weights, p.rot_batch, out_target,
-                down_m, down_k, k_top, n,
-            )),
-            _other => return Err(DispatchError::UnsupportedVariant {
-                family: "moe", variant: "prefill-down-path0-dtype",
-                arch: "", quant: "other",
-            }),
+            DType::MQ4G256 => hip!(
+                gpu.gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched(
+                    p.expert_down_ptrs,
+                    p.topk_indices,
+                    p.topk_weights,
+                    p.rot_batch,
+                    out_target,
+                    down_m,
+                    down_k,
+                    k_top,
+                    n,
+                )
+            ),
+            _other => {
+                return Err(DispatchError::UnsupportedVariant {
+                    family: "moe",
+                    variant: "prefill-down-path0-dtype",
+                    arch: "",
+                    quant: "other",
+                })
+            }
         };
         down_result?;
     } else {
@@ -1141,25 +1670,52 @@ pub fn run_moe_prefill(
         // (gfx12 via env override); the Gpu method exists.
         let down_result = match p.dtypes.routed_down {
             DType::MQ4G256 => hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-                p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
-                down_m, down_k, k_top, n,
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.rot_batch,
+                p.down_expanded,
+                down_m,
+                down_k,
+                k_top,
+                n,
             )),
             DType::MQ6G256 => hip!(gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
-                p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
-                down_m, down_k, k_top, n,
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.rot_batch,
+                p.down_expanded,
+                down_m,
+                down_k,
+                k_top,
+                n,
             )),
             DType::ParoQ4G128 => hip!(gpu.gemv_paro_q4g128_moe_down_k8_indexed_batched(
-                p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
-                down_m, down_k, k_top, n,
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.rot_batch,
+                p.down_expanded,
+                down_m,
+                down_k,
+                k_top,
+                n,
             )),
-            _other => return Err(DispatchError::UnsupportedVariant {
-                family: "moe", variant: "prefill-down-path1-dtype",
-                arch: "", quant: "other",
-            }),
+            _other => {
+                return Err(DispatchError::UnsupportedVariant {
+                    family: "moe",
+                    variant: "prefill-down-path1-dtype",
+                    arch: "",
+                    quant: "other",
+                })
+            }
         };
         down_result?;
         hip!(gpu.moe_down_combine_k8_batched(
-            p.down_expanded, p.topk_weights, out_target, down_m, k_top, n,
+            p.down_expanded,
+            p.topk_weights,
+            out_target,
+            down_m,
+            k_top,
+            n,
         ))?;
     }
 
@@ -1177,11 +1733,14 @@ pub fn dispatch_fused(
         PipelineParams::Moe(p) => return run_moe_decode(ctx, gpu, p),
     };
     macro_rules! hip {
-        ($e:expr) => { $e.map_err(|e| DispatchError::Hip(e.to_string())) };
+        ($e:expr) => {
+            $e.map_err(|e| DispatchError::Hip(e.to_string()))
+        };
     }
     match key {
         KernelKey::GemvMfp4G32Fused => {
-            gpu.ensure_mq_signs().map_err(|e| DispatchError::Hip(e.to_string()))?;
+            gpu.ensure_mq_signs()
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
             let x_rot = unsafe {
                 GpuTensor {
                     buf: gpu.mq_x_rot.as_ref().unwrap().buf.alias(),
@@ -1194,8 +1753,10 @@ pub fn dispatch_fused(
             ))
         }
         _ => Err(DispatchError::UnsupportedVariant {
-            family: "pipeline_fused", variant: "unknown",
-            arch: "", quant: "",
+            family: "pipeline_fused",
+            variant: "unknown",
+            arch: "",
+            quant: "",
         }),
     }
 }

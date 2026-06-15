@@ -40,13 +40,13 @@ use crate::types::*;
 /// routed_* checks relied on).
 pub struct MoeDtypes {
     pub router: DType,
-    pub shared_gate: DType,          // ffn.shared_expert_gate
-    pub shared_expert_gate: DType,   // ffn.shared_expert.gate
-    pub shared_expert_up: DType,     // ffn.shared_expert.up
+    pub shared_gate: DType,        // ffn.shared_expert_gate
+    pub shared_expert_gate: DType, // ffn.shared_expert.gate
+    pub shared_expert_up: DType,   // ffn.shared_expert.up
     pub experts_all_gate_up_mq4: bool,
-    pub routed_gate_up: DType,       // ffn.experts[0].gate_up
-    pub routed_down: DType,          // ffn.experts[0].down
-    pub has_paro_shared: bool,       // ffn.paro_shared.is_some()
+    pub routed_gate_up: DType, // ffn.experts[0].gate_up
+    pub routed_down: DType,    // ffn.experts[0].down
+    pub has_paro_shared: bool, // ffn.paro_shared.is_some()
 }
 
 /// Resolved fused-vs-fallback eligibility for one MoE decode layer. This IS the
@@ -84,10 +84,8 @@ impl MoeResolution {
             routed_indexable_mq4 || routed_indexable_mq6 || routed_indexable_paro;
 
         let use_gpu_topk = k == 8 && routed_dtype_indexable;
-        let needs_x_rot_local = gate_side_mq4
-            || routed_gate_up_mq4
-            || routed_gate_up_mq6
-            || routed_gate_up_paro;
+        let needs_x_rot_local =
+            gate_side_mq4 || routed_gate_up_mq4 || routed_gate_up_mq6 || routed_gate_up_paro;
 
         Self {
             gate_side_mq4,
@@ -216,7 +214,7 @@ pub struct MoeBiasAwareParams<'a> {
     /// model's shared-expert step must have run first to seed this buffer.
     pub ffn_out: &'a GpuTensor,
     // router
-    pub scores: &'a GpuTensor,    // post-sqrt_softplus gate·x (weights use these)
+    pub scores: &'a GpuTensor, // post-sqrt_softplus gate·x (weights use these)
     pub gate_bias: &'a GpuTensor, // per-expert routing bias (selection only)
     // routed expert pointer tables
     pub expert_gate_up_ptrs: &'a GpuTensor,
@@ -242,7 +240,10 @@ pub enum MoePrefillRouting<'a> {
     BiasAware { gate_bias: &'a GpuTensor },
     /// Static `tid2eid` hash routing (layers `0..num_hash_layers`). `tokens` is
     /// the device-side `[B]` i32 token-id buffer.
-    Hash { tid2eid: &'a GpuTensor, tokens: &'a GpuTensor },
+    Hash {
+        tid2eid: &'a GpuTensor,
+        tokens: &'a GpuTensor,
+    },
 }
 
 /// Parameters for the deepseek4 batched/prefill MoE (k=6, MQ2-Lloyd). The
@@ -264,15 +265,15 @@ pub struct MoeBiasAwarePrefillParams<'a> {
     pub layer_idx: usize, // for the optional HIPFIRE_DEEPSEEK4_DUMP_TOPK header
     // routing
     pub routing: MoePrefillRouting<'a>,
-    pub scores: &'a GpuTensor,       // post-sqrt_softplus moe_scores_batch [B, n_exp]
+    pub scores: &'a GpuTensor, // post-sqrt_softplus moe_scores_batch [B, n_exp]
     pub topk_indices: &'a GpuTensor, // [B, k_top] (routing out, expert in)
     pub topk_weights: &'a GpuTensor, // [B, k_top]
     // routed expert pointer tables
     pub expert_gate_up_ptrs: &'a GpuTensor,
     pub expert_down_ptrs: &'a GpuTensor,
     // activation / residual
-    pub x_rot: &'a GpuTensor,        // ffn_x_rot_batch [B, hidden]
-    pub ffn_out: &'a GpuTensor,      // ffn_out_batch [B, hidden] (accumulate target)
+    pub x_rot: &'a GpuTensor,   // ffn_x_rot_batch [B, hidden]
+    pub ffn_out: &'a GpuTensor, // ffn_out_batch [B, hidden] (accumulate target)
     // grouped-path scratch
     pub expert_token_counts: &'a GpuTensor,
     pub expert_offsets: &'a GpuTensor,
@@ -397,18 +398,22 @@ impl MoePrefillResolution {
         // (no gfx11 variant yet). Fall back to Path 1 (indexed batched GEMV)
         // on gfx11 to avoid the gfx12-only kernel panic. Path 1 MQ6 indexed
         // kernels exist on all WMMA archs.
-        let mq6_on_non_gfx12 = d.routed_gate_up == DType::MQ6G256
-            && !(arch.is_gfx1200() || arch.is_gfx1201());
+        let mq6_on_non_gfx12 =
+            d.routed_gate_up == DType::MQ6G256 && !(arch.is_gfx1200() || arch.is_gfx1201());
         let use_path2 = use_path2 && !mq6_on_non_gfx12;
         // Path 0: gfx9* wave64 archs (gfx906/gfx908/gfx94x) — cheap HBM
         // atomics make the atomic GEMV pattern competitive vs expanded scratch.
         let down_path0 = arch.is_gcn5() || arch.is_cdna1() || arch.is_cdna3();
         let is_gfx1151 = arch.is_gfx1151();
-        let use_paro_i8 = paro_mode && use_path2 && is_gfx1151
-            && flags.moe_paro_i8.unwrap_or(true);
-        let use_paro_i8_k8 = use_paro_i8
-            && flags.moe_paro_i8_k8.unwrap_or(true);
-        Self { use_path2, down_path0, use_paro_i8, use_paro_i8_k8, paro_mode }
+        let use_paro_i8 = paro_mode && use_path2 && is_gfx1151 && flags.moe_paro_i8.unwrap_or(true);
+        let use_paro_i8_k8 = use_paro_i8 && flags.moe_paro_i8_k8.unwrap_or(true);
+        Self {
+            use_path2,
+            down_path0,
+            use_paro_i8,
+            use_paro_i8_k8,
+            paro_mode,
+        }
     }
 }
 
@@ -422,7 +427,9 @@ impl MoeFamily {
     pub fn new() -> Self {
         let mut registry = KernelRegistry::new();
         moe_table::populate(&mut registry);
-        registry.validate().expect("moe kernel table has empty entries");
+        registry
+            .validate()
+            .expect("moe kernel table has empty entries");
         Self { registry }
     }
 

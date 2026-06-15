@@ -12,7 +12,10 @@ fn main() {
     let hfq = HfqFile::open(Path::new(model)).expect("open model");
     match hfq.chat_template() {
         Some(t) => {
-            eprintln!("EMBEDDED chat_template present: {} bytes", t.as_bytes().len());
+            eprintln!(
+                "EMBEDDED chat_template present: {} bytes",
+                t.as_bytes().len()
+            );
             if let Some(out) = args.get(2) {
                 std::fs::write(out, t.as_bytes()).expect("write");
                 eprintln!("wrote {out}");
