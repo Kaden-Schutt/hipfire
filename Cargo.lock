@@ -898,7 +898,6 @@ dependencies = [
  "hipfire-coherence",
  "hipfire-evidence",
  "hipfire-model",
- "hipfire-runtime",
  "libc",
  "serde",
  "serde_json",
