@@ -5450,6 +5450,12 @@ fn daemon_generate_request(
     .with_worker_key_id(worker_key_id)
 }
 
+fn read_repo_prompt_text(prompt_path: &str) -> anyhow::Result<String> {
+    let prompt_file = resolve_repo_path(prompt_path)
+        .ok_or_else(|| anyhow::anyhow!("resolve {prompt_path} from repo root"))?;
+    fs::read_to_string(&prompt_file).map_err(|e| anyhow::anyhow!("read {prompt_path}: {e}"))
+}
+
 fn daemon_smoke_skip_rows(
     config: &EvalConfig,
     ctx: &EvalContext,
@@ -5484,7 +5490,7 @@ fn daemon_smoke_skip_rows(
             None,
             "multi_turn_reset_recall",
             None,
-            "daemon-backed multi-turn session is not implemented yet",
+            load_reason,
             config,
             ctx,
             prompt("benchmarks/prompts/trains-meet.txt"),
@@ -5534,20 +5540,6 @@ fn run_daemon_smoke_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResu
             for row in &mut rows {
                 row.elapsed_ms = elapsed_ms;
             }
-            rows.push(skip_row_with_metrics(
-                BatteryId::Smoke,
-                None,
-                "multi_turn_reset_recall",
-                None,
-                "daemon-backed multi-turn session is not implemented yet",
-                config,
-                ctx,
-                prompt("benchmarks/prompts/trains-meet.txt"),
-                BTreeMap::from([
-                    ("executor".to_string(), json!("daemon")),
-                    ("shared_model_loads".to_string(), json!(1)),
-                ]),
-            ));
             rows
         }
         Err(err) => vec![
@@ -5585,7 +5577,7 @@ fn run_daemon_smoke_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResu
                 None,
                 "multi_turn_reset_recall",
                 None,
-                "daemon-backed multi-turn session is not implemented yet",
+                "daemon-backed load failed before session reset/recall",
                 config,
                 ctx,
                 prompt("benchmarks/prompts/trains-meet.txt"),
@@ -5608,10 +5600,7 @@ async fn run_daemon_smoke_rows_async(
     let worker_key_id = loaded.worker_key_id.clone();
 
     let prompt_path = "benchmarks/prompts/qwen2_smoke.txt";
-    let prompt_file = resolve_repo_path(prompt_path)
-        .ok_or_else(|| anyhow::anyhow!("resolve {prompt_path} from repo root"))?;
-    let prompt_text =
-        fs::read_to_string(&prompt_file).map_err(|e| anyhow::anyhow!("read {prompt_path}: {e}"))?;
+    let prompt_text = read_repo_prompt_text(prompt_path)?;
     let request = daemon_generate_request(
         "eval-smoke-greedy".to_string(),
         prompt_text,
@@ -5628,6 +5617,53 @@ async fn run_daemon_smoke_rows_async(
     let decode_reason =
         (!finite).then(|| "daemon returned empty or replacement-character output".to_string());
 
+    let session_prompt_path = "benchmarks/prompts/trains-meet.txt";
+    let session_prompt_text = read_repo_prompt_text(session_prompt_path)?;
+    engine.reset().await?;
+    let first_session_request = daemon_generate_request(
+        "eval-smoke-session-fresh".to_string(),
+        session_prompt_text.clone(),
+        config.max_tokens,
+        Some(worker_key_id.clone()),
+    );
+    let (first_session_text, first_session_done) = engine.generate(first_session_request).await?;
+    let distractor_request = daemon_generate_request(
+        "eval-smoke-session-distractor".to_string(),
+        "Remember this unrelated code word for the next turn: orchid. Reply with only OK."
+            .to_string(),
+        config.max_tokens,
+        Some(worker_key_id.clone()),
+    );
+    let (distractor_text, distractor_done) = engine.generate(distractor_request).await?;
+    engine.reset().await?;
+    let second_session_request = daemon_generate_request(
+        "eval-smoke-session-reset".to_string(),
+        session_prompt_text,
+        config.max_tokens,
+        Some(worker_key_id.clone()),
+    );
+    let (second_session_text, second_session_done) =
+        engine.generate(second_session_request).await?;
+    let session_finite = !first_session_text.is_empty()
+        && !second_session_text.is_empty()
+        && !first_session_text.contains('\u{fffd}')
+        && !second_session_text.contains('\u{fffd}');
+    let session_match = first_session_text == second_session_text;
+    let session_status = if session_finite && session_match {
+        EvalStatus::Pass
+    } else {
+        EvalStatus::Fail
+    };
+    let session_reason = if !session_finite {
+        Some(
+            "daemon session reset smoke returned empty or replacement-character output".to_string(),
+        )
+    } else if !session_match {
+        Some("daemon repeated greedy session request produced different output".to_string())
+    } else {
+        None
+    };
+
     Ok(vec![
         row(
             BatteryId::Smoke,
@@ -5640,7 +5676,7 @@ async fn run_daemon_smoke_rows_async(
                 ("executor".to_string(), json!("daemon")),
                 ("daemon_bin".to_string(), json!(bin.display().to_string())),
                 ("shared_model_loads".to_string(), json!(1)),
-                ("worker_key_id".to_string(), json!(worker_key_id)),
+                ("worker_key_id".to_string(), json!(worker_key_id.clone())),
                 ("arch".to_string(), json!(loaded.arch)),
                 ("dim".to_string(), json!(loaded.dim)),
                 ("layers".to_string(), json!(loaded.layers)),
@@ -5662,7 +5698,7 @@ async fn run_daemon_smoke_rows_async(
             BTreeMap::from([
                 ("executor".to_string(), json!("daemon")),
                 ("shared_model_loads".to_string(), json!(1)),
-                ("worker_key_id".to_string(), json!(loaded.worker_key_id)),
+                ("worker_key_id".to_string(), json!(worker_key_id.clone())),
                 ("tokens".to_string(), json!(done.tokens)),
                 ("text_bytes".to_string(), json!(text.len())),
                 ("tok_s".to_string(), json!(done.tok_s)),
@@ -5672,6 +5708,51 @@ async fn run_daemon_smoke_rows_async(
             config,
             ctx,
             prompt(prompt_path),
+            0,
+        ),
+        row(
+            BatteryId::Smoke,
+            None,
+            "multi_turn_reset_recall",
+            None,
+            session_status,
+            session_reason,
+            BTreeMap::from([
+                ("executor".to_string(), json!("daemon")),
+                ("implemented".to_string(), json!(true)),
+                ("shared_model_loads".to_string(), json!(1)),
+                ("worker_key_id".to_string(), json!(worker_key_id)),
+                ("reset_count".to_string(), json!(2)),
+                ("kv_reset".to_string(), json!(true)),
+                ("dn_state_reset".to_string(), json!(true)),
+                ("session_turns".to_string(), json!(3)),
+                ("first_tokens".to_string(), json!(first_session_done.tokens)),
+                (
+                    "distractor_tokens".to_string(),
+                    json!(distractor_done.tokens),
+                ),
+                (
+                    "second_tokens".to_string(),
+                    json!(second_session_done.tokens),
+                ),
+                (
+                    "first_text_hash".to_string(),
+                    json!(stable_hash_bytes(first_session_text.as_bytes())),
+                ),
+                (
+                    "second_text_hash".to_string(),
+                    json!(stable_hash_bytes(second_session_text.as_bytes())),
+                ),
+                (
+                    "distractor_text_hash".to_string(),
+                    json!(stable_hash_bytes(distractor_text.as_bytes())),
+                ),
+                ("outputs_match".to_string(), json!(session_match)),
+                ("max_tokens".to_string(), json!(config.max_tokens)),
+            ]),
+            config,
+            ctx,
+            prompt(session_prompt_path),
             0,
         ),
     ])

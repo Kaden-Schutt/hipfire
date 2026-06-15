@@ -154,6 +154,21 @@ impl DaemonEngine {
         }
     }
 
+    /// Send `reset` and wait for the daemon to confirm state reset.
+    pub async fn reset(&mut self) -> anyhow::Result<()> {
+        self.send(&DaemonRequest::Reset).await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::Reset => return Ok(()),
+                DaemonResponse::Error(e) => anyhow::bail!("daemon reset error: {}", e.message),
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during reset: {other:?}");
+                }
+            }
+        }
+    }
+
     /// Send `ping` and wait for `pong`.
     pub async fn ping(&mut self) -> anyhow::Result<()> {
         self.send(&DaemonRequest::Ping).await?;
@@ -773,6 +788,12 @@ mod tests {
         let (text, done) = engine.generate(req).await.unwrap();
         assert_eq!(text, "hello world");
         assert_eq!(done.tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn reset_waits_for_reset_response() {
+        let mut engine = mock_engine(vec![DaemonResponse::Reset]);
+        engine.reset().await.unwrap();
     }
 
     #[test]

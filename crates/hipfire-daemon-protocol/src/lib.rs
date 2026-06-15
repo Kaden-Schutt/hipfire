@@ -14,6 +14,7 @@ use hipfire_model::{ModelLoadRequest, ModelLoadedResponse};
 pub enum DaemonRequest {
     Load(ModelLoadRequest),
     Unload,
+    Reset,
     Ping,
     Generate(GenerateTextRequest),
 }
@@ -23,6 +24,7 @@ pub enum DaemonRequest {
 pub enum DaemonResponse {
     Loaded(ModelLoadedResponse),
     Unloaded,
+    Reset,
     Pong,
     Token(TokenEvent),
     Done(DoneEvent),
@@ -106,6 +108,16 @@ mod tests {
         assert_eq!(req.messages.as_ref().unwrap()[0].role, Role::System);
         assert_eq!(req.sampling.top_p, Some(0.8));
         assert_eq!(req.worker_key_id.as_deref(), Some("worker-a"));
+    }
+
+    #[test]
+    fn reset_request_and_response_preserve_existing_wire_shape() {
+        let value = serde_json::to_value(DaemonRequest::Reset).unwrap();
+        assert_eq!(value, json!({"type": "reset"}));
+
+        let response: DaemonResponse =
+            serde_json::from_value(json!({"type": "reset", "seq_pos": 0})).unwrap();
+        assert!(matches!(response, DaemonResponse::Reset));
     }
 
     #[test]
