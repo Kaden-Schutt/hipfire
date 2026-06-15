@@ -463,6 +463,90 @@ mod tests {
         assert!(q < u2, "QTIP-2 must beat uniform-2 on real weights");
     }
 
+    /// C1d model-wide reconstruction gate (env-gated). Iterates EVERY large 2D
+    /// BF16 weight in the safetensors, FWHT-rotates, beam-encodes a sampled set
+    /// of groups per tensor, and reports aggregate QTIP-2 vs the 2-bit RD bound
+    /// and vs uniform-2 across the whole model — the strongest quality signal
+    /// reachable without the GPU forward (full PPL still needs C2).
+    ///   HIPFIRE_QTIP_EVAL_ST=<model.safetensors> cargo test -p hipfire-quantize \
+    ///       whole_model_quality_gate -- --nocapture
+    #[test]
+    fn whole_model_quality_gate() {
+        let path = match std::env::var("HIPFIRE_QTIP_EVAL_ST") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("skip whole_model_quality_gate (set HIPFIRE_QTIP_EVAL_ST)");
+                return;
+            }
+        };
+        let file = std::fs::File::open(&path).expect("open safetensors");
+        let mmap = unsafe { memmap2::Mmap::map(&file).expect("mmap") };
+        let hlen = u64::from_le_bytes(mmap[0..8].try_into().unwrap()) as usize;
+        let header: serde_json::Value =
+            serde_json::from_slice(&mmap[8..8 + hlen]).expect("parse header");
+        let data_base = 8 + hlen;
+        let cb = build_codebook();
+        let signs1 = crate::gen_fwht_signs(42, 256);
+        let signs2 = crate::gen_fwht_signs(1042, 256);
+        const GROUPS_PER_TENSOR: usize = 16; // sampled, evenly spaced
+
+        let (mut q_acc, mut u2_acc, mut bound_acc, mut groups, mut tensors) =
+            (0.0f64, 0.0f64, 0.0f64, 0usize, 0usize);
+        for (name, meta) in header.as_object().unwrap() {
+            if name == "__metadata__" || meta["dtype"].as_str() != Some("BF16") {
+                continue;
+            }
+            let shape = match meta["shape"].as_array() {
+                Some(s) if s.len() == 2 => s,
+                _ => continue,
+            };
+            let _ = shape;
+            let off: Vec<usize> = meta["data_offsets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
+            let n_weights = (off[1] - off[0]) / 2;
+            if n_weights < 256 {
+                continue;
+            }
+            let n_groups = n_weights / 256;
+            let bytes = &mmap[data_base + off[0]..data_base + off[1]];
+            let stride = (n_groups / GROUPS_PER_TENSOR).max(1);
+            tensors += 1;
+            for gi in (0..n_groups).step_by(stride).take(GROUPS_PER_TENSOR) {
+                let base = gi * 256 * 2;
+                let mut g = [0.0f32; 256];
+                for (j, slot) in g.iter_mut().enumerate() {
+                    let o = base + j * 2;
+                    *slot = f32::from_bits((u16::from_le_bytes([bytes[o], bytes[o + 1]]) as u32) << 16);
+                }
+                crate::cpu_fwht_256(&mut g, &signs1, &signs2);
+                let var = g.iter().map(|&w| (w as f64) * (w as f64)).sum::<f64>() / 256.0;
+                let sym = beam_encode_group(&g, group_scale(&g), &cb, 128);
+                let s = optimal_scale(&g, &sym, &cb);
+                q_acc += mse(&g, &decode_group(&sym, s, &cb));
+                u2_acc += mse(&g, &uniform_nbit_roundtrip(&g, 2));
+                bound_acc += var / 16.0;
+                groups += 1;
+            }
+        }
+        let (q, u2, bound) = (
+            q_acc / groups as f64,
+            u2_acc / groups as f64,
+            bound_acc / groups as f64,
+        );
+        eprintln!(
+            "QTIP whole-model gate: {tensors} tensors, {groups} groups (beam=128)\n  \
+             QTIP-2 MSE={q:.6}  uniform-2={u2:.6}  2-bit RD bound={bound:.6}\n  \
+             QTIP-2/uniform-2={:.3}  QTIP-2/bound={:.3} (1.0 = optimal 2-bit)",
+            q / u2,
+            q / bound,
+        );
+        assert!(q < u2, "QTIP-2 must beat uniform-2 model-wide");
+    }
+
     #[test]
     fn beam_encode_is_near_viterbi() {
         let cb = build_codebook();
