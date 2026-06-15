@@ -23,6 +23,7 @@ The target crates for modular boundaries remain:
 - `hipfire-generate`
 - `hipfire-coherence` (created; owns detector policy and report row serialization helpers)
 - `hipfire-rocm` (created; owns ROCm backend evidence contracts)
+- `hipfire-npu` (created; owns NPU opt-in artifact/admission contracts)
 - `hipfire-daemon-adapter` (created; owns daemon JSONL process-client adapter)
 - `hipfire-daemon-protocol` (created; owns daemon JSONL request/response contracts)
 - `hipfire-evidence` (created; owns evidence provenance, host-profile contracts/policy, and hash helpers)
@@ -75,6 +76,10 @@ Current CPU/backend boundary status:
 Current ROCm/backend boundary status:
 - `hipfire-rocm` owns ROCm device identity, backend-path classification, dense FFN/projection module execution evidence, and JSON rendering for ROCm module outputs.
 - Qwen3.5 dense FFN trace output records shared ROCm evidence for the existing `weight_gemv_swiglu_residual` path without moving HIP dispatch or kernel code.
+
+Current NPU/backend boundary status:
+- `hipfire-npu` owns XDNA1 SwiGLU module artifact and admission contracts for explicit NPU opt-in paths.
+- `hipfire-arch-qwen35::ffn_bf16` consumes the shared XDNA1 artifact contract for env-derived `HIPFIRE_QWEN35_XDNA1_XCLBIN` / `HIPFIRE_QWEN35_XDNA1_INSTR` paths while Qwen3.5 still owns XRT handle creation, FFI dispatch, and GPU fallback execution.
 
 Current daemon protocol boundary status:
 - `hipfire-daemon-protocol` owns typed daemon JSONL request/response envelopes while model load request/loaded-response and generate token/done/error payloads live in shared boundary crates.
