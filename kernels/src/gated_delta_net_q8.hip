@@ -21,12 +21,11 @@ __global__ void gated_delta_net_q8(
     int n_tokens,
     int n_heads,
     int head_dim,
-    unsigned int frame
     unsigned int frame,  // per-launch monotonic counter (host-supplied) — fresh,
                          // data-INDEPENDENT entropy for the stochastic-rounding
                          // dither. Without it the dither was seeded from my_max
                          // (state-derived) → correlated, biased over the recurrence.
-    __half* __restrict__ s_ef_residual   // OPTIONAL (nullable) per-element f16
+    __half* __restrict__ s_ef_residual,  // OPTIONAL (nullable) per-element f16
                          // error-feedback residual, [n_heads*HD*HD], same layout
                          // as s_q8. Non-null ⇒ DETERMINISTIC round + sigma-delta
                          // noise-shaping (carry the per-element quant residual,
@@ -34,7 +33,6 @@ __global__ void gated_delta_net_q8(
                          // stochastic rounding. DeltaNet's contractive decay damps
                          // the shaped error → ~FP32 state at Q8's byte container
                          // (CPU sweep: 5.7× lower L2 than stochastic at α=0.99).
-    ,
     // Requant cadence gate (host-supplied). 0 = single-end: requant S→Q8 ONCE at
     // the last token (MQ4-fast path; intermediate tokens keep FP32 state in LDS).
     // 1 = per-token: Q8 roundtrip after every token (PARO drift-echo correctness,
@@ -138,23 +136,6 @@ __global__ void gated_delta_net_q8(
                 s3 += __half2float(efr[tid+96]);
             }
 
-        // Stochastic rounding: generate 4 uniform random values in [0, 1).
-        // Seed = spatial location plus a host-supplied per-launch frame so the
-        // dither is fresh and independent of the state value being rounded.
-        unsigned int rng = (unsigned int)(h * 1664525u + (row_start + r) * 1013904223u
-                         + tid * 214013u + frame * 2531011u);
-        #define STOCH_ROUND(val) ({ \
-            rng = rng * 1664525u + 1013904223u; \
-            float noise = (float)(rng >> 8) * (1.0f / 16777216.0f); \
-            float scaled = (val) * inv_s; \
-            (signed char)fminf(fmaxf(floorf(scaled + noise), -128.0f), 127.0f); \
-        })
-        dst[tid]      = STOCH_ROUND(s0);
-        dst[tid+32]   = STOCH_ROUND(s1);
-        dst[tid+64]   = STOCH_ROUND(s2);
-        dst[tid+96]   = STOCH_ROUND(s3);
-        #undef STOCH_ROUND
-        if (tid == 0) s_scales[h * HD + row_start + r] = (my_max > 0.0f) ? (my_max / 127.0f) : 1.0f;
             float my_max = fmaxf(fmaxf(fabsf(s0), fabsf(s1)), fmaxf(fabsf(s2), fabsf(s3)));
             for (int o = 16; o > 0; o >>= 1)
                 my_max = fmaxf(my_max, __shfl_xor(my_max, o));
