@@ -4,7 +4,6 @@ use clap::Args;
 use hipfire_config::HipfireConfig;
 use hipfire_daemon_adapter::{find_daemon_bin, DaemonEngine};
 use hipfire_daemon_protocol::{GenerateRequest, GenerationSamplingPolicy, LoadParams};
-use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::find_model;
@@ -24,13 +23,7 @@ pub struct RunArgs {
 }
 
 fn load_params_from_config(config: &HipfireConfig) -> LoadParams {
-    LoadParams::from_common_config_values(
-        config.max_seq,
-        &config.kv_cache,
-        &config.flash_mode,
-        &config.dflash_mode,
-        config.cask_sidecar.as_deref(),
-    )
+    LoadParams::from_hipfire_config(config)
 }
 
 fn generate_request_from_prompt(
@@ -39,14 +32,7 @@ fn generate_request_from_prompt(
     sampling: GenerationSamplingPolicy,
     worker_key_id: Option<String>,
 ) -> GenerateRequest {
-    let prompt = Value::String(prompt.to_string());
-    let mut request = GenerateRequest::from_openai_chat_messages(
-        id,
-        std::iter::once(("user", Some(&prompt))),
-        sampling,
-    );
-    request.worker_key_id = worker_key_id;
-    request
+    GenerateRequest::from_prompt(id, prompt, sampling).with_worker_key_id(worker_key_id)
 }
 
 pub async fn run(args: RunArgs, config: HipfireConfig) -> anyhow::Result<()> {
@@ -72,12 +58,15 @@ pub async fn run(args: RunArgs, config: HipfireConfig) -> anyhow::Result<()> {
     let gen_req = generate_request_from_prompt(
         Uuid::new_v4().to_string(),
         &args.prompt,
-        GenerationSamplingPolicy {
-            temperature: args.temperature.unwrap_or(config.temperature),
-            max_tokens: args.max_tokens.unwrap_or(config.max_tokens),
-            top_p: Some(config.top_p),
-            repeat_penalty: Some(config.repeat_penalty),
-        },
+        GenerationSamplingPolicy::from_defaults(
+            config.temperature,
+            config.top_p,
+            config.repeat_penalty,
+            config.max_tokens,
+            args.temperature,
+            None,
+            args.max_tokens,
+        ),
         engine.worker_key_id.clone(),
     );
 

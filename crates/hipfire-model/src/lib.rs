@@ -724,6 +724,16 @@ pub struct ModelLoadParams {
 }
 
 impl ModelLoadParams {
+    pub fn from_hipfire_config(config: &hipfire_config::HipfireConfig) -> Self {
+        Self::from_common_config_values(
+            config.max_seq,
+            &config.kv_cache,
+            &config.flash_mode,
+            &config.dflash_mode,
+            config.cask_sidecar.as_deref(),
+        )
+    }
+
     pub fn from_common_config_values(
         max_seq: u32,
         kv_cache: &str,
@@ -1026,6 +1036,29 @@ mod tests {
 
         assert_eq!(params.max_seq, 8192);
         assert_eq!(params.kv_cache, None);
+        assert_eq!(params.flash_mode, None);
+        assert_eq!(params.dflash_mode.as_deref(), Some("off"));
+        assert_eq!(
+            params.cask_sidecar.as_deref(),
+            Some("/models/qwen3.5-27b.triattn.hfq")
+        );
+    }
+
+    #[test]
+    fn model_load_params_from_hipfire_config_preserves_load_policy() {
+        let config = hipfire_config::HipfireConfig {
+            max_seq: 8192,
+            kv_cache: "asym3".to_string(),
+            flash_mode: "auto".to_string(),
+            dflash_mode: "off".to_string(),
+            cask_sidecar: Some("/models/qwen3.5-27b.triattn.hfq".to_string()),
+            ..Default::default()
+        };
+
+        let params = ModelLoadParams::from_hipfire_config(&config);
+
+        assert_eq!(params.max_seq, 8192);
+        assert_eq!(params.kv_cache.as_deref(), Some("asym3"));
         assert_eq!(params.flash_mode, None);
         assert_eq!(params.dflash_mode.as_deref(), Some("off"));
         assert_eq!(

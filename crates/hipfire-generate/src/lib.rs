@@ -31,6 +31,23 @@ impl GenerationSamplingPolicy {
             max_tokens,
         }
     }
+
+    pub fn from_defaults(
+        default_temperature: f64,
+        default_top_p: f64,
+        default_repeat_penalty: f64,
+        default_max_tokens: u32,
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+        max_tokens: Option<u32>,
+    ) -> Self {
+        Self {
+            temperature: temperature.unwrap_or(default_temperature),
+            top_p: Some(top_p.unwrap_or(default_top_p)),
+            repeat_penalty: Some(default_repeat_penalty),
+            max_tokens: max_tokens.unwrap_or(default_max_tokens),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -56,6 +73,20 @@ pub struct GenerateTextRequest {
 }
 
 impl GenerateTextRequest {
+    pub fn from_prompt(
+        id: String,
+        prompt: impl Into<String>,
+        sampling: GenerationSamplingPolicy,
+    ) -> Self {
+        let prompt = prompt.into();
+        let prompt_value = serde_json::Value::String(prompt.clone());
+        Self::from_openai_chat_messages(
+            id,
+            std::iter::once(("user", Some(&prompt_value))),
+            sampling,
+        )
+    }
+
     pub fn from_openai_chat_messages<'a, I>(
         id: String,
         messages: I,
@@ -79,6 +110,21 @@ impl GenerateTextRequest {
             max_think_tokens: None,
             request_id: None,
         }
+    }
+
+    pub fn with_worker_key_id(mut self, worker_key_id: Option<String>) -> Self {
+        self.worker_key_id = worker_key_id;
+        self
+    }
+
+    pub fn with_tools(mut self, tools: Option<serde_json::Value>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    pub fn with_system(mut self, system: Option<String>) -> Self {
+        self.system = system;
+        self
     }
 }
 
@@ -1439,6 +1485,35 @@ mod tests {
         );
         assert_eq!(request.sampling.max_tokens, 16);
         assert!(request.worker_key_id.is_none());
+    }
+
+    #[test]
+    fn prompt_generate_request_preserves_structured_boundary() {
+        let request = GenerateTextRequest::from_prompt(
+            "req-1".to_string(),
+            "hello",
+            GenerationSamplingPolicy::greedy(8),
+        )
+        .with_worker_key_id(Some("worker-a".to_string()));
+
+        assert_eq!(request.prompt, "hello");
+        assert!(!request.prompt.contains("<|im_start|>"));
+        assert_eq!(request.worker_key_id.as_deref(), Some("worker-a"));
+        let messages = request.messages.as_ref().expect("structured messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, hipfire_prompt::Role::User);
+        assert_eq!(messages[0].content, "hello");
+    }
+
+    #[test]
+    fn sampling_policy_applies_generation_overrides() {
+        let sampling =
+            GenerationSamplingPolicy::from_defaults(0.7, 0.9, 1.05, 128, Some(0.2), None, Some(8));
+
+        assert_eq!(sampling.temperature, 0.2);
+        assert_eq!(sampling.top_p, Some(0.9));
+        assert_eq!(sampling.repeat_penalty, Some(1.05));
+        assert_eq!(sampling.max_tokens, 8);
     }
 
     #[test]

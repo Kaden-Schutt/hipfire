@@ -49,13 +49,7 @@ pub async fn post_chat_completions(
 }
 
 fn load_params_from_config(cfg: &HipfireConfig) -> LoadParams {
-    LoadParams::from_common_config_values(
-        cfg.max_seq,
-        &cfg.kv_cache,
-        &cfg.flash_mode,
-        &cfg.dflash_mode,
-        cfg.cask_sidecar.as_deref(),
-    )
+    LoadParams::from_hipfire_config(cfg)
 }
 
 fn generate_request_from_chat(
@@ -66,17 +60,16 @@ fn generate_request_from_chat(
     tools: Option<Value>,
     system: Option<String>,
 ) -> GenerateRequest {
-    let mut req = GenerateRequest::from_openai_chat_messages(
+    GenerateRequest::from_openai_chat_messages(
         id,
         messages
             .iter()
             .map(|message| (message.role.as_str(), message.content.as_ref())),
         sampling,
-    );
-    req.worker_key_id = worker_key_id;
-    req.tools = tools;
-    req.system = system;
-    req
+    )
+    .with_worker_key_id(worker_key_id)
+    .with_tools(tools)
+    .with_system(system)
 }
 
 async fn ensure_model_loaded(state: &SharedState, model_arg: &str) -> Result<(), String> {
@@ -147,12 +140,15 @@ async fn blocking_chat(state: SharedState, body: ChatRequest) -> impl IntoRespon
         generate_request_from_chat(
             req_id.clone(),
             &body.messages,
-            GenerationSamplingPolicy {
-                temperature: body.temperature.unwrap_or(cfg.temperature),
-                max_tokens: body.max_tokens.unwrap_or(cfg.max_tokens),
-                top_p: Some(body.top_p.unwrap_or(cfg.top_p)),
-                repeat_penalty: Some(cfg.repeat_penalty),
-            },
+            GenerationSamplingPolicy::from_defaults(
+                cfg.temperature,
+                cfg.top_p,
+                cfg.repeat_penalty,
+                cfg.max_tokens,
+                body.temperature,
+                body.top_p,
+                body.max_tokens,
+            ),
             worker_key_id,
             body.tools,
             body.system,
@@ -235,12 +231,15 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
             generate_request_from_chat(
                 req_id.clone(),
                 &body.messages,
-                GenerationSamplingPolicy {
-                    temperature: body.temperature.unwrap_or(cfg.temperature),
-                    max_tokens: body.max_tokens.unwrap_or(cfg.max_tokens),
-                    top_p: Some(body.top_p.unwrap_or(cfg.top_p)),
-                    repeat_penalty: Some(cfg.repeat_penalty),
-                },
+                GenerationSamplingPolicy::from_defaults(
+                    cfg.temperature,
+                    cfg.top_p,
+                    cfg.repeat_penalty,
+                    cfg.max_tokens,
+                    body.temperature,
+                    body.top_p,
+                    body.max_tokens,
+                ),
                 worker_key_id,
                 body.tools,
                 body.system,
