@@ -282,8 +282,6 @@ HFQ_QUANT_TYPE_FORMATS = {
     "MQ4G256_LLOYD": "mq4",
     "HFP4G32": "hfp4",
     "MFP4G32": "mfp4",
-    "PARO4G128": "paro4",
-    "PARO4G128T": "paro4",
 }
 
 

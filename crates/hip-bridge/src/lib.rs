@@ -17,6 +17,7 @@
 mod error;
 mod ffi;
 mod kernarg;
+mod rccl;
 mod rocblas;
 
 pub use error::{
@@ -28,6 +29,7 @@ pub use ffi::{
     Event, Function, Graph, GraphExec, HipPointerAttribute, HipRuntime, HostBuffer, Module, Stream,
 };
 pub use kernarg::KernargBlob;
+pub use rccl::{RcclComms, RcclDataType, RcclError, RcclRedOp, RcclResult, NCCL_SUCCESS};
 pub use rocblas::{Rocblas, RocblasDatatype, RocblasError, RocblasOperation, RocblasResult};
 
 /// Re-export memory copy direction for callers.

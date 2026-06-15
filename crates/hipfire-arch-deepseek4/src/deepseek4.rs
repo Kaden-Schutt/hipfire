@@ -878,6 +878,8 @@ pub struct DeepseekV4State {
     pub moe_gate_batch: Option<rdna_compute::GpuTensor>,
     pub moe_up_batch: Option<rdna_compute::GpuTensor>,
     pub moe_rot_batch: Option<rdna_compute::GpuTensor>,
+    /// `[k_top × hidden]` per-expert down outputs for the deterministic MoE combine.
+    pub moe_down_expert_outputs: Option<rdna_compute::GpuTensor>,
 
     /// Buffer of all-ones, length `head_dim`, used as the weight arg
     /// to the per-head Q RMSNorm (upstream DeepSeek V4 has NO learnable scale
@@ -995,6 +997,7 @@ impl DeepseekV4State {
             moe_gate_batch: None,
             moe_up_batch: None,
             moe_rot_batch: None,
+            moe_down_expert_outputs: None,
             q_head_ones: None,
             attn_out_raw: None,
             attn_out_raw_rot: None,
@@ -1076,6 +1079,55 @@ impl DeepseekV4State {
         // are overwritten on first use and don't need explicit zeroing.
     }
 
+    /// Zero the persistent per-layer decode caches (SWA ring, full + compressed
+    /// KV, indexer/compressor scratch) so a fresh conversation starts from the
+    /// same clean state as a freshly-launched daemon.
+    ///
+    /// `reset()` only rewinds `n_tokens` and leaves these position-indexed
+    /// caches intact; a short new conversation doesn't overwrite every slot the
+    /// forward reads, so the prior turn's residue bleeds in and drifts greedy
+    /// decode.
+    ///
+    /// Must be called where `gpu` is available (the daemon's lcp==0 fresh-
+    /// conversation handler), not from `reset()` (no gpu there).
+    pub fn zero_decode_caches(&mut self, gpu: &mut rdna_compute::Gpu) {
+        fn z(gpu: &mut rdna_compute::Gpu, t: &Option<rdna_compute::GpuTensor>) {
+            if let Some(t) = t {
+                let _ = gpu.hip.memset(&t.buf, 0, t.byte_size());
+            }
+        }
+        // The compressor `score_state` ring must reset to -inf, NOT 0 (matches
+        // the reference `torch.full(-inf)`): a fresh conversation's first
+        // compressed block has no overlap prev-window, and those unfilled slots
+        // must get zero softmax weight in the pooling. Reset to 0 would instead
+        // pool the prior turn's stale window (or dilute block 0 with zeros).
+        fn zinf(gpu: &mut rdna_compute::Gpu, t: &Option<rdna_compute::GpuTensor>) {
+            if let Some(t) = t {
+                let _ = gpu.fill_f32(t, f32::NEG_INFINITY);
+            }
+        }
+        for l in &self._indexer {
+            z(gpu, &l.main_kv_cache);
+            z(gpu, &l.main_kv_state);
+            zinf(gpu, &l.main_score_state);
+            z(gpu, &l.indexer_kv_cache);
+            z(gpu, &l.indexer_kv_state);
+            zinf(gpu, &l.indexer_score_state);
+            z(gpu, &l.comp_kv_buf);
+            z(gpu, &l.comp_score_buf);
+            z(gpu, &l.comp_concat_kv);
+            z(gpu, &l.comp_concat_score);
+        }
+        for l in &self._attention {
+            z(gpu, &l.swa_k);
+            z(gpu, &l.swa_v);
+            z(gpu, &l.full_k_cache);
+            z(gpu, &l.full_v_cache);
+            z(gpu, &l.gathered_k);
+            z(gpu, &l.gathered_v);
+        }
+    }
+
     /// Release every GPU buffer this state owns back to the pool.
     /// Consumes self. Mirrors `Qwen2State::free_gpu`.
     ///
@@ -1153,6 +1205,7 @@ impl DeepseekV4State {
         free_opt(gpu, &mut self.moe_gate_batch);
         free_opt(gpu, &mut self.moe_up_batch);
         free_opt(gpu, &mut self.moe_rot_batch);
+        free_opt(gpu, &mut self.moe_down_expert_outputs);
         free_opt(gpu, &mut self.q_head_ones);
         free_opt(gpu, &mut self.attn_out_raw);
         free_opt(gpu, &mut self.attn_out_raw_rot);

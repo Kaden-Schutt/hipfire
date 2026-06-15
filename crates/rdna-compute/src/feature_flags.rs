@@ -76,6 +76,15 @@ pub struct FeatureFlags {
     pub moe_grouped_m2: bool,
     pub moe_hfq6_v2: bool,
     pub moe_hfq6_4w: bool,
+    // ── MoE prefill (Ship 4.2) ────────────────────────────────────
+    /// Grouped-GEMM MoE prefill gate (HIPFIRE_MOE_GROUPED_GEMM). Default ON.
+    pub moe_grouped_gemm: bool,
+    /// gfx1151 i8 MMQ opt-in for Paro grouped GEMM (HIPFIRE_MOE_PARO_I8).
+    /// None = arch-default (gfx1151 → true, else false).
+    pub moe_paro_i8: Option<bool>,
+    /// gfx1151 i8 MMQ k8 opt-in for Paro grouped GEMM (HIPFIRE_MOE_PARO_I8_K8).
+    /// None = arch-default (gfx1151 → true, else false).
+    pub moe_paro_i8_k8: Option<bool>,
 
     // ── Graph / capture / deterministic ─────────────────────────────
     pub force_blob_path: bool,
@@ -97,6 +106,12 @@ pub struct FeatureFlags {
 
     // ── Compiler.rs env reads ──────────────────────────────────────
     pub hipcc_extra_flags: String,
+
+    // ── Interpreter Phase 2a ───────────────────────────────────────
+    /// Force the discrete (un-fused) projection path where supported, for
+    /// fused-vs-unfused validation. Env: HIPFIRE_FORCE_UNFUSED=1. Single-GPU
+    /// decode projection fusions only (see Phase-2a spec §4b honest-scope).
+    pub force_unfused: bool,
 }
 
 impl FeatureFlags {
@@ -249,6 +264,13 @@ impl FeatureFlags {
             } else {
                 std::env::var("HIPFIRE_MOE_HFQ6_4W").as_deref() == Ok("1")
             },
+            // MoE prefill (Ship 4.2)
+            moe_grouped_gemm: match std::env::var("HIPFIRE_MOE_GROUPED_GEMM").ok().as_deref() {
+                Some("0") | Some("off") => false,
+                _ => true,
+            },
+            moe_paro_i8: parse_bool("HIPFIRE_MOE_PARO_I8"),
+            moe_paro_i8_k8: parse_bool("HIPFIRE_MOE_PARO_I8_K8"),
 
             // Graph / capture / deterministic
             force_blob_path: std::env::var("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
@@ -279,6 +301,10 @@ impl FeatureFlags {
 
             // Compiler.rs
             hipcc_extra_flags: std::env::var("HIPFIRE_HIPCC_EXTRA_FLAGS").unwrap_or_default(),
+
+            // Interpreter Phase 2a
+            force_unfused: std::env::var("HIPFIRE_FORCE_UNFUSED")
+                .map(|v| v == "1").unwrap_or(false),
         }
     }
 
@@ -401,6 +427,9 @@ impl FeatureFlags {
             moe_grouped_m2: false,
             moe_hfq6_v2: false,
             moe_hfq6_4w: false,
+            moe_grouped_gemm: true,
+            moe_paro_i8: None,
+            moe_paro_i8_k8: None,
             force_blob_path: false,
             gemm_dump: false,
             deterministic: false,
@@ -414,6 +443,18 @@ impl FeatureFlags {
             lloyd_force_baseline: false,
             rdna2_variant: None,
             hipcc_extra_flags: String::new(),
+            force_unfused: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn force_unfused_defaults_false_in_test_ctor() {
+        let f = FeatureFlags::from_env_for_test("gfx1151");
+        assert!(!f.force_unfused);
     }
 }

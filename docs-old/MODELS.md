@@ -13,12 +13,13 @@ sizes when you want more headroom; pull with the `:<size>-mq6` suffix.
 | Tag | File | VRAM floor | Notes |
 |---|---|---|---|
 | `qwen3.5:0.8b` | 0.55 GB | 1 GB | Tiny, hybrid DeltaNet + FullAttn |
+| `qwen3.5:2b` | 1.3 GB | 2 GB | 2B, HF4 (legacy 4-bit format; `-hf6` variant available) |
 | `qwen3.5:4b` | 2.6 GB | 4 GB | Best speed/quality balance |
 | `qwen3.5:9b` | 5.3 GB | 6 GB | Default `serve` pre-warm |
 | `qwen3.5:27b` | 15 GB | 16 GB | Needs 16 GB+ VRAM |
-| `qwen3.5:35b-a3b` | 18.7 GB | 22 GB | MoE 35B / 3B-active. Local-only (no HF repo yet). |
+| `qwen3.5:35b-a3b` | 19.7 GB | 22 GB | MoE 35B / 3B-active |
 | `qwen3.6:27b` | 15 GB | 16 GB | 3.6 refresh, same hybrid arch as 3.5 |
-| `qwen3.6:35b-a3b` | 18.7 GB | 22 GB | 3.6 MoE refresh. Local-only. |
+| `qwen3.6:35b-a3b` | 22.9 GB | 24 GB | 3.6 MoE refresh |
 | `deepseek-v4-flash` | 82 GB | 96 GB | DeepSeek V4 Flash (arch_id=9): MQ2-Lloyd routed-expert MoE, Q8_0 attn KV, Hyper-Connections + compressed-KV indexer + tail-only RoPE. `hipfire pull` also fetches the MTP sidecar for K=2 spec-decode (+29% TG on code). |
 
 Higher-quality variants:
@@ -170,7 +171,7 @@ Cap how many tokens the model may emit before `</think>` closes. 0
 
 ```bash
 hipfire config set max_think_tokens 4096                  # global
-hipfire config set-model qwen3.6:35b-a3b max_think_tokens 1024  # per-model
+hipfire config qwen3.6:35b-a3b set max_think_tokens 1024  # per-model
 ```
 
 Per-model settings take precedence; the registry pre-applies sane caps

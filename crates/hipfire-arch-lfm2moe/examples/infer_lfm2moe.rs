@@ -23,6 +23,10 @@ fn main() {
     let mut model: Option<PathBuf> = None;
     let mut prompt = "The capital of France is".to_string();
     let mut max: usize = 64;
+    // --tokens <json>: pre-tokenized prompt ids (bypass the embedded tokenizer;
+    // e.g. HF apply_chat_template output). --eos <id>: extra stop token.
+    let mut tokens_path: Option<PathBuf> = None;
+    let mut eos_extra: Option<u32> = None;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -36,6 +40,14 @@ fn main() {
             }
             "--max" => {
                 max = argv[i + 1].parse().expect("--max");
+                i += 2;
+            }
+            "--tokens" => {
+                tokens_path = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--eos" => {
+                eos_extra = Some(argv[i + 1].parse().expect("--eos"));
                 i += 2;
             }
             other => {
@@ -62,8 +74,15 @@ fn main() {
     let weights = Lfm2MoeWeights::load(&mut hfq, &cfg, &mut gpu).expect("weights");
     eprintln!("loaded weights in {:.1}s", t_load.elapsed().as_secs_f64());
 
-    let prompt_ids = tok.encode(&prompt);
-    eprintln!("prompt {:?} → {} tokens", prompt, prompt_ids.len());
+    let prompt_ids: Vec<u32> = if let Some(tp) = &tokens_path {
+        let s = std::fs::read_to_string(tp).expect("read --tokens");
+        let v: Vec<i64> = serde_json::from_str(&s).expect("parse --tokens json");
+        v.into_iter().map(|t| t as u32).collect()
+    } else {
+        tok.encode(&prompt)
+    };
+    eprintln!("prompt {:?} → {} tokens (src: {})", prompt, prompt_ids.len(),
+        if tokens_path.is_some() { "--tokens" } else { "embedded tokenizer" });
     let max_seq = prompt_ids.len() + max + 16;
     let mut state = Lfm2MoeState::new_with_max_seq(&mut gpu, &cfg, max_seq).expect("state");
 
@@ -98,8 +117,8 @@ fn main() {
     for _ in 0..max {
         let next = argmax(&logits);
         gen.push(next);
-        // LFM2.5 EOS = 124900; also stop on common ids.
-        if matches!(next, 124900 | 124899 | 2) {
+        // A1B EOS = 124900; dense LFM2.5 eos = 7 (<|im_end|>), pass via --eos.
+        if matches!(next, 124900 | 124899 | 2) || Some(next) == eos_extra {
             break;
         }
         logits =
@@ -114,8 +133,10 @@ fn main() {
         gen.len() as f64 / dt
     );
     println!(
-        "=== PROMPT ===\n{prompt}\n=== GENERATION ===\n{}",
+        "=== PROMPT ===\n{prompt}\n=== GENERATION (embedded-tokenizer decode) ===\n{}",
         tok.decode(&gen)
     );
-    eprintln!("token ids: {:?}", &gen[..gen.len().min(40)]);
+    // Full generated id list for an external (e.g. HF) decode — the embedded
+    // tokenizer may be wrong for a freshly-brought-up arch.
+    println!("GEN_IDS_JSON: {}", serde_json::to_string(&gen).unwrap());
 }

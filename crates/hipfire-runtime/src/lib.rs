@@ -15,6 +15,25 @@
 
 pub mod arch;
 pub mod bf16_loader;
+pub mod config;
+pub mod eval_common;
+pub mod gguf;
+pub mod hfq;
+pub mod kv_adaptive;
+pub mod llama;
+pub mod model_source;
+pub mod safetensors_source;
+pub mod loop_guard;
+pub mod multi_gpu;
+pub mod tp_shard;
+pub mod ep;
+pub mod sampler;
+#[cfg(feature = "deltanet")]
+pub mod dflash;
+#[cfg(feature = "deltanet")]
+pub mod ddtree;
+#[cfg(feature = "deltanet")]
+pub mod triattn;
 #[cfg(feature = "deltanet")]
 pub mod cask;
 pub mod coherence_runtime;

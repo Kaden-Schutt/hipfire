@@ -8,6 +8,7 @@ license = "Apache-2.0"
 
 [dependencies]
 hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
 rdna-compute = { path = "../rdna-compute" }
 hip-bridge = { path = "../hip-bridge" }
 serde = { version = "1", features = ["derive"] }

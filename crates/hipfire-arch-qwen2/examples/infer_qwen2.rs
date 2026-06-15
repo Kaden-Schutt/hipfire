@@ -51,6 +51,7 @@ struct Args {
     reference: Option<String>,
     no_load: bool,
     max_new_tokens: usize,
+    max_seq: usize,
 }
 
 fn parse_args() -> Args {
@@ -58,6 +59,7 @@ fn parse_args() -> Args {
         max_new_tokens: 16,
         ..Default::default()
     };
+    let mut out = Args { max_new_tokens: 16, max_seq: 512, ..Default::default() };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -67,6 +69,12 @@ fn parse_args() -> Args {
             "--max-new-tokens" => {
                 out.max_new_tokens = it.next().and_then(|s| s.parse().ok()).unwrap_or(16)
             }
+            "--max-new-tokens" => out.max_new_tokens = it.next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(16),
+            "--max-seq" => out.max_seq = it.next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(512),
             "--no-load" => out.no_load = true,
             "-h" | "--help" => {
                 print_help();
@@ -181,8 +189,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         weights.embd_format,
     );
 
-    let mut state = qwen2::Qwen2State::new(&mut gpu, &cfg)
-        .map_err(|e| format!("Qwen2State::new failed: {e}"))?;
+    let mut state = if args.max_seq > 512 {
+        qwen2::Qwen2State::new_with_max_seq(&mut gpu, &cfg, args.max_seq)
+            .map_err(|e| format!("Qwen2State::new_with_max_seq({}) failed: {e}", args.max_seq))?
+    } else {
+        qwen2::Qwen2State::new(&mut gpu, &cfg)
+            .map_err(|e| format!("Qwen2State::new failed: {e}"))?
+    };
     eprintln!("      KV budget = {} positions", state.max_seq);
 
     if prompt_ids.is_empty() {

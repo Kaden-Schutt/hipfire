@@ -54,6 +54,12 @@ else
     for src in crates/hipfire-arch-qwen35/src/qwen35.rs crates/hipfire-runtime/src/llama.rs \
                crates/hipfire-runtime/src/hfq.rs crates/hipfire-daemon/src/main.rs \
                crates/rdna-compute/src/dispatch.rs \
+               crates/hipfire-dispatch/src/families/moe.rs \
+               crates/hipfire-dispatch/src/pipeline/mod.rs \
+               crates/hipfire-dispatch/src/pipeline/steps.rs \
+               crates/hipfire-dispatch/src/families/gemv.rs \
+               crates/hipfire-dispatch/src/families/attention.rs \
+               crates/hipfire-dispatch/src/families/fused_qkv.rs \
                crates/hipfire-arch-deepseek4/src/arch.rs \
                crates/hipfire-arch-deepseek4/src/deepseek4.rs \
                crates/hipfire-arch-deepseek4/src/forward.rs \
@@ -228,6 +234,46 @@ FULL_EXTRA=(
     "qwen3.5-35b-a3b-mq3.hfq|moe-mq3-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
     "qwen3.6-35b-a3b-mq3.hfq|moe36-mq3-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|800"
     "qwen3.6-27b-mq4.hfq|tool-call-27b|What does the file /tmp/fibonacci.c contain?|220|tool_call_system.txt"
+    #   ln -s /data/hipfire/qwen3.5-9b.mq4-awq-gptq-f2-lmhead-a100.hfq \
+    #         "${HIPFIRE_DIR:-$HOME/.hipfire}/models/qwen3.5-9b.mq4-awq-gptq-f2-lmhead"
+    "qwen3.5-9b.mq4-awq-gptq-f2-lmhead|lmhead-awq-paris|What is the capital of France? Answer in one short sentence.|300"
+    # ParoQ4G128 dispatch smoke — regression catcher for the GemvResidual
+    # Givens-rotation fix (0912c73a): steps.rs GemvResidual else-branch was
+    # calling gemv.run(Plain) which skipped Givens rotation for Paro weights,
+    # silently producing wrong o_proj output. Fixed to gemv.run_auto().
+    # Uses shisa-ai's packed A3B-PARO checkpoint converted to HFQ format.
+    # Two prompts: fast capital check (exercises QKV + o_proj dispatch) and
+    # sheep reasoning (longer decode, stresses gate_up + o_proj repeatedly).
+    # Skipped if the HFQ file is absent. To produce it:
+    #   python3 scripts/paroquant_import.py import \
+    #     --model ~/.hipfire/models/shisa-Qwen3.6-35B-A3B-PARO-packed \
+    #     --output ~/.hipfire/models/qwen3.6-35b-a3b-paro.hfq \
+    #     --local-only
+    # (requires numpy, torch, safetensors in the active Python environment)
+    "qwen3.6-35b-a3b-paro.hfq|paro-a3b-cap|What is the capital of France? Answer in one short sentence.|80"
+    "qwen3.6-35b-a3b-paro.hfq|paro-a3b-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
+)
+FULL_EXTRA=(
+    "qwen3.5-35b-a3b.mq4|moe-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
+    # gfx12/RDNA4 Q8_0-wo MoE coverage — the gate gap that let a9e8dfda
+    # corrupt RDNA4 MoE output for ~100 commits before ae13aa75 fixed it.
+    # a9e8dfda aliased the GemvResidual fallback's `out` onto the residual
+    # buffer; on RDNA4 the Q8_0 wo / dn_out projections (which take that
+    # GemvResidual fallback rather than a fused *_residual_wmma kernel)
+    # then read-after-write the same buffer → silent wrong MoE output.
+    # NONE of the prior FULL_EXTRA rows exercised a *Q8_0* MoE (the only
+    # MoE rows were MQ4), so the aliasing regression slipped every gate.
+    # This row is a qwen3_5_moe (arch) A3B whose router + shared-gate +
+    # wo/dn_out projections are Q8_0, forcing the GemvResidual fallback on
+    # gfx12. A healthy answer states the final number (8); aliasing
+    # corruption produces an attractor / off-topic loop. It is symlink-gated
+    # exactly like the other rows (skipped where the file is absent, so it
+    # is a no-op on boxes without the Q8 A3B trunk). Produce / symlink it:
+    #   ln -s /data/hipfire-models/qwen3.5-35b-a3b.q8f16.hfq \
+    #         "${HIPFIRE_DIR:-$HOME/.hipfire}/models/qwen3.5-35b-a3b.q8f16"
+    "qwen3.5-35b-a3b.q8f16|moe-q8-wo-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
+    "qwen3.6-35b-a3b.mq4|moe36-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|800"
+    "qwen3.6-27b.mq4|tool-call-27b|What does the file /tmp/fibonacci.c contain?|220|tool_call_system.txt"
     # DeepSeek V4 Flash (arch_id=9, hipfire-arch-deepseek4). Loads the
     # 80 GB base from the MTP-sidecar split + the MTP addon via
     # HIPFIRE_DEEPSEEK4_MTP_ADDON. Skipped unless the symlink is present in

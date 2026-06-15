@@ -1212,6 +1212,7 @@ fn load_weight_tensor(
                 paro: None,
                 awq_scale: None,
             })
+            Ok::<WeightTensor, HipError>(WeightTensor { buf, gpu_dtype: DType::Q4F16G64, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
         3 => {
             // Q8F16 — same block format as GGML Q8_0 (34 bytes per 32 elements)
@@ -1317,6 +1318,7 @@ fn load_weight_tensor(
         }
         8 => {
             // HFQ6-G256 — 6-bit, 200 bytes per 256 elements
+        8 => { // HFQ6-G256 — 6-bit, 200 bytes per 256 elements
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,

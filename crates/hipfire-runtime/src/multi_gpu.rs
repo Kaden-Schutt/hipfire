@@ -23,8 +23,10 @@
 use hip_bridge::{
     DeviceBuffer, Event, HipError, HipResult, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED,
     HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
+    DeviceBuffer, Event, HipError, HipResult, RcclComms,
+    HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
 };
-use rdna_compute::{Gpu, GpuTensor};
+use rdna_compute::{Gpu, GpuTensor, DType};
 
 /// Stream-event handoff returned by `Gpus::boundary_copy`. When the src
 /// device has an active stream, `completion` holds a HIP event recorded
@@ -56,6 +58,12 @@ impl Drop for BoundaryEvent {
 }
 
 pub struct Gpus {
+    /// RCCL communicators (one per rank), lazily initialized on the first
+    /// `all_reduce_sum_*` call. Declared BEFORE `devices` so `Drop` tears
+    /// down comms (via `ncclCommDestroy`) before the underlying HIP
+    /// devices, which RCCL relies on. `None` means RCCL hasn't been used
+    /// or `HIPFIRE_TP_USE_RCCL=0` forced the opt-out.
+    rccl_comms: Option<RcclComms>,
     pub devices: Vec<Gpu>,
     /// Per-layer device id, length = n_layers.
     pub layer_to_device: Vec<u8>,
@@ -70,6 +78,12 @@ pub struct Gpus {
     /// the KV cache constructor (Stage 5) populates them.
     pub givens_cos_per_dev: Vec<GpuTensor>,
     pub givens_sin_per_dev: Vec<GpuTensor>,
+    /// Peer-direct all-reduce scratch: `peer_ar_tmp[r][slot]` is a buffer on
+    /// device `r` holding one OTHER rank's partial during
+    /// [`Gpus::all_reduce_sum_f32_peer`]. Lazily allocated / grown to the largest
+    /// `count` seen. Leaked on teardown (raw `DeviceBuffer`, no Drop-free).
+    peer_ar_tmp: Vec<Vec<DeviceBuffer>>,
+    peer_ar_tmp_bytes: usize,
 }
 
 const DEFAULT_VRAM_TOLERANCE_GB: f64 = 2.0;
@@ -143,6 +157,7 @@ impl Gpus {
     /// with all layers on dev 0. `output_device = 0`.
     pub fn single(gpu: Gpu, n_layers: usize) -> Self {
         Self {
+            rccl_comms: None,
             devices: vec![gpu],
             layer_to_device: vec![0; n_layers],
             band_starts: vec![0],
@@ -150,7 +165,58 @@ impl Gpus {
             output_device: 0,
             givens_cos_per_dev: Vec::new(),
             givens_sin_per_dev: Vec::new(),
+            peer_ar_tmp: Vec::new(),
+            peer_ar_tmp_bytes: 0,
         }
+    }
+
+    /// Tensor-parallel constructor: bring up `tp_size` devices that each run
+    /// **every** layer (PP=1), sharded within-layer per a `ShardConfig`.
+    ///
+    /// Distinct from `init_uniform` (which bands layers across devices for
+    /// pipeline parallelism): here `layer_to_device = [0; n_layers]` and
+    /// `band_starts = [0, n_layers, …]` (device 0 "owns" all layers in the
+    /// PP sense; bands ≥1 are empty) so PP-oriented helpers stay well-defined,
+    /// while the TP forward path ignores the layer-band map and dispatches
+    /// every layer on every rank. `output_device = 0` — the replicated
+    /// lm_head lives on every rank and sampling reads rank 0 by convention
+    /// (TP plan §3.5 / Stage 7).
+    ///
+    /// The Q/KV-head divisibility check lives on `ShardConfig::validate`
+    /// (called at model load once head counts are known); this constructor
+    /// only validates the device count. Pre-flight runs the arch-match +
+    /// VRAM-delta gate (TP ranks are identical cards, so the uniform delta
+    /// check applies).
+    pub fn init_tp(tp_size: usize, n_layers: usize) -> HipResult<Self> {
+        if tp_size == 0 {
+            return Err(HipError::new(0, "init_tp: tp_size must be >= 1"));
+        }
+        if n_layers == 0 {
+            return Err(HipError::new(0, "init_tp: n_layers must be >= 1"));
+        }
+        let device_ids = resolve_device_ids(tp_size)?;
+        let devices = construct_devices(&device_ids)?;
+        preflight_vram_with_opts(&devices, /*check_vram_delta=*/ true)?;
+
+        // PP=1 TP topology: every device runs every layer. Encode the layer
+        // map so PP helpers see device 0 owning all layers and devices ≥1
+        // owning empty bands.
+        let mut band_starts = vec![0usize; tp_size];
+        for b in band_starts.iter_mut().skip(1) {
+            *b = n_layers;
+        }
+        Ok(Self {
+            rccl_comms: None,
+            devices,
+            layer_to_device: vec![0u8; n_layers],
+            band_starts,
+            peer_access_enabled: false,
+            output_device: 0,
+            givens_cos_per_dev: Vec::new(),
+            givens_sin_per_dev: Vec::new(),
+            peer_ar_tmp: Vec::new(),
+            peer_ar_tmp_bytes: 0,
+        })
     }
 
     /// Bidirectional `hipDeviceEnablePeerAccess` between every pair of
@@ -391,6 +457,7 @@ impl Gpus {
             cursor += count;
         }
         Ok(Self {
+            rccl_comms: None,
             devices,
             layer_to_device,
             band_starts,
@@ -398,7 +465,226 @@ impl Gpus {
             output_device: n_devices - 1,
             givens_cos_per_dev: Vec::new(),
             givens_sin_per_dev: Vec::new(),
+            peer_ar_tmp: Vec::new(),
+            peer_ar_tmp_bytes: 0,
         })
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Tensor-parallel collectives (RCCL-backed). See
+    // docs/plans/multi-gpu-tp-a3b.md §3.3 and the comm baseline at
+    // docs/investigations/2026-05-28-tp-comm-baseline-hiptrx.md.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Lazily initialize RCCL communicators across all devices owned by
+    /// this `Gpus`. Cached for process lifetime; subsequent calls are
+    /// no-ops. `HIPFIRE_TP_USE_RCCL=0` short-circuits with a clear
+    /// error so callers can fall through to a host-driven path (not
+    /// yet implemented — Stage 2 follow-up).
+    pub fn ensure_rccl(&mut self) -> HipResult<()> {
+        if self.rccl_comms.is_some() {
+            return Ok(());
+        }
+        if matches!(crate::config::get().tp_use_rccl, Some(false)) {
+            return Err(HipError::new(
+                0,
+                "ensure_rccl: HIPFIRE_TP_USE_RCCL=0 — RCCL path opted out. \
+                 Host-driven all-reduce fallback is not yet implemented \
+                 (Stage 2 follow-up; see docs/plans/multi-gpu-tp-a3b.md).",
+            ));
+        }
+        let device_ids: Vec<i32> = self.devices.iter().map(|d| d.device_id).collect();
+        let comms = RcclComms::init_all(&device_ids).map_err(|e| {
+            HipError::new(
+                0,
+                &format!(
+                    "RcclComms::init_all(devices={:?}) failed: {}. \
+                     Is librccl.so installed? On Debian/Ubuntu: \
+                     `apt install rccl`; on ROCm install: \
+                     `/opt/rocm/lib/librccl.so.1` must be present.",
+                    device_ids, e
+                ),
+            )
+        })?;
+        self.rccl_comms = Some(comms);
+        Ok(())
+    }
+
+    /// All-reduce-sum of f32 buffers across all ranks. `buffers[r]` must
+    /// be a device pointer on `devices[r]` holding `count` f32 elements;
+    /// after this call, each buffer holds the element-wise sum across
+    /// all ranks. In-place (send == recv) — saves a memcpy and matches
+    /// how the TP forward path uses the result.
+    ///
+    /// Requires each device to have an `active_stream` set (the stream
+    /// the collective runs on). Synchronization is the caller's
+    /// responsibility: this call enqueues the collective and returns
+    /// immediately; the buffers are valid only after a subsequent
+    /// `stream_synchronize` (or a downstream dispatch that's already
+    /// ordered behind the same stream).
+    pub fn all_reduce_sum_f32(
+        &mut self,
+        buffers: &[&DeviceBuffer],
+        count: usize,
+    ) -> HipResult<()> {
+        if buffers.len() != self.devices.len() {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "all_reduce_sum_f32: buffers.len()={} != n_devices={}",
+                    buffers.len(),
+                    self.devices.len()
+                ),
+            ));
+        }
+        // Single-rank (TP=1) degenerate case: the all-reduce-sum over one
+        // buffer is the identity — the buffer already holds the only rank's
+        // partial. Short-circuit so the TP=1 EP path is a pure single-GPU
+        // reference that exercises the full EP executor WITHOUT requiring
+        // librccl (a 1-rank communicator would also work, but skipping it
+        // keeps TP=1 dependency-free and the parity baseline trivially exact).
+        if self.devices.len() == 1 {
+            return Ok(());
+        }
+        self.ensure_rccl()?;
+
+        // Borrow-check note: `self.rccl_comms.as_ref()` projects through
+        // a single field, leaving `self.devices` independently
+        // borrow-able for the per-rank stream lookup below.
+        let rccl = self.rccl_comms.as_ref().expect("ensure_rccl populated it");
+
+        rccl.group_start()
+            .map_err(|e| HipError::new(0, &format!("ncclGroupStart: {e}")))?;
+        for (r, buf) in buffers.iter().enumerate() {
+            let dev = &self.devices[r];
+            dev.bind_thread()?;
+            let stream = dev.active_stream.as_ref().ok_or_else(|| {
+                HipError::new(
+                    0,
+                    &format!(
+                        "all_reduce_sum_f32: device {r} has no active_stream — \
+                         set `gpus.devices[r].active_stream = Some(stream)` before calling.",
+                    ),
+                )
+            })?;
+            rccl.all_reduce_sum_f32(
+                r,
+                buf.as_ptr() as *const f32,
+                buf.as_ptr() as *mut f32,
+                count,
+                stream.raw_ptr(),
+            )
+            .map_err(|e| HipError::new(0, &format!("ncclAllReduce rank={r}: {e}")))?;
+        }
+        rccl.group_end()
+            .map_err(|e| HipError::new(0, &format!("ncclGroupEnd: {e}")))?;
+        Ok(())
+    }
+
+    /// Ensure `peer_ar_tmp[r]` holds `n-1` buffers of at least `bytes` on each
+    /// device. Lazily allocates; grows (freeing the old set) if `bytes` exceeds
+    /// the current size. No-op for `n <= 1`.
+    fn ensure_peer_ar_tmp(&mut self, bytes: usize) -> HipResult<()> {
+        let n = self.devices.len();
+        if n <= 1 {
+            return Ok(());
+        }
+        if !self.peer_ar_tmp.is_empty() && self.peer_ar_tmp_bytes >= bytes {
+            return Ok(());
+        }
+        // Free the old (too-small) set on its owning devices before regrowing.
+        if !self.peer_ar_tmp.is_empty() {
+            for (r, row) in std::mem::take(&mut self.peer_ar_tmp).into_iter().enumerate() {
+                let _ = self.devices[r].bind_thread();
+                for buf in row {
+                    let _ = self.devices[r].hip.free(buf);
+                }
+            }
+        }
+        let mut all = Vec::with_capacity(n);
+        for r in 0..n {
+            self.devices[r].bind_thread()?;
+            let mut row = Vec::with_capacity(n - 1);
+            for _ in 0..(n - 1) {
+                row.push(self.devices[r].hip.malloc(bytes)?);
+            }
+            all.push(row);
+        }
+        self.peer_ar_tmp = all;
+        self.peer_ar_tmp_bytes = bytes;
+        Ok(())
+    }
+
+    /// All-reduce-sum of f32 buffers across all ranks via **direct peer copy +
+    /// local add** — bypassing RCCL. On consumer/prosumer RDNA P2P (no xGMI,
+    /// e.g. hiptrx 4× gfx1201), `ncclAllReduce` costs ~40 ms/call for these
+    /// small/medium messages regardless of NCCL_PROTO/CHANNELS/BUFFSIZE/
+    /// SOCKET_IFNAME, while this path is ~1 ms. Used by EP prefill and TP; EP
+    /// decode's tiny per-token reduce stays on RCCL (already fast). PP never
+    /// all-reduces (it uses `boundary_copy` point-to-point).
+    ///
+    /// Algorithm (N-rank, race-free): **phase 1** copies every OTHER rank's
+    /// ORIGINAL buffer into a local temp (all reads, no writes); a barrier
+    /// (`wait_boundary`); **phase 2** adds the peer temps into the local buffer.
+    /// All-reads-before-writes ⇒ no cross-device read/write race. `n==1` is the
+    /// identity (no-op). Requires peer access (caller's `enable_peer_all`) for
+    /// the fast P2P path; without it `boundary_copy` host-stages (slower but
+    /// correct). In-place: `buffers[r]` is both input and output.
+    pub fn all_reduce_sum_f32_peer(
+        &mut self,
+        buffers: &[&DeviceBuffer],
+        count: usize,
+    ) -> HipResult<()> {
+        let n = self.devices.len();
+        if buffers.len() != n {
+            return Err(HipError::new(
+                0,
+                &format!("all_reduce_sum_f32_peer: buffers.len()={} != n_devices={n}", buffers.len()),
+            ));
+        }
+        if n == 1 {
+            return Ok(());
+        }
+        let bytes = count * 4;
+        self.ensure_peer_ar_tmp(bytes)?;
+
+        // Phase 1: read every peer's ORIGINAL buffer into a local temp.
+        let mut evts = Vec::with_capacity(n * (n - 1));
+        for r in 0..n {
+            let mut slot = 0usize;
+            for j in 0..n {
+                if j == r {
+                    continue;
+                }
+                let evt = self.boundary_copy(j, r, buffers[j], &self.peer_ar_tmp[r][slot], bytes)?;
+                evts.push(evt);
+                slot += 1;
+            }
+        }
+        for evt in evts {
+            self.wait_boundary(evt)?;
+        }
+
+        // Phase 2: add the peer temps into each rank's buffer.
+        for r in 0..n {
+            let dst = GpuTensor {
+                buf: unsafe { buffers[r].alias() },
+                shape: vec![count],
+                dtype: DType::F32,
+            };
+            let srcs: Vec<GpuTensor> = (0..n - 1)
+                .map(|slot| GpuTensor {
+                    buf: unsafe { self.peer_ar_tmp[r][slot].alias() },
+                    shape: vec![count],
+                    dtype: DType::F32,
+                })
+                .collect();
+            self.devices[r].bind_thread()?;
+            for src in &srcs {
+                self.devices[r].add_inplace_f32(&dst, src)?;
+            }
+        }
+        Ok(())
     }
 }
 

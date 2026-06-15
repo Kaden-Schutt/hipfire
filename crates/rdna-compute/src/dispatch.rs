@@ -168,6 +168,28 @@ impl GpuTensor {
         self.numel() * self.dtype.size()
     }
 
+    /// A `GpuTensor` whose buffer is a null pointer of size 0, for CPU-only unit
+    /// tests in **dependent crates** that read only tensor metadata (shape/dtype/op)
+    /// and never touch the device.
+    ///
+    /// CONTRACT: the returned tensor must NEVER be passed to a HIP call — its buffer
+    /// is null and dereferencing it on the GPU is undefined behavior. It exists only
+    /// so cross-crate tests can borrow a `&GpuTensor` for metadata-only logic.
+    ///
+    /// Not `#[cfg(test)]`-gated on purpose: `#[cfg(test)]` here would only be active
+    /// when `rdna-compute`'s own tests build, making this invisible to dependent
+    /// crates' tests (e.g. `hipfire-dispatch`). `#[doc(hidden)]` keeps it out of the
+    /// public API surface while remaining reachable cross-crate, matching the
+    /// `FeatureFlags::from_env_for_test` precedent.
+    #[doc(hidden)]
+    pub fn null_for_test() -> Self {
+        GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(std::ptr::null_mut::<std::ffi::c_void>(), 0) },
+            shape: vec![0],
+            dtype: crate::DType::F32,
+        }
+    }
+
     /// Create a non-owning sub-view at a byte offset. For F32 tensors,
     /// `offset_elems` is the number of f32 elements to skip.
     /// The returned tensor is a view — do NOT free it.
@@ -195,8 +217,6 @@ pub enum DType {
     Q8HFQ,        // split-metadata: scales contiguous then values contiguous, 128B-aligned rows
     HFQ4G256,     // 136 bytes per 256 elements (flat 4-bit, f32 scale+zero, 18 VGPRs)
     HFQ4G128,     // 72 bytes per 128 elements (flat 4-bit, f32 scale+zero, 14 VGPRs)
-    PARO4G128,    // ParoQuant: native G128 W4 plus pairwise activation rotation metadata
-    PARO4G128T,   // ParoQuant: engine-tiled qweight [M/8, K] for coalesced GEMV reads
     HFQ3G256,     // 104 bytes per 256 elements (flat 3-bit, f32 scale+zero)
     HFQ3G128,     // 56 bytes per 128 elements (flat 3-bit, f32 scale+zero)
     MQ4G256,      // MagnumQuant: FWHT-rotated HFQ4-G256 (136 bytes/group, same as HFQ4G256)
@@ -238,8 +258,6 @@ impl DType {
             | DType::Q8HFQ
             | DType::HFQ4G256
             | DType::HFQ4G128
-            | DType::PARO4G128
-            | DType::PARO4G128T
             | DType::HFQ3G256
             | DType::HFQ3G128
             | DType::HFQ2G256
@@ -839,6 +857,54 @@ impl Gpu {
             replay_graph_cache: HashMap::new(),
             replay_warmed_up: HashSet::new(),
             replay_capturing_n: None,
+            scratch: crate::scratch::ScratchState {
+                mq_signs1: None,
+                mq_signs2: None,
+                mq_signs1_128: None,
+                mq_signs2_128: None,
+                mq_x_rot: None,
+                mq_x_rot_fp8: None,
+                mq_x_rot_fp8_bytes: 0,
+                mq_x_q8: None,
+                mq_x_scales: None,
+                paro_x_scratch: None,
+                paro_fused_scratch: None,
+                fp16_x_scratch: None,
+                fp16_x_scratch_bytes: 0,
+                fp16_x_source_ptr: std::ptr::null_mut(),
+                fp8_x_scratch: None,
+                fp8_x_scratch_bytes: 0,
+                fp8_x_source_ptr: std::ptr::null_mut(),
+                q8_1_mmq_x_scratch: None,
+                q8_1_mmq_x_scratch_bytes: 0,
+                ksplit_det_partials: None,
+                ksplit_det_partials_bytes: 0,
+            },
+            mmq_screen: MmqScreenState {
+                cache: HashMap::new(),
+                enabled: mmq_screen,
+                threshold: mmq_screen_threshold,
+            },
+            graphs: crate::graph::GraphState {
+                capture_mode: false,
+                capture_blobs: Vec::new(),
+                graph_exec: None,
+                captured_graph: None,
+                ar_forward_kernel_dirty: true,
+                ar_forward_replay_enabled: false,
+                verify: crate::graph::PerBGraphCache {
+                    cache: std::collections::HashMap::new(),
+                    warmed_up: std::collections::HashSet::new(),
+                    capturing: None,
+                    lmhead_argmax: std::collections::HashSet::new(),
+                },
+                replay: crate::graph::PerBGraphCache {
+                    cache: std::collections::HashMap::new(),
+                    warmed_up: std::collections::HashSet::new(),
+                    capturing: None,
+                    lmhead_argmax: std::collections::HashSet::new(),
+                },
+            },
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
             capture_handler: None,
@@ -2200,6 +2266,31 @@ impl Gpu {
         Ok(tensor)
     }
 
+    /// Allocate an F32 tensor filled with a constant `value` (host-side fill +
+    /// sync htod). Used for `-inf`-initialised buffers where a byte-memset
+    /// can't express the bit pattern (e.g. the compressor `score_state`, which
+    /// the reference inits to `float("-inf")` so unfilled pool slots get zero
+    /// softmax weight).
+    pub fn full_f32(&mut self, shape: &[usize], value: f32) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let tensor = self.alloc_tensor(shape, DType::F32)?;
+        let data = vec![value; tensor.numel()];
+        let bytes =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+        self.hip.memcpy_htod(&tensor.buf, bytes)?;
+        Ok(tensor)
+    }
+
+    /// In-place constant fill of an existing F32 tensor (sync htod).
+    pub fn fill_f32(&mut self, tensor: &GpuTensor, value: f32) -> HipResult<()> {
+        self.bind_thread()?;
+        let data = vec![value; tensor.numel()];
+        let bytes =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+        self.hip.memcpy_htod(&tensor.buf, bytes)?;
+        Ok(())
+    }
+
     pub fn download_f32(&self, tensor: &GpuTensor) -> HipResult<Vec<f32>> {
         self.bind_thread()?;
         let numel = tensor.numel();
@@ -2691,6 +2782,18 @@ impl Gpu {
         self.graph_destroy();
         self.verify_graph_destroy_all();
         self.replay_graph_destroy_all();
+        self.graphs.graph_destroy(&self.hip, self.device_id);
+        self.graphs
+            .verify_graph_destroy_all(&self.hip, self.device_id);
+        self.graphs
+            .replay_graph_destroy_all(&self.hip, self.device_id);
+    }
+
+    /// Drop captured graph state after a live KV layout switch so the next
+    /// forward captures the current K/V modes and kernarg blobs.
+    pub fn invalidate_for_kv_mode_switch(&mut self) {
+        // bind_thread: skip — delegates to invalidate_graph_state(), which binds.
+        self.invalidate_graph_state();
     }
 
     // ── Kernel operations ───────────────────────────────────────

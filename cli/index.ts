@@ -8,253 +8,47 @@
 //   hipfire sidecar-gen <model>       → generate TriAttention calibration sidecar
 
 import { spawn } from "bun";
-import {
-  existsSync,
-  readdirSync,
-  statSync,
-  unlinkSync,
-  mkdirSync,
-  readFileSync,
-  writeFileSync,
-} from "fs";
+import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync, copyFileSync, cpSync, rmSync, renameSync, readFileSync, writeFileSync } from "fs";
 import { join, resolve, basename, dirname } from "path";
 import { homedir } from "os";
-import { createHash, randomUUID } from "crypto";
-import { runEvalCommand } from "./eval";
-import {
-  PriorityDecodeScheduler,
-  PriorityPrefillScheduler,
-  type ActiveDecodeSession,
-} from "./worker_scheduler";
-import {
-  parseServerPrefillBatchPolicy,
-  serverPrefillBatchEligibility,
-  createServerPrefillSession,
-  serverPrefillPendingWaitMs,
-} from "./server_prefill_batch";
-import { shouldQueueServerPrefillPending } from "./server_prefill_request_path";
-import {
-  parseSchedulerPriority,
-  parseServerPrefillPolicyControls,
-  schedulerPolicyForPriority,
-} from "./scheduler_policy";
-import {
-  createPrefixCheckpointManifest,
-  prefixCheckpointCompatible,
-  prefixCheckpointDaemonCompatible,
-  prefixCheckpointAttachable,
-  prefixCheckpointCacheKey,
-  removeAttachableManifestsByRuntimeHandle,
-  selectResidentCheckpointEvictions,
-  touchPrefixCheckpointManifest,
-  spillEligibility,
-  type PrefixCheckpointManifest,
-  type PrefixCheckpointFingerprint,
-} from "./state_cache";
-import {
-  modelWorkerKeyId,
-  type RequestSessionDraft,
-  type SessionStateKind,
-  type ModelWorkerKey,
-} from "./session_state";
-import { pickServingModelWorker } from "./model_worker_routing";
-import {
-  buildGenerateBatchPrefillProbeMessage,
-  interpretGenerateBatchPrefillProbeResponse,
-  prefillBatchRequestDispatchStatus,
-  prefillBatchRuntimeDispatchStatus,
-  type GenerateBatchPrefillCapability,
-} from "./generate_batch_prefill_protocol";
-import {
-  buildPrefillBatchHealthPayload,
-  buildBatchHealthPayload,
-  type PrefillBatchHealthInputs,
-  type BatchExecutionMode,
-  type BatchFallbackReason,
-} from "./prefill_batch_health";
-import {
-  isSupportedBatchEndpoint,
-  validateBatchInputForBatch,
-  buildBatchInputErrorArtifact,
-  buildBatchOutputArtifact,
-  type BatchRecord as StoredBatchRecord,
-  type BatchFileRecord,
-  type BatchInputRecord,
-  countUnsupportedModeErrors,
-  normalizePromptCacheKey,
-  normalizePromptCacheRetention,
-} from "./batch_api";
-import {
-  buildDummyLoadMessage,
-  DUMMY_MODEL_SENTINEL_PATH,
-  isDummyModelPath,
-  resolveDummyModelPath,
-} from "./dummy_model";
 
 const HIPFIRE_DIR = join(homedir(), ".hipfire");
 const MODELS_DIR = join(HIPFIRE_DIR, "models");
-const API_DATA_DIR = join(HIPFIRE_DIR, "api");
-const BATCH_FILE_DIR = join(API_DATA_DIR, "batch_files");
+const TEMPLATES_DIR = join(HIPFIRE_DIR, "templates");
+const DRAFTS_DIR = join(HIPFIRE_DIR, "drafts");
+const TRIATTN_DIR = join(HIPFIRE_DIR, "triattn");
 const CONFIG_PATH = join(HIPFIRE_DIR, "config.json");
+const MODELS_CATALOG_PATH = join(HIPFIRE_DIR, "models.json");
 const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_PORT = 11435;
 const TEMP_CORRECTION = 0.82;
 
 mkdirSync(MODELS_DIR, { recursive: true });
-mkdirSync(API_DATA_DIR, { recursive: true });
-mkdirSync(BATCH_FILE_DIR, { recursive: true });
-
-function newObjectId(prefix: string): string {
-  return `${prefix}_${randomUUID().replace(/-/g, "")}`;
-}
-
-function nowUnixSeconds(): number {
-  return Math.floor(Date.now() / 1000);
-}
-
-function normalizeLineIdHint(value: string): string {
-  return value.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 48);
-}
-
-function toBatchLineFallbackReason(code: string): BatchFallbackReason {
-  if (code === "streaming_unsupported") return "line_fallback:streaming_unsupported";
-  if (code === "tools_unsupported") return "line_fallback:tools";
-  if (code === "unsupported_content") return "line_fallback:unsupported_content";
-  if (code === "endpoint_mismatch") return "line_fallback:endpoint_mismatch";
-  if (code === "model_mismatch") return "line_fallback:model_mismatch";
-  if (code === "model_missing") return "line_fallback:model_missing";
-  if (code === "invalid_url") return "line_fallback:invalid_url";
-  if (code === "invalid_body") return "line_rejected:invalid_body";
-  if (code === "duplicate_custom_id") return "line_fallback:duplicate_custom_id";
-  if (code === "invalid_custom_id") return "line_rejected:invalid_custom_id";
-  if (code === "invalid_messages") return "line_fallback:invalid_messages";
-  if (code === "invalid_responses_input") return "line_fallback:invalid_responses_input";
-  if (code === "validation_rejected") return "validation_failed";
-  if (code === "batch_validation_rejected") return "batch_validation_rejected";
-  return "line_rejected:unsupported_mode";
-}
-
-type BatchJobRecord = StoredBatchRecord & {
-  metadata?: Record<string, unknown> | null;
-  completion_window?: string;
-};
-
-type StoredResponsesContext = {
-  id: string;
-  model: string | null;
-  messages: any[];
-  promptCacheKey?: string;
-  createdAtMs: number;
-  lastUsedAtMs: number;
-};
-
-function batchArtifactPath(fileId: string): string {
-  return join(BATCH_FILE_DIR, fileId);
-}
-
-function readBatchFile(fileId: string): string {
-  const path = batchArtifactPath(fileId);
-  return readFileSync(path, "utf8");
-}
-
-function writeBatchArtifact(fileId: string, content: string): void {
-  writeFileSync(batchArtifactPath(fileId), content, "utf8");
-}
-
-function cloneJsonValue<T>(value: T): T {
-  if (value === undefined) return value;
-  try {
-    return JSON.parse(JSON.stringify(value));
-  } catch {
-    return value;
-  }
-}
-
-function cloneChatMessages(messages: any[]): any[] {
-  return messages.map((message) => cloneJsonValue(message));
-}
-
-function parseResponsesToChatBody(rawBody: any): any {
-  if (rawBody === null || typeof rawBody !== "object") return rawBody;
-  const messages: any[] = [];
-  const input = rawBody.input;
-  if (Array.isArray(input)) {
-    for (const entry of input) {
-      if (entry && typeof entry === "object" && typeof entry.role === "string") {
-        messages.push({
-          role: entry.role,
-          content: entry.content ?? "",
-        });
-      }
-    }
-  } else if (typeof input === "string") {
-    messages.push({ role: "user", content: input });
-  } else if (input && typeof input === "object" && Array.isArray(input.messages)) {
-    for (const m of input.messages) {
-      if (m && typeof m === "object" && typeof m.role === "string") {
-        messages.push({
-          role: m.role,
-          content: m.content ?? "",
-          tools: m.tools,
-          tool_calls: m.tool_calls,
-        });
-      }
-    }
-  } else {
-    messages.push({ role: "user", content: rawBody.prompt ?? "" });
-  }
-
-  return {
-    model: rawBody.model,
-    temperature: rawBody.temperature ?? 0.0,
-    top_p: rawBody.top_p ?? 1.0,
-    max_tokens: rawBody.max_output_tokens ?? rawBody.max_tokens ?? 16,
-    stream: rawBody.stream ?? false,
-    messages,
-    tools: rawBody.tools ?? [],
-    tool_choice: rawBody.tool_choice ?? null,
-    previous_response_id: rawBody.previous_response_id ?? null,
-    conversation: rawBody.conversation ?? null,
-    prompt_cache_key: normalizePromptCacheKey(rawBody.prompt_cache_key),
-    prompt_cache_retention: normalizePromptCacheRetention(rawBody.prompt_cache_retention),
-    metadata: rawBody.metadata,
-  };
-}
-
-function toResponsesObject(reqId: string, chatResponse: any): any {
-  const firstChoice = chatResponse?.choices?.[0];
-  const content = firstChoice?.message?.content ?? "";
-  const reasoning = firstChoice?.message?.reasoning_content;
-  return {
-    id: `resp_${reqId.replace("chatcmpl_", "")}`,
-    object: "response",
-    created: nowUnixSeconds(),
-    model: chatResponse?.model ?? "",
-    output: [{
-      id: `out_${reqId}`,
-      type: "message",
-      role: "assistant",
-      status: "completed",
-      content: [{ type: "output_text", text: content, annotations: [] }],
-      reasoning_content: reasoning ?? null,
-    }],
-    usage: chatResponse?.usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-    status: "completed",
-  };
-}
 
 // ─── Persistent config ─────────────────────────────────
 export interface HipfireConfig {
   kv_cache: string;       // "auto" (per-arch default), "q8", "asym4", "asym3", "asym2"
+  // Adaptive KV: runtime VRAM-fit precision downshift as context grows.
+  //   "off" (default)  — fixed-precision KV (no behavior change)
+  //   "conservative"   — V q8→lloyd4 only (gentlest)
+  //   "balanced"       — V q8→lloyd4→lloyd3→lloyd2 + K fwht4→fwht2
+  //   "aggressive"     — same floor as balanced, earliest thresholds
+  //   "advanced:k=<fwht4|fwht3|fwht2>,v=<lloyd4|lloyd3|lloyd2>" — explicit floors
+  // With adaptive on, max_seq is the context GUARANTEED at the floor tier;
+  // short contexts run fast/high-precision and downshift only as needed.
+  // Works best with kv_cache=fwht4 (K starts at fwht4). Opt-in; passed to the
+  // daemon as params.kv_adaptive, overriding the HIPFIRE_KV_ADAPTIVE env.
+  kv_adaptive: string;
   flash_mode: string;     // "auto" (ctx-gated), "always", "never" — only affects Q8 path
   default_model: string;  // model tag for serve pre-warm, e.g. "qwen3.5:9b"
   temperature: number;    // default temperature for run
   top_p: number;
   repeat_penalty: number;
   max_tokens: number;     // per-turn generation cap
-  max_seq: number;        // logical context-window limit; physical KV allocation may be smaller
+  max_seq: number;        // KV cache capacity allocated at model load (shared across turns)
   thinking: string;       // "on" (model reasons in <think>, stripped from display) | "off" (suppress thinking)
   max_think_tokens: number; // per-turn budget for <think>...</think> reasoning (0 = unlimited)
+  max_total_think_tokens: number; // re-arm-proof TOTAL <think> budget across the turn (0 = off). Force-closes + blocks <think> re-open at the cap; hard-EOS past it. Bounds models that re-open <think> and out-think client timeouts.
   host: string;           // default serve bind address
   port: number;           // default serve port
   idle_timeout: number;   // serve: seconds of inactivity before unloading the model (0 = never)
@@ -283,7 +77,7 @@ export interface HipfireConfig {
   // produce subtle output drift on certain prompt shapes that hide behind
   // higher peak tok/s — confounded debugging when DFlash was silently
   // on by default (auto). Opt in per-model with
-  // `hipfire config set-model <tag> dflash_mode on` once you've confirmed
+  // `hipfire config <tag> set dflash_mode on` once you've confirmed
   // the model + prompt shape on your hardware.
   //
   // A3B-specific rationale (kept for the `auto` path): A3B DFlash is a
@@ -306,7 +100,7 @@ export interface HipfireConfig {
   dflash_ngram_block: "auto" | boolean;
 
   // ── TriAttention / CASK KV eviction (0.1.7-alpha) ─────────────────────
-  // `cask_sidecar` is a .triattn.hfq path. Empty string = eviction disabled.
+  // `cask_sidecar` is a .triattn.bin path. Empty string = eviction disabled.
   // When set, the engine compacts KV against the sidecar's band-centers
   // once the active token count exceeds `cask_budget + cask_beta`.
   cask_sidecar: string;
@@ -320,7 +114,7 @@ export interface HipfireConfig {
   cask_fold_m: number;       // m-way merge factor for non-core slots (CASK only)
   // When true (default), `serve`/`run` auto-discover a TriAttention sidecar
   // next to the loaded model file (registry's `triattn.file` first, then a
-  // glob fallback for `<model-stem>.triattn.hfq`) and engage CASK with the
+  // glob fallback for `<basename>.triattn*.bin`) and engage CASK with the
   // current policy values. The `off` profile disables this; explicit-`off`
   // beats discovery. Already silently skipped on A3B targets regardless of
   // this flag (R̄ hard rule).
@@ -333,14 +127,6 @@ export interface HipfireConfig {
   // code prompts by up to +26.7% (commit 8a4a211). Default ON since
   // 2026-04-26 (commit 9a2c667).
   prompt_normalize: boolean;
-
-  // ── Loader / HIP runtime controls ─────────────────────────────────────
-  // These mirror low-level runtime env vars so locally spawned daemon/run
-  // paths can persist the same behavior as ad-hoc shell exports.
-  gpu_slab_load: "auto" | "on" | "off";       // HIPFIRE_GPU_SLAB_LOAD
-  gpu_slab_mib: number;                       // HIPFIRE_GPU_SLAB_MIB
-  load_transport: "pread" | "pinned" | "direct"; // HIPFIRE_LOAD_TRANSPORT
-  hip_wait: "auto" | "spin" | "yield" | "blocking"; // HIPFIRE_HIP_WAIT
 
   // ── MMQ per-weight screening (#87) ──────────────────────────────────
   // Tri-state guard for the i8 WMMA (MMQ) prefill path. When MMQ is
@@ -394,6 +180,7 @@ const ARCH_DEFAULTS = archDefaults(DETECTED_ARCH);
 
 const CONFIG_DEFAULTS: HipfireConfig = {
   kv_cache: ARCH_DEFAULTS.kv_cache,
+  kv_adaptive: "off",
   flash_mode: "auto",
   default_model: "qwen3.5:9b",
   temperature: 0.3,
@@ -403,10 +190,23 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   // causes MQ4/MQ6 models to emit gibberish at temp=0 because the penalty
   // applies uniformly even in greedy mode. 1.05 is user-validated.
   repeat_penalty: 1.05,
-  max_tokens: 512,
+  // 4096 is large enough for code-emit tool calls (Pi's `write`/`edit`
+  // tools pass entire file bodies as a string argument inside a single
+  // `<tool_call>` block) without being so large that a runaway thinking
+  // loop burns minutes of decode. Bumped from 512 in 2026-05-28 after
+  // a Pi session truncated a Zig source file mid-string at 512 tokens
+  // and silently dropped the tool call (parseToolCalls returned null
+  // on the unclosed `<tool_call>` block → finish_reason="stop").
+  max_tokens: 4096,
   max_seq: 32768,
   thinking: "on",
-  max_think_tokens: 0,
+  // Default reasoning budget (was 0 = unlimited). A non-zero cap bounds the
+  // <think> span so a long-reasoning turn force-closes and commits to its
+  // answer (daemon splices the continuation) instead of running until the
+  // client times out and terminates the stream mid-think. Override per-model
+  // or set 0 for unlimited (e.g. reasoning.effort=xhigh maps to 0).
+  max_think_tokens: 2048,
+  max_total_think_tokens: 0,
   host: DEFAULT_HOST,
   port: DEFAULT_PORT,
   idle_timeout: 300,
@@ -425,10 +225,6 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   // +24% τ on PEP-8-style code prompts (159→196 tok/s on 27B-3.5 LRU DFlash).
   // Set false (or HIPFIRE_NORMALIZE_PROMPT=0) to opt out.
   prompt_normalize: true,
-  gpu_slab_load: "auto",
-  gpu_slab_mib: 512,
-  load_transport: "pread",
-  hip_wait: "auto",
   // MMQ per-weight screening: detect Q8_1 outlier rows and fall back to
   // WMMA. Default `auto`: the daemon arch-gates this to RDNA3/3.5
   // (gfx1100/1101/1102/1103/1150/1151) and only fires when MMQ is active
@@ -438,8 +234,8 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   mmq_screen_threshold: 0.10,
 
   // PFlash off by default. Operators opt in per target via:
-  //   hipfire config set-model <tag> prefill_compression auto
-  //   hipfire config set-model <tag> prefill_drafter ~/.hipfire/models/<drafter>.hfq
+  //   hipfire config <tag> set prefill_compression auto
+  //   hipfire config <tag> set prefill_drafter ~/.hipfire/models/<drafter>.hfq
   prefill_compression: "off",
   prefill_threshold: 32768,
   prefill_keep_ratio: 0.05,
@@ -456,9 +252,32 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   mtp_k: 3,
 };
 
+const KV_ADAPTIVE_OPTIONS = [
+  "off",
+  "conservative",
+  "balanced",
+  "aggressive",
+  "advanced:k=fwht4,v=lloyd4",
+  "advanced:k=fwht4,v=lloyd3",
+  "advanced:k=fwht4,v=lloyd2",
+  "advanced:k=fwht3,v=lloyd4",
+  "advanced:k=fwht3,v=lloyd3",
+  "advanced:k=fwht3,v=lloyd2",
+  "advanced:k=fwht2,v=lloyd4",
+  "advanced:k=fwht2,v=lloyd3",
+  "advanced:k=fwht2,v=lloyd2",
+];
+
+function validateKvAdaptiveValue(value: any): boolean {
+  if (typeof value !== "string") return false;
+  if (KV_ADAPTIVE_OPTIONS.includes(value)) return true;
+  return /^advanced:k=(fwht4|fwht3|fwht2),v=(lloyd4|lloyd3|lloyd2)$/.test(value);
+}
+
 function validateConfigValue(key: string, value: any): boolean {
   switch (key) {
-    case "kv_cache": return ["auto", "q8", "asym4", "asym3", "asym2", "turbo", "turbo4", "turbo3", "turbo2"].includes(value);
+    case "kv_cache": return ["auto", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2", "turbo", "turbo4", "turbo3", "turbo2"].includes(value);
+    case "kv_adaptive": return validateKvAdaptiveValue(value);
     case "flash_mode": return ["auto", "always", "never"].includes(value);
     case "temperature": return typeof value === "number" && value >= 0 && value <= 2;
     case "top_p": return typeof value === "number" && value > 0 && value <= 1;
@@ -467,6 +286,7 @@ function validateConfigValue(key: string, value: any): boolean {
     case "max_seq": return typeof value === "number" && Number.isInteger(value) && value >= 512 && value <= 524288;
     case "thinking": return ["on", "off"].includes(value);
     case "max_think_tokens": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 32768;
+    case "max_total_think_tokens": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 1000000;
     case "host": return typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= 255 && !/\s/.test(value);
     case "port": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
     case "idle_timeout": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 86400;
@@ -483,10 +303,6 @@ function validateConfigValue(key: string, value: any): boolean {
     case "cask_fold_m": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 16;
     case "cask_auto_attach": return typeof value === "boolean";
     case "prompt_normalize": return typeof value === "boolean";
-    case "gpu_slab_load": return ["auto", "on", "off"].includes(value);
-    case "gpu_slab_mib": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 262144;
-    case "load_transport": return ["pread", "pinned", "direct"].includes(value);
-    case "hip_wait": return ["auto", "spin", "yield", "blocking"].includes(value);
     case "mmq_screen": return ["off", "on", "auto"].includes(value);
     case "mmq_screen_threshold": return typeof value === "number" && value > 0 && value <= 1;
     case "prefill_compression": return ["off", "auto", "always"].includes(value);
@@ -538,7 +354,9 @@ function saveConfig(cfg: HipfireConfig) {
 const cfg = loadConfig();
 
 // ─── Per-model config overlays ──────────────────────────
-// Sparse per-tag overrides. Stored in ~/.hipfire/per_model_config.json.
+// Sparse per-tag overrides. Stored in ~/.hipfire/models.json (schema v2).
+// Legacy ~/.hipfire/per_model_config.json is read once and folded into the
+// catalog on refresh.
 // Resolution order: --flag > per-model > global > engine fallback.
 
 const PER_MODEL_CONFIG_PATH = join(HIPFIRE_DIR, "per_model_config.json");
@@ -546,8 +364,8 @@ const PER_MODEL_CONFIG_PATH = join(HIPFIRE_DIR, "per_model_config.json");
 // Fields that make sense to override per-model. host + port + idle_timeout + default_model
 // are serve-wide so they stay global-only.
 const PER_MODEL_KEYS = [
-  "kv_cache", "flash_mode", "temperature", "top_p",
-  "repeat_penalty", "max_tokens", "max_seq", "thinking", "max_think_tokens",
+  "kv_cache", "kv_adaptive", "flash_mode", "temperature", "top_p",
+  "repeat_penalty", "max_tokens", "max_seq", "thinking", "max_think_tokens", "max_total_think_tokens",
   "dflash_adaptive_b", "dflash_mode", "dflash_ngram_block",
   "cask_sidecar", "cask",
   "cask_budget", "cask_beta", "cask_core_frac", "cask_fold_m",
@@ -569,42 +387,43 @@ type PerModelOverride = Partial<Pick<HipfireConfig, PerModelKey>>;
 type PerModelConfigs = Record<string, PerModelOverride>;
 
 function loadPerModelConfigs(): PerModelConfigs {
-  try {
-    const raw = JSON.parse(require("fs").readFileSync(PER_MODEL_CONFIG_PATH, "utf-8"));
-    const out: PerModelConfigs = {};
-    let migrated = false;
-    for (const [tag, ov] of Object.entries(raw ?? {})) {
-      const clean: PerModelOverride = {};
-      // Migrate legacy boolean mmq_screen → tri-state. Pre-2026-05-01 per-model
-      // overlays from PR #104 stored true/false; without this they'd fail the
-      // new tri-state validator and the override would silently disappear.
-      if (typeof (ov as any)?.mmq_screen === "boolean") {
-        (ov as any).mmq_screen = (ov as any).mmq_screen ? "on" : "off";
-        migrated = true;
-      }
-      for (const k of PER_MODEL_KEYS) {
-        const v = (ov as any)?.[k];
-        if (v !== undefined && validateConfigValue(k, v)) (clean as any)[k] = v;
-      }
-      if (Object.keys(clean).length > 0) out[tag] = clean;
-    }
-    // Persist migration so the legacy boolean doesn't sit in the file forever
-    // tripping every read. Best-effort: if the write fails (read-only fs,
-    // permission), the in-memory result is still correct for this run.
-    if (migrated) {
-      try { savePerModelConfigs(out); } catch {}
-    }
-    return out;
-  } catch { return {}; }
+  const out: PerModelConfigs = {};
+  const merge = (tag: string, ov: any) => {
+    const clean = sanitizePerModelOverride(ov);
+    if (Object.keys(clean).length > 0) out[tag] = { ...(out[tag] ?? {}), ...clean };
+  };
+
+  for (const [tag, ov] of Object.entries(loadLegacyPerModelConfigsRaw())) merge(tag, ov);
+
+  const catalog = loadModelsCatalog();
+  for (const [tag, ov] of Object.entries(catalog.configs ?? {})) merge(tag, ov);
+  for (const [id, model] of Object.entries(catalog.models ?? {})) {
+    if (!model.config || Object.keys(model.config).length === 0) continue;
+    merge(id, model.config);
+  }
+  return out;
 }
 
 function savePerModelConfigs(all: PerModelConfigs) {
-  // Drop empty entries so the file stays minimal
-  const clean: PerModelConfigs = {};
+  const catalog = refreshModelsCatalog({ write: false });
+  const configs: PerModelConfigs = {};
+
+  for (const model of Object.values(catalog.models)) delete model.config;
+
   for (const [tag, ov] of Object.entries(all)) {
-    if (Object.keys(ov).length > 0) clean[tag] = ov;
+    const clean = sanitizePerModelOverride(ov);
+    if (Object.keys(clean).length === 0) continue;
+    const modelId = catalogModelIdForConfigKey(catalog, tag);
+    if (modelId && catalog.models[modelId]) {
+      catalog.models[modelId].config = { ...(catalog.models[modelId].config ?? {}), ...clean };
+    } else {
+      configs[tag] = clean;
+    }
   }
-  require("fs").writeFileSync(PER_MODEL_CONFIG_PATH, JSON.stringify(clean, null, 2) + "\n");
+
+  catalog.configs = configs;
+  writeModelsCatalog(catalog);
+  clearLegacyPerModelConfigs();
 }
 
 // Return the effective config for a given model tag. Per-model overrides
@@ -613,21 +432,20 @@ function savePerModelConfigs(all: PerModelConfigs) {
 // take effect without restarting a running `hipfire serve`.
 function resolveModelConfig(tag: string | null | undefined): HipfireConfig {
   const base = loadConfig();
-  const envMaxSeq = process.env.HIPFIRE_MAX_SEQ
-    ? Number.parseInt(process.env.HIPFIRE_MAX_SEQ, 10)
-    : undefined;
-  const applyEnv = (config: HipfireConfig): HipfireConfig =>
-    envMaxSeq !== undefined && Number.isFinite(envMaxSeq) && envMaxSeq >= 512
-      ? { ...config, max_seq: Math.floor(envMaxSeq) }
-      : config;
-  if (!tag) return applyEnv(base);
+  if (!tag) return base;
   const all = loadPerModelConfigs();
   const resolved = resolveModelTag(tag);
+  const catalogId = catalogModelIdForConfigKey(loadModelsCatalog(), tag);
   // Layer both keys: a model can carry overrides under the canonical
   // registry tag AND under the user alias. Alias wins where both set a
   // key, but neither drops the other. Previous `resolved ?? tag` picked
   // exactly one entry, so any key only present on the other vanished.
-  return applyEnv({ ...base, ...(all[resolved] ?? {}), ...(tag !== resolved ? (all[tag] ?? {}) : {}) });
+  return {
+    ...base,
+    ...(catalogId ? (all[catalogId] ?? {}) : {}),
+    ...(all[resolved] ?? {}),
+    ...(tag !== resolved ? (all[tag] ?? {}) : {}),
+  };
 }
 
 // applyThinkingMode is intentionally NOT called anywhere. The previous
@@ -671,69 +489,27 @@ function sizeAwareKvMode(baseMode: string, resolved: HipfireConfig, tag?: string
   return isLarge ? "asym4" : baseMode;
 }
 
-function isBf16ArtifactPath(path: string): boolean {
-  return /(^|[-_.])bf16($|[-_.])/.test(basename(path).toLowerCase());
-}
-
-function positiveIntEnv(name: string): number | undefined {
-  const raw = process.env[name];
-  if (!raw) return undefined;
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : undefined;
-}
-
-function estimatePromptPhysicalTokens(prompt: string): number {
-  if (!prompt) return 0;
-  return Math.max(
-    approximatePromptTokenIds(prompt).length,
-    Math.ceil(prompt.length / 3),
-  );
-}
-
-function defaultPhysicalCapForLoad(maxSeq: number, maxTokens: number): number {
-  const envCap = positiveIntEnv("HIPFIRE_KV_PHYSICAL_CAP")
-    ?? positiveIntEnv("HIPFIRE_KV_INITIAL_PHYSICAL_CAP");
-  const minViable = Math.max(512, maxTokens + 1024);
-  return Math.min(maxSeq, Math.max(minViable, envCap ?? 2048));
-}
-
-function physicalCapForRequest(maxSeq: number, prompt: string, maxTokens: number, visualHeadroom = 0): number {
-  const trailerHeadroom = 32;
-  const promptEstimate = estimatePromptPhysicalTokens(prompt);
-  return Math.min(
-    maxSeq,
-    Math.max(512, promptEstimate + maxTokens + visualHeadroom + trailerHeadroom),
-  );
-}
-
 function buildLoadMessage(path: string, tag?: string | null): any {
-  if (isDummyModelPath(path)) {
-    return buildDummyLoadMessage();
-  }
-
   const resolved = resolveModelConfig(tag);
   // Guard: the KV cache must be big enough to hold at least one max_tokens
   // response plus a little prompt headroom; otherwise the daemon panics mid-
   // generation. Auto-bump rather than crash.
-  const envMaxSeq = process.env.HIPFIRE_MAX_SEQ
-    ? Number.parseInt(process.env.HIPFIRE_MAX_SEQ, 10)
-    : undefined;
-  const hasEnvMaxSeq = envMaxSeq !== undefined && Number.isFinite(envMaxSeq) && envMaxSeq >= 512;
-  const minViable = hasEnvMaxSeq ? 512 : resolved.max_tokens + 1024;
-  const requestedMaxSeq =
-    hasEnvMaxSeq
-      ? Math.floor(envMaxSeq)
-      : resolved.max_seq;
-  const max_seq = Math.max(requestedMaxSeq, minViable);
-  if (max_seq > requestedMaxSeq) {
-    console.error(`[hipfire] note: max_seq (${requestedMaxSeq}) < max_tokens (${resolved.max_tokens}) + 1024 — bumping to ${max_seq} for this load`);
-  } else if (requestedMaxSeq !== resolved.max_seq) {
-    console.error(`[hipfire] max_seq overridden by HIPFIRE_MAX_SEQ=${requestedMaxSeq}`);
+  const minViable = resolved.max_tokens + 1024;
+  const max_seq = Math.max(resolved.max_seq, minViable);
+  if (max_seq > resolved.max_seq) {
+    console.error(`[hipfire] note: max_seq (${resolved.max_seq}) < max_tokens (${resolved.max_tokens}) + 1024 — bumping to ${max_seq} for this load`);
   }
-  const params: any = {
-    max_seq,
-    physical_cap: defaultPhysicalCapForLoad(max_seq, resolved.max_tokens),
-  };
+  const params: any = { max_seq };
+
+  // Expert-parallel degree (EP, task #26). `hipfire serve --tp N` (which sets
+  // HIPFIRE_TP) shards the routed experts across N GPUs via the daemon's
+  // load_model_ep (MiniMax-M2 / DeepSeek-V4). Forwarded only when > 1 so
+  // single-GPU loads stay byte-identical; the daemon refuses tp>1 for
+  // non-EP arches and for DFlash drafters (mutually exclusive with pp).
+  {
+    const tp = parseInt(process.env.HIPFIRE_TP ?? "1", 10);
+    if (Number.isInteger(tp) && tp > 1) params.tp = tp;
+  }
 
   // Resolve KV mode per-model: honors --kv-mode / per-model / global, then
   // applies size-aware default so 27B+ gets asym4 automatically. Daemon
@@ -744,16 +520,14 @@ function buildLoadMessage(path: string, tag?: string | null): any {
     console.error(`[hipfire] kv_mode bumped for ${tag}: ${baseMode} → ${effectiveMode} (deep stack, asym3 layer-count compounding)`);
   }
   params.kv_mode = effectiveMode;
-  const stateQuantOverride = process.env.HIPFIRE_QWEN35_STATE_QUANT || process.env.HIPFIRE_STATE_QUANT;
-  if (stateQuantOverride) {
-    params.state_quant = stateQuantOverride;
-  }
-  if (isBf16ArtifactPath(path)) {
-    if (params.kv_mode !== "fp32") {
-      console.error(`[hipfire] bf16 artifact detected — forcing kv_mode=fp32 for gold-path verification`);
-    }
-    params.kv_mode = "fp32";
-    params.state_quant = "fp32";
+
+  // Adaptive KV (opt-in). When set to anything other than "off", forward the
+  // selector as params.kv_adaptive — the daemon prefers it over the
+  // HIPFIRE_KV_ADAPTIVE env (param wins; env is fallback; neither ⇒ off).
+  // Left absent on the default "off" so existing loads are byte-for-byte
+  // unchanged.
+  if (resolved.kv_adaptive && resolved.kv_adaptive !== "off") {
+    params.kv_adaptive = resolved.kv_adaptive;
   }
 
   // Optional DFlash draft. The daemon wires this into a greedy speculative-
@@ -764,10 +538,9 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   //    target name. Pass "" (empty string) to disable even when a matching
   //    draft would otherwise be found.
   //
-  // 2. Auto-match: look alongside the target for a file named with the new
-  //    role-sidecar convention, e.g. `qwen3.5-27b-mq4.dflash.hfq`. Size is
-  //    extracted from the target path (e.g. `qwen3.5-27b-mq4.hfq` → size=27b).
-  //    Only runs when #1 is unset.
+  // 2. Auto-match: look alongside the target for a file named
+  //    `qwen35-<size>-dflash-<quant>.hfq`. Size is extracted from the target
+  //    path (e.g. `qwen3.5-27b.mq4` → size=27b). Only runs when #1 is unset.
   //
   // If the draft file is missing the daemon logs a warning and falls back
   // to AR (no client-visible error).
@@ -791,7 +564,7 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   const dflashAllowed = mode === "on" || (mode === "auto" && autoOn);
   if (!dflashAllowed) {
     if (mode === "auto" && isA3B) {
-      const hint = tag ? `config set-model ${tag} dflash_mode on` : `config set dflash_mode on`;
+      const hint = tag ? `config ${tag} set dflash_mode on` : `config set dflash_mode on`;
       console.error(`[hipfire] DFlash disabled for A3B target (dflash_mode=auto, no sidecar). Override with 'hipfire ${hint}'.`);
     } else if (mode === "off") {
       console.error(`[hipfire] DFlash disabled (dflash_mode=off).`);
@@ -811,11 +584,14 @@ function buildLoadMessage(path: string, tag?: string | null): any {
       if (explicit.length > 0) params.draft = explicit;
       // empty-string → explicit opt-out; leave draft unset
     } else {
-      const parsed = parseQwenQuantArtifact(targetBn);
-      if (parsed) {
-        const ver = parsed.version;        // "5" or "6"
-        const size = parsed.size;          // "9b", "27b", "35b-a3b", ...
-        const quant = parsed.quant;
+      // Size segment may contain internal dashes (e.g. "35b-a3b"); stop only
+      // at the quant-extension dot. Version digit is captured so the draft
+      // prefix picks up qwen3.5 → qwen35 vs qwen3.6 → qwen36 correctly.
+      const m = targetBn.match(/qwen3?\.?(5|6)[-_]?([^.]+)\.(mq4|mq3|mq6|hfq4|hfq6|q8)/i);
+      if (m) {
+        const ver = m[1];                 // "5" or "6"
+        const size = m[2].toLowerCase();  // "9b", "27b", "35b-a3b", ...
+        const quant = m[3].toLowerCase();
         // Candidate ordering combines two requirements:
         //   1. dirname(target) goes FIRST. The most reliable signal we have
         //      for "where this user keeps their weights" is the directory the
@@ -831,18 +607,17 @@ function buildLoadMessage(path: string, tag?: string | null): any {
         const fallbackQuant = quant === "mq3" ? "mq4" : (quant === "mq4" ? "mq3" : null);
         const dirs = [
           dirname(path),
+          DRAFTS_DIR,
           `${process.cwd()}/models`,
           `${process.cwd()}/../../models`,
-          `${homedir()}/.hipfire/models`,
+          MODELS_DIR,
         ];
         const candidates: string[] = [];
         for (const d of dirs) {
-          candidates.push(resolve(`${d}/qwen3.${ver}-${size}-${quant}.dflash.hfq`));
           candidates.push(resolve(`${d}/qwen3${ver}-${size}-dflash-${quant}.hfq`));
         }
         if (fallbackQuant) {
           for (const d of dirs) {
-            candidates.push(resolve(`${d}/qwen3.${ver}-${size}-${fallbackQuant}.dflash.hfq`));
             candidates.push(resolve(`${d}/qwen3${ver}-${size}-dflash-${fallbackQuant}.hfq`));
           }
         }
@@ -869,7 +644,7 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   //       hallucination per feedback_a3b_r_not_acceptable.md)
   //
   // Discovery: registry entry's `triattn.file` first (manifest-driven), then
-  // glob-style fallback for `<model-stem>.triattn.hfq` next to the weights for
+  // glob-style fallback for `<model>.triattn*.bin` next to the weights for
   // sidecars dropped manually.
   let autoAttachedSidecar: string | null = null;
   // HIPFIRE_CASK_OFF=1 is an ops escape hatch: forces no auto-attach
@@ -885,21 +660,28 @@ function buildLoadMessage(path: string, tag?: string | null): any {
     const modelDir = path.includes("/") ? path.substring(0, path.lastIndexOf("/")) : MODELS_DIR;
     const entry = tag ? REGISTRY[resolveModelTag(tag)] : undefined;
     if (entry?.triattn?.file) {
-      const candidate = join(modelDir, entry.triattn.file);
-      if (existsSync(candidate)) autoAttachedSidecar = candidate;
+      for (const dir of [modelDir, TRIATTN_DIR]) {
+        const candidate = join(dir, entry.triattn.file);
+        if (existsSync(candidate)) {
+          autoAttachedSidecar = candidate;
+          break;
+        }
+      }
     }
     if (!autoAttachedSidecar) {
-      // Fallback: scan modelDir for `<model-stem>.triattn.hfq`. Catches
+      // Fallback: scan modelDir for `<basename>.triattn*.bin`. Catches
       // hand-installed sidecars not in the registry.
-      try {
-        const baseName = basename(path);
-        const canonical = basename(defaultRoleSidecarPath(path, "triattn"));
-        const entries = readdirSync(modelDir);
-        const m = entries.find(e => e === canonical || (
-          e.startsWith(baseName + ".triattn") && (e.endsWith(".hfq") || e.endsWith(".bin"))
-        ));
-        if (m) autoAttachedSidecar = join(modelDir, m);
-      } catch { /* dir read failures are fine — fall through to no auto-attach */ }
+      const baseName = basename(path);
+      for (const dir of [modelDir, TRIATTN_DIR]) {
+        try {
+          const entries = readdirSync(dir);
+          const m = entries.find(e => e.startsWith(baseName + ".triattn") && e.endsWith(".bin"));
+          if (m) {
+            autoAttachedSidecar = join(dir, m);
+            break;
+          }
+        } catch { /* dir read failures are fine — try the next dir */ }
+      }
     }
   }
   if (autoAttachedSidecar) {
@@ -1027,20 +809,19 @@ const REGISTRY: Record<string, ModelEntry> = registryData.models as Record<strin
 const ALIASES: Record<string, string>    = registryData.aliases as Record<string, string>;
 
 export function resolveModelTag(input: string): string {
-  const normalized = input;
+  // Backward compat: old hfq4/hfq6 tags → hf4/hf6
+  const normalized = input.replace(/-hfq(\d)/, "-hf$1").replace(/\.hfq$/, ".hf4");
   // Direct registry match
   if (REGISTRY[normalized]) return normalized;
   // Alias
   if (ALIASES[normalized]) return ALIASES[normalized];
   // Try adding "qwen3.5:" prefix
   if (REGISTRY[`qwen3.5:${normalized}`]) return `qwen3.5:${normalized}`;
-  // Reverse-resolve: if input looks like a filename (e.g. "qwen3.6-35b-a3b-mq4.hfq"),
+  // Reverse-resolve: if input looks like a filename (e.g. "qwen3.6-35b-a3b.mq4"),
   // find the registry entry whose .file matches and return its tag. Without this,
   // per-model config is silently ignored when the user passes a raw filename.
-  const inputAliases = new Set([...modelFileAliases(input), ...modelFileAliases(normalized)]);
   for (const [tag, entry] of Object.entries(REGISTRY)) {
-    const entryAliases = modelFileAliases(entry.file);
-    if (inputAliases.has(entry.file) || entryAliases.includes(input) || entryAliases.includes(normalized)) return tag;
+    if (entry.file === normalized || entry.file === input) return tag;
   }
   return normalized;
 }
@@ -1083,118 +864,39 @@ function detectGpuArch(): string {
   return "unknown";
 }
 
-type AcceleratorInventory = {
-  hip_gpus: Array<{
-    id: number;
-    node: string;
-    arch: string;
-    vram_bytes: number | null;
-    integrated: boolean | null;
-  }>;
-  npus: Array<{
-    id: string;
-    source: string;
-    path: string;
-  }>;
-};
-
-function readTextIfExists(path: string): string | null {
-  try {
-    if (!existsSync(path)) return null;
-    return readFileSync(path, "utf8");
-  } catch {
-    return null;
-  }
-}
-
-function parseKfdNodeProperties(raw: string): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const line of raw.split("\n")) {
-    const m = line.trim().match(/^([a-zA-Z0-9_]+)\s+(.+)$/);
-    if (m) out[m[1]] = m[2].trim();
-  }
-  return out;
-}
-
-function detectAcceleratorInventory(): AcceleratorInventory {
-  const hip_gpus: AcceleratorInventory["hip_gpus"] = [];
-  const topologyRoot = "/sys/class/kfd/kfd/topology/nodes";
-  try {
-    for (const node of readdirSync(topologyRoot).sort()) {
-      const propsRaw = readTextIfExists(join(topologyRoot, node, "properties"));
-      if (!propsRaw) continue;
-      const props = parseKfdNodeProperties(propsRaw);
-      const gfxTarget = Number.parseInt(props.gfx_target_version ?? "", 10);
-      if (!Number.isFinite(gfxTarget) || gfxTarget <= 0) continue;
-      let vramBytes: number | null = null;
-      const memRoot = join(topologyRoot, node, "mem_banks");
-      try {
-        for (const bank of readdirSync(memRoot)) {
-          const memProps = parseKfdNodeProperties(readTextIfExists(join(memRoot, bank, "properties")) ?? "");
-          const size = Number.parseInt(memProps.size_in_bytes ?? "0", 10);
-          if (Number.isFinite(size) && size > 0) vramBytes = (vramBytes ?? 0) + size;
-        }
-      } catch {}
-      const nodeProps = Object.values(props).join(" ").toLowerCase();
-      hip_gpus.push({
-        id: hip_gpus.length,
-        node,
-        arch: gfxTargetVersionToArch(gfxTarget),
-        vram_bytes: vramBytes,
-        integrated: nodeProps.includes("apu") ? true : null,
-      });
-    }
-  } catch {}
-
-  const npus: AcceleratorInventory["npus"] = [];
-  try {
-    if (existsSync("/sys/class/accel")) {
-      for (const entry of readdirSync("/sys/class/accel").sort()) {
-        npus.push({ id: entry, source: "sysfs_accel", path: join("/sys/class/accel", entry) });
-      }
-    }
-  } catch {}
-  try {
-    if (existsSync("/dev/accel")) {
-      for (const entry of readdirSync("/dev/accel").sort()) {
-        npus.push({ id: entry, source: "dev_accel", path: join("/dev/accel", entry) });
-      }
-    }
-  } catch {}
-
-  return { hip_gpus, npus };
-}
-
 interface ArchDefaults {
   kv_cache: string;        // best KV mode for this hardware
   vram_gb: number;         // approximate VRAM
 }
 
 function archDefaults(arch: string): ArchDefaults {
-  // Default KV cache policy (RotorQuant asymmetric):
-  //   asym3 (K 3-bit rotated + V Q8) is the default across arches — 5.5×
-  //   compression vs fp32 with verbatim rare-token recall on head_dim=256
-  //   models (Qwen 3.5 family). Memory-tight cards get asym2 (6.0×, still
-  //   recall-safe for common tokens). Users can override to `q8` for
-  //   maximum quality or `asym4` for extra K precision headroom.
+  // Default KV cache policy (FWHT-rotated, DFlash-safe):
+  //   fwht3 (K 3-bit FWHT-rotated + V Q8) is the default across arches — same
+  //   ~5.5× compression and byte layout as asym3, but the K-rotation basis
+  //   matches the MQ4 weight/draft FWHT convention, so DFlash speculative
+  //   acceptance stays high. asym3/asym4 use a Givens basis the draft was not
+  //   calibrated against → degraded acceptance / attractors with DFlash (which
+  //   is default-on for the 27B). Memory-tight cards get fwht2 (the asym2 byte
+  //   tier, FWHT-rotated). Override to `q8` for byte-exact reference quality,
+  //   or the `asym*` modes for the legacy Givens behavior.
   switch (arch) {
-    // RDNA3 — asym3 everywhere; 24 GB cards fit full context easily.
-    case "gfx1100": return { kv_cache: "asym3", vram_gb: 24 };  // 7900 XTX
-    case "gfx1101": return { kv_cache: "asym3", vram_gb: 16 };  // 7900 XT
-    case "gfx1102": return { kv_cache: "asym3", vram_gb: 12 };  // 7800 XT
-    case "gfx1151": return { kv_cache: "asym2", vram_gb: 16 };  // Strix Halo APU (shared mem — tight)
+    // RDNA3
+    case "gfx1100": return { kv_cache: "fwht3", vram_gb: 24 };  // 7900 XTX
+    case "gfx1101": return { kv_cache: "fwht3", vram_gb: 16 };  // 7900 XT
+    case "gfx1102": return { kv_cache: "fwht3", vram_gb: 12 };  // 7800 XT
+    case "gfx1151": return { kv_cache: "fwht2", vram_gb: 16 };  // Strix Halo APU (shared mem — tight)
     // RDNA4
     case "gfx1200": case "gfx1201":
-      return { kv_cache: "asym3", vram_gb: 16 };                // 9070 XT
+      return { kv_cache: "fwht3", vram_gb: 16 };                // 9070 XT
     // RDNA2
-    case "gfx1030": return { kv_cache: "asym3", vram_gb: 32 };  // V620 (32 GB — plenty of headroom)
-    case "gfx1031": return { kv_cache: "asym3", vram_gb: 12 };  // 6700 XT
-    case "gfx1032": return { kv_cache: "asym2", vram_gb: 8 };   // 6600 XT (8 GB — asym2 for headroom)
+    case "gfx1030": return { kv_cache: "fwht3", vram_gb: 32 };  // V620 (32 GB — plenty of headroom)
+    case "gfx1031": return { kv_cache: "fwht3", vram_gb: 12 };  // 6700 XT
+    case "gfx1032": return { kv_cache: "fwht2", vram_gb: 8 };   // 6600 XT (8 GB — fwht2 for headroom)
     // RDNA1
-    case "gfx1010": return { kv_cache: "asym2", vram_gb: 8 };   // 5700 XT
-    case "gfx1013": return { kv_cache: "asym2", vram_gb: 14 };  // BC-250 APU
-    // Fallback — unknown arch, asym3 is the new safe default.
-    default: return { kv_cache: "asym3", vram_gb: 8 };
+    case "gfx1010": return { kv_cache: "fwht2", vram_gb: 8 };   // 5700 XT
+    case "gfx1013": return { kv_cache: "fwht2", vram_gb: 14 };  // BC-250 APU
+    // Fallback — unknown arch, fwht3 is the safe DFlash-compatible default.
+    default: return { kv_cache: "fwht3", vram_gb: 8 };
   }
 }
 
@@ -1258,20 +960,6 @@ function applyConfigEnv(cfg: HipfireConfig, modelTag?: string | null): void {
   } else {
     process.env.HIPFIRE_NORMALIZE_PROMPT = "0";
   }
-  // Loader / HIP runtime controls. Shell env wins for one-off diagnostics;
-  // otherwise persistent config flows into locally spawned runtime paths.
-  if (!process.env.HIPFIRE_GPU_SLAB_LOAD && cfg.gpu_slab_load !== "auto") {
-    process.env.HIPFIRE_GPU_SLAB_LOAD = cfg.gpu_slab_load;
-  }
-  if (!process.env.HIPFIRE_GPU_SLAB_MIB && cfg.gpu_slab_mib !== CONFIG_DEFAULTS.gpu_slab_mib) {
-    process.env.HIPFIRE_GPU_SLAB_MIB = String(cfg.gpu_slab_mib);
-  }
-  if (!process.env.HIPFIRE_LOAD_TRANSPORT && cfg.load_transport !== "pread") {
-    process.env.HIPFIRE_LOAD_TRANSPORT = cfg.load_transport;
-  }
-  if (!process.env.HIPFIRE_HIP_WAIT && cfg.hip_wait !== "auto") {
-    process.env.HIPFIRE_HIP_WAIT = cfg.hip_wait;
-  }
   // dflash_ngram_block: auto-resolve from model tag when "auto", else honor
   // explicit boolean. Only set the env var when we want it ON; daemon /
   // dflash_spec_demo treat unset as OFF (zero overhead).
@@ -1279,6 +967,11 @@ function applyConfigEnv(cfg: HipfireConfig, modelTag?: string | null): void {
     process.env.HIPFIRE_DFLASH_NGRAM_BLOCK = "1";
   } else {
     delete process.env.HIPFIRE_DFLASH_NGRAM_BLOCK;
+  }
+  // Total-think cap (re-arm-proof <think> bound; daemon reads it per generate).
+  // Shell env wins if the user exported it; 0/unset = off (daemon default).
+  if (!process.env.HIPFIRE_MAX_TOTAL_THINK_TOKENS && cfg.max_total_think_tokens > 0) {
+    process.env.HIPFIRE_MAX_TOTAL_THINK_TOKENS = String(cfg.max_total_think_tokens);
   }
   process.env.HIPFIRE_MTP_MODE = cfg.mtp_mode;
   process.env.HIPFIRE_MTP_K = String(cfg.mtp_k);
@@ -1434,8 +1127,25 @@ async function runViaHttp(
 
 // ─── Daemon IPC ─────────────────────────────────────────
 
+// hunt3 H-B: typed error thrown by recv() on daemon EOF in long-lived
+// (serve) mode. One-shot callers (run, bench, etc.) set `oneShot = true`
+// and recv() process.exit()s as before; serve leaves it false and catches
+// this to recover (500 + restart) instead of killing the whole serve for
+// all clients on a single daemon crash.
+class DaemonClosedError extends Error {
+  readonly code: number;
+  constructor(code: number) {
+    super("daemon closed");
+    this.name = "DaemonClosedError";
+    this.code = code;
+  }
+}
+
 class Engine {
   private proc: ReturnType<typeof spawn> | null = null;
+  // hunt3 H-B: one-shot mode (run/bench) → recv() exits on daemon EOF;
+  // long-lived serve leaves this false so recv() throws DaemonClosedError.
+  oneShot = false;
   private reader: {
     read(): Promise<{ done: boolean; value?: Uint8Array }>;
     releaseLock(): void;
@@ -1448,12 +1158,11 @@ class Engine {
     const envBin = process.env.HIPFIRE_DAEMON_BIN;
     const bins = [
       ...(envBin ? [envBin] : []),
-      resolve(__dirname, `../target/release/hipfire-daemon${exe}`),
-      join(HIPFIRE_DIR, "bin", `hipfire-daemon${exe}`),
+      resolve(__dirname, `../target/release/examples/daemon${exe}`),
       join(HIPFIRE_DIR, "bin", `daemon${exe}`),
     ];
     const bin = bins.find(p => existsSync(p));
-    if (!bin) throw new Error("daemon not found. cargo build --release -p hipfire-daemon --bin hipfire-daemon");
+    if (!bin) throw new Error("daemon not found. cargo build --release --features deltanet --example daemon -p hipfire-runtime");
 
     this.proc = spawn([bin], { stdin: "pipe", stdout: "pipe", stderr: "inherit", env: { ...process.env } });
     const stdout = this.proc.stdout;
@@ -1483,9 +1192,19 @@ class Engine {
         // unsupported environments, see #112) or via a real crash. In either
         // case, the daemon's stderr (which we inherit) already explained
         // what happened, so adding a Bun-rendered stack trace from here on
-        // top is pure noise. Exit cleanly with the daemon's own code (or 1
-        // if it hasn't exited yet) and let stderr stand on its own.
+        // top is pure noise.
         const code = (await this.proc?.exited) ?? 1;
+        // hunt3 H-B: in long-lived serve, a single daemon crash must NOT
+        // process.exit() the whole serve (kills every other client). Throw a
+        // typed error the serve handler catches → 500 + daemon restart. Clear
+        // buffered state and release the reader so a fresh start() is clean.
+        this.lines = [];
+        this.buffer = "";
+        try { this.reader?.releaseLock(); } catch {}
+        this.reader = null;
+        if (!this.oneShot) throw new DaemonClosedError(code);
+        // One-shot mode (run/bench): exit cleanly with the daemon's own code
+        // (or 1 if it hasn't exited yet) and let stderr stand on its own.
         process.exit(code === 0 ? 1 : code);
       }
       this.buffer += new TextDecoder().decode(value);
@@ -1523,15 +1242,36 @@ class Engine {
         new Promise<false>((res) => setTimeout(() => res(false), 10_000)),
       ]);
       drained = result;
-    } catch { /* daemon closed — already clean */ drained = true; }
+    } catch (err: any) {
+      // hunt3 H-B: a long-lived serve recv() throws DaemonClosedError when the
+      // daemon crashed mid-stream. The buffered EOF is NOT "already clean":
+      // recv() nulled this.reader but left this.proc non-null, so the caller's
+      // subsequent reload would send(loadMsg)/recv() against a dead pipe +
+      // null reader → a PLAIN Error("not running") that the request handler's
+      // outer catch does NOT recognize as DaemonClosedError → 500 with no
+      // restart → the daemon stays dead and every following request 500s
+      // forever (the exact "serve dies for everyone" outcome H-B prevents on
+      // the generate paths). Restart here so the caller reloads against a live
+      // daemon. A restart() failure propagates → the handler returns 500 for
+      // this one request, which is the honest outcome when recovery is
+      // genuinely impossible. Any non-DaemonClosedError is treated as the old
+      // best-effort "already clean" (drain is advisory resync, not load-bearing).
+      if (err instanceof DaemonClosedError) {
+        console.error(`[hipfire] daemon closed during drain (code ${err.code}) — restarting daemon`);
+        await this.restart();
+        return;
+      }
+      /* daemon closed — already clean */ drained = true;
+    }
 
     if (!drained) {
       // Timed out — dangling recv() still holds the reader.
       // Kill the daemon to cancel it, then restart fresh.
+      // hunt3 B-2: restart() awaits the killed proc's exit + retries the
+      // respawn with backoff so the new daemon doesn't collide with the old
+      // one's flock during teardown.
       console.error("[hipfire] drain timed out — restarting daemon");
-      await this.stop();
-      await this.start();
-      await this.send({ type: "ping" }); await this.recv();
+      await this.restart();
     }
   }
 
@@ -1539,12 +1279,44 @@ class Engine {
 
   async stop() {
     try { await this.send({ type: "unload" }); } catch {}
-    this.reader?.releaseLock();
+    try { this.reader?.releaseLock(); } catch {}
     this.reader = null;
     const proc = this.proc;
-    this.proc = null;
     proc?.kill();
-    try { await proc?.exited; } catch {}
+    // hunt3 B-2: AWAIT the killed process's exit before returning. Without
+    // this, start() can respawn while the old daemon still holds the
+    // LOCK_EX|LOCK_NB flock → the new daemon hits "FATAL: already running",
+    // exits immediately, and recv() sees EOF → serve dies. Bound the wait so
+    // a wedged daemon can't hang the restart forever.
+    try {
+      await Promise.race([
+        proc?.exited ?? Promise.resolve(),
+        new Promise<void>((res) => setTimeout(res, 5_000)),
+      ]);
+    } catch {}
+    this.proc = null;
+  }
+
+  /// hunt3 B-2: stop()+start()+ping with retry/backoff to tolerate the
+  /// residual flock-teardown window after a kill. Used by drain()'s timeout
+  /// path and by serve's daemon-crash recovery (hunt3 H-B). Throws if the
+  /// daemon can't be brought back after all retries.
+  async restart() {
+    await this.stop();
+    let lastErr: any = null;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        await this.start();
+        await this.send({ type: "ping" }); await this.recv();
+        return;
+      } catch (err: any) {
+        lastErr = err;
+        try { await this.stop(); } catch {}
+        // Backoff lets the old daemon's flock release before the next spawn.
+        await new Promise((res) => setTimeout(res, 250 * (attempt + 1)));
+      }
+    }
+    throw lastErr ?? new Error("daemon restart failed");
   }
 }
 
@@ -1645,7 +1417,7 @@ async function pull(tag: string): Promise<string> {
 
   // TriAttention sidecar: fetch alongside the weights when the registry
   // entry has one. Sidecars are tiny (≈2 MB) so we don't gate this on a
-  // flag — getting the .triattn.hfq into MODELS_DIR is the prereq for the
+  // flag — getting the .triattn.bin into MODELS_DIR is the prereq for the
   // run/serve auto-attach to fire. Failures are non-fatal: weights are
   // already on disk and runnable; the user just won't get auto-eviction.
   if (entry.triattn?.file) {
@@ -1736,24 +1508,26 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   if (!useLocal && await isServeUp(cfg.port, cfg.host)) {
     const ok = await runViaHttp(cfg.port, cfg.host, model, prompt, image, temp, maxTokens, repeatPenalty, topP, system);
     if (ok) return;
-    // runViaHttp logged its own failure reason; fall back to local spawn.
+    // runViaHttp logged its own failure reason.
+    // hunt3 B-6: only fall back to a LOCAL daemon if the serve is now GONE.
+    // If the serve is still up, a local spawn would collide with its
+    // LOCK_EX|LOCK_NB flock → daemon FATAL "already running" → process.exit.
+    // The HTTP request failed for a per-request reason (e.g. a transient
+    // serve error), not because the GPU is free — surface it and bail.
+    if (await isServeUp(cfg.port, cfg.host)) {
+      console.error(`[hipfire] serve is up but the request failed — not spawning a local daemon (would collide with the serve's GPU lock).`);
+      console.error(`  Retry, or stop the serve first: hipfire stop`);
+      process.exit(1);
+    }
+    // Serve went away — safe to fall through to a local spawn.
   }
 
   applyConfigEnv(cfg, model);
   const e = new Engine();
+  e.oneShot = true; // hunt3 H-B: one-shot run — recv() may exit on daemon EOF
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
-  const runLoadMsg = buildLoadMessage(path, model);
-  const runRequiredPhysicalCap = physicalCapForRequest(
-    runLoadMsg.params.max_seq,
-    prompt,
-    maxTokens,
-    image ? 1024 : 0,
-  );
-  if (runRequiredPhysicalCap > runLoadMsg.params.physical_cap) {
-    runLoadMsg.params.physical_cap = runRequiredPhysicalCap;
-  }
-  await e.send(runLoadMsg);
+  await e.send(buildLoadMessage(path, model));
   const loaded = await e.recv();
   if (loaded.type === "error") { console.error(loaded.message); process.exit(1); }
   const vlTag = loaded.vl ? " VL" : "";
@@ -1824,82 +1598,6 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   await e.stop();
 }
 
-function stableHash(value: string): string {
-  return createHash("sha256").update(value).digest("hex");
-}
-
-function inferModelArtifactDigest(path: string | null): string {
-  if (!path) return "unknown";
-  if (isDummyModelPath(path)) return stableHash(DUMMY_MODEL_SENTINEL_PATH);
-  try {
-    const size = statSync(path).size;
-    return stableHash(`${resolve(path)}|${size}`);
-  } catch {
-    return stableHash(resolve(path));
-  }
-}
-
-function stableObjectHash(value: Record<string, any>): string {
-  const keys = Object.keys(value).sort();
-  const normalized: Record<string, any> = {};
-  for (const key of keys) {
-    normalized[key] = value[key];
-  }
-  return stableHash(JSON.stringify(normalized));
-}
-
-function approximatePromptTokenIds(prompt: string): readonly number[] {
-  const tokens = prompt.trim().split(/\s+/);
-  const out: number[] = [];
-  for (let i = 0; i < tokens.length; i++) {
-    const combined = `${tokens[i]}\u0000${i}`;
-    let h = 0;
-    for (let j = 0; j < combined.length; j++) {
-      h = ((h << 5) - h + combined.charCodeAt(j)) | 0;
-    }
-    out.push(Math.abs(h % 500_000));
-  }
-  return out;
-}
-
-function inferQuantFamilyForPath(modelPath: string): string {
-  if (isDummyModelPath(modelPath)) return "dummy";
-  const lower = modelPath.toLowerCase();
-  const token = artifactQuantToken(lower);
-  if (token) return token;
-  if (lower.includes("mq3")) return "mq3";
-  if (lower.includes("mq6")) return "mq6";
-  if (lower.includes("q8")) return "q8";
-  return "unknown";
-}
-
-function inferStateKindsForServeArch(arch: string | null): readonly SessionStateKind[] {
-  const normalized = (arch ?? "").toLowerCase();
-  if (normalized.includes("dummy")) return ["attention_kv"];
-  const kinds: SessionStateKind[] = ["attention_kv"];
-  if (normalized.includes("qwen") || normalized.includes("deltanet") || normalized.includes("qwen2")) {
-    kinds.push("deltanet_recurrent");
-  }
-  if (normalized.includes("mamba") || normalized.includes("nemotron")) {
-    kinds.push("mamba_ssm", "mamba_conv");
-  }
-  return kinds;
-}
-
-function isQwen35RuntimeArch(arch: string | null): boolean {
-  const normalized = (arch ?? "").toLowerCase();
-  return normalized === "qwen35"
-    || normalized === "qwen35_moe"
-    || normalized === "qwen35_vl"
-    || normalized === "qwen3_5"
-    || normalized === "qwen3_5_moe"
-    || normalized === "qwen3_5_vl"
-    || normalized === "qwen3.5"
-    || normalized === "qwen3.5_moe"
-    || normalized === "qwen3.5_vl"
-    || normalized.startsWith("qwen35_");
-}
-
 async function serve(port: number, host: string) {
   applyConfigEnv(cfg);
   // Write the PID so `hipfire stop` / `hipfire ps` / `hipfire run` can find us.
@@ -1907,79 +1605,38 @@ async function serve(port: number, host: string) {
   // HIPFIRE_NO_PID_FILE=1 suppresses the write — used by `hipfire chat` when it
   // spawns an ephemeral daemon, so it doesn't clobber a long-lived `serve -d`.
   const ownsPidFile = !process.env.HIPFIRE_NO_PID_FILE;
-  const cleanupPid = () => {
-    if (!ownsPidFile) return;
-    try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {}
-  };
-  let serveEngine: Engine | null = null;
-  let shuttingDown = false;
-  const shutdown = async (code: number) => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    cleanupPid();
-    try { await serveEngine?.stop(); } catch {}
-    process.exit(code);
-  };
-  process.on("exit", () => {
-    cleanupPid();
-  });
-  process.on("SIGTERM", () => { void shutdown(0); });
-  process.on("SIGINT", () => { void shutdown(0); });
-
-  const acceleratorInventory = detectAcceleratorInventory();
-  const serverAcceleratorKind = "hip";
-  const serverDeviceId = acceleratorInventory.hip_gpus[0]?.id ?? 0;
   if (ownsPidFile) {
+    // hunt3 B-3: a foreground `serve` run over a running `serve -d` would
+    // overwrite the live daemon's pid file, then (on exit, cleanupPid below)
+    // DELETE it — orphaning the detached daemon's VRAM. Before claiming the
+    // pid file, refuse to start if another serve is already live on this bind.
+    if (await isServeUp(port, host)) {
+      const existing = readServePid();
+      console.error(`hipfire serve already running${existing ? ` (PID ${existing})` : ""} on ${formatServeBind(host, port)}.`);
+      console.error(`  Stop it first: hipfire stop`);
+      process.exit(1);
+    }
     try {
       require("fs").writeFileSync(SERVE_PID_FILE, String(process.pid));
     } catch {}
   }
+  const cleanupPid = () => {
+    if (!ownsPidFile) return;
+    // hunt3 B-3: only unlink if the file STILL names us. If a newer serve
+    // (or anything else) has since rewritten it, deleting it would orphan
+    // that live daemon's pid record. Read-back-and-compare.
+    try {
+      const cur = require("fs").readFileSync(SERVE_PID_FILE, "utf-8").trim();
+      if (cur === String(process.pid)) require("fs").unlinkSync(SERVE_PID_FILE);
+    } catch {}
+  };
+  process.on("exit", cleanupPid);
+  process.on("SIGTERM", () => { cleanupPid(); process.exit(0); });
+  process.on("SIGINT", () => { cleanupPid(); process.exit(0); });
 
   const e = new Engine();
-  serveEngine = e;
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
-  console.error(
-    `[hipfire] accelerator inventory: hip_gpus=${acceleratorInventory.hip_gpus.length} npus=${acceleratorInventory.npus.length}`,
-  );
-  const serverPrefillBatch = parseServerPrefillBatchPolicy();
-  const serverPrefillBatchControls = parseServerPrefillPolicyControls();
-  let generateBatchPrefillCapability: GenerateBatchPrefillCapability = "unknown";
-  let generateBatchPrefillCapabilityReason = "not_probed";
-  const probeGenerateBatchPrefillCapability = async (workerKeyId: string | null = null) => {
-    try {
-      const probeMsg: any = buildGenerateBatchPrefillProbeMessage();
-      if (workerKeyId) probeMsg.worker_key_id = workerKeyId;
-      await e.send(probeMsg);
-      const probeResponse = await e.recv();
-      return interpretGenerateBatchPrefillProbeResponse(probeResponse);
-    } catch (err: any) {
-      return {
-        capability: "unknown" as GenerateBatchPrefillCapability,
-        reason: err?.message ?? "probe_failed",
-      };
-    }
-  };
-  if (serverPrefillBatch.enabled) {
-    console.error(
-      `[hipfire] server prefill batching enabled: max=${serverPrefillBatch.maxBatch} wait=${serverPrefillBatch.waitMs}ms`,
-    );
-    const probe = await probeGenerateBatchPrefillCapability();
-    generateBatchPrefillCapability = probe.capability;
-    generateBatchPrefillCapabilityReason = probe.reason;
-    console.error(
-      `[hipfire] generate_batch_prefill capability=${generateBatchPrefillCapability} reason=${generateBatchPrefillCapabilityReason}`,
-    );
-    if (generateBatchPrefillCapability === "supported") {
-      console.error(
-        "[hipfire] daemon generate_batch_prefill serial prefill is available; server dispatch is enabled for compatible non-streaming batches",
-      );
-    } else {
-      console.error(
-        "[hipfire] server prefill batching runtime dispatch is SKIPPED until daemon adds generate_batch_prefill execution with session state handles",
-      );
-    }
-  }
   let current: string | null = null;
   // Track the `max_seq` the currently-loaded model was loaded with, so we can
   // detect when a live `max_tokens` bump (via `hipfire config set max_tokens`
@@ -1994,1270 +1651,11 @@ async function serve(port: number, host: string) {
   // so the legacy Hermes `<tools>` block injection and ChatML
   // conversation rebuild both turn into off-distribution noise.
   let currentArch: string | null = null;
-  let currentStateMode: string | null = null;
-  type ResidentModelWorker = {
-    workerKeyId: string;
-    workerKey: ModelWorkerKey;
-    modelPath: string;
-    maxSeq: number;
-    physicalCap: number;
-    arch: string | null;
-    stateMode: string | null;
-    hasVL: boolean;
-    lastUsedAtMs: number;
-    descriptorEntries: number;
-    descriptorBytes: number;
-    modelFileBytes: number;
-    modelWeightBytes: number;
-    runtimeBaseBytes: number;
-    runtimeSessionBytes: number;
-    runtimeStateBytes: number;
-    totalResidentBytes: number;
-    evictableStateBytes: number;
-    routeReason: string;
-  };
-  const maxResidentWorkers = Math.max(1, Math.trunc(Number(process.env.HIPFIRE_MAX_RESIDENT_WORKERS || "1") || 1));
-  const residentModelWorkers = new Map<string, ResidentModelWorker>();
-  let activeWorkerKeyId: string | null = null;
-  let runtimeWorkerStatePageDescriptorEntries = 0;
-  let runtimeWorkerStatePageDescriptorBytes = 0;
-  const metricNumber = (value: unknown): number => (
-    typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0
-  );
-  const updateRuntimeWorkerMetrics = (modelWorker: any) => {
-    if (!modelWorker || typeof modelWorker !== "object") return;
-    if (Number.isFinite(modelWorker.state_page_descriptor_entries)) {
-      runtimeWorkerStatePageDescriptorEntries = Math.max(0, Math.trunc(modelWorker.state_page_descriptor_entries));
-    }
-    if (Number.isFinite(modelWorker.state_page_descriptor_bytes)) {
-      runtimeWorkerStatePageDescriptorBytes = Math.max(0, Math.trunc(modelWorker.state_page_descriptor_bytes));
-    }
-    if (activeWorkerKeyId) {
-      const worker = residentModelWorkers.get(activeWorkerKeyId);
-      if (worker) {
-        worker.descriptorEntries = runtimeWorkerStatePageDescriptorEntries;
-        worker.descriptorBytes = runtimeWorkerStatePageDescriptorBytes;
-        worker.modelFileBytes = metricNumber(modelWorker.model_file_bytes);
-        worker.modelWeightBytes = metricNumber(modelWorker.model_weight_bytes);
-        worker.runtimeBaseBytes = metricNumber(modelWorker.runtime_base_bytes);
-        worker.runtimeSessionBytes = metricNumber(modelWorker.runtime_session_bytes);
-        worker.runtimeStateBytes = metricNumber(modelWorker.runtime_state_bytes);
-        worker.totalResidentBytes = metricNumber(modelWorker.total_resident_bytes);
-        worker.evictableStateBytes = metricNumber(modelWorker.evictable_state_bytes);
-        if (Number.isFinite(modelWorker.physical_cap)) {
-          worker.physicalCap = metricNumber(modelWorker.physical_cap);
-        }
-      }
-    }
-  };
-  const makeResidentWorkerKey = (path: string, maxSeq: number, stateMode: string | null, physicalCap?: number): ModelWorkerKey => pickServingModelWorker({
-    requestModelPath: path,
-    currentModelPath: path,
-    currentMaxSeq: maxSeq,
-    requiredMaxSeq: maxSeq,
-    archId: "unknown",
-    quantFamily: inferQuantFamilyForPath(path),
-    stateMode: stateMode || "unknown",
-    featureFlags: ["serve", "resident_worker", `physical_cap:${physicalCap ?? maxSeq}`],
-    artifactDigest: inferModelArtifactDigest(path),
-    maxSeqBucket: maxSeq,
-    acceleratorKind: serverAcceleratorKind,
-    deviceId: serverDeviceId,
-  }).workerKey;
-  const findReusableResidentWorker = (path: string, requiredMaxSeq: number, requiredPhysicalCap: number): ResidentModelWorker | undefined => {
-    let best: ResidentModelWorker | undefined;
-    for (const worker of residentModelWorkers.values()) {
-      if (worker.modelPath !== path) continue;
-      if (worker.maxSeq < requiredMaxSeq) continue;
-      if (worker.physicalCap < requiredPhysicalCap) continue;
-      if (
-        !best
-        || worker.physicalCap < best.physicalCap
-        || (worker.physicalCap === best.physicalCap && worker.maxSeq < best.maxSeq)
-        || (worker.physicalCap === best.physicalCap && worker.maxSeq === best.maxSeq && worker.lastUsedAtMs > best.lastUsedAtMs)
-      ) {
-        best = worker;
-      }
-    }
-    return best;
-  };
-  const activateResidentWorker = (worker: ResidentModelWorker, routeReason = "worker_reused") => {
-    current = worker.modelPath;
-    currentMaxSeq = worker.maxSeq;
-    currentArch = worker.arch;
-    currentStateMode = worker.stateMode;
-    modelHasVL = worker.hasVL;
-    runtimeWorkerStatePageDescriptorEntries = worker.descriptorEntries;
-    runtimeWorkerStatePageDescriptorBytes = worker.descriptorBytes;
-    activeWorkerKeyId = worker.workerKeyId;
-    worker.lastUsedAtMs = Date.now();
-    worker.routeReason = routeReason;
-  };
-  const rememberResidentWorker = (worker: ResidentModelWorker) => {
-    residentModelWorkers.set(worker.workerKeyId, worker);
-    activateResidentWorker(worker, worker.routeReason);
-  };
-  const unloadResidentWorkerById = async (workerKeyId: string, reason: string) => {
-    await e.send({
-      type: "unload_worker",
-      id: `unload-${Date.now().toString(36)}`,
-      worker_key_id: workerKeyId,
-    });
-    await e.recv();
-    clearWorkerResidentPrefixState(workerKeyId, reason);
-    residentModelWorkers.delete(workerKeyId);
-    if (activeWorkerKeyId === workerKeyId) {
-      current = null;
-      currentMaxSeq = null;
-      modelHasVL = false;
-      currentStateMode = null;
-      currentArch = null;
-      activeWorkerKeyId = null;
-    }
-  };
-  const workerPrefillSchedulers = new Map<string, PriorityPrefillScheduler>();
-  const workerDecodeSchedulers = new Map<string, PriorityDecodeScheduler>();
-  const workerStateCaches = new Map<string, Map<string, PrefixCheckpointManifest>>();
-  type ResidentPrefixCheckpointOutcome = {
-    checkpointStateHandle: string;
-    checkpointLogicalPosition?: number;
-    checkpointDaemonPrefixHash: string;
-    checkpointDaemonPrefixLen: number;
-    boundary?: string;
-    boundaryIndex?: number;
-  };
-  type PendingPrefillOutcome = {
-    prefillTokens: number;
-    elapsedMs: number;
-    selectedBatchSize: number;
-    plan?: string;
-    backend?: string;
-    runtimeStateHandle?: string;
-    checkpointStateHandle?: string;
-    checkpointLogicalPosition?: number;
-    checkpointDaemonPrefixHash?: string;
-    checkpointDaemonPrefixLen?: number;
-    checkpointPrefixCheckpoints?: ResidentPrefixCheckpointOutcome[];
-    runtimeStateEvicted?: boolean;
-  };
-  type PendingPrefillRequest = {
-    session: RequestSessionDraft;
-    prefillSession: any;
-    fanoutKey?: string;
-    reservationId?: string;
-    selected: boolean;
-    resolve: (outcome: PendingPrefillOutcome) => void;
-    reject: (err: Error) => void;
-    promise: Promise<PendingPrefillOutcome>;
-  };
-  type PendingDecodeOutcome = {
-    content: string;
-    completionTokens: number;
-    promptTokens: number;
-    cachedTokens: number;
-    finishReason: "stop" | "length";
-    runtimeStateHandle: string;
-  };
-  type PendingDecodeRequest = {
-    active: ActiveDecodeSession;
-    promptTokens: number;
-    cachedTokens: number;
-    selected: boolean;
-    resolve: (outcome: PendingDecodeOutcome) => void;
-    reject: (err: Error) => void;
-    promise: Promise<PendingDecodeOutcome>;
-  };
-  const pendingPrefillRequests = new Map<string, PendingPrefillRequest>();
-  const pendingDecodeRequests = new Map<string, PendingDecodeRequest>();
-  const residentDecodeSessions = new Set<string>();
-  const residentCheckpointHandles = new Set<string>();
-  const residentStateBudgetMb = positiveIntEnv("HIPFIRE_SERVER_RESIDENT_STATE_BUDGET_MB");
-  const residentStateBudgetBytes = residentStateBudgetMb
-    ? residentStateBudgetMb * 1024 * 1024
-    : 16 * 1024 * 1024 * 1024;
-  let memoryPressureRejectedTotal = 0;
-  let memoryPressureLastReason = "ok";
-  let debugCorruptNextPrefixHash = process.env.HIPFIRE_DEBUG_CORRUPT_PREFIX_HASH_ONCE === "1";
-  const fallbackStateCacheStore = new Map<string, PrefixCheckpointManifest>();
-  const getWorkerId = (workerKey: ModelWorkerKey): string => modelWorkerKeyId(workerKey);
-  const getWorkerPrefillScheduler = (workerKey: ModelWorkerKey | null): PriorityPrefillScheduler | undefined => {
-    if (!workerKey) return undefined;
-    const key = getWorkerId(workerKey);
-    const existing = workerPrefillSchedulers.get(key);
-    if (existing) return existing;
-    const created = new PriorityPrefillScheduler();
-    workerPrefillSchedulers.set(key, created);
-    return created;
-  };
-  const getWorkerDecodeScheduler = (workerKey: ModelWorkerKey | null): PriorityDecodeScheduler | undefined => {
-    if (!workerKey) return undefined;
-    const key = getWorkerId(workerKey);
-    const existing = workerDecodeSchedulers.get(key);
-    if (existing) return existing;
-    const created = new PriorityDecodeScheduler();
-    workerDecodeSchedulers.set(key, created);
-    return created;
-  };
-  const getWorkerStateCache = (workerKey: ModelWorkerKey | null): Map<string, PrefixCheckpointManifest> => {
-    if (!workerKey) return fallbackStateCacheStore;
-    const key = getWorkerId(workerKey);
-    const existing = workerStateCaches.get(key);
-    if (existing) return existing;
-    const created = new Map<string, PrefixCheckpointManifest>();
-    workerStateCaches.set(key, created);
-    return created;
-  };
-  const allStateCacheMaps = (): Map<string, PrefixCheckpointManifest>[] => [
-    fallbackStateCacheStore,
-    ...workerStateCaches.values(),
-  ];
-  const rejectPendingPrefillRequest = (id: string, err: Error): void => {
-    const pending = pendingPrefillRequests.get(id);
-    if (!pending) return;
-    pendingPrefillRequests.delete(id);
-    if (pending.reservationId) {
-      void releaseStateReservations([pending.reservationId], "pending prefill reject");
-    }
-    pending.reject(err);
-  };
-  const rejectPendingDecodeRequest = (id: string, err: Error): void => {
-    const pending = pendingDecodeRequests.get(id);
-    if (!pending) return;
-    pendingDecodeRequests.delete(id);
-    pending.reject(err);
-  };
-  const removeAttachableManifestsByHandle = (handle: string): number => {
-    const removed = removeAttachableManifestsByRuntimeHandle(allStateCacheMaps(), handle);
-    residentCheckpointHandles.delete(handle);
-    return removed;
-  };
-  const clearResidentPrefixState = (reason: string) => {
-    const entries = allStateCacheMaps().reduce((sum, cache) => sum + cache.size, 0);
-    const err = new Error(`resident prefix state cleared: ${reason}`);
-    for (const id of [...pendingDecodeRequests.keys()]) {
-      rejectPendingDecodeRequest(id, err);
-    }
-    fallbackStateCacheStore.clear();
-    workerStateCaches.clear();
-    workerDecodeSchedulers.clear();
-    residentDecodeSessions.clear();
-    residentCheckpointHandles.clear();
-    if (entries > 0) {
-      console.error(`[hipfire] cleared resident prefix state (${reason}; entries=${entries})`);
-    }
-  };
-  const clearWorkerResidentPrefixState = (workerKeyId: string, reason: string) => {
-    const entries = workerStateCaches.get(workerKeyId)?.size ?? 0;
-    const err = new Error(`worker resident prefix state cleared: ${reason}`);
-    for (const [id, pending] of [...pendingPrefillRequests.entries()]) {
-      if (modelWorkerKeyId(pending.session.workerKey) === workerKeyId) {
-        rejectPendingPrefillRequest(id, err);
-      }
-    }
-    workerStateCaches.delete(workerKeyId);
-    workerPrefillSchedulers.delete(workerKeyId);
-    workerDecodeSchedulers.delete(workerKeyId);
-    for (const [id, pending] of [...pendingDecodeRequests.entries()]) {
-      if (pending.active.workerKeyId === workerKeyId) {
-        rejectPendingDecodeRequest(id, err);
-      }
-    }
-    if (entries > 0) {
-      console.error(`[hipfire] cleared worker resident prefix state (${reason}; worker=${workerKeyId} entries=${entries})`);
-    }
-  };
-  const hasPendingWorkerRuntimeRequests = (workerKeyId: string): boolean => {
-    for (const pending of pendingPrefillRequests.values()) {
-      if (modelWorkerKeyId(pending.session.workerKey) === workerKeyId) return true;
-    }
-    for (const pending of pendingDecodeRequests.values()) {
-      if (pending.active.workerKeyId === workerKeyId) return true;
-    }
-    return false;
-  };
-  const countPendingWorkerResidentRequests = (workerKeyId: string): number => {
-    let count = 0;
-    for (const pending of pendingPrefillRequests.values()) {
-      if (modelWorkerKeyId(pending.session.workerKey) === workerKeyId) count += 1;
-    }
-    for (const pending of pendingDecodeRequests.values()) {
-      if (pending.active.workerKeyId === workerKeyId) count += 1;
-    }
-    if (activeWorkerKeyId === workerKeyId) {
-      count += residentDecodeSessions.size;
-    }
-    return count;
-  };
-  const estimateResidentSessionBytes = (worker: ResidentModelWorker | undefined, physicalCap: number): number => {
-    if (!worker) return Math.max(64 * 1024 * 1024, physicalCap * 256 * 1024);
-    const descriptorAverage = worker.descriptorEntries > 0
-      ? Math.ceil(worker.runtimeSessionBytes / worker.descriptorEntries)
-      : 0;
-    if (descriptorAverage > 0) return Math.max(descriptorAverage, 16 * 1024 * 1024);
-    return Math.max(64 * 1024 * 1024, physicalCap * 256 * 1024);
-  };
-  const admitResidentSessionOrReject = (
-    workerKeyId: string | null,
-    physicalCap: number,
-    reason: string,
-    additionalSessions = 1,
-  ): Response | null => {
-    if (!workerKeyId) return null;
-    const worker = residentModelWorkers.get(workerKeyId);
-    const sessionBytes = estimateResidentSessionBytes(worker, physicalCap);
-    const pending = countPendingWorkerResidentRequests(workerKeyId);
-    const projectedBytes = (pending + additionalSessions) * sessionBytes;
-    if (residentStateBudgetBytes > 0 && projectedBytes > residentStateBudgetBytes) {
-      memoryPressureRejectedTotal += 1;
-      memoryPressureLastReason = `${reason}: projected_resident_state_bytes=${projectedBytes} budget=${residentStateBudgetBytes} pending=${pending} per_session=${sessionBytes}`;
-      return Response.json({
-        error: "server memory pressure: resident session budget exceeded",
-        detail: {
-          reason,
-          worker_key_id: workerKeyId,
-          pending_resident_requests: pending,
-          estimated_session_bytes: sessionBytes,
-          projected_resident_state_bytes: projectedBytes,
-          additional_sessions: additionalSessions,
-          resident_state_budget_bytes: residentStateBudgetBytes,
-          mode: "reject",
-        },
-      }, { status: 503 });
-    }
-    memoryPressureLastReason = "ok";
-    return null;
-  };
-  const releaseStateReservations = async (reservationIds: Iterable<string>, reason: string): Promise<void> => {
-    const reservations = [...new Set([...reservationIds].filter((id) => id.length > 0))];
-    if (reservations.length === 0) return;
-    try {
-      await e.send({
-        type: "release_session_state_reservation",
-        id: `release-reservation-${Date.now().toString(36)}`,
-        reservations,
-      });
-      await e.recv();
-    } catch (err: any) {
-      console.error(`[hipfire] failed to release state reservation (${reason}): ${err?.message ?? err}`);
-    }
-  };
-  const reserveSessionStateOrReject = async (
-    workerKeyId: string | null,
-    physicalCap: number,
-    reason: string,
-  ): Promise<{ reservationId?: string; response?: Response }> => {
-    if (!workerKeyId) return {};
-    const reservationRequestId = `reserve-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-    await e.send({
-      type: "reserve_session_state",
-      id: reservationRequestId,
-      worker_key_id: workerKeyId,
-      physical_cap: physicalCap,
-      budget_bytes: residentStateBudgetBytes,
-      ttl_ms: 30_000,
-    });
-    const reserveMsg = await e.recv();
-    if (reserveMsg?.type === "reserve_session_state_done" && typeof reserveMsg.reservation_id === "string") {
-      memoryPressureLastReason = "ok";
-      return { reservationId: reserveMsg.reservation_id };
-    }
-    if (reserveMsg?.type === "reserve_session_state_rejected") {
-      memoryPressureRejectedTotal += 1;
-      memoryPressureLastReason = `${reason}: daemon ${reserveMsg.reason ?? "memory_pressure"} projected=${reserveMsg.projected_reserved_bytes ?? "unknown"} budget=${reserveMsg.budget_bytes ?? "unknown"}`;
-      return {
-        response: Response.json({
-          error: "server memory pressure: resident session reservation rejected",
-          detail: {
-            reason,
-            worker_key_id: workerKeyId,
-            daemon: reserveMsg,
-            mode: "reject",
-          },
-        }, { status: 503 }),
-      };
-    }
-    const message = reserveMsg?.message ?? `unexpected reserve_session_state response: ${reserveMsg?.type ?? "missing"}`;
-    return {
-      response: Response.json({ error: `server memory pressure: reservation failed: ${message}` }, { status: 503 }),
-    };
-  };
-  const releaseRuntimeHandles = async (handles: Iterable<string>, reason: string, workerKeyId = activeWorkerKeyId): Promise<number> => {
-    const unique = [...new Set([...handles].filter((handle) => handle.length > 0))];
-    if (unique.length === 0) return 0;
-    try {
-      const message: any = {
-        type: "release_sessions",
-        id: `release-${Date.now().toString(36)}`,
-        sessions: unique,
-      };
-      if (workerKeyId) message.worker_key_id = workerKeyId;
-      await e.send(message);
-      const releaseMsg = await e.recv();
-      if (releaseMsg?.type === "release_sessions_done") {
-        updateRuntimeWorkerMetrics((releaseMsg as any).model_worker);
-        for (const handle of unique) {
-          residentDecodeSessions.delete(handle);
-          residentCheckpointHandles.delete(handle);
-        }
-        return unique.length;
-      }
-      console.error(`[hipfire] release_sessions returned ${releaseMsg?.type ?? "missing"} while releasing ${reason}`);
-    } catch (err: any) {
-      console.error(`[hipfire] failed to release ${reason}: ${err?.message ?? err}`);
-    }
-    return 0;
-  };
-  const releaseResidentCheckpointHandles = async (handles: Iterable<string>, reason: string): Promise<number> => {
-    const unique = [...new Set([...handles].filter((handle) => handle.length > 0))];
-    if (unique.length === 0) return 0;
-    for (const handle of unique) removeAttachableManifestsByHandle(handle);
-    return releaseRuntimeHandles(unique, reason);
-  };
-  const invalidateAttachFailure = async (handle: string | undefined, reason: string) => {
-    if (!handle) return;
-    const removed = removeAttachableManifestsByHandle(handle);
-    if (removed > 0) {
-      stateCacheEvictionsTotal += removed;
-      stateCacheRecomputeRequiredTotal += removed;
-      console.error(`[hipfire] invalidated stale prefix checkpoint ${handle}: ${reason}`);
-    }
-  };
-  const enforceResidentCheckpointCap = async () => {
-    const maxCheckpoints = serverPrefillBatchControls.residentCheckpointMax;
-    const manifests = allStateCacheMaps().flatMap((cache) => [...cache.values()]);
-    const evictions = selectResidentCheckpointEvictions(manifests, maxCheckpoints);
-    const evictedHandles = evictions
-      .map((manifest) => manifest.runtimeStateHandle)
-      .filter((handle): handle is string => typeof handle === "string" && handle.length > 0);
-    if (evictedHandles.length === 0) return;
-    const released = await releaseResidentCheckpointHandles(evictedHandles, "resident checkpoint cap");
-    stateCacheEvictionsTotal += evictions.length;
-    stateCacheRecomputeRequiredTotal += evictions.length;
-    if (released > 0) {
-      console.error(`[hipfire] evicted ${released} resident prefix checkpoint(s); cap=${maxCheckpoints}`);
-    }
-  };
-  const prefillBatchMetrics = {
-    eligible: 0,
-    selected: 0,
-    skipped: 0,
-    queued: 0,
-    cacheHits: 0,
-    cacheMisses: 0,
-    metadataCacheHits: 0,
-    runtimeCacheHits: 0,
-    prefixHashPreflightRequests: 0,
-    prefixHashPreflightCandidates: 0,
-    prefixHashPreflightMatches: 0,
-    prefixHashPreflightBoundaryMatches: 0,
-    sharedPrefixFanoutGroups: 0,
-    sharedPrefixFanoutFollowers: 0,
-    semanticBoundaryCheckpoints: 0,
-    totalBatches: 0,
-    fusedBatches: 0,
-    fallbackBatches: 0,
-    batchSizeHistogram: {} as Record<string, number>,
-  };
-  const pendingPrefillFlushTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  const parseResidentPrefixCheckpoints = (stateHandle: any): ResidentPrefixCheckpointOutcome[] => {
-    if (!stateHandle || !Array.isArray(stateHandle.prefix_checkpoints)) return [];
-    const prefixCheckpoints: ResidentPrefixCheckpointOutcome[] = [];
-    for (const checkpoint of stateHandle.prefix_checkpoints) {
-      const prefixHash = checkpoint?.prefix_hash;
-      const prefixLen = typeof checkpoint?.prefix_len === "number"
-        ? checkpoint.prefix_len
-        : prefixHash?.prefix_len;
-      if (
-        checkpoint &&
-        typeof checkpoint.checkpoint_id === "string" &&
-        prefixHash &&
-        prefixHash.algorithm === "xxh128" &&
-        typeof prefixHash.value === "string" &&
-        /^[0-9a-f]{32}$/.test(prefixHash.value) &&
-        typeof prefixLen === "number" &&
-        Number.isInteger(prefixLen) &&
-        prefixLen > 0
-      ) {
-        prefixCheckpoints.push({
-          checkpointStateHandle: checkpoint.checkpoint_id,
-          checkpointLogicalPosition: Number.isInteger(checkpoint.logical_position)
-            ? checkpoint.logical_position
-            : prefixLen,
-          checkpointDaemonPrefixHash: prefixHash.value,
-          checkpointDaemonPrefixLen: prefixLen,
-          boundary: typeof checkpoint.boundary === "string" ? checkpoint.boundary : undefined,
-          boundaryIndex: Number.isInteger(checkpoint.boundary_index) ? checkpoint.boundary_index : undefined,
-        });
-      }
-    }
-    return prefixCheckpoints;
-  };
-  const flushPendingPrefillBatch = async (workerKeyId: string, reason: string): Promise<boolean> => {
-    const scheduler = workerPrefillSchedulers.get(workerKeyId);
-    if (!scheduler || scheduler.size === 0) return false;
-    const selected = scheduler.nextPrefillBatch({ nowMs: Date.now() });
-    if (!selected || selected.sessions.length === 0) return false;
-    const selectedPending = selected.sessions
-      .map((session) => pendingPrefillRequests.get(session.id))
-      .filter((pending): pending is PendingPrefillRequest => !!pending);
-    if (selectedPending.length === 0) return false;
-    for (const pending of selectedPending) pending.selected = true;
-    prefillBatchMetrics.selected += 1;
-    const selectedReservationIds = selectedPending
-      .map((pending) => pending.reservationId)
-      .filter((reservationId): reservationId is string => typeof reservationId === "string" && reservationId.length > 0);
-    const leaderPending = selectedPending[0];
-    const sharedPrefixFanoutEnabled = process.env.HIPFIRE_SERVER_PREFILL_SHARED_PREFIX_FANOUT !== "0";
-    const fanoutKey = leaderPending.fanoutKey;
-    const sameWaveFanoutFollowers = sharedPrefixFanoutEnabled && fanoutKey && selectedPending.length > 1
-      && selectedPending.every((pending) => pending.fanoutKey === fanoutKey)
-      ? selectedPending.slice(1)
-      : [];
-    if (
-      process.env.HIPFIRE_DEBUG_SHARED_PREFIX_FANOUT === "1" &&
-      selectedPending.length > 1 &&
-      sameWaveFanoutFollowers.length === 0
-    ) {
-      console.error(
-        `[hipfire] shared-prefix timer fanout skipped: fanoutKey=${fanoutKey ?? "none"} keys=${selectedPending.map((pending) => `${pending.session.id}:${pending.fanoutKey ?? "none"}`).join(",")}`,
-      );
-    }
-    const initialPending = sameWaveFanoutFollowers.length > 0
-      ? [leaderPending]
-      : selectedPending;
-    const batchId = `prefill-flush-${Date.now().toString(36)}`;
-    const modelPath = residentModelWorkers.get(workerKeyId)?.modelPath ?? current;
-    try {
-      await e.send({
-        type: "generate_batch_prefill",
-        id: `${batchId}-dispatch`,
-        batch_id: batchId,
-        worker_key_id: workerKeyId,
-        model: modelPath,
-        sessions: initialPending.map((pending) => pending.prefillSession),
-      });
-      let prefillDone = false;
-      let prefillTokens = 0;
-      let elapsedMs = 0;
-      let plan: string | undefined;
-      let backend: string | undefined;
-      const sessionPrefillTokens = new Map<string, number>();
-      const runtimeStateHandlesBySession = new Map<string, string>();
-      const checkpointStateHandlesBySession = new Map<string, string>();
-      const checkpointDaemonPrefixHashesBySession = new Map<string, { hash: string; len: number }>();
-      const checkpointPrefixCheckpointsBySession = new Map<string, ResidentPrefixCheckpointOutcome[]>();
-      const logicalPositionsBySession = new Map<string, number>();
-      for (let i = 0; i < initialPending.length + 4; i++) {
-        const prefillMsg = await e.recv();
-        if (prefillMsg?.type === "generate_batch_prefill_done" && prefillMsg.batch_id === batchId) {
-          prefillDone = true;
-          prefillTokens = Number(prefillMsg.prefill_tokens ?? 0);
-          elapsedMs = Number(prefillMsg.elapsed_ms ?? 0);
-          plan = typeof prefillMsg.plan === "string" ? prefillMsg.plan : undefined;
-          backend = typeof prefillMsg.backend === "string" ? prefillMsg.backend : undefined;
-          updateRuntimeWorkerMetrics((prefillMsg as any).model_worker);
-          break;
-        }
-        if (prefillMsg?.type === "generate_batch_prefill_session_done") {
-          if (typeof prefillMsg.session_id === "string" && typeof prefillMsg.prefill_tokens === "number") {
-            sessionPrefillTokens.set(prefillMsg.session_id, prefillMsg.prefill_tokens);
-          }
-          if (typeof prefillMsg.session_id === "string" && typeof prefillMsg.logical_position === "number") {
-            logicalPositionsBySession.set(prefillMsg.session_id, prefillMsg.logical_position);
-          }
-          const stateHandle = (prefillMsg as any).state_handle;
-          if (typeof prefillMsg.session_id === "string" && stateHandle && typeof stateHandle.session_id === "string") {
-            runtimeStateHandlesBySession.set(prefillMsg.session_id, stateHandle.session_id);
-            residentDecodeSessions.add(stateHandle.session_id);
-          }
-          if (typeof prefillMsg.session_id === "string" && stateHandle && typeof stateHandle.checkpoint_id === "string") {
-            checkpointStateHandlesBySession.set(prefillMsg.session_id, stateHandle.checkpoint_id);
-            const prefixHash = stateHandle.prefix_hash;
-            const prefixLen = typeof stateHandle.prefix_len === "number"
-              ? stateHandle.prefix_len
-              : prefixHash?.prefix_len;
-            if (
-              prefixHash &&
-              prefixHash.algorithm === "xxh128" &&
-              typeof prefixHash.value === "string" &&
-              /^[0-9a-f]{32}$/.test(prefixHash.value) &&
-              typeof prefixLen === "number" &&
-              Number.isInteger(prefixLen) &&
-              prefixLen >= 0
-            ) {
-              checkpointDaemonPrefixHashesBySession.set(prefillMsg.session_id, {
-                hash: prefixHash.value,
-                len: prefixLen,
-              });
-            }
-          }
-          const prefixCheckpoints = parseResidentPrefixCheckpoints(stateHandle);
-          if (typeof prefillMsg.session_id === "string" && prefixCheckpoints.length > 0) {
-            checkpointPrefixCheckpointsBySession.set(prefillMsg.session_id, prefixCheckpoints);
-          }
-          continue;
-        }
-        if (prefillMsg?.type === "generate_batch_prefill_started") continue;
-        if (prefillMsg?.type === "error") throw new Error(prefillMsg.message || "generate_batch_prefill flush error");
-        if (prefillMsg?.type === "generate_batch_prefill_unsupported") throw new Error(prefillMsg.reason || "generate_batch_prefill flush unsupported");
-        throw new Error(`unexpected generate_batch_prefill flush response: ${prefillMsg?.type ?? "missing"}`);
-      }
-      if (!prefillDone) throw new Error("generate_batch_prefill flush did not complete");
-
-      if (sameWaveFanoutFollowers.length > 0) {
-        const leaderId = leaderPending.session.id;
-        const leaderCheckpointCandidates: Array<{ handle: string; hash: string; len: number; logicalPosition?: number }> = [];
-        const leaderFinalPrefix = checkpointDaemonPrefixHashesBySession.get(leaderId);
-        const leaderFinalHandle = checkpointStateHandlesBySession.get(leaderId);
-        if (leaderFinalHandle && leaderFinalPrefix) {
-          leaderCheckpointCandidates.push({
-            handle: leaderFinalHandle,
-            hash: leaderFinalPrefix.hash,
-            len: leaderFinalPrefix.len,
-            logicalPosition: logicalPositionsBySession.get(leaderId),
-          });
-        }
-        for (const checkpoint of checkpointPrefixCheckpointsBySession.get(leaderId) ?? []) {
-          leaderCheckpointCandidates.push({
-            handle: checkpoint.checkpointStateHandle,
-            hash: checkpoint.checkpointDaemonPrefixHash,
-            len: checkpoint.checkpointDaemonPrefixLen,
-            logicalPosition: checkpoint.checkpointLogicalPosition,
-          });
-        }
-        let fanoutPreflightPrefixes: Array<{ value: string; prefix_len: number }> = [];
-        try {
-          const fanoutPreflightSession = cloneJsonValue(leaderPending.prefillSession);
-          delete fanoutPreflightSession.state_handle?.runtime_state_handle;
-          delete fanoutPreflightSession.state_handle?.prefix_hash;
-          delete fanoutPreflightSession.state_handle?.prefix_len;
-          fanoutPreflightSession.state_handle = {
-            ...(fanoutPreflightSession.state_handle ?? {}),
-            logical_position: 0,
-            cached_prefix_tokens: 0,
-          };
-          await e.send({
-            type: "prefix_hash_preflight",
-            id: `prefix-hash-${batchId}`,
-            worker_key_id: workerKeyId,
-            model: modelPath,
-            boundary_policy: "semantic_chat_template",
-            session: fanoutPreflightSession,
-          });
-          const fanoutPreflightMsg = await e.recv();
-          if (fanoutPreflightMsg?.type === "prefix_hash_preflight_done" && Array.isArray(fanoutPreflightMsg.prefixes)) {
-            fanoutPreflightPrefixes = fanoutPreflightMsg.prefixes
-              .filter((candidate: any) =>
-                candidate &&
-                typeof candidate.value === "string" &&
-                /^[0-9a-f]{32}$/.test(candidate.value) &&
-                Number.isInteger(candidate.prefix_len) &&
-                candidate.prefix_len >= 0
-              )
-              .map((candidate: any) => ({
-                value: candidate.value,
-                prefix_len: candidate.prefix_len,
-              }))
-              .sort((a: { prefix_len: number }, b: { prefix_len: number }) => b.prefix_len - a.prefix_len);
-            prefillBatchMetrics.prefixHashPreflightRequests += 1;
-            prefillBatchMetrics.prefixHashPreflightCandidates += fanoutPreflightPrefixes.length;
-          }
-        } catch (err: any) {
-          console.error(`[hipfire] shared-prefix timer fanout preflight failed; followers will use normal prefill: ${err?.message ?? err}`);
-        }
-        const fanoutCheckpoint = fanoutPreflightPrefixes
-          .map((prefix) => leaderCheckpointCandidates.find((checkpoint) =>
-            checkpoint.hash === prefix.value &&
-            checkpoint.len === prefix.prefix_len
-          ))
-          .find((checkpoint): checkpoint is { handle: string; hash: string; len: number; logicalPosition?: number } => !!checkpoint);
-        if (
-          process.env.HIPFIRE_DEBUG_SHARED_PREFIX_FANOUT === "1" &&
-          !fanoutCheckpoint
-        ) {
-          console.error(
-            `[hipfire] shared-prefix timer fanout found no checkpoint match: candidates=${leaderCheckpointCandidates.map((checkpoint) => `${checkpoint.len}:${checkpoint.hash}`).join(",")} preflight=${fanoutPreflightPrefixes.map((prefix) => `${prefix.prefix_len}:${prefix.value}`).join(",")}`,
-          );
-        }
-        if (fanoutCheckpoint) {
-          const fanoutBatchId = `${batchId}-fanout`;
-          await e.send({
-            type: "generate_batch_prefill",
-            id: `${fanoutBatchId}-dispatch`,
-            batch_id: fanoutBatchId,
-            worker_key_id: workerKeyId,
-            model: modelPath,
-            sessions: sameWaveFanoutFollowers.map((pending) => {
-              const payload = cloneJsonValue(pending.prefillSession);
-              payload.state_handle = {
-                ...(payload.state_handle ?? {}),
-                runtime_state_handle: fanoutCheckpoint.handle,
-                cached_prefix_tokens: fanoutCheckpoint.len,
-                logical_position: fanoutCheckpoint.logicalPosition ?? fanoutCheckpoint.len,
-                prefix_hash: {
-                  algorithm: "xxh128",
-                  value: fanoutCheckpoint.hash,
-                  prefix_len: fanoutCheckpoint.len,
-                },
-                prefix_len: fanoutCheckpoint.len,
-              };
-              delete payload.suffix_tokens;
-              return payload;
-            }),
-          });
-          let fanoutDone = false;
-          for (let i = 0; i < sameWaveFanoutFollowers.length + 4; i++) {
-            const prefillMsg = await e.recv();
-            if (prefillMsg?.type === "generate_batch_prefill_done" && prefillMsg.batch_id === fanoutBatchId) {
-              fanoutDone = true;
-              prefillTokens += Number(prefillMsg.prefill_tokens ?? 0);
-              elapsedMs += Number(prefillMsg.elapsed_ms ?? 0);
-              updateRuntimeWorkerMetrics((prefillMsg as any).model_worker);
-              break;
-            }
-            if (prefillMsg?.type === "generate_batch_prefill_session_done") {
-              if (typeof prefillMsg.session_id === "string" && typeof prefillMsg.prefill_tokens === "number") {
-                sessionPrefillTokens.set(prefillMsg.session_id, prefillMsg.prefill_tokens);
-              }
-              if (typeof prefillMsg.session_id === "string" && typeof prefillMsg.logical_position === "number") {
-                logicalPositionsBySession.set(prefillMsg.session_id, prefillMsg.logical_position);
-              }
-              const stateHandle = (prefillMsg as any).state_handle;
-              if (typeof prefillMsg.session_id === "string" && stateHandle && typeof stateHandle.session_id === "string") {
-                runtimeStateHandlesBySession.set(prefillMsg.session_id, stateHandle.session_id);
-                residentDecodeSessions.add(stateHandle.session_id);
-              }
-              if (typeof prefillMsg.session_id === "string" && stateHandle && typeof stateHandle.checkpoint_id === "string") {
-                checkpointStateHandlesBySession.set(prefillMsg.session_id, stateHandle.checkpoint_id);
-                const prefixHash = stateHandle.prefix_hash;
-                const prefixLen = typeof stateHandle.prefix_len === "number"
-                  ? stateHandle.prefix_len
-                  : prefixHash?.prefix_len;
-                if (
-                  prefixHash &&
-                  prefixHash.algorithm === "xxh128" &&
-                  typeof prefixHash.value === "string" &&
-                  /^[0-9a-f]{32}$/.test(prefixHash.value) &&
-                  typeof prefixLen === "number" &&
-                  Number.isInteger(prefixLen) &&
-                  prefixLen >= 0
-                ) {
-                  checkpointDaemonPrefixHashesBySession.set(prefillMsg.session_id, {
-                    hash: prefixHash.value,
-                    len: prefixLen,
-                  });
-                }
-              }
-              const prefixCheckpoints = parseResidentPrefixCheckpoints(stateHandle);
-              if (typeof prefillMsg.session_id === "string" && prefixCheckpoints.length > 0) {
-                checkpointPrefixCheckpointsBySession.set(prefillMsg.session_id, prefixCheckpoints);
-              }
-              continue;
-            }
-            if (prefillMsg?.type === "generate_batch_prefill_started") continue;
-            if (prefillMsg?.type === "error") throw new Error(prefillMsg.message || "generate_batch_prefill timer fanout error");
-            if (prefillMsg?.type === "generate_batch_prefill_unsupported") throw new Error(prefillMsg.reason || "generate_batch_prefill timer fanout unsupported");
-            throw new Error(`unexpected generate_batch_prefill timer fanout response: ${prefillMsg?.type ?? "missing"}`);
-          }
-          if (!fanoutDone) throw new Error("generate_batch_prefill timer fanout did not complete");
-          prefillBatchMetrics.sharedPrefixFanoutGroups += 1;
-          prefillBatchMetrics.sharedPrefixFanoutFollowers += sameWaveFanoutFollowers.length;
-          prefillBatchMetrics.cacheHits += sameWaveFanoutFollowers.length;
-          prefillBatchMetrics.runtimeCacheHits += sameWaveFanoutFollowers.length;
-        }
-      }
-
-      await releaseStateReservations(selectedReservationIds, `prefill flush ${reason}`);
-      recordPrefillBatchDispatch(selectedPending.length, prefillTokens, elapsedMs, plan, backend);
-      for (const pending of selectedPending) {
-        const id = pending.session.id;
-        pendingPrefillRequests.delete(id);
-        pending.resolve({
-          prefillTokens: sessionPrefillTokens.get(id) ?? 0,
-          elapsedMs,
-          selectedBatchSize: selectedPending.length,
-          plan,
-          backend,
-          runtimeStateHandle: runtimeStateHandlesBySession.get(id),
-          checkpointStateHandle: checkpointStateHandlesBySession.get(id),
-          checkpointLogicalPosition: logicalPositionsBySession.get(id),
-          checkpointDaemonPrefixHash: checkpointDaemonPrefixHashesBySession.get(id)?.hash,
-          checkpointDaemonPrefixLen: checkpointDaemonPrefixHashesBySession.get(id)?.len,
-          checkpointPrefixCheckpoints: checkpointPrefixCheckpointsBySession.get(id),
-          runtimeStateEvicted: false,
-        });
-      }
-      return true;
-    } catch (err: any) {
-      const error = err instanceof Error ? err : new Error(err?.message ?? String(err));
-      await releaseStateReservations(selectedReservationIds, `prefill flush failed ${reason}`);
-      for (const pending of selectedPending) {
-        pendingPrefillRequests.delete(pending.session.id);
-        pending.reservationId = undefined;
-        pending.reject(error);
-      }
-      console.error(`[hipfire] pending prefill flush failed: ${error.message}`);
-      return false;
-    }
-  };
-  const schedulePendingPrefillFlush = (workerKeyId: string, delayMs: number) => {
-    if (pendingPrefillFlushTimers.has(workerKeyId)) return;
-    const timer = setTimeout(() => {
-      pendingPrefillFlushTimers.delete(workerKeyId);
-      void (async () => {
-        await acquireLock();
-        try {
-          await flushPendingPrefillBatch(workerKeyId, "coalesce timer");
-        } finally {
-          releaseLock();
-        }
-      })();
-    }, Math.max(0, delayMs));
-    pendingPrefillFlushTimers.set(workerKeyId, timer);
-  };
-  const decodeBatchMetrics = {
-    eligible: 0,
-    selected: 0,
-    skipped: 0,
-    totalBatches: 0,
-    serialBatches: 0,
-    fusedBatches: 0,
-    activeSessions: 0,
-    selectedBatchSize: 0,
-    lastBackend: undefined as string | undefined,
-    lastChunkCount: 0,
-    lastChunkSize: 0,
-    lastDecodeMs: 0,
-    lastSkippedReason: "not_applicable",
-    lastCompatibleStateKinds: [] as string[],
-    lastCachedPrefixTokens: 0,
-    lastFallbackReason: "not_applicable",
-  };
-  const batchFileStore = new Map<string, BatchFileRecord>();
-  const batchControlStore = new Map<string, BatchJobRecord>();
-  const responsesContextMax = Math.max(0, Number.parseInt(process.env.HIPFIRE_RESPONSES_STATE_MAX ?? "1024", 10) || 1024);
-  const responsesContexts = new Map<string, StoredResponsesContext>();
-  let responsesPreviousResponseHits = 0;
-  let responsesPreviousResponseMisses = 0;
-  const storeResponsesContext = (context: StoredResponsesContext) => {
-    if (responsesContextMax <= 0) return;
-    responsesContexts.set(context.id, context);
-    while (responsesContexts.size > responsesContextMax) {
-      const oldest = [...responsesContexts.values()]
-        .sort((a, b) => a.lastUsedAtMs - b.lastUsedAtMs)[0];
-      if (!oldest) break;
-      responsesContexts.delete(oldest.id);
-    }
-  };
-  let lastPrefillQueueWaitReason: "selected" | "waiting" | "insufficient_queue" | "memory_pressure" | "not_eligible" | "disabled" = "disabled";
-  let lastPrefillFallbackReason = "not_applicable";
-  let lastPrefillRuntimeDispatchSkippedReason = "not_applicable";
-  let lastPrefillDaemonPlan: string | undefined;
-  let lastPrefillDaemonBackend: string | undefined;
-  let lastPrefillTokens = 0;
-  let lastPrefillMs = 0;
-  let lastPrefillTokS = 0;
-  let lastResidentStateLimit = 0;
-  let lastSpillableBatchMax = 0;
-  let lastSpillableSessions = 0;
-  let lastResidentStateCache = serverPrefillBatchControls.residentStateCache;
-  let lastResidentCheckpointMax = serverPrefillBatchControls.residentCheckpointMax;
-  let lastStateCacheDisk = false;
-  let lastStateCacheDiskMinPriority = 128;
-  let lastDiskSpillAllowed = false;
-  let stateCacheEvictionsTotal = 0;
-  let stateCacheRecomputeRequiredTotal = 0;
-  let lastBatchRuntimeSkippedReason = "not_enabled";
-  let lastBatchFallbackReason = "idle";
-  let lastBatchExecutionMode: BatchExecutionMode = "disabled";
-  let batchValidationErrorCount = 0;
-  let batchStreamingRejectionCount = 0;
-  let batchRuntimeUnsupportedModeCount = 0;
-
-  const batchStats = () => {
-    const records = [...batchControlStore.values()];
-    const queued = records.filter((r) =>
-      r.status === "validating" || r.status === "in_progress" || r.status === "finalizing"
-    ).length;
-    const selected = records.filter((r) => r.status === "in_progress").length;
-    const failed = records.filter((r) => r.status === "failed").length;
-    const cancelled = records.filter((r) => r.status === "cancelled").length;
-    const completed = records.filter((r) => r.status === "completed").length;
-    return { total: records.length, queued, selected, failed, cancelled, completed };
-  };
-
-  const buildBatchArtifactErrorContent = (errors: Parameters<typeof buildBatchInputErrorArtifact>[0], lines: Parameters<typeof buildBatchInputErrorArtifact>[1]) =>
-    buildBatchInputErrorArtifact(errors, lines)
-      .map((line) => JSON.stringify(line))
-      .join("\n") + "\n";
-
-  const batchRecordToResponse = (record: BatchJobRecord) => ({
-    ...record,
-    created_at: record.created_at,
-    in_progress_at: record.in_progress_at,
-    completed_at: record.completed_at,
-    request_count: record.request_count,
-    completed_requests: record.completed_requests ?? 0,
-  });
-
-  const markBatchUnsupportedFallback = (reason: string) => {
-    batchRuntimeUnsupportedModeCount += 1;
-    lastBatchRuntimeSkippedReason = `line_fallback:${reason}`;
-    lastBatchFallbackReason = `line_fallback:${reason}`;
-  };
-
-  const runBatchJob = async (
-    batchId: string,
-    parsedEntries: BatchInputRecord[],
-    preValidationErrors: Parameters<typeof buildBatchInputErrorArtifact>[0] = [],
-  ) => {
-    const batchRecord = batchControlStore.get(batchId);
-    if (!batchRecord) return;
-    if (batchRecord.status === "cancelled" || batchRecord.status === "cancelling" || batchRecord.status === "failed" || batchRecord.status === "completed") return;
-
-    batchRecord.status = "in_progress";
-    batchRecord.in_progress_at = nowUnixSeconds();
-    batchRecord.failed_reason = undefined;
-    lastBatchFallbackReason = "batch_in_progress";
-    batchControlStore.set(batchId, batchRecord);
-
-    try {
-      const outputLines: Array<{ custom_id: string; response: any }> = [];
-      const runtimeErrors: Parameters<typeof buildBatchInputErrorArtifact>[0] = [];
-      const sharedSchedulerPlan: { selected: number; notSelected: number } = {
-        selected: 0,
-        notSelected: 0,
-      };
-      let batchExecutionMode: BatchExecutionMode = serverPrefillBatch.enabled ? "serial_fallback" : "unsupported";
-      let hasSuccessfulLine = false;
-      let hasUnsupportedLine = false;
-      for (let i = 0; i < parsedEntries.length; i++) {
-        const currentBatchRecord = batchControlStore.get(batchId);
-        if (!currentBatchRecord) return;
-        if (currentBatchRecord.status === "cancelling" || currentBatchRecord.status === "cancelled") {
-          currentBatchRecord.status = "cancelled";
-          currentBatchRecord.completed_at = nowUnixSeconds();
-          batchControlStore.set(batchId, currentBatchRecord);
-          return;
-        }
-        const line = parsedEntries[i];
-        const normalizedBody = line.normalized_body ?? line.body;
-        const endpoint = line.url;
-
-        // Build a stable batch execution envelope from the normalized payload.
-        // This is intentionally minimal by design: we do not run full daemon
-        // scheduling here yet, but we preserve per-line state in response/error
-        // artifacts so downstream tooling can validate shape and correlation.
-        const modelHint = normalizedBody.model ?? batchRecord.endpoint;
-        const rawLineModel = typeof modelHint === "string" ? modelHint : "unknown";
-        const lineId = `${batchId}_${normalizeLineIdHint(line.custom_id)}_${i}`;
-        const fallbackReason = (() => {
-          if (!rawLineModel || rawLineModel === "unknown") {
-            return "missing_model";
-          }
-          if (normalizedBody.stream === true) {
-            return "streaming_unsupported";
-          }
-          if (endpoint === "/v1/responses") {
-            if (!Array.isArray(normalizedBody.messages)) {
-              return "responses_input_not_message_sequence";
-            }
-          }
-          return "serial_fallback";
-        })();
-
-        const normalizedMessages = Array.isArray(normalizedBody.messages)
-          ? normalizedBody.messages
-          : [];
-        const isValidMessages = endpoint === "/v1/responses"
-          ? Array.isArray(normalizedMessages)
-          : true;
-
-        if (!isValidMessages || fallbackReason !== "serial_fallback") {
-          runtimeErrors.push({
-            line: i + 1,
-            custom_id: line.custom_id,
-            code: "unsupported_mode",
-            message: `custom_id ${line.custom_id} fallbacked due to ${fallbackReason}`,
-          });
-          hasUnsupportedLine = true;
-          batchExecutionMode = "unsupported";
-          sharedSchedulerPlan.notSelected += 1;
-          markBatchUnsupportedFallback(fallbackReason);
-          continue;
-        }
-
-        const lineModelPath = findModel(rawLineModel);
-        if (!lineModelPath) {
-          runtimeErrors.push({
-            line: i + 1,
-            custom_id: line.custom_id,
-            code: "model_not_found",
-            message: `custom_id ${line.custom_id} model not found: ${rawLineModel}`,
-          });
-          hasUnsupportedLine = true;
-          continue;
-        }
-
-        const lineModelResolved = resolve(lineModelPath);
-        const stateModeForRouting = currentStateMode || "q8";
-        const lineRoute = pickServingModelWorker({
-          requestModelPath: lineModelResolved,
-          currentModelPath: current,
-          currentMaxSeq,
-          requiredMaxSeq: 4096,
-          archId: currentArch ?? "unknown",
-          quantFamily: inferQuantFamilyForPath(lineModelResolved),
-          stateMode: stateModeForRouting,
-          featureFlags: ["serve", "batch_worker"],
-          artifactDigest: inferModelArtifactDigest(lineModelResolved),
-          maxSeqBucket: currentMaxSeq ?? 4096,
-        });
-        const loadedModelPath = lineRoute.canReuseCurrentWorker ? current : null;
-
-        const bodyConfig = resolveModelConfig(rawLineModel);
-        const batchPolicy = schedulerPolicyForPriority(
-          parseSchedulerPriority(undefined, serverPrefillBatch.priority),
-        );
-        const schedulingEligible = serverPrefillBatch.enabled
-          ? serverPrefillBatchEligibility({
-            body: normalizedBody,
-            loadedModelPath,
-            requestModelPath: lineModelResolved,
-            loadedMaxSeq: currentMaxSeq,
-            requiredMaxSeq: 4096,
-            requestImages: [],
-            effectiveConfig: {
-              prefill_compression: bodyConfig.prefill_compression,
-              prefill_drafter: bodyConfig.prefill_drafter,
-            },
-          })
-          : { eligible: false, reason: "disabled" };
-
-        if (!schedulingEligible.eligible) {
-          batchExecutionMode = "unsupported";
-          markBatchUnsupportedFallback(schedulingEligible.reason);
-          hasUnsupportedLine = true;
-          continue;
-        }
-
-        const requestTokens = approximatePromptTokenIds(
-          Array.isArray(normalizedMessages)
-            ? normalizedMessages
-              .map((entry: any) => (typeof entry?.content === "string" ? entry.content : ""))
-              .join("\n")
-            : "",
-        );
-        const workerDraft = createServerPrefillSession({
-          id: lineId,
-          modelPath: lineModelResolved,
-          modelDigest: inferModelArtifactDigest(lineModelResolved),
-          archId: currentArch ?? "unknown",
-          quantFamily: inferQuantFamilyForPath(lineModelResolved),
-          stateMode: stateModeForRouting,
-          maxSeqBucket: Math.max(4096, requestTokens.length),
-          featureFlags: ["serve", "batch_worker", currentArch ?? "unknown", "prefill_batch"],
-          promptTokens: requestTokens,
-          stateKinds: inferStateKindsForServeArch(currentArch),
-          priority: batchPolicy.priority,
-        });
-
-        const servingWorkerKey = pickServingModelWorker({
-          requestModelPath: lineModelResolved,
-          currentModelPath: current,
-          currentMaxSeq,
-          requiredMaxSeq: 4096,
-          archId: currentArch ?? "unknown",
-          quantFamily: inferQuantFamilyForPath(lineModelResolved),
-          stateMode: stateModeForRouting,
-          featureFlags: ["serve", "batch_worker"],
-          artifactDigest: inferModelArtifactDigest(lineModelResolved),
-          maxSeqBucket: currentMaxSeq ?? 4096,
-        }).workerKey;
-
-        const workerScheduler = getWorkerPrefillScheduler(servingWorkerKey);
-        if (schedulingEligible.eligible && serverPrefillBatch.enabled && workerScheduler && generateBatchPrefillCapability === "supported") {
-          const nowMs = Date.now();
-          workerScheduler.enqueueIfAbsent(workerDraft, nowMs);
-          const preview = workerScheduler.previewNextPrefillBatch({
-            nowMs,
-            incomingSession: workerDraft,
-            incomingEnqueuedAtMs: nowMs,
-          });
-          const shouldRunThisBatch = !!preview?.sessions?.some((s) => s.id === workerDraft.id);
-          if (shouldRunThisBatch) {
-            const scheduled = workerScheduler.nextPrefillBatch({ nowMs });
-            if (scheduled?.sessions.some((s) => s.id === workerDraft.id)) {
-              sharedSchedulerPlan.selected += 1;
-              batchExecutionMode = "prefill_batch";
-            } else {
-              sharedSchedulerPlan.notSelected += 1;
-              batchExecutionMode = "serial_fallback";
-              markBatchUnsupportedFallback("prefill_batch_scheduler_miss");
-              workerScheduler.cancel(lineId);
-              hasUnsupportedLine = true;
-            }
-          } else {
-            sharedSchedulerPlan.notSelected += 1;
-            batchExecutionMode = "serial_fallback";
-            markBatchUnsupportedFallback("prefill_batch_preview_reject");
-            workerScheduler.cancel(lineId);
-            hasUnsupportedLine = true;
-          }
-        } else {
-          sharedSchedulerPlan.notSelected += 1;
-          batchExecutionMode = serverPrefillBatch.enabled ? "unsupported" : "serial_fallback";
-          markBatchUnsupportedFallback(serverPrefillBatch.enabled ? "prefill_protocol_not_supported" : "batch_prefill_disabled");
-          hasUnsupportedLine = true;
-        }
-
-        // Deterministic fallback reason for this scaffolded path.
-        const responseBodyForLine = {
-          id: `${line.url === "/v1/responses" ? "chatcmpl" : "chatcmpl"}_${normalizeLineIdHint(line.custom_id)}`,
-          object: line.url === "/v1/responses" ? "response" : "chat.completion",
-          created: nowUnixSeconds(),
-          model: normalizedBody.model ?? batchRecord.endpoint,
-          choices: [{
-            index: 0,
-            message: {
-              role: "assistant",
-              content: `Batch endpoint scaffold placeholder for ${line.custom_id}`,
-            },
-            finish_reason: "stop",
-          }],
-          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-        };
-        outputLines.push({
-          custom_id: line.custom_id,
-          response: line.url === "/v1/responses"
-            ? toResponsesObject(responseBodyForLine.id, responseBodyForLine)
-            : responseBodyForLine,
-        });
-        hasSuccessfulLine = true;
-        await new Promise((resolve) => setTimeout(resolve, 0));
-      }
-
-      const updatedBeforeWrite = batchControlStore.get(batchId);
-      if (!updatedBeforeWrite || updatedBeforeWrite.status !== "in_progress") return;
-      updatedBeforeWrite.status = "finalizing";
-      batchControlStore.set(batchId, updatedBeforeWrite);
-
-      const updated = batchControlStore.get(batchId);
-      if (!updated) return;
-      if (outputLines.length > 0) {
-        const outputFileId = `file_${randomUUID().replace(/-/g, "")}`;
-        writeBatchArtifact(outputFileId, buildBatchOutputArtifact(outputLines));
-        updated.output_file_id = outputFileId;
-      } else {
-        updated.output_file_id = null;
-      }
-      if (preValidationErrors.length > 0) {
-        updated.failed_reason = updated.failed_reason ?? "partial_batch_errors";
-      }
-      if (runtimeErrors.length > 0 || preValidationErrors.length > 0) {
-        const errorFileId = `file_${randomUUID().replace(/-/g, "")}`;
-        writeBatchArtifact(errorFileId, buildBatchArtifactErrorContent(
-          [...preValidationErrors, ...runtimeErrors],
-          parsedEntries,
-        ));
-        updated.error_file_id = errorFileId;
-        if (updated.request_count > outputLines.length) {
-          updated.failed_reason = "partial_batch_errors";
-        }
-      }
-      if (!hasSuccessfulLine && (runtimeErrors.length > 0 || preValidationErrors.length > 0)) {
-        updated.status = "failed";
-        updated.failed_reason = updated.failed_reason ?? "partial_batch_errors";
-      } else {
-        updated.status = "completed";
-      }
-      updated.completed_at = nowUnixSeconds();
-      updated.completed_requests = Math.max(0, outputLines.length);
-      updated.metadata = {
-        prefill_batch_shared_scheduler_selected: sharedSchedulerPlan.selected,
-        prefill_batch_shared_scheduler_not_selected: sharedSchedulerPlan.notSelected,
-        execution_mode: batchExecutionMode,
-      };
-      batchControlStore.set(batchId, updated);
-      lastBatchFallbackReason = preValidationErrors.length > 0
-        ? "completed_with_prevalidation_rejections"
-        : (batchExecutionMode === "prefill_batch"
-          ? "selected_for_dispatch:selected"
-          : batchExecutionMode === "serial_fallback"
-          ? "line_rejected:serial_fallback"
-          : "line_fallback:not_enabled");
-      lastBatchExecutionMode = batchExecutionMode;
-      lastBatchRuntimeSkippedReason = batchExecutionMode === "prefill_batch"
-        ? "not_implemented"
-        : batchExecutionMode === "serial_fallback"
-        ? "not_enabled"
-        : lastBatchRuntimeSkippedReason;
-    } catch (err: any) {
-      const failedBatch = batchControlStore.get(batchId);
-      if (!failedBatch) return;
-      const errorFileId = `file_${randomUUID().replace(/-/g, "")}`;
-      writeBatchArtifact(errorFileId, buildBatchArtifactErrorContent(
-        [
-          ...preValidationErrors,
-          { line: 0, code: "processing_error", message: err?.message ?? "batch processing failed" },
-        ],
-        parsedEntries,
-      ));
-      failedBatch.error_file_id = errorFileId;
-      failedBatch.status = "failed";
-      failedBatch.completed_at = nowUnixSeconds();
-      failedBatch.failed_reason = "processing_error";
-      batchValidationErrorCount += 1;
-      lastBatchFallbackReason = "processing_error";
-      lastBatchRuntimeSkippedReason = "batch_processing_error";
-      batchControlStore.set(batchId, failedBatch);
-    }
-  };
-
-  let lastSelectedBatchSize = 0;
-  const recordPrefillStatePolicy = (
-    residentStateLimit: number,
-    spillableBatchMax: number,
-    selectedSize: number,
-    residentStateCache: boolean,
-    residentCheckpointMax: number,
-    stateCacheDisk: boolean,
-    stateCacheDiskMinPriority: number,
-    diskSpillAllowed: boolean,
-  ) => {
-    lastResidentStateLimit = Math.max(0, Math.floor(residentStateLimit));
-    lastSpillableBatchMax = Math.max(lastResidentStateLimit, Math.floor(spillableBatchMax));
-    lastSpillableSessions = diskSpillAllowed
-      ? Math.max(0, Math.floor(selectedSize) - lastResidentStateLimit)
-      : 0;
-    lastResidentStateCache = residentStateCache;
-    lastResidentCheckpointMax = Math.max(0, Math.floor(residentCheckpointMax));
-    lastStateCacheDisk = stateCacheDisk;
-    lastStateCacheDiskMinPriority = Math.max(0, Math.min(255, Math.floor(stateCacheDiskMinPriority)));
-    lastDiskSpillAllowed = diskSpillAllowed;
-  };
-  const recordPrefillBatchDispatch = (
-    selectedSize: number,
-    prefillTokens: number,
-    elapsedMs: number,
-    plan?: string,
-    backend?: string,
-  ) => {
-    prefillBatchMetrics.totalBatches += 1;
-    if (backend?.startsWith("fused")) {
-      prefillBatchMetrics.fusedBatches += 1;
-    } else {
-      prefillBatchMetrics.fallbackBatches += 1;
-    }
-    const sizeKey = String(selectedSize);
-    prefillBatchMetrics.batchSizeHistogram[sizeKey] = (prefillBatchMetrics.batchSizeHistogram[sizeKey] ?? 0) + 1;
-    lastSelectedBatchSize = selectedSize;
-    lastPrefillTokens = Number.isFinite(prefillTokens) ? prefillTokens : 0;
-    lastPrefillMs = Number.isFinite(elapsedMs) ? elapsedMs : 0;
-    lastPrefillTokS = lastPrefillMs > 0 ? (lastPrefillTokens * 1000) / lastPrefillMs : 0;
-    if (plan) lastPrefillDaemonPlan = plan;
-    if (backend) lastPrefillDaemonBackend = backend;
-  };
+  // Daemon-advertised prompt-cache capability (the `cache_capable` field on
+  // the `loaded` response). Source of truth for the per-request reset
+  // decision; null when an older daemon doesn't send it (we then fall back to
+  // the arch-string allowlist below).
+  let currentCacheCapable: boolean | null = null;
 
   // Idle eviction: after `idle_timeout` seconds of no requests, unload the
   // model to free VRAM. Next request reloads it (one-shot cost). 0 disables.
@@ -3281,103 +1679,12 @@ async function serve(port: number, host: string) {
   // since gone idle.
   let lastRequestTime = Date.now();
   const idleTimeoutMs = cfg.idle_timeout * 1000;
-  const evictionInterval = idleTimeoutMs > 0 ? setInterval(async () => {
-    if (!current) return;                              // nothing to unload
-    if (e.generating) return;                          // active stream — don't yank
-    if (Date.now() - lastRequestTime < idleTimeoutMs) return;
-    try {
-      console.error(`[hipfire] idle for ${cfg.idle_timeout}s — unloading model (VRAM freed; next request will reload)`);
-      await e.send({ type: "unload" });
-      await e.recv();
-    } catch (err: any) {
-      console.error(`[hipfire] eviction failed: ${err?.message ?? err}`);
-    } finally {
-      // Reset capability state regardless of whether send/recv threw.
-      // Leaving these stale (e.g. modelHasVL=true after a broken-pipe
-      // eviction) makes the next request forward image_base64 to a
-      // daemon that has nothing loaded.
-      current = null;
-      currentMaxSeq = null;
-      modelHasVL = false;
-      currentStateMode = null;
-      currentArch = null;
-      residentModelWorkers.clear();
-      activeWorkerKeyId = null;
-      clearResidentPrefixState("idle unload");
-    }
-  }, Math.min(60_000, idleTimeoutMs)) : null;
-  // Keep process alive irrespective of the interval; clean up on exit.
-  if (evictionInterval) process.on("exit", () => clearInterval(evictionInterval));
 
-  // Pre-warm: load default model and compile kernels before accepting requests
-  const defaultModel = process.env.HIPFIRE_MODEL || cfg.default_model;
-  const rawWarmPath = findModel(defaultModel);
-  const warmPath = rawWarmPath ? (isDummyModelPath(rawWarmPath) ? rawWarmPath : resolve(rawWarmPath)) : null;
-  if (warmPath) {
-    try {
-      console.error(`[hipfire] pre-warming ${defaultModel}...`);
-      const warmLoadMsg = buildLoadMessage(warmPath, defaultModel);
-      const warmWorkerKey = makeResidentWorkerKey(
-        warmPath,
-        warmLoadMsg.params.max_seq,
-        warmLoadMsg.params.kv_mode || null,
-        warmLoadMsg.params.physical_cap,
-      );
-      const warmWorkerKeyId = modelWorkerKeyId(warmWorkerKey);
-      warmLoadMsg.worker_key_id = warmWorkerKeyId;
-      await e.send(warmLoadMsg);
-      const loadResult = await e.recv();
-      if (loadResult.type === "error") {
-        console.error(`[hipfire] pre-warm load failed: ${loadResult.message} (will load on first request)`);
-      } else {
-        for await (const msg of e.generate({ type: "generate", id: "warmup", worker_key_id: warmWorkerKeyId, prompt: "Hi", temperature: 0, max_tokens: 1 })) {
-          if (msg.type === "done") break;
-        }
-        await e.send({ type: "reset", worker_key_id: warmWorkerKeyId }); await e.recv();
-        clearResidentPrefixState("pre-warm reset");
-        rememberResidentWorker({
-          workerKeyId: warmWorkerKeyId,
-          workerKey: warmWorkerKey,
-          modelPath: warmPath,
-          maxSeq: warmLoadMsg.params.max_seq,
-          physicalCap: warmLoadMsg.params.physical_cap,
-          stateMode: warmLoadMsg.params.kv_mode || null,
-          hasVL: loadResult.vl === true,
-          arch: typeof loadResult.arch === "string" ? loadResult.arch : null,
-          descriptorEntries: 0,
-          descriptorBytes: 0,
-          modelFileBytes: 0,
-          modelWeightBytes: 0,
-          runtimeBaseBytes: 0,
-          runtimeSessionBytes: 0,
-          runtimeStateBytes: 0,
-          totalResidentBytes: 0,
-          evictableStateBytes: 0,
-          lastUsedAtMs: Date.now(),
-          routeReason: "worker_loaded",
-        });
-        updateRuntimeWorkerMetrics((loadResult as any).model_worker);
-        if (serverPrefillBatch.enabled) {
-          const probe = await probeGenerateBatchPrefillCapability(activeWorkerKeyId);
-          generateBatchPrefillCapability = probe.capability;
-          generateBatchPrefillCapabilityReason = probe.reason;
-          console.error(
-            `[hipfire] generate_batch_prefill capability=${generateBatchPrefillCapability} reason=${generateBatchPrefillCapabilityReason}`,
-          );
-        }
-        console.error(`[hipfire] warm-up complete`);
-      }
-    } catch (err: any) {
-      console.error(`[hipfire] pre-warm failed: ${err?.message} — restarting daemon`);
-      current = null;
-      currentMaxSeq = null;
-      clearResidentPrefixState("pre-warm daemon restart");
-      try { await e.stop(); } catch {}
-      await e.start();
-      await e.send({ type: "ping" }); await e.recv();
-    }
-  }
-
+  // Serve lock: serializes all daemon stdin/stdout access so only one
+  // caller is mid-send/recv on the single IPC pipe at a time. Declared
+  // BEFORE the eviction interval so the eviction tick can take it too
+  // (hunt3 B-1/B-5). `busy` covers the WHOLE lock-held window (incl. the
+  // model-reload window where e.generating is still false).
   let busy = false;
   const queue: Array<{ resolve: () => void }> = [];
   async function acquireLock() {
@@ -3390,6 +1697,100 @@ async function serve(port: number, host: string) {
     else busy = false;
   }
 
+  const evictionInterval = idleTimeoutMs > 0 ? setInterval(async () => {
+    // Cheap pre-checks before paying the lock-wait cost.
+    if (!current) return;                              // nothing to unload
+    if (e.generating) return;                          // active stream — don't yank
+    if (busy) return;                                  // hunt3 B-5: request holds the lock (incl. reload window) — don't contend
+    if (Date.now() - lastRequestTime < idleTimeoutMs) return;
+    // hunt3 B-1: take the serve lock before touching the daemon pipe.
+    // Without it, this send(unload)+recv() races a concurrent request's
+    // recv() on the one stdout — two recv() callers cross-route acks.
+    await acquireLock();
+    try {
+      // hunt3 B-1: re-validate the idle precondition AFTER the lock wait —
+      // a request may have arrived (and finished) while we were queued.
+      if (!current) return;
+      if (e.generating) return;
+      if (Date.now() - lastRequestTime < idleTimeoutMs) return;
+      console.error(`[hipfire] idle for ${cfg.idle_timeout}s — unloading model (VRAM freed; next request will reload)`);
+      await e.send({ type: "unload" });
+      await e.recv();
+      // Reset capability state only on a successful unload.
+      current = null;
+      currentMaxSeq = null;
+      modelHasVL = false;
+      currentArch = null;
+      currentCacheCapable = null;
+    } catch (err: any) {
+      console.error(`[hipfire] eviction failed: ${err?.message ?? err}`);
+      // hunt3 B-5: clear capability state on ANY eviction error, not just
+      // DaemonClosedError. An eviction that reached the send(unload)/recv()
+      // (we are past the re-validation guards above, so `current` was set and
+      // we DID attempt the unload) but failed with a non-EOF error — e.g. a
+      // malformed unload-ack, or a plain Error("not running") because the
+      // daemon died without a clean stdout EOF — leaves the daemon in an
+      // unknown/unloaded state. Leaving `current` naming the model makes the
+      // next request compute needReload=false and dispatch a generate to a
+      // dead/unloaded daemon (the outer catch only restarts on
+      // DaemonClosedError, so a non-EOF death just 500s with no recovery).
+      // Resetting forces the next request to reload from scratch.
+      current = null;
+      currentMaxSeq = null;
+      modelHasVL = false;
+      currentArch = null;
+      currentCacheCapable = null;
+      // Only proactively restart on a clean daemon EOF (DaemonClosedError).
+      // For other errors the daemon may still be alive (e.g. it merely sent a
+      // malformed ack); the next request's reload will resync it, and if it is
+      // in fact dead the reload's recv() surfaces a DaemonClosedError that the
+      // generate catch-sites restart from.
+      if (err instanceof DaemonClosedError) {
+        try { await e.restart(); } catch (re: any) {
+          console.error(`[hipfire] daemon restart after eviction failure failed: ${re?.message ?? re}`);
+        }
+      }
+    } finally {
+      releaseLock();
+    }
+  }, Math.min(60_000, idleTimeoutMs)) : null;
+  // Keep process alive irrespective of the interval; clean up on exit.
+  if (evictionInterval) process.on("exit", () => clearInterval(evictionInterval));
+
+  // Pre-warm: load default model and compile kernels before accepting requests
+  const defaultModel = process.env.HIPFIRE_MODEL || cfg.default_model;
+  const rawWarmPath = findModel(defaultModel);
+  const warmPath = rawWarmPath ? resolve(rawWarmPath) : null;
+  if (warmPath) {
+    try {
+      console.error(`[hipfire] pre-warming ${defaultModel}...`);
+      const warmLoadMsg = buildLoadMessage(warmPath, defaultModel);
+      await e.send(warmLoadMsg);
+      const loadResult = await e.recv();
+      if (loadResult.type === "error") {
+        console.error(`[hipfire] pre-warm load failed: ${loadResult.message} (will load on first request)`);
+      } else {
+        for await (const msg of e.generate({ type: "generate", id: "warmup", prompt: "Hi", temperature: 0, max_tokens: 1 })) {
+          if (msg.type === "done") break;
+        }
+        await e.send({ type: "reset" }); await e.recv();
+        current = warmPath;
+        currentMaxSeq = warmLoadMsg.params.max_seq;
+        modelHasVL = loadResult.vl === true;
+        currentArch = typeof loadResult.arch === "string" ? loadResult.arch : null;
+        currentCacheCapable = typeof loadResult.cache_capable === "boolean" ? loadResult.cache_capable : null;
+        console.error(`[hipfire] warm-up complete`);
+      }
+    } catch (err: any) {
+      console.error(`[hipfire] pre-warm failed: ${err?.message} — restarting daemon`);
+      current = null;
+      currentMaxSeq = null;
+      try { await e.stop(); } catch {}
+      await e.start();
+      await e.send({ type: "ping" }); await e.recv();
+    }
+  }
+
   console.error(`[hipfire] http://${formatServeBind(host, port)}/v1/chat/completions`);
 
   Bun.serve({
@@ -3398,463 +1799,64 @@ async function serve(port: number, host: string) {
     idleTimeout: 255, // max allowed — model loading can take 30s+
     async fetch(req) {
       const url = new URL(req.url);
-        if (url.pathname === "/health") {
-          const stateCacheBytes = [
-            ...fallbackStateCacheStore.values(),
-            ...[...workerStateCaches.values()].flatMap((cache) => [...cache.values()]),
-          ].reduce((sum, manifest) => sum + manifest.bytes, 0);
-          const stateCacheEntries = [
-            fallbackStateCacheStore.size,
-            ...[...workerStateCaches.values()].map((cache) => cache.size),
-          ].reduce((sum, size) => sum + size, 0);
-          const stateCacheDaemonPrefixEntries = [
-            ...fallbackStateCacheStore.values(),
-            ...[...workerStateCaches.values()].flatMap((cache) => [...cache.values()]),
-          ].filter((manifest) => typeof manifest.daemonPrefixHash === "string").length;
-          const prefillQueueSize = [...workerPrefillSchedulers.values()].reduce(
-            (sum, scheduler) => sum + scheduler.size,
-            0,
-          );
-          return Response.json({
-            status: "ok",
-            model: current,
-            idle_timeout_sec: cfg.idle_timeout,
-            accelerators: acceleratorInventory,
-            prefill_batch: serverPrefillBatch.enabled
-              ? buildPrefillBatchHealthPayload({
-                  enabled: true,
-                  queued: prefillBatchMetrics.queued,
-                  eligible: prefillBatchMetrics.eligible,
-                  selected: prefillBatchMetrics.selected,
-                  skipped: prefillBatchMetrics.skipped,
-                  totalBatches: prefillBatchMetrics.totalBatches,
-                  fusedBatches: prefillBatchMetrics.fusedBatches,
-                  fallbackBatches: prefillBatchMetrics.fallbackBatches,
-                  batchSizeHistogram: prefillBatchMetrics.batchSizeHistogram,
-                  cacheHits: prefillBatchMetrics.cacheHits,
-                  cacheMisses: prefillBatchMetrics.cacheMisses,
-                  metadataCacheHits: prefillBatchMetrics.metadataCacheHits,
-                  runtimeCacheHits: prefillBatchMetrics.runtimeCacheHits,
-                  queueSize: prefillQueueSize,
-                  pendingRequests: pendingPrefillRequests.size,
-                  residentRuntimeSessions: residentDecodeSessions.size + residentCheckpointHandles.size,
-                  residentDecodeSessions: residentDecodeSessions.size,
-                  residentCheckpoints: residentCheckpointHandles.size,
-                  residentCheckpointMax: lastResidentCheckpointMax,
-                  residentStateCache: lastResidentStateCache,
-                  residentStateLimit: lastResidentStateLimit,
-                  spillableBatchMax: lastSpillableBatchMax,
-                  spillableSessions: lastSpillableSessions,
-                  stateCacheDisk: lastStateCacheDisk,
-                  stateCacheDiskMinPriority: lastStateCacheDiskMinPriority,
-                  diskSpillAllowed: lastDiskSpillAllowed,
-                  stateCacheEvictionsTotal,
-                  stateCacheRecomputeRequiredTotal,
-                  generateBatchPrefillCapability,
-                  generateBatchPrefillCapabilityReason,
-                  queueWaitReason: lastPrefillQueueWaitReason,
-                  fallbackReason: lastPrefillFallbackReason,
-                  runtimeDispatchSkippedReason: lastPrefillRuntimeDispatchSkippedReason,
-                  selectedBatchSize: lastSelectedBatchSize,
-                  lastPrefillTokens,
-                  lastPrefillMs,
-                  lastPrefillTokS,
-                  daemonPrefillPlan: lastPrefillDaemonPlan,
-                  daemonPrefillBackend: lastPrefillDaemonBackend,
-                })
-              : { enabled: false },
-            decode_batch: serverPrefillBatch.enabled
-              ? {
-                  enabled: true,
-                  eligible: decodeBatchMetrics.eligible,
-                  selected: decodeBatchMetrics.selected,
-                  skipped: decodeBatchMetrics.skipped,
-                  active_sessions: decodeBatchMetrics.activeSessions,
-                  selected_batch_size: decodeBatchMetrics.selectedBatchSize,
-                  total_batches: decodeBatchMetrics.totalBatches,
-                  serial_batches: decodeBatchMetrics.serialBatches,
-                  fused_batches: decodeBatchMetrics.fusedBatches,
-                  last_backend: decodeBatchMetrics.lastBackend,
-                  last_chunk_count: decodeBatchMetrics.lastChunkCount,
-                  last_chunk_size: decodeBatchMetrics.lastChunkSize,
-                  last_decode_ms: decodeBatchMetrics.lastDecodeMs,
-                  last_skipped_reason: decodeBatchMetrics.lastSkippedReason,
-                  compatible_state_kinds: decodeBatchMetrics.lastCompatibleStateKinds,
-                  cached_prefix_tokens: decodeBatchMetrics.lastCachedPrefixTokens,
-                  fallback_reason: decodeBatchMetrics.lastFallbackReason,
-                }
-              : { enabled: false },
-            state_cache: serverPrefillBatch.enabled
-              ? {
-                  enabled: serverPrefillBatchControls.residentStateCache || serverPrefillBatchControls.stateCacheDisk,
-                  resident_enabled: serverPrefillBatchControls.residentStateCache,
-                  resident_checkpoints: residentCheckpointHandles.size,
-                  resident_checkpoint_max: serverPrefillBatchControls.residentCheckpointMax,
-                  disk_enabled: serverPrefillBatchControls.stateCacheDisk,
-                  daemon_prefix_hash: stateCacheDaemonPrefixEntries > 0,
-                  daemon_prefix_hash_entries: stateCacheDaemonPrefixEntries,
-                  semantic_boundary_checkpoints: prefillBatchMetrics.semanticBoundaryCheckpoints > 0,
-                  semantic_boundary_checkpoint_entries: prefillBatchMetrics.semanticBoundaryCheckpoints,
-                  prefix_hash_preflight_requests: prefillBatchMetrics.prefixHashPreflightRequests,
-                  prefix_hash_preflight_candidates: prefillBatchMetrics.prefixHashPreflightCandidates,
-                  prefix_hash_preflight_matches: prefillBatchMetrics.prefixHashPreflightMatches,
-                  prefix_hash_preflight_boundary_matches: prefillBatchMetrics.prefixHashPreflightBoundaryMatches,
-                  shared_prefix_fanout_groups: prefillBatchMetrics.sharedPrefixFanoutGroups,
-                  shared_prefix_fanout_followers: prefillBatchMetrics.sharedPrefixFanoutFollowers,
-                  responses_previous_response_hits: responsesPreviousResponseHits,
-                  responses_previous_response_misses: responsesPreviousResponseMisses,
-                  responses_stored_contexts: responsesContexts.size,
-                  entries: stateCacheEntries,
-                  bytes: stateCacheBytes,
-                  metadata_hits: prefillBatchMetrics.metadataCacheHits,
-                  runtime_hits: prefillBatchMetrics.runtimeCacheHits,
-                  evictions_total: stateCacheEvictionsTotal,
-                  recompute_required_total: stateCacheRecomputeRequiredTotal,
-                }
-              : { enabled: false },
-            runtime_workers: {
-              resident_workers: residentModelWorkers.size,
-              max_resident_workers: maxResidentWorkers,
-              current_worker_key_id: activeWorkerKeyId,
-              state_arena_backend: isQwen35RuntimeArch(currentArch)
-                ? "qwen35_wrapped"
-                : current
-                  ? "unsupported"
-                  : "none",
-              generic_state_arena: false,
-              state_page_descriptor_entries: runtimeWorkerStatePageDescriptorEntries,
-              state_page_descriptor_bytes: runtimeWorkerStatePageDescriptorBytes,
-              total_model_weight_bytes: [...residentModelWorkers.values()].reduce((sum, worker) => sum + worker.modelWeightBytes, 0),
-              total_runtime_state_bytes: [...residentModelWorkers.values()].reduce((sum, worker) => sum + worker.runtimeStateBytes, 0),
-              total_resident_bytes: [...residentModelWorkers.values()].reduce((sum, worker) => sum + worker.totalResidentBytes, 0),
-              total_evictable_state_bytes: [...residentModelWorkers.values()].reduce((sum, worker) => sum + worker.evictableStateBytes, 0),
-              resident_state_budget_bytes: residentStateBudgetBytes,
-              memory_pressure_rejected_total: memoryPressureRejectedTotal,
-              memory_pressure_last_reason: memoryPressureLastReason,
-              workers: [...residentModelWorkers.values()].map((worker) => ({
-                worker_key_id: worker.workerKeyId,
-                model_path: worker.modelPath,
-                arch: worker.arch,
-                max_seq: worker.maxSeq,
-                physical_cap: worker.physicalCap,
-                state_mode: worker.stateMode,
-                state_arena_backend: isQwen35RuntimeArch(worker.arch) ? "qwen35_wrapped" : "unsupported",
-                resident_sessions: 0,
-                state_page_descriptor_entries: worker.descriptorEntries,
-                state_page_descriptor_bytes: worker.descriptorBytes,
-                model_file_bytes: worker.modelFileBytes,
-                model_weight_bytes: worker.modelWeightBytes,
-                runtime_base_bytes: worker.runtimeBaseBytes,
-                runtime_session_bytes: worker.runtimeSessionBytes,
-                runtime_state_bytes: worker.runtimeStateBytes,
-                total_resident_bytes: worker.totalResidentBytes,
-                evictable_state_bytes: worker.evictableStateBytes,
-                last_used_at_ms: worker.lastUsedAtMs,
-                route_reason: worker.routeReason,
-              })),
-            },
-            batches: {
-              ...buildBatchHealthPayload({
-                enabled: true,
-                queued: batchStats().queued,
-                selected: batchStats().selected,
-                total: batchStats().total,
-                failed: batchStats().failed,
-                cancelled: batchStats().cancelled,
-                completed: batchStats().completed,
-                completion_window_supported: true,
-                supported_endpoints: ["/v1/chat/completions", "/v1/responses"],
-                execution_mode: lastBatchExecutionMode,
-              last_fallback_reason: lastBatchFallbackReason,
-              batch_capability: generateBatchPrefillCapability,
-              batch_capability_reason: generateBatchPrefillCapabilityReason,
-              selected_batch_execution_mode: lastBatchExecutionMode,
-              fallback_reason: lastBatchFallbackReason,
-              runtime_dispatch_skipped_reason: lastBatchRuntimeSkippedReason,
-              unsupported_mode_hits_total: batchRuntimeUnsupportedModeCount,
-              validation_errors_total: batchValidationErrorCount,
-              streaming_rejections_total: batchStreamingRejectionCount,
-            }),
-            },
-            pid: process.pid,
-          });
-        }
+      if (url.pathname === "/health") {
+        return Response.json({
+          status: "ok",
+          model: current,
+          idle_timeout_sec: cfg.idle_timeout,
+          pid: process.pid,
+        });
+      }
       if (url.pathname === "/v1/models") return Response.json({ data: listLocal().map(m => ({ id: m.name })) });
 
-      if (url.pathname === "/v1/files") {
-        if (req.method !== "GET" && req.method !== "POST") {
-          return Response.json({ error: "method not allowed" }, { status: 405 });
-        }
-        if (req.method === "GET") {
-          return Response.json({ data: [...batchFileStore.values()] });
-        }
-        const contentType = req.headers.get("content-type") || "";
-        if (!contentType.startsWith("multipart/form-data")) {
-          return Response.json({ error: "invalid content type; expected multipart/form-data" }, { status: 400 });
-        }
-        const formData = await req.formData();
-        const purposeField = formData.get("purpose");
-        const purpose = typeof purposeField === "string" ? purposeField : String(purposeField ?? "");
-        const rawFile = formData.get("file");
-        if (!rawFile || !(rawFile instanceof Blob) || !(rawFile as any).arrayBuffer) {
-          return Response.json({ error: "missing file" }, { status: 400 });
-        }
-        if (purpose !== "batch") {
-          return Response.json({ error: "only purpose=batch is supported" }, { status: 400 });
-        }
-        const filename = typeof (rawFile as any).name === "string" && (rawFile as any).name.length > 0
-          ? (rawFile as any).name
-          : "batch.jsonl";
-        const bytes = new Uint8Array(await (rawFile as Blob).arrayBuffer());
-        const fileId = `file_${randomUUID().replace(/-/g, "")}`;
-        const fileRecord: BatchFileRecord = {
-          id: fileId,
-          object: "file",
-          filename,
-          bytes: bytes.length,
-          purpose: "batch",
-          created_at: nowUnixSeconds(),
-        };
-        writeBatchArtifact(fileId, Buffer.from(bytes).toString("utf8"));
-        batchFileStore.set(fileId, fileRecord);
-        return Response.json(fileRecord);
-      }
-
-    if (url.pathname.startsWith("/v1/files/")) {
-        const parts = url.pathname.split("/").filter(Boolean);
-        const fileId = parts[2];
-        const fileRecord = batchFileStore.get(fileId);
-        if (!fileRecord) return Response.json({ error: "file not found" }, { status: 404 });
-        if (fileRecord.purpose !== "batch") {
-          return Response.json({ error: "file purpose not supported" }, { status: 400 });
-        }
-        if (req.method === "GET" && parts[3] === "content") {
-          try {
-            const content = readBatchFile(fileId);
-            return new Response(content, {
-              headers: { "content-type": "application/jsonl" },
-            });
-          } catch (err) {
-            return Response.json({ error: "failed to read file" }, { status: 500 });
-          }
-        }
-        if (req.method === "GET") {
-          return Response.json(fileRecord);
-        }
-        if (req.method === "DELETE") {
-          batchFileStore.delete(fileId);
-          unlinkSync(batchArtifactPath(fileId));
-          return Response.json({ id: fileId, object: "file", deleted: true });
-        }
-        return Response.json({ error: "method not allowed" }, { status: 405 });
-      }
-
-      if (url.pathname === "/v1/batches" || url.pathname.startsWith("/v1/batches/")) {
-        if (url.pathname === "/v1/batches" && req.method === "GET") {
-          return Response.json({
-            data: [...batchControlStore.values()]
-              .sort((a, b) => b.created_at - a.created_at)
-              .map(batchRecordToResponse),
-            has_more: false,
-          });
-        }
-        if (url.pathname === "/v1/batches" && req.method === "POST") {
-          let body: any;
-          try {
-            body = await req.json();
-          } catch (err) {
-            return Response.json({ error: { message: "invalid json", type: "invalid_request_error" } }, { status: 400 });
-          }
-        const inputFileId = typeof body?.input_file_id === "string" ? body.input_file_id : "";
-        const endpoint = typeof body?.endpoint === "string" ? body.endpoint : "/v1/chat/completions";
-          const completionWindow = typeof body?.completion_window === "string" ? body.completion_window : "24h";
-          if (completionWindow !== "24h") {
-            return Response.json({ error: { message: `unsupported completion_window ${completionWindow}`, type: "invalid_request_error" } }, { status: 400 });
-          }
-          const fileRecord = batchFileStore.get(inputFileId);
-          if (!fileRecord) {
-            return Response.json({ error: { message: `input file not found: ${inputFileId}`, type: "invalid_request_error" } }, { status: 400 });
-          }
-          if (fileRecord.purpose !== "batch") {
-            return Response.json({ error: { message: `input file ${inputFileId} is not a batch file`, type: "invalid_request_error" } }, { status: 400 });
-          }
-          if (!isSupportedBatchEndpoint(endpoint)) {
-            return Response.json({ error: { message: `unsupported endpoint ${endpoint}`, type: "invalid_request_error" } }, { status: 400 });
-          }
-          const rawInput = readBatchFile(inputFileId);
-          const parsed = validateBatchInputForBatch(rawInput, endpoint);
-          const unsupportedModeErrors = countUnsupportedModeErrors(parsed.errors);
-          batchRuntimeUnsupportedModeCount += unsupportedModeErrors;
-          batchStreamingRejectionCount += parsed.errors.filter((err) => err.code === "streaming_unsupported").length;
-          const preValidationFallbackReason = parsed.errors.length > 0
-            ? toBatchLineFallbackReason(
-              parsed.errors[0]?.code ?? "validation_rejected",
-            )
-            : "idle";
-          const parsedEntries = parsed.entries;
-          const batchId = newObjectId("batch");
-          const requestCount = parsed.totalLineCount;
-          const now = nowUnixSeconds();
-      const batch: BatchJobRecord = {
-            id: batchId,
-            object: "batch",
-            status: "validating",
-            endpoint,
-            completion_window: completionWindow,
-            input_file_id: inputFileId,
-            output_file_id: null,
-            error_file_id: null,
-            request_count: requestCount,
-            created_at: now,
-            ...(parsed.errors.length > 0 && parsedEntries.length === 0
-              ? { failed_reason: parsed.errors[0]?.message }
-              : {}),
-          };
-          batchControlStore.set(batchId, batch);
-
-            if (parsed.errors.length > 0) {
-            const errorFileId = `file_${randomUUID().replace(/-/g, "")}`;
-            writeBatchArtifact(errorFileId, buildBatchArtifactErrorContent(parsed.errors, parsedEntries));
-            batch.error_file_id = errorFileId;
-            batch.output_file_id = null;
-            batch.failed_reason = parsedEntries.length === 0
-              ? (parsed.errors[0]?.message ?? "validation failed")
-              : "partial_batch_errors";
-            batch.status = parsedEntries.length === 0 ? "failed" : "validating";
-            batch.completed_at = parsedEntries.length === 0 ? nowUnixSeconds() : undefined;
-            batchValidationErrorCount += parsed.errors.length;
-            batchControlStore.set(batchId, batch);
-            lastBatchFallbackReason = preValidationFallbackReason;
-            lastBatchRuntimeSkippedReason = preValidationFallbackReason;
-            batchStats();
-            if (parsedEntries.length === 0) {
-              return Response.json({
-                ...batchRecordToResponse(batch),
-                cancelled_at: null,
-                failed_at: batch.completed_at,
-              });
-            }
-          }
-            batch.status = "validating";
-            batchControlStore.set(batchId, batch);
-            void runBatchJob(batchId, parsedEntries, parsed.errors);
-            return Response.json(batchRecordToResponse(batch));
-        }
-
-        const batchPathParts = url.pathname.split("/").filter(Boolean);
-        const batchId = batchPathParts[2];
-        const operation = batchPathParts[3];
-        if (!batchId) {
-          return Response.json({ error: "missing batch id" }, { status: 400 });
-        }
-        const batch = batchControlStore.get(batchId);
-        if (!batch) return Response.json({ error: "batch not found" }, { status: 404 });
-        if (operation === "cancel" && req.method === "POST") {
-          if (batch.status === "completed" || batch.status === "failed") {
-            return Response.json(batchRecordToResponse(batch));
-          }
-          batch.status = batch.status === "validating" ? "cancelling" : "cancelled";
-          batch.failed_reason = batch.status === "cancelling" ? "cancel_requested" : batch.failed_reason;
-          batchControlStore.set(batchId, batch);
-          batch.completed_at = nowUnixSeconds();
-          batchControlStore.set(batchId, batch);
-          return Response.json(batchRecordToResponse(batch));
-        }
-        if (req.method !== "GET") {
-          return Response.json({ error: "method not allowed" }, { status: 405 });
-        }
-        return Response.json(batchRecordToResponse(batch));
-      }
-
-      if (url.pathname !== "/v1/chat/completions" && url.pathname !== "/v1/responses" || req.method !== "POST")
+      if (url.pathname !== "/v1/chat/completions" || req.method !== "POST")
         return Response.json({ error: "not found" }, { status: 404 });
 
       // Update idle timer on every real request (eviction loop checks against this).
       lastRequestTime = Date.now();
 
       await acquireLock();
+      // hunt3 B-5: re-bump after the lock wait so a request that sat QUEUED
+      // behind a long generation (potentially longer than idle_timeout) does
+      // not let the eviction tick fire the instant it finally begins. The
+      // `busy` lock flag already blocks eviction for the whole lock-held
+      // window (incl. the reload window where e.generating is still false).
+      lastRequestTime = Date.now();
       let lockReleased = false;
       const safeRelease = () => { if (!lockReleased) { lockReleased = true; releaseLock(); } };
 
       // If a previous generation was interrupted (client disconnect), drain
       // remaining daemon output before sending new commands.
-      // If drain restarts the daemon, clear current so model reloads.
+      // If drain restarts the daemon (timeout OR hunt3 H-B daemon-crash path),
+      // clear ALL capability state so the model reloads cleanly — matching the
+      // generate catch-site recovery below.
       if (e.generating) {
-        await e.drain();
+        try {
+          await e.drain();
+        } catch (drainErr: any) {
+          // drain() only throws when its own restart() exhausted retries (the
+          // daemon is unrecoverable). Surface a 500 for THIS request rather
+          // than letting the throw escape the handler — an escaped throw would
+          // skip safeRelease() and leak the serve lock, wedging every client.
+          console.error(`[hipfire] drain/daemon-recovery failed: ${drainErr?.message ?? drainErr}`);
+          e.generating = false;
+          current = null; currentMaxSeq = null; modelHasVL = false;
+          currentArch = null; currentCacheCapable = null;
+          safeRelease();
+          return Response.json(
+            { error: { message: "daemon crashed and could not be restarted; retry the request", type: "server_error" } },
+            { status: 500 },
+          );
+        }
         e.generating = false;
-        current = null; // daemon may have restarted — force model reload
-        currentMaxSeq = null;
-        residentModelWorkers.clear();
-        activeWorkerKeyId = null;
-        clearResidentPrefixState("interrupted generation drain");
+        // daemon may have restarted — force model reload + drop stale caps.
+        current = null; currentMaxSeq = null; modelHasVL = false;
+        currentArch = null; currentCacheCapable = null;
       }
 
       try {
-        const rawBody = (await req.json()) as any;
-        const isResponsesRequest = url.pathname === "/v1/responses";
-        const promptCacheRetention = normalizePromptCacheRetention(rawBody?.prompt_cache_retention);
-        if (rawBody?.prompt_cache_retention !== undefined && promptCacheRetention === undefined) {
-          return Response.json({
-            error: {
-              message: "prompt_cache_retention must be 'in_memory' or '24h'",
-              type: "invalid_request_error",
-            },
-          }, { status: 400 });
-        }
-        const body = isResponsesRequest ? parseResponsesToChatBody(rawBody) : rawBody;
-        if (!isResponsesRequest && body && typeof body === "object") {
-          body.prompt_cache_key = normalizePromptCacheKey(body.prompt_cache_key);
-          body.prompt_cache_retention = promptCacheRetention;
-        }
-        if (isResponsesRequest && body.stream === true) {
-          return Response.json({ error: { message: "streaming responses is unsupported in this scaffold", type: "invalid_request_error" } }, { status: 400 });
-        }
-        if (!body || typeof body !== "object") {
-          return Response.json({ error: { message: "invalid request body", type: "invalid_request_error" } }, { status: 400 });
-        }
-        const previousResponseId = isResponsesRequest && typeof body.previous_response_id === "string"
-          ? body.previous_response_id
-          : "";
-        let responsesContextMessagesForStore: any[] | null = null;
-        if (previousResponseId.length > 0) {
-          const previousContext = responsesContexts.get(previousResponseId);
-          if (!previousContext) {
-            responsesPreviousResponseMisses += 1;
-            return Response.json({
-              error: {
-                message: `unknown previous_response_id: ${previousResponseId}`,
-                type: "invalid_request_error",
-              },
-            }, { status: 404 });
-          }
-          const requestedModel = typeof body.model === "string" && body.model.length > 0
-            ? body.model
-            : previousContext.model;
-          if (previousContext.model && requestedModel && previousContext.model !== requestedModel) {
-            responsesPreviousResponseMisses += 1;
-            return Response.json({
-              error: {
-                message: "previous_response_id belongs to a different model",
-                type: "invalid_request_error",
-              },
-            }, { status: 400 });
-          }
-          body.model = requestedModel;
-          body.messages = [
-            ...cloneChatMessages(previousContext.messages),
-            ...cloneChatMessages(Array.isArray(body.messages) ? body.messages : []),
-          ];
-          if (!body.prompt_cache_retention) body.prompt_cache_retention = "in_memory";
-          if (!body.prompt_cache_key && previousContext.promptCacheKey) {
-            body.prompt_cache_key = previousContext.promptCacheKey;
-          }
-          previousContext.lastUsedAtMs = Date.now();
-          responsesPreviousResponseHits += 1;
-        }
+        const body = (await req.json()) as any;
         const messages: any[] = body.messages || [];
-        if (isResponsesRequest) {
-          responsesContextMessagesForStore = cloneChatMessages(messages);
-        }
         const tools: any[] = body.tools || [];
 
         // Opt-in request-body dump. Lets an operator see the full
@@ -3874,20 +1876,36 @@ async function serve(port: number, host: string) {
         // conversation. For most archs we tell the daemon to reset
         // here so prior turn KV doesn't bleed into this one.
         //
-        // V4F is the exception. Its daemon arm runs LCP detection
-        // (Reasonix-style prefix caching): if the freshly-tokenized
-        // prompt fully extends `m.conversation_tokens` from the prior
-        // turn, the daemon skips prefill for the matching prefix and
-        // only prefills the suffix — exactly the cache-hit shape
-        // Reasonix engineers for upstream. Calling `reset` here clears
-        // `m.conversation_tokens` and forces lcp=0 every turn, which
-        // is correct stateless behavior but throws away the cache.
-        // Skip the reset for V4F and let the daemon's auto-LCP
-        // (with a strict "fully extends" guard for SWA-ring safety)
-        // decide whether this is a continuation or a fresh request.
-        // Stateless reset happens after reload and batching eligibility are
-        // known. Resident prefix checkpoints live in the daemon session arena,
-        // so an unconditional reset here would erase them before cache lookup.
+        // V4F (`deepseek4`) and Qwen3.5/3.6 (`qwen35`) are exceptions.
+        // Their daemon arms run LCP detection (Reasonix-style prefix
+        // caching): if the freshly-tokenized prompt fully extends
+        // `m.conversation_tokens` from the prior turn, the daemon
+        // skips prefill for the matching prefix and only prefills the
+        // suffix — exactly the cache-hit shape Reasonix engineers for
+        // upstream. Calling `reset` here clears `m.conversation_tokens`
+        // and forces lcp=0 every turn, throwing away the cache. Skip
+        // the reset for those arches and let the daemon's auto-LCP
+        // (with strict "fully extends" guards — DeltaNet-non-reversible
+        // for qwen35, SWA-ring safety for deepseek4) decide whether
+        // this is a continuation or a fresh request.
+        // Operators can force the legacy stateless behavior by setting
+        // `HIPFIRE_QWEN_PROMPT_CACHE=0` (qwen35 daemon also honors it,
+        // so reset is harmless when the daemon-side cache is disabled
+        // — we omit reset regardless to keep behavior symmetric).
+        // Prefer the daemon's advertised `cache_capable` flag (source of
+        // truth, next to the cache impl). Fall back to the arch-string
+        // allowlist only for older daemons that don't send the flag.
+        const cacheCapable = currentCacheCapable !== null
+          ? currentCacheCapable
+          : (currentArch === "deepseek4"
+            || currentArch === "qwen3_5"
+            || currentArch === "qwen3_5_moe");
+        if (process.env.HIPFIRE_QWEN_CACHE_TRACE === "1") {
+          console.error(`[cache-route] arch=${JSON.stringify(currentArch)} daemon_cache_capable=${currentCacheCapable} cacheCapable=${cacheCapable} -> ${cacheCapable ? "skip reset (cache)" : "SEND RESET (stateless)"}`);
+        }
+        if (!cacheCapable) {
+          await e.send({ type: "reset" }); await e.recv();
+        }
 
         // Build prompt from messages with proper role handling
         let systemPrompt = "";
@@ -3900,7 +1918,7 @@ async function serve(port: number, host: string) {
         // prompt, which the model has no way to recover from. Issue #79.
         // Image parts are filtered out (no vision encoder in serve path);
         // matches the daemon's existing text-only behaviour.
-        const extractContent = (content: any): { text: string, images: string[], unsupportedImage: boolean, malformedImage: boolean } => {
+        const extractContent = (content: any): { text: string, images: string[], unsupportedImage: boolean, remoteImageUrl: boolean, malformedImage: boolean } => {
           // OpenAI assistant messages carrying only `tool_calls` send
           // `content: null`. Returning `String(null) === "null"` here
           // (the legacy fallback below) leaked the literal text `null`
@@ -3909,17 +1927,16 @@ async function serve(port: number, host: string) {
           // tool-call turn, which the model reads as "the assistant
           // previously said the word null", not as an empty turn.
           // Treat null/undefined as empty content.
-          if (content == null) return { text: "", images: [], unsupportedImage: false, malformedImage: false };
-          if (typeof content === "string") return { text: content, images: [], unsupportedImage: false, malformedImage: false };
+          if (content == null) return { text: "", images: [], unsupportedImage: false, remoteImageUrl: false, malformedImage: false };
+          if (typeof content === "string") return { text: content, images: [], unsupportedImage: false, remoteImageUrl: false, malformedImage: false };
           if (Array.isArray(content)) {
             const textParts: string[] = [];
             const images: string[] = [];
             let unsupportedImage = false;
+            let remoteImageUrl = false;
             let malformedImage = false;
             for (const p of content) {
-              if (p?.type === "text" || p?.type === "input_text" || p?.type === "output_text") {
-                textParts.push(p.text ?? "");
-              }
+              if (p?.type === "text") textParts.push(p.text ?? "");
               else if (p?.type === "image_url") {
                 if (p.image_url?.url) {
                   const url: string = p.image_url.url;
@@ -3936,15 +1953,21 @@ async function serve(port: number, host: string) {
                       // dropping the part and proceeding as text-only.
                       unsupportedImage = true;
                     }
+                  } else {
+                    // Non-data: URLs (https://, http://, file://, etc.)
+                    // are not supported — hipfire does not fetch remote
+                    // images. Use a separate flag so the error message
+                    // distinguishes "bad format" from "unsupported transport".
+                    remoteImageUrl = true;
                   }
                 } else {
                   malformedImage = true;
                 }
               }
             }
-            return { text: textParts.join(""), images, unsupportedImage, malformedImage };
+            return { text: textParts.join(""), images, unsupportedImage, remoteImageUrl, malformedImage };
           }
-          return { text: String(content), images: [], unsupportedImage: false, malformedImage: false };
+          return { text: String(content), images: [], unsupportedImage: false, remoteImageUrl: false, malformedImage: false };
         };
 
         const extractText = (content: any): string => extractContent(content).text;
@@ -3975,7 +1998,17 @@ async function serve(port: number, host: string) {
           for (const m of msgs) {
             if (!m || typeof m !== "object") continue;
             let role: string = m.role;
+            // Aliases:
+            //   developer        → system (OpenAI o1/o3 alias)
+            //   toolResult       → tool   (Pi/Anthropic-internal alias; Pi's
+            //                              SDK sometimes leaks the internal
+            //                              role name through to OpenAI-style
+            //                              requests, which would otherwise
+            //                              drop the message entirely and
+            //                              break LCP on the next turn)
+            //   tool_result      → tool   (Anthropic spelling, defensive)
             if (role === "developer") role = "system";
+            if (role === "toolResult" || role === "tool_result") role = "tool";
             if (role !== "system" && role !== "user" && role !== "assistant" && role !== "tool") {
               continue;
             }
@@ -4060,7 +2093,13 @@ async function serve(port: number, host: string) {
         };
         for (let i = 0; i < nonSystem.length; i++) {
           const m = nonSystem[i];
-          const role = m.role;
+          // Accept Pi/Anthropic-style aliases for tool messages so the
+          // inline-ChatML reconstruction doesn't silently drop them
+          // (which would corrupt history for legacy non-cacheCapable
+          // arches that only consume the inline `prompt` field).
+          const role = m.role === "toolResult" || m.role === "tool_result"
+            ? "tool"
+            : m.role;
           let text = "";
 
           if (role === "tool") {
@@ -4088,6 +2127,9 @@ async function serve(port: number, host: string) {
             const content = extractContent(m.content);
             if (content.malformedImage) {
               return rejectImage("malformed image part — image_url.url is required");
+            }
+            if (content.remoteImageUrl) {
+              return rejectImage("remote image URLs are not supported — embed images as base64 data: URLs (supported formats: png, jpeg)");
             }
             if (content.unsupportedImage) {
               return rejectImage("unsupported image format — supported: png, jpeg");
@@ -4128,234 +2170,52 @@ async function serve(port: number, host: string) {
         const rawPath = findModel(body.model || "default");
         if (!rawPath) { safeRelease(); return Response.json({ error: "model not found" }, { status: 404 }); }
         // Normalize to avoid spurious reloads when registry vs fuzzy search give different paths
-        const path = isDummyModelPath(rawPath) ? rawPath : resolve(rawPath);
+        const path = resolve(rawPath);
 
-        // Resolve effective config FIRST so max_seq remains the logical
-        // context-window limit while physical_cap is sized to this request.
-        // The daemon's KV buffers are still allocated at load time, so if the
-        // current worker's physical_cap is too small we reload/grow that
-        // worker up to max_seq instead of treating max_seq as the initial
-        // allocation size.
+        // Resolve effective config FIRST so we can size the KV cache against
+        // the actual per-request max_tokens (body.max_tokens or config). The
+        // daemon's KV buffers are sized at load time — if max_tokens grows
+        // beyond currentMaxSeq we MUST reload instead of sending a request
+        // the daemon would either reject or, worse, overrun the buffer with.
         const effective = resolveModelConfig(body.model);
-        const requestMaxTokens = body.max_tokens ?? effective.max_tokens;
+        // hunt3 H-D: `??` guards null but NOT type. A JSON-string max_tokens
+        // (e.g. "8192") makes `requestMaxTokens + 1024` STRING-CONCAT to
+        // "81921024", which Math.max coerces to ~80M → bumps load max_seq →
+        // unload-then-OOM. Accept only a sane positive integer; otherwise
+        // fall back to the per-model config value.
+        const rawMt = body.max_tokens;
+        const requestMaxTokens = (typeof rawMt === "number" && Number.isInteger(rawMt) && rawMt >= 1 && rawMt <= 131072)
+          ? rawMt
+          : effective.max_tokens;
         const visualHeadroom = requestImages.length > 0 ? 1024 : 0;
-        const requiredMaxSeq = effective.max_seq;
-        const requiredPhysicalCap = physicalCapForRequest(
-          requiredMaxSeq,
-          userPrompt,
-          requestMaxTokens,
-          visualHeadroom,
-        );
-        const requestPriority = parseSchedulerPriority(
-          body.hipfire_priority ?? req.headers.get("x-hipfire-priority"),
-          serverPrefillBatch.priority,
-        );
-        let requestBatchPolicy: ReturnType<typeof schedulerPolicyForPriority> | undefined;
-        let prefillBatchGate: { eligible: boolean; reason: string } = {
-          eligible: false,
-          reason: "disabled",
-        };
+        // Clamp the KV-cache sizing to a hard ceiling (matches the daemon's
+        // independent max_seq <= 524288 clamp, hunt3 H-D contract).
+        const requiredMaxSeq = Math.min(524288, Math.max(effective.max_seq, requestMaxTokens + 1024 + visualHeadroom));
 
-        const reusableWorker = findReusableResidentWorker(path, requiredMaxSeq, requiredPhysicalCap);
-        if (reusableWorker) {
-          activateResidentWorker(reusableWorker, "worker_reused");
-        }
-        const stateModeForRouting = currentStateMode || effective.kv_cache;
-        const initialRoute = pickServingModelWorker({
-          requestModelPath: path,
-          currentModelPath: current,
-          currentMaxSeq,
-          requiredMaxSeq,
-          archId: currentArch ?? "unknown",
-          quantFamily: inferQuantFamilyForPath(path),
-          stateMode: stateModeForRouting,
-          featureFlags: ["serve"],
-          artifactDigest: inferModelArtifactDigest(path),
-          maxSeqBucket: currentMaxSeq ?? requiredMaxSeq,
-        });
-        const needReload = !reusableWorker;
+        const needReload = current !== path
+          || (currentMaxSeq !== null && requiredMaxSeq > currentMaxSeq);
 
         if (needReload) {
-          if (maxResidentWorkers <= 1 && current) {
-            await e.send({ type: "unload" }); await e.recv();
-            clearResidentPrefixState("model reload unload");
-            residentModelWorkers.clear();
-            activeWorkerKeyId = null;
-          } else if (residentModelWorkers.size >= maxResidentWorkers) {
-            const staleSameModelWorkers = [...residentModelWorkers.values()]
-              .filter((worker) => (
-                worker.modelPath === path
-                && !hasPendingWorkerRuntimeRequests(worker.workerKeyId)
-                && (
-                  worker.maxSeq < requiredMaxSeq
-                  || (worker.maxSeq >= requiredMaxSeq && worker.physicalCap < requiredPhysicalCap)
-                )
-              ))
-              .sort((a, b) => a.physicalCap - b.physicalCap || a.maxSeq - b.maxSeq);
-            for (const stale of staleSameModelWorkers) {
-              await unloadResidentWorkerById(stale.workerKeyId, "same model max_seq growth");
-              if (residentModelWorkers.size < maxResidentWorkers) break;
-            }
-          }
-          if (needReload && maxResidentWorkers > 1 && residentModelWorkers.size >= maxResidentWorkers) {
-            const activeWorkerIds = new Set<string>();
-            for (const pending of pendingDecodeRequests.values()) {
-              activeWorkerIds.add(pending.active.workerKeyId);
-            }
-            for (const pending of pendingPrefillRequests.values()) {
-              activeWorkerIds.add(modelWorkerKeyId(pending.session.workerKey));
-            }
-            const evictionCandidate = [...residentModelWorkers.values()]
-              .filter((worker) => !activeWorkerIds.has(worker.workerKeyId))
-              .sort((a, b) => b.totalResidentBytes - a.totalResidentBytes || a.lastUsedAtMs - b.lastUsedAtMs)[0];
-            if (!evictionCandidate) {
-              safeRelease();
-              return Response.json({ error: "all resident model workers are active; cannot evict for requested model" }, { status: 503 });
-            }
-            await unloadResidentWorkerById(evictionCandidate.workerKeyId, "worker evicted lru");
-          }
+          if (current) { await e.send({ type: "unload" }); await e.recv(); }
           const loadMsg = buildLoadMessage(path, body.model);
-          if (loadMsg.params.max_seq !== requiredMaxSeq) {
+          if (requiredMaxSeq > loadMsg.params.max_seq) {
+            console.error(`[hipfire] request max_tokens=${requestMaxTokens} needs max_seq >= ${requiredMaxSeq} — bumping load (was ${loadMsg.params.max_seq})`);
             loadMsg.params.max_seq = requiredMaxSeq;
           }
-          if (requiredPhysicalCap > loadMsg.params.physical_cap) {
-            console.error(`[hipfire] request needs physical_cap >= ${requiredPhysicalCap} within max_seq=${requiredMaxSeq} — growing load (was ${loadMsg.params.physical_cap})`);
-            loadMsg.params.physical_cap = requiredPhysicalCap;
-          }
-          const loadWorkerKey = makeResidentWorkerKey(path, loadMsg.params.max_seq, loadMsg.params.kv_mode || effective.kv_cache, loadMsg.params.physical_cap);
-          const loadWorkerKeyId = modelWorkerKeyId(loadWorkerKey);
-          loadMsg.worker_key_id = loadWorkerKeyId;
           await e.send(loadMsg);
           const loadResult = await e.recv();
           if (loadResult.type === "error") {
             current = null;
             currentMaxSeq = null;
             modelHasVL = false;
-            clearResidentPrefixState("model load failed");
             safeRelease();
             return Response.json({ error: `model load failed: ${loadResult.message}` }, { status: 500 });
           }
-          rememberResidentWorker({
-            workerKeyId: loadWorkerKeyId,
-            workerKey: loadWorkerKey,
-            modelPath: path,
-            maxSeq: loadMsg.params.max_seq,
-            physicalCap: loadMsg.params.physical_cap,
-            hasVL: loadResult.vl === true,
-            stateMode: loadMsg.params.kv_mode || effective.kv_cache,
-            arch: typeof loadResult.arch === "string" ? loadResult.arch : null,
-            descriptorEntries: 0,
-            descriptorBytes: 0,
-            modelFileBytes: 0,
-            modelWeightBytes: 0,
-            runtimeBaseBytes: 0,
-            runtimeSessionBytes: 0,
-            runtimeStateBytes: 0,
-            totalResidentBytes: 0,
-            evictableStateBytes: 0,
-            lastUsedAtMs: Date.now(),
-            routeReason: "worker_loaded",
-          });
-          updateRuntimeWorkerMetrics((loadResult as any).model_worker);
-          if (serverPrefillBatch.enabled) {
-            const probe = await probeGenerateBatchPrefillCapability(activeWorkerKeyId);
-            generateBatchPrefillCapability = probe.capability;
-            generateBatchPrefillCapabilityReason = probe.reason;
-          }
-          requestBatchPolicy = serverPrefillBatch.enabled
-            ? schedulerPolicyForPriority(requestPriority, process.env)
-            : undefined;
-          if (serverPrefillBatch.enabled) {
-            prefillBatchGate = serverPrefillBatchEligibility({
-              body,
-              loadedModelPath: current,
-              requestModelPath: path,
-              loadedMaxSeq: currentMaxSeq,
-              requiredMaxSeq,
-              requestImages,
-              effectiveConfig: effective,
-            });
-          } else {
-            prefillBatchGate = { eligible: false, reason: "disabled" };
-          }
-        } else if (reusableWorker) {
-          requestBatchPolicy = serverPrefillBatch.enabled
-            ? schedulerPolicyForPriority(requestPriority, process.env)
-            : undefined;
-          prefillBatchGate = serverPrefillBatch.enabled
-            ? serverPrefillBatchEligibility({
-              body,
-              loadedModelPath: current,
-              requestModelPath: path,
-              loadedMaxSeq: currentMaxSeq,
-              requiredMaxSeq,
-              requestImages,
-              effectiveConfig: effective,
-            })
-            : { eligible: false, reason: "disabled" };
-        }
-
-        if (serverPrefillBatch.enabled && requestBatchPolicy === undefined) {
-          requestBatchPolicy = schedulerPolicyForPriority(requestPriority, process.env);
-        }
-        if (serverPrefillBatch.enabled && prefillBatchGate.reason === "disabled") {
-          prefillBatchGate = serverPrefillBatchEligibility({
-            body,
-            loadedModelPath: current,
-            requestModelPath: path,
-            loadedMaxSeq: currentMaxSeq,
-            requiredMaxSeq,
-            requestImages,
-            effectiveConfig: effective,
-          });
-        }
-
-        const requestPromptCacheRetention = normalizePromptCacheRetention(body.prompt_cache_retention);
-        const requestAllowsResidentPrefixCache = serverPrefillBatchControls.residentStateCache
-          || requestPromptCacheRetention === "in_memory"
-          || requestPromptCacheRetention === "24h";
-        const preserveDaemonStateForRuntimePrefill = serverPrefillBatch.enabled
-          && prefillBatchGate.eligible
-          && body.stream !== true
-          && generateBatchPrefillCapability === "supported";
-        const preserveDaemonStateForResidentCache =
-          preserveDaemonStateForRuntimePrefill && requestAllowsResidentPrefixCache;
-        if (currentArch !== "deepseek4" && !preserveDaemonStateForRuntimePrefill) {
-          await e.send({ type: "reset", worker_key_id: activeWorkerKeyId ?? undefined }); await e.recv();
-          if (maxResidentWorkers > 1 && activeWorkerKeyId) {
-            clearWorkerResidentPrefixState(activeWorkerKeyId, "request reset");
-          } else {
-            clearResidentPrefixState("request reset");
-          }
-        }
-
-        const servingWorkerStateMode = currentStateMode || effective.kv_cache;
-        const servingWorkerFeatureFlags = Array.from(new Set([
-          "serve",
-          servingWorkerStateMode,
-          currentArch ?? "unknown",
-          "server_batch",
-        ])).sort();
-        let servingWorkerKey: ModelWorkerKey | null = null;
-        const servingWorkerKinds: readonly SessionStateKind[] = inferStateKindsForServeArch(currentArch);
-        const activeResidentWorker = activeWorkerKeyId ? residentModelWorkers.get(activeWorkerKeyId) : undefined;
-        if (activeResidentWorker) {
-          servingWorkerKey = activeResidentWorker.workerKey;
-        } else if (current !== null) {
-          servingWorkerKey = pickServingModelWorker({
-            requestModelPath: current,
-            currentModelPath: current,
-            currentMaxSeq,
-            requiredMaxSeq,
-            archId: currentArch ?? "unknown",
-            quantFamily: inferQuantFamilyForPath(current),
-            stateMode: servingWorkerStateMode,
-            featureFlags: servingWorkerFeatureFlags,
-            artifactDigest: inferModelArtifactDigest(current),
-            maxSeqBucket: currentMaxSeq ?? requiredMaxSeq,
-            acceleratorKind: serverAcceleratorKind,
-            deviceId: serverDeviceId,
-          }).workerKey;
+          current = path;
+          currentMaxSeq = loadMsg.params.max_seq;
+          modelHasVL = loadResult.vl === true;
+          currentArch = typeof loadResult.arch === "string" ? loadResult.arch : null;
+          currentCacheCapable = typeof loadResult.cache_capable === "boolean" ? loadResult.cache_capable : null;
         }
 
         // Now that currentArch reflects the model we're ACTUALLY sending
@@ -4377,20 +2237,47 @@ async function serve(port: number, host: string) {
           systemPrompt = systemPrompt ? systemPrompt + "\n\n" + toolsBlock : toolsBlock;
         }
 
-        // 2. `userPrompt` content: V4F's daemon path reads multi-turn
-        //    history from the structured `messages` field and treats
-        //    `prompt` as the live user input. Leaving `userPrompt` set to
-        //    the ChatML rebuild of the conversation causes the daemon to
-        //    render history twice — once in V4F tokens from `messages`,
-        //    once in ChatML tokens from `prompt`. Replace with just the
-        //    trailing user message (or "" when conversation ends with a
-        //    tool/assistant turn — daemon then continues from
-        //    `<｜Assistant｜>` directly).
+        // 1b. Chunked-write nudge: steer the model away from emitting an
+        //     entire large file in ONE `write` tool call. At long-context
+        //     decode rates a ~30K-token single-shot write can't finish
+        //     within the per-turn / client deadline — it gets truncated
+        //     mid-output, the unclosed <tool_call> is dropped (finish=stop),
+        //     and the whole turn's work is lost (observed 2026-05-31: a Pi
+        //     "write the full implementation" turn terminated, then the
+        //     retry's write degraded + EOS'd at 939 tokens, unparseable).
+        //     Only relevant when a file-writing tool is exposed. Opt out
+        //     with HIPFIRE_CHUNK_WRITE_NUDGE=0.
+        const hasWriteTool = tools.some((t: any) => {
+          const n = String(t?.function?.name ?? t?.name ?? "").toLowerCase();
+          return n === "write" || n === "edit" || n === "create"
+            || n.includes("str_replace") || n.includes("write_file") || n.includes("create_file");
+        });
+        if (hasWriteTool && process.env.HIPFIRE_CHUNK_WRITE_NUDGE !== "0") {
+          const chunkNudge = "# Writing large files\n\n"
+            + "When creating or modifying a large file, do NOT emit the entire file in a single `write` "
+            + "call. A tool call that streams thousands of lines often can't be completed in one response "
+            + "and gets cut off mid-output — the truncated call is then discarded and the work is lost. "
+            + "Instead, build large files incrementally: write an initial skeleton or first focused section, "
+            + "then extend it with follow-up `edit` calls (or split the work into several smaller files). "
+            + "Keep each individual tool call bounded to a few hundred lines.";
+          systemPrompt = systemPrompt ? systemPrompt + "\n\n" + chunkNudge : chunkNudge;
+        }
+
+        // 2. `userPrompt` content: cache-capable daemon paths (V4F and
+        //    qwen3.5/3.6 with the prompt-cache active) read multi-turn
+        //    history from the structured `messages` field and treat
+        //    `prompt` as the live user input. Leaving `userPrompt` set
+        //    to the ChatML rebuild of the conversation causes the
+        //    daemon to render history twice — once in arch-canonical
+        //    tokens from `messages`, once in ChatML tokens from
+        //    `prompt`. Replace with just the trailing user message
+        //    (or "" when conversation ends with a tool/assistant turn —
+        //    daemon then continues from the assistant header directly).
         //
         //    Legacy arches (Qwen2 in particular) ignore the structured
         //    `messages` field and ONLY read `prompt` — they NEED the
         //    full ChatML rebuild for multi-turn to survive. Don't touch.
-        if (currentArch === "deepseek4") {
+        if (cacheCapable) {
           const last = nonSystem.length > 0 ? nonSystem[nonSystem.length - 1] : null;
           if (last && last.role === "user") {
             const lastContent = extractContent(last.content);
@@ -4399,429 +2286,26 @@ async function serve(port: number, host: string) {
             userPrompt = "";
           }
         }
-        const structuredMessages = mapMessagesToStructured(messages);
-        const renderInputHash = stableObjectHash({
-          arch: currentArch,
-          model: current,
-          system: systemPrompt || null,
-          prompt: userPrompt,
-          messages: structuredMessages,
-          tools: Array.isArray(body.tools) ? body.tools : [],
-          assistant_prefix_inputs: {
-            thinking: effective.thinking,
-            max_think_tokens: effective.max_think_tokens,
-            chat_template_kwargs: (body as any).chat_template_kwargs ?? null,
-            reasoning: (body as any).reasoning ?? null,
-          },
-          jinja_chat: process.env.HIPFIRE_JINJA_CHAT === "1",
-        });
 
-        const reqId = newObjectId("chatcmpl");
-        const requestNowMs = Date.now();
-        let serverPrefillSession: RequestSessionDraft | undefined;
-        let stateReservationId: string | undefined;
-        let selectedForPrefillBatch = false;
-        let selectedByScheduler = false;
-        let queuePreviewReason: "selected" | "waiting" | "insufficient_queue" | "not_eligible" = "not_eligible";
-        let selectedBatchSize = 0;
-        let selectedBatchSessions: RequestSessionDraft[] = [];
-        let fallbackReason = "not_applicable";
-        let runtimeDispatchSkippedReason = "not_applicable";
-        let cacheHit = false;
-        let cachePrefixLen = 0;
-        let cacheKey: string | null = null;
-        let spillable = false;
-        let spillReason = "state_cache_disabled";
-        let servingWorkerScheduler: PriorityPrefillScheduler | undefined;
-        let releaseRuntimeSessionId: string | null = null;
-        const preflightChatTemplateKwargs = (body.chat_template_kwargs && typeof body.chat_template_kwargs === "object")
-          ? body.chat_template_kwargs : {};
-        const preflightEnableThinking: boolean | null = typeof preflightChatTemplateKwargs.enable_thinking === "boolean"
-          ? preflightChatTemplateKwargs.enable_thinking
-          : null;
-        const preflightReasoning = (body.reasoning && typeof body.reasoning === "object") ? body.reasoning : null;
-        const preflightEffortMap: Record<string, number> = {
-          none: 1, minimal: 64, low: 256, medium: 1024, high: 4096, xhigh: 0,
-        };
-        const preflightReasoningEffort: number | null = preflightReasoning
-          && typeof preflightReasoning.effort === "string"
-          && preflightReasoning.effort in preflightEffortMap
-          ? preflightEffortMap[preflightReasoning.effort]
-          : null;
-        let requestMaxThinkTokens: number | undefined;
-        if (effective.thinking === "off") requestMaxThinkTokens = 1;
-        else if (effective.max_think_tokens > 0) requestMaxThinkTokens = effective.max_think_tokens;
-        if (preflightEnableThinking === false) requestMaxThinkTokens = 1;
-        if (preflightReasoningEffort !== null) {
-          requestMaxThinkTokens = preflightReasoningEffort === 0 ? undefined : preflightReasoningEffort;
-        }
-        const requestAssistantPrefix = currentArch === "qwen35_dummy"
-          ? "plain"
-          : effective.thinking === "off"
-            || preflightEnableThinking === false
-            || preflightReasoning?.effort === "none"
-            ? "closed_think"
-            : "open_think";
-        const prefillPromptTokens = approximatePromptTokenIds(userPrompt);
-        const stateKinds = servingWorkerKinds;
-        const stateMode = servingWorkerStateMode;
-        const stateFlags = servingWorkerFeatureFlags;
-        const modelDigest = inferModelArtifactDigest(current);
-        const cacheKeyFingerprint: PrefixCheckpointFingerprint = {
-          modelArtifactDigest: inferModelArtifactDigest(current),
-          architectureId: currentArch ?? "unknown",
-          tokenizerHash: stableObjectHash({ model: current, arch: currentArch, kv: stateMode }),
-          chatTemplateHash: stableObjectHash({ arch: currentArch, model: current, mode: stateMode }),
-          runtimeConfigHash: stableObjectHash({
-            kv_mode: stateMode,
-            prefill_compression: effective.prefill_compression,
-            prefill_drafter: effective.prefill_drafter,
-            mtp_mode: effective.mtp_mode,
-            mtp_k: effective.mtp_k,
-            prompt_cache_key: body.prompt_cache_key ?? null,
-            prompt_cache_retention: requestPromptCacheRetention ?? null,
-            render_input_hash: renderInputHash,
-          }),
-          cacheNamespaceHash: stableObjectHash({
-            prompt_cache_key: body.prompt_cache_key ?? null,
-          }),
-          stateMode,
-          positionPolicy: "rope",
-          featureFlags: stateFlags,
-        };
-        const checksumLookup: Partial<Record<SessionStateKind, string>> = {};
-        for (const stateKind of stateKinds) {
-          checksumLookup[stateKind] = stableHash(`${cacheKeyFingerprint.modelArtifactDigest}|${stateKind}`);
-        }
-        const servingWorkerStateCache = getWorkerStateCache(servingWorkerKey);
-        let daemonPreflightPrefixes: Array<{ value: string; prefix_len: number; boundary?: string; boundary_index?: number }> = [];
-        const requestPrefillDispatchStatus = prefillBatchRequestDispatchStatus({
-          eligible: prefillBatchGate.eligible,
-          capability: generateBatchPrefillCapability,
-          stream: body.stream === true,
-        });
-        const requestCanUseDaemonPrefillBatch = requestPrefillDispatchStatus.canDispatch;
-        if (serverPrefillBatch.enabled) {
-          prefillBatchMetrics.queued += 1;
-          servingWorkerScheduler = getWorkerPrefillScheduler(servingWorkerKey);
-          if (prefillBatchGate.eligible && current !== null) {
-            prefillBatchMetrics.eligible += 1;
-            const modelArtifactBucket = currentMaxSeq ?? 4096;
-            serverPrefillSession = createServerPrefillSession({
-              id: reqId,
-              modelPath: current,
-              modelDigest,
-              archId: currentArch ?? "unknown",
-              quantFamily: inferQuantFamilyForPath(current),
-              stateMode,
-              maxSeqBucket: modelArtifactBucket,
-              acceleratorKind: serverAcceleratorKind,
-              deviceId: serverDeviceId,
-              featureFlags: stateFlags,
-              promptTokens: prefillPromptTokens,
-              priority: requestPriority,
-              stateKinds,
-            });
-            if (servingWorkerKey !== null) {
-              serverPrefillSession = {
-                ...serverPrefillSession,
-                workerKey: servingWorkerKey,
-                stateHandle: {
-                  ...serverPrefillSession.stateHandle,
-                  workerKey: servingWorkerKey,
-                },
-              };
-            }
-
-            if (
-              requestAllowsResidentPrefixCache &&
-              requestCanUseDaemonPrefillBatch &&
-              servingWorkerStateCache.size > 0 &&
-              current !== null
-            ) {
-              prefillBatchMetrics.prefixHashPreflightRequests += 1;
-              const preflightSession: any = {
-                id: reqId,
-                prompt: userPrompt,
-                state_handle: {
-                  state_kinds: [...stateKinds],
-                  logical_position: 0,
-                  cached_prefix_tokens: 0,
-                },
-                params: {
-                  assistant_prefix: requestAssistantPrefix,
-                },
-              };
-              if (requestMaxThinkTokens !== undefined) {
-                preflightSession.params.max_think_tokens = requestMaxThinkTokens;
-              }
-              if (systemPrompt) preflightSession.system = systemPrompt;
-              if (Array.isArray(body.tools) && body.tools.length > 0) {
-                preflightSession.tools = body.tools;
-              }
-              if (structuredMessages.length > 0) {
-                preflightSession.messages = structuredMessages;
-              }
-              try {
-                await e.send({
-                  type: "prefix_hash_preflight",
-                  id: `prefix-hash-${reqId}`,
-                  worker_key_id: servingWorkerKey ? modelWorkerKeyId(servingWorkerKey) : undefined,
-                  model: current,
-                  boundary_policy: "semantic_chat_template",
-                  session: preflightSession,
-                });
-                const preflightMsg = await e.recv();
-                if (preflightMsg?.type === "prefix_hash_preflight_done" && Array.isArray(preflightMsg.prefixes)) {
-                  daemonPreflightPrefixes = preflightMsg.prefixes
-                    .filter((candidate: any) =>
-                      candidate
-                      && typeof candidate.value === "string"
-                      && /^[0-9a-f]{32}$/.test(candidate.value)
-                      && Number.isInteger(candidate.prefix_len)
-                      && candidate.prefix_len >= 0
-                    )
-                    .map((candidate: any) => ({
-                      value: candidate.value,
-                      prefix_len: candidate.prefix_len,
-                      boundary: typeof candidate.boundary === "string" ? candidate.boundary : undefined,
-                      boundary_index: Number.isInteger(candidate.boundary_index) ? candidate.boundary_index : undefined,
-                    }));
-                  prefillBatchMetrics.prefixHashPreflightCandidates += daemonPreflightPrefixes.length;
-                }
-              } catch (err: any) {
-                console.error(`[hipfire] prefix_hash_preflight failed; falling back to exact cache lookup: ${err?.message ?? err}`);
-              }
-            }
-
-            let cacheManifest: PrefixCheckpointManifest | undefined;
-            const daemonCacheMatch = daemonPreflightPrefixes
-              .sort((a, b) => b.prefix_len - a.prefix_len)
-              .map((candidate) => ({
-                candidate,
-                manifest: [...servingWorkerStateCache.values()]
-                  .filter((manifest) => prefixCheckpointDaemonCompatible(manifest, {
-                    fingerprint: cacheKeyFingerprint,
-                    daemonPrefixHash: candidate.value,
-                    daemonPrefixLen: candidate.prefix_len,
-                    requiredStateKinds: stateKinds,
-                  }))
-                  .sort((a, b) => (b.lastUsedAtMs - a.lastUsedAtMs) || (b.prefixLen - a.prefixLen))[0],
-              }))
-              .find((match): match is {
-                candidate: { value: string; prefix_len: number; boundary?: string; boundary_index?: number };
-                manifest: PrefixCheckpointManifest;
-              } => !!match.manifest);
-            const daemonCacheLookup = daemonCacheMatch?.manifest;
-            if (daemonCacheLookup) {
-              prefillBatchMetrics.prefixHashPreflightMatches += 1;
-              if (daemonCacheMatch?.candidate.boundary && daemonCacheMatch.candidate.boundary !== "full") {
-                prefillBatchMetrics.prefixHashPreflightBoundaryMatches += 1;
-              }
-            }
-            const compatibleCacheLookup = [...servingWorkerStateCache.values()]
-              .filter((manifest) => manifest.prefixLen <= prefillPromptTokens.length)
-              .filter((manifest) => {
-                try {
-                  return prefixCheckpointCompatible(manifest, {
-                    fingerprint: cacheKeyFingerprint,
-                    prefixTokens: prefillPromptTokens.slice(0, manifest.prefixLen),
-                    requiredStateKinds: stateKinds,
-                  });
-                } catch { return false; }
-              })
-              .sort((a, b) => b.prefixLen - a.prefixLen)[0];
-            const cacheLookup = requestAllowsResidentPrefixCache && daemonCacheLookup
-              ? daemonCacheLookup
-              : undefined;
-
-            if (cacheLookup) {
-              cacheHit = true;
-              prefillBatchMetrics.cacheHits += 1;
-              prefillBatchMetrics.runtimeCacheHits += 1;
-              cachePrefixLen = cacheLookup.daemonPrefixLen ?? cacheLookup.prefixLen;
-              cacheManifest = touchPrefixCheckpointManifest(cacheLookup, requestNowMs);
-              cacheKey = prefixCheckpointCacheKey(cacheManifest);
-              if (requestAllowsResidentPrefixCache || serverPrefillBatchControls.stateCacheDisk) {
-                servingWorkerStateCache.set(cacheKey, cacheManifest);
-              }
-              serverPrefillSession = {
-                ...serverPrefillSession,
-                cachedPrefixTokens: cacheLookup.daemonPrefixLen ?? cacheLookup.prefixLen,
-                suffixTokens: daemonCacheLookup ? [] : prefillPromptTokens.slice(cacheLookup.prefixLen),
-                stateHandle: {
-                  ...serverPrefillSession.stateHandle,
-                  cachedPrefixTokens: cacheLookup.daemonPrefixLen ?? cacheLookup.prefixLen,
-                  logicalPosition: cacheLookup.runtimeLogicalPosition ?? cacheLookup.prefixLen,
-                  runtimeStateHandle: cacheLookup.runtimeStateHandle,
-                  daemonPrefixHash: cacheLookup.daemonPrefixHash,
-                  daemonPrefixLen: cacheLookup.daemonPrefixLen,
-                },
-              };
-            } else {
-              if (compatibleCacheLookup) {
-                prefillBatchMetrics.metadataCacheHits += 1;
-                cacheKey = prefixCheckpointCacheKey(touchPrefixCheckpointManifest(compatibleCacheLookup, requestNowMs));
-              }
-              prefillBatchMetrics.cacheMisses += 1;
-            }
-
-            const manifestPrefixLen = cachePrefixLen > 0 ? cachePrefixLen : prefillPromptTokens.length;
-            const manifest = cacheManifest ?? createPrefixCheckpointManifest({
-              fingerprint: cacheKeyFingerprint,
-              prefixTokens: prefillPromptTokens.slice(0, manifestPrefixLen),
-              stateKinds,
-              bytes: serverPrefillSession.suffixTokens.length * 16,
-              createdAtMs: requestNowMs,
-              lastUsedAtMs: requestNowMs,
-              hitCount: cacheHit ? 1 : 0,
-              checksums: checksumLookup,
-            });
-            if (!cacheKey) {
-              cacheKey = prefixCheckpointCacheKey(manifest);
-            }
-            if (serverPrefillBatchControls.stateCacheDisk) {
-              const spillProfile = spillEligibility(manifest, {
-                activeSession: false,
-                pinned: false,
-                knownArchitecture: !!currentArch,
-              });
-              spillable = spillProfile.spillable;
-              spillReason = spillProfile.reason;
-              if (spillProfile.spillable) servingWorkerStateCache.set(cacheKey, manifest);
-            } else {
-              spillReason = requestAllowsResidentPrefixCache
-                ? "resident_state_cache_only"
-                : "state_cache_disabled";
-            }
-
-            // Exercise the queueing path (enqueue -> preview -> dequeue) for
-            // compatible non-streaming requests. The daemon currently executes
-            // selected Qwen35 sessions through serial prefill under explicit
-            // session activation; true fused GPU microbatching is the next
-            // runtime step.
-            if (servingWorkerScheduler) {
-              const reservation = await reserveSessionStateOrReject(
-                activeWorkerKeyId,
-                requiredPhysicalCap,
-                "prefill_admission",
-              );
-              if (reservation.response) {
-                lastPrefillQueueWaitReason = "memory_pressure";
-                lastPrefillFallbackReason = "memory_pressure";
-                safeRelease();
-                return reservation.response;
-              }
-              stateReservationId = reservation.reservationId;
-              try {
-                servingWorkerScheduler.enqueueIfAbsent(serverPrefillSession, requestNowMs);
-              } catch (err: any) {
-                if (stateReservationId) {
-                  await releaseStateReservations([stateReservationId], "prefill scheduler backpressure");
-                }
-                lastPrefillQueueWaitReason = "insufficient_queue";
-                lastPrefillFallbackReason = "prefill_scheduler_backpressure";
-                safeRelease();
-                return Response.json(
-                  { error: err?.message ?? "prefill scheduler backpressure" },
-                  { status: 503 },
-                );
-              }
-              const preview = servingWorkerScheduler.previewNextPrefillBatch({
-                nowMs: requestNowMs,
-              });
-              const nextForCurrent = !!preview?.sessions?.some((s) => s.id === reqId);
-              if (nextForCurrent && requestCanUseDaemonPrefillBatch) {
-                const next = servingWorkerScheduler.nextPrefillBatch({ nowMs: requestNowMs });
-                if (next && next.sessions.some((s) => s.id === reqId)) {
-                  selectedForPrefillBatch = true;
-                  selectedByScheduler = true;
-                  queuePreviewReason = "selected";
-                  selectedBatchSize = next.sessions.length;
-                  selectedBatchSessions = next.sessions;
-                  prefillBatchMetrics.selected += 1;
-                } else {
-                  queuePreviewReason = preview ? "waiting" : "insufficient_queue";
-                  // If preview said this request should run but dequeuing did not
-                  // return it, keep the scheduling state consistent by canceling the
-                  // request before continuing on the serialized execution path.
-                  servingWorkerScheduler.cancel(reqId);
-                  prefillBatchMetrics.skipped += 1;
-                }
-              } else {
-                queuePreviewReason = preview ? "waiting" : "insufficient_queue";
-                if (
-                  !requestCanUseDaemonPrefillBatch
-                ) {
-                  prefillBatchMetrics.skipped += 1;
-                  servingWorkerScheduler.cancel(reqId);
-                }
-              }
-            } else {
-              queuePreviewReason = "insufficient_queue";
-              prefillBatchMetrics.skipped += 1;
-            }
-          } else {
-            prefillBatchMetrics.skipped += 1;
-            queuePreviewReason = "not_eligible";
-          }
-        }
-
-        if (cacheKey == null) {
-          cacheKey = current !== null
-            ? stableHash(`${current}|${inferStateKindsForServeArch(currentArch).join(",")}`)
-            : stableHash("prefetch-disable");
-        }
-        if (!serverPrefillBatch.enabled) {
-          fallbackReason = "batching_disabled";
-          lastPrefillQueueWaitReason = "disabled";
-          lastPrefillFallbackReason = fallbackReason;
-          lastPrefillRuntimeDispatchSkippedReason = "not_enabled";
-          lastSelectedBatchSize = 0;
-          runtimeDispatchSkippedReason = "not_applicable";
-        } else if (!prefillBatchGate.eligible) {
-          fallbackReason = `not_eligible:${prefillBatchGate.reason}`;
-          lastPrefillQueueWaitReason = queuePreviewReason;
-          lastPrefillFallbackReason = fallbackReason;
-          lastPrefillRuntimeDispatchSkippedReason = "not_eligible";
-          lastSelectedBatchSize = 0;
-          runtimeDispatchSkippedReason = "not_eligible";
-        } else if (selectedByScheduler) {
-          fallbackReason = `selected_for_dispatch:${queuePreviewReason}`;
-          lastPrefillQueueWaitReason = queuePreviewReason;
-          lastPrefillFallbackReason = fallbackReason;
-          lastPrefillRuntimeDispatchSkippedReason = prefillBatchRuntimeDispatchStatus(
-            true,
-            generateBatchPrefillCapability,
-          ).runtimeDispatchReason;
-          lastSelectedBatchSize = selectedBatchSize;
-        } else {
-          fallbackReason = `queue_wait:${queuePreviewReason}`;
-          lastPrefillQueueWaitReason = queuePreviewReason;
-          lastPrefillFallbackReason = fallbackReason;
-          lastSelectedBatchSize = selectedBatchSize;
-          if (generateBatchPrefillCapability !== "supported") {
-            lastPrefillRuntimeDispatchSkippedReason = prefillBatchRuntimeDispatchStatus(
-              true,
-              generateBatchPrefillCapability,
-            ).runtimeDispatchReason;
-          } else if (!requestCanUseDaemonPrefillBatch) {
-            lastPrefillRuntimeDispatchSkippedReason = requestPrefillDispatchStatus.runtimeDispatchReason;
-          } else {
-            lastPrefillRuntimeDispatchSkippedReason = runtimeDispatchSkippedReason;
-          }
-        }
-
+        const reqId = `chatcmpl-${Date.now().toString(36)}`;
         const created = Math.floor(Date.now() / 1000);
         const modelName = body.model || "hipfire";
         // Fall back to the user's configured defaults (global or per-model) when
         // an OpenAI client doesn't set a field. 512 was a hardcoded surprise
         // that ignored `hipfire config set max_tokens …`.
-        // OpenAI-compatible penalties are now native daemon sampler knobs.
-        // Keep repeat_penalty as the hipfire-specific multiplicative control
-        // instead of folding additive OpenAI penalties into it.
-        const presencePenalty = Math.max(0, Number(body.presence_penalty) || 0);
-        const frequencyPenalty = Math.max(0, Number(body.frequency_penalty) || 0);
+        // OpenAI repeat-penalty mapping: take the larger of frequency_penalty
+        // and presence_penalty when present. Both are -2..2 in the OpenAI
+        // surface; we map non-negative values to repeat_penalty = 1 + p.
+        // (Negative penalties — boosts — aren't meaningful for hipfire's
+        // multiplicative repeat_penalty kernel, so they're treated as zero.)
+        // Requested by @shilga in #79; previously only frequency_penalty was
+        // honored.
+        const oaiPenalty = Math.max(
+          0,
+          Number(body.frequency_penalty) || 0,
+          Number(body.presence_penalty) || 0,
+        );
+        const oaiPenaltySet = body.frequency_penalty != null || body.presence_penalty != null;
 
         // chat_template_kwargs (Qwen / DeepSeek / pi-coding-agent extension).
         // Two recognized keys, both per-request overrides on top of
@@ -4845,36 +2329,78 @@ async function serve(port: number, host: string) {
         // https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events
         const includeUsage = (body.stream_options && body?.stream_options?.include_usage && body?.stream_options?.include_usage === true);
 
-        // Build the OpenAI-format `usage` object. The V4F daemon arm
-        // emits `prompt_tokens` (full client-visible prompt size) and
-        // `cached_tokens` (LCP-hit count from the prefix cache) as
-        // separate fields; legacy arches only emit `prefill_tokens`
-        // (== the number of tokens actually fed through the forward
-        // path) and we fall back to that for `prompt_tokens` so the
-        // total still balances on those paths.
+        // Build the OpenAI-format `usage` object.
         //
-        // `usage.prompt_tokens_details.cached_tokens` is the OpenAI
-        // surface DeepSeek / pi-coding-agent / OpenCode read for
-        // cache-hit accounting; we emit it whenever the daemon
-        // reports cached_tokens > 0 (V4F today; other archs when /
-        // if they grow LCP detection).
+        // Daemon emits three signals:
+        //   prompt_tokens   — total tokens in the input prompt (V4F only
+        //                     today; absent on qwen35 path, derived below)
+        //   prefill_tokens  — number of new tokens actually fed through
+        //                     the forward path this turn
+        //   cached_tokens   — LCP-hit count from the prefix cache
+        //
+        // Per OpenAI spec, `usage.prompt_tokens` is the TOTAL input
+        // size and `prompt_tokens_details.cached_tokens` is the
+        // already-cached portion of that total. So:
+        //   prompt_tokens   = cached + prefill   (when daemon doesn't emit it)
+        //   completion      = newly decoded tokens
+        //   prompt_tokens_details.cached_tokens = cached
+        //
+        // For Anthropic-compatible clients (Pi, etc.) we also emit
+        // `cache_creation_input_tokens` = prefill_tokens (the new
+        // tokens written through the forward path this turn, which
+        // populate the cache for the NEXT turn). This maps to Pi's
+        // `cacheWrite` field and pairs with `cacheRead` from
+        // `prompt_tokens_details.cached_tokens`.
         const buildUsage = (msg: any, completion: number) => {
-          const promptTokens: number = typeof msg.prompt_tokens === "number"
-            ? msg.prompt_tokens
-            : (typeof msg.prefill_tokens === "number" ? msg.prefill_tokens : 0);
+          const prefillTokens: number = typeof msg.prefill_tokens === "number"
+            ? msg.prefill_tokens
+            : 0;
           const cachedTokens: number = typeof msg.cached_tokens === "number"
             ? msg.cached_tokens
             : 0;
+          const promptTokens: number = typeof msg.prompt_tokens === "number"
+            ? msg.prompt_tokens
+            : cachedTokens + prefillTokens;
           const usage: any = {
             prompt_tokens: promptTokens,
             completion_tokens: completion,
             total_tokens: promptTokens + completion,
+            // Pi's openai-completions adapter reads BOTH cacheRead and
+            // cacheWrite from `prompt_tokens_details` (NOT the
+            // Anthropic-style top-level fields). Per
+            // packages/ai/src/providers/openai-completions.ts in
+            // earendil-works/pi:
+            //   cacheRead  ← prompt_tokens_details.cached_tokens
+            //                (or prompt_cache_hit_tokens)
+            //   cacheWrite ← prompt_tokens_details.cache_write_tokens
+            //   input      ← prompt_tokens − cacheRead − cacheWrite
+            // Emitting these nested fields is what populates Pi's
+            // `cacheWrite` column. Emit them unconditionally (0 when
+            // empty) so clients see a stable shape.
+            prompt_tokens_details: {
+              cached_tokens: cachedTokens,
+              cache_write_tokens: prefillTokens,
+            },
           };
-          if (cachedTokens > 0) {
-            usage.prompt_tokens_details = { cached_tokens: cachedTokens };
-          }
+          // Anthropic-shape top-level mirror (some other multi-provider
+          // clients read these). Harmless to emit alongside the OpenAI
+          // nested shape Pi uses.
+          //   cache_read_input_tokens     ≡ cached_tokens (LCP hit)
+          //   cache_creation_input_tokens ≡ new tokens prefilled this turn
+          usage.cache_read_input_tokens = cachedTokens;
+          usage.cache_creation_input_tokens = prefillTokens;
           return usage;
         };
+        // Per-request perf/spec-decode metrics for the streaming final chunk.
+        // `tau`/`cycles`/`dflash` surface DFlash spec-decode effectiveness (mean
+        // accepted tokens per verify cycle) for benchmarking/observability;
+        // they're absent on the AR path.
+        const buildTimings = (m: any) => ({
+          tokens: m.tokens, tok_s: m.tok_s, prefill_tokens: m.prefill_tokens,
+          prefill_ms: m.prefill_ms, prefill_tok_s: m.prefill_tok_s,
+          decode_tok_s: m.decode_tok_s, ttft_ms: m.ttft_ms,
+          tau: m.tau, cycles: m.cycles, dflash: m.dflash,
+        });
 
         // OpenAI o1/o3-style `reasoning.effort` (none / minimal / low /
         // medium / high / xhigh). Open WebUI, OpenCode, and pi-coding-agent
@@ -4888,87 +2414,33 @@ async function serve(port: number, host: string) {
         const effortMap: Record<string, number> = {
           none: 1, minimal: 64, low: 256, medium: 1024, high: 4096, xhigh: 0,
         };
-        const reasoningEffort: number | null = reasoning && typeof reasoning.effort === "string"
-          && reasoning.effort in effortMap ? effortMap[reasoning.effort] : null;
+        // Accept the reasoning effort from BOTH OpenAI shapes: the Chat
+        // Completions top-level `reasoning_effort` (what most clients + the
+        // OpenAI SDK send) AND the Responses-API nested `reasoning.effort`.
+        // Previously only the nested form was read here, so a top-level
+        // `reasoning_effort:"none"` silently no-op'd and the turn stayed in
+        // thinking mode — even though the daemon itself accepts both at
+        // generate-time (it's this HTTP layer that rewrites effort →
+        // thinking_mode). Top-level wins when both are present.
+        const effortStr: string | null =
+          (typeof (body as any).reasoning_effort === "string" ? (body as any).reasoning_effort : null)
+          ?? (reasoning && typeof reasoning.effort === "string" ? reasoning.effort : null);
+        const reasoningEffort: number | null =
+          effortStr && effortStr in effortMap ? effortMap[effortStr] : null;
 
         const genParams: any = {
           type: "generate", id: reqId, prompt: userPrompt,
-          worker_key_id: activeWorkerKeyId ?? undefined,
           temperature: (body.temperature ?? effective.temperature) * TEMP_CORRECTION,
           max_tokens: requestMaxTokens,
+          // The daemon now applies OpenAI presence/frequency penalties natively
+          // (subtractive, over the full repeat window) — strictly better than the
+          // old #79 fold into the multiplicative repeat_penalty. Pass them raw.
           repeat_penalty: body.repeat_penalty ?? effective.repeat_penalty,
-          presence_penalty: presencePenalty,
-          frequency_penalty: frequencyPenalty,
+          presence_penalty: Math.max(0, Number(body.presence_penalty) || 0),
+          frequency_penalty: Math.max(0, Number(body.frequency_penalty) || 0),
           top_p: body.top_p ?? effective.top_p,
         };
-        if (serverPrefillBatch.enabled) {
-          const runtimeDispatch = requestPrefillDispatchStatus.runtimeDispatch;
-          runtimeDispatchSkippedReason = requestPrefillDispatchStatus.runtimeDispatchReason;
-          const runtimeDispatchReason = prefillBatchGate.eligible
-            ? runtimeDispatchSkippedReason
-            : prefillBatchGate.reason;
-          const batchPolicy = requestBatchPolicy ?? {
-            priority: serverPrefillBatch.priority,
-            maxBatchSize: serverPrefillBatch.maxBatch,
-            residentStateMax: serverPrefillBatch.maxBatch,
-            spillableBatchMax: serverPrefillBatch.maxBatch,
-            diskSpillAllowed: false,
-            diskSpillMinPriority: 128,
-            coalesceWaitMs: serverPrefillBatch.waitMs,
-            targetPairTokens: serverPrefillBatch.targetPairTokens,
-            maxProcessingMs: serverPrefillBatch.maxProcessingMs,
-          };
-          const spillableSessions = batchPolicy.diskSpillAllowed
-            ? Math.max(0, selectedBatchSize - batchPolicy.residentStateMax)
-            : 0;
-          recordPrefillStatePolicy(
-            batchPolicy.residentStateMax,
-            batchPolicy.spillableBatchMax,
-            selectedBatchSize,
-            requestAllowsResidentPrefixCache,
-            serverPrefillBatchControls.residentCheckpointMax,
-            serverPrefillBatchControls.stateCacheDisk,
-            batchPolicy.diskSpillMinPriority,
-            batchPolicy.diskSpillAllowed,
-          );
-          genParams.server_prefill_batch = {
-            eligible: prefillBatchGate.eligible,
-            reason: prefillBatchGate.reason,
-            priority: batchPolicy.priority,
-            max_batch: batchPolicy.maxBatchSize,
-            resident_state_limit: batchPolicy.residentStateMax,
-            spillable_batch_max: batchPolicy.spillableBatchMax,
-            spillable_sessions: spillableSessions,
-            resident_state_cache: requestAllowsResidentPrefixCache,
-            resident_checkpoint_max: serverPrefillBatchControls.residentCheckpointMax,
-            state_cache_disk: serverPrefillBatchControls.stateCacheDisk,
-            state_cache_disk_min_priority: batchPolicy.diskSpillMinPriority,
-            disk_spill_allowed: batchPolicy.diskSpillAllowed,
-            wait_ms: batchPolicy.coalesceWaitMs,
-            target_pair_tokens: batchPolicy.targetPairTokens,
-            max_processing_ms: batchPolicy.maxProcessingMs,
-            selected_for_dispatch: selectedForPrefillBatch,
-            selected_by_scheduler: selectedByScheduler,
-            queue_preview_reason: queuePreviewReason,
-            queue_wait_reason: queuePreviewReason,
-            fallback_reason: fallbackReason,
-            selected_batch_size: selectedBatchSize,
-            runtime_dispatch_skipped_reason: runtimeDispatchSkippedReason,
-            cache_hit: cacheHit,
-            cache_prefix_len: cachePrefixLen,
-            cache_key: cacheKey,
-            cache_spillable: spillable,
-            cache_spill_reason: spillReason,
-            worker_key_id: servingWorkerKey ? modelWorkerKeyId(servingWorkerKey) : undefined,
-            route_reason: activeWorkerKeyId
-              ? (residentModelWorkers.get(activeWorkerKeyId)?.routeReason ?? initialRoute.reloadReason)
-              : initialRoute.reloadReason,
-            generate_batch_prefill_capability: generateBatchPrefillCapability,
-            generate_batch_prefill_capability_reason: generateBatchPrefillCapabilityReason,
-            runtime_dispatch: runtimeDispatch,
-            runtime_dispatch_reason: runtimeDispatchReason,
-          };
-        }
+        void oaiPenalty; void oaiPenaltySet; // superseded by native presence/frequency
         // Mirror the `hipfire run` path's per-model max_think_tokens
         // propagation. Without this, models with thinking=on can consume
         // the entire max_tokens budget inside a single <think>...</think>
@@ -5000,20 +2472,54 @@ async function serve(port: number, host: string) {
         // The Jinja path uses max_think_tokens==1 as the signal for
         // enable_thinking=false (daemon.rs line 3099). For the legacy
         // ChatFrame path, assistant_prefix="closed_think" is sufficient.
-        if (currentArch === "qwen35_dummy") {
-          genParams.assistant_prefix = "plain";
-        } else if (effective.thinking === "off") {
+        // `assistant_prefix` drives the legacy ChatFrame path (Qwen et al.);
+        // `think_mode` drives arch_id=9 (DeepSeek V4), whose generate path
+        // ignores assistant_prefix/max_think_tokens and selects framing +
+        // reasoning-parse from think_mode alone:
+        //   chat     → `<｜Assistant｜></think>` (no reasoning, content only)
+        //   thinking → `<｜Assistant｜><think>`  (emits <think>…</think> reasoning)
+        //   max      → thinking + the "Absolute maximum" reasoning preamble
+        // Both are set so each arch reads the right one. (V4 modes per the HF
+        // encoding/README.md: thinking_mode=chat|thinking, reasoning_effort=max.)
+        const rEffort = effortStr;
+        if (effective.thinking === "off") {
           genParams.assistant_prefix = "closed_think";
+          genParams.thinking_mode = "chat";
         } else if ((body as any).chat_template_kwargs?.enable_thinking === false) {
           genParams.assistant_prefix = "closed_think";
           genParams.max_think_tokens = 1; // Jinja path signal
-        } else if ((body as any).reasoning?.effort === "none") {
+          genParams.thinking_mode = "chat";
+        } else if (rEffort === "none") {
           genParams.assistant_prefix = "closed_think";
           genParams.max_think_tokens = 1;
+          genParams.thinking_mode = "chat";
         } else {
+          // Thinking is ON (config default, or explicit enable_thinking=true /
+          // reasoning.effort>=minimal). OPEN the <think> block so the model
+          // actually reasons instead of emitting an empty <think></think> and
+          // answering directly. Without this, generic OpenAI clients (which
+          // never send assistant_prefix) get no-think behaviour, which fails
+          // hard reasoning on thinking models like Qwen3.6. Safe for non-
+          // thinking models: the daemon's prompt frame falls back to Plain
+          // when the tokenizer has no `<think>` special token.
           genParams.assistant_prefix = "open_think";
+          // reasoning_effort max / xhigh → deepest reasoning; otherwise standard.
+          genParams.thinking_mode = (rEffort === "max" || rEffort === "xhigh") ? "max" : "thinking";
         }
         if (systemPrompt) genParams.system = systemPrompt;
+
+        // hunt3 M-F: forward OpenAI `stop` sequences to the daemon. Accept a
+        // single string or an array of strings; normalize to string[], drop
+        // empties, cap at 4 sequences of <= 64 chars each (the daemon matches
+        // them against the decoded-output suffix and emits finish_reason="stop").
+        {
+          const rawStop = (body as any).stop;
+          let stopSeqs: string[] = [];
+          if (typeof rawStop === "string") stopSeqs = [rawStop];
+          else if (Array.isArray(rawStop)) stopSeqs = rawStop.filter((s: any) => typeof s === "string");
+          stopSeqs = stopSeqs.filter(s => s.length > 0).slice(0, 4).map(s => s.slice(0, 64));
+          if (stopSeqs.length > 0) genParams.stop = stopSeqs;
+        }
 
         if (requestImages.length === 1) {
           if (!modelHasVL) {
@@ -5039,918 +2545,9 @@ async function serve(port: number, host: string) {
         if (Array.isArray(body.tools) && body.tools.length > 0) {
           genParams.tools = body.tools;
         }
+        const structuredMessages = mapMessagesToStructured(messages);
         if (structuredMessages.length > 0) {
           genParams.messages = structuredMessages;
-        }
-
-        if (
-          serverPrefillBatch.enabled &&
-          serverPrefillSession &&
-          requestCanUseDaemonPrefillBatch
-        ) {
-          const sessionParams: any = {
-            max_tokens: requestMaxTokens,
-            temperature: genParams.temperature,
-            semantic_boundary_checkpoints: requestAllowsResidentPrefixCache,
-          };
-          if (genParams.assistant_prefix) sessionParams.assistant_prefix = genParams.assistant_prefix;
-          if (typeof genParams.max_think_tokens === "number") {
-            sessionParams.max_think_tokens = genParams.max_think_tokens;
-          }
-          const buildDaemonPrefillSession = (draft: RequestSessionDraft): any => {
-            const payload: any = {
-              id: draft.id,
-              state_handle: {
-                state_kinds: [...draft.stateHandle.stateKinds],
-                logical_position: draft.stateHandle.logicalPosition,
-                cached_prefix_tokens: draft.stateHandle.cachedPrefixTokens,
-              },
-              params: sessionParams,
-            };
-            if (draft.stateHandle.runtimeStateHandle) {
-              payload.state_handle.runtime_state_handle = draft.stateHandle.runtimeStateHandle;
-              if (draft.stateHandle.daemonPrefixHash && draft.stateHandle.daemonPrefixLen !== undefined) {
-                let prefixHashValue = draft.stateHandle.daemonPrefixHash;
-                if (debugCorruptNextPrefixHash) {
-                  prefixHashValue = prefixHashValue === "00000000000000000000000000000000"
-                    ? "11111111111111111111111111111111"
-                    : "00000000000000000000000000000000";
-                  debugCorruptNextPrefixHash = false;
-                }
-                payload.state_handle.prefix_hash = {
-                  algorithm: "xxh128",
-                  value: prefixHashValue,
-                  prefix_len: draft.stateHandle.daemonPrefixLen,
-                };
-                payload.state_handle.prefix_len = draft.stateHandle.daemonPrefixLen;
-              }
-            }
-            if (
-              draft.stateHandle.runtimeStateHandle
-              && draft.stateHandle.daemonPrefixHash
-              && draft.stateHandle.daemonPrefixLen !== undefined
-            ) {
-              payload.prompt = userPrompt;
-            } else if (draft.cachedPrefixTokens > 0) {
-              payload.suffix_tokens = draft.suffixTokens;
-            } else {
-              payload.prompt = userPrompt;
-            }
-            if (systemPrompt) payload.system = systemPrompt;
-            if (Array.isArray(body.tools) && body.tools.length > 0) {
-              payload.tools = body.tools;
-            }
-            if (structuredMessages.length > 0) {
-              payload.messages = structuredMessages;
-            }
-            return payload;
-          };
-
-          if (selectedForPrefillBatch) {
-            const runtimeBatchId = `prefill-${reqId}`;
-            const selectedReservationIds: string[] = stateReservationId ? [stateReservationId] : [];
-            try {
-              const currentPrefillSession = buildDaemonPrefillSession(serverPrefillSession);
-              const selectedSessions = selectedBatchSessions.length > 0
-                ? selectedBatchSessions
-                : [serverPrefillSession];
-              const sharedPrefixFanoutEnabled = process.env.HIPFIRE_SERVER_PREFILL_SHARED_PREFIX_FANOUT !== "0";
-              const fanoutKeyForSession = (session: RequestSessionDraft): string | undefined => {
-                if (session.id === reqId) return requestAllowsResidentPrefixCache ? cacheKey ?? undefined : undefined;
-                return pendingPrefillRequests.get(session.id)?.fanoutKey;
-              };
-              const sameWaveFanoutFollowers = sharedPrefixFanoutEnabled
-                && requestAllowsResidentPrefixCache
-                && !cacheHit
-                && selectedSessions.length > 1
-                && cacheKey
-                && selectedSessions.every((session) => fanoutKeyForSession(session) === cacheKey)
-                ? selectedSessions.filter((session) => session.id !== reqId)
-                : [];
-              if (
-                process.env.HIPFIRE_DEBUG_SHARED_PREFIX_FANOUT === "1" &&
-                selectedSessions.length > 1 &&
-                sameWaveFanoutFollowers.length === 0
-              ) {
-                console.error(`[hipfire] shared-prefix fanout skipped: cacheHit=${cacheHit} cacheKey=${cacheKey ?? "none"} keys=${selectedSessions.map((session) => `${session.id}:${fanoutKeyForSession(session) ?? "none"}`).join(",")}`);
-              }
-              const initialPrefillSessions = sameWaveFanoutFollowers.length > 0
-                ? [serverPrefillSession]
-                : selectedSessions;
-              const daemonSessions: any[] = [];
-              for (const selected of selectedSessions) {
-                if (selected.id === reqId) continue;
-                const pending = pendingPrefillRequests.get(selected.id);
-                if (!pending) {
-                  throw new Error(`selected prefill session ${selected.id} is not pending`);
-                }
-                pending.selected = true;
-                if (pending.reservationId) selectedReservationIds.push(pending.reservationId);
-              }
-              for (const selected of initialPrefillSessions) {
-                if (selected.id === reqId) {
-                  daemonSessions.push(currentPrefillSession);
-                  continue;
-                }
-                const pending = pendingPrefillRequests.get(selected.id);
-                if (!pending) {
-                  throw new Error(`selected prefill session ${selected.id} is not pending`);
-                }
-                daemonSessions.push(pending.prefillSession);
-              }
-
-              await e.send({
-                type: "generate_batch_prefill",
-                id: `${reqId}-prefill`,
-                batch_id: runtimeBatchId,
-                worker_key_id: servingWorkerKey ? modelWorkerKeyId(servingWorkerKey) : undefined,
-                model: current,
-                sessions: daemonSessions,
-              });
-
-              let prefillDone = false;
-              const sessionPrefillTokens = new Map<string, number>();
-              const runtimeStateHandlesBySession = new Map<string, string>();
-              const checkpointStateHandlesBySession = new Map<string, string>();
-              const checkpointDaemonPrefixHashesBySession = new Map<string, { hash: string; len: number }>();
-              const checkpointPrefixCheckpointsBySession = new Map<string, ResidentPrefixCheckpointOutcome[]>();
-              const logicalPositionsBySession = new Map<string, number>();
-              const maxPrefillResponses = selectedSessions.length + 4;
-              for (let i = 0; i < maxPrefillResponses; i++) {
-                const prefillMsg = await e.recv();
-                if (prefillMsg?.type === "generate_batch_prefill_done" && prefillMsg.batch_id === runtimeBatchId) {
-                  prefillDone = true;
-                  updateRuntimeWorkerMetrics((prefillMsg as any).model_worker);
-                  if (genParams.server_prefill_batch) {
-                    genParams.server_prefill_batch.runtime_dispatch = "daemon_serial_prefill";
-                    genParams.server_prefill_batch.runtime_dispatch_reason = "prefill_done_decode_continuation";
-                    genParams.server_prefill_batch.runtime_dispatch_skipped_reason = "not_skipped";
-                    genParams.server_prefill_batch.daemon_prefill_tokens = prefillMsg.prefill_tokens;
-                    genParams.server_prefill_batch.daemon_prefill_ms = prefillMsg.elapsed_ms;
-                    if (typeof prefillMsg.plan === "string") {
-                      genParams.server_prefill_batch.daemon_prefill_plan = prefillMsg.plan;
-                    }
-                    if (typeof prefillMsg.backend === "string") {
-                      genParams.server_prefill_batch.daemon_prefill_backend = prefillMsg.backend;
-                    }
-                  }
-                  break;
-                }
-                if (prefillMsg?.type === "generate_batch_prefill_session_done") {
-                  if (typeof prefillMsg.session_id === "string" && typeof prefillMsg.prefill_tokens === "number") {
-                    sessionPrefillTokens.set(prefillMsg.session_id, prefillMsg.prefill_tokens);
-                  }
-                  const stateHandle = (prefillMsg as any).state_handle;
-                  if (
-                    typeof prefillMsg.session_id === "string" &&
-                    stateHandle &&
-                    typeof stateHandle.session_id === "string"
-                  ) {
-                    runtimeStateHandlesBySession.set(prefillMsg.session_id, stateHandle.session_id);
-                    residentDecodeSessions.add(stateHandle.session_id);
-                  }
-                  if (
-                    typeof prefillMsg.session_id === "string" &&
-                    typeof prefillMsg.logical_position === "number"
-                  ) {
-                    logicalPositionsBySession.set(prefillMsg.session_id, prefillMsg.logical_position);
-                  }
-                  if (
-                    typeof prefillMsg.session_id === "string" &&
-                    stateHandle &&
-                    typeof stateHandle.checkpoint_id === "string"
-                  ) {
-                    checkpointStateHandlesBySession.set(prefillMsg.session_id, stateHandle.checkpoint_id);
-                    const prefixHash = stateHandle.prefix_hash;
-                    const prefixLen = typeof stateHandle.prefix_len === "number"
-                      ? stateHandle.prefix_len
-                      : prefixHash?.prefix_len;
-                    if (
-                      prefixHash &&
-                      prefixHash.algorithm === "xxh128" &&
-                      typeof prefixHash.value === "string" &&
-                      /^[0-9a-f]{32}$/.test(prefixHash.value) &&
-                      typeof prefixLen === "number" &&
-                      Number.isInteger(prefixLen) &&
-                      prefixLen >= 0
-                    ) {
-                      checkpointDaemonPrefixHashesBySession.set(prefillMsg.session_id, {
-                        hash: prefixHash.value,
-                        len: prefixLen,
-                      });
-                    }
-                  }
-                  if (
-                    typeof prefillMsg.session_id === "string" &&
-                    stateHandle &&
-                    Array.isArray(stateHandle.prefix_checkpoints)
-                  ) {
-                    if (process.env.HIPFIRE_DEBUG_PREFIX_BOUNDARIES) {
-                      console.error(
-                        `[hipfire] received ${stateHandle.prefix_checkpoints.length} prefix boundary checkpoint(s) for ${prefillMsg.session_id}`,
-                      );
-                    }
-                    const prefixCheckpoints: ResidentPrefixCheckpointOutcome[] = [];
-                    for (const checkpoint of stateHandle.prefix_checkpoints) {
-                      const prefixHash = checkpoint?.prefix_hash;
-                      const prefixLen = typeof checkpoint?.prefix_len === "number"
-                        ? checkpoint.prefix_len
-                        : prefixHash?.prefix_len;
-                      if (
-                        checkpoint &&
-                        typeof checkpoint.checkpoint_id === "string" &&
-                        prefixHash &&
-                        prefixHash.algorithm === "xxh128" &&
-                        typeof prefixHash.value === "string" &&
-                        /^[0-9a-f]{32}$/.test(prefixHash.value) &&
-                        typeof prefixLen === "number" &&
-                        Number.isInteger(prefixLen) &&
-                        prefixLen > 0
-                      ) {
-                        prefixCheckpoints.push({
-                          checkpointStateHandle: checkpoint.checkpoint_id,
-                          checkpointLogicalPosition: Number.isInteger(checkpoint.logical_position)
-                            ? checkpoint.logical_position
-                            : prefixLen,
-                          checkpointDaemonPrefixHash: prefixHash.value,
-                          checkpointDaemonPrefixLen: prefixLen,
-                          boundary: typeof checkpoint.boundary === "string" ? checkpoint.boundary : undefined,
-                          boundaryIndex: Number.isInteger(checkpoint.boundary_index) ? checkpoint.boundary_index : undefined,
-                        });
-                      }
-                    }
-                    if (prefixCheckpoints.length > 0) {
-                      if (process.env.HIPFIRE_DEBUG_PREFIX_BOUNDARIES) {
-                        console.error(
-                          `[hipfire] accepted ${prefixCheckpoints.length} prefix boundary checkpoint(s) for ${prefillMsg.session_id}`,
-                        );
-                      }
-                      checkpointPrefixCheckpointsBySession.set(prefillMsg.session_id, prefixCheckpoints);
-                    }
-                  }
-                  continue;
-                }
-                if (prefillMsg?.type === "generate_batch_prefill_started") {
-                  continue;
-                }
-                if (prefillMsg?.type === "error") {
-                  throw new Error(prefillMsg.message || "generate_batch_prefill error");
-                }
-                if (prefillMsg?.type === "generate_batch_prefill_unsupported") {
-                  throw new Error(prefillMsg.reason || "generate_batch_prefill unsupported");
-                }
-                throw new Error(`unexpected generate_batch_prefill response: ${prefillMsg?.type ?? "missing"}`);
-              }
-              if (!prefillDone) throw new Error("generate_batch_prefill did not complete");
-              if (sameWaveFanoutFollowers.length > 0) {
-                const leaderCheckpointCandidates: Array<{
-                  handle: string;
-                  hash: string;
-                  len: number;
-                  logicalPosition?: number;
-                }> = [];
-                const leaderFinalPrefix = checkpointDaemonPrefixHashesBySession.get(reqId);
-                const leaderFinalHandle = checkpointStateHandlesBySession.get(reqId);
-                if (leaderFinalHandle && leaderFinalPrefix) {
-                  leaderCheckpointCandidates.push({
-                    handle: leaderFinalHandle,
-                    hash: leaderFinalPrefix.hash,
-                    len: leaderFinalPrefix.len,
-                    logicalPosition: logicalPositionsBySession.get(reqId),
-                  });
-                }
-                for (const checkpoint of checkpointPrefixCheckpointsBySession.get(reqId) ?? []) {
-                  leaderCheckpointCandidates.push({
-                    handle: checkpoint.checkpointStateHandle,
-                    hash: checkpoint.checkpointDaemonPrefixHash,
-                    len: checkpoint.checkpointDaemonPrefixLen,
-                    logicalPosition: checkpoint.checkpointLogicalPosition,
-                  });
-                }
-                let fanoutPreflightPrefixes: Array<{ value: string; prefix_len: number }> = [];
-                try {
-                  const fanoutPreflightSession = cloneJsonValue(currentPrefillSession);
-                  delete fanoutPreflightSession.state_handle?.runtime_state_handle;
-                  delete fanoutPreflightSession.state_handle?.prefix_hash;
-                  delete fanoutPreflightSession.state_handle?.prefix_len;
-                  fanoutPreflightSession.state_handle = {
-                    ...(fanoutPreflightSession.state_handle ?? {}),
-                    logical_position: 0,
-                    cached_prefix_tokens: 0,
-                  };
-                  await e.send({
-                    type: "prefix_hash_preflight",
-                    id: `prefix-hash-fanout-${reqId}`,
-                    worker_key_id: servingWorkerKey ? modelWorkerKeyId(servingWorkerKey) : undefined,
-                    model: current,
-                    boundary_policy: "semantic_chat_template",
-                    session: fanoutPreflightSession,
-                  });
-                  const fanoutPreflightMsg = await e.recv();
-                  if (fanoutPreflightMsg?.type === "prefix_hash_preflight_done" && Array.isArray(fanoutPreflightMsg.prefixes)) {
-                    fanoutPreflightPrefixes = fanoutPreflightMsg.prefixes
-                      .filter((candidate: any) =>
-                        candidate
-                        && typeof candidate.value === "string"
-                        && /^[0-9a-f]{32}$/.test(candidate.value)
-                        && Number.isInteger(candidate.prefix_len)
-                        && candidate.prefix_len >= 0
-                      )
-                      .map((candidate: any) => ({
-                        value: candidate.value,
-                        prefix_len: candidate.prefix_len,
-                      }))
-                      .sort((a: { prefix_len: number }, b: { prefix_len: number }) => b.prefix_len - a.prefix_len);
-                    prefillBatchMetrics.prefixHashPreflightRequests += 1;
-                    prefillBatchMetrics.prefixHashPreflightCandidates += fanoutPreflightPrefixes.length;
-                  }
-                } catch (err: any) {
-                  console.error(`[hipfire] shared-prefix fanout preflight failed; followers will use normal prefill: ${err?.message ?? err}`);
-                }
-                const fanoutCheckpoint = fanoutPreflightPrefixes
-                  .map((prefix) => leaderCheckpointCandidates.find((checkpoint) =>
-                    checkpoint.hash === prefix.value &&
-                    checkpoint.len === prefix.prefix_len
-                  ))
-                  .find((checkpoint): checkpoint is {
-                    handle: string;
-                    hash: string;
-                    len: number;
-                    logicalPosition?: number;
-                  } => !!checkpoint);
-                if (
-                  process.env.HIPFIRE_DEBUG_SHARED_PREFIX_FANOUT === "1" &&
-                  !fanoutCheckpoint
-                ) {
-                  console.error(
-                    `[hipfire] shared-prefix fanout found no checkpoint match: candidates=${leaderCheckpointCandidates.map((checkpoint) => `${checkpoint.len}:${checkpoint.hash}`).join(",")} preflight=${fanoutPreflightPrefixes.map((prefix) => `${prefix.prefix_len}:${prefix.value}`).join(",")}`,
-                  );
-                }
-                const fanoutCheckpointHandle = fanoutCheckpoint?.handle;
-                const fanoutDaemonPrefix = fanoutCheckpoint
-                  ? { hash: fanoutCheckpoint.hash, len: fanoutCheckpoint.len }
-                  : undefined;
-                const fanoutLogicalPosition = fanoutCheckpoint?.logicalPosition
-                  ?? fanoutDaemonPrefix?.len
-                  ?? prefillPromptTokens.length;
-                const fanoutAttachFromLeader = !!(fanoutCheckpointHandle && fanoutDaemonPrefix);
-                const fanoutSessions: any[] = [];
-                for (const follower of sameWaveFanoutFollowers) {
-                  const pending = pendingPrefillRequests.get(follower.id);
-                  if (!pending) {
-                    throw new Error(`selected fanout session ${follower.id} is not pending`);
-                  }
-                  const payload = cloneJsonValue(pending.prefillSession);
-                  if (fanoutAttachFromLeader) {
-                    payload.state_handle = {
-                      ...(payload.state_handle ?? {}),
-                      runtime_state_handle: fanoutCheckpointHandle,
-                      cached_prefix_tokens: fanoutDaemonPrefix.len,
-                      logical_position: fanoutLogicalPosition,
-                      prefix_hash: {
-                        algorithm: "xxh128",
-                        value: fanoutDaemonPrefix.hash,
-                        prefix_len: fanoutDaemonPrefix.len,
-                      },
-                      prefix_len: fanoutDaemonPrefix.len,
-                    };
-                    delete payload.suffix_tokens;
-                  }
-                  fanoutSessions.push(payload);
-                }
-                const fanoutBatchId = `${runtimeBatchId}-fanout`;
-                await e.send({
-                  type: "generate_batch_prefill",
-                  id: `${reqId}-prefill-fanout`,
-                  batch_id: fanoutBatchId,
-                  worker_key_id: servingWorkerKey ? modelWorkerKeyId(servingWorkerKey) : undefined,
-                  model: current,
-                  sessions: fanoutSessions,
-                });
-                let fanoutDone = false;
-                const maxFanoutResponses = fanoutSessions.length + 4;
-                for (let i = 0; i < maxFanoutResponses; i++) {
-                  const prefillMsg = await e.recv();
-                  if (prefillMsg?.type === "generate_batch_prefill_done" && prefillMsg.batch_id === fanoutBatchId) {
-                    fanoutDone = true;
-                    updateRuntimeWorkerMetrics((prefillMsg as any).model_worker);
-                    if (genParams.server_prefill_batch) {
-                      genParams.server_prefill_batch.daemon_prefill_tokens =
-                        Number(genParams.server_prefill_batch.daemon_prefill_tokens ?? 0)
-                        + Number(prefillMsg.prefill_tokens ?? 0);
-                      genParams.server_prefill_batch.daemon_prefill_ms =
-                        Number(genParams.server_prefill_batch.daemon_prefill_ms ?? 0)
-                        + Number(prefillMsg.elapsed_ms ?? 0);
-                    }
-                    break;
-                  }
-                  if (prefillMsg?.type === "generate_batch_prefill_session_done") {
-                    if (typeof prefillMsg.session_id === "string" && typeof prefillMsg.prefill_tokens === "number") {
-                      sessionPrefillTokens.set(prefillMsg.session_id, prefillMsg.prefill_tokens);
-                    }
-                    const stateHandle = (prefillMsg as any).state_handle;
-                    if (
-                      typeof prefillMsg.session_id === "string" &&
-                      stateHandle &&
-                      typeof stateHandle.session_id === "string"
-                    ) {
-                      runtimeStateHandlesBySession.set(prefillMsg.session_id, stateHandle.session_id);
-                      residentDecodeSessions.add(stateHandle.session_id);
-                    }
-                    if (
-                      typeof prefillMsg.session_id === "string" &&
-                      typeof prefillMsg.logical_position === "number"
-                    ) {
-                      logicalPositionsBySession.set(prefillMsg.session_id, prefillMsg.logical_position);
-                    }
-                    if (
-                      typeof prefillMsg.session_id === "string" &&
-                      stateHandle &&
-                      typeof stateHandle.checkpoint_id === "string"
-                    ) {
-                      checkpointStateHandlesBySession.set(prefillMsg.session_id, stateHandle.checkpoint_id);
-                      const prefixHash = stateHandle.prefix_hash;
-                      const prefixLen = typeof stateHandle.prefix_len === "number"
-                        ? stateHandle.prefix_len
-                        : prefixHash?.prefix_len;
-                      if (
-                        prefixHash &&
-                        prefixHash.algorithm === "xxh128" &&
-                        typeof prefixHash.value === "string" &&
-                        /^[0-9a-f]{32}$/.test(prefixHash.value) &&
-                        typeof prefixLen === "number" &&
-                        Number.isInteger(prefixLen) &&
-                        prefixLen >= 0
-                      ) {
-                        checkpointDaemonPrefixHashesBySession.set(prefillMsg.session_id, {
-                          hash: prefixHash.value,
-                          len: prefixLen,
-                        });
-                      }
-                    }
-                    if (
-                      typeof prefillMsg.session_id === "string" &&
-                      stateHandle &&
-                      Array.isArray(stateHandle.prefix_checkpoints)
-                    ) {
-                      const prefixCheckpoints: ResidentPrefixCheckpointOutcome[] = [];
-                      for (const checkpoint of stateHandle.prefix_checkpoints) {
-                        const prefixHash = checkpoint?.prefix_hash;
-                        const prefixLen = typeof checkpoint?.prefix_len === "number"
-                          ? checkpoint.prefix_len
-                          : prefixHash?.prefix_len;
-                        if (
-                          checkpoint &&
-                          typeof checkpoint.checkpoint_id === "string" &&
-                          prefixHash &&
-                          prefixHash.algorithm === "xxh128" &&
-                          typeof prefixHash.value === "string" &&
-                          /^[0-9a-f]{32}$/.test(prefixHash.value) &&
-                          typeof prefixLen === "number" &&
-                          Number.isInteger(prefixLen) &&
-                          prefixLen > 0
-                        ) {
-                          prefixCheckpoints.push({
-                            checkpointStateHandle: checkpoint.checkpoint_id,
-                            checkpointLogicalPosition: Number.isInteger(checkpoint.logical_position)
-                              ? checkpoint.logical_position
-                              : prefixLen,
-                            checkpointDaemonPrefixHash: prefixHash.value,
-                            checkpointDaemonPrefixLen: prefixLen,
-                            boundary: typeof checkpoint.boundary === "string" ? checkpoint.boundary : undefined,
-                            boundaryIndex: Number.isInteger(checkpoint.boundary_index) ? checkpoint.boundary_index : undefined,
-                          });
-                        }
-                      }
-                      if (prefixCheckpoints.length > 0) {
-                        checkpointPrefixCheckpointsBySession.set(prefillMsg.session_id, prefixCheckpoints);
-                      }
-                    }
-                    continue;
-                  }
-                  if (prefillMsg?.type === "generate_batch_prefill_started") {
-                    continue;
-                  }
-                  if (prefillMsg?.type === "error") {
-                    throw new Error(prefillMsg.message || "generate_batch_prefill fanout error");
-                  }
-                  if (prefillMsg?.type === "generate_batch_prefill_unsupported") {
-                    throw new Error(prefillMsg.reason || "generate_batch_prefill fanout unsupported");
-                  }
-                  throw new Error(`unexpected generate_batch_prefill fanout response: ${prefillMsg?.type ?? "missing"}`);
-                }
-                if (!fanoutDone) throw new Error("generate_batch_prefill fanout did not complete");
-                if (fanoutAttachFromLeader) {
-                  prefillBatchMetrics.sharedPrefixFanoutGroups += 1;
-                  prefillBatchMetrics.sharedPrefixFanoutFollowers += sameWaveFanoutFollowers.length;
-                  prefillBatchMetrics.cacheHits += sameWaveFanoutFollowers.length;
-                  prefillBatchMetrics.runtimeCacheHits += sameWaveFanoutFollowers.length;
-                }
-              }
-              await releaseStateReservations(selectedReservationIds, "prefill materialized resident state");
-              const residentStateLimit = Number(genParams.server_prefill_batch?.resident_state_limit ?? selectedSessions.length);
-              const diskSpillAllowed = genParams.server_prefill_batch?.disk_spill_allowed === true;
-              const residentSessionIds = new Set(
-                selectedSessions.slice(0, Math.max(0, residentStateLimit)).map((session) => session.id),
-              );
-              const evictedSessionIds = diskSpillAllowed
-                ? new Set(selectedSessions.filter((session) => !residentSessionIds.has(session.id)).map((session) => session.id))
-                : new Set<string>();
-              const evictedRuntimeHandles = [...evictedSessionIds]
-                .map((sessionId) => runtimeStateHandlesBySession.get(sessionId))
-                .filter((handle): handle is string => typeof handle === "string" && handle.length > 0);
-              if (evictedRuntimeHandles.length > 0) {
-                await e.send({
-                  type: "release_sessions",
-                  id: `${reqId}-spill-release`,
-                  worker_key_id: activeWorkerKeyId ?? undefined,
-                  sessions: evictedRuntimeHandles,
-                });
-                const releaseMsg = await e.recv();
-                if (releaseMsg?.type === "release_sessions_done") {
-                  updateRuntimeWorkerMetrics((releaseMsg as any).model_worker);
-                  for (const handle of evictedRuntimeHandles) residentDecodeSessions.delete(handle);
-                }
-                stateCacheEvictionsTotal += evictedRuntimeHandles.length;
-                stateCacheRecomputeRequiredTotal += evictedRuntimeHandles.length;
-              }
-              const storeAttachableCheckpoint = async (
-                draft: RequestSessionDraft,
-                checkpointHandle: string | undefined,
-                runtimeLogicalPosition: number | undefined,
-                daemonPrefix: { hash: string; len: number } | undefined,
-              ) => {
-                if (!requestAllowsResidentPrefixCache || !checkpointHandle || !daemonPrefix) return;
-                const prefixLen = Math.min(
-                  draft.promptTokens.length,
-                  Math.max(0, daemonPrefix.len),
-                );
-                if (prefixLen <= 0) return;
-                const checkpointManifest = createPrefixCheckpointManifest({
-                  fingerprint: cacheKeyFingerprint,
-                  prefixTokens: draft.promptTokens.slice(0, prefixLen),
-                  stateKinds: draft.stateHandle.stateKinds,
-                  bytes: Math.max(1, prefixLen) * 16,
-                  runtimeState: "attachable",
-                  runtimeStateHandle: checkpointHandle,
-                  runtimeLogicalPosition,
-                  daemonPrefixHash: daemonPrefix.hash,
-                  daemonPrefixLen: daemonPrefix.len,
-                  createdAtMs: requestNowMs,
-                  lastUsedAtMs: Date.now(),
-                  hitCount: 0,
-                  checksums: checksumLookup,
-                });
-                const key = prefixCheckpointCacheKey(checkpointManifest);
-                const previous = servingWorkerStateCache.get(key);
-                if (
-                  previous?.runtimeStateHandle &&
-                  previous.runtimeStateHandle !== checkpointHandle
-                ) {
-                  await releaseResidentCheckpointHandles(
-                    [previous.runtimeStateHandle],
-                    "resident checkpoint replacement",
-                  );
-                }
-                residentCheckpointHandles.add(checkpointHandle);
-                servingWorkerStateCache.set(key, checkpointManifest);
-                await enforceResidentCheckpointCap();
-              };
-              const storeAttachablePrefixCheckpoints = async (
-                draft: RequestSessionDraft,
-                checkpoints: ResidentPrefixCheckpointOutcome[] | undefined,
-              ) => {
-                if (!checkpoints || checkpoints.length === 0) return;
-                for (const checkpoint of checkpoints) {
-                  await storeAttachableCheckpoint(
-                    draft,
-                    checkpoint.checkpointStateHandle,
-                    checkpoint.checkpointLogicalPosition,
-                    {
-                      hash: checkpoint.checkpointDaemonPrefixHash,
-                      len: checkpoint.checkpointDaemonPrefixLen,
-                    },
-                  );
-                  prefillBatchMetrics.semanticBoundaryCheckpoints += 1;
-                }
-              };
-              await storeAttachableCheckpoint(
-                serverPrefillSession,
-                checkpointStateHandlesBySession.get(reqId),
-                logicalPositionsBySession.get(reqId),
-                checkpointDaemonPrefixHashesBySession.get(reqId),
-              );
-              await storeAttachablePrefixCheckpoints(
-                serverPrefillSession,
-                checkpointPrefixCheckpointsBySession.get(reqId),
-              );
-              if (!requestAllowsResidentPrefixCache) {
-                const unusedCheckpointHandles = [
-                  ...checkpointStateHandlesBySession.values(),
-                  ...[...checkpointPrefixCheckpointsBySession.values()]
-                    .flat()
-                    .map((checkpoint) => checkpoint.checkpointStateHandle),
-                ];
-                await releaseRuntimeHandles(
-                  unusedCheckpointHandles,
-                  "unused prefix checkpoints",
-                );
-              }
-              if (evictedSessionIds.has(reqId)) {
-                genParams.prefill_already_done = false;
-                releaseRuntimeSessionId = null;
-                if (genParams.server_prefill_batch) {
-                  genParams.server_prefill_batch.runtime_dispatch = "daemon_serial_prefill_evicted";
-                  genParams.server_prefill_batch.runtime_dispatch_reason = "prefill_state_evicted_recompute";
-                  genParams.server_prefill_batch.runtime_dispatch_skipped_reason = "prefill_state_evicted_recompute";
-                }
-              } else {
-                genParams.session_id = runtimeStateHandlesBySession.get(reqId) ?? reqId;
-                genParams.prefill_already_done = true;
-                const prefilledPromptTokens = logicalPositionsBySession.get(reqId);
-                if (prefilledPromptTokens !== undefined) {
-                  genParams.prefilled_prompt_tokens = prefilledPromptTokens;
-                }
-                releaseRuntimeSessionId = genParams.session_id;
-              }
-              lastPrefillRuntimeDispatchSkippedReason = evictedSessionIds.has(reqId)
-                ? "prefill_state_evicted_recompute"
-                : "not_skipped";
-              recordPrefillBatchDispatch(
-                selectedSessions.length,
-                Number(genParams.server_prefill_batch?.daemon_prefill_tokens ?? 0),
-                Number(genParams.server_prefill_batch?.daemon_prefill_ms ?? 0),
-                genParams.server_prefill_batch?.daemon_prefill_plan,
-                genParams.server_prefill_batch?.daemon_prefill_backend,
-              );
-              for (const selected of selectedSessions) {
-                if (selected.id === reqId) continue;
-                const pending = pendingPrefillRequests.get(selected.id);
-                if (!pending) continue;
-                pendingPrefillRequests.delete(selected.id);
-                const runtimeStateHandle = runtimeStateHandlesBySession.get(selected.id);
-                const runtimeStateEvicted = evictedSessionIds.has(selected.id);
-                pending.resolve({
-                  prefillTokens: sessionPrefillTokens.get(selected.id) ?? 0,
-                  elapsedMs: genParams.server_prefill_batch?.daemon_prefill_ms ?? 0,
-                  selectedBatchSize: selectedSessions.length,
-                  plan: genParams.server_prefill_batch?.daemon_prefill_plan,
-                  backend: genParams.server_prefill_batch?.daemon_prefill_backend,
-                  runtimeStateHandle: runtimeStateEvicted ? undefined : runtimeStateHandle,
-                  checkpointStateHandle: checkpointStateHandlesBySession.get(selected.id),
-                  checkpointLogicalPosition: logicalPositionsBySession.get(selected.id),
-                  checkpointDaemonPrefixHash: checkpointDaemonPrefixHashesBySession.get(selected.id)?.hash,
-                  checkpointDaemonPrefixLen: checkpointDaemonPrefixHashesBySession.get(selected.id)?.len,
-                  checkpointPrefixCheckpoints: checkpointPrefixCheckpointsBySession.get(selected.id),
-                  runtimeStateEvicted,
-                });
-              }
-            } catch (err: any) {
-              const reason = err?.message ?? "daemon_serial_prefill_failed";
-              await releaseStateReservations(selectedReservationIds, "prefill failed");
-              if (
-                reason.includes("failed to attach checkpoint") ||
-                reason.includes("prefix hash mismatch") ||
-                reason.includes("checkpoint source session") ||
-                reason.includes("no resident session exists") ||
-                reason.includes("cached prefix length") && reason.includes("exceeds rendered token length")
-              ) {
-                await invalidateAttachFailure(
-                  serverPrefillSession.stateHandle.runtimeStateHandle,
-                  reason,
-                );
-                if (preserveDaemonStateForResidentCache) {
-                  await e.send({ type: "reset", worker_key_id: activeWorkerKeyId ?? undefined });
-                  await e.recv();
-                  if (maxResidentWorkers > 1 && activeWorkerKeyId) {
-                    clearWorkerResidentPrefixState(activeWorkerKeyId, "prefill attach failure reset");
-                  } else {
-                    clearResidentPrefixState("prefill attach failure reset");
-                  }
-                }
-              }
-              if (genParams.server_prefill_batch) {
-                genParams.server_prefill_batch.runtime_dispatch = "daemon_serial_prefill_failed";
-                genParams.server_prefill_batch.runtime_dispatch_reason = reason;
-                genParams.server_prefill_batch.runtime_dispatch_skipped_reason = "daemon_serial_prefill_failed";
-              }
-              delete genParams.session_id;
-              genParams.prefill_already_done = false;
-              releaseRuntimeSessionId = null;
-              lastPrefillRuntimeDispatchSkippedReason = "daemon_serial_prefill_failed";
-              for (const selected of selectedBatchSessions) {
-                if (selected.id === reqId) continue;
-                const pending = pendingPrefillRequests.get(selected.id);
-                if (!pending) continue;
-                pendingPrefillRequests.delete(selected.id);
-                pending.reservationId = undefined;
-                pending.reject(new Error(reason));
-              }
-              console.error(`[hipfire] generate_batch_prefill failed; falling back to generate: ${reason}`);
-            }
-          } else if (shouldQueueServerPrefillPending({
-            stream: body.stream,
-            eligible: prefillBatchGate.eligible,
-            hasScheduler: Boolean(servingWorkerScheduler),
-            queuePreviewReason,
-          })) {
-            const prefillSession = buildDaemonPrefillSession(serverPrefillSession);
-            let resolvePending!: (outcome: PendingPrefillOutcome) => void;
-            let rejectPending!: (err: Error) => void;
-            const pendingPromise = new Promise<PendingPrefillOutcome>((resolve, reject) => {
-              resolvePending = resolve;
-              rejectPending = reject;
-            });
-            pendingPromise.catch(() => {});
-            pendingPrefillRequests.set(reqId, {
-              session: serverPrefillSession,
-              prefillSession,
-              fanoutKey: requestAllowsResidentPrefixCache ? cacheKey ?? undefined : undefined,
-              reservationId: stateReservationId,
-              selected: false,
-              resolve: resolvePending,
-              reject: rejectPending,
-              promise: pendingPromise,
-            });
-            const waitMs = serverPrefillPendingWaitMs({
-              coalesceWaitMs: requestBatchPolicy?.coalesceWaitMs ?? serverPrefillBatch.waitMs,
-              maxProcessingMs: requestBatchPolicy?.maxProcessingMs ?? serverPrefillBatch.maxProcessingMs,
-            });
-            if (servingWorkerKey) {
-              schedulePendingPrefillFlush(
-                modelWorkerKeyId(servingWorkerKey),
-                requestBatchPolicy?.coalesceWaitMs ?? serverPrefillBatch.waitMs,
-              );
-            }
-            safeRelease();
-            let pendingOutcome: PendingPrefillOutcome | null = null;
-            try {
-              pendingOutcome = await Promise.race([
-                pendingPromise,
-                new Promise<null>((resolve) => setTimeout(() => resolve(null), waitMs)),
-              ]);
-            } finally {
-              await acquireLock();
-              lockReleased = false;
-            }
-            if (pendingOutcome === null) {
-              const pendingAfterWait = pendingPrefillRequests.get(reqId);
-              if (!pendingAfterWait || pendingAfterWait.selected) {
-                try {
-                  pendingOutcome = await Promise.race([
-                    pendingPromise,
-                    new Promise<null>((resolve) => setTimeout(() => resolve(null), waitMs)),
-                  ]);
-                } catch {
-                  pendingOutcome = null;
-                }
-              }
-            }
-            if (pendingOutcome) {
-              if (pendingOutcome.runtimeStateEvicted) {
-                genParams.prefill_already_done = false;
-              } else {
-                genParams.session_id = pendingOutcome.runtimeStateHandle ?? reqId;
-                genParams.prefill_already_done = true;
-                if (pendingOutcome.checkpointLogicalPosition !== undefined) {
-                  genParams.prefilled_prompt_tokens = pendingOutcome.checkpointLogicalPosition;
-                }
-              }
-              if (genParams.server_prefill_batch) {
-                genParams.server_prefill_batch.runtime_dispatch = pendingOutcome.runtimeStateEvicted
-                  ? "daemon_serial_prefill_evicted"
-                  : "daemon_serial_prefill";
-                genParams.server_prefill_batch.runtime_dispatch_reason = pendingOutcome.runtimeStateEvicted
-                  ? "prefill_state_evicted_recompute"
-                  : "prefill_done_decode_continuation";
-                genParams.server_prefill_batch.runtime_dispatch_skipped_reason = pendingOutcome.runtimeStateEvicted
-                  ? "prefill_state_evicted_recompute"
-                  : "not_skipped";
-                genParams.server_prefill_batch.daemon_prefill_tokens = pendingOutcome.prefillTokens;
-                genParams.server_prefill_batch.daemon_prefill_ms = pendingOutcome.elapsedMs;
-                genParams.server_prefill_batch.selected_batch_size = pendingOutcome.selectedBatchSize;
-                if (pendingOutcome.plan) genParams.server_prefill_batch.daemon_prefill_plan = pendingOutcome.plan;
-                if (pendingOutcome.backend) genParams.server_prefill_batch.daemon_prefill_backend = pendingOutcome.backend;
-                if (pendingOutcome.runtimeStateHandle) {
-                  genParams.server_prefill_batch.runtime_state_handle = pendingOutcome.runtimeStateHandle;
-                }
-              }
-              if (
-                requestAllowsResidentPrefixCache &&
-                pendingOutcome.checkpointStateHandle &&
-                pendingOutcome.checkpointDaemonPrefixHash &&
-                pendingOutcome.checkpointDaemonPrefixLen !== undefined &&
-                serverPrefillSession
-              ) {
-                const prefixLen = Math.min(
-                  prefillPromptTokens.length,
-                  Math.max(0, serverPrefillSession.cachedPrefixTokens + serverPrefillSession.suffixTokens.length),
-                );
-                if (prefixLen > 0) {
-                  const checkpointManifest = createPrefixCheckpointManifest({
-                    fingerprint: cacheKeyFingerprint,
-                    prefixTokens: prefillPromptTokens.slice(0, prefixLen),
-                    stateKinds,
-                    bytes: Math.max(1, prefixLen) * 16,
-                    runtimeState: "attachable",
-                    runtimeStateHandle: pendingOutcome.checkpointStateHandle,
-                    runtimeLogicalPosition: pendingOutcome.checkpointLogicalPosition,
-                    daemonPrefixHash: pendingOutcome.checkpointDaemonPrefixHash,
-                    daemonPrefixLen: pendingOutcome.checkpointDaemonPrefixLen,
-                    createdAtMs: requestNowMs,
-                    lastUsedAtMs: Date.now(),
-                    hitCount: 0,
-                    checksums: checksumLookup,
-                  });
-                  const key = prefixCheckpointCacheKey(checkpointManifest);
-                  const previous = servingWorkerStateCache.get(key);
-                  if (
-                    previous?.runtimeStateHandle &&
-                    previous.runtimeStateHandle !== pendingOutcome.checkpointStateHandle
-                  ) {
-                    await releaseResidentCheckpointHandles(
-                      [previous.runtimeStateHandle],
-                      "resident checkpoint replacement",
-                    );
-                  }
-                  residentCheckpointHandles.add(pendingOutcome.checkpointStateHandle);
-                  servingWorkerStateCache.set(key, checkpointManifest);
-                  await enforceResidentCheckpointCap();
-                }
-              }
-              if (
-                requestAllowsResidentPrefixCache &&
-                pendingOutcome.checkpointPrefixCheckpoints &&
-                serverPrefillSession
-              ) {
-                for (const checkpoint of pendingOutcome.checkpointPrefixCheckpoints) {
-                  const prefixLen = Math.min(
-                    prefillPromptTokens.length,
-                    Math.max(0, checkpoint.checkpointDaemonPrefixLen),
-                  );
-                  if (prefixLen <= 0) continue;
-                  const checkpointManifest = createPrefixCheckpointManifest({
-                    fingerprint: cacheKeyFingerprint,
-                    prefixTokens: prefillPromptTokens.slice(0, prefixLen),
-                    stateKinds,
-                    bytes: Math.max(1, prefixLen) * 16,
-                    runtimeState: "attachable",
-                    runtimeStateHandle: checkpoint.checkpointStateHandle,
-                    runtimeLogicalPosition: checkpoint.checkpointLogicalPosition,
-                    daemonPrefixHash: checkpoint.checkpointDaemonPrefixHash,
-                    daemonPrefixLen: checkpoint.checkpointDaemonPrefixLen,
-                    createdAtMs: requestNowMs,
-                    lastUsedAtMs: Date.now(),
-                    hitCount: 0,
-                    checksums: checksumLookup,
-                  });
-                  const key = prefixCheckpointCacheKey(checkpointManifest);
-                  const previous = servingWorkerStateCache.get(key);
-                  if (
-                    previous?.runtimeStateHandle &&
-                    previous.runtimeStateHandle !== checkpoint.checkpointStateHandle
-                  ) {
-                    await releaseResidentCheckpointHandles(
-                      [previous.runtimeStateHandle],
-                      "resident checkpoint replacement",
-                    );
-                  }
-                  residentCheckpointHandles.add(checkpoint.checkpointStateHandle);
-                  servingWorkerStateCache.set(key, checkpointManifest);
-                  prefillBatchMetrics.semanticBoundaryCheckpoints += 1;
-                  await enforceResidentCheckpointCap();
-                }
-              }
-              releaseRuntimeSessionId = pendingOutcome.runtimeStateEvicted
-                ? null
-                : pendingOutcome.runtimeStateHandle ?? reqId;
-              lastPrefillRuntimeDispatchSkippedReason = pendingOutcome.runtimeStateEvicted
-                ? "prefill_state_evicted_recompute"
-                : "not_skipped";
-              lastSelectedBatchSize = pendingOutcome.selectedBatchSize;
-              if (pendingOutcome.plan) lastPrefillDaemonPlan = pendingOutcome.plan;
-              if (pendingOutcome.backend) lastPrefillDaemonBackend = pendingOutcome.backend;
-              lastPrefillTokens = pendingOutcome.prefillTokens;
-              lastPrefillMs = pendingOutcome.elapsedMs;
-              lastPrefillTokS = pendingOutcome.elapsedMs > 0
-                ? (pendingOutcome.prefillTokens * 1000) / pendingOutcome.elapsedMs
-                : 0;
-            } else {
-              const pendingBeforeDelete = pendingPrefillRequests.get(reqId);
-              if (pendingBeforeDelete?.reservationId) {
-                await releaseStateReservations([pendingBeforeDelete.reservationId], "prefill pending timeout");
-              }
-              pendingPrefillRequests.delete(reqId);
-              servingWorkerScheduler?.cancel(reqId);
-              prefillBatchMetrics.skipped += 1;
-              if (genParams.server_prefill_batch) {
-                genParams.server_prefill_batch.runtime_dispatch = "daemon_serial_prefill_timeout";
-                genParams.server_prefill_batch.runtime_dispatch_reason = "coalesce_wait_elapsed_without_batch";
-                genParams.server_prefill_batch.runtime_dispatch_skipped_reason = "daemon_serial_prefill_timeout";
-              }
-              lastPrefillRuntimeDispatchSkippedReason = "daemon_serial_prefill_timeout";
-            }
-          }
         }
 
         // Parse tool calls from model output: <tool_call>{"name":..., "arguments":...}</tool_call>
@@ -5973,6 +2570,39 @@ async function serve(port: number, host: string) {
         // This is a stopgap. The proper fix is MQ4 calibration retraining with
         // tool-call samples weighted on structured tokens; tracked in
         // MANUAL_REVIEW.md against #111.
+        // Detect mid-tool-call truncation. The model emitted `<tool_call>`
+        // (one or more) but the count of `</tool_call>` closers is lower,
+        // meaning the JSON inside an open block was cut off when decode
+        // hit the `max_tokens` cap. The OpenAI-correct signal is
+        // `finish_reason: "length"` (truncation), but without an extra
+        // hint clients can't distinguish "model wrote a long answer that
+        // hit the cap" from "model was midway through a tool call". We
+        // attach a `truncation` object so Pi-style clients can offer the
+        // user a single-click retry with a larger `max_tokens` budget.
+        //
+        // Slack of 4 tokens absorbs daemon-side post-loop trailer emits
+        // (`<|im_end|>\n` etc. that get force-flushed after the decode
+        // loop terminates on cap).
+        function detectToolCallTruncation(
+          text: string,
+          decodedTokens: number,
+          maxTokensCap: number,
+        ): { reason: string; max_tokens_used: number; suggested_max_tokens: number } | null {
+          const opens = (text.match(/<tool_call>/g) || []).length;
+          const closes = (text.match(/<\/tool_call>/g) || []).length;
+          if (opens <= closes) return null;
+          if (decodedTokens < maxTokensCap - 4) return null;
+          return {
+            reason: "max_tokens_in_tool_call",
+            max_tokens_used: decodedTokens,
+            // 4× the requested budget, capped at 32k. Empirically a single
+            // `write` tool call containing a small file (~500 LoC) needs
+            // 2-4k tokens; a 4× bump from the standard 4096 default
+            // covers the typical case without unbounded blow-up.
+            suggested_max_tokens: Math.min(Math.max(maxTokensCap * 4, 4096), 32768),
+          };
+        }
+
         function parseToolCalls(text: string): { content: string | null; tool_calls: any[] | null } {
           if (!text.includes("<tool_call>")) return { content: text, tool_calls: null };
           const pattern = /<tool_call>\s*(.*?)\s*<\/tool_call>|<tool_call>\s*(.*)/gs;
@@ -5994,6 +2624,33 @@ async function serve(port: number, host: string) {
             while (raw.startsWith("<tool_call>")) {
               raw = raw.slice("<tool_call>".length).trimStart();
               nestedStripped++;
+            }
+            // Inner-block recovery: when the outer match captured a
+            // garbled prelude with a NESTED `<tool_call>...</tool_call>`
+            // inside it (e.g. qwen3.6:27b sometimes emits
+            // `<tool_call>\n<|im_start|>name: bash\n</think>\n\n<tool_call>\n{json}\n</tool_call>`),
+            // the outer regex matched the OUTER `</tool_call>` and we
+            // got the entire garbled prelude + the inner block as one
+            // payload. Strip up to the LAST `<tool_call>` opener and
+            // try parsing from there — recovers the model's intent
+            // when it self-corrected mid-stream.
+            const lastInnerOpen = raw.lastIndexOf("<tool_call>");
+            if (lastInnerOpen >= 0) {
+              const innerRaw = raw.slice(lastInnerOpen + "<tool_call>".length).trimStart();
+              const innerClose = innerRaw.indexOf("</tool_call>");
+              const candidate = (innerClose >= 0 ? innerRaw.slice(0, innerClose) : innerRaw).trim();
+              if (candidate) {
+                const innerParsed = parseOneToolCall(candidate);
+                if (innerParsed) {
+                  repaired++;
+                  tool_calls.push({
+                    id: `call_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+                    type: "function",
+                    function: { name: innerParsed.name, arguments: JSON.stringify(innerParsed.arguments || {}) }
+                  });
+                  continue;
+                }
+              }
             }
             if (!raw) continue;
             const parsed = parseOneToolCall(raw);
@@ -6019,7 +2676,20 @@ async function serve(port: number, host: string) {
         // null when the payload is unrecoverable. `repaired === true` means we
         // had to coerce off-spec JSON / XML-tag shapes; valid OpenAI-spec input
         // sets repaired=false.
-        function parseOneToolCall(raw: string): { name: string; arguments: any; repaired: boolean } | null {
+        function parseOneToolCall(rawInput: string): { name: string; arguments: any; repaired: boolean } | null {
+          // Sanitize ChatML special-token leakage. qwen3.6:27b occasionally
+          // emits `<|im_start|>` / `<|im_end|>` / `<|endoftext|>` literally
+          // INSIDE the tool-call body (tokenizer quirk where the special-
+          // token boundary glues onto the JSON key). These tokens should
+          // never appear inside a tool call; strip them before any form
+          // probe so the cleaned payload has a chance at JSON.parse.
+          let raw = rawInput
+            .replace(/<\|im_start\|>/g, "")
+            .replace(/<\|im_end\|>/g, "")
+            .replace(/<\|endoftext\|>/g, "")
+            .replace(/<\|im_sep\|>/g, "")
+            .trim();
+          const sanitized = raw !== rawInput.trim();
           // Form 1: spec-compliant {"name": ..., "arguments": {...}}.
           try {
             const tc = JSON.parse(raw);
@@ -6108,6 +2778,63 @@ async function serve(port: number, host: string) {
             // dropped when only the name is recoverable.
             return { name: nm[1], arguments: {}, repaired: true };
           }
+          // Form 4: last-resort field-level extraction. Some models
+          // (qwen3.6:27b specifically) emit broken-JSON payloads where
+          // the outer `{` is missing and/or special tokens corrupt the
+          // structure (e.g. `<|im_start|>name": "write", "arguments":
+          // {"path": "..."}}`). Pull `name` and `arguments` via regex
+          // independently — if BOTH are present in any form, we can
+          // synthesize a valid tool call.
+          //
+          // Match `"name": "ident"` with the leading/trailing quote
+          // OPTIONAL on the key. qwen3.6:27b's failure mode is the
+          // special token REPLACING the opening `"` of the `name` key
+          // (`<|im_start|>name": "X"` after sanitization leaves
+          // `name": "X"` — note the unbalanced quotes around `name`).
+          // Restrict the captured identifier to JSON-style identifiers
+          // so we don't match arbitrary text after the literal `name`.
+          // `(?<![A-Za-z_])` word-boundary lookbehind so the regex
+          // doesn't match `name` inside other JSON keys like
+          // `firstname`, `displayname`, `parameter_name`. Without it
+          // a payload like `{"firstname":"X","name":"read"}` would
+          // capture "X" as the function name instead of "read". The
+          // daemon's `extract_tool_call_name_fallback` does the same
+          // check via a key-position pre-byte test (`daemon.rs`).
+          const nameMatch = raw.match(/(?<![A-Za-z_])["']?name["']?\s*:\s*["']([A-Za-z_][\w.-]*)["']/);
+          if (nameMatch) {
+            const fname = nameMatch[1];
+            // Try to locate the `"arguments":` key and grab the balanced
+            // object after it. If no such key, fall back to the FIRST
+            // balanced `{...}` in the payload (some shapes have args
+            // inlined as the top-level body).
+            const argsLeader = raw.match(/["']arguments["']\s*:\s*/);
+            let args: any = null;
+            if (argsLeader && argsLeader.index !== undefined) {
+              const tail = raw.slice(argsLeader.index + argsLeader[0].length);
+              args = extractFirstJsonObject(tail);
+            }
+            if (args === null) args = extractFirstJsonObject(raw);
+            if (args === null) {
+              // No strict-valid args object. If a brace-balanced object IS
+              // present, it's a model formatting glitch (trailing comma,
+              // unquoted key, …) — keep the call with empty args (legacy).
+              // Otherwise the call was truncated mid-args (max_tokens / grammar
+              // force-close): drop it so the emission surfaces as content +
+              // finish_reason rather than a phantom `write({})` that fails
+              // schema validation (the write-tool empty-args incident). Mirrors
+              // daemon.rs:extract_tool_calls_from_text.
+              if (jsonObjectIsComplete(raw)) return { name: fname, arguments: {}, repaired: true };
+              return null;
+            }
+            return { name: fname, arguments: args, repaired: true };
+          }
+          if (sanitized) {
+            // Last-ditch: we stripped tokens but couldn't find a name.
+            // Surface the sanitization on stderr so operators see why a
+            // visible `<tool_call>` block in the daemon stream didn't
+            // produce a structured call.
+            console.error(`[hipfire] tool_call: stripped ChatML special tokens but could not extract a name (raw=${rawInput.slice(0, 100).replace(/\n/g, "\\n")})`);
+          }
           return null;
         }
 
@@ -6157,7 +2884,35 @@ async function serve(port: number, host: string) {
           return null;
         }
 
-        if (body.stream) {
+        // True iff a brace-balanced `{...}` exists in `s` — the object is
+        // COMPLETE (not truncated) even when it isn't strict JSON. Lets Form 4
+        // distinguish a model formatting glitch (trailing comma / unquoted key
+        // — keep the call) from a call cut off mid-args (drop it). Mirrors
+        // daemon.rs:tool_call_args_object_complete.
+        function jsonObjectIsComplete(s: string): boolean {
+          const start = s.indexOf("{");
+          if (start < 0) return false;
+          let depth = 0, inStr = false, escape = false;
+          for (let i = start; i < s.length; i++) {
+            const ch = s[i];
+            if (inStr) {
+              if (escape) { escape = false; continue; }
+              if (ch === "\\") { escape = true; continue; }
+              if (ch === '"') inStr = false;
+              continue;
+            }
+            if (ch === '"') { inStr = true; continue; }
+            if (ch === "{") depth++;
+            else if (ch === "}") { depth--; if (depth === 0) return true; }
+          }
+          return false;
+        }
+
+        // hunt3 C-1: OpenAI `stream` is a strict boolean — a JSON string
+        // "false" is JS-truthy and would wrongly select the streaming path.
+        // Match the include_usage===true convention.
+        const wantStream = body.stream === true;
+        if (wantStream) {
           const enc = new TextEncoder();
           let completionTokens = 0;
           let streamCancelled = false;
@@ -6186,9 +2941,43 @@ async function serve(port: number, host: string) {
                 if (visibleChunkSent || streamCancelled) return;
                 try { ctrl.enqueue(enc.encode(": prefill\n\n")); } catch {}
               }, 10_000);
+              // Force-answer watchdog: if a thinking-heavy turn runs longer
+              // than the budget, ask the daemon to STOP THINKING and commit
+              // to the answer (it splices the think-close continuation) rather
+              // than letting the client give up and terminate the stream
+              // mid-think. One-shot. Disable with HIPFIRE_FORCE_ANSWER_SECS=0.
+              const forceAnswerSecs = parseInt(process.env.HIPFIRE_FORCE_ANSWER_SECS ?? "180", 10);
+              let forceAnswerSent = false;
+              const forceAnswerTimer = forceAnswerSecs > 0
+                ? setTimeout(async () => {
+                    if (forceAnswerSent || streamCancelled) return;
+                    forceAnswerSent = true;
+                    console.error(`[hipfire] force-answer after ${forceAnswerSecs}s (reqId=${reqId}) — asking daemon to close <think> and answer`);
+                    try { await e.send({ type: "force_answer", id: reqId }); } catch (err: any) {
+                      console.error(`[hipfire] force_answer send failed: ${err?.message || err}`);
+                    }
+                  }, forceAnswerSecs * 1000)
+                : null;
               try {
+                // open_think injects the opening <think> into the PROMPT, so the
+                // output begins inside the think span (no <think> token to detect
+                // at 2725). Start in-think so the leading reasoning streams as
+                // reasoning_content and is split off content at the first </think>.
                 let inThink = genParams.assistant_prefix === "open_think";
                 let stripNextLeadingNl = false;
+                // Track whether we've emitted any visible content yet. Used
+                // to detect an orphan `</think>` opener — when the daemon
+                // prefills `<think>\n\n</think>\n\n` for `enable_thinking=false`,
+                // the model often resumes by emitting ANOTHER `</think>\n\n`
+                // (training-distribution artifact, the model learned the
+                // close pattern follows the open). Without an orphan-strip
+                // check, that `</think>` leaks into delta.content and a
+                // client like pi-coding-agent stores it in conversation
+                // history verbatim — which then defeats the asst-turn
+                // cache fingerprint on the next request. (Lookup-side
+                // fingerprint also applies the same strip, so the cache
+                // still hits even if a stale client preserves the orphan.)
+                let firstAssistantChunk = true;
                 // When tools are present, accumulate full output for tool-call parsing
                 let accumulated = hasTool ? "" : null;
                 // V4F arm emits structured `tool_calls` events via the DSML
@@ -6238,6 +3027,18 @@ async function serve(port: number, host: string) {
                     text = text.replace(/<\|im_end\|>/g, "");
                     if (!text) continue;
                     if (stripNextLeadingNl) { text = text.replace(/^\n+/, ""); stripNextLeadingNl = false; if (!text) continue; }
+                    if (firstAssistantChunk) {
+                      // Orphan `</think>` opener strip — see firstAssistantChunk
+                      // comment above. Only fires before any visible content
+                      // has been emitted, so a legitimate `</think>` literal
+                      // later in a code block isn't affected.
+                      const stripped = text.replace(/^\s*<\/think>\s*/, "");
+                      if (stripped !== text) {
+                        text = stripped;
+                        if (!text) continue;
+                      }
+                      firstAssistantChunk = false;
+                    }
                     if (accumulated !== null) {
                       accumulated += text; // buffer for tool-call parsing at end
                     } else {
@@ -6261,11 +3062,40 @@ async function serve(port: number, host: string) {
                       visibleChunkSent = true;
                     }
                   } else if (msg.type === "tool_calls") {
-                    // V4F daemon arm emits structured `tool_calls` events
-                    // from the DSML StreamParser. Convert each call into
-                    // an OpenAI-format tool_call SSE delta. We emit one
-                    // SSE chunk per call so order is preserved; each call
-                    // gets a synthetic `call_<index>` id.
+                    // Daemon-side structured tool_calls events. Two emitters:
+                    //   - V4F's DSML StreamParser (token-by-token)
+                    //   - qwen35 daemon (single event after decode, from
+                    //     `extract_tool_calls_from_text` over the full
+                    //     decoded text — same parser that hashes the
+                    //     asst-turn cache fingerprint, so what we emit
+                    //     here is byte-identical to what Pi echoes back
+                    //     and what we'll look up next turn).
+                    //
+                    // For qwen35 the text tokens streamed BEFORE this
+                    // event include the `<tool_call>{...}</tool_call>`
+                    // markup raw — buffered in `accumulated` but not yet
+                    // sent on the wire. We split the prose (text before
+                    // first `<tool_call>`) and emit it as a single
+                    // content chunk before the structured tool_calls
+                    // chunks, so the SSE order is: prose → tool_calls →
+                    // done (OpenAI canonical). V4F's stream already
+                    // stripped the markup token-side, so the split is a
+                    // no-op in practice for it.
+                    if (accumulated !== null && accumulated.length > 0) {
+                      const tcIdx = accumulated.indexOf("<tool_call>");
+                      const prose = (tcIdx >= 0 ? accumulated.slice(0, tcIdx) : accumulated).trim();
+                      if (prose) {
+                        ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                          id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                          choices: [{ index: 0, delta: { content: prose }, finish_reason: null }]
+                        })}\n\n`));
+                        visibleChunkSent = true;
+                      }
+                      // Mark accumulated as already-flushed for the done
+                      // handler so it doesn't double-emit on the
+                      // structuredToolCallsEmitted path.
+                      accumulated = "";
+                    }
                     const calls = Array.isArray(msg.calls) ? msg.calls : [];
                     for (let i = 0; i < calls.length; i++) {
                       const c = calls[i] as { name: string; arguments: unknown };
@@ -6312,6 +3142,7 @@ async function serve(port: number, host: string) {
                         id: reqId, object: "chat.completion.chunk", created, model: modelName,
                         choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "tool_calls" }],
                         ...includeUsage && { usage: buildUsage(msg, completionTokens) },
+                        timings: buildTimings(msg),
                       })}\n\n`));
                       ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
                       ctrl.close();
@@ -6320,6 +3151,14 @@ async function serve(port: number, host: string) {
                     // When tools are present, parse accumulated text for tool calls
                     if (accumulated !== null) {
                       const parsed = parseToolCalls(accumulated);
+                      // Check for mid-tool-call truncation BEFORE falling back
+                      // to finish_reason="stop". If parseToolCalls returned no
+                      // tool_calls but the text contains an unclosed
+                      // `<tool_call>` block AND decode hit the cap, this is a
+                      // budget-truncation, not a natural stop.
+                      const truncation = !parsed.tool_calls
+                        ? detectToolCallTruncation(accumulated, (msg as any).tokens ?? 0, requestMaxTokens)
+                        : null;
                       if (parsed.tool_calls) {
                         if (parsed.content) {
                           ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
@@ -6337,6 +3176,7 @@ async function serve(port: number, host: string) {
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
                           choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "tool_calls" }],
                           ...includeUsage && { usage: buildUsage(msg, completionTokens) },
+                          timings: buildTimings(msg),
                         })}\n\n`));
                       } else {
                         if (accumulated) {
@@ -6345,19 +3185,27 @@ async function serve(port: number, host: string) {
                             choices: [{ index: 0, delta: { content: accumulated }, finish_reason: null }]
                           })}\n\n`));
                         }
-                        ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                        const finishReason = truncation
+                          ? "length"
+                          : (daemonFR ?? "stop");
+                        const finalChunk: any = {
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                          choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "stop" }],
-                          ...includeUsage && { usage: buildUsage(msg, completionTokens) },
-                        })}\n\n`));
+                          choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+                        };
+                        if (includeUsage) finalChunk.usage = buildUsage(msg, completionTokens);
+                        if (truncation) finalChunk.truncation = truncation;
+                        // Surface perf/spec-decode metrics on the tool-call final chunk too
+                        // (matches the plain-text branch) so benchmarks see timings on
+                        // tool-calling turns.
+                        finalChunk.timings = buildTimings(msg);
+                        ctrl.enqueue(enc.encode(`data: ${JSON.stringify(finalChunk)}\n\n`));
                       }
                     } else {
-                      const { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms } = msg;
                       ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                         id: reqId, object: "chat.completion.chunk", created, model: modelName,
                         choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "stop" }],
                         ...includeUsage && { usage: buildUsage(msg, completionTokens) },
-                        timings: { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms }
+                        timings: buildTimings(msg)
                       })}\n\n`));
                     }
                     ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
@@ -6380,39 +3228,99 @@ async function serve(port: number, host: string) {
                 }
                 // Safety: if loop exits without done/error (shouldn't happen), close stream
                 try { ctrl.close(); } catch {}
+              } catch (err: any) {
+                // hunt3 H-B: daemon crashed mid-stream (recv threw
+                // DaemonClosedError). Headers are already sent so we can't
+                // change status; surface the error in the stream body and
+                // restart the daemon so the NEXT request reloads cleanly
+                // instead of writing to a dead stdin.
+                try {
+                  ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                    error: { message: (err instanceof DaemonClosedError) ? "daemon crashed mid-generation" : (err?.message || "internal error"), type: "server_error" }
+                  })}\n\n`));
+                  ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
+                } catch {}
+                try { ctrl.close(); } catch {}
+                if (err instanceof DaemonClosedError) {
+                  current = null; currentMaxSeq = null; modelHasVL = false;
+                  currentArch = null; currentCacheCapable = null;
+                  try { await e.restart(); } catch (re: any) {
+                    console.error(`[hipfire] daemon restart failed: ${re?.message ?? re}`);
+                  }
+                }
               } finally {
                 clearInterval(heartbeat);
+                if (forceAnswerTimer) clearTimeout(forceAnswerTimer);
                 e.generating = false;
                 safeRelease();
               }
             },
-            cancel() { streamCancelled = true; } // lock released in finally after generation drains
+            // Streaming branch cancel. Set the local flag so the for-await
+            // loop drains daemon events without writing more SSE chunks,
+            // AND send `{type:"abort","id":"<reqId>"}` to the daemon so its
+            // prefill chunk loop bails at the next checkpoint. Same protocol
+            // as the non-stream branch — see project_daemon_abort_protocol
+            // memory + cli/index.ts:3034. Without this, Pi/opencode/etc.
+            // dropping a streaming connection mid-prefill leaves the daemon
+            // burning the full 23K-token re-prefill while no client is
+            // listening, locking out the next request for several minutes.
+            async cancel() {
+              console.error(`[hipfire] stream client cancelled (reqId=${reqId}) — sending abort to daemon`);
+              streamCancelled = true;
+              try {
+                await e.send({ type: "abort", id: reqId });
+                console.error(`[hipfire] abort sent (reqId=${reqId})`);
+              } catch (err: any) {
+                console.error(`[hipfire] stream abort send failed: ${err?.message || err}`);
+              }
+            }
           }), { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } });
         }
 
-        if (
-          currentArch !== "deepseek4" &&
-          preserveDaemonStateForRuntimePrefill &&
-          genParams.prefill_already_done !== true
-        ) {
-          const resetWorkerKeyId = activeWorkerKeyId ?? undefined;
-          if (!resetWorkerKeyId || !hasPendingWorkerRuntimeRequests(resetWorkerKeyId)) {
-            await e.send({ type: "reset", worker_key_id: resetWorkerKeyId }); await e.recv();
-            if (maxResidentWorkers > 1 && activeWorkerKeyId) {
-              clearWorkerResidentPrefixState(activeWorkerKeyId, "prefill fallback reset");
-            } else {
-              clearResidentPrefixState("prefill fallback reset");
-            }
-          }
-        }
-
+        // Non-stream chat-completion with heartbeat. The OpenAI-style
+        // non-streaming response is a single JSON body, but Bun's
+        // server-side connection idleTimeout is capped at 255s — and
+        // on 27B with a 30K+-token agent context the daemon's prefill
+        // (one synchronous device call per chunk, zero events until
+        // first sampled token) sits silent for 3–5 minutes. The Bun
+        // socket then idle-closes and the client (Pi, opencode, etc.)
+        // sees "terminated".
+        //
+        // Fix: deliver the response body via a `ReadableStream` and
+        // emit a single space byte every 10s before the JSON is ready.
+        // JSON RFC 8259 §2 allows whitespace anywhere between value
+        // tokens, so a leading-space prefix parses identically on any
+        // lenient JSON client. Each byte enqueued resets Bun's idle
+        // timer. Errors thrown inside the worker land in the catch
+        // and emit a JSON error body (status stays 200 because the
+        // header has already been sent — clients should check for the
+        // `error` field, matching the existing streaming-error
+        // convention).
+        const nsEnc = new TextEncoder();
+        // `nsClientAborted` is set by the ReadableStream's `cancel()`
+        // callback when the client closes the socket (curl `-m` timeout,
+        // Pi / opencode giving up, etc.). The worker checks this flag in
+        // its event loop and stops processing tokens / building the
+        // response — but it MUST keep draining `e.generate` until the
+        // daemon's `done` event lands. Skipping the drain leaves the
+        // EngineConnection with stale events queued for the NEXT
+        // request, which would corrupt that request's response.
+        // Same pattern as the streaming branch (cli/index.ts:2518).
+        let nsClientAborted = false;
+        const nsResponse = new Response(new ReadableStream({
+          async start(ctrl) {
+            let bodyDelivered = false;
+            const heartbeat = setInterval(() => {
+              if (bodyDelivered) return;
+              try { ctrl.enqueue(nsEnc.encode(" ")); } catch {}
+            }, 10_000);
+            try {
         let content = "";
         let completionTokens = 0;
         let promptTokens = 0;
         let cachedTokens = 0;
         let daemonError: string | null = null;
-        let daemonFinishReason: string | null = null;
-        let decodedByBatch = false;
+        e.generating = true;
         // V4F arm emits structured `tool_calls` events from the DSML
         // StreamParser. Capture them here so the non-streaming chat-
         // completion response can carry an OpenAI-format `tool_calls`
@@ -6426,354 +3334,84 @@ async function serve(port: number, host: string) {
         // Use `reasoningContent` for the accumulated `<think>…</think>`
         // body that surfaces under `message.reasoning_content` below.
         let reasoningContent = "";
-        let decodeBatchIneligibleReason = "not_eligible";
-        const decodeBatchEligible = (() => {
-          if (!serverPrefillBatch.enabled) {
-            decodeBatchIneligibleReason = "prefill_batch_disabled";
-            return false;
+        let daemonFinishReason: string | null = null;
+        for await (const msg of e.generate(genParams)) {
+          if (nsClientAborted) continue; // drain remaining daemon events, don't accumulate
+          if (msg.type === "token") { content += msg.text; completionTokens++; }
+          else if (msg.type === "reasoning") {
+            // V4F's StreamParser splits `<think>…</think>` content out
+            // as `reasoning` events. Accumulate so the non-stream chat
+            // completion response can surface it under
+            // `message.reasoning_content` — without this the reasoning
+            // text was silently dropped on every think-mode V4F turn.
+            if (typeof msg.text === "string") reasoningContent += msg.text;
           }
-          if (body.stream === true) {
-            decodeBatchIneligibleReason = "streaming";
-            return false;
-          }
-          if (tools.length > 0) {
-            decodeBatchIneligibleReason = "tools";
-            return false;
-          }
-          if (requestImages.length > 0) {
-            decodeBatchIneligibleReason = "images";
-            return false;
-          }
-          if (!isQwen35RuntimeArch(currentArch)) {
-            decodeBatchIneligibleReason = `unsupported_arch:${currentArch ?? "unknown"}`;
-            return false;
-          }
-          if (genParams.prefill_already_done !== true) {
-            decodeBatchIneligibleReason = "prefill_not_done";
-            return false;
-          }
-          if (typeof releaseRuntimeSessionId !== "string") {
-            decodeBatchIneligibleReason = "missing_runtime_state_handle";
-            return false;
-          }
-          if (genParams.assistant_prefix !== "closed_think") {
-            decodeBatchIneligibleReason = `assistant_prefix:${genParams.assistant_prefix ?? "none"}`;
-            return false;
-          }
-          if ((genParams.temperature ?? 0) > 1e-6) {
-            decodeBatchIneligibleReason = "non_greedy_temperature";
-            return false;
-          }
-          if ((body.top_p ?? effective.top_p) !== 1) {
-            decodeBatchIneligibleReason = "non_greedy_top_p";
-            return false;
-          }
-          decodeBatchIneligibleReason = "eligible";
-          return true;
-        })();
-        if (decodeBatchEligible && servingWorkerKey && releaseRuntimeSessionId) {
-          decodeBatchMetrics.eligible += 1;
-          const decodeScheduler = getWorkerDecodeScheduler(servingWorkerKey);
-          const workerKeyId = modelWorkerKeyId(servingWorkerKey);
-          const memoryReject = admitResidentSessionOrReject(
-            workerKeyId,
-            requiredPhysicalCap,
-            "decode_admission",
-            0,
-          );
-          if (memoryReject) {
-            if (releaseRuntimeSessionId) {
-              await releaseRuntimeHandles([releaseRuntimeSessionId], "decode admission memory pressure", workerKeyId);
-              releaseRuntimeSessionId = null;
-            }
-            safeRelease();
-            return memoryReject;
-          }
-          const decodeLogicalPosition = Number(genParams.prefilled_prompt_tokens ?? prefillPromptTokens.length);
-          const active: ActiveDecodeSession = {
-            id: reqId,
-            workerKeyId,
-            priority: requestPriority,
-            runtimeStateHandle: releaseRuntimeSessionId,
-            logicalPosition: decodeLogicalPosition,
-            cachedPrefixTokens: decodeLogicalPosition,
-            generatedTokens: 0,
-            maxTokens: requestMaxTokens,
-          };
-          let resolveDecode!: (outcome: PendingDecodeOutcome) => void;
-          let rejectDecode!: (err: Error) => void;
-          const decodePromise = new Promise<PendingDecodeOutcome>((resolve, reject) => {
-            resolveDecode = resolve;
-            rejectDecode = reject;
-          });
-          decodePromise.catch(() => {});
-          pendingDecodeRequests.set(reqId, {
-            active,
-            promptTokens: prefillPromptTokens.length,
-            cachedTokens: cachePrefixLen,
-            selected: false,
-            resolve: resolveDecode,
-            reject: rejectDecode,
-            promise: decodePromise,
-          });
-          try {
-            decodeScheduler?.enqueue(active);
-          } catch (err: any) {
-            pendingDecodeRequests.delete(reqId);
-            decodeBatchMetrics.skipped += 1;
-            decodeBatchMetrics.lastSkippedReason = "decode_scheduler_backpressure";
-            decodeBatchMetrics.activeSessions = pendingDecodeRequests.size;
-            if (releaseRuntimeSessionId) {
-              await releaseRuntimeHandles([releaseRuntimeSessionId], "decode scheduler backpressure", workerKeyId);
-              releaseRuntimeSessionId = null;
-            }
-            safeRelease();
-            return Response.json(
-              { error: err?.message ?? "decode scheduler backpressure" },
-              { status: 503 },
-            );
-          }
-          decodeBatchMetrics.activeSessions = pendingDecodeRequests.size;
-          safeRelease();
-          await new Promise((resolve) => setTimeout(resolve, Math.min(25, serverPrefillBatch.waitMs)));
-          await acquireLock();
-          lockReleased = false;
-          let decodeOutcome: PendingDecodeOutcome | null = null;
-          const pendingSelf = pendingDecodeRequests.get(reqId);
-          if (pendingSelf && !pendingSelf.selected && decodeScheduler) {
-            const selected = decodeScheduler.nextDecodeBatch({ nowMs: Date.now() });
-            if (selected && selected.sessions.some((session) => session.id === reqId)) {
-              decodeBatchMetrics.selected += 1;
-              decodeBatchMetrics.selectedBatchSize = selected.sessions.length;
-              for (const selectedSession of selected.sessions) {
-                const pending = pendingDecodeRequests.get(selectedSession.id);
-                if (pending) pending.selected = true;
-              }
-              const states = new Map(selected.sessions.map((session) => [
-                session.id,
-                {
-                  ...session,
-                  content: "",
-                  done: false,
-                  finishReason: "length" as "stop" | "length",
-                },
-              ]));
-              try {
-                while ([...states.values()].some((state) => !state.done && state.generatedTokens < state.maxTokens)) {
-                  const activeSessions = [...states.values()].filter((state) => !state.done && state.generatedTokens < state.maxTokens);
-                  const batchId = `decode-${reqId}-${decodeBatchMetrics.totalBatches + 1}`;
-                  const decodeCachedPrefixTokens = activeSessions.reduce(
-                    (sum, state) => sum + Math.max(0, state.cachedPrefixTokens),
-                    0,
-                  );
-                  await e.send({
-                    type: "generate_batch_decode_step",
-                    id: `${batchId}-step`,
-                    batch_id: batchId,
-                    worker_key_id: workerKeyId,
-                    cached_prefix_tokens: decodeCachedPrefixTokens,
-                    sessions: activeSessions.map((state) => ({
-                      id: state.id,
-                      session_id: state.runtimeStateHandle,
-                      logical_position: state.logicalPosition,
-                      max_tokens_remaining: state.maxTokens - state.generatedTokens,
-                    })),
-                  });
-                  const stepById = new Map<string, any>();
-                  let backend: string | undefined;
-                  let elapsedMs = 0;
-                  let chunkCount = 0;
-                  let chunkSize = 0;
-                  let compatibleStateKinds: string[] = [];
-                  let decodeFallbackReason = "not_reported";
-                  let cachedPrefixTokens = 0;
-                  for (let i = 0; i < activeSessions.length + 4; i++) {
-                    const decodeMsg = await e.recv();
-                    if (decodeMsg?.type === "generate_batch_decode_step_session_done") {
-                      stepById.set(decodeMsg.session_id, decodeMsg);
-                    } else if (decodeMsg?.type === "generate_batch_decode_step_done" && decodeMsg.batch_id === batchId) {
-                      backend = typeof decodeMsg.backend === "string" ? decodeMsg.backend : backend;
-                      chunkCount = typeof decodeMsg.chunk_count === "number" ? decodeMsg.chunk_count : 0;
-                      chunkSize = typeof decodeMsg.chunk_size === "number" ? decodeMsg.chunk_size : 0;
-                      elapsedMs = typeof decodeMsg.elapsed_ms === "number" ? decodeMsg.elapsed_ms : 0;
-                      compatibleStateKinds = Array.isArray(decodeMsg.compatible_state_kinds)
-                        ? decodeMsg.compatible_state_kinds.filter((kind: unknown): kind is string => typeof kind === "string")
-                        : [];
-                      decodeFallbackReason = typeof decodeMsg.fallback_reason === "string" ? decodeMsg.fallback_reason : "not_reported";
-                      cachedPrefixTokens = typeof decodeMsg.cached_prefix_tokens === "number" ? decodeMsg.cached_prefix_tokens : 0;
-                      updateRuntimeWorkerMetrics((decodeMsg as any).model_worker);
-                      break;
-                    } else if (decodeMsg?.type === "error") {
-                      throw new Error(decodeMsg.message || "decode batch failed");
-                    }
-                  }
-                  decodeBatchMetrics.totalBatches += 1;
-                  if (backend === "serial_reference") decodeBatchMetrics.serialBatches += 1;
-                  if (backend && backend !== "serial_reference") decodeBatchMetrics.fusedBatches += 1;
-                  decodeBatchMetrics.lastBackend = backend;
-                  decodeBatchMetrics.lastChunkCount = chunkCount;
-                  decodeBatchMetrics.lastChunkSize = chunkSize;
-                  decodeBatchMetrics.lastDecodeMs = elapsedMs;
-                  decodeBatchMetrics.lastCompatibleStateKinds = compatibleStateKinds;
-                  decodeBatchMetrics.lastCachedPrefixTokens = cachedPrefixTokens;
-                  decodeBatchMetrics.lastFallbackReason = decodeFallbackReason;
-                  for (const state of activeSessions) {
-                    const step = stepById.get(state.id);
-                    if (!step) throw new Error(`decode batch missing step result for ${state.id}`);
-                    state.generatedTokens += 1;
-                    state.logicalPosition = Number.isFinite(step.logical_position) ? step.logical_position : state.logicalPosition + 1;
-                    if (typeof step.text === "string") state.content += step.text;
-                    if (step.stop === true) {
-                      state.done = true;
-                      state.finishReason = state.generatedTokens >= state.maxTokens ? "length" : "stop";
-                    }
-                  }
-                }
-                for (const state of states.values()) {
-                  const pending = pendingDecodeRequests.get(state.id);
-                  if (!pending) continue;
-                  pendingDecodeRequests.delete(state.id);
-                  pending.resolve({
-                    content: state.content,
-                    completionTokens: state.generatedTokens,
-                    promptTokens: pending.promptTokens,
-                    cachedTokens: pending.cachedTokens,
-                    finishReason: state.finishReason,
-                    runtimeStateHandle: state.runtimeStateHandle,
-                  });
-                }
-              } catch (err: any) {
-                const decodeError = err instanceof Error ? err : new Error(err?.message ?? String(err));
-                decodeBatchMetrics.lastSkippedReason = "decode_batch_failed";
-                for (const state of states.values()) {
-                  const pending = pendingDecodeRequests.get(state.id);
-                  if (!pending) continue;
-                  pendingDecodeRequests.delete(state.id);
-                  pending.reject(decodeError);
-                }
-              }
-              decodeBatchMetrics.activeSessions = pendingDecodeRequests.size;
+          else if (msg.type === "done") {
+            // `prompt_tokens` is the full client-visible prompt size
+            // (V4F emits it). When absent, derive as `cached + prefill`
+            // — i.e. the total of cached-hit tokens plus the new tokens
+            // actually pushed through the forward path this turn. The
+            // legacy "just use prefill_tokens" fallback was wrong on
+            // cache hits, producing `prompt_tokens < cached_tokens`
+            // which contradicts the OpenAI usage spec.
+            cachedTokens = typeof msg.cached_tokens === "number"
+              ? msg.cached_tokens
+              : 0;
+            const _prefill = typeof msg.prefill_tokens === "number"
+              ? msg.prefill_tokens
+              : 0;
+            promptTokens = typeof msg.prompt_tokens === "number"
+              ? msg.prompt_tokens
+              : cachedTokens + _prefill;
+            // V4F daemon emits an authoritative finish_reason. Only
+            // accept the three OpenAI-valid values; anything else falls
+            // back to the legacy inference below.
+            if (msg.finish_reason === "stop" || msg.finish_reason === "length" || msg.finish_reason === "tool_calls") {
+              daemonFinishReason = msg.finish_reason;
             }
           }
-          try {
-            decodeOutcome = await Promise.race([
-              decodePromise,
-              new Promise<null>((resolve) => setTimeout(() => resolve(null), serverPrefillBatch.maxProcessingMs)),
-            ]);
-          } catch (err: any) {
-            daemonError = err?.message ?? String(err);
-          }
-          if (decodeOutcome) {
-            content = decodeOutcome.content;
-            completionTokens = decodeOutcome.completionTokens;
-            promptTokens = decodeOutcome.promptTokens;
-            cachedTokens = decodeOutcome.cachedTokens;
-            daemonFinishReason = decodeOutcome.finishReason;
-            decodedByBatch = true;
-          } else if (!daemonError) {
-            decodeBatchMetrics.skipped += 1;
-            decodeBatchMetrics.lastSkippedReason = "decode_batch_timeout";
-            pendingDecodeRequests.delete(reqId);
-            decodeScheduler?.cancel(reqId);
-          }
-          decodeBatchMetrics.activeSessions = pendingDecodeRequests.size;
-        } else if (serverPrefillBatch.enabled) {
-          decodeBatchMetrics.skipped += 1;
-          decodeBatchMetrics.lastSkippedReason = decodeBatchEligible ? "missing_scheduler" : decodeBatchIneligibleReason;
-        }
-        if (!decodedByBatch && daemonError && genParams.prefill_already_done === true) {
-          delete genParams.session_id;
-          delete genParams.prefilled_prompt_tokens;
-          genParams.prefill_already_done = false;
-          releaseRuntimeSessionId = null;
-        }
-        if (!decodedByBatch) {
-          e.generating = true;
-          for await (const msg of e.generate(genParams)) {
-            if (msg.type === "token") { content += msg.text; completionTokens++; }
-            else if (msg.type === "reasoning") {
-              // V4F's StreamParser splits `<think>…</think>` content out
-              // as `reasoning` events. Accumulate so the non-stream chat
-              // completion response can surface it under
-              // `message.reasoning_content` — without this the reasoning
-              // text was silently dropped on every think-mode V4F turn.
-              if (typeof msg.text === "string") reasoningContent += msg.text;
-            }
-            else if (msg.type === "done") {
-              // `prompt_tokens` is the full client-visible prompt size
-              // (V4F emits it). `prefill_tokens` (legacy) is what
-              // actually went through forward — equal to prompt when
-              // cached_tokens is 0. Fall back to prefill_tokens so the
-              // non-V4F paths keep their existing accounting.
-              promptTokens = typeof msg.prompt_tokens === "number"
-                ? msg.prompt_tokens
-                : (msg.prefill_tokens ?? 0);
-              cachedTokens = typeof msg.cached_tokens === "number"
-                ? msg.cached_tokens
-                : 0;
-              // V4F daemon emits an authoritative finish_reason. Only
-              // accept the three OpenAI-valid values; anything else falls
-              // back to the legacy inference below.
-              if (msg.finish_reason === "stop" || msg.finish_reason === "length" || msg.finish_reason === "tool_calls") {
-                daemonFinishReason = msg.finish_reason;
-              }
-            }
-            else if (msg.type === "error") { daemonError = msg.message || "generation failed"; }
-            else if (msg.type === "tool_calls") {
-              const calls = Array.isArray((msg as any).calls) ? (msg as any).calls : [];
-              if (calls.length > 0) {
-                if (structuredToolCalls === null) structuredToolCalls = [];
-                for (let i = 0; i < calls.length; i++) {
-                  const c = calls[i] as { name: string; arguments: unknown };
-                  const argStr = typeof c.arguments === "string"
-                    ? c.arguments
-                    : JSON.stringify(c.arguments);
-                  structuredToolCalls.push({
-                    id: `call_${reqId}_${structuredToolCalls.length}`,
-                    type: "function",
-                    function: { name: c.name, arguments: argStr }
-                  });
-                }
+          else if (msg.type === "error") { daemonError = msg.message || "generation failed"; }
+          else if (msg.type === "tool_calls") {
+            const calls = Array.isArray((msg as any).calls) ? (msg as any).calls : [];
+            if (calls.length > 0) {
+              if (structuredToolCalls === null) structuredToolCalls = [];
+              for (let i = 0; i < calls.length; i++) {
+                const c = calls[i] as { name: string; arguments: unknown };
+                const argStr = typeof c.arguments === "string"
+                  ? c.arguments
+                  : JSON.stringify(c.arguments);
+                structuredToolCalls.push({
+                  id: `call_${reqId}_${structuredToolCalls.length}`,
+                  type: "function",
+                  function: { name: c.name, arguments: argStr }
+                });
               }
             }
           }
-          e.generating = false;
         }
-        if (releaseRuntimeSessionId) {
-          try {
-            await e.send({
-              type: "release_sessions",
-              id: `${reqId}-release`,
-              worker_key_id: activeWorkerKeyId ?? undefined,
-              sessions: [releaseRuntimeSessionId],
-            });
-            const releaseMsg = await e.recv();
-            if (releaseMsg?.type === "release_sessions_done") {
-              updateRuntimeWorkerMetrics((releaseMsg as any).model_worker);
-              residentDecodeSessions.delete(releaseRuntimeSessionId);
-            }
-          } catch (err: any) {
-            console.error(`[hipfire] failed to release runtime session ${releaseRuntimeSessionId}: ${err?.message ?? err}`);
-          }
-        }
+        e.generating = false;
 
         // If the daemon rejected the request mid-generate (e.g. KV-budget
-        // overrun on a huge system prompt), surface that as a 400 instead of
-        // returning a 200 with empty content — otherwise a client that sent a
-        // too-large request can't distinguish failure from a zero-token reply.
+        // overrun on a huge system prompt), surface that error.
+        //
+        // hunt3 B-4: we are INSIDE the ReadableStream `start(ctrl)`, so the
+        // 200 headers were ALREADY sent (Bun streams the body lazily) — a
+        // `return Response.json(...)` here is silently DISCARDED and, worse,
+        // `start()` returns WITHOUT ctrl.enqueue/close, so the already-open
+        // 200 stream never terminates and the client hangs until the 255s
+        // idle timeout. Emit the error THROUGH the open controller and close
+        // it (status can't change post-headers; the failure rides in the
+        // body's `error` field, matching the streaming branch's convention).
         if (daemonError) {
+          bodyDelivered = true;
           safeRelease();
-          let status = 500;
-          const err = daemonError.toLowerCase();
-          if (err.includes("maximum size") || err.includes("exceeds maximum")) status = 413;
-          else if (err.includes("no vision encoder") || err.includes("unsupported image format")
-            || err.includes("image dimensions") || err.includes("failed to decode base64")
-            || err.includes("failed to decode image") || err.includes("exceeds loaded kv budget"))
-            status = 400;
-          return Response.json(
-            { error: { message: daemonError, type: "invalid_request_error" } },
-            { status }
-          );
+          try {
+            ctrl.enqueue(nsEnc.encode(JSON.stringify(
+              { error: { message: daemonError, type: "invalid_request_error" } }
+            )));
+          } catch {}
+          try { ctrl.close(); } catch {}
+          return;
         }
 
         // Strip think tags and special tokens.
@@ -6783,18 +3421,8 @@ async function serve(port: number, host: string) {
         // intact in message.content for clients that want a single-string
         // representation including reasoning. <|im_end|> stripping always
         // applies (it would break clients that re-encode message history).
-        let strippedContent = content;
-        if (!preserveThinking && genParams.assistant_prefix === "open_think" && !content.includes("<think>")) {
-          content = "<think>" + content;
-          strippedContent = content;
-        }
-        if (preserveThinking) {
-          content = content.replace(/<\|im_end\|>/g, "").trim();
-        } else {
-          content = content.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
-            .replace(/<think>[\s\S]*$/, "") // unclosed think block
-            .replace(/<\|im_end\|>/g, "").trim();
-        }
+        const strippedContent = content;
+        content = stripVisibleThinking(content, preserveThinking, genParams.assistant_prefix === "open_think");
 
         // Diagnostic: detect empty-after-unclosed-think-strip.
         let thinkWarning: string | null = null;
@@ -6803,20 +3431,25 @@ async function serve(port: number, host: string) {
           console.error(`[hipfire] ${reqId}: ${thinkWarning} — ${completionTokens} tokens consumed, all inside unclosed <think> block`);
         }
 
-        // Tool calls. V4F arm yields them as structured events (captured
-        // above into `structuredToolCalls`); legacy arches embed them as
-        // text the parser extracts. Prefer the structured source when it
+        // Tool calls. V4F and qwen35 daemon arms yield them as
+        // structured `tool_calls` events (captured above into
+        // `structuredToolCalls`). Legacy arches embed them as text
+        // the parser extracts. Prefer the structured source when it
         // emitted anything.
         const choice: any = { index: 0 };
         if (structuredToolCalls && structuredToolCalls.length > 0) {
-          // V4F's `Token` events outside the `<｜DSML｜tool_calls>` block
-          // already streamed any preceding assistant text. Pass that
-          // through as the message content (trimmed — the model
-          // typically emits trailing `\n\n` after closing `</think>`).
+          // For qwen35 the `content` variable holds the full raw token
+          // stream including the `<tool_call>{...}</tool_call>` markup
+          // (daemon doesn't strip those token-side). Split prose from
+          // markup so `message.content` doesn't double-deliver the
+          // tool_call to the client. V4F already stripped markup
+          // token-side, so the split is a no-op for that arch.
+          const tcIdx = content.indexOf("<tool_call>");
+          const prose = tcIdx >= 0 ? content.slice(0, tcIdx).trim() : content.trim();
           choice.finish_reason = daemonFinishReason ?? "tool_calls";
           choice.message = {
             role: "assistant",
-            content: content.trim() || null,
+            content: prose || null,
             tool_calls: structuredToolCalls,
           };
           if (reasoningContent) choice.message.reasoning_content = reasoningContent;
@@ -6828,14 +3461,20 @@ async function serve(port: number, host: string) {
           // but if the daemon told us "length" (max_tokens hit), use
           // that even when there's no tool call, so clients can
           // detect truncated replies.
-          choice.finish_reason = daemonFinishReason
-            ?? (parsed.tool_calls ? "tool_calls" : "stop");
+          const nonStreamTruncation = !parsed.tool_calls
+            ? detectToolCallTruncation(content, completionTokens, requestMaxTokens)
+            : null;
+          choice.finish_reason = nonStreamTruncation
+            ? "length"
+            : (daemonFinishReason ?? (parsed.tool_calls ? "tool_calls" : "stop"));
           if (parsed.tool_calls) {
             choice.message = { role: "assistant", content: parsed.content, tool_calls: parsed.tool_calls };
           } else {
             choice.message = { role: "assistant", content };
           }
           if (reasoningContent) choice.message.reasoning_content = reasoningContent;
+          // Stash for response-builder below.
+          (choice as any)._truncation = nonStreamTruncation;
         }
 
         safeRelease();
@@ -6843,46 +3482,120 @@ async function serve(port: number, host: string) {
           id: reqId, object: "chat.completion", created, model: modelName,
           choices: [choice],
           usage: (() => {
+            const cacheWriteTokens = Math.max(0, promptTokens - cachedTokens);
+            // Pi's openai-completions provider
+            // (packages/ai/src/providers/openai-completions.ts in
+            // earendil-works/pi) reads BOTH cacheRead and cacheWrite
+            // from `prompt_tokens_details`:
+            //   cacheRead  ← prompt_tokens_details.cached_tokens
+            //   cacheWrite ← prompt_tokens_details.cache_write_tokens
+            //   input      ← prompt_tokens − cacheRead − cacheWrite
+            // Emit both nested fields so Pi's display shows non-zero
+            // cacheWrite alongside cacheRead on cache hits.
             const u: any = {
               prompt_tokens: promptTokens,
               completion_tokens: completionTokens,
               total_tokens: promptTokens + completionTokens,
+              prompt_tokens_details: {
+                cached_tokens: cachedTokens,
+                cache_write_tokens: cacheWriteTokens,
+              },
             };
-            if (cachedTokens > 0) {
-              u.prompt_tokens_details = { cached_tokens: cachedTokens };
-            }
+            // Anthropic-shape top-level mirror for non-Pi multi-provider
+            // clients.
+            u.cache_read_input_tokens = cachedTokens;
+            u.cache_creation_input_tokens = cacheWriteTokens;
             return u;
           })(),
         };
         if (thinkWarning) {
           responseBody.x_hipfire_warning = thinkWarning;
         }
-        if (url.pathname === "/v1/responses") {
-          const responsesObject = toResponsesObject(responseBody.id || newObjectId("chatcmpl"), responseBody);
-          if (responsesContextMessagesForStore) {
-            const assistantMessage: any = {
-              role: "assistant",
-              content: choice.message?.content ?? "",
-            };
-            if (choice.message?.tool_calls) assistantMessage.tool_calls = cloneJsonValue(choice.message.tool_calls);
-            if (choice.message?.reasoning_content) assistantMessage.reasoning_content = choice.message.reasoning_content;
-            const nowMs = Date.now();
-            storeResponsesContext({
-              id: responsesObject.id,
-              model: typeof body.model === "string" && body.model.length > 0 ? body.model : modelName,
-              messages: [
-                ...cloneChatMessages(responsesContextMessagesForStore),
-                assistantMessage,
-              ],
-              promptCacheKey: typeof body.prompt_cache_key === "string" ? body.prompt_cache_key : undefined,
-              createdAtMs: nowMs,
-              lastUsedAtMs: nowMs,
-            });
-          }
-          return Response.json(responsesObject);
+        const nonStreamTrunc = (choice as any)._truncation;
+        if (nonStreamTrunc) {
+          delete (choice as any)._truncation;
+          responseBody.truncation = nonStreamTrunc;
         }
-        return Response.json(responseBody);
+              bodyDelivered = true;
+              ctrl.enqueue(nsEnc.encode(JSON.stringify(responseBody)));
+              ctrl.close();
+            } catch (err: any) {
+              bodyDelivered = true;
+              // hunt3 H-B: daemon crash (DaemonClosedError) mid-generate —
+              // restart so the next request reloads cleanly instead of
+              // writing to a dead stdin. Status stays 200 (header sent); the
+              // error rides in the body (matches the existing convention).
+              e.generating = false;
+              if (err instanceof DaemonClosedError) {
+                current = null; currentMaxSeq = null; modelHasVL = false;
+                currentArch = null; currentCacheCapable = null;
+                try { await e.restart(); } catch (re: any) {
+                  console.error(`[hipfire] daemon restart failed: ${re?.message ?? re}`);
+                }
+              }
+              safeRelease();
+              try {
+                ctrl.enqueue(nsEnc.encode(JSON.stringify({ error: (err instanceof DaemonClosedError) ? "daemon crashed mid-generation" : (err?.message || "internal error") })));
+              } catch {}
+              try { ctrl.close(); } catch {}
+            } finally {
+              clearInterval(heartbeat);
+            }
+          },
+          // Fires when the HTTP client closes the connection (curl
+          // hit its `-m` cap, Pi / opencode gave up after their own
+          // timeout, etc.).
+          //
+          // Two actions happen here:
+          //   1. Send `{type:"abort","id":"<reqId>"}` to the daemon.
+          //      The daemon's background stdin reader picks this up
+          //      asynchronously and signals the prefill chunk loop
+          //      to bail at the next chunk boundary (~5 s latency
+          //      on gfx1151 at 50 tps). The daemon emits `aborted`
+          //      + `done` events to terminate the generation.
+          //   2. Set `nsClientAborted = true` so the for-await loop
+          //      drains remaining daemon events (the aborted/done)
+          //      WITHOUT accumulating them into the response. This
+          //      keeps the EngineConnection's event queue clean for
+          //      the next request.
+          async cancel() {
+            console.error(`[hipfire] non-stream client cancelled (reqId=${reqId}) — sending abort to daemon`);
+            nsClientAborted = true;
+            try {
+              await e.send({ type: "abort", id: reqId });
+              console.error(`[hipfire] abort sent (reqId=${reqId})`);
+            } catch (err: any) {
+              console.error(`[hipfire] abort send failed: ${err?.message || err}`);
+            }
+          }
+        }), { headers: { "Content-Type": "application/json" } });
+        return nsResponse;
       } catch (err: any) {
+        // hunt3 H-B: a daemon crash now throws DaemonClosedError from recv()
+        // (instead of process.exit-ing the whole serve). Recover for THIS
+        // request only: restart the daemon, clear the loaded-model state so
+        // the next request reloads, and return 500 to this one client. Other
+        // clients' subsequent requests reload cleanly instead of the serve
+        // dying for everyone.
+        e.generating = false;
+        if (err instanceof DaemonClosedError) {
+          console.error(`[hipfire] daemon closed (code ${err.code}) — restarting for next request`);
+          current = null;
+          currentMaxSeq = null;
+          modelHasVL = false;
+          currentArch = null;
+          currentCacheCapable = null;
+          try {
+            await e.restart();
+          } catch (restartErr: any) {
+            console.error(`[hipfire] daemon restart failed: ${restartErr?.message ?? restartErr}`);
+          }
+          safeRelease();
+          return Response.json(
+            { error: { message: "daemon crashed and was restarted; retry the request", type: "server_error" } },
+            { status: 500 },
+          );
+        }
         safeRelease();
         return Response.json({ error: err?.message || "internal error" }, { status: 500 });
       }
@@ -6914,67 +3627,6 @@ function findTriAttnValidateBinary(): string | null {
   // Installed: ~/.hipfire/bin/ (no examples/ subdir — update copies directly)
   const installedCandidates = [join(HIPFIRE_DIR, "bin", `triattn_validate${exe}`)];
   return devCandidates.find(p => existsSync(p)) || installedCandidates.find(p => existsSync(p)) || null;
-}
-
-function artifactFormatToken(format: string): string {
-  switch (format.toLowerCase()) {
-    case "lloyd-mq2":
-      return "lloyd-mq2";
-    case "hfq4":
-    case "hfq4g256":
-      return "hf4";
-    case "hfq6":
-    case "hfq6g256":
-      return "hf6";
-    case "q8f16":
-      return "q8";
-    default:
-      return format.toLowerCase();
-  }
-}
-
-function artifactFileToken(format: string): string {
-  return artifactFormatToken(format);
-}
-
-function artifactFileName(stem: string, format: string): string {
-  const token = artifactFileToken(format);
-  return new RegExp(`(?:^|-)${token}$`, "i").test(stem)
-    ? `${stem}.hfq`
-    : `${stem}-${token}.hfq`;
-}
-
-function artifactQuantToken(filename: string): string | null {
-  const lower = filename.toLowerCase();
-  const lloydMq2 = lower.match(/(?:^|-)lloyd-mq2(?:\+[^.]*)?\.hfq$/);
-  if (lloydMq2) return "lloyd-mq2";
-  const canonical = lower.match(/(?:^|-)(mq[1-8]|hf[1-8]|q8|q8f16)(?:\+[^.]*)?\.hfq$/);
-  if (canonical) return artifactFormatToken(canonical[1]);
-  return null;
-}
-
-function isRoleSidecarArtifact(filename: string): boolean {
-  return /\.(mtp|dflash|triattn)\.hfq$/i.test(filename);
-}
-
-function defaultRoleSidecarPath(modelPath: string, role: string): string {
-  return modelPath.toLowerCase().endsWith(".hfq")
-    ? `${modelPath.slice(0, -4)}.${role}.hfq`
-    : `${modelPath}.${role}.hfq`;
-}
-
-function parseQwenQuantArtifact(filename: string): { version: string; size: string; quant: string } | null {
-  const m = filename.toLowerCase().match(/qwen3[._-]?(5|6)[-_](.+?)-(mq[1-8]|hf[1-8]|hfq4|hfq6|q8)(?:\+[^.]*)?(?:\.hfq)?$/);
-  if (!m) return null;
-  return {
-    version: m[1],
-    size: m[2],
-    quant: artifactFormatToken(m[3]),
-  };
-}
-
-function modelFileAliases(filename: string): string[] {
-  return [filename];
 }
 
 interface QuantizeOpts {
@@ -7046,8 +3698,8 @@ async function quantize(input: string, opts: QuantizeOpts): Promise<void> {
   // GGUF input supports hf4 (default for dense), hf6 (dense, higher
   // quality), mq4 / mq6 (FWHT-rotated, Qwen3.5+ DeltaNet hot path).
   // Q8 / safetensors-only formats are rejected. The format string is also
-  // the artifact token in names like `<stem>-hf4.hfq`; keep it short ("hf4")
-  // to match how the rest of the CLI recognizes models.
+  // the file extension — keep it short ("hf4") to match how the rest of
+  // the CLI (resolveModelTag, list/ps enumeration) recognizes models.
   if (isGgufFile) {
     // Normalize hfq4/hfq4g256 → hf4, hfq6/hfq6g256 → hf6 so the output
     // filename uses the canonical extension that CLI discovery picks up.
@@ -7095,7 +3747,7 @@ async function quantize(input: string, opts: QuantizeOpts): Promise<void> {
   for (const format of opts.formats) {
     const out = opts.output
       ? resolve(opts.output)
-      : join(outDir, artifactFileName(baseName, format));
+      : join(outDir, `${baseName}.${format}`);
 
     console.error(`\nQuantizing ${inputForBinary}`);
     console.error(`  → ${out} (${format})`);
@@ -7164,17 +3816,16 @@ async function quantize(input: string, opts: QuantizeOpts): Promise<void> {
 
   // Optional: append a local user-alias so the custom tag is addressable.
   if (opts.register) {
-    const aliasPath = join(HIPFIRE_DIR, "models.json");
-    let aliases: Record<string, any> = {};
-    try { aliases = JSON.parse(require("fs").readFileSync(aliasPath, "utf-8")); } catch {}
     const primary = produced.find(p => p.format === "mq4") ?? produced[0];
-    aliases[opts.register] = {
+    const catalog = refreshModelsCatalog({ write: false });
+    catalog.aliases[opts.register] = {
       repo: opts.uploadRepo ?? "",
       file: basename(primary.path),
       local_path: primary.path,
       registered_at: new Date().toISOString(),
     };
-    require("fs").writeFileSync(aliasPath, JSON.stringify(aliases, null, 2) + "\n");
+    writeModelsCatalog(catalog);
+    refreshModelsCatalog();
     console.error(`Registered ${opts.register} → ${basename(primary.path)}`);
     console.error(`  Try: hipfire run ${opts.register} "hello"`);
   }
@@ -7189,22 +3840,319 @@ interface UserAlias {
   registered_at?: string;
 }
 
-function loadUserAliases(): Record<string, UserAlias> {
+interface LocalModelRecord {
+  id: string;
+  file: string;
+  path: string;
+  size_bytes: number;
+  size_gb: number;
+  registry_tag?: string | null;
+  aliases?: string[];
+  chat_templates?: string[];
+  dflash_drafts?: string[];
+  triattn?: string[];
+  config?: PerModelOverride;
+}
+
+interface ModelsCatalog {
+  schema_version: 2;
+  updated_at: string;
+  aliases: Record<string, UserAlias>;
+  configs?: PerModelConfigs;
+  models: Record<string, LocalModelRecord>;
+}
+
+const MODEL_EXT_RE = /\.(hf4|hf6|hfq|mq3|mq4|mq6|mq2lloyd)$/i;
+
+function readJsonFile(path: string): any | null {
   try {
-    return JSON.parse(require("fs").readFileSync(join(HIPFIRE_DIR, "models.json"), "utf-8"));
-  } catch { return {}; }
+    const raw = readFileSync(path, "utf-8").trim();
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch { return null; }
+}
+
+function sanitizePerModelOverride(ov: any): PerModelOverride {
+  const clean: PerModelOverride = {};
+  if (!ov || typeof ov !== "object") return clean;
+  const src = { ...ov };
+  // Migrate legacy boolean mmq_screen -> tri-state.
+  if (typeof src.mmq_screen === "boolean") src.mmq_screen = src.mmq_screen ? "on" : "off";
+  for (const k of PER_MODEL_KEYS) {
+    const v = src[k];
+    if (v !== undefined && validateConfigValue(k, v)) (clean as any)[k] = v;
+  }
+  return clean;
+}
+
+function normalizeAliasMap(raw: any): Record<string, UserAlias> {
+  const aliases: Record<string, UserAlias> = {};
+  if (!raw || typeof raw !== "object") return aliases;
+  for (const [tag, value] of Object.entries(raw)) {
+    if (!value || typeof value !== "object") continue;
+    const v = value as any;
+    if (typeof v.file !== "string") continue;
+    aliases[tag] = {
+      repo: typeof v.repo === "string" ? v.repo : "",
+      file: v.file,
+      local_path: typeof v.local_path === "string" ? v.local_path : undefined,
+      registered_at: typeof v.registered_at === "string" ? v.registered_at : undefined,
+    };
+  }
+  return aliases;
+}
+
+function emptyModelsCatalog(aliases: Record<string, UserAlias> = {}): ModelsCatalog {
+  return {
+    schema_version: 2,
+    updated_at: new Date().toISOString(),
+    aliases,
+    configs: {},
+    models: {},
+  };
+}
+
+function sanitizePerModelConfigs(raw: any): PerModelConfigs {
+  const out: PerModelConfigs = {};
+  if (!raw || typeof raw !== "object") return out;
+  for (const [tag, ov] of Object.entries(raw)) {
+    const clean = sanitizePerModelOverride(ov);
+    if (Object.keys(clean).length > 0) out[tag] = clean;
+  }
+  return out;
+}
+
+function normalizeCatalogModels(raw: any): Record<string, LocalModelRecord> {
+  const models: Record<string, LocalModelRecord> = {};
+  if (!raw || typeof raw !== "object") return models;
+  for (const [id, value] of Object.entries(raw)) {
+    if (!value || typeof value !== "object") continue;
+    const v = value as any;
+    if (typeof v.path !== "string" || typeof v.file !== "string") continue;
+    models[id] = {
+      id,
+      file: v.file,
+      path: v.path,
+      size_bytes: Number(v.size_bytes) || 0,
+      size_gb: Number(v.size_gb) || 0,
+      registry_tag: typeof v.registry_tag === "string" ? v.registry_tag : null,
+      aliases: Array.isArray(v.aliases) ? v.aliases.filter((x: any) => typeof x === "string") : [],
+      chat_templates: Array.isArray(v.chat_templates) ? v.chat_templates.filter((x: any) => typeof x === "string") : [],
+      dflash_drafts: Array.isArray(v.dflash_drafts) ? v.dflash_drafts.filter((x: any) => typeof x === "string") : [],
+      triattn: Array.isArray(v.triattn) ? v.triattn.filter((x: any) => typeof x === "string") : [],
+      config: sanitizePerModelOverride(v.config),
+    };
+    if (Object.keys(models[id].config ?? {}).length === 0) delete models[id].config;
+  }
+  return models;
+}
+
+function loadModelsCatalog(): ModelsCatalog {
+  const raw = readJsonFile(MODELS_CATALOG_PATH);
+  if (raw?.schema_version === 2) {
+    return {
+      schema_version: 2,
+      updated_at: typeof raw.updated_at === "string" ? raw.updated_at : new Date().toISOString(),
+      aliases: normalizeAliasMap(raw.aliases),
+      configs: sanitizePerModelConfigs(raw.configs),
+      models: normalizeCatalogModels(raw.models),
+    };
+  }
+  // Legacy models.json was a flat alias map written by quantize --register.
+  return emptyModelsCatalog(normalizeAliasMap(raw));
+}
+
+function loadLegacyPerModelConfigsRaw(): Record<string, any> {
+  const raw = readJsonFile(PER_MODEL_CONFIG_PATH);
+  return raw && typeof raw === "object" ? raw : {};
+}
+
+function clearLegacyPerModelConfigs() {
+  try {
+    if (existsSync(PER_MODEL_CONFIG_PATH)) writeFileSync(PER_MODEL_CONFIG_PATH, "{}\n");
+  } catch {}
+}
+
+function writeModelsCatalog(catalog: ModelsCatalog) {
+  mkdirSync(HIPFIRE_DIR, { recursive: true });
+  catalog.schema_version = 2;
+  catalog.updated_at = new Date().toISOString();
+  const tmp = `${MODELS_CATALOG_PATH}.tmp`;
+  writeFileSync(tmp, JSON.stringify(catalog, null, 2) + "\n");
+  renameSync(tmp, MODELS_CATALOG_PATH);
+}
+
+function scanFiles(dir: string, pred: (name: string) => boolean): string[] {
+  try {
+    return readdirSync(dir)
+      .filter(pred)
+      .map(f => join(dir, f))
+      .filter(p => {
+        try { return statSync(p).isFile(); } catch { return false; }
+      })
+      .sort();
+  } catch { return []; }
+}
+
+function registryTagForFile(file: string): string | null {
+  const fNorm = file
+    .replace(/\.q4\.hfq$/i, ".hf4")
+    .replace(/\.hfq6\.hfq$/i, ".hf6")
+    .replace(/-hfq4\.hfq$/i, ".hf4")
+    .replace(/\.hfq$/i, ".hf4");
+  return Object.entries(REGISTRY).find(([_, e]) => e.file === file || e.file === fNorm)?.[0] ?? null;
+}
+
+function modelFamily(id: string): string | null {
+  const lower = id.toLowerCase();
+  const m = lower.match(/^(qwen3(?:\.[56])?|carnice|qwopus|gemma|mistral)/);
+  return m?.[1] ?? null;
+}
+
+function templateMatchesModel(templatePath: string, modelId: string): boolean {
+  const t = basename(templatePath).toLowerCase();
+  const tStem = t.replace(/\.(j2|jinja2|jinja)$/i, "");
+  const lowerId = modelId.toLowerCase();
+  const modelStem = lowerId.replace(/\.(hf4|hf6|hfq|mq3|mq4|mq6|mq2lloyd)$/i, "");
+  if (tStem === lowerId || tStem === modelStem) return true;
+  const family = modelFamily(modelId);
+  if (!family) return false;
+  return tStem === `${family}-chat_template`
+    || tStem === `${family}_chat_template`
+    || tStem === `${family}.chat_template`;
+}
+
+function draftMatchesModel(draftPath: string, modelId: string): boolean {
+  const d = basename(draftPath).toLowerCase();
+  if (!d.endsWith(".hfq")) return false;
+  const m = modelId.toLowerCase().match(/qwen3?\.?(5|6)[-_]?([^.]+)\.(mq3|mq4|mq6|hf4|hf6|hfq|mq2lloyd)/);
+  if (!m) return false;
+  return d.startsWith(`qwen3${m[1]}-${m[2].toLowerCase()}-dflash-`);
+}
+
+function triattnMatchesModel(sidecarPath: string, modelId: string): boolean {
+  const s = basename(sidecarPath).toLowerCase();
+  return s.startsWith(`${modelId.toLowerCase()}.triattn`) && s.endsWith(".bin");
+}
+
+function catalogModelIdForConfigKey(catalog: ModelsCatalog, key: string): string | null {
+  if (catalog.models[key]) return key;
+  const resolved = resolveModelTag(key);
+  for (const model of Object.values(catalog.models)) {
+    if (model.registry_tag === key || model.registry_tag === resolved) return model.id;
+    if ((model.aliases ?? []).includes(key) || (model.aliases ?? []).includes(resolved)) return model.id;
+  }
+  return null;
+}
+
+function refreshModelsCatalog(opts: { write?: boolean } = {}): ModelsCatalog {
+  const shouldWrite = opts.write !== false;
+  const previous = loadModelsCatalog();
+  const legacyConfigs = sanitizePerModelConfigs(loadLegacyPerModelConfigsRaw());
+  const catalog = emptyModelsCatalog(previous.aliases);
+  const templates = scanFiles(TEMPLATES_DIR, f => /\.(j2|jinja|jinja2)$/i.test(f));
+  const drafts = [
+    ...scanFiles(DRAFTS_DIR, f => f.toLowerCase().endsWith(".hfq")),
+    ...scanFiles(MODELS_DIR, f => /dflash/i.test(f) && f.toLowerCase().endsWith(".hfq")),
+  ];
+  const triattn = [
+    ...scanFiles(TRIATTN_DIR, f => f.toLowerCase().endsWith(".triattn.bin")),
+    ...scanFiles(MODELS_DIR, f => /\.triattn.*\.bin$/i.test(f)),
+  ];
+
+  const existingConfigs: PerModelConfigs = { ...(previous.configs ?? {}), ...legacyConfigs };
+  for (const [id, model] of Object.entries(previous.models ?? {})) {
+    if (model.config && Object.keys(model.config).length > 0) existingConfigs[id] = model.config;
+  }
+
+  const modelPaths = [
+    ...scanFiles(MODELS_DIR, f => MODEL_EXT_RE.test(f)),
+    ...scanFiles(resolve(__dirname, "../models"), f => MODEL_EXT_RE.test(f)),
+  ];
+  const seen = new Set<string>();
+  for (const path of modelPaths) {
+    const file = basename(path);
+    if (seen.has(file)) continue;
+    seen.add(file);
+    let st;
+    try { st = statSync(path); } catch { continue; }
+    const registryTag = registryTagForFile(file);
+    const aliases = Object.entries(catalog.aliases)
+      .filter(([_, a]) => {
+        if (a.local_path && resolve(a.local_path) === resolve(path)) return true;
+        return a.file === file;
+      })
+      .map(([tag]) => tag)
+      .sort();
+
+    const configCandidates = [file, registryTag, ...aliases].filter(Boolean) as string[];
+    let mergedConfig: PerModelOverride = {};
+    for (const key of configCandidates) {
+      mergedConfig = { ...mergedConfig, ...sanitizePerModelOverride(existingConfigs[key]) };
+    }
+
+    const rec: LocalModelRecord = {
+      id: file,
+      file,
+      path: resolve(path),
+      size_bytes: st.size,
+      size_gb: Number((st.size / 1e9).toFixed(3)),
+      registry_tag: registryTag,
+      aliases,
+      chat_templates: templates.filter(t => templateMatchesModel(t, file)),
+      dflash_drafts: drafts.filter(d => draftMatchesModel(d, file)),
+      triattn: triattn.filter(s => triattnMatchesModel(s, file)),
+    };
+    if (Object.keys(mergedConfig).length > 0) rec.config = mergedConfig;
+    catalog.models[file] = rec;
+  }
+
+  const unresolved: PerModelConfigs = {};
+  for (const [key, ov] of Object.entries(existingConfigs)) {
+    if (!catalogModelIdForConfigKey(catalog, key)) {
+      const clean = sanitizePerModelOverride(ov);
+      if (Object.keys(clean).length > 0) unresolved[key] = clean;
+    }
+  }
+  catalog.configs = unresolved;
+
+  if (shouldWrite) {
+    try {
+      writeModelsCatalog(catalog);
+      if (Object.keys(legacyConfigs).length > 0) clearLegacyPerModelConfigs();
+    } catch {}
+  }
+  return catalog;
+}
+
+function catalogModelOptions(): string[] {
+  const catalog = loadModelsCatalog();
+  const values = new Set<string>();
+  for (const model of Object.values(catalog.models)) {
+    values.add(model.id);
+    if (model.registry_tag) values.add(model.registry_tag);
+    for (const alias of model.aliases ?? []) values.add(alias);
+  }
+  return [...values].sort();
+}
+
+function loadUserAliases(): Record<string, UserAlias> {
+  return loadModelsCatalog().aliases;
 }
 
 export function findModel(name: string): string | null {
-  const dummy = resolveDummyModelPath(name);
-  if (dummy) return dummy;
-
   // Direct file path
   if (existsSync(name)) return resolve(name);
 
+  const catalog = loadModelsCatalog();
+  const catalogModel = catalog.models[name]
+    ?? catalog.models[resolveModelTag(name)]
+    ?? catalog.models[catalogModelIdForConfigKey(catalog, name) ?? ""];
+  if (catalogModel?.path && existsSync(catalogModel.path)) return resolve(catalogModel.path);
+
   // User aliases (from `hipfire quantize ... --register`) take precedence
   // over the built-in REGISTRY so custom tags always resolve.
-  const userAliases = loadUserAliases();
+  const userAliases = catalog.aliases;
   const alias = userAliases[name] || userAliases[resolveModelTag(name)];
   if (alias) {
     if (alias.local_path && existsSync(alias.local_path)) return resolve(alias.local_path);
@@ -7218,31 +4166,42 @@ export function findModel(name: string): string | null {
   if (entry) {
     const p = join(MODELS_DIR, entry.file);
     if (existsSync(p)) return p;
+    // Backward compat: try old .hfq naming for the SAME quant level only
+    // (only applies to .hf4 / .hf6 — .mq4 has no legacy alias)
+    if (entry.file.endsWith(".hf4") || entry.file.endsWith(".hf6")) {
+      const base = entry.file.replace(/\.(hf4|hf6)$/, "");
+      const isHf6 = entry.file.endsWith(".hf6");
+      const oldNames = isHf6
+        ? [base + ".hfq6.hfq"]                              // HF6 → only try old hfq6
+        : [base + ".q4.hfq", base + "-hfq4.hfq", base + ".hfq"];  // HF4 → only try old q4/hfq4
+      for (const old of oldNames) {
+        const op = join(MODELS_DIR, old);
+        if (existsSync(op)) return op;
+      }
+    }
   }
 
   // Fuzzy search local dirs (top-level + one level of subdirectories)
-  // If the name includes a quant hint (hfN/mqN/q8), match exactly.
-  // Otherwise prefer MQ4 (default quant: FWHT-rotated 4-bit, quality-gated,
-  // WMMA-accelerated on RDNA3+). Fall back to HF4 only if no MQ4 is found
-  // so Qwen3 (which currently ships only HF4) still resolves.
+  // If the name includes a quant hint (hf4/hf6/mq4/mq6), match exactly.
+  // Otherwise prefer .mq4 (default quant: FWHT-rotated 4-bit, quality-gated,
+  // WMMA-accelerated on RDNA3+). Fall back to .hf4 only if no .mq4 is found
+  // so Qwen3 (which currently ships only .hf4) still resolves.
   const searchName = name.replace(":", "-");
-  const hasQuantHint = /(?:^|-)(hf[1-8]|mq[1-8]|lloyd-mq2|q8|q8f16)(?:\+[^.]*)?(?:\.hfq)?$/i.test(name);
+  const hasQuantHint = /\.(hf[46]|mq[46])$|-(hf[46]|mq[46])$/.test(name);
   const matchesName = (f: string) => f === name || f === searchName
     || f.includes(name) || f.includes(searchName);
-  const hasValidExt = (f: string) => !isRoleSidecarArtifact(f)
-    && artifactQuantToken(f) !== null;
+  const hasValidExt = (f: string) => f.endsWith(".mq4") || f.endsWith(".mq6")
+    || f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq") || f.endsWith(".mq2lloyd");
 
-  // Preference order when no quant hint: MQ4 → HF4 → MQ3 → Lloyd MQ2 → MQ6 → HF6 → Q8.
+  // Preference order when no quant hint: .mq4 → .hf4 → .hf6 → .mq6 → .hfq
   // (MQ6 only if explicitly asked; HF6 ditto — both are larger files.)
   const extPriority = (f: string): number => {
-    const token = artifactQuantToken(f);
-    if (token === "mq4") return 0;
-    if (token === "hf4") return 1;
-    if (token === "mq3") return 2;
-    if (token === "lloyd-mq2") return 3;
-    if (token === "mq6") return 4;
-    if (token === "hf6") return 5;
-    if (token === "q8") return 6;
+    if (f.endsWith(".mq4")) return 0;
+    if (f.endsWith(".hf4")) return 1;
+    if (f.endsWith(".hfq")) return 2; // legacy HF4 naming
+    if (f.endsWith(".mq2lloyd")) return 3;
+    if (f.endsWith(".mq6")) return 4;
+    if (f.endsWith(".hf6")) return 5;
     return 99;
   };
 
@@ -7252,8 +4211,15 @@ export function findModel(name: string): string | null {
     if (f === name || f === searchName) return true;
     // With a quant hint in the name, caller is explicit — any matching file is fine.
     if (hasQuantHint) return true;
-    // No hint: accept any canonical quant artifact; extPriority picks the best one.
-    if (!artifactQuantToken(f)) return false;
+    // No hint: accept any valid extension; extPriority picks the best one.
+    // Still filter .hfq to default-q4 flavor (.q4.hfq / -hfq4.hfq stems) so
+    // we don't return an experimental -hfq4g128.hfq instead of a proper .mq4.
+    if (f.endsWith(".hfq")) {
+      const stem = f.slice(0, -4);
+      const isDefaultQ4 = stem.endsWith(".q4") || stem.endsWith("-hfq4")
+        || stem === searchName || stem === name;
+      if (!isDefaultQ4) return false;
+    }
     return true;
   };
 
@@ -7284,26 +4250,13 @@ export function findModel(name: string): string | null {
 
 function listLocal() {
   const models: { name: string; tag: string; size: string }[] = [];
-  const seen = new Set<string>();
-  for (const dir of [MODELS_DIR, resolve(__dirname, "../models")]) {
-    let entries: string[];
-    try { entries = readdirSync(dir); } catch { continue; }
-    for (const f of entries) {
-      if (!isRoleSidecarArtifact(f) && artifactQuantToken(f) !== null && !seen.has(f)) {
-        seen.add(f);
-        // statSync may throw on dangling symlinks or files removed mid-scan;
-        // skip those individually instead of aborting the rest of the loop
-        // (a previous try/catch wrapping the entire iteration ate everything
-        // after the first stale symlink — see commit log for the bug story).
-        try {
-          const sz = (statSync(join(dir, f)).size / 1e9).toFixed(1);
-          // Find matching registry tag (check new and old naming)
-          const aliases = new Set<string>(modelFileAliases(f));
-          const tag = Object.entries(REGISTRY).find(([_, e]) => aliases.has(e.file))?.[0] || "";
-          models.push({ name: f, tag, size: `${sz}GB` });
-        } catch {}
-      }
-    }
+  const catalog = loadModelsCatalog();
+  for (const model of Object.values(catalog.models).sort((a, b) => a.id.localeCompare(b.id))) {
+    models.push({
+      name: model.id,
+      tag: model.registry_tag ?? "",
+      size: `${(model.size_bytes / 1e9).toFixed(1)}GB`,
+    });
   }
   return models;
 }
@@ -7438,6 +4391,7 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
 
   // Start daemon
   const e = new Engine();
+  e.oneShot = true; // hunt3 H-B: one-shot bench — exit on daemon EOF is correct
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
 
@@ -7507,6 +4461,7 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
       // Restart daemon with variant env var
       process.env.HIPFIRE_RDNA2_VARIANT = String(v.n);
       const ve = new Engine();
+      ve.oneShot = true; // hunt3 H-B: one-shot variant bench — exit on EOF is correct
       let variantOk = false;
       try {
         await ve.start();
@@ -7727,6 +4682,7 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
 async function profile(modelTag: string | undefined, jsonOutput: boolean, kernelFilter: string | undefined) {
   // Start daemon — we need kernels compiled to profile them
   const e = new Engine();
+  e.oneShot = true; // hunt3 H-B: one-shot profile — exit on daemon EOF is correct
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
 
@@ -7877,7 +4833,7 @@ const CASK_PROFILES: Record<string, CaskProfile> = {
     desc: [
       "Default behavior. At load time, scan for a published TriAttention sidecar",
       "next to the model file (registry's `triattn.file` first, then a",
-      "`<model-stem>.triattn.hfq` fallback). When found AND target is not",
+      "`<basename>.triattn*.bin` glob fallback). When found AND target is not",
       "A3B, attach with drop-eviction at the budget below. Otherwise behaves",
       "identical to `off`.",
       "",
@@ -8025,15 +4981,22 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
   const isOverridden = (k: keyof HipfireConfig): boolean =>
     isPerModel && (overrides as any)[k] !== undefined;
 
-  // Build default_model options from REGISTRY so users can cycle through
-  // known tags without typing. "custom" lets them fall back to free text.
-  const modelOptions = Object.keys(REGISTRY).sort();
+  // Build default_model options from the local catalog so config does not
+  // offer registry-only models that are not actually installed. Fall back to
+  // the registry only on a completely fresh install with no local catalog yet.
+  const modelOptions = catalogModelOptions();
+  if (modelOptions.length === 0) modelOptions.push(...Object.keys(REGISTRY).sort());
 
   const meta: Record<string, FieldMeta> = {
     kv_cache: {
       label: "kv_cache",
-      desc: "KV cache quantization (more bits = higher quality, more VRAM)",
-      options: ["auto", "q8", "asym4", "asym3", "asym2"],
+      desc: "KV cache quant (fwht default: FWHT-rotated, more accurate than asym at equal VRAM; q8 = reference)",
+      options: ["auto", "q8", "fwht4", "fwht3", "fwht2", "asym4", "asym3", "asym2"],
+    },
+    kv_adaptive: {
+      label: "kv_adaptive",
+      desc: "Adaptive KV downshift pattern. Requires fwht K; advanced picks K/V floor tiers explicitly.",
+      options: KV_ADAPTIVE_OPTIONS,
     },
     flash_mode: {
       label: "flash_mode",
@@ -8067,7 +5030,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     },
     max_seq: {
       label: "max_seq",
-      desc: "logical context window (tokens). Physical KV allocation grows per request up to this limit",
+      desc: "KV cache capacity (tokens). Allocated at model load — bigger = longer context",
       range: [512, 524288], step: 4096,
     },
     thinking: {
@@ -8079,6 +5042,11 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       label: "max_think_tokens",
       desc: "Budget for reasoning inside <think>...</think> (0 = unlimited). Truncates if exceeded.",
       range: [0, 32768], step: 128,
+    },
+    max_total_think_tokens: {
+      label: "max_total_think_tokens",
+      desc: "Re-arm-proof TOTAL <think> budget across the turn (0 = off). At the cap, force-close + block <think> re-open; hard-EOS past it. Bounds models that re-open <think> and out-think client timeouts.",
+      range: [0, 1000000], step: 256,
     },
     host: {
       label: "host",
@@ -8096,7 +5064,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     },
     experimental_budget_alert: {
       label: "experimental_budget_alert",
-      desc: "show a one-line warning on startup when an experimental feature is enabled",
+      desc: "allow the budget_alert_at_tok / budget_alert_text generate params (research-only in-band nudge injected into the model's think stream — can leak into visible output). false = daemon ignores those params",
       options: ["true", "false"],
     },
     dflash_adaptive_b: {
@@ -8145,33 +5113,13 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     },
     cask_auto_attach: {
       label: "cask_auto_attach",
-      desc: "auto-discover .triattn.hfq next to model file at load (true) or never (false). cask-profile=off sets false; non-off profiles set true.",
+      desc: "auto-discover .triattn.bin next to model file at load (true) or never (false). cask-profile=off sets false; non-off profiles set true.",
       options: ["true", "false"],
     },
     prompt_normalize: {
       label: "prompt_normalize",
-      desc: "collapse \\n{3,} → \\n\\n before encode (lifts τ +26.7% on PEP-8 code prompts; on by default)",
+      desc: "collapse \\n{3,} → \\n\\n before encode (+24% τ on PEP-8 code prompts; on by default — set false to keep raw whitespace)",
       options: ["true", "false"],
-    },
-    gpu_slab_load: {
-      label: "gpu_slab_load",
-      desc: "GPU slab model preload. auto = enable on HIP-reported integrated/UMA GPUs, on = force, off = disable.",
-      options: ["auto", "on", "off"],
-    },
-    gpu_slab_mib: {
-      label: "gpu_slab_mib",
-      desc: "GPU slab bank size in MiB for the slab loader. Larger banks reduce bookkeeping; smaller banks reduce allocation spikes.",
-      range: [1, 262144], step: 64,
-    },
-    load_transport: {
-      label: "load_transport",
-      desc: "Paged-weight load transport. pread = heap staging, pinned = HIP pinned host staging, direct = O_DIRECT host staging.",
-      options: ["pread", "pinned", "direct"],
-    },
-    hip_wait: {
-      label: "hip_wait",
-      desc: "HIP host wait policy. auto = HIP default, spin = lowest latency, yield/blocking reduce CPU pressure.",
-      options: ["auto", "spin", "yield", "blocking"],
     },
     mmq_screen: {
       label: "mmq_screen",
@@ -8225,7 +5173,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     },
     prefill_drafter: {
       label: "prefill_drafter",
-      desc: "Path to PFlash drafter HFQ (e.g. ~/.hipfire/models/qwen3-0.6b-hf4.hfq). Tokenizer must match the target's. Empty = disabled.",
+      desc: "Path to PFlash drafter HFQ (e.g. ~/.hipfire/models/qwen3-0.6b.hf4). Tokenizer must match the target's. Empty = disabled.",
     },
     prefill_drafter_device: {
       label: "prefill_drafter_device",
@@ -8244,12 +5192,12 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     },
     mtp_mode: {
       label: "mtp_mode",
-      desc: "MTP speculative decode mode. off = pure target decode, on = force MTP, auto = enable where supported.",
+      desc: "Multi-token prediction speculative decode. off = disabled, on = always, auto = arch heuristic.",
       options: ["off", "on", "auto"],
     },
     mtp_k: {
       label: "mtp_k",
-      desc: "MTP draft tokens per speculative decode window.",
+      desc: "Number of draft tokens per multi-token-prediction spec-decode window (1-10).",
       range: [1, 10], step: 1,
     },
   };
@@ -8393,7 +5341,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     // Cursor home + clear screen
     write("\x1b[H\x1b[2J");
     if (isPerModel) {
-      write(`${C.bold}hipfire config ${C.cyan}${resolvedTag}${C.reset}  ${C.dim}${PER_MODEL_CONFIG_PATH}${C.reset}\n`);
+      write(`${C.bold}hipfire config ${C.cyan}${resolvedTag}${C.reset}  ${C.dim}${MODELS_CATALOG_PATH}${C.reset}\n`);
       write(`${C.dim}per-model overlay — overrides win over global. Use r to remove an override.${C.reset}\n`);
     } else {
       write(`${C.bold}hipfire config${C.reset}  ${C.dim}${CONFIG_PATH}${C.reset}\n`);
@@ -8720,16 +5668,17 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
 }
 
 // Sub-TUI launched from the global config TUI's "[per-model configs]" row.
-// Lists registered models (REGISTRY + any user-registered aliases), shows
-// which have overrides, and returns the selected tag or null if user escapes.
+// Lists local catalog models, shows which have overrides, and returns the
+// selected model id or null if user escapes.
 function modelPickerTui(): Promise<string | null> {
+  const catalog = loadModelsCatalog();
   const tags = [
-    ...Object.keys(REGISTRY),
-    ...Object.keys(loadUserAliases()),
+    ...Object.keys(catalog.models),
+    ...Object.keys(catalog.configs ?? {}),
   ].filter((t, i, arr) => arr.indexOf(t) === i).sort();
 
   if (tags.length === 0) {
-    console.log("No models registered. Pull one first: hipfire pull qwen3.5:9b");
+    console.log("No local models. Pull one first: hipfire pull qwen3.5:9b");
     return Promise.resolve(null);
   }
 
@@ -8752,9 +5701,10 @@ function modelPickerTui(): Promise<string | null> {
       const ov = overlays[tag];
       const cnt = ov ? Object.keys(ov).length : 0;
       const caret = i === selected ? `${C.cyan}▸${C.reset}` : " ";
-      const entry = REGISTRY[tag];
-      const desc = entry?.desc ?? "(user-registered)";
-      const size = entry ? `${entry.size_gb}GB`.padStart(7) : "".padStart(7);
+      const model = catalog.models[tag];
+      const entry = model?.registry_tag ? REGISTRY[model.registry_tag] : undefined;
+      const desc = entry?.desc ?? (model ? model.path : "(config-only)");
+      const size = model ? `${model.size_gb.toFixed(1)}GB`.padStart(7) : "".padStart(7);
       const marker = cnt > 0
         ? `${C.magenta}● ${cnt} override${cnt === 1 ? "" : "s"}${C.reset}`
         : `${C.dim}(no overrides)${C.reset}`;
@@ -8835,20 +5785,76 @@ function findDep(binary: string, extraDirs: string[]): string | null {
   return null;
 }
 
+function stripVisibleThinking(content: string, preserveThinking: boolean = false, startedInThink: boolean = false): string {
+  if (preserveThinking) return content.replace(/<\|im_end\|>/g, "").trim();
+  // `open_think` injects the opening <think> into the PROMPT, so the output
+  // begins INSIDE the think span and only a dangling </think> appears — none of
+  // the strips below (which key on a `<think>` opener) would fire, leaking the
+  // reasoning + a stray </think> into content. Prepend a synthetic opener so
+  // the closed case (strip the pair, keep the answer) and the unclosed case
+  // (strip <think>..end) are handled identically to a normal think span.
+  if (startedInThink && !content.includes("<think>")) content = "<think>" + content;
+  return content
+    .replace(/<think>[\s\S]*?<\/think>\s*/g, "")
+    .replace(/<think>[\s\S]*$/, "")
+    .replace(/^\s*<\/think>\s*/, "")
+    .replace(/<\|im_end\|>/g, "")
+    .trim();
+}
+
+function pruneCliRuntimePayload(cliDir: string): void {
+  for (const name of ["node_modules", ".gitignore", "tsconfig.json", "README.md", "bun.lock"]) {
+    rmSync(join(cliDir, name), { recursive: true, force: true });
+  }
+  for (const name of readdirSync(cliDir)) {
+    if (/\.test\.ts$/.test(name) || /^test_.*\.ts$/.test(name) || /^bench_.*\.ts$/.test(name)) {
+      unlinkSync(join(cliDir, name));
+    }
+  }
+}
+
+function syncCliRuntimePayload(repoDir: string): void {
+  const cliSrcDir = join(repoDir, "cli");
+  const cliDstDir = join(HIPFIRE_DIR, "cli");
+  const required = ["registry.json", "index.ts"];
+  for (const file of required) {
+    if (!existsSync(join(cliSrcDir, file))) {
+      console.error(`\nUpdate aborted: cli/${file} missing in repo checkout at`);
+      console.error(`  ${repoDir}`);
+      console.error("Repo may be on a pre-migration commit or in a dirty state. Verify with:");
+      console.error(`  git -C ${repoDir} status && git -C ${repoDir} log -1 --stat`);
+      process.exit(1);
+    }
+  }
+
+  mkdirSync(HIPFIRE_DIR, { recursive: true });
+  const stamp = `${process.pid}-${Date.now()}`;
+  const tmpDir = join(HIPFIRE_DIR, `.cli-update-${stamp}`);
+  const backupDir = join(HIPFIRE_DIR, `.cli-prev-${stamp}`);
+  rmSync(tmpDir, { recursive: true, force: true });
+  rmSync(backupDir, { recursive: true, force: true });
+
+  try {
+    cpSync(cliSrcDir, tmpDir, { recursive: true, force: true });
+    pruneCliRuntimePayload(tmpDir);
+    if (existsSync(cliDstDir)) renameSync(cliDstDir, backupDir);
+    renameSync(tmpDir, cliDstDir);
+    rmSync(backupDir, { recursive: true, force: true });
+  } catch (err) {
+    rmSync(tmpDir, { recursive: true, force: true });
+    if (!existsSync(cliDstDir) && existsSync(backupDir)) {
+      renameSync(backupDir, cliDstDir);
+    }
+    throw err;
+  }
+}
+
 // ─── Main ───────────────────────────────────────────────
+
+refreshModelsCatalog();
 
 const [cmd, ...rest] = process.argv.slice(2);
 switch (cmd) {
-  case "eval": {
-    const { runEvalCommand } = await import("./eval.ts");
-    await runEvalCommand(rest);
-    break;
-  }
-  case "host-profile": {
-    const { runHostProfileCommand } = await import("./host_profile.ts");
-    await runHostProfileCommand(rest);
-    break;
-  }
   case "serve": {
     // Parse flags: `hipfire serve [host] [port] [-d|--detach]`.
     // Also accepts `host:port`, e.g. `hipfire serve 0.0.0.0:11435`.
@@ -8878,8 +5884,23 @@ switch (cmd) {
       }
       host = raw;
     };
+    // Expert-parallel degree for `hipfire serve --tp N` (or `--tp=N`). Sets
+    // HIPFIRE_TP, which buildLoadMessage forwards as params.tp so the daemon
+    // loads via load_model_ep (MiniMax-M2 / DeepSeek-V4 across N GPUs).
+    let tpPending = false;
+    const setTp = (raw: string) => {
+      const n = parseInt(raw, 10);
+      if (!Number.isInteger(n) || n < 1 || n > 64) {
+        console.error(`Invalid --tp value: ${raw} (expected 1..64)`);
+        process.exit(1);
+      }
+      process.env.HIPFIRE_TP = String(n);
+    };
     for (const a of rest) {
-      if (a === "-d" || a === "--detach" || a === "--background") detach = true;
+      if (tpPending) { setTp(a); tpPending = false; continue; }
+      if (a === "--tp") { tpPending = true; continue; }
+      else if (a.startsWith("--tp=")) setTp(a.slice(5));
+      else if (a === "-d" || a === "--detach" || a === "--background") detach = true;
       else if (/^\d+$/.test(a)) setPort(a);
       else if (/^\[[^\]]+\]:\d+$/.test(a)) {
         const m = a.match(/^\[([^\]]+)\]:(\d+)$/)!;
@@ -8892,11 +5913,12 @@ switch (cmd) {
         setPort(a.slice(idx + 1));
       }
       else if (a === "-h" || a === "--help") {
-        console.error(`Usage: hipfire serve [host] [port] [-d|--detach]\n\n`
+        console.error(`Usage: hipfire serve [host] [port] [-d|--detach] [--tp N]\n\n`
           + `  [host]     Bind address (default: cfg.host = ${cfg.host}; examples: 127.0.0.1, 0.0.0.0, ::1)\n`
           + `  [port]     HTTP port (default: cfg.port = ${cfg.port})\n`
           + `  host:port  Shorthand bind address and port (example: 0.0.0.0:11435)\n`
-          + `  -d, --detach   Fork to background; log to ${SERVE_LOG_FILE}, PID in ${SERVE_PID_FILE}\n\n`
+          + `  -d, --detach   Fork to background; log to ${SERVE_LOG_FILE}, PID in ${SERVE_PID_FILE}\n`
+          + `  --tp N         Expert-parallel across N GPUs (MiniMax-M2 / DeepSeek-V4; needs N visible GPUs)\n\n`
           + `Background daemon:\n`
           + `  hipfire serve -d           # start in background\n`
           + `  hipfire serve 0.0.0.0:11435 -d\n`
@@ -8904,7 +5926,20 @@ switch (cmd) {
           + `  hipfire ps                 # check if running\n`
           + `  tail -f ${SERVE_LOG_FILE}  # follow log\n`);
         process.exit(0);
-      } else setHost(a);
+      }
+      // Model-tag-as-host guard: `hipfire serve qwen3.5:9b` used to silently
+      // bind to host "qwen3.5:9b" and fail later. A name:tag shape with a
+      // non-numeric port part (host:port matched above) — or anything that
+      // resolves in the registry — is a model tag, not a bind address.
+      else if (REGISTRY[resolveModelTag(a)] || /^[a-z0-9.-]+:[a-z0-9.-]+$/i.test(a)) {
+        console.error(`'${a}' looks like a model tag — \`hipfire serve\` takes [host] [port], not a model.`);
+        console.error(`The server loads models per-request (or pre-warms cfg.default_model). Instead:`);
+        console.error(`  hipfire run ${a} "hello"                # one-shot (uses running serve if any)`);
+        console.error(`  hipfire config set default_model ${a}   # make serve pre-warm this model`);
+        console.error(`  hipfire serve [host] [port]`);
+        process.exit(1);
+      }
+      else setHost(a);
     }
     host = host ?? cfg.host;
     port = port ?? cfg.port;
@@ -8989,12 +6024,12 @@ switch (cmd) {
   }
   case "run": {
     const model = rest[0];
-    if (!model) { console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>           Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  --max-tokens <int>       Max tokens to generate (default 512)\n  --image <path>           Image for VL models\n  --system <text>          System prompt (overrides per-model default)\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --temp 0.7 --max-tokens 256 \"Write a poem\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\"\n  hipfire run qwen3.5:9b --system \"You are terse.\" \"Summarize quantum mechanics\""); process.exit(1); }
+    if (!model) { console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>           Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  --max-tokens <int>       Max tokens to generate (default 4096)\n  --image <path>           Image for VL models\n  --system <text>          System prompt (overrides per-model default)\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --temp 0.7 --max-tokens 256 \"Write a poem\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\"\n  hipfire run qwen3.5:9b --system \"You are terse.\" \"Summarize quantum mechanics\""); process.exit(1); }
     // Parse --key value flags
     const flagDefs: Record<string, { default: number | string | undefined }> = {
       "--image": { default: undefined }, "--temp": { default: 0.3 },
       "--top-p": { default: 0.8 }, "--repeat-penalty": { default: 1.05 },
-      "--max-tokens": { default: 512 },
+      "--max-tokens": { default: 4096 },
       "--system": { default: undefined },
     };
     const stringFlags = new Set(["--image", "--system"]);
@@ -9088,7 +6123,7 @@ switch (cmd) {
     };
     const grepPatterns = [
       "hipfire-quantize",        // quantizer binary
-      "target/release/hipfire-daemon",  // inference daemon
+      "target/release/examples/daemon",  // inference daemon
       "target/release/examples/serve",   // http serve wrapper (if any)
       "cli/index.ts.*serve",     // bun CLI running serve
       "cli/index.ts.*quantize",  // bun CLI running quantize
@@ -9153,10 +6188,6 @@ switch (cmd) {
     const positional = rest.filter((_, i) => !skipSet.has(i));
     const profileModel = positional[0]; // optional: model to load (triggers kernel compile)
     await profile(profileModel, jsonFlag, kernelFilter);
-    break;
-  }
-  case "eval": {
-    await runEvalCommand(rest);
     break;
   }
   case "update": {
@@ -9275,31 +6306,19 @@ switch (cmd) {
     // config commands keep working. Previously the copy happened after the
     // cargo build, so a build failure left the CLI frozen at its install-time
     // version — users saw "unknown model" for entries added post-install.
-    const { copyFileSync } = await import("fs");
     const exe = process.platform === "win32" ? ".exe" : "";
     const binDir = join(HIPFIRE_DIR, "bin");
-    // Order: registry.json BEFORE index.ts. The new index.ts imports the JSON
-    // at startup; if we copied index.ts first and the JSON copy then failed
-    // (missing in repoDir, IO error, partial git pull), the install would be
-    // stranded — new TS that can't resolve its own data file. Copying JSON
-    // first means a partial failure leaves the CLI in a recoverable state:
-    // either old TS + old JSON, or old TS + new JSON (still loads OK).
-    const registrySrc = join(repoDir, "cli/registry.json");
-    const indexSrc    = join(repoDir, "cli/index.ts");
-    if (!existsSync(registrySrc) || !existsSync(indexSrc)) {
-      console.error("\nUpdate aborted: cli/registry.json or cli/index.ts missing in repo checkout at");
-      console.error(`  ${repoDir}`);
-      console.error("Repo may be on a pre-migration commit or in a dirty state. Verify with:");
-      console.error(`  git -C ${repoDir} status && git -C ${repoDir} log -1 --stat`);
-      process.exit(1);
-    }
-    copyFileSync(registrySrc, join(HIPFIRE_DIR, "cli/registry.json"));
-    copyFileSync(indexSrc,    join(HIPFIRE_DIR, "cli/index.ts"));
+    // Keep index.ts and its sibling runtime modules in lockstep. This mirrors
+    // scripts/install.{sh,ps1}: copy the whole cli/ tree, prune dev/test files,
+    // then swap the staged payload into place. A legacy updater can still copy
+    // only this new index.ts once; keeping index.ts startup-self-contained lets
+    // the user run `hipfire update` again to repair the full payload.
+    syncCliRuntimePayload(repoDir);
     console.error("  CLI updated ✓");
     // Rebuild
     console.error("Rebuilding daemon (this may take a few minutes)...");
     const build = Bun.spawnSync(
-      [CARGO_BIN, "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "--example", "triattn_validate", "--bin", "hipfire-eval", "--bin", "hipfire-host-profile", "-p", "hipfire-runtime"],
+      [CARGO_BIN, "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "--example", "triattn_validate", "-p", "hipfire-runtime"],
       { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"], env: { ...process.env } }
     );
     if (build.exitCode !== 0) {
@@ -9309,7 +6328,7 @@ switch (cmd) {
       console.error("  daemon binary was NOT rebuilt.");
       console.error("");
       console.error("  To diagnose:  hipfire diag");
-      console.error("  To retry:     cd ~/.hipfire/src && cargo build --release --features deltanet -p hipfire-daemon --bin hipfire-daemon");
+      console.error("  To retry:     cd ~/.hipfire/src && cargo build --release --features deltanet -p hipfire-runtime --example daemon");
       process.exit(1);
     }
     // Build the CPU quantizer binary too so `hipfire quantize` works out of the box.
@@ -9328,7 +6347,7 @@ switch (cmd) {
       if (existsSync(src)) { copyFileSync(src, dst); }
     }
     // Workspace binaries (e.g. hipfire-quantize) live under target/release/
-    for (const bin of ["hipfire-quantize", "hipfire-eval", "hipfire-host-profile"]) {
+    for (const bin of ["hipfire-quantize"]) {
       const src = join(repoDir, `target/release/${bin}${exe}`);
       const dst = join(binDir, `${bin}${exe}`);
       if (existsSync(src)) { copyFileSync(src, dst); }
@@ -9373,6 +6392,23 @@ switch (cmd) {
         console.error(`  Updated ${gpuArch} kernels ✓ (cache cleared)`);
       }
     }
+    // Rename legacy .hfq model files to .hf4/.hf6
+    const { renameSync } = await import("fs");
+    try {
+      for (const f of readdirSync(MODELS_DIR)) {
+        if (!f.endsWith(".hfq")) continue;
+        let newName = "";
+        if (f.endsWith(".q4.hfq")) newName = f.replace(/\.q4\.hfq$/, ".hf4");
+        else if (f.endsWith(".hfq6.hfq")) newName = f.replace(/\.hfq6\.hfq$/, ".hf6");
+        else if (f.match(/-hfq4\.hfq$/)) newName = f.replace(/-hfq4\.hfq$/, ".hf4");
+        else if (f.match(/-hfq4g\d+\.hfq$/)) continue; // skip experimental variants
+        else newName = f.replace(/\.hfq$/, ".hf4"); // bare .hfq → assume hf4
+        if (newName && newName !== f && !existsSync(join(MODELS_DIR, newName))) {
+          renameSync(join(MODELS_DIR, f), join(MODELS_DIR, newName));
+          console.error(`  Renamed ${f} → ${newName}`);
+        }
+      }
+    } catch {}
     // Pre-compile GPU kernels so `hipfire serve` starts instantly
     const daemonForPrecompile = join(binDir, `daemon${exe}`) ;
     if (existsSync(daemonForPrecompile)) {
@@ -9481,7 +6517,7 @@ switch (cmd) {
     const envBin2 = process.env.HIPFIRE_DAEMON_BIN;
     const daemonBins = [
       ...(envBin2 ? [envBin2] : []),
-      resolve(__dirname, `../target/release/hipfire-daemon${exe2}`),
+      resolve(__dirname, `../target/release/examples/daemon${exe2}`),
       join(HIPFIRE_DIR, "bin", `daemon${exe2}`),
     ];
     const daemonBin = daemonBins.find(p => existsSync(p));
@@ -9513,6 +6549,7 @@ switch (cmd) {
       console.log("\nProbing GPU via HIP runtime...");
       try {
         const de = new Engine();
+        de.oneShot = true; // hunt3 H-B: one-shot GPU probe — exit on daemon EOF is correct
         await de.start();
         await de.send({ type: "ping" }); await de.recv();
         await de.send({ type: "diag" });
@@ -9595,8 +6632,7 @@ switch (cmd) {
     console.log("\nDone.");
     break;
   }
-  case "bench":
-  case "benchmark": {
+  case "bench": {
     const exp = rest.includes("--exp");
     const runsIdx = rest.indexOf("--runs");
     const runs = runsIdx >= 0 && runsIdx + 1 < rest.length ? parseInt(rest[runsIdx + 1]) : 5;
@@ -9609,7 +6645,6 @@ switch (cmd) {
     const benchModel = positional[0];
     if (!benchModel) {
       console.error(`Usage: hipfire bench <model> [--exp] [--runs N] [prompt]
-       hipfire benchmark <model> [--exp] [--runs N] [prompt]
 
   Standard benchmark: measure decode + prefill tok/s over N runs.
   --exp    RDNA2 only: test all 5 kernel variants (occupancy/unroll/cache tradeoffs)
@@ -9627,6 +6662,11 @@ Examples:
   }
   case "rm": {
     const tag = rest[0] || "";
+    if (!tag) {
+      console.error("Usage: hipfire rm <model>   (e.g. hipfire rm qwen3.5:9b)");
+      console.error("  See installed models: hipfire list");
+      process.exit(1);
+    }
     const resolved = resolveModelTag(tag);
     const entry = REGISTRY[resolved];
     const path = entry ? join(MODELS_DIR, entry.file) : findModel(tag);
@@ -9635,6 +6675,8 @@ Examples:
       console.log(`Removed ${path}`);
     } else {
       console.error(`Model not found: ${tag}`);
+      console.error(`  See installed models: hipfire list`);
+      process.exit(1);
     }
     break;
   }
@@ -9665,10 +6707,10 @@ Q4_0 / Q6_K / F16 / BF16 / F32) and re-quantized to the chosen
 format. Pick by model architecture:
 
   hf4 / hf6:   dense (Llama / Mistral / Gemma / older Qwen). DEFAULT.
-               Output names: <stem>-hf4.hfq / <stem>-hf6.hfq.
+               Output extensions: .hf4 / .hf6.
   mq4 / mq6:   Qwen3.5+ family (DeltaNet hot path). Override only when
                the source GGUF is a Qwen3.5+ model.
-               Output names: <stem>-mq4.hfq / <stem>-mq6.hfq.
+               Output extensions: .mq4 / .mq6.
 
 Quality is lower than quantizing from full-precision safetensors due
 to the double-quant roundtrip; raise to hf6 / mq6 if you can spare
@@ -9681,11 +6723,11 @@ Examples:
       --install --register qwopus:4b
 
   # Local fine-tune → MQ4:
-  hipfire quantize ./my-finetune --format mq4 -o finetune-mq4.hfq
+  hipfire quantize ./my-finetune --format mq4 -o finetune.mq4
 
   # GGUF → HF4 (one-shot, install into ~/.hipfire/models):
   hipfire quantize ./tinyllama.Q4_K_M.gguf --install --register tinyllama:1b-gguf
-  # → ~/.hipfire/models/tinyllama-1.1b-chat-v1.0.Q4_K_M-hf4.hfq
+  # → ~/.hipfire/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.hf4
 
   # Qwen3.5+ GGUF → MQ4 (DeltaNet hot path):
   hipfire quantize ./qwen3.5.Q4_K_M.gguf --format mq4 --install --register q35:9b-gguf
@@ -9774,11 +6816,11 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
     if (!tag || tag === "-h" || tag === "--help") {
       console.error(`Usage: hipfire sidecar-gen <model> [flags]
 
-Generate a TriAttention calibration sidecar (.triattn.hfq) for the given model.
+Generate a TriAttention calibration sidecar (.triattn.bin) for the given model.
 The sidecar enables automatic KV-cache eviction and is required for CASK
 generation on large-context models (e.g. 27B with >16K max_position_embeddings).
 
-The sidecar file is saved next to the model file (same directory as the .hfq)
+The sidecar file is saved next to the model file (same directory as the .mq4/.hf4)
 so the daemon auto-discovers it.
 
 Model:
@@ -9791,13 +6833,13 @@ Flags:
   --chunk-len N          Chunk length in tokens (default: 256)
   --gpu-calib            Use GPU kernel triattn_accumulate (faster on MI300X / RDNA3+)
   --cpu-calib            Force CPU calibration path
-  -o, --output PATH      Output sidecar file path (default: <model-stem>.triattn.hfq next to model)
+  -o, --output PATH      Output sidecar file path (default: <model>.triattn.bin next to model)
   --skip-validation      Skip Phase 2 validation — faster for sidecar generation only
 
 Examples:
   hipfire sidecar-gen qwen3.5:9b
-  hipfire sidecar-gen ./my-model-mq4.hfq --corpus wikipedia.txt --max-tokens 100000
-  hipfire sidecar-gen ~/.hipfire/models/qwen3.6-27b-mq4.hfq -o /tmp/qwen3.6-27b-mq4.triattn.hfq`);
+  hipfire sidecar-gen ./my-model.mq4 --corpus wikipedia.txt --max-tokens 100000
+  hipfire sidecar-gen ~/.hipfire/models/qwen3.6-27b.mq4 -o /tmp/sidecar.bin`);
       process.exit(tag ? 0 : 1);
     }
     let corpusPath: string | undefined;
@@ -9840,8 +6882,8 @@ Examples:
       process.exit(1);
     }
 
-    // Determine output path — default is <model-stem>.triattn.hfq next to the model file.
-    const sidecarPath = output ?? defaultRoleSidecarPath(resolved, "triattn");
+    // Determine output path — default is <model>.triattn.bin next to the model file.
+    const sidecarPath = output ?? `${resolved}.triattn.bin`;
 
     console.error(`Generating TriAttention calibration sidecar for: ${tag}`);
     console.error(`  Model:        ${resolved}`);
@@ -9953,15 +6995,16 @@ Examples:
     // `hipfire config <model:tag> list|get|set|reset ...` → per-model scripting
     // `hipfire config <model:tag> cask-profile <name>`   → per-model bundle setter
     //
-    // Disambiguate: first arg is a model tag if it's a known REGISTRY entry
-    // (resolved) or matches the `name:tag` shape. Otherwise treat as action.
+    // Disambiguate: first arg is a model tag if it maps to a local catalog
+    // model, a known REGISTRY entry, or matches the `name:tag` shape.
+    // Otherwise treat as action.
     let [firstArg, maybeKey, ...valueArgs] = rest;
     let modelScope: string | null = null;
     if (firstArg && !["list", "get", "set", "reset", "cask-profile"].includes(firstArg)) {
-      // If looks like a tag, scope to that model
       const resolved = resolveModelTag(firstArg);
-      if (REGISTRY[resolved] || firstArg.includes(":")) {
-        modelScope = resolved;
+      const catalogId = catalogModelIdForConfigKey(loadModelsCatalog(), firstArg);
+      if (catalogId || REGISTRY[resolved] || firstArg.includes(":")) {
+        modelScope = catalogId ?? resolved;
         [firstArg, maybeKey, ...valueArgs] = rest.slice(1);
       }
     }
@@ -10020,7 +7063,7 @@ Examples:
       if (modelScope) {
         const ov = loadPerModelConfigs()[modelScope] ?? {};
         const merged = resolveModelConfig(modelScope);
-        console.log(`Per-model config: ${modelScope}  (${PER_MODEL_CONFIG_PATH})\n`);
+        console.log(`Per-model config: ${modelScope}  (${MODELS_CATALOG_PATH})\n`);
         for (const k of validKeys) {
           if (!(PER_MODEL_KEYS as readonly string[]).includes(k)) continue;
           const v = (merged as any)[k];
@@ -10069,23 +7112,20 @@ Examples:
       if (typeof defaultVal === "number" && isNaN(parsed as number)) { console.error(`${key} requires a number`); process.exit(1); }
       if (!validateConfigValue(key, parsed)) {
         const hints: Record<string, string> = {
-          kv_cache: "one of: auto, q8, asym4, asym3, asym2 (turbo/turbo2/turbo3/turbo4 aliases also accepted)",
+          kv_cache: "one of: auto, q8, fwht4, fwht3, fwht2, asym4, asym3, asym2 (turbo/turbo2/turbo3/turbo4 are legacy asym aliases)",
+          kv_adaptive: "one of: off, conservative, balanced, aggressive, advanced:k=<fwht4|fwht3|fwht2>,v=<lloyd4|lloyd3|lloyd2>",
           flash_mode: "one of: auto, always, never (applies to Q8 path; asym modes are flash-only)",
           temperature: "number between 0 and 2",
           top_p: "number in (0, 1]",
           repeat_penalty: "number between 1.0 and 3.0",
           max_tokens: "integer between 1 and 131072",
-          max_seq: "logical context-window limit (tokens). Integer 512-524288",
+          max_seq: "KV cache capacity (tokens). Integer 512-524288",
           thinking: "one of: on, off. Controls whether the model reasons in <think> blocks.",
           max_think_tokens: "integer 0-32768. Budget for reasoning tokens (0 = unlimited).",
           host: "non-empty bind address without whitespace (examples: 127.0.0.1, 0.0.0.0, ::1)",
           port: "integer between 1 and 65535",
           idle_timeout: "seconds of inactivity before serve unloads the model (0 = never, max 86400)",
           default_model: "non-empty model tag",
-          gpu_slab_load: "one of: auto, on, off",
-          gpu_slab_mib: "integer MiB between 1 and 262144",
-          load_transport: "one of: pread, pinned, direct",
-          hip_wait: "one of: auto, spin, yield, blocking",
         };
         console.error(`${key} must be ${hints[key] || "valid"}`); process.exit(1);
       }
@@ -10179,7 +7219,7 @@ Examples:
       if (!sidecarSet && profileName !== "off" && profileName !== "auto") {
         console.log(`note: cask_sidecar is not set. The profile is configured, but eviction`);
         console.log(`      only engages when a sidecar path is loaded. Set with:`);
-        console.log(`      hipfire config${modelScope ? ` ${modelScope}` : ""} set cask_sidecar /path/to/<model>.triattn.hfq`);
+        console.log(`      hipfire config${modelScope ? ` ${modelScope}` : ""} set cask_sidecar /path/to/<model>.triattn.bin`);
       }
       if (profileName === "auto" && !sidecarSet) {
         console.log(`note: auto-attach will scan for a sidecar next to the model file at load.`);
@@ -10197,6 +7237,14 @@ Examples:
     break;
   }
   default: {
+    // Unknown command: error to stderr + nonzero exit so scripts can detect
+    // the typo instead of parsing help text off a 0-exit stdout.
+    // `help`/`-h`/`--help` are explicit help requests, not typos.
+    if (cmd && !["help", "-h", "--help"].includes(cmd)) {
+      console.error(`Unknown command: ${cmd}`);
+      console.error(`Run \`hipfire help\` for the full command list.`);
+      process.exit(1);
+    }
     // First-run hint: if no config, no models, show a friendly setup tip.
     // (Only when invoked with no args — still show full help text below.)
     if (!cmd) {
@@ -10210,7 +7258,8 @@ Examples:
         console.log(`  1. Sanity-check your GPU:   \x1b[1mhipfire diag\x1b[0m`);
         console.log(`  2. Pull a model:            \x1b[1mhipfire pull qwen3.5:4b\x1b[0m`);
         console.log(`  3. Run your first prompt:   \x1b[1mhipfire run qwen3.5:4b "hello"\x1b[0m`);
-        console.log(`  4. Tweak settings:          \x1b[1mhipfire config\x1b[0m  (interactive)`);
+        console.log(`  4. Chat interactively:      \x1b[1mhipfire chat qwen3.5:4b\x1b[0m`);
+        console.log(`  5. Tweak settings:          \x1b[1mhipfire config\x1b[0m  (interactive)`);
         console.log(`\nFull command list:\n`);
       }
     }
@@ -10218,22 +7267,19 @@ Examples:
 
   pull <model>          Download model from HuggingFace
   run <model> [prompt]  Generate text (auto-pulls; uses running serve if any)
+  chat <model>          Interactive chat TUI (streaming, multi-turn; uses running serve if any)
   serve [host] [port] [-d]
                         Start OpenAI-compatible server (-d = background daemon)
   stop                  Stop the background serve daemon
   quantize <hf-id|dir>  Quantize to MQ4/MQ6 (CPU) — with optional HF upload
-  eval <opts>           Run quant admission/model eval harness
-  host-profile [opts]   Measure host, GPU-copy, and ~/.hipfire/models bandwidth
   bench <model> [opts]  Benchmark tok/s (--exp for RDNA2 variant sweep, --runs N)
-  benchmark <model>     Alias for bench
   profile [model]       Kernel efficiency profiler (--json, --kernel <name>)
-  eval --model <model>  Run eval harness tiers (fast default)
   list [-r]             Show local models (-r: show available too)
   config                Interactive settings editor (TUI); also: config [list|set|get|reset]
   diag                  Diagnostics — GPU, VRAM, HIP version, kernels, models
   ps                    Show running hipfire processes (serve, quantize, uploads)
   rm <model>            Delete model
-  sidecar-gen <model>   Generate TriAttention calibration sidecar (.triattn.hfq)
+  sidecar-gen <model>   Generate TriAttention calibration sidecar (.triattn.bin)
   update                Pull latest code, rebuild, update kernels
 
 Models (MQ4 default: FWHT-rotated 4-bit, quality-gated):
@@ -10256,7 +7302,7 @@ Quantize any Qwen 3.5 HF model (or local dir) — one-shot download + upload:
   hipfire quantize Jackrong/Qwopus3.5-4B-v3 --both \\
         --upload schuttdev/hipfire-qwopus-4b --create-repo \\
         --install --register qwopus:4b
-  hipfire quantize ./my-finetune --format mq6 -o my-finetune-mq6.hfq`);
+  hipfire quantize ./my-finetune --format mq6 -o my-finetune.mq6`);
     break;
   }
 }

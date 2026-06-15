@@ -3,6 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 
 #define HD 128
 #define TILE_ROWS 4
@@ -21,6 +22,25 @@ __global__ void gated_delta_net_q8(
     int n_heads,
     int head_dim,
     unsigned int frame
+    unsigned int frame,  // per-launch monotonic counter (host-supplied) — fresh,
+                         // data-INDEPENDENT entropy for the stochastic-rounding
+                         // dither. Without it the dither was seeded from my_max
+                         // (state-derived) → correlated, biased over the recurrence.
+    __half* __restrict__ s_ef_residual   // OPTIONAL (nullable) per-element f16
+                         // error-feedback residual, [n_heads*HD*HD], same layout
+                         // as s_q8. Non-null ⇒ DETERMINISTIC round + sigma-delta
+                         // noise-shaping (carry the per-element quant residual,
+                         // fold it back before the next requant) instead of
+                         // stochastic rounding. DeltaNet's contractive decay damps
+                         // the shaped error → ~FP32 state at Q8's byte container
+                         // (CPU sweep: 5.7× lower L2 than stochastic at α=0.99).
+    ,
+    // Requant cadence gate (host-supplied). 0 = single-end: requant S→Q8 ONCE at
+    // the last token (MQ4-fast path; intermediate tokens keep FP32 state in LDS).
+    // 1 = per-token: Q8 roundtrip after every token (PARO drift-echo correctness,
+    // ~1.8× slower in batched). MQ4/HFQ4 weights pass 0; PARO passes 1. For
+    // n_tokens==1 (AR decode / DFlash draft) both modes are identical.
+    int requant_per_token
 ) {
     const int h = blockIdx.x;
     const int tile = blockIdx.y;
@@ -88,22 +108,35 @@ __global__ void gated_delta_net_q8(
             if (tid == 0)
                 output[t * stride + h * HD + row] = out_v;
         }
-    }
 
-    // Requant FP32 → Q8 with stochastic rounding.
-    // Deterministic roundf systematically crushes small values to 0, causing
-    // cumulative state corruption over hundreds of tokens.
-    // Stochastic rounding: floor(x + uniform) has E[result] = x (unbiased).
-    // PRNG: position-derived LCG — deterministic, no shared state, no extra registers.
-    for (int r = 0; r < TILE_ROWS; r++) {
-        float* sr = S_tile + r * HD;
-        float s0 = sr[tid], s1 = sr[tid+32], s2 = sr[tid+64], s3 = sr[tid+96];
-        float my_max = fmaxf(fmaxf(fabsf(s0), fabsf(s1)), fmaxf(fabsf(s2), fabsf(s3)));
-        for (int o = 16; o > 0; o >>= 1)
-            my_max = fmaxf(my_max, __shfl_xor(my_max, o));
+        // Q8 requant. Cadence gated by `requant_per_token`:
+        //   per_token=1 (PARO): requant S→Q8 after EVERY token and dequant back into
+        //     LDS so the next token reads the Q8-roundtripped state (matches decode
+        //     cadence; prevents recurrent-state drift → PARO prompt echo).
+        //   per_token=0 (MQ4-fast, DEFAULT): requant ONCE at the last token;
+        //     intermediate tokens keep FP32 state in LDS. ~1.8× faster in batched
+        //     (no n_tokens× requant, VGPR pressure lower). MQ4 stays coherent with
+        //     this (the drift echo is PARO-specific; prototype cceb07c0 = 254 tok/s
+        //     coherent). For n_tokens==1 both modes are identical.
+        // Stochastic rounding: floor(x + uniform) has E[result] = x (unbiased).
+        const bool per_token = (requant_per_token != 0);
+        const bool last_tok = (t == n_tokens - 1);
+        if (!per_token && !last_tok) continue;
+        const bool use_ef = (s_ef_residual != nullptr);
+        for (int r = 0; r < TILE_ROWS; r++) {
+            int rr = row_start + r;
+            float* sr = S_tile + r * HD;
+            float s0 = sr[tid], s1 = sr[tid+32], s2 = sr[tid+64], s3 = sr[tid+96];
 
-        float inv_s = (my_max > 0.0f) ? (127.0f / my_max) : 0.0f;
-        signed char* dst = sq_base + r * HD;
+            // EF (sigma-delta): fold the carried per-element quant residual into
+            // the state BEFORE requant; efr layout matches s_q8 (h*HD*HD+row*HD+col).
+            __half* efr = use_ef ? (s_ef_residual + h * HD * HD + rr * HD) : nullptr;
+            if (use_ef) {
+                s0 += __half2float(efr[tid]);
+                s1 += __half2float(efr[tid+32]);
+                s2 += __half2float(efr[tid+64]);
+                s3 += __half2float(efr[tid+96]);
+            }
 
         // Stochastic rounding: generate 4 uniform random values in [0, 1).
         // Seed = spatial location plus a host-supplied per-launch frame so the
@@ -122,5 +155,55 @@ __global__ void gated_delta_net_q8(
         dst[tid+96]   = STOCH_ROUND(s3);
         #undef STOCH_ROUND
         if (tid == 0) s_scales[h * HD + row_start + r] = (my_max > 0.0f) ? (my_max / 127.0f) : 1.0f;
+            float my_max = fmaxf(fmaxf(fabsf(s0), fabsf(s1)), fmaxf(fabsf(s2), fabsf(s3)));
+            for (int o = 16; o > 0; o >>= 1)
+                my_max = fmaxf(my_max, __shfl_xor(my_max, o));
+
+            float inv_s = (my_max > 0.0f) ? (127.0f / my_max) : 0.0f;
+            float scale = (my_max > 0.0f) ? (my_max / 127.0f) : 1.0f;
+
+            int q0, q1, q2, q3;
+            if (use_ef) {
+                // Deterministic round-to-nearest; re-store the fresh residual
+                // (val − dequant), capturing round AND clamp-saturation error so
+                // the feedback corrects both. Deterministic ⇒ `frame` unused here.
+                #define EF_ROUND(val, slot) ({ \
+                    float qf = fminf(fmaxf(rintf((val) * inv_s), -128.0f), 127.0f); \
+                    efr[slot] = __float2half((val) - qf * scale); \
+                    (int)qf; \
+                })
+                q0 = EF_ROUND(s0, tid);    q1 = EF_ROUND(s1, tid+32);
+                q2 = EF_ROUND(s2, tid+64); q3 = EF_ROUND(s3, tid+96);
+                #undef EF_ROUND
+            } else {
+                // Stochastic rounding: seed = spatial (h, row, tid) + (frame + t)
+                // for fresh per-token entropy (data-independent; the old
+                // my_max-derived seed was correlated/biased over the recurrence).
+                unsigned int rng = (unsigned int)(h * 1664525u + rr * 1013904223u
+                                 + tid * 214013u + (frame + (unsigned int)t) * 2531011u);
+                #define STOCH_ROUND(val) ({ \
+                    rng = rng * 1664525u + 1013904223u; \
+                    float noise = (float)(rng >> 8) * (1.0f / 16777216.0f); \
+                    (int)fminf(fmaxf(floorf((val) * inv_s + noise), -128.0f), 127.0f); \
+                })
+                q0 = STOCH_ROUND(s0); q1 = STOCH_ROUND(s1);
+                q2 = STOCH_ROUND(s2); q3 = STOCH_ROUND(s3);
+                #undef STOCH_ROUND
+            }
+
+            // per_token mode: dequant back into LDS so the next token reads the Q8
+            // state. fast mode reaches here only on last_tok, so skip (we're done).
+            if (per_token && !last_tok) {
+                sr[tid] = q0 * scale; sr[tid+32] = q1 * scale;
+                sr[tid+64] = q2 * scale; sr[tid+96] = q3 * scale;
+            }
+
+            if (last_tok) {
+                signed char* dst = sq_base + r * HD;
+                dst[tid]    = (signed char)q0; dst[tid+32] = (signed char)q1;
+                dst[tid+64] = (signed char)q2; dst[tid+96] = (signed char)q3;
+                if (tid == 0) s_scales[h * HD + rr] = scale;
+            }
+        }
     }
 }

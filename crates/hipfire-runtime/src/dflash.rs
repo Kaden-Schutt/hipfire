@@ -227,15 +227,7 @@ fn hfq_weight(
                     "dflash {name} F16 byte-size mismatch"
                 );
                 let buf = gpu.upload_raw(data, &[m * k])?;
-                Ok(WeightTensor {
-                    buf,
-                    gpu_dtype: DType::F16,
-                    m,
-                    k,
-                    row_stride: 0,
-                    paro: None,
-                    awq_scale: None,
-                })
+                Ok::<WeightTensor, hip_bridge::HipError>(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0, paro: None, awq_scale: None })
             } else {
                 let f32_data: Vec<f32> = data
                     .chunks_exact(2)
@@ -1409,17 +1401,27 @@ pub fn draft_forward_opts(
 
         // Attention: Q [B, n_heads, hd] × K [tot, n_kv_heads, hd]^T → scores
         // (with GQA expansion) → softmax → @V.
-        gpu.attention_dflash_f32(
-            &scratch.q,
-            &scratch.k_cat,
-            &scratch.v_cat,
-            &scratch.attn_out,
-            b,
-            tot,
-            cfg.n_heads,
-            cfg.n_kv_heads,
-            hd,
-        )?;
+        // Dispatched via unified full-attention path (AttnFullF32 → DflashScalar).
+        // NOTE: adding a WMMA rung here changes spec-decode numerics → draft logits
+        // → acceptance patterns. Any future WMMA draft rung requires a dedicated
+        // feedback_attention_precision sweep with acceptance-rate tracking.
+        {
+            use crate::llama::{attention_family, DispatchCtx, FullAttnParams, KernelKey};
+            let ctx = DispatchCtx::new(gpu);
+            let family = attention_family();
+            family.run_full_attention(&ctx, gpu, &FullAttnParams {
+                key: KernelKey::AttnFullF32,
+                q: &scratch.q,
+                k: &scratch.k_cat,
+                v: &scratch.v_cat,
+                out: &scratch.attn_out,
+                n: b,
+                seq_len: tot,
+                n_heads: cfg.n_heads,
+                n_kv_heads: cfg.n_kv_heads,
+                head_dim: hd,
+            }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+        };
         if let Some(t) = t2 {
             gpu.hip.device_synchronize()?;
             us_attn_kernel += t.elapsed().as_micros();

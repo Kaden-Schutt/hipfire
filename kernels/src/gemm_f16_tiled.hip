@@ -5,19 +5,32 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
-// Optimized F16xF32 GEMM for the vision encoder.
+// Optimized F16xF32 GEMM (originally for the vision encoder).
 // Computes: Y[M, N] = W_f16[M, K] @ X_f32[N, K]^T
 //
-// Same grid as naive gemm_f16: Grid=[M, N], Block=[32]
-// Optimizations over naive:
-//   1. 8-way unrolled inner loop (ILP)
-//   2. Stride-256 instead of stride-32 (better cache line utilization)
-//   3. Registers over shared memory (avoids occupancy penalty)
+// Same grid as naive gemm_f16: Grid=[M, N], Block=[32], LDS=0.
+// One wave computes one output dot product Y[m, n] = W[m, :] · X[n, :].
+//
+// K partition (disjoint, exact): lane `tid` owns elements
+// {tid + 32*j : tid + 32*j < K}. The main loop walks 8 of those per
+// iteration (256 elements per wave) with 8 independent accumulators
+// (8-way ILP); consecutive lanes read consecutive addresses, so every
+// load is coalesced. The stride-32 tail loop finishes any K remainder
+// (arbitrary K supported, including K % 32 != 0).
+//
+// History: the original version of this kernel started each lane at
+// k = tid*4 but then read 16 consecutive elements per sub-block and
+// stepped by 512, so lanes overlapped 4x inside each 128-chunk, and a
+// per-lane contiguous tail loop re-summed the entire trailing K
+// remainder once per lane (~31x multi-count) — output came back ~10x
+// too large (f16_gemv_parity: l2 ratio 10.42 at m=256,k=4096,n=1).
+// This rewrite keeps the launch contract and the performance shape
+// (register accumulators, no LDS) but covers K exactly once.
 //
 // Shared memory tiling doesn't help here because:
 //   - K is small (1152-4304), fits in L2 cache
 //   - LDS allocation reduces occupancy too much
-//   - The naive kernel's bottleneck is ILP, not memory bandwidth
+//   - The bottleneck is ILP, not memory bandwidth
 
 __launch_bounds__(32, 20)
 extern "C" __global__ void gemm_f16_tiled(
@@ -36,95 +49,33 @@ extern "C" __global__ void gemm_f16_tiled(
     const float* x_row = X + (long long)n * K;
 
     float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+    float sum4 = 0.0f, sum5 = 0.0f, sum6 = 0.0f, sum7 = 0.0f;
 
-    // 4-way accumulator with stride-128 (4x32=128 elements per iteration)
-    // Better ILP than naive's single accumulator
-    int k = tid * 4;
-    for (; k + 511 < K; k += 512) {
-        sum0 += (float)w_row[k]       * x_row[k]
-              + (float)w_row[k + 1]   * x_row[k + 1]
-              + (float)w_row[k + 2]   * x_row[k + 2]
-              + (float)w_row[k + 3]   * x_row[k + 3]
-              + (float)w_row[k + 4]   * x_row[k + 4]
-              + (float)w_row[k + 5]   * x_row[k + 5]
-              + (float)w_row[k + 6]   * x_row[k + 6]
-              + (float)w_row[k + 7]   * x_row[k + 7]
-              + (float)w_row[k + 8]   * x_row[k + 8]
-              + (float)w_row[k + 9]   * x_row[k + 9]
-              + (float)w_row[k + 10]  * x_row[k + 10]
-              + (float)w_row[k + 11]  * x_row[k + 11]
-              + (float)w_row[k + 12]  * x_row[k + 12]
-              + (float)w_row[k + 13]  * x_row[k + 13]
-              + (float)w_row[k + 14]  * x_row[k + 14]
-              + (float)w_row[k + 15]  * x_row[k + 15];
-
-        int k2 = k + 128;
-        sum1 += (float)w_row[k2]       * x_row[k2]
-              + (float)w_row[k2 + 1]   * x_row[k2 + 1]
-              + (float)w_row[k2 + 2]   * x_row[k2 + 2]
-              + (float)w_row[k2 + 3]   * x_row[k2 + 3]
-              + (float)w_row[k2 + 4]   * x_row[k2 + 4]
-              + (float)w_row[k2 + 5]   * x_row[k2 + 5]
-              + (float)w_row[k2 + 6]   * x_row[k2 + 6]
-              + (float)w_row[k2 + 7]   * x_row[k2 + 7]
-              + (float)w_row[k2 + 8]   * x_row[k2 + 8]
-              + (float)w_row[k2 + 9]   * x_row[k2 + 9]
-              + (float)w_row[k2 + 10]  * x_row[k2 + 10]
-              + (float)w_row[k2 + 11]  * x_row[k2 + 11]
-              + (float)w_row[k2 + 12]  * x_row[k2 + 12]
-              + (float)w_row[k2 + 13]  * x_row[k2 + 13]
-              + (float)w_row[k2 + 14]  * x_row[k2 + 14]
-              + (float)w_row[k2 + 15]  * x_row[k2 + 15];
-
-        int k3 = k + 256;
-        sum2 += (float)w_row[k3]       * x_row[k3]
-              + (float)w_row[k3 + 1]   * x_row[k3 + 1]
-              + (float)w_row[k3 + 2]   * x_row[k3 + 2]
-              + (float)w_row[k3 + 3]   * x_row[k3 + 3]
-              + (float)w_row[k3 + 4]   * x_row[k3 + 4]
-              + (float)w_row[k3 + 5]   * x_row[k3 + 5]
-              + (float)w_row[k3 + 6]   * x_row[k3 + 6]
-              + (float)w_row[k3 + 7]   * x_row[k3 + 7]
-              + (float)w_row[k3 + 8]   * x_row[k3 + 8]
-              + (float)w_row[k3 + 9]   * x_row[k3 + 9]
-              + (float)w_row[k3 + 10]  * x_row[k3 + 10]
-              + (float)w_row[k3 + 11]  * x_row[k3 + 11]
-              + (float)w_row[k3 + 12]  * x_row[k3 + 12]
-              + (float)w_row[k3 + 13]  * x_row[k3 + 13]
-              + (float)w_row[k3 + 14]  * x_row[k3 + 14]
-              + (float)w_row[k3 + 15]  * x_row[k3 + 15];
-
-        int k4 = k + 384;
-        sum3 += (float)w_row[k4]       * x_row[k4]
-              + (float)w_row[k4 + 1]   * x_row[k4 + 1]
-              + (float)w_row[k4 + 2]   * x_row[k4 + 2]
-              + (float)w_row[k4 + 3]   * x_row[k4 + 3]
-              + (float)w_row[k4 + 4]   * x_row[k4 + 4]
-              + (float)w_row[k4 + 5]   * x_row[k4 + 5]
-              + (float)w_row[k4 + 6]   * x_row[k4 + 6]
-              + (float)w_row[k4 + 7]   * x_row[k4 + 7]
-              + (float)w_row[k4 + 8]   * x_row[k4 + 8]
-              + (float)w_row[k4 + 9]   * x_row[k4 + 9]
-              + (float)w_row[k4 + 10]  * x_row[k4 + 10]
-              + (float)w_row[k4 + 11]  * x_row[k4 + 11]
-              + (float)w_row[k4 + 12]  * x_row[k4 + 12]
-              + (float)w_row[k4 + 13]  * x_row[k4 + 13]
-              + (float)w_row[k4 + 14]  * x_row[k4 + 14]
-              + (float)w_row[k4 + 15]  * x_row[k4 + 15];
+    // Main loop: 256 elements per wave iteration, lane-coalesced
+    // stride-32 reads, 8 independent accumulators (8-way ILP).
+    int k = tid;
+    for (; k + 224 < K; k += 256) {
+        sum0 += (float)w_row[k]       * x_row[k];
+        sum1 += (float)w_row[k +  32] * x_row[k +  32];
+        sum2 += (float)w_row[k +  64] * x_row[k +  64];
+        sum3 += (float)w_row[k +  96] * x_row[k +  96];
+        sum4 += (float)w_row[k + 128] * x_row[k + 128];
+        sum5 += (float)w_row[k + 160] * x_row[k + 160];
+        sum6 += (float)w_row[k + 192] * x_row[k + 192];
+        sum7 += (float)w_row[k + 224] * x_row[k + 224];
     }
 
-    // Handle remaining with single accumulator
-    for (; k < K; k += 128) {
-        int end = k + 128;
-        if (end > K) end = K;
-        for (int j = k; j < end; j++) {
-            sum0 += (float)w_row[j] * x_row[j];
-        }
+    // Tail: stride-32, single accumulator. Picks up exactly where the
+    // main loop left this lane off, so coverage stays disjoint + exact.
+    for (; k < K; k += 32) {
+        sum0 += (float)w_row[k] * x_row[k];
     }
 
-    float sum = sum0 + sum1 + sum2 + sum3;
+    float sum = ((sum0 + sum1) + (sum2 + sum3))
+              + ((sum4 + sum5) + (sum6 + sum7));
 
-    // Warp reduction
+    // Wave-shuffle reduction (wave32) — same idiom as gemm_f16 /
+    // gemv_f16_xf32.
     for (int offset = 16; offset > 0; offset >>= 1)
         sum += __shfl_down(sum, offset);
 

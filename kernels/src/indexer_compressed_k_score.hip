@@ -51,6 +51,9 @@ extern "C" __global__ void indexer_compressed_k_score(
     const int tid  = threadIdx.x;
     if (head >= n_idx_heads) return;
 
+    // Cross-warp reduction scratch (one slot per wave32 warp in the block).
+    __shared__ float partial[THREADS_PER_BLOCK / 32];
+
     // Outer loop over position tiles.
     for (int n0 = blockIdx.y * TILE_POSITIONS;
          n0 < (blockIdx.y + 1) * TILE_POSITIONS && n0 < n_compressed;
@@ -63,11 +66,23 @@ extern "C" __global__ void indexer_compressed_k_score(
             const __half k_val = k_idx_cache[(head * idx_head_dim + d) * n_compressed + n0];
             acc += __half2float(q_val) * __half2float(k_val);
         }
-        // Wave-shuffle reduction (wave32 on gfx11xx).
+        // Intra-warp shuffle reduction (wave32 on gfx11xx), then a
+        // fixed-order cross-warp combine. THREADS_PER_BLOCK=64 is TWO
+        // wave32 warps on gfx11xx/gfx1151; the bare single-warp __shfl_down
+        // left warp 1's half of the head_dim dot product (d in [32,64) and
+        // [96,128) for idx_head_dim=128) unreduced, silently halving every
+        // DSA index score and steering top-k selection to the wrong KV.
         for (int offset = 16; offset > 0; offset >>= 1)
             acc += __shfl_down(acc, offset);
+        if ((tid & 31) == 0) partial[tid >> 5] = acc;
+        __syncthreads();
         if (tid == 0) {
-            scores[head * n_compressed + n0] = acc;
+            float total = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < THREADS_PER_BLOCK / 32; ++i) total += partial[i];
+            scores[head * n_compressed + n0] = total;
         }
+        // Guard partial[] before the next tile iteration overwrites it.
+        __syncthreads();
     }
 }

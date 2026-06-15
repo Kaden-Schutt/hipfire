@@ -1,0 +1,20 @@
+[package]
+name = "hipfire-dispatch"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }
+
+[features]
+default = []
+test-utils = []
+new-rotation = []
+new-gemv = []
+new-gemm = []
+new-fused-qkv = []
+new-attention = []
+new-moe = []
+from-hip-error = []
+deltanet = ["rdna-compute/deltanet"]

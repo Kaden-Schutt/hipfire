@@ -77,31 +77,42 @@ extern "C" __global__ void gated_delta_net_q4(
             out_val += s0 * q_lds[j] + s1 * q_lds[j+1] + s2 * q_lds[j+2] + s3 * q_lds[j+3];
         }
         output[t * stride + h * HD + row] = out_val;
+
+        // Per-token Q4 requant roundtrip — matches the per-token decode cadence
+        // (gated_delta_net_q4 with n_tokens=1 requants S after every token).
+        // Quantize S_local → Q4 and dequant back in registers so the next token
+        // reads the Q4-roundtripped state; global store on the last token only.
+        // Deterministic stochastic rounding with a state-derived seed (no
+        // token-index term) makes this N-token launch bit-exact with N×1 decode.
+        {
+            // Quantize S row back to Q4: per-row absmax, symmetric -8..+7
+            float amax = 0.0f;
+            for (int j = 0; j < HD; j++) {
+                float a = fabsf(S_local[j]);
+                if (a > amax) amax = a;
+            }
+            float new_scale = (amax > 0.0f) ? (amax / 7.0f) : 1.0f;
+            float inv_scale = (amax > 0.0f) ? (7.0f / amax) : 0.0f;
+            bool last_tok = (t == n_tokens - 1);
+
+            // Stochastic rounding: eliminates systematic bias that crushes small state values
+            unsigned int rng = (unsigned int)(h * 1664525u + row * 1013904223u + __float_as_uint(amax) * 2531011u);
+            for (int j = 0; j < HD; j += 2) {
+                rng = rng * 1664525u + 1013904223u;
+                float n0 = (float)(rng >> 8) * (1.0f / 16777216.0f);
+                rng = rng * 1664525u + 1013904223u;
+                float n1 = (float)(rng >> 8) * (1.0f / 16777216.0f);
+                int v0 = (int)floorf(S_local[j] * inv_scale + n0) + 8;
+                int v1 = (int)floorf(S_local[j+1] * inv_scale + n1) + 8;
+                v0 = v0 < 0 ? 0 : (v0 > 15 ? 15 : v0);
+                v1 = v1 < 0 ? 0 : (v1 > 15 ? 15 : v1);
+                // Dequant back so the next token reads the Q4 state.
+                S_local[j]   = new_scale * (float)(v0 - 8);
+                S_local[j+1] = new_scale * (float)(v1 - 8);
+                if (last_tok) S_q4_row[j / 2] = (unsigned char)(v0 | (v1 << 4));
+            }
+            if (last_tok) s_scales[h * HD + row] = new_scale;
+        }
         __syncthreads();
     }
-
-    // Quantize S row back to Q4: per-row absmax, symmetric -8..+7
-    float amax = 0.0f;
-    for (int j = 0; j < HD; j++) {
-        float a = fabsf(S_local[j]);
-        if (a > amax) amax = a;
-    }
-
-    float new_scale = (amax > 0.0f) ? (amax / 7.0f) : 1.0f;
-    float inv_scale = (amax > 0.0f) ? (7.0f / amax) : 0.0f;
-
-    // Stochastic rounding: eliminates systematic bias that crushes small state values
-    unsigned int rng = (unsigned int)(h * 1664525u + row * 1013904223u + __float_as_uint(amax) * 2531011u);
-    for (int j = 0; j < HD; j += 2) {
-        rng = rng * 1664525u + 1013904223u;
-        float n0 = (float)(rng >> 8) * (1.0f / 16777216.0f);
-        rng = rng * 1664525u + 1013904223u;
-        float n1 = (float)(rng >> 8) * (1.0f / 16777216.0f);
-        int v0 = (int)floorf(S_local[j] * inv_scale + n0) + 8;
-        int v1 = (int)floorf(S_local[j+1] * inv_scale + n1) + 8;
-        v0 = v0 < 0 ? 0 : (v0 > 15 ? 15 : v0);
-        v1 = v1 < 0 ? 0 : (v1 > 15 ? 15 : v1);
-        S_q4_row[j / 2] = (unsigned char)(v0 | (v1 << 4));
-    }
-    s_scales[h * HD + row] = new_scale;
 }

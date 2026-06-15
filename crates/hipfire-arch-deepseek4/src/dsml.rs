@@ -325,9 +325,24 @@ impl StreamParser {
                 }
             }
             State::InThink => {
-                // Unclosed think block — emit what we have as reasoning.
-                if !self.buf.is_empty() {
-                    events.push(StreamEvent::Reasoning(std::mem::take(&mut self.buf)));
+                // Unclosed think block — flush as reasoning. Defensive: if a
+                // `</think>` is sitting unconsumed in the buffer at EOS (e.g. it
+                // arrived in the final feed and the holdback never got a chance
+                // to re-scan), split on it so the marker never leaks into
+                // reasoning_content and the tail is surfaced as content.
+                let buf = std::mem::take(&mut self.buf);
+                match buf.find(THINK_CLOSE) {
+                    Some(idx) => {
+                        if idx > 0 {
+                            events.push(StreamEvent::Reasoning(buf[..idx].to_string()));
+                        }
+                        let tail = &buf[idx + THINK_CLOSE.len()..];
+                        if !tail.is_empty() {
+                            events.push(StreamEvent::Token(tail.to_string()));
+                        }
+                    }
+                    None if !buf.is_empty() => events.push(StreamEvent::Reasoning(buf)),
+                    None => {}
                 }
             }
             State::InToolCalls => {
@@ -392,19 +407,37 @@ impl StreamParser {
     }
 
     fn step_in_think(&mut self, events: &mut Vec<StreamEvent>) -> bool {
-        if let Some(idx) = self.buf.find(THINK_CLOSE) {
+        // Watch for the think close AND — defensively — the tool-call opener.
+        // A thinking model is instructed to emit `</think>` before any tool
+        // calls, but it sometimes emits a complete `<｜DSML｜tool_calls>` block
+        // WITHOUT closing think first (the reactive grammar permits it). If we
+        // only matched `</think>`, that whole block would stream out as
+        // reasoning_content and never parse — the agent dead-stops with no
+        // tool calls (observed on a real Pi session). Treat a tool-call opener
+        // seen inside think as an implicit think-close and hand off to the
+        // InToolCalls parser. Whichever marker appears FIRST wins.
+        let first_close = self.buf.find(THINK_CLOSE);
+        let first_tools = self.buf.find(TOOL_CALLS_OPEN);
+        let hit = match (first_close, first_tools) {
+            (None, None) => None,
+            (Some(c), None) => Some((c, THINK_CLOSE.len(), State::Normal)),
+            (None, Some(t)) => Some((t, TOOL_CALLS_OPEN.len(), State::InToolCalls)),
+            (Some(c), Some(t)) if c <= t => Some((c, THINK_CLOSE.len(), State::Normal)),
+            (Some(_), Some(t)) => Some((t, TOOL_CALLS_OPEN.len(), State::InToolCalls)),
+        };
+        if let Some((idx, marker_len, new_state)) = hit {
             let content: String = self.buf.drain(..idx).collect();
             if !content.is_empty() {
                 events.push(StreamEvent::Reasoning(content));
             }
-            let _: String = self.buf.drain(..THINK_CLOSE.len()).collect();
-            self.state = State::Normal;
+            let _: String = self.buf.drain(..marker_len).collect();
+            self.state = new_state;
             return true;
         }
-        // No close yet — emit everything up to the last `<` (might be
-        // start of `</think>`) so the agent sees thinking progress.
-        // Hold back the last `THINK_CLOSE.len()` bytes.
-        let holdback = THINK_CLOSE.len();
+        // No marker yet — emit reasoning up to a holdback large enough to hold
+        // a partial `</think>` OR `<｜DSML｜tool_calls>` straddling the tail, so
+        // the agent sees thinking progress without leaking a split marker.
+        let holdback = THINK_CLOSE.len().max(TOOL_CALLS_OPEN.len());
         if self.buf.len() > holdback {
             let emit_len = utf8_safe_split(&self.buf, self.buf.len() - holdback);
             if emit_len > 0 {
@@ -786,6 +819,47 @@ mod tests {
         assert_eq!(calls[0][0].name, "fn1");
         assert_eq!(calls[0][0].arguments["arg1"], json!("value one"));
         assert_eq!(calls[0][0].arguments["arg2"], json!(42));
+    }
+
+    #[test]
+    fn tool_calls_inside_unclosed_think_are_parsed() {
+        // Regression (real Pi session): a thinking model emitted a complete
+        // `<｜DSML｜tool_calls>` block WITHOUT first closing `<think>`. The
+        // parser must treat the tool-call opener as an implicit think-close
+        // and still surface the calls — otherwise the whole block is swallowed
+        // into reasoning_content and the agent dead-stops (stopReason=stop,
+        // zero tool calls).
+        let dsml = format!(
+            "{think}let me look around{open}\n{io}bash\">\n{po}command\" string=\"true\">ls -la{pc}\n{ic}\n{close}",
+            think = THINK_OPEN,
+            open = TOOL_CALLS_OPEN,
+            close = TOOL_CALLS_CLOSE,
+            io = INVOKE_OPEN_PREFIX,
+            ic = INVOKE_CLOSE,
+            po = PARAMETER_OPEN_PREFIX,
+            pc = PARAMETER_CLOSE,
+        );
+        let mut p = StreamParser::new();
+        let mut events = p.feed(&dsml);
+        events.extend(p.finish());
+        let reasoning: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Reasoning(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        let calls: Vec<&Vec<ToolCall>> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCalls(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning, "let me look around");
+        assert_eq!(calls.len(), 1, "tool calls must be surfaced, not swallowed");
+        assert_eq!(calls[0][0].name, "bash");
+        assert_eq!(calls[0][0].arguments["command"], json!("ls -la"));
     }
 
     #[test]

@@ -46,6 +46,8 @@ fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::{HfqFile, HfqPackage, HFQM_ARCH_NON_WEIGHT_PACKAGE};
     use hipfire_runtime::llama::{weight_gemv, KvCache};
+    use hipfire_runtime::hfq::HfqFile;
+    use hipfire_runtime::llama::{DispatchCtx, KvCache, VMode, gemv_family, weight_gemv};
     use rdna_compute::DType;
     use std::fs::File;
     use std::io::{BufReader, BufWriter, Read, Write};
@@ -728,8 +730,9 @@ fn main() {
                     all_logits.sub_offset(j * config.vocab_size, config.vocab_size)
                 } else {
                     let row_view = h_buf.sub_offset(j * config.dim, config.dim);
-                    weight_gemv(&mut gpu, &weights.output, &row_view, &scratch.logits)
-                        .expect("weight_gemv lm_head");
+                    let ctx = DispatchCtx::new(&gpu);
+                    let _ = gemv_family().run_auto(&ctx, &mut gpu, &weights.output.dispatch_ref(), &row_view, &scratch.logits)
+                        .expect("gemv lm_head");
                     scratch.logits.sub_offset(0, config.vocab_size)
                 };
                 let pos = scoring_start + j;

@@ -543,6 +543,15 @@ fn gdn_case(expected_arch: Option<&str>, n_heads: usize, hd: usize) -> CaseOutco
         let scale_size = n_heads * hd;
         let s_q8 = gpu
             .zeros(&[s_size], DType::F32)
+        let s_q8 = gpu.zeros(&[s_size], DType::F32).map_err(|e| e.to_string())?;
+        let s_scales = gpu.upload_f32(&vec![1.0f32; scale_size], &[scale_size]).map_err(|e| e.to_string())?;
+        let q = gpu.upload_f32(&vec![0.01f32; n_heads * hd], &[n_heads * hd]).map_err(|e| e.to_string())?;
+        let k = gpu.upload_f32(&vec![0.01f32; n_heads * hd], &[n_heads * hd]).map_err(|e| e.to_string())?;
+        let v = gpu.upload_f32(&vec![0.01f32; n_heads * hd], &[n_heads * hd]).map_err(|e| e.to_string())?;
+        let alpha = gpu.upload_f32(&vec![0.5f32; n_heads], &[n_heads]).map_err(|e| e.to_string())?;
+        let beta = gpu.upload_f32(&vec![0.5f32; n_heads], &[n_heads]).map_err(|e| e.to_string())?;
+        let o = gpu.alloc_tensor(&[n_heads * hd], DType::F32).map_err(|e| e.to_string())?;
+        gpu.gated_delta_net_q8(&q, &k, &v, &alpha, &beta, &s_q8, &s_scales, &o, 1, n_heads, hd, None)
             .map_err(|e| e.to_string())?;
         let s_scales = gpu
             .upload_f32(&vec![1.0f32; scale_size], &[scale_size])

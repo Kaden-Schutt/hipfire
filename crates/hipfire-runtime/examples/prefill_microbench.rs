@@ -60,6 +60,7 @@ fn main() {
     let mut kv_mode = "asym3".to_string();
     let mut warmup_iters: usize = 1;
     let mut measure_iters: usize = 3;
+    let mut prefill_only = false;
 
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -90,6 +91,9 @@ fn main() {
                 measure_iters = argv[i + 1].parse().expect("--measure-iters");
                 i += 2;
             }
+            "--warmup-iters" => { warmup_iters = argv[i + 1].parse().expect("--warmup-iters"); i += 2; }
+            "--measure-iters" => { measure_iters = argv[i + 1].parse().expect("--measure-iters"); i += 2; }
+            "--prefill-only" => { prefill_only = true; i += 1; }
             "-h" | "--help" => {
                 eprintln!("Usage: prefill_microbench --model <path> [--n-ctx 2048] [--kv-mode asym3] [--warmup-iters 1] [--measure-iters 3]");
                 std::process::exit(0);
@@ -258,7 +262,9 @@ fn main() {
         args.warmup_iters
     );
     for _ in 0..args.warmup_iters {
-        let _ = per_token_path(&mut gpu, &mut kv_cache, &mut dn_state, &tokens);
+        if !prefill_only {
+            let _ = per_token_path(&mut gpu, &mut kv_cache, &mut dn_state, &tokens);
+        }
         let _ = prefill_path(&mut gpu, &mut kv_cache, &mut dn_state, &tokens);
     }
 
@@ -266,7 +272,11 @@ fn main() {
     let mut per_token_times: Vec<f64> = Vec::with_capacity(args.measure_iters);
     let mut prefill_times: Vec<f64> = Vec::with_capacity(args.measure_iters);
     for iter in 0..args.measure_iters {
-        let pt = per_token_path(&mut gpu, &mut kv_cache, &mut dn_state, &tokens);
+        let pt = if prefill_only {
+            f64::NAN
+        } else {
+            per_token_path(&mut gpu, &mut kv_cache, &mut dn_state, &tokens)
+        };
         let pb = prefill_path(&mut gpu, &mut kv_cache, &mut dn_state, &tokens);
         eprintln!(
             "  iter {}: per-token {:.3}s ({:.1} tok/s)  prefill {:.3}s ({:.1} tok/s)  speedup {:.2}×",

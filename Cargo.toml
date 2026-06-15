@@ -1,53 +1,5 @@
-[package]
-name = "hipfire"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-description = "hipfire root install wrapper for the command-line interface."
-
-[[bin]]
-name = "hipfire"
-path = "crates/hipfire-cli/src/main.rs"
-
-[dependencies]
-hipfire-server = { path = "crates/hipfire-server" }
-clap = { version = "4", features = ["derive", "cargo"] }
-tokio = { version = "1", features = ["full"] }
-serde_json = "1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-indicatif = "0.17"
-reqwest = { version = "0.12", features = ["stream", "json"] }
-anyhow = "1"
-uuid = { version = "1", features = ["v4"] }
-
-[features]
-default = ["deltanet"]
-deltanet = []
-
 [workspace]
 resolver = "2"
-default-members = [
-    "crates/hip-bridge",
-    "crates/hsa-bridge",
-    "crates/rdna-compute",
-    "crates/hipfire-runtime",
-    "crates/hipfire-arch-qwen35",
-    "crates/hipfire-arch-qwen35-vl",
-    "crates/hipfire-arch-llama",
-    "crates/hipfire-arch-deepseek4",
-    "crates/hipfire-arch-minimax",
-    "crates/hipfire-arch-lfm2moe",
-    "crates/hipfire-arch-toy",
-    "crates/hipfire-arch-qwen2",
-    "crates/hipfire-arch-dots-ocr",
-    "crates/hipfire-quantize",
-    "crates/hipfire-detect",
-    "crates/hipfire-atlas",
-    "crates/redline",
-    "crates/hipfire-server",
-    "crates/hipfire-cli",
-    "crates/hipfire-daemon",
-]
 members = [
     "crates/hip-bridge",
     "crates/hsa-bridge",
@@ -57,21 +9,20 @@ members = [
     "crates/hipfire-arch-qwen35-vl",
     "crates/hipfire-arch-llama",
     "crates/hipfire-arch-deepseek4",
-    "crates/hipfire-arch-minimax",
-    "crates/hipfire-arch-lfm2moe",
     "crates/hipfire-arch-toy",
     "crates/hipfire-arch-qwen2",
+    "crates/hipfire-arch-lfm2moe",
+    "crates/hipfire-arch-minimax",
     "crates/hipfire-arch-dots-ocr",
     "crates/hipfire-quantize",
     "crates/hipfire-detect",
     "crates/hipfire-atlas",
     "crates/redline",
-    "crates/hipfire-server",
-    "crates/hipfire-cli",
-    "crates/hipfire-daemon",
+    "crates/hipfire-dispatch",
+    "crates/hipfire-dispatch-tests",
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "MIT"

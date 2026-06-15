@@ -279,7 +279,20 @@ pub struct MiniMaxWeights {
 }
 
 impl MiniMaxWeights {
-    pub fn load(hfq: &mut HfqFile, cfg: &MiniMaxConfig, gpu: &mut Gpu) -> Result<Self, String> {
+    /// Load MiniMax weights. `shard = Some((cfg, rank))` enables **EP shard-aware
+    /// loading**: each layer's experts are read from the file but ONLY the
+    /// rank-owned experts are uploaded into a compact packed blob (so an 86 GB
+    /// model fits across N×32 GB cards — load-then-free is impossible since the
+    /// experts are one packed blob too big for a single card). Non-owned expert
+    /// pointers point at a shared zeroed gate_up buffer (→ 0 contribution). The
+    /// non-expert weights (embed / lm_head / attention / norms) are always loaded
+    /// in full (replicated per rank). `shard = None` loads everything (single-GPU).
+    pub fn load(
+        hfq: &mut HfqFile,
+        cfg: &MiniMaxConfig,
+        gpu: &mut Gpu,
+        shard: Option<(&hipfire_runtime::tp_shard::ShardConfig, usize)>,
+    ) -> Result<Self, String> {
         let hidden = cfg.hidden_size;
         let q_dim = cfg.q_dim();
         let kv_dim = cfg.kv_dim();
@@ -367,6 +380,12 @@ impl MiniMaxWeights {
             let mut dn_stride = 0usize;
             let mut qt_gu = 0u8;
             let mut qt_dn = 0u8;
+            // EP shard: only upload rank-owned experts into the compact blob.
+            // `local_of_global[e]` maps a global expert id to its slot in the
+            // compact (owned-only) blob, or usize::MAX if not owned by this rank.
+            let owns = |e: usize| shard.map(|(s, rank)| s.owns_expert(rank, e)).unwrap_or(true);
+            let mut local_of_global = vec![usize::MAX; n_exp];
+            let mut n_owned = 0usize;
             for e in 0..n_exp {
                 let ep = format!("{p}.block_sparse_moe.experts.{e}");
                 let (qt1, w1) = read_tensor(hfq, &format!("{ep}.w1.weight"))?;
@@ -378,17 +397,27 @@ impl MiniMaxWeights {
                     dn_stride = w2.len();
                     qt_gu = qt1;
                     qt_dn = qt2;
-                    gu_combined.reserve(gu_len * n_exp);
-                    dn_combined.reserve(w2.len() * n_exp);
+                    let cap = shard.map(|(s, _)| s.experts_per_rank(n_exp)).unwrap_or(n_exp);
+                    gu_combined.reserve(gu_len * cap);
+                    dn_combined.reserve(w2.len() * cap);
                 } else if gu_len != gu_stride || w2.len() != dn_stride {
                     return Err(format!(
                         "minimax L{l}E{e}: non-uniform expert stride (gate_up {gu_len}/{gu_stride}, down {}/{dn_stride}); packed layout requires equal-size experts",
                         w2.len()
                     ));
                 }
-                gu_combined.extend_from_slice(&w1);
-                gu_combined.extend_from_slice(&w3);
-                dn_combined.extend_from_slice(&w2);
+                if owns(e) {
+                    local_of_global[e] = n_owned;
+                    n_owned += 1;
+                    gu_combined.extend_from_slice(&w1);
+                    gu_combined.extend_from_slice(&w3);
+                    dn_combined.extend_from_slice(&w2);
+                }
+                // Non-owned: w1/w3/w2 read from the file (for stride validation)
+                // then dropped — never uploaded. That is the EP memory win.
+            }
+            if n_owned == 0 {
+                return Err(format!("minimax L{l}: shard rank owns no experts"));
             }
             // One allocation per projection. The representative `WeightTensor`'s
             // buffer IS the packed blob; its m/k describe a SINGLE expert's shape
@@ -423,13 +452,41 @@ impl MiniMaxWeights {
             let dn_base = down.buf.buf.as_ptr() as u64;
             let experts = vec![MiniMaxExpertWeights { gate_up, down }];
 
-            // Device pointer tables: n_exp u64 device addresses INTO the packed
-            // blobs (base + e*stride), stored as [2*n_exp] F32 (8 bytes/ptr).
+            // Device pointer tables: n_exp u64 device addresses, stored as
+            // [2*n_exp] F32 (8 bytes/ptr). Single-GPU: base + e*stride into the
+            // full packed blob. EP shard: owned e → compact-blob slot
+            // (base + local*stride); non-owned e → a shared ZEROED gate_up buffer
+            // (→ 0 output ⇒ 0 contribution; down ptr is irrelevant since its rot
+            // input is 0, so it reuses the compact down base).
+            let dummy_gu = if shard.is_some() && n_owned < n_exp {
+                let z = gpu
+                    .zeros(&[gu_stride / 4], DType::F32)
+                    .map_err(|e| format!("minimax L{l}: zero gate_up dummy: {e:?}"))?;
+                let p = z.buf.as_ptr() as u64;
+                std::mem::forget(z); // leaked for model lifetime (process teardown reclaims)
+                p
+            } else {
+                gu_base
+            };
             let gu_bytes: Vec<u8> = (0..n_exp)
-                .flat_map(|e| (gu_base + (e * gu_stride) as u64).to_ne_bytes())
+                .flat_map(|e| {
+                    let ptr = if owns(e) {
+                        gu_base + (local_of_global[e] * gu_stride) as u64
+                    } else {
+                        dummy_gu
+                    };
+                    ptr.to_ne_bytes()
+                })
                 .collect();
             let dn_bytes: Vec<u8> = (0..n_exp)
-                .flat_map(|e| (dn_base + (e * dn_stride) as u64).to_ne_bytes())
+                .flat_map(|e| {
+                    let ptr = if owns(e) {
+                        dn_base + (local_of_global[e] * dn_stride) as u64
+                    } else {
+                        dn_base // rot input is 0 for non-owned ⇒ output 0 regardless
+                    };
+                    ptr.to_ne_bytes()
+                })
                 .collect();
             let expert_gate_up_ptrs = gpu
                 .alloc_tensor(&[2 * n_exp], DType::F32)
@@ -499,19 +556,6 @@ pub struct MiniMaxState {
     pub fa_v: GpuTensor,        // [kv_dim]
     pub fa_attn_out: GpuTensor, // [q_dim]
     pub flash_partials: GpuTensor,
-    /// Flash-attention tri-state for the Q8 decode/prefill attention path.
-    /// Mirrors qwen35's `flash_mode`:
-    ///   0 = never  — single-workgroup `attention_q8_0_kv` until the >15K
-    ///                LDS sanity cap (then forced flash anyway).
-    ///   1 = auto   — flash at ctx >= 2048.
-    ///   2 = always — flash at every ctx.
-    /// Default 2 on graph-capable archs (gfx11/gfx12) so the warmup-eager and
-    /// captured-replay decode steps use the SAME kernel (the single-workgroup
-    /// kernel has variable block_size + variable shared-mem and is NOT
-    /// capture-safe; a mode-1 default would mix kernels direct-vs-graph at
-    /// small ctx and diverge the fp32 reduction order). Override via
-    /// `HIPFIRE_ATTN_FLASH=never|auto|always`.
-    pub flash_mode: u8,
 
     // residual + embedding
     pub h: GpuTensor, // [hidden] residual stream
@@ -546,6 +590,28 @@ impl MiniMaxState {
         cfg: &MiniMaxConfig,
         max_seq: usize,
     ) -> Result<Self, String> {
+        // `attention_q8_0_kv` (single-token decode) stages its per-head score
+        // buffer in LDS sized by `max_seq`: `(max_seq + block + head_dim) * 4`
+        // bytes must fit the 64 KB per-block shared-memory limit on every RDNA
+        // arch, so the single-token attention launch is hard-bounded near 16K
+        // context. A larger requested window blows the launch
+        // (`hipModuleLaunchKernel: invalid argument` — observed serving the
+        // 86 GB mq2-lloyd on gfx1151 with the daemon's default window: prefill
+        // via the batched kernel succeeds, then the first decode token dies).
+        // Clamp the served window here so the cache, the geometry hint, and the
+        // flash-partial sizing all stay launch-valid. Proper fix = tile the
+        // scores out of LDS (flash-style); tracked as a follow-up.
+        const MINIMAX_ATTN_LDS_MAX_SEQ: usize = 12288;
+        let max_seq = if max_seq > MINIMAX_ATTN_LDS_MAX_SEQ {
+            eprintln!(
+                "[minimax] requested max_seq {max_seq} exceeds the single-token \
+                 attention LDS bound; clamping to {MINIMAX_ATTN_LDS_MAX_SEQ} \
+                 (decode scores must fit the 64 KB per-block shared-mem limit)"
+            );
+            MINIMAX_ATTN_LDS_MAX_SEQ
+        } else {
+            max_seq
+        };
         let hidden = cfg.hidden_size;
         let q_dim = cfg.q_dim();
         let kv_dim = cfg.kv_dim();
@@ -574,38 +640,14 @@ impl MiniMaxState {
             g.alloc_tensor(&[n], DType::F32)
                 .map_err(|e| format!("minimax: alloc {label}: {e:?}"))
         };
-        // Flash-attn partials for the tile+reduce two-kernel path
-        // (`attention_flash_q8_0`). The dispatch uses TILE_SIZE=128 and sizes
-        // the per-head row stride by `max_tiles = ceil(physical_cap/128)`, so
-        // the buffer MUST be `n_heads * ceil(physical_cap/128) * (2+head_dim)`
-        // floats — the prior tile=256 / (max_seq/256+1) sizing UNDER-allocated
-        // by ~2× and would corrupt the reduce read at long context. Decode is
-        // batch=1 (one query position per dispatch) and the long-prefill path
-        // serializes one flash call per row reusing this same buffer, so no
-        // batch multiplier is needed.
-        const FLASH_TILE: usize = 128;
-        let max_tiles = (kv.physical_cap + FLASH_TILE - 1) / FLASH_TILE;
+        // Flash-attn partials: [n_heads * max_tiles * (2+head_dim)]; max_tiles
+        // bounded by ceil(max_seq/tile). Use a generous tile bound of 64.
+        let max_tiles = (max_seq / 256).max(1) + 1;
         let flash_partials = alloc(
             gpu,
             cfg.num_attention_heads * max_tiles * (2 + cfg.head_dim),
             "flash_partials",
         )?;
-        // Flash tri-state: default 2 (always flash) on graph-capable archs so
-        // warmup-eager and captured-replay decode use the identical kernel.
-        let flash_mode = match std::env::var("HIPFIRE_ATTN_FLASH").as_deref() {
-            Ok("never") | Ok("0") | Ok("off") => 0u8,
-            Ok("always") | Ok("2") | Ok("force") => 2u8,
-            Ok("auto") | Ok("1") | Ok("on") => 1u8,
-            _ => {
-                let graph_capable_arch =
-                    gpu.arch.starts_with("gfx12") || gpu.arch.starts_with("gfx11");
-                if graph_capable_arch {
-                    2
-                } else {
-                    1
-                }
-            }
-        };
 
         Ok(MiniMaxState {
             kv,
@@ -621,7 +663,6 @@ impl MiniMaxState {
             fa_v: alloc(gpu, kv_dim, "fa_v")?,
             fa_attn_out: alloc(gpu, q_dim, "fa_attn_out")?,
             flash_partials,
-            flash_mode,
             h: alloc(gpu, hidden, "h")?,
             ffn_tmp: alloc(gpu, hidden, "ffn_tmp")?,
             ffn_x_rot: alloc(gpu, hidden, "ffn_x_rot")?,

@@ -55,6 +55,7 @@ struct Args {
     detect_timing: bool,
     no_strip_think: bool,
     self_check: bool,
+    emit_committed_jsonl: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -88,6 +89,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--detect-timing" => args.detect_timing = true,
             "--no-strip-think" => args.no_strip_think = true,
+            "--emit-committed-jsonl" => args.emit_committed_jsonl = it.next(),
             "--self-check" => args.self_check = true,
             "-h" | "--help" => {
                 print_help();
@@ -120,12 +122,303 @@ fn print_help() {
           --stall-tokens N      enable think_stall detector with budget N\n  \
           --detect-timing       enable per-token step-time spike detector\n  \
           --no-strip-think      ask daemon to leave <think> bytes intact\n  \
+          --emit-committed-jsonl OUT  write committed token ids to JSONL\n  \
           --self-check          run synthetic+replay self-check (no GPU needed)\n"
     );
 }
 
 fn read_text(path: &str) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path, e))
+}
+
+fn find_daemon_binary() -> Result<PathBuf, String> {
+    // Prefer release; fall back to debug. Mirror the gate scripts'
+    // discovery behaviour.
+    let candidates = [
+        "target/release/examples/daemon",
+        "target/debug/examples/daemon",
+    ];
+    for c in candidates {
+        let p = PathBuf::from(c);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+    Err("daemon binary not found; run `cargo build --release --example daemon --features deltanet` first".into())
+}
+
+fn print_live(name: &str, verdict: &Verdict, t_ms: u64, pos: Option<usize>) {
+    let label = verdict.label();
+    let detail = match verdict {
+        Verdict::Ok => return, // never print OK live
+        Verdict::Skip { .. } => return,
+        Verdict::Fired { detail, .. } => detail.clone(),
+    };
+    let pos_str = pos.map(|p| format!(" tok={}", p)).unwrap_or_default();
+    eprintln!(
+        "[t={:.3}s{}] {:<5} {:<22} {}",
+        t_ms as f64 / 1000.0,
+        pos_str,
+        label,
+        name,
+        detail
+    );
+}
+
+struct DaemonChild {
+    child: Child,
+    /// `Option` so we can drop the write end on shutdown without
+    /// destructuring the whole struct. Daemon's main `for line in stdin
+    /// .lock().lines()` loop terminates on stdin EOF — without dropping
+    /// our write end, the daemon keeps polling for the next command and
+    /// `child.wait()` blocks forever.
+    stdin: Option<std::process::ChildStdin>,
+    stdout: BufReader<std::process::ChildStdout>,
+}
+
+impl DaemonChild {
+    fn close_stdin(&mut self) {
+        self.stdin = None;
+    }
+}
+
+fn spawn_daemon(daemon: &PathBuf) -> Result<DaemonChild, String> {
+    let mut cmd = Command::new(daemon);
+    cmd.env("HIPFIRE_EMIT_TOKEN_IDS", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    let mut child = cmd.spawn().map_err(|e| format!("spawn daemon: {}", e))?;
+    let stdin = child.stdin.take().ok_or("daemon stdin")?;
+    let stdout = BufReader::new(child.stdout.take().ok_or("daemon stdout")?);
+    Ok(DaemonChild {
+        child,
+        stdin: Some(stdin),
+        stdout,
+    })
+}
+
+fn send(d: &mut DaemonChild, msg: &serde_json::Value) -> Result<(), String> {
+    let stdin = d
+        .stdin
+        .as_mut()
+        .ok_or("daemon stdin already closed")?;
+    let line = serde_json::to_string(msg).map_err(|e| format!("encode: {}", e))?;
+    writeln!(stdin, "{}", line).map_err(|e| format!("write daemon: {}", e))?;
+    stdin
+        .flush()
+        .map_err(|e| format!("flush daemon: {}", e))?;
+    Ok(())
+}
+
+fn recv_until<F>(d: &mut DaemonChild, mut visitor: F) -> Result<serde_json::Value, String>
+where
+    F: FnMut(&serde_json::Value),
+{
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = d.stdout.read_line(&mut line).map_err(|e| format!("read: {}", e))?;
+        if n == 0 {
+            return Err("daemon closed stdout unexpectedly".into());
+        }
+        let v: serde_json::Value = match serde_json::from_str(line.trim()) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[probe] non-JSON line from daemon: {} ({})", line.trim(), e);
+                continue;
+            }
+        };
+        visitor(&v);
+        let ty = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+        // Caller decides which message terminates the wait by inspecting the
+        // visitor's local state. Here we simply return on common terminators;
+        // for finer control, callers can pre-filter.
+        match ty {
+            "loaded" | "unloaded" | "done" | "error" => return Ok(v),
+            _ => {}
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+#[allow(dead_code)]
+struct DoneStats {
+    total_tokens: usize,
+    total_visible_bytes: usize,
+    wall_ms: u64,
+    ttft_ms: u64,
+    /// Daemon-reported authoritative timings from its `done` event. The
+    /// probe's own `wall_ms` / `ttft_ms` are wall-clock and confused by
+    /// stripped think tokens (TTFT becomes "first visible character",
+    /// which on a thinking model is prefill + think_phase + </think>).
+    /// The daemon timestamps real prefill end and real decode separately,
+    /// so trust those for perf reporting.
+    daemon_prefill_ms: f64,
+    daemon_prefill_tok_s: f64,
+    daemon_decode_tok_s: f64,
+    daemon_ttft_ms: f64,
+    daemon_tok_s: f64,
+}
+
+fn drive_generate(
+    d: &mut DaemonChild,
+    bank: &mut DetectorBank,
+    args: &Args,
+    prompt: &str,
+    system: Option<&str>,
+) -> Result<DoneStats, String> {
+    let req_id = "probe-1";
+    let mut req = serde_json::json!({
+        "type": "generate",
+        "id": req_id,
+        "prompt": prompt,
+        "temperature": args.temperature.unwrap_or(0.0),
+        "max_tokens": args.max_tokens.unwrap_or(200),
+    });
+    if let Some(sys) = system {
+        req.as_object_mut()
+            .unwrap()
+            .insert("system".to_string(), serde_json::Value::String(sys.to_string()));
+    }
+    send(d, &req)?;
+
+    // Stream events until we see {"type":"done"} or {"type":"error"}.
+    let t_start = Instant::now();
+    let mut visible_bytes: usize = 0;
+    let mut ttft_ms: Option<u64> = None;
+    let mut last_pos: Option<usize> = None;
+    let mut committed_ids: Vec<(usize, u32)> = Vec::new();
+    let done_stats: DoneStats;
+
+    loop {
+        let mut line = String::new();
+        let n = d
+            .stdout
+            .read_line(&mut line)
+            .map_err(|e| format!("read: {}", e))?;
+        if n == 0 {
+            return Err("daemon closed stdout during generation".into());
+        }
+        let v: serde_json::Value = match serde_json::from_str(line.trim()) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let ty = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+        match ty {
+            "committed" => {
+                let tok_id = v.get("tok_id").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                let pos = v.get("pos").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+                let t_ms = v.get("t_ms").and_then(|x| x.as_u64()).unwrap_or(0);
+                last_pos = Some(pos);
+                committed_ids.push((pos, tok_id));
+                let ev = Event::Committed { tok_id, pos, t_ms };
+                let trans = bank.observe(&ev);
+                for (n, vd) in trans {
+                    print_live(n, &vd, t_ms, Some(pos));
+                }
+            }
+            "token" => {
+                let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("");
+                let synthetic = v
+                    .get("synthetic")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false);
+                let t_ms = t_start.elapsed().as_millis() as u64;
+                if !synthetic {
+                    visible_bytes += text.len();
+                    if ttft_ms.is_none() {
+                        ttft_ms = Some(t_ms);
+                    }
+                }
+                let ev = Event::Token {
+                    text,
+                    t_ms,
+                    synthetic,
+                };
+                let trans = bank.observe(&ev);
+                for (n, vd) in trans {
+                    print_live(n, &vd, t_ms, last_pos);
+                }
+            }
+            "done" => {
+                let total_tokens = v
+                    .get("tokens")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0) as usize;
+                let wall_ms = t_start.elapsed().as_millis() as u64;
+                let ttft = ttft_ms.unwrap_or(wall_ms);
+                let ev = Event::Done {
+                    total_tokens,
+                    total_visible_bytes: visible_bytes,
+                    wall_ms,
+                    ttft_ms: ttft,
+                };
+                let trans = bank.observe(&ev);
+                for (n, vd) in trans {
+                    print_live(n, &vd, wall_ms, last_pos);
+                }
+                // Daemon-authoritative perf metrics from the done event.
+                // Default to 0 if absent (older daemons / non-Qwen35 paths).
+                let daemon_prefill_ms = v.get("prefill_ms").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let daemon_prefill_tok_s = v.get("prefill_tok_s").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let daemon_decode_tok_s = v.get("decode_tok_s").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let daemon_ttft_ms = v.get("ttft_ms").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let daemon_tok_s = v.get("tok_s").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                done_stats = DoneStats {
+                    total_tokens,
+                    total_visible_bytes: visible_bytes,
+                    wall_ms,
+                    ttft_ms: ttft,
+                    daemon_prefill_ms,
+                    daemon_prefill_tok_s,
+                    daemon_decode_tok_s,
+                    daemon_ttft_ms,
+                    daemon_tok_s,
+                };
+                break;
+            }
+            _ => {} // ignore other event types
+        }
+    }
+
+    // Write committed token IDs to JSONL if requested.
+    if let Some(ref path) = args.emit_committed_jsonl {
+        if let Ok(mut f) = std::fs::File::create(path) {
+            use std::io::Write;
+            for (i, tok_id) in &committed_ids {
+                let _ = writeln!(f, r#"{{"i":{},"id":{}}}"#, i, tok_id);
+            }
+        } else {
+            eprintln!("[probe] warning: could not create {}", path);
+        }
+    }
+
+    Ok(done_stats)
+}
+fn arch_host() -> (String, String) {
+    let arch = std::env::var("HIPFIRE_BASELINE_ARCH").unwrap_or_else(|_| {
+        // Best-effort: try amdgpu-arch, then KFD topology, then "unknown".
+        if let Ok(out) = std::process::Command::new("amdgpu-arch").output() {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout);
+                let line = s.lines().next().unwrap_or("").trim();
+                if !line.is_empty() {
+                    return line.to_string();
+                }
+            }
+        }
+        "unknown".to_string()
+    });
+    let host = std::env::var("HOSTNAME").unwrap_or_else(|_| {
+        std::process::Command::new("hostname")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    });
+    (arch, host)
 }
 
 fn run_self_check() -> Result<(), Vec<String>> {

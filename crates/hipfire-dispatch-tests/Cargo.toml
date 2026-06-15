@@ -1,0 +1,11 @@
+[package]
+name = "hipfire-dispatch-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Functional dispatch tests: verify correct kernel selection per model family × arch × quant"
+
+[dependencies]
+rdna-compute = { path = "../rdna-compute" }
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-dispatch = { path = "../hipfire-dispatch", features = ["test-utils"] }

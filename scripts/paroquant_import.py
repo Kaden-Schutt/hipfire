@@ -35,10 +35,6 @@ from pathlib import Path
 PARO_PROBE_SCHEMA = "hipfire.astrea.paro_probe.v0"
 PARO_IMPORT_SCHEMA = "hipfire.astrea.paro_import.v0"
 
-PARO_QUANT_TYPE = 28
-PARO_QUANT_TYPE_NAME = "PARO4G128"
-PARO_ENGINE_QUANT_TYPE = 29
-PARO_ENGINE_QUANT_TYPE_NAME = "PARO4G128T"
 GROUP_SIZE = 128
 BITS = 4
 PACK = 32 // BITS
@@ -219,9 +215,9 @@ def arch_id_from_config(config: dict | None) -> tuple[int, str]:
 
 def paro_quant_contract(layout: str) -> tuple[int, str]:
     if layout == "native":
-        return PARO_QUANT_TYPE, PARO_QUANT_TYPE_NAME
+        return 28, "PARO4G128"
     if layout == "engine":
-        return PARO_ENGINE_QUANT_TYPE, PARO_ENGINE_QUANT_TYPE_NAME
+        return 29, "PARO4G128T"
     raise ValueError(f"unknown Paro payload layout: {layout}")
 
 
@@ -430,8 +426,8 @@ def probe_model(model: str, *, local_only: bool = False, max_modules: int | None
             "incomplete": incomplete[:max_modules] if max_modules else incomplete,
         },
         "runtime_contract": {
-            "hfq_quant_type": PARO_QUANT_TYPE,
-            "hfq_quant_type_name": PARO_QUANT_TYPE_NAME,
+            "hfq_quant_type": 28,
+            "hfq_quant_type_name": "PARO4G128",
             "group_size": GROUP_SIZE,
             "bits": BITS,
             "krot": KROT,
