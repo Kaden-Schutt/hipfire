@@ -301,6 +301,57 @@ pub const MEMORY_TRIGGER_METRICS: &[&str] = &[
     "workspace_bytes",
 ];
 
+pub const DFLASH_TRACE_NUMERIC_METRICS: &[&str] =
+    &["ar_tok_s", "dflash_tok_s", "tau", "accept_rate", "tok_s"];
+
+pub const DFLASH_TRACE_BOOL_METRICS: &[&str] = &["ar_baseline"];
+
+pub const DFLASH_TRACE_JSON_METRICS: &[&str] = &[
+    "rollback_logit_compare",
+    "rollback_state_compare",
+    "rollback_fast_replay_admission",
+    "rollback_wo_delta_compare",
+];
+
+pub const DFLASH_TRACE_TRIGGER_METRICS: &[&str] = &[
+    "ar_tok_s",
+    "dflash_tok_s",
+    "tok_s",
+    "ar_baseline",
+    "rollback_logit_compare",
+    "rollback_state_compare",
+    "rollback_fast_replay_admission",
+    "rollback_wo_delta_compare",
+];
+
+pub const PATH_C_TRACE_JSON_METRICS: &[&str] = &[
+    "mode",
+    "phase",
+    "graph_mode",
+    "detector",
+    "verify_graph",
+    "path_c_counters",
+    "promotion_verdict",
+    "blockers",
+    "pairs",
+    "extra_args",
+    "token_attractor_detector",
+];
+
+pub const PATH_C_TRACE_NUMERIC_METRICS: &[&str] = &[
+    "tok_s",
+    "tau",
+    "accept_rate",
+    "emitted_tokens",
+    "wall_s",
+    "paired_cases",
+    "tok_s_min_delta_pct",
+    "tau_min_delta_pct",
+    "max_tokens",
+];
+
+pub const PATH_C_TRACE_TRIGGER_METRICS: &[&str] = &["promotion_verdict"];
+
 pub fn has_any_metric(metrics: &BTreeMap<String, Value>, keys: &[&str]) -> bool {
     keys.iter().any(|key| metrics.contains_key(*key))
 }
@@ -393,6 +444,60 @@ pub fn module_evidence_metrics(metrics: &BTreeMap<String, Value>) -> BTreeMap<St
     out
 }
 
+pub fn has_dflash_trace_metric(metrics: &BTreeMap<String, Value>) -> bool {
+    has_any_metric(metrics, DFLASH_TRACE_TRIGGER_METRICS)
+}
+
+pub fn dflash_trace_metrics(metrics: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    let mut out = BTreeMap::new();
+    for key in DFLASH_TRACE_NUMERIC_METRICS {
+        copy_numeric_metric(metrics, &mut out, key, key);
+    }
+    for key in DFLASH_TRACE_BOOL_METRICS {
+        copy_bool_metric(metrics, &mut out, key, key);
+    }
+    for key in DFLASH_TRACE_JSON_METRICS {
+        copy_json_metric(metrics, &mut out, key, key);
+    }
+
+    if let Some(ar_baseline) = metrics.get("ar_baseline").and_then(Value::as_bool) {
+        out.insert(
+            "mode".to_string(),
+            json!(if ar_baseline { "ar" } else { "dflash" }),
+        );
+        if ar_baseline {
+            if !out.contains_key("ar_tok_s") {
+                copy_numeric_metric(metrics, &mut out, "tok_s", "ar_tok_s");
+            }
+        } else if !out.contains_key("dflash_tok_s") {
+            copy_numeric_metric(metrics, &mut out, "tok_s", "dflash_tok_s");
+        }
+    } else if metrics.contains_key("ar_tok_s") || metrics.contains_key("dflash_tok_s") {
+        out.insert("mode".to_string(), json!("aggregate"));
+    }
+
+    out
+}
+
+pub fn has_path_c_trace_metric(metrics: &BTreeMap<String, Value>) -> bool {
+    metrics
+        .get("mode")
+        .and_then(Value::as_str)
+        .is_some_and(|mode| mode.starts_with("path-c"))
+        || has_any_metric(metrics, PATH_C_TRACE_TRIGGER_METRICS)
+}
+
+pub fn path_c_trace_metrics(metrics: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    let mut out = BTreeMap::new();
+    for key in PATH_C_TRACE_JSON_METRICS {
+        copy_json_metric(metrics, &mut out, key, key);
+    }
+    for key in PATH_C_TRACE_NUMERIC_METRICS {
+        copy_numeric_metric(metrics, &mut out, key, key);
+    }
+    out
+}
+
 fn copy_json_metric(
     source: &BTreeMap<String, Value>,
     dest: &mut BTreeMap<String, Value>,
@@ -417,6 +522,20 @@ fn copy_numeric_metric(
         return;
     }
     if let Some(value) = source.get(source_key).and_then(Value::as_f64) {
+        dest.insert(dest_key.to_string(), json!(value));
+    }
+}
+
+fn copy_bool_metric(
+    source: &BTreeMap<String, Value>,
+    dest: &mut BTreeMap<String, Value>,
+    source_key: &str,
+    dest_key: &str,
+) {
+    if dest.contains_key(dest_key) {
+        return;
+    }
+    if let Some(value) = source.get(source_key).and_then(Value::as_bool) {
         dest.insert(dest_key.to_string(), json!(value));
     }
 }
@@ -1780,6 +1899,98 @@ mod tests {
         );
         assert_eq!(selected_memory["kv_bytes"], json!(1024.0));
         assert_eq!(selected_memory["workspace_bytes"], json!(2048.0));
+    }
+
+    #[test]
+    fn dflash_trace_metrics_normalize_ar_and_dflash_rows() {
+        let ar = BTreeMap::from([
+            ("tok_s".to_string(), json!(90.0)),
+            ("ar_baseline".to_string(), json!(true)),
+        ]);
+        assert!(has_dflash_trace_metric(&ar));
+        let ar_trace = dflash_trace_metrics(&ar);
+        assert_eq!(ar_trace.get("mode"), Some(&json!("ar")));
+        assert_eq!(ar_trace.get("ar_tok_s"), Some(&json!(90.0)));
+
+        let dflash = BTreeMap::from([
+            ("tok_s".to_string(), json!(130.0)),
+            ("ar_baseline".to_string(), json!(false)),
+            ("tau".to_string(), json!(2.5)),
+            ("accept_rate".to_string(), json!(0.6)),
+            (
+                "rollback_state_compare".to_string(),
+                json!({
+                    "ok": false,
+                    "reason": "fast_replay_recurrent_state_mismatch",
+                }),
+            ),
+        ]);
+        let dflash_trace = dflash_trace_metrics(&dflash);
+        assert_eq!(dflash_trace.get("mode"), Some(&json!("dflash")));
+        assert_eq!(dflash_trace.get("dflash_tok_s"), Some(&json!(130.0)));
+        assert_eq!(dflash_trace.get("tau"), Some(&json!(2.5)));
+        assert_eq!(
+            dflash_trace
+                .get("rollback_state_compare")
+                .and_then(|value| value.get("reason")),
+            Some(&json!("fast_replay_recurrent_state_mismatch"))
+        );
+
+        let aggregate = BTreeMap::from([("dflash_tok_s".to_string(), json!(144.0))]);
+        assert_eq!(
+            dflash_trace_metrics(&aggregate).get("mode"),
+            Some(&json!("aggregate"))
+        );
+    }
+
+    #[test]
+    fn path_c_trace_metrics_select_owned_schema_fields() {
+        let dflash = BTreeMap::from([
+            ("mode".to_string(), json!("dflash")),
+            ("tok_s".to_string(), json!(130.0)),
+        ]);
+        assert!(!has_path_c_trace_metric(&dflash));
+
+        let path_c = BTreeMap::from([
+            ("mode".to_string(), json!("path-c-phase1")),
+            ("tok_s".to_string(), json!(5.86)),
+            ("tau".to_string(), json!(1.23)),
+            ("max_tokens".to_string(), json!(192)),
+            (
+                "verify_graph".to_string(),
+                json!({
+                    "direct": 0,
+                    "warmup": 3,
+                    "capture": 3,
+                    "replay": 81,
+                }),
+            ),
+            ("ignored".to_string(), json!("not exported")),
+        ]);
+        assert!(has_path_c_trace_metric(&path_c));
+        let trace = path_c_trace_metrics(&path_c);
+        assert_eq!(trace.get("mode"), Some(&json!("path-c-phase1")));
+        assert_eq!(trace.get("tok_s"), Some(&json!(5.86)));
+        assert_eq!(
+            trace
+                .get("verify_graph")
+                .and_then(|value| value.get("replay")),
+            Some(&json!(81))
+        );
+        assert!(!trace.contains_key("ignored"));
+
+        let promotion = BTreeMap::from([
+            ("promotion_verdict".to_string(), json!("NOT_PROMOTED")),
+            (
+                "blockers".to_string(),
+                json!(["path-c-phase2-code: tok/s delta -3.732% < 5.000%"]),
+            ),
+        ]);
+        assert!(has_path_c_trace_metric(&promotion));
+        assert_eq!(
+            path_c_trace_metrics(&promotion).get("promotion_verdict"),
+            Some(&json!("NOT_PROMOTED"))
+        );
     }
 
     #[test]

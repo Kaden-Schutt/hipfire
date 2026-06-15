@@ -22,14 +22,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use hipfire_evidence::{
     admission_artifact_index_entry_json, admission_artifact_json, admission_metric_is_quality,
     admission_verdict_policy, classify_hardware_kind, comparison_artifact_index_entry_json,
-    comparison_artifact_json, compute_peak_bandwidth_gbps, directory_hash,
+    comparison_artifact_json, compute_peak_bandwidth_gbps, dflash_trace_metrics, directory_hash,
     evidence_artifact_index_entry_from_value_json, evidence_artifact_index_entry_json,
     evidence_artifact_json, evidence_collection_policy, evidence_metric_direction,
     evidence_record_json, extract_external_evidence_records_json, file_hash, hardware_bucket,
     has_launch_count_metric, has_memory_metric, has_module_evidence_metric, has_moe_router_metric,
-    has_phase_timing_metric, has_profiling_metric, host_profile_artifact_index_entry_json,
-    host_profile_hash, launch_count_metrics, list_files, memory_metrics, module_evidence_metrics,
-    moe_router_metrics, phase_timing_metrics, profiling_metrics, prompt_artifact_index_entry_json,
+    has_path_c_trace_metric, has_phase_timing_metric, has_profiling_metric,
+    host_profile_artifact_index_entry_json, host_profile_hash, launch_count_metrics, list_files,
+    memory_metrics, module_evidence_metrics, moe_router_metrics, path_c_trace_metrics,
+    phase_timing_metrics, profiling_metrics, prompt_artifact_index_entry_json,
     required_admission_evidence_requirements, run_metadata_artifact_json, run_provenance_json,
     stable_hash_bytes, stable_hash_file_fallback, standard_evidence_paths_in_dir,
     AdmissionArtifact as EvidenceAdmissionArtifact, AdmissionEvidence as EvidenceAdmissionEvidence,
@@ -3636,7 +3637,7 @@ fn evidence_records(kind: &str, results: &[EvalResult]) -> Vec<Value> {
                 } else if kind == "profiling" {
                     has_profiling_metric(&row.metrics)
                 } else if kind == "path_c_trace" {
-                    has_path_c_trace_metric(row)
+                    has_path_c_trace_metric(&row.metrics)
                 } else if kind == "module_evidence" {
                     has_module_evidence_metric(&row.metrics)
                 } else {
@@ -3650,8 +3651,8 @@ fn evidence_records(kind: &str, results: &[EvalResult]) -> Vec<Value> {
                 "launch_counts" => launch_count_metrics(&row.metrics),
                 "moe_router_histogram" => moe_router_metrics(&row.metrics),
                 "profiling" => profiling_metrics(&row.metrics),
-                "dflash_trace" => dflash_trace_metrics(row),
-                "path_c_trace" => path_c_trace_metrics(row),
+                "dflash_trace" => dflash_trace_metrics(&row.metrics),
+                "path_c_trace" => path_c_trace_metrics(&row.metrics),
                 "module_evidence" => module_evidence_metrics(&row.metrics),
                 _ => row.metrics.clone(),
             };
@@ -3718,143 +3719,8 @@ fn has_quality_metric(row: &EvalResult) -> bool {
         )
 }
 
-fn has_path_c_trace_metric(row: &EvalResult) -> bool {
-    row.metrics
-        .get("mode")
-        .and_then(Value::as_str)
-        .is_some_and(|mode| mode.starts_with("path-c"))
-        || row.metrics.contains_key("promotion_verdict")
-}
-
 fn has_any_metric(row: &EvalResult, keys: &[&str]) -> bool {
     keys.iter().any(|key| row.metrics.contains_key(*key))
-}
-
-fn dflash_trace_metrics(row: &EvalResult) -> BTreeMap<String, Value> {
-    let mut metrics = BTreeMap::new();
-    copy_numeric_metric(&row.metrics, &mut metrics, "ar_tok_s", "ar_tok_s");
-    copy_numeric_metric(&row.metrics, &mut metrics, "dflash_tok_s", "dflash_tok_s");
-    copy_numeric_metric(&row.metrics, &mut metrics, "tau", "tau");
-    copy_numeric_metric(&row.metrics, &mut metrics, "accept_rate", "accept_rate");
-    copy_numeric_metric(&row.metrics, &mut metrics, "tok_s", "tok_s");
-    copy_bool_metric(&row.metrics, &mut metrics, "ar_baseline", "ar_baseline");
-    copy_json_metric(
-        &row.metrics,
-        &mut metrics,
-        "rollback_logit_compare",
-        "rollback_logit_compare",
-    );
-    copy_json_metric(
-        &row.metrics,
-        &mut metrics,
-        "rollback_state_compare",
-        "rollback_state_compare",
-    );
-    copy_json_metric(
-        &row.metrics,
-        &mut metrics,
-        "rollback_fast_replay_admission",
-        "rollback_fast_replay_admission",
-    );
-    copy_json_metric(
-        &row.metrics,
-        &mut metrics,
-        "rollback_wo_delta_compare",
-        "rollback_wo_delta_compare",
-    );
-
-    if let Some(ar_baseline) = row.metrics.get("ar_baseline").and_then(Value::as_bool) {
-        metrics.insert(
-            "mode".to_string(),
-            json!(if ar_baseline { "ar" } else { "dflash" }),
-        );
-        if ar_baseline {
-            if !metrics.contains_key("ar_tok_s") {
-                copy_numeric_metric(&row.metrics, &mut metrics, "tok_s", "ar_tok_s");
-            }
-        } else if !metrics.contains_key("dflash_tok_s") {
-            copy_numeric_metric(&row.metrics, &mut metrics, "tok_s", "dflash_tok_s");
-        }
-    } else if row.metrics.contains_key("ar_tok_s") || row.metrics.contains_key("dflash_tok_s") {
-        metrics.insert("mode".to_string(), json!("aggregate"));
-    }
-
-    metrics
-}
-
-fn path_c_trace_metrics(row: &EvalResult) -> BTreeMap<String, Value> {
-    let mut metrics = BTreeMap::new();
-    for key in [
-        "mode",
-        "phase",
-        "graph_mode",
-        "detector",
-        "verify_graph",
-        "path_c_counters",
-        "promotion_verdict",
-        "blockers",
-        "pairs",
-        "extra_args",
-        "token_attractor_detector",
-    ] {
-        copy_json_metric(&row.metrics, &mut metrics, key, key);
-    }
-    for key in [
-        "tok_s",
-        "tau",
-        "accept_rate",
-        "emitted_tokens",
-        "wall_s",
-        "paired_cases",
-        "tok_s_min_delta_pct",
-        "tau_min_delta_pct",
-        "max_tokens",
-    ] {
-        copy_numeric_metric(&row.metrics, &mut metrics, key, key);
-    }
-    metrics
-}
-
-fn copy_numeric_metric(
-    source: &BTreeMap<String, Value>,
-    dest: &mut BTreeMap<String, Value>,
-    source_key: &str,
-    dest_key: &str,
-) {
-    if dest.contains_key(dest_key) {
-        return;
-    }
-    if let Some(value) = source.get(source_key).and_then(Value::as_f64) {
-        dest.insert(dest_key.to_string(), json!(value));
-    }
-}
-
-fn copy_bool_metric(
-    source: &BTreeMap<String, Value>,
-    dest: &mut BTreeMap<String, Value>,
-    source_key: &str,
-    dest_key: &str,
-) {
-    if dest.contains_key(dest_key) {
-        return;
-    }
-    if let Some(value) = source.get(source_key).and_then(Value::as_bool) {
-        dest.insert(dest_key.to_string(), json!(value));
-    }
-}
-
-fn copy_json_metric(
-    source: &BTreeMap<String, Value>,
-    dest: &mut BTreeMap<String, Value>,
-    source_key: &str,
-    dest_key: &str,
-) {
-    if dest.contains_key(dest_key) {
-        return;
-    }
-    if let Some(value) = source.get(source_key) {
-        dest.insert(dest_key.to_string(), value.clone());
-    }
 }
 
 fn metric_string(metrics: &BTreeMap<String, Value>, key: &str) -> Option<String> {
