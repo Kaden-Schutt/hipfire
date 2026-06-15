@@ -116,7 +116,7 @@ Current evidence boundary status:
 
 Current coherence boundary status:
 - `hipfire-coherence` owns detector profile selection, detector-bank construction, agentic prompt detection, coherence run input/output contracts, report row serialization, coherence artifact serialization, daemon-backed coherence execution, prompt execution, token event capture, and detector report assembly.
-- `hipfire-runtime::coherence_runtime` remains a compatibility facade for existing `coherence_probe` and eval-harness callers while coherence ownership lives in `hipfire-coherence`.
+- Runtime `coherence_probe` and eval harness paths now consume `hipfire-coherence` directly; the old `hipfire-runtime::coherence_runtime` compatibility facade has been retired.
 
 ## 3) Execution sequence
 
