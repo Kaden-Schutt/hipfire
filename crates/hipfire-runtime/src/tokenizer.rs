@@ -1027,30 +1027,13 @@ impl Tokenizer {
     ///
     /// Cost: O(N) over the vocab, called once per drafter load.
     pub fn signature(&self) -> u64 {
-        let mut h: u64 = 0xcbf29ce484222325;
-        let mut mix = |bytes: &[u8]| {
-            for &b in bytes {
-                h ^= b as u64;
-                h = h.wrapping_mul(0x100000001b3);
-            }
-            h ^= 0xff;
-            h = h.wrapping_mul(0x100000001b3);
-        };
-        // Vocab in id order (canonical).
-        for tok in &self.vocab {
-            mix(tok.as_bytes());
-        }
-        // Specials in their stored order (longest-first; deterministic per
-        // constructor).
-        for (s, id) in &self.special_tokens {
-            mix(s.as_bytes());
-            mix(&id.to_le_bytes());
-        }
-        // Sentinel ids.
-        mix(&self.bos_id.to_le_bytes());
-        mix(&self.eos_id.to_le_bytes());
-        mix(&self.eot_id.unwrap_or(u32::MAX).to_le_bytes());
-        h
+        hipfire_model::tokenizer_signature(
+            &self.vocab,
+            &self.special_tokens,
+            self.bos_id,
+            self.eos_id,
+            self.eot_id,
+        )
     }
 }
 

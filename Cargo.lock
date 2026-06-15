@@ -826,6 +826,7 @@ dependencies = [
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
+ "hipfire-daemon-adapter",
  "hipfire-daemon-protocol",
  "hipfire-generate",
  "hipfire-runtime",
@@ -844,6 +845,7 @@ dependencies = [
  "dirs",
  "futures",
  "hipfire-daemon-protocol",
+ "libc",
  "serde_json",
  "tokio",
  "tracing",
@@ -889,13 +891,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-eval"
+version = "0.2.1"
+dependencies = [
+ "csv",
+ "hipfire-coherence",
+ "hipfire-evidence",
+ "hipfire-model",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-evidence"
 version = "0.2.1"
+dependencies = [
+ "hipfire-model",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "hipfire-generate"
 version = "0.2.1"
 dependencies = [
+ "hipfire-model",
  "hipfire-prompt",
  "hipfire-state",
  "serde",
@@ -958,6 +979,7 @@ dependencies = [
  "hipfire-coherence",
  "hipfire-detect",
  "hipfire-dispatch",
+ "hipfire-eval",
  "hipfire-evidence",
  "hipfire-model",
  "hipfire-prompt",
@@ -978,6 +1000,9 @@ dependencies = [
 [[package]]
 name = "hipfire-scheduler"
 version = "0.2.1"
+dependencies = [
+ "hipfire-model",
+]
 
 [[package]]
 name = "hipfire-server"

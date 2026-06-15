@@ -6,3 +6,4 @@ license.workspace = true
 description = "Priority scheduling and session batching policy for hipfire"
 
 [dependencies]
+hipfire-model = { path = "../hipfire-model" }

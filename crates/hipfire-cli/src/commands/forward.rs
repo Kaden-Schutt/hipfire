@@ -14,7 +14,7 @@ Usage:
   hipfire eval --model <model> --suite gpqa --fetch-datasets
 
 Build runner:
-  cargo build --release -p hipfire-runtime --bin hipfire-eval"#;
+  cargo build --release -p hipfire-eval"#;
 
 const HOST_PROFILE_HELP: &str = r#"hipfire host-profile - measured host capability report
 
@@ -60,7 +60,7 @@ pub fn run_eval(args: EvalArgs) -> anyhow::Result<()> {
         "HIPFIRE_EVAL_BIN",
         "hipfire-eval",
         EVAL_HELP,
-        "cargo build --release -p hipfire-runtime --bin hipfire-eval",
+        "cargo build --release -p hipfire-eval",
     )
 }
 

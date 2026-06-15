@@ -53,6 +53,7 @@ arch-dots-ocr = []
 experimental-examples = []
 [dependencies]
 hipfire-coherence = { path = "../hipfire-coherence" }
+hipfire-eval = { path = "../hipfire-eval" }
 hipfire-evidence = { path = "../hipfire-evidence" }
 hipfire-model = { path = "../hipfire-model" }
 hipfire-prompt = { path = "../hipfire-prompt" }
@@ -396,11 +397,6 @@ required-features = []
 [[bin]]
 name = "collect_hessian"
 path = "src/bin/collect_hessian.rs"
-required-features = []
-
-[[bin]]
-name = "hipfire-eval"
-path = "src/bin/hipfire_eval.rs"
 required-features = []
 
 [[bin]]

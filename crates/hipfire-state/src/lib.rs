@@ -134,6 +134,25 @@ pub struct SequenceStateHandle {
     pub generation: u64,
 }
 
+pub fn qwen35_state_handle_kind(session_id: &str) -> &'static str {
+    if session_id.starts_with("qwen35-checkpoint:") {
+        "qwen35_checkpoint"
+    } else {
+        "qwen35_session"
+    }
+}
+
+pub fn qwen35_sequence_state_handle(
+    session_id: &str,
+    allocation_epoch: u64,
+) -> SequenceStateHandle {
+    SequenceStateHandle {
+        id: session_id.to_string(),
+        kind: qwen35_state_handle_kind(session_id).to_string(),
+        generation: allocation_epoch,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedSequenceStateHandle {
     pub id: String,
@@ -307,6 +326,97 @@ pub fn sequence_state_page_descriptor_json(
         "shape": &descriptor.shape,
         "placement": &descriptor.placement,
         "role": &descriptor.role,
+    })
+}
+
+pub fn describe_state_done_json(
+    id: &str,
+    worker_id: &str,
+    handle: &SequenceStateHandle,
+    state_arena_owns_pages: bool,
+    reserved_bytes: usize,
+    state_page_descriptors: &[SequenceStatePageDescriptor],
+) -> serde_json::Value {
+    let state_page_descriptors = state_page_descriptors
+        .iter()
+        .map(sequence_state_page_descriptor_json)
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "type": "describe_state_done",
+        "id": id,
+        "worker_key_id": worker_id,
+        "runtime_state_handle": &handle.id,
+        "handle": {
+            "id": &handle.id,
+            "kind": &handle.kind,
+            "generation": handle.generation,
+        },
+        "state_arena_owns_pages": state_arena_owns_pages,
+        "reserved_bytes": reserved_bytes,
+        "state_page_descriptors": state_page_descriptors,
+    })
+}
+
+pub fn session_state_reservation_describe_json(
+    id: &str,
+    reservation: &SessionStateReservation,
+) -> serde_json::Value {
+    describe_state_done_json(
+        id,
+        &reservation.worker_id,
+        &reservation.handle,
+        true,
+        reservation.reserved_bytes,
+        &reservation.state_page_descriptors,
+    )
+}
+
+pub fn described_sequence_state_json(
+    id: &str,
+    described: &DescribedSequenceState,
+) -> serde_json::Value {
+    describe_state_done_json(
+        id,
+        &described.worker_id,
+        &described.handle,
+        described.state_arena_owns_pages,
+        described.reserved_bytes,
+        &described.state_page_descriptors,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReleaseStateResponseKind {
+    ReleaseState,
+    ReleaseSessionStateReservation,
+}
+
+impl ReleaseStateResponseKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReleaseState => "release_state_done",
+            Self::ReleaseSessionStateReservation => "release_session_state_reservation_done",
+        }
+    }
+}
+
+pub fn release_state_done_json(
+    kind: ReleaseStateResponseKind,
+    id: &str,
+    generic_released: usize,
+    generic_released_bytes: usize,
+    loaded_released: usize,
+    loaded_released_bytes: usize,
+) -> serde_json::Value {
+    let released = generic_released + loaded_released;
+    let released_bytes = generic_released_bytes.saturating_add(loaded_released_bytes);
+    serde_json::json!({
+        "type": kind.as_str(),
+        "id": id,
+        "released": released,
+        "released_bytes": released_bytes,
+        "generic_released": generic_released,
+        "loaded_released": loaded_released,
     })
 }
 
@@ -710,6 +820,106 @@ mod tests {
     }
 
     #[test]
+    fn describe_state_done_json_preserves_daemon_wire_shape() {
+        let handle = qwen35_sequence_state_handle("qwen35-checkpoint:batch:req:16", 41);
+        let descriptor = SequenceStatePageDescriptor {
+            session_id: handle.id.clone(),
+            handle: handle.clone(),
+            kind: SequenceStatePageKind::Kv,
+            label: "qwen35.kv_cache".to_string(),
+            logical_position: 16,
+            resident_bytes: 1024,
+            allocation_epoch: 41,
+            owns_pages: true,
+            shape: vec![2, 16, 4, 32],
+            placement: "hip:arch6:device0".to_string(),
+            role: "resident".to_string(),
+        };
+        let described = DescribedSequenceState {
+            worker_id: "worker:arch6:pp1:q8".to_string(),
+            handle,
+            state_arena_owns_pages: true,
+            reserved_bytes: 1024,
+            state_page_descriptors: vec![descriptor],
+        };
+
+        let json = described_sequence_state_json("describe-1", &described);
+        assert_eq!(json["type"], "describe_state_done");
+        assert_eq!(json["id"], "describe-1");
+        assert_eq!(json["worker_key_id"], "worker:arch6:pp1:q8");
+        assert_eq!(
+            json["runtime_state_handle"],
+            "qwen35-checkpoint:batch:req:16"
+        );
+        assert_eq!(json["handle"]["kind"], "qwen35_checkpoint");
+        assert_eq!(json["handle"]["generation"], 41);
+        assert_eq!(json["state_arena_owns_pages"], true);
+        assert_eq!(json["reserved_bytes"], 1024);
+        assert_eq!(
+            json["state_page_descriptors"][0]["state_kind"],
+            "attention_kv"
+        );
+    }
+
+    #[test]
+    fn reservation_describe_json_preserves_generic_owned_shape() {
+        let mut arena = GenericSequenceStateArena::new();
+        let reservation = arena.reserve(
+            "worker-a",
+            "reserve-a".to_string(),
+            &[SequenceStatePageKind::Kv],
+            128,
+            4096,
+            0,
+        );
+
+        let json = session_state_reservation_describe_json("describe-2", &reservation);
+        assert_eq!(json["type"], "describe_state_done");
+        assert_eq!(json["id"], "describe-2");
+        assert_eq!(json["worker_key_id"], "worker-a");
+        assert_eq!(json["runtime_state_handle"], "reserve-a");
+        assert_eq!(json["handle"]["kind"], "generic_reserved_state");
+        assert_eq!(json["state_arena_owns_pages"], true);
+        assert_eq!(json["reserved_bytes"], 4096);
+        assert_eq!(json["state_page_descriptors"][0]["owns_pages"], true);
+    }
+
+    #[test]
+    fn release_state_done_json_preserves_daemon_wire_shape() {
+        let json = release_state_done_json(
+            ReleaseStateResponseKind::ReleaseState,
+            "release-1",
+            2,
+            4096,
+            1,
+            2048,
+        );
+        assert_eq!(json["type"], "release_state_done");
+        assert_eq!(json["id"], "release-1");
+        assert_eq!(json["released"], 3);
+        assert_eq!(json["released_bytes"], 6144);
+        assert_eq!(json["generic_released"], 2);
+        assert_eq!(json["loaded_released"], 1);
+        assert!(json.get("generic_released_bytes").is_none());
+        assert!(json.get("loaded_released_bytes").is_none());
+    }
+
+    #[test]
+    fn release_session_state_reservation_done_json_uses_reservation_response_type() {
+        let json = release_state_done_json(
+            ReleaseStateResponseKind::ReleaseSessionStateReservation,
+            "release-2",
+            0,
+            usize::MAX,
+            1,
+            8,
+        );
+        assert_eq!(json["type"], "release_session_state_reservation_done");
+        assert_eq!(json["released"], 1);
+        assert_eq!(json["released_bytes"], usize::MAX);
+    }
+
+    #[test]
     fn generic_reservation_arena_releases_by_generation() {
         let mut arena = GenericSequenceStateArena::new();
         let reservation = arena.reserve(
@@ -760,6 +970,19 @@ mod tests {
             sequence_state_handle_id(&serde_json::json!({"kind": "missing_id"})),
             None
         );
+    }
+
+    #[test]
+    fn qwen35_sequence_state_handles_classify_sessions_and_checkpoints() {
+        let session = qwen35_sequence_state_handle("request-a", 7);
+        assert_eq!(session.id, "request-a");
+        assert_eq!(session.kind, "qwen35_session");
+        assert_eq!(session.generation, 7);
+
+        let checkpoint = qwen35_sequence_state_handle("qwen35-checkpoint:batch:req:16", 41);
+        assert_eq!(checkpoint.id, "qwen35-checkpoint:batch:req:16");
+        assert_eq!(checkpoint.kind, "qwen35_checkpoint");
+        assert_eq!(checkpoint.generation, 41);
     }
 
     #[test]

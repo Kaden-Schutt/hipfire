@@ -4,6 +4,10 @@
 
 //! Priority scheduling and session batching policy shared by control planes.
 
+pub use hipfire_model::{
+    model_worker_key_id, normalize_feature_flags, normalize_model_worker_key,
+    same_model_worker_key, ModelWorkerKey,
+};
 use std::collections::{BTreeMap, HashSet};
 
 pub const SCHED_PRIORITY_REALTIME: u8 = 0;
@@ -88,19 +92,6 @@ pub struct ServerPrefillPolicyControls {
     pub resident_state_cache: bool,
     pub resident_checkpoint_max: usize,
     pub state_cache_disk: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ModelWorkerKey {
-    pub artifact_path: String,
-    pub artifact_digest: Option<String>,
-    pub arch_id: String,
-    pub quant_family: String,
-    pub state_mode: String,
-    pub max_seq_bucket: usize,
-    pub accelerator_kind: Option<String>,
-    pub device_id: Option<String>,
-    pub feature_flags: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -364,54 +355,6 @@ pub fn scheduler_policy_for_priority(
 
 pub fn should_dispatch_opportunistic(input: OpportunisticDispatchInput) -> bool {
     input.schedule_clear || input.compatible_queued_tokens >= input.target_pair_tokens.max(1)
-}
-
-pub fn normalize_feature_flags(flags: &[String]) -> Vec<String> {
-    let mut flags = flags.to_vec();
-    flags.sort();
-    flags.dedup();
-    flags
-}
-
-pub fn normalize_model_worker_key(key: &ModelWorkerKey) -> ModelWorkerKey {
-    ModelWorkerKey {
-        artifact_path: key.artifact_path.clone(),
-        artifact_digest: key.artifact_digest.clone(),
-        arch_id: key.arch_id.clone(),
-        quant_family: key.quant_family.clone(),
-        state_mode: key.state_mode.clone(),
-        max_seq_bucket: key.max_seq_bucket,
-        accelerator_kind: Some(
-            key.accelerator_kind
-                .clone()
-                .unwrap_or_else(|| "hip".to_string()),
-        ),
-        device_id: Some(key.device_id.clone().unwrap_or_else(|| "0".to_string())),
-        feature_flags: normalize_feature_flags(&key.feature_flags),
-    }
-}
-
-pub fn model_worker_key_id(key: &ModelWorkerKey) -> String {
-    let normalized = normalize_model_worker_key(key);
-    [
-        normalized
-            .artifact_digest
-            .unwrap_or(normalized.artifact_path),
-        normalized.arch_id,
-        normalized.quant_family,
-        normalized.state_mode,
-        normalized.max_seq_bucket.to_string(),
-        normalized
-            .accelerator_kind
-            .unwrap_or_else(|| "hip".to_string()),
-        normalized.device_id.unwrap_or_else(|| "0".to_string()),
-        normalized.feature_flags.join("+"),
-    ]
-    .join("|")
-}
-
-pub fn same_model_worker_key(a: &ModelWorkerKey, b: &ModelWorkerKey) -> bool {
-    model_worker_key_id(a) == model_worker_key_id(b)
 }
 
 pub fn create_request_session_draft(input: CreateRequestSessionInput) -> RequestSessionDraft {

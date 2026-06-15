@@ -68,18 +68,20 @@ use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use hipfire_state::{
-    describe_sequence_state_descriptors, model_worker_runtime_view_json,
-    parse_reserve_session_state_kinds, parse_sequence_state_handle,
+    describe_sequence_state_descriptors, described_sequence_state_json,
+    model_worker_runtime_view_json, parse_reserve_session_state_kinds, parse_sequence_state_handle,
     parse_sequence_state_handle_list, parsed_handle_may_target_generic,
-    parsed_handle_may_target_loaded_state, sequence_state_page_descriptor_json,
+    parsed_handle_may_target_loaded_state, qwen35_sequence_state_handle, release_state_done_json,
+    sequence_state_page_descriptor_json, session_state_reservation_describe_json,
     DescribedSequenceState, GenericSequenceStateArena, ModelArtifactMemory, ModelWorkerId,
     ModelWorkerMemoryView, ModelWorkerRuntimeView, ParsedSequenceStateHandle,
-    SequenceStateArenaBackend, SequenceStateCheckpointRequest, SequenceStateHandle,
+    ReleaseStateResponseKind, SequenceStateArenaBackend, SequenceStateCheckpointRequest,
     SequenceStatePageDescriptor, SequenceStatePageKind,
 };
 #[cfg(test)]
 use hipfire_state::{
     generic_state_reservation_descriptors, sequence_state_handle_id, sequence_state_handle_parts,
+    SequenceStateHandle,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
@@ -729,316 +731,6 @@ fn acquire_daemon_lock() -> std::fs::File {
     f
 }
 
-#[derive(Debug)]
-struct ResourceLease {
-    dirs: Vec<std::path::PathBuf>,
-}
-
-impl Drop for ResourceLease {
-    fn drop(&mut self) {
-        for dir in self.dirs.drain(..).rev() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
-}
-
-fn sanitize_resource_id(id: &str) -> String {
-    let mut out = String::with_capacity(id.len().max(1));
-    for ch in id.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-') {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() {
-        "unknown".to_string()
-    } else {
-        out
-    }
-}
-
-fn parse_csv_ids(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn parse_cpu_core_list(raw: Option<String>) -> Result<Vec<usize>, String> {
-    let Some(raw) = raw else {
-        return Ok(Vec::new());
-    };
-    let mut out = std::collections::BTreeSet::new();
-    for part in raw.split(',') {
-        let trimmed = part.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Some((start, end)) = trimmed.split_once('-') {
-            let start = start
-                .parse::<usize>()
-                .map_err(|_| format!("invalid CPU core id: {trimmed}"))?;
-            let end = end
-                .parse::<usize>()
-                .map_err(|_| format!("invalid CPU core id: {trimmed}"))?;
-            if end < start {
-                return Err(format!("invalid CPU core range: {trimmed}"));
-            }
-            for core in start..=end {
-                out.insert(core);
-            }
-        } else {
-            out.insert(
-                trimmed
-                    .parse::<usize>()
-                    .map_err(|_| format!("invalid CPU core id: {trimmed}"))?,
-            );
-        }
-    }
-    Ok(out.into_iter().collect())
-}
-
-fn resolve_visible_hip_ids() -> Vec<String> {
-    std::env::var("HIP_VISIBLE_DEVICES")
-        .ok()
-        .or_else(|| std::env::var("ROCR_VISIBLE_DEVICES").ok())
-        .map(|raw| parse_csv_ids(&raw))
-        .filter(|ids| !ids.is_empty())
-        .unwrap_or_default()
-}
-
-fn resolve_hip_lock_ids() -> Vec<String> {
-    let visible = resolve_visible_hip_ids();
-    if let Ok(raw) = std::env::var("HIPFIRE_DEVICES") {
-        let ids = parse_csv_ids(&raw);
-        if !ids.is_empty() {
-            return ids
-                .into_iter()
-                .map(|id| {
-                    id.parse::<usize>()
-                        .ok()
-                        .and_then(|idx| visible.get(idx).cloned())
-                        .unwrap_or(id)
-                })
-                .collect();
-        }
-    }
-    visible.into_iter().next().into_iter().collect::<Vec<_>>()
-}
-
-fn discover_npu_lock_ids() -> Vec<String> {
-    let mut ids = std::collections::BTreeSet::new();
-    for root in ["/sys/class/accel", "/dev/accel"] {
-        if let Ok(entries) = std::fs::read_dir(root) {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    ids.insert(name.to_string());
-                }
-            }
-        }
-    }
-    ids.into_iter().collect()
-}
-
-fn resolve_npu_lock_ids() -> Vec<String> {
-    // HIPFIRE_RESOURCE_LOCK_NPUS=1 leases every detected NPU; comma lists lease explicit NPU IDs.
-    let Ok(raw) = std::env::var("HIPFIRE_RESOURCE_LOCK_NPUS") else {
-        return Vec::new();
-    };
-    let trimmed = raw.trim();
-    if matches!(
-        trimmed,
-        "" | "0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO"
-    ) {
-        return Vec::new();
-    }
-    if matches!(trimmed, "1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES") {
-        return discover_npu_lock_ids();
-    }
-    parse_csv_ids(trimmed)
-}
-
-fn resource_lock_requests() -> Result<Vec<String>, String> {
-    let mut resources = Vec::new();
-    let hip_ids = resolve_hip_lock_ids();
-    if hip_ids.is_empty() {
-        resources.push("hip-gpu-0".to_string());
-    } else {
-        resources.extend(
-            hip_ids
-                .into_iter()
-                .map(|id| format!("hip-gpu-{}", sanitize_resource_id(&id))),
-        );
-    }
-    resources.extend(
-        resolve_npu_lock_ids()
-            .into_iter()
-            .map(|id| format!("npu-{}", sanitize_resource_id(&id))),
-    );
-    resources.extend(
-        // HIPFIRE_RESOURCE_LOCK_CPU_CORES=0,2-4 adds daemon startup leases for CPU cores.
-        parse_cpu_core_list(std::env::var("HIPFIRE_RESOURCE_LOCK_CPU_CORES").ok())?
-            .into_iter()
-            .map(|core| format!("cpu-core-{core}")),
-    );
-    resources.sort();
-    resources.dedup();
-    Ok(resources)
-}
-
-#[cfg(unix)]
-fn pid_is_alive(pid: i64) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    rc == 0
-}
-
-#[cfg(not(unix))]
-fn pid_is_alive(_pid: i64) -> bool {
-    true
-}
-
-fn read_lock_owner(lock_dir: &std::path::Path) -> Option<serde_json::Value> {
-    std::fs::read_to_string(lock_dir.join("owner.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-}
-
-fn current_hostname() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .or_else(|_| std::fs::read_to_string("/etc/hostname"))
-        .map(|s| s.trim().to_string())
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
-fn write_lock_owner(lock_dir: &std::path::Path, resource: &str) -> std::io::Result<()> {
-    let command = std::env::args().collect::<Vec<_>>().join(" ");
-    let owner = serde_json::json!({
-        "pid": std::process::id(),
-        "host": current_hostname(),
-        "command": command,
-        "started_at_unix_ms": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-        "resource": resource,
-    });
-    let path = lock_dir.join("owner.json");
-    std::fs::write(path, format!("{owner:#}\n"))
-}
-
-fn try_acquire_resource_lock(
-    root: &std::path::Path,
-    resource: &str,
-) -> Result<std::path::PathBuf, String> {
-    std::fs::create_dir_all(root).map_err(|e| format!("create {}: {e}", root.display()))?;
-    let lock_dir = root.join(format!("{resource}.lock"));
-    match std::fs::create_dir(&lock_dir) {
-        Ok(()) => {
-            write_lock_owner(&lock_dir, resource)
-                .map_err(|e| format!("write {}: {e}", lock_dir.join("owner.json").display()))?;
-            return Ok(lock_dir);
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(format!("create {}: {e}", lock_dir.display())),
-    }
-
-    let owner = read_lock_owner(&lock_dir);
-    let owner_pid = owner
-        .as_ref()
-        .and_then(|v| v.get("pid"))
-        .and_then(|v| v.as_i64());
-    if owner_pid.is_some_and(|pid| !pid_is_alive(pid)) {
-        let _ = std::fs::remove_dir_all(&lock_dir);
-        match std::fs::create_dir(&lock_dir) {
-            Ok(()) => {
-                write_lock_owner(&lock_dir, resource)
-                    .map_err(|e| format!("write {}: {e}", lock_dir.join("owner.json").display()))?;
-                return Ok(lock_dir);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(format!("create {}: {e}", lock_dir.display())),
-        }
-    }
-
-    let owner_text = owner
-        .as_ref()
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "unknown owner".to_string());
-    Err(format!(
-        "hipfire resource {resource} is already locked by {owner_text}"
-    ))
-}
-
-fn acquire_resource_lease() -> ResourceLease {
-    // HIPFIRE_RESOURCE_LOCK=0 disables daemon startup resource leases.
-    if std::env::var("HIPFIRE_RESOURCE_LOCK").ok().as_deref() == Some("0") {
-        return ResourceLease { dirs: Vec::new() };
-    }
-
-    let resources = match resource_lock_requests() {
-        Ok(resources) => resources,
-        Err(e) => {
-            eprintln!("FATAL: invalid hipfire resource lock config: {e}");
-            std::process::exit(1);
-        }
-    };
-    if resources.is_empty() {
-        return ResourceLease { dirs: Vec::new() };
-    }
-
-    // HIPFIRE_RESOURCE_LOCK_DIR overrides the daemon resource-lock root directory.
-    let root = std::env::var("HIPFIRE_RESOURCE_LOCK_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir().join("hipfire-resource-locks"));
-    // HIPFIRE_RESOURCE_LOCK_WAIT_MS waits for busy daemon resource leases before failing startup.
-    let wait_ms = std::env::var("HIPFIRE_RESOURCE_LOCK_WAIT_MS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .unwrap_or(0);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
-    let mut dirs = Vec::new();
-
-    for resource in &resources {
-        loop {
-            match try_acquire_resource_lock(&root, resource) {
-                Ok(dir) => {
-                    dirs.push(dir);
-                    break;
-                }
-                Err(_) if wait_ms > 0 && std::time::Instant::now() < deadline => {
-                    std::thread::sleep(
-                        std::time::Duration::from_millis(250)
-                            .min(deadline.saturating_duration_since(std::time::Instant::now())),
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    for dir in dirs.drain(..).rev() {
-                        let _ = std::fs::remove_dir_all(dir);
-                    }
-                    eprintln!("FATAL: {e}");
-                    eprintln!(
-                        "Set HIPFIRE_RESOURCE_LOCK_WAIT_MS to wait, or HIPFIRE_RESOURCE_LOCK=0 to bypass."
-                    );
-                    std::process::exit(1);
-                }
-            }
-        }
-    }
-    eprintln!(
-        "[hipfire] resource locks acquired: {}",
-        resources.join(", ")
-    );
-    ResourceLease { dirs }
-}
-
 /// Cap on the *encoded* base64 string length the daemon will accept on the
 /// IPC. ~40 MB encoded → ~30 MB raw image bytes (4/3 expansion).
 const MAX_BASE64_ENCODED_LEN: usize = 40 * 1024 * 1024;
@@ -1338,71 +1030,6 @@ fn emit_generate_batch_prefill_unsupported(
 #[cfg(test)]
 mod generate_batch_prefill_tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn temp_lock_root(label: &str) -> std::path::PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "hipfire-daemon-lock-test-{label}-{}-{nanos}",
-            std::process::id()
-        ))
-    }
-
-    #[test]
-    fn resource_lock_cpu_core_list_parser_matches_cli_shape() {
-        assert_eq!(
-            parse_cpu_core_list(Some("0,2-4,3".to_string())).unwrap(),
-            vec![0, 2, 3, 4]
-        );
-        assert!(parse_cpu_core_list(Some("4-2".to_string()))
-            .unwrap_err()
-            .contains("invalid CPU core range"));
-        assert!(parse_cpu_core_list(Some("gpu0".to_string()))
-            .unwrap_err()
-            .contains("invalid CPU core id"));
-    }
-
-    #[test]
-    fn resource_lock_maps_logical_hipfire_devices_through_visible_devices() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::set_var("HIP_VISIBLE_DEVICES", "3,5");
-            std::env::remove_var("ROCR_VISIBLE_DEVICES");
-            std::env::set_var("HIPFIRE_DEVICES", "1");
-        }
-        assert_eq!(resolve_hip_lock_ids(), vec!["5".to_string()]);
-        unsafe {
-            std::env::remove_var("HIP_VISIBLE_DEVICES");
-            std::env::remove_var("HIPFIRE_DEVICES");
-        }
-    }
-
-    #[test]
-    fn resource_lock_rejects_live_owner_and_reclaims_stale_owner() {
-        let root = temp_lock_root("reclaim");
-        let first = try_acquire_resource_lock(&root, "hip-gpu-0").unwrap();
-        let busy = try_acquire_resource_lock(&root, "hip-gpu-0").unwrap_err();
-        assert!(busy.contains("hipfire resource hip-gpu-0 is already locked"));
-        std::fs::remove_dir_all(&first).unwrap();
-
-        let stale = root.join("hip-gpu-0.lock");
-        std::fs::create_dir_all(&stale).unwrap();
-        std::fs::write(
-            stale.join("owner.json"),
-            r#"{"pid":-1,"host":"test","command":"old","resource":"hip-gpu-0"}"#,
-        )
-        .unwrap();
-        let replacement = try_acquire_resource_lock(&root, "hip-gpu-0").unwrap();
-        let owner = std::fs::read_to_string(replacement.join("owner.json")).unwrap();
-        assert!(owner.contains(&format!("\"pid\": {}", std::process::id())));
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
     fn test_dense_qwen35_config() -> qwen35::Qwen35Config {
         qwen35::Qwen35Config {
             dim: 16,
@@ -3784,22 +3411,6 @@ fn qwen35_request_session_count(m: &LoadedModel) -> usize {
     saved + active
 }
 
-fn qwen35_state_handle_kind(session_id: &str) -> &'static str {
-    if session_id.starts_with("qwen35-checkpoint:") {
-        "qwen35_checkpoint"
-    } else {
-        "qwen35_session"
-    }
-}
-
-fn qwen35_sequence_state_handle(session_id: &str, allocation_epoch: u64) -> SequenceStateHandle {
-    SequenceStateHandle {
-        id: session_id.to_string(),
-        kind: qwen35_state_handle_kind(session_id).to_string(),
-        generation: allocation_epoch,
-    }
-}
-
 fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescriptor> {
     let mut descriptors = Vec::new();
     let placement = format!("hip:arch{}:device0", m.arch_id);
@@ -3902,13 +3513,10 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
             let logical_position = m.seq_pos + compact_offset;
             let allocation_epoch = m.q35_active_state_allocation_epoch;
             let owns_pages = allocation_epoch != 0;
+            let handle = qwen35_sequence_state_handle(active_id, allocation_epoch);
             descriptors.push(SequenceStatePageDescriptor {
                 session_id: active_id.to_string(),
-                handle: SequenceStateHandle {
-                    id: active_id.to_string(),
-                    kind: "qwen35_session".to_string(),
-                    generation: allocation_epoch,
-                },
+                handle: handle.clone(),
                 kind: SequenceStatePageKind::Kv,
                 label: "qwen35.kv_cache.active".to_string(),
                 logical_position,
@@ -3937,11 +3545,7 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
             });
             descriptors.push(SequenceStatePageDescriptor {
                 session_id: active_id.to_string(),
-                handle: SequenceStateHandle {
-                    id: active_id.to_string(),
-                    kind: "qwen35_session".to_string(),
-                    generation: allocation_epoch,
-                },
+                handle: handle.clone(),
                 kind: SequenceStatePageKind::DeltaNet,
                 label: "qwen35.deltanet_state.active".to_string(),
                 logical_position,
@@ -3969,11 +3573,7 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
             });
             descriptors.push(SequenceStatePageDescriptor {
                 session_id: active_id.to_string(),
-                handle: SequenceStateHandle {
-                    id: active_id.to_string(),
-                    kind: "qwen35_session".to_string(),
-                    generation: allocation_epoch,
-                },
+                handle: handle.clone(),
                 kind: SequenceStatePageKind::Logits,
                 label: "qwen35.logits_snapshot.active".to_string(),
                 logical_position,
@@ -3994,11 +3594,7 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
             });
             descriptors.push(SequenceStatePageDescriptor {
                 session_id: active_id.to_string(),
-                handle: SequenceStateHandle {
-                    id: active_id.to_string(),
-                    kind: "qwen35_session".to_string(),
-                    generation: allocation_epoch,
-                },
+                handle,
                 kind: SequenceStatePageKind::BackendPrivate,
                 label: "qwen35.prefix_metadata.active".to_string(),
                 logical_position,
@@ -7766,7 +7362,7 @@ fn main() {
     // compat paths (hfq4, hfq6, q8 weights × asym3, q8 KV) so models from any
     // era of the registry start instantly.
     if args.iter().any(|a| a == "--precompile") {
-        let _resource_lease = acquire_resource_lease();
+        let _resource_lease = hipfire_daemon_adapter::acquire_resource_lease_or_exit();
         // Pre-create the expected precompiled-dir next to this binary so the
         // compiler's writeback path fires. Without this, Gpu::init probes for
         // an existing dir and silently disables writeback if it's missing —
@@ -7816,7 +7412,7 @@ fn main() {
     // because they'd been reparented to PID 1 after their bun parent died).
     // Kept in a binding so the fd lives for the full process lifetime.
     let _daemon_lock = acquire_daemon_lock();
-    let _resource_lease = acquire_resource_lease();
+    let _resource_lease = hipfire_daemon_adapter::acquire_resource_lease_or_exit();
     hipfire_runtime::logging::init_stderr_logging("daemon");
 
     let mut gpu = match rdna_compute::Gpu::init() {
@@ -9497,25 +9093,7 @@ fn main() {
                     if let Some(reservation) =
                         generic_state_arena.describe(&handle.id, handle.generation)
                     {
-                        let state_page_descriptors: Vec<serde_json::Value> = reservation
-                            .state_page_descriptors
-                            .iter()
-                            .map(sequence_state_page_descriptor_json)
-                            .collect();
-                        let done = serde_json::json!({
-                            "type": "describe_state_done",
-                            "id": id,
-                            "worker_key_id": &reservation.worker_id,
-                            "runtime_state_handle": &reservation.handle.id,
-                            "handle": {
-                                "id": &reservation.handle.id,
-                                "kind": &reservation.handle.kind,
-                                "generation": reservation.handle.generation,
-                            },
-                            "state_arena_owns_pages": true,
-                            "reserved_bytes": reservation.reserved_bytes,
-                            "state_page_descriptors": state_page_descriptors,
-                        });
+                        let done = session_state_reservation_describe_json(id, reservation);
                         let _ = writeln!(stdout, "{done}");
                         let _ = stdout.flush();
                         continue;
@@ -9534,25 +9112,7 @@ fn main() {
                     );
                     continue;
                 };
-                let state_page_descriptors: Vec<serde_json::Value> = described
-                    .state_page_descriptors
-                    .iter()
-                    .map(sequence_state_page_descriptor_json)
-                    .collect();
-                let done = serde_json::json!({
-                    "type": "describe_state_done",
-                    "id": id,
-                    "worker_key_id": &described.worker_id,
-                    "runtime_state_handle": &described.handle.id,
-                    "handle": {
-                        "id": &described.handle.id,
-                        "kind": &described.handle.kind,
-                        "generation": described.handle.generation,
-                    },
-                    "state_arena_owns_pages": described.state_arena_owns_pages,
-                    "reserved_bytes": described.reserved_bytes,
-                    "state_page_descriptors": state_page_descriptors,
-                });
+                let done = described_sequence_state_json(id, &described);
                 let _ = writeln!(stdout, "{done}");
                 let _ = stdout.flush();
             }
@@ -9585,20 +9145,19 @@ fn main() {
                             continue;
                         }
                     };
-                let released = generic_released + loaded_released;
-                let released_bytes = generic_released_bytes.saturating_add(loaded_released_bytes);
-                let done = serde_json::json!({
-                    "type": if is_release_state {
-                        "release_state_done"
-                    } else {
-                        "release_session_state_reservation_done"
-                    },
-                    "id": id,
-                    "released": released,
-                    "released_bytes": released_bytes,
-                    "generic_released": generic_released,
-                    "loaded_released": loaded_released,
-                });
+                let kind = if is_release_state {
+                    ReleaseStateResponseKind::ReleaseState
+                } else {
+                    ReleaseStateResponseKind::ReleaseSessionStateReservation
+                };
+                let done = release_state_done_json(
+                    kind,
+                    id,
+                    generic_released,
+                    generic_released_bytes,
+                    loaded_released,
+                    loaded_released_bytes,
+                );
                 let _ = writeln!(stdout, "{done}");
                 let _ = stdout.flush();
             }

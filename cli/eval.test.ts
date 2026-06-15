@@ -239,7 +239,7 @@ describe("hipfire eval CLI delegation", () => {
     expect(EVAL_HELP).toContain("--regenerate");
     expect(EVAL_HELP).toContain("--no-cache");
     expect(EVAL_HELP).toContain("--fail-on-admission");
-    expect(EVAL_HELP).toContain("cargo build --release -p hipfire-runtime --bin hipfire-eval");
+    expect(EVAL_HELP).toContain("cargo build --release -p hipfire-eval");
   });
 
   test("local speed baseline path uses hfq stem", () => {
