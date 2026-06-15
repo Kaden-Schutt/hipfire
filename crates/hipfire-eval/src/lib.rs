@@ -26,13 +26,13 @@ use hipfire_evidence::{
     evidence_artifact_index_entry_from_value_json, evidence_artifact_index_entry_json,
     evidence_artifact_json, evidence_collection_policy, evidence_metric_direction,
     evidence_record_json, extract_external_evidence_records_json, file_hash, hardware_bucket,
-    has_launch_count_metric, has_module_evidence_metric, has_moe_router_metric,
-    has_profiling_metric, host_profile_artifact_index_entry_json, host_profile_hash,
-    launch_count_metrics, list_files, module_evidence_metrics, moe_router_metrics,
-    profiling_metrics, prompt_artifact_index_entry_json, required_admission_evidence_requirements,
-    run_metadata_artifact_json, run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
-    standard_evidence_paths_in_dir, AdmissionArtifact as EvidenceAdmissionArtifact,
-    AdmissionEvidence as EvidenceAdmissionEvidence,
+    has_launch_count_metric, has_memory_metric, has_module_evidence_metric, has_moe_router_metric,
+    has_phase_timing_metric, has_profiling_metric, host_profile_artifact_index_entry_json,
+    host_profile_hash, launch_count_metrics, list_files, memory_metrics, module_evidence_metrics,
+    moe_router_metrics, phase_timing_metrics, profiling_metrics, prompt_artifact_index_entry_json,
+    required_admission_evidence_requirements, run_metadata_artifact_json, run_provenance_json,
+    stable_hash_bytes, stable_hash_file_fallback, standard_evidence_paths_in_dir,
+    AdmissionArtifact as EvidenceAdmissionArtifact, AdmissionEvidence as EvidenceAdmissionEvidence,
     ComparisonArtifact as EvidenceComparisonArtifact, EvidenceArtifact, EvidenceArtifactCollection,
     EvidenceArtifactConfig, EvidenceArtifactDatasetStatus, EvidenceArtifactIndexContext,
     EvidenceArtifactModels, EvidenceRecord, RunMetadataArtifact, RunMetadataConfig,
@@ -3626,9 +3626,9 @@ fn evidence_records(kind: &str, results: &[EvalResult]) -> Vec<Value> {
                 } else if kind == "quality" {
                     has_quality_metric(row)
                 } else if kind == "phase_timings" {
-                    has_phase_timing_metric(row)
+                    has_phase_timing_metric(&row.metrics, row.elapsed_ms)
                 } else if kind == "memory" {
-                    has_memory_metric(row)
+                    has_memory_metric(&row.metrics)
                 } else if kind == "launch_counts" {
                     has_launch_count_metric(&row.metrics)
                 } else if kind == "moe_router_histogram" {
@@ -3645,8 +3645,8 @@ fn evidence_records(kind: &str, results: &[EvalResult]) -> Vec<Value> {
         })
         .map(|row| {
             let metrics = match kind {
-                "phase_timings" => phase_timing_metrics(row),
-                "memory" => memory_metrics(row),
+                "phase_timings" => phase_timing_metrics(&row.metrics, row.elapsed_ms),
+                "memory" => memory_metrics(&row.metrics),
                 "launch_counts" => launch_count_metrics(&row.metrics),
                 "moe_router_histogram" => moe_router_metrics(&row.metrics),
                 "profiling" => profiling_metrics(&row.metrics),
@@ -3728,86 +3728,6 @@ fn has_path_c_trace_metric(row: &EvalResult) -> bool {
 
 fn has_any_metric(row: &EvalResult, keys: &[&str]) -> bool {
     keys.iter().any(|key| row.metrics.contains_key(*key))
-}
-
-fn has_phase_timing_metric(row: &EvalResult) -> bool {
-    [
-        "load_ms",
-        "prefill_ms",
-        "prefill_secs",
-        "decode_ms",
-        "decode_secs",
-        "teardown_ms",
-        "ttft_ms",
-        "elapsed_ms",
-    ]
-    .iter()
-    .any(|key| row.metrics.contains_key(*key))
-        || row.elapsed_ms > 0
-}
-
-fn phase_timing_metrics(row: &EvalResult) -> BTreeMap<String, Value> {
-    let mut metrics = BTreeMap::new();
-    copy_numeric_metric(&row.metrics, &mut metrics, "load_ms", "load_ms");
-    copy_numeric_metric(&row.metrics, &mut metrics, "prefill_ms", "prefill_ms");
-    copy_secs_as_ms(&row.metrics, &mut metrics, "prefill_secs", "prefill_ms");
-    copy_numeric_metric(&row.metrics, &mut metrics, "decode_ms", "decode_ms");
-    copy_secs_as_ms(&row.metrics, &mut metrics, "decode_secs", "decode_ms");
-    copy_numeric_metric(&row.metrics, &mut metrics, "teardown_ms", "teardown_ms");
-    copy_numeric_metric(&row.metrics, &mut metrics, "ttft_ms", "ttft_ms");
-    if !metrics.contains_key("elapsed_ms") {
-        metrics.insert("elapsed_ms".to_string(), json!(row.elapsed_ms));
-    }
-    metrics
-}
-
-fn has_memory_metric(row: &EvalResult) -> bool {
-    [
-        "vram_peak_bytes",
-        "vram_used_bytes",
-        "vram_used_mb",
-        "vram_loaded_mb",
-        "kv_bytes",
-        "workspace_bytes",
-    ]
-    .iter()
-    .any(|key| row.metrics.contains_key(*key))
-}
-
-fn memory_metrics(row: &EvalResult) -> BTreeMap<String, Value> {
-    let mut metrics = BTreeMap::new();
-    copy_numeric_metric(
-        &row.metrics,
-        &mut metrics,
-        "vram_peak_bytes",
-        "vram_peak_bytes",
-    );
-    copy_numeric_metric(
-        &row.metrics,
-        &mut metrics,
-        "vram_used_bytes",
-        "vram_peak_bytes",
-    );
-    copy_mb_as_bytes(
-        &row.metrics,
-        &mut metrics,
-        "vram_used_mb",
-        "vram_peak_bytes",
-    );
-    copy_mb_as_bytes(
-        &row.metrics,
-        &mut metrics,
-        "vram_loaded_mb",
-        "vram_peak_bytes",
-    );
-    copy_numeric_metric(&row.metrics, &mut metrics, "kv_bytes", "kv_bytes");
-    copy_numeric_metric(
-        &row.metrics,
-        &mut metrics,
-        "workspace_bytes",
-        "workspace_bytes",
-    );
-    metrics
 }
 
 fn dflash_trace_metrics(row: &EvalResult) -> BTreeMap<String, Value> {
@@ -3934,34 +3854,6 @@ fn copy_json_metric(
     }
     if let Some(value) = source.get(source_key) {
         dest.insert(dest_key.to_string(), value.clone());
-    }
-}
-
-fn copy_secs_as_ms(
-    source: &BTreeMap<String, Value>,
-    dest: &mut BTreeMap<String, Value>,
-    source_key: &str,
-    dest_key: &str,
-) {
-    if dest.contains_key(dest_key) {
-        return;
-    }
-    if let Some(value) = source.get(source_key).and_then(Value::as_f64) {
-        dest.insert(dest_key.to_string(), json!(value * 1000.0));
-    }
-}
-
-fn copy_mb_as_bytes(
-    source: &BTreeMap<String, Value>,
-    dest: &mut BTreeMap<String, Value>,
-    source_key: &str,
-    dest_key: &str,
-) {
-    if dest.contains_key(dest_key) {
-        return;
-    }
-    if let Some(value) = source.get(source_key).and_then(Value::as_f64) {
-        dest.insert(dest_key.to_string(), json!(value * 1024.0 * 1024.0));
     }
 }
 

@@ -281,6 +281,26 @@ pub const PROFILING_METRICS: &[&str] = &[
     "sgpr_count",
 ];
 
+pub const PHASE_TIMING_TRIGGER_METRICS: &[&str] = &[
+    "load_ms",
+    "prefill_ms",
+    "prefill_secs",
+    "decode_ms",
+    "decode_secs",
+    "teardown_ms",
+    "ttft_ms",
+    "elapsed_ms",
+];
+
+pub const MEMORY_TRIGGER_METRICS: &[&str] = &[
+    "vram_peak_bytes",
+    "vram_used_bytes",
+    "vram_used_mb",
+    "vram_loaded_mb",
+    "kv_bytes",
+    "workspace_bytes",
+];
+
 pub fn has_any_metric(metrics: &BTreeMap<String, Value>, keys: &[&str]) -> bool {
     keys.iter().any(|key| metrics.contains_key(*key))
 }
@@ -317,6 +337,43 @@ pub fn has_profiling_metric(metrics: &BTreeMap<String, Value>) -> bool {
 
 pub fn profiling_metrics(metrics: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
     select_metrics(metrics, PROFILING_METRICS)
+}
+
+pub fn has_phase_timing_metric(metrics: &BTreeMap<String, Value>, elapsed_ms: u128) -> bool {
+    has_any_metric(metrics, PHASE_TIMING_TRIGGER_METRICS) || elapsed_ms > 0
+}
+
+pub fn phase_timing_metrics(
+    metrics: &BTreeMap<String, Value>,
+    elapsed_ms: u128,
+) -> BTreeMap<String, Value> {
+    let mut out = BTreeMap::new();
+    copy_numeric_metric(metrics, &mut out, "load_ms", "load_ms");
+    copy_numeric_metric(metrics, &mut out, "prefill_ms", "prefill_ms");
+    copy_secs_as_ms(metrics, &mut out, "prefill_secs", "prefill_ms");
+    copy_numeric_metric(metrics, &mut out, "decode_ms", "decode_ms");
+    copy_secs_as_ms(metrics, &mut out, "decode_secs", "decode_ms");
+    copy_numeric_metric(metrics, &mut out, "teardown_ms", "teardown_ms");
+    copy_numeric_metric(metrics, &mut out, "ttft_ms", "ttft_ms");
+    if !out.contains_key("elapsed_ms") {
+        out.insert("elapsed_ms".to_string(), json!(elapsed_ms));
+    }
+    out
+}
+
+pub fn has_memory_metric(metrics: &BTreeMap<String, Value>) -> bool {
+    has_any_metric(metrics, MEMORY_TRIGGER_METRICS)
+}
+
+pub fn memory_metrics(metrics: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    let mut out = BTreeMap::new();
+    copy_numeric_metric(metrics, &mut out, "vram_peak_bytes", "vram_peak_bytes");
+    copy_numeric_metric(metrics, &mut out, "vram_used_bytes", "vram_peak_bytes");
+    copy_mb_as_bytes(metrics, &mut out, "vram_used_mb", "vram_peak_bytes");
+    copy_mb_as_bytes(metrics, &mut out, "vram_loaded_mb", "vram_peak_bytes");
+    copy_numeric_metric(metrics, &mut out, "kv_bytes", "kv_bytes");
+    copy_numeric_metric(metrics, &mut out, "workspace_bytes", "workspace_bytes");
+    out
 }
 
 pub fn has_module_evidence_metric(metrics: &BTreeMap<String, Value>) -> bool {
@@ -361,6 +418,34 @@ fn copy_numeric_metric(
     }
     if let Some(value) = source.get(source_key).and_then(Value::as_f64) {
         dest.insert(dest_key.to_string(), json!(value));
+    }
+}
+
+fn copy_secs_as_ms(
+    source: &BTreeMap<String, Value>,
+    dest: &mut BTreeMap<String, Value>,
+    source_key: &str,
+    dest_key: &str,
+) {
+    if dest.contains_key(dest_key) {
+        return;
+    }
+    if let Some(value) = source.get(source_key).and_then(Value::as_f64) {
+        dest.insert(dest_key.to_string(), json!(value * 1000.0));
+    }
+}
+
+fn copy_mb_as_bytes(
+    source: &BTreeMap<String, Value>,
+    dest: &mut BTreeMap<String, Value>,
+    source_key: &str,
+    dest_key: &str,
+) {
+    if dest.contains_key(dest_key) {
+        return;
+    }
+    if let Some(value) = source.get(source_key).and_then(Value::as_f64) {
+        dest.insert(dest_key.to_string(), json!(value * 1024.0 * 1024.0));
     }
 }
 
@@ -1666,6 +1751,35 @@ mod tests {
         assert_eq!(profiling["kernel_name"], json!("gemv"));
         assert_eq!(profiling["duration_us"], json!(42.5));
         assert!(!profiling.contains_key("kernel_launches"));
+    }
+
+    #[test]
+    fn phase_and_memory_metric_projections_preserve_eval_aliases() {
+        let mut phase = BTreeMap::new();
+        phase.insert("prefill_secs".to_string(), json!(1.25));
+        phase.insert("decode_ms".to_string(), json!(9.0));
+        phase.insert("ttft_ms".to_string(), json!(3.0));
+
+        assert!(has_phase_timing_metric(&phase, 42));
+        let selected_phase = phase_timing_metrics(&phase, 42);
+        assert_eq!(selected_phase["prefill_ms"], json!(1250.0));
+        assert_eq!(selected_phase["decode_ms"], json!(9.0));
+        assert_eq!(selected_phase["ttft_ms"], json!(3.0));
+        assert_eq!(selected_phase["elapsed_ms"], json!(42));
+
+        let mut memory = BTreeMap::new();
+        memory.insert("vram_used_mb".to_string(), json!(2.5));
+        memory.insert("kv_bytes".to_string(), json!(1024));
+        memory.insert("workspace_bytes".to_string(), json!(2048));
+
+        assert!(has_memory_metric(&memory));
+        let selected_memory = memory_metrics(&memory);
+        assert_eq!(
+            selected_memory["vram_peak_bytes"],
+            json!(2.5 * 1024.0 * 1024.0)
+        );
+        assert_eq!(selected_memory["kv_bytes"], json!(1024.0));
+        assert_eq!(selected_memory["workspace_bytes"], json!(2048.0));
     }
 
     #[test]
