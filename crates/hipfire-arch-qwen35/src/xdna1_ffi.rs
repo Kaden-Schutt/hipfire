@@ -26,9 +26,15 @@ use std::sync::{Mutex, OnceLock};
 type FnCreate =
     unsafe extern "C" fn(*const c_char, *const c_char, usize, *mut c_void) -> *mut c_void;
 
-type FnRunHandle =
-    unsafe extern "C" fn(*mut c_void, *const u16, usize, *const u16, usize, *mut u16, usize)
-        -> *mut c_void;
+type FnRunHandle = unsafe extern "C" fn(
+    *mut c_void,
+    *const u16,
+    usize,
+    *const u16,
+    usize,
+    *mut u16,
+    usize,
+) -> *mut c_void;
 
 type FnDestroy = unsafe extern "C" fn(*mut c_void);
 
@@ -319,12 +325,7 @@ pub fn swiglu_handle_for(
 ///
 /// # Safety
 /// Caller guarantees all slices are valid and `len` matches the handle shape.
-pub unsafe fn swiglu_run(
-    handle: *mut c_void,
-    gate: &[u16],
-    up: &[u16],
-    out: &mut [u16],
-) -> bool {
+pub unsafe fn swiglu_run(handle: *mut c_void, gate: &[u16], up: &[u16], out: &mut [u16]) -> bool {
     let lib = match get_lib() {
         Some(l) => l,
         None => return false,
@@ -484,12 +485,7 @@ pub fn rope_q_handle_for(
 ///
 /// # Safety
 /// Caller guarantees all slices are valid and sizes match the handle shape.
-pub unsafe fn rope_q_run(
-    handle: *mut c_void,
-    input: &[u16],
-    cs: &[u16],
-    out: &mut [u16],
-) -> bool {
+pub unsafe fn rope_q_run(handle: *mut c_void, input: &[u16], cs: &[u16], out: &mut [u16]) -> bool {
     let lib = match get_lib() {
         Some(l) => l,
         None => return false,
@@ -563,12 +559,7 @@ pub fn rope_k_handle_for(
 ///
 /// # Safety
 /// Caller guarantees all slices are valid and sizes match the handle shape.
-pub unsafe fn rope_k_run(
-    handle: *mut c_void,
-    input: &[u16],
-    cs: &[u16],
-    out: &mut [u16],
-) -> bool {
+pub unsafe fn rope_k_run(handle: *mut c_void, input: &[u16], cs: &[u16], out: &mut [u16]) -> bool {
     let lib = match get_lib() {
         Some(l) => l,
         None => return false,
@@ -805,12 +796,7 @@ pub fn attn_gate_handle_for(
 ///
 /// # Safety
 /// Caller guarantees all slices are valid and `len` matches the handle shape.
-pub unsafe fn attn_gate_run(
-    handle: *mut c_void,
-    gate: &[u16],
-    x: &[u16],
-    out: &mut [u16],
-) -> bool {
+pub unsafe fn attn_gate_run(handle: *mut c_void, gate: &[u16], x: &[u16], out: &mut [u16]) -> bool {
     let lib = match get_lib() {
         Some(l) => l,
         None => return false,
@@ -895,11 +881,7 @@ pub fn softmax_handle_for(
 ///
 /// # Safety
 /// Caller guarantees all slices are valid and sizes match the handle shape.
-pub unsafe fn softmax_run(
-    handle: *mut c_void,
-    input: &[u16],
-    out: &mut [u16],
-) -> bool {
+pub unsafe fn softmax_run(handle: *mut c_void, input: &[u16], out: &mut [u16]) -> bool {
     let lib = match get_lib() {
         Some(l) => l,
         None => return false,

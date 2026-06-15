@@ -6,8 +6,8 @@
 //! Feature-gated behind `deltanet`.
 
 use crate::ffn_bf16::{self, Bf16DownShadow, FfnBf16Mode};
-use crate::xdna1_ffi;
 use crate::speculative::HiddenStateRingBuffer;
+use crate::xdna1_ffi;
 use hip_bridge::{HipError, HipResult};
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use hipfire_runtime::hfq_modules::HfqModuleKind;
@@ -1696,7 +1696,15 @@ fn weight_gemv_swiglu_residual_bf16_probe(
             false,
         );
         return weight_gemv_swiglu_residual_xdna1(
-            gpu, layer_idx, w_down.k, gate, up, ffn_hidden, w_down, x, &invocation,
+            gpu,
+            layer_idx,
+            w_down.k,
+            gate,
+            up,
+            ffn_hidden,
+            w_down,
+            x,
+            &invocation,
         );
     }
 
@@ -1736,7 +1744,15 @@ fn weight_gemv_swiglu_residual_bf16_probe(
                 ffn_bf16::dense_ffn_module_invocation(layer_idx, shadow, preferred_backend, false);
             if mode == FfnBf16Mode::Xdna1 {
                 return weight_gemv_swiglu_residual_xdna1(
-                    gpu, layer_idx, shadow.k, gate, up, ffn_hidden, w_down, x, &invocation,
+                    gpu,
+                    layer_idx,
+                    shadow.k,
+                    gate,
+                    up,
+                    ffn_hidden,
+                    w_down,
+                    x,
+                    &invocation,
                 );
             }
             let t0 = std::time::Instant::now();
@@ -1874,9 +1890,7 @@ fn weight_gemv_swiglu_residual_xdna1(
 
     if !ok {
         if cfg.trace {
-            eprintln!(
-                "[qwen35 xdna1] layer={layer_idx} run_handle failed — falling back to GPU"
-            );
+            eprintln!("[qwen35 xdna1] layer={layer_idx} run_handle failed — falling back to GPU");
         }
         return weight_gemv_swiglu_residual(gpu, w_down, gate, up, ffn_hidden, x);
     }
@@ -1887,9 +1901,8 @@ fn weight_gemv_swiglu_residual_xdna1(
         .map(|&b| ffn_bf16::bf16_bits_to_f32(b))
         .collect();
     let upload_t0 = std::time::Instant::now();
-    let bytes = unsafe {
-        std::slice::from_raw_parts(out_f32.as_ptr().cast::<u8>(), out_f32.len() * 4)
-    };
+    let bytes =
+        unsafe { std::slice::from_raw_parts(out_f32.as_ptr().cast::<u8>(), out_f32.len() * 4) };
     gpu.hip.memcpy_htod(&ffn_hidden.buf, bytes)?;
 
     // Down matmul on GPU: x += w_down @ ffn_hidden

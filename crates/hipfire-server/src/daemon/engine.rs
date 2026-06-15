@@ -9,10 +9,7 @@ use tracing::debug;
 use super::protocol::{DaemonRequest, DaemonResponse};
 
 trait DaemonTransport: Send {
-    fn send_json<'a>(
-        &'a mut self,
-        req: &'a DaemonRequest,
-    ) -> BoxFuture<'a, anyhow::Result<()>>;
+    fn send_json<'a>(&'a mut self, req: &'a DaemonRequest) -> BoxFuture<'a, anyhow::Result<()>>;
     fn recv_response<'a>(&'a mut self) -> BoxFuture<'a, anyhow::Result<DaemonResponse>>;
 }
 
@@ -112,7 +109,8 @@ impl DaemonEngine {
                         if matches!(r.response_id.as_deref(), Some(actual) if actual != expected) {
                             tracing::warn!(
                                 "stale load response: got response_id={:?} expected={:?}",
-                                r.response_id, expected_response
+                                r.response_id,
+                                expected_response
                             );
                             continue;
                         }
@@ -180,7 +178,11 @@ impl DaemonEngine {
                     if d.id == request_id {
                         return Ok((text, d));
                     }
-                    tracing::warn!("stale done response: got id={} expected={}", d.id, request_id);
+                    tracing::warn!(
+                        "stale done response: got id={} expected={}",
+                        d.id,
+                        request_id
+                    );
                 }
                 DaemonResponse::Error(e) => anyhow::bail!("daemon generate error: {}", e.message),
                 DaemonResponse::Unknown => {}
@@ -213,7 +215,11 @@ impl DaemonEngine {
                     if d.id == request_id {
                         return Ok(d);
                     }
-                    tracing::warn!("stale done response: got id={} expected={}", d.id, request_id);
+                    tracing::warn!(
+                        "stale done response: got id={} expected={}",
+                        d.id,
+                        request_id
+                    );
                 }
                 DaemonResponse::Error(e) => anyhow::bail!("daemon generate error: {}", e.message),
                 DaemonResponse::Unknown => {}

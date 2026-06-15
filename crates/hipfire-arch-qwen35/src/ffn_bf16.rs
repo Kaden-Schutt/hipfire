@@ -214,7 +214,13 @@ pub fn config() -> &'static FfnBf16Config {
             .unwrap_or(false);
         let xdna1_xclbin = std::env::var("HIPFIRE_QWEN35_XDNA1_XCLBIN").ok();
         let xdna1_instr = std::env::var("HIPFIRE_QWEN35_XDNA1_INSTR").ok();
-        FfnBf16Config { mode, layer, trace, xdna1_xclbin, xdna1_instr }
+        FfnBf16Config {
+            mode,
+            layer,
+            trace,
+            xdna1_xclbin,
+            xdna1_instr,
+        }
     })
 }
 

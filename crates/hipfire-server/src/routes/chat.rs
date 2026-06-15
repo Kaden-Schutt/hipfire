@@ -390,10 +390,9 @@ mod tests {
             },
         ];
 
-        assert_eq!(
-            last_user_prompt(&messages),
-            r#"{"text":"second","type":"text"}"#
-        );
+        let prompt_value: Value =
+            serde_json::from_str(&last_user_prompt(&messages)).expect("structured prompt json");
+        assert_eq!(prompt_value, json!({"type":"text","text":"second"}));
         let daemon_messages = messages_to_daemon(&messages);
         assert_eq!(daemon_messages.len(), 3);
         assert_eq!(daemon_messages[2].role, Role::User);
