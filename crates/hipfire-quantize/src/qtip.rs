@@ -283,27 +283,29 @@ mod tests {
         assert!((var - 1.0).abs() < 1e-3, "codebook var {var}");
     }
 
-    /// Position QTIP-2 between uniform-2 (iso-bpw rival, must beat) and
-    /// uniform-3 (quality target). CURRENT first-cut codebook (random-hash
-    /// Gaussian, STATE_BITS=12, RMS scale): beats uniform-2 but does NOT yet
-    /// reach uniform-3 — ~1.9× its MSE on Gaussian. Closing that gap to
-    /// uniform-3 parity (the bandwidth win) is C1 codebook/trellis tuning:
-    /// tuned hash (paper's 1MAD/3INST), larger STATE_BITS, joint scale search.
-    /// This test asserts only the validated claim (beats uniform-2) and
-    /// reports the uniform-3 gap so regressions/improvements are visible.
+    /// QTIP-2's correct yardstick is the **2-bit Gaussian rate-distortion
+    /// bound** D(R=2) = σ²·2^(-2R) = σ²/16 = 0.0625 (unit variance) — NOT
+    /// uniform-3. Uniform-3 (~0.047) spends a whole extra bit and sits *below*
+    /// the 2-bit bound, so QTIP-2 reaching uniform-3 MSE is information-
+    /// theoretically impossible. The real questions: (1) how close to the
+    /// 0.0625 floor is QTIP (vs uniform-2 ≈ 0.26, ~4× the floor), and (2) is
+    /// near-optimal-2-bit *usable* — a full-model PPL question (C1d), not a
+    /// reconstruction one. This test asserts QTIP-2 beats uniform-2 and reports
+    /// the gap to the bound so codebook tuning toward 0.0625 is visible.
     #[test]
-    fn qtip2_beats_uniform2_reports_uniform3_gap() {
+    fn qtip2_beats_uniform2_reports_bound_gap() {
         let cb = build_codebook();
         let mut rng = Lcg(0x1234_5678);
         let group: Vec<f32> = (0..256).map(|_| rng.next_normal()).collect();
+        let var = group.iter().map(|&w| (w as f64) * (w as f64)).sum::<f64>() / group.len() as f64;
+        let bound = var / 16.0; // 2-bit Gaussian rate-distortion bound
         let qtip = qtip_mse(&group, &cb);
         let u2 = mse(&group, &uniform_nbit_roundtrip(&group, 2));
-        let u3 = mse(&group, &uniform_nbit_roundtrip(&group, 3));
         eprintln!(
-            "QTIP-2 MSE={qtip:.5}  uniform-2={u2:.5}  uniform-3={u3:.5}  \
-             (QTIP/u2={:.3}, QTIP/u3={:.3})",
+            "QTIP-2 MSE={qtip:.5}  uniform-2={u2:.5}  2-bit RD bound={bound:.5}  \
+             (QTIP/u2={:.3}, QTIP/bound={:.3})",
             qtip / u2,
-            qtip / u3,
+            qtip / bound,
         );
         assert!(qtip < u2, "QTIP-2 must beat uniform-2 (iso-bpw)");
     }
@@ -362,7 +364,7 @@ mod tests {
         let cb = build_codebook();
         let signs1 = crate::gen_fwht_signs(42, 256);
         let signs2 = crate::gen_fwht_signs(1042, 256);
-        let (mut q_acc, mut u2_acc, mut u3_acc, mut groups) = (0.0f64, 0.0f64, 0.0f64, 0usize);
+        let (mut q_acc, mut u2_acc, mut bound_acc, mut groups) = (0.0f64, 0.0f64, 0.0f64, 0usize);
         for chunk in weights.chunks(256) {
             if chunk.len() < 256 {
                 break;
@@ -370,22 +372,23 @@ mod tests {
             let mut g = [0.0f32; 256];
             g.copy_from_slice(chunk);
             crate::cpu_fwht_256(&mut g, &signs1, &signs2);
+            let var = g.iter().map(|&w| (w as f64) * (w as f64)).sum::<f64>() / 256.0;
             q_acc += qtip_mse(&g, &cb);
             u2_acc += mse(&g, &uniform_nbit_roundtrip(&g, 2));
-            u3_acc += mse(&g, &uniform_nbit_roundtrip(&g, 3));
+            bound_acc += var / 16.0; // 2-bit Gaussian rate-distortion bound
             groups += 1;
         }
-        let (q, u2, u3) = (
+        let (q, u2, bound) = (
             q_acc / groups as f64,
             u2_acc / groups as f64,
-            u3_acc / groups as f64,
+            bound_acc / groups as f64,
         );
         eprintln!(
             "QTIP real-weights gate: tensor={name} groups={groups}\n  \
-             QTIP-2 MSE={q:.6}  uniform-2 MSE={u2:.6}  uniform-3 MSE={u3:.6}\n  \
-             QTIP-2/uniform-2={:.3}  QTIP-2/uniform-3={:.3}",
+             QTIP-2 MSE={q:.6}  uniform-2 MSE={u2:.6}  2-bit RD bound={bound:.6}\n  \
+             QTIP-2/uniform-2={:.3}  QTIP-2/bound={:.3} (1.0 = optimal 2-bit)",
             q / u2,
-            q / u3,
+            q / bound,
         );
         assert!(q < u2, "QTIP-2 must beat uniform-2 on real weights");
     }
