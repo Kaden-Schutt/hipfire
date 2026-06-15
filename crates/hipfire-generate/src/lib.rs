@@ -148,6 +148,56 @@ pub struct GenerateBatchPrefillPrefixHash {
     pub prefix_len: usize,
 }
 
+pub fn generate_prefix_hash_json(hash: &GenerateBatchPrefillPrefixHash) -> serde_json::Value {
+    serde_json::json!({
+        "algorithm": hash.algorithm,
+        "value": hash.value,
+        "prefix_len": hash.prefix_len,
+    })
+}
+
+fn push_hash_field(buf: &mut Vec<u8>, label: &str, value: &str) {
+    buf.extend_from_slice(label.as_bytes());
+    buf.push(b'=');
+    buf.extend_from_slice(value.as_bytes());
+    buf.push(0);
+}
+
+pub fn compute_qwen35_prefix_hash(
+    arch_id: u32,
+    kv_mode: Option<&str>,
+    state_kinds: &[String],
+    assistant_prefix: &str,
+    max_think_tokens: usize,
+    tokens: &[u32],
+) -> GenerateBatchPrefillPrefixHash {
+    let mut buf = Vec::with_capacity(128 + tokens.len() * 4);
+    push_hash_field(
+        &mut buf,
+        "domain",
+        "hipfire.generate_batch_prefill.prefix.v1",
+    );
+    push_hash_field(&mut buf, "algorithm", "xxh128");
+    push_hash_field(&mut buf, "arch_id", &arch_id.to_string());
+    push_hash_field(&mut buf, "kv_mode", kv_mode.unwrap_or("unknown"));
+    push_hash_field(&mut buf, "assistant_prefix", assistant_prefix);
+    push_hash_field(&mut buf, "max_think_tokens", &max_think_tokens.to_string());
+    let mut normalized_kinds = state_kinds.to_vec();
+    normalized_kinds.sort();
+    normalized_kinds.dedup();
+    push_hash_field(&mut buf, "state_kinds", &normalized_kinds.join("+"));
+    push_hash_field(&mut buf, "token_encoding", "u32le");
+    for token in tokens {
+        buf.extend_from_slice(&token.to_le_bytes());
+    }
+    let value = twox_hash::XxHash3_128::oneshot(&buf);
+    GenerateBatchPrefillPrefixHash {
+        algorithm: "xxh128".to_string(),
+        value: format!("{value:032x}"),
+        prefix_len: tokens.len(),
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PrefixHashPreflightEnvelope {
     pub id: String,
@@ -1085,6 +1135,41 @@ mod tests {
         assert_eq!(
             GenerateBatchPrefillPlan::SerialExact.as_str(),
             "serial_exact"
+        );
+    }
+
+    #[test]
+    fn qwen35_prefix_hash_is_domain_separated() {
+        let kinds = vec!["deltanet_recurrent".to_string(), "attention_kv".to_string()];
+        let reordered = vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()];
+        let base = compute_qwen35_prefix_hash(5, Some("q8"), &kinds, "plain", 0, &[1, 2, 3]);
+        let same = compute_qwen35_prefix_hash(5, Some("q8"), &reordered, "plain", 0, &[1, 2, 3]);
+        let different_tokens =
+            compute_qwen35_prefix_hash(5, Some("q8"), &kinds, "plain", 0, &[1, 2, 4]);
+        let different_prompt =
+            compute_qwen35_prefix_hash(5, Some("q8"), &kinds, "open_think", 0, &[1, 2, 3]);
+        assert_eq!(base, same);
+        assert_ne!(base, different_tokens);
+        assert_ne!(base, different_prompt);
+        assert_eq!(base.algorithm, "xxh128");
+        assert_eq!(base.value.len(), 32);
+        assert!(base.value.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn prefix_hash_json_shape_is_stable() {
+        let hash = GenerateBatchPrefillPrefixHash {
+            algorithm: "xxh128".to_string(),
+            value: "0123456789abcdef0123456789abcdef".to_string(),
+            prefix_len: 7,
+        };
+        assert_eq!(
+            generate_prefix_hash_json(&hash),
+            serde_json::json!({
+                "algorithm": "xxh128",
+                "value": "0123456789abcdef0123456789abcdef",
+                "prefix_len": 7
+            })
         );
     }
 
