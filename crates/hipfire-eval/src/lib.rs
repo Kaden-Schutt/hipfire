@@ -27,7 +27,7 @@ use hipfire_evidence::{
     evidence_artifact_json, evidence_collection_policy, evidence_metric_direction,
     evidence_record_json, extract_external_evidence_records_json, file_hash, hardware_bucket,
     has_launch_count_metric, has_memory_metric, has_module_evidence_metric, has_moe_router_metric,
-    has_path_c_trace_metric, has_phase_timing_metric, has_profiling_metric,
+    has_path_c_trace_metric, has_performance_metric, has_phase_timing_metric, has_profiling_metric,
     host_profile_artifact_index_entry_json, host_profile_hash, launch_count_metrics, list_files,
     memory_metrics, module_evidence_metrics, moe_router_metrics, path_c_trace_metrics,
     phase_timing_metrics, profiling_metrics, prompt_artifact_index_entry_json,
@@ -3623,7 +3623,7 @@ fn evidence_records(kind: &str, results: &[EvalResult]) -> Vec<Value> {
             (row.status == EvalStatus::Pass
                 || (kind == "coherence" && row.status == EvalStatus::Fail))
                 && if kind == "performance" {
-                    has_performance_metric(row)
+                    has_performance_metric(&row.metrics)
                 } else if kind == "quality" {
                     has_quality_metric(row)
                 } else if kind == "phase_timings" {
@@ -3682,25 +3682,6 @@ fn evidence_records(kind: &str, results: &[EvalResult]) -> Vec<Value> {
             })
         })
         .collect()
-}
-
-fn has_performance_metric(row: &EvalResult) -> bool {
-    [
-        "tok_s",
-        "tokens_per_second",
-        "ttft_ms",
-        "decode_ms",
-        "decode_secs",
-        "decode_tok_s",
-        "prefill_ms",
-        "prefill_secs",
-        "prefill_tok_s",
-        "total_ms",
-        "elapsed_ms",
-        "launch_count",
-    ]
-    .iter()
-    .any(|key| row.metrics.contains_key(*key))
 }
 
 fn has_quality_metric(row: &EvalResult) -> bool {

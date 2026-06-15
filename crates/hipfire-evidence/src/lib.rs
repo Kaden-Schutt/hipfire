@@ -301,6 +301,21 @@ pub const MEMORY_TRIGGER_METRICS: &[&str] = &[
     "workspace_bytes",
 ];
 
+pub const PERFORMANCE_TRIGGER_METRICS: &[&str] = &[
+    "tok_s",
+    "tokens_per_second",
+    "ttft_ms",
+    "decode_ms",
+    "decode_secs",
+    "decode_tok_s",
+    "prefill_ms",
+    "prefill_secs",
+    "prefill_tok_s",
+    "total_ms",
+    "elapsed_ms",
+    "launch_count",
+];
+
 pub const DFLASH_TRACE_NUMERIC_METRICS: &[&str] =
     &["ar_tok_s", "dflash_tok_s", "tau", "accept_rate", "tok_s"];
 
@@ -414,6 +429,10 @@ pub fn phase_timing_metrics(
 
 pub fn has_memory_metric(metrics: &BTreeMap<String, Value>) -> bool {
     has_any_metric(metrics, MEMORY_TRIGGER_METRICS)
+}
+
+pub fn has_performance_metric(metrics: &BTreeMap<String, Value>) -> bool {
+    has_any_metric(metrics, PERFORMANCE_TRIGGER_METRICS)
 }
 
 pub fn memory_metrics(metrics: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
@@ -1899,6 +1918,17 @@ mod tests {
         );
         assert_eq!(selected_memory["kv_bytes"], json!(1024.0));
         assert_eq!(selected_memory["workspace_bytes"], json!(2048.0));
+    }
+
+    #[test]
+    fn performance_metric_detection_preserves_eval_aliases() {
+        for key in PERFORMANCE_TRIGGER_METRICS {
+            let metrics = BTreeMap::from([((*key).to_string(), json!(1.0))]);
+            assert!(has_performance_metric(&metrics), "{key}");
+        }
+
+        let unrelated = BTreeMap::from([("mean_kld".to_string(), json!(0.01))]);
+        assert!(!has_performance_metric(&unrelated));
     }
 
     #[test]
