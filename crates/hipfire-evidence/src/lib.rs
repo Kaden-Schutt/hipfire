@@ -251,6 +251,74 @@ pub const MODULE_EVIDENCE_NUMERIC_METRICS: &[&str] = &[
     "inf",
 ];
 
+pub const LAUNCH_COUNT_METRICS: &[&str] = &[
+    "kernel_launches",
+    "graph_launches",
+    "memcpy_ops",
+    "launch_count",
+    "hip_kernel_launches",
+    "hip_graph_launches",
+    "hip_memcpy_ops",
+];
+
+pub const MOE_ROUTER_METRICS: &[&str] = &[
+    "expert_hits",
+    "shared_expert_hits",
+    "router_entropy",
+    "router_top1_histogram",
+    "router_top2_histogram",
+    "router_topk_histogram",
+    "router_dropped_tokens",
+];
+
+pub const PROFILING_METRICS: &[&str] = &[
+    "kernel_name",
+    "duration_us",
+    "occupancy",
+    "waves",
+    "lds_bytes",
+    "vgpr_count",
+    "sgpr_count",
+];
+
+pub fn has_any_metric(metrics: &BTreeMap<String, Value>, keys: &[&str]) -> bool {
+    keys.iter().any(|key| metrics.contains_key(*key))
+}
+
+pub fn select_metrics(metrics: &BTreeMap<String, Value>, keys: &[&str]) -> BTreeMap<String, Value> {
+    let mut out = BTreeMap::new();
+    for key in keys {
+        if let Some(value) = metrics.get(*key) {
+            out.insert((*key).to_string(), value.clone());
+        }
+    }
+    out
+}
+
+pub fn has_launch_count_metric(metrics: &BTreeMap<String, Value>) -> bool {
+    has_any_metric(metrics, LAUNCH_COUNT_METRICS)
+}
+
+pub fn launch_count_metrics(metrics: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    select_metrics(metrics, LAUNCH_COUNT_METRICS)
+}
+
+pub fn has_moe_router_metric(metrics: &BTreeMap<String, Value>) -> bool {
+    has_any_metric(metrics, MOE_ROUTER_METRICS)
+}
+
+pub fn moe_router_metrics(metrics: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    select_metrics(metrics, MOE_ROUTER_METRICS)
+}
+
+pub fn has_profiling_metric(metrics: &BTreeMap<String, Value>) -> bool {
+    has_any_metric(metrics, PROFILING_METRICS)
+}
+
+pub fn profiling_metrics(metrics: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    select_metrics(metrics, PROFILING_METRICS)
+}
+
 pub fn has_module_evidence_metric(metrics: &BTreeMap<String, Value>) -> bool {
     MODULE_EVIDENCE_TRIGGER_METRICS
         .iter()
@@ -1566,6 +1634,38 @@ mod tests {
         assert_eq!(selected["max_abs"], json!(0.001));
         assert_eq!(selected["nan"], json!(0.0));
         assert!(!selected.contains_key("unrelated"));
+    }
+
+    #[test]
+    fn runtime_metric_projections_select_owned_schema_fields() {
+        let mut metrics = BTreeMap::new();
+        metrics.insert("kernel_launches".to_string(), json!(12));
+        metrics.insert("hip_graph_launches".to_string(), json!(2));
+        metrics.insert("expert_hits".to_string(), json!([1, 2, 3]));
+        metrics.insert("router_entropy".to_string(), json!(0.7));
+        metrics.insert("kernel_name".to_string(), json!("gemv"));
+        metrics.insert("duration_us".to_string(), json!(42.5));
+        metrics.insert("unrelated".to_string(), json!("drop"));
+
+        assert!(has_launch_count_metric(&metrics));
+        assert!(has_moe_router_metric(&metrics));
+        assert!(has_profiling_metric(&metrics));
+
+        let launch = launch_count_metrics(&metrics);
+        assert_eq!(launch["kernel_launches"], json!(12));
+        assert_eq!(launch["hip_graph_launches"], json!(2));
+        assert!(!launch.contains_key("expert_hits"));
+        assert!(!launch.contains_key("unrelated"));
+
+        let moe = moe_router_metrics(&metrics);
+        assert_eq!(moe["expert_hits"], json!([1, 2, 3]));
+        assert_eq!(moe["router_entropy"], json!(0.7));
+        assert!(!moe.contains_key("kernel_name"));
+
+        let profiling = profiling_metrics(&metrics);
+        assert_eq!(profiling["kernel_name"], json!("gemv"));
+        assert_eq!(profiling["duration_us"], json!(42.5));
+        assert!(!profiling.contains_key("kernel_launches"));
     }
 
     #[test]

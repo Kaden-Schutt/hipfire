@@ -26,11 +26,13 @@ use hipfire_evidence::{
     evidence_artifact_index_entry_from_value_json, evidence_artifact_index_entry_json,
     evidence_artifact_json, evidence_collection_policy, evidence_metric_direction,
     evidence_record_json, extract_external_evidence_records_json, file_hash, hardware_bucket,
-    has_module_evidence_metric, host_profile_artifact_index_entry_json, host_profile_hash,
-    list_files, module_evidence_metrics, prompt_artifact_index_entry_json,
-    required_admission_evidence_requirements, run_metadata_artifact_json, run_provenance_json,
-    stable_hash_bytes, stable_hash_file_fallback, standard_evidence_paths_in_dir,
-    AdmissionArtifact as EvidenceAdmissionArtifact, AdmissionEvidence as EvidenceAdmissionEvidence,
+    has_launch_count_metric, has_module_evidence_metric, has_moe_router_metric,
+    has_profiling_metric, host_profile_artifact_index_entry_json, host_profile_hash,
+    launch_count_metrics, list_files, module_evidence_metrics, moe_router_metrics,
+    profiling_metrics, prompt_artifact_index_entry_json, required_admission_evidence_requirements,
+    run_metadata_artifact_json, run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
+    standard_evidence_paths_in_dir, AdmissionArtifact as EvidenceAdmissionArtifact,
+    AdmissionEvidence as EvidenceAdmissionEvidence,
     ComparisonArtifact as EvidenceComparisonArtifact, EvidenceArtifact, EvidenceArtifactCollection,
     EvidenceArtifactConfig, EvidenceArtifactDatasetStatus, EvidenceArtifactIndexContext,
     EvidenceArtifactModels, EvidenceRecord, RunMetadataArtifact, RunMetadataConfig,
@@ -3628,11 +3630,11 @@ fn evidence_records(kind: &str, results: &[EvalResult]) -> Vec<Value> {
                 } else if kind == "memory" {
                     has_memory_metric(row)
                 } else if kind == "launch_counts" {
-                    has_launch_count_metric(row)
+                    has_launch_count_metric(&row.metrics)
                 } else if kind == "moe_router_histogram" {
-                    has_moe_router_metric(row)
+                    has_moe_router_metric(&row.metrics)
                 } else if kind == "profiling" {
-                    has_profiling_metric(row)
+                    has_profiling_metric(&row.metrics)
                 } else if kind == "path_c_trace" {
                     has_path_c_trace_metric(row)
                 } else if kind == "module_evidence" {
@@ -3645,9 +3647,9 @@ fn evidence_records(kind: &str, results: &[EvalResult]) -> Vec<Value> {
             let metrics = match kind {
                 "phase_timings" => phase_timing_metrics(row),
                 "memory" => memory_metrics(row),
-                "launch_counts" => select_metrics(row, LAUNCH_COUNT_METRICS),
-                "moe_router_histogram" => select_metrics(row, MOE_ROUTER_METRICS),
-                "profiling" => select_metrics(row, PROFILING_METRICS),
+                "launch_counts" => launch_count_metrics(&row.metrics),
+                "moe_router_histogram" => moe_router_metrics(&row.metrics),
+                "profiling" => profiling_metrics(&row.metrics),
                 "dflash_trace" => dflash_trace_metrics(row),
                 "path_c_trace" => path_c_trace_metrics(row),
                 "module_evidence" => module_evidence_metrics(&row.metrics),
@@ -3716,48 +3718,6 @@ fn has_quality_metric(row: &EvalResult) -> bool {
         )
 }
 
-const LAUNCH_COUNT_METRICS: &[&str] = &[
-    "kernel_launches",
-    "graph_launches",
-    "memcpy_ops",
-    "launch_count",
-    "hip_kernel_launches",
-    "hip_graph_launches",
-    "hip_memcpy_ops",
-];
-
-const MOE_ROUTER_METRICS: &[&str] = &[
-    "expert_hits",
-    "shared_expert_hits",
-    "router_entropy",
-    "router_top1_histogram",
-    "router_top2_histogram",
-    "router_topk_histogram",
-    "router_dropped_tokens",
-];
-
-const PROFILING_METRICS: &[&str] = &[
-    "kernel_name",
-    "duration_us",
-    "occupancy",
-    "waves",
-    "lds_bytes",
-    "vgpr_count",
-    "sgpr_count",
-];
-
-fn has_launch_count_metric(row: &EvalResult) -> bool {
-    has_any_metric(row, LAUNCH_COUNT_METRICS)
-}
-
-fn has_moe_router_metric(row: &EvalResult) -> bool {
-    has_any_metric(row, MOE_ROUTER_METRICS)
-}
-
-fn has_profiling_metric(row: &EvalResult) -> bool {
-    has_any_metric(row, PROFILING_METRICS)
-}
-
 fn has_path_c_trace_metric(row: &EvalResult) -> bool {
     row.metrics
         .get("mode")
@@ -3768,16 +3728,6 @@ fn has_path_c_trace_metric(row: &EvalResult) -> bool {
 
 fn has_any_metric(row: &EvalResult, keys: &[&str]) -> bool {
     keys.iter().any(|key| row.metrics.contains_key(*key))
-}
-
-fn select_metrics(row: &EvalResult, keys: &[&str]) -> BTreeMap<String, Value> {
-    let mut out = BTreeMap::new();
-    for key in keys {
-        if let Some(value) = row.metrics.get(*key) {
-            out.insert((*key).to_string(), value.clone());
-        }
-    }
-    out
 }
 
 fn has_phase_timing_metric(row: &EvalResult) -> bool {
