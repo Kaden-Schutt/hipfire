@@ -14,3 +14,7 @@ twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }
 # of per-layer Hessians. The LDLQ algorithm itself is clean-room; faer is just
 # the SIMD/parallel LA backend (naive O(k³) Cholesky is minutes/tensor @ k=3584).
 faer = "0.22"
+
+[dev-dependencies]
+# hessian_io.rs unit tests (round-trip HFHS via a temp file).
+tempfile = "3"

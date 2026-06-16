@@ -219,6 +219,139 @@ pub fn beam_encode_group(
     symbols
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// V=2 vector trellis (QTIP paper config: V=2 weights/step, K=4 bits/step → 2
+// bpw, L=16 state bits). Each step emits a 2-vector; the codebook is computed
+// (two 1MAD hashes per state), so still no stored per-group table. This is the
+// main rate-distortion lever beyond the V=1 scalar trellis. Kept separate from
+// the V=1 path (which stays validated/in-use).
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Vector dim, bits/step, state bits for the V=2 trellis.
+pub const V2_V: usize = 2;
+pub const V2_K: u32 = 4; // bits per step = bits_per_weight (2) × V (2)
+pub const V2_STATE_BITS: u32 = 16;
+const V2_NUM_STATES: usize = 1 << V2_STATE_BITS;
+const V2_STATE_MASK: u32 = (V2_NUM_STATES as u32) - 1;
+const V2_NUM_SYMBOLS: usize = 1 << V2_K; // 16
+const V2_STEPS: usize = 256 / V2_V; // 128 steps per 256-group
+
+/// Two decorrelated 1MAD draws per state → the V=2 codebook entry.
+#[inline]
+fn decode_1mad_pair(state: u32) -> (f32, f32) {
+    (decode_1mad(state), decode_1mad(state ^ 0x9E37_79B9))
+}
+
+/// V=2 computed codebook, flat `[v0, v1]` per state, renormalized to exact
+/// zero-mean / unit-variance over all 2·2^L values.
+pub fn build_codebook_v2() -> Vec<f32> {
+    let mut cb: Vec<f64> = Vec::with_capacity(2 * V2_NUM_STATES);
+    for s in 0..V2_NUM_STATES as u32 {
+        let (a, b) = decode_1mad_pair(s);
+        cb.push(a as f64);
+        cb.push(b as f64);
+    }
+    let mean = cb.iter().sum::<f64>() / cb.len() as f64;
+    for v in cb.iter_mut() {
+        *v -= mean;
+    }
+    let var = cb.iter().map(|v| v * v).sum::<f64>() / cb.len() as f64;
+    let inv = if var > 0.0 { 1.0 / var.sqrt() } else { 1.0 };
+    cb.iter().map(|v| (v * inv) as f32).collect()
+}
+
+/// Decode a V=2 symbol stream (128 × 4-bit) → 256 weights.
+pub fn decode_group_v2(symbols: &[u8], scale: f32, codebook: &[f32]) -> Vec<f32> {
+    let mut state: u32 = 0;
+    let mut out = Vec::with_capacity(symbols.len() * V2_V);
+    for &sym in symbols {
+        state = ((state << V2_K) | (sym as u32 & (V2_NUM_SYMBOLS as u32 - 1))) & V2_STATE_MASK;
+        out.push(scale * codebook[2 * state as usize]);
+        out.push(scale * codebook[2 * state as usize + 1]);
+    }
+    out
+}
+
+/// Closed-form optimal scale for a fixed V=2 symbol stream.
+pub fn optimal_scale_v2(weights: &[f32], symbols: &[u8], codebook: &[f32]) -> f32 {
+    let mut state: u32 = 0;
+    let (mut num, mut den) = (0.0f64, 0.0f64);
+    for (i, &sym) in symbols.iter().enumerate() {
+        state = ((state << V2_K) | (sym as u32 & (V2_NUM_SYMBOLS as u32 - 1))) & V2_STATE_MASK;
+        for v in 0..V2_V {
+            let c = codebook[2 * state as usize + v] as f64;
+            num += weights[i * V2_V + v] as f64 * c;
+            den += c * c;
+        }
+    }
+    if den > 0.0 {
+        (num / den) as f32
+    } else {
+        group_scale(weights)
+    }
+}
+
+/// Beam-search V=2 trellis encode of a 256-weight group → 128 × 4-bit symbols.
+pub fn beam_encode_group_v2(
+    weights: &[f32],
+    scale: f32,
+    codebook: &[f32],
+    beam_width: usize,
+) -> Vec<u8> {
+    assert_eq!(weights.len(), 256);
+    let mut beam: Vec<(u32, f64)> = vec![(0u32, 0.0)];
+    let mut steps: Vec<Vec<(u32, u32, u8)>> = Vec::with_capacity(V2_STEPS);
+    let mut cand: Vec<(u32, f64, u32, u8)> = Vec::with_capacity(beam_width * V2_NUM_SYMBOLS);
+
+    for step in 0..V2_STEPS {
+        let w0 = weights[step * V2_V] as f64;
+        let w1 = weights[step * V2_V + 1] as f64;
+        cand.clear();
+        for (bi, &(s_prev, c_prev)) in beam.iter().enumerate() {
+            let base = (s_prev << V2_K) & V2_STATE_MASK;
+            for sym in 0..V2_NUM_SYMBOLS as u32 {
+                let s_new = base | sym;
+                let c0 = scale as f64 * codebook[2 * s_new as usize] as f64;
+                let c1 = scale as f64 * codebook[2 * s_new as usize + 1] as f64;
+                let d0 = w0 - c0;
+                let d1 = w1 - c1;
+                cand.push((s_new, c_prev + d0 * d0 + d1 * d1, bi as u32, sym as u8));
+            }
+        }
+        cand.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.partial_cmp(&b.1).unwrap()));
+        cand.dedup_by_key(|c| c.0);
+        if cand.len() > beam_width {
+            cand.select_nth_unstable_by(beam_width, |a, b| a.1.partial_cmp(&b.1).unwrap());
+            cand.truncate(beam_width);
+        }
+        let mut rec = Vec::with_capacity(cand.len());
+        let mut next_beam = Vec::with_capacity(cand.len());
+        for &(st, c, pi, sy) in cand.iter() {
+            rec.push((st, pi, sy));
+            next_beam.push((st, c));
+        }
+        steps.push(rec);
+        beam = next_beam;
+    }
+
+    let mut best_idx = 0usize;
+    let mut best_cost = f64::INFINITY;
+    for (i, &(_, c)) in beam.iter().enumerate() {
+        if c < best_cost {
+            best_cost = c;
+            best_idx = i;
+        }
+    }
+    let mut symbols = vec![0u8; V2_STEPS];
+    let mut idx = best_idx;
+    for step in (0..V2_STEPS).rev() {
+        let (_, prev_idx, sym) = steps[step][idx];
+        symbols[step] = sym;
+        idx = prev_idx as usize;
+    }
+    symbols
+}
+
 /// Per-group scale: RMS of the rotated weights (codebook is unit-variance,
 /// zero-mean, so RMS ≈ the optimal single scale for ≈Gaussian input). Used to
 /// drive the Viterbi search; refine with `optimal_scale` after encoding.
@@ -517,6 +650,39 @@ mod tests {
             q / bound,
         );
         assert!(q < u2, "QTIP-2 must beat uniform-2 model-wide");
+    }
+
+    /// FINDING: a *random* (computed-hash) V=2 codebook does NOT beat V=1 —
+    /// it's coarser per-dimension (≈√(2^L) pts/dim vs 2^L for scalar), so it
+    /// loses the vector-quantization gain. Realizing V=2's advantage needs a
+    /// *designed* codebook (E8 lattice / trained tlut), not two 1MAD hashes.
+    /// This test validates the V=2 path round-trips and records v2/v1 so a
+    /// future designed-codebook change can be measured against it.
+    #[test]
+    fn v2_vector_trellis_roundtrips_reports_vs_v1() {
+        let cb1 = build_codebook();
+        let cb2 = build_codebook_v2();
+        let mut rng = Lcg(0x2222);
+        let group: Vec<f32> = (0..256).map(|_| rng.next_normal()).collect();
+        let var = group.iter().map(|&w| (w as f64) * (w as f64)).sum::<f64>() / 256.0;
+        let bound = var / 16.0;
+
+        let v1 = qtip_mse(&group, &cb1);
+        let scale0 = group_scale(&group);
+        let sym2 = beam_encode_group_v2(&group, scale0, &cb2, 128);
+        let s2 = optimal_scale_v2(&group, &sym2, &cb2);
+        let v2 = mse(&group, &decode_group_v2(&sym2, s2, &cb2));
+
+        eprintln!(
+            "V=1 MSE={v1:.5} V=2 MSE={v2:.5} bound={bound:.5} (V2/V1={:.3}, V2/bound={:.3}) \
+             [random V=2 codebook — needs a designed lattice to beat V=1]",
+            v2 / v1,
+            v2 / bound
+        );
+        assert_eq!(sym2.len(), 128);
+        // Round-trip sanity: V=2 must at least clearly beat uniform-2.
+        let u2 = mse(&group, &uniform_nbit_roundtrip(&group, 2));
+        assert!(v2 < u2 * 0.6, "V=2 should beat uniform-2: {v2} vs {u2}");
     }
 
     #[test]

@@ -1396,6 +1396,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "tempfile",
  "twox-hash",
 ]
 
