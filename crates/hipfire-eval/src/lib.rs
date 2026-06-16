@@ -44,7 +44,7 @@ use hipfire_generate::{GenerateTextRequest, GenerationSamplingPolicy};
 use hipfire_hash::{file_hash, stable_hash_bytes, stable_hash_file_fallback};
 use hipfire_model::{
     discover_dflash_draft_for_model, model_artifact_stem, model_hash, model_manifest_entry,
-    ModelLoadParams, ModelManifestEntry,
+    ModelLoadParams, ModelLoadedResponse, ModelManifestEntry,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1097,10 +1097,7 @@ pub fn run_eval(config: EvalConfig) -> Result<(), String> {
     let models = model_manifest_entries(&config);
     let datasets = resolve_datasets(&config)?;
 
-    let mut results = Vec::new();
-    for battery in &config.batteries {
-        results.extend(run_battery_cached(*battery, &config, &context, &datasets)?);
-    }
+    let mut results = run_eval_batteries(&config, &context, &datasets)?;
     results.extend(run_passive_profile_collectors(&config, &context));
     let results_path = config.out_dir.join("results.jsonl");
     let mut f = OpenOptions::new()
@@ -5427,6 +5424,172 @@ fn daemon_battery_rows(
     }
 }
 
+struct DaemonEvalSession {
+    engine: hipfire_daemon_adapter::DaemonEngine,
+    loaded: ModelLoadedResponse,
+    worker_key_id: String,
+    max_seq: usize,
+}
+
+async fn load_daemon_eval_session(
+    config: &EvalConfig,
+    bin: &Path,
+    max_seq: usize,
+) -> anyhow::Result<DaemonEvalSession> {
+    let mut engine = hipfire_daemon_adapter::DaemonEngine::spawn(bin).await?;
+    let loaded = engine
+        .load(&config.model, daemon_model_load_params(config, max_seq))
+        .await?;
+    let worker_key_id = loaded.worker_key_id.clone();
+    Ok(DaemonEvalSession {
+        engine,
+        loaded,
+        worker_key_id,
+        max_seq,
+    })
+}
+
+fn run_daemon_shared_model_load_rows(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    batteries: &[BatteryId],
+) -> BTreeMap<BatteryId, Vec<EvalResult>> {
+    let mut out = BTreeMap::new();
+    if !Path::new(&config.model).exists() {
+        for battery in batteries {
+            let rows = match battery {
+                BatteryId::Smoke => daemon_smoke_skip_rows(
+                    config,
+                    ctx,
+                    "daemon executor requires --model to be a local filesystem path",
+                    "daemon executor requires --model to be a local filesystem path",
+                ),
+                BatteryId::Speed => daemon_speed_skip_rows(
+                    config,
+                    ctx,
+                    "daemon executor requires --model to be a local filesystem path",
+                ),
+                _ => Vec::new(),
+            };
+            out.insert(*battery, rows);
+        }
+        return out;
+    }
+
+    let Some(bin) = hipfire_daemon_adapter::find_daemon_bin() else {
+        for battery in batteries {
+            let rows = match battery {
+                BatteryId::Smoke => daemon_smoke_skip_rows(
+                    config,
+                    ctx,
+                    "daemon binary not found; build with `cargo build -p hipfire-daemon --bin hipfire-daemon`",
+                    "daemon binary not found; build with `cargo build -p hipfire-daemon --bin hipfire-daemon`",
+                ),
+                BatteryId::Speed => daemon_speed_skip_rows(
+                    config,
+                    ctx,
+                    "daemon binary not found; build with `cargo build -p hipfire-daemon --bin hipfire-daemon`",
+                ),
+                _ => Vec::new(),
+            };
+            out.insert(*battery, rows);
+        }
+        return out;
+    };
+
+    let started = SystemTime::now();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            for battery in batteries {
+                let rows = match battery {
+                    BatteryId::Smoke => daemon_smoke_skip_rows(
+                        config,
+                        ctx,
+                        &format!("create daemon executor runtime: {err}"),
+                        "daemon executor runtime creation failed before decode",
+                    ),
+                    BatteryId::Speed => daemon_speed_skip_rows(
+                        config,
+                        ctx,
+                        &format!("create daemon executor runtime: {err}"),
+                    ),
+                    _ => Vec::new(),
+                };
+                out.insert(*battery, rows);
+            }
+            return out;
+        }
+    };
+
+    let max_seq = (config.max_tokens.max(50) + 2048).max(4096);
+    match runtime.block_on(run_daemon_shared_model_load_rows_async(
+        config, ctx, &bin, batteries, max_seq,
+    )) {
+        Ok(mut rows_by_battery) => {
+            let elapsed_ms = elapsed_since_ms(started);
+            for rows in rows_by_battery.values_mut() {
+                for row in rows {
+                    row.elapsed_ms = elapsed_ms;
+                    row.metrics
+                        .insert("shared_daemon_session".to_string(), json!(true));
+                }
+            }
+            rows_by_battery
+        }
+        Err(err) => {
+            for battery in batteries {
+                let rows = match battery {
+                    BatteryId::Smoke => daemon_shared_smoke_failure_rows(
+                        config,
+                        ctx,
+                        &bin,
+                        &format!("daemon-backed shared executor failed: {err}"),
+                        elapsed_since_ms(started),
+                    ),
+                    BatteryId::Speed => daemon_shared_speed_failure_rows(
+                        config,
+                        ctx,
+                        &bin,
+                        &format!("daemon-backed shared executor failed: {err}"),
+                        elapsed_since_ms(started),
+                    ),
+                    _ => Vec::new(),
+                };
+                out.insert(*battery, rows);
+            }
+            out
+        }
+    }
+}
+
+async fn run_daemon_shared_model_load_rows_async(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    bin: &Path,
+    batteries: &[BatteryId],
+    max_seq: usize,
+) -> anyhow::Result<BTreeMap<BatteryId, Vec<EvalResult>>> {
+    let mut session = load_daemon_eval_session(config, bin, max_seq).await?;
+    let mut out = BTreeMap::new();
+    for battery in batteries {
+        let rows = match battery {
+            BatteryId::Smoke => {
+                daemon_smoke_rows_with_session(config, ctx, bin, &mut session).await?
+            }
+            BatteryId::Speed => {
+                daemon_speed_rows_with_session(config, ctx, bin, &mut session).await?
+            }
+            _ => Vec::new(),
+        };
+        out.insert(*battery, rows);
+    }
+    Ok(out)
+}
+
 fn daemon_model_load_params(config: &EvalConfig, max_seq: usize) -> ModelLoadParams {
     ModelLoadParams {
         max_seq: max_seq.min(u32::MAX as usize) as u32,
@@ -5678,18 +5841,114 @@ fn run_daemon_speed_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResu
     }
 }
 
+fn daemon_shared_smoke_failure_rows(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    bin: &Path,
+    reason: &str,
+    elapsed_ms: u128,
+) -> Vec<EvalResult> {
+    vec![
+        row(
+            BatteryId::Smoke,
+            None,
+            "load_metadata",
+            None,
+            EvalStatus::Fail,
+            Some(reason.to_string()),
+            BTreeMap::from([
+                ("executor".to_string(), json!("daemon")),
+                ("shared_daemon_session".to_string(), json!(true)),
+                ("daemon_bin".to_string(), json!(bin.display().to_string())),
+            ]),
+            config,
+            ctx,
+            None,
+            elapsed_ms,
+        ),
+        row(
+            BatteryId::Smoke,
+            None,
+            "finite_greedy_decode",
+            None,
+            EvalStatus::Skip,
+            Some("daemon-backed shared load failed before decode".to_string()),
+            BTreeMap::from([
+                ("executor".to_string(), json!("daemon")),
+                ("shared_daemon_session".to_string(), json!(true)),
+            ]),
+            config,
+            ctx,
+            prompt("benchmarks/prompts/qwen2_smoke.txt"),
+            elapsed_ms,
+        ),
+        skip_row_with_metrics(
+            BatteryId::Smoke,
+            None,
+            "multi_turn_reset_recall",
+            None,
+            "daemon-backed shared load failed before session reset/recall",
+            config,
+            ctx,
+            prompt("benchmarks/prompts/trains-meet.txt"),
+            BTreeMap::from([
+                ("executor".to_string(), json!("daemon")),
+                ("shared_daemon_session".to_string(), json!(true)),
+            ]),
+        ),
+    ]
+}
+
+fn daemon_shared_speed_failure_rows(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    bin: &Path,
+    reason: &str,
+    elapsed_ms: u128,
+) -> Vec<EvalResult> {
+    daemon_speed_cases()
+        .iter()
+        .map(|case| {
+            row(
+                BatteryId::Speed,
+                None,
+                case.label,
+                None,
+                EvalStatus::Fail,
+                Some(reason.to_string()),
+                BTreeMap::from([
+                    ("implemented".to_string(), json!(true)),
+                    ("executor".to_string(), json!("daemon")),
+                    ("suite".to_string(), json!("daemon_speed_anchor")),
+                    ("shared_daemon_session".to_string(), json!(true)),
+                    ("daemon_bin".to_string(), json!(bin.display().to_string())),
+                ]),
+                config,
+                ctx,
+                prompt("benchmarks/prompts/lru_cache_single_blank.txt"),
+                elapsed_ms,
+            )
+        })
+        .collect()
+}
+
 async fn run_daemon_smoke_rows_async(
     config: &EvalConfig,
     ctx: &EvalContext,
     bin: &Path,
 ) -> anyhow::Result<Vec<EvalResult>> {
     let max_seq = (config.max_tokens + 2048).max(4096);
-    let mut engine = hipfire_daemon_adapter::DaemonEngine::spawn(bin).await?;
-    let loaded = engine
-        .load(&config.model, daemon_model_load_params(config, max_seq))
-        .await?;
-    let worker_key_id = loaded.worker_key_id.clone();
+    let mut session = load_daemon_eval_session(config, bin, max_seq).await?;
+    daemon_smoke_rows_with_session(config, ctx, bin, &mut session).await
+}
 
+async fn daemon_smoke_rows_with_session(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    bin: &Path,
+    session: &mut DaemonEvalSession,
+) -> anyhow::Result<Vec<EvalResult>> {
+    let worker_key_id = session.worker_key_id.clone();
     let prompt_path = "benchmarks/prompts/qwen2_smoke.txt";
     let prompt_text = read_repo_prompt_text(prompt_path)?;
     let request = daemon_generate_request(
@@ -5698,7 +5957,7 @@ async fn run_daemon_smoke_rows_async(
         config.max_tokens,
         Some(worker_key_id.clone()),
     );
-    let (text, done) = engine.generate(request).await?;
+    let (text, done) = session.engine.generate(request).await?;
     let finite = !text.is_empty() && !text.contains('\u{fffd}');
     let decode_status = if finite {
         EvalStatus::Pass
@@ -5710,14 +5969,15 @@ async fn run_daemon_smoke_rows_async(
 
     let session_prompt_path = "benchmarks/prompts/trains-meet.txt";
     let session_prompt_text = read_repo_prompt_text(session_prompt_path)?;
-    engine.reset().await?;
+    session.engine.reset().await?;
     let first_session_request = daemon_generate_request(
         "eval-smoke-session-fresh".to_string(),
         session_prompt_text.clone(),
         config.max_tokens,
         Some(worker_key_id.clone()),
     );
-    let (first_session_text, first_session_done) = engine.generate(first_session_request).await?;
+    let (first_session_text, first_session_done) =
+        session.engine.generate(first_session_request).await?;
     let distractor_request = daemon_generate_request(
         "eval-smoke-session-distractor".to_string(),
         "Remember this unrelated code word for the next turn: orchid. Reply with only OK."
@@ -5725,8 +5985,8 @@ async fn run_daemon_smoke_rows_async(
         config.max_tokens,
         Some(worker_key_id.clone()),
     );
-    let (distractor_text, distractor_done) = engine.generate(distractor_request).await?;
-    engine.reset().await?;
+    let (distractor_text, distractor_done) = session.engine.generate(distractor_request).await?;
+    session.engine.reset().await?;
     let second_session_request = daemon_generate_request(
         "eval-smoke-session-reset".to_string(),
         session_prompt_text,
@@ -5734,7 +5994,7 @@ async fn run_daemon_smoke_rows_async(
         Some(worker_key_id.clone()),
     );
     let (second_session_text, second_session_done) =
-        engine.generate(second_session_request).await?;
+        session.engine.generate(second_session_request).await?;
     let session_finite = !first_session_text.is_empty()
         && !second_session_text.is_empty()
         && !first_session_text.contains('\u{fffd}')
@@ -5768,11 +6028,11 @@ async fn run_daemon_smoke_rows_async(
                 ("daemon_bin".to_string(), json!(bin.display().to_string())),
                 ("shared_model_loads".to_string(), json!(1)),
                 ("worker_key_id".to_string(), json!(worker_key_id.clone())),
-                ("arch".to_string(), json!(loaded.arch)),
-                ("dim".to_string(), json!(loaded.dim)),
-                ("layers".to_string(), json!(loaded.layers)),
-                ("vocab".to_string(), json!(loaded.vocab)),
-                ("max_seq".to_string(), json!(max_seq)),
+                ("arch".to_string(), json!(session.loaded.arch)),
+                ("dim".to_string(), json!(session.loaded.dim)),
+                ("layers".to_string(), json!(session.loaded.layers)),
+                ("vocab".to_string(), json!(session.loaded.vocab)),
+                ("max_seq".to_string(), json!(session.max_seq)),
             ]),
             config,
             ctx,
@@ -5855,25 +6115,31 @@ async fn run_daemon_speed_rows_async(
     bin: &Path,
 ) -> anyhow::Result<Vec<EvalResult>> {
     let max_seq = (config.max_tokens + 2048).max(4096);
-    let mut engine = hipfire_daemon_adapter::DaemonEngine::spawn(bin).await?;
-    let loaded = engine
-        .load(&config.model, daemon_model_load_params(config, max_seq))
-        .await?;
-    let worker_key_id = loaded.worker_key_id.clone();
+    let mut session = load_daemon_eval_session(config, bin, max_seq).await?;
+    daemon_speed_rows_with_session(config, ctx, bin, &mut session).await
+}
+
+async fn daemon_speed_rows_with_session(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    bin: &Path,
+    session: &mut DaemonEvalSession,
+) -> anyhow::Result<Vec<EvalResult>> {
+    let worker_key_id = session.worker_key_id.clone();
     let prompt_path = "benchmarks/prompts/lru_cache_single_blank.txt";
     let prompt_text = read_repo_prompt_text(prompt_path)?;
     let max_tokens = config.max_tokens.max(50);
 
     let mut rows = Vec::new();
     for case in daemon_speed_cases() {
-        engine.reset().await?;
+        session.engine.reset().await?;
         let request = daemon_generate_request(
             format!("eval-speed-{}", case.label),
             prompt_text.clone(),
             max_tokens,
             Some(worker_key_id.clone()),
         );
-        let (text, done) = engine.generate(request).await?;
+        let (text, done) = session.engine.generate(request).await?;
         let has_timing = done.prefill_tok_s.is_some() && done.decode_tok_s.is_some();
         let finite = !text.is_empty() && !text.contains('\u{fffd}') && done.tokens > 0;
         let status = if finite && has_timing {
@@ -9689,6 +9955,95 @@ struct ResultCacheEntry {
     rows: Vec<EvalResult>,
 }
 
+fn run_eval_batteries(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    datasets: &[DatasetManifestEntry],
+) -> Result<Vec<EvalResult>, String> {
+    if !daemon_shared_model_load_enabled(config) {
+        let mut results = Vec::new();
+        for battery in &config.batteries {
+            results.extend(run_battery_cached(*battery, config, ctx, datasets)?);
+        }
+        return Ok(results);
+    }
+
+    let mut rows_by_battery: BTreeMap<BatteryId, Vec<EvalResult>> = BTreeMap::new();
+    let mut shared_misses = Vec::new();
+    for battery in &config.batteries {
+        let key = result_cache_key(*battery, config, ctx, datasets)?;
+        let path = result_cache_path(config, &key);
+        if config.cache_mode == EvalCacheMode::Regenerate {
+            let _ = fs::remove_file(&path);
+        }
+        if config.cache_mode.reads() {
+            if let Some(rows) = read_result_cache_entry(&path, &key) {
+                rows_by_battery.insert(
+                    *battery,
+                    rows.into_iter()
+                        .map(|row| mark_cache_hit(row, &key, &path))
+                        .collect(),
+                );
+                continue;
+            }
+        }
+
+        if daemon_shared_model_load_battery(*battery) {
+            shared_misses.push((*battery, key, path));
+        } else {
+            rows_by_battery.insert(
+                *battery,
+                run_battery_cached(*battery, config, ctx, datasets)?,
+            );
+        }
+    }
+
+    if !shared_misses.is_empty() {
+        let shared_batteries = shared_misses
+            .iter()
+            .map(|(battery, _, _)| *battery)
+            .collect::<Vec<_>>();
+        let mut shared_rows = run_daemon_shared_model_load_rows(config, ctx, &shared_batteries);
+        for (battery, key, path) in shared_misses {
+            let rows = shared_rows.remove(&battery).unwrap_or_default();
+            if config.cache_mode.writes() {
+                if let Err(err) = write_result_cache_entry(&path, &key, config.cache_mode, &rows) {
+                    eprintln!(
+                        "warning: failed to write eval result cache {}: {err}",
+                        path.display()
+                    );
+                }
+            }
+            rows_by_battery.insert(battery, rows);
+        }
+    }
+
+    let mut results = Vec::new();
+    for battery in &config.batteries {
+        if let Some(rows) = rows_by_battery.remove(battery) {
+            results.extend(rows);
+        }
+    }
+    Ok(results)
+}
+
+fn daemon_shared_model_load_enabled(config: &EvalConfig) -> bool {
+    config.executor == EvalExecutorMode::Daemon
+        && config.runs == 1
+        && config.warmup_runs == 0
+        && !config.benchmark
+        && config
+            .batteries
+            .iter()
+            .filter(|battery| daemon_shared_model_load_battery(**battery))
+            .count()
+            > 1
+}
+
+fn daemon_shared_model_load_battery(battery: BatteryId) -> bool {
+    matches!(battery, BatteryId::Smoke | BatteryId::Speed)
+}
+
 fn run_battery_cached(
     battery: BatteryId,
     config: &EvalConfig,
@@ -11776,6 +12131,51 @@ mod tests {
                 && row.metrics.get("suite").and_then(Value::as_str) == Some("daemon_speed_anchor")
                 && row.metrics.get("implemented").and_then(Value::as_bool) == Some(true)
         }));
+    }
+
+    #[test]
+    fn daemon_executor_groups_smoke_and_speed_under_one_shared_load_plan() {
+        let cfg = parse_args_from([
+            "hipfire-eval",
+            "--model",
+            "missing-local-model.hfq",
+            "--executor",
+            "daemon",
+            "--battery",
+            "smoke,speed",
+            "--no-cache",
+        ])
+        .unwrap();
+        let ctx = EvalContext {
+            commit_sha: None,
+            git_branch: None,
+            git_describe: None,
+            git_dirty: None,
+            binary_hash: None,
+            arch: None,
+            rocm: None,
+            host_profile: test_host_profile(),
+        };
+
+        assert!(daemon_shared_model_load_enabled(&cfg));
+        let rows = run_eval_batteries(&cfg, &ctx, &[]).unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.battery == BatteryId::Smoke)
+                .count(),
+            3
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.battery == BatteryId::Speed)
+                .count(),
+            2
+        );
+        assert!(rows
+            .iter()
+            .all(|row| row.metrics.get("executor").and_then(Value::as_str) == Some("daemon")));
+        assert!(rows.iter().all(|row| row.status == EvalStatus::Skip));
     }
 
     #[test]
