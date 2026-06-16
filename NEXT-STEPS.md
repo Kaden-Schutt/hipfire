@@ -242,11 +242,16 @@ Papers + reference implementations vendored for Phases C/D:
     - **Hessians:** native `collect_hessian` is a SCAFFOLD (panics) — use the
       Tier-2 Python collector `scripts/collect_hessian.py` (torch CPU-only
       here, so slow; offline tooling, Rule-1-OK). HFHS read by `hessian_io.rs`.
-    - **Template = `gptq.rs::gptq_pipeline_mq4g256`** (full LDLQ for MQ4):
-      `apply_awq_rescaling` → `fwht_similarity_per_256(H)` →
-      `symmetrize_in_place` → `apply_fwht_per_256_to_weights_f64(W)` →
-      `gptq_column_sequential` (OBS via inverse-Cholesky) → pack. All these
-      helpers are pub + reusable.
+    - **CORRECTION (2026-06-16): `gptq.rs` + `hessian_io.rs` are ORPHANED** —
+      never declared as modules (no `mod gptq;`), and `gptq.rs` uses `faer`
+      which isn't a dependency, so they don't compile. NOT reusable infra as-is.
+      Reviving = add `faer` + revive ~1658 lines of possibly-API-drifted code.
+      The in-`main.rs` `quantize_mq2g256_lloyd_gptq` is only DIAGONAL (imatrix).
+      → **Clean-room path (per the goal): new compiled `ldlq.rs`** with own
+      damped inverse-Cholesky-upper (unit-tested vs UᵀU≈(H+λI)⁻¹), own per-256
+      Hessian FWHT rotation, and the block-sequential trellis OBS loop
+      (algorithm written + the OBS-beats-no-feedback unit test designed).
+      gptq.rs is kept only as an algorithm reference.
     - **New piece = `gptq_pipeline_qtip2`:** same prologue, but replace the
       per-element MQ4 quantizer in the OBS loop with a **block-sequential
       trellis**: process k-columns in 256-blocks, trellis-encode each block
