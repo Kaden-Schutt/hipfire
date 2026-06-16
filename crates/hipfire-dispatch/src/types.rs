@@ -221,6 +221,7 @@ pub enum KernelKey {
     GemvHfq6G256Residual,
     GemvMq4G256Residual,
     GemvMq3G256Residual,
+    GemvQtip3G256Residual,
     GemvMq6G256Residual,
     GemvMq3G256LloydResidual,
     GemvMq4G256LloydResidual,
@@ -230,6 +231,7 @@ pub enum KernelKey {
     GemvHfq6G256SwiGLUResidual,
     GemvMq4G256SwiGLUResidual,
     GemvMq3G256SwiGLUResidual,
+    GemvQtip3G256SwiGLUResidual,
     GemvMq6G256SwiGLUResidual,
     GemvMq3G256LloydSwiGLUResidual,
     GemvMq4G256LloydSwiGLUResidual,
@@ -614,6 +616,7 @@ impl KernelKey {
             HFQ6G256 => Ok(Self::GemvHfq6G256Residual),
             MQ4G256 => Ok(Self::GemvMq4G256Residual),
             MQ3G256 => Ok(Self::GemvMq3G256Residual),
+            Qtip3G256 => Ok(Self::GemvQtip3G256Residual),
             MQ6G256 => Ok(Self::GemvMq6G256Residual),
             MQ3G256Lloyd => Ok(Self::GemvMq3G256LloydResidual),
             MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydResidual),
@@ -634,6 +637,7 @@ impl KernelKey {
             HFQ6G256 => Ok(Self::GemvHfq6G256SwiGLUResidual),
             MQ4G256 => Ok(Self::GemvMq4G256SwiGLUResidual),
             MQ3G256 => Ok(Self::GemvMq3G256SwiGLUResidual),
+            Qtip3G256 => Ok(Self::GemvQtip3G256SwiGLUResidual),
             MQ6G256 => Ok(Self::GemvMq6G256SwiGLUResidual),
             MQ3G256Lloyd => Ok(Self::GemvMq3G256LloydSwiGLUResidual),
             MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydSwiGLUResidual),
@@ -689,7 +693,7 @@ impl KernelKey {
             Prerotated => &[PipelineOp::Gemv],
             WithResidual => {
                 let steps: &[PipelineOp] = match dtype {
-                    MQ4G256 | MQ3G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd => &[
+                    MQ4G256 | MQ3G256 | Qtip3G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd => &[
                         PipelineOp::RotateFwht,
                         PipelineOp::Gemv,
                         PipelineOp::ResidualAdd,
@@ -700,7 +704,7 @@ impl KernelKey {
             }
             WithSwiGLUResidual => {
                 let steps: &[PipelineOp] = match dtype {
-                    MQ4G256 | MQ3G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd => {
+                    MQ4G256 | MQ3G256 | Qtip3G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd => {
                         &[PipelineOp::SiluMulRotate, PipelineOp::GemvResidual]
                     }
                     _ => &[

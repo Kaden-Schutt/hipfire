@@ -66,6 +66,7 @@ fn register_prerotated(registry: &mut KernelRegistry) {
     let dtypes: &[DType] = &[
         DType::MQ4G256,
         DType::MQ3G256,
+        DType::Qtip3G256,
         DType::MQ2G256,
         DType::MQ6G256,
         DType::MQ8G256,
@@ -96,6 +97,7 @@ fn register_residual(registry: &mut KernelRegistry) {
         DType::HFQ6G256,
         DType::MQ4G256,
         DType::MQ3G256,
+        DType::Qtip3G256,
         DType::MQ6G256,
         DType::MQ3G256Lloyd,
         DType::MQ4G256Lloyd,
@@ -133,6 +135,7 @@ fn register_swiglu_residual(registry: &mut KernelRegistry) {
         DType::HFQ6G256,
         DType::MQ4G256,
         DType::MQ3G256,
+        DType::Qtip3G256,
         DType::MQ6G256,
         DType::MQ3G256Lloyd,
         DType::MQ4G256Lloyd,
