@@ -223,7 +223,21 @@ Papers + reference implementations vendored for Phases C/D:
 - **Phase B: ✅ DONE** — MTP daemon wiring, τ=1.66 @ K=2, DFlash τ<1 fixed
   (committed). NOTE: warmed A/B shows MTP **net-negative on 0.8B** (13.1 vs
   AR 57.7 tok/s); optimization moved to **Phase E**.
-- **Phase C: ACTIVE — 2-bit PPL VERDICT IN (2026-06-16): 2-bit QTIP FAILS.**
+- **Phase C: ACTIVE — LDLQ landed; pushing the rest of the QTIP stack.**
+  C1e DONE end-to-end: clean-room `ldlq.rs` (inverse-Cholesky 1e-13, per-256
+  Hessian FWHT rotation, block-trellis OBS) + `hessian_io` wired +
+  `HIPFIRE_QTIP_HESSIAN` in qtip2-sim. **PPL: MSE-only 125.6 → LDLQ 53.6
+  (2.3×), still ≫ MQ4 14.0.** Decision (2026-06-16): **push 2-bit** with the
+  rest of the QTIP stack to chase usable:
+  - **C1f — V=2 vector trellis** (2 weights/codebook-entry; the main RD lever).
+    Restructures qtip.rs: K=4 bits/step, 128 steps/256-group, codebook[state]
+    = 2-vector. Biggest quality gain.
+  - **C1g — L=16** trellis state (richer codebook; pairs with V=2).
+  - **C1h — finetune:** NOTE impractical on this box (torch is CPU-only; 0.8B
+    end-to-end finetune = hours/days). Deferred to a GPU-torch box, or skip.
+  Realism: even the full stack reaches usable 2-bit mainly on 7B+; a 0.8B
+  dense model may not hit MQ4-usable regardless. Re-quantize+PPL after V=2.
+- **Phase C (earlier verdict, superseded): 2-bit QTIP FAILS (MSE-only).**
   Built `--format qtip2-sim` (simulated QTIP-2 → bf16, kernel-free PPL via
   the normal forward) + 1MAD codebook + sort-based beam encoder. PPL on
   0.8B/calib-1m: **QTIP-2-sim 125.6 vs MQ4 14.0 vs bf16 ~10.9** — 2-bit
