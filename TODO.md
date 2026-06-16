@@ -48,9 +48,10 @@
     write standard runtime oneshot artifacts directly via `hipfire-evidence`;
     DFlash/MTP/VL evidence emission remains a path-specific follow-up.
   - The profile battery now has a daemon-backed model anchor that reuses the
-    shared daemon load path and requests runtime evidence artifacts; adding
-    daemon-side MoE router histogram gatherer hooks remains the missing
-    model-specific evidence piece.
+    shared daemon load path and requests runtime evidence artifacts.
+  - Daemon Qwen3.5 MoE AR requests now adapt native router counters into the
+    generic `hipfire-evidence` histogram contract when `evidence_dir` is set;
+    DFlash/MTP/VL evidence emission remains a path-specific follow-up.
 - Run the full no-GPU handoff gate before committing the branch.
 - Extend Qwen35 paged expert execution coverage beyond the current indexed MQ
   routed path: grouped Path 2, Paro, full-precision, and CPU-fallback paged

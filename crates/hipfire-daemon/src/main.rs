@@ -39,7 +39,7 @@ use hipfire_arch_qwen35::speculative::{
 };
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
-use hipfire_evidence::RuntimeOneshotEvidence;
+use hipfire_evidence::{RouterHistogramEvidence, RouterHistogramLayer, RuntimeOneshotEvidence};
 use hipfire_generate::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_generate::loop_guard::{LoopGuard, StopReason};
 use hipfire_generate::sampler::{collect_unclosed_attractor_blocks, SamplerConfig};
@@ -321,6 +321,79 @@ fn write_daemon_runtime_oneshot_evidence(
         hipfire_evidence::write_runtime_oneshot_evidence(Path::new(dir), &runtime_context, evidence)
     {
         eprintln!("[daemon/evidence] failed to write runtime oneshot evidence: {err}");
+    }
+}
+
+struct DaemonMoeRouterHistogramGuard {
+    active: bool,
+}
+
+impl DaemonMoeRouterHistogramGuard {
+    fn start(evidence_dir: Option<&str>, config: &qwen35::Qwen35Config) -> Self {
+        let active = evidence_dir.is_some() && config.num_experts > 0;
+        if active {
+            qwen35::reset_moe_router_histogram(config.num_experts, config.num_experts_per_tok);
+        }
+        Self { active }
+    }
+
+    fn take(mut self) -> Option<qwen35::MoeRouterHistogram> {
+        self.active = false;
+        qwen35::take_moe_router_histogram()
+    }
+}
+
+impl Drop for DaemonMoeRouterHistogramGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = qwen35::take_moe_router_histogram();
+        }
+    }
+}
+
+fn write_daemon_moe_router_evidence(
+    dir: &str,
+    model: &LoadedModel,
+    id: &str,
+    hist: qwen35::MoeRouterHistogram,
+) {
+    if hist.routed_slots == 0 {
+        return;
+    }
+    let runtime_context = daemon_runtime_context(model);
+    let evidence = RouterHistogramEvidence {
+        case_id: id,
+        prompt_path: "daemon://generate",
+        collection_scope: "qwen35_moe_daemon_ar_forward_calls",
+        num_experts: hist.num_experts,
+        k_top: hist.k_top,
+        routed_tokens: hist.routed_tokens,
+        routed_slots: hist.routed_slots,
+        top1_histogram: hist.top1_histogram,
+        topk_histogram: hist.topk_histogram,
+        weight_sums: hist.weight_sums,
+        dropped_indices: hist.dropped_indices,
+        per_layer: hist
+            .per_layer
+            .into_iter()
+            .map(|layer| RouterHistogramLayer {
+                layer_idx: layer.layer_idx,
+                top1_histogram: layer.top1_histogram,
+                topk_histogram: layer.topk_histogram,
+                weight_sums: layer.weight_sums,
+                dropped_indices: layer.dropped_indices,
+                routed_tokens: layer.routed_tokens,
+                routed_slots: layer.routed_slots,
+                cooccurrence: layer.cooccurrence,
+            })
+            .collect(),
+    };
+    if let Err(err) = hipfire_evidence::write_router_histogram_evidence(
+        Path::new(dir),
+        &runtime_context,
+        evidence,
+    ) {
+        eprintln!("[daemon/evidence] failed to write MoE router evidence: {err}");
     }
 }
 
@@ -14382,6 +14455,7 @@ fn generate(
         let scratch = m.q35_scratch.as_ref().unwrap();
         let kv = &mut session.kv_cache;
         let dn = &mut session.dn_state;
+        let moe_router_histogram = DaemonMoeRouterHistogramGuard::start(evidence_dir, config);
 
         // Prefill this turn's tokens via the batched prefill entry point.
         // On gfx11+ for MQ4/HFQ4/MQ6/HFQ6 weights this hits the WMMA GEMM
@@ -15013,6 +15087,9 @@ fn generate(
                 decode_s,
                 prefill_s * 1000.0,
             );
+            if let Some(hist) = moe_router_histogram.take() {
+                write_daemon_moe_router_evidence(dir, m, id, hist);
+            }
         }
         let _ = writeln!(
             stdout,
