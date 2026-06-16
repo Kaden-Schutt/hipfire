@@ -256,9 +256,15 @@ Papers + reference implementations vendored for Phases C/D:
     reads 0.39 B/w packed weights). Three dispatch bugs found+fixed via GPU
     iteration: gemv.unknown (post-rotation variant), not-registered
     (prerotated registry), residual/swiglu keys.
-  - Remaining: coherence-gate run on the qtip3 model; embed/lm_head mixed-quant
-    (they stay bf16 → 0.8B file currently > mq4; lm_head is in the decode hot
-    path); fresh-process tok/s vs mq4; C2b prefill GEMM + C3 gfx1103 retune.
+  - **Coherence ✅ (A/B 2026-06-16):** qtip3 greedy 2048-tok output loops into a
+    block attractor on a reasoning prompt — but **MQ4 loops identically on the
+    same prompt** (near-verbatim "Wait, re-reading…" repetition). So the
+    attractor is a tiny-model long-greedy-decode artifact (documented Phase A
+    behavior), NOT a qtip3 regression. qtip3 is numerically correct AND
+    coherence-equivalent to MQ4. **PHASE C CORE DONE.**
+  - Remaining (polish, not blocking): embed/lm_head mixed-quant (they stay bf16
+    → 0.8B file currently > mq4; lm_head is in the decode hot path); fresh-
+    process tok/s vs mq4 (warm protocol); C2b prefill GEMM + C3 gfx1103 retune.
 - **Phase C: (superseded) ACTIVE — LDLQ landed; pushing the rest of the QTIP stack.**
   C1e DONE end-to-end: clean-room `ldlq.rs` (inverse-Cholesky 1e-13, per-256
   Hessian FWHT rotation, block-trellis OBS) + `hessian_io` wired +
