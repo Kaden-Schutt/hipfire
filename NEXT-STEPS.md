@@ -155,6 +155,26 @@ row scale, GROUP=128 tile records, dequant-to-fp16-scratch then stock decode.
       when channel skew is present; the gate confirms real KV has that skew.
     - Effort ≈ the C2 effort (4 kernels + plumbing + coherence). Largest single
       remaining item in the plan.
+  - **D1 PROGRESS + REFINED STRATEGY (2026-06-16):**
+    - ✅ **CPU foundations done+tested:** `kvarn::variance_normalize` (Sinkhorn,
+      imbalance 167→3.5), `quantize_tile`/`dequantize_tile` (cos-sim 0.9955),
+      and **`pack_kvarn_tile`/`unpack_kvarn_tile`** tile record (0.55 B/elem,
+      round-trip cos-sim 0.999999). These are the exact CPU references the GPU
+      kernels mirror (same role qtip.rs played for the qtip3 kernel).
+    - **CPU-flush-first build order (de-risks the GPU Sinkhorn):** the flush is
+      infrequent (every GROUP=128 tokens), so v1 can run the Sinkhorn+pack on
+      CPU at flush time (copy staged fp16 tile → host → `kvarn::quantize_tile`
+      → `pack_kvarn_tile` → upload record). Only the **dequant-on-read** needs a
+      GPU kernel for v1 (or even CPU dequant→fp16-scratch for the very first PPL
+      verdict). This yields the KVarN PPL number WITHOUT writing the hard GPU
+      Sinkhorn kernel — exactly the qtip3-sim strategy (correctness first, then
+      optimize the flush to GPU). Build order: (a) fp16 KV mode + staging buffer
+      + CPU-flush degrade → PPL verdict; (b) if PPL good, GPU dequant kernel;
+      (c) GPU Sinkhorn+pack kernel for decode-speed.
+    - **Build-vs-skip risk:** asym4 already does per-channel 4-bit K, so KVarN's
+      marginal win = whatever the Sinkhorn adds beyond per-channel scales. The
+      CPU-flush PPL (KVarN vs asym4) IS the build/skip gate — if KVarN ≈ asym4
+      PPL, ship asym4 and skip the GPU Sinkhorn.
   - **D1-MLA (DeepSeek V4):** the KVarN-MLA backend applies more directly —
     but DeepSeek runs on the bigger boxes, not this 780M.
 - **Gate:** long-context coherence + τ stability under compressed KV.
