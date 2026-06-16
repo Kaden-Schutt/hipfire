@@ -223,10 +223,19 @@ Papers + reference implementations vendored for Phases C/D:
 - **Phase B: ✅ DONE** — MTP daemon wiring, τ=1.66 @ K=2, DFlash τ<1 fixed
   (committed). NOTE: warmed A/B shows MTP **net-negative on 0.8B** (13.1 vs
   AR 57.7 tok/s); optimization moved to **Phase E**.
-- **Phase C: ACTIVE** — C1a/C1b/C1d-reconstruction done (QTIP near-optimal
-  2-bit, 1.21× RD bound). Next: C1c adopt QTIP reference codebook (now
-  in-tree), C1d full-model PPL, C2 decode kernel (CUDA→HIP port). Reference
-  unblocked via `./Quantization/QTIP…`.
+- **Phase C: ACTIVE — 2-bit PPL VERDICT IN (2026-06-16): 2-bit QTIP FAILS.**
+  Built `--format qtip2-sim` (simulated QTIP-2 → bf16, kernel-free PPL via
+  the normal forward) + 1MAD codebook + sort-based beam encoder. PPL on
+  0.8B/calib-1m: **QTIP-2-sim 125.6 vs MQ4 14.0 vs bf16 ~10.9** — 2-bit
+  unusable as implemented. Root cause: near-optimal *reconstruction* (1.21×
+  RD bound) still collapses PPL because error accumulates across 186 weights
+  AND the encode is MSE-optimal not **output-optimal** — missing **LDLQ**
+  (Hessian/activation-aware) + V=2/L=16/finetune. FORK:
+  - **C1e — LDLQ (rescue 2-bit, the real prize):** add input-Hessian
+    calibration + LDLQ encode (ref `lib/algo/ldlq.py`). Big effort.
+  - **3-bit QTIP fallback (plan default):** make bits configurable, quantize
+    qtip3-sim, PPL. Quick; modest bandwidth win vs MQ4.
+  Then C2 decode kernel (only worth building once a bit-rate passes PPL).
 - **Phase D: spec/reference unblocked** — KVarN paper + repo in
   `./Quantization/` (was the missing spec). Caveat: MLA-shaped, needs GQA
   adaptation for Qwen3.5.
