@@ -1,0 +1,3 @@
+# gpu_arch  model_arch  logit_hash  (len=16 warmup=2 seed=42)
+gfx1151 qwen3_5 0xb9929ff22fec2015
+gfx1151 qwen3_5_moe 0x512ad6880ea52325

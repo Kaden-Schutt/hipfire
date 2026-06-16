@@ -293,13 +293,23 @@ Papers + reference implementations vendored for Phases C/D:
   | format | PPL | vs MQ4 |
   |---|---|---|
   | MQ4 (4-bit baseline) | 14.03 | — |
-  | **qtip3-sim (3-bit)** | **15.20** | **+8.3%** |
+  | **qtip3-ldlq (3-bit, Hessian)** | **14.67** | **+4.6%** |
+  | qtip3-sim (3-bit, MSE) | 15.21 | +8.4% |
   | qtip2-sim (2-bit MSE) | 120.60 | unusable |
   | qtip2-ldlq (2-bit) | 53.6 | unusable |
-  **3-bit QTIP = usable** (+8.3% PPL for 25% less weight bandwidth than MQ4).
-  2-bit stays unusable on the 0.8B even with LDLQ. DECISION: ship 3-bit; the
-  halo 2-bit finetune (C1h) is NOT worth multi-hours given 3-bit already lands
-  at MQ4-class quality.
+  **3-bit QTIP = usable** (+4.6% PPL with LDLQ for 26% less weight bandwidth
+  than MQ4). 2-bit stays unusable on the 0.8B even with LDLQ. DECISION: ship
+  3-bit; the halo 2-bit finetune (C1h) is NOT worth multi-hours given 3-bit
+  already lands at MQ4-class quality.
+  - **LDLQ-for-3-bit ✅ LANDED (2026-06-17):** LDLQ was hard-gated to
+    `qtip_bits == 2`; the qtip3 verdict (15.20) was the plain-MSE path. Made
+    the block-trellis OBS bit-parametric (`qtip_ldlq_dequant_bits`, codebook
+    indexed by the 12-bit trellis state so only encode/scale/decode route to
+    the `_bits` variants) and dropped the 2-bit filter. Same-build A/B on 0.8B
+    (Hessian `~/.hipfire/hessians/qwen3.5-0.8b.hessian.bin`, 186/186 tensors
+    LDLQ): **15.21 → 14.67, closing 45% of the MQ4 gap** (1.18 → 0.64 PPL).
+    Baseline reproduced the documented 15.20 to the digit. Free at inference
+    (same gemv_qtip3g256 kernel + bandwidth; cost is offline encode only).
   - **Packed QTIP-3 format ✅ LANDED (2026-06-16):** `qtip.rs`
     `pack_qtip3_group`/`unpack_qtip3_group` + `QTIP3_BLOCK_BYTES=100`
     ([f32 scale][96 B 3-bit symbols], no zero-point — codebook is zero-mean).
@@ -368,7 +378,8 @@ Papers + reference implementations vendored for Phases C/D:
     tensors execute. So GPU torch (Hessian collection AND end-to-end finetune)
     is now POSSIBLE — slow at 3 TFLOP/s, but feasible for the 0.8B over hours.
   - **qtip3-sim fallback ✅ WIRED (2026-06-16):** bit-rate-parametric trellis
-    (`*_bits` fns) + `--format qtip3-sim`. Quantize + PPL pending.
+    (`*_bits` fns) + `--format qtip3-sim`. Quantize + PPL DONE: MSE 15.21,
+    LDLQ 14.67 (see the verdict table above).
   Realism: even the full stack reaches usable 2-bit mainly on 7B+; a 0.8B
   dense model may not hit MQ4-usable regardless. halo's 124 GB also lets us
   validate the QTIP-2 stack on a 7B+ model where the paper says it works.

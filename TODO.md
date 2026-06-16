@@ -221,3 +221,249 @@ hours); the GPU forward + on-GPU accumulation would be far faster, and it
 removes the Python/torch tooling dependency from the quant pipeline.
 Reference: the validated Tier-2 `scripts/collect_hessian.py` + the existing
 scaffold's documented deliverables.
+
+## GPU (HIP) trellis-encode kernel for QTIP quantization
+
+The QTIP encode (`qtip::beam_encode_group_bits` + the LDLQ block loop in
+`ldlq.rs`) is the slow stage: per 256-weight group it runs 256 sequential
+Viterbi steps, each generating `beam_width × 2^bits` candidates
+(128 × 8 = 1024 at 3-bit) and doing a sort/dedup-by-state + top-`beam_width`
+select. CPU rayon parallelizes only across groups/rows, capping throughput at
+core count (0.8B qtip3-sim ≈ 10 min wall on 24 cores; LDLQ is slower still).
+This is pure *offline* cost (Rule 1 does not apply — quantize is tooling), so
+spend GPU compute once to improve the many. **Verdict: HIP/RDNA is the right
+target; the XDNA NPU is not** (beam search is sort/branch/backtrack-heavy —
+the opposite of the AIE dataflow-MAC array; only FWHT + the LDLQ Cholesky/
+residual GEMMs are NPU-shaped, and those aren't the bottleneck).
+
+Build a HIP encode kernel mirroring the structure of the decode kernel
+(`kernels/src/gemv_qtip3g256.hip`), single backend:
+- **One group per workgroup/wavefront.** Cross-group parallelism (millions of
+  256-groups) saturates every CU; the 256-step recurrence stays serial inside
+  the workgroup (don't parallelize the time axis).
+- **Codebook in LDS.** 4096 × f32 = 16 KB fits the LDS budget; the per-step
+  cost eval becomes an LDS read + FMA. Or recompute the 1MAD hash per lane
+  (the same few-ALU-op hash the decode kernel already computes — bit-identical
+  to the PPL-validated path).
+- **Beam + candidates in LDS.** beam_width 128 × (state u32 + cost f32) is
+  tiny; the 1024 per-step candidates are an LDS scratch.
+- **Per-step top-k is the only hard op** — a bitonic top-k in LDS (~10 stages)
+  or a segmented min-reduction keyed on next-state. This is the bulk of the
+  kernel engineering.
+- **LDLQ arm:** keep full row-parallelism (thousands of m rows encode
+  concurrently), serialize only the ~k/256 column-blocks (block residual feeds
+  the next block). The per-tensor inverse-Cholesky (O(k³), k ≤ 4096) is a
+  one-time dense-LA op (rocSOLVER/rocBLAS), not the bottleneck.
+
+Expected payoff: order-of-magnitude+ over the 24-core path (thousands of
+groups in flight vs ~24). Precedent: QTIP's own reference runs trellis encode
++ LDLQ on GPU. Cheap CPU-side stopgap meanwhile: lower `beam_width` (trellis
+quality is flat above ~16–32). Priority rises when encode moves to 4B/9B,
+where the offline cost actually starts to hurt.
+
+## hipfire finetune tool (QTIP blocked finetune / quant-error recovery)
+
+QTIP's headline sub-4-bit numbers depend on **blocked fine-tuning** to recover
+quality after quantization; hipfire has no training stack, which is why pure
+PTQ qtip3-sim lands at +8.3% PPL (15.20 vs MQ4 14.03) on the 0.8B worst case
+and 2-bit collapses there even with LDLQ. A native finetune tool would close
+that gap (and is the realistic path to *usable* 2-bit on bigger models, where
+the paper says blocked FT is what makes 2-bit work). Now unblocked: halo
+(Strix Halo gfx1151, 124 GB unified RAM) runs ROCm torch on the 8060S GPU
+(C1h note in NEXT-STEPS), so GPU finetune of the 0.8B is feasible (slow at
+~3 TFLOP/s, but it's a one-time offline cost — acceptable per the "improve the
+many" principle).
+
+Scope (offline tooling — Rule 1 does not apply):
+- **Blocked / layer-wise finetune** of the QTIP-quantized model against the
+  fp16 teacher: freeze the trellis symbol assignment, learn the per-group
+  `scale` (and optionally the codebook affine) to minimize per-block output
+  error — the cheap, decode-compatible recovery that keeps the kernel
+  unchanged. Then optionally end-to-end finetune of the dequantized weights
+  with straight-through trellis re-encode (the paper's full recipe).
+- **Teacher/student wiring:** reuse the calibration corpus + the Hessian
+  collector's `ActivationCapture` sites; the loss is block-output MSE (or KL on
+  logits for the final stage).
+- **Backend decision:** Tier-1 native HIP training is a large lift; Tier-2 is a
+  gated Python/torch tool on halo (matches the Hessian collector's two-tier
+  precedent — Python is allowed for offline tooling). Start Tier-2 to get a
+  quality verdict, promote to native only if it pays off.
+- **Acceptance:** qtip3 (and a 7B+ qtip2) PPL closes meaningfully toward MQ4 /
+  fp16 after FT; coherence-gate clean; the finetuned artifact still decodes
+  bit-identically on the `gemv_qtip3g256` kernel (scale-only FT) or re-packs
+  cleanly (weight FT). Validate on a 7B+ model on halo where 2-bit QTIP is
+  expected to become usable.
+
+### Legible golden for the tiny fixtures (first customer of the finetune tool)
+
+Upgrade the tiny-fixture golden (see "Tiny random-init fixtures" below) from an
+opaque `logit_hash` + random-token argmax to a **self-documenting generated
+sequence**, once the finetune tool can memorize a short prefix. Memorizing one
+fixed prefix is the *simplest* training objective (pure overfit, seconds on
+CPU) — so this doubles as the finetune tool's own smoke test.
+
+Design (force a fixed-length, e.g. 256-token, greedy generation):
+- **Trained legible preamble** — e.g. `"The model is working, what follows is
+  deliberately random:"`. Human-readable "is it alive / catastrophic
+  regression" signal; a CI failure is instantly interpretable.
+- **Untrained random tail** — the rest. NOT trained → high-entropy. "Random"
+  = varied *content*, still fully **deterministic** (fixed weights + greedy +
+  deterministic kernels). This is the **sensitive** tier: near-tie tokens sit
+  on decision boundaries, so they flip under subtle drift that the confident
+  (large-margin) memorized preamble would mask — recovering the sensitivity
+  pure memorization throws away. Keep a hash of the tail as the byte-exact
+  assertion.
+- **Bonus coverage:** 256 generated tokens exercise the full autoregressive
+  decode loop + KV-cache growth (the current single-position prefill golden
+  doesn't).
+- **Vocab:** byte-level (256-vocab, English as raw UTF-8, embed ≈ 65K params,
+  no tokenizer file) keeps it tiny; avoids the 248K-vocab embed blowup.
+- **MoE caveat:** the near-tie tail tokens are exactly where MoE-down atomicAdd
+  ULP noise can flip run-to-run → on the MoE fixture pin the deterministic
+  combine (or keep the run-twice determinism check). Dense path: a tail flip =
+  a real change.
+Complements, does not replace: `logit_hash` stays the sensitive tier today; the
+35B agentic-gate stays the *behavioral* arbiter (this is still memorized, not
+Q&A capability).
+
+## Tiny random-init fixtures + golden-output tripwire (fast kernel/MoE plumbing)
+
+The coherence/agentic gates load `qwen3.6-35b-a3b` because the agentic gate is
+*behavioral* (JSON.parse + tool-call schema match under 780–1300 token agent
+prompts, guarding the #87 long-prompt MMQ-corruption class). But the
+*regression-cover* half of that — "did a kernel start corrupting long-prompt
+output" — is really a **golden-output (characterization) test**: it needs
+determinism + coverage of the same kernel-selection branch, NOT a model that
+emits valid JSON. So a sub-10M random-init model is a valid **fast tripwire**;
+the 35B stays as the behavioral arbiter.
+
+Coverage holds because auto-MMQ selects on `batch_size >= min_batch`
+(`arch_caps.rs:229`) — token/batch count, not model dims — so a tiny model on
+the same long prompt crosses the *same* MMQ gate (`HIPFIRE_MMQ_MIN_BATCH` can
+force it lower for a cheap deterministic test). Residual: the specific MMQ
+*tile variant* can differ by K/N, so it's same-selection-branch coverage, not
+identical-tile — hence tripwire + 35B backstop, not standalone.
+
+Build TWO fixtures (must be hipfire's supported archs, NOT upstream
+`qwen3_moe` — unsupported; see `main.rs:6210`):
+- **Tiny dense (arch 5, `model_type: qwen3_5`).** Dense GEMV/attention writes
+  unique outputs, **no atomicAdd → deterministic on a fixed binary**. So a
+  **byte/token-exact golden is stable run-to-run**, and any drift is a real
+  signal — escalate to the 35B golden. This is the clean primary tripwire.
+- **Tiny MoE (arch 6, `model_type: qwen3_5_moe`,** DeltaNet LA+FA hybrid +
+  stacked-3D experts `mlp.experts.gate_up_proj/down_proj [E,…]`**).** Covers
+  router/expert-gather/grouped-MQ-GEMM. CAVEAT: MoE-down combine uses
+  `atomicAdd` with **documented non-deterministic final bits** (`kernels.rs:
+  3751`, `gemv_hfq4g256_moe_down.hip:19–23`) → a raw byte-exact MoE golden
+  diffs run-to-run with no code change. FIX: pin the golden to the in-tree
+  **deterministic no-atomicAdd combine** (expanded per-expert outputs +
+  ordered `moe_down_combine_k8_batched`, `kernels.rs:3748`). Bonus: that makes
+  the harness double as a **determinism gate** (catches anything re-routing
+  MoE-down through the atomicAdd path).
+
+Two-tier policy: tiny golden runs always (seconds, CPU/no-GPU-friendly);
+on drift, run the 35B *golden* (not the coarse JSON-valid check — it can pass
+while tokens shift). Only-tiny-moved ⇒ tiny-specific, rebaseline; 35B-also-
+moved ⇒ real change, rebaseline both deliberately (never auto on a coarse
+pass). Greedy decode, fixed long agent-shape prompt, forced MMQ.
+
+Generator = a **tiny-fixture emitter built into `hipfire-quantize`** (NOT a
+one-off script). Rationale: the quantizer already owns each arch's tensor
+manifest + the HF→internal name mapping (that's what its ingest path does), so
+reusing it as the single source of truth keeps fixtures from drifting; a
+standalone Python generator would re-derive every arch's tensor list and rot
+when a layout changes. Native Rust also drops the torch/transformers dep.
+
+Design:
+- **Emit HF safetensors + `config.json`, then run the normal `--input` quantize
+  path** (don't synthesize `.hfq` internals directly) — this exercises the
+  arch-specific **name-mapper** too, a common break point, so the fixture flow
+  gives full-pipeline coverage for free.
+- **Seeded random init** (byte-reproducible across machines → stable golden) +
+  a per-arch **"tiny preset"**: dims <10M params while preserving the structural
+  features gating needs — for Qwen3.5: ≥1 of EACH layer type (DeltaNet +
+  FullAttn, dense + MoE), enough experts for top-k, batch large enough to cross
+  the MMQ threshold. (Router-margin knob for MoE fixtures is DEFERRED until the
+  hipfire finetune tool exists — see that section; until then the MoE fixture
+  golden is stabilized by pinning the deterministic combine.)
+- CLI shape e.g. `hipfire-quantize --emit-fixture <arch> --tiny --seed N
+  --out <dir>` → then quantize to mq4/qtip3/etc.
+- **Cost to budget:** each arch's manifest is today *implicit* in the ingest/
+  mapping code; the emitter needs it *explicit/enumerable* ("arch → [(name,
+  shape-formula)]"). Modest refactor, but healthy — the same table a fixture
+  emitter wants is also what a manifest-validator and per-arch docs want, and
+  it's a forcing function to document tensor layout when adding an arch.
+- **Generalizes:** the dense (arch 5) + MoE (arch 6) goldens are just the first
+  two consumers; deepseek4 / minimax / lfm2moe / dots-ocr each get a tiny
+  gating fixture from the same mechanism as support lands. <10M is trivial
+  (hidden ~256, 2–4 layers, 8 experts top-2, small `moe_intermediate`).
+
+Wire the golden runner into `no-gpu-ci.sh` (CPU reference) + a GPU dispatch
+channel-test. Build order: dense arch-5 first (isolates the shared DeltaNet
+LA+FA hybrid manifest, deterministic golden), then MoE arch-6 is additive
+(router + experts + the combine-path stabilization above).
+
+## Deterministic MoE-down reduction (reconsider the atomicAdd default)
+
+The fast MoE-down combine accumulates expert contributions via fp32
+`atomicAdd` into the residual (`gemv_hfq4g256_moe_down.hip:154`,
+`kernels.rs:3751`). FP add is non-associative, so undefined atomic ordering
+makes the result **non-deterministic to ~ULP run-to-run on a fixed binary**
+(documented in-kernel). Usually benign — but the residual feeds the *next
+layer's MoE router top-k*, a discrete selection. On near-tied routing logits a
+last-bit wobble can **flip expert selection and diverge macroscopically** from
+that token on. So determinism here is a correctness/repro concern, not just a
+test-harness annoyance.
+
+Decision to make: should the deterministic path be the **default**, not just a
+test variant? Options, best first:
+- **Fixed-point / integer atomicAdd accumulation.** Integer add is exact and
+  order-independent ⇒ deterministic regardless of atomic order, at ~atomics
+  speed; round once on the final convert-back. This is the only scheme that
+  *guarantees* determinism while keeping atomics. **Fidelity caveat:** the
+  fixed-point accumulator must cover the dynamic range — when contribution
+  exponents are far apart, a flat fixed-point grid loses the small terms, so
+  size the integer width for the worst-case range or use a per-row/block
+  shared-exponent (the absolute LSB position is well-defined in fixed-point,
+  unlike float — which is exactly why post-fp32-sum "trim the bottom LSB" is
+  unsound: the LSB's absolute position moves with the magnitude, and a reorder
+  can straddle any trim boundary, so trimming only lowers the flip *rate*, it
+  is not a guarantee).
+- **Fixed summation order** — the in-tree `moe_down_combine_k8_batched`
+  (expanded per-expert outputs + ordered sum). Guaranteed deterministic; costs
+  an expanded scratch buffer + a combine pass. Already exists; make it the
+  default for repro/test and any router-feeding site.
+- Keep fast atomicAdd only where downstream is provably linear/tolerant.
+
+Bench the fixed-point variant; if it's near-zero perf cost it should likely be
+the global default. Pairs with the tiny-fixture golden/determinism gate above.
+
+### Router-margin tuning of the tiny MoE *fixture* (DEFERRED → needs hipfire-finetune)
+
+NOTE: this is deferred until the **hipfire finetune tool** lands — margin
+tuning is an optimization step the finetune tool is the natural home for.
+Until then, stabilize the MoE fixture golden by **pinning the deterministic
+combine** (the first option below). Recorded here so the approach isn't lost.
+
+A fixture-construction trick (this is about the tiny golden model, NOT a
+production model technique): when generating the tiny MoE fixture, nudge the
+random-init router weights so that — for the fixed test prompt — every token's
+top-k expert selection lands with a **comfortable margin** (selected vs.
+dropped experts well separated, "near the middle" of the decision region). Then
+no routing decision is near a flip boundary, so the MoE-down atomicAdd ULP
+noise cannot cascade into an expert swap, and the fixture's *token* output is
+stable run-to-run **on the production fast path** — no need to pin the
+deterministic combine for the fixture's golden.
+
+This gives two independent ways to make the MoE fixture golden stable; pick per
+goal:
+- **Pin the deterministic combine** → byte-exact *logits* golden; tests the
+  deterministic kernel specifically.
+- **Router-margin-tune the fixture** (this) → token-exact golden that exercises
+  the **default atomicAdd fast path** (only benign sub-flip ULP noise remains).
+  For full token stability also give the fixture's final lm_head argmax a
+  margin on the test prompt. Cheaper to run and tests what production uses.
+
+(A production router-margin regularizer — hardening real routing against quant
+error — is a *separate* idea; park it under the finetune tool only if it earns
+its own motivation, not as part of this fixture work.)

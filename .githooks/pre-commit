@@ -40,6 +40,48 @@ set -e
 # List files staged for this commit.
 CHANGED=$(git diff --cached --name-only --diff-filter=ACM)
 
+# ── Fast-track lint gates (every commit that stages Rust) ────────────────
+# rustfmt + clippy run BEFORE the path-gated heavy GPU gates and regardless of
+# the HOTSPOT early-exit below, so style/lint never silently slips to CI.
+#   - rustfmt blocks only on STAGED files (pre-existing unformatted files
+#     elsewhere in the tree don't block this commit).
+#   - clippy runs on the changed crates only (full-workspace clippy is CI's
+#     job) and blocks on errors; warnings surface but don't block (clippy's
+#     default exit), matching CI's advisory stance.
+STAGED_RS=$(echo "$CHANGED" | grep -E '\.rs$' || true)
+if [ -n "$STAGED_RS" ]; then
+    echo "=== Lint: rustfmt (staged) + clippy (changed crates) ==="
+    FMT_OUT=$(cargo fmt --all --check 2>&1 || true)
+    BLOCK_FMT=0
+    for f in $STAGED_RS; do
+        if echo "$FMT_OUT" | grep -qF "$f"; then
+            echo "  rustfmt: needs formatting -> $f"
+            BLOCK_FMT=1
+        fi
+    done
+    if [ "$BLOCK_FMT" = 1 ]; then
+        echo
+        echo "COMMIT BLOCKED: staged Rust is unformatted. Fix: cargo fmt"
+        exit 1
+    fi
+    echo "  rustfmt: staged files OK"
+
+    PKGS=$(echo "$STAGED_RS" | sed -nE 's|^crates/([^/]+)/.*|\1|p' | sort -u)
+    CLIPPY_PKGS=""
+    for p in $PKGS; do CLIPPY_PKGS="$CLIPPY_PKGS -p $p"; done
+    if [ -n "$CLIPPY_PKGS" ]; then
+        echo "  clippy:$CLIPPY_PKGS --all-targets"
+        if ! CLIPPY_OUT=$(cargo clippy $CLIPPY_PKGS --all-targets --locked 2>&1); then
+            echo "$CLIPPY_OUT" | grep -E '^(error|warning)' | head -30
+            echo
+            echo "COMMIT BLOCKED: clippy. Fix, or run: cargo clippy$CLIPPY_PKGS --all-targets"
+            exit 1
+        fi
+        echo "  clippy: OK"
+    fi
+    echo
+fi
+
 # Hotspots that can affect forward-pass output or speed.
 #
 # Updated for post-0.1.20 modular topology (PR 7+):

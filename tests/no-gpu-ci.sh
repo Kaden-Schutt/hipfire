@@ -15,6 +15,10 @@ cargo test -p rdna-compute --lib
 cargo test -p hipfire-arch-qwen35 --lib moe_prefill
 cargo test -p hipfire-eval --lib
 cargo test -p hipfire-quantize xxh64_provenance_tests
+cargo test -p hipfire-quantize fixture
+
+echo "== Tiny-fixture round-trip (CPU: emit → quantize, no GPU) =="
+bash tests/fixture-roundtrip-nogpu.sh
 
 echo "== Eval harness no-GPU smoke =="
 cargo build -p hipfire-eval

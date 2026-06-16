@@ -45,6 +45,8 @@ mod hessian_io;
 // KVarN (Phase D) — variance-normalized 4-bit KV, clean-room CPU core.
 #[allow(dead_code)]
 mod kvarn;
+// Tiny random-init model fixtures for fast kernel/plumbing gating.
+mod fixture;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -3246,8 +3248,8 @@ enum QuantType {
     // MFP4G32R    = 29, // v3  — HFP4G32 + online block-diag-128 rotation (AMD recipe)
     // HFP8E5M2G32 = 30, // v2  — HFP8 E5M2 family
     MQ4G256Lloyd = 30, // MagnumQuant 4-bit + per-block Lloyd-Max 16-entry fp16 codebook (160 B/group)
-                       // Renumbered from 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.
-                       // Models quantized pre-renumber MUST be re-quantized.
+    // Renumbered from 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.
+    // Models quantized pre-renumber MUST be re-quantized.
     /// QTIP-3: trellis-coded 3-bit, FWHT-rotated. Block = [f32 scale][96 B
     /// packed 3-bit trellis symbols] = 100 B/group (0.391 B/weight). Decoded by
     /// the fused `gemv_qtip3g256` kernel (computed 1MAD codebook, zero LDS); the
@@ -5523,6 +5525,25 @@ fn run_gguf_pipeline(
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    // `--emit-fixture <arch>`: write a tiny random-init HF model (safetensors +
+    // config.json) for gating, then exit. Flows through the normal `--input`
+    // quantize path afterward (separate invocation). See src/fixture.rs.
+    if let Some(arch) = arg_value(&args, "--emit-fixture") {
+        let out = arg_value(&args, "--out")
+            .or_else(|| arg_value(&args, "--output"))
+            .unwrap_or("./tiny-fixture");
+        let seed = arg_value(&args, "--seed")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0x00C0_FFEE);
+        match fixture::emit_fixture(arch, Path::new(out), seed) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("emit-fixture: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     // Bound rayon's pool to 80% of cores (default cap; override with --threads N
     // or HIPFIRE_QUANT_THREADS env). Quantization is CPU-bound and saturates
     // memory bandwidth, so leaving headroom for the rest of the system avoids
@@ -5614,7 +5635,11 @@ fn main() {
     // (rotated-frame symbols), decoded by the gemv_qtip3g256 kernel. The sim
     // path is for kernel-free PPL; this is the shippable bandwidth format.
     let use_qtip3_real = format == "qtip3";
-    let qtip_bits: u32 = if use_qtip3_sim || use_qtip3_real { 3 } else { 2 };
+    let qtip_bits: u32 = if use_qtip3_sim || use_qtip3_real {
+        3
+    } else {
+        2
+    };
     // Both sim and real QTIP first stage every 2D weight as BF16, then the
     // post-pass either bakes sim error into bf16 (sim) or packs Qtip3G256 (real).
     let use_bf16 = format == "bf16" || format == "bfloat16" || use_qtip_sim || use_qtip3_real;
@@ -5646,13 +5671,15 @@ fn main() {
             match hessian_io::HessianSidecar::open(std::path::Path::new(&p)) {
                 Ok(s) => {
                     eprintln!(
-                        "qtip2-sim: LDLQ ENABLED — Hessian sidecar {p} ({} tensors)",
+                        "qtip{qtip_bits}-sim: LDLQ ENABLED — Hessian sidecar {p} ({} tensors)",
                         s.n_tensors()
                     );
                     Some(s)
                 }
                 Err(e) => {
-                    eprintln!("qtip2-sim: WARN cannot open Hessian {p}: {e:?} — plain QTIP");
+                    eprintln!(
+                        "qtip{qtip_bits}-sim: WARN cannot open Hessian {p}: {e:?} — plain QTIP"
+                    );
                     None
                 }
             }
@@ -8901,11 +8928,11 @@ fn main() {
                 .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect();
 
-            // Prefer LDLQ when this tensor has a Hessian; else plain QTIP.
-            // LDLQ is 2-bit-specific (the qtip2_ldlq trellis); the 3-bit
-            // fallback always uses the plain (MSE) path.
+            // Prefer LDLQ (output-aware) when this tensor has a Hessian; else
+            // plain QTIP. The block-trellis OBS encode is now bit-parametric,
+            // so 3-bit gets the same Hessian-aware feedback as 2-bit.
             let key = t.name.strip_suffix(".weight").unwrap_or(&t.name);
-            let ldlq_out = qtip_hessian.as_ref().filter(|_| qtip_bits == 2).and_then(|sc| {
+            let ldlq_out = qtip_hessian.as_ref().and_then(|sc| {
                 let href = sc.get(key, 0)?;
                 if href.k != k {
                     return None;
@@ -8920,7 +8947,9 @@ fn main() {
                     diag_sum += href.at(i, i);
                 }
                 let damp = 0.01 * (diag_sum / k as f64).max(1e-12);
-                ldlq::qtip2_ldlq_dequant(&wf, m, k, &h, &qtip_s1, &qtip_s2, 128, damp)
+                ldlq::qtip_ldlq_dequant_bits(
+                    &wf, m, k, &h, &qtip_s1, &qtip_s2, 128, damp, qtip_bits,
+                )
             });
             match ldlq_out {
                 Some(deq) => {
