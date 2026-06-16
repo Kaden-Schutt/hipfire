@@ -36,6 +36,9 @@ mod gguf_input;
 // follow-up increment; allow dead_code until then.
 #[allow(dead_code)]
 mod qtip;
+// QTIP-LDLQ (Phase C1e) — output-aware trellis encode; wired in a follow-up.
+#[allow(dead_code)]
+mod ldlq;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
