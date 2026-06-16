@@ -233,10 +233,18 @@ Papers + reference implementations vendored for Phases C/D:
     Restructures qtip.rs: K=4 bits/step, 128 steps/256-group, codebook[state]
     = 2-vector. Biggest quality gain.
   - **C1g — L=16** trellis state (richer codebook; pairs with V=2).
-  - **C1h — finetune:** NOTE impractical on this box (torch is CPU-only; 0.8B
-    end-to-end finetune = hours/days). Deferred to a GPU-torch box, or skip.
+  - **C1h — finetune:** was "impractical (this box torch is CPU-only)" — but
+    **halo (172.16.16.20) unblocks it** (2026-06-16): Strix Halo gfx1151,
+    124 GB unified RAM, ROCm-7.13 torch 2.12 in `~/.venv` that runs on the
+    8060S GPU (matmul verified, ~3 TFLOP/s fp32 — iGPU-class but real GPU, not
+    CPU). `device_count()` reports 0 (gfx1151 enum quirk) but `device="cuda"`
+    tensors execute. So GPU torch (Hessian collection AND end-to-end finetune)
+    is now POSSIBLE — slow at 3 TFLOP/s, but feasible for the 0.8B over hours.
+  - **qtip3-sim fallback ✅ WIRED (2026-06-16):** bit-rate-parametric trellis
+    (`*_bits` fns) + `--format qtip3-sim`. Quantize + PPL pending.
   Realism: even the full stack reaches usable 2-bit mainly on 7B+; a 0.8B
-  dense model may not hit MQ4-usable regardless. Re-quantize+PPL after V=2.
+  dense model may not hit MQ4-usable regardless. halo's 124 GB also lets us
+  validate the QTIP-2 stack on a 7B+ model where the paper says it works.
 - **Phase C (earlier verdict, superseded): 2-bit QTIP FAILS (MSE-only).**
   Built `--format qtip2-sim` (simulated QTIP-2 → bf16, kernel-free PPL via
   the normal forward) + 1MAD codebook + sort-based beam encoder. PPL on
