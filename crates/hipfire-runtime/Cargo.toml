@@ -55,6 +55,7 @@ experimental-examples = []
 hipfire-coherence = { path = "../hipfire-coherence" }
 hipfire-eval = { path = "../hipfire-eval" }
 hipfire-evidence = { path = "../hipfire-evidence" }
+hipfire-generate = { path = "../hipfire-generate" }
 hipfire-model = { path = "../hipfire-model" }
 hipfire-prompt = { path = "../hipfire-prompt" }
 hip-bridge = { path = "../hip-bridge" }

@@ -1023,6 +1023,7 @@ dependencies = [
  "hipfire-dispatch",
  "hipfire-eval",
  "hipfire-evidence",
+ "hipfire-generate",
  "hipfire-model",
  "hipfire-prompt",
  "libc",

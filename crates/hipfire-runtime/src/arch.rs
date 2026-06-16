@@ -206,7 +206,7 @@ pub trait Architecture: Send + 'static {
 
 /// Per-arch overrides for the loop-guard n-gram blocker.
 ///
-/// The runtime's loop guard (`hipfire_runtime::loop_guard`) detects
+/// The generation loop guard (`hipfire_generate::loop_guard`) detects
 /// repeated n-grams in the recent decode window and blocks the
 /// repeating token before sampler draws it. Defaults come from env
 /// (`HIPFIRE_NGRAM_THRESHOLD`, `HIPFIRE_NGRAM_WINDOW`); per-arch

@@ -39,6 +39,7 @@ use hipfire_arch_qwen35::speculative::{
 };
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
+use hipfire_generate::loop_guard::{LoopGuard, StopReason};
 #[cfg(test)]
 use hipfire_generate::validate_qwen35_fused_dense_prefill_batch_preflight;
 use hipfire_generate::{
@@ -225,6 +226,11 @@ fn block_attractor_unclosed_cpu(
             *slot = f32::NEG_INFINITY;
         }
     }
+}
+
+fn loop_guard_from_runtime_config() -> LoopGuard {
+    let config = hipfire_runtime::config::get();
+    LoopGuard::new(config.ngram_loop_threshold, config.ngram_window)
 }
 
 //
@@ -13154,8 +13160,7 @@ fn generate_multi(
     let mut alert_fired = false;
     let mut think_count: usize = 0;
     let mut prev_in_think: bool = false;
-    let loop_guard =
-        hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
+    let loop_guard = loop_guard_from_runtime_config();
 
     while generated < max_tokens {
         generated += 1;
@@ -13286,9 +13291,7 @@ fn generate_multi(
         }
 
         // N-gram loop detector (token-side, no GPU work).
-        if let Some(hipfire_runtime::loop_guard::StopReason::NgramRepeat { count, .. }) =
-            loop_guard.check(&streamed_tokens)
-        {
+        if let Some(StopReason::NgramRepeat { count, .. }) = loop_guard.check(&streamed_tokens) {
             let window_len = loop_guard.window_len(streamed_tokens.len());
             let _ = writeln!(
                 stdout,
@@ -14449,11 +14452,10 @@ fn generate(
         // last `ngram_window` tokens, force EOS. This catches answer-phase
         // repetition loops that the think cap and repeat penalty miss.
         // Operates on token IDs (no decode overhead).
-        // Implementation lives in `hipfire_runtime::loop_guard`; defaults read from
+        // Implementation lives in `hipfire-generate` loop_guard; defaults read from
         // HIPFIRE_NGRAM_LOOP_THRESHOLD (default 8, 0 = disabled) and
         // HIPFIRE_NGRAM_WINDOW (default 256). See loop_guard.rs.
-        let loop_guard =
-            hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
+        let loop_guard = loop_guard_from_runtime_config();
 
         // `while` instead of `for 0..max_tokens` so budget-alert injection
         // (which increments `generated` beyond the iteration count) can't
@@ -14631,9 +14633,8 @@ fn generate(
             // N-gram loop detector: check if any 4-gram in the recent window
             // repeats excessively. When detected, emit an info message and
             // force EOS to prevent wasting the remaining token budget on
-            // repetitive output. Logic lives in `hipfire_runtime::loop_guard`.
-            if let Some(hipfire_runtime::loop_guard::StopReason::NgramRepeat { count, .. }) =
-                loop_guard.check(&streamed_tokens)
+            // repetitive output. Logic lives in `hipfire-generate` loop_guard.
+            if let Some(StopReason::NgramRepeat { count, .. }) = loop_guard.check(&streamed_tokens)
             {
                 let window_len = loop_guard.window_len(streamed_tokens.len());
                 let _ = writeln!(
@@ -17181,8 +17182,7 @@ fn generate_vl(
 
     // N-gram loop detector — mirrors the text path. Catches answer-phase
     // attractor loops that the think cap and repeat penalty miss.
-    let loop_guard =
-        hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
+    let loop_guard = loop_guard_from_runtime_config();
 
     while generated < max_tokens {
         generated += 1;
@@ -17224,9 +17224,7 @@ fn generate_vl(
             break;
         }
 
-        if let Some(hipfire_runtime::loop_guard::StopReason::NgramRepeat { count, .. }) =
-            loop_guard.check(&streamed_tokens)
-        {
+        if let Some(StopReason::NgramRepeat { count, .. }) = loop_guard.check(&streamed_tokens) {
             let window_len = loop_guard.window_len(streamed_tokens.len());
             let _ = writeln!(
                 stdout,

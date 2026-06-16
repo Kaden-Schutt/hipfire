@@ -4,6 +4,8 @@
 
 //! Typed generation request, event, and batch-plan contracts.
 
+pub mod loop_guard;
+
 use hipfire_model::{has_worker_or_model_identity, is_qwen35_dense_arch_id, is_qwen35_moe_arch_id};
 use hipfire_prompt::{
     openai_chat_last_user_prompt, openai_chat_messages_to_prompt_messages, Message,

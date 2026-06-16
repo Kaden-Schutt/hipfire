@@ -55,6 +55,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Rust server `/health` now consumes scheduler-owned JSON builders for scheduler-derived prefill/decode/state-cache metadata while live Rust request handling remains daemon-serial.
 - Rust server `/health.runtime_workers` now consumes `hipfire-state` runtime-worker health summary rendering, currently reporting an empty adapter state until Rust owns resident workers.
 - Generate Qwen3.5 dense/MoE batch backend selection and decode scheduler fallback metadata now reuse `hipfire-model` architecture classification instead of local numeric arch checks.
+- Daemon text/VL generation loop guards now consume `hipfire-generate` ownership directly; `hipfire-runtime::loop_guard` remains only as a source-compatible wrapper over the generate-owned policy.
 - Runtime tokenizer compatibility signatures now reuse `hipfire-model` fingerprint policy, and tokenizer parsing plus encode/decode now live in `hipfire-model` behind the `hipfire-runtime::tokenizer` compatibility re-export.
 - Runtime HFQ tokenizer metadata selection, optional safetensors `tokenizer.json` sidecar read policy, and HFQ chat-template extraction now reuse `hipfire-model`; GGUF and tokenizer runtime adapters stay as compatibility re-exports in `hipfire-runtime`.
 - Daemon load paths, runtime calibration, and Qwen3.5 PFlash/speculative code now import tokenizer contracts directly from `hipfire-model` instead of through `hipfire-runtime`.
