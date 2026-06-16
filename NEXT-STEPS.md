@@ -238,11 +238,27 @@ Papers + reference implementations vendored for Phases C/D:
     rescaling), and `quantize_mq2g256_lloyd_gptq` (a working GPTQ-LDLQ for
     2-bit Lloyd). So QTIP-LDLQ = **swap that path's Lloyd scalar quantizer
     for the trellis `beam_encode_group` on the feedback-adjusted target.**
-    Steps: (1) `collect_hessian` on 0.8B+calib → HFHS Hessians; (2) new
-    `quantize_qtip2_ldlq`: FWHT-rotate H+W, Cholesky/LDL, block-sequential
-    trellis encode with OBS feedback (mirror `quantize_mq2g256_lloyd_gptq`);
-    (3) re-quantize qtip2-ldlq-sim → PPL vs MQ4. Target: PPL ≪ 125 (toward
-    MQ4's 14 / better).
+    Steps & exact design (scoped 2026-06-16):
+    - **Hessians:** native `collect_hessian` is a SCAFFOLD (panics) — use the
+      Tier-2 Python collector `scripts/collect_hessian.py` (torch CPU-only
+      here, so slow; offline tooling, Rule-1-OK). HFHS read by `hessian_io.rs`.
+    - **Template = `gptq.rs::gptq_pipeline_mq4g256`** (full LDLQ for MQ4):
+      `apply_awq_rescaling` → `fwht_similarity_per_256(H)` →
+      `symmetrize_in_place` → `apply_fwht_per_256_to_weights_f64(W)` →
+      `gptq_column_sequential` (OBS via inverse-Cholesky) → pack. All these
+      helpers are pub + reusable.
+    - **New piece = `gptq_pipeline_qtip2`:** same prologue, but replace the
+      per-element MQ4 quantizer in the OBS loop with a **block-sequential
+      trellis**: process k-columns in 256-blocks, trellis-encode each block
+      (`beam_encode_group` on the OBS-feedback-adjusted target), propagate
+      the block residual to later columns via the inverse-Cholesky factor
+      (cf. QTIP `ldlq.py` block loop). v1 keeps the 1D-group scalar trellis
+      (not QTIP's 2D-tile V=2) — a deliberate simplification to validate the
+      Hessian-feedback win first.
+    - Re-quantize qtip2-ldlq-sim → PPL vs MQ4. Target: PPL ≪ 125 → toward
+      MQ4's 14 / below. NOTE: existing `quantize_mq2g256_lloyd_gptq` is only
+      a *diagonal* (imatrix) GPTQ, not full-Hessian — must use the
+      gptq_pipeline (full H) path.
   - **3-bit QTIP fallback (plan default):** make bits configurable, quantize
     qtip3-sim, PPL. Quick; modest bandwidth win vs MQ4.
   Then C2 decode kernel (only worth building once a bit-rate passes PPL).
