@@ -9,10 +9,9 @@
   - `hipfire-model` now owns a shared accelerator inventory/device contract,
     `/health.runtime_workers` reports the shared inventory payload, and the
     daemon exposes a typed JSONL `inventory` command;
-  - server health currently reports `source=not_probed` until it polls daemon
-    inventory, while worker identity carries accelerator kind/device id;
-  - report per-device id, arch, VRAM, integrated/discrete class, and HIP
-    runtime from the server using daemon inventory;
+  - server health polls daemon inventory when a daemon is already running and
+    otherwise reports `source=not_probed`, while worker identity carries
+    accelerator kind/device id;
   - probe available NPUs/XDNA devices separately when present;
   - make the priority microbatching scheduler route by worker/device capability
     instead of using a single server-selected HIP placement.
