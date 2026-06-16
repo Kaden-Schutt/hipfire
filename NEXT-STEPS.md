@@ -333,12 +333,23 @@ Papers + reference implementations vendored for Phases C/D:
     57.4 tok/s). After Q8: **qtip3 480 MB < mq4 549 MB (13% smaller)**, PPL holds
     **15.20**, decode 40.9→53.3 tok/s. Fair same-2039-token-window: qtip3 ~37 ≈
     mq4 ~38 tok/s.
-  - **PERF FINDING:** the 13% byte saving does NOT yet convert to a tok/s win —
-    qtip3 is competitive-but-not-faster. The first-cut trellis kernel's extra
-    ALU (per-lane 1MAD hash ×8) + untuned occupancy (39 VGPR, generic launch)
-    offsets the smaller weight reads on the bandwidth-bound 780M. Converting
-    bytes→tok/s needs **C3 gfx1103 retune** (occupancy, LDS-codebook vs
-    recompute tradeoff, multi-row). C2b prefill GEMM also remains.
+  - **PERF FINDING (measured):** the 13% byte saving does NOT yet convert to a
+    tok/s win. Bandwidth math: qtip3 reads ~14% fewer bytes/token than mq4
+    (transformer 0.39 vs 0.53 B/w; Q8 lm_head equal). Measured: qtip3 53.3 vs
+    mq4 56.9 tok/s (~6% SLOWER). Slower-despite-fewer-bytes ⇒ the qtip3 GEMV is
+    **ALU/occupancy-bound, NOT bandwidth-bound** (per-lane: 8× 1MAD hash+renorm,
+    39 VGPR, generic launch). **C3 has ~20% real headroom** (−6% → +14% ceiling).
+    - **C3 NEXT (needs rocprof, not speculation):** rocprofv3 the qtip3 GEMV to
+      confirm ALU-vs-occupancy limiter, then the right lever: (a) cut trellis
+      ALU (accumulate group dot before the single scale-mul; wider symbol loads),
+      (b) lift occupancy (VGPR pressure from the 8 unrolled states — loop vs
+      unroll tradeoff), or (c) multi-row to amortize launch overhead on the tiny
+      model. LDS-codebook is OUT (4096×4B=16KB → occupancy collapse 16→4
+      blocks/CU on gfx1103's 64KB LDS). C2b prefill GEMM also remains.
+    - NOTE: on the 0.8B specifically the win is partly Amdahl-capped — Q8 lm_head
+      (≈254 MB/token) is read equally by both, so the transformer-weight delta
+      is ~14% of total; the full qtip3 bandwidth advantage shows more on larger
+      models where transformer weights dominate the per-token stream.
 - **Phase C: (superseded) ACTIVE — LDLQ landed; pushing the rest of the QTIP stack.**
   C1e DONE end-to-end: clean-room `ldlq.rs` (inverse-Cholesky 1e-13, per-256
   Hessian FWHT rotation, block-trellis OBS) + `hessian_io` wired +
