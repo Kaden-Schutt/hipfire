@@ -907,6 +907,43 @@ mod tests {
         assert!(bpw < 0.40, "QTIP-3 must be < 0.40 B/weight");
     }
 
+    /// C2 kernel correctness: the GPU kernel decodes each weight independently
+    /// from a 4-symbol sliding window (`state_i = last 4 symbols ending at i`),
+    /// NOT by walking the trellis sequentially. This test replicates the
+    /// kernel's exact per-lane math (the `ST(a,b,c,d)` window in
+    /// gemv_qtip3g256.hip) and asserts it reproduces the sequential
+    /// `decode_group_bits` output bit-for-bit — i.e. the parallel decode the
+    /// kernel relies on is equivalent to the reference. Guards against window
+    /// off-by-one / leading-zero-padding bugs in the kernel.
+    #[test]
+    fn kernel_window_decode_matches_sequential_trellis() {
+        let cb = build_codebook();
+        let mut rng = Lcg(0xC2_F00D);
+        let group: Vec<f32> = (0..256).map(|_| rng.next_normal()).collect();
+        let scale0 = group_scale(&group);
+        let sym = beam_encode_group_bits(&group, scale0, &cb, 128, 3);
+        let scale = optimal_scale_bits(&group, &sym, &cb, 3);
+
+        // Sequential reference (what the sim/PPL used).
+        let seq = decode_group_bits(&sym, scale, &cb, 3);
+
+        // Parallel 4-symbol-window decode (the kernel's method): state at i is
+        // the last 4 symbols ending at i, leading-zero-padded at the start.
+        let s = |k: i32| -> u32 {
+            if k < 0 {
+                0
+            } else {
+                sym[k as usize] as u32 & 7
+            }
+        };
+        let mut par = vec![0.0f32; 256];
+        for i in 0..256i32 {
+            let state = ((s(i - 3) << 9) | (s(i - 2) << 6) | (s(i - 1) << 3) | s(i)) & 0xFFF;
+            par[i as usize] = scale * cb[state as usize];
+        }
+        assert_eq!(seq, par, "kernel window decode must match sequential trellis");
+    }
+
     #[test]
     fn beam_encode_is_near_viterbi() {
         let cb = build_codebook();
