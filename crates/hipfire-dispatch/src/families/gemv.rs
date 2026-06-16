@@ -486,6 +486,8 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         // prerotated
         K::GemvMq4G256Prerotated => hip!(gpu.gemv_mq4g256_prerotated(w.buf, x, y, m, k)),
         K::GemvMq3G256Prerotated => hip!(gpu.gemv_mq3g256_prerotated(w.buf, x, y, m, k)),
+        // QTIP-3: x is pre-FWHT-rotated; the plain trellis kernel does y = W·x_rot.
+        K::GemvQtip3G256Prerotated => hip!(gpu.gemv_qtip3g256(w.buf, x, y, m, k)),
         K::GemvMq2G256Prerotated => hip!(gpu.gemv_mq2g256_prerotated(w.buf, x, y, m, k)),
         K::GemvMq6G256Prerotated => hip!(gpu.gemv_mq6g256_prerotated(w.buf, x, y, m, k)),
         K::GemvMq4G128 => hip!(gpu.gemv_mq4g128_prerotated(w.buf, x, y, m, k)),

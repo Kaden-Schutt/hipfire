@@ -111,8 +111,8 @@ pub enum RotationPlan {
 pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
     use DType::*;
     match dtype {
-        MQ4G256 | MQ3G256 | MQ2G256 | MQ6G256 | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd
-        | MFP4G32 => RotationPlan::FwhtG256,
+        MQ4G256 | MQ3G256 | Qtip3G256 | MQ2G256 | MQ6G256 | MQ2G256Lloyd | MQ3G256Lloyd
+        | MQ4G256Lloyd | MFP4G32 => RotationPlan::FwhtG256,
         MQ4G128 => RotationPlan::FwhtG128,
         MQ8G256 => RotationPlan::Mq8Internal,
         ParoQ4G128 => RotationPlan::Givens,
@@ -127,8 +127,8 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
     use DType::*;
     match dtype {
         ParoQ4G128 => GemvVariant::Plain,
-        MQ4G256 | MQ3G256 | MQ2G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd | MQ3G256Lloyd
-        | MQ4G256Lloyd | MFP4G32 | MQ4G128 => GemvVariant::Prerotated,
+        MQ4G256 | MQ3G256 | Qtip3G256 | MQ2G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd
+        | MQ3G256Lloyd | MQ4G256Lloyd | MFP4G32 | MQ4G128 => GemvVariant::Prerotated,
         _ => GemvVariant::Plain,
     }
 }
@@ -207,6 +207,7 @@ pub enum KernelKey {
     // GEMV prerotated
     GemvMq4G256Prerotated,
     GemvMq3G256Prerotated,
+    GemvQtip3G256Prerotated,
     GemvMq2G256Prerotated,
     GemvMq6G256Prerotated,
     GemvMq8G256Prerotated,
@@ -569,6 +570,7 @@ impl KernelKey {
         match dtype {
             MQ4G256 => Ok(Self::GemvMq4G256Prerotated),
             MQ3G256 => Ok(Self::GemvMq3G256Prerotated),
+            Qtip3G256 => Ok(Self::GemvQtip3G256Prerotated),
             MQ2G256 => Ok(Self::GemvMq2G256Prerotated),
             MQ6G256 => Ok(Self::GemvMq6G256Prerotated),
             MQ8G256 => Ok(Self::GemvMq8G256Prerotated),
