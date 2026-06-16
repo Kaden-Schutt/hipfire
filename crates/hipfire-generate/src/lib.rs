@@ -4,6 +4,7 @@
 
 //! Typed generation request, event, and batch-plan contracts.
 
+pub mod eos_filter;
 pub mod loop_guard;
 
 use hipfire_model::{has_worker_or_model_identity, is_qwen35_dense_arch_id, is_qwen35_moe_arch_id};

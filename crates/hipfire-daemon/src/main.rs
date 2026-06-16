@@ -39,6 +39,7 @@ use hipfire_arch_qwen35::speculative::{
 };
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
+use hipfire_generate::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_generate::loop_guard::{LoopGuard, StopReason};
 #[cfg(test)]
 use hipfire_generate::validate_qwen35_fused_dense_prefill_batch_preflight;
@@ -68,7 +69,6 @@ use hipfire_model::{
 use hipfire_prompt as prompt_frame;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
-use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::multi_gpu::Gpus;

@@ -254,7 +254,7 @@ pub struct PromptFrameOverrides {
 
 /// Per-arch overrides for EOS / end-of-turn filtering.
 ///
-/// `hipfire_runtime::eos_filter` owns visible-stream EOS detection.
+/// `hipfire_generate::eos_filter` owns visible-stream EOS detection.
 /// The default implementation handles ChatML `<|im_end|>` plus
 /// `<think>` strip; per-arch overrides extend to additional markers.
 #[derive(Debug, Clone, Default)]
