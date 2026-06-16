@@ -436,6 +436,81 @@ pub fn beam_encode_group_v2(
     symbols
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Real packed QTIP-3 group format (Phase C2 prerequisite). The qtip3-sim path
+// stores bf16 (for a kernel-free PPL verdict); the *real* bandwidth win needs
+// the packed 3-bit symbol stream on disk, which the C2 fused decode-GEMV kernel
+// reads. Layout per 256-weight group: [f32 scale][96 B packed 3-bit symbols] =
+// 100 B/group (0.39 B/weight vs MQ4's 0.53). NO zero-point — the QTIP codebook
+// is zero-mean by construction (`build_codebook` renorm), unlike MQ3's
+// [scale][zero][96 B]=104 B. The 8-symbols×3-bits→3-bytes bit-packing matches
+// MQ3's `quantize_hfq3g256` exactly, so the kernel's bit-window unpack is the
+// same; only the per-symbol *meaning* (trellis code → computed codebook) and
+// the absence of a zero differ.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Bytes per packed QTIP-3 group: 4 (f32 scale) + 96 (256×3-bit symbols).
+pub const QTIP3_BLOCK_BYTES: usize = 100;
+/// QTIP group size in weights.
+pub const QTIP3_GROUP: usize = 256;
+
+/// Pack 8 three-bit symbols into 3 bytes (little-endian bitstream), matching
+/// the MQ3 GEMV kernel's unpack window. Shared by pack/unpack below.
+#[inline]
+fn pack8_3bit(q: &[u8; 8]) -> [u8; 3] {
+    let b0 = (q[0] & 7) | ((q[1] & 7) << 3) | ((q[2] & 3) << 6);
+    let b1 = ((q[2] >> 2) & 1) | ((q[3] & 7) << 1) | ((q[4] & 7) << 4) | ((q[5] & 1) << 7);
+    let b2 = ((q[5] >> 1) & 3) | ((q[6] & 7) << 2) | ((q[7] & 7) << 5);
+    [b0, b1, b2]
+}
+
+/// Inverse of `pack8_3bit`.
+#[inline]
+fn unpack8_3bit(b: &[u8; 3]) -> [u8; 8] {
+    [
+        b[0] & 7,
+        (b[0] >> 3) & 7,
+        ((b[0] >> 6) | (b[1] << 2)) & 7,
+        (b[1] >> 1) & 7,
+        (b[1] >> 4) & 7,
+        ((b[1] >> 7) | (b[2] << 1)) & 7,
+        (b[2] >> 2) & 7,
+        (b[2] >> 5) & 7,
+    ]
+}
+
+/// Pack one 256-symbol QTIP-3 group (3-bit trellis symbols + scale) into the
+/// 100-byte on-disk record the C2 kernel reads.
+pub fn pack_qtip3_group(symbols: &[u8], scale: f32) -> Vec<u8> {
+    assert_eq!(symbols.len(), QTIP3_GROUP, "QTIP-3 group is 256 symbols");
+    let mut out = vec![0u8; QTIP3_BLOCK_BYTES];
+    out[0..4].copy_from_slice(&scale.to_le_bytes());
+    for chunk in 0..32 {
+        let mut q = [0u8; 8];
+        for (j, qj) in q.iter_mut().enumerate() {
+            *qj = symbols[chunk * 8 + j] & 7;
+        }
+        let packed = pack8_3bit(&q);
+        let bo = 4 + chunk * 3;
+        out[bo..bo + 3].copy_from_slice(&packed);
+    }
+    out
+}
+
+/// Unpack a 100-byte QTIP-3 record → (256 symbols, scale).
+pub fn unpack_qtip3_group(bytes: &[u8]) -> (Vec<u8>, f32) {
+    assert_eq!(bytes.len(), QTIP3_BLOCK_BYTES);
+    let scale = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let mut symbols = vec![0u8; QTIP3_GROUP];
+    for chunk in 0..32 {
+        let bo = 4 + chunk * 3;
+        let b = [bytes[bo], bytes[bo + 1], bytes[bo + 2]];
+        let q = unpack8_3bit(&b);
+        symbols[chunk * 8..chunk * 8 + 8].copy_from_slice(&q);
+    }
+    (symbols, scale)
+}
+
 /// Per-group scale: RMS of the rotated weights (codebook is unit-variance,
 /// zero-mean, so RMS ≈ the optimal single scale for ≈Gaussian input). Used to
 /// drive the Viterbi search; refine with `optimal_scale` after encoding.
@@ -797,6 +872,39 @@ mod tests {
         eprintln!("QTIP-2 MSE={mse2:.6}  QTIP-3 MSE={mse3:.6}  (3/2={:.3})", mse3 / mse2);
         assert_eq!(s3.len(), 256, "3-bit emits one symbol per weight (V=1)");
         assert!(mse3 < mse2, "3-bit must reconstruct better than 2-bit: {mse3} vs {mse2}");
+    }
+
+    /// C2 prerequisite: the real packed QTIP-3 record round-trips bit-exactly,
+    /// and decoding from the unpacked symbols reproduces the direct
+    /// `decode_group_bits` output — i.e. the on-disk format the kernel reads is
+    /// faithful to the sim that was PPL-validated (15.20). Guards the byte
+    /// layout the GEMV kernel will depend on.
+    #[test]
+    fn qtip3_pack_roundtrip_matches_decode() {
+        let cb = build_codebook();
+        let mut rng = Lcg(0x9051_3B17);
+        let group: Vec<f32> = (0..256).map(|_| rng.next_normal()).collect();
+        let scale0 = group_scale(&group);
+
+        let sym = beam_encode_group_bits(&group, scale0, &cb, 128, 3);
+        let scale = optimal_scale_bits(&group, &sym, &cb, 3);
+
+        // Pack → unpack must recover symbols + scale exactly.
+        let rec = pack_qtip3_group(&sym, scale);
+        assert_eq!(rec.len(), QTIP3_BLOCK_BYTES);
+        let (sym2, scale2) = unpack_qtip3_group(&rec);
+        assert_eq!(sym, sym2, "packed symbols must round-trip bit-exactly");
+        assert_eq!(scale.to_bits(), scale2.to_bits(), "scale must round-trip");
+
+        // Decode from the unpacked record == direct decode (kernel faithfulness).
+        let direct = decode_group_bits(&sym, scale, &cb, 3);
+        let from_pack = decode_group_bits(&sym2, scale2, &cb, 3);
+        assert_eq!(direct, from_pack, "decode from packed record must match direct");
+
+        // Format is 0.39 B/weight: 100 B / 256 weights.
+        let bpw = QTIP3_BLOCK_BYTES as f64 / QTIP3_GROUP as f64;
+        eprintln!("QTIP-3 packed: {QTIP3_BLOCK_BYTES} B/group = {bpw:.3} B/weight (MQ4=0.53)");
+        assert!(bpw < 0.40, "QTIP-3 must be < 0.40 B/weight");
     }
 
     #[test]

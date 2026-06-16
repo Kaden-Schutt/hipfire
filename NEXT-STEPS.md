@@ -234,9 +234,21 @@ Papers + reference implementations vendored for Phases C/D:
   **3-bit QTIP = usable** (+8.3% PPL for 25% less weight bandwidth than MQ4).
   2-bit stays unusable on the 0.8B even with LDLQ. DECISION: ship 3-bit; the
   halo 2-bit finetune (C1h) is NOT worth multi-hours given 3-bit already lands
-  at MQ4-class quality. Remaining Phase C work: **C2 fused qtip3 decode GEMV**
-  (the actual bandwidth win — the sim proves quality, not speed; sim runs at
-  bf16 speed 14.9 tok/s) + C2b prefill GEMM + C3 gfx1103 retune.
+  at MQ4-class quality.
+  - **Packed QTIP-3 format ✅ LANDED (2026-06-16):** `qtip.rs`
+    `pack_qtip3_group`/`unpack_qtip3_group` + `QTIP3_BLOCK_BYTES=100`
+    ([f32 scale][96 B 3-bit symbols], no zero-point — codebook is zero-mean).
+    **0.391 B/weight** (26% < MQ4's 0.53). Round-trips bit-exactly; decode from
+    the packed record == direct decode (kernel-faithful). 8×3-bit→3B packing
+    matches MQ3's, so the kernel bit-window unpack is shared.
+  - Remaining Phase C work (GPU-kernel, needs design input + GPU iteration):
+    **C2 fused qtip3 decode GEMV** — decode the bitshift trellis on-the-fly
+    (parallel sliding-window 1MAD hash → computed codebook, ~zero LDS) × x,
+    accumulate; OPEN DESIGN: LDS-codebook vs recompute-per-lane, wave32 layout,
+    K2/K4 unroll (cf. the mq3 `_residual` kernels). Then real `--format qtip3`
+    emit (replace the sim post-pass with packed output + QuantType::Qtip3G256 +
+    loader/dispatch + qwen35 call sites), parity vs sim, coherence + fresh-probe
+    perf. C2b prefill GEMM + C3 gfx1103 retune follow.
 - **Phase C: (superseded) ACTIVE — LDLQ landed; pushing the rest of the QTIP stack.**
   C1e DONE end-to-end: clean-room `ldlq.rs` (inverse-Cholesky 1e-13, per-256
   Hessian FWHT rotation, block-trellis OBS) + `hessian_io` wired +
