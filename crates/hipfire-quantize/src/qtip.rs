@@ -80,10 +80,25 @@ pub fn build_codebook() -> Vec<f32> {
 /// here only for the reference; each output depends solely on its own bit
 /// window, so it is parallelizable.
 pub fn decode_group(symbols: &[u8], scale: f32, codebook: &[f32]) -> Vec<f32> {
+    decode_group_bits(symbols, scale, codebook, BITS_PER_WEIGHT)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Bit-rate-parametric V=1 trellis (Phase C 3-bit fallback). The codebook is
+// a pure state→value map (`build_codebook`, depends only on STATE_BITS), so it
+// is shared across bit-rates; only the per-step symbol count (2^bits) and the
+// shift width change. `STATE_BITS=12` stays fixed, so the sliding window is
+// `12/bits` symbols (4 syms @ 2-bit, 4 syms @ 3-bit). The 2-bit public
+// functions delegate here with `bits=2`; 3-bit (qtip3-sim) calls them directly.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// `bits`-parametric trellis decode. See `decode_group`.
+pub fn decode_group_bits(symbols: &[u8], scale: f32, codebook: &[f32], bits: u32) -> Vec<f32> {
+    let sym_mask = (1u32 << bits) - 1;
     let mut state: u32 = 0;
     let mut out = Vec::with_capacity(symbols.len());
     for &sym in symbols {
-        state = ((state << BITS_PER_WEIGHT) | (sym as u32 & (NUM_SYMBOLS as u32 - 1))) & STATE_MASK;
+        state = ((state << bits) | (sym as u32 & sym_mask)) & STATE_MASK;
         out.push(scale * codebook[state as usize]);
     }
     out
@@ -160,6 +175,18 @@ pub fn beam_encode_group(
     codebook: &[f32],
     beam_width: usize,
 ) -> Vec<u8> {
+    beam_encode_group_bits(weights, scale, codebook, beam_width, BITS_PER_WEIGHT)
+}
+
+/// `bits`-parametric beam-search trellis encode. See `beam_encode_group`.
+pub fn beam_encode_group_bits(
+    weights: &[f32],
+    scale: f32,
+    codebook: &[f32],
+    beam_width: usize,
+    bits: u32,
+) -> Vec<u8> {
+    let num_symbols = 1usize << bits;
     let n = weights.len();
     // Active beam: (state, cumulative_cost). Start at state 0 (leading zeros).
     let mut beam: Vec<(u32, f64)> = vec![(0u32, 0.0)];
@@ -168,14 +195,14 @@ pub fn beam_encode_group(
     // Reused candidate scratch — avoids per-step allocation (the old HashMap
     // path allocated per step, ~17× slower; sort-based dedup is allocation-free
     // after warmup).
-    let mut cand: Vec<(u32, f64, u32, u8)> = Vec::with_capacity(beam_width * NUM_SYMBOLS);
+    let mut cand: Vec<(u32, f64, u32, u8)> = Vec::with_capacity(beam_width * num_symbols);
 
     for &w in weights {
         let w = w as f64;
         cand.clear();
         for (bi, &(s_prev, c_prev)) in beam.iter().enumerate() {
-            let base = (s_prev << BITS_PER_WEIGHT) & STATE_MASK;
-            for sym in 0..NUM_SYMBOLS as u32 {
+            let base = (s_prev << bits) & STATE_MASK;
+            for sym in 0..num_symbols as u32 {
                 let s_new = base | sym;
                 let diff = w - scale as f64 * codebook[s_new as usize] as f64;
                 cand.push((s_new, c_prev + diff * diff, bi as u32, sym as u8));
@@ -425,10 +452,16 @@ pub fn group_scale(weights: &[f32]) -> f32 {
 /// Strictly ≤ the MSE of any other scale (including the RMS seed), near-free.
 /// This is the scale that should be STORED per group.
 pub fn optimal_scale(weights: &[f32], symbols: &[u8], codebook: &[f32]) -> f32 {
+    optimal_scale_bits(weights, symbols, codebook, BITS_PER_WEIGHT)
+}
+
+/// `bits`-parametric closed-form optimal scale. See `optimal_scale`.
+pub fn optimal_scale_bits(weights: &[f32], symbols: &[u8], codebook: &[f32], bits: u32) -> f32 {
+    let sym_mask = (1u32 << bits) - 1;
     let mut state: u32 = 0;
     let (mut num, mut den) = (0.0f64, 0.0f64);
     for (i, &sym) in symbols.iter().enumerate() {
-        state = ((state << BITS_PER_WEIGHT) | (sym as u32 & (NUM_SYMBOLS as u32 - 1))) & STATE_MASK;
+        state = ((state << bits) | (sym as u32 & sym_mask)) & STATE_MASK;
         let c = codebook[state as usize] as f64;
         num += weights[i] as f64 * c;
         den += c * c;
@@ -742,6 +775,28 @@ mod tests {
         // Round-trip sanity: V=2 must at least clearly beat uniform-2.
         let u2 = mse(&group, &uniform_nbit_roundtrip(&group, 2));
         assert!(v2 < u2 * 0.6, "V=2 should beat uniform-2: {v2} vs {u2}");
+    }
+
+    /// Phase C 3-bit fallback: the bits-parametric path must reconstruct
+    /// strictly better at 3 bits than at 2 (one extra bit/weight → finer
+    /// per-step symbol resolution against the shared codebook). Validates that
+    /// `*_bits` plumbing (shift width + symbol count) is wired correctly and
+    /// that 3-bit is the bandwidth/quality fallback it's meant to be.
+    #[test]
+    fn qtip3_beats_qtip2_reconstruction() {
+        let cb = build_codebook();
+        let mut rng = Lcg(0x3B17_3B17);
+        let group: Vec<f32> = (0..256).map(|_| rng.next_normal()).collect();
+        let scale0 = group_scale(&group);
+
+        let s2 = beam_encode_group_bits(&group, scale0, &cb, 128, 2);
+        let mse2 = mse(&group, &decode_group_bits(&s2, optimal_scale_bits(&group, &s2, &cb, 2), &cb, 2));
+        let s3 = beam_encode_group_bits(&group, scale0, &cb, 128, 3);
+        let mse3 = mse(&group, &decode_group_bits(&s3, optimal_scale_bits(&group, &s3, &cb, 3), &cb, 3));
+
+        eprintln!("QTIP-2 MSE={mse2:.6}  QTIP-3 MSE={mse3:.6}  (3/2={:.3})", mse3 / mse2);
+        assert_eq!(s3.len(), 256, "3-bit emits one symbol per weight (V=1)");
+        assert!(mse3 < mse2, "3-bit must reconstruct better than 2-bit: {mse3} vs {mse2}");
     }
 
     #[test]

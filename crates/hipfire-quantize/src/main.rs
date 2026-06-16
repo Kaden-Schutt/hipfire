@@ -935,14 +935,24 @@ fn f32_slice_to_bf16_bytes(d: &[f32]) -> Vec<u8> {
     out
 }
 
-/// Simulated QTIP-2 quantization of a 2D weight (row-major `m × k`), in place.
-/// Per row, per 256-group: FWHT-rotate (incoherence) → beam-encode trellis →
-/// optimal scale → decode → inverse-rotate (FWHT is orthogonal, so the inverse
-/// is `cpu_fwht_256` with the sign args swapped). The result is the *effective*
-/// weight a fused QTIP kernel would compute, so running it through the normal
-/// bf16 forward gives a faithful QTIP-2 PPL without the GPU kernel. The `k%256`
-/// tail (if any) is left unquantized. Parallel over rows.
-fn qtip_simquant_2d(f32_data: &mut [f32], k: usize, cb: &[f32], signs1: &[f32], signs2: &[f32]) {
+/// Simulated QTIP quantization of a 2D weight (row-major `m × k`), in place,
+/// bit-rate-parametric (Phase C: 2-bit primary, 3-bit fallback). Per row, per
+/// 256-group: FWHT-rotate (incoherence) → beam-encode trellis → optimal scale →
+/// decode → inverse-rotate (FWHT is orthogonal, so the inverse is `cpu_fwht_256`
+/// with the sign args swapped). `bits` selects the per-step symbol count; the
+/// codebook is bit-rate-independent (state→value map), so the same `cb` serves
+/// both 2- and 3-bit. The result is the *effective* weight a fused QTIP kernel
+/// would compute, so running it through the normal bf16 forward gives a faithful
+/// QTIP PPL without the GPU kernel. The `k%256` tail (if any) is left
+/// unquantized. Parallel over rows.
+fn qtip_simquant_nbit(
+    f32_data: &mut [f32],
+    k: usize,
+    cb: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+    bits: u32,
+) {
     use rayon::prelude::*;
     let groups = k / 256;
     if groups == 0 {
@@ -955,9 +965,9 @@ fn qtip_simquant_2d(f32_data: &mut [f32], k: usize, cb: &[f32], signs1: &[f32], 
             grp.copy_from_slice(seg);
             cpu_fwht_256(&mut grp, signs1, signs2); // rotate
             let scale0 = qtip::group_scale(&grp);
-            let sym = qtip::beam_encode_group(&grp, scale0, cb, 128);
-            let scale = qtip::optimal_scale(&grp, &sym, cb);
-            let mut deq = qtip::decode_group(&sym, scale, cb);
+            let sym = qtip::beam_encode_group_bits(&grp, scale0, cb, 128, bits);
+            let scale = qtip::optimal_scale_bits(&grp, &sym, cb, bits);
+            let mut deq = qtip::decode_group_bits(&sym, scale, cb, bits);
             cpu_fwht_256(&mut deq, signs2, signs1); // inverse rotate (swap signs)
             seg.copy_from_slice(&deq);
         }
@@ -5586,11 +5596,18 @@ fn main() {
     // qtip2-sim: emit a bf16 .hfq whose 2D weights carry *simulated* QTIP-2
     // error (FWHT-rotated bitshift-trellis, beam=128), for a kernel-free PPL
     // verdict via the normal bf16 forward. Embeddings/lm_head kept bf16.
-    let use_qtip_sim = format == "qtip2-sim";
+    // qtip3-sim: the 3-bit fallback (Phase C). 2-bit QTIP is unusable on the
+    // 0.8B dense model (PPL 53.6 with LDLQ vs MQ4 14.0); 3-bit is still a
+    // bandwidth win vs MQ4 and the documented fallback. Same trellis, bits=3.
+    let use_qtip2_sim = format == "qtip2-sim";
+    let use_qtip3_sim = format == "qtip3-sim";
+    let use_qtip_sim = use_qtip2_sim || use_qtip3_sim;
+    let qtip_bits: u32 = if use_qtip3_sim { 3 } else { 2 };
     let use_bf16 = format == "bf16" || format == "bfloat16" || use_qtip_sim;
     let (qtip_cb, qtip_s1, qtip_s2) = if use_qtip_sim {
         eprintln!(
-            "qtip2-sim: simulated QTIP-2 on 2D weights (FWHT + bitshift trellis beam=128) → bf16"
+            "qtip{qtip_bits}-sim: simulated QTIP-{qtip_bits} on 2D weights \
+             (FWHT + bitshift trellis beam=128) → bf16"
         );
         (
             qtip::build_codebook(),
@@ -8864,8 +8881,10 @@ fn main() {
                 .collect();
 
             // Prefer LDLQ when this tensor has a Hessian; else plain QTIP.
+            // LDLQ is 2-bit-specific (the qtip2_ldlq trellis); the 3-bit
+            // fallback always uses the plain (MSE) path.
             let key = t.name.strip_suffix(".weight").unwrap_or(&t.name);
-            let ldlq_out = qtip_hessian.as_ref().and_then(|sc| {
+            let ldlq_out = qtip_hessian.as_ref().filter(|_| qtip_bits == 2).and_then(|sc| {
                 let href = sc.get(key, 0)?;
                 if href.k != k {
                     return None;
@@ -8888,13 +8907,13 @@ fn main() {
                     n_ldlq += 1;
                 }
                 None => {
-                    qtip_simquant_2d(&mut wf, k, &qtip_cb, &qtip_s1, &qtip_s2);
+                    qtip_simquant_nbit(&mut wf, k, &qtip_cb, &qtip_s1, &qtip_s2, qtip_bits);
                     t.data = f32_slice_to_bf16_bytes(&wf);
                     n_plain += 1;
                 }
             }
         }
-        eprintln!("  qtip2-sim: LDLQ on {n_ldlq} tensors, plain-QTIP on {n_plain}");
+        eprintln!("  qtip{qtip_bits}-sim: LDLQ on {n_ldlq} tensors, plain-QTIP on {n_plain}");
     }
 
     // Write .hfq file
