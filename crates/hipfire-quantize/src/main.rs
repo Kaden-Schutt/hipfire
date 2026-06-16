@@ -36,9 +36,12 @@ mod gguf_input;
 // follow-up increment; allow dead_code until then.
 #[allow(dead_code)]
 mod qtip;
-// QTIP-LDLQ (Phase C1e) — output-aware trellis encode; wired in a follow-up.
+// QTIP-LDLQ (Phase C1e) — output-aware trellis encode.
 #[allow(dead_code)]
 mod ldlq;
+// HFHS Hessian sidecar reader (was orphaned; now wired for QTIP-LDLQ).
+#[allow(dead_code)]
+mod hessian_io;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -5597,6 +5600,28 @@ fn main() {
     } else {
         (Vec::new(), Vec::new(), Vec::new())
     };
+    // Optional Hessian sidecar → QTIP-LDLQ (output-aware). HIPFIRE_QTIP_HESSIAN
+    // points at an HFHS file; tensors with a Hessian use LDLQ, the rest fall
+    // back to plain (MSE) simulated QTIP.
+    let qtip_hessian: Option<hessian_io::HessianSidecar> = if use_qtip_sim {
+        std::env::var("HIPFIRE_QTIP_HESSIAN").ok().and_then(|p| {
+            match hessian_io::HessianSidecar::open(std::path::Path::new(&p)) {
+                Ok(s) => {
+                    eprintln!(
+                        "qtip2-sim: LDLQ ENABLED — Hessian sidecar {p} ({} tensors)",
+                        s.n_tensors()
+                    );
+                    Some(s)
+                }
+                Err(e) => {
+                    eprintln!("qtip2-sim: WARN cannot open Hessian {p}: {e:?} — plain QTIP");
+                    None
+                }
+            }
+        })
+    } else {
+        None
+    };
     let use_q8 = format == "q8f16" || format == "q8";
     // F1 native-bf16 oracle: full-precision passthrough. Every tensor stored
     // as QuantType::F32 (qt=2) -- weights, norms, embeddings.
@@ -8820,26 +8845,56 @@ fn main() {
     // dense/MoE/attn weights regardless of which producer branch built them).
     // Skips embeddings/lm_head and any k not divisible by 256.
     if use_qtip_sim {
-        let mut n_sim = 0usize;
+        let (mut n_ldlq, mut n_plain) = (0usize, 0usize);
         for t in hfq_tensors.iter_mut() {
-            if matches!(t.quant_type, QuantType::BF16)
+            if !(matches!(t.quant_type, QuantType::BF16)
                 && t.shape.len() == 2
                 && (t.shape[1] as usize) % 256 == 0
                 && !t.name.contains("embed")
-                && !t.name.contains("lm_head")
+                && !t.name.contains("lm_head"))
             {
-                let k = t.shape[1] as usize;
-                let mut wf: Vec<f32> = t
-                    .data
-                    .chunks_exact(2)
-                    .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                    .collect();
-                qtip_simquant_2d(&mut wf, k, &qtip_cb, &qtip_s1, &qtip_s2);
-                t.data = f32_slice_to_bf16_bytes(&wf);
-                n_sim += 1;
+                continue;
+            }
+            let m = t.shape[0] as usize;
+            let k = t.shape[1] as usize;
+            let mut wf: Vec<f32> = t
+                .data
+                .chunks_exact(2)
+                .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+
+            // Prefer LDLQ when this tensor has a Hessian; else plain QTIP.
+            let key = t.name.strip_suffix(".weight").unwrap_or(&t.name);
+            let ldlq_out = qtip_hessian.as_ref().and_then(|sc| {
+                let href = sc.get(key, 0)?;
+                if href.k != k {
+                    return None;
+                }
+                // Materialize k×k Hessian (f32) + 1% diagonal-mean ridge.
+                let mut h = vec![0.0f32; k * k];
+                let mut diag_sum = 0.0f64;
+                for i in 0..k {
+                    for j in 0..k {
+                        h[i * k + j] = href.at(i, j) as f32;
+                    }
+                    diag_sum += href.at(i, i);
+                }
+                let damp = 0.01 * (diag_sum / k as f64).max(1e-12);
+                ldlq::qtip2_ldlq_dequant(&wf, m, k, &h, &qtip_s1, &qtip_s2, 128, damp)
+            });
+            match ldlq_out {
+                Some(deq) => {
+                    t.data = f32_slice_to_bf16_bytes(&deq);
+                    n_ldlq += 1;
+                }
+                None => {
+                    qtip_simquant_2d(&mut wf, k, &qtip_cb, &qtip_s1, &qtip_s2);
+                    t.data = f32_slice_to_bf16_bytes(&wf);
+                    n_plain += 1;
+                }
             }
         }
-        eprintln!("  qtip2-sim: simulated QTIP-2 on {n_sim} 2D BF16 weights");
+        eprintln!("  qtip2-sim: LDLQ on {n_ldlq} tensors, plain-QTIP on {n_plain}");
     }
 
     // Write .hfq file
