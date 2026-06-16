@@ -205,6 +205,17 @@ Papers + reference implementations vendored for Phases C/D:
    powerful machines. So the 0.8B itself gets QTIP'd and self-drafts via
    its own MTP head.
 2. **Ordering:** **Phase C (QTIP weights) before Phase D (KVarN).**
+3. **Clean-room implementation (2026-06-16):** QTIP and KVarN are
+   implemented as fresh Rust, reading `./Quantization/{QTIP,KVarN}` only as
+   an algorithm *reference* — no direct code copy (also avoids their
+   licenses). E (MTP perf) deferred.
+4. **Active goal (2026-06-16): Phase C + D end-to-end on the 0.8B.**
+   - QTIP: uniform 2-bit g256 first; if PPL unacceptable, fall back to
+     3-bit QTIP (still a bandwidth win vs MQ4) rather than ship garbage.
+   - KVarN: adapt the variance-normalization algorithm to Qwen3.5 GQA KV
+     (keys tighter than values); the MLA reference is shape-only.
+   - Done when both weights (QTIP) and KV (KVarN) are compressed with a
+     real PPL + coherence verdict.
 
 ## Status
 
