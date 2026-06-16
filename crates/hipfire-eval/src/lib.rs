@@ -5419,6 +5419,7 @@ fn daemon_battery_rows(
 ) -> Option<Vec<EvalResult>> {
     match battery {
         BatteryId::Smoke => Some(run_daemon_smoke_rows(config, ctx)),
+        BatteryId::Speed => Some(run_daemon_speed_rows(config, ctx)),
         BatteryId::Coherence | BatteryId::Longctx | BatteryId::Agentic => {
             examples_battery_rows(battery, config, ctx, datasets)
         }
@@ -5497,6 +5498,30 @@ fn daemon_smoke_skip_rows(
             BTreeMap::from([("executor".to_string(), json!("daemon"))]),
         ),
     ]
+}
+
+fn daemon_speed_skip_rows(config: &EvalConfig, ctx: &EvalContext, reason: &str) -> Vec<EvalResult> {
+    let prompt_ref = prompt("benchmarks/prompts/lru_cache_single_blank.txt");
+    daemon_speed_cases()
+        .iter()
+        .map(|case| {
+            skip_row_with_metrics(
+                BatteryId::Speed,
+                None,
+                case.label,
+                None,
+                reason,
+                config,
+                ctx,
+                prompt_ref.clone(),
+                BTreeMap::from([
+                    ("implemented".to_string(), json!(true)),
+                    ("executor".to_string(), json!("daemon")),
+                    ("suite".to_string(), json!("daemon_speed_anchor")),
+                ]),
+            )
+        })
+        .collect()
 }
 
 fn run_daemon_smoke_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
@@ -5584,6 +5609,72 @@ fn run_daemon_smoke_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResu
                 BTreeMap::from([("executor".to_string(), json!("daemon"))]),
             ),
         ],
+    }
+}
+
+fn run_daemon_speed_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
+    if !Path::new(&config.model).exists() {
+        return daemon_speed_skip_rows(
+            config,
+            ctx,
+            "daemon executor requires --model to be a local filesystem path",
+        );
+    }
+
+    let Some(bin) = hipfire_daemon_adapter::find_daemon_bin() else {
+        return daemon_speed_skip_rows(
+            config,
+            ctx,
+            "daemon binary not found; build with `cargo build -p hipfire-daemon --bin hipfire-daemon`",
+        );
+    };
+
+    let started = SystemTime::now();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            return daemon_speed_skip_rows(
+                config,
+                ctx,
+                &format!("create daemon executor runtime: {err}"),
+            );
+        }
+    };
+
+    match runtime.block_on(run_daemon_speed_rows_async(config, ctx, &bin)) {
+        Ok(mut rows) => {
+            let elapsed_ms = elapsed_since_ms(started);
+            for row in &mut rows {
+                row.elapsed_ms = elapsed_ms;
+            }
+            rows
+        }
+        Err(err) => daemon_speed_cases()
+            .iter()
+            .map(|case| {
+                row(
+                    BatteryId::Speed,
+                    None,
+                    case.label,
+                    None,
+                    EvalStatus::Fail,
+                    Some(format!("daemon-backed speed executor failed: {err}")),
+                    BTreeMap::from([
+                        ("implemented".to_string(), json!(true)),
+                        ("executor".to_string(), json!("daemon")),
+                        ("suite".to_string(), json!("daemon_speed_anchor")),
+                        ("daemon_bin".to_string(), json!(bin.display().to_string())),
+                    ]),
+                    config,
+                    ctx,
+                    prompt("benchmarks/prompts/lru_cache_single_blank.txt"),
+                    elapsed_since_ms(started),
+                )
+            })
+            .collect(),
     }
 }
 
@@ -5756,6 +5847,100 @@ async fn run_daemon_smoke_rows_async(
             0,
         ),
     ])
+}
+
+async fn run_daemon_speed_rows_async(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    bin: &Path,
+) -> anyhow::Result<Vec<EvalResult>> {
+    let max_seq = (config.max_tokens + 2048).max(4096);
+    let mut engine = hipfire_daemon_adapter::DaemonEngine::spawn(bin).await?;
+    let loaded = engine
+        .load(&config.model, daemon_model_load_params(config, max_seq))
+        .await?;
+    let worker_key_id = loaded.worker_key_id.clone();
+    let prompt_path = "benchmarks/prompts/lru_cache_single_blank.txt";
+    let prompt_text = read_repo_prompt_text(prompt_path)?;
+    let max_tokens = config.max_tokens.max(50);
+
+    let mut rows = Vec::new();
+    for case in daemon_speed_cases() {
+        engine.reset().await?;
+        let request = daemon_generate_request(
+            format!("eval-speed-{}", case.label),
+            prompt_text.clone(),
+            max_tokens,
+            Some(worker_key_id.clone()),
+        );
+        let (text, done) = engine.generate(request).await?;
+        let has_timing = done.prefill_tok_s.is_some() && done.decode_tok_s.is_some();
+        let finite = !text.is_empty() && !text.contains('\u{fffd}') && done.tokens > 0;
+        let status = if finite && has_timing {
+            EvalStatus::Pass
+        } else {
+            EvalStatus::Fail
+        };
+        let reason = if !finite {
+            Some(
+                "daemon speed anchor returned empty, zero-token, or replacement-character output"
+                    .to_string(),
+            )
+        } else if !has_timing {
+            Some("daemon speed anchor did not emit prefill/decode timing metrics".to_string())
+        } else {
+            None
+        };
+        let mut metrics = BTreeMap::from([
+            ("implemented".to_string(), json!(true)),
+            ("executor".to_string(), json!("daemon")),
+            ("suite".to_string(), json!("daemon_speed_anchor")),
+            ("shared_model_loads".to_string(), json!(1)),
+            ("worker_key_id".to_string(), json!(worker_key_id.clone())),
+            ("daemon_bin".to_string(), json!(bin.display().to_string())),
+            ("max_tokens".to_string(), json!(max_tokens)),
+            ("tokens".to_string(), json!(done.tokens)),
+            ("text_bytes".to_string(), json!(text.len())),
+        ]);
+        if let Some(value) = done.tok_s {
+            metrics.insert("tok_s".to_string(), json!(value));
+        }
+        if let Some(value) = done.prefill_tokens {
+            metrics.insert("prefill_tokens".to_string(), json!(value));
+        }
+        if let Some(value) = done.prefill_ms {
+            metrics.insert("prefill_ms".to_string(), json!(value));
+        }
+        if let Some(value) = done.prefill_tok_s {
+            metrics.insert("prefill_tok_s".to_string(), json!(value));
+        }
+        if let Some(value) = done.decode_tok_s {
+            metrics.insert("decode_tok_s".to_string(), json!(value));
+            metrics
+                .entry("gen_tok_s".to_string())
+                .or_insert(json!(value));
+        }
+        if let Some(value) = done.ttft_ms {
+            metrics.insert("ttft_ms".to_string(), json!(value));
+        }
+
+        rows.push(row_for_model(
+            BatteryId::Speed,
+            None,
+            case.label,
+            None,
+            status,
+            reason,
+            metrics,
+            config,
+            ctx,
+            prompt(prompt_path),
+            0,
+            config.model.clone(),
+        ));
+    }
+
+    Ok(rows)
 }
 
 fn examples_executor_available_for(battery: BatteryId) -> bool {
@@ -5936,6 +6121,11 @@ struct Qwen35SpeedCase {
     prefill: usize,
 }
 
+#[derive(Clone, Copy)]
+struct DaemonSpeedCase {
+    label: &'static str,
+}
+
 fn qwen35_speed_cases() -> &'static [Qwen35SpeedCase] {
     &[
         Qwen35SpeedCase {
@@ -5945,6 +6135,17 @@ fn qwen35_speed_cases() -> &'static [Qwen35SpeedCase] {
         Qwen35SpeedCase {
             label: "pp128_prefill_decode",
             prefill: 128,
+        },
+    ]
+}
+
+fn daemon_speed_cases() -> &'static [DaemonSpeedCase] {
+    &[
+        DaemonSpeedCase {
+            label: "daemon_prefill_decode_first",
+        },
+        DaemonSpeedCase {
+            label: "daemon_prefill_decode_reset",
         },
     ]
 }
@@ -11535,6 +11736,46 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("local filesystem path"));
+    }
+
+    #[test]
+    fn daemon_executor_speed_missing_model_is_explicit_skip() {
+        let cfg = parse_args_from([
+            "hipfire-eval",
+            "--model",
+            "missing-local-model.hfq",
+            "--executor",
+            "daemon",
+            "--battery",
+            "speed",
+        ])
+        .unwrap();
+        let ctx = EvalContext {
+            commit_sha: None,
+            git_branch: None,
+            git_describe: None,
+            git_dirty: None,
+            binary_hash: None,
+            arch: None,
+            rocm: None,
+            host_profile: test_host_profile(),
+        };
+
+        let rows = daemon_battery_rows(BatteryId::Speed, &cfg, &ctx, &[]).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].case_id, "daemon_prefill_decode_first");
+        assert_eq!(rows[1].case_id, "daemon_prefill_decode_reset");
+        assert!(rows.iter().all(|row| row.status == EvalStatus::Skip));
+        assert!(rows.iter().all(|row| row
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("local filesystem path")));
+        assert!(rows.iter().all(|row| {
+            row.metrics.get("executor").and_then(Value::as_str) == Some("daemon")
+                && row.metrics.get("suite").and_then(Value::as_str) == Some("daemon_speed_anchor")
+                && row.metrics.get("implemented").and_then(Value::as_bool) == Some(true)
+        }));
     }
 
     #[test]

@@ -54,9 +54,10 @@
   - What to finish to align with daemon/lib+IPC direction:
     - finish `EvalClient` transport in eval harness with request batching for same
       model across batteries where semantics allow;
-    - daemon-backed smoke model-load, finite greedy decode, and repeated greedy
-      reset/recall now use the shared JSONL daemon adapter under
-      `--executor daemon`; extend this to speed anchors next;
+    - daemon-backed smoke model-load, finite greedy decode, repeated greedy
+      reset/recall, and explicit `--executor daemon --battery speed` timing
+      anchors now use the shared JSONL daemon adapter; examples-backed pp32/pp128
+      speed-gate rows remain the benchmark-grade default;
     - add process and handle ownership so one model-load maps to one resident daemon
       process per loaded quant/placement;
     - make battery rows consume a shared model cache key and avoid repeated
