@@ -97,34 +97,97 @@ This is the known reason QTIP/trellis is the *only* viable 2-bit path. Do
     (within 21% of the optimal 2-bit floor), **QTIP-2/uniform-2 = 0.26**
     (uniform-2 ≈ 4.6× the bound — why MQ2-Lloyd collapses). QTIP makes 2-bit
     *near-optimal*.
-  - **C1c — codebook tuning: DEPRIORITIZED.** Headroom to the floor is only
-    ~20% (already at 1.21× bound); scale refit + STATE_BITS=16 barely move
-    it. The paper's 1MAD/3INST codebook could shave some, but it won't change
-    the verdict — that's set by the *usability* question below, not
-    reconstruction.
-  - **C1d — full-model wiring + PPL (the real gate, NEXT).** New
-    `--format qtip2` (per-group `encode_group` across 2D weights;
-    beam-search encoder — per-group Viterbi too slow at model scale) → QTIP
-    `.hfq` + DType. Then measure full-model **PPL** (the only test of whether
-    near-optimal-2-bit is usable). PPL needs a forward → either a CPU dequant
-    path or the C2 kernel; the chicken-and-egg means C2 may have to land
-    before the final quality verdict.
-  - **Gate:** full-model PPL via C1d (reconstruction is settled: near
-    bound).
-- **C2 — fused QTIP decode GEMV.** Variant of `gemv_mq2g256_lloyd.hip` with
-  sliding-window trellis hash (computed codebook → ~zero LDS), reusing
-  `rotate_x_mq_awq.hip`. Friction is sub-byte bit-window unpack (LDS stage
-  + shift/mask), not serialization (decode is parallel; Viterbi is offline).
+  - **C1c — adopt the QTIP reference codebook (UNBLOCKED by ./Quantization).**
+    My random-hash codebook is at 1.21× the bound; the paper's *computed*
+    codebook is the real thing. Port `lib/codebook/bitshift.py` (1MAD/3INST
+    hashes) + `lib/algo/ldlq.py` (Hessian-aware LDLQ encode, better than my
+    MSE-only Viterbi). Re-run the C1b/whole-model gate to measure the new
+    gap-to-bound.
+  - **C1d — full-model wiring + PPL (the real gate).** New `--format qtip2`
+    (per-group beam encoder across 2D weights) → QTIP `.hfq` + DType. Then
+    full-model **PPL** — the usability verdict. Reference: `eval/eval_ppl.py`
+    + `quantize_llama/` pipeline. PPL needs a forward → CPU dequant path or
+    the C2 kernel (chicken-and-egg: C2 may land first).
+  - **Gate:** full-model PPL via C1d (reconstruction settled: near bound).
+- **C2 — fused QTIP decode GEMV.** Port the reference decode+matvec kernel
+  `qtip-kernels/src` + `test_decompress_matvec.py` (CUDA → HIP) into the
+  rdna-compute dispatch; variant of `gemv_mq2g256_lloyd.hip`. Friction is
+  sub-byte bit-window unpack, not serialization (decode is parallel).
 - **C2b — dense QTIP prefill GEMM** (mirror the mq3/mq4 `_residual_wmma`).
 - **C3.** gfx1103 retune (`gfx-kernel-metadata` for occupancy/LDS/spill).
 - **Gate:** coherence + fresh-process `scripts/probe_commits.sh`.
 
 ## Phase D — KVarN KV (long-context bandwidth)
 
-- **D1.** KVarN KV compression, gated separately from weight quant;
-  keys on a tighter bit budget than values (KV more sensitive than
-  weights — `feedback_attention_precision`).
+Reference now in-tree: `./Quantization/KVarN…/` — paper + full repo (spec
+`KVARN_MLA_BACKEND_SPEC.md`, Python refs `kvarn_mla_*`, Rust). Algorithm:
+variance-normalized 4-bit KV — Sinkhorn per-channel scale/zp + per-token
+row scale, GROUP=128 tile records, dequant-to-fp16-scratch then stock decode.
+
+- **CAVEAT — reference is MLA-shaped (DeepSeek-style latent KV, R=512).**
+  Qwen3.5 FullAttention is **GQA**, not MLA. The *core algorithm*
+  (variance-normalize → 4-bit, keys tighter than values) ports; the
+  MLA-latent tile layout does not. Two D-tracks:
+  - **D1 (Qwen3.5 GQA KV):** adapt the variance-normalization to GQA K/V
+    tensors + hipfire's KV cache (`kv_cache_write_q8`/asym paths). The
+    DeltaNet recurrent state is a *separate* concern (Phase A anchor).
+  - **D1-MLA (DeepSeek V4):** the KVarN-MLA backend applies more directly —
+    but DeepSeek runs on the bigger boxes, not this 780M.
 - **Gate:** long-context coherence + τ stability under compressed KV.
+
+## Phase E — MTP spec-decode optimization (moved from Phase B follow-up)
+
+Phase B wired MTP and fixed DFlash's τ<1, but the **warmed A/B shows MTP is
+net-negative on the 0.8B**: AR 57.7 tok/s vs MTP 13.1 tok/s (~4.4× slower),
+τ=1.66. Cause (measured, not assumed): MTP does ~2.5× the GPU kernel work
+and ~2× the bandwidth *per committed token*, plus heavy host overhead. On a
+tiny, already-fast model spec-decode's machinery exceeds its savings; the
+payoff is on the larger models (verify-dominated). Phase E is about making
+the machinery cheap enough to be net-positive.
+
+**Measured phase split** (`HIPFIRE_MTP_PHASE_TIMERS=1`, 0.8B, 46 cycles,
+committed): verify 36.5 ms (46%), draft 23.7 ms (30%), accept+replay
+18.9 ms (24%), total 79 ms/cycle. **~half of wall is host launch gaps**
+(kernel ≈32 ms vs wall ≈79 ms) — graphing matters here (bandwidth-bound
+780M), unlike the ~neutral gfx1201 (compute-bound, conclusions don't
+transfer).
+
+Three code-located fixes, ordered by effort↔payoff:
+- **E1 — GDN-tape replay elimination (do first).** accept+replay (24%) runs
+  a **second full trunk forward** to roll back DN state; MTP passes
+  `gdn_tape: None` while DFlash uses a tape. Mirror DFlash's tape rollback →
+  kill the redundant forward. Medium effort, known pattern in-repo.
+- **E2 — compressed-vocab draft lm_head.** Draft (30%) reuses the full
+  248K-vocab lm_head; `mtp_extract --vocab-sidecar` + the
+  `spec_step_mtp_compressed` path (already exists) drops it (~1.8 GB/cycle
+  BW per the code comment). Also makes the existing MTP **proposal graph**
+  eligible (gated on `!use_full_vocab`).
+- **E3 — verify graph capture (largest lift).** verify (46%) is mostly host
+  launch gaps. Needs the MTP verify forward made graph-capture-ready
+  (device-resident positions + `launch_kernel_blob`, mirroring DFlash's
+  `verify_dflash_block_with_graph_policy`) for capture-once/replay-many.
+- **E4 — tree MTP** (raises τ → more tokens per verify sweep): blocked on
+  the FP32/FP16-state tree-replay kernel (TODO.md), since small models run
+  FP32 DeltaNet state.
+- **Instrumentation shipped:** `HIPFIRE_MTP_PHASE_TIMERS` (phase split);
+  per-kernel via `HIPFIRE_PROFILE`; `rocprofv3` for host-gap timeline.
+- **Gate:** warmed daemon A/B (decode tok/s, fresh process, byte-identical
+  prompt) + `coherence-gate-dflash.sh`.
+
+## Reference sources — `./Quantization/` (local, gitignored)
+
+Papers + reference implementations vendored for Phases C/D:
+- **QTIP** `[2406.11235v4]/qtip` — bitshift codebook (`lib/codebook/bitshift.py`),
+  LDLQ encode (`lib/algo/ldlq.py`), decode+matvec CUDA kernel
+  (`qtip-kernels/`), PPL eval, full `quantize_llama` pipeline. **Covers C1c,
+  C1d, C2.** (CUDA → HIP port required for the kernel.)
+- **KVarN** `[2606.03458]/KVarN` — variance-normalized 4-bit KV; spec
+  `KVARN_MLA_BACKEND_SPEC.md`, Python refs, Rust. **Covers Phase D's
+  algorithm/spec** (the gap that previously blocked D) — but MLA-shaped;
+  GQA adaptation needed for Qwen3.5 (see Phase D caveat).
+- Supporting (rotation / salient / mixed-precision / sparse-outlier context
+  for C): ResQ, ROSAQ, CMPQ, SVD, SARQC, LIMPQ, SpQR; HoloKV (alt KV
+  compression).
 
 ## Cross-cutting invariants
 
@@ -146,8 +209,15 @@ This is the known reason QTIP/trellis is the *only* viable 2-bit path. Do
 ## Status
 
 - **Phase A: ✅ DONE + verified** (committed).
-- **Phase B: ✅ DONE + verified** — MTP daemon wiring, τ=1.66 @ K=2 on
-  0.8B, DFlash τ<1 fixed (committed; artifacts in `~/.hipfire/models/`).
-- **Phase C: ACTIVE** — QTIP quantizer (C1) is the next build, then the
-  fused decode GEMV (C2) + dense prefill GEMM (C2b). Multi-day.
-- **Phase D: pending** — KVarN KV compression.
+- **Phase B: ✅ DONE** — MTP daemon wiring, τ=1.66 @ K=2, DFlash τ<1 fixed
+  (committed). NOTE: warmed A/B shows MTP **net-negative on 0.8B** (13.1 vs
+  AR 57.7 tok/s); optimization moved to **Phase E**.
+- **Phase C: ACTIVE** — C1a/C1b/C1d-reconstruction done (QTIP near-optimal
+  2-bit, 1.21× RD bound). Next: C1c adopt QTIP reference codebook (now
+  in-tree), C1d full-model PPL, C2 decode kernel (CUDA→HIP port). Reference
+  unblocked via `./Quantization/QTIP…`.
+- **Phase D: spec/reference unblocked** — KVarN paper + repo in
+  `./Quantization/` (was the missing spec). Caveat: MLA-shaped, needs GQA
+  adaptation for Qwen3.5.
+- **Phase E: scoped + instrumented** — MTP perf (phase split measured; E1
+  GDN-tape replay, E2 compressed draft lm_head, E3 verify graph).
