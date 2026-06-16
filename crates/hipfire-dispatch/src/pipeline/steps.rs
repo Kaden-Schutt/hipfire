@@ -8,16 +8,16 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::OnceLock;
 
 use crate::context::DispatchCtx;
-use crate::families::gemv::{GemvFamily, GemvParams, RotateInputs, WeightRef};
-use crate::types::GemvVariant;
 use crate::families::fused_qkv::{FusedQkvFamily, FusedQkvParams};
+use crate::families::gemv::{GemvFamily, GemvParams, RotateInputs, WeightRef};
 use crate::families::rotation::{RotationFamily, RotationParams};
+use crate::types::GemvVariant;
 use crate::types::{DispatchError, KernelKey, PipelineOp, RotationPlan, RotationVariant};
 
 /// Rotation disposition of a Gemv's input. Borrows (never owns a RotatedActivation).
 pub enum GemvInput<'a> {
-    Raw(&'a GpuTensor),         // launch_op self-rotates via run_auto (plan-aware)
-    Prerotated(&'a GpuTensor),  // already FWHT-rotated; dispatched via Prerotated variant
+    Raw(&'a GpuTensor),        // launch_op self-rotates via run_auto (plan-aware)
+    Prerotated(&'a GpuTensor), // already FWHT-rotated; dispatched via Prerotated variant
 }
 
 pub enum Step<'a> {
@@ -42,12 +42,12 @@ pub enum Step<'a> {
     RmsnormAutomatic {
         x: &'a GpuTensor,
         norm_weight: &'a GpuTensor,
-        x_plain: &'a GpuTensor,   // rmsnorm intermediate scratch (always written)
-        out: &'a GpuTensor,       // final activation output (written by this step)
+        x_plain: &'a GpuTensor, // rmsnorm intermediate scratch (always written)
+        out: &'a GpuTensor,     // final activation output (written by this step)
         awq_scale: Option<&'a GpuTensor>,
         k: usize,
         eps: f32,
-        rotation: RotationPlan,   // FwhtG256 for MQ dtypes, None for HFQ4/others
+        rotation: RotationPlan, // FwhtG256 for MQ dtypes, None for HFQ4/others
     },
     /// Paired KV-write + flash-attention (Phase 0.3). Consumes a KvTierPlan
     /// (derived once per attention step) and AttnParams (tensor borrows).
@@ -85,9 +85,11 @@ fn window_gemv_dtype(steps: &[Step]) -> Option<DType> {
 /// - awq_scale == None (iff require_no_awq)
 fn gemv_steps_uniform(steps: &[Step], dtype: DType, require_no_awq: bool) -> bool {
     steps[1..].iter().all(|s| match s {
-        Step::Gemv { w, input: GemvInput::Prerotated(_), .. } => {
-            w.dtype == dtype && (!require_no_awq || w.awq_scale.is_none())
-        }
+        Step::Gemv {
+            w,
+            input: GemvInput::Prerotated(_),
+            ..
+        } => w.dtype == dtype && (!require_no_awq || w.awq_scale.is_none()),
         _ => false,
     })
 }
@@ -100,90 +102,138 @@ fn dp4a_eligible(ctx: &DispatchCtx) -> bool {
 // ── QKV 3-way guards ──
 
 pub(crate) fn guard_qkv_mq4g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if ctx.flags.force_unfused { return false; }
+    if ctx.flags.force_unfused {
+        return false;
+    }
     steps.len() == 4 && gemv_steps_uniform(steps, DType::MQ4G256Lloyd, true)
 }
 
 pub(crate) fn guard_qkv_mq3g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if ctx.flags.force_unfused { return false; }
+    if ctx.flags.force_unfused {
+        return false;
+    }
     steps.len() == 4 && gemv_steps_uniform(steps, DType::MQ3G256Lloyd, true)
 }
 
 /// Covers both DType::MQ4G256 (plain) and DType::HFQ4G256 — both feed
 /// gpu.fused_qkv_hfq4g256 which takes a pre-normalized x.
 pub(crate) fn guard_qkv_hfq4g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if ctx.flags.force_unfused { return false; }
-    if steps.len() != 4 { return false; }
-    let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
-    matches!(dt, DType::MQ4G256 | DType::HFQ4G256)
-        && gemv_steps_uniform(steps, dt, true)
+    if ctx.flags.force_unfused {
+        return false;
+    }
+    if steps.len() != 4 {
+        return false;
+    }
+    let dt = match window_gemv_dtype(steps) {
+        Some(d) => d,
+        None => return false,
+    };
+    matches!(dt, DType::MQ4G256 | DType::HFQ4G256) && gemv_steps_uniform(steps, dt, true)
 }
 
 /// Covers both DType::HFQ6G256 and DType::MQ6G256 — both use dp4a.
 pub(crate) fn guard_qkv_hfq6g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if !dp4a_eligible(ctx) { return false; }
-    if steps.len() != 4 { return false; }
-    let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
-    matches!(dt, DType::HFQ6G256 | DType::MQ6G256)
-        && gemv_steps_uniform(steps, dt, true)
+    if !dp4a_eligible(ctx) {
+        return false;
+    }
+    if steps.len() != 4 {
+        return false;
+    }
+    let dt = match window_gemv_dtype(steps) {
+        Some(d) => d,
+        None => return false,
+    };
+    matches!(dt, DType::HFQ6G256 | DType::MQ6G256) && gemv_steps_uniform(steps, dt, true)
 }
 
 // ── QKVZA 4-way guards (DeltaNet linear attention) ──
 
 pub(crate) fn guard_qkvza_mq4g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if ctx.flags.force_unfused { return false; }
+    if ctx.flags.force_unfused {
+        return false;
+    }
     steps.len() == 5 && gemv_steps_uniform(steps, DType::MQ4G256Lloyd, true)
 }
 
 pub(crate) fn guard_qkvza_mq3g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if ctx.flags.force_unfused { return false; }
+    if ctx.flags.force_unfused {
+        return false;
+    }
     steps.len() == 5 && gemv_steps_uniform(steps, DType::MQ3G256Lloyd, true)
 }
 
 /// Covers both DType::MQ4G256 (plain) and DType::HFQ4G256.
 pub(crate) fn guard_qkvza_hfq4g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if ctx.flags.force_unfused { return false; }
-    if steps.len() != 5 { return false; }
-    let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
-    matches!(dt, DType::MQ4G256 | DType::HFQ4G256)
-        && gemv_steps_uniform(steps, dt, true)
+    if ctx.flags.force_unfused {
+        return false;
+    }
+    if steps.len() != 5 {
+        return false;
+    }
+    let dt = match window_gemv_dtype(steps) {
+        Some(d) => d,
+        None => return false,
+    };
+    matches!(dt, DType::MQ4G256 | DType::HFQ4G256) && gemv_steps_uniform(steps, dt, true)
 }
 
 /// Covers both DType::HFQ6G256 and DType::MQ6G256 — both use dp4a.
 pub(crate) fn guard_qkvza_hfq6g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if !dp4a_eligible(ctx) { return false; }
-    if steps.len() != 5 { return false; }
-    let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
-    matches!(dt, DType::HFQ6G256 | DType::MQ6G256)
-        && gemv_steps_uniform(steps, dt, true)
+    if !dp4a_eligible(ctx) {
+        return false;
+    }
+    if steps.len() != 5 {
+        return false;
+    }
+    let dt = match window_gemv_dtype(steps) {
+        Some(d) => d,
+        None => return false,
+    };
+    matches!(dt, DType::HFQ6G256 | DType::MQ6G256) && gemv_steps_uniform(steps, dt, true)
 }
 
 // ── Gate+Up 2-way guards ──
 
 pub(crate) fn guard_gate_up_mq4g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if ctx.flags.force_unfused { return false; }
+    if ctx.flags.force_unfused {
+        return false;
+    }
     steps.len() == 3 && gemv_steps_uniform(steps, DType::MQ4G256Lloyd, true)
 }
 
 pub(crate) fn guard_gate_up_mq3g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if ctx.flags.force_unfused { return false; }
+    if ctx.flags.force_unfused {
+        return false;
+    }
     steps.len() == 3 && gemv_steps_uniform(steps, DType::MQ3G256Lloyd, true)
 }
 
 pub(crate) fn guard_gate_up_hfq4g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if ctx.flags.force_unfused { return false; }
-    if steps.len() != 3 { return false; }
-    let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
-    matches!(dt, DType::MQ4G256 | DType::HFQ4G256)
-        && gemv_steps_uniform(steps, dt, true)
+    if ctx.flags.force_unfused {
+        return false;
+    }
+    if steps.len() != 3 {
+        return false;
+    }
+    let dt = match window_gemv_dtype(steps) {
+        Some(d) => d,
+        None => return false,
+    };
+    matches!(dt, DType::MQ4G256 | DType::HFQ4G256) && gemv_steps_uniform(steps, dt, true)
 }
 
 pub(crate) fn guard_gate_up_hfq6g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if !dp4a_eligible(ctx) { return false; }
-    if steps.len() != 3 { return false; }
-    let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
-    matches!(dt, DType::HFQ6G256 | DType::MQ6G256)
-        && gemv_steps_uniform(steps, dt, true)
+    if !dp4a_eligible(ctx) {
+        return false;
+    }
+    if steps.len() != 3 {
+        return false;
+    }
+    let dt = match window_gemv_dtype(steps) {
+        Some(d) => d,
+        None => return false,
+    };
+    matches!(dt, DType::HFQ6G256 | DType::MQ6G256) && gemv_steps_uniform(steps, dt, true)
 }
 
 // ── Q8_0 / Q4K fused guards (non-rotated, Prerotated input) ──
@@ -194,19 +244,25 @@ pub(crate) fn guard_gate_up_hfq6g256(steps: &[Step], ctx: &DispatchCtx) -> bool 
 
 /// Fused QKV with Q4K weights. Used by llama (dense).
 pub(crate) fn guard_qkv_q4k(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if ctx.flags.force_unfused { return false; }
+    if ctx.flags.force_unfused {
+        return false;
+    }
     steps.len() == 4 && gemv_steps_uniform(steps, DType::Q4K, true)
 }
 
 /// Fused gate+up with Q4K weights. Used by llama (dense).
 pub(crate) fn guard_gate_up_q4k(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if ctx.flags.force_unfused { return false; }
+    if ctx.flags.force_unfused {
+        return false;
+    }
     steps.len() == 3 && gemv_steps_uniform(steps, DType::Q4K, true)
 }
 
 /// Fused gate+up with Q8_0 weights. Used by qwen2 FFN.
 pub(crate) fn guard_gate_up_q8_0(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if ctx.flags.force_unfused { return false; }
+    if ctx.flags.force_unfused {
+        return false;
+    }
     steps.len() == 3 && gemv_steps_uniform(steps, DType::Q8_0, true)
 }
 
@@ -275,43 +331,121 @@ pub(crate) fn step_op_kind(step: &Step) -> PipelineOp {
 
 const QKV3: &[PipelineOp] = &[
     PipelineOp::RmsnormAutomatic,
-    PipelineOp::Gemv, PipelineOp::Gemv, PipelineOp::Gemv,
+    PipelineOp::Gemv,
+    PipelineOp::Gemv,
+    PipelineOp::Gemv,
 ];
 const QKVZA4: &[PipelineOp] = &[
     PipelineOp::RmsnormAutomatic,
-    PipelineOp::Gemv, PipelineOp::Gemv, PipelineOp::Gemv, PipelineOp::Gemv,
+    PipelineOp::Gemv,
+    PipelineOp::Gemv,
+    PipelineOp::Gemv,
+    PipelineOp::Gemv,
 ];
 const GATE_UP2: &[PipelineOp] = &[
     PipelineOp::RmsnormAutomatic,
-    PipelineOp::Gemv, PipelineOp::Gemv,
+    PipelineOp::Gemv,
+    PipelineOp::Gemv,
 ];
 
 const FUSED_TABLE: &[FusedPattern] = &[
     // ── QKV 3-way ──────────────────────────────────────────────────────────
-    FusedPattern { ops: QKV3, key: KernelKey::FusedQkvMq4G256Lloyd,  guard: guard_qkv_mq4g256lloyd  },
-    FusedPattern { ops: QKV3, key: KernelKey::FusedQkvMq3G256Lloyd,  guard: guard_qkv_mq3g256lloyd  },
-    FusedPattern { ops: QKV3, key: KernelKey::FusedQkvHfq4G256,      guard: guard_qkv_hfq4g256      },
-    FusedPattern { ops: QKV3, key: KernelKey::FusedQkvHfq6G256,      guard: guard_qkv_hfq6g256      },
+    FusedPattern {
+        ops: QKV3,
+        key: KernelKey::FusedQkvMq4G256Lloyd,
+        guard: guard_qkv_mq4g256lloyd,
+    },
+    FusedPattern {
+        ops: QKV3,
+        key: KernelKey::FusedQkvMq3G256Lloyd,
+        guard: guard_qkv_mq3g256lloyd,
+    },
+    FusedPattern {
+        ops: QKV3,
+        key: KernelKey::FusedQkvHfq4G256,
+        guard: guard_qkv_hfq4g256,
+    },
+    FusedPattern {
+        ops: QKV3,
+        key: KernelKey::FusedQkvHfq6G256,
+        guard: guard_qkv_hfq6g256,
+    },
     // ── QKVZA 4-way (DeltaNet linear attention) ────────────────────────────
-    FusedPattern { ops: QKVZA4, key: KernelKey::FusedQkvzaMq4G256Lloyd,  guard: guard_qkvza_mq4g256lloyd  },
-    FusedPattern { ops: QKVZA4, key: KernelKey::FusedQkvzaMq3G256Lloyd,  guard: guard_qkvza_mq3g256lloyd  },
-    FusedPattern { ops: QKVZA4, key: KernelKey::FusedQkvzaHfq4G256,      guard: guard_qkvza_hfq4g256      },
-    FusedPattern { ops: QKVZA4, key: KernelKey::FusedQkvzaHfq6G256,      guard: guard_qkvza_hfq6g256      },
+    FusedPattern {
+        ops: QKVZA4,
+        key: KernelKey::FusedQkvzaMq4G256Lloyd,
+        guard: guard_qkvza_mq4g256lloyd,
+    },
+    FusedPattern {
+        ops: QKVZA4,
+        key: KernelKey::FusedQkvzaMq3G256Lloyd,
+        guard: guard_qkvza_mq3g256lloyd,
+    },
+    FusedPattern {
+        ops: QKVZA4,
+        key: KernelKey::FusedQkvzaHfq4G256,
+        guard: guard_qkvza_hfq4g256,
+    },
+    FusedPattern {
+        ops: QKVZA4,
+        key: KernelKey::FusedQkvzaHfq6G256,
+        guard: guard_qkvza_hfq6g256,
+    },
     // ── Gate+Up 2-way ───────────────────────────────────────────────────────
-    FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpMq4G256Lloyd, guard: guard_gate_up_mq4g256lloyd },
-    FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpMq3G256Lloyd, guard: guard_gate_up_mq3g256lloyd },
-    FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpHfq4G256,     guard: guard_gate_up_hfq4g256     },
-    FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpHfq6G256,     guard: guard_gate_up_hfq6g256     },
+    FusedPattern {
+        ops: GATE_UP2,
+        key: KernelKey::FusedGateUpMq4G256Lloyd,
+        guard: guard_gate_up_mq4g256lloyd,
+    },
+    FusedPattern {
+        ops: GATE_UP2,
+        key: KernelKey::FusedGateUpMq3G256Lloyd,
+        guard: guard_gate_up_mq3g256lloyd,
+    },
+    FusedPattern {
+        ops: GATE_UP2,
+        key: KernelKey::FusedGateUpHfq4G256,
+        guard: guard_gate_up_hfq4g256,
+    },
+    FusedPattern {
+        ops: GATE_UP2,
+        key: KernelKey::FusedGateUpHfq6G256,
+        guard: guard_gate_up_hfq6g256,
+    },
     // ── Q8_0 / Q4K fused entries (non-rotated, Always arch gate) ─────────
     // No FusedQkvQ8_0 entry: neither qwen2 (QKV is HFQ4G256) nor llama (QKV is
     // Q4K/MQ/plain) uses Q8_0 for QKV — only gate+up.
-    FusedPattern { ops: QKV3,     key: KernelKey::FusedQkvQ4K,          guard: guard_qkv_q4k          },
-    FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpQ4K,       guard: guard_gate_up_q4k      },
-    FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpQ8_0,       guard: guard_gate_up_q8_0     },
+    FusedPattern {
+        ops: QKV3,
+        key: KernelKey::FusedQkvQ4K,
+        guard: guard_qkv_q4k,
+    },
+    FusedPattern {
+        ops: GATE_UP2,
+        key: KernelKey::FusedGateUpQ4K,
+        guard: guard_gate_up_q4k,
+    },
+    FusedPattern {
+        ops: GATE_UP2,
+        key: KernelKey::FusedGateUpQ8_0,
+        guard: guard_gate_up_q8_0,
+    },
     // ── Paro fused Paro4G128T (dp4a, Raw input) ────────────────────────
-    FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpParo4G128T,   guard: guard_gate_up_paro4g128t },
-    FusedPattern { ops: QKVZA4, key: KernelKey::FusedQkvzaParo4G128T,     guard: guard_qkvza_paro4g128t },
-    FusedPattern { ops: QKV3,   key: KernelKey::FusedQkvParo4G128T,       guard: guard_qkv_paro4g128t },
+    FusedPattern {
+        ops: GATE_UP2,
+        key: KernelKey::FusedGateUpParo4G128T,
+        guard: guard_gate_up_paro4g128t,
+    },
+    FusedPattern {
+        ops: QKVZA4,
+        key: KernelKey::FusedQkvzaParo4G128T,
+        guard: guard_qkvza_paro4g128t,
+    },
+    FusedPattern {
+        ops: QKV3,
+        key: KernelKey::FusedQkvParo4G128T,
+        guard: guard_qkv_paro4g128t,
+    },
 ];
 static GEMV: OnceLock<GemvFamily> = OnceLock::new();
 static ROTATION: OnceLock<RotationFamily> = OnceLock::new();
@@ -339,29 +473,65 @@ pub fn execute_steps(
 /// op to have an arm (spec F4 — a missing arm would be a silent runtime error).
 fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), DispatchError> {
     match step {
-        Step::Gemv { w, input: GemvInput::Raw(x), out } => {
+        Step::Gemv {
+            w,
+            input: GemvInput::Raw(x),
+            out,
+        } => {
             let gemv = GEMV.get_or_init(GemvFamily::new);
             gemv.run_auto(ctx, gpu, w, x, out)
         }
-        Step::Gemv { w, input: GemvInput::Prerotated(xr), out } => {
+        Step::Gemv {
+            w,
+            input: GemvInput::Prerotated(xr),
+            out,
+        } => {
             let gemv = GEMV.get_or_init(GemvFamily::new);
-            gemv.run(ctx, gpu, &GemvParams {
-                w, x: xr, y: out, variant: GemvVariant::Prerotated,
-                residual: None, gate: None, up: None,
-            })
+            gemv.run(
+                ctx,
+                gpu,
+                &GemvParams {
+                    w,
+                    x: xr,
+                    y: out,
+                    variant: GemvVariant::Prerotated,
+                    residual: None,
+                    gate: None,
+                    up: None,
+                },
+            )
         }
-        Step::GemvResidual { w, input: GemvInput::Prerotated(xr), residual, out: _ } => {
+        Step::GemvResidual {
+            w,
+            input: GemvInput::Prerotated(xr),
+            residual,
+            out: _,
+        } => {
             // MQ-family with a fused residual kernel: writes `residual` in-place via
             // GemvVariant::WithResidual. `out` is NOT written — it is scratch for the
             // fallback path only (see the Raw arm below). Nothing downstream reads
             // `out` after this step in either qwen2 or llama decode paths.
             let gemv = GEMV.get_or_init(GemvFamily::new);
-            gemv.run(ctx, gpu, &GemvParams {
-                w, x: xr, y: residual, variant: GemvVariant::WithResidual,
-                residual: None, gate: None, up: None,
-            })
+            gemv.run(
+                ctx,
+                gpu,
+                &GemvParams {
+                    w,
+                    x: xr,
+                    y: residual,
+                    variant: GemvVariant::WithResidual,
+                    residual: None,
+                    gate: None,
+                    up: None,
+                },
+            )
         }
-        Step::GemvResidual { w, input: GemvInput::Raw(x), residual, out } => {
+        Step::GemvResidual {
+            w,
+            input: GemvInput::Raw(x),
+            residual,
+            out,
+        } => {
             // For dtypes WITHOUT a fused residual kernel (Q8_0, Q4K, F32), the
             // fallback path runs a plain GEMV then `residual += result`. `out` may
             // be used as scratch ONLY when it does not alias `residual`; when it
@@ -379,15 +549,33 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                 if crate::types::dtype_rotation_plan(w.dtype) != RotationPlan::None {
                     let h = gemv.rotate(ctx, gpu, w, x, &RotateInputs::default())?;
                     let xr = h.into_buf();
-                    gemv.run(ctx, gpu, &GemvParams {
-                        w, x: &xr, y: residual, variant: GemvVariant::WithResidual,
-                        residual: None, gate: None, up: None,
-                    })
+                    gemv.run(
+                        ctx,
+                        gpu,
+                        &GemvParams {
+                            w,
+                            x: &xr,
+                            y: residual,
+                            variant: GemvVariant::WithResidual,
+                            residual: None,
+                            gate: None,
+                            up: None,
+                        },
+                    )
                 } else {
-                    gemv.run(ctx, gpu, &GemvParams {
-                        w, x, y: residual, variant: GemvVariant::WithResidual,
-                        residual: None, gate: None, up: None,
-                    })
+                    gemv.run(
+                        ctx,
+                        gpu,
+                        &GemvParams {
+                            w,
+                            x,
+                            y: residual,
+                            variant: GemvVariant::WithResidual,
+                            residual: None,
+                            gate: None,
+                            up: None,
+                        },
+                    )
                 }
             } else {
                 // run_auto applies the dtype's rotation (FWHT/Givens) before the
@@ -401,7 +589,8 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                 // and allocate a fresh scratch when they overlap. When `out` is a
                 // genuinely-distinct buffer, reuse it (no alloc churn).
                 if std::ptr::eq(residual, out) || residual.buf.as_ptr() == out.buf.as_ptr() {
-                    let tmp = gpu.alloc_tensor(&[w.m], DType::F32)
+                    let tmp = gpu
+                        .alloc_tensor(&[w.m], DType::F32)
                         .map_err(|e| DispatchError::Hip(e.to_string()))?;
                     gemv.run_auto(ctx, gpu, w, x, &tmp)?;
                     gpu.add_inplace_f32(residual, &tmp)
@@ -416,7 +605,16 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                 Ok(())
             }
         }
-        Step::RmsnormAutomatic { x, norm_weight, x_plain, out, awq_scale, k, eps, rotation } => {
+        Step::RmsnormAutomatic {
+            x,
+            norm_weight,
+            x_plain,
+            out,
+            awq_scale,
+            k,
+            eps,
+            rotation,
+        } => {
             if *rotation == RotationPlan::None {
                 // HFQ4G256 and other non-FWHT dtypes: plain rmsnorm into `out`.
                 // x_plain is not written in this path (scratch only for FWHT path).
@@ -434,14 +632,28 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                     .map_err(|e| DispatchError::Hip(e.to_string()))
             } else {
                 let rotation_family = ROTATION.get_or_init(RotationFamily::new);
-                rotation_family.run(ctx, gpu, RotationParams {
-                    x, x_up: None, w_norm: Some(norm_weight),
-                    x_plain, x_rot: out, awq_scale: *awq_scale,
-                    k: *k, eps: *eps, batch_size: 1,
-                    variant: RotationVariant::WithRmsnorm,
-                    givens_pairs: None, givens_theta: None,
-                    givens_scales: None, givens_krot: None,
-                }).map_err(|e| DispatchError::Hip(e.to_string()))
+                rotation_family
+                    .run(
+                        ctx,
+                        gpu,
+                        RotationParams {
+                            x,
+                            x_up: None,
+                            w_norm: Some(norm_weight),
+                            x_plain,
+                            x_rot: out,
+                            awq_scale: *awq_scale,
+                            k: *k,
+                            eps: *eps,
+                            batch_size: 1,
+                            variant: RotationVariant::WithRmsnorm,
+                            givens_pairs: None,
+                            givens_theta: None,
+                            givens_scales: None,
+                            givens_krot: None,
+                        },
+                    )
+                    .map_err(|e| DispatchError::Hip(e.to_string()))
             }
         }
         Step::Attend { plan, io } => {
@@ -490,16 +702,20 @@ fn launch_fused(
             let (wq, q) = gemv_weight_out(&steps[1]);
             let (wk, k) = gemv_weight_out(&steps[2]);
             let (wv, v) = gemv_weight_out(&steps[3]);
-            fused_qkv.run(ctx, gpu, &FusedQkvParams {
-                kind: key,
-                weights: &[wq.buf, wk.buf, wv.buf],
-                x: activated,
-                outputs: &[q, k, v],
-                m: &[wq.m, wk.m, wv.m],
-                k: wq.k,
-                rot_scratch: &[],
-                batch_size: None,
-            })
+            fused_qkv.run(
+                ctx,
+                gpu,
+                &FusedQkvParams {
+                    kind: key,
+                    weights: &[wq.buf, wk.buf, wv.buf],
+                    x: activated,
+                    outputs: &[q, k, v],
+                    m: &[wq.m, wk.m, wv.m],
+                    k: wq.k,
+                    rot_scratch: &[],
+                    batch_size: None,
+                },
+            )
         }
         KernelKey::FusedGateUpMq4G256Lloyd
         | KernelKey::FusedGateUpMq3G256Lloyd
@@ -508,37 +724,45 @@ fn launch_fused(
         | KernelKey::FusedGateUpQ4K
         | KernelKey::FusedGateUpQ8_0 => {
             let (wg, gate) = gemv_weight_out(&steps[1]);
-            let (wu, up)   = gemv_weight_out(&steps[2]);
-            fused_qkv.run(ctx, gpu, &FusedQkvParams {
-                kind: key,
-                weights: &[wg.buf, wu.buf],
-                x: activated,
-                outputs: &[gate, up],
-                m: &[wg.m, wu.m],
-                k: wg.k,
-                rot_scratch: &[],
-                batch_size: None,
-            })
+            let (wu, up) = gemv_weight_out(&steps[2]);
+            fused_qkv.run(
+                ctx,
+                gpu,
+                &FusedQkvParams {
+                    kind: key,
+                    weights: &[wg.buf, wu.buf],
+                    x: activated,
+                    outputs: &[gate, up],
+                    m: &[wg.m, wu.m],
+                    k: wg.k,
+                    rot_scratch: &[],
+                    batch_size: None,
+                },
+            )
         }
         // ── QKVZA 4-way (DeltaNet) ──
         KernelKey::FusedQkvzaHfq4G256
         | KernelKey::FusedQkvzaMq3G256Lloyd
         | KernelKey::FusedQkvzaMq4G256Lloyd
         | KernelKey::FusedQkvzaHfq6G256 => {
-            let (wqkv, qkv)   = gemv_weight_out(&steps[1]);
-            let (wz, z)       = gemv_weight_out(&steps[2]);
-            let (wb, beta)    = gemv_weight_out(&steps[3]);
-            let (wa, alpha)   = gemv_weight_out(&steps[4]);
-            fused_qkv.run(ctx, gpu, &FusedQkvParams {
-                kind: key,
-                weights: &[wqkv.buf, wz.buf, wb.buf, wa.buf],
-                x: activated,
-                outputs: &[qkv, z, beta, alpha],
-                m: &[wqkv.m, wz.m, wb.m, wa.m],
-                k: wqkv.k,
-                rot_scratch: &[],
-                batch_size: None,
-            })
+            let (wqkv, qkv) = gemv_weight_out(&steps[1]);
+            let (wz, z) = gemv_weight_out(&steps[2]);
+            let (wb, beta) = gemv_weight_out(&steps[3]);
+            let (wa, alpha) = gemv_weight_out(&steps[4]);
+            fused_qkv.run(
+                ctx,
+                gpu,
+                &FusedQkvParams {
+                    kind: key,
+                    weights: &[wqkv.buf, wz.buf, wb.buf, wa.buf],
+                    x: activated,
+                    outputs: &[qkv, z, beta, alpha],
+                    m: &[wqkv.m, wz.m, wb.m, wa.m],
+                    k: wqkv.k,
+                    rot_scratch: &[],
+                    batch_size: None,
+                },
+            )
         }
 
         // ── Paro fused Paro4G128T ────────────────────────────────────────
@@ -553,7 +777,7 @@ fn launch_fused(
         // an owned descriptor over the same VRAM — no Rust borrow held.
         KernelKey::FusedGateUpParo4G128T => {
             let (wg, gate) = gemv_weight_out(&steps[1]);
-            let (wu, up)   = gemv_weight_out(&steps[2]);
+            let (wu, up) = gemv_weight_out(&steps[2]);
             let k = wg.k;
             #[cfg(debug_assertions)]
             eprintln!("[dispatch] GateUp Paro: k={}, mg={}, mu={}", k, wg.m, wu.m);
@@ -562,7 +786,11 @@ fn launch_fused(
             // Also ensure mq_x_rot >= k (the kernel aliases it for x_rot_up).
             gpu.ensure_mq_signs()
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            let rot_aliases: Vec<GpuTensor> = gpu.scratch.paro_fused_scratch.as_ref().unwrap()
+            let rot_aliases: Vec<GpuTensor> = gpu
+                .scratch
+                .paro_fused_scratch
+                .as_ref()
+                .unwrap()
                 .iter()
                 .map(|t| GpuTensor {
                     buf: unsafe { t.buf.alias() },
@@ -574,31 +802,44 @@ fn launch_fused(
             {
                 let gate_buf = &gpu.scratch.paro_fused_scratch.as_ref().unwrap()[0];
                 let up_internal = gpu.scratch.mq_x_rot.as_ref().unwrap();
-                debug_assert!(gate_buf.buf.as_ptr() != up_internal.buf.as_ptr(),
-                    "Paro gate+up: x_rot_gate must not alias mq_x_rot");
+                debug_assert!(
+                    gate_buf.buf.as_ptr() != up_internal.buf.as_ptr(),
+                    "Paro gate+up: x_rot_gate must not alias mq_x_rot"
+                );
             }
-            fused_qkv.run(ctx, gpu, &FusedQkvParams {
-                kind: key,
-                weights: &[wg.buf, wu.buf],
-                x: activated,
-                outputs: &[gate, up],
-                m: &[wg.m, wu.m],
-                k,
-                rot_scratch: &rot_aliases,
-                batch_size: None,
-            })
+            fused_qkv.run(
+                ctx,
+                gpu,
+                &FusedQkvParams {
+                    kind: key,
+                    weights: &[wg.buf, wu.buf],
+                    x: activated,
+                    outputs: &[gate, up],
+                    m: &[wg.m, wu.m],
+                    k,
+                    rot_scratch: &rot_aliases,
+                    batch_size: None,
+                },
+            )
         }
         KernelKey::FusedQkvzaParo4G128T => {
-            let (wqkv, qkv)   = gemv_weight_out(&steps[1]);
-            let (wz, z)       = gemv_weight_out(&steps[2]);
-            let (wb, beta)    = gemv_weight_out(&steps[3]);
-            let (wa, alpha)   = gemv_weight_out(&steps[4]);
+            let (wqkv, qkv) = gemv_weight_out(&steps[1]);
+            let (wz, z) = gemv_weight_out(&steps[2]);
+            let (wb, beta) = gemv_weight_out(&steps[3]);
+            let (wa, alpha) = gemv_weight_out(&steps[4]);
             let k = wqkv.k;
             #[cfg(debug_assertions)]
-            eprintln!("[dispatch] QKVZA Paro: k={}, mqkv={}, mz={}, mbeta={}, malpha={}", k, wqkv.m, wz.m, wb.m, wa.m);
+            eprintln!(
+                "[dispatch] QKVZA Paro: k={}, mqkv={}, mz={}, mbeta={}, malpha={}",
+                k, wqkv.m, wz.m, wb.m, wa.m
+            );
             gpu.ensure_paro_fused_scratch(k)
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            let rot_aliases: Vec<GpuTensor> = gpu.scratch.paro_fused_scratch.as_ref().unwrap()
+            let rot_aliases: Vec<GpuTensor> = gpu
+                .scratch
+                .paro_fused_scratch
+                .as_ref()
+                .unwrap()
                 .iter()
                 .map(|t| GpuTensor {
                     buf: unsafe { t.buf.alias() },
@@ -606,16 +847,20 @@ fn launch_fused(
                     dtype: t.dtype,
                 })
                 .collect();
-            fused_qkv.run(ctx, gpu, &FusedQkvParams {
-                kind: key,
-                weights: &[wqkv.buf, wz.buf, wb.buf, wa.buf],
-                x: activated,
-                outputs: &[qkv, z, beta, alpha],
-                m: &[wqkv.m, wz.m, wb.m, wa.m],
-                k,
-                rot_scratch: &rot_aliases,
-                batch_size: None,
-            })
+            fused_qkv.run(
+                ctx,
+                gpu,
+                &FusedQkvParams {
+                    kind: key,
+                    weights: &[wqkv.buf, wz.buf, wb.buf, wa.buf],
+                    x: activated,
+                    outputs: &[qkv, z, beta, alpha],
+                    m: &[wqkv.m, wz.m, wb.m, wa.m],
+                    k,
+                    rot_scratch: &rot_aliases,
+                    batch_size: None,
+                },
+            )
         }
         KernelKey::FusedQkvParo4G128T => {
             let (wq, q) = gemv_weight_out(&steps[1]);
@@ -623,10 +868,17 @@ fn launch_fused(
             let (wv, v) = gemv_weight_out(&steps[3]);
             let kk = wq.k;
             #[cfg(debug_assertions)]
-            eprintln!("[dispatch] QKV Paro: k={}, mq={}, mk={}, mv={}", kk, wq.m, wk.m, wv.m);
+            eprintln!(
+                "[dispatch] QKV Paro: k={}, mq={}, mk={}, mv={}",
+                kk, wq.m, wk.m, wv.m
+            );
             gpu.ensure_paro_fused_scratch(kk)
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            let rot_aliases: Vec<GpuTensor> = gpu.scratch.paro_fused_scratch.as_ref().unwrap()
+            let rot_aliases: Vec<GpuTensor> = gpu
+                .scratch
+                .paro_fused_scratch
+                .as_ref()
+                .unwrap()
                 .iter()
                 .map(|t| GpuTensor {
                     buf: unsafe { t.buf.alias() },
@@ -634,16 +886,20 @@ fn launch_fused(
                     dtype: t.dtype,
                 })
                 .collect();
-            fused_qkv.run(ctx, gpu, &FusedQkvParams {
-                kind: key,
-                weights: &[wq.buf, wk.buf, wv.buf],
-                x: activated,
-                outputs: &[q, k, v],
-                m: &[wq.m, wk.m, wv.m],
-                k: kk,
-                rot_scratch: &rot_aliases,
-                batch_size: None,
-            })
+            fused_qkv.run(
+                ctx,
+                gpu,
+                &FusedQkvParams {
+                    kind: key,
+                    weights: &[wq.buf, wk.buf, wv.buf],
+                    x: activated,
+                    outputs: &[q, k, v],
+                    m: &[wq.m, wk.m, wv.m],
+                    k: kk,
+                    rot_scratch: &rot_aliases,
+                    batch_size: None,
+                },
+            )
         }
         _ => Err(DispatchError::MissingImpl { key }),
     }
@@ -661,19 +917,37 @@ mod tests {
     #[test]
     fn qkvza_fused_table_entries_exist() {
         let keys: Vec<_> = FUSED_TABLE.iter().map(|e| e.key).collect();
-        assert!(keys.contains(&KernelKey::FusedQkvzaMq4G256Lloyd), "FusedQkvzaMq4G256Lloyd missing");
-        assert!(keys.contains(&KernelKey::FusedQkvzaMq3G256Lloyd), "FusedQkvzaMq3G256Lloyd missing");
-        assert!(keys.contains(&KernelKey::FusedQkvzaHfq4G256),     "FusedQkvzaHfq4G256 missing");
-        assert!(keys.contains(&KernelKey::FusedQkvzaHfq6G256),     "FusedQkvzaHfq6G256 missing");
+        assert!(
+            keys.contains(&KernelKey::FusedQkvzaMq4G256Lloyd),
+            "FusedQkvzaMq4G256Lloyd missing"
+        );
+        assert!(
+            keys.contains(&KernelKey::FusedQkvzaMq3G256Lloyd),
+            "FusedQkvzaMq3G256Lloyd missing"
+        );
+        assert!(
+            keys.contains(&KernelKey::FusedQkvzaHfq4G256),
+            "FusedQkvzaHfq4G256 missing"
+        );
+        assert!(
+            keys.contains(&KernelKey::FusedQkvzaHfq6G256),
+            "FusedQkvzaHfq6G256 missing"
+        );
 
         for entry in FUSED_TABLE.iter() {
-            if matches!(entry.key,
+            if matches!(
+                entry.key,
                 KernelKey::FusedQkvzaMq4G256Lloyd
-                | KernelKey::FusedQkvzaMq3G256Lloyd
-                | KernelKey::FusedQkvzaHfq4G256
-                | KernelKey::FusedQkvzaHfq6G256
+                    | KernelKey::FusedQkvzaMq3G256Lloyd
+                    | KernelKey::FusedQkvzaHfq4G256
+                    | KernelKey::FusedQkvzaHfq6G256
             ) {
-                assert_eq!(entry.ops.len(), 5, "QKVZA entry {:?} should have 5 ops", entry.key);
+                assert_eq!(
+                    entry.ops.len(),
+                    5,
+                    "QKVZA entry {:?} should have 5 ops",
+                    entry.key
+                );
             }
         }
     }
@@ -697,12 +971,17 @@ mod tests {
         let paro = KernelKey::for_gemv(DType::ParoQ4G128, GemvVariant::Plain, false);
         let q8 = KernelKey::for_gemv(DType::Q8_0, GemvVariant::Plain, false);
         for key in [paro.ok(), q8.ok()].into_iter().flatten() {
-            assert!(!matches!(key,
-                KernelKey::FusedQkvzaMq4G256Lloyd
-                | KernelKey::FusedQkvzaMq3G256Lloyd
-                | KernelKey::FusedQkvzaHfq4G256
-                | KernelKey::FusedQkvzaHfq6G256
-            ), "ParoQ4G128/Q8_0 must not resolve to a fused QKVZA key, got {:?}", key);
+            assert!(
+                !matches!(
+                    key,
+                    KernelKey::FusedQkvzaMq4G256Lloyd
+                        | KernelKey::FusedQkvzaMq3G256Lloyd
+                        | KernelKey::FusedQkvzaHfq4G256
+                        | KernelKey::FusedQkvzaHfq6G256
+                ),
+                "ParoQ4G128/Q8_0 must not resolve to a fused QKVZA key, got {:?}",
+                key
+            );
         }
     }
 
@@ -713,12 +992,15 @@ mod tests {
         // returns false even for otherwise-matching dtypes. We can't build full
         // Steps with real GPU tensors, so we test the guard logic directly with
         // the flag set.
-        use std::sync::Arc;
         use rdna_compute::feature_flags::FeatureFlags;
+        use std::sync::Arc;
         let mut flags = FeatureFlags::from_env_for_test("gfx1100");
         flags.force_unfused = true;
         let ctx = DispatchCtx {
-            arch: rdna_compute::arch_caps::ArchCaps::new("gfx1100", Arc::new(FeatureFlags::from_env_for_test("gfx1100"))),
+            arch: rdna_compute::arch_caps::ArchCaps::new(
+                "gfx1100",
+                Arc::new(FeatureFlags::from_env_for_test("gfx1100")),
+            ),
             flags: Arc::new(flags),
             resources: crate::resource::ResourceManager::for_test(),
         };
@@ -743,12 +1025,16 @@ mod tests {
         // (They may be Err for arches without support, which is also fine.)
         for key in [paro_q4_key, q8_key] {
             if let Ok(k) = key {
-                assert!(!matches!(k,
-                    KernelKey::FusedQkvzaMq4G256Lloyd
-                    | KernelKey::FusedQkvzaMq3G256Lloyd
-                    | KernelKey::FusedQkvzaHfq4G256
-                    | KernelKey::FusedQkvzaHfq6G256
-                ), "ParoQ4G128/Q8_0 should not resolve to a fused QKVZA key");
+                assert!(
+                    !matches!(
+                        k,
+                        KernelKey::FusedQkvzaMq4G256Lloyd
+                            | KernelKey::FusedQkvzaMq3G256Lloyd
+                            | KernelKey::FusedQkvzaHfq4G256
+                            | KernelKey::FusedQkvzaHfq6G256
+                    ),
+                    "ParoQ4G128/Q8_0 should not resolve to a fused QKVZA key"
+                );
             }
         }
     }
@@ -766,10 +1052,16 @@ mod tests {
         ];
 
         for &key in wmma_keys {
-            assert!(family.resolve(key, &ctx1100, None).is_ok(),
-                "QKVZA {:?} should resolve on gfx1100", key);
-            assert!(family.resolve(key, &ctx1201, None).is_ok(),
-                "QKVZA {:?} should resolve on gfx1201", key);
+            assert!(
+                family.resolve(key, &ctx1100, None).is_ok(),
+                "QKVZA {:?} should resolve on gfx1100",
+                key
+            );
+            assert!(
+                family.resolve(key, &ctx1201, None).is_ok(),
+                "QKVZA {:?} should resolve on gfx1201",
+                key
+            );
         }
 
         // dp4a key: just verify no panic
@@ -781,9 +1073,18 @@ mod tests {
     fn paro_guards_reject_force_unfused() {
         let ctx = DispatchCtx::for_test("gfx1100");
         let empty: &[Step] = &[];
-        assert!(!guard_gate_up_paro4g128t(empty, &ctx), "force_unfused must reject gate_up_paro");
-        assert!(!guard_qkvza_paro4g128t(empty, &ctx), "force_unfused must reject qkvza_paro");
-        assert!(!guard_qkv_paro4g128t(empty, &ctx), "force_unfused must reject qkv_paro");
+        assert!(
+            !guard_gate_up_paro4g128t(empty, &ctx),
+            "force_unfused must reject gate_up_paro"
+        );
+        assert!(
+            !guard_qkvza_paro4g128t(empty, &ctx),
+            "force_unfused must reject qkvza_paro"
+        );
+        assert!(
+            !guard_qkv_paro4g128t(empty, &ctx),
+            "force_unfused must reject qkv_paro"
+        );
     }
 
     #[test]
@@ -801,9 +1102,18 @@ mod tests {
     #[test]
     fn paro_fused_table_entries_exist() {
         let keys: Vec<_> = FUSED_TABLE.iter().map(|e| e.key).collect();
-        assert!(keys.contains(&KernelKey::FusedGateUpParo4G128T), "FusedGateUpParo4G128T missing from FUSED_TABLE");
-        assert!(keys.contains(&KernelKey::FusedQkvzaParo4G128T), "FusedQkvzaParo4G128T missing from FUSED_TABLE");
-        assert!(keys.contains(&KernelKey::FusedQkvParo4G128T),   "FusedQkvParo4G128T missing from FUSED_TABLE");
+        assert!(
+            keys.contains(&KernelKey::FusedGateUpParo4G128T),
+            "FusedGateUpParo4G128T missing from FUSED_TABLE"
+        );
+        assert!(
+            keys.contains(&KernelKey::FusedQkvzaParo4G128T),
+            "FusedQkvzaParo4G128T missing from FUSED_TABLE"
+        );
+        assert!(
+            keys.contains(&KernelKey::FusedQkvParo4G128T),
+            "FusedQkvParo4G128T missing from FUSED_TABLE"
+        );
     }
 
     #[test]
@@ -820,10 +1130,16 @@ mod tests {
 
         for &key in paro_keys {
             // Paro uses dp4a — should resolve on gfx1100 (RDNA3) and gfx1201 (RDNA4).
-            assert!(family.resolve(key, &ctx1100, None).is_ok(),
-                "Paro key {:?} should resolve on gfx1100", key);
-            assert!(family.resolve(key, &ctx1201, None).is_ok(),
-                "Paro key {:?} should resolve on gfx1201", key);
+            assert!(
+                family.resolve(key, &ctx1100, None).is_ok(),
+                "Paro key {:?} should resolve on gfx1100",
+                key
+            );
+            assert!(
+                family.resolve(key, &ctx1201, None).is_ok(),
+                "Paro key {:?} should resolve on gfx1201",
+                key
+            );
         }
     }
 
@@ -833,19 +1149,31 @@ mod tests {
     fn q4k_q8_0_guards_reject_force_unfused() {
         // All three new guards must return false when force_unfused is set,
         // even for empty slices (the guard opens with the early-return).
-        use std::sync::Arc;
         use rdna_compute::feature_flags::FeatureFlags;
+        use std::sync::Arc;
         let mut flags = FeatureFlags::from_env_for_test("gfx1100");
         flags.force_unfused = true;
         let ctx = DispatchCtx {
-            arch: rdna_compute::arch_caps::ArchCaps::new("gfx1100", Arc::new(FeatureFlags::from_env_for_test("gfx1100"))),
+            arch: rdna_compute::arch_caps::ArchCaps::new(
+                "gfx1100",
+                Arc::new(FeatureFlags::from_env_for_test("gfx1100")),
+            ),
             flags: Arc::new(flags),
             resources: crate::resource::ResourceManager::for_test(),
         };
         let empty: &[Step] = &[];
-        assert!(!guard_qkv_q4k(empty, &ctx), "guard_qkv_q4k must reject force_unfused");
-        assert!(!guard_gate_up_q4k(empty, &ctx), "guard_gate_up_q4k must reject force_unfused");
-        assert!(!guard_gate_up_q8_0(empty, &ctx), "guard_gate_up_q8_0 must reject force_unfused");
+        assert!(
+            !guard_qkv_q4k(empty, &ctx),
+            "guard_qkv_q4k must reject force_unfused"
+        );
+        assert!(
+            !guard_gate_up_q4k(empty, &ctx),
+            "guard_gate_up_q4k must reject force_unfused"
+        );
+        assert!(
+            !guard_gate_up_q8_0(empty, &ctx),
+            "guard_gate_up_q8_0 must reject force_unfused"
+        );
     }
 
     #[test]
@@ -853,15 +1181,30 @@ mod tests {
         let ctx = DispatchCtx::for_test("gfx1100");
         let empty: &[Step] = &[];
         assert!(!guard_qkv_q4k(empty, &ctx), "Q4K QKV guard needs len==4");
-        assert!(!guard_gate_up_q4k(empty, &ctx), "Q4K gate+up guard needs len==3");
-        assert!(!guard_gate_up_q8_0(empty, &ctx), "Q8_0 gate+up guard needs len==3");
+        assert!(
+            !guard_gate_up_q4k(empty, &ctx),
+            "Q4K gate+up guard needs len==3"
+        );
+        assert!(
+            !guard_gate_up_q8_0(empty, &ctx),
+            "Q8_0 gate+up guard needs len==3"
+        );
     }
 
     #[test]
     fn q4k_q8_0_fused_table_entries_exist() {
         let keys: Vec<_> = FUSED_TABLE.iter().map(|e| e.key).collect();
-        assert!(keys.contains(&KernelKey::FusedQkvQ4K), "FusedQkvQ4K missing from FUSED_TABLE");
-        assert!(keys.contains(&KernelKey::FusedGateUpQ4K), "FusedGateUpQ4K missing from FUSED_TABLE");
-        assert!(keys.contains(&KernelKey::FusedGateUpQ8_0), "FusedGateUpQ8_0 missing from FUSED_TABLE");
+        assert!(
+            keys.contains(&KernelKey::FusedQkvQ4K),
+            "FusedQkvQ4K missing from FUSED_TABLE"
+        );
+        assert!(
+            keys.contains(&KernelKey::FusedGateUpQ4K),
+            "FusedGateUpQ4K missing from FUSED_TABLE"
+        );
+        assert!(
+            keys.contains(&KernelKey::FusedGateUpQ8_0),
+            "FusedGateUpQ8_0 missing from FUSED_TABLE"
+        );
     }
 }
