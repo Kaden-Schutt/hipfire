@@ -47,13 +47,14 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Rust server `/v1/models` response rendering now reuses `hipfire-model` OpenAI-compatible list rendering instead of route-local JSON construction.
 - Eval DFlash draft auto-discovery now reuses `hipfire-model` sidecar discovery instead of eval-local candidate parsing.
 - Rust scheduler worker-key identity and compatibility helpers now reuse `hipfire-model` ownership instead of scheduler-local model identity code.
+- `hipfire-model` now owns shared accelerator inventory/device contracts and JSON rendering for control-plane health/status payloads.
 - Rust scheduler now consumes model-worker identity helpers directly from `hipfire-model` instead of re-exporting them through scheduler.
 - Daemon and state runtime-worker views now consume model-worker runtime id construction and `worker_id` / `worker_key_id` alias parsing from `hipfire-model` instead of `hipfire-state`.
 - Generate batch validators now use `hipfire-model` worker/model identity requirement policy instead of local `worker_key_id` / `model` checks.
 - Daemon Qwen3.5 family, dense, and MoE runtime guards now use `hipfire-model` architecture classifiers instead of daemon-local arch-id predicates.
 - Rust scheduler policy parity tests now cover remaining Bun policy cases for realtime dispatch, legacy wait mapping, opportunistic pairing, spill gating, and clamped residency/spill limits.
 - Rust server `/health` now consumes scheduler-owned JSON builders for scheduler-derived prefill/decode/state-cache metadata while live Rust request handling remains daemon-serial.
-- Rust server `/health.runtime_workers` now consumes `hipfire-state` runtime-worker health summary rendering, currently reporting an empty adapter state until Rust owns resident workers.
+- Rust server `/health.runtime_workers` now consumes `hipfire-state` runtime-worker health summary rendering and includes model-owned accelerator inventory payloads, currently reporting `source=not_probed` until daemon-owned device probing is wired and an empty adapter state until Rust owns resident workers.
 - Generate Qwen3.5 dense/MoE batch backend selection and decode scheduler fallback metadata now reuse `hipfire-model` architecture classification instead of local numeric arch checks.
 - Daemon text/VL generation loop guards now consume `hipfire-generate` ownership directly; `hipfire-runtime::loop_guard` remains only as a source-compatible wrapper over the generate-owned policy.
 - Daemon text output filtering now consumes `hipfire-generate` EOS/holdback/strip-think filter ownership directly; `hipfire-runtime::eos_filter` remains only as a source-compatible re-export.

@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use hipfire_model::{is_qwen35_family_arch_id, parse_model_worker_id, ModelWorkerId};
+use hipfire_model::{
+    accelerator_inventory_json, is_qwen35_family_arch_id, parse_model_worker_id,
+    AcceleratorInventory, ModelWorkerId,
+};
 
 #[derive(Clone, Debug)]
 pub struct SessionStateReservation {
@@ -625,6 +628,26 @@ pub fn runtime_workers_health_json(
     memory_pressure_rejected_total: usize,
     memory_pressure_last_reason: &str,
 ) -> serde_json::Value {
+    runtime_workers_health_json_with_inventory(
+        workers,
+        max_resident_workers,
+        current_worker_key_id,
+        resident_state_budget_bytes,
+        memory_pressure_rejected_total,
+        memory_pressure_last_reason,
+        &AcceleratorInventory::not_probed(),
+    )
+}
+
+pub fn runtime_workers_health_json_with_inventory(
+    workers: &[ModelWorkerRuntimeView],
+    max_resident_workers: usize,
+    current_worker_key_id: Option<&str>,
+    resident_state_budget_bytes: usize,
+    memory_pressure_rejected_total: usize,
+    memory_pressure_last_reason: &str,
+    accelerator_inventory: &AcceleratorInventory,
+) -> serde_json::Value {
     let resident_workers = workers.len();
     let state_page_descriptor_entries = workers
         .iter()
@@ -679,6 +702,7 @@ pub fn runtime_workers_health_json(
         "resident_state_budget_bytes": resident_state_budget_bytes,
         "memory_pressure_rejected_total": memory_pressure_rejected_total,
         "memory_pressure_last_reason": memory_pressure_last_reason,
+        "accelerator_inventory": accelerator_inventory_json(accelerator_inventory),
         "workers": worker_rows,
     })
 }
@@ -1772,6 +1796,8 @@ mod tests {
         assert_eq!(json["generic_state_arena"], false);
         assert_eq!(json["state_page_descriptor_entries"], 0);
         assert_eq!(json["state_page_descriptor_bytes"], 0);
+        assert_eq!(json["accelerator_inventory"]["source"], "not_probed");
+        assert_eq!(json["accelerator_inventory"]["device_count"], 0);
         assert_eq!(json["workers"], serde_json::json!([]));
     }
 
@@ -1839,6 +1865,34 @@ mod tests {
         assert_eq!(json["memory_pressure_rejected_total"], 3);
         assert_eq!(json["memory_pressure_last_reason"], "budget");
         assert_eq!(json["workers"][0]["state_page_descriptor_bytes"], 2048);
+    }
+
+    #[test]
+    fn runtime_workers_health_json_can_report_accelerator_inventory() {
+        let inventory = AcceleratorInventory::from_devices(
+            "daemon",
+            vec![hipfire_model::AcceleratorDeviceInfo::hip(
+                "1",
+                1,
+                Some("gfx1151".to_string()),
+                Some(96_000_000_000),
+                Some(true),
+                Some("HIP 7.2".to_string()),
+            )],
+        );
+        let json =
+            runtime_workers_health_json_with_inventory(&[], 0, None, 0, 0, "none", &inventory);
+
+        assert_eq!(json["accelerator_inventory"]["source"], "daemon");
+        assert_eq!(json["accelerator_inventory"]["device_count"], 1);
+        assert_eq!(
+            json["accelerator_inventory"]["devices"][0]["device_class"],
+            "integrated"
+        );
+        assert_eq!(
+            json["accelerator_inventory"]["devices"][0]["arch"],
+            "gfx1151"
+        );
     }
 
     #[test]

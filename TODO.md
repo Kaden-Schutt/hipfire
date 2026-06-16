@@ -6,8 +6,10 @@
 
 - Extend startup device inventory into daemon-owned placement and scheduler
   routing:
-  - server startup now exposes basic accelerator inventory and worker identity
-    carries accelerator kind/device id;
+  - `hipfire-model` now owns a shared accelerator inventory/device contract,
+    and `/health.runtime_workers` reports the shared inventory payload;
+  - server health currently reports `source=not_probed` until daemon-owned
+    probing is wired, while worker identity carries accelerator kind/device id;
   - enumerate all HIP GPUs at daemon startup, not just selected device 0;
   - report per-device id, arch, VRAM, integrated/discrete class, and HIP
     runtime from the daemon as well as the server;

@@ -230,6 +230,104 @@ pub fn same_model_worker_key(a: &ModelWorkerKey, b: &ModelWorkerKey) -> bool {
     model_worker_key_id(a) == model_worker_key_id(b)
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AcceleratorInventory {
+    pub source: String,
+    pub devices: Vec<AcceleratorDeviceInfo>,
+}
+
+impl AcceleratorInventory {
+    pub fn not_probed() -> Self {
+        Self {
+            source: "not_probed".to_string(),
+            devices: Vec::new(),
+        }
+    }
+
+    pub fn from_devices(source: impl Into<String>, devices: Vec<AcceleratorDeviceInfo>) -> Self {
+        Self {
+            source: source.into(),
+            devices,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AcceleratorDeviceInfo {
+    pub kind: String,
+    pub device_id: String,
+    pub ordinal: Option<usize>,
+    pub arch: Option<String>,
+    pub name: Option<String>,
+    pub total_memory_bytes: Option<u64>,
+    pub integrated: Option<bool>,
+    pub runtime: Option<String>,
+    pub available: bool,
+    pub selected: bool,
+    pub reason: Option<String>,
+}
+
+impl AcceleratorDeviceInfo {
+    pub fn hip(
+        device_id: impl Into<String>,
+        ordinal: usize,
+        arch: Option<String>,
+        total_memory_bytes: Option<u64>,
+        integrated: Option<bool>,
+        runtime: Option<String>,
+    ) -> Self {
+        Self {
+            kind: "hip".to_string(),
+            device_id: device_id.into(),
+            ordinal: Some(ordinal),
+            arch,
+            total_memory_bytes,
+            integrated,
+            runtime,
+            available: true,
+            ..Default::default()
+        }
+    }
+
+    pub fn device_class(&self) -> &'static str {
+        match self.integrated {
+            Some(true) => "integrated",
+            Some(false) => "discrete",
+            None => "unknown",
+        }
+    }
+}
+
+pub fn accelerator_inventory_json(inventory: &AcceleratorInventory) -> serde_json::Value {
+    let devices = inventory
+        .devices
+        .iter()
+        .map(accelerator_device_info_json)
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "source": inventory.source,
+        "device_count": inventory.devices.len(),
+        "devices": devices,
+    })
+}
+
+pub fn accelerator_device_info_json(device: &AcceleratorDeviceInfo) -> serde_json::Value {
+    serde_json::json!({
+        "kind": device.kind,
+        "device_id": device.device_id,
+        "ordinal": device.ordinal,
+        "arch": device.arch,
+        "name": device.name,
+        "total_memory_bytes": device.total_memory_bytes,
+        "integrated": device.integrated,
+        "device_class": device.device_class(),
+        "runtime": device.runtime,
+        "available": device.available,
+        "selected": device.selected,
+        "reason": device.reason,
+    })
+}
+
 /// Unified interface for reading model data from HFQ files or safetensors
 /// directories. Concrete loaders live in backend/runtime crates.
 pub trait ModelSource {
@@ -870,6 +968,43 @@ mod tests {
         );
         assert_eq!(model_worker_key_id(&base), model_worker_key_id(&shuffled));
         assert!(same_model_worker_key(&base, &shuffled));
+    }
+
+    #[test]
+    fn accelerator_inventory_json_reports_empty_contract_state() {
+        let json = accelerator_inventory_json(&AcceleratorInventory::not_probed());
+
+        assert_eq!(json["source"], "not_probed");
+        assert_eq!(json["device_count"], 0);
+        assert_eq!(json["devices"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn accelerator_inventory_json_reports_hip_device_metadata() {
+        let mut device = AcceleratorDeviceInfo::hip(
+            "0",
+            0,
+            Some("gfx1201".to_string()),
+            Some(24_000_000_000),
+            Some(false),
+            Some("HIP 6.4".to_string()),
+        );
+        device.selected = true;
+        let inventory = AcceleratorInventory::from_devices("daemon", vec![device]);
+        let json = accelerator_inventory_json(&inventory);
+
+        assert_eq!(json["source"], "daemon");
+        assert_eq!(json["device_count"], 1);
+        assert_eq!(json["devices"][0]["kind"], "hip");
+        assert_eq!(json["devices"][0]["device_id"], "0");
+        assert_eq!(json["devices"][0]["ordinal"], 0);
+        assert_eq!(json["devices"][0]["arch"], "gfx1201");
+        assert_eq!(json["devices"][0]["total_memory_bytes"], 24_000_000_000u64);
+        assert_eq!(json["devices"][0]["integrated"], false);
+        assert_eq!(json["devices"][0]["device_class"], "discrete");
+        assert_eq!(json["devices"][0]["runtime"], "HIP 6.4");
+        assert_eq!(json["devices"][0]["available"], true);
+        assert_eq!(json["devices"][0]["selected"], true);
     }
 
     #[test]
