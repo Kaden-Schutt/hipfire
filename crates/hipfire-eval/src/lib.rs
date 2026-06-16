@@ -10028,8 +10028,10 @@ fn run_eval_batteries(
 }
 
 fn daemon_shared_model_load_enabled(config: &EvalConfig) -> bool {
-    config.executor == EvalExecutorMode::Daemon
-        && config.runs == 1
+    matches!(
+        config.executor,
+        EvalExecutorMode::Auto | EvalExecutorMode::Daemon
+    ) && config.runs == 1
         && config.warmup_runs == 0
         && !config.benchmark
         && config
@@ -10038,10 +10040,25 @@ fn daemon_shared_model_load_enabled(config: &EvalConfig) -> bool {
             .filter(|battery| daemon_shared_model_load_battery(**battery))
             .count()
             > 1
+        && config
+            .batteries
+            .iter()
+            .filter(|battery| daemon_shared_model_load_battery(**battery))
+            .all(|battery| daemon_executor_available_for(config, *battery))
 }
 
 fn daemon_shared_model_load_battery(battery: BatteryId) -> bool {
     matches!(battery, BatteryId::Smoke | BatteryId::Speed)
+}
+
+fn daemon_executor_available_for(config: &EvalConfig, battery: BatteryId) -> bool {
+    if !matches!(battery, BatteryId::Smoke | BatteryId::Speed) {
+        return false;
+    }
+    if !Path::new(&config.model).exists() {
+        return true;
+    }
+    hipfire_daemon_adapter::find_daemon_bin().is_some()
 }
 
 fn run_battery_cached(
@@ -10544,6 +10561,11 @@ fn run_battery(
         }
     }
     if config.executor == EvalExecutorMode::Daemon {
+        if let Some(rows) = daemon_battery_rows(battery, config, ctx, datasets) {
+            return rows;
+        }
+    }
+    if config.executor == EvalExecutorMode::Auto && daemon_executor_available_for(config, battery) {
         if let Some(rows) = daemon_battery_rows(battery, config, ctx, datasets) {
             return rows;
         }
@@ -12139,8 +12161,6 @@ mod tests {
             "hipfire-eval",
             "--model",
             "missing-local-model.hfq",
-            "--executor",
-            "daemon",
             "--battery",
             "smoke,speed",
             "--no-cache",
@@ -13169,10 +13189,7 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
     }
 
     #[test]
-    fn auto_executor_uses_examples_when_binaries_are_available() {
-        if resolve_run_example_bin().is_none() {
-            return;
-        }
+    fn auto_executor_uses_daemon_for_implemented_smoke_rows() {
         let cfg = parse_args_from([
             "hipfire-eval",
             "--model",
@@ -13194,16 +13211,55 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
         };
 
         let rows = run_battery(BatteryId::Smoke, &cfg, &ctx, &[]);
-        assert_eq!(rows[0].case_id, "finite_greedy_decode");
+        assert_eq!(rows[0].case_id, "load_metadata");
         assert_eq!(
-            rows[0].prompt_path.as_deref(),
+            rows[0].metrics.get("executor").and_then(Value::as_str),
+            Some("daemon")
+        );
+        assert_eq!(rows[1].case_id, "finite_greedy_decode");
+        assert_eq!(
+            rows[1].prompt_path.as_deref(),
             Some("benchmarks/prompts/qwen2_smoke.txt")
         );
-        assert!(rows[0]
+        assert!(rows[1]
             .reason
             .as_deref()
             .unwrap_or("")
             .contains("local filesystem path"));
+    }
+
+    #[test]
+    fn explicit_examples_executor_still_uses_examples_when_available() {
+        if resolve_run_example_bin().is_none() {
+            return;
+        }
+        let cfg = parse_args_from([
+            "hipfire-eval",
+            "--model",
+            "missing-local-model.hfq",
+            "--executor",
+            "examples",
+            "--battery",
+            "smoke",
+        ])
+        .unwrap();
+        let ctx = EvalContext {
+            commit_sha: None,
+            git_branch: None,
+            git_describe: None,
+            git_dirty: None,
+            binary_hash: None,
+            arch: None,
+            rocm: None,
+            host_profile: test_host_profile(),
+        };
+
+        let rows = run_battery(BatteryId::Smoke, &cfg, &ctx, &[]);
+        assert_eq!(rows[0].case_id, "finite_greedy_decode");
+        assert_eq!(
+            rows[0].metrics.get("executor").and_then(Value::as_str),
+            Some("examples")
+        );
     }
 
     #[test]

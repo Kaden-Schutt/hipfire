@@ -64,6 +64,8 @@
       reset/recall, and explicit `--executor daemon --battery speed` timing
       anchors now use the shared JSONL daemon adapter; examples-backed pp32/pp128
       speed-gate rows remain the benchmark-grade default;
+    - default `--executor auto` now prefers daemon-backed smoke/speed rows and
+      shares one daemon load across those rows when they run together;
     - add process and handle ownership so one model-load maps to one resident daemon
       process per loaded quant/placement;
     - make battery rows consume a shared model cache key and avoid repeated
