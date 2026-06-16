@@ -105,6 +105,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Coherence daemon binary discovery now reuses `hipfire-daemon-adapter` ownership instead of coherence-local repository probing.
 - Rust server scheduler construction can now pass daemon accelerator inventory into `hipfire-scheduler` prefill admission, preserving unprobed compatibility and rejecting unavailable worker devices.
 - Eval artifact row records now reuse `hipfire-evidence` record contracts instead of eval-local JSON construction.
+- Runtime oneshot evidence and sparse router-histogram artifact rendering now reuse `hipfire-evidence` writer contracts; Qwen3.5 remains a model-specific histogram gatherer.
 - Eval comparison, admission, and evidence artifacts now reuse `hipfire-evidence` run-provenance contracts instead of eval-local provenance structs.
 - Eval artifact index entries now reuse `hipfire-evidence` index rendering instead of eval-local JSON construction.
 - Eval comparison, admission, prompt-ledger, and host-profile artifact index entries now reuse `hipfire-evidence` variant renderers instead of eval-local JSON mutation.

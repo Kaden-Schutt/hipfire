@@ -4,7 +4,7 @@
 
 //! Evidence provenance helpers shared by Hipfire eval and gate tooling.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -103,6 +103,297 @@ pub const STANDARD_EVIDENCE_ARTIFACT_SPECS: &[EvidenceArtifactSpec] = &[
         ],
     },
 ];
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeOneshotEvidence<'a> {
+    pub case_id: &'a str,
+    pub prompt_path: &'a str,
+    pub prompt_tokens: usize,
+    pub emitted_tokens: usize,
+    pub prefill_forward_calls: usize,
+    pub decode_forward_calls: usize,
+    pub prefill_secs: f64,
+    pub decode_secs: f64,
+    pub ttft_ms: f64,
+    pub vram_used_mb: u64,
+    pub vram_total_mb: u64,
+}
+
+pub fn write_runtime_oneshot_evidence(
+    dir: &Path,
+    runtime_context: &Value,
+    evidence: RuntimeOneshotEvidence<'_>,
+) -> std::io::Result<()> {
+    let prefill_tok_s = evidence.prompt_tokens as f64 / evidence.prefill_secs.max(1e-9);
+    let decode_tok_s = evidence.emitted_tokens as f64 / evidence.decode_secs.max(1e-9);
+    let base = json!({
+        "case_id": evidence.case_id,
+        "prompt_path": evidence.prompt_path,
+        "hipfire_runtime_context": runtime_context,
+        "metrics": {
+            "prompt_tokens": evidence.prompt_tokens,
+            "decode_tokens_emitted": evidence.emitted_tokens,
+        },
+    });
+
+    write_json_pretty_value(
+        &dir.join("performance.json"),
+        &json!({
+            "schema": 1,
+            "kind": "performance",
+            "hipfire_runtime_context": runtime_context,
+            "records": [{
+                "case_id": evidence.case_id,
+                "prompt_path": evidence.prompt_path,
+                "hipfire_runtime_context": runtime_context,
+                "metrics": {
+                    "tok_s": decode_tok_s,
+                    "decode_tok_s": decode_tok_s,
+                    "prefill_tok_s": prefill_tok_s,
+                    "ttft_ms": evidence.ttft_ms,
+                    "prompt_tokens": evidence.prompt_tokens,
+                    "decode_tokens_emitted": evidence.emitted_tokens,
+                }
+            }]
+        }),
+    )?;
+    write_json_pretty_value(
+        &dir.join("phase_timings.json"),
+        &json!({
+            "schema": 1,
+            "kind": "phase_timings",
+            "hipfire_runtime_context": runtime_context,
+            "records": [{
+                "case_id": evidence.case_id,
+                "prompt_path": evidence.prompt_path,
+                "hipfire_runtime_context": runtime_context,
+                "metrics": {
+                    "prefill_ms": evidence.prefill_secs * 1000.0,
+                    "decode_ms": evidence.decode_secs * 1000.0,
+                    "ttft_ms": evidence.ttft_ms,
+                }
+            }]
+        }),
+    )?;
+    write_json_pretty_value(
+        &dir.join("memory.json"),
+        &json!({
+            "schema": 1,
+            "kind": "memory",
+            "hipfire_runtime_context": runtime_context,
+            "records": [{
+                "case_id": evidence.case_id,
+                "prompt_path": evidence.prompt_path,
+                "hipfire_runtime_context": runtime_context,
+                "metrics": {
+                    "vram_peak_bytes": (evidence.vram_used_mb as f64) * 1024.0 * 1024.0,
+                    "vram_used_mb": evidence.vram_used_mb,
+                    "vram_total_mb": evidence.vram_total_mb,
+                }
+            }]
+        }),
+    )?;
+    write_json_pretty_value(
+        &dir.join("launch_counts.json"),
+        &json!({
+            "schema": 1,
+            "kind": "launch_counts",
+            "hipfire_runtime_context": runtime_context,
+            "records": [{
+                "case_id": evidence.case_id,
+                "prompt_path": evidence.prompt_path,
+                "hipfire_runtime_context": runtime_context,
+                "metrics": {
+                    "kernel_launches": evidence.prefill_forward_calls + evidence.decode_forward_calls,
+                    "graph_launches": 0,
+                    "memcpy_ops": evidence.emitted_tokens,
+                    "model_forward_calls": evidence.prefill_forward_calls + evidence.decode_forward_calls,
+                    "prefill_forward_calls": evidence.prefill_forward_calls,
+                    "decode_forward_calls": evidence.decode_forward_calls,
+                    "counting_scope": "model_forward_call_proxy"
+                },
+                "notes": "examples/run currently exposes model forward-call counts, not raw HIP kernel launch counters"
+            }]
+        }),
+    )?;
+    write_json_pretty_value(
+        &dir.join("run_oneshot.json"),
+        &json!({
+            "schema": 1,
+            "kind": "run_oneshot",
+            "hipfire_runtime_context": runtime_context,
+            "records": [base]
+        }),
+    )
+}
+
+fn write_json_pretty_value(path: &Path, value: &Value) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_string_pretty(value)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    fs::write(path, format!("{body}\n"))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouterHistogramLayer {
+    pub layer_idx: usize,
+    pub top1_histogram: Vec<u64>,
+    pub topk_histogram: Vec<u64>,
+    pub weight_sums: Vec<f64>,
+    pub dropped_indices: u64,
+    pub routed_tokens: u64,
+    pub routed_slots: u64,
+    pub cooccurrence: HashMap<u64, u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouterHistogramEvidence<'a> {
+    pub case_id: &'a str,
+    pub prompt_path: &'a str,
+    pub collection_scope: &'a str,
+    pub num_experts: usize,
+    pub k_top: usize,
+    pub routed_tokens: u64,
+    pub routed_slots: u64,
+    pub top1_histogram: Vec<u64>,
+    pub topk_histogram: Vec<u64>,
+    pub weight_sums: Vec<f64>,
+    pub dropped_indices: u64,
+    pub per_layer: Vec<RouterHistogramLayer>,
+}
+
+pub fn write_router_histogram_evidence(
+    dir: &Path,
+    runtime_context: &Value,
+    evidence: RouterHistogramEvidence<'_>,
+) -> std::io::Result<()> {
+    if evidence.routed_slots == 0 {
+        return Ok(());
+    }
+    write_json_pretty_value(
+        &dir.join("moe_router_histogram.json"),
+        &json!({
+            "schema": 1,
+            "kind": "moe_router_histogram",
+            "hipfire_runtime_context": runtime_context,
+            "records": [{
+                "case_id": evidence.case_id,
+                "prompt_path": evidence.prompt_path,
+                "hipfire_runtime_context": runtime_context,
+                "metrics": router_histogram_metrics_json(&evidence),
+            }]
+        }),
+    )
+}
+
+pub fn router_histogram_metrics_json(evidence: &RouterHistogramEvidence<'_>) -> Value {
+    json!({
+        "expert_hits": sparse_u64_histogram(&evidence.topk_histogram),
+        "router_top1_histogram": sparse_u64_histogram(&evidence.top1_histogram),
+        "router_topk_histogram": sparse_u64_histogram(&evidence.topk_histogram),
+        "router_weight_sums": sparse_f64_histogram(&evidence.weight_sums),
+        "router_entropy": histogram_entropy(&evidence.topk_histogram),
+        "router_dropped_tokens": evidence.dropped_indices,
+        "routed_tokens": evidence.routed_tokens,
+        "routed_slots": evidence.routed_slots,
+        "num_experts": evidence.num_experts,
+        "k_top": evidence.k_top,
+        "per_layer_router_histograms": per_layer_router_histograms_json(evidence),
+        "collection_scope": evidence.collection_scope,
+    })
+}
+
+fn per_layer_router_histograms_json(evidence: &RouterHistogramEvidence<'_>) -> Value {
+    let layers = evidence
+        .per_layer
+        .iter()
+        .filter(|layer| layer.routed_slots > 0 || layer.dropped_indices > 0)
+        .map(|layer| {
+            json!({
+                "layer_idx": layer.layer_idx,
+                "expert_hits": sparse_u64_histogram(&layer.topk_histogram),
+                "router_top1_histogram": sparse_u64_histogram(&layer.top1_histogram),
+                "router_topk_histogram": sparse_u64_histogram(&layer.topk_histogram),
+                "router_weight_sums": sparse_f64_histogram(&layer.weight_sums),
+                "router_entropy": histogram_entropy(&layer.topk_histogram),
+                "router_dropped_tokens": layer.dropped_indices,
+                "routed_tokens": layer.routed_tokens,
+                "routed_slots": layer.routed_slots,
+                "topk_cooccurrence": sparse_pair_histogram_from_flat_keys(
+                    &layer.cooccurrence,
+                    evidence.num_experts,
+                ),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!(layers)
+}
+
+pub fn sparse_u64_histogram(values: &[u64]) -> Value {
+    let mut object = serde_json::Map::new();
+    for (idx, &count) in values.iter().enumerate() {
+        if count > 0 {
+            object.insert(idx.to_string(), json!(count));
+        }
+    }
+    Value::Object(object)
+}
+
+pub fn sparse_f64_histogram(values: &[f64]) -> Value {
+    let mut object = serde_json::Map::new();
+    for (idx, &sum) in values.iter().enumerate() {
+        if sum != 0.0 {
+            object.insert(idx.to_string(), json!(sum));
+        }
+    }
+    Value::Object(object)
+}
+
+pub fn histogram_entropy(values: &[u64]) -> f64 {
+    let total: u64 = values.iter().sum();
+    if total == 0 {
+        return 0.0;
+    }
+    values
+        .iter()
+        .filter(|&&count| count > 0)
+        .map(|&count| {
+            let p = count as f64 / total as f64;
+            -p * p.ln()
+        })
+        .sum()
+}
+
+pub fn sparse_pair_histogram_from_flat_keys(
+    cooccurrence: &HashMap<u64, u64>,
+    modulus: usize,
+) -> Value {
+    if modulus == 0 {
+        return json!({});
+    }
+    let mut entries = cooccurrence
+        .iter()
+        .filter(|(_, &count)| count > 0)
+        .map(|(&key, &count)| {
+            let a = key / modulus as u64;
+            let b = key % modulus as u64;
+            (a, b, count)
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|a, b| {
+        b.2.cmp(&a.2)
+            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.1.cmp(&b.1))
+    });
+
+    let mut object = serde_json::Map::new();
+    for (a, b, count) in entries {
+        object.insert(format!("{a},{b}"), json!(count));
+    }
+    Value::Object(object)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmissionEvidenceRequirement {
@@ -2587,6 +2878,124 @@ mod tests {
             .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert_eq!(names, vec!["module_evidence.json", "quality.json"]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn router_histogram_metrics_render_sparse_generic_histograms() {
+        let mut cooccurrence = HashMap::new();
+        cooccurrence.insert(1, 4);
+        cooccurrence.insert(5, 2);
+        cooccurrence.insert(7, 0);
+        let evidence = RouterHistogramEvidence {
+            case_id: "router",
+            prompt_path: "prompt.txt",
+            collection_scope: "test_gatherer",
+            num_experts: 4,
+            k_top: 2,
+            routed_tokens: 3,
+            routed_slots: 6,
+            top1_histogram: vec![2, 0, 1, 0],
+            topk_histogram: vec![2, 3, 1, 0],
+            weight_sums: vec![0.5, 0.0, 1.25, 0.0],
+            dropped_indices: 1,
+            per_layer: vec![RouterHistogramLayer {
+                layer_idx: 7,
+                top1_histogram: vec![0, 1, 0, 0],
+                topk_histogram: vec![0, 2, 1, 0],
+                weight_sums: vec![0.0, 0.7, 0.2, 0.0],
+                dropped_indices: 0,
+                routed_tokens: 2,
+                routed_slots: 3,
+                cooccurrence,
+            }],
+        };
+
+        let metrics = router_histogram_metrics_json(&evidence);
+
+        assert_eq!(metrics["expert_hits"], json!({"0": 2, "1": 3, "2": 1}));
+        assert_eq!(metrics["router_top1_histogram"], json!({"0": 2, "2": 1}));
+        assert_eq!(metrics["router_weight_sums"], json!({"0": 0.5, "2": 1.25}));
+        assert_eq!(metrics["router_dropped_tokens"], 1);
+        assert_eq!(metrics["num_experts"], 4);
+        assert_eq!(metrics["k_top"], 2);
+        assert_eq!(
+            metrics["per_layer_router_histograms"][0]["topk_cooccurrence"],
+            json!({"0,1": 4, "1,1": 2})
+        );
+        assert!(
+            metrics["router_entropy"].as_f64().unwrap() > 0.0,
+            "non-empty histograms should expose entropy"
+        );
+    }
+
+    #[test]
+    fn runtime_oneshot_and_router_histogram_writers_emit_standard_artifacts() {
+        let root = temp_dir("hipfire-evidence-runtime-writers");
+        let context = json!({"runner": "unit-test"});
+
+        write_runtime_oneshot_evidence(
+            &root,
+            &context,
+            RuntimeOneshotEvidence {
+                case_id: "run_oneshot",
+                prompt_path: "prompt.txt",
+                prompt_tokens: 10,
+                emitted_tokens: 5,
+                prefill_forward_calls: 10,
+                decode_forward_calls: 4,
+                prefill_secs: 0.5,
+                decode_secs: 0.25,
+                ttft_ms: 550.0,
+                vram_used_mb: 128,
+                vram_total_mb: 1024,
+            },
+        )
+        .unwrap();
+        write_router_histogram_evidence(
+            &root,
+            &context,
+            RouterHistogramEvidence {
+                case_id: "run_oneshot",
+                prompt_path: "prompt.txt",
+                collection_scope: "unit_gatherer",
+                num_experts: 2,
+                k_top: 1,
+                routed_tokens: 2,
+                routed_slots: 2,
+                top1_histogram: vec![1, 1],
+                topk_histogram: vec![1, 1],
+                weight_sums: vec![0.8, 0.2],
+                dropped_indices: 0,
+                per_layer: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let performance: Value =
+            serde_json::from_str(&fs::read_to_string(root.join("performance.json")).unwrap())
+                .unwrap();
+        let launch_counts: Value =
+            serde_json::from_str(&fs::read_to_string(root.join("launch_counts.json")).unwrap())
+                .unwrap();
+        let router: Value = serde_json::from_str(
+            &fs::read_to_string(root.join("moe_router_histogram.json")).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(performance["kind"], "performance");
+        assert_eq!(performance["records"][0]["metrics"]["prefill_tok_s"], 20.0);
+        assert_eq!(performance["records"][0]["metrics"]["decode_tok_s"], 20.0);
+        assert_eq!(
+            launch_counts["records"][0]["metrics"]["kernel_launches"],
+            14
+        );
+        assert_eq!(router["kind"], "moe_router_histogram");
+        assert_eq!(
+            router["records"][0]["metrics"]["collection_scope"],
+            "unit_gatherer"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

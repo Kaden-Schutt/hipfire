@@ -41,6 +41,9 @@
   - The profile row now declares the expected runtime evidence kinds
     (`performance`, `memory`, `launch_counts`, `moe_router_histogram`) so
     artifact collection regressions stay visible in row metadata.
+  - Generic runtime oneshot evidence writers and sparse router-histogram
+    artifact rendering now live in `hipfire-evidence`; model-specific gatherers
+    adapt their native counters into the shared histogram contract.
 - Run the full no-GPU handoff gate before committing the branch.
 - Extend Qwen35 paged expert execution coverage beyond the current indexed MQ
   routed path: grouped Path 2, Paro, full-precision, and CPU-fallback paged
