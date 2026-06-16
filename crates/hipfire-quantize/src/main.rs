@@ -910,6 +910,54 @@ fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
         .collect()
 }
 
+/// f32 → bf16 bits, round-to-nearest-even (truncate the low 16 mantissa bits).
+fn f32_to_bf16_bits(f: f32) -> u16 {
+    let bits = f.to_bits();
+    if (bits >> 23) & 0xFF == 0xFF {
+        // inf / nan: truncate the high half (keeps inf; nan stays nan).
+        return (bits >> 16) as u16;
+    }
+    let bias = 0x7FFF + ((bits >> 16) & 1);
+    (bits.wrapping_add(bias) >> 16) as u16
+}
+
+fn f32_slice_to_bf16_bytes(d: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(d.len() * 2);
+    for &f in d {
+        out.extend_from_slice(&f32_to_bf16_bits(f).to_le_bytes());
+    }
+    out
+}
+
+/// Simulated QTIP-2 quantization of a 2D weight (row-major `m × k`), in place.
+/// Per row, per 256-group: FWHT-rotate (incoherence) → beam-encode trellis →
+/// optimal scale → decode → inverse-rotate (FWHT is orthogonal, so the inverse
+/// is `cpu_fwht_256` with the sign args swapped). The result is the *effective*
+/// weight a fused QTIP kernel would compute, so running it through the normal
+/// bf16 forward gives a faithful QTIP-2 PPL without the GPU kernel. The `k%256`
+/// tail (if any) is left unquantized. Parallel over rows.
+fn qtip_simquant_2d(f32_data: &mut [f32], k: usize, cb: &[f32], signs1: &[f32], signs2: &[f32]) {
+    use rayon::prelude::*;
+    let groups = k / 256;
+    if groups == 0 {
+        return;
+    }
+    f32_data.par_chunks_mut(k).for_each(|row| {
+        for g in 0..groups {
+            let seg = &mut row[g * 256..g * 256 + 256];
+            let mut grp = [0.0f32; 256];
+            grp.copy_from_slice(seg);
+            cpu_fwht_256(&mut grp, signs1, signs2); // rotate
+            let scale0 = qtip::group_scale(&grp);
+            let sym = qtip::beam_encode_group(&grp, scale0, cb, 128);
+            let scale = qtip::optimal_scale(&grp, &sym, cb);
+            let mut deq = qtip::decode_group(&sym, scale, cb);
+            cpu_fwht_256(&mut deq, signs2, signs1); // inverse rotate (swap signs)
+            seg.copy_from_slice(&deq);
+        }
+    });
+}
+
 /// MagnumQuant HFQ4-G256: FWHT-rotated 4-bit quantization.
 /// Same binary format as HFQ4-G256 (136 bytes/group) — the rotation is baked
 /// into the weights. The GEMV kernel rotates x instead of inverse-rotating w.
@@ -5529,7 +5577,17 @@ fn main() {
     // q8-fast = Q8 attn + Q4-as-Q8 FFN (all Q8 occupancy, most VRAM)
     // q8hfq = all weights Q8_HFQ (split-metadata, 128B-aligned rows)
     let use_fp16 = format == "fp16" || format == "f16" || format == "float16";
-    let use_bf16 = format == "bf16" || format == "bfloat16";
+    // qtip2-sim: emit a bf16 .hfq whose 2D weights carry *simulated* QTIP-2
+    // error (FWHT-rotated bitshift-trellis, beam=128), for a kernel-free PPL
+    // verdict via the normal bf16 forward. Embeddings/lm_head kept bf16.
+    let use_qtip_sim = format == "qtip2-sim";
+    let use_bf16 = format == "bf16" || format == "bfloat16" || use_qtip_sim;
+    let (qtip_cb, qtip_s1, qtip_s2) = if use_qtip_sim {
+        eprintln!("qtip2-sim: simulated QTIP-2 on 2D weights (FWHT + bitshift trellis beam=128) → bf16");
+        (qtip::build_codebook(), gen_fwht_signs(42, 256), gen_fwht_signs(1042, 256))
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
     let use_q8 = format == "q8f16" || format == "q8";
     // F1 native-bf16 oracle: full-precision passthrough. Every tensor stored
     // as QuantType::F32 (qt=2) -- weights, norms, embeddings.
@@ -7147,6 +7205,10 @@ fn main() {
             let k = meta.shape[1];
             let m = meta.shape[0];
             if use_fp16 || use_bf16 {
+                // qtip2-sim: simulate QTIP-2 on quantizable 2D weights (skip
+                // embeddings/lm_head and any k not divisible by 256), then emit
+                // bf16 from the perturbed f32 so the normal forward yields a
+                // faithful QTIP-2 PPL.
                 let (q, qt, label) = if use_bf16 {
                     source_precision_tensor_bytes(raw_data, &meta.dtype, &f32_data)
                 } else {
@@ -8743,6 +8805,33 @@ fn main() {
     eprintln!("  Mean quant error: {mean_quant_error:.8}");
     eprintln!("  Max quant error:  {max_quant_error:.8}");
     eprintln!("  Output size:      {:.1} MB", total_bytes as f64 / 1e6);
+
+    // qtip2-sim post-pass: simulate QTIP-2 on every eligible 2D BF16 weight,
+    // branch-independent (operates on the finalized tensor list, so it catches
+    // dense/MoE/attn weights regardless of which producer branch built them).
+    // Skips embeddings/lm_head and any k not divisible by 256.
+    if use_qtip_sim {
+        let mut n_sim = 0usize;
+        for t in hfq_tensors.iter_mut() {
+            if matches!(t.quant_type, QuantType::BF16)
+                && t.shape.len() == 2
+                && (t.shape[1] as usize) % 256 == 0
+                && !t.name.contains("embed")
+                && !t.name.contains("lm_head")
+            {
+                let k = t.shape[1] as usize;
+                let mut wf: Vec<f32> = t
+                    .data
+                    .chunks_exact(2)
+                    .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect();
+                qtip_simquant_2d(&mut wf, k, &qtip_cb, &qtip_s1, &qtip_s2);
+                t.data = f32_slice_to_bf16_bytes(&wf);
+                n_sim += 1;
+            }
+        }
+        eprintln!("  qtip2-sim: simulated QTIP-2 on {n_sim} 2D BF16 weights");
+    }
 
     // Write .hfq file
     eprintln!("\nWriting: {}", output_path.display());
