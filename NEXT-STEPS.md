@@ -131,6 +131,30 @@ row scale, GROUP=128 tile records, dequant-to-fp16-scratch then stock decode.
   - **D1 (Qwen3.5 GQA KV):** adapt the variance-normalization to GQA K/V
     tensors + hipfire's KV cache (`kv_cache_write_q8`/asym paths). The
     DeltaNet recurrent state is a *separate* concern (Phase A anchor).
+  - **D1 BUILD SPEC (scoped 2026-06-16) — it's a SUBSYSTEM, no sim shortcut.**
+    Unlike qtip3 (offline tensor transform → existing bf16 forward), KV is
+    GPU-fused (write + attention-read kernels), and asym4 quantizes K
+    *per-token on write* while KVarN needs a GROUP=128-token *tile* for the
+    Sinkhorn balance. So D1 = a staged block-flush KV subsystem (cf. the
+    KVARN_MLA_BACKEND_SPEC), four components:
+    1. **Staged write:** accumulate fp16 K/V per block_id until GROUP=128 fills,
+       then flush. New KvCache mode `"kvarn"` + a staging buffer. (Mirror the
+       spec's `do_kv_cache_update`; sink + in-progress tail stay fp16.)
+    2. **GPU Sinkhorn** per tile (16 iters col/row std-norm) — new kernel; the
+       CPU reference is `kvarn::variance_normalize` (already unit-tested).
+    3. **4-bit pack tile** on GPU = `kvarn::quantize_tile` ported to a kernel
+       (per-channel scale/zp + per-token s_col, 100 B/group-equivalent record).
+    4. **Dequant-on-read:** `_dequant_tile` kernel → fp16 scratch → stock flash
+       attention (the spec's "dequant → fp16 scratch → stock decode" — avoids a
+       bespoke KVarN attention kernel). Tail/sink blocks copied fp16.
+    - **Gate before kernels:** a CPU reconstruction gate on REAL Qwen3.5 KV
+      activations (capture via a hook) comparing KVarN vs plain-4bit (asym4
+      analog) — confirm Sinkhorn's win survives on real GQA KV before building
+      the GPU Sinkhorn (mirrors the qtip2 PPL gate that killed 2-bit). The
+      `kvarn::balancing_beats_naive_per_row_4bit` test shows the mechanism works
+      when channel skew is present; the gate confirms real KV has that skew.
+    - Effort ≈ the C2 effort (4 kernels + plumbing + coherence). Largest single
+      remaining item in the plan.
   - **D1-MLA (DeepSeek V4):** the KVarN-MLA backend applies more directly —
     but DeepSeek runs on the bigger boxes, not this 780M.
 - **Gate:** long-context coherence + τ stability under compressed KV.
