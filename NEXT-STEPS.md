@@ -231,8 +231,18 @@ Papers + reference implementations vendored for Phases C/D:
   RD bound) still collapses PPL because error accumulates across 186 weights
   AND the encode is MSE-optimal not **output-optimal** — missing **LDLQ**
   (Hessian/activation-aware) + V=2/L=16/finetune. FORK:
-  - **C1e — LDLQ (rescue 2-bit, the real prize):** add input-Hessian
-    calibration + LDLQ encode (ref `lib/algo/ldlq.py`). Big effort.
+  - **C1e — LDLQ (rescue 2-bit) — CHOSEN, and tractable (infra exists).**
+    hipfire already has: `collect_hessian` (native per-layer input-Hessian
+    calibration), `gptq.rs` (Cholesky + inverse-Cholesky OBS error feedback,
+    `fwht_similarity_per_256` = FWHT incoherence on the Hessian, AWQ
+    rescaling), and `quantize_mq2g256_lloyd_gptq` (a working GPTQ-LDLQ for
+    2-bit Lloyd). So QTIP-LDLQ = **swap that path's Lloyd scalar quantizer
+    for the trellis `beam_encode_group` on the feedback-adjusted target.**
+    Steps: (1) `collect_hessian` on 0.8B+calib → HFHS Hessians; (2) new
+    `quantize_qtip2_ldlq`: FWHT-rotate H+W, Cholesky/LDL, block-sequential
+    trellis encode with OBS feedback (mirror `quantize_mq2g256_lloyd_gptq`);
+    (3) re-quantize qtip2-ldlq-sim → PPL vs MQ4. Target: PPL ≪ 125 (toward
+    MQ4's 14 / better).
   - **3-bit QTIP fallback (plan default):** make bits configurable, quantize
     qtip3-sim, PPL. Quick; modest bandwidth win vs MQ4.
   Then C2 decode kernel (only worth building once a bit-rate passes PPL).
