@@ -40,6 +40,13 @@ set -e
 # List files staged for this commit.
 CHANGED=$(git diff --cached --name-only --diff-filter=ACM)
 
+# Docs and markdown can never affect forward-pass output or speed, but a path
+# like `docs/roughquant/...` matches the `quant` hotspot substring and would
+# otherwise trigger the full GPU gate battery on a docs-only commit. Strip
+# docs/markdown for the HEAVY-GATE hotspot decisions below (lint still runs on
+# the full staged set via STAGED_RS).
+CODE_CHANGED=$(echo "$CHANGED" | grep -vE '(^|/)docs/|\.md$' || true)
+
 # ── Fast-track lint gates (every commit that stages Rust) ────────────────
 # rustfmt + clippy run BEFORE the path-gated heavy GPU gates and regardless of
 # the HOTSPOT early-exit below, so style/lint never silently slips to CI.
@@ -102,11 +109,11 @@ HOTSPOT='\.hip$|gemv|forward|quant|rotate|dispatch|fwht|rmsnorm|fused|mq4|hfq|ma
 PP_HOTSPOT='multi_gpu\.rs|peer_access|pp_|pipeline|stages|forward_prefill_batch_multi|forward_scratch_multi|Gpus|init_uniform|init_layers|boundary_copy'
 
 PP_TOUCHED=0
-if echo "$CHANGED" | grep -qE "$PP_HOTSPOT"; then
+if echo "$CODE_CHANGED" | grep -qE "$PP_HOTSPOT"; then
     PP_TOUCHED=1
 fi
 
-if ! echo "$CHANGED" | grep -qE "$HOTSPOT"; then
+if ! echo "$CODE_CHANGED" | grep -qE "$HOTSPOT"; then
     exit 0
 fi
 
@@ -118,7 +125,7 @@ fi
 # example, and the gate scripts themselves.
 PFLASH_HOTSPOT='pflash'
 if [ "${HIPFIRE_FORCE_PFLASH_GATE:-0}" = "1" ] \
-   || echo "$CHANGED" | grep -qE "$PFLASH_HOTSPOT"; then
+   || echo "$CODE_CHANGED" | grep -qE "$PFLASH_HOTSPOT"; then
     PFLASH_GATE_ENV=""
     PFLASH_GATE_NOTE="(diff touches pflash — running)"
 else
@@ -193,8 +200,8 @@ SPEC_HOTSPOT='dflash|ddtree|spec_step|tree_verify|gdn_tape|kv_compact_gather|rop
 # pflash.rs is intentionally NOT here — PFlash is a different feature
 # (long-context bench), gated separately via PFLASH_HOTSPOT above.
 if [ "${HIPFIRE_FORCE_SPEC_GATE:-0}" = "1" ] \
-   || echo "$CHANGED" | grep -qE "$SPEC_HOTSPOT" \
-   || echo "$CHANGED" | grep -qE 'speculative\.rs|qwen35\.rs|ddtree\.rs|dflash\.rs|dflash_spec_demo\.rs|spec_decode\.rs|deepseek4'; then
+   || echo "$CODE_CHANGED" | grep -qE "$SPEC_HOTSPOT" \
+   || echo "$CODE_CHANGED" | grep -qE 'speculative\.rs|qwen35\.rs|ddtree\.rs|dflash\.rs|dflash_spec_demo\.rs|spec_decode\.rs|deepseek4'; then
     # --fast on every commit; --full only when explicitly forced. The fast
     # battery (1 prose + 1 code, dflash only) catches the Path A single-token
     # attractor regression class which is what this gate is here for. The
