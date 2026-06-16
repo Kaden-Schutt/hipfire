@@ -6,7 +6,10 @@
 
 #[cfg(test)]
 use hipfire_model::model_worker_key_id;
-use hipfire_model::{normalize_model_worker_key, same_model_worker_key, ModelWorkerKey};
+use hipfire_model::{
+    normalize_model_worker_key, same_model_worker_key, AcceleratorDeviceInfo, AcceleratorInventory,
+    ModelWorkerKey,
+};
 use hipfire_state::generate_state_kind_sets_match_exactly;
 use std::collections::{BTreeMap, HashSet};
 
@@ -151,6 +154,39 @@ pub struct PrefillBatchSelection {
     pub total_prompt_tokens: usize,
     pub total_suffix_tokens: usize,
     pub max_prompt_tokens: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkerDeviceCapabilityStatus {
+    pub supported: bool,
+    pub capability: &'static str,
+    pub reason: &'static str,
+}
+
+impl WorkerDeviceCapabilityStatus {
+    pub fn supported() -> Self {
+        Self {
+            supported: true,
+            capability: "supported",
+            reason: "worker_device_available",
+        }
+    }
+
+    pub fn unprobed() -> Self {
+        Self {
+            supported: true,
+            capability: "unknown",
+            reason: "accelerator_inventory_not_probed",
+        }
+    }
+
+    pub fn unsupported(reason: &'static str) -> Self {
+        Self {
+            supported: false,
+            capability: "unsupported",
+            reason,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -520,9 +556,40 @@ pub fn sessions_compatible_for_prefill(a: &RequestSessionDraft, b: &RequestSessi
     generate_state_kind_sets_match_exactly(&a.state_handle.state_kinds, &b.state_handle.state_kinds)
 }
 
+pub fn worker_device_capability_status(
+    worker_key: &ModelWorkerKey,
+    inventory: &AcceleratorInventory,
+) -> WorkerDeviceCapabilityStatus {
+    if inventory.source == "not_probed" {
+        return WorkerDeviceCapabilityStatus::unprobed();
+    }
+    let worker_key = normalize_model_worker_key(worker_key);
+    let accelerator_kind = worker_key.accelerator_kind.as_deref().unwrap_or("hip");
+    let device_id = worker_key.device_id.as_deref().unwrap_or("0");
+    let Some(device) = inventory
+        .devices
+        .iter()
+        .find(|device| device.kind == accelerator_kind && device.device_id == device_id)
+    else {
+        return WorkerDeviceCapabilityStatus::unsupported("worker_device_not_found");
+    };
+    worker_device_capability_status_for_device(device)
+}
+
+fn worker_device_capability_status_for_device(
+    device: &AcceleratorDeviceInfo,
+) -> WorkerDeviceCapabilityStatus {
+    if device.available {
+        WorkerDeviceCapabilityStatus::supported()
+    } else {
+        WorkerDeviceCapabilityStatus::unsupported("worker_device_unavailable")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PriorityPrefillScheduler {
     env: SchedulerPolicyEnv,
+    accelerator_inventory: Option<AcceleratorInventory>,
     buckets: Vec<Vec<QueuedPrefillRequest>>,
     queued_ids: HashSet<String>,
     queued_count: usize,
@@ -538,9 +605,20 @@ impl PriorityPrefillScheduler {
     pub fn new(env: SchedulerPolicyEnv) -> Self {
         Self {
             env,
+            accelerator_inventory: None,
             buckets: (0..=255).map(|_| Vec::new()).collect(),
             queued_ids: HashSet::new(),
             queued_count: 0,
+        }
+    }
+
+    pub fn with_accelerator_inventory(
+        env: SchedulerPolicyEnv,
+        accelerator_inventory: AcceleratorInventory,
+    ) -> Self {
+        Self {
+            accelerator_inventory: Some(accelerator_inventory),
+            ..Self::new(env)
         }
     }
 
@@ -557,6 +635,7 @@ impl PriorityPrefillScheduler {
         session: RequestSessionDraft,
         enqueued_at_ms: u64,
     ) -> Result<(), String> {
+        self.require_worker_device_capability(&session)?;
         let max_queued = self.max_queued_requests();
         if max_queued > 0 && self.queued_count >= max_queued {
             return Err(format!(
@@ -588,6 +667,24 @@ impl PriorityPrefillScheduler {
         }
         self.enqueue(session, enqueued_at_ms)?;
         Ok(true)
+    }
+
+    fn require_worker_device_capability(
+        &self,
+        session: &RequestSessionDraft,
+    ) -> Result<(), String> {
+        let Some(inventory) = self.accelerator_inventory.as_ref() else {
+            return Ok(());
+        };
+        let status = worker_device_capability_status(&session.worker_key, inventory);
+        if status.supported {
+            Ok(())
+        } else {
+            Err(format!(
+                "prefill scheduler worker device unsupported: request={} reason={}",
+                session.id, status.reason
+            ))
+        }
     }
 
     pub fn cancel(&mut self, id: &str) -> bool {
@@ -1223,6 +1320,104 @@ mod tests {
         );
         assert!(sessions_compatible_for_prefill(&a, &b));
         assert!(!sessions_compatible_for_prefill(&a, &c));
+    }
+
+    #[test]
+    fn worker_device_capability_uses_inventory_when_available() {
+        let worker = qwen_worker();
+        let inventory = AcceleratorInventory::from_devices(
+            "daemon",
+            vec![AcceleratorDeviceInfo::hip(
+                "0",
+                0,
+                Some("gfx1201".to_string()),
+                Some(24_000_000_000),
+                Some(false),
+                Some("HIP 6.4".to_string()),
+            )],
+        );
+
+        let status = worker_device_capability_status(&worker, &inventory);
+        assert!(status.supported);
+        assert_eq!(status.capability, "supported");
+        assert_eq!(status.reason, "worker_device_available");
+    }
+
+    #[test]
+    fn worker_device_capability_preserves_unprobed_compatibility() {
+        let status =
+            worker_device_capability_status(&qwen_worker(), &AcceleratorInventory::not_probed());
+
+        assert!(status.supported);
+        assert_eq!(status.capability, "unknown");
+        assert_eq!(status.reason, "accelerator_inventory_not_probed");
+    }
+
+    #[test]
+    fn worker_device_capability_rejects_missing_or_unavailable_device() {
+        let missing = worker_device_capability_status(
+            &qwen_worker(),
+            &AcceleratorInventory::from_devices(
+                "daemon",
+                vec![AcceleratorDeviceInfo::hip(
+                    "1",
+                    1,
+                    Some("gfx1151".to_string()),
+                    Some(96_000_000_000),
+                    Some(true),
+                    Some("HIP 7.2".to_string()),
+                )],
+            ),
+        );
+        assert!(!missing.supported);
+        assert_eq!(missing.reason, "worker_device_not_found");
+
+        let mut unavailable = AcceleratorDeviceInfo::hip(
+            "0",
+            0,
+            Some("gfx1201".to_string()),
+            Some(24_000_000_000),
+            Some(false),
+            Some("HIP 6.4".to_string()),
+        );
+        unavailable.available = false;
+        unavailable.reason = Some("set_device failed".to_string());
+        let status = worker_device_capability_status(
+            &qwen_worker(),
+            &AcceleratorInventory::from_devices("daemon", vec![unavailable]),
+        );
+        assert!(!status.supported);
+        assert_eq!(status.reason, "worker_device_unavailable");
+    }
+
+    #[test]
+    fn prefill_scheduler_rejects_sessions_for_unavailable_worker_devices() {
+        let mut scheduler = PriorityPrefillScheduler::with_accelerator_inventory(
+            SchedulerPolicyEnv::empty(),
+            AcceleratorInventory::from_devices(
+                "daemon",
+                vec![AcceleratorDeviceInfo::hip(
+                    "1",
+                    1,
+                    Some("gfx1151".to_string()),
+                    Some(96_000_000_000),
+                    Some(true),
+                    Some("HIP 7.2".to_string()),
+                )],
+            ),
+        );
+
+        let err = scheduler.enqueue(session("a", 64, 3), 0).unwrap_err();
+        assert!(err.contains("worker_device_not_found"));
+        assert_eq!(scheduler.size(), 0);
+    }
+
+    #[test]
+    fn prefill_scheduler_without_inventory_preserves_existing_admission() {
+        let mut scheduler = PriorityPrefillScheduler::new(SchedulerPolicyEnv::empty());
+
+        scheduler.enqueue(session("a", 64, 3), 0).unwrap();
+        assert_eq!(scheduler.size(), 1);
     }
 
     #[test]

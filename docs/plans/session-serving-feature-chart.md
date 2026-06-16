@@ -49,6 +49,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Rust scheduler worker-key identity and compatibility helpers now reuse `hipfire-model` ownership instead of scheduler-local model identity code.
 - `hipfire-model` now owns shared accelerator inventory/device contracts and JSON rendering for control-plane health/status payloads.
 - Rust scheduler now consumes model-worker identity helpers directly from `hipfire-model` instead of re-exporting them through scheduler.
+- Rust scheduler prefill admission can now consume daemon accelerator inventory and reject sessions targeting missing or unavailable worker devices while preserving existing unprobed-inventory behavior.
 - Daemon and state runtime-worker views now consume model-worker runtime id construction and `worker_id` / `worker_key_id` alias parsing from `hipfire-model` instead of `hipfire-state`.
 - Generate batch validators now use `hipfire-model` worker/model identity requirement policy instead of local `worker_key_id` / `model` checks.
 - Daemon Qwen3.5 family, dense, and MoE runtime guards now use `hipfire-model` architecture classifiers instead of daemon-local arch-id predicates.

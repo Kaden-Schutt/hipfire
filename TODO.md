@@ -12,9 +12,11 @@
   - server health polls daemon inventory when a daemon is already running and
     otherwise reports `source=not_probed`, while worker identity carries
     accelerator kind/device id;
+  - priority prefill scheduler admission can now consume accelerator inventory
+    and reject sessions targeting missing or unavailable worker devices;
   - probe available NPUs/XDNA devices separately when present;
-  - make the priority microbatching scheduler route by worker/device capability
-    instead of using a single server-selected HIP placement.
+  - wire live server request scheduling to pass daemon inventory into scheduler
+    admission instead of using a single server-selected HIP placement.
 - Regenerate quality KLD references as first-party HFQM `.kldref.hfq`
   packages. Do not trust previously downloaded raw `.kldref.bin` files for
   baseline claims. Regeneration must use Hipfire reference execution with
