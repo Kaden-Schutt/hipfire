@@ -5418,6 +5418,7 @@ fn daemon_battery_rows(
     match battery {
         BatteryId::Smoke => Some(run_daemon_smoke_rows(config, ctx)),
         BatteryId::Speed => Some(run_daemon_speed_rows(config, ctx)),
+        BatteryId::Profile => Some(run_daemon_profile_rows(config, ctx)),
         BatteryId::Coherence | BatteryId::Longctx | BatteryId::Agentic => {
             examples_battery_rows(battery, config, ctx, datasets)
         }
@@ -5470,6 +5471,11 @@ fn run_daemon_shared_model_load_rows(
                     ctx,
                     "daemon executor requires --model to be a local filesystem path",
                 ),
+                BatteryId::Profile => daemon_profile_skip_rows(
+                    config,
+                    ctx,
+                    "daemon executor requires --model to be a local filesystem path",
+                ),
                 _ => Vec::new(),
             };
             out.insert(*battery, rows);
@@ -5487,6 +5493,11 @@ fn run_daemon_shared_model_load_rows(
                     "daemon binary not found; build with `cargo build -p hipfire-daemon --bin hipfire-daemon`",
                 ),
                 BatteryId::Speed => daemon_speed_skip_rows(
+                    config,
+                    ctx,
+                    "daemon binary not found; build with `cargo build -p hipfire-daemon --bin hipfire-daemon`",
+                ),
+                BatteryId::Profile => daemon_profile_skip_rows(
                     config,
                     ctx,
                     "daemon binary not found; build with `cargo build -p hipfire-daemon --bin hipfire-daemon`",
@@ -5514,6 +5525,11 @@ fn run_daemon_shared_model_load_rows(
                         "daemon executor runtime creation failed before decode",
                     ),
                     BatteryId::Speed => daemon_speed_skip_rows(
+                        config,
+                        ctx,
+                        &format!("create daemon executor runtime: {err}"),
+                    ),
+                    BatteryId::Profile => daemon_profile_skip_rows(
                         config,
                         ctx,
                         &format!("create daemon executor runtime: {err}"),
@@ -5558,6 +5574,13 @@ fn run_daemon_shared_model_load_rows(
                         &format!("daemon-backed shared executor failed: {err}"),
                         elapsed_since_ms(started),
                     ),
+                    BatteryId::Profile => daemon_shared_profile_failure_rows(
+                        config,
+                        ctx,
+                        &bin,
+                        &format!("daemon-backed shared executor failed: {err}"),
+                        elapsed_since_ms(started),
+                    ),
                     _ => Vec::new(),
                 };
                 out.insert(*battery, rows);
@@ -5583,6 +5606,9 @@ async fn run_daemon_shared_model_load_rows_async(
             }
             BatteryId::Speed => {
                 daemon_speed_rows_with_session(config, ctx, bin, &mut session).await?
+            }
+            BatteryId::Profile => {
+                daemon_profile_rows_with_session(config, ctx, bin, &mut session).await?
             }
             _ => Vec::new(),
         };
@@ -5689,6 +5715,54 @@ fn daemon_speed_skip_rows(config: &EvalConfig, ctx: &EvalContext, reason: &str) 
             )
         })
         .collect()
+}
+
+fn daemon_profile_expected_runtime_evidence_kinds() -> Value {
+    json!([
+        "performance",
+        "memory",
+        "launch_counts",
+        "moe_router_histogram"
+    ])
+}
+
+fn daemon_profile_base_metrics() -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        ("implemented".to_string(), json!(true)),
+        ("executor".to_string(), json!("daemon")),
+        ("suite".to_string(), json!("daemon_profile_anchor")),
+        ("profile_requested".to_string(), json!(true)),
+        (
+            "collection_scope".to_string(),
+            json!("model_backed_daemon_anchor"),
+        ),
+        (
+            "moe_router_histogram_expected_when_moe".to_string(),
+            json!(true),
+        ),
+        (
+            "expected_runtime_evidence_kinds".to_string(),
+            daemon_profile_expected_runtime_evidence_kinds(),
+        ),
+    ])
+}
+
+fn daemon_profile_skip_rows(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    reason: &str,
+) -> Vec<EvalResult> {
+    vec![skip_row_with_metrics(
+        BatteryId::Profile,
+        None,
+        "model_profile_anchor",
+        None,
+        reason,
+        config,
+        ctx,
+        prompt("benchmarks/prompts/dflash_resident_smoke.txt"),
+        daemon_profile_base_metrics(),
+    )]
 }
 
 fn run_daemon_smoke_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
@@ -5845,6 +5919,56 @@ fn run_daemon_speed_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResu
     }
 }
 
+fn run_daemon_profile_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
+    if !Path::new(&config.model).exists() {
+        return daemon_profile_skip_rows(
+            config,
+            ctx,
+            "daemon executor requires --model to be a local filesystem path",
+        );
+    }
+
+    let Some(bin) = hipfire_daemon_adapter::find_daemon_bin() else {
+        return daemon_profile_skip_rows(
+            config,
+            ctx,
+            "daemon binary not found; build with `cargo build -p hipfire-daemon --bin hipfire-daemon`",
+        );
+    };
+
+    let started = SystemTime::now();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            return daemon_profile_skip_rows(
+                config,
+                ctx,
+                &format!("create daemon executor runtime: {err}"),
+            );
+        }
+    };
+
+    match runtime.block_on(run_daemon_profile_rows_async(config, ctx, &bin)) {
+        Ok(mut rows) => {
+            let elapsed_ms = elapsed_since_ms(started);
+            for row in &mut rows {
+                row.elapsed_ms = elapsed_ms;
+            }
+            rows
+        }
+        Err(err) => daemon_shared_profile_failure_rows(
+            config,
+            ctx,
+            &bin,
+            &format!("daemon-backed profile executor failed: {err}"),
+            elapsed_since_ms(started),
+        ),
+    }
+}
+
 fn daemon_shared_smoke_failure_rows(
     config: &EvalConfig,
     ctx: &EvalContext,
@@ -5934,6 +6058,31 @@ fn daemon_shared_speed_failure_rows(
             )
         })
         .collect()
+}
+
+fn daemon_shared_profile_failure_rows(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    bin: &Path,
+    reason: &str,
+    elapsed_ms: u128,
+) -> Vec<EvalResult> {
+    let mut metrics = daemon_profile_base_metrics();
+    metrics.insert("shared_daemon_session".to_string(), json!(true));
+    metrics.insert("daemon_bin".to_string(), json!(bin.display().to_string()));
+    vec![row(
+        BatteryId::Profile,
+        None,
+        "model_profile_anchor",
+        None,
+        EvalStatus::Fail,
+        Some(reason.to_string()),
+        metrics,
+        config,
+        ctx,
+        prompt("benchmarks/prompts/dflash_resident_smoke.txt"),
+        elapsed_ms,
+    )]
 }
 
 async fn run_daemon_smoke_rows_async(
@@ -6127,6 +6276,16 @@ async fn run_daemon_speed_rows_async(
     daemon_speed_rows_with_session(config, ctx, bin, &mut session).await
 }
 
+async fn run_daemon_profile_rows_async(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    bin: &Path,
+) -> anyhow::Result<Vec<EvalResult>> {
+    let max_seq = (config.max_tokens.max(50) + 2048).max(4096);
+    let mut session = load_daemon_eval_session(config, bin, max_seq).await?;
+    daemon_profile_rows_with_session(config, ctx, bin, &mut session).await
+}
+
 async fn daemon_speed_rows_with_session(
     config: &EvalConfig,
     ctx: &EvalContext,
@@ -6225,6 +6384,94 @@ async fn daemon_speed_rows_with_session(
     }
 
     Ok(rows)
+}
+
+async fn daemon_profile_rows_with_session(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    bin: &Path,
+    session: &mut DaemonEvalSession,
+) -> anyhow::Result<Vec<EvalResult>> {
+    let worker_key_id = session.worker_key_id.clone();
+    let prompt_path = "benchmarks/prompts/dflash_resident_smoke.txt";
+    let prompt_text = read_repo_prompt_text(prompt_path)?;
+    let max_tokens = config.max_tokens.max(50);
+    let evidence_dir =
+        runtime_evidence_dir(config, "daemon-profile-model_profile_anchor", &config.model);
+    session.engine.reset().await?;
+    let request = daemon_generate_request(
+        "eval-profile-model_profile_anchor".to_string(),
+        prompt_text,
+        max_tokens,
+        Some(worker_key_id.clone()),
+        Some(&evidence_dir),
+    );
+    let (text, done) = session.engine.generate(request).await?;
+    let finite = !text.is_empty() && !text.contains('\u{fffd}') && done.tokens > 0;
+    let has_timing = done.prefill_tok_s.is_some() && done.decode_tok_s.is_some();
+    let status = if finite && has_timing {
+        EvalStatus::Pass
+    } else {
+        EvalStatus::Fail
+    };
+    let reason = if !finite {
+        Some(
+            "daemon profile anchor returned empty, zero-token, or replacement-character output"
+                .to_string(),
+        )
+    } else if !has_timing {
+        Some("daemon profile anchor did not emit prefill/decode timing metrics".to_string())
+    } else {
+        None
+    };
+    let mut metrics = daemon_profile_base_metrics();
+    metrics.extend([
+        ("shared_model_loads".to_string(), json!(1)),
+        ("worker_key_id".to_string(), json!(worker_key_id)),
+        ("daemon_bin".to_string(), json!(bin.display().to_string())),
+        ("max_tokens".to_string(), json!(max_tokens)),
+        ("tokens".to_string(), json!(done.tokens)),
+        ("text_bytes".to_string(), json!(text.len())),
+        (
+            "runtime_evidence_dir".to_string(),
+            json!(evidence_dir.display().to_string()),
+        ),
+    ]);
+    if let Some(value) = done.tok_s {
+        metrics.insert("tok_s".to_string(), json!(value));
+    }
+    if let Some(value) = done.prefill_tokens {
+        metrics.insert("prefill_tokens".to_string(), json!(value));
+    }
+    if let Some(value) = done.prefill_ms {
+        metrics.insert("prefill_ms".to_string(), json!(value));
+    }
+    if let Some(value) = done.prefill_tok_s {
+        metrics.insert("prefill_tok_s".to_string(), json!(value));
+    }
+    if let Some(value) = done.decode_tok_s {
+        metrics.insert("decode_tok_s".to_string(), json!(value));
+        metrics
+            .entry("gen_tok_s".to_string())
+            .or_insert(json!(value));
+    }
+    if let Some(value) = done.ttft_ms {
+        metrics.insert("ttft_ms".to_string(), json!(value));
+    }
+
+    Ok(vec![row(
+        BatteryId::Profile,
+        None,
+        "model_profile_anchor",
+        None,
+        status,
+        reason,
+        metrics,
+        config,
+        ctx,
+        prompt(prompt_path),
+        0,
+    )])
 }
 
 fn examples_executor_available_for(battery: BatteryId) -> bool {
@@ -10075,11 +10322,17 @@ fn daemon_shared_model_load_enabled(config: &EvalConfig) -> bool {
 }
 
 fn daemon_shared_model_load_battery(battery: BatteryId) -> bool {
-    matches!(battery, BatteryId::Smoke | BatteryId::Speed)
+    matches!(
+        battery,
+        BatteryId::Smoke | BatteryId::Speed | BatteryId::Profile
+    )
 }
 
 fn daemon_executor_available_for(config: &EvalConfig, battery: BatteryId) -> bool {
-    if !matches!(battery, BatteryId::Smoke | BatteryId::Speed) {
+    if !matches!(
+        battery,
+        BatteryId::Smoke | BatteryId::Speed | BatteryId::Profile
+    ) {
         return false;
     }
     if !Path::new(&config.model).exists() {
@@ -12198,13 +12451,13 @@ mod tests {
     }
 
     #[test]
-    fn daemon_executor_groups_smoke_and_speed_under_one_shared_load_plan() {
+    fn daemon_executor_groups_smoke_speed_and_profile_under_one_shared_load_plan() {
         let cfg = parse_args_from([
             "hipfire-eval",
             "--model",
             "missing-local-model.hfq",
             "--battery",
-            "smoke,speed",
+            "smoke,speed,profile",
             "--no-cache",
         ])
         .unwrap();
@@ -12221,7 +12474,7 @@ mod tests {
 
         assert!(daemon_shared_model_load_enabled(&cfg));
         let rows = run_eval_batteries(&cfg, &ctx, &[]).unwrap();
-        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.len(), 6);
         assert_eq!(
             rows.iter()
                 .filter(|row| row.battery == BatteryId::Smoke)
@@ -12233,6 +12486,18 @@ mod tests {
                 .filter(|row| row.battery == BatteryId::Speed)
                 .count(),
             2
+        );
+        let profile = rows
+            .iter()
+            .find(|row| row.battery == BatteryId::Profile)
+            .expect("profile row");
+        assert_eq!(profile.case_id, "model_profile_anchor");
+        assert_eq!(
+            profile
+                .metrics
+                .get("collection_scope")
+                .and_then(Value::as_str),
+            Some("model_backed_daemon_anchor")
         );
         assert!(rows
             .iter()

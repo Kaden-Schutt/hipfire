@@ -47,6 +47,10 @@
   - `GenerateTextRequest.evidence_dir` lets daemon-backed AR text generation
     write standard runtime oneshot artifacts directly via `hipfire-evidence`;
     DFlash/MTP/VL evidence emission remains a path-specific follow-up.
+  - The profile battery now has a daemon-backed model anchor that reuses the
+    shared daemon load path and requests runtime evidence artifacts; adding
+    daemon-side MoE router histogram gatherer hooks remains the missing
+    model-specific evidence piece.
 - Run the full no-GPU handoff gate before committing the branch.
 - Extend Qwen35 paged expert execution coverage beyond the current indexed MQ
   routed path: grouped Path 2, Paro, full-precision, and CPU-fallback paged
@@ -77,7 +81,8 @@
       anchors now use the shared JSONL daemon adapter; examples-backed pp32/pp128
       speed-gate rows remain the benchmark-grade default;
     - default `--executor auto` now prefers daemon-backed smoke/speed rows and
-      shares one daemon load across those rows when they run together;
+      shares one daemon load across those rows and the profile anchor when they
+      run together;
     - add process and handle ownership so one model-load maps to one resident daemon
       process per loaded quant/placement;
     - make battery rows consume a shared model cache key and avoid repeated
