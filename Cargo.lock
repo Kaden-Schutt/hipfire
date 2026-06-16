@@ -684,6 +684,7 @@ version = "0.2.1"
 dependencies = [
  "hip-bridge",
  "hipfire-arch-qwen2",
+ "hipfire-model",
  "hipfire-runtime",
  "image",
  "rdna-compute",

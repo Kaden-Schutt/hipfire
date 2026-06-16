@@ -13,6 +13,7 @@ description = "dots.ocr (Qwen2-VL family) — Qwen2 text decoder + 42-block Dots
 
 [dependencies]
 hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-model = { path = "../hipfire-model" }
 hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }

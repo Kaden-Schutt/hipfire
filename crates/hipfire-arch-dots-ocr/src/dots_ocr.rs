@@ -40,6 +40,7 @@
 
 use hip_bridge::HipResult;
 use hipfire_arch_qwen2::qwen2::{Qwen2Config, Qwen2Weights};
+use hipfire_model::tokenizer::Tokenizer;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, f32_to_f16};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -1582,7 +1583,7 @@ pub const ENDOFTEXT_ID: u32 = 151643;
 /// prefill loop replaces, one-for-one, with merged visual-token
 /// embeddings; the count MUST equal the merger's output-token count.
 pub fn build_prompt_ids(
-    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    tokenizer: &Tokenizer,
     prompt_text: &str,
     n_visual_tokens: usize,
 ) -> Vec<u32> {
@@ -1675,8 +1676,8 @@ mod tests {
             return;
         }
         let hfq = HfqFile::open(Path::new(hfq_path)).expect("open hfq");
-        let tok = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-            .expect("tokenizer from hfq metadata");
+        let tok =
+            Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer from hfq metadata");
         let cap: serde_json::Value =
             serde_json::from_slice(&std::fs::read(cap_path).unwrap()).unwrap();
         let expected: Vec<u32> = cap["input_token_ids"]
