@@ -42,6 +42,9 @@ mod ldlq;
 // HFHS Hessian sidecar reader (was orphaned; now wired for QTIP-LDLQ).
 #[allow(dead_code)]
 mod hessian_io;
+// KVarN (Phase D) — variance-normalized 4-bit KV, clean-room CPU core.
+#[allow(dead_code)]
+mod kvarn;
 
 use memmap2::Mmap;
 use std::collections::HashMap;

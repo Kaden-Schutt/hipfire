@@ -303,8 +303,16 @@ Papers + reference implementations vendored for Phases C/D:
   - **3-bit QTIP fallback (plan default):** make bits configurable, quantize
     qtip3-sim, PPL. Quick; modest bandwidth win vs MQ4.
   Then C2 decode kernel (only worth building once a bit-rate passes PPL).
-- **Phase D: spec/reference unblocked** — KVarN paper + repo in
-  `./Quantization/` (was the missing spec). Caveat: MLA-shaped, needs GQA
-  adaptation for Qwen3.5.
+- **Phase D: clean-room CPU core LANDED (2026-06-16).** `hipfire-quantize/src/
+  kvarn.rs` — log-domain Sinkhorn `variance_normalize` (imbalance 167→3.5,
+  perfect=2.0) + per-channel 4-bit `quantize_tile`/`dequantize_tile`
+  (`deq=(q*scale_abs+zp_abs)*s_col`, per-row Sinkhorn scale absorbed). Tests:
+  Sinkhorn reduces imbalance, 4-bit cos-sim 0.9955 (un-rotated core; FWHT
+  upstream lifts to the spec's 0.999 at the wiring layer), KVarN MSE 0.43× naive
+  per-row 4-bit on a skewed tile. Operates on a generic `[R,C]` tile — the GQA
+  adaptation. NEXT (D1): wire into the KV path (tile per `(layer,kv_head)` over
+  head_dim, share engine FWHT) + long-context coherence gate.
+- **Phase D (ref):** KVarN paper + repo in `./Quantization/` — algorithm ported
+  clean-room; MLA tile layout (R=512 latent) intentionally NOT ported (GQA).
 - **Phase E: scoped + instrumented** — MTP perf (phase split measured; E1
   GDN-tape replay, E2 compressed draft lm_head, E3 verify graph).
