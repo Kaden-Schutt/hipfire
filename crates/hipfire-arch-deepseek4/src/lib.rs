@@ -61,6 +61,6 @@ pub mod spec_decode;
 
 pub use arch::DeepseekV4;
 pub use deepseek4::{
-    DeepseekV4Config, DeepseekV4State, DeepseekV4Weights, IndexerLayerState,
-    MainAttentionLayerState,
+    config_from_safetensors, DeepseekV4Config, DeepseekV4State, DeepseekV4Weights,
+    IndexerLayerState, MainAttentionLayerState,
 };
