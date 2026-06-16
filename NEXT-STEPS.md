@@ -248,11 +248,17 @@ Papers + reference implementations vendored for Phases C/D:
     window, each lane reads 3 preceding symbols from the prev chunk. wave32,
     8 w/thread. Verified: compiles gfx1103+gfx1100, VGPR=39/SGPR=17/LDS=0/
     spills=0; test proves parallel-window decode == sequential trellis bit-exact.
-  - Remaining C2 wiring (needs GPU runtime iteration): QuantType::Qtip3G256 +
-    real `--format qtip3` emit (packed output, replacing the sim's bf16 post-
-    pass) + loader + dispatch registration of `gemv_qtip3g256` + qwen35 call
-    sites + GPU parity vs sim + coherence + fresh-probe perf. C2b prefill GEMM +
-    C3 gfx1103 retune follow.
+  - **C2 END-TO-END ON GPU ✅ (2026-06-16):** real `--format qtip3` emit
+    (QuantType::Qtip3G256) + full consumer wiring (DType, loader qt=31,
+    FwhtG256 rotation plan, Prerotated/Residual/SwiGLU dispatch + registry +
+    launch methods). **GPU parity: real kernel PPL 15.2117 vs sim 15.2040
+    (0.05% — bit-faithful decode), at 37 tok/s** (vs bf16 sim 14.9, since it
+    reads 0.39 B/w packed weights). Three dispatch bugs found+fixed via GPU
+    iteration: gemv.unknown (post-rotation variant), not-registered
+    (prerotated registry), residual/swiglu keys.
+  - Remaining: coherence-gate run on the qtip3 model; embed/lm_head mixed-quant
+    (they stay bf16 → 0.8B file currently > mq4; lm_head is in the decode hot
+    path); fresh-process tok/s vs mq4; C2b prefill GEMM + C3 gfx1103 retune.
 - **Phase C: (superseded) ACTIVE — LDLQ landed; pushing the rest of the QTIP stack.**
   C1e DONE end-to-end: clean-room `ldlq.rs` (inverse-Cholesky 1e-13, per-256
   Hessian FWHT rotation, block-trellis OBS) + `hessian_io` wired +
