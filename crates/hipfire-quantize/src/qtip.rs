@@ -242,14 +242,71 @@ fn decode_1mad_pair(state: u32) -> (f32, f32) {
     (decode_1mad(state), decode_1mad(state ^ 0x9E37_79B9))
 }
 
-/// V=2 computed codebook, flat `[v0, v1]` per state, renormalized to exact
-/// zero-mean / unit-variance over all 2·2^L values.
+/// Number of distinct 2-vectors (tlut entries) the V=2 codebook resolves to.
+/// 2^12 optimal 2D centroids — the bitshift state hashes onto these, so the
+/// effective codebook is `V2_TLUT` *designed* points, not 2^16 random ones.
+const V2_TLUT: usize = 4096;
+
+/// Lloyd (k-means) fit of `t` centroids to N(0,I)₂ — a *designed* 2D codebook
+/// that realizes the vector-quantization gain a random codebook can't.
+/// Deterministic (seeded), offline, cheap (no model/GPU/torch).
+fn lloyd_2d(t: usize, n_samples: usize, iters: usize) -> Vec<[f64; 2]> {
+    // Deterministic 2D Gaussian samples (Box–Muller over an LCG).
+    let mut lcg: u64 = 0xD1B5_4A32_D192_ED03;
+    let mut u01 = || {
+        lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((lcg >> 33) as f64 / (1u64 << 31) as f64).clamp(1e-12, 1.0)
+    };
+    let mut samples = Vec::with_capacity(n_samples);
+    for _ in 0..n_samples {
+        let (u1, u2) = (u01(), u01());
+        let r = (-2.0 * u1.ln()).sqrt();
+        samples.push([r * (std::f64::consts::TAU * u2).cos(), r * (std::f64::consts::TAU * u2).sin()]);
+    }
+    // Init centroids from the first `t` samples.
+    let mut cent: Vec<[f64; 2]> = samples[..t].to_vec();
+    for _ in 0..iters {
+        let mut sum = vec![[0.0f64; 2]; t];
+        let mut cnt = vec![0u32; t];
+        for s in &samples {
+            let mut best = 0usize;
+            let mut bd = f64::INFINITY;
+            for (i, c) in cent.iter().enumerate() {
+                let d = (s[0] - c[0]).powi(2) + (s[1] - c[1]).powi(2);
+                if d < bd {
+                    bd = d;
+                    best = i;
+                }
+            }
+            sum[best][0] += s[0];
+            sum[best][1] += s[1];
+            cnt[best] += 1;
+        }
+        for i in 0..t {
+            if cnt[i] > 0 {
+                cent[i] = [sum[i][0] / cnt[i] as f64, sum[i][1] / cnt[i] as f64];
+            }
+        }
+    }
+    cent
+}
+
+/// V=2 codebook (flat `[v0,v1]` per state). Each of the 2^L states maps via a
+/// splitmix hash onto one of `V2_TLUT` Lloyd-fitted 2D centroids, so the
+/// reachable codebook is the *designed* centroid set. Renormalized to exact
+/// zero-mean / unit-variance.
 pub fn build_codebook_v2() -> Vec<f32> {
+    let tlut = lloyd_2d(V2_TLUT, 200_000, 12);
     let mut cb: Vec<f64> = Vec::with_capacity(2 * V2_NUM_STATES);
     for s in 0..V2_NUM_STATES as u32 {
-        let (a, b) = decode_1mad_pair(s);
-        cb.push(a as f64);
-        cb.push(b as f64);
+        // splitmix32-ish hash → tlut index.
+        let mut z = s.wrapping_mul(0x9E37_79B1);
+        z ^= z >> 15;
+        z = z.wrapping_mul(0x85EB_CA77);
+        z ^= z >> 13;
+        let idx = (z as usize) % V2_TLUT;
+        cb.push(tlut[idx][0]);
+        cb.push(tlut[idx][1]);
     }
     let mean = cb.iter().sum::<f64>() / cb.len() as f64;
     for v in cb.iter_mut() {
@@ -675,7 +732,9 @@ mod tests {
 
         eprintln!(
             "V=1 MSE={v1:.5} V=2 MSE={v2:.5} bound={bound:.5} (V2/V1={:.3}, V2/bound={:.3}) \
-             [random V=2 codebook — needs a designed lattice to beat V=1]",
+             [Lloyd-designed V=2 codebook: narrowed V2/V1 from 1.09 (random) to ~1.01 but \
+              still not < 1 — vector gain needs the trellis-structured quantlut state→tlut \
+              map (cf. QTIP), not a hash; finetune (the bigger lever) impractical on this box]",
             v2 / v1,
             v2 / bound
         );
