@@ -262,9 +262,18 @@ Papers + reference implementations vendored for Phases C/D:
     attractor is a tiny-model long-greedy-decode artifact (documented Phase A
     behavior), NOT a qtip3 regression. qtip3 is numerically correct AND
     coherence-equivalent to MQ4. **PHASE C CORE DONE.**
-  - Remaining (polish, not blocking): embed/lm_head mixed-quant (they stay bf16
-    → 0.8B file currently > mq4; lm_head is in the decode hot path); fresh-
-    process tok/s vs mq4 (warm protocol); C2b prefill GEMM + C3 gfx1103 retune.
+  - **Mixed-quant ✅ (2026-06-16):** tied embed/lm_head → Q8F16 (gather-friendly;
+    can't be trellis-qtip3 — no random access). Was the bandwidth blocker:
+    bf16 lm_head [vocab×dim] read every token erased the win (qtip3 40.9 vs mq4
+    57.4 tok/s). After Q8: **qtip3 480 MB < mq4 549 MB (13% smaller)**, PPL holds
+    **15.20**, decode 40.9→53.3 tok/s. Fair same-2039-token-window: qtip3 ~37 ≈
+    mq4 ~38 tok/s.
+  - **PERF FINDING:** the 13% byte saving does NOT yet convert to a tok/s win —
+    qtip3 is competitive-but-not-faster. The first-cut trellis kernel's extra
+    ALU (per-lane 1MAD hash ×8) + untuned occupancy (39 VGPR, generic launch)
+    offsets the smaller weight reads on the bandwidth-bound 780M. Converting
+    bytes→tok/s needs **C3 gfx1103 retune** (occupancy, LDS-codebook vs
+    recompute tradeoff, multi-row). C2b prefill GEMM also remains.
 - **Phase C: (superseded) ACTIVE — LDLQ landed; pushing the rest of the QTIP stack.**
   C1e DONE end-to-end: clean-room `ldlq.rs` (inverse-Cholesky 1e-13, per-256
   Hessian FWHT rotation, block-trellis OBS) + `hessian_io` wired +
