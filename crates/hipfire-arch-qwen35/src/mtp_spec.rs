@@ -1313,6 +1313,16 @@ pub fn spec_step_mtp(
         gpu.active_stream = Some(gpu.hip.stream_create()?);
     }
 
+    // Env-gated phase timers (HIPFIRE_MTP_PHASE_TIMERS=1). The existing
+    // candidate/verify D2Hs synchronize the stream at the draft/verify
+    // boundaries, so host-wall deltas there are accurate; a device_synchronize
+    // before return captures the accept+replay phase. Off by default → no syncs
+    // added, zero behavior change.
+    let phase_timers = std::env::var("HIPFIRE_MTP_PHASE_TIMERS")
+        .map(|v| v != "0")
+        .unwrap_or(false);
+    let t_start = std::time::Instant::now();
+
     // ── 1. MTP candidate chain (Approach B: feature-only K-step) ────────
     //
     // ARCHITECTURALLY LOSSY: each step k (k > 0) feeds the previous step's
@@ -1413,6 +1423,7 @@ pub fn spec_step_mtp(
         gpu.hip.memcpy_dtoh(bytes, &lm_argmax_view.buf)?;
     }
     let candidates: Vec<u32> = argmax_host.into_iter().map(|x| x as u32).collect();
+    let t_draft = std::time::Instant::now();
 
     // ── 2. Build trunk verify input: [last_committed, c1, ..., c_max_n] ──
     let mut verify_tokens: Vec<u32> = Vec::with_capacity(max_n + 1);
@@ -1576,6 +1587,7 @@ pub fn spec_step_mtp(
         gpu.hip.memcpy_dtoh(bytes, &argmax_view.buf)?;
     }
     let argmax_per_pos: Vec<u32> = argmax_host.into_iter().map(|x| x as u32).collect();
+    let t_verify = std::time::Instant::now();
 
     // ── 6. Accept-prefix ────────────────────────────────────────────────
     //
@@ -1693,6 +1705,19 @@ pub fn spec_step_mtp(
     // (k+1)-th formerly-stale slot before its attention reads it. The
     // chain progresses left-to-right, overwriting stale slots in-order
     // exactly as needed. NO explicit rollback required.
+
+    if phase_timers {
+        let _ = gpu.hip.device_synchronize();
+        let t_end = std::time::Instant::now();
+        let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
+        eprintln!(
+            "[mtp-phase] draft={:.2}ms verify={:.2}ms accept+replay={:.2}ms total={:.2}ms advance={advance}",
+            ms(t_start, t_draft),
+            ms(t_draft, t_verify),
+            ms(t_verify, t_end),
+            ms(t_start, t_end),
+        );
+    }
 
     Ok(MtpSpecResult {
         committed,
