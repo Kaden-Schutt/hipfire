@@ -20,6 +20,7 @@ use crate::deepseek4::{
 };
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::model_source::ModelSource;
 use rdna_compute::Gpu;
 
 /// Type marker for DeepSeek V4 Flash. `arch_id = 9` — next free slot
@@ -171,7 +172,11 @@ impl DeepseekV4 {
         // EP shard: precompute owned set + compact-slot mapping. `shard = None`
         // ⇒ every expert owned, `local_of_global[e] == e`, n_owned == n_exp →
         // identical layout to the unsharded path.
-        let owns = |e: usize| shard.map(|(s, rank)| s.owns_expert(rank, e)).unwrap_or(true);
+        let owns = |e: usize| {
+            shard
+                .map(|(s, rank)| s.owns_expert(rank, e))
+                .unwrap_or(true)
+        };
         let mut local_of_global = vec![usize::MAX; n_exp];
         let mut n_owned = 0usize;
         for e in 0..n_exp {
@@ -588,8 +593,10 @@ impl DeepseekV4 {
         // N). Layers >= N fall back to shared-only FFN. Each layer's
         // expert blob is ~1.84 GB on the FP4-fixed HFQ (post-unpack
         // logical shape), so 22 layers ≈ 40 GB.
-        let upload_experts =
-            std::env::var("HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS").ok().as_deref() != Some("0");
+        let upload_experts = std::env::var("HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS")
+            .ok()
+            .as_deref()
+            != Some("0");
         let expert_layer_end: Option<usize> = std::env::var("HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END")
             .ok()
             .and_then(|s| s.parse().ok());
@@ -1253,6 +1260,853 @@ impl DeepseekV4 {
                     cfg.n_routed_experts,
                     mtp,
                     shard,
+                )?;
+            }
+        }
+
+        Ok(weights)
+    }
+}
+
+// ── ModelSource (safetensors) load helpers ──────────────────────
+
+impl DeepseekV4 {
+    /// Determine whether a tensor's bytes represent F16 values or a
+    /// quantized format by comparing the byte count against the
+    /// expected sizes. Returns `(is_f16, is_q8_0)`.
+    fn classify_tensor_bytes(bytes: &[u8], numel: usize) -> (bool, bool) {
+        let is_f16 = bytes.len() == numel * 2;
+        // Q8_0: 34 bytes per block of 32 elements:
+        //   [f16 scale (2 bytes)] [32 × i8 (32 bytes)]
+        let q8_0_expected = ((numel + 31) / 32) * 34;
+        let is_q8_0 = !is_f16 && bytes.len() == q8_0_expected;
+        (is_f16, is_q8_0)
+    }
+
+    /// Upload a tensor verbatim (raw bytes) from ModelSource to GPU.
+    /// Mirrors `upload_global_raw` but sources from `&dyn ModelSource`.
+    fn upload_global_raw_from_source(
+        source: &dyn ModelSource,
+        gpu: &mut Gpu,
+        name: &str,
+    ) -> Result<rdna_compute::GpuTensor, String> {
+        let (info, bytes) = source
+            .tensor_data(name)
+            .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in source"))?;
+        let shape: Vec<usize> = info.shape.clone();
+        gpu.upload_raw(bytes, &shape)
+            .map_err(|e| format!("deepseek4: upload '{name}' failed: {e:?}"))
+    }
+
+    /// Upload a weight tensor, classifying it as F16, Q8_0, or Raw
+    /// (MQ4-family) based on byte-count heuristics. Mirrors
+    /// `upload_quant_or_f16` but sources from `&dyn ModelSource`.
+    fn upload_quant_or_f16_from_source(
+        source: &dyn ModelSource,
+        gpu: &mut Gpu,
+        name: &str,
+    ) -> Result<rdna_compute::GpuTensor, String> {
+        let (info, bytes) = source
+            .tensor_data(name)
+            .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in source"))?;
+        let shape: Vec<usize> = info.shape.clone();
+        let numel: usize = shape.iter().product();
+        let (is_f16, is_q8_0) = Self::classify_tensor_bytes(bytes, numel);
+
+        if is_f16 {
+            if bytes.len() != numel * 2 {
+                return Err(format!(
+                    "deepseek4: '{name}' appears F16 but byte size {} != 2 × {numel}",
+                    bytes.len()
+                ));
+            }
+            let mut t = gpu
+                .upload_raw(bytes, &shape)
+                .map_err(|e| format!("deepseek4: upload f16-native '{name}' failed: {e:?}"))?;
+            t.dtype = rdna_compute::DType::F16;
+            return Ok(t);
+        }
+
+        let mut t = gpu
+            .upload_raw(bytes, &shape)
+            .map_err(|e| format!("deepseek4: upload '{name}' failed: {e:?}"))?;
+        if is_q8_0 {
+            t.dtype = rdna_compute::DType::Q8_0;
+        }
+        Ok(t)
+    }
+
+    /// Upload an F16-on-disk tensor as F32 on GPU. Mirrors
+    /// `upload_global_f16_as_f32` but sources from `&dyn ModelSource`.
+    fn upload_global_f16_as_f32_from_source(
+        source: &dyn ModelSource,
+        gpu: &mut Gpu,
+        name: &str,
+    ) -> Result<rdna_compute::GpuTensor, String> {
+        let (info, bytes) = source
+            .tensor_data(name)
+            .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in source"))?;
+        let shape: Vec<usize> = info.shape.clone();
+        let n: usize = shape.iter().product();
+        if bytes.len() != n * 2 {
+            return Err(format!(
+                "deepseek4: '{name}' expected F16 bytes ({} = 2 × {}), got {}",
+                n * 2,
+                n,
+                bytes.len()
+            ));
+        }
+        let f32_vals: Vec<f32> = (0..n)
+            .map(|i| {
+                let lo = bytes[i * 2];
+                let hi = bytes[i * 2 + 1];
+                hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([lo, hi]))
+            })
+            .collect();
+        gpu.upload_f32(&f32_vals, &shape)
+            .map_err(|e| format!("deepseek4: upload f16→f32 '{name}' failed: {e:?}"))
+    }
+
+    /// Upload an F16-on-disk tensor as F16 bytes on GPU (no conversion).
+    /// Mirrors `upload_quant_as_f16_native` but sources from
+    /// `&dyn ModelSource`. Errors if the tensor isn't F16.
+    fn upload_quant_as_f16_native_from_source(
+        source: &dyn ModelSource,
+        gpu: &mut Gpu,
+        name: &str,
+    ) -> Result<rdna_compute::GpuTensor, String> {
+        let (info, bytes) = source
+            .tensor_data(name)
+            .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in source"))?;
+        let shape: Vec<usize> = info.shape.clone();
+        let numel: usize = shape.iter().product();
+        let (is_f16, _) = Self::classify_tensor_bytes(bytes, numel);
+        if !is_f16 {
+            return Err(format!(
+                "deepseek4: '{name}' not F16 ({} bytes for {numel} elems); cannot upload as F16 native",
+                bytes.len()
+            ));
+        }
+        if bytes.len() != numel * 2 {
+            return Err(format!(
+                "deepseek4: '{name}' marked F16 but byte size {} != 2 × {numel}",
+                bytes.len()
+            ));
+        }
+        let mut t = gpu
+            .upload_raw(bytes, &shape)
+            .map_err(|e| format!("deepseek4: upload f16-native '{name}' failed: {e:?}"))?;
+        t.dtype = rdna_compute::DType::F16;
+        Ok(t)
+    }
+
+    /// Upload routed-expert blobs for one layer from a ModelSource.
+    /// Mirrors `upload_layer_routed_experts` but sources from
+    /// `&dyn ModelSource`.
+    fn upload_layer_routed_experts_from_source(
+        source: &dyn ModelSource,
+        gpu: &mut Gpu,
+        prefix: &str,
+        n_exp: usize,
+        layer: &mut DeepseekV4LayerWeights,
+        shard: Option<(&hipfire_runtime::tp_shard::ShardConfig, usize)>,
+    ) -> Result<(), String> {
+        // EP shard: precompute owned set + compact-slot mapping.
+        let owns = |e: usize| {
+            shard
+                .map(|(s, rank)| s.owns_expert(rank, e))
+                .unwrap_or(true)
+        };
+        let mut local_of_global = vec![usize::MAX; n_exp];
+        let mut n_owned = 0usize;
+        for e in 0..n_exp {
+            if owns(e) {
+                local_of_global[e] = n_owned;
+                n_owned += 1;
+            }
+        }
+        if n_owned == 0 {
+            return Err(format!("deepseek4: {prefix} shard rank owns no experts"));
+        }
+
+        // w2 (down): read each expert, pack ONLY owned into blob.
+        {
+            let name0 = format!("{prefix}.ffn.experts.0.w2.weight");
+            let (info0, _b0) = source
+                .tensor_data(&name0)
+                .ok_or_else(|| format!("deepseek4: missing {name0}"))?;
+            let stride = info0.data_size;
+            let shape0: Vec<usize> = info0.shape.clone();
+
+            let mut blob = Vec::with_capacity(stride * n_owned);
+            for e in 0..n_exp {
+                if !owns(e) {
+                    continue;
+                }
+                let name = format!("{prefix}.ffn.experts.{e}.w2.weight");
+                let (info, bytes) = source
+                    .tensor_data(&name)
+                    .ok_or_else(|| format!("deepseek4: missing {name}"))?;
+                if info.data_size != stride {
+                    return Err(format!(
+                        "deepseek4: {name} size {} != stride {}",
+                        info.data_size, stride
+                    ));
+                }
+                blob.extend_from_slice(bytes);
+            }
+            let mut blob_shape = vec![n_owned];
+            blob_shape.extend_from_slice(&shape0);
+            let blob_tensor = gpu
+                .upload_raw(&blob, &blob_shape)
+                .map_err(|e| format!("deepseek4: upload blob {prefix}.w2: {e:?}"))?;
+            drop(blob);
+            let base_ptr = blob_tensor.buf.as_ptr() as u64;
+            let ptrs: Vec<u64> = (0..n_exp)
+                .map(|e| {
+                    if owns(e) {
+                        base_ptr + (local_of_global[e] * stride) as u64
+                    } else {
+                        base_ptr
+                    }
+                })
+                .collect();
+            let ptr_bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
+            let ptr_tensor = gpu
+                .alloc_tensor(&[2 * n_exp], rdna_compute::DType::F32)
+                .map_err(|e| format!("deepseek4: alloc ptr table {prefix}.w2: {e:?}"))?;
+            gpu.hip
+                .memcpy_htod(&ptr_tensor.buf, &ptr_bytes)
+                .map_err(|e| format!("deepseek4: copy ptr table {prefix}.w2: {e:?}"))?;
+            layer.expert_w2_blob = Some(blob_tensor);
+            layer.expert_w2_ptrs = Some(ptr_tensor);
+            layer.expert_w2_stride = stride;
+        }
+
+        // gate_up (combined w1 ‖ w3).
+        {
+            let w1_0 = format!("{prefix}.ffn.experts.0.w1.weight");
+            let w3_0 = format!("{prefix}.ffn.experts.0.w3.weight");
+            let (w1_info0, _b1) = source
+                .tensor_data(&w1_0)
+                .ok_or_else(|| format!("deepseek4: missing {w1_0}"))?;
+            let stride_w1 = w1_info0.data_size;
+            let (w3_info0, _b3) = source
+                .tensor_data(&w3_0)
+                .ok_or_else(|| format!("deepseek4: missing {w3_0}"))?;
+            let stride_w3 = w3_info0.data_size;
+            if stride_w1 != stride_w3 {
+                return Err(format!(
+                    "deepseek4: {prefix} w1/w3 stride mismatch: w1={} w3={}",
+                    stride_w1, stride_w3
+                ));
+            }
+            let combined_stride = stride_w1 + stride_w3;
+            let mut combined = Vec::with_capacity(combined_stride * n_owned);
+            for e in 0..n_exp {
+                if !owns(e) {
+                    continue;
+                }
+                let w1_name = format!("{prefix}.ffn.experts.{e}.w1.weight");
+                {
+                    let (_, w1_bytes) = source
+                        .tensor_data(&w1_name)
+                        .ok_or_else(|| format!("deepseek4: missing {w1_name}"))?;
+                    combined.extend_from_slice(w1_bytes);
+                }
+                let w3_name = format!("{prefix}.ffn.experts.{e}.w3.weight");
+                {
+                    let (_, w3_bytes) = source
+                        .tensor_data(&w3_name)
+                        .ok_or_else(|| format!("deepseek4: missing {w3_name}"))?;
+                    combined.extend_from_slice(w3_bytes);
+                }
+            }
+            let combined_tensor = gpu
+                .upload_raw(&combined, &[n_owned, combined_stride])
+                .map_err(|e| format!("deepseek4: upload gate_up {prefix}: {e:?}"))?;
+            drop(combined);
+            let base_ptr = combined_tensor.buf.as_ptr() as u64;
+            let dummy_gu = if shard.is_some() && n_owned < n_exp {
+                let z = gpu
+                    .zeros(&[combined_stride / 4], rdna_compute::DType::F32)
+                    .map_err(|e| format!("deepseek4: {prefix} zero gate_up dummy: {e:?}"))?;
+                let p = z.buf.as_ptr() as u64;
+                std::mem::forget(z);
+                p
+            } else {
+                base_ptr
+            };
+            let ptrs: Vec<u64> = (0..n_exp)
+                .map(|e| {
+                    if owns(e) {
+                        base_ptr + (local_of_global[e] * combined_stride) as u64
+                    } else {
+                        dummy_gu
+                    }
+                })
+                .collect();
+            let ptr_bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
+            let ptr_tensor = gpu
+                .alloc_tensor(&[2 * n_exp], rdna_compute::DType::F32)
+                .map_err(|e| format!("deepseek4: alloc gate_up ptr table {prefix}: {e:?}"))?;
+            gpu.hip
+                .memcpy_htod(&ptr_tensor.buf, &ptr_bytes)
+                .map_err(|e| format!("deepseek4: copy gate_up ptr table {prefix}: {e:?}"))?;
+            layer.expert_gate_up_blob = Some(combined_tensor);
+            layer.expert_gate_up_ptrs = Some(ptr_tensor);
+            layer.expert_gate_up_stride = combined_stride;
+        }
+        Ok(())
+    }
+}
+
+// ── Top-level safetensors load entry point ──────────────────────
+
+impl DeepseekV4 {
+    /// Load model weights from a `&dyn ModelSource` (safetensors or HFQ
+    /// wrapper). Mirrors `load_weights_inner` but reads tensor data via
+    /// `ModelSource::tensor_data()` instead of `HfqFile::tensor_data_pread()`.
+    ///
+    /// Tensor names match those used in the HFQ path (the safetensors
+    /// created by `hipfire-quantize` use the same naming convention).
+    /// Quantization format is inferred from byte counts (F16 vs Q8_0 vs
+    /// MQ4-family) matching the HFQ byte layout.
+    ///
+    /// Only `shard = None` is currently exposed — EP-shard-aware loading
+    /// from safetensors is a future extension when multi-GPU deepseek4
+    /// is brought up.
+    pub fn load_weights_from_safetensors(
+        source: &dyn ModelSource,
+        cfg: &DeepseekV4Config,
+        gpu: &mut Gpu,
+    ) -> Result<DeepseekV4Weights, String> {
+        let upload_experts = std::env::var("HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS")
+            .ok()
+            .as_deref()
+            != Some("0");
+        let expert_layer_end: Option<usize> = std::env::var("HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let comp_f16_wmma = std::env::var("HIPFIRE_DEEPSEEK4_COMP_F16_WMMA")
+            .map(|s| s != "0")
+            .unwrap_or(true);
+
+        // Build empty weight scaffold from config.
+        let n_layers = cfg.num_hidden_layers;
+        let mut layers: Vec<DeepseekV4LayerWeights> = Vec::with_capacity(n_layers);
+        for l in 0..n_layers {
+            let ratio = *cfg.compress_ratios.get(l).unwrap_or(&0);
+            layers.push(DeepseekV4LayerWeights::new_empty(ratio));
+        }
+        let mut weights = DeepseekV4Weights {
+            token_embd: None,
+            output_norm: None,
+            head: None,
+            hc_head_fn: None,
+            hc_head_base: None,
+            hc_head_scale: 1.0,
+            layers,
+            mtp_layer: None,
+            _scaffold: (),
+        };
+
+        // ── Globals ────────────────────────────────────────────────────
+        weights.token_embd = Some(Self::upload_global_raw_from_source(
+            source,
+            gpu,
+            "embed.weight",
+        )?);
+        weights.output_norm = Some(Self::upload_global_f16_as_f32_from_source(
+            source,
+            gpu,
+            "norm.weight",
+        )?);
+        weights.head = Some(Self::upload_quant_or_f16_from_source(
+            source,
+            gpu,
+            "head.weight",
+        )?);
+
+        weights.hc_head_fn = Some(Self::upload_global_raw_from_source(
+            source,
+            gpu,
+            "hc_head_fn",
+        )?);
+        weights.hc_head_base = Some(Self::upload_global_raw_from_source(
+            source,
+            gpu,
+            "hc_head_base",
+        )?);
+        {
+            let (info, bytes) = source
+                .tensor_data("hc_head_scale")
+                .ok_or_else(|| "deepseek4: hc_head_scale missing in source".to_string())?;
+            if info.shape != vec![1] {
+                return Err(format!(
+                    "deepseek4: hc_head_scale unexpected shape {:?}",
+                    info.shape
+                ));
+            }
+            let scale =
+                hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]));
+            weights.hc_head_scale = scale;
+        }
+
+        // ── Per-layer ──────────────────────────────────────────────────
+        for (l, layer) in weights.layers.iter_mut().enumerate() {
+            // Norms (F16 on disk → F32 on GPU).
+            layer.attn_norm = Some(Self::upload_global_f16_as_f32_from_source(
+                source,
+                gpu,
+                &format!("layers.{l}.attn_norm.weight"),
+            )?);
+            layer.ffn_norm = Some(Self::upload_global_f16_as_f32_from_source(
+                source,
+                gpu,
+                &format!("layers.{l}.ffn_norm.weight"),
+            )?);
+            layer.q_norm = Some(Self::upload_global_f16_as_f32_from_source(
+                source,
+                gpu,
+                &format!("layers.{l}.attn.q_norm.weight"),
+            )?);
+            layer.kv_norm = Some(Self::upload_global_f16_as_f32_from_source(
+                source,
+                gpu,
+                &format!("layers.{l}.attn.kv_norm.weight"),
+            )?);
+            layer.attn_sink = Some(Self::upload_global_f16_as_f32_from_source(
+                source,
+                gpu,
+                &format!("layers.{l}.attn.attn_sink"),
+            )?);
+
+            // Attention LoRA + KV joint.
+            layer.wq_a = Some(Self::upload_quant_or_f16_from_source(
+                source,
+                gpu,
+                &format!("layers.{l}.attn.wq_a.weight"),
+            )?);
+            layer.wq_b = Some(Self::upload_quant_or_f16_from_source(
+                source,
+                gpu,
+                &format!("layers.{l}.attn.wq_b.weight"),
+            )?);
+            layer.wkv = Some(Self::upload_quant_or_f16_from_source(
+                source,
+                gpu,
+                &format!("layers.{l}.attn.wkv.weight"),
+            )?);
+            layer.wo_a = Some(Self::upload_quant_or_f16_from_source(
+                source,
+                gpu,
+                &format!("layers.{l}.attn.wo_a.weight"),
+            )?);
+            layer.wo_b = Some(Self::upload_quant_or_f16_from_source(
+                source,
+                gpu,
+                &format!("layers.{l}.attn.wo_b.weight"),
+            )?);
+
+            // Main-attention compressor — only when ratio > 0.
+            if layer.compress_ratio > 0 {
+                layer.compressor_wkv = Some(Self::upload_quant_or_f16_from_source(
+                    source,
+                    gpu,
+                    &format!("layers.{l}.attn.compressor.wkv.weight"),
+                )?);
+                layer.compressor_wgate = Some(Self::upload_quant_or_f16_from_source(
+                    source,
+                    gpu,
+                    &format!("layers.{l}.attn.compressor.wgate.weight"),
+                )?);
+                if comp_f16_wmma {
+                    layer.compressor_wkv_f16 = Some(Self::upload_quant_as_f16_native_from_source(
+                        source,
+                        gpu,
+                        &format!("layers.{l}.attn.compressor.wkv.weight"),
+                    )?);
+                    layer.compressor_wgate_f16 =
+                        Some(Self::upload_quant_as_f16_native_from_source(
+                            source,
+                            gpu,
+                            &format!("layers.{l}.attn.compressor.wgate.weight"),
+                        )?);
+                }
+                layer.compressor_norm = Some(Self::upload_global_f16_as_f32_from_source(
+                    source,
+                    gpu,
+                    &format!("layers.{l}.attn.compressor.norm.weight"),
+                )?);
+                layer.compressor_ape = Some(Self::upload_global_f16_as_f32_from_source(
+                    source,
+                    gpu,
+                    &format!("layers.{l}.attn.compressor.ape"),
+                )?);
+            }
+
+            // Indexer sub-module — only on layers with compress_ratio == 4.
+            if layer.compress_ratio == 4 {
+                layer.indexer_wq_b = Some(Self::upload_quant_or_f16_from_source(
+                    source,
+                    gpu,
+                    &format!("layers.{l}.attn.indexer.wq_b.weight"),
+                )?);
+                layer.indexer_weights_proj = Some(Self::upload_quant_or_f16_from_source(
+                    source,
+                    gpu,
+                    &format!("layers.{l}.attn.indexer.weights_proj.weight"),
+                )?);
+                layer.indexer_compressor_wkv = Some(Self::upload_quant_or_f16_from_source(
+                    source,
+                    gpu,
+                    &format!("layers.{l}.attn.indexer.compressor.wkv.weight"),
+                )?);
+                layer.indexer_compressor_wgate = Some(Self::upload_quant_or_f16_from_source(
+                    source,
+                    gpu,
+                    &format!("layers.{l}.attn.indexer.compressor.wgate.weight"),
+                )?);
+                if comp_f16_wmma {
+                    layer.indexer_compressor_wkv_f16 =
+                        Some(Self::upload_quant_as_f16_native_from_source(
+                            source,
+                            gpu,
+                            &format!("layers.{l}.attn.indexer.compressor.wkv.weight"),
+                        )?);
+                    layer.indexer_compressor_wgate_f16 =
+                        Some(Self::upload_quant_as_f16_native_from_source(
+                            source,
+                            gpu,
+                            &format!("layers.{l}.attn.indexer.compressor.wgate.weight"),
+                        )?);
+                }
+                layer.indexer_compressor_norm = Some(Self::upload_global_f16_as_f32_from_source(
+                    source,
+                    gpu,
+                    &format!("layers.{l}.attn.indexer.compressor.norm.weight"),
+                )?);
+                layer.indexer_compressor_ape = Some(Self::upload_global_f16_as_f32_from_source(
+                    source,
+                    gpu,
+                    &format!("layers.{l}.attn.indexer.compressor.ape"),
+                )?);
+            }
+
+            // Hyper-Connections (F16 small matrices).
+            layer.hc_attn_base = Some(Self::upload_global_raw_from_source(
+                source,
+                gpu,
+                &format!("layers.{l}.hc_attn_base"),
+            )?);
+            layer.hc_attn_fn = Some(Self::upload_global_raw_from_source(
+                source,
+                gpu,
+                &format!("layers.{l}.hc_attn_fn"),
+            )?);
+            layer.hc_attn_scale = Some(Self::upload_global_raw_from_source(
+                source,
+                gpu,
+                &format!("layers.{l}.hc_attn_scale"),
+            )?);
+            layer.hc_ffn_base = Some(Self::upload_global_raw_from_source(
+                source,
+                gpu,
+                &format!("layers.{l}.hc_ffn_base"),
+            )?);
+            layer.hc_ffn_fn = Some(Self::upload_global_raw_from_source(
+                source,
+                gpu,
+                &format!("layers.{l}.hc_ffn_fn"),
+            )?);
+            layer.hc_ffn_scale = Some(Self::upload_global_raw_from_source(
+                source,
+                gpu,
+                &format!("layers.{l}.hc_ffn_scale"),
+            )?);
+
+            // FFN router.
+            layer.gate_weight = Some(Self::upload_quant_or_f16_from_source(
+                source,
+                gpu,
+                &format!("layers.{l}.ffn.gate.weight"),
+            )?);
+            if l >= cfg.num_hash_layers {
+                let bias_name = format!("layers.{l}.ffn.gate.bias");
+                let bias_gpu = Self::upload_global_f16_as_f32_from_source(source, gpu, &bias_name)?;
+                layer.gate_bias_host = gpu
+                    .download_f32(&bias_gpu)
+                    .map_err(|e| format!("d2h gate_bias l{l}: {e:?}"))?;
+                layer.gate_bias = Some(bias_gpu);
+            } else {
+                // Hash-routed layer: read `tid2eid` lookup table (I32 raw bytes).
+                let tid_name = format!("layers.{l}.ffn.gate.tid2eid");
+                if let Some((info, bytes)) = source.tensor_data(&tid_name) {
+                    if bytes.len() % 4 == 0 {
+                        let vals: Vec<u32> = bytes
+                            .chunks_exact(4)
+                            .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+                            .collect();
+                        let expected = info.shape.iter().product::<usize>();
+                        if vals.len() == expected {
+                            let shape: Vec<usize> = info.shape.clone();
+                            match gpu.upload_raw(bytes, &shape) {
+                                Ok(t) => layer.tid2eid_dev = Some(t),
+                                Err(e) => eprintln!(
+                                    "deepseek4: tid2eid l{l} upload failed: {e:?}; \
+                                    fall back to host gather"
+                                ),
+                            }
+                            layer.tid2eid_host = vals;
+                        } else {
+                            eprintln!(
+                                "deepseek4: tid2eid l{l} size mismatch \
+                                ({} vs expected {}); ignoring",
+                                vals.len(),
+                                expected
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Shared expert.
+            layer.shared_w1 = Some(Self::upload_quant_or_f16_from_source(
+                source,
+                gpu,
+                &format!("layers.{l}.ffn.shared_experts.w1.weight"),
+            )?);
+            layer.shared_w2 = Some(Self::upload_quant_or_f16_from_source(
+                source,
+                gpu,
+                &format!("layers.{l}.ffn.shared_experts.w2.weight"),
+            )?);
+            layer.shared_w3 = Some(Self::upload_quant_or_f16_from_source(
+                source,
+                gpu,
+                &format!("layers.{l}.ffn.shared_experts.w3.weight"),
+            )?);
+        }
+
+        // ── MTP layer ─────────────────────────────────────────────────
+        // Check if the source has MTP tensors (same naming as HFQ path:
+        // `mtp.0.norm.weight` as the canary).
+        let mtp_present = source.tensor_info("mtp.0.norm.weight").is_some();
+        if mtp_present {
+            let load_mtp = std::env::var("HIPFIRE_DEEPSEEK4_LOAD_MTP")
+                .map(|s| s != "0")
+                .unwrap_or(true);
+            if !load_mtp {
+                eprintln!(
+                    "deepseek4: source contains MTP layer but \
+                    HIPFIRE_DEEPSEEK4_LOAD_MTP=0 — skipping MTP upload"
+                );
+            } else {
+                eprintln!("deepseek4: MTP layer present — uploading from safetensors source.");
+                let mut mtp = DeepseekV4LayerWeights::new_empty(0);
+
+                // Standard layer fields under `mtp.0.` prefix.
+                mtp.attn_norm = Some(Self::upload_global_f16_as_f32_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.attn_norm.weight",
+                )?);
+                mtp.ffn_norm = Some(Self::upload_global_f16_as_f32_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.ffn_norm.weight",
+                )?);
+                mtp.q_norm = Some(Self::upload_global_f16_as_f32_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.attn.q_norm.weight",
+                )?);
+                mtp.kv_norm = Some(Self::upload_global_f16_as_f32_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.attn.kv_norm.weight",
+                )?);
+                mtp.attn_sink = Some(Self::upload_global_f16_as_f32_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.attn.attn_sink",
+                )?);
+
+                mtp.wq_a = Some(Self::upload_quant_or_f16_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.attn.wq_a.weight",
+                )?);
+                mtp.wq_b = Some(Self::upload_quant_or_f16_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.attn.wq_b.weight",
+                )?);
+                mtp.wkv = Some(Self::upload_quant_or_f16_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.attn.wkv.weight",
+                )?);
+                mtp.wo_a = Some(Self::upload_quant_or_f16_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.attn.wo_a.weight",
+                )?);
+                mtp.wo_b = Some(Self::upload_quant_or_f16_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.attn.wo_b.weight",
+                )?);
+
+                // HC blocks.
+                mtp.hc_attn_base = Some(Self::upload_global_raw_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.hc_attn_base",
+                )?);
+                mtp.hc_attn_fn = Some(Self::upload_global_raw_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.hc_attn_fn",
+                )?);
+                mtp.hc_attn_scale = Some(Self::upload_global_raw_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.hc_attn_scale",
+                )?);
+                mtp.hc_ffn_base = Some(Self::upload_global_raw_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.hc_ffn_base",
+                )?);
+                mtp.hc_ffn_fn = Some(Self::upload_global_raw_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.hc_ffn_fn",
+                )?);
+                mtp.hc_ffn_scale = Some(Self::upload_global_raw_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.hc_ffn_scale",
+                )?);
+
+                // FFN router (score-routed).
+                mtp.gate_weight = Some(Self::upload_quant_or_f16_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.ffn.gate.weight",
+                )?);
+                let bias_gpu =
+                    Self::upload_global_f16_as_f32_from_source(source, gpu, "mtp.0.ffn.gate.bias")?;
+                mtp.gate_bias_host = gpu
+                    .download_f32(&bias_gpu)
+                    .map_err(|e| format!("d2h mtp gate_bias: {e:?}"))?;
+                mtp.gate_bias = Some(bias_gpu);
+
+                // Shared expert.
+                mtp.shared_w1 = Some(Self::upload_quant_or_f16_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.ffn.shared_experts.w1.weight",
+                )?);
+                mtp.shared_w2 = Some(Self::upload_quant_or_f16_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.ffn.shared_experts.w2.weight",
+                )?);
+                mtp.shared_w3 = Some(Self::upload_quant_or_f16_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.ffn.shared_experts.w3.weight",
+                )?);
+
+                // MTP-specific fields.
+                mtp.mtp_enorm = Some(Self::upload_global_f16_as_f32_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.enorm.weight",
+                )?);
+                mtp.mtp_hnorm = Some(Self::upload_global_f16_as_f32_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.hnorm.weight",
+                )?);
+                mtp.mtp_e_proj = Some(Self::upload_quant_or_f16_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.e_proj.weight",
+                )?);
+                mtp.mtp_h_proj = Some(Self::upload_quant_or_f16_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.h_proj.weight",
+                )?);
+                mtp.mtp_final_norm = Some(Self::upload_global_f16_as_f32_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.norm.weight",
+                )?);
+
+                // MTP-specific head-HC matrices.
+                mtp.mtp_hc_head_fn = Some(Self::upload_global_raw_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.hc_head_fn",
+                )?);
+                mtp.mtp_hc_head_base = Some(Self::upload_global_raw_from_source(
+                    source,
+                    gpu,
+                    "mtp.0.hc_head_base",
+                )?);
+                {
+                    let (info, bytes) = source
+                        .tensor_data("mtp.0.hc_head_scale")
+                        .ok_or_else(|| "mtp.0.hc_head_scale missing in source".to_string())?;
+                    if info.shape != vec![1] {
+                        return Err(format!(
+                            "mtp.0.hc_head_scale unexpected shape {:?}",
+                            info.shape
+                        ));
+                    }
+                    mtp.mtp_hc_head_scale =
+                        hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([
+                            bytes[0], bytes[1],
+                        ]));
+                }
+
+                weights.mtp_layer = Some(mtp);
+            }
+        }
+
+        // ── Routed experts ────────────────────────────────────────────
+        if upload_experts {
+            for (l, layer) in weights.layers.iter_mut().enumerate() {
+                let upload_this_layer = expert_layer_end.is_none_or(|end| l < end);
+                if !upload_this_layer {
+                    continue;
+                }
+                let n_exp = cfg.n_routed_experts;
+                Self::upload_layer_routed_experts_from_source(
+                    source,
+                    gpu,
+                    &format!("layers.{l}"),
+                    n_exp,
+                    layer,
+                    None, // No EP shard in safetensors path yet.
+                )?;
+            }
+        }
+        if upload_experts {
+            if let Some(mtp) = weights.mtp_layer.as_mut() {
+                eprintln!("deepseek4: uploading MTP routed experts from safetensors source.");
+                Self::upload_layer_routed_experts_from_source(
+                    source,
+                    gpu,
+                    "mtp.0",
+                    cfg.n_routed_experts,
+                    mtp,
+                    None,
                 )?;
             }
         }
