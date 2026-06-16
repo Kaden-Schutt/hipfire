@@ -5606,13 +5606,16 @@ fn daemon_generate_request(
     prompt_text: String,
     max_tokens: usize,
     worker_key_id: Option<String>,
+    evidence_dir: Option<&Path>,
 ) -> GenerateTextRequest {
-    GenerateTextRequest::from_prompt(
+    let mut request = GenerateTextRequest::from_prompt(
         id,
         prompt_text,
         GenerationSamplingPolicy::greedy(max_tokens.min(u32::MAX as usize) as u32),
     )
-    .with_worker_key_id(worker_key_id)
+    .with_worker_key_id(worker_key_id);
+    request.evidence_dir = evidence_dir.map(|dir| dir.display().to_string());
+    request
 }
 
 fn read_repo_prompt_text(prompt_path: &str) -> anyhow::Result<String> {
@@ -5957,6 +5960,7 @@ async fn daemon_smoke_rows_with_session(
         prompt_text,
         config.max_tokens,
         Some(worker_key_id.clone()),
+        None,
     );
     let (text, done) = session.engine.generate(request).await?;
     let finite = !text.is_empty() && !text.contains('\u{fffd}');
@@ -5976,6 +5980,7 @@ async fn daemon_smoke_rows_with_session(
         session_prompt_text.clone(),
         config.max_tokens,
         Some(worker_key_id.clone()),
+        None,
     );
     let (first_session_text, first_session_done) =
         session.engine.generate(first_session_request).await?;
@@ -5985,6 +5990,7 @@ async fn daemon_smoke_rows_with_session(
             .to_string(),
         config.max_tokens,
         Some(worker_key_id.clone()),
+        None,
     );
     let (distractor_text, distractor_done) = session.engine.generate(distractor_request).await?;
     session.engine.reset().await?;
@@ -5993,6 +5999,7 @@ async fn daemon_smoke_rows_with_session(
         session_prompt_text,
         config.max_tokens,
         Some(worker_key_id.clone()),
+        None,
     );
     let (second_session_text, second_session_done) =
         session.engine.generate(second_session_request).await?;
@@ -6134,11 +6141,17 @@ async fn daemon_speed_rows_with_session(
     let mut rows = Vec::new();
     for case in daemon_speed_cases() {
         session.engine.reset().await?;
+        let evidence_dir = runtime_evidence_dir(
+            config,
+            &format!("daemon-speed-{}", case.label),
+            &config.model,
+        );
         let request = daemon_generate_request(
             format!("eval-speed-{}", case.label),
             prompt_text.clone(),
             max_tokens,
             Some(worker_key_id.clone()),
+            Some(&evidence_dir),
         );
         let (text, done) = session.engine.generate(request).await?;
         let has_timing = done.prefill_tok_s.is_some() && done.decode_tok_s.is_some();
@@ -6168,6 +6181,10 @@ async fn daemon_speed_rows_with_session(
             ("max_tokens".to_string(), json!(max_tokens)),
             ("tokens".to_string(), json!(done.tokens)),
             ("text_bytes".to_string(), json!(text.len())),
+            (
+                "runtime_evidence_dir".to_string(),
+                json!(evidence_dir.display().to_string()),
+            ),
         ]);
         if let Some(value) = done.tok_s {
             metrics.insert("tok_s".to_string(), json!(value));
@@ -12075,15 +12092,30 @@ mod tests {
             "What is 2+2?".to_string(),
             cfg.max_tokens,
             Some("worker-key".to_string()),
+            None,
         );
         assert_eq!(req.id, "eval-smoke");
         assert_eq!(req.prompt, "What is 2+2?");
         assert_eq!(req.worker_key_id.as_deref(), Some("worker-key"));
         assert_eq!(req.sampling.max_tokens, 17);
+        assert_eq!(req.evidence_dir, None);
         assert!(req
             .messages
             .as_ref()
             .is_some_and(|messages| messages.len() == 1));
+
+        let evidence_dir = PathBuf::from("/tmp/hipfire-daemon-evidence");
+        let req = daemon_generate_request(
+            "eval-speed".to_string(),
+            "Count quickly.".to_string(),
+            cfg.max_tokens,
+            Some("worker-key".to_string()),
+            Some(&evidence_dir),
+        );
+        assert_eq!(
+            req.evidence_dir.as_deref(),
+            Some("/tmp/hipfire-daemon-evidence")
+        );
     }
 
     #[test]

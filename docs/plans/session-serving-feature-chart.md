@@ -107,6 +107,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Eval artifact row records now reuse `hipfire-evidence` record contracts instead of eval-local JSON construction.
 - Runtime oneshot evidence and sparse router-histogram artifact rendering now reuse `hipfire-evidence` writer contracts; Qwen3.5 remains a model-specific histogram gatherer.
 - Daemon AR text generation can now emit standard runtime oneshot artifacts via additive `GenerateTextRequest.evidence_dir`; DFlash/MTP/VL evidence emission remains a follow-up.
+- Daemon-backed speed eval rows now pass per-case `evidence_dir` paths and expose `runtime_evidence_dir` metrics for existing artifact collection.
 - Eval comparison, admission, and evidence artifacts now reuse `hipfire-evidence` run-provenance contracts instead of eval-local provenance structs.
 - Eval artifact index entries now reuse `hipfire-evidence` index rendering instead of eval-local JSON construction.
 - Eval comparison, admission, prompt-ledger, and host-profile artifact index entries now reuse `hipfire-evidence` variant renderers instead of eval-local JSON mutation.
