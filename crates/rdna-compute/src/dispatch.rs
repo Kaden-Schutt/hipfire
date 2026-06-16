@@ -211,22 +211,22 @@ pub enum DType {
     F32,
     F16,
     BF16,
-    Q4K,          // 144 bytes per 256 elements
-    Q6K,          // 210 bytes per 256 elements
-    Q8_0,         // 34 bytes per 32 elements
-    Q4F16G64,     // 36 bytes per 64 elements (RDNA-native FP16 dequant)
-    Q4F16G32,     // 20 bytes per 32 elements (RDNA-native FP16 dequant)
-    Q8HFQ,        // split-metadata: scales contiguous then values contiguous, 128B-aligned rows
-    HFQ4G256,     // 136 bytes per 256 elements (flat 4-bit, f32 scale+zero, 18 VGPRs)
-    HFQ4G128,     // 72 bytes per 128 elements (flat 4-bit, f32 scale+zero, 14 VGPRs)
-    HFQ3G256,     // 104 bytes per 256 elements (flat 3-bit, f32 scale+zero)
-    HFQ3G128,     // 56 bytes per 128 elements (flat 3-bit, f32 scale+zero)
-    MQ4G256,      // MagnumQuant: FWHT-rotated HFQ4-G256 (136 bytes/group, same as HFQ4G256)
-    MQ4G128,      // MagnumQuant: FWHT-128-rotated INT4 (72 bytes/group, same layout as HFQ4G128)
-    MQ8G256,      // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target (258 bytes/group)
-    MQ6G256,      // MagnumQuant: FWHT-rotated HFQ6-G256 (200 bytes/group, same as HFQ6G256)
-    MQ3G256,      // MagnumQuant: FWHT-rotated HFQ3-G256 (104 bytes/group, same as HFQ3G256)
-    Qtip3G256,    // QTIP-3: FWHT-rotated trellis-coded 3-bit (100 bytes/group: f32 scale + 96 B
+    Q4K,       // 144 bytes per 256 elements
+    Q6K,       // 210 bytes per 256 elements
+    Q8_0,      // 34 bytes per 32 elements
+    Q4F16G64,  // 36 bytes per 64 elements (RDNA-native FP16 dequant)
+    Q4F16G32,  // 20 bytes per 32 elements (RDNA-native FP16 dequant)
+    Q8HFQ,     // split-metadata: scales contiguous then values contiguous, 128B-aligned rows
+    HFQ4G256,  // 136 bytes per 256 elements (flat 4-bit, f32 scale+zero, 18 VGPRs)
+    HFQ4G128,  // 72 bytes per 128 elements (flat 4-bit, f32 scale+zero, 14 VGPRs)
+    HFQ3G256,  // 104 bytes per 256 elements (flat 3-bit, f32 scale+zero)
+    HFQ3G128,  // 56 bytes per 128 elements (flat 3-bit, f32 scale+zero)
+    MQ4G256,   // MagnumQuant: FWHT-rotated HFQ4-G256 (136 bytes/group, same as HFQ4G256)
+    MQ4G128,   // MagnumQuant: FWHT-128-rotated INT4 (72 bytes/group, same layout as HFQ4G128)
+    MQ8G256,   // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target (258 bytes/group)
+    MQ6G256,   // MagnumQuant: FWHT-rotated HFQ6-G256 (200 bytes/group, same as HFQ6G256)
+    MQ3G256,   // MagnumQuant: FWHT-rotated HFQ3-G256 (104 bytes/group, same as HFQ3G256)
+    Qtip3G256, // QTIP-3: FWHT-rotated trellis-coded 3-bit (100 bytes/group: f32 scale + 96 B
     // packed symbols). Decoded by gemv_qtip3g256 (computed 1MAD codebook, zero LDS); runtime
     // FWHT-rotates x like MQ3/MQ4. See kernels/src/gemv_qtip3g256.hip / qtip.rs.
     MQ2G256,      // MagnumQuant: FWHT-rotated HFQ2-G256 (72 bytes/group, same as HFQ2G256)
@@ -9467,7 +9467,11 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("gemv_qtip3g256", kernels::GEMV_QTIP3G256_SRC, "gemv_qtip3g256")?;
+        self.ensure_kernel(
+            "gemv_qtip3g256",
+            kernels::GEMV_QTIP3G256_SRC,
+            "gemv_qtip3g256",
+        )?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();

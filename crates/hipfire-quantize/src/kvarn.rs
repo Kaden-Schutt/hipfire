@@ -163,10 +163,10 @@ pub fn variance_normalize(tile: &[f32], r_dim: usize, c_dim: usize, iters: usize
 /// `scale_abs`/`zp_abs` are per-channel (per-row, with the row Sinkhorn scale
 /// absorbed); `s_col` is the per-column (per-token) scale stored separately.
 pub struct QuantTile {
-    pub q: Vec<u8>,         // [r_dim * c_dim] 4-bit codes (stored one per byte here; pack downstream)
+    pub q: Vec<u8>, // [r_dim * c_dim] 4-bit codes (stored one per byte here; pack downstream)
     pub scale_abs: Vec<f32>, // [r_dim]
-    pub zp_abs: Vec<f32>,    // [r_dim]
-    pub s_col: Vec<f32>,     // [c_dim]
+    pub zp_abs: Vec<f32>, // [r_dim]
+    pub s_col: Vec<f32>, // [c_dim]
     pub r_dim: usize,
     pub c_dim: usize,
 }
@@ -402,7 +402,10 @@ mod tests {
             rec.len(),
             rec.len() as f32 / (r * c) as f32
         );
-        assert!(cs > 0.9999, "fp16-metadata dequant drift: cos-sim {cs} too low");
+        assert!(
+            cs > 0.9999,
+            "fp16-metadata dequant drift: cos-sim {cs} too low"
+        );
     }
 
     #[test]
@@ -432,11 +435,21 @@ mod tests {
             }
         }
         let mse = |a: &[f32], b: &[f32]| -> f64 {
-            a.iter().zip(b).map(|(&x, &y)| ((x - y) as f64).powi(2)).sum::<f64>() / a.len() as f64
+            a.iter()
+                .zip(b)
+                .map(|(&x, &y)| ((x - y) as f64).powi(2))
+                .sum::<f64>()
+                / a.len() as f64
         };
         let kvarn = dequantize_tile(&quantize_tile(&tile, r, c));
         let (e_naive, e_kvarn) = (mse(&tile, &naive), mse(&tile, &kvarn));
-        eprintln!("MSE naive-per-row={e_naive:.5} KVarN={e_kvarn:.5} (KVarN/naive={:.3})", e_kvarn / e_naive);
-        assert!(e_kvarn < e_naive, "KVarN must beat naive per-row 4-bit on a skewed tile");
+        eprintln!(
+            "MSE naive-per-row={e_naive:.5} KVarN={e_kvarn:.5} (KVarN/naive={:.3})",
+            e_kvarn / e_naive
+        );
+        assert!(
+            e_kvarn < e_naive,
+            "KVarN must beat naive per-row 4-bit on a skewed tile"
+        );
     }
 }

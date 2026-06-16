@@ -281,14 +281,19 @@ fn lloyd_2d(t: usize, n_samples: usize, iters: usize) -> Vec<[f64; 2]> {
     // Deterministic 2D Gaussian samples (Box–Muller over an LCG).
     let mut lcg: u64 = 0xD1B5_4A32_D192_ED03;
     let mut u01 = || {
-        lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        lcg = lcg
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((lcg >> 33) as f64 / (1u64 << 31) as f64).clamp(1e-12, 1.0)
     };
     let mut samples = Vec::with_capacity(n_samples);
     for _ in 0..n_samples {
         let (u1, u2) = (u01(), u01());
         let r = (-2.0 * u1.ln()).sqrt();
-        samples.push([r * (std::f64::consts::TAU * u2).cos(), r * (std::f64::consts::TAU * u2).sin()]);
+        samples.push([
+            r * (std::f64::consts::TAU * u2).cos(),
+            r * (std::f64::consts::TAU * u2).sin(),
+        ]);
     }
     // Init centroids from the first `t` samples.
     let mut cent: Vec<[f64; 2]> = samples[..t].to_vec();
@@ -865,13 +870,25 @@ mod tests {
         let scale0 = group_scale(&group);
 
         let s2 = beam_encode_group_bits(&group, scale0, &cb, 128, 2);
-        let mse2 = mse(&group, &decode_group_bits(&s2, optimal_scale_bits(&group, &s2, &cb, 2), &cb, 2));
+        let mse2 = mse(
+            &group,
+            &decode_group_bits(&s2, optimal_scale_bits(&group, &s2, &cb, 2), &cb, 2),
+        );
         let s3 = beam_encode_group_bits(&group, scale0, &cb, 128, 3);
-        let mse3 = mse(&group, &decode_group_bits(&s3, optimal_scale_bits(&group, &s3, &cb, 3), &cb, 3));
+        let mse3 = mse(
+            &group,
+            &decode_group_bits(&s3, optimal_scale_bits(&group, &s3, &cb, 3), &cb, 3),
+        );
 
-        eprintln!("QTIP-2 MSE={mse2:.6}  QTIP-3 MSE={mse3:.6}  (3/2={:.3})", mse3 / mse2);
+        eprintln!(
+            "QTIP-2 MSE={mse2:.6}  QTIP-3 MSE={mse3:.6}  (3/2={:.3})",
+            mse3 / mse2
+        );
         assert_eq!(s3.len(), 256, "3-bit emits one symbol per weight (V=1)");
-        assert!(mse3 < mse2, "3-bit must reconstruct better than 2-bit: {mse3} vs {mse2}");
+        assert!(
+            mse3 < mse2,
+            "3-bit must reconstruct better than 2-bit: {mse3} vs {mse2}"
+        );
     }
 
     /// C2 prerequisite: the real packed QTIP-3 record round-trips bit-exactly,
@@ -899,7 +916,10 @@ mod tests {
         // Decode from the unpacked record == direct decode (kernel faithfulness).
         let direct = decode_group_bits(&sym, scale, &cb, 3);
         let from_pack = decode_group_bits(&sym2, scale2, &cb, 3);
-        assert_eq!(direct, from_pack, "decode from packed record must match direct");
+        assert_eq!(
+            direct, from_pack,
+            "decode from packed record must match direct"
+        );
 
         // Format is 0.39 B/weight: 100 B / 256 weights.
         let bpw = QTIP3_BLOCK_BYTES as f64 / QTIP3_GROUP as f64;
@@ -941,7 +961,10 @@ mod tests {
             let state = ((s(i - 3) << 9) | (s(i - 2) << 6) | (s(i - 1) << 3) | s(i)) & 0xFFF;
             par[i as usize] = scale * cb[state as usize];
         }
-        assert_eq!(seq, par, "kernel window decode must match sequential trellis");
+        assert_eq!(
+            seq, par,
+            "kernel window decode must match sequential trellis"
+        );
     }
 
     #[test]

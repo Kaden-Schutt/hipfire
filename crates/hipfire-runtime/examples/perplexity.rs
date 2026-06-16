@@ -59,8 +59,7 @@ fn degrade_k_group_kvarn(
                 }
             }
         }
-        let bytes =
-            unsafe { std::slice::from_raw_parts(k.as_ptr() as *const u8, k.len() * 4) };
+        let bytes = unsafe { std::slice::from_raw_parts(k.as_ptr() as *const u8, k.len() * 4) };
         gpu.memcpy_htod_auto(&kv.k_gpu[layer].buf, bytes).unwrap();
     }
 }
@@ -123,7 +122,10 @@ fn kvarn_degrade_tile(tile: &[f32], r_dim: usize, c_dim: usize) -> Vec<f32> {
                 sq += v * v;
             }
             let n = r_dim as f64;
-            let std = (sq / n - (s / n) * (s / n)).max(0.0).sqrt().clamp(1e-3, 1e3);
+            let std = (sq / n - (s / n) * (s / n))
+                .max(0.0)
+                .sqrt()
+                .clamp(1e-3, 1e3);
             lc[c] = clamp(lc[c] + std.ln());
         }
         let m = cur(&lc, &lr);
@@ -135,7 +137,10 @@ fn kvarn_degrade_tile(tile: &[f32], r_dim: usize, c_dim: usize) -> Vec<f32> {
                 sq += v * v;
             }
             let n = c_dim as f64;
-            let std = (sq / n - (s / n) * (s / n)).max(0.0).sqrt().clamp(1e-3, 1e3);
+            let std = (sq / n - (s / n) * (s / n))
+                .max(0.0)
+                .sqrt()
+                .clamp(1e-3, 1e3);
             lr[r] = clamp(lr[r] + std.ln());
         }
         let cand = cur(&lc, &lr);
@@ -193,7 +198,9 @@ fn main() {
     }
     let kvarn_sim = std::env::var("HIPFIRE_KVARN_SIM").as_deref() == Ok("1");
     if kvarn_sim {
-        eprintln!("KVarN-K sim ON: degrading K per GROUP={KVARN_GROUP} (Sinkhorn+4bit), V lossless");
+        eprintln!(
+            "KVarN-K sim ON: degrading K per GROUP={KVARN_GROUP} (Sinkhorn+4bit), V lossless"
+        );
     }
     assert!(
         ctx_len > warmup + 4,
