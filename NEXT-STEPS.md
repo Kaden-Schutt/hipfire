@@ -241,14 +241,18 @@ Papers + reference implementations vendored for Phases C/D:
     **0.391 B/weight** (26% < MQ4's 0.53). Round-trips bit-exactly; decode from
     the packed record == direct decode (kernel-faithful). 8×3-bit→3B packing
     matches MQ3's, so the kernel bit-window unpack is shared.
-  - Remaining Phase C work (GPU-kernel, needs design input + GPU iteration):
-    **C2 fused qtip3 decode GEMV** — decode the bitshift trellis on-the-fly
-    (parallel sliding-window 1MAD hash → computed codebook, ~zero LDS) × x,
-    accumulate; OPEN DESIGN: LDS-codebook vs recompute-per-lane, wave32 layout,
-    K2/K4 unroll (cf. the mq3 `_residual` kernels). Then real `--format qtip3`
-    emit (replace the sim post-pass with packed output + QuantType::Qtip3G256 +
-    loader/dispatch + qwen35 call sites), parity vs sim, coherence + fresh-probe
-    perf. C2b prefill GEMM + C3 gfx1103 retune follow.
+  - **C2 kernel ✅ LANDED (2026-06-16):** `kernels/src/gemv_qtip3g256.hip` —
+    fused on-the-fly trellis decode + matvec. Recompute-per-lane computed
+    codebook (1MAD hash + baked renorm affine MEAN/INV_STD → bit-identical to
+    the PPL-validated sim), ZERO LDS. Parallel decode: state_i = last-4-symbol
+    window, each lane reads 3 preceding symbols from the prev chunk. wave32,
+    8 w/thread. Verified: compiles gfx1103+gfx1100, VGPR=39/SGPR=17/LDS=0/
+    spills=0; test proves parallel-window decode == sequential trellis bit-exact.
+  - Remaining C2 wiring (needs GPU runtime iteration): QuantType::Qtip3G256 +
+    real `--format qtip3` emit (packed output, replacing the sim's bf16 post-
+    pass) + loader + dispatch registration of `gemv_qtip3g256` + qwen35 call
+    sites + GPU parity vs sim + coherence + fresh-probe perf. C2b prefill GEMM +
+    C3 gfx1103 retune follow.
 - **Phase C: (superseded) ACTIVE — LDLQ landed; pushing the rest of the QTIP stack.**
   C1e DONE end-to-end: clean-room `ldlq.rs` (inverse-Cholesky 1e-13, per-256
   Hessian FWHT rotation, block-trellis OBS) + `hessian_io` wired +
