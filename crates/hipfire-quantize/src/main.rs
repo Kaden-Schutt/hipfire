@@ -5583,8 +5583,14 @@ fn main() {
     let use_qtip_sim = format == "qtip2-sim";
     let use_bf16 = format == "bf16" || format == "bfloat16" || use_qtip_sim;
     let (qtip_cb, qtip_s1, qtip_s2) = if use_qtip_sim {
-        eprintln!("qtip2-sim: simulated QTIP-2 on 2D weights (FWHT + bitshift trellis beam=128) → bf16");
-        (qtip::build_codebook(), gen_fwht_signs(42, 256), gen_fwht_signs(1042, 256))
+        eprintln!(
+            "qtip2-sim: simulated QTIP-2 on 2D weights (FWHT + bitshift trellis beam=128) → bf16"
+        );
+        (
+            qtip::build_codebook(),
+            gen_fwht_signs(42, 256),
+            gen_fwht_signs(1042, 256),
+        )
     } else {
         (Vec::new(), Vec::new(), Vec::new())
     };

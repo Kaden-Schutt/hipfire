@@ -5,9 +5,10 @@
 //! Shared framework for the `hipfire-eval` runner.
 //!
 //! This module establishes the stable CLI, manifest, JSONL, dataset provenance,
-//! comparison, and evidence-artifact contract. Model-backed scoring currently
-//! runs through Hipfire example binaries when available and otherwise emits
-//! explicit skip rows rather than silently dropping batteries.
+//! comparison, and evidence-artifact contract. Model-backed scoring uses
+//! daemon-backed rows where that path is implemented, falls back to Hipfire
+//! example binaries for specialized gates, and otherwise emits explicit skip
+//! rows rather than silently dropping batteries.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -6341,6 +6342,15 @@ fn run_examples_profile_anchor(
             (
                 "moe_router_histogram_expected_when_moe".to_string(),
                 json!(true),
+            ),
+            (
+                "expected_runtime_evidence_kinds".to_string(),
+                json!([
+                    "performance",
+                    "memory",
+                    "launch_counts",
+                    "moe_router_histogram"
+                ]),
             ),
         ]),
     )
@@ -13141,6 +13151,19 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
                 .get("moe_router_histogram_expected_when_moe")
                 .and_then(Value::as_bool),
             Some(true)
+        );
+        assert_eq!(
+            profile[0]
+                .metrics
+                .get("expected_runtime_evidence_kinds")
+                .and_then(Value::as_array)
+                .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
+            Some(vec![
+                "performance",
+                "memory",
+                "launch_counts",
+                "moe_router_histogram"
+            ])
         );
     }
 

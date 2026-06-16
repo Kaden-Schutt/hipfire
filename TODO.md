@@ -35,6 +35,9 @@
   battery should run a real Hipfire model-backed anchor and ingest runtime
   evidence artifacts, especially `moe_router_histogram.json` for MoE/A3B
   models.
+  - The profile row now declares the expected runtime evidence kinds
+    (`performance`, `memory`, `launch_counts`, `moe_router_histogram`) so
+    artifact collection regressions stay visible in row metadata.
 - Run the full no-GPU handoff gate before committing the branch.
 - Extend Qwen35 paged expert execution coverage beyond the current indexed MQ
   routed path: grouped Path 2, Paro, full-precision, and CPU-fallback paged
