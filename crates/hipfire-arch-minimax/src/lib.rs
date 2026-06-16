@@ -26,5 +26,6 @@ pub mod minimax;
 
 pub use arch::MiniMaxM2;
 pub use minimax::{
-    MiniMaxConfig, MiniMaxExpertWeights, MiniMaxLayerWeights, MiniMaxState, MiniMaxWeights,
+    config_from_safetensors, load_weights_from_safetensors, MiniMaxConfig, MiniMaxExpertWeights,
+    MiniMaxLayerWeights, MiniMaxState, MiniMaxWeights,
 };
