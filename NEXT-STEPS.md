@@ -182,8 +182,20 @@ row scale, GROUP=128 tile records, dequant-to-fp16-scratch then stock decode.
       (+0.80%)**. KVarN-K BEATS asym4 — Sinkhorn recovers ~40% of plain-4-bit's
       loss on REAL K (mechanism confirmed, not just synthetic). But the margin
       is modest at short ctx (asym4's per-channel scales already capture most
-      skew). DECISION pends the long-ctx compounding test (KVarN paper's thesis:
-      benefit grows with reasoning-sequence length / error accumulation).
+      skew).
+    - ✅ **VERDICT — SKIP the GPU Sinkhorn subsystem (2026-06-16).** Long-ctx
+      test (calib-5m, fair within-run): f32 ctx1024=11.51 ctx4096=24.27; asym4
+      11.60 / 24.80; KVarN-K 11.56 / **28.66**. KVarN-K helps +0.5% at ctx1024
+      but DEGRADES to +18% at ctx4096 — the OPPOSITE of the paper's compounding
+      claim, and worse than the asym4 already shipped. The per-token Sinkhorn
+      s_col scaling (designed for DeepSeek MLA latent KV) misfits Qwen3.5 GQA
+      long-context attention. Per the build/skip gate (the whole point of the
+      cheap sim, cf. qtip2 PPL killing 2-bit): **do not build the GPU KVarN
+      subsystem.** Phase D KV answer = **ship asym4** (existing per-channel
+      4-bit K, +2.2% @ ctx4096). Retained: `kvarn.rs` core + tile record
+      (tested) + the `f32` kv-mode + `HIPFIRE_KVARN_SIM` harness for future KV
+      eval. D1-MLA (DeepSeek, where the MLA-latent layout fits) remains open but
+      runs on the big boxes, not this 780M.
   - **D1-MLA (DeepSeek V4):** the KVarN-MLA backend applies more directly —
     but DeepSeek runs on the bigger boxes, not this 780M.
 - **Gate:** long-context coherence + τ stability under compressed KV.
