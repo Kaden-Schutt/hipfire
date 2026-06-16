@@ -175,6 +175,15 @@ row scale, GROUP=128 tile records, dequant-to-fp16-scratch then stock decode.
       marginal win = whatever the Sinkhorn adds beyond per-channel scales. The
       CPU-flush PPL (KVarN vs asym4) IS the build/skip gate — if KVarN ≈ asym4
       PPL, ship asym4 and skip the GPU Sinkhorn.
+    - ✅ **CPU-flush sim built + VERDICT (2026-06-16):** `HIPFIRE_KVARN_SIM=1` +
+      `--kv-mode f32` in the perplexity example degrades K per GROUP=128
+      (Sinkhorn+4bit+dequant, K only, V lossless). On real Qwen3.5 K (0.8B mq4,
+      ctx 1024): **f32 lossless 11.51, KVarN-K 11.56 (+0.48%), asym4 11.60
+      (+0.80%)**. KVarN-K BEATS asym4 — Sinkhorn recovers ~40% of plain-4-bit's
+      loss on REAL K (mechanism confirmed, not just synthetic). But the margin
+      is modest at short ctx (asym4's per-channel scales already capture most
+      skew). DECISION pends the long-ctx compounding test (KVarN paper's thesis:
+      benefit grows with reasoning-sequence length / error accumulation).
   - **D1-MLA (DeepSeek V4):** the KVarN-MLA backend applies more directly —
     but DeepSeek runs on the bigger boxes, not this 780M.
 - **Gate:** long-context coherence + τ stability under compressed KV.
