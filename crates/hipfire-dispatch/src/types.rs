@@ -665,6 +665,9 @@ impl KernelKey {
             | HFP4G32 | MFP4G32 | ParoQ4G128 => ArchPredicate::Always,
             HFQ3G256 | HFQ3G128 => ArchPredicate::HasSdot4,
             MQ3G256 => ArchPredicate::HasWmma,
+            // QTIP-3 decode is pure integer hash + fp mul-add (no WMMA/dot/sdot
+            // intrinsics), so the gemv_qtip3g256 kernel runs on every arch.
+            Qtip3G256 => ArchPredicate::Always,
             MQ6G256 | HFQ6G256 => ArchPredicate::HasMmq,
             MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWmma,
             Q8HFQ | Raw => ArchPredicate::Always,
@@ -719,6 +722,7 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
         MQ4G256
             | MQ4G128
             | MQ3G256
+            | Qtip3G256
             | MQ2G256
             | MQ6G256
             | MQ8G256

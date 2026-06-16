@@ -531,6 +531,8 @@ fn dispatch_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchE
         MQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x, y, m, k)),
         MQ3G256Lloyd => hip!(gpu.gemv_mq3g256_lloyd_residual(w.buf, x, y, m, k)),
         MQ4G256Lloyd => hip!(gpu.gemv_mq4g256_lloyd_residual(w.buf, x, y, m, k)),
+        // QTIP-3: own trellis-decode kernel (not the HFQ3 path). x pre-rotated.
+        Qtip3G256 => hip!(gpu.gemv_qtip3g256_residual(w.buf, x, y, m, k)),
         _ => Err(DispatchError::UnsupportedVariant {
             family: "gemv",
             variant: "residual",
@@ -573,6 +575,7 @@ fn dispatch_swiglu_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), Di
         MQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x_in, residual, m, k)),
         MQ3G256Lloyd => hip!(gpu.gemv_mq3g256_lloyd_residual(w.buf, x_in, residual, m, k)),
         MQ4G256Lloyd => hip!(gpu.gemv_mq4g256_lloyd_residual(w.buf, x_in, residual, m, k)),
+        Qtip3G256 => hip!(gpu.gemv_qtip3g256_residual(w.buf, x_in, residual, m, k)),
         _ => Err(DispatchError::UnsupportedVariant {
             family: "gemv",
             variant: "swiglu_residual",

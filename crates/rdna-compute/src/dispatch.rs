@@ -226,6 +226,9 @@ pub enum DType {
     MQ8G256,      // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target (258 bytes/group)
     MQ6G256,      // MagnumQuant: FWHT-rotated HFQ6-G256 (200 bytes/group, same as HFQ6G256)
     MQ3G256,      // MagnumQuant: FWHT-rotated HFQ3-G256 (104 bytes/group, same as HFQ3G256)
+    Qtip3G256,    // QTIP-3: FWHT-rotated trellis-coded 3-bit (100 bytes/group: f32 scale + 96 B
+    // packed symbols). Decoded by gemv_qtip3g256 (computed 1MAD codebook, zero LDS); runtime
+    // FWHT-rotates x like MQ3/MQ4. See kernels/src/gemv_qtip3g256.hip / qtip.rs.
     MQ2G256,      // MagnumQuant: FWHT-rotated HFQ2-G256 (72 bytes/group, same as HFQ2G256)
     MQ2G256Lloyd, // MagnumQuant 2-bit + Lloyd-Max 4-entry fp16 codebook (72 bytes/group)
     MQ3G256Lloyd, // MagnumQuant 3-bit + Lloyd-Max 8-entry fp16 codebook (112 bytes/group)
@@ -270,6 +273,7 @@ impl DType {
             | DType::MQ6G256
             | DType::MQ8G256
             | DType::MQ3G256
+            | DType::Qtip3G256
             | DType::MQ2G256
             | DType::MQ2G256Lloyd
             | DType::MQ3G256Lloyd
@@ -9435,6 +9439,95 @@ impl Gpu {
         ];
         self.launch_maybe_blob(
             "gemv_hfq3g256_residual",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
+    }
+
+    /// QTIP-3 GEMV (plain, y = W·x). Fused on-the-fly trellis decode via
+    /// gemv_qtip3g256 (computed 1MAD codebook, zero LDS). x must be pre-FWHT-
+    /// rotated by the caller (rotate_x_mq_for), same contract as MQ3/MQ4.
+    pub fn gemv_qtip3g256(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gemv_qtip3g256", kernels::GEMV_QTIP3G256_SRC, "gemv_qtip3g256")?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemv_qtip3g256",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
+    }
+
+    /// QTIP-3 GEMV with fused residual add (y += W·x). Same decode as
+    /// `gemv_qtip3g256`; the kernel's final store accumulates.
+    pub fn gemv_qtip3g256_residual(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_qtip3g256",
+            kernels::GEMV_QTIP3G256_SRC,
+            "gemv_qtip3g256_residual",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemv_qtip3g256_residual",
             [m as u32, 1, 1],
             [32, 1, 1],
             0,

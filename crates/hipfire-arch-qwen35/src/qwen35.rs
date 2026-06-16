@@ -2483,6 +2483,19 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
             })
         }
+        31 => {
+            // QTIP-3 G256 (trellis-coded 3-bit, 100 B/group)
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::Qtip3G256,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         18 => {
             // MQ2-G256
             let buf = gpu.upload_raw(data, &[data.len()])?;
@@ -3913,6 +3926,7 @@ fn slab_dtype_for_quant(qt: u8, k: usize) -> Option<DType> {
         14 => Some(DType::MQ8G256),
         15 => Some(DType::MQ6G256),
         17 => Some(DType::MQ3G256),
+        31 => Some(DType::Qtip3G256),
         18 => Some(DType::MQ2G256),
         19 => Some(DType::MQ2G256Lloyd),
         20 => Some(DType::MQ3G256Lloyd),

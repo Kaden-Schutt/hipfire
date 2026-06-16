@@ -130,3 +130,80 @@ extern "C" __global__ void gemv_qtip3g256(
 
     if (tid == 0) y[row] = acc;
 }
+
+// Residual variant: y[row] += W·x (used by o_proj/down_proj into the residual
+// stream). Identical decode; only the final store accumulates. Shared body via
+// a macro would obscure the simple structure, so it is duplicated verbatim.
+__launch_bounds__(32, 16)
+extern "C" __global__ void gemv_qtip3g256_residual(
+    const char* __restrict__ A,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int tid = threadIdx.x;
+
+    const int groups_per_row = K / 256;
+    const char* row_ptr = A + (long long)row * groups_per_row * 100;
+
+    float acc = 0.0f;
+
+    for (int g = 0; g < groups_per_row; g++) {
+        const char* gptr = row_ptr + g * 100;
+        const float scale = *reinterpret_cast<const float*>(gptr);
+        const unsigned char* data = (const unsigned char*)(gptr + 4);
+
+        const int boff = tid * 3;
+        unsigned int pk = (unsigned int)data[boff]
+                        | ((unsigned int)data[boff + 1] << 8)
+                        | ((unsigned int)data[boff + 2] << 16);
+
+        unsigned int s_m3 = 0u, s_m2 = 0u, s_m1 = 0u;
+        if (tid > 0) {
+            const int pboff = (tid - 1) * 3;
+            unsigned int ppk = (unsigned int)data[pboff]
+                             | ((unsigned int)data[pboff + 1] << 8)
+                             | ((unsigned int)data[pboff + 2] << 16);
+            s_m3 = (ppk >> 15) & 7u;
+            s_m2 = (ppk >> 18) & 7u;
+            s_m1 = (ppk >> 21) & 7u;
+        }
+
+        unsigned int q0 = pk & 7u;
+        unsigned int q1 = (pk >> 3) & 7u;
+        unsigned int q2 = (pk >> 6) & 7u;
+        unsigned int q3 = (pk >> 9) & 7u;
+        unsigned int q4 = (pk >> 12) & 7u;
+        unsigned int q5 = (pk >> 15) & 7u;
+        unsigned int q6 = (pk >> 18) & 7u;
+        unsigned int q7 = (pk >> 21) & 7u;
+
+        #define ST(a,b,c,d) ((((a)<<9)|((b)<<6)|((c)<<3)|(d)) & QTIP_STATE_MASK)
+        unsigned int st0 = ST(s_m3, s_m2, s_m1, q0);
+        unsigned int st1 = ST(s_m2, s_m1, q0,  q1);
+        unsigned int st2 = ST(s_m1, q0,  q1,  q2);
+        unsigned int st3 = ST(q0,   q1,  q2,  q3);
+        unsigned int st4 = ST(q1,   q2,  q3,  q4);
+        unsigned int st5 = ST(q2,   q3,  q4,  q5);
+        unsigned int st6 = ST(q3,   q4,  q5,  q6);
+        unsigned int st7 = ST(q4,   q5,  q6,  q7);
+        #undef ST
+
+        const int base_idx = g * 256 + tid * 8;
+        acc += scale * qtip_decode(st0) * x[base_idx]
+             + scale * qtip_decode(st1) * x[base_idx + 1]
+             + scale * qtip_decode(st2) * x[base_idx + 2]
+             + scale * qtip_decode(st3) * x[base_idx + 3]
+             + scale * qtip_decode(st4) * x[base_idx + 4]
+             + scale * qtip_decode(st5) * x[base_idx + 5]
+             + scale * qtip_decode(st6) * x[base_idx + 6]
+             + scale * qtip_decode(st7) * x[base_idx + 7];
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset);
+
+    if (tid == 0) y[row] += acc;
+}
