@@ -223,7 +223,21 @@ Papers + reference implementations vendored for Phases C/D:
 - **Phase B: ✅ DONE** — MTP daemon wiring, τ=1.66 @ K=2, DFlash τ<1 fixed
   (committed). NOTE: warmed A/B shows MTP **net-negative on 0.8B** (13.1 vs
   AR 57.7 tok/s); optimization moved to **Phase E**.
-- **Phase C: ACTIVE — LDLQ landed; pushing the rest of the QTIP stack.**
+- **Phase C: 3-BIT QTIP IS THE VERDICT (2026-06-16).** PPL on 0.8B, byte-identical
+  calib-1m (ctx 2048, warmup 8, fresh process, LD_LIBRARY_PATH=/opt/rocm/lib):
+  | format | PPL | vs MQ4 |
+  |---|---|---|
+  | MQ4 (4-bit baseline) | 14.03 | — |
+  | **qtip3-sim (3-bit)** | **15.20** | **+8.3%** |
+  | qtip2-sim (2-bit MSE) | 120.60 | unusable |
+  | qtip2-ldlq (2-bit) | 53.6 | unusable |
+  **3-bit QTIP = usable** (+8.3% PPL for 25% less weight bandwidth than MQ4).
+  2-bit stays unusable on the 0.8B even with LDLQ. DECISION: ship 3-bit; the
+  halo 2-bit finetune (C1h) is NOT worth multi-hours given 3-bit already lands
+  at MQ4-class quality. Remaining Phase C work: **C2 fused qtip3 decode GEMV**
+  (the actual bandwidth win — the sim proves quality, not speed; sim runs at
+  bf16 speed 14.9 tok/s) + C2b prefill GEMM + C3 gfx1103 retune.
+- **Phase C: (superseded) ACTIVE — LDLQ landed; pushing the rest of the QTIP stack.**
   C1e DONE end-to-end: clean-room `ldlq.rs` (inverse-Cholesky 1e-13, per-256
   Hessian FWHT rotation, block-trellis OBS) + `hessian_io` wired +
   `HIPFIRE_QTIP_HESSIAN` in qtip2-sim. **PPL: MSE-only 125.6 → LDLQ 53.6
