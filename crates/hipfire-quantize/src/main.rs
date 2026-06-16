@@ -3248,6 +3248,11 @@ enum QuantType {
     MQ4G256Lloyd = 30, // MagnumQuant 4-bit + per-block Lloyd-Max 16-entry fp16 codebook (160 B/group)
                        // Renumbered from 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.
                        // Models quantized pre-renumber MUST be re-quantized.
+    /// QTIP-3: trellis-coded 3-bit, FWHT-rotated. Block = [f32 scale][96 B
+    /// packed 3-bit trellis symbols] = 100 B/group (0.391 B/weight). Decoded by
+    /// the fused `gemv_qtip3g256` kernel (computed 1MAD codebook, zero LDS); the
+    /// runtime FWHT-rotates x (shared mq_rotate_x path). See qtip.rs / Phase C2.
+    Qtip3G256 = 31,
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -5605,13 +5610,26 @@ fn main() {
     let use_qtip2_sim = format == "qtip2-sim";
     let use_qtip3_sim = format == "qtip3-sim";
     let use_qtip_sim = use_qtip2_sim || use_qtip3_sim;
-    let qtip_bits: u32 = if use_qtip3_sim { 3 } else { 2 };
-    let use_bf16 = format == "bf16" || format == "bfloat16" || use_qtip_sim;
-    let (qtip_cb, qtip_s1, qtip_s2) = if use_qtip_sim {
-        eprintln!(
-            "qtip{qtip_bits}-sim: simulated QTIP-{qtip_bits} on 2D weights \
-             (FWHT + bitshift trellis beam=128) → bf16"
-        );
+    // Real packed QTIP-3 (vs the bf16 sim): emit QuantType::Qtip3G256 records
+    // (rotated-frame symbols), decoded by the gemv_qtip3g256 kernel. The sim
+    // path is for kernel-free PPL; this is the shippable bandwidth format.
+    let use_qtip3_real = format == "qtip3";
+    let qtip_bits: u32 = if use_qtip3_sim || use_qtip3_real { 3 } else { 2 };
+    // Both sim and real QTIP first stage every 2D weight as BF16, then the
+    // post-pass either bakes sim error into bf16 (sim) or packs Qtip3G256 (real).
+    let use_bf16 = format == "bf16" || format == "bfloat16" || use_qtip_sim || use_qtip3_real;
+    let (qtip_cb, qtip_s1, qtip_s2) = if use_qtip_sim || use_qtip3_real {
+        if use_qtip3_real {
+            eprintln!(
+                "qtip3 (real): packing 2D weights as Qtip3G256 \
+                 (FWHT-rotated bitshift trellis beam=128, 100 B/group → gemv_qtip3g256)"
+            );
+        } else {
+            eprintln!(
+                "qtip{qtip_bits}-sim: simulated QTIP-{qtip_bits} on 2D weights \
+                 (FWHT + bitshift trellis beam=128) → bf16"
+            );
+        }
         (
             qtip::build_codebook(),
             gen_fwht_signs(42, 256),
@@ -8917,6 +8935,70 @@ fn main() {
             }
         }
         eprintln!("  qtip{qtip_bits}-sim: LDLQ on {n_ldlq} tensors, plain-QTIP on {n_plain}");
+    }
+
+    // qtip3 (real) post-pass: pack every eligible 2D BF16 weight into
+    // QuantType::Qtip3G256 records (rotated-frame 3-bit trellis symbols + scale,
+    // 100 B/group), decoded at runtime by gemv_qtip3g256. Unlike the sim, the
+    // weights are stored in the FWHT-rotated frame (NO inverse rotation); the
+    // runtime FWHT-rotates x. A self-check re-decodes and reports max abs error
+    // vs the effective sim weight so the producer is verified offline.
+    if use_qtip3_real {
+        use rayon::prelude::*;
+        let (mut n_packed, mut max_err) = (0usize, 0.0f32);
+        for t in hfq_tensors.iter_mut() {
+            if !(matches!(t.quant_type, QuantType::BF16)
+                && t.shape.len() == 2
+                && (t.shape[1] as usize) % 256 == 0
+                && !t.name.contains("embed")
+                && !t.name.contains("lm_head"))
+            {
+                continue;
+            }
+            let k = t.shape[1] as usize;
+            let groups = k / 256;
+            let wf: Vec<f32> = t
+                .data
+                .chunks_exact(2)
+                .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            // Per row → packed records; collect per-row max-error in parallel.
+            let row_out: Vec<(Vec<u8>, f32)> = wf
+                .par_chunks(k)
+                .map(|row| {
+                    let mut packed = Vec::with_capacity(groups * qtip::QTIP3_BLOCK_BYTES);
+                    let mut rerr = 0.0f32;
+                    for g in 0..groups {
+                        let mut grp = [0.0f32; 256];
+                        grp.copy_from_slice(&row[g * 256..g * 256 + 256]);
+                        cpu_fwht_256(&mut grp, &qtip_s1, &qtip_s2); // rotate
+                        let scale0 = qtip::group_scale(&grp);
+                        let sym = qtip::beam_encode_group_bits(&grp, scale0, &qtip_cb, 128, 3);
+                        let scale = qtip::optimal_scale_bits(&grp, &sym, &qtip_cb, 3);
+                        // Self-check: decode in the rotated frame vs the encode target.
+                        let deq = qtip::decode_group_bits(&sym, scale, &qtip_cb, 3);
+                        for (a, b) in grp.iter().zip(&deq) {
+                            rerr = rerr.max((a - b).abs());
+                        }
+                        packed.extend_from_slice(&qtip::pack_qtip3_group(&sym, scale));
+                    }
+                    (packed, rerr)
+                })
+                .collect();
+            let mut data = Vec::with_capacity(row_out.len() * groups * qtip::QTIP3_BLOCK_BYTES);
+            for (packed, rerr) in &row_out {
+                data.extend_from_slice(packed);
+                max_err = max_err.max(*rerr);
+            }
+            t.data = data;
+            t.quant_type = QuantType::Qtip3G256;
+            t.group_size = 256;
+            n_packed += 1;
+        }
+        eprintln!(
+            "  qtip3 (real): packed {n_packed} tensors as Qtip3G256 (100 B/group, 0.391 B/w); \
+             rotated-frame decode max-abs-err {max_err:.5}"
+        );
     }
 
     // Write .hfq file
