@@ -979,6 +979,69 @@ fn qtip_simquant_nbit(
     });
 }
 
+/// RoughQuant Phase-1 sim (no rotation): protect the most-salient input columns
+/// of a 2D weight (row-major `m × k`) at full precision, crush the rest to a
+/// `bulk_bits` symmetric-uniform grid (per row, per `group` columns), in place.
+///
+/// `saliency[c]` ranks input column `c` (higher = protect). With a Hessian it is
+/// `diag(H) = E[x_c²]` (output-aware: quant noise on a high-energy input channel
+/// costs more output error — CMPQ's "quant-error impact"); without one it is the
+/// column L2 norm of W. The top `protect_frac · k` columns are left untouched;
+/// the bulk is absmax-quantized over the non-protected entries of each group so
+/// the protected outliers don't inflate the bulk scale. Running the perturbed
+/// weight through the normal bf16 forward gives a faithful RoughQuant PPL with no
+/// GPU kernel. Parallel over rows.
+fn roughquant_sim_tensor(
+    wf: &mut [f32],
+    m: usize,
+    k: usize,
+    saliency: &[f32],
+    protect_frac: f64,
+    bulk_bits: u32,
+    group: usize,
+) {
+    use rayon::prelude::*;
+    debug_assert_eq!(wf.len(), m * k);
+    debug_assert_eq!(saliency.len(), k);
+    let n_prot = ((protect_frac * k as f64).round() as usize).min(k);
+    // Rank columns by saliency desc; mark the top n_prot as protected.
+    let mut order: Vec<usize> = (0..k).collect();
+    order.sort_unstable_by(|&a, &b| {
+        saliency[b]
+            .partial_cmp(&saliency[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut protected = vec![false; k];
+    for &c in &order[..n_prot] {
+        protected[c] = true;
+    }
+    // Symmetric-uniform levels for `bulk_bits`: q ∈ {-(2^{b-1}-1) .. 2^{b-1}-1}.
+    let qmax = (((1u32 << bulk_bits) >> 1) as f32 - 1.0).max(1.0);
+    wf.par_chunks_mut(k).for_each(|row| {
+        let mut g = 0usize;
+        while g < k {
+            let end = (g + group).min(k);
+            let mut amax = 0.0f32;
+            for c in g..end {
+                if !protected[c] {
+                    amax = amax.max(row[c].abs());
+                }
+            }
+            if amax > 0.0 {
+                let scale = amax / qmax;
+                let inv = 1.0 / scale;
+                for c in g..end {
+                    if !protected[c] {
+                        let qi = (row[c] * inv).round().clamp(-qmax, qmax);
+                        row[c] = qi * scale;
+                    }
+                }
+            }
+            g = end;
+        }
+    });
+}
+
 /// MagnumQuant HFQ4-G256: FWHT-rotated 4-bit quantization.
 /// Same binary format as HFQ4-G256 (136 bytes/group) — the rotation is baked
 /// into the weights. The GEMV kernel rotates x instead of inverse-rotating w.
@@ -5631,6 +5694,16 @@ fn main() {
     let use_qtip2_sim = format == "qtip2-sim";
     let use_qtip3_sim = format == "qtip3-sim";
     let use_qtip_sim = use_qtip2_sim || use_qtip3_sim;
+    // roughquant-sim (Phase 1, no rotation): emit a bf16 .hfq where each 2D
+    // weight's most-salient input columns (ranked by diag(H)) are kept exact
+    // and the rest are crushed to a low-bit uniform grid, baked back into bf16
+    // for a kernel-free PPL verdict. Swept via env:
+    //   HIPFIRE_RQ_PROTECT_FRAC (default 0.015) — fraction of columns protected
+    //   HIPFIRE_RQ_BULK_BITS    (default 2)      — bulk uniform bit-width
+    //   HIPFIRE_RQ_GROUP        (default 256)    — bulk quant group size (cols)
+    // The Hessian sidecar comes from HIPFIRE_QTIP_HESSIAN (shared with qtip-sim);
+    // tensors without one fall back to a column-L2-norm saliency proxy.
+    let use_roughquant_sim = format == "roughquant-sim" || format == "rq-sim";
     // Real packed QTIP-3 (vs the bf16 sim): emit QuantType::Qtip3G256 records
     // (rotated-frame symbols), decoded by the gemv_qtip3g256 kernel. The sim
     // path is for kernel-free PPL; this is the shippable bandwidth format.
@@ -5642,7 +5715,11 @@ fn main() {
     };
     // Both sim and real QTIP first stage every 2D weight as BF16, then the
     // post-pass either bakes sim error into bf16 (sim) or packs Qtip3G256 (real).
-    let use_bf16 = format == "bf16" || format == "bfloat16" || use_qtip_sim || use_qtip3_real;
+    let use_bf16 = format == "bf16"
+        || format == "bfloat16"
+        || use_qtip_sim
+        || use_qtip3_real
+        || use_roughquant_sim;
     let (qtip_cb, qtip_s1, qtip_s2) = if use_qtip_sim || use_qtip3_real {
         if use_qtip3_real {
             eprintln!(
@@ -5666,7 +5743,7 @@ fn main() {
     // Optional Hessian sidecar → QTIP-LDLQ (output-aware). HIPFIRE_QTIP_HESSIAN
     // points at an HFHS file; tensors with a Hessian use LDLQ, the rest fall
     // back to plain (MSE) simulated QTIP.
-    let qtip_hessian: Option<hessian_io::HessianSidecar> = if use_qtip_sim {
+    let qtip_hessian: Option<hessian_io::HessianSidecar> = if use_qtip_sim || use_roughquant_sim {
         std::env::var("HIPFIRE_QTIP_HESSIAN").ok().and_then(|p| {
             match hessian_io::HessianSidecar::open(std::path::Path::new(&p)) {
                 Ok(s) => {
@@ -8964,6 +9041,77 @@ fn main() {
             }
         }
         eprintln!("  qtip{qtip_bits}-sim: LDLQ on {n_ldlq} tensors, plain-QTIP on {n_plain}");
+    }
+
+    // roughquant-sim post-pass (Phase 1, no rotation): for every eligible 2D
+    // BF16 weight, protect the top `protect_frac` highest-diag(H) input columns
+    // at full precision and crush the rest to a `bulk_bits` uniform grid, baked
+    // back into bf16. Saliency = diag(H) when the tensor has a Hessian, else the
+    // column L2 norm of W. Mirrors the qtip-sim post-pass above.
+    if use_roughquant_sim {
+        let protect_frac: f64 = std::env::var("HIPFIRE_RQ_PROTECT_FRAC")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.015);
+        let bulk_bits: u32 = std::env::var("HIPFIRE_RQ_BULK_BITS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+        let group: usize = std::env::var("HIPFIRE_RQ_GROUP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256);
+        eprintln!(
+            "  roughquant-sim: protect_frac={protect_frac} bulk_bits={bulk_bits} group={group}"
+        );
+        let (mut n_hess, mut n_proxy) = (0usize, 0usize);
+        for t in hfq_tensors.iter_mut() {
+            if !(matches!(t.quant_type, QuantType::BF16)
+                && t.shape.len() == 2
+                && (t.shape[1] as usize) % group == 0
+                && !t.name.contains("embed")
+                && !t.name.contains("lm_head"))
+            {
+                continue;
+            }
+            let m = t.shape[0] as usize;
+            let k = t.shape[1] as usize;
+            let mut wf: Vec<f32> = t
+                .data
+                .chunks_exact(2)
+                .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            // Saliency per input column c: diag(H)=E[x_c²] if Hessian present,
+            // else column L2 norm of W.
+            let key = t.name.strip_suffix(".weight").unwrap_or(&t.name);
+            let saliency: Vec<f32> = match qtip_hessian
+                .as_ref()
+                .and_then(|sc| sc.get(key, 0))
+                .filter(|h| h.k == k)
+            {
+                Some(href) => {
+                    n_hess += 1;
+                    (0..k).map(|i| href.at(i, i) as f32).collect()
+                }
+                None => {
+                    n_proxy += 1;
+                    let mut s = vec![0.0f32; k];
+                    for r in 0..m {
+                        let row = &wf[r * k..r * k + k];
+                        for c in 0..k {
+                            s[c] += row[c] * row[c];
+                        }
+                    }
+                    for v in s.iter_mut() {
+                        *v = v.sqrt();
+                    }
+                    s
+                }
+            };
+            roughquant_sim_tensor(&mut wf, m, k, &saliency, protect_frac, bulk_bits, group);
+            t.data = f32_slice_to_bf16_bytes(&wf);
+        }
+        eprintln!("  roughquant-sim: diag(H)-saliency on {n_hess} tensors, L2-proxy on {n_proxy}");
     }
 
     // qtip3 (real) post-pass: pack every eligible 2D BF16 weight into
