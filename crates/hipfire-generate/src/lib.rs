@@ -6,6 +6,7 @@
 
 pub mod eos_filter;
 pub mod loop_guard;
+pub mod sampler;
 
 use hipfire_model::{has_worker_or_model_identity, is_qwen35_dense_arch_id, is_qwen35_moe_arch_id};
 use hipfire_prompt::{

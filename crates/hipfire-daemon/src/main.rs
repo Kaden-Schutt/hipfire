@@ -41,6 +41,7 @@ use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_generate::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_generate::loop_guard::{LoopGuard, StopReason};
+use hipfire_generate::sampler::{collect_unclosed_attractor_blocks, SamplerConfig};
 #[cfg(test)]
 use hipfire_generate::validate_qwen35_fused_dense_prefill_batch_preflight;
 use hipfire_generate::{
@@ -72,7 +73,7 @@ use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::multi_gpu::Gpus;
-use hipfire_runtime::sampler::{self, SamplerConfig};
+use hipfire_runtime::sampler;
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use hipfire_state::{
     describe_sequence_state_descriptors, described_sequence_state_json,
@@ -190,10 +191,10 @@ struct CaskConfig {
 /// repeat-penalty alone doesn't break a strong single-token loop fast
 /// enough at the user-validated `RP=1.05` floor.
 ///
-/// The unclosed-opener depth counter has moved to
-/// `hipfire_runtime::sampler::collect_unclosed_attractor_blocks` (PR 3 of the
-/// engine-modularization plan); the resulting blocked-token list is
-/// applied to the GPU logits buffer by `hipfire_runtime::sampler::sample`
+/// The unclosed-opener depth counter lives in
+/// `hipfire_generate::sampler::collect_unclosed_attractor_blocks`; the resulting
+/// blocked-token list is applied to the GPU logits buffer by
+/// `hipfire_runtime::sampler::sample`
 /// before the sampling kernel launches. The `gpu_block_attractor_token`
 /// helper below is the simpler fallback for unpaired tokens — trips on
 /// `count >= threshold` regardless of structure — kept here as
@@ -13126,7 +13127,7 @@ fn generate_multi(
     // First sample on the output device.
     let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
     let mut blocked0: Vec<u32> = Vec::new();
-    sampler::collect_unclosed_attractor_blocks(ngram_scope, &attractor_pairs, 20, 2, &mut blocked0);
+    collect_unclosed_attractor_blocks(ngram_scope, &attractor_pairs, 20, 2, &mut blocked0);
     let cfg0 = SamplerConfig {
         temperature: temp,
         top_p,
@@ -13325,7 +13326,7 @@ fn generate_multi(
                 let _ = stdout.flush();
                 let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
                 let mut blocked: Vec<u32> = Vec::new();
-                sampler::collect_unclosed_attractor_blocks(
+                collect_unclosed_attractor_blocks(
                     ngram_scope,
                     &attractor_pairs,
                     20,
@@ -13424,13 +13425,7 @@ fn generate_multi(
         // Steady-state sample.
         let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
         let mut blocked: Vec<u32> = Vec::new();
-        sampler::collect_unclosed_attractor_blocks(
-            ngram_scope,
-            &attractor_pairs,
-            20,
-            2,
-            &mut blocked,
-        );
+        collect_unclosed_attractor_blocks(ngram_scope, &attractor_pairs, 20, 2, &mut blocked);
         let cfg = SamplerConfig {
             temperature: temp,
             top_p,
@@ -14374,7 +14369,7 @@ fn generate(
         let repeat_buf_cap = (scratch.repeat_buf.buf.size() / 4).min(repeat_window);
 
         // Build the list of paired (open, close) attractor pairs once;
-        // sampler::collect_unclosed_attractor_blocks decides per-call
+        // collect_unclosed_attractor_blocks decides per-call
         // which openers (if any) trip the depth threshold.
         let attractor_pairs: Vec<(u32, u32)> = tool_call_pair
             .into_iter()
@@ -14389,13 +14384,7 @@ fn generate(
         // the loop body, in case a future change moves this block into
         // a multi-step warmup.
         let mut blocked0: Vec<u32> = Vec::new();
-        sampler::collect_unclosed_attractor_blocks(
-            ngram_scope,
-            &attractor_pairs,
-            20,
-            2,
-            &mut blocked0,
-        );
+        collect_unclosed_attractor_blocks(ngram_scope, &attractor_pairs, 20, 2, &mut blocked0);
         let cfg0 = SamplerConfig {
             temperature: temp,
             top_p,
@@ -14685,7 +14674,7 @@ fn generate(
                     // Fall through — resample next token as normal
                     let ngram_scope = &session.conversation_tokens[ngram_scope_start..];
                     let mut blocked: Vec<u32> = Vec::new();
-                    sampler::collect_unclosed_attractor_blocks(
+                    collect_unclosed_attractor_blocks(
                         ngram_scope,
                         &attractor_pairs,
                         20,
@@ -14811,13 +14800,7 @@ fn generate(
             // performed inside sampler::sample).
             let ngram_scope = &session.conversation_tokens[ngram_scope_start..];
             let mut blocked: Vec<u32> = Vec::new();
-            sampler::collect_unclosed_attractor_blocks(
-                ngram_scope,
-                &attractor_pairs,
-                20,
-                2,
-                &mut blocked,
-            );
+            collect_unclosed_attractor_blocks(ngram_scope, &attractor_pairs, 20, 2, &mut blocked);
             let cfg = SamplerConfig {
                 temperature: temp,
                 top_p,

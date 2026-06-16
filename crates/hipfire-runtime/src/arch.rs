@@ -223,9 +223,9 @@ pub struct LoopGuardOverrides {
 
 /// Per-arch overrides for the sampler.
 ///
-/// `hipfire_runtime::sampler` owns top-p / top-k / temperature / repeat-
-/// penalty / blocked-token mechanics. Per-arch overrides add to (don't
-/// replace) the runtime config.
+/// `hipfire-generate` owns sampler policy. `hipfire_runtime::sampler` owns
+/// top-p / top-k / repeat-penalty execution mechanics. Per-arch overrides add
+/// to (don't replace) the runtime config.
 #[derive(Debug, Clone, Default)]
 pub struct SamplerOverrides {
     /// Tokens to add to `SamplerConfig::blocked_tokens` for this arch

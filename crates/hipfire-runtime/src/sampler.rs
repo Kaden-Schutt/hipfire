@@ -48,73 +48,7 @@ pub use crate::llama::{
     sample_top_p as sample_top_p_cpu, sample_top_p_from_candidates, sampler_rng_restore,
     sampler_rng_snapshot, SamplingConfig,
 };
-
-/// Sampler policy knobs for a single token sample.
-///
-/// `temperature == 0.0` is the greedy path (the kernel falls back to
-/// argmax internally). `top_p == 1.0` disables nucleus truncation.
-/// `repeat_penalty == 1.0` (with any `repeat_window`) is a no-op.
-///
-/// `blocked_tokens` are unconditional `-INF` writes applied directly to
-/// the on-GPU logits buffer before the sampling kernel launches. The
-/// daemon populates this list per-token from its unclosed-opener depth
-/// counter (#111); a future caller could populate it from anywhere.
-#[derive(Debug, Clone)]
-pub struct SamplerConfig {
-    /// 0.0 = greedy (kernel argmax fast path).
-    pub temperature: f32,
-    /// 1.0 = no nucleus truncation.
-    pub top_p: f32,
-    /// 1.0 = repeat-penalty disabled.
-    pub repeat_penalty: f32,
-    /// Tokens of recent history visible to the repeat-penalty kernel.
-    /// Effective window is `min(history.len(), repeat_window)` and is
-    /// also clipped to the GPU `repeat_buf` capacity by the caller.
-    pub repeat_window: usize,
-    /// OpenAI `presence_penalty`: flat logit subtraction applied once to any
-    /// token that occurred within `repeat_window`. 0.0 = disabled.
-    pub presence_penalty: f32,
-    /// OpenAI `frequency_penalty`: logit subtraction scaled by the token's
-    /// occurrence count within `repeat_window`. 0.0 = disabled.
-    pub frequency_penalty: f32,
-    /// Token IDs whose logit is unconditionally set to `-INF` before
-    /// sampling. Used for the unclosed-opener attractor block (#111).
-    pub blocked_tokens: Vec<u32>,
-}
-
-impl SamplerConfig {
-    /// Greedy: temperature=0, top_p=1, repeat_penalty=1, no blocks.
-    /// The kernel takes the argmax fast path; RNG state is unused.
-    pub fn greedy() -> Self {
-        Self {
-            temperature: 0.0,
-            top_p: 1.0,
-            repeat_penalty: 1.0,
-            repeat_window: 0,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            blocked_tokens: Vec::new(),
-        }
-    }
-}
-
-impl Default for SamplerConfig {
-    /// Daemon-default: temperature=0.3, top_p=0.95, repeat_penalty=1.05.
-    /// Mirrors the user-validated `RP=1.05` floor (CLAUDE.md memory:
-    /// `feedback_repeat_penalty_default.md`). `repeat_window=128`
-    /// matches `hipfire_runtime::llama::SamplingConfig::text_thinking()`.
-    fn default() -> Self {
-        Self {
-            temperature: 0.3,
-            top_p: 0.95,
-            repeat_penalty: 1.05,
-            repeat_window: 128,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            blocked_tokens: Vec::new(),
-        }
-    }
-}
+pub use hipfire_generate::sampler::{collect_unclosed_attractor_blocks, SamplerConfig};
 
 /// Sample one token from a GPU-resident `logits` tensor.
 ///
@@ -239,76 +173,9 @@ pub fn sample_cpu(logits: &mut [f32], history: &[u32], cfg: &SamplerConfig) -> u
     llama::sample_top_p(logits, cfg.temperature, cfg.top_p)
 }
 
-/// Compute the unclosed-opener attractor blocked-token list (#111).
-///
-/// Counts unclosed openers in the trailing `window` tokens of `history`
-/// (as `opens - closes`, floored at zero). When the running depth
-/// reaches `threshold`, the opener is appended to `out`. The
-/// downstream sampler will write `-INF` to that token's logit so the
-/// next sample cannot stack another nested opener.
-///
-/// `pairs` is a slice of `(open, close)` pairs (e.g.
-/// `(<tool_call>, </tool_call>)` and `(<think>, </think>)`); only
-/// pairs whose `open` clears the threshold contribute. With
-/// `threshold = 2`, a second consecutive opener without an intervening
-/// closer is the last one the decoder is allowed to emit.
-///
-/// Pure, no GPU work; the caller passes the result into
-/// [`SamplerConfig::blocked_tokens`].
-pub fn collect_unclosed_attractor_blocks(
-    history: &[u32],
-    pairs: &[(u32, u32)],
-    window: usize,
-    threshold: usize,
-    out: &mut Vec<u32>,
-) {
-    if window == 0 || threshold == 0 {
-        return;
-    }
-    let start = history.len().saturating_sub(window);
-    let recent = &history[start..];
-    for &(open_id, close_id) in pairs {
-        let mut depth: i32 = 0;
-        for &t in recent {
-            if t == open_id {
-                depth += 1;
-            } else if t == close_id && depth > 0 {
-                depth -= 1;
-            }
-        }
-        if depth >= threshold as i32 {
-            out.push(open_id);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn greedy_config_fields() {
-        let g = SamplerConfig::greedy();
-        assert_eq!(g.temperature, 0.0);
-        assert_eq!(g.top_p, 1.0);
-        assert_eq!(g.repeat_penalty, 1.0);
-        assert_eq!(g.repeat_window, 0);
-        assert_eq!(g.presence_penalty, 0.0);
-        assert_eq!(g.frequency_penalty, 0.0);
-        assert!(g.blocked_tokens.is_empty());
-    }
-
-    #[test]
-    fn default_config_fields() {
-        let d = SamplerConfig::default();
-        assert!((d.temperature - 0.3).abs() < 1e-6);
-        assert!((d.top_p - 0.95).abs() < 1e-6);
-        assert!((d.repeat_penalty - 1.05).abs() < 1e-6);
-        assert_eq!(d.repeat_window, 128);
-        assert_eq!(d.presence_penalty, 0.0);
-        assert_eq!(d.frequency_penalty, 0.0);
-        assert!(d.blocked_tokens.is_empty());
-    }
 
     #[test]
     fn sample_cpu_applies_presence_and_frequency_penalties() {
@@ -350,38 +217,6 @@ mod tests {
         cfg.blocked_tokens = vec![3];
         let tok = sample_cpu(&mut logits, &[], &cfg);
         assert_eq!(tok, 1);
-    }
-
-    #[test]
-    fn collect_unclosed_blocks_appends_when_depth_reached() {
-        // history has 2 unclosed `<tool_call>` (id=10) — depth=2
-        // hits threshold=2, so 10 should be in `out`. `<think>`
-        // (id=20, close=21) has 1 unclosed → below threshold, not
-        // appended.
-        let history = [10u32, 99, 10, 5, 20, 7];
-        let pairs = [(10u32, 11u32), (20u32, 21u32)];
-        let mut out = Vec::new();
-        collect_unclosed_attractor_blocks(&history, &pairs, 20, 2, &mut out);
-        assert_eq!(out, vec![10]);
-    }
-
-    #[test]
-    fn collect_unclosed_blocks_zero_threshold_is_noop() {
-        let history = [10u32, 10, 10];
-        let pairs = [(10u32, 11u32)];
-        let mut out = Vec::new();
-        collect_unclosed_attractor_blocks(&history, &pairs, 20, 0, &mut out);
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn collect_unclosed_blocks_balanced_open_close_does_not_block() {
-        // 2 opens, 2 closes → depth=0, never trips.
-        let history = [10u32, 5, 11, 10, 7, 11];
-        let pairs = [(10u32, 11u32)];
-        let mut out = Vec::new();
-        collect_unclosed_attractor_blocks(&history, &pairs, 20, 2, &mut out);
-        assert!(out.is_empty());
     }
 
     #[test]

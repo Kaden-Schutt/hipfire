@@ -55,6 +55,7 @@ Current model boundary status:
 - `hipfire-model` owns common model-load parameter construction from config values, including `auto` mode elision, explicit `dflash_mode=off`, and empty sidecar filtering, now consumed by both Rust server and CLI run load paths.
 - `hipfire-generate` owns pure n-gram loop-guard policy used by daemon text/VL generation; `hipfire-runtime::loop_guard` remains a compatibility wrapper that constructs the generate-owned guard from runtime config values.
 - `hipfire-generate` owns pure EOS/holdback/strip-think output filtering used by daemon text generation; `hipfire-runtime::eos_filter` remains a compatibility re-export.
+- `hipfire-generate` owns sampler configuration policy and unclosed-attractor block collection used by daemon generation; `hipfire-runtime::sampler` remains the CPU/GPU sampling execution wrapper and source-compatible re-export.
 - `hipfire-model` owns eval model-manifest row construction for local-file/tag identity, file/tag hashes, HFQ metadata hashes, architecture IDs, embedded quantization hashes, and model-specific hash/HFQ metadata compatibility helpers consumed by evidence/runtime paths. It consumes `hipfire-hash` directly instead of re-exporting generic hash helpers.
 - `hipfire-model` owns OpenAI-compatible `/v1/models` list response rendering consumed by the Rust server.
 - Runtime and arch callers now consume `hipfire-model` model-source contracts directly; `hipfire-runtime::gguf` remains a compatibility re-export and `hipfire-runtime::model_source` remains only the concrete HFQ/safetensors opener adapter until those loaders move.
@@ -74,6 +75,7 @@ Current generate boundary status:
 - `hipfire-generate` owns OpenAI chat-message to structured text-generate request construction, including the last-user `prompt` compatibility fallback and full `messages` forwarding.
 - `hipfire-generate` owns OpenAI chat completion and streaming chunk JSON response rendering consumed by the Rust server.
 - `hipfire-generate` owns prompt-only structured text-generate request construction, generation sampling default/override merging, and worker/tools/system request decoration consumed by Rust server and CLI daemon adapters.
+- `hipfire-daemon` consumes generate-owned sampler configuration and unclosed-attractor block collection directly while runtime sampler execution remains unchanged.
 - `hipfire-cli run` consumes `hipfire-generate` structured text-generate request construction directly instead of pre-rendering ChatML locally.
 - `hipfire-generate` consumes model-owned architecture classification for Qwen3.5 dense/MoE batch backend decisions and decode scheduler fallback metadata instead of owning local arch-id checks.
 - `hipfire-daemon-protocol` uses generate-owned text request and token/done/error event structs for daemon JSONL generate traffic without re-exporting them as compatibility aliases.
