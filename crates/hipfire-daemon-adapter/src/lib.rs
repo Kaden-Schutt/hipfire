@@ -822,6 +822,7 @@ mod tests {
             thinking: None,
             max_think_tokens: None,
             request_id: None,
+            evidence_dir: None,
         };
         let (text, done) = engine.generate(req).await.unwrap();
         assert_eq!(text, "hello world");

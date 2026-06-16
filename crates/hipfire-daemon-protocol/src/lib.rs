@@ -73,6 +73,7 @@ mod tests {
             thinking: None,
             max_think_tokens: None,
             request_id: None,
+            evidence_dir: None,
         });
 
         let value = serde_json::to_value(req).unwrap();

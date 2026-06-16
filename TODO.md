@@ -44,6 +44,9 @@
   - Generic runtime oneshot evidence writers and sparse router-histogram
     artifact rendering now live in `hipfire-evidence`; model-specific gatherers
     adapt their native counters into the shared histogram contract.
+  - `GenerateTextRequest.evidence_dir` lets daemon-backed AR text generation
+    write standard runtime oneshot artifacts directly via `hipfire-evidence`;
+    DFlash/MTP/VL evidence emission remains a path-specific follow-up.
 - Run the full no-GPU handoff gate before committing the branch.
 - Extend Qwen35 paged expert execution coverage beyond the current indexed MQ
   routed path: grouped Path 2, Paro, full-precision, and CPU-fallback paged

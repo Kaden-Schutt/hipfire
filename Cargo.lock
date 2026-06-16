@@ -843,6 +843,7 @@ dependencies = [
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
  "hipfire-daemon-adapter",
+ "hipfire-evidence",
  "hipfire-generate",
  "hipfire-model",
  "hipfire-npu",

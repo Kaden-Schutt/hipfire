@@ -77,6 +77,8 @@ pub struct GenerateTextRequest {
     pub max_think_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_dir: Option<String>,
 }
 
 impl GenerateTextRequest {
@@ -116,6 +118,7 @@ impl GenerateTextRequest {
             thinking: None,
             max_think_tokens: None,
             request_id: None,
+            evidence_dir: None,
         }
     }
 
@@ -1696,6 +1699,7 @@ mod tests {
             thinking: Some("auto".to_string()),
             max_think_tokens: Some(64),
             request_id: Some("req-1".to_string()),
+            evidence_dir: Some("/tmp/hipfire-evidence".to_string()),
         };
         assert_eq!(
             serde_json::to_value(req).unwrap(),
@@ -1709,7 +1713,8 @@ mod tests {
                 "worker_key_id": "worker-a",
                 "thinking": "auto",
                 "max_think_tokens": 64,
-                "request_id": "req-1"
+                "request_id": "req-1",
+                "evidence_dir": "/tmp/hipfire-evidence"
             })
         );
     }

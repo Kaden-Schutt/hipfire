@@ -39,6 +39,7 @@ use hipfire_arch_qwen35::speculative::{
 };
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
+use hipfire_evidence::RuntimeOneshotEvidence;
 use hipfire_generate::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_generate::loop_guard::{LoopGuard, StopReason};
 use hipfire_generate::sampler::{collect_unclosed_attractor_blocks, SamplerConfig};
@@ -271,6 +272,56 @@ fn emit_error_with_id(stdout: &mut std::io::Stdout, id: &str, message: impl std:
     });
     let _ = writeln!(stdout, "{}", envelope);
     let _ = stdout.flush();
+}
+
+fn daemon_runtime_context(model: &LoadedModel) -> serde_json::Value {
+    serde_json::json!({
+        "schema": 1,
+        "runner": "hipfire-daemon",
+        "hipfire_version": env!("CARGO_PKG_VERSION"),
+        "model_path": &model.model_path,
+        "arch_id": model.arch_id,
+        "pipeline_parallel_degree": model.pp,
+        "max_seq": model.max_seq,
+        "physical_cap": model.physical_cap,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_daemon_runtime_oneshot_evidence(
+    dir: &str,
+    model: &LoadedModel,
+    gpu: &rdna_compute::Gpu,
+    id: &str,
+    prompt_tokens: usize,
+    emitted_tokens: usize,
+    prefill_secs: f64,
+    decode_secs: f64,
+    ttft_ms: f64,
+) {
+    let (vram_free_bytes, vram_total_bytes) = gpu.hip.get_vram_info().unwrap_or((0, 0));
+    let vram_used_mb =
+        ((vram_total_bytes.saturating_sub(vram_free_bytes)) as f64 / (1024.0 * 1024.0)) as u64;
+    let vram_total_mb = (vram_total_bytes as f64 / (1024.0 * 1024.0)) as u64;
+    let runtime_context = daemon_runtime_context(model);
+    let evidence = RuntimeOneshotEvidence {
+        case_id: id,
+        prompt_path: "daemon://generate",
+        prompt_tokens,
+        emitted_tokens,
+        prefill_forward_calls: if prompt_tokens == 0 { 0 } else { 1 },
+        decode_forward_calls: emitted_tokens,
+        prefill_secs,
+        decode_secs,
+        ttft_ms,
+        vram_used_mb,
+        vram_total_mb,
+    };
+    if let Err(err) =
+        hipfire_evidence::write_runtime_oneshot_evidence(Path::new(dir), &runtime_context, evidence)
+    {
+        eprintln!("[daemon/evidence] failed to write runtime oneshot evidence: {err}");
+    }
 }
 
 #[derive(Default)]
@@ -8511,6 +8562,10 @@ fn main() {
                         think_mode,
                         prefill_already_done,
                         prefilled_prompt_tokens,
+                        protocol_generate
+                            .as_ref()
+                            .and_then(|req| req.evidence_dir.as_deref())
+                            .or_else(|| msg.get("evidence_dir").and_then(|v| v.as_str())),
                     );
                 }
             }
@@ -13594,6 +13649,7 @@ fn generate(
     think_mode: ThinkMode,
     prefill_already_done: bool,
     prefilled_prompt_tokens: Option<usize>,
+    evidence_dir: Option<&str>,
 ) {
     // Seed the process-global CPU sampler RNG for this request. CPU fallback and
     // grammar/VL-style sampling should not inherit RNG state from prior requests.
@@ -14945,6 +15001,19 @@ fn generate(
         } else {
             0.0
         };
+        if let Some(dir) = evidence_dir {
+            write_daemon_runtime_oneshot_evidence(
+                dir,
+                m,
+                gpu,
+                id,
+                prefill_tokens,
+                generated,
+                prefill_s,
+                decode_s,
+                prefill_s * 1000.0,
+            );
+        }
         let _ = writeln!(
             stdout,
             r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}{}}}"#,
@@ -15107,6 +15176,19 @@ fn generate(
         } else {
             0.0
         };
+        if let Some(dir) = evidence_dir {
+            write_daemon_runtime_oneshot_evidence(
+                dir,
+                m,
+                gpu,
+                id,
+                prefill_tokens,
+                generated,
+                prefill_s,
+                decode_s,
+                prefill_s * 1000.0,
+            );
+        }
         let _ = writeln!(
             stdout,
             r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}{}}}"#,
