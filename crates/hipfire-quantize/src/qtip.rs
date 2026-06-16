@@ -41,79 +41,29 @@ const NUM_STATES: usize = 1 << STATE_BITS;
 const STATE_MASK: u32 = (NUM_STATES as u32) - 1;
 const NUM_SYMBOLS: usize = 1 << BITS_PER_WEIGHT;
 
-/// splitmix64 finalizer → u53 → [0,1). Deterministic state→uniform map; the
-/// avalanche decorrelates adjacent states so the computed codebook covers the
-/// Gaussian well rather than being monotone in the state integer.
+/// QTIP "1MAD" computed-codebook hash: maps a trellis state to an
+/// approximately-N(0,1) value with one multiply-add + a byte sum (central-limit
+/// over 4 bytes → Gaussian). Clean-room reimplementation of the published QTIP
+/// method (the integer constants ARE the method; cf. QTIP §3 / `decode_1mad`).
+/// GPU-cheap and stateless — exactly what the C2 decode kernel will compute, so
+/// the offline codebook here matches the on-device decode bit-for-bit.
 #[inline]
-fn hash_u01(state: u32) -> f64 {
-    let mut z = (state as u64)
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^= z >> 31;
-    ((z >> 11) as f64) / ((1u64 << 53) as f64)
+fn decode_1mad(state: u32) -> f32 {
+    let x = (state as u64) & 0xFFFF_FFFF;
+    let x = x.wrapping_mul(34_038_481).wrapping_add(76_625_530) & 0xFFFF_FFFF;
+    let byte_sum = (x & 0xFF) + ((x >> 8) & 0xFF) + ((x >> 16) & 0xFF) + ((x >> 24) & 0xFF);
+    // Center (E[sum]=510 for 4 uniform bytes) and scale to unit-ish variance.
+    (byte_sum as f32 - 510.0) / 147.800_537_109_375
 }
 
-/// Acklam's rational approximation of the inverse standard-normal CDF.
-/// |error| < 1.15e-9. Maps u∈(0,1) → N(0,1) quantile.
-fn inv_norm_cdf(p: f64) -> f64 {
-    // Coefficients.
-    const A: [f64; 6] = [
-        -3.969683028665376e+01,
-        2.209460984245205e+02,
-        -2.759285104469687e+02,
-        1.383577518672690e+02,
-        -3.066479806614716e+01,
-        2.506628277459239e+00,
-    ];
-    const B: [f64; 5] = [
-        -5.447609879822406e+01,
-        1.615858368580409e+02,
-        -1.556989798598866e+02,
-        6.680131188771972e+01,
-        -1.328068155288572e+01,
-    ];
-    const C: [f64; 6] = [
-        -7.784894002430293e-03,
-        -3.223964580411365e-01,
-        -2.400758277161838e+00,
-        -2.549732539343734e+00,
-        4.374664141464968e+00,
-        2.938163982698783e+00,
-    ];
-    const D: [f64; 4] = [
-        7.784695709041462e-03,
-        3.224671290700398e-01,
-        2.445134137142996e+00,
-        3.754408661907416e+00,
-    ];
-    const P_LOW: f64 = 0.02425;
-    const P_HIGH: f64 = 1.0 - P_LOW;
-    let p = p.clamp(1e-12, 1.0 - 1e-12);
-    if p < P_LOW {
-        let q = (-2.0 * p.ln()).sqrt();
-        (((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
-            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
-    } else if p <= P_HIGH {
-        let q = p - 0.5;
-        let r = q * q;
-        (((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r + A[4]) * r + A[5]) * q
-            / (((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0)
-    } else {
-        let q = (-2.0 * (1.0 - p).ln()).sqrt();
-        -(((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
-            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
-    }
-}
-
-/// Build the computed Gaussian codebook: `codebook[state]` ≈ a unit-variance
-/// normal sample deterministically derived from `state`. Renormalized to exact
-/// zero mean / unit variance so a single per-group `scale` reconstructs the
-/// rotated (≈Gaussian, zero-mean) weights as `scale * codebook[state]`.
+/// Build the computed codebook: `codebook[state] = decode_1mad(state)`,
+/// renormalized to exact zero mean / unit variance so a single per-group
+/// `scale` reconstructs the rotated (≈Gaussian, zero-mean) weights as
+/// `scale * codebook[state]`. The renorm is offline-only; the kernel applies
+/// the same affine via baked constants.
 pub fn build_codebook() -> Vec<f32> {
     let mut cb: Vec<f64> = (0..NUM_STATES as u32)
-        .map(|s| inv_norm_cdf(hash_u01(s)))
+        .map(|s| decode_1mad(s) as f64)
         .collect();
     let mean = cb.iter().sum::<f64>() / cb.len() as f64;
     for v in cb.iter_mut() {
