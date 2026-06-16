@@ -184,3 +184,28 @@ current models, gated on redundancy (`head_dim × n_heads`) via
      drafting at the cheaper FP16 tier once FP16 coherence is established.
    Until either lands, tree drafting needs `state_quant=q8` (only safe on
    high-redundancy models, never 0.8B/2B).
+
+## Native Rust/GPU Hessian collector (finish the collect_hessian.rs scaffold)
+
+The QTIP LDLQ path (Phase C1e) needs per-layer input Hessians. The native
+`crates/hipfire-runtime/src/bin/collect_hessian.rs` is currently a SCAFFOLD
+that panics ("not implemented"); we fall back to the Tier-2 Python collector
+`scripts/collect_hessian.py` (HF transformers + ROCm/CPU torch). The Python
+path WORKS (validated 2026-06-16: 0.8B → 2.21 GB HFHS file, read by
+`hessian_io.rs`), so the HFHS-v1 format + approach are proven.
+
+Implement the native Tier-1 collector (the scaffold's own TODO list) so we
+get GPU speed and drop the torch dependency:
+- BF16 safetensors → device tensors loader.
+- On-GPU K×K outer-product Hessian rank-1-update kernel (accumulate
+  H += xᵀx over calibration tokens per GPTQ-target linear).
+- `ActivationCapture` wiring at the GPTQ-target dispatch sites in the
+  qwen35/generic forward (capture each linear's input activations).
+- HFHS-v1 binary writer matching `scripts/collect_hessian.py` (so
+  `hessian_io.rs` reads it unchanged).
+
+Benefit: CPU torch is slow (0.8B calibration is minutes; bigger models
+hours); the GPU forward + on-GPU accumulation would be far faster, and it
+removes the Python/torch tooling dependency from the quant pipeline.
+Reference: the validated Tier-2 `scripts/collect_hessian.py` + the existing
+scaffold's documented deliverables.
