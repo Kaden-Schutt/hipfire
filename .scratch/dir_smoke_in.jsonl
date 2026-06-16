@@ -1,0 +1,3 @@
+{"type":"load","model":"/home/bjoern/.hipfire/models/shisa-Qwen3.6-35B-A3B-PARO-packed","params":{"max_seq":4096}}
+{"type":"generate","id":"r1","prompt":"What is the capital of France? Answer in one short sentence.","temperature":0.0,"max_tokens":60}
+{"type":"unload"}
