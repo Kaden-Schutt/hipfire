@@ -16,10 +16,13 @@
     and reject sessions targeting missing or unavailable worker devices;
   - daemon inventory now includes explicitly configured XDNA1/NPU rows from the
     NPU module runtime/artifact contract;
+  - Rust server now has a daemon-inventory-backed `PriorityPrefillScheduler`
+    construction seam, and `/health` shares the same inventory probe helper;
   - replace the XDNA1 env/artifact sentinel with a real XRT hardware probe when
     NPU runtime dispatch owns that boundary;
   - wire live server request scheduling to pass daemon inventory into scheduler
-    admission instead of using a single server-selected HIP placement.
+    admission at the request queue site instead of using a single
+    server-selected HIP placement.
 - Regenerate quality KLD references as first-party HFQM `.kldref.hfq`
   packages. Do not trust previously downloaded raw `.kldref.bin` files for
   baseline claims. Regeneration must use Hipfire reference execution with

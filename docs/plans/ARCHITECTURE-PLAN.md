@@ -68,7 +68,7 @@ Current scheduler boundary status:
 - `hipfire-scheduler` owns Rust parity contracts for priority classes, prefill/decode scheduler policy, model-worker compatibility, request-session drafts, prefill queue selection, decode active-set batching, backpressure, opportunistic dispatch, deadline aging, and server health JSON contracts for scheduler-derived prefill/decode/state-cache metadata while consuming state-owned state-kind compatibility policy.
 - `hipfire-scheduler` consumes model-owned worker-key identity helpers directly from `hipfire-model` without re-exporting them through scheduler.
 - `hipfire-scheduler` can consume model-owned accelerator inventory to reject prefill sessions targeting missing or unavailable worker devices while preserving unprobed inventory compatibility for existing control-plane paths.
-- Rust server `/health` consumes scheduler-owned health JSON builders and reports daemon-backed accelerator inventory when a daemon is already running, while live Rust request queuing remains daemon-serial.
+- Rust server `/health` consumes scheduler-owned health JSON builders and reports daemon-backed accelerator inventory when a daemon is already running; the server also has a daemon-inventory-backed `PriorityPrefillScheduler` construction seam for request admission, while live Rust request queuing remains daemon-serial.
 - Bun scheduler code remains the live batching control plane until Rust server request paths consume the shared scheduler queue/session contracts.
 
 Current generate boundary status:

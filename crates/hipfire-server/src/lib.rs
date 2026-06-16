@@ -1,5 +1,6 @@
 pub mod model;
 pub mod routes;
+pub mod scheduler;
 pub mod state;
 
 pub use state::{AppState, SharedState};

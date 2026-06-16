@@ -8,6 +8,7 @@ use hipfire_state::runtime_workers_health_json_with_inventory;
 use serde_json::{json, Value};
 use std::env;
 
+use crate::scheduler::server_accelerator_inventory;
 use crate::state::SharedState;
 
 pub async fn get_health(state: State<SharedState>) -> Json<Value> {
@@ -30,16 +31,6 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
 
 fn scheduler_env_from_process() -> SchedulerPolicyEnv {
     SchedulerPolicyEnv::from_pairs(env::vars())
-}
-
-async fn server_accelerator_inventory(state: &SharedState) -> AcceleratorInventory {
-    let mut engine = state.engine.lock().await;
-    if let Some(engine) = engine.as_mut() {
-        if let Ok(inventory) = engine.inventory().await {
-            return inventory;
-        }
-    }
-    AcceleratorInventory::not_probed()
 }
 
 fn runtime_workers_health_payload(inventory: &AcceleratorInventory) -> serde_json::Value {
