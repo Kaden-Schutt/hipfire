@@ -42,6 +42,7 @@ use hip_bridge::HipResult;
 use hipfire_arch_qwen2::qwen2::{Qwen2Config, Qwen2Weights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, f32_to_f16, attention_family, DispatchCtx, FullAttnParams, KernelKey, ShapeInfo};
+use hipfire_runtime::model_source::ModelSource;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ─── Config ─────────────────────────────────────────────────────────────
@@ -129,6 +130,19 @@ impl DotsOcrConfig {
     pub fn from_hfq(hfq: &HfqFile) -> Result<Self, String> {
         let text = Qwen2Config::from_hfq(hfq)?;
         let vision = parse_vision_config(&hfq.metadata_json)
+            .unwrap_or_else(DotsVisionConfig::dots_ocr_defaults);
+        Ok(Self { text, vision })
+    }
+
+    /// Parse a `DotsOcrConfig` from a `ModelSource` (safetensors or HFQ).
+    ///
+    /// Text side delegates to `Qwen2Config::from_source`. Vision side
+    /// reads `config.vision_config.*` from the metadata JSON with
+    /// `dots_ocr_defaults()` fallbacks.
+    pub fn from_source(source: &dyn ModelSource) -> Result<Self, String> {
+        let text = hipfire_arch_qwen2::qwen2::config_from_source(source)
+            .ok_or_else(|| "dots-ocr: failed to parse Qwen2 text config from source".to_string())?;
+        let vision = parse_vision_config(source.metadata_json())
             .unwrap_or_else(DotsVisionConfig::dots_ocr_defaults);
         Ok(Self { text, vision })
     }
@@ -344,6 +358,21 @@ impl DotsOcrWeights {
         let text = Qwen2Weights::load(hfq, &cfg.text, gpu)?;
         let vision = load_vision_weights(hfq, &cfg.vision, gpu)
             .map_err(|e| format!("dots-ocr: load_vision_weights failed: {e:?}"))?;
+        Ok(Self { text, vision })
+    }
+
+    /// Load both text and vision weights from a `ModelSource` (safetensors
+    /// or HFQ). Text side delegates to `Qwen2Weights::load_weights_from_source`.
+    /// Vision side uses `load_vision_weights_from_source`.
+    pub fn load_weights_from_source(
+        source: &dyn ModelSource,
+        cfg: &DotsOcrConfig,
+        gpu: &mut Gpu,
+    ) -> Result<Self, String> {
+        let text = hipfire_arch_qwen2::qwen2::load_weights_from_source(source, &cfg.text, gpu)
+            .map_err(|e| format!("dots-ocr: text weights from source failed: {e:?}"))?;
+        let vision = load_vision_weights_from_source(source, &cfg.vision, gpu)
+            .map_err(|e| format!("dots-ocr: vision weights from source failed: {e:?}"))?;
         Ok(Self { text, vision })
     }
 
@@ -692,6 +721,227 @@ fn dequant_hfq4(data: &[u8], n_elements: usize, group_size: usize) -> Vec<f32> {
     }
     out.truncate(n_elements);
     out
+}
+
+// ─── Source-based vision weight loaders (from &dyn ModelSource) ─────────
+
+/// Convert BF16 bytes to a vector of F32 values.
+fn bf16_bytes_to_f32(data: &[u8]) -> Vec<f32> {
+    data.chunks_exact(2)
+        .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+        .collect()
+}
+
+/// Convert source dtype bytes to a F16 byte stream for GPU upload.
+/// Handles F16 (passthrough), BF16 (→F16), and F32 (→F16).
+fn source_bytes_to_f16_stream(source_dtype: &str, data: &[u8], n_elements: usize) -> Vec<u8> {
+    match source_dtype {
+        "F16" => {
+            assert_eq!(data.len(), 2 * n_elements,
+                "dots-ocr: F16 tensor has {} bytes, expected 2 * {n_elements}", data.len());
+            data.to_vec()
+        }
+        "BF16" => {
+            let f32_vals = bf16_bytes_to_f32(data);
+            assert_eq!(f32_vals.len(), n_elements);
+            f32_vals.iter().flat_map(|&v| f32_to_f16(v).to_le_bytes()).collect()
+        }
+        "F32" => {
+            let f32_vals: Vec<f32> = data.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            assert_eq!(f32_vals.len(), n_elements);
+            f32_vals.iter().flat_map(|&v| f32_to_f16(v).to_le_bytes()).collect()
+        }
+        other => panic!(
+            "dots-ocr: unsupported source dtype '{other}' for tensor (expected F16/BF16/F32)"
+        ),
+    }
+}
+
+/// Convert source dtype bytes to an F32 vector (for norms/biases).
+fn source_bytes_to_f32_vec(source_dtype: &str, data: &[u8], n: usize) -> Vec<f32> {
+    match source_dtype {
+        "F16" => {
+            let v: Vec<f32> = data.chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            assert_eq!(v.len(), n);
+            v
+        }
+        "BF16" => {
+            let v = bf16_bytes_to_f32(data);
+            assert_eq!(v.len(), n);
+            v
+        }
+        "F32" => {
+            let v: Vec<f32> = data.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            assert_eq!(v.len(), n);
+            v
+        }
+        other => panic!(
+            "dots-ocr: unsupported source dtype '{other}' for tensor (expected F16/BF16/F32)"
+        ),
+    }
+}
+
+/// Load a norm weight tensor from ModelSource (always F32 on GPU).
+fn load_norm_weight_raw_from_source(
+    source: &dyn ModelSource,
+    gpu: &mut Gpu,
+    name: &str,
+    n: usize,
+) -> HipResult<GpuTensor> {
+    let (info, data) = source.tensor_data(name)
+        .unwrap_or_else(|| panic!("dots-ocr: tensor not found: {name}"));
+    let f32_data = source_bytes_to_f32_vec(&info.dtype, data, n);
+    gpu.upload_f32(&f32_data, &[n])
+}
+
+/// Load a bias tensor from ModelSource (always F32 on GPU).
+fn load_bias_f32_from_source(
+    source: &dyn ModelSource,
+    gpu: &mut Gpu,
+    name: &str,
+    n: usize,
+) -> HipResult<GpuTensor> {
+    let (info, data) = source.tensor_data(name)
+        .unwrap_or_else(|| panic!("dots-ocr: tensor not found: {name}"));
+    let f32_data = source_bytes_to_f32_vec(&info.dtype, data, n);
+    gpu.upload_f32(&f32_data, &[n])
+}
+
+/// Load a linear weight from ModelSource as F16 on GPU.
+/// Handles F16/BF16/F32 source dtypes, converting to F16 bytes.
+fn load_f16_from_source(
+    source: &dyn ModelSource,
+    gpu: &mut Gpu,
+    name: &str,
+    n_elements: usize,
+) -> HipResult<GpuTensor> {
+    let (info, data) = source.tensor_data(name)
+        .unwrap_or_else(|| panic!("dots-ocr: tensor not found: {name}"));
+    let f16_bytes = source_bytes_to_f16_stream(&info.dtype, data, n_elements);
+    gpu.upload_raw(&f16_bytes, &[n_elements])
+}
+
+/// Load TWO linear weights from ModelSource and concatenate them along the
+/// output (M) axis at load time into a single F16 GPU tensor. Used for the
+/// SwiGLU fc1+fc3 fusion. Handles F16/BF16/F32 source dtypes.
+fn load_f16_concat_rows_from_source(
+    source: &dyn ModelSource,
+    gpu: &mut Gpu,
+    name_a: &str,
+    name_b: &str,
+    n_elements_a: usize,
+    n_elements_b: usize,
+) -> HipResult<GpuTensor> {
+    let bytes_a = {
+        let (info, data) = source.tensor_data(name_a)
+            .unwrap_or_else(|| panic!("dots-ocr: tensor not found: {name_a}"));
+        source_bytes_to_f16_stream(&info.dtype, data, n_elements_a)
+    };
+    let bytes_b = {
+        let (info, data) = source.tensor_data(name_b)
+            .unwrap_or_else(|| panic!("dots-ocr: tensor not found: {name_b}"));
+        source_bytes_to_f16_stream(&info.dtype, data, n_elements_b)
+    };
+    assert_eq!(bytes_a.len(), 2 * n_elements_a,
+        "dots-ocr: {name_a} produced {} f16 bytes, expected {}", bytes_a.len(), 2 * n_elements_a);
+    assert_eq!(bytes_b.len(), 2 * n_elements_b,
+        "dots-ocr: {name_b} produced {} f16 bytes, expected {}", bytes_b.len(), 2 * n_elements_b);
+    let mut combined = Vec::with_capacity(bytes_a.len() + bytes_b.len());
+    combined.extend_from_slice(&bytes_a);
+    combined.extend_from_slice(&bytes_b);
+    gpu.upload_raw(&combined, &[n_elements_a + n_elements_b])
+}
+
+/// Load all dots.ocr vision-tower weights from a `ModelSource` (safetensors
+/// or HFQ). Mirrors `load_vision_weights` but reads via `source.tensor_data()`
+/// instead of `hfq.tensor_data_vec()`, supporting BF16 source dtypes.
+///
+/// Tensor name layout is identical to `load_vision_weights` — see its
+/// documentation for the full inventory.
+pub fn load_vision_weights_from_source(
+    source: &dyn ModelSource,
+    cfg: &DotsVisionConfig,
+    gpu: &mut Gpu,
+) -> HipResult<DotsVisionWeights> {
+    let h = cfg.embed_dim;
+    let intermediate = cfg.intermediate_size;
+    let patch_dim = cfg.num_channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
+    let merge_dim = h * cfg.spatial_merge_size * cfg.spatial_merge_size;
+    eprintln!(
+        "  loading dots-ocr vision tower (from source): embed_dim={h} layers={} intermediate={intermediate} \
+         patch_dim={patch_dim} merge_dim={merge_dim}",
+        cfg.num_hidden_layers,
+    );
+
+    // ── patch_embed ───────────────────────────────────────────────
+    let patch_embed_w = load_f16_from_source(
+        source, gpu, "vision_tower.patch_embed.patchifier.proj.weight", h * patch_dim,
+    )?;
+    let patch_embed_b = load_bias_f32_from_source(
+        source, gpu, "vision_tower.patch_embed.patchifier.proj.bias", h,
+    )?;
+    let patch_embed_norm = load_norm_weight_raw_from_source(
+        source, gpu, "vision_tower.patch_embed.patchifier.norm.weight", h,
+    )?;
+
+    // ── blocks ────────────────────────────────────────────────────
+    let mut blocks = Vec::with_capacity(cfg.num_hidden_layers);
+    for i in 0..cfg.num_hidden_layers {
+        if i % 7 == 0 {
+            eprintln!("  loading vision block {i}/{} (from source)", cfg.num_hidden_layers);
+        }
+        let p = format!("vision_tower.blocks.{i}");
+        let norm1_w = load_norm_weight_raw_from_source(source, gpu, &format!("{p}.norm1.weight"), h)?;
+        let qkv_w = load_f16_from_source(source, gpu, &format!("{p}.attn.qkv.weight"), 3 * h * h)?;
+        let proj_w = load_f16_from_source(source, gpu, &format!("{p}.attn.proj.weight"), h * h)?;
+        let norm2_w = load_norm_weight_raw_from_source(source, gpu, &format!("{p}.norm2.weight"), h)?;
+        let fc13_proj = load_f16_concat_rows_from_source(
+            source, gpu,
+            &format!("{p}.mlp.fc1.weight"),
+            &format!("{p}.mlp.fc3.weight"),
+            intermediate * h, intermediate * h,
+        )?;
+        let fc2 = load_f16_from_source(source, gpu, &format!("{p}.mlp.fc2.weight"), h * intermediate)?;
+        blocks.push(DotsVisionBlockWeights { norm1_w, qkv_w, proj_w, norm2_w, fc13_proj, fc2 });
+    }
+
+    // ── post-trunk norm + merger ──────────────────────────────────
+    let post_trunk_norm = load_norm_weight_raw_from_source(
+        source, gpu, "vision_tower.post_trunk_norm.weight", h,
+    )?;
+    eprintln!("  loading vision merger (from source)");
+    let merger_ln_w = load_norm_weight_raw_from_source(source, gpu, "vision_tower.merger.ln_q.weight", h)?;
+    let merger_ln_b = load_bias_f32_from_source(source, gpu, "vision_tower.merger.ln_q.bias", h)?;
+    let merger_fc1_w = load_f16_from_source(
+        source, gpu, "vision_tower.merger.mlp.0.weight", merge_dim * merge_dim,
+    )?;
+    let merger_fc1_b = load_bias_f32_from_source(source, gpu, "vision_tower.merger.mlp.0.bias", merge_dim)?;
+    let merger_fc2_w = load_f16_from_source(
+        source, gpu, "vision_tower.merger.mlp.2.weight", cfg.out_hidden_size * merge_dim,
+    )?;
+    let merger_fc2_b = load_bias_f32_from_source(
+        source, gpu, "vision_tower.merger.mlp.2.bias", cfg.out_hidden_size,
+    )?;
+
+    Ok(DotsVisionWeights {
+        patch_embed_w,
+        patch_embed_b,
+        patch_embed_norm,
+        blocks,
+        post_trunk_norm,
+        merger_ln_w,
+        merger_ln_b,
+        merger_fc1_w,
+        merger_fc1_b,
+        merger_fc2_w,
+        merger_fc2_b,
+    })
 }
 
 // ─── Vision-forward primitives ─────────────────────────────────────────
