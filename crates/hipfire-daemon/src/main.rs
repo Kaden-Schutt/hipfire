@@ -65,7 +65,7 @@ use hipfire_generate::{
 };
 use hipfire_model::{
     is_qwen35_dense_arch_id, is_qwen35_family_arch_id, is_qwen35_moe_arch_id,
-    parse_model_worker_id, ModelWorkerId,
+    parse_model_worker_id, AcceleratorDeviceInfo, AcceleratorInventory, ModelWorkerId,
 };
 use hipfire_prompt as prompt_frame;
 use hipfire_runtime::cask::CaskCtx;
@@ -3904,6 +3904,56 @@ fn resident_worker_status_json(
         "total_evictable_state_bytes": total_evictable_state_bytes,
         "workers": workers,
     })
+}
+
+fn daemon_accelerator_inventory(gpu: &mut rdna_compute::Gpu) -> AcceleratorInventory {
+    let hip_runtime = gpu
+        .hip
+        .runtime_version()
+        .ok()
+        .map(|(major, minor)| format!("HIP {major}.{minor}"));
+    let selected_device = gpu.device_id;
+    let count = gpu.hip.device_count().unwrap_or(0).max(0);
+    let mut devices = Vec::new();
+
+    for ordinal in 0..count {
+        let device_id = ordinal.to_string();
+        if let Err(err) = gpu.hip.set_device(ordinal) {
+            devices.push(AcceleratorDeviceInfo {
+                kind: "hip".to_string(),
+                device_id,
+                ordinal: Some(ordinal as usize),
+                available: false,
+                selected: ordinal == selected_device,
+                reason: Some(err.to_string()),
+                ..Default::default()
+            });
+            continue;
+        }
+
+        let arch = gpu.hip.get_arch(ordinal).ok();
+        let integrated = gpu.hip.is_integrated_device(ordinal).ok();
+        let total_memory_bytes = gpu.hip.get_vram_info().ok().map(|(_, total)| total as u64);
+        let mut device = AcceleratorDeviceInfo::hip(
+            device_id,
+            ordinal as usize,
+            arch,
+            total_memory_bytes,
+            integrated,
+            hip_runtime.clone(),
+        );
+        device.selected = ordinal == selected_device;
+        devices.push(device);
+    }
+
+    if let Err(err) = gpu.hip.set_device(selected_device) {
+        eprintln!(
+            "WARNING: failed to restore HIP device {} after inventory probe: {}",
+            selected_device, err
+        );
+    }
+
+    AcceleratorInventory::from_devices("daemon", devices)
 }
 
 fn resident_state_reservation_budget_bytes() -> usize {
@@ -8925,6 +8975,15 @@ fn main() {
                     &resident_models,
                 );
                 let _ = writeln!(stdout, "{status}");
+                let _ = stdout.flush();
+            }
+
+            "inventory" => {
+                let inventory = daemon_accelerator_inventory(&mut gpu);
+                let mut payload = serde_json::to_value(inventory)
+                    .unwrap_or_else(|_| serde_json::json!({"source": "daemon", "devices": []}));
+                payload["type"] = serde_json::json!("inventory");
+                let _ = writeln!(stdout, "{payload}");
                 let _ = stdout.flush();
             }
 

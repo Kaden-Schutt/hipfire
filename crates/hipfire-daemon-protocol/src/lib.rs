@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use hipfire_generate::{DoneEvent, ErrorEvent, GenerateTextRequest, TokenEvent};
-use hipfire_model::{ModelLoadRequest, ModelLoadedResponse};
+use hipfire_model::{AcceleratorInventory, ModelLoadRequest, ModelLoadedResponse};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -16,6 +16,7 @@ pub enum DaemonRequest {
     Unload,
     Reset,
     Ping,
+    Inventory,
     Generate(GenerateTextRequest),
 }
 
@@ -26,6 +27,7 @@ pub enum DaemonResponse {
     Unloaded,
     Reset,
     Pong,
+    Inventory(AcceleratorInventory),
     Token(TokenEvent),
     Done(DoneEvent),
     Error(ErrorEvent),
@@ -118,6 +120,39 @@ mod tests {
         let response: DaemonResponse =
             serde_json::from_value(json!({"type": "reset", "seq_pos": 0})).unwrap();
         assert!(matches!(response, DaemonResponse::Reset));
+    }
+
+    #[test]
+    fn inventory_request_and_response_use_shared_model_contract() {
+        let value = serde_json::to_value(DaemonRequest::Inventory).unwrap();
+        assert_eq!(value, json!({"type": "inventory"}));
+
+        let response: DaemonResponse = serde_json::from_value(json!({
+            "type": "inventory",
+            "source": "daemon",
+            "devices": [{
+                "kind": "hip",
+                "device_id": "0",
+                "ordinal": 0,
+                "arch": "gfx1201",
+                "name": null,
+                "total_memory_bytes": 24000000000u64,
+                "integrated": false,
+                "runtime": "HIP 6.4",
+                "available": true,
+                "selected": true,
+                "reason": null
+            }]
+        }))
+        .unwrap();
+
+        let DaemonResponse::Inventory(inventory) = response else {
+            panic!("expected inventory response");
+        };
+        assert_eq!(inventory.source, "daemon");
+        assert_eq!(inventory.devices.len(), 1);
+        assert_eq!(inventory.devices[0].device_id, "0");
+        assert_eq!(inventory.devices[0].arch.as_deref(), Some("gfx1201"));
     }
 
     #[test]

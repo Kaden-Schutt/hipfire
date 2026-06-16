@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use futures::future::BoxFuture;
 use hipfire_daemon_protocol::{DaemonRequest, DaemonResponse};
 use hipfire_generate::{DoneEvent, GenerateTextRequest};
-use hipfire_model::{ModelLoadParams, ModelLoadRequest, ModelLoadedResponse};
+use hipfire_model::{AcceleratorInventory, ModelLoadParams, ModelLoadRequest, ModelLoadedResponse};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tracing::debug;
@@ -178,6 +178,21 @@ impl DaemonEngine {
                 DaemonResponse::Unknown => {}
                 other => {
                     tracing::warn!("unexpected response during ping: {other:?}");
+                }
+            }
+        }
+    }
+
+    /// Send `inventory` and wait for accelerator inventory.
+    pub async fn inventory(&mut self) -> anyhow::Result<AcceleratorInventory> {
+        self.send(&DaemonRequest::Inventory).await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::Inventory(inventory) => return Ok(inventory),
+                DaemonResponse::Error(e) => anyhow::bail!("daemon inventory error: {}", e.message),
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during inventory: {other:?}");
                 }
             }
         }
@@ -736,6 +751,29 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.worker_key_id, "worker-a");
         assert_eq!(engine.worker_key_id.as_deref(), Some("worker-a"));
+    }
+
+    #[tokio::test]
+    async fn inventory_returns_shared_accelerator_contract() {
+        let mut engine = mock_engine(vec![DaemonResponse::Inventory(
+            AcceleratorInventory::from_devices(
+                "daemon",
+                vec![hipfire_model::AcceleratorDeviceInfo::hip(
+                    "0",
+                    0,
+                    Some("gfx1201".to_string()),
+                    Some(24_000_000_000),
+                    Some(false),
+                    Some("HIP 6.4".to_string()),
+                )],
+            ),
+        )]);
+
+        let inventory = engine.inventory().await.unwrap();
+        assert_eq!(inventory.source, "daemon");
+        assert_eq!(inventory.devices.len(), 1);
+        assert_eq!(inventory.devices[0].device_id, "0");
+        assert_eq!(inventory.devices[0].device_class(), "discrete");
     }
 
     #[tokio::test]

@@ -97,6 +97,7 @@ Current NPU/backend boundary status:
 Current daemon protocol boundary status:
 - `hipfire-daemon-protocol` owns typed daemon JSONL request/response envelopes while model load request/loaded-response and generate token/done/error payloads live in shared boundary crates.
 - `hipfire-server` consumes `hipfire-daemon-protocol` directly for daemon JSONL request/response contracts; the old server-local protocol re-export has been retired.
+- `hipfire-daemon-protocol` owns the typed `inventory` request/response envelope over the model-owned accelerator inventory contract.
 - `hipfire-daemon` consumes the shared generate request contract opportunistically for common generate fields while preserving raw-JSON fallbacks for legacy/daemon-only fields.
 - `hipfire-daemon` also consumes generate-owned batch prefill/preflight/decode contracts, validators, prefix-hash helpers, selector policy, scratch sizing policy, scheduler metadata, and state-owned prefix-hash/checkpoint metadata so daemon-local duplicate batch structs, hash helpers, validation helpers, checkpoint request structs, and Qwen3.5 batch policy helpers are retired.
 - `hipfire-daemon` also consumes the shared load request contract for common load fields (`model`, `max_seq`, `physical_cap`, `dflash_mode`, `draft`, `kv_cache`, `cask_sidecar`) while preserving raw-JSON fallbacks for legacy/daemon-only load fields.
@@ -104,6 +105,7 @@ Current daemon protocol boundary status:
 
 Current daemon adapter boundary status:
 - `hipfire-daemon-adapter` owns the async stdio JSONL process client, daemon binary discovery and missing-binary diagnostics, load/ping/unload/generate response loops, stale-response filtering, and daemon startup resource lease policy/helpers.
+- `hipfire-daemon-adapter` owns the typed daemon inventory client call over the shared accelerator inventory contract.
 - `hipfire-cli run` consumes `hipfire-daemon-adapter` and `hipfire-daemon-protocol` directly for daemon-backed execution instead of reaching those contracts through the server crate.
 - `hipfire-server` consumes `hipfire-daemon-adapter` directly for daemon-backed execution; the old server-local engine re-export has been retired.
 - `hipfire-coherence` consumes `hipfire-daemon-adapter` for daemon binary discovery while retaining its coherence-specific raw JSONL runner and detector orchestration.

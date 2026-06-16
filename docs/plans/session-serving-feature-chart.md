@@ -55,6 +55,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Rust scheduler policy parity tests now cover remaining Bun policy cases for realtime dispatch, legacy wait mapping, opportunistic pairing, spill gating, and clamped residency/spill limits.
 - Rust server `/health` now consumes scheduler-owned JSON builders for scheduler-derived prefill/decode/state-cache metadata while live Rust request handling remains daemon-serial.
 - Rust server `/health.runtime_workers` now consumes `hipfire-state` runtime-worker health summary rendering and includes model-owned accelerator inventory payloads, currently reporting `source=not_probed` until daemon-owned device probing is wired and an empty adapter state until Rust owns resident workers.
+- Daemon JSONL now exposes a typed `inventory` request/response through `hipfire-daemon-protocol` and `hipfire-daemon-adapter`, returning the model-owned accelerator inventory contract for visible HIP devices.
 - Generate Qwen3.5 dense/MoE batch backend selection and decode scheduler fallback metadata now reuse `hipfire-model` architecture classification instead of local numeric arch checks.
 - Daemon text/VL generation loop guards now consume `hipfire-generate` ownership directly; `hipfire-runtime::loop_guard` remains only as a source-compatible wrapper over the generate-owned policy.
 - Daemon text output filtering now consumes `hipfire-generate` EOS/holdback/strip-think filter ownership directly; `hipfire-runtime::eos_filter` remains only as a source-compatible re-export.
