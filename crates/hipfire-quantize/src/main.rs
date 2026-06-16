@@ -8945,6 +8945,35 @@ fn main() {
     // vs the effective sim weight so the producer is verified offline.
     if use_qtip3_real {
         use rayon::prelude::*;
+        // The tied embed/lm_head ([vocab × dim]) is gather-accessed (embedding
+        // lookup), which the trellis format can't random-access — and it is the
+        // single largest tensor, read every decode token via lm_head. Leaving it
+        // bf16 erased the transformer-weight savings (measured: qtip3 40.9 tok/s
+        // vs mq4 57.4 with bf16 lm_head). Quantize it Q8F16 (gather-friendly,
+        // 1 B/w), matching what the mq4 path does for tied embed/lm_head.
+        let mut n_q8 = 0usize;
+        for t in hfq_tensors.iter_mut() {
+            if !(matches!(t.quant_type, QuantType::BF16)
+                && t.shape.len() == 2
+                && (t.name.contains("embed")
+                    || t.name.contains("lm_head")
+                    || t.name.ends_with("output.weight")))
+            {
+                continue;
+            }
+            let wf: Vec<f32> = t
+                .data
+                .chunks_exact(2)
+                .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            t.data = quantize_q8f16(&wf);
+            t.quant_type = QuantType::Q8F16;
+            t.group_size = 32;
+            n_q8 += 1;
+        }
+        if n_q8 > 0 {
+            eprintln!("  qtip3 (real): embed/lm_head → Q8F16 ({n_q8} tensors, gather-friendly)");
+        }
         let (mut n_packed, mut max_err) = (0usize, 0.0f32);
         for t in hfq_tensors.iter_mut() {
             if !(matches!(t.quant_type, QuantType::BF16)
