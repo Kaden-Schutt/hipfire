@@ -27,6 +27,7 @@ hipfire-arch-lfm2moe   = { path = "../hipfire-arch-lfm2moe", optional = true }
 hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
 hipfire-generate = { path = "../hipfire-generate" }
 hipfire-model = { path = "../hipfire-model" }
+hipfire-npu = { path = "../hipfire-npu" }
 hipfire-prompt = { path = "../hipfire-prompt" }
 hipfire-state = { path = "../hipfire-state" }
 hip-bridge    = { path = "../hip-bridge" }

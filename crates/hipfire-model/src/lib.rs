@@ -289,6 +289,26 @@ impl AcceleratorDeviceInfo {
         }
     }
 
+    pub fn npu_xdna1(
+        device_id: impl Into<String>,
+        ordinal: Option<usize>,
+        runtime: Option<String>,
+        available: bool,
+        reason: Option<String>,
+    ) -> Self {
+        Self {
+            kind: "npu".to_string(),
+            device_id: device_id.into(),
+            ordinal,
+            arch: Some("xdna1".to_string()),
+            name: Some("XDNA1 NPU".to_string()),
+            runtime,
+            available,
+            reason,
+            ..Default::default()
+        }
+    }
+
     pub fn device_class(&self) -> &'static str {
         match self.integrated {
             Some(true) => "integrated",

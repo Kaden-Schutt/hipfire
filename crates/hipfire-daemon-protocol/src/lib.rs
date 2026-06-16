@@ -142,6 +142,18 @@ mod tests {
                 "available": true,
                 "selected": true,
                 "reason": null
+            }, {
+                "kind": "npu",
+                "device_id": "xdna1:0",
+                "ordinal": 0,
+                "arch": "xdna1",
+                "name": "XDNA1 NPU",
+                "total_memory_bytes": null,
+                "integrated": null,
+                "runtime": "xdna1_ffi",
+                "available": true,
+                "selected": false,
+                "reason": null
             }]
         }))
         .unwrap();
@@ -150,9 +162,12 @@ mod tests {
             panic!("expected inventory response");
         };
         assert_eq!(inventory.source, "daemon");
-        assert_eq!(inventory.devices.len(), 1);
+        assert_eq!(inventory.devices.len(), 2);
         assert_eq!(inventory.devices[0].device_id, "0");
         assert_eq!(inventory.devices[0].arch.as_deref(), Some("gfx1201"));
+        assert_eq!(inventory.devices[1].kind, "npu");
+        assert_eq!(inventory.devices[1].device_id, "xdna1:0");
+        assert_eq!(inventory.devices[1].arch.as_deref(), Some("xdna1"));
     }
 
     #[test]

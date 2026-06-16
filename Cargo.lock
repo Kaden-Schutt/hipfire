@@ -845,6 +845,7 @@ dependencies = [
  "hipfire-daemon-adapter",
  "hipfire-generate",
  "hipfire-model",
+ "hipfire-npu",
  "hipfire-prompt",
  "hipfire-runtime",
  "hipfire-state",
@@ -972,6 +973,7 @@ name = "hipfire-npu"
 version = "0.2.1"
 dependencies = [
  "hipfire-cpu",
+ "hipfire-model",
  "serde_json",
 ]
 

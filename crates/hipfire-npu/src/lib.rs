@@ -9,10 +9,12 @@
 //! needed to be admitted by an architecture-specific caller.
 
 use hipfire_cpu::{BackendSelection, DenseFfnBackend, DenseFfnBackendPreference, ModuleInvocation};
+use hipfire_model::AcceleratorDeviceInfo;
 use serde_json::{json, Value};
 
 pub const XDNA1_SWIGLU_BACKEND: &str = "npu_xdna1";
 pub const NPU_ARTIFACTS_MISSING_FALLBACK: &str = "npu_artifacts_missing";
+pub const XDNA1_RUNTIME_MISSING_FALLBACK: &str = "xdna1_runtime_missing";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NpuModuleTarget {
@@ -42,6 +44,86 @@ impl Xdna1ModuleArtifacts {
         self.xclbin.as_deref().is_some_and(|path| !path.is_empty())
             && self.instr.as_deref().is_some_and(|path| !path.is_empty())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Xdna1InventoryConfig {
+    pub runtime_lib: Option<String>,
+    pub swiglu_artifacts: Xdna1ModuleArtifacts,
+}
+
+impl Xdna1InventoryConfig {
+    pub fn new(runtime_lib: Option<String>, swiglu_artifacts: Xdna1ModuleArtifacts) -> Self {
+        Self {
+            runtime_lib,
+            swiglu_artifacts,
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self {
+            runtime_lib: std::env::var("HIPFIRE_XDNA1_LIB")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            swiglu_artifacts: Xdna1ModuleArtifacts::new(
+                std::env::var("HIPFIRE_QWEN35_XDNA1_XCLBIN")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty()),
+                std::env::var("HIPFIRE_QWEN35_XDNA1_INSTR")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty()),
+            ),
+        }
+    }
+
+    pub fn explicitly_configured(&self) -> bool {
+        self.runtime_lib
+            .as_deref()
+            .is_some_and(|path| !path.is_empty())
+            || self
+                .swiglu_artifacts
+                .xclbin
+                .as_deref()
+                .is_some_and(|path| !path.is_empty())
+            || self
+                .swiglu_artifacts
+                .instr
+                .as_deref()
+                .is_some_and(|path| !path.is_empty())
+    }
+}
+
+pub fn xdna1_inventory_devices(config: &Xdna1InventoryConfig) -> Vec<AcceleratorDeviceInfo> {
+    if !config.explicitly_configured() {
+        return Vec::new();
+    }
+
+    let runtime_available = config
+        .runtime_lib
+        .as_deref()
+        .is_some_and(|path| !path.trim().is_empty());
+    let artifacts_available = config.swiglu_artifacts.complete();
+    let available = runtime_available && artifacts_available;
+    let reason = if !runtime_available {
+        Some(XDNA1_RUNTIME_MISSING_FALLBACK.to_string())
+    } else if !artifacts_available {
+        Some(NPU_ARTIFACTS_MISSING_FALLBACK.to_string())
+    } else {
+        None
+    };
+    let runtime = runtime_available.then(|| "xdna1_ffi".to_string());
+
+    vec![AcceleratorDeviceInfo::npu_xdna1(
+        "xdna1:0",
+        Some(0),
+        runtime,
+        available,
+        reason,
+    )]
+}
+
+pub fn xdna1_inventory_devices_from_env() -> Vec<AcceleratorDeviceInfo> {
+    xdna1_inventory_devices(&Xdna1InventoryConfig::from_env())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +208,62 @@ mod tests {
             Some("a.instr".to_string())
         )
         .complete());
+    }
+
+    #[test]
+    fn xdna1_inventory_stays_empty_without_explicit_runtime_or_artifacts() {
+        let devices = xdna1_inventory_devices(&Xdna1InventoryConfig::new(
+            None,
+            Xdna1ModuleArtifacts::new(None, None),
+        ));
+
+        assert!(devices.is_empty());
+    }
+
+    #[test]
+    fn xdna1_inventory_reports_configured_runtime_and_artifacts() {
+        let devices = xdna1_inventory_devices(&Xdna1InventoryConfig::new(
+            Some("libxdna1.so".to_string()),
+            Xdna1ModuleArtifacts::new(Some("a.xclbin".to_string()), Some("a.instr".to_string())),
+        ));
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].kind, "npu");
+        assert_eq!(devices[0].device_id, "xdna1:0");
+        assert_eq!(devices[0].arch.as_deref(), Some("xdna1"));
+        assert_eq!(devices[0].runtime.as_deref(), Some("xdna1_ffi"));
+        assert!(devices[0].available);
+        assert_eq!(devices[0].reason, None);
+    }
+
+    #[test]
+    fn xdna1_inventory_marks_partial_configuration_unavailable() {
+        let devices = xdna1_inventory_devices(&Xdna1InventoryConfig::new(
+            Some("libxdna1.so".to_string()),
+            Xdna1ModuleArtifacts::new(Some("a.xclbin".to_string()), None),
+        ));
+
+        assert_eq!(devices.len(), 1);
+        assert!(!devices[0].available);
+        assert_eq!(
+            devices[0].reason.as_deref(),
+            Some(NPU_ARTIFACTS_MISSING_FALLBACK)
+        );
+    }
+
+    #[test]
+    fn xdna1_inventory_marks_artifacts_without_runtime_unavailable() {
+        let devices = xdna1_inventory_devices(&Xdna1InventoryConfig::new(
+            None,
+            Xdna1ModuleArtifacts::new(Some("a.xclbin".to_string()), Some("a.instr".to_string())),
+        ));
+
+        assert_eq!(devices.len(), 1);
+        assert!(!devices[0].available);
+        assert_eq!(
+            devices[0].reason.as_deref(),
+            Some(XDNA1_RUNTIME_MISSING_FALLBACK)
+        );
     }
 
     #[test]

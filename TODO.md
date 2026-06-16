@@ -14,7 +14,10 @@
     accelerator kind/device id;
   - priority prefill scheduler admission can now consume accelerator inventory
     and reject sessions targeting missing or unavailable worker devices;
-  - probe available NPUs/XDNA devices separately when present;
+  - daemon inventory now includes explicitly configured XDNA1/NPU rows from the
+    NPU module runtime/artifact contract;
+  - replace the XDNA1 env/artifact sentinel with a real XRT hardware probe when
+    NPU runtime dispatch owns that boundary;
   - wire live server request scheduling to pass daemon inventory into scheduler
     admission instead of using a single server-selected HIP placement.
 - Regenerate quality KLD references as first-party HFQM `.kldref.hfq`

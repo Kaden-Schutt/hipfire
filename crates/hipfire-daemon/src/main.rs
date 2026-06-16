@@ -3953,6 +3953,8 @@ fn daemon_accelerator_inventory(gpu: &mut rdna_compute::Gpu) -> AcceleratorInven
         );
     }
 
+    devices.extend(hipfire_npu::xdna1_inventory_devices_from_env());
+
     AcceleratorInventory::from_devices("daemon", devices)
 }
 
