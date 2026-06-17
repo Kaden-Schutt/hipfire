@@ -1,14 +1,19 @@
 # RoughQuant — energy-concentrating mixed-precision weight quant (build spec)
 
-**Status:** **POSITIVE at low bits (2026-06-17, phase2h) — reverses the earlier
-negative.** Foldable Q8-protection of the shared ~75-channel outlier set + mq4
-bulk beats uniform by ~25% KLD at ~4.4–4.5 avg-bits (win shrinks toward higher
-bits). Reached only after user skepticism uncovered 4 compounding artifacts
-(zeroing bug, energy-aggregation error, bf16-protection wasting half its bits,
-PPL pointwise noise). Literature-consistent (AWQ/super-weight). SIM result; needs
-packed format + offline fold + coherence + cross-model before shipping. See
-`docs/roughquant/phase2h-foldable-win.md`. (Earlier phases below retained for the
-record; their "no foldable win" verdicts are SUPERSEDED by phase2g/2h.)
+**Status:** **POSITIVE & reconciled (2026-06-17, phase2h).** Foldable protection
+of the shared ~75-channel outlier set (bf16) genuinely improves BOTH teacher-
+forced KLD (HALVES mq4's, 0.162→0.084 at +0.6 bits) AND coherence (beats the
+protect-0% control toward mq4). Literature-consistent (AWQ/super-weight). Reached
+only after user skepticism uncovered FIVE compounding artifacts that had produced
+false negatives: (1) non-monotonic zeroing bug, (2) energy-aggregation error
+hiding the shared outlier structure, (3) bf16 wasting half its protection bits,
+(4) PPL pointwise noise, (5) Q8-DeltaNet-state + bf16-sim generation-fidelity
+confounds faking "coherence failure". Caveats: Q8 *weight*-protection is out
+(degrades vs bf16); the bf16 SIM under-represents generation quality (faithful
+for KLD/PPL, not generation), so a SHIPPABLE win needs the REAL packed format
+(mq4 bulk + bf16 outlier sidecar) + offline fold + coherence on the real GEMV +
+cross-model (7B/9B). See `docs/roughquant/phase2{g,h}*.md`. (Earlier phases
+retained for the record; their "no foldable win" verdicts are SUPERSEDED.)
 
 _Prior status line (superseded):_ **CONCLUDED — NOT DEPLOYABLE on Qwen3.5-0.8B (2026-06-17).** Sim
 phases 0–2 + de-risks A/B done — see `docs/roughquant/phase{0,1,2}.md`. Two
