@@ -40511,6 +40511,61 @@ impl Gpu {
         }
     }
 
+    /// Training row-softmax forward (fp32). `s`,`y`: `[rows*n]`; writes p into y.
+    pub fn softmax_train_fwd(
+        &mut self,
+        s: &GpuTensor,
+        y: &GpuTensor,
+        rows: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("softmax_train_fwd", kernels::SOFTMAX_TRAIN_SRC, "softmax_train_fwd")?;
+        let func = &self.functions["softmax_train_fwd"];
+        let mut sp = s.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut rowsi = rows as i32;
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut sp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut rowsi as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(func, [rows as u32, 1, 1], [64, 1, 1], 0, self.stream_ref(), &mut params)
+        }
+    }
+
+    /// Training row-softmax backward (fp32). `dy`,`p`,`ds`: `[rows*n]`.
+    pub fn softmax_train_bwd(
+        &mut self,
+        dy: &GpuTensor,
+        p: &GpuTensor,
+        ds: &GpuTensor,
+        rows: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("softmax_train_bwd", kernels::SOFTMAX_TRAIN_SRC, "softmax_train_bwd")?;
+        let func = &self.functions["softmax_train_bwd"];
+        let mut dyp = dy.buf.as_ptr();
+        let mut pp = p.buf.as_ptr();
+        let mut dsp = ds.buf.as_ptr();
+        let mut rowsi = rows as i32;
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dyp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut dsp as *mut _ as *mut c_void,
+            &mut rowsi as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(func, [rows as u32, 1, 1], [64, 1, 1], 0, self.stream_ref(), &mut params)
+        }
+    }
+
     /// LayerNorm with bias (batched): out = gamma * (x - mean) / sqrt(var + eps) + beta
     pub fn layernorm_batched(
         &mut self,

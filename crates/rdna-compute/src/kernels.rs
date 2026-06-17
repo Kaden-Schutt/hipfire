@@ -3189,6 +3189,10 @@ pub const GEMM_F32_TRAIN_SRC: &str = include_str!("../../../kernels/src/gemm_f32
 /// `rmsnorm_train_fwd` saves `1/r` per row for `rmsnorm_train_bwd`.
 pub const RMSNORM_TRAIN_SRC: &str = include_str!("../../../kernels/src/rmsnorm_train.hip");
 
+/// Row-softmax forward+backward (fp32) for the un-fused training path.
+/// `softmax_train_fwd` writes p; `softmax_train_bwd` consumes it.
+pub const SOFTMAX_TRAIN_SRC: &str = include_str!("../../../kernels/src/softmax_train.hip");
+
 /// LayerNorm with bias: out = gamma * (x - mean) / sqrt(var + eps) + beta
 /// Grid=[batch], Block=[min(256, n)].
 pub const LAYERNORM_SRC: &str = include_str!("../../../kernels/src/layernorm.hip");
