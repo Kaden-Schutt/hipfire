@@ -34,14 +34,20 @@ rotation is the same routine with sign vectors swapped. Verified.
     teacher↔student gap (CE loss increase + per-token KL) — the gap recovery FT
     must close. (Beam encode is CPU-heavy at model scale; tune beam / parallelize
     with rayon, or quantize a subset first.)
-- **Q1 — distillation loss op.** KL-divergence (and/or logit-MSE) loss, fwd+bwd,
-  finite-difference gradcheck. (We have softmax/CE; KL is a close cousin.)
-- **Q2 — recovery FT loop.** Teacher = fp32 Supra-50M, student = QTIP-dequant.
-  Unfreeze RMSNorm weights (rmsnorm_backward already computes `dw` — currently
-  discarded into a dummy; route it to a trainable param) and optionally add LoRA.
-  AdamW-distill on a small text/calibration set; watch the gap shrink.
+- **Q1 — distillation loss op.** ✅ DONE: `kernels/src/distill_train.hip`,
+  `ops/distill.rs`, `examples/gradcheck_distill.rs` PASS (1.4e-4). KL(teacher‖
+  softmax(student)); d_logits = softmax(student) − teacher_p.
+- **Q2 — recovery FT loop.** ✅ DONE: norm grads threaded out of block/model
+  backward (`BlockLoraGrad` gains dnorm1/dnorm2; `model_distill_backward` +
+  `recovery_params`/`flatten_recovery_grads`). `examples/recovery_ft_supra50m.rs`:
+  QTIP-3 student distilled to fp32 teacher, training LoRA + layernorms (codes
+  frozen). Mean KL **0.915 → 0.0296 nats/token in 120 steps** on gfx1103.
+  QTIP-style tuning works end to end.
+  - Caveat: distills on a FIXED small set (no tokenizer yet) — demonstrates the
+    mechanism; broad coherence needs real calibration text (Q3).
 - **Q3 — coherence.** Tokenizer (Supra ships `tokenizer.json`) + greedy
-  generation from the tuned student; compare to teacher; eyeball coherence.
+  generation from the tuned student over real prompts; distill on real text;
+  compare to teacher; eyeball coherence.
 
 ## Simplifications vs full QTIP (documented, revisit later)
 

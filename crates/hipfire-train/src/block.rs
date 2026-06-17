@@ -65,12 +65,15 @@ pub struct BlockLora<'a> {
     pub bv: &'a GpuTensor,
 }
 
-/// Gradients of the LoRA adapters (same shapes as BlockLora).
+/// Gradients of the trainable block params: LoRA adapters + the two RMSNorm
+/// weights (the layernorms QTIP recovery FT tunes). Base linears stay frozen.
 pub struct BlockLoraGrad {
     pub daq: GpuTensor,
     pub dbq: GpuTensor,
     pub dav: GpuTensor,
     pub dbv: GpuTensor,
+    pub dnorm1: GpuTensor, // [h]
+    pub dnorm2: GpuTensor, // [h]
 }
 
 /// Saved forward activations needed by the backward pass.
@@ -174,7 +177,8 @@ pub fn block_backward(
 ) -> HipResult<(GpuTensor, BlockLoraGrad)> {
     let (seq, h, inter) = (dims.seq, dims.h, dims.inter);
     let (qd, kvd, r) = (dims.q_dim(), dims.kv_dim(), dims.lora_rank);
-    let dw_dummy_h = gpu.zeros(&[h], DType::F32)?; // frozen norm weights: discard dw
+    let dnorm1 = gpu.zeros(&[h], DType::F32)?; // trainable RMSNorm grads
+    let dnorm2 = gpu.zeros(&[h], DType::F32)?;
 
     // ── MLP branch ──────────────────────────────────────────────────────────
     // x_out = x_mid + mlp  ⇒ d_mlp = d_x_out, and d_x_mid starts = d_x_out.
@@ -186,11 +190,11 @@ pub fn block_backward(
     let d_xn2 = gpu.zeros(&[seq * h], DType::F32)?;
     linear_backward_x(gpu, &d_gate, w.wgate, &d_xn2, seq, h, inter, false)?;
     linear_backward_x(gpu, &d_up, w.wup, &d_xn2, seq, h, inter, true)?;
-    // norm2 backward → adds into d_x_mid
+    // norm2 backward → adds into d_x_mid; dnorm2 is the trainable weight grad
     let d_x_mid = gpu.zeros(&[seq * h], DType::F32)?;
     gpu.memcpy_dtod_auto(&d_x_mid.buf, &d_x_out.buf, seq * h * 4)?; // residual
     let d_xmid_norm = gpu.zeros(&[seq * h], DType::F32)?;
-    rmsnorm_backward(gpu, &d_xn2, &acts.x_mid, w.norm2, &acts.rinv2, &d_xmid_norm, &dw_dummy_h, seq, h)?;
+    rmsnorm_backward(gpu, &d_xn2, &acts.x_mid, w.norm2, &acts.rinv2, &d_xmid_norm, &dnorm2, seq, h)?;
     gpu.add_inplace_f32(&d_x_mid, &d_xmid_norm)?;
 
     // ── Attention branch ──────────────────────────────────────────────────────
@@ -221,12 +225,12 @@ pub fn block_backward(
     let dh_v = gpu.zeros(&[seq * r], DType::F32)?;
     lora_backward(gpu, &d_v, &acts.xn1, w.wv, lora.av, lora.bv, &acts.hv, &dyl_v, &dh_v, &dav, &dbv, &d_xn1, seq, h, kvd, r, dims.lora_scale, true)?;
 
-    // norm1 backward → adds into d_x
+    // norm1 backward → adds into d_x; dnorm1 is the trainable weight grad
     let d_x = gpu.zeros(&[seq * h], DType::F32)?;
     gpu.memcpy_dtod_auto(&d_x.buf, &d_x_mid.buf, seq * h * 4)?; // residual
     let d_x_norm = gpu.zeros(&[seq * h], DType::F32)?;
-    rmsnorm_backward(gpu, &d_xn1, x, w.norm1, &acts.rinv1, &d_x_norm, &dw_dummy_h, seq, h)?;
+    rmsnorm_backward(gpu, &d_xn1, x, w.norm1, &acts.rinv1, &d_x_norm, &dnorm1, seq, h)?;
     gpu.add_inplace_f32(&d_x, &d_x_norm)?;
 
-    Ok((d_x, BlockLoraGrad { daq, dbq, dav, dbv }))
+    Ok((d_x, BlockLoraGrad { daq, dbq, dav, dbv, dnorm1, dnorm2 }))
 }

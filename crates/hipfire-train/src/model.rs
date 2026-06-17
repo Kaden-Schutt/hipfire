@@ -10,6 +10,7 @@ use crate::block::{block_backward, block_forward, BlockActivations, BlockDims, B
 use crate::config::LlamaConfig;
 use crate::loader::LlamaWeightsF32;
 use crate::ops::cross_entropy::cross_entropy;
+use crate::ops::distill::distill_kl;
 use crate::ops::linear::{linear_backward_x, linear_forward};
 use crate::ops::rmsnorm::{rmsnorm_backward, rmsnorm_forward};
 use rdna_compute::{DType, Gpu, GpuTensor, HipResult};
@@ -143,6 +144,45 @@ impl LlamaModel {
     pub fn lora_param_sizes(&self) -> Vec<usize> {
         self.lora_params().iter().map(|t| t.shape.iter().product()).collect()
     }
+
+    /// Trainable params for QTIP recovery FT: per layer `[aq,bq,av,bv,norm1,
+    /// norm2]`, then the final norm. Matches `flatten_recovery_grads` order.
+    pub fn recovery_params(&self) -> Vec<&GpuTensor> {
+        let mut v = Vec::with_capacity(self.layers.len() * 6 + 1);
+        for (w, l) in &self.layers {
+            v.push(&l.aq);
+            v.push(&l.bq);
+            v.push(&l.av);
+            v.push(&l.bv);
+            v.push(&w.norm1);
+            v.push(&w.norm2);
+        }
+        v.push(&self.final_norm);
+        v
+    }
+
+    pub fn recovery_param_sizes(&self) -> Vec<usize> {
+        self.recovery_params().iter().map(|t| t.shape.iter().product()).collect()
+    }
+}
+
+/// Flatten recovery grads to match `recovery_params()`: per layer
+/// `[daq,dbq,dav,dbv,dnorm1,dnorm2]`, then `d_final_norm`.
+pub fn flatten_recovery_grads<'a>(
+    grads: &'a [BlockLoraGrad],
+    d_final_norm: &'a GpuTensor,
+) -> Vec<&'a GpuTensor> {
+    let mut v = Vec::with_capacity(grads.len() * 6 + 1);
+    for g in grads {
+        v.push(&g.daq);
+        v.push(&g.dbq);
+        v.push(&g.dav);
+        v.push(&g.dbv);
+        v.push(&g.dnorm1);
+        v.push(&g.dnorm2);
+    }
+    v.push(d_final_norm);
+    v
 }
 
 /// Saved forward state for the backward pass.
@@ -244,6 +284,41 @@ pub fn flatten_lora_grads(grads: &[BlockLoraGrad]) -> Vec<&GpuTensor> {
         v.push(&g.dbv);
     }
     v
+}
+
+/// Distillation forward-loss + backward against a teacher distribution
+/// `teacher_p` `[seq*vocab]` (probabilities). Returns the summed KL, per-layer
+/// grads (LoRA + layernorms), and the final-norm grad. The student's base
+/// linears stay frozen.
+pub fn model_distill_backward(
+    gpu: &mut Gpu,
+    model: &LlamaModel,
+    acts: &ModelActivations,
+    teacher_p: &GpuTensor,
+) -> HipResult<(f32, Vec<BlockLoraGrad>, GpuTensor)> {
+    let (seq, h, vocab) = (model.dims.seq, model.dims.h, model.vocab);
+
+    let loss = gpu.zeros(&[seq], DType::F32)?;
+    let d_logits = gpu.zeros(&[seq * vocab], DType::F32)?;
+    distill_kl(gpu, &acts.logits, teacher_p, &loss, &d_logits, seq, vocab)?;
+    let loss_sum: f32 = gpu.download_f32(&loss)?.iter().sum();
+
+    let d_xf = gpu.zeros(&[seq * h], DType::F32)?;
+    linear_backward_x(gpu, &d_logits, &model.embed, &d_xf, seq, h, vocab, false)?;
+    let d_x_last = gpu.zeros(&[seq * h], DType::F32)?;
+    let d_final_norm = gpu.zeros(&[h], DType::F32)?;
+    rmsnorm_backward(gpu, &d_xf, &acts.x_last, &model.final_norm, &acts.rinv_final, &d_x_last, &d_final_norm, seq, h)?;
+
+    let mut grads: Vec<BlockLoraGrad> = Vec::with_capacity(model.layers.len());
+    let mut d_x = d_x_last;
+    for i in (0..model.layers.len()).rev() {
+        let (lw, ll) = &model.layers[i];
+        let (d_in, g) = block_backward(gpu, &d_x, &acts.layer_inputs[i], &lw.as_block(), &ll.as_block(), &acts.layer_acts[i], &model.dims)?;
+        grads.push(g);
+        d_x = d_in;
+    }
+    grads.reverse();
+    Ok((loss_sum, grads, d_final_norm))
 }
 
 fn clone_tensor(gpu: &mut Gpu, t: &GpuTensor) -> HipResult<GpuTensor> {
