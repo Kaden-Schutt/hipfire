@@ -13,6 +13,7 @@
 //!   standard RMSNorm (weight * x̂, no +1), tie_word_embeddings.
 
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::model_source::ModelSource;
 use serde::Deserialize;
 
 /// Per-layer mixer kind, decoded from `layer_types`.
@@ -257,4 +258,13 @@ impl Lfm2MoeConfig {
             .filter(|&&t| t == MixerKind::Conv)
             .count()
     }
+}
+
+/// Parse Lfm2MoeConfig from a `&dyn ModelSource` (safetensors or HFQ wrapper).
+/// The metadata JSON should contain the `{"architecture":..., "config":{...}}` envelope
+/// as produced by SafetensorsSource::build_metadata_json.
+pub fn config_from_source(source: &dyn ModelSource) -> Option<Lfm2MoeConfig> {
+    let meta: serde_json::Value = serde_json::from_str(source.metadata_json()).ok()?;
+    let inner = meta.get("config")?;
+    Lfm2MoeConfig::from_config_value(inner).ok()
 }

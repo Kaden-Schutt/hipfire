@@ -4664,10 +4664,16 @@ fn load_model_safetensors(
         });
     }
 
-    if arch_id != 5 && arch_id != 6 {
-        return Err(format!("safetensors loading only supports LLaMA/Qwen3 (arch_id 0/1) and Qwen3.5/3.6 (arch_id 5/6), got {arch_id}"));
+    if arch_id != 5 && arch_id != 6 && arch_id != 8 && arch_id != 9 && arch_id != 10 && arch_id != 11
+    {
+        return Err(format!(
+            "safetensors loading only supports LLaMA/Qwen3 (arch_id 0/1), \
+             Qwen3.5/3.6 (arch_id 5/6), dots_ocr (arch_id 8), deepseek4 (arch_id 9), \
+             minimax (arch_id 10), and lfm2moe (arch_id 11), got {arch_id}"
+        ));
     }
 
+    if arch_id == 5 || arch_id == 6 {
     // Parse config (reuse Qwen35's config parser via metadata_json)
     let config = qwen35::config_from_safetensors(&source)
         .ok_or("failed to parse Qwen3.5 config from config.json")?;
@@ -4805,6 +4811,149 @@ fn load_model_safetensors(
         dflash: None,
         chat_template,
     })
+    } else if arch_id == 8 {
+        let config = dots_ocr::DotsOcrConfig::from_source(&source)?;
+        let weights = dots_ocr::DotsOcrWeights::load_weights_from_source(&source, &config, gpu)
+            .map_err(|e| format!("dots_ocr load_weights: {e:?}"))?;
+        let state = qwen2::Qwen2State::new_with_max_seq(gpu, &config.text, max_seq)
+            .map_err(|e| format!("dots_ocr Qwen2State: {e:?}"))?;
+        return Ok(LoadedModel {
+            arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None,
+            pp_dn_la_to_device: None,
+            q35_config: None, q35_weights: None, q35_scratch: None,
+            kv_cache: None, dn_state: None,
+            llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
+            qwen2_config: None, qwen2_weights: None, qwen2_state: Some(state),
+            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None,
+            deepseek4_pbs: None, deepseek4_eos_tok: 0,
+            lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None,
+            lfm2moe_eos_tok: 0,
+            minimax_config: None, minimax_weights: None, minimax_state: None,
+            minimax_eos_tok: 0,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
+            dots_ocr_config: Some(config), dots_ocr_weights: Some(weights),
+            vision_config: None, vision_weights: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0, max_seq, physical_cap: max_seq,
+            eviction: None, kv_adaptive: None,
+            conversation_tokens: Vec::new(),
+            asst_turn_cache: AsstTurnCache::new_from_env(),
+            prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(),
+            decoded_vocab: None, model_path: path.to_string(), dflash: None,
+            chat_template,
+        });
+    } else if arch_id == 9 {
+        let config = deepseek4::config_from_safetensors(&source)
+            .ok_or("failed to parse deepseek4 config")?;
+        let weights = deepseek4::DeepseekV4::load_weights_from_safetensors(&source, &config, gpu)
+            .map_err(|e| format!("deepseek4 load_weights: {e:?}"))?;
+        let state = deepseek4::DeepseekV4State::new(&config)
+            .map_err(|e| format!("deepseek4 state: {e:?}"))?;
+        let eos_tok: u32 = tokenizer
+            .encode("</s>").first().copied()
+            .or_else(|| tokenizer.encode("<|endoftext|>").first().copied())
+            .unwrap_or(1);
+        return Ok(LoadedModel {
+            arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None,
+            pp_dn_la_to_device: None,
+            q35_config: None, q35_weights: None, q35_scratch: None,
+            kv_cache: None, dn_state: None,
+            llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
+            qwen2_config: None, qwen2_weights: None, qwen2_state: None,
+            deepseek4_config: Some(config), deepseek4_weights: Some(weights),
+            deepseek4_state: Some(state), deepseek4_pbs: None,
+            deepseek4_eos_tok: eos_tok,
+            lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None,
+            lfm2moe_eos_tok: 0,
+            minimax_config: None, minimax_weights: None, minimax_state: None,
+            minimax_eos_tok: 0,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
+            dots_ocr_config: None, dots_ocr_weights: None,
+            vision_config: None, vision_weights: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0, max_seq, physical_cap: max_seq,
+            eviction: None, kv_adaptive: None,
+            conversation_tokens: Vec::new(),
+            asst_turn_cache: AsstTurnCache::new_from_env(),
+            prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(),
+            decoded_vocab: None, model_path: path.to_string(), dflash: None,
+            chat_template,
+        });
+    } else if arch_id == 10 {
+        let config = minimax::config_from_safetensors(&source)
+            .ok_or("failed to parse minimax config")?;
+        let weights = minimax::load_weights_from_safetensors(&source, &config, gpu)
+            .map_err(|e| format!("minimax load_weights: {e:?}"))?;
+        let state = minimax::MiniMaxState::new_with_max_seq(gpu, &config, max_seq)
+            .map_err(|e| format!("minimax state: {e:?}"))?;
+        let eos_tok: u32 = tokenizer
+            .encode("[e~[").first().copied()
+            .or_else(|| tokenizer.encode("</s>").first().copied())
+            .unwrap_or(1);
+        return Ok(LoadedModel {
+            arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None,
+            pp_dn_la_to_device: None,
+            q35_config: None, q35_weights: None, q35_scratch: None,
+            kv_cache: None, dn_state: None,
+            llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
+            qwen2_config: None, qwen2_weights: None, qwen2_state: None,
+            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None,
+            deepseek4_pbs: None, deepseek4_eos_tok: 0,
+            lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None,
+            lfm2moe_eos_tok: 0,
+            minimax_config: Some(config), minimax_weights: Some(weights),
+            minimax_state: Some(state), minimax_eos_tok: eos_tok,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
+            dots_ocr_config: None, dots_ocr_weights: None,
+            vision_config: None, vision_weights: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0, max_seq, physical_cap: max_seq,
+            eviction: None, kv_adaptive: None,
+            conversation_tokens: Vec::new(),
+            asst_turn_cache: AsstTurnCache::new_from_env(),
+            prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(),
+            decoded_vocab: None, model_path: path.to_string(), dflash: None,
+            chat_template,
+        });
+    } else if arch_id == 11 {
+        let config = lfm2moe::config_from_source(&source)
+            .ok_or("failed to parse lfm2moe config")?;
+        let weights = lfm2moe::load_weights_from_source(&source, &config, gpu)
+            .map_err(|e| format!("lfm2moe load_weights: {e:?}"))?;
+        let state = lfm2moe::Lfm2MoeState::new_with_max_seq(gpu, &config, max_seq)
+            .map_err(|e| format!("lfm2moe state: {e:?}"))?;
+        let eos_tok: u32 = tokenizer
+            .encode("</s>").first().copied()
+            .or_else(|| tokenizer.encode("<|endoftext|>").first().copied())
+            .unwrap_or(1);
+        return Ok(LoadedModel {
+            arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None,
+            pp_dn_la_to_device: None,
+            q35_config: None, q35_weights: None, q35_scratch: None,
+            kv_cache: None, dn_state: None,
+            llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
+            qwen2_config: None, qwen2_weights: None, qwen2_state: None,
+            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None,
+            deepseek4_pbs: None, deepseek4_eos_tok: 0,
+            lfm2moe_config: Some(config), lfm2moe_weights: Some(weights),
+            lfm2moe_state: Some(state), lfm2moe_eos_tok: eos_tok,
+            minimax_config: None, minimax_weights: None, minimax_state: None,
+            minimax_eos_tok: 0,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
+            dots_ocr_config: None, dots_ocr_weights: None,
+            vision_config: None, vision_weights: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0, max_seq, physical_cap: max_seq,
+            eviction: None, kv_adaptive: None,
+            conversation_tokens: Vec::new(),
+            asst_turn_cache: AsstTurnCache::new_from_env(),
+            prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(),
+            decoded_vocab: None, model_path: path.to_string(), dflash: None,
+            chat_template,
+        });
+    } else {
+        unreachable!()
+    }
 }
 
 /// Multi-GPU pipeline-parallel load path (Stage 7 of #58). Refuses VL,

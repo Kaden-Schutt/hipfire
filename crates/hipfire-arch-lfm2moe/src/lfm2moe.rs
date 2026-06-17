@@ -17,6 +17,7 @@
 use crate::config::{Lfm2MoeConfig, MixerKind};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, KvCache, WeightTensor};
+use hipfire_runtime::model_source::ModelSource;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ───────────────────────── HFQ load helpers ─────────────────────────
@@ -472,7 +473,419 @@ impl Lfm2MoeWeights {
     }
 }
 
-// ──────────────────────────── State ────────────────────────────
+// ─────────────── Source-based load helpers (ModelSource) ──────────────
+
+/// Classify a tensor's byte format. Returns `(is_f16, is_q8_0)` based
+/// on byte-count heuristics. Used when loading from safetensors where
+/// quant_type is not available.
+fn classify_tensor_bytes(bytes: &[u8], numel: usize) -> (bool, bool) {
+    let is_f16 = bytes.len() == numel * 2;
+    // Q8_0: 34 bytes per block of 32 elements:
+    //   [f16 scale (2 bytes)] [32 × i8 (32 bytes)]
+    let q8_0_expected = ((numel + 31) / 32) * 34;
+    let is_q8_0 = !is_f16 && bytes.len() == q8_0_expected;
+    (is_f16, is_q8_0)
+}
+
+/// Determine effective quant_type from a ModelSource tensor.
+/// - HFQ-backed sources preserve quant_type (≠ 0xFF).
+/// - Safetensors (quant_type == 0xFF) use dtype string + byte heuristics.
+fn effective_quant_type(info: &hipfire_runtime::model_source::TensorInfo, data: &[u8]) -> u8 {
+    if info.quant_type != 0xFF {
+        return info.quant_type;
+    }
+    // Safetensors: infer from dtype string.
+    match info.dtype.as_str() {
+        "F16" | "BF16" => 1, // treat BF16 as F16 for byte-size purposes
+        "F32" => 2,
+        "I8" | "INT8" => 3, // Q8_0-compatible raw int8
+        _ => {
+            // Fall back to byte-count heuristics.
+            let numel: usize = info.shape.iter().product();
+            let (is_f16, is_q8_0) = classify_tensor_bytes(data, numel);
+            if is_f16 {
+                1
+            } else if is_q8_0 {
+                3
+            } else {
+                // Unknown; default to F16 and let the upload handle it.
+                1
+            }
+        }
+    }
+}
+
+/// Read raw bytes from a ModelSource with dtype classification.
+/// Returns `(effective_quant_type, &[u8])`.
+fn read_tensor_from_source<'a>(
+    source: &'a dyn ModelSource,
+    name: &str,
+) -> Result<(u8, &'a [u8]), String> {
+    let (info, data) = source
+        .tensor_data(name)
+        .ok_or_else(|| format!("lfm2moe: tensor not found in source: {name}"))?;
+    Ok((effective_quant_type(info, data), data))
+}
+
+/// Load a norm/1D tensor as F32 on GPU from a ModelSource.
+/// Handles F16, BF16, F32, and Q8_0 sources.
+fn load_f32_from_source(
+    source: &dyn ModelSource,
+    gpu: &mut Gpu,
+    name: &str,
+    shape: &[usize],
+) -> Result<GpuTensor, String> {
+    let (qt, data) = read_tensor_from_source(source, name)?;
+    let f32_data: Vec<f32> = match qt {
+        1 => data
+            .chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        2 => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        3 => {
+            // Q8_0: 32-elem blocks [f16 scale | 32 i8]. Dequant to f32.
+            dequant_q8_0(data)
+        }
+        _ => {
+            return Err(format!(
+                "lfm2moe: expected F16/F32/Q8 for {name}, got qt={qt}"
+            ))
+        }
+    };
+    gpu.upload_f32(&f32_data, shape)
+        .map_err(|e| format!("lfm2moe: upload {name}: {e:?}"))
+}
+
+/// Load a quantized 2D weight tensor from a ModelSource, classifying the
+/// format via byte-count heuristics when quant_type is unavailable.
+fn load_wt_from_source(
+    source: &dyn ModelSource,
+    gpu: &mut Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+) -> Result<WeightTensor, String> {
+    let (qt, data) = read_tensor_from_source(source, name)?;
+    wt_from_source_raw(gpu, qt, data, m, k)
+        .map_err(|e| format!("lfm2moe: load_wt_from_source {name}: {e}"))
+}
+
+/// Upload raw bytes as a WeightTensor, determining gpu_dtype from the
+/// (possibly inferred) quant_type.
+fn wt_from_source_raw(
+    gpu: &mut Gpu,
+    qt: u8,
+    data: &[u8],
+    m: usize,
+    k: usize,
+) -> Result<WeightTensor, String> {
+    let dtype = match qt {
+        3 => DType::Q8_0,
+        6 => DType::HFQ4G256,
+        8 => DType::HFQ6G256,
+        13 => DType::MQ4G256,
+        15 => DType::MQ6G256,
+        17 => DType::MQ3G256,
+        18 => DType::MQ2G256,
+        19 => DType::MQ2G256Lloyd,
+        20 => DType::MQ3G256Lloyd,
+        30 => DType::MQ4G256Lloyd,
+        1 => DType::F16,
+        other => return Err(format!("unsupported quant_type {other}")),
+    };
+    let buf = gpu
+        .upload_raw(data, &[data.len()])
+        .map_err(|e| format!("upload_raw: {e:?}"))?;
+    Ok(WeightTensor {
+        buf,
+        gpu_dtype: dtype,
+        m,
+        k,
+        row_stride: 0,
+        paro: None,
+        awq_scale: None,
+    })
+}
+
+/// Load an LFM2 AWQ shared gate_up-scale sidecar from a ModelSource.
+/// Returns None if absent or malformed (non-AWQ models load cleanly).
+fn load_lfm2_awq_scale_from_source(
+    source: &dyn ModelSource,
+    gpu: &mut Gpu,
+    name: &str,
+    k: usize,
+) -> Option<GpuTensor> {
+    let (info, data) = source.tensor_data(name)?;
+    let qt = effective_quant_type(info, data);
+    if qt != 1 {
+        return None;
+    } // 1 = F16
+    if data.len() != k * 2 {
+        eprintln!(
+            "lfm2moe AWQ sidecar {name}: {} bytes != {} (k*2); skipping",
+            data.len(),
+            k * 2
+        );
+        return None;
+    }
+    let f32_data: Vec<f32> = data
+        .chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .collect();
+    let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
+    gpu.upload_raw(&f32_bytes, &[f32_data.len()]).ok()
+}
+
+/// Load full LFM2.5-MoE weights from a `&dyn ModelSource` (safetensors or HFQ).
+/// Mirrors `Lfm2MoeWeights::load` but reads through the ModelSource trait.
+///
+/// Tensor names match those used in the HFQ path. Quantization format is
+/// inferred from byte counts matching the HFQ byte layout.
+pub fn load_weights_from_source(
+    source: &dyn ModelSource,
+    cfg: &Lfm2MoeConfig,
+    gpu: &mut Gpu,
+) -> Result<Lfm2MoeWeights, String> {
+    let hidden = cfg.hidden_size;
+    let q_dim = cfg.q_dim();
+    let kv_dim = cfg.kv_dim();
+    let head_dim = cfg.head_dim;
+    let dense_inter = cfg.intermediate_size;
+    let moe_inter = cfg.moe_intermediate_size;
+    let n_exp = cfg.num_experts;
+    let k_conv = cfg.conv_kernel_size;
+
+    // Globals. embed_tokens is the shared (tied) lm_head.
+    let (_eqt, embed_bytes) = read_tensor_from_source(source, "model.embed_tokens.weight")?;
+    let embed = gpu
+        .upload_raw(embed_bytes, &[embed_bytes.len()])
+        .map_err(|e| format!("lfm2moe: upload embed: {e:?}"))?;
+    let embedding_norm =
+        load_f32_from_source(source, gpu, "model.embedding_norm.weight", &[hidden])?;
+    // lm_head: tied → reuse embed_tokens.weight as a Q8 weight tensor.
+    let lm_head = load_wt_from_source(source, gpu, "model.embed_tokens.weight", cfg.vocab_size, hidden)?;
+
+    let mut conv_state_count = 0usize;
+    let mut kv_count = 0usize;
+
+    let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+    for l in 0..cfg.num_hidden_layers {
+        let p = format!("model.layers.{l}");
+        let operator_norm =
+            load_f32_from_source(source, gpu, &format!("{p}.operator_norm.weight"), &[hidden])?;
+        let ffn_norm =
+            load_f32_from_source(source, gpu, &format!("{p}.ffn_norm.weight"), &[hidden])?;
+
+        // ── Mixer: conv vs attention ──────────────────────────────────
+        let mixer = match cfg.mixer(l) {
+            MixerKind::Conv => {
+                let in_proj = load_wt_from_source(
+                    source,
+                    gpu,
+                    &format!("{p}.conv.in_proj.weight"),
+                    3 * hidden,
+                    hidden,
+                )?;
+                let conv_weight = load_f32_from_source(
+                    source,
+                    gpu,
+                    &format!("{p}.conv.conv.weight"),
+                    &[hidden * k_conv],
+                )?;
+                let out_proj = load_wt_from_source(
+                    source,
+                    gpu,
+                    &format!("{p}.conv.out_proj.weight"),
+                    hidden,
+                    hidden,
+                )?;
+                let conv_state_idx = conv_state_count;
+                conv_state_count += 1;
+                Mixer::Conv(ConvWeights {
+                    in_proj,
+                    conv_weight,
+                    out_proj,
+                    conv_state_idx,
+                })
+            }
+            MixerKind::Attention => {
+                let wq = load_wt_from_source(
+                    source,
+                    gpu,
+                    &format!("{p}.self_attn.q_proj.weight"),
+                    q_dim,
+                    hidden,
+                )?;
+                let wk = load_wt_from_source(
+                    source,
+                    gpu,
+                    &format!("{p}.self_attn.k_proj.weight"),
+                    kv_dim,
+                    hidden,
+                )?;
+                let wv = load_wt_from_source(
+                    source,
+                    gpu,
+                    &format!("{p}.self_attn.v_proj.weight"),
+                    kv_dim,
+                    hidden,
+                )?;
+                let wo = load_wt_from_source(
+                    source,
+                    gpu,
+                    &format!("{p}.self_attn.out_proj.weight"),
+                    hidden,
+                    q_dim,
+                )?;
+                let q_norm = load_f32_from_source(
+                    source,
+                    gpu,
+                    &format!("{p}.self_attn.q_layernorm.weight"),
+                    &[head_dim],
+                )?;
+                let k_norm = load_f32_from_source(
+                    source,
+                    gpu,
+                    &format!("{p}.self_attn.k_layernorm.weight"),
+                    &[head_dim],
+                )?;
+                let kv_idx = kv_count;
+                kv_count += 1;
+                Mixer::Attention(AttnWeights {
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    q_norm,
+                    k_norm,
+                    kv_idx,
+                })
+            }
+        };
+
+        // ── FFN: dense SwiGLU vs top-4 MoE ────────────────────────────
+        let ffn = if cfg.is_dense_ffn(l) {
+            let w1 = load_wt_from_source(
+                source,
+                gpu,
+                &format!("{p}.feed_forward.w1.weight"),
+                dense_inter,
+                hidden,
+            )?;
+            let w3 = load_wt_from_source(
+                source,
+                gpu,
+                &format!("{p}.feed_forward.w3.weight"),
+                dense_inter,
+                hidden,
+            )?;
+            let w2 = load_wt_from_source(
+                source,
+                gpu,
+                &format!("{p}.feed_forward.w2.weight"),
+                hidden,
+                dense_inter,
+            )?;
+            Ffn::Dense(DenseFfn { w1, w3, w2 })
+        } else {
+            let router = load_wt_from_source(
+                source,
+                gpu,
+                &format!("{p}.feed_forward.gate.weight"),
+                n_exp,
+                hidden,
+            )?;
+            let expert_bias =
+                load_f32_from_source(source, gpu, &format!("{p}.feed_forward.expert_bias"), &[n_exp])?;
+            // Byte-fuse w1‖w3 → gate_up [2*moe_inter, hidden]; w2 → down.
+            let mut experts = Vec::with_capacity(n_exp);
+            for e in 0..n_exp {
+                let ep = format!("{p}.feed_forward.experts.{e}");
+                let (qt1, w1) = read_tensor_from_source(source, &format!("{ep}.w1.weight"))?;
+                let (_qt3, w3) = read_tensor_from_source(source, &format!("{ep}.w3.weight"))?;
+                let mut gate_up_bytes: Vec<u8> = w1.to_vec();
+                gate_up_bytes.extend_from_slice(w3);
+                let mut gate_up =
+                    wt_from_source_raw(gpu, qt1, &gate_up_bytes, 2 * moe_inter, hidden)
+                        .map_err(|e2| format!("lfm2moe: fuse gate_up L{l}E{e}: {e2}"))?;
+                let (qt2, w2) = read_tensor_from_source(source, &format!("{ep}.w2.weight"))?;
+                let mut down = wt_from_source_raw(gpu, qt2, w2, hidden, moe_inter)
+                    .map_err(|e2| format!("lfm2moe: down L{l}E{e}: {e2}"))?;
+                // AWQ scales: shared per layer, emitted once on expert 0.
+                if e == 0 {
+                    gate_up.awq_scale = load_lfm2_awq_scale_from_source(
+                        source,
+                        gpu,
+                        &format!("{p}.feed_forward.awq_scale_gate_up.weight"),
+                        hidden,
+                    );
+                    if gate_up.awq_scale.is_some() {
+                        eprintln!(
+                            "lfm2moe: AWQ gate_up scale attached at {p} (expert-0 representative)"
+                        );
+                    }
+                    down.awq_scale = load_lfm2_awq_scale_from_source(
+                        source,
+                        gpu,
+                        &format!("{p}.feed_forward.awq_scale_down.weight"),
+                        moe_inter,
+                    );
+                    if down.awq_scale.is_some() {
+                        eprintln!(
+                            "lfm2moe: AWQ down scale attached at {p} (expert-0 representative)"
+                        );
+                    }
+                }
+                experts.push(ExpertWeights { gate_up, down });
+            }
+            let gu_bytes: Vec<u8> = experts
+                .iter()
+                .flat_map(|e| (e.gate_up.buf.buf.as_ptr() as u64).to_ne_bytes())
+                .collect();
+            let dn_bytes: Vec<u8> = experts
+                .iter()
+                .flat_map(|e| (e.down.buf.buf.as_ptr() as u64).to_ne_bytes())
+                .collect();
+            let expert_gate_up_ptrs = gpu
+                .alloc_tensor(&[2 * n_exp], DType::F32)
+                .map_err(|e| format!("lfm2moe: alloc gu_ptrs: {e:?}"))?;
+            let expert_down_ptrs = gpu
+                .alloc_tensor(&[2 * n_exp], DType::F32)
+                .map_err(|e| format!("lfm2moe: alloc dn_ptrs: {e:?}"))?;
+            gpu.hip
+                .memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)
+                .map_err(|e| format!("lfm2moe: htod gu_ptrs: {e:?}"))?;
+            gpu.hip
+                .memcpy_htod(&expert_down_ptrs.buf, &dn_bytes)
+                .map_err(|e| format!("lfm2moe: htod dn_ptrs: {e:?}"))?;
+            Ffn::Moe(MoeFfn {
+                router,
+                expert_bias,
+                experts,
+                expert_gate_up_ptrs,
+                expert_down_ptrs,
+            })
+        };
+
+        layers.push(Lfm2MoeLayerWeights {
+            operator_norm,
+            ffn_norm,
+            mixer,
+            ffn,
+        });
+    }
+
+    let _ = (conv_state_count, kv_count);
+    Ok(Lfm2MoeWeights {
+        embed,
+        embedding_norm,
+        lm_head,
+        layers,
+    })
+}
 
 /// Per-decode GPU scratch + KV cache (attention layers) + conv-state cache
 /// (conv layers). Buffers are eager-allocated.

@@ -17,13 +17,15 @@
 //!   * dense MLP   -> Q8 SwiGLU (w1 gate, w3 up, silu_mul, w2 down)
 //!   * LIV conv    -> conv1d_gated_decode_f32 (NEW: K=3, fused B*x / C*conv_out
 //!                    gates + rolling conv-state cache)
+pub mod arch;
 pub mod config;
 pub mod forward;
 pub mod lfm2moe;
 
-pub use config::{Lfm2MoeConfig, MixerKind};
+pub use arch::Lfm2Moe;
+pub use config::{config_from_source, Lfm2MoeConfig, MixerKind};
 pub use forward::{decode_step, decode_step_capture};
-pub use lfm2moe::{Lfm2MoeState, Lfm2MoeWeights};
+pub use lfm2moe::{load_weights_from_source, Lfm2MoeState, Lfm2MoeWeights};
 
 /// Architecture id for LFM2.5-MoE.
 pub const ARCH_ID: u32 = 11;
