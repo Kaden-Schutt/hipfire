@@ -52,9 +52,26 @@ rotation is the same routine with sign vectors swapped. Verified.
     Middle Ages, the Roman Empire was a powerful … force that had a profound
     impact on the world"). This validates the ENTIRE hipfire-train fp32 forward
     against real output — strongest end-to-end check yet, beyond gradchecks.
-  - TODO step 2: distill the QTIP student on real text (encode a corpus with the
-    tokenizer), then generate from the student BEFORE vs AFTER recovery FT and
-    compare to the teacher — the actual coherence-recovery demonstration.
+  - ✅ step 2: `examples/coherence_recovery_supra50m.rs` — QTIP-3 student
+    distilled on a real (Roman-history) corpus vs the fp32 teacher. Corpus KL
+    0.367 → 0.0215 over 120 steps. Greedy continuations of "The Roman Empire was":
+    - TEACHER: "established in 27 AD … divided into two major territories: the
+      Eastern and Western Roman Empire."
+    - STUDENT before recovery: coherent-ish but loops ("…and the East and the
+      West. … The East was the Western Roman Empire and the West") + a factual
+      flip — the QTIP degradation.
+    - STUDENT after recovery: "established by the Senate … in 27 AD …" —
+      grammatical, on-topic, picks up the teacher's "established … in 27 AD"
+      content; recovers from the before-loop. Still small-model artifacts (Senate
+      loop) — expected at 50M @ 3-bit.
+
+  **PHASE 2 COMPLETE** — QTIP-style recovery tuning works end to end: quantize →
+  measure damage → distill (codes frozen, LoRA+layernorms tuned) → coherent
+  generation, with recovery measurably improving the quantized student. Honest
+  scope: at 50M @ 3-bit on a 133-token corpus the gain is incremental (the raw
+  student was already semi-coherent), not rescue-from-gibberish — but the
+  mechanism is proven and would scale to bigger models / lower bpw / more
+  calibration text.
 
 ## Simplifications vs full QTIP (documented, revisit later)
 
