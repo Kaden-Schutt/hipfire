@@ -137,6 +137,29 @@ Protection recovers ~half the sim-path coherence gap toward mq4 ⇒ helps, doesn
 hurt (confirms the phase2h retraction). NB: the sim-path itself (rq-mq4path) still
 degrades vs real mq4 → absolute coherence needs the real packed format.
 
+## Finding: does diag(H) rank the TAIL? (not just the outliers) — yes, weakly
+
+Control (`HIPFIRE_RQ4_BULK=void`, `HIPFIRE_RQ4_INVERT` for top): void the
+diag-BOTTOM-k vs RANDOM-k vs diag-TOP-k, KLD damage:
+
+| void % (ch) | diag-bottom | random (2 seeds) | diag-top |
+|---|---|---|---|
+| 0.2% (2)  | 0.0060 | 0.0064 / 0.0072 | — |
+| 0.5% (5)  | 0.0138 | 0.0188 / 0.0175 | — |
+| 1.0% (10) | 0.0285 | 0.0447 / 0.0413 | — |
+| 2%  (20)  | 0.070  | 0.099           | — |
+| 5%  (51)  | 0.216  | 0.321           | 7.67 |
+
+- diag-bottom < random at EVERY fraction (~25–33% less damage ≥0.5%) and
+  diag-top is ~35× worse ⇒ **diag orders the whole spectrum, tail included.**
+- BUT the tail gradient is SHALLOW (~30% gap) vs the top (35× gap / KLD-halving);
+  at 0.2% (2 ch) diag ≈ random. So diag is decisive at the top, weakly-but-real at
+  the tail ⇒ room for a better metric (OBS/Fisher) at the tail. Motivates the
+  importance-metric exploration; validates the graded-tier premise.
+- Note: turnaround profiling — mq4-path quantize is **2.5s** (eval-bound, ~50s
+  KLD), so GPU-quant is unnecessary for the importance sweep (reserve for
+  PCA/cross-model). Measure-first win.
+
 ## Finding: the 5 permutations — bijectivity verified
 
 `scripts/roughquant_permute_verify.py` + `docs/roughquant/permutation-bijectivity.md`:

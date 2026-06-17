@@ -9752,14 +9752,26 @@ fn main() {
                 *e = (z as f64) / (u64::MAX as f64);
             }
         }
+        // HIPFIRE_RQ4_INVERT=1: protect the LOWEST-saliency channels instead of the
+        // highest. Used by the TAIL-RANKING control: with bulk=void + protect_frac
+        // high (e.g. 0.95), the non-protected (voided) set is the BOTTOM (1-frac)
+        // by the chosen metric; INVERT flips it so the voided set is the TOP. If
+        // void-bottom (our metric) hurts LESS than void-random and void-top hurts
+        // MOST, the metric ranks the tail correctly (not just the outliers).
+        let invert_select = std::env::var("HIPFIRE_RQ4_INVERT").ok().as_deref() == Some("1");
         // Top residual channels (shared across readers' cols and writers' rows).
         let n_prot_resid = ((protect_frac * dmodel as f64).round() as usize).min(dmodel);
         let protected_resid: Vec<usize> = {
             let mut idx: Vec<usize> = (0..dmodel).collect();
             idx.sort_unstable_by(|&a, &b| {
-                resid_energy[b]
+                let o = resid_energy[b]
                     .partial_cmp(&resid_energy[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .unwrap_or(std::cmp::Ordering::Equal);
+                if invert_select {
+                    o.reverse()
+                } else {
+                    o
+                }
             });
             idx.truncate(n_prot_resid);
             idx
@@ -9852,9 +9864,14 @@ fn main() {
                         .collect();
                     let mut idx: Vec<usize> = (0..k).collect();
                     idx.sort_unstable_by(|&a, &b| {
-                        sal[b]
+                        let o = sal[b]
                             .partial_cmp(&sal[a])
-                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .unwrap_or(std::cmp::Ordering::Equal);
+                        if invert_select {
+                            o.reverse()
+                        } else {
+                            o
+                        }
                     });
                     idx.truncate(((protect_frac * k as f64).round() as usize).min(k));
                     idx
