@@ -4481,6 +4481,48 @@ fn rq_apply_writer(
     Ok(())
 }
 
+/// Build the calibration capture map: device-buffer-pointer → canonical .hfq
+/// tensor name (matching the HFHS/imatrix key convention,
+/// `model.language_model.layers.{i}.{role}`, no `.weight` suffix), for every
+/// residual-linear weight. The forward's gemv arms resolve their weight buffer
+/// pointer through this map to attribute captured activations. No loader change —
+/// walks the typed `Qwen35Weights`. Set `gpu.capture_names` to this before arming
+/// `gpu.active_capture`.
+pub fn build_capture_names(weights: &Qwen35Weights) -> std::collections::HashMap<usize, String> {
+    let mut m = std::collections::HashMap::new();
+    let mut put = |wt: &WeightTensor, name: String| {
+        m.insert(wt.buf.buf.as_ptr() as usize, name);
+    };
+    for (i, layer) in weights.layers.iter().enumerate() {
+        let p = format!("model.language_model.layers.{i}");
+        match layer {
+            LayerWeights::DeltaNet(l) => {
+                put(&l.wqkv, format!("{p}.linear_attn.in_proj_qkv"));
+                put(&l.wz, format!("{p}.linear_attn.in_proj_z"));
+                put(&l.w_alpha, format!("{p}.linear_attn.in_proj_a"));
+                put(&l.w_beta, format!("{p}.linear_attn.in_proj_b"));
+                put(&l.wo, format!("{p}.linear_attn.out_proj"));
+                put(&l.w_gate, format!("{p}.mlp.gate_proj"));
+                put(&l.w_up, format!("{p}.mlp.up_proj"));
+                put(&l.w_down, format!("{p}.mlp.down_proj"));
+            }
+            LayerWeights::FullAttn(l) => {
+                put(&l.wq, format!("{p}.self_attn.q_proj"));
+                put(&l.wk, format!("{p}.self_attn.k_proj"));
+                put(&l.wv, format!("{p}.self_attn.v_proj"));
+                put(&l.wo, format!("{p}.self_attn.o_proj"));
+                put(&l.w_gate, format!("{p}.mlp.gate_proj"));
+                put(&l.w_up, format!("{p}.mlp.up_proj"));
+                put(&l.w_down, format!("{p}.mlp.down_proj"));
+            }
+            // MoE variants: dense attn weights + per-expert FFN; experts are
+            // paged/aliased, so calibration of MoE FFN is a later extension.
+            LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => {}
+        }
+    }
+    m
+}
+
 pub fn load_weights(
     hfq: &mut HfqFile,
     config: &Qwen35Config,

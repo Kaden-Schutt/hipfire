@@ -385,21 +385,22 @@ impl DType {
 pub trait ActivationCapture: Send + Sync {
     /// Called by linear-layer dispatch arms when calibration is active.
     ///
-    /// `tensor_name` — canonical .hfq / GGUF tensor name.
-    /// `input_ptr`   — device pointer to the input activation tensor.
-    /// `numel`       — number of elements at `input_ptr` (NOT bytes).
-    /// `dtype`       — element type of the captured activation.
-    /// `shape`       — full activation shape (e.g. `[batch, K]` for the
-    ///                 input of a `[K, M]` linear). Borrowed; do NOT
-    ///                 retain past the call.
-    fn capture(
-        &mut self,
-        tensor_name: &str,
-        input_ptr: *const c_void,
-        numel: usize,
-        dtype: DType,
-        shape: &[usize],
-    );
+    /// `gpu`         — the dispatcher, so the collector can run its on-GPU
+    ///                 reduction kernels (`calib_sumsq_reduce_f32` /
+    ///                 `calib_hessian_outer_f32`). Safe to take `&mut Gpu`:
+    ///                 the dispatch site clones the collector `Arc` before
+    ///                 calling, so `gpu.active_capture` is not aliased here.
+    /// `tensor_name` — canonical .hfq / GGUF tensor name (resolved from the
+    ///                 weight buffer pointer via `gpu.capture_names`).
+    /// `input`       — the input-activation buffer (borrowed; do NOT retain past
+    ///                 the call). NOTE its `.shape` may be a shared scratch sized
+    ///                 to `max(dim, hidden)`, so it is NOT a reliable source of
+    ///                 `k`/`n` — use the passed `n`/`k` instead.
+    /// `n`           — number of activation rows (tokens / batch) this call.
+    /// `k`           — the linear's input dim (the meaningful width of each row).
+    /// Interior mutability (`&self`) lets the collector accumulate without an
+    /// exclusive borrow.
+    fn capture(&self, gpu: &mut Gpu, tensor_name: &str, input: &GpuTensor, n: usize, k: usize);
 }
 
 /// High-level GPU context. Owns the HIP runtime, compiler, and loaded kernels.
@@ -416,6 +417,18 @@ pub struct Gpu {
     modules: HashMap<String, hip_bridge::Module>,
     functions: HashMap<String, hip_bridge::Function>,
     pool: crate::pool::GpuPool,
+    /// Calibration activation capture (Tier-1 collector). When `Some`, the
+    /// instrumented linear dispatch arms (`gemv_f16_xf32`, `fused_qkvza_f16_xf32`,
+    /// `fused_gate_up_f16_xf32`) resolve their weight buffer pointer to a tensor
+    /// name via `capture_names` and invoke `capture()` with the input activation.
+    /// `None` (the default) ⇒ the check is a single `is_none()` and forwards are
+    /// byte-identical. The collector is held by `Arc` so the dispatch site can
+    /// clone it (breaking the borrow on `self`) before calling `capture(self, …)`.
+    pub active_capture: Option<Arc<dyn ActivationCapture>>,
+    /// Weight-buffer-pointer → canonical tensor name, populated by the loader
+    /// when calibration is armed. Lets capture fire from ANY forward path
+    /// (hand or lowered, fused or not) keyed by the weight the gemv received.
+    pub capture_names: HashMap<usize, String>,
     /// When set, all kernel launches go to this stream instead of null stream.
     pub active_stream: Option<hip_bridge::Stream>,
     /// Task #93 Phase A (2026-04-24): optional secondary streams for
@@ -821,6 +834,8 @@ impl Gpu {
             modules: HashMap::new(),
             functions: HashMap::new(),
             pool: crate::pool::GpuPool::new(),
+            active_capture: None,
+            capture_names: HashMap::new(),
             active_stream: None,
             draft_stream: None,
             verify_stream: None,
@@ -26025,6 +26040,10 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Calibration capture: this is the F16/BF16 linear chokepoint the lowered
+        // super-op path routes through (GemvFamily K::GemvF16), so capturing here
+        // fires for the resident bf16 calibration forward. No-op when unarmed.
+        self.maybe_capture_activation(w_f16, x, batch_size, k);
         if !self.arch_caps.has_wmma_w32() {
             // No mw16 WMMA on non-RDNA3. The generic F16 GEMM writes [M,N],
             // while lm_head consumers expect [N,M], so preserve layout by
@@ -31158,6 +31177,34 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    /// Calibration capture hook for an instrumented linear: if a collector is
+    /// armed and `weight`'s buffer pointer is a known calibration target, invoke
+    /// `capture(name, input)`. Zero-cost (`is_none()` + return) when no collector
+    /// is armed, so non-calibration forwards are byte-identical. The collector
+    /// `Arc` is cloned before the call so `self` is not aliased by `active_capture`.
+    #[inline]
+    pub fn maybe_capture_activation(
+        &mut self,
+        weight: &GpuTensor,
+        input: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) {
+        // bind_thread: skip — launches no kernel itself; the collector's capture()
+        // calls calib_*_reduce_f32, which bind_thread on their own.
+        if self.active_capture.is_none() {
+            return;
+        }
+        let ptr = weight.buf.as_ptr() as usize;
+        let name = match self.capture_names.get(&ptr) {
+            Some(nm) => nm.clone(),
+            None => return,
+        };
+        if let Some(cap) = self.active_capture.clone() {
+            cap.capture(self, &name, input, n, k);
+        }
     }
 
     /// Calibration: `acc[c] += Σ_n x[n,c]²` (per-column sum-of-squares, the
@@ -43648,6 +43695,10 @@ impl Gpu {
         batch_size: usize,
         profile_label: &'static str,
     ) -> HipResult<()> {
+        // Calibration capture: the BF16 linear chokepoint (the lowered super-op
+        // path's bf16 gemv funnels here via gemm_bf16_x_bf16_wmma). Captures the
+        // input activation before the compute. No-op when unarmed.
+        self.maybe_capture_activation(a_bf16, x_f32, batch_size, k);
         if self.arch == "gfx1151"
             && m >= 128
             && batch_size >= 16
@@ -44746,14 +44797,16 @@ impl Gpu {
             b
         };
 
-        self.launch_maybe_blob(
+        let r = self.launch_maybe_blob(
             "gemv_f16_xf32",
             [m as u32, 1, 1],
             [32, 1, 1],
             0,
             &mut params,
             blob_builder,
-        )
+        );
+        self.maybe_capture_activation(weight, x, 1, k);
+        r
     }
 
     /// F16-weight × F32-input GEMV with fused residual add.
@@ -44913,7 +44966,7 @@ impl Gpu {
             &k_val as *const _ as *mut c_void,
         ];
         let total = mqkv + mz + mbeta + malpha;
-        self.launch_maybe_blob(
+        let r = self.launch_maybe_blob(
             "fused_qkvza_f16_xf32",
             [total as u32, 1, 1],
             [32, 1, 1],
@@ -44937,7 +44990,13 @@ impl Gpu {
                 b.push_i32(k_val);
                 b
             },
-        )
+        );
+        // All four fused projections share input x → capture x per weight.
+        self.maybe_capture_activation(wqkv, x, 1, k);
+        self.maybe_capture_activation(wz, x, 1, k);
+        self.maybe_capture_activation(wbeta, x, 1, k);
+        self.maybe_capture_activation(walpha, x, 1, k);
+        r
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -45067,7 +45126,7 @@ impl Gpu {
             &k_val as *const _ as *mut c_void,
         ];
         let total = mgate + mup;
-        self.launch_maybe_blob(
+        let r = self.launch_maybe_blob(
             "fused_gate_up_f16_xf32",
             [total as u32, 1, 1],
             [32, 1, 1],
@@ -45085,7 +45144,11 @@ impl Gpu {
                 b.push_i32(k_val);
                 b
             },
-        )
+        );
+        // gate + up share input x → capture x per weight.
+        self.maybe_capture_activation(wgate, x, 1, k);
+        self.maybe_capture_activation(wup, x, 1, k);
+        r
     }
 
     #[allow(clippy::too_many_arguments)]
