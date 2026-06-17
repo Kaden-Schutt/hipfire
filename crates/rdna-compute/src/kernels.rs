@@ -3207,6 +3207,10 @@ pub const ROPE_TRAIN_SRC: &str = include_str!("../../../kernels/src/rope_train.h
 pub const CAUSAL_MASK_TRAIN_SRC: &str =
     include_str!("../../../kernels/src/causal_mask_train.hip");
 
+/// Strided 2D copy / scatter-add (fp32) — GQA gather/scatter primitive.
+pub const STRIDED_COPY_2D_SRC: &str =
+    include_str!("../../../kernels/src/strided_copy_2d.hip");
+
 /// LayerNorm with bias: out = gamma * (x - mean) / sqrt(var + eps) + beta
 /// Grid=[batch], Block=[min(256, n)].
 pub const LAYERNORM_SRC: &str = include_str!("../../../kernels/src/layernorm.hip");

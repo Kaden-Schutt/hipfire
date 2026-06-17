@@ -193,6 +193,14 @@ cosine schedule + 10% warmup, **global-norm grad clip at 1.0**.
 - **M2 — full-graph gradient check.** End-to-end fp32 model, finite-difference
   check on LoRA params (and one base param via a temporarily-unfrozen linear)
   for a 1–2 token toy input.
+  - **LoRA op** ✅ DONE: `ops/lora.rs`, gradcheck dA/dB/dX ≈1e-5.
+  - **single-head causal SDPA** ✅ DONE: `ops/attention.rs` sdpa_*,
+    `causal_mask_train.hip`, gradcheck dQ/dK/dV ≈6–8e-5.
+  - **GQA multi-head** ✅ DONE: gqa_forward/gqa_backward via gather/scatter
+    (`strided_copy_2d.hip`, scatter-add for shared kv heads),
+    gradcheck dQ 6.2e-5 / dK 9.4e-5 / dV 7.8e-5 with n_heads=4,n_kv=2.
+  - TODO: full transformer block (norm→attn proj+LoRA→residual→norm→swiglu
+    MLP→residual) → full model fwd+bwd → end-to-end LoRA gradcheck.
 - **M3 — AdamW overfit.** LoRA on q_proj/v_proj, ~50 examples → loss → ~0.
   THE success criterion.
 - **M4 — directional vs PyTorch.** Few-thousand-example run trends like

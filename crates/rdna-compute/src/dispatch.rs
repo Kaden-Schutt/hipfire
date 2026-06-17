@@ -40762,6 +40762,49 @@ impl Gpu {
         }
     }
 
+    /// Strided 2D copy (fp32): `dst[dst_off+r*dst_stride+c] (+=|=) src[...]`.
+    /// `accumulate` selects scatter-add. Element units throughout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn strided_copy_2d(
+        &mut self,
+        src: &GpuTensor,
+        src_off: usize,
+        src_stride: usize,
+        dst: &GpuTensor,
+        dst_off: usize,
+        dst_stride: usize,
+        rows: usize,
+        cols: usize,
+        accumulate: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("strided_copy_2d", kernels::STRIDED_COPY_2D_SRC, "strided_copy_2d")?;
+        let func = &self.functions["strided_copy_2d"];
+        let mut sp = src.buf.as_ptr();
+        let mut so = src_off as i32;
+        let mut ss = src_stride as i32;
+        let mut dp = dst.buf.as_ptr();
+        let mut do_ = dst_off as i32;
+        let mut ds = dst_stride as i32;
+        let mut rr = rows as i32;
+        let mut cc = cols as i32;
+        let mut acc = accumulate as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut sp as *mut _ as *mut c_void,
+            &mut so as *mut _ as *mut c_void,
+            &mut ss as *mut _ as *mut c_void,
+            &mut dp as *mut _ as *mut c_void,
+            &mut do_ as *mut _ as *mut c_void,
+            &mut ds as *mut _ as *mut c_void,
+            &mut rr as *mut _ as *mut c_void,
+            &mut cc as *mut _ as *mut c_void,
+            &mut acc as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(func, [rows as u32, 1, 1], [64, 1, 1], 0, self.stream_ref(), &mut params)
+        }
+    }
+
     /// LayerNorm with bias (batched): out = gamma * (x - mean) / sqrt(var + eps) + beta
     pub fn layernorm_batched(
         &mut self,
