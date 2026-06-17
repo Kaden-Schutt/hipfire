@@ -45,9 +45,16 @@ rotation is the same routine with sign vectors swapped. Verified.
   QTIP-style tuning works end to end.
   - Caveat: distills on a FIXED small set (no tokenizer yet) — demonstrates the
     mechanism; broad coherence needs real calibration text (Q3).
-- **Q3 — coherence.** Tokenizer (Supra ships `tokenizer.json`) + greedy
-  generation from the tuned student over real prompts; distill on real text;
-  compare to teacher; eyeball coherence.
+- **Q3 — coherence.** IN PROGRESS.
+  - ✅ step 1: tokenizer (`hipfire_model::tokenizer::Tokenizer`, no new dep) +
+    greedy generation. `examples/generate_supra50m.rs`: the fp32 teacher
+    generates COHERENT English ("…a fascinating and complex topic. In the late
+    Middle Ages, the Roman Empire was a powerful … force that had a profound
+    impact on the world"). This validates the ENTIRE hipfire-train fp32 forward
+    against real output — strongest end-to-end check yet, beyond gradchecks.
+  - TODO step 2: distill the QTIP student on real text (encode a corpus with the
+    tokenizer), then generate from the student BEFORE vs AFTER recovery FT and
+    compare to the teacher — the actual coherence-recovery demonstration.
 
 ## Simplifications vs full QTIP (documented, revisit later)
 
