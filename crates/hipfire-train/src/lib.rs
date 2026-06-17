@@ -16,6 +16,7 @@ pub mod loader;
 pub mod model;
 pub mod ops;
 pub mod optim;
+pub mod qtip_quant;
 pub mod tensor;
 
 pub use config::LlamaConfig;
