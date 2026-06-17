@@ -137,3 +137,45 @@ imports under deltanet,experimental-examples; would need a fix or a thin harness
 over the detectors.) If bf16-protection passes the battery AND a fair iso-bit
 coherence comparison vs mq4, it's a candidate; otherwise RoughQuant stays
 non-deployable on 0.8B.
+
+## RETRACTION of the coherence falsification (user was right)
+
+The "coherence falsification" above was a DOUBLE CONFOUND, not the protection:
+
+1. **Q8 DeltaNet state**: `infer_qwen35` defaults to the quantized DeltaNet state
+   (fp32 only with `FP32_STATE=1`). Qwen3.5-0.8b attractors under Q8 state on
+   complex prompts (from the first token). My coherence runs used the Q8 default.
+2. **Sim-path fidelity**: rq-mq4path (my roughquant4 path at protect-0%, which
+   MUST equal mq4) generates measurably worse than real mq4 — the bf16-baked
+   effective-weight sim (4-bit → inverse-FWHT → bf16 re-round) diverges from the
+   real packed mq4 GEMV in generation, though it matches PPL/KLD (teacher-forced).
+
+Coherence battery (FP32 state, 8 prompts, protect-0% control):
+
+| model | avg uniq↑ | 5gram-rep↓ |
+|---|---|---|
+| mq4 (real)              | 0.344 | 0.387 |
+| rq-mq4path (sim, p=0)   | 0.263 | 0.517 |
+| rq-protect5bf16 (sim)   | 0.300 | 0.465 |
+
+**Protection HELPS coherence** (protect-5% beats the protect-0% control, toward
+mq4) — strictly-more-precise weights can only help, as the user argued. The
+degradation is entirely the sim-path (rq-mq4path << mq4), which affects all sim
+variants equally, so protection's RELATIVE benefit is clear.
+
+## Corrected verdict (final, user-reconciled)
+
+Protection (shared ~75-channel outlier set, bf16) genuinely improves BOTH
+teacher-forced KLD (halves mq4's, +0.6 bits) AND coherence (relative to the same
+path). The earlier negatives were artifacts (zeroing bug, energy-aggregation,
+Q8-state, sim-path fidelity, PPL noise) — every one surfaced by user skepticism.
+Q8 *weight*-protection is the only genuine casualty (it does degrade vs bf16, and
+its catastrophic loops were the Q8-state confound stacked on top).
+
+Remaining for a SHIPPABLE win (the bf16-sim cannot settle these):
+- Real packed format (mq4 bulk + bf16/Q8 sidecar for ~75 shared channels) + the
+  offline fold, evaluated through the real GEMV (not the bf16 sim) for honest
+  absolute coherence + perf.
+- Fix or replace the bf16-sim generation-fidelity gap (or just evaluate via the
+  real format).
+- Cross-model (7B/9B).
