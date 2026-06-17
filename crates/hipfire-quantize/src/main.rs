@@ -47,6 +47,8 @@ mod hessian_io;
 mod kvarn;
 // Tiny random-init model fixtures for fast kernel/plumbing gating.
 mod fixture;
+// RoughQuant Phase 2 — PCA rotation into the activation-Hessian eigenbasis.
+mod roughquant;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -976,6 +978,53 @@ fn qtip_simquant_nbit(
             cpu_fwht_256(&mut deq, signs2, signs1); // inverse rotate (swap signs)
             seg.copy_from_slice(&deq);
         }
+    });
+}
+
+/// QTIP-trellis the bulk after RoughQuant PCA rotation, protecting the leading
+/// `n_prot` columns (PCA-sorted by eigenvalue descending → highest-energy first)
+/// at full precision with PER-COLUMN granularity. The protected columns are
+/// saved and zeroed before the per-256-group FWHT+trellis so their large values
+/// don't inflate the group scale (which would coarsen the bulk grid), then
+/// restored exactly afterward. Parallel over rows.
+///
+/// Correctness: in the rotated frame y = W̃·x̃ = Σ_j W̃[:,j]·x̃[j]. After this
+/// pass the protected columns carry exact W̃ values and the bulk carries the
+/// trellis reconstruction, so the protected subspace contributes zero error and
+/// only the bulk is quantized — exactly the RoughQuant split.
+fn qtip_simquant_protected(
+    f32_data: &mut [f32],
+    k: usize,
+    n_prot: usize,
+    cb: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+    bits: u32,
+) {
+    use rayon::prelude::*;
+    let groups = k / 256;
+    if groups == 0 {
+        return;
+    }
+    let n_prot = n_prot.min(k);
+    f32_data.par_chunks_mut(k).for_each(|row| {
+        let saved: Vec<f32> = row[..n_prot].to_vec();
+        for c in 0..n_prot {
+            row[c] = 0.0;
+        }
+        for g in 0..groups {
+            let seg = &mut row[g * 256..g * 256 + 256];
+            let mut grp = [0.0f32; 256];
+            grp.copy_from_slice(seg);
+            cpu_fwht_256(&mut grp, signs1, signs2);
+            let scale0 = qtip::group_scale(&grp);
+            let sym = qtip::beam_encode_group_bits(&grp, scale0, cb, 128, bits);
+            let scale = qtip::optimal_scale_bits(&grp, &sym, cb, bits);
+            let mut deq = qtip::decode_group_bits(&sym, scale, cb, bits);
+            cpu_fwht_256(&mut deq, signs2, signs1);
+            seg.copy_from_slice(&deq);
+        }
+        row[..n_prot].copy_from_slice(&saved);
     });
 }
 
@@ -5704,6 +5753,16 @@ fn main() {
     // The Hessian sidecar comes from HIPFIRE_QTIP_HESSIAN (shared with qtip-sim);
     // tensors without one fall back to a column-L2-norm saliency proxy.
     let use_roughquant_sim = format == "roughquant-sim" || format == "rq-sim";
+    // roughquant2-sim (Phase 2): PCA-rotate each 2D weight into the eigenbasis of
+    // its activation Hessian C=XᵀX, protect the top `protect_frac` highest-energy
+    // columns at full precision, quantize the bulk with the QTIP trellis (which
+    // supplies the within-tier Hadamard + low-bit format), then inverse-rotate
+    // back. Kernel-free PPL verdict via the normal bf16 forward. Swept via env:
+    //   HIPFIRE_RQ2_PROTECT_FRAC (default 0.015) — top columns kept exact
+    //   HIPFIRE_RQ2_BULK_BITS    (default 3)     — QTIP trellis bits for the bulk
+    //   HIPFIRE_RQ2_DAMP         (default 0.01)  — Hessian diagonal ridge fraction
+    // Needs HIPFIRE_QTIP_HESSIAN; tensors without a Hessian are left bf16.
+    let use_roughquant2_sim = format == "roughquant2-sim" || format == "rq2-sim";
     // Real packed QTIP-3 (vs the bf16 sim): emit QuantType::Qtip3G256 records
     // (rotated-frame symbols), decoded by the gemv_qtip3g256 kernel. The sim
     // path is for kernel-free PPL; this is the shippable bandwidth format.
@@ -5719,8 +5778,9 @@ fn main() {
         || format == "bfloat16"
         || use_qtip_sim
         || use_qtip3_real
-        || use_roughquant_sim;
-    let (qtip_cb, qtip_s1, qtip_s2) = if use_qtip_sim || use_qtip3_real {
+        || use_roughquant_sim
+        || use_roughquant2_sim;
+    let (qtip_cb, qtip_s1, qtip_s2) = if use_qtip_sim || use_qtip3_real || use_roughquant2_sim {
         if use_qtip3_real {
             eprintln!(
                 "qtip3 (real): packing 2D weights as Qtip3G256 \
@@ -5743,27 +5803,28 @@ fn main() {
     // Optional Hessian sidecar → QTIP-LDLQ (output-aware). HIPFIRE_QTIP_HESSIAN
     // points at an HFHS file; tensors with a Hessian use LDLQ, the rest fall
     // back to plain (MSE) simulated QTIP.
-    let qtip_hessian: Option<hessian_io::HessianSidecar> = if use_qtip_sim || use_roughquant_sim {
-        std::env::var("HIPFIRE_QTIP_HESSIAN").ok().and_then(|p| {
-            match hessian_io::HessianSidecar::open(std::path::Path::new(&p)) {
-                Ok(s) => {
-                    eprintln!(
-                        "qtip{qtip_bits}-sim: LDLQ ENABLED — Hessian sidecar {p} ({} tensors)",
-                        s.n_tensors()
-                    );
-                    Some(s)
+    let qtip_hessian: Option<hessian_io::HessianSidecar> =
+        if use_qtip_sim || use_roughquant_sim || use_roughquant2_sim {
+            std::env::var("HIPFIRE_QTIP_HESSIAN").ok().and_then(|p| {
+                match hessian_io::HessianSidecar::open(std::path::Path::new(&p)) {
+                    Ok(s) => {
+                        eprintln!(
+                            "qtip{qtip_bits}-sim: LDLQ ENABLED — Hessian sidecar {p} ({} tensors)",
+                            s.n_tensors()
+                        );
+                        Some(s)
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "qtip{qtip_bits}-sim: WARN cannot open Hessian {p}: {e:?} — plain QTIP"
+                        );
+                        None
+                    }
                 }
-                Err(e) => {
-                    eprintln!(
-                        "qtip{qtip_bits}-sim: WARN cannot open Hessian {p}: {e:?} — plain QTIP"
-                    );
-                    None
-                }
-            }
-        })
-    } else {
-        None
-    };
+            })
+        } else {
+            None
+        };
     let use_q8 = format == "q8f16" || format == "q8";
     // F1 native-bf16 oracle: full-precision passthrough. Every tensor stored
     // as QuantType::F32 (qt=2) -- weights, norms, embeddings.
@@ -9112,6 +9173,79 @@ fn main() {
             t.data = f32_slice_to_bf16_bytes(&wf);
         }
         eprintln!("  roughquant-sim: diag(H)-saliency on {n_hess} tensors, L2-proxy on {n_proxy}");
+    }
+
+    // roughquant2-sim post-pass (Phase 2): PCA-rotate each eligible 2D BF16
+    // weight into its activation-Hessian eigenbasis, protect the top
+    // `protect_frac` highest-energy columns at full precision, QTIP-trellis the
+    // bulk, inverse-rotate back, bake into bf16. Tensors lacking a Hessian (or
+    // whose eigensolve fails) are left as the staged bf16.
+    if use_roughquant2_sim {
+        let protect_frac: f64 = std::env::var("HIPFIRE_RQ2_PROTECT_FRAC")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.015);
+        let bulk_bits: u32 = std::env::var("HIPFIRE_RQ2_BULK_BITS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        let damp: f64 = std::env::var("HIPFIRE_RQ2_DAMP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.01);
+        eprintln!(
+            "  roughquant2-sim: PCA rotation, protect_frac={protect_frac} bulk_bits={bulk_bits} damp={damp}"
+        );
+        let (mut n_rot, mut n_skip) = (0usize, 0usize);
+        for t in hfq_tensors.iter_mut() {
+            if !(matches!(t.quant_type, QuantType::BF16)
+                && t.shape.len() == 2
+                && (t.shape[1] as usize) % 256 == 0
+                && !t.name.contains("embed")
+                && !t.name.contains("lm_head"))
+            {
+                continue;
+            }
+            let m = t.shape[0] as usize;
+            let k = t.shape[1] as usize;
+            let key = t.name.strip_suffix(".weight").unwrap_or(&t.name);
+            // Need a k×k Hessian to build the PCA basis; else leave bf16.
+            let cmat: Option<Vec<f32>> = qtip_hessian
+                .as_ref()
+                .and_then(|sc| sc.get(key, 0))
+                .filter(|h| h.k == k)
+                .map(|href| {
+                    let mut c = vec![0.0f32; k * k];
+                    for i in 0..k {
+                        for j in 0..k {
+                            c[i * k + j] = href.at(i, j) as f32;
+                        }
+                    }
+                    c
+                });
+            let Some(c) = cmat else {
+                n_skip += 1;
+                continue;
+            };
+            let Some((p, _ev)) = roughquant::pca_basis(&c, k, damp) else {
+                n_skip += 1;
+                continue;
+            };
+            let mut wf: Vec<f32> = t
+                .data
+                .chunks_exact(2)
+                .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            // Rotate into PCA frame, protect top cols (rounded to 256), QTIP the
+            // bulk, rotate back.
+            let mut wt = roughquant::rotate_w(&wf, &p, m, k, false);
+            let n_prot = ((protect_frac * k as f64).round() as usize).min(k);
+            qtip_simquant_protected(&mut wt, k, n_prot, &qtip_cb, &qtip_s1, &qtip_s2, bulk_bits);
+            wf = roughquant::rotate_w(&wt, &p, m, k, true);
+            t.data = f32_slice_to_bf16_bytes(&wf);
+            n_rot += 1;
+        }
+        eprintln!("  roughquant2-sim: PCA-rotated+quantized {n_rot} tensors, left-bf16 {n_skip}");
     }
 
     // qtip3 (real) post-pass: pack every eligible 2D BF16 weight into
