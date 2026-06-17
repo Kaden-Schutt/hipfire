@@ -1131,10 +1131,12 @@ fn mq4_simquant_masked(
     protected_rows: &[bool],
     signs1: &[f32],
     signs2: &[f32],
+    bits: u32,
 ) {
     use rayon::prelude::*;
     debug_assert_eq!(wf.len(), m * k);
     debug_assert_eq!(protected_rows.len(), m);
+    let levels = ((1u32 << bits) - 1) as f32; // 4-bit→15, 5-bit→31, 6-bit→63
     let groups = k / 256;
     if groups == 0 {
         return;
@@ -1161,10 +1163,11 @@ fn mq4_simquant_masked(
                 mx = mx.max(v);
             }
             let range = mx - mn;
-            let scale = if range > 0.0 { range / 15.0 } else { 1.0 };
+            let scale = if range > 0.0 { range / levels } else { 1.0 };
             let inv = if range > 0.0 { 1.0 / scale } else { 0.0 };
+            let qmax = levels as u32;
             for v in grp.iter_mut() {
-                let q = (((*v - mn) * inv + 0.5) as u32).min(15);
+                let q = (((*v - mn) * inv + 0.5) as u32).min(qmax);
                 *v = q as f32 * scale + mn;
             }
             cpu_fwht_256(&mut grp, signs2, signs1);
@@ -9644,6 +9647,14 @@ fn main() {
         let bulk_kind = std::env::var("HIPFIRE_RQ4_BULK").ok().unwrap_or_default();
         let bulk_mq4 = bulk_kind == "mq4";
         let bulk_void = bulk_kind == "void";
+        // Uniform bulk bit-width for the mq bulk (4=mq4, 5, 6=mq6). protect_frac=0
+        // + this gives a fair FWHT uniform-N-bit anchor on the same machinery.
+        let mq_bits: u32 = std::env::var("HIPFIRE_RQ4_MQ_BITS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        // Protect at 8-bit (per-channel Q8) instead of bf16 — honest bit-cost.
+        let protect_q8 = std::env::var("HIPFIRE_RQ4_PROTECT_Q8").ok().as_deref() == Some("1");
         // Saliency metric for which channels to protect (user steer: don't rely
         // on diag(H) alone). diag = E[x²] (activation energy); wnorm = ‖W[:,c]‖²
         // (weight energy); product = ‖W[:,c]‖²·E[x²] (output-error contribution).
@@ -9814,6 +9825,7 @@ fn main() {
                     &protected_rows,
                     &qtip_s1,
                     &qtip_s2,
+                    mq_bits,
                 );
             } else {
                 qtip_simquant_masked(
@@ -9827,6 +9839,41 @@ fn main() {
                     &qtip_s2,
                     bulk_bits,
                 );
+            }
+            // HIPFIRE_RQ4_PROTECT_Q8: protect at 8-bit precision (per-column /
+            // per-row symmetric Q8) instead of bf16. bf16 already only has ~8-bit
+            // mantissa, so this is ~same KLD at HALF the protected bit-cost — the
+            // honest bit-accounting for a deployable protected format.
+            if protect_q8 {
+                for &c in &protected_cols {
+                    let mut amax = 0.0f32;
+                    for r in 0..m {
+                        amax = amax.max(wf[r * k + c].abs());
+                    }
+                    if amax > 0.0 {
+                        let s = amax / 127.0;
+                        let inv = 1.0 / s;
+                        for r in 0..m {
+                            let q = (wf[r * k + c] * inv).round().clamp(-127.0, 127.0);
+                            wf[r * k + c] = q * s;
+                        }
+                    }
+                }
+                for r in 0..m {
+                    if !protected_rows[r] {
+                        continue;
+                    }
+                    let row = &mut wf[r * k..r * k + k];
+                    let amax = row.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                    if amax > 0.0 {
+                        let s = amax / 127.0;
+                        let inv = 1.0 / s;
+                        for v in row.iter_mut() {
+                            let q = (*v * inv).round().clamp(-127.0, 127.0);
+                            *v = q * s;
+                        }
+                    }
+                }
             }
             t.data = f32_slice_to_bf16_bytes(&wf);
         }

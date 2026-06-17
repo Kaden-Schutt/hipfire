@@ -1,6 +1,16 @@
 # RoughQuant — energy-concentrating mixed-precision weight quant (build spec)
 
-**Status:** **CONCLUDED — NOT DEPLOYABLE on Qwen3.5-0.8B (2026-06-17).** Sim
+**Status:** **POSITIVE at low bits (2026-06-17, phase2h) — reverses the earlier
+negative.** Foldable Q8-protection of the shared ~75-channel outlier set + mq4
+bulk beats uniform by ~25% KLD at ~4.4–4.5 avg-bits (win shrinks toward higher
+bits). Reached only after user skepticism uncovered 4 compounding artifacts
+(zeroing bug, energy-aggregation error, bf16-protection wasting half its bits,
+PPL pointwise noise). Literature-consistent (AWQ/super-weight). SIM result; needs
+packed format + offline fold + coherence + cross-model before shipping. See
+`docs/roughquant/phase2h-foldable-win.md`. (Earlier phases below retained for the
+record; their "no foldable win" verdicts are SUPERSEDED by phase2g/2h.)
+
+_Prior status line (superseded):_ **CONCLUDED — NOT DEPLOYABLE on Qwen3.5-0.8B (2026-06-17).** Sim
 phases 0–2 + de-risks A/B done — see `docs/roughquant/phase{0,1,2}.md`. Two
 independent failures: (1) the headline thesis (≈2.5 avg-bit ≈ 4-bit PPL) is
 FALSIFIED — 2-bit bulk non-viable (2.55 bit → PPL 47.85 vs mq4 29.08); (2) the
