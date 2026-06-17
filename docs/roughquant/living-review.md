@@ -106,3 +106,43 @@ Net: ledger C1/C4/C5 reproduce; the quantizer invariants are sound on the
 audited code. Remaining audit work: canonicalize the coherence battery prompts
 (`benchmarks/prompts/*.txt`), and the real-packed-format coherence/perf (the only
 path to a shippable verdict).
+
+## Finding: importance selection beats random (the win is importance-driven)
+
+Control (`HIPFIRE_RQ4_SALIENCY=random`, seeded): protect-5% (51 ch), bf16, KLD —
+
+| selection | KLD | vs mq4 (0.162) |
+|---|---|---|
+| diag (ours) | 0.084 | −48% |
+| product | 0.087 | −46% |
+| random (3 seeds) | 0.140 / 0.148 / 0.151 | −7…−14% |
+
+Our selector beats random ~1.7×; random promotion of the same count barely helps.
+⇒ the protection win comes from WHICH channels (importance), not just from having
+bf16 channels. `diag(H)` captures real, selectable importance (≈ product here, so
+weight-magnitude adds little at this level). Answers "is OUR selector worthless" →
+no.
+
+## Finding: canonical coherence battery (protection helps coherence)
+
+8 committed `benchmarks/prompts/*.txt` (md5-recorded), FP32 DeltaNet state:
+
+| model | avg uniq↑ | 5gram-rep↓ | attractors |
+|---|---|---|---|
+| mq4 (real) | 0.458 | 0.187 | 3/8 |
+| rq-mq4path (protect-0 control) | 0.255 | 0.538 | 6/8 |
+| rq-protect5bf16 | 0.371 | 0.286 | 4/8 |
+
+Protection recovers ~half the sim-path coherence gap toward mq4 ⇒ helps, doesn't
+hurt (confirms the phase2h retraction). NB: the sim-path itself (rq-mq4path) still
+degrades vs real mq4 → absolute coherence needs the real packed format.
+
+## Finding: the 5 permutations — bijectivity verified
+
+`scripts/roughquant_permute_verify.py` + `docs/roughquant/permutation-bijectivity.md`:
+#1 hidden / #2 MLP / #3 attn-heads(GQA) / #5 residual are FREE (function-preserving,
+max|Δ|~machine-zero on synthetic per-block forwards). **#4 per-head dims is free
+WITHOUT RoPE but BROKEN with RoPE** (relative-position dot product changes; only
+RoPE-pair-preserving perms are free). The verifier self-caught a same-position bug
+that had masked the #4 failure. Propagation specs recorded for the production
+machinery (next).

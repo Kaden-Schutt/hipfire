@@ -9735,6 +9735,23 @@ fn main() {
                 }
             }
         }
+        // CONTROL (HIPFIRE_RQ4_SALIENCY=random): replace importance with a seeded
+        // random ranking. If random ties our metric, it means OUR selector
+        // (energy/product) is no better than chance at finding the important
+        // channels — not that importance is worthless. Reproducible via the seed.
+        if saliency_metric == "random" {
+            let seed: u64 = std::env::var("HIPFIRE_RQ4_RANDOM_SEED")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1234567);
+            for (i, e) in resid_energy.iter_mut().enumerate() {
+                let mut z = seed.wrapping_add((i as u64).wrapping_mul(0x9E3779B97F4A7C15));
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+                z ^= z >> 31;
+                *e = (z as f64) / (u64::MAX as f64);
+            }
+        }
         // Top residual channels (shared across readers' cols and writers' rows).
         let n_prot_resid = ((protect_frac * dmodel as f64).round() as usize).min(dmodel);
         let protected_resid: Vec<usize> = {
@@ -9778,20 +9795,22 @@ fn main() {
                 .collect();
             // Read side: true residual readers share the global residual channel
             // set; internal-output projections protect their own input channels.
-            let protected_cols: Vec<usize> =
-                if roughquant4_is_residual_reader(&t.name) && k == dmodel {
-                    protected_resid.clone()
+            let protected_cols: Vec<usize> = if roughquant4_is_residual_reader(&t.name)
+                && k == dmodel
+            {
+                protected_resid.clone()
+            } else {
+                // Per-weight saliency for non-residual inputs, by the chosen metric.
+                let diag: Option<Vec<f64>> = qtip_hessian
+                    .as_ref()
+                    .and_then(|sc| sc.get(key, 0))
+                    .filter(|h| h.k == k)
+                    .map(|h| (0..k).map(|i| h.at(i, i)).collect());
+                if diag.is_none() && saliency_metric == "diag" {
+                    Vec::new()
                 } else {
-                    // Per-weight saliency for non-residual inputs, by the chosen metric.
-                    let diag: Option<Vec<f64>> = qtip_hessian
-                        .as_ref()
-                        .and_then(|sc| sc.get(key, 0))
-                        .filter(|h| h.k == k)
-                        .map(|h| (0..k).map(|i| h.at(i, i)).collect());
-                    if diag.is_none() && saliency_metric == "diag" {
-                        Vec::new()
-                    } else {
-                        let cn2: Option<Vec<f32>> = if saliency_metric != "diag" {
+                    let cn2: Option<Vec<f32>> =
+                        if saliency_metric != "diag" && saliency_metric != "random" {
                             let mut s = vec![0.0f32; k];
                             for r in 0..m {
                                 let row = &wf[r * k..r * k + k];
@@ -9803,27 +9822,44 @@ fn main() {
                         } else {
                             None
                         };
-                        let sal: Vec<f64> = (0..k)
-                            .map(|c| {
-                                let d = diag.as_ref().map(|d| d[c]).unwrap_or(1.0);
-                                let w = cn2.as_ref().map(|x| x[c] as f64).unwrap_or(1.0);
-                                match saliency_metric.as_str() {
-                                    "wnorm" => w,
-                                    "product" => w * d,
-                                    _ => d,
+                    let rng_seed: u64 = std::env::var("HIPFIRE_RQ4_RANDOM_SEED")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(1234567);
+                    let sal: Vec<f64> = (0..k)
+                        .map(|c| {
+                            let d = diag.as_ref().map(|d| d[c]).unwrap_or(1.0);
+                            let w = cn2.as_ref().map(|x| x[c] as f64).unwrap_or(1.0);
+                            match saliency_metric.as_str() {
+                                "wnorm" => w,
+                                "product" => w * d,
+                                "random" => {
+                                    // seeded per (tensor-key-hash, column) so it's
+                                    // reproducible but independent per tensor.
+                                    let kh = key.bytes().fold(rng_seed, |a, b| {
+                                        (a ^ b as u64).wrapping_mul(0x100000001B3)
+                                    });
+                                    let mut z = kh
+                                        .wrapping_add((c as u64).wrapping_mul(0x9E3779B97F4A7C15));
+                                    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                                    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+                                    z ^= z >> 31;
+                                    (z as f64) / (u64::MAX as f64)
                                 }
-                            })
-                            .collect();
-                        let mut idx: Vec<usize> = (0..k).collect();
-                        idx.sort_unstable_by(|&a, &b| {
-                            sal[b]
-                                .partial_cmp(&sal[a])
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                        idx.truncate(((protect_frac * k as f64).round() as usize).min(k));
-                        idx
-                    }
-                };
+                                _ => d,
+                            }
+                        })
+                        .collect();
+                    let mut idx: Vec<usize> = (0..k).collect();
+                    idx.sort_unstable_by(|&a, &b| {
+                        sal[b]
+                            .partial_cmp(&sal[a])
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    idx.truncate(((protect_frac * k as f64).round() as usize).min(k));
+                    idx
+                }
+            };
             // Write side: residual writers (m==dmodel) keep high-energy output
             // rows exact.
             let mut protected_rows = vec![false; m];
