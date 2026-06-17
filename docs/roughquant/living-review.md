@@ -137,6 +137,30 @@ Protection recovers ~half the sim-path coherence gap toward mq4 ⇒ helps, doesn
 hurt (confirms the phase2h retraction). NB: the sim-path itself (rq-mq4path) still
 degrades vs real mq4 → absolute coherence needs the real packed format.
 
+## Finding: importance-metric bake-off — diag(H) wins; OBS backfires
+
+`HIPFIRE_RQ4_SALIENCY ∈ {diag, product, wnorm, obs}` (OBS = ‖W[:,c]‖²/[H⁻¹]_cc,
+compensation-aware, reuses LDLQ Cholesky):
+
+| metric | protect-5% (top) KLD | void-bottom-1% (tail) KLD |
+|---|---|---|
+| diag | 0.084 | 0.0285 |
+| product | 0.087 | — |
+| obs | 0.088 | 0.046 |
+| wnorm | 0.140 | — |
+| random | ~0.146 | ~0.043 |
+
+- **Activation energy is THE signal.** diag/product/obs tie at the top
+  (0.084–0.088); wnorm (weight-magnitude only) ≈ random ⇒ weights without
+  activations are useless. product (W²·E[x²]) doesn't beat diag (E[x²]).
+- **OBS does NOT help and is WORSE than random at the tail** (0.046 > 0.043).
+  OBS assumes COMPENSATION (other weights re-optimize); our scheme doesn't
+  re-optimize, so "compensatable ⇒ safe to drop" is wrong — those channels are
+  correlated but still carry signal. diag's "low energy ⇒ safe" is correct here.
+- ⇒ **diag(H) is the best selector at both ends**; the shallow tail gradient is
+  intrinsic, not a metric limitation. Importance-metric exploration settled:
+  plain activation-energy diag(H) for non-compensating protection.
+
 ## Finding: does diag(H) rank the TAIL? (not just the outliers) — yes, weakly
 
 Control (`HIPFIRE_RQ4_BULK=void`, `HIPFIRE_RQ4_INVERT` for top): void the

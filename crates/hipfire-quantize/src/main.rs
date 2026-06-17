@@ -1192,6 +1192,38 @@ fn bf16_colnorm2(data: &[u8], k: usize) -> Vec<f32> {
     s
 }
 
+/// OBS/GPTQ compensation-aware per-column saliency: `‖W[:,c]‖² / [H⁻¹]_cc`, where
+/// `[H⁻¹]_cc` is the diagonal of `(H+λI)⁻¹`. Small `[H⁻¹]_cc` = a "stiff" channel
+/// other channels cannot compensate for → high importance. This captures the
+/// cross-channel correlation that `diag(H)=H_cc` misses (the hypothesized
+/// improvement for the shallow TAIL of the importance ranking). `h_full` is the
+/// row-major k×k Hessian; reuses the LDLQ Cholesky. None on breakdown.
+fn obs_col_saliency(
+    h_full: &[f32],
+    colnorm2: &[f32],
+    k: usize,
+    damp_frac: f64,
+) -> Option<Vec<f64>> {
+    // damp scaled to the Hessian's diagonal mean, matching the LDLQ convention.
+    let mut diag_sum = 0.0f64;
+    for i in 0..k {
+        diag_sum += h_full[i * k + i] as f64;
+    }
+    let damp = damp_frac * (diag_sum / k as f64).max(1e-12);
+    let l = ldlq::inv_cholesky_lower(h_full, k, damp)?; // L Lᵀ = (H+λI)⁻¹
+    let mut sal = vec![0.0f64; k];
+    for c in 0..k {
+        // [H⁻¹]_cc = (L Lᵀ)_cc = Σ_{j≤c} L[c,j]²  (L lower-triangular)
+        let mut hinv_cc = 0.0f64;
+        for j in 0..=c {
+            let v = l[(c, j)];
+            hinv_cc += v * v;
+        }
+        sal[c] = colnorm2[c] as f64 / (hinv_cc + 1e-12);
+    }
+    Some(sal)
+}
+
 /// RoughQuant Phase-1 sim (no rotation): protect the most-salient input columns
 /// of a 2D weight (row-major `m × k`) at full precision, crush the rest to a
 /// `bulk_bits` symmetric-uniform grid (per row, per `group` columns), in place.
@@ -9682,6 +9714,11 @@ fn main() {
         let bulk_kind = std::env::var("HIPFIRE_RQ4_BULK").ok().unwrap_or_default();
         let bulk_mq4 = bulk_kind == "mq4";
         let bulk_void = bulk_kind == "void";
+        // OBS saliency Hessian ridge (fraction of diag mean), for SALIENCY=obs.
+        let damp: f64 = std::env::var("HIPFIRE_RQ4_OBS_DAMP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.01);
         // Uniform bulk bit-width for the mq bulk (4=mq4, 5, 6=mq6). protect_frac=0
         // + this gives a fair FWHT uniform-N-bit anchor on the same machinery.
         let mq_bits: u32 = std::env::var("HIPFIRE_RQ4_MQ_BITS")
@@ -9714,6 +9751,31 @@ fn main() {
                 && roughquant4_is_residual_reader(&t.name)
             {
                 let key = t.name.strip_suffix(".weight").unwrap_or(&t.name);
+                if saliency_metric == "obs" {
+                    // OBS: needs the FULL Hessian + ‖W[:,c]‖²; compensation-aware.
+                    let hfull: Option<Vec<f32>> = qtip_hessian
+                        .as_ref()
+                        .and_then(|sc| sc.get(key, 0))
+                        .filter(|h| h.k == dmodel)
+                        .map(|h| {
+                            let mut c = vec![0.0f32; dmodel * dmodel];
+                            for i in 0..dmodel {
+                                for j in 0..dmodel {
+                                    c[i * dmodel + j] = h.at(i, j) as f32;
+                                }
+                            }
+                            c
+                        });
+                    if let Some(hf) = hfull {
+                        let cn2 = bf16_colnorm2(&t.data, dmodel);
+                        if let Some(sal) = obs_col_saliency(&hf, &cn2, dmodel, damp) {
+                            for i in 0..dmodel {
+                                resid_energy[i] += sal[i];
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let diag: Option<Vec<f64>> = qtip_hessian
                     .as_ref()
                     .and_then(|sc| sc.get(key, 0))
