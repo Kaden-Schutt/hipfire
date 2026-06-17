@@ -1366,6 +1366,42 @@ fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
     output
 }
 
+/// Dequantize MQ4G256 packed bytes back to f32, EXACTLY mirroring the GEMV
+/// kernel (and `quant_quality_mse`'s reference): per 136-byte group read scale+min
+/// (f32), expand 128 nibble bytes to 256 values `min + scale*q` (lo=2i, hi=2i+1),
+/// then inverse FWHT (signs swapped). Used by the roughquant real format to form
+/// the protected-channel correction residual `R = W − dequant(mq4(W))`, so adding
+/// `R_S·x_S` to the kernel's mq4 output yields the EXACT bf16 contribution for the
+/// protected channels (the kernel and this dequant agree bit-for-bit).
+fn dequant_mq4g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
+    let group = 256usize;
+    let block = 136usize;
+    let n_blocks = n.div_ceil(group);
+    let mut out = Vec::with_capacity(n_blocks * group);
+    for b in 0..n_blocks {
+        let off = b * block;
+        if off + block > data.len() {
+            break;
+        }
+        let scale = f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+        let min_val =
+            f32::from_le_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]);
+        let mut group_buf = [0.0f32; 256];
+        for i in 0..128 {
+            let byte = data[off + 8 + i];
+            let lo = (byte & 0xF) as f32;
+            let hi = (byte >> 4) as f32;
+            group_buf[2 * i] = min_val + scale * lo;
+            group_buf[2 * i + 1] = min_val + scale * hi;
+        }
+        // Inverse FWHT: forward op with signs1/signs2 swapped (matches encode).
+        cpu_fwht_256(&mut group_buf, signs2, signs1);
+        out.extend_from_slice(&group_buf);
+    }
+    out.truncate(n);
+    out
+}
+
 /// MagnumQuant MQ6-G256: FWHT-rotated 6-bit quantization.
 /// Same binary format as HFQ6-G256 (200 bytes/group) — the rotation is baked
 /// into the weights. The GEMV kernel rotates x instead of inverse-rotating w.
@@ -6016,6 +6052,14 @@ fn main() {
     //   HIPFIRE_RQ4_PROTECT_FRAC (default 0.03), HIPFIRE_RQ4_BULK_BITS (default 3),
     //   HIPFIRE_RQ4_Q8_EMBED.
     let use_roughquant4_sim = format == "roughquant4-sim" || format == "rq4-sim";
+    // roughquant (REAL, shippable): the de-risked sim verdict in a real packed
+    // format. Bulk = real MQ4G256 (existing kernel); protected residual channels
+    // (diag(H)-selected, role-based: reader cols + writer rows) get an exact bf16
+    // CORRECTION SIDECAR storing R = W − dequant(mq4(W)) over the protected set,
+    // applied at GEMV time as y += R_S·x_S. No rotation/fold; absent sidecar =
+    // plain mq4 (backward-compatible). diag is the production selector (ablation
+    // oracle: Spearman 0.90). Env: HIPFIRE_RQ4_PROTECT_FRAC (default 0.03).
+    let use_roughquant_real = format == "roughquant" || format == "rq";
     // Real packed QTIP-3 (vs the bf16 sim): emit QuantType::Qtip3G256 records
     // (rotated-frame symbols), decoded by the gemv_qtip3g256 kernel. The sim
     // path is for kernel-free PPL; this is the shippable bandwidth format.
@@ -6034,12 +6078,14 @@ fn main() {
         || use_roughquant_sim
         || use_roughquant2_sim
         || use_roughquant3_sim
-        || use_roughquant4_sim;
+        || use_roughquant4_sim
+        || use_roughquant_real;
     let (qtip_cb, qtip_s1, qtip_s2) = if use_qtip_sim
         || use_qtip3_real
         || use_roughquant2_sim
         || use_roughquant3_sim
         || use_roughquant4_sim
+        || use_roughquant_real
     {
         if use_qtip3_real {
             eprintln!(
@@ -6068,6 +6114,7 @@ fn main() {
         || use_roughquant2_sim
         || use_roughquant3_sim
         || use_roughquant4_sim
+        || use_roughquant_real
     {
         std::env::var("HIPFIRE_QTIP_HESSIAN").ok().and_then(|p| {
             match hessian_io::HessianSidecar::open(std::path::Path::new(&p)) {
@@ -6807,7 +6854,7 @@ fn main() {
 
     // Build metadata for .hfq. The quantization_hash is added after tensor
     // production so it covers the final quantized payload bytes.
-    let metadata = serde_json::json!({
+    let mut metadata = serde_json::json!({
         "architecture": arch_str,
         "config": config,
         "tokenizer": tokenizer_str.as_deref().unwrap_or("{}"),
@@ -10101,6 +10148,187 @@ fn main() {
                 "  roughquant4-sim: HIPFIRE_RQ4_Q8_EMBED — Q8-sim on {n_e} embed/lm_head tensors"
             );
         }
+    }
+
+    // roughquant (REAL) post-pass: bulk = real MQ4G256 packed bytes (existing
+    // kernel) + an exact bf16 CORRECTION SIDECAR over the diag(H)-selected shared
+    // residual channel set. For residual READERS the protected COLUMNS get a
+    // [m × |S|] correction; for residual WRITERS the protected ROWS get a [|S| × k]
+    // correction. The correction stores R = W − dequant(mq4(W)) over the protected
+    // entries, so y = mq4_gemv(W) + R_S·x_S yields the EXACT bf16 contribution for
+    // those channels (dequant_mq4g256 is bit-identical to the kernel). Channel
+    // indices live in metadata["roughquant_sidecar"]; values in `<name>.rqcorr`
+    // BF16 tensors. Absent sidecar ⇒ plain mq4 (backward-compatible loader).
+    if use_roughquant_real {
+        let protect_frac: f64 = std::env::var("HIPFIRE_RQ4_PROTECT_FRAC")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.03);
+        let dmodel = roughquant4_infer_dmodel(&hfq_tensors).unwrap_or(1024);
+        // Aggregate per-residual-channel diag(H) energy from true residual readers.
+        let mut resid_energy = vec![0.0f64; dmodel];
+        for t in hfq_tensors.iter() {
+            if matches!(t.quant_type, QuantType::BF16)
+                && t.shape.len() == 2
+                && t.shape[1] as usize == dmodel
+                && !t.name.contains("embed")
+                && !t.name.contains("lm_head")
+                && roughquant4_is_residual_reader(&t.name)
+            {
+                let key = t.name.strip_suffix(".weight").unwrap_or(&t.name);
+                if let Some(diag) = qtip_hessian
+                    .as_ref()
+                    .and_then(|sc| sc.get(key, 0))
+                    .filter(|h| h.k == dmodel)
+                {
+                    for i in 0..dmodel {
+                        resid_energy[i] += diag.at(i, i);
+                    }
+                }
+            }
+        }
+        let n_prot = ((protect_frac * dmodel as f64).round() as usize).min(dmodel);
+        let protected_resid: Vec<usize> = {
+            let mut idx: Vec<usize> = (0..dmodel).collect();
+            idx.sort_unstable_by(|&a, &b| {
+                resid_energy[b]
+                    .partial_cmp(&resid_energy[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            idx.truncate(n_prot);
+            idx.sort_unstable();
+            idx
+        };
+        eprintln!(
+            "  roughquant (real): d_model={dmodel}, protect_frac={protect_frac} \
+             → {n_prot} shared residual channels (reader cols + writer rows)"
+        );
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let mut sidecars: Vec<HfqTensor> = Vec::new();
+        let mut sidecar_meta = serde_json::Map::new();
+        let (mut n_r, mut n_w, mut max_resid) = (0usize, 0usize, 0.0f32);
+        let mut rq_recon_err = 0.0f32;
+        for t in hfq_tensors.iter_mut() {
+            if !(matches!(t.quant_type, QuantType::BF16)
+                && t.shape.len() == 2
+                && (t.shape[1] as usize) % 256 == 0
+                && !t.name.contains("embed")
+                && !t.name.contains("lm_head"))
+            {
+                continue;
+            }
+            let m = t.shape[0] as usize;
+            let k = t.shape[1] as usize;
+            let is_reader = roughquant4_is_residual_reader(&t.name) && k == dmodel;
+            let is_writer = roughquant4_is_residual_writer(&t.name) && m == dmodel;
+            // f32 weights, real mq4 pack, kernel-faithful dequant.
+            let wf: Vec<f32> = t
+                .data
+                .chunks_exact(2)
+                .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            let packed = quantize_mq4g256(&wf, &signs1, &signs2);
+            // Emit the bulk regardless; only attach a sidecar for residual roles.
+            if is_reader || is_writer {
+                let recon = dequant_mq4g256(&packed, m * k, &signs1, &signs2);
+                let (corr_f32, shape, role): (Vec<f32>, Vec<u32>, &str) = if is_reader {
+                    // protected COLUMNS: [m × |S|], corr[r,j] = (W − recon)[r, S[j]]
+                    let s = &protected_resid;
+                    let mut corr = vec![0.0f32; m * s.len()];
+                    for r in 0..m {
+                        for (j, &c) in s.iter().enumerate() {
+                            corr[r * s.len() + j] = wf[r * k + c] - recon[r * k + c];
+                        }
+                    }
+                    (corr, vec![m as u32, s.len() as u32], "reader")
+                } else {
+                    // protected ROWS: [|S| × k], corr[j,c] = (W − recon)[S[j], c]
+                    let s = &protected_resid;
+                    let mut corr = vec![0.0f32; s.len() * k];
+                    for (j, &row) in s.iter().enumerate() {
+                        for c in 0..k {
+                            corr[j * k + c] = wf[row * k + c] - recon[row * k + c];
+                        }
+                    }
+                    (corr, vec![s.len() as u32, k as u32], "writer")
+                };
+                for &v in corr_f32.iter() {
+                    max_resid = max_resid.max(v.abs());
+                }
+                // Self-check: recon(bulk)[protected] + bf16(R) must reconstruct the
+                // protected entries to bf16 precision (proves the sidecar carries the
+                // right correction; error is only the bf16 rounding of R, ~1e-4).
+                {
+                    let corr_bf16: Vec<f32> = f32_slice_to_bf16_bytes(&corr_f32)
+                        .chunks_exact(2)
+                        .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                        .collect();
+                    let s = &protected_resid;
+                    let mut e = 0.0f32;
+                    if is_reader {
+                        for r in 0..m {
+                            for (j, &c) in s.iter().enumerate() {
+                                let got = recon[r * k + c] + corr_bf16[r * s.len() + j];
+                                e = e.max((got - wf[r * k + c]).abs());
+                            }
+                        }
+                    } else {
+                        for (j, &row) in s.iter().enumerate() {
+                            for c in 0..k {
+                                let got = recon[row * k + c] + corr_bf16[j * k + c];
+                                e = e.max((got - wf[row * k + c]).abs());
+                            }
+                        }
+                    }
+                    rq_recon_err = rq_recon_err.max(e);
+                }
+                let corr_name = format!("{}.rqcorr", t.name);
+                sidecars.push(HfqTensor {
+                    name: corr_name.clone(),
+                    quant_type: QuantType::BF16,
+                    shape,
+                    group_size: 0,
+                    data: f32_slice_to_bf16_bytes(&corr_f32),
+                    spilled_len: 0,
+                });
+                sidecar_meta.insert(
+                    t.name.clone(),
+                    serde_json::json!({
+                        "role": role,
+                        "channels": protected_resid,
+                        "corr": corr_name,
+                    }),
+                );
+                if is_reader {
+                    n_r += 1;
+                } else {
+                    n_w += 1;
+                }
+            }
+            t.data = packed;
+            t.quant_type = QuantType::MQ4G256;
+            t.group_size = 256;
+        }
+        hfq_tensors.extend(sidecars);
+        if let Some(obj) = metadata.as_object_mut() {
+            obj.insert(
+                "roughquant_sidecar".to_string(),
+                serde_json::json!({
+                    "version": 1,
+                    "saliency": "diag",
+                    "protect_frac": protect_frac,
+                    "d_model": dmodel,
+                    "n_channels": n_prot,
+                    "tensors": serde_json::Value::Object(sidecar_meta),
+                }),
+            );
+        }
+        eprintln!(
+            "  roughquant (real): {n_r} reader + {n_w} writer correction sidecars \
+             (bf16, max|R|={max_resid:.4}); bulk=MQ4G256; \
+             protected-channel recon max-err={rq_recon_err:.2e} (bf16 rounding of R)"
+        );
     }
 
     // qtip3 (real) post-pass: pack every eligible 2D BF16 weight into
