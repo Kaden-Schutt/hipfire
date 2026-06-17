@@ -38,6 +38,7 @@ members = [
     "crates/redline",
     "crates/hipfire-dispatch",
     "crates/hipfire-dispatch-tests",
+    "crates/hipfire-train",
 ]
 
 [workspace.package]

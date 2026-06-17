@@ -1486,6 +1486,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-train"
+version = "0.2.1"
+dependencies = [
+ "half",
+ "hipfire-model",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde_json",
+]
+
+[[package]]
 name = "hsa-bridge"
 version = "0.2.1"
 dependencies = [
