@@ -984,9 +984,8 @@ fn qtip_simquant_nbit(
 /// QTIP-trellis the bulk after RoughQuant PCA rotation, protecting the leading
 /// `n_prot` columns (PCA-sorted by eigenvalue descending → highest-energy first)
 /// at full precision with PER-COLUMN granularity. The protected columns are
-/// saved and zeroed before the per-256-group FWHT+trellis so their large values
-/// don't inflate the group scale (which would coarsen the bulk grid), then
-/// restored exactly afterward. Parallel over rows.
+/// overwritten exactly after the per-256-group FWHT+trellis pass. Parallel over
+/// rows.
 ///
 /// Correctness: in the rotated frame y = W̃·x̃ = Σ_j W̃[:,j]·x̃[j]. After this
 /// pass the protected columns carry exact W̃ values and the bulk carries the
@@ -1071,8 +1070,8 @@ fn unpermute_cols(wperm: &[f32], m: usize, k: usize, perm: &[usize]) -> Vec<f32>
 /// the residual stream: a high-energy residual channel is kept exact where it is
 /// READ (a reader weight's column) AND where it is WRITTEN (a writer weight's
 /// row). Protected rows are left entirely untouched; for other rows the protected
-/// columns are saved & zeroed before the per-256-group FWHT+trellis (so they
-/// don't inflate group scales) and restored after. Parallel over rows.
+/// columns are overwritten exactly after the per-256-group FWHT+trellis pass.
+/// Parallel over rows.
 fn qtip_simquant_masked(
     wf: &mut [f32],
     m: usize,
@@ -1254,6 +1253,42 @@ fn roughquant_sim_tensor(
             g = end;
         }
     });
+}
+
+fn roughquant4_is_residual_reader(name: &str) -> bool {
+    let name = name.strip_suffix(".weight").unwrap_or(name);
+    name.contains(".linear_attn.in_proj_")
+        || name.ends_with(".mlp.gate_proj")
+        || name.ends_with(".mlp.up_proj")
+        || name.ends_with(".self_attn.q_proj")
+        || name.ends_with(".self_attn.k_proj")
+        || name.ends_with(".self_attn.v_proj")
+}
+
+fn roughquant4_is_residual_writer(name: &str) -> bool {
+    let name = name.strip_suffix(".weight").unwrap_or(name);
+    name.ends_with(".self_attn.o_proj")
+        || name.ends_with(".linear_attn.out_proj")
+        || name.ends_with(".mlp.down_proj")
+}
+
+fn roughquant4_infer_dmodel(tensors: &[HfqTensor]) -> Option<usize> {
+    let mut counts: HashMap<usize, usize> = HashMap::new();
+    for t in tensors {
+        if matches!(t.quant_type, QuantType::BF16)
+            && t.shape.len() == 2
+            && (t.shape[1] as usize) % 256 == 0
+            && !t.name.contains("embed")
+            && !t.name.contains("lm_head")
+            && roughquant4_is_residual_reader(&t.name)
+        {
+            *counts.entry(t.shape[1] as usize).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .max_by_key(|&(dmodel, count)| (count, dmodel))
+        .map(|(dmodel, _)| dmodel)
 }
 
 /// MagnumQuant HFQ4-G256: FWHT-rotated 4-bit quantization.
@@ -5941,11 +5976,11 @@ fn main() {
     // consistent mixed precision on the residual stream — NO rotation, NO
     // permutation. Rank residual channels by aggregated activation energy once,
     // keep the top set high-res in (a) the COLUMNS of every residual reader
-    // (k==1024) AND (b) the ROWS of every residual writer (o_proj/out_proj/
-    // down_proj, m==1024), so a high-energy channel is exact where it is written
-    // and where it is read. Non-residual inputs (o_proj/down_proj's internal
-    // activations) get per-weight diag(H) column protection. QTIP the bulk. Folds
-    // for free (it's a per-channel bit map, no runtime transform). Env:
+    // (inferred d_model input) AND (b) the ROWS of every residual writer
+    // (inferred d_model output), so a high-energy channel is exact where it is
+    // written and where it is read. Non-residual inputs (o_proj/down_proj's
+    // internal activations) get per-weight diag(H) column protection. QTIP the
+    // bulk. Folds for free (it's a per-channel bit map, no runtime transform). Env:
     //   HIPFIRE_RQ4_PROTECT_FRAC (default 0.03), HIPFIRE_RQ4_BULK_BITS (default 3),
     //   HIPFIRE_RQ4_Q8_EMBED.
     let use_roughquant4_sim = format == "roughquant4-sim" || format == "rq4-sim";
@@ -9631,8 +9666,8 @@ fn main() {
 
     // roughquant4-sim post-pass (Phase 2d): channel-consistent residual-stream
     // mixed precision. Rank residual channels by aggregated energy once; keep the
-    // top set exact in reader COLUMNS (k==1024) and writer ROWS (o/out/down_proj,
-    // m==1024). Non-residual inputs use per-weight diag(H) column protection.
+    // top set exact in true residual-reader COLUMNS and residual-writer ROWS.
+    // Non-residual inputs use per-weight diag(H) column protection.
     if use_roughquant4_sim {
         let protect_frac: f64 = std::env::var("HIPFIRE_RQ4_PROTECT_FRAC")
             .ok()
@@ -9661,8 +9696,14 @@ fn main() {
         let saliency_metric = std::env::var("HIPFIRE_RQ4_SALIENCY")
             .ok()
             .unwrap_or_else(|| "diag".into());
-        let dmodel = 1024usize;
-        // Aggregate per-residual-channel saliency from all k==1024 readers.
+        let dmodel = roughquant4_infer_dmodel(&hfq_tensors).unwrap_or_else(|| {
+            eprintln!(
+                "  roughquant4-sim: WARNING could not infer residual d_model; \
+                 falling back to 1024"
+            );
+            1024
+        });
+        // Aggregate per-residual-channel saliency from true residual readers.
         let mut resid_energy = vec![0.0f64; dmodel];
         for t in hfq_tensors.iter() {
             if matches!(t.quant_type, QuantType::BF16)
@@ -9670,6 +9711,7 @@ fn main() {
                 && t.shape[1] as usize == dmodel
                 && !t.name.contains("embed")
                 && !t.name.contains("lm_head")
+                && roughquant4_is_residual_reader(&t.name)
             {
                 let key = t.name.strip_suffix(".weight").unwrap_or(&t.name);
                 let diag: Option<Vec<f64>> = qtip_hessian
@@ -9716,9 +9758,6 @@ fn main() {
                 format!("qtip{bulk_bits}")
             }
         );
-        let is_writer = |name: &str| {
-            name.contains("o_proj") || name.contains("out_proj") || name.contains("down_proj")
-        };
         let (mut n_w, mut n_r) = (0usize, 0usize);
         for t in hfq_tensors.iter_mut() {
             if !(matches!(t.quant_type, QuantType::BF16)
@@ -9737,57 +9776,58 @@ fn main() {
                 .chunks_exact(2)
                 .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect();
-            // Read side: residual readers (k==dmodel) share the global residual
-            // channel set; others protect their own top-diag(H) input columns.
-            let protected_cols: Vec<usize> = if k == dmodel {
-                protected_resid.clone()
-            } else {
-                // Per-weight saliency for non-residual inputs, by the chosen metric.
-                let diag: Option<Vec<f64>> = qtip_hessian
-                    .as_ref()
-                    .and_then(|sc| sc.get(key, 0))
-                    .filter(|h| h.k == k)
-                    .map(|h| (0..k).map(|i| h.at(i, i)).collect());
-                if diag.is_none() && saliency_metric == "diag" {
-                    Vec::new()
+            // Read side: true residual readers share the global residual channel
+            // set; internal-output projections protect their own input channels.
+            let protected_cols: Vec<usize> =
+                if roughquant4_is_residual_reader(&t.name) && k == dmodel {
+                    protected_resid.clone()
                 } else {
-                    let cn2: Option<Vec<f32>> = if saliency_metric != "diag" {
-                        let mut s = vec![0.0f32; k];
-                        for r in 0..m {
-                            let row = &wf[r * k..r * k + k];
-                            for c in 0..k {
-                                s[c] += row[c] * row[c];
-                            }
-                        }
-                        Some(s)
+                    // Per-weight saliency for non-residual inputs, by the chosen metric.
+                    let diag: Option<Vec<f64>> = qtip_hessian
+                        .as_ref()
+                        .and_then(|sc| sc.get(key, 0))
+                        .filter(|h| h.k == k)
+                        .map(|h| (0..k).map(|i| h.at(i, i)).collect());
+                    if diag.is_none() && saliency_metric == "diag" {
+                        Vec::new()
                     } else {
-                        None
-                    };
-                    let sal: Vec<f64> = (0..k)
-                        .map(|c| {
-                            let d = diag.as_ref().map(|d| d[c]).unwrap_or(1.0);
-                            let w = cn2.as_ref().map(|x| x[c] as f64).unwrap_or(1.0);
-                            match saliency_metric.as_str() {
-                                "wnorm" => w,
-                                "product" => w * d,
-                                _ => d,
+                        let cn2: Option<Vec<f32>> = if saliency_metric != "diag" {
+                            let mut s = vec![0.0f32; k];
+                            for r in 0..m {
+                                let row = &wf[r * k..r * k + k];
+                                for c in 0..k {
+                                    s[c] += row[c] * row[c];
+                                }
                             }
-                        })
-                        .collect();
-                    let mut idx: Vec<usize> = (0..k).collect();
-                    idx.sort_unstable_by(|&a, &b| {
-                        sal[b]
-                            .partial_cmp(&sal[a])
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    idx.truncate(((protect_frac * k as f64).round() as usize).min(k));
-                    idx
-                }
-            };
+                            Some(s)
+                        } else {
+                            None
+                        };
+                        let sal: Vec<f64> = (0..k)
+                            .map(|c| {
+                                let d = diag.as_ref().map(|d| d[c]).unwrap_or(1.0);
+                                let w = cn2.as_ref().map(|x| x[c] as f64).unwrap_or(1.0);
+                                match saliency_metric.as_str() {
+                                    "wnorm" => w,
+                                    "product" => w * d,
+                                    _ => d,
+                                }
+                            })
+                            .collect();
+                        let mut idx: Vec<usize> = (0..k).collect();
+                        idx.sort_unstable_by(|&a, &b| {
+                            sal[b]
+                                .partial_cmp(&sal[a])
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        idx.truncate(((protect_frac * k as f64).round() as usize).min(k));
+                        idx
+                    }
+                };
             // Write side: residual writers (m==dmodel) keep high-energy output
             // rows exact.
             let mut protected_rows = vec![false; m];
-            if is_writer(&t.name) && m == dmodel {
+            if roughquant4_is_residual_writer(&t.name) && m == dmodel {
                 for &c in &protected_resid {
                     protected_rows[c] = true;
                 }
@@ -12013,6 +12053,57 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.contains("only source-precision HFQ tensors are supported"));
+    }
+
+    fn roughquant4_test_tensor(name: &str, shape: &[u32]) -> HfqTensor {
+        HfqTensor {
+            name: name.to_string(),
+            quant_type: QuantType::BF16,
+            shape: shape.to_vec(),
+            group_size: 0,
+            data: Vec::new(),
+            spilled_len: 0,
+        }
+    }
+
+    #[test]
+    fn roughquant4_classifies_residual_readers_and_writers_by_role() {
+        for name in [
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+            "model.language_model.layers.0.linear_attn.in_proj_z.weight",
+            "model.language_model.layers.0.linear_attn.in_proj_a.weight",
+            "model.language_model.layers.0.linear_attn.in_proj_b.weight",
+            "model.language_model.layers.0.mlp.gate_proj.weight",
+            "model.language_model.layers.0.mlp.up_proj.weight",
+            "model.language_model.layers.3.self_attn.q_proj.weight",
+            "model.language_model.layers.3.self_attn.k_proj.weight",
+            "model.language_model.layers.3.self_attn.v_proj.weight",
+        ] {
+            assert!(roughquant4_is_residual_reader(name), "{name}");
+            assert!(!roughquant4_is_residual_writer(name), "{name}");
+        }
+
+        for name in [
+            "model.language_model.layers.3.self_attn.o_proj.weight",
+            "model.language_model.layers.0.linear_attn.out_proj.weight",
+            "model.language_model.layers.0.mlp.down_proj.weight",
+        ] {
+            assert!(roughquant4_is_residual_writer(name), "{name}");
+            assert!(!roughquant4_is_residual_reader(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn roughquant4_infers_dmodel_from_residual_readers_not_shape_literals() {
+        let tensors = vec![
+            // A writer with a 1024-wide internal input must not force d_model=1024.
+            roughquant4_test_tensor("model.layers.0.self_attn.o_proj.weight", &[4096, 1024]),
+            roughquant4_test_tensor("model.layers.0.self_attn.q_proj.weight", &[4096, 4096]),
+            roughquant4_test_tensor("model.layers.0.mlp.gate_proj.weight", &[11008, 4096]),
+            roughquant4_test_tensor("model.layers.0.mlp.up_proj.weight", &[11008, 4096]),
+        ];
+
+        assert_eq!(roughquant4_infer_dmodel(&tensors), Some(4096));
     }
 
     #[test]

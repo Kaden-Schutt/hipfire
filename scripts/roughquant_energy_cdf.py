@@ -10,12 +10,11 @@ Two views, both as cumulative-energy CDFs over the residual stream:
   - EIGENBASIS energy: eigenvalues of each weight's input Hessian. This is the
     PCA-rotated basis (per-weight, dense, NOT foldable for free).
 
-Finding on Qwen3.5-0.8B (2026-06-17): raw per-channel energy is ~uniformly
-spread (no knee: top 1% of residual channels hold only ~21%), but eigenvalues
-are sharply concentrated (top 1% hold 40–80%). The concentration RoughQuant
-needs exists ONLY in the un-foldable per-weight eigenbasis — which is exactly
-why PCA-protect wins numerically but isn't deployable (de-risk B), and why
-foldable channel/permutation protection doesn't help.
+Historical note: the original aggregate CDF read as "raw energy is spread",
+but phase2g showed that was an aggregation artifact. Per-input outlier
+channels are strong and largely shared across layers, so foldable channel
+protection is real. Keep this script as a CDF/eigenbasis inspection helper, not
+as the final verdict; see docs/roughquant/README.md and phase2g/phase2h.
 
 Usage: python3 scripts/roughquant_energy_cdf.py [hessian.bin] [hf_model_dir]
 """

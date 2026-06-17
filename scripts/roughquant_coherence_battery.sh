@@ -8,23 +8,28 @@ cd "$(dirname "$0")/.."
 BIN=./target/release/examples/infer_qwen35
 M=("$@"); [ ${#M[@]} -eq 0 ] && M=(mq4 rq-mq4path rq-protect5bf16)
 OUT=/tmp/rq_coh_battery; mkdir -p "$OUT"
-PROMPTS=(
-  "Explain why the sky is blue in three sentences."
-  "If a train travels 60 km in 1.5 hours, what is its average speed?"
-  "Write a Python function that reverses a string."
-  "List three causes of the French Revolution."
-  "What is the capital of Australia and why?"
-  "Summarize how photosynthesis works."
-  "Solve: a baker has 24 cookies and packs them in boxes of 6. How many boxes?"
-  "Describe the water cycle in two sentences."
+# Byte-identical committed prompts (repo rule: prompt-sensitive evidence must use
+# benchmarks/prompts/*.txt, not heredocs). Mix of factual / reasoning / code so
+# the attractor detector sees the regimes that actually loop. md5s recorded below.
+PROMPT_FILES=(
+  benchmarks/prompts/coherence_capital_france.txt
+  benchmarks/prompts/coherence_sheep_reason.txt
+  benchmarks/prompts/coherence_square_function.txt
+  benchmarks/prompts/trains-meet.txt
+  benchmarks/prompts/merge_sort_thinking_off.txt
+  benchmarks/prompts/humaneval_2_truncate.txt
+  benchmarks/prompts/humaneval_3_below_zero.txt
+  benchmarks/prompts/lru_cache_single_blank.txt
 )
+echo "=== prompt provenance (md5) ==="; md5sum "${PROMPT_FILES[@]}"
 source scripts/gpu-lock.sh 2>/dev/null || true
 for m in "${M[@]}"; do
   : > "$OUT/$m.txt"
-  for i in "${!PROMPTS[@]}"; do
+  for i in "${!PROMPT_FILES[@]}"; do
+    P="$(cat "${PROMPT_FILES[$i]}")"
     gpu_acquire "coh-$m-$i" 2>/dev/null || true
-    echo "===PROMPT $i===" >> "$OUT/$m.txt"
-    FP32_STATE=1 $BIN ~/.hipfire/models/qwen3.5-0.8b-$m.hfq --guards on "${PROMPTS[$i]}" 2>/dev/null >> "$OUT/$m.txt"
+    echo "===PROMPT $i (${PROMPT_FILES[$i]##*/})===" >> "$OUT/$m.txt"
+    FP32_STATE=1 $BIN ~/.hipfire/models/qwen3.5-0.8b-$m.hfq --guards on "$P" 2>/dev/null >> "$OUT/$m.txt"
     gpu_release 2>/dev/null || true
   done
   echo "done: $m"
@@ -35,7 +40,7 @@ import sys, re, glob
 out=sys.argv[1]; models=sys.argv[2:]
 def metrics(text):
     # per-prompt blocks
-    blocks=re.split(r'===PROMPT \d+===', text)[1:]
+    blocks=re.split(r'===PROMPT \d+[^=]*===', text)[1:]
     rows=[]
     for b in blocks:
         words=re.findall(r"\S+", b)
