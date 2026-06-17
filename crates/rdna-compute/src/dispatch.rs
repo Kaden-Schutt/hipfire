@@ -40858,6 +40858,40 @@ impl Gpu {
         }
     }
 
+    /// KL distillation loss fwd+bwd (fp32). `student`,`d_logits`: `[rows*v]`;
+    /// `teacher_p`: `[rows*v]` (probabilities); `loss`: `[rows]`. `d_logits` is
+    /// the sum-reduction gradient (q − p_t).
+    pub fn distill_kl_train(
+        &mut self,
+        student: &GpuTensor,
+        teacher_p: &GpuTensor,
+        loss: &GpuTensor,
+        d_logits: &GpuTensor,
+        rows: usize,
+        v: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("distill_kl_train", kernels::DISTILL_TRAIN_SRC, "distill_kl_train")?;
+        let func = &self.functions["distill_kl_train"];
+        let mut sp = student.buf.as_ptr();
+        let mut tp = teacher_p.buf.as_ptr();
+        let mut lp = loss.buf.as_ptr();
+        let mut dp = d_logits.buf.as_ptr();
+        let mut rowsi = rows as i32;
+        let mut vi = v as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut sp as *mut _ as *mut c_void,
+            &mut tp as *mut _ as *mut c_void,
+            &mut lp as *mut _ as *mut c_void,
+            &mut dp as *mut _ as *mut c_void,
+            &mut rowsi as *mut _ as *mut c_void,
+            &mut vi as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(func, [rows as u32, 1, 1], [64, 1, 1], 0, self.stream_ref(), &mut params)
+        }
+    }
+
     /// LayerNorm with bias (batched): out = gamma * (x - mean) / sqrt(var + eps) + beta
     pub fn layernorm_batched(
         &mut self,
