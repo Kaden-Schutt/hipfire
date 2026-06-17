@@ -1492,6 +1492,7 @@ dependencies = [
  "half",
  "hipfire-model",
  "hipfire-runtime",
+ "rayon",
  "rdna-compute",
  "serde_json",
 ]

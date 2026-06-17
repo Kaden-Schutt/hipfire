@@ -173,21 +173,26 @@ fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
 /// Per 256-group: FWHT-rotate → beam-encode (`bits`-bit trellis) → decode →
 /// inverse-FWHT. Returns the fp32 dequantized weights (`hatW`) in weight space.
 pub fn qtip_quantize_dequant(w: &[f32], bits: u32, beam_width: usize) -> Vec<f32> {
+    use rayon::prelude::*;
     assert!(w.len() % GROUP == 0, "weight len {} not a multiple of 256", w.len());
     let cb = build_codebook();
     let s1 = gen_fwht_signs(42, GROUP);
     let s2 = gen_fwht_signs(1042, GROUP);
     let mut out = vec![0.0f32; w.len()];
-    for b in 0..w.len() / GROUP {
-        let mut g = [0.0f32; GROUP];
-        g.copy_from_slice(&w[b * GROUP..(b + 1) * GROUP]);
-        cpu_fwht_256(&mut g, &s1, &s2); // rotate into ≈Gaussian space
-        let s0 = group_scale(&g);
-        let sym = beam_encode_group_bits(&g, s0, &cb, beam_width, bits);
-        let s = optimal_scale_bits(&g, &sym, &cb, bits);
-        let mut hat = decode_group_bits(&sym, s, &cb, bits);
-        cpu_fwht_256(&mut hat, &s2, &s1); // inverse rotation (signs swapped)
-        out[b * GROUP..(b + 1) * GROUP].copy_from_slice(&hat);
-    }
+    // Groups are independent (no LDLQ cross-group feedback yet) → embarrassingly
+    // parallel. Each group: FWHT rotate → beam-encode → decode → inverse-FWHT.
+    out.par_chunks_mut(GROUP)
+        .zip(w.par_chunks(GROUP))
+        .for_each(|(o, win)| {
+            let mut g = [0.0f32; GROUP];
+            g.copy_from_slice(win);
+            cpu_fwht_256(&mut g, &s1, &s2); // rotate into ≈Gaussian space
+            let s0 = group_scale(&g);
+            let sym = beam_encode_group_bits(&g, s0, &cb, beam_width, bits);
+            let s = optimal_scale_bits(&g, &sym, &cb, bits);
+            let mut hat = decode_group_bits(&sym, s, &cb, bits);
+            cpu_fwht_256(&mut hat, &s2, &s1); // inverse rotation (signs swapped)
+            o.copy_from_slice(&hat);
+        });
     out
 }
