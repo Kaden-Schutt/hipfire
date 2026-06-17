@@ -96,15 +96,19 @@ hence 838 MB) are follow-ups once the binary verdict lands.
      so for the small correction width `|S|` (<256, not power-of-2) the gather/corr
      MUST be **padded to the next power of two** (zeros don't change the dot). The
      forward wiring + a fused gfx1100/gfx1201 kernel are the only remaining work.
-4. **Forward wiring (the big, hot-path, coherence-gated step)**: qwen35 has ~10
-   forward variants (`forward_from_x_gpu`, `forward_scratch`, `forward_prefill_*`)
-   with linears dispatched inline via `dispatch_ref()`→`GemvFamily` — there is NO
-   single `linear()` helper, so the correction must be applied at each residual
-   reader/writer projection. Two options: (a) add `rq_corr: Option<RqCorrection>`
-   to `WeightTensor` (clean, but ~120 `rq_corr: None` constructor sites across
-   crates — no `Default`), or (b) a side `HashMap` in the qwen35 model keyed by
-   projection, applied within qwen35.rs only (lower cross-crate churn). Decide
-   before starting; this is the multi-hour, gate-heavy part.
+4. **Forward wiring (the big, hot-path, coherence-gated step) — LARGER THAN
+   EXPECTED, see finding**: the KLD path uses only `forward_scratch`, which
+   delegates to `forward_scratch_layers` (≈4,200 lines, qwen35.rs:21830). Critical
+   finding: **projections are FUSED, not separate GEMVs** — `fused_qkvza_*`
+   (q+k+v+z+α+β in one kernel), `fused_gate_up_*` (gate+up in one), plus many
+   arch-specific branches (dp4a / paro / prerotated / Lloyd). So the bf16
+   correction cannot drop in "after each projection GEMV"; it needs a correction
+   pass after each fused block, slicing the fused output to the right sub-range
+   (wqkv→q/k/v/z/a/b; gate_up→gate/up), replicated across every branch, plus the
+   writer corrections (wo, w_down). The side-map (per-layer correction bundle on
+   the 4 layer structs — chosen 2026-06-17) avoids the WeightTensor 120-site churn,
+   but the *apply* sites are numerous and branch-dense. This is the dominant cost
+   and is what the product decision below should weigh.
 5. **Validation gates (the actual verdict):**
    - KLD on the **real GEMV** (not sim) vs bf16 — must keep the ~half-mq4 win.
    - **Coherence battery** (`scripts/roughquant_coherence_battery.sh`, canonical
@@ -121,9 +125,26 @@ those weights; writers similar. Net decode-time overhead likely a few %. If that
 holds and KLD stays halved with coherence intact, it's a real intermediate
 operating point between mq4 (4.25b) and mq6 (6.25b) that mq5 doesn't fill.
 
-## Open / decision
+## Open / decision (updated 2026-06-17 — DECISION POINT)
 
-- Cross-model (7B/9B) confirmatory (the role classifier + d_model-from-roles fix
-  now make this safe).
-- Is the ~half-KLD / few-% win worth a new format + sparse-GEMV kernel vs just
-  using mq6 where VRAM allows? Product call once real-GEMV coherence + tok/s land.
+Everything cheap and decisive is now DONE: importance science (diag ρ=0.90),
+producer (verified), and the **kernel-level proof** that the correction
+reconstructs protected channels to bf16 precision on the real GEMV. What remains
+is ONLY the expensive part: wiring the correction into the fused, arch-branched
+decode path (`forward_scratch_layers`) + coherence + tok/s — a multi-hour,
+gate-heavy hot-path surgery across many fused-kernel branches (see step 4).
+
+The product question is now sharp and should be answered BEFORE paying that cost:
+**is the proven ~half-mq4-KLD win (4.25b→~4.8b effective) worth the fused-path
+forward surgery + a per-fused-block correction GEMV, vs simply shipping mq6
+(6.25b) where VRAM allows?** The intermediate operating point only matters where
+mq6 doesn't fit but mq4 does and the quality gap bites. Inputs to the call:
+- sim KLD halving is real and coherence-positive (established);
+- real-GEMV protected-channel exactness is proven (kernel proof);
+- the missing number is decode tok/s overhead of the correction on the real fused
+  path — which requires doing the wiring to measure.
+
+Recommendation: gate the forward-wiring spend on a product decision (or do a
+single-projection spike to estimate tok/s overhead before committing to all
+branches). Cross-model (7B/9B) confirmatory is independent and safe (the role
+classifier + d_model-from-roles fix), and validates generality regardless.
