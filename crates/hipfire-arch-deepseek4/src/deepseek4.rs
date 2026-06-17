@@ -213,56 +213,6 @@ impl DeepseekV4Config {
             num_hash_layers: raw.num_hash_layers,
         })
     }
-
-    /// Parse `DeepseekV4Config` from a `ModelSource` (safetensors or HFQ).
-    /// The `ModelSource`'s metadata JSON should contain the same outer
-    /// `{"architecture":..., "config":{...}}` wrapper as the HFQ format.
-    pub fn config_from_safetensors(source: &dyn ModelSource) -> Option<DeepseekV4Config> {
-        let meta: serde_json::Value = serde_json::from_str(source.metadata_json()).ok()?;
-        let inner = meta.get("config")?;
-        let raw: RawDeepseekV4Config = serde_json::from_value(inner.clone()).ok()?;
-        Some(DeepseekV4Config {
-            vocab_size: raw.vocab_size,
-            hidden_size: raw.hidden_size,
-            num_hidden_layers: raw.num_hidden_layers,
-            num_attention_heads: raw.num_attention_heads,
-            num_key_value_heads: raw.num_key_value_heads,
-            head_dim: raw.head_dim,
-            max_position_embeddings: raw.max_position_embeddings,
-            rms_norm_eps: raw.rms_norm_eps,
-            q_lora_rank: raw.q_lora_rank,
-            o_lora_rank: raw.o_lora_rank,
-            qk_rope_head_dim: raw.qk_rope_head_dim,
-            o_groups: raw.o_groups,
-            n_routed_experts: raw.n_routed_experts,
-            n_shared_experts: raw.n_shared_experts,
-            num_experts_per_tok: raw.num_experts_per_tok,
-            moe_intermediate_size: raw.moe_intermediate_size,
-            routed_scaling_factor: raw.routed_scaling_factor,
-            topk_method: raw.topk_method,
-            scoring_func: raw.scoring_func,
-            norm_topk_prob: raw.norm_topk_prob,
-            swiglu_limit: raw.swiglu_limit,
-            hc_mult: raw.hc_mult,
-            hc_sinkhorn_iters: raw.hc_sinkhorn_iters,
-            hc_eps: raw.hc_eps,
-            index_n_heads: raw.index_n_heads,
-            index_head_dim: raw.index_head_dim,
-            index_topk: raw.index_topk,
-            compress_ratios: raw.compress_ratios,
-            compress_rope_theta: raw.compress_rope_theta,
-            rope_theta: raw.rope_theta,
-            rope_scaling_factor: raw.rope_scaling.factor,
-            rope_scaling_original_max_position_embeddings: raw
-                .rope_scaling
-                .original_max_position_embeddings,
-            rope_scaling_beta_fast: raw.rope_scaling.beta_fast,
-            rope_scaling_beta_slow: raw.rope_scaling.beta_slow,
-            sliding_window: raw.sliding_window,
-            num_nextn_predict_layers: raw.num_nextn_predict_layers,
-            num_hash_layers: raw.num_hash_layers,
-        })
-    }
 }
 
 /// Parse `DeepseekV4Config` from a `ModelSource` (safetensors or HFQ).
