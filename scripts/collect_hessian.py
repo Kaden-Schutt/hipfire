@@ -164,61 +164,73 @@ def _translate_to_stored_name(mod_name: str, stored_keys: set[str]) -> str | Non
 class HessianAccumulator:
     """One per nn.Linear we hook. Accumulates H = sum_t x_t · x_t^T (FP32, K×K).
 
-    We accumulate in FP32 on the CPU side to keep GPU memory free for the
-    forward pass. The transfer per token is K*4 bytes — for K=4096 that's
-    16 KB per linear per token, ~5 MB per layer per token — fits in PCIe
-    bandwidth.
+    Two accumulation modes (`accum_device`):
+
+    - "gpu" (default, ~20× faster): keep the K×K accumulator on the SAME device
+      as the module's activations and do the outer product as an on-GPU
+      `addmm_` (H += xᵀx). No per-sequence host transfer of the [N,K]
+      activations and no slow CPU BLAS gemm — only the final K×K block is
+      copied to host. VRAM cost is Σ K² across hooked linears; fits easily for
+      ≤9B on big-VRAM boxes (e.g. Strix Halo 96 GB). The accumulator is
+      allocated lazily on first update so it lands on the activation's own
+      device (correct under HF `device_map="auto"` offload).
+
+    - "cpu" (fallback for VRAM-constrained big models, e.g. 27B on 24 GB):
+      transfer [N,K] to host and accumulate with numpy BLAS — the original
+      behavior. Slower but bounded VRAM.
 
     Promoted to FP64 only at the quantizer for Cholesky (per plan v2 §2).
     """
 
-    def __init__(self, name: str, K: int) -> None:
+    def __init__(self, name: str, K: int, accum_device: str = "gpu") -> None:
         self.name = name
         self.K = K
-        # FP32 accumulator. K=12288 → 576 MB. For 27B's largest tensor we'd
-        # need ~600 MB host RAM per Hessian; manageable.
-        self.H = np.zeros((K, K), dtype=np.float32)
+        self.accum_device = accum_device
+        # Lazily allocated on first update (GPU: on the activation's device;
+        # CPU: numpy host array). K=12288 → 576 MB per Hessian either way.
+        self.H = None  # torch.Tensor (gpu) or np.ndarray (cpu)
         self.n_tokens = 0
 
-    def update(self, x_2d: np.ndarray) -> None:
-        """x_2d: shape [num_tokens, K] in FP32 on CPU.
-
-        We use BLAS gemm via numpy: H += x.T @ x. Single-precision; the
-        rounding error per accumulation is ~1 ULP per entry per token —
-        across 262k tokens, accumulated error stays well below the
-        damping λ that GPTQ adds anyway.
-        """
-        assert x_2d.ndim == 2 and x_2d.shape[1] == self.K, \
-            f"{self.name}: shape mismatch {x_2d.shape} vs K={self.K}"
-        # numpy's gemm path: x.T @ x is the standard outer-product
-        # accumulation. For x shape [N, K], x.T @ x gives [K, K].
-        self.H += x_2d.T @ x_2d
-        self.n_tokens += x_2d.shape[0]
+    def update(self, x: "torch.Tensor") -> None:
+        """x: shape [num_tokens, K], any dtype, on the forward device."""
+        assert x.ndim == 2 and x.shape[1] == self.K, \
+            f"{self.name}: shape mismatch {tuple(x.shape)} vs K={self.K}"
+        if self.accum_device == "gpu":
+            xf = x.to(dtype=torch.float32)
+            if self.H is None:
+                self.H = torch.zeros(self.K, self.K, dtype=torch.float32, device=xf.device)
+            # H += xᵀ·x as a single fused in-place GPU gemm.
+            self.H.addmm_(xf.t(), xf)
+        else:
+            x_np = x.to(dtype=torch.float32).detach().cpu().numpy()
+            if self.H is None:
+                self.H = np.zeros((self.K, self.K), dtype=np.float32)
+            self.H += x_np.T @ x_np
+        self.n_tokens += x.shape[0]
 
     def finalize(self) -> np.ndarray:
-        """Returns H / n_tokens (the actual expectation E[x x^T])."""
-        if self.n_tokens == 0:
-            return self.H  # uninitialized — caller must skip
-        return self.H / self.n_tokens
+        """Returns H / n_tokens (the expectation E[x xᵀ]) as a host fp32 array."""
+        if self.n_tokens == 0 or self.H is None:
+            return np.zeros((self.K, self.K), dtype=np.float32)  # caller skips
+        if isinstance(self.H, np.ndarray):
+            return self.H / self.n_tokens
+        # GPU tensor → divide on device, then one K×K host copy.
+        return (self.H / self.n_tokens).to(dtype=torch.float32).cpu().numpy()
 
 
 def build_hook(acc: HessianAccumulator):
     """Returns a forward-pre hook that captures the input activations.
 
-    Hooks are registered on `nn.Linear`; the input is `x` (the matmul
-    input, shape [..., K]). We flatten leading dims and move to CPU FP32
-    before accumulating.
+    Hooks are registered on `nn.Linear`; the input is `x` (the matmul input,
+    shape [..., K]). We flatten leading dims and hand the GPU tensor straight
+    to the accumulator — the gemm + transfer policy lives in `update`.
     """
 
     def hook(module, inputs):  # noqa: ARG001 — module is unused but required by API
         x = inputs[0]
         if x.dim() > 2:
             x = x.reshape(-1, x.size(-1))
-        # Cast to FP32 on the GPU then transfer — avoids a host-side
-        # cast and minimizes PCIe bytes (BF16→FP32 is 2x more bytes,
-        # but the .cpu() transfer is the bottleneck either way).
-        x_cpu = x.to(dtype=torch.float32).detach().cpu().numpy()
-        acc.update(x_cpu)
+        acc.update(x.detach())
 
     return hook
 
@@ -267,9 +279,23 @@ def load_calibration_text(corpus: str, n_sequences: int, ctx_len: int,
             ds = load_dataset(ds_name, cfg, split="train", trust_remote_code=False)
         else:
             ds = load_dataset(corpus, split="train", trust_remote_code=False)
-        # Concatenate text rows; the dataset's "text" field is conventional.
+        # Concatenate text rows up to a char budget covering the tokens we need,
+        # then tokenize. Avoids tokenizing the ENTIRE dataset (e.g. all of
+        # wikitext-train, millions of tokens) to use only n_sequences×ctx_len.
+        # ~8 chars/token slack (matches perplexity.rs) + 2× margin for safety.
         text_field = "text" if "text" in ds.column_names else ds.column_names[0]
-        text = "\n\n".join(row[text_field] for row in ds if row[text_field].strip())
+        char_budget = n_sequences * ctx_len * 8 * 2
+        parts: list[str] = []
+        n_chars = 0
+        for row in ds:
+            t = row[text_field]
+            if not t.strip():
+                continue
+            parts.append(t)
+            n_chars += len(t) + 2  # +2 for the "\n\n" join
+            if n_chars >= char_budget:
+                break
+        text = "\n\n".join(parts)
         all_tokens = tokenizer(text, return_tensors="pt").input_ids[0]
 
     n_total_tokens = all_tokens.shape[0]
@@ -302,6 +328,12 @@ def main():
     ap.add_argument("--dtype", default="bfloat16",
                     choices=["bfloat16", "float16", "float32"],
                     help="Model dtype (default bfloat16).")
+    ap.add_argument("--accum", default="gpu", choices=["gpu", "cpu"],
+                    help="Hessian outer-product accumulation device. 'gpu' "
+                         "(default, ~20x faster): on-device addmm_, only the "
+                         "final K×K copied to host (VRAM = Σ K²; fits ≤9B on "
+                         "big-VRAM boxes). 'cpu': transfer [N,K] + numpy gemm "
+                         "(original behavior; use for VRAM-constrained big models).")
     args = ap.parse_args()
 
     print(f"=== Hessian collector — Stage B Phase 1.1 ===")
@@ -312,6 +344,8 @@ def main():
           f"= {args.n_sequences * args.ctx_len} calibration tokens")
     print(f"  device:       {args.device}")
     print(f"  dtype:        {args.dtype}")
+    print(f"  accum:        {args.accum} "
+          f"({'on-GPU addmm_, K×K host copy at end' if args.accum == 'gpu' else 'host numpy gemm (original)'})")
 
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
 
@@ -360,7 +394,7 @@ def main():
                 continue
             if stored != mod_name:
                 name_remap_count += 1
-            accs[stored] = HessianAccumulator(stored, K)
+            accs[stored] = HessianAccumulator(stored, K, accum_device=args.accum)
             handles.append(module.register_forward_pre_hook(build_hook(accs[stored])))
     print(f"      {name_remap_count} of {len(accs)} names remapped from in-memory "
           f"→ stored (multimodal-flatten translation)")
