@@ -195,6 +195,42 @@ impl LlamaModel {
             .map(|t| t.shape.iter().product())
             .collect()
     }
+
+    /// Layernorm-only trainable params (faithful QTIP recovery, no LoRA): per
+    /// layer `[norm1, norm2]`, then the final norm. Matches `flatten_norm_grads`.
+    /// This is the Path-A export set — tuning only the fp norms leaves the
+    /// trellis codes exportable as-is (lossless servable export).
+    pub fn norm_params(&self) -> Vec<&GpuTensor> {
+        let mut v = Vec::with_capacity(self.layers.len() * 2 + 1);
+        for (w, _) in &self.layers {
+            v.push(&w.norm1);
+            v.push(&w.norm2);
+        }
+        v.push(&self.final_norm);
+        v
+    }
+
+    pub fn norm_param_sizes(&self) -> Vec<usize> {
+        self.norm_params()
+            .iter()
+            .map(|t| t.shape.iter().product())
+            .collect()
+    }
+}
+
+/// Flatten norm grads to match `norm_params()`: per layer `[dnorm1, dnorm2]`,
+/// then `d_final_norm`.
+pub fn flatten_norm_grads<'a>(
+    grads: &'a [BlockLoraGrad],
+    d_final_norm: &'a GpuTensor,
+) -> Vec<&'a GpuTensor> {
+    let mut v = Vec::with_capacity(grads.len() * 2 + 1);
+    for g in grads {
+        v.push(&g.dnorm1);
+        v.push(&g.dnorm2);
+    }
+    v.push(d_final_norm);
+    v
 }
 
 /// Flatten recovery grads to match `recovery_params()`: per layer
