@@ -3196,6 +3196,10 @@ pub const SOFTMAX_TRAIN_SRC: &str = include_str!("../../../kernels/src/softmax_t
 /// SwiGLU (silu(gate)*up) forward+backward (fp32), un-fused training path.
 pub const SWIGLU_TRAIN_SRC: &str = include_str!("../../../kernels/src/swiglu_train.hip");
 
+/// Fused cross-entropy (logsoftmax+NLL) fwd+bwd with ignore_index masking.
+pub const CROSS_ENTROPY_TRAIN_SRC: &str =
+    include_str!("../../../kernels/src/cross_entropy_train.hip");
+
 /// LayerNorm with bias: out = gamma * (x - mean) / sqrt(var + eps) + beta
 /// Grid=[batch], Block=[min(256, n)].
 pub const LAYERNORM_SRC: &str = include_str!("../../../kernels/src/layernorm.hip");

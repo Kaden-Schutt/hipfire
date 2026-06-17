@@ -40626,6 +40626,48 @@ impl Gpu {
         }
     }
 
+    /// Fused cross-entropy fwd+bwd (fp32). `logits`,`d_logits`: `[rows*v]`;
+    /// `targets`,`loss`: `[rows]` (targets integer-valued f32). `d_logits` is the
+    /// SUM-reduction gradient (divide by valid-token count for mean).
+    #[allow(clippy::too_many_arguments)]
+    pub fn cross_entropy_train(
+        &mut self,
+        logits: &GpuTensor,
+        targets: &GpuTensor,
+        loss: &GpuTensor,
+        d_logits: &GpuTensor,
+        rows: usize,
+        v: usize,
+        ignore_index: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "cross_entropy_train",
+            kernels::CROSS_ENTROPY_TRAIN_SRC,
+            "cross_entropy_train",
+        )?;
+        let func = &self.functions["cross_entropy_train"];
+        let mut lp = logits.buf.as_ptr();
+        let mut tp = targets.buf.as_ptr();
+        let mut losp = loss.buf.as_ptr();
+        let mut dlp = d_logits.buf.as_ptr();
+        let mut rowsi = rows as i32;
+        let mut vi = v as i32;
+        let mut ign = ignore_index;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut lp as *mut _ as *mut c_void,
+            &mut tp as *mut _ as *mut c_void,
+            &mut losp as *mut _ as *mut c_void,
+            &mut dlp as *mut _ as *mut c_void,
+            &mut rowsi as *mut _ as *mut c_void,
+            &mut vi as *mut _ as *mut c_void,
+            &mut ign as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(func, [rows as u32, 1, 1], [64, 1, 1], 0, self.stream_ref(), &mut params)
+        }
+    }
+
     /// LayerNorm with bias (batched): out = gamma * (x - mean) / sqrt(var + eps) + beta
     pub fn layernorm_batched(
         &mut self,
