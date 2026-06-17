@@ -12,6 +12,7 @@
 
 pub mod block;
 pub mod config;
+pub mod hfq_patch;
 pub mod loader;
 pub mod model;
 pub mod ops;
