@@ -1,8 +1,27 @@
 # RoughQuant — Phase 2h: foldable outlier protection WINS at low bits
 
-**VERDICT: POSITIVE (reverses the earlier negative).** Foldable protection of the
-shared outlier channels at **Q8** (honest 8-bit cost) + mq4 bulk beats uniform
-FWHT bit-increase by **~25% KLD at ~4.4–4.5 avg-bits** on Qwen3.5-0.8B. The win
+**VERDICT (updated after coherence): KLD win is REAL but does NOT survive
+generation — NOT a deployable win.** The Q8 cost-trick breaks generation
+(hard-loop/empty); bf16-protection is strictly more precise than mq4 yet rambles
+on hard prompts (generation is non-monotonic in weight precision — the analog of
+the pointwise-PPL wiggle). KLD (teacher-forced) does not guarantee free-generation
+coherence. A proper coherence battery is required to settle bf16-protection; the
+Q8 form is out. See "Coherence falsification" below.
+
+_Original (teacher-forced KLD) framing — REAL on the metric, but see coherence:_
+
+**Two framings, both wins (on KLD):**
+
+1. **vs the real production baseline (mq4) — the practical headline:** protecting
+   the top 5% outlier channels at Q8 nearly **HALVES mq4's KLD (0.162→0.088) for
+   +0.19 avg-bits.** There is no `mq5` in hipfire — the only no-protection way to
+   that quality is `mq6` (+2 bits). So this is a cheap, foldable new operating
+   point strictly between mq4 and mq6.
+2. **vs a hypothetical uniform-5-bit Pareto:** still ~25% lower KLD at ~4.4–4.5b.
+
+Foldable protection of the shared outlier channels at **Q8** (honest 8-bit cost)
++ mq4 bulk beats uniform FWHT bit-increase by **~25% KLD at ~4.4–4.5 avg-bits** on
+Qwen3.5-0.8B. The win
 shrinks toward higher bits (the literature's pattern: protection matters most
 when bits are scarce). This is foldable (shared ~75-channel set, no rotation),
 literature-consistent (AWQ/super-weight), and measured cleanly (KLD vs bf16).
@@ -74,3 +93,47 @@ generic FWHT only partially tames, and Q8 fixes them cheaply.
 - KLD via `perplexity --dump-ref/--kld-ref` (the default quant-quality metric now).
 - Supersedes the negative verdicts in phase2e/2f and the "uniform dominates" of
   phase2g: the honest-bit-cost (Q8) result is a low-bit WIN.
+
+## Coherence falsification (the decisive output-axis check)
+
+Generated with `infer_qwen35` (greedy + production guards) on the protect models
+vs mq4:
+
+- **mq4**: coherent, on-topic, terminates (sky → structured Rayleigh answer;
+  capital → "Paris"/"Tokyo"; code → reasonable).
+- **protect-5%-Q8**: CATASTROPHIC — verbatim attractor loop ("Wait, let me check
+  my memory on Blue light vs red/green wavelengths one more time...") ×8, or empty
+  output. The Q8 per-channel quant of the *sensitive outlier* channels
+  destabilizes decoding. Q8-protection is OUT — so protection's real bit-cost is
+  ~bf16 (16b) for those channels, not 8b, which removes the iso-bit win (it only
+  ties uniform at bf16 cost, phase2g).
+- **protect-5%-bf16**: clean on easy prompts (capital→Tokyo) but degrades to
+  rambling/self-contradiction (sky) and broken code (Fibonacci). Yet it is
+  STRICTLY more precise than mq4 (= mq4 for 95% of channels + bf16 for the top
+  5%), and the protect-0% control via the same path generates cleanly (matches
+  mq4). So the rambling is **generation non-monotonicity** — small weight changes
+  (even improvements) reroute greedy decoding — not a path bug and not necessarily
+  systematic degradation. Inconclusive from anecdotes.
+
+## Corrected bottom line
+
+- Outliers are real, shared (~75 dims), foldable; protecting them genuinely
+  improves teacher-forced KLD (halves mq4's). Literature-consistent.
+- BUT: (a) cheap Q8-protection breaks generation, (b) bf16-protection (the viable
+  form) only ties uniform at iso-bits AND has unresolved generation coherence.
+- So NO clean DEPLOYABLE win — but for the now-correct reason: protecting the
+  sensitive outliers needs ~bf16 precision (Q8 destabilizes), which costs too many
+  bits to beat uniform; and KLD does not predict generation coherence.
+- **Meta-lesson (3rd time this session): coherence batteries must gate, not
+  PPL/KLD.** Generation quality is non-monotonic in weight precision.
+
+## Decisive next step
+
+Run protect-5%-bf16 through a real coherence battery (many prompts + aggregate
+detectors: unique-token-ratio, n-gram density, attractor — `hipfire-detect`),
+not anecdotes, to settle whether bf16-protection is systematically degraded or
+just trajectory-noisy vs mq4. (coherence_probe is currently broken — missing std
+imports under deltanet,experimental-examples; would need a fix or a thin harness
+over the detectors.) If bf16-protection passes the battery AND a fair iso-bit
+coherence comparison vs mq4, it's a candidate; otherwise RoughQuant stays
+non-deployable on 0.8B.
