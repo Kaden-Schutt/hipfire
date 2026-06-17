@@ -4390,8 +4390,9 @@ fn load_rq_corrections(
     if !map.is_empty() {
         eprintln!(
             "  roughquant: loaded {n_r} reader + {n_w} writer corrections \
-             (NOTE: applied in the hand forward path; HIPFIRE_FORWARD_LOWERED=0 \
-             required — lowered super-op path not yet wired)"
+             (DORMANT by default — hand path is broken; opt in with HIPFIRE_RQ_HAND=1 \
+             for experiments; lowered super-op wiring is the verdict path. See \
+             docs/roughquant/phase3-real-format-scope.md)"
         );
     }
     Ok(map)
@@ -22128,9 +22129,16 @@ fn forward_scratch_layers(
     // single-GPU decode through the lowered super-op executor. Skipped when a
     // hidden-state ring buffer is active (spec-decode capture engages only the
     // hand path for now). Default off → the hand arms below run unchanged.
-    // RoughQuant corrections are wired into THIS hand path (not the lowered
-    // super-op executor), so route models carrying a correction side-map here.
-    if forward_lowered_enabled() && hidden_rb.is_none() && weights.rq_corrections.is_empty() {
+    // RoughQuant corrections are wired into THIS hand path, but the hand path is
+    // currently broken (bf16 self-KLD 13.89 vs lowered 0.000 — see
+    // docs/roughquant/phase3-real-format-scope.md). Until it is resurrected OR the
+    // correction is wired into the lowered super-op executor, route rq models to
+    // the hand path ONLY under the opt-in HIPFIRE_RQ_HAND=1 (experiments); by
+    // default rq models use the working (uncorrected) lowered path so they stay
+    // coherent. The correction stack stays as a proven, dormant foundation.
+    let rq_hand_optin = !weights.rq_corrections.is_empty()
+        && std::env::var("HIPFIRE_RQ_HAND").as_deref() == Ok("1");
+    if forward_lowered_enabled() && hidden_rb.is_none() && !rq_hand_optin {
         return forward_scratch_layers_lowered(gpu, weights, config, pos, kv_cache, dn_state, s);
     }
 

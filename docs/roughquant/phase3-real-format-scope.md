@@ -156,6 +156,18 @@ Implemented the full correction stack and wired it into the **hand** forward pat
    staleness interaction — a pre-existing issue, not roughquant). So the hand path
    can't produce the clean ~0.084 verdict number.
 
+**Update (deferred 2026-06-17):** further isolation showed the hand path is not
+merely divergent but **catastrophically broken** — plain **bf16** through the hand
+path gives self-KLD **13.89** vs lowered **0.000** (the hand path produces
+near-random output, independent of roughquant). So "fix the hand path" = resurrect
+dead code, and the only working forward is the lowered super-op executor. Per the
+product owner, #10c is **DEFERRED** at proven-mechanism. The rq→hand routing is now
+gated behind opt-in `HIPFIRE_RQ_HAND=1`; by default rq models use the working
+(uncorrected) lowered path and stay coherent, with the correction stack dormant.
+The verdict requires wiring the correction into the lowered super-op executor
+(`run_layer_program`) — the scoped follow-up, to be gated by the product call (vs
+mq6).
+
 **Mechanism IS proven**: in the hand path, corrections reduce KLD 0.598 → 0.571
 (real reduction; the math + kernels + loader are correct, consistent with the
 standalone `rq_real_gemv_check` proof). The remaining work for the shippable
