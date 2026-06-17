@@ -19,10 +19,21 @@ analysis (`scripts/roughquant_energy_cdf.py`, see `phase2e`) shows why: raw/
 foldable-basis energy is ~uniform (top 1% of residual channels = 21%, no knee);
 concentration exists ONLY in the un-foldable per-weight eigenbasis (top 1% of
 eigenvalues = 42–81%). So NO variant — foldable or not — beats mq4 on 0.8B.
-Phase 3 NOT pursued. Remaining avenues: learned block-diagonal rotation (foldable
-in-kernel like mq4's FWHT but data-fitted; user's chosen next direction),
-cross-model 7B/9B. Derived from ResQ (2412.14363), adapted to hipfire (weight-only,
-GQA, multi-tier, fp32 super-bin) + the "roughquant" lever.
+Phase 3 NOT pursued. **CORRECTION (phase2g):** the "energy is spread / no foldable
+concentration" reading was WRONG — an aggregation artifact + PPL noise. Per-tensor
+outliers are strong (max/med up to 283×, kurtosis 391) and SHARED across layers
+(~75 persistent residual dims; union of top-2% over 48 input-points = 75/1024).
+Foldable shared-outlier protection HALVES mq4's KLD (0.162→0.084 at +0.6 bits) —
+literature-consistent. BUT uniform mq6 still dominates at iso-bits (0.0084 vs
+protect-15% 0.057 at ~6b) because mq4's per-256 FWHT already does incoherence
+processing (the papers' protection wins are over naive RTN) and the bulk carries
+~1/3 of the error (only uniform-bit-increase fixes it). Deployment verdict
+unchanged (uniform ≥ protection on a strong baseline); the mechanism is now
+correctly understood & reconciled with the literature. Untested: Q8 (vs bf16)
+protection, persistence-based selection, cross-model 7B/9B. Tooling: KLD now the
+default metric (`perplexity --dump-ref/--kld-ref`); `scripts/roughquant_energy_cdf.py`.
+Derived from ResQ (2412.14363), adapted to hipfire (weight-only, GQA, multi-tier,
+fp32 super-bin) + the "roughquant" lever.
 
 ## Lineage / what's new
 
