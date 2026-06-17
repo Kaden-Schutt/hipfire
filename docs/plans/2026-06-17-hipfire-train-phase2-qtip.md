@@ -65,6 +65,21 @@ rotation is the same routine with sign vectors swapped. Verified.
       content; recovers from the before-loop. Still small-model artifacts (Senate
       loop) — expected at 50M @ 3-bit.
 
+  - ✅ step 3 (2-bit, the real test): same example with `HIPFIRE_QTIP_BITS=2
+    HIPFIRE_QTIP_STEPS=200`. Initial corpus KL **1.582** (vs 0.367 @3-bit — 2-bit
+    genuinely wrecks the model) → 0.0247 after recovery. Continuations of "The
+    Roman Empire was":
+    - before recovery: "the most influential in the political and the political
+      age … the political and the political age was not always a good" —
+      degenerate repetition loop (2-bit broke it).
+    - after recovery: "established by the Greeks and Romans … were not able to
+      establish a strong presence in the Middle East" — fluent, grammatical,
+      on-topic; echoes the teacher's "established …" / "Middle East". Rescued
+      from the loop. (Factually loose — it matches the teacher's *distribution*
+      on the calibration domain, recovering fluency, not facts.)
+    This is the rescue-from-degradation case: at 2-bit, recovery FT clearly
+    matters (KL 1.58→0.02, degenerate loop → coherent prose).
+
   **PHASE 2 COMPLETE** — QTIP-style recovery tuning works end to end: quantize →
   measure damage → distill (codes frozen, LoRA+layernorms tuned) → coherent
   generation, with recovery measurably improving the quantized student. Honest

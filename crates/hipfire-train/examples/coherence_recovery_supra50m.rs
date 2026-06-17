@@ -24,13 +24,16 @@ use std::path::Path;
 const MODEL_DIR: &str =
     "/srv/huggingface/models--SupraLabs--Supra-50M-Instruct/snapshots/77a1c2a33f386f9f4bf7151ec5f2156b62caac39";
 const L: usize = 32; // seq length for both distill chunks and generation
-const BITS: u32 = 3;
 const BEAM: usize = 32;
 const RANK: usize = 16;
 const ALPHA: f32 = 32.0;
 const LR: f32 = 1e-3;
-const STEPS: usize = 120;
 const PROMPT: &str = "The Roman Empire was";
+// Bit-width and step count are env-tunable (QTIP-2 needs more recovery than -3):
+//   HIPFIRE_QTIP_BITS (default 3), HIPFIRE_QTIP_STEPS (default 120).
+fn env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
 
 const CORPUS: &str = "The Roman Empire was one of the largest empires in ancient history. At its \
 height it controlled vast territories across Europe, North Africa, and the Middle East. Roman \
@@ -41,14 +44,14 @@ economic troubles, and political instability. The western half eventually fell, 
 half continued as the Byzantine Empire for another thousand years. Roman law, architecture, and \
 culture continue to influence the modern world to this day in countless ways.";
 
-fn quantize_linears(gpu: &mut Gpu, w: &mut LlamaWeightsF32) -> Result<(), Box<dyn std::error::Error>> {
+fn quantize_linears(gpu: &mut Gpu, w: &mut LlamaWeightsF32, bits: u32) -> Result<(), Box<dyn std::error::Error>> {
     for l in w.layers.iter_mut() {
         for t in [
             &mut l.q_proj, &mut l.k_proj, &mut l.v_proj, &mut l.o_proj,
             &mut l.gate_proj, &mut l.up_proj, &mut l.down_proj,
         ] {
             let host = gpu.download_f32(t)?;
-            let q = qtip_quantize_dequant(&host, BITS, BEAM);
+            let q = qtip_quantize_dequant(&host, bits, BEAM);
             *t = gpu.upload_f32(&q, &t.shape.clone())?;
         }
     }
@@ -87,8 +90,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (cfg, w_teacher) = load_llama_fp32(&mut gpu, dir)?;
     let (_, mut w_student) = load_llama_fp32(&mut gpu, dir)?;
     let vocab = cfg.vocab_size;
-    println!("quantizing student to QTIP-{BITS}...");
-    quantize_linears(&mut gpu, &mut w_student)?;
+    let bits = env_u32("HIPFIRE_QTIP_BITS", 3);
+    let steps = env_u32("HIPFIRE_QTIP_STEPS", 120) as usize;
+    println!("quantizing student to QTIP-{bits}...");
+    quantize_linears(&mut gpu, &mut w_student, bits)?;
 
     let teacher = LlamaModel::from_f32_weights(&mut gpu, &cfg, w_teacher, L, RANK, ALPHA)?;
     let student = LlamaModel::from_f32_weights(&mut gpu, &cfg, w_student, L, RANK, ALPHA)?;
@@ -118,7 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut opt = AdamW::new(&mut gpu, &sizes, LR, 0.9, 0.999, 1e-8, 0.0)?;
     println!("recovery FT ({} trainable tensors)...", sizes.len());
     let mut last = 0.0f32;
-    for step in 0..STEPS {
+    for step in 0..steps {
         let mut total = 0.0f32;
         for (ci, toks) in chunks.iter().enumerate() {
             let acts = model_forward(&mut gpu, &student, toks, &pos)?;
@@ -139,11 +144,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gen_after = generate(&mut gpu, &student, &prompt_ids, vocab)?;
 
     let plen = prompt_ids.len();
-    println!("\n══ greedy continuations of {PROMPT:?} ══");
+    println!("\n══ greedy continuations of {PROMPT:?}  (QTIP-{bits}) ══");
     println!("TEACHER (fp32):        {}", tok.decode(&gen_teacher[plen..L]));
     println!("STUDENT before recov:  {}", tok.decode(&gen_before[plen..L]));
     println!("STUDENT after  recov:  {}", tok.decode(&gen_after[plen..L]));
     println!("\n(corpus KL dropped over FT; compare whether 'after' reads closer to the");
-    println!(" teacher / more coherent than 'before' — eyeball test for a 50M @ 3-bit model.)");
+    println!(" teacher / more coherent than 'before' — eyeball test for a 50M @ {bits}-bit model.)");
     Ok(())
 }
