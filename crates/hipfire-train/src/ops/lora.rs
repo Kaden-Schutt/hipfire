@@ -62,6 +62,7 @@ pub fn lora_backward(
     n: usize,
     r: usize,
     scale: f32,
+    accumulate_dx: bool, // add into dx instead of overwriting (q/k/v fan-in)
 ) -> HipResult<()> {
     // dyl = scale·dy
     gpu.memcpy_dtod_auto(&dyl.buf, &dy.buf, m * n * 4)?;
@@ -74,8 +75,9 @@ pub fn lora_backward(
     // dA = dhᵀ·x  [r,k]
     linear_backward_w(gpu, dh, x, da, m, k, r, false)?;
 
-    // dx = dy·W (base) + dh·A (lora)
-    linear_backward_x(gpu, dy, w, dx, m, k, n, false)?;
-    linear_backward_x(gpu, dh, a, dx, m, k, r, true)?; // accumulate
+    // dx += dy·W (base) + dh·A (lora). The base term honors accumulate_dx; the
+    // lora term always accumulates on top of it.
+    linear_backward_x(gpu, dy, w, dx, m, k, n, accumulate_dx)?;
+    linear_backward_x(gpu, dh, a, dx, m, k, r, true)?;
     Ok(())
 }

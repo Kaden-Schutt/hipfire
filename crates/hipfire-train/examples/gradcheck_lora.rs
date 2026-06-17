@@ -67,7 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = gpu.zeros(&[N * R], DType::F32)?;
     let dx = gpu.zeros(&[M * K], DType::F32)?;
     lora_backward(
-        &mut gpu, &dy, &x, &w, &a, &b, &h, &dyl, &dh, &da, &db, &dx, M, K, N, R, SCALE,
+        &mut gpu, &dy, &x, &w, &a, &b, &h, &dyl, &dh, &da, &db, &dx, M, K, N, R, SCALE, false,
     )?;
     let da_a = gpu.download_f32(&da)?;
     let db_a = gpu.download_f32(&db)?;
