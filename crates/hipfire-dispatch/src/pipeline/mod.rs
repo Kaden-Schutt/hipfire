@@ -10,6 +10,81 @@ use std::sync::OnceLock;
 #[allow(unused_imports)]
 use hip_bridge;
 
+// ── REAP probe (HIPFIRE_REAP_PROBE=1) ───────────────────────────────────────
+// Accumulates per-(layer, expert): (count, gate_weight_sum, contribution_mass)
+// where contribution_mass = Σ gate_weight_i × ‖expert_output_i‖₂ per token.
+// Thread-safe via Mutex. Layer index is set by the arch crate before each call
+// via REAP_LAYER_IDX. Disabled by default (zero overhead when env var unset).
+static REAP_ENABLED: OnceLock<bool> = OnceLock::new();
+
+/// Set by the arch crate (qwen35.rs) before each moe_ffn_decode call.
+/// Value = the layer index this MoE call belongs to.
+pub static REAP_LAYER_IDX: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Per-(layer, expert) REAP accumulators: [count, gate_sum, contribution_mass]
+static REAP_ACC: OnceLock<std::sync::Mutex<Vec<Vec<[f64; 3]>>>> = OnceLock::new();
+/// (n_layers, n_experts) seen on first MoE call.
+static REAP_DIMS: OnceLock<(usize, usize)> = OnceLock::new();
+
+fn reap_enabled() -> bool {
+    *REAP_ENABLED.get_or_init(|| std::env::var("HIPFIRE_REAP_PROBE").ok().as_deref() == Some("1"))
+}
+
+/// Called once (first probe call) to size the accumulator.
+fn reap_init(n_layers: usize, n_exp: usize) {
+    REAP_DIMS.get_or_init(|| (n_layers, n_exp));
+    REAP_ACC.get_or_init(|| {
+        std::sync::Mutex::new(vec![vec![[0f64; 3]; n_exp]; n_layers])
+    });
+}
+
+/// Accumulate one token's routing data.
+/// `topk_idx_raw`: k f32 values reinterpreted as i32 (GPU side stores i32 in F32 slots).
+/// `topk_w`: k renorm'd routing weights.
+/// `down_exp`: [k × hidden] f32 per-expert down-projection outputs (before combine).
+fn reap_accumulate(layer: usize, k: usize, hidden: usize,
+    topk_idx_raw: &[f32], topk_w: &[f32], down_exp: &[f32])
+{
+    let acc_lock = match REAP_ACC.get() {
+        Some(m) => m,
+        None => return,
+    };
+    let mut acc = match acc_lock.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let layer_acc = match acc.get_mut(layer) {
+        Some(l) => l,
+        None => return,
+    };
+    for slot in 0..k.min(topk_idx_raw.len()).min(topk_w.len()) {
+        // GPU stores i32 expert index in F32 memory — transmute.
+        let expert_id = i32::from_le_bytes(topk_idx_raw[slot].to_le_bytes()) as usize;
+        let gate_w = topk_w[slot] as f64;
+        // down_exp layout: [k × hidden], slot-major.
+        let start = slot * hidden;
+        let end = start + hidden;
+        if end > down_exp.len() { continue; }
+        let norm: f64 = down_exp[start..end].iter()
+            .map(|&v| (v as f64) * (v as f64)).sum::<f64>().sqrt();
+        if let Some(row) = layer_acc.get_mut(expert_id) {
+            row[0] += 1.0;
+            row[1] += gate_w;
+            row[2] += gate_w * norm;
+        }
+    }
+}
+
+/// Called by the probe example to retrieve accumulated data.
+/// Returns Vec<Vec<[f64; 3]>> indexed [layer][expert] = [count, gate_sum, mass].
+pub fn reap_take_dump() -> Option<(usize, usize, Vec<Vec<[f64; 3]>>)> {
+    let (nl, ne) = REAP_DIMS.get().copied()?;
+    let acc = REAP_ACC.get()?.lock().ok()?;
+    Some((nl, ne, acc.clone()))
+}
+// ── end REAP probe ───────────────────────────────────────────────────────────
+
 pub(crate) mod steps;
 pub use steps::{execute_steps, FusedPattern, GemvInput, Step};
 
@@ -440,6 +515,21 @@ pub fn run_moe_decode(
     // experts read zeroed weights (load-time dummy-fill) → contribute 0, so the
     // all-reduced sum of partials equals the full single-GPU combine.
     hip!(gpu.moe_down_combine_k8_batched(p.down_expanded, p.topk_weights, out_target, down_m, p.k, 1))?;
+
+    // ── REAP probe hook (HIPFIRE_REAP_PROBE=1) ───────────────────────────────
+    if reap_enabled() {
+        let layer = REAP_LAYER_IDX.load(std::sync::atomic::Ordering::Relaxed) as usize;
+        let _ = gpu.hip.device_synchronize();
+        reap_init(64, p.n_exp); // 64-layer upper bound; trimmed on dump
+        if let (Ok(idx_raw), Ok(weights_raw), Ok(down_raw)) = (
+            gpu.download_f32(p.topk_indices),
+            gpu.download_f32(p.topk_weights),
+            gpu.download_f32(p.down_expanded),
+        ) {
+            reap_accumulate(layer, p.k, p.hidden, &idx_raw, &weights_raw, &down_raw);
+        }
+    }
+    // ── end REAP probe hook ──────────────────────────────────────────────────
 
     Ok(())
 }

@@ -97,8 +97,9 @@ impl ArchPredicate {
             Self::HasDot2F32F16 => ctx.arch.has_dot2_f32_f16(),
             Self::HasSdot4 => ctx.arch.has_hfq3_sdot4(),
             // MQ6/HFQ6 GEMV ships on RDNA4 (gemv_mq6g256_prerotated has a gfx12 build);
-            // has_mmq is gfx906||rdna3 only, so admit RDNA4 explicitly.
-            Self::HasMmq => ctx.arch.has_mmq() || ctx.arch.is_rdna4(),
+            // has_mmq is gfx906||rdna3 only, so admit RDNA4 explicitly. CDNA3 (gfx942)
+            // also runs the generic no-intrinsic MQ6/HFQ6 GEMV (same as gfx906 wave64).
+            Self::HasMmq => ctx.arch.has_mmq() || ctx.arch.is_rdna4() || ctx.arch.is_cdna3(),
             Self::HasCdna3LdsGemv => ctx.arch.has_cdna3_lds_gemv(),
             Self::HasDp4a => ctx.arch.gemv_dp4a_enabled(),
         }

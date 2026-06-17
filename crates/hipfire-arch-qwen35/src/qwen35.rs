@@ -12053,6 +12053,7 @@ fn forward_scratch_layers(
                 }
 
                 // ── MoE FFN ──
+                hipfire_dispatch::pipeline::REAP_LAYER_IDX.store(layer_idx as u32, std::sync::atomic::Ordering::Relaxed);
                 moe_ffn_dispatch(gpu, &layer.ffn, &s.x, &layer.ffn_norm, config, s)?;
                 // DIAG: dump MoE router logits (per-token)
                 if layer_idx == 0 {
@@ -12120,6 +12121,7 @@ fn forward_scratch_layers(
                 }
 
                 // ── MoE FFN ──
+                hipfire_dispatch::pipeline::REAP_LAYER_IDX.store(layer_idx as u32, std::sync::atomic::Ordering::Relaxed);
                 moe_ffn_dispatch(gpu, &layer.ffn, &s.x, &layer.ffn_norm, config, s)?;
 
                 if let Some(ref rb) = hidden_rb {
@@ -12978,6 +12980,9 @@ fn forward_scratch_layers_lowered(
     for layer_idx in 0..config.n_layers {
         let layer = &weights.layers[layer_idx];
         let program = lower_variant(variant_of(layer));
+        // REAP probe: tag the upcoming MoE super-op with its layer index so the
+        // run_moe_decode hook attributes contribution mass to the right layer.
+        hipfire_dispatch::pipeline::REAP_LAYER_IDX.store(layer_idx as u32, std::sync::atomic::Ordering::Relaxed);
         {
             let mut bind = Qwen35Bindings {
                 layer,
