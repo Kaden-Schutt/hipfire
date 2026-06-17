@@ -125,6 +125,43 @@ those weights; writers similar. Net decode-time overhead likely a few %. If that
 holds and KLD stays halved with coherence intact, it's a real intermediate
 operating point between mq4 (4.25b) and mq6 (6.25b) that mq5 doesn't fill.
 
+## Forward-wiring attempt (2026-06-17) — hand path DONE, lowered path is the blocker
+
+Implemented the full correction stack and wired it into the **hand** forward path
+(`forward_scratch_layers`):
+- **Kernels** (`kernels/src/rq_correction.hip`): `rq_gather_f32` (xs = x[S], padded
+  to pow2) + `rq_scatter_add_f32` (y[S] += c) + dispatch wrappers.
+- **Loader** (`load_rq_corrections`): reads `metadata["roughquant_sidecar"]` +
+  `.rqcorr` bf16 tensors into a `(layer_idx, RqProj) -> RqCorr` side-map on
+  `Qwen35Weights` (pads reader corr to pow2). Verified: 138 reader + 48 writer
+  corrections loaded on 0.8B @ 5%.
+- **Apply** (`rq_apply_readers` / `rq_apply_writer`): reader = explicit
+  original-frame `rmsnorm(x)` → gather S → `gemv_f32(corr)` → `add_inplace`;
+  writer = `gemv_f32(corr)` → `rq_scatter_add`. Wired at all 12 DeltaNet +
+  FullAttn projection sites. Gated on side-map presence ⇒ **byte-identical for
+  non-roughquant models** (coherence-safe).
+
+**Two blocking findings (why the clean verdict isn't measured yet):**
+1. **The default decode path is the LOWERED super-op executor, NOT the hand
+   path.** `forward_scratch_layers` returns `forward_scratch_layers_lowered` at
+   entry unless `HIPFIRE_FORWARD_LOWERED=0`. The lowered path runs each layer as a
+   `LayerProgram` through `hipfire_dispatch::pipeline::superop::run_layer_program`
+   — a generic cross-crate super-op executor with NO per-projection hook. Wiring
+   the correction there (correction super-ops in the IR, or a post-projection bind
+   hook) is a separate, larger, cross-crate task than the hand path.
+2. **The hand path is NOT a valid baseline — it diverges from lowered.** On plain
+   mq4 (no sidecar, FP32 DeltaNet state, ctx 1024): hand path KLD = **0.598** vs
+   lowered = **0.158** for the SAME weights. The "byte-identical" claim in the
+   lowered-path docstring does not hold under this config (likely an FP32-state or
+   staleness interaction — a pre-existing issue, not roughquant). So the hand path
+   can't produce the clean ~0.084 verdict number.
+
+**Mechanism IS proven**: in the hand path, corrections reduce KLD 0.598 → 0.571
+(real reduction; the math + kernels + loader are correct, consistent with the
+standalone `rq_real_gemv_check` proof). The remaining work for the shippable
+verdict is wiring the correction into the lowered super-op executor and measuring
+KLD there (lowered mq4 0.158 → target ~0.084), then coherence + tok/s.
+
 ## Open / decision (updated 2026-06-17 — DECISION POINT)
 
 Everything cheap and decisive is now DONE: importance science (diag ρ=0.90),

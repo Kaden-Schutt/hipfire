@@ -2362,6 +2362,11 @@ pub const ADD_SRC: &str = include_str!("../../../kernels/src/add.hip");
 /// Element-wise in-place add: a[i] += b[i]
 pub const ADD_INPLACE_SRC: &str = include_str!("../../../kernels/src/add_inplace.hip");
 
+/// RoughQuant sparse-correction gather/scatter (`rq_gather_f32`,
+/// `rq_scatter_add_f32`): move data into/out of the |S|-wide protected-channel
+/// space for the real-format correction GEMV (y += R_S·x_S).
+pub const RQ_CORRECTION_SRC: &str = include_str!("../../../kernels/src/rq_correction.hip");
+
 /// Scaled in-place add: y[i] += c * x[i] — one kernel for both
 /// CPU-scalar (c via kernarg) and GPU-scalar (c via device buffer)
 /// variants. Used in the MoE FFN accumulator to fuse the old

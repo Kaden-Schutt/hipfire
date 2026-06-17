@@ -263,6 +263,17 @@ Remaining for the shippable verdict: wire the correction into the qwen35 forward
 (side-map approach, ~10 forward variants — the coherence-gated step), then measure
 real-model KLD + coherence + tok/s.
 
+**Forward-wiring update (2026-06-17):** the full correction stack (gather/scatter
+kernels + `load_rq_corrections` side-map + `rq_apply_readers/writer`) is
+implemented and wired into the HAND path (`forward_scratch_layers`, all 12
+DeltaNet+FullAttn sites, gated ⇒ no-op for non-rq models). Mechanism proven:
+corrections reduce hand-path KLD 0.598→0.571. BUT (a) the default decode path is
+the **lowered super-op executor** (`run_layer_program`, cross-crate), not the hand
+path — corrections there are NOT yet wired; and (b) the hand path **diverges** from
+lowered on plain mq4 (0.598 vs 0.158, FP32 state) so it can't yield the clean
+verdict. Remaining: wire the lowered super-op path, then measure KLD (lowered mq4
+0.158 → ~0.084) + coherence + tok/s. See phase3-real-format-scope.md.
+
 ## Finding: the 5 permutations — bijectivity verified
 
 `scripts/roughquant_permute_verify.py` + `docs/roughquant/permutation-bijectivity.md`:

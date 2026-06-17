@@ -31160,6 +31160,93 @@ impl Gpu {
         result
     }
 
+    /// RoughQuant reader gather: `dst[j] = src[idx[j]]` for j<n_idx, 0 for the
+    /// power-of-2 padding up to n_out. `idx` is an i32 GpuTensor of length n_idx.
+    pub fn rq_gather_f32(
+        &mut self,
+        src: &GpuTensor,
+        idx: &GpuTensor,
+        dst: &GpuTensor,
+        n_idx: usize,
+        n_out: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("rq_correction", kernels::RQ_CORRECTION_SRC, "rq_gather_f32")?;
+        let src_ptr = src.buf.as_ptr();
+        let idx_ptr = idx.buf.as_ptr();
+        let dst_ptr = dst.buf.as_ptr();
+        let ni = n_idx as i32;
+        let no = n_out as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &src_ptr as *const _ as *mut c_void,
+            &idx_ptr as *const _ as *mut c_void,
+            &dst_ptr as *const _ as *mut c_void,
+            &ni as *const _ as *mut c_void,
+            &no as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((n_out as u32) + block - 1) / block;
+        self.launch_maybe_blob(
+            "rq_gather_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut bb = hip_bridge::KernargBlob::new();
+                bb.push_ptr(src_ptr);
+                bb.push_ptr(idx_ptr);
+                bb.push_ptr(dst_ptr);
+                bb.push_i32(ni);
+                bb.push_i32(no);
+                bb
+            },
+        )
+    }
+
+    /// RoughQuant writer scatter-add: `y[idx[j]] += c[j]` for j<n_idx.
+    pub fn rq_scatter_add_f32(
+        &mut self,
+        y: &GpuTensor,
+        idx: &GpuTensor,
+        c: &GpuTensor,
+        n_idx: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rq_correction",
+            kernels::RQ_CORRECTION_SRC,
+            "rq_scatter_add_f32",
+        )?;
+        let y_ptr = y.buf.as_ptr();
+        let idx_ptr = idx.buf.as_ptr();
+        let c_ptr = c.buf.as_ptr();
+        let ni = n_idx as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &y_ptr as *const _ as *mut c_void,
+            &idx_ptr as *const _ as *mut c_void,
+            &c_ptr as *const _ as *mut c_void,
+            &ni as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((n_idx as u32) + block - 1) / block;
+        self.launch_maybe_blob(
+            "rq_scatter_add_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut bb = hip_bridge::KernargBlob::new();
+                bb.push_ptr(y_ptr);
+                bb.push_ptr(idx_ptr);
+                bb.push_ptr(c_ptr);
+                bb.push_i32(ni);
+                bb
+            },
+        )
+    }
+
     /// c = a * b (element-wise)
     pub fn mul_f32(&mut self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
@@ -42701,6 +42788,7 @@ impl Gpu {
         _n_kv_heads: usize,
         _head_dim: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — unimplemented stub (no GPU work; returns Err)
         Err(hip_bridge::HipError::new(801, "not yet implemented"))
     }
 
@@ -42725,6 +42813,7 @@ impl Gpu {
         _block_start: usize,
         _block_cols: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — unimplemented stub (no GPU work; returns Err)
         Err(hip_bridge::HipError::new(801, "not yet implemented"))
     }
 
@@ -42749,6 +42838,7 @@ impl Gpu {
         _block_start: usize,
         _block_cols: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — unimplemented stub (no GPU work; returns Err)
         Err(hip_bridge::HipError::new(801, "not yet implemented"))
     }
 
@@ -42764,6 +42854,7 @@ impl Gpu {
         _m_up: usize,
         _k: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — unimplemented stub (no GPU work; returns Err)
         Err(hip_bridge::HipError::new(801, "not yet implemented"))
     }
 
@@ -42776,6 +42867,7 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — delegates to gemm_f16 (which binds)
         self.gemm_f16(w, x, y, m, k, n)
     }
 
@@ -42788,6 +42880,7 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — delegates to gemm_f16 (which binds)
         self.gemm_f16(w, x, y, m, k, n)
     }
 }

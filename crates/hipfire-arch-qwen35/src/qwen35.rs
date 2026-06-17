@@ -990,6 +990,46 @@ pub enum LayerWeights {
     FullAttnMoe(FullAttnMoeLayerWeights),
 }
 
+/// RoughQuant real-format protected-channel correction (one per quantized
+/// residual projection that carries a `.rqcorr` sidecar). Applied at GEMV time as
+/// `y += R_S · x_S`, restoring the protected channels to bf16 precision over the
+/// mq4 bulk. See `docs/roughquant/phase3-real-format-scope.md`.
+pub enum RqCorr {
+    /// Residual reader (protected input COLUMNS): gather `xs = x_normed[S]` (padded
+    /// to power-of-2 `np`), `out += corr[m×np] · xs`.
+    Reader {
+        corr: GpuTensor, // [m × np] f32
+        idx: GpuTensor,  // [n_idx] i32 — residual channel ids (gather source)
+        m: usize,
+        n_idx: usize,
+        np: usize,
+    },
+    /// Residual writer (protected output ROWS): `c = corr[|S|×k] · input`, then
+    /// scatter-add `out[S[j]] += c[j]`.
+    Writer {
+        corr: GpuTensor, // [n_s × k] f32
+        idx: GpuTensor,  // [n_s] i32 — residual channel ids (scatter target)
+        n_s: usize,
+        k: usize,
+    },
+}
+
+/// Which projection within a layer a correction targets (keys the side-map).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum RqProj {
+    Wqkv,
+    Wz,
+    Walpha,
+    Wbeta,
+    Wq,
+    Wk,
+    Wv,
+    Wgate,
+    Wup,
+    Wo,
+    Wdown,
+}
+
 pub struct Qwen35Weights {
     pub token_embd: GpuTensor,
     pub embd_format: EmbeddingFormat,
@@ -997,6 +1037,11 @@ pub struct Qwen35Weights {
     pub output: WeightTensor,
     pub layers: Vec<LayerWeights>,
     pub slab_storage: Option<ModelGpuStorage>,
+    /// RoughQuant real-format corrections, keyed by `(layer_idx, projection)`.
+    /// Empty for all non-roughquant models (backward-compatible: the forward
+    /// applies nothing). Populated by `load_rq_corrections` from the
+    /// `metadata["roughquant_sidecar"]` index + `<name>.rqcorr` tensors.
+    pub rq_corrections: std::collections::HashMap<(u32, RqProj), RqCorr>,
 
     /// Weight pager (MAD-93 v0.1). `Some` only when the model was loaded
     /// with `Qwen35Config::paged_experts == true`. The forward path uses
@@ -4204,6 +4249,237 @@ impl Drop for AlignedLoadBuffer {
     }
 }
 
+/// Map a `<base>.weight` tensor name to its `(layer_idx, RqProj)` key, or None if
+/// it is not a residual projection roughquant protects.
+fn rq_parse_proj(name: &str) -> Option<(u32, RqProj)> {
+    let layers_pos = name.find("layers.")? + "layers.".len();
+    let rest = &name[layers_pos..];
+    let dot = rest.find('.')?;
+    let layer_idx: u32 = rest[..dot].parse().ok()?;
+    let proj = if name.contains("linear_attn.in_proj_qkv") {
+        RqProj::Wqkv
+    } else if name.contains("linear_attn.in_proj_z") {
+        RqProj::Wz
+    } else if name.contains("linear_attn.in_proj_a") {
+        RqProj::Walpha
+    } else if name.contains("linear_attn.in_proj_b") {
+        RqProj::Wbeta
+    } else if name.contains("self_attn.q_proj") {
+        RqProj::Wq
+    } else if name.contains("self_attn.k_proj") {
+        RqProj::Wk
+    } else if name.contains("self_attn.v_proj") {
+        RqProj::Wv
+    } else if name.contains("self_attn.o_proj") || name.contains("linear_attn.out_proj") {
+        RqProj::Wo
+    } else if name.contains("mlp.gate_proj") {
+        RqProj::Wgate
+    } else if name.contains("mlp.up_proj") {
+        RqProj::Wup
+    } else if name.contains("mlp.down_proj") {
+        RqProj::Wdown
+    } else {
+        return None;
+    };
+    Some((layer_idx, proj))
+}
+
+#[inline]
+fn rq_bf16_to_f32(b: u16) -> f32 {
+    f32::from_bits((b as u32) << 16)
+}
+
+/// Load the roughquant real-format corrections from `metadata["roughquant_sidecar"]`
+/// + the `<name>.rqcorr` bf16 tensors into a `(layer_idx, RqProj) -> RqCorr` map.
+/// Empty when the model carries no sidecar (backward-compatible).
+fn load_rq_corrections(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+) -> HipResult<std::collections::HashMap<(u32, RqProj), RqCorr>> {
+    use std::collections::HashMap;
+    let mut map: HashMap<(u32, RqProj), RqCorr> = HashMap::new();
+    let meta: serde_json::Value = match serde_json::from_str(&hfq.metadata_json) {
+        Ok(v) => v,
+        Err(_) => return Ok(map),
+    };
+    let sidecar = match meta.get("roughquant_sidecar") {
+        Some(s) => s,
+        None => return Ok(map),
+    };
+    let tensors = match sidecar.get("tensors").and_then(|t| t.as_object()) {
+        Some(t) => t,
+        None => return Ok(map),
+    };
+    let (mut n_r, mut n_w) = (0usize, 0usize);
+    for (name, entry) in tensors {
+        let Some((layer_idx, proj)) = rq_parse_proj(name) else {
+            continue;
+        };
+        let role = entry.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let corr_name = entry
+            .get("corr")
+            .and_then(|c| c.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| format!("{name}.rqcorr"));
+        let channels: Vec<i32> = entry
+            .get("channels")
+            .and_then(|c| c.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64().map(|x| x as i32))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if channels.is_empty() {
+            continue;
+        }
+        let Some((info, data)) = hfq.tensor_data_pread(&corr_name) else {
+            eprintln!("  roughquant: WARN sidecar tensor {corr_name} missing; skipping");
+            continue;
+        };
+        let shape: Vec<usize> = info.shape.iter().map(|&d| d as usize).collect();
+        if shape.len() != 2 {
+            continue;
+        }
+        let f32_vals: Vec<f32> = data
+            .chunks_exact(2)
+            .map(|c| rq_bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect();
+        let idx_bytes: Vec<u8> = channels.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let idx_tensor = gpu.upload_raw(&idx_bytes, &[channels.len()])?;
+        if role == "reader" {
+            // corr is [m × n_idx]; pad columns to a power-of-2 `np` (gemv_f32 tree
+            // reduction needs a power-of-2 block when k<256).
+            let m = shape[0];
+            let n_idx = shape[1];
+            let np = n_idx.next_power_of_two();
+            let mut padded = vec![0.0f32; m * np];
+            for r in 0..m {
+                padded[r * np..r * np + n_idx]
+                    .copy_from_slice(&f32_vals[r * n_idx..r * n_idx + n_idx]);
+            }
+            let corr = gpu.upload_f32(&padded, &[m, np])?;
+            map.insert(
+                (layer_idx, proj),
+                RqCorr::Reader {
+                    corr,
+                    idx: idx_tensor,
+                    m,
+                    n_idx,
+                    np,
+                },
+            );
+            n_r += 1;
+        } else {
+            // writer: corr is [n_s × k]; gemv over k (≥256) needs no padding.
+            let n_s = shape[0];
+            let k = shape[1];
+            let corr = gpu.upload_f32(&f32_vals, &[n_s, k])?;
+            map.insert(
+                (layer_idx, proj),
+                RqCorr::Writer {
+                    corr,
+                    idx: idx_tensor,
+                    n_s,
+                    k,
+                },
+            );
+            n_w += 1;
+        }
+    }
+    if !map.is_empty() {
+        eprintln!(
+            "  roughquant: loaded {n_r} reader + {n_w} writer corrections \
+             (NOTE: applied in the hand forward path; HIPFIRE_FORWARD_LOWERED=0 \
+             required — lowered super-op path not yet wired)"
+        );
+    }
+    Ok(map)
+}
+
+/// Apply a residual-reader correction in place: `out += corr · gather(src_normed, S)`.
+/// `src_normed` is the ORIGINAL-frame rmsnormed hidden (the projection's logical
+/// input). Allocates small scratch per call (eval/decode path; graph disabled).
+fn rq_apply_reader(
+    gpu: &mut Gpu,
+    corr: &RqCorr,
+    src_normed: &GpuTensor,
+    out: &GpuTensor,
+) -> HipResult<()> {
+    if let RqCorr::Reader {
+        corr,
+        idx,
+        m,
+        n_idx,
+        np,
+    } = corr
+    {
+        let xs = gpu.zeros(&[*np], DType::F32)?;
+        gpu.rq_gather_f32(src_normed, idx, &xs, *n_idx, *np)?;
+        let tmp = gpu.zeros(&[*m], DType::F32)?;
+        gpu.gemv_f32(corr, &xs, &tmp)?;
+        gpu.add_inplace_f32(out, &tmp)?;
+        gpu.free_tensor(xs)?;
+        gpu.free_tensor(tmp)?;
+    }
+    Ok(())
+}
+
+/// Apply all residual-reader corrections for a projection group sharing one
+/// normed input. Computes the original-frame `rmsnorm(x)` gather-source ONCE
+/// (only when at least one site has a correction), then `out += corr · src[S]`
+/// per site. No-op for models without sidecars.
+fn rq_apply_readers(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    layer_idx: usize,
+    norm_weight: &GpuTensor,
+    x: &GpuTensor,
+    eps: f32,
+    dim: usize,
+    sites: &[(RqProj, &GpuTensor)],
+) -> HipResult<()> {
+    let li = layer_idx as u32;
+    if !sites
+        .iter()
+        .any(|(p, _)| weights.rq_corrections.contains_key(&(li, *p)))
+    {
+        return Ok(());
+    }
+    let src = gpu.zeros(&[dim], DType::F32)?;
+    gpu.rmsnorm_f32(x, norm_weight, &src, eps)?;
+    for (p, out) in sites {
+        if let Some(c) = weights.rq_corrections.get(&(li, *p)) {
+            rq_apply_reader(gpu, c, &src, out)?;
+        }
+    }
+    gpu.free_tensor(src)?;
+    Ok(())
+}
+
+/// Apply a residual-writer correction in place: `c = corr · input;
+/// out_resid[S[j]] += c[j]`. `input` is the writer's full-width input activation.
+fn rq_apply_writer(
+    gpu: &mut Gpu,
+    corr: &RqCorr,
+    input: &GpuTensor,
+    out_resid: &GpuTensor,
+) -> HipResult<()> {
+    if let RqCorr::Writer {
+        corr,
+        idx,
+        n_s,
+        k: _,
+    } = corr
+    {
+        let c = gpu.zeros(&[*n_s], DType::F32)?;
+        gpu.gemv_f32(corr, input, &c)?;
+        gpu.rq_scatter_add_f32(out_resid, idx, &c, *n_s)?;
+        gpu.free_tensor(c)?;
+    }
+    Ok(())
+}
+
 pub fn load_weights(
     hfq: &mut HfqFile,
     config: &Qwen35Config,
@@ -4935,6 +5211,7 @@ pub fn load_weights(
     );
 
     let slab_storage = slab_index.map(|idx| idx.storage);
+    let rq_corrections = load_rq_corrections(hfq, gpu)?;
     Ok(Qwen35Weights {
         token_embd,
         embd_format: embd_fmt,
@@ -4942,6 +5219,7 @@ pub fn load_weights(
         output,
         layers,
         slab_storage,
+        rq_corrections,
         pager: pager.take().map(RefCell::new),
     })
 }
@@ -5500,6 +5778,7 @@ pub fn load_weights_paroquant(
         output,
         layers,
         slab_storage: None,
+        rq_corrections: std::collections::HashMap::new(),
         pager: None,
     })
 }
@@ -5551,6 +5830,7 @@ pub fn load_weights_multi(
         output,
         layers,
         slab_storage: None,
+        rq_corrections: std::collections::HashMap::new(),
         pager: None,
     })
 }
@@ -21848,7 +22128,9 @@ fn forward_scratch_layers(
     // single-GPU decode through the lowered super-op executor. Skipped when a
     // hidden-state ring buffer is active (spec-decode capture engages only the
     // hand path for now). Default off → the hand arms below run unchanged.
-    if forward_lowered_enabled() && hidden_rb.is_none() {
+    // RoughQuant corrections are wired into THIS hand path (not the lowered
+    // super-op executor), so route models carrying a correction side-map here.
+    if forward_lowered_enabled() && hidden_rb.is_none() && weights.rq_corrections.is_empty() {
         return forward_scratch_layers_lowered(gpu, weights, config, pos, kv_cache, dn_state, s);
     }
 
@@ -22104,6 +22386,22 @@ fn forward_scratch_layers(
                     trace_finite_if_enabled(gpu, "layer 0 LA w_beta", &s.dn_beta)?;
                     trace_finite_if_enabled(gpu, "layer 0 LA w_alpha", &s.dn_alpha)?;
                 }
+                // RoughQuant residual-reader corrections (DeltaNet in_proj_*).
+                rq_apply_readers(
+                    gpu,
+                    weights,
+                    layer_idx,
+                    &layer.attn_norm,
+                    &s.x,
+                    config.norm_eps,
+                    config.dim,
+                    &[
+                        (RqProj::Wqkv, &s.dn_qkv),
+                        (RqProj::Wz, &s.dn_z),
+                        (RqProj::Walpha, &s.dn_alpha),
+                        (RqProj::Wbeta, &s.dn_beta),
+                    ],
+                )?;
                 if layer_idx == 0
                     && dflash_serial_qkvza_self_compare_enabled()
                     && gdn_tape_capture.is_some()
@@ -22456,6 +22754,10 @@ fn forward_scratch_layers(
                 }
                 // Fused wo GEMV + residual add: s.x += layer.wo * s.dn_normed
                 weight_gemv_residual(gpu, &layer.wo, &s.dn_normed, &s.x)?;
+                // RoughQuant residual-writer correction (DeltaNet out_proj rows).
+                if let Some(c) = weights.rq_corrections.get(&(layer_idx as u32, RqProj::Wo)) {
+                    rq_apply_writer(gpu, c, &s.dn_normed, &s.x)?;
+                }
                 if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
                     let v_row_bytes = tape.v_dim * 4;
                     let wo_input = if matches!(
@@ -22653,6 +22955,18 @@ fn forward_scratch_layers(
                     trace_finite_if_enabled(gpu, "layer 0 FFN gate", &s.gate_ffn)?;
                     trace_finite_if_enabled(gpu, "layer 0 FFN up", &s.up)?;
                 }
+                // RoughQuant residual-reader corrections (DeltaNet mlp gate/up).
+                // Applied before SwiGLU so the corrected gate/up feed w_down.
+                rq_apply_readers(
+                    gpu,
+                    weights,
+                    layer_idx,
+                    &layer.ffn_norm,
+                    &s.x,
+                    config.norm_eps,
+                    config.dim,
+                    &[(RqProj::Wgate, &s.gate_ffn), (RqProj::Wup, &s.up)],
+                )?;
                 if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
                     let ffn_row_bytes = tape.ffn_dim * 4;
                     gpu.memcpy_dtod_at_auto(
@@ -22693,6 +23007,18 @@ fn forward_scratch_layers(
                     &s.ffn_hidden,
                     &s.x,
                 )?;
+                // RoughQuant residual-writer correction (DeltaNet mlp.down_proj).
+                // w_down's logical input is silu(gate)*up in ORIGINAL frame (the
+                // fused kernel rotates internally), so recompute it explicitly.
+                if let Some(c) = weights
+                    .rq_corrections
+                    .get(&(layer_idx as u32, RqProj::Wdown))
+                {
+                    let inp = gpu.zeros(&[layer.w_down.k], DType::F32)?;
+                    gpu.silu_mul_f32(&s.gate_ffn, &s.up, &inp)?;
+                    rq_apply_writer(gpu, c, &inp, &s.x)?;
+                    gpu.free_tensor(inp)?;
+                }
                 if layer_idx == 0 {
                     trace_finite_if_enabled(gpu, "layer 0 FFN residual", &s.x)?;
                 }
@@ -22962,6 +23288,22 @@ fn forward_scratch_layers(
                         &format!("layer {layer_idx} FullAttnMoe split v projection done"),
                     )?;
                 }
+                // RoughQuant residual-reader corrections (FullAttn q/k/v_proj),
+                // applied to the raw projection outputs before q_norm/materialize.
+                rq_apply_readers(
+                    gpu,
+                    weights,
+                    layer_idx,
+                    &layer.attn_norm,
+                    &s.x,
+                    config.norm_eps,
+                    config.dim,
+                    &[
+                        (RqProj::Wq, &s.fa_q_full),
+                        (RqProj::Wk, &s.fa_k),
+                        (RqProj::Wv, &s.fa_v),
+                    ],
+                )?;
                 if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
                     if delta_layer_idx < tape.fa_bridge_valid.len()
                         && tape.fa_bridge_valid[delta_layer_idx]
@@ -23426,6 +23768,10 @@ fn forward_scratch_layers(
                     &s.x,
                     &s.o,
                 )?;
+                // RoughQuant residual-writer correction (FullAttn o_proj rows).
+                if let Some(c) = weights.rq_corrections.get(&(layer_idx as u32, RqProj::Wo)) {
+                    rq_apply_writer(gpu, c, &s.fa_attn_out, &s.x)?;
+                }
                 if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
                     if delta_layer_idx < tape.fa_bridge_valid.len()
                         && tape.fa_bridge_valid[delta_layer_idx]
@@ -23586,6 +23932,17 @@ fn forward_scratch_layers(
                     }
                     weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
                 }
+                // RoughQuant residual-reader corrections (FullAttn mlp gate/up).
+                rq_apply_readers(
+                    gpu,
+                    weights,
+                    layer_idx,
+                    &layer.ffn_norm,
+                    &s.x,
+                    config.norm_eps,
+                    config.dim,
+                    &[(RqProj::Wgate, &s.gate_ffn), (RqProj::Wup, &s.up)],
+                )?;
                 // Fused SwiGLU + w_down residual GEMV:
                 //   MQ4: fused_silu_rotate(gate,up) + gemv_residual(w_down, rotated, x)
                 //   HF4: silu_mul + weight_gemv_residual (unchanged)
@@ -23599,6 +23956,16 @@ fn forward_scratch_layers(
                     &s.ffn_hidden,
                     &s.x,
                 )?;
+                // RoughQuant residual-writer correction (FullAttn mlp.down_proj).
+                if let Some(c) = weights
+                    .rq_corrections
+                    .get(&(layer_idx as u32, RqProj::Wdown))
+                {
+                    let inp = gpu.zeros(&[layer.w_down.k], DType::F32)?;
+                    gpu.silu_mul_f32(&s.gate_ffn, &s.up, &inp)?;
+                    rq_apply_writer(gpu, c, &inp, &s.x)?;
+                    gpu.free_tensor(inp)?;
+                }
                 kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, layer_idx, pos)?;
 
                 gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
