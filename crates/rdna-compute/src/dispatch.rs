@@ -40739,6 +40739,29 @@ impl Gpu {
         }
     }
 
+    /// Apply a causal mask to attention scores `[seq_q*seq_k]` (j>i → −1e30).
+    pub fn causal_mask_train(
+        &mut self,
+        scores: &GpuTensor,
+        seq_q: usize,
+        seq_k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("causal_mask_train", kernels::CAUSAL_MASK_TRAIN_SRC, "causal_mask_train")?;
+        let func = &self.functions["causal_mask_train"];
+        let mut sp = scores.buf.as_ptr();
+        let mut sq = seq_q as i32;
+        let mut sk = seq_k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut sp as *mut _ as *mut c_void,
+            &mut sq as *mut _ as *mut c_void,
+            &mut sk as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(func, [seq_q as u32, 1, 1], [64, 1, 1], 0, self.stream_ref(), &mut params)
+        }
+    }
+
     /// LayerNorm with bias (batched): out = gamma * (x - mean) / sqrt(var + eps) + beta
     pub fn layernorm_batched(
         &mut self,

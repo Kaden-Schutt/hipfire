@@ -3203,6 +3203,10 @@ pub const CROSS_ENTROPY_TRAIN_SRC: &str =
 /// RoPE fwd+bwd (fp32), HF-Llama half-split convention, un-fused training path.
 pub const ROPE_TRAIN_SRC: &str = include_str!("../../../kernels/src/rope_train.hip");
 
+/// Causal mask for attention scores (fp32), un-fused training path.
+pub const CAUSAL_MASK_TRAIN_SRC: &str =
+    include_str!("../../../kernels/src/causal_mask_train.hip");
+
 /// LayerNorm with bias: out = gamma * (x - mean) / sqrt(var + eps) + beta
 /// Grid=[batch], Block=[min(256, n)].
 pub const LAYERNORM_SRC: &str = include_str!("../../../kernels/src/layernorm.hip");

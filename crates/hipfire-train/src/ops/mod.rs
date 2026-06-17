@@ -6,6 +6,7 @@
 //! produces gradients for each differentiable input. All matmuls route through
 //! `gemm_f32_train` (verified correct in rdna-compute).
 
+pub mod attention;
 pub mod cross_entropy;
 pub mod linear;
 pub mod lora;
