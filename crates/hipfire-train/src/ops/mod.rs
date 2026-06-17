@@ -8,6 +8,7 @@
 
 pub mod cross_entropy;
 pub mod linear;
+pub mod lora;
 pub mod rmsnorm;
 pub mod rope;
 pub mod softmax;
