@@ -25,6 +25,40 @@ y = mq4_gemv(W_mq4, x)  +  sparse_gemv(R_S, x_S)
 - The sidecar stores the *residual* (exact − mq4), so a protected channel becomes
   effectively bf16/Q8 with no double-quant.
 
+## Optional perf optimization: #5 permutation → gather-free correction
+
+The sparse correction needs a runtime **gather** of `x[S]` (readers) and a
+**scatter** into `y[S]` (writers) — implemented as `rq_gather_f32` /
+`rq_scatter_add_f32`. The *data* there is trivial (~|S| floats), but as standalone
+kernels they add launch + alloc overhead on the decode hot path (cf. the measured
+`add_inplace_f32` ~4.4% of decode time on gfx1100/gfx1151; less relevant on a
+bandwidth-bound 780M). The **#5 residual-stream permutation eliminates them**:
+
+- Permute the residual channel order (OFFLINE, baked into weights) so the protected
+  set S is a **contiguous block** (e.g. channels `0..|S|`). Then the reader gather
+  becomes a pointer-offset **slice** `x_normed[0..|S|]` and the writer scatter
+  becomes a contiguous **slice-add** `y[0..|S|] += c`. No gather/scatter kernel, no
+  index buffer.
+- #5 is **runtime-free** (verified bijective in `permutation-bijectivity.md`): the
+  stream is simply *stored* in the permuted order with the permutation propagated
+  across embed rows + every reader input-col + every writer output-row + RMSNorm γ
+  + lm_head + tied embed. No per-token transform (unlike the dead PCA rotation).
+- It reorders the hidden/residual axis only, **upstream of the q/k/v head split**,
+  so there is **no RoPE interaction** (the RoPE constraint is on #4 per-head-dims).
+- For the **current binary format (residual-only protection) this removes the
+  gather/scatter entirely** — one global #5 makes the single shared set contiguous
+  everywhere. It only becomes partial ("most") if per-weight NON-residual protection
+  is later added (each such projection's salient input cols would need its own free
+  #1 hidden-dim permute; one global perm can't cluster all sets at once).
+- It does **not** save the correction GEMV MACs (~|S|/d_in ≈ 5% on protected
+  projections) — only the gather/scatter overhead, which is exactly the part that
+  wasn't already free.
+
+⇒ This is the real consumer for the (verified but unbuilt) **production #5 applier**:
+not "folding a rotation" (channel protection needs no fold) but making the
+correction gather-free. The producer would emit S as a contiguous range + bake the
+#5 permutation; the lowered-path correction then reads/writes dense slices.
+
 ## Graded importance (the review insight)
 
 Not binary. Tiers by importance LEVEL:

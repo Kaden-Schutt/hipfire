@@ -40,5 +40,11 @@ invisible at equal q/k positions — must test `pos_q ≠ pos_k`.
 - **Production machinery** (next): Rust appliers that permute a loaded model's
   weights per type, enforcing the GQA grouping (#3) and the RoPE-pair constraint
   (#4), with the #5 global propagation across embed/norms/all-projections/lm_head.
-  Use case: permutation-based protection clustering (contiguous protected channels
-  for the packed format) — free-folding, unlike the dead PCA rotation.
+  Primary use case: **gather-free RoughQuant correction**. The real packed format's
+  protected-channel correction otherwise needs a runtime gather `x[S]` (readers) +
+  scatter `y[S]` (writers); a #5 residual permutation that makes S a contiguous
+  block turns those into pointer-offset slices — eliminating the
+  `rq_gather_f32`/`rq_scatter_add_f32` launches + index buffers. #5 is runtime-free
+  (baked offline), so the only residual cost is the correction GEMV's ~5% MACs.
+  (NB: framing is "gather-free", NOT "foldable rotation" — channel protection needs
+  no fold; see docs/roughquant/phase3-real-format-scope.md.)
