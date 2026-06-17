@@ -3185,6 +3185,10 @@ pub const GEMM_F32_SRC: &str = include_str!("../../../kernels/src/gemm_f32.hip")
 /// See `kernels/src/gemm_f32_train.hip` and the hipfire-train Phase 0 plan.
 pub const GEMM_F32_TRAIN_SRC: &str = include_str!("../../../kernels/src/gemm_f32_train.hip");
 
+/// RMSNorm forward+backward (fp32) for the un-fused training path.
+/// `rmsnorm_train_fwd` saves `1/r` per row for `rmsnorm_train_bwd`.
+pub const RMSNORM_TRAIN_SRC: &str = include_str!("../../../kernels/src/rmsnorm_train.hip");
+
 /// LayerNorm with bias: out = gamma * (x - mean) / sqrt(var + eps) + beta
 /// Grid=[batch], Block=[min(256, n)].
 pub const LAYERNORM_SRC: &str = include_str!("../../../kernels/src/layernorm.hip");

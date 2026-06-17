@@ -40421,6 +40421,96 @@ impl Gpu {
         }
     }
 
+    /// Training RMSNorm forward (fp32). `x`,`y`: `[rows*H]`; `w`: `[H]`;
+    /// `rinv`: `[rows]` output (1/r per row, consumed by the backward).
+    pub fn rmsnorm_train_fwd(
+        &mut self,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        y: &GpuTensor,
+        rinv: &GpuTensor,
+        rows: usize,
+        h: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("rmsnorm_train_fwd", kernels::RMSNORM_TRAIN_SRC, "rmsnorm_train_fwd")?;
+        let func = &self.functions["rmsnorm_train_fwd"];
+        let mut xp = x.buf.as_ptr();
+        let mut wp = w.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut rp = rinv.buf.as_ptr();
+        let mut rowsi = rows as i32;
+        let mut hi = h as i32;
+        let mut epsf = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut rowsi as *mut _ as *mut c_void,
+            &mut hi as *mut _ as *mut c_void,
+            &mut epsf as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [rows as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Training RMSNorm backward (fp32). Produces `dx` `[rows*H]` and
+    /// atomic-accumulates `dw` `[H]` (zero it first). `rinv` is from the forward.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_train_bwd(
+        &mut self,
+        dy: &GpuTensor,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        rinv: &GpuTensor,
+        dx: &GpuTensor,
+        dw: &GpuTensor,
+        rows: usize,
+        h: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("rmsnorm_train_bwd", kernels::RMSNORM_TRAIN_SRC, "rmsnorm_train_bwd")?;
+        let func = &self.functions["rmsnorm_train_bwd"];
+        let mut dyp = dy.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut wp = w.buf.as_ptr();
+        let mut rp = rinv.buf.as_ptr();
+        let mut dxp = dx.buf.as_ptr();
+        let mut dwp = dw.buf.as_ptr();
+        let mut rowsi = rows as i32;
+        let mut hi = h as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dyp as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut dxp as *mut _ as *mut c_void,
+            &mut dwp as *mut _ as *mut c_void,
+            &mut rowsi as *mut _ as *mut c_void,
+            &mut hi as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [rows as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// LayerNorm with bias (batched): out = gamma * (x - mean) / sqrt(var + eps) + beta
     pub fn layernorm_batched(
         &mut self,

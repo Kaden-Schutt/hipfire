@@ -177,8 +177,12 @@ cosine schedule + 10% warmup, **global-norm grad clip at 1.0**.
   - **linear** ✅ DONE: `ops/linear.rs` (forward + dX + dW via `gemm_f32_train`),
     `examples/gradcheck_linear.rs` passes on gfx1103 (max|analytic−numeric|
     ≈1.5e-5, tol 1e-2). No new kernel needed.
-  - rmsnorm, softmax, swiglu, rope, cross_entropy: TODO (each needs a small
-    fwd+bwd kernel).
+  - **rmsnorm** ✅ DONE: `kernels/src/rmsnorm_train.hip` (fwd saves 1/r per row;
+    bwd computes dx + atomic-accumulates dw), `ops/rmsnorm.rs`,
+    `examples/gradcheck_rmsnorm.rs` passes on gfx1103 (dX 3.2e-5, dW 2.0e-5).
+  - softmax, swiglu, rope, cross_entropy: TODO (each needs a small fwd+bwd
+    kernel; follow the rmsnorm pattern — kernel + dispatch wrapper + op module +
+    gradcheck example).
 - **M2 — full-graph gradient check.** End-to-end fp32 model, finite-difference
   check on LoRA params (and one base param via a temporarily-unfrozen linear)
   for a 1–2 token toy input.

@@ -7,3 +7,4 @@
 //! `gemm_f32_train` (verified correct in rdna-compute).
 
 pub mod linear;
+pub mod rmsnorm;
