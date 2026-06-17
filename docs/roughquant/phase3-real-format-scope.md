@@ -56,17 +56,46 @@ Not binary. Tiers by importance LEVEL:
 3. **Sidecar size sweep:** KLD + tok/s vs |S| and per-tier precision, to find the
    knee on the real format.
 
-## Implementation plan (only after the sim de-risks confirm graded wins)
+## Build status (2026-06-17)
 
-1. **Producer** (`hipfire-quantize`): emit MQ4G256 bulk + a `roughquant-sidecar`
-   record = {channel ids (shared residual set, role-based per the audit fix),
-   per-tier precision, residual values}. Reuse the role classifier + multi-signal
-   selector.
-2. **Loader/format**: extend the HFQ tensor schema with the sidecar; keep
-   backward-compat (absent sidecar = plain mq4).
-3. **GEMV**: `mq4_gemv` + a sparse correction kernel (small dense GEMV over |S|
-   channels, bf16/Q8). gfx1100 + gfx1201 (RDNA4 mandatory) per repo cross-arch rule.
-4. **Validation gates (the actual verdict):**
+**Step 1 (producer) DONE + verified — commit `fb3d403b`.** `--format roughquant`
+(`rq`) emits real MQ4G256 bulk + a bf16 correction sidecar over the diag(H)-selected
+shared residual set (reader cols + writer rows). Key numerics de-risk: the feared
+"sim ≠ real mq4" gap was only the *sim* storing its recon as lossy bf16 — NOT a
+dequant mismatch. `dequant_mq4g256` (added to the quantize crate) is bit-identical
+to the GEMV kernel (which rotates x, so its effective W = inverse-FWHT(stored) =
+dequant), so `R = W − dequant_mq4g256(packed)` makes protected channels exact on the
+REAL kernel. In-place self-check on 0.8B @ 5%: protected-channel recon
+max-err = **1.19e-4** (= bf16 rounding of R only). Indices in
+`metadata["roughquant_sidecar"]`; values in `<name>.rqcorr` bf16 tensors; absent
+sidecar = plain mq4 (backward-compatible).
+
+Producer simplification vs the graded table above: v1 is BINARY (bf16-protect +
+mq4-bulk), the validated mechanism. Graded T0/T1 tiers and embed-Q8 (for size
+fairness vs mq4, which Q8s the tied embed — the current rq file leaves it bf16,
+hence 838 MB) are follow-ups once the binary verdict lands.
+
+## Remaining implementation plan
+
+1. ~~**Producer**~~ — DONE (`fb3d403b`), see above.
+2. **Loader/format**: read `metadata["roughquant_sidecar"]`, load each `.rqcorr`
+   bf16 tensor + a u32 channel-index buffer to GPU. Mirror the AWQ-sidecar loader
+   precedent (`load_awq_scale_for`, qwen35.rs:2729).
+3. **Correction GEMV (compose existing primitives, likely no new kernel)**: reader
+   = gather `x[S]`→`xs` then dense `gemv_f32`/residual of `corr[m×|S|]` added into
+   `y`; writer = `gemv_f32` of `corr[|S|×k]·x` then scatter-add into `y[S]`. Reuse
+   `dispatch.rs::gemv_f32` + a small gather (or the `*_residual` y+=A·x variants).
+   gfx1100 + gfx1201 (RDNA4 mandatory) per cross-arch rule.
+4. **Forward wiring (the big, hot-path, coherence-gated step)**: qwen35 has ~10
+   forward variants (`forward_from_x_gpu`, `forward_scratch`, `forward_prefill_*`)
+   with linears dispatched inline via `dispatch_ref()`→`GemvFamily` — there is NO
+   single `linear()` helper, so the correction must be applied at each residual
+   reader/writer projection. Two options: (a) add `rq_corr: Option<RqCorrection>`
+   to `WeightTensor` (clean, but ~120 `rq_corr: None` constructor sites across
+   crates — no `Default`), or (b) a side `HashMap` in the qwen35 model keyed by
+   projection, applied within qwen35.rs only (lower cross-crate churn). Decide
+   before starting; this is the multi-hour, gate-heavy part.
+5. **Validation gates (the actual verdict):**
    - KLD on the **real GEMV** (not sim) vs bf16 — must keep the ~half-mq4 win.
    - **Coherence battery** (`scripts/roughquant_coherence_battery.sh`, canonical
      prompts, FP32 state) on the real format — must not regress vs mq4.
