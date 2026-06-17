@@ -1009,9 +1009,9 @@ fn qtip_simquant_protected(
     let n_prot = n_prot.min(k);
     f32_data.par_chunks_mut(k).for_each(|row| {
         let saved: Vec<f32> = row[..n_prot].to_vec();
-        for c in 0..n_prot {
-            row[c] = 0.0;
-        }
+        // Quantize the FULL row, then overwrite the leading n_prot (protected)
+        // columns exact — guarantees protect ≤ no-protect. (Earlier zero-before-
+        // quant was non-monotonic and could worsen PPL; removed.)
         for g in 0..groups {
             let seg = &mut row[g * 256..g * 256 + 256];
             let mut grp = [0.0f32; 256];
@@ -1096,9 +1096,9 @@ fn qtip_simquant_masked(
             return; // high-energy residual output channel — keep exact
         }
         let saved: Vec<(usize, f32)> = protected_cols.iter().map(|&c| (c, row[c])).collect();
-        for &(c, _) in &saved {
-            row[c] = 0.0;
-        }
+        // Quantize the FULL group, then overwrite protected positions exact
+        // (below) — guarantees protect ≤ no-protect. (Non-monotonic zero-before-
+        // quant removed.)
         for g in 0..groups {
             let seg = &mut row[g * 256..g * 256 + 256];
             let mut grp = [0.0f32; 256];
@@ -1115,6 +1115,79 @@ fn qtip_simquant_masked(
             row[c] = v;
         }
     });
+}
+
+/// Like `qtip_simquant_masked` but the bulk codec is **mq4** (MQ4G256:
+/// per-256-group FWHT → asymmetric 4-bit → dequant → inverse FWHT), matching the
+/// real production format exactly (`quantize_mq4g256`). Used to measure the
+/// marginal value of channel protection ON TOP of mq4 (`mq4+protect` vs `mq4`) —
+/// the fair, iso-format comparison: protected columns/rows kept exact, the rest
+/// quantized exactly as mq4 would. Parallel over rows.
+fn mq4_simquant_masked(
+    wf: &mut [f32],
+    m: usize,
+    k: usize,
+    protected_cols: &[usize],
+    protected_rows: &[bool],
+    signs1: &[f32],
+    signs2: &[f32],
+) {
+    use rayon::prelude::*;
+    debug_assert_eq!(wf.len(), m * k);
+    debug_assert_eq!(protected_rows.len(), m);
+    let groups = k / 256;
+    if groups == 0 {
+        return;
+    }
+    wf.par_chunks_mut(k).enumerate().for_each(|(r, row)| {
+        if protected_rows[r] {
+            return;
+        }
+        let saved: Vec<(usize, f32)> = protected_cols.iter().map(|&c| (c, row[c])).collect();
+        // Quantize the FULL group exactly as mq4 does, then overwrite the
+        // protected positions with their exact values (below). This guarantees
+        // mq4+protect ≤ mq4 — protection only removes error, never adds it.
+        // (An earlier "zero protected before FWHT to tighten the bulk range" was
+        // NOT monotonic and could WORSEN PPL; removed.)
+        for g in 0..groups {
+            let seg = &mut row[g * 256..g * 256 + 256];
+            let mut grp = [0.0f32; 256];
+            grp.copy_from_slice(seg);
+            cpu_fwht_256(&mut grp, signs1, signs2);
+            let mut mn = f32::INFINITY;
+            let mut mx = f32::NEG_INFINITY;
+            for &v in grp.iter() {
+                mn = mn.min(v);
+                mx = mx.max(v);
+            }
+            let range = mx - mn;
+            let scale = if range > 0.0 { range / 15.0 } else { 1.0 };
+            let inv = if range > 0.0 { 1.0 / scale } else { 0.0 };
+            for v in grp.iter_mut() {
+                let q = (((*v - mn) * inv + 0.5) as u32).min(15);
+                *v = q as f32 * scale + mn;
+            }
+            cpu_fwht_256(&mut grp, signs2, signs1);
+            seg.copy_from_slice(&grp);
+        }
+        for (c, v) in saved {
+            row[c] = v;
+        }
+    });
+}
+
+/// Per-input-column sum-of-squares ‖W[:,c]‖² from a row-major bf16 weight blob
+/// (k = input dim). Used for weight-aware saliency metrics (`wnorm`, `product`):
+/// the output-error contribution of channel c scales with ‖W[:,c]‖²·E[x_c²], so
+/// pure activation energy diag(H) alone under/over-protects depending on weight
+/// magnitude (CMPQ: select by quant-error impact, not raw activation).
+fn bf16_colnorm2(data: &[u8], k: usize) -> Vec<f32> {
+    let mut s = vec![0.0f32; k];
+    for (i, c) in data.chunks_exact(2).enumerate() {
+        let v = bf16_to_f32(u16::from_le_bytes([c[0], c[1]]));
+        s[i % k] += v * v;
+    }
+    s
 }
 
 /// RoughQuant Phase-1 sim (no rotation): protect the most-salient input columns
@@ -9566,23 +9639,44 @@ fn main() {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(3);
+        // Bulk codec: "mq4" → real mq4 format (fair mq4+protect-vs-mq4 test, set
+        // protect_frac=0 for the plain-mq4 baseline); else QTIP-{bulk_bits}.
+        let bulk_mq4 = std::env::var("HIPFIRE_RQ4_BULK").ok().as_deref() == Some("mq4");
+        // Saliency metric for which channels to protect (user steer: don't rely
+        // on diag(H) alone). diag = E[x²] (activation energy); wnorm = ‖W[:,c]‖²
+        // (weight energy); product = ‖W[:,c]‖²·E[x²] (output-error contribution).
+        let saliency_metric = std::env::var("HIPFIRE_RQ4_SALIENCY")
+            .ok()
+            .unwrap_or_else(|| "diag".into());
         let dmodel = 1024usize;
-        // Aggregate per-residual-channel energy from all k==1024 readers' diag(H).
+        // Aggregate per-residual-channel saliency from all k==1024 readers.
         let mut resid_energy = vec![0.0f64; dmodel];
-        if let Some(sc) = qtip_hessian.as_ref() {
-            for t in hfq_tensors.iter() {
-                if matches!(t.quant_type, QuantType::BF16)
-                    && t.shape.len() == 2
-                    && t.shape[1] as usize == dmodel
-                    && !t.name.contains("embed")
-                    && !t.name.contains("lm_head")
-                {
-                    let key = t.name.strip_suffix(".weight").unwrap_or(&t.name);
-                    if let Some(href) = sc.get(key, 0).filter(|h| h.k == dmodel) {
-                        for i in 0..dmodel {
-                            resid_energy[i] += href.at(i, i);
-                        }
-                    }
+        for t in hfq_tensors.iter() {
+            if matches!(t.quant_type, QuantType::BF16)
+                && t.shape.len() == 2
+                && t.shape[1] as usize == dmodel
+                && !t.name.contains("embed")
+                && !t.name.contains("lm_head")
+            {
+                let key = t.name.strip_suffix(".weight").unwrap_or(&t.name);
+                let diag: Option<Vec<f64>> = qtip_hessian
+                    .as_ref()
+                    .and_then(|sc| sc.get(key, 0))
+                    .filter(|h| h.k == dmodel)
+                    .map(|h| (0..dmodel).map(|i| h.at(i, i)).collect());
+                let cn2: Option<Vec<f32>> = if saliency_metric != "diag" {
+                    Some(bf16_colnorm2(&t.data, dmodel))
+                } else {
+                    None
+                };
+                for i in 0..dmodel {
+                    let d = diag.as_ref().map(|d| d[i]).unwrap_or(0.0);
+                    let w = cn2.as_ref().map(|c| c[i] as f64).unwrap_or(0.0);
+                    resid_energy[i] += match saliency_metric.as_str() {
+                        "wnorm" => w,
+                        "product" => w * d,
+                        _ => d,
+                    };
                 }
             }
         }
@@ -9599,8 +9693,13 @@ fn main() {
             idx
         };
         eprintln!(
-            "  roughquant4-sim: channel-consistent, protect_frac={protect_frac} bulk_bits={bulk_bits}; \
-             {n_prot_resid}/{dmodel} residual channels protected (read cols + write rows)"
+            "  roughquant4-sim: channel-consistent, protect_frac={protect_frac} bulk={}; \
+             {n_prot_resid}/{dmodel} residual channels protected (read cols + write rows)",
+            if bulk_mq4 {
+                "mq4".to_string()
+            } else {
+                format!("qtip{bulk_bits}")
+            }
         );
         let is_writer = |name: &str| {
             name.contains("o_proj") || name.contains("out_proj") || name.contains("down_proj")
@@ -9627,21 +9726,48 @@ fn main() {
             // channel set; others protect their own top-diag(H) input columns.
             let protected_cols: Vec<usize> = if k == dmodel {
                 protected_resid.clone()
-            } else if let Some(href) = qtip_hessian
-                .as_ref()
-                .and_then(|sc| sc.get(key, 0))
-                .filter(|h| h.k == k)
-            {
-                let mut idx: Vec<usize> = (0..k).collect();
-                idx.sort_unstable_by(|&a, &b| {
-                    href.at(b, b)
-                        .partial_cmp(&href.at(a, a))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                idx.truncate(((protect_frac * k as f64).round() as usize).min(k));
-                idx
             } else {
-                Vec::new()
+                // Per-weight saliency for non-residual inputs, by the chosen metric.
+                let diag: Option<Vec<f64>> = qtip_hessian
+                    .as_ref()
+                    .and_then(|sc| sc.get(key, 0))
+                    .filter(|h| h.k == k)
+                    .map(|h| (0..k).map(|i| h.at(i, i)).collect());
+                if diag.is_none() && saliency_metric == "diag" {
+                    Vec::new()
+                } else {
+                    let cn2: Option<Vec<f32>> = if saliency_metric != "diag" {
+                        let mut s = vec![0.0f32; k];
+                        for r in 0..m {
+                            let row = &wf[r * k..r * k + k];
+                            for c in 0..k {
+                                s[c] += row[c] * row[c];
+                            }
+                        }
+                        Some(s)
+                    } else {
+                        None
+                    };
+                    let sal: Vec<f64> = (0..k)
+                        .map(|c| {
+                            let d = diag.as_ref().map(|d| d[c]).unwrap_or(1.0);
+                            let w = cn2.as_ref().map(|x| x[c] as f64).unwrap_or(1.0);
+                            match saliency_metric.as_str() {
+                                "wnorm" => w,
+                                "product" => w * d,
+                                _ => d,
+                            }
+                        })
+                        .collect();
+                    let mut idx: Vec<usize> = (0..k).collect();
+                    idx.sort_unstable_by(|&a, &b| {
+                        sal[b]
+                            .partial_cmp(&sal[a])
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    idx.truncate(((protect_frac * k as f64).round() as usize).min(k));
+                    idx
+                }
             };
             // Write side: residual writers (m==dmodel) keep high-energy output
             // rows exact.
@@ -9654,17 +9780,29 @@ fn main() {
             } else {
                 n_r += 1;
             }
-            qtip_simquant_masked(
-                &mut wf,
-                m,
-                k,
-                &protected_cols,
-                &protected_rows,
-                &qtip_cb,
-                &qtip_s1,
-                &qtip_s2,
-                bulk_bits,
-            );
+            if bulk_mq4 {
+                mq4_simquant_masked(
+                    &mut wf,
+                    m,
+                    k,
+                    &protected_cols,
+                    &protected_rows,
+                    &qtip_s1,
+                    &qtip_s2,
+                );
+            } else {
+                qtip_simquant_masked(
+                    &mut wf,
+                    m,
+                    k,
+                    &protected_cols,
+                    &protected_rows,
+                    &qtip_cb,
+                    &qtip_s1,
+                    &qtip_s2,
+                    bulk_bits,
+                );
+            }
             t.data = f32_slice_to_bf16_bytes(&wf);
         }
         eprintln!("  roughquant4-sim: {n_w} residual writers (row-protected), {n_r} other tensors");
