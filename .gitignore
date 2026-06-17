@@ -121,4 +121,7 @@ docs/investigations/*/sources/
 
 # Build scratch
 /logs/
+.scratch/vk-gfx1151/
+.scratch/
+.opencode/
 /.build/
