@@ -7,6 +7,8 @@
 //! bookends plus the block loop and its reverse.
 
 use crate::block::{block_backward, block_forward, BlockActivations, BlockDims, BlockLora, BlockLoraGrad, BlockWeights};
+use crate::config::LlamaConfig;
+use crate::loader::LlamaWeightsF32;
 use crate::ops::cross_entropy::cross_entropy;
 use crate::ops::linear::{linear_backward_x, linear_forward};
 use crate::ops::rmsnorm::{rmsnorm_backward, rmsnorm_forward};
@@ -54,6 +56,93 @@ pub struct LlamaModel {
     pub layers: Vec<(LayerWeights, LayerLora)>,
     pub dims: BlockDims,
     pub vocab: usize,
+}
+
+impl LlamaModel {
+    /// Build a trainable model from loaded fp32 base weights. Base weights are
+    /// frozen; LoRA adapters are created on q_proj/v_proj of every layer with
+    /// `A` small-random and `B = 0` (so the initial LoRA contribution is zero
+    /// and the model starts exactly at the base). `seq` is the (fixed) training
+    /// sequence length used to populate `BlockDims`. Requires tied embeddings.
+    pub fn from_f32_weights(
+        gpu: &mut Gpu,
+        cfg: &LlamaConfig,
+        w: LlamaWeightsF32,
+        seq: usize,
+        lora_rank: usize,
+        lora_alpha: f32,
+    ) -> HipResult<Self> {
+        assert!(w.lm_head.is_none(), "from_f32_weights requires tied embeddings");
+        let h = cfg.hidden_size;
+        let qd = cfg.q_dim();
+        let kvd = cfg.kv_dim();
+        let r = lora_rank;
+
+        // Deterministic small-random A init (Kaiming-ish, scaled); B = 0.
+        let a_init = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let x = ((i.wrapping_mul(2654435761).wrapping_add(seed)) % 1000) as f32 / 1000.0;
+                    (x - 0.5) * (2.0 / h as f32).sqrt()
+                })
+                .collect()
+        };
+
+        let mut layers = Vec::with_capacity(w.layers.len());
+        for (li, lw) in w.layers.into_iter().enumerate() {
+            let weights = LayerWeights {
+                norm1: lw.input_layernorm,
+                wq: lw.q_proj,
+                wk: lw.k_proj,
+                wv: lw.v_proj,
+                wo: lw.o_proj,
+                norm2: lw.post_attention_layernorm,
+                wgate: lw.gate_proj,
+                wup: lw.up_proj,
+                wdown: lw.down_proj,
+            };
+            let lora = LayerLora {
+                aq: gpu.upload_f32(&a_init(r * h, li * 7 + 1), &[r * h])?,
+                bq: gpu.zeros(&[qd * r], DType::F32)?,
+                av: gpu.upload_f32(&a_init(r * h, li * 7 + 3), &[r * h])?,
+                bv: gpu.zeros(&[kvd * r], DType::F32)?,
+            };
+            layers.push((weights, lora));
+        }
+
+        let dims = BlockDims {
+            seq,
+            h,
+            n_heads: cfg.num_attention_heads,
+            n_kv: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            inter: cfg.intermediate_size,
+            rope_base: cfg.rope_theta,
+            eps: cfg.rms_norm_eps,
+            lora_scale: lora_alpha / r as f32,
+            lora_rank: r,
+        };
+
+        Ok(Self { embed: w.embed_tokens, final_norm: w.final_norm, layers, dims, vocab: cfg.vocab_size })
+    }
+
+    /// Flat list of trainable LoRA params, layer-major `[aq,bq,av,bv]` — the
+    /// order the optimizer and `model_loss_backward`'s grads use.
+    pub fn lora_params(&self) -> Vec<&GpuTensor> {
+        let mut v = Vec::with_capacity(self.layers.len() * 4);
+        for (_, l) in &self.layers {
+            v.push(&l.aq);
+            v.push(&l.bq);
+            v.push(&l.av);
+            v.push(&l.bv);
+        }
+        v
+    }
+
+    /// Element counts of `lora_params()`, for `AdamW::new`.
+    pub fn lora_param_sizes(&self) -> Vec<usize> {
+        self.lora_params().iter().map(|t| t.shape.iter().product()).collect()
+    }
 }
 
 /// Saved forward state for the backward pass.
@@ -143,6 +232,18 @@ pub fn model_loss_backward(
     }
     grads.reverse(); // align with layer order
     Ok((loss_sum, grads))
+}
+
+/// Flatten per-layer LoRA grads into the same order as `LlamaModel::lora_params`.
+pub fn flatten_lora_grads(grads: &[BlockLoraGrad]) -> Vec<&GpuTensor> {
+    let mut v = Vec::with_capacity(grads.len() * 4);
+    for g in grads {
+        v.push(&g.daq);
+        v.push(&g.dbq);
+        v.push(&g.dav);
+        v.push(&g.dbv);
+    }
+    v
 }
 
 fn clone_tensor(gpu: &mut Gpu, t: &GpuTensor) -> HipResult<GpuTensor> {

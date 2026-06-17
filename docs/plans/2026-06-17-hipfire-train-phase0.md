@@ -208,10 +208,27 @@ cosine schedule + 10% warmup, **global-norm grad clip at 1.0**.
   **M2 COMPLETE** — end-to-end fp32 model fwd+bwd verified by full-model LoRA
   gradcheck. Backward machinery proven from a single matmul up to the whole
   network. Next: M3 (AdamW + alpaca data → overfit ~50 examples to ~0 loss).
-- **M3 — AdamW overfit.** LoRA on q_proj/v_proj, ~50 examples → loss → ~0.
-  THE success criterion.
+- **M3 — AdamW overfit.** ✅ **DONE — PHASE 0 WIN.**
+  - **AdamW** ✅: `kernels/src/adamw_train.hip`, `optim.rs`,
+    `examples/optim_quadratic.rs` converges a quadratic (loss→1.5e-14).
+  - **loader→model bridge** ✅: `LlamaModel::from_f32_weights` (frozen base +
+    LoRA A small-random / B=0 on q,v of every layer).
+  - **overfit** ✅: `examples/overfit_supra50m.rs` — LoRA on frozen Supra-50M,
+    3×8-token fixed batch, AdamW lr 5e-3 r16 a32. Mean per-token CE
+    **15.12 → 0.0153 in 300 steps** on gfx1103. The full loop
+    (fp32 forward → hand-written backward → AdamW) demonstrably learns.
 - **M4 — directional vs PyTorch.** Few-thousand-example run trends like
-  `sft.py`. Bank the loss curve.
+  `sft.py`. Bank the loss curve. (Optional polish; the M3 win already proves
+  the loop.)
+
+## PHASE 0 COMPLETE (2026-06-17)
+
+The first backward pass + optimizer in hipfire exist and are verified — every op
+by finite-difference gradcheck, the full model end-to-end, and the whole loop by
+an overfit-to-~0 on a real model. Backward machinery proven from a single matmul
+up to a 50M LLaMA. Next: **Phase 1** — swap the frozen fp32 base for an MQ4
+dequant-GEMV forward (LoRA/backward/optimizer unchanged) to fine-tune a
+*quantized* base; or arch expansion (Qwen3.5 hybrid: gated-delta-net + QK-norm).
 
 ## Phase 1 preview (the actual goal: fine-tune quantized)
 
