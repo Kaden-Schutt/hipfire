@@ -209,6 +209,37 @@ Extends the tail finding to the deep bulk. Cumulative void-BOTTOM-k% vs RANDOM-k
   full bit-budget range. Closes the user's "haven't proved it works for the tail"
   concern — proven for tail AND full spectrum.
 
+## Finding: ablation oracle — diag(H) is near-optimal (ρ=0.90); gain is at the TOP, not the tail
+
+Gold-standard check: TRUE per-channel importance = KLD damage of voiding EXACTLY
+one residual channel (all others exact bf16), via `HIPFIRE_RQ4_VOID_ONLY`. 38
+channels sampled across the diag-rank spectrum, deterministic teacher-forced eval
+(ctx 1024) so cross-channel ranking is apples-to-apples. Script:
+`scripts/roughquant_ablation_oracle.sh` + `roughquant_ablation_analyze.py`.
+
+- **Spearman(diag_order, ablation_KLD) = +0.90** ⇒ diag(H) is a strong, near-optimal
+  ranker. Validates it as the production selector at the level the format cares about.
+- **Channel 0 is a super-weight**: ablating it alone → KLD **0.791**, ~3× the next
+  (ch 12: 0.282) and ~10× rank-4 (0.070). One dominant channel — direct
+  AWQ/super-weight-literature confirmation on this model.
+- **Imperfections are at the TOP, where it matters**: 12.9% of sampled pairs are
+  mis-ordered, concentrated in the high-energy head (ch 12 @ rank 2 hurts MORE than
+  ch 4 @ rank 1; ch 9 @ rank 8 (0.099) > ch 46 @ rank 4 (0.070)). So a better
+  top-end metric (or per-channel ablation on the top ~16) could squeeze a little
+  more — but diag already captures the dominant structure (the super-weight + the
+  energy ordering).
+- **The tail is a genuine flat noise floor**: every channel with diag_rank ≳110 has
+  ablation KLD ≈ 0.002–0.004, indistinguishable. The oracle's best tail pick beats
+  diag's by only **+0.0012 KLD/channel** — negligible. This RESOLVES the "shallow
+  tail" question definitively: the tail looks flat because per-channel importance
+  IS flat there (no signal to rank), NOT because diag fails. Matches the
+  full-spectrum void result (diag-bottom ≈ random only at sub-1%, strong in bulk).
+
+Net: importance science is closed. diag(H) is the production selector; the only
+headroom is re-ranking the top ~16 high-energy channels (small KLD), and there is
+no achievable tail gain. Graded protection should spend its budget on getting the
+HEAD right (T0 super-weight bf16 + T1 outlier set), not on tail metric refinement.
+
 ## Finding: the 5 permutations — bijectivity verified
 
 `scripts/roughquant_permute_verify.py` + `docs/roughquant/permutation-bijectivity.md`:

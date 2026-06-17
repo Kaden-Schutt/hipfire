@@ -9814,6 +9814,21 @@ fn main() {
                 *e = (z as f64) / (u64::MAX as f64);
             }
         }
+        // HIPFIRE_RQ4_DUMP_RANK=1: print the residual-channel saliency ranking
+        // (descending) as `RANK<tab>channel<tab>energy` and exit. Cheap (no quant);
+        // used to pick ablation-oracle targets sampled across the diag spectrum.
+        if std::env::var("HIPFIRE_RQ4_DUMP_RANK").ok().as_deref() == Some("1") {
+            let mut idx: Vec<usize> = (0..dmodel).collect();
+            idx.sort_unstable_by(|&a, &b| {
+                resid_energy[b]
+                    .partial_cmp(&resid_energy[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for (rank, &c) in idx.iter().enumerate() {
+                println!("RANK\t{rank}\t{c}\t{:.10e}", resid_energy[c]);
+            }
+            std::process::exit(0);
+        }
         // HIPFIRE_RQ4_INVERT=1: protect the LOWEST-saliency channels instead of the
         // highest. Used by the TAIL-RANKING control: with bulk=void + protect_frac
         // high (e.g. 0.95), the non-protected (voided) set is the BOTTOM (1-frac)
@@ -9838,6 +9853,35 @@ fn main() {
             idx.truncate(n_prot_resid);
             idx
         };
+        // ABLATION ORACLE (HIPFIRE_RQ4_VOID_ONLY=c1,c2,...): void EXACTLY the listed
+        // residual channels and protect ALL others exact bf16. With bulk=void this
+        // isolates the marginal KLD damage of ablating those specific channels —
+        // the gold-standard per-channel importance signal to validate diag against.
+        // Overrides protect_frac/saliency selection for the residual set.
+        let (protected_resid, n_prot_resid) =
+            if let Ok(spec) = std::env::var("HIPFIRE_RQ4_VOID_ONLY") {
+                let void_set: std::collections::HashSet<usize> = spec
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<usize>().ok())
+                    .filter(|&c| c < dmodel)
+                    .collect();
+                let keep: Vec<usize> = (0..dmodel).filter(|c| !void_set.contains(c)).collect();
+                eprintln!(
+                    "  roughquant4-sim: ABLATION ORACLE — voiding {} residual channels {:?}, \
+                 protecting the other {}",
+                    void_set.len(),
+                    {
+                        let mut v: Vec<usize> = void_set.iter().copied().collect();
+                        v.sort_unstable();
+                        v
+                    },
+                    keep.len()
+                );
+                let n = keep.len();
+                (keep, n)
+            } else {
+                (protected_resid, n_prot_resid)
+            };
         eprintln!(
             "  roughquant4-sim: channel-consistent, protect_frac={protect_frac} bulk={}; \
              {n_prot_resid}/{dmodel} residual channels protected (read cols + write rows)",
