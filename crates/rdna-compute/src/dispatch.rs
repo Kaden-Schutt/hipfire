@@ -40566,6 +40566,66 @@ impl Gpu {
         }
     }
 
+    /// Training SwiGLU forward (fp32): `out = silu(gate)*up`, all `[n]`.
+    pub fn swiglu_train_fwd(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        out: &GpuTensor,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("swiglu_train_fwd", kernels::SWIGLU_TRAIN_SRC, "swiglu_train_fwd")?;
+        let func = &self.functions["swiglu_train_fwd"];
+        let mut gp = gate.buf.as_ptr();
+        let mut up_ = up.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gp as *mut _ as *mut c_void,
+            &mut up_ as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        let grid = ((n as u32) + 255) / 256;
+        unsafe {
+            self.hip.launch_kernel(func, [grid, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)
+        }
+    }
+
+    /// Training SwiGLU backward (fp32). Produces `d_gate`,`d_up` `[n]`.
+    pub fn swiglu_train_bwd(
+        &mut self,
+        d_out: &GpuTensor,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        d_gate: &GpuTensor,
+        d_up: &GpuTensor,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("swiglu_train_bwd", kernels::SWIGLU_TRAIN_SRC, "swiglu_train_bwd")?;
+        let func = &self.functions["swiglu_train_bwd"];
+        let mut dop = d_out.buf.as_ptr();
+        let mut gp = gate.buf.as_ptr();
+        let mut up_ = up.buf.as_ptr();
+        let mut dgp = d_gate.buf.as_ptr();
+        let mut dup = d_up.buf.as_ptr();
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dop as *mut _ as *mut c_void,
+            &mut gp as *mut _ as *mut c_void,
+            &mut up_ as *mut _ as *mut c_void,
+            &mut dgp as *mut _ as *mut c_void,
+            &mut dup as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        let grid = ((n as u32) + 255) / 256;
+        unsafe {
+            self.hip.launch_kernel(func, [grid, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)
+        }
+    }
+
     /// LayerNorm with bias (batched): out = gamma * (x - mean) / sqrt(var + eps) + beta
     pub fn layernorm_batched(
         &mut self,

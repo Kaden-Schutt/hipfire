@@ -9,3 +9,4 @@
 pub mod linear;
 pub mod rmsnorm;
 pub mod softmax;
+pub mod swiglu;
