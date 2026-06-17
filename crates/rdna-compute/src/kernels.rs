@@ -2367,6 +2367,11 @@ pub const ADD_INPLACE_SRC: &str = include_str!("../../../kernels/src/add_inplace
 /// space for the real-format correction GEMV (y += R_S·x_S).
 pub const RQ_CORRECTION_SRC: &str = include_str!("../../../kernels/src/rq_correction.hip");
 
+/// Calibration activation reductions (`calib_sumsq_reduce_f32` = per-column Σx²
+/// for imatrix/diag; `calib_hessian_outer_f32` = Σxxᵀ K×K for GPTQ Hessian).
+/// Accumulate-in-place over the calibration corpus. Tier-1 native collector.
+pub const CALIB_REDUCE_SRC: &str = include_str!("../../../kernels/src/calib_reduce.hip");
+
 /// Scaled in-place add: y[i] += c * x[i] — one kernel for both
 /// CPU-scalar (c via kernarg) and GPU-scalar (c via device buffer)
 /// variants. Used in the MoE FFN accumulator to fuse the old

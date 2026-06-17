@@ -31160,6 +31160,97 @@ impl Gpu {
         result
     }
 
+    /// Calibration: `acc[c] += Σ_n x[n,c]²` (per-column sum-of-squares, the
+    /// imatrix / diag(H) signal). `x` is [N, K] F32; `acc` is [K] F32, ADDED into
+    /// (caller zeroes once, then accumulates across the calibration corpus).
+    pub fn calib_sumsq_reduce_f32(
+        &mut self,
+        x: &GpuTensor,
+        acc: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "calib_reduce",
+            kernels::CALIB_REDUCE_SRC,
+            "calib_sumsq_reduce_f32",
+        )?;
+        let x_ptr = x.buf.as_ptr();
+        let acc_ptr = acc.buf.as_ptr();
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &acc_ptr as *const _ as *mut c_void,
+            &n_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((k as u32) + block - 1) / block;
+        self.launch_maybe_blob(
+            "calib_sumsq_reduce_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut bb = hip_bridge::KernargBlob::new();
+                bb.push_ptr(x_ptr);
+                bb.push_ptr(acc_ptr);
+                bb.push_i32(n_i);
+                bb.push_i32(k_i);
+                bb
+            },
+        )
+    }
+
+    /// Calibration: `H[i,j] += Σ_n x[n,i]·x[n,j]` (the K×K GPTQ Hessian, tiled
+    /// GEMM accumulate). `x` is [N, K] F32; `H` is [K, K] F32 row-major, ADDED
+    /// into (caller zeroes once, then accumulates across the calibration corpus).
+    pub fn calib_hessian_outer_f32(
+        &mut self,
+        x: &GpuTensor,
+        h: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "calib_reduce",
+            kernels::CALIB_REDUCE_SRC,
+            "calib_hessian_outer_f32",
+        )?;
+        let x_ptr = x.buf.as_ptr();
+        let h_ptr = h.buf.as_ptr();
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &h_ptr as *const _ as *mut c_void,
+            &n_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        let tile = 16u32;
+        let grid_x = ((k as u32) + tile - 1) / tile;
+        let grid_y = ((k as u32) + tile - 1) / tile;
+        self.launch_maybe_blob(
+            "calib_hessian_outer_f32",
+            [grid_x, grid_y, 1],
+            [tile, tile, 1],
+            0,
+            &mut params,
+            || {
+                let mut bb = hip_bridge::KernargBlob::new();
+                bb.push_ptr(x_ptr);
+                bb.push_ptr(h_ptr);
+                bb.push_i32(n_i);
+                bb.push_i32(k_i);
+                bb
+            },
+        )
+    }
+
     /// RoughQuant reader gather: `dst[j] = src[idx[j]]` for j<n_idx, 0 for the
     /// power-of-2 padding up to n_out. `idx` is an i32 GpuTensor of length n_idx.
     pub fn rq_gather_f32(
