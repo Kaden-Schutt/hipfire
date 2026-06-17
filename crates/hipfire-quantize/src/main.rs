@@ -1062,6 +1062,21 @@ fn unpermute_cols(wperm: &[f32], m: usize, k: usize, perm: &[usize]) -> Vec<f32>
     out
 }
 
+/// Permute ROWS of a row-major `m × k` matrix (gather convention, mirroring
+/// `permute_cols`): `out[j, :] = w[perm[j], :]`. Used by the #5 residual
+/// permutation to reorder residual-WRITER output rows. Parallel over output rows.
+fn permute_rows(w: &[f32], m: usize, k: usize, perm: &[usize]) -> Vec<f32> {
+    use rayon::prelude::*;
+    debug_assert_eq!(w.len(), m * k);
+    debug_assert_eq!(perm.len(), m);
+    let mut out = vec![0.0f32; m * k];
+    out.par_chunks_mut(k).enumerate().for_each(|(j, orow)| {
+        let src = perm[j] * k;
+        orow.copy_from_slice(&w[src..src + k]);
+    });
+    out
+}
+
 /// RoughQuant Phase-2d (channel-consistent) QTIP sim: protect arbitrary input
 /// COLUMNS (`protected_cols`) and entire output ROWS (`protected_rows`) at full
 /// precision, QTIP-trellis the rest. Row-major `m × k`.
@@ -6060,6 +6075,14 @@ fn main() {
     // plain mq4 (backward-compatible). diag is the production selector (ablation
     // oracle: Spearman 0.90). Env: HIPFIRE_RQ4_PROTECT_FRAC (default 0.03).
     let use_roughquant_real = format == "roughquant" || format == "rq";
+    // permute5 (rq5): apply the #5 residual-stream permutation OFFLINE — cluster the
+    // diag(H)-selected protected residual set S into a contiguous front block and
+    // propagate the permutation across embed cols + every reader input-col + every
+    // writer output-row + all dim-wide RMSNorm γ + lm_head. Bijective (output
+    // unchanged) — the foundation for a gather-free RoughQuant correction. Weights
+    // stay bf16 (verification: permuted vs original KLD ≈ 0). See
+    // docs/roughquant/permutation-bijectivity.md.
+    let use_roughquant5 = format == "permute5" || format == "rq5";
     // Real packed QTIP-3 (vs the bf16 sim): emit QuantType::Qtip3G256 records
     // (rotated-frame symbols), decoded by the gemv_qtip3g256 kernel. The sim
     // path is for kernel-free PPL; this is the shippable bandwidth format.
@@ -6079,13 +6102,15 @@ fn main() {
         || use_roughquant2_sim
         || use_roughquant3_sim
         || use_roughquant4_sim
-        || use_roughquant_real;
+        || use_roughquant_real
+        || use_roughquant5;
     let (qtip_cb, qtip_s1, qtip_s2) = if use_qtip_sim
         || use_qtip3_real
         || use_roughquant2_sim
         || use_roughquant3_sim
         || use_roughquant4_sim
         || use_roughquant_real
+        || use_roughquant5
     {
         if use_qtip3_real {
             eprintln!(
@@ -6115,6 +6140,7 @@ fn main() {
         || use_roughquant3_sim
         || use_roughquant4_sim
         || use_roughquant_real
+        || use_roughquant5
     {
         std::env::var("HIPFIRE_QTIP_HESSIAN").ok().and_then(|p| {
             match hessian_io::HessianSidecar::open(std::path::Path::new(&p)) {
@@ -10328,6 +10354,119 @@ fn main() {
             "  roughquant (real): {n_r} reader + {n_w} writer correction sidecars \
              (bf16, max|R|={max_resid:.4}); bulk=MQ4G256; \
              protected-channel recon max-err={rq_recon_err:.2e} (bf16 rounding of R)"
+        );
+    }
+
+    // permute5 (rq5) post-pass: apply the #5 residual-stream permutation OFFLINE.
+    // Cluster the diag(H)-selected protected residual set S into a contiguous front
+    // block and propagate the same permutation P across every residual-touching
+    // tensor (embed cols, reader input-cols, writer output-rows, dim-wide RMSNorm γ,
+    // lm_head cols). Bijective ⇒ model output unchanged. Verify: permuted-vs-original
+    // KLD ≈ 0 on the working forward path.
+    if use_roughquant5 {
+        let protect_frac: f64 = std::env::var("HIPFIRE_RQ4_PROTECT_FRAC")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.05);
+        let dmodel = roughquant4_infer_dmodel(&hfq_tensors).unwrap_or(1024);
+        // diag(H) residual-channel energy from true residual readers.
+        let mut resid_energy = vec![0.0f64; dmodel];
+        for t in hfq_tensors.iter() {
+            if matches!(t.quant_type, QuantType::BF16)
+                && t.shape.len() == 2
+                && t.shape[1] as usize == dmodel
+                && !t.name.contains("embed")
+                && !t.name.contains("lm_head")
+                && roughquant4_is_residual_reader(&t.name)
+            {
+                let key = t.name.strip_suffix(".weight").unwrap_or(&t.name);
+                if let Some(diag) = qtip_hessian
+                    .as_ref()
+                    .and_then(|sc| sc.get(key, 0))
+                    .filter(|h| h.k == dmodel)
+                {
+                    for i in 0..dmodel {
+                        resid_energy[i] += diag.at(i, i);
+                    }
+                }
+            }
+        }
+        let n_prot = ((protect_frac * dmodel as f64).round() as usize).min(dmodel);
+        // Protected (top-energy) channels, then the rest — both ascending so the
+        // permutation is deterministic. P[new] = old channel mapped to slot `new`.
+        let mut order: Vec<usize> = (0..dmodel).collect();
+        order.sort_unstable_by(|&a, &b| {
+            resid_energy[b]
+                .partial_cmp(&resid_energy[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut protected: Vec<usize> = order[..n_prot].to_vec();
+        let mut rest: Vec<usize> = order[n_prot..].to_vec();
+        protected.sort_unstable();
+        rest.sort_unstable();
+        let perm: Vec<usize> = protected.iter().chain(rest.iter()).copied().collect();
+        debug_assert_eq!(perm.len(), dmodel);
+
+        let (mut n_e, mut n_r, mut n_w, mut n_n) = (0usize, 0usize, 0usize, 0usize);
+        for t in hfq_tensors.iter_mut() {
+            if !matches!(t.quant_type, QuantType::BF16) {
+                continue;
+            }
+            let mut wf: Vec<f32> = t
+                .data
+                .chunks_exact(2)
+                .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            let is_embed_or_head = t.name.contains("embed")
+                || t.name.contains("lm_head")
+                || t.name.ends_with("output.weight");
+            if t.shape.len() == 2 {
+                let m = t.shape[0] as usize;
+                let k = t.shape[1] as usize;
+                if k == dmodel && (is_embed_or_head || roughquant4_is_residual_reader(&t.name)) {
+                    // input/residual columns (readers + embed/lm_head)
+                    wf = permute_cols(&wf, m, k, &perm);
+                    if is_embed_or_head {
+                        n_e += 1;
+                    } else {
+                        n_r += 1;
+                    }
+                } else if m == dmodel && roughquant4_is_residual_writer(&t.name) {
+                    // output/residual rows (writers)
+                    wf = permute_rows(&wf, m, k, &perm);
+                    n_w += 1;
+                } else {
+                    continue;
+                }
+            } else if t.shape.len() == 1 && t.shape[0] as usize == dmodel && t.name.contains("norm")
+            {
+                // dim-wide RMSNorm γ (input/post-attn/final) — elementwise on residual
+                let g = wf.clone();
+                for (j, &old) in perm.iter().enumerate() {
+                    wf[j] = g[old];
+                }
+                n_n += 1;
+            } else {
+                continue;
+            }
+            t.data = f32_slice_to_bf16_bytes(&wf);
+        }
+        if let Some(obj) = metadata.as_object_mut() {
+            obj.insert(
+                "roughquant_permutation".to_string(),
+                serde_json::json!({
+                    "version": 1,
+                    "saliency": "diag",
+                    "d_model": dmodel,
+                    "n_protected": n_prot,
+                    "protected_contiguous_front": true,
+                    "perm": perm,
+                }),
+            );
+        }
+        eprintln!(
+            "  permute5 (#5): d_model={dmodel}, S={n_prot} clustered to front [0..{n_prot}); \
+             permuted {n_e} embed/head + {n_r} readers + {n_w} writers + {n_n} norms"
         );
     }
 

@@ -36,7 +36,16 @@ invisible at equal q/k positions — must test `pos_q ≠ pos_k`.
 
 ## Status
 
-- **Verified** (this doc): which permutations are free + their propagation spec.
+- **#5 verified on a REAL model** (`--format permute5`, 2026-06-18): applied the #5
+  residual permutation to Qwen3.5-0.8B (clustering the diag-selected S=51 to a
+  contiguous front block), propagated across 1 embed/lm_head + 138 readers + 48
+  writers + 49 dim-wide norms, and the permuted bf16 model gives **KLD 5.2e-5 vs the
+  bf16 reference** on the working forward path — i.e. output-identical up to FP
+  reduction-order noise (permuting the residual reorders GEMV accumulation; FP add
+  is non-associative). Confirms bijectivity beyond the synthetic per-block check.
+  Producer also writes `metadata["roughquant_permutation"]` (perm + n_protected) so
+  a downstream correction knows S = `[0..n_protected)`.
+- **Verified** (synthetic, this doc): which permutations are free + propagation spec.
 - **Production machinery** (next): Rust appliers that permute a loaded model's
   weights per type, enforcing the GQA grouping (#3) and the RoPE-pair constraint
   (#4), with the #5 global propagation across embed/norms/all-projections/lm_head.
