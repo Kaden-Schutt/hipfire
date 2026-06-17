@@ -3200,6 +3200,9 @@ pub const SWIGLU_TRAIN_SRC: &str = include_str!("../../../kernels/src/swiglu_tra
 pub const CROSS_ENTROPY_TRAIN_SRC: &str =
     include_str!("../../../kernels/src/cross_entropy_train.hip");
 
+/// RoPE fwd+bwd (fp32), HF-Llama half-split convention, un-fused training path.
+pub const ROPE_TRAIN_SRC: &str = include_str!("../../../kernels/src/rope_train.hip");
+
 /// LayerNorm with bias: out = gamma * (x - mean) / sqrt(var + eps) + beta
 /// Grid=[batch], Block=[min(256, n)].
 pub const LAYERNORM_SRC: &str = include_str!("../../../kernels/src/layernorm.hip");

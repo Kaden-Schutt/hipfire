@@ -40668,6 +40668,77 @@ impl Gpu {
         }
     }
 
+    /// Training RoPE forward (fp32), HF half-split. `x`,`out`: `[rows*d]`,
+    /// rows = seq*n_heads; `pos`: `[seq]`.
+    pub fn rope_train_fwd(
+        &mut self,
+        x: &GpuTensor,
+        out: &GpuTensor,
+        pos: &GpuTensor,
+        rows: usize,
+        n_heads: usize,
+        d: usize,
+        base: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("rope_train_fwd", kernels::ROPE_TRAIN_SRC, "rope_train_fwd")?;
+        let func = &self.functions["rope_train_fwd"];
+        let mut xp = x.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut pp = pos.buf.as_ptr();
+        let mut rowsi = rows as i32;
+        let mut nh = n_heads as i32;
+        let mut di = d as i32;
+        let mut basef = base;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut rowsi as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut di as *mut _ as *mut c_void,
+            &mut basef as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(func, [rows as u32, 1, 1], [64, 1, 1], 0, self.stream_ref(), &mut params)
+        }
+    }
+
+    /// Training RoPE backward (fp32): rotation by −angle. `d_out`,`dx`: `[rows*d]`.
+    pub fn rope_train_bwd(
+        &mut self,
+        d_out: &GpuTensor,
+        dx: &GpuTensor,
+        pos: &GpuTensor,
+        rows: usize,
+        n_heads: usize,
+        d: usize,
+        base: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("rope_train_bwd", kernels::ROPE_TRAIN_SRC, "rope_train_bwd")?;
+        let func = &self.functions["rope_train_bwd"];
+        let mut dop = d_out.buf.as_ptr();
+        let mut dxp = dx.buf.as_ptr();
+        let mut pp = pos.buf.as_ptr();
+        let mut rowsi = rows as i32;
+        let mut nh = n_heads as i32;
+        let mut di = d as i32;
+        let mut basef = base;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dop as *mut _ as *mut c_void,
+            &mut dxp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut rowsi as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut di as *mut _ as *mut c_void,
+            &mut basef as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(func, [rows as u32, 1, 1], [64, 1, 1], 0, self.stream_ref(), &mut params)
+        }
+    }
+
     /// LayerNorm with bias (batched): out = gamma * (x - mean) / sqrt(var + eps) + beta
     pub fn layernorm_batched(
         &mut self,

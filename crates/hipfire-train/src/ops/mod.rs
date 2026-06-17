@@ -9,5 +9,6 @@
 pub mod cross_entropy;
 pub mod linear;
 pub mod rmsnorm;
+pub mod rope;
 pub mod softmax;
 pub mod swiglu;
