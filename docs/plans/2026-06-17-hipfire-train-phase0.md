@@ -199,8 +199,15 @@ cosine schedule + 10% warmup, **global-norm grad clip at 1.0**.
   - **GQA multi-head** ✅ DONE: gqa_forward/gqa_backward via gather/scatter
     (`strided_copy_2d.hip`, scatter-add for shared kv heads),
     gradcheck dQ 6.2e-5 / dK 9.4e-5 / dV 7.8e-5 with n_heads=4,n_kv=2.
-  - TODO: full transformer block (norm→attn proj+LoRA→residual→norm→swiglu
-    MLP→residual) → full model fwd+bwd → end-to-end LoRA gradcheck.
+  - **full transformer block** ✅ DONE: `block.rs` block_forward/block_backward,
+    `examples/gradcheck_block.rs` PASS (dAq/dBq/dAv/dBv ≈2–4e-4).
+  - **full model** ✅ DONE: `model.rs` (embed → N blocks → final norm → tied
+    logits → CE), `examples/gradcheck_model.rs` 2-layer PASS — LoRA grads in
+    BOTH layers ≈2.5–3.8e-4.
+
+  **M2 COMPLETE** — end-to-end fp32 model fwd+bwd verified by full-model LoRA
+  gradcheck. Backward machinery proven from a single matmul up to the whole
+  network. Next: M3 (AdamW + alpaca data → overfit ~50 examples to ~0 loss).
 - **M3 — AdamW overfit.** LoRA on q_proj/v_proj, ~50 examples → loss → ~0.
   THE success criterion.
 - **M4 — directional vs PyTorch.** Few-thousand-example run trends like
