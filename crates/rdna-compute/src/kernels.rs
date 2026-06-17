@@ -3211,6 +3211,9 @@ pub const CAUSAL_MASK_TRAIN_SRC: &str =
 pub const STRIDED_COPY_2D_SRC: &str =
     include_str!("../../../kernels/src/strided_copy_2d.hip");
 
+/// AdamW optimizer step (fp32, decoupled weight decay), un-fused training path.
+pub const ADAMW_TRAIN_SRC: &str = include_str!("../../../kernels/src/adamw_train.hip");
+
 /// LayerNorm with bias: out = gamma * (x - mean) / sqrt(var + eps) + beta
 /// Grid=[batch], Block=[min(256, n)].
 pub const LAYERNORM_SRC: &str = include_str!("../../../kernels/src/layernorm.hip");

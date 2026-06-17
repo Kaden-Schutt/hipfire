@@ -40805,6 +40805,59 @@ impl Gpu {
         }
     }
 
+    /// AdamW step (fp32). `p`,`g`,`m`,`v`: `[n]` (m,v persisted across steps).
+    /// `bc1`/`bc2` are host-computed bias corrections (1−β^t).
+    #[allow(clippy::too_many_arguments)]
+    pub fn adamw_step(
+        &mut self,
+        p: &GpuTensor,
+        g: &GpuTensor,
+        m: &GpuTensor,
+        v: &GpuTensor,
+        n: usize,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        wd: f32,
+        bc1: f32,
+        bc2: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("adamw_step", kernels::ADAMW_TRAIN_SRC, "adamw_step")?;
+        let func = &self.functions["adamw_step"];
+        let mut pp = p.buf.as_ptr();
+        let mut gp = g.buf.as_ptr();
+        let mut mp = m.buf.as_ptr();
+        let mut vp = v.buf.as_ptr();
+        let mut ni = n as i32;
+        let mut lrf = lr;
+        let mut b1 = beta1;
+        let mut b2 = beta2;
+        let mut epsf = eps;
+        let mut wdf = wd;
+        let mut bc1f = bc1;
+        let mut bc2f = bc2;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut pp as *mut _ as *mut c_void,
+            &mut gp as *mut _ as *mut c_void,
+            &mut mp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut lrf as *mut _ as *mut c_void,
+            &mut b1 as *mut _ as *mut c_void,
+            &mut b2 as *mut _ as *mut c_void,
+            &mut epsf as *mut _ as *mut c_void,
+            &mut wdf as *mut _ as *mut c_void,
+            &mut bc1f as *mut _ as *mut c_void,
+            &mut bc2f as *mut _ as *mut c_void,
+        ];
+        let grid = ((n as u32) + 255) / 256;
+        unsafe {
+            self.hip.launch_kernel(func, [grid, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)
+        }
+    }
+
     /// LayerNorm with bias (batched): out = gamma * (x - mean) / sqrt(var + eps) + beta
     pub fn layernorm_batched(
         &mut self,
