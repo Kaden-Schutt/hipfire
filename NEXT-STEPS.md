@@ -360,6 +360,25 @@ Papers + reference implementations vendored for Phases C/D:
       (≈254 MB/token) is read equally by both, so the transformer-weight delta
       is ~14% of total; the full qtip3 bandwidth advantage shows more on larger
       models where transformer weights dominate the per-token stream.
+  - **AMDAHL TEST ✅ CONFIRMED at 4B (2026-06-17).** Quantized qwen3.5-4B as real
+    qtip3 (Q8 embed, 248 tensors, 0.391 B/w) and A/B'd vs 4b-mq4:
+    | metric | qtip3-4b | mq4-4b | Δ |
+    | size | 2.086 GB | 2.587 GB | **−19%** |
+    | PPL (calib-1m ctx1536) | 6.87 | 6.72 | +2.2% |
+    | PPL (ctx2048, first clean run) | 7.68 | 7.51 | +2.2% |
+    | decode (WARM, paired, ctx1536) | **7.2 tok/s** | 6.1 tok/s | **+18%** |
+    The byte saving **DOES convert to a decode-speed win at 4B** (+18%),
+    overturning the 0.8B pessimism: at 0.8B qtip3≈mq4 (Q8 lm_head dominates the
+    per-token stream and is equal for both); at 4B transformer weights dominate,
+    so qtip3's 0.39-vs-0.53 B/w shows through. So qtip3 = smaller AND faster AND
+    near-mq4 PPL once the model is big enough that weights (not lm_head) gate
+    decode. **Methodology caveats:** decode tok/s MUST be warm + same-process
+    paired — cross-run cold numbers swung mq4 6.1↔10.8 and falsely showed qtip3
+    slower; the warm paired run is the trustworthy one. PPL: the perplexity
+    harness emits non-finite NLLs at the last ~2 window positions (near KV-max)
+    for BOTH formats — a harness edge artifact, not a format issue; use ctx
+    clear of the tail or ignore the final 2 skips. C3 kernel retune would widen
+    the +18% further (still ALU headroom), but it's already a net win at 4B+.
 - **Phase C: (superseded) ACTIVE — LDLQ landed; pushing the rest of the QTIP stack.**
   C1e DONE end-to-end: clean-room `ldlq.rs` (inverse-Cholesky 1e-13, per-256
   Hessian FWHT rotation, block-trellis OBS) + `hessian_io` wired +
