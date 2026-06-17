@@ -467,3 +467,24 @@ goal:
 (A production router-margin regularizer — hardening real routing against quant
 error — is a *separate* idea; park it under the finetune tool only if it earns
 its own motivation, not as part of this fixture work.)
+
+---
+
+## Circle back: QTIP recovery export — norms-only quality vs Path B (2026-06-17)
+
+Phase 3 export bridge (`hipfire-train` → daemon-servable qtip3 `.hfq`) is being
+built on **Path A** (layernorm-only recovery → patch tuned norms into a qtip3
+`.hfq`; lossless, codes untouched). Validated: norms-only recovery rescues
+coherence (2-bit Supra-50M: corpus KL 1.58 → **0.144**, degenerate loop →
+grammatical prose, from only ~12.8k trainable params).
+
+**The tradeoff to revisit:** norms-only floors ~6× higher KL than **LoRA+norms**
+(0.144 vs **0.025**). Path A ships that lossless-but-lower-capacity result. If
+the served quality isn't good enough, evaluate **Path B** (merge LoRA into the
+base, re-quantize to qtip3) and **measure how much of the 0.025 survives
+re-quantization** — Path B trades a re-quant loss for LoRA's extra capacity.
+Also possible: **Path C** (LoRA fp sidecar, daemon applies it — needs new daemon
+support, no re-quant loss).
+
+Decision deferred; Path A v1 ships first. See
+`docs/plans/2026-06-17-hipfire-train-phase3-hfq-export.md`.
