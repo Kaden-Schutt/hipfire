@@ -1,8 +1,18 @@
 # RoughQuant — Phase 2: PCA rotation + frontier sweep
 
-**VERDICT: HEADLINE THESIS FALSIFIED, modest sub-4-bit win exists but is
-CONFOUNDED and not yet deployable. → Do NOT build Phase 3 kernels yet; resolve
-two cheap de-risks first (see NEXT-STEPS).**
+**FINAL VERDICT (post de-risk A+B): NOT DEPLOYABLE on Qwen3.5-0.8B. STOP.**
+The headline 2.5-bit thesis is falsified; the modest sub-4-bit quality edge is
+real and iso-bit (de-risk A) but **evaporates under the folding constraint**
+(de-risk B): the deployable (foldable shared-rotation) form scores PPL 30.68 —
+**worse than mq4's 29.08** — while also incurring runtime rotation cost for
+o_proj/down_proj. The win existed only with per-weight dense rotations that
+cannot fold for free. Do NOT build Phase 3. (Cross-model recheck on a 7B/9B is
+the only remaining avenue and is speculative — see NEXT-STEPS.)
+
+---
+
+_Original phase-2 verdict (pre de-risk B), kept for the record:_ headline thesis
+falsified, modest sub-4-bit win exists but confounded and not-yet-deployable.
 
 - The spec's headline gate — *"does ~2.5 avg-bit ≈ 4-bit-uniform PPL?"* — **fails**
   on Qwen3.5-0.8B: at 2.55 avg-bits RoughQuant gives PPL 47.85 vs mq4's 29.08.
@@ -89,30 +99,54 @@ the eigenbasis + protecting the top-energy subspace genuinely helps.
    rotation is far more constrained than 186 per-weight ones and will capture
    less benefit — this is the research crux, and a redesign, not a quick sweep.
 
-## STATUS: stopped here for a human go/no-go (2026-06-17)
+## De-risk B — DONE, FAILED (the deployability verdict)
 
-De-risk A passed → the mechanism win is real and iso-bit (~0.7 bit at iso-PPL,
-~2.8% better than mq4; +11% over QTIP-3-LDLQ). De-risk B (foldable shared
-rotation) is unresolved and is the deployability make-or-break. Building it is a
-substantial redesign (global/shared residual-stream rotation + fold + packed
-per-tier format + kernels) for a **modest ~0.7-bit payoff**. Per the project
-methodology (don't build large speculative kernels for a contingent win), this is
-left for a human decision rather than an unattended build.
+Foldability analysis first (Hessian inspection, no GPU):
+- Same-input weights have **identical** Hessians (cos = 1.000000 for
+  `in_proj_{qkv,z,b,a}` and for `gate/up`; unrelated pairs cos ≈ 0.034). So
+  within-input-group rotation sharing is **already free** and the per-weight
+  phase-2 result already reflects it — the win was NOT inflated by per-q/k/v
+  rotations.
+- Rotations can only be shared among **same-input, same-k** weights. By k:
+  k=1024 = all d_model residual readers (in_proj_*, gate/up, q/k/v) → one
+  foldable residual rotation; k=2048 (o_proj/out_proj) and k=3584 (down_proj)
+  read internal activations → need a runtime rotation regardless.
 
-## NEXT-STEPS (gating Phase 3)
+Experiment (`HIPFIRE_RQ2_SHARE_RESID=1`): force all 138 k=1024 weights onto ONE
+global rotation aggregated from their summed Hessians (the foldable ResQ-U_A
+design); keep o_proj/down_proj per-weight. `b3 f0.03`, Q8 embed:
 
-1. **De-risk A — DONE, PASSED.** Iso-bit (Q8 embed): b3 f0.03 = 28.28 < mq4 29.08.
-2. **De-risk B (the blocker, a redesign): shared/foldable rotation.** Collect ONE
-   residual-stream Hessian per block boundary (or one global), apply a single
-   shared rotation foldable into embed + all o_proj/down_proj outputs + lm_head,
-   and confirm b3 f0.03's PPL edge survives the shared constraint. If shared-P
-   loses the edge → win not deployable, STOP. If it holds → Phase 3 is justified.
-3. **Only if B holds:** offline fold + down_proj runtime FWHT + real packed
-   per-tier format (not bf16 sim) + coherence + fresh-probe perf on a perf-class
-   model. Large effort; confirm the payoff is worth it first.
-4. **Cross-model check (orthogonal):** the 2-bit failure and bounded ~3.5-bit win
-   are on a 0.8B; bigger models have more redundancy and may push the frontier
-   lower. Worth re-running phase 2 on a 7B/9B before concluding 2-bit is dead.
+| rotation | avg-bits | PPL | vs mq4 (29.08) |
+|---|---|---|---|
+| per-weight (NOT foldable) | ~3.5 | 28.28 | −2.8% ✓ |
+| **shared residual (foldable)** | ~3.5 | **30.68** | **+5.5% ✗** |
+
+**The win evaporates under folding.** The single shared residual rotation is
+suboptimal for every individual input-point (attn-input vs mlp-input vs the
+evolving cross-layer residual have different covariance), and that 2.4-PPL
+penalty is larger than the entire margin over mq4. The deployable form (30.68) is
+strictly dominated by mq4 (29.08) — worse PPL **and** still needing runtime
+rotations for o_proj/down_proj. The phase-2 edge was an artifact of per-weight
+dense rotations that cannot fold for free.
+
+## CONCLUSION: RoughQuant not deployable on Qwen3.5-0.8B — STOP
+
+Two independent failures on this model: (1) 2-bit bulk non-viable (headline
+thesis), (2) the sub-4-bit quality edge does not survive the folding constraint.
+The deployable form loses to existing mq4. No Phase 3.
+
+## NEXT-STEPS
+
+1. **De-risk A — DONE, PASSED** (iso-bit: 28.28 < 29.08).
+2. **De-risk B — DONE, FAILED** (foldable: 30.68 > 29.08). Deployability killed.
+3. **Phase 3 — NOT pursued.** Would ship a format strictly worse than mq4.
+4. **Only remaining avenue (speculative): cross-model.** Both failures are on a
+   0.8B. A 7B/9B has more redundancy — 2-bit might become viable AND the shared-
+   rotation penalty might shrink (a bigger residual stream may admit a better
+   single rotation). Requires a fresh Hessian (~1–3 h collect via
+   `scripts/collect_hessian.py`) + a slower sweep. Given two clean negatives
+   here, pursue only if there's an independent reason to expect big models to
+   differ qualitatively. Not auto-run.
 
 ## Artifacts
 

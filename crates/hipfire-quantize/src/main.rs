@@ -9196,6 +9196,47 @@ fn main() {
         eprintln!(
             "  roughquant2-sim: PCA rotation, protect_frac={protect_frac} bulk_bits={bulk_bits} damp={damp}"
         );
+        // De-risk B: single shared, foldable residual-stream rotation. With
+        // HIPFIRE_RQ2_SHARE_RESID=1, every k==1024 weight (the d_model residual
+        // readers: in_proj_*, gate/up, q/k/v) uses ONE global rotation aggregated
+        // from their summed Hessians — the foldable ResQ-U_A design. Weights with
+        // k!=1024 (o_proj/out_proj=2048, down_proj=3584) read internal activations
+        // and keep their own per-weight rotation (the runtime-rotation tier).
+        // Tests whether forcing the foldable shared rotation preserves the win.
+        let share_resid = std::env::var("HIPFIRE_RQ2_SHARE_RESID").ok().as_deref() == Some("1");
+        let r_global: Option<Vec<f32>> = if share_resid {
+            let kk = 1024usize;
+            let mut csum = vec![0.0f32; kk * kk];
+            let mut n_agg = 0usize;
+            if let Some(sc) = qtip_hessian.as_ref() {
+                for t in hfq_tensors.iter() {
+                    if matches!(t.quant_type, QuantType::BF16)
+                        && t.shape.len() == 2
+                        && t.shape[1] as usize == kk
+                        && !t.name.contains("embed")
+                        && !t.name.contains("lm_head")
+                    {
+                        let key = t.name.strip_suffix(".weight").unwrap_or(&t.name);
+                        if let Some(href) = sc.get(key, 0).filter(|h| h.k == kk) {
+                            for i in 0..kk {
+                                for j in 0..kk {
+                                    csum[i * kk + j] += href.at(i, j) as f32;
+                                }
+                            }
+                            n_agg += 1;
+                        }
+                    }
+                }
+            }
+            let rg = roughquant::pca_basis(&csum, kk, damp).map(|(p, _)| p);
+            eprintln!(
+                "  roughquant2-sim: SHARE_RESID — global k=1024 rotation from {n_agg} tensors ({})",
+                if rg.is_some() { "ok" } else { "FAILED" }
+            );
+            rg
+        } else {
+            None
+        };
         let (mut n_rot, mut n_skip) = (0usize, 0usize);
         for t in hfq_tensors.iter_mut() {
             if !(matches!(t.quant_type, QuantType::BF16)
@@ -9209,27 +9250,42 @@ fn main() {
             let m = t.shape[0] as usize;
             let k = t.shape[1] as usize;
             let key = t.name.strip_suffix(".weight").unwrap_or(&t.name);
-            // Need a k×k Hessian to build the PCA basis; else leave bf16.
-            let cmat: Option<Vec<f32>> = qtip_hessian
-                .as_ref()
-                .and_then(|sc| sc.get(key, 0))
-                .filter(|h| h.k == k)
-                .map(|href| {
-                    let mut c = vec![0.0f32; k * k];
-                    for i in 0..k {
-                        for j in 0..k {
-                            c[i * k + j] = href.at(i, j) as f32;
-                        }
+            // Rotation basis: the shared global residual rotation for k==1024 when
+            // SHARE_RESID is on, else the per-weight PCA basis from this tensor's
+            // own Hessian (skip the tensor if it has none / the eigensolve fails).
+            let p: Vec<f32> = if share_resid && k == 1024 {
+                match r_global.as_ref() {
+                    Some(rg) => rg.clone(),
+                    None => {
+                        n_skip += 1;
+                        continue;
                     }
-                    c
-                });
-            let Some(c) = cmat else {
-                n_skip += 1;
-                continue;
-            };
-            let Some((p, _ev)) = roughquant::pca_basis(&c, k, damp) else {
-                n_skip += 1;
-                continue;
+                }
+            } else {
+                let cmat: Option<Vec<f32>> = qtip_hessian
+                    .as_ref()
+                    .and_then(|sc| sc.get(key, 0))
+                    .filter(|h| h.k == k)
+                    .map(|href| {
+                        let mut c = vec![0.0f32; k * k];
+                        for i in 0..k {
+                            for j in 0..k {
+                                c[i * k + j] = href.at(i, j) as f32;
+                            }
+                        }
+                        c
+                    });
+                let Some(c) = cmat else {
+                    n_skip += 1;
+                    continue;
+                };
+                match roughquant::pca_basis(&c, k, damp) {
+                    Some((p, _ev)) => p,
+                    None => {
+                        n_skip += 1;
+                        continue;
+                    }
+                }
             };
             let mut wf: Vec<f32> = t
                 .data

@@ -1,14 +1,16 @@
 # RoughQuant — energy-concentrating mixed-precision weight quant (build spec)
 
-**Status:** design (2026-06-17); **sim phases 0–2 done (2026-06-17)** — see
-`docs/roughquant/phase{0,1,2}.md`. **Headline thesis (≈2.5 avg-bit ≈ 4-bit PPL)
-FALSIFIED on Qwen3.5-0.8B**; a clean mechanism win exists (PCA + top-subspace
-protection beats iso-bit QTIP-3-LDLQ by 11%) but the deployment win over 4-bit
-mq4 is modest (~0.7 bit), confounded (embed precision), and contingent on a
-foldable shared rotation that is not yet validated. Phase 3 (kernels/format)
-gated on two cheap de-risks + a human go/no-go — NOT auto-built. Derived from
-ResQ (2412.14363), adapted to hipfire (weight-only, GQA, multi-tier, fp32
-super-bin) + the "roughquant" lever.
+**Status:** **CONCLUDED — NOT DEPLOYABLE on Qwen3.5-0.8B (2026-06-17).** Sim
+phases 0–2 + de-risks A/B done — see `docs/roughquant/phase{0,1,2}.md`. Two
+independent failures: (1) the headline thesis (≈2.5 avg-bit ≈ 4-bit PPL) is
+FALSIFIED — 2-bit bulk non-viable (2.55 bit → PPL 47.85 vs mq4 29.08); (2) the
+real sub-4-bit quality edge (per-weight PCA: 28.28 < mq4 29.08, iso-bit, de-risk
+A) EVAPORATES under the folding constraint (de-risk B: foldable shared residual
+rotation → 30.68, worse than mq4). The win existed only with per-weight dense
+rotations that cannot fold for free; the deployable form is strictly dominated by
+mq4. Phase 3 NOT pursued. Only speculative remaining avenue: cross-model recheck
+on a 7B/9B. Derived from ResQ (2412.14363), adapted to hipfire (weight-only, GQA,
+multi-tier, fp32 super-bin) + the "roughquant" lever.
 
 ## Lineage / what's new
 
