@@ -35,10 +35,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu = Gpu::init().expect("Gpu::init failed");
     println!("arch: {}", gpu.arch);
 
-    let qh: Vec<f32> = (0..SEQ * QDIM).map(|i| ((i * 17 % 13) as f32) * 0.12 - 0.6).collect();
-    let kh: Vec<f32> = (0..SEQ * KVDIM).map(|i| ((i * 23 % 11) as f32) * 0.1 - 0.4).collect();
-    let vh: Vec<f32> = (0..SEQ * KVDIM).map(|i| ((i * 7 % 9) as f32) * 0.15 - 0.5).collect();
-    let gh: Vec<f32> = (0..SEQ * QDIM).map(|i| ((i * 13 % 5) as f32) * 0.2 - 0.3).collect();
+    let qh: Vec<f32> = (0..SEQ * QDIM)
+        .map(|i| ((i * 17 % 13) as f32) * 0.12 - 0.6)
+        .collect();
+    let kh: Vec<f32> = (0..SEQ * KVDIM)
+        .map(|i| ((i * 23 % 11) as f32) * 0.1 - 0.4)
+        .collect();
+    let vh: Vec<f32> = (0..SEQ * KVDIM)
+        .map(|i| ((i * 7 % 9) as f32) * 0.15 - 0.5)
+        .collect();
+    let gh: Vec<f32> = (0..SEQ * QDIM)
+        .map(|i| ((i * 13 % 5) as f32) * 0.2 - 0.3)
+        .collect();
 
     let q = gpu.upload_f32(&qh, &[SEQ * QDIM])?;
     let k = gpu.upload_f32(&kh, &[SEQ * KVDIM])?;
@@ -51,7 +59,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dq = gpu.zeros(&[SEQ * QDIM], DType::F32)?;
     let dk = gpu.zeros(&[SEQ * KVDIM], DType::F32)?; // zeroed (scatter-add target)
     let dv = gpu.zeros(&[SEQ * KVDIM], DType::F32)?;
-    gqa_backward(&mut gpu, &d_ctx, &q, &k, &v, &p_all, &dq, &dk, &dv, SEQ, NH, NKV, D, scale())?;
+    gqa_backward(
+        &mut gpu,
+        &d_ctx,
+        &q,
+        &k,
+        &v,
+        &p_all,
+        &dq,
+        &dk,
+        &dv,
+        SEQ,
+        NH,
+        NKV,
+        D,
+        scale(),
+    )?;
     let dq_a = gpu.download_f32(&dq)?;
     let dk_a = gpu.download_f32(&dk)?;
     let dv_a = gpu.download_f32(&dv)?;
@@ -88,7 +111,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ev = check(&mut gpu, &vh, 2, &dv_a, &q, &k, &v)?;
 
     println!("gqa dQ max|analytic-numeric| = {eq:.2e}");
-    println!("gqa dK max|analytic-numeric| = {ek:.2e}  (grad-accum across {} q-heads/kv)", NH / NKV);
+    println!(
+        "gqa dK max|analytic-numeric| = {ek:.2e}  (grad-accum across {} q-heads/kv)",
+        NH / NKV
+    );
     println!("gqa dV max|analytic-numeric| = {ev:.2e}");
     let tol = 1e-2f32;
     if eq < tol && ek < tol && ev < tol {

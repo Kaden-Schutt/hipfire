@@ -24,9 +24,9 @@ pub fn lora_forward(
     w: &GpuTensor,
     a: &GpuTensor,
     b: &GpuTensor,
-    h: &GpuTensor,   // out scratch [m*r]
+    h: &GpuTensor,    // out scratch [m*r]
     lora: &GpuTensor, // out scratch [m*n]
-    y: &GpuTensor,   // out [m*n]
+    y: &GpuTensor,    // out [m*n]
     m: usize,
     k: usize,
     n: usize,

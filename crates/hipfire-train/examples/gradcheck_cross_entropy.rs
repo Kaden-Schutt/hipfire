@@ -28,8 +28,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu = Gpu::init().expect("Gpu::init failed");
     println!("arch: {}", gpu.arch);
 
-    let logits_host: Vec<f32> =
-        (0..ROWS * V).map(|i| ((i * 23 % 17) as f32) * 0.25 - 2.0).collect();
+    let logits_host: Vec<f32> = (0..ROWS * V)
+        .map(|i| ((i * 23 % 17) as f32) * 0.25 - 2.0)
+        .collect();
     // Row 2 is the ignored row.
     let targets_host: Vec<f32> = vec![3.0, 7.0, IGNORE as f32, 1.0];
 

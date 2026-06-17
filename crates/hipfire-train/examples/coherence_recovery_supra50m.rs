@@ -14,7 +14,9 @@
 
 use hipfire_model::tokenizer::Tokenizer;
 use hipfire_train::loader::{load_llama_fp32, LlamaWeightsF32};
-use hipfire_train::model::{flatten_recovery_grads, model_distill_backward, model_forward, LlamaModel};
+use hipfire_train::model::{
+    flatten_recovery_grads, model_distill_backward, model_forward, LlamaModel,
+};
 use hipfire_train::ops::softmax::softmax_forward;
 use hipfire_train::optim::AdamW;
 use hipfire_train::qtip_quant::qtip_quantize_dequant;
@@ -32,7 +34,10 @@ const PROMPT: &str = "The Roman Empire was";
 // Bit-width and step count are env-tunable (QTIP-2 needs more recovery than -3):
 //   HIPFIRE_QTIP_BITS (default 3), HIPFIRE_QTIP_STEPS (default 120).
 fn env_u32(key: &str, default: u32) -> u32 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 const CORPUS: &str = "The Roman Empire was one of the largest empires in ancient history. At its \
@@ -44,11 +49,20 @@ economic troubles, and political instability. The western half eventually fell, 
 half continued as the Byzantine Empire for another thousand years. Roman law, architecture, and \
 culture continue to influence the modern world to this day in countless ways.";
 
-fn quantize_linears(gpu: &mut Gpu, w: &mut LlamaWeightsF32, bits: u32) -> Result<(), Box<dyn std::error::Error>> {
+fn quantize_linears(
+    gpu: &mut Gpu,
+    w: &mut LlamaWeightsF32,
+    bits: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
     for l in w.layers.iter_mut() {
         for t in [
-            &mut l.q_proj, &mut l.k_proj, &mut l.v_proj, &mut l.o_proj,
-            &mut l.gate_proj, &mut l.up_proj, &mut l.down_proj,
+            &mut l.q_proj,
+            &mut l.k_proj,
+            &mut l.v_proj,
+            &mut l.o_proj,
+            &mut l.gate_proj,
+            &mut l.up_proj,
+            &mut l.down_proj,
         ] {
             let host = gpu.download_f32(t)?;
             let q = qtip_quantize_dequant(&host, bits, BEAM);
@@ -59,10 +73,21 @@ fn quantize_linears(gpu: &mut Gpu, w: &mut LlamaWeightsF32, bits: u32) -> Result
 }
 
 fn argmax(row: &[f32]) -> u32 {
-    row.iter().enumerate().fold((0u32, f32::MIN), |a, (i, &x)| if x > a.1 { (i as u32, x) } else { a }).0
+    row.iter()
+        .enumerate()
+        .fold(
+            (0u32, f32::MIN),
+            |a, (i, &x)| if x > a.1 { (i as u32, x) } else { a },
+        )
+        .0
 }
 
-fn generate(gpu: &mut Gpu, m: &LlamaModel, prompt: &[u32], vocab: usize) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+fn generate(
+    gpu: &mut Gpu,
+    m: &LlamaModel,
+    prompt: &[u32],
+    vocab: usize,
+) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
     let plen = prompt.len();
     let mut tokens = vec![0u32; L];
     tokens[..plen].copy_from_slice(prompt);
@@ -105,7 +130,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Distillation corpus → L-token chunks → frozen teacher distributions.
     let corpus_ids = tok.encode(CORPUS);
     let n_chunks = corpus_ids.len() / L;
-    println!("corpus {} tokens → {n_chunks} chunks of {L}", corpus_ids.len());
+    println!(
+        "corpus {} tokens → {n_chunks} chunks of {L}",
+        corpus_ids.len()
+    );
     let pos: Vec<f32> = (0..L).map(|t| t as f32).collect();
     let mut chunks: Vec<Vec<u32>> = Vec::new();
     let mut teacher_p: Vec<GpuTensor> = Vec::new();
@@ -127,7 +155,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut total = 0.0f32;
         for (ci, toks) in chunks.iter().enumerate() {
             let acts = model_forward(&mut gpu, &student, toks, &pos)?;
-            let (kl, grads, d_final) = model_distill_backward(&mut gpu, &student, &acts, &teacher_p[ci])?;
+            let (kl, grads, d_final) =
+                model_distill_backward(&mut gpu, &student, &acts, &teacher_p[ci])?;
             total += kl;
             let params = student.recovery_params();
             let gflat = flatten_recovery_grads(&grads, &d_final);
@@ -145,10 +174,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let plen = prompt_ids.len();
     println!("\n══ greedy continuations of {PROMPT:?}  (QTIP-{bits}) ══");
-    println!("TEACHER (fp32):        {}", tok.decode(&gen_teacher[plen..L]));
-    println!("STUDENT before recov:  {}", tok.decode(&gen_before[plen..L]));
+    println!(
+        "TEACHER (fp32):        {}",
+        tok.decode(&gen_teacher[plen..L])
+    );
+    println!(
+        "STUDENT before recov:  {}",
+        tok.decode(&gen_before[plen..L])
+    );
     println!("STUDENT after  recov:  {}", tok.decode(&gen_after[plen..L]));
     println!("\n(corpus KL dropped over FT; compare whether 'after' reads closer to the");
-    println!(" teacher / more coherent than 'before' — eyeball test for a 50M @ {bits}-bit model.)");
+    println!(
+        " teacher / more coherent than 'before' — eyeball test for a 50M @ {bits}-bit model.)"
+    );
     Ok(())
 }

@@ -35,11 +35,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu = Gpu::init().expect("Gpu::init failed");
     println!("arch: {}", gpu.arch);
 
-    let s_host: Vec<f32> = (0..ROWS * V).map(|i| ((i * 23 % 17) as f32) * 0.2 - 1.0).collect();
+    let s_host: Vec<f32> = (0..ROWS * V)
+        .map(|i| ((i * 23 % 17) as f32) * 0.2 - 1.0)
+        .collect();
     // teacher_p: row-wise softmax of a different deterministic logit field.
     let mut tp_host = vec![0.0f32; ROWS * V];
     for r in 0..ROWS {
-        let tl: Vec<f32> = (0..V).map(|i| (((r * V + i) * 13 % 11) as f32) * 0.3 - 0.5).collect();
+        let tl: Vec<f32> = (0..V)
+            .map(|i| (((r * V + i) * 13 % 11) as f32) * 0.3 - 0.5)
+            .collect();
         tp_host[r * V..(r + 1) * V].copy_from_slice(&softmax(&tl));
     }
 

@@ -71,6 +71,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\nGRADCHECK PASS — swiglu backward matches finite differences.");
         Ok(())
     } else {
-        Err(format!("gradcheck FAIL (tol {tol:.0e}): d_gate {max_err_g:.2e}, d_up {max_err_u:.2e}").into())
+        Err(
+            format!("gradcheck FAIL (tol {tol:.0e}): d_gate {max_err_g:.2e}, d_up {max_err_u:.2e}")
+                .into(),
+        )
     }
 }

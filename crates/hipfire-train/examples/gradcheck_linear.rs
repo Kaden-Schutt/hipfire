@@ -31,9 +31,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("arch: {}", gpu.arch);
 
     // Deterministic inputs.
-    let x_host: Vec<f32> = (0..M * K).map(|i| ((i * 31 % 17) as f32) * 0.07 - 0.4).collect();
-    let w_host: Vec<f32> = (0..N * K).map(|i| ((i * 23 % 13) as f32) * 0.05 - 0.25).collect();
-    let g_host: Vec<f32> = (0..M * N).map(|i| ((i * 11 % 7) as f32) * 0.1 - 0.2).collect();
+    let x_host: Vec<f32> = (0..M * K)
+        .map(|i| ((i * 31 % 17) as f32) * 0.07 - 0.4)
+        .collect();
+    let w_host: Vec<f32> = (0..N * K)
+        .map(|i| ((i * 23 % 13) as f32) * 0.05 - 0.25)
+        .collect();
+    let g_host: Vec<f32> = (0..M * N)
+        .map(|i| ((i * 11 % 7) as f32) * 0.1 - 0.2)
+        .collect();
 
     let x = gpu.upload_f32(&x_host, &[M * K])?;
     let w = gpu.upload_f32(&w_host, &[N * K])?;
@@ -86,6 +92,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\nGRADCHECK PASS — linear backward matches finite differences.");
         Ok(())
     } else {
-        Err(format!("gradcheck FAIL (tol {tol:.0e}): dX {max_err_x:.2e}, dW {max_err_w:.2e}").into())
+        Err(
+            format!("gradcheck FAIL (tol {tol:.0e}): dX {max_err_x:.2e}, dW {max_err_w:.2e}")
+                .into(),
+        )
     }
 }

@@ -21,13 +21,21 @@ pub struct TrainTensor {
 impl TrainTensor {
     /// Wrap an existing fp32 GPU buffer as a frozen (no-grad) leaf.
     pub fn frozen(value: GpuTensor) -> Self {
-        Self { value, grad: None, trainable: false }
+        Self {
+            value,
+            grad: None,
+            trainable: false,
+        }
     }
 
     /// Wrap an fp32 GPU buffer as a trainable leaf and allocate its grad.
     pub fn trainable(gpu: &mut Gpu, value: GpuTensor) -> HipResult<Self> {
         let grad = gpu.zeros(&value.shape, DType::F32)?;
-        Ok(Self { value, grad: Some(grad), trainable: true })
+        Ok(Self {
+            value,
+            grad: Some(grad),
+            trainable: true,
+        })
     }
 
     /// Number of logical elements.

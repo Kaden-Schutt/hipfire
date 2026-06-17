@@ -37,8 +37,16 @@ fn cpu_gemm(
         for ni in 0..n {
             let mut acc = 0.0f32;
             for ki in 0..k {
-                let av = if trans_a { a[ki * lda + mi] } else { a[mi * lda + ki] };
-                let bv = if trans_b { b[ni * ldb + ki] } else { b[ki * ldb + ni] };
+                let av = if trans_a {
+                    a[ki * lda + mi]
+                } else {
+                    a[mi * lda + ki]
+                };
+                let bv = if trans_b {
+                    b[ni * ldb + ki]
+                } else {
+                    b[ki * ldb + ni]
+                };
                 acc += av * bv;
             }
             c[mi * n + ni] = acc;
@@ -48,7 +56,10 @@ fn cpu_gemm(
 }
 
 fn max_abs_err(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -60,9 +71,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tokens, kin, nout) = (5usize, 7usize, 3usize);
 
     // Deterministic pseudo-random inputs (no Math.random in this env anyway).
-    let x: Vec<f32> = (0..tokens * kin).map(|i| ((i * 37 % 23) as f32) * 0.05 - 0.5).collect();
-    let w: Vec<f32> = (0..nout * kin).map(|i| ((i * 19 % 17) as f32) * 0.07 - 0.4).collect();
-    let dy: Vec<f32> = (0..tokens * nout).map(|i| ((i * 13 % 11) as f32) * 0.1 - 0.3).collect();
+    let x: Vec<f32> = (0..tokens * kin)
+        .map(|i| ((i * 37 % 23) as f32) * 0.05 - 0.5)
+        .collect();
+    let w: Vec<f32> = (0..nout * kin)
+        .map(|i| ((i * 19 % 17) as f32) * 0.07 - 0.4)
+        .collect();
+    let dy: Vec<f32> = (0..tokens * nout)
+        .map(|i| ((i * 13 % 11) as f32) * 0.1 - 0.3)
+        .collect();
 
     let dx = gpu.upload_f32(&x, &[tokens * kin])?;
     let dw = gpu.upload_f32(&w, &[nout * kin])?;
@@ -80,7 +97,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let err = max_abs_err(&got, &want);
         let ok = err < tol;
         failures += !ok as i32;
-        println!("forward  Y=X·Wᵀ      max_abs_err={err:.2e} {}", if ok { "PASS" } else { "FAIL" });
+        println!(
+            "forward  Y=X·Wᵀ      max_abs_err={err:.2e} {}",
+            if ok { "PASS" } else { "FAIL" }
+        );
     }
 
     // ── 2. backward dX[tokens,kin] = dY·W ────────────────────────────────────
@@ -92,7 +112,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let err = max_abs_err(&got, &want);
         let ok = err < tol;
         failures += !ok as i32;
-        println!("backward dX=dY·W     max_abs_err={err:.2e} {}", if ok { "PASS" } else { "FAIL" });
+        println!(
+            "backward dX=dY·W     max_abs_err={err:.2e} {}",
+            if ok { "PASS" } else { "FAIL" }
+        );
     }
 
     // ── 3. backward dW[nout,kin] = dYᵀ·X ─────────────────────────────────────
@@ -104,7 +127,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let err = max_abs_err(&got, &want);
         let ok = err < tol;
         failures += !ok as i32;
-        println!("backward dW=dYᵀ·X    max_abs_err={err:.2e} {}", if ok { "PASS" } else { "FAIL" });
+        println!(
+            "backward dW=dYᵀ·X    max_abs_err={err:.2e} {}",
+            if ok { "PASS" } else { "FAIL" }
+        );
     }
 
     // ── 4. accum variant: C = beta*C + X·Wᵀ ──────────────────────────────────
@@ -115,11 +141,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         gpu.gemm_f32_train_accum(&dx, &dw, &c, tokens, nout, kin, kin, kin, false, true, beta)?;
         let got = gpu.download_f32(&c)?;
         let prod = cpu_gemm(&x, &w, tokens, nout, kin, kin, kin, false, true);
-        let want: Vec<f32> = init.iter().zip(&prod).map(|(c0, p)| beta * c0 + p).collect();
+        let want: Vec<f32> = init
+            .iter()
+            .zip(&prod)
+            .map(|(c0, p)| beta * c0 + p)
+            .collect();
         let err = max_abs_err(&got, &want);
         let ok = err < tol;
         failures += !ok as i32;
-        println!("accum    C=βC+X·Wᵀ   max_abs_err={err:.2e} {}", if ok { "PASS" } else { "FAIL" });
+        println!(
+            "accum    C=βC+X·Wᵀ   max_abs_err={err:.2e} {}",
+            if ok { "PASS" } else { "FAIL" }
+        );
     }
 
     if failures == 0 {

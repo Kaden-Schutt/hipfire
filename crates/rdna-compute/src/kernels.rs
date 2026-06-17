@@ -3204,12 +3204,10 @@ pub const CROSS_ENTROPY_TRAIN_SRC: &str =
 pub const ROPE_TRAIN_SRC: &str = include_str!("../../../kernels/src/rope_train.hip");
 
 /// Causal mask for attention scores (fp32), un-fused training path.
-pub const CAUSAL_MASK_TRAIN_SRC: &str =
-    include_str!("../../../kernels/src/causal_mask_train.hip");
+pub const CAUSAL_MASK_TRAIN_SRC: &str = include_str!("../../../kernels/src/causal_mask_train.hip");
 
 /// Strided 2D copy / scatter-add (fp32) — GQA gather/scatter primitive.
-pub const STRIDED_COPY_2D_SRC: &str =
-    include_str!("../../../kernels/src/strided_copy_2d.hip");
+pub const STRIDED_COPY_2D_SRC: &str = include_str!("../../../kernels/src/strided_copy_2d.hip");
 
 /// AdamW optimizer step (fp32, decoupled weight decay), un-fused training path.
 pub const ADAMW_TRAIN_SRC: &str = include_str!("../../../kernels/src/adamw_train.hip");

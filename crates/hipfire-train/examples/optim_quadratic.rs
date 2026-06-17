@@ -39,7 +39,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let pv = gpu.download_f32(&p)?;
-    let max_err = pv.iter().zip(&target).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+    let max_err = pv
+        .iter()
+        .zip(&target)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max);
     println!("final loss = {loss:.3e}, max|p-target| = {max_err:.3e} after {STEPS} steps");
 
     if max_err < 1e-3 {

@@ -29,8 +29,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu = Gpu::init().expect("Gpu::init failed");
     println!("arch: {}", gpu.arch);
 
-    let x_host: Vec<f32> = (0..ROWS * D).map(|i| ((i * 19 % 13) as f32) * 0.2 - 1.1).collect();
-    let g_host: Vec<f32> = (0..ROWS * D).map(|i| ((i * 7 % 5) as f32) * 0.3 - 0.5).collect();
+    let x_host: Vec<f32> = (0..ROWS * D)
+        .map(|i| ((i * 19 % 13) as f32) * 0.2 - 1.1)
+        .collect();
+    let g_host: Vec<f32> = (0..ROWS * D)
+        .map(|i| ((i * 7 % 5) as f32) * 0.3 - 0.5)
+        .collect();
     let pos_host: Vec<f32> = (0..SEQ).map(|t| t as f32).collect();
 
     let x = gpu.upload_f32(&x_host, &[ROWS * D])?;
@@ -42,8 +46,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ov = gpu.download_f32(&out)?;
     let mut max_norm_err = 0.0f32;
     for r in 0..ROWS {
-        let n_in: f32 = x_host[r * D..(r + 1) * D].iter().map(|v| v * v).sum::<f32>().sqrt();
-        let n_out: f32 = ov[r * D..(r + 1) * D].iter().map(|v| v * v).sum::<f32>().sqrt();
+        let n_in: f32 = x_host[r * D..(r + 1) * D]
+            .iter()
+            .map(|v| v * v)
+            .sum::<f32>()
+            .sqrt();
+        let n_out: f32 = ov[r * D..(r + 1) * D]
+            .iter()
+            .map(|v| v * v)
+            .sum::<f32>()
+            .sqrt();
         max_norm_err = max_norm_err.max((n_in - n_out).abs());
     }
 
@@ -70,7 +82,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("rope dX max|analytic-numeric|  = {max_err:.2e}");
     let tol = 1e-2f32;
     if max_err < tol && max_norm_err < 1e-4 {
-        println!("\nGRADCHECK PASS — rope backward matches finite differences (and is a rotation).");
+        println!(
+            "\nGRADCHECK PASS — rope backward matches finite differences (and is a rotation)."
+        );
         Ok(())
     } else {
         Err(format!("gradcheck FAIL: dX {max_err:.2e}, norm {max_norm_err:.2e}").into())

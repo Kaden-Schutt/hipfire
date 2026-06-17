@@ -44,11 +44,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu = Gpu::init().expect("Gpu::init failed");
     println!("arch: {}", gpu.arch);
 
-    let xh: Vec<f32> = (0..M * K).map(|i| ((i * 31 % 17) as f32) * 0.07 - 0.4).collect();
-    let wh: Vec<f32> = (0..N * K).map(|i| ((i * 23 % 13) as f32) * 0.05 - 0.25).collect();
-    let ah: Vec<f32> = (0..R * K).map(|i| ((i * 7 % 5) as f32) * 0.1 - 0.2).collect();
-    let bh: Vec<f32> = (0..N * R).map(|i| ((i * 13 % 11) as f32) * 0.08 - 0.3).collect();
-    let gh: Vec<f32> = (0..M * N).map(|i| ((i * 11 % 7) as f32) * 0.1 - 0.2).collect();
+    let xh: Vec<f32> = (0..M * K)
+        .map(|i| ((i * 31 % 17) as f32) * 0.07 - 0.4)
+        .collect();
+    let wh: Vec<f32> = (0..N * K)
+        .map(|i| ((i * 23 % 13) as f32) * 0.05 - 0.25)
+        .collect();
+    let ah: Vec<f32> = (0..R * K)
+        .map(|i| ((i * 7 % 5) as f32) * 0.1 - 0.2)
+        .collect();
+    let bh: Vec<f32> = (0..N * R)
+        .map(|i| ((i * 13 % 11) as f32) * 0.08 - 0.3)
+        .collect();
+    let gh: Vec<f32> = (0..M * N)
+        .map(|i| ((i * 11 % 7) as f32) * 0.1 - 0.2)
+        .collect();
 
     let x = gpu.upload_f32(&xh, &[M * K])?;
     let w = gpu.upload_f32(&wh, &[N * K])?;

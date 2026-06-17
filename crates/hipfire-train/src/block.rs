@@ -116,25 +116,83 @@ pub fn block_forward(
     let hq = gpu.zeros(&[seq * r], DType::F32)?;
     let loraq_s = gpu.zeros(&[seq * qd], DType::F32)?;
     let q = gpu.zeros(&[seq * qd], DType::F32)?;
-    lora_forward(gpu, &xn1, w.wq, lora.aq, lora.bq, &hq, &loraq_s, &q, seq, h, qd, r, dims.lora_scale)?;
+    lora_forward(
+        gpu,
+        &xn1,
+        w.wq,
+        lora.aq,
+        lora.bq,
+        &hq,
+        &loraq_s,
+        &q,
+        seq,
+        h,
+        qd,
+        r,
+        dims.lora_scale,
+    )?;
     let k = gpu.zeros(&[seq * kvd], DType::F32)?;
     linear_forward(gpu, &xn1, w.wk, &k, seq, h, kvd)?;
     let hv = gpu.zeros(&[seq * r], DType::F32)?;
     let lorav_s = gpu.zeros(&[seq * kvd], DType::F32)?;
     let v = gpu.zeros(&[seq * kvd], DType::F32)?;
-    lora_forward(gpu, &xn1, w.wv, lora.av, lora.bv, &hv, &lorav_s, &v, seq, h, kvd, r, dims.lora_scale)?;
+    lora_forward(
+        gpu,
+        &xn1,
+        w.wv,
+        lora.av,
+        lora.bv,
+        &hv,
+        &lorav_s,
+        &v,
+        seq,
+        h,
+        kvd,
+        r,
+        dims.lora_scale,
+    )?;
 
     // rope(q), rope(k)
     let pos = gpu.upload_f32(pos_host, &[seq])?;
     let q_r = gpu.zeros(&[seq * qd], DType::F32)?;
-    rope_forward(gpu, &q, &q_r, &pos, seq * dims.n_heads, dims.n_heads, dims.head_dim, dims.rope_base)?;
+    rope_forward(
+        gpu,
+        &q,
+        &q_r,
+        &pos,
+        seq * dims.n_heads,
+        dims.n_heads,
+        dims.head_dim,
+        dims.rope_base,
+    )?;
     let k_r = gpu.zeros(&[seq * kvd], DType::F32)?;
-    rope_forward(gpu, &k, &k_r, &pos, seq * dims.n_kv, dims.n_kv, dims.head_dim, dims.rope_base)?;
+    rope_forward(
+        gpu,
+        &k,
+        &k_r,
+        &pos,
+        seq * dims.n_kv,
+        dims.n_kv,
+        dims.head_dim,
+        dims.rope_base,
+    )?;
 
     // attention
     let p_all = gpu.zeros(&[dims.n_heads * seq * seq], DType::F32)?;
     let ctx = gpu.zeros(&[seq * qd], DType::F32)?;
-    gqa_forward(gpu, &q_r, &k_r, &v, &p_all, &ctx, seq, dims.n_heads, dims.n_kv, dims.head_dim, dims.attn_scale())?;
+    gqa_forward(
+        gpu,
+        &q_r,
+        &k_r,
+        &v,
+        &p_all,
+        &ctx,
+        seq,
+        dims.n_heads,
+        dims.n_kv,
+        dims.head_dim,
+        dims.attn_scale(),
+    )?;
 
     // o_proj + residual
     let attn = gpu.zeros(&[seq * h], DType::F32)?;
@@ -159,7 +217,24 @@ pub fn block_forward(
 
     Ok((
         x_out,
-        BlockActivations { xn1, rinv1, hq, hv, q_r, k_r, v, p_all, ctx, x_mid, xn2, rinv2, gate, up, act, pos },
+        BlockActivations {
+            xn1,
+            rinv1,
+            hq,
+            hv,
+            q_r,
+            k_r,
+            v,
+            p_all,
+            ctx,
+            x_mid,
+            xn2,
+            rinv2,
+            gate,
+            up,
+            act,
+            pos,
+        },
     ))
 }
 
@@ -186,7 +261,15 @@ pub fn block_backward(
     linear_backward_x(gpu, d_x_out, w.wdown, &d_act, seq, inter, h, false)?;
     let d_gate = gpu.zeros(&[seq * inter], DType::F32)?;
     let d_up = gpu.zeros(&[seq * inter], DType::F32)?;
-    swiglu_backward(gpu, &d_act, &acts.gate, &acts.up, &d_gate, &d_up, seq * inter)?;
+    swiglu_backward(
+        gpu,
+        &d_act,
+        &acts.gate,
+        &acts.up,
+        &d_gate,
+        &d_up,
+        seq * inter,
+    )?;
     let d_xn2 = gpu.zeros(&[seq * h], DType::F32)?;
     linear_backward_x(gpu, &d_gate, w.wgate, &d_xn2, seq, h, inter, false)?;
     linear_backward_x(gpu, &d_up, w.wup, &d_xn2, seq, h, inter, true)?;
@@ -194,7 +277,17 @@ pub fn block_backward(
     let d_x_mid = gpu.zeros(&[seq * h], DType::F32)?;
     gpu.memcpy_dtod_auto(&d_x_mid.buf, &d_x_out.buf, seq * h * 4)?; // residual
     let d_xmid_norm = gpu.zeros(&[seq * h], DType::F32)?;
-    rmsnorm_backward(gpu, &d_xn2, &acts.x_mid, w.norm2, &acts.rinv2, &d_xmid_norm, &dnorm2, seq, h)?;
+    rmsnorm_backward(
+        gpu,
+        &d_xn2,
+        &acts.x_mid,
+        w.norm2,
+        &acts.rinv2,
+        &d_xmid_norm,
+        &dnorm2,
+        seq,
+        h,
+    )?;
     gpu.add_inplace_f32(&d_x_mid, &d_xmid_norm)?;
 
     // ── Attention branch ──────────────────────────────────────────────────────
@@ -204,12 +297,45 @@ pub fn block_backward(
     let d_q_r = gpu.zeros(&[seq * qd], DType::F32)?;
     let d_k_r = gpu.zeros(&[seq * kvd], DType::F32)?;
     let d_v = gpu.zeros(&[seq * kvd], DType::F32)?;
-    gqa_backward(gpu, &d_ctx, &acts.q_r, &acts.k_r, &acts.v, &acts.p_all, &d_q_r, &d_k_r, &d_v, seq, dims.n_heads, dims.n_kv, dims.head_dim, dims.attn_scale())?;
+    gqa_backward(
+        gpu,
+        &d_ctx,
+        &acts.q_r,
+        &acts.k_r,
+        &acts.v,
+        &acts.p_all,
+        &d_q_r,
+        &d_k_r,
+        &d_v,
+        seq,
+        dims.n_heads,
+        dims.n_kv,
+        dims.head_dim,
+        dims.attn_scale(),
+    )?;
     // rope backward
     let d_q = gpu.zeros(&[seq * qd], DType::F32)?;
-    rope_backward(gpu, &d_q_r, &d_q, &acts.pos, seq * dims.n_heads, dims.n_heads, dims.head_dim, dims.rope_base)?;
+    rope_backward(
+        gpu,
+        &d_q_r,
+        &d_q,
+        &acts.pos,
+        seq * dims.n_heads,
+        dims.n_heads,
+        dims.head_dim,
+        dims.rope_base,
+    )?;
     let d_k = gpu.zeros(&[seq * kvd], DType::F32)?;
-    rope_backward(gpu, &d_k_r, &d_k, &acts.pos, seq * dims.n_kv, dims.n_kv, dims.head_dim, dims.rope_base)?;
+    rope_backward(
+        gpu,
+        &d_k_r,
+        &d_k,
+        &acts.pos,
+        seq * dims.n_kv,
+        dims.n_kv,
+        dims.head_dim,
+        dims.rope_base,
+    )?;
 
     // q/k/v projection backward → accumulate into d_xn1, produce LoRA grads
     let d_xn1 = gpu.zeros(&[seq * h], DType::F32)?;
@@ -219,18 +345,76 @@ pub fn block_backward(
     let dbv = gpu.zeros(&[kvd * r], DType::F32)?;
     let dyl_q = gpu.zeros(&[seq * qd], DType::F32)?;
     let dh_q = gpu.zeros(&[seq * r], DType::F32)?;
-    lora_backward(gpu, &d_q, &acts.xn1, w.wq, lora.aq, lora.bq, &acts.hq, &dyl_q, &dh_q, &daq, &dbq, &d_xn1, seq, h, qd, r, dims.lora_scale, true)?;
+    lora_backward(
+        gpu,
+        &d_q,
+        &acts.xn1,
+        w.wq,
+        lora.aq,
+        lora.bq,
+        &acts.hq,
+        &dyl_q,
+        &dh_q,
+        &daq,
+        &dbq,
+        &d_xn1,
+        seq,
+        h,
+        qd,
+        r,
+        dims.lora_scale,
+        true,
+    )?;
     linear_backward_x(gpu, &d_k, w.wk, &d_xn1, seq, h, kvd, true)?;
     let dyl_v = gpu.zeros(&[seq * kvd], DType::F32)?;
     let dh_v = gpu.zeros(&[seq * r], DType::F32)?;
-    lora_backward(gpu, &d_v, &acts.xn1, w.wv, lora.av, lora.bv, &acts.hv, &dyl_v, &dh_v, &dav, &dbv, &d_xn1, seq, h, kvd, r, dims.lora_scale, true)?;
+    lora_backward(
+        gpu,
+        &d_v,
+        &acts.xn1,
+        w.wv,
+        lora.av,
+        lora.bv,
+        &acts.hv,
+        &dyl_v,
+        &dh_v,
+        &dav,
+        &dbv,
+        &d_xn1,
+        seq,
+        h,
+        kvd,
+        r,
+        dims.lora_scale,
+        true,
+    )?;
 
     // norm1 backward → adds into d_x; dnorm1 is the trainable weight grad
     let d_x = gpu.zeros(&[seq * h], DType::F32)?;
     gpu.memcpy_dtod_auto(&d_x.buf, &d_x_mid.buf, seq * h * 4)?; // residual
     let d_x_norm = gpu.zeros(&[seq * h], DType::F32)?;
-    rmsnorm_backward(gpu, &d_xn1, x, w.norm1, &acts.rinv1, &d_x_norm, &dnorm1, seq, h)?;
+    rmsnorm_backward(
+        gpu,
+        &d_xn1,
+        x,
+        w.norm1,
+        &acts.rinv1,
+        &d_x_norm,
+        &dnorm1,
+        seq,
+        h,
+    )?;
     gpu.add_inplace_f32(&d_x, &d_x_norm)?;
 
-    Ok((d_x, BlockLoraGrad { daq, dbq, dav, dbv, dnorm1, dnorm2 }))
+    Ok((
+        d_x,
+        BlockLoraGrad {
+            daq,
+            dbq,
+            dav,
+            dbv,
+            dnorm1,
+            dnorm2,
+        },
+    ))
 }

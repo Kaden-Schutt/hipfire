@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::State,
@@ -20,7 +21,11 @@ use hipfire_generate::{
     openai_chat_completion_done_chunk_json, openai_chat_completion_response_json,
     openai_chat_completion_token_chunk_json, GenerateTextRequest, GenerationSamplingPolicy,
 };
-use hipfire_model::ModelLoadParams;
+use hipfire_model::{ModelLoadParams, ModelWorkerKey};
+use hipfire_scheduler::{
+    create_request_session_draft, server_prefill_batch_enabled, CreateRequestSessionInput,
+    NextBatchInput, SchedulerPolicyEnv,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
@@ -31,6 +36,7 @@ pub struct ChatRequest {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub max_tokens: Option<u32>,
+    pub priority: Option<i64>,
     pub tools: Option<Value>,
     pub system: Option<String>,
 }
@@ -56,6 +62,12 @@ fn load_params_from_config(cfg: &HipfireConfig) -> ModelLoadParams {
     ModelLoadParams::from_hipfire_config(cfg)
 }
 
+#[derive(Clone, Debug)]
+struct LoadedModelContext {
+    model_path: String,
+    worker_key_id: Option<String>,
+}
+
 fn generate_request_from_chat(
     id: String,
     messages: &[ChatMessage],
@@ -76,7 +88,10 @@ fn generate_request_from_chat(
     .with_system(system)
 }
 
-async fn ensure_model_loaded(state: &SharedState, model_arg: &str) -> Result<(), String> {
+async fn ensure_model_loaded(
+    state: &SharedState,
+    model_arg: &str,
+) -> Result<LoadedModelContext, String> {
     let model_path =
         find_model(model_arg).ok_or_else(|| format!("model not found: {model_arg}"))?;
     let model_str = model_path.to_string_lossy().into_owned();
@@ -87,7 +102,10 @@ async fn ensure_model_loaded(state: &SharedState, model_arg: &str) -> Result<(),
     if loaded_guard.as_deref() == Some(&model_str) {
         if let Some(eng) = engine_guard.as_mut() {
             if eng.ping().await.is_ok() {
-                return Ok(());
+                return Ok(LoadedModelContext {
+                    model_path: model_str,
+                    worker_key_id: eng.worker_key_id.clone(),
+                });
             }
         }
     }
@@ -101,14 +119,129 @@ async fn ensure_model_loaded(state: &SharedState, model_arg: &str) -> Result<(),
         load_params_from_config(&cfg)
     };
 
-    engine
+    let loaded = engine
         .load(&model_str, params)
         .await
         .map_err(|e| e.to_string())?;
 
+    let worker_key_id = Some(loaded.worker_key_id);
     *loaded_guard = Some(model_str);
     *engine_guard = Some(engine);
-    Ok(())
+    Ok(LoadedModelContext {
+        model_path: loaded_guard
+            .as_ref()
+            .expect("loaded model path set")
+            .clone(),
+        worker_key_id,
+    })
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn estimated_prompt_tokens(messages: &[ChatMessage]) -> Vec<u32> {
+    let mut tokens = Vec::new();
+    for message in messages {
+        if let Some(content) = &message.content {
+            let text = content
+                .as_str()
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| content.to_string());
+            tokens.extend(text.as_bytes().iter().map(|b| u32::from(*b)));
+        }
+    }
+    if tokens.is_empty() {
+        tokens.push(0);
+    }
+    tokens
+}
+
+fn scheduler_worker_key(model_path: &str, cfg: &HipfireConfig) -> ModelWorkerKey {
+    ModelWorkerKey {
+        artifact_path: model_path.to_string(),
+        artifact_digest: None,
+        arch_id: "unknown".to_string(),
+        quant_family: "unknown".to_string(),
+        state_mode: cfg.kv_cache.clone(),
+        max_seq_bucket: cfg.max_seq as usize,
+        accelerator_kind: Some("hip".to_string()),
+        device_id: Some("0".to_string()),
+        feature_flags: vec!["rust-server".to_string(), "prefill-queue".to_string()],
+    }
+}
+
+async fn wait_for_prefill_scheduler_turn(
+    state: &SharedState,
+    req_id: &str,
+    model_path: &str,
+    messages: &[ChatMessage],
+    priority: Option<i64>,
+) -> Result<(), String> {
+    let env = SchedulerPolicyEnv::from_pairs(std::env::vars());
+    if !server_prefill_batch_enabled(&env) {
+        return Ok(());
+    }
+
+    let worker_key = {
+        let cfg = state.config.lock().await;
+        scheduler_worker_key(model_path, &cfg)
+    };
+    let session = create_request_session_draft(CreateRequestSessionInput {
+        id: req_id.to_string(),
+        worker_key,
+        prompt_tokens: estimated_prompt_tokens(messages),
+        cached_prefix_tokens: None,
+        priority,
+        state_kinds: vec!["kv".to_string()],
+    });
+
+    {
+        let mut scheduler = state.prefill_scheduler.lock().await;
+        scheduler.enqueue(session, now_ms())?;
+    }
+    state.prefill_notify.notify_waiters();
+
+    loop {
+        {
+            let mut selected = state.selected_prefill_requests.lock().await;
+            if selected.remove(req_id) {
+                return Ok(());
+            }
+        }
+
+        {
+            let _dispatch = state.prefill_dispatch.lock().await;
+            {
+                let mut selected = state.selected_prefill_requests.lock().await;
+                if selected.remove(req_id) {
+                    return Ok(());
+                }
+            }
+
+            let batch = {
+                let mut scheduler = state.prefill_scheduler.lock().await;
+                scheduler.next_prefill_batch(NextBatchInput { now_ms: now_ms() })
+            };
+
+            if let Some(batch) = batch {
+                let mut selected = state.selected_prefill_requests.lock().await;
+                for session in batch.sessions {
+                    selected.insert(session.id);
+                }
+                state.prefill_notify.notify_waiters();
+                continue;
+            }
+        }
+
+        tokio::select! {
+            _ = state.prefill_notify.notified() => {}
+            _ = tokio::time::sleep(Duration::from_millis(2)) => {}
+        }
+    }
 }
 
 async fn blocking_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse {
@@ -126,18 +259,27 @@ async fn blocking_chat(state: SharedState, body: ChatRequest) -> impl IntoRespon
         .into_response();
     };
 
-    if let Err(e) = ensure_model_loaded(&state, &model_arg).await {
+    let loaded = match ensure_model_loaded(&state, &model_arg).await {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            return Json(json!({"error": {"message": e, "type": "server_error"}})).into_response()
+        }
+    };
+
+    if let Err(e) = wait_for_prefill_scheduler_turn(
+        &state,
+        &req_id,
+        &loaded.model_path,
+        &body.messages,
+        body.priority,
+    )
+    .await
+    {
         return Json(json!({"error": {"message": e, "type": "server_error"}})).into_response();
     }
 
     let gen_req = {
         let cfg = state.config.lock().await;
-        let worker_key_id = state
-            .engine
-            .lock()
-            .await
-            .as_ref()
-            .and_then(|e| e.worker_key_id.clone());
         generate_request_from_chat(
             req_id.clone(),
             &body.messages,
@@ -150,7 +292,7 @@ async fn blocking_chat(state: SharedState, body: ChatRequest) -> impl IntoRespon
                 body.top_p,
                 body.max_tokens,
             ),
-            worker_key_id,
+            loaded.worker_key_id,
             body.tools,
             body.system,
         )
@@ -198,7 +340,24 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
             }
         };
 
-        if let Err(e) = ensure_model_loaded(&state, &model_arg).await {
+        let loaded = match ensure_model_loaded(&state, &model_arg).await {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                let _ = tx.send(Ok(sse_error(&e))).await;
+                let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+                return;
+            }
+        };
+
+        if let Err(e) = wait_for_prefill_scheduler_turn(
+            &state,
+            &req_id,
+            &loaded.model_path,
+            &body.messages,
+            body.priority,
+        )
+        .await
+        {
             let _ = tx.send(Ok(sse_error(&e))).await;
             let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
             return;
@@ -206,12 +365,6 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
 
         let gen_req = {
             let cfg = state.config.lock().await;
-            let worker_key_id = state
-                .engine
-                .lock()
-                .await
-                .as_ref()
-                .and_then(|e| e.worker_key_id.clone());
             generate_request_from_chat(
                 req_id.clone(),
                 &body.messages,
@@ -224,7 +377,7 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
                     body.top_p,
                     body.max_tokens,
                 ),
-                worker_key_id,
+                loaded.worker_key_id,
                 body.tools,
                 body.system,
             )

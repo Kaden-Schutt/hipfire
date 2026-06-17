@@ -32,10 +32,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu = Gpu::init().expect("Gpu::init failed");
     println!("arch: {}", gpu.arch);
 
-    let qh: Vec<f32> = (0..SEQ * D).map(|i| ((i * 17 % 13) as f32) * 0.15 - 0.8).collect();
-    let kh: Vec<f32> = (0..SEQ * D).map(|i| ((i * 23 % 11) as f32) * 0.12 - 0.5).collect();
-    let vh: Vec<f32> = (0..SEQ * D).map(|i| ((i * 7 % 9) as f32) * 0.2 - 0.7).collect();
-    let gh: Vec<f32> = (0..SEQ * D).map(|i| ((i * 13 % 5) as f32) * 0.25 - 0.4).collect();
+    let qh: Vec<f32> = (0..SEQ * D)
+        .map(|i| ((i * 17 % 13) as f32) * 0.15 - 0.8)
+        .collect();
+    let kh: Vec<f32> = (0..SEQ * D)
+        .map(|i| ((i * 23 % 11) as f32) * 0.12 - 0.5)
+        .collect();
+    let vh: Vec<f32> = (0..SEQ * D)
+        .map(|i| ((i * 7 % 9) as f32) * 0.2 - 0.7)
+        .collect();
+    let gh: Vec<f32> = (0..SEQ * D)
+        .map(|i| ((i * 13 % 5) as f32) * 0.25 - 0.4)
+        .collect();
 
     let q = gpu.upload_f32(&qh, &[SEQ * D])?;
     let k = gpu.upload_f32(&kh, &[SEQ * D])?;
@@ -53,7 +61,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dk = gpu.zeros(&[SEQ * D], DType::F32)?;
     let dv = gpu.zeros(&[SEQ * D], DType::F32)?;
     sdpa_backward(
-        &mut gpu, &d_ctx, &q, &k, &v, &p, &dp, &dsc, &dq, &dk, &dv, SEQ, D, scale(),
+        &mut gpu,
+        &d_ctx,
+        &q,
+        &k,
+        &v,
+        &p,
+        &dp,
+        &dsc,
+        &dq,
+        &dk,
+        &dv,
+        SEQ,
+        D,
+        scale(),
     )?;
     let dq_a = gpu.download_f32(&dq)?;
     let dk_a = gpu.download_f32(&dk)?;

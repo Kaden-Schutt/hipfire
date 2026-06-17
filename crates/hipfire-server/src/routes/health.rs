@@ -16,12 +16,29 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
         let loaded = state.loaded_model_path.lock().await;
         loaded.clone()
     };
+    let prefill_queue_size = state.prefill_scheduler.lock().await.size();
+    let selected_prefill_requests = state.selected_prefill_requests.lock().await.len();
     let accelerator_inventory = server_accelerator_inventory(&state).await;
     let scheduler_env = scheduler_env_from_process();
+    let mut prefill_batch = server_prefill_batch_health_json(&scheduler_env);
+    if let Some(obj) = prefill_batch.as_object_mut() {
+        obj.insert("queue_size".to_string(), json!(prefill_queue_size));
+        obj.insert("queued".to_string(), json!(prefill_queue_size));
+        obj.insert(
+            "selected_pending_dispatch".to_string(),
+            json!(selected_prefill_requests),
+        );
+        if prefill_queue_size > 0 || selected_prefill_requests > 0 {
+            obj.insert(
+                "runtime_dispatch_skipped_reason".to_string(),
+                json!("rust_server_requests_waiting_for_serial_daemon_dispatch"),
+            );
+        }
+    }
     Json(json!({
         "status": "ok",
         "model": loaded,
-        "prefill_batch": server_prefill_batch_health_json(&scheduler_env),
+        "prefill_batch": prefill_batch,
         "decode_batch": server_decode_batch_health_json(&scheduler_env),
         "state_cache": server_state_cache_health_json(&scheduler_env),
         "runtime_workers": runtime_workers_health_payload(&accelerator_inventory),

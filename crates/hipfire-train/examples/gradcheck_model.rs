@@ -10,8 +10,8 @@
 //!   gpu_release
 
 use hipfire_train::block::BlockDims;
-use hipfire_train::model::{LayerLora, LayerWeights, LlamaModel};
 use hipfire_train::model::{model_forward, model_loss_backward};
+use hipfire_train::model::{LayerLora, LayerWeights, LlamaModel};
 use rdna_compute::{Gpu, HipResult};
 
 const NL: usize = 2;
@@ -29,8 +29,16 @@ const IGNORE: i32 = -100;
 
 fn dims() -> BlockDims {
     BlockDims {
-        seq: SEQ, h: H, n_heads: NH, n_kv: NKV, head_dim: HD, inter: INTER,
-        rope_base: 10000.0, eps: 1e-6, lora_scale: 1.0, lora_rank: R,
+        seq: SEQ,
+        h: H,
+        n_heads: NH,
+        n_kv: NKV,
+        head_dim: HD,
+        inter: INTER,
+        rope_base: 10000.0,
+        eps: 1e-6,
+        lora_scale: 1.0,
+        lora_rank: R,
     }
 }
 
@@ -42,15 +50,15 @@ fn rnd(n: usize, a: usize, b: usize, scale: f32, off: f32) -> Vec<f32> {
 fn base_layer(l: usize) -> [Vec<f32>; 9] {
     let s = l + 1;
     [
-        rnd(H, 3 * s, 4, 0.05, 0.9),          // norm1
-        rnd(QD * H, 11 * s, 7, 0.06, -0.2),   // wq
-        rnd(KVD * H, 13 * s, 9, 0.06, -0.2),  // wk
-        rnd(KVD * H, 5 * s, 11, 0.06, -0.2),  // wv
-        rnd(H * QD, 7 * s, 13, 0.06, -0.2),   // wo
-        rnd(H, 5 * s, 4, 0.05, 0.9),          // norm2
-        rnd(INTER * H, 9 * s, 7, 0.05, -0.15),// wgate
-        rnd(INTER * H, 11 * s, 5, 0.05, -0.15),// wup
-        rnd(H * INTER, 13 * s, 7, 0.05, -0.15),// wdown
+        rnd(H, 3 * s, 4, 0.05, 0.9),            // norm1
+        rnd(QD * H, 11 * s, 7, 0.06, -0.2),     // wq
+        rnd(KVD * H, 13 * s, 9, 0.06, -0.2),    // wk
+        rnd(KVD * H, 5 * s, 11, 0.06, -0.2),    // wv
+        rnd(H * QD, 7 * s, 13, 0.06, -0.2),     // wo
+        rnd(H, 5 * s, 4, 0.05, 0.9),            // norm2
+        rnd(INTER * H, 9 * s, 7, 0.05, -0.15),  // wgate
+        rnd(INTER * H, 11 * s, 5, 0.05, -0.15), // wup
+        rnd(H * INTER, 13 * s, 7, 0.05, -0.15), // wdown
     ]
 }
 
@@ -90,7 +98,13 @@ fn build_model(gpu: &mut Gpu, lora: &[[Vec<f32>; 4]]) -> HipResult<LlamaModel> {
         };
         layers.push((lw, ll));
     }
-    Ok(LlamaModel { embed, final_norm, layers, dims: dims(), vocab: VOCAB })
+    Ok(LlamaModel {
+        embed,
+        final_norm,
+        layers,
+        dims: dims(),
+        vocab: VOCAB,
+    })
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

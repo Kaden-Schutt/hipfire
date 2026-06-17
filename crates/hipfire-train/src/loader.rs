@@ -15,15 +15,15 @@ use std::path::Path;
 /// Per-layer frozen weights (HF row-major `[out, in]`, ready for
 /// `gemm_f32_train` with `trans_b=true`).
 pub struct LlamaLayerF32 {
-    pub input_layernorm: GpuTensor,         // [hidden]
-    pub q_proj: GpuTensor,                  // [q_dim, hidden]
-    pub k_proj: GpuTensor,                  // [kv_dim, hidden]
-    pub v_proj: GpuTensor,                  // [kv_dim, hidden]
-    pub o_proj: GpuTensor,                  // [hidden, q_dim]
+    pub input_layernorm: GpuTensor,          // [hidden]
+    pub q_proj: GpuTensor,                   // [q_dim, hidden]
+    pub k_proj: GpuTensor,                   // [kv_dim, hidden]
+    pub v_proj: GpuTensor,                   // [kv_dim, hidden]
+    pub o_proj: GpuTensor,                   // [hidden, q_dim]
     pub post_attention_layernorm: GpuTensor, // [hidden]
-    pub gate_proj: GpuTensor,               // [inter, hidden]
-    pub up_proj: GpuTensor,                 // [inter, hidden]
-    pub down_proj: GpuTensor,               // [hidden, inter]
+    pub gate_proj: GpuTensor,                // [inter, hidden]
+    pub up_proj: GpuTensor,                  // [inter, hidden]
+    pub down_proj: GpuTensor,                // [hidden, inter]
 }
 
 pub struct LlamaWeightsF32 {
@@ -35,7 +35,10 @@ pub struct LlamaWeightsF32 {
 }
 
 /// Open `dir`, parse config, and upload all weights as fp32.
-pub fn load_llama_fp32(gpu: &mut Gpu, dir: &Path) -> Result<(LlamaConfig, LlamaWeightsF32), String> {
+pub fn load_llama_fp32(
+    gpu: &mut Gpu,
+    dir: &Path,
+) -> Result<(LlamaConfig, LlamaWeightsF32), String> {
     let cfg = LlamaConfig::from_dir(dir)?;
     let src = SafetensorsSource::open(dir).map_err(|e| format!("open safetensors: {e}"))?;
 
@@ -76,7 +79,15 @@ pub fn load_llama_fp32(gpu: &mut Gpu, dir: &Path) -> Result<(LlamaConfig, LlamaW
         });
     }
 
-    Ok((cfg, LlamaWeightsF32 { embed_tokens, layers, final_norm, lm_head }))
+    Ok((
+        cfg,
+        LlamaWeightsF32 {
+            embed_tokens,
+            layers,
+            final_norm,
+            lm_head,
+        },
+    ))
 }
 
 /// Fetch a tensor's raw bytes, convert to fp32, validate shape, upload.
@@ -95,8 +106,7 @@ fn load_tensor_f32(
             info.shape, want_shape
         ));
     }
-    let f32s = bytes_to_f32(&info.dtype, bytes)
-        .map_err(|e| format!("tensor {name}: {e}"))?;
+    let f32s = bytes_to_f32(&info.dtype, bytes).map_err(|e| format!("tensor {name}: {e}"))?;
     let expected: usize = want_shape.iter().product();
     if f32s.len() != expected {
         return Err(format!(

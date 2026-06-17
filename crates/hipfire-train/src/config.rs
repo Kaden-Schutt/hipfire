@@ -26,8 +26,8 @@ impl LlamaConfig {
     /// Read and validate `<dir>/config.json`.
     pub fn from_dir(dir: &Path) -> Result<Self, String> {
         let path = dir.join("config.json");
-        let txt = std::fs::read_to_string(&path)
-            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let txt =
+            std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
         let v: serde_json::Value =
             serde_json::from_str(&txt).map_err(|e| format!("parse config.json: {e}"))?;
 

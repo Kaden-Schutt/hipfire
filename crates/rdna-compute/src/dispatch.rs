@@ -40434,7 +40434,11 @@ impl Gpu {
         eps: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("rmsnorm_train_fwd", kernels::RMSNORM_TRAIN_SRC, "rmsnorm_train_fwd")?;
+        self.ensure_kernel(
+            "rmsnorm_train_fwd",
+            kernels::RMSNORM_TRAIN_SRC,
+            "rmsnorm_train_fwd",
+        )?;
         let func = &self.functions["rmsnorm_train_fwd"];
         let mut xp = x.buf.as_ptr();
         let mut wp = w.buf.as_ptr();
@@ -40479,7 +40483,11 @@ impl Gpu {
         h: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("rmsnorm_train_bwd", kernels::RMSNORM_TRAIN_SRC, "rmsnorm_train_bwd")?;
+        self.ensure_kernel(
+            "rmsnorm_train_bwd",
+            kernels::RMSNORM_TRAIN_SRC,
+            "rmsnorm_train_bwd",
+        )?;
         let func = &self.functions["rmsnorm_train_bwd"];
         let mut dyp = dy.buf.as_ptr();
         let mut xp = x.buf.as_ptr();
@@ -40520,7 +40528,11 @@ impl Gpu {
         n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("softmax_train_fwd", kernels::SOFTMAX_TRAIN_SRC, "softmax_train_fwd")?;
+        self.ensure_kernel(
+            "softmax_train_fwd",
+            kernels::SOFTMAX_TRAIN_SRC,
+            "softmax_train_fwd",
+        )?;
         let func = &self.functions["softmax_train_fwd"];
         let mut sp = s.buf.as_ptr();
         let mut yp = y.buf.as_ptr();
@@ -40533,7 +40545,14 @@ impl Gpu {
             &mut ni as *mut _ as *mut c_void,
         ];
         unsafe {
-            self.hip.launch_kernel(func, [rows as u32, 1, 1], [64, 1, 1], 0, self.stream_ref(), &mut params)
+            self.hip.launch_kernel(
+                func,
+                [rows as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
         }
     }
 
@@ -40547,7 +40566,11 @@ impl Gpu {
         n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("softmax_train_bwd", kernels::SOFTMAX_TRAIN_SRC, "softmax_train_bwd")?;
+        self.ensure_kernel(
+            "softmax_train_bwd",
+            kernels::SOFTMAX_TRAIN_SRC,
+            "softmax_train_bwd",
+        )?;
         let func = &self.functions["softmax_train_bwd"];
         let mut dyp = dy.buf.as_ptr();
         let mut pp = p.buf.as_ptr();
@@ -40562,7 +40585,14 @@ impl Gpu {
             &mut ni as *mut _ as *mut c_void,
         ];
         unsafe {
-            self.hip.launch_kernel(func, [rows as u32, 1, 1], [64, 1, 1], 0, self.stream_ref(), &mut params)
+            self.hip.launch_kernel(
+                func,
+                [rows as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
         }
     }
 
@@ -40575,7 +40605,11 @@ impl Gpu {
         n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("swiglu_train_fwd", kernels::SWIGLU_TRAIN_SRC, "swiglu_train_fwd")?;
+        self.ensure_kernel(
+            "swiglu_train_fwd",
+            kernels::SWIGLU_TRAIN_SRC,
+            "swiglu_train_fwd",
+        )?;
         let func = &self.functions["swiglu_train_fwd"];
         let mut gp = gate.buf.as_ptr();
         let mut up_ = up.buf.as_ptr();
@@ -40589,7 +40623,14 @@ impl Gpu {
         ];
         let grid = ((n as u32) + 255) / 256;
         unsafe {
-            self.hip.launch_kernel(func, [grid, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
         }
     }
 
@@ -40604,7 +40645,11 @@ impl Gpu {
         n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("swiglu_train_bwd", kernels::SWIGLU_TRAIN_SRC, "swiglu_train_bwd")?;
+        self.ensure_kernel(
+            "swiglu_train_bwd",
+            kernels::SWIGLU_TRAIN_SRC,
+            "swiglu_train_bwd",
+        )?;
         let func = &self.functions["swiglu_train_bwd"];
         let mut dop = d_out.buf.as_ptr();
         let mut gp = gate.buf.as_ptr();
@@ -40622,7 +40667,14 @@ impl Gpu {
         ];
         let grid = ((n as u32) + 255) / 256;
         unsafe {
-            self.hip.launch_kernel(func, [grid, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
         }
     }
 
@@ -40664,7 +40716,14 @@ impl Gpu {
             &mut ign as *mut _ as *mut c_void,
         ];
         unsafe {
-            self.hip.launch_kernel(func, [rows as u32, 1, 1], [64, 1, 1], 0, self.stream_ref(), &mut params)
+            self.hip.launch_kernel(
+                func,
+                [rows as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
         }
     }
 
@@ -40700,7 +40759,14 @@ impl Gpu {
             &mut basef as *mut _ as *mut c_void,
         ];
         unsafe {
-            self.hip.launch_kernel(func, [rows as u32, 1, 1], [64, 1, 1], 0, self.stream_ref(), &mut params)
+            self.hip.launch_kernel(
+                func,
+                [rows as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
         }
     }
 
@@ -40735,7 +40801,14 @@ impl Gpu {
             &mut basef as *mut _ as *mut c_void,
         ];
         unsafe {
-            self.hip.launch_kernel(func, [rows as u32, 1, 1], [64, 1, 1], 0, self.stream_ref(), &mut params)
+            self.hip.launch_kernel(
+                func,
+                [rows as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
         }
     }
 
@@ -40747,7 +40820,11 @@ impl Gpu {
         seq_k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("causal_mask_train", kernels::CAUSAL_MASK_TRAIN_SRC, "causal_mask_train")?;
+        self.ensure_kernel(
+            "causal_mask_train",
+            kernels::CAUSAL_MASK_TRAIN_SRC,
+            "causal_mask_train",
+        )?;
         let func = &self.functions["causal_mask_train"];
         let mut sp = scores.buf.as_ptr();
         let mut sq = seq_q as i32;
@@ -40758,7 +40835,14 @@ impl Gpu {
             &mut sk as *mut _ as *mut c_void,
         ];
         unsafe {
-            self.hip.launch_kernel(func, [seq_q as u32, 1, 1], [64, 1, 1], 0, self.stream_ref(), &mut params)
+            self.hip.launch_kernel(
+                func,
+                [seq_q as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
         }
     }
 
@@ -40778,7 +40862,11 @@ impl Gpu {
         accumulate: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("strided_copy_2d", kernels::STRIDED_COPY_2D_SRC, "strided_copy_2d")?;
+        self.ensure_kernel(
+            "strided_copy_2d",
+            kernels::STRIDED_COPY_2D_SRC,
+            "strided_copy_2d",
+        )?;
         let func = &self.functions["strided_copy_2d"];
         let mut sp = src.buf.as_ptr();
         let mut so = src_off as i32;
@@ -40801,7 +40889,14 @@ impl Gpu {
             &mut acc as *mut _ as *mut c_void,
         ];
         unsafe {
-            self.hip.launch_kernel(func, [rows as u32, 1, 1], [64, 1, 1], 0, self.stream_ref(), &mut params)
+            self.hip.launch_kernel(
+                func,
+                [rows as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
         }
     }
 
@@ -40854,7 +40949,14 @@ impl Gpu {
         ];
         let grid = ((n as u32) + 255) / 256;
         unsafe {
-            self.hip.launch_kernel(func, [grid, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
         }
     }
 
@@ -40871,7 +40973,11 @@ impl Gpu {
         v: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("distill_kl_train", kernels::DISTILL_TRAIN_SRC, "distill_kl_train")?;
+        self.ensure_kernel(
+            "distill_kl_train",
+            kernels::DISTILL_TRAIN_SRC,
+            "distill_kl_train",
+        )?;
         let func = &self.functions["distill_kl_train"];
         let mut sp = student.buf.as_ptr();
         let mut tp = teacher_p.buf.as_ptr();
@@ -40888,7 +40994,14 @@ impl Gpu {
             &mut vi as *mut _ as *mut c_void,
         ];
         unsafe {
-            self.hip.launch_kernel(func, [rows as u32, 1, 1], [64, 1, 1], 0, self.stream_ref(), &mut params)
+            self.hip.launch_kernel(
+                func,
+                [rows as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
         }
     }
 

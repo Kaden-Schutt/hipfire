@@ -14,7 +14,9 @@
 //!   gpu_release
 
 use hipfire_train::loader::{load_llama_fp32, LlamaWeightsF32};
-use hipfire_train::model::{flatten_recovery_grads, model_distill_backward, model_forward, LlamaModel};
+use hipfire_train::model::{
+    flatten_recovery_grads, model_distill_backward, model_forward, LlamaModel,
+};
 use hipfire_train::ops::softmax::softmax_forward;
 use hipfire_train::optim::AdamW;
 use hipfire_train::qtip_quant::qtip_quantize_dequant;
@@ -32,11 +34,19 @@ const ALPHA: f32 = 32.0;
 const LR: f32 = 1e-3;
 const STEPS: usize = 120;
 
-fn quantize_linears(gpu: &mut Gpu, w: &mut LlamaWeightsF32) -> Result<(), Box<dyn std::error::Error>> {
+fn quantize_linears(
+    gpu: &mut Gpu,
+    w: &mut LlamaWeightsF32,
+) -> Result<(), Box<dyn std::error::Error>> {
     for l in w.layers.iter_mut() {
         for t in [
-            &mut l.q_proj, &mut l.k_proj, &mut l.v_proj, &mut l.o_proj,
-            &mut l.gate_proj, &mut l.up_proj, &mut l.down_proj,
+            &mut l.q_proj,
+            &mut l.k_proj,
+            &mut l.v_proj,
+            &mut l.o_proj,
+            &mut l.gate_proj,
+            &mut l.up_proj,
+            &mut l.down_proj,
         ] {
             let host = gpu.download_f32(t)?;
             let q = qtip_quantize_dequant(&host, BITS, BEAM);
@@ -65,7 +75,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pos: Vec<f32> = (0..SEQ).map(|t| t as f32).collect();
     let batch: Vec<Vec<u32>> = (0..N_SEQS)
-        .map(|s| (0..SEQ).map(|t| (((t + 1) * 2654435761 + s * 40503) % vocab) as u32).collect())
+        .map(|s| {
+            (0..SEQ)
+                .map(|t| (((t + 1) * 2654435761 + s * 40503) % vocab) as u32)
+                .collect()
+        })
         .collect();
 
     // Precompute frozen teacher distributions (teacher never changes).
@@ -79,14 +93,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let sizes = student.recovery_param_sizes();
     let mut opt = AdamW::new(&mut gpu, &sizes, LR, 0.9, 0.999, 1e-8, 0.0)?;
-    println!("recovery FT: {} trainable tensors (LoRA + layernorms)\n", sizes.len());
+    println!(
+        "recovery FT: {} trainable tensors (LoRA + layernorms)\n",
+        sizes.len()
+    );
 
     let mut last = 0.0f32;
     for step in 0..=STEPS {
         let mut total = 0.0f32;
         for (si, toks) in batch.iter().enumerate() {
             let acts = model_forward(&mut gpu, &student, toks, &pos)?;
-            let (kl, grads, d_final) = model_distill_backward(&mut gpu, &student, &acts, &teacher_p[si])?;
+            let (kl, grads, d_final) =
+                model_distill_backward(&mut gpu, &student, &acts, &teacher_p[si])?;
             total += kl;
             if step < STEPS {
                 let params = student.recovery_params();

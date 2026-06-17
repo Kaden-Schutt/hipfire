@@ -26,8 +26,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu = Gpu::init().expect("Gpu::init failed");
     println!("arch: {}", gpu.arch);
 
-    let s_host: Vec<f32> = (0..ROWS * N).map(|i| ((i * 19 % 13) as f32) * 0.3 - 1.5).collect();
-    let g_host: Vec<f32> = (0..ROWS * N).map(|i| ((i * 11 % 5) as f32) * 0.4 - 0.7).collect();
+    let s_host: Vec<f32> = (0..ROWS * N)
+        .map(|i| ((i * 19 % 13) as f32) * 0.3 - 1.5)
+        .collect();
+    let g_host: Vec<f32> = (0..ROWS * N)
+        .map(|i| ((i * 11 % 5) as f32) * 0.4 - 0.7)
+        .collect();
 
     let s = gpu.upload_f32(&s_host, &[ROWS * N])?;
     let p = gpu.zeros(&[ROWS * N], DType::F32)?;

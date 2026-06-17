@@ -25,7 +25,13 @@ const PROMPT: &str = "The history of the Roman Empire is";
 const GEN: usize = 32;
 
 fn argmax(row: &[f32]) -> u32 {
-    row.iter().enumerate().fold((0u32, f32::MIN), |a, (i, &x)| if x > a.1 { (i as u32, x) } else { a }).0
+    row.iter()
+        .enumerate()
+        .fold(
+            (0u32, f32::MIN),
+            |a, (i, &x)| if x > a.1 { (i as u32, x) } else { a },
+        )
+        .0
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

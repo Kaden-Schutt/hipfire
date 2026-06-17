@@ -27,7 +27,9 @@ fn decode_1mad(state: u32) -> f32 {
 }
 
 pub fn build_codebook() -> Vec<f32> {
-    let mut cb: Vec<f64> = (0..NUM_STATES as u32).map(|s| decode_1mad(s) as f64).collect();
+    let mut cb: Vec<f64> = (0..NUM_STATES as u32)
+        .map(|s| decode_1mad(s) as f64)
+        .collect();
     let mean = cb.iter().sum::<f64>() / cb.len() as f64;
     for v in cb.iter_mut() {
         *v -= mean;
@@ -137,7 +139,11 @@ pub fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
     (0..n)
         .map(|_| {
             state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            if (state >> 16) & 1 == 1 { 1.0f32 } else { -1.0f32 }
+            if (state >> 16) & 1 == 1 {
+                1.0f32
+            } else {
+                -1.0f32
+            }
         })
         .collect()
 }
@@ -174,7 +180,11 @@ fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
 /// inverse-FWHT. Returns the fp32 dequantized weights (`hatW`) in weight space.
 pub fn qtip_quantize_dequant(w: &[f32], bits: u32, beam_width: usize) -> Vec<f32> {
     use rayon::prelude::*;
-    assert!(w.len() % GROUP == 0, "weight len {} not a multiple of 256", w.len());
+    assert!(
+        w.len() % GROUP == 0,
+        "weight len {} not a multiple of 256",
+        w.len()
+    );
     let cb = build_codebook();
     let s1 = gen_fwht_signs(42, GROUP);
     let s2 = gen_fwht_signs(1042, GROUP);

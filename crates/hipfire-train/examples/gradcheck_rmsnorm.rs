@@ -28,9 +28,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu = Gpu::init().expect("Gpu::init failed");
     println!("arch: {}", gpu.arch);
 
-    let x_host: Vec<f32> = (0..ROWS * H).map(|i| ((i * 17 % 11) as f32) * 0.2 - 0.9).collect();
+    let x_host: Vec<f32> = (0..ROWS * H)
+        .map(|i| ((i * 17 % 11) as f32) * 0.2 - 0.9)
+        .collect();
     let w_host: Vec<f32> = (0..H).map(|i| 0.5 + ((i * 7 % 5) as f32) * 0.1).collect();
-    let g_host: Vec<f32> = (0..ROWS * H).map(|i| ((i * 13 % 7) as f32) * 0.1 - 0.3).collect();
+    let g_host: Vec<f32> = (0..ROWS * H)
+        .map(|i| ((i * 13 % 7) as f32) * 0.1 - 0.3)
+        .collect();
 
     let x = gpu.upload_f32(&x_host, &[ROWS * H])?;
     let w = gpu.upload_f32(&w_host, &[H])?;
@@ -81,6 +85,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\nGRADCHECK PASS — rmsnorm backward matches finite differences.");
         Ok(())
     } else {
-        Err(format!("gradcheck FAIL (tol {tol:.0e}): dX {max_err_x:.2e}, dW {max_err_w:.2e}").into())
+        Err(
+            format!("gradcheck FAIL (tol {tol:.0e}): dX {max_err_x:.2e}, dW {max_err_w:.2e}")
+                .into(),
+        )
     }
 }

@@ -30,12 +30,20 @@ fn quantize_inplace(gpu: &mut Gpu, t: &mut GpuTensor) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-fn quantize_linears(gpu: &mut Gpu, w: &mut LlamaWeightsF32) -> Result<usize, Box<dyn std::error::Error>> {
+fn quantize_linears(
+    gpu: &mut Gpu,
+    w: &mut LlamaWeightsF32,
+) -> Result<usize, Box<dyn std::error::Error>> {
     let mut nparams = 0;
     for l in w.layers.iter_mut() {
         for t in [
-            &mut l.q_proj, &mut l.k_proj, &mut l.v_proj, &mut l.o_proj,
-            &mut l.gate_proj, &mut l.up_proj, &mut l.down_proj,
+            &mut l.q_proj,
+            &mut l.k_proj,
+            &mut l.v_proj,
+            &mut l.o_proj,
+            &mut l.gate_proj,
+            &mut l.up_proj,
+            &mut l.down_proj,
         ] {
             nparams += t.shape.iter().product::<usize>();
             quantize_inplace(gpu, t)?;
@@ -67,13 +75,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("quantizing student linears to QTIP-{BITS} (beam {BEAM})...");
     let t0 = std::time::Instant::now();
     let nq = quantize_linears(&mut gpu, &mut w_student)?;
-    println!("quantized {nq} linear params in {:.1}s", t0.elapsed().as_secs_f32());
+    println!(
+        "quantized {nq} linear params in {:.1}s",
+        t0.elapsed().as_secs_f32()
+    );
 
     let teacher = LlamaModel::from_f32_weights(&mut gpu, &cfg, w_teacher, SEQ, 4, 8.0)?;
     let student = LlamaModel::from_f32_weights(&mut gpu, &cfg, w_student, SEQ, 4, 8.0)?;
 
     // Fixed input + next-token targets.
-    let tokens: Vec<u32> = (0..SEQ).map(|t| (((t + 1) * 2654435761) % vocab) as u32).collect();
+    let tokens: Vec<u32> = (0..SEQ)
+        .map(|t| (((t + 1) * 2654435761) % vocab) as u32)
+        .collect();
     let pos: Vec<f32> = (0..SEQ).map(|t| t as f32).collect();
 
     let at = model_forward(&mut gpu, &teacher, &tokens, &pos)?;
@@ -94,7 +107,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 kl += pt[v] as f64 * ((pt[v].max(1e-12) / ps[v].max(1e-12)) as f64).ln();
             }
         }
-        let amax = |p: &[f32]| p.iter().enumerate().fold((0, f32::MIN), |a, (i, &x)| if x > a.1 { (i, x) } else { a }).0;
+        let amax = |p: &[f32]| {
+            p.iter()
+                .enumerate()
+                .fold((0, f32::MIN), |a, (i, &x)| if x > a.1 { (i, x) } else { a })
+                .0
+        };
         if amax(&pt) == amax(&ps) {
             agree += 1;
         }
@@ -103,7 +121,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n── QTIP-{BITS} damage on Supra-50M (linears only, embed/norms fp) ──");
     println!("teacher per-token CE = {:.4}", ce_t / npos as f64);
     println!("student per-token CE = {:.4}", ce_s / npos as f64);
-    println!("mean KL(teacher‖student) = {:.4} nats/token", kl / npos as f64);
+    println!(
+        "mean KL(teacher‖student) = {:.4} nats/token",
+        kl / npos as f64
+    );
     println!("top-1 argmax agreement = {}/{}", agree, npos);
     println!("\n→ recovery FT (Q2) must shrink the KL / restore agreement.");
     Ok(())

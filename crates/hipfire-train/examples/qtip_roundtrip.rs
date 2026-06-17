@@ -14,7 +14,9 @@ fn main() {
     let n = 256 * 8;
     let mut st: u64 = 0x1234_5678;
     let mut next = || {
-        st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        st = st
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((st >> 33) as f64) / (1u64 << 31) as f64
     };
     let mut w = vec![0.0f32; n];
@@ -41,8 +43,14 @@ fn main() {
     let mse3 = mse(&w, &hat3);
 
     println!("signal var          = {var:.4}");
-    println!("QTIP-2 recon MSE    = {mse2:.4}  (MSE/var = {:.3})", mse2 / var);
-    println!("QTIP-3 recon MSE    = {mse3:.4}  (MSE/var = {:.3})", mse3 / var);
+    println!(
+        "QTIP-2 recon MSE    = {mse2:.4}  (MSE/var = {:.3})",
+        mse2 / var
+    );
+    println!(
+        "QTIP-3 recon MSE    = {mse3:.4}  (MSE/var = {:.3})",
+        mse3 / var
+    );
 
     assert!(mse2 < var * 0.5, "QTIP-2 MSE not well below variance");
     assert!(mse3 < mse2, "QTIP-3 should beat QTIP-2");

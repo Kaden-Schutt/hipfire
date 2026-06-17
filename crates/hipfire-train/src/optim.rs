@@ -38,7 +38,14 @@ impl AdamW {
             v.push(gpu.zeros(&[n], DType::F32)?);
         }
         Ok(Self {
-            lr, beta1, beta2, eps, weight_decay, t: 0, m, v,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            weight_decay,
+            t: 0,
+            m,
+            v,
             numel: sizes.to_vec(),
         })
     }
@@ -62,8 +69,18 @@ impl AdamW {
         let bc2 = 1.0 - self.beta2.powi(self.t);
         for i in 0..params.len() {
             gpu.adamw_step(
-                params[i], grads[i], &self.m[i], &self.v[i], self.numel[i],
-                self.lr, self.beta1, self.beta2, self.eps, self.weight_decay, bc1, bc2,
+                params[i],
+                grads[i],
+                &self.m[i],
+                &self.v[i],
+                self.numel[i],
+                self.lr,
+                self.beta1,
+                self.beta2,
+                self.eps,
+                self.weight_decay,
+                bc1,
+                bc2,
             )?;
         }
         Ok(())
