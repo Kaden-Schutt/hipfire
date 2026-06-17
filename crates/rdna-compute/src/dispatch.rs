@@ -40299,6 +40299,128 @@ impl Gpu {
         }
     }
 
+    /// General fp32 GEMM with per-operand transpose flags (training path).
+    ///
+    /// Computes `C[M,N] = op(A)·op(B)`, C row-major. `op(A)` is `[M,K]`, `op(B)`
+    /// is `[K,N]`. `lda`/`ldb` are the leading dims of the *stored* operands;
+    /// `trans_a`/`trans_b` select whether the stored matrix is read transposed.
+    /// One general kernel covers the forward and both backward matmuls of a
+    /// linear — see `kernels/src/gemm_f32_train.hip`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f32_train(
+        &mut self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        c: &GpuTensor,
+        m: usize,
+        n: usize,
+        k: usize,
+        lda: usize,
+        ldb: usize,
+        trans_a: bool,
+        trans_b: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_f32_train",
+            kernels::GEMM_F32_TRAIN_SRC,
+            "gemm_f32_train",
+        )?;
+        let func = &self.functions["gemm_f32_train"];
+        let mut ap = a.buf.as_ptr();
+        let mut bp = b.buf.as_ptr();
+        let mut cp = c.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ni = n as i32;
+        let mut ki = k as i32;
+        let mut ldai = lda as i32;
+        let mut ldbi = ldb as i32;
+        let mut tai = trans_a as i32;
+        let mut tbi = trans_b as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void,
+            &mut cp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ldai as *mut _ as *mut c_void,
+            &mut ldbi as *mut _ as *mut c_void,
+            &mut tai as *mut _ as *mut c_void,
+            &mut tbi as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, n as u32, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// `gemm_f32_train` variant that accumulates: `C = beta*C + op(A)·op(B)`.
+    /// Used where a gradient lands on a buffer that already holds a partial.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f32_train_accum(
+        &mut self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        c: &GpuTensor,
+        m: usize,
+        n: usize,
+        k: usize,
+        lda: usize,
+        ldb: usize,
+        trans_a: bool,
+        trans_b: bool,
+        beta: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_f32_train_accum",
+            kernels::GEMM_F32_TRAIN_SRC,
+            "gemm_f32_train_accum",
+        )?;
+        let func = &self.functions["gemm_f32_train_accum"];
+        let mut ap = a.buf.as_ptr();
+        let mut bp = b.buf.as_ptr();
+        let mut cp = c.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ni = n as i32;
+        let mut ki = k as i32;
+        let mut ldai = lda as i32;
+        let mut ldbi = ldb as i32;
+        let mut tai = trans_a as i32;
+        let mut tbi = trans_b as i32;
+        let mut betaf = beta;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void,
+            &mut cp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ldai as *mut _ as *mut c_void,
+            &mut ldbi as *mut _ as *mut c_void,
+            &mut tai as *mut _ as *mut c_void,
+            &mut tbi as *mut _ as *mut c_void,
+            &mut betaf as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, n as u32, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// LayerNorm with bias (batched): out = gamma * (x - mean) / sqrt(var + eps) + beta
     pub fn layernorm_batched(
         &mut self,

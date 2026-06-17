@@ -3180,6 +3180,11 @@ pub const VIT_ATTENTION_OPT_SRC: &str = include_str!("../../../kernels/src/vit_a
 /// Batched GEMM for F32: Y[M,N] = A[M,K] @ B[N,K]^T
 pub const GEMM_F32_SRC: &str = include_str!("../../../kernels/src/gemm_f32.hip");
 
+/// General fp32 GEMM with per-operand transpose flags, for the training path.
+/// C[M,N] = op(A)·op(B); covers forward + both backward matmuls of a linear.
+/// See `kernels/src/gemm_f32_train.hip` and the hipfire-train Phase 0 plan.
+pub const GEMM_F32_TRAIN_SRC: &str = include_str!("../../../kernels/src/gemm_f32_train.hip");
+
 /// LayerNorm with bias: out = gamma * (x - mean) / sqrt(var + eps) + beta
 /// Grid=[batch], Block=[min(256, n)].
 pub const LAYERNORM_SRC: &str = include_str!("../../../kernels/src/layernorm.hip");
