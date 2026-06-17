@@ -1028,6 +1028,95 @@ fn qtip_simquant_protected(
     });
 }
 
+/// Reorder the columns of a row-major `m×k` matrix: output column `j` takes input
+/// column `perm[j]`. Used by roughquant3 to cluster salient input channels into
+/// contiguous leading columns before protect+QTIP. Parallel over rows.
+fn permute_cols(w: &[f32], m: usize, k: usize, perm: &[usize]) -> Vec<f32> {
+    use rayon::prelude::*;
+    debug_assert_eq!(w.len(), m * k);
+    debug_assert_eq!(perm.len(), k);
+    let mut out = vec![0.0f32; m * k];
+    out.par_chunks_mut(k)
+        .zip(w.par_chunks(k))
+        .for_each(|(orow, irow)| {
+            for j in 0..k {
+                orow[j] = irow[perm[j]];
+            }
+        });
+    out
+}
+
+/// Inverse of `permute_cols`: place permuted column `j` back at original column
+/// `perm[j]` (`out[:, perm[j]] = wperm[:, j]`). Parallel over rows.
+fn unpermute_cols(wperm: &[f32], m: usize, k: usize, perm: &[usize]) -> Vec<f32> {
+    use rayon::prelude::*;
+    debug_assert_eq!(wperm.len(), m * k);
+    debug_assert_eq!(perm.len(), k);
+    let mut out = vec![0.0f32; m * k];
+    out.par_chunks_mut(k)
+        .zip(wperm.par_chunks(k))
+        .for_each(|(orow, irow)| {
+            for j in 0..k {
+                orow[perm[j]] = irow[j];
+            }
+        });
+    out
+}
+
+/// RoughQuant Phase-2d (channel-consistent) QTIP sim: protect arbitrary input
+/// COLUMNS (`protected_cols`) and entire output ROWS (`protected_rows`) at full
+/// precision, QTIP-trellis the rest. Row-major `m × k`.
+///
+/// This realizes "energy flows down high-resolution channels" on BOTH sides of
+/// the residual stream: a high-energy residual channel is kept exact where it is
+/// READ (a reader weight's column) AND where it is WRITTEN (a writer weight's
+/// row). Protected rows are left entirely untouched; for other rows the protected
+/// columns are saved & zeroed before the per-256-group FWHT+trellis (so they
+/// don't inflate group scales) and restored after. Parallel over rows.
+fn qtip_simquant_masked(
+    wf: &mut [f32],
+    m: usize,
+    k: usize,
+    protected_cols: &[usize],
+    protected_rows: &[bool],
+    cb: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+    bits: u32,
+) {
+    use rayon::prelude::*;
+    debug_assert_eq!(wf.len(), m * k);
+    debug_assert_eq!(protected_rows.len(), m);
+    let groups = k / 256;
+    if groups == 0 {
+        return;
+    }
+    wf.par_chunks_mut(k).enumerate().for_each(|(r, row)| {
+        if protected_rows[r] {
+            return; // high-energy residual output channel — keep exact
+        }
+        let saved: Vec<(usize, f32)> = protected_cols.iter().map(|&c| (c, row[c])).collect();
+        for &(c, _) in &saved {
+            row[c] = 0.0;
+        }
+        for g in 0..groups {
+            let seg = &mut row[g * 256..g * 256 + 256];
+            let mut grp = [0.0f32; 256];
+            grp.copy_from_slice(seg);
+            cpu_fwht_256(&mut grp, signs1, signs2);
+            let scale0 = qtip::group_scale(&grp);
+            let sym = qtip::beam_encode_group_bits(&grp, scale0, cb, 128, bits);
+            let scale = qtip::optimal_scale_bits(&grp, &sym, cb, bits);
+            let mut deq = qtip::decode_group_bits(&sym, scale, cb, bits);
+            cpu_fwht_256(&mut deq, signs2, signs1);
+            seg.copy_from_slice(&deq);
+        }
+        for (c, v) in saved {
+            row[c] = v;
+        }
+    });
+}
+
 /// RoughQuant Phase-1 sim (no rotation): protect the most-salient input columns
 /// of a 2D weight (row-major `m × k`) at full precision, crush the rest to a
 /// `bulk_bits` symmetric-uniform grid (per row, per `group` columns), in place.
@@ -5763,6 +5852,27 @@ fn main() {
     //   HIPFIRE_RQ2_DAMP         (default 0.01)  — Hessian diagonal ridge fraction
     // Needs HIPFIRE_QTIP_HESSIAN; tensors without a Hessian are left bf16.
     let use_roughquant2_sim = format == "roughquant2-sim" || format == "rq2-sim";
+    // roughquant3-sim (Phase 2c): Phase 2 with the dense PCA rotation replaced by
+    // a PERMUTATION — reorder each weight's input columns by diag(H) saliency so
+    // the salient channels become contiguous leading columns, protect them, QTIP
+    // the bulk (QTIP's per-256 Hadamard is free, like mq4), un-permute back.
+    // Permutations fold for FREE (reindex, no runtime matmul), unlike the dense
+    // rotation that died in de-risk B. Tests whether reordering (no channel
+    // mixing) keeps enough of the win to be deployable. Env:
+    //   HIPFIRE_RQ3_PROTECT_FRAC (default 0.03), HIPFIRE_RQ3_BULK_BITS (default 3).
+    let use_roughquant3_sim = format == "roughquant3-sim" || format == "rq3-sim";
+    // roughquant4-sim (Phase 2d, the "think in channels" variant): channel-
+    // consistent mixed precision on the residual stream — NO rotation, NO
+    // permutation. Rank residual channels by aggregated activation energy once,
+    // keep the top set high-res in (a) the COLUMNS of every residual reader
+    // (k==1024) AND (b) the ROWS of every residual writer (o_proj/out_proj/
+    // down_proj, m==1024), so a high-energy channel is exact where it is written
+    // and where it is read. Non-residual inputs (o_proj/down_proj's internal
+    // activations) get per-weight diag(H) column protection. QTIP the bulk. Folds
+    // for free (it's a per-channel bit map, no runtime transform). Env:
+    //   HIPFIRE_RQ4_PROTECT_FRAC (default 0.03), HIPFIRE_RQ4_BULK_BITS (default 3),
+    //   HIPFIRE_RQ4_Q8_EMBED.
+    let use_roughquant4_sim = format == "roughquant4-sim" || format == "rq4-sim";
     // Real packed QTIP-3 (vs the bf16 sim): emit QuantType::Qtip3G256 records
     // (rotated-frame symbols), decoded by the gemv_qtip3g256 kernel. The sim
     // path is for kernel-free PPL; this is the shippable bandwidth format.
@@ -5779,8 +5889,15 @@ fn main() {
         || use_qtip_sim
         || use_qtip3_real
         || use_roughquant_sim
-        || use_roughquant2_sim;
-    let (qtip_cb, qtip_s1, qtip_s2) = if use_qtip_sim || use_qtip3_real || use_roughquant2_sim {
+        || use_roughquant2_sim
+        || use_roughquant3_sim
+        || use_roughquant4_sim;
+    let (qtip_cb, qtip_s1, qtip_s2) = if use_qtip_sim
+        || use_qtip3_real
+        || use_roughquant2_sim
+        || use_roughquant3_sim
+        || use_roughquant4_sim
+    {
         if use_qtip3_real {
             eprintln!(
                 "qtip3 (real): packing 2D weights as Qtip3G256 \
@@ -5803,28 +5920,32 @@ fn main() {
     // Optional Hessian sidecar → QTIP-LDLQ (output-aware). HIPFIRE_QTIP_HESSIAN
     // points at an HFHS file; tensors with a Hessian use LDLQ, the rest fall
     // back to plain (MSE) simulated QTIP.
-    let qtip_hessian: Option<hessian_io::HessianSidecar> =
-        if use_qtip_sim || use_roughquant_sim || use_roughquant2_sim {
-            std::env::var("HIPFIRE_QTIP_HESSIAN").ok().and_then(|p| {
-                match hessian_io::HessianSidecar::open(std::path::Path::new(&p)) {
-                    Ok(s) => {
-                        eprintln!(
-                            "qtip{qtip_bits}-sim: LDLQ ENABLED — Hessian sidecar {p} ({} tensors)",
-                            s.n_tensors()
-                        );
-                        Some(s)
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "qtip{qtip_bits}-sim: WARN cannot open Hessian {p}: {e:?} — plain QTIP"
-                        );
-                        None
-                    }
+    let qtip_hessian: Option<hessian_io::HessianSidecar> = if use_qtip_sim
+        || use_roughquant_sim
+        || use_roughquant2_sim
+        || use_roughquant3_sim
+        || use_roughquant4_sim
+    {
+        std::env::var("HIPFIRE_QTIP_HESSIAN").ok().and_then(|p| {
+            match hessian_io::HessianSidecar::open(std::path::Path::new(&p)) {
+                Ok(s) => {
+                    eprintln!(
+                        "qtip{qtip_bits}-sim: LDLQ ENABLED — Hessian sidecar {p} ({} tensors)",
+                        s.n_tensors()
+                    );
+                    Some(s)
                 }
-            })
-        } else {
-            None
-        };
+                Err(e) => {
+                    eprintln!(
+                        "qtip{qtip_bits}-sim: WARN cannot open Hessian {p}: {e:?} — plain QTIP"
+                    );
+                    None
+                }
+            }
+        })
+    } else {
+        None
+    };
     let use_q8 = format == "q8f16" || format == "q8";
     // F1 native-bf16 oracle: full-precision passthrough. Every tensor stored
     // as QuantType::F32 (qt=2) -- weights, norms, embeddings.
@@ -9330,6 +9451,245 @@ fn main() {
             }
             eprintln!(
                 "  roughquant2-sim: HIPFIRE_RQ2_Q8_EMBED — Q8-sim on {n_e} embed/lm_head tensors"
+            );
+        }
+    }
+
+    // roughquant3-sim post-pass (Phase 2c): permutation instead of dense rotation.
+    // Reorder each weight's input columns by diag(H) saliency so the salient
+    // channels are contiguous leading columns, protect them, QTIP the bulk,
+    // un-permute back. A permutation folds for free (reindex), so this is the
+    // foldable analog of Phase 2 — minus the channel-mixing decorrelation.
+    if use_roughquant3_sim {
+        let protect_frac: f64 = std::env::var("HIPFIRE_RQ3_PROTECT_FRAC")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.03);
+        let bulk_bits: u32 = std::env::var("HIPFIRE_RQ3_BULK_BITS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        eprintln!(
+            "  roughquant3-sim: permutation+protection, protect_frac={protect_frac} bulk_bits={bulk_bits}"
+        );
+        let (mut n_hess, mut n_proxy) = (0usize, 0usize);
+        for t in hfq_tensors.iter_mut() {
+            if !(matches!(t.quant_type, QuantType::BF16)
+                && t.shape.len() == 2
+                && (t.shape[1] as usize) % 256 == 0
+                && !t.name.contains("embed")
+                && !t.name.contains("lm_head"))
+            {
+                continue;
+            }
+            let m = t.shape[0] as usize;
+            let k = t.shape[1] as usize;
+            let key = t.name.strip_suffix(".weight").unwrap_or(&t.name);
+            let mut wf: Vec<f32> = t
+                .data
+                .chunks_exact(2)
+                .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            // Saliency per input column: diag(H) if available, else column L2.
+            let saliency: Vec<f32> = match qtip_hessian
+                .as_ref()
+                .and_then(|sc| sc.get(key, 0))
+                .filter(|h| h.k == k)
+            {
+                Some(href) => {
+                    n_hess += 1;
+                    (0..k).map(|i| href.at(i, i) as f32).collect()
+                }
+                None => {
+                    n_proxy += 1;
+                    let mut s = vec![0.0f32; k];
+                    for r in 0..m {
+                        let row = &wf[r * k..r * k + k];
+                        for c in 0..k {
+                            s[c] += row[c] * row[c];
+                        }
+                    }
+                    s
+                }
+            };
+            // Permutation = saliency descending → salient channels lead.
+            let mut perm: Vec<usize> = (0..k).collect();
+            perm.sort_unstable_by(|&a, &b| {
+                saliency[b]
+                    .partial_cmp(&saliency[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut wp = permute_cols(&wf, m, k, &perm);
+            let n_prot = ((protect_frac * k as f64).round() as usize).min(k);
+            qtip_simquant_protected(&mut wp, k, n_prot, &qtip_cb, &qtip_s1, &qtip_s2, bulk_bits);
+            wf = unpermute_cols(&wp, m, k, &perm);
+            t.data = f32_slice_to_bf16_bytes(&wf);
+        }
+        eprintln!("  roughquant3-sim: diag(H)-saliency on {n_hess} tensors, L2-proxy on {n_proxy}");
+        // Iso-bit embed for an honest mq4 comparison (same as roughquant2 de-risk A).
+        if std::env::var("HIPFIRE_RQ3_Q8_EMBED").ok().as_deref() == Some("1") {
+            let mut n_e = 0usize;
+            for t in hfq_tensors.iter_mut() {
+                if matches!(t.quant_type, QuantType::BF16)
+                    && t.shape.len() == 2
+                    && (t.shape[1] as usize) % 256 == 0
+                    && (t.name.contains("embed") || t.name.contains("lm_head"))
+                {
+                    let m = t.shape[0] as usize;
+                    let k = t.shape[1] as usize;
+                    let mut wf: Vec<f32> = t
+                        .data
+                        .chunks_exact(2)
+                        .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                        .collect();
+                    roughquant_sim_tensor(&mut wf, m, k, &vec![0.0; k], 0.0, 8, 256);
+                    t.data = f32_slice_to_bf16_bytes(&wf);
+                    n_e += 1;
+                }
+            }
+            eprintln!(
+                "  roughquant3-sim: HIPFIRE_RQ3_Q8_EMBED — Q8-sim on {n_e} embed/lm_head tensors"
+            );
+        }
+    }
+
+    // roughquant4-sim post-pass (Phase 2d): channel-consistent residual-stream
+    // mixed precision. Rank residual channels by aggregated energy once; keep the
+    // top set exact in reader COLUMNS (k==1024) and writer ROWS (o/out/down_proj,
+    // m==1024). Non-residual inputs use per-weight diag(H) column protection.
+    if use_roughquant4_sim {
+        let protect_frac: f64 = std::env::var("HIPFIRE_RQ4_PROTECT_FRAC")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.03);
+        let bulk_bits: u32 = std::env::var("HIPFIRE_RQ4_BULK_BITS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        let dmodel = 1024usize;
+        // Aggregate per-residual-channel energy from all k==1024 readers' diag(H).
+        let mut resid_energy = vec![0.0f64; dmodel];
+        if let Some(sc) = qtip_hessian.as_ref() {
+            for t in hfq_tensors.iter() {
+                if matches!(t.quant_type, QuantType::BF16)
+                    && t.shape.len() == 2
+                    && t.shape[1] as usize == dmodel
+                    && !t.name.contains("embed")
+                    && !t.name.contains("lm_head")
+                {
+                    let key = t.name.strip_suffix(".weight").unwrap_or(&t.name);
+                    if let Some(href) = sc.get(key, 0).filter(|h| h.k == dmodel) {
+                        for i in 0..dmodel {
+                            resid_energy[i] += href.at(i, i);
+                        }
+                    }
+                }
+            }
+        }
+        // Top residual channels (shared across readers' cols and writers' rows).
+        let n_prot_resid = ((protect_frac * dmodel as f64).round() as usize).min(dmodel);
+        let protected_resid: Vec<usize> = {
+            let mut idx: Vec<usize> = (0..dmodel).collect();
+            idx.sort_unstable_by(|&a, &b| {
+                resid_energy[b]
+                    .partial_cmp(&resid_energy[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            idx.truncate(n_prot_resid);
+            idx
+        };
+        eprintln!(
+            "  roughquant4-sim: channel-consistent, protect_frac={protect_frac} bulk_bits={bulk_bits}; \
+             {n_prot_resid}/{dmodel} residual channels protected (read cols + write rows)"
+        );
+        let is_writer = |name: &str| {
+            name.contains("o_proj") || name.contains("out_proj") || name.contains("down_proj")
+        };
+        let (mut n_w, mut n_r) = (0usize, 0usize);
+        for t in hfq_tensors.iter_mut() {
+            if !(matches!(t.quant_type, QuantType::BF16)
+                && t.shape.len() == 2
+                && (t.shape[1] as usize) % 256 == 0
+                && !t.name.contains("embed")
+                && !t.name.contains("lm_head"))
+            {
+                continue;
+            }
+            let m = t.shape[0] as usize;
+            let k = t.shape[1] as usize;
+            let key = t.name.strip_suffix(".weight").unwrap_or(&t.name);
+            let mut wf: Vec<f32> = t
+                .data
+                .chunks_exact(2)
+                .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            // Read side: residual readers (k==dmodel) share the global residual
+            // channel set; others protect their own top-diag(H) input columns.
+            let protected_cols: Vec<usize> = if k == dmodel {
+                protected_resid.clone()
+            } else if let Some(href) = qtip_hessian
+                .as_ref()
+                .and_then(|sc| sc.get(key, 0))
+                .filter(|h| h.k == k)
+            {
+                let mut idx: Vec<usize> = (0..k).collect();
+                idx.sort_unstable_by(|&a, &b| {
+                    href.at(b, b)
+                        .partial_cmp(&href.at(a, a))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                idx.truncate(((protect_frac * k as f64).round() as usize).min(k));
+                idx
+            } else {
+                Vec::new()
+            };
+            // Write side: residual writers (m==dmodel) keep high-energy output
+            // rows exact.
+            let mut protected_rows = vec![false; m];
+            if is_writer(&t.name) && m == dmodel {
+                for &c in &protected_resid {
+                    protected_rows[c] = true;
+                }
+                n_w += 1;
+            } else {
+                n_r += 1;
+            }
+            qtip_simquant_masked(
+                &mut wf,
+                m,
+                k,
+                &protected_cols,
+                &protected_rows,
+                &qtip_cb,
+                &qtip_s1,
+                &qtip_s2,
+                bulk_bits,
+            );
+            t.data = f32_slice_to_bf16_bytes(&wf);
+        }
+        eprintln!("  roughquant4-sim: {n_w} residual writers (row-protected), {n_r} other tensors");
+        if std::env::var("HIPFIRE_RQ4_Q8_EMBED").ok().as_deref() == Some("1") {
+            let mut n_e = 0usize;
+            for t in hfq_tensors.iter_mut() {
+                if matches!(t.quant_type, QuantType::BF16)
+                    && t.shape.len() == 2
+                    && (t.shape[1] as usize) % 256 == 0
+                    && (t.name.contains("embed") || t.name.contains("lm_head"))
+                {
+                    let m = t.shape[0] as usize;
+                    let k = t.shape[1] as usize;
+                    let mut wf: Vec<f32> = t
+                        .data
+                        .chunks_exact(2)
+                        .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                        .collect();
+                    roughquant_sim_tensor(&mut wf, m, k, &vec![0.0; k], 0.0, 8, 256);
+                    t.data = f32_slice_to_bf16_bytes(&wf);
+                    n_e += 1;
+                }
+            }
+            eprintln!(
+                "  roughquant4-sim: HIPFIRE_RQ4_Q8_EMBED — Q8-sim on {n_e} embed/lm_head tensors"
             );
         }
     }

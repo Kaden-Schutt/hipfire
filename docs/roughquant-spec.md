@@ -8,8 +8,12 @@ real sub-4-bit quality edge (per-weight PCA: 28.28 < mq4 29.08, iso-bit, de-risk
 A) EVAPORATES under the folding constraint (de-risk B: foldable shared residual
 rotation → 30.68, worse than mq4). The win existed only with per-weight dense
 rotations that cannot fold for free; the deployable form is strictly dominated by
-mq4. Phase 3 NOT pursued. Only speculative remaining avenue: cross-model recheck
-on a 7B/9B. Derived from ResQ (2412.14363), adapted to hipfire (weight-only, GQA,
+mq4. **The foldable design space is now fully swept (phases 2c/2d): shared
+rotation, permutation (read), and channel-consistent read+write protection all
+land at ~29.4–30.7 PPL, all dominated by mq4** — the write-side lever genuinely
+helps (~1 PPL) but decorrelation is the missing ingredient and it doesn't fold.
+Phase 3 NOT pursued. Only speculative remaining avenue: cross-model recheck on a
+7B/9B. Derived from ResQ (2412.14363), adapted to hipfire (weight-only, GQA,
 multi-tier, fp32 super-bin) + the "roughquant" lever.
 
 ## Lineage / what's new
