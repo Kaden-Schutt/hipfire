@@ -32,9 +32,16 @@ header writer, arch detection, and tokenizer/config embedding — and guarantees
 the served codes match the kernel. `hipfire-train`'s only new code is a tuned
 fp32 **safetensors writer** (it currently only reads).
 
-Edge case to verify: Supra `down_proj` has `k = 1408` (not ÷256). The per-row
-qtip3 path can't 256-group it — confirm what the quantizer does (fp/other-format
-fallback for `k % 256 != 0` tensors) and mirror that expectation.
+**A qtip3 `.hfq` is mixed-format (resolved — main.rs:9007-9014).** The qtip3
+packer only takes 2D BF16 tensors with `shape[1] % 256 == 0` and not
+embed/lm_head; others `continue`. So for Supra-50M:
+- **Qtip3G256** — q/k/v/o/gate/up (k=512 ÷256),
+- **Q8F16** — embed/lm_head (gather-friendly, main.rs:8998),
+- **BF16** — `down_proj` (k=1408, not ÷256 → skipped to BF16) **and the 1-D
+  RMSNorms**.
+The bridge must respect this: Path A's norm-patch writes **BF16** norm tensors to
+match; the daemon already serves the mixed set (BF16/Q8F16/Qtip3 are all valid
+gemv DTypes). Reusing the quantizer (Path B) gets the whole mix for free.
 
 ## The real design fork: what happens to the LoRA delta
 
@@ -88,8 +95,9 @@ re-quant-loss number. Defer Path C unless a no-loss LoRA serve is required.
 
 ## Risks / open items
 
-- `k % 256 != 0` tensors (down_proj 1408): confirm quantizer behavior; the daemon
-  may serve them in a non-qtip3 format — the bridge must not assume all-qtip3.
+- ~~`k % 256 != 0` tensors~~ RESOLVED (see above): qtip3 `.hfq` is mixed —
+  down_proj + norms stay BF16, embed/lm_head Q8F16, the rest Qtip3. Bridge must
+  not assume all-qtip3; norm-patch writes BF16.
 - Header/metadata parity: the patched/emitted `.hfq` must carry arch_id +
   tokenizer + config the daemon expects; reusing the quantizer's writer (Path B)
   gives this for free, patching (Path A) preserves the original's metadata.
