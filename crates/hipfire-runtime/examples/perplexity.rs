@@ -185,6 +185,14 @@ fn main() {
     let mut warmup: usize = 8;
     let mut offset: usize = 0;
     let mut kv_mode: String = "q8".to_string();
+    // Combined PPL+KLD: --dump-ref writes per-position top-K logprobs (+logZ) of
+    // THIS model (run on the bf16 reference); --kld-ref loads such a file and
+    // reports mean top-K KLD(ref‖cand) alongside PPL. Self-contained (works for
+    // bf16-weight sim candidates that eval_hipfire can't handle on gfx1151), and
+    // KLD is monotonic in weight error — immune to PPL's pointwise wiggle.
+    let mut dump_ref: Option<String> = None;
+    let mut kld_ref: Option<String> = None;
+    let mut top_k: usize = 128;
 
     while let Some(flag) = args.next() {
         let val = args.next().expect("flag missing value");
@@ -193,6 +201,9 @@ fn main() {
             "--warmup" => warmup = val.parse().unwrap(),
             "--offset" => offset = val.parse().unwrap(),
             "--kv-mode" => kv_mode = val,
+            "--dump-ref" => dump_ref = Some(val),
+            "--kld-ref" => kld_ref = Some(val),
+            "--top-k" => top_k = val.parse().unwrap(),
             _ => panic!("unknown flag: {flag}"),
         }
     }
@@ -359,6 +370,13 @@ fn main() {
     let mut scored: usize = 0;
     let t0 = Instant::now();
 
+    // KLD reference state. dump: collect (logZ, top-K (idx,logit)) per scored pos.
+    // kld: load the reference records and accumulate KLD(ref‖cand).
+    let mut ref_records: Vec<(f32, Vec<(u32, f32)>)> = Vec::new();
+    let kld_records: Option<Vec<(f32, Vec<(u32, f32)>)>> = kld_ref.as_ref().map(|p| read_kldref(p));
+    let mut total_kld: f64 = 0.0;
+    let mut kld_scored: usize = 0;
+
     for (pos, &tok) in window.iter().enumerate().take(window.len() - 1) {
         qwen35::forward_scratch(
             &mut gpu,
@@ -401,6 +419,32 @@ fn main() {
             continue;
         }
         total_nll += nll as f64;
+
+        // logZ (full-vocab log-sum-exp) of THIS model's logits — needed for both
+        // dumping the reference and scoring KLD of a candidate.
+        if dump_ref.is_some() || kld_records.is_some() {
+            let logz = logsumexp(&logits);
+            if let Some(_) = dump_ref {
+                ref_records.push((logz, topk_logits(&logits, top_k)));
+            }
+            if let Some(ref recs) = kld_records {
+                if scored < recs.len() {
+                    let (ref_logz, ref_topk) = &recs[scored];
+                    // top-K KLD(P_ref ‖ P_cand) = Σ_k p_ref[k]·(logp_ref[k]-logp_cand[k]),
+                    // over the reference's top-K token ids.
+                    let mut kl = 0.0f64;
+                    for &(idx, rlogit) in ref_topk {
+                        let lp_ref = (rlogit - ref_logz) as f64;
+                        let lp_cand = (logits[idx as usize] - logz) as f64;
+                        kl += lp_ref.exp() * (lp_ref - lp_cand);
+                    }
+                    if kl.is_finite() {
+                        total_kld += kl;
+                        kld_scored += 1;
+                    }
+                }
+            }
+        }
         scored += 1;
 
         if scored == 1 || scored % 256 == 0 {
@@ -435,11 +479,95 @@ fn main() {
     println!("Scored:   {scored}");
     println!("NLL/tok:  {:.10}", avg_nll);
     println!("PPL:      {:.4}", ppl);
+    if kld_records.is_some() && kld_scored > 0 {
+        let mean_kld = total_kld / kld_scored as f64;
+        println!("KLD/tok:  {:.6} (top-{top_k}, {kld_scored} pos)", mean_kld);
+    }
     println!(
         "Elapsed:  {:.1}s ({:.1} tok/s)",
         elapsed,
         scored as f64 / elapsed.max(1e-9)
     );
+
+    if let Some(path) = dump_ref {
+        write_kldref(&path, &ref_records, top_k);
+        println!(
+            "Wrote KLD reference: {path} ({} positions)",
+            ref_records.len()
+        );
+    }
+}
+
+/// Full-vocab log-sum-exp of logits (the log normalizer logZ).
+fn logsumexp(logits: &[f32]) -> f32 {
+    let mut max = f32::NEG_INFINITY;
+    for &v in logits {
+        if v > max {
+            max = v;
+        }
+    }
+    let mut sum = 0.0f64;
+    for &v in logits {
+        sum += ((v - max) as f64).exp();
+    }
+    (max as f64 + sum.ln()) as f32
+}
+
+/// Indices+logits of the top-`k` logits (descending), for the KLD reference.
+fn topk_logits(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
+    let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
+    let k = k.min(logits.len());
+    idx.select_nth_unstable_by(k.saturating_sub(1), |&a, &b| {
+        logits[b as usize]
+            .partial_cmp(&logits[a as usize])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    idx.truncate(k);
+    idx.into_iter().map(|i| (i, logits[i as usize])).collect()
+}
+
+/// KLD-reference file: magic "PKLD", u32 top_k, u64 n_pos, then per position:
+/// f32 logZ, u32 n, n×(u32 idx, f32 logit).
+fn write_kldref(path: &str, records: &[(f32, Vec<(u32, f32)>)], top_k: usize) {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"PKLD");
+    buf.extend_from_slice(&(top_k as u32).to_le_bytes());
+    buf.extend_from_slice(&(records.len() as u64).to_le_bytes());
+    for (logz, topk) in records {
+        buf.extend_from_slice(&logz.to_le_bytes());
+        buf.extend_from_slice(&(topk.len() as u32).to_le_bytes());
+        for &(idx, logit) in topk {
+            buf.extend_from_slice(&idx.to_le_bytes());
+            buf.extend_from_slice(&logit.to_le_bytes());
+        }
+    }
+    std::fs::write(path, buf).expect("write kldref");
+}
+
+fn read_kldref(path: &str) -> Vec<(f32, Vec<(u32, f32)>)> {
+    let b = std::fs::read(path).expect("read kldref");
+    assert_eq!(&b[0..4], b"PKLD", "bad kldref magic");
+    let n_pos = u64::from_le_bytes(b[8..16].try_into().unwrap()) as usize;
+    let mut off = 16;
+    let rd_f32 = |b: &[u8], o: usize| f32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    let rd_u32 = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    let mut out = Vec::with_capacity(n_pos);
+    for _ in 0..n_pos {
+        let logz = rd_f32(&b, off);
+        off += 4;
+        let n = rd_u32(&b, off) as usize;
+        off += 4;
+        let mut topk = Vec::with_capacity(n);
+        for _ in 0..n {
+            let idx = rd_u32(&b, off);
+            off += 4;
+            let logit = rd_f32(&b, off);
+            off += 4;
+            topk.push((idx, logit));
+        }
+        out.push((logz, topk));
+    }
+    out
 }
 
 fn neg_log_softmax_at(logits: &[f32], target: usize) -> f32 {
