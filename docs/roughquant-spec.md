@@ -12,9 +12,17 @@ mq4. **The foldable design space is now fully swept (phases 2c/2d): shared
 rotation, permutation (read), and channel-consistent read+write protection all
 land at ~29.4–30.7 PPL, all dominated by mq4** — the write-side lever genuinely
 helps (~1 PPL) but decorrelation is the missing ingredient and it doesn't fold.
-Phase 3 NOT pursued. Only speculative remaining avenue: cross-model recheck on a
-7B/9B. Derived from ResQ (2412.14363), adapted to hipfire (weight-only, GQA,
-multi-tier, fp32 super-bin) + the "roughquant" lever.
+**CORRECTION (phase2e):** a non-monotonic bug (zero-before-quant) inflated the
+earlier "PCA beats mq4 (27.90/28.28)" headline; with the fixed monotonic
+quantizer PCA b3 f0.03 = 29.37, which does NOT beat mq4 (29.07). The energy-CDF
+analysis (`scripts/roughquant_energy_cdf.py`, see `phase2e`) shows why: raw/
+foldable-basis energy is ~uniform (top 1% of residual channels = 21%, no knee);
+concentration exists ONLY in the un-foldable per-weight eigenbasis (top 1% of
+eigenvalues = 42–81%). So NO variant — foldable or not — beats mq4 on 0.8B.
+Phase 3 NOT pursued. Remaining avenues: learned block-diagonal rotation (foldable
+in-kernel like mq4's FWHT but data-fitted; user's chosen next direction),
+cross-model 7B/9B. Derived from ResQ (2412.14363), adapted to hipfire (weight-only,
+GQA, multi-tier, fp32 super-bin) + the "roughquant" lever.
 
 ## Lineage / what's new
 

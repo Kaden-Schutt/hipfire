@@ -9641,7 +9641,9 @@ fn main() {
             .unwrap_or(3);
         // Bulk codec: "mq4" → real mq4 format (fair mq4+protect-vs-mq4 test, set
         // protect_frac=0 for the plain-mq4 baseline); else QTIP-{bulk_bits}.
-        let bulk_mq4 = std::env::var("HIPFIRE_RQ4_BULK").ok().as_deref() == Some("mq4");
+        let bulk_kind = std::env::var("HIPFIRE_RQ4_BULK").ok().unwrap_or_default();
+        let bulk_mq4 = bulk_kind == "mq4";
+        let bulk_void = bulk_kind == "void";
         // Saliency metric for which channels to protect (user steer: don't rely
         // on diag(H) alone). diag = E[x²] (activation energy); wnorm = ‖W[:,c]‖²
         // (weight energy); product = ‖W[:,c]‖²·E[x²] (output-error contribution).
@@ -9695,7 +9697,9 @@ fn main() {
         eprintln!(
             "  roughquant4-sim: channel-consistent, protect_frac={protect_frac} bulk={}; \
              {n_prot_resid}/{dmodel} residual channels protected (read cols + write rows)",
-            if bulk_mq4 {
+            if bulk_void {
+                "void(prune)".to_string()
+            } else if bulk_mq4 {
                 "mq4".to_string()
             } else {
                 format!("qtip{bulk_bits}")
@@ -9780,7 +9784,28 @@ fn main() {
             } else {
                 n_r += 1;
             }
-            if bulk_mq4 {
+            if bulk_void {
+                // VOID: zero the non-protected (low-energy) entries entirely —
+                // structured prune. An entry (r,c) is kept iff its row OR column
+                // is protected (high-energy residual write row / read col);
+                // everything else is set to 0. Tests true redundancy: how much
+                // of the low-energy tail is genuinely unneeded.
+                let mut col_keep = vec![false; k];
+                for &c in &protected_cols {
+                    col_keep[c] = true;
+                }
+                for r in 0..m {
+                    if protected_rows[r] {
+                        continue;
+                    }
+                    let row = &mut wf[r * k..r * k + k];
+                    for c in 0..k {
+                        if !col_keep[c] {
+                            row[c] = 0.0;
+                        }
+                    }
+                }
+            } else if bulk_mq4 {
                 mq4_simquant_masked(
                     &mut wf,
                     m,
