@@ -240,6 +240,29 @@ headroom is re-ranking the top ~16 high-energy channels (small KLD), and there i
 no achievable tail gain. Graded protection should spend its budget on getting the
 HEAD right (T0 super-weight bf16 + T1 outlier set), not on tail metric refinement.
 
+## Finding: real packed format — producer + kernel-level GEMV proof (10a/10b)
+
+The de-risked sim verdict now has a REAL packed format (`--format roughquant`,
+commit `fb3d403b`): real MQ4G256 bulk + bf16 correction sidecar (`R = W −
+dequant_mq4g256(packed)`) over the diag-selected shared residual set (reader cols
++ writer rows). Two verifications:
+
+- **Producer self-check**: protected-channel recon max-err = 1.19e-4 (= bf16
+  rounding of R) on 0.8B @ 5% (51 ch, 138 reader + 48 writer sidecars).
+- **Kernel-level proof** (`crates/hipfire-runtime/examples/rq_real_gemv_check.rs`):
+  on the REAL `gemv_mq4g256_with_rotate` kernel + `gemv_f32` correction, with input
+  nonzero only on the protected set, the composition reconstructs protected
+  channels to **bf16 precision** (corrected err 3.5e-3–1.3e-2 vs uncorrected mq4
+  1.1–5.0 → 100–400× reduction). `dequant_mq4g256` is bit-identical to the kernel
+  (1e-6), confirming the earlier "sim ≠ real" gap was only the sim's bf16 *storage*
+  of its recon, NOT a dequant mismatch.
+- Reusable finding: `gemv_f32`'s tree reduction needs a power-of-2 block when
+  k<256 → the correction width |S| must be padded to the next power of two.
+
+Remaining for the shippable verdict: wire the correction into the qwen35 forward
+(side-map approach, ~10 forward variants — the coherence-gated step), then measure
+real-model KLD + coherence + tok/s.
+
 ## Finding: the 5 permutations — bijectivity verified
 
 `scripts/roughquant_permute_verify.py` + `docs/roughquant/permutation-bijectivity.md`:

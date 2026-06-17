@@ -81,11 +81,21 @@ hence 838 MB) are follow-ups once the binary verdict lands.
 2. **Loader/format**: read `metadata["roughquant_sidecar"]`, load each `.rqcorr`
    bf16 tensor + a u32 channel-index buffer to GPU. Mirror the AWQ-sidecar loader
    precedent (`load_awq_scale_for`, qwen35.rs:2729).
-3. **Correction GEMV (compose existing primitives, likely no new kernel)**: reader
-   = gather `x[S]`→`xs` then dense `gemv_f32`/residual of `corr[m×|S|]` added into
-   `y`; writer = `gemv_f32` of `corr[|S|×k]·x` then scatter-add into `y[S]`. Reuse
-   `dispatch.rs::gemv_f32` + a small gather (or the `*_residual` y+=A·x variants).
-   gfx1100 + gfx1201 (RDNA4 mandatory) per cross-arch rule.
+3. **Correction GEMV (compose existing primitives, NO new kernel) — PROVEN on real
+   GPU, `rq_real_gemv_check` example, commit pending**: reader = gather `x[S]`→`xs`
+   then dense `gemv_f32` of `corr[m×|S|]` added into `y`; writer = `gemv_f32` of
+   `corr[|S|×k]·x` then scatter-add into `y[S]`. Kernel-level proof result: with
+   `x` nonzero only on `S`, `mq4_kernel(x) + gemv_f32(corr,x_S)` reconstructs the
+   protected channels to **bf16 precision** (corrected err 3.5e-3–1.3e-2 vs
+   uncorrected mq4 1.1–5.0, i.e. 100–400× reduction) on the real
+   `gemv_mq4g256_with_rotate` kernel. Two findings:
+   - `dequant_mq4g256` is **bit-identical** to the kernel's effective weights
+     (|kernel − cpu(recon·x)| ≈ 1e-6), so the producer's residual is exact — no
+     producer/kernel dequant mismatch.
+   - **`gemv_f32`'s tree reduction requires a power-of-2 block** (`block=256.min(k)`),
+     so for the small correction width `|S|` (<256, not power-of-2) the gather/corr
+     MUST be **padded to the next power of two** (zeros don't change the dot). The
+     forward wiring + a fused gfx1100/gfx1201 kernel are the only remaining work.
 4. **Forward wiring (the big, hot-path, coherence-gated step)**: qwen35 has ~10
    forward variants (`forward_from_x_gpu`, `forward_scratch`, `forward_prefill_*`)
    with linears dispatched inline via `dispatch_ref()`→`GemvFamily` — there is NO
