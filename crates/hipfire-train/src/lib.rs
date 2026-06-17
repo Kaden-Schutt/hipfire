@@ -12,6 +12,7 @@
 
 pub mod config;
 pub mod loader;
+pub mod ops;
 pub mod tensor;
 
 pub use config::LlamaConfig;

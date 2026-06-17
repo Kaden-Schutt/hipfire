@@ -162,11 +162,23 @@ cosine schedule + 10% warmup, **global-norm grad clip at 1.0**.
 ## Milestones
 
 - **M0 — crate + loader.** `hipfire-train` builds; load Supra-50M safetensors to
-  fp32 GPU tensors; un-fused fp32 forward reproduces logits matching the
-  existing inference forward on a fixed prompt (sanity that the forward is
-  wired right before we trust the backward).
+  fp32 GPU tensors. ✅ DONE (commit b9c3f69): config parse + bf16→f32 + all
+  weights verified on gfx1103.
+  - *Approach change (2026-06-17):* the original M0 also asked for an fp32
+    forward matching the inference logits as a sanity check. But the inference
+    fp32 ops carry conventions (RoPE interleave, batched-row layout) we'd have to
+    match exactly and then still write backward for — throwaway work. Since the
+    crate owns its own un-fused ops anyway (plan architecture), we instead
+    validate each op directly by **finite-difference gradcheck** (M1) and the
+    eventual full forward against a **PyTorch logit dump on fixed input_ids**
+    (tokenizer-independent). The inference-logit match is dropped.
 - **M1 — single-op gradient checks.** linear, rmsnorm, softmax, swiglu, rope,
   cross_entropy each pass finite-difference check in isolation.
+  - **linear** ✅ DONE: `ops/linear.rs` (forward + dX + dW via `gemm_f32_train`),
+    `examples/gradcheck_linear.rs` passes on gfx1103 (max|analytic−numeric|
+    ≈1.5e-5, tol 1e-2). No new kernel needed.
+  - rmsnorm, softmax, swiglu, rope, cross_entropy: TODO (each needs a small
+    fwd+bwd kernel).
 - **M2 — full-graph gradient check.** End-to-end fp32 model, finite-difference
   check on LoRA params (and one base param via a temporarily-unfrozen linear)
   for a 1–2 token toy input.
