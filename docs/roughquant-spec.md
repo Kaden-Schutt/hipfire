@@ -1,7 +1,14 @@
 # RoughQuant — energy-concentrating mixed-precision weight quant (build spec)
 
-**Status:** design (2026-06-17). Derived from ResQ (2412.14363), adapted to
-hipfire (weight-only, GQA, multi-tier, fp32 super-bin) + the "roughquant" lever.
+**Status:** design (2026-06-17); **sim phases 0–2 done (2026-06-17)** — see
+`docs/roughquant/phase{0,1,2}.md`. **Headline thesis (≈2.5 avg-bit ≈ 4-bit PPL)
+FALSIFIED on Qwen3.5-0.8B**; a clean mechanism win exists (PCA + top-subspace
+protection beats iso-bit QTIP-3-LDLQ by 11%) but the deployment win over 4-bit
+mq4 is modest (~0.7 bit), confounded (embed precision), and contingent on a
+foldable shared rotation that is not yet validated. Phase 3 (kernels/format)
+gated on two cheap de-risks + a human go/no-go — NOT auto-built. Derived from
+ResQ (2412.14363), adapted to hipfire (weight-only, GQA, multi-tier, fp32
+super-bin) + the "roughquant" lever.
 
 ## Lineage / what's new
 
@@ -91,8 +98,34 @@ weight-only quant), `W ∈ ℝ^{d×d_out}`.
 
 - Top-bin: **fp32 vs bf16** — does fp32 buy enough residual-flattening to drop the
   bulk a further bit? (roughquant's core claim)
+  → **Moot so far:** the bulk could not drop to 2-bit on the 0.8B at all (2-bit
+  PPL ≥ 35 even with rotation+protection), so the further-bit-drop the fp32 bin
+  was meant to enable did not materialize. fp32-vs-bf16 untested because the
+  bf16 sim already keeps the protected subspace effectively exact for PPL.
 - Tier count on small models (launch cost) vs big models (where it amortizes).
+  → **Untested across models** (0.8B only). The 0.8B verdict: a binary split
+  (protect + single bulk tier) already shows the win is bounded at ~3.5 bits;
+  multi-tier unlikely to help here. May differ on big models — deferred.
 - PCA basis is per-activation (shared by `q/k/v/gate/up`); per-tensor refinement
   (different bins per weight sharing one rotation) — needed or not?
+  → **THE pivotal open question for deployability.** The sim used a per-weight
+  dense PCA basis, which does NOT fold for free. Whether a *shared* per-activation
+  basis (foldable, ResQ-style) preserves the PPL win is de-risk B and must be
+  settled before any kernel work.
 - Super-weights as a sparse scalar exception bin (SpQR-style) vs a full fp32
   column — which is cheaper for the lone scalars.
+  → Untested; the column-granular protection used here is the full-column form.
+
+## Sim verdict (2026-06-17)
+
+- **Phase 0** (`docs/roughquant/phase0.md`): baselines — bf16 26.17, mq4
+  (4-bit gate) 29.08, QTIP-3-LDLQ 31.42.
+- **Phase 1** (`phase1.md`): top-k column protection (no rotation) — super-weight
+  premise confirmed (3-bit 3978→105 at 1.5% protect), but no un-rotated config
+  beats mq4; rotation is the competitiveness lever.
+- **Phase 2** (`phase2.md`): PCA rotation + protection — headline 2.5-bit gate
+  FALSIFIED (2.55 bit → 47.85); best `b3 f0.03` = 27.90 at ~3.5 bit beats mq4 and
+  beats iso-bit QTIP-3-LDLQ by 11%. Win confounded by bf16 embed/lm_head and
+  contingent on foldable shared rotation. **De-risks gating Phase 3:** (A) iso-bit
+  embed comparison; (B) shared/foldable rotation preserves the win. Phase 3
+  kernels NOT to be built until A+B hold + human go/no-go.

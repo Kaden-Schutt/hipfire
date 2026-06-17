@@ -9246,6 +9246,36 @@ fn main() {
             n_rot += 1;
         }
         eprintln!("  roughquant2-sim: PCA-rotated+quantized {n_rot} tensors, left-bf16 {n_skip}");
+        // De-risk A: optional iso-bit embed/lm_head. The win-vs-mq4 comparison is
+        // confounded because this sim leaves embed/lm_head at bf16 while mq4 uses
+        // Q8 (~20% of params on a tied-embedding 0.8B). With HIPFIRE_RQ2_Q8_EMBED=1,
+        // simulate Q8 (8-bit per-256-group uniform, no protection) on those tensors
+        // so the comparison is honest.
+        if std::env::var("HIPFIRE_RQ2_Q8_EMBED").ok().as_deref() == Some("1") {
+            let mut n_e = 0usize;
+            for t in hfq_tensors.iter_mut() {
+                if matches!(t.quant_type, QuantType::BF16)
+                    && t.shape.len() == 2
+                    && (t.shape[1] as usize) % 256 == 0
+                    && (t.name.contains("embed") || t.name.contains("lm_head"))
+                {
+                    let m = t.shape[0] as usize;
+                    let k = t.shape[1] as usize;
+                    let mut wf: Vec<f32> = t
+                        .data
+                        .chunks_exact(2)
+                        .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                        .collect();
+                    // 8-bit per-group uniform, protect nothing → Q8G256-equivalent.
+                    roughquant_sim_tensor(&mut wf, m, k, &vec![0.0; k], 0.0, 8, 256);
+                    t.data = f32_slice_to_bf16_bytes(&wf);
+                    n_e += 1;
+                }
+            }
+            eprintln!(
+                "  roughquant2-sim: HIPFIRE_RQ2_Q8_EMBED — Q8-sim on {n_e} embed/lm_head tensors"
+            );
+        }
     }
 
     // qtip3 (real) post-pass: pack every eligible 2D BF16 weight into

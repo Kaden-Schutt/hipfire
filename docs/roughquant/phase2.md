@@ -64,40 +64,55 @@ the eigenbasis + protecting the top-energy subspace genuinely helps.
    frame and the top columns are worth protecting. It just doesn't extend down
    to 2-bit on a 0.8B.
 
-## Two confounds — settle before ANY Phase 3 work
+## Two confounds — one settled, one is the blocker
 
-1. **Embed/lm_head precision is unequal (inflates the win).** The `*-sim`
-   post-pass leaves embed/lm_head at **bf16**; mq4 quantizes them to **Q8**. On a
-   0.8B with tied embeddings, that tensor is ~20% of params getting a free
-   precision boost in RoughQuant's favor. The avg-bits estimate (3.52) counts
-   only the 2D transformer weights and ignores this. **The 27.90-vs-29.08 win is
-   not iso-bit.** Re-run with embed/lm_head Q8 (or mq4 with bf16 embed) for an
-   honest comparison — the ~0.7-bit edge may shrink or vanish.
-2. **The PCA rotation may not fold for free (could erase the perf win).** The win
+1. **Embed/lm_head precision — SETTLED (de-risk A PASSED).** The `*-sim`
+   post-pass leaves embed/lm_head at bf16; mq4 uses Q8 (~20% of params on a tied
+   0.8B). Re-ran `b3 f0.03` with `HIPFIRE_RQ2_Q8_EMBED=1` (8-bit per-256-group
+   uniform on embed/lm_head, matching mq4): **PPL 28.28** (vs 27.90 bf16-embed).
+   The win shrank slightly but **still beats mq4 (29.08) by ~2.8% at ~0.7 fewer
+   bits**. The win is real and iso-bit — NOT an embed artifact.
+2. **The PCA rotation does not fold for free (the deployability blocker).** The win
    assumes the rotation is zero-cost at runtime. mq4's FWHT rotation IS free
    (folded into the GEMV that rotates x). RoughQuant uses a **dense per-weight
    k×k PCA basis P**. A dense per-weight rotation applied at runtime is a k×k
    matmul per weight per token — catastrophic, erasing any bit-saving. It is
    free ONLY if P is **shared across all weights reading one residual-stream
-   point** and folds into the producing weight (ResQ's U_A). q/k/v/gate/up share
-   their input, so a shared P is plausible; down_proj needs a runtime Hadamard
-   (spec-acknowledged). **This is unvalidated.** Until a shared-and-foldable
-   rotation is shown to keep the PPL win, the win is a sim artifact.
+   point** and folds into the producing weight (ResQ's U_A). The sim used a
+   **dense per-weight** P (186 distinct rotations) — each weight's own optimal
+   basis. That does NOT fold: applying it at runtime is a [k×k] matvec per weight
+   per token (~100M MACs/token across the model), eroding the perf benefit of the
+   ~0.7 saved bits. mq4's FWHT rotation is free precisely because it is a fixed
+   structured (Hadamard) transform baked into the GEMV. **The open question:** does
+   a single SHARED rotation of the residual stream (foldable into embed +
+   o_proj/down_proj outputs + lm_head, ResQ-style) preserve the win? A shared
+   rotation is far more constrained than 186 per-weight ones and will capture
+   less benefit — this is the research crux, and a redesign, not a quick sweep.
+
+## STATUS: stopped here for a human go/no-go (2026-06-17)
+
+De-risk A passed → the mechanism win is real and iso-bit (~0.7 bit at iso-PPL,
+~2.8% better than mq4; +11% over QTIP-3-LDLQ). De-risk B (foldable shared
+rotation) is unresolved and is the deployability make-or-break. Building it is a
+substantial redesign (global/shared residual-stream rotation + fold + packed
+per-tier format + kernels) for a **modest ~0.7-bit payoff**. Per the project
+methodology (don't build large speculative kernels for a contingent win), this is
+left for a human decision rather than an unattended build.
 
 ## NEXT-STEPS (gating Phase 3)
 
-1. **De-risk A (cheap, ~1 sweep): iso-bit embed.** Add embed/lm_head Q8 to the
-   roughquant2-sim path (or a bf16-embed mq4 baseline) and re-measure b3 f0.03.
-   If the win survives → continue; if it vanishes → RoughQuant ≈ mq4, STOP.
-2. **De-risk B (cheap, ~1 sweep): shared/foldable rotation.** Compute ONE P per
-   residual-stream input (shared by q/k/v and by gate/up) instead of per-weight,
-   confirm the b3 f0.03 PPL win holds. If shared-P loses the edge, the win is not
-   deployable, STOP.
-3. **Only if A and B both hold:** design the offline fold (shared U_A into
-   adjacent weights + residual skip), the down_proj runtime FWHT, a real packed
-   per-tier format (not bf16 sim), then coherence + fresh-probe perf on a
-   perf-class model. This is a large, intricate effort for a ~0.7-bit payoff —
-   worth a human go/no-go decision, not an unattended build.
+1. **De-risk A — DONE, PASSED.** Iso-bit (Q8 embed): b3 f0.03 = 28.28 < mq4 29.08.
+2. **De-risk B (the blocker, a redesign): shared/foldable rotation.** Collect ONE
+   residual-stream Hessian per block boundary (or one global), apply a single
+   shared rotation foldable into embed + all o_proj/down_proj outputs + lm_head,
+   and confirm b3 f0.03's PPL edge survives the shared constraint. If shared-P
+   loses the edge → win not deployable, STOP. If it holds → Phase 3 is justified.
+3. **Only if B holds:** offline fold + down_proj runtime FWHT + real packed
+   per-tier format (not bf16 sim) + coherence + fresh-probe perf on a perf-class
+   model. Large effort; confirm the payoff is worth it first.
+4. **Cross-model check (orthogonal):** the 2-bit failure and bounded ~3.5-bit win
+   are on a 0.8B; bigger models have more redundancy and may push the frontier
+   lower. Worth re-running phase 2 on a 7B/9B before concluding 2-bit is dead.
 
 ## Artifacts
 
