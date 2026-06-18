@@ -5,10 +5,15 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-MODEL=/srv/huggingface/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17
-export HIPFIRE_QTIP_HESSIAN="$HOME/.hipfire/hessians/qwen3.5-0.8b.hessian.bin"
+MODEL=${MODEL:-/srv/huggingface/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17}
+# Hessian is now the unified `.calib.hfq` (HFQM) from the native collector
+# (`hipfire collect-artifacts`); the legacy HFHS `.hessian.bin` was retired.
+export HIPFIRE_QTIP_HESSIAN="${HESS:-$HOME/.hipfire/calib/qwen3.5-0.8b.calib.hfq}"
 CORPUS=benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt
 Q=./target/release/hipfire-quantize
+# Per-config PPL via the `perplexity` example directly (tight sweep loop). For
+# one-off / standalone PPL+KLD on a model, prefer the canonical harness path:
+#   hipfire-eval --model <m> --battery perplexity [--kldref <ref>]
 PPL=./target/release/examples/perplexity
 TMP="$HOME/.hipfire/models/_rq2_sweep.hfq"
 OUT="${1:-/tmp/roughquant_phase2.tsv}"
