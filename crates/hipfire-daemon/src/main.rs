@@ -3193,6 +3193,22 @@ struct DdtreeState {
     path_c_main_end_snap: DeltaNetSnapshot,
 }
 
+thread_local! {
+    /// Per-request raw-prompt override, parsed from the generate message's
+    /// optional `"raw"` field. `None` = use the auto default (raw iff the model
+    /// has no chat_template). Set at the top of the generate handler (the daemon
+    /// processes generate messages synchronously on one thread), read by
+    /// `effective_raw`. Reset every generate request, so no cross-request leak.
+    static RAW_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Effective raw-prompt flag for prompt framing. An explicit request `"raw"`
+/// wins; otherwise default to raw for base/completion models (no chat_template)
+/// and framed for chat models (has a chat_template).
+fn effective_raw(m: &LoadedModel) -> bool {
+    RAW_OVERRIDE.with(|c| c.get()).unwrap_or(m.chat_template.is_none())
+}
+
 struct LoadedModel {
     arch_id: u32,
     /// Pipeline-parallel degree. 1 = single-GPU (all existing fields below in
@@ -4954,7 +4970,7 @@ fn qwen35_materialize_batch_prefill_prompt(
                     system: system_prompt,
                     user: "",
                     assistant_prefix,
-                    raw: m.chat_template.is_none(),
+                    raw: effective_raw(m),
                 }
                 .build_with_user_tokens(&raw_q_tokens))
             }
@@ -4969,7 +4985,7 @@ fn qwen35_materialize_batch_prefill_prompt(
             },
             user: "",
             assistant_prefix,
-            raw: m.chat_template.is_none(),
+            raw: effective_raw(m),
         }
         .build_with_user_tokens(&raw_q_tokens))
     }
@@ -8243,6 +8259,10 @@ fn main() {
             }
 
             "generate" => {
+                // Explicit per-request raw-prompt override (optional `"raw"`
+                // bool). Absent → None → auto default (raw iff no chat_template).
+                // Always set, so it resets every request (no cross-request leak).
+                RAW_OVERRIDE.with(|c| c.set(msg.get("raw").and_then(|v| v.as_bool())));
                 let protocol_generate =
                     serde_json::from_value::<hipfire_generate::GenerateTextRequest>(msg.clone())
                         .ok();
@@ -12187,7 +12207,7 @@ fn generate_mtp(
                     system: system_prompt,
                     user: prompt,
                     assistant_prefix,
-                    raw: m.chat_template.is_none(),
+                    raw: effective_raw(m),
                 }
                 .build()
             }
@@ -12198,7 +12218,7 @@ fn generate_mtp(
             system: system_prompt,
             user: prompt,
             assistant_prefix,
-            raw: m.chat_template.is_none(),
+            raw: effective_raw(m),
         }
         .build()
     };
@@ -12611,7 +12631,7 @@ fn generate_dflash(
                     system: system_prompt,
                     user: prompt,
                     assistant_prefix,
-                    raw: m.chat_template.is_none(),
+                    raw: effective_raw(m),
                 }
                 .build()
             }
@@ -12622,7 +12642,7 @@ fn generate_dflash(
             system: system_prompt,
             user: prompt,
             assistant_prefix,
-            raw: m.chat_template.is_none(),
+            raw: effective_raw(m),
         }
         .build()
     };
@@ -13403,7 +13423,7 @@ fn generate_multi(
                     system: if m.seq_pos == 0 { system_prompt } else { None },
                     user: "",
                     assistant_prefix,
-                    raw: m.chat_template.is_none(),
+                    raw: effective_raw(m),
                 }
                 .build_with_user_tokens(&q_tokens)
             }
@@ -13414,7 +13434,7 @@ fn generate_multi(
             system: if m.seq_pos == 0 { system_prompt } else { None },
             user: "",
             assistant_prefix,
-            raw: m.chat_template.is_none(),
+            raw: effective_raw(m),
         }
         .build_with_user_tokens(&q_tokens)
     };
@@ -14507,7 +14527,7 @@ fn generate(
                     system: system_prompt,
                     user: "",
                     assistant_prefix,
-                    raw: m.chat_template.is_none(),
+                    raw: effective_raw(m),
                 }
                 .build_with_user_tokens(&q_tokens)
             }
@@ -14522,7 +14542,7 @@ fn generate(
             },
             user: "", // unused: we pass tokens directly via build_with_user_tokens
             assistant_prefix,
-            raw: m.chat_template.is_none(),
+            raw: effective_raw(m),
         }
         .build_with_user_tokens(&q_tokens)
     };
@@ -16815,7 +16835,7 @@ fn generate_minimax(
                         system: system_prompt,
                         user: prompt,
                         assistant_prefix: prompt_frame::AssistantPrefix::Plain,
-                        raw: m.chat_template.is_none(),
+                        raw: effective_raw(m),
                     }
                     .build()
                 }
@@ -16826,7 +16846,7 @@ fn generate_minimax(
                 system: system_prompt,
                 user: prompt,
                 assistant_prefix: prompt_frame::AssistantPrefix::Plain,
-                raw: m.chat_template.is_none(),
+                raw: effective_raw(m),
             }
             .build()
         }
@@ -17076,7 +17096,7 @@ fn generate_lfm2moe(
                         system: system_prompt,
                         user: prompt,
                         assistant_prefix: prompt_frame::AssistantPrefix::Plain,
-                        raw: m.chat_template.is_none(),
+                        raw: effective_raw(m),
                     }
                     .build()
                 }
@@ -17087,7 +17107,7 @@ fn generate_lfm2moe(
                 system: system_prompt,
                 user: prompt,
                 assistant_prefix: prompt_frame::AssistantPrefix::Plain,
-                raw: m.chat_template.is_none(),
+                raw: effective_raw(m),
             }
             .build()
         }
@@ -17374,6 +17394,8 @@ fn generate_vl(
     let vision_weights = m.vision_weights.as_ref().unwrap();
     let weights = m.q35_weights.as_ref().unwrap();
     let scratch = m.q35_scratch.as_ref().unwrap();
+    // Compute the raw-prompt flag before the mutable kv/dn borrows below.
+    let vl_raw = effective_raw(m);
     let kv = m.kv_cache.as_mut().unwrap();
     let dn = m.dn_state.as_mut().unwrap();
 
@@ -17399,7 +17421,7 @@ fn generate_vl(
         system: if m.seq_pos == 0 { system_prompt } else { None },
         user: "", // unused: we pass tokens directly via build_with_user_tokens
         assistant_prefix: prompt_frame::AssistantPrefix::Plain, // VL always uses Plain
-        raw: m.chat_template.is_none(),
+        raw: vl_raw,
     }
     .build_with_user_tokens(&user_body);
 
