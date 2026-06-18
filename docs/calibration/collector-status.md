@@ -107,6 +107,38 @@ integration + cross-model capture, flagged below.
   interface ⇒ do with review. The `collect_artifacts` CLI already provides the
   standalone (in-process, daemon-free) path.
 
+## Update (2026-06-18, loop session 6) — build COMPLETE; cross-model artifact landed
+
+The full single-load calibration-artifact collector (Phases 1–5) is **done and
+verified**. Final-session work:
+
+- **Genuine cross-model artifact (item 4 / #11).** Generated a real (128-token,
+  not 8-token mechanism) `.calib.hfq` for the focus MoE model
+  `qwen3.6-35b-a3b-bf16` to **real disk** (`~/.hipfire/calib/`, not tmpfs):
+  **7.3 GiB**, `n_hessian=350` (dense projections, `diag(Σxxᵀ)==Σx²` CONSISTENT,
+  rel-err 0.000e0), `n_imatrix=11568` (350 dense + 11218 routed-expert
+  imatrix-only = 5609 distinct expert-projections covered, up from 3014 at 8
+  tokens — coverage scales with tokens as expected). 35.9 s capture / ~60 s
+  total on gfx1151. **Collector cross-model generality confirmed**: 0.8B (dense,
+  byte-identical to the Python Hessian), 9B (`[4096,4096]` CONSISTENT), and A3B
+  (MoE, dense-Hessian + per-expert-imatrix) all produce correct artifacts.
+  Correctness is token-count-independent (the consistency check holds at any N),
+  so this is a full-size, real-disk validation of the focus model.
+
+- **Importance/KLD sweep re-run — DEFERRED (scoped follow-up, not done).** The
+  prior sweep tooling (`scripts/roughquant_ablation_oracle.sh`, task #9) reads the
+  **old binary** Hessian (`HIPFIRE_QTIP_HESSIAN=<model>.hessian.bin`) and is
+  0.8B-specific (hard-coded model path, 39-rank per-channel ablation × full
+  `perplexity` KLD eval). Re-running it on a fresh model needs, in order:
+  1. a **format bridge** — the quantizer/`perplexity` path consumes the legacy
+     `.hessian.bin`, not the new `.calib.hfq`; either teach them to read the HFQM
+     `<name>.hessian` tensors (preferred) or add a `hfq extract`→`.hessian.bin`
+     shim;
+  2. a per-model `DUMP_RANK` diag rank-map (the sweep's input);
+  3. the ablation loop itself (expensive on 9B/A3B: ~39 quant+PPL evals).
+  This is a research investigation (not autonomous build work) and is gated on
+  step 1 — left as a documented follow-up rather than rabbit-holed.
+
 ## Perf note
 Per-token AR forward + per-token K×K outer-product is slow (~35 s / 256 tok on
 gfx1151). A full 262k-token calibration wants **batched-prefill capture** (process
