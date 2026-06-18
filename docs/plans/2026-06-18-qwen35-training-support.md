@@ -83,6 +83,37 @@ A3B (35B) won't fit fp32 on a 24GB/45GB box. Prototype on a **small dense
 qwen3.5** (0.8b / 4b) or a synthetic tiny config; the A3B path is for the big
 boxes (hipx 96GB / hiptrx) and likely needs bf16 master weights, not fp32.
 
+## Q1 findings (2026-06-18, autonomous exploration)
+
+Before writing the config/loader, two concrete findings that shape it:
+
+1. **qwen3.5 is heterogeneous** — `model_type: "qwen3"`, and the per-layer shape is
+   driven by `layer_types` + presence of optional fields. Seen so far:
+   - **DeltaNet + MoE (A3B)** — `linear_num_key_heads`, `conv_kernel_dim`,
+     `num_experts=256`, per `qwen35.rs`.
+   - **Sliding + full attention** — e.g. the local Qwen3.5-122B-A10B-DFlash config:
+     `layer_types: [sliding_attention…, full_attention]`, `sliding_window=2048`,
+     `head_dim=128`, GQA 32/4, `partial`/MoE fields absent, `tie_word_embeddings=false`,
+     vocab 248320. (That snapshot is the **DFlash draft head** — `num_hidden_layers=4`,
+     `num_target_layers=48`, `block_size=16` — not the full model, but it shows the
+     sliding/full-attn variant shape.)
+   So the loader must branch on `layer_types` and treat DeltaNet/MoE/partial-rope/
+   sliding-window as **optional** capabilities, not a fixed block.
+
+2. **No reusable runtime fp32 loader.** `hipfire-runtime`'s weight loading is
+   HFQ/quantized-oriented (`load_weights_hfq`, `load_weights_paroquant_llama`); the
+   qwen3.5 `Config` in `qwen35.rs` is intertwined with GPU runtime state, not a
+   clean parse-only struct. So hipfire-train needs **its own** fp32 safetensors
+   loader (extend `load_llama_fp32` for qwen3.5 tensor names + per-layer-type),
+   rather than calling into the runtime.
+
+**Direction question for the user (pick the first target variant):** the
+DeltaNet+MoE A3B is the hardest (gated-delta recurrence + 256-expert MoE) but the
+flagship; a **small sliding/full-attention dense qwen3.5** (if one exists at 0.6–4B)
+is far closer to the existing LLaMA path (just partial-rope + qk-norm + attn-output-
+gate + sliding-window mask) and is the tractable first cut. Recommend starting
+Scope-B on the **dense sliding/full-attn** variant, deferring DeltaNet+MoE.
+
 ## Milestones
 
 - **Q1 — config + fp32 loader** for a small qwen3.5 (CPU-checkable against a real
