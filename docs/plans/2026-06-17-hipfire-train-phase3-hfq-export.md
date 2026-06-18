@@ -114,3 +114,38 @@ re-quant-loss number. Defer Path C unless a no-loss LoRA serve is required.
 2. Is daemon-served inference of the recovered model actually needed now, or is
    in-`hipfire-train` train+eval sufficient (in which case this stays scoped,
    unbuilt)?
+
+---
+
+## Findings (2026-06-18): daemon serving — diagnosis corrected
+
+Tried to serve the recovered Supra qtip3 `.hfq` via the daemon. Two corrections
+to the earlier "missing qtip3 forward route" claim (commit 7085611b):
+
+1. **The qtip3 forward route EXISTS.** `weight_gemv` (llama.rs:761) routes
+   rotation-needing dtypes through its default arm (line 922):
+   `rotate_x_mq_for` + prerotated gemv. Qtip3G256 has `dtype_needs_rotation=true`
+   and no explicit arm → hits that default. FWHT seeds match on both sides
+   (`gen_fwht_signs(42/1042,256)` in quantizer main.rs:5660 and runtime
+   `ensure_mq_signs` dispatch.rs:7693). qwen3.5 serves qtip3 via this same
+   `weight_gemv`. So the loader fixes WERE needed (real load panics) but the
+   "garbage = no forward route" attribution was wrong.
+
+2. **The Supra garbage is a daemon chat-framing quirk, not qtip3/recovery.**
+   Control test: Supra quantized to **Q8** (near-lossless) ALSO produces garbage
+   on the daemon — `<|im_end|>user\n<|im_end|>user…` (ChatML tokens). Supra's
+   tokenizer has NO `<|im_end|>`/`<|im_start|>` and no chat_template (just
+   `<s>/<pad>/</s>/<unk>` + BPE); the `.hfq` embeds that correct tokenizer. So
+   the daemon's hand-rolled ChatML framing / special-token rendering assumes a
+   ChatML model and mangles a plain-llama BASE model. `hipfire-train`'s own
+   forward (raw prompt, correct tokenizer) generates coherent text — which is why
+   recovery validated there.
+
+**Implication:** Path A recovery + export + loader plumbing all work; recovery
+quality is validated in hipfire-train. A *daemon-served* demo of the recovered
+model is blocked only by Supra being an awkward base model to serve (no chat
+template), not by the pipeline. Options: (a) add a raw-prompt / no-chat-frame
+serve path for plain-llama base models; (b) accept hipfire-train-forward
+validation + loader plumbing as the deliverable; (c) the real production target
+qwen3.5 needs its hybrid arch ported into hipfire-train before Path A recovery
+can run on it at all (hipfire-train is llama-only).
