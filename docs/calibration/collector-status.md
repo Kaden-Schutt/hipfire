@@ -134,15 +134,19 @@ Always state the box for perf numbers (gfx1151/Strix Halo here).
   Plain)` (`hipfire-dispatch/src/types.rs:561`) has **no `(BF16, Plain)` entry**,
   so it returns `UnsupportedVariant{family:"gemv", variant:"unknown", arch:"",
   quant:""}` (→ "gemv.unknown for /"). `weight_gemv` short-circuits BF16 to
-  `gemm_bf16_x_bf16_wmma` (`llama.rs:780`), but a MoE-path `gemv_family.run_auto`
-  call reaches `for_gemv` with a bf16 weight WITHOUT that short-circuit. The dense
-  hybrid `qwen3.5-0.8b-bf16` (same DeltaNet+FullAttn arch) calibrates fine, so the
-  gap is isolated to the **MoE FFN bf16 dispatch** (never exercised before — bf16
-  MoE source models are normally quantized, not inferred). **Next step (cheap, but
-  do with a coherence gate on a WORKING mq4 MoE model, not blind):** get a
-  debug-build backtrace / add an eprintln at the `for_gemv` `_ =>` arm to name the
-  exact call site, then either short-circuit BF16 → `gemm_bf16_x_bf16_wmma` at that
-  site or add a `(BF16, Plain)` gemv entry. Until then, A3B calibration must run
-  against a model whose MoE FFN forward is supported (e.g. an mq* variant) — but
-  capture only fires at the BF16/F16 chokepoints, so a faithful A3B Hessian needs
-  the bf16 MoE forward fixed first.
+  `gemm_bf16_x_bf16_wmma` (`llama.rs:780`), but the A3B MoE FFN forward does NOT
+  go through `weight_gemv` — it routes through the **Ship 4.1 MoE dispatch
+  family** `hipfire_runtime::llama::moe_family().run()` (`qwen35.rs:8140`), whose
+  inner gemvs resolve via `for_gemv` and have no BF16 path. The dense hybrid
+  `qwen3.5-0.8b-bf16` (same DeltaNet+FullAttn arch) calibrates fine, so the gap is
+  isolated to the **MoE family executor's bf16 dispatch** (never exercised before
+  — bf16 MoE source models are normally quantized, not inferred). **Next step
+  (NOT a one-line short-circuit — a dispatch-family feature, scope accordingly):**
+  add BF16 support to the MoE family's inner gate/up/down/router gemvs (route bf16
+  weights to `gemm_bf16_x_bf16_wmma` inside the family executor). Low regression
+  risk for mq* production (the change only affects the arm that currently
+  hard-errors), but verify against the working mq4 `qwen3.6-35b-a3b` coherence +
+  speed gates. Until then, capture only fires at the BF16/F16 chokepoints, so a
+  faithful A3B Hessian needs the bf16 MoE family forward supported first; the
+  capture-name + imatrix-only plumbing is already in place and will populate
+  per-expert imatrices the moment that forward runs.
