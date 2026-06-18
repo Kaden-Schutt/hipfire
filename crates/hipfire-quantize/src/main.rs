@@ -6131,9 +6131,9 @@ fn main() {
     } else {
         (Vec::new(), Vec::new(), Vec::new())
     };
-    // Optional Hessian sidecar → QTIP-LDLQ (output-aware). HIPFIRE_QTIP_HESSIAN
-    // points at an HFHS file; tensors with a Hessian use LDLQ, the rest fall
-    // back to plain (MSE) simulated QTIP.
+    // Optional Hessian → QTIP-LDLQ (output-aware). HIPFIRE_QTIP_HESSIAN points
+    // at a `.calib.hfq` (HFQM) package from the native collector; tensors with a
+    // `<name>.hessian` use LDLQ, the rest fall back to plain (MSE) simulated QTIP.
     let qtip_hessian: Option<hessian_io::HessianSidecar> = if use_qtip_sim
         || use_roughquant_sim
         || use_roughquant2_sim

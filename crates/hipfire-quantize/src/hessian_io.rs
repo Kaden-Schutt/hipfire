@@ -1,23 +1,31 @@
-//! HFHS Hipfire Hessian Sidecar reader.
+//! HFQM calibration-package Hessian reader.
 //!
-//! Reads the per-tensor Hessian binary file produced by
-//! `scripts/collect_hessian.py` (the Python calibration collector for Stage B
-//! GPTQ). Format specification: `docs/plans/gptq-hessian-format.md`.
+//! Reads per-tensor Hessians out of a unified `.calib.hfq` (HFQM) package
+//! produced by the native single-load collector
+//! (`hipfire_arch_qwen35::qwen35::collect_calibration_artifacts` →
+//! `write_calib_artifacts`, or the `hipfire collect-artifacts` CLI / daemon
+//! `Collect` op). Each dense projection is stored as a `<name>.hessian`
+//! `[K,K]` F32 tensor alongside its `<name>.imatrix`; MoE routed experts are
+//! imatrix-only (their full Hessians don't fit), so they carry no `.hessian`
+//! entry and `get` returns `None` for them (the quantizer then skips LDLQ for
+//! that tensor — exactly the prior behavior).
 //!
-//! Design choices:
-//! - **mmap-based.** A 9B Hessian sidecar is ~6 GB; mmap with sequential
-//!   POSIX advice lets the kernel page in tensor-by-tensor as the
-//!   quantizer's per-tensor Cholesky walk progresses, then evicts.
-//! - **Zero-copy.** `HessianRef` borrows from the mmap; the caller copies /
-//!   promotes only when needed (e.g. Cholesky's FP32 → FP64 promotion at
-//!   quantize time).
-//! - **Index built at open time.** A `HashMap<(name, expert_idx), offset>`
-//!   gives O(1) lookup for the quantizer's per-tensor query. With 200
-//!   tensors per 9B model, the index is < 32 KB.
+//! This replaced the standalone HFHS `.hessian.bin` sidecar format: the engine
+//! emits one container, the quantizer reads it directly, and there is no second
+//! Hessian format to keep in sync.
 //!
-//! Consumer integration (Phase 2): `crates/hipfire-quantize/src/gptq.rs`
-//! calls `HessianSidecar::open(path)` once per model, then queries
-//! `get(tensor_name_without_dot_weight_suffix, 0)` per MQ4G256 tensor.
+//! Design choices (unchanged from the sidecar era):
+//! - **mmap-based.** A 9B Hessian package is multi-GB; mmap with sequential
+//!   advice lets the kernel page tensors in as the per-tensor Cholesky walk
+//!   progresses, then evict.
+//! - **Zero-copy.** `HessianRef` borrows from the mmap; the caller promotes
+//!   FP32 → FP64 only at Cholesky time.
+//! - **Index built at open.** A `HashMap<name, entry>` over the `.hessian`
+//!   tensors gives O(1) lookup for the quantizer's per-tensor query.
+//!
+//! Consumer integration: the quantizer (`HIPFIRE_QTIP_HESSIAN` →
+//! `HessianSidecar::open`) queries `get(tensor_name_without_dot_weight_suffix,
+//! 0)` per LDLQ-target tensor.
 
 #![cfg_attr(not(test), allow(dead_code))]
 
@@ -27,11 +35,13 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
-const HFHS_MAGIC: &[u8; 4] = b"HFHS";
-const HFHS_VERSION_SUPPORTED: u32 = 1;
-const HEADER_SIZE: usize = 24;
-const DTYPE_F32: u32 = 1;
-const DTYPE_F64: u32 = 2;
+const HFQM_MAGIC: &[u8; 4] = b"HFQM";
+const HFQM_VERSION_SUPPORTED: u32 = 1;
+const HEADER_SIZE: usize = 32;
+/// HFQM `quant_type` byte for F32 tensors (the collector writes Hessians as F32).
+const QUANT_TYPE_F32: u8 = 2;
+/// Suffix the collector appends to a tensor's canonical name for its Hessian.
+const HESSIAN_SUFFIX: &str = ".hessian";
 
 #[derive(Debug)]
 pub enum HessianError {
@@ -42,12 +52,12 @@ pub enum HessianError {
         needed: usize,
         have: usize,
     },
+    InvalidData(String),
     NegativeDiagonal {
         tensor: String,
         index: usize,
         value: f32,
     },
-    UnknownDtype(u32),
 }
 
 impl std::fmt::Display for HessianError {
@@ -55,18 +65,15 @@ impl std::fmt::Display for HessianError {
         match self {
             HessianError::Io(e) => write!(f, "I/O error: {e}"),
             HessianError::InvalidMagic(m) => {
-                write!(
-                    f,
-                    "invalid HFHS magic: got {m:?}, expected {:?}",
-                    HFHS_MAGIC
-                )
+                write!(f, "invalid HFQM magic: got {m:?}, expected {HFQM_MAGIC:?}")
             }
             HessianError::UnsupportedVersion(v) => {
-                write!(f, "unsupported HFHS version {v}, this build understands v{HFHS_VERSION_SUPPORTED}")
+                write!(f, "unsupported HFQM version {v}, this build understands v{HFQM_VERSION_SUPPORTED}")
             }
             HessianError::TruncatedFile { needed, have } => {
-                write!(f, "HFHS truncated: needed {needed} bytes, file is {have}")
+                write!(f, "HFQM truncated: needed {needed} bytes, file is {have}")
             }
+            HessianError::InvalidData(m) => write!(f, "invalid HFQM package: {m}"),
             HessianError::NegativeDiagonal {
                 tensor,
                 index,
@@ -76,7 +83,6 @@ impl std::fmt::Display for HessianError {
                 "Hessian for tensor {tensor:?} has negative diagonal H[{index},{index}] = {value} \
                  (should be ≥0 by PSD construction; likely FP corruption — fall back to plain MQ4)"
             ),
-            HessianError::UnknownDtype(d) => write!(f, "unknown HFHS dtype flag {d}"),
         }
     }
 }
@@ -143,14 +149,14 @@ impl<'a> HessianRef<'a> {
     }
 }
 
-/// Per-tensor record layout (computed at open, points into the mmap).
+/// Per-Hessian record (computed at open, points into the mmap). `name` is the
+/// canonical tensor name with the `.hessian` suffix stripped — the key the
+/// quantizer queries.
 struct TensorEntry {
-    name_offset: usize, // byte offset of the name string in mmap
-    name_len: usize,
-    expert_idx: u32,
+    name: String,
     k: usize,
     dtype: HessianDtype,
-    payload_offset: usize, // byte offset of K*K float payload in mmap
+    payload_offset: usize,
     payload_bytes: usize,
 }
 
@@ -159,7 +165,7 @@ pub struct HessianSidecar {
     // borrow from this. `_file` keeps the fd alive on Unix.
     mmap: Mmap,
     _file: File,
-    index: HashMap<(String, u32), TensorEntry>,
+    index: HashMap<String, TensorEntry>,
 }
 
 impl std::fmt::Debug for HessianSidecar {
@@ -169,6 +175,40 @@ impl std::fmt::Debug for HessianSidecar {
             .field("n_tensors", &self.index.len())
             .finish()
     }
+}
+
+/// Find the byte index just past the first complete top-level JSON object in
+/// `bytes` (the HFQM metadata blob is immediately followed by the tensor
+/// index). Mirrors the engine-side `hfq::json_blob_end`.
+fn json_blob_end(bytes: &[u8]) -> Option<usize> {
+    let mut brace_depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if b == b'\\' && in_string {
+            escape = true;
+            continue;
+        }
+        if b == b'"' {
+            in_string = !in_string;
+            continue;
+        }
+        if !in_string {
+            if b == b'{' {
+                brace_depth += 1;
+            } else if b == b'}' {
+                brace_depth -= 1;
+                if brace_depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+        }
+    }
+    None
 }
 
 impl HessianSidecar {
@@ -188,72 +228,113 @@ impl HessianSidecar {
                 have: mmap.len(),
             });
         }
-        // Header
         let magic: [u8; 4] = mmap[0..4].try_into().unwrap();
-        if &magic != HFHS_MAGIC {
+        if &magic != HFQM_MAGIC {
             return Err(HessianError::InvalidMagic(magic));
         }
         let version = LittleEndian::read_u32(&mmap[4..8]);
-        if version != HFHS_VERSION_SUPPORTED {
+        if version != HFQM_VERSION_SUPPORTED {
             return Err(HessianError::UnsupportedVersion(version));
         }
-        let n_tensors = LittleEndian::read_u64(&mmap[8..16]) as usize;
-        let _reserved = LittleEndian::read_u64(&mmap[16..24]);
+        // mmap[8..12] = arch_id (unused for a calibration package)
+        let n_entries = LittleEndian::read_u32(&mmap[12..16]) as usize;
+        let metadata_offset = LittleEndian::read_u64(&mmap[16..24]) as usize;
+        let data_offset = LittleEndian::read_u64(&mmap[24..32]) as usize;
+        if metadata_offset > data_offset || data_offset > mmap.len() {
+            return Err(HessianError::InvalidData(format!(
+                "offsets metadata={metadata_offset} data={data_offset} len={}",
+                mmap.len()
+            )));
+        }
 
-        // Walk records, build index.
-        let mut index = HashMap::with_capacity(n_tensors);
-        let mut pos = HEADER_SIZE;
-        for _ in 0..n_tensors {
-            if pos + 4 > mmap.len() {
-                return Err(HessianError::TruncatedFile {
-                    needed: pos + 4,
-                    have: mmap.len(),
-                });
+        // Metadata JSON is self-delimited; the tensor index follows it.
+        let meta_bytes = &mmap[metadata_offset..data_offset];
+        let json_end = json_blob_end(meta_bytes)
+            .ok_or_else(|| HessianError::InvalidData("metadata JSON did not end".into()))?;
+        let mut pos = metadata_offset + json_end;
+        if pos + 4 > data_offset {
+            return Err(HessianError::InvalidData(
+                "index missing tensor count".into(),
+            ));
+        }
+        let idx_n = LittleEndian::read_u32(&mmap[pos..pos + 4]) as usize;
+        if idx_n != n_entries {
+            return Err(HessianError::InvalidData(format!(
+                "index count {idx_n} != header count {n_entries}"
+            )));
+        }
+        pos += 4;
+
+        // Walk the index. Payloads are laid out contiguously from `data_offset`
+        // in index order; only `.hessian` F32 tensors are retained.
+        let mut index = HashMap::new();
+        let mut cumulative_offset = data_offset;
+        for _ in 0..n_entries {
+            if pos + 2 > data_offset {
+                return Err(HessianError::InvalidData(
+                    "index truncated at name length".into(),
+                ));
             }
-            let name_len = LittleEndian::read_u32(&mmap[pos..pos + 4]) as usize;
-            pos += 4;
-            if pos + name_len + 12 > mmap.len() {
-                return Err(HessianError::TruncatedFile {
-                    needed: pos + name_len + 12,
-                    have: mmap.len(),
-                });
+            let name_len = LittleEndian::read_u16(&mmap[pos..pos + 2]) as usize;
+            pos += 2;
+            if pos + name_len + 2 > data_offset {
+                return Err(HessianError::InvalidData(
+                    "index truncated at name/header".into(),
+                ));
             }
-            let name_offset = pos;
-            let name = std::str::from_utf8(&mmap[pos..pos + name_len])
-                .map_err(|_| HessianError::InvalidMagic([0; 4]))? // reuse for UTF-8 failure
-                .to_string();
+            let name = String::from_utf8_lossy(&mmap[pos..pos + name_len]).to_string();
             pos += name_len;
-            let expert_idx = LittleEndian::read_u32(&mmap[pos..pos + 4]);
+            let quant_type = mmap[pos];
+            pos += 1;
+            let n_dims = mmap[pos] as usize;
+            pos += 1;
+            if pos + n_dims * 4 + 12 > data_offset {
+                return Err(HessianError::InvalidData(
+                    "index truncated at shape/data_size".into(),
+                ));
+            }
+            let mut shape = Vec::with_capacity(n_dims);
+            for _ in 0..n_dims {
+                shape.push(LittleEndian::read_u32(&mmap[pos..pos + 4]) as usize);
+                pos += 4;
+            }
+            // group_size (u32) then data_len (u64)
             pos += 4;
-            let k = LittleEndian::read_u32(&mmap[pos..pos + 4]) as usize;
-            pos += 4;
-            let dtype_flag = LittleEndian::read_u32(&mmap[pos..pos + 4]);
-            pos += 4;
-            let dtype = match dtype_flag {
-                DTYPE_F32 => HessianDtype::F32,
-                DTYPE_F64 => HessianDtype::F64,
-                d => return Err(HessianError::UnknownDtype(d)),
-            };
-            let payload_bytes = k * k * dtype.size_bytes();
-            if pos + payload_bytes > mmap.len() {
+            let data_size = LittleEndian::read_u64(&mmap[pos..pos + 8]) as usize;
+            pos += 8;
+            let payload_offset = cumulative_offset;
+            cumulative_offset += data_size;
+            if cumulative_offset > mmap.len() {
                 return Err(HessianError::TruncatedFile {
-                    needed: pos + payload_bytes,
+                    needed: cumulative_offset,
                     have: mmap.len(),
                 });
+            }
+
+            // Retain only the dense `.hessian` tensors (F32, [K,K]).
+            let Some(base) = name.strip_suffix(HESSIAN_SUFFIX) else {
+                continue;
+            };
+            if quant_type != QUANT_TYPE_F32 || shape.len() != 2 || shape[0] != shape[1] {
+                continue;
+            }
+            let k = shape[0];
+            if k * k * 4 != data_size {
+                return Err(HessianError::InvalidData(format!(
+                    "{name}: K={k} implies {} bytes but data_size={data_size}",
+                    k * k * 4
+                )));
             }
             index.insert(
-                (name, expert_idx),
+                base.to_string(),
                 TensorEntry {
-                    name_offset,
-                    name_len,
-                    expert_idx,
+                    name: base.to_string(),
                     k,
-                    dtype,
-                    payload_offset: pos,
-                    payload_bytes,
+                    dtype: HessianDtype::F32,
+                    payload_offset,
+                    payload_bytes: data_size,
                 },
             );
-            pos += payload_bytes;
         }
 
         Ok(Self {
@@ -263,22 +344,18 @@ impl HessianSidecar {
         })
     }
 
-    /// Look up a Hessian by (`tensor_name`, `expert_idx`). The name SHOULD
-    /// be the `.hfq` tensor name with the trailing `.weight` stripped (see
-    /// the format spec §3.1). Returns `None` if the tensor isn't in the
-    /// sidecar — the quantizer treats this as "skip GPTQ for this tensor".
-    pub fn get(&self, name: &str, expert_idx: u32) -> Option<HessianRef<'_>> {
-        // Allocate-free lookup: HashMap key is (&str, u32) won't work
-        // because the map owns the String. Use a per-call key tuple via
-        // `get_key_value` requires Borrow<(String,u32)> — clone is cheaper
-        // than alternative gymnastics for this rare-call path.
-        let entry = self.index.get(&(name.to_string(), expert_idx))?;
+    /// Look up a Hessian by tensor name (the `.hfq` weight name with the
+    /// trailing `.weight` stripped). `expert_idx` is retained for signature
+    /// compatibility but ignored: MoE experts are encoded in the tensor name
+    /// itself (`...experts.{x}...`) and are imatrix-only, so they have no
+    /// `.hessian` entry and resolve to `None`. Returns `None` when the tensor
+    /// has no Hessian — the quantizer treats that as "skip LDLQ for this
+    /// tensor".
+    pub fn get(&self, name: &str, _expert_idx: u32) -> Option<HessianRef<'_>> {
+        let entry = self.index.get(name)?;
         Some(HessianRef {
-            name: std::str::from_utf8(
-                &self.mmap[entry.name_offset..entry.name_offset + entry.name_len],
-            )
-            .ok()?,
-            expert_idx: entry.expert_idx,
+            name: &entry.name,
+            expert_idx: 0,
             k: entry.k,
             dtype: entry.dtype,
             bytes: &self.mmap[entry.payload_offset..entry.payload_offset + entry.payload_bytes],
@@ -290,11 +367,8 @@ impl HessianSidecar {
     #[allow(dead_code)]
     pub fn tensors(&self) -> impl Iterator<Item = HessianRef<'_>> + '_ {
         self.index.values().map(|entry| HessianRef {
-            name: std::str::from_utf8(
-                &self.mmap[entry.name_offset..entry.name_offset + entry.name_len],
-            )
-            .unwrap_or(""),
-            expert_idx: entry.expert_idx,
+            name: &entry.name,
+            expert_idx: 0,
             k: entry.k,
             dtype: entry.dtype,
             bytes: &self.mmap[entry.payload_offset..entry.payload_offset + entry.payload_bytes],
@@ -342,9 +416,8 @@ impl HessianSidecar {
     }
 
     /// PSD diagnostic: scan all diagonals for negativity. PSD-by-construction
-    /// guarantees `H[i,i] >= 0`; FP corruption (e.g. from a partial sidecar
-    /// download) can produce negatives. Returns the first negative diagonal,
-    /// if any.
+    /// guarantees `H[i,i] >= 0`; FP corruption (e.g. from a partial download)
+    /// can produce negatives. Returns the first negative diagonal, if any.
     pub fn check_positive_diagonal(href: &HessianRef<'_>) -> Result<(), HessianError> {
         for i in 0..href.k {
             let v = href.at(i, i);
@@ -366,49 +439,76 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
-    /// Build a minimal v1 HFHS file with two tiny tensors for round-trip
-    /// testing.
-    fn make_test_sidecar() -> NamedTempFile {
+    /// Build a minimal HFQM `.calib.hfq` with one `.hessian` tensor (`tA`, K=2)
+    /// plus a non-Hessian `.imatrix` tensor that must be ignored. Mirrors
+    /// `hipfire_runtime::hfq::write_hfqm_package_mem`.
+    fn make_test_package() -> NamedTempFile {
+        struct Entry {
+            name: &'static str,
+            quant_type: u8,
+            shape: Vec<u32>,
+            data: Vec<u8>,
+        }
+        let f32_bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let entries = vec![
+            Entry {
+                name: "tA.hessian",
+                quant_type: 2,
+                shape: vec![2, 2],
+                data: f32_bytes(&[1.0, 0.5, 0.5, 2.0]),
+            },
+            Entry {
+                name: "tA.imatrix",
+                quant_type: 2,
+                shape: vec![2],
+                data: f32_bytes(&[1.0, 2.0]),
+            },
+        ];
+
+        let metadata = b"{\"artifact_kind\":\"calibration\"}";
+        let metadata_offset = 32u64;
+        let index_offset = metadata_offset + metadata.len() as u64;
+        let mut index = Vec::new();
+        index.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for e in &entries {
+            index.extend_from_slice(&(e.name.len() as u16).to_le_bytes());
+            index.extend_from_slice(e.name.as_bytes());
+            index.push(e.quant_type);
+            index.push(e.shape.len() as u8);
+            for &d in &e.shape {
+                index.extend_from_slice(&d.to_le_bytes());
+            }
+            index.extend_from_slice(&0u32.to_le_bytes()); // group_size
+            index.extend_from_slice(&(e.data.len() as u64).to_le_bytes());
+        }
+        let data_start = index_offset + index.len() as u64;
+        let data_offset = (data_start + 4095) & !4095;
+
         let mut tf = NamedTempFile::new().unwrap();
         let f = tf.as_file_mut();
-
-        // Header
-        f.write_all(b"HFHS").unwrap();
+        f.write_all(b"HFQM").unwrap();
         f.write_all(&1u32.to_le_bytes()).unwrap(); // version
-        f.write_all(&2u64.to_le_bytes()).unwrap(); // n_tensors
-        f.write_all(&0u64.to_le_bytes()).unwrap(); // reserved
-
-        // Tensor 1: "tA", expert_idx=0, K=2, FP32, H = [[1.0, 0.5], [0.5, 2.0]]
-        let name1 = b"tA";
-        f.write_all(&(name1.len() as u32).to_le_bytes()).unwrap();
-        f.write_all(name1).unwrap();
-        f.write_all(&0u32.to_le_bytes()).unwrap(); // expert_idx
-        f.write_all(&2u32.to_le_bytes()).unwrap(); // K
-        f.write_all(&1u32.to_le_bytes()).unwrap(); // dtype = F32
-        for v in [1.0_f32, 0.5_f32, 0.5_f32, 2.0_f32] {
-            f.write_all(&v.to_le_bytes()).unwrap();
+        f.write_all(&0u32.to_le_bytes()).unwrap(); // arch_id
+        f.write_all(&(entries.len() as u32).to_le_bytes()).unwrap();
+        f.write_all(&metadata_offset.to_le_bytes()).unwrap();
+        f.write_all(&data_offset.to_le_bytes()).unwrap();
+        f.write_all(metadata).unwrap();
+        f.write_all(&index).unwrap();
+        f.write_all(&vec![0u8; (data_offset - data_start) as usize])
+            .unwrap();
+        for e in &entries {
+            f.write_all(&e.data).unwrap();
         }
-
-        // Tensor 2: "tB", expert_idx=3, K=2, FP64, H = [[3.0, 1.0], [1.0, 4.0]]
-        let name2 = b"tB";
-        f.write_all(&(name2.len() as u32).to_le_bytes()).unwrap();
-        f.write_all(name2).unwrap();
-        f.write_all(&3u32.to_le_bytes()).unwrap(); // expert_idx
-        f.write_all(&2u32.to_le_bytes()).unwrap(); // K
-        f.write_all(&2u32.to_le_bytes()).unwrap(); // dtype = F64
-        for v in [3.0_f64, 1.0_f64, 1.0_f64, 4.0_f64] {
-            f.write_all(&v.to_le_bytes()).unwrap();
-        }
-
         tf.flush().unwrap();
         tf
     }
 
     #[test]
     fn open_and_lookup_roundtrip() {
-        let tf = make_test_sidecar();
+        let tf = make_test_package();
         let sc = HessianSidecar::open(tf.path()).unwrap();
-        assert_eq!(sc.n_tensors(), 2);
+        // Only the `.hessian` tensor is indexed; `.imatrix` is ignored.
+        assert_eq!(sc.n_tensors(), 1);
 
         let ta = sc.get("tA", 0).expect("tA missing");
         assert_eq!(ta.k, 2);
@@ -418,22 +518,16 @@ mod tests {
         assert_eq!(ta.at(1, 0), 0.5);
         assert_eq!(ta.at(1, 1), 2.0);
 
-        let tb = sc.get("tB", 3).expect("tB missing");
-        assert_eq!(tb.k, 2);
-        assert_eq!(tb.dtype, HessianDtype::F64);
-        assert_eq!(tb.at(0, 0), 3.0);
-        assert_eq!(tb.at(1, 1), 4.0);
-
-        // Wrong expert_idx → None
-        assert!(sc.get("tB", 0).is_none());
+        // The query name is the canonical name WITHOUT the `.hessian` suffix.
+        assert!(sc.get("tA.hessian", 0).is_none());
         assert!(sc.get("not_there", 0).is_none());
     }
 
     #[test]
     fn rejects_bad_magic() {
         let mut tf = NamedTempFile::new().unwrap();
-        tf.write_all(b"XXXX\x01\x00\x00\x00").unwrap();
-        tf.write_all(&[0u8; 16]).unwrap();
+        tf.write_all(b"XXXX").unwrap();
+        tf.write_all(&[0u8; 28]).unwrap();
         tf.flush().unwrap();
         match HessianSidecar::open(tf.path()) {
             Err(HessianError::InvalidMagic(m)) => assert_eq!(&m, b"XXXX"),
@@ -444,9 +538,9 @@ mod tests {
     #[test]
     fn rejects_future_version() {
         let mut tf = NamedTempFile::new().unwrap();
-        tf.write_all(b"HFHS").unwrap();
+        tf.write_all(b"HFQM").unwrap();
         tf.write_all(&99u32.to_le_bytes()).unwrap();
-        tf.write_all(&[0u8; 16]).unwrap();
+        tf.write_all(&[0u8; 24]).unwrap();
         tf.flush().unwrap();
         match HessianSidecar::open(tf.path()) {
             Err(HessianError::UnsupportedVersion(v)) => assert_eq!(v, 99),
@@ -457,8 +551,7 @@ mod tests {
     #[test]
     fn rejects_truncated() {
         let mut tf = NamedTempFile::new().unwrap();
-        tf.write_all(b"HFHS").unwrap();
-        // Only 4 of 24 header bytes
+        tf.write_all(b"HFQM").unwrap();
         tf.flush().unwrap();
         assert!(matches!(
             HessianSidecar::open(tf.path()),
@@ -468,7 +561,7 @@ mod tests {
 
     #[test]
     fn symmetry_check_passes_on_symmetric_h() {
-        let tf = make_test_sidecar();
+        let tf = make_test_package();
         let sc = HessianSidecar::open(tf.path()).unwrap();
         let ta = sc.get("tA", 0).unwrap();
         HessianSidecar::check_symmetry(&ta, 1e-6).expect("tA is symmetric");
@@ -476,7 +569,7 @@ mod tests {
 
     #[test]
     fn psd_diagonal_check_passes_on_positive_h() {
-        let tf = make_test_sidecar();
+        let tf = make_test_package();
         let sc = HessianSidecar::open(tf.path()).unwrap();
         let ta = sc.get("tA", 0).unwrap();
         HessianSidecar::check_positive_diagonal(&ta).expect("tA has positive diagonal");

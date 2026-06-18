@@ -126,11 +126,10 @@ pub fn load_bf16_model(_gpu: &mut Gpu, model_dir: &Path) -> HipResult<TrunkBF16>
     );
 }
 
-/// Returns true if a tensor name matches the GPTQ-target whitelist that
-/// `collect_hessian` should accumulate a Hessian for. Mirrors
-/// `scripts/collect_hessian.py::is_gptq_target` so the Tier 1 binary
-/// produces a byte-compatible HFHS-v1 output with the Tier 2 Python
-/// path.
+/// Returns true if a tensor name matches the GPTQ-target whitelist that the
+/// calibration collector should accumulate a Hessian for (the `collect_artifacts`
+/// example / `hipfire collect-artifacts` / daemon `Collect` op, which write the
+/// per-tensor Hessians into the unified `.calib.hfq`).
 ///
 /// Whitelist (suffixes matched against the last `.`-separated segment):
 ///

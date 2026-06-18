@@ -1,8 +1,9 @@
 //! GPTQ column-sequential quantization for hipfire's MQ4G256 wire format.
 //!
 //! Phase A Stage B per `docs/plans/gptq.md` v2. Consumes per-tensor input
-//! Hessians from `scripts/collect_hessian.py` (read via `hessian_io::HessianSidecar`),
-//! produces MQ4G256 codewords optimized for activation-aware reconstruction.
+//! Hessians from a `.calib.hfq` (HFQM) calibration package emitted by the native
+//! collector (read via `hessian_io::HessianSidecar`), produces MQ4G256 codewords
+//! optimized for activation-aware reconstruction.
 //!
 //! ## Architecture summary
 //!

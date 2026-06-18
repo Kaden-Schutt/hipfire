@@ -353,13 +353,13 @@ impl DType {
     }
 }
 
-/// Activation-capture hook for the Tier 1 hipfire-native calibration path.
+/// Activation-capture hook for the hipfire-native calibration path.
 ///
-/// Foundation scaffold (2026-05-19) — the field on `Gpu` is set by
-/// `collect_imatrix` / `collect_hessian` (see
-/// `crates/hipfire-runtime/src/bin/`) and called from each linear-layer
-/// dispatch site to feed activations into an on-GPU reduction
-/// (per-channel `Σ act²` for imatrix, K×K outer-product for the GPTQ
+/// The field on `Gpu` is set by the calibration collector
+/// (`hipfire_runtime::calibration::CalibCollector`, driven by the
+/// `collect_artifacts` example / `hipfire collect-artifacts` / daemon `Collect`
+/// op) and called from each linear-layer dispatch site to feed activations into
+/// an on-GPU reduction (per-channel `Σ act²` for imatrix, K×K outer-product for the GPTQ
 /// Hessian).
 ///
 /// Phase 1 ships only the trait, the `Gpu::capture_handler` field, and
@@ -608,11 +608,11 @@ pub struct Gpu {
     /// so consumer cards stay on the wave32/64 hand-rolled GEMV path.
     fp16_shadow_cache: HashMap<usize, GpuTensor>,
 
-    /// Activation-capture hook for the Tier 1 hipfire-native calibration
-    /// path (foundation scaffold 2026-05-19). `None` by default — set by
-    /// `collect_imatrix` / `collect_hessian` binaries when calibration is
-    /// active. Phase 2 threads the `Some(h).capture(...)` call into each
-    /// linear-layer dispatch arm. See `ActivationCapture` trait doc above.
+    /// Activation-capture hook for the hipfire-native calibration path.
+    /// `None` by default — set by the calibration collector
+    /// (`CalibCollector`, via `collect_artifacts` / `hipfire collect-artifacts`
+    /// / the daemon `Collect` op) when calibration is active, and threaded into
+    /// each linear-layer dispatch arm. See `ActivationCapture` trait doc above.
     ///
     /// `Arc<dyn>` so the same handler can be shared across multi-GPU
     /// dispatch threads (one `Gpu` per device, all routing into a single
