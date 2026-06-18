@@ -61,6 +61,42 @@ integration + cross-model capture, flagged below.
    histogram) for the two `qwen3.5/3.6-35b-a3b` models and re-run the
    importance/KLD sweep to confirm generality.
 
+## Update (2026-06-18, loop session 2)
+
+- **Driver lib-ified** into `qwen35::collect_calibration_artifacts` (+ `CalibOpts`/
+  `CalibArtifacts`); `collect_artifacts` is now a thin CLI. The daemon op + a CLI
+  subcommand reuse this driver (no duplication).
+- **#11 cross-model VALIDATED on `qwen3.5-9b-bf16`** (dense, same hybrid arch):
+  248 hessian tensors, `diag(Σxxᵀ)==Σx²` CONSISTENT, `[4096,4096]` Hessians. The
+  collector generalizes beyond 0.8B. (Run used 16 tokens — mechanism check, not a
+  full-quality Hessian.)
+- **Scaling finding (important):** full **fp32** Hessians for a 9B = **~16 GB**
+  held in RAM (`art.tensors` is all in-memory) AND written at once — it filled the
+  63 GB RAM-backed `/tmp`. For ≥9B this does NOT scale. Mitigations, in order of
+  preference:
+  1. **Streaming writer** — write tensors to disk incrementally instead of holding
+     all of `art.tensors` in RAM (the current `write_hfqm_package_mem` takes the
+     full `&[HfqMemTensor]`). Best fix; no precision loss.
+  2. **imatrix-default, Hessian opt-in** — the imatrix (K-vector) is tiny;
+     store Hessians only for GPTQ-target tensors or on `--hessian`.
+  3. **fp16 Hessian** — halves size, but the Hessian is Cholesky-factored at quant
+     time and fp16's range/precision may hurt GPTQ quality; NOT a safe default.
+  Write big-model artifacts to a real disk path, not the RAM-backed `/tmp`.
+
+- **Daemon `Collect` op — design (review-gated, NOT done autonomously):** the daemon
+  (`hipfire-daemon/src/main.rs`, ~9k lines) dispatches via a custom JSON
+  message-parser loop (`parse_*_request` at ~8865+), not a clean `match
+  DaemonRequest`; the `DaemonRequest` enum is the *client/adapter* send-side. So a
+  `Collect` op spans: (a) a `DaemonRequest::Collect(CollectRequest)` variant
+  (`hipfire-daemon-protocol`), (b) an adapter send method
+  (`hipfire-daemon-adapter`), (c) a server-side message parser + handler in the
+  daemon loop that calls `qwen35::collect_calibration_artifacts` on the resident
+  `LoadedModel.q35_weights` (+ `q35_config`, the daemon's main `Gpu`, tokenizer),
+  writes the `.calib.hfq`, returns the path. Data plane stays daemon-internal
+  (only request + path cross JSONL). Touches the flagged-unstable daemon
+  interface ⇒ do with review. The `collect_artifacts` CLI already provides the
+  standalone (in-process, daemon-free) path.
+
 ## Perf note
 Per-token AR forward + per-token K×K outer-product is slow (~35 s / 256 tok on
 gfx1151). A full 262k-token calibration wants **batched-prefill capture** (process
