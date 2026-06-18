@@ -4523,6 +4523,179 @@ pub fn build_capture_names(weights: &Qwen35Weights) -> std::collections::HashMap
     m
 }
 
+/// Options for [`collect_calibration_artifacts`].
+pub struct CalibOpts {
+    /// Capture the lm-head top-K logits + logZ per position (KLDREF reference).
+    pub kldref: bool,
+    pub kldref_topk: usize,
+}
+
+impl Default for CalibOpts {
+    fn default() -> Self {
+        Self {
+            kldref: false,
+            kldref_topk: 64,
+        }
+    }
+}
+
+/// Result of a calibration pass: the HFQ artifact tensors + the technical
+/// metadata block (per-tensor token counts, MoE router histogram, KLDREF
+/// descriptor, artifact list). The caller adds provenance keys (source_model,
+/// corpus, n_calib_tokens) and writes the `.calib.hfq`.
+pub struct CalibArtifacts {
+    pub tensors: Vec<hipfire_runtime::hfq::HfqMemTensor>,
+    pub metadata: serde_json::Value,
+    pub max_consistency: f32,
+    pub n_hessian: usize,
+}
+
+/// Single-load calibration driver: arm the [`CalibCollector`] on the resident
+/// weights, run the engine forward over `tokens` (capturing per-tensor Hessian +
+/// imatrix, the MoE router histogram for MoE models, and optionally KLDREF), and
+/// assemble the HFQ artifact tensors + metadata. Reused by the `collect_artifacts`
+/// CLI and (Phase 5) the daemon `Collect` op. Uses f32 KV + FP32 DeltaNet state
+/// for faithful (lossless) activations. Restores `gpu.active_capture`/`capture_names`
+/// to empty on return.
+pub fn collect_calibration_artifacts(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    opts: &CalibOpts,
+) -> HipResult<CalibArtifacts> {
+    use hipfire_runtime::calibration::{logsumexp, topk_logits, CalibCollector};
+    use hipfire_runtime::hfq::HfqMemTensor;
+
+    let collector = std::sync::Arc::new(CalibCollector::new());
+    gpu.capture_names = build_capture_names(weights);
+    gpu.active_capture = Some(collector.clone());
+
+    let is_moe = config.num_experts > 0;
+    if is_moe {
+        reset_moe_router_histogram(config.num_experts, config.num_experts_per_tok);
+    }
+
+    let n_tok = tokens.len();
+    let mut kv = llama::KvCache::new_gpu(
+        gpu,
+        config.n_layers,
+        config.n_kv_heads,
+        config.head_dim,
+        n_tok + 16,
+    )?;
+    let mut dn = DeltaNetState::new(gpu, config)?;
+    let scratch = Qwen35Scratch::new(gpu, config, 64)?;
+
+    let mut kldref: Vec<(f32, Vec<(u32, f32)>)> = Vec::new();
+    for (pos, &tok) in tokens.iter().enumerate() {
+        forward_scratch(gpu, weights, config, tok, pos, &mut kv, &mut dn, &scratch)?;
+        if opts.kldref {
+            let lg = gpu.download_f32(&scratch.logits)?;
+            kldref.push((logsumexp(&lg), topk_logits(&lg, opts.kldref_topk)));
+        }
+    }
+    gpu.active_capture = None;
+    gpu.capture_names = std::collections::HashMap::new();
+
+    let f32_bytes = |v: &[f32]| -> Vec<u8> {
+        let mut b = Vec::with_capacity(v.len() * 4);
+        for &x in v {
+            b.extend_from_slice(&x.to_le_bytes());
+        }
+        b
+    };
+
+    let (mut tensors, max_consistency, token_counts) = collector.drain(gpu);
+    let n_hessian = tensors.len() / 2;
+    let mut per_tensor_tokens = serde_json::Map::new();
+    for (name, n) in &token_counts {
+        per_tensor_tokens.insert(name.clone(), serde_json::json!(n));
+    }
+    let mut artifacts = vec![serde_json::json!("hessian"), serde_json::json!("imatrix")];
+
+    // MoE router histogram (summed co-occurrence = scheduler-affinity signal).
+    let mut meta = serde_json::json!({
+        "artifact_kind": "calibration",
+        "per_tensor_tokens": serde_json::Value::Object(per_tensor_tokens),
+    });
+    if is_moe {
+        if let Some(h) = take_moe_router_histogram() {
+            let mut cooc: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+            for l in &h.per_layer {
+                for (&k, &v) in &l.cooccurrence {
+                    *cooc.entry(k).or_insert(0) += v;
+                }
+            }
+            let mut pairs: Vec<(u64, u64)> = cooc.into_iter().collect();
+            pairs.sort_by(|a, b| b.1.cmp(&a.1));
+            pairs.truncate(64);
+            let ne = h.num_experts as u64;
+            let cooc_json: Vec<serde_json::Value> = pairs
+                .iter()
+                .map(|(key, cnt)| serde_json::json!([key / ne, key % ne, cnt]))
+                .collect();
+            meta.as_object_mut().unwrap().insert(
+                "moe_router_histogram".to_string(),
+                serde_json::json!({
+                    "num_experts": h.num_experts,
+                    "k_top": h.k_top,
+                    "routed_tokens": h.routed_tokens,
+                    "routed_slots": h.routed_slots,
+                    "top1_histogram": h.top1_histogram,
+                    "topk_histogram": h.topk_histogram,
+                    "per_layer_topk": h.per_layer.iter().map(|l| serde_json::json!(l.topk_histogram)).collect::<Vec<_>>(),
+                    "top_cooccurrence": cooc_json,
+                }),
+            );
+            artifacts.push(serde_json::json!("moe_router_histogram"));
+        }
+    }
+
+    // KLDREF tensors.
+    if !kldref.is_empty() {
+        let np = kldref.len();
+        let kk = kldref[0].1.len();
+        let (mut idx_v, mut lg_v, mut lz_v) = (Vec::new(), Vec::new(), Vec::new());
+        for (logz, tk) in &kldref {
+            lz_v.push(*logz);
+            for j in 0..kk {
+                let (i, l) = tk.get(j).copied().unwrap_or((0, f32::NEG_INFINITY));
+                idx_v.push(i as f32);
+                lg_v.push(l);
+            }
+        }
+        for (nm, shape, data) in [
+            ("lm_head.kldref_idx", vec![np as u32, kk as u32], idx_v),
+            ("lm_head.kldref_logit", vec![np as u32, kk as u32], lg_v),
+            ("lm_head.kldref_logz", vec![np as u32], lz_v),
+        ] {
+            tensors.push(HfqMemTensor {
+                name: nm.to_string(),
+                quant_type: 2,
+                shape,
+                group_size: 0,
+                data: f32_bytes(&data),
+            });
+        }
+        meta.as_object_mut().unwrap().insert(
+            "kldref".to_string(),
+            serde_json::json!({ "n_positions": np, "top_k": kk }),
+        );
+        artifacts.push(serde_json::json!("kldref"));
+    }
+    meta.as_object_mut()
+        .unwrap()
+        .insert("artifacts".to_string(), serde_json::Value::Array(artifacts));
+
+    Ok(CalibArtifacts {
+        tensors,
+        metadata: meta,
+        max_consistency,
+        n_hessian,
+    })
+}
+
 pub fn load_weights(
     hfq: &mut HfqFile,
     config: &Qwen35Config,
