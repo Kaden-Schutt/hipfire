@@ -1,0 +1,210 @@
+//! P3 — train the PFlash drafter to reproduce the target's MID-layer block
+//! ranking, and measure it against the shallow-K baseline PFlash uses today.
+//!
+//! Labels and drafter scores both use the SAME production scoring
+//! (`pflash_score_forward` = full-kv_dim cosine of block_mean vs last-token K),
+//! so a win is genuinely drop-in. Listwise (ListNet top-1) loss, AdamW.
+//!
+//!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
+//!   source ./scripts/gpu-lock.sh && gpu_acquire "pflash-train"
+//!   cargo run -p hipfire-train --release --example pflash_drafter_train
+
+use hipfire_model::tokenizer::Tokenizer;
+use hipfire_train::drafter::{
+    drafter_backward, drafter_forward_train, free_drafter_acts, free_drafter_grads, Drafter,
+    DrafterConfig,
+};
+use hipfire_train::loader::load_llama_fp32;
+use hipfire_train::model::{free_model_acts, model_forward, LlamaModel};
+use hipfire_train::ops::pflash_score::pflash_score_forward;
+use hipfire_train::optim::AdamW;
+use rdna_compute::{DType, Gpu};
+use std::path::{Path, PathBuf};
+
+const HF: &str = "/srv/huggingface";
+const TARGET: &str = "models--meta-llama--Llama-3.2-3B-Instruct";
+const SEQ: usize = 512;
+const BLOCK: usize = 64;
+const SHALLOW: usize = 1;
+const N_TRAIN: usize = 12;
+const N_EVAL: usize = 4;
+const EPOCHS: usize = 300;
+const TAU: f32 = 0.1;
+
+fn snapshot_dir(repo: &str) -> Option<PathBuf> {
+    let snaps = Path::new(HF).join(repo).join("snapshots");
+    std::fs::read_dir(&snaps).ok()?.flatten().map(|e| e.path()).find(|p| p.is_dir())
+}
+
+fn corpus_tokens(tok: &Tokenizer) -> Vec<u32> {
+    let mut stack = vec![PathBuf::from("docs"), PathBuf::from("crates")];
+    let mut text = String::new();
+    while let Some(d) = stack.pop() {
+        if let Ok(rd) = std::fs::read_dir(&d) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().map_or(false, |x| x == "md" || x == "rs") {
+                    if let Ok(t) = std::fs::read_to_string(&p) {
+                        text.push_str(&t);
+                        text.push('\n');
+                    }
+                }
+                if text.len() > 2_000_000 {
+                    break;
+                }
+            }
+        }
+    }
+    tok.encode(&text)
+}
+
+fn rank(a: &[f32]) -> Vec<f32> {
+    let mut idx: Vec<usize> = (0..a.len()).collect();
+    idx.sort_by(|&i, &j| a[i].partial_cmp(&a[j]).unwrap());
+    let mut r = vec![0.0f32; a.len()];
+    for (pos, &i) in idx.iter().enumerate() {
+        r[i] = pos as f32;
+    }
+    r
+}
+fn pearson(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len() as f64;
+    let (ma, mb) = (a.iter().sum::<f32>() as f64 / n, b.iter().sum::<f32>() as f64 / n);
+    let (mut c, mut va, mut vb) = (0.0, 0.0, 0.0);
+    for i in 0..a.len() {
+        let (da, db) = (a[i] as f64 - ma, b[i] as f64 - mb);
+        c += da * db; va += da * da; vb += db * db;
+    }
+    if va == 0.0 || vb == 0.0 { 0.0 } else { (c / (va.sqrt() * vb.sqrt())) as f32 }
+}
+fn spearman(a: &[f32], b: &[f32]) -> f32 { pearson(&rank(a), &rank(b)) }
+
+fn softmax_t(x: &[f32], tau: f32) -> Vec<f32> {
+    let m = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let e: Vec<f32> = x.iter().map(|&v| ((v - m) / tau).exp()).collect();
+    let z: f32 = e.iter().sum();
+    e.into_iter().map(|v| v / z).collect()
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut gpu = Gpu::init().expect("Gpu::init failed");
+    let nb = SEQ / BLOCK;
+    let last = SEQ - 1;
+    println!("arch: {}  SEQ={SEQ} BLOCK={BLOCK} blocks={nb} train={N_TRAIN} eval={N_EVAL}", gpu.arch);
+
+    let dir = snapshot_dir(TARGET).ok_or("target not found")?;
+    let tok = Tokenizer::from_hf_json(&std::fs::read_to_string(dir.join("tokenizer.json"))?)
+        .map_err(|e| format!("tok: {e:?}"))?;
+    let toks = corpus_tokens(&tok);
+    let n_chunks = N_TRAIN + N_EVAL;
+    if toks.len() < n_chunks * SEQ {
+        return Err(format!("corpus too small: {} toks < {}", toks.len(), n_chunks * SEQ).into());
+    }
+    let chunks: Vec<Vec<u32>> =
+        (0..n_chunks).map(|i| toks[i * SEQ..(i + 1) * SEQ].to_vec()).collect();
+    let pos: Vec<f32> = (0..SEQ).map(|t| t as f32).collect();
+
+    // ── P1: capture target mid-layer labels + shallow baseline per chunk ──────
+    let (cfg, w) = load_llama_fp32(&mut gpu, &dir)?;
+    let (n_kv_t, hd_t, h_t, vocab) =
+        (cfg.num_key_value_heads, cfg.head_dim, cfg.hidden_size, cfg.vocab_size);
+    let kvd_t = n_kv_t * hd_t;
+    let (rope_base, eps, n_layers) = (cfg.rope_theta, cfg.rms_norm_eps, cfg.num_hidden_layers);
+    let mid = n_layers / 2;
+    let mut target = LlamaModel::from_f32_weights(&mut gpu, &cfg, w, SEQ, 4, 8.0)?;
+    let max_id = chunks.iter().flatten().copied().max().unwrap_or(0);
+    println!("target {TARGET}: h_t={h_t} layers={n_layers} mid=L{mid} vocab={vocab} max_tok_id={max_id}");
+    assert!((max_id as usize) < vocab, "token id {max_id} ≥ vocab {vocab} → OOB embedding read");
+    println!("capturing labels…");
+
+    let scores_dev = gpu.zeros(&[nb], DType::F32)?;
+    let mut label_mid: Vec<Vec<f32>> = Vec::new();
+    let mut base_shallow: Vec<Vec<f32>> = Vec::new();
+    for ids in &chunks {
+        let acts = model_forward(&mut gpu, &target, ids, &pos)?;
+        pflash_score_forward(&mut gpu, &acts.layer_acts[mid].k_r, &scores_dev, SEQ, kvd_t, BLOCK, nb, last)?;
+        label_mid.push(gpu.download_f32(&scores_dev)?);
+        pflash_score_forward(&mut gpu, &acts.layer_acts[SHALLOW].k_r, &scores_dev, SEQ, kvd_t, BLOCK, nb, last)?;
+        base_shallow.push(gpu.download_f32(&scores_dev)?);
+        free_model_acts(&mut gpu, acts)?;
+    }
+    // shallow baseline vs mid label (the bar to beat), eval split
+    let bar: f32 = (N_TRAIN..n_chunks)
+        .map(|i| spearman(&base_shallow[i], &label_mid[i]))
+        .sum::<f32>() / N_EVAL as f32;
+
+    // move the embedding into the drafter (target not used again)
+    let embed = std::mem::replace(&mut target.embed, gpu.zeros(&[1], DType::F32)?);
+
+    // ── P2/P3: drafter + training ─────────────────────────────────────────────
+    let dcfg = DrafterConfig::tiny(rope_base, eps);
+    let kvd_d = dcfg.kv_dim();
+    let drafter = Drafter::new(&mut gpu, embed, h_t, vocab, dcfg, SEQ)?;
+    let sizes = drafter.param_sizes();
+    let nparams: usize = sizes.iter().sum();
+    let mut opt = AdamW::new(&mut gpu, &sizes, 1e-3, 0.9, 0.999, 1e-8, 0.0)?;
+    println!(
+        "drafter: h={} layers={} kv={}×{}  params={} ({:.2}M)\n",
+        dcfg.h_draft, dcfg.n_layers, dcfg.n_kv, dcfg.head_dim, sizes.len(), nparams as f32 / 1e6
+    );
+
+    let eval = |gpu: &mut Gpu, d: &Drafter| -> f32 {
+        let sc = gpu.zeros(&[nb], DType::F32).unwrap();
+        let mut s = 0.0;
+        for i in N_TRAIN..n_chunks {
+            let a = drafter_forward_train(gpu, d, &chunks[i], &pos).unwrap();
+            pflash_score_forward(gpu, &a.score_k, &sc, SEQ, kvd_d, BLOCK, nb, last).unwrap();
+            let pred = gpu.download_f32(&sc).unwrap();
+            s += spearman(&pred, &label_mid[i]);
+            free_drafter_acts(gpu, a).unwrap();
+        }
+        s / N_EVAL as f32
+    };
+
+    println!("  bar  Spearman(shallow, mid) [eval] = {bar:+.3}  ← drafter must beat this");
+    println!("  init Spearman(drafter, mid) [eval] = {:+.3}\n", eval(&mut gpu, &drafter));
+
+    for ep in 0..EPOCHS {
+        let mut ep_loss = 0.0f32;
+        for i in 0..N_TRAIN {
+            let acts = drafter_forward_train(&mut gpu, &drafter, &chunks[i], &pos)?;
+            pflash_score_forward(&mut gpu, &acts.score_k, &scores_dev, SEQ, kvd_d, BLOCK, nb, last)?;
+            let pred = gpu.download_f32(&scores_dev)?;
+            // ListNet top-1: L = -Σ p_label log p_pred ; dL/dpred = (p_pred - p_label)/τ
+            let pl = softmax_t(&label_mid[i], TAU);
+            let pp = softmax_t(&pred, TAU);
+            let mut ds = vec![0.0f32; nb];
+            let mut l = 0.0f32;
+            for b in 0..nb {
+                l -= pl[b] * pp[b].max(1e-12).ln();
+                ds[b] = (pp[b] - pl[b]) / TAU;
+            }
+            ep_loss += l;
+            let dscores = gpu.upload_f32(&ds, &[nb])?;
+            let grads = drafter_backward(&mut gpu, &drafter, &acts, &dscores, BLOCK, nb, last)?;
+            opt.step(&mut gpu, &drafter.params(), &grads.flat())?;
+            free_drafter_acts(&mut gpu, acts)?;
+            free_drafter_grads(&mut gpu, grads)?;
+            gpu.free_tensor(dscores)?;
+        }
+        if ep % 30 == 0 || ep == EPOCHS - 1 {
+            println!(
+                "  ep {ep:>3}  train_loss {:.4}  eval Spearman(drafter,mid) {:+.3}",
+                ep_loss / N_TRAIN as f32, eval(&mut gpu, &drafter)
+            );
+        }
+    }
+
+    let final_corr = eval(&mut gpu, &drafter);
+    println!("\n── P3 result ──");
+    println!("  shallow bar : {bar:+.3}");
+    println!("  drafter     : {final_corr:+.3}");
+    if final_corr > bar {
+        println!("  ✓ drafter BEATS the shallow baseline at tracking the mid-layer ranking");
+    } else {
+        println!("  ✗ drafter did not beat the shallow baseline (yet) — tune depth/τ/lr/epochs");
+    }
+    Ok(())
+}

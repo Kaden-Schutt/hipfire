@@ -229,6 +229,41 @@ impl DrafterGrads {
     }
 }
 
+/// Return a forward's saved activations to the pool (no Drop on GpuTensor).
+pub fn free_drafter_acts(gpu: &mut Gpu, a: DrafterActs) -> HipResult<()> {
+    let DrafterActs { emb, layer_inputs, layer_acts, x_last, xn_out, rinv_out, score_k, pos } = a;
+    for t in layer_inputs {
+        gpu.free_tensor(t)?;
+    }
+    for b in layer_acts {
+        let BlockActivations {
+            xn1, rinv1, hq, hv, q_r, k_r, v, p_all, ctx, x_mid, xn2, rinv2, gate, up, act, pos,
+        } = b;
+        for t in [xn1, rinv1, hq, hv, q_r, k_r, v, p_all, ctx, x_mid, xn2, rinv2, gate, up, act, pos] {
+            gpu.free_tensor(t)?;
+        }
+    }
+    for t in [emb, x_last, xn_out, rinv_out, score_k, pos] {
+        gpu.free_tensor(t)?;
+    }
+    Ok(())
+}
+
+/// Return a backward's grads to the pool after the optimizer step.
+pub fn free_drafter_grads(gpu: &mut Gpu, g: DrafterGrads) -> HipResult<()> {
+    let DrafterGrads { d_in_proj, layers, d_out_norm, d_wk_score } = g;
+    gpu.free_tensor(d_in_proj)?;
+    for (wg, dn1, dn2) in layers {
+        let BlockWeightGrad { dwq, dwk, dwv, dwo, dwgate, dwup, dwdown } = wg;
+        for t in [dwq, dwk, dwv, dwo, dwgate, dwup, dwdown, dn1, dn2] {
+            gpu.free_tensor(t)?;
+        }
+    }
+    gpu.free_tensor(d_out_norm)?;
+    gpu.free_tensor(d_wk_score)?;
+    Ok(())
+}
+
 fn block_views<'a>(lw: &'a LayerWeights, ll: &'a LayerLora) -> (BlockWeights<'a>, BlockLora<'a>) {
     (
         BlockWeights {
@@ -307,6 +342,8 @@ pub fn drafter_backward(
     linear_backward_w(gpu, &d_ks, &acts.xn_out, &d_wk_score, seq, hd, kvd, false)?;
     let d_xn_out = gpu.zeros(&[seq * hd], DType::F32)?;
     linear_backward_x(gpu, &d_ks, &d.wk_score, &d_xn_out, seq, hd, kvd, false)?;
+    gpu.free_tensor(d_score_k)?;
+    gpu.free_tensor(d_ks)?;
 
     // out_norm backward → d(x_last)
     let d_x_last = gpu.zeros(&[seq * hd], DType::F32)?;
@@ -314,6 +351,7 @@ pub fn drafter_backward(
     rmsnorm_backward(
         gpu, &d_xn_out, &acts.x_last, &d.out_norm, &acts.rinv_out, &d_x_last, &d_out_norm, seq, hd,
     )?;
+    gpu.free_tensor(d_xn_out)?;
 
     // blocks in reverse (full base grads)
     let mut layer_grads: Vec<(BlockWeightGrad, GpuTensor, GpuTensor)> =
@@ -324,7 +362,13 @@ pub fn drafter_backward(
         let (bw, bl) = block_views(lw, ll);
         let (d_in, lora_g, wg) =
             block_backward_full(gpu, &d_x, &acts.layer_inputs[i], &bw, &bl, &acts.layer_acts[i], &d.dims)?;
-        layer_grads.push((wg, lora_g.dnorm1, lora_g.dnorm2));
+        gpu.free_tensor(d_x)?; // consumed; free before reassigning
+        // we only train norms (dnorm1/dnorm2); LoRA grads are unused → free.
+        let crate::block::BlockLoraGrad { daq, dbq, dav, dbv, dnorm1, dnorm2 } = lora_g;
+        for t in [daq, dbq, dav, dbv] {
+            gpu.free_tensor(t)?;
+        }
+        layer_grads.push((wg, dnorm1, dnorm2));
         d_x = d_in;
     }
     layer_grads.reverse();
@@ -332,6 +376,7 @@ pub fn drafter_backward(
     // in_proj backward: d_x is grad w.r.t. in_proj output [seq*hd]; embed frozen.
     let d_in_proj = gpu.zeros(&[hd * h_t], DType::F32)?;
     linear_backward_w(gpu, &d_x, &acts.emb, &d_in_proj, seq, h_t, hd, false)?;
+    gpu.free_tensor(d_x)?;
 
     Ok(DrafterGrads { d_in_proj, layers: layer_grads, d_out_norm, d_wk_score })
 }

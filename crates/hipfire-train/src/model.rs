@@ -262,6 +262,28 @@ pub struct ModelActivations {
     pub logits: GpuTensor, // [seq, vocab]
 }
 
+/// Return a forward's activations to the pool — GpuTensor has no Drop, so a loop
+/// of `model_forward` calls (e.g. capturing labels over a corpus) climbs ~2 GB/
+/// forward and OOMs without this.
+pub fn free_model_acts(gpu: &mut Gpu, a: ModelActivations) -> HipResult<()> {
+    let ModelActivations { layer_inputs, layer_acts, x_last, rinv_final, xf, logits } = a;
+    for t in layer_inputs {
+        gpu.free_tensor(t)?;
+    }
+    for b in layer_acts {
+        let BlockActivations {
+            xn1, rinv1, hq, hv, q_r, k_r, v, p_all, ctx, x_mid, xn2, rinv2, gate, up, act, pos,
+        } = b;
+        for t in [xn1, rinv1, hq, hv, q_r, k_r, v, p_all, ctx, x_mid, xn2, rinv2, gate, up, act, pos] {
+            gpu.free_tensor(t)?;
+        }
+    }
+    for t in [x_last, rinv_final, xf, logits] {
+        gpu.free_tensor(t)?;
+    }
+    Ok(())
+}
+
 /// Partial forward: embed + blocks `0..=up_to`, returning each block's saved
 /// activations (incl. `k_r`, the post-rope K). Skips the final norm + logit GEMM
 /// — cheap when you only need intermediate K (e.g. PFlash-style shallow-layer

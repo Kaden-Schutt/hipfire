@@ -474,6 +474,16 @@ fn block_backward_inner(
         None
     };
 
+    // Return internal temporaries to the pool — GpuTensor has no Drop, so without
+    // this the per-step training graph climbs ~50 MB/layer and OOMs. Only the
+    // returned grads (d_x, BlockLoraGrad, BlockWeightGrad) survive.
+    for t in [
+        d_act, d_gate, d_up, d_xn2, d_x_mid, d_xmid_norm, d_ctx, d_q_r, d_k_r, d_v, d_q, d_k,
+        d_xn1, d_x_norm, dyl_q, dh_q, dyl_v, dh_v,
+    ] {
+        gpu.free_tensor(t)?;
+    }
+
     Ok((
         d_x,
         BlockLoraGrad {
