@@ -26,7 +26,9 @@ use std::path::{Path, PathBuf};
 
 const LABELS_PATH: &str = "target/pflash_labels.bin";
 const CKPT_PATH: &str = "target/pflash_drafter_ckpt.bin";
+const CKPT_BEST_PATH: &str = "target/pflash_drafter_best.bin";
 const CKPT_EVERY: usize = 30;
+const EVAL_EVERY: usize = 15;
 
 fn env_usize(k: &str, d: usize) -> usize {
     std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
@@ -185,9 +187,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let epochs = env_usize("HIPFIRE_PFLASH_EPOCHS", EPOCHS);
     let tau = env_f32("HIPFIRE_PFLASH_TAU", TAU);
     let lr = env_f32("HIPFIRE_PFLASH_LR", 1e-3);
-    let mut opt = AdamW::new(&mut gpu, &sizes, lr, 0.9, 0.999, 1e-8, 0.0)?;
+    let wd = env_f32("HIPFIRE_PFLASH_WD", 0.0);
+    let mut opt = AdamW::new(&mut gpu, &sizes, lr, 0.9, 0.999, 1e-8, wd)?;
     println!(
-        "drafter: h={} layers={} kv={}×{}  params={} ({:.2}M)  epochs={epochs} tau={tau} lr={lr}",
+        "drafter: h={} layers={} kv={}×{}  params={} ({:.2}M)  epochs={epochs} tau={tau} lr={lr} wd={wd}",
         dcfg.h_draft, dcfg.n_layers, dcfg.n_kv, dcfg.head_dim, sizes.len(), nparams as f32 / 1e6
     );
 
@@ -222,6 +225,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  bar  Spearman(shallow, mid) [eval] = {bar:+.3}  ← drafter must beat this");
     println!("  init Spearman(drafter, mid) [eval] = {:+.3}\n", eval(&mut gpu, &drafter));
 
+    // best-eval checkpointing: the drafter overfits past its peak, so keep the
+    // best-generalizing weights rather than the final (decayed) ones.
+    let mut best_corr = f32::NEG_INFINITY;
+    let mut best_ep = start_ep;
     for ep in start_ep..epochs {
         let mut ep_loss = 0.0f32;
         for i in 0..N_TRAIN {
@@ -245,11 +252,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             free_drafter_grads(&mut gpu, grads)?;
             gpu.free_tensor(dscores)?;
         }
-        if ep % 30 == 0 || ep == epochs - 1 {
-            println!(
-                "  ep {ep:>3}  train_loss {:.4}  eval Spearman(drafter,mid) {:+.3}",
-                ep_loss / N_TRAIN as f32, eval(&mut gpu, &drafter)
-            );
+        if ep % EVAL_EVERY == 0 || ep == epochs - 1 {
+            let corr = eval(&mut gpu, &drafter);
+            if corr > best_corr {
+                best_corr = corr;
+                best_ep = ep;
+                save_drafter(&mut gpu, CKPT_BEST_PATH, &drafter, &opt, ep as u32)?;
+            }
+            if ep % 30 == 0 || ep == epochs - 1 {
+                println!(
+                    "  ep {ep:>3}  train_loss {:.4}  eval {:+.3}  (best {:+.3} @ ep {})",
+                    ep_loss / N_TRAIN as f32, corr, best_corr, best_ep
+                );
+            }
         }
         // checkpoint periodically + on the last epoch (epoch+1 = next to run)
         if (ep + 1) % CKPT_EVERY == 0 || ep == epochs - 1 {
@@ -257,14 +272,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let final_corr = eval(&mut gpu, &drafter);
     println!("\n── P3 result ──");
-    println!("  shallow bar : {bar:+.3}");
-    println!("  drafter     : {final_corr:+.3}");
-    if final_corr > bar {
-        println!("  ✓ drafter BEATS the shallow baseline at tracking the mid-layer ranking");
+    println!("  shallow bar  : {bar:+.3}");
+    println!("  drafter final: {:+.3}", eval(&mut gpu, &drafter));
+    println!("  drafter BEST : {best_corr:+.3} @ ep {best_ep}  → {CKPT_BEST_PATH}");
+    if best_corr > bar {
+        println!("  ✓ drafter BEATS the shallow baseline (best-eval checkpoint)");
     } else {
-        println!("  ✗ drafter did not beat the shallow baseline (yet) — tune depth/τ/lr/epochs");
+        println!("  ✗ best did not beat the shallow baseline — tune wd/τ/lr/data");
     }
     Ok(())
 }
