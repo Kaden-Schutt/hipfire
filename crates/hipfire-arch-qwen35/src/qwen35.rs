@@ -4488,6 +4488,32 @@ fn rq_apply_writer(
 /// pointer through this map to attribute captured activations. No loader change —
 /// walks the typed `Qwen35Weights`. Set `gpu.capture_names` to this before arming
 /// `gpu.active_capture`.
+/// Map the MoE FFN weight buffers → canonical names. The router + shared
+/// expert are dense (full Hessian); the routed experts are named only when
+/// resident (`experts` populated) and the names contain `.experts.` so the
+/// collector keeps them imatrix-only (full per-expert Hessians don't fit).
+/// Names mirror the checkpoint tensor names so the quantizer can match
+/// imatrix → weight.
+fn put_moe_ffn(put: &mut impl FnMut(&WeightTensor, String), p: &str, ffn: &MoeFfnWeights) {
+    put(&ffn.router, format!("{p}.mlp.gate"));
+    put(
+        &ffn.shared_expert.gate,
+        format!("{p}.mlp.shared_expert.gate_proj"),
+    );
+    put(
+        &ffn.shared_expert.up,
+        format!("{p}.mlp.shared_expert.up_proj"),
+    );
+    put(
+        &ffn.shared_expert.down,
+        format!("{p}.mlp.shared_expert.down_proj"),
+    );
+    for (x, e) in ffn.experts.iter().enumerate() {
+        put(&e.gate_up, format!("{p}.mlp.experts.{x}.gate_up_proj"));
+        put(&e.down, format!("{p}.mlp.experts.{x}.down_proj"));
+    }
+}
+
 pub fn build_capture_names(weights: &Qwen35Weights) -> std::collections::HashMap<usize, String> {
     let mut m = std::collections::HashMap::new();
     let mut put = |wt: &WeightTensor, name: String| {
@@ -4515,9 +4541,29 @@ pub fn build_capture_names(weights: &Qwen35Weights) -> std::collections::HashMap
                 put(&l.w_up, format!("{p}.mlp.up_proj"));
                 put(&l.w_down, format!("{p}.mlp.down_proj"));
             }
-            // MoE variants: dense attn weights + per-expert FFN; experts are
-            // paged/aliased, so calibration of MoE FFN is a later extension.
-            LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => {}
+            // MoE variants: the dense attention projections + router + shared
+            // expert flow through the same gemm chokepoint as the dense layers,
+            // so they get full Hessians. The routed experts go through the
+            // indexed-MoE GEMV kernels and are imatrix-only (full per-expert
+            // Hessians don't fit — see CalibCollector). Routed-expert names are
+            // only emitted when the experts are resident (`experts` populated);
+            // in paged mode the buffers are owned by the WeightPager and the
+            // ptrs are patched per-token, so capture-by-buf-ptr can't key them.
+            LayerWeights::DeltaNetMoe(l) => {
+                put(&l.wqkv, format!("{p}.linear_attn.in_proj_qkv"));
+                put(&l.wz, format!("{p}.linear_attn.in_proj_z"));
+                put(&l.w_alpha, format!("{p}.linear_attn.in_proj_a"));
+                put(&l.w_beta, format!("{p}.linear_attn.in_proj_b"));
+                put(&l.wo, format!("{p}.linear_attn.out_proj"));
+                put_moe_ffn(&mut put, &p, &l.ffn);
+            }
+            LayerWeights::FullAttnMoe(l) => {
+                put(&l.wq, format!("{p}.self_attn.q_proj"));
+                put(&l.wk, format!("{p}.self_attn.k_proj"));
+                put(&l.wv, format!("{p}.self_attn.v_proj"));
+                put(&l.wo, format!("{p}.self_attn.o_proj"));
+                put_moe_ffn(&mut put, &p, &l.ffn);
+            }
         }
     }
     m
@@ -4567,7 +4613,13 @@ pub fn collect_calibration_artifacts(
     use hipfire_runtime::calibration::{logsumexp, topk_logits, CalibCollector};
     use hipfire_runtime::hfq::HfqMemTensor;
 
-    let collector = std::sync::Arc::new(CalibCollector::new());
+    // Routed MoE experts are imatrix-only: a full per-expert Hessian
+    // (num_experts × n_layers × [K,K]) does not fit (~196 GB for A3B), but the
+    // imatrix is ~100 MB and is the importance signal quant needs. Dense
+    // projections (attention + router + shared expert) keep full Hessians.
+    let collector = std::sync::Arc::new(CalibCollector::with_imatrix_only(vec![
+        ".experts.".to_string()
+    ]));
     gpu.capture_names = build_capture_names(weights);
     gpu.active_capture = Some(collector.clone());
 
@@ -4607,7 +4659,16 @@ pub fn collect_calibration_artifacts(
     };
 
     let (mut tensors, max_consistency, token_counts) = collector.drain(gpu);
-    let n_hessian = tensors.len() / 2;
+    // Dense projections emit `.hessian` + `.imatrix`; imatrix-only tensors (MoE
+    // routed experts) emit just `.imatrix`, so count `.hessian` directly.
+    let n_hessian = tensors
+        .iter()
+        .filter(|t| t.name.ends_with(".hessian"))
+        .count();
+    let n_imatrix = tensors
+        .iter()
+        .filter(|t| t.name.ends_with(".imatrix"))
+        .count();
     let mut per_tensor_tokens = serde_json::Map::new();
     for (name, n) in &token_counts {
         per_tensor_tokens.insert(name.clone(), serde_json::json!(n));
@@ -4617,6 +4678,8 @@ pub fn collect_calibration_artifacts(
     // MoE router histogram (summed co-occurrence = scheduler-affinity signal).
     let mut meta = serde_json::json!({
         "artifact_kind": "calibration",
+        "n_hessian": n_hessian,
+        "n_imatrix": n_imatrix,
         "per_tensor_tokens": serde_json::Value::Object(per_tensor_tokens),
     });
     if is_moe {

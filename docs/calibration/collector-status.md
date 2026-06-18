@@ -52,11 +52,11 @@ integration + cross-model capture, flagged below.
    Wire the per-session histogram (esp. the co-occurrence pairs) into the
    scheduler's expert-affinity grouping so the paged-expert (`WeightPager`) path
    sees fewer page-ins. Scheduler hot-path — do with review.
-4. **MoE-expert capture for A3B Hessians** — `build_capture_names` currently skips
-   the MoE layer variants (`DeltaNetMoe`/`FullAttnMoe` → empty), so an A3B calib
-   run captures only the router histogram, not the per-expert Hessians (the
-   experts are paged/aliased, dynamic ptrs). Extending capture to paged experts
-   is non-trivial new design.
+4. **MoE-expert capture for A3B Hessians** — CAPTURE SIDE DONE (loop session 3,
+   see Update below): `build_capture_names` maps MoE dense projections (full
+   Hessian) + resident routed experts (imatrix-only). BLOCKED on E2E by the bf16
+   A3B MoE forward gap (also below). Paged-mode experts still uncovered (buffers
+   owned by the WeightPager, ptrs patched per-token — needs pager-side capture).
 5. **#11 cross-model** — once (4) lands, generate full `.calib.hfq` (Hessian +
    histogram) for the two `qwen3.5/3.6-35b-a3b` models and re-run the
    importance/KLD sweep to confirm generality.
@@ -102,3 +102,47 @@ Per-token AR forward + per-token K×K outer-product is slow (~35 s / 256 tok on
 gfx1151). A full 262k-token calibration wants **batched-prefill capture** (process
 many tokens per forward, batch the outer-product) — the throughput follow-up.
 Always state the box for perf numbers (gfx1151/Strix Halo here).
+
+## Update (2026-06-18, loop session 3)
+
+- **Buffer-and-flush capture landed (perf).** `CalibCollector` now stages
+  activation rows into a `[FLUSH_BATCH=256, K]` buffer and runs a SINGLE batched
+  `calib_hessian_outer_f32` / `calib_sumsq_reduce_f32` per 256 rows (the tiled
+  GEMM is built for N≥16, so per-token N=1 wasted ~256×). Verified on
+  `qwen3.5-0.8b-bf16` (gfx1151): 186 hessians, `diag(Σxxᵀ)==Σx²` CONSISTENT,
+  **4.5–7.8 s** vs the prior ~35 s/256-tok. Commit 6084ade2.
+
+- **MoE-expert capture (A3B) — capture side built + verified-by-construction.**
+  `build_capture_names` now maps the MoE-layer dense projections (attention
+  q/k/v/o or qkv/z/a/b/o, the router `mlp.gate`, and the shared expert
+  gate/up/down) → **full Hessian** (same gemm chokepoint as the dense layers),
+  and the resident routed experts (`mlp.experts.{x}.{gate_up,down}_proj`) →
+  **imatrix-only**. The collector gained `CalibCollector::with_imatrix_only(substr)`:
+  tensors whose name contains a substring (here `".experts."`) accumulate only
+  Σx² (no [K,K] Hessian alloc / outer-product). Rationale: a full per-expert
+  Hessian for A3B is **256 experts × 40 layers × [K,K] ≈ 196 GB** — does not fit
+  on-GPU; the imatrix is a K-vector (~100 MB total) and is the importance signal
+  AWQ-style quant needs. Dense path re-verified unchanged (0.8B: 186 hessians,
+  CONSISTENT). Routed-expert names are emitted only when experts are **resident**
+  (`HIPFIRE_QWEN35_PAGED_EXPERTS` unset = the default; paged mode owns buffers in
+  the WeightPager and patches ptrs per-token, so capture-by-buf-ptr can't key them).
+
+- **BLOCKER — bf16 A3B forward is unsupported (orthogonal to capture).** E2E
+  verification on `qwen3.6-35b-a3b-bf16` (the calib SOURCE) loads fully (40
+  layers, 64.56 GiB on gfx1151) but the FIRST forward token fails:
+  `HIP error: unsupported gemv.unknown for /`. Root: `KernelKey::for_gemv(dtype,
+  Plain)` (`hipfire-dispatch/src/types.rs:561`) has **no `(BF16, Plain)` entry**,
+  so it returns `UnsupportedVariant{family:"gemv", variant:"unknown", arch:"",
+  quant:""}` (→ "gemv.unknown for /"). `weight_gemv` short-circuits BF16 to
+  `gemm_bf16_x_bf16_wmma` (`llama.rs:780`), but a MoE-path `gemv_family.run_auto`
+  call reaches `for_gemv` with a bf16 weight WITHOUT that short-circuit. The dense
+  hybrid `qwen3.5-0.8b-bf16` (same DeltaNet+FullAttn arch) calibrates fine, so the
+  gap is isolated to the **MoE FFN bf16 dispatch** (never exercised before — bf16
+  MoE source models are normally quantized, not inferred). **Next step (cheap, but
+  do with a coherence gate on a WORKING mq4 MoE model, not blind):** get a
+  debug-build backtrace / add an eprintln at the `for_gemv` `_ =>` arm to name the
+  exact call site, then either short-circuit BF16 → `gemm_bf16_x_bf16_wmma` at that
+  site or add a `(BF16, Plain)` gemv entry. Until then, A3B calibration must run
+  against a model whose MoE FFN forward is supported (e.g. an mq* variant) — but
+  capture only fires at the BF16/F16 chokepoints, so a faithful A3B Hessian needs
+  the bf16 MoE forward fixed first.

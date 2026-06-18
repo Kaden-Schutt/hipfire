@@ -26,38 +26,63 @@ const FLUSH_BATCH: usize = 256;
 
 /// Per-tensor on-GPU accumulators + a small activation row buffer.
 struct Acc {
-    diag: GpuTensor, // [K]   Σx²  (imatrix)
-    h: GpuTensor,    // [K,K] Σxxᵀ (Hessian)
-    buf: GpuTensor,  // [FLUSH_BATCH, K] staged activation rows
-    buf_rows: usize, // rows currently staged in `buf`
+    diag: GpuTensor,      // [K]   Σx²  (imatrix)
+    h: Option<GpuTensor>, // [K,K] Σxxᵀ (Hessian); `None` = imatrix-only tensor
+    buf: GpuTensor,       // [FLUSH_BATCH, K] staged activation rows
+    buf_rows: usize,      // rows currently staged in `buf`
     k: usize,
     n_tokens: u64,
 }
 
 impl Acc {
     /// Reduce the staged rows into the accumulators (one batched launch each),
-    /// then reset the buffer. No-op when empty.
+    /// then reset the buffer. No-op when empty. Imatrix-only tensors (`h` is
+    /// `None`) skip the [K,K] outer-product — this is how MoE routed experts
+    /// are captured: a full per-expert Hessian (256 experts × ~48 layers ×
+    /// [K,K]) is ~196 GB and does not fit, but the imatrix (Σx², a K-vector)
+    /// is ~100 MB and is the importance signal AWQ-style quant needs.
     fn flush(&mut self, gpu: &mut Gpu) {
         if self.buf_rows == 0 {
             return;
         }
         gpu.calib_sumsq_reduce_f32(&self.buf, &self.diag, self.buf_rows, self.k)
             .unwrap();
-        gpu.calib_hessian_outer_f32(&self.buf, &self.h, self.buf_rows, self.k)
-            .unwrap();
+        if let Some(h) = &self.h {
+            gpu.calib_hessian_outer_f32(&self.buf, h, self.buf_rows, self.k)
+                .unwrap();
+        }
         self.buf_rows = 0;
     }
 }
 
 /// Unified Hessian + imatrix collector. Arm via `gpu.active_capture`.
+///
+/// By default every captured tensor accumulates a full [K,K] Hessian. Tensors
+/// whose canonical name contains any of `imatrix_only_substr` accumulate only
+/// the imatrix (Σx²); used for MoE routed experts whose full Hessians do not
+/// fit in memory (see [`Acc::flush`]).
 #[derive(Default)]
 pub struct CalibCollector {
     accs: Mutex<HashMap<String, Acc>>,
+    imatrix_only_substr: Vec<String>,
 }
 
 impl CalibCollector {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Collector that stores imatrix-only (no [K,K] Hessian) for any tensor
+    /// whose name contains one of `substr` (e.g. `".experts."` for MoE).
+    pub fn with_imatrix_only(substr: Vec<String>) -> Self {
+        Self {
+            accs: Mutex::new(HashMap::new()),
+            imatrix_only_substr: substr,
+        }
+    }
+
+    fn wants_hessian(&self, name: &str) -> bool {
+        !self.imatrix_only_substr.iter().any(|s| name.contains(s))
     }
 
     /// Number of distinct tensors captured so far.
@@ -94,21 +119,25 @@ impl CalibCollector {
         for name in &names {
             let acc = &accs[*name];
             let diag = gpu.download_f32(&acc.diag).expect("download imatrix");
-            let h = gpu.download_f32(&acc.h).expect("download hessian");
-            for c in 0..acc.k {
-                let rel = (h[c * acc.k + c] - diag[c]).abs() / diag[c].abs().max(1.0);
-                max_consistency = max_consistency.max(rel);
-            }
             let inv = 1.0 / acc.n_tokens.max(1) as f32;
-            let hessian: Vec<f32> = h.iter().map(|v| v * inv).collect();
+            // Full Hessian (dense projections). Imatrix-only tensors (MoE
+            // routed experts) skip this and emit only `.imatrix`.
+            if let Some(h_t) = &acc.h {
+                let h = gpu.download_f32(h_t).expect("download hessian");
+                for c in 0..acc.k {
+                    let rel = (h[c * acc.k + c] - diag[c]).abs() / diag[c].abs().max(1.0);
+                    max_consistency = max_consistency.max(rel);
+                }
+                let hessian: Vec<f32> = h.iter().map(|v| v * inv).collect();
+                tensors.push(HfqMemTensor {
+                    name: format!("{name}.hessian"),
+                    quant_type: 2,
+                    shape: vec![acc.k as u32, acc.k as u32],
+                    group_size: 0,
+                    data: f32_bytes(&hessian),
+                });
+            }
             let imatrix: Vec<f32> = diag.iter().map(|v| v * inv).collect();
-            tensors.push(HfqMemTensor {
-                name: format!("{name}.hessian"),
-                quant_type: 2,
-                shape: vec![acc.k as u32, acc.k as u32],
-                group_size: 0,
-                data: f32_bytes(&hessian),
-            });
             tensors.push(HfqMemTensor {
                 name: format!("{name}.imatrix"),
                 quant_type: 2,
@@ -129,7 +158,11 @@ impl ActivationCapture for CalibCollector {
         let mut accs = self.accs.lock().unwrap();
         if !accs.contains_key(tensor_name) {
             let diag = gpu.zeros(&[k], DType::F32).unwrap();
-            let h = gpu.zeros(&[k, k], DType::F32).unwrap();
+            let h = if self.wants_hessian(tensor_name) {
+                Some(gpu.zeros(&[k, k], DType::F32).unwrap())
+            } else {
+                None
+            };
             let buf = gpu.zeros(&[FLUSH_BATCH, k], DType::F32).unwrap();
             accs.insert(
                 tensor_name.to_string(),
