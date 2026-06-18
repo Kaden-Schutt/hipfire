@@ -24,6 +24,8 @@ enum Command {
     Eval(commands::forward::EvalArgs),
     /// Measure host, GPU-copy, and model storage bandwidth
     HostProfile(commands::forward::HostProfileArgs),
+    /// Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one model load
+    CollectArtifacts(commands::forward::CollectArtifactsArgs),
 }
 
 #[tokio::main]
@@ -48,5 +50,6 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Eval(args) => commands::forward::run_eval(args),
         Command::HostProfile(args) => commands::forward::run_host_profile(args),
+        Command::CollectArtifacts(args) => commands::forward::run_collect_artifacts(args),
     }
 }

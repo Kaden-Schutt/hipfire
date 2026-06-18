@@ -53,6 +53,28 @@ pub struct HostProfileArgs {
     pub args: Vec<OsString>,
 }
 
+const COLLECT_ARTIFACTS_HELP: &str = r#"hipfire collect-artifacts - single-load Tier-1 calibration artifact collector
+
+Loads a bf16 .hfq once and writes a unified <model>.calib.hfq bundling the
+per-tensor Hessian + imatrix (full Hessian for dense projections; imatrix-only
+for MoE routed experts), the MoE router histogram (MoE models), and optionally
+KLDREF.
+
+Usage:
+  hipfire collect-artifacts --model <bf16.hfq> --corpus <text> \
+      --output <out.calib.hfq> [--max-tokens N] [--kldref]
+
+Build runner:
+  cargo build --release -p hipfire-runtime --example collect_artifacts"#;
+
+#[derive(Debug, Args)]
+#[command(disable_help_flag = true, trailing_var_arg = true)]
+pub struct CollectArtifactsArgs {
+    /// Arguments forwarded to the collect_artifacts runner
+    #[arg(allow_hyphen_values = true)]
+    pub args: Vec<OsString>,
+}
+
 pub fn run_eval(args: EvalArgs) -> anyhow::Result<()> {
     run_forwarded(
         Runner::eval(),
@@ -72,6 +94,17 @@ pub fn run_host_profile(args: HostProfileArgs) -> anyhow::Result<()> {
         "hipfire-host-profile",
         HOST_PROFILE_HELP,
         "cargo build --release -p hipfire-runtime --bin hipfire-host-profile",
+    )
+}
+
+pub fn run_collect_artifacts(args: CollectArtifactsArgs) -> anyhow::Result<()> {
+    run_forwarded(
+        Runner::collect_artifacts(),
+        args.args,
+        "HIPFIRE_COLLECT_ARTIFACTS_BIN",
+        "collect_artifacts",
+        COLLECT_ARTIFACTS_HELP,
+        "cargo build --release -p hipfire-runtime --example collect_artifacts",
     )
 }
 
@@ -116,6 +149,9 @@ fn is_help(args: &[OsString]) -> bool {
 struct Runner {
     release_name: &'static str,
     debug_name: Option<&'static str>,
+    /// When set, the binary is a cargo example, so it lives under
+    /// `target/{profile}/examples/` rather than `target/{profile}/`.
+    is_example: bool,
 }
 
 impl Runner {
@@ -123,6 +159,7 @@ impl Runner {
         Self {
             release_name: "hipfire-eval",
             debug_name: None,
+            is_example: false,
         }
     }
 
@@ -130,6 +167,15 @@ impl Runner {
         Self {
             release_name: "hipfire-host-profile",
             debug_name: Some("hipfire-host-profile"),
+            is_example: false,
+        }
+    }
+
+    fn collect_artifacts() -> Self {
+        Self {
+            release_name: "collect_artifacts",
+            debug_name: Some("collect_artifacts"),
+            is_example: true,
         }
     }
 }
@@ -154,10 +200,11 @@ fn runner_candidates(runner: &Runner, env_var: &str, bin_name: &str) -> Vec<Path
         }
     }
 
+    let sub = if runner.is_example { "examples/" } else { "" };
     if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join(format!("target/release/{}{}", runner.release_name, exe)));
+        candidates.push(cwd.join(format!("target/release/{sub}{}{exe}", runner.release_name)));
         if let Some(debug_name) = runner.debug_name {
-            candidates.push(cwd.join(format!("target/debug/{}{}", debug_name, exe)));
+            candidates.push(cwd.join(format!("target/debug/{sub}{debug_name}{exe}")));
         }
     }
 
@@ -209,5 +256,21 @@ mod tests {
         assert!(candidates
             .iter()
             .any(|p| p.ends_with("target/debug/hipfire-host-profile")));
+    }
+
+    #[test]
+    fn collect_artifacts_candidates_resolve_the_example_path() {
+        let candidates = runner_candidates(
+            &Runner::collect_artifacts(),
+            "HIPFIRE_COLLECT_ARTIFACTS_BIN",
+            "collect_artifacts",
+        );
+        // The runner is a cargo example, so it lives under examples/.
+        assert!(candidates
+            .iter()
+            .any(|p| p.ends_with("target/release/examples/collect_artifacts")));
+        assert!(candidates
+            .iter()
+            .any(|p| p.ends_with("target/debug/examples/collect_artifacts")));
     }
 }
