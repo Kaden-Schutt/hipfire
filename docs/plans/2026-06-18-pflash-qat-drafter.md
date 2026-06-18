@@ -141,3 +141,47 @@ Do **M0 first** — it's cheap, needs no new code (compute the target's block
 ranking + a generic small LM's ranking, measure correlation), and it's the
 go/no-go: it tells us whether a trained drafter has headroom to capture before we
 invest in M1–M5. Everything downstream is gated on that number.
+
+## M0 RESULT (2026-06-18) — recency-confounded, GO NOT established
+
+Probe: `crates/hipfire-train/examples/pflash_m0_probe.rs`. Supra-50M, fp32
+partial forward (hipfire-train, no PyTorch), SEQ=1024 (Supra max_position),
+shallow L1 vs deep L8, block-cosine importance = PFlash's own metric
+`cosine(block_mean_K, last_token_K)`. Run on gfx1103.
+
+First-pass headline looked like a clean GO (shallow↔deep Spearman **0.991**,
+top-k recall 1.00). **It was a synthetic-win trap.** Adding a recency baseline
+(score = block index) collapses the claim:
+
+| block | shallow↔deep | recency↔deep | recency↔shallow |
+|------:|-------------:|-------------:|----------------:|
+| 16    | +0.983       | **+0.981**   | +0.988          |
+| 32    | +0.991       | **+0.985**   | +0.994          |
+| 64    | +0.991       | **+0.991**   | +1.000          |
+
+**The shallow layer adds ~zero lift over block-index recency** at reproducing the
+deep ranking. PFlash's cosine-K importance score is, on this proxy, almost
+entirely recency: recent blocks resemble the last token at *every* layer, so the
+trivial "keep recent blocks + anchors" heuristic already captures nearly all of
+it. A *learned* drafter has little headroom to beat that here.
+
+**Two distinct takeaways:**
+1. **Drafter (M1–M5): not justified by this number.** Do not invest in the QAT
+   drafter on the strength of M0. The cheap signal a drafter would learn is
+   recency, which we already have for free.
+2. **PFlash metric critique (independent, useful):** `cosine(block_mean_K,
+   last_token_K)` is recency-dominated by construction. That's worth knowing for
+   PFlash selection design regardless of the drafter.
+
+**Caveats — why this is "not established," not a hard NO:**
+- Supra-50M at SEQ=1024 on local prose is a *weak proxy*. PFlash's real regime is
+  a 9B/27B target at **>32K** context, where importance may decouple from recency
+  much more (long-range retrieval, anchors far from the tail).
+- Tiny models / short context / locally-coherent prose all bias toward recency.
+- The faithful next step is to re-run the **same recency-confound test on a real
+  target at real long context** before either building the drafter or redesigning
+  the metric. That's the gate — not the inflated 0.991.
+
+Bottom line: **M0 falsifies the easy GO.** Park M1–M5; the next cheap experiment
+is the confound test at scale (large target, >32K), and/or rethinking PFlash's
+importance metric to add a non-recency component.

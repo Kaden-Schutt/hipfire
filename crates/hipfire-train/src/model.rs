@@ -262,6 +262,36 @@ pub struct ModelActivations {
     pub logits: GpuTensor, // [seq, vocab]
 }
 
+/// Partial forward: embed + blocks `0..=up_to`, returning each block's saved
+/// activations (incl. `k_r`, the post-rope K). Skips the final norm + logit GEMM
+/// — cheap when you only need intermediate K (e.g. PFlash-style shallow-layer
+/// block scoring; the teacher only needs the target's first few layers).
+pub fn model_block_activations(
+    gpu: &mut Gpu,
+    model: &LlamaModel,
+    token_ids: &[u32],
+    pos_host: &[f32],
+    up_to: usize,
+) -> HipResult<Vec<BlockActivations>> {
+    let (seq, h) = (model.dims.seq, model.dims.h);
+    assert_eq!(token_ids.len(), seq);
+    let x0 = gpu.zeros(&[seq * h], DType::F32)?;
+    for (t, &tok) in token_ids.iter().enumerate() {
+        gpu.strided_copy_2d(&model.embed, tok as usize * h, h, &x0, t * h, h, 1, h, false)?;
+    }
+    let last = up_to.min(model.layers.len() - 1);
+    let mut out = Vec::with_capacity(last + 1);
+    let mut x = x0;
+    for i in 0..=last {
+        let (lw, ll) = &model.layers[i];
+        let (x_out, acts) =
+            block_forward(gpu, &x, &lw.as_block(), &ll.as_block(), &model.dims, pos_host)?;
+        out.push(acts);
+        x = x_out;
+    }
+    Ok(out)
+}
+
 /// Forward through logits (no loss). `token_ids.len()` must equal `dims.seq`.
 pub fn model_forward(
     gpu: &mut Gpu,
