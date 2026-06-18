@@ -470,6 +470,29 @@ its own motivation, not as part of this fixture work.)
 
 ---
 
+## PFlash drafter training — progress reporting + checkpoint/resume (2026-06-18)
+
+The drafter trainer (`crates/hipfire-train/examples/pflash_drafter_train.rs`,
+plan `docs/plans/2026-06-18-pflash-qat-drafter.md`) currently runs as a
+fire-and-forget loop. Two ergonomics gaps surfaced while running it:
+
+- **Progress reporting.** Label capture (16 × 3B target forwards) and the long
+  epoch loop are silent for minutes. Add: per-chunk capture progress
+  (`captured i/N`), a per-epoch (or every-K-step) line with loss + a wall-clock /
+  ETA estimate, and optionally a `--quiet`/`--verbose` knob. Consider a tiny
+  shared progress helper so other training examples (`overfit_supra50m`,
+  `recovery_ft_supra50m`) can reuse it.
+- **Checkpoint / resume.** Long runs can't currently be stopped and continued.
+  Add: periodic checkpointing of the drafter weights + AdamW moment buffers
+  (m/v/t) + RNG/epoch position to a `.hfq`-style or simple binary artifact, and a
+  `--resume <path>` that reloads them and continues. Also cache the captured
+  mid-layer labels (they're deterministic per corpus+target) so a resume skips
+  the expensive recapture. Graceful SIGINT → checkpoint-then-exit would be ideal.
+
+Both are training-harness ergonomics, not blockers for the P3 result, so they're
+parked here. Revisit once P3 shows the drafter beats the shallow bar and we move
+to longer real-target (qwen) runs where these actually bite.
+
 ## Circle back: QTIP recovery export — norms-only quality vs Path B (2026-06-17)
 
 Phase 3 export bridge (`hipfire-train` → daemon-servable qtip3 `.hfq`) is being
