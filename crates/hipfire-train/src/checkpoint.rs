@@ -55,17 +55,38 @@ fn rmagic(r: &mut impl Read, want: &[u8; 4]) -> io::Result<bool> {
 // ── label cache ───────────────────────────────────────────────────────────
 const LBL_MAGIC: &[u8; 4] = b"PFLB";
 
+fn wvec_u32(w: &mut impl Write, v: &[u32]) -> io::Result<()> {
+    wu32(w, v.len() as u32)?;
+    for &x in v {
+        w.write_all(&x.to_le_bytes())?;
+    }
+    Ok(())
+}
+fn rvec_u32(r: &mut impl Read) -> io::Result<Vec<u32>> {
+    let n = ru32(r)? as usize;
+    let mut buf = vec![0u8; n * 4];
+    r.read_exact(&mut buf)?;
+    Ok(buf.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+}
+
+/// Stores the token CHUNKS alongside the labels so a HIT reuses the exact corpus
+/// the labels were computed from — decoupled from live repo files (the corpus is
+/// globbed from docs/+crates/, which churn). Key is therefore geometry-only.
 pub fn save_labels(
     path: &str,
     key: u64,
+    chunks: &[Vec<u32>],
     label_mid: &[Vec<f32>],
     base_shallow: &[Vec<f32>],
 ) -> io::Result<()> {
     let mut f = io::BufWriter::new(std::fs::File::create(path)?);
     f.write_all(LBL_MAGIC)?;
-    wu32(&mut f, 1)?; // version
+    wu32(&mut f, 2)?; // version 2: now carries chunks
     wu64(&mut f, key)?;
     wu32(&mut f, label_mid.len() as u32)?;
+    for c in chunks {
+        wvec_u32(&mut f, c)?;
+    }
     for v in label_mid {
         wvec(&mut f, v)?;
     }
@@ -75,21 +96,24 @@ pub fn save_labels(
     f.flush()
 }
 
-/// Returns `Some((label_mid, base_shallow))` iff the file exists and its key
-/// matches (same target+corpus+geometry); otherwise `None` (recapture).
-pub fn load_labels(path: &str, key: u64) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+/// `Some((chunks, label_mid, base_shallow))` iff the file exists, is v2, and its
+/// key matches (same target + geometry); otherwise `None` (recapture).
+pub fn load_labels(path: &str, key: u64) -> Option<(Vec<Vec<u32>>, Vec<Vec<f32>>, Vec<Vec<f32>>)> {
     let mut f = io::BufReader::new(std::fs::File::open(path).ok()?);
     if !rmagic(&mut f, LBL_MAGIC).ok()? {
         return None;
     }
-    let _ver = ru32(&mut f).ok()?;
+    if ru32(&mut f).ok()? != 2 {
+        return None; // old format → recapture
+    }
     if ru64(&mut f).ok()? != key {
         return None;
     }
     let n = ru32(&mut f).ok()? as usize;
+    let chunks: Vec<Vec<u32>> = (0..n).map(|_| rvec_u32(&mut f)).collect::<io::Result<_>>().ok()?;
     let label_mid: Vec<Vec<f32>> = (0..n).map(|_| rvec(&mut f)).collect::<io::Result<_>>().ok()?;
     let base_shallow: Vec<Vec<f32>> = (0..n).map(|_| rvec(&mut f)).collect::<io::Result<_>>().ok()?;
-    Some((label_mid, base_shallow))
+    Some((chunks, label_mid, base_shallow))
 }
 
 // ── drafter checkpoint ────────────────────────────────────────────────────

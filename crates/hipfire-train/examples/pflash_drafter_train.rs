@@ -118,7 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if toks.len() < n_chunks * SEQ {
         return Err(format!("corpus too small: {} toks < {}", toks.len(), n_chunks * SEQ).into());
     }
-    let chunks: Vec<Vec<u32>> =
+    let mut chunks: Vec<Vec<u32>> =
         (0..n_chunks).map(|i| toks[i * SEQ..(i + 1) * SEQ].to_vec()).collect();
     let pos: Vec<f32> = (0..SEQ).map(|t| t as f32).collect();
 
@@ -130,25 +130,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (rope_base, eps, n_layers) = (cfg.rope_theta, cfg.rms_norm_eps, cfg.num_hidden_layers);
     let mid = n_layers / 2;
     let mut target = LlamaModel::from_f32_weights(&mut gpu, &cfg, w, SEQ, 4, 8.0)?;
-    let max_id = chunks.iter().flatten().copied().max().unwrap_or(0);
-    println!("target {TARGET}: h_t={h_t} layers={n_layers} mid=L{mid} vocab={vocab} max_tok_id={max_id}");
-    assert!((max_id as usize) < vocab, "token id {max_id} ≥ vocab {vocab} → OOB embedding read");
+    println!("target {TARGET}: h_t={h_t} layers={n_layers} mid=L{mid} vocab={vocab}");
 
-    // deterministic label key: same target + corpus geometry → reuse the cache.
+    // Geometry-only key (NOT corpus content): the cache stores its own chunks, so
+    // a HIT reuses the exact captured corpus regardless of live docs/+crates churn.
     let key = {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         TARGET.hash(&mut h);
         (SEQ, BLOCK, mid, n_chunks).hash(&mut h);
-        for c in &chunks {
-            c.hash(&mut h);
-        }
         h.finish()
     };
     let scores_dev = gpu.zeros(&[nb], DType::F32)?;
-    let (label_mid, base_shallow) = if let Some((lm, bs)) = load_labels(LABELS_PATH, key) {
+    let (label_mid, base_shallow) = if let Some((cached, lm, bs)) = load_labels(LABELS_PATH, key) {
         println!("labels: cache HIT {LABELS_PATH} ({} chunks) — skipping 3B capture", lm.len());
+        chunks = cached; // use the exact corpus the labels were computed from
         (lm, bs)
     } else {
+        let max_id = chunks.iter().flatten().copied().max().unwrap_or(0);
+        assert!((max_id as usize) < vocab, "token id {max_id} ≥ vocab {vocab} → OOB embedding read");
         println!("labels: cache miss — capturing (mid-layer partial forward)…");
         let mut label_mid: Vec<Vec<f32>> = Vec::new();
         let mut base_shallow: Vec<Vec<f32>> = Vec::new();
@@ -165,7 +164,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             eprintln!("  captured labels {}/{}", ci + 1, n_chunks);
         }
-        save_labels(LABELS_PATH, key, &label_mid, &base_shallow)
+        save_labels(LABELS_PATH, key, &chunks, &label_mid, &base_shallow)
             .map_err(|e| format!("save_labels: {e}"))?;
         println!("labels: cached → {LABELS_PATH}");
         (label_mid, base_shallow)
