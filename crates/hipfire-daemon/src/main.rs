@@ -4954,7 +4954,7 @@ fn qwen35_materialize_batch_prefill_prompt(
                     system: system_prompt,
                     user: "",
                     assistant_prefix,
-                    raw: false,
+                    raw: m.chat_template.is_none(),
                 }
                 .build_with_user_tokens(&raw_q_tokens))
             }
@@ -4969,7 +4969,7 @@ fn qwen35_materialize_batch_prefill_prompt(
             },
             user: "",
             assistant_prefix,
-            raw: false,
+            raw: m.chat_template.is_none(),
         }
         .build_with_user_tokens(&raw_q_tokens))
     }
@@ -12187,7 +12187,7 @@ fn generate_mtp(
                     system: system_prompt,
                     user: prompt,
                     assistant_prefix,
-                    raw: false,
+                    raw: m.chat_template.is_none(),
                 }
                 .build()
             }
@@ -12198,7 +12198,7 @@ fn generate_mtp(
             system: system_prompt,
             user: prompt,
             assistant_prefix,
-            raw: false,
+            raw: m.chat_template.is_none(),
         }
         .build()
     };
@@ -12611,7 +12611,7 @@ fn generate_dflash(
                     system: system_prompt,
                     user: prompt,
                     assistant_prefix,
-                    raw: false,
+                    raw: m.chat_template.is_none(),
                 }
                 .build()
             }
@@ -12622,7 +12622,7 @@ fn generate_dflash(
             system: system_prompt,
             user: prompt,
             assistant_prefix,
-            raw: false,
+            raw: m.chat_template.is_none(),
         }
         .build()
     };
@@ -13403,7 +13403,7 @@ fn generate_multi(
                     system: if m.seq_pos == 0 { system_prompt } else { None },
                     user: "",
                     assistant_prefix,
-                    raw: false,
+                    raw: m.chat_template.is_none(),
                 }
                 .build_with_user_tokens(&q_tokens)
             }
@@ -13414,7 +13414,7 @@ fn generate_multi(
             system: if m.seq_pos == 0 { system_prompt } else { None },
             user: "",
             assistant_prefix,
-            raw: false,
+            raw: m.chat_template.is_none(),
         }
         .build_with_user_tokens(&q_tokens)
     };
@@ -14507,7 +14507,7 @@ fn generate(
                     system: system_prompt,
                     user: "",
                     assistant_prefix,
-                    raw: false,
+                    raw: m.chat_template.is_none(),
                 }
                 .build_with_user_tokens(&q_tokens)
             }
@@ -14522,7 +14522,7 @@ fn generate(
             },
             user: "", // unused: we pass tokens directly via build_with_user_tokens
             assistant_prefix,
-            raw: false,
+            raw: m.chat_template.is_none(),
         }
         .build_with_user_tokens(&q_tokens)
     };
@@ -16815,7 +16815,7 @@ fn generate_minimax(
                         system: system_prompt,
                         user: prompt,
                         assistant_prefix: prompt_frame::AssistantPrefix::Plain,
-                        raw: false,
+                        raw: m.chat_template.is_none(),
                     }
                     .build()
                 }
@@ -16826,7 +16826,7 @@ fn generate_minimax(
                 system: system_prompt,
                 user: prompt,
                 assistant_prefix: prompt_frame::AssistantPrefix::Plain,
-                raw: false,
+                raw: m.chat_template.is_none(),
             }
             .build()
         }
@@ -17076,7 +17076,7 @@ fn generate_lfm2moe(
                         system: system_prompt,
                         user: prompt,
                         assistant_prefix: prompt_frame::AssistantPrefix::Plain,
-                        raw: false,
+                        raw: m.chat_template.is_none(),
                     }
                     .build()
                 }
@@ -17087,7 +17087,7 @@ fn generate_lfm2moe(
                 system: system_prompt,
                 user: prompt,
                 assistant_prefix: prompt_frame::AssistantPrefix::Plain,
-                raw: false,
+                raw: m.chat_template.is_none(),
             }
             .build()
         }
@@ -17399,7 +17399,7 @@ fn generate_vl(
         system: if m.seq_pos == 0 { system_prompt } else { None },
         user: "", // unused: we pass tokens directly via build_with_user_tokens
         assistant_prefix: prompt_frame::AssistantPrefix::Plain, // VL always uses Plain
-        raw: false,
+        raw: m.chat_template.is_none(),
     }
     .build_with_user_tokens(&user_body);
 
