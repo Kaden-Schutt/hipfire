@@ -119,6 +119,67 @@ To build:
 M0–M4 are training-side (hipfire-train + calib, our turf). M5 is engine
 greenfield (PFlash hot-path; coherence-gated).
 
+## DECISIONS LOCKED (2026-06-18, post-M0b)
+
+**Build the custom scorer.** M0b shows real, scale-growing non-recency importance
+→ enough headroom to justify the machinery.
+
+**Arch — shared embedding + small ATTENTION body + token-ID prior bias; NOT a
+token-ID-gated MoE body.**
+- Shared target embedding, frozen, resident (D1 confirmed). Only thing that makes
+  "tiny" possible at 248K vocab.
+- A few (2–4) SMALL attention+MLP layers. Attention is non-negotiable: the M0b
+  needle is important only because the tail query asks for it — importance is
+  CONTEXTUAL and needs attention depth (shallow K barely sees it, mid-layer does).
+- A learned token-ID importance-prior bias (`[vocab]→scalar`, additive to the
+  head) captures the cheap *static/lexical* slice (sinks, rare content tokens,
+  punctuation — the StreamingLLM/H2O regime). This is the salvageable part of the
+  token-ID-MoE idea.
+- **Rejected: token-ID-gated MoE as the body.** It's a static per-token mechanism,
+  but the shared embedding we already reuse IS a 248K token-ID lookup — an MoE
+  would add capacity to the already-solved lexical part while contributing nothing
+  to the hard contextual-coupling part (which only attention provides). Kept in
+  reserve ONLY as a possible attention-free "fast lexical-prior tier" that
+  knowingly cannot catch contextual needles.
+
+**Train target — the target's MID-LAYER cosine-K block ranking (drop-in).**
+Chosen over reproducing PFlash's shallow cosine-K (the weak +0.34 signal M0b
+exposed) and over the causal oracle (gold but O(blocks) forwards/example).
+Rationale: mid-layer K is the strong +0.81 signal, costs ONE target forward to
+label, and the scorer keeps emitting K so PFlash's existing cosine scoring
+consumes it unchanged (minimal engine change). The scorer's job is precisely the
+M0b headroom: *shallow-cost output that ranks like the target's mid layer.* Causal
+oracle reserved as a small validation set (does it catch the distant needle?).
+
+**Strategy — prototype entirely in hipfire-train on a LOADABLE Llama target
+first.** The real PFlash target (qwen3.5-9b/27b, vocab 248320) is hybrid-arch and
+hipfire-train can't load it; capturing ITS mid-layer K needs a daemon-side hook
+(the M1 engine gap). But we can prove the whole concept TODAY on a dense-Llama
+stand-in target (e.g. Llama-3.2-3B) that hipfire-train loads: capture its
+mid-layer K labels, build the shared-embedding tiny-attention drafter, train it to
+reproduce the ranking, and measure vs the target's own shallow K (PFlash's
+baseline). Only after that proto succeeds do we build the daemon K-capture hook +
+PFlash consumption for the real qwen target.
+
+### Revised milestones (supersede the M0–M5 list above for the chosen path)
+
+- **P1 — label capture (hipfire-train, mostly exists).** Run a Llama stand-in
+  target over a corpus; capture mid-layer K; per-block cosine ranking = labels.
+  Reuses `model_forward` (returns all `layer_acts`) + `block_scores`.
+- **P2 — drafter arch (hipfire-train).** Shared frozen target embedding + N small
+  attention+MLP layers (reuse `block_forward` ops) emitting K, + token-ID prior
+  bias. New constructor; no own vocab.
+- **P3 — train + measure.** Distill the ranking (listwise/cosine-correlation or
+  MSE on block-cosine scores). Gate: drafter's K ranking vs target mid-layer
+  ranking, AND does it beat the target's OWN shallow K (PFlash's current baseline)?
+  Validate distant-needle capture against the causal oracle on a few examples.
+- **P4 — QAT (Q8 fake-quant + STE)** once fp32 proto clears P3.
+- **P5 — real target.** Daemon-side mid-layer K-capture hook for qwen3.5; retrain
+  the drafter against the real target.
+- **P6 — PFlash consumption.** Drafter forward → K → existing cosine scoring →
+  block selection + anchors → gather → compressed prefill; flip
+  `maybe_compress_prompt`. Coherence-gated; measure long-ctx speedup + quality.
+
 ## Open questions / risks (decide before/within M0)
 
 1. **Does a tiny QAT'd drafter rank well enough at 5% keep?** The core empirical
