@@ -11,7 +11,7 @@
 //!       act = swiglu(lin_g(xn2), lin_u(xn2)); mlp = lin_d(act); x_out = x_mid + mlp
 
 use crate::ops::attention::{gqa_backward, gqa_forward};
-use crate::ops::linear::{linear_backward_x, linear_forward};
+use crate::ops::linear::{linear_backward_w, linear_backward_x, linear_forward};
 use crate::ops::lora::{lora_backward, lora_forward};
 use crate::ops::rmsnorm::{rmsnorm_backward, rmsnorm_forward};
 use crate::ops::rope::{rope_backward, rope_forward};
@@ -241,6 +241,20 @@ pub fn block_forward(
 /// Backward. `d_x_out` `[seq*h]` upstream; writes LoRA grads and returns the
 /// input gradient `d_x` `[seq*h]`. `x` is the original block input (for norm1).
 #[allow(clippy::too_many_arguments)]
+/// Gradients of the FROZEN base block linears — only produced by
+/// `block_backward_full` (for from-scratch training, e.g. the PFlash drafter).
+/// Recovery FT leaves the base frozen and never asks for these.
+pub struct BlockWeightGrad {
+    pub dwq: GpuTensor,    // [q_dim, h]
+    pub dwk: GpuTensor,    // [kv_dim, h]
+    pub dwv: GpuTensor,    // [kv_dim, h]
+    pub dwo: GpuTensor,    // [h, q_dim]
+    pub dwgate: GpuTensor, // [inter, h]
+    pub dwup: GpuTensor,   // [inter, h]
+    pub dwdown: GpuTensor, // [h, inter]
+}
+
+/// Recovery-FT backward: base frozen, returns LoRA + norm grads only.
 pub fn block_backward(
     gpu: &mut Gpu,
     d_x_out: &GpuTensor,
@@ -250,6 +264,35 @@ pub fn block_backward(
     acts: &BlockActivations,
     dims: &BlockDims,
 ) -> HipResult<(GpuTensor, BlockLoraGrad)> {
+    let (d_x, lora_g, _) = block_backward_inner(gpu, d_x_out, x, w, lora, acts, dims, false)?;
+    Ok((d_x, lora_g))
+}
+
+/// From-scratch backward: also returns gradients for the base linears.
+pub fn block_backward_full(
+    gpu: &mut Gpu,
+    d_x_out: &GpuTensor,
+    x: &GpuTensor,
+    w: &BlockWeights,
+    lora: &BlockLora,
+    acts: &BlockActivations,
+    dims: &BlockDims,
+) -> HipResult<(GpuTensor, BlockLoraGrad, BlockWeightGrad)> {
+    let (d_x, lora_g, wg) = block_backward_inner(gpu, d_x_out, x, w, lora, acts, dims, true)?;
+    Ok((d_x, lora_g, wg.expect("want_w=true ⇒ Some")))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn block_backward_inner(
+    gpu: &mut Gpu,
+    d_x_out: &GpuTensor,
+    x: &GpuTensor,
+    w: &BlockWeights,
+    lora: &BlockLora,
+    acts: &BlockActivations,
+    dims: &BlockDims,
+    want_w: bool,
+) -> HipResult<(GpuTensor, BlockLoraGrad, Option<BlockWeightGrad>)> {
     let (seq, h, inter) = (dims.seq, dims.h, dims.inter);
     let (qd, kvd, r) = (dims.q_dim(), dims.kv_dim(), dims.lora_rank);
     let dnorm1 = gpu.zeros(&[h], DType::F32)?; // trainable RMSNorm grads
@@ -406,6 +449,31 @@ pub fn block_backward(
     )?;
     gpu.add_inplace_f32(&d_x, &d_x_norm)?;
 
+    // Base-linear weight grads (from-scratch training only). dw = dyᵀ·x; every
+    // (dy, input) pair below is already materialised above.
+    let wg = if want_w {
+        let dwq = gpu.zeros(&[qd * h], DType::F32)?;
+        let dwk = gpu.zeros(&[kvd * h], DType::F32)?;
+        let dwv = gpu.zeros(&[kvd * h], DType::F32)?;
+        let dwo = gpu.zeros(&[h * qd], DType::F32)?;
+        let dwgate = gpu.zeros(&[inter * h], DType::F32)?;
+        let dwup = gpu.zeros(&[inter * h], DType::F32)?;
+        let dwdown = gpu.zeros(&[h * inter], DType::F32)?;
+        // attention projections (input = acts.xn1)
+        linear_backward_w(gpu, &d_q, &acts.xn1, &dwq, seq, h, qd, false)?;
+        linear_backward_w(gpu, &d_k, &acts.xn1, &dwk, seq, h, kvd, false)?;
+        linear_backward_w(gpu, &d_v, &acts.xn1, &dwv, seq, h, kvd, false)?;
+        // output projection (input = acts.ctx)
+        linear_backward_w(gpu, &d_x_mid, &acts.ctx, &dwo, seq, qd, h, false)?;
+        // MLP (gate/up input = acts.xn2; down input = acts.act)
+        linear_backward_w(gpu, &d_gate, &acts.xn2, &dwgate, seq, h, inter, false)?;
+        linear_backward_w(gpu, &d_up, &acts.xn2, &dwup, seq, h, inter, false)?;
+        linear_backward_w(gpu, d_x_out, &acts.act, &dwdown, seq, inter, h, false)?;
+        Some(BlockWeightGrad { dwq, dwk, dwv, dwo, dwgate, dwup, dwdown })
+    } else {
+        None
+    };
+
     Ok((
         d_x,
         BlockLoraGrad {
@@ -416,5 +484,6 @@ pub fn block_backward(
             dnorm1,
             dnorm2,
         },
+        wg,
     ))
 }
