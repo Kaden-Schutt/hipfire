@@ -89,4 +89,33 @@ impl AdamW {
     pub fn step_count(&self) -> i32 {
         self.t
     }
+
+    /// Download the optimizer state (per-param `m`, `v`, and the step counter) to
+    /// host — for checkpointing. `m[i]`/`v[i]` match the construction order.
+    pub fn save_state(&self, gpu: &mut Gpu) -> HipResult<(Vec<Vec<f32>>, Vec<Vec<f32>>, i32)> {
+        let m = self.m.iter().map(|t| gpu.download_f32(t)).collect::<HipResult<Vec<_>>>()?;
+        let v = self.v.iter().map(|t| gpu.download_f32(t)).collect::<HipResult<Vec<_>>>()?;
+        Ok((m, v, self.t))
+    }
+
+    /// Restore optimizer state from host buffers (resume). Sizes/order must match
+    /// construction. Overwrites the existing device moment buffers in place.
+    pub fn load_state(&mut self, gpu: &mut Gpu, m: &[Vec<f32>], v: &[Vec<f32>], t: i32) -> HipResult<()> {
+        assert_eq!(m.len(), self.m.len(), "AdamW m count mismatch on resume");
+        assert_eq!(v.len(), self.v.len(), "AdamW v count mismatch on resume");
+        for (i, h) in m.iter().enumerate() {
+            assert_eq!(h.len(), self.numel[i], "AdamW m[{i}] size mismatch");
+            gpu.memcpy_htod_auto(&self.m[i].buf, bytemuck_f32(h))?;
+        }
+        for (i, h) in v.iter().enumerate() {
+            assert_eq!(h.len(), self.numel[i], "AdamW v[{i}] size mismatch");
+            gpu.memcpy_htod_auto(&self.v[i].buf, bytemuck_f32(h))?;
+        }
+        self.t = t;
+        Ok(())
+    }
+}
+
+fn bytemuck_f32(v: &[f32]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }

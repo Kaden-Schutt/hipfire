@@ -15,12 +15,25 @@ use hipfire_train::drafter::{
     DrafterConfig,
 };
 use hipfire_train::block::free_block_acts;
+use hipfire_train::checkpoint::{load_drafter, load_labels, save_drafter, save_labels};
 use hipfire_train::loader::load_llama_fp32;
 use hipfire_train::model::{model_block_activations, LlamaModel};
 use hipfire_train::ops::pflash_score::pflash_score_forward;
 use hipfire_train::optim::AdamW;
 use rdna_compute::{DType, Gpu};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+
+const LABELS_PATH: &str = "target/pflash_labels.bin";
+const CKPT_PATH: &str = "target/pflash_drafter_ckpt.bin";
+const CKPT_EVERY: usize = 30;
+
+fn env_usize(k: &str, d: usize) -> usize {
+    std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+}
+fn env_f32(k: &str, d: f32) -> f32 {
+    std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+}
 
 const HF: &str = "/srv/huggingface";
 const TARGET: &str = "models--meta-llama--Llama-3.2-3B-Instruct";
@@ -118,24 +131,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let max_id = chunks.iter().flatten().copied().max().unwrap_or(0);
     println!("target {TARGET}: h_t={h_t} layers={n_layers} mid=L{mid} vocab={vocab} max_tok_id={max_id}");
     assert!((max_id as usize) < vocab, "token id {max_id} ≥ vocab {vocab} → OOB embedding read");
-    println!("capturing labels…");
 
-    let scores_dev = gpu.zeros(&[nb], DType::F32)?;
-    let mut label_mid: Vec<Vec<f32>> = Vec::new();
-    let mut base_shallow: Vec<Vec<f32>> = Vec::new();
-    for (ci, ids) in chunks.iter().enumerate() {
-        // partial forward to the mid layer only — skips the final norm + the huge
-        // [seq×vocab] logit GEMM that label capture doesn't need.
-        let acts = model_block_activations(&mut gpu, &target, ids, &pos, mid)?;
-        pflash_score_forward(&mut gpu, &acts[mid].k_r, &scores_dev, SEQ, kvd_t, BLOCK, nb, last)?;
-        label_mid.push(gpu.download_f32(&scores_dev)?);
-        pflash_score_forward(&mut gpu, &acts[SHALLOW].k_r, &scores_dev, SEQ, kvd_t, BLOCK, nb, last)?;
-        base_shallow.push(gpu.download_f32(&scores_dev)?);
-        for b in acts {
-            free_block_acts(&mut gpu, b)?;
+    // deterministic label key: same target + corpus geometry → reuse the cache.
+    let key = {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        TARGET.hash(&mut h);
+        (SEQ, BLOCK, mid, n_chunks).hash(&mut h);
+        for c in &chunks {
+            c.hash(&mut h);
         }
-        eprintln!("  captured labels {}/{}", ci + 1, n_chunks);
-    }
+        h.finish()
+    };
+    let scores_dev = gpu.zeros(&[nb], DType::F32)?;
+    let (label_mid, base_shallow) = if let Some((lm, bs)) = load_labels(LABELS_PATH, key) {
+        println!("labels: cache HIT {LABELS_PATH} ({} chunks) — skipping 3B capture", lm.len());
+        (lm, bs)
+    } else {
+        println!("labels: cache miss — capturing (mid-layer partial forward)…");
+        let mut label_mid: Vec<Vec<f32>> = Vec::new();
+        let mut base_shallow: Vec<Vec<f32>> = Vec::new();
+        for (ci, ids) in chunks.iter().enumerate() {
+            // partial forward to the mid layer only — skips the final norm + the
+            // huge [seq×vocab] logit GEMM that label capture doesn't need.
+            let acts = model_block_activations(&mut gpu, &target, ids, &pos, mid)?;
+            pflash_score_forward(&mut gpu, &acts[mid].k_r, &scores_dev, SEQ, kvd_t, BLOCK, nb, last)?;
+            label_mid.push(gpu.download_f32(&scores_dev)?);
+            pflash_score_forward(&mut gpu, &acts[SHALLOW].k_r, &scores_dev, SEQ, kvd_t, BLOCK, nb, last)?;
+            base_shallow.push(gpu.download_f32(&scores_dev)?);
+            for b in acts {
+                free_block_acts(&mut gpu, b)?;
+            }
+            eprintln!("  captured labels {}/{}", ci + 1, n_chunks);
+        }
+        save_labels(LABELS_PATH, key, &label_mid, &base_shallow)
+            .map_err(|e| format!("save_labels: {e}"))?;
+        println!("labels: cached → {LABELS_PATH}");
+        (label_mid, base_shallow)
+    };
     // shallow baseline vs mid label (the bar to beat), eval split
     let bar: f32 = (N_TRAIN..n_chunks)
         .map(|i| spearman(&base_shallow[i], &label_mid[i]))
@@ -150,11 +182,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let drafter = Drafter::new(&mut gpu, embed, h_t, vocab, dcfg, SEQ)?;
     let sizes = drafter.param_sizes();
     let nparams: usize = sizes.iter().sum();
-    let mut opt = AdamW::new(&mut gpu, &sizes, 1e-3, 0.9, 0.999, 1e-8, 0.0)?;
+    let epochs = env_usize("HIPFIRE_PFLASH_EPOCHS", EPOCHS);
+    let tau = env_f32("HIPFIRE_PFLASH_TAU", TAU);
+    let lr = env_f32("HIPFIRE_PFLASH_LR", 1e-3);
+    let mut opt = AdamW::new(&mut gpu, &sizes, lr, 0.9, 0.999, 1e-8, 0.0)?;
     println!(
-        "drafter: h={} layers={} kv={}×{}  params={} ({:.2}M)\n",
+        "drafter: h={} layers={} kv={}×{}  params={} ({:.2}M)  epochs={epochs} tau={tau} lr={lr}",
         dcfg.h_draft, dcfg.n_layers, dcfg.n_kv, dcfg.head_dim, sizes.len(), nparams as f32 / 1e6
     );
+
+    // resume: reload weights + AdamW state from the checkpoint unless FRESH=1.
+    let fresh = std::env::var("HIPFIRE_PFLASH_FRESH").is_ok();
+    let start_ep = if fresh {
+        0
+    } else {
+        match load_drafter(&mut gpu, CKPT_PATH, &drafter, &mut opt)? {
+            Some(e) => {
+                println!("resume: loaded {CKPT_PATH} → continuing from epoch {e}");
+                e as usize
+            }
+            None => 0,
+        }
+    };
+    println!();
 
     let eval = |gpu: &mut Gpu, d: &Drafter| -> f32 {
         let sc = gpu.zeros(&[nb], DType::F32).unwrap();
@@ -172,20 +222,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  bar  Spearman(shallow, mid) [eval] = {bar:+.3}  ← drafter must beat this");
     println!("  init Spearman(drafter, mid) [eval] = {:+.3}\n", eval(&mut gpu, &drafter));
 
-    for ep in 0..EPOCHS {
+    for ep in start_ep..epochs {
         let mut ep_loss = 0.0f32;
         for i in 0..N_TRAIN {
             let acts = drafter_forward_train(&mut gpu, &drafter, &chunks[i], &pos)?;
             pflash_score_forward(&mut gpu, &acts.score_k, &scores_dev, SEQ, kvd_d, BLOCK, nb, last)?;
             let pred = gpu.download_f32(&scores_dev)?;
             // ListNet top-1: L = -Σ p_label log p_pred ; dL/dpred = (p_pred - p_label)/τ
-            let pl = softmax_t(&label_mid[i], TAU);
-            let pp = softmax_t(&pred, TAU);
+            let pl = softmax_t(&label_mid[i], tau);
+            let pp = softmax_t(&pred, tau);
             let mut ds = vec![0.0f32; nb];
             let mut l = 0.0f32;
             for b in 0..nb {
                 l -= pl[b] * pp[b].max(1e-12).ln();
-                ds[b] = (pp[b] - pl[b]) / TAU;
+                ds[b] = (pp[b] - pl[b]) / tau;
             }
             ep_loss += l;
             let dscores = gpu.upload_f32(&ds, &[nb])?;
@@ -195,11 +245,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             free_drafter_grads(&mut gpu, grads)?;
             gpu.free_tensor(dscores)?;
         }
-        if ep % 30 == 0 || ep == EPOCHS - 1 {
+        if ep % 30 == 0 || ep == epochs - 1 {
             println!(
                 "  ep {ep:>3}  train_loss {:.4}  eval Spearman(drafter,mid) {:+.3}",
                 ep_loss / N_TRAIN as f32, eval(&mut gpu, &drafter)
             );
+        }
+        // checkpoint periodically + on the last epoch (epoch+1 = next to run)
+        if (ep + 1) % CKPT_EVERY == 0 || ep == epochs - 1 {
+            save_drafter(&mut gpu, CKPT_PATH, &drafter, &opt, (ep + 1) as u32)?;
         }
     }
 

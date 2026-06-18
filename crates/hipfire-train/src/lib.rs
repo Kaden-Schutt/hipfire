@@ -11,6 +11,7 @@
 // `gemm_f32_train` primitive (general transpose flags) in `rdna-compute`.
 
 pub mod block;
+pub mod checkpoint;
 pub mod config;
 pub mod drafter;
 pub mod hfq_patch;
