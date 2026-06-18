@@ -800,6 +800,134 @@ fn write_error(stdout: &mut std::io::Stdout, id: &str, message: &str) {
     let _ = stdout.flush();
 }
 
+fn chat_output_filter(m: &LoadedModel, request_stop_sequences: &[String]) -> EosFilter {
+    chat_output_filter_from_profile(m.chat_template_profile.as_ref(), request_stop_sequences)
+}
+
+fn chat_output_filter_from_profile(
+    chat_template_profile: Option<&prompt_frame::ChatTemplateProfile>,
+    request_stop_sequences: &[String],
+) -> EosFilter {
+    let (mut stop_at, mut holdback_prefixes) = chat_template_profile
+        .map(|profile| {
+            (
+                profile
+                    .stop_at
+                    .iter()
+                    .map(|s| s.as_bytes().to_vec())
+                    .collect::<Vec<_>>(),
+                profile
+                    .holdback_prefixes
+                    .iter()
+                    .map(|s| s.as_bytes().to_vec())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .filter(|(stop_at, _)| !stop_at.is_empty())
+        .unwrap_or_else(|| (vec![b"<|im_end|>".to_vec()], vec![b"<|im_end|>".to_vec()]));
+
+    for stop in request_stop_sequences {
+        if stop.is_empty() {
+            continue;
+        }
+        let bytes = stop.as_bytes().to_vec();
+        if !stop_at.iter().any(|existing| existing == &bytes) {
+            stop_at.push(bytes.clone());
+        }
+        if !holdback_prefixes.iter().any(|existing| existing == &bytes) {
+            holdback_prefixes.push(bytes);
+        }
+    }
+
+    EosFilter::new(EosFilterConfig {
+        stop_at,
+        holdback_prefixes,
+        ..Default::default()
+    })
+}
+
+fn normalize_request_stop_sequences(value: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    let mut out = match value {
+        serde_json::Value::String(s) => vec![s.clone()],
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    out.retain(|s| !s.is_empty());
+    out.truncate(4);
+    for seq in &mut out {
+        if seq.len() > 64 {
+            seq.truncate(64);
+        }
+    }
+    out
+}
+
+fn emit_filter_action(stdout: &mut std::io::Stdout, id: &str, action: FilterAction) -> bool {
+    match action {
+        FilterAction::Emit(text_bytes) => {
+            emit_text_bytes(stdout, id, &text_bytes);
+            false
+        }
+        FilterAction::StopEmit(text_bytes) => {
+            emit_text_bytes(stdout, id, &text_bytes);
+            true
+        }
+        FilterAction::Hold => false,
+        FilterAction::Stop => true,
+    }
+}
+
+fn emit_text_bytes(stdout: &mut std::io::Stdout, id: &str, text_bytes: &[u8]) {
+    if text_bytes.is_empty() {
+        return;
+    }
+    if let Ok(text) = std::str::from_utf8(text_bytes) {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"token","id":"{}","text":{}}}"#,
+            id,
+            serde_json::to_string(text).unwrap_or_default()
+        );
+        let _ = stdout.flush();
+    }
+}
+
+#[cfg(test)]
+mod output_filter_tests {
+    use super::*;
+
+    #[test]
+    fn request_stop_sequences_are_normalized_like_bun() {
+        let value = serde_json::json!(["", "END", "x".repeat(80), "A", "B", "C"]);
+        let stops = normalize_request_stop_sequences(Some(&value));
+        assert_eq!(stops.len(), 4);
+        assert_eq!(stops[0], "END");
+        assert_eq!(stops[1].len(), 64);
+    }
+
+    #[test]
+    fn request_stop_sequence_stops_filter_output() {
+        let stops = vec!["END".to_string()];
+        let mut filter = chat_output_filter_from_profile(None, &stops);
+        match filter.observe(b"hello END hidden") {
+            FilterAction::StopEmit(bytes) => {
+                assert_eq!(std::str::from_utf8(&bytes).unwrap(), "hello ");
+            }
+            other => panic!("expected emitted prefix before stop, got {other:?}"),
+        }
+        assert!(matches!(
+            filter.observe(b" after"),
+            FilterAction::Stop | FilterAction::Hold
+        ));
+    }
+}
+
 fn validate_qwen35_decode_batch_runtime_surface(
     arch_id: u32,
     pp: usize,
@@ -3065,6 +3193,22 @@ struct DdtreeState {
     path_c_main_end_snap: DeltaNetSnapshot,
 }
 
+thread_local! {
+    /// Per-request raw-prompt override, parsed from the generate message's
+    /// optional `"raw"` field. `None` = use the auto default (raw iff the model
+    /// has no chat_template). Set at the top of the generate handler (the daemon
+    /// processes generate messages synchronously on one thread), read by
+    /// `effective_raw`. Reset every generate request, so no cross-request leak.
+    static RAW_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Effective raw-prompt flag for prompt framing. An explicit request `"raw"`
+/// wins; otherwise default to raw for base/completion models (no chat_template)
+/// and framed for chat models (has a chat_template).
+fn effective_raw(m: &LoadedModel) -> bool {
+    RAW_OVERRIDE.with(|c| c.get()).unwrap_or(m.chat_template.is_none())
+}
+
 struct LoadedModel {
     arch_id: u32,
     /// Pipeline-parallel degree. 1 = single-GPU (all existing fields below in
@@ -3245,6 +3389,7 @@ struct LoadedModel {
     // Stage 2 partial: AR generate() path only. DFlash, multi-GPU PP>1, and
     // VL paths still hit the Plain scaffold.
     chat_template: Option<String>,
+    chat_template_profile: Option<prompt_frame::ChatTemplateProfile>,
 }
 
 const QWEN35_LEGACY_SESSION_ID: &str = "__legacy_generate__";
@@ -4825,7 +4970,7 @@ fn qwen35_materialize_batch_prefill_prompt(
                     system: system_prompt,
                     user: "",
                     assistant_prefix,
-                    raw: false,
+                    raw: effective_raw(m),
                 }
                 .build_with_user_tokens(&raw_q_tokens))
             }
@@ -4840,7 +4985,7 @@ fn qwen35_materialize_batch_prefill_prompt(
             },
             user: "",
             assistant_prefix,
-            raw: false,
+            raw: effective_raw(m),
         }
         .build_with_user_tokens(&raw_q_tokens))
     }
@@ -7519,6 +7664,7 @@ fn main() {
                         "type": "loaded",
                         "worker_key_id": requested_worker_id,
                         "arch": "qwen35_dummy",
+                        "cache_capable": false,
                         "dim": 16,
                         "layers": 1,
                         "vocab": 1024,
@@ -7969,6 +8115,7 @@ fn main() {
 
                         let model_worker =
                             model_worker_runtime_view_json(&loaded_model_worker_runtime_view(&m));
+                        let cache_capable = m.arch_id == 9 || is_qwen35_family_arch_id(m.arch_id);
                         let _ = writeln!(
                             stdout,
                             "{}",
@@ -7976,6 +8123,7 @@ fn main() {
                                 "type": "loaded",
                                 "worker_key_id": requested_worker_id,
                                 "arch": arch,
+                                "cache_capable": cache_capable,
                                 "dim": dim,
                                 "layers": layers,
                                 "vocab": vocab,
@@ -8111,6 +8259,10 @@ fn main() {
             }
 
             "generate" => {
+                // Explicit per-request raw-prompt override (optional `"raw"`
+                // bool). Absent → None → auto default (raw iff no chat_template).
+                // Always set, so it resets every request (no cross-request leak).
+                RAW_OVERRIDE.with(|c| c.set(msg.get("raw").and_then(|v| v.as_bool())));
                 let protocol_generate =
                     serde_json::from_value::<hipfire_generate::GenerateTextRequest>(msg.clone())
                         .ok();
@@ -8240,7 +8392,10 @@ fn main() {
                     .and_then(|req| req.system.as_deref())
                     .or_else(|| msg.get("system").and_then(|v| v.as_str()));
                 let image = msg.get("image").and_then(|v| v.as_str());
-                let image_base64 = msg.get("image_base64").and_then(|v| v.as_str());
+                let image_base64 = protocol_generate
+                    .as_ref()
+                    .and_then(|req| req.image_base64.as_deref())
+                    .or_else(|| msg.get("image_base64").and_then(|v| v.as_str()));
 
                 // Structured-tools + structured-messages support (Phase 1 of
                 // Jinja-everywhere migration). When present, both fields are
@@ -8318,6 +8473,10 @@ fn main() {
                         None => None,
                     }
                 };
+                let request_stop_sequences = protocol_generate
+                    .as_ref()
+                    .and_then(|req| req.stop.clone())
+                    .unwrap_or_else(|| normalize_request_stop_sequences(msg.get("stop")));
                 // Sampling defaults differ by arch: qwen35 family was tuned
                 // at `temp=0.3, top_p=0.8` (DFlash-friendly, instruct-stable);
                 // DeepSeek V4 Flash's HF card recommends `temp=1.0, top_p=1.0`
@@ -8384,24 +8543,35 @@ fn main() {
                 // OpenAI-compatible `reasoning_effort` (also accept our custom
                 // `thinking_mode` alias) — only consumed by arch_id=9 today.
                 // Default = NonThink, matching the safe HF chat frame.
-                let think_mode = msg
-                    .get("reasoning_effort")
-                    .or_else(|| msg.get("thinking_mode"))
-                    .and_then(|v| v.as_str())
+                let think_mode = protocol_generate
+                    .as_ref()
+                    .and_then(|req| {
+                        req.reasoning_effort
+                            .as_deref()
+                            .or(req.thinking_mode.as_deref())
+                            .or(req.thinking.as_deref())
+                    })
+                    .or_else(|| {
+                        msg.get("reasoning_effort")
+                            .or_else(|| msg.get("thinking_mode"))
+                            .and_then(|v| v.as_str())
+                    })
                     .map(ThinkMode::from_str)
                     .unwrap_or(ThinkMode::NonThink);
                 let repeat_window = msg
                     .get("repeat_window")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(128) as usize;
-                let presence_penalty = msg
-                    .get("presence_penalty")
-                    .and_then(|v| v.as_f64())
+                let presence_penalty = protocol_generate
+                    .as_ref()
+                    .and_then(|req| req.presence_penalty)
+                    .or_else(|| msg.get("presence_penalty").and_then(|v| v.as_f64()))
                     .unwrap_or(0.0)
                     .max(0.0) as f32;
-                let frequency_penalty = msg
-                    .get("frequency_penalty")
-                    .and_then(|v| v.as_f64())
+                let frequency_penalty = protocol_generate
+                    .as_ref()
+                    .and_then(|req| req.frequency_penalty)
+                    .or_else(|| msg.get("frequency_penalty").and_then(|v| v.as_f64()))
                     .unwrap_or(0.0)
                     .max(0.0) as f32;
                 // Experimental: inject a nudge string at a specific generated-
@@ -8452,9 +8622,10 @@ fn main() {
                 // shipping in genParams since cli/index.ts but the daemon
                 // was silently ignoring it, making the new reasoning.effort
                 // / enable_thinking knobs no-ops on the wire.
-                let max_think_tokens = msg
-                    .get("max_think_tokens")
-                    .and_then(|v| v.as_u64())
+                let max_think_tokens = protocol_generate
+                    .as_ref()
+                    .and_then(|req| req.max_think_tokens.map(u64::from))
+                    .or_else(|| msg.get("max_think_tokens").and_then(|v| v.as_u64()))
                     .unwrap_or(0) as usize;
 
                 // assistant_prefix: "plain", "open_think", or "closed_think"
@@ -8462,7 +8633,10 @@ fn main() {
                 // Consumed by the text path; VL path does not yet propagate
                 // it (tracked as a follow-up to the post-#169 rebase).
                 let assistant_prefix = prompt_frame::AssistantPrefix::from_label(
-                    msg.get("assistant_prefix").and_then(|v| v.as_str()),
+                    protocol_generate
+                        .as_ref()
+                        .and_then(|req| req.assistant_prefix.as_deref())
+                        .or_else(|| msg.get("assistant_prefix").and_then(|v| v.as_str())),
                 );
 
                 let has_image = image_base64.is_some() || image.is_some();
@@ -8635,6 +8809,7 @@ fn main() {
                         think_mode,
                         prefill_already_done,
                         prefilled_prompt_tokens,
+                        &request_stop_sequences,
                         protocol_generate
                             .as_ref()
                             .and_then(|req| req.evidence_dir.as_deref())
@@ -9705,6 +9880,25 @@ fn resolve_chat_template(hfq: &hipfire_runtime::hfq::HfqFile, model_path: &str) 
     Some(resolved.template)
 }
 
+fn profile_chat_template(
+    chat_template: Option<String>,
+    tokenizer: Option<&hipfire_model::tokenizer::Tokenizer>,
+) -> (Option<String>, Option<prompt_frame::ChatTemplateProfile>) {
+    let profile = match (chat_template.as_deref(), tokenizer) {
+        (Some(template), Some(tokenizer)) => {
+            match prompt_frame::ChatTemplateProfile::from_template(tokenizer, template) {
+                Ok(profile) => Some(profile),
+                Err(e) => {
+                    eprintln!("[chat_template] failed to profile template ({e}); using fallback stop policy");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    (chat_template, profile)
+}
+
 fn parse_state_quant(
     mode: Option<&str>,
 ) -> Result<hipfire_arch_qwen35::qwen35::StateQuant, String> {
@@ -10019,6 +10213,8 @@ fn load_model(
         let state = qwen2::Qwen2State::new_with_max_seq(gpu, &config, max_seq)
             .map_err(|e| format!("qwen2: Qwen2State::new_with_max_seq failed: {e:?}"))?;
         let chat_template = resolve_chat_template(&hfq, path);
+        let (chat_template, chat_template_profile) =
+            profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
@@ -10079,6 +10275,7 @@ fn load_model(
             memory: model_memory,
             dflash: None,
             chat_template,
+            chat_template_profile,
         });
     }
 
@@ -10111,6 +10308,8 @@ fn load_model(
         let state = qwen2::Qwen2State::new_with_max_seq(gpu, &config.text, max_seq)
             .map_err(|e| format!("dots-ocr: Qwen2State::new_with_max_seq failed: {e:?}"))?;
         let chat_template = resolve_chat_template(&hfq, path);
+        let (chat_template, chat_template_profile) =
+            profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
@@ -10171,6 +10370,7 @@ fn load_model(
             memory: model_memory,
             dflash: None,
             chat_template,
+            chat_template_profile,
         });
     }
 
@@ -10224,6 +10424,8 @@ fn load_model(
             }
         };
         let chat_template = resolve_chat_template(&hfq, path);
+        let (chat_template, chat_template_profile) =
+            profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
@@ -10284,6 +10486,7 @@ fn load_model(
             memory: model_memory,
             dflash: None,
             chat_template,
+            chat_template_profile,
         });
     }
 
@@ -10343,6 +10546,8 @@ fn load_model(
                 .unwrap_or(1)
         };
         let chat_template = resolve_chat_template(&hfq, path);
+        let (chat_template, chat_template_profile) =
+            profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
@@ -10403,6 +10608,7 @@ fn load_model(
             memory: model_memory,
             dflash: None,
             chat_template,
+            chat_template_profile,
         });
     }
 
@@ -10475,6 +10681,8 @@ fn load_model(
                     .unwrap_or(1)
             };
             let chat_template = resolve_chat_template(&hfq, path);
+            let (chat_template, chat_template_profile) =
+                profile_chat_template(chat_template, Some(&tokenizer));
             return Ok(LoadedModel {
                 arch_id: hfq.arch_id,
                 pp: 1,
@@ -10531,6 +10739,7 @@ fn load_model(
                 memory: model_memory,
                 dflash: None,
                 chat_template,
+                chat_template_profile,
             });
         }
     }
@@ -10811,6 +11020,8 @@ fn load_model(
         };
 
         let chat_template = resolve_chat_template(&hfq, path);
+        let (chat_template, chat_template_profile) =
+            profile_chat_template(chat_template, Some(&tokenizer));
         Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
@@ -10871,6 +11082,7 @@ fn load_model(
             memory: model_memory,
             dflash,
             chat_template,
+            chat_template_profile,
         })
     } else {
         // Qwen3 / LLaMA — no eviction supported on this path (TriAttention needs
@@ -10893,6 +11105,8 @@ fn load_model(
         .map_err(|e| format!("{e}"))?;
         let scratch = <Llama as Architecture>::new_state(gpu, &config)?;
         let chat_template = resolve_chat_template(&hfq, path);
+        let (chat_template, chat_template_profile) =
+            profile_chat_template(chat_template, Some(&tokenizer));
         Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
@@ -10953,6 +11167,7 @@ fn load_model(
             memory: model_memory,
             dflash: None,
             chat_template,
+            chat_template_profile,
         })
     }
 }
@@ -10993,6 +11208,8 @@ fn load_model_safetensors(
     let chat_template = source.chat_template();
 
     if arch_id == 0 || arch_id == 1 {
+        let (chat_template, chat_template_profile) =
+            profile_chat_template(chat_template, Some(&tokenizer));
         // LLaMA / Qwen3 — standard attention, no DeltaNet
         let config = hipfire_runtime::hfq::config_from_safetensors_llama(&source)
             .ok_or("failed to parse LLaMA/Qwen3 config from config.json")?;
@@ -11122,6 +11339,7 @@ fn load_model_safetensors(
             memory: model_memory,
             dflash: None,
             chat_template,
+            chat_template_profile,
         });
     }
 
@@ -11175,6 +11393,8 @@ fn load_model_safetensors(
         DeltaNetState::new(gpu, &config).map_err(|e| format!("DeltaNetState::new: {e:?}"))?;
     let scratch = qwen35::Qwen35Scratch::new(gpu, &config, 256)
         .map_err(|e| format!("Qwen35Scratch::new: {e:?}"))?;
+    let (chat_template, chat_template_profile) =
+        profile_chat_template(chat_template, Some(&tokenizer));
 
     Ok(LoadedModel {
         arch_id,
@@ -11236,6 +11456,7 @@ fn load_model_safetensors(
         memory: model_memory,
         dflash: None,
         chat_template,
+        chat_template_profile,
     })
 }
 
@@ -11437,6 +11658,10 @@ fn load_model_pp(
         gpus.layer_to_device, gpus.output_device, gpus.peer_access_enabled,
     );
 
+    let chat_template = resolve_chat_template(&hfq, path);
+    let (chat_template, chat_template_profile) =
+        profile_chat_template(chat_template, Some(&tokenizer));
+
     Ok(LoadedModel {
         arch_id: hfq.arch_id,
         pp,
@@ -11496,7 +11721,8 @@ fn load_model_pp(
         model_path: path.to_string(),
         memory: model_memory,
         dflash: None,
-        chat_template: resolve_chat_template(&hfq, path),
+        chat_template,
+        chat_template_profile,
     })
 }
 
@@ -11921,6 +12147,7 @@ fn generate_mtp(
     assistant_prefix: prompt_frame::AssistantPrefix,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[prompt_frame::Message]>,
+    request_stop_sequences: &[String],
 ) {
     use hipfire_arch_qwen35::mtp_head::{self, MtpKvMode};
     use hipfire_arch_qwen35::mtp_spec::{self, MtpSpecState};
@@ -11980,7 +12207,7 @@ fn generate_mtp(
                     system: system_prompt,
                     user: prompt,
                     assistant_prefix,
-                    raw: false,
+                    raw: effective_raw(m),
                 }
                 .build()
             }
@@ -11991,7 +12218,7 @@ fn generate_mtp(
             system: system_prompt,
             user: prompt,
             assistant_prefix,
-            raw: false,
+            raw: effective_raw(m),
         }
         .build()
     };
@@ -12156,7 +12383,7 @@ fn generate_mtp(
         // Streaming state (mirrors generate_dflash).
         let mut streamed_tokens: Vec<u32> = Vec::new();
         let mut bytes_fed_to_filter = 0usize;
-        let mut filter = EosFilter::new(EosFilterConfig::default());
+        let mut filter = chat_output_filter(m, request_stop_sequences);
         let mut generated = 0usize;
         let mut think_count: usize = 0;
         let mut prev_in_think: bool = false;
@@ -12182,16 +12409,8 @@ fn generate_mtp(
             let all_bytes = tokenizer.decode_bytes(streamed_tokens);
             let new_bytes = &all_bytes[*bytes_fed_to_filter..];
             *bytes_fed_to_filter = all_bytes.len();
-            if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-                if let Ok(text) = std::str::from_utf8(&text_bytes) {
-                    let _ = writeln!(
-                        stdout,
-                        r#"{{"type":"token","id":"{}","text":{}}}"#,
-                        id,
-                        serde_json::to_string(text).unwrap_or_default()
-                    );
-                    let _ = stdout.flush();
-                }
+            if emit_filter_action(stdout, id, filter.observe(new_bytes)) {
+                return (true, false);
             }
             let hit_eos =
                 tok == eos_token || im_end_token == Some(tok) || tokenizer.is_terminator(tok);
@@ -12343,6 +12562,7 @@ fn generate_dflash(
     pflash_alpha: Option<f32>,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[prompt_frame::Message]>,
+    request_stop_sequences: &[String],
 ) {
     use hipfire_arch_qwen35::speculative::{
         spec_step_ddtree_batched, spec_step_ddtree_path_c, spec_step_dflash, ModelSlot,
@@ -12411,7 +12631,7 @@ fn generate_dflash(
                     system: system_prompt,
                     user: prompt,
                     assistant_prefix,
-                    raw: false,
+                    raw: effective_raw(m),
                 }
                 .build()
             }
@@ -12422,7 +12642,7 @@ fn generate_dflash(
             system: system_prompt,
             user: prompt,
             assistant_prefix,
-            raw: false,
+            raw: effective_raw(m),
         }
         .build()
     };
@@ -12451,6 +12671,7 @@ fn generate_dflash(
             let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
         }
     }
+    let chat_template_profile = m.chat_template_profile.clone();
     let df = m.dflash.as_mut().unwrap();
     df.target_hidden_host.clear();
     df.draft_scratch.reset_upload_tracking();
@@ -12619,7 +12840,8 @@ fn generate_dflash(
     // quirks (Gemma 4 marker holdback, strip-think, byte-level stop_at);
     // see crates/engine/src/eos_filter.rs.
     let mut bytes_fed_to_filter = 0usize;
-    let mut filter = EosFilter::new(EosFilterConfig::default());
+    let mut filter =
+        chat_output_filter_from_profile(chat_template_profile.as_ref(), request_stop_sequences);
     let mut position = prompt_tokens.len();
     let mut seed_token = first_token;
     let mut stats = SpecStats::new(df.block_size);
@@ -12672,16 +12894,7 @@ fn generate_dflash(
     let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
     let new_bytes = &all_bytes[bytes_fed_to_filter..];
     bytes_fed_to_filter = all_bytes.len();
-    if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-        let text = std::str::from_utf8(&text_bytes).unwrap();
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"token","id":"{}","text":{}}}"#,
-            id,
-            serde_json::to_string(&text).unwrap_or_default()
-        );
-        let _ = stdout.flush();
-    }
+    let first_filter_stop = emit_filter_action(stdout, id, filter.observe(new_bytes));
     generated += 1;
 
     // First-token EOS guard. The first token is already emitted above; if
@@ -12723,7 +12936,7 @@ fn generate_dflash(
     };
 
     // Fast path exit conditions (mirrors the dflash_spec_demo outer loop).
-    while !first_token_is_eos && generated < max_tokens {
+    while !first_filter_stop && !first_token_is_eos && generated < max_tokens {
         if position + df.block_size >= ctx_capacity {
             break;
         }
@@ -12843,15 +13056,9 @@ fn generate_dflash(
             let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
             let new_bytes = &all_bytes[bytes_fed_to_filter..];
             bytes_fed_to_filter = all_bytes.len();
-            if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-                let text = std::str::from_utf8(&text_bytes).unwrap();
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"token","id":"{}","text":{}}}"#,
-                    id,
-                    serde_json::to_string(&text).unwrap_or_default()
-                );
-                let _ = stdout.flush();
+            if emit_filter_action(stdout, id, filter.observe(new_bytes)) {
+                hit_eos = true;
+                break;
             }
             generated += 1;
             if tok == target.config.eos_token
@@ -13037,6 +13244,7 @@ fn generate_multi(
     assistant_prefix: prompt_frame::AssistantPrefix,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[prompt_frame::Message]>,
+    request_stop_sequences: &[String],
 ) {
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
@@ -13215,7 +13423,7 @@ fn generate_multi(
                     system: if m.seq_pos == 0 { system_prompt } else { None },
                     user: "",
                     assistant_prefix,
-                    raw: false,
+                    raw: effective_raw(m),
                 }
                 .build_with_user_tokens(&q_tokens)
             }
@@ -13226,7 +13434,7 @@ fn generate_multi(
             system: if m.seq_pos == 0 { system_prompt } else { None },
             user: "",
             assistant_prefix,
-            raw: false,
+            raw: effective_raw(m),
         }
         .build_with_user_tokens(&q_tokens)
     };
@@ -13269,6 +13477,7 @@ fn generate_multi(
 
     let prefill_tokens = new_tokens.len();
     let t0 = Instant::now();
+    let chat_template_profile = m.chat_template_profile.clone();
 
     let config = m.q35_config.as_ref().unwrap();
     let weights = m.q35_weights.as_ref().unwrap();
@@ -13346,7 +13555,8 @@ fn generate_multi(
     let mut generated = 0usize;
     let mut streamed_tokens: Vec<u32> = Vec::new();
     let mut bytes_fed_to_filter = 0usize;
-    let mut filter = EosFilter::new(EosFilterConfig::default());
+    let mut filter =
+        chat_output_filter_from_profile(chat_template_profile.as_ref(), request_stop_sequences);
     let mut alert_fired = false;
     let mut think_count: usize = 0;
     let mut prev_in_think: bool = false;
@@ -13366,16 +13576,7 @@ fn generate_multi(
         let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
         let new_bytes = &all_bytes[bytes_fed_to_filter..];
         bytes_fed_to_filter = all_bytes.len();
-        if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-            let text = std::str::from_utf8(&text_bytes).unwrap();
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"token","id":"{}","text":{}}}"#,
-                id,
-                serde_json::to_string(&text).unwrap_or_default()
-            );
-            let _ = stdout.flush();
-        }
+        let filter_stop = emit_filter_action(stdout, id, filter.observe(new_bytes));
 
         if let Err(e) = qwen35::forward_scratch_multi(
             gpus,
@@ -13398,6 +13599,9 @@ fn generate_multi(
         m.seq_pos += 1;
 
         if next_token == config.eos_token {
+            break;
+        }
+        if filter_stop {
             break;
         }
         if im_end_token == Some(next_token) {
@@ -13460,16 +13664,7 @@ fn generate_multi(
                     let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
                     let new_bytes = &all_bytes[bytes_fed_to_filter..];
                     bytes_fed_to_filter = all_bytes.len();
-                    if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-                        let text = std::str::from_utf8(&text_bytes).unwrap();
-                        let _ = writeln!(
-                            stdout,
-                            r#"{{"type":"token","id":"{}","text":{}}}"#,
-                            id,
-                            serde_json::to_string(&text).unwrap_or_default()
-                        );
-                        let _ = stdout.flush();
-                    }
+                    let _ = emit_filter_action(stdout, id, filter.observe(new_bytes));
                     generated += 1;
                 }
                 think_count = 0;
@@ -13565,16 +13760,7 @@ fn generate_multi(
                     let all_bytes2 = tokenizer.decode_bytes(&streamed_tokens);
                     let new_bytes2 = &all_bytes2[bytes_fed_to_filter..];
                     bytes_fed_to_filter = all_bytes2.len();
-                    if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes2) {
-                        let t = std::str::from_utf8(&text_bytes).unwrap();
-                        let _ = writeln!(
-                            stdout,
-                            r#"{{"type":"token","id":"{}","text":{}}}"#,
-                            id,
-                            serde_json::to_string(&t).unwrap_or_default()
-                        );
-                        let _ = stdout.flush();
-                    }
+                    let _ = emit_filter_action(stdout, id, filter.observe(new_bytes2));
                     if let Err(e) = qwen35::forward_scratch_multi(
                         gpus,
                         weights,
@@ -13722,6 +13908,7 @@ fn generate(
     think_mode: ThinkMode,
     prefill_already_done: bool,
     prefilled_prompt_tokens: Option<usize>,
+    request_stop_sequences: &[String],
     evidence_dir: Option<&str>,
 ) {
     // Seed the process-global CPU sampler RNG for this request. CPU fallback and
@@ -13894,6 +14081,7 @@ fn generate(
             assistant_prefix,
             tools,
             messages_history,
+            request_stop_sequences,
         );
         return;
     }
@@ -13968,6 +14156,7 @@ fn generate(
             dflash_alpha,
             tools,
             messages_history,
+            request_stop_sequences,
         );
         // Silence unused-variable warnings for the params DFlash doesn't
         // consume (top_p / repeat penalties are AR-only sampling knobs;
@@ -14006,6 +14195,7 @@ fn generate(
             assistant_prefix,
             tools,
             messages_history,
+            request_stop_sequences,
         );
         let _ = (
             top_p,
@@ -14337,7 +14527,7 @@ fn generate(
                     system: system_prompt,
                     user: "",
                     assistant_prefix,
-                    raw: false,
+                    raw: effective_raw(m),
                 }
                 .build_with_user_tokens(&q_tokens)
             }
@@ -14352,7 +14542,7 @@ fn generate(
             },
             user: "", // unused: we pass tokens directly via build_with_user_tokens
             assistant_prefix,
-            raw: false,
+            raw: effective_raw(m),
         }
         .build_with_user_tokens(&q_tokens)
     };
@@ -14614,7 +14804,7 @@ fn generate(
         // future arch quirks (Gemma 4 marker holdback, strip-think,
         // byte-level stop_at); see crates/engine/src/eos_filter.rs.
         let mut bytes_fed_to_filter = 0usize;
-        let mut filter = EosFilter::new(EosFilterConfig::default());
+        let mut filter = chat_output_filter(m, request_stop_sequences);
         let mut alert_fired = false;
         // max_think_tokens enforcement state. think_count increments only
         // while we observe ourselves to be inside a `<think>...</think>`
@@ -14657,16 +14847,7 @@ fn generate(
             let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
             let new_bytes = &all_bytes[bytes_fed_to_filter..];
             bytes_fed_to_filter = all_bytes.len();
-            if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-                let text = std::str::from_utf8(&text_bytes).unwrap();
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"token","id":"{}","text":{}}}"#,
-                    id,
-                    serde_json::to_string(&text).unwrap_or_default()
-                );
-                let _ = stdout.flush();
-            }
+            let filter_stop = emit_filter_action(stdout, id, filter.observe(new_bytes));
 
             // Write this token's K/V to the cache FIRST so the next turn
             // always starts from a fully-written context. Breaking before
@@ -14705,6 +14886,9 @@ fn generate(
                 {
                     session.seq_pos = new_phys;
                 }
+            }
+            if filter_stop {
+                break;
             }
 
             if next_token == config.eos_token {
@@ -14790,16 +14974,7 @@ fn generate(
                         let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
                         let new_bytes = &all_bytes[bytes_fed_to_filter..];
                         bytes_fed_to_filter = all_bytes.len();
-                        if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-                            let text = std::str::from_utf8(&text_bytes).unwrap();
-                            let _ = writeln!(
-                                stdout,
-                                r#"{{"type":"token","id":"{}","text":{}}}"#,
-                                id,
-                                serde_json::to_string(&text).unwrap_or_default()
-                            );
-                            let _ = stdout.flush();
-                        }
+                        let _ = emit_filter_action(stdout, id, filter.observe(new_bytes));
                         generated += 1;
                     }
                     think_count = 0;
@@ -14922,16 +15097,7 @@ fn generate(
                         let all_bytes2 = tokenizer.decode_bytes(&streamed_tokens);
                         let new_bytes2 = &all_bytes2[bytes_fed_to_filter..];
                         bytes_fed_to_filter = all_bytes2.len();
-                        if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes2) {
-                            let t = std::str::from_utf8(&text_bytes).unwrap();
-                            let _ = writeln!(
-                                stdout,
-                                r#"{{"type":"token","id":"{}","text":{}}}"#,
-                                id,
-                                serde_json::to_string(&t).unwrap_or_default()
-                            );
-                            let _ = stdout.flush();
-                        }
+                        let _ = emit_filter_action(stdout, id, filter.observe(new_bytes2));
                         if let Err(e) = qwen35::forward_scratch(
                             gpu,
                             weights,
@@ -15108,6 +15274,7 @@ fn generate(
         qwen35_restore_or_error(stdout, id, m, gpu, session);
     } else {
         // Qwen3 / LLaMA path -- multi-turn aware
+        let chat_template_profile = m.chat_template_profile.clone();
         let config = m.llama_config.as_ref().unwrap();
         let weights = m.llama_weights.as_ref().unwrap();
         let scratch = m.llama_scratch.as_ref().unwrap();
@@ -15147,7 +15314,8 @@ fn generate(
         // future arch quirks (Gemma 4 marker holdback, strip-think,
         // byte-level stop_at); see crates/engine/src/eos_filter.rs.
         let mut bytes_fed_to_filter = 0usize;
-        let mut filter = EosFilter::new(EosFilterConfig::default());
+        let mut filter =
+            chat_output_filter_from_profile(chat_template_profile.as_ref(), request_stop_sequences);
 
         for _ in 0..max_tokens {
             generated += 1;
@@ -15163,16 +15331,7 @@ fn generate(
             let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
             let new_bytes = &all_bytes[bytes_fed_to_filter..];
             bytes_fed_to_filter = all_bytes.len();
-            if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-                let text = std::str::from_utf8(&text_bytes).unwrap();
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"token","id":"{}","text":{}}}"#,
-                    id,
-                    serde_json::to_string(&text).unwrap_or_default()
-                );
-                let _ = stdout.flush();
-            }
+            let filter_stop = emit_filter_action(stdout, id, filter.observe(new_bytes));
 
             // Scope repeat_buf to this turn's prompt + generated tokens
             // (same logic as the Qwen3.5 path: prompt anchor + current turn).
@@ -15207,6 +15366,9 @@ fn generate(
             .unwrap();
 
             if next_token == config.eos_token {
+                break;
+            }
+            if filter_stop {
                 break;
             }
             if im_end_token == Some(next_token) {
@@ -16673,7 +16835,7 @@ fn generate_minimax(
                         system: system_prompt,
                         user: prompt,
                         assistant_prefix: prompt_frame::AssistantPrefix::Plain,
-                        raw: false,
+                        raw: effective_raw(m),
                     }
                     .build()
                 }
@@ -16684,7 +16846,7 @@ fn generate_minimax(
                 system: system_prompt,
                 user: prompt,
                 assistant_prefix: prompt_frame::AssistantPrefix::Plain,
-                raw: false,
+                raw: effective_raw(m),
             }
             .build()
         }
@@ -16934,7 +17096,7 @@ fn generate_lfm2moe(
                         system: system_prompt,
                         user: prompt,
                         assistant_prefix: prompt_frame::AssistantPrefix::Plain,
-                        raw: false,
+                        raw: effective_raw(m),
                     }
                     .build()
                 }
@@ -16945,7 +17107,7 @@ fn generate_lfm2moe(
                 system: system_prompt,
                 user: prompt,
                 assistant_prefix: prompt_frame::AssistantPrefix::Plain,
-                raw: false,
+                raw: effective_raw(m),
             }
             .build()
         }
@@ -17232,6 +17394,8 @@ fn generate_vl(
     let vision_weights = m.vision_weights.as_ref().unwrap();
     let weights = m.q35_weights.as_ref().unwrap();
     let scratch = m.q35_scratch.as_ref().unwrap();
+    // Compute the raw-prompt flag before the mutable kv/dn borrows below.
+    let vl_raw = effective_raw(m);
     let kv = m.kv_cache.as_mut().unwrap();
     let dn = m.dn_state.as_mut().unwrap();
 
@@ -17257,7 +17421,7 @@ fn generate_vl(
         system: if m.seq_pos == 0 { system_prompt } else { None },
         user: "", // unused: we pass tokens directly via build_with_user_tokens
         assistant_prefix: prompt_frame::AssistantPrefix::Plain, // VL always uses Plain
-        raw: false,
+        raw: vl_raw,
     }
     .build_with_user_tokens(&user_body);
 

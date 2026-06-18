@@ -40524,6 +40524,712 @@ impl Gpu {
         }
     }
 
+    /// General fp32 GEMM with per-operand transpose flags (training path).
+    ///
+    /// Computes `C[M,N] = op(A)·op(B)`, C row-major. `op(A)` is `[M,K]`, `op(B)`
+    /// is `[K,N]`. `lda`/`ldb` are the leading dims of the *stored* operands;
+    /// `trans_a`/`trans_b` select whether the stored matrix is read transposed.
+    /// One general kernel covers the forward and both backward matmuls of a
+    /// linear — see `kernels/src/gemm_f32_train.hip`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f32_train(
+        &mut self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        c: &GpuTensor,
+        m: usize,
+        n: usize,
+        k: usize,
+        lda: usize,
+        ldb: usize,
+        trans_a: bool,
+        trans_b: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_f32_train",
+            kernels::GEMM_F32_TRAIN_SRC,
+            "gemm_f32_train",
+        )?;
+        let func = &self.functions["gemm_f32_train"];
+        let mut ap = a.buf.as_ptr();
+        let mut bp = b.buf.as_ptr();
+        let mut cp = c.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ni = n as i32;
+        let mut ki = k as i32;
+        let mut ldai = lda as i32;
+        let mut ldbi = ldb as i32;
+        let mut tai = trans_a as i32;
+        let mut tbi = trans_b as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void,
+            &mut cp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ldai as *mut _ as *mut c_void,
+            &mut ldbi as *mut _ as *mut c_void,
+            &mut tai as *mut _ as *mut c_void,
+            &mut tbi as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, n as u32, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// `gemm_f32_train` variant that accumulates: `C = beta*C + op(A)·op(B)`.
+    /// Used where a gradient lands on a buffer that already holds a partial.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f32_train_accum(
+        &mut self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        c: &GpuTensor,
+        m: usize,
+        n: usize,
+        k: usize,
+        lda: usize,
+        ldb: usize,
+        trans_a: bool,
+        trans_b: bool,
+        beta: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_f32_train_accum",
+            kernels::GEMM_F32_TRAIN_SRC,
+            "gemm_f32_train_accum",
+        )?;
+        let func = &self.functions["gemm_f32_train_accum"];
+        let mut ap = a.buf.as_ptr();
+        let mut bp = b.buf.as_ptr();
+        let mut cp = c.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ni = n as i32;
+        let mut ki = k as i32;
+        let mut ldai = lda as i32;
+        let mut ldbi = ldb as i32;
+        let mut tai = trans_a as i32;
+        let mut tbi = trans_b as i32;
+        let mut betaf = beta;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void,
+            &mut cp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ldai as *mut _ as *mut c_void,
+            &mut ldbi as *mut _ as *mut c_void,
+            &mut tai as *mut _ as *mut c_void,
+            &mut tbi as *mut _ as *mut c_void,
+            &mut betaf as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, n as u32, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Training RMSNorm forward (fp32). `x`,`y`: `[rows*H]`; `w`: `[H]`;
+    /// `rinv`: `[rows]` output (1/r per row, consumed by the backward).
+    pub fn rmsnorm_train_fwd(
+        &mut self,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        y: &GpuTensor,
+        rinv: &GpuTensor,
+        rows: usize,
+        h: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rmsnorm_train_fwd",
+            kernels::RMSNORM_TRAIN_SRC,
+            "rmsnorm_train_fwd",
+        )?;
+        let func = &self.functions["rmsnorm_train_fwd"];
+        let mut xp = x.buf.as_ptr();
+        let mut wp = w.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut rp = rinv.buf.as_ptr();
+        let mut rowsi = rows as i32;
+        let mut hi = h as i32;
+        let mut epsf = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut rowsi as *mut _ as *mut c_void,
+            &mut hi as *mut _ as *mut c_void,
+            &mut epsf as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [rows as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Training RMSNorm backward (fp32). Produces `dx` `[rows*H]` and
+    /// atomic-accumulates `dw` `[H]` (zero it first). `rinv` is from the forward.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_train_bwd(
+        &mut self,
+        dy: &GpuTensor,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        rinv: &GpuTensor,
+        dx: &GpuTensor,
+        dw: &GpuTensor,
+        rows: usize,
+        h: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rmsnorm_train_bwd",
+            kernels::RMSNORM_TRAIN_SRC,
+            "rmsnorm_train_bwd",
+        )?;
+        let func = &self.functions["rmsnorm_train_bwd"];
+        let mut dyp = dy.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut wp = w.buf.as_ptr();
+        let mut rp = rinv.buf.as_ptr();
+        let mut dxp = dx.buf.as_ptr();
+        let mut dwp = dw.buf.as_ptr();
+        let mut rowsi = rows as i32;
+        let mut hi = h as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dyp as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut dxp as *mut _ as *mut c_void,
+            &mut dwp as *mut _ as *mut c_void,
+            &mut rowsi as *mut _ as *mut c_void,
+            &mut hi as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [rows as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Training row-softmax forward (fp32). `s`,`y`: `[rows*n]`; writes p into y.
+    pub fn softmax_train_fwd(
+        &mut self,
+        s: &GpuTensor,
+        y: &GpuTensor,
+        rows: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "softmax_train_fwd",
+            kernels::SOFTMAX_TRAIN_SRC,
+            "softmax_train_fwd",
+        )?;
+        let func = &self.functions["softmax_train_fwd"];
+        let mut sp = s.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut rowsi = rows as i32;
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut sp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut rowsi as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [rows as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Training row-softmax backward (fp32). `dy`,`p`,`ds`: `[rows*n]`.
+    pub fn softmax_train_bwd(
+        &mut self,
+        dy: &GpuTensor,
+        p: &GpuTensor,
+        ds: &GpuTensor,
+        rows: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "softmax_train_bwd",
+            kernels::SOFTMAX_TRAIN_SRC,
+            "softmax_train_bwd",
+        )?;
+        let func = &self.functions["softmax_train_bwd"];
+        let mut dyp = dy.buf.as_ptr();
+        let mut pp = p.buf.as_ptr();
+        let mut dsp = ds.buf.as_ptr();
+        let mut rowsi = rows as i32;
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dyp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut dsp as *mut _ as *mut c_void,
+            &mut rowsi as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [rows as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Training SwiGLU forward (fp32): `out = silu(gate)*up`, all `[n]`.
+    pub fn swiglu_train_fwd(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        out: &GpuTensor,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "swiglu_train_fwd",
+            kernels::SWIGLU_TRAIN_SRC,
+            "swiglu_train_fwd",
+        )?;
+        let func = &self.functions["swiglu_train_fwd"];
+        let mut gp = gate.buf.as_ptr();
+        let mut up_ = up.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gp as *mut _ as *mut c_void,
+            &mut up_ as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        let grid = ((n as u32) + 255) / 256;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Training SwiGLU backward (fp32). Produces `d_gate`,`d_up` `[n]`.
+    pub fn swiglu_train_bwd(
+        &mut self,
+        d_out: &GpuTensor,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        d_gate: &GpuTensor,
+        d_up: &GpuTensor,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "swiglu_train_bwd",
+            kernels::SWIGLU_TRAIN_SRC,
+            "swiglu_train_bwd",
+        )?;
+        let func = &self.functions["swiglu_train_bwd"];
+        let mut dop = d_out.buf.as_ptr();
+        let mut gp = gate.buf.as_ptr();
+        let mut up_ = up.buf.as_ptr();
+        let mut dgp = d_gate.buf.as_ptr();
+        let mut dup = d_up.buf.as_ptr();
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dop as *mut _ as *mut c_void,
+            &mut gp as *mut _ as *mut c_void,
+            &mut up_ as *mut _ as *mut c_void,
+            &mut dgp as *mut _ as *mut c_void,
+            &mut dup as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        let grid = ((n as u32) + 255) / 256;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Fused cross-entropy fwd+bwd (fp32). `logits`,`d_logits`: `[rows*v]`;
+    /// `targets`,`loss`: `[rows]` (targets integer-valued f32). `d_logits` is the
+    /// SUM-reduction gradient (divide by valid-token count for mean).
+    #[allow(clippy::too_many_arguments)]
+    pub fn cross_entropy_train(
+        &mut self,
+        logits: &GpuTensor,
+        targets: &GpuTensor,
+        loss: &GpuTensor,
+        d_logits: &GpuTensor,
+        rows: usize,
+        v: usize,
+        ignore_index: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "cross_entropy_train",
+            kernels::CROSS_ENTROPY_TRAIN_SRC,
+            "cross_entropy_train",
+        )?;
+        let func = &self.functions["cross_entropy_train"];
+        let mut lp = logits.buf.as_ptr();
+        let mut tp = targets.buf.as_ptr();
+        let mut losp = loss.buf.as_ptr();
+        let mut dlp = d_logits.buf.as_ptr();
+        let mut rowsi = rows as i32;
+        let mut vi = v as i32;
+        let mut ign = ignore_index;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut lp as *mut _ as *mut c_void,
+            &mut tp as *mut _ as *mut c_void,
+            &mut losp as *mut _ as *mut c_void,
+            &mut dlp as *mut _ as *mut c_void,
+            &mut rowsi as *mut _ as *mut c_void,
+            &mut vi as *mut _ as *mut c_void,
+            &mut ign as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [rows as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Training RoPE forward (fp32), HF half-split. `x`,`out`: `[rows*d]`,
+    /// rows = seq*n_heads; `pos`: `[seq]`.
+    pub fn rope_train_fwd(
+        &mut self,
+        x: &GpuTensor,
+        out: &GpuTensor,
+        pos: &GpuTensor,
+        rows: usize,
+        n_heads: usize,
+        d: usize,
+        base: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("rope_train_fwd", kernels::ROPE_TRAIN_SRC, "rope_train_fwd")?;
+        let func = &self.functions["rope_train_fwd"];
+        let mut xp = x.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut pp = pos.buf.as_ptr();
+        let mut rowsi = rows as i32;
+        let mut nh = n_heads as i32;
+        let mut di = d as i32;
+        let mut basef = base;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut rowsi as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut di as *mut _ as *mut c_void,
+            &mut basef as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [rows as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Training RoPE backward (fp32): rotation by −angle. `d_out`,`dx`: `[rows*d]`.
+    pub fn rope_train_bwd(
+        &mut self,
+        d_out: &GpuTensor,
+        dx: &GpuTensor,
+        pos: &GpuTensor,
+        rows: usize,
+        n_heads: usize,
+        d: usize,
+        base: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("rope_train_bwd", kernels::ROPE_TRAIN_SRC, "rope_train_bwd")?;
+        let func = &self.functions["rope_train_bwd"];
+        let mut dop = d_out.buf.as_ptr();
+        let mut dxp = dx.buf.as_ptr();
+        let mut pp = pos.buf.as_ptr();
+        let mut rowsi = rows as i32;
+        let mut nh = n_heads as i32;
+        let mut di = d as i32;
+        let mut basef = base;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dop as *mut _ as *mut c_void,
+            &mut dxp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut rowsi as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut di as *mut _ as *mut c_void,
+            &mut basef as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [rows as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Apply a causal mask to attention scores `[seq_q*seq_k]` (j>i → −1e30).
+    pub fn causal_mask_train(
+        &mut self,
+        scores: &GpuTensor,
+        seq_q: usize,
+        seq_k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "causal_mask_train",
+            kernels::CAUSAL_MASK_TRAIN_SRC,
+            "causal_mask_train",
+        )?;
+        let func = &self.functions["causal_mask_train"];
+        let mut sp = scores.buf.as_ptr();
+        let mut sq = seq_q as i32;
+        let mut sk = seq_k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut sp as *mut _ as *mut c_void,
+            &mut sq as *mut _ as *mut c_void,
+            &mut sk as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [seq_q as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Strided 2D copy (fp32): `dst[dst_off+r*dst_stride+c] (+=|=) src[...]`.
+    /// `accumulate` selects scatter-add. Element units throughout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn strided_copy_2d(
+        &mut self,
+        src: &GpuTensor,
+        src_off: usize,
+        src_stride: usize,
+        dst: &GpuTensor,
+        dst_off: usize,
+        dst_stride: usize,
+        rows: usize,
+        cols: usize,
+        accumulate: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "strided_copy_2d",
+            kernels::STRIDED_COPY_2D_SRC,
+            "strided_copy_2d",
+        )?;
+        let func = &self.functions["strided_copy_2d"];
+        let mut sp = src.buf.as_ptr();
+        let mut so = src_off as i32;
+        let mut ss = src_stride as i32;
+        let mut dp = dst.buf.as_ptr();
+        let mut do_ = dst_off as i32;
+        let mut ds = dst_stride as i32;
+        let mut rr = rows as i32;
+        let mut cc = cols as i32;
+        let mut acc = accumulate as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut sp as *mut _ as *mut c_void,
+            &mut so as *mut _ as *mut c_void,
+            &mut ss as *mut _ as *mut c_void,
+            &mut dp as *mut _ as *mut c_void,
+            &mut do_ as *mut _ as *mut c_void,
+            &mut ds as *mut _ as *mut c_void,
+            &mut rr as *mut _ as *mut c_void,
+            &mut cc as *mut _ as *mut c_void,
+            &mut acc as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [rows as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// AdamW step (fp32). `p`,`g`,`m`,`v`: `[n]` (m,v persisted across steps).
+    /// `bc1`/`bc2` are host-computed bias corrections (1−β^t).
+    #[allow(clippy::too_many_arguments)]
+    pub fn adamw_step(
+        &mut self,
+        p: &GpuTensor,
+        g: &GpuTensor,
+        m: &GpuTensor,
+        v: &GpuTensor,
+        n: usize,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        wd: f32,
+        bc1: f32,
+        bc2: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("adamw_step", kernels::ADAMW_TRAIN_SRC, "adamw_step")?;
+        let func = &self.functions["adamw_step"];
+        let mut pp = p.buf.as_ptr();
+        let mut gp = g.buf.as_ptr();
+        let mut mp = m.buf.as_ptr();
+        let mut vp = v.buf.as_ptr();
+        let mut ni = n as i32;
+        let mut lrf = lr;
+        let mut b1 = beta1;
+        let mut b2 = beta2;
+        let mut epsf = eps;
+        let mut wdf = wd;
+        let mut bc1f = bc1;
+        let mut bc2f = bc2;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut pp as *mut _ as *mut c_void,
+            &mut gp as *mut _ as *mut c_void,
+            &mut mp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut lrf as *mut _ as *mut c_void,
+            &mut b1 as *mut _ as *mut c_void,
+            &mut b2 as *mut _ as *mut c_void,
+            &mut epsf as *mut _ as *mut c_void,
+            &mut wdf as *mut _ as *mut c_void,
+            &mut bc1f as *mut _ as *mut c_void,
+            &mut bc2f as *mut _ as *mut c_void,
+        ];
+        let grid = ((n as u32) + 255) / 256;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// KL distillation loss fwd+bwd (fp32). `student`,`d_logits`: `[rows*v]`;
+    /// `teacher_p`: `[rows*v]` (probabilities); `loss`: `[rows]`. `d_logits` is
+    /// the sum-reduction gradient (q − p_t).
+    pub fn distill_kl_train(
+        &mut self,
+        student: &GpuTensor,
+        teacher_p: &GpuTensor,
+        loss: &GpuTensor,
+        d_logits: &GpuTensor,
+        rows: usize,
+        v: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "distill_kl_train",
+            kernels::DISTILL_TRAIN_SRC,
+            "distill_kl_train",
+        )?;
+        let func = &self.functions["distill_kl_train"];
+        let mut sp = student.buf.as_ptr();
+        let mut tp = teacher_p.buf.as_ptr();
+        let mut lp = loss.buf.as_ptr();
+        let mut dp = d_logits.buf.as_ptr();
+        let mut rowsi = rows as i32;
+        let mut vi = v as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut sp as *mut _ as *mut c_void,
+            &mut tp as *mut _ as *mut c_void,
+            &mut lp as *mut _ as *mut c_void,
+            &mut dp as *mut _ as *mut c_void,
+            &mut rowsi as *mut _ as *mut c_void,
+            &mut vi as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [rows as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// LayerNorm with bias (batched): out = gamma * (x - mean) / sqrt(var + eps) + beta
     pub fn layernorm_batched(
         &mut self,

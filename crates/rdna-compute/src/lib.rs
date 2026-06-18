@@ -21,3 +21,6 @@ pub use dispatch::{
 };
 pub use feature_flags::FeatureFlags;
 pub use kernels::GEMV_SRC;
+// Re-export the result/error types of `Gpu`'s public methods so downstream
+// crates (e.g. hipfire-train) can name them without depending on hip-bridge.
+pub use hip_bridge::{HipError, HipResult};

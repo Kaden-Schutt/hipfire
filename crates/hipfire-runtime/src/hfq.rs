@@ -1187,8 +1187,16 @@ fn load_f16_tensor(
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect()
         }
+        16 => {
+            // BF16 (QuantType::BF16). The qtip3 path stores 1-D norms (and other
+            // non-256-divisible tensors) as BF16; the llama loader must accept
+            // them for norm/embedding tensors. bf16→f32 = high 16 bits.
+            data.chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect()
+        }
         _ => panic!(
-            "expected F16/F32 tensor for {st_name}, got quant_type={}",
+            "expected F16/F32/BF16 tensor for {st_name}, got quant_type={}",
             info.quant_type
         ),
     };
@@ -1592,6 +1600,42 @@ fn load_weight_tensor(
                 awq_scale: None,
             })
         }
+        16 => {
+            // BF16 — dequant to F32 for F32 GEMV. The qtip3 path leaves
+            // non-256-divisible linears (e.g. down_proj, k=1408) as BF16.
+            let f32_data: Vec<f32> = data
+                .chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect();
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+            };
+            let buf = gpu.upload_raw(bytes, &[m, k])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::F32,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        31 => {
+            // Qtip3G256 — packed bitshift-trellis (100 B/group), served by the
+            // gemv_qtip3g256 kernel. Wires qtip3 into the plain-llama path
+            // (previously only the qwen3.5 arch loaded qtip3).
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::Qtip3G256,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         _ => panic!(
             "unsupported quant_type {} for weight {st_name}",
             info.quant_type
@@ -1706,12 +1750,26 @@ pub fn load_weights_hfq(
     let output = if hfq.find_tensor("lm_head.weight").is_some() {
         load_weight_tensor(hfq, gpu, "lm_head.weight", config.vocab_size, config.dim)?
     } else {
-        // Tied embeddings — reuse token_embd as output weights (F32 for GEMV)
-        let data = hfq.tensor_data("model.embed_tokens.weight").unwrap().1;
-        let f32_data: Vec<f32> = data
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect();
+        // Tied embeddings — reuse token_embd as F32 output weights for the
+        // logit GEMV. Dequant by the embed's actual format (qtip3 models store
+        // embed as Q8F16; the old code assumed F16 and would garble Q8 bytes).
+        let (embd_t, data) = hfq.tensor_data("model.embed_tokens.weight").unwrap();
+        let n = config.vocab_size * config.dim;
+        let f32_data: Vec<f32> = match embd_t.quant_type {
+            3 => crate::llama::dequantize_q8_0(data, n), // Q8F16 == GGML Q8_0 blocks
+            2 => data
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+            16 => data
+                .chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect(),
+            _ => data
+                .chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect(),
+        };
         let bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
         };

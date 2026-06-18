@@ -1,0 +1,22 @@
+[package]
+name = "hipfire-train"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hipfire training path: un-fused fp32 forward + hand-written backward + AdamW for LoRA fine-tuning of (quantized) models. Phase 0 scaffold."
+
+# See docs/plans/2026-06-17-hipfire-train-phase0.md for the design. This crate
+# is deliberately decoupled from the fused inference hot path: it owns its own
+# un-fused fp32 forward so every op has a clean, differentiable backward.
+
+[dependencies]
+rdna-compute = { path = "../rdna-compute" }
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-model = { path = "../hipfire-model" }
+serde_json = "1"
+half = "2"
+rayon = "1"
+
+[[example]]
+name = "train_load_supra50m"
+path = "examples/train_load_supra50m.rs"

@@ -20,6 +20,8 @@
 //!   or bytes inside a `<think>` block while `strip_think=true`).
 //! - `FilterAction::Stop` — generation should stop. Any buffered bytes
 //!   are discarded; the caller must not emit further output.
+//! - `FilterAction::StopEmit(Vec<u8>)` — write these bytes, then stop
+//!   before the matched marker.
 //!
 //! Construction is config-only; no allocations until the first
 //! `observe` call. The filter is `Send` and stateless across requests
@@ -38,6 +40,9 @@ pub enum FilterAction {
     Hold,
     /// Generation should stop. Any buffered bytes are discarded.
     Stop,
+    /// Emit these bytes, then stop. The matched stop marker and any
+    /// trailing buffered bytes are discarded.
+    StopEmit(Vec<u8>),
 }
 
 /// Configuration for `EosFilter`. All fields default to "filter does
@@ -178,8 +183,14 @@ impl EosFilter {
                 if needle.is_empty() {
                     continue;
                 }
-                if memmem(&self.state.buf, needle).is_some() {
+                if let Some(pos) = memmem(&self.state.buf, needle) {
+                    if pos > self.state.emitted {
+                        let out = self.state.buf[self.state.emitted..pos].to_vec();
+                        self.state.emitted = self.state.buf.len();
+                        return FilterAction::StopEmit(out);
+                    }
                     // Discard everything; signal Stop.
+                    self.state.emitted = self.state.buf.len();
                     return FilterAction::Stop;
                 }
             }
@@ -499,6 +510,19 @@ mod tests {
         let mut f = EosFilter::new(cfg_im_end());
         assert_eq!(f.observe(b"hi"), FilterAction::Emit(b"hi".to_vec()));
         assert_eq!(f.observe(b"<|im_end|>"), FilterAction::Stop);
+    }
+
+    #[test]
+    fn stop_at_mid_chunk_emits_prefix_then_stops() {
+        let mut f = EosFilter::new(EosFilterConfig {
+            stop_at: vec![b"END".to_vec()],
+            holdback_prefixes: vec![b"END".to_vec()],
+            ..Default::default()
+        });
+        assert_eq!(
+            f.observe(b"hello END hidden"),
+            FilterAction::StopEmit(b"hello ".to_vec())
+        );
     }
 
     #[test]

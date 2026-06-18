@@ -3190,6 +3190,41 @@ pub const VIT_ATTENTION_OPT_SRC: &str = include_str!("../../../kernels/src/vit_a
 /// Batched GEMM for F32: Y[M,N] = A[M,K] @ B[N,K]^T
 pub const GEMM_F32_SRC: &str = include_str!("../../../kernels/src/gemm_f32.hip");
 
+/// General fp32 GEMM with per-operand transpose flags, for the training path.
+/// C[M,N] = op(A)·op(B); covers forward + both backward matmuls of a linear.
+/// See `kernels/src/gemm_f32_train.hip` and the hipfire-train Phase 0 plan.
+pub const GEMM_F32_TRAIN_SRC: &str = include_str!("../../../kernels/src/gemm_f32_train.hip");
+
+/// RMSNorm forward+backward (fp32) for the un-fused training path.
+/// `rmsnorm_train_fwd` saves `1/r` per row for `rmsnorm_train_bwd`.
+pub const RMSNORM_TRAIN_SRC: &str = include_str!("../../../kernels/src/rmsnorm_train.hip");
+
+/// Row-softmax forward+backward (fp32) for the un-fused training path.
+/// `softmax_train_fwd` writes p; `softmax_train_bwd` consumes it.
+pub const SOFTMAX_TRAIN_SRC: &str = include_str!("../../../kernels/src/softmax_train.hip");
+
+/// SwiGLU (silu(gate)*up) forward+backward (fp32), un-fused training path.
+pub const SWIGLU_TRAIN_SRC: &str = include_str!("../../../kernels/src/swiglu_train.hip");
+
+/// Fused cross-entropy (logsoftmax+NLL) fwd+bwd with ignore_index masking.
+pub const CROSS_ENTROPY_TRAIN_SRC: &str =
+    include_str!("../../../kernels/src/cross_entropy_train.hip");
+
+/// RoPE fwd+bwd (fp32), HF-Llama half-split convention, un-fused training path.
+pub const ROPE_TRAIN_SRC: &str = include_str!("../../../kernels/src/rope_train.hip");
+
+/// Causal mask for attention scores (fp32), un-fused training path.
+pub const CAUSAL_MASK_TRAIN_SRC: &str = include_str!("../../../kernels/src/causal_mask_train.hip");
+
+/// Strided 2D copy / scatter-add (fp32) — GQA gather/scatter primitive.
+pub const STRIDED_COPY_2D_SRC: &str = include_str!("../../../kernels/src/strided_copy_2d.hip");
+
+/// AdamW optimizer step (fp32, decoupled weight decay), un-fused training path.
+pub const ADAMW_TRAIN_SRC: &str = include_str!("../../../kernels/src/adamw_train.hip");
+
+/// KL distillation loss (fwd+bwd, fp32) — soft-target cross-entropy.
+pub const DISTILL_TRAIN_SRC: &str = include_str!("../../../kernels/src/distill_train.hip");
+
 /// LayerNorm with bias: out = gamma * (x - mean) / sqrt(var + eps) + beta
 /// Grid=[batch], Block=[min(256, n)].
 pub const LAYERNORM_SRC: &str = include_str!("../../../kernels/src/layernorm.hip");

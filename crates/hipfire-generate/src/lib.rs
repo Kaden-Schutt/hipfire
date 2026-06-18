@@ -46,12 +46,13 @@ impl GenerationSamplingPolicy {
         default_max_tokens: u32,
         temperature: Option<f64>,
         top_p: Option<f64>,
+        repeat_penalty: Option<f64>,
         max_tokens: Option<u32>,
     ) -> Self {
         Self {
             temperature: temperature.unwrap_or(default_temperature),
             top_p: Some(top_p.unwrap_or(default_top_p)),
-            repeat_penalty: Some(default_repeat_penalty),
+            repeat_penalty: Some(repeat_penalty.unwrap_or(default_repeat_penalty)),
             max_tokens: max_tokens.unwrap_or(default_max_tokens),
         }
     }
@@ -72,9 +73,23 @@ pub struct GenerateTextRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_base64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assistant_prefix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_think_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -115,8 +130,15 @@ impl GenerateTextRequest {
             worker_key_id: None,
             tools: None,
             system: None,
+            stop: None,
+            image_base64: None,
             thinking: None,
+            thinking_mode: None,
+            reasoning_effort: None,
+            assistant_prefix: None,
             max_think_tokens: None,
+            presence_penalty: None,
+            frequency_penalty: None,
             request_id: None,
             evidence_dir: None,
         }
@@ -134,6 +156,40 @@ impl GenerateTextRequest {
 
     pub fn with_system(mut self, system: Option<String>) -> Self {
         self.system = system;
+        self
+    }
+
+    pub fn with_stop(mut self, stop: Option<Vec<String>>) -> Self {
+        self.stop = stop.filter(|seqs| !seqs.is_empty());
+        self
+    }
+
+    pub fn with_image_base64(mut self, image_base64: Option<String>) -> Self {
+        self.image_base64 = image_base64.filter(|s| !s.is_empty());
+        self
+    }
+
+    pub fn with_penalties(
+        mut self,
+        presence_penalty: Option<f64>,
+        frequency_penalty: Option<f64>,
+    ) -> Self {
+        self.presence_penalty = presence_penalty;
+        self.frequency_penalty = frequency_penalty;
+        self
+    }
+
+    pub fn with_thinking_controls(
+        mut self,
+        reasoning_effort: Option<String>,
+        thinking_mode: Option<String>,
+        assistant_prefix: Option<String>,
+        max_think_tokens: Option<u32>,
+    ) -> Self {
+        self.reasoning_effort = reasoning_effort.filter(|s| !s.is_empty());
+        self.thinking_mode = thinking_mode.filter(|s| !s.is_empty());
+        self.assistant_prefix = assistant_prefix.filter(|s| !s.is_empty());
+        self.max_think_tokens = max_think_tokens;
         self
     }
 }
@@ -162,6 +218,7 @@ pub struct GenerateVLParams<'a> {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GenerationEvent {
     Token(TokenEvent),
+    ToolCalls(ToolCallsEvent),
     Done(DoneEvent),
     Error(ErrorEvent),
 }
@@ -170,6 +227,18 @@ pub enum GenerationEvent {
 pub struct TokenEvent {
     pub id: String,
     pub text: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ToolCallsEvent {
+    pub id: String,
+    pub calls: Vec<ToolCall>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ToolCall {
+    pub name: String,
+    pub arguments: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1556,8 +1625,16 @@ mod tests {
 
     #[test]
     fn sampling_policy_applies_generation_overrides() {
-        let sampling =
-            GenerationSamplingPolicy::from_defaults(0.7, 0.9, 1.05, 128, Some(0.2), None, Some(8));
+        let sampling = GenerationSamplingPolicy::from_defaults(
+            0.7,
+            0.9,
+            1.05,
+            128,
+            Some(0.2),
+            None,
+            None,
+            Some(8),
+        );
 
         assert_eq!(sampling.temperature, 0.2);
         assert_eq!(sampling.top_p, Some(0.9));
@@ -1574,6 +1651,22 @@ mod tests {
         assert_eq!(
             serde_json::to_value(token).unwrap(),
             serde_json::json!({"type": "token", "id": "r1", "text": "The"})
+        );
+
+        let tool_calls = GenerationEvent::ToolCalls(ToolCallsEvent {
+            id: "r1".to_string(),
+            calls: vec![ToolCall {
+                name: "lookup".to_string(),
+                arguments: serde_json::json!({"q": "hipfire"}),
+            }],
+        });
+        assert_eq!(
+            serde_json::to_value(tool_calls).unwrap(),
+            serde_json::json!({
+                "type": "tool_calls",
+                "id": "r1",
+                "calls": [{"name": "lookup", "arguments": {"q": "hipfire"}}]
+            })
         );
 
         let done = GenerationEvent::Done(DoneEvent {
@@ -1696,8 +1789,15 @@ mod tests {
             worker_key_id: Some("worker-a".to_string()),
             tools: None,
             system: None,
+            stop: Some(vec!["END".to_string()]),
+            image_base64: Some("AAAA".to_string()),
             thinking: Some("auto".to_string()),
+            thinking_mode: Some("thinking".to_string()),
+            reasoning_effort: Some("low".to_string()),
+            assistant_prefix: Some("open_think".to_string()),
             max_think_tokens: Some(64),
+            presence_penalty: Some(0.1),
+            frequency_penalty: Some(0.2),
             request_id: Some("req-1".to_string()),
             evidence_dir: Some("/tmp/hipfire-evidence".to_string()),
         };
@@ -1711,8 +1811,15 @@ mod tests {
                 "repeat_penalty": 1.05,
                 "max_tokens": 128,
                 "worker_key_id": "worker-a",
+                "stop": ["END"],
+                "image_base64": "AAAA",
                 "thinking": "auto",
+                "thinking_mode": "thinking",
+                "reasoning_effort": "low",
+                "assistant_prefix": "open_think",
                 "max_think_tokens": 64,
+                "presence_penalty": 0.1,
+                "frequency_penalty": 0.2,
                 "request_id": "req-1",
                 "evidence_dir": "/tmp/hipfire-evidence"
             })
