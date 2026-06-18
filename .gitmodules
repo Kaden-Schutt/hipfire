@@ -1,3 +1,6 @@
 [submodule "third_party/amd_matrix_instruction_calculator"]
 	path = third_party/amd_matrix_instruction_calculator
 	url = https://github.com/ROCm/amd_matrix_instruction_calculator.git
+[submodule "third_party/fsr4-rdna3-optimization"]
+	path = third_party/fsr4-rdna3-optimization
+	url = https://github.com/lhl/fsr4-rdna3-optimization.git
