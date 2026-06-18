@@ -14,8 +14,9 @@ use hipfire_train::drafter::{
     drafter_backward, drafter_forward_train, free_drafter_acts, free_drafter_grads, Drafter,
     DrafterConfig,
 };
+use hipfire_train::block::free_block_acts;
 use hipfire_train::loader::load_llama_fp32;
-use hipfire_train::model::{free_model_acts, model_forward, LlamaModel};
+use hipfire_train::model::{model_block_activations, LlamaModel};
 use hipfire_train::ops::pflash_score::pflash_score_forward;
 use hipfire_train::optim::AdamW;
 use rdna_compute::{DType, Gpu};
@@ -122,13 +123,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scores_dev = gpu.zeros(&[nb], DType::F32)?;
     let mut label_mid: Vec<Vec<f32>> = Vec::new();
     let mut base_shallow: Vec<Vec<f32>> = Vec::new();
-    for ids in &chunks {
-        let acts = model_forward(&mut gpu, &target, ids, &pos)?;
-        pflash_score_forward(&mut gpu, &acts.layer_acts[mid].k_r, &scores_dev, SEQ, kvd_t, BLOCK, nb, last)?;
+    for (ci, ids) in chunks.iter().enumerate() {
+        // partial forward to the mid layer only — skips the final norm + the huge
+        // [seq×vocab] logit GEMM that label capture doesn't need.
+        let acts = model_block_activations(&mut gpu, &target, ids, &pos, mid)?;
+        pflash_score_forward(&mut gpu, &acts[mid].k_r, &scores_dev, SEQ, kvd_t, BLOCK, nb, last)?;
         label_mid.push(gpu.download_f32(&scores_dev)?);
-        pflash_score_forward(&mut gpu, &acts.layer_acts[SHALLOW].k_r, &scores_dev, SEQ, kvd_t, BLOCK, nb, last)?;
+        pflash_score_forward(&mut gpu, &acts[SHALLOW].k_r, &scores_dev, SEQ, kvd_t, BLOCK, nb, last)?;
         base_shallow.push(gpu.download_f32(&scores_dev)?);
-        free_model_acts(&mut gpu, acts)?;
+        for b in acts {
+            free_block_acts(&mut gpu, b)?;
+        }
+        eprintln!("  captured labels {}/{}", ci + 1, n_chunks);
     }
     // shallow baseline vs mid label (the bar to beat), eval split
     let bar: f32 = (N_TRAIN..n_chunks)

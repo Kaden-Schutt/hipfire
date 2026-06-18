@@ -254,6 +254,17 @@ pub struct BlockWeightGrad {
     pub dwdown: GpuTensor, // [h, inter]
 }
 
+/// Return one block's saved activations to the pool (GpuTensor has no Drop).
+pub fn free_block_acts(gpu: &mut Gpu, b: BlockActivations) -> HipResult<()> {
+    let BlockActivations {
+        xn1, rinv1, hq, hv, q_r, k_r, v, p_all, ctx, x_mid, xn2, rinv2, gate, up, act, pos,
+    } = b;
+    for t in [xn1, rinv1, hq, hv, q_r, k_r, v, p_all, ctx, x_mid, xn2, rinv2, gate, up, act, pos] {
+        gpu.free_tensor(t)?;
+    }
+    Ok(())
+}
+
 /// Recovery-FT backward: base frozen, returns LoRA + norm grads only.
 pub fn block_backward(
     gpu: &mut Gpu,
