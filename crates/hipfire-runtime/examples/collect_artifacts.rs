@@ -57,31 +57,39 @@ fn main() {
         kldref: want_kldref,
         kldref_topk: 64,
     };
-    let t0 = std::time::Instant::now();
-    let art = qwen35::collect_calibration_artifacts(&mut gpu, &weights, &config, tokens, &opts)
-        .expect("collect");
-    eprintln!(
-        "collected {} hessian tensors in {:.1}s; max diag(H)-vs-Σx² rel-err = {:.3e} {}",
-        art.n_hessian,
-        t0.elapsed().as_secs_f64(),
-        art.max_consistency,
-        if art.max_consistency < 1e-4 {
-            "[CONSISTENT]"
-        } else {
-            "[MISMATCH]"
-        }
-    );
-
     // Provenance keys (caller-known) layered onto the driver's technical metadata.
     let provenance = [
         ("source_model", serde_json::json!(model)),
         ("corpus", serde_json::json!(corpus)),
         ("n_calib_tokens", serde_json::json!(n_tok)),
     ];
-    let n_written = qwen35::write_calib_artifacts(&art, Path::new(&output), &provenance)
-        .expect("write calib.hfq");
-    eprintln!("wrote calib HFQ: {output} ({n_written} tensors)");
-    if art.max_consistency >= 1e-4 {
+    let t0 = std::time::Instant::now();
+    // Streams the package to `output` one tensor at a time (no full-RAM
+    // materialization), returning only a summary.
+    let summary = qwen35::collect_calibration_artifacts(
+        &mut gpu,
+        &weights,
+        &config,
+        tokens,
+        &opts,
+        Path::new(&output),
+        &provenance,
+    )
+    .expect("collect");
+    eprintln!(
+        "collected {} hessian + {} imatrix tensors in {:.1}s; max diag(H)-vs-Σx² rel-err = {:.3e} {}",
+        summary.n_hessian,
+        summary.n_imatrix,
+        t0.elapsed().as_secs_f64(),
+        summary.max_consistency,
+        if summary.max_consistency < 1e-4 {
+            "[CONSISTENT]"
+        } else {
+            "[MISMATCH]"
+        }
+    );
+    eprintln!("wrote calib HFQ: {output}");
+    if summary.max_consistency >= 1e-4 {
         std::process::exit(1);
     }
 }

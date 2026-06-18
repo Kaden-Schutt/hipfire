@@ -80,18 +80,20 @@ integration + cross-model capture, flagged below.
   248 hessian tensors, `diag(Σxxᵀ)==Σx²` CONSISTENT, `[4096,4096]` Hessians. The
   collector generalizes beyond 0.8B. (Run used 16 tokens — mechanism check, not a
   full-quality Hessian.)
-- **Scaling finding (important):** full **fp32** Hessians for a 9B = **~16 GB**
-  held in RAM (`art.tensors` is all in-memory) AND written at once — it filled the
-  63 GB RAM-backed `/tmp`. For ≥9B this does NOT scale. Mitigations, in order of
-  preference:
-  1. **Streaming writer** — write tensors to disk incrementally instead of holding
-     all of `art.tensors` in RAM (the current `write_hfqm_package_mem` takes the
-     full `&[HfqMemTensor]`). Best fix; no precision loss.
-  2. **imatrix-default, Hessian opt-in** — the imatrix (K-vector) is tiny;
-     store Hessians only for GPTQ-target tensors or on `--hessian`.
-  3. **fp16 Hessian** — halves size, but the Hessian is Cholesky-factored at quant
-     time and fp16's range/precision may hurt GPTQ quality; NOT a safe default.
-  Write big-model artifacts to a real disk path, not the RAM-backed `/tmp`.
+- **Scaling finding (RESOLVED — streaming writer shipped).** Originally the
+  collector materialized ALL Hessians in RAM (`drain() -> Vec<HfqMemTensor>`,
+  then `write_hfqm_package_mem`) — ~32 GB for a 9B (down-proj Hessians are
+  `[mi², ]`), filling the 63 GB RAM-backed `/tmp`. Fixed with a **streaming
+  writer** (`hfq::write_hfqm_package_streaming` + `CalibCollector::write_streaming`):
+  the HFQM index/metadata are written first (payload sizes are deterministic from
+  `k`), then each Hessian/imatrix is downloaded → normalized → written → dropped,
+  one at a time. Peak host RAM is now a single tensor (~hundreds of MB) instead of
+  the whole package. `collect_calibration_artifacts` writes directly to the output
+  path (no `CalibArtifacts`/`write_calib_artifacts` round-trip — removed).
+  Verified byte-correct on 0.8B (quantizer reads the streamed file, LDLQ engages
+  on all 8 layer-0 tensors). The imatrix-default / fp16 alternatives are
+  unnecessary now (no precision loss, no RAM ceiling). Still: write big-model
+  artifacts to a real disk path, not the RAM-backed `/tmp`.
 
 - **Daemon `Collect` op — design (review-gated, NOT done autonomously):** the daemon
   (`hipfire-daemon/src/main.rs`, ~9k lines) dispatches via a custom JSON

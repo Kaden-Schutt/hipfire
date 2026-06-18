@@ -9590,37 +9590,32 @@ fn main() {
                     kldref,
                     kldref_topk: 64,
                 };
+                let provenance = [
+                    ("source_model", serde_json::json!(m.model_path)),
+                    ("corpus", serde_json::json!(corpus)),
+                    ("n_calib_tokens", serde_json::json!(n_tok)),
+                ];
+                // Streams the .calib.hfq directly to `output` one tensor at a
+                // time (no full-RAM materialization), returning a summary.
                 match qwen35::collect_calibration_artifacts(
-                    &mut gpu, weights, config, tokens, &opts,
+                    &mut gpu,
+                    weights,
+                    config,
+                    tokens,
+                    &opts,
+                    std::path::Path::new(&output),
+                    &provenance,
                 ) {
-                    Ok(art) => {
-                        let provenance = [
-                            ("source_model", serde_json::json!(m.model_path)),
-                            ("corpus", serde_json::json!(corpus)),
-                            ("n_calib_tokens", serde_json::json!(n_tok)),
-                        ];
-                        match qwen35::write_calib_artifacts(
-                            &art,
-                            std::path::Path::new(&output),
-                            &provenance,
-                        ) {
-                            Ok(_) => {
-                                let resp = serde_json::json!({
-                                    "type": "collected",
-                                    "output": output,
-                                    "n_hessian": art.n_hessian,
-                                    "n_calib_tokens": n_tok,
-                                    "max_consistency": art.max_consistency,
-                                });
-                                let _ = writeln!(stdout, "{resp}");
-                                let _ = stdout.flush();
-                            }
-                            Err(e) => emit_error_with_id(
-                                &mut stdout,
-                                "",
-                                format!("collect: write {output}: {e}"),
-                            ),
-                        }
+                    Ok(summary) => {
+                        let resp = serde_json::json!({
+                            "type": "collected",
+                            "output": output,
+                            "n_hessian": summary.n_hessian,
+                            "n_calib_tokens": n_tok,
+                            "max_consistency": summary.max_consistency,
+                        });
+                        let _ = writeln!(stdout, "{resp}");
+                        let _ = stdout.flush();
                     }
                     Err(e) => emit_error_with_id(&mut stdout, "", format!("collect: {e}")),
                 }

@@ -4585,15 +4585,14 @@ impl Default for CalibOpts {
     }
 }
 
-/// Result of a calibration pass: the HFQ artifact tensors + the technical
-/// metadata block (per-tensor token counts, MoE router histogram, KLDREF
-/// descriptor, artifact list). The caller adds provenance keys (source_model,
-/// corpus, n_calib_tokens) and writes the `.calib.hfq`.
-pub struct CalibArtifacts {
-    pub tensors: Vec<hipfire_runtime::hfq::HfqMemTensor>,
-    pub metadata: serde_json::Value,
-    pub max_consistency: f32,
+/// Summary of a calibration pass after the `.calib.hfq` has been streamed to
+/// disk. The tensors themselves are NOT returned — they are written one at a
+/// time (see [`CalibCollector::write_streaming`]) so a 9B's ~32 GB of Hessians
+/// never sits in host RAM at once.
+pub struct CalibSummary {
     pub n_hessian: usize,
+    pub n_imatrix: usize,
+    pub max_consistency: f32,
 }
 
 /// Single-load calibration driver: arm the [`CalibCollector`] on the resident
@@ -4609,7 +4608,9 @@ pub fn collect_calibration_artifacts(
     config: &Qwen35Config,
     tokens: &[u32],
     opts: &CalibOpts,
-) -> HipResult<CalibArtifacts> {
+    output: &std::path::Path,
+    provenance: &[(&str, serde_json::Value)],
+) -> HipResult<CalibSummary> {
     use hipfire_runtime::calibration::{logsumexp, topk_logits, CalibCollector};
     use hipfire_runtime::hfq::HfqMemTensor;
 
@@ -4658,20 +4659,16 @@ pub fn collect_calibration_artifacts(
         b
     };
 
-    let (mut tensors, max_consistency, token_counts) = collector.drain(gpu);
-    // Dense projections emit `.hessian` + `.imatrix`; imatrix-only tensors (MoE
-    // routed experts) emit just `.imatrix`, so count `.hessian` directly.
-    let n_hessian = tensors
-        .iter()
-        .filter(|t| t.name.ends_with(".hessian"))
-        .count();
-    let n_imatrix = tensors
-        .iter()
-        .filter(|t| t.name.ends_with(".imatrix"))
-        .count();
+    // Descriptors are cheap (no GPU download): counts + per-tensor token map for
+    // the metadata, which the HFQM layout requires written BEFORE the payloads.
+    let descriptors = collector.tensor_descriptors();
+    // Every captured tensor emits `.imatrix`; dense projections also emit
+    // `.hessian` (MoE routed experts are imatrix-only).
+    let n_hessian = descriptors.iter().filter(|d| d.has_hessian).count();
+    let n_imatrix = descriptors.len();
     let mut per_tensor_tokens = serde_json::Map::new();
-    for (name, n) in &token_counts {
-        per_tensor_tokens.insert(name.clone(), serde_json::json!(n));
+    for d in &descriptors {
+        per_tensor_tokens.insert(d.name.clone(), serde_json::json!(d.n_tokens));
     }
     let mut artifacts = vec![serde_json::json!("hessian"), serde_json::json!("imatrix")];
 
@@ -4715,7 +4712,9 @@ pub fn collect_calibration_artifacts(
         }
     }
 
-    // KLDREF tensors.
+    // KLDREF tensors — small, already in host RAM; passed as `extra` to the
+    // streaming writer (the big Hessians stream straight from GPU).
+    let mut extra: Vec<HfqMemTensor> = Vec::new();
     if !kldref.is_empty() {
         let np = kldref.len();
         let kk = kldref[0].1.len();
@@ -4733,7 +4732,7 @@ pub fn collect_calibration_artifacts(
             ("lm_head.kldref_logit", vec![np as u32, kk as u32], lg_v),
             ("lm_head.kldref_logz", vec![np as u32], lz_v),
         ] {
-            tensors.push(HfqMemTensor {
+            extra.push(HfqMemTensor {
                 name: nm.to_string(),
                 quant_type: 2,
                 shape,
@@ -4751,36 +4750,23 @@ pub fn collect_calibration_artifacts(
         .unwrap()
         .insert("artifacts".to_string(), serde_json::Value::Array(artifacts));
 
-    Ok(CalibArtifacts {
-        tensors,
-        metadata: meta,
-        max_consistency,
-        n_hessian,
-    })
-}
-
-/// Layer caller-known provenance keys onto the driver's technical metadata and
-/// write the unified `.calib.hfq`. Shared by the `collect_artifacts` CLI/example
-/// and the daemon `Collect` op so the provenance+write half isn't duplicated.
-/// Returns the number of tensors written.
-pub fn write_calib_artifacts(
-    art: &CalibArtifacts,
-    output: &std::path::Path,
-    provenance: &[(&str, serde_json::Value)],
-) -> std::io::Result<usize> {
-    let mut metadata = art.metadata.clone();
-    if let Some(obj) = metadata.as_object_mut() {
+    // Caller-known provenance (source_model, corpus, n_calib_tokens) layered
+    // onto the technical metadata, then the package is streamed to `output`.
+    if let Some(obj) = meta.as_object_mut() {
         for (k, v) in provenance {
             obj.insert((*k).to_string(), v.clone());
         }
     }
-    hipfire_runtime::hfq::write_hfqm_package_mem(
-        output,
-        0,
-        &serde_json::to_string(&metadata).unwrap(),
-        &art.tensors,
-    )?;
-    Ok(art.tensors.len())
+    let metadata_json = serde_json::to_string(&meta).unwrap();
+    let max_consistency = collector
+        .write_streaming(gpu, output, 0, &metadata_json, &extra)
+        .map_err(|e| HipError::new(0, &format!("write .calib.hfq: {e}")))?;
+
+    Ok(CalibSummary {
+        n_hessian,
+        n_imatrix,
+        max_consistency,
+    })
 }
 
 pub fn load_weights(

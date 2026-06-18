@@ -315,39 +315,54 @@ pub struct HfqMemTensor {
     pub data: Vec<u8>,
 }
 
-/// Write an HFQM container from in-memory tensors (vs the file-sourced
-/// [`write_hfqm_package_from_files`]). Used by the artifact collector and the
-/// `hfq` tool to emit/transform containers without round-tripping through temp
-/// files. Mirrors the canonical layout: 32-byte header, metadata JSON, index,
-/// 4096-aligned tensor data.
-pub fn write_hfqm_package_mem(
+/// Descriptor for one tensor in a streaming HFQM write. `data_len` is the exact
+/// payload byte count (deterministic from `shape` + `quant_type`), so the index
+/// can be written before any payload is materialized — that is what lets the
+/// collector stream multi-GB Hessians one tensor at a time instead of holding
+/// them all in RAM.
+pub struct HfqStreamEntry {
+    pub name: String,
+    pub quant_type: u8,
+    pub shape: Vec<u32>,
+    pub group_size: u32,
+    pub data_len: u64,
+}
+
+/// Streaming HFQM writer: write the header + metadata + index up front (payload
+/// sizes come from `entries`), then call `write_nth(i, w)` once per entry, in
+/// index order, to stream that tensor's `data_len` bytes directly to the file.
+/// Only one tensor's payload need exist in memory at a time. `write_nth` MUST
+/// write exactly `entries[i].data_len` bytes. This is the canonical HFQM layout
+/// impl (the in-memory [`write_hfqm_package_mem`] is a thin wrapper over it).
+pub fn write_hfqm_package_streaming(
     path: &Path,
     arch_id: u32,
     metadata_json: &str,
-    tensors: &[HfqMemTensor],
+    entries: &[HfqStreamEntry],
+    mut write_nth: impl FnMut(usize, &mut dyn Write) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let meta = metadata_json.as_bytes();
     let metadata_offset = 32u64;
     let index_offset = metadata_offset + meta.len() as u64;
     let mut index = Vec::new();
-    index.extend_from_slice(&(tensors.len() as u32).to_le_bytes());
-    for t in tensors {
-        let nb = t.name.as_bytes();
+    index.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for e in entries {
+        let nb = e.name.as_bytes();
         if nb.len() > u16::MAX as usize {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("HFQM entry name too long: {}", t.name),
+                format!("HFQM entry name too long: {}", e.name),
             ));
         }
         index.extend_from_slice(&(nb.len() as u16).to_le_bytes());
         index.extend_from_slice(nb);
-        index.push(t.quant_type);
-        index.push(t.shape.len() as u8);
-        for &d in &t.shape {
+        index.push(e.quant_type);
+        index.push(e.shape.len() as u8);
+        for &d in &e.shape {
             index.extend_from_slice(&d.to_le_bytes());
         }
-        index.extend_from_slice(&t.group_size.to_le_bytes());
-        index.extend_from_slice(&(t.data.len() as u64).to_le_bytes());
+        index.extend_from_slice(&e.group_size.to_le_bytes());
+        index.extend_from_slice(&e.data_len.to_le_bytes());
     }
     let data_start = index_offset + index.len() as u64;
     let data_offset = (data_start + 4095) & !4095;
@@ -355,17 +370,75 @@ pub fn write_hfqm_package_mem(
     f.write_all(HFQM_MAGIC)?;
     f.write_all(&HFQM_VERSION.to_le_bytes())?;
     f.write_all(&arch_id.to_le_bytes())?;
-    f.write_all(&(tensors.len() as u32).to_le_bytes())?;
+    f.write_all(&(entries.len() as u32).to_le_bytes())?;
     f.write_all(&metadata_offset.to_le_bytes())?;
     f.write_all(&data_offset.to_le_bytes())?;
     f.write_all(meta)?;
     f.write_all(&index)?;
     f.write_all(&vec![0u8; (data_offset - data_start) as usize])?;
-    for t in tensors {
-        f.write_all(&t.data)?;
+    // Stream each payload through a counting writer that enforces the declared
+    // data_len, so a producer bug can't silently desync the index from the data.
+    for (i, e) in entries.iter().enumerate() {
+        let mut counter = CountingWriter {
+            inner: &mut f,
+            written: 0,
+        };
+        write_nth(i, &mut counter)?;
+        if counter.written != e.data_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "HFQM entry {}: wrote {} bytes, index declared {}",
+                    e.name, counter.written, e.data_len
+                ),
+            ));
+        }
     }
     f.flush()?;
     Ok(())
+}
+
+/// Wraps a writer and counts bytes written, to verify a streaming producer
+/// emitted exactly the declared payload length.
+struct CountingWriter<'a, W: Write> {
+    inner: &'a mut W,
+    written: u64,
+}
+
+impl<W: Write> Write for CountingWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Write an HFQM container from in-memory tensors. Thin wrapper over
+/// [`write_hfqm_package_streaming`] for callers that already hold every payload
+/// in RAM (e.g. small sidecars, tests). Large producers (the calibration
+/// collector) should stream instead.
+pub fn write_hfqm_package_mem(
+    path: &Path,
+    arch_id: u32,
+    metadata_json: &str,
+    tensors: &[HfqMemTensor],
+) -> std::io::Result<()> {
+    let entries: Vec<HfqStreamEntry> = tensors
+        .iter()
+        .map(|t| HfqStreamEntry {
+            name: t.name.clone(),
+            quant_type: t.quant_type,
+            shape: t.shape.clone(),
+            group_size: t.group_size,
+            data_len: t.data.len() as u64,
+        })
+        .collect();
+    write_hfqm_package_streaming(path, arch_id, metadata_json, &entries, |i, w| {
+        w.write_all(&tensors[i].data)
+    })
 }
 
 /// Drop page cache for a file byte range via posix_fadvise(FADV_DONTNEED).

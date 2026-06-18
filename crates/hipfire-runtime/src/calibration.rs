@@ -132,87 +132,175 @@ impl CalibCollector {
         self.len() == 0
     }
 
-    /// Drain to HFQ tensors (`<name>.hessian` + `<name>.imatrix`, both finalized
-    /// `/ n_tokens`), plus the max relative `diag(H)`-vs-`Σx²` error (should be
-    /// ~0; the two reduction kernels must agree on the same activations) and a
-    /// `name -> n_tokens` map for provenance.
-    pub fn drain(&self, gpu: &mut Gpu) -> (Vec<HfqMemTensor>, f32, HashMap<String, u64>) {
+    /// Per-tensor descriptors (no GPU work): `name`, whether it has a full
+    /// Hessian, `k`, and `n_tokens`. The caller uses these to compute counts +
+    /// `name -> n_tokens` provenance for the metadata BEFORE the streaming write
+    /// (the HFQM index/metadata must be written ahead of the payloads).
+    pub fn tensor_descriptors(&self) -> Vec<CalibTensorDesc> {
+        let accs = self.accs.lock().unwrap();
+        let mut names: Vec<&String> = accs.keys().collect();
+        names.sort();
+        names
+            .iter()
+            .map(|name| {
+                let acc = &accs[*name];
+                CalibTensorDesc {
+                    name: (*name).clone(),
+                    has_hessian: acc.h.is_some(),
+                    k: acc.k,
+                    n_tokens: acc.n_tokens,
+                }
+            })
+            .collect()
+    }
+
+    /// Stream the accumulated tensors into an HFQM `.calib.hfq` at `path`,
+    /// **one tensor at a time** (download → normalize `/ n_tokens` → write →
+    /// drop), so peak host memory is a single Hessian rather than all of them
+    /// (a 9B is ~32 GB if materialized at once). `extra` holds any small
+    /// already-in-RAM tensors (e.g. KLDREF) the caller wants in the same
+    /// package. The metadata + index are written first (payload sizes are
+    /// deterministic from `k`), then the payloads stream. Returns the max
+    /// relative `diag(H)`-vs-`Σx²` consistency error. Also runs the optional
+    /// f64 audit (`HIPFIRE_CALIB_F64_AUDIT`) during the per-Hessian download.
+    pub fn write_streaming(
+        &self,
+        gpu: &mut Gpu,
+        path: &std::path::Path,
+        arch_id: u32,
+        metadata_json: &str,
+        extra: &[HfqMemTensor],
+    ) -> std::io::Result<f32> {
+        use crate::hfq::{write_hfqm_package_streaming, HfqStreamEntry};
+        use std::cell::{Cell, RefCell};
+
         let mut accs = self.accs.lock().unwrap();
-        // Flush any staged activation rows before reading the accumulators.
+        // Fold any staged activation rows before reading the accumulators.
         for acc in accs.values_mut() {
             acc.flush(gpu);
         }
-        let mut names: Vec<&String> = accs.keys().collect();
+        let mut names: Vec<String> = accs.keys().cloned().collect();
         names.sort();
-        let mut tensors = Vec::with_capacity(names.len() * 2);
-        let mut max_consistency = 0.0f32;
-        let mut token_counts = HashMap::new();
-        // f64 audit accumulators (only populated under HIPFIRE_CALIB_F64_AUDIT).
-        let mut f64_audit_max = 0.0f64;
-        let mut f64_audit_worst = String::new();
-        let mut f64_audit_n = 0usize;
-        let f32_bytes = |v: &[f32]| -> Vec<u8> {
-            let mut b = Vec::with_capacity(v.len() * 4);
-            for &x in v {
-                b.extend_from_slice(&x.to_le_bytes());
-            }
-            b
-        };
+
+        // Build the index entries (payload sizes from `k`) + a parallel plan of
+        // how to produce each payload, in the SAME order.
+        enum Plan {
+            Hessian(String),
+            Imatrix(String),
+            Extra(usize),
+        }
+        let mut entries: Vec<HfqStreamEntry> = Vec::new();
+        let mut plan: Vec<Plan> = Vec::new();
         for name in &names {
-            let acc = &accs[*name];
-            let diag = gpu.download_f32(&acc.diag).expect("download imatrix");
-            let inv = 1.0 / acc.n_tokens.max(1) as f32;
-            // Full Hessian (dense projections). Imatrix-only tensors (MoE
-            // routed experts) skip this and emit only `.imatrix`.
-            if let Some(h_t) = &acc.h {
-                let h = gpu.download_f32(h_t).expect("download hessian");
-                for c in 0..acc.k {
-                    let rel = (h[c * acc.k + c] - diag[c]).abs() / diag[c].abs().max(1.0);
-                    max_consistency = max_consistency.max(rel);
-                }
-                // f64 audit: max element-wise relative divergence between the
-                // f32-GPU and f64-CPU accumulations of the same Σxxᵀ. Compared
-                // on the raw sums (the /n_tokens scale is identical for both).
-                if let Some(h_ref) = &acc.h_f64 {
-                    f64_audit_n += 1;
-                    let mut tmax = 0.0f64;
-                    for idx in 0..acc.k * acc.k {
-                        let r = h_ref[idx];
-                        let rel = (h[idx] as f64 - r).abs() / r.abs().max(1.0);
-                        tmax = tmax.max(rel);
-                    }
-                    if tmax > f64_audit_max {
-                        f64_audit_max = tmax;
-                        f64_audit_worst = (*name).clone();
-                    }
-                }
-                let hessian: Vec<f32> = h.iter().map(|v| v * inv).collect();
-                tensors.push(HfqMemTensor {
+            let acc = &accs[name];
+            if acc.h.is_some() {
+                entries.push(HfqStreamEntry {
                     name: format!("{name}.hessian"),
                     quant_type: 2,
                     shape: vec![acc.k as u32, acc.k as u32],
                     group_size: 0,
-                    data: f32_bytes(&hessian),
+                    data_len: (acc.k * acc.k * 4) as u64,
                 });
+                plan.push(Plan::Hessian(name.clone()));
             }
-            let imatrix: Vec<f32> = diag.iter().map(|v| v * inv).collect();
-            tensors.push(HfqMemTensor {
+            entries.push(HfqStreamEntry {
                 name: format!("{name}.imatrix"),
                 quant_type: 2,
                 shape: vec![acc.k as u32],
                 group_size: 0,
-                data: f32_bytes(&imatrix),
+                data_len: (acc.k * 4) as u64,
             });
-            token_counts.insert((*name).clone(), acc.n_tokens);
+            plan.push(Plan::Imatrix(name.clone()));
         }
-        if f64_audit_n > 0 {
+        for (j, t) in extra.iter().enumerate() {
+            entries.push(HfqStreamEntry {
+                name: t.name.clone(),
+                quant_type: t.quant_type,
+                shape: t.shape.clone(),
+                group_size: t.group_size,
+                data_len: t.data.len() as u64,
+            });
+            plan.push(Plan::Extra(j));
+        }
+
+        let max_consistency = Cell::new(0.0f32);
+        let audit_max = Cell::new(0.0f64);
+        let audit_n = Cell::new(0usize);
+        let audit_worst = RefCell::new(String::new());
+        let io_err = |e: rdna_compute::HipError| std::io::Error::other(e.to_string());
+
+        write_hfqm_package_streaming(path, arch_id, metadata_json, &entries, |i, w| {
+            match &plan[i] {
+                Plan::Hessian(name) => {
+                    let acc = &accs[name];
+                    let inv = 1.0 / acc.n_tokens.max(1) as f32;
+                    let h = gpu.download_f32(acc.h.as_ref().unwrap()).map_err(io_err)?;
+                    let diag = gpu.download_f32(&acc.diag).map_err(io_err)?;
+                    let mut mc = max_consistency.get();
+                    for c in 0..acc.k {
+                        let rel = (h[c * acc.k + c] - diag[c]).abs() / diag[c].abs().max(1.0);
+                        mc = mc.max(rel);
+                    }
+                    max_consistency.set(mc);
+                    if let Some(h_ref) = &acc.h_f64 {
+                        let mut tmax = 0.0f64;
+                        for idx in 0..acc.k * acc.k {
+                            let r = h_ref[idx];
+                            tmax = tmax.max((h[idx] as f64 - r).abs() / r.abs().max(1.0));
+                        }
+                        audit_n.set(audit_n.get() + 1);
+                        if tmax > audit_max.get() {
+                            audit_max.set(tmax);
+                            *audit_worst.borrow_mut() = name.clone();
+                        }
+                    }
+                    write_f32_scaled(w, &h, inv)
+                }
+                Plan::Imatrix(name) => {
+                    let acc = &accs[name];
+                    let inv = 1.0 / acc.n_tokens.max(1) as f32;
+                    let diag = gpu.download_f32(&acc.diag).map_err(io_err)?;
+                    write_f32_scaled(w, &diag, inv)
+                }
+                Plan::Extra(j) => w.write_all(&extra[*j].data),
+            }
+        })?;
+
+        if audit_n.get() > 0 {
             eprintln!(
-                "F64 AUDIT: max f32-vs-f64 Σxxᵀ rel-diff = {f64_audit_max:.3e} over {f64_audit_n} \
-                 Hessians (worst: {f64_audit_worst}); n_tokens spread across the accumulation"
+                "F64 AUDIT: max f32-vs-f64 Σxxᵀ rel-diff = {:.3e} over {} Hessians (worst: {})",
+                audit_max.get(),
+                audit_n.get(),
+                audit_worst.borrow()
             );
         }
-        (tensors, max_consistency, token_counts)
+        Ok(max_consistency.get())
     }
+}
+
+/// Per-tensor descriptor from [`CalibCollector::tensor_descriptors`].
+pub struct CalibTensorDesc {
+    pub name: String,
+    pub has_hessian: bool,
+    pub k: usize,
+    pub n_tokens: u64,
+}
+
+/// Stream `v * scale` as little-endian f32 to `w` in bounded chunks (so a
+/// multi-hundred-MB Hessian never materializes a second full byte buffer).
+fn write_f32_scaled(w: &mut dyn std::io::Write, v: &[f32], scale: f32) -> std::io::Result<()> {
+    let mut buf: Vec<u8> = Vec::with_capacity(16384);
+    for &x in v {
+        buf.extend_from_slice(&(x * scale).to_le_bytes());
+        if buf.len() >= 16384 {
+            w.write_all(&buf)?;
+            buf.clear();
+        }
+    }
+    if !buf.is_empty() {
+        w.write_all(&buf)?;
+    }
+    Ok(())
 }
 
 impl ActivationCapture for CalibCollector {
