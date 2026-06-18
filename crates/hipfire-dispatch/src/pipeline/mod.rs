@@ -229,6 +229,33 @@ pub fn check_moe_decode_supported(
 /// substituting `ffn.*`/`config.*`/`s.*` references with `MoeParams` fields.
 /// Resolution is owned here (computed from `MoeDtypes` + k), and `ctx` is
 /// threaded to every inner GEMV so the call site builds one `DispatchCtx`.
+/// Plain GEMV that short-circuits BF16 weights to the WMMA GEMM. The gemv
+/// family `for_gemv` has no `(BF16, Plain)` entry (BF16 has no scalar GEMV
+/// kernel — it uses WMMA), so a bf16 weight through `run_auto` errors with
+/// `gemv.unknown`. `weight_gemv` (llama.rs) short-circuits the same way for the
+/// dense path; the MoE family executor needs the identical fast path so bf16
+/// MoE source models (the calibration target) run their FFN forward. BF16 needs
+/// no rotation/AWQ (mirrors `weight_gemv`'s bf16 branch), and routing through
+/// `gemm_bf16_x_bf16_wmma` also fires the calibration capture hook keyed by the
+/// weight buffer pointer. Decode width is 1. All non-bf16 dtypes go through
+/// `run_auto` unchanged — byte-identical for mq*/paro production.
+fn moe_gemv_plain(
+    ctx: &DispatchCtx,
+    gpu: &mut Gpu,
+    gemv: &GemvFamily,
+    w: &WeightRef,
+    x: &GpuTensor,
+    y: &GpuTensor,
+) -> Result<(), DispatchError> {
+    if w.dtype == DType::BF16 {
+        return gpu
+            .gemm_bf16_x_bf16_wmma(w.buf, x, y, w.m, w.k, 1)
+            .map_err(|e| DispatchError::Hip(e.to_string()));
+    }
+    gemv.run_auto(ctx, gpu, w, x, y)
+        .map_err(|e| DispatchError::Hip(e.to_string()))
+}
+
 pub fn run_moe_decode(
     ctx: &DispatchCtx,
     gpu: &mut Gpu,
@@ -327,14 +354,17 @@ pub fn run_moe_decode(
     } else {
         static GEMV_GATE: OnceLock<GemvFamily> = OnceLock::new();
         let gemv = GEMV_GATE.get_or_init(GemvFamily::new);
-        gemv.run_auto(ctx, gpu, &p.router, p.x_norm, p.router_logits)
-            .map_err(|e| DispatchError::Hip(e.to_string()))?;
-        gemv.run_auto(ctx, gpu, &p.shared_expert_gate, p.x_norm, p.scalar_buf)
-            .map_err(|e| DispatchError::Hip(e.to_string()))?;
-        gemv.run_auto(ctx, gpu, &p.shared_gate_w, p.x_norm, &shared_gate)
-            .map_err(|e| DispatchError::Hip(e.to_string()))?;
-        gemv.run_auto(ctx, gpu, &p.shared_up_w, p.x_norm, &shared_up)
-            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        moe_gemv_plain(ctx, gpu, gemv, &p.router, p.x_norm, p.router_logits)?;
+        moe_gemv_plain(
+            ctx,
+            gpu,
+            gemv,
+            &p.shared_expert_gate,
+            p.x_norm,
+            p.scalar_buf,
+        )?;
+        moe_gemv_plain(ctx, gpu, gemv, &p.shared_gate_w, p.x_norm, &shared_gate)?;
+        moe_gemv_plain(ctx, gpu, gemv, &p.shared_up_w, p.x_norm, &shared_up)?;
     }
 
     // ── Top-K + routed experts: CPU-top-K generic fallback ───────────────────
@@ -701,7 +731,7 @@ fn run_moe_decode_cpu_fallback(
             hip!(gpu.silu_mul_f32(shared_gate, shared_up, &shared_hid))?;
             static GEMV_DOWN_FB: OnceLock<GemvFamily> = OnceLock::new();
             let gemv = GEMV_DOWN_FB.get_or_init(GemvFamily::new);
-            gemv.run_auto(ctx, gpu, &p.shared_down_w, &shared_hid, p.ffn_out)?;
+            moe_gemv_plain(ctx, gpu, gemv, &p.shared_down_w, &shared_hid, p.ffn_out)?;
             hip!(gpu.scaled_add_inplace_gpu_scalar_f32(p.x_residual, p.ffn_out, p.scalar_buf))?;
         }
         #[cfg(not(feature = "deltanet"))]
@@ -720,19 +750,16 @@ fn run_moe_decode_cpu_fallback(
     for (&expert_idx, &weight) in topk_indices.iter().zip(topk_weights.iter()) {
         let (gate_up_w, down_w) = &p.routed_experts[expert_idx];
 
-        // gate_up: y = W·x  (run_auto auto-rotates for MQ/Paro dtypes).
-        {
-            gemv.run_auto(ctx, gpu, gate_up_w, p.x_norm, p.gate_up_buf)?;
-        }
+        // gate_up: y = W·x  (run_auto auto-rotates for MQ/Paro dtypes; bf16
+        // short-circuits to the WMMA gemm + fires the capture hook).
+        moe_gemv_plain(ctx, gpu, gemv, gate_up_w, p.x_norm, p.gate_up_buf)?;
         let gate_view = unsafe { slice_moe_f32_view(p.gate_up_buf, 0, mi) };
         let up_view = unsafe { slice_moe_f32_view(p.gate_up_buf, mi, mi) };
 
         // silu(gate)·up → ffn_hidden, then down GEMV, then weighted residual add.
         let hid_view = unsafe { slice_moe_f32_view(p.ffn_hidden, 0, mi) };
         hip!(gpu.silu_mul_f32(&gate_view, &up_view, &hid_view))?;
-        {
-            gemv.run_auto(ctx, gpu, down_w, &hid_view, p.ffn_out)?;
-        }
+        moe_gemv_plain(ctx, gpu, gemv, down_w, &hid_view, p.ffn_out)?;
         hip!(gpu.scaled_add_inplace_cpu_scalar_f32(p.x_residual, p.ffn_out, weight))?;
     }
 

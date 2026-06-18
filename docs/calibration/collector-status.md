@@ -52,11 +52,12 @@ integration + cross-model capture, flagged below.
    Wire the per-session histogram (esp. the co-occurrence pairs) into the
    scheduler's expert-affinity grouping so the paged-expert (`WeightPager`) path
    sees fewer page-ins. Scheduler hot-path — do with review.
-4. **MoE-expert capture for A3B Hessians** — CAPTURE SIDE DONE (loop session 3,
+4. **MoE-expert capture for A3B Hessians** — DONE + VERIFIED E2E (loop session 3,
    see Update below): `build_capture_names` maps MoE dense projections (full
-   Hessian) + resident routed experts (imatrix-only). BLOCKED on E2E by the bf16
-   A3B MoE forward gap (also below). Paged-mode experts still uncovered (buffers
-   owned by the WeightPager, ptrs patched per-token — needs pager-side capture).
+   Hessian) + resident routed experts (imatrix-only); the bf16 MoE forward gap
+   that blocked E2E is fixed (`moe_gemv_plain`). Verified on `qwen3.6-35b-a3b-bf16`:
+   350 dense Hessians CONSISTENT + 3014 routed-expert imatrices. Remaining:
+   paged-mode experts (WeightPager-owned buffers — needs pager-side capture).
 5. **#11 cross-model** — once (4) lands, generate full `.calib.hfq` (Hessian +
    histogram) for the two `qwen3.5/3.6-35b-a3b` models and re-run the
    importance/KLD sweep to confirm generality.
@@ -127,26 +128,25 @@ Always state the box for perf numbers (gfx1151/Strix Halo here).
   (`HIPFIRE_QWEN35_PAGED_EXPERTS` unset = the default; paged mode owns buffers in
   the WeightPager and patches ptrs per-token, so capture-by-buf-ptr can't key them).
 
-- **BLOCKER — bf16 A3B forward is unsupported (orthogonal to capture).** E2E
-  verification on `qwen3.6-35b-a3b-bf16` (the calib SOURCE) loads fully (40
-  layers, 64.56 GiB on gfx1151) but the FIRST forward token fails:
-  `HIP error: unsupported gemv.unknown for /`. Root: `KernelKey::for_gemv(dtype,
-  Plain)` (`hipfire-dispatch/src/types.rs:561`) has **no `(BF16, Plain)` entry**,
-  so it returns `UnsupportedVariant{family:"gemv", variant:"unknown", arch:"",
-  quant:""}` (→ "gemv.unknown for /"). `weight_gemv` short-circuits BF16 to
-  `gemm_bf16_x_bf16_wmma` (`llama.rs:780`), but the A3B MoE FFN forward does NOT
-  go through `weight_gemv` — it routes through the **Ship 4.1 MoE dispatch
-  family** `hipfire_runtime::llama::moe_family().run()` (`qwen35.rs:8140`), whose
-  inner gemvs resolve via `for_gemv` and have no BF16 path. The dense hybrid
-  `qwen3.5-0.8b-bf16` (same DeltaNet+FullAttn arch) calibrates fine, so the gap is
-  isolated to the **MoE family executor's bf16 dispatch** (never exercised before
-  — bf16 MoE source models are normally quantized, not inferred). **Next step
-  (NOT a one-line short-circuit — a dispatch-family feature, scope accordingly):**
-  add BF16 support to the MoE family's inner gate/up/down/router gemvs (route bf16
-  weights to `gemm_bf16_x_bf16_wmma` inside the family executor). Low regression
-  risk for mq* production (the change only affects the arm that currently
-  hard-errors), but verify against the working mq4 `qwen3.6-35b-a3b` coherence +
-  speed gates. Until then, capture only fires at the BF16/F16 chokepoints, so a
-  faithful A3B Hessian needs the bf16 MoE family forward supported first; the
-  capture-name + imatrix-only plumbing is already in place and will populate
-  per-expert imatrices the moment that forward runs.
+- **bf16 A3B MoE forward — RESOLVED, and A3B capture VERIFIED E2E.** The bf16 MoE
+  FFN forward routes through the Ship 4.1 MoE dispatch family
+  (`hipfire_runtime::llama::moe_family().run()` → `pipeline::run_moe_decode`),
+  whose inner gemvs resolved via `for_gemv` — which has **no `(BF16, Plain)` entry**
+  (BF16 has no scalar GEMV kernel; it uses WMMA), so the first forward token failed
+  `unsupported gemv.unknown for /`. Fix (commit pending): added `moe_gemv_plain`
+  (`pipeline/mod.rs`), a `weight_gemv`-style helper that short-circuits BF16 →
+  `gemm_bf16_x_bf16_wmma`, applied at the 7 bf16-reachable gemv sites (router +
+  3 shared on the gate side; shared-down + per-expert gate_up + down in the
+  CPU-top-K fallback). Non-bf16 dtypes still go through `run_auto` unchanged
+  (byte-identical for mq*/paro production — the change only touches the arm that
+  previously hard-errored). **Bonus:** routing bf16 through `gemm_bf16_x_bf16_wmma`
+  is exactly the capture chokepoint, so this simultaneously unblocked the forward
+  AND fired the MoE capture. Verified on `qwen3.6-35b-a3b-bf16` (gfx1151, 8 tokens):
+  **350 dense Hessians (CONSISTENT, rel-err 0.000e0)** + 3364 imatrices (350 dense
+  + 3014 routed-expert imatrix-only), 3714 tensors. Structure confirmed via `hfq
+  list`: dense projections (linear_attn in_proj_*/out_proj, full_attn q/k/v/o,
+  router `mlp.gate`, shared_expert gate/up/down) carry both `.hessian [K,K]` +
+  `.imatrix [K]`; routed `mlp.experts.{x}.{gate_up,down}_proj` carry `.imatrix`
+  only (shapes [2048]/[512]). A full-corpus run (more tokens) covers more of the
+  256×40 experts; 8 tokens hit 1507 distinct (expert,layer,proj) imatrices. Paged
+  mode still uncovered (WeightPager owns buffers).
