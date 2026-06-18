@@ -36,13 +36,19 @@ integration + cross-model capture, flagged below.
 
 ## Remaining (needs design/review — paused for the user)
 
-1. **Daemon `Collect` op** — host `CalibCollector` on the resident model (calibrate
-   without reload). Additive `DaemonRequest` variant + handler that arms the
-   collector, forwards the corpus, writes the `.calib.hfq`, returns the path. The
-   data plane stays daemon-internal (only a control message + file path cross the
-   JSONL boundary). NOTE: touches the daemon↔eval interface flagged as possibly
-   unstable — do with review. Expose ALSO as a CLI subcommand so the capability
-   doesn't depend on the eval seam.
+1. **Daemon `Collect` op** — DONE + VERIFIED E2E (loop session 5). Additive
+   `{"type":"collect",...}` handler calibrates the resident model in place (no
+   reload) and writes the `.calib.hfq`, returning `{"type":"collected", output,
+   n_hessian, n_calib_tokens, max_consistency}`. Data plane stays daemon-internal
+   (only request + summary cross JSONL). Single-GPU (pp==1) qwen3.5-family bf16
+   only; additive/gated, never on the decode hot path. Pieces: typed
+   `CollectRequest`/`CollectResponse` + `DaemonRequest::Collect`/`Collected`
+   (hipfire-daemon-protocol), `DaemonProcess::collect` adapter method
+   (hipfire-daemon-adapter), and the daemon handler (parses msg fields directly,
+   calls `qwen35::collect_calibration_artifacts` on `LoadedModel.q35_weights`,
+   writes via the shared `qwen35::write_calib_artifacts`). Verified on resident
+   `qwen3.5-0.8b-bf16`: `n_hessian=186, max_consistency=0.0`. The CLI subcommand
+   (above) remains the standalone in-process path.
 2. **eval `calibrate` battery** — DONE (loop session 4). Additive
    `BatteryId::Calibrate` (opt-in via `--battery calibrate`, not in any default
    tier) spawns the `collect_artifacts` example via the examples executor and

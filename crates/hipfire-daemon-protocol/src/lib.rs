@@ -14,6 +14,34 @@ pub struct RequestControl {
     pub id: String,
 }
 
+/// Calibrate the resident model in place (no reload): run the Tier-1
+/// calibration collector over `corpus` and write a unified `.calib.hfq` to
+/// `output`. The data plane stays daemon-internal — only this request and the
+/// resulting path cross the JSONL boundary. Requires a resident bf16 model
+/// (capture fires at the bf16/f16 gemm chokepoints).
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CollectRequest {
+    /// Path to a UTF-8 corpus file (tokenized with the resident tokenizer).
+    pub corpus: String,
+    /// Path to write the `.calib.hfq` artifact.
+    pub output: String,
+    /// Max calibration tokens (default 512 if absent).
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
+    /// Also capture the lm-head top-K KLDREF reference.
+    #[serde(default)]
+    pub kldref: bool,
+}
+
+/// Result of a [`DaemonRequest::Collect`] op.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CollectResponse {
+    pub output: String,
+    pub n_hessian: usize,
+    pub n_calib_tokens: usize,
+    pub max_consistency: f32,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonRequest {
@@ -25,6 +53,7 @@ pub enum DaemonRequest {
     Generate(GenerateTextRequest),
     Abort(RequestControl),
     ForceAnswer(RequestControl),
+    Collect(CollectRequest),
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,6 +68,7 @@ pub enum DaemonResponse {
     ToolCalls(ToolCallsEvent),
     Done(DoneEvent),
     Error(ErrorEvent),
+    Collected(CollectResponse),
     #[serde(other)]
     Unknown,
 }

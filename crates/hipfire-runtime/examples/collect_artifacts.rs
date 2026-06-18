@@ -58,7 +58,7 @@ fn main() {
         kldref_topk: 64,
     };
     let t0 = std::time::Instant::now();
-    let mut art = qwen35::collect_calibration_artifacts(&mut gpu, &weights, &config, tokens, &opts)
+    let art = qwen35::collect_calibration_artifacts(&mut gpu, &weights, &config, tokens, &opts)
         .expect("collect");
     eprintln!(
         "collected {} hessian tensors in {:.1}s; max diag(H)-vs-Σx² rel-err = {:.3e} {}",
@@ -73,19 +73,14 @@ fn main() {
     );
 
     // Provenance keys (caller-known) layered onto the driver's technical metadata.
-    let obj = art.metadata.as_object_mut().unwrap();
-    obj.insert("source_model".to_string(), serde_json::json!(model));
-    obj.insert("corpus".to_string(), serde_json::json!(corpus));
-    obj.insert("n_calib_tokens".to_string(), serde_json::json!(n_tok));
-
-    hipfire_runtime::hfq::write_hfqm_package_mem(
-        Path::new(&output),
-        0,
-        &serde_json::to_string(&art.metadata).unwrap(),
-        &art.tensors,
-    )
-    .expect("write calib.hfq");
-    eprintln!("wrote calib HFQ: {output} ({} tensors)", art.tensors.len());
+    let provenance = [
+        ("source_model", serde_json::json!(model)),
+        ("corpus", serde_json::json!(corpus)),
+        ("n_calib_tokens", serde_json::json!(n_tok)),
+    ];
+    let n_written = qwen35::write_calib_artifacts(&art, Path::new(&output), &provenance)
+        .expect("write calib.hfq");
+    eprintln!("wrote calib HFQ: {output} ({n_written} tensors)");
     if art.max_consistency >= 1e-4 {
         std::process::exit(1);
     }

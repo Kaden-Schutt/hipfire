@@ -3206,7 +3206,9 @@ thread_local! {
 /// wins; otherwise default to raw for base/completion models (no chat_template)
 /// and framed for chat models (has a chat_template).
 fn effective_raw(m: &LoadedModel) -> bool {
-    RAW_OVERRIDE.with(|c| c.get()).unwrap_or(m.chat_template.is_none())
+    RAW_OVERRIDE
+        .with(|c| c.get())
+        .unwrap_or(m.chat_template.is_none())
 }
 
 struct LoadedModel {
@@ -9518,6 +9520,110 @@ fn main() {
             "ping" => {
                 let _ = writeln!(stdout, r#"{{"type":"pong"}}"#);
                 let _ = stdout.flush();
+            }
+
+            // Calibrate the resident model in place (no reload): run the Tier-1
+            // collector over a corpus and write a .calib.hfq. The data plane stays
+            // daemon-internal — only the request + the resulting path/summary cross
+            // JSONL. Single-GPU qwen3.5-family bf16 only (capture fires at the
+            // bf16 chokepoints); additive and gated, never on the decode hot path.
+            "collect" => {
+                // Parse fields directly from the JSON message (the daemon is the
+                // server side; the typed CollectRequest contract lives in
+                // hipfire-daemon-protocol for clients). Field names must match.
+                let Some(corpus) = msg.get("corpus").and_then(|v| v.as_str()).map(String::from)
+                else {
+                    emit_error_with_id(&mut stdout, "", "collect: missing 'corpus'".to_string());
+                    continue;
+                };
+                let Some(output) = msg.get("output").and_then(|v| v.as_str()).map(String::from)
+                else {
+                    emit_error_with_id(&mut stdout, "", "collect: missing 'output'".to_string());
+                    continue;
+                };
+                let max_tokens = msg
+                    .get("max_tokens")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(512);
+                let kldref = msg.get("kldref").and_then(|v| v.as_bool()).unwrap_or(false);
+                let Some(m) = model.as_ref() else {
+                    emit_error_with_id(&mut stdout, "", "collect: no model loaded".to_string());
+                    continue;
+                };
+                if m.pp != 1 {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "collect: requires a single-GPU resident model (pp == 1)".to_string(),
+                    );
+                    continue;
+                }
+                let (Some(weights), Some(config), Some(tokenizer)) = (
+                    m.q35_weights.as_ref(),
+                    m.q35_config.as_ref(),
+                    m.tokenizer.as_ref(),
+                ) else {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "collect: resident model is not a qwen3.5-family model with a tokenizer"
+                            .to_string(),
+                    );
+                    continue;
+                };
+                let text = match std::fs::read_to_string(&corpus) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            format!("collect: read corpus {corpus}: {e}"),
+                        );
+                        continue;
+                    }
+                };
+                let all = tokenizer.encode(&text);
+                let n_tok = all.len().min(max_tokens);
+                let tokens = &all[..n_tok];
+                let opts = qwen35::CalibOpts {
+                    kldref,
+                    kldref_topk: 64,
+                };
+                match qwen35::collect_calibration_artifacts(
+                    &mut gpu, weights, config, tokens, &opts,
+                ) {
+                    Ok(art) => {
+                        let provenance = [
+                            ("source_model", serde_json::json!(m.model_path)),
+                            ("corpus", serde_json::json!(corpus)),
+                            ("n_calib_tokens", serde_json::json!(n_tok)),
+                        ];
+                        match qwen35::write_calib_artifacts(
+                            &art,
+                            std::path::Path::new(&output),
+                            &provenance,
+                        ) {
+                            Ok(_) => {
+                                let resp = serde_json::json!({
+                                    "type": "collected",
+                                    "output": output,
+                                    "n_hessian": art.n_hessian,
+                                    "n_calib_tokens": n_tok,
+                                    "max_consistency": art.max_consistency,
+                                });
+                                let _ = writeln!(stdout, "{resp}");
+                                let _ = stdout.flush();
+                            }
+                            Err(e) => emit_error_with_id(
+                                &mut stdout,
+                                "",
+                                format!("collect: write {output}: {e}"),
+                            ),
+                        }
+                    }
+                    Err(e) => emit_error_with_id(&mut stdout, "", format!("collect: {e}")),
+                }
             }
 
             "diag" => {

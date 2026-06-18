@@ -10,7 +10,9 @@ use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::future::BoxFuture;
-use hipfire_daemon_protocol::{DaemonRequest, DaemonResponse, RequestControl};
+use hipfire_daemon_protocol::{
+    CollectRequest, CollectResponse, DaemonRequest, DaemonResponse, RequestControl,
+};
 use hipfire_generate::{DoneEvent, GenerateTextRequest, ToolCall};
 use hipfire_model::{AcceleratorInventory, ModelLoadParams, ModelLoadRequest, ModelLoadedResponse};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -240,6 +242,22 @@ impl DaemonEngine {
                 DaemonResponse::Unknown => {}
                 other => {
                     tracing::warn!("unexpected response during inventory: {other:?}");
+                }
+            }
+        }
+    }
+
+    /// Send `collect` (calibrate the resident model in place) and wait for the
+    /// resulting `.calib.hfq` path + summary.
+    pub async fn collect(&mut self, req: CollectRequest) -> anyhow::Result<CollectResponse> {
+        self.send(&DaemonRequest::Collect(req)).await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::Collected(resp) => return Ok(resp),
+                DaemonResponse::Error(e) => anyhow::bail!("daemon collect error: {}", e.message),
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during collect: {other:?}");
                 }
             }
         }

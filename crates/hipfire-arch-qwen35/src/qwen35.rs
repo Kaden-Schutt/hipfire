@@ -4759,6 +4759,30 @@ pub fn collect_calibration_artifacts(
     })
 }
 
+/// Layer caller-known provenance keys onto the driver's technical metadata and
+/// write the unified `.calib.hfq`. Shared by the `collect_artifacts` CLI/example
+/// and the daemon `Collect` op so the provenance+write half isn't duplicated.
+/// Returns the number of tensors written.
+pub fn write_calib_artifacts(
+    art: &CalibArtifacts,
+    output: &std::path::Path,
+    provenance: &[(&str, serde_json::Value)],
+) -> std::io::Result<usize> {
+    let mut metadata = art.metadata.clone();
+    if let Some(obj) = metadata.as_object_mut() {
+        for (k, v) in provenance {
+            obj.insert((*k).to_string(), v.clone());
+        }
+    }
+    hipfire_runtime::hfq::write_hfqm_package_mem(
+        output,
+        0,
+        &serde_json::to_string(&metadata).unwrap(),
+        &art.tensors,
+    )?;
+    Ok(art.tensors.len())
+}
+
 pub fn load_weights(
     hfq: &mut HfqFile,
     config: &Qwen35Config,
