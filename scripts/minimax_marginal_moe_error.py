@@ -2,7 +2,7 @@ import struct, numpy as np
 
 def load(p):
     b = open(p, "rb").read()
-    assert b[:8] == b"HFHS\0\0\0\0", p
+    assert b[:8] == b"HFHIDDEN", p
     nl, npos, h, _ = struct.unpack_from("<IIII", b, 8)
     return np.frombuffer(b, dtype=np.float32, offset=24).reshape(nl, npos, h)
 

@@ -39,7 +39,7 @@ mod qtip;
 // QTIP-LDLQ (Phase C1e) — output-aware trellis encode.
 #[allow(dead_code)]
 mod ldlq;
-// HFHS Hessian sidecar reader (was orphaned; now wired for QTIP-LDLQ).
+// HFQM `.calib.hfq` Hessian reader (wired for QTIP-LDLQ).
 #[allow(dead_code)]
 mod hessian_io;
 // KVarN (Phase D) — variance-normalized 4-bit KV, clean-room CPU core.

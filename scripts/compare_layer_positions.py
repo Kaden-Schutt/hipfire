@@ -32,7 +32,7 @@ def parse_args():
 def read_hfhs(path):
     with open(path, "rb") as f:
         magic = f.read(8)
-        if magic != b"HFHS\0\0\0\0":
+        if magic != b"HFHIDDEN":
             sys.exit(f"{path}: bad magic")
         n_layers, n_pos, hidden, _ = struct.unpack("<IIII", f.read(16))
         body = np.frombuffer(f.read(), dtype=np.float32)

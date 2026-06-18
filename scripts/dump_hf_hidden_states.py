@@ -14,7 +14,7 @@ to localize which layer first diverges by how much.
 
 Output format (raw little-endian):
   - header: 16 bytes
-      magic 8B = b"HFHS\\0\\0\\0\\0"
+      magic 8B = b"HFHIDDEN"
       n_layers u32
       n_pos u32  (= n_ctx; we dump *every* position so cosine is
                   per-position per-layer)
@@ -141,7 +141,7 @@ def main():
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "wb") as f:
-        f.write(b"HFHS\0\0\0\0")
+        f.write(b"HFHIDDEN")
         f.write(struct.pack("<IIII", n_layers, n_ctx, hidden_dim, 0))
         for layer_idx in range(n_layers):
             if layer_idx < n_layers - 1:

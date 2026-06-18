@@ -7,7 +7,7 @@
 # Builds a small random-weight Lfm2MoeForCausalLM that EXERCISES ALL PATHS:
 #   * conv mixer (LIV short-conv, K=3) AND attention mixer (GQA + qk-norm)
 #   * dense SwiGLU MLP (the first num_dense_layers) AND sparse top-4 MoE
-# then dumps per-layer POST-residual hidden states in the shared HFHS format
+# then dumps per-layer POST-residual hidden states in the shared HFHIDDEN format
 # for comparison against the hipfire decode_step (see
 # docs/methodology/arch-port-validation.md and compare_hidden_states.py).
 #
@@ -25,7 +25,7 @@
 #   python3 scripts/gen_tiny_lfm2moe.py --out /tmp/tiny_lfm2moe
 # Produces:
 #   <out>/hf/            tiny HF checkpoint (bf16 safetensors + config.json)
-#   <out>/oracle.hfhs    per-layer hidden states (HFHS)
+#   <out>/oracle.hfhs    per-layer hidden states (HFHIDDEN)
 #   <out>/tokens.json    the fixed input token ids
 import argparse, json, os, struct, sys
 
@@ -149,12 +149,12 @@ def main():
     n_layers = cfg.num_hidden_layers
     n_pos = len(TOKENS)
     hidden = cfg.hidden_size
-    # ----- write HFHS -----
-    # magic "HFHS\0\0\0\0", <IIII> n_layers,n_pos,hidden,reserved,
+    # ----- write HFHIDDEN -----
+    # magic "HFHIDDEN", <IIII> n_layers,n_pos,hidden,reserved,
     # then n_layers x [n_pos, hidden] f32 row-major.
     out_path = os.path.join(args.out, "oracle.hfhs")
     with open(out_path, "wb") as f:
-        f.write(b"HFHS\x00\x00\x00\x00")
+        f.write(b"HFHIDDEN")
         f.write(struct.pack("<IIII", n_layers, n_pos, hidden, 0))
         for i in range(n_layers):
             arr = captures[i].contiguous().numpy().astype("float32")

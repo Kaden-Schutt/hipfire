@@ -82,7 +82,7 @@ def main():
     h.remove()
     post_last = cap["x"][0]
     with open(out / "oracle_hidden.hfhs", "wb") as f:
-        f.write(b"HFHS\0\0\0\0"); f.write(struct.pack("<IIII", n_layers, args.n_ctx, hidden, 0))
+        f.write(b"HFHIDDEN"); f.write(struct.pack("<IIII", n_layers, args.n_ctx, hidden, 0))
         for k in range(n_layers):
             t = hs[k + 1][0] if k < n_layers - 1 else post_last
             assert tuple(t.shape) == (args.n_ctx, hidden), (k, t.shape)
@@ -102,7 +102,7 @@ def main():
     for h2 in handles:
         h2.remove()
     with open(out / "oracle_postattn.hfhs", "wb") as f:
-        f.write(b"HFHS\0\0\0\0"); f.write(struct.pack("<IIII", n_layers, args.n_ctx, hidden, 0))
+        f.write(b"HFHIDDEN"); f.write(struct.pack("<IIII", n_layers, args.n_ctx, hidden, 0))
         for k in range(n_layers):
             arr = pa[k][0].float().cpu().contiguous().numpy()
             assert arr.shape == (args.n_ctx, hidden), (k, arr.shape)

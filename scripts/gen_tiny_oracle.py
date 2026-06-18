@@ -15,7 +15,7 @@ Outputs into <out>:
   oracle_postattn.hfhs               (HF per-layer post-ATTENTION residual; for bisection)
   tokens.hfkldr                      (fixed token chunk both dumpers read)
 
-HFHS = magic "HFHS\\0\\0\\0\\0" + <IIII>(n_layers,n_pos,hidden,0) + n_layers×[n_pos,hidden] f32.
+HFHIDDEN = magic "HFHIDDEN" + <IIII>(n_layers,n_pos,hidden,0) + n_layers×[n_pos,hidden] f32.
 HFKLDR = magic "HFKLDR\\0\\0" + 24B hdr (n_ctx@[4:8], n_chunk@[12:16]) + n_ctx u32 tokens @32.
 
 ──────────────────────────────────────────────────────────────────────────────
@@ -115,7 +115,7 @@ def flat_config_fields(cfg):
 
 def write_hfhs(path, tensors, n_layers, n_ctx, hidden):
     with open(path, "wb") as f:
-        f.write(b"HFHS\0\0\0\0")
+        f.write(b"HFHIDDEN")
         f.write(struct.pack("<IIII", n_layers, n_ctx, hidden, 0))
         for k in range(n_layers):
             arr = tensors[k].float().cpu().contiguous().numpy()

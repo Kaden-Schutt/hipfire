@@ -12,7 +12,7 @@
 //! Reads chunk-N tokens from a hipfire-β kldref so the input matches the
 //! eval pipeline byte-for-byte, runs `forward_scratch_with_hidden` per
 //! position with ALL layers configured as extraction targets, and writes a
-//! single HFHS binary containing post-layer hidden states for every layer +
+//! single HFHIDDEN binary containing post-layer hidden states for every layer +
 //! every position.
 //!
 //! Reuses the existing `HiddenStateRingBuffer` from spec-decode infra
@@ -21,7 +21,7 @@
 //! range.
 //!
 //! Output format mirrors `scripts/dump_hf_hidden_states.py`:
-//!   magic 8B = b"HFHS\0\0\0\0"
+//!   magic 8B = b"HFHIDDEN"
 //!   n_layers u32
 //!   n_pos u32  (= n_ctx)
 //!   hidden_dim u32
@@ -245,13 +245,13 @@ fn main() {
     }
     eprintln!("forward complete in {:.1}s", t0.elapsed().as_secs_f64());
 
-    // -------- download each layer's buffer + write HFHS file --------
+    // -------- download each layer's buffer + write HFHIDDEN file --------
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent).expect("mkdir");
     }
     let out_file = File::create(&out_path).expect("create out");
     let mut out = BufWriter::with_capacity(8 * 1024 * 1024, out_file);
-    out.write_all(b"HFHS\0\0\0\0").unwrap();
+    out.write_all(b"HFHIDDEN").unwrap();
     out.write_all(&(config.n_layers as u32).to_le_bytes())
         .unwrap();
     out.write_all(&(n_ctx as u32).to_le_bytes()).unwrap();

@@ -4,7 +4,7 @@
 //! comparison against the HF transformers oracle (arch bring-up validation).
 //!
 //! Reads a JSON array of token ids, runs `decode_step_capture` per position
-//! with all layers captured, and writes a single HFHS binary of post-layer
+//! with all layers captured, and writes a single HFHIDDEN binary of post-layer
 //! (pre-final-norm) hidden states — byte-format-compatible with
 //! `scripts/gen_tiny_lfm2moe.py` + `scripts/compare_hidden_states.py`.
 //!
@@ -110,12 +110,12 @@ fn main() {
     }
     eprintln!("forward complete in {:.2}s", t0.elapsed().as_secs_f64());
 
-    // ---- write HFHS ----
+    // ---- write HFHIDDEN ----
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
     let mut out = BufWriter::new(File::create(&out_path).expect("create out"));
-    out.write_all(b"HFHS\0\0\0\0").unwrap();
+    out.write_all(b"HFHIDDEN").unwrap();
     out.write_all(&(cfg.num_hidden_layers as u32).to_le_bytes())
         .unwrap();
     out.write_all(&(n_ctx as u32).to_le_bytes()).unwrap();

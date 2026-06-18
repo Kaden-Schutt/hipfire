@@ -4482,7 +4482,7 @@ fn rq_apply_writer(
 }
 
 /// Build the calibration capture map: device-buffer-pointer → canonical .hfq
-/// tensor name (matching the HFHS/imatrix key convention,
+/// tensor name (matching the `.calib.hfq` Hessian/imatrix key convention,
 /// `model.language_model.layers.{i}.{role}`, no `.weight` suffix), for every
 /// residual-linear weight. The forward's gemv arms resolve their weight buffer
 /// pointer through this map to attribute captured activations. No loader change —

@@ -7,7 +7,7 @@
 """Compare per-layer hidden states between HF transformers oracle and
 hipfire dump (Step A phase 3).
 
-Reads two HFHS-format binary dumps produced by
+Reads two HFHIDDEN-format binary dumps produced by
   scripts/dump_hf_hidden_states.py    (HF transformers BF16 oracle)
   examples/dump_qwen35_hidden_states  (hipfire forward, captured via
                                        HiddenStateRingBuffer)
@@ -45,7 +45,7 @@ def parse_args():
 def read_hfhs(path: Path):
     with open(path, "rb") as f:
         magic = f.read(8)
-        if magic != b"HFHS\0\0\0\0":
+        if magic != b"HFHIDDEN":
             sys.exit(f"{path}: bad magic {magic!r}")
         n_layers, n_pos, hidden_dim, _reserved = struct.unpack("<IIII", f.read(16))
         # body: n_layers * [n_pos, hidden_dim] f32
