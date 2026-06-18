@@ -29,7 +29,11 @@ use std::path::Path;
 const MODEL_DIR: &str =
     "/srv/huggingface/models--SupraLabs--Supra-50M-Instruct/snapshots/77a1c2a33f386f9f4bf7151ec5f2156b62caac39";
 const L: usize = 32;
-const BITS: u32 = 3; // qtip3 (matches the quantizer)
+// BITS matches the quantizer's qtip format (3 = qtip3, 2 = qtip2-sim).
+// Set via HIPFIRE_QTIP_BITS (default 3).
+fn bits() -> u32 {
+    std::env::var("HIPFIRE_QTIP_BITS").ok().and_then(|v| v.parse().ok()).unwrap_or(3)
+}
 const BEAM: usize = 128; // matches the quantizer
 const LR: f32 = 1e-3;
 const STEPS: usize = 200;
@@ -45,11 +49,11 @@ culture continue to influence the modern world to this day in countless ways.";
 
 /// Quantize only the qtip3-eligible linears (q/k/v/o/gate/up) to match the
 /// daemon; leave down_proj (BF16 in daemon) and embed (Q8) ~original.
-fn quantize_matching(gpu: &mut Gpu, w: &mut LlamaWeightsF32) -> Result<(), Box<dyn std::error::Error>> {
+fn quantize_matching(gpu: &mut Gpu, w: &mut LlamaWeightsF32, bits: u32) -> Result<(), Box<dyn std::error::Error>> {
     for l in w.layers.iter_mut() {
         for t in [&mut l.q_proj, &mut l.k_proj, &mut l.v_proj, &mut l.o_proj, &mut l.gate_proj, &mut l.up_proj] {
             let host = gpu.download_f32(t)?;
-            let q = qtip_quantize_dequant(&host, BITS, BEAM);
+            let q = qtip_quantize_dequant(&host, bits, BEAM);
             *t = gpu.upload_f32(&q, &t.shape.clone())?;
         }
     }
@@ -71,8 +75,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (cfg, w_teacher) = load_llama_fp32(&mut gpu, dir)?;
     let (_, mut w_student) = load_llama_fp32(&mut gpu, dir)?;
     let vocab = cfg.vocab_size;
-    println!("building daemon-matching student (qtip-{BITS} beam {BEAM} on q/k/v/o/gate/up)...");
-    quantize_matching(&mut gpu, &mut w_student)?;
+    println!("building daemon-matching student (qtip-{} beam {BEAM} on q/k/v/o/gate/up)...", bits());
+    let b = bits(); quantize_matching(&mut gpu, &mut w_student, b)?;
 
     let teacher = LlamaModel::from_f32_weights(&mut gpu, &cfg, w_teacher, L, 16, 32.0)?;
     let student = LlamaModel::from_f32_weights(&mut gpu, &cfg, w_student, L, 16, 32.0)?;
@@ -133,6 +137,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if n != tuned.len() {
         return Err(format!("patched {n} but had {} tuned norms — name mismatch", tuned.len()).into());
     }
-    println!("OK — recovered qtip3 .hfq written (codes unchanged, norms tuned).");
+    println!("OK — recovered qtip-{} .hfq written (codes/weights unchanged, norms tuned).", bits());
     Ok(())
 }
