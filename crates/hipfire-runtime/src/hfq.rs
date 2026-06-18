@@ -306,6 +306,68 @@ pub fn write_hfqm_package_from_files(
     Ok(())
 }
 
+/// One in-memory tensor for [`write_hfqm_package_mem`].
+pub struct HfqMemTensor {
+    pub name: String,
+    pub quant_type: u8,
+    pub shape: Vec<u32>,
+    pub group_size: u32,
+    pub data: Vec<u8>,
+}
+
+/// Write an HFQM container from in-memory tensors (vs the file-sourced
+/// [`write_hfqm_package_from_files`]). Used by the artifact collector and the
+/// `hfq` tool to emit/transform containers without round-tripping through temp
+/// files. Mirrors the canonical layout: 32-byte header, metadata JSON, index,
+/// 4096-aligned tensor data.
+pub fn write_hfqm_package_mem(
+    path: &Path,
+    arch_id: u32,
+    metadata_json: &str,
+    tensors: &[HfqMemTensor],
+) -> std::io::Result<()> {
+    let meta = metadata_json.as_bytes();
+    let metadata_offset = 32u64;
+    let index_offset = metadata_offset + meta.len() as u64;
+    let mut index = Vec::new();
+    index.extend_from_slice(&(tensors.len() as u32).to_le_bytes());
+    for t in tensors {
+        let nb = t.name.as_bytes();
+        if nb.len() > u16::MAX as usize {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("HFQM entry name too long: {}", t.name),
+            ));
+        }
+        index.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+        index.extend_from_slice(nb);
+        index.push(t.quant_type);
+        index.push(t.shape.len() as u8);
+        for &d in &t.shape {
+            index.extend_from_slice(&d.to_le_bytes());
+        }
+        index.extend_from_slice(&t.group_size.to_le_bytes());
+        index.extend_from_slice(&(t.data.len() as u64).to_le_bytes());
+    }
+    let data_start = index_offset + index.len() as u64;
+    let data_offset = (data_start + 4095) & !4095;
+    let mut f = std::io::BufWriter::new(File::create(path)?);
+    f.write_all(HFQM_MAGIC)?;
+    f.write_all(&HFQM_VERSION.to_le_bytes())?;
+    f.write_all(&arch_id.to_le_bytes())?;
+    f.write_all(&(tensors.len() as u32).to_le_bytes())?;
+    f.write_all(&metadata_offset.to_le_bytes())?;
+    f.write_all(&data_offset.to_le_bytes())?;
+    f.write_all(meta)?;
+    f.write_all(&index)?;
+    f.write_all(&vec![0u8; (data_offset - data_start) as usize])?;
+    for t in tensors {
+        f.write_all(&t.data)?;
+    }
+    f.flush()?;
+    Ok(())
+}
+
 /// Drop page cache for a file byte range via posix_fadvise(FADV_DONTNEED).
 /// On unified-memory APUs (e.g. Strix Halo), mmap'd model data and
 /// hipMalloc'd GPU copies share physical RAM — without this, loading

@@ -16,10 +16,10 @@
 //!     --output /tmp/qwen3.5-0.8b-native.hessian.bin --max-tokens 512
 
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
+use hipfire_runtime::hfq::HfqMemTensor;
 use hipfire_runtime::llama::KvCache;
 use rdna_compute::{ActivationCapture, DType, Gpu, GpuTensor};
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -135,30 +135,53 @@ fn main() {
     // Disarm before draining (avoid capturing the drain's own ops, if any).
     gpu.active_capture = None;
 
-    // Drain + verify diag(H) == Σx² (the two kernels agree on real activations).
+    // Drain + verify diag(H) == Σx² (the two kernels agree on real activations),
+    // and build the HFQ artifact tensors: <name>.hessian (E[xxᵀ], [K,K]) +
+    // <name>.imatrix (E[x²], [K]). F32 = quant_type 2.
     let accs = collector.accs.lock().unwrap();
     let mut names_sorted: Vec<&String> = accs.keys().collect();
     names_sorted.sort();
     let mut max_consistency = 0.0f32;
-    let mut records: Vec<(String, usize, Vec<f32>)> = Vec::new();
+    let mut tensors: Vec<HfqMemTensor> = Vec::new();
+    let mut per_tensor_tokens = serde_json::Map::new();
+    let f32_bytes = |v: &[f32]| -> Vec<u8> {
+        let mut b = Vec::with_capacity(v.len() * 4);
+        for &x in v {
+            b.extend_from_slice(&x.to_le_bytes());
+        }
+        b
+    };
     for name in &names_sorted {
         let acc = &accs[*name];
         let diag = gpu.download_f32(&acc.diag).unwrap();
         let h = gpu.download_f32(&acc.h).unwrap();
-        // diag(H)[c] vs Σx²[c]
         let mut md = 0.0f32;
         for c in 0..acc.k {
             md = md.max((h[c * acc.k + c] - diag[c]).abs() / diag[c].abs().max(1.0));
         }
         max_consistency = max_consistency.max(md);
-        // Finalize H / n_tokens for the HFHS payload.
         let inv = 1.0 / acc.n_tokens as f32;
-        let h_final: Vec<f32> = h.iter().map(|v| v * inv).collect();
-        records.push(((*name).clone(), acc.k, h_final));
+        let hessian: Vec<f32> = h.iter().map(|v| v * inv).collect();
+        let imatrix: Vec<f32> = diag.iter().map(|v| v * inv).collect();
+        tensors.push(HfqMemTensor {
+            name: format!("{name}.hessian"),
+            quant_type: 2,
+            shape: vec![acc.k as u32, acc.k as u32],
+            group_size: 0,
+            data: f32_bytes(&hessian),
+        });
+        tensors.push(HfqMemTensor {
+            name: format!("{name}.imatrix"),
+            quant_type: 2,
+            shape: vec![acc.k as u32],
+            group_size: 0,
+            data: f32_bytes(&imatrix),
+        });
+        per_tensor_tokens.insert((*name).clone(), serde_json::json!(acc.n_tokens));
     }
     eprintln!(
         "drained {} tensors; max diag(H)-vs-Σx² rel-err = {max_consistency:.3e} {}",
-        records.len(),
+        names_sorted.len(),
         if max_consistency < 1e-4 {
             "[CONSISTENT]"
         } else {
@@ -166,25 +189,24 @@ fn main() {
         }
     );
 
-    // Write HFHS v1 (matches scripts/collect_hessian.py / hessian_io.rs reader).
-    let mut f = std::io::BufWriter::new(std::fs::File::create(&output).expect("create out"));
-    f.write_all(b"HFHS").unwrap();
-    f.write_all(&1u32.to_le_bytes()).unwrap(); // version
-    f.write_all(&(records.len() as u64).to_le_bytes()).unwrap(); // n_tensors
-    f.write_all(&0u64.to_le_bytes()).unwrap(); // reserved
-    for (name, k, h_final) in &records {
-        let nb = name.as_bytes();
-        f.write_all(&(nb.len() as u32).to_le_bytes()).unwrap();
-        f.write_all(nb).unwrap();
-        f.write_all(&0u32.to_le_bytes()).unwrap(); // expert_idx
-        f.write_all(&(*k as u32).to_le_bytes()).unwrap(); // K
-        f.write_all(&1u32.to_le_bytes()).unwrap(); // dtype_flag = F32
-        let bytes =
-            unsafe { std::slice::from_raw_parts(h_final.as_ptr() as *const u8, h_final.len() * 4) };
-        f.write_all(bytes).unwrap();
-    }
-    f.flush().unwrap();
-    eprintln!("wrote HFHS: {output}");
+    // Provenance metadata (the unify-on-HFQ decision: artifacts carry their own
+    // producer/corpus/token provenance, queryable via `hfq meta-get`).
+    let meta = serde_json::json!({
+        "artifact_kind": "calibration",
+        "source_model": model,
+        "corpus": corpus,
+        "n_calib_tokens": n_tok,
+        "artifacts": ["hessian", "imatrix"],
+        "per_tensor_tokens": serde_json::Value::Object(per_tensor_tokens),
+    });
+    hipfire_runtime::hfq::write_hfqm_package_mem(
+        Path::new(&output),
+        0,
+        &serde_json::to_string(&meta).unwrap(),
+        &tensors,
+    )
+    .expect("write calib.hfq");
+    eprintln!("wrote calib HFQ: {output} ({} tensors)", tensors.len());
     if max_consistency >= 1e-4 {
         std::process::exit(1);
     }
