@@ -135,6 +135,7 @@ pub enum BatteryId {
     Vision,
     Cask,
     Profile,
+    Calibrate,
 }
 
 impl BatteryId {
@@ -156,6 +157,7 @@ impl BatteryId {
             "vision" => Ok(Self::Vision),
             "cask" => Ok(Self::Cask),
             "profile" => Ok(Self::Profile),
+            "calibrate" | "calibration" => Ok(Self::Calibrate),
             other => Err(format!("unknown battery: {other}")),
         }
     }
@@ -178,6 +180,7 @@ impl BatteryId {
             Self::Vision => "vision",
             Self::Cask => "cask",
             Self::Profile => "profile",
+            Self::Calibrate => "calibrate",
         }
     }
 }
@@ -5384,6 +5387,7 @@ fn examples_battery_rows(
                 .map(|model| run_examples_profile_anchor(config, ctx, model))
                 .collect(),
         ),
+        BatteryId::Calibrate => Some(run_examples_calibrate_rows(config, ctx)),
         _ => None,
     }
 }
@@ -6488,6 +6492,7 @@ fn examples_executor_available_for(battery: BatteryId) -> bool {
         BatteryId::Pflash => resolve_pflash_niah_bench_bin().is_some(),
         BatteryId::Agentic => hipfire_coherence::daemon_binary_available(),
         BatteryId::Runtime => true,
+        BatteryId::Calibrate => resolve_collect_artifacts_bin().is_some(),
         _ => false,
     }
 }
@@ -6653,6 +6658,166 @@ fn run_examples_longctx_anchor(config: &EvalConfig, ctx: &EvalContext) -> EvalRe
             0,
         ),
     }
+}
+
+/// Tier-1 calibration battery: run the single-load `collect_artifacts` example
+/// over each evaluation model and assert the on-GPU Hessian/imatrix internal
+/// consistency (`diag(Σxxᵀ)==Σx²`) plus a non-zero captured-tensor count. This
+/// is a mechanism/correctness check (small token budget), not a full-quality
+/// Hessian. Capture fires only at the bf16/f16 chokepoints, so non-bf16 models
+/// are skipped. Not in any default tier — opt in with `--battery calibrate`.
+fn run_examples_calibrate_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
+    evaluation_models(config)
+        .into_iter()
+        .map(|model| run_examples_calibrate_model(config, ctx, model))
+        .collect()
+}
+
+fn run_examples_calibrate_model(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    model: String,
+) -> EvalResult {
+    let label = "single_load_hessian_consistency";
+    let prompt_ref = prompt("benchmarks/prompts/lru_cache_single_blank.txt");
+    let base_metrics = BTreeMap::from([
+        ("implemented".to_string(), json!(true)),
+        ("executor".to_string(), json!("examples")),
+        ("suite".to_string(), json!("calibration")),
+    ]);
+
+    let skip = |reason: &str| -> EvalResult {
+        row_for_model(
+            BatteryId::Calibrate,
+            None,
+            label,
+            None,
+            EvalStatus::Skip,
+            Some(reason.to_string()),
+            base_metrics.clone(),
+            config,
+            ctx,
+            prompt_ref.clone(),
+            0,
+            model.clone(),
+        )
+    };
+
+    // Capture fires at the bf16/f16 gemm chokepoints, so a faithful calibration
+    // pass needs a bf16 source model.
+    if !model_artifact_stem(&model).contains("bf16") {
+        return skip(
+            "calibration requires a bf16 source model (capture fires at the bf16 chokepoint)",
+        );
+    }
+    if !Path::new(&model).exists() {
+        return skip("collect_artifacts requires --model to be a local filesystem path");
+    }
+    let Some(bin) = resolve_collect_artifacts_bin() else {
+        return skip("collect_artifacts example binary not found; build with `cargo build --release -p hipfire-runtime --example collect_artifacts`");
+    };
+
+    let corpus = repo_root()
+        .map(|r| r.join("benchmarks/prompts/lru_cache_single_blank.txt"))
+        .unwrap_or_else(|| PathBuf::from("benchmarks/prompts/lru_cache_single_blank.txt"));
+    let out = std::env::temp_dir().join(format!(
+        "hipfire-eval-calib-{}.calib.hfq",
+        std::process::id()
+    ));
+    let max_tokens = config.max_tokens.clamp(16, 64).to_string();
+    let args = vec![
+        "--model".to_string(),
+        model.clone(),
+        "--corpus".to_string(),
+        corpus.display().to_string(),
+        "--output".to_string(),
+        out.display().to_string(),
+        "--max-tokens".to_string(),
+        max_tokens,
+    ];
+    let command_display = format!("{} {}", bin.display(), args.join(" "));
+    let started = SystemTime::now();
+    let output = match Command::new(&bin).args(&args).output() {
+        Ok(o) => o,
+        Err(err) => {
+            let mut m = base_metrics.clone();
+            m.insert("command".to_string(), json!(command_display));
+            return row_for_model(
+                BatteryId::Calibrate,
+                None,
+                label,
+                None,
+                EvalStatus::Fail,
+                Some(format!("spawn collect_artifacts: {err}")),
+                m,
+                config,
+                ctx,
+                prompt_ref,
+                elapsed_since_ms(started),
+                model,
+            );
+        }
+    };
+    let elapsed_ms = elapsed_since_ms(started);
+    let _ = std::fs::remove_file(&out);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // collect_artifacts prints to stderr:
+    //   "collected N hessian tensors in ...s; max diag(H)-vs-Σx² rel-err = ... [CONSISTENT]"
+    let combined = format!("{stdout}{stderr}");
+    let consistent = combined.contains("[CONSISTENT]");
+    let n_hessian = parse_collected_hessian_count(&combined);
+
+    let mut metrics = base_metrics.clone();
+    metrics.insert("command".to_string(), json!(command_display));
+    metrics.insert("consistent".to_string(), json!(consistent));
+    if let Some(n) = n_hessian {
+        metrics.insert("n_hessian".to_string(), json!(n));
+    }
+    metrics.insert(
+        "stderr_hash".to_string(),
+        json!(stable_hash_bytes(stderr.as_bytes())),
+    );
+
+    let ok = output.status.success() && consistent && n_hessian.map_or(false, |n| n > 0);
+    let status = if ok {
+        EvalStatus::Pass
+    } else {
+        EvalStatus::Fail
+    };
+    let reason = if ok {
+        None
+    } else if !output.status.success() {
+        Some(format!("collect_artifacts exited with {}", output.status))
+    } else if !consistent {
+        Some("Hessian/imatrix consistency check did not report [CONSISTENT]".to_string())
+    } else {
+        Some("collect_artifacts captured 0 hessian tensors".to_string())
+    };
+
+    row_for_model(
+        BatteryId::Calibrate,
+        None,
+        label,
+        None,
+        status,
+        reason,
+        metrics,
+        config,
+        ctx,
+        prompt_ref,
+        elapsed_ms,
+        model,
+    )
+}
+
+/// Parse the captured-Hessian count from collect_artifacts' summary line
+/// ("collected N hessian tensors in ...").
+fn parse_collected_hessian_count(s: &str) -> Option<u64> {
+    let idx = s.find("collected ")? + "collected ".len();
+    let rest = &s[idx..];
+    let end = rest.find(' ')?;
+    rest[..end].parse::<u64>().ok()
 }
 
 #[derive(Clone, Copy)]
@@ -10119,6 +10284,21 @@ fn resolve_run_example_bin() -> Option<PathBuf> {
     ])
 }
 
+fn resolve_collect_artifacts_bin() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("HIPFIRE_COLLECT_ARTIFACTS_BIN") {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let exe = std::env::consts::EXE_SUFFIX;
+    let repo = repo_root()?;
+    newest_existing_path([
+        repo.join(format!("target/release/examples/collect_artifacts{exe}")),
+        repo.join(format!("target/debug/examples/collect_artifacts{exe}")),
+    ])
+}
+
 fn resolve_eval_hipfire_bin() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("HIPFIRE_EVAL_HIPFIRE_BIN") {
         let p = PathBuf::from(path);
@@ -10760,6 +10940,7 @@ fn result_cache_prompt_paths(battery: BatteryId) -> Vec<&'static str> {
         BatteryId::Structured => vec!["benchmarks/prompts/tool_call_read_file.txt"],
         BatteryId::Longctx => vec!["benchmarks/prompts/longprose_multidoc.jsonl"],
         BatteryId::Profile => vec!["benchmarks/prompts/dflash_resident_smoke.txt"],
+        BatteryId::Calibrate => vec!["benchmarks/prompts/lru_cache_single_blank.txt"],
         BatteryId::Barrage | BatteryId::Vision | BatteryId::Cask => Vec::new(),
     }
 }
@@ -11035,6 +11216,16 @@ fn run_battery(
             BTreeMap::from([("structured_probe".to_string(), json!("tool_call_jsonish"))]),
         )],
         BatteryId::Barrage => barrage_rows(config, ctx, datasets),
+        BatteryId::Calibrate => vec![skip_row(
+            battery,
+            None,
+            "single_load_hessian_consistency",
+            None,
+            "calibration requires the examples executor (collect_artifacts); none was available",
+            config,
+            ctx,
+            prompt("benchmarks/prompts/lru_cache_single_blank.txt"),
+        )],
         BatteryId::Longctx | BatteryId::Vision | BatteryId::Cask | BatteryId::Profile => {
             vec![skip_row(
                 battery,

@@ -43,10 +43,13 @@ integration + cross-model capture, flagged below.
    JSONL boundary). NOTE: touches the daemon↔eval interface flagged as possibly
    unstable — do with review. Expose ALSO as a CLI subcommand so the capability
    doesn't depend on the eval seam.
-2. **eval `calibrate` battery** — additive `BatteryId` that spawns
-   `collect_artifacts` via the existing examples (subprocess) executor + checks
-   the consistency/tensor-count result. Low-risk but moderate surgery in the
-   3.6k-line `hipfire-eval/src/lib.rs`.
+2. **eval `calibrate` battery** — DONE (loop session 4). Additive
+   `BatteryId::Calibrate` (opt-in via `--battery calibrate`, not in any default
+   tier) spawns the `collect_artifacts` example via the examples executor and
+   asserts `[CONSISTENT]` + non-zero `n_hessian`. bf16-only (skips otherwise).
+   Verified on `qwen3.5-0.8b-bf16`: pass, n_hessian=186, consistent=true.
+   Also: **`hipfire collect-artifacts` CLI subcommand DONE** (forwards to the
+   example, mirroring `eval`/`host-profile`).
 3. **Runtime per-session MoE histogram → microbatch scheduler** — the daemon
    already calls `reset`/`take_moe_router_histogram` (`hipfire-daemon/src/main.rs`).
    Wire the per-session histogram (esp. the co-occurrence pairs) into the
