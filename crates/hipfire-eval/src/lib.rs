@@ -12503,7 +12503,8 @@ pub fn run_from_env() -> Result<(), String> {
         return run_sweep(&config, &spec);
     }
     if config.dry_run {
-        let plan = plan_model(&config)?;
+        let (ctx, datasets) = dry_run_inputs(&config)?;
+        let plan = plan_model(&config, &ctx, &datasets)?;
         print_plans(std::slice::from_ref(&plan));
         return Ok(());
     }
@@ -12666,19 +12667,22 @@ fn cell_block_reason(
     }
 }
 
-fn plan_model(config: &EvalConfig) -> Result<ModelPlan, String> {
-    let ctx = eval_context(config);
-    let mut probe = config.clone();
-    probe.fetch_datasets = false; // dry-run must not download
-    let datasets = resolve_datasets(&probe)?;
+/// `ctx` (hardware/build) and `datasets` (shared HF datasets) are
+/// model-independent — the caller builds them ONCE and passes them in, so a
+/// many-model dry-run does one host-profiling pass, not one per SKU.
+fn plan_model(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    datasets: &[DatasetManifestEntry],
+) -> Result<ModelPlan, String> {
     let mut cells = Vec::new();
     for &battery in &config.batteries {
-        let key = result_cache_key(battery, config, &ctx, &datasets)?;
+        let key = result_cache_key(battery, config, ctx, datasets)?;
         let path = result_cache_path(config, &key);
         let cached = config.cache_mode == EvalCacheMode::Use && path.exists();
         let (state, reason) = if cached {
             ("CACHED", None)
-        } else if let Some(r) = cell_block_reason(battery, config, &datasets) {
+        } else if let Some(r) = cell_block_reason(battery, config, datasets) {
             ("BLOCKED", Some(r))
         } else {
             ("READY", None)
@@ -12693,6 +12697,16 @@ fn plan_model(config: &EvalConfig) -> Result<ModelPlan, String> {
         model: config.model.clone(),
         cells,
     })
+}
+
+/// Build the shared dry-run context + dataset manifest once (no network:
+/// datasets are resolved with fetch disabled).
+fn dry_run_inputs(config: &EvalConfig) -> Result<(EvalContext, Vec<DatasetManifestEntry>), String> {
+    let ctx = eval_context(config);
+    let mut probe = config.clone();
+    probe.fetch_datasets = false;
+    let datasets = resolve_datasets(&probe)?;
+    Ok((ctx, datasets))
 }
 
 fn print_plans(plans: &[ModelPlan]) {
@@ -12751,6 +12765,14 @@ fn run_sweep(config: &EvalConfig, spec: &str) -> Result<(), String> {
         base.display()
     );
 
+    // Hardware/build ctx + shared dataset manifest are model-independent: build
+    // ONCE for the whole dry-run (one host-profiling pass, not one per SKU).
+    let dry_inputs = if config.dry_run {
+        Some(dry_run_inputs(config)?)
+    } else {
+        None
+    };
+
     let mut plans = Vec::new();
     let mut outcomes: Vec<(String, PathBuf, String)> = Vec::new();
     for m in &models {
@@ -12762,8 +12784,8 @@ fn run_sweep(config: &EvalConfig, spec: &str) -> Result<(), String> {
             cfg.draft =
                 discover_dflash_draft_for_model(Path::new(m)).map(|p| p.display().to_string());
         }
-        if config.dry_run {
-            match plan_model(&cfg) {
+        if let Some((ctx, datasets)) = &dry_inputs {
+            match plan_model(&cfg, ctx, datasets) {
                 Ok(p) => plans.push(p),
                 Err(e) => eprintln!("[eval] plan {m}: {e}"),
             }

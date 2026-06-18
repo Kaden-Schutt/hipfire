@@ -644,13 +644,61 @@ pub fn model_manifest_entry(role: &str, identifier: &str) -> ModelManifestEntry 
     }
 }
 
+#[allow(clippy::type_complexity)]
+fn model_hash_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<(String, u64, u64), Option<String>>> {
+    static C: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(String, u64, u64), Option<String>>>,
+    > = std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Pull the producer-stamped content hash out of an HFQ container's metadata
+/// (`quantization_hash`, an xxh64 over the tensor index + payload). This reads
+/// only the metadata span, not the multi-GB payload, so it is effectively free
+/// vs `file_hash`. `None` for non-HFQ files or older artifacts lacking the field.
+fn hfq_embedded_hash(path: &Path) -> Option<String> {
+    let meta = read_hfq_metadata(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&meta.metadata_json).ok()?;
+    let qh = v.get("quantization_hash")?;
+    let value = qh.get("value")?.as_str()?;
+    let algo = qh
+        .get("algorithm")
+        .and_then(|a| a.as_str())
+        .unwrap_or("hash");
+    // Namespaced so it never collides with a raw file_hash hex or a tag: id.
+    Some(format!("hfq:{algo}:{value}"))
+}
+
 pub fn model_hash(model: &str) -> Option<String> {
     let p = Path::new(model);
-    if p.exists() {
-        file_hash(p)
-    } else {
-        Some(format!("tag:{}", stable_hash_bytes(model.as_bytes())))
+    if !p.exists() {
+        return Some(format!("tag:{}", stable_hash_bytes(model.as_bytes())));
     }
+    // Prefer the content hash the producer already stamped into the HFQ metadata
+    // (cheap: metadata-span read only). Falls back to a full file hash for
+    // non-HFQ files or older artifacts without the field.
+    if let Some(h) = hfq_embedded_hash(p) {
+        return Some(h);
+    }
+    // `file_hash` reads the whole (multi-GB) model; callers hash the same model
+    // repeatedly within one process (per-battery cache keys, model sweeps), so
+    // memoize by (path, mtime, size) — recompute only if the file changes.
+    let meta = std::fs::metadata(p).ok();
+    let mtime = meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let key = (model.to_string(), mtime, size);
+    if let Some(cached) = model_hash_cache().lock().unwrap().get(&key) {
+        return cached.clone();
+    }
+    let hash = file_hash(p);
+    model_hash_cache().lock().unwrap().insert(key, hash.clone());
+    hash
 }
 
 pub fn read_hfq_metadata(path: &Path) -> Result<HfqMetadata, String> {
