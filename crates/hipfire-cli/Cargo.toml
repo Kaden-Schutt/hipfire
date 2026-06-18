@@ -23,3 +23,4 @@ indicatif = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls"] }
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
+libc = "0.2"

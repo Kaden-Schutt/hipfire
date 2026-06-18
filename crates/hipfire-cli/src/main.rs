@@ -26,6 +26,8 @@ enum Command {
     HostProfile(commands::forward::HostProfileArgs),
     /// Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one model load
     CollectArtifacts(commands::forward::CollectArtifactsArgs),
+    /// GPU mutex for multi-agent coordination (acquire/release/status)
+    GpuLock(commands::gpu_lock::GpuLockArgs),
 }
 
 #[tokio::main]
@@ -51,5 +53,6 @@ async fn main() -> anyhow::Result<()> {
         Command::Eval(args) => commands::forward::run_eval(args),
         Command::HostProfile(args) => commands::forward::run_host_profile(args),
         Command::CollectArtifacts(args) => commands::forward::run_collect_artifacts(args),
+        Command::GpuLock(args) => commands::gpu_lock::run(args),
     }
 }
