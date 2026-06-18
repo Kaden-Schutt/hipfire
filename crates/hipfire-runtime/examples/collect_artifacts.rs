@@ -16,63 +16,11 @@
 //!     --output /tmp/qwen3.5-0.8b-native.hessian.bin --max-tokens 512
 
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
+use hipfire_runtime::calibration::{logsumexp, topk_logits, CalibCollector};
 use hipfire_runtime::hfq::HfqMemTensor;
 use hipfire_runtime::llama::KvCache;
-use rdna_compute::{ActivationCapture, DType, Gpu, GpuTensor};
-use std::collections::HashMap;
+use rdna_compute::Gpu;
 use std::path::Path;
-use std::sync::Mutex;
-
-struct Acc {
-    diag: GpuTensor, // [K]   Σx²  (imatrix)
-    h: GpuTensor,    // [K,K] Σxxᵀ (Hessian)
-    k: usize,
-    n_tokens: u64,
-}
-
-#[derive(Default)]
-struct UnifiedCollector {
-    accs: Mutex<HashMap<String, Acc>>,
-}
-
-impl ActivationCapture for UnifiedCollector {
-    fn capture(&self, gpu: &mut Gpu, tensor_name: &str, input: &GpuTensor, n: usize, k: usize) {
-        // Use the gemm's actual n/k — `input` is a shared scratch buffer whose
-        // shape (max(dim,hidden)) does NOT reflect the linear's input width.
-        let mut accs = self.accs.lock().unwrap();
-        if !accs.contains_key(tensor_name) {
-            let diag = gpu.zeros(&[k], DType::F32).unwrap();
-            let h = gpu.zeros(&[k, k], DType::F32).unwrap();
-            accs.insert(
-                tensor_name.to_string(),
-                Acc {
-                    diag,
-                    h,
-                    k,
-                    n_tokens: 0,
-                },
-            );
-        }
-        let acc = accs.get_mut(tensor_name).unwrap();
-        gpu.calib_sumsq_reduce_f32(input, &acc.diag, n, k).unwrap();
-        gpu.calib_hessian_outer_f32(input, &acc.h, n, k).unwrap();
-        acc.n_tokens += n as u64;
-    }
-}
-
-/// log(Σ exp(logits)) — numerically stable (subtract max).
-fn logsumexp(logits: &[f32]) -> f32 {
-    let m = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    m + logits.iter().map(|&x| (x - m).exp()).sum::<f32>().ln()
-}
-
-/// Top-`k` (index, logit) descending — for the KLDREF reference.
-fn topk_logits(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
-    let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
-    idx.sort_unstable_by(|&a, &b| logits[b as usize].total_cmp(&logits[a as usize]));
-    idx.truncate(k);
-    idx.into_iter().map(|i| (i, logits[i as usize])).collect()
-}
 
 fn arg(flag: &str, default: Option<String>) -> Option<String> {
     let a: Vec<String> = std::env::args().collect();
@@ -119,7 +67,7 @@ fn main() {
             l0.wqkv.gpu_dtype, l0.wo.gpu_dtype, l0.w_down.gpu_dtype
         );
     }
-    let collector = std::sync::Arc::new(UnifiedCollector::default());
+    let collector = std::sync::Arc::new(CalibCollector::new());
     gpu.capture_names = names;
     gpu.active_capture = Some(collector.clone());
 
@@ -220,15 +168,12 @@ fn main() {
         None
     };
 
-    // Drain + verify diag(H) == Σx² (the two kernels agree on real activations),
-    // and build the HFQ artifact tensors: <name>.hessian (E[xxᵀ], [K,K]) +
-    // <name>.imatrix (E[x²], [K]). F32 = quant_type 2.
-    let accs = collector.accs.lock().unwrap();
-    let mut names_sorted: Vec<&String> = accs.keys().collect();
-    names_sorted.sort();
-    let mut max_consistency = 0.0f32;
-    let mut tensors: Vec<HfqMemTensor> = Vec::new();
+    // Drain the lib collector → HFQ hessian+imatrix tensors + consistency.
+    let (mut tensors, max_consistency, token_counts) = collector.drain(&gpu);
     let mut per_tensor_tokens = serde_json::Map::new();
+    for (name, n) in &token_counts {
+        per_tensor_tokens.insert(name.clone(), serde_json::json!(n));
+    }
     let f32_bytes = |v: &[f32]| -> Vec<u8> {
         let mut b = Vec::with_capacity(v.len() * 4);
         for &x in v {
@@ -236,37 +181,9 @@ fn main() {
         }
         b
     };
-    for name in &names_sorted {
-        let acc = &accs[*name];
-        let diag = gpu.download_f32(&acc.diag).unwrap();
-        let h = gpu.download_f32(&acc.h).unwrap();
-        let mut md = 0.0f32;
-        for c in 0..acc.k {
-            md = md.max((h[c * acc.k + c] - diag[c]).abs() / diag[c].abs().max(1.0));
-        }
-        max_consistency = max_consistency.max(md);
-        let inv = 1.0 / acc.n_tokens as f32;
-        let hessian: Vec<f32> = h.iter().map(|v| v * inv).collect();
-        let imatrix: Vec<f32> = diag.iter().map(|v| v * inv).collect();
-        tensors.push(HfqMemTensor {
-            name: format!("{name}.hessian"),
-            quant_type: 2,
-            shape: vec![acc.k as u32, acc.k as u32],
-            group_size: 0,
-            data: f32_bytes(&hessian),
-        });
-        tensors.push(HfqMemTensor {
-            name: format!("{name}.imatrix"),
-            quant_type: 2,
-            shape: vec![acc.k as u32],
-            group_size: 0,
-            data: f32_bytes(&imatrix),
-        });
-        per_tensor_tokens.insert((*name).clone(), serde_json::json!(acc.n_tokens));
-    }
     eprintln!(
         "drained {} tensors; max diag(H)-vs-Σx² rel-err = {max_consistency:.3e} {}",
-        names_sorted.len(),
+        tensors.len() / 2,
         if max_consistency < 1e-4 {
             "[CONSISTENT]"
         } else {
