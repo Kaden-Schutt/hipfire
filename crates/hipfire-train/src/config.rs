@@ -30,7 +30,22 @@ impl LlamaConfig {
             std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
         let v: serde_json::Value =
             serde_json::from_str(&txt).map_err(|e| format!("parse config.json: {e}"))?;
+        Self::from_json_value(&v)
+    }
 
+    /// Parse from a `.hfq` HFQM metadata JSON string. The quantizer stores the
+    /// HF config under `{"architecture":..,"config":{..}}` — this navigates to
+    /// `config` and parses the same fields as `config.json`. Enables training to
+    /// load its base from the exact served artifact (layer-1 runtime unification).
+    pub fn from_hfq_metadata(metadata_json: &str) -> Result<Self, String> {
+        let m: serde_json::Value =
+            serde_json::from_str(metadata_json).map_err(|e| format!("parse hfq metadata: {e}"))?;
+        let cfg = m.get("config").unwrap_or(&m);
+        Self::from_json_value(cfg)
+    }
+
+    /// Core parser shared by `from_dir` and `from_hfq_metadata`.
+    pub fn from_json_value(v: &serde_json::Value) -> Result<Self, String> {
         let model_type = v["model_type"].as_str().unwrap_or("");
         if model_type != "llama" {
             return Err(format!(
@@ -42,8 +57,8 @@ impl LlamaConfig {
             return Err("attention_bias=true unsupported in Phase 0 (use a no-bias llama)".into());
         }
 
-        let hidden_size = uget(&v, "hidden_size")?;
-        let num_attention_heads = uget(&v, "num_attention_heads")?;
+        let hidden_size = uget(v, "hidden_size")?;
+        let num_attention_heads = uget(v, "num_attention_heads")?;
         let head_dim = v["head_dim"]
             .as_u64()
             .map(|n| n as usize)
@@ -55,15 +70,15 @@ impl LlamaConfig {
 
         Ok(Self {
             hidden_size,
-            intermediate_size: uget(&v, "intermediate_size")?,
-            num_hidden_layers: uget(&v, "num_hidden_layers")?,
+            intermediate_size: uget(v, "intermediate_size")?,
+            num_hidden_layers: uget(v, "num_hidden_layers")?,
             num_attention_heads,
             num_key_value_heads: v["num_key_value_heads"]
                 .as_u64()
                 .map(|n| n as usize)
                 .unwrap_or(num_attention_heads),
             head_dim,
-            vocab_size: uget(&v, "vocab_size")?,
+            vocab_size: uget(v, "vocab_size")?,
             rms_norm_eps: v["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32,
             rope_theta,
             tie_word_embeddings: v["tie_word_embeddings"].as_bool().unwrap_or(false),

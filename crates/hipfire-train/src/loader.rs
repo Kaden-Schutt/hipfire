@@ -119,6 +119,84 @@ fn load_tensor_f32(
         .map_err(|e| format!("upload {name}: {e:?}"))
 }
 
+/// Decode an HFQM tensor's bytes (by `quant_type`) to fp32 — the layer-1 runtime
+/// unification: training loads its base from the *exact served artifact*.
+/// Handles BF16(16)/F32(2)/Q8F16(3) now; Qtip3G256(31) is a clear TODO (qtip2-sim
+/// `.hfq` is all bf16, so this covers the 2-bit path today).
+fn decode_hfq_tensor(quant_type: u8, data: &[u8], n: usize) -> Result<Vec<f32>, String> {
+    match quant_type {
+        2 => Ok(data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()),
+        16 => Ok(data
+            .chunks_exact(2)
+            .map(|c| crate::hfq_patch::bf16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect()),
+        3 => Ok(hipfire_runtime::llama::dequantize_q8_0(data, n)),
+        31 => Err("Qtip3G256 .hfq decode not yet implemented in hipfire-train \
+                   (use a bf16/qtip2-sim .hfq, or load from the source safetensors)"
+            .to_string()),
+        other => Err(format!("unsupported quant_type {other} for hfq decode")),
+    }
+}
+
+/// Load a dense LLaMA model's base weights directly from a `.hfq` artifact,
+/// decoded to fp32 — so the training "student" IS the served model (no
+/// re-quantize / format-matching). Config comes from the HFQM metadata.
+pub fn load_llama_from_hfq(
+    gpu: &mut Gpu,
+    path: &Path,
+) -> Result<(LlamaConfig, LlamaWeightsF32), String> {
+    use std::collections::HashMap;
+    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let (entries, meta) = crate::hfq_patch::parse_hfq(&bytes)?;
+    let cfg = LlamaConfig::from_hfq_metadata(&meta)?;
+    let map: HashMap<&str, &crate::hfq_patch::HfqEntry> =
+        entries.iter().map(|e| (e.name.as_str(), e)).collect();
+
+    let load = |gpu: &mut Gpu, name: &str, want: &[usize]| -> Result<GpuTensor, String> {
+        let e = map.get(name).ok_or_else(|| format!("missing tensor {name}"))?;
+        let data = &bytes[e.data_offset..e.data_offset + e.data_size];
+        let n: usize = want.iter().product();
+        let f32s = decode_hfq_tensor(e.quant_type, data, n).map_err(|x| format!("{name}: {x}"))?;
+        if f32s.len() != n {
+            return Err(format!("{name}: {} elems != {n}", f32s.len()));
+        }
+        gpu.upload_f32(&f32s, want).map_err(|x| format!("upload {name}: {x:?}"))
+    };
+
+    let (h, q, kv, inter) =
+        (cfg.hidden_size, cfg.q_dim(), cfg.kv_dim(), cfg.intermediate_size);
+    let embed_tokens = load(gpu, "model.embed_tokens.weight", &[cfg.vocab_size, h])?;
+    let final_norm = load(gpu, "model.norm.weight", &[h])?;
+    let lm_head = if map.contains_key("lm_head.weight") {
+        Some(load(gpu, "lm_head.weight", &[cfg.vocab_size, h])?)
+    } else {
+        None
+    };
+    let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+    for i in 0..cfg.num_hidden_layers {
+        let p = format!("model.layers.{i}");
+        layers.push(LlamaLayerF32 {
+            input_layernorm: load(gpu, &format!("{p}.input_layernorm.weight"), &[h])?,
+            q_proj: load(gpu, &format!("{p}.self_attn.q_proj.weight"), &[q, h])?,
+            k_proj: load(gpu, &format!("{p}.self_attn.k_proj.weight"), &[kv, h])?,
+            v_proj: load(gpu, &format!("{p}.self_attn.v_proj.weight"), &[kv, h])?,
+            o_proj: load(gpu, &format!("{p}.self_attn.o_proj.weight"), &[h, q])?,
+            post_attention_layernorm: load(
+                gpu,
+                &format!("{p}.post_attention_layernorm.weight"),
+                &[h],
+            )?,
+            gate_proj: load(gpu, &format!("{p}.mlp.gate_proj.weight"), &[inter, h])?,
+            up_proj: load(gpu, &format!("{p}.mlp.up_proj.weight"), &[inter, h])?,
+            down_proj: load(gpu, &format!("{p}.mlp.down_proj.weight"), &[h, inter])?,
+        });
+    }
+    Ok((cfg, LlamaWeightsF32 { embed_tokens, layers, final_norm, lm_head }))
+}
+
 /// Convert little-endian safetensors bytes of the given dtype to fp32.
 fn bytes_to_f32(dtype: &str, bytes: &[u8]) -> Result<Vec<f32>, String> {
     match dtype {

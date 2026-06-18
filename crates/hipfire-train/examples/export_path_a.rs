@@ -1,27 +1,25 @@
-//! Phase 3 Path A — export tool. Recover RMSNorms (codes frozen) on a student
-//! that matches the daemon's served qtip3 weights, then patch the tuned norms
-//! into the qtip3 `.hfq` → a servable, recovered artifact.
+//! Phase 3 Path A — export tool (layer-1 runtime-unified). The student base is
+//! loaded DIRECTLY from the served `.hfq` (decoded to fp32 via
+//! `load_llama_from_hfq`), so it IS the served model — no re-quantize, no
+//! beam/grouping/format-matching guesswork. Recover RMSNorms (codes/weights
+//! frozen) against the fp32 teacher, patch the tuned norms back into the `.hfq`.
 //!
-//! Student matching: the quantizer's qtip3 path uses bits=3, beam=128 on the
-//! 6 linears with k%256==0 (q/k/v/o/gate/up), leaves down_proj BF16 and embed
-//! Q8F16. We mirror that — qtip-dequant only those 6 at beam=128 (flat-grouping
-//! == per-row for k%256==0), and leave down_proj/embed ~original — so the
-//! recovered norms are valid for the served model.
+//! Works for any `.hfq` the loader can decode (bf16 / qtip2-sim today; qtip3
+//! real-packed once Qtip3 decode lands).
 //!
 //! Run:
 //!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
 //!   source ./scripts/gpu-lock.sh && gpu_acquire "export-path-a"
 //!   cargo run -p hipfire-train --release --example export_path_a -- \
-//!       /tmp/hfq-export/supra-50m-qtip3.hfq /tmp/hfq-export/supra-50m-qtip3-recovered.hfq
+//!       <served.hfq> <recovered.hfq>
 //!   gpu_release
 
 use hipfire_model::tokenizer::Tokenizer;
 use hipfire_train::hfq_patch::{is_norm, parse_hfq, patch_norms_inplace};
-use hipfire_train::loader::{load_llama_fp32, LlamaWeightsF32};
+use hipfire_train::loader::{load_llama_fp32, load_llama_from_hfq};
 use hipfire_train::model::{flatten_norm_grads, model_distill_backward, model_forward, LlamaModel};
 use hipfire_train::ops::softmax::softmax_forward;
 use hipfire_train::optim::AdamW;
-use hipfire_train::qtip_quant::qtip_quantize_dequant;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::HashMap;
 use std::path::Path;
@@ -29,12 +27,6 @@ use std::path::Path;
 const MODEL_DIR: &str =
     "/srv/huggingface/models--SupraLabs--Supra-50M-Instruct/snapshots/77a1c2a33f386f9f4bf7151ec5f2156b62caac39";
 const L: usize = 32;
-// BITS matches the quantizer's qtip format (3 = qtip3, 2 = qtip2-sim).
-// Set via HIPFIRE_QTIP_BITS (default 3).
-fn bits() -> u32 {
-    std::env::var("HIPFIRE_QTIP_BITS").ok().and_then(|v| v.parse().ok()).unwrap_or(3)
-}
-const BEAM: usize = 128; // matches the quantizer
 const LR: f32 = 1e-3;
 const STEPS: usize = 200;
 
@@ -46,19 +38,6 @@ foundation of many modern European languages. Over the centuries the empire face
 economic troubles, and political instability. The western half eventually fell, while the eastern \
 half continued as the Byzantine Empire for another thousand years. Roman law, architecture, and \
 culture continue to influence the modern world to this day in countless ways.";
-
-/// Quantize only the qtip3-eligible linears (q/k/v/o/gate/up) to match the
-/// daemon; leave down_proj (BF16 in daemon) and embed (Q8) ~original.
-fn quantize_matching(gpu: &mut Gpu, w: &mut LlamaWeightsF32, bits: u32) -> Result<(), Box<dyn std::error::Error>> {
-    for l in w.layers.iter_mut() {
-        for t in [&mut l.q_proj, &mut l.k_proj, &mut l.v_proj, &mut l.o_proj, &mut l.gate_proj, &mut l.up_proj] {
-            let host = gpu.download_f32(t)?;
-            let q = qtip_quantize_dequant(&host, bits, BEAM);
-            *t = gpu.upload_f32(&q, &t.shape.clone())?;
-        }
-    }
-    Ok(())
-}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -72,14 +51,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tok = Tokenizer::from_hf_json(&std::fs::read_to_string(dir.join("tokenizer.json"))?)
         .map_err(|e| format!("tokenizer: {e:?}"))?;
 
+    // Teacher = fp32 original (distillation target). Student = the served .hfq,
+    // decoded to fp32 — it IS the served model, no re-quantize/matching.
     let (cfg, w_teacher) = load_llama_fp32(&mut gpu, dir)?;
-    let (_, mut w_student) = load_llama_fp32(&mut gpu, dir)?;
+    let (scfg, w_student) = load_llama_from_hfq(&mut gpu, Path::new(&in_hfq))?;
     let vocab = cfg.vocab_size;
-    println!("building daemon-matching student (qtip-{} beam {BEAM} on q/k/v/o/gate/up)...", bits());
-    let b = bits(); quantize_matching(&mut gpu, &mut w_student, b)?;
+    println!("student loaded directly from served {in_hfq} (decoded), {} layers", scfg.num_hidden_layers);
 
     let teacher = LlamaModel::from_f32_weights(&mut gpu, &cfg, w_teacher, L, 16, 32.0)?;
-    let student = LlamaModel::from_f32_weights(&mut gpu, &cfg, w_student, L, 16, 32.0)?;
+    let student = LlamaModel::from_f32_weights(&mut gpu, &scfg, w_student, L, 16, 32.0)?;
 
     // teacher distributions over the corpus chunks
     let corpus_ids = tok.encode(CORPUS);
@@ -137,6 +117,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if n != tuned.len() {
         return Err(format!("patched {n} but had {} tuned norms — name mismatch", tuned.len()).into());
     }
-    println!("OK — recovered qtip-{} .hfq written (codes/weights unchanged, norms tuned).", bits());
+    println!("OK — recovered .hfq written (codes/weights unchanged, norms tuned).");
     Ok(())
 }
