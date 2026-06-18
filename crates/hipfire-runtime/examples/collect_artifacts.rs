@@ -60,6 +60,20 @@ impl ActivationCapture for UnifiedCollector {
     }
 }
 
+/// log(Σ exp(logits)) — numerically stable (subtract max).
+fn logsumexp(logits: &[f32]) -> f32 {
+    let m = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    m + logits.iter().map(|&x| (x - m).exp()).sum::<f32>().ln()
+}
+
+/// Top-`k` (index, logit) descending — for the KLDREF reference.
+fn topk_logits(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
+    let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
+    idx.sort_unstable_by(|&a, &b| logits[b as usize].total_cmp(&logits[a as usize]));
+    idx.truncate(k);
+    idx.into_iter().map(|i| (i, logits[i as usize])).collect()
+}
+
 fn arg(flag: &str, default: Option<String>) -> Option<String> {
     let a: Vec<String> = std::env::args().collect();
     a.iter()
@@ -133,12 +147,30 @@ fn main() {
     let mut dn = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 64).unwrap();
 
+    // KLDREF (opt-in --kldref): capture the lm-head top-K logits + logZ per
+    // position (the teacher-forced bf16 reference for KLD-vs-quant eval). This is
+    // an OUTPUT tap (not a linear input), so it reads scratch.logits after each
+    // forward — mirrors perplexity.rs --dump-ref / the .pkld format.
+    let want_kldref = std::env::args().any(|a| a == "--kldref");
+    const KLDREF_TOPK: usize = 64;
+    let mut kldref: Vec<(f32, Vec<(u32, f32)>)> = Vec::new();
+
     let t0 = std::time::Instant::now();
     for (pos, &tok) in all.iter().take(n_tok).enumerate() {
         qwen35::forward_scratch(
             &mut gpu, &weights, &config, tok, pos, &mut kv, &mut dn, &scratch,
         )
         .expect("forward");
+        if want_kldref {
+            let lg = gpu.download_f32(&scratch.logits).expect("logits");
+            kldref.push((logsumexp(&lg), topk_logits(&lg, KLDREF_TOPK)));
+        }
+    }
+    if want_kldref {
+        eprintln!(
+            "KLDREF: captured {} positions (top-{KLDREF_TOPK})",
+            kldref.len()
+        );
     }
     eprintln!(
         "forward over {n_tok} tokens: {:.1}s",
@@ -242,6 +274,39 @@ fn main() {
         }
     );
 
+    // KLDREF tensors: idx [n_pos,K] + logit [n_pos,K] (F32) + logz [n_pos] (F32).
+    // Indices stored as f32 (vocab < 2^24 — exact).
+    let mut kldref_meta = serde_json::Value::Null;
+    if !kldref.is_empty() {
+        let np = kldref.len();
+        let kk = kldref[0].1.len();
+        let mut idx_v = Vec::with_capacity(np * kk);
+        let mut lg_v = Vec::with_capacity(np * kk);
+        let mut lz_v = Vec::with_capacity(np);
+        for (logz, tk) in &kldref {
+            lz_v.push(*logz);
+            for j in 0..kk {
+                let (i, l) = tk.get(j).copied().unwrap_or((0, f32::NEG_INFINITY));
+                idx_v.push(i as f32);
+                lg_v.push(l);
+            }
+        }
+        for (nm, shape, data) in [
+            ("lm_head.kldref_idx", vec![np as u32, kk as u32], idx_v),
+            ("lm_head.kldref_logit", vec![np as u32, kk as u32], lg_v),
+            ("lm_head.kldref_logz", vec![np as u32], lz_v),
+        ] {
+            tensors.push(HfqMemTensor {
+                name: nm.to_string(),
+                quant_type: 2,
+                shape,
+                group_size: 0,
+                data: f32_bytes(&data),
+            });
+        }
+        kldref_meta = serde_json::json!({ "n_positions": np, "top_k": kk });
+    }
+
     // Provenance metadata (the unify-on-HFQ decision: artifacts carry their own
     // producer/corpus/token provenance, queryable via `hfq meta-get`).
     let mut meta = serde_json::json!({
@@ -261,6 +326,18 @@ fn main() {
             .unwrap()
             .push(serde_json::json!("moe_router_histogram"));
     }
+    if !kldref_meta.is_null() {
+        meta.as_object_mut()
+            .unwrap()
+            .insert("kldref".to_string(), kldref_meta);
+        meta["artifacts"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!("kldref"));
+    }
+    // NOTE: AWQ scales are derived at quant time from the captured imatrix (E[x²],
+    // the activation side) + model weights — no separate (easily-stale) awq_scale
+    // artifact is stored; the imatrix is the source of record.
     hipfire_runtime::hfq::write_hfqm_package_mem(
         Path::new(&output),
         0,
