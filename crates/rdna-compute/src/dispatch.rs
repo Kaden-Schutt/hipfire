@@ -40903,6 +40903,107 @@ impl Gpu {
         }
     }
 
+    /// PFlash per-block cosine-importance forward (fp32 training twin).
+    /// `k`:`[n_pos*kv_dim]`, `scores`:`[n_blocks]`. score[b] = cosine(block_mean_K,
+    /// last_token_K) over the full kv_dim (matches production `pflash_score_q8_kv`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn pflash_score_f32_fwd(
+        &mut self,
+        k: &GpuTensor,
+        scores: &GpuTensor,
+        n_pos: usize,
+        kv_dim: usize,
+        block_size: usize,
+        n_blocks: usize,
+        last_pos: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "pflash_score_f32_fwd",
+            kernels::PFLASH_SCORE_F32_TRAIN_SRC,
+            "pflash_score_f32_fwd",
+        )?;
+        let func = &self.functions["pflash_score_f32_fwd"];
+        let mut kp = k.buf.as_ptr();
+        let mut sp = scores.buf.as_ptr();
+        let mut a = n_pos as i32;
+        let mut b = kv_dim as i32;
+        let mut c = block_size as i32;
+        let mut d = n_blocks as i32;
+        let mut e = last_pos as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut kp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut a as *mut _ as *mut c_void,
+            &mut b as *mut _ as *mut c_void,
+            &mut c as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+            &mut e as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_blocks as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// PFlash importance backward (fp32 training twin). `dscores`:`[n_blocks]`,
+    /// `dk`:`[n_pos*kv_dim]` — MUST be zeroed before the call (accumulated via
+    /// atomics; the last-token K is shared across all blocks).
+    #[allow(clippy::too_many_arguments)]
+    pub fn pflash_score_f32_bwd(
+        &mut self,
+        k: &GpuTensor,
+        dscores: &GpuTensor,
+        dk: &GpuTensor,
+        n_pos: usize,
+        kv_dim: usize,
+        block_size: usize,
+        n_blocks: usize,
+        last_pos: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "pflash_score_f32_bwd",
+            kernels::PFLASH_SCORE_F32_TRAIN_SRC,
+            "pflash_score_f32_bwd",
+        )?;
+        let func = &self.functions["pflash_score_f32_bwd"];
+        let mut kp = k.buf.as_ptr();
+        let mut dsp = dscores.buf.as_ptr();
+        let mut dkp = dk.buf.as_ptr();
+        let mut a = n_pos as i32;
+        let mut b = kv_dim as i32;
+        let mut c = block_size as i32;
+        let mut d = n_blocks as i32;
+        let mut e = last_pos as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut kp as *mut _ as *mut c_void,
+            &mut dsp as *mut _ as *mut c_void,
+            &mut dkp as *mut _ as *mut c_void,
+            &mut a as *mut _ as *mut c_void,
+            &mut b as *mut _ as *mut c_void,
+            &mut c as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+            &mut e as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_blocks as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Fused cross-entropy fwd+bwd (fp32). `logits`,`d_logits`: `[rows*v]`;
     /// `targets`,`loss`: `[rows]` (targets integer-valued f32). `d_logits` is the
     /// SUM-reduction gradient (divide by valid-token count for mean).

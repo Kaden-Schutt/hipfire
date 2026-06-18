@@ -3210,6 +3210,12 @@ pub const SWIGLU_TRAIN_SRC: &str = include_str!("../../../kernels/src/swiglu_tra
 pub const CROSS_ENTROPY_TRAIN_SRC: &str =
     include_str!("../../../kernels/src/cross_entropy_train.hip");
 
+/// PFlash per-block cosine-importance head, fp32 training twin (fwd+bwd).
+/// Forward matches the production `pflash_score_q8_kv` / `compute_scores_batched`
+/// (full-kv_dim cosine of block_mean vs last-token K); bwd gives grad w.r.t. K.
+pub const PFLASH_SCORE_F32_TRAIN_SRC: &str =
+    include_str!("../../../kernels/src/pflash_score_f32_train.hip");
+
 /// RoPE fwd+bwd (fp32), HF-Llama half-split convention, un-fused training path.
 pub const ROPE_TRAIN_SRC: &str = include_str!("../../../kernels/src/rope_train.hip");
 

@@ -11,6 +11,7 @@ pub mod cross_entropy;
 pub mod distill;
 pub mod linear;
 pub mod lora;
+pub mod pflash_score;
 pub mod rmsnorm;
 pub mod rope;
 pub mod softmax;
