@@ -215,6 +215,13 @@ pub fn block_forward(
     let x_out = gpu.zeros(&[seq * h], DType::F32)?;
     gpu.add_f32(&x_mid, &mlp, &x_out)?;
 
+    // Return forward scratch the backward never reads (pre-rope q/k, lora
+    // pre-scale, attn/mlp pre-residual) to the pool — GpuTensor has no Drop, so
+    // without this each block_forward leaks ~5 MB and many-step training OOMs.
+    for t in [loraq_s, q, k, lorav_s, attn, mlp] {
+        gpu.free_tensor(t)?;
+    }
+
     Ok((
         x_out,
         BlockActivations {

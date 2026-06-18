@@ -118,6 +118,10 @@ pub fn gqa_forward(
         gpu.strided_copy_2d(&ph, 0, seq, p_all, h * seq * seq, seq, seq, seq, false)?;
         gpu.strided_copy_2d(&ctxh, 0, d, ctx, h * d, q_dim, seq, d, false)?;
     }
+    // per-head scratch (reused across the loop) → back to the pool; no Drop.
+    for t in [qh, kh, vh, scores, ph, ctxh] {
+        gpu.free_tensor(t)?;
+    }
     Ok(())
 }
 
@@ -171,6 +175,9 @@ pub fn gqa_backward(
         gpu.strided_copy_2d(&dqh, 0, d, dq, h * d, q_dim, seq, d, false)?;
         gpu.strided_copy_2d(&dkh, 0, d, dk, kvh * d, kv_dim, seq, d, true)?;
         gpu.strided_copy_2d(&dvh, 0, d, dv, kvh * d, kv_dim, seq, d, true)?;
+    }
+    for t in [qh, kh, vh, ph, dctxh, dp, dsc, dqh, dkh, dvh] {
+        gpu.free_tensor(t)?;
     }
     Ok(())
 }
