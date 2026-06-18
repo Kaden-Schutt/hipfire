@@ -28,8 +28,15 @@ const FLUSH_BATCH: usize = 256;
 struct Acc {
     diag: GpuTensor,      // [K]   Σx²  (imatrix)
     h: Option<GpuTensor>, // [K,K] Σxxᵀ (Hessian); `None` = imatrix-only tensor
-    buf: GpuTensor,       // [FLUSH_BATCH, K] staged activation rows
-    buf_rows: usize,      // rows currently staged in `buf`
+    /// Host f64 reference accumulator (`Some` only under `HIPFIRE_CALIB_F64_AUDIT`).
+    /// The GPU outer-product accumulates `Σxxᵀ` in f32; RDNA has no f64 matrix
+    /// units and only ~1:16 scalar f64, so a faithful f64 reference is computed
+    /// CPU-side from the same staged rows. `drain` then reports the max relative
+    /// f32-vs-f64 divergence — measure-first before deciding whether f32
+    /// accumulation needs replacing for large token counts.
+    h_f64: Option<Vec<f64>>,
+    buf: GpuTensor,  // [FLUSH_BATCH, K] staged activation rows
+    buf_rows: usize, // rows currently staged in `buf`
     k: usize,
     n_tokens: u64,
 }
@@ -51,6 +58,23 @@ impl Acc {
             gpu.calib_hessian_outer_f32(&self.buf, h, self.buf_rows, self.k)
                 .unwrap();
         }
+        // Audit: accumulate the same rows in f64 on the CPU (no GPU f64 path).
+        if let Some(h_f64) = &mut self.h_f64 {
+            let k = self.k;
+            let rows = gpu
+                .download_f32(&self.buf)
+                .expect("download buf (f64 audit)");
+            for r in 0..self.buf_rows {
+                let x = &rows[r * k..r * k + k];
+                for i in 0..k {
+                    let xi = x[i] as f64;
+                    let hrow = &mut h_f64[i * k..i * k + k];
+                    for j in 0..k {
+                        hrow[j] += xi * x[j] as f64;
+                    }
+                }
+            }
+        }
         self.buf_rows = 0;
     }
 }
@@ -65,11 +89,24 @@ impl Acc {
 pub struct CalibCollector {
     accs: Mutex<HashMap<String, Acc>>,
     imatrix_only_substr: Vec<String>,
+    /// When set (`HIPFIRE_CALIB_F64_AUDIT=1`), also accumulate each Hessian in
+    /// f64 on the CPU and report the f32-vs-f64 divergence in `drain`. Opt-in,
+    /// slow (CPU outer-products) — a measurement tool, not the default path.
+    f64_audit: bool,
+}
+
+/// `HIPFIRE_CALIB_F64_AUDIT=1` → run the CPU f64 reference accumulation.
+fn f64_audit_enabled() -> bool {
+    std::env::var("HIPFIRE_CALIB_F64_AUDIT").ok().as_deref() == Some("1")
 }
 
 impl CalibCollector {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            accs: Mutex::new(HashMap::new()),
+            imatrix_only_substr: Vec::new(),
+            f64_audit: f64_audit_enabled(),
+        }
     }
 
     /// Collector that stores imatrix-only (no [K,K] Hessian) for any tensor
@@ -78,6 +115,7 @@ impl CalibCollector {
         Self {
             accs: Mutex::new(HashMap::new()),
             imatrix_only_substr: substr,
+            f64_audit: f64_audit_enabled(),
         }
     }
 
@@ -109,6 +147,10 @@ impl CalibCollector {
         let mut tensors = Vec::with_capacity(names.len() * 2);
         let mut max_consistency = 0.0f32;
         let mut token_counts = HashMap::new();
+        // f64 audit accumulators (only populated under HIPFIRE_CALIB_F64_AUDIT).
+        let mut f64_audit_max = 0.0f64;
+        let mut f64_audit_worst = String::new();
+        let mut f64_audit_n = 0usize;
         let f32_bytes = |v: &[f32]| -> Vec<u8> {
             let mut b = Vec::with_capacity(v.len() * 4);
             for &x in v {
@@ -127,6 +169,22 @@ impl CalibCollector {
                 for c in 0..acc.k {
                     let rel = (h[c * acc.k + c] - diag[c]).abs() / diag[c].abs().max(1.0);
                     max_consistency = max_consistency.max(rel);
+                }
+                // f64 audit: max element-wise relative divergence between the
+                // f32-GPU and f64-CPU accumulations of the same Σxxᵀ. Compared
+                // on the raw sums (the /n_tokens scale is identical for both).
+                if let Some(h_ref) = &acc.h_f64 {
+                    f64_audit_n += 1;
+                    let mut tmax = 0.0f64;
+                    for idx in 0..acc.k * acc.k {
+                        let r = h_ref[idx];
+                        let rel = (h[idx] as f64 - r).abs() / r.abs().max(1.0);
+                        tmax = tmax.max(rel);
+                    }
+                    if tmax > f64_audit_max {
+                        f64_audit_max = tmax;
+                        f64_audit_worst = (*name).clone();
+                    }
                 }
                 let hessian: Vec<f32> = h.iter().map(|v| v * inv).collect();
                 tensors.push(HfqMemTensor {
@@ -147,6 +205,12 @@ impl CalibCollector {
             });
             token_counts.insert((*name).clone(), acc.n_tokens);
         }
+        if f64_audit_n > 0 {
+            eprintln!(
+                "F64 AUDIT: max f32-vs-f64 Σxxᵀ rel-diff = {f64_audit_max:.3e} over {f64_audit_n} \
+                 Hessians (worst: {f64_audit_worst}); n_tokens spread across the accumulation"
+            );
+        }
         (tensors, max_consistency, token_counts)
     }
 }
@@ -164,11 +228,17 @@ impl ActivationCapture for CalibCollector {
                 None
             };
             let buf = gpu.zeros(&[FLUSH_BATCH, k], DType::F32).unwrap();
+            let h_f64 = if self.f64_audit && h.is_some() {
+                Some(vec![0.0f64; k * k])
+            } else {
+                None
+            };
             accs.insert(
                 tensor_name.to_string(),
                 Acc {
                     diag,
                     h,
+                    h_f64,
                     buf,
                     buf_rows: 0,
                     k,

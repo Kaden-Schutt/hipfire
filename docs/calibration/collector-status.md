@@ -139,6 +139,32 @@ verified**. Final-session work:
   This is a research investigation (not autonomous build work) and is gated on
   step 1 — left as a documented follow-up rather than rabbit-holed.
 
+## f32 vs f64 Hessian accumulation (measured — f32 is sufficient)
+
+The GPU accumulates `Σxxᵀ` in **f32** (`calib_hessian_outer_f32`). Question: does
+f32 summation error over many tokens hurt LDLQ? Measured with an opt-in CPU f64
+reference (`HIPFIRE_CALIB_F64_AUDIT=1` — `CalibCollector` accumulates the same
+staged rows in f64 on the CPU and `drain` reports the max element-wise f32-vs-f64
+rel-diff). RDNA has no f64 matrix units and only ~1:16 scalar f64, so the
+reference is computed CPU-side, not on-GPU.
+
+qwen3.5-0.8b-bf16 (gfx1151):
+
+| tokens | max f32-vs-f64 Σxxᵀ rel-diff | collect time |
+|-------:|----------------------------:|-------------:|
+| 256    | 2.46e-4 | 40 s  |
+| 4096   | 6.07e-4 | 570 s |
+
+**Verdict: f32 accumulation is sufficient — f64 is NOT made the default.**
+- Divergence grows sub-linearly with N (16× tokens → 2.4× error ≈ N^0.32, not the
+  N¹ of catastrophic cancellation); extrapolated to a 262k-token corpus ≈ 2e-3.
+- LDLQ adds a 1% diagonal ridge (`damp = 0.01·mean_diag`) before Cholesky, so even
+  the extrapolated full-corpus perturbation is ~5× below the regularization the
+  quantizer already applies — no quant-quality impact.
+- The CPU f64 path is also 14× slower (570 s vs 40 s at 4096 tok), confirming a
+  GPU f64 kernel would be the wrong trade. The audit stays as an opt-in
+  diagnostic (e.g. for a future arch, or to re-check at very large N).
+
 ## Perf note
 Per-token AR forward + per-token K×K outer-product is slow (~35 s / 256 tok on
 gfx1151). A full 262k-token calibration wants **batched-prefill capture** (process
