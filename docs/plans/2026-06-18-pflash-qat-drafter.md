@@ -185,3 +185,57 @@ it. A *learned* drafter has little headroom to beat that here.
 Bottom line: **M0 falsifies the easy GO.** Park M1–M5; the next cheap experiment
 is the confound test at scale (large target, >32K), and/or rethinking PFlash's
 importance metric to add a non-recency component.
+
+## M0b — SCALING + CAUSAL-ORACLE follow-up (2026-06-18) — REVISES the M0 verdict
+
+M0 was scoped to Supra-50M and used shallow-vs-deep self-correlation (both layers
+share the RoPE recency envelope → trivially correlated → measures little). The
+405B question ("does this change with scale?") demanded a better design. Probe:
+`crates/hipfire-train/examples/pflash_scaling_probe.rs`, dense-Llama ladder, fp32,
+SEQ=512, 8 blocks, **planted distant dependency** (a needle fact in early block 1;
+the tail query needs it), with a **causal keep/drop oracle** (ablate each context
+block → KL shift in last-token logits = "does this block matter for the next
+token"). Compares PFlash's shallow cosine-K metric AND a mid-layer metric against
+the oracle, partialling out recency.
+
+| model         | layers | partial(**shallowK**,oracle\|rec) | partial(**midK**,oracle\|rec) | needle rank shallow/mid/oracle |
+|---------------|-------:|----------------------------------:|------------------------------:|--------------------------------|
+| Supra-50M     | 12     | +0.000                            | −0.222                        | 6/7 · 5/7 · 2/7                |
+| Llama-3.2-1B  | 16     | +0.154                            | +0.394                        | 7/7 · 5/7 · 1/7                |
+| Llama-3.2-3B  | 28     | +0.335                            | **+0.810**                    | 5/7 · 3/7 · 2/7                |
+
+(8B fp32 OOMs the 45GB gfx1103 box — the train loader has no quantized path; 8B/
+70B/405B are the natural next rungs on hipx 96GB / hiptrx. partial = recency-
+partialled Spearman of the metric vs the causal oracle; needle rank 1=best of 7
+context blocks.)
+
+**This REVISES M0, in the direction the 405B intuition predicted:**
+
+1. **Recency dominance is a small-model artifact.** Shallow-K's non-recency
+   importance (partial vs the causal oracle) rises **monotonically +0.00 → +0.15 →
+   +0.34** across 60× scale. M0's "it's just recency" held only at 50M. By 3B the
+   shallow metric already beats recency at finding what causally matters, and the
+   trend extrapolates favourably toward 405B.
+2. **Depth carries far more signal than scale.** Mid-layer K is dramatically better
+   at every rung (3B: **+0.810** mid vs +0.335 shallow; −0.22→+0.39→+0.81). PFlash
+   scores at the *shallowest* full-attn layer (to dodge long-ctx RoPE-OOD NaN) and
+   is therefore leaving most of the importance signal on the table. **The gap
+   between cheap-shallow and rich-mid is the real headroom** — and it's exactly the
+   niche a trained drafter could fill: emit a mid-quality ranking at shallow cost
+   without the deep-layer NaN.
+3. **Caveat — the single distant needle is still hard.** Even at 3B the shallow
+   metric ranks the one critical far-back block 5/7; the partial-correlation gains
+   come from ranking the bulk, not nailing THE block 5%-keep depends on. Mid-layer
+   does better (3/7 at 3B) but isn't crisp either at this size.
+
+**Revised recommendation (supersedes M0's "park"):** the drafter is back on the
+table, but its target is **not** "beat recency at shallow" (small win) — it's
+**reproduce a mid-layer-quality importance ranking cheaply**, which is where the
+signal actually lives and where the shallow-NaN constraint blocks PFlash today.
+Before building M1–M5, the two decisive open tests are: (a) confirm the trend at
+8B/70B (big boxes) — does shallow-K's partial keep climbing?; and (b) the **>32K
+operating point** — this probe is 512 tokens; the recency envelope and OOD-NaN
+behaviour at true long context (PFlash's actual trigger) are still untested.
+Caveat on the retrieval readout: 3B-Instruct p(answer)=0.13 (vs 1B-base 0.80) is
+confounded by base-vs-instruct chat formatting on a raw prompt; the causal oracle
+is robust to it (KL shift regardless of literal answer token).

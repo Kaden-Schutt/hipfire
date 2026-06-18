@@ -67,7 +67,8 @@ impl LayerLora {
 }
 
 pub struct LlamaModel {
-    pub embed: GpuTensor,      // [vocab, h] (also tied lm_head)
+    pub embed: GpuTensor,      // [vocab, h] (input embedding; also lm_head when tied)
+    pub lm_head: Option<GpuTensor>, // [vocab, h] separate output proj; None ⇒ tied (use embed)
     pub final_norm: GpuTensor, // [h]
     pub layers: Vec<(LayerWeights, LayerLora)>,
     pub dims: BlockDims,
@@ -88,10 +89,8 @@ impl LlamaModel {
         lora_rank: usize,
         lora_alpha: f32,
     ) -> HipResult<Self> {
-        assert!(
-            w.lm_head.is_none(),
-            "from_f32_weights requires tied embeddings"
-        );
+        // Untied lm_head is carried for the forward logit path (inference / probes);
+        // the backward functions only support tied embeddings (guarded there).
         let h = cfg.hidden_size;
         let qd = cfg.q_dim();
         let kvd = cfg.kv_dim();
@@ -145,6 +144,7 @@ impl LlamaModel {
 
         Ok(Self {
             embed: w.embed_tokens,
+            lm_head: w.lm_head,
             final_norm: w.final_norm,
             layers,
             dims,
@@ -350,7 +350,8 @@ pub fn model_forward(
         model.dims.eps,
     )?;
     let logits = gpu.zeros(&[seq * model.vocab], DType::F32)?;
-    linear_forward(gpu, &xf, &model.embed, &logits, seq, h, model.vocab)?;
+    let out_proj = model.lm_head.as_ref().unwrap_or(&model.embed);
+    linear_forward(gpu, &xf, out_proj, &logits, seq, h, model.vocab)?;
 
     Ok(ModelActivations {
         layer_inputs,
@@ -373,6 +374,7 @@ pub fn model_loss_backward(
     ignore_index: i32,
 ) -> HipResult<(f32, Vec<BlockLoraGrad>)> {
     let (seq, h, vocab) = (model.dims.seq, model.dims.h, model.vocab);
+    debug_assert!(model.lm_head.is_none(), "backward supports tied embeddings only");
 
     // Loss + d_logits (sum-reduction).
     let tgt = gpu.upload_f32(targets, &[seq])?;
@@ -452,6 +454,7 @@ pub fn model_distill_backward(
     teacher_p: &GpuTensor,
 ) -> HipResult<(f32, Vec<BlockLoraGrad>, GpuTensor)> {
     let (seq, h, vocab) = (model.dims.seq, model.dims.h, model.vocab);
+    debug_assert!(model.lm_head.is_none(), "backward supports tied embeddings only");
 
     let loss = gpu.zeros(&[seq], DType::F32)?;
     let d_logits = gpu.zeros(&[seq * vocab], DType::F32)?;
