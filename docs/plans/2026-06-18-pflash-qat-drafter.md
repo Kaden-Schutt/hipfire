@@ -119,6 +119,48 @@ To build:
 M0–M4 are training-side (hipfire-train + calib, our turf). M5 is engine
 greenfield (PFlash hot-path; coherence-gated).
 
+## P1–P3 RESULT (2026-06-18) — drafter BEATS the shallow-K baseline ✓
+
+Prototyped end-to-end in hipfire-train on a loadable Llama-3.2-3B stand-in target
+(the real qwen3.5 target is P5, needs the daemon K-capture hook). All on gfx1103.
+
+**Built + gradchecked (finite-difference):**
+- GPU scoring head `pflash_score_f32` (fwd+bwd) — the production cosine-block-score
+  primitive's training twin (full-kv_dim cosine = `compute_scores_batched`).
+- `block_backward_full` — base-weight grads for from-scratch training (recovery
+  path untouched).
+- Drafter (`drafter.rs`): shared frozen target embedding → in_proj (3072→512) → 3
+  small attention+MLP blocks → out_norm → K-head → rope → cosine score. 8.79M
+  trainable params. Full backward composes through verified ops; end-to-end
+  gradcheck PASSES.
+- Per-step VRAM freeing throughout (GpuTensor has no Drop): block_forward,
+  gqa_forward/backward, the drafter fwd/bwd graph. Without it SEQ=512 training OOMs.
+
+**Training (P3):** capture target mid-layer block-cosine labels over a docs/crates
+corpus (same `pflash_score_forward` the drafter uses → genuinely drop-in), ListNet
+top-1 loss, AdamW.
+- First run (wd=0): peaked **+0.804 vs +0.780 bar @ ep30**, then overfit hard
+  (→ +0.512 by ep300) — only 12 train prompts, no regularization.
+- Retune (**wd=0.05 + best-eval checkpointing**): **BEST +0.762 @ ep15 vs +0.714
+  bar → ✓ beats PFlash's current shallow-K ranking.** Still overfits past the peak
+  (final +0.494), so best-checkpointing (`pflash_drafter_best.bin`) keeps the good
+  weights.
+
+**Takeaway:** a tiny shared-embedding attention drafter *can* reproduce the
+target's mid-layer importance ranking better than the shallow-K signal PFlash uses
+today — confirming the M0b headroom is capturable. The win is best-checkpoint, not
+end-of-run; generalization is data-limited (12 prompts), so the obvious next lever
+is **more training data** (the v2 label cache stores its own chunks + keys on
+geometry, so scaling the corpus is the only thing that re-pays capture).
+
+**Infra shipped alongside:** label cache (v2, stores chunks; geometry-only key so
+commits don't invalidate it) + drafter/AdamW checkpoint + `--resume`
+(HIPFIRE_PFLASH_FRESH=1 to ignore); env-overridable EPOCHS/TAU/LR/WD.
+
+**Open follow-ups:** more-data run (lower overfit); token-ID importance-prior bias
+(D1 deferred); then P4 (Q8 QAT) → P5 (daemon hook for the real qwen3.5 target) →
+P6 (PFlash consumption).
+
 ## DECISIONS LOCKED (2026-06-18, post-M0b)
 
 **Build the custom scorer.** M0b shows real, scale-growing non-recency importance
