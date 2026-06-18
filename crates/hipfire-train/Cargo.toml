@@ -16,6 +16,11 @@ hipfire-model = { path = "../hipfire-model" }
 serde_json = "1"
 half = "2"
 rayon = "1"
+glob = "0.3"
+
+# Trainer progress/ETA TUI (matches hipfire-tui's versions).
+ratatui = "0.29"
+crossterm = "0.28"
 
 [[example]]
 name = "train_load_supra50m"
