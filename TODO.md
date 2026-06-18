@@ -477,11 +477,19 @@ plan `docs/plans/2026-06-18-pflash-qat-drafter.md`) currently runs as a
 fire-and-forget loop. Two ergonomics gaps surfaced while running it:
 
 - **Progress reporting.** Label capture (16 × 3B target forwards) and the long
-  epoch loop are silent for minutes. Add: per-chunk capture progress
-  (`captured i/N`), a per-epoch (or every-K-step) line with loss + a wall-clock /
-  ETA estimate, and optionally a `--quiet`/`--verbose` knob. Consider a tiny
-  shared progress helper so other training examples (`overfit_supra50m`,
-  `recovery_ft_supra50m`) can reuse it.
+  epoch loop are silent for minutes. Shipped a per-chunk `captured i/N` line; still
+  want a per-epoch (or every-K-step) line with loss + a wall-clock / ETA estimate,
+  and a `--quiet`/`--verbose` knob. Consider a tiny shared progress helper so other
+  training examples (`overfit_supra50m`, `recovery_ft_supra50m`) can reuse it.
+
+- **TUI dashboard (eventual).** Build a proper `ratatui` dashboard for the trainer
+  (deps already added: `ratatui` 0.29 + `crossterm` 0.28 in hipfire-train, matching
+  hipfire-tui). Target panels: capture progress + ETA; live loss + eval-Spearman
+  sparkline vs the shallow bar; per-epoch/step timing + overall ETA; current
+  hyperparams (τ/lr/epochs) and checkpoint status. Should degrade gracefully to the
+  plain-line output when stdout isn't a TTY (CI / piped logs). Sits on top of the
+  progress-helper above. Not urgent — land after the P3 result and the
+  checkpoint/resume round-trip are solid.
 - **Checkpoint / resume.** Long runs can't currently be stopped and continued.
   Add: periodic checkpointing of the drafter weights + AdamW moment buffers
   (m/v/t) + RNG/epoch position to a `.hfq`-style or simple binary artifact, and a
