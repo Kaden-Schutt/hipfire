@@ -18,12 +18,35 @@ use rdna_compute::{ActivationCapture, DType, Gpu, GpuTensor};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// Per-tensor on-GPU accumulators.
+/// Rows buffered per tensor before flushing the outer-product. A single
+/// `calib_hessian_outer_f32` over `[FLUSH_BATCH, K]` is ~FLUSH_BATCH× more
+/// efficient than per-token (N=1) launches (the tiled GEMM is built for N≥16),
+/// so this is the dominant calibration-throughput lever.
+const FLUSH_BATCH: usize = 256;
+
+/// Per-tensor on-GPU accumulators + a small activation row buffer.
 struct Acc {
     diag: GpuTensor, // [K]   Σx²  (imatrix)
     h: GpuTensor,    // [K,K] Σxxᵀ (Hessian)
+    buf: GpuTensor,  // [FLUSH_BATCH, K] staged activation rows
+    buf_rows: usize, // rows currently staged in `buf`
     k: usize,
     n_tokens: u64,
+}
+
+impl Acc {
+    /// Reduce the staged rows into the accumulators (one batched launch each),
+    /// then reset the buffer. No-op when empty.
+    fn flush(&mut self, gpu: &mut Gpu) {
+        if self.buf_rows == 0 {
+            return;
+        }
+        gpu.calib_sumsq_reduce_f32(&self.buf, &self.diag, self.buf_rows, self.k)
+            .unwrap();
+        gpu.calib_hessian_outer_f32(&self.buf, &self.h, self.buf_rows, self.k)
+            .unwrap();
+        self.buf_rows = 0;
+    }
 }
 
 /// Unified Hessian + imatrix collector. Arm via `gpu.active_capture`.
@@ -50,8 +73,12 @@ impl CalibCollector {
     /// `/ n_tokens`), plus the max relative `diag(H)`-vs-`Σx²` error (should be
     /// ~0; the two reduction kernels must agree on the same activations) and a
     /// `name -> n_tokens` map for provenance.
-    pub fn drain(&self, gpu: &Gpu) -> (Vec<HfqMemTensor>, f32, HashMap<String, u64>) {
-        let accs = self.accs.lock().unwrap();
+    pub fn drain(&self, gpu: &mut Gpu) -> (Vec<HfqMemTensor>, f32, HashMap<String, u64>) {
+        let mut accs = self.accs.lock().unwrap();
+        // Flush any staged activation rows before reading the accumulators.
+        for acc in accs.values_mut() {
+            acc.flush(gpu);
+        }
         let mut names: Vec<&String> = accs.keys().collect();
         names.sort();
         let mut tensors = Vec::with_capacity(names.len() * 2);
@@ -103,19 +130,39 @@ impl ActivationCapture for CalibCollector {
         if !accs.contains_key(tensor_name) {
             let diag = gpu.zeros(&[k], DType::F32).unwrap();
             let h = gpu.zeros(&[k, k], DType::F32).unwrap();
+            let buf = gpu.zeros(&[FLUSH_BATCH, k], DType::F32).unwrap();
             accs.insert(
                 tensor_name.to_string(),
                 Acc {
                     diag,
                     h,
+                    buf,
+                    buf_rows: 0,
                     k,
                     n_tokens: 0,
                 },
             );
         }
         let acc = accs.get_mut(tensor_name).unwrap();
-        gpu.calib_sumsq_reduce_f32(input, &acc.diag, n, k).unwrap();
-        gpu.calib_hessian_outer_f32(input, &acc.h, n, k).unwrap();
+        // Stage each activation row into the flush buffer; the actual reductions
+        // run a single batched launch per FLUSH_BATCH rows (Acc::flush). `input`
+        // is a shared scratch buffer of width `row_stride` ≥ k, so copy the first
+        // k columns of each of the n rows.
+        let row_stride = input.numel() / n.max(1);
+        for r in 0..n {
+            if acc.buf_rows == FLUSH_BATCH {
+                acc.flush(gpu);
+            }
+            gpu.memcpy_dtod_at_auto(
+                &acc.buf.buf,
+                acc.buf_rows * k * 4,
+                &input.buf,
+                r * row_stride * 4,
+                k * 4,
+            )
+            .unwrap();
+            acc.buf_rows += 1;
+        }
         acc.n_tokens += n as u64;
     }
 }
