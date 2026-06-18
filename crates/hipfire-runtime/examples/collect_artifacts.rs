@@ -109,6 +109,19 @@ fn main() {
     gpu.capture_names = names;
     gpu.active_capture = Some(collector.clone());
 
+    // MoE router histogram (cheap; reuses the engine facility). Captured during
+    // the same calibration forward; folded into the artifact metadata. For MoE
+    // models only (no-op when num_experts == 0). Per-subject extension: reset/take
+    // at subject boundaries when the corpus exposes subject identifiers.
+    let is_moe = config.num_experts > 0;
+    if is_moe {
+        qwen35::reset_moe_router_histogram(config.num_experts, config.num_experts_per_tok);
+        eprintln!(
+            "MoE: router histogram armed ({} experts, top-{})",
+            config.num_experts, config.num_experts_per_tok
+        );
+    }
+
     let mut kv = KvCache::new_gpu(
         &mut gpu,
         config.n_layers,
@@ -134,6 +147,46 @@ fn main() {
 
     // Disarm before draining (avoid capturing the drain's own ops, if any).
     gpu.active_capture = None;
+
+    // Drain the MoE router histogram (if MoE) into a JSON block for the artifact.
+    let moe_meta: Option<serde_json::Value> = if is_moe {
+        qwen35::take_moe_router_histogram().map(|h| {
+            // Top co-occurring expert pairs (the scheduler-affinity signal),
+            // summed across layers, top 64 by count.
+            let mut cooc: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+            for l in &h.per_layer {
+                for (&k, &v) in &l.cooccurrence {
+                    *cooc.entry(k).or_insert(0) += v;
+                }
+            }
+            let mut pairs: Vec<(u64, u64)> = cooc.into_iter().collect();
+            pairs.sort_by(|a, b| b.1.cmp(&a.1));
+            pairs.truncate(64);
+            let ne = h.num_experts as u64;
+            let cooc_json: Vec<serde_json::Value> = pairs
+                .iter()
+                .map(|(key, cnt)| serde_json::json!([key / ne, key % ne, cnt]))
+                .collect();
+            eprintln!(
+                "MoE: routed {} tokens; nonzero experts {}/{}",
+                h.routed_tokens,
+                h.topk_histogram.iter().filter(|&&c| c > 0).count(),
+                h.num_experts
+            );
+            serde_json::json!({
+                "num_experts": h.num_experts,
+                "k_top": h.k_top,
+                "routed_tokens": h.routed_tokens,
+                "routed_slots": h.routed_slots,
+                "top1_histogram": h.top1_histogram,
+                "topk_histogram": h.topk_histogram,
+                "per_layer_topk": h.per_layer.iter().map(|l| serde_json::json!(l.topk_histogram)).collect::<Vec<_>>(),
+                "top_cooccurrence": cooc_json, // [expert_a, expert_b, count]
+            })
+        })
+    } else {
+        None
+    };
 
     // Drain + verify diag(H) == Σx² (the two kernels agree on real activations),
     // and build the HFQ artifact tensors: <name>.hessian (E[xxᵀ], [K,K]) +
@@ -191,7 +244,7 @@ fn main() {
 
     // Provenance metadata (the unify-on-HFQ decision: artifacts carry their own
     // producer/corpus/token provenance, queryable via `hfq meta-get`).
-    let meta = serde_json::json!({
+    let mut meta = serde_json::json!({
         "artifact_kind": "calibration",
         "source_model": model,
         "corpus": corpus,
@@ -199,6 +252,15 @@ fn main() {
         "artifacts": ["hessian", "imatrix"],
         "per_tensor_tokens": serde_json::Value::Object(per_tensor_tokens),
     });
+    if let Some(mh) = moe_meta {
+        meta.as_object_mut()
+            .unwrap()
+            .insert("moe_router_histogram".to_string(), mh);
+        meta["artifacts"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!("moe_router_histogram"));
+    }
     hipfire_runtime::hfq::write_hfqm_package_mem(
         Path::new(&output),
         0,
