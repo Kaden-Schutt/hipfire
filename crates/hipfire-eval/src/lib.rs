@@ -907,7 +907,7 @@ pub fn usage() -> String {
        --executor <auto|none|examples|daemon|direct|mock> execution backend (default: auto; daemon uses the JSONL adapter; examples/direct run Hipfire example binaries; mock is no-GPU test-only)\n\
        --fetch-datasets         opt in to Hugging Face dataset fetches\n\
        --offline                forbid network fetches\n\
-       --dataset-cache <dir>    dataset cache root (default: ~/.hipfire/eval/datasets)\n\
+       --dataset-cache <dir>    dataset cache root (default: ~/.hipfire/datasets)\n\
        --result-cache <dir>     result cache root (default: ~/.hipfire/eval-results/cache)\n\
        --force                  ignore cache hits for this run, but write new cache entries\n\
        --regenerate             delete and replace matching cache entries before running\n\
@@ -1014,7 +1014,14 @@ pub fn default_batteries(tier: EvalTier) -> Vec<BatteryId> {
         tier,
         EvalTier::Medium | EvalTier::Long | EvalTier::Extensive
     ) {
-        out.extend([BatteryId::Barrage, BatteryId::Longctx]);
+        // Perplexity (PPL, + KLD when a reference resolves) joins medium: the
+        // run itself is fast when the corpus/kldref are present, and it skips
+        // with an actionable reason when they are not.
+        out.extend([
+            BatteryId::Barrage,
+            BatteryId::Longctx,
+            BatteryId::Perplexity,
+        ]);
     }
     if matches!(tier, EvalTier::Long | EvalTier::Extensive) {
         out.push(BatteryId::Profile);
@@ -1072,10 +1079,11 @@ pub fn default_output_dir(model: &str, tier: EvalTier) -> PathBuf {
 }
 
 fn default_dataset_cache() -> PathBuf {
+    // Reusable top-level location (shared across eval runs / tools), overridable
+    // with --dataset-cache. (Was ~/.hipfire/eval/datasets.)
     home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".hipfire")
-        .join("eval")
         .join("datasets")
 }
 
@@ -6838,6 +6846,39 @@ fn run_examples_perplexity_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<E
         .collect()
 }
 
+/// Resolve a KLD reference for `model`, in priority order: explicit `--kldref`,
+/// then `HIPFIRE_EVAL_KLDREF`, then a sibling `<stem>.kldref.hfq` / `.pkld`,
+/// then `~/.hipfire/datasets/kldref/<stem>.{kldref.hfq,pkld}`. `None` ⇒ PPL-only
+/// (not a failure). Generate one with `collect_artifacts --kldref` (HFQM) or
+/// `perplexity --dump-ref` (.pkld).
+fn resolve_kldref(model: &str, config: &EvalConfig) -> Option<PathBuf> {
+    if let Some(p) = &config.kldref {
+        if p.exists() {
+            return Some(p.clone());
+        }
+    }
+    if let Some(p) = std::env::var_os("HIPFIRE_EVAL_KLDREF").map(PathBuf::from) {
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let stem = model_artifact_stem(model);
+    let sibling_dir = Path::new(model)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut candidates = vec![
+        sibling_dir.join(format!("{stem}.kldref.hfq")),
+        sibling_dir.join(format!("{stem}.pkld")),
+    ];
+    if let Some(home) = home_dir() {
+        let d = home.join(".hipfire").join("datasets").join("kldref");
+        candidates.push(d.join(format!("{stem}.kldref.hfq")));
+        candidates.push(d.join(format!("{stem}.pkld")));
+    }
+    candidates.into_iter().find(|p| p.exists())
+}
+
 /// Parse a `"<label>:<ws><number>..."` line from perplexity stdout (e.g.
 /// `PPL:      14.6700`, `KLD/tok:  0.012345 (top-128, ...)`).
 fn parse_labeled_f64(s: &str, label: &str) -> Option<f64> {
@@ -6859,7 +6900,9 @@ fn run_examples_perplexity_model(
         "benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt".into()
     });
     let prompt_ref = prompt(&corpus_rel);
-    let kld_on = config.kldref.is_some();
+    // KLD needs a reference; absent ⇒ PPL-only (not a failure). See resolve_kldref.
+    let kldref = resolve_kldref(&model, config);
+    let kld_on = kldref.is_some();
     let base_metrics = BTreeMap::from([
         ("implemented".to_string(), json!(true)),
         ("executor".to_string(), json!("examples")),
@@ -6894,7 +6937,10 @@ fn run_examples_perplexity_model(
         .map(|r| r.join(&corpus_rel))
         .unwrap_or_else(|| PathBuf::from(&corpus_rel));
     if !corpus.exists() {
-        return skip(&format!("corpus not found: {}", corpus.display()));
+        return skip(&format!(
+            "corpus not found: {} — set HIPFIRE_EVAL_PERPLEXITY_CORPUS or place a corpus under ~/.hipfire/datasets/",
+            corpus.display()
+        ));
     }
 
     let ctx_len = std::env::var("HIPFIRE_EVAL_PERPLEXITY_CTX")
@@ -6914,7 +6960,7 @@ fn run_examples_perplexity_model(
         "--kv-mode".to_string(),
         kv_mode.clone(),
     ];
-    if let Some(kref) = &config.kldref {
+    if let Some(kref) = &kldref {
         args.push("--kld-ref".to_string());
         args.push(kref.display().to_string());
     }
