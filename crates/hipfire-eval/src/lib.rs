@@ -136,6 +136,7 @@ pub enum BatteryId {
     Cask,
     Profile,
     Calibrate,
+    Perplexity,
 }
 
 impl BatteryId {
@@ -158,6 +159,7 @@ impl BatteryId {
             "cask" => Ok(Self::Cask),
             "profile" => Ok(Self::Profile),
             "calibrate" | "calibration" => Ok(Self::Calibrate),
+            "perplexity" | "ppl" => Ok(Self::Perplexity),
             other => Err(format!("unknown battery: {other}")),
         }
     }
@@ -181,6 +183,7 @@ impl BatteryId {
             Self::Cask => "cask",
             Self::Profile => "profile",
             Self::Calibrate => "calibrate",
+            Self::Perplexity => "perplexity",
         }
     }
 }
@@ -5388,6 +5391,7 @@ fn examples_battery_rows(
                 .collect(),
         ),
         BatteryId::Calibrate => Some(run_examples_calibrate_rows(config, ctx)),
+        BatteryId::Perplexity => Some(run_examples_perplexity_rows(config, ctx)),
         _ => None,
     }
 }
@@ -6493,6 +6497,7 @@ fn examples_executor_available_for(battery: BatteryId) -> bool {
         BatteryId::Agentic => hipfire_coherence::daemon_binary_available(),
         BatteryId::Runtime => true,
         BatteryId::Calibrate => resolve_collect_artifacts_bin().is_some(),
+        BatteryId::Perplexity => resolve_perplexity_bin().is_some(),
         _ => false,
     }
 }
@@ -6818,6 +6823,183 @@ fn parse_collected_hessian_count(s: &str) -> Option<u64> {
     let rest = &s[idx..];
     let end = rest.find(' ')?;
     rest[..end].parse::<u64>().ok()
+}
+
+/// Perplexity / KLD battery: run the `perplexity` example over a raw corpus and
+/// report PPL + NLL/tok (+ KLD/tok when `--kldref` is given). The canonical
+/// quant-quality primitive — the place the older bench_quant_quality / megabench
+/// / sim_mq3_eval scripts should funnel into instead of invoking `perplexity`
+/// raw. Opt-in (`--battery perplexity`); not in any default tier (needs a
+/// corpus). Corpus/ctx via HIPFIRE_EVAL_PERPLEXITY_CORPUS / _CTX.
+fn run_examples_perplexity_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
+    evaluation_models(config)
+        .into_iter()
+        .map(|model| run_examples_perplexity_model(config, ctx, model))
+        .collect()
+}
+
+/// Parse a `"<label>:<ws><number>..."` line from perplexity stdout (e.g.
+/// `PPL:      14.6700`, `KLD/tok:  0.012345 (top-128, ...)`).
+fn parse_labeled_f64(s: &str, label: &str) -> Option<f64> {
+    let line = s.lines().find(|l| l.trim_start().starts_with(label))?;
+    line[line.find(label)? + label.len()..]
+        .split_whitespace()
+        .next()?
+        .parse::<f64>()
+        .ok()
+}
+
+fn run_examples_perplexity_model(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    model: String,
+) -> EvalResult {
+    let label = "corpus_perplexity";
+    let corpus_rel = std::env::var("HIPFIRE_EVAL_PERPLEXITY_CORPUS").unwrap_or_else(|_| {
+        "benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt".into()
+    });
+    let prompt_ref = prompt(&corpus_rel);
+    let kld_on = config.kldref.is_some();
+    let base_metrics = BTreeMap::from([
+        ("implemented".to_string(), json!(true)),
+        ("executor".to_string(), json!("examples")),
+        ("suite".to_string(), json!("perplexity")),
+        ("kld_ref".to_string(), json!(kld_on)),
+    ]);
+
+    let skip = |reason: &str| -> EvalResult {
+        row_for_model(
+            BatteryId::Perplexity,
+            None,
+            label,
+            None,
+            EvalStatus::Skip,
+            Some(reason.to_string()),
+            base_metrics.clone(),
+            config,
+            ctx,
+            prompt_ref.clone(),
+            0,
+            model.clone(),
+        )
+    };
+
+    if !Path::new(&model).exists() {
+        return skip("perplexity requires --model to be a local filesystem path");
+    }
+    let Some(bin) = resolve_perplexity_bin() else {
+        return skip("perplexity example binary not found; build with `cargo build --release -p hipfire-runtime --example perplexity`");
+    };
+    let corpus = repo_root()
+        .map(|r| r.join(&corpus_rel))
+        .unwrap_or_else(|| PathBuf::from(&corpus_rel));
+    if !corpus.exists() {
+        return skip(&format!("corpus not found: {}", corpus.display()));
+    }
+
+    let ctx_len = std::env::var("HIPFIRE_EVAL_PERPLEXITY_CTX")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(512);
+    let kv_mode = config.kv_mode.as_deref().unwrap_or("q8").to_string();
+    let mut args = vec![
+        model.clone(),
+        corpus.display().to_string(),
+        "--ctx".to_string(),
+        ctx_len.to_string(),
+        "--warmup".to_string(),
+        "8".to_string(),
+        "--offset".to_string(),
+        "0".to_string(),
+        "--kv-mode".to_string(),
+        kv_mode.clone(),
+    ];
+    if let Some(kref) = &config.kldref {
+        args.push("--kld-ref".to_string());
+        args.push(kref.display().to_string());
+    }
+    let command_display = format!("{} {}", bin.display(), args.join(" "));
+    let started = SystemTime::now();
+    let output = match Command::new(&bin).args(&args).output() {
+        Ok(o) => o,
+        Err(err) => {
+            let mut m = base_metrics.clone();
+            m.insert("command".to_string(), json!(command_display));
+            return row_for_model(
+                BatteryId::Perplexity,
+                None,
+                label,
+                None,
+                EvalStatus::Fail,
+                Some(format!("spawn perplexity: {err}")),
+                m,
+                config,
+                ctx,
+                prompt_ref,
+                elapsed_since_ms(started),
+                model,
+            );
+        }
+    };
+    let elapsed_ms = elapsed_since_ms(started);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let ppl = parse_labeled_f64(&stdout, "PPL:");
+    let nll = parse_labeled_f64(&stdout, "NLL/tok:");
+    let kld = parse_labeled_f64(&stdout, "KLD/tok:");
+
+    let mut metrics = base_metrics.clone();
+    metrics.insert("command".to_string(), json!(command_display));
+    metrics.insert("ctx".to_string(), json!(ctx_len));
+    metrics.insert("kv_mode".to_string(), json!(kv_mode));
+    if let Some(p) = ppl {
+        metrics.insert("ppl".to_string(), json!(p));
+    }
+    if let Some(n) = nll {
+        metrics.insert("nll_per_tok".to_string(), json!(n));
+    }
+    if let Some(k) = kld {
+        metrics.insert("kld_per_tok".to_string(), json!(k));
+    }
+    metrics.insert(
+        "stdout_hash".to_string(),
+        json!(stable_hash_bytes(stdout.as_bytes())),
+    );
+
+    // Pass when a finite, positive PPL was produced (and, if a KLD ref was
+    // supplied, a KLD value too). Baseline-regression gating is the sweep
+    // caller's job; this battery is the measurement primitive.
+    let ppl_ok = ppl.is_some_and(|p| p.is_finite() && p > 0.0);
+    let kld_ok = !kld_on || kld.is_some_and(|k| k.is_finite());
+    let ok = output.status.success() && ppl_ok && kld_ok;
+    let status = if ok {
+        EvalStatus::Pass
+    } else {
+        EvalStatus::Fail
+    };
+    let reason = if ok {
+        None
+    } else if !output.status.success() {
+        Some(format!("perplexity exited with {}", output.status))
+    } else if !ppl_ok {
+        Some("perplexity produced no finite positive PPL".to_string())
+    } else {
+        Some("KLD ref supplied but no KLD/tok produced".to_string())
+    };
+
+    row_for_model(
+        BatteryId::Perplexity,
+        None,
+        label,
+        None,
+        status,
+        reason,
+        metrics,
+        config,
+        ctx,
+        prompt_ref,
+        elapsed_ms,
+        model,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -10299,6 +10481,21 @@ fn resolve_collect_artifacts_bin() -> Option<PathBuf> {
     ])
 }
 
+fn resolve_perplexity_bin() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("HIPFIRE_PERPLEXITY_BIN") {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let exe = std::env::consts::EXE_SUFFIX;
+    let repo = repo_root()?;
+    newest_existing_path([
+        repo.join(format!("target/release/examples/perplexity{exe}")),
+        repo.join(format!("target/debug/examples/perplexity{exe}")),
+    ])
+}
+
 fn resolve_eval_hipfire_bin() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("HIPFIRE_EVAL_HIPFIRE_BIN") {
         let p = PathBuf::from(path);
@@ -10941,6 +11138,9 @@ fn result_cache_prompt_paths(battery: BatteryId) -> Vec<&'static str> {
         BatteryId::Longctx => vec!["benchmarks/prompts/longprose_multidoc.jsonl"],
         BatteryId::Profile => vec!["benchmarks/prompts/dflash_resident_smoke.txt"],
         BatteryId::Calibrate => vec!["benchmarks/prompts/lru_cache_single_blank.txt"],
+        BatteryId::Perplexity => {
+            vec!["benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt"]
+        }
         BatteryId::Barrage | BatteryId::Vision | BatteryId::Cask => Vec::new(),
     }
 }
@@ -11225,6 +11425,16 @@ fn run_battery(
             config,
             ctx,
             prompt("benchmarks/prompts/lru_cache_single_blank.txt"),
+        )],
+        BatteryId::Perplexity => vec![skip_row(
+            battery,
+            None,
+            "corpus_perplexity",
+            None,
+            "perplexity requires the examples executor (perplexity bin); none was available",
+            config,
+            ctx,
+            prompt("benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt"),
         )],
         BatteryId::Longctx | BatteryId::Vision | BatteryId::Cask | BatteryId::Profile => {
             vec![skip_row(
