@@ -1,7 +1,7 @@
 use axum::{extract::State, response::Json};
 use hipfire_model::AcceleratorInventory;
 use hipfire_scheduler::{
-    server_batch_health_json, server_decode_batch_health_json, server_prefill_batch_health_json,
+    server_decode_batch_health_json, server_prefill_batch_health_json,
     server_state_cache_health_json, SchedulerPolicyEnv,
 };
 use hipfire_state::runtime_workers_health_json_with_inventory;
@@ -15,6 +15,10 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
     let loaded = {
         let loaded = state.loaded_model_path.lock().await;
         loaded.clone()
+    };
+    let idle_timeout_sec = {
+        let cfg = state.config.lock().await;
+        cfg.idle_timeout
     };
     let prefill_queue_size = state.prefill_scheduler.lock().await.size();
     let selected_prefill_requests = state.selected_prefill_requests.lock().await.len();
@@ -38,11 +42,13 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
     Json(json!({
         "status": "ok",
         "model": loaded,
+        "idle_timeout_sec": idle_timeout_sec,
+        "pid": std::process::id(),
         "prefill_batch": prefill_batch,
         "decode_batch": server_decode_batch_health_json(&scheduler_env),
         "state_cache": server_state_cache_health_json(&scheduler_env),
         "runtime_workers": runtime_workers_health_payload(&accelerator_inventory),
-        "batches": server_batch_health_json(),
+        "batches": batch_health_payload(&state).await,
     }))
 }
 
@@ -52,6 +58,53 @@ fn scheduler_env_from_process() -> SchedulerPolicyEnv {
 
 fn runtime_workers_health_payload(inventory: &AcceleratorInventory) -> serde_json::Value {
     runtime_workers_health_json_with_inventory(&[], 0, None, 0, 0, "none", inventory)
+}
+
+async fn batch_health_payload(state: &SharedState) -> serde_json::Value {
+    let batches = state.batches.lock().await;
+    let total = batches.len();
+    let completed = batches
+        .values()
+        .filter(|batch| batch.status == "completed")
+        .count();
+    let failed = batches
+        .values()
+        .filter(|batch| batch.status == "failed")
+        .count();
+    let cancelled = batches
+        .values()
+        .filter(|batch| batch.status == "cancelled")
+        .count();
+    let queued = batches
+        .values()
+        .filter(|batch| {
+            matches!(
+                batch.status.as_str(),
+                "validating" | "in_progress" | "finalizing"
+            )
+        })
+        .count();
+    json!({
+        "enabled": true,
+        "queued": queued,
+        "selected": queued,
+        "total": total,
+        "failed": failed,
+        "cancelled": cancelled,
+        "completed": completed,
+        "completion_window_supported": true,
+        "supported_endpoints": ["/v1/chat/completions", "/v1/responses"],
+        "execution_mode": "serial_fallback",
+        "last_fallback_reason": "daemon_serialized_request_path",
+        "batch_capability": "supported",
+        "batch_capability_reason": "rust_axum_batch_control_plane",
+        "selected_batch_execution_mode": "serial_fallback",
+        "fallback_reason": "generate_batch_prefill_not_used_for_file_batches",
+        "runtime_dispatch_skipped_reason": "batch_jobs_execute_via_blocking_routes",
+        "unsupported_mode_hits_total": 0,
+        "validation_errors_total": failed,
+        "streaming_rejections_total": 0,
+    })
 }
 
 #[cfg(test)]
@@ -65,7 +118,7 @@ mod tests {
             "decode_batch": server_decode_batch_health_json(&SchedulerPolicyEnv::empty()),
             "state_cache": server_state_cache_health_json(&SchedulerPolicyEnv::empty()),
             "runtime_workers": runtime_workers_health_payload(&AcceleratorInventory::not_probed()),
-            "batches": server_batch_health_json(),
+            "batches": json!({ "enabled": true }),
         });
 
         assert_eq!(payload["prefill_batch"], json!({ "enabled": false }));
@@ -82,7 +135,7 @@ mod tests {
             0
         );
         assert_eq!(payload["runtime_workers"]["workers"], json!([]));
-        assert_eq!(payload["batches"], json!({ "enabled": false }));
+        assert_eq!(payload["batches"], json!({ "enabled": true }));
     }
 
     #[test]

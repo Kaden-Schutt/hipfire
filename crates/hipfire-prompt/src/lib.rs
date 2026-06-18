@@ -651,6 +651,109 @@ pub struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
+/// Runtime facts inferred from a resolved HF chat template by rendering
+/// controlled conversations through MiniJinja.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChatTemplateProfile {
+    /// Bytes appended by `add_generation_prompt=true` after a completed user
+    /// turn. This is the exact assistant prompt prefix the model sees.
+    pub assistant_prefix: String,
+    /// Bytes the template appends after assistant content when replaying a
+    /// completed assistant turn.
+    pub assistant_turn_suffix: String,
+    /// Stop strings that should be hidden from generated output.
+    pub stop_at: Vec<String>,
+    /// Strings whose prefixes should be held back while streaming, so partial
+    /// stop markers are not leaked before the full marker is known.
+    pub holdback_prefixes: Vec<String>,
+    pub think_open: Option<String>,
+    pub think_close: Option<String>,
+}
+
+impl ChatTemplateProfile {
+    pub fn from_template(tokenizer: &dyn PromptTokenizer, template: &str) -> Result<Self, String> {
+        const USER_SENTINEL: &str = "__HIPFIRE_PROFILE_USER_6f6e921c__";
+        const ASSISTANT_SENTINEL: &str = "__HIPFIRE_PROFILE_ASSISTANT_6f6e921c__";
+
+        let frame = JinjaChatFrame {
+            tokenizer,
+            template,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: None,
+        };
+        let user_turn = Message {
+            role: Role::User,
+            content: USER_SENTINEL.to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        };
+        let assistant_turn = Message {
+            role: Role::Assistant,
+            content: ASSISTANT_SENTINEL.to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        };
+
+        let without_prompt = frame.render_messages_with_generation_prompt(
+            std::slice::from_ref(&user_turn),
+            None,
+            None,
+            false,
+        )?;
+        let with_prompt = frame.render_messages_with_generation_prompt(
+            std::slice::from_ref(&user_turn),
+            None,
+            None,
+            true,
+        )?;
+        let assistant_replay = frame.render_messages_with_generation_prompt(
+            &[user_turn, assistant_turn],
+            None,
+            None,
+            false,
+        )?;
+
+        let assistant_prefix = with_prompt
+            .strip_prefix(&without_prompt)
+            .unwrap_or_default()
+            .to_string();
+        let assistant_turn_suffix = assistant_replay
+            .split_once(ASSISTANT_SENTINEL)
+            .map(|(_, suffix)| suffix.to_string())
+            .unwrap_or_default();
+
+        let mut stop_at = Vec::new();
+        push_unique_nonempty(&mut stop_at, assistant_turn_suffix.trim_end().to_string());
+        push_unique_nonempty(&mut stop_at, assistant_turn_suffix.clone());
+
+        let mut holdback_prefixes = Vec::new();
+        for stop in &stop_at {
+            push_unique_nonempty(&mut holdback_prefixes, stop.clone());
+        }
+
+        Ok(Self {
+            think_open: assistant_prefix
+                .contains("<think>")
+                .then(|| "<think>".to_string()),
+            think_close: assistant_prefix
+                .contains("</think>")
+                .then(|| "</think>".to_string()),
+            assistant_prefix,
+            assistant_turn_suffix,
+            stop_at,
+            holdback_prefixes,
+        })
+    }
+}
+
+fn push_unique_nonempty(items: &mut Vec<String>, item: String) {
+    if !item.is_empty() && !items.iter().any(|existing| existing == &item) {
+        items.push(item);
+    }
+}
+
 /// Stable canonical JSON representation for prompt-identity fingerprints.
 ///
 /// Objects emit keys in lexical order recursively; arrays preserve order.
@@ -732,8 +835,36 @@ pub fn openai_chat_role_to_prompt_role(role: &str) -> Option<Role> {
 pub fn openai_chat_content_to_text(content: Option<&serde_json::Value>) -> String {
     match content {
         Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| {
+                if part.get("type").and_then(serde_json::Value::as_str) == Some("text") {
+                    part.get("text").and_then(serde_json::Value::as_str)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(""),
         Some(other) => other.to_string(),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod openai_content_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn content_parts_extract_text_and_ignore_images() {
+        let content = json!([
+            {"type": "text", "text": "look "},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            {"type": "text", "text": "here"}
+        ]);
+
+        assert_eq!(openai_chat_content_to_text(Some(&content)), "look here");
     }
 }
 
@@ -904,6 +1035,18 @@ impl<'a> JinjaChatFrame<'a> {
         tools: Option<&[serde_json::Value]>,
         tool_call_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
     ) -> Result<String, String> {
+        self.render_messages_with_generation_prompt(messages, tools, tool_call_kwargs, true)
+    }
+
+    /// Render the template against a full multi-turn message history, with
+    /// explicit control over HuggingFace's `add_generation_prompt` kwarg.
+    pub fn render_messages_with_generation_prompt(
+        &self,
+        messages: &[Message],
+        tools: Option<&[serde_json::Value]>,
+        tool_call_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
+        add_generation_prompt: bool,
+    ) -> Result<String, String> {
         use minijinja::{Environment, Error, ErrorKind, Value};
         use minijinja_contrib::pycompat::unknown_method_callback;
 
@@ -993,7 +1136,7 @@ impl<'a> JinjaChatFrame<'a> {
         };
         let ctx = minijinja::context! {
             messages => Value::from_serialize(messages),
-            add_generation_prompt => true,
+            add_generation_prompt => add_generation_prompt,
             enable_thinking => self.enable_thinking,
             bos_token => bos_token,
             tools => tools_val,
@@ -1386,6 +1529,27 @@ mod tests {
             rendered.contains("\"get_weather\""),
             "tool json missing: {rendered}"
         );
+    }
+
+    #[test]
+    fn chat_template_profile_extracts_assistant_stop_marker() {
+        let t = make_tokenizer();
+        let template = "{% for m in messages %}\
+            <|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n\
+            {% endfor %}\
+            {% if add_generation_prompt %}<|im_start|>assistant\n\
+            {% if enable_thinking %}<think>\n{% endif %}\
+            {% endif %}";
+        let profile = ChatTemplateProfile::from_template(&t, template)
+            .expect("profile extraction should render probe conversations");
+
+        assert_eq!(profile.assistant_turn_suffix, "<|im_end|>\n");
+        assert!(profile.stop_at.iter().any(|s| s == "<|im_end|>"));
+        assert!(profile.holdback_prefixes.iter().any(|s| s == "<|im_end|>"));
+        assert!(profile
+            .assistant_prefix
+            .contains("<|im_start|>assistant\n<think>\n"));
+        assert_eq!(profile.think_open.as_deref(), Some("<think>"));
     }
 
     #[test]

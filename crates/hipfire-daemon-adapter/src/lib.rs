@@ -10,14 +10,16 @@ use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::future::BoxFuture;
-use hipfire_daemon_protocol::{DaemonRequest, DaemonResponse};
-use hipfire_generate::{DoneEvent, GenerateTextRequest};
+use hipfire_daemon_protocol::{DaemonRequest, DaemonResponse, RequestControl};
+use hipfire_generate::{DoneEvent, GenerateTextRequest, ToolCall};
 use hipfire_model::{AcceleratorInventory, ModelLoadParams, ModelLoadRequest, ModelLoadedResponse};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tracing::debug;
 
 trait DaemonTransport: Send {
+    #[cfg(test)]
+    fn as_any(&self) -> &dyn std::any::Any;
     fn send_json<'a>(&'a mut self, req: &'a DaemonRequest) -> BoxFuture<'a, anyhow::Result<()>>;
     fn recv_response<'a>(&'a mut self) -> BoxFuture<'a, anyhow::Result<DaemonResponse>>;
 }
@@ -34,6 +36,7 @@ impl StdioTransport {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
+            .kill_on_drop(true)
             .spawn()
             .map_err(|e| anyhow::anyhow!("failed to spawn daemon at {}: {e}", bin.display()))?;
 
@@ -49,6 +52,11 @@ impl StdioTransport {
 }
 
 impl DaemonTransport for StdioTransport {
+    #[cfg(test)]
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn send_json<'a>(&'a mut self, req: &'a DaemonRequest) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
             let line = serde_json::to_string(req)?;
@@ -79,6 +87,23 @@ pub struct DaemonEngine {
     pub worker_key_id: Option<String>,
 }
 
+pub struct GenerateCollected {
+    pub text: String,
+    pub done: DoneEvent,
+    pub tool_calls: Vec<ToolCall>,
+}
+
+pub enum GenerateStreamEvent {
+    Token(String),
+    ToolCalls(Vec<ToolCall>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GenerateStreamControl {
+    Continue,
+    Cancel,
+}
+
 impl DaemonEngine {
     pub async fn spawn(bin: &Path) -> anyhow::Result<Self> {
         let transport = StdioTransport::spawn(bin).await?;
@@ -94,6 +119,28 @@ impl DaemonEngine {
 
     async fn recv(&mut self) -> anyhow::Result<DaemonResponse> {
         self.transport.recv_response().await
+    }
+
+    /// Ask the daemon to abort a running request.
+    ///
+    /// This is fire-and-forget by protocol design: the matching generate
+    /// stream is expected to drain its own terminal `done`/`error` event.
+    pub async fn abort(&mut self, request_id: impl Into<String>) -> anyhow::Result<()> {
+        self.send(&DaemonRequest::Abort(RequestControl {
+            id: request_id.into(),
+        }))
+        .await
+    }
+
+    /// Ask the daemon to close an active thinking block and answer.
+    ///
+    /// Like `abort`, this does not wait for a separate acknowledgement; the
+    /// active generate stream remains the authoritative response path.
+    pub async fn force_answer(&mut self, request_id: impl Into<String>) -> anyhow::Result<()> {
+        self.send(&DaemonRequest::ForceAnswer(RequestControl {
+            id: request_id.into(),
+        }))
+        .await
     }
 
     /// Send `load` and wait for `loaded`.
@@ -203,9 +250,19 @@ impl DaemonEngine {
         &mut self,
         req: GenerateTextRequest,
     ) -> anyhow::Result<(String, DoneEvent)> {
+        let collected = self.generate_collected(req).await?;
+        Ok((collected.text, collected.done))
+    }
+
+    /// Send `generate` and collect all text plus structured tool-call events.
+    pub async fn generate_collected(
+        &mut self,
+        req: GenerateTextRequest,
+    ) -> anyhow::Result<GenerateCollected> {
         let request_id = req.id.clone();
         self.send(&DaemonRequest::Generate(req)).await?;
         let mut text = String::new();
+        let mut tool_calls = Vec::new();
         loop {
             match self.recv().await? {
                 DaemonResponse::Token(t) => {
@@ -213,9 +270,18 @@ impl DaemonEngine {
                         text.push_str(&t.text)
                     }
                 }
+                DaemonResponse::ToolCalls(t) => {
+                    if t.id == request_id {
+                        tool_calls.extend(t.calls);
+                    }
+                }
                 DaemonResponse::Done(d) => {
                     if d.id == request_id {
-                        return Ok((text, d));
+                        return Ok(GenerateCollected {
+                            text,
+                            done: d,
+                            tool_calls,
+                        });
                     }
                     tracing::warn!(
                         "stale done response: got id={} expected={}",
@@ -241,18 +307,69 @@ impl DaemonEngine {
     where
         F: FnMut(String),
     {
+        self.generate_streaming_events(req, move |event| {
+            if let GenerateStreamEvent::Token(text) = event {
+                on_token(text);
+            }
+        })
+        .await
+    }
+
+    /// Send `generate` and stream typed generation events via a callback. Returns done.
+    pub async fn generate_streaming_events<F>(
+        &mut self,
+        req: GenerateTextRequest,
+        mut on_event: F,
+    ) -> anyhow::Result<DoneEvent>
+    where
+        F: FnMut(GenerateStreamEvent),
+    {
+        self.generate_streaming_events_controlled(req, move |event| {
+            on_event(event);
+            GenerateStreamControl::Continue
+        })
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("generation cancelled"))
+    }
+
+    /// Send `generate` and stream typed events until completion or caller cancellation.
+    ///
+    /// Returning `GenerateStreamControl::Cancel` stops reading the daemon
+    /// stream and returns `Ok(None)`. Callers must then discard this engine:
+    /// unread daemon events would otherwise corrupt the next request.
+    pub async fn generate_streaming_events_controlled<F>(
+        &mut self,
+        req: GenerateTextRequest,
+        mut on_event: F,
+    ) -> anyhow::Result<Option<DoneEvent>>
+    where
+        F: FnMut(GenerateStreamEvent) -> GenerateStreamControl,
+    {
         let request_id = req.id.clone();
         self.send(&DaemonRequest::Generate(req)).await?;
         loop {
             match self.recv().await? {
                 DaemonResponse::Token(t) => {
                     if t.id == request_id {
-                        on_token(t.text)
+                        if on_event(GenerateStreamEvent::Token(t.text))
+                            == GenerateStreamControl::Cancel
+                        {
+                            return Ok(None);
+                        }
+                    }
+                }
+                DaemonResponse::ToolCalls(t) => {
+                    if t.id == request_id {
+                        if on_event(GenerateStreamEvent::ToolCalls(t.calls))
+                            == GenerateStreamControl::Cancel
+                        {
+                            return Ok(None);
+                        }
                     }
                 }
                 DaemonResponse::Done(d) => {
                     if d.id == request_id {
-                        return Ok(d);
+                        return Ok(Some(d));
                     }
                     tracing::warn!(
                         "stale done response: got id={} expected={}",
@@ -670,6 +787,10 @@ mod tests {
     }
 
     impl DaemonTransport for MockTransport {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn send_json<'a>(
             &'a mut self,
             req: &'a DaemonRequest,
@@ -728,6 +849,7 @@ mod tests {
             DaemonResponse::Loaded(ModelLoadedResponse {
                 worker_key_id: "stale-worker".to_string(),
                 arch: None,
+                cache_capable: None,
                 dim: None,
                 layers: None,
                 vocab: None,
@@ -737,6 +859,7 @@ mod tests {
             DaemonResponse::Loaded(ModelLoadedResponse {
                 worker_key_id: "worker-a".to_string(),
                 arch: Some("qwen35".to_string()),
+                cache_capable: Some(true),
                 dim: Some(4096),
                 layers: Some(32),
                 vocab: Some(151936),
@@ -791,6 +914,20 @@ mod tests {
                 id: "req-1".to_string(),
                 text: " world".to_string(),
             }),
+            DaemonResponse::ToolCalls(hipfire_generate::ToolCallsEvent {
+                id: "other".to_string(),
+                calls: vec![hipfire_generate::ToolCall {
+                    name: "skip".to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+            }),
+            DaemonResponse::ToolCalls(hipfire_generate::ToolCallsEvent {
+                id: "req-1".to_string(),
+                calls: vec![hipfire_generate::ToolCall {
+                    name: "lookup".to_string(),
+                    arguments: serde_json::json!({"q": "hipfire"}),
+                }],
+            }),
             DaemonResponse::Done(DoneEvent {
                 id: "req-1".to_string(),
                 tokens: 2,
@@ -819,20 +956,136 @@ mod tests {
             worker_key_id: Some("worker-a".to_string()),
             tools: None,
             system: None,
+            stop: None,
+            image_base64: None,
             thinking: None,
+            thinking_mode: None,
+            reasoning_effort: None,
+            assistant_prefix: None,
             max_think_tokens: None,
+            presence_penalty: None,
+            frequency_penalty: None,
             request_id: None,
             evidence_dir: None,
         };
-        let (text, done) = engine.generate(req).await.unwrap();
-        assert_eq!(text, "hello world");
-        assert_eq!(done.tokens, 2);
+        let collected = engine.generate_collected(req).await.unwrap();
+        assert_eq!(collected.text, "hello world");
+        assert_eq!(collected.done.tokens, 2);
+        assert_eq!(collected.tool_calls.len(), 1);
+        assert_eq!(collected.tool_calls[0].name, "lookup");
+        assert_eq!(
+            collected.tool_calls[0].arguments,
+            serde_json::json!({"q": "hipfire"})
+        );
     }
 
     #[tokio::test]
     async fn reset_waits_for_reset_response() {
         let mut engine = mock_engine(vec![DaemonResponse::Reset]);
         engine.reset().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_control_helpers_send_bun_wire_shape_without_waiting() {
+        let mut engine = mock_engine(vec![]);
+
+        engine.abort("req-1").await.unwrap();
+        engine.force_answer("req-1").await.unwrap();
+
+        let transport = engine
+            .transport
+            .as_any()
+            .downcast_ref::<MockTransport>()
+            .expect("mock transport");
+        assert_eq!(
+            transport.sent,
+            vec![
+                r#"{"type":"abort","id":"req-1"}"#,
+                r#"{"type":"force_answer","id":"req-1"}"#,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_streaming_events_forwards_tokens_and_tool_calls() {
+        let mut engine = mock_engine(vec![
+            DaemonResponse::Token(hipfire_generate::TokenEvent {
+                id: "req-1".to_string(),
+                text: "before".to_string(),
+            }),
+            DaemonResponse::ToolCalls(hipfire_generate::ToolCallsEvent {
+                id: "req-1".to_string(),
+                calls: vec![hipfire_generate::ToolCall {
+                    name: "lookup".to_string(),
+                    arguments: serde_json::json!({"q": "hipfire"}),
+                }],
+            }),
+            DaemonResponse::Done(DoneEvent {
+                id: "req-1".to_string(),
+                tokens: 2,
+                tok_s: None,
+                prefill_tokens: None,
+                prefill_ms: None,
+                prefill_tok_s: None,
+                decode_tok_s: None,
+                ttft_ms: None,
+                finish_reason: Some("tool_calls".to_string()),
+                response_id: None,
+                extra: Default::default(),
+            }),
+        ]);
+
+        let req = GenerateTextRequest::from_prompt(
+            "req-1".to_string(),
+            "hello",
+            GenerationSamplingPolicy::greedy(8),
+        );
+        let mut seen = Vec::new();
+        let done = engine
+            .generate_streaming_events(req, |event| match event {
+                GenerateStreamEvent::Token(text) => seen.push(format!("token:{text}")),
+                GenerateStreamEvent::ToolCalls(calls) => {
+                    seen.push(format!("tool:{}", calls[0].name))
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(seen, vec!["token:before", "tool:lookup"]);
+        assert_eq!(done.finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[tokio::test]
+    async fn controlled_stream_can_stop_without_waiting_for_done() {
+        let mut engine = mock_engine(vec![
+            DaemonResponse::Token(hipfire_generate::TokenEvent {
+                id: "req-1".to_string(),
+                text: "first".to_string(),
+            }),
+            DaemonResponse::Token(hipfire_generate::TokenEvent {
+                id: "req-1".to_string(),
+                text: "unread".to_string(),
+            }),
+        ]);
+
+        let req = GenerateTextRequest::from_prompt(
+            "req-1".to_string(),
+            "hello",
+            GenerationSamplingPolicy::greedy(8),
+        );
+        let mut seen = Vec::new();
+        let done = engine
+            .generate_streaming_events_controlled(req, |event| {
+                if let GenerateStreamEvent::Token(text) = event {
+                    seen.push(text);
+                }
+                GenerateStreamControl::Cancel
+            })
+            .await
+            .unwrap();
+
+        assert!(done.is_none());
+        assert_eq!(seen, vec!["first"]);
     }
 
     #[test]

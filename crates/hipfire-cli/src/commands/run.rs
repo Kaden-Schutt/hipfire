@@ -62,6 +62,7 @@ pub async fn run(args: RunArgs, config: HipfireConfig) -> anyhow::Result<()> {
             config.max_tokens,
             args.temperature,
             None,
+            None,
             args.max_tokens,
         ),
         engine.worker_key_id.clone(),

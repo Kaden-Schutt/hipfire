@@ -6,6 +6,15 @@ into full investigations here.
 
 - Qwen3 no-output-gate FullAttention faults in fused Q/K/V MQ4 projection;
   split projection should be used until the fused kernel is shape-audited.
+- Rust/Axum `hipfire serve` still lacks Bun-equivalent request cancellation:
+  Bun sends daemon `{type:"abort", id}` on stream/non-stream client disconnect
+  and `{type:"force_answer", id}` after the thinking watchdog, but the Rust
+  daemon adapter currently owns stdin/stdout behind one mutable engine during
+  generation and the daemon main loop is synchronous while generating. The
+  shared protocol now has typed `abort`/`force_answer` messages, and Axum
+  streaming drops the daemon when it detects a closed SSE channel after a
+  daemon event. Effective mid-prefill cancellation and force-answer still need
+  split write/read transport ownership plus generation-loop checkpoints.
 - Qwen3.5-397B-A17B HFQM v2 paged-expert forced serial prefill can panic when
   `HIPFIRE_QWEN35_EXPERT_CACHE_MB` is too small for the per-layer routed set;
   observed with 64 MB as `patch_expert_module_ptr_table: layer=0 expert=9 not

@@ -6,8 +6,13 @@
 
 use serde::{Deserialize, Serialize};
 
-use hipfire_generate::{DoneEvent, ErrorEvent, GenerateTextRequest, TokenEvent};
+use hipfire_generate::{DoneEvent, ErrorEvent, GenerateTextRequest, TokenEvent, ToolCallsEvent};
 use hipfire_model::{AcceleratorInventory, ModelLoadRequest, ModelLoadedResponse};
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RequestControl {
+    pub id: String,
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -18,6 +23,8 @@ pub enum DaemonRequest {
     Ping,
     Inventory,
     Generate(GenerateTextRequest),
+    Abort(RequestControl),
+    ForceAnswer(RequestControl),
 }
 
 #[derive(Debug, Deserialize)]
@@ -29,6 +36,7 @@ pub enum DaemonResponse {
     Pong,
     Inventory(AcceleratorInventory),
     Token(TokenEvent),
+    ToolCalls(ToolCallsEvent),
     Done(DoneEvent),
     Error(ErrorEvent),
     #[serde(other)]
@@ -70,8 +78,15 @@ mod tests {
             worker_key_id: Some("worker-a".to_string()),
             tools: None,
             system: None,
+            stop: None,
+            image_base64: None,
             thinking: None,
+            thinking_mode: None,
+            reasoning_effort: None,
+            assistant_prefix: None,
             max_think_tokens: None,
+            presence_penalty: None,
+            frequency_penalty: None,
             request_id: None,
             evidence_dir: None,
         });
@@ -83,6 +98,32 @@ mod tests {
         assert_eq!(value["messages"][1]["content"], "last user text");
         assert!(value.get("tools").is_none());
         assert!(value.get("request_id").is_none());
+    }
+
+    #[test]
+    fn request_control_messages_match_bun_wire_shape() {
+        let abort = serde_json::to_value(DaemonRequest::Abort(RequestControl {
+            id: "chatcmpl-1".to_string(),
+        }))
+        .unwrap();
+        assert_eq!(abort, json!({"type": "abort", "id": "chatcmpl-1"}));
+
+        let force = serde_json::to_value(DaemonRequest::ForceAnswer(RequestControl {
+            id: "chatcmpl-1".to_string(),
+        }))
+        .unwrap();
+        assert_eq!(force, json!({"type": "force_answer", "id": "chatcmpl-1"}));
+
+        let parsed: DaemonRequest = serde_json::from_value(json!({
+            "type": "abort",
+            "id": "chatcmpl-1",
+            "ignored": true
+        }))
+        .unwrap();
+        let DaemonRequest::Abort(control) = parsed else {
+            panic!("expected abort request");
+        };
+        assert_eq!(control.id, "chatcmpl-1");
     }
 
     #[test]
@@ -183,6 +224,8 @@ mod tests {
                 "dflash_mode": "off",
                 "draft": "draft.hfq",
                 "cask_sidecar": "sidecar.triattn.hfq",
+                "mtp_mode": "auto",
+                "mtp_k": 3,
                 "ignored": true
             },
             "request_id": "load-1",
@@ -203,6 +246,8 @@ mod tests {
             req.params.cask_sidecar.as_deref(),
             Some("sidecar.triattn.hfq")
         );
+        assert_eq!(req.params.mtp_mode.as_deref(), Some("auto"));
+        assert_eq!(req.params.mtp_k, Some(3));
         assert_eq!(req.request_id.as_deref(), Some("load-1"));
     }
 
@@ -223,5 +268,22 @@ mod tests {
         };
         assert_eq!(done.id, "req-1");
         assert_eq!(done.extra["backend_path"], "hip_rdna_compute");
+    }
+
+    #[test]
+    fn tool_calls_response_deserializes_daemon_shape() {
+        let response: DaemonResponse = serde_json::from_value(json!({
+            "type": "tool_calls",
+            "id": "req-1",
+            "calls": [{"name": "lookup", "arguments": {"q": "hipfire"}}]
+        }))
+        .unwrap();
+
+        let DaemonResponse::ToolCalls(tool_calls) = response else {
+            panic!("expected tool_calls response");
+        };
+        assert_eq!(tool_calls.id, "req-1");
+        assert_eq!(tool_calls.calls[0].name, "lookup");
+        assert_eq!(tool_calls.calls[0].arguments, json!({"q": "hipfire"}));
     }
 }

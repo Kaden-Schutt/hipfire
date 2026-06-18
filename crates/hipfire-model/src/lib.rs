@@ -750,10 +750,26 @@ pub fn discover_dflash_draft_for_model(model: &Path) -> Option<PathBuf> {
     }
     let dir = model.parent().unwrap_or_else(|| Path::new("."));
     let filename = model.file_name().and_then(|name| name.to_str())?;
-    dflash_draft_candidates(filename)
+    dflash_draft_search_dirs(dir)
         .into_iter()
-        .map(|candidate| dir.join(candidate))
+        .flat_map(|search_dir| {
+            dflash_draft_candidates(filename)
+                .into_iter()
+                .map(move |candidate| search_dir.join(candidate))
+        })
         .find(|candidate| candidate.is_file())
+}
+
+fn dflash_draft_search_dirs(model_dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![model_dir.to_path_buf()];
+    let hipfire = hipfire_config::hipfire_dir();
+    dirs.push(hipfire.join("drafts"));
+    dirs.push(hipfire.join("models"));
+    if let Ok(cwd) = std::env::current_dir() {
+        dirs.push(cwd.join("models"));
+        dirs.push(cwd.join("../../models"));
+    }
+    dirs
 }
 
 /// Return candidate DFlash draft sidecar filenames for a target model filename.
@@ -762,10 +778,20 @@ pub fn dflash_draft_candidates(filename: &str) -> Vec<String> {
         return Vec::new();
     };
     let dotted_family = format!("{family}{version}");
-    vec![
-        format!("{dotted_family}-{size}-{quant}.dflash.hfq"),
-        format!("{dotted_family}-{size}-{quant}.draft.hfq"),
-    ]
+    let compact_family = dotted_family.replace('.', "");
+    let mut quants = vec![quant.clone()];
+    if quant == "mq3" {
+        quants.push("mq4".to_string());
+    } else if quant == "mq4" {
+        quants.push("mq3".to_string());
+    }
+    let mut out = Vec::new();
+    for q in quants {
+        out.push(format!("{compact_family}-{size}-dflash-{q}.hfq"));
+        out.push(format!("{dotted_family}-{size}-{q}.dflash.hfq"));
+        out.push(format!("{dotted_family}-{size}-{q}.draft.hfq"));
+    }
+    out
 }
 
 fn parse_qwen_dflash_target(filename: &str) -> Option<(&'static str, String, String, String)> {
@@ -789,7 +815,6 @@ fn parse_qwen_dflash_target(filename: &str) -> Option<(&'static str, String, Str
         return None;
     }
     let version = parts[0].trim_start_matches("qwen").to_string();
-    let size = parts[1].to_string();
     let quant = quant_from_ext.or_else(|| {
         parts
             .iter()
@@ -797,6 +822,12 @@ fn parse_qwen_dflash_target(filename: &str) -> Option<(&'static str, String, Str
             .find(|part| matches!(**part, "mq3" | "mq4" | "mq6" | "mq8"))
             .map(|part| (*part).to_string())
     })?;
+    let quant_idx = parts
+        .iter()
+        .rposition(|part| *part == quant)
+        .unwrap_or(parts.len());
+    let size_end = quant_idx.max(2);
+    let size = parts[1..size_end].join("-");
     Some(("qwen", version, size, quant))
 }
 
@@ -874,7 +905,7 @@ pub struct ModelLoadRequest {
 /// Common load parameters shared by daemon protocol clients and future direct
 /// library adapters. Daemon-only tuning fields remain in the daemon raw JSON
 /// path until they have stable library ownership.
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
 pub struct ModelLoadParams {
     pub max_seq: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -882,24 +913,100 @@ pub struct ModelLoadParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_cache: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_adaptive: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub flash_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dflash_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub dflash_adaptive_b: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub draft: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cask_sidecar: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cask: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cask_budget: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cask_beta: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cask_core_frac: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cask_fold_m: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mmq_screen: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mmq_screen_threshold: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_compression: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_threshold: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_keep_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_alpha: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_min_keep: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_sink: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_recent: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_block: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_drafter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_drafter_device: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_profile: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_sparse_threshold: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mtp_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mtp_k: Option<u32>,
 }
 
 impl ModelLoadParams {
     pub fn from_hipfire_config(config: &hipfire_config::HipfireConfig) -> Self {
-        Self::from_common_config_values(
+        let mut params = Self::from_common_config_values(
             config.max_seq,
             &config.kv_cache,
             &config.flash_mode,
             &config.dflash_mode,
             config.cask_sidecar.as_deref(),
-        )
+        );
+        params.kv_adaptive = non_off_value(&config.kv_adaptive);
+        params.dflash_adaptive_b = Some(config.dflash_adaptive_b);
+        params.mmq_screen = Some(config.mmq_screen != "off");
+        params.mmq_screen_threshold = Some(config.mmq_screen_threshold);
+        if params.cask_sidecar.is_some() {
+            params.cask = Some(config.cask);
+            params.cask_budget = Some(config.cask_budget);
+            params.cask_beta = Some(config.cask_beta);
+            params.cask_core_frac = Some(config.cask_core_frac);
+            params.cask_fold_m = Some(config.cask_fold_m);
+        }
+        if config.prefill_compression != "off" {
+            if let Some(drafter) = config.prefill_drafter.as_deref().and_then(non_empty_value) {
+                params.prefill_compression = Some(config.prefill_compression.clone());
+                params.prefill_threshold = Some(config.prefill_threshold);
+                params.prefill_keep_ratio = Some(config.prefill_keep_ratio);
+                params.prefill_alpha = Some(config.prefill_alpha);
+                params.prefill_min_keep = Some(config.prefill_min_keep);
+                params.prefill_sink = Some(config.prefill_sink);
+                params.prefill_recent = Some(config.prefill_recent);
+                params.prefill_block = Some(config.prefill_block);
+                params.prefill_drafter = Some(drafter);
+                params.prefill_drafter_device = Some(config.prefill_drafter_device);
+                params.prefill_profile = Some(config.prefill_profile);
+                params.prefill_sparse_threshold = Some(config.prefill_sparse_threshold);
+            }
+        }
+        params.mtp_mode = non_empty_value(&config.mtp_mode);
+        params.mtp_k = Some(config.mtp_k);
+        params
     }
 
     pub fn from_common_config_values(
@@ -924,6 +1031,10 @@ fn non_auto_value(value: &str) -> Option<String> {
     (value != "auto").then(|| value.to_string())
 }
 
+fn non_off_value(value: &str) -> Option<String> {
+    (value != "off").then(|| value.to_string())
+}
+
 fn non_empty_value(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
@@ -933,6 +1044,8 @@ fn non_empty_value(value: &str) -> Option<String> {
 pub struct ModelLoadedResponse {
     pub worker_key_id: String,
     pub arch: Option<String>,
+    #[serde(default)]
+    pub cache_capable: Option<bool>,
     pub dim: Option<u32>,
     pub layers: Option<u32>,
     pub vocab: Option<u32>,
@@ -1374,6 +1487,9 @@ mod tests {
                 dflash_mode: Some("off".to_string()),
                 draft: Some("draft.hfq".to_string()),
                 cask_sidecar: Some("model.triattn.hfq".to_string()),
+                mtp_mode: Some("auto".to_string()),
+                mtp_k: Some(3),
+                ..Default::default()
             },
             request_id: Some("load-1".to_string()),
         };
@@ -1386,6 +1502,8 @@ mod tests {
         assert_eq!(value["params"]["dflash_mode"], "off");
         assert_eq!(value["params"]["draft"], "draft.hfq");
         assert_eq!(value["params"]["cask_sidecar"], "model.triattn.hfq");
+        assert_eq!(value["params"]["mtp_mode"], "auto");
+        assert_eq!(value["params"]["mtp_k"], 3);
         assert!(value["params"].get("flash_mode").is_none());
         assert_eq!(value["request_id"], "load-1");
     }
@@ -1415,9 +1533,23 @@ mod tests {
         let config = hipfire_config::HipfireConfig {
             max_seq: 8192,
             kv_cache: "asym3".to_string(),
+            kv_adaptive: "balanced".to_string(),
             flash_mode: "auto".to_string(),
             dflash_mode: "off".to_string(),
+            dflash_adaptive_b: false,
+            mtp_mode: "auto".to_string(),
+            mtp_k: 3,
             cask_sidecar: Some("/models/qwen3.5-27b.triattn.hfq".to_string()),
+            cask: true,
+            cask_budget: 1024,
+            cask_beta: 256,
+            cask_core_frac: 0.25,
+            cask_fold_m: 4,
+            mmq_screen: "off".to_string(),
+            prefill_compression: "auto".to_string(),
+            prefill_drafter: Some("/models/drafter.hfq".to_string()),
+            prefill_drafter_device: 1,
+            prefill_profile: true,
             ..Default::default()
         };
 
@@ -1425,12 +1557,29 @@ mod tests {
 
         assert_eq!(params.max_seq, 8192);
         assert_eq!(params.kv_cache.as_deref(), Some("asym3"));
+        assert_eq!(params.kv_adaptive.as_deref(), Some("balanced"));
         assert_eq!(params.flash_mode, None);
         assert_eq!(params.dflash_mode.as_deref(), Some("off"));
+        assert_eq!(params.dflash_adaptive_b, Some(false));
+        assert_eq!(params.mtp_mode.as_deref(), Some("auto"));
+        assert_eq!(params.mtp_k, Some(3));
         assert_eq!(
             params.cask_sidecar.as_deref(),
             Some("/models/qwen3.5-27b.triattn.hfq")
         );
+        assert_eq!(params.cask, Some(true));
+        assert_eq!(params.cask_budget, Some(1024));
+        assert_eq!(params.cask_beta, Some(256));
+        assert_eq!(params.cask_core_frac, Some(0.25));
+        assert_eq!(params.cask_fold_m, Some(4));
+        assert_eq!(params.mmq_screen, Some(false));
+        assert_eq!(params.prefill_compression.as_deref(), Some("auto"));
+        assert_eq!(
+            params.prefill_drafter.as_deref(),
+            Some("/models/drafter.hfq")
+        );
+        assert_eq!(params.prefill_drafter_device, Some(1));
+        assert_eq!(params.prefill_profile, Some(true));
     }
 
     #[test]
@@ -1493,16 +1642,22 @@ mod tests {
         assert_eq!(
             dflash_draft_candidates("qwen3.5-27b-mq4.hfq"),
             vec![
+                "qwen35-27b-dflash-mq4.hfq".to_string(),
                 "qwen3.5-27b-mq4.dflash.hfq".to_string(),
-                "qwen3.5-27b-mq4.draft.hfq".to_string()
+                "qwen3.5-27b-mq4.draft.hfq".to_string(),
+                "qwen35-27b-dflash-mq3.hfq".to_string(),
+                "qwen3.5-27b-mq3.dflash.hfq".to_string(),
+                "qwen3.5-27b-mq3.draft.hfq".to_string(),
             ]
         );
+        assert!(dflash_draft_candidates("qwen3.5-35b-a3b-mq4.hfq")
+            .contains(&"qwen35-35b-a3b-dflash-mq4.hfq".to_string()));
         assert!(dflash_draft_candidates("llama-8b-mq4.hfq").is_empty());
 
         let root = temp_dir("hipfire-dflash-draft-discovery");
         fs::create_dir_all(&root).unwrap();
         let target = root.join("qwen3.5-27b-mq4.hfq");
-        let draft = root.join("qwen3.5-27b-mq4.dflash.hfq");
+        let draft = root.join("qwen35-27b-dflash-mq4.hfq");
         fs::write(&target, "target").unwrap();
         fs::write(&draft, "draft").unwrap();
 
@@ -1578,6 +1733,7 @@ mod tests {
         let loaded: ModelLoadedResponse = serde_json::from_value(json!({
             "worker_key_id": "worker:arch5:pp1:mq4",
             "arch": "qwen35",
+            "cache_capable": true,
             "dim": 4096,
             "layers": 32,
             "vocab": 248320,
@@ -1594,6 +1750,7 @@ mod tests {
 
         assert_eq!(loaded.worker_key_id, "worker:arch5:pp1:mq4");
         assert_eq!(loaded.arch.as_deref(), Some("qwen35"));
+        assert_eq!(loaded.cache_capable, Some(true));
         assert_eq!(loaded.dim, Some(4096));
         assert_eq!(loaded.layers, Some(32));
         assert_eq!(loaded.vocab, Some(248320));
