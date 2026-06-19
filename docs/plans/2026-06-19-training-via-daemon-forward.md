@@ -66,6 +66,33 @@ plan's Q1–Q4 entirely *for the drafter use case*.
 - If we ever want to fine-tune qwen3.5 itself (not just a drafter), we still need
   a differentiable qwen3.5 forward — but that's a separate, later goal.
 
+## STATUS (2026-06-19) — teacher VALIDATED on the real qwen3.5-0.8B
+
+**Teacher half done.** Built + validated end-to-end:
+- `qwen35::capture_pflash_block_scores` (+ `full_attention_layers`) — forward the
+  resident qwen3.5 target via the per-token `forward_scratch` path (FP32 KV + FP32
+  DeltaNet state), then run the fp32 `pflash_score_f32` kernel on `k_gpu` at each
+  FullAttention layer. Only FullAttention layers carry K (linear_attn = SSM).
+- Daemon `pflash_labels` JSONL op — forward a corpus (n_chunks × seq), emit
+  per-chunk per-block cosine-K scores at shallow + mid FullAttention layers to
+  JSONL.
+- **Validated on `qwen3.5-0.8b-bf16.hfq`:** loads (24 layers, 6/24 = FullAttention
+  carry KV), shallow=L3 mid=L15, 8 valid cosine scores/block in [0.35,0.77], no
+  NaN, Spearman(shallow,mid)=+0.69/+0.48 — the same imperfect shallow→mid tracking
+  (= drafter headroom) seen on the Llama stand-in, now on the REAL target.
+
+**Student half remaining (well-scoped):**
+1. hipfire-train: a daemon-label loader (read the JSONL → chunks + mid/shallow
+   scores) that fills the same structures `pflash_drafter_train` already trains on
+   (and/or writes them into the v2 label cache via `save_labels`).
+2. The qwen3.5 fp32 **embedding** into hipfire-train (the drafter shares it,
+   read-only). Cleanest: extend `pflash_labels` to also dump `embed_tokens` as an
+   fp32 sidecar binary (daemon already has the weights); trainer mmaps it. Avoids
+   teaching hipfire-train to parse the qwen3.5 `.hfq`.
+3. Point `pflash_drafter_train` at the daemon labels + qwen3.5 embed instead of the
+   Llama-3.2-3B stand-in capture. Train; confirm it beats the shallow bar on the
+   REAL target.
+
 ## Recommendation
 
 Adopt the teacher/student split as the standing architecture: **daemon = frozen
