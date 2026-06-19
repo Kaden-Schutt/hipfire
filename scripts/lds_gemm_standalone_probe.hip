@@ -690,6 +690,44 @@ __global__ void gemm_lds_store_then_load_separate_tile_read6_probe(int M, int N,
     asm volatile("" ::"v"(sum));
 }
 
+template <int TILE>
+__global__ void gemm_lds_store_then_load_separate_readtile_probe(int M, int N,
+                                                                 int K,
+                                                                 int k_limit) {
+    __shared__ float As[TILE][TILE];
+    __shared__ float Xs[TILE][TILE];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int m = blockIdx.y * TILE + ty;
+    const int n = blockIdx.x * TILE + tx;
+    const int K_run = k_limit > 0 && k_limit < K ? k_limit : K;
+
+    Xs[ty][tx] = static_cast<float>((m & 3) + tx);
+    __syncthreads();
+
+    float sum = 0.0f;
+    for (int kt = 0; kt < K_run; kt += TILE) {
+        As[ty][tx] = static_cast<float>((m & 7) + tx + kt);
+        __syncthreads();
+
+        As[ty][tx] = static_cast<float>((m & 7) + tx + kt + 1);
+        __syncthreads();
+
+        const float tmp = As[ty][tx];
+        asm volatile("" ::"v"(tmp));
+
+#pragma unroll
+        for (int kk = 0; kk < TILE; ++kk) {
+            const float b = static_cast<float>((n & 7) - ty + kt);
+            sum += Xs[ty][kk] * b;
+        }
+        __syncthreads();
+    }
+
+    asm volatile("" ::"v"(sum));
+}
+
 static int parse_mode(const char* mode) {
     if (std::strcmp(mode, "full") == 0) return static_cast<int>(Mode::Full);
     if (std::strcmp(mode, "nostore") == 0) return static_cast<int>(Mode::NoStore);
@@ -870,6 +908,11 @@ static int run_variant(const char* variant, const char* mode_name, int launches,
             dim3 block(6, 6, 1);
             dim3 grid((n + 5) / 6, (m + 5) / 6, 1);
             hipLaunchKernelGGL((gemm_lds_store_then_load_separate_tile_read6_probe<6>),
+                               grid, block, 0, 0, m, n, k, k_limit);
+        } else if (std::strcmp(variant, "tile6_lds_store_then_load_separate_readtile") == 0) {
+            dim3 block(6, 6, 1);
+            dim3 grid((n + 5) / 6, (m + 5) / 6, 1);
+            hipLaunchKernelGGL((gemm_lds_store_then_load_separate_readtile_probe<6>),
                                grid, block, 0, 0, m, n, k, k_limit);
         } else if (std::strcmp(variant, "tile16") == 0) {
             dim3 block(16, 16, 1);
