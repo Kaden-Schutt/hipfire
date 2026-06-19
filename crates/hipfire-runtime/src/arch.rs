@@ -415,3 +415,71 @@ pub trait ServingBackend: Send {
     /// Release GPU resources (consumes the boxed backend on unload).
     fn unload(self: Box<Self>, gpu: &mut Gpu);
 }
+
+/// Shared dense-AR serving loop: tokenize the (pre-framed) prompt → prefill →
+/// greedy-decode, streaming JSONL `token` events to `ctx.sink` and a final
+/// `done`, stopping on EOS / `max_tokens` / a `stop_sequences` match. Every
+/// `SimpleAr` backend's `ServingBackend::serve` delegates here, so the loop
+/// lives in ONE place instead of per-arch `generate_*` copies.
+///
+/// Greedy for now (matches the bring-up examples); top-p / repeat-penalty /
+/// loop-guard thread in as the daemon's sampler is migrated behind this driver.
+pub fn run_simple_ar(
+    gpu: &mut Gpu,
+    backend: &mut dyn SimpleAr,
+    tok: &crate::tokenizer::Tokenizer,
+    eos: u32,
+    ctx: &mut GenerateCtx,
+) -> Result<ServeOutcome, String> {
+    let ids = tok.encode(ctx.prompt);
+    if ids.is_empty() {
+        return Err("run_simple_ar: empty prompt after tokenize".to_string());
+    }
+    backend.prefill(gpu, &ids)?;
+    let vocab = backend.vocab_size();
+
+    let mut pos = ids.len();
+    let mut next = gpu
+        .argmax_f32(backend.logits(), vocab)
+        .map_err(|e| format!("argmax: {e:?}"))?;
+    let mut generated = 0usize;
+    let mut text = String::new();
+    let mut stop = StopReason::MaxTokens;
+
+    while generated < ctx.max_tokens {
+        if next == eos {
+            stop = StopReason::Eos;
+            break;
+        }
+        let frag = tok.decode(&[next]);
+        text.push_str(&frag);
+        if ctx
+            .stop_sequences
+            .iter()
+            .any(|s| !s.is_empty() && text.contains(s.as_str()))
+        {
+            stop = StopReason::StopSequence;
+            break;
+        }
+        let ev = serde_json::json!({ "type": "token", "id": ctx.id, "text": frag });
+        let _ = writeln!(ctx.sink, "{ev}");
+        let _ = ctx.sink.flush();
+        generated += 1;
+
+        backend.decode_step(gpu, next, pos)?;
+        pos += 1;
+        next = gpu
+            .argmax_f32(backend.logits(), vocab)
+            .map_err(|e| format!("argmax: {e:?}"))?;
+    }
+
+    let done = serde_json::json!({ "type": "done", "id": ctx.id, "tokens": generated });
+    let _ = writeln!(ctx.sink, "{done}");
+    let _ = ctx.sink.flush();
+
+    Ok(ServeOutcome {
+        prompt_tokens: ids.len(),
+        tokens_generated: generated,
+        stop_reason: stop,
+    })
+}
