@@ -269,11 +269,66 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 | Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 416x86 grid, chunks `80,80` | PASS | Same total 160 as failing one-child runs; passed in both plain and HIP-initialized parent modes. |
 | Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 384x86 grid, one child `125`/`128`/`130`/`132`/`134` | PASS | Lower grid pass side; 134 remained the highest preserved one-child pass before repeat failure at 135. |
 | Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 384x86 grid, one child `135` | FAIL | Failed twice: first at sync/global launch 132, repeat at 133. Same coredump signature. |
+| Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 384x86 grid, one child `134`/`135` (fresh) | PASS at `134`, FAIL at `135` | Fresh same-work rerun reproduced the same edge family and supports the same process-state behavior as 352/320 family. |
+| Direct-AB multi-exec `5x5`, reads=3, 448 iterations, 384x86 grid, one child `150` | PASS | Active-lane reduction to 25/24-thread blocks survives same total at the 384x86 edge. |
+| Direct-AB multi-exec `4x4`, reads=3, 448 iterations, 384x86 grid, one child `200` | PASS | 16-thread variant survives in same geometry/iterness where 6x6 fails. |
 | Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 384x86 grid, chunks `134,46` | FAIL | Failed inside the first 134-launch child in both plain and HIP-initialized parent modes, showing the earlier 134 pass became state-sensitive after reset pressure. |
 | Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 384x86 grid, chunks `90,90` | PASS | Same total 180 as failing near-edge split; passed in both plain and HIP-initialized parent modes. |
+| Direct-AB multi-exec `5x5`, reads=3, 448 iterations, 384x86 grid, one child `260`/`280`/`300`/`320` | PASS / FAIL / FAIL / PASS | Fresh 260 passed; 280/300 failed at sync 264; 320 passed, reinforcing state-sensitive non-monotonicity even with 25 lanes. |
+| Direct-AB multi-exec `4x4`, reads=3, 448 iterations, 384x86 grid, one child `270`/`278`/`279` | PASS / PASS / FAIL | 4x4 passes through 278 and fails at 279 in fresh one-child runs. |
+| Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 352x86 grid, one child `148`/`149`/`150`/`151`/`152` | PASS at `150` in the initial run; plain-mode fresh rerun had `148`/`149` fail, `150` pass, `151`/`152` fail; `hipinit_reset_before` mode had all fail | State-sensitive narrow pass window with strong process-state sensitivity. |
+| Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 352x86 grid, chunks `105,45` | PASS | Split child work passed in both plain and HIP-initialized parent modes. |
+| Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 320x86 grid, one child `156`/`160`/`162` | PASS | Lower grid moves the one-child pass side higher. |
+| Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 320x86 grid, one child `163`/`164`/`165`/`166` | PASS at `163`/`164` in the initial run; fresh process rerun shows fresh non-monotonicity (`162` fail in one plain-run, while `163`/`164` passed) and `>=162` fail in `hipinit_reset_before` | Band no longer deterministic, reinforcing process-state coupling. |
+| Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 320x86 grid, chunks `98,67` / `80,85` | PASS | Split child work passed in both plain and HIP-initialized parent modes. |
 | Direct-AB no-output `8x4` active/block, reads=6, 512 iterations, 512x86 grid | PASS | Exact one-wave, two-array control. |
 | Direct-AB no-output `8x4` active inside `8x5` block, reads=6, 512 iterations, 512x86 grid | PASS | Two-wave block with 32 active lanes; still stable. |
 | Direct-AB no-output `5x5`/`4x4` active inside `6x6` block, reads=6, 512 iterations, 512x86 grid | PASS | Small active controls remain stable without cooperative producer loops. |
+
+### Dispatch Geometry Control
+
+- `c3765ea9` and `b41368bb` are correct with a `TILE=16` kernel launch of
+  `ceil(N/16) × ceil(M/16)`; this is what those commits contain.
+- For comparison, I built a throwaway control where that LDS kernel was forced to
+  `ceil(N/64) × ceil(M/64)`. It still ran and did not hit a fault in 100 launches,
+  but this mode covers only 1/4 of the intended output columns (`3072` would be
+  covered as `768`), so the work profile changed.
+- Returning to the commit-correct `ceil(N/16)` launch in the same throwaway setup
+  reproduced the fault (unrecoverable by retry around launch ~29) with the same
+  MES reset / `gfxhub` + GDS protection-fault behavior.
+- The throwaway `gemm_f32_train_recover` harness is also state-sensitive on the
+  same LDS-backed shape: `HIPFIRE_LAUNCHES=120` failed unrecoverably at launch
+  28 after 8 retries, while `HIPFIRE_LAUNCHES=27` failed at launch 13 without
+  profiling and at launch 8 under `rocprofv3`. The driver signature remained the
+  same `MES failed to respond to msg=REMOVE_QUEUE` / reset / coredump path.
+- A standalone LDS-only `lds_minimal_probe` at `TILE=6`, `ITERS=320`,
+  `512x86`, and 100 launches completed successfully, so the bare LDS loop by
+  itself is not enough.
+- The standalone GEMM-shaped `lds_gemm_standalone_probe` at
+  `tile6 full 100 512 3072 3072` failed at sync 19 with HIP 719 and the same
+  MES `REMOVE_QUEUE` reset path, showing the kernel shape alone is sufficient
+  outside hipfire.
+- A laddered standalone narrowing run now shows `tile5 full` passes at
+  `512x3072x3072` while every `tile6` variant in the ladder fails at the same
+  `100`-launch configuration, including `tile6_synth`, `tile6_synth_masked`,
+  `nostore`, `noglobal`, `aonly`, `bonly`, and the full GEMM-shaped variant.
+  The minimum distinguishing factor is therefore still the `tile6` GEMM shape,
+  not the hipfire runtime.
+- A subsequent `K_LIMIT` bisect on the standalone GEMM probe found a nominal
+  `1651` pass / `1652` fail bracket, but immediate reruns of both values also
+  failed, so the exact loop-depth edge is still state-sensitive. Treat that
+  cutoff as provisional rather than fixed.
+- Direct single-axis bisection at 56 launches now gives provisional brackets of
+  `M=507` pass / `508` fail, `N=3041` pass / `3042` fail, and `K=3020` pass /
+  `3021` fail for the standalone `tile6_synth` probe. The original
+  `512x3072x3072` control still fails at sync 55, but a combined reduced
+  control can pass, so these cutoffs describe the current edge family rather
+  than an independent axis model.
+- In the current standalone GEMM probe state, launch counts `50` and `55`
+  pass, while `56` and `60` fail, so the reusable-process edge is now tightly
+  bracketed between `55` and `56` launches for the `tile6_synth` shape.
+- Conclusion: launch-grid mismatch can mask the bug by reducing workload, but
+  the correct launch geometry still faults.
 
 Latest artifact paths:
 
@@ -519,6 +574,34 @@ Latest artifact paths:
   state-sensitive shape: `134,46` failed inside the first 134-launch child in
   both plain-parent and HIP-initialized-parent modes (`devcd54` / `devcd55`),
   while `90,90` passed in both modes.
+- At reads=3/448/352x86, one child with `150` requested launches passed, while
+  `151` and `152` failed. A nearby check also observed `148`/`149` failures
+  after prior state exposure. Split control `105,45` passed in both parent
+  modes.
+- At reads=3/448/320x86, one child passed at `156`, `160`, and `162`, while
+  `163` through `166` failed. Split controls `80,85` and `98,67` passed at the
+  same totals in both plain-parent and HIP-initialized-parent modes.
+- All `352x86` and `320x86` follow-up runs are stored under:
+  `/tmp/hipfire-lds-direct-ab-lower-grid-352-320-artifacts/`.
+- At reads=3/448/352x86 fresh rerun, plain mode gave `148`/`149` fail, `150`
+  pass, `151`/`152` fail; `MODE=hipinit_reset_before` failed `148`–`152` all
+  together. At reads=3/448/320x86 fresh rerun, plain mode gave
+  `160`/`161` pass, `162` fail, `163`/`164` pass, while
+  `MODE=hipinit_reset_before` shifted to `160`/`161` pass and `162`+ fail.
+  All failures still captured the same signature (`[gfxhub] Page fault
+  observed`, faulty page `0x000074669d000000`, `Protection fault status
+  register: 0x841051`). Fresh runs are under:
+  `/tmp/hipfire-lds-direct-ab-lower-grid-fresh/`.
+- In the next fresh pass/fail extension (`/next`), plain mode at `384x86` gave
+  `134` pass / `135` fail while `hipinit_reset_before` gave `134` fail /
+  `135` pass; at `416x86` both modes failed for `124` and `125`.
+- A fresh 384x86 follow-up (`/tmp/hipfire-lds-active-lane-fresh/`) kept this
+  active-thread threshold behavior: `6x6` failed at one-child `135`, while `5x5`
+  and `4x4` variants were green at `150` and `200`, respectively. Additional
+  active-lane sweeps (`/tmp/hipfire-lds-active-lane-fresh/act4_plain_scan_*` and
+  `/tmp/hipfire-lds-active-lane-fresh/act5_plain_scan_*`) show fresh one-child
+  non-monotonic behavior (`4x4` fails at `279`, `5x5` fails at `280` and
+  `300` but passes at `320`).
 
 ## Current Narrowing
 
@@ -767,6 +850,23 @@ Reduction results after extending the standalone HIP GEMM probe:
   state-sensitive, but not the broad fact that slightly shorter same-process
   runs pass and slightly longer same-process runs fail with the same generated
   code.
+- Fresh reruns at 352x86 and 320x86 one-child confirm this state sensitivity in
+  the same kernel family. Plain mode is non-monotonic in 320x86 (160/161 pass,
+  162 fail, 163/164 pass), while `hipinit_reset_before` gives `160`/`161` pass
+  and `>=162` fail. At 352x86, plain-mode fresh reruns show `148`/`149` fail,
+  `150` pass, and `151`/`152` fail; `hipinit_reset_before` failed all `148`–`152`.
+  Signature remains unchanged (`[gfxhub] Page fault observed`, faulting page
+  `0x000074669d000000`, status `0x841051`), so this is still the same fault
+  family with moving timing thresholds.
+- Extending to fresh 384/416 one-child points reinforced this: plain mode gave
+  `384x86` `134` pass / `135` fail, while `hipinit_reset_before` inverted to
+  `134` fail / `135` pass, and both modes failed fresh `416x86` at `124` and
+  `125`.
+- Active-lane sweeps at the same `384x86` geometry show the trigger shifts with
+  active thread count but stays state-sensitive: `5x5` fails around `280`–`300`
+  while `4x4` pushes to `279` (`320`/`260` pass), and `6x6` fails at `135`.
+  That pattern supports “work-per-thread + queue lifetime” coupling rather than
+  a fixed launch-count constant.
 - Phase-mode controls sharpen the process-boundary result. With the same
   direct-AB kernel body at reads=6/192/511x86, same-process `99 + 1` fails on
   phase2 launch 0 / global launch 99, and same-process `98 + 2` fails on
@@ -1078,6 +1178,17 @@ regGDS_PROTECTION_FAULT                             0x3f000007
 regGDS_VM_PROTECTION_FAULT                          0x0fc00113
 ```
 
+The 352x86 and 320x86 runs used the same failure signature in `devcd58`
+through `devcd65`:
+
+```text
+[gfxhub] Page fault observed
+Faulty page starting at address: 0x000074669d000000
+Protection fault status register: 0x841051
+regGDS_PROTECTION_FAULT                             0x3f000007
+regGDS_VM_PROTECTION_FAULT                          0x0fc00113
+```
+
 Code object/resource observations from `llvm-readobj` dumps:
 
 | Variant | Workgroup | LDS group segment | VGPR | SGPR | Spills | Wavefront |
@@ -1132,6 +1243,8 @@ LDS-only control:
 | direct-AB multi-exec `6x6` block, reads=3, 448 iters, 448x86 | MIXED at one-child 120 after reset pressure; FAIL at one-child 121+; PASS for 80,80 child splits | `_Z25lds_direct_ab_phase_probev` | 288 B | 34 | 2 | 0 | 32 |
 | direct-AB multi-exec `6x6` block, reads=3, 448 iters, 416x86 | PASS through one-child 124 before reset pressure; FAIL at one-child 125+; PASS for 80,80 child splits | `_Z25lds_direct_ab_phase_probev` | 288 B | 34 | 2 | 0 | 32 |
 | direct-AB multi-exec `6x6` block, reads=3, 448 iters, 384x86 | PASS through one-child 134; FAIL at one-child 135; PASS for 90,90 child splits | `_Z25lds_direct_ab_phase_probev` | 288 B | 34 | 2 | 0 | 32 |
+| direct-AB multi-exec `6x6` block, reads=3, 448 iters, 352x86 | PASS at one-child 150; FAIL at one-child 151+; PASS for 105,45 child splits | `_Z25lds_direct_ab_phase_probev` | 288 B | 34 | 2 | 0 | 32 |
+| direct-AB multi-exec `6x6` block, reads=3, 448 iters, 320x86 | PASS through one-child 162; FAIL at one-child 163+; PASS for 98,67 and 80,85 child splits | `_Z25lds_direct_ab_phase_probev` | 288 B | 34 | 2 | 0 | 32 |
 | direct-AB no-output `8x4` active in `8x5` block, reads=6 | PASS at 512 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 256 B | 22 | 5 | 0 | 32 |
 
 ISA observations:
@@ -1314,10 +1427,10 @@ control):
   `99` fail with the same split-child passes. At 480x86 the edge moves to
   `104` pass / `105` fail, while total `120` split as `104,16` still passes.
   At 448x86, `80,80` split children pass while one-child `160` fails, but
-  child-local `120` is mixed after reset pressure. Next, either step grid_x
-  lower again (for example 352x86 or 320x86), or repeat the 384x86/416x86
-  near-edge region after a fresh GPU state to quantify reset-pressure drift
-  before fitting `grid_x * grid_y * child_launches`. Treat the common
+  child-local `120` is mixed after reset pressure. Next, repeat the 384x86/416x86
+  near-edge region after fresh one-child runs (plain/`hipinit_reset_before`) to
+  quantify reset-pressure drift before fitting `grid_x * grid_y * child_launches`.
+  Treat the common
   in-process HIP reset APIs as already tested; only revisit teardown if a
   genuinely different ROCm mechanism is identified.
 - create a single-instantiation compile unit for the failing synthetic symbol
@@ -1325,6 +1438,37 @@ control):
   instead of object-aggregate.
 - create single-instantiation LDS-only masked/no-mask compile units so resource
   and instruction counts are not polluted by unused template variants.
+
+### Additional Sequence Sweep (Fresh)
+
+- Fresh standalone launcher added at `/tmp/hipfire-lds-prewarm-probe.hip` splits
+  a run into a warmup phase and a target phase inside one HIP process. The target
+  kernel is the same all-active `6x6` direct-AB probe (`READS=6`,
+  `ITERS=192`, `grid=511x86`, `ARCH=gfx1103`, `BLOCK=6x6`).
+- Artifact directory: `/tmp/hipfire-lds-prewarm-artifacts/`.
+- Results:
+  - `w0_t100_g511x86` (`0` warmup, `100` target): **fail** at target
+    `sync 98`.
+  - `w0_t80_g511x86` (`0` warmup, `80` target): **pass**.
+  - `w20_t60_g511x86` (`20` warmup, `60` target): **pass**.
+  - `w40_t60_g511x86` (`40` warmup, `60` target): **pass**.
+  - `w20_t80_g511x86` (`20` warmup, `80` target): **pass**.
+  - `w80_t100_g511x86` (`80` warmup, `100` target): **fail** at target
+    `sync 98`.
+  - `w160_t100_g511x86` (`160` warmup, `100` target): **fail** at target
+    `sync 98`.
+  - Fresh single-process edge sweep at `g=511` (`0` warmup):
+    `t=90`, `91`, `92`, `93`, `94`, `95`, `96`, `97`, `98` **pass**;  
+    `t=99`, `100`, `101`, `102` **fail** (HIP `719`, `target sync 98/99`).
+- All 100-target failures captured the same coredump signature in
+  `devcoredump.data`:
+  `0x074669d000000`, protection status `0x841051`,
+  `regGDS_PROTECTION_FAULT 0x3f000007`,
+  `regGDS_VM_PROTECTION_FAULT 0x0fc00113`.
+- Interpretation: with this protocol, large warmup launch mass does not shift
+  the edge; the immediate trigger remains attached to the target-kernel launch
+  sequence/work, supporting a target-specific accumulation model rather than
+  pure process-launch volume.
 
 Compare pass/fail boundary for:
 
