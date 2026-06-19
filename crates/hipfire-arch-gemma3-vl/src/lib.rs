@@ -15,12 +15,14 @@
 
 pub mod config;
 pub mod forward;
+pub mod image;
 pub mod loader;
 pub mod projector;
 pub mod vision;
 
 pub use config::{vl_config_from_hfq, Gemma3VlConfig, SigLipConfig};
 pub use forward::vision_forward;
+pub use image::preprocess_image;
 pub use loader::{load_vl, Gemma3VlWeights, LoadedVl};
 pub use projector::{project, ProjectorWeights};
 pub use vision::{SigLipLayerWeights, SigLipWeights};

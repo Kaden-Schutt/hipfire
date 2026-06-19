@@ -1165,6 +1165,7 @@ dependencies = [
  "hipfire-arch-gemma3",
  "hipfire-dispatch",
  "hipfire-runtime",
+ "image",
  "rdna-compute",
  "serde_json",
 ]

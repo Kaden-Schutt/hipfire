@@ -17,3 +17,5 @@ hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 hipfire-arch-gemma3 = { path = "../hipfire-arch-gemma3" }
 serde_json = "1"
+# Image decode (PNG/JPEG) + resize for the SigLIP preprocessing pipeline.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
