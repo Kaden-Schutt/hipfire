@@ -87,9 +87,9 @@ use hipfire_state::{
     sequence_state_reservation_plan_for_reserved_bytes, session_state_reservation_describe_json,
     unload_worker_done_json, validate_checkpoint_logical_position, validate_checkpoint_prefix_hash,
     validate_checkpoint_source_resident, DescribedSequenceState, GenericSequenceStateArena,
-    ModelArtifactMemory, ModelWorkerMemoryView, ModelWorkerRuntimeView, ParsedSequenceStateHandle,
-    SequenceStateArenaBackend, SequenceStateCheckpointRequest, SequenceStateForkRequest,
-    SequenceStatePageDescriptor, SequenceStatePageKind, SequenceStatePrefixHash,
+    ModelWorkerRuntimeView, ParsedSequenceStateHandle, SequenceStateArenaBackend,
+    SequenceStateCheckpointRequest, SequenceStateForkRequest, SequenceStatePageDescriptor,
+    SequenceStatePageKind, SequenceStatePrefixHash,
 };
 #[cfg(test)]
 use hipfire_state::{
@@ -115,6 +115,8 @@ use output_filter::{
 };
 mod model;
 use model::{effective_raw, DdtreeState, DflashState, Eviction, LoadedModel, RAW_OVERRIDE};
+mod memory;
+use memory::{hfq_model_memory, loaded_model_memory_view, unknown_model_memory};
 
 /// CASK/TriAttention params forwarded by the CLI at load time. Zero-initialized
 /// CaskConfig{sidecar: None, ..} means no eviction — matches 0.1.7-alpha behavior.
@@ -816,6 +818,7 @@ fn emit_generate_batch_prefill_unsupported(
 #[cfg(test)]
 mod generate_batch_prefill_tests {
     use super::*;
+    use hipfire_state::ModelWorkerMemoryView;
     fn test_dense_qwen35_config() -> qwen35::Qwen35Config {
         qwen35::Qwen35Config {
             dim: 16,
@@ -3165,217 +3168,6 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
         }
     }
     descriptors
-}
-
-fn hfq_model_memory(path: &str, hfq: &hipfire_runtime::hfq::HfqFile) -> ModelArtifactMemory {
-    ModelArtifactMemory {
-        model_file_bytes: std::fs::metadata(path)
-            .map(|metadata| metadata.len() as usize)
-            .unwrap_or(0),
-        model_weight_bytes: hfq
-            .tensors()
-            .iter()
-            .map(|tensor| tensor.data_size)
-            .sum::<usize>(),
-    }
-}
-
-fn unknown_model_memory(path: &str) -> ModelArtifactMemory {
-    ModelArtifactMemory {
-        model_file_bytes: std::fs::metadata(path)
-            .map(|metadata| metadata.len() as usize)
-            .unwrap_or(0),
-        model_weight_bytes: 0,
-    }
-}
-
-fn tensor_bytes(tensor: &rdna_compute::GpuTensor) -> usize {
-    tensor.buf.size()
-}
-
-fn opt_tensor_bytes(tensor: Option<&rdna_compute::GpuTensor>) -> usize {
-    tensor.map(tensor_bytes).unwrap_or(0)
-}
-
-fn tensor_vec_bytes(tensors: &[rdna_compute::GpuTensor]) -> usize {
-    tensors.iter().map(tensor_bytes).sum::<usize>()
-}
-
-fn kv_cache_bytes(kv: &llama::KvCache) -> usize {
-    tensor_vec_bytes(&kv.k_gpu)
-        + tensor_vec_bytes(&kv.v_gpu)
-        + tensor_vec_bytes(&kv.k_scales)
-        + tensor_vec_bytes(&kv.v_scales)
-        + opt_tensor_bytes(kv.givens_cos.as_ref())
-        + opt_tensor_bytes(kv.givens_sin.as_ref())
-}
-
-fn deltanet_state_bytes(dn: &DeltaNetState) -> usize {
-    tensor_vec_bytes(&dn.s_matrices)
-        + tensor_vec_bytes(&dn.s_scales)
-        + tensor_vec_bytes(&dn.conv_states)
-}
-
-fn qwen35_scratch_bytes(scratch: &qwen35::Qwen35Scratch) -> usize {
-    let mut total = scratch.pos_buf.size();
-    total += tensor_bytes(&scratch.x)
-        + tensor_bytes(&scratch.tmp)
-        + tensor_bytes(&scratch.dn_qkv)
-        + tensor_bytes(&scratch.dn_z)
-        + tensor_bytes(&scratch.dn_alpha)
-        + tensor_bytes(&scratch.dn_beta)
-        + tensor_bytes(&scratch.dn_conv_out)
-        + tensor_bytes(&scratch.dn_q)
-        + tensor_bytes(&scratch.dn_k)
-        + tensor_bytes(&scratch.dn_v)
-        + tensor_bytes(&scratch.dn_q_raw)
-        + tensor_bytes(&scratch.dn_k_raw)
-        + tensor_bytes(&scratch.dn_attn_out)
-        + tensor_bytes(&scratch.dn_normed)
-        + tensor_bytes(&scratch.fa_q_full)
-        + tensor_bytes(&scratch.fa_q)
-        + tensor_bytes(&scratch.fa_gate)
-        + tensor_bytes(&scratch.fa_k)
-        + tensor_bytes(&scratch.fa_v)
-        + tensor_bytes(&scratch.fa_attn_out)
-        + tensor_bytes(&scratch.o)
-        + tensor_bytes(&scratch.gate_ffn)
-        + tensor_bytes(&scratch.up)
-        + tensor_bytes(&scratch.ffn_hidden)
-        + tensor_bytes(&scratch.ffn_out)
-        + tensor_bytes(&scratch.logits)
-        + tensor_bytes(&scratch.sample_buf)
-        + tensor_bytes(&scratch.repeat_buf)
-        + tensor_bytes(&scratch.x_rot)
-        + tensor_bytes(&scratch.flash_partials);
-    total += opt_tensor_bytes(scratch.moe_router_logits.as_ref())
-        + opt_tensor_bytes(scratch.moe_scalar_buf.as_ref())
-        + opt_tensor_bytes(scratch.moe_x_rot.as_ref())
-        + opt_tensor_bytes(scratch.moe_gate_up_buf.as_ref())
-        + opt_tensor_bytes(scratch.moe_gate_buf.as_ref())
-        + opt_tensor_bytes(scratch.moe_up_buf.as_ref())
-        + opt_tensor_bytes(scratch.moe_ffn_hidden.as_ref())
-        + opt_tensor_bytes(scratch.moe_ffn_out.as_ref())
-        + opt_tensor_bytes(scratch.moe_gate_batch.as_ref())
-        + opt_tensor_bytes(scratch.moe_up_batch.as_ref())
-        + opt_tensor_bytes(scratch.moe_rot_batch.as_ref())
-        + opt_tensor_bytes(scratch.moe_topk_indices.as_ref())
-        + opt_tensor_bytes(scratch.moe_topk_weights.as_ref())
-        + opt_tensor_bytes(scratch.moe_down_expanded.as_ref());
-    // PrefillBatchScratch is an optional optimization scratch with private
-    // fields. Report it as unknown in V1 instead of inventing an estimate.
-    total
-}
-
-fn qwen2_state_bytes(state: &qwen2::Qwen2State) -> usize {
-    state.pos_buf.size()
-        + tensor_bytes(&state.x)
-        + tensor_bytes(&state.tmp)
-        + tensor_bytes(&state.q)
-        + tensor_bytes(&state.k)
-        + tensor_bytes(&state.v)
-        + tensor_bytes(&state.attn_out)
-        + tensor_bytes(&state.o)
-        + tensor_bytes(&state.gate)
-        + tensor_bytes(&state.up)
-        + tensor_bytes(&state.ffn_hidden)
-        + tensor_bytes(&state.ffn_out)
-        + tensor_bytes(&state.logits)
-        + tensor_bytes(&state.attn_partials)
-        + tensor_vec_bytes(&state.k_cache)
-        + tensor_vec_bytes(&state.v_cache)
-}
-
-fn llama_scratch_bytes(scratch: &llama::ForwardScratch) -> usize {
-    scratch.pos_buf.size()
-        + tensor_bytes(&scratch.x)
-        + tensor_bytes(&scratch.tmp)
-        + tensor_bytes(&scratch.q)
-        + tensor_bytes(&scratch.k)
-        + tensor_bytes(&scratch.v)
-        + tensor_bytes(&scratch.attn_out)
-        + tensor_bytes(&scratch.o)
-        + tensor_bytes(&scratch.gate)
-        + tensor_bytes(&scratch.up)
-        + tensor_bytes(&scratch.ffn_hidden)
-        + tensor_bytes(&scratch.ffn_out)
-        + tensor_bytes(&scratch.logits)
-        + tensor_bytes(&scratch.sample_buf)
-        + tensor_bytes(&scratch.repeat_buf)
-        + tensor_bytes(&scratch.attn_partials)
-        + tensor_bytes(&scratch.x_rot)
-}
-
-fn minimax_state_bytes(state: &hipfire_arch_minimax::MiniMaxState) -> usize {
-    state.pos_buf.size()
-        + kv_cache_bytes(&state.kv)
-        + tensor_bytes(&state.tmp)
-        + tensor_bytes(&state.x_rot)
-        + tensor_bytes(&state.fa_q)
-        + tensor_bytes(&state.fa_k)
-        + tensor_bytes(&state.fa_v)
-        + tensor_bytes(&state.fa_attn_out)
-        + tensor_bytes(&state.flash_partials)
-        + tensor_bytes(&state.h)
-        + tensor_bytes(&state.ffn_tmp)
-        + tensor_bytes(&state.ffn_x_rot)
-        + tensor_bytes(&state.router_logits)
-        + tensor_bytes(&state.topk_indices)
-        + tensor_bytes(&state.topk_weights)
-        + tensor_bytes(&state.gate_batch)
-        + tensor_bytes(&state.up_batch)
-        + tensor_bytes(&state.rot_batch)
-        + tensor_bytes(&state.down_expanded)
-        + tensor_bytes(&state.final_norm_buf)
-        + tensor_bytes(&state.final_rot)
-        + tensor_bytes(&state.logits)
-}
-
-fn loaded_model_runtime_base_bytes(m: &LoadedModel) -> usize {
-    let mut total = 0usize;
-    total += m.kv_cache.as_ref().map(kv_cache_bytes).unwrap_or(0);
-    total += m.dn_state.as_ref().map(deltanet_state_bytes).unwrap_or(0);
-    total += m
-        .q35_scratch
-        .as_ref()
-        .map(qwen35_scratch_bytes)
-        .unwrap_or(0);
-    total += m
-        .pp_scratch_set
-        .as_ref()
-        .map(|set| {
-            set.per_device
-                .iter()
-                .map(qwen35_scratch_bytes)
-                .sum::<usize>()
-        })
-        .unwrap_or(0);
-    total += m.qwen2_state.as_ref().map(qwen2_state_bytes).unwrap_or(0);
-    total += m.llama_kv.as_ref().map(kv_cache_bytes).unwrap_or(0);
-    total += m
-        .llama_scratch
-        .as_ref()
-        .map(llama_scratch_bytes)
-        .unwrap_or(0);
-    total += m
-        .minimax_state
-        .as_ref()
-        .map(minimax_state_bytes)
-        .unwrap_or(0);
-    total
-}
-
-fn loaded_model_memory_view(
-    m: &LoadedModel,
-    state_page_descriptors: &[SequenceStatePageDescriptor],
-) -> ModelWorkerMemoryView {
-    let runtime_base_bytes = loaded_model_runtime_base_bytes(m);
-    let runtime_session_bytes = state_page_descriptors
-        .iter()
-        .map(|descriptor| descriptor.resident_bytes)
-        .sum::<usize>();
-    m.memory
-        .worker_memory_view(runtime_base_bytes, runtime_session_bytes)
 }
 
 fn loaded_model_worker_id(m: &LoadedModel) -> ModelWorkerId {
