@@ -408,8 +408,15 @@ pub trait ServingBackend: Send {
     fn caps(&self) -> ArchCaps;
     /// The model's EOS / end-of-turn token id.
     fn eos_token(&self) -> u32;
-    /// Run one full generation, streaming visible tokens to `ctx.sink`.
-    fn serve(&mut self, gpu: &mut Gpu, ctx: &mut GenerateCtx) -> Result<ServeOutcome, String>;
+    /// Run one full generation, streaming visible tokens to `ctx.sink`. `tok`
+    /// is the daemon-owned tokenizer (kept out of the backend to avoid a
+    /// self-borrow conflict when delegating to [`run_simple_ar`]).
+    fn serve(
+        &mut self,
+        gpu: &mut Gpu,
+        tok: &crate::tokenizer::Tokenizer,
+        ctx: &mut GenerateCtx,
+    ) -> Result<ServeOutcome, String>;
     /// Reset multi-turn session state (e.g. the KV-cache cursor) for a session.
     fn reset_session(&mut self, gpu: &mut Gpu, session_id: &str) -> Result<(), String>;
     /// Release GPU resources (consumes the boxed backend on unload).
