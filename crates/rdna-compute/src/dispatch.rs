@@ -40577,8 +40577,8 @@ impl Gpu {
         unsafe {
             self.hip.launch_kernel(
                 func,
-                [((n + 15) / 16) as u32, ((m + 15) / 16) as u32, 1],
-                [16, 16, 1],
+                [m as u32, n as u32, 1],
+                [32, 1, 1],
                 0,
                 self.stream_ref(),
                 &mut params,
@@ -40637,8 +40637,8 @@ impl Gpu {
         unsafe {
             self.hip.launch_kernel(
                 func,
-                [((n + 15) / 16) as u32, ((m + 15) / 16) as u32, 1],
-                [16, 16, 1],
+                [m as u32, n as u32, 1],
+                [32, 1, 1],
                 0,
                 self.stream_ref(),
                 &mut params,

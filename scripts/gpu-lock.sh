@@ -44,9 +44,27 @@ gpu_acquire() {
         return 3
     }
 
+    # Verbose contention warning: if the lock is already held by ANOTHER holder,
+    # announce it loudly (with the current holder + how to clear a stale lock)
+    # BEFORE we block waiting — silent blocking made contention/stale-lock stalls
+    # hard to diagnose.
+    local lockfile="${HIPFIRE_GPU_LOCK_FILE:-/tmp/hipfire-gpu.lock}"
+    local waited_from=""
+    if [ -s "$lockfile" ]; then
+        local holder; holder="$(cat "$lockfile" 2>/dev/null)"
+        echo "[gpu-lock] ⚠️  GPU BUSY — '${agent_name}' is WAITING for the lock." >&2
+        echo "[gpu-lock] ⚠️  held by: ${holder}" >&2
+        echo "[gpu-lock] ⚠️  poll=${GPU_POLL_INTERVAL:-5}s timeout=${GPU_LOCK_TIMEOUT:-default}s." >&2
+        echo "[gpu-lock] ⚠️  if this is STALE (holder dead), clear it: rm -f ${lockfile}" >&2
+        waited_from="$SECONDS"
+    fi
+
     # The holder watches THIS shell ($$); it auto-releases when this shell exits.
     # GPU_POLL_INTERVAL / GPU_LOCK_TIMEOUT are honored by the binary's defaults.
     "$bin" gpu-lock acquire "$agent_name" --watch-pid "$$" || return $?
+    if [ -n "$waited_from" ]; then
+        echo "[gpu-lock] ✓ '${agent_name}' acquired after $((SECONDS - waited_from))s wait" >&2
+    fi
     export HIPFIRE_GPU_LOCK_OWNER="$$"
     return 0
 }
