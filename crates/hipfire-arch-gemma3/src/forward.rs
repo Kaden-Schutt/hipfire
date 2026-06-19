@@ -184,6 +184,40 @@ pub fn forward_step(
     Ok(())
 }
 
+/// Decode one position from a **prebuilt embedding** instead of an embedded
+/// token — the image-token splice primitive for gemma3-vl. The multimodal
+/// projector output already lives in the text embedding space and is inserted
+/// into the (already-scaled) text stream **unscaled**, so this path does NOT
+/// apply the `√hidden` embed scale. `embedding` is one row of `hidden_size`
+/// F32s. Mirrors `hipfire-arch-qwen2::forward_step_with_embed`.
+pub fn forward_step_with_embed(
+    gpu: &mut Gpu,
+    weights: &Gemma3Weights,
+    cfg: &Gemma3Config,
+    state: &mut Gemma3State,
+    embedding: &[f32],
+) -> HipResult<()> {
+    let dim = cfg.hidden_size;
+    if embedding.len() != dim {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "gemma3: forward_step_with_embed expects {dim} F32s, got {}",
+                embedding.len()
+            ),
+        ));
+    }
+    let pos = prelude(gpu, state)?;
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(embedding.as_ptr() as *const u8, embedding.len() * 4) };
+    gpu.hip.memcpy_htod(&state.x.buf, bytes)?;
+    // NB: no embed_scale here — the image embedding is inserted at its own
+    // magnitude (only token embeddings get the √hidden normalizer).
+    forward_after_x(gpu, weights, cfg, state, pos)?;
+    state.next_pos += 1;
+    Ok(())
+}
+
 fn forward_after_x(
     gpu: &mut Gpu,
     weights: &Gemma3Weights,
