@@ -15,8 +15,10 @@
 
 pub mod config;
 pub mod forward;
+pub mod projector;
 pub mod vision;
 
 pub use config::{vl_config_from_hfq, Gemma3VlConfig, SigLipConfig};
 pub use forward::vision_forward;
+pub use projector::{project, ProjectorWeights};
 pub use vision::{SigLipLayerWeights, SigLipWeights};
