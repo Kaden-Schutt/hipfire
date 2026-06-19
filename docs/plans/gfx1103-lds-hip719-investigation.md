@@ -542,10 +542,11 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   - The pinned post-row extra-load control is now tracked as
     `tile6_lds_store_then_rowload_then_extra_load4_consume4_pinned`. It keeps
     the two per-K stores and four waited/interleaved dynamic row loads, but
-    moves the extra ordinary LDS load after the four row loads. A one-launch
-    local smoke passed; the 100-launch stress result is pending cross-system
-    confirmation. This case directly tests whether the per-K/proximate extra
-    LDS load must occur before the row-consumption phase.
+    moves the extra ordinary LDS load after the four row loads. The 100-launch
+    stress run failed at sync 88 with HIP 719 and the same MES `REMOVE_QUEUE`
+    reset family; a follow-up one-launch `load4_noextra_consume4_pinned`
+    recovery smoke passed. This shows the per-K/proximate extra LDS load does
+    not need to occur before the row-consumption phase.
   - The cross-row load split `tile6_lds_store_then_load_nextrow_read6` also
     failed under the 100-launch stress envelope, at sync 88. Clean follow-up
     runs passed at `N_LAUNCH=1` and `N_LAUNCH=2`, so treat the earlier
@@ -600,15 +601,17 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   launches with the same resource tuple, and removing the second per-K LDS
   store while keeping the extra load and four dynamic row loads also passes
   with the same tuple. Moving the extra load before the second store, to the
-  next row, or to a separate one-time-initialized LDS tile still fails, but a
-  one-time preloop extra LDS load passes. The leading local suspect is now the
-  conjunction of a per-K/proximate extra ordinary LDS load, a second per-K LDS
-  store before the four-row consumption phase, four dynamic row LDS loads
-  separated by explicit waits with interleaved consumes, and repeated
-  launch/process state, with strong same-process/reset-state sensitivity.
+  next row, to a separate one-time-initialized LDS tile, or after the four
+  waited/interleaved row loads still fails, but a one-time preloop extra LDS
+  load passes. The leading local suspect is now the conjunction of a
+  per-K/same-loop extra ordinary LDS load, a second per-K LDS store, four
+  dynamic row LDS loads separated by explicit waits with interleaved consumes,
+  and repeated launch/process state, with strong same-process/reset-state
+  sensitivity.
   Same-row and same-tile membership are no longer required by the current
-  evidence, and extra-load-before-second-store ordering is also enough, though
-  the separate-tile and preloop controls change resource tuples.
+  evidence, and neither extra-load-before-second-store nor extra-load-after-row
+  ordering prevents the failure, though the separate-tile and preloop controls
+  change resource tuples.
   Barrier count alone is ruled out by the three-barrier no-LDS pass and the
   isolated extra-load / isolated load-store phase controls.
 - The throwaway split's resource metadata is useful: no-LDS and barrier-only
@@ -679,9 +682,10 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   fails with `288`, `sgpr_count=6`, and `vgpr_count=11`, showing same-tile
   membership is also not required in the pinned four-load shape, with the
   caveat that the resource tuple differs. The pinned post-row extra-load
-  control passes a one-launch smoke with `144`, `sgpr_count=5`, and
-  `vgpr_count=10`, matching the failing pre-row pinned tuple; its 100-launch
-  stress result is pending. The cross-row load split
+  control fails at sync 88 under the 100-launch stress envelope with `144`,
+  `sgpr_count=5`, and `vgpr_count=10`, matching the failing pre-row pinned
+  tuple and showing that moving the extra load after row consumption is still
+  fail-side. The cross-row load split
   uses `144`, `sgpr_count=5`, and `vgpr_count=13`, and rules out same-row
   membership as a required trigger component. The separate-tile load split uses
   `288`,
@@ -925,8 +929,14 @@ Latest artifact paths:
   barrier -> four waited/interleaved dynamic row loads and FMACs -> extra
   `ds_load_b32` -> barrier. Metadata is `group_segment_fixed_size=144`,
   `sgpr_count=5`, `vgpr_count=10`, and no spills, matching the failing
-  pre-row pinned tuple. The 100-launch stress result is pending on another
-  780M system.
+  pre-row pinned tuple.
+- `/tmp/hipfire-lds-postrow-pinned-runs/`: post-row extra-load stress and
+  recovery. `tile6_lds_store_then_rowload_then_extra_load4_consume4_pinned`
+  failed at sync 88 with HIP 719 under `N_LAUNCH=100`, producing the same MES
+  `REMOVE_QUEUE` / MODE2 reset family. Live dmesg recorded reset 523 at
+  2026-06-19 23:06:25-23:06:29 UTC. A follow-up one-launch
+  `tile6_lds_store_then_load_dynamiccols_load4_noextra_consume4_pinned`
+  recovery smoke passed.
 - `/tmp/hipfire-lds-crossrow-runs/`: cross-row extra-load controls. The first
   two-launch run failed adjacent to prior reset pressure, but a recovery
   `tile6_lds_second_store_only_read6` control passed, then clean
