@@ -96,6 +96,9 @@ Standalone HIP probes were added in the throwaway worktree only:
   stores into one LDS array. This removes the cooperative A/B staging loops so
   block shape and active masks can be compared without extra producer
   iterations.
+- `/tmp/hipfire-lds-repro/lds_direct_ab_probe.hip`: rectangular no-output LDS
+  probe with direct per-lane stores into two LDS arrays. This preserves a
+  two-slab A/B-like footprint without cooperative producer loops.
 
 Their artifact roots are:
 
@@ -105,6 +108,7 @@ Their artifact roots are:
 /tmp/hipfire-lds-gemm-standalone-artifacts/
 /tmp/hipfire-lds-rect-active-artifacts/
 /tmp/hipfire-lds-direct-active-artifacts/
+/tmp/hipfire-lds-direct-ab-artifacts/
 ```
 
 ## Variant Matrix
@@ -194,6 +198,16 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 | Direct-active no-output `4x4` active inside `6x6` block, K=6, 512 iterations, 512x86 grid | PASS | Small-active control; cooperative-loader version failed at 320. |
 | Direct-active no-output `5x5` active inside `6x6` block, K=6, 512 iterations, 512x86 grid | PASS | Small-active control; cooperative-loader version failed at 320/336/512. |
 | Direct-active no-output `6x4`/`4x6` active inside `6x6` block, K=6, 512 iterations, 512x86 grid | PASS | 24-active orientation controls; cooperative-loader versions failed at 320. |
+| Direct-AB no-output `6x6` active/block, reads=1/2, 512 iterations, 512x86 grid | PASS | Same 288 B LDS footprint as failing reads=3+ controls; footprint alone is not enough. |
+| Direct-AB no-output `6x6` active/block, reads=3, 384 iterations, 512x86 grid | PASS | Low side of reads=3 edge. |
+| Direct-AB no-output `6x6` active/block, reads=3, 448/512 iterations, 512x86 grid | FAIL | Reads=3 edge is between 384 and 448; same coredump signature. |
+| Direct-AB no-output `6x6` active/block, reads=5, 192/224 iterations, 512x86 grid | PASS | Reads=5 low side. |
+| Direct-AB no-output `6x6` active/block, reads=5, 256/320 iterations, 512x86 grid | FAIL | Reads=5 edge is between 224 and 256. |
+| Direct-AB no-output `6x6` active/block, reads=6, 176 iterations, 512x86 grid | PASS | Reads=6 low side. |
+| Direct-AB no-output `6x6` active/block, reads=6, 192/256/320 iterations, 512x86 grid | FAIL | Reads=6 edge is between 176 and 192. |
+| Direct-AB no-output `8x4` active/block, reads=6, 512 iterations, 512x86 grid | PASS | Exact one-wave, two-array control. |
+| Direct-AB no-output `8x4` active inside `8x5` block, reads=6, 512 iterations, 512x86 grid | PASS | Two-wave block with 32 active lanes; still stable. |
+| Direct-AB no-output `5x5`/`4x4` active inside `6x6` block, reads=6, 512 iterations, 512x86 grid | PASS | Small active controls remain stable without cooperative producer loops. |
 
 Latest artifact paths:
 
@@ -278,6 +292,13 @@ Latest artifact paths:
   here at 512 iterations. All-active `6x6`, K=6 still fails, but the threshold
   moves upward: 464 iterations passes and 480/512 fail. The 512 failure has the
   same gfxhub/GDS coredump signature.
+- `/tmp/hipfire-lds-direct-ab-artifacts/`: two-array direct per-lane no-output
+  LDS probe. It keeps a 288 B A/B-like LDS footprint for `6x6` while removing
+  cooperative producer loops. Footprint alone is not sufficient: reads=1 and
+  reads=2 pass at 512 iterations. Read traffic shifts the threshold: reads=3
+  passes at 384 and fails at 448, reads=5 passes at 224 and fails at 256, and
+  reads=6 passes at 176 and fails at 192. Failures keep the same gfxhub/GDS
+  coredump signature.
 
 ## Current Narrowing
 
@@ -485,6 +506,20 @@ Reduction results after extending the standalone HIP GEMM probe:
   direct-store source passes at 512. The direct-store failure therefore keeps
   K-depth and repeated multi-wave LDS consumer work in the suspect set even
   after removing cooperative A/B staging.
+- A two-array direct-store probe separates LDS footprint from cooperative
+  producer-loop structure. With all-active `6x6`, it uses a 288 B LDS segment
+  like the original square A/B cases, but each active lane directly stores one
+  A and one B element. Reads=1 and reads=2 pass at 512 iterations, so the
+  288 B footprint alone is not sufficient. Increasing repeated LDS read work
+  moves the threshold sharply: reads=3 passes at 384 and fails at 448, reads=5
+  passes at 224 and fails at 256, and reads=6 passes at 176 and fails at 192.
+  This makes repeated LDS read pressure, not just LDS allocation size, a
+  load-bearing trigger.
+- The same two-array direct-store probe preserves stable controls: exact
+  one-wave `8x4` and `8x4` active inside an `8x5` two-wave block both pass at
+  reads=6/512, and small active rectangles (`5x5`, `4x4`) inside `6x6` pass at
+  reads=6/512. This keeps the suspect set centered on all-active multi-wave
+  LDS read pressure rather than barrier count alone.
 
 The synthetic failure coredump again reports:
 
@@ -541,6 +576,12 @@ LDS-only control:
 | direct-active no-output `6x6` block, K=5 | PASS at 512 iterations / 512x86 | `_Z23lds_direct_active_probev` | 144 B | 28 | 2 | 0 | 32 |
 | direct-active no-output `8x4` active in `8x5` block, K=6 | PASS at 512 iterations / 512x86 | `_Z23lds_direct_active_probev` | 128 B | 14 | 5 | 0 | 32 |
 | direct-active no-output `4x4` active in `6x6` block, K=6 | PASS at 512 iterations / 512x86 | `_Z23lds_direct_active_probev` | 64 B | 13 | 4 | 0 | 32 |
+| direct-AB no-output `6x6` block, reads=1 | PASS at 512 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 288 B | 22 | 2 | 0 | 32 |
+| direct-AB no-output `6x6` block, reads=2 | PASS at 512 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 288 B | 24 | 2 | 0 | 32 |
+| direct-AB no-output `6x6` block, reads=3 | PASS at 384, FAIL at 448/512 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 288 B | 34 | 2 | 0 | 32 |
+| direct-AB no-output `6x6` block, reads=5 | PASS at 224, FAIL at 256 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 288 B | 54 | 2 | 0 | 32 |
+| direct-AB no-output `6x6` block, reads=6 | PASS at 176, FAIL at 192 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 288 B | 40-52 | 2 | 0 | 32 |
+| direct-AB no-output `8x4` active in `8x5` block, reads=6 | PASS at 512 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 256 B | 22 | 5 | 0 | 32 |
 
 ISA observations:
 
@@ -600,6 +641,11 @@ ISA observations:
   `gfxhub` page fault at `0x000074669d000000`, protection status `0x841051`,
   `regGDS_PROTECTION_FAULT 0x3f000007`, and
   `regGDS_VM_PROTECTION_FAULT 0x0fc00113`.
+- Direct-AB no-output failures keep the same low-level signature. Captured
+  reads=3, reads=5, and reads=6 failures report the same `gfxhub` page fault at
+  `0x000074669d000000`, protection status `0x841051`,
+  `regGDS_PROTECTION_FAULT 0x3f000007`, and
+  `regGDS_VM_PROTECTION_FAULT 0x0fc00113`.
 
 Best current hypothesis:
 
@@ -610,15 +656,18 @@ Best current hypothesis:
 > `TILE=6`/K=6 multi-wave failing, but rectangular controls refine that into a
 > more precise model: exact one-wave K=6 LDS blocks are stable, while multi-wave
 > blocks with repeated LDS producer/consumer work fail after a duration
-> threshold whose position depends on active shape, K-depth, grid work, launched
-> block shape, and LDS producer-loop shape. Direct per-lane LDS stores still
-> reproduce HIP 719, but much later than cooperative A/B staging. Crossing
-> 32 active lanes, increasing K-depth, and requiring extra cooperative producer
-> iterations all accelerate the failure rather than solely defining it. A
-> no-global, no-store synthetic GEMM-shaped kernel reproduces HIP 719, and
-> simpler no-output LDS probes reproduce the same gfxhub/GDS coredump signature
-> once the block/K-depth/grid/launch threshold is crossed. Exec-mask structure
-> alone does not appear to be the deciding factor.
+> threshold whose position depends on active shape, read count, K-depth, grid
+> work, launched block shape, and LDS producer-loop shape. Direct per-lane LDS
+> stores still reproduce HIP 719, but much later than cooperative A/B staging
+> unless the direct source uses two arrays and enough repeated reads. LDS
+> footprint alone is not enough: two-array reads=1/2 passes at 512 despite a
+> 288 B segment. Crossing 32 active lanes, increasing read/K-depth, and
+> requiring extra cooperative producer iterations all accelerate the failure
+> rather than solely defining it. A no-global, no-store synthetic GEMM-shaped
+> kernel reproduces HIP 719, and simpler no-output LDS probes reproduce the same
+> gfxhub/GDS coredump signature once the block/read-depth/grid/launch threshold
+> is crossed. Exec-mask structure alone does not appear to be the deciding
+> factor.
 
 ## Next Evidence To Capture
 
@@ -648,10 +697,9 @@ control):
 - use the minimal no-output repro for the next reduction: repeat the 256-pass /
   320-fail correlate in fresh processes and try smaller active-lane shapes
   around the one-wave/two-wave boundary.
-- use the direct-active no-output repro for the next reduction: vary direct
-  LDS read count without changing K modulo arithmetic, and add a two-array
-  direct-store variant so A/B footprint can be separated from cooperative
-  producer-loop structure.
+- use the direct-AB no-output repro for the next reduction: vary grid_x at a
+  fixed reads=3 or reads=6 edge, and compare one-array versus two-array forms
+  at equal DS load counts where compiler unrolling permits.
 - create a single-instantiation compile unit for the failing synthetic symbol
   and the passing long-loop symbol so instruction counts can be per-symbol
   instead of object-aggregate.
