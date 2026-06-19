@@ -379,6 +379,12 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
     with HIP 719 at sync 89. The emitted ISA keeps ordinary `ds_store_b32`,
     `ds_load_b32`, `ds_store_b32`, barriers, and six-wide row readback. This
     rules out an exact same-address LDS load/store alias as a requirement.
+  - The order split `tile6_lds_store_then_load_read6` also failed with HIP 719.
+    It emits ordinary `ds_store_b32 -> barrier -> ds_store_b32 -> barrier ->
+    ds_load_b32 -> six-wide row readback`, uses one 144 B LDS tile, and keeps
+    `sgpr_count=5` / `vgpr_count=12`. Therefore a load-before-second-store
+    ordering is not required either; a second LDS store followed by an ordinary
+    LDS load before the full row consumption is enough to reproduce the reset.
   - Repeating `tile6_lds_forced_same_second_store` immediately after that pass
     failed at sync 92, preserving the read-modify-write distinction in the same
     compile unit.
@@ -394,10 +400,11 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   read/write phase also fails, but only when followed by the normal six-wide
   LDS row readback. Read widths 1/2/4/5 are still pass-side, and a second
   same-address store followed by six reads is still pass-side. The better
-  current model is per-K repeated same-address LDS read-modify-write followed
-  by full-row LDS consumption, with barrier count alone ruled out by the
-  three-barrier no-LDS pass and the isolated extra-load / isolated load-store
-  phase controls.
+  current model is a per-K second LDS store plus an ordinary LDS load before
+  full-row LDS consumption; value dependency, exact address aliasing, and
+  load-before-store ordering have all been ruled out as required trigger
+  components. Barrier count alone is ruled out by the three-barrier no-LDS pass
+  and the isolated extra-load / isolated load-store phase controls.
 - The throwaway split's resource metadata is useful: no-LDS and barrier-only
   variants use `group_segment_fixed_size=0`, one-tile LDS uses `144`, and the
   two-tile failing splitter uses `288` with the same `sgpr_count=5` and
@@ -415,9 +422,12 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   tuple alone. The failing `tile6_lds_load_independent_store_read6` also uses
   `144`, `sgpr_count=5`, and `vgpr_count=12`. The address-split variants use
   `144`, `sgpr_count=5`, and `vgpr_count=13`, and both still fail when the LDS
-  load and second LDS store target different columns. The clean boundary is now
-  an extra LDS load before a second LDS store plus six-wide row readback, not a
-  load-to-store value dependency or exact same-address alias. The failing
+  load and second LDS store target different columns. The order split
+  `tile6_lds_store_then_load_read6` returns to `144`, `sgpr_count=5`, and
+  `vgpr_count=12`, and still fails with the second store before the extra LDS
+  load. The clean boundary is now a second LDS store plus an extra ordinary LDS
+  load before six-wide row readback, not a load-to-store value dependency,
+  exact same-address alias, or load-before-store ordering. The failing
   `tile6_synth` uses `288`, `sgpr_count=5`, and `vgpr_count=18`.
 - A naive same-address double-store variant was not useful: the compiler reduced
   it to a single `ds_store`. A volatile padded second-address variant failed at
@@ -488,6 +498,14 @@ Latest artifact paths:
   address-split variants use one 144-byte LDS tile with `sgpr_count=5` and
   `vgpr_count=13`, and both emit ordinary `ds_load_b32`/`ds_store_b32`
   sequences. Exact same-address load/store aliasing is not required.
+- `/tmp/hipfire-lds-order-split-runs/`: ordering splitter controls. The first
+  same-thread store-then-load attempt was not useful because the compiler
+  forwarded the stored value; a volatile version forced a `flat_load_b32` rather
+  than ordinary LDS. The clean barrier-separated variant
+  `tile6_lds_store_then_load_read6` emitted `ds_store_b32 -> barrier ->
+  ds_store_b32 -> barrier -> ds_load_b32 -> six-wide row readback` and failed
+  with HIP 719, while using `group_segment_fixed_size=144`, `sgpr_count=5`, and
+  `vgpr_count=12`.
 - `/tmp/hipfire-lds-gemm-klimit-repeat-artifacts/`: repeated no-global/no-store
   K-limit sweep, including pass at `K_LIMIT=1536`, repeated failures at
   `K_LIMIT=2048`, and tile5 pass at full K.
