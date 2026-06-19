@@ -200,3 +200,31 @@ two real levers left, both larger investments:
 Recommend doing the data recapture FIRST (cheap, and the overfitting proves we're
 data-limited) before investing in the conv1d primitive — a bigger model on more
 data may be what actually clears the bar.
+
+### Shuffled-split sweep — the body barely beats random init (2026-06-19)
+
+100-chunk daemon labels (XL corpus), deterministic shuffle, 80 train / 20 eval,
+bar +0.644:
+
+| config | params | init (random) | best (trained) | end |
+|--------|--------|---------------|----------------|-----|
+| 3L h512 | 7.74M | +0.477 | +0.426 @ ep15 | +0.271 |
+| 5L h768 | 21.6M | +0.456 | +0.429 @ ep30 | +0.396 |
+
+**On a fair shuffled eval, training the body does NOT beat random init** — it
+slightly underperforms it, at both sizes. train_loss drops monotone (1.89→1.68,
+so the model fits the TRAIN ranking) but eval ends at/below the random-init score.
+
+**Reframe:** the earlier +0.554 "SSM beats +0.47 ceiling" was on a favorable
+8-chunk UNSHUFFLED eval. On a robust 20-chunk shuffled eval, +0.47 / +0.554 /
++0.43 are all ≈ the same **embedding-geometry floor**. The drafter score is
+dominated by the frozen shared embedding + the cosine-K metric; the trainable
+token-mixer (attention OR SSM, small OR large) contributes almost nothing. Every
+lever pulled so far (capacity, wd, 2.5× data, attn→SSM) optimized a near-flat
+axis — which is why none closed the gap.
+
+**Decisive control (run before any conv1d build):** measure random-init vs trained
+on the shuffled split across a few seeds. If indistinguishable, the token-mixer is
+NOT the bottleneck — pivot from "ablate the recurrence (conv1d/delta-rule)" to the
+TASK FORMULATION: what the drafter predicts (cosine-K vs mid-L15 target) and how it
+emits K. Do NOT build conv1d until the body is shown to matter at all.
