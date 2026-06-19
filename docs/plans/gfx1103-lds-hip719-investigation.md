@@ -368,6 +368,11 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
     `sgpr_count=5`, `vgpr_count=12`) and emits `ds_store -> barrier ->
     ds_store -> barrier -> six-wide row readback`, but it does not load from LDS
     in the second producer phase.
+  - `tile6_lds_load_independent_store_read6` failed with HIP 719 at sync 90.
+    It emits `ds_store -> barrier -> ds_load -> ds_store -> barrier ->
+    six-wide row readback`, but the second store writes an independent value
+    rather than the loaded value. The load-to-store data dependency is not
+    required for the reset trigger.
   - Repeating `tile6_lds_forced_same_second_store` immediately after that pass
     failed at sync 92, preserving the read-modify-write distinction in the same
     compile unit.
@@ -401,8 +406,11 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   `read2=8`, `read4=10`, `read5=11`), while the six-wide failing splitter uses
   `vgpr_count=12`. The pass-side `tile6_lds_second_store_only_read6` also uses
   `144`, `sgpr_count=5`, and `vgpr_count=12`, which rules out that resource
-  tuple alone. The failing `tile6_synth` uses `288`, `sgpr_count=5`, and
-  `vgpr_count=18`.
+  tuple alone. The failing `tile6_lds_load_independent_store_read6` also uses
+  `144`, `sgpr_count=5`, and `vgpr_count=12`, so the clean boundary is the
+  extra same-address LDS load before the second same-address store plus six-wide
+  row readback, not a load-to-store value dependency. The failing `tile6_synth`
+  uses `288`, `sgpr_count=5`, and `vgpr_count=18`.
 - A naive same-address double-store variant was not useful: the compiler reduced
   it to a single `ds_store`. A volatile padded second-address variant failed at
   sync 57, but compiled the shared accesses as `flat_store_b32` /
@@ -457,6 +465,13 @@ Latest artifact paths:
   `tile6_lds_second_store_only_read6` passed with two same-address stores and
   six-wide row readback; `tile6_lds_forced_same_second_store` failed at sync 92
   in the same compile unit.
+- `/tmp/hipfire-lds-dependency-runs/`: load-dependency splitter controls.
+  `tile6_lds_second_store_only_read6` passed, while
+  `tile6_lds_load_independent_store_read6` failed at sync 90. The failing
+  variant has the same resource tuple as the pass-side store-only control
+  (`group_segment_fixed_size=144`, `sgpr_count=5`, `vgpr_count=12`) and confirms
+  that an LDS load before the second same-address store is sufficient; the
+  second store does not need to consume the loaded value.
 - `/tmp/hipfire-lds-gemm-klimit-repeat-artifacts/`: repeated no-global/no-store
   K-limit sweep, including pass at `K_LIMIT=1536`, repeated failures at
   `K_LIMIT=2048`, and tile5 pass at full K.
