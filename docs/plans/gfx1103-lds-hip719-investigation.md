@@ -390,6 +390,12 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
     all pass at 100 launches. The six-wide `tile6_lds_store_then_load_read6`
     failed at sync 91 in the same sequence. This preserves the six-wide row
     consumption threshold for the store-before-load ordering.
+  - The cross-row load split `tile6_lds_store_then_load_nextrow_read6` also
+    failed under the 100-launch stress envelope, at sync 88. Clean follow-up
+    runs passed at `N_LAUNCH=1` and `N_LAUNCH=2`, so treat the earlier
+    reset-adjacent two-launch failure as contaminated. The useful boundary is
+    that the extra ordinary LDS load can target a different row from the
+    six-wide row readback and still reproduce the reset under stress.
   - Repeating `tile6_lds_forced_same_second_store` immediately after that pass
     failed at sync 92, preserving the read-modify-write distinction in the same
     compile unit.
@@ -408,8 +414,10 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   current model is a per-K second LDS store plus an ordinary LDS load before
   six-wide row LDS consumption; value dependency, exact address aliasing, and
   load-before-store ordering have all been ruled out as required trigger
-  components. Barrier count alone is ruled out by the three-barrier no-LDS pass
-  and the isolated extra-load / isolated load-store phase controls.
+  components. The extra LDS load also does not need to target the same row as
+  the six-wide row readback. Barrier count alone is ruled out by the
+  three-barrier no-LDS pass and the isolated extra-load / isolated load-store
+  phase controls.
 - The throwaway split's resource metadata is useful: no-LDS and barrier-only
   variants use `group_segment_fixed_size=0`, one-tile LDS uses `144`, and the
   two-tile failing splitter uses `288` with the same `sgpr_count=5` and
@@ -435,7 +443,9 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   `read4=10`, and `read5=11` VGPRs with `sgpr_count=5`. The clean boundary is
   now a second LDS store plus an extra ordinary LDS load before six-wide row
   readback, not a load-to-store value dependency, exact same-address alias, or
-  load-before-store ordering. The failing `tile6_synth` uses `288`,
+  load-before-store ordering. The cross-row load split uses `144`,
+  `sgpr_count=5`, and `vgpr_count=13`, and rules out same-row membership as a
+  required trigger component. The failing `tile6_synth` uses `288`,
   `sgpr_count=5`, and `vgpr_count=18`.
 - A naive same-address double-store variant was not useful: the compiler reduced
   it to a single `ds_store`. A volatile padded second-address variant failed at
@@ -521,6 +531,14 @@ Latest artifact paths:
   with the same MES reset signature. ISA confirms ordinary `ds_store_b32`,
   `ds_load_b32`, and row-read `ds_load*` instructions; width 0 emits the extra
   LDS load but no row readback.
+- `/tmp/hipfire-lds-crossrow-runs/`: cross-row extra-load controls. The first
+  two-launch run failed adjacent to prior reset pressure, but a recovery
+  `tile6_lds_second_store_only_read6` control passed, then clean
+  `tile6_lds_store_then_load_nextrow_read6` runs passed at one and two launches.
+  The 100-launch cross-row run failed at sync 88. ISA emits `ds_store_b32 ->
+  barrier -> ds_store_b32 -> barrier -> ds_load_b32` from `As[(ty+1)%6][tx]`,
+  followed by the six-wide row readback from `As[ty][0..5]`; metadata is
+  `group_segment_fixed_size=144`, `sgpr_count=5`, and `vgpr_count=13`.
 - `/tmp/hipfire-lds-gemm-klimit-repeat-artifacts/`: repeated no-global/no-store
   K-limit sweep, including pass at `K_LIMIT=1536`, repeated failures at
   `K_LIMIT=2048`, and tile5 pass at full K.
