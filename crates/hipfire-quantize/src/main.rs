@@ -7309,7 +7309,10 @@ fn main() {
     let mut max_quant_error = 0.0f32;
     let mut _n_quant_groups = 0u64;
 
-    let include_vision = std::env::args().any(|a| a == "--include-vision");
+    // arch_id 13 (gemma3-vl) is multimodal — the SigLIP vision tower is REQUIRED,
+    // not optional, so auto-include it (no --include-vision needed). Other arches
+    // keep the opt-in default (vision skipped unless the flag is passed).
+    let include_vision = std::env::args().any(|a| a == "--include-vision") || arch_id == 13;
     let vision_quant = std::env::args()
         .position(|a| a == "--vision-quant")
         .and_then(|i| std::env::args().nth(i + 1))
