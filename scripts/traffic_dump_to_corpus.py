@@ -129,8 +129,8 @@ def main() -> int:
 
     with open(out_path, mode, encoding="utf-8") as out:
         for fp in paths:
-            for line in open(fp, encoding="utf-8"):
-                line = line.strip()
+            for raw_line in open(fp, encoding="utf-8"):
+                line = raw_line.strip()
                 if not line:
                     continue
                 stats["lines"] += 1

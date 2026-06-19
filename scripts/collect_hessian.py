@@ -411,8 +411,8 @@ def main():
     t0 = time.time()
     with torch.no_grad():
         for i, seq in enumerate(seqs):
-            seq = seq.unsqueeze(0).to(args.device)
-            model(seq)
+            seq_batch = seq.unsqueeze(0).to(args.device)
+            model(seq_batch)
             if (i + 1) % 8 == 0:
                 elapsed = time.time() - t0
                 rate = (i + 1) / elapsed

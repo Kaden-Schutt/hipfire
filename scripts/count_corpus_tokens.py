@@ -40,8 +40,8 @@ def main() -> int:
         tok_count = 0
         reported_count = 0
 
-        for line in fp.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
+        for raw_line in fp.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
             if not line:
                 continue
             try:

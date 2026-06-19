@@ -76,8 +76,8 @@ def resplit_state_dict(sd, cfg):
     want split block_sparse_moe.experts.E.{w1,w2,w3}."""
     inter = cfg.intermediate_size
     out = {}
-    for name, t in sd.items():
-        t = t.detach().to(torch.float32).contiguous()
+    for name, tensor in sd.items():
+        t = tensor.detach().to(torch.float32).contiguous()
         if name.endswith("mlp.experts.gate_up_proj"):
             pre = name[:-len("mlp.experts.gate_up_proj")]
             for e in range(cfg.num_local_experts):
@@ -163,7 +163,7 @@ def main():
     pa, handles = {}, []
     for li, mod in enumerate(post_attn_modules(model)):
         handles.append(mod.register_forward_pre_hook(
-            (lambda idx: (lambda m, i: pa.__setitem__(idx, i[0].detach())))(li)))
+            lambda m, i, idx=li: pa.__setitem__(idx, i[0].detach())))
     with torch.no_grad():
         _ = model(input_ids)
     for hd in handles:

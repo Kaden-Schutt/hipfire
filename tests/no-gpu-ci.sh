@@ -25,6 +25,8 @@ cargo build -p hipfire-eval
 HIPFIRE_EVAL_BIN="$ROOT/target/debug/hipfire-eval" bash tests/smoke/eval-harness-nogpu-smoke.sh
 
 echo "== Python CPU tests =="
+python3 -m ruff check .
+python3 -m mypy tests scripts benchmarks tools --config-file pyproject.toml
 python3 -m pytest tests
 
 echo "== Env/docs drift check =="

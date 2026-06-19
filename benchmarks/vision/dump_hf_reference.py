@@ -149,8 +149,8 @@ def main():
           f"n_blocks={len(model.model.visual.blocks)}")
 
     out_root = Path(args.out)
-    for img_path in args.images:
-        img_path = Path(img_path)
+    for img_path_arg in args.images:
+        img_path = Path(img_path_arg)
         print(f"\n== {img_path.name} ==")
         dump_one(img_path, out_root / img_path.stem, model, processor, args.device)
 

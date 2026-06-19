@@ -21,6 +21,7 @@ import ctypes
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 # ── pyxrt bootstrap (must happen before any aie imports) ────────────────────
 _XRT_PYTHON = "/opt/xilinx/xrt/python"
@@ -78,7 +79,7 @@ def run_one(label: str, n_heads: int, head_dim: int, n_rot: int,
             xclbin_path: Path, instr_path: Path,
             warmup: int = 20, timed: int = 200,
             atol: float = 0.02, rtol: float = 0.02,
-            pos: int = 1, freq_base: float = 500000.0) -> None:
+            pos: int = 1, freq_base: float = 500000.0) -> dict[str, Any]:
     total_elems = n_heads * head_dim
     total_bytes = total_elems * 2  # bfloat16
 

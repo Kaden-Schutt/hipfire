@@ -3,7 +3,17 @@ line-length = 120
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F"]
+select = [
+    "E",
+    "F",
+    # Focused Pylint-derived smell checks that are clean enough to gate.
+    "PLC0206",
+    "PLC0207",
+    "PLC3002",
+    "PLR1714",
+    "PLW1510",
+    "PLW2901",
+]
 ignore = [
     "E402",
     "E501",

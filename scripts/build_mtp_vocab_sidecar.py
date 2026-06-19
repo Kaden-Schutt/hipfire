@@ -144,8 +144,8 @@ def load_custom_corpus(jsonl_globs, corpus_dir) -> list[tuple[str, str]]:
     for fp in jsonl_paths:
         chunks: list[str] = []
         with open(fp, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
+            for raw_line in f:
+                line = raw_line.strip()
                 if not line:
                     continue
                 try:

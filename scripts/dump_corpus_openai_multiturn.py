@@ -90,8 +90,8 @@ from pathlib import Path
 def load_seeds_jsonl(path: str) -> list[dict]:
     """Load multi-turn seeds from JSONL. Each line is an object with 'turns'."""
     seeds: list[dict] = []
-    for lineno, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
-        line = line.strip()
+    for lineno, raw_line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
+        line = raw_line.strip()
         if not line:
             continue
         try:

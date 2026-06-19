@@ -27,6 +27,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 _VENV = Path.home() / ".venv" / "lib"
 for p in _VENV.glob("python*/site-packages"):
@@ -102,8 +103,8 @@ def build_one(label: str, n_total: int, n_heads_label: int,
     if n_total % head_dim != 0:
         raise ValueError(f"n_total={n_total} must be divisible by head_dim={head_dim}")
 
-    tile_ty    = np.ndarray[(head_dim,), np.dtype[bfloat16]]
-    weight_ty  = np.ndarray[(head_dim,), np.dtype[bfloat16]]
+    tile_ty: Any = np.ndarray[(head_dim,), np.dtype[bfloat16]]
+    weight_ty: Any = np.ndarray[(head_dim,), np.dtype[bfloat16]]
 
     include_dirs = []
     if AIE_INCLUDE and AIE_INCLUDE.is_dir():

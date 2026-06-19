@@ -9,8 +9,8 @@ import sys, json
 
 tokens = []
 done = None
-for line in sys.stdin:
-    line = line.strip()
+for raw_line in sys.stdin:
+    line = raw_line.strip()
     if not line:
         continue
     try:

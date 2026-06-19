@@ -56,8 +56,8 @@ from pathlib import Path
 
 def load_seeds(path: str) -> list[dict]:
     seeds: list[dict] = []
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
-        line = line.strip()
+    for raw_line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
         if not line:
             continue
         if line[0] == "{":

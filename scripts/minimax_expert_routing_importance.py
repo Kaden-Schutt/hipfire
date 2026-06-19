@@ -43,7 +43,7 @@ for n in range(NL):
     c = counts[n]; s = np.sort(c)[::-1]; t = c.sum()
     if t == 0: continue
     row = {k: s[:k].sum()/t for k in cov}
-    for k in cov: cov[k].append(row[k])
+    for k, values in cov.items(): values.append(row[k])
     if n % 8 == 0 or n in (1, NL-1):
         print(f"{n:>5} {row[8]:>6.2f} {row[16]:>6.2f} {row[32]:>6.2f} {row[64]:>6.2f} {s[0]/t:>8.3f} {gini(c):>6.3f}")
 print(f"{'MEAN':>5} {np.mean(cov[8]):>6.2f} {np.mean(cov[16]):>6.2f} {np.mean(cov[32]):>6.2f} {np.mean(cov[64]):>6.2f}")

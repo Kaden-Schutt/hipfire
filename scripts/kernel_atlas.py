@@ -496,7 +496,7 @@ def parse_disassembly_stats(text):
 
 
 def run_tool(command):
-    proc = subprocess.run(command, text=True, capture_output=True)
+    proc = subprocess.run(command, text=True, capture_output=True, check=False)
     return proc.returncode, proc.stdout + proc.stderr
 
 
@@ -633,8 +633,8 @@ def collect_isa_manifest(*, arch, files=None, dirs=None, name_filter=None, limit
 
 def kernel_name_variants(name):
     variants = []
-    for candidate in (name or "", str(name or "").split(".kd", 1)[0]):
-        candidate = candidate.strip()
+    for raw_candidate in (name or "", str(name or "").split(".kd", 1)[0]):
+        candidate = raw_candidate.strip()
         if candidate and candidate not in variants:
             variants.append(candidate)
     for pattern in (r"_r[0-9]+$", r"_k[0-9]+$", r"_v[0-9]+$", r"_default$"):
@@ -1513,8 +1513,8 @@ def read_jsonl_objects(path):
         text = Path(path).read_text(encoding="utf-8")
     except OSError:
         return rows
-    for line in text.splitlines():
-        line = line.strip()
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
         if not line:
             continue
         try:
@@ -2490,6 +2490,7 @@ def run_task_command(command, env=None, timeout=None, cwd=None):
         cwd=cwd,
         shell=use_shell,
         executable="/bin/bash" if use_shell else None,
+        check=False,
     )
     return {
         "command": proc_command,
@@ -3044,6 +3045,7 @@ def run_capture(command, env, timeout):
         capture_output=True,
         env=full_env,
         timeout=timeout,
+        check=False,
     )
     return proc.returncode, proc.stdout + proc.stderr
 

@@ -24,6 +24,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 # ── venv bootstrap ──────────────────────────────────────────────────────────
 _VENV = Path.home() / ".venv" / "lib"
@@ -142,7 +143,7 @@ def build(hidden_size: int, out_dir: Path, tile_size: int = 16,
         if _mlir_aie_pkg else None
     )
 
-    tile_ty = np.ndarray[(tile_size,), np.dtype[bfloat16]]
+    tile_ty: Any = np.ndarray[(tile_size,), np.dtype[bfloat16]]
     include_dirs = []
     if AIE_INCLUDE and AIE_INCLUDE.is_dir():
         include_dirs.append(str(AIE_INCLUDE))

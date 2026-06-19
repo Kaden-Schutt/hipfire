@@ -30,6 +30,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 # ── venv bootstrap ──────────────────────────────────────────────────────────
 _VENV = Path.home() / ".venv" / "lib"
@@ -128,7 +129,7 @@ def build(hidden_size: int, out_dir: Path, npu: str = "auto") -> None:
     # At bfloat16: 3 × hidden_size × 2 bytes = 9 KB (1536) or 21 KB (3584) — both fit.
     # This produces a single-tile design so the reduction sees all elements at once.
     tile_size = hidden_size
-    tile_ty = np.ndarray[(tile_size,), np.dtype[bfloat16]]
+    tile_ty: Any = np.ndarray[(tile_size,), np.dtype[bfloat16]]
 
     include_dirs = []
     if AIE_INCLUDE and AIE_INCLUDE.is_dir():

@@ -80,7 +80,7 @@ def main():
                 [args.demo, "--target", args.target, "--draft", args.draft,
                  "--prompt", prompt, "--max", str(args.max), "--ctx", str(args.ctx),
                  "--no-chatml", *extra_args],
-                capture_output=True, text=True, timeout=240)
+                capture_output=True, text=True, timeout=240, check=False)
             out = proc.stdout + proc.stderr
         except subprocess.TimeoutExpired:
             print(f"{tid:<16} TIMEOUT")

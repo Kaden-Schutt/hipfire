@@ -46,8 +46,8 @@ def load_jsonl(path: Path, max_rows: int | None = None) -> list[dict]:
     """Read any JSONL into a list of dicts. Schema-agnostic at this layer."""
     rows: list[dict] = []
     with path.open() as f:
-        for line in f:
-            line = line.strip()
+        for raw_line in f:
+            line = raw_line.strip()
             if not line:
                 continue
             try:
@@ -112,7 +112,7 @@ def sample_from_dataset(
             continue
         if len(p) < 30 or len(p) > 8000:
             continue
-        prompts.append((dataset_name.split("/")[-1], p))
+        prompts.append((dataset_name.rsplit("/", 1)[-1], p))
     if len(prompts) > n:
         prompts = rng.sample(prompts, n)
     return prompts
@@ -142,8 +142,8 @@ def main() -> int:
     }
 
     weights: dict[str, int] = {}
-    for tok in args.mix.split(","):
-        tok = tok.strip()
+    for raw_tok in args.mix.split(","):
+        tok = raw_tok.strip()
         for i, ch in enumerate(tok):
             if ch.isdigit():
                 short, pct = tok[:i], int(tok[i:])

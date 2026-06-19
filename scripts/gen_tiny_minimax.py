@@ -96,7 +96,7 @@ def main():
     handles = []
     for li, layer in enumerate(model.model.layers):
         handles.append(layer.post_attention_layernorm.register_forward_pre_hook(
-            (lambda idx: (lambda m, i: pa.__setitem__(idx, i[0].detach())))(li)))
+            lambda m, i, idx=li: pa.__setitem__(idx, i[0].detach())))
     with torch.no_grad():
         _ = model(input_ids)
     for h2 in handles:
@@ -112,8 +112,8 @@ def main():
     # Re-split PACKED → SPLIT and save model.safetensors.
     sd = model.state_dict()
     split = {}
-    for name, t in sd.items():
-        t = t.detach().to(torch.float32).contiguous()
+    for name, tensor in sd.items():
+        t = tensor.detach().to(torch.float32).contiguous()
         if name.endswith("mlp.experts.gate_up_proj"):           # [E, 2I, H]
             pre = name[:-len("mlp.experts.gate_up_proj")]
             for e in range(cfg.num_local_experts):

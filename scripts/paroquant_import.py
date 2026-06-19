@@ -346,7 +346,7 @@ def tensor_to_copy_payload(index: dict[str, Path], name: str, *, copy_floats: st
     shape = [int(x) for x in tensor.shape]
     if copy_floats == "q8" and tensor.ndim >= 2 and shape[-1] % 32 == 0:
         return quantize_q8f16_payload(tensor), shape, 3, 32
-    if copy_floats != "f16" and copy_floats != "q8":
+    if copy_floats not in {"f16", "q8"}:
         raise ValueError(f"unknown copied-float mode: {copy_floats}")
     tensor = tensor.to(dtype=torch.float16).contiguous()
     return tensor.numpy().tobytes(order="C"), shape, 1, 0

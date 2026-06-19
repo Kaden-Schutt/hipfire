@@ -447,8 +447,8 @@ def parse_max_memory(value: str | None):
     if not value:
         return None
     out: dict[int | str, str] = {}
-    for item in value.split(","):
-        item = item.strip()
+    for raw_item in value.split(","):
+        item = raw_item.strip()
         if not item:
             continue
         if "=" not in item:
@@ -1435,7 +1435,7 @@ def quantize_candidate(args):
         name = item["hfq_name"]
         tensor_started = time.time()
         if args.progress_every and (
-            index == 1 or index == total or (index - 1) % args.progress_every == 0
+            index in (1, total) or (index - 1) % args.progress_every == 0
         ):
             print(
                 f"[mq4_masked_calib] quantize {index}/{total} {name} "
@@ -1700,7 +1700,7 @@ def tensor_sweep_worker(worker):
                 "--max-chunks",
                 max_chunks,
             ]
-            proc = subprocess.run(cmd, text=True, capture_output=True, env=env_base)
+            proc = subprocess.run(cmd, text=True, capture_output=True, env=env_base, check=False)
             log_path.write_text(proc.stdout + proc.stderr)
             status = "ok" if proc.returncode == 0 else f"failed_{proc.returncode}"
         except Exception as exc:
@@ -1900,7 +1900,7 @@ def run_round_bench(args, round_dir: Path, model_path: Path):
     env = os.environ.copy()
     if args.gpu is not None:
         env["HIP_VISIBLE_DEVICES"] = str(args.gpu)
-    proc = subprocess.run(cmd, text=True, capture_output=True, env=env)
+    proc = subprocess.run(cmd, text=True, capture_output=True, env=env, check=False)
     log.write_text(proc.stdout + proc.stderr)
     metrics = reduce_kldseq_metrics(output) if proc.returncode == 0 and output.exists() else None
     return {

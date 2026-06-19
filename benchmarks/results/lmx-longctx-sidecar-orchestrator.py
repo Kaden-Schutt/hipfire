@@ -106,7 +106,7 @@ def run_bench(tag):
     env["PATH"] = f"{Path.home() / '.hipfire' / 'bin'}:" + env.get("PATH", "")
     cmd = ["hipfire", "bench", tag, "--runs", str(RUNS), PROMPT]
     log(f"  $ {' '.join(cmd)}")
-    proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=600)
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=600, check=False)
     return proc.stdout + proc.stderr, proc.returncode
 
 

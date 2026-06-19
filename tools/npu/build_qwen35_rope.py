@@ -28,6 +28,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 # ── venv bootstrap ──────────────────────────────────────────────────────────
 _VENV = Path.home() / ".venv" / "lib"
@@ -112,9 +113,9 @@ def build_one(label: str, n_total: int, n_heads_label: int,
         raise ValueError(f"n_total={n_total} must be divisible by head_dim={head_dim}")
 
     # tile_ty: one head (head_dim bfloat16 elements)
-    tile_ty    = np.ndarray[(head_dim,), np.dtype[bfloat16]]
+    tile_ty: Any = np.ndarray[(head_dim,), np.dtype[bfloat16]]
     # cs_tile_ty: n_rot bfloat16 elements [cos_0..cos_{n_rot/2-1}, sin_0..sin_{n_rot/2-1}]
-    cs_tile_ty = np.ndarray[(n_rot,), np.dtype[bfloat16]]
+    cs_tile_ty: Any = np.ndarray[(n_rot,), np.dtype[bfloat16]]
 
     include_dirs = []
     if AIE_INCLUDE and AIE_INCLUDE.is_dir():

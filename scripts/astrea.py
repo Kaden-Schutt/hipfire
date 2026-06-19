@@ -1638,6 +1638,7 @@ def copy_candidate_file(model, candidate):
         ["cp", "--reflink=auto", "--sparse=always", str(src), str(dst)],
         text=True,
         capture_output=True,
+        check=False,
     )
     if proc.returncode != 0:
         shutil.copy2(src, dst)
@@ -2783,7 +2784,7 @@ def eval_plan(plan_path, *, run=False):
         if not run:
             results.append({"command": command, "status": "not_run"})
             continue
-        proc = subprocess.run(command, shell=True, text=True, capture_output=True)
+        proc = subprocess.run(command, shell=True, text=True, capture_output=True, check=False)
         results.append(
             {
                 "command": command,

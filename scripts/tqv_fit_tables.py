@@ -42,8 +42,8 @@ class SampleSet:
 
 def parse_csv_ints(raw: str) -> list[int]:
     out = []
-    for part in raw.split(","):
-        part = part.strip()
+    for raw_part in raw.split(","):
+        part = raw_part.strip()
         if not part:
             continue
         out.append(int(part))

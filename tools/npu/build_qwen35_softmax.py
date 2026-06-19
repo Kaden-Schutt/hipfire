@@ -28,6 +28,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 _VENV = Path.home() / ".venv" / "lib"
 for p in _VENV.glob("python*/site-packages"):
@@ -115,7 +116,7 @@ def build_one(n_heads: int, ctx_len: int, out_dir: Path, npu: str) -> None:
         if _mlir_aie_pkg else None
     )
 
-    tile_ty = np.ndarray[(ctx_len,), np.dtype[bfloat16]]
+    tile_ty: Any = np.ndarray[(ctx_len,), np.dtype[bfloat16]]
     include_dirs = []
     if AIE_INCLUDE and AIE_INCLUDE.is_dir():
         include_dirs.append(str(AIE_INCLUDE))
