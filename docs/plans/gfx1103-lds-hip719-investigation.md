@@ -205,6 +205,10 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 | Direct-AB no-output `6x6` active/block, reads=5, 256/320 iterations, 512x86 grid | FAIL | Reads=5 edge is between 224 and 256. |
 | Direct-AB no-output `6x6` active/block, reads=6, 176 iterations, 512x86 grid | PASS | Reads=6 low side. |
 | Direct-AB no-output `6x6` active/block, reads=6, 192/256/320 iterations, 512x86 grid | FAIL | Reads=6 edge is between 176 and 192. |
+| Direct-AB no-output `6x6` active/block, reads=6, 192 iterations, 509x86 grid | PASS | Grid-width low side at fixed read/loop edge. |
+| Direct-AB no-output `6x6` active/block, reads=6, 192 iterations, 510/511/512x86 grid | FAIL | Grid-width edge is between 509 and 510 at grid_y=86. |
+| Direct-AB no-output `6x6` active/block, reads=3, 448 iterations, 511x86 grid | PASS | Grid-width low side at fixed read/loop edge. |
+| Direct-AB no-output `6x6` active/block, reads=3, 448 iterations, 512x86 grid | FAIL | Grid-width edge is between 511 and 512 at grid_y=86. |
 | Direct-AB no-output `8x4` active/block, reads=6, 512 iterations, 512x86 grid | PASS | Exact one-wave, two-array control. |
 | Direct-AB no-output `8x4` active inside `8x5` block, reads=6, 512 iterations, 512x86 grid | PASS | Two-wave block with 32 active lanes; still stable. |
 | Direct-AB no-output `5x5`/`4x4` active inside `6x6` block, reads=6, 512 iterations, 512x86 grid | PASS | Small active controls remain stable without cooperative producer loops. |
@@ -298,7 +302,9 @@ Latest artifact paths:
   reads=2 pass at 512 iterations. Read traffic shifts the threshold: reads=3
   passes at 384 and fails at 448, reads=5 passes at 224 and fails at 256, and
   reads=6 passes at 176 and fails at 192. Failures keep the same gfxhub/GDS
-  coredump signature.
+  coredump signature. Grid-width sweeps at fixed edge points show sharp total
+  work thresholds: reads=6/192 passes through 509x86 and fails at 510x86,
+  while reads=3/448 passes through 511x86 and fails at 512x86.
 
 ## Current Narrowing
 
@@ -520,6 +526,15 @@ Reduction results after extending the standalone HIP GEMM probe:
   reads=6/512, and small active rectangles (`5x5`, `4x4`) inside `6x6` pass at
   reads=6/512. This keeps the suspect set centered on all-active multi-wave
   LDS read pressure rather than barrier count alone.
+- Grid-width sweeps on the direct-AB edge preserve the cumulative-work model.
+  At reads=6 and 192 iterations, grid_x 256, 320, 384, 448, 480, 496, 504,
+  508, and 509 all pass at grid_y=86, while grid_x 510, 511, and 512 fail at
+  sync 99 with identical resource metadata. At reads=3 and 448 iterations,
+  grid_x 256, 320, 384, 448, 480, 496, 504, 508, 510, and 511 pass, while
+  grid_x 512 fails on repeat at sync 97-98. This is sharper than the earlier
+  LDS-only grid threshold but points in the same direction: the fault appears
+  after a narrow cumulative LDS-read/work threshold, not at kernel launch or
+  compile time.
 
 The synthetic failure coredump again reports:
 
@@ -581,6 +596,8 @@ LDS-only control:
 | direct-AB no-output `6x6` block, reads=3 | PASS at 384, FAIL at 448/512 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 288 B | 34 | 2 | 0 | 32 |
 | direct-AB no-output `6x6` block, reads=5 | PASS at 224, FAIL at 256 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 288 B | 54 | 2 | 0 | 32 |
 | direct-AB no-output `6x6` block, reads=6 | PASS at 176, FAIL at 192 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 288 B | 40-52 | 2 | 0 | 32 |
+| direct-AB no-output `6x6` block, reads=6, 192 iters | PASS at 509x86, FAIL at 510x86 | `_Z19lds_direct_ab_probev` | 288 B | 52 | 2 | 0 | 32 |
+| direct-AB no-output `6x6` block, reads=3, 448 iters | PASS at 511x86, FAIL at 512x86 | `_Z19lds_direct_ab_probev` | 288 B | 34 | 2 | 0 | 32 |
 | direct-AB no-output `8x4` active in `8x5` block, reads=6 | PASS at 512 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 256 B | 22 | 5 | 0 | 32 |
 
 ISA observations:
@@ -645,7 +662,9 @@ ISA observations:
   reads=3, reads=5, and reads=6 failures report the same `gfxhub` page fault at
   `0x000074669d000000`, protection status `0x841051`,
   `regGDS_PROTECTION_FAULT 0x3f000007`, and
-  `regGDS_VM_PROTECTION_FAULT 0x0fc00113`.
+  `regGDS_VM_PROTECTION_FAULT 0x0fc00113`. Captured grid-width-edge failures
+  for reads=6/192 at 510x86 and reads=3/448 at 512x86 report the same
+  signature.
 
 Best current hypothesis:
 
@@ -666,7 +685,9 @@ Best current hypothesis:
 > rather than solely defining it. A no-global, no-store synthetic GEMM-shaped
 > kernel reproduces HIP 719, and simpler no-output LDS probes reproduce the same
 > gfxhub/GDS coredump signature once the block/read-depth/grid/launch threshold
-> is crossed. Exec-mask structure alone does not appear to be the deciding
+> is crossed. The latest direct-AB grid sweeps make that threshold extremely
+> narrow near the fail edge: one grid column separates pass from fail in the
+> reads=3/448 case. Exec-mask structure alone does not appear to be the deciding
 > factor.
 
 ## Next Evidence To Capture
@@ -697,9 +718,9 @@ control):
 - use the minimal no-output repro for the next reduction: repeat the 256-pass /
   320-fail correlate in fresh processes and try smaller active-lane shapes
   around the one-wave/two-wave boundary.
-- use the direct-AB no-output repro for the next reduction: vary grid_x at a
-  fixed reads=3 or reads=6 edge, and compare one-array versus two-array forms
-  at equal DS load counts where compiler unrolling permits.
+- use the direct-AB no-output repro for the next reduction: vary launch count
+  at the reads=6/192/510x86 and reads=3/448/512x86 edges, then repeat one edge
+  in fresh processes to quantify state sensitivity.
 - create a single-instantiation compile unit for the failing synthetic symbol
   and the passing long-loop symbol so instruction counts can be per-symbol
   instead of object-aggregate.
