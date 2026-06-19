@@ -14,5 +14,7 @@
 //! RoPE) — so its forward reuses the qwen35-vl vision kernels.
 
 pub mod config;
+pub mod vision;
 
 pub use config::{vl_config_from_hfq, Gemma3VlConfig, SigLipConfig};
+pub use vision::{SigLipLayerWeights, SigLipWeights};
