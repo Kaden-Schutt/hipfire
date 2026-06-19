@@ -19,7 +19,6 @@ use rdna_compute::{DType, Gpu};
 
 const SEQ: usize = 512;
 const BLOCK: usize = 64;
-const N_TRAIN: usize = 32;
 const N_EVAL: usize = 8;
 const EPOCHS: usize = 300;
 const TAU: f32 = 0.1;
@@ -108,15 +107,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let dlpath = std::env::var("HIPFIRE_PFLASH_DAEMON_LABELS")
         .map_err(|_| "set HIPFIRE_PFLASH_DAEMON_LABELS=<jsonl> (real qwen3.5 labels)")?;
-    println!("arch: {}  SEQ={SEQ} BLOCK={BLOCK} blocks={nb} train={N_TRAIN} eval={N_EVAL}", gpu.arch);
-    println!("labels: daemon source {dlpath} (real qwen3.5 target)");
+    let n_eval = env_usize("HIPFIRE_PFLASH_NEVAL", N_EVAL);
     let (chunks, label_mid, base_shallow, embed, h_t, vocab) = load_daemon_labels(&mut gpu, &dlpath)?;
 
+    // train = all-but-last-n_eval chunks (eval split is the tail).
     let n_chunks = chunks.len();
-    assert!(n_chunks == N_TRAIN + N_EVAL, "expected {} chunks, got {n_chunks}", N_TRAIN + N_EVAL);
+    let n_train = n_chunks.checked_sub(n_eval).filter(|&t| t > 0)
+        .unwrap_or_else(|| panic!("n_chunks {n_chunks} ≤ n_eval {n_eval}"));
+    println!("arch: {}  SEQ={SEQ} BLOCK={BLOCK} blocks={nb} train={n_train} eval={n_eval}", gpu.arch);
+    println!("labels: daemon source {dlpath} (real qwen3.5 target)");
     let scores_dev = gpu.zeros(&[nb], DType::F32)?;
-    let bar: f32 = (N_TRAIN..n_chunks).map(|i| spearman(&base_shallow[i], &label_mid[i])).sum::<f32>()
-        / N_EVAL as f32;
+    let bar: f32 = (n_train..n_chunks).map(|i| spearman(&base_shallow[i], &label_mid[i])).sum::<f32>()
+        / n_eval as f32;
 
     // ── SSM drafter + training ──
     let n_layers = env_usize("HIPFIRE_SSM_LAYERS", 3);
@@ -142,7 +144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let eval = |gpu: &mut Gpu, d: &SsmDrafter| -> f32 {
         let sc = gpu.zeros(&[nb], DType::F32).unwrap();
         let mut s = 0.0;
-        for i in N_TRAIN..n_chunks {
+        for i in n_train..n_chunks {
             let a = ssm_drafter_forward_train(gpu, d, &chunks[i], &pos).unwrap();
             pflash_score_fwd(gpu, &a.score_k, &sc, kvd_d, nb, last);
             let pred = gpu.download_f32(&sc).unwrap();
@@ -150,7 +152,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             free_ssm_drafter_acts(gpu, a).unwrap();
         }
         let _ = gpu.free_tensor(sc);
-        s / N_EVAL as f32
+        s / n_eval as f32
     };
 
     println!("\n  bar  Spearman(shallow, mid)   [eval] = {bar:+.3}  ← drafter must beat this");
@@ -161,7 +163,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut best_ep = 0usize;
     for ep in 0..epochs {
         let mut ep_loss = 0.0f32;
-        for i in 0..N_TRAIN {
+        for i in 0..n_train {
             let acts = ssm_drafter_forward_train(&mut gpu, &drafter, &chunks[i], &pos)?;
             pflash_score_fwd(&mut gpu, &acts.score_k, &scores_dev, kvd_d, nb, last);
             let pred = gpu.download_f32(&scores_dev)?;
@@ -190,7 +192,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if ep % 30 == 0 || ep == epochs - 1 {
                 println!(
                     "  ep {ep:>3}  train_loss {:.4}  eval {:+.3}  (best {:+.3} @ ep {})",
-                    ep_loss / N_TRAIN as f32, corr, best_corr, best_ep
+                    ep_loss / n_train as f32, corr, best_corr, best_ep
                 );
             }
         }
