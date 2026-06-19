@@ -390,6 +390,14 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
     all pass at 100 launches. The six-wide `tile6_lds_store_then_load_read6`
     failed at sync 91 in the same sequence. This preserves the six-wide row
     consumption threshold for the store-before-load ordering.
+  - The dynamic-column row-read split
+    `tile6_lds_store_then_load_dynamiccols_read6` failed at sync 85 under the
+    100-launch stress envelope after passing a one-launch smoke. It keeps the
+    same one-tile store-then-load producer pattern, but hides the six row
+    column constants behind empty inline asm so the row readback emits six
+    separate `ds_load_b32` instructions instead of the packed
+    `ds_load_2addr_b64` / `ds_load_b64` sequence. A recovery
+    `tile6_lds_two_store_once_one_read` control passed.
   - The cross-row load split `tile6_lds_store_then_load_nextrow_read6` also
     failed under the 100-launch stress envelope, at sync 88. Clean follow-up
     runs passed at `N_LAUNCH=1` and `N_LAUNCH=2`, so treat the earlier
@@ -433,9 +441,11 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   readback likewise does not need to target the same LDS tile as the second
   store and extra load. The separate-tile controls are less minimal because
   they use `group_segment_fixed_size=288`, but together they show same-tile
-  membership is not required on either side of the split. Barrier count alone
-  is ruled out by the three-barrier no-LDS pass and the isolated extra-load /
-  isolated load-store phase controls.
+  membership is not required on either side of the split. The dynamic-column
+  split rules out the packed contiguous row-load instruction form as a
+  requirement; six independent `ds_load_b32` row loads are still enough.
+  Barrier count alone is ruled out by the three-barrier no-LDS pass and the
+  isolated extra-load / isolated load-store phase controls.
 - The throwaway split's resource metadata is useful: no-LDS and barrier-only
   variants use `group_segment_fixed_size=0`, one-tile LDS uses `144`, and the
   two-tile failing splitter uses `288` with the same `sgpr_count=5` and
@@ -461,7 +471,10 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   `read4=10`, and `read5=11` VGPRs with `sgpr_count=5`. The clean boundary is
   now a second LDS store plus an extra ordinary LDS load before six-wide row
   readback, not a load-to-store value dependency, exact same-address alias, or
-  load-before-store ordering. The cross-row load split uses `144`,
+  load-before-store ordering. The dynamic-column split keeps `144`,
+  `sgpr_count=5`, and raises `vgpr_count` to `17` while replacing packed row
+  LDS loads with six separate dynamic-address `ds_load_b32` operations. The
+  cross-row load split uses `144`,
   `sgpr_count=5`, and `vgpr_count=13`, and rules out same-row membership as a
   required trigger component. The separate-tile load split uses `288`,
   `sgpr_count=4`, and `vgpr_count=13`, and rules out same-tile membership when
@@ -554,6 +567,15 @@ Latest artifact paths:
   with the same MES reset signature. ISA confirms ordinary `ds_store_b32`,
   `ds_load_b32`, and row-read `ds_load*` instructions; width 0 emits the extra
   LDS load but no row readback.
+- `/tmp/hipfire-lds-scrambled-read-runs/`: row-read instruction-form controls.
+  A source-order scramble still compiled to the same packed row-read sequence
+  as the existing six-wide case, so it was not promoted. The useful
+  `tile6_lds_store_then_load_dynamiccols_read6` variant passed at one launch
+  and failed at sync 85 under 100 launches. It emits the same store-then-load
+  producer sequence followed by six independent dynamic-address `ds_load_b32`
+  row loads. Metadata is `group_segment_fixed_size=144`, `sgpr_count=5`, and
+  `vgpr_count=17`. A recovery `tile6_lds_two_store_once_one_read` control
+  passed at 20 launches.
 - `/tmp/hipfire-lds-crossrow-runs/`: cross-row extra-load controls. The first
   two-launch run failed adjacent to prior reset pressure, but a recovery
   `tile6_lds_second_store_only_read6` control passed, then clean
