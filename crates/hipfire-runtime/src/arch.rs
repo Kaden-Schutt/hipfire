@@ -46,7 +46,7 @@
 //!      time.
 
 use crate::hfq::HfqFile;
-use rdna_compute::Gpu;
+use rdna_compute::{Gpu, GpuTensor};
 
 /// Bring-up contract for a hipfire architecture.
 ///
@@ -273,4 +273,71 @@ pub struct EosFilterOverrides {
     /// If `Some`, override whether to strip `<think>...</think>` blocks
     /// from the visible stream. Default is on for thinking-mode arches.
     pub strip_think: Option<bool>,
+}
+
+// ── Serving seam (de-qwen-ification) ────────────────────────────────
+// See docs/plans/2026-06-19-daemon-family-seam.md. The daemon's per-arch
+// `generate_*` functions and the `LoadedModel` Option-soup are being
+// migrated behind an object-safe serving trait so new families integrate
+// without editing the 18k-line daemon at ~1000 sites.
+//
+// P0 (this): `ArchCaps` + `SimpleAr` — the stable keystone a new dense
+// arch implements. The full `ServingBackend` boxed trait + `GenerateCtx`
+// land in P2, once the daemon extraction pins the exact context surface.
+
+/// Optional fast-path capabilities a serving backend advertises.
+///
+/// The daemon checks these instead of branching on `arch_id` (e.g.
+/// `if caps.dflash { ... }` rather than `if is_qwen35_family_arch_id(id) { ... }`).
+/// A backend that lacks a path leaves the flag `false` and the daemon falls
+/// back to the plain autoregressive loop ([`SimpleAr`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ArchCaps {
+    /// DDTree / DFlash speculative decode (draft + tree verify).
+    pub dflash: bool,
+    /// Multi-token-prediction head (e.g. DeepSeek V4, qwen35 MTP).
+    pub mtp: bool,
+    /// Pipeline-parallel multi-GPU serving (`pp > 1`).
+    pub pipeline_parallel: bool,
+    /// Grouped-MoE batched prefill/decode fast path.
+    pub grouped_moe_batch: bool,
+    /// Vision conditioning (image tokens spliced into the decoder input).
+    pub vision: bool,
+    /// Paged KV cache (block-table allocator) rather than a flat buffer.
+    pub paged_kv: bool,
+}
+
+/// Plain autoregressive serving surface.
+///
+/// A dense, full-attention-only family (gemma3 text, llama, plain qwen2)
+/// implements **only** this; the daemon drives the shared
+/// prefill → sample → stream → decode_step loop (sampler, EOS filter,
+/// loop-guard, penalties all stay daemon-side and are reused by every arch).
+/// Families with a bespoke loop (qwen35 DFlash/MTP, deepseek4 MTP, VL splice)
+/// override the full serving entry point instead (P2's `ServingBackend`).
+///
+/// Object-safe by construction: methods take `&mut self`, `&mut Gpu`, slices
+/// and scalars, and hand back the logits tensor by reference for the daemon's
+/// sampler — no associated types, no generics, no `Self`-by-value. So the
+/// daemon can hold `Box<dyn SimpleAr>`.
+///
+/// The dyn boundary here is **coarse** — one virtual call per prefill and per
+/// decode step (i.e. per token), not per layer. The per-layer forward stays
+/// monomorphized inside the implementor, so this does not reintroduce the
+/// inner-loop dyn cost the [`Architecture`] docs warn about.
+pub trait SimpleAr {
+    /// Run the prompt through the model, populating the KV cache and leaving
+    /// the final-position logits available via [`SimpleAr::logits`]. `tokens`
+    /// is the full prompt (already framed/templated by the daemon).
+    fn prefill(&mut self, gpu: &mut Gpu, tokens: &[u32]) -> Result<(), String>;
+
+    /// Advance one autoregressive step: feed `token` at absolute position
+    /// `pos`, updating the KV cache and refreshing [`SimpleAr::logits`].
+    fn decode_step(&mut self, gpu: &mut Gpu, token: u32, pos: usize) -> Result<(), String>;
+
+    /// The most recent step's logits (`[vocab_size]`), for the daemon sampler.
+    fn logits(&self) -> &GpuTensor;
+
+    /// Vocabulary length (logits width), so the daemon sizes its sampler.
+    fn vocab_size(&self) -> usize;
 }
