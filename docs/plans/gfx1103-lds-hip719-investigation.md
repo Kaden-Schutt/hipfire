@@ -101,6 +101,8 @@ VARIANT=tile6_lds_store_then_load_dynamiccols_load5_split2_2_1_use5 MODE=full N_
 VARIANT=tile6_lds_store_then_load_dynamiccols_load5_split1_keep5 MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-split1-keep5-780m
 VARIANT=tile6_lds_store_then_load_dynamiccols_load4_split1_keep4 MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-split1-keep4-780m
 VARIANT=tile6_lds_store_then_load_dynamiccols_load3_split1_keep3 MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-split1-keep3-780m
+VARIANT=tile6_lds_store_then_load_dynamiccols_load4_split1_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-consume4-pinned-780m
+VARIANT=tile6_lds_store_then_load_dynamiccols_load3_split1_consume3_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-consume3-pinned-780m
 ```
 
 The currently promoted standalone GEMM jig lives in the repo:
@@ -480,6 +482,14 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
     launches with the same producer phase and delayed consumption pattern. The
     local delayed-consume boundary is therefore between three and four live
     dynamic row values.
+  - Pinned immediate-consume controls kept the same 3/4 boundary while removing
+    delayed live-value pressure. `tile6_lds_store_then_load_dynamiccols_load4_split1_consume4_pinned`
+    emits an FMAC after each waited dynamic row load, uses only
+    `vgpr_count=10`, and still failed at sync 89. The matching three-load
+    pinned control passed at 100 launches with `vgpr_count=9`. This moves the
+    local model away from delayed live values as the sole cause and toward a
+    four dynamic row-load / explicit wait / interleaved consume threshold after
+    the second-store/extra-load producer phase.
   - The cross-row load split `tile6_lds_store_then_load_nextrow_read6` also
     failed under the 100-launch stress envelope, at sync 88. Clean follow-up
     runs passed at `N_LAUNCH=1` and `N_LAUNCH=2`, so treat the earlier
@@ -529,11 +539,11 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   enough, and their stress threshold is lower: four pass and five fail when
   the loads are outstanding together. Clean-state immediate-consume
   serialization can pass, but split controls down to max-one outstanding still
-  fail when four or more row-load results remain live until delayed
-  accumulation.
+  fail with four row-loads even when FMACs are pinned between loads.
   The leading local suspect is now the combination of the second-store /
-  extra-load producer phase, four dynamic row LDS values live across waits, and
-  delayed consumption, with strong same-process/reset-state sensitivity.
+  extra-load producer phase, four dynamic row LDS loads separated by explicit
+  waits, and repeated launch/process state, with strong same-process/reset-state
+  sensitivity.
   Barrier count alone is ruled out by the three-barrier no-LDS pass and the
   isolated extra-load / isolated load-store phase controls.
 - The throwaway split's resource metadata is useful: no-LDS and barrier-only
@@ -577,10 +587,12 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   `split1_keep5` controls all fail with the same `144`, `sgpr_count=5`, and
   `vgpr_count=15` tuple. `load4_split1_keep4` fails with `144`,
   `sgpr_count=5`, and `vgpr_count=13`, while `load3_split1_keep3` passes with
-  `144`, `sgpr_count=5`, and `vgpr_count=11`. The issue is therefore not
-  removed by reducing only the outstanding dynamic row-load group size, even to
-  one, once four loaded values remain live until delayed consumption. The
-  cross-row load split
+  `144`, `sgpr_count=5`, and `vgpr_count=11`. Pinned immediate-consume
+  `load4_split1_consume4_pinned` fails with `144`, `sgpr_count=5`, and
+  `vgpr_count=10`, while `load3_split1_consume3_pinned` passes with `144`,
+  `sgpr_count=5`, and `vgpr_count=9`. The issue is therefore not removed by
+  reducing only the outstanding dynamic row-load group size, even to one, or by
+  consuming each waited value immediately. The cross-row load split
   uses `144`, `sgpr_count=5`, and `vgpr_count=13`, and rules out same-row
   membership as a required trigger component. The separate-tile load split uses
   `288`,
@@ -742,6 +754,21 @@ Latest artifact paths:
   values, `group_segment_fixed_size=144`, `sgpr_count=5`, and
   `vgpr_count=11`. This brackets the delayed-live boundary between three and
   four dynamic row values for the one-tile store-then-load producer shape.
+- `/tmp/hipfire-lds-immediate-consume-runs/`: pinned immediate-consume
+  controls. A sanity run of promoted
+  `tile6_lds_store_then_load_dynamiccols_load4_use4` passed at 100 launches
+  before this throwaway worktree. An initial unpinned consume4 source was not
+  used as evidence because codegen still delayed all FMACs until after the row
+  loads. Throwaway
+  `tile6_lds_store_then_load_dynamiccols_load4_split1_consume4_pinned` passed
+  smoke, emitted dynamic row load / wait / FMAC groups, used
+  `group_segment_fixed_size=144`, `sgpr_count=5`, `vgpr_count=10`, and failed
+  at sync 89 over 100 launches. Recovery passed afterward. Throwaway
+  `tile6_lds_store_then_load_dynamiccols_load3_split1_consume3_pinned` passed
+  smoke and passed 100 launches with the same pinned consume form,
+  `group_segment_fixed_size=144`, `sgpr_count=5`, and `vgpr_count=9`. This
+  shows the 3/4 boundary survives even when delayed live-value pressure is
+  removed and the FMACs are interleaved with waited row loads.
 - `/tmp/hipfire-lds-crossrow-runs/`: cross-row extra-load controls. The first
   two-launch run failed adjacent to prior reset pressure, but a recovery
   `tile6_lds_second_store_only_read6` control passed, then clean
