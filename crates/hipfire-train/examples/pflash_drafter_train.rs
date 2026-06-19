@@ -52,6 +52,49 @@ fn snapshot_dir(repo: &str) -> Option<PathBuf> {
     std::fs::read_dir(&snaps).ok()?.flatten().map(|e| e.path()).find(|p| p.is_dir())
 }
 
+/// Load drafter training labels emitted by the daemon `pflash_labels` op (real
+/// qwen3.5 target, teacher/student split): the JSONL (one `{tokens, mid_scores,
+/// shallow_scores}` per chunk) + the `<path>.embed.bin` fp32 embedding sidecar
+/// (`QEMB` header). Returns (chunks, label_mid, base_shallow, embed_gpu, h_t,
+/// vocab, rope_base, eps) matching the Llama path's tuple. Drafter rope/eps are
+/// its own small-block params, not the target's, so use sane defaults.
+#[allow(clippy::type_complexity)]
+fn load_daemon_labels(
+    gpu: &mut Gpu,
+    jsonl: &str,
+) -> Result<(Vec<Vec<u32>>, Vec<Vec<f32>>, Vec<Vec<f32>>, rdna_compute::GpuTensor, usize, usize, f32, f32), Box<dyn std::error::Error>>
+{
+    let text = std::fs::read_to_string(jsonl)?;
+    let (mut chunks, mut label_mid, mut base_shallow) = (Vec::new(), Vec::new(), Vec::new());
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let v: serde_json::Value = serde_json::from_str(line)?;
+        let arr_u32 = |k: &str| -> Vec<u32> {
+            v[k].as_array().map(|a| a.iter().map(|x| x.as_u64().unwrap_or(0) as u32).collect()).unwrap_or_default()
+        };
+        let arr_f32 = |k: &str| -> Vec<f32> {
+            v[k].as_array().map(|a| a.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect()).unwrap_or_default()
+        };
+        let toks = arr_u32("tokens");
+        assert_eq!(toks.len(), SEQ, "daemon label chunk len {} != SEQ {SEQ}", toks.len());
+        chunks.push(toks);
+        label_mid.push(arr_f32("mid_scores"));
+        base_shallow.push(arr_f32("shallow_scores"));
+    }
+    // embed sidecar: QEMB | u32 vocab | u32 dim | vocab*dim f32
+    let bytes = std::fs::read(format!("{jsonl}.embed.bin"))?;
+    if &bytes[0..4] != b"QEMB" {
+        return Err("daemon embed sidecar: bad magic".into());
+    }
+    let vocab = u32::from_le_bytes(bytes[4..8].try_into()?) as usize;
+    let dim = u32::from_le_bytes(bytes[8..12].try_into()?) as usize;
+    let data: Vec<f32> =
+        bytes[12..].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    assert_eq!(data.len(), vocab * dim, "embed sidecar size mismatch");
+    let embed = gpu.upload_f32(&data, &[vocab, dim])?;
+    println!("daemon labels: {} chunks, embed [{vocab}×{dim}]", chunks.len());
+    Ok((chunks, label_mid, base_shallow, embed, dim, vocab, 10000.0, 1e-5))
+}
+
 fn corpus_tokens(tok: &Tokenizer) -> Vec<u32> {
     let mut stack = vec![PathBuf::from("docs"), PathBuf::from("crates")];
     let mut text = String::new();
@@ -110,72 +153,91 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let last = SEQ - 1;
     println!("arch: {}  SEQ={SEQ} BLOCK={BLOCK} blocks={nb} train={N_TRAIN} eval={N_EVAL}", gpu.arch);
 
-    let dir = snapshot_dir(TARGET).ok_or("target not found")?;
-    let tok = Tokenizer::from_hf_json(&std::fs::read_to_string(dir.join("tokenizer.json"))?)
-        .map_err(|e| format!("tok: {e:?}"))?;
-    let toks = corpus_tokens(&tok);
-    let n_chunks = N_TRAIN + N_EVAL;
-    if toks.len() < n_chunks * SEQ {
-        return Err(format!("corpus too small: {} toks < {}", toks.len(), n_chunks * SEQ).into());
-    }
-    let mut chunks: Vec<Vec<u32>> =
-        (0..n_chunks).map(|i| toks[i * SEQ..(i + 1) * SEQ].to_vec()).collect();
     let pos: Vec<f32> = (0..SEQ).map(|t| t as f32).collect();
 
-    // ── P1: capture target mid-layer labels + shallow baseline per chunk ──────
-    let (cfg, w) = load_llama_fp32(&mut gpu, &dir)?;
-    let (n_kv_t, hd_t, h_t, vocab) =
-        (cfg.num_key_value_heads, cfg.head_dim, cfg.hidden_size, cfg.vocab_size);
-    let kvd_t = n_kv_t * hd_t;
-    let (rope_base, eps, n_layers) = (cfg.rope_theta, cfg.rms_norm_eps, cfg.num_hidden_layers);
-    let mid = n_layers / 2;
-    let mut target = LlamaModel::from_f32_weights(&mut gpu, &cfg, w, SEQ, 4, 8.0)?;
-    println!("target {TARGET}: h_t={h_t} layers={n_layers} mid=L{mid} vocab={vocab}");
-
-    // Geometry-only key (NOT corpus content): the cache stores its own chunks, so
-    // a HIT reuses the exact captured corpus regardless of live docs/+crates churn.
-    let key = {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        TARGET.hash(&mut h);
-        (SEQ, BLOCK, mid, n_chunks).hash(&mut h);
-        h.finish()
-    };
-    let scores_dev = gpu.zeros(&[nb], DType::F32)?;
-    let (label_mid, base_shallow) = if let Some((cached, lm, bs)) = load_labels(LABELS_PATH, key) {
-        println!("labels: cache HIT {LABELS_PATH} ({} chunks) — skipping 3B capture", lm.len());
-        chunks = cached; // use the exact corpus the labels were computed from
-        (lm, bs)
+    // ── Labels + shared embedding: daemon (REAL qwen3.5 target, teacher/student
+    // split) via HIPFIRE_PFLASH_DAEMON_LABELS=<jsonl>, else the loadable Llama
+    // stand-in target captured + cached locally. Both produce the same tuple. ──
+    #[allow(clippy::type_complexity)]
+    let (chunks, label_mid, base_shallow, embed, h_t, vocab, rope_base, eps): (
+        Vec<Vec<u32>>,
+        Vec<Vec<f32>>,
+        Vec<Vec<f32>>,
+        rdna_compute::GpuTensor,
+        usize,
+        usize,
+        f32,
+        f32,
+    ) = if let Ok(dlpath) = std::env::var("HIPFIRE_PFLASH_DAEMON_LABELS") {
+        println!("labels: daemon source {dlpath} (real qwen3.5 target)");
+        load_daemon_labels(&mut gpu, &dlpath)?
     } else {
-        let max_id = chunks.iter().flatten().copied().max().unwrap_or(0);
-        assert!((max_id as usize) < vocab, "token id {max_id} ≥ vocab {vocab} → OOB embedding read");
-        println!("labels: cache miss — capturing (mid-layer partial forward)…");
-        let mut label_mid: Vec<Vec<f32>> = Vec::new();
-        let mut base_shallow: Vec<Vec<f32>> = Vec::new();
-        for (ci, ids) in chunks.iter().enumerate() {
-            // partial forward to the mid layer only — skips the final norm + the
-            // huge [seq×vocab] logit GEMM that label capture doesn't need.
-            let acts = model_block_activations(&mut gpu, &target, ids, &pos, mid)?;
-            pflash_score_forward(&mut gpu, &acts[mid].k_r, &scores_dev, SEQ, kvd_t, BLOCK, nb, last)?;
-            label_mid.push(gpu.download_f32(&scores_dev)?);
-            pflash_score_forward(&mut gpu, &acts[SHALLOW].k_r, &scores_dev, SEQ, kvd_t, BLOCK, nb, last)?;
-            base_shallow.push(gpu.download_f32(&scores_dev)?);
-            for b in acts {
-                free_block_acts(&mut gpu, b)?;
-            }
-            eprintln!("  captured labels {}/{}", ci + 1, n_chunks);
+        let dir = snapshot_dir(TARGET).ok_or("target not found")?;
+        let tok = Tokenizer::from_hf_json(&std::fs::read_to_string(dir.join("tokenizer.json"))?)
+            .map_err(|e| format!("tok: {e:?}"))?;
+        let toks = corpus_tokens(&tok);
+        let nc = N_TRAIN + N_EVAL;
+        if toks.len() < nc * SEQ {
+            return Err(format!("corpus too small: {} toks < {}", toks.len(), nc * SEQ).into());
         }
-        save_labels(LABELS_PATH, key, &chunks, &label_mid, &base_shallow)
-            .map_err(|e| format!("save_labels: {e}"))?;
-        println!("labels: cached → {LABELS_PATH}");
-        (label_mid, base_shallow)
+        let mut chunks: Vec<Vec<u32>> =
+            (0..nc).map(|i| toks[i * SEQ..(i + 1) * SEQ].to_vec()).collect();
+        let (cfg, w) = load_llama_fp32(&mut gpu, &dir)?;
+        let (n_kv_t, hd_t, h_t, vocab) =
+            (cfg.num_key_value_heads, cfg.head_dim, cfg.hidden_size, cfg.vocab_size);
+        let kvd_t = n_kv_t * hd_t;
+        let (rope_base, eps, n_layers) = (cfg.rope_theta, cfg.rms_norm_eps, cfg.num_hidden_layers);
+        let mid = n_layers / 2;
+        let mut target = LlamaModel::from_f32_weights(&mut gpu, &cfg, w, SEQ, 4, 8.0)?;
+        println!("target {TARGET}: h_t={h_t} layers={n_layers} mid=L{mid} vocab={vocab}");
+        let key = {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            TARGET.hash(&mut h);
+            (SEQ, BLOCK, mid, nc).hash(&mut h);
+            h.finish()
+        };
+        let sc = gpu.zeros(&[nb], DType::F32)?;
+        let (label_mid, base_shallow) = if let Some((cached, lm, bs)) = load_labels(LABELS_PATH, key) {
+            println!("labels: cache HIT {LABELS_PATH} ({} chunks)", lm.len());
+            chunks = cached;
+            (lm, bs)
+        } else {
+            let max_id = chunks.iter().flatten().copied().max().unwrap_or(0);
+            assert!((max_id as usize) < vocab, "token id {max_id} ≥ vocab {vocab}");
+            println!("labels: cache miss — capturing (mid-layer partial forward)…");
+            let mut label_mid: Vec<Vec<f32>> = Vec::new();
+            let mut base_shallow: Vec<Vec<f32>> = Vec::new();
+            for (ci, ids) in chunks.iter().enumerate() {
+                let acts = model_block_activations(&mut gpu, &target, ids, &pos, mid)?;
+                pflash_score_forward(&mut gpu, &acts[mid].k_r, &sc, SEQ, kvd_t, BLOCK, nb, last)?;
+                label_mid.push(gpu.download_f32(&sc)?);
+                pflash_score_forward(&mut gpu, &acts[SHALLOW].k_r, &sc, SEQ, kvd_t, BLOCK, nb, last)?;
+                base_shallow.push(gpu.download_f32(&sc)?);
+                for b in acts {
+                    free_block_acts(&mut gpu, b)?;
+                }
+                eprintln!("  captured labels {}/{}", ci + 1, nc);
+            }
+            save_labels(LABELS_PATH, key, &chunks, &label_mid, &base_shallow)
+                .map_err(|e| format!("save_labels: {e}"))?;
+            (label_mid, base_shallow)
+        };
+        let _ = gpu.free_tensor(sc);
+        let embed = std::mem::replace(&mut target.embed, gpu.zeros(&[1], DType::F32)?);
+        (chunks, label_mid, base_shallow, embed, h_t, vocab, rope_base, eps)
     };
+
+    let n_chunks = chunks.len();
+    assert!(
+        n_chunks == N_TRAIN + N_EVAL,
+        "expected {} chunks, got {n_chunks}",
+        N_TRAIN + N_EVAL
+    );
+    let scores_dev = gpu.zeros(&[nb], DType::F32)?;
     // shallow baseline vs mid label (the bar to beat), eval split
     let bar: f32 = (N_TRAIN..n_chunks)
         .map(|i| spearman(&base_shallow[i], &label_mid[i]))
         .sum::<f32>() / N_EVAL as f32;
-
-    // move the embedding into the drafter (target not used again)
-    let embed = std::mem::replace(&mut target.embed, gpu.zeros(&[1], DType::F32)?);
 
     // ── P2/P3: drafter + training ─────────────────────────────────────────────
     let dcfg = DrafterConfig::tiny(rope_base, eps);

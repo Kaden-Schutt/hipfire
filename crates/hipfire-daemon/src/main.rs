@@ -9714,19 +9714,37 @@ fn main() {
                 }
                 use std::io::Write as _;
                 let _ = out_file.flush();
-                if !failed {
-                    let resp = serde_json::json!({
-                        "type": "pflash_labels",
-                        "output": output,
-                        "n_chunks": n_chunks,
-                        "seq": seq,
-                        "block": block,
-                        "shallow_layer": shallow,
-                        "mid_layer": mid,
-                    });
-                    let _ = writeln!(stdout, "{resp}");
-                    let _ = stdout.flush();
+                if failed {
+                    continue;
                 }
+                // Dump the shared fp32 embedding once (the drafter shares it RO).
+                let embed_path = format!("{output}.embed.bin");
+                let embed_dims = match qwen35::dump_embed_fp32(
+                    &mut gpu,
+                    weights,
+                    config,
+                    std::path::Path::new(&embed_path),
+                ) {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        emit_error_with_id(&mut stdout, "", format!("pflash_labels: embed: {e}"));
+                        None
+                    }
+                };
+                let resp = serde_json::json!({
+                    "type": "pflash_labels",
+                    "output": output,
+                    "embed": embed_dims.map(|_| embed_path.clone()),
+                    "embed_vocab": embed_dims.map(|(v, _)| v),
+                    "embed_dim": embed_dims.map(|(_, d)| d),
+                    "n_chunks": n_chunks,
+                    "seq": seq,
+                    "block": block,
+                    "shallow_layer": shallow,
+                    "mid_layer": mid,
+                });
+                let _ = writeln!(stdout, "{resp}");
+                let _ = stdout.flush();
             }
 
             "diag" => {

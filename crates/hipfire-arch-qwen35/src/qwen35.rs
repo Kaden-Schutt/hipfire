@@ -4667,6 +4667,44 @@ pub fn capture_pflash_block_scores(
     Ok(out)
 }
 
+/// Write the target's token embedding as an fp32 sidecar for the PFlash drafter,
+/// which shares it read-only (teacher/student split). Format: magic `QEMB`, u32
+/// vocab, u32 dim (little-endian), then vocab*dim little-endian f32 rows. Only F32
+/// embeddings are supported (the bf16/unquantized teacher path uploads token_embd
+/// as F32); quantized embeddings would need a per-format dequant first.
+pub fn dump_embed_fp32(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    path: &std::path::Path,
+) -> HipResult<(usize, usize)> {
+    use std::io::Write;
+    if !matches!(weights.embd_format, EmbeddingFormat::F32) {
+        return Err(rdna_compute::HipError {
+            code: u32::MAX,
+            message: format!(
+                "dump_embed_fp32: embedding is {:?}, only F32 supported (load the bf16/unquantized target)",
+                weights.embd_format
+            ),
+        });
+    }
+    let (vocab, dim) = (config.vocab_size, config.dim);
+    let data = gpu.download_f32(&weights.token_embd)?;
+    assert_eq!(data.len(), vocab * dim, "dump_embed_fp32: embed size mismatch");
+    let io_err = |e: std::io::Error| rdna_compute::HipError {
+        code: u32::MAX,
+        message: format!("dump_embed_fp32 io: {e}"),
+    };
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path).map_err(io_err)?);
+    f.write_all(b"QEMB").map_err(io_err)?;
+    f.write_all(&(vocab as u32).to_le_bytes()).map_err(io_err)?;
+    f.write_all(&(dim as u32).to_le_bytes()).map_err(io_err)?;
+    let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+    f.write_all(bytes).map_err(io_err)?;
+    f.flush().map_err(io_err)?;
+    Ok((vocab, dim))
+}
+
 /// Single-load calibration driver: arm the [`CalibCollector`] on the resident
 /// weights, run the engine forward over `tokens` (capturing per-tensor Hessian +
 /// imatrix, the MoE router histogram for MoE models, and optionally KLDREF), and
