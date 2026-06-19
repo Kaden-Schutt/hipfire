@@ -111,6 +111,8 @@ VARIANT=tile6_lds_preloop_load_then_store_dynamiccols_load4_consume4_pinned MODE
 VARIANT=tile6_lds_store_then_load_dynamiccols_load4_nextrow_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-nextrow-consume4-pinned-780m
 VARIANT=tile6_lds_store_then_rowload_then_extra_load4_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-postrow-extra-consume4-pinned-780m
 VARIANT=tile6_lds_store_then_rowload_barrier_noextra_load4_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-postrow-barrier-noextra-consume4-pinned-780m
+VARIANT=tile6_lds_single_store_rowload_barrier_noextra_load4_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-single-store-postrow-barrier-noextra-consume4-pinned-780m
+VARIANT=tile6_lds_store_then_rowload_barrier_noextra_load3_consume3_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-postrow-barrier-noextra-consume3-pinned-780m
 VARIANT=tile6_lds_store_then_load_dynamiccols_load4_separate_tile_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-separate-tile-consume4-pinned-780m
 ```
 
@@ -559,6 +561,17 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
     smoke passed afterward. This shows the extra ordinary LDS load is not the
     only fail-side post-consumption operation; an additional post-row barrier
     epoch can substitute under the stress envelope.
+  - The single-store no-extra double-barrier control
+    `tile6_lds_single_store_rowload_barrier_noextra_load4_consume4_pinned`
+    passed 100 launches with the same `144`, `sgpr_count=5`,
+    `vgpr_count=10` tuple as the failing two-store double-barrier control.
+    This keeps the second per-K LDS store as a required component for the
+    double-barrier branch, not only for the extra-load branch.
+  - The two-store no-extra double-barrier three-load control
+    `tile6_lds_store_then_rowload_barrier_noextra_load3_consume3_pinned`
+    passed 100 launches with `144`, `sgpr_count=5`, and `vgpr_count=9`.
+    This keeps the row-load width boundary at four dynamic row loads for the
+    double-barrier branch.
   - The cross-row load split `tile6_lds_store_then_load_nextrow_read6` also
     failed under the 100-launch stress envelope, at sync 88. Clean follow-up
     runs passed at `N_LAUNCH=1` and `N_LAUNCH=2`, so treat the earlier
@@ -621,7 +634,9 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   four dynamic row LDS loads separated by explicit waits with interleaved
   consumes, and either additional same-loop LDS activity or an additional
   post-consumption synchronization epoch, with repeated launch/process state
-  acting as the stress amplifier.
+  acting as the stress amplifier. Removing the second store or reducing the
+  row-load width from four to three keeps the no-extra double-barrier shape
+  pass-side.
   Same-row and same-tile membership are no longer required by the current
   evidence, and neither extra-load-before-second-store nor extra-load-after-row
   ordering prevents the failure, though the separate-tile and preloop controls
@@ -702,8 +717,12 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   fail-side. The no-extra double-barrier control fails at sync 94 with the
   same `144`, `sgpr_count=5`, and `vgpr_count=10` tuple, showing the tuple is
   still pass-side in the one-closing-barrier no-extra control but fail-side
-  when a second closing barrier is added after row consumption. The cross-row
-  load split
+  when a second closing barrier is added after row consumption. The matching
+  single-store double-barrier control passes with the same `144`,
+  `sgpr_count=5`, and `vgpr_count=10` tuple, and the two-store three-load
+  double-barrier control passes with `144`, `sgpr_count=5`, and
+  `vgpr_count=9`; together they keep the second-store and four-row-load
+  thresholds intact for the double-barrier branch. The cross-row load split
   uses `144`, `sgpr_count=5`, and `vgpr_count=13`, and rules out same-row
   membership as a required trigger component. The separate-tile load split uses
   `288`,
@@ -966,6 +985,16 @@ Latest artifact paths:
   recovery smoke passed. A post-barrier extra-load variant was built and
   one-launch smoked in the throwaway worktree, but its stress result is not
   useful until the no-extra double-barrier failure is understood.
+- `/tmp/hipfire-lds-barrier-width-store-runs/`: double-barrier pass-side
+  store-count and width controls. Throwaway
+  `tile6_lds_single_store_rowload_barrier_noextra_load4_consume4_pinned`
+  passed 100 launches. ISA emits one `ds_store_b32`, four waited row loads,
+  then two closing barriers; metadata is `group_segment_fixed_size=144`,
+  `sgpr_count=5`, `vgpr_count=10`, and no spills. Throwaway
+  `tile6_lds_store_then_rowload_barrier_noextra_load3_consume3_pinned`
+  also passed 100 launches. ISA emits two `ds_store_b32` phases, three waited
+  row loads, then two closing barriers; metadata is `group_segment_fixed_size=144`,
+  `sgpr_count=5`, `vgpr_count=9`, and no spills.
 - `/tmp/hipfire-lds-crossrow-runs/`: cross-row extra-load controls. The first
   two-launch run failed adjacent to prior reset pressure, but a recovery
   `tile6_lds_second_store_only_read6` control passed, then clean
