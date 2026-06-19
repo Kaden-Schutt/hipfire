@@ -42,8 +42,8 @@ const TARGET: &str = "models--meta-llama--Llama-3.2-3B-Instruct";
 const SEQ: usize = 512;
 const BLOCK: usize = 64;
 const SHALLOW: usize = 1;
-const N_TRAIN: usize = 12;
-const N_EVAL: usize = 4;
+const N_TRAIN: usize = 32;
+const N_EVAL: usize = 8;
 const EPOCHS: usize = 300;
 const TAU: f32 = 0.1;
 
