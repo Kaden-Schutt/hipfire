@@ -21,6 +21,7 @@ pub mod ops;
 pub mod optim;
 pub mod qtip_quant;
 pub mod ssm_block;
+pub mod ssm_drafter;
 pub mod tensor;
 
 pub use config::LlamaConfig;
