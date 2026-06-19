@@ -161,3 +161,21 @@ shallow bar.
 unchanged): (a) capacity scale (more layers / wider h — env `HIPFIRE_SSM_{LAYERS,H}`);
 (b) add a conv1d short causal conv before the gate (Mamba selective short-conv);
 (c) add the delta rule (matrix state) → full gated-delta-net matching the target.
+
+### Capacity ablation — NEGATIVE (don't scale params): 2026-06-19
+
+Scaled the GLA-lite drafter 3L/h512/7.74M → 5L/h768/21.6M, same labels/loop:
+
+| config | params | best eval | end eval | signature |
+|--------|--------|-----------|----------|-----------|
+| 3L h512 | 7.74M | **+0.554** @ ep240 | +0.455 | mild late decay |
+| 5L h768 | 21.6M | +0.375 @ ep75 | +0.312 | **eval COLLAPSES** ep90+ (→+0.23) while train_loss keeps falling |
+
+The big model overfits hard — train_loss 1.87→1.67 monotone while eval crashes.
+With only **32 training chunks**, 21.6M params is far past the data budget; the
+7.74M model won *because* it can't overfit. **Conclusion: capacity is NOT the
+bottleneck.** The remaining gap to +0.702 must close via (a) more DATA (recapture
+more daemon chunks) and/or (b) ARCHITECTURE that shares more of the gated-delta-net
+target's structure at small param count — conv1d short-conv, then the delta rule —
+NOT more parameters. Next rung: tiny conv1d short causal conv before the gate
+(Mamba selectivity), kept at ~7-10M params.
