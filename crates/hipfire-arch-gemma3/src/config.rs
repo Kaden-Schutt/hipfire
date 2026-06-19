@@ -47,6 +47,10 @@ pub struct Gemma3Config {
     /// the forward applies no further offset because it is already in the
     /// stored weights.
     pub gemma_norm_offset: f32,
+    /// Generation stop token. Gemma3-it ends a turn with `<end_of_turn>` (106),
+    /// not the base `<eos>` (1); config.json may give either a scalar or a
+    /// `[1, 106]` array. The serving seam stops on this id.
+    pub eos_token_id: u32,
 }
 
 impl Gemma3Config {
@@ -163,6 +167,22 @@ pub fn config_from_metadata_json(metadata_json: &str) -> Option<Gemma3Config> {
         .get("gemma_norm_offset")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0) as f32;
+    // Gemma3-it turn-ender is `<end_of_turn>` (106). config.json `eos_token_id`
+    // can be a scalar (`1`) or an array (`[1, 106]`); when an array, prefer the
+    // turn-ender (106) so chat generation actually stops, else take the first.
+    let eos_token_id = tc
+        .get("eos_token_id")
+        .and_then(|v| match v {
+            serde_json::Value::Array(a) => {
+                let ids: Vec<u64> = a.iter().filter_map(|x| x.as_u64()).collect();
+                ids.iter()
+                    .copied()
+                    .find(|&id| id == 106)
+                    .or_else(|| ids.first().copied())
+            }
+            other => other.as_u64(),
+        })
+        .unwrap_or(106) as u32;
 
     Some(Gemma3Config {
         hidden_size,
@@ -182,6 +202,7 @@ pub fn config_from_metadata_json(metadata_json: &str) -> Option<Gemma3Config> {
         hidden_activation,
         tie_word_embeddings,
         gemma_norm_offset,
+        eos_token_id,
     })
 }
 
@@ -211,7 +232,8 @@ mod tests {
                 "sliding_window_pattern": 6,
                 "query_pre_attn_scalar": 168,
                 "hidden_activation": "gelu_pytorch_tanh",
-                "max_position_embeddings": 131072
+                "max_position_embeddings": 131072,
+                "eos_token_id": [1, 106]
             }
         })
         .to_string()
@@ -231,6 +253,20 @@ mod tests {
         assert_eq!(cfg.query_pre_attn_scalar, 168.0);
         assert_eq!(cfg.hidden_activation, "gelu_pytorch_tanh");
         assert_eq!(cfg.gemma_norm_offset, 1.0);
+        // `[1, 106]` → prefer the `<end_of_turn>` turn-ender so chat stops.
+        assert_eq!(cfg.eos_token_id, 106);
+    }
+
+    #[test]
+    fn eos_defaults_to_end_of_turn_when_absent() {
+        let meta = serde_json::json!({
+            "architecture": "gemma3_text",
+            "config": { "hidden_size": 8, "num_hidden_layers": 1,
+                "num_attention_heads": 2, "intermediate_size": 16, "vocab_size": 32 }
+        })
+        .to_string();
+        let cfg = config_from_metadata_json(&meta).unwrap();
+        assert_eq!(cfg.eos_token_id, 106);
     }
 
     #[test]

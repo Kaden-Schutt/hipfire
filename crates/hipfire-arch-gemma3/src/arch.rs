@@ -5,8 +5,12 @@
 //! `Gemma3Backend: SimpleAr` serving impl (the dense-AR output strategy seed
 //! for E2's `ServingBackend` seam). Mirrors `hipfire-arch-qwen2::arch`.
 
-use hipfire_runtime::arch::{Architecture, EosFilterOverrides, PromptFrameOverrides, SimpleAr};
+use hipfire_runtime::arch::{
+    run_simple_ar, ArchCaps, Architecture, EosFilterOverrides, GenerateCtx, PromptFrameOverrides,
+    ServeOutcome, ServingBackend, SimpleAr,
+};
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::{Gpu, GpuTensor};
 
 use crate::config::Gemma3Config;
@@ -119,6 +123,47 @@ impl SimpleAr for Gemma3Backend {
 
     fn vocab_size(&self) -> usize {
         self.config.vocab_size
+    }
+}
+
+/// Gemma3 text is a plain dense-AR family (sliding-window + global attention is
+/// internal to `forward_step`): its `ServingBackend` advertises no fast-path
+/// caps and delegates the loop to the shared [`run_simple_ar`]. The vision tower
+/// (arch_id 13) overrides `serve` for the image-token splice; this text path is
+/// the splice-free base.
+impl ServingBackend for Gemma3Backend {
+    fn arch_id(&self) -> u32 {
+        12
+    }
+
+    fn caps(&self) -> ArchCaps {
+        ArchCaps::default()
+    }
+
+    fn eos_token(&self) -> u32 {
+        self.config.eos_token_id
+    }
+
+    fn serve(
+        &mut self,
+        gpu: &mut Gpu,
+        tok: &Tokenizer,
+        ctx: &mut GenerateCtx,
+    ) -> Result<ServeOutcome, String> {
+        let eos = self.config.eos_token_id;
+        run_simple_ar(gpu, self, tok, eos, ctx)
+    }
+
+    fn reset_session(&mut self, _gpu: &mut Gpu, _session_id: &str) -> Result<(), String> {
+        // Single-session bring-up: rewind the KV cursor (O(1); slots overwrite).
+        self.state.reset();
+        Ok(())
+    }
+
+    fn unload(self: Box<Self>, gpu: &mut Gpu) {
+        let b = *self;
+        b.weights.free_gpu(gpu);
+        b.state.free_gpu(gpu);
     }
 }
 
