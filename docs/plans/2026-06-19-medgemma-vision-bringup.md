@@ -87,3 +87,35 @@ Projector: avg-pool (small new kernel or strided-average via existing ops),
   confirm it's non-causal and scale = 1/√head_dim (head_dim = 1152/16 = 72).
 - **Image token count**: prompt must reserve exactly 256 placeholders per image
   between boi/eoi; tokenizer/templating must match.
+
+## V5 COMPLETE — multimodal pipeline validated (2026-06-19)
+
+medgemma-1.5-4b-it (multimodal, arch_id 13, q8f16 text + BF16 vision/projector,
+5.0 GB) decoded the brain-MRI fixture correctly via `infer_gemma3_vl`:
+
+> "This is a brain MRI scan. The image shows the brain structure. There are
+> several structures visible, including the cerebrum (the largest part of the
+> brain), cerebellum, brainstem, and possibly parts of the skull. The image is
+> in grayscale, which is typical for MRI scans…"
+
+273-token prefill (256 image rows spliced), clean greedy decode, ec=0. The whole
+multimodal path is numerically correct: SigLIP encoder (patch-embed → learned
+pos → 27 ViT layers → post_ln) → projector (avg-pool 4096→256 → mm_soft_emb_norm
+→ mm_input_projection) → image-token splice (`forward_step_with_embed`) → gemma3
+text decoder, plus im2col preproc and the arch-13 multimodal ingest.
+
+Two bugs found+fixed during bring-up:
+1. Ingest dropped the vision tower (default `--include-vision` opt-in) →
+   arch_id 13 now auto-includes it (`fix(quantize)`).
+2. Vision/projector loaders used `tensor_data` (mmap) which returns None on the
+   UMA APU (mmap dropped) → switched to `tensor_data_vec` (pread)
+   (`fix(gemma3-vl)`).
+
+Landed (pushed): SigLipConfig/Gemma3VlConfig, SigLIP weights+forward, projector,
+multimodal loader bundle, image preproc, forward_step_with_embed splice, the
+infer_gemma3_vl harness, arch-13 ingest, and both fixes.
+
+**Follow-ups (not blocking):** GPU avg-pool (currently host-side), medgemma-27b-it,
+daemon wiring (arch_id 13 ServingBackend), pan-and-scan for large images, and the
+prompt-frame specials check (the manual `<bos>`/turn-token construction in the
+example should move to the proper gemma chat template when daemon-wired).
