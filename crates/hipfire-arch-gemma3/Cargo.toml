@@ -1,0 +1,20 @@
+[package]
+name = "hipfire-arch-gemma3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Gemma3 text decoder (GQA + per-head QK-norm + 4 norms/layer + GeGLU + dual-theta sliding-window attention). arch_id=12."
+
+# Bring-up status: Phase 1.1 — Gemma3Config + config_from_hfq landed and
+# unit-tested. load_weights / forward (4-norm residual, embed scale, custom
+# attn scale, dual-theta SWA interleave, fused gelu_mul) + Architecture/SimpleAr
+# impls are the remaining Phase 1 work. The quantizer ingest (arch_id 12 + the
+# (1+w) RMSNorm baking) ships separately. Target: medgemma-27b-text-it.
+# See docs/plans/2026-06-19-gemma3-bringup.md.
+
+[dependencies]
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-dispatch = { path = "../hipfire-dispatch" }
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }
+serde_json = "1"
