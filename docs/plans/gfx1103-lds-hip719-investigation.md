@@ -126,7 +126,9 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 | Standalone GEMM synthetic `TILE=6`, M=512, K=2048, N=2496 | PASS | Grid around 416x86 blocks. |
 | Standalone GEMM synthetic `TILE=6`, M=512, K=2048, N=2688 | FAIL | Grid around 448x86 blocks; same MES/GDS fault state. |
 | Standalone GEMM synthetic `TILE=6`, M=512, N=2688, K=2048, 90 launches | PASS | Same reduced no-global/no-store kernel; launch-count threshold control. |
-| Standalone GEMM synthetic `TILE=6`, M=512, N=2688, K=2048, 95 launches | FAIL | Fails at sync 94; reproduced again at 100 launches. |
+| Standalone GEMM synthetic `TILE=6`, M=512, N=2688, K=2048, 95 launches | MIXED | Earlier launch-repeat artifact failed at sync 94; fresh launch-bisect artifact passed. |
+| Standalone GEMM synthetic `TILE=6`, M=512, N=2688, K=2048, 96 launches | FAIL | Fresh launch-bisect artifact failed at sync 93 after a reset. |
+| Standalone GEMM synthetic `TILE=6`, M=512, N=2688, K=2048, 100 launches | FAIL | Fresh launch-bisect artifact failed at sync 95. |
 | Standalone GEMM synthetic `TILE=6`, M=512, N=2880, K=2048 | FAIL | 100-launch shape repeat failed at sync 87. |
 | Standalone GEMM synthetic `TILE=6`, M=512, N=3072, K=2048 | FAIL | 100-launch shape repeat failed at sync 81. |
 
@@ -159,6 +161,10 @@ Latest artifact paths:
 - `/tmp/hipfire-lds-gemm-launch-repeat-artifacts/`: preserved launch-count
   repeat at M=512, N=2688, K_LIMIT=2048. 80, 85, and 90 launches pass; 95 and
   100 launches both fail at sync 94.
+- `/tmp/hipfire-lds-gemm-launch-bisect-artifacts/`: fresh launch-count edge
+  check at the same shape. 91, 92, 93, 94, and 95 launches pass; 96 launches
+  fails at sync 93 and 100 launches fails at sync 95. The 96-launch artifact
+  includes a manually copied `devcoredump.data` sample via passwordless sudo.
 - `/tmp/hipfire-lds-standalone-long-artifacts/`: passing long-loop LDS-only
   control, including `TILE=6`, 512 iterations, 100 launches at 64x64 grid.
 
@@ -280,13 +286,28 @@ Reduction results after extending the standalone HIP GEMM probe:
 - `tile6_synth` at M=512, K_LIMIT=2048 passed up to N=2496 and failed at
   N=2688, 2880, and 3072. This points at total grid/work duration as part of
   the trigger.
-- Preserved repeat runs sharpen that into a cumulative launch/work threshold.
-  For M=512, N=2688, K_LIMIT=2048, the reduced synthetic kernel passes at 80,
-  85, and 90 launches, then fails at sync 94 when asked for 95 or 100 launches.
-  Holding launch count at 100, larger N moves failure earlier: N=2688 fails at
-  sync 95, N=2880 at sync 87, and N=3072 at sync 81.
+- Preserved repeat runs sharpen that into a cumulative launch/work threshold,
+  but not an exact deterministic launch counter. For M=512, N=2688,
+  K_LIMIT=2048, one artifact family passes at 80, 85, and 90 launches, then
+  fails at sync 94 when asked for 95 or 100 launches. A fresh bisect artifact
+  family passes at 91, 92, 93, 94, and 95 launches, then fails at sync 93 for
+  96 launches and sync 95 for 100 launches. Treat the edge as a narrow,
+  reset/state-sensitive band around roughly launches 94-96. Holding launch
+  count at 100, larger N still moves failure earlier: N=2688 fails around sync
+  81-95 across repeats, N=2880 at sync 87, and N=3072 at sync 81.
 
 The synthetic failure coredump again reports:
+
+```text
+[gfxhub] Page fault observed
+Faulty page starting at address: 0x000074669d000000
+Protection fault status register: 0x841051
+regGDS_PROTECTION_FAULT                             0x3f000007
+regGDS_VM_PROTECTION_FAULT                          0x0fc00113
+```
+
+The fresh launch-bisect coredump copied from the 96-launch failure reports the
+same low-level signature:
 
 ```text
 [gfxhub] Page fault observed
@@ -357,7 +378,8 @@ Best current hypothesis:
 > remains `TILE=5` (25 active lanes, pass) vs `TILE=6` (36 active lanes, fail).
 > A no-global, no-store, compile-time synthetic GEMM-shaped kernel still
 > reproduces HIP 719 and the same MES/GDS coredump state, but only when K-loop
-> work, grid size, and repeated launches cross a threshold.
+> work, grid size, and repeated launches cross a narrow, reset-sensitive
+> threshold band.
 
 ## Next Evidence To Capture
 
@@ -378,8 +400,9 @@ control):
   runtime-generated `.hsaco`; the active4 control passed but did not leave a
   `.hsaco` under the expected cache name in the latest run.
 - reduce the standalone HIP synthetic reproducer further: binary-search the
-  90-95 launch-count edge at N=2688, the N=2496-2688 grid edge at 100
-  launches, and the K_LIMIT=1536-2048 edge independently.
+  launch-count edge around 94-96 at N=2688 with repeated fresh-process trials,
+  the N=2496-2688 grid edge at 100 launches, and the K_LIMIT=1536-2048 edge
+  independently.
 - create a single-instantiation compile unit for the failing synthetic symbol
   and the passing long-loop symbol so instruction counts can be per-symbol
   instead of object-aggregate.
