@@ -41,6 +41,8 @@ pub(crate) enum Eviction {
 }
 
 impl Eviction {
+    /// Run one eviction pass when the physical KV occupancy warrants it,
+    /// dispatching to the active policy; `Ok(None)` when nothing was evicted.
     pub(crate) fn maybe_evict(
         &self,
         gpu: &mut rdna_compute::Gpu,
@@ -52,18 +54,21 @@ impl Eviction {
             Eviction::Cask(c) => c.maybe_evict(gpu, kv, physical),
         }
     }
+    /// Protected-core budget (slots kept before eviction begins).
     pub(crate) fn budget(&self) -> usize {
         match self {
             Eviction::Plain(c) => c.budget,
             Eviction::Cask(c) => c.base.budget,
         }
     }
+    /// Recency window (`beta`) preserved alongside the budget.
     pub(crate) fn beta(&self) -> usize {
         match self {
             Eviction::Plain(c) => c.beta,
             Eviction::Cask(c) => c.base.beta,
         }
     }
+    /// Release the policy's GPU-side scratch on unload.
     pub(crate) fn free_gpu(self, gpu: &mut rdna_compute::Gpu) {
         match self {
             Eviction::Plain(c) => c.free_gpu(gpu),
@@ -145,6 +150,12 @@ pub(crate) fn effective_raw(m: &LoadedModel) -> bool {
         .unwrap_or(m.chat_template.is_none())
 }
 
+/// Everything resident for the currently-loaded model: an `arch_id` tag plus the
+/// per-family typed config/weights/state behind `Option` fields (only the active
+/// arch's are `Some`), the KV cache + eviction policy, multi-turn conversation
+/// bookkeeping, and the optional DFlash/vision/chat-template side state. The
+/// request loop drives whichever arch is populated. The E2 `ServingBackend` seam
+/// will eventually collapse this Option-soup into one boxed backend.
 pub(crate) struct LoadedModel {
     pub(crate) arch_id: u32,
     /// Pipeline-parallel degree. 1 = single-GPU (all existing fields below in

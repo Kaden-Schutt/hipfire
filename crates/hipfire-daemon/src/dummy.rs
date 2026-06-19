@@ -13,16 +13,21 @@ use std::time::Instant;
 
 use hipfire_generate::{GenerateBatchPrefillEnvelope, GenerateBatchPrefillSession};
 
+/// GPU-free stand-in model: per-session token counters keyed by session id. Used
+/// by tests and the batch-prefill harness to drive the daemon protocol end to
+/// end without loading weights. Emits synthetic `dummy:N` tokens.
 #[derive(Default)]
 pub(crate) struct DummyModelState {
     pub(crate) sessions: HashMap<String, usize>,
 }
 
 impl DummyModelState {
+    /// Drop all per-session counters (cold start).
     pub(crate) fn reset(&mut self) {
         self.sessions.clear();
     }
 
+    /// Forget the given sessions; returns how many were actually present.
     pub(crate) fn release_sessions(&mut self, sessions: &[String]) -> usize {
         sessions
             .iter()
@@ -30,10 +35,12 @@ impl DummyModelState {
             .count()
     }
 
+    /// Number of resident sessions.
     pub(crate) fn session_count(&self) -> usize {
         self.sessions.len()
     }
 
+    /// Whitespace-word count — the dummy's stand-in for real tokenization.
     fn prompt_token_count(text: &str) -> usize {
         text.trim()
             .split_whitespace()
@@ -41,6 +48,8 @@ impl DummyModelState {
             .count()
     }
 
+    /// Advance a session's counter by its prompt/suffix token count (seeding the
+    /// counter from `logical_position` on first sight); returns tokens consumed.
     pub(crate) fn consume_prefill_session(
         &mut self,
         session: &GenerateBatchPrefillSession,
@@ -65,6 +74,9 @@ impl DummyModelState {
         consumed
     }
 
+    /// Stream `max_tokens` synthetic `dummy:N` token events then a `done`
+    /// envelope, mirroring the real generate protocol (with an optional
+    /// configurable delay) so clients can be exercised GPU-free.
     pub(crate) fn generate(
         &mut self,
         stdout: &mut std::io::Stdout,
@@ -114,6 +126,8 @@ impl DummyModelState {
     }
 }
 
+/// Optional synthetic prefill delay (`HIPFIRE_DUMMY_PREFILL_DELAY_MS`, clamped
+/// 0–5000) for exercising client timeout/latency handling.
 fn dummy_prefill_delay_ms() -> u64 {
     std::env::var("HIPFIRE_DUMMY_PREFILL_DELAY_MS")
         .ok()
@@ -122,6 +136,9 @@ fn dummy_prefill_delay_ms() -> u64 {
         .clamp(0, 5000) as u64
 }
 
+/// Optional pseudo-random per-generate delay in `0..=max` ms, where `max` is
+/// `HIPFIRE_DUMMY_GENERATE_DELAY_MS` (default 8, clamped 0–250). The jitter comes
+/// from the wall clock, giving non-uniform timings for client stress tests.
 fn dummy_generate_delay_ms() -> u64 {
     let max_ms = std::env::var("HIPFIRE_DUMMY_GENERATE_DELAY_MS")
         .ok()
@@ -138,6 +155,8 @@ fn dummy_generate_delay_ms() -> u64 {
     nanos % (max_ms + 1)
 }
 
+/// Emit the `generate_batch_prefill_ready` capability envelope advertising the
+/// dummy backend can serve a batch-prefill request.
 pub(crate) fn emit_dummy_generate_batch_prefill_ready(
     stdout: &mut std::io::Stdout,
     envelope: &GenerateBatchPrefillEnvelope,
@@ -157,6 +176,9 @@ pub(crate) fn emit_dummy_generate_batch_prefill_ready(
     let _ = stdout.flush();
 }
 
+/// Run a dummy batch prefill: emit `started`, consume each session's tokens into
+/// its counter emitting a per-session `done`, then a batch `done` — the full
+/// protocol shape the real backends produce, GPU-free.
 pub(crate) fn run_generate_batch_prefill_dummy(
     dummy: &mut DummyModelState,
     stdout: &mut std::io::Stdout,

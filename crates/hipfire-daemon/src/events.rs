@@ -17,6 +17,9 @@ use hipfire_generate::eos_filter::FilterAction;
 /// IPC. ~40 MB encoded → ~30 MB raw image bytes (4/3 expansion).
 pub(crate) const MAX_BASE64_ENCODED_LEN: usize = 40 * 1024 * 1024;
 
+/// Emit an id-tagged `{"type":"error","id","message"}` line and flush. Use this
+/// (not raw `writeln!`) so a user-controlled `id`/message can't desync the JSONL
+/// protocol via an embedded `"`, `\`, or newline.
 pub(crate) fn emit_error_with_id(
     stdout: &mut std::io::Stdout,
     id: &str,
@@ -31,8 +34,9 @@ pub(crate) fn emit_error_with_id(
     let _ = stdout.flush();
 }
 
-// Symmetric id-less variant of `emit_error_with_id`. Currently has no caller
-// (pre-existing dead code, relocated as-is); kept for protocol completeness.
+/// Id-less variant of [`emit_error_with_id`] — emits `{"type":"error","message"}`.
+/// Currently has no caller (pre-existing dead code, relocated as-is); kept for
+/// protocol completeness.
 #[allow(dead_code)]
 pub(crate) fn emit_error_no_id(stdout: &mut std::io::Stdout, message: impl std::fmt::Display) {
     let envelope = serde_json::json!({
@@ -93,6 +97,11 @@ pub(crate) fn emit_stream_event(
     let _ = writeln!(stdout, "{}", envelope);
 }
 
+/// Emit a probe-only `{"type":"committed",id,tok_id,pos,t_ms}` event for every
+/// committed token — a parallel raw-token-id stream alongside the text `token`
+/// events. Gated on `HIPFIRE_EMIT_TOKEN_IDS=1` (read once); a no-op otherwise, so
+/// existing JSONL clients see no change. The probe binary sets the env on the
+/// daemon child it spawns.
 pub(crate) fn emit_committed_event(
     stdout: &mut std::io::Stdout,
     id: &str,
@@ -135,6 +144,9 @@ pub(crate) fn write_error(stdout: &mut std::io::Stdout, id: &str, message: &str)
     let _ = stdout.flush();
 }
 
+/// Act on an [`EosFilter`](hipfire_generate::eos_filter) decision: stream any
+/// emitted/held bytes as a `token` event and return `true` when generation
+/// should stop (`Stop`/`StopEmit`), `false` to continue (`Emit`/`Hold`).
 pub(crate) fn emit_filter_action(
     stdout: &mut std::io::Stdout,
     id: &str,
@@ -154,6 +166,9 @@ pub(crate) fn emit_filter_action(
     }
 }
 
+/// Emit a `{"type":"token","id","text"}` event for `text_bytes`. No-op on empty
+/// input or non-UTF-8 bytes (a partial multibyte fragment is dropped rather than
+/// emitting mojibake; the filter re-presents it once the codepoint completes).
 pub(crate) fn emit_text_bytes(stdout: &mut std::io::Stdout, id: &str, text_bytes: &[u8]) {
     if text_bytes.is_empty() {
         return;

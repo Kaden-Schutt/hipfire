@@ -18,6 +18,11 @@ use hipfire_generate::eos_filter::{EosFilter, EosFilterConfig};
 use hipfire_generate::loop_guard::LoopGuard;
 use hipfire_prompt as prompt_frame;
 
+/// Collapse runaway whitespace (3+ newlines → 2, etc.) before tokenizing, so
+/// prompts that differ only in blank-line padding tokenize identically — a
+/// material τ/throughput stabilizer (see CLAUDE.md "Prompt-structure τ
+/// sensitivity"). Borrows unchanged when normalization is disabled
+/// (`HIPFIRE_NORMALIZE_PROMPT=0` or the runtime config flag is off).
 pub(crate) fn normalize_daemon_prompt(prompt: &str) -> std::borrow::Cow<'_, str> {
     if matches!(
         std::env::var("HIPFIRE_NORMALIZE_PROMPT").ok().as_deref(),
@@ -79,11 +84,18 @@ pub(crate) fn block_attractor_unclosed_cpu(
     }
 }
 
+/// Build the n-gram repetition [`LoopGuard`] from the runtime config
+/// (`ngram_loop_threshold` / `ngram_window`) — the decode-loop guard that breaks
+/// degenerate verbatim repetition.
 pub(crate) fn loop_guard_from_runtime_config() -> LoopGuard {
     let config = hipfire_runtime::config::get();
     LoopGuard::new(config.ngram_loop_threshold, config.ngram_window)
 }
 
+/// Simpler unpaired-token fallback to [`block_attractor_unclosed_cpu`]: writes
+/// `-inf` straight into the GPU logits buffer for `tok_id` once it repeats
+/// `>= threshold` times in the last `window` tokens, regardless of open/close
+/// structure. Currently unused — kept as reference for a future per-token block.
 #[allow(dead_code)]
 pub(crate) fn gpu_block_attractor_token(
     gpu: &rdna_compute::Gpu,
@@ -106,6 +118,11 @@ pub(crate) fn gpu_block_attractor_token(
     }
 }
 
+/// Build the streaming [`EosFilter`] for a turn: the chat-template profile's
+/// `stop_at`/`holdback_prefixes` (defaulting to `<|im_end|>` when the profile has
+/// none) unioned with the per-request stop sequences. Holdback prefixes let the
+/// filter buffer a partial stop token rather than leaking it before the match
+/// completes.
 pub(crate) fn chat_output_filter_from_profile(
     chat_template_profile: Option<&prompt_frame::ChatTemplateProfile>,
     request_stop_sequences: &[String],
@@ -148,6 +165,9 @@ pub(crate) fn chat_output_filter_from_profile(
     })
 }
 
+/// Parse and sanitize a request's `stop` field (string or array) the same way
+/// the Bun CLI does: drop empties, cap at 4 sequences, truncate each to 64
+/// bytes. Bounds adversarial/oversized input before it reaches the filter.
 pub(crate) fn normalize_request_stop_sequences(value: Option<&serde_json::Value>) -> Vec<String> {
     let Some(value) = value else {
         return Vec::new();

@@ -15,6 +15,8 @@ use hipfire_state::{ModelArtifactMemory, ModelWorkerMemoryView, SequenceStatePag
 
 use crate::model::LoadedModel;
 
+/// Artifact memory for a loaded HFQ: on-disk file size plus the summed
+/// tensor-data bytes (resident weight footprint).
 pub(crate) fn hfq_model_memory(
     path: &str,
     hfq: &hipfire_runtime::hfq::HfqFile,
@@ -31,6 +33,8 @@ pub(crate) fn hfq_model_memory(
     }
 }
 
+/// Artifact memory for a non-HFQ / unparsed model: file size only, weight bytes
+/// reported as 0 (unknown) rather than guessed.
 pub(crate) fn unknown_model_memory(path: &str) -> ModelArtifactMemory {
     ModelArtifactMemory {
         model_file_bytes: std::fs::metadata(path)
@@ -40,18 +44,23 @@ pub(crate) fn unknown_model_memory(path: &str) -> ModelArtifactMemory {
     }
 }
 
+/// Device-buffer byte size of one GPU tensor.
 pub(crate) fn tensor_bytes(tensor: &rdna_compute::GpuTensor) -> usize {
     tensor.buf.size()
 }
 
+/// [`tensor_bytes`] for an optional tensor; 0 when `None`.
 pub(crate) fn opt_tensor_bytes(tensor: Option<&rdna_compute::GpuTensor>) -> usize {
     tensor.map(tensor_bytes).unwrap_or(0)
 }
 
+/// Summed [`tensor_bytes`] over a tensor slice (e.g. per-layer KV vectors).
 pub(crate) fn tensor_vec_bytes(tensors: &[rdna_compute::GpuTensor]) -> usize {
     tensors.iter().map(tensor_bytes).sum::<usize>()
 }
 
+/// Resident bytes of a KV cache: K/V tensors, their quant scales, and the
+/// optional cached RoPE givens.
 pub(crate) fn kv_cache_bytes(kv: &llama::KvCache) -> usize {
     tensor_vec_bytes(&kv.k_gpu)
         + tensor_vec_bytes(&kv.v_gpu)
@@ -61,12 +70,17 @@ pub(crate) fn kv_cache_bytes(kv: &llama::KvCache) -> usize {
         + opt_tensor_bytes(kv.givens_sin.as_ref())
 }
 
+/// Resident bytes of the DeltaNet linear-attention state: S-matrices, their
+/// scales, and the short-conv states.
 pub(crate) fn deltanet_state_bytes(dn: &DeltaNetState) -> usize {
     tensor_vec_bytes(&dn.s_matrices)
         + tensor_vec_bytes(&dn.s_scales)
         + tensor_vec_bytes(&dn.conv_states)
 }
 
+/// Resident bytes of the Qwen3.5 forward scratch: attention/DeltaNet/FlashAttn
+/// working buffers, the FFN buffers, and the optional grouped-MoE scratch.
+/// (`PrefillBatchScratch` has private fields and is reported as unknown / 0.)
 pub(crate) fn qwen35_scratch_bytes(scratch: &qwen35::Qwen35Scratch) -> usize {
     let mut total = scratch.pos_buf.size();
     total += tensor_bytes(&scratch.x)
@@ -118,6 +132,7 @@ pub(crate) fn qwen35_scratch_bytes(scratch: &qwen35::Qwen35Scratch) -> usize {
     total
 }
 
+/// Resident bytes of the Qwen2 decode state, including its in-struct K/V cache.
 pub(crate) fn qwen2_state_bytes(state: &qwen2::Qwen2State) -> usize {
     state.pos_buf.size()
         + tensor_bytes(&state.x)
@@ -137,6 +152,8 @@ pub(crate) fn qwen2_state_bytes(state: &qwen2::Qwen2State) -> usize {
         + tensor_vec_bytes(&state.v_cache)
 }
 
+/// Resident bytes of the LLaMA/Qwen3 forward scratch (attention + FFN working
+/// buffers). The KV cache is separate ([`kv_cache_bytes`]).
 pub(crate) fn llama_scratch_bytes(scratch: &llama::ForwardScratch) -> usize {
     scratch.pos_buf.size()
         + tensor_bytes(&scratch.x)
@@ -157,6 +174,8 @@ pub(crate) fn llama_scratch_bytes(scratch: &llama::ForwardScratch) -> usize {
         + tensor_bytes(&scratch.x_rot)
 }
 
+/// Resident bytes of the MiniMax-M2 decode state: its KV cache plus the
+/// attention/FlashAttn, FFN, and MoE routing working buffers.
 pub(crate) fn minimax_state_bytes(state: &hipfire_arch_minimax::MiniMaxState) -> usize {
     state.pos_buf.size()
         + kv_cache_bytes(&state.kv)
@@ -182,6 +201,10 @@ pub(crate) fn minimax_state_bytes(state: &hipfire_arch_minimax::MiniMaxState) ->
         + tensor_bytes(&state.logits)
 }
 
+/// Total resident runtime bytes for a loaded model (excludes weights/artifact):
+/// sums whichever arch's KV cache, DeltaNet state, and forward scratch are
+/// populated — the per-arch Option fields make this a simple `map().unwrap_or(0)`
+/// tally.
 pub(crate) fn loaded_model_runtime_base_bytes(m: &LoadedModel) -> usize {
     let mut total = 0usize;
     total += m.kv_cache.as_ref().map(kv_cache_bytes).unwrap_or(0);
@@ -216,6 +239,9 @@ pub(crate) fn loaded_model_runtime_base_bytes(m: &LoadedModel) -> usize {
     total
 }
 
+/// Assemble the client-facing [`ModelWorkerMemoryView`]: artifact bytes plus the
+/// runtime base ([`loaded_model_runtime_base_bytes`]) and the per-session
+/// resident bytes summed from the supplied state-page descriptors.
 pub(crate) fn loaded_model_memory_view(
     m: &LoadedModel,
     state_page_descriptors: &[SequenceStatePageDescriptor],
