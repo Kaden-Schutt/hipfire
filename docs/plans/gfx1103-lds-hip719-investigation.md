@@ -112,6 +112,8 @@ VARIANT=tile6_lds_store_then_load_dynamiccols_load4_nextrow_consume4_pinned MODE
 VARIANT=tile6_lds_store_then_rowload_then_extra_load4_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-postrow-extra-consume4-pinned-780m
 VARIANT=tile6_lds_store_then_rowload_barrier_noextra_load4_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-postrow-barrier-noextra-consume4-pinned-780m
 VARIANT=tile6_lds_prestore_barrier_noextra_load4_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-prestore-barrier-noextra-consume4-pinned-780m
+VARIANT=tile6_lds_preloop_barrier_noextra_load4_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-preloop-barrier-noextra-consume4-pinned-780m
+VARIANT=tile6_lds_firstiter_barrier_noextra_load4_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-firstiter-barrier-noextra-consume4-pinned-780m
 VARIANT=tile6_lds_single_store_prestore_barrier_noextra_load4_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-single-store-prestore-barrier-noextra-consume4-pinned-780m
 VARIANT=tile6_lds_prestore_barrier_noextra_load3_consume3_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-prestore-barrier-noextra-consume3-pinned-780m
 VARIANT=tile6_lds_betweenstore_barrier_noextra_load4_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-betweenstore-barrier-noextra-consume4-pinned-780m
@@ -582,6 +584,21 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
     -> second store -> barrier -> four row loads/FMAs -> barrier. Metadata
     remains `144`, `sgpr_count=5`, `vgpr_count=10`, and no spills. This shows
     the added barrier epoch does not need to follow an LDS producer phase.
+  - The one-time pre-loop barrier control
+    `tile6_lds_preloop_barrier_noextra_load4_consume4_pinned` passed a
+    one-launch smoke. It keeps the two stores and four waited/interleaved row
+    loads, but moves the extra barrier outside the K loop so the repeated
+    per-iteration sync epoch is removed. Metadata is `144`, `sgpr_count=6`,
+    `vgpr_count=10`, and no spills. This control is meant to test whether the
+    prestore failure requires repeated per-K execution rather than just the
+    presence of one extra barrier in the kernel.
+  - The first-iteration-only barrier control
+    `tile6_lds_firstiter_barrier_noextra_load4_consume4_pinned` passed a
+    one-launch smoke. It keeps the extra barrier inside the K loop but guards
+    it with `kt == 0`, leaving later K iterations at the normal two-store,
+    four-load, one-closing-barrier shape. Metadata is `144`, `sgpr_count=5`,
+    `vgpr_count=11`, and no spills. A 100-launch run on another 780M should
+    distinguish one-time in-loop sync from repeated per-K sync.
   - The single-store prestore extra-barrier control
     `tile6_lds_single_store_prestore_barrier_noextra_load4_consume4_pinned`
     passed 100 launches with `144`, `sgpr_count=5`, `vgpr_count=10`, and no
@@ -1090,6 +1107,17 @@ Latest artifact paths:
   barrier -> second store -> barrier -> three waited row loads -> barrier;
   metadata is `144`, `sgpr_count=5`, `vgpr_count=9`, and no spills. Live dmesg
   showed no new reset during either passing stress run.
+- `/tmp/hipfire-lds-barrier-once-runs/`: one-time barrier controls. Throwaway
+  `tile6_lds_preloop_barrier_noextra_load4_consume4_pinned` passed a
+  one-launch smoke. ISA/resource metadata showed `group_segment_fixed_size=144`,
+  `sgpr_count=6`, `vgpr_count=10`, and no spills. Throwaway
+  `tile6_lds_firstiter_barrier_noextra_load4_consume4_pinned` also passed a
+  one-launch smoke with `group_segment_fixed_size=144`, `sgpr_count=5`,
+  `vgpr_count=11`, and no spills. These controls are now promoted for
+  cross-system 100-launch stress on another 780M. After promotion in the main
+  checkout, both variants passed one-launch compile/run smokes at
+  `/tmp/hipfire-lds-promote-preloop-barrier-n1/` and
+  `/tmp/hipfire-lds-promote-firstiter-barrier-n1/`.
 - `/tmp/hipfire-lds-crossrow-runs/`: cross-row extra-load controls. The first
   two-launch run failed adjacent to prior reset pressure, but a recovery
   `tile6_lds_second_store_only_read6` control passed, then clean
