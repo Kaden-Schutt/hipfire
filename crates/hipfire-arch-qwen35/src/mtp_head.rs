@@ -1906,14 +1906,40 @@ pub fn mtp_head_apply_lm_head_batched(
     let logits_view = logits_batched.sub_offset(0, n * vocab);
     match lm_head_weights.gpu_dtype {
         DType::Q8_0 => {
-            gpu.gemm_q8_0_batched(
-                &lm_head_weights.buf,
-                tmp_batched,
-                &logits_view,
-                lm_head_weights.m,
-                lm_head_weights.k,
-                n,
-            )?;
+            // Route the full-vocab MTP-head lm_head to the WMMA Q8 kernel
+            // (gemm_q8_0_wmma: gfx12 gemm_q8_0_wmma_gfx12 ~0.3ms / gfx11 RDNA3
+            // sibling) instead of the scalar 1-wave-per-row kernel — which
+            // rocprofv3 (2026-06-16, A3B K=1 gfx1201) measured at ~9.2ms/cycle
+            // = 40% of all MTP GPU time (one full-vocab B=2 GEMM per proposal).
+            // Mirrors the trunk verify lm_head (mtp_spec.rs:2704), but calls the
+            // WMMA kernel DIRECTLY rather than via gemm_q8_0_batched_chunked
+            // (whose WMMA arm is gated to is_rdna4()) so RDNA3 (gfx11) — where
+            // the head lm_head is ALSO scalar today — gets the fix too. WMMA
+            // needs wave32 (gfx11+) and K%32==0; else fall back to scalar.
+            // Opt out with HIPFIRE_MTP_HEAD_LMHEAD_WMMA=0.
+            let use_wmma = std::env::var("HIPFIRE_MTP_HEAD_LMHEAD_WMMA").ok().as_deref()
+                != Some("0")
+                && gpu.arch_caps.has_wmma()
+                && lm_head_weights.k % 32 == 0;
+            if use_wmma {
+                gpu.gemm_q8_0_wmma(
+                    &lm_head_weights.buf,
+                    tmp_batched,
+                    &logits_view,
+                    lm_head_weights.m,
+                    lm_head_weights.k,
+                    n,
+                )?;
+            } else {
+                gpu.gemm_q8_0_batched(
+                    &lm_head_weights.buf,
+                    tmp_batched,
+                    &logits_view,
+                    lm_head_weights.m,
+                    lm_head_weights.k,
+                    n,
+                )?;
+            }
         }
         DType::HFQ4G256 => {
             gpu.gemm_hfq4g256_batched_lmhead(

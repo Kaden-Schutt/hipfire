@@ -46,6 +46,12 @@ pub struct ScratchState {
     /// [K_SPLITS][batch_size][M] fp32, grows-never-shrinks.
     pub ksplit_det_partials: Option<DeviceBuffer>,
     pub ksplit_det_partials_bytes: usize,
+    /// Partials buffer for the multi-workgroup parallel sampler
+    /// (`sample_topk_partial` → `sample_topk_finalize`). Holds
+    /// `[n_blocks*TOP_K]` f32 values followed by `[n_blocks*TOP_K]` i32 indices
+    /// in one allocation; grows-never-shrinks.
+    pub sample_partials: Option<DeviceBuffer>,
+    pub sample_partials_bytes: usize,
 }
 
 // ── Shared kernel dispatch helpers ──────────────────────────────────────
@@ -164,6 +170,22 @@ impl ScratchState {
             self.ksplit_det_partials_bytes = n_bytes;
         }
         Ok(self.ksplit_det_partials.as_ref().unwrap().as_ptr())
+    }
+
+    /// Ensure the parallel-sampler partials scratch is at least `n_bytes`,
+    /// growing (never shrinking). Returns the device base pointer. No init
+    /// needed: every valid cell is written by `sample_topk_partial` before
+    /// `sample_topk_finalize` reads it.
+    pub fn ensure_sample_partials(
+        &mut self,
+        hip: &HipRuntime,
+        n_bytes: usize,
+    ) -> HipResult<*mut c_void> {
+        if self.sample_partials_bytes < n_bytes {
+            self.sample_partials = Some(hip.malloc(n_bytes)?);
+            self.sample_partials_bytes = n_bytes;
+        }
+        Ok(self.sample_partials.as_ref().unwrap().as_ptr())
     }
 
     /// Lazily initialize MagnumQuant FWHT sign tables (256 floats each, seeds 42 and 1042).

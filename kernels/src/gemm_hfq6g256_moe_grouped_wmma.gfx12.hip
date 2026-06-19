@@ -117,14 +117,17 @@ extern "C" __global__ void gemm_hfq6g256_moe_grouped_wmma_gfx12(
             const unsigned char* dp_b = (const unsigned char*)(gp + 8 + bb_b);
             const unsigned char* dp_c = (const unsigned char*)(gp + 8 + bb_c);
             const unsigned char* dp_d = (const unsigned char*)(gp + 8 + bb_d);
+            // d1 uses only bits 0..23 (3 bytes); a *(uint*)(dp+3) fetches a 4th
+            // byte (dp+6) that is 1 B past the group on the last tile of the last
+            // group → GPU VM read fault on tightly-packed expert buffers. Read 3 B.
             unsigned int d0a = *(const unsigned int*)(dp_a);
-            unsigned int d1a = *(const unsigned int*)(dp_a + 3);
+            unsigned int d1a = (unsigned int)dp_a[3] | ((unsigned int)dp_a[4] << 8) | ((unsigned int)dp_a[5] << 16);
             unsigned int d0b = *(const unsigned int*)(dp_b);
-            unsigned int d1b = *(const unsigned int*)(dp_b + 3);
+            unsigned int d1b = (unsigned int)dp_b[3] | ((unsigned int)dp_b[4] << 8) | ((unsigned int)dp_b[5] << 16);
             unsigned int d0c = *(const unsigned int*)(dp_c);
-            unsigned int d1c = *(const unsigned int*)(dp_c + 3);
+            unsigned int d1c = (unsigned int)dp_c[3] | ((unsigned int)dp_c[4] << 8) | ((unsigned int)dp_c[5] << 16);
             unsigned int d0d = *(const unsigned int*)(dp_d);
-            unsigned int d1d = *(const unsigned int*)(dp_d + 3);
+            unsigned int d1d = (unsigned int)dp_d[3] | ((unsigned int)dp_d[4] << 8) | ((unsigned int)dp_d[5] << 16);
 
             half8_t b_a, b_b, b_c, b_d;
             if (xg != nullptr) {

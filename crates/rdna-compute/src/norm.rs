@@ -2027,6 +2027,47 @@ impl Gpu {
     }
 
     /// Fused conv1d (kernel_size=4) + SiLU decode.
+    /// Batched sigmoid-scaled residual add: `y[t,:] += sigmoid(scalars[t]) * x[t,:]`.
+    /// `y` and `x` are `[n × dim]` f32; `scalars` is `[n]` pre-sigmoid logits.
+    /// Batched analog of `sigmoid_f32` + `scaled_add_inplace_gpu_scalar_f32` used
+    /// to fold the Q8 shared-expert down output into the residual stream in the
+    /// E8 MoE batched-prefill body.
+    pub fn sigmoid_scaled_residual_add_batched_f32(
+        &mut self, y: &GpuTensor, x: &GpuTensor, scalars: &GpuTensor, n: usize, dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "sigmoid_scaled_residual_add_batched",
+            kernels::SIGMOID_SCALED_RESIDUAL_ADD_BATCHED_SRC,
+            "sigmoid_scaled_residual_add_batched_f32",
+        )?;
+        let yp = y.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let sp = scalars.buf.as_ptr();
+        let nv = n as i32;
+        let dv = dim as i32;
+        let total = (n * dim) as u32;
+        let mut params: Vec<*mut c_void> = vec![
+            &yp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &nv as *const _ as *mut c_void,
+            &dv as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = (total + block - 1) / block;
+        self.launch_maybe_blob(
+            "sigmoid_scaled_residual_add_batched_f32",
+            [grid, 1, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(yp); b.push_ptr(xp); b.push_ptr(sp);
+                b.push_i32(nv); b.push_i32(dv);
+                b
+            },
+        )
+    }
+
     #[cfg(feature = "deltanet")]
     pub fn conv1d_silu_f32(
         &mut self, output: &GpuTensor, input: &GpuTensor, weight: &GpuTensor,

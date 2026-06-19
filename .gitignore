@@ -32,6 +32,7 @@
 # JIT-compiled kernel cache
 kernels/compiled/
 .hipfire_kernels/
+.hipfire_kernels_*/
 
 # Agent / tool state
 .serena/

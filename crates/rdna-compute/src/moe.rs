@@ -386,7 +386,9 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "moe_gate_up_unscatter_k8",
-            [grid_x, m_total as u32, 1], [block, 1, 1], 0, &mut params,
+            // m_total in grid.x (limit 2^31), mi-tile in grid.y — m_total exceeds
+            // the 65535 grid.y limit past ~8k prefill tokens (m_total = N*K_TOP).
+            [m_total as u32, grid_x, 1], [block, 1, 1], 0, &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(yp); b.push_ptr(sp); b.push_ptr(gp); b.push_ptr(up);

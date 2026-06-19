@@ -63,6 +63,7 @@ struct Args {
     max_tokens: Option<usize>,
     temperature: Option<f64>,
     max_seq: Option<usize>,
+    kv_mode: Option<String>,
     report_json: Option<String>,
     agentic: bool,
     stall_tokens: Option<usize>,
@@ -89,6 +90,7 @@ fn parse_args() -> Result<Args, String> {
             "--max-seq" => {
                 args.max_seq = it.next().and_then(|v| v.parse().ok());
             }
+            "--kv-mode" => args.kv_mode = it.next(),
             "--report-json" => args.report_json = it.next(),
             "--agentic" => args.agentic = true,
             "--stall-tokens" => {
@@ -121,6 +123,7 @@ fn print_help() {
           --max-tokens N        max generated tokens (default 200)\n  \
           --temperature F       sampling temperature (default 0.0)\n  \
           --max-seq N           daemon max_seq override (default 4096)\n  \
+          --kv-mode MODE        KV cache mode (q8|asym3|fwht3|...); default daemon's own\n  \
           --report-json OUT     also write the report as JSON\n  \
           --agentic             auto-engage tool-call shape detector\n  \
           --stall-tokens N      enable think_stall detector with budget N\n  \
@@ -565,10 +568,17 @@ fn run() -> Result<i32, String> {
 
     // Load
     let max_seq = effective_args.max_seq.unwrap_or(4096);
+    // KV mode passthrough (mirrors bench_sweep.ts `params.kv_mode`). Without it
+    // the daemon uses its default (asym3), so coherence must NOT be qualified on
+    // the shipped path — pass `--kv-mode q8` to probe the q8 KV path that ships.
+    let mut params = serde_json::json!({ "max_seq": max_seq });
+    if let Some(ref kv) = effective_args.kv_mode {
+        params["kv_mode"] = serde_json::Value::String(kv.clone());
+    }
     let load = serde_json::json!({
         "type": "load",
         "model": model,
-        "params": { "max_seq": max_seq },
+        "params": params,
     });
     send(&mut child, &load)?;
     let loaded = recv_until(&mut child, |_| {})?;

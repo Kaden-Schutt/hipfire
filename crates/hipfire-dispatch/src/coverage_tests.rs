@@ -99,6 +99,8 @@ const FLEET: &[OpUse] = &[
     OpUse { model: "qwen3.5-27b.mq3",       role: Role::Residual, dtype: MQ3G256,      archs: WAVE32 },
     OpUse { model: "qwen3.6-27b.mq3-lloyd", role: Role::Residual, dtype: MQ3G256Lloyd, archs: WAVE32 },
     OpUse { model: "qwen3.6-35b-a3b.mq4",   role: Role::Plain,    dtype: MQ4G256,      archs: ALL },
+    // MQ5-promoted projections — gate is HasMmq (gfx906 + RDNA3 + RDNA4), mirrors MQ6:
+    OpUse { model: "qwen3.6-35b-a3b.mq5",   role: Role::Plain,    dtype: MQ5G256,      archs: &["gfx906", "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1152", "gfx1200", "gfx1201"] },
     // MQ6-promoted projections (A3B AWQ-attractor mitigation) — gate is HasMmq (gfx906 + RDNA3 + RDNA4):
     OpUse { model: "qwen3.6-35b-a3b.mq4",   role: Role::Plain,    dtype: MQ6G256,      archs: &["gfx906", "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1152", "gfx1200", "gfx1201"] },
 
@@ -107,6 +109,7 @@ const FLEET: &[OpUse] = &[
     OpUse { model: "qwen3.5-27b.mq4-rdna4",   role: Role::Plain,    dtype: MQ4G256,      archs: &["gfx1200", "gfx1201"] },
     OpUse { model: "qwen3.5-27b.mq3-rdna4",   role: Role::Plain,    dtype: MQ3G256,      archs: &["gfx1200", "gfx1201"] },
     OpUse { model: "qwen3.6-27b.lloyd-rdna4", role: Role::Plain,    dtype: MQ3G256Lloyd, archs: &["gfx1200", "gfx1201"] },
+    OpUse { model: "a3b-moe-mq5-rdna4",       role: Role::Plain,    dtype: MQ5G256,      archs: &["gfx1200", "gfx1201"] },
     OpUse { model: "a3b-moe-rdna4",           role: Role::Plain,    dtype: MQ6G256,      archs: &["gfx1200", "gfx1201"] },
 ];
 
@@ -181,7 +184,7 @@ fn fleet_dtypes_resolve_on_every_target_arch() {
 #[test]
 fn confirmed_oproj_dtypes_have_a_plan() {
     const OPROJ_DTYPES: &[DType] = &[
-        Q8_0, MQ4G256, MQ3G256, MQ6G256, HFQ4G256, HFQ6G256,
+        Q8_0, MQ4G256, MQ3G256, MQ5G256, MQ6G256, HFQ4G256, HFQ6G256,
         MQ3G256Lloyd, MQ4G256Lloyd, ParoQ4G128, MFP4G32, Q4K,
     ];
     let no_fused: Vec<_> = OPROJ_DTYPES
@@ -241,6 +244,7 @@ fn non_k8_and_q8_routed_moe_has_a_dispatch_plan() {
             experts_all_gate_up_mq4: u.routed_gate_up == MQ4G256,
             routed_gate_up: u.routed_gate_up,
             routed_down: u.routed_down,
+            routed_has_mixed_experts: false,
             has_paro_shared: false,
         };
         let res = MoeResolution::resolve(&d, u.k);
@@ -294,6 +298,7 @@ fn moe_decode_pre_guard_admits_fallback_and_rejects_invalid() {
         shared_expert_gate: Q8_0, shared_expert_up: Q8_0, shared_expert_down: Q8_0,
         experts_all_gate_up_mq4: true,
         routed_gate_up: MQ4G256, routed_down: MQ4G256,
+        routed_has_mixed_experts: false,
         has_paro_shared: false,
     };
     let res_k4 = MoeResolution::resolve(&mq4_k4, 4);

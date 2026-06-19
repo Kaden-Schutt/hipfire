@@ -10,3 +10,4 @@ deltanet = []
 
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
+rayon = "1"

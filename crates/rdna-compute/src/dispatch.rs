@@ -151,6 +151,7 @@ pub enum DType {
     MQ4G128,      // MagnumQuant: FWHT-128-rotated INT4 (72 bytes/group, same layout as HFQ4G128)
     MQ8G256,      // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target (258 bytes/group)
     MQ6G256,      // MagnumQuant: FWHT-rotated HFQ6-G256 (200 bytes/group, same as HFQ6G256)
+    MQ5G256,      // MagnumQuant: FWHT-rotated 5-bit (168 bytes/group, 5.25 bpw)
     MQ3G256,      // MagnumQuant: FWHT-rotated HFQ3-G256 (104 bytes/group, same as HFQ3G256)
     MQ2G256,      // MagnumQuant: FWHT-rotated HFQ2-G256 (72 bytes/group, same as HFQ2G256)
     MQ2G256Lloyd, // MagnumQuant 2-bit + Lloyd-Max 4-entry fp16 codebook (72 bytes/group)
@@ -163,6 +164,22 @@ pub enum DType {
     // as HFP4G32; format_flags bit 0 + bits 2-3 = 01 stamps the rotation kind.
     // Runtime applies the matching FWHT to x via mq_rotate_x; the kernel itself
     // is shared with HFP4G32.
+    MFP4G32Lloyd, // mfp4 + per-tensor 16-entry fp16 Lloyd codebook. Same per-row byte
+    // layout as MFP4G32, plus a 32-B codebook prefix before row 0. format_flags=0x05
+    // (same FWHT rotation as MFP4G32); recon uses codebook[nibble] not E2M1_LUT.
+    MFP4G32P, // mfp4+P — mfp4 (E2M1 + FP16 row scale + offline FWHT) with the per-32-block
+    // UE8M0 scale promoted to E4M3 (FP8, non-power-of-2). Byte layout BYTE-IDENTICAL to
+    // MFP4G32 (NO prefix); only the per-block scale byte's decode differs (E4M3 vs UE8M0).
+    MFP4G32E8, // mfp4-E8: mfp4+P container (E4M3 block scale, NO prefix, same row_bytes)
+    // with the per-32-block 16 E2M1 nibbles replaced by 4x32-bit E8-lattice codewords
+    // (8 weights/codeword, QUANT_STEP=0.88). 4.25 bpw, byte-IDENTICAL footprint to MFP4G32P.
+    MFP4G32E8SOA, // mfp4-E8 SoA: same E8 data as MFP4G32E8 permuted for coalesced reads.
+    // Per-row: [16B hdr: row_scale_a:f16@0, n_blocks:u16@4, flag:0x06@6]
+    //   + [n_blocks B: E4M3 scales, pad to 16B boundary]
+    //   + [n_blocks*16 B: 4xu32 E8 codewords/block, 16B-aligned].
+    // Pure byte-permutation of MFP4G32E8 => dequant result IDENTICAL.
+    MFP3G32E8, // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 3), 13 B/blk, 104 B/grp, 3.25 bpw. Drop-in for MQ3G256Lloyd.
+    MFP2G32E8, // mfp2-E8: MFP4G32E8 frame, 2-bit lattice (center 1),  9 B/blk,  72 B/grp, 2.25 bpw. Drop-in for MQ2G256Lloyd.
     HFQ2G256,   // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
     HFQ2G128,   // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
     HFQ6G256,   // 200 bytes per 256 elements (6-bit, f32 scale+zero)
@@ -194,6 +211,7 @@ impl DType {
             | DType::MQ4G256
             | DType::MQ4G128
             | DType::MQ6G256
+            | DType::MQ5G256
             | DType::MQ8G256
             | DType::MQ3G256
             | DType::MQ2G256
@@ -202,6 +220,12 @@ impl DType {
             | DType::MQ4G256Lloyd
             | DType::HFP4G32
             | DType::MFP4G32
+            | DType::MFP4G32Lloyd
+            | DType::MFP4G32P
+            | DType::MFP4G32E8
+            | DType::MFP4G32E8SOA
+            | DType::MFP3G32E8
+            | DType::MFP2G32E8
             | DType::ParoQ4G128
             | DType::Raw => 1, // byte-level
         }
@@ -364,6 +388,215 @@ pub struct Gpu {
     /// Only populated on CDNA3 when rocBLAS loaded — 4× VRAM blow-up vs MQ4
     /// so consumer cards stay on the wave32/64 hand-rolled GEMV path.
     fp16_shadow_cache: HashMap<usize, GpuTensor>,
+
+    /// Native GPTQ-on-E8 Hessian collection. `None` in production (zero
+    /// overhead -- a single `is_some()` branch in the MoE CPU-top-K fallback
+    /// per routed expert). The `collect_e8_hessian_native` example sets this to
+    /// `Some(default)` before running the calibration forward; every routed
+    /// expert then accumulates its per-256-block XX^T over the RAW pre-rotation
+    /// input (gate_up: post-rmsnorm x; down: silu(g)*u), keyed by the full
+    /// safetensors tensor name == `hipfire-quantize::main::hessian_key`. Drained
+    /// to per-(tensor,expert) `.hblk` files after the pass. See
+    /// `hipfire-dispatch::pipeline::run_moe_decode_cpu_fallback` for the hook.
+    pub hessian_capture: Option<HessianCapture>,
+}
+
+/// Per-256-block XX^T accumulator for ONE weight tensor (one expert), keyed
+/// inside [`HessianCapture`] by the full safetensors name. Byte-for-byte the
+/// same accumulation + `.hblk` layout as
+/// `hipfire-quantize::bin::collect_e8_hessian::BlockHessian` (duplicated here
+/// because that lives in a `bin` crate the GPU layer cannot import). The
+/// quantizer's `load_hessian_blocks` reads exactly this format.
+#[derive(Debug)]
+pub struct BlockHessianAcc {
+    pub k: usize,
+    pub n_blocks: usize,
+    /// `n_blocks` blocks of `256*256` f64 accumulators (row-major per block).
+    pub blocks: Vec<Vec<f64>>,
+    pub n_rows: u64,
+}
+
+impl BlockHessianAcc {
+    pub fn new(k: usize) -> Self {
+        assert!(k % 256 == 0, "Hessian K={k} must be divisible by 256");
+        let n_blocks = k / 256;
+        BlockHessianAcc {
+            k,
+            n_blocks,
+            blocks: (0..n_blocks).map(|_| vec![0.0f64; 256 * 256]).collect(),
+            n_rows: 0,
+        }
+    }
+
+    /// Accumulate one pre-rotation activation row `x[0..K]` into the per-256-block
+    /// diagonal XX^T (block b += x_b x_b^T over its 256 channels).
+    pub fn accumulate_row(&mut self, x: &[f32]) {
+        debug_assert_eq!(x.len(), self.k);
+        for b in 0..self.n_blocks {
+            let xb = &x[b * 256..b * 256 + 256];
+            let acc = &mut self.blocks[b];
+            for i in 0..256 {
+                let xi = xb[i] as f64;
+                if xi == 0.0 {
+                    continue;
+                }
+                let row = &mut acc[i * 256..i * 256 + 256];
+                for j in 0..256 {
+                    row[j] += xi * xb[j] as f64;
+                }
+            }
+        }
+        self.n_rows += 1;
+    }
+
+    /// Serialize to the `.hblk` format consumed by
+    /// `hipfire-quantize::main::load_hessian_blocks`:
+    /// `[u32 magic=0x45384831][u32 n_blocks=K/256][u32 K][f32 ... n_blocks*256*256]`.
+    pub fn write_hblk(&self, dir: &std::path::Path, tensor_name: &str) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        // MUST byte-match hessian_key(): replace('/','_').replace('\\','_').replace("..","_").
+        let key = tensor_name.replace(['/', '\\'], "_").replace("..", "_");
+        let path = dir.join(format!("{key}.hblk"));
+        let mut buf = Vec::with_capacity(12 + self.n_blocks * 256 * 256 * 4);
+        buf.extend_from_slice(&0x45_38_48_31u32.to_le_bytes()); // "E8H1"
+        buf.extend_from_slice(&(self.n_blocks as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.k as u32).to_le_bytes());
+        for b in 0..self.n_blocks {
+            for &v in &self.blocks[b] {
+                buf.extend_from_slice(&(v as f32).to_le_bytes());
+            }
+        }
+        std::fs::write(&path, &buf)
+    }
+
+    /// Mean of the per-block diagonal (sanity: should be > 0 for a frequently
+    /// routed expert; 0 == never accumulated).
+    pub fn mean_diag(&self) -> f64 {
+        let mut s = 0.0f64;
+        let mut n = 0u64;
+        for b in 0..self.n_blocks {
+            for i in 0..256 {
+                s += self.blocks[b][i * 256 + i];
+                n += 1;
+            }
+        }
+        if n == 0 { 0.0 } else { s / n as f64 }
+    }
+}
+
+/// Host-side accumulator for native GPTQ-on-E8 Hessian collection. Lives on
+/// [`Gpu`] so the MoE CPU-top-K fallback chokepoint can reach it without
+/// threading a parameter through every forward path. Pure host data.
+///
+/// Keyed by the FULL safetensors tensor name (== the quantizer's
+/// `hessian_key` input), e.g.
+/// `model.language_model.layers.7.mlp.experts.42.gate_up_proj.weight`.
+#[derive(Debug, Default)]
+pub struct HessianCapture {
+    /// `tensor_name -> per-256-block XX^T`. Lazily sized to the tensor's K on
+    /// first sighting of that (tensor,expert).
+    pub entries: HashMap<String, BlockHessianAcc>,
+    /// Total calibration tokens processed (collector increments once/step).
+    pub n_tokens: u64,
+}
+
+impl HessianCapture {
+    /// Accumulate one RAW pre-rotation activation row for `name`. `x` is the
+    /// linear's pre-rotation input (gate_up: post-rmsnorm x; down: silu(g)*u);
+    /// only the first `k` channels are used. Creates the entry on first sight.
+    pub fn accumulate(&mut self, name: &str, x: &[f32], k: usize) {
+        let acc = self
+            .entries
+            .entry(name.to_string())
+            .or_insert_with(|| BlockHessianAcc::new(k));
+        if x.len() >= k {
+            acc.accumulate_row(&x[..k]);
+        } else {
+            let mut row = vec![0.0f32; k];
+            row[..x.len()].copy_from_slice(x);
+            acc.accumulate_row(&row);
+        }
+    }
+
+    /// Accumulate ALL of one token's routed (tensor,expert) activation rows in
+    /// PARALLEL across rayon worker threads. `items` is the token's list of
+    /// `(name, x, k)` work-units (gate_up + down for each of the top-k experts).
+    ///
+    /// WHY THIS IS THE HOT-PATH OPTIMIZATION: the per-token capture cost is
+    /// dominated by the `accumulate_row` rank-1 XX^T updates over a HUGE, COLD
+    /// working set (A3B: ~16k distinct (tensor,expert) accumulators, ~30 GB of
+    /// f64), which is memory-system-bound (cold-line latency + first-touch page
+    /// faults), single-threaded, GPU idle, 20 host cores free. Each work-unit in
+    /// `items` targets a DISTINCT (tensor,expert) accumulator (distinct experts
+    /// per token, distinct gate_up/down tensors), so the accumulators are
+    /// pairwise DISJOINT and can be updated concurrently — spreading the cold
+    /// memory traffic + faults across cores.
+    ///
+    /// BIT-IDENTICAL TO SERIAL: each accumulator receives EXACTLY the same
+    /// `accumulate_row(x)` call it would in the per-expert serial loop, computed
+    /// by exactly ONE thread; only the (already order-independent, because the
+    /// targets are disjoint) cross-accumulator iteration is parallelized. The
+    /// internal float sum of every H[i,j] entry is byte-for-byte the serial
+    /// result. See `accumulate_token_bit_identical_to_serial` parity test.
+    pub fn accumulate_token(&mut self, items: &[(String, &[f32], usize)]) {
+        use rayon::prelude::*;
+        // 1) Ensure every entry exists (serial; allocation must not race the
+        //    HashMap). Entries are keyed by full name; first sight sizes to k.
+        for (name, _x, k) in items {
+            self.entries
+                .entry(name.clone())
+                .or_insert_with(|| BlockHessianAcc::new(*k));
+        }
+        // 2) Gather a raw *mut to each target accumulator. The targets are
+        //    pairwise disjoint iff the names within this token are distinct —
+        //    which routing guarantees (distinct expert ids; distinct tensors).
+        //    A SyncPtr wrapper lets rayon move the (provably disjoint) pointers
+        //    across threads; no two closures touch the same accumulator.
+        #[derive(Clone, Copy)]
+        struct SyncPtr(*mut BlockHessianAcc);
+        // SAFETY: each pointer addresses a distinct HashMap value (distinct keys,
+        // asserted below); the map is not mutated for the duration of the
+        // parallel section, so the pointees are stable and non-overlapping.
+        unsafe impl Send for SyncPtr {}
+        unsafe impl Sync for SyncPtr {}
+
+        // Debug guard: catch any accidental duplicate key (would alias &mut).
+        debug_assert!(
+            {
+                let mut ns: Vec<&str> = items.iter().map(|(n, _, _)| n.as_str()).collect();
+                ns.sort_unstable();
+                let before = ns.len();
+                ns.dedup();
+                ns.len() == before
+            },
+            "accumulate_token: duplicate (tensor,expert) name within one token              would alias &mut — parallel accumulate requires distinct keys"
+        );
+
+        let ptrs: Vec<(SyncPtr, &[f32], usize)> = items
+            .iter()
+            .map(|(name, x, k)| {
+                let acc: &mut BlockHessianAcc = self
+                    .entries
+                    .get_mut(name)
+                    .expect("entry ensured above");
+                (SyncPtr(acc as *mut BlockHessianAcc), *x, *k)
+            })
+            .collect();
+
+        // 3) Parallel accumulate, one work-unit per rayon task. Each task calls
+        //    the SAME `accumulate_row` as serial on its own disjoint accumulator.
+        ptrs.par_iter().for_each(|&(p, x, k)| {
+            // SAFETY: disjoint targets (distinct keys); no aliasing across tasks.
+            let acc: &mut BlockHessianAcc = unsafe { &mut *p.0 };
+            if x.len() >= k {
+                acc.accumulate_row(&x[..k]);
+            } else {
+                let mut row = vec![0.0f32; k];
+                row[..x.len()].copy_from_slice(x);
+                acc.accumulate_row(&row);
+            }
+        });
+    }
 }
 
 /// Generate `n` FWHT sign values (+1.0 / -1.0) from a simple LCG seeded with `seed`.
@@ -566,6 +799,8 @@ impl Gpu {
                 q8_1_mmq_x_scratch_bytes: 0,
                 ksplit_det_partials: None,
                 ksplit_det_partials_bytes: 0,
+                sample_partials: None,
+                sample_partials_bytes: 0,
             },
             mmq_screen: MmqScreenState {
                 cache: HashMap::new(),
@@ -577,8 +812,10 @@ impl Gpu {
                 capture_blobs: Vec::new(),
                 graph_exec: None,
                 captured_graph: None,
+                ar_forward_blobs: Vec::new(),
                 ar_forward_kernel_dirty: true,
                 ar_forward_replay_enabled: false,
+                ar_graph_eligible: true,
                 verify: crate::graph::PerBGraphCache {
                     cache: std::collections::HashMap::new(),
                     warmed_up: std::collections::HashSet::new(),
@@ -594,6 +831,7 @@ impl Gpu {
             },
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
+            hessian_capture: None,
         }).map(|mut gpu| {
             if gpu.flags.force_blob_path {
                 eprintln!("[diag] HIPFIRE_BLOB_FORCE=1: all kernel launches will use the blob path (kernelParams bypassed). Diagnostic only.");
@@ -688,6 +926,143 @@ impl Gpu {
                 func,
                 [m as u32, groups, 1],
                 [128, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Dequantize MFP4G32-Lloyd matrix [M x K] to FP16 [M x K] row-major.
+    /// Input `w_mq4` = full tensor bytes (32-B codebook prefix + M rows).
+    /// Output `w_fp16` = FP16 row-major (M x K), in the ROTATED domain.
+    /// Grid: [M, K/256]. Block: [32]. Mirrors dequantize_hfq4g256_to_f16 shape.
+    pub fn dequantize_mfp4g32_lloyd_to_f16(
+        &mut self,
+        w_mq4: &DeviceBuffer,
+        w_fp16: &DeviceBuffer,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            k % 256 == 0,
+            "mfp4g32_lloyd dequant: K must be multiple of 256 (got {k})"
+        );
+        self.ensure_kernel(
+            "dequantize_mfp4g32_lloyd_to_f16",
+            kernels::DEQUANTIZE_MFP4G32_LLOYD_TO_F16_SRC,
+            "dequantize_mfp4g32_lloyd_to_f16",
+        )?;
+        let func = &self.functions["dequantize_mfp4g32_lloyd_to_f16"];
+        let mut w_in = w_mq4.as_ptr();
+        let mut w_out = w_fp16.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut w_in as *mut _ as *mut c_void,
+            &mut w_out as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+        ];
+        let groups = (k / 256) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, groups, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Dequantize an mfp4+P matrix [M x K] to FP16 [M x K] row-major.
+    /// Input `w_mq4` = full tensor bytes (M rows, NO prefix; byte-identical to mfp4).
+    /// Output `w_fp16` = FP16 row-major (M x K), in the ROTATED domain.
+    /// Decodes the per-block scale byte as E4M3 (FP8). Grid: [M, K/256]. Block: [32].
+    pub fn dequantize_mfp4g32_p_to_f16(
+        &mut self,
+        w_mq4: &DeviceBuffer,
+        w_fp16: &DeviceBuffer,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            k % 256 == 0,
+            "mfp4g32_p dequant: K must be multiple of 256 (got {k})"
+        );
+        self.ensure_kernel(
+            "dequantize_mfp4g32_p_to_f16",
+            kernels::DEQUANTIZE_MFP4G32_P_TO_F16_SRC,
+            "dequantize_mfp4g32_p_to_f16",
+        )?;
+        let func = &self.functions["dequantize_mfp4g32_p_to_f16"];
+        let mut w_in = w_mq4.as_ptr();
+        let mut w_out = w_fp16.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut w_in as *mut _ as *mut c_void,
+            &mut w_out as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+        ];
+        let groups = (k / 256) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, groups, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+
+    /// Dequantize an mfp4-E8 matrix [M x K] to FP16 [M x K] row-major.
+    /// Input `w_mq4` = full tensor bytes (M rows, NO prefix; byte-identical footprint to mfp4+P).
+    /// Output `w_fp16` = FP16 row-major (M x K), in the ROTATED domain.
+    /// Decodes the per-block scale byte as E4M3 (FP8) * QUANT_STEP, then E8 coords.
+    /// Grid: [M, K/256]. Block: [32].
+    pub fn dequantize_mfp4g32_e8_to_f16(
+        &mut self,
+        w_mq4: &DeviceBuffer,
+        w_fp16: &DeviceBuffer,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            k % 256 == 0,
+            "mfp4g32_e8 dequant: K must be multiple of 256 (got {k})"
+        );
+        self.ensure_kernel(
+            "dequantize_mfp4g32_e8_to_f16",
+            kernels::DEQUANTIZE_MFP4G32_E8_TO_F16_SRC,
+            "dequantize_mfp4g32_e8_to_f16",
+        )?;
+        let func = &self.functions["dequantize_mfp4g32_e8_to_f16"];
+        let mut w_in = w_mq4.as_ptr();
+        let mut w_out = w_fp16.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut w_in as *mut _ as *mut c_void,
+            &mut w_out as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+        ];
+        let groups = (k / 256) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, groups, 1],
+                [32, 1, 1],
                 0,
                 self.stream_ref(),
                 &mut params,
@@ -2023,6 +2398,105 @@ impl Drop for Gpu {
 #[cfg(test)]
 mod tests {
     use super::gen_fwht_signs;
+    use super::HessianCapture;
+
+    /// Deterministic pseudo-random rows (no RNG crate): mix in exact zeros,
+    /// signed-zero, negatives, and large/small magnitudes to exercise the
+    /// zero-skip branch and fp rounding.
+    fn fixed_row(k: usize, seed: u64) -> Vec<f32> {
+        let mut state: u64 = seed ^ 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as u32) as f64 / (u32::MAX as f64)
+        };
+        (0..k)
+            .map(|c| {
+                let r = next();
+                if r < 0.20 {
+                    0.0f32
+                } else if r < 0.25 {
+                    -0.0f32
+                } else {
+                    let mag = (r - 0.5) * 4.0;
+                    let scale = if c % 7 == 0 { 1.0e3 } else { 1.0 };
+                    (mag * scale) as f32
+                }
+            })
+            .collect()
+    }
+
+    /// LOAD-BEARING CORRECTNESS GATE for the rayon-parallel `accumulate_token`.
+    /// The parallel per-token accumulate (across disjoint (tensor,expert)
+    /// accumulators) MUST be BIT-IDENTICAL to the serial per-item `accumulate`
+    /// reference — a wrong parallel sum would silently produce wrong Hessians
+    /// and reconfound the GPTQ-on-E8 experiment. We compare every f64 entry by
+    /// raw bits (`to_bits()`), not an epsilon: each accumulator is updated by
+    /// exactly one thread with the SAME ops as serial, so exact equality is the
+    /// correct, strongest assertion. Multiple tokens are accumulated to verify
+    /// the parallel path is also correct across repeated touches of an entry.
+    #[test]
+    fn accumulate_token_bit_identical_to_serial() {
+        // A3B-shaped: gate_up K=2048 (8 blocks), down K=512 (2 blocks); 8 experts
+        // (distinct ids) -> 16 distinct (tensor,expert) keys per token.
+        let n_experts = 8usize;
+        let n_tokens = 5usize;
+        let k_gate = 2048usize;
+        let k_down = 512usize;
+
+        let mut par = HessianCapture::default();
+        let mut ser = HessianCapture::default();
+
+        for t in 0..n_tokens {
+            // Build this token's distinct work-units.
+            let mut names: Vec<String> = Vec::new();
+            let mut xs: Vec<Vec<f32>> = Vec::new();
+            let mut ks: Vec<usize> = Vec::new();
+            for e in 0..n_experts {
+                let l = 7usize;
+                names.push(format!(
+                    "model.language_model.layers.{l}.mlp.experts.{e}.gate_up_proj.weight"
+                ));
+                xs.push(fixed_row(k_gate, (t * 131 + e) as u64));
+                ks.push(k_gate);
+                names.push(format!(
+                    "model.language_model.layers.{l}.mlp.experts.{e}.down_proj.weight"
+                ));
+                xs.push(fixed_row(k_down, (t * 977 + e + 1) as u64));
+                ks.push(k_down);
+            }
+            // Serial reference: per-item accumulate in fixed order.
+            for i in 0..names.len() {
+                ser.accumulate(&names[i], &xs[i], ks[i]);
+            }
+            // Parallel path: one batched call.
+            let items: Vec<(String, &[f32], usize)> = (0..names.len())
+                .map(|i| (names[i].clone(), xs[i].as_slice(), ks[i]))
+                .collect();
+            par.accumulate_token(&items);
+        }
+
+        // Compare every accumulator bit-for-bit.
+        assert_eq!(par.entries.len(), ser.entries.len());
+        for (name, pacc) in &par.entries {
+            let sacc = ser.entries.get(name).expect("name in serial map");
+            assert_eq!(pacc.n_blocks, sacc.n_blocks, "{name} n_blocks");
+            assert_eq!(pacc.n_rows, sacc.n_rows, "{name} n_rows");
+            for b in 0..pacc.n_blocks {
+                let pb = &pacc.blocks[b];
+                let sb = &sacc.blocks[b];
+                for idx in 0..pb.len() {
+                    assert_eq!(
+                        pb[idx].to_bits(),
+                        sb[idx].to_bits(),
+                        "{name} block={b} idx={idx}: parallel {} != serial {} (NOT bit-identical)",
+                        pb[idx], sb[idx]
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn mq_signs_128_deterministic() {

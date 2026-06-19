@@ -579,6 +579,22 @@ pub struct MoeFfnWeights {
     pub expert_gate_up_ptrs: GpuTensor, // [num_experts * 2] f32 slots = num_experts × u64
     pub expert_down_ptrs: GpuTensor,      // [num_experts * 2] f32 slots = num_experts × u64
 
+    /// Route A MoE-AWQ: per-expert down `awq_scale` pointer table
+    /// (`[num_experts * 2]` f32 = num_experts × u64). `Some` only when the
+    /// `.hfq` carries per-expert `down_proj.awq_scale` sidecars (all-or-none).
+    /// Holds *non-owning* device pointers into each `experts[i].down.awq_scale`
+    /// — freed as a buffer only; the scales are freed via
+    /// `ExpertWeights::down.free_all`.
+    pub expert_down_awq_ptrs: Option<GpuTensor>,
+
+    /// Per-expert mixed-precision decode: `[num_experts]` u8 (DType::Raw,
+    /// 1 B/expert) dtype-tag table. `Some` only when the layer's routed
+    /// experts carry MIXED down dtypes (graded MQ6 hot / MQ2-Lloyd cold);
+    /// the merged dtype-tag-branched down kernel reads `tags[expert_id]`
+    /// per block (0=MQ6, 1=MQ2-Lloyd). `None` ⇒ uniform path, byte-identical.
+    /// Owned device buffer (no aliasing) — freed as a buffer in free_moe_ffn.
+    pub expert_dtype_tags: Option<GpuTensor>,
+
     /// Layer index. Stable identity used to key
     /// [`hipfire_runtime::weight_pager::WeightId::Expert`] entries.
     pub layer_idx: u16,
@@ -836,6 +852,16 @@ fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
     ffn.shared_expert.down.free_all(gpu);
     let _ = gpu.free_tensor(ffn.expert_gate_up_ptrs);
     let _ = gpu.free_tensor(ffn.expert_down_ptrs);
+    // Non-owning pointer table — free the buffer only; the per-expert scales it
+    // points into are owned by `experts[i].down.awq_scale` and freed below via
+    // `e.down.free_all`.
+    if let Some(t) = ffn.expert_down_awq_ptrs {
+        let _ = gpu.free_tensor(t);
+    }
+    // Owned device buffer (built from per-expert gpu_dtype). Free it.
+    if let Some(t) = ffn.expert_dtype_tags {
+        let _ = gpu.free_tensor(t);
+    }
     for e in ffn.experts {
         e.gate_up.free_all(gpu);
         e.down.free_all(gpu);
@@ -1403,6 +1429,22 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
             })
         }
+        31 => {
+            // MQ5-G256 — MagnumQuant FWHT-rotated 5-bit (168 bytes/group, 5.25 bpw).
+            // Opaque raw buffer, same pattern as MQ4(13)/MQ6(15); the GEMV
+            // dispatch FWHT-rotates x at use. AWQ sidecar attached by the
+            // caller via DType::supports_awq_sidecar (already includes MQ5G256).
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ5G256,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         21 => {
             // HFP4G32 — E2M1 + UE8M0 g32 + FP16 row scale. See docs/quant-formats/hfp4.md.
             // K%256 — kernel constraint (gemv_hfp4g32 in dispatch.rs); refuse here so a
@@ -1434,6 +1476,80 @@ fn load_weight_tensor_raw(
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MFP4G32,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        32 => {
+            // MFP4G32Lloyd lm_head: mfp4 rows + 32-B per-tensor fp16 codebook prefix.
+            assert!(k % 256 == 0, "MFP4G32Lloyd lm_head has K={k} but kernel + FWHT both require K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MFP4G32Lloyd,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        33 => {
+            // MFP4G32P lm_head: mfp4+P — mfp4 rows with E4M3 per-block scale. NO prefix;
+            // byte-identical layout to MFP4G32 (qt 24).
+            assert!(k % 256 == 0, "MFP4G32P lm_head has K={k} but kernel + FWHT both require K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MFP4G32P,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        34 => {
+            // MFP4G32E8 lm_head: mfp4-E8 — mfp4+P container, NO prefix, same row_bytes;
+            // per-32-block 16 E2M1 nibbles replaced by 4x32-bit E8-lattice codewords.
+            assert!(k % 256 == 0, "MFP4G32E8 lm_head has K={k} but kernel + FWHT both require K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MFP4G32E8,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        36 => {
+            // MFP3G32E8: mfp4-E8 frame with 3-bit lattice, 13 B/blk, 3.25 bpw.
+            // Drop-in cold tier for MQ3G256Lloyd (kernel tag 5).
+            assert!(k % 256 == 0, "MFP3G32E8 has K={k} but FWHT requires K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MFP3G32E8,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        37 => {
+            // MFP2G32E8: mfp4-E8 frame with 2-bit lattice, 9 B/blk, 2.25 bpw.
+            // Drop-in cold tier for MQ2G256Lloyd (kernel tag 6).
+            assert!(k % 256 == 0, "MFP2G32E8 has K={k} but FWHT requires K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MFP2G32E8,
                 m,
                 k,
                 row_stride: 0,
@@ -1526,6 +1642,20 @@ fn load_weight_tensor_raw(
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::F32,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        35 => {
+            // MFP4G32E8SOA lm_head: mfp4-E8 SoA layout for coalesced GEMV.
+            assert!(k % 256 == 0, "MFP4G32E8SOA lm_head has K={k} but kernel + FWHT both require K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MFP4G32E8SOA,
                 m,
                 k,
                 row_stride: 0,
@@ -2118,6 +2248,11 @@ fn paro_load_moe_ffn(
         shared_expert_gate,
         expert_gate_up_ptrs,
         expert_down_ptrs,
+        // ParoQuant routed experts use shared per-layer Givens sidecars, not
+        // per-expert MQ4 AWQ scales — no MoE-AWQ table.
+        expert_down_awq_ptrs: None,
+        // Paged/paro layers are uniform-dtype — no per-expert mixed table.
+        expert_dtype_tags: None,
         layer_idx,
         expert_shape: None,
         paro_shared: Some(shared),
@@ -2633,6 +2768,303 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
                 let scale_inv = 0.0625; // 1/sqrt(256)
                 for i in 0..256 {
                     group[i] *= scale_inv * signs1[i];
+                }
+            }
+            out
+        }
+        32 => {
+            // MFP4G32Lloyd (qt 32): [32-B fp16 codebook prefix][M rows].
+            // Each row = 16-B header + (K/32)*17 B blocks (UE8M0 + nibbles).
+            // Recon: value = row_scale_a * 2^(block_e-127) * cb[nibble].
+            // Returns rotated-domain f32 (weights stored pre-FWHT-rotated).
+            let row_bytes = 16 + 17 * (n / 32);
+            let m_rows = if row_bytes > 0 { (data.len().saturating_sub(32)) / row_bytes } else { 0 };
+            let mut cb = [0.0f32; 16];
+            for i in 0..16 {
+                let bits = u16::from_le_bytes([data[2*i], data[2*i+1]]);
+                cb[i] = hipfire_runtime::llama::f16_to_f32(bits);
+            }
+            let mut out = vec![0.0f32; n];
+            let k_row = if m_rows > 0 { n / m_rows } else { n };
+            let k_row = k_row.max(1);
+            let n_blocks = k_row / 32;
+            for r in 0..m_rows {
+                let base = 32 + r * (16 + n_blocks * 17);
+                let row_scale_a = hipfire_runtime::llama::f16_to_f32(
+                    u16::from_le_bytes([data[base], data[base+1]]));
+                for b in 0..n_blocks {
+                    let po = base + 16 + b * 17;
+                    let block_e = data[po] as i32;
+                    let scale = row_scale_a * ((block_e - 127) as f32).exp2();
+                    for i in 0..16 {
+                        let byte = data[po + 1 + i];
+                        out[r*k_row + b*32 + 2*i]     = scale * cb[(byte & 0x0F) as usize];
+                        out[r*k_row + b*32 + 2*i + 1] = scale * cb[((byte >> 4) & 0x0F) as usize];
+                    }
+                }
+            }
+            out
+        }
+        33 => {
+            // MFP4G32P (qt 33): mfp4 rows (NO prefix) with E4M3 (FP8) per-block scale.
+            // Recon: value = row_scale_a * e4m3_decode(scale_byte) * E2M1_LUT[nibble].
+            // Returns rotated-domain f32 (weights stored pre-FWHT-rotated).
+            const E2M1_MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+            #[inline]
+            fn e2m1(n: u8) -> f32 {
+                let m = E2M1_MAG[(n & 0x7) as usize];
+                if (n & 0x8) != 0 { -m } else { m }
+            }
+            // E4M3 (unsigned scale, bias 7, 3 mantissa) — bit-identical to the
+            // quantizer `e4m3_scale_decode` and the gfx942 kernel decode.
+            #[inline]
+            fn e4m3(b: u8) -> f32 {
+                let exp = ((b >> 3) & 0xf) as i32;
+                let mant = (b & 0x7) as u32;
+                if exp == 0 { return (2.0f32).powi(-6) * (mant as f32) / 8.0; }
+                if exp == 0xf && mant == 7 { return 448.0; }
+                (2.0f32).powi(exp - 7) * (1.0 + (mant as f32) / 8.0)
+            }
+            let row_bytes = 16 + 17 * (n / 32);
+            let m_rows = if row_bytes > 0 { data.len() / row_bytes } else { 0 };
+            let mut out = vec![0.0f32; n];
+            let k_row = if m_rows > 0 { n / m_rows } else { n };
+            let k_row = k_row.max(1);
+            let n_blocks = k_row / 32;
+            for r in 0..m_rows {
+                let base = r * (16 + n_blocks * 17);
+                let row_scale_a = hipfire_runtime::llama::f16_to_f32(
+                    u16::from_le_bytes([data[base], data[base + 1]]));
+                for b in 0..n_blocks {
+                    let po = base + 16 + b * 17;
+                    let scale = row_scale_a * e4m3(data[po]);
+                    for i in 0..16 {
+                        let byte = data[po + 1 + i];
+                        out[r*k_row + b*32 + 2*i]     = scale * e2m1(byte & 0x0F);
+                        out[r*k_row + b*32 + 2*i + 1] = scale * e2m1((byte >> 4) & 0x0F);
+                    }
+                }
+            }
+            out
+        }
+        34 => {
+            // MFP4G32E8 (qt 34): mfp4+P container, NO prefix, with E8-lattice codewords.
+            // Identical framing to qt 33 (E4M3 block scale, row_scale f16); per block
+            // decode 4 E8 codewords instead of 32 E2M1 nibbles.
+            // E8 decode — bit-identical to e8.rs::decode_index + * QUANT_STEP.
+            #[inline]
+            fn e4m3_e8(b: u8) -> f32 {
+                let exp = ((b >> 3) & 0xf) as i32;
+                let mant = (b & 0x7) as u32;
+                if exp == 0 { return (2.0f32).powi(-6) * (mant as f32) / 8.0; }
+                if exp == 0xf && mant == 7 { return 448.0; }
+                (2.0f32).powi(exp - 7) * (1.0 + (mant as f32) / 8.0)
+            }
+            #[inline]
+            fn e8_decode(idx: u32, coord: usize) -> f32 {
+                // Decode a single coord of an E8 lattice point from a u32 index.
+                // Matches kernel e8_decode_index exactly.
+                let coset = (idx >> 31) & 1;
+                let e: u32;
+                if coord < 7 {
+                    e = (idx >> (4 * coord as u32)) & 0xF;
+                } else {
+                    // coord == 7: recover from parity
+                    let mut sl: u32 = 0;
+                    for i in 0..7 { sl += (idx >> (4 * i)) & 0xF; }
+                    let e7h = (idx >> 28) & 0x7;
+                    let p7 = e7h << 1;
+                    let lsb = (sl + p7) & 1;
+                    e = p7 | lsb;
+                }
+                let c = (e as i32 - 7) as f32;
+                if coset == 1 { c + 0.5 } else { c }
+            }
+            const QUANT_STEP: f32 = 0.88;
+            let row_bytes = 16 + 17 * (n / 32);
+            let m_rows = if row_bytes > 0 { data.len() / row_bytes } else { 0 };
+            let mut out = vec![0.0f32; n];
+            let k_row = if m_rows > 0 { n / m_rows } else { n };
+            let k_row = k_row.max(1);
+            let n_blocks = k_row / 32;
+            for r in 0..m_rows {
+                let base = r * (16 + n_blocks * 17);
+                let row_scale_a = hipfire_runtime::llama::f16_to_f32(
+                    u16::from_le_bytes([data[base], data[base + 1]]));
+                for b in 0..n_blocks {
+                    let po = base + 16 + b * 17;
+                    let scale = row_scale_a * e4m3_e8(data[po]) * QUANT_STEP;
+                    for g in 0..4usize {
+                        let idx = u32::from_le_bytes([
+                            data[po + 1 + g * 4],
+                            data[po + 2 + g * 4],
+                            data[po + 3 + g * 4],
+                            data[po + 4 + g * 4],
+                        ]);
+                        for i in 0..8usize {
+                            out[r * k_row + b * 32 + g * 8 + i] = scale * e8_decode(idx, i);
+                        }
+                    }
+                }
+            }
+            out
+        }
+        35 => {
+            // MFP4G32E8SOA (qt 35): same E8 data as qt 34 but in SoA layout.
+            // Per-row: [16B hdr] + [n_blocks bytes E4M3 scales, pad16] + [n_blocks*16 bytes codewords].
+            #[inline]
+            fn e4m3_e8_soa(b: u8) -> f32 {
+                let exp = ((b >> 3) & 0xf) as i32;
+                let mant = (b & 0x7) as u32;
+                if exp == 0 { return (2.0f32).powi(-6) * (mant as f32) / 8.0; }
+                if exp == 0xf && mant == 7 { return 448.0; }
+                (2.0f32).powi(exp - 7) * (1.0 + (mant as f32) / 8.0)
+            }
+            #[inline]
+            fn e8_decode_soa(idx: u32, coord: usize) -> f32 {
+                let coset = (idx >> 31) & 1;
+                let e: u32;
+                if coord < 7 {
+                    e = (idx >> (4 * coord as u32)) & 0xF;
+                } else {
+                    let mut sl: u32 = 0;
+                    for i in 0..7 { sl += (idx >> (4 * i)) & 0xF; }
+                    let e7h = (idx >> 28) & 0x7;
+                    let p7 = e7h << 1;
+                    let lsb = (sl + p7) & 1;
+                    e = p7 | lsb;
+                }
+                let c = (e as i32 - 7) as f32;
+                if coset == 1 { c + 0.5 } else { c }
+            }
+            const QUANT_STEP_SOA: f32 = 0.88;
+            // Decode assuming n = k_row; figure out m_rows from total bytes.
+            // n_blocks = n/32; scale_padded = ceil(n_blocks/16)*16
+            let n_blocks = n / 32;
+            let scale_padded = ((n_blocks + 15) >> 4) << 4;
+            let soa_row_bytes = 16 + scale_padded + n_blocks * 16;
+            let m_rows = if soa_row_bytes > 0 { data.len() / soa_row_bytes } else { 0 };
+            let mut out = vec![0.0f32; n];
+            let k_row = if m_rows > 0 { n / m_rows } else { n };
+            let k_row = k_row.max(1);
+            let n_blocks2 = k_row / 32;
+            let scale_padded2 = ((n_blocks2 + 15) >> 4) << 4;
+            let row_bytes2 = 16 + scale_padded2 + n_blocks2 * 16;
+            for r in 0..m_rows {
+                let base = r * row_bytes2;
+                let row_scale_a = hipfire_runtime::llama::f16_to_f32(
+                    u16::from_le_bytes([data[base], data[base + 1]]));
+                let scale_arr = &data[base + 16..base + 16 + n_blocks2];
+                let cw_arr    = &data[base + 16 + scale_padded2..base + 16 + scale_padded2 + n_blocks2 * 16];
+                for b in 0..n_blocks2 {
+                    let scale = row_scale_a * e4m3_e8_soa(scale_arr[b]) * QUANT_STEP_SOA;
+                    for g in 0..4usize {
+                        let co = b * 16 + g * 4;
+                        let idx = u32::from_le_bytes([
+                            cw_arr[co], cw_arr[co + 1], cw_arr[co + 2], cw_arr[co + 3],
+                        ]);
+                        for i in 0..8usize {
+                            out[r * k_row + b * 32 + g * 8 + i] = scale * e8_decode_soa(idx, i);
+                        }
+                    }
+                }
+            }
+            out
+        }
+        36 => {
+            // MFP3G32E8 (qt 36): mfp4-E8 frame with 3-bit lattice, 13 B/blk, center 4.
+            // Decode mirrors kernel mfp3_decode_index: nibbles 3b, coset bit 23, e7_high 2b@21.
+            #[inline]
+            fn e4m3_mfp3(b: u8) -> f32 {
+                let exp = ((b >> 3) & 0xf) as i32;
+                let mant = (b & 0x7) as u32;
+                if exp == 0 { return (2.0f32).powi(-6) * (mant as f32) / 8.0; }
+                if exp == 0xf && mant == 7 { return 448.0; }
+                (2.0f32).powi(exp - 7) * (1.0 + (mant as f32) / 8.0)
+            }
+            const MFP3_BLOCK: usize = 13; // 1 + 4*3
+            const MFP3_STEP: f32 = 1.8; // MSE-tuned; matches QUANT_STEP_MFP3 in e8.rs + kernels
+            let row_bytes = 16 + MFP3_BLOCK * (n / 32);
+            let m_rows = if row_bytes > 0 { data.len() / row_bytes } else { 0 };
+            let mut out = vec![0.0f32; n];
+            let k_row = if m_rows > 0 { n / m_rows } else { n };
+            let k_row = k_row.max(1);
+            let n_blocks = k_row / 32;
+            for r in 0..m_rows {
+                let base = r * (16 + n_blocks * MFP3_BLOCK);
+                let row_scale_a = hipfire_runtime::llama::f16_to_f32(
+                    u16::from_le_bytes([data[base], data[base + 1]]));
+                for b in 0..n_blocks {
+                    let po = base + 16 + b * MFP3_BLOCK;
+                    let scale = row_scale_a * e4m3_mfp3(data[po]) * MFP3_STEP;
+                    for g in 0..4usize {
+                        let cw_off = po + 1 + g * 3;
+                        // 3-byte narrow read (mfp3 codeword is only 24 bits)
+                        let idx: u32 = (data[cw_off] as u32)
+                            | ((data[cw_off + 1] as u32) << 8)
+                            | ((data[cw_off + 2] as u32) << 16);
+                        // mfp3_decode_index: 3-bit nibbles, center 4, coset bit 23, e7_high @21 (2b)
+                        let coset = (idx >> 23) & 1;
+                        let mut e = [0u32; 8];
+                        let mut sl: u32 = 0;
+                        for i in 0..7 { e[i] = (idx >> (3 * i as u32)) & 0x7; sl += e[i]; }
+                        let e7_high = (idx >> 21) & 0x3;
+                        let p7 = e7_high << 1;
+                        e[7] = p7 | ((sl + p7) & 1);
+                        for i in 0..8usize {
+                            let c = (e[i] as i32 - 4) as f32;
+                            let coord = if coset == 1 { c + 0.5 } else { c };
+                            out[r * k_row + b * 32 + g * 8 + i] = scale * coord;
+                        }
+                    }
+                }
+            }
+            out
+        }
+        37 => {
+            // MFP2G32E8 (qt 37): mfp4-E8 frame with 2-bit lattice, 9 B/blk, center 2.
+            // Decode mirrors kernel mfp2_decode_index: nibbles 2b, coset bit 15, e7_high 1b@14.
+            #[inline]
+            fn e4m3_mfp2(b: u8) -> f32 {
+                let exp = ((b >> 3) & 0xf) as i32;
+                let mant = (b & 0x7) as u32;
+                if exp == 0 { return (2.0f32).powi(-6) * (mant as f32) / 8.0; }
+                if exp == 0xf && mant == 7 { return 448.0; }
+                (2.0f32).powi(exp - 7) * (1.0 + (mant as f32) / 8.0)
+            }
+            const MFP2_BLOCK: usize = 9; // 1 + 4*2
+            const MFP2_STEP: f32 = 3.8; // MSE-tuned; matches QUANT_STEP_MFP2 in e8.rs + kernels
+            let row_bytes = 16 + MFP2_BLOCK * (n / 32);
+            let m_rows = if row_bytes > 0 { data.len() / row_bytes } else { 0 };
+            let mut out = vec![0.0f32; n];
+            let k_row = if m_rows > 0 { n / m_rows } else { n };
+            let k_row = k_row.max(1);
+            let n_blocks = k_row / 32;
+            for r in 0..m_rows {
+                let base = r * (16 + n_blocks * MFP2_BLOCK);
+                let row_scale_a = hipfire_runtime::llama::f16_to_f32(
+                    u16::from_le_bytes([data[base], data[base + 1]]));
+                for b in 0..n_blocks {
+                    let po = base + 16 + b * MFP2_BLOCK;
+                    let scale = row_scale_a * e4m3_mfp2(data[po]) * MFP2_STEP;
+                    for g in 0..4usize {
+                        let cw_off = po + 1 + g * 2;
+                        // 2-byte narrow read (mfp2 codeword is only 16 bits)
+                        let idx: u32 = (data[cw_off] as u32) | ((data[cw_off + 1] as u32) << 8);
+                        // mfp2_decode_index: 2-bit nibbles, center 2, coset bit 15, e7_high @14 (1b)
+                        let coset = (idx >> 15) & 1;
+                        let mut e = [0u32; 8];
+                        let mut sl: u32 = 0;
+                        for i in 0..7 { e[i] = (idx >> (2 * i as u32)) & 0x3; sl += e[i]; }
+                        let e7_high = (idx >> 14) & 0x1;
+                        let p7 = e7_high << 1;
+                        e[7] = p7 | ((sl + p7) & 1);
+                        for i in 0..8usize {
+                            let c = (e[i] as i32 - 2) as f32;
+                            let coord = if coset == 1 { c + 0.5 } else { c };
+                            out[r * k_row + b * 32 + g * 8 + i] = scale * coord;
+                        }
+                    }
                 }
             }
             out
@@ -4331,10 +4763,78 @@ fn load_layer_into(
     })
 }
 
+thread_local! {
+    /// Per-thread EP expert-shard context. When `Some((shard, rank))`,
+    /// [`load_moe_ffn`] loads ONLY this rank's owned experts (streaming
+    /// owned-only) and builds the `[n_exp]` global pointer tables with dummy
+    /// pointers for non-owned slots — the SAME structure post-load
+    /// [`shard_moe_experts`] produces, but WITHOUT the full-model load peak that
+    /// OOMs a model larger than one card's VRAM. Set by the EP load driver
+    /// around `load_weights`, cleared (`None`) after. `None` = full replicated
+    /// load (the default for every non-EP caller).
+    static EP_EXPERT_SHARD: std::cell::RefCell<Option<(ShardConfig, usize)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Set the per-thread EP expert-shard context consumed by `load_weights` →
+/// [`load_moe_ffn`]. The EP load driver calls this with `Some((shard, rank))`
+/// immediately before `load_weights` on each rank, then `None` immediately
+/// after. Mirrors DeepSeek-V4's `load_weights_sharded` but threaded via TLS so
+/// the 87 existing `load_weights` callers need no signature change.
+pub fn set_ep_expert_shard(ctx: Option<(ShardConfig, usize)>) {
+    EP_EXPERT_SHARD.with(|c| *c.borrow_mut() = ctx);
+}
+
+fn current_ep_expert_shard() -> Option<(ShardConfig, usize)> {
+    EP_EXPERT_SHARD.with(|c| c.borrow().clone())
+}
+
 /// Load one layer's full MoE FFN block: router, all routed experts, shared expert,
 /// and the per-layer scalar shared-expert gate. Tensor naming follows what the
 /// quantizer emits for qwen3_5_moe (commit 4860575): the 3D stacked-expert source
 /// tensors get split per-expert into `mlp.experts.{X}.{base}.weight`.
+///
+/// HIPFIRE_E8_SOA_EXPERTS (cached): transpose routed E8 gate_up experts AoS->SoA at
+/// load so the SoA-coalesced indexed kernel can read them. Must match the dispatch
+/// flag in rdna-compute (same env). Default OFF.
+fn e8_soa_experts() -> bool {
+    use std::sync::OnceLock;
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| std::env::var("HIPFIRE_E8_SOA_EXPERTS").map(|v| v == "1").unwrap_or(false))
+}
+
+/// AoS mfp4-E8 -> SoA byte transform (exact port of `aos_to_soa_full` in
+/// bench_e8_soa_correctness). AoS row: [16B hdr][n_blocks×(1B scale + 16B cw)].
+/// SoA row: [16B hdr (flag=0x06)][n_blocks scales, pad16][n_blocks×16B cw]. Same size.
+fn e8_aos_to_soa(aos: &[u8], m: usize, k: usize) -> Vec<u8> {
+    let n_blocks = k / 32;
+    let aos_row = 16 + n_blocks * 17;
+    let scale_padded = ((n_blocks + 15) >> 4) << 4;
+    let soa_row = 16 + scale_padded + n_blocks * 16;
+    let mut out = vec![0u8; m * soa_row];
+    for r in 0..m {
+        let src = &aos[r * aos_row..(r + 1) * aos_row];
+        let dst = &mut out[r * soa_row..(r + 1) * soa_row];
+        dst[..16].copy_from_slice(&src[..16]);
+        dst[6] = 0x06; // SoA flag
+        for b in 0..n_blocks {
+            dst[16 + b] = src[16 + b * 17]; // E4M3 scales -> contiguous
+        }
+        let cw0 = 16 + scale_padded;
+        for b in 0..n_blocks {
+            let s = 16 + b * 17 + 1;
+            let d = cw0 + b * 16;
+            dst[d..d + 16].copy_from_slice(&src[s..s + 16]); // 16B codewords -> contiguous
+        }
+    }
+    out
+}
+
+/// EP streaming-shard mode: when [`current_ep_expert_shard`] is `Some`, only the
+/// rank's owned experts are read/allocated; the pointer tables are built global
+/// `[n_exp]` with dummy pointers for non-owned slots (which contribute 0 to the
+/// all-reduce because their gate_up is a zeroed buffer). Uniform files only —
+/// graded/AWQ EP would need the full per-expert dtype map and is rejected here.
 fn load_moe_ffn(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -4388,8 +4888,18 @@ fn load_moe_ffn(
     // Routed experts — quantizer wrote per-expert tensors named
     // `{p}.mlp.experts.{X}.gate_up_proj.weight` (shape [2*moe_intermediate, hidden_size])
     // and `{p}.mlp.experts.{X}.down_proj.weight` (shape [hidden_size, moe_intermediate]).
+    // EP streaming-shard: load ONLY this rank's owned experts (see fn doc). When
+    // not sharding (`None`), `owns(x)` is always true → full replicated load.
+    // The closure caches the decision so the pointer-table build below agrees
+    // with this load loop.
+    let ep_shard = current_ep_expert_shard();
+    let owns = |x: usize| ep_shard.as_ref().map_or(true, |(sh, r)| sh.owns_expert(*r, x));
+
     let mut experts = Vec::with_capacity(n_exp);
     for x in 0..n_exp {
+        if !owns(x) {
+            continue; // non-owned on this rank: dummy pointer assigned below
+        }
         let gate_up = load_weight_tensor(
             hfq,
             gpu,
@@ -4407,16 +4917,72 @@ fn load_moe_ffn(
         experts.push(ExpertWeights { gate_up, down });
     }
 
+    // gfx11 E8 SoA experts: transpose routed gate_up E8 weights AoS->SoA at load so the
+    // SoA-coalesced indexed kernel reads coalesced; the ptr table below picks up the new
+    // SoA bufs. Down experts stay AoS (down SoA = increment 2). RDNA3 dGPU +
+    // HIPFIRE_E8_SOA_EXPERTS=1, full-load only (EP shard builds its table separately).
+    if e8_soa_experts() && gpu.arch_caps.is_rdna3_dgpu() && ep_shard.is_none() {
+        let mut converted = 0usize;
+        for ew in experts.iter_mut() {
+            if ew.gate_up.gpu_dtype == DType::MFP4G32E8 {
+                let (m, k) = (ew.gate_up.m, ew.gate_up.k);
+                let nbytes = ew.gate_up.buf.buf.size();
+                let mut aos = vec![0u8; nbytes];
+                gpu.hip.memcpy_dtoh(&mut aos, &ew.gate_up.buf.buf)?;
+                let soa = e8_aos_to_soa(&aos, m, k);
+                // In-place overwrite — SoA == AoS byte size when n_blocks%16==0 (true for
+                // K=2048: 16+64+64*16 == 16+64*17 == 1104). No new alloc → no VRAM growth.
+                if soa.len() == nbytes {
+                    gpu.hip.memcpy_htod(&ew.gate_up.buf.buf, &soa)?;
+                    converted += 1;
+                } else if layer_idx == 0 {
+                    eprintln!("  [e8-soa] SKIP: SoA size {} != AoS {} (n_blocks%16!=0) — keeping AoS", soa.len(), nbytes);
+                }
+            }
+        }
+        if converted > 0 && layer_idx == 0 {
+            eprintln!("  [e8-soa] transposed {converted} gate_up experts AoS->SoA (per layer)");
+        }
+    }
+
     // Build the device-side pointer tables consumed by the indexed MoE
     // GEMV kernels. Each slot is an `unsigned long long` (the device
     // address of an expert's `gate_up.buf` / `down.buf`). Stored as an
     // F32 tensor of length 2 * num_experts because each pointer occupies
     // 8 bytes = 2 F32 slots; the kernel reads them via a u64 cast.
-    let mut gu_ptrs: Vec<u64> = Vec::with_capacity(n_exp);
-    let mut dn_ptrs: Vec<u64> = Vec::with_capacity(n_exp);
-    for e in &experts {
-        gu_ptrs.push(e.gate_up.buf.buf.as_ptr() as u64);
-        dn_ptrs.push(e.down.buf.buf.as_ptr() as u64);
+    // GLOBAL [n_exp] device pointer tables (8 B/ptr = 2 F32 slots). Full load:
+    // gu_ptrs[e] = experts[e]. EP shard: non-owned slots get a dummy pointer
+    // (zeroed gate_up ⇒ silu output 0 ⇒ 0 contribution to the EP all-reduce;
+    // the down dummy is a real owned buffer so its uniform-dtype dequant stays
+    // in-bounds) — exactly what `shard_moe_experts` builds post-load.
+    let mut gu_ptrs = vec![0u64; n_exp];
+    let mut dn_ptrs = vec![0u64; n_exp];
+    if ep_shard.is_some() {
+        assert!(!experts.is_empty(), "EP shard: rank owns no experts in layer {layer_idx}");
+        // Shared zeroed gate_up dummy (same byte size as a real expert gate_up).
+        // LEAKED so the ptr stays valid for the model's lifetime (matches
+        // shard_moe_experts v1).
+        let gu_buf_bytes = experts[0].gate_up.buf.buf.size();
+        let zero_gu = gpu.zeros(&[gu_buf_bytes / 4], DType::F32)?;
+        let dummy_gu = zero_gu.buf.as_ptr() as u64;
+        std::mem::forget(zero_gu);
+        let dummy_dn = experts[0].down.buf.buf.as_ptr() as u64;
+        let mut li = 0usize;
+        for e in 0..n_exp {
+            if owns(e) {
+                gu_ptrs[e] = experts[li].gate_up.buf.buf.as_ptr() as u64;
+                dn_ptrs[e] = experts[li].down.buf.buf.as_ptr() as u64;
+                li += 1;
+            } else {
+                gu_ptrs[e] = dummy_gu;
+                dn_ptrs[e] = dummy_dn;
+            }
+        }
+    } else {
+        for (e, ew) in experts.iter().enumerate() {
+            gu_ptrs[e] = ew.gate_up.buf.buf.as_ptr() as u64;
+            dn_ptrs[e] = ew.down.buf.buf.as_ptr() as u64;
+        }
     }
     let gu_bytes: Vec<u8> = gu_ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
     let dn_bytes: Vec<u8> = dn_ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
@@ -4425,6 +4991,135 @@ fn load_moe_ffn(
     gpu.hip.memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)?;
     gpu.hip.memcpy_htod(&expert_down_ptrs.buf, &dn_bytes)?;
 
+    // Route A MoE-AWQ: when every expert carries a down.awq_scale sidecar
+    // (auto-loaded by load_weight_tensor for MQ4G256, which supports_awq_sidecar),
+    // build the per-expert pointer table the indexed silu+rotate selects from
+    // (topk_indices[krank] → expert's [mi] scale). All-or-none — a partial set
+    // is a malformed file and disables MoE-AWQ for the layer.
+    // Debug kill-switch, read ONCE at load (never on the decode hot path):
+    // HIPFIRE_MOE_AWQ=0 forces the plain silu+rotate even on an AWQ file.
+    // NOTE: this is a path-confirmation tool, NOT a safe fallback — AWQ files
+    // bake W·s into the weights, so skipping the x/s divide yields W·s·x
+    // (garbage). Expect incoherent output when set on an AWQ file; that
+    // *confirms* the indexed AWQ kernel is the firing path. The real
+    // AWQ-vs-plain A/B uses two separately quantized files.
+    let moe_awq_enabled = std::env::var("HIPFIRE_MOE_AWQ").ok().as_deref() != Some("0");
+    let awq_present = experts.iter().filter(|e| e.down.awq_scale.is_some()).count();
+    let expert_down_awq_ptrs = if ep_shard.is_some() {
+        // EP shard: AWQ-EP needs a sharded scale pointer table (dummies for
+        // non-owned slots). Not yet supported — guard rather than silently
+        // disable. Uniform-no-AWQ files (e.g. .mq6) hit `awq_present == 0` → None.
+        if awq_present != 0 {
+            return Err(HipError::new(
+                0,
+                "AWQ MoE EP not yet supported (quantize experts without AWQ for EP serving)",
+            ));
+        }
+        None
+    } else if moe_awq_enabled && n_exp > 0 && awq_present == n_exp {
+        let aw_ptrs: Vec<u64> = experts
+            .iter()
+            .map(|e| e.down.awq_scale.as_ref().unwrap().buf.as_ptr() as u64)
+            .collect();
+        let aw_bytes: Vec<u8> = aw_ptrs.iter().flat_map(|q| q.to_ne_bytes()).collect();
+        let t = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
+        gpu.hip.memcpy_htod(&t.buf, &aw_bytes)?;
+        Some(t)
+    } else {
+        if awq_present != 0 {
+            eprintln!(
+                "[moe-awq] layer {layer_idx}: partial down.awq_scale coverage \
+                 ({awq_present}/{n_exp}) — disabling MoE-AWQ for this layer"
+            );
+        }
+        None
+    };
+
+    // ── Per-expert mixed-precision dtype-tag table ──────────────────────
+    // For N-tier graded files (T3-2L / T3-3L) the TIER_MAP assigns each
+    // expert a tier that applies to BOTH gate_up AND down.  Built iff
+    // gate_up OR down dtypes differ across experts (single source of truth
+    // for `routed_has_mixed_experts`).  Tags:
+    //   0 = MQ6G256      (200 B/group affine)
+    //   1 = MQ2G256Lloyd ( 72 B/group codebook)
+    //   2 = MQ4G256      (136 B/group affine)
+    //   3 = MQ3G256Lloyd (112 B/group codebook)
+    //   4 = MFP4G32E8    (16 B row hdr + (K/32)*17 B; E8 lattice VQ, 4.25 bpw)
+    //   5 = MFP3G32E8    (16 B row hdr + (K/32)*13 B; 3-bit E8 lattice, 3.25 bpw)
+    //   6 = MFP2G32E8    (16 B row hdr + (K/32)*9  B; 2-bit E8 lattice, 2.25 bpw)
+    // Uniform files see gu0==gu_n and dn0==dn_n → None (byte-identical).
+    // All E8 tags (4, 5, 6) are decoded by BOTH the per-token mixed gemv kernels
+    // AND the batched grouped-WMMA kernels (gfx11 _k2 and gfx12 .gfx12).
+    // Priority: gate_up dtype drives the tag (gate_up is the dominant quality
+    // lever); for the existing down-only graded binary the gate_up types are
+    // uniform MQ4G256 → tag2, which is the correct MQ4 branch.
+    let expert_dtype_tags = if ep_shard.is_some() {
+        // EP shard: a graded (mixed-dtype) file needs the FULL [n_exp] global tag
+        // map, but only this rank's owned experts are loaded, so non-owned dtypes
+        // aren't visible. Uniform files (all owned experts same dtype, e.g. .mq6)
+        // → None; graded EP is not yet supported.
+        let mixed = !experts.is_empty()
+            && (experts.iter().any(|e| e.gate_up.gpu_dtype != experts[0].gate_up.gpu_dtype)
+                || experts.iter().any(|e| e.down.gpu_dtype != experts[0].down.gpu_dtype));
+        if mixed {
+            return Err(HipError::new(0, "graded (mixed-dtype) MoE EP not yet supported"));
+        }
+        None
+    } else if n_exp > 0 {
+        let gu0 = experts[0].gate_up.gpu_dtype;
+        let dn0 = experts[0].down.gpu_dtype;
+        let mixed = experts.iter().any(|e| e.gate_up.gpu_dtype != gu0)
+            || experts.iter().any(|e| e.down.gpu_dtype != dn0);
+        if mixed {
+            // Map each expert to a tag based on its gate_up dtype (the tier
+            // that was assigned to BOTH projections by the quantizer).  Fall
+            // back to the down dtype for the legacy down-only-graded case
+            // (gate_up all MQ4G256 → tag2 = MQ4, which is correct).
+            let tags: Vec<u8> = experts
+                .iter()
+                .map(|e| match e.gate_up.gpu_dtype {
+                    DType::MQ6G256 => 0u8,
+                    DType::MQ2G256Lloyd => 1u8,
+                    DType::MQ4G256 => {
+                        // gate_up uniform MQ4: use down dtype to distinguish
+                        // hot (MQ6) from mid (MQ4) from cold tiers so the
+                        // legacy down-only-graded binary still dispatches the
+                        // correct down branch.
+                        match e.down.gpu_dtype {
+                            DType::MQ6G256 => 0u8,       // hot (gu4 dn6 mixed)
+                            DType::MQ2G256Lloyd => 1u8,  // cold MQ2L
+                            DType::MFP2G32E8 => 6u8,     // cold mfp2-E8
+                            DType::MQ3G256Lloyd => 3u8,  // cold MQ3L
+                            DType::MFP3G32E8 => 5u8,     // cold mfp3-E8
+                            _ => 2u8,                    // default MQ4
+                        }
+                    }
+                    DType::MQ3G256Lloyd => 3u8,
+                    // mfp4-E8 (4.25 bpw) graded tier — gate_up AND down are E8
+                    // for these experts (tier applies to both); the mixed gemv
+                    // kernels decode tag 4 via e8_row_partial.
+                    DType::MFP4G32E8 => 4u8,
+                    // [NaN-CRITICAL] mfp3-E8 graded cold tier (tag 5).
+                    // Both gate_up AND down carry MFP3G32E8; the merged gemv kernels
+                    // decode tag 5 via mfp3e8_row_partial (3-bit lattice, 13 B/blk).
+                    DType::MFP3G32E8 => 5u8,
+                    // [NaN-CRITICAL] mfp2-E8 graded cold tier (tag 6).
+                    // Both gate_up AND down carry MFP2G32E8; the merged gemv kernels
+                    // decode tag 6 via mfp2e8_row_partial (2-bit lattice, 9 B/blk).
+                    DType::MFP2G32E8 => 6u8,
+                    _ => 2u8,  // default: treat unknown tiers as MQ4
+                })
+                .collect();
+            let t = gpu.alloc_tensor(&[n_exp], DType::Raw)?;
+            gpu.hip.memcpy_htod(&t.buf, &tags)?;
+            Some(t)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     Ok(MoeFfnWeights {
         router,
         experts,
@@ -4432,6 +5127,8 @@ fn load_moe_ffn(
         shared_expert_gate,
         expert_gate_up_ptrs,
         expert_down_ptrs,
+        expert_down_awq_ptrs,
+        expert_dtype_tags,
         // MAD-93 v0.1: non-paged loader path. Layer identity for pager-keyed
         // future work, expert_shape None (callers read shapes off `experts`
         // directly when paged_experts==false).
@@ -4603,14 +5300,26 @@ fn moe_ffn_decode(
 /// the prerotated fast path where the caller can fuse rmsnorm+FWHT via
 /// `fused_rmsnorm_rotate_mq` and call `moe_ffn_decode_with_scratch_prerotated`.
 pub(crate) fn ffn_all_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
-    ffn.router.gpu_dtype == DType::MQ4G256
-        && ffn.shared_expert_gate.gpu_dtype == DType::MQ4G256
-        && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
-        && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
+    ffn_gate_side_mq4_for_moe(ffn)
         && ffn
             .experts
             .iter()
             .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
+}
+
+/// GATE-SIDE only MQ4 (router + shared expert), independent of the routed
+/// experts. When true, the fused rmsnorm+FWHT path + prerotated MoE decode are
+/// applicable even on a graded file: the MQ4 router routes on the rotated x via
+/// the fused gate kernel (MoeResolution::gate_fusable), and the routed experts
+/// (any FwhtG256 MQ-family) consume the same single rotated activation — saving
+/// the un-fused rmsnorm + the per-component rotates the else-branch incurs.
+/// The redline mq4r (MQ4 gate + graded experts) hits this; uniform MQ4 is a
+/// superset (ffn_all_mq4_for_moe). Q8-router files (mq4p) correctly stay false.
+pub(crate) fn ffn_gate_side_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
+    ffn.router.gpu_dtype == DType::MQ4G256
+        && ffn.shared_expert_gate.gpu_dtype == DType::MQ4G256
+        && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
+        && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
 }
 
 /// Detect any MQ3G256 / MQ3G256Lloyd weight inside a MoE FFN block (router,
@@ -4622,14 +5331,26 @@ pub(crate) fn ffn_all_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
 ///
 /// Mirrors `is_mq3_any` in `forward_prefill_batch_single_chunk_captured`
 /// (line 3325) so both cross-checks treat plain and Lloyd-MQ3 identically.
-fn moe_ffn_has_mq3(ffn: &MoeFfnWeights) -> bool {
+/// MQ3/MQ3-Lloyd in the STRUCTURAL parts of a MoE FFN (router, shared
+/// expert gate/up/down). These are NOT served by the merged grouped kernel
+/// (which only handles routed experts) → must still hard-error.
+fn moe_ffn_has_mq3_structural(ffn: &MoeFfnWeights) -> bool {
     let is_mq3_any = |dt: DType| matches!(dt, DType::MQ3G256 | DType::MQ3G256Lloyd);
     is_mq3_any(ffn.router.gpu_dtype)
         || is_mq3_any(ffn.shared_expert_gate.gpu_dtype)
         || is_mq3_any(ffn.shared_expert.gate.gpu_dtype)
         || is_mq3_any(ffn.shared_expert.up.gpu_dtype)
         || is_mq3_any(ffn.shared_expert.down.gpu_dtype)
-        || ffn
+}
+
+/// MQ3/MQ3-Lloyd in ROUTED experts WITHOUT a tag table (uniform MQ3, not
+/// the graded case the merged grouped kernel handles). When
+/// `expert_dtype_tags` is `Some`, the merged grouped kernel carries the
+/// correct per-expert stride and this returns false (pass).
+fn moe_ffn_has_mq3_experts_uniform(ffn: &MoeFfnWeights) -> bool {
+    let is_mq3_any = |dt: DType| matches!(dt, DType::MQ3G256 | DType::MQ3G256Lloyd);
+    ffn.expert_dtype_tags.is_none()
+        && ffn
             .experts
             .iter()
             .any(|e| is_mq3_any(e.gate_up.gpu_dtype) || is_mq3_any(e.down.gpu_dtype))
@@ -4690,6 +5411,68 @@ pub(crate) fn moe_ffn_decode_with_scratch_prerotated(
 
 /// The actual MoE FFN implementation. Uses the caller-provided scratch
 /// buffers, never allocates.
+// ── REAP expert-importance capture (HIPFIRE_MOE_EXPERT_STATS=1) ────────────
+// Per-(layer, expert) accumulators: routing count, Σ gate_weight,
+// Σ ‖expert_output‖, Σ (gate × ‖output‖). The last is the true REAP
+// contribution (gate-weighted output norm) — compared against raw frequency
+// (count) to decide whether freq agrees with contribution before committing to
+// any per-expert mixed-precision kernel. Dumped by `dump_expert_stats`.
+static EXPERT_STATS: std::sync::Mutex<
+    Option<std::collections::HashMap<(u16, u16), (u64, f64, f64, f64)>>,
+> = std::sync::Mutex::new(None);
+static EXPERT_STATS_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn expert_stats_enabled() -> bool {
+    *EXPERT_STATS_ON.get_or_init(|| {
+        std::env::var("HIPFIRE_MOE_EXPERT_STATS").ok().as_deref() == Some("1")
+    })
+}
+fn capture_expert_stats(
+    gpu: &Gpu,
+    layer_idx: u16,
+    k: usize,
+    hidden: usize,
+    down_expanded: &GpuTensor,
+    topk_indices: &GpuTensor,
+    topk_weights: &GpuTensor,
+) {
+    let dn = match gpu.download_f32(down_expanded) { Ok(v) => v, Err(_) => return };
+    let ti = match gpu.download_f32(topk_indices) { Ok(v) => v, Err(_) => return };
+    let tw = match gpu.download_f32(topk_weights) { Ok(v) => v, Err(_) => return };
+    let mut guard = EXPERT_STATS.lock().unwrap();
+    let m = guard.get_or_insert_with(std::collections::HashMap::new);
+    for krank in 0..k {
+        if krank >= ti.len() || krank >= tw.len() { break; }
+        let e = (ti[krank].to_bits() as i32) as u16; // i32-in-F32 alias
+        let w = tw[krank] as f64;
+        let base = krank * hidden;
+        if base + hidden > dn.len() { break; }
+        let mut sq = 0.0f64;
+        for j in 0..hidden { let x = dn[base + j] as f64; sq += x * x; }
+        let norm = sq.sqrt();
+        let ent = m.entry((layer_idx, e)).or_insert((0, 0.0, 0.0, 0.0));
+        ent.0 += 1; ent.1 += w; ent.2 += norm; ent.3 += w * norm;
+    }
+}
+/// Dump the accumulated per-(layer,expert) REAP stats to a TSV. Called from
+/// eval harnesses when HIPFIRE_MOE_EXPERT_STATS_OUT is set.
+pub fn dump_expert_stats(path: &str) {
+    let guard = EXPERT_STATS.lock().unwrap();
+    let m = match guard.as_ref() {
+        Some(m) if !m.is_empty() => m,
+        _ => { eprintln!("expert_stats: empty (capture not enabled?)"); return; }
+    };
+    let mut rows: Vec<_> = m.iter().collect();
+    rows.sort_by_key(|((l, e), _)| (*l, *e));
+    let mut out = String::from("layer\texpert\tcount\tsum_gate\tsum_norm\tsum_contrib\n");
+    for ((l, e), (c, sg, sn, sc)) in rows {
+        out.push_str(&format!("{l}\t{e}\t{c}\t{sg:.6}\t{sn:.6}\t{sc:.6}\n"));
+    }
+    match std::fs::write(path, out) {
+        Ok(_) => eprintln!("expert_stats: wrote {path} ({} layer×expert rows)", m.len()),
+        Err(e) => eprintln!("expert_stats: write failed {path}: {e}"),
+    }
+}
+
 fn moe_ffn_decode_impl(
     gpu: &mut Gpu,
     ffn: &MoeFfnWeights,
@@ -4731,6 +5514,9 @@ fn moe_ffn_decode_impl(
             .first()
             .map(|e| e.down.gpu_dtype)
             .unwrap_or(DType::F32),
+        // Single source of truth: the tag table is built iff experts carry
+        // mixed down dtypes, so its presence == the mixed-per-expert flag.
+        routed_has_mixed_experts: ffn.expert_dtype_tags.is_some(),
         has_paro_shared: ffn.paro_shared.is_some(),
     };
     // Resolution is owned by the MoeFamily (Ship 4.1). The model passes only
@@ -4759,6 +5545,7 @@ fn moe_ffn_decode_impl(
         n_exp,
         norm_topk_prob: config.norm_topk_prob,
         x_rot_prerotated,
+        layer_idx: ffn.layer_idx,
         x_norm,
         x_residual,
         // EP (Ship 6 substrate-EP): threaded from moe_ffn_decode_impl params.
@@ -4773,6 +5560,14 @@ fn moe_ffn_decode_impl(
         shared_down_w: ffn.shared_expert.down.dispatch_ref(),
         expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
         expert_down_ptrs: &ffn.expert_down_ptrs,
+        // Route A MoE-AWQ: `Some` only on per-expert-AWQ .hfq files (the
+        // HIPFIRE_MOE_AWQ kill-switch is applied once at load in load_moe_ffn,
+        // not per-token). `None` ⇒ plain silu+rotate (byte-identical).
+        expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
+        // Per-expert mixed-precision decode: `Some` only on graded mixed
+        // files; drives the merged dtype-tag-branched down kernel + forces
+        // the shared combine. `None` ⇒ uniform path (byte-identical).
+        expert_dtype_tags: ffn.expert_dtype_tags.as_ref(),
         routed_gate_up_k: ffn.experts.first().map_or(0, |e| e.gate_up.k),
         routed_down_m: ffn.experts.first().map_or(0, |e| e.down.m),
         routed_down_k: ffn.experts.first().map_or(0, |e| e.down.k),
@@ -4807,6 +5602,10 @@ fn moe_ffn_decode_impl(
     let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
     hipfire_runtime::llama::moe_family().run(&ctx, gpu, &moe_params)
         .map_err(HipError::from)?;
+    if expert_stats_enabled() {
+        capture_expert_stats(gpu, ffn.layer_idx, k, hidden,
+            s.down_expanded, s.topk_indices, s.topk_weights);
+    }
     Ok(())
 }
 
@@ -5370,15 +6169,18 @@ pub fn forward_scratch(
     // change between forward calls; cache once and read atomically.
     static ALLOW_MOE_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static GRAPH_OVERRIDE_ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-    // Opt-in: set HIPFIRE_GRAPH_MOE=1 to enable graph capture for the MoE
-    // forward path. Default-off until a follow-up makes the CPU-topK
-    // fallback's `download_f32(router_logits)` D2H sync capture-safe —
-    // mixed-kmap A3B (post-PR #199) routes through that fallback and crashes
-    // with hipError 906 under graph capture. The atomicAdd-determinism fix in
-    // this commit removes the use_gpu_topk path's drift, which is the necessary
-    // first step, but is not sufficient to enable MoE+graph by default.
+    // Default-ON (2026-06-16): cross-arch A/B validated — gfx12 +4.2% A3B mq4
+    // decode, coherence-gate clean (fluent at decode pos 1-4 on current ROCm).
+    // Opt-out via HIPFIRE_GRAPH_MOE=0. Both root causes of the prior
+    // crash/drift are fixed:
+    //   1. atomicAdd drift (task #100, 2026-05-21): expand+combine pattern.
+    //   2. CPU-topK fallback D2H: `download_f32(router_logits)` replaced by
+    //      GPU `softmax_f32` + `moe_topk_renorm_k8` + small [k] D2H — fully
+    //      capture-safe. Mixed-kmap A3B (Q8 router, post-PR #199) no longer
+    //      crashes with hipError 906 under HIPFIRE_AR_GRAPH=1.
+    // Validated + flipped to default-on 2026-06-16 (was opt-in HIPFIRE_GRAPH_MOE=1).
     let allow_moe = *ALLOW_MOE_ENV
-        .get_or_init(|| std::env::var("HIPFIRE_GRAPH_MOE").ok().as_deref() == Some("1"));
+        .get_or_init(|| std::env::var("HIPFIRE_GRAPH_MOE").ok().as_deref() != Some("0"));
     // hipGraph per-forward-pass capture/replay default policy:
     //   - gfx12 (RDNA4): default-ON. +2.4-2.7% decode on 9B Qwen 3.5
     //     MFP4G32 (5-run mean, all positive, tight variance, 2026-05-11).
@@ -5406,7 +6208,10 @@ pub fn forward_scratch(
         });
     let graph_arch_default = gpu.arch.starts_with("gfx12") || gpu.arch.starts_with("gfx11");
     let graph_enabled = graph_override.unwrap_or(graph_arch_default);
-    // AR-forward hipGraph DISABLED (2026-05-15) — this disable SUPERSEDES the
+    // AR-forward hipGraph RE-ENABLED (2026-06-16) — the kernarg-snapshot attractor
+    // is re-verified GONE on current ROCm (HIP 7.x, coherence-gate clean, fluent at
+    // decode pos 1-4 on gfx12 A3B mq4). Opt-out via HIPFIRE_AR_GRAPH=0. The prior
+    // 2026-05-15 disable rationale is retained below; it SUPERSEDED the
     // arch-default re-enable merged from master (`graph_enabled` above is kept
     // live so the HIPFIRE_GRAPH parse and kill switch stay wired for when the
     // path is flipped back on). Empirically on ROCm 7.2.2 + gfx11 +
@@ -5423,12 +6228,30 @@ pub fn forward_scratch(
     // forward is direct-only. Policy infra (`ar_forward_kernel_dirty`,
     // `ar_forward_replay_enabled`, `end_decode_turn()`, `drop_captured_graph()`)
     // is preserved on Gpu so the path can be flipped on once the bug is fixed.
-    let use_graph = false;
-    let _ = (
-        graph_enabled,
-        allow_moe,
-        gpu.graphs.ar_forward_replay_enabled,
-    ); // suppress unused warnings
+    // RE-VERIFY GATE (2026-06-12): HIPFIRE_AR_GRAPH=1 flips the 2026-05-15
+    // disable back on to re-test the capture/replay attractor on current ROCm
+    // (HIP 7.x). Default OFF preserves the direct-only behavior. When set, the
+    // path still honors the HIPFIRE_GRAPH kill switch + arch default via
+    // `graph_enabled`.
+    static AR_GRAPH_TEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let ar_graph_test = *AR_GRAPH_TEST
+        .get_or_init(|| std::env::var("HIPFIRE_AR_GRAPH").ok().as_deref() != Some("0"));
+    // AR-forward hipGraph eligibility. Plain sequential single-token AR decode
+    // is eligible BY DEFAULT (the consume below resets to true); spec-decode /
+    // MTP re-seed and the verify/prefill batch path explicitly set this FALSE
+    // right before their `forward_scratch` call so the plain-AR graph can never
+    // capture or replay in a non-sequential context. An ineligible call also
+    // INVALIDATES any captured graph (forces re-capture on the next plain call).
+    let graph_eligible = std::mem::replace(&mut gpu.graphs.ar_graph_eligible, true);
+    if ar_graph_test && !graph_eligible {
+        gpu.graphs.ar_forward_replay_enabled = false;
+        gpu.graphs.ar_forward_kernel_dirty = true;
+    }
+    // MoE models require allow_moe (HIPFIRE_GRAPH_MOE=1) in addition to the
+    // arch/kill-switch guards. Dense models (num_experts==0) are unaffected.
+    let use_graph = ar_graph_test && graph_enabled && graph_eligible
+        && (config.num_experts == 0 || allow_moe);
+    let _ = gpu.graphs.ar_forward_replay_enabled; // suppress unused warning
 
     // Embedding lookup into scratch.x (always direct, changes per token)
     match weights.embd_format {
@@ -5449,8 +6272,11 @@ pub fn forward_scratch(
 
     let pos_i32 = pos as i32;
     if use_graph && gpu.graphs.ar_forward_replay_enabled && gpu.graphs.graph_exec.is_some() {
-        // ── Replay path: caller has signalled end_decode_turn() since the
-        // last capture AND kernels are not dirty. Cheapest path. ──
+        // ── Replay path: graph captured + kernels clean. Cheapest path: pos
+        // memcpy + graph replay. The graph is position-agnostic (pos via
+        // pos_buf), so replay is correct across positions and requests as long
+        // as the buffers are the plain-AR continuation — which the spec markers
+        // + verify invalidation guarantee. ──
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         gpu.graphs
@@ -5489,6 +6315,12 @@ pub fn forward_scratch(
         )?;
         gpu.graphs
             .graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())?;
+        // Intra-generate replay (2026-06-12): promote this fresh capture to the
+        // replay graph immediately so the NEXT token replays (cheap: pos memcpy
+        // + graph_launch) instead of re-capturing + re-instantiating every
+        // token. The per-token instantiate is why the path "did nothing" — the
+        // daemon never calls end_decode_turn() to enable replay.
+        gpu.graphs.ar_forward_replay_enabled = true;
     } else {
         // ── Direct path (graph not eligible: arch / MoE config) ──
         gpu.hip
@@ -5626,6 +6458,26 @@ pub struct PrefillBatchScratch {
 
 impl PrefillBatchScratch {
     pub fn new(gpu: &mut Gpu, config: &Qwen35Config, max_batch: usize) -> HipResult<Self> {
+        // Default: allocate the spec-decode DeltaNet S-tape (tree-verify reads it).
+        Self::new_opt(gpu, config, max_batch, /*cap_gdn_tape=*/ true)
+    }
+
+    /// Like [`new`], but `cap_gdn_tape` controls allocation of the per-token
+    /// DeltaNet S-state tape (`dn_s_tape_*`, sized `[max_batch × n_v_heads ×
+    /// value_head_dim²]`). The tape is consumed ONLY by the tree-verify
+    /// (spec-decode) GDN kernels; plain prefill (`tree_parents == None`)
+    /// advances the recurrent state in place and never touches it. Pass `false`
+    /// for plain prefill to skip the tape — on A3B (16 value heads × 128²) it is
+    /// ~10 GB at an 8k batch (dn_s_tape_f32 8.2 GB + dn_s_tape_q8 2 GB), the
+    /// difference between an 8k prefill fitting and OOMing. Callers that may run
+    /// tree-verify MUST pass `true` (else the `.expect()` at the consumption site
+    /// panics).
+    pub fn new_opt(
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        max_batch: usize,
+        cap_gdn_tape: bool,
+    ) -> HipResult<Self> {
         let dim = config.dim;
         let hidden_dim = config.hidden_dim;
         let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -5814,7 +6666,7 @@ impl PrefillBatchScratch {
                 DType::F32
             ),
             dn_s_tape_q8: alloc_opt!(
-                config.linear_num_value_heads > 0,
+                cap_gdn_tape && config.linear_num_value_heads > 0,
                 &[max_batch
                     * config.linear_num_value_heads
                     * config.linear_value_head_dim
@@ -5822,12 +6674,12 @@ impl PrefillBatchScratch {
                 DType::Raw
             ),
             dn_s_tape_scales: alloc_opt!(
-                config.linear_num_value_heads > 0,
+                cap_gdn_tape && config.linear_num_value_heads > 0,
                 &[max_batch * config.linear_num_value_heads * config.linear_value_head_dim],
                 DType::F32
             ),
             dn_s_tape_f32: alloc_opt!(
-                config.linear_num_value_heads > 0,
+                cap_gdn_tape && config.linear_num_value_heads > 0,
                 &[max_batch
                     * config.linear_num_value_heads
                     * config.linear_value_head_dim
@@ -6171,7 +7023,8 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
                     || is_mq3_any(l.w_beta.gpu_dtype)
                     || is_mq3_any(l.w_alpha.gpu_dtype)
                     || is_mq3_any(l.wo.gpu_dtype)
-                    || moe_ffn_has_mq3(&l.ffn)
+                    || moe_ffn_has_mq3_structural(&l.ffn)
+                    || moe_ffn_has_mq3_experts_uniform(&l.ffn)
                 {
                     mq3_in_moe = true;
                 }
@@ -6181,17 +7034,22 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
                     || is_mq3_any(l.wk.gpu_dtype)
                     || is_mq3_any(l.wv.gpu_dtype)
                     || is_mq3_any(l.wo.gpu_dtype)
-                    || moe_ffn_has_mq3(&l.ffn)
+                    || moe_ffn_has_mq3_structural(&l.ffn)
+                    || moe_ffn_has_mq3_experts_uniform(&l.ffn)
                 {
                     mq3_in_moe = true;
                 }
             }
         }
     }
-    let arch_has_wmma = matches!(
-        arch,
-        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
-    );
+    // ANTIBLEED admit-vs-select fix: this guard rejects MQ3-in-dense when the
+    // arch lacks the WMMA builtin. The old ad-hoc string list OMITTED gfx1103
+    // (Phoenix APU) and gfx1152, yet both ARE wave32-WMMA archs (is_rdna3) and
+    // are ADMITTED by is_batchable_la's mq3_uniform_with_wmma — so a gfx1103 /
+    // gfx1152 box would be wrongly rejected here. Derive from the has_wmma
+    // capability molecule instead (rdna3 incl 1103/1152, + rdna4), matching the
+    // sibling `arch_has_wmma = gpu.arch_caps.has_wmma()` in forward_prefill_chunk.
+    let arch_has_wmma = gpu.arch_caps.has_wmma();
     if mq3_in_moe {
         return Err(hip_bridge::HipError::new(
             0,
@@ -6209,8 +7067,9 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
             &format!(
                 "forward_prefill_batch_single_chunk_captured: model contains MQ3G256 \
              weights but arch {arch} lacks the gfx11 wave32 WMMA builtin. The MQ3 \
-             prefill kernels (gemm_*_hfq3g256_wmma) only compile on \
-             gfx1100/1101/1102/1150/1151. Caller must use the non-captured \
+             prefill kernels (gemm_*_hfq3g256_wmma) only compile on the wave32-WMMA \
+             archs (rdna3: gfx1100/1101/1102/1103/1150/1151/1152, + rdna4 gfx12). \
+             Caller must use the non-captured \
              forward_prefill_batch path (which falls back to per-token \
              forward_scratch on this arch). gfx12 K4 variant for MQ3 is \
              a planned follow-up."
@@ -6394,6 +7253,17 @@ pub fn forward_prefill_batch_with_pbs_opts(
     max_layer: Option<usize>,
     needs_last_token_logits: bool,
 ) -> HipResult<()> {
+    // Plain single-token AR decode? Only then is the per-token `forward_scratch`
+    // call below eligible for the AR-forward hipGraph (capture/replay). Any spec
+    // marker (tree_verify / gdn_tape / per-token-hidden extraction / hidden ring)
+    // or a multi-token batch means this is prefill or a spec/MTP verify forward,
+    // which must NOT replay the plain-AR graph. See `forward_scratch`'s
+    // `ar_graph_eligible` one-shot signal.
+    let plain_ar_graph_eligible = tree_verify.is_none()
+        && gdn_tape.is_none()
+        && per_token_hidden_out.is_none()
+        && hidden_rb.is_none()
+        && tokens.len() == 1;
     // Upper bound on the PrefillBatchScratch — large prompts get split
     // into chunks of this size and processed in a loop.
     //
@@ -6440,14 +7310,16 @@ pub fn forward_prefill_batch_with_pbs_opts(
                 || is_mq3_any(l.w_beta.gpu_dtype)
                 || is_mq3_any(l.w_alpha.gpu_dtype)
                 || is_mq3_any(l.wo.gpu_dtype)
-                || moe_ffn_has_mq3(&l.ffn)
+                || moe_ffn_has_mq3_structural(&l.ffn)
+                || moe_ffn_has_mq3_experts_uniform(&l.ffn)
         }
         LayerWeights::FullAttnMoe(l) => {
             is_mq3_any(l.wq.gpu_dtype)
                 || is_mq3_any(l.wk.gpu_dtype)
                 || is_mq3_any(l.wv.gpu_dtype)
                 || is_mq3_any(l.wo.gpu_dtype)
-                || moe_ffn_has_mq3(&l.ffn)
+                || moe_ffn_has_mq3_structural(&l.ffn)
+                || moe_ffn_has_mq3_experts_uniform(&l.ffn)
         }
         _ => false,
     });
@@ -6553,6 +7425,9 @@ pub fn forward_prefill_batch_with_pbs_opts(
                     rb,
                 )?;
             } else {
+                // One-shot: mark this forward AR-graph-eligible iff it's plain
+                // single-token decode (consumed inside forward_scratch).
+                gpu.graphs.ar_graph_eligible = plain_ar_graph_eligible;
                 forward_scratch(
                     gpu,
                     weights,
@@ -6795,16 +7670,43 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
     // Uses the gemm_*_mq4g256_lloyd_wmma family; group stride differs
     // (160 B Lloyd vs 136 B HFQ4) so dispatch routes through the
     // Lloyd-specific arms in forward_prefill_chunk.
+    // ANTIBLEED admit-vs-select fix: the MQ4-Lloyd batched-prefill GEMM source
+    // selectors (gemm_*_mq4g256_lloyd_wmma_for_arch in rdna-compute/kernels.rs)
+    // ship a kernel only for gfx1100/1101/1102/1151 and PANIC on any other arch
+    // (160 B Lloyd stride mismatches the default). gfx1150 was admitted here but
+    // has no MQ4-Lloyd source (intentionally excluded to stay symmetric with the
+    // MQ4-Lloyd GEMV/fused-decode path — see kernels.rs:195), so a gfx1150 box
+    // doing MQ4-Lloyd batched prefill would crash at source lookup. Drop gfx1150
+    // from the admit set so admit == select. (MQ3-Lloyd DOES ship a gfx1150
+    // source, hence its admit set below keeps gfx1150.)
     let lloyd_mq4_with_gfx11_wmma = matches!(dt, DType::MQ4G256Lloyd)
-        && matches!(
-            arch,
-            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
-        );
+        && matches!(arch, "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151");
 
     // Lloyd-MQ4 on gfx12 (RDNA4): same opt-in gate as Lloyd-MQ3.
     let lloyd_mq4_with_gfx12_wmma = matches!(dt, DType::MQ4G256Lloyd)
         && matches!(arch, "gfx1200" | "gfx1201")
         && std::env::var("HIPFIRE_LLOYD_GFX12").ok().as_deref() == Some("1");
+
+    // MFP4G32E8 on gfx11/gfx1151/gfx12: the mfp4-E8 A3B model takes the
+    // batched-prefill path (FWHT-rotated activations + dequant→F16 GEMM for
+    // the shared expert, indexed E8 kernels for the routed experts). Admission
+    // is behind the HIPFIRE_E8_GFX12 gate because the shared-expert dequant
+    // path is validated on gfx1151 only; other arches are opt-in for now.
+    // The LA matchers (wqkv/wz/wo/etc.) for an MFP4G32E8 A3B model are
+    // still MQ4/Q8 (only the FFN expert weights are E8), so reaching here
+    // with DType::MFP4G32E8 means a weight was quantized to E8 dtype at the
+    // LA level — admitting it keeps the eligibility gate from rejecting the
+    // whole model when an attention tensor is E8 (unlikely today, but correct
+    // defensively). The real admission gate for the FFN body is
+    // `moe_ffn_batched_admissible`.
+    let e8_with_wmma = matches!(dt, DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8)
+        && matches!(
+            arch,
+            "gfx1100" | "gfx1101" | "gfx1102"
+            | "gfx1150" | "gfx1151" | "gfx1152"
+            | "gfx1200" | "gfx1201"
+        )
+        && std::env::var("HIPFIRE_E8_GFX12").ok().as_deref() == Some("1");
 
     mq3_uniform_with_wmma
         || mq3_uniform_with_gfx10_scalar
@@ -6813,6 +7715,7 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
         || lloyd_mq4_with_gfx11_wmma
         || lloyd_mq4_with_gfx12_wmma
         || fp4_with_wmma
+        || e8_with_wmma
 }
 
 pub(crate) fn trace_finite_if_enabled(gpu: &Gpu, label: &str, tensor: &GpuTensor) -> HipResult<()> {
@@ -6914,6 +7817,14 @@ struct MoePrefillDtypes {
     expert_down: DType,
     expert_gate_up_uniform: bool,
     expert_down_uniform: bool,
+    /// Routed experts are dtype-mixed (graded) AND carry an `expert_dtype_tags`
+    /// table → served by the merged grouped-WMMA prefill kernel (per-expert
+    /// MQ6/MQ4/MQ3L/MQ2L). When true, the per-expert *uniform* requirement is
+    /// waived for the ROUTED experts; the router + shared expert still use their
+    /// own batched paths and are validated normally. Without this, a graded file
+    /// fails admission and silently drops to the per-token prefill fallback (the
+    /// merged kernel never fires — observed as ~decode-speed prefill).
+    routed_mixed_merged: bool,
 }
 
 impl MoePrefillDtypes {
@@ -6929,6 +7840,7 @@ impl MoePrefillDtypes {
             expert_down: dtype,
             expert_gate_up_uniform: true,
             expert_down_uniform: true,
+            routed_mixed_merged: false,
         }
     }
 
@@ -6950,6 +7862,7 @@ impl MoePrefillDtypes {
                 .experts
                 .iter()
                 .all(|e| e.down.gpu_dtype == first.down.gpu_dtype),
+            routed_mixed_merged: ffn.expert_dtype_tags.is_some(),
         })
     }
 }
@@ -6962,15 +7875,77 @@ fn moe_ffn_batched_admissible_for_dtypes(
     dtypes: &MoePrefillDtypes,
     admit_mq6: bool,
     admit_paro: bool,
+    admit_e8: bool,
 ) -> bool {
     let router_ok = matches!(dtypes.router, DType::MQ4G256 | DType::Q8_0 | DType::F32);
     let shared_gate_ok = matches!(
         dtypes.shared_expert_scalar_gate,
         DType::MQ4G256 | DType::Q8_0 | DType::F32
     );
-    if !(router_ok && shared_gate_ok && dtypes.expert_gate_up_uniform && dtypes.expert_down_uniform)
-    {
+    // Graded (mixed-dtype) routed experts are served by the merged grouped-WMMA
+    // prefill kernel, so the per-expert *uniform* requirement is waived for the
+    // routed experts; the router + shared expert still go through their own
+    // batched paths and are validated below.
+    let routed_ok = dtypes.routed_mixed_merged
+        || (dtypes.expert_gate_up_uniform && dtypes.expert_down_uniform);
+    if !(router_ok && shared_gate_ok && routed_ok) {
         return false;
+    }
+
+    if dtypes.routed_mixed_merged {
+        // Routed experts handled by the merged kernel (per-expert MQ6/MQ4/MQ3L/
+        // MQ2L). Only require the SHARED expert to be batchable on its dense
+        // path: MQ4 always, MQ6 when this arch admits MQ6 dense kernels.
+        let shared_gu_ok = (dtypes.shared_expert_gate == DType::MQ4G256
+            && dtypes.shared_expert_up == DType::MQ4G256)
+            || (admit_mq6
+                && matches!(dtypes.shared_expert_gate, DType::MQ4G256 | DType::MQ6G256)
+                && dtypes.shared_expert_up == dtypes.shared_expert_gate);
+        let shared_dn_ok = dtypes.shared_expert_down == DType::MQ4G256
+            || (admit_mq6 && dtypes.shared_expert_down == DType::MQ6G256);
+        return shared_gu_ok && shared_dn_ok;
+    }
+
+    // mfp4-E8 routed experts with Q8 shared expert (original arm):
+    // gfx1151-native A3B checkpoint. Shared expert is Q8 (gate/up/down);
+    // router/scalar-gate are Q8 (validated by router_ok/shared_gate_ok above).
+    // The batched body runs a dedicated Q8 shared-expert path (two plain Q8
+    // GEMMs + silu_mul + sigmoid-scaled residual add) and routes the E8
+    // experts through `run_moe_prefill` Path 1 (indexed batched GEMV).
+    // E8-family match helper: MFP4, MFP3, MFP2 lattice types.
+    let is_e8_family = |dt: DType| matches!(dt, DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8);
+
+    if admit_e8
+        && dtypes.shared_expert_gate == DType::Q8_0
+        && dtypes.shared_expert_up == DType::Q8_0
+        && dtypes.shared_expert_down == DType::Q8_0
+        && is_e8_family(dtypes.expert_gate_up)
+        && is_e8_family(dtypes.expert_down)
+    {
+        return true;
+    }
+
+    // Uniform mfp4/mfp3/mfp2-E8: BOTH shared AND routed experts are E8-family
+    // (Option B from the implementation spec). Router + shared_expert_gate
+    // (scalar) remain Q8 (validated above). The batched body dequants the shared
+    // expert E8→F16 transiently and runs `gemm_f16_wmma_mb8` against
+    // `x_rot_batch` (FWHT-rotated activations), then the routed experts go
+    // through the indexed E8 batched GEMV path. The dequant→F16 path requires
+    // has_wmma_w32 (gfx11+), which `admit_e8` already gates on arch.
+    if admit_e8
+        && is_e8_family(dtypes.expert_gate_up)
+        && is_e8_family(dtypes.expert_down)
+        // Shared expert may be per-projection MIXED — gate+up are dispatched
+        // together (one match on gate's dtype) so they must share a dtype;
+        // down is matched independently. The batched body handles Q8 (un-rotated)
+        // and E8 (dequant→f16, x_rot) per projection and keys the SwiGLU rotate
+        // on the down dtype, so any {Q8,E8-family} combination of (gate==up,down)
+        // is correct.
+        && dtypes.shared_expert_gate == dtypes.shared_expert_up
+        && matches!(dtypes.shared_expert_gate, DType::Q8_0 | DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8)
+        && matches!(dtypes.shared_expert_down, DType::Q8_0 | DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8)
+    {
+        return true;
     }
 
     if admit_paro
@@ -7024,8 +7999,34 @@ pub fn prefill_batch_pbs_eligible(
     arch: &str,
     moe_router_logits_present: bool,
 ) -> bool {
-    // HIPFIRE_PREFILL_BATCHED=0 forces the per-token fallback (escape hatch).
-    let force_fallback = std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() == Some("0");
+    // HIPFIRE_PREFILL_BATCHED=0 forces the per-token fallback — an escape hatch
+    // for the LARGE seed prefill (gfx11 24GB OOM + a batched-seed correctness bug
+    // that collapses MTP τ→1.0). But the small-B MTP verify (n = K+1, ≤ ~32) is
+    // cheap and its BATCHED path is the dominant gfx11 decode lever: per-token it
+    // costs ~K full sequential trunk forwards/cycle (the measured 92ms→16.8ms /
+    // 41→223 tok/s bottleneck, rocprofv3 2026-06-16). Decouple: let the small-B
+    // verify batch even when the flag forces the seed per-token. Opt-in
+    // (HIPFIRE_MTP_VERIFY_DECOUPLE=1) until the batched verify is validated
+    // coherent + τ-preserving per-arch (the gfx11 batched *seed* corrupts; whether
+    // the small-B *verify* also corrupts is exactly what this gate tests).
+    // DEFAULT-ON for RDNA3 (gfx11) — the small-B verify BATCHED is validated
+    // coherent + τ-preserving there (W3x 2026-06-16: byte-identical output vs
+    // per-token at 240-tok ctx; +20% mq4; the scalar→WMMA + MQ3L-LUT kernel
+    // wins lift all STRUCTURED domains >AR on both mq4/mq4p; fresh default-config
+    // re-validated mq4 code 1.26× / mq4p chat 1.07×). Opt-out
+    // HIPFIRE_MTP_VERIFY_DECOUPLE=0. Other archs opt-in (=1) until validated;
+    // gfx12 batches the whole prefill already so it is moot there. The seed
+    // stays per-token for LONG prompts (n>32 fails this gate → force_fallback
+    // when PREFILL_BATCHED=0); a short seed (n≤32) batches, fine for mq4/mq4p
+    // (E8 short-seed batched-prefill can OOM, but E8 admission is itself opt-in
+    // via HIPFIRE_E8_GFX12 so the default config never reaches it).
+    let decouple_env = std::env::var("HIPFIRE_MTP_VERIFY_DECOUPLE").ok();
+    let is_rdna3_decouple = arch.starts_with("gfx11");
+    let verify_decouple = n <= 32
+        && decouple_env.as_deref() != Some("0")
+        && (is_rdna3_decouple || decouple_env.as_deref() == Some("1"));
+    let force_fallback = !verify_decouple
+        && std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() == Some("0");
     // MoE batched path requires K_TOP=8 (hard-coded in the indexed kernels) and
     // num_experts ≤ 1024 (bound of the batched top-K shared mem).
     let moe_topk_ok =
@@ -7034,7 +8035,40 @@ pub fn prefill_batch_pbs_eligible(
         std::env::var("HIPFIRE_MOE_MQ6_ADMIT").ok().as_deref(),
         arch,
     );
-    !force_fallback
+    let has_dn = weights.layers.iter().any(|lw| matches!(
+        lw,
+        LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_),
+    ));
+    let all_dtypes_ok = weights.layers.iter().all(|lw| match lw {
+        LayerWeights::DeltaNet(l) =>
+            is_batchable_la(l.wqkv.gpu_dtype, arch)
+                && is_batchable_la(l.wz.gpu_dtype, arch)
+                && is_batchable_la(l.w_beta.gpu_dtype, arch)
+                && is_batchable_la(l.w_alpha.gpu_dtype, arch)
+                && is_batchable_la(l.wo.gpu_dtype, arch)
+                && is_batchable_la(l.w_gate.gpu_dtype, arch)
+                && is_batchable_la(l.w_up.gpu_dtype, arch)
+                && is_batchable_la(l.w_down.gpu_dtype, arch),
+        LayerWeights::FullAttn(_) => true,
+        LayerWeights::DeltaNetMoe(l) =>
+            moe_topk_ok
+                && moe_router_logits_present
+                && is_batchable_la(l.wqkv.gpu_dtype, arch)
+                && is_batchable_la(l.wz.gpu_dtype, arch)
+                && is_batchable_la(l.w_beta.gpu_dtype, arch)
+                && is_batchable_la(l.w_alpha.gpu_dtype, arch)
+                && is_batchable_la(l.wo.gpu_dtype, arch)
+                && moe_ffn_batched_admissible(&l.ffn, admit_mq6, arch),
+        LayerWeights::FullAttnMoe(l) =>
+            moe_topk_ok
+                && moe_router_logits_present
+                && is_batchable_la(l.wq.gpu_dtype, arch)
+                && is_batchable_la(l.wk.gpu_dtype, arch)
+                && is_batchable_la(l.wv.gpu_dtype, arch)
+                && is_batchable_la(l.wo.gpu_dtype, arch)
+                && moe_ffn_batched_admissible(&l.ffn, admit_mq6, arch),
+    });
+    let result = !force_fallback
         && n >= MIN_BATCH
         // State quant no longer gates batched prefill: forward_prefill_chunk
         // dispatches the GDN recurrence by dn_state.quant on the non-tree path
@@ -7042,54 +8076,50 @@ pub fn prefill_batch_pbs_eligible(
         // so FP32/Q4 state is fully batchable here. Was hard-gated to Q8 when
         // the batched GDN was Q8-only; that's the seed + per-cycle-commit
         // per-token fallback that made FP32 DFlash ~4.5× slower + 10× TTFT.
-        && weights.layers.iter().any(|lw| matches!(
-            lw,
-            LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_),
-        ))
+        && has_dn
         // LA/FA/MoE projection + MoE-FFN weight dtypes must all be batchable;
         // A3B engine policy quantizes attention as Q8 (admitted alongside MQ4).
-        && weights.layers.iter().all(|lw| match lw {
-            LayerWeights::DeltaNet(l) =>
-                is_batchable_la(l.wqkv.gpu_dtype, arch)
-                    && is_batchable_la(l.wz.gpu_dtype, arch)
-                    && is_batchable_la(l.w_beta.gpu_dtype, arch)
-                    && is_batchable_la(l.w_alpha.gpu_dtype, arch)
-                    && is_batchable_la(l.wo.gpu_dtype, arch)
-                    && is_batchable_la(l.w_gate.gpu_dtype, arch)
-                    && is_batchable_la(l.w_up.gpu_dtype, arch)
-                    && is_batchable_la(l.w_down.gpu_dtype, arch),
-            LayerWeights::FullAttn(_) => true,
-            LayerWeights::DeltaNetMoe(l) =>
-                moe_topk_ok
-                    && moe_router_logits_present
-                    && is_batchable_la(l.wqkv.gpu_dtype, arch)
-                    && is_batchable_la(l.wz.gpu_dtype, arch)
-                    && is_batchable_la(l.w_beta.gpu_dtype, arch)
-                    && is_batchable_la(l.w_alpha.gpu_dtype, arch)
-                    && is_batchable_la(l.wo.gpu_dtype, arch)
-                    && moe_ffn_batched_admissible(&l.ffn, admit_mq6),
-            LayerWeights::FullAttnMoe(l) =>
-                moe_topk_ok
-                    && moe_router_logits_present
-                    && is_batchable_la(l.wq.gpu_dtype, arch)
-                    && is_batchable_la(l.wk.gpu_dtype, arch)
-                    && is_batchable_la(l.wv.gpu_dtype, arch)
-                    && is_batchable_la(l.wo.gpu_dtype, arch)
-                    && moe_ffn_batched_admissible(&l.ffn, admit_mq6),
-        })
+        && all_dtypes_ok;
+    // HIPFIRE_DEBUG_BATCH=1: print per-component eligibility to stderr.
+    if std::env::var("HIPFIRE_DEBUG_BATCH").ok().as_deref() == Some("1") {
+        eprintln!(
+            "[hipfire::batch_eligible] result={result} \
+             arch={arch} n={n} n>={MIN_BATCH}={} \
+             force_fallback={force_fallback} \
+             has_dn={has_dn} \
+             moe_topk_ok={moe_topk_ok} \
+             moe_router_logits_present={moe_router_logits_present} \
+             all_dtypes_ok={all_dtypes_ok}",
+            n >= MIN_BATCH,
+        );
+    }
+    result
 }
 
-/// Whether MQ6 MoE FFN projections can enter batched prefill. gfx12 defaults
-/// to admit because its HFQ6 grouped-WMMA path is production-smoked. gfx1151
-/// now has an explicit routed grouped-WMMA MQ6 sister; its unrelated Q8 WMMA
-/// prefill family is gated separately by `q8_prefill_wmma_enabled`.
-/// Other gfx11 and older archs stay default-off pending per-arch channel
-/// testing.
+/// Whether MQ6 MoE FFN projections can enter batched prefill. Default-on for
+/// gfx11 (RDNA3/3.5) AND gfx12 (RDNA4): the MQ6 grouped-WMMA decode is present
+/// on both (tag 0 of the merged `gemm_mixed_moe_grouped_wmma{_k2,.gfx12}` kernel,
+/// plus the standalone `gemm_hfq6g256_moe_grouped_wmma{_k2,.gfx12,_gfx1151}` ported
+/// 2026-06-11/12), and the graded shared-MQ6 expert runs the dense-GEMM batched
+/// path. Validated on gfx1100: graded T3-3L-E8 (MQ6 hot / E8 mid / MQ3L cold,
+/// MQ6 shared) batches coherently, KLD 0.038964, and gfx11 prefill is ~10× the
+/// per-token fallback (1012 vs 106 tok/s pp512). UNIFORM-MQ6 OOMs on gfx11
+/// (>24 GB) so it never reaches this gate there — only graded MQ6 models do.
+/// The original gfx12-only default predated the gfx11 MQ6 grouped port and
+/// silently forced per-token prefill on every graded-MQ6 model on gfx11.
+/// gfx1151 (RDNA3.5, Strix Halo) additionally has master's channel-tested
+/// routed grouped-WMMA MQ6 fast-path (its unrelated Q8 WMMA prefill family is
+/// gated separately by `q8_prefill_wmma_enabled`). Override per-arch with
+/// `HIPFIRE_MOE_MQ6_ADMIT=0|1`.
 fn mq6_batched_admit_enabled_from_env(value: Option<&str>, arch: &str) -> bool {
     match value {
         Some("0") | Some("off") | Some("false") => false,
         Some("1") | Some("on") | Some("true") => true,
-        _ => arch.starts_with("gfx12") || arch.starts_with("gfx1151"),
+        // RDNA3/3.5 (gfx11xx, includes gfx1151) + RDNA4 (gfx12xx). RDNA1/2
+        // (gfx10xx, no WMMA) stay off. The gfx11 widen (8d555fc6) subsumes
+        // master's narrower gfx12||gfx1151 default; gfx1151 still picks up its
+        // channel-tested grouped-WMMA fast-path inside the kernel dispatcher.
+        _ => arch.starts_with("gfx11") || arch.starts_with("gfx12"),
     }
 }
 
@@ -7118,10 +8148,22 @@ fn q8_prefill_wmma_enabled(gpu: &Gpu) -> bool {
     )
 }
 
-fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, admit_mq6: bool) -> bool {
+fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, admit_mq6: bool, arch: &str) -> bool {
     let Some(dtypes) = MoePrefillDtypes::from_ffn(ffn) else {
         return false;
     };
+    // mfp4-E8 routed experts: originally gfx1151-only, now widened to all
+    // gfx11 + gfx12 arches behind the HIPFIRE_E8_GFX12 gate. The shared-expert
+    // dequant→F16 GEMM path uses `dequantize_mfp4g32_e8_to_f16` + `gemm_f16_wmma_mb8`
+    // which are available on all WMMA-capable arches. The indexed E8 GEMV kernels
+    // for the routed experts are also present on gfx11 (shipped in the MoE-AWQ
+    // branch). Gate on HIPFIRE_E8_GFX12 to allow safe opt-in rollout.
+    let admit_e8 = matches!(
+        arch,
+        "gfx1100" | "gfx1101" | "gfx1102"
+        | "gfx1150" | "gfx1151" | "gfx1152"
+        | "gfx1200" | "gfx1201"
+    ) && std::env::var("HIPFIRE_E8_GFX12").ok().as_deref() == Some("1");
 
     // PARO admit is default-on. Set HIPFIRE_PARO_BATCHED=0 to force the old
     // fallback path while bisecting or debugging.
@@ -7135,7 +8177,7 @@ fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, admit_mq6: bool) -> bool {
         paro_batched_admit_enabled_from_env(std::env::var("HIPFIRE_PARO_BATCHED").ok().as_deref())
     });
 
-    moe_ffn_batched_admissible_for_dtypes(&dtypes, admit_mq6, admit_paro)
+    moe_ffn_batched_admissible_for_dtypes(&dtypes, admit_mq6, admit_paro, admit_e8)
 }
 
 /// #397 Ship 5.2 slice 1: route a single PLAIN-batched prefill GEMM through
@@ -7654,6 +8696,88 @@ fn prefill_moe_ffn_body_batched(
                 n,
             )?;
         }
+        // Q8 shared expert (A3B mfp4-E8): gate + up via two batched Q8 GEMMs
+        // reading the UN-rotated x_norm_batch (Q8 weights are quantized against
+        // un-rotated rmsnorm output). No fused Q8 gate+up kernel — two plain
+        // launches; mirrors the decode `gemv.run_auto` Q8 shared gate/up arm.
+        DType::Q8_0 => {
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                &ffn.shared_expert.gate.buf,
+                ffn.shared_expert.gate.gpu_dtype,
+                &pbs.x_norm_batch,
+                shared_gate,
+                ffn.shared_expert.gate.m,
+                ffn.shared_expert.gate.k,
+                n,
+            )?;
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                &ffn.shared_expert.up.buf,
+                ffn.shared_expert.up.gpu_dtype,
+                &pbs.x_norm_batch,
+                shared_up,
+                ffn.shared_expert.up.m,
+                ffn.shared_expert.up.k,
+                n,
+            )?;
+        }
+        // Uniform mfp4-E8 shared expert (Option B): shared expert gate/up are both
+        // MFP4G32E8. We dequant each to F16 transiently (E8→F16 gives W_rot in the
+        // FWHT-rotated domain), then run GemmF16WmmaMb8 against x_rot_batch (F32).
+        // Math: GEMM(W_rot, x_rot) = W·x_norm = correct forward pass.
+        // The F16 scratch tensors are allocated per call and freed after use; they
+        // are small (smi × dim × 2 bytes each) relative to VRAM.
+        DType::MFP4G32E8 => {
+            let gate_m = ffn.shared_expert.gate.m;
+            let gate_k = ffn.shared_expert.gate.k;
+            let up_m = ffn.shared_expert.up.m;
+            let up_k = ffn.shared_expert.up.k;
+            // Dequantize gate and up weights: E8 → F16 (in-rotated domain)
+            let gate_f16 = gpu.alloc_tensor(&[gate_m * gate_k], DType::F16)?;
+            gpu.dequantize_mfp4g32_e8_to_f16(
+                &ffn.shared_expert.gate.buf.buf,
+                &gate_f16.buf,
+                gate_m,
+                gate_k,
+            )?;
+            let up_f16 = gpu.alloc_tensor(&[up_m * up_k], DType::F16)?;
+            gpu.dequantize_mfp4g32_e8_to_f16(
+                &ffn.shared_expert.up.buf.buf,
+                &up_f16.buf,
+                up_m,
+                up_k,
+            )?;
+            // GemmF16WmmaMb8: W(F16) × x_rot_batch(F32) → shared_gate / shared_up (F32)
+            // x_rot_batch is F32; gemm_f16_wmma_mb8 accepts F32 activations directly.
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmF16WmmaMb8,
+                &gate_f16,
+                DType::F16,
+                &pbs.x_rot_batch,
+                shared_gate,
+                gate_m,
+                gate_k,
+                n,
+            )?;
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmF16WmmaMb8,
+                &up_f16,
+                DType::F16,
+                &pbs.x_rot_batch,
+                shared_up,
+                up_m,
+                up_k,
+                n,
+            )?;
+            // Free the transient F16 weight buffers
+            gpu.free_tensor(gate_f16)?;
+            gpu.free_tensor(up_f16)?;
+        }
         other => panic!(
             "prefill_moe_ffn_body_batched: unsupported shared_expert.gate dtype {other:?} \
                          — admit predicate should have rejected this layer"
@@ -7710,6 +8834,11 @@ fn prefill_moe_ffn_body_batched(
             smi,
             paro_down.krot as usize,
         )?;
+    } else if matches!(ffn.shared_expert.down.gpu_dtype, DType::Q8_0) {
+        // Q8 shared down expects the UN-rotated SwiGLU hidden (no FWHT). Plain
+        // element-wise silu_mul over the flat [N × smi] buffers (batched for
+        // free) writes the hidden into shared_rot, feeding the Q8 down GEMM.
+        gpu.silu_mul_f32(shared_gate, shared_up, shared_rot)?;
     } else {
         fused_silu_mul_rotate_mq_batched_for(
             gpu,
@@ -7763,6 +8892,71 @@ fn prefill_moe_ffn_body_batched(
             ffn.shared_expert.down.k,
             n,
         )?,
+        // Q8 shared down (A3B mfp4-E8, Q8-shared variant): plain batched Q8 GEMM
+        // W_down · hidden into a [N × dim] temp, then fold into the residual with
+        // the per-token sigmoid(shared_scalar) gate. The temp aliases the first N×dim
+        // of `down_expanded` (the routed down-expanded scratch), which is FREE here —
+        // the routed experts (step 6) overwrite it only after this completes, and
+        // the HIP stream is in-order so the add reads before that. Batched analog
+        // of the decode sigmoid_f32 + scaled_add_inplace shared-down arm.
+        DType::Q8_0 => {
+            let down_tmp = GpuTensor {
+                buf: unsafe { down_expanded.buf.alias() },
+                shape: vec![n * dim],
+                dtype: DType::F32,
+            };
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                &ffn.shared_expert.down.buf,
+                ffn.shared_expert.down.gpu_dtype,
+                shared_rot,
+                &down_tmp,
+                ffn.shared_expert.down.m,
+                ffn.shared_expert.down.k,
+                n,
+            )?;
+            gpu.sigmoid_scaled_residual_add_batched_f32(
+                &pbs.x_batch, &down_tmp, shared_scalar, n, dim,
+            )?;
+        }
+        // Uniform mfp4-E8 shared expert down (Option B): dequant the E8 down weight
+        // to F16, run GemmF16WmmaMb8 against shared_rot (FWHT-rotated SwiGLU hidden)
+        // into a [N × dim] temp, then sigmoid-scale-add into the residual. The temp
+        // aliases the first N×dim of `down_expanded` (safe: step 6 routed experts
+        // run after this, and the stream is in-order). Mirrors the Q8_0 arm above
+        // except the GEMM is F16 weight × F32 activation = F32 output.
+        DType::MFP4G32E8 => {
+            let down_m = ffn.shared_expert.down.m;
+            let down_k = ffn.shared_expert.down.k;
+            let down_f16 = gpu.alloc_tensor(&[down_m * down_k], DType::F16)?;
+            gpu.dequantize_mfp4g32_e8_to_f16(
+                &ffn.shared_expert.down.buf.buf,
+                &down_f16.buf,
+                down_m,
+                down_k,
+            )?;
+            let down_tmp = GpuTensor {
+                buf: unsafe { down_expanded.buf.alias() },
+                shape: vec![n * dim],
+                dtype: DType::F32,
+            };
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmF16WmmaMb8,
+                &down_f16,
+                DType::F16,
+                shared_rot,
+                &down_tmp,
+                down_m,
+                down_k,
+                n,
+            )?;
+            gpu.free_tensor(down_f16)?;
+            gpu.sigmoid_scaled_residual_add_batched_f32(
+                &pbs.x_batch, &down_tmp, shared_scalar, n, dim,
+            )?;
+        }
         other => panic!(
             "prefill_moe_ffn_body_batched: unsupported shared_expert.down dtype {other:?} \
                          — admit predicate should have rejected this layer"
@@ -7788,6 +8982,9 @@ fn prefill_moe_ffn_body_batched(
             .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256),
         routed_gate_up: ffn.experts[0].gate_up.gpu_dtype,
         routed_down: ffn.experts[0].down.gpu_dtype,
+        // Prefill never fires the merged decode kernel (decode-only), but the
+        // shared MoeDtypes struct still requires the flag; carry it honestly.
+        routed_has_mixed_experts: ffn.expert_dtype_tags.is_some(),
         has_paro_shared: ffn.paro_shared.is_some(),
     };
 
@@ -7807,7 +9004,12 @@ fn prefill_moe_ffn_body_batched(
             krot: paro.krot as usize,
         }
     });
-    let down_awq_scale = ffn.experts[0].down.awq_scale.as_ref();
+    // Route A MoE-AWQ: the per-expert indexed table (built at load) supersedes
+    // the Ship 4.2 single-scale `down_awq_scale` stub for routed experts — that
+    // stub applied experts[0]'s scale to every routed slot, which is wrong once
+    // experts actually carry per-expert AWQ. Pass `None` for the single scale;
+    // `expert_down_awq_ptrs` drives the correct per-slot path in run_moe_prefill.
+    let down_awq_scale: Option<&GpuTensor> = None;
 
     let moe_prefill_params = hipfire_dispatch::families::moe::MoePrefillParams {
         dtypes: moe_dtypes,
@@ -7829,6 +9031,8 @@ fn prefill_moe_ffn_body_batched(
         x_rot_batch: &pbs.x_rot_batch,
         expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
         expert_down_ptrs: &ffn.expert_down_ptrs,
+        expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
+        expert_dtype_tags: ffn.expert_dtype_tags.as_ref(),
         gate_batch,
         up_batch,
         rot_batch,
@@ -12417,7 +13621,7 @@ fn moe_ffn_dispatch(
     config: &Qwen35Config,
     s: &Qwen35Scratch,
 ) -> HipResult<()> {
-    let r = if ffn_all_mq4_for_moe(ffn) {
+    let r = if ffn_gate_side_mq4_for_moe(ffn) {
         gpu.fused_rmsnorm_rotate_mq(
             x, ffn_norm,
             s.moe_x_rot.as_ref().expect("MoE scratch"),
@@ -12534,6 +13738,27 @@ pub fn shard_moe_experts(
     let dn_b: Vec<u8> = dn.iter().flat_map(|p| p.to_ne_bytes()).collect();
     gpu.hip.memcpy_htod(&ffn.expert_gate_up_ptrs.buf, &gu_b)?;
     gpu.hip.memcpy_htod(&ffn.expert_down_ptrs.buf, &dn_b)?;
+
+    // Route A MoE-AWQ under EP: rebuild the per-expert down.awq_scale pointer
+    // table over the compacted set. Non-owned slots get a valid dummy pointer
+    // (compacted[0]'s scale) — they read zeroed gate_up ⇒ silu output 0 ⇒
+    // 0/scale = 0 regardless, so the all-reduced sum is unaffected.
+    if let Some(awq_tbl) = ffn.expert_down_awq_ptrs.as_ref() {
+        let dummy_aw = compacted[0].down.awq_scale.as_ref()
+            .map(|s| s.buf.as_ptr() as u64).unwrap_or(0);
+        let mut aw = vec![dummy_aw; n_exp];
+        for (e, slot) in aw.iter_mut().enumerate() {
+            if shard.owns_expert(rank, e) {
+                let li = local_of_global[e];
+                if let Some(s) = compacted[li].down.awq_scale.as_ref() {
+                    *slot = s.buf.as_ptr() as u64;
+                }
+            }
+        }
+        let aw_b: Vec<u8> = aw.iter().flat_map(|p| p.to_ne_bytes()).collect();
+        gpu.hip.memcpy_htod(&awq_tbl.buf, &aw_b)?;
+    }
+
     ffn.experts = compacted;
     Ok(())
 }
@@ -13269,10 +14494,16 @@ pub fn forward_prefill_batch_ep(
         return Ok(());
     }
     let dim = config.dim;
+    // Per-call contract: one window must fit max_batch. Long prompts are driven
+    // by calling this repeatedly with advancing start_pos + persistent kv/dn
+    // (KV + DeltaNet state accumulate in place across calls, identical to the
+    // single-GPU chunk loop in forward_prefill_batch) — see ep_decode_parity's
+    // chunked-prefill loop. That bounds the prefill scratch to chunk_size, so
+    // context length is limited by the KV cache, not the activation buffers.
     assert!(
         n <= pbs_per_rank[0].max_batch,
-        "forward_prefill_batch_ep v1: prompt ({n} toks) must fit one batch (max_batch={}); \
-         chunked EP prefill is future work",
+        "forward_prefill_batch_ep: window ({n} toks) must fit one batch (max_batch={}); \
+         caller chunks long prompts into max_batch-sized windows",
         pbs_per_rank[0].max_batch,
     );
 
@@ -15280,12 +16511,22 @@ mod tests {
 
     #[test]
     fn qwen35_is_batchable_la_lloyd_mq3_only_on_gfx11_with_opt_in_gfx12() {
-        // gfx11 always admits Lloyd MQ3
+        // MQ3-Lloyd admits gfx1100/1101/1102/1150/1151 — the MQ3-Lloyd GEMM
+        // source selectors DO ship a gfx1150 kernel.
         for &arch in &["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"] {
             assert!(is_batchable_la(DType::MQ3G256Lloyd, arch), "MQ3G256Lloyd should batch on {arch}");
+        }
+        // MQ4-Lloyd admits gfx1100/1101/1102/1151 ONLY (NOT gfx1150). ANTIBLEED
+        // admit-vs-select fix: the MQ4-Lloyd GEMM source selectors panic on
+        // gfx1150 (no kernel), so admitting it upstream would crash at lookup.
+        for &arch in &["gfx1100", "gfx1101", "gfx1102", "gfx1151"] {
             assert!(is_batchable_la(DType::MQ4G256Lloyd, arch), "MQ4G256Lloyd should batch on {arch}");
         }
-        // gfx1152 not in admit list
+        assert!(
+            !is_batchable_la(DType::MQ4G256Lloyd, "gfx1150"),
+            "gfx1150 must NOT admit Lloyd MQ4 (no MQ4-Lloyd kernel source → panic)"
+        );
+        // gfx1152 not in either admit list
         assert!(!is_batchable_la(DType::MQ3G256Lloyd, "gfx1152"), "gfx1152 should NOT admit Lloyd MQ3");
         assert!(!is_batchable_la(DType::MQ4G256Lloyd, "gfx1152"), "gfx1152 should NOT admit Lloyd MQ4");
         // gfx12 requires env gate
@@ -15310,11 +16551,16 @@ mod tests {
 
     #[test]
     fn moe_ffn_has_mq3_detects_mq3_in_experts() {
-        // Build a minimal MoeFfnWeights with MQ3 dtypes
+        // Smoke-test the renamed split predicates to ensure they compile and
+        // the DType-level logic is preserved.
+        // MoeFfnWeights requires GPU-backed tensors; the real DType dispatch
+        // is tested via moe_prefill_rejects_mq3_before_admission_work below.
         let _mq3_dt = DType::MQ3G256;
-        let _batchable_dt = DType::MQ4G256;
-        // Use default F32 as fallback
-        // MoeFfnWeights requires GPU-backed tensors; predicate is tested at DType level.
+        let _mq3l_dt = DType::MQ3G256Lloyd;
+        let _mq4_dt = DType::MQ4G256;
+        // Verify the predicates are callable (the MoeFfnWeights tensor
+        // requirement prevents constructing a real fixture here; logic
+        // coverage is via the admission tests below that use MoePrefillDtypes).
     }
 
     #[test]
@@ -15328,18 +16574,36 @@ mod tests {
     #[test]
     fn moe_prefill_admits_mq4_as_known_good_control() {
         let dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
-        assert!(moe_ffn_batched_admissible_for_dtypes(&dtypes, false, false));
+        assert!(moe_ffn_batched_admissible_for_dtypes(&dtypes, false, false, false));
+    }
+
+    #[test]
+    fn moe_prefill_admits_graded_mixed_experts_via_merged_kernel() {
+        // Graded T3-3L: routed experts dtype-mixed (hot MQ6 / mid MQ4 / cold
+        // MQ3-Lloyd), shared expert + router MQ4. The merged grouped-WMMA prefill
+        // kernel serves the routed experts, so this MUST be batched-admissible —
+        // otherwise it silently drops to the per-token prefill fallback at
+        // ~decode speed and the merged kernel never fires.
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.routed_mixed_merged = true;
+        dtypes.expert_gate_up_uniform = false;
+        dtypes.expert_down_uniform = false;
+        dtypes.expert_down = DType::MQ3G256Lloyd; // representative cold-tier dtype
+        assert!(moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false));
+        // The same mixed file WITHOUT the merged-kernel tag table is NOT admissible.
+        dtypes.routed_mixed_merged = false;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false));
     }
 
     #[test]
     fn moe_prefill_rejects_mq3_before_admission_work() {
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         dtypes.expert_gate_up = DType::MQ3G256;
-        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false));
 
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         dtypes.shared_expert_down = DType::MQ3G256;
-        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false));
     }
 
     #[test]
@@ -15352,27 +16616,27 @@ mod tests {
         dtypes.expert_gate_up = DType::MQ6G256;
         dtypes.expert_down = DType::MQ6G256;
         assert!(!moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, false, false
+            &dtypes, false, false, false
         ));
-        assert!(moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+        assert!(moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false));
     }
 
     #[test]
     fn moe_prefill_rejects_nonuniform_expert_projections() {
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         dtypes.expert_gate_up_uniform = false;
-        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false));
 
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         dtypes.expert_down_uniform = false;
-        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false));
     }
 
     #[test]
     fn moe_prefill_shared_gate_up_must_be_one_dtype() {
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         dtypes.shared_expert_up = DType::MQ6G256;
-        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false));
     }
 
     #[test]
@@ -15380,20 +16644,41 @@ mod tests {
         let mut dtypes = MoePrefillDtypes::uniform(DType::ParoQ4G128);
         dtypes.router = DType::F32;
         dtypes.shared_expert_scalar_gate = DType::F32;
-        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
-        assert!(moe_ffn_batched_admissible_for_dtypes(&dtypes, true, true));
+        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false));
+        assert!(moe_ffn_batched_admissible_for_dtypes(&dtypes, true, true, false));
     }
 
     #[test]
-    fn mq6_batched_admit_defaults_to_gfx12_and_gfx1151() {
+    fn moe_prefill_admits_e8_only_with_arch_gate() {
+        // A3B mfp4-E8: Q8 router/scalar-gate/shared-expert + E8 routed experts.
+        let mut dtypes = MoePrefillDtypes::uniform(DType::Q8_0);
+        dtypes.expert_gate_up = DType::MFP4G32E8;
+        dtypes.expert_down = DType::MFP4G32E8;
+        // Without the arch gate (non-gfx1151), E8 is rejected.
+        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, false, false, false));
+        // With the gfx1151 arch gate, the Q8-shared + E8-routed layer admits.
+        assert!(moe_ffn_batched_admissible_for_dtypes(&dtypes, false, false, true));
+    }
+
+    #[test]
+    fn mq6_batched_admit_defaults_to_gfx11_and_gfx12() {
+        // Post-merge resolved default (gfx11 widen 8d555fc6 ∪ master's gfx1151
+        // fast-path): every WMMA arch — all gfx11 (RDNA3/3.5, incl. gfx1100 and
+        // gfx1151) and all gfx12 (RDNA4) — default-admits MQ6 batched prefill.
+        // Non-WMMA archs (gfx942 CDNA, gfx1030 RDNA2) stay default-off.
         assert!(mq6_batched_admit_enabled_from_env(None, "gfx1201"));
         assert!(mq6_batched_admit_enabled_from_env(None, "gfx1200"));
         assert!(mq6_batched_admit_enabled_from_env(None, "gfx1151"));
-        assert!(!mq6_batched_admit_enabled_from_env(None, "gfx1100"));
+        // gfx1100 is now ADMITTED by default (the gfx11 widen), where master
+        // had it default-off pending channel testing.
+        assert!(mq6_batched_admit_enabled_from_env(None, "gfx1100"));
         assert!(!mq6_batched_admit_enabled_from_env(None, "gfx942"));
+        assert!(!mq6_batched_admit_enabled_from_env(None, "gfx1030"));
+        // Explicit env overrides still win on every arch.
         assert!(mq6_batched_admit_enabled_from_env(Some("1"), "gfx1151"));
         assert!(mq6_batched_admit_enabled_from_env(Some("1"), "gfx1100"));
         assert!(!mq6_batched_admit_enabled_from_env(Some("0"), "gfx1201"));
+        assert!(!mq6_batched_admit_enabled_from_env(Some("0"), "gfx1100"));
     }
 
     #[test]

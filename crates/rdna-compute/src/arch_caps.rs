@@ -218,9 +218,21 @@ impl ArchCaps {
                 // dropping the cutoff from 256 → 128, with byte-identical
                 // greedy decode parity (2026-05-29). RDNA2 keeps 256 for now
                 // (untested at lower cutoffs in this session).
+                // ANTIBLEED split: the gfx11 MMQ cutoff is TUNING, not a
+                // capability — it should track bandwidth/CU count, which differ
+                // dGPU (wide GDDR6) vs iGPU (narrow LPDDR5). Split the branch by
+                // bandwidth molecule. Both arms keep 128 for now
+                // (behavior-preserving: gfx1100 + gfx1151 stay route-identical);
+                // the per-arch divergence is tuned later by the re-sweep, not
+                // here. is_rdna4 stays at 128 unchanged.
                 let arch_min_batch: usize = if self.is_gfx906 {
                     8
-                } else if self.is_rdna3 || self.is_rdna4 {
+                } else if self.is_rdna3_dgpu || self.is_rdna4 {
+                    128
+                } else if self.is_rdna3p5 || self.is_gfx1103 {
+                    // Narrow-BW arm: iGPU (gfx1150/1151/1152) + the gfx1103
+                    // Phoenix mobile APU orphan (in neither fine RDNA3 molecule,
+                    // but narrow-BW like the iGPUs).
                     128
                 } else {
                     256
@@ -317,6 +329,26 @@ impl ArchCaps {
     }
     pub fn is_rdna3p5(&self) -> bool {
         self.is_rdna3p5
+    }
+    /// MQ4-Lloyd `_mb4` batch-fanout kernel admission. The MQ4-Lloyd mb4
+    /// `*_mb4_for_arch` source selectors in `kernels.rs` ship a real kernel
+    /// only for gfx1100/1101/1102 (RDNA3 dGPU) and gfx1151 (the Strix-Halo K4
+    /// sibling); every other arch panics there. This predicate MUST stay in
+    /// lock-step with that select-set so an admitted box never reaches the
+    /// panic — gfx1150/1152/1103 are deliberately excluded (no mb4 source).
+    /// It is a CAPABILITY gate (does the mb4 kernel exist for this chip), not a
+    /// bandwidth/CU tuning knob, so it does NOT split dGPU-vs-iGPU.
+    pub fn supports_mq4_lloyd_mb4(&self) -> bool {
+        self.is_rdna3 && (self.is_gfx1100 || self.is_gfx1101 || self.is_gfx1102 || self.is_gfx1151)
+    }
+    /// MQ3-Lloyd / HFQ3 `_mb4` batch-fanout kernel admission. Distinct from
+    /// `supports_mq4_lloyd_mb4`: the MQ3-Lloyd mb4 `*_mb4_for_arch` source
+    /// selectors DO ship a gfx1150 source (gfx1100/1101/1102/1150/1151), so the
+    /// admit-set is wider by exactly gfx1150. Only gfx1152 and the gfx1103 APU
+    /// orphan lack an mb4 source. CAPABILITY gate (kernel existence), not a
+    /// bandwidth tuning knob — kept as the exclusion form to mirror the select.
+    pub fn supports_mq3_lloyd_mb4(&self) -> bool {
+        self.is_rdna3 && !self.is_gfx1152 && !self.is_gfx1103
     }
     pub fn is_rdna4(&self) -> bool {
         self.is_rdna4
@@ -590,5 +622,58 @@ mod tests {
         assert!(make_caps("gfx908").is_wave64_native());
         assert!(make_caps("gfx942").is_wave64_native());
         assert!(!make_caps("gfx1100").is_wave64_native());
+    }
+
+    // ── ANTIBLEED divorce: mb4 admission must equal the kernel select-set ──
+
+    #[test]
+    fn mq4_lloyd_mb4_admits_only_select_set() {
+        // MQ4-Lloyd mb4 source selectors ship gfx1100/1101/1102/1151 ONLY;
+        // gfx1150/1152/1103 panic there → must be rejected by the predicate.
+        for arch in &["gfx1100", "gfx1101", "gfx1102", "gfx1151"] {
+            assert!(
+                make_caps(arch).supports_mq4_lloyd_mb4(),
+                "mq4-lloyd mb4 must admit {arch}"
+            );
+        }
+        for arch in &["gfx1150", "gfx1152", "gfx1103", "gfx1200", "gfx1201", "gfx906"] {
+            assert!(
+                !make_caps(arch).supports_mq4_lloyd_mb4(),
+                "mq4-lloyd mb4 must NOT admit {arch} (no kernel source → panic)"
+            );
+        }
+    }
+
+    #[test]
+    fn mq3_lloyd_mb4_admits_only_select_set() {
+        // MQ3-Lloyd mb4 source selectors ship gfx1100/1101/1102/1150/1151
+        // (gfx1150 INCLUDED, unlike MQ4); gfx1152/1103 panic there.
+        for arch in &["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"] {
+            assert!(
+                make_caps(arch).supports_mq3_lloyd_mb4(),
+                "mq3-lloyd mb4 must admit {arch}"
+            );
+        }
+        for arch in &["gfx1152", "gfx1103", "gfx1200", "gfx1201", "gfx906"] {
+            assert!(
+                !make_caps(arch).supports_mq3_lloyd_mb4(),
+                "mq3-lloyd mb4 must NOT admit {arch}"
+            );
+        }
+    }
+
+    #[test]
+    fn mmq_cutoff_behavior_preserving_post_split() {
+        // The dGPU/iGPU split keeps the gfx11 cutoff at 128 on BOTH arms, and
+        // gfx1103 (orphan) stays at 128 too. gfx1100 + gfx1151 stay identical.
+        // (rdna4 lacks has_mmq so it short-circuits to false — not tested here.)
+        for arch in &["gfx1100", "gfx1151", "gfx1150", "gfx1152", "gfx1103"] {
+            let caps = make_caps(arch);
+            assert!(
+                !caps.should_use_mmq(127),
+                "{arch} should not use mmq below 128"
+            );
+            assert!(caps.should_use_mmq(128), "{arch} should use mmq at 128");
+        }
     }
 }

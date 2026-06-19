@@ -400,6 +400,7 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         K::GemvMq4G256Prerotated => hip!(gpu.gemv_mq4g256_prerotated(w.buf, x, y, m, k)),
         K::GemvMq3G256Prerotated => hip!(gpu.gemv_mq3g256_prerotated(w.buf, x, y, m, k)),
         K::GemvMq2G256Prerotated => hip!(gpu.gemv_mq2g256_prerotated(w.buf, x, y, m, k)),
+        K::GemvMq5G256Prerotated => hip!(gpu.gemv_mq5g256_prerotated(w.buf, x, y, m, k)),
         K::GemvMq6G256Prerotated => hip!(gpu.gemv_mq6g256_prerotated(w.buf, x, y, m, k)),
         K::GemvMq4G128 => hip!(gpu.gemv_mq4g128_prerotated(w.buf, x, y, m, k)),
         K::GemvMq8G256Prerotated => hip!(gpu.gemv_mq8g256_prerotated(w.buf, y, m, k)),
@@ -407,6 +408,10 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         K::GemvMq3G256Lloyd | K::GemvMq3G256LloydPrerotated => hip!(gpu.gemv_mq3g256_lloyd(w.buf, x, y, m, k)),
         K::GemvMq4G256Lloyd | K::GemvMq4G256LloydPrerotated => hip!(gpu.gemv_mq4g256_lloyd(w.buf, x, y, m, k)),
         K::GemvMfp4G32Prerotated => hip!(gpu.gemv_mfp4g32_prerotated(w.buf, x, y, m, k)),
+        K::GemvMfp4G32Lloyd | K::GemvMfp4G32LloydPrerotated => hip!(gpu.gemv_mfp4g32_lloyd(w.buf, x, y, m, k)),
+        K::GemvMfp4G32P | K::GemvMfp4G32PPrerotated => hip!(gpu.gemv_mfp4g32_p(w.buf, x, y, m, k)),
+        K::GemvMfp4G32E8 | K::GemvMfp4G32E8Prerotated => hip!(gpu.gemv_mfp4g32_e8(w.buf, x, y, m, k)),
+        K::GemvMfp4G32E8Soa | K::GemvMfp4G32E8SoaPrerotated => hip!(gpu.gemv_mfp4g32_e8_soa(w.buf, x, y, m, k)),
         other => return Err(DispatchError::MissingImpl { key: other }),
     }
 }
@@ -435,6 +440,7 @@ fn dispatch_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchE
         // (same contract as Prerotated) — dispatch through HFQ residual kernel.
         MQ4G256 => hip!(gpu.gemv_hfq4g256_residual(w.buf, x, y, m, k)),
         MQ3G256 => hip!(gpu.gemv_hfq3g256_residual(w.buf, x, y, m, k)),
+        MQ5G256 => hip!(gpu.gemv_hfq5g256_residual(w.buf, x, y, m, k)),
         MQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x, y, m, k)),
         MQ3G256Lloyd => hip!(gpu.gemv_mq3g256_lloyd_residual(w.buf, x, y, m, k)),
         MQ4G256Lloyd => hip!(gpu.gemv_mq4g256_lloyd_residual(w.buf, x, y, m, k)),
@@ -475,6 +481,7 @@ fn dispatch_swiglu_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), Di
         HFQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x_in, residual, m, k)),
         MQ4G256 => hip!(gpu.gemv_hfq4g256_residual(w.buf, x_in, residual, m, k)),
         MQ3G256 => hip!(gpu.gemv_hfq3g256_residual(w.buf, x_in, residual, m, k)),
+        MQ5G256 => hip!(gpu.gemv_hfq5g256_residual(w.buf, x_in, residual, m, k)),
         MQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x_in, residual, m, k)),
         MQ3G256Lloyd => hip!(gpu.gemv_mq3g256_lloyd_residual(w.buf, x_in, residual, m, k)),
         MQ4G256Lloyd => hip!(gpu.gemv_mq4g256_lloyd_residual(w.buf, x_in, residual, m, k)),

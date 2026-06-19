@@ -55,7 +55,21 @@ SCHEMA_VERSION = 1
 SIZE_TOLERANCE = 0.25
 # Known weight-file quant suffixes (see docs/MODELS.md). Anything else is an
 # error: a new format must be added here deliberately, not silently passed.
-KNOWN_QUANTS = {"mq2lloyd", "mq3", "mq4", "mq6", "hf4", "hf6", "q8", "hfq"}
+KNOWN_QUANTS = {
+    "mq2lloyd",
+    "mq2",
+    "mq3",
+    "mq3p",
+    "mq4",
+    "mq4p",
+    "mq5",
+    "mq6",
+    "mfp4",
+    "hf4",
+    "hf6",
+    "q8",
+    "hfq",
+}
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CURATED_PATH = REPO_ROOT / "cli" / "registry.json"

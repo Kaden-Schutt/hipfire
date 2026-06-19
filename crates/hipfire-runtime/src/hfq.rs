@@ -37,7 +37,7 @@ fn fadvise_dontneed(_fd: i32, _offset: usize, _len: usize) {}
 
 pub struct HfqTensorInfo {
     pub name: String,
-    pub quant_type: u8, // 0=Q4F16G64, 1=F16, 2=F32
+    pub quant_type: u8, // serialized QuantType byte (e.g. 13=MQ4G256, 15=MQ6G256, 31=MQ5G256); see hipfire-quantize QuantType enum
     pub shape: Vec<u32>,
     pub group_size: u32,
     pub data_offset: usize,
@@ -206,7 +206,7 @@ impl HfqFile {
             cumulative_offset += data_size;
         }
 
-        Ok(Self {
+        let me = Self {
             _file: file,
             path: path.to_path_buf(),
             mmap: Some(mmap),
@@ -215,7 +215,27 @@ impl HfqFile {
             tensors,
             tensor_map,
             pread_buf: std::cell::RefCell::new(Vec::new()),
-        })
+        };
+
+        // Structural-pillar tripwire: a qwen3.5/3.6 checkpoint MUST carry
+        // arch_id 5 (dense) or 6 (MoE) so the daemon's chat-template resolver
+        // routes it through the froggeric pillar and its forward dispatches to
+        // the qwen35 crate. If the retained source provenance says qwen3* but
+        // the stamped arch_id is anything else, the pillar cannot fire — hard-
+        // fail at load rather than silently serving a mis-framed model.
+        if !matches!(me.arch_id, 5 | 6) {
+            if let Some(prov) = me.qwen3_provenance() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "qwen3* model ({prov}) stamped arch_id={}; cannot guarantee froggeric pillar — re-quantize with correct arch_id (5=dense, 6=MoE)",
+                        me.arch_id
+                    ),
+                ));
+            }
+        }
+
+        Ok(me)
     }
 
     /// Drop the mmap to free the virtual address mapping. After this call,
@@ -269,6 +289,59 @@ impl HfqFile {
             .get("chat_template")?
             .as_str()
             .map(|s| s.to_string())
+    }
+
+    /// Detect whether this .hfq's retained source provenance indicates a
+    /// qwen3.5 / qwen3.6 model. The quantizer writes the original family
+    /// identity into the .hfq metadata blob: the safetensors path stores
+    /// `metadata.architecture` (= `config.model_type`) and the full
+    /// `metadata.config` (which carries `architectures[]` and `model_type`);
+    /// the GGUF path stores `metadata.architecture` (e.g. "qwen3moe") and
+    /// `metadata.config.model_type`. This scans all of those for the same
+    /// qwen3_5/qwen3.5/qwen3_6/qwen3.6 substrings used by
+    /// `safetensors_source::detect_arch_id` so the load-time pillar tripwire
+    /// can flag a qwen3* checkpoint whose `arch_id` header was mis-stamped
+    /// (i.e. not 5/6). Returns the matched provenance string for the error
+    /// message, or `None` when no qwen3* marker is present (or metadata is
+    /// unparseable / absent).
+    pub fn qwen3_provenance(&self) -> Option<String> {
+        let meta: serde_json::Value = serde_json::from_str(&self.metadata_json).ok()?;
+        let is_qwen35 = |s: &str| {
+            let l = s.to_lowercase();
+            l.contains("qwen3_5")
+                || l.contains("qwen3.5")
+                || l.contains("qwen3_6")
+                || l.contains("qwen3.6")
+        };
+        // metadata.architecture (model_type str for safetensors; GGUF arch str).
+        if let Some(a) = meta.get("architecture").and_then(|v| v.as_str()) {
+            if is_qwen35(a) {
+                return Some(format!("architecture={a}"));
+            }
+        }
+        // metadata.config.model_type and metadata.config.architectures[].
+        let cfg = meta.get("config");
+        if let Some(mt) = cfg
+            .and_then(|c| c.get("model_type"))
+            .and_then(|v| v.as_str())
+        {
+            if is_qwen35(mt) {
+                return Some(format!("model_type={mt}"));
+            }
+        }
+        if let Some(archs) = cfg
+            .and_then(|c| c.get("architectures"))
+            .and_then(|v| v.as_array())
+        {
+            for v in archs {
+                if let Some(a) = v.as_str() {
+                    if is_qwen35(a) {
+                        return Some(format!("architectures={a}"));
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Resolve a tensor name, trying common prefix variants.
@@ -973,10 +1046,39 @@ fn load_weight_tensor(
                 awq_scale: None,
             })
         }
+        32 => { // MFP4G32Lloyd -- mfp4 rows + 32-B per-tensor fp16 codebook prefix.
+                // data_size already includes the +32 B prefix; upload verbatim.
+            assert!(k % 256 == 0, "MFP4G32Lloyd weight {st_name} has K={k} but kernel + FWHT require K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MFP4G32Lloyd, m, k, row_stride: 0, paro: None, awq_scale: None })
+        }
+        33 => { // MFP4G32P -- mfp4+P: mfp4 rows with E4M3 (non-power-of-2) per-block scale.
+                // Byte-IDENTICAL layout to MFP4G32 (qt 24): NO prefix, same row_bytes.
+                // Only the per-block scale byte's decode differs (E4M3 vs UE8M0).
+            assert!(k % 256 == 0, "MFP4G32P weight {st_name} has K={k} but kernel + FWHT require K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MFP4G32P, m, k, row_stride: 0, paro: None, awq_scale: None })
+        }
+        34 => { // MFP4G32E8 — mfp4-E8: mfp4+P container, NO prefix, same row_bytes;
+                // per-32-block 16 E2M1 nibbles replaced by 4x32-bit E8-lattice codewords.
+            assert!(k % 256 == 0, "MFP4G32E8 weight {st_name} has K={k} but kernel + FWHT require K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MFP4G32E8, m, k, row_stride: 0, paro: None, awq_scale: None })
+        }
+        35 => { // MFP4G32E8SOA — mfp4-E8 SoA: same E8 data as qt=34 but in SoA layout.
+                // Per-row: [16B hdr] + [n_blocks B E4M3 scales, pad 16B] + [n_blocks*16B codewords].
+            assert!(k % 256 == 0, "MFP4G32E8SOA weight {st_name} has K={k} but kernel + FWHT require K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MFP4G32E8SOA, m, k, row_stride: 0, paro: None, awq_scale: None })
+        }
+        31 => { // MQ5-G256 — MagnumQuant FWHT-rotated 5-bit, 168 bytes per 256 elements (5.25 bpw).
+                // AWQ sidecar attached centrally below via supports_awq_sidecar().
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ5G256, m, k, row_stride: 0, paro: None, awq_scale: None })
+        }
         1 => {
             // F16 — dequant to F32 for F32 GEMV
-            let f32_data: Vec<f32> = data
-                .chunks_exact(2)
+            let f32_data: Vec<f32> = data.chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect();
             let bytes: &[u8] = unsafe {

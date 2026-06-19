@@ -661,6 +661,7 @@ impl ModelSlot {
 
     /// Single-token forward pass. Writes logits into `self.scratch.logits`.
     pub fn forward(&mut self, gpu: &mut Gpu, token: u32, pos: usize) -> HipResult<()> {
+        gpu.graphs.ar_graph_eligible = false; // spec re-seed: never the plain-AR graph
         qwen35::forward_scratch(
             gpu,
             &self.weights,
@@ -3026,7 +3027,17 @@ pub fn spec_step_dflash(
     let ngram_block_env = *NGRAM_BLOCK_ENV
         .get_or_init(|| std::env::var("HIPFIRE_DFLASH_NGRAM_BLOCK").ok().as_deref() == Some("1"));
     let ngram_block_active = !use_temp_sampling && ngram_block_env;
-    let host_path_active = rp_active || ngram_block_active;
+    // HIPFIRE_DFLASH_LOGIT_DUMP=1: per-cycle diagnostic. Forces the host-logits
+    // path and prints, at the acceptance boundary, the target top1/top2 margin
+    // and the logit gap to the drafted (rejected) token. A tiny gap at the
+    // first divergence position is the signature of a sub-ULP numerics
+    // tie-break (noise), vs a large gap = a real forward divergence. Greedy
+    // only; zero cost when unset.
+    static LOGIT_DUMP_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let logit_dump_active = !use_temp_sampling
+        && *LOGIT_DUMP_ENV
+            .get_or_init(|| std::env::var("HIPFIRE_DFLASH_LOGIT_DUMP").ok().as_deref() == Some("1"));
+    let host_path_active = rp_active || ngram_block_active || logit_dump_active;
     let draft_ffn_graph_env = std::env::var("HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH").ok();
     let draft_ffn_graph = dflash_moe_draft_ffn_graph_eligible(
         target.config.num_experts,
@@ -3598,6 +3609,39 @@ pub fn spec_step_dflash(
             }
         }
         bonus_token = argmax_per_pos[accept_len];
+
+        if logit_dump_active {
+            // Inspect the acceptance boundary. If accept_len < b-1 the block
+            // was rejected at position accept_len (drafted loser = block[accept_len+1]);
+            // otherwise the whole block accepted and we report the bonus slot.
+            let tgt = &verify_out.logits_per_pos;
+            let rej_i = accept_len.min(b - 1);
+            let row = &tgt[rej_i * vocab..(rej_i + 1) * vocab];
+            let (mut top1_idx, mut top1, mut top2) = (0usize, f32::NEG_INFINITY, f32::NEG_INFINITY);
+            for (j, &v) in row.iter().enumerate() {
+                if v > top1 {
+                    top2 = top1;
+                    top1 = v;
+                    top1_idx = j;
+                } else if v > top2 {
+                    top2 = v;
+                }
+            }
+            let rejected = accept_len < b - 1;
+            let rej_tok: i64 = if rejected { block[accept_len + 1] as i64 } else { -1 };
+            let (rej_logit, gap, rej_rank) = if rejected {
+                let rv = row[rej_tok as usize];
+                let rank = row.iter().filter(|&&v| v > rv).count() + 1;
+                (rv, top1 - rv, rank as i64)
+            } else {
+                (f32::NAN, f32::NAN, -1)
+            };
+            eprintln!(
+                "DFLDUMP pos={} b={} accept={} rejected={} top1_tok={} top1={:.5} top2={:.5} margin={:.5} rej_tok={} rej_logit={:.5} gap={:.5} rej_rank={} bonus={}",
+                position, b, accept_len, rejected as u8, top1_idx, top1, top2,
+                top1 - top2, rej_tok, rej_logit, gap, rej_rank, bonus_token
+            );
+        }
     }
 
     // ── 7b. Seed-prediction oracle (Task #93 Phase B) ───────────────────

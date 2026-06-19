@@ -11,6 +11,19 @@ use crate::dispatch::{Gpu, GpuTensor};
 use crate::kernels;
 use hip_bridge::HipResult;
 
+/// Whether the multi-workgroup parallel sampler is enabled (default ON).
+/// `HIPFIRE_SAMPLE_PARALLEL=0` forces the legacy single-block kernel (for
+/// byte-exact A/B and as a fallback). Read once, cached.
+fn sample_parallel_enabled() -> bool {
+    use std::sync::OnceLock;
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| {
+        std::env::var("HIPFIRE_SAMPLE_PARALLEL")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
 impl Gpu {
     /// Compute max softmax probability on GPU. Downloads 4 bytes instead of vocab×4.
     pub fn max_prob(
@@ -153,6 +166,16 @@ impl Gpu {
         frequency_penalty: f32,
     ) -> HipResult<(u32, u32)> {
         self.bind_thread()?;
+        // Multi-workgroup parallel sampler (default ON): splits the 150K-vocab
+        // top-K scan across N blocks instead of the single-block kernel that
+        // idles 95 of 96 CUs (~305 us/token on gfx1100 A3B decode). Byte-
+        // identical token for distinct logits. Opt out: HIPFIRE_SAMPLE_PARALLEL=0.
+        if sample_parallel_enabled() {
+            return self.sample_top_p_parallel_impl(
+                logits, result_buf, repeat_buf, vocab_size, temperature, top_p,
+                rng_state, repeat_window, repeat_penalty, presence_penalty, frequency_penalty,
+            );
+        }
         self.ensure_kernel("sample_top_p", kernels::SAMPLE_TOP_P_SRC, "sample_top_p")?;
         let func = &self.functions["sample_top_p"];
 
@@ -195,6 +218,121 @@ impl Gpu {
                 self.stream_ref(),
                 &mut params,
             )?;
+        }
+
+        let mut out = [0u8; 8];
+        self.hip.memcpy_dtoh(&mut out, &result_buf.buf)?;
+        let token_id = u32::from_ne_bytes([out[0], out[1], out[2], out[3]]);
+        let new_rng = u32::from_ne_bytes([out[4], out[5], out[6], out[7]]);
+        Ok((token_id, new_rng))
+    }
+
+    /// Multi-workgroup parallel implementation of [`sample_top_p_pf`]. Three
+    /// stream-ordered launches: an in-place penalty prepass (only when a
+    /// penalty is active), `sample_topk_partial` (vocab top-K split across
+    /// `N_BLOCKS` workgroups → partials scratch), and `sample_topk_finalize`
+    /// (merge partials → global top-K + the verbatim softmax/sort/top-p/RNG
+    /// tail). Byte-identical token to the single-block kernel for distinct
+    /// logits.
+    #[allow(clippy::too_many_arguments)]
+    fn sample_top_p_parallel_impl(
+        &mut self,
+        logits: &GpuTensor,
+        result_buf: &GpuTensor,
+        repeat_buf: &GpuTensor,
+        vocab_size: usize,
+        temperature: f32,
+        top_p: f32,
+        rng_state: u32,
+        repeat_window: usize,
+        repeat_penalty: f32,
+        presence_penalty: f32,
+        frequency_penalty: f32,
+    ) -> HipResult<(u32, u32)> {
+        const N_BLOCKS: u32 = 128;
+        const TOP_K: usize = 20;
+        const BLOCK: u32 = 256;
+        // smem: topk_val[BLOCK*TOP_K] + topk_idx[BLOCK*TOP_K], 4 bytes each.
+        let shared_mem = BLOCK * TOP_K as u32 * 4 * 2;
+
+        let m = "sample_top_p_parallel";
+        self.ensure_kernel(m, kernels::SAMPLE_TOP_P_PARALLEL_SRC, "sample_apply_repeat_penalty")?;
+        self.ensure_kernel(m, kernels::SAMPLE_TOP_P_PARALLEL_SRC, "sample_topk_partial")?;
+        self.ensure_kernel(m, kernels::SAMPLE_TOP_P_PARALLEL_SRC, "sample_topk_finalize")?;
+
+        // Partials scratch: [N_BLOCKS*TOP_K] f32 vals then [N_BLOCKS*TOP_K] i32 idx.
+        let n_cand = N_BLOCKS as usize * TOP_K;
+        let val_bytes = n_cand * 4;
+        let partial_base = self.scratch.ensure_sample_partials(&self.hip, val_bytes * 2)?;
+        let partial_val_ptr = partial_base;
+        let partial_idx_ptr = unsafe { (partial_base as *mut u8).add(val_bytes) as *mut std::ffi::c_void };
+
+        let mut logits_ptr = logits.buf.as_ptr();
+        let mut result_ptr = result_buf.buf.as_ptr();
+        let mut repeat_ptr = repeat_buf.buf.as_ptr();
+        let mut vs = vocab_size as i32;
+        let mut nb = N_BLOCKS as i32;
+        let mut ncand = n_cand as i32;
+        let mut temp = temperature;
+        let mut tp = top_p;
+        let mut rng = rng_state;
+        let mut rw = repeat_window as i32;
+        let mut rp = repeat_penalty;
+        let mut pp = presence_penalty;
+        let mut fp = frequency_penalty;
+        let mut pval = partial_val_ptr;
+        let mut pidx = partial_idx_ptr;
+
+        let any_penalty =
+            repeat_penalty > 1.0 || presence_penalty > 0.0 || frequency_penalty > 0.0;
+
+        // 1) Penalty prepass (in-place on logits), only when active.
+        if any_penalty && repeat_window > 0 {
+            let mut params: Vec<*mut c_void> = vec![
+                &mut logits_ptr as *mut _ as *mut c_void,
+                &mut repeat_ptr as *mut _ as *mut c_void,
+                &mut vs as *mut _ as *mut c_void,
+                &mut rw as *mut _ as *mut c_void,
+                &mut rp as *mut _ as *mut c_void,
+                &mut pp as *mut _ as *mut c_void,
+                &mut fp as *mut _ as *mut c_void,
+            ];
+            let func = &self.functions["sample_apply_repeat_penalty"];
+            unsafe {
+                self.hip.launch_kernel(func, [1, 1, 1], [BLOCK, 1, 1], 0, self.stream_ref(), &mut params)?;
+            }
+        }
+
+        // 2) Per-block partial top-K over vocab strips.
+        {
+            let mut params: Vec<*mut c_void> = vec![
+                &mut logits_ptr as *mut _ as *mut c_void,
+                &mut vs as *mut _ as *mut c_void,
+                &mut nb as *mut _ as *mut c_void,
+                &mut pval as *mut _ as *mut c_void,
+                &mut pidx as *mut _ as *mut c_void,
+            ];
+            let func = &self.functions["sample_topk_partial"];
+            unsafe {
+                self.hip.launch_kernel(func, [N_BLOCKS, 1, 1], [BLOCK, 1, 1], shared_mem, self.stream_ref(), &mut params)?;
+            }
+        }
+
+        // 3) Merge partials → global top-K, then softmax/top-p/RNG sample.
+        {
+            let mut params: Vec<*mut c_void> = vec![
+                &mut pval as *mut _ as *mut c_void,
+                &mut pidx as *mut _ as *mut c_void,
+                &mut ncand as *mut _ as *mut c_void,
+                &mut result_ptr as *mut _ as *mut c_void,
+                &mut temp as *mut _ as *mut c_void,
+                &mut tp as *mut _ as *mut c_void,
+                &mut rng as *mut _ as *mut c_void,
+            ];
+            let func = &self.functions["sample_topk_finalize"];
+            unsafe {
+                self.hip.launch_kernel(func, [1, 1, 1], [BLOCK, 1, 1], shared_mem, self.stream_ref(), &mut params)?;
+            }
         }
 
         let mut out = [0u8; 8];

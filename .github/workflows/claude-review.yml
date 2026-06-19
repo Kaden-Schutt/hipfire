@@ -22,7 +22,7 @@ name: Claude PR Review
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
@@ -42,6 +42,7 @@ concurrency:
 jobs:
   review:
     name: Claude review (advisory)
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     # secrets are unavailable on fork PRs, so HAS_TOKEN is false there → skip.
     env:

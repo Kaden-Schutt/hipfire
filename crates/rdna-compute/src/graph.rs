@@ -72,8 +72,21 @@ pub struct GraphState {
     pub capture_blobs: Vec<Vec<u8>>,
     pub graph_exec: Option<GraphExec>,
     pub captured_graph: Option<Graph>,
+    /// Kernarg blobs OWNED by the captured AR graph. Drained out of the shared
+    /// `capture_blobs` at `end_graph_capture` (mirrors the verify cache's
+    /// per-entry blob ownership at line ~235) so an interleaved verify capture —
+    /// which CLEARS `capture_blobs` in `begin_verify_graph_capture` — cannot
+    /// dangle the AR graph's kernarg pointers. Kept alive as long as
+    /// `graph_exec`; freed in `drop_captured_graph` / `graph_destroy`.
+    pub ar_forward_blobs: Vec<Vec<u8>>,
     pub ar_forward_kernel_dirty: bool,
     pub ar_forward_replay_enabled: bool,
+    /// One-shot AR-graph eligibility, CONSUMED (reset to **true**) on read in
+    /// `forward_scratch`. Plain sequential single-token decode is eligible by
+    /// default; the spec-decode / MTP / verify callers set it FALSE right before
+    /// their `forward_scratch` call so the plain-AR graph can't capture/replay
+    /// in their non-sequential context.
+    pub ar_graph_eligible: bool,
 
     // Verify (DFlash, per-B)
     pub verify: PerBGraphCache,
@@ -113,6 +126,12 @@ impl GraphState {
         let exec = hip.graph_instantiate(&graph)?;
         self.captured_graph = Some(graph);
         self.graph_exec = Some(exec);
+        // Take OWNERSHIP of this graph's kernarg blobs out of the shared
+        // `capture_blobs` (mirrors `end_verify_graph_capture`). The heap
+        // allocations move with the Vec, so the graph nodes' kernarg pointers
+        // stay valid; and a later `begin_verify_graph_capture` clearing
+        // `capture_blobs` can no longer dangle them.
+        self.ar_forward_blobs = std::mem::take(&mut self.capture_blobs);
         Ok(())
     }
 
@@ -153,6 +172,7 @@ impl GraphState {
             let _ = hip.graph_destroy(graph);
         }
         self.capture_blobs.clear();
+        self.ar_forward_blobs.clear();
     }
 
     /// Caller signals a kernel-module change (model load, dtype switch, etc).
@@ -174,6 +194,7 @@ impl GraphState {
             let _ = hip.graph_destroy(graph);
         }
         self.capture_blobs.clear();
+        self.ar_forward_blobs.clear();
         self.ar_forward_kernel_dirty = true;
         self.ar_forward_replay_enabled = false;
     }
@@ -212,6 +233,12 @@ impl GraphState {
         debug_assert!(!self.capture_mode,
             "begin_verify_graph_capture: capture_mode already set");
         self.capture_blobs.clear();
+        // A verify forward is about to run on the shared buffers — invalidate the
+        // plain-AR graph so it can't replay across this spec excursion (the next
+        // plain-AR forward will re-capture). Defense-in-depth alongside the
+        // caller-side `ar_graph_eligible=false` + position-continuity gate.
+        self.ar_forward_replay_enabled = false;
+        self.ar_forward_kernel_dirty = true;
         self.verify.capturing = Some(b);
         self.capture_mode = true;
         hip.stream_begin_capture(stream, 0) // hipStreamCaptureModeGlobal

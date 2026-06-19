@@ -604,6 +604,9 @@ fn main() {
         overall_mean, overall_nll, overall_ppl
     );
     eprintln!("eval_hipfire: wrote {}", args.output.display());
+    if let Ok(p) = std::env::var("HIPFIRE_MOE_EXPERT_STATS_OUT") {
+        qwen35::dump_expert_stats(&p);
+    }
 }
 
 // (verify_ref_sha256 now lives in hipfire_runtime::eval_common — see

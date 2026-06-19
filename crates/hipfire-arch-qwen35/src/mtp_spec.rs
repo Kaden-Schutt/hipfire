@@ -125,6 +125,26 @@ fn mtp_q8_verify_wmma_enabled_from_env() -> bool {
     )
 }
 
+/// Default draft-confidence cutoff (adaptive-K) per arch. p_min=0.6 truncates
+/// the low-confidence tail of the K-chain — a win measured on the gfx1100 dGPU
+/// (2026-06-16 sweep: lifts every domain, even high-τ code +11%; 0.6 is the
+/// sweet spot, >0.7 over-truncates). DEFAULT-ON for the RDNA3 dGPU
+/// (gfx1100/1101/1102), the ONLY validated arch class. ANTIBLEED: the prior
+/// `starts_with("gfx11")` test also defaulted the RDNA3.5 iGPUs (gfx1150/1151/
+/// 1152) and the gfx1103 APU to 0.6, but p_min was NEVER validated there — they
+/// inherited a dGPU-tuned cutoff. They now default 0.0 (off) until validated in
+/// their own serve path (same as gfx12, whose W3v durability was measured at
+/// p_min=0). Override on any arch via HIPFIRE_MTP_P_MIN (e.g. =0.6 to enable
+/// elsewhere, =0 to disable). An explicit `set_p_min` call still overrides this.
+fn default_mtp_p_min(arch: &str) -> f32 {
+    if let Some(v) = std::env::var("HIPFIRE_MTP_P_MIN").ok() {
+        return v.trim().parse::<f32>().ok().filter(|x| (0.0..=1.0).contains(x)).unwrap_or(0.0);
+    }
+    // is_rdna3_dgpu arch set (wide-BW GDDR6 dGPU); the iGPUs + gfx1103 APU are
+    // deliberately excluded — p_min there is unvalidated.
+    if matches!(arch, "gfx1100" | "gfx1101" | "gfx1102") { 0.6 } else { 0.0 }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum MtpProposalGraphPolicy {
     Off,
@@ -632,7 +652,7 @@ impl MtpSpecState {
             mtp_gather_prob_verify,
             gpu_rng_state: 42,
             max_n,
-            p_min: 0.0,
+            p_min: default_mtp_p_min(gpu.arch.as_str()),
             sampling: MtpSamplingConfig::default(),
             rng: MtpRng::new(42),
         })
@@ -1385,6 +1405,30 @@ pub fn spec_step_mtp(
     // `forward_prefill_batch_with_pbs` writes per-position post-output-norm
     // hidden into `state.verify_hidden` when per_token_hidden_out is Some.
     // Trunk KV cache and dn_state advance by max_n+1 (= verify_tokens.len()).
+    //
+    // GDN-tape capture gate: the batched (PBS) verify path writes the GDN
+    // innovation tape; the per-token fallback does not. Gate on the forward's
+    // OWN eligibility predicate so the rollback's cheap-vs-full replay choice
+    // tracks exactly whether the tape was written this cycle. Mirror
+    // compressed_serial (lines 2604-2616) and DFlash (speculative.rs:3452-3456).
+    let n_verify = max_n + 1;
+    let moe_router_logits_present = state
+        .trunk_pbs
+        .moe_router_logits_batch
+        .is_some();
+    let tape_captured = qwen35::prefill_batch_pbs_eligible(
+        trunk_weights,
+        &target.config,
+        &target.dn_state,
+        n_verify,
+        gpu.arch.as_str(),
+        moe_router_logits_present,
+    );
+    let verify_tape: Option<&mut GdnTape> = if tape_captured {
+        Some(&mut state.trunk_gdn_tape)
+    } else {
+        None
+    };
     qwen35::forward_prefill_batch_with_pbs_opts(
         gpu,
         trunk_weights,
@@ -1396,7 +1440,7 @@ pub fn spec_step_mtp(
         &target.scratch,
         None, // hidden_rb: not used here (DFlash drafter not in the loop)
         Some(&state.verify_hidden),
-        None, // gdn_tape
+        verify_tape,
         None, // tree_verify
         Some(&state.trunk_pbs),
         None,  // mask_override
@@ -1409,7 +1453,7 @@ pub fn spec_step_mtp(
     // Mirrors verify_dflash_block's batched lm_head dispatch by dtype.
     // Sized to (max_n + 1). Greedy-only, so we use GPU-side batched argmax
     // to avoid the (max_n + 1) × vocab D2H.
-    let n_verify = max_n + 1;
+    // n_verify is hoisted above (before tape_captured computation).
     let w_out = &trunk_weights.output;
     let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
     match w_out.gpu_dtype {
@@ -1594,41 +1638,80 @@ pub fn spec_step_mtp(
     // After verify, trunk dn_state is at position cur_pos + max_n + 1.
     // We need it at cur_pos + advance for next cycle. Restore snapshot
     // (back to cur_pos), then replay first `advance` of `verify_tokens`.
-    // Replay re-writes trunk KV slots [cur_pos..cur_pos + advance) with
-    // identical K/V (idempotent — same inputs, same positions), and
-    // re-runs DN recurrence.
+    //
+    // LEVER 1 (W3e): When the verify took the batched (PBS) path it populated
+    // `state.trunk_gdn_tape` with the GDN innovation (qkvza projection +
+    // post-sigmoid α/β) for each LA layer at each verify position. We replay
+    // ONLY the GDN recurrence from the tape (~0.30ms) instead of a full B=2
+    // trunk forward_prefill_batch (~12.7ms). This is the same GDN-only repair
+    // that DFlash uses (speculative.rs:3465 dflash_use_gdn_tape_replay) and that
+    // compressed_serial already wires at lines 2942-2987. Mirror that exactly.
+    //
+    // Safety: replay_gdn does NOT touch KV cache. Per the "MTP KV cache rollback:
+    // NOT NEEDED" argument below, the accepted prefix's KV slots
+    // [cur_pos..cur_pos+advance) are already correct from the verify forward (the
+    // verify wrote the same tokens to the same positions as the replay would).
+    // Stale slots beyond cur_pos+advance are overwritten in-order by next cycle
+    // before they are attended. Skipping the KV re-write is safe for both the
+    // full-replay and tape-replay paths.
+    //
+    // Instrument first cycle: print tape_captured so we can confirm the MoE
+    // batched verify populates the tape (HIPFIRE_DEBUG_BATCH=1 already prints
+    // eligibility; this one-shot print on cycle 0 is unconditional for W3e).
+    // HIPFIRE_MTP_TAPE_REPLAY=0 forces the original full-replay path (A/B gate).
+    let use_tape_replay = tape_captured
+        && advance >= 2
+        && std::env::var("HIPFIRE_MTP_TAPE_REPLAY").ok().as_deref() != Some("0");
     state.trunk_snap.restore_to(&mut target.dn_state, gpu)?;
-    if advance >= 2 {
-        let replay = &verify_tokens[..advance];
-        qwen35::forward_prefill_batch(
+    if use_tape_replay {
+        // Batched verify populated the tape this cycle — cheap GDN-only replay.
+        // Only fire for advance >= 2: for advance=1 the baseline uses forward_scratch
+        // (decode-mode GEMV for wqkv), while the tape captured the batched WMMA
+        // result. These differ at ULP level. To preserve byte-identical streams,
+        // fall through to forward_scratch below when advance==1.
+        state.trunk_gdn_tape.replay_gdn(
             gpu,
             trunk_weights,
             &target.config,
-            replay,
-            cur_pos,
-            &mut target.kv_cache,
             &mut target.dn_state,
-            &target.scratch,
-            None,
-            None,
-            None,
-            None,
+            advance,
         )?;
     } else {
-        // advance == 1: only the seed (last_committed) is "replayed". This
-        // happens when EOS hits with accept_count==0 AND bonus==eos
-        // (very rare), or when the bonus was committed alone (also implies
-        // accept_count==0, which is the common AR-degraded case).
-        qwen35::forward_scratch(
-            gpu,
-            trunk_weights,
-            &target.config,
-            verify_tokens[0],
-            cur_pos,
-            &mut target.kv_cache,
-            &mut target.dn_state,
-            &target.scratch,
-        )?;
+        // Either tape not captured, HIPFIRE_MTP_TAPE_REPLAY=0 (A/B gate), or advance=1
+        // (decode-mode-GEMV vs batch-WMMA ULP mismatch — use decode path for identity).
+        if advance >= 2 {
+            let replay = &verify_tokens[..advance];
+            qwen35::forward_prefill_batch(
+                gpu,
+                trunk_weights,
+                &target.config,
+                replay,
+                cur_pos,
+                &mut target.kv_cache,
+                &mut target.dn_state,
+                &target.scratch,
+                None,
+                None,
+                None,
+                None,
+            )?;
+        } else {
+            // advance == 1: only the seed (last_committed) is "replayed". This
+            // happens when EOS hits with accept_count==0 AND bonus==eos
+            // (very rare), or when the bonus was committed alone (also implies
+            // accept_count==0, which is the common AR-degraded case).
+            gpu.graphs.ar_graph_eligible = false; // spec re-seed: never the plain-AR graph
+            qwen35::forward_scratch(
+                gpu,
+                trunk_weights,
+                &target.config,
+                verify_tokens[0],
+                cur_pos,
+                &mut target.kv_cache,
+                &mut target.dn_state,
+                &target.scratch,
+            )?;
+        }
     }
 
     // ── 9. MTP KV cache rollback: NOT NEEDED ────────────────────────────
@@ -2009,6 +2092,7 @@ pub fn spec_step_mtp_compressed(
             None,
         )?;
     } else {
+        gpu.graphs.ar_graph_eligible = false; // spec re-seed: never the plain-AR graph
         qwen35::forward_scratch(
             gpu,
             trunk_weights,
@@ -2970,6 +3054,7 @@ pub fn spec_step_mtp_compressed_serial(
                     None,
                 )?;
             } else {
+                gpu.graphs.ar_graph_eligible = false; // spec re-seed: never the plain-AR graph
                 qwen35::forward_scratch(
                     gpu,
                     trunk_weights,

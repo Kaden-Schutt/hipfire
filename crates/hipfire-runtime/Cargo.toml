@@ -341,6 +341,10 @@ required-features = ["arch-qwen35", "deltanet"]
 name = "eval_hipfire"
 required-features = ["arch-qwen35", "deltanet"]
 
+[[example]]
+name = "collect_e8_hessian_native"
+required-features = ["arch-qwen35", "deltanet"]
+
 # eval_hipfire_llama — KLD eval for llama-arch hipfire models (Qwen3 /
 # Qwen2 / Llama / Mistral / TinyLlama). Same HFKSEQ output as
 # eval_hipfire, but the forward path goes through

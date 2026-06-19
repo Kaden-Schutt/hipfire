@@ -48,10 +48,59 @@
     },
     "qwen3.6:35b-a3b": {
       "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
+      "file": "qwen3.6-35b-a3b.mq4p",
+      "size_gb": 19.8,
+      "min_vram_gb": 22,
+      "desc": "MoE 35B/3B-active. mq4p graded-HQ default (robust on all arches; supersedes the dense-AWQ mq4 which is gfx12-only)."
+    },
+    "qwen3.6:35b-a3b-mq2": {
+      "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
+      "file": "qwen3.6-35b-a3b.mq2",
+      "size_gb": 11.6,
+      "min_vram_gb": 14,
+      "desc": "Floor SKU — smallest, coherent but degraded."
+    },
+    "qwen3.6:35b-a3b-mq3p": {
+      "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
+      "file": "qwen3.6-35b-a3b.mq3p",
+      "size_gb": 17.2,
+      "min_vram_gb": 20,
+      "desc": "MQ3+P graded — MQ4 quality at MQ3 size."
+    },
+    "qwen3.6:35b-a3b-mq4p": {
+      "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
+      "file": "qwen3.6-35b-a3b.mq4p",
+      "size_gb": 19.8,
+      "min_vram_gb": 22,
+      "desc": "MQ4+P graded — robust 4-bit default, beats uniform MQ4."
+    },
+    "qwen3.6:35b-a3b-mfp4": {
+      "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
+      "file": "qwen3.6-35b-a3b.mfp4",
+      "size_gb": 20.2,
+      "min_vram_gb": 22,
+      "desc": "MFP4-E8 vector quant — the 4-bit quality leader."
+    },
+    "qwen3.6:35b-a3b-mq5": {
+      "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
+      "file": "qwen3.6-35b-a3b.mq5",
+      "size_gb": 23.7,
+      "min_vram_gb": 26,
+      "desc": "Quality SKU — ~80% MQ4->f32."
+    },
+    "qwen3.6:35b-a3b-mq6": {
+      "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
+      "file": "qwen3.6-35b-a3b.mq6",
+      "size_gb": 27.7,
+      "min_vram_gb": 30,
+      "desc": "Max quality; needs 30GB+."
+    },
+    "qwen3.6:35b-a3b-mq4": {
+      "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
       "file": "qwen3.6-35b-a3b.mq4",
-      "size_gb": 22.9,
-      "min_vram_gb": 24,
-      "desc": "MoE 35B/3B-active refresh, 148 tok/s"
+      "size_gb": 18.7,
+      "min_vram_gb": 22,
+      "desc": "Uniform MQ4 (plain, no dense-AWQ) — coherent on all arches (the dense-AWQ mq4 build was the lobotomy; this is the validated plain build)."
     },
     "qwen3.6:27b": {
       "repo": "schuttdev/hipfire-qwen3.6-27b",
