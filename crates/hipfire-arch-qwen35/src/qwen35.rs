@@ -4595,6 +4595,78 @@ pub struct CalibSummary {
     pub max_consistency: f32,
 }
 
+/// FullAttention layer indices, in order. (LinearAttention/DeltaNet layers are
+/// SSM and do not populate the KV cache's `k_gpu`, so PFlash scoring — and the
+/// drafter teacher — only ever use FullAttention layers.)
+pub fn full_attention_layers(config: &Qwen35Config) -> Vec<usize> {
+    config
+        .layer_types
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| **t == LayerType::FullAttention)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// PFlash drafter TEACHER capture (teacher/student split — see
+/// docs/plans/2026-06-19-training-via-daemon-forward.md). Forward `tokens`
+/// through the resident Qwen3.5 target (FP32 KV + FP32 DeltaNet state) and return
+/// per-block cosine-K scores `score(b) = cos(block_mean_K, last_K)` at each
+/// requested FullAttention layer — the exact signal `pflash_drafter_train`
+/// distils into a tiny custom drafter, but from the REAL target instead of a
+/// loadable stand-in. Reuses the per-token `forward_scratch` path (like
+/// `collect_calibration_artifacts`) + the fp32 `pflash_score_f32` kernel.
+pub fn capture_pflash_block_scores(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    block_size: usize,
+    layers: &[usize],
+) -> HipResult<Vec<Vec<f32>>> {
+    let n_tok = tokens.len();
+    assert!(n_tok > 0, "capture_pflash_block_scores: empty tokens");
+    assert!(block_size > 0, "capture_pflash_block_scores: block_size must be > 0");
+    for &l in layers {
+        assert!(
+            config.layer_types.get(l) == Some(&LayerType::FullAttention),
+            "capture_pflash_block_scores: layer {l} is not FullAttention (no K in cache)"
+        );
+    }
+
+    let mut kv = llama::KvCache::new_gpu(
+        gpu,
+        config.n_layers,
+        config.n_kv_heads,
+        config.head_dim,
+        n_tok + 16,
+    )?;
+    let mut dn = DeltaNetState::new(gpu, config)?;
+    let scratch = Qwen35Scratch::new(gpu, config, 64)?;
+    for (pos, &tok) in tokens.iter().enumerate() {
+        forward_scratch(gpu, weights, config, tok, pos, &mut kv, &mut dn, &scratch)?;
+    }
+
+    let kv_dim = config.n_kv_heads * config.head_dim;
+    let n_blocks = n_tok.div_ceil(block_size);
+    let mut out = Vec::with_capacity(layers.len());
+    for &layer in layers {
+        let scores = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
+        gpu.pflash_score_f32_fwd(
+            &kv.k_gpu[layer],
+            &scores,
+            n_tok,
+            kv_dim,
+            block_size,
+            n_blocks,
+            n_tok - 1,
+        )?;
+        out.push(gpu.download_f32(&scores)?);
+        let _ = gpu.free_tensor(scores);
+    }
+    Ok(out)
+}
+
 /// Single-load calibration driver: arm the [`CalibCollector`] on the resident
 /// weights, run the engine forward over `tokens` (capturing per-tensor Hessian +
 /// imatrix, the MoE router histogram for MoE models, and optionally KLDREF), and
