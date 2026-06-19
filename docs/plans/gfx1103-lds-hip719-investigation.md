@@ -78,6 +78,22 @@ The runner preserves variant-local `HIPFIRE_KERNEL_CACHE` output, `dmesg`
 snapshots, run logs, and generated source/code-object files when the runtime
 compiler writes them. `sudo` is available for root-only amdgpu sysfs evidence.
 
+Standalone HIP probes were added in the throwaway worktree only:
+
+- `/tmp/hipfire-lds-repro/lds_standalone_probe.hip`: LDS-only shared-memory
+  store/load/barrier stress kernels, no GEMM global matrix traffic.
+- `/tmp/hipfire-lds-repro/lds_gemm_standalone_probe.hip`: direct HIP tiled
+  GEMM reproducer using the same A/B/C global-memory shape as the hipfire
+  training example.
+
+Their artifact roots are:
+
+```text
+/tmp/hipfire-lds-standalone-artifacts/
+/tmp/hipfire-lds-standalone-artifacts-v2/
+/tmp/hipfire-lds-gemm-standalone-artifacts/
+```
+
 ## Variant Matrix
 
 All rows below use the same gfx1103 Phoenix APU unless noted.
@@ -93,6 +109,11 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 | LDS `TILE=5`, 5x5 block | PASS | 100 launches, 0 retries. |
 | LDS `TILE=4`, 4x4 block | PASS | 100 launches, 0 retries. |
 | 4x4 active LDS subset inside 8x8 block | PASS | 100 launches, 0 retries; barriers span 64 threads, only 16 lanes touch LDS. |
+| Standalone LDS-only `TILE=6`, 6x6 block | PASS | 100 direct HIP launches, 64x64 grid, no dmesg delta. |
+| Standalone LDS-only `TILE=8`, 8x8 block | PASS | 100 direct HIP launches, 64x64 grid, no dmesg delta. |
+| Standalone LDS-only `TILE=16`, 16x16 block | PASS | 100 direct HIP launches after fixing an output-allocation bug in the probe; no new dmesg delta. |
+| Standalone HIP GEMM `TILE=5`, 5x5 block | PASS | 100 direct HIP launches at M=512, N=3072, K=3072; no dmesg delta. |
+| Standalone HIP GEMM `TILE=6`, 6x6 block | FAIL | Direct HIP, no hipfire Rust/JIT path; sync 20 failed with HIP 719 and MES reset. |
 
 Latest artifact paths:
 
@@ -108,6 +129,9 @@ Latest artifact paths:
   comparison for this control still needs runner cleanup.
 - `tile6_dmesg_probe/`: `dmesg.before.txt` and `dmesg.after.txt` around the
   failing `tile6` run.
+- `/tmp/hipfire-lds-gemm-standalone-artifacts/tile6_n100_m512_n3072_k3072/`:
+  direct HIP standalone GEMM reproducer. Includes generated object/ISA dumps,
+  dmesg snapshots, final dmesg tail, and a root-copied `devcoredump.data`.
 
 ## Current Narrowing
 
@@ -118,6 +142,10 @@ Evidence argues against these as sole causes:
 - A-side vs B-side address math: A-only and B-only LDS both fail.
 - LDS allocation size alone: tiny 4x4 active LDS inside an 8x8 block passes.
 - Multi-wave `__syncthreads()` alone: 4x4 active LDS inside 8x8 block passes.
+- Multi-wave LDS store/load/barrier alone: standalone HIP LDS-only kernels pass
+  for `TILE=6`, `TILE=8`, and `TILE=16` at 100 launches with 64x64 grids.
+- hipfire Rust runtime/JIT/dispatch as the root cause: a standalone HIP GEMM
+  repro using `hipcc` and direct `hipLaunchKernelGGL` still fails.
 
 The `tile6` dmesg delta shows a driver-side device wedge, not a simple HIP
 runtime recoverable error. The latest v2 failing run again reset through the
@@ -175,12 +203,41 @@ gfxhub page-fault snapshot and GDS/GDS-VM protection fault registers. That makes
 this look much more like a GPU/kernel-codegen/driver interaction than an
 ordinary HIP launch bookkeeping issue.
 
+The standalone HIP GEMM repro independently reproduced the failure outside
+hipfire:
+
+```text
+sync 20 failed: unspecified launch failure (719)
+amdgpu ... MES failed to respond to msg=REMOVE_QUEUE
+amdgpu ... failed to remove hardware queue from MES, doorbell=0x1802
+amdgpu ... GPU reset begin!. Source:  3
+amdgpu ... MODE2 reset
+amdgpu ... GPU reset(13) succeeded!
+```
+
+Its coredump is also text-formatted, 64 KiB, and reports:
+
+```text
+[gfxhub] Page fault observed
+Faulty page starting at address: 0x000074669d000000
+Protection fault status register: 0x841051
+regGDS_PROTECTION_FAULT                             0x3f000007
+regGDS_VM_PROTECTION_FAULT                          0x0fc00113
+```
+
+The GDS/GDS-VM protection registers match the earlier hipfire-run failure. The
+fault address differs: the earlier coredump captured address `0x0`, while the
+standalone GEMM captured a concrete process GPUVA-like address. Both paths
+still converge on the same MES reset and GDS protection state.
+
 Code object/resource observations from `llvm-readobj` dumps:
 
 | Variant | Workgroup | LDS group segment | VGPR | SGPR | Spills | Wavefront |
 |---|---:|---:|---:|---:|---:|---:|
 | `tile5` pass | 25 | 212 B | 18 | 20/21 | 0 | 32 |
 | `tile6` fail | 36 | 288 B | 20 | 20/21 | 0 | 32 |
+| standalone GEMM `tile5` pass | 25 | 212 B | 23 | 16 | 0 | 32 |
+| standalone GEMM `tile6` fail | 36 | 288 B | 25 | 16 | 0 | 32 |
 
 ISA observations:
 
@@ -191,16 +248,24 @@ ISA observations:
 - Both `tile5` and `tile6` still contain LDS instructions. The current ISA
   counts are: `tile5` = 0 `s_barrier`, 4 `ds_store*`, 12 `ds_load*`; `tile6` =
   4 `s_barrier`, 4 `ds_store*`, 10 `ds_load*`.
+- Standalone GEMM object counts across all compiled template variants are:
+  6 `s_barrier`, 6 `ds_store*`, 23 `ds_load*`, 6 `global_load*`, and
+  3 `global_store*`. The standalone object contains `TILE=5`, `TILE=6`, and
+  `TILE=16` template instantiations, so use per-symbol disassembly before
+  over-interpreting the aggregate counts.
 - The active4-in-8x8 control passed even though the launched block spans two
   waves; only 16 lanes actively touch LDS. This keeps the current hypothesis on
   active LDS traffic across waves rather than barrier presence alone.
 
 Best current hypothesis:
 
-> On gfx1103 with this ROCm/amdgpu stack, the failure appears when more than one
-> wave worth of lanes actively performs LDS traffic in this GEMM-style kernel.
-> The sharp boundary is `TILE=5` (25 active lanes, pass) vs `TILE=6` (36 active
-> lanes, fail). This is more specific than "any LDS" or "any multi-wave block".
+> On gfx1103 with this ROCm/amdgpu stack, the failure is tied to the tiled GEMM
+> code shape, not just LDS or barriers in isolation. The sharp boundary remains
+> `TILE=5` (25 active lanes, pass) vs `TILE=6` (36 active lanes, fail) for the
+> GEMM pattern, and it reproduces in standalone HIP without hipfire runtime/JIT.
+> Standalone LDS-only kernels pass even at `TILE=16`, so the next target is the
+> interaction among GEMM global A/B/C traffic, LDS staging, cross-wave barriers,
+> and the compiler/driver's generated queue state.
 
 ## Next Evidence To Capture
 
@@ -220,9 +285,11 @@ control):
 - improve the throwaway matrix runner so it always preserves the exact
   runtime-generated `.hsaco`; the active4 control passed but did not leave a
   `.hsaco` under the expected cache name in the latest run.
-- add a minimal no-GEMM LDS reproducer if possible: isolate whether a tiny
-  multi-wave kernel with only LDS store/load/barrier can reproduce the same
-  GDS/GDS-VM fault without global matrix traffic.
+- reduce the standalone HIP GEMM reproducer further: remove C stores, then
+  remove either A or B global loads, then simplify loop trip count, while
+  preserving the direct-HIP repro path and coredump capture.
+- split standalone object metadata by kernel symbol so tile5/tile6/tile16 ISA
+  counts are not aggregated across template instantiations.
 
 Compare pass/fail boundary for:
 
@@ -236,9 +303,9 @@ Compare pass/fail boundary for:
 
 `5546fe12`'s no-LDS register-tiled production choice is currently justified.
 The 288 GFLOP/s LDS path from `b41368bb` is not safe on gfx1103. The strongest
-current lead is not just "LDS is flaky"; it is a failing multi-wave LDS GEMM
-kernel producing a MES reset path plus GDS/GDS-VM protection-fault state in the
-amdgpu coredump. A production mitigation should not be attempted until the repro
-matrix shows whether a single-wave LDS variant is actually faster enough to
-matter, or whether the fault belongs below hipfire in ROCm/amdgpu/compiler
-behavior.
+current lead is not just "LDS is flaky"; LDS-only direct-HIP stress passes, but
+the multi-wave tiled GEMM pattern fails both in hipfire and standalone HIP,
+producing a MES reset path plus GDS/GDS-VM protection-fault state in the amdgpu
+coredump. A production mitigation should not be attempted until the standalone
+GEMM repro is reduced enough to identify which part of the GEMM pattern crosses
+from valid LDS use into the gfx1103 fault path.
