@@ -216,11 +216,14 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 | Direct-AB phase-mode `6x6`, reads=6, 192 iterations, 511x86 grid, same-process 98+1 | PASS | Phase-mode runner, null stream, extra boundary synchronize; total 99 passed. |
 | Direct-AB phase-mode `6x6`, reads=6, 192 iterations, 511x86 grid, same-process 99+0 | PASS | Phase-mode runner, total 99 passed before the edge shifted again. |
 | Direct-AB phase-mode `6x6`, reads=6, 192 iterations, 511x86 grid, same-process 99+1 | FAIL | Failed on phase2 launch 0 / global launch 99. |
-| Direct-AB phase-mode `6x6`, reads=6, 192 iterations, 511x86 grid, same-process 98+2 | FAIL | Failed on phase2 launch 1 / global launch 99; preserved repeat failed 2/2. |
+| Direct-AB phase-mode `6x6`, reads=6, 192 iterations, 511x86 grid, same-process 98+2 | MIXED | Earlier preserved repeats failed 2/2 at phase2 launch 1 / global launch 99; later confirmation passed. The edge is state-sensitive. |
 | Direct-AB phase-mode `6x6`, reads=6, 192 iterations, 511x86 grid, device-reset 98+2 | FAIL | `hipDeviceReset()` between phases returned success, but phase2 launch 1 / global launch 99 still failed. |
 | Direct-AB phase-mode `6x6`, reads=6, 192 iterations, 511x86 grid, stream-recreate 98+2 | FAIL | Destroying phase1 stream and creating phase2 stream did not clear the edge. |
 | Direct-AB phase-mode `6x6`, reads=6, 192 iterations, 511x86 grid, same-stream 98+2 | MIXED | Explicit non-default stream was state-sensitive: one preserved pass and three preserved failures. |
 | Direct-AB phase-mode `6x6`, reads=6, 192 iterations, 511x86 grid, cross-process 98+2 | PASS | Two trials passed `98+0` in one process followed by `2+0` in a new process. |
+| Direct-AB exec-parent `6x6`, reads=6, 192 iterations, 511x86 grid, child-process 98+2 | PASS | Parent process survived across both phases; phase1 and phase2 ran via fork/exec children. Plain parent, HIP-initialized parent, parent reset-before, and parent reset-between modes all passed. |
+| Direct-AB phase-mode confirmation `6x6`, reads=6, 192 iterations, 511x86 grid, same-process 100+0/100+1/101+0/101+1 | FAIL | Current calibration failed at phase1 sync 99 / global launch 99, while same-process 99+1 passed later. |
+| Direct-AB exec-parent confirmation `6x6`, reads=6, 192 iterations, 511x86 grid, child-process 99+1 | PASS | Parent plain and HIP-initialized modes both passed. |
 | Direct-AB no-output `6x6` active/block, reads=3, 448 iterations, 511x86 grid | PASS | Grid-width low side at fixed read/loop edge. |
 | Direct-AB no-output `6x6` active/block, reads=3, 448 iterations, 512x86 grid | MIXED | Fails on repeat, but the exact launch edge moves with reset/GPU state. |
 | Direct-AB no-output `6x6` active/block, reads=3, 448 iterations, 512x86 grid, 94-99 launches | PASS | Initial launch-count sweep low side. |
@@ -352,6 +355,21 @@ Latest artifact paths:
   phase2 launch 1 / global launch 99. Explicit same-stream mode was mixed:
   one preserved pass and three preserved failures, so stream mode changes the
   state sensitivity but is not a reliable fix or root-cause discriminator.
+- `/tmp/hipfire-lds-direct-ab-exec-artifacts/`: exec-parent wrapper controls
+  for phase-mode `98 + 2`. The parent process stays alive across both phases
+  and runs phase1/phase2 through fork/exec child processes. Plain parent,
+  HIP-initialized parent, HIP-initialized parent with `hipDeviceReset()` before
+  children, and HIP-initialized parent with `hipDeviceReset()` between children
+  all pass. This means parent process lifetime, even with an initialized HIP
+  context, is not enough to retain the bad state; the HIP-launching process
+  exiting between phases is the meaningful boundary.
+- `/tmp/hipfire-lds-direct-ab-exec-confirm-artifacts/`: current-edge
+  confirmation around the exec-parent result. Same-process phase-mode `100+0`,
+  `100+1`, `101+0`, and `101+1` all fail at phase1 sync 99 / global launch 99
+  with the same gfxhub/GDS signature captured for `100+1` and `101+0`.
+  Same-process `99+1` passed later, reinforcing that the exact boundary is
+  state-sensitive. Exec-parent `99+1` passed in both plain-parent and
+  HIP-initialized-parent modes.
 
 ## Current Narrowing
 
@@ -603,15 +621,27 @@ Reduction results after extending the standalone HIP GEMM probe:
 - Phase-mode controls sharpen the process-boundary result. With the same
   direct-AB kernel body at reads=6/192/511x86, same-process `99 + 1` fails on
   phase2 launch 0 / global launch 99, and same-process `98 + 2` fails on
-  phase2 launch 1 / global launch 99. Repeating default/null-stream `98 + 2`
-  preserved the failure 2/2. `hipDeviceReset()` between `98 + 2` phases returns
-  success but still fails on the same phase2/global launch, so HIP context
-  reset from inside the process is not sufficient. Destroying and recreating a
-  stream between phases is also insufficient. Cross-process `98+0` followed by
-  `2+0` passes 2/2, so process exit still clears enough state to avoid the
-  immediate edge. Explicit same-stream `98 + 2` is mixed: one preserved pass
-  and three preserved failures. Treat stream choice as a state-sensitivity
-  modifier, not a reliable explanation.
+  phase2 launch 1 / global launch 99 in the preserved failing repeats.
+  `hipDeviceReset()` between `98 + 2` phases returns success but still fails on
+  the same phase2/global launch, so HIP context reset from inside the process
+  is not sufficient. Destroying and recreating a stream between phases is also
+  insufficient. Cross-process `98+0` followed by `2+0` passes 2/2, so process
+  exit still clears enough state to avoid the immediate edge. Explicit
+  same-stream `98 + 2` is mixed: one preserved pass and three preserved
+  failures. Later confirmation runs show the exact edge is still
+  state-sensitive: same-process `98 + 2` and `99 + 1` both passed in one later
+  run, while `100+0`, `100+1`, `101+0`, and `101+1` failed at global launch 99.
+  Treat stream choice and exact phase split as state-sensitivity modifiers, not
+  reliable explanations.
+- Exec-parent controls separate parent lifetime from HIP-launching process
+  lifetime. A parent wrapper that stays alive across both phases but runs each
+  phase through a fork/exec child passes for `98 + 2` in all tested modes:
+  plain parent, HIP-initialized parent, parent `hipDeviceReset()` before
+  children, and parent `hipDeviceReset()` between children. The same wrapper
+  also passes `99 + 1` in plain and HIP-initialized parent modes. This means an
+  unrelated surviving parent process, even one with HIP initialized, does not
+  retain the bad state. The meaningful cleanup boundary is exit of the process
+  that actually launched the edge workload.
 
 The synthetic failure coredump again reports:
 
@@ -662,6 +692,10 @@ regGDS_PROTECTION_FAULT                             0x3f000007
 regGDS_VM_PROTECTION_FAULT                          0x0fc00113
 ```
 
+The exec-parent confirmation failures for same-process `100+1` and `101+0`
+again captured the same signature. The exec-parent pass cases did not create a
+coredump.
+
 Code object/resource observations from `llvm-readobj` dumps:
 
 | Variant | Workgroup | LDS group segment | VGPR | SGPR | Spills | Wavefront |
@@ -706,6 +740,7 @@ LDS-only control:
 | direct-AB no-output `6x6` block, reads=6, 192 iters, 511x86 | PASS at 98 launches, MIXED at 99 launches, FAIL at 100 launches | `_Z19lds_direct_ab_probev` | 288 B | 52 | 2 | 0 | 32 |
 | direct-AB no-output `6x6` block, reads=6, 192 iters, 511x86, split-process | PASS for 98+1 split, FAIL for one-process 99 | `_Z19lds_direct_ab_probev` | 288 B | 52 | 2 | 0 | 32 |
 | direct-AB phase-mode `6x6` block, reads=6, 192 iters, 511x86 | PASS for cross-process 98+2, FAIL for same-process 98+2 / device-reset 98+2 / stream-recreate 98+2 | `_Z25lds_direct_ab_phase_probev` | 288 B | 52 | 2 | 0 | 32 |
+| direct-AB exec-parent `6x6` block, reads=6, 192 iters, 511x86 | PASS for child-process 98+2 and 99+1 even with HIP-initialized parent | `_Z25lds_direct_ab_phase_probev` | 288 B | 52 | 2 | 0 | 32 |
 | direct-AB no-output `6x6` block, reads=3, 448 iters, 512x86 | PASS at 99 launches, FAIL on 100+ launch repeats | `_Z19lds_direct_ab_probev` | 288 B | 34 | 2 | 0 | 32 |
 | direct-AB no-output `8x4` active in `8x5` block, reads=6 | PASS at 512 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 256 B | 22 | 5 | 0 | 32 |
 
@@ -802,10 +837,14 @@ Best current hypothesis:
 > implicates same-process lifetime in the immediate trigger. Phase-mode controls
 > refine that further: `hipDeviceReset()` and stream destroy/recreate inside the
 > same process do not clear the edge for `98 + 2`, while process exit between
-> `98` and `2` does. The remaining suspect layer is therefore more like
-> process-scoped HIP/HSA/KFD state, code-object/queue bookkeeping, or GPU state
-> keyed by the process, not merely a user-visible stream lifetime. Exec-mask
-> structure alone does not appear to be the deciding factor.
+> `98` and `2` does. Exec-parent controls show that a surviving parent process,
+> even one with HIP initialized, does not retain the bad state when the
+> HIP-launching children exit between phases. The remaining suspect layer is
+> therefore more like state owned by the HIP/HSA/KFD process that launched the
+> kernels: code-object/queue bookkeeping, process-scoped GPUVM or queue state,
+> or GPU state keyed by that process, not merely a user-visible stream lifetime
+> or parent process lifetime. Exec-mask structure alone does not appear to be
+> the deciding factor.
 
 ## Next Evidence To Capture
 
@@ -835,12 +874,11 @@ control):
 - use the minimal no-output repro for the next reduction: repeat the 256-pass /
   320-fail correlate in fresh processes and try smaller active-lane shapes
   around the one-wave/two-wave boundary.
-- use the direct-AB phase-mode repro for the next reduction: add an optional
-  child-process/fork mode or a parent wrapper that runs phase2 through
-  `execve()` after phase1. Compare that with `hipDeviceReset()` to separate
-  process exit, address-space teardown, and parent process lifetime. Also test
-  a lower grid/launch edge to see whether the process-boundary finding holds
-  away from the state-sensitive 511x86 boundary.
+- use the direct-AB phase-mode repro for the next reduction: test a lower
+  grid/launch edge to see whether the process-boundary finding holds away from
+  the state-sensitive 511x86 boundary. Also look for a HIP/HSA teardown lever
+  stronger than `hipDeviceReset()` but weaker than process exit, if one exists
+  in the local ROCm stack.
 - create a single-instantiation compile unit for the failing synthetic symbol
   and the passing long-loop symbol so instruction counts can be per-symbol
   instead of object-aggregate.
