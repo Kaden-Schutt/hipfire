@@ -3,8 +3,9 @@
 
 //! Decode an image → SigLIP patch tensor for `vision_forward`.
 //!
-//! Gemma3's image processor: resize to `image_size × image_size` (bicubic;
-//! CatmullRom here), rescale `1/255`, normalize with mean/std `0.5` → `[-1, 1]`.
+//! Gemma3's image processor: resize to `image_size × image_size` (bilinear
+//! convolution via `fast_image_resize`, matching HF `resample: 2`), rescale
+//! `1/255`, normalize with mean/std `0.5` → `[-1, 1]`.
 //! Then im2col into `[num_patches, 3·patch²]` where each patch's `3·patch²`
 //! values are ordered **channel-major** `[c][kh][kw]` and patches run row-major
 //! over the `grid×grid` layout — matching the flattened Conv2d `patch_embedding`
@@ -17,14 +18,29 @@ use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer
 
 use crate::config::SigLipConfig;
 
-/// Load + preprocess an image into the SigLIP patch tensor
+/// Load + preprocess an image **file** into the SigLIP patch tensor
 /// `[num_patches · 3·patch²]` (row-major patches, channel-major within a patch).
 pub fn preprocess_image(path: &Path, cfg: &SigLipConfig) -> Result<Vec<f32>, String> {
-    // Decode with the `image` crate (fast_image_resize does not decode), to raw
-    // interleaved sRGB RGB u8.
-    let decoded = image::open(path)
-        .map_err(|e| format!("gemma3-vl: open image {path:?}: {e}"))?
-        .to_rgb8();
+    let decoded = image::open(path).map_err(|e| format!("gemma3-vl: open image {path:?}: {e}"))?;
+    preprocess_decoded(decoded, cfg)
+}
+
+/// Same as [`preprocess_image`] but from raw encoded image **bytes** (PNG/JPEG),
+/// the form the daemon hands a multimodal request (`GenerateCtx::image_bytes`).
+pub fn preprocess_image_bytes(bytes: &[u8], cfg: &SigLipConfig) -> Result<Vec<f32>, String> {
+    let decoded = image::load_from_memory(bytes)
+        .map_err(|e| format!("gemma3-vl: decode image bytes: {e}"))?;
+    preprocess_decoded(decoded, cfg)
+}
+
+/// Shared core: a decoded image → the SigLIP patch tensor. `fast_image_resize`
+/// does not decode, so callers decode with the `image` crate first.
+fn preprocess_decoded(
+    decoded: image::DynamicImage,
+    cfg: &SigLipConfig,
+) -> Result<Vec<f32>, String> {
+    // Raw interleaved sRGB RGB u8.
+    let decoded = decoded.to_rgb8();
     let (src_w, src_h) = decoded.dimensions();
     let size = cfg.image_size as u32;
 

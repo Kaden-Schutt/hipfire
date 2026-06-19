@@ -13,6 +13,7 @@
 //! bidirectional attention, gelu-tanh MLP, **learned** position embeddings (no
 //! RoPE) — so its forward reuses the qwen35-vl vision kernels.
 
+pub mod arch;
 pub mod config;
 pub mod forward;
 pub mod image;
@@ -20,9 +21,10 @@ pub mod loader;
 pub mod projector;
 pub mod vision;
 
+pub use arch::Gemma3VlBackend;
 pub use config::{vl_config_from_hfq, Gemma3VlConfig, SigLipConfig};
 pub use forward::vision_forward;
-pub use image::preprocess_image;
+pub use image::{preprocess_image, preprocess_image_bytes};
 pub use loader::{load_vl, Gemma3VlWeights, LoadedVl};
 pub use projector::{project, ProjectorWeights};
 pub use vision::{SigLipLayerWeights, SigLipWeights};

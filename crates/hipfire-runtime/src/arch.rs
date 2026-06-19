@@ -443,9 +443,34 @@ pub fn run_simple_ar(
         return Err("run_simple_ar: empty prompt after tokenize".to_string());
     }
     backend.prefill(gpu, &ids)?;
+    decode_loop(gpu, backend, tok, eos, ctx, ids.len(), ids.len())
+}
+
+/// Shared post-prefill greedy decode loop: from the just-prefilled
+/// `backend.logits()`, argmax → stream a JSONL `token` event → `decode_step`,
+/// until EOS / `max_tokens` / a `stop_sequences` match, then a final `done`.
+///
+/// Split out of [`run_simple_ar`] so backends whose **prefill** differs from the
+/// plain token-stream path — e.g. the gemma3-vl image-embedding splice, which
+/// feeds projected vision rows via `forward_step_with_embed` — can run their own
+/// prefill and still share this one streaming/stop loop. `start_pos` is the
+/// absolute KV position after prefill; `prompt_tokens` is reported back in the
+/// [`ServeOutcome`] (the two differ when image rows expand the prompt).
+///
+/// Greedy for now (matches the bring-up examples); top-p / repeat-penalty /
+/// loop-guard thread in as the daemon's sampler is migrated behind this driver.
+pub fn decode_loop(
+    gpu: &mut Gpu,
+    backend: &mut dyn SimpleAr,
+    tok: &crate::tokenizer::Tokenizer,
+    eos: u32,
+    ctx: &mut GenerateCtx,
+    start_pos: usize,
+    prompt_tokens: usize,
+) -> Result<ServeOutcome, String> {
     let vocab = backend.vocab_size();
 
-    let mut pos = ids.len();
+    let mut pos = start_pos;
     let mut next = gpu
         .argmax_f32(backend.logits(), vocab)
         .map_err(|e| format!("argmax: {e:?}"))?;
@@ -485,7 +510,7 @@ pub fn run_simple_ar(
     let _ = ctx.sink.flush();
 
     Ok(ServeOutcome {
-        prompt_tokens: ids.len(),
+        prompt_tokens,
         tokens_generated: generated,
         stop_reason: stop,
     })
