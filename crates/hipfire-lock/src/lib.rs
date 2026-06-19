@@ -191,6 +191,17 @@ pub fn probe(path: impl AsRef<Path>) -> io::Result<LockState> {
     }
 }
 
+/// Canonical GPU-mutex lockfile path — the single source of truth for the
+/// path/env-var contract shared by `hipfire gpu-lock`, `scripts/gpu-lock.sh`,
+/// and any future participant (Python, etc.). Resolves `$HIPFIRE_GPU_LOCKFILE`,
+/// else `<tmpdir>/hipfire-gpu.lock`. Because `flock` keys on the inode, every
+/// participant that opens *this* path shares one mutex regardless of language.
+pub fn gpu_lock_path() -> PathBuf {
+    std::env::var_os("HIPFIRE_GPU_LOCKFILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("hipfire-gpu.lock"))
+}
+
 fn read_holder_line(path: &Path) -> Option<String> {
     let mut s = String::new();
     File::open(path).ok()?.read_to_string(&mut s).ok()?;

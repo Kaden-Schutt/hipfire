@@ -1315,6 +1315,7 @@ dependencies = [
  "hipfire-config",
  "hipfire-daemon-adapter",
  "hipfire-generate",
+ "hipfire-lock",
  "hipfire-model",
  "hipfire-server",
  "indicatif",

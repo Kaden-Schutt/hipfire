@@ -23,8 +23,7 @@
 //! NB: the lockfile is never unlinked — unlinking a flock'd file lets the next
 //! acquirer lock a different inode and yields two simultaneous holders.
 
-use std::io::{Seek, SeekFrom, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -88,9 +87,9 @@ fn default_timeout() -> u64 {
 }
 
 fn lockfile_path() -> PathBuf {
-    std::env::var_os("HIPFIRE_GPU_LOCKFILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("hipfire-gpu.lock"))
+    // The canonical path/env-var contract lives in `hipfire-lock` so the daemon,
+    // gpu-lock.sh, and any future participant agree on one file + env var.
+    hipfire_lock::gpu_lock_path()
 }
 
 fn pid_alive(pid: i32) -> bool {
@@ -132,42 +131,34 @@ fn acquire(
     let watch_pid = watch_pid.unwrap_or_else(|| unsafe { libc::getppid() });
     let path = lockfile_path();
 
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)?;
-    let fd = file.as_raw_fd();
-
-    // Block (poll) until we hold LOCK_EX, surfacing the current holder + a hard cap.
+    // Block (poll) until we hold LOCK_EX, surfacing the holder + a hard cap, via
+    // the shared `hipfire-lock` flock primitive.
+    let mut guard = hipfire_lock::FlockGuard::open(&path)?;
+    let timeout = (timeout_secs > 0).then(|| std::time::Duration::from_secs(timeout_secs));
     let mut waited = 0u64;
-    loop {
-        let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-        if rc == 0 {
-            break;
-        }
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
-            anyhow::bail!("flock {}: {err}", path.display());
-        }
-        if timeout_secs > 0 && waited >= timeout_secs {
-            // Exit code 2 on timeout — the historical gpu-lock.sh contract that
-            // gates/waiters distinguish from other failures.
-            eprintln!(
-                "[gpu-lock] TIMEOUT after {waited}s; holder still alive: {}",
-                read_holder(&path).unwrap_or_else(|| "unknown".into())
-            );
-            std::process::exit(2);
-        }
-        let holder = read_holder(&path).unwrap_or_else(|| "unknown".into());
-        eprintln!("[gpu-lock] busy: {holder} — waited {waited}s, still waiting…");
-        std::thread::sleep(std::time::Duration::from_secs(poll_secs));
-        waited += poll_secs;
+    let acquired = guard.lock_blocking(
+        std::time::Duration::from_secs(poll_secs),
+        timeout,
+        |holder| {
+            waited += poll_secs;
+            let who = if holder.is_empty() { "unknown" } else { holder };
+            eprintln!("[gpu-lock] busy: {who} — waited {waited}s, still waiting…");
+        },
+    )?;
+    if !acquired {
+        // Exit code 2 on timeout — the historical gpu-lock.sh contract that
+        // gates/waiters distinguish from other failures.
+        eprintln!(
+            "[gpu-lock] TIMEOUT after {timeout_secs}s; holder still alive: {}",
+            guard.holder().unwrap_or_else(|| "unknown".into())
+        );
+        std::process::exit(2);
     }
 
     // We hold it. Clear CLOEXEC so the holder inherits this fd across exec, then
-    // spawn the detached holder; its inherited copy keeps the lock after we exit.
+    // spawn the detached holder; its inherited copy keeps the lock after we exit
+    // (and our `guard` drops, closing our copy).
+    let fd = guard.raw_fd();
     clear_cloexec(fd)?;
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
@@ -197,16 +188,18 @@ fn acquire(
     }
     let holder = cmd.spawn()?;
 
-    // Record metadata (truncate + write; does not disturb the held flock).
+    // Record metadata (truncate + write under the held flock — `flock` is on the
+    // open fd, so rewriting the contents doesn't drop it).
     let meta = format!(
-        "{label} pid={watch_pid} host={} acquired_epoch={} holder={}\n",
+        "{label} pid={watch_pid} host={} acquired_epoch={} holder={}",
         hostname(),
         now_iso(),
         holder.id()
     );
-    write_meta(fd, &meta)?;
+    guard.write_holder(&meta)?;
     eprintln!("[gpu-lock] acquired by {label}");
-    // Returning closes our fd copy; the holder's inherited copy keeps the lock.
+    // Returning drops `guard` (closes our fd copy); the holder's inherited copy
+    // keeps the lock.
     Ok(())
 }
 
@@ -236,29 +229,21 @@ fn hold(lock_fd: i32, watch_pid: i32, poll_secs: u64) -> anyhow::Result<()> {
     }
 }
 
-/// Non-blocking probe on a scratch fd: if we can take the lock, nobody holds it.
+/// Non-blocking probe via the shared primitive: free if we can take the lock.
 fn status_line() -> String {
-    let path = lockfile_path();
-    if !path.exists() {
-        return "gpu is free".to_string();
-    }
-    let Ok(file) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-    else {
-        return "gpu is free".to_string();
-    };
-    let fd = file.as_raw_fd();
-    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        unsafe { libc::flock(fd, libc::LOCK_UN) };
-        "gpu is free".to_string()
-    } else {
-        format!(
-            "gpu BUSY: {}",
-            read_holder(&path).unwrap_or_else(|| "unknown".into())
-        )
+    match hipfire_lock::probe(lockfile_path()) {
+        Ok(hipfire_lock::LockState::Free) => "gpu is free".to_string(),
+        Ok(hipfire_lock::LockState::Busy(holder)) => {
+            let who = if holder.is_empty() {
+                "unknown"
+            } else {
+                &holder
+            };
+            format!("gpu BUSY: {who}")
+        }
+        // Probe I/O error → report free (best-effort, matches the prior
+        // open-failure fallback).
+        Err(_) => "gpu is free".to_string(),
     }
 }
 
@@ -277,17 +262,6 @@ fn read_holder_pid(path: &std::path::Path) -> Option<i32> {
     line.split_whitespace()
         .find_map(|tok| tok.strip_prefix("holder="))
         .and_then(|v| v.parse().ok())
-}
-
-/// Truncate + write the metadata line via the held fd (preserves the flock).
-fn write_meta(fd: i32, meta: &str) -> anyhow::Result<()> {
-    // Borrow the fd without taking ownership (must not close it here).
-    let mut f = unsafe { std::fs::File::from_raw_fd(libc::dup(fd)) };
-    f.seek(SeekFrom::Start(0))?;
-    f.set_len(0)?;
-    f.write_all(meta.as_bytes())?;
-    f.flush()?;
-    Ok(())
 }
 
 fn clear_cloexec(fd: i32) -> anyhow::Result<()> {

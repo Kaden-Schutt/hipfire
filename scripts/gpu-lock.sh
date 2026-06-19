@@ -48,7 +48,7 @@ gpu_acquire() {
     # announce it loudly (with the current holder + how to clear a stale lock)
     # BEFORE we block waiting — silent blocking made contention/stale-lock stalls
     # hard to diagnose.
-    local lockfile="${HIPFIRE_GPU_LOCK_FILE:-/tmp/hipfire-gpu.lock}"
+    local lockfile="${HIPFIRE_GPU_LOCKFILE:-/tmp/hipfire-gpu.lock}"
     local waited_from=""
     if [ -s "$lockfile" ]; then
         local holder; holder="$(cat "$lockfile" 2>/dev/null)"
