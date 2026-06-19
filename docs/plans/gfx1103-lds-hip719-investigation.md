@@ -585,20 +585,21 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
     remains `144`, `sgpr_count=5`, `vgpr_count=10`, and no spills. This shows
     the added barrier epoch does not need to follow an LDS producer phase.
   - The one-time pre-loop barrier control
-    `tile6_lds_preloop_barrier_noextra_load4_consume4_pinned` passed a
-    one-launch smoke. It keeps the two stores and four waited/interleaved row
-    loads, but moves the extra barrier outside the K loop so the repeated
+    `tile6_lds_preloop_barrier_noextra_load4_consume4_pinned` passed 100
+    launches. It keeps the two stores and four waited/interleaved row loads,
+    but moves the extra barrier outside the K loop so the repeated
     per-iteration sync epoch is removed. Metadata is `144`, `sgpr_count=6`,
-    `vgpr_count=10`, and no spills. This control is meant to test whether the
-    prestore failure requires repeated per-K execution rather than just the
-    presence of one extra barrier in the kernel.
+    `vgpr_count=10`, and no spills. This shows the prestore barrier failure
+    requires more than the presence of one extra barrier somewhere in the
+    kernel.
   - The first-iteration-only barrier control
-    `tile6_lds_firstiter_barrier_noextra_load4_consume4_pinned` passed a
-    one-launch smoke. It keeps the extra barrier inside the K loop but guards
-    it with `kt == 0`, leaving later K iterations at the normal two-store,
-    four-load, one-closing-barrier shape. Metadata is `144`, `sgpr_count=5`,
-    `vgpr_count=11`, and no spills. A 100-launch run on another 780M should
-    distinguish one-time in-loop sync from repeated per-K sync.
+    `tile6_lds_firstiter_barrier_noextra_load4_consume4_pinned` passed 100
+    launches. It keeps the extra barrier inside the K loop but guards it with
+    `kt == 0`, leaving later K iterations at the normal two-store, four-load,
+    one-closing-barrier shape. Metadata is `144`, `sgpr_count=5`,
+    `vgpr_count=11`, and no spills. This distinguishes one-time in-loop sync
+    from repeated per-K sync: the failing prestore barrier shape needs the
+    extra sync epoch to recur across K iterations.
   - The single-store prestore extra-barrier control
     `tile6_lds_single_store_prestore_barrier_noextra_load4_consume4_pinned`
     passed 100 launches with `144`, `sgpr_count=5`, `vgpr_count=10`, and no
@@ -696,10 +697,10 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   The leading local suspect is now the conjunction of a second per-K LDS store,
   four dynamic row LDS loads separated by explicit waits with interleaved
   consumes, and either additional same-loop LDS activity or an additional
-  same-loop synchronization epoch anywhere in the K iteration, with repeated
+  same-loop synchronization epoch repeated across K iterations, with repeated
   launch/process state acting as the stress amplifier. Removing the second
-  store or reducing the row-load width from four to three keeps both the
-  post-row and early-barrier no-extra shapes pass-side.
+  store, reducing the row-load width from four to three, or making the extra
+  barrier one-time-only keeps these no-extra barrier shapes pass-side.
   Same-row and same-tile membership are no longer required by the current
   evidence, and neither extra-load-before-second-store nor extra-load-after-row
   ordering prevents the failure, though the separate-tile and preloop controls
@@ -1118,6 +1119,18 @@ Latest artifact paths:
   checkout, both variants passed one-launch compile/run smokes at
   `/tmp/hipfire-lds-promote-preloop-barrier-n1/` and
   `/tmp/hipfire-lds-promote-firstiter-barrier-n1/`.
+- `/tmp/hipfire-lds-barrier-once-stress/`: promoted one-time barrier stress
+  controls. `tile6_lds_preloop_barrier_noextra_load4_consume4_pinned` passed
+  100 launches at
+  `/tmp/hipfire-lds-barrier-once-stress/preloop-barrier-load4-n100/`; metadata
+  is `group_segment_fixed_size=144`, `sgpr_count=6`, `vgpr_count=10`,
+  `wavefront_size=32`, and no private segment.
+  `tile6_lds_firstiter_barrier_noextra_load4_consume4_pinned` passed 100
+  launches at
+  `/tmp/hipfire-lds-barrier-once-stress/firstiter-barrier-load4-n100/`;
+  metadata is `group_segment_fixed_size=144`, `sgpr_count=5`, `vgpr_count=11`,
+  `wavefront_size=32`, and no private segment. Live dmesg still ended at the
+  earlier reset 528 after both passing runs.
 - `/tmp/hipfire-lds-crossrow-runs/`: cross-row extra-load controls. The first
   two-launch run failed adjacent to prior reset pressure, but a recovery
   `tile6_lds_second_store_only_read6` control passed, then clean
@@ -1417,6 +1430,10 @@ Evidence argues against these as sole causes:
   to the synthetic GEMM-shaped kernel did not help, and removing exec-mask
   regions from the LDS-only control did not move the 288x86 pass / 304x86 fail
   threshold.
+- One extra barrier anywhere in the kernel as the root cause: a pre-loop extra
+  barrier passes, and a first-iteration-only extra barrier inside the K loop
+  also passes 100 launches. The fail-side barrier controls require the extra
+  sync epoch to repeat across K iterations.
 
 The `tile6` dmesg delta shows a driver-side device wedge, not a simple HIP
 runtime recoverable error. The latest v2 failing run again reset through the
