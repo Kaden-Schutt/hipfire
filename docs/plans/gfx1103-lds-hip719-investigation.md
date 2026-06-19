@@ -243,6 +243,9 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 | Direct-AB exec-parent `6x6`, reads=3, 448 iterations, 512x86 grid, child-process 96+5 | PASS | Plain, HIP-initialized, and HIP-initialized reset-between parent modes passed; repeat plain and hipinit trials also passed. |
 | Direct-AB coredump repeat `6x6`, reads=3, 448 iterations, 512x86 grid, same-process 96+5 / 100+1 | PASS | After clearing generic devcoredump state, both repeat controls passed; another example of edge movement after reset/coredump pressure. |
 | Direct-AB coredump repeat `6x6`, reads=3, 448 iterations, 512x86 grid, same-process 110+0 | FAIL | After clearing stale devcoredump state, failed at phase1 sync 99 / global launch 99. A fresh generic `devcd28` node appeared late and captured the same gfxhub/GDS signature. |
+| Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 512x86 grid, one child `101` | FAIL | Parent ran one fork/exec child with 101 launches; child failed at sync/global launch 100 and late `devcd29` captured the same gfxhub/GDS signature. |
+| Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 512x86 grid, chunks `96,5` | PASS | Same total launches as one-child `101`, but phase work split across two child processes. Passed for plain and HIP-initialized parent modes. |
+| Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 512x86 grid, chunks `50,30,21` | PASS | Same total launches as one-child `101`, split across three child processes. Passed for plain and HIP-initialized parent modes. |
 | Direct-AB no-output `8x4` active/block, reads=6, 512 iterations, 512x86 grid | PASS | Exact one-wave, two-array control. |
 | Direct-AB no-output `8x4` active inside `8x5` block, reads=6, 512 iterations, 512x86 grid | PASS | Two-wave block with 32 active lanes; still stable. |
 | Direct-AB no-output `5x5`/`4x4` active inside `6x6` block, reads=6, 512 iterations, 512x86 grid | PASS | Small active controls remain stable without cooperative producer loops. |
@@ -427,6 +430,14 @@ Latest artifact paths:
   has the same gfxhub/GDS signature as the earlier direct-AB failures. No new
   `dmesg` lines appeared after 12:13 UTC, so this artifact is evidence from
   the sysfs coredump node rather than a fresh dmesg delta.
+- `/tmp/hipfire-lds-direct-ab-multi-exec-artifacts/`: multi-child exec-parent
+  controls for reads=3/448/512x86. The scratch harness runs a persistent
+  parent process and a comma-separated list of fork/exec children, each child
+  invoking the phase probe for its own local launch count. A one-child `101`
+  run failed at child sync/global launch 100 and captured a late generic
+  `devcd29` coredump 2 seconds after failure. The same total launch count
+  passed when split into `96,5` or `50,30,21` child processes. Both split
+  shapes also passed with a HIP-initialized parent.
 
 ## Current Narrowing
 
@@ -727,6 +738,16 @@ Reduction results after extending the standalone HIP GEMM probe:
   `regGDS_* 0x3f000007/0x0fc00113` state. This gives a post-clear coredump
   match, but the missing fresh dmesg lines mean the sysfs coredump, not dmesg,
   is the authoritative evidence for this particular repeat.
+- Multi-child exec-parent controls separate total submitted work from
+  child-local launch-sequence length. At reads=3/448/512x86, a persistent
+  plain parent running one child with `101` launches fails inside that child at
+  sync/global launch 100 and produces the same gfxhub/GDS coredump. The same
+  parent running the same total launch count split as `96,5` passes, and a
+  three-child split `50,30,21` also passes. The `96,5` and `50,30,21` splits
+  also pass when the parent has initialized HIP. This tightens the process
+  boundary result: the cleanup that matters is exit of the process issuing the
+  long launch sequence, not merely the existence of a surviving parent process
+  or total launches across a parent-supervised job.
 - Additional in-process teardown checks did not find a clean middle ground
   between `hipDeviceReset()` and process exit. `hipDevicePrimaryCtxReset(0)`
   and `hipDevicePrimaryCtxRelease(0)` both return success but still fail on the
@@ -810,6 +831,17 @@ reads=3/448/512x86 edge produced another matching coredump on a longer
 same-process `110+0` run that failed at phase1 sync 99 / global launch 99.
 The fresh node appeared as `/sys/class/devcoredump/devcd28` shortly after the
 immediate capture window, and the copied 64 KiB text payload reported:
+
+```text
+[gfxhub] Page fault observed
+Faulty page starting at address: 0x000074669d000000
+Protection fault status register: 0x841051
+regGDS_PROTECTION_FAULT                             0x3f000007
+regGDS_VM_PROTECTION_FAULT                          0x0fc00113
+```
+
+The multi-child exec-parent one-child `101` failure also produced a late
+generic devcoredump (`devcd29`) with the same fields:
 
 ```text
 [gfxhub] Page fault observed
@@ -984,6 +1016,9 @@ Best current hypothesis:
 > not parent process lifetime by itself. A post-clear generic devcoredump
 > capture on same-process `110+0` again matches the gfxhub/GDS signature, but
 > the edge still moves enough that post-clear `96+5` and `100+1` can pass.
+> Multi-child exec-parent controls tighten that further: one child running
+> `101` launches fails, while `96,5` and `50,30,21` child splits with the same
+> total launch count pass even when the parent process has initialized HIP.
 > Exec-mask structure alone does not appear to be the deciding factor.
 
 ## Next Evidence To Capture
@@ -999,10 +1034,9 @@ control):
 - ISA dump via `llvm-objdump`.
 - rocprof/rocprof-compute output for passing variants and any failing variants
   that complete far enough to profile.
-- root-only follow-up: repeat coredump capture with a wrapper that waits for
-  late generic `/sys/class/devcoredump/devcd*` nodes and records `dmesg
-  --since` around the launch, because the first post-clear capture produced a
-  fresh generic node but no new dmesg lines after 12:13 UTC.
+- root-only follow-up: keep using the late generic `/sys/class/devcoredump`
+  wait wrapper for new failing probes; it successfully captured `devcd29` two
+  seconds after the one-child multi-exec failure.
 - improve the throwaway matrix runner so it always preserves the exact
   runtime-generated `.hsaco`; the active4 control passed but did not leave a
   `.hsaco` under the expected cache name in the latest run.
@@ -1017,10 +1051,11 @@ control):
   320-fail correlate in fresh processes and try smaller active-lane shapes
   around the one-wave/two-wave boundary.
 - use the direct-AB phase-mode repro for the next reduction: try a slightly
-  lower grid and split one phase into more than two child processes to separate
-  process exit from child-local launch sequence length. Treat the common
-  in-process HIP reset APIs as already tested; only revisit teardown if a
-  genuinely different ROCm mechanism is identified.
+  lower grid with the same multi-child matrix (`one child over edge` vs
+  `split children under edge`) to see whether the child-local launch sequence
+  finding holds away from 512x86. Treat the common in-process HIP reset APIs
+  as already tested; only revisit teardown if a genuinely different ROCm
+  mechanism is identified.
 - create a single-instantiation compile unit for the failing synthetic symbol
   and the passing long-loop symbol so instruction counts can be per-symbol
   instead of object-aggregate.
