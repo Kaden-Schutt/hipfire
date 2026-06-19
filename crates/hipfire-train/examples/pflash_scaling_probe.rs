@@ -317,13 +317,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     r.needle_rank_oracle, r.needle_rank_recency, r.needle_rank_metric, r.needle_rank_mid, n = r.n_ctx
                 );
                 println!(
-                    "  partial(K,oracle|recency) — shallow:{:+.3}  mid:{:+.3}   sp(recency,oracle)={:+.3}",
-                    r.partial, r.partial_mid, r.sp_recency
+                    "  corr(K,oracle) — shallow:{:+.3}  partial(shallow|recency):{:+.3}  mid partial:{:+.3}  sp(recency,oracle)={:+.3}",
+                    r.sp_metric, r.partial, r.partial_mid, r.sp_recency
                 );
                 // single machine-greppable summary line for the bash loop to collect
                 println!(
-                    "ROW\t{}\t{}\t{}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{:.4}",
-                    r.label, r.layers, r.mid_layer, r.partial, r.partial_mid,
+                    "ROW\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{:.4}",
+                    r.label, r.layers, r.mid_layer, r.sp_metric, r.partial, r.partial_mid,
                     r.needle_rank_oracle, r.needle_rank_recency, r.needle_rank_metric,
                     r.needle_rank_mid, r.retrieved_prob
                 );

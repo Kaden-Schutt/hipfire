@@ -5,10 +5,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 echo "== Rust check =="
-cargo check --workspace --examples
+RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-D warnings" cargo check --workspace --examples
 
 echo "== Eval harness check =="
-cargo check -p hipfire-eval
+RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-D warnings" cargo check -p hipfire-eval
 
 echo "== Rust no-GPU unit tests =="
 cargo test -p rdna-compute --lib
