@@ -9,8 +9,8 @@
 //! functions in `crate::forward` (hot-path static dispatch), called
 //! directly by the daemon's `arch_id == 11` generate branch.
 
-use crate::lfm2moe::{Lfm2MoeState, Lfm2MoeWeights};
 use crate::config::Lfm2MoeConfig;
+use crate::lfm2moe::{Lfm2MoeState, Lfm2MoeWeights};
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use rdna_compute::Gpu;

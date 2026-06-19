@@ -131,11 +131,17 @@ pub(crate) fn guard_qkv_hfq4g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
 /// and beneficial on RDNA3+ even without dp4a; dp4a is handled per-arm
 /// in fused_qkv.rs dispatch.
 pub(crate) fn guard_qkv_hfq6g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if ctx.flags.force_unfused { return false; }
-    if steps.len() != 4 { return false; }
-    let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
-    matches!(dt, DType::HFQ6G256 | DType::MQ6G256)
-        && gemv_steps_uniform(steps, dt, true)
+    if ctx.flags.force_unfused {
+        return false;
+    }
+    if steps.len() != 4 {
+        return false;
+    }
+    let dt = match window_gemv_dtype(steps) {
+        Some(d) => d,
+        None => return false,
+    };
+    matches!(dt, DType::HFQ6G256 | DType::MQ6G256) && gemv_steps_uniform(steps, dt, true)
 }
 
 // ── QKVZA 4-way guards (DeltaNet linear attention) ──
@@ -174,11 +180,17 @@ pub(crate) fn guard_qkvza_hfq4g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
 /// and beneficial on RDNA3+ even without dp4a; dp4a is handled per-arm
 /// in fused_qkv.rs dispatch.
 pub(crate) fn guard_qkvza_hfq6g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if ctx.flags.force_unfused { return false; }
-    if steps.len() != 5 { return false; }
-    let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
-    matches!(dt, DType::HFQ6G256 | DType::MQ6G256)
-        && gemv_steps_uniform(steps, dt, true)
+    if ctx.flags.force_unfused {
+        return false;
+    }
+    if steps.len() != 5 {
+        return false;
+    }
+    let dt = match window_gemv_dtype(steps) {
+        Some(d) => d,
+        None => return false,
+    };
+    matches!(dt, DType::HFQ6G256 | DType::MQ6G256) && gemv_steps_uniform(steps, dt, true)
 }
 
 // ── Gate+Up 2-way guards ──
@@ -212,9 +224,16 @@ pub(crate) fn guard_gate_up_hfq4g256(steps: &[Step], ctx: &DispatchCtx) -> bool 
 }
 
 pub(crate) fn guard_gate_up_hfq6g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if ctx.flags.force_unfused { return false; }
-    if steps.len() != 3 { return false; }
-    let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
+    if ctx.flags.force_unfused {
+        return false;
+    }
+    if steps.len() != 3 {
+        return false;
+    }
+    let dt = match window_gemv_dtype(steps) {
+        Some(d) => d,
+        None => return false,
+    };
     matches!(dt, DType::HFQ6G256 | DType::MQ6G256) && gemv_steps_uniform(steps, dt, true)
 }
 
@@ -232,18 +251,36 @@ pub(crate) fn guard_gate_up_hfq6g256(steps: &[Step], ctx: &DispatchCtx) -> bool 
 // compute + the (32,7) launch_bounds tuned for gfx1151 occupancy leave no launch
 // win to capture. Kept gfx1151-only; revisit only with a gfx1100 occupancy retune.
 pub(crate) fn guard_gate_up_mfp4g32e8(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if ctx.flags.force_unfused { return false; }
-    if !ctx.arch.is_gfx1151() { return false; }
-    if steps.len() != 3 { return false; }
-    let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
+    if ctx.flags.force_unfused {
+        return false;
+    }
+    if !ctx.arch.is_gfx1151() {
+        return false;
+    }
+    if steps.len() != 3 {
+        return false;
+    }
+    let dt = match window_gemv_dtype(steps) {
+        Some(d) => d,
+        None => return false,
+    };
     dt == DType::MFP4G32E8 && gemv_steps_uniform(steps, dt, true)
 }
 
 pub(crate) fn guard_qkvza_mfp4g32e8(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if ctx.flags.force_unfused { return false; }
-    if !ctx.arch.is_gfx1151() { return false; }
-    if steps.len() != 5 { return false; }
-    let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
+    if ctx.flags.force_unfused {
+        return false;
+    }
+    if !ctx.arch.is_gfx1151() {
+        return false;
+    }
+    if steps.len() != 5 {
+        return false;
+    }
+    let dt = match window_gemv_dtype(steps) {
+        Some(d) => d,
+        None => return false,
+    };
     dt == DType::MFP4G32E8 && gemv_steps_uniform(steps, dt, true)
 }
 
@@ -297,13 +334,17 @@ pub(crate) fn guard_gate_up_paro4g128t(_steps: &[Step], _ctx: &DispatchCtx) -> b
 /// Fused 4-way QKVZA with Q8_0 weights (DECODE path, n=1). Used by
 /// Qwen3.5/A3B .mq4p DeltaNet layers (qt=3). No dp4a required.
 pub(crate) fn guard_qkvza_q8_0(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if ctx.flags.force_unfused { return false; }
+    if ctx.flags.force_unfused {
+        return false;
+    }
     steps.len() == 5 && gemv_steps_uniform(steps, DType::Q8_0, true)
 }
 
 /// Fused 3-way QKV with Q8_0 weights (DECODE path, n=1). No dp4a required.
 pub(crate) fn guard_qkv_q8_0(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if ctx.flags.force_unfused { return false; }
+    if ctx.flags.force_unfused {
+        return false;
+    }
     steps.len() == 4 && gemv_steps_uniform(steps, DType::Q8_0, true)
 }
 
@@ -397,27 +438,87 @@ const FUSED_TABLE: &[FusedPattern] = &[
         guard: guard_qkv_hfq6g256,
     },
     // ── QKVZA 4-way (DeltaNet linear attention) ────────────────────────────
-    FusedPattern { ops: QKVZA4, key: KernelKey::FusedQkvzaMq4G256Lloyd,  guard: guard_qkvza_mq4g256lloyd  },
-    FusedPattern { ops: QKVZA4, key: KernelKey::FusedQkvzaMq3G256Lloyd,  guard: guard_qkvza_mq3g256lloyd  },
-    FusedPattern { ops: QKVZA4, key: KernelKey::FusedQkvzaHfq4G256,      guard: guard_qkvza_hfq4g256      },
-    FusedPattern { ops: QKVZA4, key: KernelKey::FusedQkvzaHfq6G256,      guard: guard_qkvza_hfq6g256      },
+    FusedPattern {
+        ops: QKVZA4,
+        key: KernelKey::FusedQkvzaMq4G256Lloyd,
+        guard: guard_qkvza_mq4g256lloyd,
+    },
+    FusedPattern {
+        ops: QKVZA4,
+        key: KernelKey::FusedQkvzaMq3G256Lloyd,
+        guard: guard_qkvza_mq3g256lloyd,
+    },
+    FusedPattern {
+        ops: QKVZA4,
+        key: KernelKey::FusedQkvzaHfq4G256,
+        guard: guard_qkvza_hfq4g256,
+    },
+    FusedPattern {
+        ops: QKVZA4,
+        key: KernelKey::FusedQkvzaHfq6G256,
+        guard: guard_qkvza_hfq6g256,
+    },
     // mfp4-E8 decode launch-fusion — gfx1151-ONLY (guard firewalls the arch).
-    FusedPattern { ops: QKVZA4, key: KernelKey::FusedQkvzaMfp4G32E8,     guard: guard_qkvza_mfp4g32e8     },
+    FusedPattern {
+        ops: QKVZA4,
+        key: KernelKey::FusedQkvzaMfp4G32E8,
+        guard: guard_qkvza_mfp4g32e8,
+    },
     // ── Gate+Up 2-way ───────────────────────────────────────────────────────
-    FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpMq4G256Lloyd, guard: guard_gate_up_mq4g256lloyd },
-    FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpMq3G256Lloyd, guard: guard_gate_up_mq3g256lloyd },
-    FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpHfq4G256,     guard: guard_gate_up_hfq4g256     },
-    FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpHfq6G256,     guard: guard_gate_up_hfq6g256     },
+    FusedPattern {
+        ops: GATE_UP2,
+        key: KernelKey::FusedGateUpMq4G256Lloyd,
+        guard: guard_gate_up_mq4g256lloyd,
+    },
+    FusedPattern {
+        ops: GATE_UP2,
+        key: KernelKey::FusedGateUpMq3G256Lloyd,
+        guard: guard_gate_up_mq3g256lloyd,
+    },
+    FusedPattern {
+        ops: GATE_UP2,
+        key: KernelKey::FusedGateUpHfq4G256,
+        guard: guard_gate_up_hfq4g256,
+    },
+    FusedPattern {
+        ops: GATE_UP2,
+        key: KernelKey::FusedGateUpHfq6G256,
+        guard: guard_gate_up_hfq6g256,
+    },
     // mfp4-E8 decode launch-fusion — gfx1151-ONLY (guard firewalls the arch).
-    FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpMfp4G32E8,    guard: guard_gate_up_mfp4g32e8    },
+    FusedPattern {
+        ops: GATE_UP2,
+        key: KernelKey::FusedGateUpMfp4G32E8,
+        guard: guard_gate_up_mfp4g32e8,
+    },
     // ── Q8_0 / Q4K fused entries (non-rotated, Always arch gate) ─────────
     // Q8_0 QKV/QKVZA: Qwen3.5-A3B .mq4p uses Q8_0 for all linear-attention
     // projections (qt=3). Scalar decode kernels added 2026-06-14.
-    FusedPattern { ops: QKVZA4, key: KernelKey::FusedQkvzaQ8_0,       guard: guard_qkvza_q8_0       },
-    FusedPattern { ops: QKV3,   key: KernelKey::FusedQkvQ8_0,          guard: guard_qkv_q8_0         },
-    FusedPattern { ops: QKV3,     key: KernelKey::FusedQkvQ4K,          guard: guard_qkv_q4k          },
-    FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpQ4K,       guard: guard_gate_up_q4k      },
-    FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpQ8_0,       guard: guard_gate_up_q8_0     },
+    FusedPattern {
+        ops: QKVZA4,
+        key: KernelKey::FusedQkvzaQ8_0,
+        guard: guard_qkvza_q8_0,
+    },
+    FusedPattern {
+        ops: QKV3,
+        key: KernelKey::FusedQkvQ8_0,
+        guard: guard_qkv_q8_0,
+    },
+    FusedPattern {
+        ops: QKV3,
+        key: KernelKey::FusedQkvQ4K,
+        guard: guard_qkv_q4k,
+    },
+    FusedPattern {
+        ops: GATE_UP2,
+        key: KernelKey::FusedGateUpQ4K,
+        guard: guard_gate_up_q4k,
+    },
+    FusedPattern {
+        ops: GATE_UP2,
+        key: KernelKey::FusedGateUpQ8_0,
+        guard: guard_gate_up_q8_0,
+    },
     // ── Paro fused Paro4G128T (dp4a, Raw input) ────────────────────────
     FusedPattern {
         ops: GATE_UP2,
@@ -737,20 +838,24 @@ fn launch_fused(
         | KernelKey::FusedQkvzaHfq6G256
         | KernelKey::FusedQkvzaMfp4G32E8
         | KernelKey::FusedQkvzaQ8_0 => {
-            let (wqkv, qkv)   = gemv_weight_out(&steps[1]);
-            let (wz, z)       = gemv_weight_out(&steps[2]);
-            let (wb, beta)    = gemv_weight_out(&steps[3]);
-            let (wa, alpha)   = gemv_weight_out(&steps[4]);
-            fused_qkv.run(ctx, gpu, &FusedQkvParams {
-                kind: key,
-                weights: &[wqkv.buf, wz.buf, wb.buf, wa.buf],
-                x: activated,
-                outputs: &[qkv, z, beta, alpha],
-                m: &[wqkv.m, wz.m, wb.m, wa.m],
-                k: wqkv.k,
-                rot_scratch: &[],
-                batch_size: None,
-            })
+            let (wqkv, qkv) = gemv_weight_out(&steps[1]);
+            let (wz, z) = gemv_weight_out(&steps[2]);
+            let (wb, beta) = gemv_weight_out(&steps[3]);
+            let (wa, alpha) = gemv_weight_out(&steps[4]);
+            fused_qkv.run(
+                ctx,
+                gpu,
+                &FusedQkvParams {
+                    kind: key,
+                    weights: &[wqkv.buf, wz.buf, wb.buf, wa.buf],
+                    x: activated,
+                    outputs: &[qkv, z, beta, alpha],
+                    m: &[wqkv.m, wz.m, wb.m, wa.m],
+                    k: wqkv.k,
+                    rot_scratch: &[],
+                    batch_size: None,
+                },
+            )
         }
 
         // ── Paro fused Paro4G128T ────────────────────────────────────────

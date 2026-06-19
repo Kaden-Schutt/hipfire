@@ -28,15 +28,17 @@
 //! crate shares one implementation. Marked individually below.
 
 use hip_bridge::{DeviceBuffer, HipResult};
-use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{f16_to_f32, f32_to_f16, gemv_family, weight_gemm, EmbeddingFormat, WeightTensor};
-use hipfire_runtime::model_source::ModelSource;
 use hipfire_dispatch::context::DispatchCtx;
-use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::pipeline::superop::{
     self, EscapeKind, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind, WeightSlot,
 };
+use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::{dtype_rotation_plan, DispatchError};
+use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::llama::{
+    f16_to_f32, f32_to_f16, gemv_family, weight_gemm, EmbeddingFormat, WeightTensor,
+};
+use hipfire_runtime::model_source::ModelSource;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Qwen2 model-shape constants parsed from `HfqFile::metadata_json`.
@@ -98,28 +100,35 @@ pub fn config_from_metadata_json(metadata_json: &str) -> Option<Qwen2Config> {
     let hidden_size = tc.get("hidden_size")?.as_u64()? as usize;
     let num_hidden_layers = tc.get("num_hidden_layers")?.as_u64()? as usize;
     let num_attention_heads = tc.get("num_attention_heads")?.as_u64()? as usize;
-    let num_key_value_heads = tc.get("num_key_value_heads")
+    let num_key_value_heads = tc
+        .get("num_key_value_heads")
         .and_then(|v| v.as_u64())
         .unwrap_or(num_attention_heads as u64) as usize;
-    let head_dim = tc.get("head_dim")
+    let head_dim = tc
+        .get("head_dim")
         .and_then(|v| v.as_u64())
         .map(|v| v as usize)
         .unwrap_or(hidden_size / num_attention_heads);
     let intermediate_size = tc.get("intermediate_size")?.as_u64()? as usize;
     let vocab_size = tc.get("vocab_size")?.as_u64()? as usize;
-    let max_position_embeddings = tc.get("max_position_embeddings")
+    let max_position_embeddings = tc
+        .get("max_position_embeddings")
         .and_then(|v| v.as_u64())
         .unwrap_or(32768) as usize;
-    let rope_theta = tc.get("rope_theta")
+    let rope_theta = tc
+        .get("rope_theta")
         .and_then(|v| v.as_f64())
         .unwrap_or(1_000_000.0) as f32;
-    let rms_norm_eps = tc.get("rms_norm_eps")
+    let rms_norm_eps = tc
+        .get("rms_norm_eps")
         .and_then(|v| v.as_f64())
         .unwrap_or(1e-6) as f32;
-    let attention_bias = tc.get("attention_bias")
+    let attention_bias = tc
+        .get("attention_bias")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    let tie_word_embeddings = tc.get("tie_word_embeddings")
+    let tie_word_embeddings = tc
+        .get("tie_word_embeddings")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     // Build the full EOS set first, then the scalar accessor is its
@@ -141,11 +150,12 @@ pub fn config_from_metadata_json(metadata_json: &str) -> Option<Qwen2Config> {
             _ => Vec::new(),
         }
     };
-    let mut eos_token_ids: Vec<u32> = tc.get("eos_token_id")
-        .map(parse_eos)
-        .unwrap_or_default();
+    let mut eos_token_ids: Vec<u32> = tc.get("eos_token_id").map(parse_eos).unwrap_or_default();
     if eos_token_ids.is_empty() {
-        if let Some(gc_eos) = meta.get("generation_config").and_then(|gc| gc.get("eos_token_id")) {
+        if let Some(gc_eos) = meta
+            .get("generation_config")
+            .and_then(|gc| gc.get("eos_token_id"))
+        {
             eos_token_ids = parse_eos(gc_eos);
         }
     }
@@ -190,18 +200,18 @@ impl Qwen2Config {
 /// Q/K/V projections carry a bias tensor (`attention_bias=true` in
 /// modeling default); `o_proj` and the FFN linears do not.
 pub struct Qwen2LayerWeights {
-    pub attn_norm: GpuTensor,         // input_layernorm.weight, F32 on GPU
-    pub wq: WeightTensor,             // q_proj.weight  [n_heads*head_dim, hidden]
-    pub wq_bias: GpuTensor,           // q_proj.bias    [n_heads*head_dim], F32
-    pub wk: WeightTensor,             // k_proj.weight  [n_kv_heads*head_dim, hidden]
-    pub wk_bias: GpuTensor,           // k_proj.bias    [n_kv_heads*head_dim], F32
-    pub wv: WeightTensor,             // v_proj.weight
-    pub wv_bias: GpuTensor,           // v_proj.bias
-    pub wo: WeightTensor,             // o_proj.weight  (no bias)
-    pub ffn_norm: GpuTensor,          // post_attention_layernorm.weight, F32
-    pub w_gate: WeightTensor,         // mlp.gate_proj.weight  (no bias)
-    pub w_up: WeightTensor,           // mlp.up_proj.weight
-    pub w_down: WeightTensor,         // mlp.down_proj.weight
+    pub attn_norm: GpuTensor, // input_layernorm.weight, F32 on GPU
+    pub wq: WeightTensor,     // q_proj.weight  [n_heads*head_dim, hidden]
+    pub wq_bias: GpuTensor,   // q_proj.bias    [n_heads*head_dim], F32
+    pub wk: WeightTensor,     // k_proj.weight  [n_kv_heads*head_dim, hidden]
+    pub wk_bias: GpuTensor,   // k_proj.bias    [n_kv_heads*head_dim], F32
+    pub wv: WeightTensor,     // v_proj.weight
+    pub wv_bias: GpuTensor,   // v_proj.bias
+    pub wo: WeightTensor,     // o_proj.weight  (no bias)
+    pub ffn_norm: GpuTensor,  // post_attention_layernorm.weight, F32
+    pub w_gate: WeightTensor, // mlp.gate_proj.weight  (no bias)
+    pub w_up: WeightTensor,   // mlp.up_proj.weight
+    pub w_down: WeightTensor, // mlp.down_proj.weight
 }
 
 /// GPU-resident Qwen2 model weights.
@@ -223,8 +233,7 @@ impl Qwen2Weights {
     /// weights; F16/F32 on norm and bias tensors. Other quant types panic
     /// with a clear message — extend as needed.
     pub fn load(hfq: &mut HfqFile, cfg: &Qwen2Config, gpu: &mut Gpu) -> Result<Self, String> {
-        load_weights(hfq, cfg, gpu)
-            .map_err(|e| format!("qwen2: load_weights failed: {e:?}"))
+        load_weights(hfq, cfg, gpu).map_err(|e| format!("qwen2: load_weights failed: {e:?}"))
     }
 
     /// Release every GPU buffer back to the pool. Consumes self.
@@ -272,7 +281,11 @@ pub fn load_weights(
 
     let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
     for i in 0..cfg.num_hidden_layers {
-        eprintln!("qwen2: loading layer {}/{}...", i + 1, cfg.num_hidden_layers);
+        eprintln!(
+            "qwen2: loading layer {}/{}...",
+            i + 1,
+            cfg.num_hidden_layers
+        );
         layers.push(load_layer(hfq, gpu, cfg, i)?);
     }
 
@@ -294,7 +307,8 @@ fn load_embed_tokens(
     cfg: &Qwen2Config,
 ) -> HipResult<(GpuTensor, EmbeddingFormat)> {
     let name = "model.embed_tokens.weight";
-    let (info, data) = hfq.tensor_data_vec(name)
+    let (info, data) = hfq
+        .tensor_data_vec(name)
         .unwrap_or_else(|| panic!("qwen2: tensor not found: {name}"));
     // Quant-type coverage matches `load_lm_head` tied branch above, so a
     // tied-embeddings model produces consistent embed + lm_head paths.
@@ -312,15 +326,18 @@ fn load_embed_tokens(
             Ok((buf, EmbeddingFormat::Q8_0))
         }
         1 => {
-            let f32_data: Vec<f32> = data.chunks_exact(2)
+            let f32_data: Vec<f32> = data
+                .chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect();
             let buf = gpu.upload_f32(&f32_data, &[cfg.vocab_size, cfg.hidden_size])?;
             Ok((buf, EmbeddingFormat::F32))
         }
-        qt => panic!("qwen2: unsupported embedding quant_type {qt}; \
+        qt => panic!(
+            "qwen2: unsupported embedding quant_type {qt}; \
                      handled: 1 (F16→F32), 3 (Q8_0), 6 (HFQ4G256), 7 (HFQ4G128). \
-                     Extend load_embed_tokens to handle this format."),
+                     Extend load_embed_tokens to handle this format."
+        ),
     }
 }
 
@@ -352,7 +369,8 @@ fn load_lm_head(
 ) -> HipResult<(WeightTensor, bool)> {
     if cfg.tie_word_embeddings {
         let name = "model.embed_tokens.weight";
-        let (info, data) = hfq.tensor_data_vec(name)
+        let (info, data) = hfq
+            .tensor_data_vec(name)
             .unwrap_or_else(|| panic!("qwen2: tensor not found for tied lm_head: {name}"));
         let dtype = match embd_format {
             EmbeddingFormat::HFQ4G256 => DType::HFQ4G256,
@@ -367,14 +385,12 @@ fn load_lm_head(
                 // F16 source: load_embed_tokens promoted to F32 on host.
                 // We must do the same so gpu_dtype=F32 matches the actual
                 // buffer contents. Mirror qwen35.rs:1438-1447.
-                let f32_data: Vec<f32> = data.chunks_exact(2)
+                let f32_data: Vec<f32> = data
+                    .chunks_exact(2)
                     .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                     .collect();
                 let bytes: &[u8] = unsafe {
-                    std::slice::from_raw_parts(
-                        f32_data.as_ptr() as *const u8,
-                        f32_data.len() * 4,
-                    )
+                    std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
                 };
                 gpu.upload_raw(bytes, &[cfg.vocab_size, cfg.hidden_size])?
             }
@@ -406,27 +422,87 @@ fn load_layer(
     let q_dim = cfg.num_attention_heads * cfg.head_dim;
     let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
 
-    let attn_norm = load_norm_weight_raw(hfq, gpu, &format!("{p}.input_layernorm.weight"), cfg.hidden_size)?;
+    let attn_norm = load_norm_weight_raw(
+        hfq,
+        gpu,
+        &format!("{p}.input_layernorm.weight"),
+        cfg.hidden_size,
+    )?;
 
-    let wq = load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.q_proj.weight"), q_dim, cfg.hidden_size)?;
+    let wq = load_weight_tensor(
+        hfq,
+        gpu,
+        &format!("{p}.self_attn.q_proj.weight"),
+        q_dim,
+        cfg.hidden_size,
+    )?;
     let wq_bias = load_bias_f32(hfq, gpu, &format!("{p}.self_attn.q_proj.bias"), q_dim)?;
-    let wk = load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.k_proj.weight"), kv_dim, cfg.hidden_size)?;
+    let wk = load_weight_tensor(
+        hfq,
+        gpu,
+        &format!("{p}.self_attn.k_proj.weight"),
+        kv_dim,
+        cfg.hidden_size,
+    )?;
     let wk_bias = load_bias_f32(hfq, gpu, &format!("{p}.self_attn.k_proj.bias"), kv_dim)?;
-    let wv = load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.v_proj.weight"), kv_dim, cfg.hidden_size)?;
+    let wv = load_weight_tensor(
+        hfq,
+        gpu,
+        &format!("{p}.self_attn.v_proj.weight"),
+        kv_dim,
+        cfg.hidden_size,
+    )?;
     let wv_bias = load_bias_f32(hfq, gpu, &format!("{p}.self_attn.v_proj.bias"), kv_dim)?;
-    let wo = load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.o_proj.weight"), cfg.hidden_size, q_dim)?;
+    let wo = load_weight_tensor(
+        hfq,
+        gpu,
+        &format!("{p}.self_attn.o_proj.weight"),
+        cfg.hidden_size,
+        q_dim,
+    )?;
 
-    let ffn_norm = load_norm_weight_raw(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), cfg.hidden_size)?;
+    let ffn_norm = load_norm_weight_raw(
+        hfq,
+        gpu,
+        &format!("{p}.post_attention_layernorm.weight"),
+        cfg.hidden_size,
+    )?;
 
-    let w_gate = load_weight_tensor(hfq, gpu, &format!("{p}.mlp.gate_proj.weight"), cfg.intermediate_size, cfg.hidden_size)?;
-    let w_up = load_weight_tensor(hfq, gpu, &format!("{p}.mlp.up_proj.weight"), cfg.intermediate_size, cfg.hidden_size)?;
-    let w_down = load_weight_tensor(hfq, gpu, &format!("{p}.mlp.down_proj.weight"), cfg.hidden_size, cfg.intermediate_size)?;
+    let w_gate = load_weight_tensor(
+        hfq,
+        gpu,
+        &format!("{p}.mlp.gate_proj.weight"),
+        cfg.intermediate_size,
+        cfg.hidden_size,
+    )?;
+    let w_up = load_weight_tensor(
+        hfq,
+        gpu,
+        &format!("{p}.mlp.up_proj.weight"),
+        cfg.intermediate_size,
+        cfg.hidden_size,
+    )?;
+    let w_down = load_weight_tensor(
+        hfq,
+        gpu,
+        &format!("{p}.mlp.down_proj.weight"),
+        cfg.hidden_size,
+        cfg.intermediate_size,
+    )?;
 
     Ok(Qwen2LayerWeights {
         attn_norm,
-        wq, wq_bias, wk, wk_bias, wv, wv_bias, wo,
+        wq,
+        wq_bias,
+        wk,
+        wk_bias,
+        wv,
+        wv_bias,
+        wo,
         ffn_norm,
-        w_gate, w_up, w_down,
+        w_gate,
+        w_up,
+        w_down,
     })
 }
 
@@ -446,12 +522,24 @@ fn load_layer(
 /// Both deltas would be parameters if this lived in
 /// `hipfire_runtime::transformer::norm`. Pull during the
 /// Transformer-extraction PR.
-fn load_norm_weight_raw(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
-    let (info, data) = hfq.tensor_data_vec(name)
+fn load_norm_weight_raw(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    n: usize,
+) -> HipResult<GpuTensor> {
+    let (info, data) = hfq
+        .tensor_data_vec(name)
         .unwrap_or_else(|| panic!("qwen2: tensor not found: {name}"));
     let f32_data: Vec<f32> = match info.quant_type {
-        1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
-        2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        1 => data
+            .chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        2 => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
         qt => panic!("qwen2: expected F16/F32 for norm {name}, got qt={qt}"),
     };
     // Harmonised with `hipfire-arch-dots-ocr::dots_ocr::load_norm_weight_raw`.
@@ -460,8 +548,10 @@ fn load_norm_weight_raw(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> H
     // time rather than letting a wrong-shape GpuTensor cascade through
     // the forward pass.
     assert_eq!(
-        f32_data.len(), n,
-        "qwen2: norm {name} has {} elements, expected {n}", f32_data.len(),
+        f32_data.len(),
+        n,
+        "qwen2: norm {name} has {} elements, expected {n}",
+        f32_data.len(),
     );
     gpu.upload_f32(&f32_data, &[n])
 }
@@ -475,15 +565,26 @@ fn load_norm_weight_raw(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> H
 /// next to `load_norm_weight` as a sibling F32-uploader keyed by tensor
 /// element count.
 fn load_bias_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
-    let (info, data) = hfq.tensor_data_vec(name)
+    let (info, data) = hfq
+        .tensor_data_vec(name)
         .unwrap_or_else(|| panic!("qwen2: tensor not found: {name}"));
     let f32_data: Vec<f32> = match info.quant_type {
-        1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
-        2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        1 => data
+            .chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        2 => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
         qt => panic!("qwen2: expected F16/F32 for bias {name}, got qt={qt}"),
     };
-    assert_eq!(f32_data.len(), n,
-        "qwen2: bias {name} has {} elements, expected {n}", f32_data.len());
+    assert_eq!(
+        f32_data.len(),
+        n,
+        "qwen2: bias {name} has {} elements, expected {n}",
+        f32_data.len()
+    );
     gpu.upload_f32(&f32_data, &[n])
 }
 
@@ -500,16 +601,33 @@ fn load_weight_tensor(
     m: usize,
     k: usize,
 ) -> HipResult<WeightTensor> {
-    let (info, data) = hfq.tensor_data_vec(name)
+    let (info, data) = hfq
+        .tensor_data_vec(name)
         .unwrap_or_else(|| panic!("qwen2: tensor not found: {name}"));
     match info.quant_type {
         6 => {
             let buf = gpu.upload_raw(&data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G256, m, k, row_stride: 0, paro: None, awq_scale: None })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::HFQ4G256,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
         }
         7 => {
             let buf = gpu.upload_raw(&data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G128, m, k, row_stride: 0, paro: None, awq_scale: None })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::HFQ4G128,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
         }
         3 => {
             // Q8F16 (= GGML Q8_0 layout): [F16 scale ‖ 32× INT8]. The fused
@@ -519,16 +637,34 @@ fn load_weight_tensor(
             // the high-precision sweep (`--format q8`) to discriminate
             // forward-pass correctness from HFQ4 quant noise.
             let buf = gpu.upload_raw(&data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0, paro: None, awq_scale: None })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::Q8_0,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
         }
         1 => {
             let buf = gpu.upload_raw(&data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0, paro: None, awq_scale: None })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::F16,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
         }
-        qt => panic!("qwen2: unsupported weight quant_type {qt} for {name}. \
+        qt => panic!(
+            "qwen2: unsupported weight quant_type {qt} for {name}. \
                      This loader handles qt ∈ {{1 (F16), 3 (Q8F16), 6 (HFQ4G256), 7 (HFQ4G128)}}. \
                      Extend load_weight_tensor or wait for the Transformer-extraction PR \
-                     to pick up qwen35's full quant_type matrix."),
+                     to pick up qwen35's full quant_type matrix."
+        ),
     }
 }
 
@@ -552,25 +688,36 @@ fn bf16_bytes_to_f32(data: &[u8]) -> Vec<f32> {
 fn source_bytes_to_f16_stream(source_dtype: &str, data: &[u8], n_elements: usize) -> Vec<u8> {
     match source_dtype {
         "F16" => {
-            assert_eq!(data.len(), 2 * n_elements,
-                "qwen2: F16 tensor has {} bytes, expected 2 * {n_elements}", data.len());
+            assert_eq!(
+                data.len(),
+                2 * n_elements,
+                "qwen2: F16 tensor has {} bytes, expected 2 * {n_elements}",
+                data.len()
+            );
             data.to_vec()
         }
         "BF16" => {
             let f32_vals = bf16_bytes_to_f32(data);
             assert_eq!(f32_vals.len(), n_elements);
-            f32_vals.iter().flat_map(|&v| f32_to_f16(v).to_le_bytes()).collect()
+            f32_vals
+                .iter()
+                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                .collect()
         }
         "F32" => {
-            let f32_vals: Vec<f32> = data.chunks_exact(4)
+            let f32_vals: Vec<f32> = data
+                .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             assert_eq!(f32_vals.len(), n_elements);
-            f32_vals.iter().flat_map(|&v| f32_to_f16(v).to_le_bytes()).collect()
+            f32_vals
+                .iter()
+                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                .collect()
         }
-        other => panic!(
-            "qwen2: unsupported source dtype '{other}' for tensor (expected F16/BF16/F32)"
-        ),
+        other => {
+            panic!("qwen2: unsupported source dtype '{other}' for tensor (expected F16/BF16/F32)")
+        }
     }
 }
 
@@ -578,7 +725,8 @@ fn source_bytes_to_f16_stream(source_dtype: &str, data: &[u8], n_elements: usize
 fn source_bytes_to_f32_vec(source_dtype: &str, data: &[u8], n: usize) -> Vec<f32> {
     match source_dtype {
         "F16" => {
-            let v: Vec<f32> = data.chunks_exact(2)
+            let v: Vec<f32> = data
+                .chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect();
             assert_eq!(v.len(), n);
@@ -590,15 +738,16 @@ fn source_bytes_to_f32_vec(source_dtype: &str, data: &[u8], n: usize) -> Vec<f32
             v
         }
         "F32" => {
-            let v: Vec<f32> = data.chunks_exact(4)
+            let v: Vec<f32> = data
+                .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             assert_eq!(v.len(), n);
             v
         }
-        other => panic!(
-            "qwen2: unsupported source dtype '{other}' for tensor (expected F16/BF16/F32)"
-        ),
+        other => {
+            panic!("qwen2: unsupported source dtype '{other}' for tensor (expected F16/BF16/F32)")
+        }
     }
 }
 
@@ -609,7 +758,8 @@ fn load_norm_weight_raw_from_source(
     name: &str,
     n: usize,
 ) -> HipResult<GpuTensor> {
-    let (info, data) = source.tensor_data(name)
+    let (info, data) = source
+        .tensor_data(name)
         .unwrap_or_else(|| panic!("qwen2: tensor not found: {name}"));
     let f32_data = source_bytes_to_f32_vec(&info.dtype, data, n);
     gpu.upload_f32(&f32_data, &[n])
@@ -622,7 +772,8 @@ fn load_bias_f32_from_source(
     name: &str,
     n: usize,
 ) -> HipResult<GpuTensor> {
-    let (info, data) = source.tensor_data(name)
+    let (info, data) = source
+        .tensor_data(name)
         .unwrap_or_else(|| panic!("qwen2: tensor not found: {name}"));
     let f32_data = source_bytes_to_f32_vec(&info.dtype, data, n);
     gpu.upload_f32(&f32_data, &[n])
@@ -636,7 +787,8 @@ fn load_weight_tensor_from_source(
     m: usize,
     k: usize,
 ) -> HipResult<WeightTensor> {
-    let (info, data) = source.tensor_data(name)
+    let (info, data) = source
+        .tensor_data(name)
         .unwrap_or_else(|| panic!("qwen2: tensor not found: {name}"));
     let n_elements = m * k;
     let f16_bytes = source_bytes_to_f16_stream(&info.dtype, data, n_elements);
@@ -644,7 +796,8 @@ fn load_weight_tensor_from_source(
     Ok(WeightTensor {
         buf,
         gpu_dtype: DType::F16,
-        m, k,
+        m,
+        k,
         row_stride: 0,
         paro: None,
         awq_scale: None,
@@ -658,7 +811,8 @@ fn load_embed_tokens_from_source(
     cfg: &Qwen2Config,
 ) -> HipResult<(GpuTensor, EmbeddingFormat)> {
     let name = "model.embed_tokens.weight";
-    let (info, data) = source.tensor_data(name)
+    let (info, data) = source
+        .tensor_data(name)
         .unwrap_or_else(|| panic!("qwen2: tensor not found: {name}"));
     let n = cfg.vocab_size * cfg.hidden_size;
     let f32_data = source_bytes_to_f32_vec(&info.dtype, data, n);
@@ -677,7 +831,8 @@ fn load_lm_head_from_source(
 ) -> HipResult<(WeightTensor, bool)> {
     if cfg.tie_word_embeddings {
         let name = "model.embed_tokens.weight";
-        let (info, data) = source.tensor_data(name)
+        let (info, data) = source
+            .tensor_data(name)
             .unwrap_or_else(|| panic!("qwen2: tensor not found for tied lm_head: {name}"));
         let n = cfg.vocab_size * cfg.hidden_size;
         let f32_data = source_bytes_to_f32_vec(&info.dtype, data, n);
@@ -696,8 +851,13 @@ fn load_lm_head_from_source(
         };
         Ok((wt, true))
     } else {
-        let wt = load_weight_tensor_from_source(source, gpu, "lm_head.weight",
-            cfg.vocab_size, cfg.hidden_size)?;
+        let wt = load_weight_tensor_from_source(
+            source,
+            gpu,
+            "lm_head.weight",
+            cfg.vocab_size,
+            cfg.hidden_size,
+        )?;
         Ok((wt, false))
     }
 }
@@ -713,39 +873,90 @@ fn load_layer_from_source(
     let q_dim = cfg.num_attention_heads * cfg.head_dim;
     let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
 
-    let attn_norm = load_norm_weight_raw_from_source(source, gpu,
-        &format!("{p}.input_layernorm.weight"), cfg.hidden_size)?;
+    let attn_norm = load_norm_weight_raw_from_source(
+        source,
+        gpu,
+        &format!("{p}.input_layernorm.weight"),
+        cfg.hidden_size,
+    )?;
 
-    let wq = load_weight_tensor_from_source(source, gpu,
-        &format!("{p}.self_attn.q_proj.weight"), q_dim, cfg.hidden_size)?;
-    let wq_bias = load_bias_f32_from_source(source, gpu,
-        &format!("{p}.self_attn.q_proj.bias"), q_dim)?;
-    let wk = load_weight_tensor_from_source(source, gpu,
-        &format!("{p}.self_attn.k_proj.weight"), kv_dim, cfg.hidden_size)?;
-    let wk_bias = load_bias_f32_from_source(source, gpu,
-        &format!("{p}.self_attn.k_proj.bias"), kv_dim)?;
-    let wv = load_weight_tensor_from_source(source, gpu,
-        &format!("{p}.self_attn.v_proj.weight"), kv_dim, cfg.hidden_size)?;
-    let wv_bias = load_bias_f32_from_source(source, gpu,
-        &format!("{p}.self_attn.v_proj.bias"), kv_dim)?;
-    let wo = load_weight_tensor_from_source(source, gpu,
-        &format!("{p}.self_attn.o_proj.weight"), cfg.hidden_size, q_dim)?;
+    let wq = load_weight_tensor_from_source(
+        source,
+        gpu,
+        &format!("{p}.self_attn.q_proj.weight"),
+        q_dim,
+        cfg.hidden_size,
+    )?;
+    let wq_bias =
+        load_bias_f32_from_source(source, gpu, &format!("{p}.self_attn.q_proj.bias"), q_dim)?;
+    let wk = load_weight_tensor_from_source(
+        source,
+        gpu,
+        &format!("{p}.self_attn.k_proj.weight"),
+        kv_dim,
+        cfg.hidden_size,
+    )?;
+    let wk_bias =
+        load_bias_f32_from_source(source, gpu, &format!("{p}.self_attn.k_proj.bias"), kv_dim)?;
+    let wv = load_weight_tensor_from_source(
+        source,
+        gpu,
+        &format!("{p}.self_attn.v_proj.weight"),
+        kv_dim,
+        cfg.hidden_size,
+    )?;
+    let wv_bias =
+        load_bias_f32_from_source(source, gpu, &format!("{p}.self_attn.v_proj.bias"), kv_dim)?;
+    let wo = load_weight_tensor_from_source(
+        source,
+        gpu,
+        &format!("{p}.self_attn.o_proj.weight"),
+        cfg.hidden_size,
+        q_dim,
+    )?;
 
-    let ffn_norm = load_norm_weight_raw_from_source(source, gpu,
-        &format!("{p}.post_attention_layernorm.weight"), cfg.hidden_size)?;
+    let ffn_norm = load_norm_weight_raw_from_source(
+        source,
+        gpu,
+        &format!("{p}.post_attention_layernorm.weight"),
+        cfg.hidden_size,
+    )?;
 
-    let w_gate = load_weight_tensor_from_source(source, gpu,
-        &format!("{p}.mlp.gate_proj.weight"), cfg.intermediate_size, cfg.hidden_size)?;
-    let w_up = load_weight_tensor_from_source(source, gpu,
-        &format!("{p}.mlp.up_proj.weight"), cfg.intermediate_size, cfg.hidden_size)?;
-    let w_down = load_weight_tensor_from_source(source, gpu,
-        &format!("{p}.mlp.down_proj.weight"), cfg.hidden_size, cfg.intermediate_size)?;
+    let w_gate = load_weight_tensor_from_source(
+        source,
+        gpu,
+        &format!("{p}.mlp.gate_proj.weight"),
+        cfg.intermediate_size,
+        cfg.hidden_size,
+    )?;
+    let w_up = load_weight_tensor_from_source(
+        source,
+        gpu,
+        &format!("{p}.mlp.up_proj.weight"),
+        cfg.intermediate_size,
+        cfg.hidden_size,
+    )?;
+    let w_down = load_weight_tensor_from_source(
+        source,
+        gpu,
+        &format!("{p}.mlp.down_proj.weight"),
+        cfg.hidden_size,
+        cfg.intermediate_size,
+    )?;
 
     Ok(Qwen2LayerWeights {
         attn_norm,
-        wq, wq_bias, wk, wk_bias, wv, wv_bias, wo,
+        wq,
+        wq_bias,
+        wk,
+        wk_bias,
+        wv,
+        wv_bias,
+        wo,
         ffn_norm,
-        w_gate, w_up, w_down,
+        w_gate,
+        w_up,
+        w_down,
     })
 }
 
@@ -759,14 +970,20 @@ pub fn load_weights_from_source(
     let (embd_token, embd_format) = load_embed_tokens_from_source(source, gpu, cfg)?;
 
     eprintln!("qwen2: loading model.norm...");
-    let output_norm = load_norm_weight_raw_from_source(source, gpu, "model.norm.weight", cfg.hidden_size)?;
+    let output_norm =
+        load_norm_weight_raw_from_source(source, gpu, "model.norm.weight", cfg.hidden_size)?;
 
     eprintln!("qwen2: loading lm_head...");
-    let (output, tied_lm_head) = load_lm_head_from_source(source, gpu, cfg, &embd_token, embd_format)?;
+    let (output, tied_lm_head) =
+        load_lm_head_from_source(source, gpu, cfg, &embd_token, embd_format)?;
 
     let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
     for i in 0..cfg.num_hidden_layers {
-        eprintln!("qwen2: loading layer {}/{} (from source)...", i + 1, cfg.num_hidden_layers);
+        eprintln!(
+            "qwen2: loading layer {}/{} (from source)...",
+            i + 1,
+            cfg.num_hidden_layers
+        );
         layers.push(load_layer_from_source(source, gpu, cfg, i)?);
     }
 
@@ -816,7 +1033,7 @@ pub fn load_weights_from_source(
 pub struct Qwen2State {
     pub x: GpuTensor,
     pub tmp: GpuTensor,
-    pub x_rot: GpuTensor,  // rotation output scratch (rmsnorm output for non-MQ dtypes)
+    pub x_rot: GpuTensor, // rotation output scratch (rmsnorm output for non-MQ dtypes)
     pub q: GpuTensor,
     pub k: GpuTensor,
     pub v: GpuTensor,
@@ -853,11 +1070,7 @@ impl Qwen2State {
     }
 
     /// Allocate the full scratch graph + KV cache at the given seq budget.
-    pub fn new_with_max_seq(
-        gpu: &mut Gpu,
-        cfg: &Qwen2Config,
-        max_seq: usize,
-    ) -> HipResult<Self> {
+    pub fn new_with_max_seq(gpu: &mut Gpu, cfg: &Qwen2Config, max_seq: usize) -> HipResult<Self> {
         let dim = cfg.hidden_size;
         let q_dim = cfg.num_attention_heads * cfg.head_dim;
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
@@ -880,21 +1093,21 @@ impl Qwen2State {
         let x_rot_len = dim.max(hidden_dim);
 
         Ok(Self {
-            x:           gpu.alloc_tensor(&[dim], DType::F32)?,
-            tmp:         gpu.alloc_tensor(&[dim], DType::F32)?,
-            x_rot:       gpu.alloc_tensor(&[x_rot_len], DType::F32)?,
-            q:           gpu.alloc_tensor(&[q_dim], DType::F32)?,
-            k:           gpu.alloc_tensor(&[kv_dim], DType::F32)?,
-            v:           gpu.alloc_tensor(&[kv_dim], DType::F32)?,
-            attn_out:    gpu.alloc_tensor(&[q_dim], DType::F32)?,
-            o:           gpu.alloc_tensor(&[dim], DType::F32)?,
-            gate:        gpu.alloc_tensor(&[hidden_dim], DType::F32)?,
-            up:          gpu.alloc_tensor(&[hidden_dim], DType::F32)?,
-            ffn_hidden:  gpu.alloc_tensor(&[hidden_dim], DType::F32)?,
-            ffn_out:     gpu.alloc_tensor(&[dim], DType::F32)?,
-            logits:      gpu.alloc_tensor(&[cfg.vocab_size], DType::F32)?,
+            x: gpu.alloc_tensor(&[dim], DType::F32)?,
+            tmp: gpu.alloc_tensor(&[dim], DType::F32)?,
+            x_rot: gpu.alloc_tensor(&[x_rot_len], DType::F32)?,
+            q: gpu.alloc_tensor(&[q_dim], DType::F32)?,
+            k: gpu.alloc_tensor(&[kv_dim], DType::F32)?,
+            v: gpu.alloc_tensor(&[kv_dim], DType::F32)?,
+            attn_out: gpu.alloc_tensor(&[q_dim], DType::F32)?,
+            o: gpu.alloc_tensor(&[dim], DType::F32)?,
+            gate: gpu.alloc_tensor(&[hidden_dim], DType::F32)?,
+            up: gpu.alloc_tensor(&[hidden_dim], DType::F32)?,
+            ffn_hidden: gpu.alloc_tensor(&[hidden_dim], DType::F32)?,
+            ffn_out: gpu.alloc_tensor(&[dim], DType::F32)?,
+            logits: gpu.alloc_tensor(&[cfg.vocab_size], DType::F32)?,
             attn_partials: gpu.alloc_tensor(&[attn_partials_len], DType::F32)?,
-            pos_buf:     gpu.hip.malloc(4)?,
+            pos_buf: gpu.hip.malloc(4)?,
             k_cache,
             v_cache,
             max_seq,
@@ -917,13 +1130,30 @@ impl Qwen2State {
     /// Release every GPU buffer back to the pool. Consumes self.
     /// Mirrors `ForwardScratch::free_gpu` in `hipfire_runtime::llama`.
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        for t in [self.x, self.tmp, self.x_rot, self.q, self.k, self.v, self.attn_out,
-                  self.o, self.gate, self.up, self.ffn_hidden,
-                  self.ffn_out, self.logits, self.attn_partials] {
+        for t in [
+            self.x,
+            self.tmp,
+            self.x_rot,
+            self.q,
+            self.k,
+            self.v,
+            self.attn_out,
+            self.o,
+            self.gate,
+            self.up,
+            self.ffn_hidden,
+            self.ffn_out,
+            self.logits,
+            self.attn_partials,
+        ] {
             let _ = gpu.free_tensor(t);
         }
-        for t in self.k_cache { let _ = gpu.free_tensor(t); }
-        for t in self.v_cache { let _ = gpu.free_tensor(t); }
+        for t in self.k_cache {
+            let _ = gpu.free_tensor(t);
+        }
+        for t in self.v_cache {
+            let _ = gpu.free_tensor(t);
+        }
         let _ = gpu.hip.free(self.pos_buf);
     }
 }
@@ -975,10 +1205,18 @@ pub fn forward_step(
     // Embedding lookup → state.x.
     let dim = cfg.hidden_size;
     match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &state.x, token, dim)?,
-        EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &state.x, token, dim)?,
-        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &state.x, token, dim)?,
-        EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &state.x, token, dim)?,
+        EmbeddingFormat::HFQ4G256 => {
+            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &state.x, token, dim)?
+        }
+        EmbeddingFormat::HFQ4G128 => {
+            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &state.x, token, dim)?
+        }
+        EmbeddingFormat::Q8_0 => {
+            gpu.embedding_lookup_q8(&weights.token_embd, &state.x, token, dim)?
+        }
+        EmbeddingFormat::Q4K => {
+            gpu.embedding_lookup_q4k(&weights.token_embd, &state.x, token, dim)?
+        }
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &state.x, token, dim)?,
     }
 
@@ -1012,9 +1250,8 @@ pub fn forward_step_with_embed(
         ));
     }
     let pos = forward_step_prelude(gpu, state)?;
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(embedding.as_ptr() as *const u8, embedding.len() * 4)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(embedding.as_ptr() as *const u8, embedding.len() * 4) };
     gpu.hip.memcpy_htod(&state.x.buf, bytes)?;
     forward_step_after_x(gpu, weights, cfg, state, pos)
 }
@@ -1023,15 +1260,26 @@ pub fn forward_step_with_embed(
 /// splice: lets a VLM example build a [batch, dim] embeds matrix with vision
 /// rows interleaved at IMGPAD slots and text rows here. Uses `state.x` scratch.
 pub fn embed_token_row(
-    gpu: &mut Gpu, weights: &Qwen2Weights, cfg: &Qwen2Config,
-    state: &mut Qwen2State, token: u32,
+    gpu: &mut Gpu,
+    weights: &Qwen2Weights,
+    cfg: &Qwen2Config,
+    state: &mut Qwen2State,
+    token: u32,
 ) -> HipResult<Vec<f32>> {
     let dim = cfg.hidden_size;
     match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &state.x, token, dim)?,
-        EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &state.x, token, dim)?,
-        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &state.x, token, dim)?,
-        EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &state.x, token, dim)?,
+        EmbeddingFormat::HFQ4G256 => {
+            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &state.x, token, dim)?
+        }
+        EmbeddingFormat::HFQ4G128 => {
+            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &state.x, token, dim)?
+        }
+        EmbeddingFormat::Q8_0 => {
+            gpu.embedding_lookup_q8(&weights.token_embd, &state.x, token, dim)?
+        }
+        EmbeddingFormat::Q4K => {
+            gpu.embedding_lookup_q4k(&weights.token_embd, &state.x, token, dim)?
+        }
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &state.x, token, dim)?,
     }
     gpu.download_f32(&state.x)
@@ -1052,7 +1300,8 @@ fn forward_step_prelude(gpu: &mut Gpu, state: &Qwen2State) -> HipResult<usize> {
         ));
     }
     let pos_i32 = pos as i32;
-    gpu.hip.memcpy_htod(&state.pos_buf, &pos_i32.to_ne_bytes())?;
+    gpu.hip
+        .memcpy_htod(&state.pos_buf, &pos_i32.to_ne_bytes())?;
     Ok(pos)
 }
 
@@ -1091,17 +1340,38 @@ fn forward_step_after_x(
         let wrq = layer.wq.dispatch_ref();
         let wrk = layer.wk.dispatch_ref();
         let wrv = layer.wv.dispatch_ref();
-        execute_steps(gpu, &ctx, &[
-            Step::RmsnormAutomatic {
-                x: &state.x, norm_weight: &layer.attn_norm,
-                x_plain: &state.tmp, out: &state.x_rot,
-                awq_scale: layer.wq.awq_scale.as_ref(),
-                k: layer.wq.k, eps: cfg.rms_norm_eps, rotation: qkv_rot,
-            },
-            Step::Gemv { w: &wrq, input: GemvInput::Prerotated(&state.x_rot), out: &state.q },
-            Step::Gemv { w: &wrk, input: GemvInput::Prerotated(&state.x_rot), out: &state.k },
-            Step::Gemv { w: &wrv, input: GemvInput::Prerotated(&state.x_rot), out: &state.v },
-        ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+        execute_steps(
+            gpu,
+            &ctx,
+            &[
+                Step::RmsnormAutomatic {
+                    x: &state.x,
+                    norm_weight: &layer.attn_norm,
+                    x_plain: &state.tmp,
+                    out: &state.x_rot,
+                    awq_scale: layer.wq.awq_scale.as_ref(),
+                    k: layer.wq.k,
+                    eps: cfg.rms_norm_eps,
+                    rotation: qkv_rot,
+                },
+                Step::Gemv {
+                    w: &wrq,
+                    input: GemvInput::Prerotated(&state.x_rot),
+                    out: &state.q,
+                },
+                Step::Gemv {
+                    w: &wrk,
+                    input: GemvInput::Prerotated(&state.x_rot),
+                    out: &state.k,
+                },
+                Step::Gemv {
+                    w: &wrv,
+                    input: GemvInput::Prerotated(&state.x_rot),
+                    out: &state.v,
+                },
+            ],
+        )
+        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
 
         // (3) QKV bias. attention_bias=true on Qwen2 — three small adds
         // per layer (batch=1, n=q_dim or kv_dim). This is **option (a)**
@@ -1118,7 +1388,15 @@ fn forward_step_after_x(
 
         // (4) RoPE on q,k (1-D, theta from config). Qwen2 does NOT apply
         // q/k RMSNorm pre-RoPE (Qwen3-only — see lib.rs doc).
-        gpu.rope_f32(&state.q, &state.k, &state.pos_buf, n_heads, n_kv_heads, head_dim, cfg.rope_theta)?;
+        gpu.rope_f32(
+            &state.q,
+            &state.k,
+            &state.pos_buf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            cfg.rope_theta,
+        )?;
 
         // (5) KV cache write at pos.
         gpu.kv_cache_write(&state.k_cache[layer_idx], &state.k, &state.pos_buf, kv_dim)?;
@@ -1139,75 +1417,139 @@ fn forward_step_after_x(
         // DRAM round-trip + reduce dispatch. Probe of launch-overhead vs
         // occupancy tradeoff.
         let use_fused = std::env::var("HIPFIRE_GQA_FUSED")
-            .map(|v| v == "1").unwrap_or(false);
+            .map(|v| v == "1")
+            .unwrap_or(false);
         if use_fused && n_kv_heads < n_heads {
             gpu.attention_flash_gqa_fused(
-                &state.q, &state.k_cache[layer_idx], &state.v_cache[layer_idx],
+                &state.q,
+                &state.k_cache[layer_idx],
+                &state.v_cache[layer_idx],
                 &state.attn_out,
-                pos + 1, n_heads, n_kv_heads, head_dim, state.max_seq,
+                pos + 1,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                state.max_seq,
             )?;
         } else if n_kv_heads < n_heads && head_dim == 128 && pos + 1 >= 4096 {
             gpu.attention_gqa_warp(
-                &state.q, &state.k_cache[layer_idx], &state.v_cache[layer_idx],
-                &state.attn_out, &state.attn_partials,
-                pos + 1, n_heads, n_kv_heads, head_dim, state.max_seq,
+                &state.q,
+                &state.k_cache[layer_idx],
+                &state.v_cache[layer_idx],
+                &state.attn_out,
+                &state.attn_partials,
+                pos + 1,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                state.max_seq,
             )?;
         } else if n_kv_heads < n_heads && pos + 1 >= 4096 {
-            Gpu::attention_flash_gqa(gpu,
-                &state.q, &state.k_cache[layer_idx], &state.v_cache[layer_idx],
-                &state.attn_out, &state.attn_partials,
-                pos + 1, n_heads, n_kv_heads, head_dim, state.max_seq,
+            Gpu::attention_flash_gqa(
+                gpu,
+                &state.q,
+                &state.k_cache[layer_idx],
+                &state.v_cache[layer_idx],
+                &state.attn_out,
+                &state.attn_partials,
+                pos + 1,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                state.max_seq,
             )?;
         } else {
-            Gpu::attention_flash(gpu,
-                &state.q, &state.k_cache[layer_idx], &state.v_cache[layer_idx],
-                &state.attn_out, &state.attn_partials,
-                pos + 1, n_heads, n_kv_heads, head_dim, state.max_seq,
+            Gpu::attention_flash(
+                gpu,
+                &state.q,
+                &state.k_cache[layer_idx],
+                &state.v_cache[layer_idx],
+                &state.attn_out,
+                &state.attn_partials,
+                pos + 1,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                state.max_seq,
             )?;
         }
 
         // (7–8) o_proj + residual via execute_steps.
         let wro = layer.wo.dispatch_ref();
-        execute_steps(gpu, &ctx, &[
-            Step::GemvResidual {
-                w: &wro, input: GemvInput::Raw(&state.attn_out),
-                residual: &state.x, out: &state.o,
-            },
-        ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+        execute_steps(
+            gpu,
+            &ctx,
+            &[Step::GemvResidual {
+                w: &wro,
+                input: GemvInput::Raw(&state.attn_out),
+                residual: &state.x,
+                out: &state.o,
+            }],
+        )
+        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
 
         // (9–10) FFN norm + gate/up via execute_steps.
         // The interpreter selects FusedGateUpQ8_0 / FusedGateUpHfq4G256 / per-op.
         let ffn_rot = dtype_rotation_plan(layer.w_gate.gpu_dtype);
         let wrg = layer.w_gate.dispatch_ref();
         let wru = layer.w_up.dispatch_ref();
-        execute_steps(gpu, &ctx, &[
-            Step::RmsnormAutomatic {
-                x: &state.x, norm_weight: &layer.ffn_norm,
-                x_plain: &state.tmp, out: &state.x_rot,
-                awq_scale: layer.w_gate.awq_scale.as_ref(),
-                k: layer.w_gate.k, eps: cfg.rms_norm_eps, rotation: ffn_rot,
-            },
-            Step::Gemv { w: &wrg, input: GemvInput::Prerotated(&state.x_rot), out: &state.gate },
-            Step::Gemv { w: &wru, input: GemvInput::Prerotated(&state.x_rot), out: &state.up },
-        ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+        execute_steps(
+            gpu,
+            &ctx,
+            &[
+                Step::RmsnormAutomatic {
+                    x: &state.x,
+                    norm_weight: &layer.ffn_norm,
+                    x_plain: &state.tmp,
+                    out: &state.x_rot,
+                    awq_scale: layer.w_gate.awq_scale.as_ref(),
+                    k: layer.w_gate.k,
+                    eps: cfg.rms_norm_eps,
+                    rotation: ffn_rot,
+                },
+                Step::Gemv {
+                    w: &wrg,
+                    input: GemvInput::Prerotated(&state.x_rot),
+                    out: &state.gate,
+                },
+                Step::Gemv {
+                    w: &wru,
+                    input: GemvInput::Prerotated(&state.x_rot),
+                    out: &state.up,
+                },
+            ],
+        )
+        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
 
         // SwiGLU activation + w_down + residual.
         gpu.silu_mul_f32(&state.gate, &state.up, &state.ffn_hidden)?;
         let wrd = layer.w_down.dispatch_ref();
-        execute_steps(gpu, &ctx, &[
-            Step::GemvResidual {
-                w: &wrd, input: GemvInput::Raw(&state.ffn_hidden),
-                residual: &state.x, out: &state.ffn_out,
-            },
-        ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+        execute_steps(
+            gpu,
+            &ctx,
+            &[Step::GemvResidual {
+                w: &wrd,
+                input: GemvInput::Raw(&state.ffn_hidden),
+                residual: &state.x,
+                out: &state.ffn_out,
+            }],
+        )
+        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
     }
 
     // Final RMSNorm + lm_head.
     gpu.rmsnorm_f32(&state.x, &weights.output_norm, &state.tmp, cfg.rms_norm_eps)?;
     let wr_out = weights.output.dispatch_ref();
-    execute_steps(gpu, &ctx, &[
-        Step::Gemv { w: &wr_out, input: GemvInput::Raw(&state.tmp), out: &state.logits },
-    ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+    execute_steps(
+        gpu,
+        &ctx,
+        &[Step::Gemv {
+            w: &wr_out,
+            input: GemvInput::Raw(&state.tmp),
+            out: &state.logits,
+        }],
+    )
+    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
 
     state.next_pos = pos + 1;
     Ok(())
@@ -1261,18 +1603,33 @@ pub fn forward_prefill_batch_embeds(
     let gemv = gemv_family();
     let ctx = DispatchCtx::new(gpu);
 
-    assert_eq!(embeds.len() % dim, 0,
-        "forward_prefill_batch_embeds: embeds.len()={} not a multiple of dim={dim}", embeds.len());
+    assert_eq!(
+        embeds.len() % dim,
+        0,
+        "forward_prefill_batch_embeds: embeds.len()={} not a multiple of dim={dim}",
+        embeds.len()
+    );
     let batch = embeds.len() / dim;
     let base = state.next_pos;
     if base + batch > state.max_seq {
-        return Err(hip_bridge::HipError::new(0, &format!(
-            "qwen2: prefill batch={batch} + next_pos={base} > max_seq={}", state.max_seq)));
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "qwen2: prefill batch={batch} + next_pos={base} > max_seq={}",
+                state.max_seq
+            ),
+        ));
     }
 
     // Batched projection: Q8 weights get a true batched GEMM; other dtypes
     // fall back to weight_gemm (HFQ4 batched, else a per-row GEMV loop).
-    fn proj(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor, batch: usize) -> HipResult<()> {
+    fn proj(
+        gpu: &mut Gpu,
+        w: &WeightTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        batch: usize,
+    ) -> HipResult<()> {
         match w.gpu_dtype {
             DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(&w.buf, x, y, w.m, w.k, batch),
             _ => weight_gemm(gpu, w, x, y, batch),
@@ -1291,10 +1648,9 @@ pub fn forward_prefill_batch_embeds(
     let ffn_hidden_batch = gpu.alloc_tensor(&[batch, hidden_dim], DType::F32)?;
     let ffn_out_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
 
-    let use_wmma_causal =
-        (gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12())
-            && head_dim == 128
-            && batch >= 64;
+    let use_wmma_causal = (gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12())
+        && head_dim == 128
+        && batch >= 64;
     let (k_f16_batch, v_f16_batch) = if use_wmma_causal {
         let k16 = gpu.alloc_tensor(&[batch, kv_dim], DType::F16)?;
         let v16 = gpu.alloc_tensor(&[batch, kv_dim], DType::F16)?;
@@ -1313,7 +1669,14 @@ pub fn forward_prefill_batch_embeds(
     for layer_idx in 0..cfg.num_hidden_layers {
         let layer = &weights.layers[layer_idx];
 
-        gpu.rmsnorm_batched(&x_batch, &layer.attn_norm, &tmp_batch, batch, dim, cfg.rms_norm_eps)?;
+        gpu.rmsnorm_batched(
+            &x_batch,
+            &layer.attn_norm,
+            &tmp_batch,
+            batch,
+            dim,
+            cfg.rms_norm_eps,
+        )?;
 
         proj(gpu, &layer.wq, &tmp_batch, &q_batch, batch)?;
         proj(gpu, &layer.wk, &tmp_batch, &k_batch, batch)?;
@@ -1323,14 +1686,34 @@ pub fn forward_prefill_batch_embeds(
         gpu.bias_add_f32(&k_batch, &layer.wk_bias, batch, kv_dim)?;
         gpu.bias_add_f32(&v_batch, &layer.wv_bias, batch, kv_dim)?;
 
-        gpu.rope_batched_f32(&q_batch, &k_batch, &pos_array,
-            n_heads, n_kv_heads, head_dim, cfg.rope_theta, batch)?;
+        gpu.rope_batched_f32(
+            &q_batch,
+            &k_batch,
+            &pos_array,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            cfg.rope_theta,
+            batch,
+        )?;
 
         // Persist post-RoPE K/V to the F32 cache at absolute positions
         // (pos_array = [base..base+batch)) in one launch each, so decode
         // (forward_step) can attend to the whole prompt.
-        gpu.kv_cache_write_f32_batched(&state.k_cache[layer_idx], &k_batch, &pos_array, kv_dim, batch)?;
-        gpu.kv_cache_write_f32_batched(&state.v_cache[layer_idx], &v_batch, &pos_array, kv_dim, batch)?;
+        gpu.kv_cache_write_f32_batched(
+            &state.k_cache[layer_idx],
+            &k_batch,
+            &pos_array,
+            kv_dim,
+            batch,
+        )?;
+        gpu.kv_cache_write_f32_batched(
+            &state.v_cache[layer_idx],
+            &v_batch,
+            &pos_array,
+            kv_dim,
+            batch,
+        )?;
 
         // Attention: WMMA causal flash when head_dim=128 and batch is
         // large enough to fill the M=64 tile. gfx11 and gfx12 use separate
@@ -1341,18 +1724,40 @@ pub fn forward_prefill_batch_embeds(
             gpu.cast_f32_to_f16(&k_batch, k16)?;
             gpu.cast_f32_to_f16(&v_batch, v16)?;
             gpu.attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32(
-                &q_batch, k16, v16, &attn_out_batch,
-                batch, batch, n_heads, n_kv_heads, head_dim,
+                &q_batch,
+                k16,
+                v16,
+                &attn_out_batch,
+                batch,
+                batch,
+                n_heads,
+                n_kv_heads,
+                head_dim,
             )?;
         } else {
-            gpu.attention_causal_batched(&q_batch, &k_batch, &v_batch, &attn_out_batch,
-                batch, n_heads, n_kv_heads, head_dim)?;
+            gpu.attention_causal_batched(
+                &q_batch,
+                &k_batch,
+                &v_batch,
+                &attn_out_batch,
+                batch,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+            )?;
         }
 
         proj(gpu, &layer.wo, &attn_out_batch, &o_batch, batch)?;
         gpu.add_inplace_f32(&x_batch, &o_batch)?;
 
-        gpu.rmsnorm_batched(&x_batch, &layer.ffn_norm, &tmp_batch, batch, dim, cfg.rms_norm_eps)?;
+        gpu.rmsnorm_batched(
+            &x_batch,
+            &layer.ffn_norm,
+            &tmp_batch,
+            batch,
+            dim,
+            cfg.rms_norm_eps,
+        )?;
 
         proj(gpu, &layer.w_gate, &tmp_batch, &gate_batch, batch)?;
         proj(gpu, &layer.w_up, &tmp_batch, &up_batch, batch)?;
@@ -1363,22 +1768,44 @@ pub fn forward_prefill_batch_embeds(
 
     // Final norm + lm_head for the LAST position only → state.logits.
     let last_off = (batch - 1) * dim * 4;
-    gpu.hip.memcpy_dtod_at(&state.x.buf, 0, &x_batch.buf, last_off, dim * 4)?;
+    gpu.hip
+        .memcpy_dtod_at(&state.x.buf, 0, &x_batch.buf, last_off, dim * 4)?;
     gpu.rmsnorm_f32(&state.x, &weights.output_norm, &state.tmp, cfg.rms_norm_eps)?;
-    gemv.run_auto(&ctx, gpu, &weights.output.dispatch_ref(), &state.tmp, &state.logits).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+    gemv.run_auto(
+        &ctx,
+        gpu,
+        &weights.output.dispatch_ref(),
+        &state.tmp,
+        &state.logits,
+    )
+    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
 
     state.next_pos = base + batch;
 
-    for t in [x_batch, tmp_batch, q_batch, k_batch, v_batch, attn_out_batch,
-              o_batch, gate_batch, up_batch, ffn_hidden_batch, ffn_out_batch,
-              pos_array] {
+    for t in [
+        x_batch,
+        tmp_batch,
+        q_batch,
+        k_batch,
+        v_batch,
+        attn_out_batch,
+        o_batch,
+        gate_batch,
+        up_batch,
+        ffn_hidden_batch,
+        ffn_out_batch,
+        pos_array,
+    ] {
         gpu.free_tensor(t)?;
     }
-    if let Some(k16) = k_f16_batch { gpu.free_tensor(k16)?; }
-    if let Some(v16) = v_f16_batch { gpu.free_tensor(v16)?; }
+    if let Some(k16) = k_f16_batch {
+        gpu.free_tensor(k16)?;
+    }
+    if let Some(v16) = v_f16_batch {
+        gpu.free_tensor(v16)?;
+    }
     Ok(())
 }
-
 
 // ─────────────────────────────────────────────────────────────────────────
 // #397 Ship 6 — forward-as-pipeline: Qwen2 lowered decode.
@@ -1455,7 +1882,12 @@ struct Qwen2Bindings<'a> {
 }
 
 impl<'a> ForwardBindings for Qwen2Bindings<'a> {
-    fn run_proj(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError> {
+    fn run_proj(
+        &mut self,
+        gpu: &mut Gpu,
+        ctx: &DispatchCtx,
+        op: &OpBinding,
+    ) -> Result<(), DispatchError> {
         match op_code(op) {
             q2_op::PROJ_QKV => {
                 // Hand-path: rmsnorm + QKV projection via execute_steps.
@@ -1463,39 +1895,84 @@ impl<'a> ForwardBindings for Qwen2Bindings<'a> {
                 let wrq = self.layer.wq.dispatch_ref();
                 let wrk = self.layer.wk.dispatch_ref();
                 let wrv = self.layer.wv.dispatch_ref();
-                execute_steps(gpu, ctx, &[
-                    Step::RmsnormAutomatic {
-                        x: &self.state.x, norm_weight: &self.layer.attn_norm,
-                        x_plain: &self.state.tmp, out: &self.state.x_rot,
-                        awq_scale: self.layer.wq.awq_scale.as_ref(),
-                        k: self.layer.wq.k, eps: self.cfg.rms_norm_eps, rotation: qkv_rot,
-                    },
-                    Step::Gemv { w: &wrq, input: GemvInput::Prerotated(&self.state.x_rot), out: &self.state.q },
-                    Step::Gemv { w: &wrk, input: GemvInput::Prerotated(&self.state.x_rot), out: &self.state.k },
-                    Step::Gemv { w: &wrv, input: GemvInput::Prerotated(&self.state.x_rot), out: &self.state.v },
-                ]).map_err(|e| DispatchError::Hip(format!("qwen2 L{}: qkv proj: {e}", self.l)))
+                execute_steps(
+                    gpu,
+                    ctx,
+                    &[
+                        Step::RmsnormAutomatic {
+                            x: &self.state.x,
+                            norm_weight: &self.layer.attn_norm,
+                            x_plain: &self.state.tmp,
+                            out: &self.state.x_rot,
+                            awq_scale: self.layer.wq.awq_scale.as_ref(),
+                            k: self.layer.wq.k,
+                            eps: self.cfg.rms_norm_eps,
+                            rotation: qkv_rot,
+                        },
+                        Step::Gemv {
+                            w: &wrq,
+                            input: GemvInput::Prerotated(&self.state.x_rot),
+                            out: &self.state.q,
+                        },
+                        Step::Gemv {
+                            w: &wrk,
+                            input: GemvInput::Prerotated(&self.state.x_rot),
+                            out: &self.state.k,
+                        },
+                        Step::Gemv {
+                            w: &wrv,
+                            input: GemvInput::Prerotated(&self.state.x_rot),
+                            out: &self.state.v,
+                        },
+                    ],
+                )
+                .map_err(|e| DispatchError::Hip(format!("qwen2 L{}: qkv proj: {e}", self.l)))
             }
             q2_op::PROJ_GATE_UP => {
                 // Hand-path: ffn norm + gate/up projection via execute_steps.
                 let ffn_rot = dtype_rotation_plan(self.layer.w_gate.gpu_dtype);
                 let wrg = self.layer.w_gate.dispatch_ref();
                 let wru = self.layer.w_up.dispatch_ref();
-                execute_steps(gpu, ctx, &[
-                    Step::RmsnormAutomatic {
-                        x: &self.state.x, norm_weight: &self.layer.ffn_norm,
-                        x_plain: &self.state.tmp, out: &self.state.x_rot,
-                        awq_scale: self.layer.w_gate.awq_scale.as_ref(),
-                        k: self.layer.w_gate.k, eps: self.cfg.rms_norm_eps, rotation: ffn_rot,
-                    },
-                    Step::Gemv { w: &wrg, input: GemvInput::Prerotated(&self.state.x_rot), out: &self.state.gate },
-                    Step::Gemv { w: &wru, input: GemvInput::Prerotated(&self.state.x_rot), out: &self.state.up },
-                ]).map_err(|e| DispatchError::Hip(format!("qwen2 L{}: gate_up proj: {e}", self.l)))
+                execute_steps(
+                    gpu,
+                    ctx,
+                    &[
+                        Step::RmsnormAutomatic {
+                            x: &self.state.x,
+                            norm_weight: &self.layer.ffn_norm,
+                            x_plain: &self.state.tmp,
+                            out: &self.state.x_rot,
+                            awq_scale: self.layer.w_gate.awq_scale.as_ref(),
+                            k: self.layer.w_gate.k,
+                            eps: self.cfg.rms_norm_eps,
+                            rotation: ffn_rot,
+                        },
+                        Step::Gemv {
+                            w: &wrg,
+                            input: GemvInput::Prerotated(&self.state.x_rot),
+                            out: &self.state.gate,
+                        },
+                        Step::Gemv {
+                            w: &wru,
+                            input: GemvInput::Prerotated(&self.state.x_rot),
+                            out: &self.state.up,
+                        },
+                    ],
+                )
+                .map_err(|e| DispatchError::Hip(format!("qwen2 L{}: gate_up proj: {e}", self.l)))
             }
-            c => Err(DispatchError::Hip(format!("qwen2: run_proj bad opcode {c}"))),
+            c => Err(DispatchError::Hip(format!(
+                "qwen2: run_proj bad opcode {c}"
+            ))),
         }
     }
 
-    fn run_attend(&mut self, gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
+    fn run_attend(
+        &mut self,
+        gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
         let l = self.l;
         let n_heads = self.cfg.num_attention_heads;
         let n_kv_heads = self.cfg.num_key_value_heads;
@@ -1512,87 +1989,183 @@ impl<'a> ForwardBindings for Qwen2Bindings<'a> {
             .map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: v bias: {e:?}")))?;
 
         // (4) RoPE
-        gpu.rope_f32(&self.state.q, &self.state.k, &self.state.pos_buf,
-                     n_heads, n_kv_heads, head_dim, self.cfg.rope_theta)
-            .map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: rope: {e:?}")))?;
+        gpu.rope_f32(
+            &self.state.q,
+            &self.state.k,
+            &self.state.pos_buf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            self.cfg.rope_theta,
+        )
+        .map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: rope: {e:?}")))?;
 
         // (5) KV write
-        gpu.kv_cache_write(&self.state.k_cache[l], &self.state.k, &self.state.pos_buf, kv_dim)
-            .map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: kv write k: {e:?}")))?;
-        gpu.kv_cache_write(&self.state.v_cache[l], &self.state.v, &self.state.pos_buf, kv_dim)
-            .map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: kv write v: {e:?}")))?;
+        gpu.kv_cache_write(
+            &self.state.k_cache[l],
+            &self.state.k,
+            &self.state.pos_buf,
+            kv_dim,
+        )
+        .map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: kv write k: {e:?}")))?;
+        gpu.kv_cache_write(
+            &self.state.v_cache[l],
+            &self.state.v,
+            &self.state.pos_buf,
+            kv_dim,
+        )
+        .map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: kv write v: {e:?}")))?;
 
         // (6) Attention — 4-way select (exact hand-path mirror)
-        let use_fused = std::env::var("HIPFIRE_GQA_FUSED").map(|v| v == "1").unwrap_or(false);
+        let use_fused = std::env::var("HIPFIRE_GQA_FUSED")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         if use_fused && n_kv_heads < n_heads {
             gpu.attention_flash_gqa_fused(
-                &self.state.q, &self.state.k_cache[l], &self.state.v_cache[l],
+                &self.state.q,
+                &self.state.k_cache[l],
+                &self.state.v_cache[l],
                 &self.state.attn_out,
-                self.seq_len, n_heads, n_kv_heads, head_dim, self.state.max_seq,
+                self.seq_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                self.state.max_seq,
             )
         } else if n_kv_heads < n_heads && head_dim == 128 && self.seq_len >= 4096 {
             gpu.attention_gqa_warp(
-                &self.state.q, &self.state.k_cache[l], &self.state.v_cache[l],
-                &self.state.attn_out, &self.state.attn_partials,
-                self.seq_len, n_heads, n_kv_heads, head_dim, self.state.max_seq,
+                &self.state.q,
+                &self.state.k_cache[l],
+                &self.state.v_cache[l],
+                &self.state.attn_out,
+                &self.state.attn_partials,
+                self.seq_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                self.state.max_seq,
             )
         } else if n_kv_heads < n_heads && self.seq_len >= 4096 {
-            Gpu::attention_flash_gqa(gpu,
-                &self.state.q, &self.state.k_cache[l], &self.state.v_cache[l],
-                &self.state.attn_out, &self.state.attn_partials,
-                self.seq_len, n_heads, n_kv_heads, head_dim, self.state.max_seq,
+            Gpu::attention_flash_gqa(
+                gpu,
+                &self.state.q,
+                &self.state.k_cache[l],
+                &self.state.v_cache[l],
+                &self.state.attn_out,
+                &self.state.attn_partials,
+                self.seq_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                self.state.max_seq,
             )
         } else {
-            Gpu::attention_flash(gpu,
-                &self.state.q, &self.state.k_cache[l], &self.state.v_cache[l],
-                &self.state.attn_out, &self.state.attn_partials,
-                self.seq_len, n_heads, n_kv_heads, head_dim, self.state.max_seq,
+            Gpu::attention_flash(
+                gpu,
+                &self.state.q,
+                &self.state.k_cache[l],
+                &self.state.v_cache[l],
+                &self.state.attn_out,
+                &self.state.attn_partials,
+                self.seq_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                self.state.max_seq,
             )
-        }.map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: attention: {e:?}")))?;
+        }
+        .map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: attention: {e:?}")))?;
 
         Ok(())
     }
 
-    fn run_residual_gemv(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError> {
+    fn run_residual_gemv(
+        &mut self,
+        gpu: &mut Gpu,
+        ctx: &DispatchCtx,
+        op: &OpBinding,
+    ) -> Result<(), DispatchError> {
         match op_code(op) {
             q2_op::RESID_WO => {
                 let wro = self.layer.wo.dispatch_ref();
-                execute_steps(gpu, ctx, &[
-                    Step::GemvResidual {
-                        w: &wro, input: GemvInput::Raw(&self.state.attn_out),
-                        residual: &self.state.x, out: &self.state.o,
-                    },
-                ]).map_err(|e| DispatchError::Hip(format!("qwen2 L{}: wo: {e}", self.l)))
+                execute_steps(
+                    gpu,
+                    ctx,
+                    &[Step::GemvResidual {
+                        w: &wro,
+                        input: GemvInput::Raw(&self.state.attn_out),
+                        residual: &self.state.x,
+                        out: &self.state.o,
+                    }],
+                )
+                .map_err(|e| DispatchError::Hip(format!("qwen2 L{}: wo: {e}", self.l)))
             }
             q2_op::RESID_DOWN => {
                 // silu_mul + w_down residual (always paired in qwen2).
                 gpu.silu_mul_f32(&self.state.gate, &self.state.up, &self.state.ffn_hidden)
-                    .map_err(|e| DispatchError::Hip(format!("qwen2 L{}: silu_mul: {e:?}", self.l)))?;
+                    .map_err(|e| {
+                        DispatchError::Hip(format!("qwen2 L{}: silu_mul: {e:?}", self.l))
+                    })?;
                 let wrd = self.layer.w_down.dispatch_ref();
-                execute_steps(gpu, ctx, &[
-                    Step::GemvResidual {
-                        w: &wrd, input: GemvInput::Raw(&self.state.ffn_hidden),
-                        residual: &self.state.x, out: &self.state.ffn_out,
-                    },
-                ]).map_err(|e| DispatchError::Hip(format!("qwen2 L{}: down: {e}", self.l)))
+                execute_steps(
+                    gpu,
+                    ctx,
+                    &[Step::GemvResidual {
+                        w: &wrd,
+                        input: GemvInput::Raw(&self.state.ffn_hidden),
+                        residual: &self.state.x,
+                        out: &self.state.ffn_out,
+                    }],
+                )
+                .map_err(|e| DispatchError::Hip(format!("qwen2 L{}: down: {e}", self.l)))
             }
-            c => Err(DispatchError::Hip(format!("qwen2: run_residual_gemv bad opcode {c}"))),
+            c => Err(DispatchError::Hip(format!(
+                "qwen2: run_residual_gemv bad opcode {c}"
+            ))),
         }
     }
 
-    fn run_norm(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
-        Err(DispatchError::Hip("qwen2 has no standalone Norm super-op".into()))
+    fn run_norm(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::Hip(
+            "qwen2 has no standalone Norm super-op".into(),
+        ))
     }
-    fn run_moe(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
+    fn run_moe(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
         Err(DispatchError::Hip("qwen2 has no MoE".into()))
     }
-    fn run_recurrent(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
+    fn run_recurrent(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
         Err(DispatchError::Hip("qwen2 has no Recurrent super-op".into()))
     }
-    fn run_conv(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
+    fn run_conv(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
         Err(DispatchError::Hip("qwen2 has no Conv super-op".into()))
     }
-    fn run_escape(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding, _kind: EscapeKind) -> Result<(), DispatchError> {
+    fn run_escape(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+        _kind: EscapeKind,
+    ) -> Result<(), DispatchError> {
         Err(DispatchError::Hip("qwen2 has no Escape super-op".into()))
     }
 }
@@ -1625,16 +2198,29 @@ fn forward_step_after_x_lowered(
     let ctx = DispatchCtx::new(gpu);
     let program = qwen2_lower_program();
     for (l, layer) in weights.layers.iter().enumerate() {
-        let mut bind = Qwen2Bindings { cfg, layer, state, l, seq_len: pos + 1 };
+        let mut bind = Qwen2Bindings {
+            cfg,
+            layer,
+            state,
+            l,
+            seq_len: pos + 1,
+        };
         superop::run_layer_program(gpu, &ctx, &program, &mut bind)
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
     }
     // Final RMSNorm + lm_head (outside layer loop).
     gpu.rmsnorm_f32(&state.x, &weights.output_norm, &state.tmp, cfg.rms_norm_eps)?;
     let wr_out = weights.output.dispatch_ref();
-    execute_steps(gpu, &ctx, &[
-        Step::Gemv { w: &wr_out, input: GemvInput::Raw(&state.tmp), out: &state.logits },
-    ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+    execute_steps(
+        gpu,
+        &ctx,
+        &[Step::Gemv {
+            w: &wr_out,
+            input: GemvInput::Raw(&state.tmp),
+            out: &state.logits,
+        }],
+    )
+    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
     state.next_pos = pos + 1;
     Ok(())
 }
@@ -1812,8 +2398,7 @@ mod tests {
                 "pad_token_id": 151643
             }
         }"#;
-        let cfg = config_from_metadata_json(json)
-            .expect("config + generation_config should parse");
+        let cfg = config_from_metadata_json(json).expect("config + generation_config should parse");
         assert_eq!(cfg.eos_token_id, 151643);
         assert_eq!(cfg.eos_token_ids, vec![151643, 151673]);
     }

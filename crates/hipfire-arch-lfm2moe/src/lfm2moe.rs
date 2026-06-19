@@ -666,7 +666,13 @@ pub fn load_weights_from_source(
     let embedding_norm =
         load_f32_from_source(source, gpu, "model.embedding_norm.weight", &[hidden])?;
     // lm_head: tied → reuse embed_tokens.weight as a Q8 weight tensor.
-    let lm_head = load_wt_from_source(source, gpu, "model.embed_tokens.weight", cfg.vocab_size, hidden)?;
+    let lm_head = load_wt_from_source(
+        source,
+        gpu,
+        "model.embed_tokens.weight",
+        cfg.vocab_size,
+        hidden,
+    )?;
 
     let mut conv_state_count = 0usize;
     let mut kv_count = 0usize;
@@ -798,8 +804,12 @@ pub fn load_weights_from_source(
                 n_exp,
                 hidden,
             )?;
-            let expert_bias =
-                load_f32_from_source(source, gpu, &format!("{p}.feed_forward.expert_bias"), &[n_exp])?;
+            let expert_bias = load_f32_from_source(
+                source,
+                gpu,
+                &format!("{p}.feed_forward.expert_bias"),
+                &[n_exp],
+            )?;
             // Byte-fuse w1‖w3 → gate_up [2*moe_inter, hidden]; w2 → down.
             let mut experts = Vec::with_capacity(n_exp);
             for e in 0..n_exp {

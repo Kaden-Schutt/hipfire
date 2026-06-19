@@ -24,10 +24,10 @@
 use base64::Engine;
 use hip_bridge::HipResult;
 use hipfire_arch_deepseek4 as deepseek4;
-use hipfire_arch_lfm2moe as lfm2moe;
-use hipfire_arch_minimax as minimax;
 use hipfire_arch_dots_ocr::dots_ocr;
+use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_llama::Llama;
+use hipfire_arch_minimax as minimax;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::{DeltaNetState, LayerType, Qwen35ScratchSet};
@@ -119,9 +119,9 @@ fn think_continuation() -> String {
 /// force-close / budget-alert site so they stay consistent.
 fn currently_in_think(raw_str: &str, started_in_think: bool) -> bool {
     match (raw_str.rfind("<think>"), raw_str.rfind("</think>")) {
-        (Some(o), Some(c)) => o > c,      // both present: in-think iff opener is latest
-        (Some(_), None) => true,          // generated opener, not yet closed
-        (None, Some(_)) => false,         // closed (e.g. a prompt-injected opener) → answering
+        (Some(o), Some(c)) => o > c, // both present: in-think iff opener is latest
+        (Some(_), None) => true,     // generated opener, not yet closed
+        (None, Some(_)) => false,    // closed (e.g. a prompt-injected opener) → answering
         (None, None) => started_in_think, // no tags generated yet → trust the prompt prefix
     }
 }
@@ -2314,15 +2314,26 @@ fn main() {
                     .and_then(|v| v.as_str())
                     .map(ThinkMode::from_str)
                     .unwrap_or(ThinkMode::NonThink);
-                let repeat_window = msg.get("repeat_window").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
+                let repeat_window = msg
+                    .get("repeat_window")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(128) as usize;
                 // OpenAI subtractive penalties. The CLI forwards raw
                 // `presence_penalty`/`frequency_penalty` (0.0 = off). Unlike the
                 // recency-weighted multiplicative `repeat_penalty`, these are
                 // flat across the (now long) window, which is what breaks the
                 // block-level repetition loops on long reasoning generations.
                 // Clamp negatives to 0 (negative would REWARD repetition).
-                let presence_penalty = (msg.get("presence_penalty").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32).max(0.0);
-                let frequency_penalty = (msg.get("frequency_penalty").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32).max(0.0);
+                let presence_penalty = (msg
+                    .get("presence_penalty")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32)
+                    .max(0.0);
+                let frequency_penalty = (msg
+                    .get("frequency_penalty")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32)
+                    .max(0.0);
                 // Experimental: inject a nudge string at a specific generated-
                 // token count. The nudge tokens get forward-fed through the KV
                 // cache so the model "sees" them as part of its own trajectory,
@@ -2582,10 +2593,23 @@ fn main() {
                         continue;
                     }
                     generate(
-                        m, &mut gpu, pflash_drafter_gpu.as_mut(), &mut stdout, id, prompt, system,
-                        temp, top_p, max_tokens, repeat_penalty, repeat_window,
-                        presence_penalty, frequency_penalty,
-                        budget_alert_at_tok, &budget_alert_text, max_think_tokens,
+                        m,
+                        &mut gpu,
+                        pflash_drafter_gpu.as_mut(),
+                        &mut stdout,
+                        id,
+                        prompt,
+                        system,
+                        temp,
+                        top_p,
+                        max_tokens,
+                        repeat_penalty,
+                        repeat_window,
+                        presence_penalty,
+                        frequency_penalty,
+                        budget_alert_at_tok,
+                        &budget_alert_text,
+                        max_think_tokens,
                         assistant_prefix,
                         pflash_state.as_mut(),
                         pf_cfg_owned.as_ref(),
@@ -3849,11 +3873,9 @@ fn load_model(
                 .to_string());
         }
         if cask.sidecar.is_some() {
-            return Err(
-                "CASK eviction not supported on arch_id=11 (LFM2.5-MoE). \
+            return Err("CASK eviction not supported on arch_id=11 (LFM2.5-MoE). \
                        Reload without --cask-sidecar."
-                    .to_string(),
-            );
+                .to_string());
         }
         let _ = kv_mode;
         let _ = state_quant_override;
@@ -3949,16 +3971,13 @@ fn load_model(
                 .to_string());
         }
         if cask.sidecar.is_some() {
-            return Err(
-                "CASK eviction not supported on arch_id=10 (MiniMax-M2). \
+            return Err("CASK eviction not supported on arch_id=10 (MiniMax-M2). \
                        Reload without --cask-sidecar."
-                    .to_string(),
-            );
+                .to_string());
         }
         if pp > 1 {
             return Err(
-                "pipeline-parallel (pp>1) not supported on arch_id=10 (MiniMax-M2)."
-                    .to_string(),
+                "pipeline-parallel (pp>1) not supported on arch_id=10 (MiniMax-M2).".to_string(),
             );
         }
         let _ = kv_mode;
@@ -4345,7 +4364,8 @@ fn load_model(
         // a block-level repetition loop (~150 tok on Qwen3.6-A3B long reasoning),
         // so the anti-repeat machinery literally could not see a full loop to
         // suppress it. 2048 spans the loop period. Buffer is [2048] F32 = 8 KB.
-        let scratch = qwen35::Qwen35Scratch::new_with_kv_max(gpu, &config, 2048, physical_cap).map_err(|e| format!("{e}"))?;
+        let scratch = qwen35::Qwen35Scratch::new_with_kv_max(gpu, &config, 2048, physical_cap)
+            .map_err(|e| format!("{e}"))?;
 
         // Build eviction policy if the operator supplied a sidecar. Qwen3 (arch_id < 5)
         // lacks the FA/LA hybrid wiring TriAttention needs, so sidecars only take
@@ -4745,7 +4765,12 @@ fn load_model_safetensors(
         });
     }
 
-    if arch_id != 5 && arch_id != 6 && arch_id != 8 && arch_id != 9 && arch_id != 10 && arch_id != 11
+    if arch_id != 5
+        && arch_id != 6
+        && arch_id != 8
+        && arch_id != 9
+        && arch_id != 10
+        && arch_id != 11
     {
         return Err(format!(
             "safetensors loading only supports LLaMA/Qwen3 (arch_id 0/1), \
@@ -4755,143 +4780,143 @@ fn load_model_safetensors(
     }
 
     if arch_id == 5 || arch_id == 6 {
-    // Parse config (reuse Qwen35's config parser via metadata_json)
-    let config = qwen35::config_from_safetensors(&source)
-        .ok_or("failed to parse Qwen3.5 config from config.json")?;
+        // Parse config (reuse Qwen35's config parser via metadata_json)
+        let config = qwen35::config_from_safetensors(&source)
+            .ok_or("failed to parse Qwen3.5 config from config.json")?;
 
-    eprintln!(
-        "  Qwen3.5/3.6: dim={}, layers={}, heads={}",
-        config.dim, config.n_layers, config.n_heads
-    );
+        eprintln!(
+            "  Qwen3.5/3.6: dim={}, layers={}, heads={}",
+            config.dim, config.n_layers, config.n_heads
+        );
 
-    // Load weights via ParoQuant path
-    let weights = qwen35::load_weights_paroquant(&source, &config, gpu)
-        .map_err(|e| format!("load_weights_paroquant: {e:?}"))?;
+        // Load weights via ParoQuant path
+        let weights = qwen35::load_weights_paroquant(&source, &config, gpu)
+            .map_err(|e| format!("load_weights_paroquant: {e:?}"))?;
 
-    // KV cache: filtered to FullAttention layers (hybrid Qwen3.5/3.6), mirroring
-    // the HFQ single-GPU path so AWQ/safetensors models also get the ~75% cut and
-    // honor the fwht* default. physical_cap == max_seq (no CASK on this path).
-    let effective_max_seq = max_seq;
-    let is_kv_layer: Vec<bool> = config
-        .layer_types
-        .iter()
-        .map(|t| *t == LayerType::FullAttention)
-        .collect();
-    let kv_cache = match kv_mode {
-        "q8" => llama::KvCache::new_gpu_q8_capped_filtered(
-            gpu,
-            &is_kv_layer,
-            config.n_kv_heads,
-            config.head_dim,
-            max_seq,
-            max_seq,
-        ),
-        "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_filtered(
-            gpu,
-            &is_kv_layer,
-            config.n_kv_heads,
-            config.head_dim,
-            max_seq,
-        ),
-        "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2_filtered(
-            gpu,
-            &is_kv_layer,
-            config.n_kv_heads,
-            config.head_dim,
-            max_seq,
-        ),
-        "fwht4" => llama::KvCache::new_gpu_fwht4_filtered(
-            gpu,
-            &is_kv_layer,
-            config.n_kv_heads,
-            config.head_dim,
-            max_seq,
-        ),
-        "fwht3" => llama::KvCache::new_gpu_fwht3_capped_filtered(
-            gpu,
-            &is_kv_layer,
-            config.n_kv_heads,
-            config.head_dim,
-            max_seq,
-            max_seq,
-        ),
-        "fwht2" => llama::KvCache::new_gpu_fwht2_capped_filtered(
-            gpu,
-            &is_kv_layer,
-            config.n_kv_heads,
-            config.head_dim,
-            max_seq,
-            max_seq,
-        ),
-        _ => llama::KvCache::new_gpu_asym3_capped_filtered(
-            gpu,
-            &is_kv_layer,
-            config.n_kv_heads,
-            config.head_dim,
-            max_seq,
-            max_seq,
-        ),
-    }
-    .map_err(|e| format!("KvCache: {e}"))?;
-    let dn_state =
-        DeltaNetState::new(gpu, &config).map_err(|e| format!("DeltaNetState::new: {e:?}"))?;
-    let scratch = qwen35::Qwen35Scratch::new(gpu, &config, 256)
-        .map_err(|e| format!("Qwen35Scratch::new: {e:?}"))?;
+        // KV cache: filtered to FullAttention layers (hybrid Qwen3.5/3.6), mirroring
+        // the HFQ single-GPU path so AWQ/safetensors models also get the ~75% cut and
+        // honor the fwht* default. physical_cap == max_seq (no CASK on this path).
+        let effective_max_seq = max_seq;
+        let is_kv_layer: Vec<bool> = config
+            .layer_types
+            .iter()
+            .map(|t| *t == LayerType::FullAttention)
+            .collect();
+        let kv_cache = match kv_mode {
+            "q8" => llama::KvCache::new_gpu_q8_capped_filtered(
+                gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                max_seq,
+                max_seq,
+            ),
+            "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_filtered(
+                gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                max_seq,
+            ),
+            "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2_filtered(
+                gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                max_seq,
+            ),
+            "fwht4" => llama::KvCache::new_gpu_fwht4_filtered(
+                gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                max_seq,
+            ),
+            "fwht3" => llama::KvCache::new_gpu_fwht3_capped_filtered(
+                gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                max_seq,
+                max_seq,
+            ),
+            "fwht2" => llama::KvCache::new_gpu_fwht2_capped_filtered(
+                gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                max_seq,
+                max_seq,
+            ),
+            _ => llama::KvCache::new_gpu_asym3_capped_filtered(
+                gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                max_seq,
+                max_seq,
+            ),
+        }
+        .map_err(|e| format!("KvCache: {e}"))?;
+        let dn_state =
+            DeltaNetState::new(gpu, &config).map_err(|e| format!("DeltaNetState::new: {e:?}"))?;
+        let scratch = qwen35::Qwen35Scratch::new(gpu, &config, 256)
+            .map_err(|e| format!("Qwen35Scratch::new: {e:?}"))?;
 
-    Ok(LoadedModel {
-        arch_id,
-        pp: 1,
-        ep: None,
-        pp_gpus: None,
-        pp_scratch_set: None,
-        pp_dn_la_to_device: None,
-        q35_config: Some(config),
-        q35_weights: Some(weights),
-        q35_scratch: Some(scratch),
-        qwen2_config: None,
-        qwen2_weights: None,
-        qwen2_state: None,
-        dots_ocr_config: None,
-        dots_ocr_weights: None,
-        kv_cache: Some(kv_cache),
-        dn_state: Some(dn_state),
-        llama_config: None,
-        llama_weights: None,
-        llama_scratch: None,
-        llama_kv: None,
-        deepseek4_config: None,
-        deepseek4_weights: None,
-        deepseek4_state: None,
-        deepseek4_pbs: None,
-        deepseek4_eos_tok: 0,
-        lfm2moe_config: None,
-        lfm2moe_weights: None,
-        lfm2moe_state: None,
-        lfm2moe_eos_tok: 0,
-        minimax_config: None,
-        minimax_weights: None,
-        minimax_state: None,
-        minimax_eos_tok: 0,
-        mtp_mode: "auto".to_string(),
-        mtp_k: 3,
-        mtp_weights_present: false,
-        vision_config: None,
-        vision_weights: None,
-        tokenizer: Some(tokenizer),
-        seq_pos: 0,
-        max_seq: effective_max_seq,
-        physical_cap: effective_max_seq,
-        eviction: None,
-        kv_adaptive: None,
-        conversation_tokens: Vec::new(),
-        asst_turn_cache: AsstTurnCache::new_from_env(),
-        prefill_checkpoints: Vec::new(),
-        dflash_checkpoints: Vec::new(),
-        decoded_vocab: None,
-        model_path: path.to_string(),
-        dflash: None,
-        chat_template,
-    })
+        Ok(LoadedModel {
+            arch_id,
+            pp: 1,
+            ep: None,
+            pp_gpus: None,
+            pp_scratch_set: None,
+            pp_dn_la_to_device: None,
+            q35_config: Some(config),
+            q35_weights: Some(weights),
+            q35_scratch: Some(scratch),
+            qwen2_config: None,
+            qwen2_weights: None,
+            qwen2_state: None,
+            dots_ocr_config: None,
+            dots_ocr_weights: None,
+            kv_cache: Some(kv_cache),
+            dn_state: Some(dn_state),
+            llama_config: None,
+            llama_weights: None,
+            llama_scratch: None,
+            llama_kv: None,
+            deepseek4_config: None,
+            deepseek4_weights: None,
+            deepseek4_state: None,
+            deepseek4_pbs: None,
+            deepseek4_eos_tok: 0,
+            lfm2moe_config: None,
+            lfm2moe_weights: None,
+            lfm2moe_state: None,
+            lfm2moe_eos_tok: 0,
+            minimax_config: None,
+            minimax_weights: None,
+            minimax_state: None,
+            minimax_eos_tok: 0,
+            mtp_mode: "auto".to_string(),
+            mtp_k: 3,
+            mtp_weights_present: false,
+            vision_config: None,
+            vision_weights: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0,
+            max_seq: effective_max_seq,
+            physical_cap: effective_max_seq,
+            eviction: None,
+            kv_adaptive: None,
+            conversation_tokens: Vec::new(),
+            asst_turn_cache: AsstTurnCache::new_from_env(),
+            prefill_checkpoints: Vec::new(),
+            dflash_checkpoints: Vec::new(),
+            decoded_vocab: None,
+            model_path: path.to_string(),
+            dflash: None,
+            chat_template,
+        })
     } else if arch_id == 8 {
         let config = dots_ocr::DotsOcrConfig::from_source(&source)?;
         let weights = dots_ocr::DotsOcrWeights::load_weights_from_source(&source, &config, gpu)
@@ -4899,28 +4924,57 @@ fn load_model_safetensors(
         let state = qwen2::Qwen2State::new_with_max_seq(gpu, &config.text, max_seq)
             .map_err(|e| format!("dots_ocr Qwen2State: {e:?}"))?;
         return Ok(LoadedModel {
-            arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None,
+            arch_id,
+            pp: 1,
+            ep: None,
+            pp_gpus: None,
+            pp_scratch_set: None,
             pp_dn_la_to_device: None,
-            q35_config: None, q35_weights: None, q35_scratch: None,
-            kv_cache: None, dn_state: None,
-            llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
-            qwen2_config: None, qwen2_weights: None, qwen2_state: Some(state),
-            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None,
-            deepseek4_pbs: None, deepseek4_eos_tok: 0,
-            lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None,
+            q35_config: None,
+            q35_weights: None,
+            q35_scratch: None,
+            kv_cache: None,
+            dn_state: None,
+            llama_config: None,
+            llama_weights: None,
+            llama_scratch: None,
+            llama_kv: None,
+            qwen2_config: None,
+            qwen2_weights: None,
+            qwen2_state: Some(state),
+            deepseek4_config: None,
+            deepseek4_weights: None,
+            deepseek4_state: None,
+            deepseek4_pbs: None,
+            deepseek4_eos_tok: 0,
+            lfm2moe_config: None,
+            lfm2moe_weights: None,
+            lfm2moe_state: None,
             lfm2moe_eos_tok: 0,
-            minimax_config: None, minimax_weights: None, minimax_state: None,
+            minimax_config: None,
+            minimax_weights: None,
+            minimax_state: None,
             minimax_eos_tok: 0,
-            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
-            dots_ocr_config: Some(config), dots_ocr_weights: Some(weights),
-            vision_config: None, vision_weights: None,
+            mtp_mode: "auto".to_string(),
+            mtp_k: 3,
+            mtp_weights_present: false,
+            dots_ocr_config: Some(config),
+            dots_ocr_weights: Some(weights),
+            vision_config: None,
+            vision_weights: None,
             tokenizer: Some(tokenizer),
-            seq_pos: 0, max_seq, physical_cap: max_seq,
-            eviction: None, kv_adaptive: None,
+            seq_pos: 0,
+            max_seq,
+            physical_cap: max_seq,
+            eviction: None,
+            kv_adaptive: None,
             conversation_tokens: Vec::new(),
             asst_turn_cache: AsstTurnCache::new_from_env(),
-            prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(),
-            decoded_vocab: None, model_path: path.to_string(), dflash: None,
+            prefill_checkpoints: Vec::new(),
+            dflash_checkpoints: Vec::new(),
+            decoded_vocab: None,
+            model_path: path.to_string(),
+            dflash: None,
             chat_template,
         });
     } else if arch_id == 9 {
@@ -4931,105 +4985,197 @@ fn load_model_safetensors(
         let state = deepseek4::DeepseekV4State::new(&config)
             .map_err(|e| format!("deepseek4 state: {e:?}"))?;
         let eos_tok: u32 = tokenizer
-            .encode("</s>").first().copied()
+            .encode("</s>")
+            .first()
+            .copied()
             .or_else(|| tokenizer.encode("<|endoftext|>").first().copied())
             .unwrap_or(1);
         return Ok(LoadedModel {
-            arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None,
+            arch_id,
+            pp: 1,
+            ep: None,
+            pp_gpus: None,
+            pp_scratch_set: None,
             pp_dn_la_to_device: None,
-            q35_config: None, q35_weights: None, q35_scratch: None,
-            kv_cache: None, dn_state: None,
-            llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
-            qwen2_config: None, qwen2_weights: None, qwen2_state: None,
-            deepseek4_config: Some(config), deepseek4_weights: Some(weights),
-            deepseek4_state: Some(state), deepseek4_pbs: None,
+            q35_config: None,
+            q35_weights: None,
+            q35_scratch: None,
+            kv_cache: None,
+            dn_state: None,
+            llama_config: None,
+            llama_weights: None,
+            llama_scratch: None,
+            llama_kv: None,
+            qwen2_config: None,
+            qwen2_weights: None,
+            qwen2_state: None,
+            deepseek4_config: Some(config),
+            deepseek4_weights: Some(weights),
+            deepseek4_state: Some(state),
+            deepseek4_pbs: None,
             deepseek4_eos_tok: eos_tok,
-            lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None,
+            lfm2moe_config: None,
+            lfm2moe_weights: None,
+            lfm2moe_state: None,
             lfm2moe_eos_tok: 0,
-            minimax_config: None, minimax_weights: None, minimax_state: None,
+            minimax_config: None,
+            minimax_weights: None,
+            minimax_state: None,
             minimax_eos_tok: 0,
-            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
-            dots_ocr_config: None, dots_ocr_weights: None,
-            vision_config: None, vision_weights: None,
+            mtp_mode: "auto".to_string(),
+            mtp_k: 3,
+            mtp_weights_present: false,
+            dots_ocr_config: None,
+            dots_ocr_weights: None,
+            vision_config: None,
+            vision_weights: None,
             tokenizer: Some(tokenizer),
-            seq_pos: 0, max_seq, physical_cap: max_seq,
-            eviction: None, kv_adaptive: None,
+            seq_pos: 0,
+            max_seq,
+            physical_cap: max_seq,
+            eviction: None,
+            kv_adaptive: None,
             conversation_tokens: Vec::new(),
             asst_turn_cache: AsstTurnCache::new_from_env(),
-            prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(),
-            decoded_vocab: None, model_path: path.to_string(), dflash: None,
+            prefill_checkpoints: Vec::new(),
+            dflash_checkpoints: Vec::new(),
+            decoded_vocab: None,
+            model_path: path.to_string(),
+            dflash: None,
             chat_template,
         });
     } else if arch_id == 10 {
-        let config = minimax::config_from_safetensors(&source)
-            .ok_or("failed to parse minimax config")?;
+        let config =
+            minimax::config_from_safetensors(&source).ok_or("failed to parse minimax config")?;
         let weights = minimax::load_weights_from_safetensors(&source, &config, gpu)
             .map_err(|e| format!("minimax load_weights: {e:?}"))?;
         let state = minimax::MiniMaxState::new_with_max_seq(gpu, &config, max_seq)
             .map_err(|e| format!("minimax state: {e:?}"))?;
         let eos_tok: u32 = tokenizer
-            .encode("[e~[").first().copied()
+            .encode("[e~[")
+            .first()
+            .copied()
             .or_else(|| tokenizer.encode("</s>").first().copied())
             .unwrap_or(1);
         return Ok(LoadedModel {
-            arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None,
+            arch_id,
+            pp: 1,
+            ep: None,
+            pp_gpus: None,
+            pp_scratch_set: None,
             pp_dn_la_to_device: None,
-            q35_config: None, q35_weights: None, q35_scratch: None,
-            kv_cache: None, dn_state: None,
-            llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
-            qwen2_config: None, qwen2_weights: None, qwen2_state: None,
-            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None,
-            deepseek4_pbs: None, deepseek4_eos_tok: 0,
-            lfm2moe_config: None, lfm2moe_weights: None, lfm2moe_state: None,
+            q35_config: None,
+            q35_weights: None,
+            q35_scratch: None,
+            kv_cache: None,
+            dn_state: None,
+            llama_config: None,
+            llama_weights: None,
+            llama_scratch: None,
+            llama_kv: None,
+            qwen2_config: None,
+            qwen2_weights: None,
+            qwen2_state: None,
+            deepseek4_config: None,
+            deepseek4_weights: None,
+            deepseek4_state: None,
+            deepseek4_pbs: None,
+            deepseek4_eos_tok: 0,
+            lfm2moe_config: None,
+            lfm2moe_weights: None,
+            lfm2moe_state: None,
             lfm2moe_eos_tok: 0,
-            minimax_config: Some(config), minimax_weights: Some(weights),
-            minimax_state: Some(state), minimax_eos_tok: eos_tok,
-            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
-            dots_ocr_config: None, dots_ocr_weights: None,
-            vision_config: None, vision_weights: None,
+            minimax_config: Some(config),
+            minimax_weights: Some(weights),
+            minimax_state: Some(state),
+            minimax_eos_tok: eos_tok,
+            mtp_mode: "auto".to_string(),
+            mtp_k: 3,
+            mtp_weights_present: false,
+            dots_ocr_config: None,
+            dots_ocr_weights: None,
+            vision_config: None,
+            vision_weights: None,
             tokenizer: Some(tokenizer),
-            seq_pos: 0, max_seq, physical_cap: max_seq,
-            eviction: None, kv_adaptive: None,
+            seq_pos: 0,
+            max_seq,
+            physical_cap: max_seq,
+            eviction: None,
+            kv_adaptive: None,
             conversation_tokens: Vec::new(),
             asst_turn_cache: AsstTurnCache::new_from_env(),
-            prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(),
-            decoded_vocab: None, model_path: path.to_string(), dflash: None,
+            prefill_checkpoints: Vec::new(),
+            dflash_checkpoints: Vec::new(),
+            decoded_vocab: None,
+            model_path: path.to_string(),
+            dflash: None,
             chat_template,
         });
     } else if arch_id == 11 {
-        let config = lfm2moe::config_from_source(&source)
-            .ok_or("failed to parse lfm2moe config")?;
+        let config =
+            lfm2moe::config_from_source(&source).ok_or("failed to parse lfm2moe config")?;
         let weights = lfm2moe::load_weights_from_source(&source, &config, gpu)
             .map_err(|e| format!("lfm2moe load_weights: {e:?}"))?;
         let state = lfm2moe::Lfm2MoeState::new_with_max_seq(gpu, &config, max_seq)
             .map_err(|e| format!("lfm2moe state: {e:?}"))?;
         let eos_tok: u32 = tokenizer
-            .encode("</s>").first().copied()
+            .encode("</s>")
+            .first()
+            .copied()
             .or_else(|| tokenizer.encode("<|endoftext|>").first().copied())
             .unwrap_or(1);
         return Ok(LoadedModel {
-            arch_id, pp: 1, ep: None, pp_gpus: None, pp_scratch_set: None,
+            arch_id,
+            pp: 1,
+            ep: None,
+            pp_gpus: None,
+            pp_scratch_set: None,
             pp_dn_la_to_device: None,
-            q35_config: None, q35_weights: None, q35_scratch: None,
-            kv_cache: None, dn_state: None,
-            llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
-            qwen2_config: None, qwen2_weights: None, qwen2_state: None,
-            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None,
-            deepseek4_pbs: None, deepseek4_eos_tok: 0,
-            lfm2moe_config: Some(config), lfm2moe_weights: Some(weights),
-            lfm2moe_state: Some(state), lfm2moe_eos_tok: eos_tok,
-            minimax_config: None, minimax_weights: None, minimax_state: None,
+            q35_config: None,
+            q35_weights: None,
+            q35_scratch: None,
+            kv_cache: None,
+            dn_state: None,
+            llama_config: None,
+            llama_weights: None,
+            llama_scratch: None,
+            llama_kv: None,
+            qwen2_config: None,
+            qwen2_weights: None,
+            qwen2_state: None,
+            deepseek4_config: None,
+            deepseek4_weights: None,
+            deepseek4_state: None,
+            deepseek4_pbs: None,
+            deepseek4_eos_tok: 0,
+            lfm2moe_config: Some(config),
+            lfm2moe_weights: Some(weights),
+            lfm2moe_state: Some(state),
+            lfm2moe_eos_tok: eos_tok,
+            minimax_config: None,
+            minimax_weights: None,
+            minimax_state: None,
             minimax_eos_tok: 0,
-            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
-            dots_ocr_config: None, dots_ocr_weights: None,
-            vision_config: None, vision_weights: None,
+            mtp_mode: "auto".to_string(),
+            mtp_k: 3,
+            mtp_weights_present: false,
+            dots_ocr_config: None,
+            dots_ocr_weights: None,
+            vision_config: None,
+            vision_weights: None,
             tokenizer: Some(tokenizer),
-            seq_pos: 0, max_seq, physical_cap: max_seq,
-            eviction: None, kv_adaptive: None,
+            seq_pos: 0,
+            max_seq,
+            physical_cap: max_seq,
+            eviction: None,
+            kv_adaptive: None,
             conversation_tokens: Vec::new(),
             asst_turn_cache: AsstTurnCache::new_from_env(),
-            prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(),
-            decoded_vocab: None, model_path: path.to_string(), dflash: None,
+            prefill_checkpoints: Vec::new(),
+            dflash_checkpoints: Vec::new(),
+            decoded_vocab: None,
+            model_path: path.to_string(),
+            dflash: None,
             chat_template,
         });
     } else {
@@ -5209,7 +5355,8 @@ fn load_model_pp(
     let (dn, la_to_device) = DeltaNetState::new_with_quant_multi(&mut gpus, &config, dn_quant)
         .map_err(|e| format!("{e}"))?;
 
-    let scratch_set = Qwen35ScratchSet::new_with_kv_max_multi(&mut gpus, &config, 2048, max_seq).map_err(|e| format!("{e}"))?;
+    let scratch_set = Qwen35ScratchSet::new_with_kv_max_multi(&mut gpus, &config, 2048, max_seq)
+        .map_err(|e| format!("{e}"))?;
 
     // ROCm 6.4.3 gotcha: enable_peer_access AFTER all allocations are live.
     // See multi_gpu.rs::enable_peer_all docstring for the silent-success bug
@@ -5371,7 +5518,8 @@ fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, S
     let config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
     let n_exp = config.n_routed_experts;
 
-    let mut gpus = Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    let mut gpus =
+        Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
     let n = gpus.devices.len();
     if n != tp {
         return Err(format!(
@@ -5379,34 +5527,58 @@ fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, S
         ));
     }
     eprintln!("[daemon] EP load: tp={tp} arch=ds4 experts={n_exp} (rank r owns e%{tp}==r)");
-    let shard = ShardConfig::new(tp, /*tp_kv_replicate=*/ true, n_exp, ExpertAssign::Stride)
-        .map_err(|e| format!("ShardConfig: {e:?}"))?;
+    let shard = ShardConfig::new(
+        tp,
+        /*tp_kv_replicate=*/ true,
+        n_exp,
+        ExpertAssign::Stride,
+    )
+    .map_err(|e| format!("ShardConfig: {e:?}"))?;
     let mut weights = Vec::with_capacity(n);
     for r in 0..n {
-        gpus.devices[r].bind_thread().map_err(|e| format!("bind {r}: {e:?}"))?;
+        gpus.devices[r]
+            .bind_thread()
+            .map_err(|e| format!("bind {r}: {e:?}"))?;
         let mut h = HfqFile::open(Path::new(path)).map_err(|e| format!("reopen rank {r}: {e}"))?;
-        let w = deepseek4::DeepseekV4::load_weights_sharded(&mut h, &config, &mut gpus.devices[r], &shard, r)
-            .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
+        let w = deepseek4::DeepseekV4::load_weights_sharded(
+            &mut h,
+            &config,
+            &mut gpus.devices[r],
+            &shard,
+            r,
+        )
+        .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
         weights.push(w);
     }
     let mut state = Vec::with_capacity(n);
     let mut partials = Vec::with_capacity(n);
     for r in 0..n {
-        gpus.devices[r].bind_thread().map_err(|e| format!("bind {r}: {e:?}"))?;
-        state.push(deepseek4::DeepseekV4State::new(&config).map_err(|e| format!("state {r}: {e:?}"))?);
+        gpus.devices[r]
+            .bind_thread()
+            .map_err(|e| format!("bind {r}: {e:?}"))?;
+        state.push(
+            deepseek4::DeepseekV4State::new(&config).map_err(|e| format!("state {r}: {e:?}"))?,
+        );
         partials.push(
             gpus.devices[r]
                 .zeros(&[config.hidden_size], rdna_compute::DType::F32)
                 .map_err(|e| format!("partial {r}: {e:?}"))?,
         );
     }
-    let peer = gpus.enable_peer_all().map_err(|e| format!("enable_peer_all: {e:?}"))?;
-    hipfire_runtime::ep::ensure_rank_streams(&mut gpus).map_err(|e| format!("ensure_rank_streams: {e:?}"))?;
+    let peer = gpus
+        .enable_peer_all()
+        .map_err(|e| format!("enable_peer_all: {e:?}"))?;
+    hipfire_runtime::ep::ensure_rank_streams(&mut gpus)
+        .map_err(|e| format!("ensure_rank_streams: {e:?}"))?;
     eprintln!("[daemon] EP load complete: {n} ranks, peer_access={peer}");
 
     let eos_tok: u32 = {
         let ids = tokenizer.encode("<｜end▁of▁sentence｜>");
-        if ids.len() == 1 { ids[0] } else { 1 }
+        if ids.len() == 1 {
+            ids[0]
+        } else {
+            1
+        }
     };
     let chat_template = resolve_chat_template(&hfq, path);
 
@@ -5415,7 +5587,12 @@ fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, S
         pp: 1,
         ep: Some(EpState {
             gpus,
-            inner: EpArch::Ds4 { config, weights, state, partials },
+            inner: EpArch::Ds4 {
+                config,
+                weights,
+                state,
+                partials,
+            },
         }),
         pp_gpus: None,
         pp_scratch_set: None,
@@ -5483,7 +5660,8 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
     let config = <minimax::MiniMaxM2 as Architecture>::config_from_hfq(&hfq)?;
     let n_exp = config.num_local_experts;
 
-    let mut gpus = Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    let mut gpus =
+        Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
     let n = gpus.devices.len();
     if n != tp {
         return Err(format!(
@@ -5491,20 +5669,30 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
         ));
     }
     eprintln!("[daemon] EP load: tp={tp} arch=minimax experts={n_exp} (rank r owns e%{tp}==r)");
-    let shard = ShardConfig::new(tp, /*tp_kv_replicate=*/ true, n_exp, ExpertAssign::Stride)
-        .map_err(|e| format!("ShardConfig: {e:?}"))?;
+    let shard = ShardConfig::new(
+        tp,
+        /*tp_kv_replicate=*/ true,
+        n_exp,
+        ExpertAssign::Stride,
+    )
+    .map_err(|e| format!("ShardConfig: {e:?}"))?;
     let mut weights = Vec::with_capacity(n);
     for r in 0..n {
-        gpus.devices[r].bind_thread().map_err(|e| format!("bind {r}: {e:?}"))?;
+        gpus.devices[r]
+            .bind_thread()
+            .map_err(|e| format!("bind {r}: {e:?}"))?;
         let mut h = HfqFile::open(Path::new(path)).map_err(|e| format!("reopen rank {r}: {e}"))?;
-        let w = minimax::MiniMaxWeights::load(&mut h, &config, &mut gpus.devices[r], Some((&shard, r)))
-            .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
+        let w =
+            minimax::MiniMaxWeights::load(&mut h, &config, &mut gpus.devices[r], Some((&shard, r)))
+                .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
         weights.push(w);
     }
     let mut state = Vec::with_capacity(n);
     let mut partials = Vec::with_capacity(n);
     for r in 0..n {
-        gpus.devices[r].bind_thread().map_err(|e| format!("bind {r}: {e:?}"))?;
+        gpus.devices[r]
+            .bind_thread()
+            .map_err(|e| format!("bind {r}: {e:?}"))?;
         state.push(
             minimax::MiniMaxState::new_with_max_seq(&mut gpus.devices[r], &config, max_seq)
                 .map_err(|e| format!("state {r}: {e:?}"))?,
@@ -5515,14 +5703,21 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
                 .map_err(|e| format!("partial {r}: {e:?}"))?,
         );
     }
-    let peer = gpus.enable_peer_all().map_err(|e| format!("enable_peer_all: {e:?}"))?;
-    hipfire_runtime::ep::ensure_rank_streams(&mut gpus).map_err(|e| format!("ensure_rank_streams: {e:?}"))?;
+    let peer = gpus
+        .enable_peer_all()
+        .map_err(|e| format!("enable_peer_all: {e:?}"))?;
+    hipfire_runtime::ep::ensure_rank_streams(&mut gpus)
+        .map_err(|e| format!("ensure_rank_streams: {e:?}"))?;
     eprintln!("[daemon] EP load complete: {n} ranks, peer_access={peer}");
 
     let eos_tok: u32 = {
         let try_one = |s: &str| -> Option<u32> {
             let ids = tokenizer.encode(s);
-            if ids.len() == 1 { Some(ids[0]) } else { None }
+            if ids.len() == 1 {
+                Some(ids[0])
+            } else {
+                None
+            }
         };
         try_one("[e~[")
             .or_else(|| try_one("<|im_end|>"))
@@ -5537,7 +5732,12 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
         pp: 1,
         ep: Some(EpState {
             gpus,
-            inner: EpArch::Minimax { config, weights, state, partials },
+            inner: EpArch::Minimax {
+                config,
+                weights,
+                state,
+                partials,
+            },
         }),
         pp_gpus: None,
         pp_scratch_set: None,
@@ -5647,28 +5847,29 @@ fn generate_ep(
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
                 let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-                let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
-                    Some(h) => h,
-                    None => {
-                        let mut v = Vec::new();
-                        if let Some(sys) = system_prompt {
+                let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
+                    match messages_history {
+                        Some(h) => h,
+                        None => {
+                            let mut v = Vec::new();
+                            if let Some(sys) = system_prompt {
+                                v.push(hipfire_runtime::prompt_frame::Message {
+                                    role: hipfire_runtime::prompt_frame::Role::System,
+                                    content: sys.to_string(),
+                                    tool_calls: Vec::new(),
+                                    tool_call_id: None,
+                                });
+                            }
                             v.push(hipfire_runtime::prompt_frame::Message {
-                                role: hipfire_runtime::prompt_frame::Role::System,
-                                content: sys.to_string(),
+                                role: hipfire_runtime::prompt_frame::Role::User,
+                                content: prompt.to_string(),
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
                             });
+                            synthesized = v;
+                            &synthesized
                         }
-                        v.push(hipfire_runtime::prompt_frame::Message {
-                            role: hipfire_runtime::prompt_frame::Role::User,
-                            content: prompt.to_string(),
-                            tool_calls: Vec::new(),
-                            tool_call_id: None,
-                        });
-                        synthesized = v;
-                        &synthesized
-                    }
-                };
+                    };
                 frame.render_messages(messages_slice, tools, None)
             } else {
                 frame.render()
@@ -5679,7 +5880,12 @@ fn generate_ep(
                     tokenizer.encode(&rendered)
                 }
                 Err(e) => {
-                    let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP jinja render: {}"}}"#, id, format!("{e}").replace('"', "'"));
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"error","id":"{}","message":"EP jinja render: {}"}}"#,
+                        id,
+                        format!("{e}").replace('"', "'")
+                    );
                     let _ = stdout.flush();
                     return;
                 }
@@ -5687,12 +5893,18 @@ fn generate_ep(
         } else {
             // No embedded template — minimal ds4-style fallback (single-turn).
             let mut ids = Vec::new();
-            if let Some(b) = tokenizer.special_token_id("<｜begin▁of▁sentence｜>") { ids.push(b); }
+            if let Some(b) = tokenizer.special_token_id("<｜begin▁of▁sentence｜>") {
+                ids.push(b);
+            }
             ids.extend(tokenizer.encode(&format!("<｜User｜>{prompt}<｜Assistant｜>")));
             ids
         }
     };
-    if std::env::var("HIPFIRE_DEEPSEEK4_DUMP_PROMPT").ok().as_deref() == Some("1") {
+    if std::env::var("HIPFIRE_DEEPSEEK4_DUMP_PROMPT")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         let tk = m.tokenizer.as_ref().unwrap();
         eprintln!(
             "[ep prompt dump] arch={} {} tokens, decoded:\n>>>\n{}\n<<<",
@@ -5702,19 +5914,52 @@ fn generate_ep(
         );
     }
     if prompt_ids.is_empty() {
-        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP: empty prompt after render"}}"#, id);
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"EP: empty prompt after render"}}"#,
+            id
+        );
         let _ = stdout.flush();
         return;
     }
-    let eos_tok = if m.arch_id == 10 { m.minimax_eos_tok } else { m.deepseek4_eos_tok };
+    let eos_tok = if m.arch_id == 10 {
+        m.minimax_eos_tok
+    } else {
+        m.deepseek4_eos_tok
+    };
     match m.arch_id {
-        10 => ep_serve_minimax(m, stdout, id, &prompt_ids, eos_tok, max_tokens, stop, primed_think),
-        _ => ep_serve_ds4(m, stdout, id, &prompt_ids, eos_tok, max_tokens, think_mode, tools, stop),
+        10 => ep_serve_minimax(
+            m,
+            stdout,
+            id,
+            &prompt_ids,
+            eos_tok,
+            max_tokens,
+            stop,
+            primed_think,
+        ),
+        _ => ep_serve_ds4(
+            m,
+            stdout,
+            id,
+            &prompt_ids,
+            eos_tok,
+            max_tokens,
+            think_mode,
+            tools,
+            stop,
+        ),
     }
 }
 
 /// Stream a token JSON event; returns true if a stop sequence is now satisfied.
-fn ep_emit_token(stdout: &mut std::io::Stdout, id: &str, piece: &str, text_acc: &mut String, stop: &[String]) -> bool {
+fn ep_emit_token(
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    piece: &str,
+    text_acc: &mut String,
+    stop: &[String],
+) -> bool {
     text_acc.push_str(piece);
     let _ = writeln!(
         stdout,
@@ -5726,9 +5971,24 @@ fn ep_emit_token(stdout: &mut std::io::Stdout, id: &str, piece: &str, text_acc: 
     stop.iter().any(|s| !s.is_empty() && text_acc.ends_with(s))
 }
 
-fn ep_emit_done(stdout: &mut std::io::Stdout, id: &str, generated: usize, prompt_n: usize, prefill_ms: f64, decode_ms: f64) {
-    let decode_tok_s = if decode_ms > 0.0 { generated as f64 / (decode_ms / 1000.0) } else { 0.0 };
-    let prefill_tok_s = if prefill_ms > 0.0 { prompt_n as f64 / (prefill_ms / 1000.0) } else { 0.0 };
+fn ep_emit_done(
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    generated: usize,
+    prompt_n: usize,
+    prefill_ms: f64,
+    decode_ms: f64,
+) {
+    let decode_tok_s = if decode_ms > 0.0 {
+        generated as f64 / (decode_ms / 1000.0)
+    } else {
+        0.0
+    };
+    let prefill_tok_s = if prefill_ms > 0.0 {
+        prompt_n as f64 / (prefill_ms / 1000.0)
+    } else {
+        0.0
+    };
     eprintln!("[daemon] EP generate done: {generated} tok, {decode_tok_s:.1} tok/s");
     let _ = writeln!(
         stdout,
@@ -5739,9 +5999,19 @@ fn ep_emit_done(stdout: &mut std::io::Stdout, id: &str, generated: usize, prompt
 }
 
 /// ds4 EP prefill + greedy decode.
-fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, prompt_ids: &[u32], eos_tok: u32, max_tokens: usize, think_mode: ThinkMode, tools: Option<&[serde_json::Value]>, stop: &[String]) {
-    use std::time::Instant;
+fn ep_serve_ds4(
+    m: &mut LoadedModel,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt_ids: &[u32],
+    eos_tok: u32,
+    max_tokens: usize,
+    think_mode: ThinkMode,
+    tools: Option<&[serde_json::Value]>,
+    stop: &[String],
+) {
     use hipfire_arch_deepseek4::dsml::StreamEvent;
+    use std::time::Instant;
 
     let prompt_n = prompt_ids.len();
 
@@ -5805,17 +6075,15 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
     let mut grammar_mask: Vec<bool> = vec![true; decoded_vocab.len()];
     let mut emit_text_buf = String::new();
     let mut emit_tool_calls_buf: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
-    let mut absorb_event = |ev: &StreamEvent| {
-        match ev {
-            StreamEvent::Token(t) => emit_text_buf.push_str(t),
-            StreamEvent::Reasoning(_) => {}
-            StreamEvent::ToolCalls(calls) => {
-                for c in calls {
-                    emit_tool_calls_buf.push(hipfire_runtime::prompt_frame::ToolCall {
-                        name: c.name.clone(),
-                        arguments: c.arguments.clone(),
-                    });
-                }
+    let mut absorb_event = |ev: &StreamEvent| match ev {
+        StreamEvent::Token(t) => emit_text_buf.push_str(t),
+        StreamEvent::Reasoning(_) => {}
+        StreamEvent::ToolCalls(calls) => {
+            for c in calls {
+                emit_tool_calls_buf.push(hipfire_runtime::prompt_frame::ToolCall {
+                    name: c.name.clone(),
+                    arguments: c.arguments.clone(),
+                });
             }
         }
     };
@@ -5823,14 +6091,31 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
     let t_prefill = Instant::now();
     {
         let EpState { gpus, inner } = m.ep.as_mut().unwrap();
-        let EpArch::Ds4 { config, weights, state, partials } = inner else {
-            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP arch mismatch (expected ds4)"}}"#, id);
+        let EpArch::Ds4 {
+            config,
+            weights,
+            state,
+            partials,
+        } = inner
+        else {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"EP arch mismatch (expected ds4)"}}"#,
+                id
+            );
             let _ = stdout.flush();
             return;
         };
         for (pos, &t) in prompt_ids.iter().enumerate() {
-            if let Err(e) = deepseek4::forward::forward_ep(gpus, weights, config, state, partials, t, pos as u32) {
-                let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"forward_ep prefill: {}"}}"#, id, format!("{e}").replace('"', "'"));
+            if let Err(e) = deepseek4::forward::forward_ep(
+                gpus, weights, config, state, partials, t, pos as u32,
+            ) {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"error","id":"{}","message":"forward_ep prefill: {}"}}"#,
+                    id,
+                    format!("{e}").replace('"', "'")
+                );
                 let _ = stdout.flush();
                 return;
             }
@@ -5840,7 +6125,11 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
     let mut logits = {
         let EpState { gpus, inner } = m.ep.as_mut().unwrap();
         let EpArch::Ds4 { state, .. } = inner else {
-            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP arch mismatch (expected ds4)"}}"#, id);
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"EP arch mismatch (expected ds4)"}}"#,
+                id
+            );
             let _ = stdout.flush();
             return;
         };
@@ -5848,7 +6137,11 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
         match state[0].logits.as_ref() {
             Some(l) => gpus.devices[0].download_f32(l).unwrap_or_default(),
             None => {
-                let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP logits unset after prefill"}}"#, id);
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"error","id":"{}","message":"EP logits unset after prefill"}}"#,
+                    id
+                );
                 let _ = stdout.flush();
                 return;
             }
@@ -5867,8 +6160,15 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
         }
         let mut next = 0u32;
         let mut best = f32::NEG_INFINITY;
-        for (i, &x) in logits.iter().enumerate() { if x > best { best = x; next = i as u32; } }
-        if next == eos_tok { break; }
+        for (i, &x) in logits.iter().enumerate() {
+            if x > best {
+                best = x;
+                next = i as u32;
+            }
+        }
+        if next == eos_tok {
+            break;
+        }
         let piece = m.tokenizer.as_ref().unwrap().decode(&[next]);
         for ev in parser.feed(&piece) {
             absorb_event(&ev);
@@ -5888,15 +6188,36 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
         local_emitted_ids.push(next);
         text_acc.push_str(&piece);
         generated += 1;
-        if stop.iter().any(|s| !s.is_empty() && text_acc.ends_with(s)) { break; }
+        if stop.iter().any(|s| !s.is_empty() && text_acc.ends_with(s)) {
+            break;
+        }
         let EpState { gpus, inner } = m.ep.as_mut().unwrap();
-        let EpArch::Ds4 { config, weights, state, partials } = inner else { break; };
-        if let Err(e) = deepseek4::forward::forward_ep(gpus, weights, config, state, partials, next, pos as u32) {
-            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"forward_ep decode: {}"}}"#, id, format!("{e}").replace('"', "'")); return;
+        let EpArch::Ds4 {
+            config,
+            weights,
+            state,
+            partials,
+        } = inner
+        else {
+            break;
+        };
+        if let Err(e) =
+            deepseek4::forward::forward_ep(gpus, weights, config, state, partials, next, pos as u32)
+        {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"forward_ep decode: {}"}}"#,
+                id,
+                format!("{e}").replace('"', "'")
+            );
+            return;
         }
         pos += 1;
         let _ = gpus.devices[0].bind_thread();
-        logits = match state[0].logits.as_ref() { Some(l) => gpus.devices[0].download_f32(l).unwrap_or_default(), None => break };
+        logits = match state[0].logits.as_ref() {
+            Some(l) => gpus.devices[0].download_f32(l).unwrap_or_default(),
+            None => break,
+        };
     }
     for ev in parser.finish() {
         absorb_event(&ev);
@@ -5933,8 +6254,16 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
     }
 
     let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
-    let decode_tok_s = if decode_ms > 0.0 { generated as f64 / (decode_ms / 1000.0) } else { 0.0 };
-    let prefill_tok_s = if prefill_ms > 0.0 { prompt_n as f64 / (prefill_ms / 1000.0) } else { 0.0 };
+    let decode_tok_s = if decode_ms > 0.0 {
+        generated as f64 / (decode_ms / 1000.0)
+    } else {
+        0.0
+    };
+    let prefill_tok_s = if prefill_ms > 0.0 {
+        prompt_n as f64 / (prefill_ms / 1000.0)
+    } else {
+        0.0
+    };
     eprintln!("[daemon] EP generate done: {generated} tok, {decode_tok_s:.1} tok/s");
     let done = serde_json::json!({
         "type": "done",
@@ -5959,7 +6288,16 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
 /// reuse — see generate_minimax for the full rationale). `primed_think`
 /// re-emits the MiniMax `<think>\n` opener display-only for a well-formed turn.
 #[allow(clippy::too_many_arguments)]
-fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, prompt_ids: &[u32], eos_tok: u32, max_tokens: usize, stop: &[String], primed_think: bool) {
+fn ep_serve_minimax(
+    m: &mut LoadedModel,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt_ids: &[u32],
+    eos_tok: u32,
+    max_tokens: usize,
+    stop: &[String],
+    primed_think: bool,
+) {
     use std::time::Instant;
     let prompt_n = prompt_ids.len();
 
@@ -5972,21 +6310,35 @@ fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str,
         let prior_len = m.conversation_tokens.len();
         let max_match = prior_len.min(prompt_n);
         let mut lcp = 0usize;
-        while lcp < max_match && m.conversation_tokens[lcp] == prompt_ids[lcp] { lcp += 1; }
+        while lcp < max_match && m.conversation_tokens[lcp] == prompt_ids[lcp] {
+            lcp += 1;
+        }
         let cache_hit = lcp > 0 && lcp < prompt_n;
         if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
             eprintln!(
                 "[minimax-ep-cache] prior_len={} rendered_len={} lcp={} hit={} partial={}",
-                prior_len, prompt_n, lcp, cache_hit, cache_hit && lcp < prior_len,
+                prior_len,
+                prompt_n,
+                lcp,
+                cache_hit,
+                cache_hit && lcp < prior_len,
             );
         }
-        if cache_hit { m.conversation_tokens.truncate(lcp); lcp } else { m.conversation_tokens.clear(); 0 }
+        if cache_hit {
+            m.conversation_tokens.truncate(lcp);
+            lcp
+        } else {
+            m.conversation_tokens.clear();
+            0
+        }
     };
     // Rewind every rank's KV cursor to the reuse point.
     {
         let EpState { inner, .. } = m.ep.as_mut().unwrap();
         if let EpArch::Minimax { state, .. } = inner {
-            for s in state.iter_mut() { s.n_tokens = prefill_from; }
+            for s in state.iter_mut() {
+                s.n_tokens = prefill_from;
+            }
         }
     }
 
@@ -5994,36 +6346,63 @@ fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str,
     let t_prefill = Instant::now();
     {
         let EpState { gpus, inner } = m.ep.as_mut().unwrap();
-        let EpArch::Minimax { config, weights, state, partials } = inner else {
-            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP arch mismatch (expected minimax)"}}"#, id);
+        let EpArch::Minimax {
+            config,
+            weights,
+            state,
+            partials,
+        } = inner
+        else {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"EP arch mismatch (expected minimax)"}}"#,
+                id
+            );
             let _ = stdout.flush();
             return;
         };
         for (i, &t) in prompt_ids[prefill_from..].iter().enumerate() {
             let pos = (prefill_from + i) as u32;
-            if let Err(e) = minimax::forward::forward_ep(gpus, weights, config, state, partials, t, pos) {
-                let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"forward_ep prefill: {}"}}"#, id, format!("{e}").replace('"', "'"));
+            if let Err(e) =
+                minimax::forward::forward_ep(gpus, weights, config, state, partials, t, pos)
+            {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"error","id":"{}","message":"forward_ep prefill: {}"}}"#,
+                    id,
+                    format!("{e}").replace('"', "'")
+                );
                 let _ = stdout.flush();
                 return;
             }
         }
     }
     // Mirror the prefilled suffix into conversation_tokens (the prefix is kept).
-    for &t in &prompt_ids[prefill_from..] { m.conversation_tokens.push(t); }
+    for &t in &prompt_ids[prefill_from..] {
+        m.conversation_tokens.push(t);
+    }
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
 
     // MiniMax primes the assistant with `<think>\n`; re-emit display-only so the
     // assistant message is a well-formed think block (parity with single-GPU).
     if primed_think {
-        let _ = writeln!(stdout, "{}", serde_json::json!({"type":"token","id":id,"text":"<think>\n"}));
+        let _ = writeln!(
+            stdout,
+            "{}",
+            serde_json::json!({"type":"token","id":id,"text":"<think>\n"})
+        );
         let _ = stdout.flush();
     }
 
     let mut logits = {
         let EpState { gpus, inner } = m.ep.as_mut().unwrap();
-        let EpArch::Minimax { state, .. } = inner else { return; };
+        let EpArch::Minimax { state, .. } = inner else {
+            return;
+        };
         let _ = gpus.devices[0].bind_thread();
-        gpus.devices[0].download_f32(&state[0].logits).unwrap_or_default()
+        gpus.devices[0]
+            .download_f32(&state[0].logits)
+            .unwrap_or_default()
     };
     let t_decode = Instant::now();
     let mut generated = 0usize;
@@ -6032,22 +6411,56 @@ fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str,
     while generated < max_tokens {
         let mut next = 0u32;
         let mut best = f32::NEG_INFINITY;
-        for (i, &x) in logits.iter().enumerate() { if x > best { best = x; next = i as u32; } }
-        if next == eos_tok { break; }
+        for (i, &x) in logits.iter().enumerate() {
+            if x > best {
+                best = x;
+                next = i as u32;
+            }
+        }
+        if next == eos_tok {
+            break;
+        }
         let piece = m.tokenizer.as_ref().unwrap().decode(&[next]);
         generated += 1;
         m.conversation_tokens.push(next);
-        if ep_emit_token(stdout, id, &piece, &mut text_acc, stop) { break; }
+        if ep_emit_token(stdout, id, &piece, &mut text_acc, stop) {
+            break;
+        }
         let EpState { gpus, inner } = m.ep.as_mut().unwrap();
-        let EpArch::Minimax { config, weights, state, partials } = inner else { break; };
-        if let Err(e) = minimax::forward::forward_ep(gpus, weights, config, state, partials, next, pos as u32) {
-            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"forward_ep decode: {}"}}"#, id, format!("{e}").replace('"', "'")); return;
+        let EpArch::Minimax {
+            config,
+            weights,
+            state,
+            partials,
+        } = inner
+        else {
+            break;
+        };
+        if let Err(e) =
+            minimax::forward::forward_ep(gpus, weights, config, state, partials, next, pos as u32)
+        {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"forward_ep decode: {}"}}"#,
+                id,
+                format!("{e}").replace('"', "'")
+            );
+            return;
         }
         pos += 1;
         let _ = gpus.devices[0].bind_thread();
-        logits = gpus.devices[0].download_f32(&state[0].logits).unwrap_or_default();
+        logits = gpus.devices[0]
+            .download_f32(&state[0].logits)
+            .unwrap_or_default();
     }
-    ep_emit_done(stdout, id, generated, prompt_n, prefill_ms, t_decode.elapsed().as_secs_f64() * 1000.0);
+    ep_emit_done(
+        stdout,
+        id,
+        generated,
+        prompt_n,
+        prefill_ms,
+        t_decode.elapsed().as_secs_f64() * 1000.0,
+    );
 }
 
 fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
@@ -6551,8 +6964,7 @@ fn generate_dflash(
     // Jinja default-ON (flipped 2026-06-09): render through the model's chat
     // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
     // ChatML/Plain). Falls back to Plain automatically when no template resolves.
-    let jinja_enabled =
-        std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
     let try_jinja = jinja_enabled && m.chat_template.is_some();
     let prompt_tokens: Vec<u32> = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
@@ -7425,10 +7837,17 @@ fn generate_dflash(
                 let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
                 let in_think = currently_in_think(
                     raw_str,
-                    matches!(assistant_prefix, hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink),
+                    matches!(
+                        assistant_prefix,
+                        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+                    ),
                 );
-                if in_think && !prev_in_think { think_count = 0; }
-                if in_think { think_count += 1; }
+                if in_think && !prev_in_think {
+                    think_count = 0;
+                }
+                if in_think {
+                    think_count += 1;
+                }
                 prev_in_think = in_think;
 
                 if in_think && think_count >= max_think_tokens {
@@ -7829,8 +8248,7 @@ fn generate_multi(
     // Jinja default-ON (flipped 2026-06-09): render through the model's chat
     // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
     // ChatML/Plain). Falls back to Plain automatically when no template resolves.
-    let jinja_enabled =
-        std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
     // hunt3 H-A: drop the `seq_pos == 0` gate (PR #389 removed it from generate()).
     // With the gate, turn 2+ fell through to the Plain scaffold, dropping the
     // system prompt and the full history replay that render_messages provides.
@@ -8024,7 +8442,8 @@ fn generate_multi(
     // Effective penalty window = request `_repeat_window` (default 128),
     // bounded by repeat_buf capacity (2048). Default stays 128; the wide buffer
     // only enables a larger window when a request explicitly sets one.
-    let repeat_buf_cap = (scratch_set.per_device[dev_last].repeat_buf.buf.size() / 4).min(_repeat_window.max(1));
+    let repeat_buf_cap =
+        (scratch_set.per_device[dev_last].repeat_buf.buf.size() / 4).min(_repeat_window.max(1));
 
     // hunt3 M-C: grammar-guided decoding for pp>1 (mirrors generate() ~8168).
     // Without this, a pp>1 + tools request samples unconstrained once the model
@@ -8191,7 +8610,9 @@ fn generate_multi(
     // generation runs this many tokens past it — generous for a real final
     // answer, bounded against runaway.
     let post_latch_answer_budget: usize = std::env::var("HIPFIRE_POST_LATCH_ANSWER_TOKENS")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(768);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(768);
     let mut latch_gen_mark: Option<usize> = None;
     let loop_guard =
         hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
@@ -8295,9 +8716,14 @@ fn generate_multi(
             let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
             let in_think = currently_in_think(
                 raw_str,
-                matches!(assistant_prefix, hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink),
+                matches!(
+                    assistant_prefix,
+                    hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+                ),
             );
-            if in_think { total_think_tokens += 1; }
+            if in_think {
+                total_think_tokens += 1;
+            }
             if max_total_think > 0 && total_think_tokens >= max_total_think {
                 force_answer_latched = true;
             }
@@ -8419,7 +8845,10 @@ fn generate_multi(
             let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
             let in_think = currently_in_think(
                 raw_str,
-                matches!(assistant_prefix, hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink),
+                matches!(
+                    assistant_prefix,
+                    hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+                ),
             );
             if !in_think {
                 let _ = writeln!(
@@ -8668,7 +9097,32 @@ fn generate_multi(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Option<&mut rdna_compute::Gpu>, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, presence_penalty: f32, frequency_penalty: f32, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>, think_mode: ThinkMode, stop: &[String]) {
+fn generate(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    drafter_gpu: Option<&mut rdna_compute::Gpu>,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    budget_alert_at_tok: usize,
+    budget_alert_text: &str,
+    max_think_tokens: usize,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>,
+    pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    think_mode: ThinkMode,
+    stop: &[String],
+) {
     // hunt3 M-E: seed the process-global CPU sampler RNG with this request's
     // fixed seed so the grammar/CPU-fallback sample stream is deterministic per
     // request and does not carry RNG state across requests. Matches the u32 the
@@ -8679,7 +9133,19 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // single-GPU arch fields (q35_*/deepseek4_*) None — the per-arch paths
     // would unwrap-panic / error on the missing config.
     if m.ep.is_some() {
-        generate_ep(m, stdout, id, prompt, system_prompt, max_tokens, max_think_tokens, think_mode, tools, messages_history, stop);
+        generate_ep(
+            m,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            max_tokens,
+            max_think_tokens,
+            think_mode,
+            tools,
+            messages_history,
+            stop,
+        );
         return;
     }
     // Compress runs on the PFlash drafter handle when one is set (hetero
@@ -8826,10 +9292,24 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // doesn't need to thread any of those args through.
     if m.pp > 1 {
         generate_multi(
-            m, gpu, pflash_state, pflash_cfg, stdout, id, prompt, system_prompt,
-            temp, top_p, max_tokens, repeat_penalty, repeat_window,
-            presence_penalty, frequency_penalty,
-            budget_alert_at_tok, budget_alert_text, max_think_tokens,
+            m,
+            gpu,
+            pflash_state,
+            pflash_cfg,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            temp,
+            top_p,
+            max_tokens,
+            repeat_penalty,
+            repeat_window,
+            presence_penalty,
+            frequency_penalty,
+            budget_alert_at_tok,
+            budget_alert_text,
+            max_think_tokens,
             assistant_prefix,
             tools,
             messages_history,
@@ -9190,8 +9670,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // Jinja default-ON (flipped 2026-06-09): render through the model's chat
     // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
     // ChatML/Plain). Falls back to Plain automatically when no template resolves.
-    let jinja_enabled =
-        std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
     // Jinja renders the FULL conversation every turn (stateless full-render,
     // like generate_dflash) — fire on every turn, not just `seq_pos == 0`.
     // `render_messages` below replays `messages_history` (all prior turns) and
@@ -10175,7 +10654,9 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         // re-open loop after the cap latches would run to max_tokens. Hard-EOS
         // once generation runs this many tokens past the latch.
         let post_latch_answer_budget: usize = std::env::var("HIPFIRE_POST_LATCH_ANSWER_TOKENS")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(768);
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(768);
         let mut latch_gen_mark: Option<usize> = None;
 
         // N-gram loop detector: track 4-gram token sequences. When any
@@ -10373,7 +10854,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                 let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
                 let in_think = currently_in_think(
                     raw_str,
-                    matches!(assistant_prefix, hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink),
+                    matches!(
+                        assistant_prefix,
+                        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+                    ),
                 );
                 // Total-think bound (re-arm-proof). Count every think token; at the
                 // cap, latch force-answer (force-close + block <think>); a margin
@@ -10526,7 +11010,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                 let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
                 let in_think = currently_in_think(
                     raw_str,
-                    matches!(assistant_prefix, hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink),
+                    matches!(
+                        assistant_prefix,
+                        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+                    ),
                 );
                 if !in_think {
                     let _ = writeln!(
@@ -12286,12 +12773,20 @@ fn generate_lfm2moe(
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
     if m.tokenizer.is_none() {
-        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"tokenizer not loaded"}}"#, id);
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"tokenizer not loaded"}}"#,
+            id
+        );
         let _ = stdout.flush();
         return;
     }
     if m.lfm2moe_config.is_none() {
-        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"lfm2moe_config missing on arch_id=11 generate"}}"#, id);
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"lfm2moe_config missing on arch_id=11 generate"}}"#,
+            id
+        );
         let _ = stdout.flush();
         return;
     }
@@ -12300,14 +12795,13 @@ fn generate_lfm2moe(
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
         // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
-    // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
-    // produces garbage. Force jinja on for arch 11 (falls back to Plain only if
-    // the .hfq carries no template, e.g. an older A1B convert).
-    // Jinja default-ON (flipped 2026-06-09): render through the model's chat
-    // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
-    // ChatML/Plain). Falls back to Plain automatically when no template resolves.
-    let jinja_enabled =
-        std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
+        // produces garbage. Force jinja on for arch 11 (falls back to Plain only if
+        // the .hfq carries no template, e.g. an older A1B convert).
+        // Jinja default-ON (flipped 2026-06-09): render through the model's chat
+        // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
+        // ChatML/Plain). Falls back to Plain automatically when no template resolves.
+        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -12321,28 +12815,29 @@ fn generate_lfm2moe(
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
                 let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-                let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
-                    Some(h) => h,
-                    None => {
-                        let mut v = Vec::new();
-                        if let Some(sys) = system_prompt {
+                let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
+                    match messages_history {
+                        Some(h) => h,
+                        None => {
+                            let mut v = Vec::new();
+                            if let Some(sys) = system_prompt {
+                                v.push(hipfire_runtime::prompt_frame::Message {
+                                    role: hipfire_runtime::prompt_frame::Role::System,
+                                    content: sys.to_string(),
+                                    tool_calls: Vec::new(),
+                                    tool_call_id: None,
+                                });
+                            }
                             v.push(hipfire_runtime::prompt_frame::Message {
-                                role: hipfire_runtime::prompt_frame::Role::System,
-                                content: sys.to_string(),
+                                role: hipfire_runtime::prompt_frame::Role::User,
+                                content: prompt.to_string(),
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
                             });
+                            synthesized = v;
+                            &synthesized
                         }
-                        v.push(hipfire_runtime::prompt_frame::Message {
-                            role: hipfire_runtime::prompt_frame::Role::User,
-                            content: prompt.to_string(),
-                            tool_calls: Vec::new(),
-                            tool_call_id: None,
-                        });
-                        synthesized = v;
-                        &synthesized
-                    }
-                };
+                    };
                 frame.render_messages(messages_slice, tools, None)
             } else {
                 frame.render()
@@ -12374,7 +12869,11 @@ fn generate_lfm2moe(
     };
 
     if prompt_ids.is_empty() {
-        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"empty prompt after tokenize"}}"#, id);
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"empty prompt after tokenize"}}"#,
+            id
+        );
         let _ = stdout.flush();
         return;
     }
@@ -12392,9 +12891,7 @@ fn generate_lfm2moe(
             let state = m.lfm2moe_state.as_ref().unwrap();
             (state.n_tokens, state.max_seq)
         };
-        eprintln!(
-            "[daemon] arch_id=11 context full ({n}/{cap}) — resetting Lfm2MoeState",
-        );
+        eprintln!("[daemon] arch_id=11 context full ({n}/{cap}) — resetting Lfm2MoeState",);
         let _ = m.lfm2moe_state.as_mut().unwrap().reset(gpu);
         m.seq_pos = 0;
         m.conversation_tokens.clear();
@@ -12523,12 +13020,20 @@ fn generate_minimax(
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
     if m.tokenizer.is_none() {
-        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"tokenizer not loaded"}}"#, id);
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"tokenizer not loaded"}}"#,
+            id
+        );
         let _ = stdout.flush();
         return;
     }
     if m.minimax_config.is_none() {
-        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"minimax_config missing on arch_id=10 generate"}}"#, id);
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"minimax_config missing on arch_id=10 generate"}}"#,
+            id
+        );
         let _ = stdout.flush();
         return;
     }
@@ -12542,16 +13047,16 @@ fn generate_minimax(
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
         // MiniMax-M2 (arch 10) and LFM2.5 (arch 11) REQUIRE their embedded Jinja
-    // chat_template — their structural tokens are NOT ChatML. MiniMax frames
-    // turns with `]~b]ai` / `[e~[` and primes the assistant with `<think>\n`;
-    // LFM2 needs its `<|startoftext|>` BOS. The hand-rolled Plain ChatML frame
-    // emits `<|im_start|>`/`<|im_end|>` which these models never trained on,
-    // producing an off-distribution prompt that (a) decodes incoherently and
-    // (b) never matches across turns so the LCP prompt-cache is dead. Force
-    // jinja on for both (falls back to Plain only when the .hfq carries no
-    // template).
-    // Jinja default-ON (flipped 2026-06-09); opt out with HIPFIRE_JINJA_CHAT=0.
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        // chat_template — their structural tokens are NOT ChatML. MiniMax frames
+        // turns with `]~b]ai` / `[e~[` and primes the assistant with `<think>\n`;
+        // LFM2 needs its `<|startoftext|>` BOS. The hand-rolled Plain ChatML frame
+        // emits `<|im_start|>`/`<|im_end|>` which these models never trained on,
+        // producing an off-distribution prompt that (a) decodes incoherently and
+        // (b) never matches across turns so the LCP prompt-cache is dead. Force
+        // jinja on for both (falls back to Plain only when the .hfq carries no
+        // template).
+        // Jinja default-ON (flipped 2026-06-09); opt out with HIPFIRE_JINJA_CHAT=0.
+        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -12565,28 +13070,29 @@ fn generate_minimax(
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
                 let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-                let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
-                    Some(h) => h,
-                    None => {
-                        let mut v = Vec::new();
-                        if let Some(sys) = system_prompt {
+                let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
+                    match messages_history {
+                        Some(h) => h,
+                        None => {
+                            let mut v = Vec::new();
+                            if let Some(sys) = system_prompt {
+                                v.push(hipfire_runtime::prompt_frame::Message {
+                                    role: hipfire_runtime::prompt_frame::Role::System,
+                                    content: sys.to_string(),
+                                    tool_calls: Vec::new(),
+                                    tool_call_id: None,
+                                });
+                            }
                             v.push(hipfire_runtime::prompt_frame::Message {
-                                role: hipfire_runtime::prompt_frame::Role::System,
-                                content: sys.to_string(),
+                                role: hipfire_runtime::prompt_frame::Role::User,
+                                content: prompt.to_string(),
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
                             });
+                            synthesized = v;
+                            &synthesized
                         }
-                        v.push(hipfire_runtime::prompt_frame::Message {
-                            role: hipfire_runtime::prompt_frame::Role::User,
-                            content: prompt.to_string(),
-                            tool_calls: Vec::new(),
-                            tool_call_id: None,
-                        });
-                        synthesized = v;
-                        &synthesized
-                    }
-                };
+                    };
                 frame.render_messages(messages_slice, tools, None)
             } else {
                 frame.render()
@@ -12621,7 +13127,11 @@ fn generate_minimax(
     };
 
     if prompt_ids.is_empty() {
-        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"empty prompt after tokenize"}}"#, id);
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"empty prompt after tokenize"}}"#,
+            id
+        );
         let _ = stdout.flush();
         return;
     }
@@ -12640,9 +13150,7 @@ fn generate_minimax(
             let state = m.minimax_state.as_ref().unwrap();
             (state.n_tokens, state.max_seq)
         };
-        eprintln!(
-            "[daemon] arch_id=10 context full ({n}/{cap}) — resetting MiniMaxState",
-        );
+        eprintln!("[daemon] arch_id=10 context full ({n}/{cap}) — resetting MiniMaxState",);
         m.minimax_state.as_mut().unwrap().reset();
         m.seq_pos = 0;
         m.conversation_tokens.clear();
@@ -12663,46 +13171,47 @@ fn generate_minimax(
     // tail is never attended. The reused prefix GROWS with the conversation
     // (all older turns, reasoning already stripped, stay matched), so
     // steady-state per-turn prefill is just {last visible answer} + {new user}.
-    let prefill_ids: Vec<u32> = {
-        let prior_len = m.conversation_tokens.len();
-        let max_match = prior_len.min(prompt_ids.len());
-        let mut lcp = 0usize;
-        while lcp < max_match && m.conversation_tokens[lcp] == prompt_ids[lcp] {
-            lcp += 1;
-        }
-        // A usable common prefix that leaves at least one fresh token to prefill
-        // (the render always appends a new `]~b]ai\n<think>\n` primer, so
-        // lcp == rendered_len cannot occur on a normal turn). `partial` is the
-        // interleaved-thinking divergence (lcp < prior_len); lcp == prior_len is
-        // the degenerate pure-extension case (rewind is then a no-op).
-        let cache_hit = lcp > 0 && lcp < prompt_ids.len();
-        let partial = lcp < prior_len;
-        if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
-            eprintln!(
+    let prefill_ids: Vec<u32> =
+        {
+            let prior_len = m.conversation_tokens.len();
+            let max_match = prior_len.min(prompt_ids.len());
+            let mut lcp = 0usize;
+            while lcp < max_match && m.conversation_tokens[lcp] == prompt_ids[lcp] {
+                lcp += 1;
+            }
+            // A usable common prefix that leaves at least one fresh token to prefill
+            // (the render always appends a new `]~b]ai\n<think>\n` primer, so
+            // lcp == rendered_len cannot occur on a normal turn). `partial` is the
+            // interleaved-thinking divergence (lcp < prior_len); lcp == prior_len is
+            // the degenerate pure-extension case (rewind is then a no-op).
+            let cache_hit = lcp > 0 && lcp < prompt_ids.len();
+            let partial = lcp < prior_len;
+            if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+                eprintln!(
                 "[minimax-cache] prior_len={} rendered_len={} lcp={} hit={} partial={} n_tokens={}",
                 prior_len, prompt_ids.len(), lcp, cache_hit, cache_hit && partial,
                 m.minimax_state.as_ref().unwrap().n_tokens,
             );
-        }
-        if cache_hit {
-            // Rewind KV + token history to the common prefix. When lcp ==
-            // prior_len this is a no-op; when lcp < prior_len it discards the
-            // stale reasoning+answer tail. The prefill loop below reads
-            // `state.n_tokens` as its base position, so n_tokens is the only
-            // KV state the rewind must touch (plus the mirror token history).
-            m.minimax_state.as_mut().unwrap().n_tokens = lcp;
-            m.conversation_tokens.truncate(lcp);
-            m.seq_pos = lcp;
-            prompt_ids[lcp..].to_vec()
-        } else {
-            if prior_len > 0 {
-                m.minimax_state.as_mut().unwrap().reset();
-                m.seq_pos = 0;
-                m.conversation_tokens.clear();
             }
-            prompt_ids.clone()
-        }
-    };
+            if cache_hit {
+                // Rewind KV + token history to the common prefix. When lcp ==
+                // prior_len this is a no-op; when lcp < prior_len it discards the
+                // stale reasoning+answer tail. The prefill loop below reads
+                // `state.n_tokens` as its base position, so n_tokens is the only
+                // KV state the rewind must touch (plus the mirror token history).
+                m.minimax_state.as_mut().unwrap().n_tokens = lcp;
+                m.conversation_tokens.truncate(lcp);
+                m.seq_pos = lcp;
+                prompt_ids[lcp..].to_vec()
+            } else {
+                if prior_len > 0 {
+                    m.minimax_state.as_mut().unwrap().reset();
+                    m.seq_pos = 0;
+                    m.conversation_tokens.clear();
+                }
+                prompt_ids.clone()
+            }
+        };
 
     let t0 = Instant::now();
 
@@ -12731,7 +13240,11 @@ fn generate_minimax(
                 match minimax::forward::forward_batch(cfg, weights, state, gpu, chunk, pos) {
                     Ok(logits) => last_logits = logits,
                     Err(e) => {
-                        emit_error_with_id(stdout, id, format!("minimax batch prefill failed: {e:?}"));
+                        emit_error_with_id(
+                            stdout,
+                            id,
+                            format!("minimax batch prefill failed: {e:?}"),
+                        );
                         return;
                     }
                 }

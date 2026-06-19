@@ -1046,39 +1046,97 @@ fn load_weight_tensor(
                 awq_scale: None,
             })
         }
-        32 => { // MFP4G32Lloyd -- mfp4 rows + 32-B per-tensor fp16 codebook prefix.
-                // data_size already includes the +32 B prefix; upload verbatim.
-            assert!(k % 256 == 0, "MFP4G32Lloyd weight {st_name} has K={k} but kernel + FWHT require K%256==0");
+        32 => {
+            // MFP4G32Lloyd -- mfp4 rows + 32-B per-tensor fp16 codebook prefix.
+            // data_size already includes the +32 B prefix; upload verbatim.
+            assert!(
+                k % 256 == 0,
+                "MFP4G32Lloyd weight {st_name} has K={k} but kernel + FWHT require K%256==0"
+            );
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MFP4G32Lloyd, m, k, row_stride: 0, paro: None, awq_scale: None })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MFP4G32Lloyd,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
         }
-        33 => { // MFP4G32P -- mfp4+P: mfp4 rows with E4M3 (non-power-of-2) per-block scale.
-                // Byte-IDENTICAL layout to MFP4G32 (qt 24): NO prefix, same row_bytes.
-                // Only the per-block scale byte's decode differs (E4M3 vs UE8M0).
-            assert!(k % 256 == 0, "MFP4G32P weight {st_name} has K={k} but kernel + FWHT require K%256==0");
+        33 => {
+            // MFP4G32P -- mfp4+P: mfp4 rows with E4M3 (non-power-of-2) per-block scale.
+            // Byte-IDENTICAL layout to MFP4G32 (qt 24): NO prefix, same row_bytes.
+            // Only the per-block scale byte's decode differs (E4M3 vs UE8M0).
+            assert!(
+                k % 256 == 0,
+                "MFP4G32P weight {st_name} has K={k} but kernel + FWHT require K%256==0"
+            );
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MFP4G32P, m, k, row_stride: 0, paro: None, awq_scale: None })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MFP4G32P,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
         }
-        34 => { // MFP4G32E8 — mfp4-E8: mfp4+P container, NO prefix, same row_bytes;
-                // per-32-block 16 E2M1 nibbles replaced by 4x32-bit E8-lattice codewords.
-            assert!(k % 256 == 0, "MFP4G32E8 weight {st_name} has K={k} but kernel + FWHT require K%256==0");
+        34 => {
+            // MFP4G32E8 — mfp4-E8: mfp4+P container, NO prefix, same row_bytes;
+            // per-32-block 16 E2M1 nibbles replaced by 4x32-bit E8-lattice codewords.
+            assert!(
+                k % 256 == 0,
+                "MFP4G32E8 weight {st_name} has K={k} but kernel + FWHT require K%256==0"
+            );
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MFP4G32E8, m, k, row_stride: 0, paro: None, awq_scale: None })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MFP4G32E8,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
         }
-        35 => { // MFP4G32E8SOA — mfp4-E8 SoA: same E8 data as qt=34 but in SoA layout.
-                // Per-row: [16B hdr] + [n_blocks B E4M3 scales, pad 16B] + [n_blocks*16B codewords].
-            assert!(k % 256 == 0, "MFP4G32E8SOA weight {st_name} has K={k} but kernel + FWHT require K%256==0");
+        35 => {
+            // MFP4G32E8SOA — mfp4-E8 SoA: same E8 data as qt=34 but in SoA layout.
+            // Per-row: [16B hdr] + [n_blocks B E4M3 scales, pad 16B] + [n_blocks*16B codewords].
+            assert!(
+                k % 256 == 0,
+                "MFP4G32E8SOA weight {st_name} has K={k} but kernel + FWHT require K%256==0"
+            );
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MFP4G32E8SOA, m, k, row_stride: 0, paro: None, awq_scale: None })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MFP4G32E8SOA,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
         }
-        31 => { // MQ5-G256 — MagnumQuant FWHT-rotated 5-bit, 168 bytes per 256 elements (5.25 bpw).
-                // AWQ sidecar attached centrally below via supports_awq_sidecar().
+        31 => {
+            // MQ5-G256 — MagnumQuant FWHT-rotated 5-bit, 168 bytes per 256 elements (5.25 bpw).
+            // AWQ sidecar attached centrally below via supports_awq_sidecar().
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ5G256, m, k, row_stride: 0, paro: None, awq_scale: None })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ5G256,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
         }
         1 => {
             // F16 — dequant to F32 for F32 GEMV
-            let f32_data: Vec<f32> = data.chunks_exact(2)
+            let f32_data: Vec<f32> = data
+                .chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect();
             let bytes: &[u8] = unsafe {
