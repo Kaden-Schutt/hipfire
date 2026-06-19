@@ -115,3 +115,6 @@ benchmarks/results/eval/
 benchmarks/results/eval-smoke/
 
 flake.lock
+
+# Local-only scratchpad of jobs deferred to idle/quiet-box time (per-machine).
+NIGHT-WORK.md
