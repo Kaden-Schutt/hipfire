@@ -153,15 +153,27 @@ allow for, even though near-term we only wire the AR strategy.
 7. **VAD / diarization** — pyannote segmentation models; preprocessing for
    streaming STT/omni, not generation.
 
-## Non-HFQ formats (need dedicated loaders, or are out of the safetensors path)
+## Foreign formats convert TO HFQ — the runtime stays HFQ-only
 
-- **`.nemo`** (parakeet, conformer) — NVIDIA NeMo tarball (weights + yaml).
-- **`model_index.json`** (Qwen-Image) — diffusers multi-component pipeline.
-- **`config.yaml`** (pyannote) — pyannote framework.
-- **`model_type=onnx`** (supertonic) — ONNX runtime graph.
+**Assumption (2026-06-19):** every source format is converted to an HFQ artifact
+offline, exactly as safetensors and GGUF already are. The *runtime* only ever
+ingests HFQ; format diversity is absorbed by **converter front-ends**, never by
+runtime special-casing. HFQ is tensor-generic (named tensors + `arch_id` +
+metadata JSON), so it holds non-transformer weights — Conformer/Whisper audio
+encoders, neural codecs/vocoders, ViTs, VAEs — without format changes.
 
-These don't flow through the HFQ/safetensors quantizer ingest; each needs a
-bespoke loader (or stays out of scope).
+So these are **converter front-ends to build**, not runtime loaders:
+
+- **`.nemo`** (parakeet, conformer) — NeMo tarball (PyTorch ckpt + yaml): untar,
+  map tensor names + arch metadata → HFQ.
+- **`model_index.json`** (Qwen-Image) — diffusers multi-component pipeline:
+  per-component (MMDiT / VAE / text-encoder) safetensors → HFQ bundle.
+- **`config.yaml`** (pyannote) — pyannote segmentation → HFQ.
+- **`model_type=onnx`** (supertonic) — ONNX graph → extract weights → HFQ.
+
+Front-ends live next to the existing safetensors/GGUF ingest in
+`hipfire-quantize`; the engine's loader surface does not grow per format. (Image
+diffusion may still be a separate *engine*, but even its weights would ship HFQ.)
 
 ## Scope framing (honest)
 
@@ -172,3 +184,40 @@ is a normal-but-large new text+vision arch. **(F) audio STT/TTS** and **(D) omni
 are major multi-quarter subsystems; **(G) image-gen** is a separate engine. The
 family-seam refactor (output-strategy + input-adapter decomposition) is exactly
 what keeps these addable later without re-architecting the core.
+
+## Realtime / streaming serving (a distinct serving mode)
+
+Several audio/omni models carry a **hard latency requirement**, not just a
+throughput target — they must run **faster than real time (RTF < 1)** and emit
+incrementally:
+
+- **Streaming STT**: `parakeet-realtime_eou_120m`, `multitalker-parakeet-
+  streaming-0.6b`, `kyutai-stt` — audio arrives in chunks; the encoder runs
+  incrementally with **bounded right-context** (cache-based Conformer), and
+  tokens emit with bounded delay. Cannot wait for the full utterance.
+- **Streaming TTS**: `kyutai pocket-tts`, Kokoro/supertonic in streaming use —
+  low **first-chunk latency**; the vocoder/codec must synthesize faster than
+  playback.
+- **Full-duplex omni**: kyutai (Moshi lineage) and Qwen-Omni
+  thinker→talker→codec — **listen and speak simultaneously** on a fixed frame
+  clock (e.g. 12.5 Hz / 80 ms frames); every frame's encoder + LLM + codec work
+  must fit the per-frame budget.
+
+Architectural implications (mostly future, but they constrain the seam *now*):
+
+- **Streaming I/O in the serving abstraction.** The output-strategy/`GenerateCtx`
+  surface must not bake in "fixed prompt → N tokens": realtime input is a
+  *stream of frames*, output is a *stream with a latency SLA*. A `Streaming`
+  serving mode sits beside the batch AR loop.
+- **Stateful incremental encoders** (encoder cache / ring buffer), not
+  full-sequence prefill, for the audio input adapter.
+- **Latency, not just tok/s, becomes a gate.** Add a real-time-factor / per-frame
+  wall-clock budget to the perf methodology for these models; the existing
+  ±1–3% tok/s band doesn't capture a missed frame deadline. On the gfx1151 UMA
+  APU especially, the encoder+LLM+codec pipeline sharing memory bandwidth is the
+  risk to validate.
+
+Take-away for the seam: keep the loop pluggable enough that a streaming/duplex
+strategy is *a* strategy, not a rewrite — same reason `ServingBackend` must span
+AR / pooling / diffusion. Realtime is the latency-bounded streaming variant of
+the speech-out output strategy.
