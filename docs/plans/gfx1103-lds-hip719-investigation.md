@@ -398,6 +398,15 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
     separate `ds_load_b32` instructions instead of the packed
     `ds_load_2addr_b64` / `ds_load_b64` sequence. A recovery
     `tile6_lds_two_store_once_one_read` control passed.
+  - The dynamic-column load/use split then found a sharper independent-load
+    boundary. `tile6_lds_store_then_load_dynamiccols_load4_use4` passed at 100
+    launches, while `tile6_lds_store_then_load_dynamiccols_load5_use5` failed
+    at sync 92. Throwaway auxiliary controls also failed:
+    `dynamiccols_load6_use5` at sync 82 and `dynamiccols_load5_use6` at sync
+    91. This means the old static read-width boundary is instruction-form
+    dependent: packed/static read5 still passes, but five independent
+    dynamic-address row `ds_load_b32` operations are enough to reproduce the
+    reset.
   - The cross-row load split `tile6_lds_store_then_load_nextrow_read6` also
     failed under the 100-launch stress envelope, at sync 88. Clean follow-up
     runs passed at `N_LAUNCH=1` and `N_LAUNCH=2`, so treat the earlier
@@ -443,7 +452,8 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   they use `group_segment_fixed_size=288`, but together they show same-tile
   membership is not required on either side of the split. The dynamic-column
   split rules out the packed contiguous row-load instruction form as a
-  requirement; six independent `ds_load_b32` row loads are still enough.
+  requirement; independent dynamic-address `ds_load_b32` row loads are still
+  enough, and their stress threshold is lower: four pass and five fail.
   Barrier count alone is ruled out by the three-barrier no-LDS pass and the
   isolated extra-load / isolated load-store phase controls.
 - The throwaway split's resource metadata is useful: no-LDS and barrier-only
@@ -474,7 +484,10 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   load-before-store ordering. The dynamic-column split keeps `144`,
   `sgpr_count=5`, and raises `vgpr_count` to `17` while replacing packed row
   LDS loads with six separate dynamic-address `ds_load_b32` operations. The
-  cross-row load split uses `144`,
+  promoted dynamic load/use controls keep `144` and `sgpr_count=5`;
+  `load4_use4` passes with `vgpr_count=13`, while `load5_use5` fails with
+  `vgpr_count=15`. Throwaway `load6_use5` and `load5_use6` also fail with
+  `vgpr_count=16` and `15`, respectively. The cross-row load split uses `144`,
   `sgpr_count=5`, and `vgpr_count=13`, and rules out same-row membership as a
   required trigger component. The separate-tile load split uses `288`,
   `sgpr_count=4`, and `vgpr_count=13`, and rules out same-tile membership when
@@ -576,6 +589,17 @@ Latest artifact paths:
   row loads. Metadata is `group_segment_fixed_size=144`, `sgpr_count=5`, and
   `vgpr_count=17`. A recovery `tile6_lds_two_store_once_one_read` control
   passed at 20 launches.
+- `/tmp/hipfire-lds-load-use-split-runs/`: dynamic row-load/use-count controls.
+  Promoted `tile6_lds_store_then_load_dynamiccols_load4_use4` passed at 100
+  launches with four independent row `ds_load_b32` operations (`144`,
+  `sgpr_count=5`, `vgpr_count=13`). Promoted
+  `tile6_lds_store_then_load_dynamiccols_load5_use5` failed at sync 92 with
+  five independent row `ds_load_b32` operations (`144`, `sgpr_count=5`,
+  `vgpr_count=15`). Throwaway auxiliaries
+  `tile6_lds_store_then_load_dynamiccols_load6_use5` and
+  `tile6_lds_store_then_load_dynamiccols_load5_use6` failed at sync 82 and
+  sync 91, respectively. Recovery controls passed between reset-producing
+  runs.
 - `/tmp/hipfire-lds-crossrow-runs/`: cross-row extra-load controls. The first
   two-launch run failed adjacent to prior reset pressure, but a recovery
   `tile6_lds_second_store_only_read6` control passed, then clean
