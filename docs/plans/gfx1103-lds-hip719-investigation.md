@@ -106,6 +106,7 @@ VARIANT=tile6_lds_store_then_load_dynamiccols_load3_split1_consume3_pinned MODE=
 VARIANT=tile6_lds_store_then_load_dynamiccols_load4_noextra_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-noextra-consume4-pinned-780m
 VARIANT=tile6_lds_store_then_load_dynamiccols_load3_noextra_consume3_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-noextra-consume3-pinned-780m
 VARIANT=tile6_lds_store_then_load_dynamiccols_load4_nextrow_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-nextrow-consume4-pinned-780m
+VARIANT=tile6_lds_store_then_load_dynamiccols_load4_separate_tile_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-separate-tile-consume4-pinned-780m
 ```
 
 The currently promoted standalone GEMM jig lives in the repo:
@@ -507,6 +508,13 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
     extra ordinary LDS load and the four dynamic row loads as a required
     trigger component in the pinned form. Caveat: the computed next-row address
     raises the VGPR count to 13.
+  - The pinned separate-tile extra-load control failed at sync 88. It
+    initializes `Xs` once, keeps the per-K second store and four waited /
+    interleaved dynamic row loads on `As`, and changes only the extra ordinary
+    LDS load to `Xs[ty][tx]`. This shows the extra ordinary LDS load does not
+    need to come from the same LDS tile as the four dynamic row loads in the
+    pinned four-load shape. Caveat: this uses `group_segment_fixed_size=288`
+    and `sgpr_count=6`.
   - The cross-row load split `tile6_lds_store_then_load_nextrow_read6` also
     failed under the 100-launch stress envelope, at sync 88. Clean follow-up
     runs passed at `N_LAUNCH=1` and `N_LAUNCH=2`, so treat the earlier
@@ -559,11 +567,13 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   fail with four row-loads even when FMACs are pinned between loads. Removing
   the extra ordinary LDS load makes the four-load pinned variant pass 100
   launches with the same resource tuple, while moving that extra load to the
-  next row still fails. The leading local suspect is now the combination of a
-  second LDS store, an extra ordinary LDS load from the same LDS tile, four
-  dynamic row LDS loads separated by explicit waits with interleaved consumes,
-  and repeated launch/process state, with strong same-process/reset-state
-  sensitivity.
+  next row or to a separate one-time-initialized LDS tile still fails. The
+  leading local suspect is now the combination of a second LDS store, an extra
+  ordinary LDS load, four dynamic row LDS loads separated by explicit waits
+  with interleaved consumes, and repeated launch/process state, with strong
+  same-process/reset-state sensitivity. Same-row and same-tile membership are
+  no longer required by the current evidence, though the separate-tile control
+  changes the group segment and SGPR tuple.
   Barrier count alone is ruled out by the three-barrier no-LDS pass and the
   isolated extra-load / isolated load-store phase controls.
 - The throwaway split's resource metadata is useful: no-LDS and barrier-only
@@ -620,7 +630,10 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   that load is removed. The pinned next-row extra-load control fails with
   `144`, `sgpr_count=5`, and `vgpr_count=13`, which rules out same-row
   membership in this minimized pinned shape but has a higher VGPR count due to
-  the computed next-row address. The cross-row load split
+  the computed next-row address. The pinned separate-tile extra-load control
+  fails with `288`, `sgpr_count=6`, and `vgpr_count=11`, showing same-tile
+  membership is also not required in the pinned four-load shape, with the
+  caveat that the resource tuple differs. The cross-row load split
   uses `144`, `sgpr_count=5`, and `vgpr_count=13`, and rules out same-row
   membership as a required trigger component. The separate-tile load split uses
   `288`,
@@ -817,6 +830,17 @@ Latest artifact paths:
   follow-up one-launch `load4_noextra_consume4_pinned` recovery smoke passed.
   This shows the extra ordinary LDS load does not need to target the same row
   as the four dynamic row loads in the pinned minimized shape.
+- `/tmp/hipfire-lds-separate-tile-pinned-runs/`: pinned separate-tile
+  extra-load control. Throwaway
+  `tile6_lds_store_then_load_dynamiccols_load4_separate_tile_consume4_pinned`
+  passed one-launch smoke. ISA initializes `Xs` once before the loop, then
+  emits the per-K second store on `As`, an extra `ds_load_b32` from `Xs`, and
+  four waited/interleaved dynamic row loads from `As`. Metadata is
+  `group_segment_fixed_size=288`, `sgpr_count=6`, and `vgpr_count=11`. The
+  100-launch run failed at sync 88 with HIP 719. A follow-up one-launch
+  `load4_noextra_consume4_pinned` recovery smoke passed. This shows the extra
+  ordinary LDS load does not need to come from the same LDS tile as the four
+  dynamic row loads in the pinned four-load shape.
 - `/tmp/hipfire-lds-crossrow-runs/`: cross-row extra-load controls. The first
   two-launch run failed adjacent to prior reset pressure, but a recovery
   `tile6_lds_second_store_only_read6` control passed, then clean
