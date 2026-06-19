@@ -34,7 +34,7 @@ __device__ __forceinline__ float load_b(
     return transB ? B[(size_t)n * ldb + bk] : B[(size_t)bk * ldb + n];
 }
 
-extern "C" __launch_bounds__(TILE * TILE, 4)
+extern "C" __launch_bounds__(TILE * TILE)
 __global__ void gemm_f32_train(
     const float* __restrict__ A,
     const float* __restrict__ B,
@@ -64,7 +64,7 @@ __global__ void gemm_f32_train(
 
 // Accumulating variant: C = beta*C + op(A)·op(B). Used where a gradient lands on
 // a buffer that already holds a partial (residual-merged dX, LoRA dX onto base).
-extern "C" __launch_bounds__(TILE * TILE, 4)
+extern "C" __launch_bounds__(TILE * TILE)
 __global__ void gemm_f32_train_accum(
     const float* __restrict__ A,
     const float* __restrict__ B,
