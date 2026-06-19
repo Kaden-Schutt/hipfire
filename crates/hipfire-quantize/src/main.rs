@@ -4375,6 +4375,9 @@ fn should_quantize(name: &str) -> bool {
     if name.starts_with("model.visual.")
         || name.starts_with("visual.")
         || name.starts_with("vision_tower.")
+        // Gemma3 multimodal projector (mm_input_projection_weight) — kept F32 so
+        // the SigLIP/projector loader's source-precision reader consumes it.
+        || name.starts_with("multi_modal_projector.")
     {
         return false;
     }
@@ -6982,6 +6985,15 @@ fn main() {
             eprintln!("Warning: unknown architecture '{other}', treating as llama");
             0
         }
+    };
+    // Gemma3 multimodal (Gemma3ForConditionalGeneration) carries a `vision_config`
+    // → arch_id 13 (gemma3-vl: SigLIP tower + projector + the gemma3 text
+    // decoder). Pure-text `gemma3`/`gemma3_text` stay 12. Text tensors are
+    // `language_model.*`-prefixed; vision/projector stay F32 (see should_quantize).
+    let auto_arch_id = if auto_arch_id == 12 && config.get("vision_config").is_some() {
+        13
+    } else {
+        auto_arch_id
     };
     // --arch-id <u32> overrides the auto-detected id. Use when the
     // model's family maps to a different crate than the default
@@ -10725,10 +10737,14 @@ fn main() {
     // gemma3 forward. Norms ship at source precision (F32/F16/BF16); convert,
     // offset, convert back to the same dtype. The `gemma_norm_offset=1.0`
     // metadata marker records that this happened.
-    if arch_id == 12 {
+    if arch_id == 12 || arch_id == 13 {
         let mut n_baked = 0usize;
         for t in hfq_tensors.iter_mut() {
-            if !t.name.ends_with("norm.weight") {
+            // Bake the gemma (1+w) RMSNorms (text norms + the projector's
+            // mm_soft_emb_norm), but NOT the SigLIP vision tower's standard
+            // LayerNorms — `vision_tower.*.post_layernorm.weight` also ends in
+            // `norm.weight` and must be left untouched (arch_id 13).
+            if !t.name.ends_with("norm.weight") || t.name.starts_with("vision_tower.") {
                 continue;
             }
             if t.spilled_len > 0 {
