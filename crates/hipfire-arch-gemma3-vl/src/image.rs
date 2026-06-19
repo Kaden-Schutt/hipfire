@@ -21,7 +21,11 @@ pub fn preprocess_image(path: &Path, cfg: &SigLipConfig) -> Result<Vec<f32>, Str
     let size = cfg.image_size as u32;
     // Resize to a fixed square (Gemma3 uses a fixed image_size grid).
     let img = img
-        .resize_exact(size, size, image::imageops::FilterType::CatmullRom)
+        // BILINEAR to match HF Gemma3ImageProcessor (`resample: 2`). Parity with
+        // the training preprocessing matters more than subjective sharpness — a
+        // cubic filter would feed the model a different (off-distribution) 896²
+        // tensor than it was trained on. `Triangle` is the image-crate bilinear.
+        .resize_exact(size, size, image::imageops::FilterType::Triangle)
         .to_rgb8();
 
     let s = cfg.image_size;
