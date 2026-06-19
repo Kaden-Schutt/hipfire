@@ -213,6 +213,14 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 | Direct-AB no-output `6x6` active/block, reads=6, 192 iterations, 511x86 grid, 100 launches | FAIL | Launch-count high side; failed at sync 98-99 with the same gfxhub/GDS coredump signature. |
 | Direct-AB no-output `6x6` active/block, reads=6, 192 iterations, 511x86 grid, split-process 98+1 launches | PASS | Same reused binary; three trials passed both the 98-launch process and the follow-up 1-launch process. |
 | Direct-AB no-output `6x6` active/block, reads=6, 192 iterations, 511x86 grid, one-process 99 launches after split controls | FAIL | Same reused binary and total launch count as split 98+1; failed at sync 98. |
+| Direct-AB phase-mode `6x6`, reads=6, 192 iterations, 511x86 grid, same-process 98+1 | PASS | Phase-mode runner, null stream, extra boundary synchronize; total 99 passed. |
+| Direct-AB phase-mode `6x6`, reads=6, 192 iterations, 511x86 grid, same-process 99+0 | PASS | Phase-mode runner, total 99 passed before the edge shifted again. |
+| Direct-AB phase-mode `6x6`, reads=6, 192 iterations, 511x86 grid, same-process 99+1 | FAIL | Failed on phase2 launch 0 / global launch 99. |
+| Direct-AB phase-mode `6x6`, reads=6, 192 iterations, 511x86 grid, same-process 98+2 | FAIL | Failed on phase2 launch 1 / global launch 99; preserved repeat failed 2/2. |
+| Direct-AB phase-mode `6x6`, reads=6, 192 iterations, 511x86 grid, device-reset 98+2 | FAIL | `hipDeviceReset()` between phases returned success, but phase2 launch 1 / global launch 99 still failed. |
+| Direct-AB phase-mode `6x6`, reads=6, 192 iterations, 511x86 grid, stream-recreate 98+2 | FAIL | Destroying phase1 stream and creating phase2 stream did not clear the edge. |
+| Direct-AB phase-mode `6x6`, reads=6, 192 iterations, 511x86 grid, same-stream 98+2 | MIXED | Explicit non-default stream was state-sensitive: one preserved pass and three preserved failures. |
+| Direct-AB phase-mode `6x6`, reads=6, 192 iterations, 511x86 grid, cross-process 98+2 | PASS | Two trials passed `98+0` in one process followed by `2+0` in a new process. |
 | Direct-AB no-output `6x6` active/block, reads=3, 448 iterations, 511x86 grid | PASS | Grid-width low side at fixed read/loop edge. |
 | Direct-AB no-output `6x6` active/block, reads=3, 448 iterations, 512x86 grid | MIXED | Fails on repeat, but the exact launch edge moves with reset/GPU state. |
 | Direct-AB no-output `6x6` active/block, reads=3, 448 iterations, 512x86 grid, 94-99 launches | PASS | Initial launch-count sweep low side. |
@@ -331,6 +339,19 @@ Latest artifact paths:
   current evidence that the immediate edge is tied to same-process/HIP queue
   lifetime or same-queue dispatch sequence, not just total LDS work submitted
   across a process boundary.
+- `/tmp/hipfire-lds-direct-ab-phase-artifacts/`: phase-mode direct-AB probe
+  artifacts. The kernel body matches the direct-AB no-output source; only host
+  launch sequencing changes. At reads=6/192/511x86, same-process `99 + 1`
+  fails on phase2 launch 0 / global launch 99, and same-process `98 + 2`
+  fails on phase2 launch 1 / global launch 99. `hipDeviceReset()` between
+  `98 + 2` phases returns success but does not clear the edge; stream
+  destroy/recreate also does not clear it. Cross-process `98+0` followed by
+  `2+0` passes in two trials using the same phase-probe binary.
+- `/tmp/hipfire-lds-direct-ab-phase-repeat-artifacts/`: preserved repeats for
+  phase-mode `98 + 2`. Default/null-stream same-process mode failed 2/2 at
+  phase2 launch 1 / global launch 99. Explicit same-stream mode was mixed:
+  one preserved pass and three preserved failures, so stream mode changes the
+  state sensitivity but is not a reliable fix or root-cause discriminator.
 
 ## Current Narrowing
 
@@ -579,6 +600,18 @@ Reduction results after extending the standalone HIP GEMM probe:
   state-sensitive, but not the broad fact that slightly shorter same-process
   runs pass and slightly longer same-process runs fail with the same generated
   code.
+- Phase-mode controls sharpen the process-boundary result. With the same
+  direct-AB kernel body at reads=6/192/511x86, same-process `99 + 1` fails on
+  phase2 launch 0 / global launch 99, and same-process `98 + 2` fails on
+  phase2 launch 1 / global launch 99. Repeating default/null-stream `98 + 2`
+  preserved the failure 2/2. `hipDeviceReset()` between `98 + 2` phases returns
+  success but still fails on the same phase2/global launch, so HIP context
+  reset from inside the process is not sufficient. Destroying and recreating a
+  stream between phases is also insufficient. Cross-process `98+0` followed by
+  `2+0` passes 2/2, so process exit still clears enough state to avoid the
+  immediate edge. Explicit same-stream `98 + 2` is mixed: one preserved pass
+  and three preserved failures. Treat stream choice as a state-sensitivity
+  modifier, not a reliable explanation.
 
 The synthetic failure coredump again reports:
 
@@ -616,6 +649,18 @@ The reused-binary split-process controls captured the same signature for the
 one-process 99-launch failure and the failed 99-launch half of the `99 + 1`
 split attempt. The successful `98 + 1` split-process trials did not create a
 new coredump.
+
+Phase-mode failures captured the same signature for same-process `98 + 2`,
+`hipDeviceReset()`-between-phases `98 + 2`, stream-recreate `98 + 2`, and
+failed same-stream `98 + 2` repeats:
+
+```text
+[gfxhub] Page fault observed
+Faulty page starting at address: 0x000074669d000000
+Protection fault status register: 0x841051
+regGDS_PROTECTION_FAULT                             0x3f000007
+regGDS_VM_PROTECTION_FAULT                          0x0fc00113
+```
 
 Code object/resource observations from `llvm-readobj` dumps:
 
@@ -660,6 +705,7 @@ LDS-only control:
 | direct-AB no-output `6x6` block, reads=3, 448 iters | PASS at 511x86, FAIL on repeat at 512x86 | `_Z19lds_direct_ab_probev` | 288 B | 34 | 2 | 0 | 32 |
 | direct-AB no-output `6x6` block, reads=6, 192 iters, 511x86 | PASS at 98 launches, MIXED at 99 launches, FAIL at 100 launches | `_Z19lds_direct_ab_probev` | 288 B | 52 | 2 | 0 | 32 |
 | direct-AB no-output `6x6` block, reads=6, 192 iters, 511x86, split-process | PASS for 98+1 split, FAIL for one-process 99 | `_Z19lds_direct_ab_probev` | 288 B | 52 | 2 | 0 | 32 |
+| direct-AB phase-mode `6x6` block, reads=6, 192 iters, 511x86 | PASS for cross-process 98+2, FAIL for same-process 98+2 / device-reset 98+2 / stream-recreate 98+2 | `_Z25lds_direct_ab_phase_probev` | 288 B | 52 | 2 | 0 | 32 |
 | direct-AB no-output `6x6` block, reads=3, 448 iters, 512x86 | PASS at 99 launches, FAIL on 100+ launch repeats | `_Z19lds_direct_ab_probev` | 288 B | 34 | 2 | 0 | 32 |
 | direct-AB no-output `8x4` active in `8x5` block, reads=6 | PASS at 512 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 256 B | 22 | 5 | 0 | 32 |
 
@@ -753,9 +799,13 @@ Best current hypothesis:
 > reads=3/448 case. Reused-binary split-process controls narrow the cumulative
 > part further: at the reads=6/192/511x86 edge, `98 + 1` launches split across
 > two processes pass repeatedly, while 99 launches in one process fail. That
-> implicates same-process/HIP queue lifetime or same-queue dispatch sequencing
-> in the immediate trigger. Exec-mask structure alone does not appear to be the
-> deciding factor.
+> implicates same-process lifetime in the immediate trigger. Phase-mode controls
+> refine that further: `hipDeviceReset()` and stream destroy/recreate inside the
+> same process do not clear the edge for `98 + 2`, while process exit between
+> `98` and `2` does. The remaining suspect layer is therefore more like
+> process-scoped HIP/HSA/KFD state, code-object/queue bookkeeping, or GPU state
+> keyed by the process, not merely a user-visible stream lifetime. Exec-mask
+> structure alone does not appear to be the deciding factor.
 
 ## Next Evidence To Capture
 
@@ -785,11 +835,12 @@ control):
 - use the minimal no-output repro for the next reduction: repeat the 256-pass /
   320-fail correlate in fresh processes and try smaller active-lane shapes
   around the one-wave/two-wave boundary.
-- use the direct-AB no-output repro for the next reduction: add a phase-mode
-  runner that can do `98 + 1` inside one process with optional `hipDeviceReset`,
-  stream destroy/recreate, or device synchronize between phases. Compare that
-  against the current cross-process `98 + 1` pass and one-process 99 fail to
-  separate process lifetime, HIP context reset, and queue/stream lifetime.
+- use the direct-AB phase-mode repro for the next reduction: add an optional
+  child-process/fork mode or a parent wrapper that runs phase2 through
+  `execve()` after phase1. Compare that with `hipDeviceReset()` to separate
+  process exit, address-space teardown, and parent process lifetime. Also test
+  a lower grid/launch edge to see whether the process-boundary finding holds
+  away from the state-sensitive 511x86 boundary.
 - create a single-instantiation compile unit for the failing synthetic symbol
   and the passing long-loop symbol so instruction counts can be per-symbol
   instead of object-aggregate.
