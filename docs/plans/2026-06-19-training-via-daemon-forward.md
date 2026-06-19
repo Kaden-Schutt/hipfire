@@ -179,3 +179,24 @@ more daemon chunks) and/or (b) ARCHITECTURE that shares more of the gated-delta-
 target's structure at small param count — conv1d short-conv, then the delta rule —
 NOT more parameters. Next rung: tiny conv1d short causal conv before the gate
 (Mamba selectivity), kept at ~7-10M params.
+
+### Weight-decay ablation — NEGATIVE (cheap knobs exhausted): 2026-06-19
+
+3L/h512/7.74M + wd=0.05, 400 epochs: best **+0.381** (erratic eval, dips to +0.11
+mid-run), never recovers to the wd=0 +0.554. Same underfitting signature wd gave
+the attention drafter. So for the SMALL model wd HURTS, while the BIG model
+overfits at wd=0 — the sweet spot is exactly the original small/low-wd config.
+
+**Consolidated ablation verdict (3 runs, consistent):** capacity↑ → worse (overfit),
+wd↑ → worse (underfit), base 3L/h512/wd0 → +0.554. **+0.554 is the GLA-lite ceiling
+for this 32-chunk data budget; no hyperparameter closes the gap to +0.702.** The
+two real levers left, both larger investments:
+- **More data** — recapture daemon labels with many more chunks (current cache is
+  only 40; 32 train is starving even 7.74M). Cheapest principled fix; ~30 min capture.
+- **Architecture** — conv1d short causal conv before the gate (Mamba selectivity),
+  then the delta rule → full gated-delta-net. New gradchecked primitive(s) at small
+  param count, sharing more of the target's structure.
+
+Recommend doing the data recapture FIRST (cheap, and the overfitting proves we're
+data-limited) before investing in the conv1d primitive — a bigger model on more
+data may be what actually clears the bar.
