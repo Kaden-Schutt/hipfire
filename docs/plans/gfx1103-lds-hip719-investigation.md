@@ -113,6 +113,7 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 | Standalone LDS-only `TILE=6`, 6x6 block | PASS | 100 direct HIP launches, 64x64 grid, no dmesg delta. |
 | Standalone LDS-only `TILE=8`, 8x8 block | PASS | 100 direct HIP launches, 64x64 grid, no dmesg delta. |
 | Standalone LDS-only `TILE=16`, 16x16 block | PASS | 100 direct HIP launches after fixing an output-allocation bug in the probe; no new dmesg delta. |
+| Standalone LDS-only `TILE=6`, 128 iterations, 448x86 grid | PASS | Large grid alone is not enough with the short loop. |
 | Standalone HIP GEMM `TILE=5`, 5x5 block | PASS | 100 direct HIP launches at M=512, N=3072, K=3072; no dmesg delta. |
 | Standalone HIP GEMM `TILE=6`, 6x6 block | FAIL | Direct HIP, no hipfire Rust/JIT path; sync 20 failed with HIP 719 and MES reset. |
 | Standalone GEMM reduction `TILE=6`, no C store | FAIL | C/global output write is not required; failed with HIP 719. |
@@ -132,6 +133,12 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 | Standalone GEMM synthetic `TILE=6`, M=512, N=2880, K=2048 | FAIL | 100-launch shape repeat failed at sync 87. |
 | Standalone GEMM synthetic `TILE=6`, M=512, N=3072, K=2048 | FAIL | 100-launch shape repeat failed at sync 81. |
 | Standalone GEMM synthetic masked `TILE=6`, M=512, N=2688, K=2048 | FAIL | Exec-mask regions were emitted around active LDS regions; still failed at sync 95. |
+| Standalone LDS-only `TILE=6`, 512 iterations, 288x86 grid | PASS | Simple LDS-only threshold control. |
+| Standalone LDS-only `TILE=6`, 512 iterations, 304x86 grid | FAIL | Simple LDS-only repro; failed at sync 97. |
+| Standalone LDS-only `TILE=6`, 512 iterations, 320x86 grid | FAIL | Failed at sync 90; same coredump signature. |
+| Standalone LDS-only `TILE=6`, 512 iterations, 448x86 grid | FAIL | Grid-matched to synthetic N=2688/M=512; failed at sync 64. |
+| Standalone LDS-only no-mask `TILE=6`, 512 iterations, 288x86 grid | PASS | Removes exec-mask regions; same pass side as masked control. |
+| Standalone LDS-only no-mask `TILE=6`, 512 iterations, 304x86 grid | FAIL | Removes exec-mask regions; failed at sync 98. |
 
 Latest artifact paths:
 
@@ -172,6 +179,15 @@ Latest artifact paths:
   produced the same GDS/GDS-VM coredump signature.
 - `/tmp/hipfire-lds-standalone-long-artifacts/`: passing long-loop LDS-only
   control, including `TILE=6`, 512 iterations, 100 launches at 64x64 grid.
+- `/tmp/hipfire-lds-standalone-gridmatch-artifacts/`: grid/work sweep for the
+  existing masked LDS-only `TILE=6`, 512-iteration control. At 100 launches
+  and grid_y=86, grid_x 192, 256, and 288 pass; grid_x 304, 320, 384, 416,
+  and 448 fail. Failure moves earlier as the grid grows: sync 97 at 304x86,
+  sync 90 at 320x86, sync 75 at 384x86, sync 68 at 416x86, sync 64 at 448x86.
+  The short 128-iteration `tile6` control passes at 448x86.
+- `/tmp/hipfire-lds-standalone-nomask-artifacts/`: no-mask LDS-only controls.
+  `tile6_i512_nomask` matches the masked threshold: 288x86 passes, 304x86
+  fails at sync 98. `tile6_nomask` with 128 iterations passes at 448x86.
 
 ## Current Narrowing
 
@@ -182,15 +198,18 @@ Evidence argues against these as sole causes:
 - A-side vs B-side address math: A-only and B-only LDS both fail.
 - LDS allocation size alone: tiny 4x4 active LDS inside an 8x8 block passes.
 - Multi-wave `__syncthreads()` alone: 4x4 active LDS inside 8x8 block passes.
-- Multi-wave LDS store/load/barrier alone: standalone HIP LDS-only kernels pass
-  for `TILE=6`, `TILE=8`, and `TILE=16` at 100 launches with 64x64 grids.
+- Multi-wave LDS store/load/barrier alone at small grids: standalone HIP
+  LDS-only kernels pass for `TILE=6`, `TILE=8`, and `TILE=16` at 100 launches
+  with 64x64 grids.
 - hipfire Rust runtime/JIT/dispatch as the root cause: a standalone HIP GEMM
   repro using `hipcc` and direct `hipLaunchKernelGGL` still fails.
 - Actual global memory access as the root cause: a compile-time standalone
   synthetic `TILE=6` kernel with no global loads and no C/global store still
   fails once K-loop work and grid size are high enough.
-- Long LDS loop alone as the root cause: the simpler LDS-only `TILE=6` probe
-  with 512 iterations passes at 100 launches and a 64x64 grid.
+- Exec-mask presence as the root cause: adding LDS-only-style exec-mask regions
+  to the synthetic GEMM-shaped kernel did not help, and removing exec-mask
+  regions from the LDS-only control did not move the 288x86 pass / 304x86 fail
+  threshold.
 
 The `tile6` dmesg delta shows a driver-side device wedge, not a simple HIP
 runtime recoverable error. The latest v2 failing run again reset through the
@@ -305,6 +324,17 @@ Reduction results after extending the standalone HIP GEMM probe:
   sync 95 for M=512, N=2688, K_LIMIT=2048. This weakens the hypothesis that the
   passing LDS-only control survives solely because it has `s_and_saveexec_b32`
   / `s_cbranch_execz` around LDS store/load regions.
+- Grid-matching the simpler LDS-only control changes the conclusion. The
+  `tile6_i512` LDS-only kernel that passes at 64x64 fails once the grid and
+  total LDS work are large enough, without GEMM global-memory traffic and
+  without the synthetic GEMM-shaped source. At 100 launches with grid_y=86,
+  grid_x 288 passes and 304 fails; larger grids fail earlier. The short
+  128-iteration `tile6` LDS-only kernel still passes at 448x86, so grid size
+  alone is not enough.
+- Removing exec-mask regions from the LDS-only control does not shift that
+  threshold materially. `tile6_i512_nomask` passes at 288x86 and fails at
+  304x86, matching the masked control. The no-mask failure's coredump has the
+  same gfxhub/GDS/GDS-VM signature.
 
 The synthetic failure coredump again reports:
 
@@ -345,6 +375,7 @@ LDS-only control:
 | synthetic GEMM-shaped `TILE=6`, no global/no store | FAIL | `_Z20gemm_lds_synth_probeILi6EEviiii` | 288 B | 18 | 5 | 0 | 32 |
 | masked synthetic GEMM-shaped `TILE=6`, no global/no store | FAIL | `_Z27gemm_lds_synth_masked_probeILi6EEviiii` | 288 B | 18 | 7 | 0 | 32 |
 | LDS-only `TILE=6`, 512 iterations | PASS | `_Z9lds_probeILi6ELi6ELi512EEvPfi` | 288 B | 20 | 8 | 0 | 32 |
+| LDS-only no-mask `TILE=6`, 512 iterations | FAIL at 304x86 | `_Z16lds_probe_nomaskILi6ELi512EEvPfi` | 288 B | 56 | 8 | 0 | 32 |
 
 ISA observations:
 
@@ -381,20 +412,26 @@ ISA observations:
   LDS regions and has 288 B LDS, 18 VGPR, 7 SGPR, and zero spills. It still
   fails, so the remaining difference from the passing LDS-only long-loop
   control is not just the presence of exec-mask instructions.
+- The no-mask LDS-only `tile6_i512_nomask` symbol has no `s_and_saveexec`
+  inside the symbol, 288 B LDS, 56 VGPR, 8 SGPR, and zero spills. Per-symbol
+  counts for that symbol are 8 `s_barrier`, 4 `ds_store*`, 20 `ds_load*`, 13
+  `s_waitcnt`, 1 `s_cbranch`, and 1 final `global_store`. It shares the same
+  288x86 pass / 304x86 fail threshold as the masked LDS-only control.
 - The active4-in-8x8 control passed even though the launched block spans two
   waves; only 16 lanes actively touch LDS. This keeps the current hypothesis on
   active LDS traffic across waves rather than barrier presence alone.
 
 Best current hypothesis:
 
-> On gfx1103 with this ROCm/amdgpu stack, the failure is a multi-wave,
-> GEMM-shaped LDS loop/grid-duration/cumulative-launch fault, not a plain
-> global-memory bug and not LDS/barriers in isolation. The sharp lane boundary
-> remains `TILE=5` (25 active lanes, pass) vs `TILE=6` (36 active lanes, fail).
-> A no-global, no-store, compile-time synthetic GEMM-shaped kernel still
-> reproduces HIP 719 and the same MES/GDS coredump state, but only when K-loop
-> work, grid size, and repeated launches cross a narrow, reset-sensitive
-> threshold band.
+> On gfx1103 with this ROCm/amdgpu stack, the failure is a multi-wave active
+> LDS loop/grid-duration/cumulative-launch fault, not a plain global-memory
+> bug and not specific to the original GEMM global-memory traffic. The sharp
+> lane boundary remains `TILE=5` (25 active lanes, pass) vs `TILE=6` (36 active
+> lanes, fail). A no-global, no-store synthetic GEMM-shaped kernel reproduces
+> HIP 719, and a simpler LDS-only `TILE=6` long-loop kernel also reproduces it
+> once grid size and repeated launches cross a narrow, reset-sensitive
+> threshold band. Exec-mask structure does not appear to be the deciding
+> factor.
 
 ## Next Evidence To Capture
 
@@ -418,12 +455,14 @@ control):
   launch-count edge around 94-96 at N=2688 with repeated fresh-process trials,
   the N=2496-2688 grid edge at 100 launches, and the K_LIMIT=1536-2048 edge
   independently.
+- reduce the LDS-only reproducer further: binary-search the grid_x 288-304 edge
+  at grid_y=86 and 512 iterations, then test whether lowering iteration count
+  moves the edge monotonically.
 - create a single-instantiation compile unit for the failing synthetic symbol
   and the passing long-loop symbol so instruction counts can be per-symbol
   instead of object-aggregate.
-- test whether removing the exec-mask regions from the LDS-only control moves
-  its failure boundary; adding similar regions to the synthetic kernel did not
-  help.
+- create single-instantiation LDS-only masked/no-mask compile units so resource
+  and instruction counts are not polluted by unused template variants.
 
 Compare pass/fail boundary for:
 
