@@ -145,6 +145,12 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 | Standalone LDS-only `TILE=6`, 336 iterations, 512x86 grid | FAIL | Loop-depth correlate near synthetic `K_LIMIT=2048`; failed at sync 84. |
 | Standalone LDS-only `TILE=6`, 320 iterations, 448x86 grid | PASS | Tight iteration-edge control at full grid. |
 | Standalone LDS-only `TILE=6`, 336 iterations, 448x86 grid | FAIL | Tight iteration-edge repro; failed at sync 98. |
+| Minimal no-output LDS-only `TILE=5`, 512 iterations, 512x86 grid | PASS | Single-instantiation no-output control. |
+| Minimal no-output LDS-only `TILE=6`, 256 iterations, 512x86 grid | PASS | No host allocations or global stores; mirrors `K_LIMIT=1536` pass. |
+| Minimal no-output LDS-only `TILE=6`, 320 iterations, 512x86 grid | FAIL | No host allocations or global stores; failed at sync 86. |
+| Minimal no-output LDS-only `TILE=6`, 336 iterations, 512x86 grid | FAIL | No host allocations or global stores; failed at sync 84. |
+| Minimal no-output LDS-only `TILE=6`, 320 iterations, 448x86 grid | PASS | Preserves the 448x86 loop-depth edge without global stores. |
+| Minimal no-output LDS-only `TILE=6`, 336 iterations, 448x86 grid | FAIL | Preserves the 448x86 loop-depth edge; failed at sync 96. |
 | Standalone LDS-only no-mask `TILE=6`, 512 iterations, 288x86 grid | PASS | Removes exec-mask regions; same pass side as masked control. |
 | Standalone LDS-only no-mask `TILE=6`, 512 iterations, 304x86 grid | FAIL | Removes exec-mask regions; failed at sync 98. |
 
@@ -209,6 +215,12 @@ Latest artifact paths:
   grid. `tile6_i256` passes, while `tile6_i320` and `tile6_i336` fail at sync
   87 and 84 respectively. The `tile6_i320` rerun has a coredump captured
   immediately after the failure; it matches the same gfxhub/GDS signature.
+- `/tmp/hipfire-lds-minimal-artifacts/`: single-instantiation minimal
+  no-output kernel. It has no host allocations, no global-memory kernel
+  arguments, no final global store, no `s_and_saveexec`, and no global
+  load/store instructions in ISA. It preserves the correlation: tile5/512
+  passes at 512x86, tile6/256 passes at 512x86, tile6/320 and tile6/336 fail
+  at 512x86, and the 448x86 edge remains tile6/320 pass vs tile6/336 fail.
 
 ## Current Narrowing
 
@@ -363,6 +375,12 @@ Reduction results after extending the standalone HIP GEMM probe:
   loop-depth/grid threshold rather than a separate GEMM-shaped source effect.
 - The one-wave boundary still holds under the larger grid: `tile5_i512` passes
   at 512x86, while `tile6_i320` and above fail.
+- A minimal no-output kernel preserves the same thresholds. It removes host
+  device allocations, kernel global-pointer arguments, the final global store,
+  exec-mask regions, and object-aggregate template noise. Its ISA has no
+  global load/store instructions and no `s_and_saveexec`; it still passes at
+  tile6/256 and fails at tile6/320 for grid 512x86, and preserves the 448x86
+  320-pass / 336-fail edge.
 - Removing exec-mask regions from the LDS-only control does not shift that
   threshold materially. `tile6_i512_nomask` passes at 288x86 and fails at
   304x86, matching the masked control. The no-mask failure's coredump has the
@@ -408,6 +426,7 @@ LDS-only control:
 | masked synthetic GEMM-shaped `TILE=6`, no global/no store | FAIL | `_Z27gemm_lds_synth_masked_probeILi6EEviiii` | 288 B | 18 | 7 | 0 | 32 |
 | LDS-only `TILE=6`, 512 iterations | PASS | `_Z9lds_probeILi6ELi6ELi512EEvPfi` | 288 B | 20 | 8 | 0 | 32 |
 | LDS-only no-mask `TILE=6`, 512 iterations | FAIL at 304x86 | `_Z16lds_probe_nomaskILi6ELi512EEvPfi` | 288 B | 56 | 8 | 0 | 32 |
+| minimal no-output LDS-only `TILE=6` | FAIL at 320 iterations / 512x86 | `_Z17lds_minimal_probev` | 288 B | 54 | 2 | 0 | 32 |
 
 ISA observations:
 
@@ -449,6 +468,10 @@ ISA observations:
   counts for that symbol are 8 `s_barrier`, 4 `ds_store*`, 20 `ds_load*`, 13
   `s_waitcnt`, 1 `s_cbranch`, and 1 final `global_store`. It shares the same
   288x86 pass / 304x86 fail threshold as the masked LDS-only control.
+- The minimal no-output `lds_minimal_probe` symbol has 288 B LDS, 54 VGPR, 2
+  SGPR, zero spills, no global load/store instructions, and no `s_and_saveexec`.
+  Its instruction counts are 8 `s_barrier`, 4 `ds_store*`, 20 `ds_load*`, 12
+  `s_waitcnt`, and 1 `s_cbranch`.
 - The active4-in-8x8 control passed even though the launched block spans two
   waves; only 16 lanes actively touch LDS. This keeps the current hypothesis on
   active LDS traffic across waves rather than barrier presence alone.
@@ -463,8 +486,9 @@ Best current hypothesis:
 > HIP 719, and a simpler LDS-only `TILE=6` long-loop kernel also reproduces it
 > once grid size, loop depth, and repeated launches cross a narrow,
 > reset-sensitive threshold band. The synthetic `K_LIMIT` threshold aligns with
-> equivalent LDS-only loop-trip counts. Exec-mask structure does not appear to
-> be the deciding factor.
+> equivalent LDS-only loop-trip counts. A single-instantiation no-output kernel
+> with no global memory traffic preserves the edge. Exec-mask structure does
+> not appear to be the deciding factor.
 
 ## Next Evidence To Capture
 
@@ -491,8 +515,9 @@ control):
 - reduce the LDS-only reproducer further: repeat the tight grid_x 297/298 edge
   and loop-depth 320/336 edge in fresh processes to determine how much state
   sensitivity remains.
-- test whether a no-output, single-instantiation LDS-only kernel preserves the
-  same loop-depth/grid edge, using the 256-pass / 320-fail correlate at 512x86.
+- use the minimal no-output repro for the next reduction: repeat the 256-pass /
+  320-fail correlate in fresh processes and try smaller active-lane shapes
+  around the one-wave/two-wave boundary.
 - create a single-instantiation compile unit for the failing synthetic symbol
   and the passing long-loop symbol so instruction counts can be per-symbol
   instead of object-aggregate.
