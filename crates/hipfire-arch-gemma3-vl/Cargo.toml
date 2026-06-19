@@ -1,0 +1,19 @@
+[package]
+name = "hipfire-arch-gemma3-vl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Gemma3 multimodal (SigLIP vision encoder + projector + image-token splice into the gemma3 text decoder). arch_id=13."
+
+# Bring-up status: V1 — SigLipConfig + Gemma3VlConfig landed and unit-tested.
+# SigLIP encoder forward, projector, splice, and image preproc are the remaining
+# phases. Reuses hipfire-arch-gemma3 (text decoder) + qwen35-vl vision kernels.
+# See docs/plans/2026-06-19-medgemma-vision-bringup.md.
+
+[dependencies]
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-dispatch = { path = "../hipfire-dispatch" }
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }
+hipfire-arch-gemma3 = { path = "../hipfire-arch-gemma3" }
+serde_json = "1"

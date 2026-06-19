@@ -1158,6 +1158,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-gemma3-vl"
+version = "0.2.1"
+dependencies = [
+ "hip-bridge",
+ "hipfire-arch-gemma3",
+ "hipfire-dispatch",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-lfm2moe"
 version = "0.1.0"
 dependencies = [
