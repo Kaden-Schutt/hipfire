@@ -2389,6 +2389,10 @@ pub const SILU_SRC: &str = include_str!("../../../kernels/src/silu.hip");
 /// Saves one kernel launch + one intermediate buffer.
 pub const SILU_MUL_SRC: &str = include_str!("../../../kernels/src/silu_mul.hip");
 
+/// Fused GeGLU: out[i] = gelu_tanh(gate[i]) * up[i]. Gemma-family gated MLP
+/// (`gelu_pytorch_tanh`); the GeGLU analogue of SILU_MUL_SRC.
+pub const GELU_MUL_SRC: &str = include_str!("../../../kernels/src/gelu_mul.hip");
+
 /// Softmax over last dimension (one block per row)
 pub const SOFTMAX_SRC: &str = include_str!("../../../kernels/src/softmax.hip");
 

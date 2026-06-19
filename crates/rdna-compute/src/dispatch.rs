@@ -31444,6 +31444,55 @@ impl Gpu {
     }
 
     /// out = silu(gate) * up — fused to avoid intermediate buffer
+    /// Fused GeGLU: `out = gelu_tanh(gate) * up`. Gemma-family gated MLP
+    /// (`gelu_pytorch_tanh`); same launch shape as [`Self::silu_mul_f32`].
+    pub fn gelu_mul_f32(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        out: &GpuTensor,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gelu_mul", kernels::GELU_MUL_SRC, "gelu_mul_f32")?;
+
+        let n = gate.numel() as i32;
+        let mut gate_ptr = gate.buf.as_ptr();
+        let mut up_ptr = up.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut n_val = n;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gate_ptr as *mut _ as *mut c_void,
+            &mut up_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        let bytes = crate::profile::elementwise_bytes(n as usize);
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "gelu_mul_f32", bytes);
+        let result = self.launch_maybe_blob(
+            "gelu_mul_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gate_ptr);
+                b.push_ptr(up_ptr);
+                b.push_ptr(out_ptr);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     pub fn silu_mul_f32(
         &mut self,
         gate: &GpuTensor,
