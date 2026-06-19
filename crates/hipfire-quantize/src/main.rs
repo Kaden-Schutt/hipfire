@@ -6968,6 +6968,16 @@ fn main() {
         // Crate hipfire-arch-lfm2moe (arch_id 11); loader handles both via
         // num_dense_layers == num_hidden_layers for the dense variant.
         "lfm2_moe" | "lfm2" => 11,
+        // Gemma3 (text). `gemma3_text` = Gemma3ForCausalLM (clean
+        // model.layers.* names, e.g. medgemma-27b-text-it); `gemma3` =
+        // Gemma3ForConditionalGeneration (multimodal wrapper — text fields
+        // under text_config, SigLIP vision deferred to arch_id 13). Dense
+        // decoder with the Gemma quirks: (1+w) zero-centered RMSNorm (baked
+        // below), 4 norms/layer, per-head QK-norm, head_dim independent of
+        // dim/n_heads, custom attn scale query_pre_attn_scalar^-0.5, dual-theta
+        // sliding-window interleave, GeGLU gelu-tanh. Crate hipfire-arch-gemma3.
+        // See docs/plans/2026-06-19-gemma3-bringup.md.
+        "gemma3_text" | "gemma3" => 12,
         other => {
             eprintln!("Warning: unknown architecture '{other}', treating as llama");
             0
@@ -7114,6 +7124,17 @@ fn main() {
         "tokenizer_config": tokenizer_config,
         "generation_config": generation_config,
     });
+
+    // Gemma3 RMSNorm uses the (1 + weight) zero-centered convention. We bake the
+    // +1 into every norm tensor (post-pass below, before write) so the standard
+    // rmsnorm kernel — which applies plain `w` — is numerically correct at
+    // runtime, with no per-layer special-casing in the gemma3 forward. Record
+    // the offset for provenance and to make a re-quantize double-bake detectable.
+    if arch_id == 12 {
+        if let serde_json::Value::Object(ref mut m) = metadata {
+            m.insert("gemma_norm_offset".to_string(), serde_json::json!(1.0_f32));
+        }
+    }
 
     // Load all safetensors files
     let st_files: Vec<SafetensorsFile> = find_safetensors(input_dir)
@@ -10694,6 +10715,59 @@ fn main() {
         eprintln!(
             "  permute5 (#5): d_model={dmodel}, S={n_prot} clustered to front [0..{n_prot}); \
              permuted {n_e} embed/head + {n_r} readers + {n_w} writers + {n_n} norms"
+        );
+    }
+
+    // ── Gemma3 (1+w) RMSNorm baking (arch_id 12) ───────────────────────
+    // Gemma stores norm weights `w` and applies `(1 + w)`. Add 1.0 to every
+    // norm-weight tensor here so the standard rmsnorm kernel (plain `w`) is
+    // numerically correct at runtime — no per-layer special-casing in the
+    // gemma3 forward. Norms ship at source precision (F32/F16/BF16); convert,
+    // offset, convert back to the same dtype. The `gemma_norm_offset=1.0`
+    // metadata marker records that this happened.
+    if arch_id == 12 {
+        let mut n_baked = 0usize;
+        for t in hfq_tensors.iter_mut() {
+            if !t.name.ends_with("norm.weight") {
+                continue;
+            }
+            if t.spilled_len > 0 {
+                // A spilled norm can't be offset in place; shipping it unbaked
+                // would silently corrupt the (1+w) convention. Refuse loudly.
+                eprintln!(
+                    "gemma3: FATAL norm tensor {} was spilled to disk before the +1 bake; \
+                     re-run with a smaller --format or more RAM so norms stay resident",
+                    t.name
+                );
+                std::process::exit(2);
+            }
+            let dtype = match t.quant_type {
+                QuantType::F32 => "F32",
+                QuantType::F16 => "F16",
+                QuantType::BF16 => "BF16",
+                other => {
+                    eprintln!(
+                        "gemma3: FATAL norm tensor {} has quant_type {} (expected \
+                         F32/F16/BF16); cannot bake the (1+w) offset",
+                        t.name, other as u8
+                    );
+                    std::process::exit(2);
+                }
+            };
+            let mut vals = to_f32(&t.data, dtype);
+            for v in vals.iter_mut() {
+                *v += 1.0;
+            }
+            t.data = match t.quant_type {
+                QuantType::F32 => vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                QuantType::F16 => f32_slice_to_f16_bytes(&vals),
+                QuantType::BF16 => f32_slice_to_bf16_bytes(&vals),
+                _ => unreachable!(),
+            };
+            n_baked += 1;
+        }
+        eprintln!(
+            "gemma3: baked +1.0 into {n_baked} RMSNorm weight tensors (zero-centered (1+w) convention)"
         );
     }
 
