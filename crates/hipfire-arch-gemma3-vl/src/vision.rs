@@ -81,8 +81,10 @@ impl SigLipWeights {
 /// Read a tensor to a host F32 vector (F16/F32/BF16 source). Vision towers ship
 /// at source precision (the quantizer leaves them un-quantized).
 fn read_f32(hfq: &HfqFile, name: &str) -> Vec<f32> {
+    // tensor_data_vec (pread) not tensor_data (mmap): on UMA APUs the loader
+    // drops the mmap, so the mmap accessor returns None.
     let (info, data) = hfq
-        .tensor_data(name)
+        .tensor_data_vec(name)
         .unwrap_or_else(|| panic!("gemma3-vl: vision tensor not found: {name}"));
     match info.quant_type {
         1 => data

@@ -64,8 +64,9 @@ impl ProjectorWeights {
 }
 
 fn read_f32(hfq: &HfqFile, name: &str) -> Vec<f32> {
+    // tensor_data_vec (pread) not tensor_data (mmap) — UMA APUs drop the mmap.
     let (info, data) = hfq
-        .tensor_data(name)
+        .tensor_data_vec(name)
         .unwrap_or_else(|| panic!("gemma3-vl: projector tensor not found: {name}"));
     match info.quant_type {
         1 => data
