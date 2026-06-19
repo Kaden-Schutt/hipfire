@@ -373,6 +373,12 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
     six-wide row readback`, but the second store writes an independent value
     rather than the loaded value. The load-to-store data dependency is not
     required for the reset trigger.
+  - Address-split throwaway variants both failed. `tile6_lds_load_next_store_same_read6`
+    failed with HIP 719 at sync 0 after prior reset pressure; a recovery pass
+    control then succeeded, and `tile6_lds_load_same_store_next_read6` failed
+    with HIP 719 at sync 89. The emitted ISA keeps ordinary `ds_store_b32`,
+    `ds_load_b32`, `ds_store_b32`, barriers, and six-wide row readback. This
+    rules out an exact same-address LDS load/store alias as a requirement.
   - Repeating `tile6_lds_forced_same_second_store` immediately after that pass
     failed at sync 92, preserving the read-modify-write distinction in the same
     compile unit.
@@ -407,10 +413,12 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   `vgpr_count=12`. The pass-side `tile6_lds_second_store_only_read6` also uses
   `144`, `sgpr_count=5`, and `vgpr_count=12`, which rules out that resource
   tuple alone. The failing `tile6_lds_load_independent_store_read6` also uses
-  `144`, `sgpr_count=5`, and `vgpr_count=12`, so the clean boundary is the
-  extra same-address LDS load before the second same-address store plus six-wide
-  row readback, not a load-to-store value dependency. The failing `tile6_synth`
-  uses `288`, `sgpr_count=5`, and `vgpr_count=18`.
+  `144`, `sgpr_count=5`, and `vgpr_count=12`. The address-split variants use
+  `144`, `sgpr_count=5`, and `vgpr_count=13`, and both still fail when the LDS
+  load and second LDS store target different columns. The clean boundary is now
+  an extra LDS load before a second LDS store plus six-wide row readback, not a
+  load-to-store value dependency or exact same-address alias. The failing
+  `tile6_synth` uses `288`, `sgpr_count=5`, and `vgpr_count=18`.
 - A naive same-address double-store variant was not useful: the compiler reduced
   it to a single `ds_store`. A volatile padded second-address variant failed at
   sync 57, but compiled the shared accesses as `flat_store_b32` /
@@ -472,6 +480,14 @@ Latest artifact paths:
   (`group_segment_fixed_size=144`, `sgpr_count=5`, `vgpr_count=12`) and confirms
   that an LDS load before the second same-address store is sufficient; the
   second store does not need to consume the loaded value.
+- `/tmp/hipfire-lds-address-split-runs/`: address-dependency splitter controls.
+  The pass-side `tile6_lds_second_store_only_read6` control passed at 100
+  launches, `tile6_lds_load_next_store_same_read6` failed with HIP 719, a
+  20-launch recovery pass control succeeded, and
+  `tile6_lds_load_same_store_next_read6` failed with HIP 719. Both failing
+  address-split variants use one 144-byte LDS tile with `sgpr_count=5` and
+  `vgpr_count=13`, and both emit ordinary `ds_load_b32`/`ds_store_b32`
+  sequences. Exact same-address load/store aliasing is not required.
 - `/tmp/hipfire-lds-gemm-klimit-repeat-artifacts/`: repeated no-global/no-store
   K-limit sweep, including pass at `K_LIMIT=1536`, repeated failures at
   `K_LIMIT=2048`, and tile5 pass at full K.
