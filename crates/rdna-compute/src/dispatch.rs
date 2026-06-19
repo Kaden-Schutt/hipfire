@@ -41064,6 +41064,102 @@ impl Gpu {
         }
     }
 
+    /// Gated linear-recurrence scan forward (fp32). `g`,`u`,`h_out`: `[seq*D]`
+    /// row-major (time-major: index `t*D+c`). `h[t]=g[t]*h[t-1]+(1-g[t])*u[t]`,
+    /// `h[-1]=0`. One thread per channel `c`, sequential over time; no shared mem.
+    pub fn gated_scan_fwd(
+        &mut self,
+        g: &GpuTensor,
+        u: &GpuTensor,
+        h_out: &GpuTensor,
+        seq: usize,
+        d: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gated_scan_fwd",
+            kernels::GATED_SCAN_TRAIN_SRC,
+            "gated_scan_fwd",
+        )?;
+        let func = &self.functions["gated_scan_fwd"];
+        let mut gp = g.buf.as_ptr();
+        let mut up = u.buf.as_ptr();
+        let mut hp = h_out.buf.as_ptr();
+        let mut s = seq as i32;
+        let mut dd = d as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gp as *mut _ as *mut c_void,
+            &mut up as *mut _ as *mut c_void,
+            &mut hp as *mut _ as *mut c_void,
+            &mut s as *mut _ as *mut c_void,
+            &mut dd as *mut _ as *mut c_void,
+        ];
+        let blocks = (d as u32).div_ceil(256);
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [blocks, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Gated linear-recurrence scan backward (fp32). Given `d_hout`=dL/dh[t] for
+    /// every t, produces `d_g`,`d_u` (`[seq*D]`). Reverse scan, one thread per
+    /// channel; `h_out` is the forward output (needed for `h[t-1]`). No shared mem.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_scan_bwd(
+        &mut self,
+        g: &GpuTensor,
+        u: &GpuTensor,
+        h_out: &GpuTensor,
+        d_hout: &GpuTensor,
+        d_g: &GpuTensor,
+        d_u: &GpuTensor,
+        seq: usize,
+        d: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gated_scan_bwd",
+            kernels::GATED_SCAN_TRAIN_SRC,
+            "gated_scan_bwd",
+        )?;
+        let func = &self.functions["gated_scan_bwd"];
+        let mut gp = g.buf.as_ptr();
+        let mut up = u.buf.as_ptr();
+        let mut hp = h_out.buf.as_ptr();
+        let mut dhp = d_hout.buf.as_ptr();
+        let mut dgp = d_g.buf.as_ptr();
+        let mut dup = d_u.buf.as_ptr();
+        let mut s = seq as i32;
+        let mut dd = d as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gp as *mut _ as *mut c_void,
+            &mut up as *mut _ as *mut c_void,
+            &mut hp as *mut _ as *mut c_void,
+            &mut dhp as *mut _ as *mut c_void,
+            &mut dgp as *mut _ as *mut c_void,
+            &mut dup as *mut _ as *mut c_void,
+            &mut s as *mut _ as *mut c_void,
+            &mut dd as *mut _ as *mut c_void,
+        ];
+        let blocks = (d as u32).div_ceil(256);
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [blocks, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Fused cross-entropy fwd+bwd (fp32). `logits`,`d_logits`: `[rows*v]`;
     /// `targets`,`loss`: `[rows]` (targets integer-valued f32). `d_logits` is the
     /// SUM-reduction gradient (divide by valid-token count for mean).

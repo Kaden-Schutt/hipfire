@@ -3220,6 +3220,12 @@ pub const CROSS_ENTROPY_TRAIN_SRC: &str =
 pub const PFLASH_SCORE_F32_TRAIN_SRC: &str =
     include_str!("../../../kernels/src/pflash_score_f32_train.hip");
 
+/// Gated linear-recurrence scan fwd+bwd (fp32), the token-mixer for the GLA-lite /
+/// minimal-selective-SSM PFlash drafter. `h[t]=g[t]*h[t-1]+(1-g[t])*u[t]`; per-channel
+/// diagonal recurrence, one thread per channel, NO shared memory (gfx1103 LDS lesson).
+pub const GATED_SCAN_TRAIN_SRC: &str =
+    include_str!("../../../kernels/src/gated_scan_train.hip");
+
 /// RoPE fwd+bwd (fp32), HF-Llama half-split convention, un-fused training path.
 pub const ROPE_TRAIN_SRC: &str = include_str!("../../../kernels/src/rope_train.hip");
 

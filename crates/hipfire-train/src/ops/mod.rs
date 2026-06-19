@@ -9,6 +9,7 @@
 pub mod attention;
 pub mod cross_entropy;
 pub mod distill;
+pub mod gated_scan;
 pub mod linear;
 pub mod lora;
 pub mod pflash_score;
