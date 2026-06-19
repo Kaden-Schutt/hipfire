@@ -341,3 +341,77 @@ pub trait SimpleAr {
     /// Vocabulary length (logits width), so the daemon sizes its sampler.
     fn vocab_size(&self) -> usize;
 }
+
+/// Why a serving run stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StopReason {
+    /// Hit the model's EOS / end-of-turn token.
+    #[default]
+    Eos,
+    /// Reached `GenerateCtx::max_tokens`.
+    MaxTokens,
+    /// Matched a `GenerateCtx::stop_sequences` entry.
+    StopSequence,
+}
+
+/// Result of a [`ServingBackend::serve`] run.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ServeOutcome {
+    pub prompt_tokens: usize,
+    pub tokens_generated: usize,
+    pub stop_reason: StopReason,
+}
+
+/// Serving-infra parameters the daemon owns and hands to a backend's `serve`
+/// loop — the decoupled, object-safe replacement for `generate()`'s 28-arg
+/// surface. **Prompt framing is done daemon-side before `serve`** (chat
+/// template, think-mode, tools, system prompt all resolved into `prompt`), so
+/// those daemon/prompt types stay out of this ctx. Per-arch fast-path state
+/// (pflash/MTP/drafter) is NOT here either — it lives in the backend, gated by
+/// [`ArchCaps`]. Visible tokens stream to `sink`.
+pub struct GenerateCtx<'a> {
+    /// Request id (echoed in streamed events).
+    pub id: &'a str,
+    /// The fully-framed prompt text (post chat-template / think-mode).
+    pub prompt: &'a str,
+    pub temperature: f32,
+    pub top_p: f32,
+    pub max_tokens: usize,
+    pub repeat_penalty: f32,
+    pub repeat_window: usize,
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
+    pub max_think_tokens: usize,
+    /// Visible-stream stop sequences (in addition to EOS).
+    pub stop_sequences: &'a [String],
+    /// Raw encoded image bytes for a multimodal request; the backend decodes +
+    /// preprocesses (None for a text-only request). The `caps().vision` flag
+    /// says whether a backend can consume it.
+    pub image_bytes: Option<&'a [u8]>,
+    /// Visible-token streaming sink (the daemon's JSONL stdout writer).
+    pub sink: &'a mut dyn std::io::Write,
+}
+
+/// Object-safe serving handle the daemon holds per loaded model
+/// (`Box<dyn ServingBackend>`), replacing the per-arch `generate_*` dispatch and
+/// the `LoadedModel` Option-soup. It is **one output strategy among several**:
+/// dense-AR families run the shared `run_simple_ar` loop over their [`SimpleAr`];
+/// families with a bespoke loop (qwen35 DFlash/MTP, the VL splice,
+/// block-diffusion) override [`ServingBackend::serve`] directly. The dyn
+/// boundary is per-request, so it costs nothing in the per-token/per-layer hot
+/// path.
+pub trait ServingBackend: Send {
+    /// Loaded `HfqFile::arch_id` (e.g. 5/6 qwen35, 12 gemma3, 13 gemma3-vl).
+    fn arch_id(&self) -> u32;
+    /// Optional fast-path capabilities the daemon checks instead of branching
+    /// on `arch_id`.
+    fn caps(&self) -> ArchCaps;
+    /// The model's EOS / end-of-turn token id.
+    fn eos_token(&self) -> u32;
+    /// Run one full generation, streaming visible tokens to `ctx.sink`.
+    fn serve(&mut self, gpu: &mut Gpu, ctx: &mut GenerateCtx) -> Result<ServeOutcome, String>;
+    /// Reset multi-turn session state (e.g. the KV-cache cursor) for a session.
+    fn reset_session(&mut self, gpu: &mut Gpu, session_id: &str) -> Result<(), String>;
+    /// Release GPU resources (consumes the boxed backend on unload).
+    fn unload(self: Box<Self>, gpu: &mut Gpu);
+}
