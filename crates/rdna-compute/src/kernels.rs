@@ -3220,6 +3220,10 @@ pub const CROSS_ENTROPY_TRAIN_SRC: &str =
 pub const PFLASH_SCORE_F32_TRAIN_SRC: &str =
     include_str!("../../../kernels/src/pflash_score_f32_train.hip");
 
+/// Elementwise sigmoid fwd+bwd (fp32), un-fused training path. Backward consumes
+/// the saved forward output (`d_x = d_out·s·(1-s)`). GLA-lite forget gate.
+pub const SIGMOID_TRAIN_SRC: &str = include_str!("../../../kernels/src/sigmoid_train.hip");
+
 /// Gated linear-recurrence scan fwd+bwd (fp32), the token-mixer for the GLA-lite /
 /// minimal-selective-SSM PFlash drafter. `h[t]=g[t]*h[t-1]+(1-g[t])*u[t]`; per-channel
 /// diagonal recurrence, one thread per channel, NO shared memory (gfx1103 LDS lesson).

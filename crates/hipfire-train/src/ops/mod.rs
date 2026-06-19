@@ -15,5 +15,6 @@ pub mod lora;
 pub mod pflash_score;
 pub mod rmsnorm;
 pub mod rope;
+pub mod sigmoid;
 pub mod softmax;
 pub mod swiglu;

@@ -41064,6 +41064,53 @@ impl Gpu {
         }
     }
 
+    /// Elementwise sigmoid forward (fp32). `x`→`out` `[n]`.
+    pub fn sigmoid_train_fwd(&mut self, x: &GpuTensor, out: &GpuTensor, n: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("sigmoid_train_fwd", kernels::SIGMOID_TRAIN_SRC, "sigmoid_train_fwd")?;
+        let func = &self.functions["sigmoid_train_fwd"];
+        let mut xp = x.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        let grid = (n as u32).div_ceil(256);
+        unsafe {
+            self.hip.launch_kernel(func, [grid, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)
+        }
+    }
+
+    /// Elementwise sigmoid backward (fp32). `out` is the saved forward output;
+    /// `d_x = d_out·out·(1-out)` `[n]`.
+    pub fn sigmoid_train_bwd(
+        &mut self,
+        d_out: &GpuTensor,
+        out: &GpuTensor,
+        d_x: &GpuTensor,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("sigmoid_train_bwd", kernels::SIGMOID_TRAIN_SRC, "sigmoid_train_bwd")?;
+        let func = &self.functions["sigmoid_train_bwd"];
+        let mut dop = d_out.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut dxp = d_x.buf.as_ptr();
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dop as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut dxp as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        let grid = (n as u32).div_ceil(256);
+        unsafe {
+            self.hip.launch_kernel(func, [grid, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)
+        }
+    }
+
     /// Gated linear-recurrence scan forward (fp32). `g`,`u`,`h_out`: `[seq*D]`
     /// row-major (time-major: index `t*D+c`). `h[t]=g[t]*h[t-1]+(1-g[t])*u[t]`,
     /// `h[-1]=0`. One thread per channel `c`, sequential over time; no shared mem.
