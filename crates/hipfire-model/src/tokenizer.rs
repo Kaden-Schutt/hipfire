@@ -244,6 +244,21 @@ fn resolve_merges(
 /// the resulting char string against `token_to_id`. Returns `Err` on the
 /// first byte whose char isn't in the vocab — that would silently corrupt
 /// `encode_gpt2_bpe`'s initial seed (#203).
+/// Recursively scan an HF tokenizer.json component subtree (a `pre_tokenizer`
+/// or `decoder`, which may be a `Sequence` wrapping a list of components) for a
+/// component whose `"type"` equals `target`. Used to detect the `ByteLevel`
+/// component that defines GPT-2 byte-level BPE.
+fn json_has_component_type(v: &serde_json::Value, target: &str) -> bool {
+    match v {
+        serde_json::Value::Object(map) => {
+            map.get("type").and_then(|t| t.as_str()) == Some(target)
+                || map.values().any(|x| json_has_component_type(x, target))
+        }
+        serde_json::Value::Array(arr) => arr.iter().any(|x| json_has_component_type(x, target)),
+        _ => false,
+    }
+}
+
 fn build_byte_to_id(token_to_id: &HashMap<String, u32>) -> Result<[u32; 256], TokenizerError> {
     let mut out = [0u32; 256];
     let mut buf = [0u8; 4];
@@ -465,16 +480,30 @@ impl Tokenizer {
             _ => None,
         };
 
-        // GPT-2 byte-level BPE (Qwen) marks spaces with `Ġ`; SentencePiece-style
-        // BPE (LLaMA, Gemma) marks them with `▁` and uses byte_fallback. A plain
-        // `contains("Ġ")` false-positives on large multilingual SentencePiece
-        // vocabs that happen to include a single stray `Ġ` token — e.g. Gemma3's
-        // 262k vocab has exactly 1 `Ġ`-prefixed token vs 137_541 `▁`-prefixed,
-        // and tripped the GPT-2 byte-map build (byte 0x90 → 'Ĳ' not in vocab).
-        // Decide by which space marker DOMINATES, so a stray token can't flip it.
-        let gpt2_marked = token_to_id.keys().filter(|k| k.starts_with('Ġ')).count();
-        let spm_marked = token_to_id.keys().filter(|k| k.starts_with('▁')).count();
-        let is_gpt2_bpe = token_to_id.contains_key("Ġthe") || gpt2_marked > spm_marked;
+        // Whether this is GPT-2 byte-level BPE is DECLARED by the tokenizer.json,
+        // not something to sniff from the vocab. GPT-2 byte-level (Qwen, Llama-3,
+        // LFM2) carries a `ByteLevel` component in its `pre_tokenizer`/`decoder`
+        // — that component IS the byte↔unicode (`Ġ`) mapping, so its presence is
+        // exactly the condition under which we must build the byte map.
+        // SentencePiece-style BPE (Gemma, older LLaMA) uses `Metaspace`/`▁` +
+        // `byte_fallback` and has no `ByteLevel`. Reading the declared structure
+        // avoids vocab-content false positives (e.g. Gemma3's 262k vocab carries
+        // a single stray `Ġ` token among 137k `▁` tokens, which a
+        // `contains("Ġ")` heuristic mis-read as GPT-2 → byte-map build failure).
+        let uses_byte_level = tok
+            .get("pre_tokenizer")
+            .is_some_and(|p| json_has_component_type(p, "ByteLevel"))
+            || tok
+                .get("decoder")
+                .is_some_and(|d| json_has_component_type(d, "ByteLevel"));
+        let is_gpt2_bpe = if tok.get("pre_tokenizer").is_some() || tok.get("decoder").is_some() {
+            uses_byte_level
+        } else {
+            // Minimal/synthetic tokenizer.json with no pipeline declared: fall
+            // back to space-marker dominance (`Ġ`-prefixed vs `▁`-prefixed).
+            token_to_id.keys().filter(|k| k.starts_with('Ġ')).count()
+                > token_to_id.keys().filter(|k| k.starts_with('▁')).count()
+        };
 
         let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)?;
         let byte_to_id = if is_gpt2_bpe {
@@ -1487,6 +1516,63 @@ pub fn maybe_normalize_prompt(s: &str) -> std::borrow::Cow<'_, str> {
 #[cfg(test)]
 mod bpe_tests {
     use super::*;
+
+    #[test]
+    fn bytelevel_component_detected_at_any_depth() {
+        // GPT-2 byte-level: ByteLevel nested inside a pre_tokenizer Sequence.
+        let qwen_pre = serde_json::json!({
+            "type": "Sequence",
+            "pretokenizers": [{"type": "Split"}, {"type": "ByteLevel"}]
+        });
+        assert!(json_has_component_type(&qwen_pre, "ByteLevel"));
+        assert!(json_has_component_type(
+            &serde_json::json!({"type": "ByteLevel"}),
+            "ByteLevel"
+        ));
+        // Gemma / SentencePiece: Split pre_tokenizer + ByteFallback decoder, no ByteLevel.
+        assert!(!json_has_component_type(
+            &serde_json::json!({"type": "Split"}),
+            "ByteLevel"
+        ));
+        assert!(!json_has_component_type(
+            &serde_json::json!({
+                "type": "Sequence",
+                "decoders": [{"type":"Replace"},{"type":"ByteFallback"},{"type":"Metaspace"}]
+            }),
+            "ByteLevel"
+        ));
+    }
+
+    #[test]
+    fn gemma_style_tokenizer_is_not_gpt2_despite_stray_g_token() {
+        // Minimal Gemma-shape tokenizer.json: SentencePiece BPE (Split
+        // pre_tokenizer, ByteFallback decoder, byte_fallback) whose vocab carries
+        // a single stray `Ġ` among `▁` tokens — the exact shape the old
+        // `contains("Ġ")` heuristic mis-classified as GPT-2 byte-level.
+        let json = serde_json::json!({
+            "model": {
+                "type": "BPE",
+                "vocab": {"<s>": 0, "</s>": 1, "▁the": 2, "▁a": 3, "Ġ": 4},
+                "merges": [],
+                "byte_fallback": true
+            },
+            "pre_tokenizer": {"type": "Split"},
+            "decoder": {
+                "type": "Sequence",
+                "decoders": [{"type":"Replace"},{"type":"ByteFallback"},{"type":"Metaspace"}]
+            }
+        })
+        .to_string();
+        let tok = Tokenizer::from_hf_json(&json).expect("gemma-style tokenizer should build");
+        assert!(
+            !tok.is_gpt2_bpe,
+            "Gemma SentencePiece tokenizer must not be classified GPT-2 byte-level"
+        );
+        assert!(
+            tok.byte_to_id.is_none(),
+            "SentencePiece tokenizer should build no GPT-2 byte map"
+        );
+    }
 
     /// Build a synthetic GPT-2 BPE Tokenizer from a vocab list and an ordered
     /// merge list. Used to assert exact `Vec<u32>` output of the priority-queue
