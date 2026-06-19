@@ -1,0 +1,26 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH hipfire-gpu-lock 1  "hipfire-gpu-lock " 
+.SH NAME
+hipfire\-gpu\-lock \- GPU mutex for multi\-agent coordination (acquire/release/status)
+.SH SYNOPSIS
+\fBhipfire\-gpu\-lock\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+GPU mutex for multi\-agent coordination (acquire/release/status)
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH SUBCOMMANDS
+.TP
+hipfire\-gpu\-lock\-acquire(1)
+Acquire the GPU lock (blocks until free). A detached holder keeps it until `release` or the calling shell exits
+.TP
+hipfire\-gpu\-lock\-release(1)
+Release the GPU lock (SIGTERM the holder recorded in the lockfile)
+.TP
+hipfire\-gpu\-lock\-status(1)
+Print lock status: "gpu is free" or "gpu BUSY: <holder>"
+.TP
+hipfire\-gpu\-lock\-help(1)
+Print this message or the help of the given subcommand(s)

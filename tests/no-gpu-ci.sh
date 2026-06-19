@@ -32,6 +32,9 @@ python3 -m pytest tests
 echo "== Env/docs drift check =="
 python3 scripts/check-env-docs.py
 
+echo "== CLI docs freshness (docs/CLI.md + man/ vs clap definition) =="
+cargo run -q -p hipfire-cli -- gen-docs --check
+
 echo "== Artifact naming check =="
 bash scripts/check-artifact-names.sh
 

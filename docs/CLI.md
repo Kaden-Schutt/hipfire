@@ -1,0 +1,170 @@
+# Command-Line Help for `hipfire`
+
+This document contains the help content for the `hipfire` command-line program.
+
+**Command Overview:**
+
+* [`hipfire`↴](#hipfire)
+* [`hipfire serve`↴](#hipfire-serve)
+* [`hipfire run`↴](#hipfire-run)
+* [`hipfire list`↴](#hipfire-list)
+* [`hipfire eval`↴](#hipfire-eval)
+* [`hipfire host-profile`↴](#hipfire-host-profile)
+* [`hipfire collect-artifacts`↴](#hipfire-collect-artifacts)
+* [`hipfire gpu-lock`↴](#hipfire-gpu-lock)
+* [`hipfire gpu-lock acquire`↴](#hipfire-gpu-lock-acquire)
+* [`hipfire gpu-lock release`↴](#hipfire-gpu-lock-release)
+* [`hipfire gpu-lock status`↴](#hipfire-gpu-lock-status)
+
+## `hipfire`
+
+hipfire LLM inference CLI
+
+**Usage:** `hipfire <COMMAND>`
+
+###### **Subcommands:**
+
+* `serve` — Start the hipfire HTTP server (OpenAI-compatible)
+* `run` — Load a model and generate a response (one-shot)
+* `list` — List locally available models
+* `eval` — Run the quant admission/model evaluation harness
+* `host-profile` — Measure host, GPU-copy, and model storage bandwidth
+* `collect-artifacts` — Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one model load
+* `gpu-lock` — GPU mutex for multi-agent coordination (acquire/release/status)
+
+
+
+## `hipfire serve`
+
+Start the hipfire HTTP server (OpenAI-compatible)
+
+**Usage:** `hipfire serve [OPTIONS]`
+
+###### **Options:**
+
+* `--host <HOST>` — Override bind host
+* `-p`, `--port <PORT>` — Override bind port
+* `-m`, `--model <MODEL>` — Pre-load a model on startup
+
+
+
+## `hipfire run`
+
+Load a model and generate a response (one-shot)
+
+**Usage:** `hipfire run [OPTIONS] <MODEL> <PROMPT>`
+
+###### **Arguments:**
+
+* `<MODEL>` — Model name, alias, or path
+* `<PROMPT>` — Prompt text
+
+###### **Options:**
+
+* `--max-tokens <MAX_TOKENS>` — Max tokens to generate
+* `--temperature <TEMPERATURE>` — Sampling temperature
+
+
+
+## `hipfire list`
+
+List locally available models
+
+**Usage:** `hipfire list`
+
+
+
+## `hipfire eval`
+
+Run the quant admission/model evaluation harness
+
+**Usage:** `hipfire eval [ARGS]...`
+
+###### **Arguments:**
+
+* `<ARGS>` — Arguments forwarded to hipfire-eval
+
+
+
+## `hipfire host-profile`
+
+Measure host, GPU-copy, and model storage bandwidth
+
+**Usage:** `hipfire host-profile [ARGS]...`
+
+###### **Arguments:**
+
+* `<ARGS>` — Arguments forwarded to hipfire-host-profile
+
+
+
+## `hipfire collect-artifacts`
+
+Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one model load
+
+**Usage:** `hipfire collect-artifacts [ARGS]...`
+
+###### **Arguments:**
+
+* `<ARGS>` — Arguments forwarded to the collect_artifacts runner
+
+
+
+## `hipfire gpu-lock`
+
+GPU mutex for multi-agent coordination (acquire/release/status)
+
+**Usage:** `hipfire gpu-lock <COMMAND>`
+
+###### **Subcommands:**
+
+* `acquire` — Acquire the GPU lock (blocks until free). A detached holder keeps it until `release` or the calling shell exits
+* `release` — Release the GPU lock (SIGTERM the holder recorded in the lockfile)
+* `status` — Print lock status: "gpu is free" or "gpu BUSY: <holder>"
+
+
+
+## `hipfire gpu-lock acquire`
+
+Acquire the GPU lock (blocks until free). A detached holder keeps it until `release` or the calling shell exits
+
+**Usage:** `hipfire gpu-lock acquire [OPTIONS] <LABEL>`
+
+###### **Arguments:**
+
+* `<LABEL>` — Human label recorded in the lockfile (who/what holds it)
+
+###### **Options:**
+
+* `--watch-pid <WATCH_PID>` — Pid whose death auto-releases the lock (default: the calling shell)
+* `--timeout-secs <TIMEOUT_SECS>` — Hard cap in seconds to wait for a busy lock; 0 = wait forever
+
+  Default value: `1800`
+* `--poll-secs <POLL_SECS>` — Cadence of "busy" messages while waiting, in seconds
+
+  Default value: `5`
+
+
+
+## `hipfire gpu-lock release`
+
+Release the GPU lock (SIGTERM the holder recorded in the lockfile)
+
+**Usage:** `hipfire gpu-lock release`
+
+
+
+## `hipfire gpu-lock status`
+
+Print lock status: "gpu is free" or "gpu BUSY: <holder>"
+
+**Usage:** `hipfire gpu-lock status`
+
+
+
+<hr/>
+
+<small><i>
+    This document was generated automatically by
+    <a href="https://crates.io/crates/clap-markdown"><code>clap-markdown</code></a>.
+</i></small>

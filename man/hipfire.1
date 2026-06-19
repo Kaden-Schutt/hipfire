@@ -1,0 +1,43 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH hipfire 1  "hipfire 0.2.1" 
+.SH NAME
+hipfire \- hipfire LLM inference CLI
+.SH SYNOPSIS
+\fBhipfire\fR [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+hipfire LLM inference CLI
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH SUBCOMMANDS
+.TP
+hipfire\-serve(1)
+Start the hipfire HTTP server (OpenAI\-compatible)
+.TP
+hipfire\-run(1)
+Load a model and generate a response (one\-shot)
+.TP
+hipfire\-list(1)
+List locally available models
+.TP
+hipfire\-eval(1)
+Run the quant admission/model evaluation harness
+.TP
+hipfire\-host\-profile(1)
+Measure host, GPU\-copy, and model storage bandwidth
+.TP
+hipfire\-collect\-artifacts(1)
+Collect Tier\-1 calibration artifacts (Hessian/imatrix/router\-histogram) in one model load
+.TP
+hipfire\-gpu\-lock(1)
+GPU mutex for multi\-agent coordination (acquire/release/status)
+.TP
+hipfire\-help(1)
+Print this message or the help of the given subcommand(s)
+.SH VERSION
+v0.2.1

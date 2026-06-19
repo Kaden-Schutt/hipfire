@@ -28,6 +28,11 @@ enum Command {
     CollectArtifacts(commands::forward::CollectArtifactsArgs),
     /// GPU mutex for multi-agent coordination (acquire/release/status)
     GpuLock(commands::gpu_lock::GpuLockArgs),
+    /// Regenerate the committed CLI docs (docs/cli.md + man pages) from this
+    /// clap definition. Hidden: a maintenance command, not part of the
+    /// user-facing surface; run via `cargo run -p hipfire-cli -- gen-docs`.
+    #[command(hide = true)]
+    GenDocs(commands::gen_docs::GenDocsArgs),
 }
 
 #[tokio::main]
@@ -54,5 +59,6 @@ async fn main() -> anyhow::Result<()> {
         Command::HostProfile(args) => commands::forward::run_host_profile(args),
         Command::CollectArtifacts(args) => commands::forward::run_collect_artifacts(args),
         Command::GpuLock(args) => commands::gpu_lock::run(args),
+        Command::GenDocs(args) => commands::gen_docs::run(args),
     }
 }

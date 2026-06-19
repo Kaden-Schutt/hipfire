@@ -1,0 +1,25 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH hipfire-run 1  "hipfire-run " 
+.SH NAME
+hipfire\-run \- Load a model and generate a response (one\-shot)
+.SH SYNOPSIS
+\fBhipfire\-run\fR [\fB\-\-max\-tokens\fR] [\fB\-\-temperature\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIMODEL\fR> <\fIPROMPT\fR> 
+.SH DESCRIPTION
+Load a model and generate a response (one\-shot)
+.SH OPTIONS
+.TP
+\fB\-\-max\-tokens\fR \fI<MAX_TOKENS>\fR
+Max tokens to generate
+.TP
+\fB\-\-temperature\fR \fI<TEMPERATURE>\fR
+Sampling temperature
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIMODEL\fR>
+Model name, alias, or path
+.TP
+<\fIPROMPT\fR>
+Prompt text
