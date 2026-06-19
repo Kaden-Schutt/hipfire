@@ -267,6 +267,10 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 | Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 416x86 grid, one child `125`/`126`/`130` | FAIL | One-child `125`/`126` failed at sync/global launch 120; one-child `130` failed at launch 124. Same coredump signature. |
 | Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 416x86 grid, chunks `124,36` | FAIL | Failed inside the first 124-launch child in both plain and HIP-initialized parent modes, showing the earlier 124 pass became state-sensitive after reset pressure. |
 | Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 416x86 grid, chunks `80,80` | PASS | Same total 160 as failing one-child runs; passed in both plain and HIP-initialized parent modes. |
+| Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 384x86 grid, one child `125`/`128`/`130`/`132`/`134` | PASS | Lower grid pass side; 134 remained the highest preserved one-child pass before repeat failure at 135. |
+| Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 384x86 grid, one child `135` | FAIL | Failed twice: first at sync/global launch 132, repeat at 133. Same coredump signature. |
+| Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 384x86 grid, chunks `134,46` | FAIL | Failed inside the first 134-launch child in both plain and HIP-initialized parent modes, showing the earlier 134 pass became state-sensitive after reset pressure. |
+| Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 384x86 grid, chunks `90,90` | PASS | Same total 180 as failing near-edge split; passed in both plain and HIP-initialized parent modes. |
 | Direct-AB no-output `8x4` active/block, reads=6, 512 iterations, 512x86 grid | PASS | Exact one-wave, two-array control. |
 | Direct-AB no-output `8x4` active inside `8x5` block, reads=6, 512 iterations, 512x86 grid | PASS | Two-wave block with 32 active lanes; still stable. |
 | Direct-AB no-output `5x5`/`4x4` active inside `6x6` block, reads=6, 512 iterations, 512x86 grid | PASS | Small active controls remain stable without cooperative producer loops. |
@@ -507,6 +511,14 @@ Latest artifact paths:
   controls at total `160` matched the 448x86 shape: `124,36` failed inside the
   first 124-launch child in both plain-parent and HIP-initialized-parent modes
   (`devcd50` / `devcd51`), while `80,80` passed in both modes.
+- At reads=3/448/384x86, one child passed at `125`, `128`, `130`, `132`, and
+  `134` requested launches. One child with `135` requested launches failed at
+  sync/global launch 132 with late generic `devcd52`, then a repeat failed at
+  sync/global launch 133 and preserved `devcd53` in the same artifact
+  directory. Split controls at total `180` matched the lower-grid
+  state-sensitive shape: `134,46` failed inside the first 134-launch child in
+  both plain-parent and HIP-initialized-parent modes (`devcd54` / `devcd55`),
+  while `90,90` passed in both modes.
 
 ## Current Narrowing
 
@@ -864,6 +876,13 @@ Reduction results after extending the standalone HIP GEMM probe:
   products for 480x86 (`104/105`), 448x86 (`120/121` mixed), and 416x86
   (`124/125`) cluster in the same rough total-work band, but reset pressure can
   move a previously passing child-local count onto the failing side.
+- Reads=3/448/384x86 strengthens the total-work interpretation. One-child
+  `134` passes, while `135` fails twice. The rough product
+  `384 * 134 = 51456` is close to the prior 416x86 and 480x86 boundaries.
+  Process-local state still matters: `134,46` fails inside the first child
+  after reset pressure, while `90,90` passes in both parent modes. This keeps
+  the model as a weighted work/sequence band rather than a pure total-launch or
+  pure total-work threshold.
 - Additional in-process teardown checks did not find a clean middle ground
   between `hipDeviceReset()` and process exit. `hipDevicePrimaryCtxReset(0)`
   and `hipDevicePrimaryCtxRelease(0)` both return success but still fail on the
@@ -1048,6 +1067,17 @@ regGDS_PROTECTION_FAULT                             0x3f000007
 regGDS_VM_PROTECTION_FAULT                          0x0fc00113
 ```
 
+The 384x86 one-child and split-child failures captured the same fields in
+`devcd52` through `devcd55`; the lower split control `90,90` passed:
+
+```text
+[gfxhub] Page fault observed
+Faulty page starting at address: 0x000074669d000000
+Protection fault status register: 0x841051
+regGDS_PROTECTION_FAULT                             0x3f000007
+regGDS_VM_PROTECTION_FAULT                          0x0fc00113
+```
+
 Code object/resource observations from `llvm-readobj` dumps:
 
 | Variant | Workgroup | LDS group segment | VGPR | SGPR | Spills | Wavefront |
@@ -1101,6 +1131,7 @@ LDS-only control:
 | direct-AB multi-exec `6x6` block, reads=3, 448 iters, 480x86 | PASS through one-child 104; FAIL at one-child 105+; PASS for 104,16 and 60,60 child splits | `_Z25lds_direct_ab_phase_probev` | 288 B | 34 | 2 | 0 | 32 |
 | direct-AB multi-exec `6x6` block, reads=3, 448 iters, 448x86 | MIXED at one-child 120 after reset pressure; FAIL at one-child 121+; PASS for 80,80 child splits | `_Z25lds_direct_ab_phase_probev` | 288 B | 34 | 2 | 0 | 32 |
 | direct-AB multi-exec `6x6` block, reads=3, 448 iters, 416x86 | PASS through one-child 124 before reset pressure; FAIL at one-child 125+; PASS for 80,80 child splits | `_Z25lds_direct_ab_phase_probev` | 288 B | 34 | 2 | 0 | 32 |
+| direct-AB multi-exec `6x6` block, reads=3, 448 iters, 384x86 | PASS through one-child 134; FAIL at one-child 135; PASS for 90,90 child splits | `_Z25lds_direct_ab_phase_probev` | 288 B | 34 | 2 | 0 | 32 |
 | direct-AB no-output `8x4` active in `8x5` block, reads=6 | PASS at 512 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 256 B | 22 | 5 | 0 | 32 |
 
 ISA observations:
@@ -1238,7 +1269,11 @@ Best current hypothesis:
 > moving band, not a deterministic scalar threshold. At 416x86, the one-child
 > edge moves to `124` pass / `125` fail before `124,36` also fails after reset
 > pressure, while `80,80` still passes. The total-work term is real, but the
-> process-local state term remains load-bearing.
+> process-local state term remains load-bearing. At 384x86, the one-child edge
+> lands at `134` pass / `135` fail, closely matching the rough
+> `grid_x * launches` work band, while `134,46` still fails after reset
+> pressure and `90,90` passes. This is the cleanest current evidence that both
+> total per-child LDS work and process-local state are involved.
 > Exec-mask structure alone does not appear to be the deciding factor.
 
 ## Next Evidence To Capture
@@ -1280,11 +1315,11 @@ control):
   `104` pass / `105` fail, while total `120` split as `104,16` still passes.
   At 448x86, `80,80` split children pass while one-child `160` fails, but
   child-local `120` is mixed after reset pressure. Next, either step grid_x
-  lower again (for example 384x86), or repeat the 416x86/448x86 `120`/`124`
-  region after a fresh GPU state to quantify reset-pressure drift before
-  fitting `grid_x * grid_y * child_launches`. Treat the common in-process HIP
-  reset APIs as already tested; only revisit teardown if a genuinely different
-  ROCm mechanism is identified.
+  lower again (for example 352x86 or 320x86), or repeat the 384x86/416x86
+  near-edge region after a fresh GPU state to quantify reset-pressure drift
+  before fitting `grid_x * grid_y * child_launches`. Treat the common
+  in-process HIP reset APIs as already tested; only revisit teardown if a
+  genuinely different ROCm mechanism is identified.
 - create a single-instantiation compile unit for the failing synthetic symbol
   and the passing long-loop symbol so instruction counts can be per-symbol
   instead of object-aggregate.
