@@ -24,10 +24,12 @@
 //! 8. **GeGLU `gelu_pytorch_tanh`** (not SwiGLU/silu).
 //! 9. **No logit/attn soft-capping** in Gemma3.
 
+pub mod arch;
 pub mod config;
 pub mod forward;
 pub mod weights;
 
+pub use arch::{Gemma3, Gemma3Backend};
 pub use config::{config_from_hfq, config_from_metadata_json, Gemma3Config};
 pub use forward::{forward_step, forward_step_greedy, Gemma3State};
 pub use weights::{load_weights, Gemma3LayerWeights, Gemma3Weights};
