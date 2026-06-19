@@ -109,22 +109,56 @@ The existing qwen35 code is correct and perf-tuned — do NOT rewrite it up fron
 Introduce the seam, onboard simple archs to prove it, route gemma3 through it
 clean, then peel qwen35 onto it last.
 
-- **P0** — Define `ServingBackend` + `ArchCaps` + `SimpleAr` + `GenerateCtx` in
-  `hipfire-runtime::arch`. No daemon wiring yet (compiles, zero behavior change).
+- **P0 ✓** — Define `ServingBackend` + `ArchCaps` + `SimpleAr` + `GenerateCtx` in
+  `hipfire-runtime::arch` (`ef4f4f30`). Compiles, zero behavior change. Also
+  added `StopReason`/`ServeOutcome` and the shared `run_simple_ar` driver
+  (`14c9de28`), later split into a reusable `decode_loop(gpu, backend, tok, eos,
+  ctx, start_pos, prompt_tokens)` so non-token-stream prefills (the VL splice)
+  can share the one streaming/stop loop (`ec54d01f`).
 - **P1** — Relocate the neutral serving primitives (`KvCache`, generic scratch,
   session-state) out of `hipfire-arch-qwen35`/`llama` into a neutral home so arch
   crates stop depending on qwen35. (Can be deferred if too invasive; P0/P2 don't
-  strictly need it.)
-- **P2** — Onboard a **simple existing arch** (qwen2, arch_id 7) onto
-  `SimpleAr` + `ServingBackend` as the proof-of-seam; route its daemon path
-  through the trait. Validate parity (coherence + speed gate).
-- **P3** — **Onboard gemma3** via `SimpleAr` (clean from day one). This is where
-  the [gemma3 plan](2026-06-19-gemma3-bringup.md) Phase 1.5 lands.
+  strictly need it.) **Deferred** — not needed for the backend impls below.
+- **P2 (crate side ✓, daemon routing pending)** — qwen2 (arch_id 7) onboarded
+  onto `SimpleAr` + `ServingBackend` as the proof-of-seam (`a6f6d1d9`). The
+  *crate-side* backend exists and is tested; **routing the daemon's qwen2 path
+  through it is the pending half** (see "Decision point" below).
+- **P3 (crate side ✓)** — gemma3 text (arch_id 12, `3fc36d2e`) and gemma3-vl
+  (arch_id 13, `ec54d01f`) implement `ServingBackend`. gemma3-vl overrides
+  `serve` for the SigLIP→projector→image-token splice prefill, then hands off to
+  the shared `decode_loop`; gemma3 text is a plain `run_simple_ar` delegate.
+  Added `eos_token_id` to `Gemma3Config` (gemma3-it stops on `<end_of_turn>`=106,
+  scalar-or-array) and `preprocess_image_bytes` for the daemon's raw image form.
 - **P4** — Migrate the dense llama AR path and the qwen35 AR path onto the trait.
 - **P5** — Migrate qwen35 fast paths (dflash/mtp/pp/grouped-moe) behind
-  `ArchCaps`, overriding `ServingBackend::generate`.
+  `ArchCaps`, overriding `ServingBackend::serve`.
 - **P6** — Collapse `LoadedModel` Option-soup into the single `backend` field;
   delete the per-arch `generate_*` free functions and the `arch_id` match ladder.
+
+## Decision point — daemon wiring (needs direction before proceeding)
+
+All three seam archs (qwen2/gemma3/gemma3-vl) have committed, tested
+`ServingBackend` impls. The remaining work all lives in the 18k-line
+`hipfire-daemon/src/main.rs` and touches the **production hot path**, so it
+warrants an explicit call rather than an autonomous edit:
+
+1. **`load_model` has no arch_id 12/13 blocks yet** (`main.rs:10221` ladder stops
+   at 11) — gemma3/medgemma can't be loaded by the daemon at all today. Need a
+   load block per arch building the backend from the bring-up triple.
+2. **`generate`'s ~2000-line dispatch** (`main.rs:~8000–10000`) owns the daemon's
+   sampler, sessions, eviction, tool-calls and streaming protocol. Our
+   `ServingBackend::serve`/`decode_loop` currently does its **own** greedy +
+   JSONL `{"type":"token"}` streaming. Two routes:
+   - **Additive (recommended for medgemma now):** add a `serving_backend:
+     Option<Box<dyn ServingBackend>>` field + a `serve`-based branch for 12/13
+     only, leaving qwen35/deepseek4/minimax fast paths untouched. Ships medgemma
+     vision fast; greedy-only sampling at first.
+   - **Full collapse (P4–P6):** thread the daemon sampler/sessions through
+     `decode_loop`, migrate every arch, delete the Option-soup. Larger, riskier,
+     better end state.
+3. **Image bytes through the request protocol** — `GenerateCtx::image_bytes`
+   exists; the daemon-protocol crate's request type and the `hipfire serve`
+   path need a field to carry the encoded image to the backend.
 
 ## Testing
 
