@@ -9621,6 +9621,114 @@ fn main() {
                 }
             }
 
+            // PFlash drafter TEACHER: forward the resident qwen3.5 target over a
+            // corpus and emit per-chunk per-block cosine-K scores at the shallow +
+            // mid FullAttention layers — the labels `pflash_drafter_train` distils
+            // (teacher/student split, docs/plans/2026-06-19-training-via-daemon-forward.md).
+            // Output is JSONL, one line per chunk; the trainer's daemon-label
+            // loader converts it to the v2 label cache.
+            "pflash_labels" => {
+                let Some(corpus) = msg.get("corpus").and_then(|v| v.as_str()).map(String::from)
+                else {
+                    emit_error_with_id(&mut stdout, "", "pflash_labels: missing 'corpus'".to_string());
+                    continue;
+                };
+                let Some(output) = msg.get("output").and_then(|v| v.as_str()).map(String::from)
+                else {
+                    emit_error_with_id(&mut stdout, "", "pflash_labels: missing 'output'".to_string());
+                    continue;
+                };
+                let seq = msg.get("seq").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(512);
+                let block =
+                    msg.get("block").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(64);
+                let n_chunks =
+                    msg.get("n_chunks").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(40);
+                let Some(m) = model.as_ref() else {
+                    emit_error_with_id(&mut stdout, "", "pflash_labels: no model loaded".to_string());
+                    continue;
+                };
+                let (Some(weights), Some(config), Some(tokenizer)) =
+                    (m.q35_weights.as_ref(), m.q35_config.as_ref(), m.tokenizer.as_ref())
+                else {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "pflash_labels: resident model is not a qwen3.5-family model".to_string(),
+                    );
+                    continue;
+                };
+                let fa = qwen35::full_attention_layers(config);
+                if fa.is_empty() {
+                    emit_error_with_id(&mut stdout, "", "pflash_labels: no FullAttention layers".to_string());
+                    continue;
+                }
+                let shallow = fa[0];
+                let mid = fa[fa.len() / 2];
+                let text = match std::fs::read_to_string(&corpus) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        emit_error_with_id(&mut stdout, "", format!("pflash_labels: read {corpus}: {e}"));
+                        continue;
+                    }
+                };
+                let all = tokenizer.encode(&text);
+                if all.len() < n_chunks * seq {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        format!("pflash_labels: corpus too small: {} toks < {}", all.len(), n_chunks * seq),
+                    );
+                    continue;
+                }
+                let mut out_file = match std::fs::File::create(&output) {
+                    Ok(f) => std::io::BufWriter::new(f),
+                    Err(e) => {
+                        emit_error_with_id(&mut stdout, "", format!("pflash_labels: create {output}: {e}"));
+                        continue;
+                    }
+                };
+                let mut failed = false;
+                for ci in 0..n_chunks {
+                    let toks = all[ci * seq..(ci + 1) * seq].to_vec();
+                    match qwen35::capture_pflash_block_scores(
+                        &mut gpu, weights, config, &toks, block, &[shallow, mid],
+                    ) {
+                        Ok(scores) => {
+                            let line = serde_json::json!({
+                                "chunk": ci,
+                                "tokens": toks,
+                                "shallow_scores": scores[0],
+                                "mid_scores": scores[1],
+                            });
+                            if writeln!(out_file, "{line}").is_err() {
+                                failed = true;
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            emit_error_with_id(&mut stdout, "", format!("pflash_labels: chunk {ci}: {e}"));
+                            failed = true;
+                            break;
+                        }
+                    }
+                }
+                use std::io::Write as _;
+                let _ = out_file.flush();
+                if !failed {
+                    let resp = serde_json::json!({
+                        "type": "pflash_labels",
+                        "output": output,
+                        "n_chunks": n_chunks,
+                        "seq": seq,
+                        "block": block,
+                        "shallow_layer": shallow,
+                        "mid_layer": mid,
+                    });
+                    let _ = writeln!(stdout, "{resp}");
+                    let _ = stdout.flush();
+                }
+            }
+
             "diag" => {
                 let (vram_free, vram_total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
                 let hip_ver = gpu.hip.runtime_version().unwrap_or((0, 0));
@@ -11301,7 +11409,7 @@ fn load_model_safetensors(
             .map_err(|e| format!("failed to parse tokenizer at {}: {e}", tok_path.display()))?
             .ok_or_else(|| format!("failed to load tokenizer from {}", tok_path.display()))?
     } else {
-        return Err("no tokenizer.json found in model directory".into());
+        return Err("no tokenizer.json found in model directory".to_string());
     };
 
     // HF safetensors use half-split RoPE convention (rotate_half)
@@ -11605,7 +11713,7 @@ fn load_model_pp(
             .tensor_data("model.visual.patch_embed.proj.weight")
             .is_some()
     {
-        return Err("pp>1 does not support VL models in v1; see issue #58 v1.1 roadmap".into());
+        return Err("pp>1 does not support VL models in v1; see issue #58 v1.1 roadmap".to_string());
     }
 
     let config = qwen35::config_from_hfq(&hfq).ok_or("failed to read Qwen3.5 config")?;
