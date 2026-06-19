@@ -84,7 +84,8 @@ Standalone HIP probes were added in the throwaway worktree only:
   store/load/barrier stress kernels, no GEMM global matrix traffic.
 - `/tmp/hipfire-lds-repro/lds_gemm_standalone_probe.hip`: direct HIP tiled
   GEMM reproducer using the same A/B/C global-memory shape as the hipfire
-  training example.
+  training example. Later extended with reduction modes and a compile-time
+  synthetic no-global kernel.
 
 Their artifact roots are:
 
@@ -114,6 +115,16 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 | Standalone LDS-only `TILE=16`, 16x16 block | PASS | 100 direct HIP launches after fixing an output-allocation bug in the probe; no new dmesg delta. |
 | Standalone HIP GEMM `TILE=5`, 5x5 block | PASS | 100 direct HIP launches at M=512, N=3072, K=3072; no dmesg delta. |
 | Standalone HIP GEMM `TILE=6`, 6x6 block | FAIL | Direct HIP, no hipfire Rust/JIT path; sync 20 failed with HIP 719 and MES reset. |
+| Standalone GEMM reduction `TILE=6`, no C store | FAIL | C/global output write is not required; failed with HIP 719. |
+| Standalone GEMM reduction `TILE=6`, A-only | FAIL | B global load is not required; failed with HIP 719. |
+| Standalone GEMM reduction `TILE=6`, B-only | FAIL | A global load is not required; failed with HIP 719. |
+| Standalone GEMM reduction `TILE=6`, no global/no store | FAIL | Runtime-mode version failed; global memory access is not required. |
+| Standalone GEMM synthetic `TILE=6`, no global/no store, K=1536 | PASS | 100 launches at M=512, N=3072. |
+| Standalone GEMM synthetic `TILE=6`, no global/no store, K=2048 | FAIL | Repeated failure, sync ~82-83; same MES/GDS fault state. |
+| Standalone GEMM synthetic `TILE=5`, no global/no store, K=3072 | PASS | 100 launches at M=512, N=3072. |
+| Standalone LDS-only `TILE=6`, 512 iterations | PASS | 100 launches at 64x64 grid; long LDS loop alone still passes. |
+| Standalone GEMM synthetic `TILE=6`, M=512, K=2048, N=2496 | PASS | Grid around 416x86 blocks. |
+| Standalone GEMM synthetic `TILE=6`, M=512, K=2048, N=2688 | FAIL | Grid around 448x86 blocks; same MES/GDS fault state. |
 
 Latest artifact paths:
 
@@ -132,6 +143,12 @@ Latest artifact paths:
 - `/tmp/hipfire-lds-gemm-standalone-artifacts/tile6_n100_m512_n3072_k3072/`:
   direct HIP standalone GEMM reproducer. Includes generated object/ISA dumps,
   dmesg snapshots, final dmesg tail, and a root-copied `devcoredump.data`.
+- `/tmp/hipfire-lds-gemm-klimit-repeat-artifacts/`: repeated no-global/no-store
+  K-limit sweep, including pass at `K_LIMIT=1536`, repeated failures at
+  `K_LIMIT=2048`, and tile5 pass at full K.
+- `/tmp/hipfire-lds-gemm-synth-shape-artifacts2/`: compile-time synthetic
+  no-global/no-store shape sweep, including pass at N=2496 and failure at
+  N=2688 for M=512, K_LIMIT=2048.
 
 ## Current Narrowing
 
@@ -146,6 +163,11 @@ Evidence argues against these as sole causes:
   for `TILE=6`, `TILE=8`, and `TILE=16` at 100 launches with 64x64 grids.
 - hipfire Rust runtime/JIT/dispatch as the root cause: a standalone HIP GEMM
   repro using `hipcc` and direct `hipLaunchKernelGGL` still fails.
+- Actual global memory access as the root cause: a compile-time standalone
+  synthetic `TILE=6` kernel with no global loads and no C/global store still
+  fails once K-loop work and grid size are high enough.
+- Long LDS loop alone as the root cause: the simpler LDS-only `TILE=6` probe
+  with 512 iterations passes at 100 launches and a 64x64 grid.
 
 The `tile6` dmesg delta shows a driver-side device wedge, not a simple HIP
 runtime recoverable error. The latest v2 failing run again reset through the
@@ -230,6 +252,33 @@ fault address differs: the earlier coredump captured address `0x0`, while the
 standalone GEMM captured a concrete process GPUVA-like address. Both paths
 still converge on the same MES reset and GDS protection state.
 
+Reduction results after extending the standalone HIP GEMM probe:
+
+- `nostore` failed, so the final C write is not required.
+- `aonly` and `bonly` failed, so neither A nor B global load is individually
+  required.
+- `noglobal_nostore` failed, so no actual global memory access is required.
+- A compile-time `tile6_synth` kernel with no global pointers and no C store
+  also failed at `K_LIMIT=2048` and `3072`, ruling out dead global branches in
+  the runtime-mode kernel as the trigger.
+- `tile6_synth` passed at `K_LIMIT=1536` and failed repeatedly at
+  `K_LIMIT=2048` for M=512, N=3072.
+- `tile5_synth` / no-global/no-store passed at full K=3072 for M=512, N=3072,
+  preserving the one-wave vs multi-wave boundary.
+- `tile6_synth` at M=512, K_LIMIT=2048 passed up to N=2496 and failed at
+  N=2688, 2880, and 3072. This points at total grid/work duration as part of
+  the trigger.
+
+The synthetic failure coredump again reports:
+
+```text
+[gfxhub] Page fault observed
+Faulty page starting at address: 0x000074669d000000
+Protection fault status register: 0x841051
+regGDS_PROTECTION_FAULT                             0x3f000007
+regGDS_VM_PROTECTION_FAULT                          0x0fc00113
+```
+
 Code object/resource observations from `llvm-readobj` dumps:
 
 | Variant | Workgroup | LDS group segment | VGPR | SGPR | Spills | Wavefront |
@@ -238,6 +287,7 @@ Code object/resource observations from `llvm-readobj` dumps:
 | `tile6` fail | 36 | 288 B | 20 | 20/21 | 0 | 32 |
 | standalone GEMM `tile5` pass | 25 | 212 B | 23 | 16 | 0 | 32 |
 | standalone GEMM `tile6` fail | 36 | 288 B | 25 | 16 | 0 | 32 |
+| standalone synthetic `tile6` fail | 36 | 288 B | 26 | 17 | 0 | 32 |
 
 ISA observations:
 
@@ -259,13 +309,13 @@ ISA observations:
 
 Best current hypothesis:
 
-> On gfx1103 with this ROCm/amdgpu stack, the failure is tied to the tiled GEMM
-> code shape, not just LDS or barriers in isolation. The sharp boundary remains
-> `TILE=5` (25 active lanes, pass) vs `TILE=6` (36 active lanes, fail) for the
-> GEMM pattern, and it reproduces in standalone HIP without hipfire runtime/JIT.
-> Standalone LDS-only kernels pass even at `TILE=16`, so the next target is the
-> interaction among GEMM global A/B/C traffic, LDS staging, cross-wave barriers,
-> and the compiler/driver's generated queue state.
+> On gfx1103 with this ROCm/amdgpu stack, the failure is a multi-wave,
+> GEMM-shaped LDS loop/grid-duration fault, not a plain global-memory bug and
+> not LDS/barriers in isolation. The sharp lane boundary remains `TILE=5`
+> (25 active lanes, pass) vs `TILE=6` (36 active lanes, fail). A no-global,
+> no-store, compile-time synthetic GEMM-shaped kernel still reproduces HIP 719
+> and the same MES/GDS coredump state, but only when K-loop work and grid size
+> cross a threshold.
 
 ## Next Evidence To Capture
 
@@ -285,9 +335,11 @@ control):
 - improve the throwaway matrix runner so it always preserves the exact
   runtime-generated `.hsaco`; the active4 control passed but did not leave a
   `.hsaco` under the expected cache name in the latest run.
-- reduce the standalone HIP GEMM reproducer further: remove C stores, then
-  remove either A or B global loads, then simplify loop trip count, while
-  preserving the direct-HIP repro path and coredump capture.
+- reduce the standalone HIP synthetic reproducer further: binary-search the
+  N/grid threshold, then test whether reducing launch count, grid dimensions,
+  or K-loop trip count removes the MES/GDS fault independently.
+- inspect per-symbol ISA for `tile6_synth` vs the passing LDS-only long-loop
+  kernel to identify the remaining code-shape difference.
 - split standalone object metadata by kernel symbol so tile5/tile6/tile16 ISA
   counts are not aggregated across template instantiations.
 
@@ -304,8 +356,8 @@ Compare pass/fail boundary for:
 `5546fe12`'s no-LDS register-tiled production choice is currently justified.
 The 288 GFLOP/s LDS path from `b41368bb` is not safe on gfx1103. The strongest
 current lead is not just "LDS is flaky"; LDS-only direct-HIP stress passes, but
-the multi-wave tiled GEMM pattern fails both in hipfire and standalone HIP,
-producing a MES reset path plus GDS/GDS-VM protection-fault state in the amdgpu
-coredump. A production mitigation should not be attempted until the standalone
-GEMM repro is reduced enough to identify which part of the GEMM pattern crosses
-from valid LDS use into the gfx1103 fault path.
+a multi-wave GEMM-shaped synthetic LDS loop with no global memory traffic can
+still fail, producing a MES reset path plus GDS/GDS-VM protection-fault state in
+the amdgpu coredump. A production mitigation should not be attempted until the
+standalone synthetic repro is reduced enough to identify which grid/work/ISA
+feature crosses from valid LDS use into the gfx1103 fault path.
