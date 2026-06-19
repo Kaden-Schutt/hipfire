@@ -14,6 +14,7 @@ Do not add one-off experiments here unless they are accepted as canonical. Those
 ## Canonical Pages
 
 - [OVERVIEW.md](./OVERVIEW.md) — one-page statement of the current documentation organization.
+- [CHAT.md](./CHAT.md) — active `hipfire chat` keybinding and slash-command reference.
 - [ARCHIVE-INDEX.md](./ARCHIVE-INDEX.md) — complete catalog of everything moved to `docs-old` with stable links.
 - [plans/ARCHITECTURE-PLAN.md](./plans/ARCHITECTURE-PLAN.md) — current architecture + modularization plan.
 - [reference/STATUS.md](./reference/STATUS.md) — current doc quality and drift state.

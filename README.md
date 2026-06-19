@@ -158,6 +158,11 @@ attribute the corresponding inventions per [AGENTS.md](AGENTS.md).
 
 ## Contributing
 
+All further work should use `chaingun` as the reference branch. New work should
+either happen directly on `chaingun` or be explicitly based on and compared
+against `chaingun`; do not treat `master` as the active development baseline
+unless that is called out for a specific task.
+
 See [.github/CONTRIBUTING.md](.github/CONTRIBUTING.md). Install local hooks with
 `./scripts/install-hooks.sh`. The no-GPU CI subset is
 `./tests/no-gpu-ci.sh`; it does not replace the hardware gates. Any
@@ -992,7 +997,7 @@ against the A3B MoE DFlash perfmaxx line.
 | `--ddtree-batched` | Use batched tree verify (research) |
 | `--ddtree-budget N` | Tree node budget |
 | `--ddtree-topk K` | Tree fan-out |
-| `--cask-sidecar PATH` | Load TriAttention sidecar |
+| `--cask-sidecar PATH` | Load TriAttention sidecar; `.triattn.hfq` is canonical, `.triattn.bin` is legacy compatibility |
 | `--cask-budget N` | KV eviction target |
 | `--cask-beta N` | Hysteresis (lower = more aggressive eviction) |
 

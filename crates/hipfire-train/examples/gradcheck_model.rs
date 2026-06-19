@@ -100,6 +100,7 @@ fn build_model(gpu: &mut Gpu, lora: &[[Vec<f32>; 4]]) -> HipResult<LlamaModel> {
     }
     Ok(LlamaModel {
         embed,
+        lm_head: None,
         final_norm,
         layers,
         dims: dims(),

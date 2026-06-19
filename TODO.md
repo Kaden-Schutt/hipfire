@@ -97,15 +97,11 @@
         command-level `--prefill-list` optimization already in `bench_qwen35_speed`.
 
 - [Documentation debt] Refresh docs drift where active behavior has changed:
-  - `docs/CHAT.md` is missing the `/set <key> <val>` command that `cli/chat.ts`
-    supports for live session parameter updates.
-  - TriAttention sidecar examples and naming in docs should consistently use
-    `.triattn.hfq` as canonical; `.triattn.bin` is allowed only for explicit
-    legacy compatibility.
-  - `docs/QUANTIZATION.md` still claims MQ3 prefill is non-WMMA in places; the
-    runtime now contains WMMA prefill paths for MQ3 on supported RDNA3/4 targets.
-  - `docs/env-vars.md` is behind the current source surface and should be
-    regenerated from `./scripts/regen-env-vars-doc.sh` after this cycle.
+  - Keep TriAttention sidecar examples and naming in active docs on
+    `.triattn.hfq` as canonical; mention `.triattn.bin` only as explicit legacy
+    compatibility.
+  - Regenerate `docs/env-vars.md` from `./scripts/regen-env-vars-doc.sh` after
+    source/env surface changes.
 
 ### Deferred
 

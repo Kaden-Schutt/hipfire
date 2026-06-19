@@ -826,7 +826,6 @@ pub fn dflash_draft_candidates(filename: &str) -> Vec<String> {
         return Vec::new();
     };
     let dotted_family = format!("{family}{version}");
-    let compact_family = dotted_family.replace('.', "");
     let mut quants = vec![quant.clone()];
     if quant == "mq3" {
         quants.push("mq4".to_string());
@@ -835,7 +834,6 @@ pub fn dflash_draft_candidates(filename: &str) -> Vec<String> {
     }
     let mut out = Vec::new();
     for q in quants {
-        out.push(format!("{compact_family}-{size}-dflash-{q}.hfq"));
         out.push(format!("{dotted_family}-{size}-{q}.dflash.hfq"));
         out.push(format!("{dotted_family}-{size}-{q}.draft.hfq"));
     }
@@ -1690,22 +1688,20 @@ mod tests {
         assert_eq!(
             dflash_draft_candidates("qwen3.5-27b-mq4.hfq"),
             vec![
-                "qwen35-27b-dflash-mq4.hfq".to_string(),
                 "qwen3.5-27b-mq4.dflash.hfq".to_string(),
                 "qwen3.5-27b-mq4.draft.hfq".to_string(),
-                "qwen35-27b-dflash-mq3.hfq".to_string(),
                 "qwen3.5-27b-mq3.dflash.hfq".to_string(),
                 "qwen3.5-27b-mq3.draft.hfq".to_string(),
             ]
         );
         assert!(dflash_draft_candidates("qwen3.5-35b-a3b-mq4.hfq")
-            .contains(&"qwen35-35b-a3b-dflash-mq4.hfq".to_string()));
+            .contains(&"qwen3.5-35b-a3b-mq4.dflash.hfq".to_string()));
         assert!(dflash_draft_candidates("llama-8b-mq4.hfq").is_empty());
 
         let root = temp_dir("hipfire-dflash-draft-discovery");
         fs::create_dir_all(&root).unwrap();
         let target = root.join("qwen3.5-27b-mq4.hfq");
-        let draft = root.join("qwen35-27b-dflash-mq4.hfq");
+        let draft = root.join("qwen3.5-27b-mq4.dflash.hfq");
         fs::write(&target, "target").unwrap();
         fs::write(&draft, "draft").unwrap();
 

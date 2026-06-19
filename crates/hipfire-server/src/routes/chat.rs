@@ -2756,7 +2756,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let target = root.join("qwen3.5-27b-mq4.hfq");
-        let draft = root.join("qwen35-27b-dflash-mq4.hfq");
+        let draft = root.join("qwen3.5-27b-mq4.dflash.hfq");
         std::fs::write(&target, "target").unwrap();
         std::fs::write(&draft, "draft").unwrap();
 
