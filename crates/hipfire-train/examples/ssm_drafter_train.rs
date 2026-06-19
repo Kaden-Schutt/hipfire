@@ -108,9 +108,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dlpath = std::env::var("HIPFIRE_PFLASH_DAEMON_LABELS")
         .map_err(|_| "set HIPFIRE_PFLASH_DAEMON_LABELS=<jsonl> (real qwen3.5 labels)")?;
     let n_eval = env_usize("HIPFIRE_PFLASH_NEVAL", N_EVAL);
-    let (chunks, label_mid, base_shallow, embed, h_t, vocab) = load_daemon_labels(&mut gpu, &dlpath)?;
+    let (mut chunks, mut label_mid, mut base_shallow, embed, h_t, vocab) =
+        load_daemon_labels(&mut gpu, &dlpath)?;
 
-    // train = all-but-last-n_eval chunks (eval split is the tail).
+    // Deterministic shuffle BEFORE the train/eval split. The corpus is often
+    // content-ordered (docs → crates → kernels), so a tail split would put a
+    // different-domain eval set against the train set — distribution shift that
+    // looks like "training degrades eval". Shuffle → same-distribution disjoint
+    // splits. Seed fixed (HIPFIRE_PFLASH_SHUFFLE_SEED) for reproducibility.
+    {
+        let mut seed = env_usize("HIPFIRE_PFLASH_SHUFFLE_SEED", 0x5EED) as u64;
+        let mut perm: Vec<usize> = (0..chunks.len()).collect();
+        for i in (1..perm.len()).rev() {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let j = (seed >> 33) as usize % (i + 1);
+            perm.swap(i, j);
+        }
+        let take = |src: &mut Vec<Vec<f32>>, p: &[usize]| -> Vec<Vec<f32>> {
+            p.iter().map(|&k| std::mem::take(&mut src[k])).collect()
+        };
+        let ch: Vec<Vec<u32>> = perm.iter().map(|&k| std::mem::take(&mut chunks[k])).collect();
+        let lm = take(&mut label_mid, &perm);
+        let bs = take(&mut base_shallow, &perm);
+        chunks = ch;
+        label_mid = lm;
+        base_shallow = bs;
+    }
+
+    // train = all-but-last-n_eval chunks (eval split is the shuffled tail).
     let n_chunks = chunks.len();
     let n_train = n_chunks.checked_sub(n_eval).filter(|&t| t > 0)
         .unwrap_or_else(|| panic!("n_chunks {n_chunks} ≤ n_eval {n_eval}"));
