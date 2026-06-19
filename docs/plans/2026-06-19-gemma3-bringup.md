@@ -141,3 +141,50 @@ Bring-up target: **`medgemma-27b-text-it`** (`Gemma3ForCausalLM`, clean
   loop.
 - **(1+w) baking** is exact only if norms stay F32/Q8 (they do — non-quantizable
   per `should_quantize`).
+
+## Status & implementation notes (updated 2026-06-19)
+
+**Done:**
+- Phase 0 ingest — `gemma3_text`/`gemma3` → arch_id 12, `(1+w)` RMSNorm baking
+  (F32/F16/BF16, spill/dtype-guarded), `gemma_norm_offset=1.0` marker. Commit
+  `c80cc0e4` (rebased).
+- Phase 1.1 — `hipfire-arch-gemma3` crate + `Gemma3Config`/`config_from_hfq`,
+  with tested helpers `embed_scale` / `attn_scale` / `is_global_layer` /
+  `rope_base_for_layer`. Commit `500ba879` (rebased). 4 unit tests green.
+
+**De-risk finding — attention needs NO new kernel for bring-up:**
+The attention kernels (`attention_f32`, `attention_flash_gqa` in
+`rdna-compute/src/dispatch.rs`) hardcode `scale = 1/√head_dim` internally and
+expose **no scale or sliding-window parameter**. So:
+- **Custom attn scale** (`query_pre_attn_scalar^-0.5`; `1/√168` on 27b): get it
+  WITHOUT touching kernels by **pre-scaling Q** by `√(head_dim/query_pre_attn_scalar)`
+  in the forward, so the kernel's `1/√head_dim` yields the correct effective
+  scale. On 4b (`query_pre_attn_scalar == head_dim`) the factor is 1 (no-op).
+- **Sliding window**: a real kernel gap, but it only changes behavior past
+  `sliding_window` (1024) tokens — so short-prompt **bring-up correctness is
+  identical to full-causal**. Defer the SWA mask to a long-context follow-on; it
+  is NOT a Phase-1 blocker.
+
+**Loader reality:** qwen2's load helpers (`load_embed_tokens`/`load_lm_head`/
+`load_norm_weight_raw`/`load_bias_f32`) are private to the qwen2 crate, and
+`hfq::load_weights_hfq` is llama-config-shaped — so gemma3 `load_weights` is a
+**replicate-from-qwen2** job, adapting the layer struct for 4 norms/layer
+(`input`/`post_attention`/`pre_feedforward`/`post_feedforward`), per-head
+`q_norm`/`k_norm`, GeGLU `gate`/`up`/`down`, tied embed, no QKV bias.
+
+**Ownership:** the upstream daemon-refactor branch is abandoned, so the full
+de-qwen-ification (P2b + P4–P6 in `2026-06-19-daemon-family-seam.md`) is owned
+here. No conflict constraints.
+
+**Confirmed order for the next focused block:**
+1. Phase 1.2 — `Gemma3Weights` + `load_weights` (replicate qwen2; compiles/
+   validates without GPU).
+2. Phase 1.3–1.4 — forward (embed √scale, Q pre-scale, per-layer dual-θ RoPE via
+   `rope_f32`'s base arg, 4-norm residual — can't reuse fused gemv+residual,
+   QK-norm, GQA via `attention_flash_gqa`) + a fused `gelu_mul` kernel (mirror
+   `silu_mul_f32`, reuse the existing `gelu_tanh_f32`) + `Architecture` +
+   `Gemma3Backend: SimpleAr`. **Needs GPU iteration** (decode medgemma-27b-text-it,
+   eyeball coherence).
+3. P2b — route qwen2 + gemma3 through the seam (generic `run_simple_ar` loop,
+   define `ServingBackend`/`GenerateCtx`); then P4–P6 migrate qwen35 + collapse
+   the `LoadedModel` Option-soup.
