@@ -134,9 +134,13 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 | Standalone GEMM synthetic `TILE=6`, M=512, N=3072, K=2048 | FAIL | 100-launch shape repeat failed at sync 81. |
 | Standalone GEMM synthetic masked `TILE=6`, M=512, N=2688, K=2048 | FAIL | Exec-mask regions were emitted around active LDS regions; still failed at sync 95. |
 | Standalone LDS-only `TILE=6`, 512 iterations, 288x86 grid | PASS | Simple LDS-only threshold control. |
+| Standalone LDS-only `TILE=6`, 512 iterations, 297x86 grid | PASS | Tight grid-edge control at grid_y=86. |
+| Standalone LDS-only `TILE=6`, 512 iterations, 298x86 grid | FAIL | Tight grid-edge repro; failed at sync 98. |
 | Standalone LDS-only `TILE=6`, 512 iterations, 304x86 grid | FAIL | Simple LDS-only repro; failed at sync 97. |
 | Standalone LDS-only `TILE=6`, 512 iterations, 320x86 grid | FAIL | Failed at sync 90; same coredump signature. |
 | Standalone LDS-only `TILE=6`, 512 iterations, 448x86 grid | FAIL | Grid-matched to synthetic N=2688/M=512; failed at sync 64. |
+| Standalone LDS-only `TILE=6`, 320 iterations, 448x86 grid | PASS | Tight iteration-edge control at full grid. |
+| Standalone LDS-only `TILE=6`, 336 iterations, 448x86 grid | FAIL | Tight iteration-edge repro; failed at sync 98. |
 | Standalone LDS-only no-mask `TILE=6`, 512 iterations, 288x86 grid | PASS | Removes exec-mask regions; same pass side as masked control. |
 | Standalone LDS-only no-mask `TILE=6`, 512 iterations, 304x86 grid | FAIL | Removes exec-mask regions; failed at sync 98. |
 
@@ -188,6 +192,14 @@ Latest artifact paths:
 - `/tmp/hipfire-lds-standalone-nomask-artifacts/`: no-mask LDS-only controls.
   `tile6_i512_nomask` matches the masked threshold: 288x86 passes, 304x86
   fails at sync 98. `tile6_nomask` with 128 iterations passes at 448x86.
+- `/tmp/hipfire-lds-standalone-grid-bisect-artifacts/`: tight grid-edge
+  bisect for masked `tile6_i512` at grid_y=86. At 100 launches, grid_x 296
+  and 297 pass; grid_x 298 and 300 fail at sync 98. The 298x86 and 300x86
+  artifacts include root-copied coredumps with the same gfxhub/GDS signature.
+- `/tmp/hipfire-lds-standalone-iter-artifacts/`: iteration-depth sweep for
+  masked `tile6` at grid 448x86. At 100 launches, 256 and 320 iterations pass;
+  336, 352, and 384 iterations fail at sync 98, 91, and 84 respectively. The
+  failing artifacts include root-copied coredumps with the same signature.
 
 ## Current Narrowing
 
@@ -328,9 +340,12 @@ Reduction results after extending the standalone HIP GEMM probe:
   `tile6_i512` LDS-only kernel that passes at 64x64 fails once the grid and
   total LDS work are large enough, without GEMM global-memory traffic and
   without the synthetic GEMM-shaped source. At 100 launches with grid_y=86,
-  grid_x 288 passes and 304 fails; larger grids fail earlier. The short
+  grid_x 297 passes and 298 fails; larger grids fail earlier. The short
   128-iteration `tile6` LDS-only kernel still passes at 448x86, so grid size
   alone is not enough.
+- At the grid-matched 448x86 shape, loop depth has its own tight edge. The
+  same LDS-only pattern passes at 320 iterations and fails at 336 iterations;
+  larger loop depths fail earlier.
 - Removing exec-mask regions from the LDS-only control does not shift that
   threshold materially. `tile6_i512_nomask` passes at 288x86 and fails at
   304x86, matching the masked control. The no-mask failure's coredump has the
@@ -429,9 +444,9 @@ Best current hypothesis:
 > lane boundary remains `TILE=5` (25 active lanes, pass) vs `TILE=6` (36 active
 > lanes, fail). A no-global, no-store synthetic GEMM-shaped kernel reproduces
 > HIP 719, and a simpler LDS-only `TILE=6` long-loop kernel also reproduces it
-> once grid size and repeated launches cross a narrow, reset-sensitive
-> threshold band. Exec-mask structure does not appear to be the deciding
-> factor.
+> once grid size, loop depth, and repeated launches cross a narrow,
+> reset-sensitive threshold band. Exec-mask structure does not appear to be the
+> deciding factor.
 
 ## Next Evidence To Capture
 
@@ -455,9 +470,9 @@ control):
   launch-count edge around 94-96 at N=2688 with repeated fresh-process trials,
   the N=2496-2688 grid edge at 100 launches, and the K_LIMIT=1536-2048 edge
   independently.
-- reduce the LDS-only reproducer further: binary-search the grid_x 288-304 edge
-  at grid_y=86 and 512 iterations, then test whether lowering iteration count
-  moves the edge monotonically.
+- reduce the LDS-only reproducer further: repeat the tight grid_x 297/298 edge
+  and loop-depth 320/336 edge in fresh processes to determine how much state
+  sensitivity remains.
 - create a single-instantiation compile unit for the failing synthetic symbol
   and the passing long-loop symbol so instruction counts can be per-symbol
   instead of object-aggregate.
