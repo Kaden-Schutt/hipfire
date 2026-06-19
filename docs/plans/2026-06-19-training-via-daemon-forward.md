@@ -125,3 +125,39 @@ on an SSM-driven target — empirical support for a **gated-delta-net drafter**
 change; daemon labels unchanged) and test head-to-head vs the +0.47 attn ceiling.
 Confounds noted but weak: higher bar (less headroom) and the attention-shaped
 cosine-K metric / L15 choice.
+
+## SSM-drafter result — GLA-lite breaks the attention ceiling (2026-06-19)
+
+Built the GLA-lite / minimal-selective-SSM drafter bottom-up, each rung finite-diff
+gradchecked before the next was built:
+
+1. `gated_scan` — `h[t] = g[t]·h[t-1] + (1-g[t])·u[t]` (g = input-dependent forget
+   gate = selectivity), fwd+bwd, one thread per channel, NO shared memory
+   (`kernels/src/gated_scan_train.hip`; gfx1103 LDS firmware lesson). gradcheck
+   dL/dg + dL/du max_abs_err 2.3e-4 ✓
+2. `sigmoid_train` — the forget-gate activation, fwd+bwd ✓
+3. `ssm_block` — one GLA-lite block: `rmsnorm → u=lin(xn1), g=σ(lin(xn1)) →
+   hs=gated_scan(g,u) → lin_o → residual → rmsnorm → swiglu MLP → residual`, all
+   base weights trainable. Full composed-path gradcheck (dx, norm1, w_u/g/o, wdown)
+   max_abs_err 1.4e-2 ✓
+4. `SsmDrafter` — drop-in body swap for the attention `Drafter` (shared frozen
+   embed → in_proj → N SSM blocks → out_norm → K-head → rope → cosine). End-to-end
+   gradcheck on in_proj / w_u / w_g / w_o / norm1 / out_norm / wk_score ✓
+
+Trained on the SAME cached real qwen3.5-0.8B labels, same ListNet/AdamW loop:
+
+| drafter body | params | best eval | vs attn ceiling | vs shallow bar |
+|--------------|--------|-----------|-----------------|----------------|
+| attention (P5)     | 8.79M | +0.47  | —        | ✗ |
+| **GLA-lite SSM**   | 7.74M | **+0.554** @ ep240 | **+0.084 (+18%)** | ✗ (bar +0.702) |
+
+The SSM body sits robustly above the attention ceiling across ep120–270 (all
+≥+0.458) — a real ceiling-break, not eval noise. **Hypothesis confirmed:** an SSM
+token-mixer shares the SSM-driven target's inductive bias better than attention
+(which was tuning-resistant at +0.47). But GLA-lite alone does not clear the +0.702
+shallow bar.
+
+**Next — ablate up** (in order, each a student-only change; daemon labels
+unchanged): (a) capacity scale (more layers / wider h — env `HIPFIRE_SSM_{LAYERS,H}`);
+(b) add a conv1d short causal conv before the gate (Mamba selective short-conv);
+(c) add the delta rule (matrix state) → full gated-delta-net matching the target.
