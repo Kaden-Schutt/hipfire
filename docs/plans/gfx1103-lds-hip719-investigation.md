@@ -125,6 +125,10 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 | Standalone LDS-only `TILE=6`, 512 iterations | PASS | 100 launches at 64x64 grid; long LDS loop alone still passes. |
 | Standalone GEMM synthetic `TILE=6`, M=512, K=2048, N=2496 | PASS | Grid around 416x86 blocks. |
 | Standalone GEMM synthetic `TILE=6`, M=512, K=2048, N=2688 | FAIL | Grid around 448x86 blocks; same MES/GDS fault state. |
+| Standalone GEMM synthetic `TILE=6`, M=512, N=2688, K=2048, 90 launches | PASS | Same reduced no-global/no-store kernel; launch-count threshold control. |
+| Standalone GEMM synthetic `TILE=6`, M=512, N=2688, K=2048, 95 launches | FAIL | Fails at sync 94; reproduced again at 100 launches. |
+| Standalone GEMM synthetic `TILE=6`, M=512, N=2880, K=2048 | FAIL | 100-launch shape repeat failed at sync 87. |
+| Standalone GEMM synthetic `TILE=6`, M=512, N=3072, K=2048 | FAIL | 100-launch shape repeat failed at sync 81. |
 
 Latest artifact paths:
 
@@ -149,6 +153,14 @@ Latest artifact paths:
 - `/tmp/hipfire-lds-gemm-synth-shape-artifacts2/`: compile-time synthetic
   no-global/no-store shape sweep, including pass at N=2496 and failure at
   N=2688 for M=512, K_LIMIT=2048.
+- `/tmp/hipfire-lds-gemm-shape-repeat-artifacts/`: preserved shape repeat for
+  the reduced no-global/no-store synthetic kernel. At 100 launches, N=2496
+  passes; N=2688, 2880, and 3072 fail at sync 95, 87, and 81 respectively.
+- `/tmp/hipfire-lds-gemm-launch-repeat-artifacts/`: preserved launch-count
+  repeat at M=512, N=2688, K_LIMIT=2048. 80, 85, and 90 launches pass; 95 and
+  100 launches both fail at sync 94.
+- `/tmp/hipfire-lds-standalone-long-artifacts/`: passing long-loop LDS-only
+  control, including `TILE=6`, 512 iterations, 100 launches at 64x64 grid.
 
 ## Current Narrowing
 
@@ -268,6 +280,11 @@ Reduction results after extending the standalone HIP GEMM probe:
 - `tile6_synth` at M=512, K_LIMIT=2048 passed up to N=2496 and failed at
   N=2688, 2880, and 3072. This points at total grid/work duration as part of
   the trigger.
+- Preserved repeat runs sharpen that into a cumulative launch/work threshold.
+  For M=512, N=2688, K_LIMIT=2048, the reduced synthetic kernel passes at 80,
+  85, and 90 launches, then fails at sync 94 when asked for 95 or 100 launches.
+  Holding launch count at 100, larger N moves failure earlier: N=2688 fails at
+  sync 95, N=2880 at sync 87, and N=3072 at sync 81.
 
 The synthetic failure coredump again reports:
 
@@ -289,6 +306,14 @@ Code object/resource observations from `llvm-readobj` dumps:
 | standalone GEMM `tile6` fail | 36 | 288 B | 25 | 16 | 0 | 32 |
 | standalone synthetic `tile6` fail | 36 | 288 B | 26 | 17 | 0 | 32 |
 
+Per-symbol metadata for the newest reduced repro versus the passing long-loop
+LDS-only control:
+
+| Variant | Result | Kernel symbol | LDS group segment | VGPR | SGPR | Spills | Wavefront |
+|---|---:|---|---:|---:|---:|---:|---:|
+| synthetic GEMM-shaped `TILE=6`, no global/no store | FAIL | `_Z20gemm_lds_synth_probeILi6EEviiii` | 288 B | 18 | 5 | 0 | 32 |
+| LDS-only `TILE=6`, 512 iterations | PASS | `_Z9lds_probeILi6ELi6ELi512EEvPfi` | 288 B | 20 | 8 | 0 | 32 |
+
 ISA observations:
 
 - `tile5` is a single-wave workgroup (`25 < 32`). The compiler appears to
@@ -303,6 +328,23 @@ ISA observations:
   3 `global_store*`. The standalone object contains `TILE=5`, `TILE=6`, and
   `TILE=16` template instantiations, so use per-symbol disassembly before
   over-interpreting the aggregate counts.
+- Aggregate object counts for the newest saved objects are not directly
+  comparable because each object contains several template instantiations. The
+  failing synthetic object as a whole has 8 `s_barrier`, 10 `ds_store*`, 28
+  `ds_load*`, 29 `s_waitcnt`, and 59 `s_cbranch` instances. The passing
+  LDS-only long-loop object as a whole has more LDS/barrier traffic: 26
+  `s_barrier`, 13 `ds_store*`, 74 `ds_load*`, 64 `s_waitcnt`, and 40
+  `s_cbranch` instances.
+- The failing synthetic `tile6` symbol has the compact GEMM-shaped loop:
+  `ds_store_2addr_b32`, `s_waitcnt lgkmcnt(0)`, `s_barrier`,
+  `buffer_gl0_inv`, a cluster of `ds_load_*`, staged `s_waitcnt`/`v_fmac`,
+  another `s_barrier`, and a scalar loop back edge. It has no global load/store
+  in this symbol.
+- The passing `lds_probe<TILE=6, ACTIVE=6, ITERS=512>` symbol uses the same
+  288-byte LDS footprint but carries explicit exec-mask control
+  (`s_and_saveexec_b32` / `s_cbranch_execz`) around active-lane store/load
+  regions, includes two LDS phases per loop iteration pair, and finishes with a
+  global store. It passes despite higher aggregate barrier and DS counts.
 - The active4-in-8x8 control passed even though the launched block spans two
   waves; only 16 lanes actively touch LDS. This keeps the current hypothesis on
   active LDS traffic across waves rather than barrier presence alone.
@@ -310,12 +352,12 @@ ISA observations:
 Best current hypothesis:
 
 > On gfx1103 with this ROCm/amdgpu stack, the failure is a multi-wave,
-> GEMM-shaped LDS loop/grid-duration fault, not a plain global-memory bug and
-> not LDS/barriers in isolation. The sharp lane boundary remains `TILE=5`
-> (25 active lanes, pass) vs `TILE=6` (36 active lanes, fail). A no-global,
-> no-store, compile-time synthetic GEMM-shaped kernel still reproduces HIP 719
-> and the same MES/GDS coredump state, but only when K-loop work and grid size
-> cross a threshold.
+> GEMM-shaped LDS loop/grid-duration/cumulative-launch fault, not a plain
+> global-memory bug and not LDS/barriers in isolation. The sharp lane boundary
+> remains `TILE=5` (25 active lanes, pass) vs `TILE=6` (36 active lanes, fail).
+> A no-global, no-store, compile-time synthetic GEMM-shaped kernel still
+> reproduces HIP 719 and the same MES/GDS coredump state, but only when K-loop
+> work, grid size, and repeated launches cross a threshold.
 
 ## Next Evidence To Capture
 
@@ -336,12 +378,13 @@ control):
   runtime-generated `.hsaco`; the active4 control passed but did not leave a
   `.hsaco` under the expected cache name in the latest run.
 - reduce the standalone HIP synthetic reproducer further: binary-search the
-  N/grid threshold, then test whether reducing launch count, grid dimensions,
-  or K-loop trip count removes the MES/GDS fault independently.
-- inspect per-symbol ISA for `tile6_synth` vs the passing LDS-only long-loop
-  kernel to identify the remaining code-shape difference.
-- split standalone object metadata by kernel symbol so tile5/tile6/tile16 ISA
-  counts are not aggregated across template instantiations.
+  90-95 launch-count edge at N=2688, the N=2496-2688 grid edge at 100
+  launches, and the K_LIMIT=1536-2048 edge independently.
+- create a single-instantiation compile unit for the failing synthetic symbol
+  and the passing long-loop symbol so instruction counts can be per-symbol
+  instead of object-aggregate.
+- test whether adding LDS-only-style exec-mask regions to the synthetic kernel,
+  or removing them from the LDS-only control, moves the failure boundary.
 
 Compare pass/fail boundary for:
 
