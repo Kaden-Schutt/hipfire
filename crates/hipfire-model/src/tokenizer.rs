@@ -465,7 +465,16 @@ impl Tokenizer {
             _ => None,
         };
 
-        let is_gpt2_bpe = token_to_id.contains_key("Ġthe") || token_to_id.contains_key("Ġ");
+        // GPT-2 byte-level BPE (Qwen) marks spaces with `Ġ`; SentencePiece-style
+        // BPE (LLaMA, Gemma) marks them with `▁` and uses byte_fallback. A plain
+        // `contains("Ġ")` false-positives on large multilingual SentencePiece
+        // vocabs that happen to include a single stray `Ġ` token — e.g. Gemma3's
+        // 262k vocab has exactly 1 `Ġ`-prefixed token vs 137_541 `▁`-prefixed,
+        // and tripped the GPT-2 byte-map build (byte 0x90 → 'Ĳ' not in vocab).
+        // Decide by which space marker DOMINATES, so a stray token can't flip it.
+        let gpt2_marked = token_to_id.keys().filter(|k| k.starts_with('Ġ')).count();
+        let spm_marked = token_to_id.keys().filter(|k| k.starts_with('▁')).count();
+        let is_gpt2_bpe = token_to_id.contains_key("Ġthe") || gpt2_marked > spm_marked;
 
         let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)?;
         let byte_to_id = if is_gpt2_bpe {
