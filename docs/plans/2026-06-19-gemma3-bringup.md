@@ -188,3 +188,33 @@ here. No conflict constraints.
 3. P2b — route qwen2 + gemma3 through the seam (generic `run_simple_ar` loop,
    define `ServingBackend`/`GenerateCtx`); then P4–P6 migrate qwen35 + collapse
    the `LoadedModel` Option-soup.
+
+## E1 COMPLETE — forward validated (2026-06-19)
+
+medgemma-27b-text-it (q8f16, 28.7 GB, arch_id 12) decoded a fluent, correct
+answer via `infer_gemma3`:
+
+> "A CT scan uses X-rays to create detailed images of the inside of the body.`<end_of_turn>`"
+
+— with the correct `<end_of_turn>` EOS (token 106). All gemma deltas confirmed
+numerically correct: embedding √hidden scale, 4-norm residual structure,
+per-head QK-norm, dual-θ RoPE, GQA, GeGLU, the Q pre-scale baked into q_norm,
+and the `(1+w)` norm bake at ingest. ~4.5 tok/s on the 27B-q8 UMA APU
+(bandwidth-bound, expected for a correctness smoke).
+
+En route, fixed a real bug the smoke surfaced: the tokenizer mis-classified
+gemma (SentencePiece BPE) as GPT-2 byte-level off a single stray `Ġ` token —
+now detected from the declared `ByteLevel` component in tokenizer.json
+(`fix(tokenizer)`, commit 2c9e9d07).
+
+Landed (pushed to fork/chaingun): gelu_mul kernel, forward_step, load_weights,
+Gemma3Config, Architecture + Gemma3Backend:SimpleAr, infer_gemma3 example,
+quantizer ingest, tokenizer fix.
+
+Minor follow-up (cosmetic, not blocking): `infer_gemma3` greedy-decodes a fixed
+count with no EOS-stop, so it prints trailing `<end_of_turn>` repeats after the
+answer; the daemon path (E2) stops on EOS properly.
+
+**Next: E2** — the seam: `CoreModel` (forward separable from loop) +
+`ServingBackend`/`GenerateCtx`, route qwen2 + gemma3 through it, begin the
+`LoadedModel` Option-soup collapse (chaingun-owned daemon de-qwen).
