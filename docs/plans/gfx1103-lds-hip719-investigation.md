@@ -176,6 +176,10 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 | Rect-active no-output `5x5` active inside `6x6` block, K=6, 320 iterations, 512x86 grid | FAIL | Two-wave block, 25 active lanes, K=6; failed at sync 50. |
 | Rect-active no-output `5x5` active inside `6x6` block, K=6, 336 iterations, 512x86 grid | FAIL | Same shape; failed at sync 47. |
 | Rect-active no-output `5x5` active inside `6x6` block, K=6, 512 iterations, 512x86 grid | FAIL | Same shape; failed at sync 31. |
+| Rect-active no-output `6x4` active inside `6x6` block, K=6, 320 iterations, 512x86 grid | FAIL | 24 active lanes; failed at sync 98. |
+| Rect-active no-output `4x6` active inside `6x6` block, K=6, 320 iterations, 512x86 grid | FAIL | Transposed 24-active control; failed at sync 75. |
+| Rect-active no-output `4x4` active inside `6x6` block, K=6, 320 iterations, 512x86 grid | FAIL | 16 active lanes; failed at sync 65. |
+| Rect-active no-output `4x4` active inside `6x6` block, K=5, 320 iterations, 512x86 grid | FAIL | 16 active lanes; failed at sync 67. |
 
 Latest artifact paths:
 
@@ -440,6 +444,14 @@ Reduction results after extending the standalone HIP GEMM probe:
   also have identical resource metadata: 248 B LDS, 47 VGPR, 5 SGPR, 8
   `s_barrier`, 8 `ds_store*`, 24 `ds_load*`, 10 `s_waitcnt`, 4
   `s_and_saveexec`, and no global load/store instructions.
+- The rectangular probe is not a pure active-lane experiment once the active
+  rectangle has fewer lanes than the number of staged A/B LDS elements. In
+  those cases some lanes execute extra producer-loop iterations before the
+  barrier. This appears to be another trigger accelerator: `6x4`, `4x6`, and
+  even `4x4` active regions inside a `6x6` block fail at K=6/320, and
+  `4x4` inside `6x6` also fails at K=5/320. The earlier direct active4-in-8x8
+  pass used a different K=4 direct-store source shape, so it should not be
+  treated as equivalent to these rectangular cooperative-loader controls.
 
 The synthetic failure coredump again reports:
 
@@ -489,6 +501,9 @@ LDS-only control:
 | rect-active no-output `8x4` active in `8x5` block, K=6 | PASS at 336, FAIL at 512 iterations / 512x86 | `_Z21lds_rect_active_probev` | 288 B | 21 | 8 | 0 | 32 |
 | rect-active no-output `5x5` active in `6x6` block, K=5 | PASS at 512 iterations / 512x86 | `_Z21lds_rect_active_probev` | 212 B | 16 | 7 | 0 | 32 |
 | rect-active no-output `5x5` active in `6x6` block, K=6 | FAIL at 320 iterations / 512x86 | `_Z21lds_rect_active_probev` | 248 B | 16 | 9 | 0 | 32 |
+| rect-active no-output `6x4` active in `6x6` block, K=6 | FAIL at 320 iterations / 512x86 | `_Z21lds_rect_active_probev` | 240 B | 18 | 9 | 0 | 32 |
+| rect-active no-output `4x6` active in `6x6` block, K=6 | FAIL at 320 iterations / 512x86 | `_Z21lds_rect_active_probev` | 240 B | 20 | 10 | 0 | 32 |
+| rect-active no-output `4x4` active in `6x6` block, K=5 | FAIL at 320 iterations / 512x86 | `_Z21lds_rect_active_probev` | 160 B | 18 | 8 | 0 | 32 |
 
 ISA observations:
 
@@ -553,12 +568,13 @@ Best current hypothesis:
 > `TILE=6`/K=6 multi-wave failing, but rectangular controls refine that into a
 > more precise model: exact one-wave K=6 LDS blocks are stable, while multi-wave
 > blocks with LDS producer/consumer loops fail after a duration threshold whose
-> position depends on active shape, K-depth, grid work, and launched block shape.
-> Crossing 32 active lanes and increasing K-depth both accelerate the failure
+> position depends on active shape, K-depth, grid work, launched block shape, and
+> the cooperative LDS producer-loop shape. Crossing 32 active lanes, increasing
+> K-depth, and requiring extra producer iterations all accelerate the failure
 > rather than solely defining it. A no-global, no-store synthetic GEMM-shaped
 > kernel reproduces HIP 719, and simpler no-output LDS probes reproduce the same
 > gfxhub/GDS coredump signature once the block/K-depth/grid/launch threshold is
-> crossed. Exec-mask structure does not appear to be the deciding factor.
+> crossed. Exec-mask structure alone does not appear to be the deciding factor.
 
 ## Next Evidence To Capture
 
@@ -591,7 +607,9 @@ control):
 - use the rectangular no-output repro for the next reduction: normalize DS
   instruction count across K=5/K=6 where possible, then separate inactive lanes
   from launched block size with `6x5`/`5x6` active-in-`6x6` controls and
-  one-wave all-active counterparts.
+  one-wave all-active counterparts. Prefer a follow-up probe with direct
+  per-lane stores for small active rectangles so active-lane count can be
+  tested without the cooperative-loader extra-iteration variable.
 - create a single-instantiation compile unit for the failing synthetic symbol
   and the passing long-loop symbol so instruction counts can be per-symbol
   instead of object-aggregate.
