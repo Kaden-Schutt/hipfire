@@ -208,8 +208,11 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 | Direct-AB no-output `6x6` active/block, reads=6, 192 iterations, 509x86 grid | PASS | Grid-width low side at fixed read/loop edge. |
 | Direct-AB no-output `6x6` active/block, reads=6, 192 iterations, 510x86 grid | MIXED | Earlier grid sweep failed at sync 99; fresh launch-count replay passed through 100 launches. Treat exact 510x86 edge as reset/state-sensitive. |
 | Direct-AB no-output `6x6` active/block, reads=6, 192 iterations, 511/512x86 grid | FAIL | Fresh replay failed at sync 99 for 100 requested launches. |
-| Direct-AB no-output `6x6` active/block, reads=6, 192 iterations, 511x86 grid, 96-99 launches | PASS | Launch-count low side at the fresh grid edge. |
-| Direct-AB no-output `6x6` active/block, reads=6, 192 iterations, 511x86 grid, 100 launches | FAIL | Launch-count high side; failed at sync 99 with the same gfxhub/GDS coredump signature. |
+| Direct-AB no-output `6x6` active/block, reads=6, 192 iterations, 511x86 grid, 96-98 launches | PASS | Launch-count low side at the fresh grid edge. |
+| Direct-AB no-output `6x6` active/block, reads=6, 192 iterations, 511x86 grid, 99 launches | MIXED | Passed in the first launch-count sweep, then failed at sync 98 after reset pressure with the reused binary. |
+| Direct-AB no-output `6x6` active/block, reads=6, 192 iterations, 511x86 grid, 100 launches | FAIL | Launch-count high side; failed at sync 98-99 with the same gfxhub/GDS coredump signature. |
+| Direct-AB no-output `6x6` active/block, reads=6, 192 iterations, 511x86 grid, split-process 98+1 launches | PASS | Same reused binary; three trials passed both the 98-launch process and the follow-up 1-launch process. |
+| Direct-AB no-output `6x6` active/block, reads=6, 192 iterations, 511x86 grid, one-process 99 launches after split controls | FAIL | Same reused binary and total launch count as split 98+1; failed at sync 98. |
 | Direct-AB no-output `6x6` active/block, reads=3, 448 iterations, 511x86 grid | PASS | Grid-width low side at fixed read/loop edge. |
 | Direct-AB no-output `6x6` active/block, reads=3, 448 iterations, 512x86 grid | MIXED | Fails on repeat, but the exact launch edge moves with reset/GPU state. |
 | Direct-AB no-output `6x6` active/block, reads=3, 448 iterations, 512x86 grid, 94-99 launches | PASS | Initial launch-count sweep low side. |
@@ -318,6 +321,16 @@ Latest artifact paths:
   98-101. The deliberate reads=3 100-launch repeat overwrote the earlier
   pass artifact, so use the 99-pass and 100-fail directories for preserved
   low/high artifacts.
+- `/tmp/hipfire-lds-direct-ab-split-artifacts/`: reused-binary split-process
+  controls for the reads=6/192/511x86 edge. The setup compile artifact is
+  `a6x6_b6x6_r6_i192_n99_g511x86/` and uses the same code object for all
+  follow-up runs. A one-process 100-launch run failed at sync 98. After reset
+  pressure, the 99-launch edge lowered and a one-process 99-launch run failed
+  at sync 98 with the same gfxhub/GDS signature. In contrast, three
+  split-process `98 + 1` trials passed both halves. This is the strongest
+  current evidence that the immediate edge is tied to same-process/HIP queue
+  lifetime or same-queue dispatch sequence, not just total LDS work submitted
+  across a process boundary.
 
 ## Current Narrowing
 
@@ -551,13 +564,21 @@ Reduction results after extending the standalone HIP GEMM probe:
   points in the same direction: the fault appears after a narrow cumulative
   LDS-read/work threshold, not at kernel launch or compile time.
 - Launch-count controls on the same direct-AB edge strengthen the cumulative
-  exposure model. At reads=6/192/511x86, launch counts 96, 97, 98, and 99 pass;
-  100 fails at sync 99. At reads=3/448/512x86, launch counts 94-99 pass in the
-  initial sweep; extending to 110/120/130/150 requested launches fails around
-  sync 98-101; a deliberate 100-vs-101 repeat after reset pressure failed at
-  sync 99 and sync 98. Treat the reads=3 exact counter as state-sensitive, but
-  not the broad fact that slightly shorter runs pass and slightly longer runs
-  fail with the same generated code.
+  exposure model, with the exact edge moving after reset pressure. At
+  reads=6/192/511x86, launch counts 96, 97, and 98 pass. A 99-launch run
+  passed in the first sweep but failed at sync 98 after later failures, while
+  100-launch runs fail at sync 98-99. Reusing the exact same binary gives a
+  sharper process-boundary control under the shifted edge: three split-process
+  trials of `98 + 1` launches all pass, but a one-process 99-launch run fails
+  at sync 98. That points at same-process/HIP-queue lifetime or same-queue
+  dispatch sequence as part of the immediate trigger, not merely total LDS work
+  submitted across process boundaries. At reads=3/448/512x86, launch counts
+  94-99 pass in the initial sweep; extending to 110/120/130/150 requested
+  launches fails around sync 98-101; a deliberate 100-vs-101 repeat after reset
+  pressure failed at sync 99 and sync 98. Treat exact counters as
+  state-sensitive, but not the broad fact that slightly shorter same-process
+  runs pass and slightly longer same-process runs fail with the same generated
+  code.
 
 The synthetic failure coredump again reports:
 
@@ -590,6 +611,11 @@ Protection fault status register: 0x841051
 regGDS_PROTECTION_FAULT                             0x3f000007
 regGDS_VM_PROTECTION_FAULT                          0x0fc00113
 ```
+
+The reused-binary split-process controls captured the same signature for the
+one-process 99-launch failure and the failed 99-launch half of the `99 + 1`
+split attempt. The successful `98 + 1` split-process trials did not create a
+new coredump.
 
 Code object/resource observations from `llvm-readobj` dumps:
 
@@ -632,7 +658,8 @@ LDS-only control:
 | direct-AB no-output `6x6` block, reads=6 | PASS at 176, FAIL at 192 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 288 B | 40-52 | 2 | 0 | 32 |
 | direct-AB no-output `6x6` block, reads=6, 192 iters | PASS at 509x86, MIXED at 510x86, FAIL at 511x86 | `_Z19lds_direct_ab_probev` | 288 B | 52 | 2 | 0 | 32 |
 | direct-AB no-output `6x6` block, reads=3, 448 iters | PASS at 511x86, FAIL on repeat at 512x86 | `_Z19lds_direct_ab_probev` | 288 B | 34 | 2 | 0 | 32 |
-| direct-AB no-output `6x6` block, reads=6, 192 iters, 511x86 | PASS at 99 launches, FAIL at 100 launches | `_Z19lds_direct_ab_probev` | 288 B | 52 | 2 | 0 | 32 |
+| direct-AB no-output `6x6` block, reads=6, 192 iters, 511x86 | PASS at 98 launches, MIXED at 99 launches, FAIL at 100 launches | `_Z19lds_direct_ab_probev` | 288 B | 52 | 2 | 0 | 32 |
+| direct-AB no-output `6x6` block, reads=6, 192 iters, 511x86, split-process | PASS for 98+1 split, FAIL for one-process 99 | `_Z19lds_direct_ab_probev` | 288 B | 52 | 2 | 0 | 32 |
 | direct-AB no-output `6x6` block, reads=3, 448 iters, 512x86 | PASS at 99 launches, FAIL on 100+ launch repeats | `_Z19lds_direct_ab_probev` | 288 B | 34 | 2 | 0 | 32 |
 | direct-AB no-output `8x4` active in `8x5` block, reads=6 | PASS at 512 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 256 B | 22 | 5 | 0 | 32 |
 
@@ -723,8 +750,12 @@ Best current hypothesis:
 > gfxhub/GDS coredump signature once the block/read-depth/grid/launch threshold
 > is crossed. The latest direct-AB grid sweeps make that threshold extremely
 > narrow near the fail edge: one grid column separates pass from fail in the
-> reads=3/448 case. Exec-mask structure alone does not appear to be the deciding
-> factor.
+> reads=3/448 case. Reused-binary split-process controls narrow the cumulative
+> part further: at the reads=6/192/511x86 edge, `98 + 1` launches split across
+> two processes pass repeatedly, while 99 launches in one process fail. That
+> implicates same-process/HIP queue lifetime or same-queue dispatch sequencing
+> in the immediate trigger. Exec-mask structure alone does not appear to be the
+> deciding factor.
 
 ## Next Evidence To Capture
 
@@ -754,9 +785,11 @@ control):
 - use the minimal no-output repro for the next reduction: repeat the 256-pass /
   320-fail correlate in fresh processes and try smaller active-lane shapes
   around the one-wave/two-wave boundary.
-- use the direct-AB no-output repro for the next reduction: vary launch count
-  at the reads=6/192/510x86 and reads=3/448/512x86 edges, then repeat one edge
-  in fresh processes to quantify state sensitivity.
+- use the direct-AB no-output repro for the next reduction: add a phase-mode
+  runner that can do `98 + 1` inside one process with optional `hipDeviceReset`,
+  stream destroy/recreate, or device synchronize between phases. Compare that
+  against the current cross-process `98 + 1` pass and one-process 99 fail to
+  separate process lifetime, HIP context reset, and queue/stream lifetime.
 - create a single-instantiation compile unit for the failing synthetic symbol
   and the passing long-loop symbol so instruction counts can be per-symbol
   instead of object-aggregate.
