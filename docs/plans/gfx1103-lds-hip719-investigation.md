@@ -112,6 +112,8 @@ VARIANT=tile6_lds_store_then_load_dynamiccols_load4_nextrow_consume4_pinned MODE
 VARIANT=tile6_lds_store_then_rowload_then_extra_load4_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-postrow-extra-consume4-pinned-780m
 VARIANT=tile6_lds_store_then_rowload_barrier_noextra_load4_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-postrow-barrier-noextra-consume4-pinned-780m
 VARIANT=tile6_lds_prestore_barrier_noextra_load4_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-prestore-barrier-noextra-consume4-pinned-780m
+VARIANT=tile6_lds_single_store_prestore_barrier_noextra_load4_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-single-store-prestore-barrier-noextra-consume4-pinned-780m
+VARIANT=tile6_lds_prestore_barrier_noextra_load3_consume3_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-prestore-barrier-noextra-consume3-pinned-780m
 VARIANT=tile6_lds_betweenstore_barrier_noextra_load4_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-betweenstore-barrier-noextra-consume4-pinned-780m
 VARIANT=tile6_lds_store_then_prerow_barrier_noextra_load4_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-prerow-barrier-noextra-consume4-pinned-780m
 VARIANT=tile6_lds_store_then_rowload_barrier_gap_noextra_load4_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-postrow-barrier-gap-noextra-consume4-pinned-780m
@@ -580,6 +582,18 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
     -> second store -> barrier -> four row loads/FMAs -> barrier. Metadata
     remains `144`, `sgpr_count=5`, `vgpr_count=10`, and no spills. This shows
     the added barrier epoch does not need to follow an LDS producer phase.
+  - The single-store prestore extra-barrier control
+    `tile6_lds_single_store_prestore_barrier_noextra_load4_consume4_pinned`
+    passed 100 launches with `144`, `sgpr_count=5`, `vgpr_count=10`, and no
+    spills. It keeps four barriers in the K iteration but removes the second
+    per-K LDS store: barrier -> first store -> barrier -> barrier -> four row
+    loads/FMAs -> barrier. This keeps the second-store requirement intact for
+    the early-barrier branch and rules out four same-loop barriers alone.
+  - The two-store prestore extra-barrier three-load control
+    `tile6_lds_prestore_barrier_noextra_load3_consume3_pinned` passed 100
+    launches with `144`, `sgpr_count=5`, `vgpr_count=9`, and no spills. This
+    keeps the four-row-load width requirement intact for the early-barrier
+    branch.
   - The no-extra between-store extra-barrier control
     `tile6_lds_betweenstore_barrier_noextra_load4_consume4_pinned` failed at
     sync 94 with HIP 719. ISA emits first store -> barrier -> barrier ->
@@ -667,8 +681,8 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   consumes, and either additional same-loop LDS activity or an additional
   same-loop synchronization epoch anywhere in the K iteration, with repeated
   launch/process state acting as the stress amplifier. Removing the second
-  store or reducing the row-load width from four to three keeps the no-extra
-  double-barrier shape pass-side.
+  store or reducing the row-load width from four to three keeps both the
+  post-row and early-barrier no-extra shapes pass-side.
   Same-row and same-tile membership are no longer required by the current
   evidence, and neither extra-load-before-second-store nor extra-load-after-row
   ordering prevents the failure, though the separate-tile and preloop controls
@@ -755,11 +769,11 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   `s_nop 0` between the two closing barriers still fails, so the double-barrier
   branch is not specifically post-consumption, post-producer, or
   adjacent-barrier sensitive. The matching single-store double-barrier control
-  passes with the same `144`, `sgpr_count=5`, and `vgpr_count=10` tuple, and
-  the two-store three-load double-barrier control passes with `144`,
-  `sgpr_count=5`, and `vgpr_count=9`; together they keep the second-store and
-  four-row-load thresholds intact for the double-barrier branch. The cross-row
-  load split
+  passes with the same `144`, `sgpr_count=5`, and `vgpr_count=10` tuple; the
+  single-store four-barrier prestore control also passes with that tuple; and
+  the two-store three-load controls pass with `144`, `sgpr_count=5`, and
+  `vgpr_count=9`. Together they keep the second-store and four-row-load
+  thresholds intact for the double-barrier branch. The cross-row load split
   uses `144`, `sgpr_count=5`, and `vgpr_count=13`, and rules out same-row
   membership as a required trigger component. The separate-tile load split uses
   `288`,
@@ -1064,6 +1078,18 @@ Latest artifact paths:
   Live dmesg recorded the same MES `REMOVE_QUEUE` / MODE2 reset family,
   including reset 527 for the prestore control and reset 528 for the
   between-store control.
+- `/tmp/hipfire-lds-barrier-reqs-runs/`: pass-side requirement controls for
+  the early-barrier branch. Throwaway
+  `tile6_lds_single_store_prestore_barrier_noextra_load4_consume4_pinned`
+  passed one-launch smoke and 100-launch stress. ISA emits barrier -> one
+  `ds_store_b32` -> barrier -> barrier -> four waited row loads -> barrier;
+  metadata is `group_segment_fixed_size=144`, `sgpr_count=5`,
+  `vgpr_count=10`, and no spills. Throwaway
+  `tile6_lds_prestore_barrier_noextra_load3_consume3_pinned` also passed
+  one-launch smoke and 100-launch stress. ISA emits barrier -> first store ->
+  barrier -> second store -> barrier -> three waited row loads -> barrier;
+  metadata is `144`, `sgpr_count=5`, `vgpr_count=9`, and no spills. Live dmesg
+  showed no new reset during either passing stress run.
 - `/tmp/hipfire-lds-crossrow-runs/`: cross-row extra-load controls. The first
   two-launch run failed adjacent to prior reset pressure, but a recovery
   `tile6_lds_second_store_only_read6` control passed, then clean
