@@ -83,3 +83,92 @@ and stresses the seam early (no-KV at #3, non-AR at #6).
 - **Shared MoE FFN**: qwen35-MoE, gemma4, nemotron_h, lfm2_moe, diffusion_gemma
   all need MoE — converge on one expert-FFN building block (watch differing
   expert tensor layouts: stacked-3D vs per-expert-split).
+
+---
+
+# Part 2 — the rest of /srv/huggingface (beyond text decoders)
+
+Surveyed 2026-06-19 (130 model dirs). Most are variants of the Part-1 families
+(Qwen2.5/3/3.5/3.6, gemma4, nemotron, lfm2, llama, deepseek4, minimax). The
+genuinely new work clusters into a few **machinery classes** layered on top of —
+or beside — the text core.
+
+## The tiered shape this reveals
+
+An arch is no longer just "a forward + an AR loop." It decomposes into:
+
+```
+INPUT ADAPTERS              CORE FORWARD                OUTPUT STRATEGY
+  text tokenizer       →    layer stack (the         →    AR decode (text)        ← ServingBackend
+  vision encoder       →    Part-1 mixer/FFN          →    pooling (embedding)
+  audio encoder        →    families)                 →    scoring (rerank)
+                                                       →    speech tokens → codec→wav (TTS/omni)
+                                                       →    block diffusion (diffusion_gemma)
+                                                       →    image-latent diffusion (Qwen-Image, separate)
+```
+
+`ServingBackend` is **one output strategy among several**; input adapters
+(vision/audio → embeddings spliced into the core, à la `hipfire-arch-qwen35-vl`)
+and output heads are orthogonal axes. This is the generalization the seam must
+allow for, even though near-term we only wire the AR strategy.
+
+## Family taxonomy (the remainder)
+
+| group | families | disposition |
+|---|---|---|
+| **A. reuse existing text family** | Llama-3.x/3.1/3.2/3.3 (llama 0), MiniCPM5 (`llama`), Qwen2/2.5 (qwen2 7), Qwen3 dense/MoE (llama/qwen35), MiniMax-M2.7 (`minimax_m2`, arch 10), all PARO/DFlash z-lab variants | loader/config only; no new arch |
+| **B. new text-arch crate** | **llama4** (`llama4_text`: 48L, 16-expert MoE, iRoPE + early-fusion vision), **hrm_text** (hierarchical recurrent reasoning, H/L cycles — not a flat layer stack), **zaya** (Zyphra, 80L hybrid — study at bring-up) | new crates; llama4 also needs vision |
+| **C. multimodal input** | medgemma-*-it / gemma4-mm (vision), **sensenova neo_chat/MoT** (qwen3 LLM + `neo_vision`), llama4 vision | vision-encoder adapter (extend qwen35-vl) + existing/new core |
+| **D. omni (in + out)** | **Qwen2.5-Omni** (thinker + talker + token2wav), **Qwen3-Omni-MoE** (thinker + talker + code2wav), **Nemotron-Omni** (parakeet sound + nemotron_h llm + vision) | orchestration of C + audio-in + TTS-out |
+| **E. non-generative heads** | **Qwen3-Embedding** (0.6/4/8B), **Qwen3-Reranker** (0.6/4/8B) — `Qwen3ForCausalLM` backbone, no AR loop | cheap: reuse qwen3 forward, add encode→pool / score head |
+| **F. audio subsystems** | STT: **kyutai-stt**, **parakeet-tdt/ctc** (.nemo), **conformer-ctc** (.nemo), parakeet-realtime/multitalker. TTS: **Kokoro-82M**, **kyutai pocket-tts**, **supertonic-3** (onnx), **personaplex**. VAD/diarization: **pyannote** (config.yaml) | large new subsystems (see below) |
+| **G. image generation** | **Qwen-Image**, **Qwen-Image-Edit** (`model_index.json` — diffusers MMDiT+VAE pipeline) | separate engine; out of near-term text-inference scope |
+| **misc / not models** | froggeric (chat templates), tiny-random-qwen3-moe (test fixture), Qwen SAE-Res (interpretability SAE) | skip |
+
+## New machinery subsystems (scope + reuse)
+
+1. **Vision encoder** — extend the `hipfire-arch-qwen35-vl` splice pattern
+   (ViT → projector → image tokens into the decoder input). Consumers:
+   gemma multimodal, llama4_vision (34L), neo_vision, omni vision.
+2. **Audio encoder / ASR front-end** — mel-spectrogram features → Conformer/
+   Whisper-style encoder → CTC / TDT / RNN-T decode. Consumers: parakeet,
+   kyutai-stt, conformer, nemotron-omni `sound_config(parakeet)`, and the
+   omni **thinker** `audio_encoder`. Big new subsystem; build/validate on a
+   standalone STT (conformer-ctc) first.
+3. **Speech synthesis (TTS)** — G2P → acoustic model → neural codec/vocoder.
+   Consumers: Kokoro, pocket-tts, supertonic, personaplex, and the omni
+   **talker** (speech-token LM) + **code2wav/token2wav** (codec → waveform).
+4. **Omni orchestration** — thinker (multimodal LLM, ingests text+vision+audio)
+   → talker (autoregressive speech-token LM conditioned on thinker hidden) →
+   codec vocoder. Composes (1)+(2)+(3) over a text core. Qwen2.5/3-Omni,
+   Nemotron-Omni.
+5. **Non-generative output heads** — `encode → pool` (embedding) and pairwise
+   `score` (rerank). The **cheapest** new capability: the qwen3 forward already
+   exists; add a pooled/scoring output path + skip the AR loop. Good first proof
+   that `ServingBackend` spans non-AR *output* (complements diffusion's non-AR
+   *generation*).
+6. **Image generation** — MMDiT + VAE + text-encoder diffusers pipeline
+   (Qwen-Image). A distinct engine (image-latent diffusion); treat as out of the
+   text/audio inference scope unless explicitly prioritized.
+7. **VAD / diarization** — pyannote segmentation models; preprocessing for
+   streaming STT/omni, not generation.
+
+## Non-HFQ formats (need dedicated loaders, or are out of the safetensors path)
+
+- **`.nemo`** (parakeet, conformer) — NVIDIA NeMo tarball (weights + yaml).
+- **`model_index.json`** (Qwen-Image) — diffusers multi-component pipeline.
+- **`config.yaml`** (pyannote) — pyannote framework.
+- **`model_type=onnx`** (supertonic) — ONNX runtime graph.
+
+These don't flow through the HFQ/safetensors quantizer ingest; each needs a
+bespoke loader (or stays out of scope).
+
+## Scope framing (honest)
+
+hipfire is HIP/ROCm **text-inference-first**. Of the above, the near-term-cheap
+wins that fit the current engine are **(E) embedding/rerank heads** (qwen3
+forward exists) and **(C) vision input** (qwen35-vl precedent). **(B) llama4**
+is a normal-but-large new text+vision arch. **(F) audio STT/TTS** and **(D) omni**
+are major multi-quarter subsystems; **(G) image-gen** is a separate engine. The
+family-seam refactor (output-strategy + input-adapter decomposition) is exactly
+what keeps these addable later without re-architecting the core.
