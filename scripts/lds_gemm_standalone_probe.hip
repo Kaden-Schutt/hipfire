@@ -125,6 +125,105 @@ __global__ void gemm_lds_synth_masked_probe(int M, int N, int K, int k_limit) {
     asm volatile("" ::"v"(sum));
 }
 
+template <int TILE>
+__global__ void gemm_nolds_synth_probe(int M, int N, int K, int k_limit) {
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int m = blockIdx.y * TILE + ty;
+    const int n = blockIdx.x * TILE + tx;
+    const int K_run = k_limit > 0 && k_limit < K ? k_limit : K;
+
+    float sum = 0.0f;
+    for (int kt = 0; kt < K_run; kt += TILE) {
+#pragma unroll
+        for (int kk = 0; kk < TILE; ++kk) {
+            const float a = static_cast<float>((m & 7) + kk + kt);
+            const float b = static_cast<float>((n & 7) - ty + kt);
+            sum += a * b;
+        }
+    }
+
+    asm volatile("" ::"v"(sum));
+}
+
+template <int TILE>
+__global__ void gemm_barrier_synth_probe(int M, int N, int K, int k_limit) {
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int m = blockIdx.y * TILE + ty;
+    const int n = blockIdx.x * TILE + tx;
+    const int K_run = k_limit > 0 && k_limit < K ? k_limit : K;
+
+    float sum = 0.0f;
+    for (int kt = 0; kt < K_run; kt += TILE) {
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < TILE; ++kk) {
+            const float a = static_cast<float>((m & 7) + kk + kt);
+            const float b = static_cast<float>((n & 7) - ty + kt);
+            sum += a * b;
+        }
+        __syncthreads();
+    }
+
+    asm volatile("" ::"v"(sum));
+}
+
+template <int TILE>
+__global__ void gemm_lds_one_synth_probe(int M, int N, int K, int k_limit) {
+    __shared__ float As[TILE][TILE];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int m = blockIdx.y * TILE + ty;
+    const int n = blockIdx.x * TILE + tx;
+    const int K_run = k_limit > 0 && k_limit < K ? k_limit : K;
+
+    float sum = 0.0f;
+    for (int kt = 0; kt < K_run; kt += TILE) {
+        As[ty][tx] = static_cast<float>((m & 7) + tx + kt);
+        __syncthreads();
+
+#pragma unroll
+        for (int kk = 0; kk < TILE; ++kk) {
+            const float b = static_cast<float>((n & 7) - ty + kt);
+            sum += As[ty][kk] * b;
+        }
+        __syncthreads();
+    }
+
+    asm volatile("" ::"v"(sum));
+}
+
+template <int TILE>
+__global__ void gemm_lds_two_store_one_read_probe(int M, int N, int K,
+                                                  int k_limit) {
+    __shared__ float As[TILE][TILE];
+    __shared__ float Bs[TILE][TILE];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int m = blockIdx.y * TILE + ty;
+    const int n = blockIdx.x * TILE + tx;
+    const int K_run = k_limit > 0 && k_limit < K ? k_limit : K;
+
+    float sum = 0.0f;
+    for (int kt = 0; kt < K_run; kt += TILE) {
+        As[ty][tx] = static_cast<float>((m & 7) + tx + kt);
+        Bs[ty][tx] = static_cast<float>((n & 7) - ty + kt);
+        __syncthreads();
+
+#pragma unroll
+        for (int kk = 0; kk < TILE; ++kk) {
+            const float b = static_cast<float>((n & 7) - ty + kt);
+            sum += As[ty][kk] * b;
+        }
+        __syncthreads();
+    }
+
+    asm volatile("" ::"v"(sum));
+}
+
 static int parse_mode(const char* mode) {
     if (std::strcmp(mode, "full") == 0) return static_cast<int>(Mode::Full);
     if (std::strcmp(mode, "nostore") == 0) return static_cast<int>(Mode::NoStore);
@@ -176,6 +275,26 @@ static int run_variant(const char* variant, const char* mode_name, int launches,
             dim3 grid((n + 5) / 6, (m + 5) / 6, 1);
             hipLaunchKernelGGL((gemm_lds_synth_masked_probe<6>), grid, block,
                                0, 0, m, n, k, k_limit);
+        } else if (std::strcmp(variant, "tile6_nolds_synth") == 0) {
+            dim3 block(6, 6, 1);
+            dim3 grid((n + 5) / 6, (m + 5) / 6, 1);
+            hipLaunchKernelGGL((gemm_nolds_synth_probe<6>), grid, block, 0, 0,
+                               m, n, k, k_limit);
+        } else if (std::strcmp(variant, "tile6_barrier_synth") == 0) {
+            dim3 block(6, 6, 1);
+            dim3 grid((n + 5) / 6, (m + 5) / 6, 1);
+            hipLaunchKernelGGL((gemm_barrier_synth_probe<6>), grid, block, 0,
+                               0, m, n, k, k_limit);
+        } else if (std::strcmp(variant, "tile6_lds_one_synth") == 0) {
+            dim3 block(6, 6, 1);
+            dim3 grid((n + 5) / 6, (m + 5) / 6, 1);
+            hipLaunchKernelGGL((gemm_lds_one_synth_probe<6>), grid, block, 0,
+                               0, m, n, k, k_limit);
+        } else if (std::strcmp(variant, "tile6_lds_two_store_one_read") == 0) {
+            dim3 block(6, 6, 1);
+            dim3 grid((n + 5) / 6, (m + 5) / 6, 1);
+            hipLaunchKernelGGL((gemm_lds_two_store_one_read_probe<6>), grid,
+                               block, 0, 0, m, n, k, k_limit);
         } else if (std::strcmp(variant, "tile16") == 0) {
             dim3 block(16, 16, 1);
             dim3 grid((n + 15) / 16, (m + 15) / 16, 1);

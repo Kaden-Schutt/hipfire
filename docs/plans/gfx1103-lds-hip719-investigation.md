@@ -327,6 +327,35 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 - In the current standalone GEMM probe state, launch counts `50` and `55`
   pass, while `56` and `60` fail, so the reusable-process edge is now tightly
   bracketed between `55` and `56` launches for the `tile6_synth` shape.
+- A throwaway same-shape kernel-body split in
+  `/tmp/hipfire-lds-chaingun` sharpened the LDS boundary. At
+  `512x3072x3072`, 100 launches, and the same `6x6` block / `ceil(dim/6)`
+  grid:
+  - `tile6_nolds_synth` passed. This keeps launch geometry, loop count, and
+    arithmetic, but removes LDS and barriers.
+  - `tile6_barrier_synth` passed. This keeps the two barriers per K tile but
+    still removes LDS.
+  - `tile6_lds_one_synth` passed. This adds one `6x6` shared tile
+    (`group_segment_fixed_size=144`) and reads it back.
+  - `tile6_lds_two_store_one_read` failed with HIP 719 at sync 97. This writes
+    two `6x6` shared tiles (`group_segment_fixed_size=288`) but only reads one
+    tile back.
+  - The existing `tile6_synth` failed with HIP 719 at sync 56 in the same
+    envelope (`group_segment_fixed_size=288`).
+  This points away from launch count, arithmetic, barriers alone, and a single
+  LDS producer/consumer tile. The smallest new failing splitter is two shared
+  6x6 tiles being populated in the all-active 36-thread workgroup, even before
+  the second tile is consumed by the inner product.
+- The throwaway split's resource metadata is useful: no-LDS and barrier-only
+  variants use `group_segment_fixed_size=0`, one-tile LDS uses `144`, and the
+  two-tile failing splitter uses `288` with the same `sgpr_count=5` and
+  `vgpr_count=12` as the passing one-tile variant. The failing `tile6_synth`
+  uses `288`, `sgpr_count=5`, and `vgpr_count=18`.
+- Caution for those latest throwaway runs: `run.log`/`exit_code.txt` are the
+  authoritative pass/fail evidence. The captured dmesg snapshots and live
+  `dmesg --ctime` preserve the same MES `REMOVE_QUEUE` reset family, but the
+  ctime stamps lag file timestamps on this machine, so do not use ctime alone
+  to order those runs.
 - Conclusion: launch-grid mismatch can mask the bug by reducing workload, but
   the correct launch geometry still faults.
 
@@ -347,6 +376,10 @@ Latest artifact paths:
 - `/tmp/hipfire-lds-gemm-standalone-artifacts/tile6_n100_m512_n3072_k3072/`:
   direct HIP standalone GEMM reproducer. Includes generated object/ISA dumps,
   dmesg snapshots, final dmesg tail, and a root-copied `devcoredump.data`.
+- `/tmp/hipfire-lds-chaingun-runs/`: current throwaway `chaingun` body-split
+  controls. Preserved subdirectories include `nolds-control`,
+  `barrier-control`, `lds-one-control`, `lds-two-store-one-read`, and
+  `lds-synth-control`.
 - `/tmp/hipfire-lds-gemm-klimit-repeat-artifacts/`: repeated no-global/no-store
   K-limit sweep, including pass at `K_LIMIT=1536`, repeated failures at
   `K_LIMIT=2048`, and tile5 pass at full K.
