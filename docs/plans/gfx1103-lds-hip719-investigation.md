@@ -206,9 +206,15 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 | Direct-AB no-output `6x6` active/block, reads=6, 176 iterations, 512x86 grid | PASS | Reads=6 low side. |
 | Direct-AB no-output `6x6` active/block, reads=6, 192/256/320 iterations, 512x86 grid | FAIL | Reads=6 edge is between 176 and 192. |
 | Direct-AB no-output `6x6` active/block, reads=6, 192 iterations, 509x86 grid | PASS | Grid-width low side at fixed read/loop edge. |
-| Direct-AB no-output `6x6` active/block, reads=6, 192 iterations, 510/511/512x86 grid | FAIL | Grid-width edge is between 509 and 510 at grid_y=86. |
+| Direct-AB no-output `6x6` active/block, reads=6, 192 iterations, 510x86 grid | MIXED | Earlier grid sweep failed at sync 99; fresh launch-count replay passed through 100 launches. Treat exact 510x86 edge as reset/state-sensitive. |
+| Direct-AB no-output `6x6` active/block, reads=6, 192 iterations, 511/512x86 grid | FAIL | Fresh replay failed at sync 99 for 100 requested launches. |
+| Direct-AB no-output `6x6` active/block, reads=6, 192 iterations, 511x86 grid, 96-99 launches | PASS | Launch-count low side at the fresh grid edge. |
+| Direct-AB no-output `6x6` active/block, reads=6, 192 iterations, 511x86 grid, 100 launches | FAIL | Launch-count high side; failed at sync 99 with the same gfxhub/GDS coredump signature. |
 | Direct-AB no-output `6x6` active/block, reads=3, 448 iterations, 511x86 grid | PASS | Grid-width low side at fixed read/loop edge. |
-| Direct-AB no-output `6x6` active/block, reads=3, 448 iterations, 512x86 grid | FAIL | Grid-width edge is between 511 and 512 at grid_y=86. |
+| Direct-AB no-output `6x6` active/block, reads=3, 448 iterations, 512x86 grid | MIXED | Fails on repeat, but the exact launch edge moves with reset/GPU state. |
+| Direct-AB no-output `6x6` active/block, reads=3, 448 iterations, 512x86 grid, 94-99 launches | PASS | Initial launch-count sweep low side. |
+| Direct-AB no-output `6x6` active/block, reads=3, 448 iterations, 512x86 grid, 100 launches | MIXED | Initial run passed; deliberate repeat after reset pressure failed at sync 99. |
+| Direct-AB no-output `6x6` active/block, reads=3, 448 iterations, 512x86 grid, 110/120/130/150 launches | FAIL | Extended launch-count sweep failed around sync 98-101. |
 | Direct-AB no-output `8x4` active/block, reads=6, 512 iterations, 512x86 grid | PASS | Exact one-wave, two-array control. |
 | Direct-AB no-output `8x4` active inside `8x5` block, reads=6, 512 iterations, 512x86 grid | PASS | Two-wave block with 32 active lanes; still stable. |
 | Direct-AB no-output `5x5`/`4x4` active inside `6x6` block, reads=6, 512 iterations, 512x86 grid | PASS | Small active controls remain stable without cooperative producer loops. |
@@ -303,8 +309,15 @@ Latest artifact paths:
   passes at 384 and fails at 448, reads=5 passes at 224 and fails at 256, and
   reads=6 passes at 176 and fails at 192. Failures keep the same gfxhub/GDS
   coredump signature. Grid-width sweeps at fixed edge points show sharp total
-  work thresholds: reads=6/192 passes through 509x86 and fails at 510x86,
-  while reads=3/448 passes through 511x86 and fails at 512x86.
+  work thresholds: reads=6/192 passes through 509x86 and fails at 511x86 in
+  the fresh replay, while the exact 510x86 edge is mixed across runs.
+  Reads=3/448 passes through 511x86 and fails on repeat at 512x86. Launch-count
+  controls are preserved in the same root: for reads=6/192/511x86, 99 launches
+  pass and 100 launches fail at sync 99; for reads=3/448/512x86, 99 launches
+  pass, 100 launches is mixed, and longer requested runs fail around sync
+  98-101. The deliberate reads=3 100-launch repeat overwrote the earlier
+  pass artifact, so use the 99-pass and 100-fail directories for preserved
+  low/high artifacts.
 
 ## Current Narrowing
 
@@ -528,13 +541,23 @@ Reduction results after extending the standalone HIP GEMM probe:
   LDS read pressure rather than barrier count alone.
 - Grid-width sweeps on the direct-AB edge preserve the cumulative-work model.
   At reads=6 and 192 iterations, grid_x 256, 320, 384, 448, 480, 496, 504,
-  508, and 509 all pass at grid_y=86, while grid_x 510, 511, and 512 fail at
-  sync 99 with identical resource metadata. At reads=3 and 448 iterations,
-  grid_x 256, 320, 384, 448, 480, 496, 504, 508, 510, and 511 pass, while
-  grid_x 512 fails on repeat at sync 97-98. This is sharper than the earlier
-  LDS-only grid threshold but points in the same direction: the fault appears
-  after a narrow cumulative LDS-read/work threshold, not at kernel launch or
-  compile time.
+  508, and 509 all pass at grid_y=86. The exact 510x86 edge is
+  reset/state-sensitive: an earlier grid sweep failed at sync 99, while a
+  fresh launch-count replay passed through 100 launches. The fresh replay gives
+  the cleaner edge at 511x86/512x86, both failing at sync 99 for 100 requested
+  launches. At reads=3 and 448 iterations, grid_x 256, 320, 384, 448, 480,
+  496, 504, 508, 510, and 511 pass, while grid_x 512 fails on repeat around
+  sync 97-99. This is sharper than the earlier LDS-only grid threshold but
+  points in the same direction: the fault appears after a narrow cumulative
+  LDS-read/work threshold, not at kernel launch or compile time.
+- Launch-count controls on the same direct-AB edge strengthen the cumulative
+  exposure model. At reads=6/192/511x86, launch counts 96, 97, 98, and 99 pass;
+  100 fails at sync 99. At reads=3/448/512x86, launch counts 94-99 pass in the
+  initial sweep; extending to 110/120/130/150 requested launches fails around
+  sync 98-101; a deliberate 100-vs-101 repeat after reset pressure failed at
+  sync 99 and sync 98. Treat the reads=3 exact counter as state-sensitive, but
+  not the broad fact that slightly shorter runs pass and slightly longer runs
+  fail with the same generated code.
 
 The synthetic failure coredump again reports:
 
@@ -548,6 +571,17 @@ regGDS_VM_PROTECTION_FAULT                          0x0fc00113
 
 The fresh launch-bisect coredump copied from the 96-launch failure reports the
 same low-level signature:
+
+```text
+[gfxhub] Page fault observed
+Faulty page starting at address: 0x000074669d000000
+Protection fault status register: 0x841051
+regGDS_PROTECTION_FAULT                             0x3f000007
+regGDS_VM_PROTECTION_FAULT                          0x0fc00113
+```
+
+The direct-AB launch-count failures copied from the reads=6/192/511x86 and
+reads=3/448/512x86 controls report the same signature:
 
 ```text
 [gfxhub] Page fault observed
@@ -596,8 +630,10 @@ LDS-only control:
 | direct-AB no-output `6x6` block, reads=3 | PASS at 384, FAIL at 448/512 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 288 B | 34 | 2 | 0 | 32 |
 | direct-AB no-output `6x6` block, reads=5 | PASS at 224, FAIL at 256 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 288 B | 54 | 2 | 0 | 32 |
 | direct-AB no-output `6x6` block, reads=6 | PASS at 176, FAIL at 192 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 288 B | 40-52 | 2 | 0 | 32 |
-| direct-AB no-output `6x6` block, reads=6, 192 iters | PASS at 509x86, FAIL at 510x86 | `_Z19lds_direct_ab_probev` | 288 B | 52 | 2 | 0 | 32 |
-| direct-AB no-output `6x6` block, reads=3, 448 iters | PASS at 511x86, FAIL at 512x86 | `_Z19lds_direct_ab_probev` | 288 B | 34 | 2 | 0 | 32 |
+| direct-AB no-output `6x6` block, reads=6, 192 iters | PASS at 509x86, MIXED at 510x86, FAIL at 511x86 | `_Z19lds_direct_ab_probev` | 288 B | 52 | 2 | 0 | 32 |
+| direct-AB no-output `6x6` block, reads=3, 448 iters | PASS at 511x86, FAIL on repeat at 512x86 | `_Z19lds_direct_ab_probev` | 288 B | 34 | 2 | 0 | 32 |
+| direct-AB no-output `6x6` block, reads=6, 192 iters, 511x86 | PASS at 99 launches, FAIL at 100 launches | `_Z19lds_direct_ab_probev` | 288 B | 52 | 2 | 0 | 32 |
+| direct-AB no-output `6x6` block, reads=3, 448 iters, 512x86 | PASS at 99 launches, FAIL on 100+ launch repeats | `_Z19lds_direct_ab_probev` | 288 B | 34 | 2 | 0 | 32 |
 | direct-AB no-output `8x4` active in `8x5` block, reads=6 | PASS at 512 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 256 B | 22 | 5 | 0 | 32 |
 
 ISA observations:
