@@ -160,6 +160,11 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 | Standalone LDS-only no-mask `TILE=6`, 512 iterations, 288x86 grid | PASS | Removes exec-mask regions; same pass side as masked control. |
 | Standalone LDS-only no-mask `TILE=6`, 512 iterations, 304x86 grid | FAIL | Removes exec-mask regions; failed at sync 98. |
 | Rect-active no-output `6x6` active/block, K=6, 320 iterations, 512x86 grid | FAIL | Rectangular probe baseline; failed at sync 87. No global load/store ISA. |
+| Rect-active no-output `6x6` active/block, K=6, 256 iterations, 512x86 grid | PASS | Low side of the rectangular K=6 loop-depth edge. |
+| Rect-active no-output `6x6` active/block, K=6, 272 iterations, 512x86 grid | PASS | Same code-object resource metadata as the 280-fail case. |
+| Rect-active no-output `6x6` active/block, K=6, 280 iterations, 512x86 grid | FAIL | Same code-object resource metadata as the 272-pass case; failed at sync 99. |
+| Rect-active no-output `6x6` active/block, K=5, 320/336/384 iterations, 512x86 grid | PASS | K=5 shifts the same all-active 6x6 threshold upward. |
+| Rect-active no-output `6x6` active/block, K=5, 416/448/512 iterations, 512x86 grid | FAIL | K=5 edge is between 384 and 416 iterations; 416 failed at sync 91. |
 | Rect-active no-output `8x4` active/block, K=6, 336 iterations, 512x86 grid | PASS | Exactly one wave, K=6, code-object LDS segment 288 B. |
 | Rect-active no-output `8x4` active/block, K=6, 512 iterations, 512x86 grid | PASS | Exact one-wave K=6 control remains stable at longer loop depth. |
 | Rect-active no-output `8x4` active inside `8x5` block, K=6, 336 iterations, 512x86 grid | PASS | Two-wave block and barriers with only 32 active LDS lanes; code-object LDS segment 288 B. |
@@ -246,6 +251,9 @@ Latest artifact paths:
   passes at 336 iterations but fails at 512. It also shows K-depth matters:
   `5x5` active inside a `6x6` block passes with K=5 at 512 iterations but
   fails with K=6 at 320/336/512; `5x5` active/block with K=6 passes at 512.
+  The all-active `6x6` source gives a tighter K-depth comparison: K=6 passes
+  at 272 iterations and fails at 280 with identical resource metadata, while
+  K=5 passes at 384 and fails at 416.
 
 ## Current Narrowing
 
@@ -422,6 +430,16 @@ Reduction results after extending the standalone HIP GEMM probe:
   active/block, K=6 control passes at 512 iterations. This moves the current
   model from "active lanes > 32" to "multi-wave block plus K=6 LDS
   producer/consumer loops plus cumulative work".
+- For the all-active `6x6` rectangular source, K-depth shifts rather than
+  creates the loop-depth threshold. K=6 passes at 256/272 iterations and fails
+  at 280/288/320. The 272-pass and 280-fail artifacts have identical resource
+  metadata: 288 B LDS, 30 VGPR, 5 SGPR, 4 `s_barrier`, 2 `ds_store*`, 10
+  `ds_load*`, 5 `s_waitcnt`, 2 `s_and_saveexec`, and no global load/store
+  instructions. K=5 on the same `6x6` active/block shape passes at
+  320/336/384 and fails at 416/448/512. Its 384-pass and 416-fail artifacts
+  also have identical resource metadata: 248 B LDS, 47 VGPR, 5 SGPR, 8
+  `s_barrier`, 8 `ds_store*`, 24 `ds_load*`, 10 `s_waitcnt`, 4
+  `s_and_saveexec`, and no global load/store instructions.
 
 The synthetic failure coredump again reports:
 
@@ -465,6 +483,8 @@ LDS-only control:
 | LDS-only no-mask `TILE=6`, 512 iterations | FAIL at 304x86 | `_Z16lds_probe_nomaskILi6ELi512EEvPfi` | 288 B | 56 | 8 | 0 | 32 |
 | minimal no-output LDS-only `TILE=6` | FAIL at 320 iterations / 512x86 | `_Z17lds_minimal_probev` | 288 B | 54 | 2 | 0 | 32 |
 | rect-active no-output `6x6` block, K=6 | FAIL at 320 iterations / 512x86 | `_Z21lds_rect_active_probev` | 288 B | 30 | 5 | 0 | 32 |
+| rect-active no-output `6x6` block, K=6 | PASS at 272, FAIL at 280 iterations / 512x86 | `_Z21lds_rect_active_probev` | 288 B | 30 | 5 | 0 | 32 |
+| rect-active no-output `6x6` block, K=5 | PASS at 384, FAIL at 416 iterations / 512x86 | `_Z21lds_rect_active_probev` | 248 B | 47 | 5 | 0 | 32 |
 | rect-active no-output `8x4` block, K=6 | PASS at 512 iterations / 512x86 | `_Z21lds_rect_active_probev` | 288 B | 33 | 7 | 0 | 32 |
 | rect-active no-output `8x4` active in `8x5` block, K=6 | PASS at 336, FAIL at 512 iterations / 512x86 | `_Z21lds_rect_active_probev` | 288 B | 21 | 8 | 0 | 32 |
 | rect-active no-output `5x5` active in `6x6` block, K=5 | PASS at 512 iterations / 512x86 | `_Z21lds_rect_active_probev` | 212 B | 16 | 7 | 0 | 32 |
@@ -532,13 +552,13 @@ Best current hypothesis:
 > square-kernel symptom remains `TILE=5`/K=5 one-wave passing versus
 > `TILE=6`/K=6 multi-wave failing, but rectangular controls refine that into a
 > more precise model: exact one-wave K=6 LDS blocks are stable, while multi-wave
-> blocks with K=6 LDS producer/consumer loops can fail even with 25 or 32 active
-> lanes once loop depth and grid work are high enough. Crossing 32 active lanes
-> accelerates the failure rather than solely defining it. A no-global, no-store
-> synthetic GEMM-shaped kernel reproduces HIP 719, and simpler no-output LDS
-> probes reproduce the same gfxhub/GDS coredump signature once the
-> block/K-depth/grid/launch threshold is crossed. Exec-mask structure does not
-> appear to be the deciding factor.
+> blocks with LDS producer/consumer loops fail after a duration threshold whose
+> position depends on active shape, K-depth, grid work, and launched block shape.
+> Crossing 32 active lanes and increasing K-depth both accelerate the failure
+> rather than solely defining it. A no-global, no-store synthetic GEMM-shaped
+> kernel reproduces HIP 719, and simpler no-output LDS probes reproduce the same
+> gfxhub/GDS coredump signature once the block/K-depth/grid/launch threshold is
+> crossed. Exec-mask structure does not appear to be the deciding factor.
 
 ## Next Evidence To Capture
 
@@ -568,10 +588,10 @@ control):
 - use the minimal no-output repro for the next reduction: repeat the 256-pass /
   320-fail correlate in fresh processes and try smaller active-lane shapes
   around the one-wave/two-wave boundary.
-- use the rectangular no-output repro for the next reduction: binary-search
-  the `5x5` active in `6x6`, K=6 failure between K=5 and K=6, then separate
-  the role of inactive lanes from block size by adding an all-active `6x6`
-  K=5/K=6 comparison at identical source and metadata collection.
+- use the rectangular no-output repro for the next reduction: normalize DS
+  instruction count across K=5/K=6 where possible, then separate inactive lanes
+  from launched block size with `6x5`/`5x6` active-in-`6x6` controls and
+  one-wave all-active counterparts.
 - create a single-instantiation compile unit for the failing synthetic symbol
   and the passing long-loop symbol so instruction counts can be per-symbol
   instead of object-aggregate.
