@@ -228,3 +228,41 @@ on the shuffled split across a few seeds. If indistinguishable, the token-mixer 
 NOT the bottleneck — pivot from "ablate the recurrence (conv1d/delta-rule)" to the
 TASK FORMULATION: what the drafter predicts (cosine-K vs mid-L15 target) and how it
 emits K. Do NOT build conv1d until the body is shown to matter at all.
+
+### Random-init control — DECISIVE: the body doesn't learn (2026-06-19)
+
+3 shuffle seeds, 3L/h512, 120 epochs, 80 train / 20 eval:
+
+| seed | bar | init (random) | best (trained) | best @ |
+|------|-----|---------------|----------------|--------|
+| 4660  | +0.719 | +0.481 | +0.513 | ep 0 |
+| 1337  | +0.713 | +0.543 | +0.515 | ep 0  (below init) |
+| 90210 | +0.664 | +0.493 | +0.517 | ep 75 |
+
+Trained-best is pinned at ~+0.515 across all seeds; random init is ~+0.51; best is
+at ep0 for 2/3 seeds; seed 1337's training ended BELOW its random init. Mean lift
+from training ≈ +0.01 (noise). **Conclusion: the trainable token-mixer contributes
+nothing that transfers.** The drafter's ~+0.51 importance correlation comes entirely
+from the frozen shared embedding + cosine-K geometry — the random body is a
+near-isometry that passes embedding structure through, and a tiny body can't learn
+the residual.
+
+**Consequence for the whole drafter line:** on a fair shuffled eval the
+embedding-only drafter (~+0.51) sits BELOW the shallow-K bar (~+0.66–0.72) it was
+meant to replace. So as formulated, the tiny purpose-built drafter does NOT beat
+the baseline — and the reason is task/architecture mismatch, NOT token-mixer choice.
+The earlier P1–P3 "+0.762 vs +0.714 beats shallow-K" (Llama target) and P5 "+0.554
+vs +0.47" were UNSHUFFLED / favorable-eval-set artifacts and need the same fair
+re-check.
+
+**STOP building drafter bodies** (no conv1d, no delta rule — the body is not the
+lever). Pivot options:
+1. Task formulation — predict a different target (layer/metric) or emit importance
+   DIRECTLY (a learned scalar head) instead of via cosine-K geometry.
+2. Accept embedding-only ~+0.51 as a near-free but weaker signal; measure whether
+   PFlash's speculative-prefill tolerates it vs shallow-K's +0.70.
+3. Shelve the tiny-drafter line; PFlash keeps shallow-K.
+
+Open question worth one probe: is the mid-L15 cosine-K target itself learnable by
+ANY embedding-derived feature, or is the +0.51 a hard ceiling of the
+embedding→cosine-K path? (Train a LARGE head briefly as an oracle to bound it.)
