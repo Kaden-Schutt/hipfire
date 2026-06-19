@@ -32,4 +32,4 @@ pub mod weights;
 pub use arch::{Gemma3, Gemma3Backend};
 pub use config::{config_from_hfq, config_from_metadata_json, Gemma3Config};
 pub use forward::{forward_step, forward_step_greedy, forward_step_with_embed, Gemma3State};
-pub use weights::{load_weights, Gemma3LayerWeights, Gemma3Weights};
+pub use weights::{load_weights, load_weights_prefixed, Gemma3LayerWeights, Gemma3Weights};

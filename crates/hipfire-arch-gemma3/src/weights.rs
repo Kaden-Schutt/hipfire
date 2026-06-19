@@ -91,20 +91,37 @@ pub fn load_weights(
     cfg: &Gemma3Config,
     gpu: &mut Gpu,
 ) -> HipResult<Gemma3Weights> {
+    load_weights_prefixed(hfq, cfg, gpu, "")
+}
+
+/// Load the gemma3 text decoder with a tensor-name `prefix`. Pure-text gemma3
+/// uses `""` (`model.*` / `lm_head.weight`); the gemma3 multimodal wrapper nests
+/// the decoder under `"language_model."` (`language_model.model.*`).
+pub fn load_weights_prefixed(
+    hfq: &mut HfqFile,
+    cfg: &Gemma3Config,
+    gpu: &mut Gpu,
+    prefix: &str,
+) -> HipResult<Gemma3Weights> {
     #[cfg(unix)]
     hfq.drop_mmap();
 
     eprintln!("gemma3: loading token_embd...");
-    let (token_embd, embd_format) = load_embed_tokens(hfq, gpu, cfg)?;
+    let (token_embd, embd_format) = load_embed_tokens(hfq, gpu, cfg, prefix)?;
 
     eprintln!("gemma3: loading model.norm...");
-    let output_norm = load_norm_weight_raw(hfq, gpu, "model.norm.weight", cfg.hidden_size)?;
+    let output_norm = load_norm_weight_raw(
+        hfq,
+        gpu,
+        &format!("{prefix}model.norm.weight"),
+        cfg.hidden_size,
+    )?;
 
     eprintln!(
         "gemma3: loading lm_head (tied={})...",
         cfg.tie_word_embeddings
     );
-    let (output, tied_lm_head) = load_lm_head(hfq, gpu, cfg, embd_format)?;
+    let (output, tied_lm_head) = load_lm_head(hfq, gpu, cfg, embd_format, prefix)?;
 
     let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
     for i in 0..cfg.num_hidden_layers {
@@ -113,7 +130,7 @@ pub fn load_weights(
             i + 1,
             cfg.num_hidden_layers
         );
-        layers.push(load_layer(hfq, gpu, cfg, i)?);
+        layers.push(load_layer(hfq, gpu, cfg, i, prefix)?);
     }
 
     Ok(Gemma3Weights {
@@ -132,10 +149,11 @@ fn load_embed_tokens(
     hfq: &HfqFile,
     gpu: &mut Gpu,
     cfg: &Gemma3Config,
+    prefix: &str,
 ) -> HipResult<(GpuTensor, EmbeddingFormat)> {
-    let name = "model.embed_tokens.weight";
+    let name = format!("{prefix}model.embed_tokens.weight");
     let (info, data) = hfq
-        .tensor_data_vec(name)
+        .tensor_data_vec(&name)
         .unwrap_or_else(|| panic!("gemma3: tensor not found: {name}"));
     match info.quant_type {
         6 => Ok((
@@ -171,15 +189,16 @@ fn load_lm_head(
     gpu: &mut Gpu,
     cfg: &Gemma3Config,
     embd_format: EmbeddingFormat,
+    prefix: &str,
 ) -> HipResult<(WeightTensor, bool)> {
     // Gemma3 is tied in every shipped config, but honor the flag.
     let name = if cfg.tie_word_embeddings {
-        "model.embed_tokens.weight"
+        format!("{prefix}model.embed_tokens.weight")
     } else {
-        "lm_head.weight"
+        format!("{prefix}lm_head.weight")
     };
     let (info, data) = hfq
-        .tensor_data_vec(name)
+        .tensor_data_vec(&name)
         .unwrap_or_else(|| panic!("gemma3: tensor not found for lm_head: {name}"));
     let m = cfg.vocab_size;
     let k = cfg.hidden_size;
@@ -207,8 +226,9 @@ fn load_layer(
     gpu: &mut Gpu,
     cfg: &Gemma3Config,
     i: usize,
+    prefix: &str,
 ) -> HipResult<Gemma3LayerWeights> {
-    let p = format!("model.layers.{i}");
+    let p = format!("{prefix}model.layers.{i}");
     let q_dim = cfg.num_attention_heads * cfg.head_dim;
     let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
 
