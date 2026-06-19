@@ -139,6 +139,10 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 | Standalone LDS-only `TILE=6`, 512 iterations, 304x86 grid | FAIL | Simple LDS-only repro; failed at sync 97. |
 | Standalone LDS-only `TILE=6`, 512 iterations, 320x86 grid | FAIL | Failed at sync 90; same coredump signature. |
 | Standalone LDS-only `TILE=6`, 512 iterations, 448x86 grid | FAIL | Grid-matched to synthetic N=2688/M=512; failed at sync 64. |
+| Standalone LDS-only `TILE=5`, 512 iterations, 512x86 grid | PASS | One-wave control still passes at a larger grid than the `TILE=6` failing edge. |
+| Standalone LDS-only `TILE=6`, 256 iterations, 512x86 grid | PASS | Loop-depth correlate for synthetic `K_LIMIT=1536` pass. |
+| Standalone LDS-only `TILE=6`, 320 iterations, 512x86 grid | FAIL | Loop-depth correlate; failed at sync 87 with same coredump signature. |
+| Standalone LDS-only `TILE=6`, 336 iterations, 512x86 grid | FAIL | Loop-depth correlate near synthetic `K_LIMIT=2048`; failed at sync 84. |
 | Standalone LDS-only `TILE=6`, 320 iterations, 448x86 grid | PASS | Tight iteration-edge control at full grid. |
 | Standalone LDS-only `TILE=6`, 336 iterations, 448x86 grid | FAIL | Tight iteration-edge repro; failed at sync 98. |
 | Standalone LDS-only no-mask `TILE=6`, 512 iterations, 288x86 grid | PASS | Removes exec-mask regions; same pass side as masked control. |
@@ -200,6 +204,11 @@ Latest artifact paths:
   masked `tile6` at grid 448x86. At 100 launches, 256 and 320 iterations pass;
   336, 352, and 384 iterations fail at sync 98, 91, and 84 respectively. The
   failing artifacts include root-copied coredumps with the same signature.
+- `/tmp/hipfire-lds-standalone-correlate-artifacts/`: correlation sweep at
+  grid 512x86. `tile5_i512` passes, preserving the one-wave control at large
+  grid. `tile6_i256` passes, while `tile6_i320` and `tile6_i336` fail at sync
+  87 and 84 respectively. The `tile6_i320` rerun has a coredump captured
+  immediately after the failure; it matches the same gfxhub/GDS signature.
 
 ## Current Narrowing
 
@@ -346,6 +355,14 @@ Reduction results after extending the standalone HIP GEMM probe:
 - At the grid-matched 448x86 shape, loop depth has its own tight edge. The
   same LDS-only pattern passes at 320 iterations and fails at 336 iterations;
   larger loop depths fail earlier.
+- The LDS-only loop-depth edge lines up with the synthetic GEMM K-limit edge.
+  For `TILE=6`, `K_LIMIT=1536` is 256 loop trips and the LDS-only `tile6_i256`
+  control passes even at grid 512x86. `K_LIMIT=2048` is about 342 loop trips;
+  LDS-only `tile6_i320` and `tile6_i336` already fail at grid 512x86. This
+  makes the synthetic GEMM threshold look like the same active-LDS
+  loop-depth/grid threshold rather than a separate GEMM-shaped source effect.
+- The one-wave boundary still holds under the larger grid: `tile5_i512` passes
+  at 512x86, while `tile6_i320` and above fail.
 - Removing exec-mask regions from the LDS-only control does not shift that
   threshold materially. `tile6_i512_nomask` passes at 288x86 and fails at
   304x86, matching the masked control. The no-mask failure's coredump has the
@@ -445,8 +462,9 @@ Best current hypothesis:
 > lanes, fail). A no-global, no-store synthetic GEMM-shaped kernel reproduces
 > HIP 719, and a simpler LDS-only `TILE=6` long-loop kernel also reproduces it
 > once grid size, loop depth, and repeated launches cross a narrow,
-> reset-sensitive threshold band. Exec-mask structure does not appear to be the
-> deciding factor.
+> reset-sensitive threshold band. The synthetic `K_LIMIT` threshold aligns with
+> equivalent LDS-only loop-trip counts. Exec-mask structure does not appear to
+> be the deciding factor.
 
 ## Next Evidence To Capture
 
@@ -473,6 +491,8 @@ control):
 - reduce the LDS-only reproducer further: repeat the tight grid_x 297/298 edge
   and loop-depth 320/336 edge in fresh processes to determine how much state
   sensitivity remains.
+- test whether a no-output, single-instantiation LDS-only kernel preserves the
+  same loop-depth/grid edge, using the 256-pass / 320-fail correlate at 512x86.
 - create a single-instantiation compile unit for the failing synthetic symbol
   and the passing long-loop symbol so instruction counts can be per-symbol
   instead of object-aggregate.
