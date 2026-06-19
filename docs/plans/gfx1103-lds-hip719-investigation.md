@@ -238,6 +238,9 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 | Direct-AB exec-parent `6x6`, reads=3, 448 iterations, 512x86 grid, child-process 98+3, plain parent | PASS | First run and repeat both passed with phase1 and phase2 in fork/exec children. |
 | Direct-AB exec-parent `6x6`, reads=3, 448 iterations, 512x86 grid, child-process 98+3, HIP-initialized parent | MIXED | First trial failed inside the phase1 child at sync 97; repeat passed. Treat as edge state sensitivity, not deterministic parent-state retention. |
 | Direct-AB exec-parent `6x6`, reads=3, 448 iterations, 512x86 grid, child-process 98+3, HIP-initialized parent reset-between | PASS | Parent `hipDeviceReset()` between children returned success and both child phases passed. |
+| Direct-AB phase-mode `6x6`, reads=3, 448 iterations, 512x86 grid, same-process 96+5 | FAIL | Lower-risk split: phase1 completed, boundary sync succeeded, then phase2 launch 2 / global launch 98 failed with HIP 719. |
+| Direct-AB phase-mode `6x6`, reads=3, 448 iterations, 512x86 grid, same-process 97+4 | PASS | Same total launch count as 96+5, confirming ordering/state sensitivity near the edge rather than a simple total counter. |
+| Direct-AB exec-parent `6x6`, reads=3, 448 iterations, 512x86 grid, child-process 96+5 | PASS | Plain, HIP-initialized, and HIP-initialized reset-between parent modes passed; repeat plain and hipinit trials also passed. |
 | Direct-AB no-output `8x4` active/block, reads=6, 512 iterations, 512x86 grid | PASS | Exact one-wave, two-array control. |
 | Direct-AB no-output `8x4` active inside `8x5` block, reads=6, 512 iterations, 512x86 grid | PASS | Two-wave block with 32 active lanes; still stable. |
 | Direct-AB no-output `5x5`/`4x4` active inside `6x6` block, reads=6, 512 iterations, 512x86 grid | PASS | Small active controls remain stable without cooperative producer loops. |
@@ -401,6 +404,16 @@ Latest artifact paths:
   exec-parent controls for reads=3/448/512x86 `98+3`. Both plain parent and
   HIP-initialized parent passed, confirming that the earlier hipinit-parent
   failure is not deterministic.
+- `/tmp/hipfire-lds-direct-ab-lower-split-artifacts/`: lower-risk
+  reads=3/448/512x86 split controls. Same-process `96+5` failed after a clean
+  phase boundary at phase2 launch 2 / global launch 98, while same-process
+  `97+4` passed. Exec-parent `96+5` passed in plain, HIP-initialized, and
+  HIP-initialized reset-between parent modes. No fresh coredump was captured
+  because the devcoredump sysfs node was absent at copy time, but the dmesg
+  delta captured the same `REMOVE_QUEUE` failure and MES reset-begin path.
+- `/tmp/hipfire-lds-direct-ab-lower-split-repeat-artifacts/`: repeat
+  exec-parent controls for reads=3/448/512x86 `96+5`. Plain parent and
+  HIP-initialized parent both passed again.
 
 ## Current Narrowing
 
@@ -683,6 +696,15 @@ Reduction results after extending the standalone HIP GEMM probe:
   was exercised. Treat that as reset/state sensitivity at the edge, not as
   evidence that parent HIP initialization deterministically retains bad child
   state.
+- A lower-risk reads=3/448/512x86 split strengthens the process-boundary
+  result. Same-process `96 + 5` completed phase1 and boundary sync, then
+  failed on phase2 launch 2 / global launch 98. Same-process `97 + 4` passed
+  despite the same total requested launch count, reinforcing that ordering and
+  GPU/process state matter near the edge. Exec-parent `96 + 5` passed in all
+  first-pass parent modes, including a HIP-initialized parent, and passed again
+  in repeat plain/hipinit trials. This makes the previous one-off
+  HIP-initialized-parent failure at `98 + 3` look like ordinary edge
+  state-sensitivity rather than deterministic parent HIP context retention.
 - Additional in-process teardown checks did not find a clean middle ground
   between `hipDeviceReset()` and process exit. `hipDevicePrimaryCtxReset(0)`
   and `hipDevicePrimaryCtxRelease(0)` both return success but still fail on the
@@ -918,8 +940,13 @@ Best current hypothesis:
 > boundary, while one HIP-initialized-parent trial failed before the boundary
 > and then passed on repeat. Process exit appears to clear enough state near
 > the edge, but it is not a deterministic explanation for every trial once the
-> first child itself lands on the shifted failure side. Exec-mask structure
-> alone does not appear to be the deciding factor.
+> first child itself lands on the shifted failure side. A lower-risk `96+5`
+> split makes the parent-state picture cleaner: same-process `96+5` fails after
+> the boundary, same-process `97+4` passes, and exec-parent `96+5` passes in
+> plain and HIP-initialized parent modes across repeats. That points back to
+> state retained by the process actually issuing a long sequence of launches,
+> not parent process lifetime by itself. Exec-mask structure alone does not
+> appear to be the deciding factor.
 
 ## Next Evidence To Capture
 
@@ -950,11 +977,12 @@ control):
   320-fail correlate in fresh processes and try smaller active-lane shapes
   around the one-wave/two-wave boundary.
 - use the direct-AB phase-mode repro for the next reduction: repeat the
-  reads=3/448/512x86 `98+3` process-boundary case in fresh batches, and try
-  a slightly lower-risk split such as `96+5` or a slightly lower grid to
-  separate parent HIP initialization from ordinary edge state sensitivity.
-  Treat the common in-process HIP reset APIs as already tested; only revisit
-  teardown if a genuinely different ROCm mechanism is identified.
+  reads=3/448/512x86 `96+5` case in fresh batches with explicit coredump
+  clearing/capture, then try a slightly lower grid or split one phase into
+  more than two child processes to separate process exit from child-local
+  launch sequence length. Treat the common in-process HIP reset APIs as already
+  tested; only revisit teardown if a genuinely different ROCm mechanism is
+  identified.
 - create a single-instantiation compile unit for the failing synthetic symbol
   and the passing long-loop symbol so instruction counts can be per-symbol
   instead of object-aggregate.
