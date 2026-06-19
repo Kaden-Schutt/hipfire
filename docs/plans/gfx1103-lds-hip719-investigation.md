@@ -250,6 +250,9 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 | Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 511x86 grid, one child `99`/`100`/`101`/`102` | FAIL | Lower-grid bracket after reset pressure; 99 and 100 failed at sync/global launch 98, 101 and 102 at sync/global launch 99. |
 | Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 511x86 grid, one child `120` | FAIL | Lower-grid replay; one fork/exec child failed at sync/global launch 101 and late `devcd30` captured the same gfxhub/GDS signature. |
 | Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 511x86 grid, chunks `96,24` / `60,60` | PASS | Same total launches as one-child `120`, split across child processes. Both split shapes passed for plain and HIP-initialized parent modes. |
+| Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 510x86 grid, one child `99` | PASS | Next lower grid low side. |
+| Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 510x86 grid, one child `100`/`120` | FAIL | One-child `120` failed at sync/global launch 99; follow-up `100` failed at sync/global launch 96. Both produced the same coredump signature. |
+| Direct-AB multi-exec `6x6`, reads=3, 448 iterations, 510x86 grid, chunks `96,24` / `60,60` | PASS | Same total launches as one-child `120`, split across child processes. Both split shapes passed for plain and HIP-initialized parent modes. |
 | Direct-AB no-output `8x4` active/block, reads=6, 512 iterations, 512x86 grid | PASS | Exact one-wave, two-array control. |
 | Direct-AB no-output `8x4` active inside `8x5` block, reads=6, 512 iterations, 512x86 grid | PASS | Two-wave block with 32 active lanes; still stable. |
 | Direct-AB no-output `5x5`/`4x4` active inside `6x6` block, reads=6, 512 iterations, 512x86 grid | PASS | Small active controls remain stable without cooperative producer loops. |
@@ -455,6 +458,13 @@ Latest artifact paths:
   `101`, and `102` all failed, then a low-to-high sweep passed `90`, `95`,
   `96`, and `98` before `99` failed at sync/global launch 98. The `99` failure
   captured late generic `devcd34` with the same signature.
+- The same artifact root also contains the next grid step, reads=3/448/510x86.
+  One child with `99` requested launches passed. One child with `120` requested
+  launches failed at sync/global launch 99 and captured late generic `devcd35`;
+  after split controls, one child with `100` requested launches failed at
+  sync/global launch 96 and captured late generic `devcd36`. The same total
+  `120` requested launches passed when split as `96,24` or `60,60` child
+  processes, in both plain-parent and HIP-initialized-parent modes.
 
 ## Current Narrowing
 
@@ -776,6 +786,13 @@ Reduction results after extending the standalone HIP GEMM probe:
   one-child bracket after reset pressure narrowed the shifted edge to `98`
   passing and `99` failing, with the `99` run failing at sync/global launch 98
   and producing the same late coredump signature.
+- Stepping down again to reads=3/448/510x86 preserves the same process-boundary
+  shape. One child with `99` requested launches passes, while one child with
+  `100` requested launches fails after reset pressure. A one-child `120` run
+  also fails, but the same total work split as `96,24` or `60,60` passes in
+  both plain-parent and HIP-initialized-parent modes. This makes the grid-width
+  effect look like a movement of the child-local launch threshold, not removal
+  of the process-local failure mode.
 - Additional in-process teardown checks did not find a clean middle ground
   between `hipDeviceReset()` and process exit. `hipDevicePrimaryCtxReset(0)`
   and `hipDevicePrimaryCtxRelease(0)` both return success but still fail on the
@@ -902,6 +919,18 @@ regGDS_PROTECTION_FAULT                             0x3f000007
 regGDS_VM_PROTECTION_FAULT                          0x0fc00113
 ```
 
+The 510x86 one-child failures (`120`, then `100`) captured the same fields in
+`devcd35` and `devcd36`; the preserved one-child bracket is `99` pass / `100`
+fail:
+
+```text
+[gfxhub] Page fault observed
+Faulty page starting at address: 0x000074669d000000
+Protection fault status register: 0x841051
+regGDS_PROTECTION_FAULT                             0x3f000007
+regGDS_VM_PROTECTION_FAULT                          0x0fc00113
+```
+
 Code object/resource observations from `llvm-readobj` dumps:
 
 | Variant | Workgroup | LDS group segment | VGPR | SGPR | Spills | Wavefront |
@@ -950,6 +979,7 @@ LDS-only control:
 | direct-AB exec-parent `6x6` block, reads=6, 192 iters, 511x86 | PASS for child-process 98+2 and 99+1 even with HIP-initialized parent | `_Z25lds_direct_ab_phase_probev` | 288 B | 52 | 2 | 0 | 32 |
 | direct-AB no-output `6x6` block, reads=3, 448 iters, 512x86 | PASS at 99 launches, FAIL on 100+ launch repeats | `_Z19lds_direct_ab_probev` | 288 B | 34 | 2 | 0 | 32 |
 | direct-AB multi-exec `6x6` block, reads=3, 448 iters, 511x86 | PASS through one-child 98; FAIL at one-child 99+; PASS for 96,24 and 60,60 child splits | `_Z25lds_direct_ab_phase_probev` | 288 B | 34 | 2 | 0 | 32 |
+| direct-AB multi-exec `6x6` block, reads=3, 448 iters, 510x86 | PASS through one-child 99; FAIL at one-child 100+; PASS for 96,24 and 60,60 child splits | `_Z25lds_direct_ab_phase_probev` | 288 B | 34 | 2 | 0 | 32 |
 | direct-AB no-output `8x4` active in `8x5` block, reads=6 | PASS at 512 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 256 B | 22 | 5 | 0 | 32 |
 
 ISA observations:
@@ -1075,7 +1105,9 @@ Best current hypothesis:
 > one child running `120` launches fails, while `96,24` and `60,60` splits
 > with the same total pass in both plain-parent and HIP-initialized-parent
 > modes. A follow-up one-child bracket at 511x86 shifted lower after reset
-> pressure but stayed sharp: `98` passes and `99` fails.
+> pressure but stayed sharp: `98` passes and `99` fails. Stepping grid_x down
+> to 510 keeps the same pattern with `99` pass / `100` fail and split children
+> passing at the same total work.
 > Exec-mask structure alone does not appear to be the deciding factor.
 
 ## Next Evidence To Capture
@@ -1111,10 +1143,12 @@ control):
   lower-grid multi-child replay preserved the child-local launch sequence
   finding (`120` in one child fails; `96,24` and `60,60` split children pass),
   and a follow-up one-child bracket now has `98` pass / `99` fail at the same
-  grid after reset pressure. Next, step grid_x lower again to map how quickly
-  the one-child edge moves. Treat the common in-process HIP reset APIs as
-  already tested; only revisit teardown if a genuinely different ROCm
-  mechanism is identified.
+  grid after reset pressure. The 510x86 replay has `99` pass / `100` fail, with
+  the same split-child passes at total `120`. Next, step grid_x lower again
+  (509x86) to see where the process-local edge finally falls below this
+  bracket or disappears. Treat the common in-process HIP reset APIs as already
+  tested; only revisit teardown if a genuinely different ROCm mechanism is
+  identified.
 - create a single-instantiation compile unit for the failing synthetic symbol
   and the passing long-loop symbol so instruction counts can be per-symbol
   instead of object-aggregate.
