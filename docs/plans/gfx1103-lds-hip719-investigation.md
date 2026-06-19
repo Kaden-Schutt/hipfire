@@ -335,6 +335,8 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
     arithmetic, but removes LDS and barriers.
   - `tile6_barrier_synth` passed. This keeps the two barriers per K tile but
     still removes LDS.
+  - `tile6_barrier3_synth` passed. This keeps three barriers per K tile but
+    still removes LDS (`group_segment_fixed_size=0`).
   - `tile6_lds_one_synth` passed. This adds one `6x6` shared tile
     (`group_segment_fixed_size=144`) and reads it back.
   - `tile6_lds_padded_one_synth` passed. This uses one padded shared array
@@ -343,6 +345,10 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   - `tile6_lds_two_store_once_one_read` passed. This allocates two `6x6`
     shared tiles and writes the second tile once before the K loop, then only
     uses the first tile inside the loop.
+  - `tile6_lds_forced_same_second_store` failed with HIP 719 at sync 92. This
+    uses one `6x6` tile (`group_segment_fixed_size=144`) but forces a per-K
+    `ds_store -> barrier -> ds_load/ds_store -> barrier` sequence on the same
+    LDS addresses before the regular inner-product reads.
   - `tile6_lds_two_store_one_read` failed with HIP 719 at sync 97. This writes
     two `6x6` shared tiles (`group_segment_fixed_size=288`) but only reads one
     tile back.
@@ -350,17 +356,24 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
     envelope (`group_segment_fixed_size=288`).
   This points away from launch count, arithmetic, barriers alone, and a single
   LDS producer/consumer tile. The 288 B group segment alone also passes, and a
-  second tile written only once passes. The smallest new failing splitter is two
-  shared `6x6` tiles being populated on every K tile in the all-active
-  36-thread workgroup, even before the second tile is consumed by the inner
-  product.
+  second tile written only once passes. The smallest current failing splitter
+  is not strictly "second address range"; a forced second same-address LDS
+  read/write phase also fails. The better current model is per-K repeated LDS
+  producer/consumer pressure beyond the single-store/single-read tile pattern,
+  with barrier count alone ruled out by the three-barrier no-LDS pass.
 - The throwaway split's resource metadata is useful: no-LDS and barrier-only
   variants use `group_segment_fixed_size=0`, one-tile LDS uses `144`, and the
   two-tile failing splitter uses `288` with the same `sgpr_count=5` and
   `vgpr_count=12` as the passing one-tile variant. The padded-one passing
   variant uses `288`, `sgpr_count=6`, and `vgpr_count=24`; the write-once
   passing variant uses `288`, `sgpr_count=6`, and `vgpr_count=12`. The failing
-  `tile6_synth` uses `288`, `sgpr_count=5`, and `vgpr_count=18`.
+  forced-same-address splitter uses `144`, `sgpr_count=5`, and `vgpr_count=12`.
+  The failing `tile6_synth` uses `288`, `sgpr_count=5`, and `vgpr_count=18`.
+- A naive same-address double-store variant was not useful: the compiler reduced
+  it to a single `ds_store`. A volatile padded second-address variant failed at
+  sync 57, but compiled the shared accesses as `flat_store_b32` /
+  `flat_load_b32` with cache modifiers rather than ordinary `ds_*`, so treat it
+  as a side observation rather than the clean LDS-store boundary.
 - Caution for those latest throwaway runs: `run.log`/`exit_code.txt` are the
   authoritative pass/fail evidence. The captured dmesg snapshots and live
   `dmesg --ctime` preserve the same MES `REMOVE_QUEUE` reset family, but the
@@ -395,6 +408,10 @@ Latest artifact paths:
   `lds-two-store-once-one-read`, and the repeat failing
   `lds-two-store-perk-one-read` (`tile6_lds_two_store_one_read` failed at sync
   96).
+- `/tmp/hipfire-lds-store-split-runs/`: same-address/second-address splitter
+  controls. `tile6_barrier3_synth` passed at 100 launches, while
+  `tile6_lds_forced_same_second_store` failed at sync 92 with a real
+  `ds_store`, `ds_load`, `ds_store` same-address sequence.
 - `/tmp/hipfire-lds-gemm-klimit-repeat-artifacts/`: repeated no-global/no-store
   K-limit sweep, including pass at `K_LIMIT=1536`, repeated failures at
   `K_LIMIT=2048`, and tile5 pass at full K.
