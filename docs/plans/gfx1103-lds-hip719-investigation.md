@@ -96,6 +96,9 @@ Compare with the adjacent controls:
 ```bash
 VARIANT=tile6_lds_store_then_load_dynamiccols_load4_use4 MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-load4-780m
 VARIANT=tile6_lds_store_then_load_dynamiccols_load5_serial_use5 MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-serial5-780m
+VARIANT=tile6_lds_store_then_load_dynamiccols_load5_split3_use5 MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-split3-780m
+VARIANT=tile6_lds_store_then_load_dynamiccols_load5_split2_2_1_use5 MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-split2-2-1-780m
+VARIANT=tile6_lds_store_then_load_dynamiccols_load5_split1_keep5 MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-split1-keep5-780m
 ```
 
 The currently promoted standalone GEMM jig lives in the repo:
@@ -440,9 +443,10 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
     `s_waitcnt lgkmcnt(0)` after each load flips the result back to pass:
     `tile6_lds_store_then_load_dynamiccols_load5_serial_use5` passed at 100
     launches. The non-serialized `dynamiccols_load5_use5` contrast failed at
-    sync 91 in the same compile unit. This makes the current strongest model
-    an outstanding-LDS-read pressure issue after the second store/extra-load
-    producer phase, not simply the total number of row LDS load instructions.
+    sync 91 in the same compile unit. Later reset-pressure testing found the
+    same serialized control can fail at sync 87 after several nearby
+    reset-producing variants, so treat this pass as a clean-state contrast, not
+    an unconditional workaround.
   - The promoted split wait control
     `tile6_lds_store_then_load_dynamiccols_load5_split4_use5` issues four
     dynamic row `ds_load_b32` operations, waits, then issues the fifth. It
@@ -450,6 +454,22 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
     recovery control passed afterward. That rules out the fully packed five
     load group as the only bad shape; a four-load outstanding group followed by
     another dynamic row load is still sufficient on this local 780M.
+  - Further promoted split wait controls also failed:
+    `tile6_lds_store_then_load_dynamiccols_load5_split3_use5` at sync 91,
+    `tile6_lds_store_then_load_dynamiccols_load5_split2_3_use5` at sync 92,
+    and `tile6_lds_store_then_load_dynamiccols_load5_split2_2_1_use5` at sync
+    92. All passed one-launch smoke, kept `144` B LDS,
+    `sgpr_count=5`, and `vgpr_count=15`, and produced the same MES reset path.
+    This rules out a simple peak outstanding row-load threshold of four, three,
+    or two.
+  - The max-one-outstanding delayed-consume control
+    `tile6_lds_store_then_load_dynamiccols_load5_split1_keep5` also failed at
+    sync 87. It waits after every dynamic row load but delays the final
+    accumulation until all five loaded values are live. That shifts the leading
+    local model away from "outstanding LDS read count alone" and toward a
+    combination of second-store/extra-load producer phase, five dynamic LDS row
+    values live across waits, and delayed consumption. Recovery controls passed
+    between reset-producing runs.
   - The cross-row load split `tile6_lds_store_then_load_nextrow_read6` also
     failed under the 100-launch stress envelope, at sync 88. Clean follow-up
     runs passed at `N_LAUNCH=1` and `N_LAUNCH=2`, so treat the earlier
@@ -497,9 +517,12 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   split rules out the packed contiguous row-load instruction form as a
   requirement; independent dynamic-address `ds_load_b32` row loads are still
   enough, and their stress threshold is lower: four pass and five fail when
-  the loads are outstanding together. Explicitly waiting after each dynamic row
-  load makes five pass again, so outstanding LDS read depth is now a leading
-  suspect.
+  the loads are outstanding together. Clean-state immediate-consume
+  serialization can pass, but split controls down to max-one outstanding still
+  fail when all five row-load results remain live until delayed accumulation.
+  The leading local suspect is now the combination of the second-store /
+  extra-load producer phase, five dynamic row LDS values live across waits, and
+  delayed consumption, with strong same-process/reset-state sensitivity.
   Barrier count alone is ruled out by the three-barrier no-LDS pass and the
   isolated extra-load / isolated load-store phase controls.
 - The throwaway split's resource metadata is useful: no-LDS and barrier-only
@@ -534,14 +557,19 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   `load4_use4` passes with `vgpr_count=13`, while `load5_use5` fails with
   `vgpr_count=15`. Throwaway `load6_use5` and `load5_use6` also fail with
   `vgpr_count=16` and `15`, respectively. The serialized
-  `load5_serial_use5` control passes with the same `144`, `sgpr_count=5`, and
-  `vgpr_count=15` resource tuple as the failing non-serialized `load5_use5`,
-  which rules out that tuple alone. The split-wait `load5_split4_use5` control
-  fails with the same `144`, `sgpr_count=5`, and `vgpr_count=15` tuple, so the
-  issue is not removed by reducing only the first outstanding dynamic row-load
-  group from five to four. The cross-row load split uses `144`, `sgpr_count=5`,
-  and `vgpr_count=13`, and rules out same-row membership as a required trigger
-  component. The separate-tile load split uses `288`,
+  `load5_serial_use5` clean-state control passed with the same `144`,
+  `sgpr_count=5`, and `vgpr_count=15` resource tuple as the failing
+  non-serialized `load5_use5`, which ruled out that tuple alone in the clean
+  sequence. After repeated reset-producing tests the same serialized control
+  failed at sync 87, so state pressure can move this boundary. The split-wait
+  `load5_split4_use5`, `split3_use5`, `split2_3_use5`, `split2_2_1_use5`, and
+  `split1_keep5` controls all fail with the same `144`, `sgpr_count=5`, and
+  `vgpr_count=15` tuple. The issue is therefore not removed by reducing only
+  the outstanding dynamic row-load group size, even to one, when the five
+  loaded values remain live until delayed consumption. The cross-row load split
+  uses `144`, `sgpr_count=5`, and `vgpr_count=13`, and rules out same-row
+  membership as a required trigger component. The separate-tile load split uses
+  `288`,
   `sgpr_count=4`, and `vgpr_count=13`, and rules out same-tile membership when
   compared with the pass-side write-once second tile control. The separate
   read-tile split also uses `288`, `sgpr_count=4`, and `vgpr_count=12`, and
@@ -659,7 +687,10 @@ Latest artifact paths:
   `group_segment_fixed_size=144`, `sgpr_count=5`, and `vgpr_count=15`. The
   non-serialized
   `tile6_lds_store_then_load_dynamiccols_load5_use5` contrast failed at sync
-  91 in the same compile unit, and the recovery control passed afterward.
+  91 in the same compile unit, and the recovery control passed afterward. A
+  later serialized contrast in `/tmp/hipfire-lds-split3-load-runs/` failed at
+  sync 87 after several reset-producing split controls, so this is a
+  clean-state contrast rather than a stable recovery workaround.
 - `/tmp/hipfire-lds-split-load-runs/`: split dynamic row-load controls.
   Promoted `tile6_lds_store_then_load_dynamiccols_load5_split4_use5` passed a
   one-launch smoke, then failed at sync 92 over 100 launches. ISA shows four
@@ -667,6 +698,22 @@ Latest artifact paths:
   dynamic row `ds_load_b32`; metadata is `group_segment_fixed_size=144`,
   `sgpr_count=5`, and `vgpr_count=15`. A recovery
   `tile6_lds_two_store_once_one_read` control passed afterward.
+- `/tmp/hipfire-lds-split3-load-runs/`: follow-up split dynamic row-load
+  controls. Promoted `tile6_lds_store_then_load_dynamiccols_load5_split3_use5`
+  passed one-launch smoke, emitted three dynamic row `ds_load_b32` operations,
+  `s_waitcnt lgkmcnt(0)`, then two more dynamic row `ds_load_b32` operations,
+  and failed at sync 91 over 100 launches. Promoted
+  `tile6_lds_store_then_load_dynamiccols_load5_split2_3_use5` passed smoke and
+  failed at sync 92. Promoted
+  `tile6_lds_store_then_load_dynamiccols_load5_split2_2_1_use5` passed smoke
+  and failed at sync 92. Promoted
+  `tile6_lds_store_then_load_dynamiccols_load5_split1_keep5` passed smoke,
+  emitted wait-after-each dynamic row load, kept all five loaded values live
+  until final accumulation, and failed at sync 87. All four controls use
+  `group_segment_fixed_size=144`, `sgpr_count=5`, and `vgpr_count=15`, and
+  each failure produced the same MES remove-queue / MODE2 reset path. Recovery
+  `tile6_lds_two_store_once_one_read` controls passed between reset-producing
+  runs.
 - `/tmp/hipfire-lds-crossrow-runs/`: cross-row extra-load controls. The first
   two-launch run failed adjacent to prior reset pressure, but a recovery
   `tile6_lds_second_store_only_read6` control passed, then clean
