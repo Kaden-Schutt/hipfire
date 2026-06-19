@@ -131,6 +131,7 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 | Standalone GEMM synthetic `TILE=6`, M=512, N=2688, K=2048, 100 launches | FAIL | Fresh launch-bisect artifact failed at sync 95. |
 | Standalone GEMM synthetic `TILE=6`, M=512, N=2880, K=2048 | FAIL | 100-launch shape repeat failed at sync 87. |
 | Standalone GEMM synthetic `TILE=6`, M=512, N=3072, K=2048 | FAIL | 100-launch shape repeat failed at sync 81. |
+| Standalone GEMM synthetic masked `TILE=6`, M=512, N=2688, K=2048 | FAIL | Exec-mask regions were emitted around active LDS regions; still failed at sync 95. |
 
 Latest artifact paths:
 
@@ -165,6 +166,10 @@ Latest artifact paths:
   check at the same shape. 91, 92, 93, 94, and 95 launches pass; 96 launches
   fails at sync 93 and 100 launches fails at sync 95. The 96-launch artifact
   includes a manually copied `devcoredump.data` sample via passwordless sudo.
+- `/tmp/hipfire-lds-gemm-mask-artifacts/`: throwaway masked synthetic variant
+  at M=512, N=2688, K_LIMIT=2048. The compiler emitted exec-mask instructions
+  around the active LDS regions, but 100 launches still failed at sync 95 and
+  produced the same GDS/GDS-VM coredump signature.
 - `/tmp/hipfire-lds-standalone-long-artifacts/`: passing long-loop LDS-only
   control, including `TILE=6`, 512 iterations, 100 launches at 64x64 grid.
 
@@ -295,6 +300,11 @@ Reduction results after extending the standalone HIP GEMM probe:
   reset/state-sensitive band around roughly launches 94-96. Holding launch
   count at 100, larger N still moves failure earlier: N=2688 fails around sync
   81-95 across repeats, N=2880 at sync 87, and N=3072 at sync 81.
+- Adding LDS-only-style active-lane exec-mask regions to the synthetic kernel
+  does not avoid the fault. The masked synthetic `TILE=6` kernel still fails at
+  sync 95 for M=512, N=2688, K_LIMIT=2048. This weakens the hypothesis that the
+  passing LDS-only control survives solely because it has `s_and_saveexec_b32`
+  / `s_cbranch_execz` around LDS store/load regions.
 
 The synthetic failure coredump again reports:
 
@@ -333,6 +343,7 @@ LDS-only control:
 | Variant | Result | Kernel symbol | LDS group segment | VGPR | SGPR | Spills | Wavefront |
 |---|---:|---|---:|---:|---:|---:|---:|
 | synthetic GEMM-shaped `TILE=6`, no global/no store | FAIL | `_Z20gemm_lds_synth_probeILi6EEviiii` | 288 B | 18 | 5 | 0 | 32 |
+| masked synthetic GEMM-shaped `TILE=6`, no global/no store | FAIL | `_Z27gemm_lds_synth_masked_probeILi6EEviiii` | 288 B | 18 | 7 | 0 | 32 |
 | LDS-only `TILE=6`, 512 iterations | PASS | `_Z9lds_probeILi6ELi6ELi512EEvPfi` | 288 B | 20 | 8 | 0 | 32 |
 
 ISA observations:
@@ -366,6 +377,10 @@ ISA observations:
   (`s_and_saveexec_b32` / `s_cbranch_execz`) around active-lane store/load
   regions, includes two LDS phases per loop iteration pair, and finishes with a
   global store. It passes despite higher aggregate barrier and DS counts.
+- The masked synthetic `tile6` symbol also carries exec-mask control around
+  LDS regions and has 288 B LDS, 18 VGPR, 7 SGPR, and zero spills. It still
+  fails, so the remaining difference from the passing LDS-only long-loop
+  control is not just the presence of exec-mask instructions.
 - The active4-in-8x8 control passed even though the launched block spans two
   waves; only 16 lanes actively touch LDS. This keeps the current hypothesis on
   active LDS traffic across waves rather than barrier presence alone.
@@ -406,8 +421,9 @@ control):
 - create a single-instantiation compile unit for the failing synthetic symbol
   and the passing long-loop symbol so instruction counts can be per-symbol
   instead of object-aggregate.
-- test whether adding LDS-only-style exec-mask regions to the synthetic kernel,
-  or removing them from the LDS-only control, moves the failure boundary.
+- test whether removing the exec-mask regions from the LDS-only control moves
+  its failure boundary; adding similar regions to the synthetic kernel did not
+  help.
 
 Compare pass/fail boundary for:
 
