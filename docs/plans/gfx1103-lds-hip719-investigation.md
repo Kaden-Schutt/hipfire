@@ -231,6 +231,13 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 | Direct-AB no-output `6x6` active/block, reads=3, 448 iterations, 512x86 grid, 94-99 launches | PASS | Initial launch-count sweep low side. |
 | Direct-AB no-output `6x6` active/block, reads=3, 448 iterations, 512x86 grid, 100 launches | MIXED | Initial run passed; deliberate repeat after reset pressure failed at sync 99. |
 | Direct-AB no-output `6x6` active/block, reads=3, 448 iterations, 512x86 grid, 110/120/130/150 launches | FAIL | Extended launch-count sweep failed around sync 98-101. |
+| Direct-AB phase-mode `6x6`, reads=3, 448 iterations, 512x86 grid, same-process 99+0/99+1/100+0 | PASS | Second-edge phase probe; low side remained stable before reset pressure moved the edge. |
+| Direct-AB phase-mode `6x6`, reads=3, 448 iterations, 512x86 grid, same-process 100+1/101+0 | FAIL | Failed during phase1 at sync 98 / 97, showing the edge had shifted before the explicit phase boundary. |
+| Direct-AB phase-mode `6x6`, reads=3, 448 iterations, 512x86 grid, same-process 99+2 | PASS | Total 101 passed after nearby failures; exact counters remain state-sensitive. |
+| Direct-AB phase-mode `6x6`, reads=3, 448 iterations, 512x86 grid, same-process 98+3 | FAIL | Phase1 completed, boundary sync succeeded, then phase2 launch 1 / global launch 99 failed with HIP 719. |
+| Direct-AB exec-parent `6x6`, reads=3, 448 iterations, 512x86 grid, child-process 98+3, plain parent | PASS | First run and repeat both passed with phase1 and phase2 in fork/exec children. |
+| Direct-AB exec-parent `6x6`, reads=3, 448 iterations, 512x86 grid, child-process 98+3, HIP-initialized parent | MIXED | First trial failed inside the phase1 child at sync 97; repeat passed. Treat as edge state sensitivity, not deterministic parent-state retention. |
+| Direct-AB exec-parent `6x6`, reads=3, 448 iterations, 512x86 grid, child-process 98+3, HIP-initialized parent reset-between | PASS | Parent `hipDeviceReset()` between children returned success and both child phases passed. |
 | Direct-AB no-output `8x4` active/block, reads=6, 512 iterations, 512x86 grid | PASS | Exact one-wave, two-array control. |
 | Direct-AB no-output `8x4` active inside `8x5` block, reads=6, 512 iterations, 512x86 grid | PASS | Two-wave block with 32 active lanes; still stable. |
 | Direct-AB no-output `5x5`/`4x4` active inside `6x6` block, reads=6, 512 iterations, 512x86 grid | PASS | Small active controls remain stable without cooperative producer loops. |
@@ -382,6 +389,18 @@ Latest artifact paths:
   lever here: `hsa_shutdown`, `hsa_shutdown_init`, and
   `hsa_shutdown_hip_reset` all terminate with SIGSEGV or leave `hsa_init()`
   returning `HSA_STATUS_ERROR_OUT_OF_RESOURCES`.
+- `/tmp/hipfire-lds-direct-ab-second-edge-artifacts/`: second-edge phase-mode
+  and exec-parent controls for reads=3/448/512x86. Same-process `100+1` and
+  `101+0` failed during phase1 at sync 98/97, `99+2` passed, and `98+3`
+  failed after a clean phase boundary at phase2 launch 1 / global launch 99.
+  Exec-parent `98+3` passed with a plain parent and with a HIP-initialized
+  parent that reset between children. One HIP-initialized-parent trial failed
+  inside the first child at sync 97, so preserve it as a state-sensitivity
+  artifact rather than treating it as a clean parent-lifetime result.
+- `/tmp/hipfire-lds-direct-ab-second-edge-rerun-artifacts/`: repeat
+  exec-parent controls for reads=3/448/512x86 `98+3`. Both plain parent and
+  HIP-initialized parent passed, confirming that the earlier hipinit-parent
+  failure is not deterministic.
 
 ## Current Narrowing
 
@@ -654,6 +673,16 @@ Reduction results after extending the standalone HIP GEMM probe:
   unrelated surviving parent process, even one with HIP initialized, does not
   retain the bad state. The meaningful cleanup boundary is exit of the process
   that actually launched the edge workload.
+- A second direct-AB edge at reads=3/448/512x86 mostly preserves the same
+  process-boundary shape, but shows the edge is not deterministic enough for
+  single-trial overclaims. Same-process `98 + 3` completed phase1 and boundary
+  sync, then failed on phase2 launch 1 / global launch 99. The same `98 + 3`
+  split passed under an exec-parent plain parent, and passed again on repeat
+  for both plain and HIP-initialized parents. One HIP-initialized-parent trial
+  failed inside the phase1 child at sync 97 before any split-boundary question
+  was exercised. Treat that as reset/state sensitivity at the edge, not as
+  evidence that parent HIP initialization deterministically retains bad child
+  state.
 - Additional in-process teardown checks did not find a clean middle ground
   between `hipDeviceReset()` and process exit. `hipDevicePrimaryCtxReset(0)`
   and `hipDevicePrimaryCtxRelease(0)` both return success but still fail on the
@@ -719,6 +748,18 @@ The in-process teardown failures for `hipDeviceReset()`,
 the same gfxhub/GDS signature. The direct `hsa_shut_down()` modes are excluded
 from fault-mechanism interpretation because they crashed the host process rather
 than producing a clean phase2 HIP launch result.
+
+The reads=3/448/512x86 second-edge phase-mode failures captured the same
+low-level signature for same-process `101+0`, same-process `98+3`, and the
+single failed HIP-initialized exec-parent trial:
+
+```text
+[gfxhub] Page fault observed
+Faulty page starting at address: 0x000074669d000000
+Protection fault status register: 0x841051
+regGDS_PROTECTION_FAULT                             0x3f000007
+regGDS_VM_PROTECTION_FAULT                          0x0fc00113
+```
 
 Code object/resource observations from `llvm-readobj` dumps:
 
@@ -871,8 +912,14 @@ Best current hypothesis:
 > or parent process lifetime. The exposed in-process HIP reset APIs tested so
 > far (`hipDeviceReset`, primary-context reset/release) do not clear it, and
 > calling raw `hsa_shut_down()` after HIP work is not a clean recovery path on
-> this stack. Exec-mask structure alone does not appear to be the deciding
-> factor.
+> this stack. A second direct-AB edge at reads=3/448/512x86 strengthens the
+> process-boundary result but also underscores the state sensitivity: a plain
+> child-process split passes where same-process `98+3` fails after the phase
+> boundary, while one HIP-initialized-parent trial failed before the boundary
+> and then passed on repeat. Process exit appears to clear enough state near
+> the edge, but it is not a deterministic explanation for every trial once the
+> first child itself lands on the shifted failure side. Exec-mask structure
+> alone does not appear to be the deciding factor.
 
 ## Next Evidence To Capture
 
@@ -902,11 +949,12 @@ control):
 - use the minimal no-output repro for the next reduction: repeat the 256-pass /
   320-fail correlate in fresh processes and try smaller active-lane shapes
   around the one-wave/two-wave boundary.
-- use the direct-AB phase-mode repro for the next reduction: test a lower
-  grid/launch edge to see whether the process-boundary finding holds away from
-  the state-sensitive 511x86 boundary. Treat the common in-process HIP reset
-  APIs as already tested; only revisit teardown if a genuinely different ROCm
-  mechanism is identified.
+- use the direct-AB phase-mode repro for the next reduction: repeat the
+  reads=3/448/512x86 `98+3` process-boundary case in fresh batches, and try
+  a slightly lower-risk split such as `96+5` or a slightly lower grid to
+  separate parent HIP initialization from ordinary edge state sensitivity.
+  Treat the common in-process HIP reset APIs as already tested; only revisit
+  teardown if a genuinely different ROCm mechanism is identified.
 - create a single-instantiation compile unit for the failing synthetic symbol
   and the passing long-loop symbol so instruction counts can be per-symbol
   instead of object-aggregate.
