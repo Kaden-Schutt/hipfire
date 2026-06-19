@@ -4,18 +4,20 @@
 //! production scoring, same ListNet/AdamW loop as `pflash_drafter_train` — only
 //! the drafter body differs (gated recurrence vs attention).
 //!
+//! Thin client over `hipfire_train::train_loop` — the SAME loop the daemon
+//! `train_drafter` op will call (docs/plans/2026-06-19-train-as-daemon-op.md).
+//! This binary owns only label IO + shuffle; the loop owns epochs/loss/eval.
+//!
 //! Requires daemon labels (teacher/student split; real qwen3.5 target):
 //!   HIPFIRE_PFLASH_DAEMON_LABELS=/tmp/pflash_q35_labels.jsonl \
 //!   cargo run -p hipfire-train --release --example ssm_drafter_train
 //!
-//! Env knobs: HIPFIRE_PFLASH_{EPOCHS,TAU,LR,WD}, HIPFIRE_SSM_LAYERS, HIPFIRE_SSM_H.
+//! Env knobs: HIPFIRE_PFLASH_{EPOCHS,TAU,LR,WD,NEVAL,SHUFFLE_SEED},
+//!            HIPFIRE_SSM_LAYERS, HIPFIRE_SSM_H.
 
-use hipfire_train::optim::AdamW;
-use hipfire_train::ssm_drafter::{
-    free_ssm_drafter_acts, free_ssm_drafter_grads, ssm_drafter_backward, ssm_drafter_forward_train,
-    SsmDrafter, SsmDrafterConfig,
-};
-use rdna_compute::{DType, Gpu};
+use hipfire_train::ssm_drafter::{SsmDrafter, SsmDrafterConfig};
+use hipfire_train::train_loop::{eval_ssm_drafter, spearman, train_ssm_drafter_loop, TrainCfg};
+use rdna_compute::Gpu;
 
 const SEQ: usize = 512;
 const BLOCK: usize = 64;
@@ -29,37 +31,6 @@ fn env_usize(k: &str, d: usize) -> usize {
 }
 fn env_f32(k: &str, d: f32) -> f32 {
     std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
-}
-
-fn rank(a: &[f32]) -> Vec<f32> {
-    let mut idx: Vec<usize> = (0..a.len()).collect();
-    idx.sort_by(|&i, &j| a[i].partial_cmp(&a[j]).unwrap());
-    let mut r = vec![0.0f32; a.len()];
-    for (pos, &i) in idx.iter().enumerate() {
-        r[i] = pos as f32;
-    }
-    r
-}
-fn pearson(a: &[f32], b: &[f32]) -> f32 {
-    let n = a.len() as f64;
-    let (ma, mb) = (a.iter().sum::<f32>() as f64 / n, b.iter().sum::<f32>() as f64 / n);
-    let (mut c, mut va, mut vb) = (0.0, 0.0, 0.0);
-    for i in 0..a.len() {
-        let (da, db) = (a[i] as f64 - ma, b[i] as f64 - mb);
-        c += da * db;
-        va += da * da;
-        vb += db * db;
-    }
-    if va == 0.0 || vb == 0.0 { 0.0 } else { (c / (va.sqrt() * vb.sqrt())) as f32 }
-}
-fn spearman(a: &[f32], b: &[f32]) -> f32 {
-    pearson(&rank(a), &rank(b))
-}
-fn softmax_t(x: &[f32], tau: f32) -> Vec<f32> {
-    let m = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let e: Vec<f32> = x.iter().map(|&v| ((v - m) / tau).exp()).collect();
-    let z: f32 = e.iter().sum();
-    e.into_iter().map(|v| v / z).collect()
 }
 
 /// Daemon `pflash_labels` JSONL + `<path>.embed.bin` (QEMB) sidecar.
@@ -102,8 +73,6 @@ fn load_daemon_labels(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu = Gpu::init().expect("Gpu::init failed");
     let nb = SEQ / BLOCK;
-    let last = SEQ - 1;
-    let pos: Vec<f32> = (0..SEQ).map(|t| t as f32).collect();
 
     let dlpath = std::env::var("HIPFIRE_PFLASH_DAEMON_LABELS")
         .map_err(|_| "set HIPFIRE_PFLASH_DAEMON_LABELS=<jsonl> (real qwen3.5 labels)")?;
@@ -135,110 +104,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         base_shallow = bs;
     }
 
-    // train = all-but-last-n_eval chunks (eval split is the shuffled tail).
     let n_chunks = chunks.len();
     let n_train = n_chunks.checked_sub(n_eval).filter(|&t| t > 0)
         .unwrap_or_else(|| panic!("n_chunks {n_chunks} ≤ n_eval {n_eval}"));
-    println!("arch: {}  SEQ={SEQ} BLOCK={BLOCK} blocks={nb} train={n_train} eval={n_eval}", gpu.arch);
-    println!("labels: daemon source {dlpath} (real qwen3.5 target)");
-    let scores_dev = gpu.zeros(&[nb], DType::F32)?;
-    let bar: f32 = (n_train..n_chunks).map(|i| spearman(&base_shallow[i], &label_mid[i])).sum::<f32>()
-        / n_eval as f32;
 
-    // ── SSM drafter + training ──
-    let n_layers = env_usize("HIPFIRE_SSM_LAYERS", 3);
-    let h_draft = env_usize("HIPFIRE_SSM_H", 512);
+    // ── SSM drafter + shared training loop ──
     let mut dcfg = SsmDrafterConfig::tiny(10000.0, 1e-5);
-    dcfg.n_layers = n_layers;
-    dcfg.h_draft = h_draft;
-    let kvd_d = dcfg.kv_dim();
+    dcfg.n_layers = env_usize("HIPFIRE_SSM_LAYERS", 3);
+    dcfg.h_draft = env_usize("HIPFIRE_SSM_H", 512);
     let drafter = SsmDrafter::new(&mut gpu, embed, h_t, vocab, dcfg, SEQ)?;
-    let sizes = drafter.param_sizes();
-    let nparams: usize = sizes.iter().sum();
-    let epochs = env_usize("HIPFIRE_PFLASH_EPOCHS", EPOCHS);
-    let tau = env_f32("HIPFIRE_PFLASH_TAU", TAU);
-    let lr = env_f32("HIPFIRE_PFLASH_LR", 1e-3);
-    let wd = env_f32("HIPFIRE_PFLASH_WD", 0.0);
-    let mut opt = AdamW::new(&mut gpu, &sizes, lr, 0.9, 0.999, 1e-8, wd)?;
-    println!(
-        "SSM drafter: h={} layers={} inter={} kv={}×{}  params={} ({:.2}M)  epochs={epochs} tau={tau} lr={lr} wd={wd}",
-        dcfg.h_draft, dcfg.n_layers, dcfg.inter, dcfg.n_kv, dcfg.head_dim, sizes.len(),
-        nparams as f32 / 1e6
-    );
+    let nparams: usize = drafter.param_sizes().iter().sum();
 
-    let eval = |gpu: &mut Gpu, d: &SsmDrafter| -> f32 {
-        let sc = gpu.zeros(&[nb], DType::F32).unwrap();
-        let mut s = 0.0;
-        for i in n_train..n_chunks {
-            let a = ssm_drafter_forward_train(gpu, d, &chunks[i], &pos).unwrap();
-            pflash_score_fwd(gpu, &a.score_k, &sc, kvd_d, nb, last);
-            let pred = gpu.download_f32(&sc).unwrap();
-            s += spearman(&pred, &label_mid[i]);
-            free_ssm_drafter_acts(gpu, a).unwrap();
-        }
-        let _ = gpu.free_tensor(sc);
-        s / n_eval as f32
+    let cfg = TrainCfg {
+        seq: SEQ,
+        block: BLOCK,
+        n_eval,
+        epochs: env_usize("HIPFIRE_PFLASH_EPOCHS", EPOCHS),
+        lr: env_f32("HIPFIRE_PFLASH_LR", 1e-3),
+        wd: env_f32("HIPFIRE_PFLASH_WD", 0.0),
+        tau: env_f32("HIPFIRE_PFLASH_TAU", TAU),
+        eval_every: EVAL_EVERY,
     };
 
+    println!("arch: {}  SEQ={SEQ} BLOCK={BLOCK} blocks={nb} train={n_train} eval={n_eval}", gpu.arch);
+    println!("labels: daemon source {dlpath} (real qwen3.5 target)");
+    println!(
+        "SSM drafter: h={} layers={} inter={} kv={}×{}  params={} ({:.2}M)  epochs={} tau={} lr={} wd={}",
+        dcfg.h_draft, dcfg.n_layers, dcfg.inter, dcfg.n_kv, dcfg.head_dim,
+        drafter.param_sizes().len(), nparams as f32 / 1e6, cfg.epochs, cfg.tau, cfg.lr, cfg.wd
+    );
+
+    let bar: f32 = (n_train..n_chunks).map(|i| spearman(&base_shallow[i], &label_mid[i])).sum::<f32>()
+        / n_eval as f32;
     println!("\n  bar  Spearman(shallow, mid)   [eval] = {bar:+.3}  ← drafter must beat this");
     println!("  ref  attention-drafter ceiling       ≈ +0.47  (P5, tuning-resistant)");
-    println!("  init Spearman(ssm-drafter, mid)[eval] = {:+.3}\n", eval(&mut gpu, &drafter));
+    let init = eval_ssm_drafter(&mut gpu, &drafter, &chunks, &label_mid, &cfg);
+    println!("  init Spearman(ssm-drafter, mid)[eval] = {init:+.3}\n");
 
-    let mut best_corr = f32::NEG_INFINITY;
-    let mut best_ep = 0usize;
-    for ep in 0..epochs {
-        let mut ep_loss = 0.0f32;
-        for i in 0..n_train {
-            let acts = ssm_drafter_forward_train(&mut gpu, &drafter, &chunks[i], &pos)?;
-            pflash_score_fwd(&mut gpu, &acts.score_k, &scores_dev, kvd_d, nb, last);
-            let pred = gpu.download_f32(&scores_dev)?;
-            let pl = softmax_t(&label_mid[i], tau);
-            let pp = softmax_t(&pred, tau);
-            let mut ds = vec![0.0f32; nb];
-            let mut l = 0.0f32;
-            for b in 0..nb {
-                l -= pl[b] * pp[b].max(1e-12).ln();
-                ds[b] = (pp[b] - pl[b]) / tau;
+    let report = train_ssm_drafter_loop(
+        &mut gpu,
+        &drafter,
+        &chunks,
+        &label_mid,
+        &base_shallow,
+        &cfg,
+        |ep, train_loss, corr, best, best_ep| {
+            if ep % 30 == 0 || ep == cfg.epochs - 1 {
+                println!("  ep {ep:>3}  train_loss {train_loss:.4}  eval {corr:+.3}  (best {best:+.3} @ ep {best_ep})");
             }
-            ep_loss += l;
-            let dscores = gpu.upload_f32(&ds, &[nb])?;
-            let grads = ssm_drafter_backward(&mut gpu, &drafter, &acts, &dscores, BLOCK, nb, last)?;
-            opt.step(&mut gpu, &drafter.params(), &grads.flat())?;
-            free_ssm_drafter_acts(&mut gpu, acts)?;
-            free_ssm_drafter_grads(&mut gpu, grads)?;
-            gpu.free_tensor(dscores)?;
-        }
-        if ep % EVAL_EVERY == 0 || ep == epochs - 1 {
-            let corr = eval(&mut gpu, &drafter);
-            if corr > best_corr {
-                best_corr = corr;
-                best_ep = ep;
-            }
-            if ep % 30 == 0 || ep == epochs - 1 {
-                println!(
-                    "  ep {ep:>3}  train_loss {:.4}  eval {:+.3}  (best {:+.3} @ ep {})",
-                    ep_loss / n_train as f32, corr, best_corr, best_ep
-                );
-            }
-        }
-    }
+        },
+    )?;
 
     println!("\n── SSM drafter result ──");
-    println!("  shallow bar       : {bar:+.3}");
+    println!("  shallow bar       : {:+.3}", report.bar);
     println!("  attn ceiling (P5) : ≈ +0.47");
-    println!("  SSM drafter BEST  : {best_corr:+.3} @ ep {best_ep}");
-    if best_corr > bar {
+    println!("  SSM drafter BEST  : {:+.3} @ ep {}", report.best_eval, report.best_epoch);
+    if report.best_eval > report.bar {
         println!("  ✓ SSM drafter BEATS the shallow bar");
-    } else if best_corr > 0.47 {
+    } else if report.best_eval > 0.47 {
         println!("  ~ SSM drafter beats the attn ceiling but not the shallow bar");
     } else {
         println!("  ✗ SSM drafter did not beat the attn ceiling — ablate up (conv1d / delta rule)");
     }
     Ok(())
-}
-
-/// Local helper: PFlash forward (last_pos = SEQ-1) without re-importing the op
-/// path each call site.
-fn pflash_score_fwd(gpu: &mut Gpu, k: &rdna_compute::GpuTensor, sc: &rdna_compute::GpuTensor, kvd: usize, nb: usize, last: usize) {
-    hipfire_train::ops::pflash_score::pflash_score_forward(gpu, k, sc, SEQ, kvd, BLOCK, nb, last).unwrap();
 }

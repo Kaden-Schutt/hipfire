@@ -4618,6 +4618,64 @@ fn main() {
                 let _ = stdout.flush();
             }
 
+            // Train a PFlash importance-scorer drafter in-process against the
+            // resident target (teacher/student split). STEP 1: plumbing only —
+            // validates args + the hipfire-train link; the loop wiring lands in
+            // step 3. See docs/plans/2026-06-19-train-as-daemon-op.md.
+            "train_drafter" => {
+                let arch = msg.get("arch").and_then(|v| v.as_str()).unwrap_or("ssm").to_string();
+                if arch != "ssm" && arch != "attention" {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        format!("train_drafter: unknown arch '{arch}' (expected ssm|attention)"),
+                    );
+                    continue;
+                }
+                if model.as_ref().and_then(|m| m.q35_config.as_ref()).is_none() {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "train_drafter: no qwen3.5-family model loaded".to_string(),
+                    );
+                    continue;
+                }
+                // Parse the train block into the SHARED TrainCfg (proves the
+                // hipfire-train dep links and the op speaks the lib's types).
+                let t = msg.get("train").cloned().unwrap_or_else(|| serde_json::json!({}));
+                let labels = msg.get("labels").cloned().unwrap_or_else(|| serde_json::json!({}));
+                let getu = |o: &serde_json::Value, k: &str, d: usize| -> usize {
+                    o.get(k).and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(d)
+                };
+                let getf = |o: &serde_json::Value, k: &str, d: f32| -> f32 {
+                    o.get(k).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(d)
+                };
+                let cfg = hipfire_train::train_loop::TrainCfg {
+                    seq: getu(&labels, "seq", 512),
+                    block: getu(&labels, "block", 64),
+                    n_eval: getu(&labels, "n_eval", 20),
+                    epochs: getu(&t, "epochs", 300),
+                    lr: getf(&t, "lr", 1e-3),
+                    wd: getf(&t, "wd", 0.0),
+                    tau: getf(&t, "tau", 0.1),
+                    eval_every: getu(&t, "eval_every", 15),
+                };
+                let resp = serde_json::json!({
+                    "type": "train_drafter",
+                    "status": "not_implemented",
+                    "detail": "step 1 plumbing only — loop wiring lands in step 3",
+                    "arch": arch,
+                    "label_source": labels.get("source").and_then(|v| v.as_str()).unwrap_or("file"),
+                    "cfg": {
+                        "seq": cfg.seq, "block": cfg.block, "n_eval": cfg.n_eval,
+                        "epochs": cfg.epochs, "lr": cfg.lr, "wd": cfg.wd,
+                        "tau": cfg.tau, "eval_every": cfg.eval_every,
+                    },
+                });
+                let _ = writeln!(stdout, "{resp}");
+                let _ = stdout.flush();
+            }
+
             "diag" => {
                 let (vram_free, vram_total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
                 let hip_ver = gpu.hip.runtime_version().unwrap_or((0, 0));

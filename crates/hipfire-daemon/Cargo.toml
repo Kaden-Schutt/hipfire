@@ -31,6 +31,7 @@ hipfire-model = { path = "../hipfire-model" }
 hipfire-npu = { path = "../hipfire-npu" }
 hipfire-prompt = { path = "../hipfire-prompt" }
 hipfire-state = { path = "../hipfire-state" }
+hipfire-train = { path = "../hipfire-train" }
 hip-bridge    = { path = "../hip-bridge" }
 rdna-compute  = { path = "../rdna-compute" }
 base64        = "0.22"

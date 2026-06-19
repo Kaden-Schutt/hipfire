@@ -23,6 +23,7 @@ pub mod qtip_quant;
 pub mod ssm_block;
 pub mod ssm_drafter;
 pub mod tensor;
+pub mod train_loop;
 
 pub use config::LlamaConfig;
 pub use loader::{load_llama_fp32, LlamaWeightsF32};
