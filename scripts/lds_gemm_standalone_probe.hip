@@ -1471,6 +1471,105 @@ __global__ void gemm_lds_store_then_rowload_barrier_noextra_load4_consume4_pinne
 }
 
 template <int TILE>
+__global__ void gemm_lds_store_then_prerow_barrier_noextra_load4_consume4_pinned_probe(
+    int M, int N, int K, int k_limit) {
+    __shared__ float As[TILE][TILE];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int m = blockIdx.y * TILE + ty;
+    const int n = blockIdx.x * TILE + tx;
+    const int K_run = k_limit > 0 && k_limit < K ? k_limit : K;
+
+    int c0 = 0;
+    int c1 = 1;
+    int c2 = 2;
+    int c3 = 3;
+    asm volatile("" : "+v"(c0), "+v"(c1), "+v"(c2), "+v"(c3));
+
+    float sum = 0.0f;
+    for (int kt = 0; kt < K_run; kt += TILE) {
+        As[ty][tx] = static_cast<float>((m & 7) + tx + kt);
+        __syncthreads();
+
+        As[ty][tx] = static_cast<float>((m & 7) + tx + kt + 1);
+        __syncthreads();
+        __syncthreads();
+
+        const float b = static_cast<float>((n & 7) - ty + kt);
+        float r0 = As[ty][c0];
+        asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+        sum += r0 * b;
+        asm volatile("" : "+v"(sum) :: "memory");
+        float r1 = As[ty][c1];
+        asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+        sum += r1 * b;
+        asm volatile("" : "+v"(sum) :: "memory");
+        float r2 = As[ty][c2];
+        asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+        sum += r2 * b;
+        asm volatile("" : "+v"(sum) :: "memory");
+        float r3 = As[ty][c3];
+        asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+        sum += r3 * b;
+        asm volatile("" : "+v"(sum) :: "memory");
+        __syncthreads();
+    }
+
+    asm volatile("" ::"v"(sum));
+}
+
+template <int TILE>
+__global__ void gemm_lds_store_then_rowload_barrier_gap_noextra_load4_consume4_pinned_probe(
+    int M, int N, int K, int k_limit) {
+    __shared__ float As[TILE][TILE];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int m = blockIdx.y * TILE + ty;
+    const int n = blockIdx.x * TILE + tx;
+    const int K_run = k_limit > 0 && k_limit < K ? k_limit : K;
+
+    int c0 = 0;
+    int c1 = 1;
+    int c2 = 2;
+    int c3 = 3;
+    asm volatile("" : "+v"(c0), "+v"(c1), "+v"(c2), "+v"(c3));
+
+    float sum = 0.0f;
+    for (int kt = 0; kt < K_run; kt += TILE) {
+        As[ty][tx] = static_cast<float>((m & 7) + tx + kt);
+        __syncthreads();
+
+        As[ty][tx] = static_cast<float>((m & 7) + tx + kt + 1);
+        __syncthreads();
+
+        const float b = static_cast<float>((n & 7) - ty + kt);
+        float r0 = As[ty][c0];
+        asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+        sum += r0 * b;
+        asm volatile("" : "+v"(sum) :: "memory");
+        float r1 = As[ty][c1];
+        asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+        sum += r1 * b;
+        asm volatile("" : "+v"(sum) :: "memory");
+        float r2 = As[ty][c2];
+        asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+        sum += r2 * b;
+        asm volatile("" : "+v"(sum) :: "memory");
+        float r3 = As[ty][c3];
+        asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+        sum += r3 * b;
+        asm volatile("" : "+v"(sum) :: "memory");
+        __syncthreads();
+        asm volatile("s_nop 0" ::: "memory");
+        __syncthreads();
+    }
+
+    asm volatile("" ::"v"(sum));
+}
+
+template <int TILE>
 __global__ void gemm_lds_store_then_rowload_barrier_noextra_load3_consume3_pinned_probe(
     int M, int N, int K, int k_limit) {
     __shared__ float As[TILE][TILE];
@@ -2118,6 +2217,16 @@ static int run_variant(const char* variant, const char* mode_name, int launches,
             dim3 block(6, 6, 1);
             dim3 grid((n + 5) / 6, (m + 5) / 6, 1);
             hipLaunchKernelGGL((gemm_lds_store_then_rowload_barrier_noextra_load4_consume4_pinned_probe<6>),
+                               grid, block, 0, 0, m, n, k, k_limit);
+        } else if (std::strcmp(variant, "tile6_lds_store_then_prerow_barrier_noextra_load4_consume4_pinned") == 0) {
+            dim3 block(6, 6, 1);
+            dim3 grid((n + 5) / 6, (m + 5) / 6, 1);
+            hipLaunchKernelGGL((gemm_lds_store_then_prerow_barrier_noextra_load4_consume4_pinned_probe<6>),
+                               grid, block, 0, 0, m, n, k, k_limit);
+        } else if (std::strcmp(variant, "tile6_lds_store_then_rowload_barrier_gap_noextra_load4_consume4_pinned") == 0) {
+            dim3 block(6, 6, 1);
+            dim3 grid((n + 5) / 6, (m + 5) / 6, 1);
+            hipLaunchKernelGGL((gemm_lds_store_then_rowload_barrier_gap_noextra_load4_consume4_pinned_probe<6>),
                                grid, block, 0, 0, m, n, k, k_limit);
         } else if (std::strcmp(variant, "tile6_lds_store_then_rowload_barrier_noextra_load3_consume3_pinned") == 0) {
             dim3 block(6, 6, 1);
