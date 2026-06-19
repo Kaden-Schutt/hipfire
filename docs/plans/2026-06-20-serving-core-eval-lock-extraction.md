@@ -154,7 +154,7 @@ de-risk and shrink the diff that A2 later touches.
 |---|------|----------|----------|-------|
 | 1 | `hipfire-daemon/main.rs::acquire_daemon_lock` | `~/.hipfire/daemon.pid` | — | singleton, `LOCK_EX\|LOCK_NB`, fatal-on-busy |
 | 2 | `hipfire-cli/commands/gpu_lock.rs` (Rust) | `/tmp/hipfire-gpu.lock` | `HIPFIRE_GPU_LOCKFILE` | **the real GPU-mutex flock**: acquire/release/status/hold, detached `setsid` holder |
-| 4 | daemon **resource-lock leases** | `/tmp/hipfire-resource-locks/*.lock` | `HIPFIRE_RESOURCE_LOCK_DIR` (`_WAIT_MS` to wait) | per-resource GPU/NPU/CPU leases before HIP init |
+| 4 | daemon **resource-lock leases** (`hipfire-daemon-adapter::try_acquire_resource_lock`) | `/tmp/hipfire-resource-locks/<res>.lock/` | `HIPFIRE_RESOURCE_LOCK_DIR` (`_WAIT_MS` to wait) | per-resource GPU/NPU/CPU leases before HIP init — **NOT flock**: atomic `mkdir` + `owner.json` pidfile with stale-reclaim |
 
 **Correction (verified):** `scripts/gpu-lock.sh` is **NOT a separate flock impl** —
 its `gpu_acquire/release/status` shell out to `hipfire gpu-lock … --watch-pid $$`
@@ -172,9 +172,14 @@ while the actual lock path comes from the Rust CLI's `HIPFIRE_GPU_LOCKFILE` — 
 overriding the path makes gpu-lock.sh's warning text point at the wrong file
 (the locking itself stays correct, since it delegates). `hipfire-lock` owns ONE
 path + ONE env-var name + ONE metadata-line format; #1/#2 route through it, and
-gpu-lock.sh's warning reads the same env var. The resource-lease protocol (#4) is
-more complex (per-resource, async, wait-with-timeout) — adopt the same primitive
-but keep its lease logic on top.
+gpu-lock.sh's warning reads the same env var.
+
+**Scope:** only #1 and #2 are `flock`-based → they consolidate onto
+`FlockGuard`. #4 is a *different* primitive (atomic `mkdir` + pidfile, with
+stale-owner reclaim) living in the adapter for the client side; it's cohesive
+and correct as-is. Leave it; optionally relocate it into `hipfire-lock` as a
+second `dir_lock` module in a follow-up so all lock primitives share one home —
+but it is **not** part of the flock consolidation.
 
 New tiny crate `crates/hipfire-lock/` (unix `flock(2)` primitive). Module shape:
 

@@ -13,6 +13,7 @@ members = [
     "crates/hipfire-evidence",
     "crates/hipfire-generate",
     "crates/hipfire-hash",
+    "crates/hipfire-lock",
     "crates/hipfire-model",
     "crates/hipfire-npu",
     "crates/hipfire-prompt",

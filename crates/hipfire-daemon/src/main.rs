@@ -234,41 +234,27 @@ pub(crate) fn write_daemon_moe_router_evidence(
 /// silently overwrite the PID. This matches the v0.1.0-alpha Windows
 /// behavior; tightening it is tracked in a follow-up.
 ///
-/// Returns the File handle; caller MUST keep it alive for the process
-/// lifetime (on Unix, dropping it closes the fd and releases the lock).
-fn acquire_daemon_lock() -> std::fs::File {
-    use std::io::{Seek, Write};
-
+/// Returns the [`FlockGuard`]; caller MUST keep it alive for the process
+/// lifetime (dropping it closes the fd and releases the lock).
+fn acquire_daemon_lock() -> hipfire_lock::FlockGuard {
     #[cfg(unix)]
     let home = std::env::var("HOME").expect("HOME environment variable not set");
     #[cfg(windows)]
     let home = std::env::var("USERPROFILE").expect("USERPROFILE environment variable not set");
 
-    let hipfire_dir = std::path::PathBuf::from(home).join(".hipfire");
-    std::fs::create_dir_all(&hipfire_dir).expect("failed to create ~/.hipfire");
-    let pid_path = hipfire_dir.join("daemon.pid");
+    let pid_path = std::path::PathBuf::from(home)
+        .join(".hipfire")
+        .join("daemon.pid");
 
-    let mut f = {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.read(true).write(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        opts.open(&pid_path)
-            .expect("failed to open ~/.hipfire/daemon.pid")
-    };
-
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        use std::os::unix::io::AsRawFd;
-        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            let mut existing = String::new();
-            let _ = f.read_to_string(&mut existing);
-            let pid = existing.trim();
+    let mut guard =
+        hipfire_lock::FlockGuard::open(&pid_path).expect("failed to open ~/.hipfire/daemon.pid");
+    match guard.try_lock() {
+        Ok(true) => {}
+        Ok(false) => {
+            // Already held: surface the holder PID (written below by the live
+            // daemon) in the fatal message.
+            let holder = guard.holder().unwrap_or_default();
+            let pid = holder.trim();
             let pid_display = if pid.is_empty() { "<unknown>" } else { pid };
             let kill_arg = if pid.is_empty() { "<pid>" } else { pid };
             eprintln!(
@@ -277,16 +263,14 @@ fn acquire_daemon_lock() -> std::fs::File {
             );
             std::process::exit(1);
         }
+        Err(e) => panic!("failed to flock ~/.hipfire/daemon.pid: {e}"),
     }
 
-    // Got the lock (Unix) / opened the PID file (Windows). Truncate any stale
-    // content and write our PID so tooling and the Unix-side error above can
-    // both show a useful number.
-    f.set_len(0).ok();
-    f.seek(std::io::SeekFrom::Start(0)).ok();
-    writeln!(f, "{}", std::process::id()).ok();
-    f.flush().ok();
-    f
+    // Got the lock. Record our PID so the fatal message above (in a second
+    // daemon) and external tooling can show a useful number. `flock` is on the
+    // open fd, so rewriting the contents doesn't drop the lock.
+    let _ = guard.write_holder(&std::process::id().to_string());
+    guard
 }
 
 pub(crate) fn chat_output_filter(m: &LoadedModel, request_stop_sequences: &[String]) -> EosFilter {
