@@ -221,6 +221,8 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
 | Direct-AB phase-mode `6x6`, reads=6, 192 iterations, 511x86 grid, stream-recreate 98+2 | FAIL | Destroying phase1 stream and creating phase2 stream did not clear the edge. |
 | Direct-AB phase-mode `6x6`, reads=6, 192 iterations, 511x86 grid, same-stream 98+2 | MIXED | Explicit non-default stream was state-sensitive: one preserved pass and three preserved failures. |
 | Direct-AB phase-mode `6x6`, reads=6, 192 iterations, 511x86 grid, cross-process 98+2 | PASS | Two trials passed `98+0` in one process followed by `2+0` in a new process. |
+| Direct-AB phase-mode `6x6`, reads=6, 192 iterations, 511x86 grid, primary-ctx reset/release 98+2 | FAIL | Deprecated `hipDevicePrimaryCtxReset(0)` and `hipDevicePrimaryCtxRelease(0)` returned success, but phase2 launch 1 / global launch 99 still failed. |
+| Direct-AB phase-mode `6x6`, reads=6, 192 iterations, 511x86 grid, HSA shutdown 98+2 | CRASH | Direct `hsa_shut_down()` modes segfaulted or made `hsa_init()` fail; not a clean in-process teardown lever for HIP here. |
 | Direct-AB exec-parent `6x6`, reads=6, 192 iterations, 511x86 grid, child-process 98+2 | PASS | Parent process survived across both phases; phase1 and phase2 ran via fork/exec children. Plain parent, HIP-initialized parent, parent reset-before, and parent reset-between modes all passed. |
 | Direct-AB phase-mode confirmation `6x6`, reads=6, 192 iterations, 511x86 grid, same-process 100+0/100+1/101+0/101+1 | FAIL | Current calibration failed at phase1 sync 99 / global launch 99, while same-process 99+1 passed later. |
 | Direct-AB exec-parent confirmation `6x6`, reads=6, 192 iterations, 511x86 grid, child-process 99+1 | PASS | Parent plain and HIP-initialized modes both passed. |
@@ -370,6 +372,16 @@ Latest artifact paths:
   Same-process `99+1` passed later, reinforcing that the exact boundary is
   state-sensitive. Exec-parent `99+1` passed in both plain-parent and
   HIP-initialized-parent modes.
+- `/tmp/hipfire-lds-direct-ab-teardown-artifacts/`: in-process teardown API
+  checks at the active reads=6/192/511x86 `98 + 2` edge. `same` and
+  `hipDeviceReset()` controls both fail on phase2 launch 1 / global launch 99.
+  Deprecated `hipDevicePrimaryCtxReset(0)` and
+  `hipDevicePrimaryCtxRelease(0)` both return success but still fail on the
+  same phase2/global launch with the same gfxhub/GDS signature. Direct
+  `hsa_shut_down()` inside the HIP process is not usable as a clean teardown
+  lever here: `hsa_shutdown`, `hsa_shutdown_init`, and
+  `hsa_shutdown_hip_reset` all terminate with SIGSEGV or leave `hsa_init()`
+  returning `HSA_STATUS_ERROR_OUT_OF_RESOURCES`.
 
 ## Current Narrowing
 
@@ -642,6 +654,12 @@ Reduction results after extending the standalone HIP GEMM probe:
   unrelated surviving parent process, even one with HIP initialized, does not
   retain the bad state. The meaningful cleanup boundary is exit of the process
   that actually launched the edge workload.
+- Additional in-process teardown checks did not find a clean middle ground
+  between `hipDeviceReset()` and process exit. `hipDevicePrimaryCtxReset(0)`
+  and `hipDevicePrimaryCtxRelease(0)` both return success but still fail on the
+  same phase2/global launch. Direct `hsa_shut_down()` after HIP work is not a
+  practical recovery lever: the process segfaults or `hsa_init()` fails with
+  `HSA_STATUS_ERROR_OUT_OF_RESOURCES` before phase2 can run cleanly.
 
 The synthetic failure coredump again reports:
 
@@ -696,6 +714,12 @@ The exec-parent confirmation failures for same-process `100+1` and `101+0`
 again captured the same signature. The exec-parent pass cases did not create a
 coredump.
 
+The in-process teardown failures for `hipDeviceReset()`,
+`hipDevicePrimaryCtxReset(0)`, and `hipDevicePrimaryCtxRelease(0)` also captured
+the same gfxhub/GDS signature. The direct `hsa_shut_down()` modes are excluded
+from fault-mechanism interpretation because they crashed the host process rather
+than producing a clean phase2 HIP launch result.
+
 Code object/resource observations from `llvm-readobj` dumps:
 
 | Variant | Workgroup | LDS group segment | VGPR | SGPR | Spills | Wavefront |
@@ -740,6 +764,7 @@ LDS-only control:
 | direct-AB no-output `6x6` block, reads=6, 192 iters, 511x86 | PASS at 98 launches, MIXED at 99 launches, FAIL at 100 launches | `_Z19lds_direct_ab_probev` | 288 B | 52 | 2 | 0 | 32 |
 | direct-AB no-output `6x6` block, reads=6, 192 iters, 511x86, split-process | PASS for 98+1 split, FAIL for one-process 99 | `_Z19lds_direct_ab_probev` | 288 B | 52 | 2 | 0 | 32 |
 | direct-AB phase-mode `6x6` block, reads=6, 192 iters, 511x86 | PASS for cross-process 98+2, FAIL for same-process 98+2 / device-reset 98+2 / stream-recreate 98+2 | `_Z25lds_direct_ab_phase_probev` | 288 B | 52 | 2 | 0 | 32 |
+| direct-AB phase-mode teardown `6x6` block, reads=6, 192 iters, 511x86 | FAIL for primary-ctx reset/release; HSA shutdown crashes host process | `_Z25lds_direct_ab_phase_probev` | 288 B | 52 | 2 | 0 | 32 |
 | direct-AB exec-parent `6x6` block, reads=6, 192 iters, 511x86 | PASS for child-process 98+2 and 99+1 even with HIP-initialized parent | `_Z25lds_direct_ab_phase_probev` | 288 B | 52 | 2 | 0 | 32 |
 | direct-AB no-output `6x6` block, reads=3, 448 iters, 512x86 | PASS at 99 launches, FAIL on 100+ launch repeats | `_Z19lds_direct_ab_probev` | 288 B | 34 | 2 | 0 | 32 |
 | direct-AB no-output `8x4` active in `8x5` block, reads=6 | PASS at 512 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 256 B | 22 | 5 | 0 | 32 |
@@ -843,8 +868,11 @@ Best current hypothesis:
 > therefore more like state owned by the HIP/HSA/KFD process that launched the
 > kernels: code-object/queue bookkeeping, process-scoped GPUVM or queue state,
 > or GPU state keyed by that process, not merely a user-visible stream lifetime
-> or parent process lifetime. Exec-mask structure alone does not appear to be
-> the deciding factor.
+> or parent process lifetime. The exposed in-process HIP reset APIs tested so
+> far (`hipDeviceReset`, primary-context reset/release) do not clear it, and
+> calling raw `hsa_shut_down()` after HIP work is not a clean recovery path on
+> this stack. Exec-mask structure alone does not appear to be the deciding
+> factor.
 
 ## Next Evidence To Capture
 
@@ -876,9 +904,9 @@ control):
   around the one-wave/two-wave boundary.
 - use the direct-AB phase-mode repro for the next reduction: test a lower
   grid/launch edge to see whether the process-boundary finding holds away from
-  the state-sensitive 511x86 boundary. Also look for a HIP/HSA teardown lever
-  stronger than `hipDeviceReset()` but weaker than process exit, if one exists
-  in the local ROCm stack.
+  the state-sensitive 511x86 boundary. Treat the common in-process HIP reset
+  APIs as already tested; only revisit teardown if a genuinely different ROCm
+  mechanism is identified.
 - create a single-instantiation compile unit for the failing synthetic symbol
   and the passing long-loop symbol so instruction counts can be per-symbol
   instead of object-aggregate.
