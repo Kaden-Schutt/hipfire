@@ -394,6 +394,36 @@ __global__ void gemm_lds_same_phase_no_wide_read_probe(int M, int N, int K,
     asm volatile("" ::"v"(sum));
 }
 
+template <int TILE, int READS>
+__global__ void gemm_lds_forced_same_readwidth_probe(int M, int N, int K,
+                                                     int k_limit) {
+    __shared__ float As[TILE][TILE];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int m = blockIdx.y * TILE + ty;
+    const int n = blockIdx.x * TILE + tx;
+    const int K_run = k_limit > 0 && k_limit < K ? k_limit : K;
+
+    float sum = 0.0f;
+    for (int kt = 0; kt < K_run; kt += TILE) {
+        As[ty][tx] = static_cast<float>((m & 7) + tx + kt);
+        __syncthreads();
+
+        As[ty][tx] = As[ty][tx] + 1.0f;
+        __syncthreads();
+
+#pragma unroll
+        for (int kk = 0; kk < READS; ++kk) {
+            const float b = static_cast<float>((n & 7) - ty + kt);
+            sum += As[ty][kk] * b;
+        }
+        __syncthreads();
+    }
+
+    asm volatile("" ::"v"(sum));
+}
+
 static int parse_mode(const char* mode) {
     if (std::strcmp(mode, "full") == 0) return static_cast<int>(Mode::Full);
     if (std::strcmp(mode, "nostore") == 0) return static_cast<int>(Mode::NoStore);
@@ -494,6 +524,26 @@ static int run_variant(const char* variant, const char* mode_name, int launches,
             dim3 block(6, 6, 1);
             dim3 grid((n + 5) / 6, (m + 5) / 6, 1);
             hipLaunchKernelGGL((gemm_lds_same_phase_no_wide_read_probe<6>),
+                               grid, block, 0, 0, m, n, k, k_limit);
+        } else if (std::strcmp(variant, "tile6_lds_forced_same_read1") == 0) {
+            dim3 block(6, 6, 1);
+            dim3 grid((n + 5) / 6, (m + 5) / 6, 1);
+            hipLaunchKernelGGL((gemm_lds_forced_same_readwidth_probe<6, 1>),
+                               grid, block, 0, 0, m, n, k, k_limit);
+        } else if (std::strcmp(variant, "tile6_lds_forced_same_read2") == 0) {
+            dim3 block(6, 6, 1);
+            dim3 grid((n + 5) / 6, (m + 5) / 6, 1);
+            hipLaunchKernelGGL((gemm_lds_forced_same_readwidth_probe<6, 2>),
+                               grid, block, 0, 0, m, n, k, k_limit);
+        } else if (std::strcmp(variant, "tile6_lds_forced_same_read4") == 0) {
+            dim3 block(6, 6, 1);
+            dim3 grid((n + 5) / 6, (m + 5) / 6, 1);
+            hipLaunchKernelGGL((gemm_lds_forced_same_readwidth_probe<6, 4>),
+                               grid, block, 0, 0, m, n, k, k_limit);
+        } else if (std::strcmp(variant, "tile6_lds_forced_same_read5") == 0) {
+            dim3 block(6, 6, 1);
+            dim3 grid((n + 5) / 6, (m + 5) / 6, 1);
+            hipLaunchKernelGGL((gemm_lds_forced_same_readwidth_probe<6, 5>),
                                grid, block, 0, 0, m, n, k, k_limit);
         } else if (std::strcmp(variant, "tile16") == 0) {
             dim3 block(16, 16, 1);

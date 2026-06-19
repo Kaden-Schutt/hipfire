@@ -357,6 +357,12 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
     regular six-wide row readback and uses the loaded value directly.
   - Repeating `tile6_lds_forced_same_second_store` in that same compile unit
     failed again, this time at sync 91.
+  - A read-width split then showed `tile6_lds_forced_same_read1`,
+    `tile6_lds_forced_same_read2`, `tile6_lds_forced_same_read4`, and
+    `tile6_lds_forced_same_read5` all pass at 100 launches. These keep the
+    same-address load/store phase and vary only the number of post-phase row
+    reads. The six-wide `tile6_lds_forced_same_second_store` failed twice in
+    that sequence, both times at sync 0 after prior reset pressure.
   - `tile6_lds_two_store_one_read` failed with HIP 719 at sync 97. This writes
     two `6x6` shared tiles (`group_segment_fixed_size=288`) but only reads one
     tile back.
@@ -366,11 +372,12 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   LDS producer/consumer tile. The 288 B group segment alone also passes, and a
   second tile written only once passes. The smallest current failing splitter
   is not strictly "second address range"; a forced second same-address LDS
-  read/write phase also fails, but only when followed by the normal wide LDS
-  row readback. The better current model is per-K repeated LDS
-  producer/consumer pressure beyond the single-store/single-read tile pattern,
-  with barrier count alone ruled out by the three-barrier no-LDS pass and the
-  isolated extra-load / isolated load-store phase controls.
+  read/write phase also fails, but only when followed by the normal six-wide
+  LDS row readback. Read widths 1/2/4/5 are still pass-side. The better current
+  model is per-K repeated LDS producer/consumer pressure beyond the
+  single-store/single-read tile pattern, with barrier count alone ruled out by
+  the three-barrier no-LDS pass and the isolated extra-load / isolated
+  load-store phase controls.
 - The throwaway split's resource metadata is useful: no-LDS and barrier-only
   variants use `group_segment_fixed_size=0`, one-tile LDS uses `144`, and the
   two-tile failing splitter uses `288` with the same `sgpr_count=5` and
@@ -380,7 +387,10 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   forced-same-address splitter uses `144`, `sgpr_count=5`, and `vgpr_count=12`.
   The pass-side `tile6_lds_forced_same_load_only` uses the same resource counts,
   while `tile6_lds_same_phase_no_wide_read` uses `144`, `sgpr_count=5`, and
-  `vgpr_count=6`. The failing `tile6_synth` uses `288`, `sgpr_count=5`, and
+  `vgpr_count=6`. The read-width variants all keep `group_segment_fixed_size=144`
+  and `sgpr_count=5`; pass-side VGPR counts rose with width (`read1=7`,
+  `read2=8`, `read4=10`, `read5=11`), while the six-wide failing splitter uses
+  `vgpr_count=12`. The failing `tile6_synth` uses `288`, `sgpr_count=5`, and
   `vgpr_count=18`.
 - A naive same-address double-store variant was not useful: the compiler reduced
   it to a single `ds_store`. A volatile padded second-address variant failed at
@@ -429,6 +439,9 @@ Latest artifact paths:
   same-address load plus wide reads passed, same-address load/store without
   wide row reads passed, and the full forced same-address load/store plus wide
   row reads failed at sync 91.
+- `/tmp/hipfire-lds-readwidth-runs/`: row-read-width splitter controls. Forced
+  same-address load/store plus read widths 1, 2, 4, and 5 passed; the six-wide
+  `tile6_lds_forced_same_second_store` contrast failed in both repeats.
 - `/tmp/hipfire-lds-gemm-klimit-repeat-artifacts/`: repeated no-global/no-store
   K-limit sweep, including pass at `K_LIMIT=1536`, repeated failures at
   `K_LIMIT=2048`, and tile5 pass at full K.
