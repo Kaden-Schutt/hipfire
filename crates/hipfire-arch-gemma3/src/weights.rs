@@ -218,13 +218,20 @@ fn load_layer(
         &format!("{p}.input_layernorm.weight"),
         cfg.hidden_size,
     )?;
-    // Per-head QK-norm: RMSNorm over head_dim.
+    // Per-head QK-norm: RMSNorm over head_dim. Bake the Q pre-scale into
+    // q_norm so the attention kernel's built-in 1/√head_dim becomes Gemma's
+    // 1/√query_pre_attn_scalar (no per-step scale launch). No-op when
+    // q_prescale == 1.0 (query_pre_attn_scalar == head_dim, e.g. gemma3-4b).
     let q_norm = load_norm_weight_raw(
         hfq,
         gpu,
         &format!("{p}.self_attn.q_norm.weight"),
         cfg.head_dim,
     )?;
+    let prescale = cfg.q_prescale();
+    if (prescale - 1.0).abs() > 1e-6 {
+        gpu.scale_f32(&q_norm, prescale)?;
+    }
     let k_norm = load_norm_weight_raw(
         hfq,
         gpu,

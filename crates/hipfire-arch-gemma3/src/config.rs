@@ -62,6 +62,15 @@ impl Gemma3Config {
         self.query_pre_attn_scalar.powf(-0.5)
     }
 
+    /// Pre-scale applied to Q so the attention kernel's built-in `1/√head_dim`
+    /// softmax scale equals Gemma's `1/√query_pre_attn_scalar`:
+    /// `√(head_dim / query_pre_attn_scalar)`. It is `1.0` when
+    /// `query_pre_attn_scalar == head_dim` (e.g. gemma3-4b). The loader bakes
+    /// this into the `q_norm` weights so no per-step scale launch is needed.
+    pub fn q_prescale(&self) -> f32 {
+        (self.head_dim as f32 / self.query_pre_attn_scalar).sqrt()
+    }
+
     /// True if layer `layer_idx` (0-based) uses **global** full-causal attention
     /// (θ=`rope_theta`); false ⇒ a **local** sliding-window layer
     /// (θ=`rope_local_base_freq`, mask width `sliding_window`). Gemma3 makes
