@@ -1373,6 +1373,7 @@ dependencies = [
  "hipfire-prompt",
  "hipfire-runtime",
  "hipfire-state",
+ "hipfire-train",
  "libc",
  "rdna-compute",
  "serde_json",
