@@ -12,6 +12,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu = Gpu::init().expect("Gpu::init failed");
     println!("arch: {}", gpu.arch);
 
+    // Sweep all forward-NT shapes a 3B capture actually uses (the capture faulted
+    // with HIP 719; the bench's single 512×3072×3072 shape passed).
+    let shapes: &[(usize, usize, usize, &str)] = &[
+        (512, 3072, 3072, "q/o_proj"),
+        (512, 1024, 3072, "k/v_proj"),
+        (512, 8192, 3072, "mlp gate/up"),
+        (512, 3072, 8192, "mlp down"),
+    ];
+    for &(sm, sn, sk, name) in shapes {
+        let xa: Vec<f32> = (0..sm * sk).map(|_| 0.01f32).collect();
+        let wa: Vec<f32> = (0..sn * sk).map(|_| 0.01f32).collect();
+        let xt = gpu.upload_f32(&xa, &[sm * sk])?;
+        let wt = gpu.upload_f32(&wa, &[sn * sk])?;
+        let yt = gpu.zeros(&[sm * sn], DType::F32)?;
+        gpu.gemm_f32_train(&xt, &wt, &yt, sm, sn, sk, sk, sk, false, true)?;
+        let _ = gpu.download_f32(&yt)?; // sync barrier → surfaces any fault here
+        println!("  shape {name:14} M={sm} N={sn} K={sk}  OK");
+    }
+    println!("all capture forward-NT shapes OK\n");
+
     // forward shape: Y[M,N] = X[M,K] · W[N,K]ᵀ  (transB=1), 3B-ish dims
     let (m, n, k) = (512usize, 3072usize, 3072usize);
     let mut s: u64 = 0x1234567;
