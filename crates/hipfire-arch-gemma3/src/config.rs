@@ -39,6 +39,9 @@ pub struct Gemma3Config {
     pub query_pre_attn_scalar: f32,
     /// Expected `"gelu_pytorch_tanh"` (GeGLU). Retained for validation.
     pub hidden_activation: String,
+    /// Gemma3 ties the lm_head to the embedding table (default true); the
+    /// loader re-uploads the embedding bytes as the output projection.
+    pub tie_word_embeddings: bool,
     /// The `(1+w)` offset the quantizer baked into the norm weights at ingest
     /// (`1.0` for a correctly-ingested Gemma3 artifact). Stored for provenance;
     /// the forward applies no further offset because it is already in the
@@ -141,6 +144,10 @@ pub fn config_from_metadata_json(metadata_json: &str) -> Option<Gemma3Config> {
         .and_then(|v| v.as_str())
         .unwrap_or("gelu_pytorch_tanh")
         .to_string();
+    let tie_word_embeddings = tc
+        .get("tie_word_embeddings")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     // Baked at ingest; default 0.0 for a non-Gemma / legacy artifact so the
     // absence is visible rather than silently assumed.
     let gemma_norm_offset = meta
@@ -164,6 +171,7 @@ pub fn config_from_metadata_json(metadata_json: &str) -> Option<Gemma3Config> {
         sliding_window_pattern,
         query_pre_attn_scalar,
         hidden_activation,
+        tie_word_embeddings,
         gemma_norm_offset,
     })
 }

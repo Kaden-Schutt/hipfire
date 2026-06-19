@@ -25,5 +25,7 @@
 //! 9. **No logit/attn soft-capping** in Gemma3.
 
 pub mod config;
+pub mod weights;
 
 pub use config::{config_from_hfq, config_from_metadata_json, Gemma3Config};
+pub use weights::{load_weights, Gemma3LayerWeights, Gemma3Weights};
