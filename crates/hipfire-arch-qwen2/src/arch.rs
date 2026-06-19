@@ -13,12 +13,13 @@
 //! reach the hot path via [`crate::qwen2::forward_step`] /
 //! [`crate::qwen2::forward_step_greedy`] directly.
 
-use crate::qwen2::{Qwen2Config, Qwen2State, Qwen2Weights};
+use crate::qwen2::{forward_step, Qwen2Config, Qwen2State, Qwen2Weights};
 use hipfire_runtime::arch::{
     Architecture, EosFilterOverrides, LoopGuardOverrides, PromptFrameOverrides, SamplerOverrides,
+    SimpleAr,
 };
 use hipfire_runtime::hfq::HfqFile;
-use rdna_compute::Gpu;
+use rdna_compute::{Gpu, GpuTensor};
 
 /// Zero-sized type marker for the Qwen2 arch.
 pub struct Qwen2;
@@ -88,6 +89,68 @@ impl Architecture for Qwen2 {
             holdback_prefixes: vec![],
             strip_think: Some(false),
         }
+    }
+}
+
+// ── Serving seam (P2: SimpleAr) ─────────────────────────────────────
+// See docs/plans/2026-06-19-daemon-family-seam.md. Qwen2 is the proof-of-seam
+// arch: a dense, full-attention decoder whose existing per-token `forward_step`
+// maps directly onto the object-safe `SimpleAr` surface. Bundling config +
+// weights + state into one backend lets the daemon hold it as a `dyn SimpleAr`
+// (P2b) and drive it with the shared sample/stream/decode loop, instead of the
+// qwen2-specific `q35_*`/`qwen2_*` Option fields and `generate_qwen2`.
+
+/// Owns the typed Qwen2 config/weights/state behind the object-safe
+/// [`SimpleAr`] serving surface. Constructed by the daemon once the
+/// [`Architecture`] bring-up triple (`config_from_hfq` / `load_weights` /
+/// `new_state`) has produced the parts.
+pub struct Qwen2Backend {
+    pub config: Qwen2Config,
+    pub weights: Qwen2Weights,
+    pub state: Qwen2State,
+}
+
+impl Qwen2Backend {
+    pub fn new(config: Qwen2Config, weights: Qwen2Weights, state: Qwen2State) -> Self {
+        Self {
+            config,
+            weights,
+            state,
+        }
+    }
+}
+
+impl SimpleAr for Qwen2Backend {
+    fn prefill(&mut self, gpu: &mut Gpu, tokens: &[u32]) -> Result<(), String> {
+        // Qwen2's forward_step has no batched prefill — run the prompt one token
+        // at a time (it tracks the KV write slot in state.next_pos). The final
+        // call leaves the next-token logits in state.logits.
+        for &t in tokens {
+            forward_step(gpu, &self.weights, &self.config, &mut self.state, t)
+                .map_err(|e| format!("qwen2 prefill forward_step: {e:?}"))?;
+        }
+        Ok(())
+    }
+
+    fn decode_step(&mut self, gpu: &mut Gpu, token: u32, pos: usize) -> Result<(), String> {
+        // Absolute position is tracked internally via state.next_pos; the
+        // explicit `pos` arg (for archs that need it) must agree.
+        debug_assert_eq!(
+            pos, self.state.next_pos,
+            "qwen2 decode pos {pos} drifted from internal next_pos {}",
+            self.state.next_pos
+        );
+        let _ = pos;
+        forward_step(gpu, &self.weights, &self.config, &mut self.state, token)
+            .map_err(|e| format!("qwen2 decode forward_step: {e:?}"))
+    }
+
+    fn logits(&self) -> &GpuTensor {
+        &self.state.logits
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.config.vocab_size
     }
 }
 
