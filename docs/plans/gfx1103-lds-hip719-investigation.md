@@ -107,6 +107,7 @@ VARIANT=tile6_lds_store_then_load_dynamiccols_load4_noextra_consume4_pinned MODE
 VARIANT=tile6_lds_store_then_load_dynamiccols_load3_noextra_consume3_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-noextra-consume3-pinned-780m
 VARIANT=tile6_lds_single_store_then_load_dynamiccols_load4_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-single-store-consume4-pinned-780m
 VARIANT=tile6_lds_load_then_store_dynamiccols_load4_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-load-then-store-consume4-pinned-780m
+VARIANT=tile6_lds_preloop_load_then_store_dynamiccols_load4_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-preloop-load-consume4-pinned-780m
 VARIANT=tile6_lds_store_then_load_dynamiccols_load4_nextrow_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-nextrow-consume4-pinned-780m
 VARIANT=tile6_lds_store_then_load_dynamiccols_load4_separate_tile_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-separate-tile-consume4-pinned-780m
 ```
@@ -516,6 +517,13 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
     does not need to happen after the second store in the pinned minimized
     shape; the second store must still be present before the four dynamic row
     loads.
+  - The preloop-only extra-load control passed 100 launches. It performs one
+    extra ordinary LDS load before entering the K loop, then each K iteration
+    does the two stores and four waited/interleaved dynamic row loads with no
+    per-K extra load. This indicates the extra LDS load must be per-K/proximate
+    to the row-consumption phase, not merely present somewhere earlier in the
+    kernel. Caveat: the preloop setup changes the tuple to `144`,
+    `sgpr_count=6`, `vgpr_count=11`.
   - The pinned next-row extra-load control failed at sync 86. It keeps the same
     one-tile second store and four waited/interleaved dynamic row loads, but
     changes only the extra ordinary LDS load from `As[ty][tx]` to
@@ -584,14 +592,15 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   launches with the same resource tuple, and removing the second per-K LDS
   store while keeping the extra load and four dynamic row loads also passes
   with the same tuple. Moving the extra load before the second store, to the
-  next row, or to a separate one-time-initialized LDS tile still fails. The
-  leading local suspect is now the conjunction of an extra ordinary LDS load, a
-  second per-K LDS store before the four-row consumption phase, four dynamic
-  row LDS loads separated by explicit waits with interleaved consumes, and
-  repeated launch/process state, with strong same-process/reset-state
-  sensitivity. Same-row and same-tile membership are no longer required by the
-  current evidence, and extra-load-before-second-store ordering is also enough,
-  though the separate-tile control changes the group segment and SGPR tuple.
+  next row, or to a separate one-time-initialized LDS tile still fails, but a
+  one-time preloop extra LDS load passes. The leading local suspect is now the
+  conjunction of a per-K/proximate extra ordinary LDS load, a second per-K LDS
+  store before the four-row consumption phase, four dynamic row LDS loads
+  separated by explicit waits with interleaved consumes, and repeated
+  launch/process state, with strong same-process/reset-state sensitivity.
+  Same-row and same-tile membership are no longer required by the current
+  evidence, and extra-load-before-second-store ordering is also enough, though
+  the separate-tile and preloop controls change resource tuples.
   Barrier count alone is ruled out by the three-barrier no-LDS pass and the
   isolated extra-load / isolated load-store phase controls.
 - The throwaway split's resource metadata is useful: no-LDS and barrier-only
@@ -651,8 +660,11 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   store is removed. The pinned load-then-store order split fails with the same
   `144`, `sgpr_count=5`, and `vgpr_count=10` tuple, showing the extra ordinary
   LDS load does not need to follow the second store as long as the second store
-  precedes the four-row consumption phase. The pinned next-row extra-load
-  control fails with
+  precedes the four-row consumption phase. The preloop-only extra-load control
+  passes with `144`, `sgpr_count=6`, and `vgpr_count=11`, indicating the extra
+  LDS load must occur per K / near the row-consumption phase rather than only
+  once before the loop, with the resource-tuple caveat. The pinned next-row
+  extra-load control fails with
   `144`, `sgpr_count=5`, and `vgpr_count=13`, which rules out same-row
   membership in this minimized pinned shape but has a higher VGPR count due to
   the computed next-row address. The pinned separate-tile extra-load control
@@ -866,6 +878,16 @@ Latest artifact paths:
   load does not need to occur after the second store in the pinned minimized
   shape; the second store only needs to be present before the four dynamic row
   loads.
+- `/tmp/hipfire-lds-preloop-pinned-runs/`: preloop-only extra-load control.
+  Throwaway `tile6_lds_preloop_load_then_store_dynamiccols_load4_consume4_pinned`
+  passed one-launch smoke. ISA emits one preloop `ds_store_b32` / `ds_load_b32`
+  setup pair, then the K loop emits first store -> barrier -> second store ->
+  barrier -> four waited/interleaved dynamic row loads, with no per-K extra LDS
+  load. Metadata is `group_segment_fixed_size=144`, `sgpr_count=6`, and
+  `vgpr_count=11`. The 100-launch run passed. This indicates the extra
+  ordinary LDS load must happen per K / near the row-consumption phase, not
+  merely once before the loop. Resource tuple differs from the failing pinned
+  control because of the preloop setup.
 - `/tmp/hipfire-lds-extra-row-runs/`: pinned next-row extra-load control.
   Throwaway `tile6_lds_store_then_load_dynamiccols_load4_nextrow_consume4_pinned`
   passed one-launch smoke. ISA emits the second store, then an extra
