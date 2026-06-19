@@ -102,3 +102,26 @@ the drafter P5 (above), which is mostly wiring over existing `collect` /
 `CalibCollector` / pflash K-capture. Supersedes
 `2026-06-18-qwen35-training-support.md` for the drafter; that plan's full qwen3.5
 forward port is only needed if/when we want to *train qwen3.5 itself*.
+
+## P5 RESULT + the SSM-drafter signal (2026-06-19)
+
+Ran the full pipeline on the REAL qwen3.5-0.8B target (daemon captured 40 chunks +
+1GB embed sidecar; drafter trained, zero SSM forward in hipfire-train). Pipeline
+works. But the tiny-ATTENTION drafter underperforms badly:
+
+| target | nature | shallow bar | attn drafter best |
+|--------|--------|-------------|-------------------|
+| Llama-3.2-3B | dense attention | +0.595 | **+0.676 ✓** |
+| qwen3.5-0.8B | gated-delta-net (SSM) hybrid | +0.702 | +0.47 ✗ |
+
+Tuning sweep on the cached real-target labels (wd/lr/epochs/tau) all plateaued at
++0.36–0.47 — and MORE weight decay made it WORSE. That rules out overfit: the
+drafter is UNDERFITTING the task. Real architectural ceiling (~+0.47), tuning-
+resistant, far below the +0.702 bar.
+
+**Conclusion:** the attention drafter matches an attention target but hits a wall
+on an SSM-driven target — empirical support for a **gated-delta-net drafter**
+(shares the target's inductive bias). Next: build a tiny GDN drafter (student-only
+change; daemon labels unchanged) and test head-to-head vs the +0.47 attn ceiling.
+Confounds noted but weak: higher bar (less headroom) and the attention-shaped
+cosine-K metric / L15 choice.
