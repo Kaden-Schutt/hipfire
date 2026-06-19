@@ -40,7 +40,7 @@ use hipfire_arch_qwen35::speculative::{
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_evidence::{RouterHistogramEvidence, RouterHistogramLayer, RuntimeOneshotEvidence};
-use hipfire_generate::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
+use hipfire_generate::eos_filter::{EosFilter, EosFilterConfig};
 use hipfire_generate::loop_guard::{LoopGuard, StopReason};
 use hipfire_generate::sampler::{collect_unclosed_attractor_blocks, SamplerConfig};
 #[cfg(test)]
@@ -103,6 +103,12 @@ use std::io::{BufRead, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+mod events;
+use events::{
+    emit_committed_event, emit_error_with_id, emit_filter_action, emit_stream_event, write_error,
+    MAX_BASE64_ENCODED_LEN,
+};
 
 fn normalize_daemon_prompt(prompt: &str) -> std::borrow::Cow<'_, str> {
     if matches!(
@@ -264,16 +270,6 @@ fn loop_guard_from_runtime_config() -> LoopGuard {
 /// interpolation of error values — Rust's `Display` will pass through
 /// a `"` unchanged, and `Debug` actively wraps strings in escaped quotes,
 /// both of which break the surrounding JSON.
-fn emit_error_with_id(stdout: &mut std::io::Stdout, id: &str, message: impl std::fmt::Display) {
-    let envelope = serde_json::json!({
-        "type": "error",
-        "id": id,
-        "message": format!("{}", message),
-    });
-    let _ = writeln!(stdout, "{}", envelope);
-    let _ = stdout.flush();
-}
-
 fn daemon_runtime_context(model: &LoadedModel) -> serde_json::Value {
     serde_json::json!({
         "schema": 1,
@@ -620,93 +616,6 @@ fn run_generate_batch_prefill_dummy(
 }
 
 #[allow(dead_code)]
-fn emit_error_no_id(stdout: &mut std::io::Stdout, message: impl std::fmt::Display) {
-    let envelope = serde_json::json!({
-        "type": "error",
-        "message": format!("{}", message),
-    });
-    let _ = writeln!(stdout, "{}", envelope);
-    let _ = stdout.flush();
-}
-
-/// Emit a parsed `deepseek4::dsml::StreamEvent` to the JSONL stream.
-/// Maps:
-///   - Token(text)        → `{type:"token",   id, text}`
-///   - Reasoning(text)    → `{type:"reasoning", id, text}`
-///   - ToolCalls(calls)   → `{type:"tool_calls", id, calls:[{name, arguments}]}`
-///
-/// The CLI / OpenAI HTTP layer translates these into the corresponding
-/// SSE chunks (`content`, `reasoning_content`, `tool_calls.delta`).
-fn emit_stream_event(
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    ev: hipfire_arch_deepseek4::dsml::StreamEvent,
-) {
-    use hipfire_arch_deepseek4::dsml::StreamEvent;
-    // The request id is user-supplied. Build the envelope through
-    // `serde_json` so any embedded `"` / `\` / control chars are
-    // escaped — otherwise a malformed id corrupts every subsequent
-    // line of the JSONL stream and the cli/serve loop dies with a
-    // `JSON Parse error: Expected '}'`.
-    let envelope = match ev {
-        StreamEvent::Token(text) => serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": text,
-        }),
-        StreamEvent::Reasoning(text) => serde_json::json!({
-            "type": "reasoning",
-            "id": id,
-            "text": text,
-        }),
-        StreamEvent::ToolCalls(calls) => {
-            let arr: Vec<serde_json::Value> = calls
-                .into_iter()
-                .map(|c| {
-                    serde_json::json!({
-                        "name": c.name,
-                        "arguments": c.arguments,
-                    })
-                })
-                .collect();
-            serde_json::json!({
-                "type": "tool_calls",
-                "id": id,
-                "calls": serde_json::Value::Array(arr),
-            })
-        }
-    };
-    let _ = writeln!(stdout, "{}", envelope);
-}
-
-fn emit_committed_event(
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    tok_id: u32,
-    pos: usize,
-    t_ms: u64,
-) {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    let on = *ENABLED
-        .get_or_init(|| std::env::var("HIPFIRE_EMIT_TOKEN_IDS").ok().as_deref() == Some("1"));
-    if !on {
-        return;
-    }
-    // Build through `serde_json::json!` for the same reason
-    // `emit_error_with_id` does: `id` is user-supplied and a single `"`
-    // or `\` in it would corrupt the line, breaking the client's JSONL
-    // parser for every subsequent event on the same connection.
-    let envelope = serde_json::json!({
-        "type": "committed",
-        "id": id,
-        "tok_id": tok_id,
-        "pos": pos,
-        "t_ms": t_ms,
-    });
-    let _ = writeln!(stdout, "{}", envelope);
-}
-
 #[allow(dead_code)]
 fn gpu_block_attractor_token(
     gpu: &rdna_compute::Gpu,
@@ -782,24 +691,6 @@ fn acquire_daemon_lock() -> std::fs::File {
     f
 }
 
-/// Cap on the *encoded* base64 string length the daemon will accept on the
-/// IPC. ~40 MB encoded → ~30 MB raw image bytes (4/3 expansion).
-const MAX_BASE64_ENCODED_LEN: usize = 40 * 1024 * 1024;
-
-/// Emit a single-line `{"type":"error","id":"...","message":"..."}` JSON
-/// line on the IPC stream. Uses `serde_json` so user-controlled error
-/// strings (image decoder messages, base64 errors) can't desync the
-/// protocol by injecting embedded `"`, `\`, or newline bytes.
-fn write_error(stdout: &mut std::io::Stdout, id: &str, message: &str) {
-    let line = serde_json::json!({
-        "type": "error",
-        "id": id,
-        "message": message,
-    });
-    let _ = writeln!(stdout, "{line}");
-    let _ = stdout.flush();
-}
-
 fn chat_output_filter(m: &LoadedModel, request_stop_sequences: &[String]) -> EosFilter {
     chat_output_filter_from_profile(m.chat_template_profile.as_ref(), request_stop_sequences)
 }
@@ -868,39 +759,10 @@ fn normalize_request_stop_sequences(value: Option<&serde_json::Value>) -> Vec<St
     out
 }
 
-fn emit_filter_action(stdout: &mut std::io::Stdout, id: &str, action: FilterAction) -> bool {
-    match action {
-        FilterAction::Emit(text_bytes) => {
-            emit_text_bytes(stdout, id, &text_bytes);
-            false
-        }
-        FilterAction::StopEmit(text_bytes) => {
-            emit_text_bytes(stdout, id, &text_bytes);
-            true
-        }
-        FilterAction::Hold => false,
-        FilterAction::Stop => true,
-    }
-}
-
-fn emit_text_bytes(stdout: &mut std::io::Stdout, id: &str, text_bytes: &[u8]) {
-    if text_bytes.is_empty() {
-        return;
-    }
-    if let Ok(text) = std::str::from_utf8(text_bytes) {
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"token","id":"{}","text":{}}}"#,
-            id,
-            serde_json::to_string(text).unwrap_or_default()
-        );
-        let _ = stdout.flush();
-    }
-}
-
 #[cfg(test)]
 mod output_filter_tests {
     use super::*;
+    use hipfire_generate::eos_filter::FilterAction;
 
     #[test]
     fn request_stop_sequences_are_normalized_like_bun() {
@@ -9630,26 +9492,50 @@ fn main() {
             "pflash_labels" => {
                 let Some(corpus) = msg.get("corpus").and_then(|v| v.as_str()).map(String::from)
                 else {
-                    emit_error_with_id(&mut stdout, "", "pflash_labels: missing 'corpus'".to_string());
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "pflash_labels: missing 'corpus'".to_string(),
+                    );
                     continue;
                 };
                 let Some(output) = msg.get("output").and_then(|v| v.as_str()).map(String::from)
                 else {
-                    emit_error_with_id(&mut stdout, "", "pflash_labels: missing 'output'".to_string());
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "pflash_labels: missing 'output'".to_string(),
+                    );
                     continue;
                 };
-                let seq = msg.get("seq").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(512);
-                let block =
-                    msg.get("block").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(64);
-                let n_chunks =
-                    msg.get("n_chunks").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(40);
+                let seq = msg
+                    .get("seq")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(512);
+                let block = msg
+                    .get("block")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(64);
+                let n_chunks = msg
+                    .get("n_chunks")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(40);
                 let Some(m) = model.as_ref() else {
-                    emit_error_with_id(&mut stdout, "", "pflash_labels: no model loaded".to_string());
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "pflash_labels: no model loaded".to_string(),
+                    );
                     continue;
                 };
-                let (Some(weights), Some(config), Some(tokenizer)) =
-                    (m.q35_weights.as_ref(), m.q35_config.as_ref(), m.tokenizer.as_ref())
-                else {
+                let (Some(weights), Some(config), Some(tokenizer)) = (
+                    m.q35_weights.as_ref(),
+                    m.q35_config.as_ref(),
+                    m.tokenizer.as_ref(),
+                ) else {
                     emit_error_with_id(
                         &mut stdout,
                         "",
@@ -9659,7 +9545,11 @@ fn main() {
                 };
                 let fa = qwen35::full_attention_layers(config);
                 if fa.is_empty() {
-                    emit_error_with_id(&mut stdout, "", "pflash_labels: no FullAttention layers".to_string());
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "pflash_labels: no FullAttention layers".to_string(),
+                    );
                     continue;
                 }
                 let shallow = fa[0];
@@ -9667,7 +9557,11 @@ fn main() {
                 let text = match std::fs::read_to_string(&corpus) {
                     Ok(t) => t,
                     Err(e) => {
-                        emit_error_with_id(&mut stdout, "", format!("pflash_labels: read {corpus}: {e}"));
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            format!("pflash_labels: read {corpus}: {e}"),
+                        );
                         continue;
                     }
                 };
@@ -9676,14 +9570,22 @@ fn main() {
                     emit_error_with_id(
                         &mut stdout,
                         "",
-                        format!("pflash_labels: corpus too small: {} toks < {}", all.len(), n_chunks * seq),
+                        format!(
+                            "pflash_labels: corpus too small: {} toks < {}",
+                            all.len(),
+                            n_chunks * seq
+                        ),
                     );
                     continue;
                 }
                 let mut out_file = match std::fs::File::create(&output) {
                     Ok(f) => std::io::BufWriter::new(f),
                     Err(e) => {
-                        emit_error_with_id(&mut stdout, "", format!("pflash_labels: create {output}: {e}"));
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            format!("pflash_labels: create {output}: {e}"),
+                        );
                         continue;
                     }
                 };
@@ -9691,7 +9593,12 @@ fn main() {
                 for ci in 0..n_chunks {
                     let toks = all[ci * seq..(ci + 1) * seq].to_vec();
                     match qwen35::capture_pflash_block_scores(
-                        &mut gpu, weights, config, &toks, block, &[shallow, mid],
+                        &mut gpu,
+                        weights,
+                        config,
+                        &toks,
+                        block,
+                        &[shallow, mid],
                     ) {
                         Ok(scores) => {
                             let line = serde_json::json!({
@@ -9706,7 +9613,11 @@ fn main() {
                             }
                         }
                         Err(e) => {
-                            emit_error_with_id(&mut stdout, "", format!("pflash_labels: chunk {ci}: {e}"));
+                            emit_error_with_id(
+                                &mut stdout,
+                                "",
+                                format!("pflash_labels: chunk {ci}: {e}"),
+                            );
                             failed = true;
                             break;
                         }
@@ -11731,7 +11642,9 @@ fn load_model_pp(
             .tensor_data("model.visual.patch_embed.proj.weight")
             .is_some()
     {
-        return Err("pp>1 does not support VL models in v1; see issue #58 v1.1 roadmap".to_string());
+        return Err(
+            "pp>1 does not support VL models in v1; see issue #58 v1.1 roadmap".to_string(),
+        );
     }
 
     let config = qwen35::config_from_hfq(&hfq).ok_or("failed to read Qwen3.5 config")?;
