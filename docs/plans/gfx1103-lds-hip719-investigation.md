@@ -1,0 +1,244 @@
+# gfx1103 LDS HIP-719 Investigation
+
+Living notes for narrowing the intermittent, sticky HIP-719 launch failure seen
+with LDS-backed `gemm_f32_train` variants on gfx1103.
+
+## Scope
+
+- Kernel under investigation: `kernels/src/gemm_f32_train.hip`.
+- Reference branch: `chaingun`.
+- Risky experiments: throwaway worktrees only.
+- Goal: diagnose the failure mechanism well enough to decide whether this is
+  a hipfire kernel bug, compiler/codegen bug, or gfx1103 ROCm/amdgpu LDS runtime
+  bug. Do not land a production kernel rewrite from this note alone.
+
+## Local Test Target
+
+Observed local hardware/software for the first repro pass:
+
+- GPU: `gfx1103`, AMD Radeon 780M Graphics / Phoenix APU.
+- ROCm driver reported by `rocm-smi`: `6.19.0`.
+- ROCm tools present:
+  - `/opt/rocm/bin/rocprofv3`
+  - `/opt/rocm/bin/rocprof-compute`
+  - `/opt/rocm/bin/rocgdb`
+  - `/opt/rocm/bin/hipcc`
+  - `/opt/rocm/llvm/bin/llvm-objdump`
+  - `/opt/rocm/llvm/bin/llvm-readobj`
+- Local driver source available:
+  - `/usr/src/amdgpu-6.19.0-2307534.24.04/amd/amdgpu`
+- Full ROCm runtime/compiler source trees are not currently present locally.
+
+## Commit History Examined
+
+Three relevant file states were compared:
+
+- `c3765ea9`: introduced shared-memory tiled GEMM, `TILE=16`, one output per
+  thread, `__shared__` A/B tiles.
+- `b41368bb`: kept the LDS tiled kernel but removed the second
+  `__launch_bounds__` argument after HIP-719 launch failures.
+- `5546fe12`: replaced the LDS tiled kernel with a no-LDS register-tiled
+  micro-tile kernel after finding the LDS variant unreliable on gfx1103.
+
+Current `chaingun` uses the `5546fe12` no-LDS register-tiled kernel and a
+`ceil(N/64) x ceil(M/64)` host launch grid.
+
+## Repro Harness
+
+Initial repro used a throwaway worktree:
+
+```bash
+git worktree add --detach /tmp/hipfire-lds-repro HEAD
+git -C /tmp/hipfire-lds-repro checkout b41368bb -- kernels/src/gemm_f32_train.hip
+# Patch dispatch grid back to ceil(N/16) x ceil(M/16), block 16x16.
+source ./scripts/rocm-env.sh 2>/dev/null || true
+cargo run -p hipfire-train --release --example gemm_f32_train_recover
+```
+
+The recovery harness repeatedly launches:
+
+```rust
+gpu.gemm_f32_train(&x, &w, &c, 512, 3072, 3072, 3072, 3072, false, true)
+```
+
+and after a launch failure tries:
+
+1. `clear_last_error()`
+2. `device_synchronize()`
+3. `clear_last_error()`
+4. relaunch, up to 8 retries
+
+Current artifact root for this investigation pass:
+
+```text
+/tmp/hipfire-lds-artifacts-v2/
+```
+
+The runner preserves variant-local `HIPFIRE_KERNEL_CACHE` output, `dmesg`
+snapshots, run logs, and generated source/code-object files when the runtime
+compiler writes them. `sudo` is available for root-only amdgpu sysfs evidence.
+
+## Variant Matrix
+
+All rows below use the same gfx1103 Phoenix APU unless noted.
+
+| Variant | Result | Notes |
+|---|---:|---|
+| b413 LDS `TILE=16`, 16x16 block | FAIL | Unrecoverable at launch 11 after 8 retries. |
+| b413 LDS `TILE=16` with `TILE+1` padded LDS rows | FAIL | Unrecoverable at launch 13. Padding does not fix it. |
+| A-only LDS, B direct global | FAIL | Unrecoverable at launch 8. |
+| B-only LDS, A direct global | FAIL | Unrecoverable at launch 8. |
+| LDS `TILE=8`, 8x8 block | FAIL | Unrecoverable at launch 7. |
+| LDS `TILE=6`, 6x6 block | FAIL | Unrecoverable at launch 5. |
+| LDS `TILE=5`, 5x5 block | PASS | 100 launches, 0 retries. |
+| LDS `TILE=4`, 4x4 block | PASS | 100 launches, 0 retries. |
+| 4x4 active LDS subset inside 8x8 block | PASS | 100 launches, 0 retries; barriers span 64 threads, only 16 lanes touch LDS. |
+
+Latest artifact paths:
+
+- `/tmp/hipfire-lds-artifacts-v2/tile5_t5_b5_n100/`: pass case, includes run
+  log, saved kernel source, `gemm_f32_train.hsaco`, metadata, and ISA dump.
+- `tile6_t6_b6_n100/`: fail case, includes run log, saved kernel source, and
+  generated `gemm_f32_train.hsaco` metadata/ISA dumps. Also includes a
+  root-copied `devcoredump.data` sample from
+  `/sys/class/drm/card0/device/devcoredump/data`.
+- `active4_block8_t4_b8_n100/`: pass control, 4x4 active LDS subset inside
+  8x8 block. This run did not leave `gemm_f32_train.hsaco`; it wrote only the
+  runtime source and hash under the variant-local cache, so exact code-object
+  comparison for this control still needs runner cleanup.
+- `tile6_dmesg_probe/`: `dmesg.before.txt` and `dmesg.after.txt` around the
+  failing `tile6` run.
+
+## Current Narrowing
+
+Evidence argues against these as sole causes:
+
+- `__launch_bounds__` second argument.
+- Simple LDS bank-layout issue: row padding still fails.
+- A-side vs B-side address math: A-only and B-only LDS both fail.
+- LDS allocation size alone: tiny 4x4 active LDS inside an 8x8 block passes.
+- Multi-wave `__syncthreads()` alone: 4x4 active LDS inside 8x8 block passes.
+
+The `tile6` dmesg delta shows a driver-side device wedge, not a simple HIP
+runtime recoverable error. The latest v2 failing run again reset through the
+same path:
+
+```text
+amdgpu ... MES failed to respond to msg=REMOVE_QUEUE
+amdgpu ... failed to remove hardware queue from MES, doorbell=0x1802
+amdgpu ... MES might be in unrecoverable state, issue a GPU reset
+amdgpu ... Failed to evict queue 1
+amdgpu ... Failed to evict process queues
+amdgpu ... GPU reset begin!. Source:  3
+amdgpu ... remove_all_kfd_queues_mes: Failed to remove queue 0 for dev 42885
+amdgpu ... Dumping IP State
+amdgpu ... MODE2 reset
+amdgpu ... GPU reset succeeded, trying to resume
+amdgpu ... AMDGPU device coredump file has been created
+amdgpu ... GPU reset(12) succeeded!
+amdgpu ... [drm] device wedged, but recovered through reset
+```
+
+Driver-source mapping from the local amdgpu tree:
+
+- `GPU reset begin!. Source:  3` maps to `AMDGPU_RESET_SRC_MES` in
+  `amd/amdgpu/amdgpu_reset.h`.
+- The reset work path chooses `AMDGPU_RESET_SRC_MES` when `adev->enable_mes`
+  is true in `amd/amdgpu/amdgpu_amdkfd.c`.
+- `Failed to evict queue`, `Failed to evict process queues`, and
+  `remove_all_kfd_queues_mes` are KFD queue eviction / MES queue removal paths.
+
+With passwordless sudo, the devcoredump sysfs node can be sampled. The latest
+captured coredump is text-formatted, 64 KiB, and starts with:
+
+```text
+**** AMDGPU Device Coredump ****
+kernel: 6.17.0-35-generic
+module: amdgpu
+HWIP: GC[1][0]: v11.0.1.0.0
+MES_KIQ feature version: 6, fw version: 0x00000109
+MES feature version: 1, fw version: 0x00000087
+[gfxhub] Page fault observed
+Faulty page starting at address: 0x0000000000000000
+Protection fault status register: 0x0
+regGDS_PROTECTION_FAULT                             0x3f000007
+regGDS_VM_PROTECTION_FAULT                          0x0fc00113
+```
+
+Decoded against `gc_11_0_3_sh_mask.h`, the two GDS registers both have
+`WRITE_DIS`, `FAULT_DETECTED`, and `GRBM` set. Their decoded address field is
+`0xfc0`; `GDS_VM_PROTECTION_FAULT` reports `VMID=1`.
+
+This materially changes the lower-level description: the user-visible recovery
+path is a MES queue removal/reset wedge, while the devcoredump also records a
+gfxhub page-fault snapshot and GDS/GDS-VM protection fault registers. That makes
+this look much more like a GPU/kernel-codegen/driver interaction than an
+ordinary HIP launch bookkeeping issue.
+
+Code object/resource observations from `llvm-readobj` dumps:
+
+| Variant | Workgroup | LDS group segment | VGPR | SGPR | Spills | Wavefront |
+|---|---:|---:|---:|---:|---:|---:|
+| `tile5` pass | 25 | 212 B | 18 | 20/21 | 0 | 32 |
+| `tile6` fail | 36 | 288 B | 20 | 20/21 | 0 | 32 |
+
+ISA observations:
+
+- `tile5` is a single-wave workgroup (`25 < 32`). The compiler appears to
+  remove explicit `s_barrier` instructions in the runtime-generated code object.
+- `tile6` is a two-wave workgroup (`36 > 32`) and retains `s_barrier`
+  instructions around LDS traffic.
+- Both `tile5` and `tile6` still contain LDS instructions. The current ISA
+  counts are: `tile5` = 0 `s_barrier`, 4 `ds_store*`, 12 `ds_load*`; `tile6` =
+  4 `s_barrier`, 4 `ds_store*`, 10 `ds_load*`.
+- The active4-in-8x8 control passed even though the launched block spans two
+  waves; only 16 lanes actively touch LDS. This keeps the current hypothesis on
+  active LDS traffic across waves rather than barrier presence alone.
+
+Best current hypothesis:
+
+> On gfx1103 with this ROCm/amdgpu stack, the failure appears when more than one
+> wave worth of lanes actively performs LDS traffic in this GEMM-style kernel.
+> The sharp boundary is `TILE=5` (25 active lanes, pass) vs `TILE=6` (36 active
+> lanes, fail). This is more specific than "any LDS" or "any multi-wave block".
+
+## Next Evidence To Capture
+
+Continue improving the small repro matrix so it emits and preserves artifacts
+for each variant (`TILE=4`, `5`, `6`, `8`, `16`, and the 4-active-in-8x8
+control):
+
+- Exact patch or generated kernel source.
+- pass/fail launch count and retry behavior.
+- `dmesg` / amdgpu log delta around each run.
+- generated code object metadata via ROCm LLVM tools.
+- ISA dump via `llvm-objdump`.
+- rocprof/rocprof-compute output for passing variants and any failing variants
+  that complete far enough to profile.
+- root-only follow-up: capture a fresh full devcoredump after clearing the old
+  sysfs node, then compare its GDS/GDS-VM registers against the v2 sample.
+- improve the throwaway matrix runner so it always preserves the exact
+  runtime-generated `.hsaco`; the active4 control passed but did not leave a
+  `.hsaco` under the expected cache name in the latest run.
+- add a minimal no-GEMM LDS reproducer if possible: isolate whether a tiny
+  multi-wave kernel with only LDS store/load/barrier can reproduce the same
+  GDS/GDS-VM fault without global matrix traffic.
+
+Compare pass/fail boundary for:
+
+- active lanes and waves per workgroup,
+- LDS instructions and barrier sequence,
+- VGPR/SGPR/LDS resource usage,
+- occupancy/workgroup metadata,
+- any kernel log evidence of GPUVM fault, queue fault, ring timeout, or trap.
+
+## Working Conclusion
+
+`5546fe12`'s no-LDS register-tiled production choice is currently justified.
+The 288 GFLOP/s LDS path from `b41368bb` is not safe on gfx1103. The strongest
+current lead is not just "LDS is flaky"; it is a failing multi-wave LDS GEMM
+kernel producing a MES reset path plus GDS/GDS-VM protection-fault state in the
+amdgpu coredump. A production mitigation should not be attempted until the repro
+matrix shows whether a single-wave LDS variant is actually faster enough to
+matter, or whether the fault belongs below hipfire in ROCm/amdgpu/compiler
+behavior.
