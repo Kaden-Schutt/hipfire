@@ -12,21 +12,39 @@
 
 use std::path::Path;
 
+use fast_image_resize::images::Image;
+use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
+
 use crate::config::SigLipConfig;
 
 /// Load + preprocess an image into the SigLIP patch tensor
 /// `[num_patches · 3·patch²]` (row-major patches, channel-major within a patch).
 pub fn preprocess_image(path: &Path, cfg: &SigLipConfig) -> Result<Vec<f32>, String> {
-    let img = image::open(path).map_err(|e| format!("gemma3-vl: open image {path:?}: {e}"))?;
-    let size = cfg.image_size as u32;
-    // Resize to a fixed square (Gemma3 uses a fixed image_size grid).
-    let img = img
-        // BILINEAR to match HF Gemma3ImageProcessor (`resample: 2`). Parity with
-        // the training preprocessing matters more than subjective sharpness — a
-        // cubic filter would feed the model a different (off-distribution) 896²
-        // tensor than it was trained on. `Triangle` is the image-crate bilinear.
-        .resize_exact(size, size, image::imageops::FilterType::Triangle)
+    // Decode with the `image` crate (fast_image_resize does not decode), to raw
+    // interleaved sRGB RGB u8.
+    let decoded = image::open(path)
+        .map_err(|e| format!("gemma3-vl: open image {path:?}: {e}"))?
         .to_rgb8();
+    let (src_w, src_h) = decoded.dimensions();
+    let size = cfg.image_size as u32;
+
+    // Resize to the fixed image_size² grid with fast_image_resize: bilinear
+    // convolution to match HF Gemma3ImageProcessor (`resample: 2`), Pillow-grade.
+    // `Resizer::new()` auto-selects the best CPU extension (AVX2/SSE4.1/NEON,
+    // runtime-detected via is_x86_feature_detected!) — no manual selection
+    // needed; `set_cpu_extensions` is the (unsafe) override for forcing one.
+    let src = Image::from_vec_u8(src_w, src_h, decoded.into_raw(), PixelType::U8x3)
+        .map_err(|e| format!("gemma3-vl: src image: {e}"))?;
+    let mut dst = Image::new(size, size, PixelType::U8x3);
+    let mut resizer = Resizer::new();
+    resizer
+        .resize(
+            &src,
+            &mut dst,
+            &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear)),
+        )
+        .map_err(|e| format!("gemma3-vl: resize: {e}"))?;
+    let resized = dst.buffer(); // [size·size·3] interleaved RGB u8
 
     let s = cfg.image_size;
     let ps = cfg.patch_size;
@@ -39,9 +57,8 @@ pub fn preprocess_image(path: &Path, cfg: &SigLipConfig) -> Result<Vec<f32>, Str
     let mut chw = vec![0.0f32; c * s * s];
     for y in 0..s {
         for x in 0..s {
-            let px = img.get_pixel(x as u32, y as u32);
             for ch in 0..c {
-                chw[ch * s * s + y * s + x] = px[ch] as f32 / 127.5 - 1.0;
+                chw[ch * s * s + y * s + x] = resized[(y * s + x) * c + ch] as f32 / 127.5 - 1.0;
             }
         }
     }

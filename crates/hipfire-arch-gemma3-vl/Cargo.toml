@@ -17,5 +17,9 @@ hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 hipfire-arch-gemma3 = { path = "../hipfire-arch-gemma3" }
 serde_json = "1"
-# Image decode (PNG/JPEG) + resize for the SigLIP preprocessing pipeline.
+# Image decode (PNG/JPEG) only — fast_image_resize does the resize.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Pillow-parity, SIMD (AVX2/SSE4.1/NEON, runtime-detected) resize — matches the
+# HF Gemma3ImageProcessor bilinear convolution far more closely than image-crate
+# resampling, and is the fast per-frame path for future video preprocessing.
+fast_image_resize = "5"
