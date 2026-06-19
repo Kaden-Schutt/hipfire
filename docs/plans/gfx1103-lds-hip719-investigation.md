@@ -105,6 +105,7 @@ VARIANT=tile6_lds_store_then_load_dynamiccols_load4_split1_consume4_pinned MODE=
 VARIANT=tile6_lds_store_then_load_dynamiccols_load3_split1_consume3_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-consume3-pinned-780m
 VARIANT=tile6_lds_store_then_load_dynamiccols_load4_noextra_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-noextra-consume4-pinned-780m
 VARIANT=tile6_lds_store_then_load_dynamiccols_load3_noextra_consume3_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-noextra-consume3-pinned-780m
+VARIANT=tile6_lds_single_store_then_load_dynamiccols_load4_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-single-store-consume4-pinned-780m
 VARIANT=tile6_lds_store_then_load_dynamiccols_load4_nextrow_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-nextrow-consume4-pinned-780m
 VARIANT=tile6_lds_store_then_load_dynamiccols_load4_separate_tile_consume4_pinned MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-separate-tile-consume4-pinned-780m
 ```
@@ -501,6 +502,12 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
     variant also passed 100 launches with `vgpr_count=9`. This shows the extra
     ordinary LDS load remains a required trigger component for the four-load
     pinned failure on this system.
+  - The single-store pinned extra-load control passed 100 launches. It keeps
+    the extra ordinary LDS load and the four waited/interleaved dynamic row
+    loads, but removes the second per-K LDS store. It matches the failing
+    second-store pinned resource tuple (`group_segment_fixed_size=144`,
+    `sgpr_count=5`, `vgpr_count=10`). This shows the second per-K LDS store
+    remains a required trigger component in the current minimized shape.
   - The pinned next-row extra-load control failed at sync 86. It keeps the same
     one-tile second store and four waited/interleaved dynamic row loads, but
     changes only the extra ordinary LDS load from `As[ty][tx]` to
@@ -566,14 +573,16 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   serialization can pass, but split controls down to max-one outstanding still
   fail with four row-loads even when FMACs are pinned between loads. Removing
   the extra ordinary LDS load makes the four-load pinned variant pass 100
-  launches with the same resource tuple, while moving that extra load to the
-  next row or to a separate one-time-initialized LDS tile still fails. The
-  leading local suspect is now the combination of a second LDS store, an extra
-  ordinary LDS load, four dynamic row LDS loads separated by explicit waits
-  with interleaved consumes, and repeated launch/process state, with strong
-  same-process/reset-state sensitivity. Same-row and same-tile membership are
-  no longer required by the current evidence, though the separate-tile control
-  changes the group segment and SGPR tuple.
+  launches with the same resource tuple, and removing the second per-K LDS
+  store while keeping the extra load and four dynamic row loads also passes
+  with the same tuple. Moving the extra load to the next row or to a separate
+  one-time-initialized LDS tile still fails. The leading local suspect is now
+  the conjunction of a second per-K LDS store, an extra ordinary LDS load, four
+  dynamic row LDS loads separated by explicit waits with interleaved consumes,
+  and repeated launch/process state, with strong same-process/reset-state
+  sensitivity. Same-row and same-tile membership are no longer required by the
+  current evidence, though the separate-tile control changes the group segment
+  and SGPR tuple.
   Barrier count alone is ruled out by the three-barrier no-LDS pass and the
   isolated extra-load / isolated load-store phase controls.
 - The throwaway split's resource metadata is useful: no-LDS and barrier-only
@@ -627,7 +636,10 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   `144`, `sgpr_count=5`, and `vgpr_count=10`/`9`, respectively, showing the
   extra ordinary LDS load is required for the four-load pinned failure and that
   the failing `load4_split1_consume4_pinned` resource tuple is pass-side when
-  that load is removed. The pinned next-row extra-load control fails with
+  that load is removed. The single-store pinned extra-load control also passes
+  with `144`, `sgpr_count=5`, and `vgpr_count=10`, showing the second per-K LDS
+  store is required and that the failing tuple remains pass-side when that
+  store is removed. The pinned next-row extra-load control fails with
   `144`, `sgpr_count=5`, and `vgpr_count=13`, which rules out same-row
   membership in this minimized pinned shape but has a higher VGPR count due to
   the computed next-row address. The pinned separate-tile extra-load control
@@ -821,6 +833,15 @@ Latest artifact paths:
   smoke and passed 100 launches with `group_segment_fixed_size=144`,
   `sgpr_count=5`, and `vgpr_count=9`. These are pass-side controls showing the
   extra ordinary LDS load remains required for the four-load pinned failure.
+- `/tmp/hipfire-lds-single-store-pinned-runs/`: single-store pinned extra-load
+  control. Throwaway
+  `tile6_lds_single_store_then_load_dynamiccols_load4_consume4_pinned` passed
+  one-launch smoke. ISA emits exactly one per-K `ds_store_b32`, one extra
+  `ds_load_b32`, then four waited/interleaved dynamic row loads. Metadata is
+  `group_segment_fixed_size=144`, `sgpr_count=5`, and `vgpr_count=10`, matching
+  the failing second-store pinned tuple. The 100-launch run passed. This shows
+  the second per-K LDS store remains required in the current minimized
+  four-load pinned shape.
 - `/tmp/hipfire-lds-extra-row-runs/`: pinned next-row extra-load control.
   Throwaway `tile6_lds_store_then_load_dynamiccols_load4_nextrow_consume4_pinned`
   passed one-launch smoke. ISA emits the second store, then an extra
