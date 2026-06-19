@@ -337,20 +337,30 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
     still removes LDS.
   - `tile6_lds_one_synth` passed. This adds one `6x6` shared tile
     (`group_segment_fixed_size=144`) and reads it back.
+  - `tile6_lds_padded_one_synth` passed. This uses one padded shared array
+    with `group_segment_fixed_size=288`, but still has only one per-K LDS
+    store/read stream.
+  - `tile6_lds_two_store_once_one_read` passed. This allocates two `6x6`
+    shared tiles and writes the second tile once before the K loop, then only
+    uses the first tile inside the loop.
   - `tile6_lds_two_store_one_read` failed with HIP 719 at sync 97. This writes
     two `6x6` shared tiles (`group_segment_fixed_size=288`) but only reads one
     tile back.
   - The existing `tile6_synth` failed with HIP 719 at sync 56 in the same
     envelope (`group_segment_fixed_size=288`).
   This points away from launch count, arithmetic, barriers alone, and a single
-  LDS producer/consumer tile. The smallest new failing splitter is two shared
-  6x6 tiles being populated in the all-active 36-thread workgroup, even before
-  the second tile is consumed by the inner product.
+  LDS producer/consumer tile. The 288 B group segment alone also passes, and a
+  second tile written only once passes. The smallest new failing splitter is two
+  shared `6x6` tiles being populated on every K tile in the all-active
+  36-thread workgroup, even before the second tile is consumed by the inner
+  product.
 - The throwaway split's resource metadata is useful: no-LDS and barrier-only
   variants use `group_segment_fixed_size=0`, one-tile LDS uses `144`, and the
   two-tile failing splitter uses `288` with the same `sgpr_count=5` and
-  `vgpr_count=12` as the passing one-tile variant. The failing `tile6_synth`
-  uses `288`, `sgpr_count=5`, and `vgpr_count=18`.
+  `vgpr_count=12` as the passing one-tile variant. The padded-one passing
+  variant uses `288`, `sgpr_count=6`, and `vgpr_count=24`; the write-once
+  passing variant uses `288`, `sgpr_count=6`, and `vgpr_count=12`. The failing
+  `tile6_synth` uses `288`, `sgpr_count=5`, and `vgpr_count=18`.
 - Caution for those latest throwaway runs: `run.log`/`exit_code.txt` are the
   authoritative pass/fail evidence. The captured dmesg snapshots and live
   `dmesg --ctime` preserve the same MES `REMOVE_QUEUE` reset family, but the
@@ -380,6 +390,11 @@ Latest artifact paths:
   controls. Preserved subdirectories include `nolds-control`,
   `barrier-control`, `lds-one-control`, `lds-two-store-one-read`, and
   `lds-synth-control`.
+- `/tmp/hipfire-lds-chaingun-next-runs/`: follow-up throwaway splitter controls
+  from current `chaingun`, including `lds-padded-one`,
+  `lds-two-store-once-one-read`, and the repeat failing
+  `lds-two-store-perk-one-read` (`tile6_lds_two_store_one_read` failed at sync
+  96).
 - `/tmp/hipfire-lds-gemm-klimit-repeat-artifacts/`: repeated no-global/no-store
   K-limit sweep, including pass at `K_LIMIT=1536`, repeated failures at
   `K_LIMIT=2048`, and tile5 pass at full K.
