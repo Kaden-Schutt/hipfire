@@ -40577,7 +40577,7 @@ impl Gpu {
         unsafe {
             self.hip.launch_kernel(
                 func,
-                [((n + 15) / 16) as u32, ((m + 15) / 16) as u32, 1],
+                [((n + 63) / 64) as u32, ((m + 63) / 64) as u32, 1],
                 [16, 16, 1],
                 0,
                 self.stream_ref(),
@@ -40637,13 +40637,24 @@ impl Gpu {
         unsafe {
             self.hip.launch_kernel(
                 func,
-                [((n + 15) / 16) as u32, ((m + 15) / 16) as u32, 1],
+                [((n + 63) / 64) as u32, ((m + 63) / 64) as u32, 1],
                 [16, 16, 1],
                 0,
                 self.stream_ref(),
                 &mut params,
             )
         }
+    }
+
+    /// Block until all prior GPU work on this device completes.
+    pub fn device_synchronize(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        self.hip.device_synchronize()
+    }
+
+    /// Read-and-clear the HIP last-error flag (hipGetLastError). Returns the code.
+    pub fn clear_last_error(&mut self) -> u32 {
+        self.hip.last_error()
     }
 
     /// Training RMSNorm forward (fp32). `x`,`y`: `[rows*H]`; `w`: `[H]`;

@@ -12,23 +12,38 @@
 //   dX[M,K]            = dY·W  : gemm(dY,W,  dX, M, K,   Nout, Nout, K, 0, 0)
 //   dW[Nout,K]         = dYᵀ·X : gemm(dY,X,  dW, Nout, K, M,   Nout, K, 1, 0)
 //
-// 16x16 2D BLOCK, one output element per thread, NO shared memory. ~6× the naive
-// one-wave-per-output kernel (~15 → ~92 GFLOP/s on gfx1103): 256 independent
-// threads per block beat 32-thread waves doing a shuffle-reduce per output.
+// REGISTER-TILED, NO SHARED MEMORY. Each thread computes a TM×TN (4×4) output
+// micro-tile, holding accumulators in registers and reusing each loaded A/B value
+// across the micro-tile — arithmetic intensity TM·TN/(TM+TN)=2 vs 0.5 for a
+// one-output-per-thread kernel, so meaningfully faster while reading from global.
 //
-// WHY NO LDS: a shared-memory tiled variant is ~3× faster again (~288 GFLOP/s) but
-// triggers an intermittent HIP-719 "unspecified launch failure" on the FIRST
-// launch on gfx1103 (Phoenix APU) — measured ~70% fault rate, halved by a
-// post-module-load device sync, but never eliminated; the no-LDS form is 0/N.
-// Isolated to LDS (the 2D block alone is fine). See gemm_f32_train_bench. Re-land
-// the LDS version only with a register-tiled (no-LDS) reuse scheme or once the
-// driver issue is resolved.
+// WHY NO LDS: a shared-memory tiled variant is faster still (~288 GFLOP/s) but
+// triggers a STICKY, UNRECOVERABLE intermittent HIP-719 on gfx1103 (Phoenix APU)
+// — a per-launch fault (~few %) that accumulates to ~100% over many launches and
+// cannot be cleared/retried. Isolated to LDS use (the no-LDS forms are 0/N). See
+// gemm_f32_train_bench / gemm_f32_train_recover. Re-enable LDS only on hardware/
+// drivers where it's reliable.
 
 #include <hip/hip_runtime.h>
 
-#define TILE 16
+#define TM 4
+#define TN 4
+#define TPB 16            // 16x16 = 256 threads/block
+#define BM (TPB * TM)     // 64 output rows per block
+#define BN (TPB * TN)     // 64 output cols per block
 
-extern "C" __launch_bounds__(TILE * TILE)
+__device__ __forceinline__ float lda_(
+    const float* __restrict__ A, int m, int k, int M, int lda, int transA) {
+    if (m >= M) return 0.0f;
+    return transA ? A[(size_t)k * lda + m] : A[(size_t)m * lda + k];
+}
+__device__ __forceinline__ float ldb_(
+    const float* __restrict__ B, int k, int n, int N, int ldb, int transB) {
+    if (n >= N) return 0.0f;
+    return transB ? B[(size_t)n * ldb + k] : B[(size_t)k * ldb + n];
+}
+
+extern "C" __launch_bounds__(TPB * TPB)
 __global__ void gemm_f32_train(
     const float* __restrict__ A,
     const float* __restrict__ B,
@@ -37,21 +52,40 @@ __global__ void gemm_f32_train(
     int lda, int ldb,
     int transA, int transB
 ) {
-    int m = blockIdx.y * TILE + threadIdx.y;
-    int n = blockIdx.x * TILE + threadIdx.x;
-    if (m >= M || n >= N) return;
-    float sum = 0.0f;
+    int row0 = blockIdx.y * BM + threadIdx.y * TM;
+    int col0 = blockIdx.x * BN + threadIdx.x * TN;
+    float acc[TM][TN];
+    #pragma unroll
+    for (int i = 0; i < TM; i++)
+        #pragma unroll
+        for (int j = 0; j < TN; j++) acc[i][j] = 0.0f;
+
     for (int k = 0; k < K; k++) {
-        float a = transA ? A[(size_t)k * lda + m] : A[(size_t)m * lda + k];
-        float b = transB ? B[(size_t)n * ldb + k] : B[(size_t)k * ldb + n];
-        sum += a * b;
+        float a[TM], b[TN];
+        #pragma unroll
+        for (int i = 0; i < TM; i++) a[i] = lda_(A, row0 + i, k, M, lda, transA);
+        #pragma unroll
+        for (int j = 0; j < TN; j++) b[j] = ldb_(B, k, col0 + j, N, ldb, transB);
+        #pragma unroll
+        for (int i = 0; i < TM; i++)
+            #pragma unroll
+            for (int j = 0; j < TN; j++) acc[i][j] += a[i] * b[j];
     }
-    C[(size_t)m * N + n] = sum;
+
+    #pragma unroll
+    for (int i = 0; i < TM; i++) {
+        int m = row0 + i;
+        if (m >= M) continue;
+        #pragma unroll
+        for (int j = 0; j < TN; j++) {
+            int n = col0 + j;
+            if (n < N) C[(size_t)m * N + n] = acc[i][j];
+        }
+    }
 }
 
-// Accumulating variant: C = beta*C + op(A)·op(B). Used where a gradient lands on
-// a buffer that already holds a partial (residual-merged dX, LoRA dX onto base).
-extern "C" __launch_bounds__(TILE * TILE)
+// Accumulating variant: C = beta*C + op(A)·op(B).
+extern "C" __launch_bounds__(TPB * TPB)
 __global__ void gemm_f32_train_accum(
     const float* __restrict__ A,
     const float* __restrict__ B,
@@ -61,15 +95,37 @@ __global__ void gemm_f32_train_accum(
     int transA, int transB,
     float beta
 ) {
-    int m = blockIdx.y * TILE + threadIdx.y;
-    int n = blockIdx.x * TILE + threadIdx.x;
-    if (m >= M || n >= N) return;
-    float sum = 0.0f;
+    int row0 = blockIdx.y * BM + threadIdx.y * TM;
+    int col0 = blockIdx.x * BN + threadIdx.x * TN;
+    float acc[TM][TN];
+    #pragma unroll
+    for (int i = 0; i < TM; i++)
+        #pragma unroll
+        for (int j = 0; j < TN; j++) acc[i][j] = 0.0f;
+
     for (int k = 0; k < K; k++) {
-        float a = transA ? A[(size_t)k * lda + m] : A[(size_t)m * lda + k];
-        float b = transB ? B[(size_t)n * ldb + k] : B[(size_t)k * ldb + n];
-        sum += a * b;
+        float a[TM], b[TN];
+        #pragma unroll
+        for (int i = 0; i < TM; i++) a[i] = lda_(A, row0 + i, k, M, lda, transA);
+        #pragma unroll
+        for (int j = 0; j < TN; j++) b[j] = ldb_(B, k, col0 + j, N, ldb, transB);
+        #pragma unroll
+        for (int i = 0; i < TM; i++)
+            #pragma unroll
+            for (int j = 0; j < TN; j++) acc[i][j] += a[i] * b[j];
     }
-    size_t idx = (size_t)m * N + n;
-    C[idx] = beta * C[idx] + sum;
+
+    #pragma unroll
+    for (int i = 0; i < TM; i++) {
+        int m = row0 + i;
+        if (m >= M) continue;
+        #pragma unroll
+        for (int j = 0; j < TN; j++) {
+            int n = col0 + j;
+            if (n < N) {
+                size_t idx = (size_t)m * N + n;
+                C[idx] = beta * C[idx] + acc[i][j];
+            }
+        }
+    }
 }
