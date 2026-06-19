@@ -40,8 +40,8 @@ use hipfire_arch_qwen35::speculative::{
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_evidence::{RouterHistogramEvidence, RouterHistogramLayer, RuntimeOneshotEvidence};
-use hipfire_generate::eos_filter::{EosFilter, EosFilterConfig};
-use hipfire_generate::loop_guard::{LoopGuard, StopReason};
+use hipfire_generate::eos_filter::EosFilter;
+use hipfire_generate::loop_guard::StopReason;
 use hipfire_generate::sampler::{collect_unclosed_attractor_blocks, SamplerConfig};
 #[cfg(test)]
 use hipfire_generate::validate_qwen35_fused_dense_prefill_batch_preflight;
@@ -109,18 +109,11 @@ use events::{
     emit_committed_event, emit_error_with_id, emit_filter_action, emit_stream_event, write_error,
     MAX_BASE64_ENCODED_LEN,
 };
-
-fn normalize_daemon_prompt(prompt: &str) -> std::borrow::Cow<'_, str> {
-    if matches!(
-        std::env::var("HIPFIRE_NORMALIZE_PROMPT").ok().as_deref(),
-        Some("0") | Some("false") | Some("off") | Some("no")
-    ) || !hipfire_runtime::config::get().normalize_prompt
-    {
-        return std::borrow::Cow::Borrowed(prompt);
-    }
-
-    hipfire_prompt::normalize_prompt_text_with_policy(prompt, true)
-}
+mod output_filter;
+use output_filter::{
+    block_attractor_unclosed_cpu, chat_output_filter_from_profile, loop_guard_from_runtime_config,
+    normalize_daemon_prompt, normalize_request_stop_sequences,
+};
 
 /// Eviction policy wrapper — dispatches to plain TriAttention or CASK m-folding.
 enum Eviction {
@@ -173,103 +166,6 @@ struct CaskConfig {
     fold_m: usize,
 }
 
-/// Acquire a machine-wide exclusive lock on ~/.hipfire/daemon.pid.
-///
-/// On Unix: flock(2) is the kernel-level lock. The kernel releases it
-/// automatically on process death (including SIGKILL), so no manual
-/// cleanup is required — stale PID file contents are fine, the fd is
-/// what holds the lock.
-///
-/// On Windows: no kernel-level lock; we write the PID file but don't
-/// guarantee single-instance semantics. A second daemon launch may
-/// silently overwrite the PID. This matches the v0.1.0-alpha Windows
-/// behavior; tightening it is tracked in a follow-up.
-///
-/// Returns the File handle; caller MUST keep it alive for the process
-/// lifetime (on Unix, dropping it closes the fd and releases the lock).
-/// GPU-side attractor blockers for the AR generate path (#111).
-///
-/// MQ4 quant pressure makes structured-output special tokens (`<tool_call>`,
-/// `<think>`) into self-reinforcing attractors: the model emits the same
-/// special token hundreds of times in a row, never reaching the JSON body
-/// (or in stacked-opener shapes that downstream regex parsers cannot
-/// recover). The CPU-side `apply_ngram_block` is not in this path (its
-/// per-token D2H + H2D would tank decode tok/s) and the GPU sampler's
-/// repeat-penalty alone doesn't break a strong single-token loop fast
-/// enough at the user-validated `RP=1.05` floor.
-///
-/// The unclosed-opener depth counter lives in
-/// `hipfire_generate::sampler::collect_unclosed_attractor_blocks`; the resulting
-/// blocked-token list is applied to the GPU logits buffer by
-/// `hipfire_runtime::sampler::sample`
-/// before the sampling kernel launches. The `gpu_block_attractor_token`
-/// helper below is the simpler fallback for unpaired tokens — trips on
-/// `count >= threshold` regardless of structure — kept here as
-/// reference for a future per-token attractor block.
-/// CPU-side counterpart that applies the same depth-tracking attractor
-/// block directly to a freshly-downloaded logits vector. Avoids the
-/// htod-memcpy + redownload roundtrip the GPU variant required per token.
-fn block_attractor_unclosed_cpu(
-    logits: &mut [f32],
-    history: &[u32],
-    open_id: u32,
-    close_id: u32,
-    window: usize,
-    threshold: usize,
-) {
-    if window == 0 || threshold == 0 || open_id == close_id {
-        return;
-    }
-    let start = history.len().saturating_sub(window);
-    let mut depth: i32 = 0;
-    for &t in &history[start..] {
-        if t == open_id {
-            depth += 1;
-        } else if t == close_id && depth > 0 {
-            depth -= 1;
-        }
-    }
-    if depth >= threshold as i32 {
-        if let Some(slot) = logits.get_mut(open_id as usize) {
-            *slot = f32::NEG_INFINITY;
-        }
-    }
-}
-
-fn loop_guard_from_runtime_config() -> LoopGuard {
-    let config = hipfire_runtime::config::get();
-    LoopGuard::new(config.ngram_loop_threshold, config.ngram_window)
-}
-
-//
-// ─── Probe-mode `committed` event emitter ────────────────────────────────
-//
-// When `HIPFIRE_EMIT_TOKEN_IDS=1` is set, the daemon emits a
-// `{"type":"committed",...}` event for every token it commits (i.e. every
-// time a sampled token is appended to `streamed_tokens` /
-// `conversation_tokens`). This is a parallel stream alongside the
-// existing `{"type":"token","text":"..."}` events; it carries the raw
-// token ID, the per-request position, and ms-since-request-start.
-//
-// Why a parallel stream and not a `tok_id` field on the existing token
-// event: `EosFilter` can hold/merge/strip/stop bytes across multiple
-// committed tokens (many-to-one and zero-to-one relationships); a
-// `tok_id` field on a text event would lie about which token produced
-// the visible chunk. The runtime-protective synthetic emit at the
-// `</think>` force-close site is intentionally NOT paired with a
-// `committed` event, because no token was actually committed there.
-//
-// Off by default — env var read once on first call. The probe binary
-// (`examples/coherence_probe.rs`) sets the env on the daemon child it
-// spawns. Existing JSONL clients see no change.
-/// Safely emit a `{"type":"error", …}` JSONL line. Builds the envelope
-/// through `serde_json::json!` so embedded `"` / `\` / control chars in
-/// the message or `id` can't corrupt the line and trigger a client-side
-/// `JSON Parse error: Expected '}'` parse loop. Use this instead of
-/// `writeln!(stdout, r#"{{"type":"error",…}}"#, …)` with raw `{}` / `{:?}`
-/// interpolation of error values — Rust's `Display` will pass through
-/// a `"` unchanged, and `Debug` actively wraps strings in escaped quotes,
-/// both of which break the surrounding JSON.
 fn daemon_runtime_context(model: &LoadedModel) -> serde_json::Value {
     serde_json::json!({
         "schema": 1,
@@ -615,29 +511,20 @@ fn run_generate_batch_prefill_dummy(
     Ok(())
 }
 
-#[allow(dead_code)]
-#[allow(dead_code)]
-fn gpu_block_attractor_token(
-    gpu: &rdna_compute::Gpu,
-    logits_buf: &hip_bridge::DeviceBuffer,
-    history: &[u32],
-    tok_id: u32,
-    window: usize,
-    threshold: usize,
-) {
-    if window == 0 || threshold == 0 {
-        return;
-    }
-    let start = history.len().saturating_sub(window);
-    let count = history[start..].iter().filter(|&&t| t == tok_id).count();
-    if count >= threshold {
-        let bytes: [u8; 4] = f32::NEG_INFINITY.to_ne_bytes();
-        let _ = gpu
-            .hip
-            .memcpy_htod_offset(logits_buf, (tok_id as usize) * 4, &bytes);
-    }
-}
-
+/// Acquire a machine-wide exclusive lock on ~/.hipfire/daemon.pid.
+///
+/// On Unix: flock(2) is the kernel-level lock. The kernel releases it
+/// automatically on process death (including SIGKILL), so no manual
+/// cleanup is required — stale PID file contents are fine, the fd is
+/// what holds the lock.
+///
+/// On Windows: no kernel-level lock; we write the PID file but don't
+/// guarantee single-instance semantics. A second daemon launch may
+/// silently overwrite the PID. This matches the v0.1.0-alpha Windows
+/// behavior; tightening it is tracked in a follow-up.
+///
+/// Returns the File handle; caller MUST keep it alive for the process
+/// lifetime (on Unix, dropping it closes the fd and releases the lock).
 fn acquire_daemon_lock() -> std::fs::File {
     use std::io::{Seek, Write};
 
@@ -693,101 +580,6 @@ fn acquire_daemon_lock() -> std::fs::File {
 
 fn chat_output_filter(m: &LoadedModel, request_stop_sequences: &[String]) -> EosFilter {
     chat_output_filter_from_profile(m.chat_template_profile.as_ref(), request_stop_sequences)
-}
-
-fn chat_output_filter_from_profile(
-    chat_template_profile: Option<&prompt_frame::ChatTemplateProfile>,
-    request_stop_sequences: &[String],
-) -> EosFilter {
-    let (mut stop_at, mut holdback_prefixes) = chat_template_profile
-        .map(|profile| {
-            (
-                profile
-                    .stop_at
-                    .iter()
-                    .map(|s| s.as_bytes().to_vec())
-                    .collect::<Vec<_>>(),
-                profile
-                    .holdback_prefixes
-                    .iter()
-                    .map(|s| s.as_bytes().to_vec())
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .filter(|(stop_at, _)| !stop_at.is_empty())
-        .unwrap_or_else(|| (vec![b"<|im_end|>".to_vec()], vec![b"<|im_end|>".to_vec()]));
-
-    for stop in request_stop_sequences {
-        if stop.is_empty() {
-            continue;
-        }
-        let bytes = stop.as_bytes().to_vec();
-        if !stop_at.iter().any(|existing| existing == &bytes) {
-            stop_at.push(bytes.clone());
-        }
-        if !holdback_prefixes.iter().any(|existing| existing == &bytes) {
-            holdback_prefixes.push(bytes);
-        }
-    }
-
-    EosFilter::new(EosFilterConfig {
-        stop_at,
-        holdback_prefixes,
-        ..Default::default()
-    })
-}
-
-fn normalize_request_stop_sequences(value: Option<&serde_json::Value>) -> Vec<String> {
-    let Some(value) = value else {
-        return Vec::new();
-    };
-    let mut out = match value {
-        serde_json::Value::String(s) => vec![s.clone()],
-        serde_json::Value::Array(items) => items
-            .iter()
-            .filter_map(|item| item.as_str().map(ToOwned::to_owned))
-            .collect::<Vec<_>>(),
-        _ => Vec::new(),
-    };
-    out.retain(|s| !s.is_empty());
-    out.truncate(4);
-    for seq in &mut out {
-        if seq.len() > 64 {
-            seq.truncate(64);
-        }
-    }
-    out
-}
-
-#[cfg(test)]
-mod output_filter_tests {
-    use super::*;
-    use hipfire_generate::eos_filter::FilterAction;
-
-    #[test]
-    fn request_stop_sequences_are_normalized_like_bun() {
-        let value = serde_json::json!(["", "END", "x".repeat(80), "A", "B", "C"]);
-        let stops = normalize_request_stop_sequences(Some(&value));
-        assert_eq!(stops.len(), 4);
-        assert_eq!(stops[0], "END");
-        assert_eq!(stops[1].len(), 64);
-    }
-
-    #[test]
-    fn request_stop_sequence_stops_filter_output() {
-        let stops = vec!["END".to_string()];
-        let mut filter = chat_output_filter_from_profile(None, &stops);
-        match filter.observe(b"hello END hidden") {
-            FilterAction::StopEmit(bytes) => {
-                assert_eq!(std::str::from_utf8(&bytes).unwrap(), "hello ");
-            }
-            other => panic!("expected emitted prefix before stop, got {other:?}"),
-        }
-        assert!(matches!(
-            filter.observe(b" after"),
-            FilterAction::Stop | FilterAction::Hold
-        ));
-    }
 }
 
 fn validate_qwen35_decode_batch_runtime_surface(
