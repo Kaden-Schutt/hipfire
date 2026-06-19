@@ -32,7 +32,7 @@ use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::triattn::EvictionCtx;
 use hipfire_state::ModelArtifactMemory;
 
-use crate::Qwen35RequestSessionState;
+use crate::session::Qwen35RequestSessionState;
 
 /// Eviction policy wrapper — dispatches to plain TriAttention or CASK m-folding.
 pub(crate) enum Eviction {
