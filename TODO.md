@@ -399,6 +399,36 @@ channel-test. Build order: dense arch-5 first (isolates the shared DeltaNet
 LA+FA hybrid manifest, deterministic golden), then MoE arch-6 is additive
 (router + experts + the combine-path stabilization above).
 
+### TODO: extend tiny-golden coverage to the other model families
+
+**Status:** P1–P3 of `docs/plans/2026-06-20-tiny-golden-tripwire.md` shipped —
+the two-tier gate is live, but it only covers **qwen3.5/3.6 dense (arch 5) +
+MoE (arch 6)**. We now ship many more families; each is a forward-pass path the
+tripwire is blind to, so a regression there falls back on the qualitative 35B
+battery (or nothing, if the heavy gate is skipped on a tiny-pass).
+
+**Families with no tiny fixture yet** (`crates/hipfire-arch-*`, excl. the
+synthetic `toy`): `llama`, `qwen2`, `gemma3`, `gemma3-vl`, `deepseek4`,
+`minimax`, `lfm2moe`, `qwen35-vl`, `dots-ocr`. The VL ones (`gemma3-vl`,
+`qwen35-vl`, `dots-ocr`) also need a tiny image-feature stub to exercise the
+vision/projector path, or a text-only mode.
+
+**Each family needs two pieces** (today both hard-code qwen35):
+1. **`emit_fixture` preset** (`hipfire-quantize/src/fixture.rs`) — the `match
+   arch_norm` only has `qwen3_5` / `qwen3_5_moe`; its own error already says
+   "Add a tiny preset per arch". Each preset = a <10M config + explicit tensor
+   manifest (the manifest-must-be-enumerable refactor noted above).
+2. **`fixture_golden.rs` arch dispatch** — it hard-codes
+   `qwen35::{config_from_hfq, load_weights, forward_scratch}`. Generalize to
+   dispatch on `arch_id` so each family's forward runs (per-arch shim; the
+   runner only needs argmax + KV growth per arch).
+
+Then add the family to `ARCHS` in `tests/fixture-golden-gate.sh` and `--record`
+its baselines (×format axis × gpu-arch fleet — see P4). Order by blast radius:
+`llama`/`qwen2` (simplest dense, shared kernels) → `gemma3` → `deepseek4`/
+`minimax`/`lfm2moe` (MoE/hybrid, reuse the arch-6 combine-pin pattern) → the VL
+trio last (need the image stub).
+
 ## Deterministic MoE-down reduction (reconsider the atomicAdd default)
 
 The fast MoE-down combine accumulates expert contributions via fp32

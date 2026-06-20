@@ -82,6 +82,12 @@ sequence (robust) are both emitted.
 to each runtime format that has its own dequant kernel path — `{MQ4, MQ3, Q8,
 lloyd-MQ3, lloyd-MQ4, MQ6}` — so each format's dequant kernel gets golden
 coverage. The cell set is `{dense, MoE} × {formats}` minus unsupported combos.
+- **Model-family axis (the bigger gap):** only qwen3.5/3.6 dense+MoE have
+  fixtures; `llama`/`qwen2`/`gemma3`/`deepseek4`/`minimax`/`lfm2moe`/the VL trio
+  have none, so the tripwire is blind to their forward paths. Tracked as a
+  dedicated TODO — see `TODO.md` §"extend tiny-golden coverage to the other
+  model families" (needs an `emit_fixture` preset + `fixture_golden` arch
+  dispatch per family).
 - Generation stays **materialize-then-real-load**, not in-memory synthesis. The
   user floated a "loader fills a template in memory" path; §325 deliberately
   chose emit-safetensors→quantize→load-through-the-unmodified-loader because the
