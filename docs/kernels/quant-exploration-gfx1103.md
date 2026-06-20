@@ -128,6 +128,43 @@ Resolved choice by regime:
 | Prefill, quality-first | **W4A8 via iu8** (upcast) | full weight quality, int8 compute, 4-bit storage |
 | Prefill, speed-first | **W4A4 fused iu4 + rotation** | fastest compute; rotation → within ~2 dB |
 
+## E4 — How far can W4A4 quality be pushed? (all fused-iu4)
+
+`quant_w4a4_improve` stacks iu4-preserving techniques on the W4A4 baseline and
+measures output SQNR (M=128 K=2048 B=64, outlier-heavy activations):
+
+| W4A4 scheme (fused iu4) | SQNR dB | Δ baseline |
+|-------------------------|--------:|-----------:|
+| baseline: FWHT256 + absmax, A=g128 | 16.0 | — |
+| + clip-search scale | 17.1 | +1.0 |
+| + clip + A=g32 | 17.3 | +1.3 |
+| + full-K Hadamard | 16.8 | +0.8 |
+| **+ SmoothQuant α0.5 + clip + g32** | **21.9** | **+5.9** |
+| ref: W4A8 (upcast iu8), same front-end | 24.2 | |
+| ref: W8A8 (ceiling), same front-end | 46.4 | |
+
+Findings:
+1. **W4A4 quality is very improvable.** Naive W4A4 was 9.3 dB (E3); the full
+   iu4-preserving stack reaches **21.9 dB — +12.5 dB over naive (~18× less
+   error)** — and closes most of the gap to W4A8 (24.2), still on the fused iu4
+   path.
+2. **SmoothQuant (per-channel migration) is the dominant lever** (+5.9 dB):
+   `s_j = max|X_:,j|^α / max|W_:,j|^(1-α)`, then `X/s, W·s` (exact product). It
+   moves activation channel-outliers into weights, which int4 tolerates far
+   better. Activation scale is a runtime elementwise op (foldable into the
+   preceding norm); weight scale is offline. iu4-compatible.
+3. **Clip-search + fine activation groups are cheap additive wins** (~+1.3 dB):
+   MSE-optimal per-group scale instead of absmax, A=g32.
+4. **Rotation block size barely matters once SmoothQuant runs** (256-block ≈
+   full-K) — both target the same outliers.
+5. The residual ~2 dB to W4A8 is the intrinsic 4-bit-activation cost; closing it
+   further needs GPTQ weight error-compensation (repo has `gptq.rs`) or
+   outlier-channel mixed precision (breaks pure iu4 — needs a side GEMM).
+
+So the fused-iu4 W4A4 path is quality-viable for compute-bound prefill with the
+recipe **SmoothQuant → rotation → clip-search int4, A=g32**. Reproduce:
+`cargo run -p hipfire-quantize --example quant_w4a4_improve`.
+
 ## Net recommendation for gfx1103
 
 - **Weights: FWHT-rotated symmetric int4 (MQ4) at ~4.06 bits/w**, group scales,
