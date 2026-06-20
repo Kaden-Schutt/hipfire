@@ -45,7 +45,14 @@ dmesg_delta_count() {
     awk -v start="$start" 'NR >= start' "$after" | rg -c "$pattern" || true
 }
 
-printf 'artifact\tvariant\tmode\tlaunches\tshape\tk_limit\tarch\tbuild_only\texit\tsync_failure\thip_error\tgit_commit\tgit_dirty\thipcc\tdriver\tgpu\tdmesg_remove_queue\tdmesg_mode2\tdmesg_gds\tdevcoredump\tisa_files\n' >"$TSV"
+short_sha256() {
+    local path="$1"
+    if [[ -r "$path" ]]; then
+        sha256sum "$path" | awk '{ print substr($1, 1, 16) }'
+    fi
+}
+
+printf 'artifact\tvariant\tmode\tlaunches\tshape\tk_limit\tarch\tbuild_only\texit\tsync_failure\thip_error\tgit_commit\tgit_dirty\thipcc\tdriver\tgpu\tsource_sha256\tamdgpu_obj_sha256\tamdgpu_isa_sha256\tdmesg_remove_queue\tdmesg_mode2\tdmesg_gds\tdevcoredump\tisa_files\n' >"$TSV"
 
 while IFS= read -r meta; do
     dir="$(dirname "$meta")"
@@ -95,11 +102,17 @@ while IFS= read -r meta; do
     devcoredump=0
     [[ -s "$dir/devcoredump.data" ]] && devcoredump=1
     isa_files="$(find "$dir/save-temps" -maxdepth 1 -type f -name '*.isa.txt' 2>/dev/null | wc -l | tr -d ' ')"
+    source_sha="$(short_sha256 "$dir/lds_gemm_standalone_probe.hip")"
+    amdgpu_obj="$(find "$dir/save-temps" "$dir" -maxdepth 1 -type f -name '*hip-amdgcn-amd-amdhsa-*.o' 2>/dev/null | sort | head -1)"
+    amdgpu_isa="$(find "$dir/save-temps" "$dir" -maxdepth 1 -type f -name '*hip-amdgcn-amd-amdhsa-*.o.isa.txt' 2>/dev/null | sort | head -1)"
+    amdgpu_obj_sha="$(short_sha256 "$amdgpu_obj")"
+    amdgpu_isa_sha="$(short_sha256 "$amdgpu_isa")"
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$rel" "$variant" "$mode" "$launches" "$shape" "$k_limit" "$arch" \
         "$build_only" "$exit_code" "$sync_failure" "$hip_error" "$git_commit" \
-        "$git_dirty" "$hipcc" "$driver" "$gpu" "$dmesg_remove_queue" \
+        "$git_dirty" "$hipcc" "$driver" "$gpu" "$source_sha" \
+        "$amdgpu_obj_sha" "$amdgpu_isa_sha" "$dmesg_remove_queue" \
         "$dmesg_mode2" "$dmesg_gds" "$devcoredump" "$isa_files" >>"$TSV"
 done < <(find "$ROOT" -type f -name meta.txt | sort)
 
@@ -110,13 +123,13 @@ done < <(find "$ROOT" -type f -name meta.txt | sort)
     echo "- generated: \`$(date -u +%Y-%m-%dT%H:%M:%SZ)\`"
     echo "- tsv: \`$TSV\`"
     echo
-    echo "| artifact | variant | exit | sync failure | git | driver | gpu | dmesg remove_queue | mode2 | gds | devcoredump |"
-    echo "|---|---|---:|---|---|---|---|---:|---:|---:|---:|"
+    echo "| artifact | variant | exit | sync failure | git | driver | gpu | src | obj | isa | remove_queue | mode2 | gds | devcoredump |"
+    echo "|---|---|---:|---|---|---|---|---|---|---|---:|---:|---:|---:|"
     awk -F '\t' 'NR > 1 {
         dirty = ($13 == "1") ? " dirty" : "";
         sync_failure = ($10 == "") ? " " : $10;
-        printf "| `%s` | `%s` | `%s` | %s | `%s%s` | `%s` | `%s` | %s | %s | %s | %s |\n", \
-            $1, $2, $9, sync_failure, $12, dirty, $15, $16, $17, $18, $19, $20;
+        printf "| `%s` | `%s` | `%s` | %s | `%s%s` | `%s` | `%s` | `%s` | `%s` | `%s` | %s | %s | %s | %s |\n", \
+            $1, $2, $9, sync_failure, $12, dirty, $15, $16, $17, $18, $19, $20, $21, $22, $23;
     }' "$TSV"
 } >"$MD"
 

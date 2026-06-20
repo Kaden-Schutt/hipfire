@@ -141,7 +141,8 @@ The currently promoted standalone GEMM jig lives in the repo:
 - `scripts/lds_gemm_artifact_summary.sh`: read-only artifact summarizer for
   cross-machine repro results. It writes TSV and Markdown summaries from
   `meta.txt`, `run.log`, `exit_code.txt`, dmesg deltas, devcoredump presence,
-  and saved ISA/readobj files.
+  saved ISA/readobj files, and short SHA-256 hashes for the captured HIP source,
+  AMDGPU object, and AMDGPU ISA dump.
 - `scripts/narrow-gemm-lds-shape.sh`: runs the curated variant matrix and
   writes a TSV report plus summary.
 - `tests/gfx1103-lds-tail-snop-repro.sh`: focused cross-system pass/fail
@@ -2393,6 +2394,12 @@ tail-noop checks in one run.
 ```bash
 scripts/lds_gemm_artifact_summary.sh /tmp/hipfire-lds-tail-snop-780m
 ```
+
+Compare the `source_sha256`, `amdgpu_obj_sha256`, and `amdgpu_isa_sha256`
+columns first when comparing 780M machines. Matching source with different
+object/ISA hashes means compiler/toolchain or environment drift is part of the
+comparison; matching object/ISA hashes makes runtime/driver behavior the main
+remaining difference.
 
 - Safe build/codegen metadata capture without launching the repro:
 
