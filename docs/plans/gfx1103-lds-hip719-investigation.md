@@ -130,6 +130,9 @@ The currently promoted standalone GEMM jig lives in the repo:
   LDS stress variants, including the dynamic row-load split controls.
 - `scripts/lds_gemm_standalone_matrix.sh`: builds/runs one selected variant and
   preserves logs, code objects, ISA/readobj output, and dmesg snapshots.
+- `scripts/lds_gemm_isa_compare.sh`: compile-only helper that builds the
+  standalone probe, does not launch any GPU kernel, and writes per-symbol
+  resource/ISA counters for the no-extra versus tail-loop `s_nop` comparison.
 - `scripts/narrow-gemm-lds-shape.sh`: runs the curated variant matrix and
   writes a TSV report plus summary.
 - `tests/gfx1103-lds-tail-snop-repro.sh`: focused cross-system pass/fail
@@ -2409,6 +2412,14 @@ tail-noop checks in one run.
   delta is placement of the recurrent scalar padding at the loop tail/backedge,
   after the final barrier/gl0 invalidation and before the branch, not total
   instruction count, register pressure, or LDS footprint.
+- The same comparison can now be regenerated without launching the repro:
+
+```bash
+scripts/lds_gemm_isa_compare.sh /tmp/hipfire-lds-gemm-isa-compare
+```
+
+The helper writes `isa-summary.tsv` plus per-symbol ISA and key-op extracts,
+with `SYMBOLS="..."` available for later single-symbol comparisons.
 - A sequential K-limit sweep in
   `/tmp/hipfire-lds-tail-snop-klimit-runs/` shows the tail-noop trigger is
   concentrated near the top of the K loop. The initial concurrent
