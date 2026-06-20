@@ -119,3 +119,7 @@ flake.lock
 
 # Local-only scratchpad of jobs deferred to idle/quiet-box time (per-machine).
 NIGHT-WORK.md
+
+# transient / vendored — never commit
+node_modules/
+.smallcode/

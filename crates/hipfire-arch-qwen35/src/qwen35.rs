@@ -2695,6 +2695,52 @@ fn load_weight_tensor_raw(
             }
         },
         16 => load_bf16_matrix_weight(gpu, data, m, k),
+        32 => {
+            // Opus Quant W4A4 (OQ4G256). On-disk: [f16 scale][128 nibbles] per
+            // 256-group, row-contiguous (codec `quantize_oq4g256`). Repack to the
+            // kernel layout in ONE buffer — packed nibbles [M,K/2] followed by
+            // per-group f32 scales [M,K/256] — so the forward derives the
+            // weight-scale pointer via `GpuTensor::sub_offset(M*K/2, ..)` and feeds
+            // the existing `gemm_oq4_grouped_wmma` with no extra WeightTensor field.
+            // Activations are quantized to int4 at runtime (`quantize_act_oq4`);
+            // weights are already FWHT-rotated offline, so the forward FWHT-rotates
+            // x to match (shared mq_rotate_x path). AWQ smooth, when present, is
+            // applied to x by the wrapper via the awq_scale sidecar.
+            const GROUP: usize = 256;
+            const BLOCK: usize = 130; // 2 (f16 scale) + 128 nibbles
+            assert_eq!(k % GROUP, 0, "OQ4G256 requires K % 256 == 0 (got K={k})");
+            let ng = k / GROUP;
+            let packed_bytes = m * (k / 2);
+            let scales_bytes = m * ng * 4;
+            let expect = m * ng * BLOCK;
+            assert_eq!(
+                data.len(),
+                expect,
+                "OQ4G256 weight byte length {} != M*ng*130 = {expect} (M={m} K={k})",
+                data.len()
+            );
+            let mut combined = vec![0u8; packed_bytes + scales_bytes];
+            for r in 0..m {
+                for g in 0..ng {
+                    let src = (r * ng + g) * BLOCK;
+                    let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+                    let dst = r * (k / 2) + g * (GROUP / 2);
+                    combined[dst..dst + 128].copy_from_slice(&data[src + 2..src + BLOCK]);
+                    let so = packed_bytes + (r * ng + g) * 4;
+                    combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
+                }
+            }
+            let buf = gpu.upload_raw(&combined, &[combined.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::Oq4G256,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         _ => panic!("unsupported quant_type {} for qwen35 weight", quant_type),
     }
 }

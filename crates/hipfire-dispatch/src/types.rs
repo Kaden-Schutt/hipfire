@@ -676,6 +676,8 @@ impl KernelKey {
             Qtip3G256 => ArchPredicate::Always,
             MQ6G256 | HFQ6G256 => ArchPredicate::HasMmq,
             MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWmma,
+            // Opus Quant W4A4 — int4 activations + int4 weights via iu4 WMMA.
+            Oq4G256 => ArchPredicate::HasWmma,
             Q8HFQ | Raw => ArchPredicate::Always,
         }
     }

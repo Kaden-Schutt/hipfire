@@ -247,6 +247,12 @@ pub enum DType {
     // Weights are standard HFQ4G128 (72 bytes/group); the ParoQuant distinction
     // is that weight_gemv applies Givens rotation to activations before GEMV.
     // Rotation metadata (pairs, theta, channel_scales) lives on WeightTensor::paro.
+    Oq4G256, // Opus Quant W4A4: symmetric signed-INT4, FWHT-rotated, per-group f32 scale.
+    // On-disk storage is [f16 scale][128 nibbles]/256-group (130 B/group, codec
+    // `quantize_oq4g256`). The loader repacks to the kernel layout: packed nibbles
+    // [M,K/2] followed by per-group f32 scales [M,K/256] in one buffer. The forward
+    // quantizes activations to int4 at runtime (`quantize_act_oq4`) and dispatches
+    // `gemm_oq4_grouped_wmma` — the only W4A4 (int4-activation) path in the engine.
     Raw, // raw bytes, no element interpretation
 }
 
@@ -281,6 +287,7 @@ impl DType {
             | DType::HFP4G32
             | DType::MFP4G32
             | DType::ParoQ4G128
+            | DType::Oq4G256
             | DType::Raw => 1, // byte-level
         }
     }
@@ -349,6 +356,10 @@ impl DType {
                 | DType::MQ2G256
                 | DType::MQ3G256Lloyd
                 | DType::MQ2G256Lloyd
+                // Opus Quant W4A4: SmoothQuant migrates a per-channel scale into the
+                // weight offline (W·s); the forward divides x by the awq_scale
+                // sidecar before FWHT+int4-quantize, completing (W·s)·(x/s) = W·x.
+                | DType::Oq4G256
         )
     }
 }
