@@ -2327,16 +2327,27 @@ control):
 
 - The standalone matrix runner now includes the scalar-control probes needed
   for cross-machine 780M testing:
+  - `tile6_lds_snop_noextra_load4_consume4_pinned`
   - `tile6_lds_counter_noextra_load4_consume4_pinned`
   - `tile6_lds_counter_mask_noextra_load4_consume4_pinned`
 - Baseline cross-check command:
 
 ```bash
-VARIANT=tile6_lds_counter_noextra_load4_consume4_pinned \
+VARIANT=tile6_lds_snop_noextra_load4_consume4_pinned \
 MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 \
 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-scalar-control-runs
 ```
 
+- A tighter throwaway control in `/tmp/hipfire-lds-scalar-nop-runs/` shows
+  `tile6_lds_snop_noextra_load4_consume4_pinned` passed one-launch smoke and
+  failed under the 100-launch full-shape run at `sync 98` with HIP `719`.
+  The object metadata stayed at `group_segment_fixed_size=144`,
+  `sgpr_count=5`, `vgpr_count=10`, `wavefront_size=32`, and no private
+  segment. The ISA delta from the pass-side no-extra shape is one recurrent
+  `s_nop 0` before the first LDS store in each K iteration. A follow-up
+  `tile6_lds_store_then_load_dynamiccols_load4_noextra_consume4_pinned`
+  100-launch recovery run passed, so this split is not explained by device
+  wedging alone.
 - On the first 780M system, the counter-only variant passed one-launch smoke
   and failed under the 100-launch full-shape run at `sync 98` with HIP `719`.
   The object metadata stayed at `group_segment_fixed_size=144`,
@@ -2344,10 +2355,12 @@ scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-scalar-control-runs
   segment. The ISA delta from the pass-side no-extra shape is a loop-carried
   scalar increment (`s_add_i32`) and sink, with no extra LDS operation and no
   extra branch beyond the normal K-loop branch.
-- This sharpens the current suspect: in the second-store/four-waited-row-load
-  loop, a recurrent per-K scalar/control perturbation is enough to move the
-  pass-side no-extra shape into the faulting class under full-K repeated-launch
-  stress. It does not require an extra recurrent barrier.
+- This sharpens the current suspect further: in the
+  second-store/four-waited-row-load loop, a single recurrent scalar no-op is
+  enough to move the pass-side no-extra shape into the faulting class under
+  full-K repeated-launch stress. It does not require an extra recurrent
+  barrier, loop-carried scalar data dependency, extra LDS operation, register
+  pressure change, spill, or different LDS allocation size.
 
 Compare pass/fail boundary for:
 
