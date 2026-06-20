@@ -3673,6 +3673,14 @@ pub const GEMM_F16_X_F16_WMMA_SRC: &str =
 pub const GEMM_BF16_X_BF16_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_bf16_x_bf16_wmma.hip");
 
+/// Generic kernel library: WMMA BF16 × BF16 → BF16 GEMM, (B, M) output.
+/// gfx1103 (RDNA3 UMA) wave32, register-tiled, zero LDS. Lossy bf16-precision
+/// accumulation (uses the 16-bit-output WMMA). See
+/// `kernels/src/gemm_bf16_bf16_wmma.hip` and
+/// `docs/kernels/generic-kernel-library.md`.
+pub const GEMM_BF16_BF16_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bf16_bf16_wmma.hip");
+
 /// Bulk F32→F16 conversion for staging WMMA activations. Named
 /// `deepseek4_convert_f32_to_f16` to avoid collision with the embedded
 /// `convert_f32_to_f16` helper in `GEMM_HFQ4G256_RESIDUAL_FP16_SRC`

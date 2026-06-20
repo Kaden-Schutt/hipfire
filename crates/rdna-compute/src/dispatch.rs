@@ -2276,6 +2276,16 @@ impl Gpu {
         Ok(data)
     }
 
+    /// Download `n_bytes` of raw device memory to host bytes. Dtype-agnostic;
+    /// used by the generic-kernel-library tests to read back BF16/F16/I32
+    /// outputs without a dedicated typed helper.
+    pub fn download_raw(&self, tensor: &GpuTensor, n_bytes: usize) -> HipResult<Vec<u8>> {
+        self.bind_thread()?;
+        let mut data = vec![0u8; n_bytes];
+        self.hip.memcpy_dtoh(&mut data, &tensor.buf)?;
+        Ok(data)
+    }
+
     pub fn zeros(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
         self.bind_thread()?;
         let tensor = self.alloc_tensor(shape, dtype)?;
@@ -44675,6 +44685,57 @@ impl Gpu {
     /// (B, M) output layout. `a_bf16` is raw BF16 row-major [M, K].
     /// `x_f32` is staged through the cached BF16 scratch once per source
     /// pointer, then consumed by the RDNA wave32 BF16 WMMA kernel.
+    /// Generic kernel library: WMMA GEMM, BF16 inputs → BF16 output.
+    /// `a_bf16` [M,K], `x_bf16` [B,K], `y_bf16` [B,M], all raw BF16 (u16)
+    /// payloads. gfx1103/RDNA3 wave32, zero LDS. Accumulation is in bf16
+    /// precision (16-bit-output WMMA), so this trades accuracy for a bf16
+    /// output; use the `→F32` sibling when long-K accuracy matters.
+    /// Requires `k % 16 == 0` and wave32 WMMA.
+    pub fn gemm_bf16_bf16_wmma(
+        &mut self,
+        a_bf16: &GpuTensor,
+        x_bf16: &GpuTensor,
+        y_bf16: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(k % 16, 0, "gemm_bf16_bf16_wmma: K must be a multiple of 16");
+        self.ensure_kernel(
+            "gemm_bf16_bf16_wmma",
+            kernels::GEMM_BF16_BF16_WMMA_SRC,
+            "gemm_bf16_bf16_wmma",
+        )?;
+        let ap = a_bf16.buf.as_ptr();
+        let xp = x_bf16.buf.as_ptr();
+        let yp = y_bf16.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+        ];
+        let grid_m = ((m + 15) / 16) as u32;
+        let grid_b = ((batch_size + 15) / 16) as u32;
+        let func = &self.functions["gemm_bf16_bf16_wmma"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_m, grid_b, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     pub fn gemm_bf16_x_bf16_wmma(
         &mut self,
         a_bf16: &GpuTensor,

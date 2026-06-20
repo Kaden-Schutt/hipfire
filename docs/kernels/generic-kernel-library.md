@@ -44,8 +44,8 @@ GEMM (existing kernels accumulate-and-store **F32**):
 |------------|----------|------------------------|
 | `f16→f32`  | ✅ exists | `gemm_f16_wmma` (Wf16×Xf32), `gemm_f16_x_f16_wmma` (Wf16×Xf16→F32) |
 | `bf16→f32` | ✅ exists | `gemm_bf16_x_bf16_wmma` (named bf16×bf16 but **stores F32**) + `_gfx1151_m128` LDS large-M variant |
-| `f16→f16`  | ❌ missing| need `wmma_f16_16x16x16_f16` + u16 store epilogue |
-| `bf16→bf16`| ❌ missing| need `wmma_bf16_16x16x16_bf16` |
+| `f16→f16`  | ❌ missing| f32-accumulate (`wmma_f32_…_f16`) + bf16/f16-round store — see lesson below |
+| `bf16→bf16`| ✅ done   | `gemm_bf16_bf16_wmma` (no-LDS, F32 accum + bf16 store); parity test `examples/parity_gemm_bf16_bf16_wmma.rs`, validated on gfx1103 |
 | `iu8→i32`  | ❌ missing| only synthetic probe `bench_iu8_wmma_gfx1151` |
 | `iu4→i32`  | ⚠️ partial| `gemm_s4s4_wmma_tile_gfx1151` (signed-only, gfx1151-tagged) — generalize + test |
 
@@ -82,6 +82,18 @@ open-coding this at every call site.
 Each kernel source carries both bodies behind arch macros (the JIT compiles
 per `self.arch` via `compiler.compile`), or ships a `.gfx1151.hip` sibling
 selected in Rust — mirror whichever the neighbouring kernels already use.
+
+### Lesson: 16-bit-output WMMA does NOT chain (use F32 accumulate)
+
+For `bf16→bf16` and `f16→f16`, do **not** accumulate with the 16-bit-output
+WMMA (`v_wmma_bf16_16x16x16_bf16` / `…_f16_…_f16`) across K-tiles. Re-feeding
+the packed 16-bit `C` accumulator does not line up with the even-slot `D`
+write, so for K>16 the chain silently drops magnitude (measured: gpu −4.09 vs
+ref −6.5 at K=512; single-tile K=16 was exact). Instead accumulate in **F32**
+via `v_wmma_f32_16x16x16_{bf16,f16}` and round to 16-bit only on store. This is
+more accurate AND robust; "→bf16/→f16" denotes the output dtype, not the
+accumulation precision. `gemm_bf16_bf16_wmma` does exactly this; `f16→f16` will
+follow the same shape.
 
 ## Dispatch / wiring pattern (per kernel)
 
