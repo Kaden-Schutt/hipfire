@@ -1898,6 +1898,22 @@ Latest artifact paths:
   sync/global 379 with the same signature, so treat those pass-side rows as
   clean-sequence evidence and continue bracketing any late-session result with
   a recovery control.
+- Child-process split control
+  (`/tmp/hipfire-lds-direct-ab-promoted-split-artifacts/`, throwaway worktree
+  `/tmp/hipfire-lds-direct-ab-split-current`, commit `f4d8e3e5`) confirms that
+  the shifted row fault still has a process-local cumulative-launch component.
+  Active `30x1` start=3 in `34x1` READS=2, 448 iters, 512x86 passed the same
+  total `500` launches when split as four child processes
+  `120,120,120,140`. A one-child `500` repeat in the same artifact root failed
+  at sync/global 179 with the canonical direct-AB GFXHUB/GDS signature. The
+  split and one-child rows have the same selected normalized ISA hash
+  (`bb1a56b38225028e`), `group_segment=280`, `private_segment=0`, `sgpr=5`,
+  `vgpr=8`, `wavefront=32`, `s_barrier=8`, DS=12, `s_waitcnt=12`,
+  `s_cbranch=9`, `offset1=36`, and `ds_load_b32 ... offset:12`. This separates
+  the per-kernel codegen/shape trigger from the accumulating per-child process
+  state: the high-end shifted row shape is fail-capable, but staying below the
+  per-child launch threshold avoids the fault for at least this 500-total
+  envelope.
 
 ## Current Narrowing
 
@@ -2726,6 +2742,7 @@ LDS-only control:
 | direct-AB active `1x32` in `1x34` block/layout, reads=2, forced compare/cndmask wrap, 448 iters, 512x86 | PASS one-child `500`; normal `% 32`/`v_and 31` codegen FAILS at sync/global 64 | `_Z25lds_direct_ab_phase_probev` | 280 B | 9 | 6 | 0 | 32 |
 | direct-AB promoted-source shifted active `31x1` in `34x1` block/layout, reads=2, 448 iters, 512x86 | start=0/1 PASS one-child `500`; start=2 FAIL at sync/global 374; start=3 FAIL at sync/global 179; all use DS=12 and failing rows keep the canonical gfxhub/GDS signature | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5-6 | 0 | 32 |
 | direct-AB promoted-source shifted active `30x1` in `34x1` block/layout, reads=2, 448 iters, 512x86 | start=2 PASS one-child `500`; start=3 FAIL at sync/global 179; start=4 FAIL at sync/global 375; all use DS=12 and failing rows keep the canonical gfxhub/GDS signature | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
+| direct-AB promoted-source shifted active `30x1` start=3 in `34x1`, reads=2, 448 iters, 512x86 | same total `500` launches PASS when split across child processes `120,120,120,140`; one-child `500` repeat FAILS at sync/global 179 with identical selected ISA/resource tuple | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB promoted-source shifted active `29x1` in `34x1` block/layout, reads=2, 448 iters, 512x86 | start=3/4 initially PASS one-child `500`; start=5 FAIL at sync/global 374; post-failure recovery rerun of start=4 FAILS at 379; all use DS=12 and failing rows keep the canonical gfxhub/GDS signature | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB promoted-source shifted active `28x1` in `34x1` block/layout, reads=2, 448 iters, 512x86 | start=6 FAIL at sync/global 177 with canonical gfxhub/GDS signature | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB multi-exec `17x2`/`2x17` block/layout, reads=2, 448 iters, 512x86 | `17x2`: FAIL one-child `130` at sync/global 32; `2x17`: FAIL one-child `130` at sync/global 35 | `_Z25lds_direct_ab_phase_probev` | 280 B | 24 | 2 | 0 | 32 |
