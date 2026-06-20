@@ -150,7 +150,12 @@ impl ServingBackend for Gemma3Backend {
         tok: &Tokenizer,
         ctx: &mut GenerateCtx,
     ) -> Result<ServeOutcome, String> {
-        let eos = self.config.eos_token_id;
+        // gemma3 ends a chat turn with `<end_of_turn>`, which differs from
+        // `config.eos_token_id` (`<eos>`). Stop on it so generation halts at the
+        // turn boundary instead of leaking `<end_of_turn>` and running on.
+        let eos = tok
+            .special_token_id("<end_of_turn>")
+            .unwrap_or(self.config.eos_token_id);
         run_simple_ar(gpu, self, tok, eos, ctx)
     }
 

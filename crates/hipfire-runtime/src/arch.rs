@@ -534,7 +534,12 @@ pub fn decode_loop(
     let mut stop = StopReason::MaxTokens;
 
     while generated < ctx.max_tokens {
-        if next == eos {
+        // Stop on the explicit eos AND any tokenizer terminator (eos OR the
+        // end-of-turn token). gemma3's chat terminator is `<end_of_turn>`, which
+        // differs from `config.eos_token_id` (`<eos>`) — without the
+        // `is_terminator` check it would leak as literal text and the model would
+        // keep generating past the turn boundary.
+        if next == eos || tok.is_terminator(next) {
             stop = StopReason::Eos;
             break;
         }

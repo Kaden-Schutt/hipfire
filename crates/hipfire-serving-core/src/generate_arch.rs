@@ -20,6 +20,7 @@ use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_prompt as prompt_frame;
+use hipfire_runtime::arch::{GenerateCtx, ServingBackend};
 
 use crate::events::{emit_committed_event, emit_error_with_id, emit_stream_event};
 use crate::model::{effective_raw, LoadedModel};
@@ -1755,4 +1756,75 @@ pub fn generate_lfm2moe(
         id, generated_count, tok_s, prefill_ms, total_ms,
     );
     let _ = stdout.flush();
+}
+
+/// Gemma3 text (arch_id=12, e.g. medgemma-*-text) generate path.
+///
+/// Frames the gemma chat prompt (bos + user turn + model turn; `<bos>` /
+/// `<start_of_turn>` / `<end_of_turn>` are registered specials that round-trip
+/// through `tok.encode`, so the framed text reproduces the gemma chat template)
+/// and runs the shared `ServingBackend::serve` seam — `run_simple_ar` →
+/// tokenize → prefill (`forward_step`) → `decode_loop`. Greedy; `repeat_penalty`
+/// is honored by `decode_loop`. No vision, tools, or think-budget on this path.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_gemma3(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+) {
+    let mut framed = String::from("<bos><start_of_turn>user\n");
+    if let Some(sys) = system_prompt.filter(|s| !s.is_empty()) {
+        // gemma3 has no system role — HF folds system content into the user turn.
+        framed.push_str(sys);
+        framed.push_str("\n\n");
+    }
+    framed.push_str(prompt);
+    framed.push_str("<end_of_turn>\n<start_of_turn>model\n");
+
+    if m.tokenizer.is_none() {
+        emit_error_with_id(stdout, id, "tokenizer not loaded".to_string());
+        return;
+    }
+    if m.gemma3_text.is_none() {
+        emit_error_with_id(
+            stdout,
+            id,
+            "gemma3 backend not loaded (arch 12 not active)".to_string(),
+        );
+        return;
+    }
+    // Disjoint field borrows: tokenizer (shared) + backend (mut).
+    let tok = m.tokenizer.as_ref().unwrap();
+    let backend = m.gemma3_text.as_mut().unwrap();
+
+    let no_images: [&[u8]; 0] = [];
+    let mut ctx = GenerateCtx {
+        id,
+        prompt: &framed,
+        temperature: temp,
+        top_p,
+        max_tokens,
+        repeat_penalty,
+        repeat_window,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        max_think_tokens: 0,
+        stop_sequences: &[],
+        images: &no_images,
+        sink: stdout,
+    };
+    let result = backend.serve(gpu, tok, &mut ctx);
+    // `ctx` mutably borrows `stdout`; drop before reusing it for errors.
+    drop(ctx);
+    if let Err(e) = result {
+        emit_error_with_id(stdout, id, format!("gemma3 serve: {e}"));
+    }
 }

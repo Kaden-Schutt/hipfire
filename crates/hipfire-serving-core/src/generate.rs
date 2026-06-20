@@ -36,7 +36,7 @@ use crate::evidence::{
 };
 #[cfg(feature = "arch-lfm2moe")]
 use crate::generate_arch::generate_lfm2moe;
-use crate::generate_arch::{generate_deepseek4, generate_minimax, generate_qwen2};
+use crate::generate_arch::{generate_deepseek4, generate_gemma3, generate_minimax, generate_qwen2};
 use crate::model::{effective_raw, LoadedModel};
 use crate::output_filter::chat_output_filter;
 use crate::output_filter::{chat_output_filter_from_profile, loop_guard_from_runtime_config};
@@ -1878,6 +1878,36 @@ pub fn generate(
             prefill_already_done,
         );
         generate_qwen2(
+            m,
+            gpu,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            temp,
+            top_p,
+            max_tokens,
+            repeat_penalty,
+            repeat_window,
+        );
+        return;
+    }
+    if m.arch_id == 12 {
+        // arch_id=12 (gemma3 text, e.g. medgemma-*-text). Plain dense-AR via the
+        // `ServingBackend::serve` seam — same short-circuit shape as qwen2 above.
+        // PFlash / DFlash / VL / multi-GPU / tools / think-budget all bypass.
+        let _ = (
+            budget_alert_at_tok,
+            budget_alert_text,
+            max_think_tokens,
+            assistant_prefix,
+            pflash_state,
+            pflash_cfg,
+            tools,
+            messages_history,
+            prefill_already_done,
+        );
+        generate_gemma3(
             m,
             gpu,
             stdout,

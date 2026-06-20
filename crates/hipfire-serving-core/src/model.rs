@@ -14,6 +14,7 @@
 use hip_bridge::HipResult;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
+use hipfire_arch_gemma3::Gemma3Backend;
 use hipfire_arch_gemma3_vl::Gemma3VlBackend;
 #[cfg(feature = "arch-lfm2moe")]
 use hipfire_arch_lfm2moe as lfm2moe;
@@ -282,6 +283,10 @@ pub struct LoadedModel {
     // `has_vl` gate keys off `gemma3_vl.is_some()` for arch 13 (rather than the
     // qwen35-typed `vision_config`). None on every other arch path.
     pub gemma3_vl: Option<Gemma3VlBackend>,
+    // Gemma3 text (medgemma-*-text, arch_id=12). The splice-free text decoder
+    // behind the same `ServingBackend::serve` seam (delegates to `run_simple_ar`);
+    // its KV/decode state lives inside `Gemma3Backend`. None on every other arch.
+    pub gemma3_text: Option<Gemma3Backend>,
     // Shared
     pub tokenizer: Option<hipfire_model::tokenizer::Tokenizer>,
     // Multi-turn conversation state

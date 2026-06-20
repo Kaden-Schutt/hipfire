@@ -2707,6 +2707,7 @@ fn main() {
                             9 => "deepseek4",
                             10 => "minimax_m2",
                             11 => "lfm2moe",
+                            12 => "gemma3",
                             13 => "gemma3_vl",
                             _ => "qwen3",
                         };
@@ -2718,6 +2719,12 @@ fn main() {
                                 b.text_cfg.hidden_size,
                                 b.text_cfg.num_hidden_layers,
                                 b.text_cfg.vocab_size,
+                            )
+                        } else if let Some(ref b) = m.gemma3_text {
+                            (
+                                b.config.hidden_size,
+                                b.config.num_hidden_layers,
+                                b.config.vocab_size,
                             )
                         } else if let Some(ref c) = m.q35_config {
                             (c.dim, c.n_layers, c.vocab_size)

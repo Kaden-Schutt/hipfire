@@ -89,7 +89,9 @@ impl Gemma3VlBackend {
         img_embeds: &[f32],
         n_images: usize,
     ) -> Result<ServeOutcome, String> {
-        let eos = self.text_cfg.eos_token_id;
+        let eos = tok
+            .special_token_id("<end_of_turn>")
+            .unwrap_or(self.text_cfg.eos_token_id);
         let ids = tok.encode(ctx.prompt);
         if ids.is_empty() {
             return Err("gemma3-vl serve: empty prompt after tokenize".to_string());
@@ -240,7 +242,9 @@ impl ServingBackend for Gemma3VlBackend {
         tok: &Tokenizer,
         ctx: &mut GenerateCtx,
     ) -> Result<ServeOutcome, String> {
-        let eos = self.text_cfg.eos_token_id;
+        let eos = tok
+            .special_token_id("<end_of_turn>")
+            .unwrap_or(self.text_cfg.eos_token_id);
         let ids = tok.encode(ctx.prompt);
         if ids.is_empty() {
             return Err("gemma3-vl serve: empty prompt after tokenize".to_string());
