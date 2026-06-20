@@ -620,6 +620,71 @@ pub(crate) fn quantize_mq8g256_clipsearch(f32_data: &[f32], signs1: &[f32], sign
     output
 }
 
+/// Opus Quant foundation codec: **symmetric signed-INT4**, FWHT-rotated, with
+/// clip-searched per-group scale. Per 256-group block = `[f16 scale][128 bytes]`
+/// = 130 B/group (4.0625 b/w). Nibbles are signed two's-complement, packed
+/// `byte = k_even | (k_odd<<4)` — the SAME convention `gemm_iu4_i32_wmma` /
+/// `gemv_iu4_i32` consume — so this format feeds the fused-iu4 path (Opus Quant
+/// W4A4) directly, and the int8-activation variant (Opus-A8) by upcasting the
+/// signed nibbles to int8 for the iu8 path. Dequant: `scale · sext4(nibble)`.
+pub(crate) fn quantize_oq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    let (group_size, block_bytes) = (256usize, 130usize); // 2 (f16 scale) + 128 nibbles
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let mut group = [0.0f32; 256];
+        group[..end - start].copy_from_slice(&f32_data[start..end]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        // Symmetric clip-searched scale; q in [-7, 7] (signed 4-bit, avoid -8 to
+        // keep magnitude symmetric, matching the iu4 GEMM's signed range use).
+        let scale = symmetric_clipsearch(&group, 7.0);
+        let inv = 1.0 / scale;
+        let out_off = b * block_bytes;
+        let scale_f16 = f32_to_f16(scale);
+        output[out_off] = (scale_f16 & 0xFF) as u8;
+        output[out_off + 1] = (scale_f16 >> 8) as u8;
+        for i in 0..128 {
+            let q_lo = (group[2 * i] * inv).round().clamp(-7.0, 7.0) as i8;
+            let q_hi = (group[2 * i + 1] * inv).round().clamp(-7.0, 7.0) as i8;
+            output[out_off + 2 + i] = ((q_lo as u8) & 0xf) | (((q_hi as u8) & 0xf) << 4);
+        }
+    }
+    output
+}
+
+/// Dequantize OQ4G256 (round-trip oracle for the Opus codec / tests).
+/// `[f16 scale][128 signed nibbles]` per 256-group → `scale·sext4`, inverse FWHT.
+pub(crate) fn dequant_oq4g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
+    let (group_size, block_bytes) = (256usize, 130usize);
+    let n_blocks = n.div_ceil(group_size);
+    let mut out = Vec::with_capacity(n_blocks * group_size);
+    let sext4 = |nib: u8| -> f32 {
+        let v = (nib & 0xf) as i8;
+        (if v > 7 { v - 16 } else { v }) as f32
+    };
+    for b in 0..n_blocks {
+        let off = b * block_bytes;
+        if off + block_bytes > data.len() {
+            break;
+        }
+        let scale = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        let mut grp = [0.0f32; 256];
+        for i in 0..128 {
+            let byte = data[off + 2 + i];
+            grp[2 * i] = scale * sext4(byte & 0xf);
+            grp[2 * i + 1] = scale * sext4(byte >> 4);
+        }
+        // inverse FWHT (forward with signs swapped)
+        cpu_fwht_256(&mut grp, signs2, signs1);
+        out.extend_from_slice(&grp);
+    }
+    out.truncate(n);
+    out
+}
+
 /// Dequantize MQ4G256 packed bytes back to f32, EXACTLY mirroring the GEMV
 /// kernel (and `quant_quality_mse`'s reference): per 136-byte group read scale+min
 /// (f32), expand 128 nibble bytes to 256 values `min + scale*q` (lo=2i, hi=2i+1),

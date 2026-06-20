@@ -11777,6 +11777,7 @@ mod codec_golden {
         h("mq3g256_clipsearch", &quantize_mq3g256_clipsearch(&x, &s1, &s2));
         h("mq2g256_clipsearch", &quantize_mq2g256_clipsearch(&x, &s1, &s2));
         h("mq8g256_clipsearch", &quantize_mq8g256_clipsearch(&x, &s1, &s2));
+        h("oq4g256", &quantize_oq4g256(&x, &s1, &s2));
         h("mq6g256", &quantize_mq6g256(&x, &s1, &s2));
         h("mq8g256", &quantize_mq8g256(&x, &s1, &s2));
         h("mq3g256", &quantize_mq3g256(&x, &s1, &s2));
@@ -11821,6 +11822,7 @@ mod codec_golden {
         ("mq3g256_clipsearch", "a57eada9ebb78586"),
         ("mq2g256_clipsearch", "a95cdd8e7672e915"),
         ("mq8g256_clipsearch", "8987f0aa7fdfb487"),
+        ("oq4g256", "fceec61d1cb735b3"),
         ("mq6g256", "c43cbf518aae87fe"),
         ("mq8g256", "8987f0aa7fdfb487"),
         ("mq3g256", "0c2f928a4236cf57"),
@@ -11878,6 +11880,26 @@ mod codec_golden {
         let (mp, mc) = (mse(&plain), mse(&clip));
         assert!(mc <= mp * 1.0001, "clip-search MSE {mc:.3e} worse than plain {mp:.3e}");
         eprintln!("mq4 plain MSE={mp:.4e}  clipsearch MSE={mc:.4e}  ({:.1}% lower)", 100.0 * (mp - mc) / mp);
+    }
+
+    /// Opus OQ4 (symmetric signed-int4) must round-trip with quality comparable
+    /// to affine MQ4 on FWHT-rotated weights (E6: affine vs symmetric is a wash).
+    #[test]
+    fn oq4_roundtrip_comparable_to_mq4() {
+        let x = det_input(1024, 5);
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let mq4 = dequant_mq4g256(&quantize_mq4g256(&x, &s1, &s2), x.len(), &s1, &s2);
+        let oq4 = dequant_oq4g256(&quantize_oq4g256(&x, &s1, &s2), x.len(), &s1, &s2);
+        let sqnr = |rec: &[f32]| -> f64 {
+            let (mut sig, mut noise) = (0.0f64, 0.0f64);
+            for (&a, &b) in x.iter().zip(rec) { sig += (a as f64).powi(2); noise += ((a-b) as f64).powi(2); }
+            10.0 * (sig / noise.max(1e-30)).log10()
+        };
+        let (m, o) = (sqnr(&mq4), sqnr(&oq4));
+        eprintln!("mq4 SQNR={m:.2} dB  oq4 SQNR={o:.2} dB");
+        assert!(o > 8.0, "oq4 SQNR {o:.2} dB too low (broken codec?)");
+        assert!(o > m - 3.0, "oq4 {o:.2} dB >3 dB worse than mq4 {m:.2} dB");
     }
 
     /// FWHT must be exactly invertible (forward then inverse = identity).
