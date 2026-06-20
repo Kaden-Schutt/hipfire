@@ -1757,6 +1757,14 @@ Latest artifact paths:
   last 34-lane orientation escape hatch: the 33-lane column extreme `1x33`
   can survive to one-child `500`, but adding one more active lane makes the
   same orientation fail early.
+- 34-lane READS=1 extreme controls
+  (`/tmp/hipfire-lds-direct-ab-34extreme-r1-artifacts/`, same throwaway
+  worktree) failed too: both `34x1` and `1x34` one-child `500` failed at
+  sync/global 51 with the canonical coredump signature. They use
+  `group_segment=280`, `vgpr=22`, `sgpr=2`, `s_barrier=16`, DS=24,
+  `s_waitcnt=16`, and `offset1=36`. This is the first direct-AB READS=1 fail
+  at the current edge and shows the 34-lane extreme shape crosses a harsher
+  boundary than the `9x4`, `11x3`, and `3x11` READS=1 passes.
 
 ## Current Narrowing
 
@@ -2551,6 +2559,7 @@ LDS-only control:
 | direct-AB multi-exec `32x1`/`1x32` block/layout, reads=2, 448 iters, 512x86 | PASS at one-child `500` for both one-wave extreme orientations | `_Z25lds_direct_ab_phase_probev` | 256 B | 28 | 2 | 0 | 32 |
 | direct-AB multi-exec `33x1`/`1x33` block/layout, reads=2, 448 iters, 512x86 | `33x1`: FAIL one-child `130` at sync/global 41; `1x33`: PASS one-child `130`/`140`, FAIL one-child `500` at sync/global 359 | `_Z25lds_direct_ab_phase_probev` | 276 B | 28 | 2 | 0 | 32 |
 | direct-AB multi-exec `34x1`/`1x34` block/layout, reads=2, 448 iters, 512x86 | FAIL one-child `130` at sync/global 40 for both extreme orientations | `_Z25lds_direct_ab_phase_probev` | 280 B | 28 | 2 | 0 | 32 |
+| direct-AB multi-exec `34x1`/`1x34` block/layout, reads=1, 448 iters, 512x86 | FAIL one-child `500` at sync/global 51 for both extreme orientations | `_Z25lds_direct_ab_phase_probev` | 280 B | 22 | 2 | 0 | 32 |
 | direct-AB multi-exec `17x2`/`2x17` block/layout, reads=2, 448 iters, 512x86 | `17x2`: FAIL one-child `130` at sync/global 32; `2x17`: FAIL one-child `130` at sync/global 35 | `_Z25lds_direct_ab_phase_probev` | 280 B | 24 | 2 | 0 | 32 |
 | direct-AB pre-sync diagnostic `11x3`/`3x11` block/layout, reads=2, 448 iters, 512x86 | `PRE_SYNC_EACH_LAUNCH=1`: `11x3` one-child `133` PASS; `3x11` one-child `134` FAIL at sync/global 133 | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
 | direct-AB throwaway host-sleep diagnostic `11x3` block/layout, reads=2, 448 iters, 512x86 | local-only `PRE_LAUNCH_SLEEP_US=1000`: one-child `133` FAIL at sync/global 73 | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
