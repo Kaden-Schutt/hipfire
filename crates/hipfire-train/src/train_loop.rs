@@ -180,6 +180,13 @@ pub fn train_ssm_drafter_loop(
             free_ssm_drafter_grads(gpu, grads)?;
             gpu.free_tensor(dscores)?;
         }
+        // Live heartbeat on stderr (unbuffered) — a per-epoch signal between the
+        // (every-`eval_every`) eval prints, so long runs are never silent/blind.
+        {
+            use std::io::Write;
+            eprint!("\r  [train] ep {:>4}/{}  loss {:.4}   ", ep + 1, cfg.epochs, ep_loss / n_train as f32);
+            let _ = std::io::stderr().flush();
+        }
         if ep % cfg.eval_every == 0 || ep == cfg.epochs - 1 {
             let corr = eval_ssm_drafter(gpu, drafter, chunks, label_mid, cfg);
             final_eval = corr;

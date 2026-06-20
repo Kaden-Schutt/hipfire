@@ -150,10 +150,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &base_shallow,
         &cfg,
         |ep, train_loss, corr, best, best_ep, train_corr| {
-            if ep % 30 == 0 || ep == cfg.epochs - 1 {
-                let tc = train_corr.map(|t| format!("  train_ρ {t:+.3}")).unwrap_or_default();
-                println!("  ep {ep:>3}  train_loss {train_loss:.4}  eval {corr:+.3}{tc}  (best {best:+.3} @ ep {best_ep})");
-            }
+            // Print EVERY eval epoch and FLUSH — block-buffering when piped left
+            // prior runs unobservable for hours. Always flush; never gate prints.
+            use std::io::Write;
+            let tc = train_corr.map(|t| format!("  train_ρ {t:+.3}")).unwrap_or_default();
+            println!("  ep {ep:>3}  train_loss {train_loss:.4}  eval {corr:+.3}{tc}  (best {best:+.3} @ ep {best_ep})");
+            let _ = std::io::stdout().flush();
         },
     )?;
 
