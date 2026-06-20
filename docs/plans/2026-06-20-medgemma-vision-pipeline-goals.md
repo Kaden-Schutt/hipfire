@@ -120,7 +120,13 @@ video both stream coherent output; integrates the Goal-1 cache on the hash path.
 
 **Remaining (Goal 4):** the `hipfire-eval` battery row formalizing this as a
 CI-runnable suite (the direct evidence above is recorded; the eval-harness suite
-is the canonical home and is the open Goal-4 item).
+is the canonical home and is the open Goal-4 item). **Starting point:** the
+`Vision` battery is currently a declared-but-empty stub
+(`hipfire-eval/src/driver.rs:569` → `Vec::new()`) and the daemon executor
+(`executor_daemon.rs`) has no `image`/`video` field support. Implementing needs:
+(1) executor image/video request support, (2) medgemma test cases (model + a
+`MRI_BRAIN` fixture + prompt + coherence/non-degeneracy assertion), (3) wiring
+`Vision`-battery prompts. Add a daemon-serve parity guard for arch 13 alongside.
 
 ## Goal 3 — 8-bit variance-normalized KV ("KVarN-8")
 
