@@ -3240,7 +3240,24 @@ pub fn generate(
         let _ = stdout.flush();
         qwen35_restore_or_error(stdout, id, m, gpu, session);
     } else {
-        // Qwen3 / LLaMA path -- multi-turn aware
+        // Qwen3 / LLaMA path -- multi-turn aware. This is the `not qwen35`
+        // fallback, but it's specifically the llama (arch 0/1) state — every
+        // other non-qwen35 arch has a dedicated route above (7/9/10/11/12
+        // short-circuit; 8/13 VL route in the daemon). Guard the llama unwraps
+        // so a future/misrouted arch reaching here gets a clean error instead of
+        // a None-unwrap panic (it must NOT silently run on the llama path).
+        if m.llama_config.is_none() {
+            write_error(
+                stdout,
+                id,
+                &format!(
+                    "generate(): arch_id {} reached the llama fallback with no \
+                     llama state loaded — this arch needs a dedicated generate route",
+                    m.arch_id
+                ),
+            );
+            return;
+        }
         let chat_template_profile = m.chat_template_profile.clone();
         let config = m.llama_config.as_ref().unwrap();
         let weights = m.llama_weights.as_ref().unwrap();

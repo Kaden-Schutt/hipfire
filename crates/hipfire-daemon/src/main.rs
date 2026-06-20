@@ -5012,8 +5012,7 @@ fn main() {
                     {
                         false
                     }
-                } else {
-                    let config = m.llama_config.as_ref().unwrap();
+                } else if let Some(config) = m.llama_config.as_ref() {
                     let weights = m.llama_weights.as_ref().unwrap();
                     let scratch = m.llama_scratch.as_ref().unwrap();
                     let kv = m.llama_kv.as_mut().unwrap();
@@ -5029,6 +5028,12 @@ fn main() {
                         }
                     }
                     ok
+                } else {
+                    // Unhandled arch for this prefill bench (e.g. gemma3 text/VL
+                    // arch 12/13, dots.ocr arch 8): no warm-pass is wired, so skip
+                    // rather than assume the llama path (which would unwrap None
+                    // and panic). Kernels JIT on the first real request.
+                    true
                 };
                 let _ = gpu.hip.device_synchronize();
                 let elapsed = t0.elapsed().as_secs_f64();
