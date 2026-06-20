@@ -136,13 +136,18 @@ Reuse `hipfire-train/src/checkpoint.rs` (`save_drafter`), but:
 
 ## Migration (incremental — each step ships + is verifiable)
 
-1. **Plumbing.** Add `hipfire-train` dep; add a `train_drafter` op that validates
+1. **Plumbing.** ✅ DONE (commit beba0214)
+    Add `hipfire-train` dep; add a `train_drafter` op that validates
    args and returns `"not implemented yet"`. Daemon still builds + passes the
    no-GPU CI subset.
-2. **Lib loop extraction.** Move the epoch loop from `ssm_drafter_train.rs` into
+2. **Lib loop extraction.** ✅ DONE (with step 1)
+    Move the epoch loop from `ssm_drafter_train.rs` into
    `hipfire-train::train_drafter_loop`; the example calls it. No behavior change —
    re-run the shuffled sweep, confirm identical curve.
-3. **Op: file-source training.** `train_drafter` with `labels.source:"file"` loads
+3. **Op: file-source training.** ✅ DONE — verified: op streams train_start/
+   progress/done + checkpoints; bar matches the example exactly, ep0/15 eval within
+   GPU-atomic noise. ONE shared loader (hipfire-train::labels) + train_loop.
+    `train_drafter` with `labels.source:"file"` loads
    the existing JSONL+sidecar and runs `train_drafter_loop`, streaming progress +
    saving a checkpoint. Verify the result matches the standalone example
    (byte-identical drafter checkpoint for a fixed seed).

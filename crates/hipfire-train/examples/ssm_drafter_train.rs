@@ -33,43 +33,6 @@ fn env_f32(k: &str, d: f32) -> f32 {
     std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
 }
 
-/// Daemon `pflash_labels` JSONL + `<path>.embed.bin` (QEMB) sidecar.
-#[allow(clippy::type_complexity)]
-fn load_daemon_labels(
-    gpu: &mut Gpu,
-    jsonl: &str,
-) -> Result<(Vec<Vec<u32>>, Vec<Vec<f32>>, Vec<Vec<f32>>, rdna_compute::GpuTensor, usize, usize), Box<dyn std::error::Error>>
-{
-    let text = std::fs::read_to_string(jsonl)?;
-    let (mut chunks, mut label_mid, mut base_shallow) = (Vec::new(), Vec::new(), Vec::new());
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let v: serde_json::Value = serde_json::from_str(line)?;
-        let arr_u32 = |k: &str| -> Vec<u32> {
-            v[k].as_array().map(|a| a.iter().map(|x| x.as_u64().unwrap_or(0) as u32).collect()).unwrap_or_default()
-        };
-        let arr_f32 = |k: &str| -> Vec<f32> {
-            v[k].as_array().map(|a| a.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect()).unwrap_or_default()
-        };
-        let toks = arr_u32("tokens");
-        assert_eq!(toks.len(), SEQ, "daemon label chunk len {} != SEQ {SEQ}", toks.len());
-        chunks.push(toks);
-        label_mid.push(arr_f32("mid_scores"));
-        base_shallow.push(arr_f32("shallow_scores"));
-    }
-    let bytes = std::fs::read(format!("{jsonl}.embed.bin"))?;
-    if &bytes[0..4] != b"QEMB" {
-        return Err("daemon embed sidecar: bad magic".into());
-    }
-    let vocab = u32::from_le_bytes(bytes[4..8].try_into()?) as usize;
-    let dim = u32::from_le_bytes(bytes[8..12].try_into()?) as usize;
-    let data: Vec<f32> =
-        bytes[12..].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-    assert_eq!(data.len(), vocab * dim, "embed sidecar size mismatch");
-    let embed = gpu.upload_f32(&data, &[vocab, dim])?;
-    println!("daemon labels: {} chunks, embed [{vocab}×{dim}]", chunks.len());
-    Ok((chunks, label_mid, base_shallow, embed, dim, vocab))
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu = Gpu::init().expect("Gpu::init failed");
     let nb = SEQ / BLOCK;
@@ -77,32 +40,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dlpath = std::env::var("HIPFIRE_PFLASH_DAEMON_LABELS")
         .map_err(|_| "set HIPFIRE_PFLASH_DAEMON_LABELS=<jsonl> (real qwen3.5 labels)")?;
     let n_eval = env_usize("HIPFIRE_PFLASH_NEVAL", N_EVAL);
-    let (mut chunks, mut label_mid, mut base_shallow, embed, h_t, vocab) =
-        load_daemon_labels(&mut gpu, &dlpath)?;
-
-    // Deterministic shuffle BEFORE the train/eval split. The corpus is often
-    // content-ordered (docs → crates → kernels), so a tail split would put a
-    // different-domain eval set against the train set — distribution shift that
-    // looks like "training degrades eval". Shuffle → same-distribution disjoint
-    // splits. Seed fixed (HIPFIRE_PFLASH_SHUFFLE_SEED) for reproducibility.
-    {
-        let mut seed = env_usize("HIPFIRE_PFLASH_SHUFFLE_SEED", 0x5EED) as u64;
-        let mut perm: Vec<usize> = (0..chunks.len()).collect();
-        for i in (1..perm.len()).rev() {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let j = (seed >> 33) as usize % (i + 1);
-            perm.swap(i, j);
-        }
-        let take = |src: &mut Vec<Vec<f32>>, p: &[usize]| -> Vec<Vec<f32>> {
-            p.iter().map(|&k| std::mem::take(&mut src[k])).collect()
-        };
-        let ch: Vec<Vec<u32>> = perm.iter().map(|&k| std::mem::take(&mut chunks[k])).collect();
-        let lm = take(&mut label_mid, &perm);
-        let bs = take(&mut base_shallow, &perm);
-        chunks = ch;
-        label_mid = lm;
-        base_shallow = bs;
-    }
+    // ONE loader, shared with the daemon train_drafter op.
+    let mut ls = hipfire_train::labels::load_daemon_labels(&mut gpu, &dlpath, SEQ)?;
+    println!("daemon labels: {} chunks, embed [{}×{}]", ls.chunks.len(), ls.vocab, ls.h_t);
+    let seed = env_usize("HIPFIRE_PFLASH_SHUFFLE_SEED", 0x5EED) as u64;
+    hipfire_train::labels::shuffle_in_place(&mut ls.chunks, &mut ls.label_mid, &mut ls.base_shallow, seed);
+    let (chunks, label_mid, base_shallow, embed, h_t, vocab) =
+        (ls.chunks, ls.label_mid, ls.base_shallow, ls.embed, ls.h_t, ls.vocab);
 
     let n_chunks = chunks.len();
     let n_train = n_chunks.checked_sub(n_eval).filter(|&t| t > 0)
