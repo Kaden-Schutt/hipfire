@@ -28,6 +28,10 @@ pub struct TrainCfg {
     pub wd: f32,
     pub tau: f32,
     pub eval_every: usize,
+    /// Also measure mean Spearman over the TRAIN split each eval epoch (oracle
+    /// diagnostic: bounds representational capacity / cosine-K-head fit). Costs an
+    /// extra forward over every train chunk — only enable for probes.
+    pub report_train: bool,
 }
 
 /// Outcome of a training run (best-eval checkpoint is the model that generalizes).
@@ -80,6 +84,33 @@ pub fn softmax_t(x: &[f32], tau: f32) -> Vec<f32> {
     e.into_iter().map(|v| v / z).collect()
 }
 
+/// Mean Spearman(drafter, target-mid) over chunk indices `[start, end)`.
+pub fn eval_ssm_drafter_range(
+    gpu: &mut Gpu,
+    drafter: &SsmDrafter,
+    chunks: &[Vec<u32>],
+    label_mid: &[Vec<f32>],
+    start: usize,
+    end: usize,
+    cfg: &TrainCfg,
+) -> f32 {
+    let nb = cfg.seq / cfg.block;
+    let last = cfg.seq - 1;
+    let kvd = drafter.cfg.kv_dim();
+    let pos: Vec<f32> = (0..cfg.seq).map(|t| t as f32).collect();
+    let sc = gpu.zeros(&[nb], DType::F32).unwrap();
+    let mut s = 0.0;
+    for i in start..end {
+        let a = ssm_drafter_forward_train(gpu, drafter, &chunks[i], &pos).unwrap();
+        pflash_score_forward(gpu, &a.score_k, &sc, cfg.seq, kvd, cfg.block, nb, last).unwrap();
+        let pred = gpu.download_f32(&sc).unwrap();
+        s += spearman(&pred, &label_mid[i]);
+        free_ssm_drafter_acts(gpu, a).unwrap();
+    }
+    let _ = gpu.free_tensor(sc);
+    s / (end - start).max(1) as f32
+}
+
 /// Mean Spearman(drafter, target-mid) over the eval split (last `n_eval` chunks).
 pub fn eval_ssm_drafter(
     gpu: &mut Gpu,
@@ -88,23 +119,8 @@ pub fn eval_ssm_drafter(
     label_mid: &[Vec<f32>],
     cfg: &TrainCfg,
 ) -> f32 {
-    let nb = cfg.seq / cfg.block;
-    let last = cfg.seq - 1;
     let n_chunks = chunks.len();
-    let n_train = n_chunks - cfg.n_eval;
-    let kvd = drafter.cfg.kv_dim();
-    let pos: Vec<f32> = (0..cfg.seq).map(|t| t as f32).collect();
-    let sc = gpu.zeros(&[nb], DType::F32).unwrap();
-    let mut s = 0.0;
-    for i in n_train..n_chunks {
-        let a = ssm_drafter_forward_train(gpu, drafter, &chunks[i], &pos).unwrap();
-        pflash_score_forward(gpu, &a.score_k, &sc, cfg.seq, kvd, cfg.block, nb, last).unwrap();
-        let pred = gpu.download_f32(&sc).unwrap();
-        s += spearman(&pred, &label_mid[i]);
-        free_ssm_drafter_acts(gpu, a).unwrap();
-    }
-    let _ = gpu.free_tensor(sc);
-    s / cfg.n_eval as f32
+    eval_ssm_drafter_range(gpu, drafter, chunks, label_mid, n_chunks - cfg.n_eval, n_chunks, cfg)
 }
 
 /// Train an SSM drafter to reproduce the target's mid-layer block ranking.
@@ -119,7 +135,7 @@ pub fn train_ssm_drafter_loop(
     label_mid: &[Vec<f32>],
     base_shallow: &[Vec<f32>],
     cfg: &TrainCfg,
-    mut on_epoch: impl FnMut(usize, f32, f32, f32, usize),
+    mut on_epoch: impl FnMut(usize, f32, f32, f32, usize, Option<f32>),
 ) -> HipResult<DrafterTrainReport> {
     let nb = cfg.seq / cfg.block;
     let last = cfg.seq - 1;
@@ -171,7 +187,12 @@ pub fn train_ssm_drafter_loop(
                 best_eval = corr;
                 best_epoch = ep;
             }
-            on_epoch(ep, ep_loss / n_train as f32, corr, best_eval, best_epoch);
+            let train_corr = if cfg.report_train {
+                Some(eval_ssm_drafter_range(gpu, drafter, chunks, label_mid, 0, n_train, cfg))
+            } else {
+                None
+            };
+            on_epoch(ep, ep_loss / n_train as f32, corr, best_eval, best_epoch, train_corr);
         }
     }
 

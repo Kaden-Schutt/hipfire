@@ -124,6 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wd: env_f32("HIPFIRE_PFLASH_WD", 0.0),
         tau: env_f32("HIPFIRE_PFLASH_TAU", TAU),
         eval_every: EVAL_EVERY,
+        report_train: std::env::var("HIPFIRE_PFLASH_REPORT_TRAIN").is_ok(),
     };
 
     println!("arch: {}  SEQ={SEQ} BLOCK={BLOCK} blocks={nb} train={n_train} eval={n_eval}", gpu.arch);
@@ -148,9 +149,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &label_mid,
         &base_shallow,
         &cfg,
-        |ep, train_loss, corr, best, best_ep| {
+        |ep, train_loss, corr, best, best_ep, train_corr| {
             if ep % 30 == 0 || ep == cfg.epochs - 1 {
-                println!("  ep {ep:>3}  train_loss {train_loss:.4}  eval {corr:+.3}  (best {best:+.3} @ ep {best_ep})");
+                let tc = train_corr.map(|t| format!("  train_ρ {t:+.3}")).unwrap_or_default();
+                println!("  ep {ep:>3}  train_loss {train_loss:.4}  eval {corr:+.3}{tc}  (best {best:+.3} @ ep {best_ep})");
             }
         },
     )?;

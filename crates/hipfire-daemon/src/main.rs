@@ -4643,6 +4643,7 @@ fn main() {
                     wd: getf(&t, "wd", 0.0),
                     tau: getf(&t, "tau", 0.1),
                     eval_every: getu(&t, "eval_every", 15),
+                    report_train: t.get("report_train").and_then(|v| v.as_bool()).unwrap_or(false),
                 };
                 let resp = serde_json::json!({
                     "type": "train_drafter",
