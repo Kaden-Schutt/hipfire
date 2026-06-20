@@ -2428,6 +2428,17 @@ Print the full second-780M command sequence with:
 scripts/lds_gemm_780m_runbook.sh
 ```
 
+- One-command second-780M jig:
+
+```bash
+# Safe: compiles and captures codegen artifacts only.
+scripts/lds_gemm_780m_test_jig.sh
+
+# Risky: expected to exercise the HIP-719/reset path on affected stacks.
+scripts/lds_gemm_780m_test_jig.sh --risky
+scripts/lds_gemm_780m_test_jig.sh --kedge
+```
+
 - Summarize an artifact root for cross-machine comparison:
 
 ```bash
@@ -2447,20 +2458,21 @@ scripts/lds_gemm_summary_compare.sh local-summary.tsv other-780m-summary.tsv
 ```
 
 - Current clean local build-only reference from `chaingun` commit
-  `14df1a2f3516` on this 780M (`BUILD_ONLY=1`, ROCm HIP
+  `29307782b127` on this 780M (`BUILD_ONLY=1`, ROCm HIP
   `7.13.26176-79e85e1468`, driver `6.19.0`):
   - no-extra baseline:
     `source_sha256=4267f867c3901afc`,
-    `amdgpu_obj_sha256=cec20f5226b977ad`,
-    `amdgpu_isa_sha256=18b249f22fda8613`.
+    `selected_isa_norm_sha256=07a8198f82d17006`.
   - tail `s_nop`:
     `source_sha256=4267f867c3901afc`,
-    `amdgpu_obj_sha256=b07d37d96bc12cdc`,
-    `amdgpu_isa_sha256=be2db7646b26f2bf`.
-  The build-only wrapper exits with one expected mismatch because the
-  fail-expected tail case cannot fail when no kernel is launched; use the
-  generated `artifact-summary.tsv` for codegen comparison, not the wrapper exit
-  code.
+    `selected_isa_norm_sha256=abcf16851242d139`.
+  The current build-only wrapper treats successful build-only capture as a
+  match for both rows, so it should exit zero when both variants compile and
+  summarize cleanly.
+  The expected failing coredump signature for the reset-prone path is
+  `devcore_sig=1/0x0000000000000000/0x0/0x3f000007/0x0fc00113`,
+  with `devcore_gds_addr=0xfc0`, `devcore_gds_vm_vmid=1`, and
+  `devcore_gds_vm_addr=0xfc0`.
 
 - Safe build/codegen metadata capture without launching the repro:
 

@@ -8,6 +8,13 @@ LOCAL_KEDGE_SUMMARY="${LOCAL_KEDGE_SUMMARY:-}"
 cat <<EOF
 # gfx1103 / 780M LDS tail-snop repro runbook
 
+# 0. One-command handoff jig. This defaults to the safe build-only preflight.
+scripts/lds_gemm_780m_test_jig.sh
+
+#    The repro modes can reset affected machines.
+scripts/lds_gemm_780m_test_jig.sh --risky
+scripts/lds_gemm_780m_test_jig.sh --kedge
+
 # 1. Optional safe codegen/metadata preflight. This compiles and captures
 #    codegen artifacts but does not launch the repro kernel.
 BUILD_ONLY=1 OUT=$OUT-buildonly tests/gfx1103-lds-tail-snop-repro.sh
@@ -56,4 +63,10 @@ cat <<'EOF'
 # - devcore_sig compares gfxhub page-fault, address/status, and GDS/GDS-VM
 #   protection fault fields from captured devcoredumps.
 # - same: summary rows match on the fields the comparator tracks.
+#
+# Local reference signatures from this gfx1103/780M stack:
+# - source_sha256=4267f867c3901afc
+# - baseline selected_isa_norm_sha256=07a8198f82d17006
+# - tail-snop selected_isa_norm_sha256=abcf16851242d139
+# - expected failing devcore_sig=1/0x0000000000000000/0x0/0x3f000007/0x0fc00113
 EOF
