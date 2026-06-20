@@ -227,7 +227,12 @@ pub fn load_model(
     let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let model_memory = hfq_model_memory(path, &hfq);
     let is_bf16_artifact = hfq_has_bf16_weights(&hfq);
-    if is_bf16_artifact {
+    // HIPFIRE_FORCE_QUANT_KV=1: diagnostic escape — keep the requested quantized
+    // KV even when a few BF16 tensors (e.g. norms) are present, to measure the
+    // batched-prefill path's speed. Not for production (KV/weight precision mix
+    // is intentional); see prefill eligibility investigation.
+    let allow_quant_kv = std::env::var("HIPFIRE_FORCE_QUANT_KV").as_deref() == Ok("1");
+    if is_bf16_artifact && !allow_quant_kv {
         if kv_mode != "fp32" {
             eprintln!("  BF16 tensors detected: forcing KV cache to fp32");
         }
@@ -1780,7 +1785,12 @@ pub fn load_model_pp(
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let model_memory = hfq_model_memory(path, &hfq);
     let is_bf16_artifact = hfq_has_bf16_weights(&hfq);
-    if is_bf16_artifact {
+    // HIPFIRE_FORCE_QUANT_KV=1: diagnostic escape — keep the requested quantized
+    // KV even when a few BF16 tensors (e.g. norms) are present, to measure the
+    // batched-prefill path's speed. Not for production (KV/weight precision mix
+    // is intentional); see prefill eligibility investigation.
+    let allow_quant_kv = std::env::var("HIPFIRE_FORCE_QUANT_KV").as_deref() == Ok("1");
+    if is_bf16_artifact && !allow_quant_kv {
         if kv_mode != "fp32" {
             eprintln!("  BF16 tensors detected: forcing KV cache to fp32");
         }
