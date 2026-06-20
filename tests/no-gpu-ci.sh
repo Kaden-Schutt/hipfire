@@ -35,6 +35,11 @@ python3 scripts/check-env-docs.py
 echo "== CLI docs freshness (docs/CLI.md + man/ vs clap definition) =="
 cargo run -q -p hipfire-cli -- gen-docs --check
 
+echo "== Config schema freshness (docs/config-schema.* vs schema registry) =="
+cargo run -q -p hipfire-cli -- gen-config-schema --format json --output docs/config-schema.json --check
+cargo run -q -p hipfire-cli -- gen-config-schema --format toml --output docs/config-schema.toml --check
+cargo run -q -p hipfire-cli -- gen-config-schema --format markdown --output docs/config-schema.md --check
+
 echo "== Artifact naming check =="
 bash scripts/check-artifact-names.sh
 
