@@ -46,7 +46,8 @@ cat <<'EOF'
 
 # Interpretation:
 # - source-drift: compare runs only after aligning repo revision/source.
-# - codegen-drift: same source compiled differently; compare ROCm/HIP/tool env.
+# - codegen-drift: same source compiled differently; compare selected_isa first,
+#   then whole normalized ISA, then ROCm/HIP/tool env.
 # - same-codegen-runtime-diff: same source/object/ISA but different outcome;
 #   this points at runtime/driver/device state.
 # - codegen-metadata-drift: normalized ISA matches, but raw object/disassembly

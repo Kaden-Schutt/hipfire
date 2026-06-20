@@ -60,7 +60,40 @@ normalized_isa_sha256() {
     fi
 }
 
-printf 'artifact\tvariant\tmode\tlaunches\tshape\tk_limit\tarch\tbuild_only\texit\tsync_failure\thip_error\tgit_commit\tgit_dirty\thipcc\tdriver\tgpu\tsource_sha256\tamdgpu_obj_sha256\tamdgpu_isa_sha256\tdmesg_remove_queue\tdmesg_mode2\tdmesg_gds\tdevcoredump\tisa_files\tamdgpu_isa_norm_sha256\n' >"$TSV"
+selected_isa_symbol() {
+    local variant="$1"
+    local tile suffix
+
+    case "$variant" in
+        tile5|tile6|tile16)
+            tile="${variant#tile}"
+            echo "gemm_lds_probeILi${tile}"
+            ;;
+        tile[0-9]*_*)
+            suffix="${variant#tile[0-9]*_}"
+            echo "gemm_${suffix}_probe"
+            ;;
+    esac
+}
+
+selected_isa_sha256() {
+    local path="$1"
+    local symbol="$2"
+    local section
+    if [[ -r "$path" && -n "$symbol" ]]; then
+        section="$(awk -v symbol="$symbol" '
+            /^Disassembly of section / {
+                emit = index($0, symbol) > 0;
+            }
+            emit { print }
+        ' "$path")"
+        if [[ -n "$section" ]]; then
+            printf '%s\n' "$section" | sha256sum | awk '{ print substr($1, 1, 16) }'
+        fi
+    fi
+}
+
+printf 'artifact\tvariant\tmode\tlaunches\tshape\tk_limit\tarch\tbuild_only\texit\tsync_failure\thip_error\tgit_commit\tgit_dirty\thipcc\tdriver\tgpu\tsource_sha256\tamdgpu_obj_sha256\tamdgpu_isa_sha256\tdmesg_remove_queue\tdmesg_mode2\tdmesg_gds\tdevcoredump\tisa_files\tamdgpu_isa_norm_sha256\tselected_isa_symbol\tselected_isa_norm_sha256\n' >"$TSV"
 
 while IFS= read -r meta; do
     dir="$(dirname "$meta")"
@@ -116,14 +149,16 @@ while IFS= read -r meta; do
     amdgpu_obj_sha="$(short_sha256 "$amdgpu_obj")"
     amdgpu_isa_sha="$(short_sha256 "$amdgpu_isa")"
     amdgpu_isa_norm_sha="$(normalized_isa_sha256 "$amdgpu_isa")"
+    selected_symbol="$(selected_isa_symbol "$variant")"
+    selected_isa_norm_sha="$(selected_isa_sha256 "$amdgpu_isa" "$selected_symbol")"
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$rel" "$variant" "$mode" "$launches" "$shape" "$k_limit" "$arch" \
         "$build_only" "$exit_code" "$sync_failure" "$hip_error" "$git_commit" \
         "$git_dirty" "$hipcc" "$driver" "$gpu" "$source_sha" \
         "$amdgpu_obj_sha" "$amdgpu_isa_sha" "$dmesg_remove_queue" \
         "$dmesg_mode2" "$dmesg_gds" "$devcoredump" "$isa_files" \
-        "$amdgpu_isa_norm_sha" >>"$TSV"
+        "$amdgpu_isa_norm_sha" "$selected_symbol" "$selected_isa_norm_sha" >>"$TSV"
 done < <(find "$ROOT" -type f -name meta.txt | sort)
 
 {
@@ -133,13 +168,13 @@ done < <(find "$ROOT" -type f -name meta.txt | sort)
     echo "- generated: \`$(date -u +%Y-%m-%dT%H:%M:%SZ)\`"
     echo "- tsv: \`$TSV\`"
     echo
-    echo "| artifact | variant | exit | sync failure | git | driver | gpu | src | obj | isa | isa_norm | remove_queue | mode2 | gds | devcoredump |"
-    echo "|---|---|---:|---|---|---|---|---|---|---|---|---:|---:|---:|---:|"
+    echo "| artifact | variant | exit | sync failure | git | driver | gpu | src | obj | isa | isa_norm | selected_isa | remove_queue | mode2 | gds | devcoredump |"
+    echo "|---|---|---:|---|---|---|---|---|---|---|---|---|---:|---:|---:|---:|"
     awk -F '\t' 'NR > 1 {
         dirty = ($13 == "1") ? " dirty" : "";
         sync_failure = ($10 == "") ? " " : $10;
-        printf "| `%s` | `%s` | `%s` | %s | `%s%s` | `%s` | `%s` | `%s` | `%s` | `%s` | `%s` | %s | %s | %s | %s |\n", \
-            $1, $2, $9, sync_failure, $12, dirty, $15, $16, $17, $18, $19, $25, $20, $21, $22, $23;
+        printf "| `%s` | `%s` | `%s` | %s | `%s%s` | `%s` | `%s` | `%s` | `%s` | `%s` | `%s` | `%s` | %s | %s | %s | %s |\n", \
+            $1, $2, $9, sync_failure, $12, dirty, $15, $16, $17, $18, $19, $25, $27, $20, $21, $22, $23;
     }' "$TSV"
 } >"$MD"
 
