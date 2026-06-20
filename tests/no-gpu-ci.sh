@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+PYTHON="${HIPFIRE_PYTHON:-python3}"
 
 echo "== Rust check =="
 RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-D warnings" cargo check --workspace --examples
@@ -25,12 +26,12 @@ cargo build -p hipfire-eval
 HIPFIRE_EVAL_BIN="$ROOT/target/debug/hipfire-eval" bash tests/smoke/eval-harness-nogpu-smoke.sh
 
 echo "== Python CPU tests =="
-python3 -m ruff check .
-python3 -m mypy tests scripts benchmarks tools --config-file pyproject.toml
-python3 -m pytest tests
+"$PYTHON" -m ruff check .
+"$PYTHON" -m mypy tests scripts benchmarks tools --config-file pyproject.toml
+"$PYTHON" -m pytest tests
 
 echo "== Env/docs drift check =="
-python3 scripts/check-env-docs.py
+"$PYTHON" scripts/check-env-docs.py
 
 echo "== CLI docs freshness (docs/CLI.md + man/ vs clap definition) =="
 cargo run -q -p hipfire-cli -- gen-docs --check

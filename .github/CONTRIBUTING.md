@@ -75,6 +75,7 @@ The default CI path intentionally avoids AMD GPU access and model
 downloads:
 
 ```bash
+python3 -m pip install -r requirements-dev.txt
 ./tests/no-gpu-ci.sh
 ```
 
@@ -82,6 +83,8 @@ It runs `cargo check --workspace --examples`, no-GPU Rust unit tests,
 CPU Python tests, the env/docs drift check, and Bun tests/typecheck
 when Bun is installed. GPU coherence and speed gates remain required
 for kernel, dispatch, quant, forward-pass, and spec-decode changes.
+Set `HIPFIRE_PYTHON=/path/to/venv/bin/python` when running the gate with
+an isolated Python environment.
 
 ### GPU kernel correctness check
 

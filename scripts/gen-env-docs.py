@@ -117,6 +117,20 @@ class EnvDoc:
     source: str
 
 
+DOC_ONLY_ENV_DOCS = {
+    "HIPFIRE_LOCAL": EnvDoc(
+        name="HIPFIRE_LOCAL",
+        description="Force local-spawn behavior and skip serve HTTP in documented workflows",
+        source=f"{ROOT / 'README.md'}:962",
+    ),
+    "HIPFIRE_PYTHON": EnvDoc(
+        name="HIPFIRE_PYTHON",
+        description="Python interpreter used by the no-GPU CI shell gate for Python tooling and tests",
+        source=f"{ROOT / '.github' / 'CONTRIBUTING.md'}:86",
+    ),
+}
+
+
 def tracked_sources() -> List[Path]:
     cmd = ["git", "ls-files"]
     proc = subprocess.run(cmd, cwd=ROOT, check=True, text=True, capture_output=True)
@@ -390,6 +404,7 @@ def collect_env_data() -> Tuple[Dict[str, EnvDoc], Set[str]]:
 
         docs[name] = best_doc if best_doc else EnvDoc(name=name, description=infer_name_from_var(name, best_source), source=best_source)
 
+    docs.update(DOC_ONLY_ENV_DOCS)
     return docs, set(usages)
 
 
