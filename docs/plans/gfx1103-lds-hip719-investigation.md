@@ -1693,6 +1693,14 @@ Latest artifact paths:
   is now promoted into `scripts/lds_direct_ab_phase_probe.hip` and
   `scripts/lds_direct_ab_multi_exec_matrix.sh`; default behavior and default
   artifact names remain unchanged.
+- A throwaway host-sleep control
+  (`/tmp/hipfire-lds-direct-ab-presleep-artifacts/`, throwaway worktree
+  `/tmp/hipfire-lds-direct-ab-presleep-1781926637`) added a local-only
+  `PRE_LAUNCH_SLEEP_US=1000` before each launch. Unlike the HIP pre-sync
+  diagnostic, host sleeping did not clear `11x3` READS=2 one-child `133`; it
+  failed earlier at sync/global 73 with the canonical coredump signature. The
+  sleep knob was not promoted because the negative result is enough: the
+  `PRE_SYNC_EACH_LAUNCH=1` pass is not explained by a simple 1 ms host delay.
 
 ## Current Narrowing
 
@@ -2072,6 +2080,10 @@ Reduction results after extending the standalone HIP GEMM probe:
   `3x11` one-child `134`, which still fails. This keeps the trigger model
   shape/orientation sensitive even within the same 33 active-lane and static
   codegen tuple.
+- A local host-sleep-before-launch control failed earlier than the normal
+  `11x3` edge, so the pre-sync improvement is not just wall-clock spacing
+  between launches. The useful distinction is currently "extra HIP
+  synchronization call" rather than "extra time".
 - Phase-mode controls sharpen the process-boundary result. With the same
   direct-AB kernel body at reads=6/192/511x86, same-process `99 + 1` fails on
   phase2 launch 0 / global launch 99, and same-process `98 + 2` fails on
@@ -2465,6 +2477,7 @@ LDS-only control:
 | direct-AB multi-exec `11x3`/`3x11` block/layout, reads=1, 448 iters, 512x86 | PASS at one-child `500` for both orientations | `_Z25lds_direct_ab_phase_probev` | 276 B | 22 | 2 | 0 | 32 |
 | direct-AB multi-exec/phase-mode `11x3`/`3x11` block/layout, reads=2, 448 iters, 512x86 | `11x3`: PASS `131`/`132`, FAIL one-child `133`, same-process `132+1` PASS, `device_reset 132+1` FAILS in phase1/global 130; `3x11`: PASS `131`-`133`, FAIL `134`, cross-process `132,1` PASS, same-process `132+1` FAIL at phase2 launch 0, `device_reset 132+1` PASS | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
 | direct-AB pre-sync diagnostic `11x3`/`3x11` block/layout, reads=2, 448 iters, 512x86 | `PRE_SYNC_EACH_LAUNCH=1`: `11x3` one-child `133` PASS; `3x11` one-child `134` FAIL at sync/global 133 | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
+| direct-AB throwaway host-sleep diagnostic `11x3` block/layout, reads=2, 448 iters, 512x86 | local-only `PRE_LAUNCH_SLEEP_US=1000`: one-child `133` FAIL at sync/global 73 | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
 | direct-AB phase-mode `3x11` block/layout, reads=2, 448 iters, 512x86, first-risky cleanup modes | `stream_recreate 132+1` FAILS in phase1/global 69; `primary_ctx_reset 132+1` FAILS in phase1/global 33 | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
 | direct-AB no-output `8x4` active in `8x5` block, reads=6 | PASS at 512 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 256 B | 22 | 5 | 0 | 32 |
 
