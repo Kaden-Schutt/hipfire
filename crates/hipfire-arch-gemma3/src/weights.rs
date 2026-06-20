@@ -19,7 +19,8 @@
 
 use hip_bridge::HipResult;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{f16_to_f32, EmbeddingFormat, WeightTensor};
+use hipfire_runtime::quant::f16_to_f32;
+use hipfire_runtime::weights::{EmbeddingFormat, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::config::Gemma3Config;

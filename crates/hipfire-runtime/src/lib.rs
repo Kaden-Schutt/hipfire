@@ -33,6 +33,29 @@ pub mod hfq;
 pub mod hfq_modules;
 pub mod host_profile;
 pub mod llama;
+// Neutral homes for the GENERIC primitives historically defined under `llama`
+// (they are not llama-specific — every arch uses them). Callers should import
+// from these modules, not `llama`. The definitions still physically live in
+// `llama` for now; relocating them is a no-API-change follow-up. See the
+// de-llama-ify cleanup.
+pub mod kv {
+    //! Generic KV cache (not llama-specific).
+    pub use crate::llama::KvCache;
+}
+pub mod weights {
+    //! Generic weight/embedding primitives (not llama-specific).
+    pub use crate::llama::{
+        weight_gemv, weight_gemv_residual, weight_gemv_swiglu_residual, EmbeddingFormat,
+        LayerWeights, WeightTensor,
+    };
+}
+pub mod quant {
+    //! Generic dequant codecs + half/bf16 conversions (not llama-specific).
+    pub use crate::llama::{
+        convert_q4k_to_q4f16_g32, convert_q4k_to_q4f16_g64, dequantize_q4_0, dequantize_q4_k,
+        dequantize_q6_k, dequantize_q8_0, f16_to_f32, f32_to_f16,
+    };
+}
 pub mod logging;
 pub mod loop_guard;
 pub mod model_source;

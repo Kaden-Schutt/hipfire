@@ -26,7 +26,7 @@
 //! pre-scale baked into `q_norm` (see `load_weights`).
 
 use hip_bridge::{DeviceBuffer, HipResult};
-use hipfire_runtime::llama::{weight_gemv, EmbeddingFormat};
+use hipfire_runtime::weights::{weight_gemv, EmbeddingFormat};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::config::Gemma3Config;

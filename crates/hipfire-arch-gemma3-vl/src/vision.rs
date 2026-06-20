@@ -16,7 +16,7 @@
 
 use hip_bridge::HipResult;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::f16_to_f32;
+use hipfire_runtime::quant::f16_to_f32;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::config::SigLipConfig;
