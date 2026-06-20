@@ -2,7 +2,7 @@ mod commands;
 mod model;
 
 use clap::{Parser, Subcommand};
-use hipfire_config::load_config;
+use hipfire_config::load_config_bundle;
 
 #[derive(Debug, Parser)]
 #[command(name = "hipfire", version, about = "hipfire LLM inference CLI")]
@@ -50,10 +50,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let config = load_config();
+    let loaded_config = load_config_bundle();
+    let config = loaded_config.config.clone();
 
     match cli.command {
-        Command::Serve(args) => commands::serve::run(args, config).await,
+        Command::Serve(args) => commands::serve::run(args, loaded_config).await,
         Command::Run(args) => commands::run::run(args, config).await,
         Command::List => {
             commands::list::run();

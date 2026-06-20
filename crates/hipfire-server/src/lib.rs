@@ -13,7 +13,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use hipfire_config::HipfireConfig;
+use hipfire_config::{HipfireConfig, LoadedConfig};
 use hipfire_generate::{GenerateTextRequest, GenerationSamplingPolicy};
 use tower_http::cors::{Any, CorsLayer};
 
@@ -69,8 +69,12 @@ pub fn build_router(state: SharedState) -> Router {
 }
 
 pub async fn serve(config: HipfireConfig) -> anyhow::Result<()> {
-    let addr = format!("{}:{}", config.host, config.port);
-    let state = AppState::new(config);
+    serve_loaded(LoadedConfig::from_config(config)).await
+}
+
+pub async fn serve_loaded(config: LoadedConfig) -> anyhow::Result<()> {
+    let addr = format!("{}:{}", config.config.host, config.config.port);
+    let state = AppState::new_loaded(config);
 
     prewarm_default_model(&state).await;
 

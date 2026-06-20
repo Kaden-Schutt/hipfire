@@ -253,6 +253,7 @@ pub struct LoadedConfig {
     pub raw_document: Value,
     pub read_error: Option<String>,
     pub additional_layers: Vec<ConfigLayer>,
+    pub layers: Vec<ConfigLayer>,
     pub config: HipfireConfig,
     pub resolution: ConfigResolution,
     pub diagnostics: Vec<ConfigDiagnostic>,
@@ -288,6 +289,7 @@ impl LoadedConfig {
             &self.additional_layers,
         );
         self.config = resolved.config;
+        self.layers = resolved.layers;
         self.resolution = resolved.resolution;
         self.diagnostics = resolved.diagnostics;
     }
@@ -426,6 +428,7 @@ pub fn loaded_config_from_document(
         raw_document,
         read_error,
         additional_layers,
+        layers: resolved.layers,
         config: resolved.config,
         resolution: resolved.resolution,
         diagnostics: resolved.diagnostics,

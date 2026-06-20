@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify};
 
-use hipfire_config::HipfireConfig;
+use hipfire_config::{HipfireConfig, LoadedConfig};
 use hipfire_daemon_adapter::DaemonEngine;
 use hipfire_prompt::Message;
 use hipfire_scheduler::{PriorityPrefillScheduler, SchedulerPolicyEnv};
@@ -43,6 +43,7 @@ pub struct StoredBatch {
 pub struct AppState {
     /// Serializes all daemon I/O. Phase A: one request at a time.
     pub engine: Mutex<Option<DaemonEngine>>,
+    pub loaded_config: Mutex<LoadedConfig>,
     pub config: Mutex<HipfireConfig>,
     /// Worker key ID of the currently loaded model, if any.
     pub loaded_model_path: Mutex<Option<String>>,
@@ -68,9 +69,15 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: HipfireConfig) -> Arc<Self> {
+        Self::new_loaded(LoadedConfig::from_config(config))
+    }
+
+    pub fn new_loaded(loaded_config: LoadedConfig) -> Arc<Self> {
         let scheduler_env = SchedulerPolicyEnv::from_pairs(std::env::vars());
+        let config = loaded_config.config.clone();
         Arc::new(Self {
             engine: Mutex::new(None),
+            loaded_config: Mutex::new(loaded_config),
             config: Mutex::new(config),
             loaded_model_path: Mutex::new(None),
             loaded_model_cache_capable: Mutex::new(None),
