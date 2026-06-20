@@ -1926,6 +1926,18 @@ Latest artifact paths:
   offset:12`. This separates a normal in-process synchronization boundary from
   a child-process boundary: only the latter avoided the cumulative fault in
   the paired split control.
+- Same-process early phase split baseline
+  (`/tmp/hipfire-lds-direct-ab-same20-artifacts-97238ba2/`, throwaway worktree
+  `/tmp/hipfire-lds-direct-ab-same20-current-97238ba2`, commit `97238ba2`)
+  gives the direct baseline for the early cleanup rows. The same active `30x1`
+  start=3 shape ran phase1 `20`, completed `boundary hipDeviceSynchronize OK`,
+  then failed in phase2 at local sync 26 / global launch 46. The selected
+  normalized ISA hash stayed `bb1a56b38225028e` with the same resource tuple,
+  and the devcoredump kept the canonical promoted direct-AB GFXHUB/GDS fields.
+  This shows the early `hipDeviceReset` / primary-context reset / release rows
+  failing at globals 44 / 45 / 43 are not meaningfully better than a plain early
+  sync boundary; the later global-373 `device_reset` row is phase-placement
+  sensitivity, not true cleanup.
 - Same-process stream recreation
   (`/tmp/hipfire-lds-direct-ab-stream-recreate-artifacts/`, throwaway worktree
   `/tmp/hipfire-lds-direct-ab-stream-current`, commit `480f0b8b`) also does not
@@ -2379,6 +2391,9 @@ Reduction results after extending the standalone HIP GEMM probe:
   at global `373`, but the direct `20+480` comparison shows device reset does
   not inherently clear the process-local fault state; it can shift the apparent
   threshold depending on where it is placed.
+- The matching shifted `30x1` plain `same` split at `20+480` failed in phase2
+  at local/global `26/46`, so the early reset/API rows are effectively in the
+  same threshold band as an ordinary early `hipDeviceSynchronize` boundary.
 - The `11x3` orientation behaves differently near the exact READS=2 edge:
   plain same-process `132+1` passes, while one-child `133` still fails. That
   points at a host phase boundary / final synchronization effect in addition
@@ -2831,6 +2846,7 @@ LDS-only control:
 | direct-AB promoted-source shifted active `30x1` in `34x1` block/layout, reads=2, 448 iters, 512x86 | start=2 PASS one-child `500`; start=3 FAIL at sync/global 179; start=4 FAIL at sync/global 375; all use DS=12 and failing rows keep the canonical gfxhub/GDS signature | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB promoted-source shifted active `30x1` start=3 in `34x1`, reads=2, 448 iters, 512x86 | same total `500` launches PASS when split across child processes `120,120,120,140`; one-child `500` repeat FAILS at sync/global 179 with identical selected ISA/resource tuple | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB promoted-source shifted active `30x1` start=3 in `34x1`, same-process phase split, reads=2, 448 iters, 512x86 | phase1 `120` + boundary `hipDeviceSynchronize` + phase2 `380` FAILS in phase2 at local sync 61 / global 181 with identical selected ISA/resource tuple | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
+| direct-AB promoted-source shifted active `30x1` start=3 in `34x1`, same-process early phase split, reads=2, 448 iters, 512x86 | phase1 `20` + boundary `hipDeviceSynchronize` + phase2 `480` FAILS in phase2 at local sync 26 / global 46 with identical selected ISA/resource tuple and canonical devcoredump fields | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB promoted-source shifted active `30x1` start=3 in `34x1`, same-process stream-recreate phase split, reads=2, 448 iters, 512x86 | phase1 `120` + stream destroy/recreate + phase2 `380` FAILS in phase2 at local sync 57 / global 177 with identical selected ISA/resource tuple | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB promoted-source shifted active `30x1` start=3 in `34x1`, same-process device-reset phase split, reads=2, 448 iters, 512x86 | phase1 `120` + `hipDeviceReset` OK + phase2 `380` FAILS in phase2 at local sync 253 / global 373 with identical selected ISA/resource tuple | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB promoted-source shifted active `30x1` start=3 in `34x1`, same-process early device-reset phase split, reads=2, 448 iters, 512x86 | phase1 `20` + `hipDeviceReset` OK + phase2 `480` FAILS in phase2 at local sync 24 / global 44 with identical selected ISA/resource tuple and canonical devcoredump fields | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
@@ -2954,11 +2970,12 @@ Best current hypothesis:
 > the edge, but it is not a deterministic explanation for every trial once the
 > first child itself lands on the shifted failure side. The latest shifted
 > `30x1` edge adds cleaner early-boundary API results: moving the boundary to
-> `20 + 480` lets `hipDeviceReset()`, `hipDevicePrimaryCtxReset(0)`, and
-> `hipDevicePrimaryCtxRelease(0)` return success, but phase2 still fails at
-> global launch 44/45/43 with the same codegen and coredump signature. That
-> keeps process exit as the only cleanup boundary observed to avoid the
-> shifted-row cumulative fault. A lower-risk `96+5`
+> `20 + 480` makes plain `hipDeviceSynchronize`, `hipDeviceReset()`,
+> `hipDevicePrimaryCtxReset(0)`, and `hipDevicePrimaryCtxRelease(0)` all return
+> success at the boundary, but phase2 still fails at global launch
+> 46/44/45/43 with the same codegen and coredump signature. That keeps process
+> exit as the only cleanup boundary observed to avoid the shifted-row
+> cumulative fault. A lower-risk `96+5`
 > split makes the parent-state picture cleaner: same-process `96+5` fails after
 > the boundary, same-process `97+4` passes, and exec-parent `96+5` passes in
 > plain and HIP-initialized parent modes across repeats. That points back to
