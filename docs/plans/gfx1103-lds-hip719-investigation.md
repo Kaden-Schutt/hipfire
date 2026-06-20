@@ -129,7 +129,10 @@ The currently promoted standalone GEMM jig lives in the repo:
 - `scripts/lds_gemm_standalone_probe.hip`: direct HIP tiled GEMM and reduced
   LDS stress variants, including the dynamic row-load split controls.
 - `scripts/lds_gemm_standalone_matrix.sh`: builds/runs one selected variant and
-  preserves logs, code objects, ISA/readobj output, and dmesg snapshots.
+  preserves logs, code objects, ISA/readobj output, dmesg snapshots, git
+  revision, host/kernel details, HIP/ROCm tool versions, and relevant runtime
+  environment variables. Set `BUILD_ONLY=1` to capture build/codegen metadata
+  without launching the generated HIP binary.
 - `scripts/lds_gemm_isa_compare.sh`: compile-only helper that builds the
   standalone probe, does not launch any GPU kernel, and writes per-symbol
   resource/ISA counters for the promoted scalar-control comparison.
@@ -2380,6 +2383,14 @@ OUT=/tmp/hipfire-lds-tail-snop-780m tests/gfx1103-lds-tail-snop-repro.sh
 Use `PROFILE=kedge` for the current K-limit edge (`K_LIMIT=3024` pass-side,
 `K_LIMIT=3032` fail-side) or `PROFILE=full` for baseline, K-edge, and full-depth
 tail-noop checks in one run.
+
+- Safe build/codegen metadata capture without launching the repro:
+
+```bash
+BUILD_ONLY=1 VARIANT=tile6_lds_tail_snop_noextra_load4_consume4_pinned \
+MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 \
+scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-tail-snop-buildonly
+```
 
 - A tighter throwaway control in `/tmp/hipfire-lds-scalar-nop-runs/` shows
   `tile6_lds_snop_noextra_load4_consume4_pinned` passed one-launch smoke and

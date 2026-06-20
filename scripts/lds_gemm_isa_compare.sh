@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$ROOT/.." && pwd)"
 OUT="${1:-/tmp/hipfire-lds-gemm-isa-compare}"
 ARCH="${ARCH:-gfx1103}"
 HIPCC="${HIPCC:-/opt/rocm/bin/hipcc}"
@@ -46,9 +47,22 @@ mkdir -p "$temps" "$sections"
     echo "source=$SRC"
     echo "arch=$ARCH"
     echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "uname=$(uname -a)"
+    if [[ -r /etc/os-release ]]; then
+        grep '^PRETTY_NAME=' /etc/os-release || true
+    fi
+    echo "git_commit=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
+    echo "git_branch=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    echo "git_status_short=$(git -C "$REPO_ROOT" status --short 2>/dev/null | tr '\n' ';' || true)"
     echo "hipcc=$HIPCC"
+    "$HIPCC" --version 2>/dev/null | sed 's/^/hipcc_version=/' | head -1 || true
     echo "llvm-readobj=$READOBJ"
+    "$READOBJ" --version 2>/dev/null | sed 's/^/llvm_readobj_version=/' | head -1 || true
     echo "llvm-objdump=$OBJDUMP"
+    "$OBJDUMP" --version 2>/dev/null | sed 's/^/llvm_objdump_version=/' | head -1 || true
+    echo "HSA_OVERRIDE_GFX_VERSION=${HSA_OVERRIDE_GFX_VERSION:-}"
+    echo "HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-}"
+    echo "ROCR_VISIBLE_DEVICES=${ROCR_VISIBLE_DEVICES:-}"
 } >"$OUT/meta.txt"
 
 cp "$SRC" "$OUT/lds_gemm_standalone_probe.hip"
