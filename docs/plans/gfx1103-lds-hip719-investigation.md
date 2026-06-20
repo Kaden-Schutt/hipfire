@@ -27,7 +27,13 @@ Observed local hardware/software for the first repro pass:
   - `/opt/rocm/llvm/bin/llvm-readobj`
 - Local driver source available:
   - `/usr/src/amdgpu-6.19.0-2307534.24.04/amd/amdgpu`
-- Full ROCm runtime/compiler source trees are not currently present locally.
+- TheRock runtime source inspected on 2026-06-20:
+  - superproject `/tmp/therock` at `a8d56de8b2879b76ff2c4d5251b1c2750a8498a4`
+  - `rocm-systems` submodule at
+    `a0952b2b339b4603050acee1672b0aa0d8abb702`
+  - This covers HIP/ROCclr/ROCr/libhsakmt user-space paths. It does not include
+    the kernel `amdgpu` driver tree; the installed driver source above remains
+    the local kernel-side reference.
 
 ## Commit History Examined
 
@@ -2113,6 +2119,62 @@ path is a MES queue removal/reset wedge, while the devcoredump also records a
 gfxhub page-fault snapshot and GDS/GDS-VM protection fault registers. That makes
 this look much more like a GPU/kernel-codegen/driver interaction than an
 ordinary HIP launch bookkeeping issue.
+
+TheRock runtime-source mapping for the cleanup-boundary experiments:
+
+- HIP primary-context reset/release do not meaningfully clean up the runtime
+  state in this source snapshot. In
+  `projects/clr/hipamd/src/hip_context.cpp`, `hipDevicePrimaryCtxRelease`
+  validates the device and returns success, while `hipDevicePrimaryCtxReset`
+  returns success immediately. This source behavior directly matches the
+  shifted `30x1 start=3` experiments where both APIs returned OK but failed
+  like same-process work.
+- `hipDeviceReset()` in
+  `projects/clr/hipamd/src/hip_device_runtime.cpp` only calls
+  `hip::getCurrentDevice()->Reset()`. The implementation in
+  `projects/clr/hipamd/src/hip_device.cpp` releases HIP memory pools, destroys
+  HIP streams, purges HIP memory objects, and recreates the HIP device wrapper.
+  The examined code does not show it destroying the underlying ROCclr device or
+  its normal active hardware-queue pool.
+- ROCclr active queues are pooled in
+  `projects/clr/rocclr/device/rocm/rocdevice.cpp`. `AcquireActiveQueue` calls
+  `acquireQueue(... managed=true, dedicated_queue=false, ...)`; created queues
+  are inserted into `queuePool_`, and normal `ReleaseActiveQueue` only
+  decrements refcounts unless the persistent queue count exceeds the configured
+  maximum. `releaseQueue` destroys CU-mask/cooperative queues, but ordinary
+  managed active queues remain pooled. The ROCclr device destructor does destroy
+  every pooled queue with `Hsa::queue_destroy()`.
+- ROCR queue destruction then reaches KFD through a short chain:
+  `hsa_queue_destroy()` calls `Queue::Destroy()`,
+  `AqlQueue::Destroy()` deletes the queue object, `AqlQueue::~AqlQueue()` calls
+  `Inactivate()`, and `Inactivate()` calls `agent_->driver().DestroyQueue()`.
+  The KFD driver wrapper calls `hsaKmtDestroyQueue()`, which delegates to
+  `hsaKmtDestroyQueueCtx()` in libhsakmt.
+- ROCR runtime shutdown is the broader process-level teardown path:
+  `hsa_shut_down()` calls `Runtime::Release()`, the final release calls
+  `Runtime::Unload()`, unload destroys agents, destroys drivers, and the KFD
+  driver close calls `hsaKmtCloseKFD()`. This is consistent with process exit
+  being the first tested boundary that actually reaches full runtime/queue
+  teardown for ordinary queues.
+
+Interpretation: the TheRock source strongly explains why `hipDeviceReset()`,
+stream recreation, and HIP primary-context APIs do not act like child-process
+exit for this failure. They mostly exercise HIP/ROCclr object lifetime, while
+ordinary active queues can stay pooled until the ROCclr device/runtime is
+destroyed. This supports the current model: low same-process accumulation is
+queue/runtime-lifetime sensitive, while the oversized-child failures show that
+process exit only clears that low band and does not remove the underlying
+per-child codegen/shape hazard.
+
+The same source pass identifies useful runtime logging knobs for future risky
+probes:
+
+- `HSA_ENABLE_VM_FAULT_MESSAGE` and `HSA_ENABLE_QUEUE_FAULT_MESSAGE` are enabled
+  unless set to `0` in ROCR's `core/util/flag.h`.
+- ROCclr queue/AQL logs use `AMD_LOG_LEVEL` and `AMD_LOG_MASK`; `LOG_AQL` is
+  `0x8`, `LOG_QUEUE` is `0x10`, and `LOG_CMD` is `0x2`.
+- libhsakmt reads `HSAKMT_DEBUG_LEVEL` in `libhsakmt/src/openclose.c`, with
+  levels through `7` for debug.
 
 The standalone HIP GEMM repro independently reproduced the failure outside
 hipfire:
