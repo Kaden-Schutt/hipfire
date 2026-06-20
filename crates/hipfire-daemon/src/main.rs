@@ -18,6 +18,7 @@
 //!   ← {"type":"loaded","arch":"qwen3_5","dim":4096,"layers":32,"vocab":248320,"vl":true}
 //!   → {"type":"generate","id":"r1","prompt":"Hello","temperature":0.3,"max_tokens":512}
 //!   → {"type":"generate","id":"r1","prompt":"Describe this","image":"/path/to/img.png","temperature":0.3,"max_tokens":512}
+//!   → {"type":"generate","id":"r1","prompt":"Describe this MRI series","video":"/path/scan.webm","max_frames":8}   (gemma3-vl / arch 13)
 //!   ← {"type":"token","id":"r1","text":"The"}
 //!   ← {"type":"done","id":"r1","tokens":42,"tok_s":44.5}
 //!   → {"type":"unload"}
@@ -65,7 +66,7 @@ use dummy::{
 };
 use events::{emit_error_with_id, write_error, MAX_BASE64_ENCODED_LEN};
 use generate::*;
-use generate_vl::{generate_vl, generate_vl_dots_ocr};
+use generate_vl::{decode_vl_frames, generate_vl, generate_vl_dots_ocr, generate_vl_gemma3};
 use hipfire_serving_core::{
     dummy, events, generate, generate_vl, load, model, output_filter, qwen35_decode,
     qwen35_prefill, request, session,
@@ -3300,11 +3301,51 @@ fn main() {
                 );
 
                 let has_image = image_base64.is_some() || image.is_some();
+                let video = msg.get("video").and_then(|v| v.as_str());
+                let max_frames =
+                    msg.get("max_frames").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let is_dots_ocr = m.arch_id == 8;
-                let has_vl = m.vision_config.is_some() || is_dots_ocr;
+                let is_gemma3_vl = m.gemma3_vl.is_some(); // arch 13 (medgemma)
+                let has_media = has_image || video.is_some();
+                let has_vl = m.vision_config.is_some() || is_dots_ocr || is_gemma3_vl;
 
-                if has_image && !has_vl {
+                if video.is_some() && !is_gemma3_vl {
+                    write_error(
+                        &mut stdout,
+                        id,
+                        "video input is only supported on gemma3-vl (arch 13)",
+                    );
+                } else if has_media && !has_vl {
                     write_error(&mut stdout, id, "model has no vision encoder");
+                } else if is_gemma3_vl && has_media {
+                    // arch-13 gemma3-vl: decode image / image_base64 / video into raw
+                    // frames daemon-side, then serve through Gemma3VlBackend (SigLIP
+                    // encode → projector splice → shared greedy decode_loop). A video
+                    // (or an image path that is_video) expands to up to max_frames.
+                    let vl_max_think_tokens = if max_think_tokens == 0 {
+                        256
+                    } else {
+                        max_think_tokens
+                    };
+                    match decode_vl_frames(image, image_base64, video, max_frames) {
+                        Ok(frames) => {
+                            let params = GenerateVLParams {
+                                id,
+                                prompt,
+                                system_prompt: system,
+                                // Unused on the gemma3-vl path: bytes arrive via `frames`.
+                                image_source: ImageSource::Path(""),
+                                temp,
+                                top_p,
+                                max_tokens,
+                                repeat_penalty,
+                                repeat_window,
+                                max_think_tokens: vl_max_think_tokens,
+                            };
+                            generate_vl_gemma3(m, &mut gpu, &mut stdout, &params, &frames);
+                        }
+                        Err(e) => write_error(&mut stdout, id, &e),
+                    }
                 } else if has_image && has_vl {
                     if image_base64.is_some() && image.is_some() {
                         eprintln!(

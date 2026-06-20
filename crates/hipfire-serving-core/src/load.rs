@@ -16,6 +16,8 @@
 use std::path::Path;
 
 use hipfire_arch_deepseek4 as deepseek4;
+use hipfire_arch_gemma3::Gemma3State;
+use hipfire_arch_gemma3_vl::{load_vl, Gemma3VlBackend, LoadedVl};
 #[cfg(feature = "arch-lfm2moe")]
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_llama::Llama;
@@ -453,6 +455,104 @@ pub fn load_model(
             dots_ocr_weights: None,
             vision_config: None,
             vision_weights: None,
+            gemma3_vl: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0,
+            max_seq,
+            physical_cap: max_seq,
+            eviction: None,
+            conversation_tokens: Vec::new(),
+            asst_turn_cache: std::collections::HashMap::new(),
+            decoded_vocab: None,
+            model_path: path.to_string(),
+            memory: model_memory,
+            dflash: None,
+            chat_template,
+            chat_template_profile,
+        });
+    }
+
+    if hfq.arch_id == 13 {
+        // Gemma3-VL (medgemma). Self-contained multimodal backend: the gemma3
+        // text decoder (loaded from the `language_model.` prefix) + the SigLIP
+        // vision tower + the projector, plus its own decode state — all owned by
+        // `Gemma3VlBackend`, which serves via `ServingBackend::serve` →
+        // `decode_loop` (greedy). No eviction / DFlash / CASK / PP, and not the
+        // qwen35-VL `vision_config` splice path (that field stays None for 13;
+        // the `has_vl` gate keys off `gemma3_vl.is_some()`).
+        if draft_path.is_some() {
+            return Err(
+                "DFlash not supported on arch_id=13 (gemma3-vl). Reload without a draft."
+                    .to_string(),
+            );
+        }
+        if cask.sidecar.is_some() {
+            return Err("CASK eviction not supported on arch_id=13 (gemma3-vl). \
+                       Reload without --cask-sidecar."
+                .to_string());
+        }
+        let _ = kv_mode;
+        let _ = state_quant_override;
+        let LoadedVl {
+            text_cfg,
+            vl_cfg,
+            weights,
+        } = load_vl(&mut hfq, gpu)?;
+        let state = Gemma3State::new_with_max_seq(gpu, &text_cfg, max_seq)
+            .map_err(|e| format!("gemma3-vl: Gemma3State::new_with_max_seq failed: {e:?}"))?;
+        let backend = Gemma3VlBackend::new(text_cfg, vl_cfg, weights, state);
+        let chat_template = resolve_chat_template(&hfq, path);
+        let (chat_template, chat_template_profile) =
+            profile_chat_template(chat_template, Some(&tokenizer));
+        return Ok(LoadedModel {
+            arch_id: hfq.arch_id,
+            pp: 1,
+            pp_gpus: None,
+            pp_scratch_set: None,
+            pp_dn_la_to_device: None,
+            q35_config: None,
+            q35_weights: None,
+            q35_scratch: None,
+            kv_cache: None,
+            dn_state: None,
+            q35_kv_mode: None,
+            q35_state_quant: None,
+            q35_sessions: std::collections::HashMap::new(),
+            q35_active_session_id: None,
+            q35_active_state_allocation_epoch: 0,
+            q35_active_prefilled_generated_suffix_len: 0,
+            llama_config: None,
+            llama_weights: None,
+            llama_scratch: None,
+            llama_kv: None,
+            qwen2_config: None,
+            qwen2_weights: None,
+            qwen2_state: None,
+            deepseek4_config: None,
+            deepseek4_weights: None,
+            deepseek4_state: None,
+            deepseek4_pbs: None,
+            deepseek4_eos_tok: 0,
+            mtp_mode: "auto".to_string(),
+            mtp_k: 3,
+            mtp_weights_present: false,
+            minimax_config: None,
+            minimax_weights: None,
+            minimax_state: None,
+            minimax_eos_tok: 0,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2moe_config: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2moe_weights: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2moe_state: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2moe_eos_tok: 0,
+            dots_ocr_config: None,
+            dots_ocr_weights: None,
+            vision_config: None,
+            vision_weights: None,
+            gemma3_vl: Some(backend),
             tokenizer: Some(tokenizer),
             seq_pos: 0,
             max_seq,
@@ -548,6 +648,7 @@ pub fn load_model(
             dots_ocr_weights: Some(weights),
             vision_config: None,
             vision_weights: None,
+            gemma3_vl: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0,
             max_seq,
@@ -664,6 +765,7 @@ pub fn load_model(
             dots_ocr_weights: None,
             vision_config: None,
             vision_weights: None,
+            gemma3_vl: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0,
             max_seq,
@@ -786,6 +888,7 @@ pub fn load_model(
             dots_ocr_weights: None,
             vision_config: None,
             vision_weights: None,
+            gemma3_vl: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0,
             max_seq,
@@ -917,6 +1020,7 @@ pub fn load_model(
                 dots_ocr_weights: None,
                 vision_config: None,
                 vision_weights: None,
+                gemma3_vl: None,
                 tokenizer: Some(tokenizer),
                 seq_pos: 0,
                 max_seq,
@@ -1260,6 +1364,7 @@ pub fn load_model(
             dots_ocr_weights: None,
             vision_config,
             vision_weights,
+            gemma3_vl: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0,
             max_seq,
@@ -1345,6 +1450,7 @@ pub fn load_model(
             dots_ocr_weights: None,
             vision_config: None,
             vision_weights: None,
+            gemma3_vl: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0,
             max_seq,
@@ -1517,6 +1623,7 @@ pub fn load_model_safetensors(
             lfm2moe_eos_tok: 0,
             vision_config: None,
             vision_weights: None,
+            gemma3_vl: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0,
             max_seq,
@@ -1634,6 +1741,7 @@ pub fn load_model_safetensors(
         lfm2moe_eos_tok: 0,
         vision_config: None,
         vision_weights: None,
+        gemma3_vl: None,
         tokenizer: Some(tokenizer),
         seq_pos: 0,
         max_seq: effective_max_seq,
@@ -1902,6 +2010,7 @@ pub fn load_model_pp(
         dots_ocr_weights: None,
         vision_config: None,
         vision_weights: None,
+        gemma3_vl: None,
         tokenizer: Some(tokenizer),
         seq_pos: 0,
         max_seq,
@@ -2088,6 +2197,12 @@ pub fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     }
     if let Some(w) = m.vision_weights {
         w.free_gpu(gpu);
+    }
+    // Gemma3-VL (arch_id=13): the backend owns the text/vision/projector weights
+    // and its decode state — free both (mirrors Gemma3VlBackend::unload).
+    if let Some(b) = m.gemma3_vl {
+        b.weights.free_gpu(gpu);
+        b.state.free_gpu(gpu);
     }
     if let Some(w) = m.deepseek4_weights {
         w.free_gpu(gpu);

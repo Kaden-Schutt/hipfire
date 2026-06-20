@@ -14,6 +14,7 @@
 use hip_bridge::HipResult;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
+use hipfire_arch_gemma3_vl::Gemma3VlBackend;
 #[cfg(feature = "arch-lfm2moe")]
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
@@ -274,6 +275,13 @@ pub struct LoadedModel {
     // Vision state (VL models only)
     pub vision_config: Option<qwen35_vl::VisionConfig>,
     pub vision_weights: Option<qwen35_vl::VisionWeights>,
+    // Gemma3-VL (medgemma, arch_id=13). Self-contained multimodal backend
+    // (gemma3 text decoder + SigLIP tower + projector + decode state) behind
+    // the object-safe `ServingBackend::serve` seam — its own KV/decode state
+    // lives inside, so there is no separate kv_cache/scratch field. The
+    // `has_vl` gate keys off `gemma3_vl.is_some()` for arch 13 (rather than the
+    // qwen35-typed `vision_config`). None on every other arch path.
+    pub gemma3_vl: Option<Gemma3VlBackend>,
     // Shared
     pub tokenizer: Option<hipfire_model::tokenizer::Tokenizer>,
     // Multi-turn conversation state

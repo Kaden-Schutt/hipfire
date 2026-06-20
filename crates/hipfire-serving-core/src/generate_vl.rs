@@ -25,6 +25,7 @@ use hipfire_generate::loop_guard::StopReason;
 use hipfire_generate::sampler::SamplerConfig;
 use hipfire_generate::{GenerateVLParams, ImageSource};
 use hipfire_prompt as prompt_frame;
+use hipfire_runtime::arch::{GenerateCtx, ServingBackend};
 use hipfire_runtime::llama;
 use hipfire_runtime::sampler;
 
@@ -866,4 +867,183 @@ pub fn generate_vl_dots_ocr(
         prefill_s * 1000.0
     );
     let _ = stdout.flush();
+}
+
+/// Decode the multimodal inputs of a gemma3-vl request into owned, raw encoded
+/// image bytes — one entry per image/frame, in prompt order. The bytes are what
+/// `Gemma3VlBackend::serve` consumes (each goes through `preprocess_image_bytes`
+/// → SigLIP), so they are the *encoded* container bytes (PNG/JPEG), not pixels.
+///
+/// Routing: a `video` path (or an `image` path that `hipfire_media::is_video`)
+/// is expanded to up to `max_frames` uniformly-sampled PNG frames in slice
+/// order; a still `image` path is read as one frame; a base64 payload (optional
+/// `data:…;base64,` prefix stripped) is decoded as one frame. `max_frames == 0`
+/// means "all frames". Precedence: `video` > `image` > `image_base64`.
+pub fn decode_vl_frames(
+    image: Option<&str>,
+    image_base64: Option<&str>,
+    video: Option<&str>,
+    max_frames: usize,
+) -> Result<Vec<Vec<u8>>, String> {
+    if let Some(vp) = video {
+        return hipfire_media::decode_frames(Path::new(vp), max_frames);
+    }
+    if let Some(ip) = image {
+        let p = Path::new(ip);
+        if hipfire_media::is_video(p) {
+            return hipfire_media::decode_frames(p, max_frames);
+        }
+        let bytes = std::fs::read(p).map_err(|e| format!("gemma3-vl: read image {ip}: {e}"))?;
+        return Ok(vec![bytes]);
+    }
+    if let Some(b64) = image_base64 {
+        let raw = match b64.strip_prefix("data:") {
+            Some(rest) => rest
+                .split_once(',')
+                .map(|(_, after)| after)
+                .ok_or_else(|| "malformed data URL: missing ',' separator".to_string())?,
+            None => b64,
+        };
+        let bytes = Engine::decode(&base64::engine::general_purpose::STANDARD, raw)
+            .map_err(|e| format!("gemma3-vl: base64 decode failed: {e}"))?;
+        return Ok(vec![bytes]);
+    }
+    Err("gemma3-vl: no image/video provided".to_string())
+}
+
+/// Gemma3-VL (medgemma, arch_id=13) generate path.
+///
+/// Builds the gemma3 chat-framed prompt with one `<start_of_image>` marker per
+/// frame (HF wraps every image as `\n\n<start_of_image>\n\n`), then hands the raw
+/// frame bytes to [`Gemma3VlBackend::serve`] via [`GenerateCtx`]. `serve` encodes
+/// each frame through SigLIP + projector, splices the projected rows at the image
+/// placeholders during prefill (`splice_image_tokens` expands every marker into
+/// `[boi, image_soft_token×mm, eoi]`, or front-prepends the blocks if the
+/// tokenizer didn't surface the marker), and streams the daemon's exact
+/// `token`/`done` schema through the shared greedy `decode_loop`.
+///
+/// `frames` is daemon-decoded (see [`decode_vl_frames`]): one raw encoded image
+/// per image/video-frame, in order. `params.image_source` is unused here (the
+/// bytes arrive via `frames`); the rest of `params` supplies id/prompt/system/
+/// sampling. Decode is greedy (`decode_loop`); the repeat-penalty / loop-guard
+/// sampler migration tracked on `decode_loop` is a follow-up, so near-duplicate
+/// frames under greedy can still attractor — validate with distinct frames.
+pub fn generate_vl_gemma3(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    params: &GenerateVLParams,
+    frames: &[Vec<u8>],
+) {
+    let id = params.id;
+
+    // Frame the prompt. `<bos>` / `<start_of_turn>` / `<end_of_turn>` /
+    // `<start_of_image>` all round-trip through `tok.encode` (they are registered
+    // special tokens), so the whole chat frame can be expressed as text and the
+    // backend's `tok.encode(ctx.prompt)` reproduces the example's token stream.
+    let mut framed = String::from("<bos><start_of_turn>user\n");
+    if let Some(sys) = params.system_prompt.filter(|s| !s.is_empty()) {
+        // gemma3 has no system role — HF folds system content into the user turn.
+        framed.push_str(sys);
+        framed.push_str("\n\n");
+    }
+    for _ in 0..frames.len() {
+        framed.push_str("\n\n<start_of_image>\n\n");
+    }
+    framed.push_str(params.prompt);
+    framed.push_str("<end_of_turn>\n<start_of_turn>model\n");
+
+    // Disjoint field borrows: tokenizer (shared) + backend (mut).
+    if m.tokenizer.is_none() {
+        write_error(stdout, id, "gemma3-vl: tokenizer not loaded");
+        return;
+    }
+    if m.gemma3_vl.is_none() {
+        write_error(
+            stdout,
+            id,
+            "gemma3-vl: backend not loaded (arch 13 not active)",
+        );
+        return;
+    }
+    let tok = m.tokenizer.as_ref().unwrap();
+    let backend = m.gemma3_vl.as_mut().unwrap();
+
+    let images: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+    let mut ctx = GenerateCtx {
+        id,
+        prompt: &framed,
+        temperature: params.temp,
+        top_p: params.top_p,
+        max_tokens: params.max_tokens,
+        repeat_penalty: params.repeat_penalty,
+        repeat_window: params.repeat_window,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        max_think_tokens: params.max_think_tokens,
+        stop_sequences: &[],
+        images: &images,
+        sink: stdout,
+    };
+    let result = backend.serve(gpu, tok, &mut ctx);
+    // `ctx` mutably borrows `stdout`; drop it before reusing `stdout` for errors.
+    drop(ctx);
+    if let Err(e) = result {
+        write_error(stdout, id, &format!("gemma3-vl serve: {e}"));
+    }
+}
+
+#[cfg(test)]
+mod gemma3_vl_tests {
+    use super::decode_vl_frames;
+    use base64::Engine;
+
+    #[test]
+    fn decode_vl_frames_errors_without_input() {
+        let err = decode_vl_frames(None, None, None, 0).unwrap_err();
+        assert!(err.contains("no image/video"), "got: {err}");
+    }
+
+    #[test]
+    fn decode_vl_frames_decodes_base64_single_frame() {
+        let payload = b"\x89PNG\r\n\x1a\n-pretend-bytes";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
+        let frames = decode_vl_frames(None, Some(&b64), None, 0).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], payload);
+    }
+
+    #[test]
+    fn decode_vl_frames_strips_data_url_prefix() {
+        let payload = b"jpeg-ish";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
+        let data_url = format!("data:image/png;base64,{b64}");
+        let frames = decode_vl_frames(None, Some(&data_url), None, 0).unwrap();
+        assert_eq!(frames[0], payload);
+    }
+
+    #[test]
+    fn decode_vl_frames_rejects_malformed_data_url() {
+        // `data:` prefix but no comma separator.
+        let err = decode_vl_frames(None, Some("data:image/png;base64"), None, 0).unwrap_err();
+        assert!(err.contains("data URL"), "got: {err}");
+    }
+
+    #[test]
+    fn decode_vl_frames_reads_still_image_path_as_one_frame() {
+        let dir = std::env::temp_dir().join(format!("hfvl-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("frame.png");
+        std::fs::write(&p, b"not-really-png-but-bytes").unwrap();
+        let frames = decode_vl_frames(Some(p.to_str().unwrap()), None, None, 0).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], b"not-really-png-but-bytes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decode_vl_frames_errors_on_missing_image_path() {
+        let err = decode_vl_frames(Some("/no/such/frame.png"), None, None, 0).unwrap_err();
+        assert!(err.contains("read image"), "got: {err}");
+    }
 }
