@@ -2370,6 +2370,18 @@ scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-scalar-control-runs
   no-extra 100-launch recovery runs passed after the failing tail-noop runs.
   This makes the upper edge stress-history-sensitive, but the robust pass
   side currently extends through `K_LIMIT=3024`.
+- A launch-count bracket in `/tmp/hipfire-lds-tail-snop-launch-runs/` shows
+  the near-full tail-noop edge is strongly tied to the 100th launch.
+  `K_LIMIT=3032` passed with `N_LAUNCH=96`, `98`, and `99`, then failed at
+  `sync 99` with `N_LAUNCH=100`. `K_LIMIT=3040` also passed with
+  `N_LAUNCH=99` and failed at `sync 99` with `N_LAUNCH=100`. Full-depth
+  tail-noop was harsher after reset pressure, failing at `sync 98` even with
+  `N_LAUNCH=99`. After that sequence, the previously pass-side
+  `tile6_lds_store_then_load_dynamiccols_load4_noextra_consume4_pinned`
+  also became fragile at the 100th launch: it failed at `sync 99` with
+  `N_LAUNCH=100` but passed with `N_LAUNCH=99`. Treat late-session
+  100-launch results as reset-pressure-sensitive unless bracketed by fresh
+  process/recovery controls.
 - On the first 780M system, the counter-only variant passed one-launch smoke
   and failed under the 100-launch full-shape run at `sync 98` with HIP `719`.
   The object metadata stayed at `group_segment_fixed_size=144`,
