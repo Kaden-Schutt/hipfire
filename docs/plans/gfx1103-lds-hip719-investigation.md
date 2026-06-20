@@ -165,6 +165,14 @@ The currently promoted standalone GEMM jig lives in the repo:
   repro, summary regeneration, and summary comparison.
 - `scripts/narrow-gemm-lds-shape.sh`: runs the curated variant matrix and
   writes a TSV report plus summary.
+- `scripts/lds_standalone_probe.hip`: promoted LDS-only store/load/barrier
+  stress probe used for the long-loop masked/no-mask controls; the file has a
+  `HIPFIRE_LDS_STANDALONE_NO_MAIN` guard so compile-only helpers can emit
+  explicit single-instantiation objects.
+- `scripts/lds_standalone_isa_compare.sh`: read-only compile/ISA summarizer
+  for the LDS-only long-loop probe. It defaults to `SINGLE_INSTANTIATION=1`
+  and writes per-symbol size, instruction, DS, barrier, wait, exec-mask,
+  global-store, and code-object resource metadata.
 - `tests/gfx1103-lds-tail-snop-repro.sh`: focused cross-system pass/fail
   wrapper for a second 780M. The default `PROFILE=repro` checks the no-extra
   baseline against the tail-loop `s_nop` repro and writes a TSV report under
@@ -173,10 +181,11 @@ The currently promoted standalone GEMM jig lives in the repo:
   are intentionally bypassed and each case is judged only on whether it built
   and captured artifacts successfully.
 
-Older throwaway-only HIP probes used during the investigation:
+Older throwaway HIP probes used during the investigation:
 
 - `/tmp/hipfire-lds-repro/lds_standalone_probe.hip`: LDS-only shared-memory
-  store/load/barrier stress kernels, no GEMM global matrix traffic.
+  store/load/barrier stress kernels, no GEMM global matrix traffic. This source
+  is now promoted as `scripts/lds_standalone_probe.hip`.
 - `/tmp/hipfire-lds-repro/lds_gemm_standalone_probe.hip`: direct HIP tiled
   GEMM reproducer using the same A/B/C global-memory shape as the hipfire
   training example. Later extended with reduction modes and a compile-time
@@ -2359,8 +2368,9 @@ control):
   Treat the common
   in-process HIP reset APIs as already tested; only revisit teardown if a
   genuinely different ROCm mechanism is identified.
-- create a single-instantiation compile unit for the passing long-loop symbol
-  so instruction counts can be per-symbol instead of object-aggregate.
+- rerun the passing long-loop symbol on the second 780M only if its compile-only
+  ISA/resource rows drift from the local reference; the source and summarizer
+  are now promoted in `scripts/`.
 
 ### Additional Sequence Sweep (Fresh)
 
@@ -2590,6 +2600,29 @@ skewed by neighboring template variants.
   and scalar-control rows; the unmasked synthetic row differs in VGPR metadata
   (`26` in the full object versus `18` isolated), so use
   `SINGLE_INSTANTIATION=1` for resource-count evidence on that symbol.
+- The promoted LDS-only long-loop helper captures the passing masked control and
+  the no-mask threshold control without launching either kernel:
+
+```bash
+SINGLE_INSTANTIATION=1 scripts/lds_standalone_isa_compare.sh /tmp/hipfire-lds-standalone-isa-single
+SINGLE_INSTANTIATION=0 scripts/lds_standalone_isa_compare.sh /tmp/hipfire-lds-standalone-isa-full
+```
+
+  On this stack, full-object and isolated mode agree for both rows:
+  - masked passing long-loop `_Z9lds_probeILi6ELi6ELi512EEvPfi`: 592 bytes,
+    115 instructions, zero `s_nop 0`, two LDS stores, ten LDS loads,
+    four barriers, nine waits, six scalar branches, five `s_and_saveexec`,
+    one global store, `group_segment_fixed_size=288`, `sgpr_count=8`,
+    `vgpr_count=20`, `wavefront_size=32`.
+  - no-mask long-loop `_Z16lds_probe_nomaskILi6ELi512EEvPfi`: 780 bytes,
+    146 instructions, zero `s_nop 0`, four LDS stores, twenty LDS loads,
+    eight barriers, thirteen waits, one scalar branch, no `s_and_saveexec`,
+    one global store, `group_segment_fixed_size=288`, `sgpr_count=8`,
+    `vgpr_count=56`, `wavefront_size=32`.
+  This resolves the per-symbol artifact gap for the passing long-loop control:
+  it genuinely has more DS/barrier/wait traffic than the failing compact
+  synthetic symbols, so aggregate object counts were not hiding a simpler
+  "more LDS ops fails" relation.
 - This sharpens the current suspect further: in the
   second-store/four-waited-row-load loop, a single recurrent scalar no-op is
   enough to move the pass-side no-extra shape into the faulting class under
