@@ -24,6 +24,10 @@ pub fn build_router(state: SharedState) -> Router {
             "/operator/config/schema",
             get(routes::operator::get_config_schema),
         )
+        .route(
+            "/operator/config/resolved",
+            get(routes::operator::get_resolved_config),
+        )
         .route("/v1/models", get(routes::models::get_models))
         .route(
             "/v1/files",
