@@ -19,6 +19,7 @@ pub mod loader;
 pub mod model;
 pub mod ops;
 pub mod optim;
+pub mod labels;
 pub mod qtip_quant;
 pub mod ssm_block;
 pub mod ssm_drafter;

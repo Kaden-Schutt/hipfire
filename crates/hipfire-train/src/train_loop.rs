@@ -40,6 +40,9 @@ pub struct DrafterTrainReport {
     pub best_epoch: usize,
     pub bar: f32,
     pub final_eval: f32,
+    /// Host snapshot of the drafter params (in `params()` order) at the best-eval
+    /// epoch — the generalizing model to checkpoint. Empty if no eval ran.
+    pub best_weights: Vec<Vec<f32>>,
 }
 
 // ── ranking math (shared with any drafter-vs-target evaluation) ──
@@ -156,6 +159,7 @@ pub fn train_ssm_drafter_loop(
     let mut best_eval = f32::NEG_INFINITY;
     let mut best_epoch = 0usize;
     let mut final_eval = 0.0f32;
+    let mut best_weights: Vec<Vec<f32>> = Vec::new();
 
     for ep in 0..cfg.epochs {
         let mut ep_loss = 0.0f32;
@@ -193,6 +197,12 @@ pub fn train_ssm_drafter_loop(
             if corr > best_eval {
                 best_eval = corr;
                 best_epoch = ep;
+                // Snapshot the generalizing weights (host) for checkpointing.
+                best_weights = drafter
+                    .params()
+                    .iter()
+                    .map(|t| gpu.download_f32(t))
+                    .collect::<HipResult<_>>()?;
             }
             let train_corr = if cfg.report_train {
                 Some(eval_ssm_drafter_range(gpu, drafter, chunks, label_mid, 0, n_train, cfg))
@@ -204,5 +214,5 @@ pub fn train_ssm_drafter_loop(
     }
 
     let _ = gpu.free_tensor(scores_dev);
-    Ok(DrafterTrainReport { best_eval, best_epoch, bar, final_eval })
+    Ok(DrafterTrainReport { best_eval, best_epoch, bar, final_eval, best_weights })
 }

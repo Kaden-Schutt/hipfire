@@ -4464,24 +4464,15 @@ fn main() {
                     .and_then(|v| v.as_str())
                     .unwrap_or("ssm")
                     .to_string();
-                if arch != "ssm" && arch != "attention" {
+                if arch != "ssm" {
                     emit_error_with_id(
                         &mut stdout,
                         "",
-                        format!("train_drafter: unknown arch '{arch}' (expected ssm|attention)"),
+                        format!("train_drafter: arch '{arch}' not implemented (only ssm; step 3)"),
                     );
                     continue;
                 }
-                if model.as_ref().and_then(|m| m.q35_config.as_ref()).is_none() {
-                    emit_error_with_id(
-                        &mut stdout,
-                        "",
-                        "train_drafter: no qwen3.5-family model loaded".to_string(),
-                    );
-                    continue;
-                }
-                // Parse the train block into the SHARED TrainCfg (proves the
-                // hipfire-train dep links and the op speaks the lib's types).
+                // Parse the train block into the SHARED TrainCfg.
                 let t = msg
                     .get("train")
                     .cloned()
@@ -4516,19 +4507,96 @@ fn main() {
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false),
                 };
-                let resp = serde_json::json!({
-                    "type": "train_drafter",
-                    "status": "not_implemented",
-                    "detail": "step 1 plumbing only — loop wiring lands in step 3",
-                    "arch": arch,
-                    "label_source": labels.get("source").and_then(|v| v.as_str()).unwrap_or("file"),
-                    "cfg": {
-                        "seq": cfg.seq, "block": cfg.block, "n_eval": cfg.n_eval,
-                        "epochs": cfg.epochs, "lr": cfg.lr, "wd": cfg.wd,
-                        "tau": cfg.tau, "eval_every": cfg.eval_every,
+                let source = labels.get("source").and_then(|v| v.as_str()).unwrap_or("file");
+                if source != "file" {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        format!("train_drafter: label source '{source}' not implemented (only file; capture is step 4)"),
+                    );
+                    continue;
+                }
+                let Some(path) = labels.get("path").and_then(|v| v.as_str()).map(String::from) else {
+                    emit_error_with_id(&mut stdout, "", "train_drafter: labels.path required for source=file".to_string());
+                    continue;
+                };
+                let Some(output) = msg.get("output").and_then(|v| v.as_str()).map(String::from) else {
+                    emit_error_with_id(&mut stdout, "", "train_drafter: 'output' (checkpoint path) required".to_string());
+                    continue;
+                };
+
+                // ── load cached labels + frozen target embedding (file source) ──
+                let mut ls = match hipfire_train::labels::load_daemon_labels(&mut gpu, &path, cfg.seq) {
+                    Ok(ls) => ls,
+                    Err(e) => {
+                        emit_error_with_id(&mut stdout, "", format!("train_drafter: load labels {path}: {e}"));
+                        continue;
+                    }
+                };
+                let shuffle_seed = getu(&labels, "shuffle_seed", 0x5EED) as u64;
+                hipfire_train::labels::shuffle_in_place(
+                    &mut ls.chunks, &mut ls.label_mid, &mut ls.base_shallow, shuffle_seed,
+                );
+
+                // ── build the SSM drafter from the request config ──
+                let dc = msg.get("config").cloned().unwrap_or_else(|| serde_json::json!({}));
+                let mut dcfg = hipfire_train::ssm_drafter::SsmDrafterConfig::tiny(10000.0, 1e-5);
+                dcfg.h_draft = getu(&dc, "h_draft", 512);
+                dcfg.n_layers = getu(&dc, "n_layers", 3);
+                dcfg.inter = getu(&dc, "inter", 1024);
+                dcfg.n_kv = getu(&dc, "n_kv", 4);
+                dcfg.head_dim = getu(&dc, "head_dim", 64);
+                let (h_t, vocab) = (ls.h_t, ls.vocab);
+                let drafter = match hipfire_train::ssm_drafter::SsmDrafter::new(
+                    &mut gpu, ls.embed, h_t, vocab, dcfg, cfg.seq,
+                ) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        emit_error_with_id(&mut stdout, "", format!("train_drafter: build drafter: {e}"));
+                        continue;
+                    }
+                };
+                let nparams: usize = drafter.param_sizes().iter().sum();
+                let _ = writeln!(stdout, "{}", serde_json::json!({
+                    "type": "train_start", "arch": arch, "params": nparams,
+                    "chunks": ls.chunks.len(), "n_train": ls.chunks.len().saturating_sub(cfg.n_eval),
+                    "n_eval": cfg.n_eval, "epochs": cfg.epochs,
+                }));
+                let _ = stdout.flush();
+
+                // ── run the SHARED training loop, streaming progress JSONL ──
+                let train_res = hipfire_train::train_loop::train_ssm_drafter_loop(
+                    &mut gpu, &drafter, &ls.chunks, &ls.label_mid, &ls.base_shallow, &cfg,
+                    |ep, train_loss, corr, best, best_ep, train_corr| {
+                        let mut ev = serde_json::json!({
+                            "type": "train_progress", "epoch": ep, "train_loss": train_loss,
+                            "eval": corr, "best": best, "best_epoch": best_ep,
+                        });
+                        if let Some(tc) = train_corr { ev["train_rho"] = serde_json::json!(tc); }
+                        let _ = writeln!(stdout, "{ev}");
+                        let _ = stdout.flush();
                     },
-                });
-                let _ = writeln!(stdout, "{resp}");
+                );
+                let report = match train_res {
+                    Ok(r) => r,
+                    Err(e) => {
+                        emit_error_with_id(&mut stdout, "", format!("train_drafter: train loop: {e}"));
+                        continue;
+                    }
+                };
+
+                // ── checkpoint the best-eval weights ──
+                let saved = hipfire_train::labels::save_ssm_drafter_weights(
+                    &output, &report.best_weights, report.best_epoch as u32,
+                );
+                let _ = writeln!(stdout, "{}", serde_json::json!({
+                    "type": "train_done",
+                    "best_eval": report.best_eval, "best_epoch": report.best_epoch,
+                    "bar": report.bar, "final_eval": report.final_eval,
+                    "beat_bar": report.best_eval > report.bar,
+                    "checkpoint": if saved.is_ok() { Some(output.clone()) } else { None },
+                    "checkpoint_error": saved.err().map(|e| e.to_string()),
+                }));
                 let _ = stdout.flush();
             }
 
