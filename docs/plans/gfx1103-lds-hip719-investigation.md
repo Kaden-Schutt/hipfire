@@ -2420,6 +2420,22 @@ Compare two summary TSVs directly with:
 scripts/lds_gemm_summary_compare.sh local-summary.tsv other-780m-summary.tsv
 ```
 
+- Current clean local build-only reference from `chaingun` commit
+  `14df1a2f3516` on this 780M (`BUILD_ONLY=1`, ROCm HIP
+  `7.13.26176-79e85e1468`, driver `6.19.0`):
+  - no-extra baseline:
+    `source_sha256=4267f867c3901afc`,
+    `amdgpu_obj_sha256=cec20f5226b977ad`,
+    `amdgpu_isa_sha256=18b249f22fda8613`.
+  - tail `s_nop`:
+    `source_sha256=4267f867c3901afc`,
+    `amdgpu_obj_sha256=b07d37d96bc12cdc`,
+    `amdgpu_isa_sha256=be2db7646b26f2bf`.
+  The build-only wrapper exits with one expected mismatch because the
+  fail-expected tail case cannot fail when no kernel is launched; use the
+  generated `artifact-summary.tsv` for codegen comparison, not the wrapper exit
+  code.
+
 - Safe build/codegen metadata capture without launching the repro:
 
 ```bash
