@@ -2477,6 +2477,7 @@ __global__ void gemm_lds_store_then_load_separate_readtile_probe(int M, int N,
     asm volatile("" ::"v"(sum));
 }
 
+#ifndef HIPFIRE_LDS_PROBE_NO_MAIN
 static int parse_mode(const char* mode) {
     if (std::strcmp(mode, "full") == 0) return static_cast<int>(Mode::Full);
     if (std::strcmp(mode, "nostore") == 0) return static_cast<int>(Mode::NoStore);
@@ -2899,3 +2900,4 @@ int main(int argc, char** argv) {
     int k_limit = argc > 7 ? std::atoi(argv[7]) : 0;
     return run_variant(variant, mode, launches, m, n, k, k_limit);
 }
+#endif

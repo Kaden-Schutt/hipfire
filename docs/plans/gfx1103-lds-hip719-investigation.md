@@ -133,6 +133,8 @@ The currently promoted standalone GEMM jig lives in the repo:
 - `scripts/lds_gemm_isa_compare.sh`: compile-only helper that builds the
   standalone probe, does not launch any GPU kernel, and writes per-symbol
   resource/ISA counters for the no-extra versus tail-loop `s_nop` comparison.
+  Set `SINGLE_INSTANTIATION=1` to compile each mapped kernel in its own
+  generated source/object.
 - `scripts/narrow-gemm-lds-shape.sh`: runs the curated variant matrix and
   writes a TSV report plus summary.
 - `tests/gfx1103-lds-tail-snop-repro.sh`: focused cross-system pass/fail
@@ -2416,10 +2418,14 @@ tail-noop checks in one run.
 
 ```bash
 scripts/lds_gemm_isa_compare.sh /tmp/hipfire-lds-gemm-isa-compare
+SINGLE_INSTANTIATION=1 scripts/lds_gemm_isa_compare.sh /tmp/hipfire-lds-gemm-isa-compare-single
 ```
 
 The helper writes `isa-summary.tsv` plus per-symbol ISA and key-op extracts,
-with `SYMBOLS="..."` available for later single-symbol comparisons.
+with `SYMBOLS="..."` available for later single-symbol comparisons. The
+single-instantiation pass emits the same counts for the current no-extra and
+tail-noop pair, so the saved full-object comparison is not being skewed by
+neighboring template variants.
 - A sequential K-limit sweep in
   `/tmp/hipfire-lds-tail-snop-klimit-runs/` shows the tail-noop trigger is
   concentrated near the top of the K loop. The initial concurrent
