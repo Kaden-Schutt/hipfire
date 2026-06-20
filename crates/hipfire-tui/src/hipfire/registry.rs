@@ -92,32 +92,13 @@ pub enum RegistryAction {
 
 impl RegistryState {
     pub fn load(paths: &HipfirePaths) -> Self {
-        let mut warning = None;
         let local_files = list_local_models(paths);
         let local_names = local_files
             .iter()
             .map(|m| m.file.as_str())
             .collect::<std::collections::BTreeSet<_>>();
-
-        let (loaded_path, registry) = match paths.registry_path() {
-            Some(path) => match fs::read_to_string(path) {
-                Ok(raw) => match serde_json::from_str::<RegistryFile>(&raw) {
-                    Ok(registry) => (Some(path.to_path_buf()), registry),
-                    Err(err) => {
-                        warning = Some(format!("registry parse error: {err}"));
-                        (Some(path.to_path_buf()), RegistryFile::default())
-                    }
-                },
-                Err(err) => {
-                    warning = Some(format!("registry read error: {err}"));
-                    (Some(path.to_path_buf()), RegistryFile::default())
-                }
-            },
-            None => {
-                warning = Some("registry.json not found".into());
-                (None, RegistryFile::default())
-            }
-        };
+        let loaded_path = None;
+        let registry = RegistryFile::default();
 
         let registry_file_keys = registry
             .models
@@ -176,7 +157,7 @@ impl RegistryState {
             selected: 0,
             expanded_groups: BTreeSet::new(),
             loaded_path,
-            warning,
+            warning: None,
         }
     }
 

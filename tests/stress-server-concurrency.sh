@@ -152,7 +152,7 @@ if model_b:
     env["HIPFIRE_MAX_RESIDENT_WORKERS"] = env.get("HIPFIRE_MAX_RESIDENT_WORKERS", "2")
 
 proc = subprocess.Popen(
-    ["bun", os.path.join(root, "cli", "index.ts"), "serve", "127.0.0.1", str(port)],
+    ["cargo", "run", "-q", "-p", "hipfire-cli", "--", "serve", "--host", "127.0.0.1", "--port", str(port)],
     cwd=root,
     stdin=subprocess.DEVNULL,
     stdout=log_file,

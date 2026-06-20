@@ -4,9 +4,8 @@ LLM inference for AMD RDNA GPUs. Rust + HIP. Single binary. No Python
 in the hot path. Ollama-style UX.
 
 ```bash
-hipfire pull qwen3.5:9b
 hipfire run  qwen3.5:9b "What is the capital of France?"
-hipfire serve -d        # background daemon, OpenAI-compatible API on 0.0.0.0:11435
+hipfire serve           # OpenAI-compatible API on 0.0.0.0:11435
 ```
 
 Current release: **v0.2.1** — dispatch unification (#397). DeepSeek V4 Flash support landed in v0.2.0. See [CHANGELOG.md](CHANGELOG.md).
@@ -53,28 +52,8 @@ Linux with ROCm 6+:
 curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash
 ```
 
-For Windows, source builds, and verifying the install:
+For source builds and verifying the install:
 [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md).
-
-## NixOS
-
-First-class support via Nix flake. See [docs/NIXOS.md](docs/NIXOS.md).
-
-```bash
-nix develop github:Kaden-Schutt/hipfire  # dev shell with Rust + ROCm + bun
-nix build github:Kaden-Schutt/hipfire    # build package
-```
-
-NixOS module:
-
-```nix
-{
-  inputs.hipfire.url = "github:Kaden-Schutt/hipfire";
-  # then in configuration.nix:
-  services.hipfire.enable = true;
-  services.hipfire.gpuTargets = [ "gfx1100" ];
-}
-```
 
 ## Inspiration: Lucebox
 
@@ -125,7 +104,6 @@ the prefill MMQ redesign log is at
 | Page | Topic |
 |---|---|
 | [GETTING_STARTED.md](docs/GETTING_STARTED.md) | Install, first run, what to read next |
-| [NIXOS.md](docs/NIXOS.md) | NixOS flake, module, dev shell |
 | [CLI.md](docs/CLI.md) | Every subcommand, flags, file locations |
 | [MODELS.md](docs/MODELS.md) | Curated tags, BYO models, file extensions |
 | [QUANTIZE.md](docs/QUANTIZE.md) | `hipfire quantize` for HF / safetensors / GGUF |
@@ -510,7 +488,7 @@ matches. Index of currently-available skills:
   `hipfire serve`. **Reach for this when:** serve "Failed to start
   (port in use)", a stale daemon holds VRAM, a pre-warm JSON-parse /
   os-error-2 crash left a zombie `daemon.pid` singleton, or you need a
-  guaranteed-fresh daemon. Kills bun CLI + spawned daemon, fuser-frees
+  guaranteed-fresh daemon. Kills Rust serve + spawned daemon, fuser-frees
   the port, reaps pid/lock files. `scripts/serve-restart.sh [port]`.
 
 When adding a new skill, give it a one-line index entry here so future
@@ -584,20 +562,11 @@ This playbook explains how to verify v0.2.0-era branches, what to measure, and w
    or a heredoc inside a committed script.
 5. **Prefer fast targeted searches.** Use `rg` for text/file searches
    where available, and avoid broad slow `find`/`grep` sweeps.
-6. **`scripts/install.{sh,ps1}` copy the whole `cli/` directory recursively
-   and prune dev/test artifacts by pattern.** New `.ts` files in `cli/`
-   are auto-installed — no install-script edit required. Tests must
-   follow `*.test.ts` / `test_*.ts` / `bench_*.ts` naming so the prune
-   step excludes them; if you add a runtime helper that *looks* like a
-   test name, rename it. The previous per-file enumeration grew stale
-   silently after PR #129 (issue #163, naive fix #165, structural fix
-   in this rule's enforcing PR).
-7. **Run the no-GPU subset before handing off workflow-only changes.**
+6. **Run the no-GPU subset before handing off workflow-only changes.**
    `./tests/no-gpu-ci.sh` is the default CI shape: Rust check/examples,
-   no-GPU Rust units, CPU Python tests, env/docs drift, and Bun
-   tests/typecheck when Bun is installed. It does not replace hardware
-   coherence or speed gates.
-8. **Document bugs before moving on.** Whenever you encounter a bug,
+   no-GPU Rust units, CPU Python tests, env/docs drift, and CLI doc
+   freshness checks. It does not replace hardware coherence or speed gates.
+7. **Document bugs before moving on.** Whenever you encounter a bug,
    odd error, obvious omission, bad code smell, or unexpected behavior
    while working in this repo, add a lightweight note to `BUGS.md`
    before continuing to unrelated work. A short description is enough;

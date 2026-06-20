@@ -43,13 +43,5 @@ bash -n tests/smoke/eval-harness-nogpu-smoke.sh
 bash -n tests/smoke/eval-harness-gpu-smoke.sh
 bash -n tests/smoke/eval-harness-model-eval-smoke.sh
 
-if command -v bun >/dev/null 2>&1; then
-    echo "== Bun tests/typecheck =="
-    (
-        cd cli
-        bun test
-        bun run typecheck
-    )
-else
-    echo "no-gpu-ci: bun not found; skipping Bun checks" >&2
-fi
+echo "== Legacy TypeScript CLI checks =="
+echo "Legacy TypeScript CLI support has been removed; no JS runtime checks are run."

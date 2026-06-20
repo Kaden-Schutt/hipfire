@@ -9,7 +9,7 @@
 #   ./tests/test-serve.sh --port 8080
 #   ./tests/test-serve.sh --running  # connect to already-running hipfire serve
 #
-# Requires: curl, jq, bun (for starting hipfire serve)
+# Requires: curl, jq, cargo (for starting hipfire serve from a checkout)
 
 set -euo pipefail
 
@@ -60,13 +60,7 @@ trap cleanup EXIT
 # ─── Start hipfire serve ───────────────────────────────────
 if ! $ALREADY_RUNNING; then
   header "Starting hipfire serve on port $PORT"
-  # Find the CLI
-  CLI="$ROOT/cli/index.ts"
-  if [[ ! -f "$CLI" ]]; then
-    echo "Cannot find cli/index.ts — run from repo root"
-    exit 1
-  fi
-  HIPFIRE_MODEL="$MODEL" bun "$CLI" serve "$PORT" &
+  (cd "$ROOT" && cargo run -q -p hipfire-cli -- serve --host 127.0.0.1 --port "$PORT" --model "$MODEL") &
   SERVE_PID=$!
   echo "  PID: $SERVE_PID"
 

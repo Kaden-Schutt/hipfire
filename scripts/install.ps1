@@ -189,32 +189,6 @@ if ($HipDllFound -and $GpuArch -ne "unknown") {
     }
 }
 
-# ─── Bun (CLI runtime) ───────────────────────────────────
-Write-Host ""
-Write-Host "Checking Bun..." -ForegroundColor Cyan
-
-$BunBin = "$env:USERPROFILE\.bun\bin"
-if (Get-Command bun -ErrorAction SilentlyContinue) {
-    Write-Host "  Bun: found ✓" -ForegroundColor Green
-} else {
-    Write-Host "  Bun not found. Installing..." -ForegroundColor Yellow
-    try {
-        powershell -c "irm bun.sh/install.ps1 | iex"
-        # Add bun to PATH for remainder of this session
-        $env:PATH = "$BunBin;$env:PATH"
-        if (Get-Command bun -ErrorAction SilentlyContinue) {
-            Write-Host "  Bun installed ✓" -ForegroundColor Green
-        } else {
-            Write-Host "  Bun installed but not in PATH. Add manually:" -ForegroundColor Yellow
-            Write-Host "    $BunBin"
-        }
-    } catch {
-        Write-Host "  Bun install failed: $_" -ForegroundColor Red
-        Write-Host "  Visit https://bun.sh and install manually, then re-run."
-        exit 1
-    }
-}
-
 # ─── Clone / update repo ─────────────────────────────────
 Write-Host ""
 Write-Host "Setting up hipfire source..." -ForegroundColor Cyan
@@ -368,7 +342,6 @@ if ($PreBuilt -and $PreBuilt -ne "$BinDir\daemon.exe") {
         $RustupExe  = "$env:TEMP\rustup-init.exe"
         Invoke-WebRequest -Uri $RustupUrl -OutFile $RustupExe -UseBasicParsing
         & $RustupExe -y --default-toolchain stable
-        # Add cargo to PATH for this session
         $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
     }
 
@@ -376,6 +349,7 @@ if ($PreBuilt -and $PreBuilt -ne "$BinDir\daemon.exe") {
     Push-Location $RepoDir
     try {
         cargo build --release --features deltanet -p hipfire-daemon --bin hipfire-daemon
+        cargo build --release -p hipfire-cli
         cargo build --release -p hipfire-eval
         cargo build --release --features deltanet -p hipfire-runtime --example infer --example infer_hfq --bin hipfire-host-profile
     } finally {
@@ -407,6 +381,38 @@ if ($PreBuilt -and $PreBuilt -ne "$BinDir\daemon.exe") {
     Write-Host "  Build complete ✓" -ForegroundColor Green
 }
 
+# The CLI is always Rust-native now. Build it even when daemon.exe came from a
+# release asset so `hipfire serve/run/list` never depends on a removed script
+# runtime.
+if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    Write-Host "  Installing Rust via rustup for the hipfire CLI..." -ForegroundColor Yellow
+    $RustupUrl  = "https://win.rustup.rs/x86_64"
+    $RustupExe  = "$env:TEMP\rustup-init.exe"
+    Invoke-WebRequest -Uri $RustupUrl -OutFile $RustupExe -UseBasicParsing
+    & $RustupExe -y --default-toolchain stable
+    $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+}
+
+Write-Host "  Building Rust CLI..." -ForegroundColor Cyan
+Push-Location $RepoDir
+try {
+    cargo build --release -p hipfire-cli
+} finally {
+    Pop-Location
+}
+try {
+    $Meta = cargo metadata --format-version 1 --manifest-path "$RepoDir\Cargo.toml" 2>$null | ConvertFrom-Json
+    if ($Meta.target_directory) { $TargetDir = $Meta.target_directory }
+} catch {}
+$CliExe = "$TargetDir\release\hipfire.exe"
+if (-not (Test-Path $CliExe)) {
+    Write-Host "  BUILD FAILED: hipfire.exe was not produced." -ForegroundColor Red
+    Write-Host "  Try manually: cd $RepoDir; cargo build --release -p hipfire-cli"
+    exit 1
+}
+Copy-Item $CliExe "$BinDir\hipfire.exe" -Force
+Write-Host "  hipfire.exe installed ✓" -ForegroundColor Green
+
 # Copy optional helper binaries if present
 foreach ($exe in @("infer.exe", "infer_hfq.exe")) {
     $src = "$TargetDir\release\examples\$exe"
@@ -418,49 +424,6 @@ if (Test-Path "$TargetDir\release\hipfire-eval.exe") {
 if (Test-Path "$TargetDir\release\hipfire-host-profile.exe") {
     Copy-Item "$TargetDir\release\hipfire-host-profile.exe" "$BinDir\hipfire-host-profile.exe" -Force
 }
-
-# ─── CLI ─────────────────────────────────────────────────
-Write-Host ""
-Write-Host "Installing CLI..." -ForegroundColor Cyan
-
-$CliDir = "$HipfireDir\cli"
-New-Item -ItemType Directory -Force -Path $CliDir | Out-Null
-# Recursive copy of the whole cli\ directory, then prune dev/test artifacts.
-# New .ts files added to cli\ (next chat helper, future slash-command module)
-# are picked up automatically — no install-script edit required. Replaces
-# the previous per-file enumeration that grew stale after PR #129 added
-# chat.ts/chat_pure.ts (issue #163, patched in #165; this is the structural
-# follow-up that PR left for later).
-if (-not (Test-Path "$RepoDir\cli\registry.json") -or -not (Test-Path "$RepoDir\cli\index.ts")) {
-    Write-Host "ERROR: cli\registry.json or cli\index.ts missing in $RepoDir" -ForegroundColor Red
-    Write-Host "       Repo checkout may be incomplete; aborting install." -ForegroundColor Red
-    exit 1
-}
-# Robocopy mirrors better than Copy-Item -Recurse for this case (handles
-# permissions, exit-code semantics, and is on every Windows installation),
-# but Copy-Item is more portable across PowerShell core / Windows PS / pwsh
-# on macOS-via-PS-remoting; sticking with Copy-Item for parity with the rest
-# of the script.
-Copy-Item "$RepoDir\cli\*" $CliDir -Recurse -Force
-# Prune dev artifacts. Patterns mirror install.sh — tests follow
-# `*.test.ts` / `test_*.ts` / `bench_*.ts` Bun conventions; node_modules
-# and dotfiles are dev-only. Adding a new test file with the same naming
-# requires no install-script change.
-$prunePaths = @("node_modules", ".gitignore", "tsconfig.json", "README.md", "bun.lock")
-foreach ($p in $prunePaths) {
-    $target = Join-Path $CliDir $p
-    if (Test-Path $target) { Remove-Item $target -Recurse -Force -ErrorAction SilentlyContinue }
-}
-Get-ChildItem -Path $CliDir -File | Where-Object {
-    $_.Name -like "*.test.ts" -or $_.Name -like "test_*.ts" -or $_.Name -like "bench_*.ts"
-} | Remove-Item -Force -ErrorAction SilentlyContinue
-
-# Create hipfire.cmd wrapper
-$CmdWrapper = "@echo off`r`nbun run `"%USERPROFILE%\.hipfire\cli\index.ts`" %*`r`n"
-[System.IO.File]::WriteAllText("$BinDir\hipfire.cmd", $CmdWrapper)
-
-Write-Host "  CLI installed to $CliDir ✓" -ForegroundColor Green
-Write-Host "  Wrapper: $BinDir\hipfire.cmd ✓" -ForegroundColor Green
 
 # ─── Kernels ─────────────────────────────────────────────
 # kernels/compiled/<arch>/ is gitignored, so a fresh git clone never ships

@@ -33,7 +33,8 @@ cat > "$TMPCFG/.hipfire/config.json" <<'JSON'
 {"max_seq": 1024, "max_tokens": 16, "default_model": "qwen3.5:0.8b"}
 JSON
 
-HOME="$TMPCFG" HIPFIRE_MODEL="$MODEL" bun cli/index.ts serve "$PORT" > "$LOG" 2>&1 &
+cargo build -q -p hipfire-cli
+HOME="$TMPCFG" "$PWD/target/debug/hipfire" serve --host 127.0.0.1 --port "$PORT" --model "$MODEL" > "$LOG" 2>&1 &
 PID=$!
 trap "kill -TERM $PID 2>/dev/null; wait $PID 2>/dev/null; rm -rf $TMPCFG $LOG /tmp/qg_N.json" EXIT
 

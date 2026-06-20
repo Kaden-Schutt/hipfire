@@ -12,7 +12,7 @@ MODEL=${MODEL:-qwen3.5:0.8b}
 LOG=$(mktemp)
 
 echo "=== booting serve on :$PORT (log $LOG) ==="
-HIPFIRE_MODEL="$MODEL" bun cli/index.ts serve "$PORT" > "$LOG" 2>&1 &
+cargo run -q -p hipfire-cli -- serve --host 127.0.0.1 --port "$PORT" --model "$MODEL" > "$LOG" 2>&1 &
 PID=$!
 trap "kill -TERM $PID 2>/dev/null; wait $PID 2>/dev/null; rm -f $LOG" EXIT
 

@@ -161,7 +161,7 @@ def run_scenario(run_backend: str, run_expected_backend: str, log_prefix: str) -
     })
 
     proc = subprocess.Popen(
-        ["bun", os.path.join(root, "cli", "index.ts"), "serve", "127.0.0.1", str(port)],
+        ["cargo", "run", "-q", "-p", "hipfire-cli", "--", "serve", "--host", "127.0.0.1", "--port", str(port)],
         cwd=root,
         stdin=subprocess.DEVNULL,
         stdout=log_file,

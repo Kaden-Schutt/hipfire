@@ -8,24 +8,22 @@ Run from the repository root:
 cargo run -p hipfire-tui
 ```
 
-For the Chat tab to stream, start the existing Bun serve bridge in a separate
-terminal first:
+For the Chat tab to stream, start the Rust serve process in a separate terminal
+first:
 
 ```bash
-bun cli/index.ts serve
+hipfire serve
 ```
 
 Current scope:
 
 - Ratatui shell with Home, Chat, Models, Settings, and System tabs.
-- Reads real `~/.hipfire` config, per-model overlays, local model files, and
-  the current `cli/registry.json`.
+- Reads real `~/.hipfire` config, per-model overlays, and local model files.
 - Probes the existing `/health` endpoint and streams chat through
   `/v1/chat/completions`.
-- Chat can ask the existing Bun CLI to start `serve -d` when the endpoint is
-  offline; the typed prompt stays in place so you can retry after health comes
-  online.
-- The Models tab groups registry entries and local-only model files by family.
+- Chat can ask the Rust CLI to start `serve` when the endpoint is offline; the
+  typed prompt stays in place so you can retry after health comes online.
+- The Models tab groups local model files by family.
   `Enter` expands/collapses a family, and `Enter` on a model selects it for
   this TUI session without mutating config.
 - Settings are read-only in this spike. Tools such as quantizer, AWQ import,

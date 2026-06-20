@@ -96,7 +96,7 @@ def start_server() -> tuple[str, subprocess.Popen[str], Any, str]:
         "HIPFIRE_JINJA_CHAT": "1",
     })
     proc = subprocess.Popen(
-        ["bun", os.path.join(root, "cli", "index.ts"), "serve", "127.0.0.1", str(port)],
+        ["cargo", "run", "-q", "-p", "hipfire-cli", "--", "serve", "--host", "127.0.0.1", "--port", str(port)],
         cwd=root,
         stdin=subprocess.DEVNULL,
         stdout=log_file,

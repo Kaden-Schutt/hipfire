@@ -65,14 +65,6 @@ into full investigations here.
   is skipped for files > 64 GiB, and `drop_mmap()` now calls `FADV_DONTNEED` to
   cancel any in-flight readahead before the O_DIRECT path starts.
 
-## [High] cli/index.ts is a monolithic file
-- Category: Maintainability
-- Location: cli/index.ts
-- Summary: The file is ~490KB, indicating poor module boundaries and mixed responsibilities.
-- Suggested fix: Break down into smaller, focused modules (e.g., config, daemon management, CLI commands).
-- Scope: Architectural
-- Confidence: High
-
 ## [High] crates/rdna-compute/src/dispatch.rs is excessively large
 - Category: Maintainability
 - Location: crates/rdna-compute/src/dispatch.rs

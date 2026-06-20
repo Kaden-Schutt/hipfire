@@ -3,7 +3,7 @@
 // hipfire - see LICENSE and NOTICE in the project root.
 
 use std::{
-    env, fs,
+    fs,
     process::{Command, Stdio},
     time::Duration,
 };
@@ -66,23 +66,13 @@ impl StatusState {
 }
 
 pub fn start_background_serve() -> Result<()> {
-    let cwd = env::current_dir()?;
-    let script = cwd.join("cli/index.ts");
-    if !script.exists() {
-        return Err(anyhow!(
-            "cli/index.ts not found; run this spike from the hipfire repo root"
-        ));
-    }
-
-    Command::new("bun")
-        .arg(script)
+    Command::new("hipfire")
         .arg("serve")
-        .arg("-d")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|err| anyhow!("failed to launch `bun cli/index.ts serve -d`: {err}"))?;
+        .map_err(|err| anyhow!("failed to launch `hipfire serve`: {err}"))?;
     Ok(())
 }
 

@@ -295,7 +295,7 @@ matches. Index of currently-available skills:
   `hipfire serve`. **Reach for this when:** serve "Failed to start
   (port in use)", a stale daemon holds VRAM, a pre-warm JSON-parse /
   os-error-2 crash left a zombie `daemon.pid` singleton, or you need a
-  guaranteed-fresh daemon. Kills bun CLI + spawned daemon, fuser-frees
+  guaranteed-fresh daemon. Kills Rust serve + spawned daemon, fuser-frees
   the port, reaps pid/lock files. `scripts/serve-restart.sh [port]`.
 
 When adding a new skill, give it a one-line index entry here so future
