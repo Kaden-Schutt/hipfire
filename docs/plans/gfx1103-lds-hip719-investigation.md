@@ -193,6 +193,15 @@ The currently promoted standalone GEMM jig lives in the repo:
   direct-AB multi-exec repro. It defaults to `BUILD_ONLY=1`, compiles the child
   and parent, captures ISA/readobj artifacts, and does not launch the risky
   repro unless `BUILD_ONLY=0` is explicitly set.
+- `scripts/lds_direct_ab_780m_test_jig.sh`: one-command handoff jig for a
+  second gfx1103/780M system. The default `--build-only` mode safely compiles
+  the direct-AB active-shape controls and captures codegen artifacts under
+  `/tmp/hipfire-lds-direct-ab-780m-buildonly`. `--risky` runs the current
+  focused sequence: 4x4 one-child pass control, 5x5 one-child pass controls,
+  6x6 split-child pass control, then the 6x6 one-child fail-side repro. It
+  writes `report.tsv`, `summary.txt`, and
+  `direct-ab-artifact-summary.tsv/.md`, and `--compare` delegates to the
+  direct-AB summary comparator for local-vs-remote result checks.
 - `scripts/lds_direct_ab_artifact_summary.sh`: read-only summarizer for
   direct-AB artifact roots. It writes `direct-ab-artifact-summary.tsv/.md` with
   shape/chunk metadata, exit/sync failure, code-object hashes/resources, dmesg
