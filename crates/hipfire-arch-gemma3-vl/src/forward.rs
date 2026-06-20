@@ -8,10 +8,12 @@
 //!
 //! Mixed precision (encode is bandwidth-bound on unified-memory gfx1151): the
 //! per-layer linears run `gemm_bf16_x_bf16_wmma` (bf16 weights, f32 accumulation
-//! in the matrix cores) and attention runs the bf16 `flash_attn_bf16` (online
-//! softmax, no causal mask); `layernorm_batched`, `gelu_tanh_f32`, `bias_add_f32`,
-//! and `add_inplace_f32` stay F32 (negligible cost). The patch-embed linear stays
-//! F32 (its `k = 3·patch² = 588` is not a multiple of 16, so no WMMA).
+//! in the matrix cores); attention runs the f16-KV matrix-core flash
+//! (`attention_dflash_wmma_m64_n128_f16kv_v3_f32`, head_dim padded 72→128) on
+//! WMMA archs, falling back to the generic bf16 `flash_attn_bf16` otherwise.
+//! `layernorm_batched`, `gelu_tanh_f32`, `bias_add_f32`, and `add_inplace_f32`
+//! stay F32 (negligible cost). The patch-embed linear stays F32 (its
+//! `k = 3·patch² = 588` is not a multiple of 16, so no WMMA).
 //!
 //! Output `[num_patches=4096, hidden=1152]` feeds the multimodal projector
 //! (avg-pool → `mm_soft_emb_norm` → `mm_input_projection`), the next phase.
