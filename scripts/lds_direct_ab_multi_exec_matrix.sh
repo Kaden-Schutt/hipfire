@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="${1:-/tmp/hipfire-lds-direct-ab-multi-exec-artifacts}"
+SUMMARY="${SUMMARY:-$ROOT/lds_direct_ab_artifact_summary.sh}"
 BUILD_ONLY="${BUILD_ONLY:-1}"
 ACTIVE_X="${ACTIVE_X:-6}"
 ACTIVE_Y="${ACTIVE_Y:-6}"
@@ -34,6 +35,10 @@ for tool in "$HIPCC" "$READOBJ" "$OBJDUMP"; do
     exit 1
   fi
 done
+if [ ! -x "$SUMMARY" ]; then
+  echo "missing executable: $SUMMARY" >&2
+  exit 1
+fi
 
 if [ "$CLEAR_COREDUMP" = "1" ]; then
   for data in /sys/class/devcoredump/devcd*/data; do
@@ -107,7 +112,12 @@ if [ "$BUILD_ONLY" = "1" ]; then
     echo "phase_bin=$dest/lds_direct_ab_phase_probe"
     echo "parent_bin=$dest/lds_direct_ab_multi_exec_parent"
   } > "$dest/summary.txt"
+  "$SUMMARY" "$OUT" "$OUT/direct-ab-artifact-summary" > "$dest/artifact-summary.log" 2>&1 || {
+    cat "$dest/artifact-summary.log" >&2
+    exit 1
+  }
   cat "$dest/summary.txt"
+  cat "$dest/artifact-summary.log"
   exit 0
 fi
 
@@ -161,5 +171,11 @@ if [ "$rc" -ne 0 ]; then
     fi
   done
 fi
+
+"$SUMMARY" "$OUT" "$OUT/direct-ab-artifact-summary" > "$dest/artifact-summary.log" 2>&1 || {
+  cat "$dest/artifact-summary.log" >&2
+  exit 1
+}
+cat "$dest/artifact-summary.log"
 
 exit "$rc"

@@ -193,6 +193,10 @@ The currently promoted standalone GEMM jig lives in the repo:
   direct-AB multi-exec repro. It defaults to `BUILD_ONLY=1`, compiles the child
   and parent, captures ISA/readobj artifacts, and does not launch the risky
   repro unless `BUILD_ONLY=0` is explicitly set.
+- `scripts/lds_direct_ab_artifact_summary.sh`: read-only summarizer for
+  direct-AB artifact roots. It writes `direct-ab-artifact-summary.tsv/.md` with
+  shape/chunk metadata, exit/sync failure, code-object hashes/resources, dmesg
+  deltas, and decoded gfxhub/GCVM/GDS coredump fields.
 - `tests/gfx1103-lds-tail-snop-repro.sh`: focused cross-system pass/fail
   wrapper for a second 780M. The default `PROFILE=repro` checks the no-extra
   baseline against the tail-loop `s_nop` repro and writes a TSV report under
@@ -2425,7 +2429,12 @@ The build-only artifact
 `/tmp/hipfire-lds-direct-ab-promote-buildonly/a6x6_b6x6_r3_i448_chunks96_5_multi_plain_g512x86/`
 compiled both binaries and captured the expected direct-AB kernel metadata:
 `group_segment_fixed_size=288`, `sgpr_count=2`, `vgpr_count=34`,
-`wavefront_size=32`.
+`wavefront_size=32`. The wrapper now regenerates:
+
+```text
+/tmp/hipfire-lds-direct-ab-promote-buildonly/direct-ab-artifact-summary.tsv
+/tmp/hipfire-lds-direct-ab-promote-buildonly/direct-ab-artifact-summary.md
+```
 
 The earlier reads=6 / 192-iteration / 511x86 edge also compiles from the
 promoted source in build-only mode:
@@ -2437,6 +2446,16 @@ READS=6 ITERS=192 CHUNKS=98,2 GRID_X=511 GRID_Y=86 BUILD_ONLY=1 \
 
 Its build-only artifact captured `group_segment_fixed_size=288`,
 `sgpr_count=2`, `vgpr_count=52`, and `wavefront_size=32`.
+
+The direct-AB summarizer also parses older risky multi-exec artifacts. On
+`/tmp/hipfire-lds-direct-ab-multi-exec-artifacts/`, the current summary captures
+the known failing rows with:
+`sync_failure=phase1 sync ... failed: unspecified launch failure (719)`,
+`devcore_fault_addr=0x000074669d000000`,
+`devcore_prot_status=0x841051`,
+`devcore_gcvm_flags=MORE_FAULTS,PERMISSION_FAULTS,RW`,
+`devcore_gds_protection_fault=0x3f000007`, and
+`devcore_gds_vm_protection_fault=0x0fc00113`.
 
 ### Additional Sequence Sweep (Fresh)
 
