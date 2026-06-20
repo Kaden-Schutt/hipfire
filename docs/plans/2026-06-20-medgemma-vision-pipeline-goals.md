@@ -118,15 +118,27 @@ video both stream coherent output; integrates the Goal-1 cache on the hash path.
   `hits=1`, **byte-identical output (hit == miss)**; `.vrow` = 48B header +
   256×2560×4 f32, persists across restart.
 
-**Remaining (Goal 4):** the `hipfire-eval` battery row formalizing this as a
-CI-runnable suite (the direct evidence above is recorded; the eval-harness suite
-is the canonical home and is the open Goal-4 item). **Starting point:** the
-`Vision` battery is currently a declared-but-empty stub
-(`hipfire-eval/src/driver.rs:569` → `Vec::new()`) and the daemon executor
-(`executor_daemon.rs`) has no `image`/`video` field support. Implementing needs:
-(1) executor image/video request support, (2) medgemma test cases (model + a
-`MRI_BRAIN` fixture + prompt + coherence/non-degeneracy assertion), (3) wiring
-`Vision`-battery prompts. Add a daemon-serve parity guard for arch 13 alongside.
+**Goal 4 — DONE (2026-06-20, `943ddfed`).** The `hipfire-eval` `Vision` battery
+(previously a stub) now drives the gemma3-vl path through the daemon executor and
+PASSES on gfx1151 with medgemma-1.5-4b:
+- **`describe_image`** — loads the model, sends a committed MRI fixture
+  (`benchmarks/vision/images/mri_human_brain.jpg`) via `image_base64` + a
+  byte-identical prompt (`benchmarks/prompts/vision_describe_image.txt`), asserts
+  finite + non-degenerate (unique_word_ratio ≥ 0.30, max_word_freq ≤ 0.50;
+  measured 0.89 / 0.054).
+- **`cache_hit_determinism`** — reset + re-run the same image (vision-cache hit on
+  the 2nd pass); asserts byte-identical output — the in-harness hit==miss guard
+  (measured byte_identical=true).
+- Gated on `arch == "gemma3_vl"` (skip otherwise); image sent through the existing
+  `GenerateTextRequest.image_base64` (no wire-protocol extension); 3 no-GPU unit
+  tests for the coherence stat. Run:
+  `hipfire-eval --battery vision --no-cache --executor daemon --model <medgemma>.hfq`.
+- **Gotcha:** `find_daemon_bin` prefers a stale `~/.hipfire/bin` install over
+  `target/release` — set `HIPFIRE_DAEMON_BIN` or `hipfire install` for a fresh
+  daemon (affects all daemon-executor batteries, not just Vision).
+
+All four goals (1, 2, 4) are complete and GPU-validated; **Goal 3 (KVarN-8) is
+being taken independently by the user.**
 
 ## Goal 3 — 8-bit variance-normalized KV ("KVarN-8")
 
