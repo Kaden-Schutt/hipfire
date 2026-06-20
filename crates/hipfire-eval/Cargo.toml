@@ -17,6 +17,7 @@ hipfire-generate = { path = "../hipfire-generate" }
 hipfire-hash = { path = "../hipfire-hash" }
 hipfire-model = { path = "../hipfire-model" }
 anyhow = "1"
+base64 = "0.22"
 csv = "1"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }

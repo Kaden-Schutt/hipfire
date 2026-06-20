@@ -130,7 +130,7 @@ pub(crate) fn daemon_shared_model_load_battery(battery: BatteryId) -> bool {
 pub(crate) fn daemon_executor_available_for(config: &EvalConfig, battery: BatteryId) -> bool {
     if !matches!(
         battery,
-        BatteryId::Smoke | BatteryId::Speed | BatteryId::Profile
+        BatteryId::Smoke | BatteryId::Speed | BatteryId::Profile | BatteryId::Vision
     ) {
         return false;
     }
@@ -566,7 +566,8 @@ pub(crate) fn result_cache_prompt_paths(battery: BatteryId) -> Vec<&'static str>
         BatteryId::Perplexity => {
             vec!["benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt"]
         }
-        BatteryId::Barrage | BatteryId::Vision | BatteryId::Cask => Vec::new(),
+        BatteryId::Vision => vec!["benchmarks/prompts/vision_describe_image.txt"],
+        BatteryId::Barrage | BatteryId::Cask => Vec::new(),
     }
 }
 
