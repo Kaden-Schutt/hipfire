@@ -3697,6 +3697,14 @@ pub const GEMM_F16_F16_WMMA_SRC: &str =
 pub const GEMM_IU8_I32_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_iu8_i32_wmma.hip");
 
+/// Generic kernel library: WMMA signed-INT4 × INT4 → INT32 GEMM, (B, M) output.
+/// gfx1103 (RDNA3 UMA) wave32, register-tiled, zero LDS. Packed nibbles
+/// (`byte = k_even | k_odd<<4`), `v_wmma_i32_16x16x16_iu4`, both operands
+/// signed, clamp=false. See `kernels/src/gemm_iu4_i32_wmma.hip` and
+/// `docs/kernels/generic-kernel-library.md`.
+pub const GEMM_IU4_I32_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_iu4_i32_wmma.hip");
+
 /// Bulk F32→F16 conversion for staging WMMA activations. Named
 /// `deepseek4_convert_f32_to_f16` to avoid collision with the embedded
 /// `convert_f32_to_f16` helper in `GEMM_HFQ4G256_RESIDUAL_FP16_SRC`

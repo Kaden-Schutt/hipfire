@@ -47,7 +47,7 @@ GEMM (existing kernels accumulate-and-store **F32**):
 | `f16→f16`  | ✅ done   | `gemm_f16_f16_wmma` (no-LDS, F32 accum + f16 store); parity test `examples/parity_gemm_f16_f16_wmma.rs`, validated on gfx1103 |
 | `bf16→bf16`| ✅ done   | `gemm_bf16_bf16_wmma` (no-LDS, F32 accum + bf16 store); parity test `examples/parity_gemm_bf16_bf16_wmma.rs`, validated on gfx1103 |
 | `iu8→i32`  | ✅ done   | `gemm_iu8_i32_wmma` (signed int8, no-LDS, clamp=false); parity test `examples/parity_gemm_iu8_i32_wmma.rs`, EXACT match on gfx1103 |
-| `iu4→i32`  | ⚠️ partial| `gemm_s4s4_wmma_tile_gfx1151` (signed-only, gfx1151-tagged) — generalize + test |
+| `iu4→i32`  | ✅ done   | `gemm_iu4_i32_wmma` (signed int4, gfx1103-generic, no-LDS, clamp=false); parity test `examples/parity_gemm_iu4_i32_wmma.rs`, EXACT match on gfx1103 |
 
 GEMV:
 
@@ -124,10 +124,12 @@ follow the same shape.
 
 ## Build order
 
-1. Foundation (this doc) + `is_rdna3_uma()` cap helper.
-2. GEMM missing set: `bf16→bf16`, `f16→f16`, then `iu8→i32`, generalize
-   `iu4→i32`. (Reuse existing `bf16→f32` / `f16→f32`.)
-3. GEMV across all six (no-LDS register/dot bodies; UMA-first since GEMV is
+1. ✅ Foundation (this doc) + `is_rdna3_uma()` cap helper.
+2. ✅ GEMM tier complete on gfx1103: `bf16→bf16`, `f16→f16`, `iu8→i32`,
+   `iu4→i32` all built + parity-tested (floats: F32-accum+round store; ints:
+   exact). `bf16→f32` / `f16→f32` reused from pre-existing kernels.
+3. ⏳ GEMV across all six (no-LDS register/dot bodies; UMA-first since GEMV is
    memory-bound and the MI50/UMA story centers on it).
-4. Numeric tests for each on gfx1100 + gfx1151.
+4. Numeric tests for each (currently validated on gfx1103; re-run on
+   gfx1100/gfx1151 when fleet access is available).
 5. Later phases: gfx906 V_DOT path, gfx1201 fp8/sparse.
