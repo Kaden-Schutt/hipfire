@@ -12,6 +12,7 @@ deltanet = ["rdna-compute/deltanet"]
 
 [dependencies]
 hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-evidence = { path = "../hipfire-evidence" }
 hipfire-generate = { path = "../hipfire-generate" }
 hipfire-prompt = { path = "../hipfire-prompt" }
 hipfire-model = { path = "../hipfire-model" }

@@ -1626,6 +1626,7 @@ dependencies = [
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
+ "hipfire-evidence",
  "hipfire-generate",
  "hipfire-model",
  "hipfire-npu",

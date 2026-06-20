@@ -18,6 +18,8 @@ use hipfire_generate::eos_filter::{EosFilter, EosFilterConfig};
 use hipfire_generate::loop_guard::LoopGuard;
 use hipfire_prompt as prompt_frame;
 
+use crate::model::LoadedModel;
+
 /// Collapse runaway whitespace (3+ newlines → 2, etc.) before tokenizing, so
 /// prompts that differ only in blank-line padding tokenize identically — a
 /// material τ/throughput stabilizer (see CLAUDE.md "Prompt-structure τ
@@ -123,6 +125,10 @@ pub fn gpu_block_attractor_token(
 /// none) unioned with the per-request stop sequences. Holdback prefixes let the
 /// filter buffer a partial stop token rather than leaking it before the match
 /// completes.
+pub fn chat_output_filter(m: &LoadedModel, request_stop_sequences: &[String]) -> EosFilter {
+    chat_output_filter_from_profile(m.chat_template_profile.as_ref(), request_stop_sequences)
+}
+
 pub fn chat_output_filter_from_profile(
     chat_template_profile: Option<&prompt_frame::ChatTemplateProfile>,
     request_stop_sequences: &[String],

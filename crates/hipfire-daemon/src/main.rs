@@ -29,8 +29,6 @@ use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35;
-use hipfire_evidence::{RouterHistogramEvidence, RouterHistogramLayer, RuntimeOneshotEvidence};
-use hipfire_generate::eos_filter::EosFilter;
 #[cfg(test)]
 use hipfire_generate::validate_qwen35_fused_dense_prefill_batch_preflight;
 use hipfire_generate::{
@@ -56,7 +54,6 @@ use hipfire_state::{
     sequence_state_page_descriptor_json, SequenceStateHandle,
 };
 use std::io::{BufRead, Write};
-use std::path::Path;
 use std::time::Instant;
 
 // These modules now live in `hipfire-serving-core` (workstream A0). Re-import
@@ -67,144 +64,27 @@ use dummy::{
     emit_dummy_generate_batch_prefill_ready, run_generate_batch_prefill_dummy, DummyModelState,
 };
 use events::{emit_error_with_id, write_error, MAX_BASE64_ENCODED_LEN};
+use evidence::{
+    write_daemon_moe_router_evidence, write_daemon_runtime_oneshot_evidence,
+    DaemonMoeRouterHistogramGuard,
+};
 use generate_vl::{generate_vl, generate_vl_dots_ocr};
 use hipfire_serving_core::{
-    dummy, events, generate_vl, load, model, output_filter, qwen35_decode, qwen35_prefill, session,
+    dummy, events, evidence, generate_vl, load, model, output_filter, qwen35_decode,
+    qwen35_prefill, request, session,
 };
 use load::*;
 use model::{CaskConfig, LoadedModel, RAW_OVERRIDE};
 use output_filter::{
-    chat_output_filter_from_profile, normalize_daemon_prompt, normalize_request_stop_sequences,
+    chat_output_filter, normalize_daemon_prompt, normalize_request_stop_sequences,
 };
 use qwen35_decode::*;
 use qwen35_prefill::*;
+use request::ThinkMode;
 use session::*;
 mod generate;
 mod generate_arch;
 use generate::*;
-
-fn daemon_runtime_context(model: &LoadedModel) -> serde_json::Value {
-    serde_json::json!({
-        "schema": 1,
-        "runner": "hipfire-daemon",
-        "hipfire_version": env!("CARGO_PKG_VERSION"),
-        "model_path": &model.model_path,
-        "arch_id": model.arch_id,
-        "pipeline_parallel_degree": model.pp,
-        "max_seq": model.max_seq,
-        "physical_cap": model.physical_cap,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn write_daemon_runtime_oneshot_evidence(
-    dir: &str,
-    model: &LoadedModel,
-    gpu: &rdna_compute::Gpu,
-    id: &str,
-    prompt_tokens: usize,
-    emitted_tokens: usize,
-    prefill_secs: f64,
-    decode_secs: f64,
-    ttft_ms: f64,
-) {
-    let (vram_free_bytes, vram_total_bytes) = gpu.hip.get_vram_info().unwrap_or((0, 0));
-    let vram_used_mb =
-        ((vram_total_bytes.saturating_sub(vram_free_bytes)) as f64 / (1024.0 * 1024.0)) as u64;
-    let vram_total_mb = (vram_total_bytes as f64 / (1024.0 * 1024.0)) as u64;
-    let runtime_context = daemon_runtime_context(model);
-    let evidence = RuntimeOneshotEvidence {
-        case_id: id,
-        prompt_path: "daemon://generate",
-        prompt_tokens,
-        emitted_tokens,
-        prefill_forward_calls: if prompt_tokens == 0 { 0 } else { 1 },
-        decode_forward_calls: emitted_tokens,
-        prefill_secs,
-        decode_secs,
-        ttft_ms,
-        vram_used_mb,
-        vram_total_mb,
-    };
-    if let Err(err) =
-        hipfire_evidence::write_runtime_oneshot_evidence(Path::new(dir), &runtime_context, evidence)
-    {
-        eprintln!("[daemon/evidence] failed to write runtime oneshot evidence: {err}");
-    }
-}
-
-pub(crate) struct DaemonMoeRouterHistogramGuard {
-    active: bool,
-}
-
-impl DaemonMoeRouterHistogramGuard {
-    pub(crate) fn start(evidence_dir: Option<&str>, config: &qwen35::Qwen35Config) -> Self {
-        let active = evidence_dir.is_some() && config.num_experts > 0;
-        if active {
-            qwen35::reset_moe_router_histogram(config.num_experts, config.num_experts_per_tok);
-        }
-        Self { active }
-    }
-
-    pub(crate) fn take(mut self) -> Option<qwen35::MoeRouterHistogram> {
-        self.active = false;
-        qwen35::take_moe_router_histogram()
-    }
-}
-
-impl Drop for DaemonMoeRouterHistogramGuard {
-    fn drop(&mut self) {
-        if self.active {
-            let _ = qwen35::take_moe_router_histogram();
-        }
-    }
-}
-
-pub(crate) fn write_daemon_moe_router_evidence(
-    dir: &str,
-    model: &LoadedModel,
-    id: &str,
-    hist: qwen35::MoeRouterHistogram,
-) {
-    if hist.routed_slots == 0 {
-        return;
-    }
-    let runtime_context = daemon_runtime_context(model);
-    let evidence = RouterHistogramEvidence {
-        case_id: id,
-        prompt_path: "daemon://generate",
-        collection_scope: "qwen35_moe_daemon_ar_forward_calls",
-        num_experts: hist.num_experts,
-        k_top: hist.k_top,
-        routed_tokens: hist.routed_tokens,
-        routed_slots: hist.routed_slots,
-        top1_histogram: hist.top1_histogram,
-        topk_histogram: hist.topk_histogram,
-        weight_sums: hist.weight_sums,
-        dropped_indices: hist.dropped_indices,
-        per_layer: hist
-            .per_layer
-            .into_iter()
-            .map(|layer| RouterHistogramLayer {
-                layer_idx: layer.layer_idx,
-                top1_histogram: layer.top1_histogram,
-                topk_histogram: layer.topk_histogram,
-                weight_sums: layer.weight_sums,
-                dropped_indices: layer.dropped_indices,
-                routed_tokens: layer.routed_tokens,
-                routed_slots: layer.routed_slots,
-                cooccurrence: layer.cooccurrence,
-            })
-            .collect(),
-    };
-    if let Err(err) = hipfire_evidence::write_router_histogram_evidence(
-        Path::new(dir),
-        &runtime_context,
-        evidence,
-    ) {
-        eprintln!("[daemon/evidence] failed to write MoE router evidence: {err}");
-    }
-}
 
 /// Acquire a machine-wide exclusive lock on ~/.hipfire/daemon.pid.
 ///
@@ -255,10 +135,6 @@ fn acquire_daemon_lock() -> hipfire_lock::FlockGuard {
     // open fd, so rewriting the contents doesn't drop the lock.
     let _ = guard.write_holder(&std::process::id().to_string());
     guard
-}
-
-pub(crate) fn chat_output_filter(m: &LoadedModel, request_stop_sequences: &[String]) -> EosFilter {
-    chat_output_filter_from_profile(m.chat_template_profile.as_ref(), request_stop_sequences)
 }
 
 #[cfg(test)]
@@ -5014,39 +4890,6 @@ fn main() {
                 );
                 let _ = stdout.flush();
             }
-        }
-    }
-}
-
-/// HuggingFace DeepSeek V4 thinking modes (per `encoding/README.md`).
-///
-/// The chat template choice changes the open-token after `<｜Assistant｜>`
-/// and (for `Max`) prepends an extended reasoning instruction.
-#[derive(Copy, Clone, Debug)]
-pub enum ThinkMode {
-    /// Non-thinking. Frame: `<｜Assistant｜></think>{response}`.
-    /// Model skips reasoning, replies directly. HF default for chat.
-    NonThink,
-    /// Thinking-high. Frame: `<｜Assistant｜><think>{reasoning}</think>{response}`.
-    /// Model produces a `<think>` block before responding.
-    High,
-    /// Thinking-max. Same frame as `High`, plus prepended
-    /// "Reasoning Effort: Absolute maximum..." system instruction.
-    /// HF recommends context ≥ 384K for this mode.
-    Max,
-}
-
-impl ThinkMode {
-    /// Map a JSONL field value (OpenAI-compatible `reasoning_effort` or
-    /// project-custom `thinking_mode`) to a mode.
-    /// Accepted: "none|off|chat|minimal" → NonThink;
-    ///           "low|medium|high|thinking" → High;
-    ///           "max" → Max. Anything else → NonThink (safe default).
-    pub fn from_str(s: &str) -> Self {
-        match s.to_ascii_lowercase().as_str() {
-            "max" => Self::Max,
-            "high" | "thinking" | "low" | "medium" => Self::High,
-            _ => Self::NonThink,
         }
     }
 }
