@@ -146,6 +146,9 @@ The currently promoted standalone GEMM jig lives in the repo:
 - `scripts/lds_gemm_summary_compare.sh`: read-only TSV comparator for two
   artifact summaries. It classifies differences as source drift, codegen drift,
   same-codegen runtime difference, same-result environment difference, or same.
+- `scripts/lds_gemm_780m_runbook.sh`: command-only runbook printer for the
+  second-780M flow: safe build-only preflight, risky repro, optional K-edge
+  repro, summary regeneration, and summary comparison.
 - `scripts/narrow-gemm-lds-shape.sh`: runs the curated variant matrix and
   writes a TSV report plus summary.
 - `tests/gfx1103-lds-tail-snop-repro.sh`: focused cross-system pass/fail
@@ -2392,6 +2395,12 @@ OUT=/tmp/hipfire-lds-tail-snop-780m tests/gfx1103-lds-tail-snop-repro.sh
 Use `PROFILE=kedge` for the current K-limit edge (`K_LIMIT=3024` pass-side,
 `K_LIMIT=3032` fail-side) or `PROFILE=full` for baseline, K-edge, and full-depth
 tail-noop checks in one run.
+
+Print the full second-780M command sequence with:
+
+```bash
+scripts/lds_gemm_780m_runbook.sh
+```
 
 - Summarize an artifact root for cross-machine comparison:
 
