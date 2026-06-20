@@ -1659,6 +1659,17 @@ Latest artifact paths:
   signature. This suggests an in-process device reset can clear enough
   near-edge state for the split case, but it does not eliminate the underlying
   failing one-child shape.
+- First-risky cleanup-mode checks for the same `3x11`, READS=2, `132+1`
+  shape show that stream/primary-context variants are not equivalent to
+  `hipDeviceReset`. `stream_recreate` from a fresh throwaway worktree
+  (`/tmp/hipfire-lds-direct-ab-stream-first-artifacts/`, worktree
+  `/tmp/hipfire-lds-direct-ab-stream-first-1781925950`) failed during phase1
+  at sync/global 69. `primary_ctx_reset` from a separate fresh throwaway
+  worktree (`/tmp/hipfire-lds-direct-ab-primary-first-artifacts/`, worktree
+  `/tmp/hipfire-lds-direct-ab-primary-first-1781925950`) failed during phase1
+  at sync/global 33. Both kept the canonical coredump signature. Because they
+  did not reach the phase boundary, these rows are threshold-perturbation
+  evidence, not boundary-cleanup evidence.
 
 ## Current Narrowing
 
@@ -2021,6 +2032,12 @@ Reduction results after extending the standalone HIP GEMM probe:
   one-child `134` control still failed. Treat `hipDeviceReset` as a diagnostic
   state-clearing lever near the edge, not as evidence that the reduced trigger
   is gone.
+- Explicit stream and primary-context boundary modes are not interchangeable
+  with `hipDeviceReset`: first-risky `stream_recreate` and
+  `primary_ctx_reset` runs failed in phase1 before reaching the boundary. That
+  keeps the useful cleanup claim narrow: only the observed `hipDeviceReset`
+  path cleared enough state for the `132+1` split, while other HIP API shapes
+  can shift the launch threshold downward.
 - Phase-mode controls sharpen the process-boundary result. With the same
   direct-AB kernel body at reads=6/192/511x86, same-process `99 + 1` fails on
   phase2 launch 0 / global launch 99, and same-process `98 + 2` fails on
@@ -2413,6 +2430,7 @@ LDS-only control:
 | direct-AB multi-exec `8x4` block/layout, reads=2, 448 iters, 512x86 | PASS at one-child `500`/`1000` | `_Z25lds_direct_ab_phase_probev` | 256 B | 24 | 2 | 0 | 32 |
 | direct-AB multi-exec `11x3`/`3x11` block/layout, reads=1, 448 iters, 512x86 | PASS at one-child `500` for both orientations | `_Z25lds_direct_ab_phase_probev` | 276 B | 22 | 2 | 0 | 32 |
 | direct-AB multi-exec `11x3`/`3x11` block/layout, reads=2, 448 iters, 512x86 | `11x3`: PASS `131`/`132`, FAIL `133`, split `132,1` PASS; `3x11`: PASS `131`-`133`, FAIL `134`, cross-process `132,1` PASS, same-process `132+1` FAIL at phase2 launch 0, `device_reset` boundary `132+1` PASS | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
+| direct-AB phase-mode `3x11` block/layout, reads=2, 448 iters, 512x86, first-risky cleanup modes | `stream_recreate 132+1` FAILS in phase1/global 69; `primary_ctx_reset 132+1` FAILS in phase1/global 33 | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
 | direct-AB no-output `8x4` active in `8x5` block, reads=6 | PASS at 512 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 256 B | 22 | 5 | 0 | 32 |
 
 ISA observations:
