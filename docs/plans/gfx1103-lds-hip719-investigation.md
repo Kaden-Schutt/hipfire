@@ -142,12 +142,16 @@ The currently promoted standalone GEMM jig lives in the repo:
   cross-machine repro results. It writes TSV and Markdown summaries from
   `meta.txt`, `run.log`, `exit_code.txt`, dmesg deltas, devcoredump presence,
   saved ISA/readobj files, and short SHA-256 hashes for the captured HIP source,
-  AMDGPU object, and AMDGPU ISA dump. Dmesg deltas are counted with a multiset
-  difference between `dmesg.before.txt` and `dmesg.after.txt`, which handles
-  kernel ring-buffer snapshots while preserving repeated new reset messages.
+  AMDGPU object, raw AMDGPU ISA dump, and normalized AMDGPU ISA dump. The
+  normalized ISA hash strips the disassembly file-format line because it embeds
+  the artifact path and otherwise produces false codegen-drift reports. Dmesg
+  deltas are counted with a multiset difference between `dmesg.before.txt` and
+  `dmesg.after.txt`, which handles kernel ring-buffer snapshots while preserving
+  repeated new reset messages.
 - `scripts/lds_gemm_summary_compare.sh`: read-only TSV comparator for two
   artifact summaries. It classifies differences as source drift, codegen drift,
-  same-codegen runtime difference, same-result environment difference, or same.
+  same-codegen runtime difference, codegen metadata drift, same-result
+  environment difference, or same.
 - `scripts/lds_gemm_780m_runbook.sh`: command-only runbook printer for the
   second-780M flow: safe build-only preflight, risky repro, optional K-edge
   repro, summary regeneration, and summary comparison.
@@ -157,7 +161,9 @@ The currently promoted standalone GEMM jig lives in the repo:
   wrapper for a second 780M. The default `PROFILE=repro` checks the no-extra
   baseline against the tail-loop `s_nop` repro and writes a TSV report under
   `/tmp/hipfire-lds-tail-snop-repro`; it also invokes the artifact summarizer
-  at the end of the run.
+  at the end of the run. With `BUILD_ONLY=1`, runtime pass/fail expectations
+  are intentionally bypassed and each case is judged only on whether it built
+  and captured artifacts successfully.
 
 Older throwaway-only HIP probes used during the investigation:
 

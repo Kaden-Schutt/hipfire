@@ -37,20 +37,29 @@ function load_row(dst,    i) {
 function same(a, b) {
     return a == b ? "same" : "diff";
 }
-function classify(k,    source_same, obj_same, isa_same, exit_same, driver_same, hipcc_same, verdict) {
+function code_same(k) {
+    if (left[k, "amdgpu_isa_norm_sha256"] != "" && right[k, "amdgpu_isa_norm_sha256"] != "") {
+        return same(left[k, "amdgpu_isa_norm_sha256"], right[k, "amdgpu_isa_norm_sha256"]);
+    }
+    return same(left[k, "amdgpu_isa_sha256"], right[k, "amdgpu_isa_sha256"]);
+}
+function classify(k,    source_same, code_same_result, metadata_same, exit_same, driver_same, hipcc_same, verdict) {
     source_same = same(left[k, "source_sha256"], right[k, "source_sha256"]);
-    obj_same = same(left[k, "amdgpu_obj_sha256"], right[k, "amdgpu_obj_sha256"]);
-    isa_same = same(left[k, "amdgpu_isa_sha256"], right[k, "amdgpu_isa_sha256"]);
+    code_same_result = code_same(k);
+    metadata_same = (same(left[k, "amdgpu_obj_sha256"], right[k, "amdgpu_obj_sha256"]) == "same" && \
+        same(left[k, "amdgpu_isa_sha256"], right[k, "amdgpu_isa_sha256"]) == "same") ? "same" : "diff";
     exit_same = same(left[k, "exit"], right[k, "exit"]);
     driver_same = same(left[k, "driver"], right[k, "driver"]);
     hipcc_same = same(left[k, "hipcc"], right[k, "hipcc"]);
 
     if (source_same == "diff") {
         verdict = "source-drift";
-    } else if (obj_same == "diff" || isa_same == "diff") {
+    } else if (code_same_result == "diff") {
         verdict = "codegen-drift";
     } else if (exit_same == "diff") {
         verdict = "same-codegen-runtime-diff";
+    } else if (metadata_same == "diff") {
+        verdict = "codegen-metadata-drift";
     } else if (driver_same == "diff" || hipcc_same == "diff") {
         verdict = "same-result-env-diff";
     } else {
@@ -85,10 +94,10 @@ file_no == 2 {
     next;
 }
 END {
-    print "key\tstatus\tverdict\tleft_exit\tright_exit\tleft_sync\tright_sync\tsource\tobj\tisa\tdriver\thipcc\tleft_git\tright_git";
+    print "key\tstatus\tverdict\tleft_exit\tright_exit\tleft_sync\tright_sync\tsource\tobj\tisa\tisa_norm\tdriver\thipcc\tleft_git\tright_git";
     for (k in left_keys) {
         if (!(k in right_keys)) {
-            print k "\tleft-only\tmissing-right\t" left[k, "exit"] "\t\t" left[k, "sync_failure"] "\t\t\t\t\t\t\t" left[k, "git_commit"] "\t";
+            print k "\tleft-only\tmissing-right\t" left[k, "exit"] "\t\t" left[k, "sync_failure"] "\t\t\t\t\t\t\t\t" left[k, "git_commit"] "\t";
             continue;
         }
         verdict = classify(k);
@@ -97,13 +106,14 @@ END {
             same(left[k, "source_sha256"], right[k, "source_sha256"]) "\t" \
             same(left[k, "amdgpu_obj_sha256"], right[k, "amdgpu_obj_sha256"]) "\t" \
             same(left[k, "amdgpu_isa_sha256"], right[k, "amdgpu_isa_sha256"]) "\t" \
+            same(left[k, "amdgpu_isa_norm_sha256"], right[k, "amdgpu_isa_norm_sha256"]) "\t" \
             same(left[k, "driver"], right[k, "driver"]) "\t" \
             same(left[k, "hipcc"], right[k, "hipcc"]) "\t" \
             left[k, "git_commit"] "\t" right[k, "git_commit"];
     }
     for (k in right_keys) {
         if (!(k in left_keys)) {
-            print k "\tright-only\tmissing-left\t\t" right[k, "exit"] "\t\t" right[k, "sync_failure"] "\t\t\t\t\t\t\t" right[k, "git_commit"];
+            print k "\tright-only\tmissing-left\t\t" right[k, "exit"] "\t\t" right[k, "sync_failure"] "\t\t\t\t\t\t\t\t" right[k, "git_commit"];
         }
     }
 }

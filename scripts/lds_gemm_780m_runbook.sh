@@ -49,5 +49,7 @@ cat <<'EOF'
 # - codegen-drift: same source compiled differently; compare ROCm/HIP/tool env.
 # - same-codegen-runtime-diff: same source/object/ISA but different outcome;
 #   this points at runtime/driver/device state.
+# - codegen-metadata-drift: normalized ISA matches, but raw object/disassembly
+#   metadata differs, usually from build path or object metadata noise.
 # - same: summary rows match on the fields the comparator tracks.
 EOF

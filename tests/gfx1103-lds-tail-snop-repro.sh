@@ -29,6 +29,7 @@ run_case() {
     local expected="$5"
     local case_out="$OUT/$case_name"
     local rc match
+    local reported_expected="$expected"
 
     mkdir -p "$case_out"
     echo "[gfx1103-lds-tail-snop] case=$case_name variant=$variant launches=$launches shape=${M}x${N}x${K} k_limit=$k_limit expected=$expected" >&2
@@ -47,8 +48,14 @@ run_case() {
     rc=$?
     set -e
 
+    if [[ "$BUILD_ONLY" == "1" ]]; then
+        reported_expected="build-only"
+    fi
+
     match=0
-    if [[ "$expected" == "pass" && "$rc" -eq 0 ]]; then
+    if [[ "$BUILD_ONLY" == "1" && "$rc" -eq 0 ]]; then
+        match=1
+    elif [[ "$expected" == "pass" && "$rc" -eq 0 ]]; then
         match=1
     elif [[ "$expected" == "fail" && "$rc" -ne 0 ]]; then
         match=1
@@ -56,7 +63,7 @@ run_case() {
 
     printf '%s\t%s\tfull\t%s\t%sx%sx%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$case_name" "$variant" "$launches" "$M" "$N" "$K" "$k_limit" \
-        "$expected" "$rc" "$match" "$case_out" >>"$report"
+        "$reported_expected" "$rc" "$match" "$case_out" >>"$report"
 
     [[ "$match" -eq 1 ]]
 }
