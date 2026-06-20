@@ -149,7 +149,9 @@ The currently promoted standalone GEMM jig lives in the repo:
   artifact path and otherwise produces false codegen-drift reports. Dmesg
   deltas are counted with a multiset difference between `dmesg.before.txt` and
   `dmesg.after.txt`, which handles kernel ring-buffer snapshots while
-  preserving repeated new reset messages.
+  preserving repeated new reset messages. GDS/GDS-VM devcoredump registers are
+  decoded with the gfx11 masks from
+  `/usr/src/amdgpu-6.19.0-2307534.24.04/amd/include/asic_reg/gc/gc_11_0_3_sh_mask.h`.
 - `scripts/lds_gemm_summary_compare.sh`: read-only TSV comparator for two
   artifact summaries. It compares selected-variant ISA hashes first, then whole
   normalized ISA hashes, then raw object/disassembly hashes. It classifies

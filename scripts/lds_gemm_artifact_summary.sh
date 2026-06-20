@@ -119,6 +119,73 @@ devcore_reg_value() {
     fi
 }
 
+hex_to_dec() {
+    local value="$1"
+    if [[ "$value" =~ ^0[xX][0-9a-fA-F]+$ ]]; then
+        printf '%u\n' "$((value))"
+    fi
+}
+
+join_flags() {
+    local joined=""
+    local flag
+    for flag in "$@"; do
+        [[ -n "$flag" ]] || continue
+        if [[ -n "$joined" ]]; then
+            joined="${joined},${flag}"
+        else
+            joined="$flag"
+        fi
+    done
+    printf '%s\n' "$joined"
+}
+
+gds_fault_flags() {
+    local raw
+    local flags=()
+    raw="$(hex_to_dec "$1")"
+    [[ -n "$raw" ]] || return 0
+    ((raw & 0x1)) && flags+=("WRITE_DIS")
+    ((raw & 0x2)) && flags+=("FAULT_DETECTED")
+    ((raw & 0x4)) && flags+=("GRBM")
+    join_flags "${flags[@]}"
+}
+
+gds_vm_fault_flags() {
+    local raw
+    local flags=()
+    raw="$(hex_to_dec "$1")"
+    [[ -n "$raw" ]] || return 0
+    ((raw & 0x1)) && flags+=("WRITE_DIS")
+    ((raw & 0x2)) && flags+=("FAULT_DETECTED")
+    ((raw & 0x4)) && flags+=("GWS")
+    ((raw & 0x8)) && flags+=("OA")
+    ((raw & 0x10)) && flags+=("GRBM")
+    ((raw & 0x20)) && flags+=("TMZ")
+    join_flags "${flags[@]}"
+}
+
+gds_fault_addr() {
+    local raw
+    raw="$(hex_to_dec "$1")"
+    [[ -n "$raw" ]] || return 0
+    printf '0x%x\n' "$(((raw & 0xfffc0000) >> 18))"
+}
+
+gds_vm_fault_vmid() {
+    local raw
+    raw="$(hex_to_dec "$1")"
+    [[ -n "$raw" ]] || return 0
+    printf '%u\n' "$(((raw & 0x00000f00) >> 8))"
+}
+
+gds_vm_fault_addr() {
+    local raw
+    raw="$(hex_to_dec "$1")"
+    [[ -n "$raw" ]] || return 0
+    printf '0x%x\n' "$(((raw & 0xffff0000) >> 16))"
+}
+
 first_artifact_file() {
     local dir="$1"
     local name="$2"
@@ -130,7 +197,7 @@ first_artifact_file() {
     } 2>/dev/null | sort | head -1 || true
 }
 
-printf 'artifact\tvariant\tmode\tlaunches\tshape\tk_limit\tarch\tbuild_only\texit\tsync_failure\thip_error\tgit_commit\tgit_dirty\thipcc\tdriver\tgpu\tsource_sha256\tamdgpu_obj_sha256\tamdgpu_isa_sha256\tdmesg_remove_queue\tdmesg_mode2\tdmesg_gds\tdevcoredump\tisa_files\tamdgpu_isa_norm_sha256\tselected_isa_symbol\tselected_isa_norm_sha256\tdevcore_gfxhub_page_fault\tdevcore_fault_addr\tdevcore_prot_status\tdevcore_gds_protection_fault\tdevcore_gds_vm_protection_fault\n' >"$TSV"
+printf 'artifact\tvariant\tmode\tlaunches\tshape\tk_limit\tarch\tbuild_only\texit\tsync_failure\thip_error\tgit_commit\tgit_dirty\thipcc\tdriver\tgpu\tsource_sha256\tamdgpu_obj_sha256\tamdgpu_isa_sha256\tdmesg_remove_queue\tdmesg_mode2\tdmesg_gds\tdevcoredump\tisa_files\tamdgpu_isa_norm_sha256\tselected_isa_symbol\tselected_isa_norm_sha256\tdevcore_gfxhub_page_fault\tdevcore_fault_addr\tdevcore_prot_status\tdevcore_gds_protection_fault\tdevcore_gds_vm_protection_fault\tdevcore_gds_flags\tdevcore_gds_addr\tdevcore_gds_vm_flags\tdevcore_gds_vm_vmid\tdevcore_gds_vm_addr\n' >"$TSV"
 
 while IFS= read -r meta; do
     dir="$(dirname "$meta")"
@@ -185,6 +252,11 @@ while IFS= read -r meta; do
     devcore_prot_status="$(devcore_colon_value '^Protection fault status register:' "$devcore")"
     devcore_gds_pf="$(devcore_reg_value 'regGDS_PROTECTION_FAULT' "$devcore")"
     devcore_gds_vm_pf="$(devcore_reg_value 'regGDS_VM_PROTECTION_FAULT' "$devcore")"
+    devcore_gds_flags="$(gds_fault_flags "$devcore_gds_pf")"
+    devcore_gds_addr="$(gds_fault_addr "$devcore_gds_pf")"
+    devcore_gds_vm_flags="$(gds_vm_fault_flags "$devcore_gds_vm_pf")"
+    devcore_gds_vm_vmid="$(gds_vm_fault_vmid "$devcore_gds_vm_pf")"
+    devcore_gds_vm_addr="$(gds_vm_fault_addr "$devcore_gds_vm_pf")"
     isa_files=0
     if [[ -d "$dir/save-temps" ]]; then
         isa_files="$(find "$dir/save-temps" -maxdepth 1 -type f -name '*.isa.txt' 2>/dev/null | wc -l | tr -d ' ')"
@@ -198,7 +270,7 @@ while IFS= read -r meta; do
     selected_symbol="$(selected_isa_symbol "$variant")"
     selected_isa_norm_sha="$(selected_isa_sha256 "$amdgpu_isa" "$selected_symbol")"
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$rel" "$variant" "$mode" "$launches" "$shape" "$k_limit" "$arch" \
         "$build_only" "$exit_code" "$sync_failure" "$hip_error" "$git_commit" \
         "$git_dirty" "$hipcc" "$driver" "$gpu" "$source_sha" \
@@ -206,7 +278,9 @@ while IFS= read -r meta; do
         "$dmesg_mode2" "$dmesg_gds" "$devcoredump" "$isa_files" \
         "$amdgpu_isa_norm_sha" "$selected_symbol" "$selected_isa_norm_sha" \
         "$devcore_gfxhub_pf" "$devcore_fault_addr" "$devcore_prot_status" \
-        "$devcore_gds_pf" "$devcore_gds_vm_pf" >>"$TSV"
+        "$devcore_gds_pf" "$devcore_gds_vm_pf" "$devcore_gds_flags" \
+        "$devcore_gds_addr" "$devcore_gds_vm_flags" "$devcore_gds_vm_vmid" \
+        "$devcore_gds_vm_addr" >>"$TSV"
 done < <(find "$ROOT" -type f -name meta.txt | sort)
 
 {
@@ -216,13 +290,13 @@ done < <(find "$ROOT" -type f -name meta.txt | sort)
     echo "- generated: \`$(date -u +%Y-%m-%dT%H:%M:%SZ)\`"
     echo "- tsv: \`$TSV\`"
     echo
-    echo "| artifact | variant | exit | sync failure | git | driver | gpu | src | obj | isa | isa_norm | selected_isa | remove_queue | mode2 | gds | devcoredump | gfxhub_pf | gds_pf | gds_vm_pf |"
-    echo "|---|---|---:|---|---|---|---|---|---|---|---|---|---:|---:|---:|---:|---:|---|---|"
+    echo "| artifact | variant | exit | sync failure | git | driver | gpu | src | obj | isa | isa_norm | selected_isa | remove_queue | mode2 | gds | devcoredump | gfxhub_pf | gds_pf | gds_addr | gds_vm_pf | vmid | vm_addr |"
+    echo "|---|---|---:|---|---|---|---|---|---|---|---|---|---:|---:|---:|---:|---:|---|---|---|---:|---|"
     awk -F '\t' 'NR > 1 {
         dirty = ($13 == "1") ? " dirty" : "";
         sync_failure = ($10 == "") ? " " : $10;
-        printf "| `%s` | `%s` | `%s` | %s | `%s%s` | `%s` | `%s` | `%s` | `%s` | `%s` | `%s` | `%s` | %s | %s | %s | %s | %s | `%s` | `%s` |\n", \
-            $1, $2, $9, sync_failure, $12, dirty, $15, $16, $17, $18, $19, $25, $27, $20, $21, $22, $23, $28, $31, $32;
+        printf "| `%s` | `%s` | `%s` | %s | `%s%s` | `%s` | `%s` | `%s` | `%s` | `%s` | `%s` | `%s` | %s | %s | %s | %s | %s | `%s` | `%s` | `%s` | %s | `%s` |\n", \
+            $1, $2, $9, sync_failure, $12, dirty, $15, $16, $17, $18, $19, $25, $27, $20, $21, $22, $23, $28, $31, $34, $32, $36, $37;
     }' "$TSV"
 } >"$MD"
 
