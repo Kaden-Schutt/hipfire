@@ -160,7 +160,41 @@ if echo "$CHANGED" | grep -qE 'crates/rdna-compute/src/dispatch\.rs'; then
     echo
 fi
 
+# ── Tiny-fixture golden tripwire (cheap front tier) ──────────────────────
+# A deterministic golden over tiny random-init fixtures (seconds) decides
+# whether the expensive coherence battery needs to run. Two-tier policy
+# (docs/plans/2026-06-20-tiny-golden-tripwire.md; TODO.md §325):
+#   exit 0 (confirmed unchanged: every runnable cell == its committed baseline
+#           for THIS gpu-arch) → covered forward paths didn't change → SKIP the
+#           heavy battery. This is the cost win.
+#   exit 1 (drift)        → a covered kernel changed output → run the battery.
+#   exit 3 (no baseline for this gpu-arch) / exit 2 (couldn't run) → INCONCLUSIVE
+#           → run the battery (never skip safety on an inconclusive tripwire).
+# Overrides: HIPFIRE_FORCE_COHERENCE=1 always runs the battery;
+#            HIPFIRE_SKIP_TINY_GOLDEN=1 disables the tripwire (battery runs).
+# Note: this gates ONLY the coherence battery, not the DFlash gate below — the
+# fixture golden exercises the AR decode path, not the spec-decode tree path.
+RUN_COHERENCE=1
+if [ "${HIPFIRE_FORCE_COHERENCE:-0}" = "1" ] || [ "${HIPFIRE_SKIP_TINY_GOLDEN:-0}" = "1" ]; then
+    : # tripwire disabled — battery runs unconditionally
+else
+    echo "=== Tiny-fixture golden tripwire ==="
+    # `|| tg=$?` keeps the non-zero exits (1/2/3) from aborting under `set -e`
+    # while still capturing the specific code.
+    tg=0
+    ./tests/fixture-golden-gate.sh || tg=$?
+    case "$tg" in
+        0) echo "tiny golden: confirmed unchanged → SKIPPING heavy coherence battery."
+           RUN_COHERENCE=0 ;;
+        1) echo "tiny golden: DRIFT → escalating to the full coherence battery." ;;
+        3) echo "tiny golden: no baseline for this gpu-arch → running full battery." ;;
+        *) echo "tiny golden: could not run → running full battery." ;;
+    esac
+    echo
+fi
+
 # ── Coherence battery ────────────────────────────────────────────────────
+if [ "$RUN_COHERENCE" = 1 ]; then
 echo "=== Coherence Battery (short) ==="
 echo "Engine code changed. Running coherence battery (~2-4 min)..."
 echo "PFlash regression stage: $PFLASH_GATE_NOTE"
@@ -190,6 +224,7 @@ echo "hard errors. Read the report above and confirm each model's output is"
 echo "coherent (fluent, on-topic, not stuck in a verbatim loop) before"
 echo "proceeding with the commit."
 echo
+fi  # RUN_COHERENCE
 
 echo
 

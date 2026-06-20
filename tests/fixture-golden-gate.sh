@@ -63,7 +63,9 @@ lookup_baseline() { # gpu_arch model_arch format
     awk -v g="$1" -v m="$2" -v f="$3" '$1==g && $2==m && $3==f {print $4}' "$BASELINES" | head -1
 }
 
-fail=0
+fail=0          # drift or nondeterminism — a real regression signal
+matched=0       # runnable cell == its committed baseline for this gpu-arch
+nobaseline=0    # runnable cell, but no committed baseline for this gpu-arch
 declare -a RECORDED=()
 for arch in "${ARCHS[@]}"; do
     echo "== golden: $arch =="
@@ -91,11 +93,13 @@ for arch in "${ARCHS[@]}"; do
             echo "  $fmt: $h1 ($gpu_arch) [record]"
         elif [ -z "$base" ]; then
             echo "  NOTE $fmt: no baseline for $gpu_arch — observed $h1 (run --record to add)"
+            nobaseline=$((nobaseline + 1))
         elif [ "$base" != "$h1" ]; then
             echo "  FAIL drift $fmt: $h1 != baseline $base → escalate to 35B golden (agentic-gate.sh)"
             fail=1
         else
             echo "  OK $fmt: matches baseline ($h1)"
+            matched=$((matched + 1))
         fi
     done
 done
@@ -109,5 +113,25 @@ if [ "$RECORD" = 1 ]; then
     exit 0
 fi
 
-[ "$fail" = 0 ] && echo "fixture-golden-gate: PASS" || echo "fixture-golden-gate: FAIL"
-exit "$fail"
+# Exit-code contract (consumed by .githooks/pre-commit's two-tier wiring):
+#   0  CONFIRMED unchanged — every runnable cell matched a committed baseline
+#      for this gpu-arch (>=1 match, no drift, no missing baseline). The covered
+#      forward paths did not change → safe to skip the heavy coherence battery.
+#   1  DRIFT / nondeterminism — a covered kernel changed output. Escalate.
+#   3  INCONCLUSIVE — cells ran but ≥1 has no baseline for this gpu-arch
+#      (e.g. fleet box not yet recorded). Do NOT skip the heavy battery.
+#   2  could not run anything (build/GPU). Do NOT skip the heavy battery.
+if [ "$fail" != 0 ]; then
+    echo "fixture-golden-gate: FAIL (drift/nondeterminism) → escalate to coherence-gate.sh + rebaseline if intended"
+    exit 1
+fi
+if [ "$nobaseline" -gt 0 ]; then
+    echo "fixture-golden-gate: INCONCLUSIVE ($nobaseline cell(s) with no baseline for this gpu-arch; matched $matched) — run --record"
+    exit 3
+fi
+if [ "$matched" -gt 0 ]; then
+    echo "fixture-golden-gate: PASS ($matched cell(s) match committed baselines)"
+    exit 0
+fi
+echo "fixture-golden-gate: INCONCLUSIVE (no cells ran on this box)"
+exit 2
