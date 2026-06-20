@@ -1926,6 +1926,17 @@ Latest artifact paths:
   offset:12`. This separates a normal in-process synchronization boundary from
   a child-process boundary: only the latter avoided the cumulative fault in
   the paired split control.
+- Same-process stream recreation
+  (`/tmp/hipfire-lds-direct-ab-stream-recreate-artifacts/`, throwaway worktree
+  `/tmp/hipfire-lds-direct-ab-stream-current`, commit `480f0b8b`) also does not
+  clear the shifted row fault. The same active `30x1` start=3 shape ran phase1
+  `120` on a stream, destroyed that stream, created a new phase2 stream, then
+  failed in phase2 at local sync 57 / global launch 177 with HIP `719`;
+  destroying the failed phase2 stream also returned HIP `719`. The coredump
+  kept the canonical promoted direct-AB signature, and the selected normalized
+  ISA hash stayed `bb1a56b38225028e` with the same resource tuple and
+  `ds_load_b32 ... offset:12`. Stream lifetime therefore behaves like ordinary
+  same-process launch state, not like child-process exit.
 - Same-process `hipDeviceReset` phase split
   (`/tmp/hipfire-lds-direct-ab-device-reset-artifacts/`, throwaway worktree
   `/tmp/hipfire-lds-direct-ab-device-reset-current`, commit `61ba100a`) shows
@@ -2769,6 +2780,7 @@ LDS-only control:
 | direct-AB promoted-source shifted active `30x1` in `34x1` block/layout, reads=2, 448 iters, 512x86 | start=2 PASS one-child `500`; start=3 FAIL at sync/global 179; start=4 FAIL at sync/global 375; all use DS=12 and failing rows keep the canonical gfxhub/GDS signature | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB promoted-source shifted active `30x1` start=3 in `34x1`, reads=2, 448 iters, 512x86 | same total `500` launches PASS when split across child processes `120,120,120,140`; one-child `500` repeat FAILS at sync/global 179 with identical selected ISA/resource tuple | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB promoted-source shifted active `30x1` start=3 in `34x1`, same-process phase split, reads=2, 448 iters, 512x86 | phase1 `120` + boundary `hipDeviceSynchronize` + phase2 `380` FAILS in phase2 at local sync 61 / global 181 with identical selected ISA/resource tuple | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
+| direct-AB promoted-source shifted active `30x1` start=3 in `34x1`, same-process stream-recreate phase split, reads=2, 448 iters, 512x86 | phase1 `120` + stream destroy/recreate + phase2 `380` FAILS in phase2 at local sync 57 / global 177 with identical selected ISA/resource tuple | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB promoted-source shifted active `30x1` start=3 in `34x1`, same-process device-reset phase split, reads=2, 448 iters, 512x86 | phase1 `120` + `hipDeviceReset` OK + phase2 `380` FAILS in phase2 at local sync 253 / global 373 with identical selected ISA/resource tuple | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB promoted-source shifted active `29x1` in `34x1` block/layout, reads=2, 448 iters, 512x86 | start=3/4 initially PASS one-child `500`; start=5 FAIL at sync/global 374; post-failure recovery rerun of start=4 FAILS at 379; all use DS=12 and failing rows keep the canonical gfxhub/GDS signature | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB promoted-source shifted active `28x1` in `34x1` block/layout, reads=2, 448 iters, 512x86 | start=6 FAIL at sync/global 177 with canonical gfxhub/GDS signature | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
