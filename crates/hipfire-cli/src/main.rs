@@ -33,6 +33,10 @@ enum Command {
     /// user-facing surface; run via `cargo run -p hipfire-cli -- gen-docs`.
     #[command(hide = true)]
     GenDocs(commands::gen_docs::GenDocsArgs),
+    /// Render the shared config schema. Hidden: maintenance command for docs
+    /// and operator UI schema artifacts.
+    #[command(hide = true)]
+    GenConfigSchema(commands::gen_config_schema::GenConfigSchemaArgs),
 }
 
 #[tokio::main]
@@ -60,5 +64,6 @@ async fn main() -> anyhow::Result<()> {
         Command::CollectArtifacts(args) => commands::forward::run_collect_artifacts(args),
         Command::GpuLock(args) => commands::gpu_lock::run(args),
         Command::GenDocs(args) => commands::gen_docs::run(args),
+        Command::GenConfigSchema(args) => commands::gen_config_schema::run(args),
     }
 }

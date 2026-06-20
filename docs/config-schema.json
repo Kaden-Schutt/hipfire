@@ -1,0 +1,969 @@
+[
+  {
+    "key": "cask",
+    "type": {
+      "kind": "bool"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "false",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Enable CASK/TriAttention behavior where supported.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "cask_auto_attach",
+    "type": {
+      "kind": "bool"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "true",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Whether compatible CASK/TriAttention sidecars may auto-attach.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "cask_beta",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "128",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "CASK beta control value.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "cask_budget",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "512",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "CASK token or block budget.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "cask_core_frac",
+    "type": {
+      "kind": "f64"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "0.5",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Fraction of CASK core candidates to keep.",
+    "validation": "0.0..=1.0",
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "cask_fold_m",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "2",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "CASK fold factor.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "cask_sidecar",
+    "type": {
+      "kind": "path"
+    },
+    "requirement": {
+      "kind": "required_when",
+      "condition": "cask == true && cask_auto_attach == false"
+    },
+    "default": null,
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Explicit CASK/TriAttention sidecar path.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "default_model",
+    "type": {
+      "kind": "string"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": null,
+    "scopes": [
+      "global",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Model tag, alias, or path to pre-load or use by default.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "dflash_adaptive_b",
+    "type": {
+      "kind": "bool"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "true",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Whether DFlash may adapt draft batch size.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "dflash_mode",
+    "type": {
+      "kind": "enum",
+      "values": [
+        "off",
+        "auto",
+        "on"
+      ]
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "off",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "DFlash speculative decode mode.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "dflash_ngram_block",
+    "type": {
+      "kind": "json"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "\"auto\"",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "DFlash n-gram blocking policy; accepts boolean or auto.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "flash_mode",
+    "type": {
+      "kind": "enum",
+      "values": [
+        "auto",
+        "always",
+        "never"
+      ]
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "auto",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Flash-attention selection policy.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "gpu_slab_load",
+    "type": {
+      "kind": "enum",
+      "values": [
+        "auto",
+        "off",
+        "on"
+      ]
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "auto",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "GPU slab loading policy for model weights.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "host",
+    "type": {
+      "kind": "string"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "0.0.0.0",
+    "scopes": [
+      "global",
+      "runtime"
+    ],
+    "mutability": "static",
+    "owner": "hipfire-config",
+    "description": "Bind host for the OpenAI-compatible HTTP server.",
+    "validation": "valid IP address or hostname",
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "idle_timeout",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "300",
+    "scopes": [
+      "global",
+      "runtime"
+    ],
+    "mutability": "runtime_reloadable",
+    "owner": "hipfire-config",
+    "description": "Seconds of inactivity before the server may evict an idle model.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "kv_adaptive",
+    "type": {
+      "kind": "enum",
+      "values": [
+        "off",
+        "auto"
+      ]
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "off",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Adaptive KV-cache policy.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "kv_cache",
+    "type": {
+      "kind": "enum",
+      "values": [
+        "auto",
+        "q8",
+        "asym2",
+        "asym3",
+        "asym4"
+      ]
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "auto",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "KV-cache precision and memory policy.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "max_seq",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "4096",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Maximum context/KV-cache capacity allocated at model load.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "max_tokens",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "512",
+    "scopes": [
+      "global",
+      "model",
+      "request"
+    ],
+    "mutability": "request_only",
+    "owner": "hipfire-config",
+    "description": "Default maximum number of generated tokens per request.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "mmq_screen",
+    "type": {
+      "kind": "enum",
+      "values": [
+        "auto",
+        "off",
+        "on"
+      ]
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "auto",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "MMQ safety screening mode.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "mmq_screen_threshold",
+    "type": {
+      "kind": "f64"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "0.10",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "MMQ screening rejection threshold.",
+    "validation": "0.0..=1.0",
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "model_overrides",
+    "type": {
+      "kind": "json"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "{}",
+    "scopes": [
+      "global",
+      "model"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Sparse per-model override map layered on top of global config.",
+    "validation": "object keyed by model tag",
+    "secret": false,
+    "restart_impact": "reload_model",
+    "env": []
+  },
+  {
+    "key": "mtp_k",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "3",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Number of MTP candidate tokens to consider.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "mtp_mode",
+    "type": {
+      "kind": "enum",
+      "values": [
+        "auto",
+        "off",
+        "on"
+      ]
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "auto",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Multi-token prediction sidecar mode.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "port",
+    "type": {
+      "kind": "u16"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "11435",
+    "scopes": [
+      "global",
+      "runtime"
+    ],
+    "mutability": "static",
+    "owner": "hipfire-config",
+    "description": "Bind port for the OpenAI-compatible HTTP server.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "prefill_alpha",
+    "type": {
+      "kind": "f64"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "0.85",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Prefill compression scoring alpha.",
+    "validation": "0.0..=1.0",
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "prefill_block",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "128",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Block size used by prefill compression.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "prefill_compression",
+    "type": {
+      "kind": "enum",
+      "values": [
+        "off",
+        "auto",
+        "on"
+      ]
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "off",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Long-context prefill compression mode.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "prefill_drafter",
+    "type": {
+      "kind": "path"
+    },
+    "requirement": {
+      "kind": "required_when",
+      "condition": "prefill_compression != 'off' && prefill_drafter_device >= 0"
+    },
+    "default": null,
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Optional drafter artifact for prefill compression.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "prefill_drafter_device",
+    "type": {
+      "kind": "i32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "-1",
+    "scopes": [
+      "global",
+      "host",
+      "node",
+      "model"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Preferred accelerator device for the prefill drafter.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "prefill_keep_ratio",
+    "type": {
+      "kind": "f64"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "0.05",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Fraction of prefill blocks to keep under compression.",
+    "validation": "0.0..=1.0",
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "prefill_min_keep",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "2048",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Minimum tokens or blocks retained during prefill compression.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "prefill_profile",
+    "type": {
+      "kind": "bool"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "false",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Emit prefill compression profiling details.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "prefill_recent",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "1024",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Recent context size retained during prefill compression.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "prefill_sink",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "256",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Prefix sink size retained during prefill compression.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "prefill_sparse_threshold",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "32768",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Context threshold for sparse prefill behavior.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "prefill_threshold",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "32768",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Context length threshold for prefill compression.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "prompt_normalize",
+    "type": {
+      "kind": "bool"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "true",
+    "scopes": [
+      "global",
+      "model",
+      "request"
+    ],
+    "mutability": "request_only",
+    "owner": "hipfire-config",
+    "description": "Whether prompts are normalized before tokenization.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "repeat_penalty",
+    "type": {
+      "kind": "f64"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "1.05",
+    "scopes": [
+      "global",
+      "model",
+      "request"
+    ],
+    "mutability": "request_only",
+    "owner": "hipfire-config",
+    "description": "Default repeat penalty for generated text.",
+    "validation": "0.0..",
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "temperature",
+    "type": {
+      "kind": "f64"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "0.3",
+    "scopes": [
+      "global",
+      "model",
+      "request"
+    ],
+    "mutability": "request_only",
+    "owner": "hipfire-config",
+    "description": "Default sampling temperature.",
+    "validation": "0.0..",
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "thinking",
+    "type": {
+      "kind": "enum",
+      "values": [
+        "off",
+        "on"
+      ]
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "off",
+    "scopes": [
+      "global",
+      "model",
+      "request"
+    ],
+    "mutability": "request_only",
+    "owner": "hipfire-config",
+    "description": "Reasoning/thinking display policy for compatible models.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "top_p",
+    "type": {
+      "kind": "f64"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "0.8",
+    "scopes": [
+      "global",
+      "model",
+      "request"
+    ],
+    "mutability": "request_only",
+    "owner": "hipfire-config",
+    "description": "Default nucleus sampling probability.",
+    "validation": "0.0..=1.0",
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  }
+]

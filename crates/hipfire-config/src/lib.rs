@@ -4,9 +4,16 @@
 
 //! Shared CLI/server configuration and local filesystem paths.
 
+pub mod schema;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+
+pub use schema::{
+    config_schema, ConfigField, ConfigMutability, ConfigScope, ConfigType, Requirement,
+    RestartImpact,
+};
 
 fn default_host() -> String {
     "0.0.0.0".to_string()

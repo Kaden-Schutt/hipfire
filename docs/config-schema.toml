@@ -1,0 +1,510 @@
+[[field]]
+key = "cask"
+type = "bool"
+requirement = "optional"
+default = "false"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Enable CASK/TriAttention behavior where supported."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "cask_auto_attach"
+type = "bool"
+requirement = "optional"
+default = "true"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Whether compatible CASK/TriAttention sidecars may auto-attach."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "cask_beta"
+type = "u32"
+requirement = "optional"
+default = "128"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "CASK beta control value."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "cask_budget"
+type = "u32"
+requirement = "optional"
+default = "512"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "CASK token or block budget."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "cask_core_frac"
+type = "f64"
+requirement = "optional"
+default = "0.5"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Fraction of CASK core candidates to keep."
+validation = "0.0..=1.0"
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "cask_fold_m"
+type = "u32"
+requirement = "optional"
+default = "2"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "CASK fold factor."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "cask_sidecar"
+type = "path"
+requirement = "required when `cask == true && cask_auto_attach == false`"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Explicit CASK/TriAttention sidecar path."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "default_model"
+type = "string"
+requirement = "optional"
+scopes = ["global", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Model tag, alias, or path to pre-load or use by default."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "dflash_adaptive_b"
+type = "bool"
+requirement = "optional"
+default = "true"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Whether DFlash may adapt draft batch size."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "dflash_mode"
+type = "enum(off|auto|on)"
+requirement = "optional"
+default = "off"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "DFlash speculative decode mode."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "dflash_ngram_block"
+type = "json"
+requirement = "optional"
+default = "\"auto\""
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "DFlash n-gram blocking policy; accepts boolean or auto."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "flash_mode"
+type = "enum(auto|always|never)"
+requirement = "optional"
+default = "auto"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Flash-attention selection policy."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "gpu_slab_load"
+type = "enum(auto|off|on)"
+requirement = "optional"
+default = "auto"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "GPU slab loading policy for model weights."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "host"
+type = "string"
+requirement = "optional"
+default = "0.0.0.0"
+scopes = ["global", "runtime"]
+mutability = "static"
+owner = "hipfire-config"
+description = "Bind host for the OpenAI-compatible HTTP server."
+validation = "valid IP address or hostname"
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "idle_timeout"
+type = "u32"
+requirement = "optional"
+default = "300"
+scopes = ["global", "runtime"]
+mutability = "runtime_reloadable"
+owner = "hipfire-config"
+description = "Seconds of inactivity before the server may evict an idle model."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "kv_adaptive"
+type = "enum(off|auto)"
+requirement = "optional"
+default = "off"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Adaptive KV-cache policy."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "kv_cache"
+type = "enum(auto|q8|asym2|asym3|asym4)"
+requirement = "optional"
+default = "auto"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "KV-cache precision and memory policy."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "max_seq"
+type = "u32"
+requirement = "optional"
+default = "4096"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Maximum context/KV-cache capacity allocated at model load."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "max_tokens"
+type = "u32"
+requirement = "optional"
+default = "512"
+scopes = ["global", "model", "request"]
+mutability = "request_only"
+owner = "hipfire-config"
+description = "Default maximum number of generated tokens per request."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "mmq_screen"
+type = "enum(auto|off|on)"
+requirement = "optional"
+default = "auto"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "MMQ safety screening mode."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "mmq_screen_threshold"
+type = "f64"
+requirement = "optional"
+default = "0.10"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "MMQ screening rejection threshold."
+validation = "0.0..=1.0"
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "model_overrides"
+type = "json"
+requirement = "optional"
+default = "{}"
+scopes = ["global", "model"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Sparse per-model override map layered on top of global config."
+validation = "object keyed by model tag"
+secret = false
+restart_impact = "reload_model"
+
+[[field]]
+key = "mtp_k"
+type = "u32"
+requirement = "optional"
+default = "3"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Number of MTP candidate tokens to consider."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "mtp_mode"
+type = "enum(auto|off|on)"
+requirement = "optional"
+default = "auto"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Multi-token prediction sidecar mode."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "port"
+type = "u16"
+requirement = "optional"
+default = "11435"
+scopes = ["global", "runtime"]
+mutability = "static"
+owner = "hipfire-config"
+description = "Bind port for the OpenAI-compatible HTTP server."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "prefill_alpha"
+type = "f64"
+requirement = "optional"
+default = "0.85"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Prefill compression scoring alpha."
+validation = "0.0..=1.0"
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "prefill_block"
+type = "u32"
+requirement = "optional"
+default = "128"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Block size used by prefill compression."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "prefill_compression"
+type = "enum(off|auto|on)"
+requirement = "optional"
+default = "off"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Long-context prefill compression mode."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "prefill_drafter"
+type = "path"
+requirement = "required when `prefill_compression != 'off' && prefill_drafter_device >= 0`"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Optional drafter artifact for prefill compression."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "prefill_drafter_device"
+type = "i32"
+requirement = "optional"
+default = "-1"
+scopes = ["global", "host", "node", "model"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Preferred accelerator device for the prefill drafter."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "prefill_keep_ratio"
+type = "f64"
+requirement = "optional"
+default = "0.05"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Fraction of prefill blocks to keep under compression."
+validation = "0.0..=1.0"
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "prefill_min_keep"
+type = "u32"
+requirement = "optional"
+default = "2048"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Minimum tokens or blocks retained during prefill compression."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "prefill_profile"
+type = "bool"
+requirement = "optional"
+default = "false"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Emit prefill compression profiling details."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "prefill_recent"
+type = "u32"
+requirement = "optional"
+default = "1024"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Recent context size retained during prefill compression."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "prefill_sink"
+type = "u32"
+requirement = "optional"
+default = "256"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Prefix sink size retained during prefill compression."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "prefill_sparse_threshold"
+type = "u32"
+requirement = "optional"
+default = "32768"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Context threshold for sparse prefill behavior."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "prefill_threshold"
+type = "u32"
+requirement = "optional"
+default = "32768"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Context length threshold for prefill compression."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "prompt_normalize"
+type = "bool"
+requirement = "optional"
+default = "true"
+scopes = ["global", "model", "request"]
+mutability = "request_only"
+owner = "hipfire-config"
+description = "Whether prompts are normalized before tokenization."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "repeat_penalty"
+type = "f64"
+requirement = "optional"
+default = "1.05"
+scopes = ["global", "model", "request"]
+mutability = "request_only"
+owner = "hipfire-config"
+description = "Default repeat penalty for generated text."
+validation = "0.0.."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "temperature"
+type = "f64"
+requirement = "optional"
+default = "0.3"
+scopes = ["global", "model", "request"]
+mutability = "request_only"
+owner = "hipfire-config"
+description = "Default sampling temperature."
+validation = "0.0.."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "thinking"
+type = "enum(off|on)"
+requirement = "optional"
+default = "off"
+scopes = ["global", "model", "request"]
+mutability = "request_only"
+owner = "hipfire-config"
+description = "Reasoning/thinking display policy for compatible models."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "top_p"
+type = "f64"
+requirement = "optional"
+default = "0.8"
+scopes = ["global", "model", "request"]
+mutability = "request_only"
+owner = "hipfire-config"
+description = "Default nucleus sampling probability."
+validation = "0.0..=1.0"
+secret = false
+restart_impact = "none"
+
