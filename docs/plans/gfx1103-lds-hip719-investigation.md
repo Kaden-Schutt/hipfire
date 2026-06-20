@@ -1950,6 +1950,20 @@ Latest artifact paths:
   failing at global 181 and child-process `120,120,120,140` passing, this
   suggests `hipDeviceReset` perturbs or partially resets the accumulated state
   but still does not provide the cleanup boundary that process exit provides.
+- Same-process primary-context reset on the shifted row
+  (`/tmp/hipfire-lds-direct-ab-primaryctx20-artifacts-12b86320/`, throwaway
+  worktree `/tmp/hipfire-lds-direct-ab-primaryctx-current-12b86320`, commit
+  `12b86320`) reached an earlier phase boundary but still failed as cumulative
+  same-process work. With the same active `30x1` start=3 shape, phase1 `20`
+  passed, `boundary hipDevicePrimaryCtxReset(0)` returned OK, and phase2 `480`
+  failed at local sync 25 / global launch 45 with HIP `719`. The coredump kept
+  the canonical promoted direct-AB GFXHUB/GDS signature and the selected
+  normalized ISA hash stayed `bb1a56b38225028e` with the same resource tuple
+  and `ds_load_b32 ... offset:12`. A prior `120+380` primary-context attempt in
+  `/tmp/hipfire-lds-direct-ab-primaryctx-artifacts-12b86320/` failed before the
+  boundary at phase1/global 43 under reset pressure, so the useful cleanup
+  evidence is the `20+480` run: primary-context reset is not the process-exit
+  cleanup boundary.
 
 ## Current Narrowing
 
@@ -2328,6 +2342,11 @@ Reduction results after extending the standalone HIP GEMM probe:
   keeps the useful cleanup claim narrow: only the observed `hipDeviceReset`
   path cleared enough state for the `132+1` split, while other HIP API shapes
   can shift the launch threshold downward.
+- On the later shifted `30x1` start=3 row, an earlier `20+480`
+  `primary_ctx_reset` split did reach the boundary and still failed in phase2
+  at local/global `25/45`, so primary-context reset is now negative cleanup
+  evidence for the current direct-AB edge rather than merely a threshold
+  perturbation.
 - The `11x3` orientation behaves differently near the exact READS=2 edge:
   plain same-process `132+1` passes, while one-child `133` still fails. That
   points at a host phase boundary / final synchronization effect in addition
@@ -2782,6 +2801,7 @@ LDS-only control:
 | direct-AB promoted-source shifted active `30x1` start=3 in `34x1`, same-process phase split, reads=2, 448 iters, 512x86 | phase1 `120` + boundary `hipDeviceSynchronize` + phase2 `380` FAILS in phase2 at local sync 61 / global 181 with identical selected ISA/resource tuple | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB promoted-source shifted active `30x1` start=3 in `34x1`, same-process stream-recreate phase split, reads=2, 448 iters, 512x86 | phase1 `120` + stream destroy/recreate + phase2 `380` FAILS in phase2 at local sync 57 / global 177 with identical selected ISA/resource tuple | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB promoted-source shifted active `30x1` start=3 in `34x1`, same-process device-reset phase split, reads=2, 448 iters, 512x86 | phase1 `120` + `hipDeviceReset` OK + phase2 `380` FAILS in phase2 at local sync 253 / global 373 with identical selected ISA/resource tuple | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
+| direct-AB promoted-source shifted active `30x1` start=3 in `34x1`, same-process primary-context reset phase split, reads=2, 448 iters, 512x86 | phase1 `20` + `hipDevicePrimaryCtxReset(0)` OK + phase2 `480` FAILS in phase2 at local sync 25 / global 45 with identical selected ISA/resource tuple; `120+380` under reset pressure failed before boundary at global 43 | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB promoted-source shifted active `29x1` in `34x1` block/layout, reads=2, 448 iters, 512x86 | start=3/4 initially PASS one-child `500`; start=5 FAIL at sync/global 374; post-failure recovery rerun of start=4 FAILS at 379; all use DS=12 and failing rows keep the canonical gfxhub/GDS signature | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB promoted-source shifted active `28x1` in `34x1` block/layout, reads=2, 448 iters, 512x86 | start=6 FAIL at sync/global 177 with canonical gfxhub/GDS signature | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB multi-exec `17x2`/`2x17` block/layout, reads=2, 448 iters, 512x86 | `17x2`: FAIL one-child `130` at sync/global 32; `2x17`: FAIL one-child `130` at sync/global 35 | `_Z25lds_direct_ab_phase_probev` | 280 B | 24 | 2 | 0 | 32 |
@@ -2898,7 +2918,12 @@ Best current hypothesis:
 > boundary, while one HIP-initialized-parent trial failed before the boundary
 > and then passed on repeat. Process exit appears to clear enough state near
 > the edge, but it is not a deterministic explanation for every trial once the
-> first child itself lands on the shifted failure side. A lower-risk `96+5`
+> first child itself lands on the shifted failure side. The latest shifted
+> `30x1` edge adds a cleaner primary-context reset result: moving the boundary
+> early to `20 + 480` lets `hipDevicePrimaryCtxReset(0)` return success, but
+> phase2 still fails at global launch 45 with the same codegen and coredump
+> signature. That keeps process exit as the only cleanup boundary observed to
+> avoid the shifted-row cumulative fault. A lower-risk `96+5`
 > split makes the parent-state picture cleaner: same-process `96+5` fails after
 > the boundary, same-process `97+4` passes, and exec-parent `96+5` passes in
 > plain and HIP-initialized parent modes across repeats. That points back to
