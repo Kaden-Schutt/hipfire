@@ -3182,7 +3182,7 @@ scripts/lds_gemm_780m_runbook.sh
 scripts/lds_direct_ab_780m_test_jig.sh
 
 # Risky: expected pass-side controls followed by READS=2 9x4 and
-# 33/34-lane fail-side checks.
+# 33/34-lane plus shifted 30x1 start=3 fail-side checks.
 scripts/lds_direct_ab_780m_test_jig.sh --risky
 ```
 
@@ -3191,6 +3191,11 @@ The direct-AB jig writes:
 ```text
 /tmp/hipfire-lds-direct-ab-780m-buildonly/direct-ab-artifact-summary.tsv
 ```
+
+The current direct-AB jig includes the latest narrowed shifted-row control:
+`30x1 start=2` in a `34x1` layout should pass one-child `500`,
+`30x1 start=3` should pass as child-process split `120,120,120,140`, and the
+same `30x1 start=3` total should fail as one-child `500` on the first 780M.
 
 Compare two machines' direct-AB summaries with:
 

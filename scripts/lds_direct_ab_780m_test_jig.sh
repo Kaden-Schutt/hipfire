@@ -23,8 +23,8 @@ shapes and captures codegen artifacts without launching the reset-prone probe.
 Modes:
   --build-only  Safe compile/codegen capture under OUT-buildonly
   --risky       Run focused READS=2 pass-side controls first, then the
-                33/34-lane direct-AB repros. This can trip HIP-719 and
-                wedge/reset affected gfx1103/780M stacks.
+                33/34-lane and shifted 30x1 direct-AB repros. This can trip
+                HIP-719 and wedge/reset affected gfx1103/780M stacks.
   --compare     Compare two direct-ab-artifact-summary.tsv files
 
 Environment:
@@ -117,6 +117,9 @@ print_reference() {
 #   active=31x1 start=0x0 block/layout=34x1 reads=2 iters=448 chunks=500 grid=512x86 exit=4
 #   active=31x1 start=1x0 block/layout=34x1 reads=2 iters=448 chunks=500 grid=512x86 exit=0
 #   active=31x1 start=2x0 block/layout=34x1 reads=2 iters=448 chunks=500 grid=512x86 exit=4
+#   active=30x1 start=2x0 block/layout=34x1 reads=2 iters=448 chunks=500 grid=512x86 exit=0
+#   active=30x1 start=3x0 block/layout=34x1 reads=2 iters=448 chunks=500 grid=512x86 exit=4
+#   active=30x1 start=3x0 block/layout=34x1 reads=2 iters=448 chunks=120,120,120,140 grid=512x86 exit=0
 #   active=1x32 start=0x0 block/layout=1x34 reads=2 iters=448 chunks=500 grid=512x86 force_wrap=0 exit=4
 #   active=1x32 start=0x0 block/layout=1x34 reads=2 iters=448 chunks=500 grid=512x86 force_wrap=1 exit=0
 EOF
@@ -223,6 +226,9 @@ run_matrix() {
         run_case "16-build-31x1-start2-in-34x1-r2-one-child-500" 31 1 34 1 34 1 2 448 512 86 500 fail 1 2 0 || failures=$((failures + 1))
         run_case "17-build-1x32-in-1x34-r2-one-child-500" 1 32 1 34 1 34 2 448 512 86 500 fail 1 || failures=$((failures + 1))
         run_case "18-build-1x32-in-1x34-r2-wrapcnd-one-child-500" 1 32 1 34 1 34 2 448 512 86 500 pass 1 0 0 1 || failures=$((failures + 1))
+        run_case "19-build-30x1-start2-in-34x1-r2-one-child-500" 30 1 34 1 34 1 2 448 512 86 500 pass 1 2 0 || failures=$((failures + 1))
+        run_case "20-build-30x1-start3-in-34x1-r2-one-child-500" 30 1 34 1 34 1 2 448 512 86 500 fail 1 3 0 || failures=$((failures + 1))
+        run_case "21-build-30x1-start3-in-34x1-r2-split-120-120-120-140" 30 1 34 1 34 1 2 448 512 86 120,120,120,140 pass 1 3 0 || failures=$((failures + 1))
     else
         run_case "00-control-8x4-r2-one-child-500" 8 4 8 4 8 4 2 448 512 86 500 pass 0 || failures=$((failures + 1))
         run_case "01-control-32x1-r2-one-child-500" 32 1 32 1 32 1 2 448 512 86 500 pass 0 || failures=$((failures + 1))
@@ -243,6 +249,9 @@ run_matrix() {
         run_case "16-fail-31x1-start2-in-34x1-r2-one-child-500" 31 1 34 1 34 1 2 448 512 86 500 fail 0 2 0 || failures=$((failures + 1))
         run_case "17-fail-1x32-in-1x34-r2-one-child-500" 1 32 1 34 1 34 2 448 512 86 500 fail 0 || failures=$((failures + 1))
         run_case "18-control-1x32-in-1x34-r2-wrapcnd-one-child-500" 1 32 1 34 1 34 2 448 512 86 500 pass 0 0 0 1 || failures=$((failures + 1))
+        run_case "19-control-30x1-start2-in-34x1-r2-one-child-500" 30 1 34 1 34 1 2 448 512 86 500 pass 0 2 0 || failures=$((failures + 1))
+        run_case "20-control-30x1-start3-in-34x1-r2-split-120-120-120-140" 30 1 34 1 34 1 2 448 512 86 120,120,120,140 pass 0 3 0 || failures=$((failures + 1))
+        run_case "21-fail-30x1-start3-in-34x1-r2-one-child-500" 30 1 34 1 34 1 2 448 512 86 500 fail 0 3 0 || failures=$((failures + 1))
     fi
 
     {
