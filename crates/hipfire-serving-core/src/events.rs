@@ -15,16 +15,12 @@ use hipfire_generate::eos_filter::FilterAction;
 
 /// Cap on the *encoded* base64 string length the daemon will accept on the
 /// IPC. ~40 MB encoded → ~30 MB raw image bytes (4/3 expansion).
-pub(crate) const MAX_BASE64_ENCODED_LEN: usize = 40 * 1024 * 1024;
+pub const MAX_BASE64_ENCODED_LEN: usize = 40 * 1024 * 1024;
 
 /// Emit an id-tagged `{"type":"error","id","message"}` line and flush. Use this
 /// (not raw `writeln!`) so a user-controlled `id`/message can't desync the JSONL
 /// protocol via an embedded `"`, `\`, or newline.
-pub(crate) fn emit_error_with_id(
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    message: impl std::fmt::Display,
-) {
+pub fn emit_error_with_id(stdout: &mut std::io::Stdout, id: &str, message: impl std::fmt::Display) {
     let envelope = serde_json::json!({
         "type": "error",
         "id": id,
@@ -38,7 +34,7 @@ pub(crate) fn emit_error_with_id(
 /// Currently has no caller (pre-existing dead code, relocated as-is); kept for
 /// protocol completeness.
 #[allow(dead_code)]
-pub(crate) fn emit_error_no_id(stdout: &mut std::io::Stdout, message: impl std::fmt::Display) {
+pub fn emit_error_no_id(stdout: &mut std::io::Stdout, message: impl std::fmt::Display) {
     let envelope = serde_json::json!({
         "type": "error",
         "message": format!("{}", message),
@@ -55,7 +51,7 @@ pub(crate) fn emit_error_no_id(stdout: &mut std::io::Stdout, message: impl std::
 ///
 /// The CLI / OpenAI HTTP layer translates these into the corresponding
 /// SSE chunks (`content`, `reasoning_content`, `tool_calls.delta`).
-pub(crate) fn emit_stream_event(
+pub fn emit_stream_event(
     stdout: &mut std::io::Stdout,
     id: &str,
     ev: hipfire_arch_deepseek4::dsml::StreamEvent,
@@ -102,7 +98,7 @@ pub(crate) fn emit_stream_event(
 /// events. Gated on `HIPFIRE_EMIT_TOKEN_IDS=1` (read once); a no-op otherwise, so
 /// existing JSONL clients see no change. The probe binary sets the env on the
 /// daemon child it spawns.
-pub(crate) fn emit_committed_event(
+pub fn emit_committed_event(
     stdout: &mut std::io::Stdout,
     id: &str,
     tok_id: u32,
@@ -134,7 +130,7 @@ pub(crate) fn emit_committed_event(
 /// line on the IPC stream. Uses `serde_json` so user-controlled error
 /// strings (image decoder messages, base64 errors) can't desync the
 /// protocol by injecting embedded `"`, `\`, or newline bytes.
-pub(crate) fn write_error(stdout: &mut std::io::Stdout, id: &str, message: &str) {
+pub fn write_error(stdout: &mut std::io::Stdout, id: &str, message: &str) {
     let line = serde_json::json!({
         "type": "error",
         "id": id,
@@ -147,11 +143,7 @@ pub(crate) fn write_error(stdout: &mut std::io::Stdout, id: &str, message: &str)
 /// Act on an [`EosFilter`](hipfire_generate::eos_filter) decision: stream any
 /// emitted/held bytes as a `token` event and return `true` when generation
 /// should stop (`Stop`/`StopEmit`), `false` to continue (`Emit`/`Hold`).
-pub(crate) fn emit_filter_action(
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    action: FilterAction,
-) -> bool {
+pub fn emit_filter_action(stdout: &mut std::io::Stdout, id: &str, action: FilterAction) -> bool {
     match action {
         FilterAction::Emit(text_bytes) => {
             emit_text_bytes(stdout, id, &text_bytes);
@@ -169,7 +161,7 @@ pub(crate) fn emit_filter_action(
 /// Emit a `{"type":"token","id","text"}` event for `text_bytes`. No-op on empty
 /// input or non-UTF-8 bytes (a partial multibyte fragment is dropped rather than
 /// emitting mojibake; the filter re-presents it once the codepoint completes).
-pub(crate) fn emit_text_bytes(stdout: &mut std::io::Stdout, id: &str, text_bytes: &[u8]) {
+pub fn emit_text_bytes(stdout: &mut std::io::Stdout, id: &str, text_bytes: &[u8]) {
     if text_bytes.is_empty() {
         return;
     }

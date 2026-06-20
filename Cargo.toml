@@ -37,6 +37,7 @@ members = [
     "crates/hipfire-atlas",
     "crates/hipfire-cli",
     "crates/hipfire-server",
+    "crates/hipfire-serving-core",
     "crates/hipfire-daemon",
     "crates/redline",
     "crates/hipfire-dispatch",

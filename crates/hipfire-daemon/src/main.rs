@@ -59,15 +59,17 @@ use std::io::{BufRead, Write};
 use std::path::Path;
 use std::time::Instant;
 
-mod events;
+// `events`, `output_filter`, `dummy` now live in `hipfire-serving-core`
+// (workstream A0). Re-import them at the crate root so existing `crate::events`
+// / `crate::output_filter` / `crate::dummy` paths in the daemon's other modules
+// keep resolving unchanged.
 use events::{emit_error_with_id, write_error, MAX_BASE64_ENCODED_LEN};
-mod output_filter;
+use hipfire_serving_core::{dummy, events, output_filter};
 use output_filter::{
     chat_output_filter_from_profile, normalize_daemon_prompt, normalize_request_stop_sequences,
 };
 mod model;
 use model::{LoadedModel, RAW_OVERRIDE};
-mod dummy;
 mod memory;
 use dummy::{
     emit_dummy_generate_batch_prefill_ready, run_generate_batch_prefill_dummy, DummyModelState,
@@ -4607,7 +4609,11 @@ fn main() {
             // validates args + the hipfire-train link; the loop wiring lands in
             // step 3. See docs/plans/2026-06-19-train-as-daemon-op.md.
             "train_drafter" => {
-                let arch = msg.get("arch").and_then(|v| v.as_str()).unwrap_or("ssm").to_string();
+                let arch = msg
+                    .get("arch")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("ssm")
+                    .to_string();
                 if arch != "ssm" && arch != "attention" {
                     emit_error_with_id(
                         &mut stdout,
@@ -4626,13 +4632,25 @@ fn main() {
                 }
                 // Parse the train block into the SHARED TrainCfg (proves the
                 // hipfire-train dep links and the op speaks the lib's types).
-                let t = msg.get("train").cloned().unwrap_or_else(|| serde_json::json!({}));
-                let labels = msg.get("labels").cloned().unwrap_or_else(|| serde_json::json!({}));
+                let t = msg
+                    .get("train")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let labels = msg
+                    .get("labels")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
                 let getu = |o: &serde_json::Value, k: &str, d: usize| -> usize {
-                    o.get(k).and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(d)
+                    o.get(k)
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as usize)
+                        .unwrap_or(d)
                 };
                 let getf = |o: &serde_json::Value, k: &str, d: f32| -> f32 {
-                    o.get(k).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(d)
+                    o.get(k)
+                        .and_then(|v| v.as_f64())
+                        .map(|v| v as f32)
+                        .unwrap_or(d)
                 };
                 let cfg = hipfire_train::train_loop::TrainCfg {
                     seq: getu(&labels, "seq", 512),

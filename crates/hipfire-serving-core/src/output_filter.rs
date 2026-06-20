@@ -23,7 +23,7 @@ use hipfire_prompt as prompt_frame;
 /// material τ/throughput stabilizer (see CLAUDE.md "Prompt-structure τ
 /// sensitivity"). Borrows unchanged when normalization is disabled
 /// (`HIPFIRE_NORMALIZE_PROMPT=0` or the runtime config flag is off).
-pub(crate) fn normalize_daemon_prompt(prompt: &str) -> std::borrow::Cow<'_, str> {
+pub fn normalize_daemon_prompt(prompt: &str) -> std::borrow::Cow<'_, str> {
     if matches!(
         std::env::var("HIPFIRE_NORMALIZE_PROMPT").ok().as_deref(),
         Some("0") | Some("false") | Some("off") | Some("no")
@@ -57,7 +57,7 @@ pub(crate) fn normalize_daemon_prompt(prompt: &str) -> std::borrow::Cow<'_, str>
 /// CPU-side counterpart that applies the same depth-tracking attractor
 /// block directly to a freshly-downloaded logits vector. Avoids the
 /// htod-memcpy + redownload roundtrip the GPU variant required per token.
-pub(crate) fn block_attractor_unclosed_cpu(
+pub fn block_attractor_unclosed_cpu(
     logits: &mut [f32],
     history: &[u32],
     open_id: u32,
@@ -87,7 +87,7 @@ pub(crate) fn block_attractor_unclosed_cpu(
 /// Build the n-gram repetition [`LoopGuard`] from the runtime config
 /// (`ngram_loop_threshold` / `ngram_window`) — the decode-loop guard that breaks
 /// degenerate verbatim repetition.
-pub(crate) fn loop_guard_from_runtime_config() -> LoopGuard {
+pub fn loop_guard_from_runtime_config() -> LoopGuard {
     let config = hipfire_runtime::config::get();
     LoopGuard::new(config.ngram_loop_threshold, config.ngram_window)
 }
@@ -97,7 +97,7 @@ pub(crate) fn loop_guard_from_runtime_config() -> LoopGuard {
 /// `>= threshold` times in the last `window` tokens, regardless of open/close
 /// structure. Currently unused — kept as reference for a future per-token block.
 #[allow(dead_code)]
-pub(crate) fn gpu_block_attractor_token(
+pub fn gpu_block_attractor_token(
     gpu: &rdna_compute::Gpu,
     logits_buf: &hip_bridge::DeviceBuffer,
     history: &[u32],
@@ -123,7 +123,7 @@ pub(crate) fn gpu_block_attractor_token(
 /// none) unioned with the per-request stop sequences. Holdback prefixes let the
 /// filter buffer a partial stop token rather than leaking it before the match
 /// completes.
-pub(crate) fn chat_output_filter_from_profile(
+pub fn chat_output_filter_from_profile(
     chat_template_profile: Option<&prompt_frame::ChatTemplateProfile>,
     request_stop_sequences: &[String],
 ) -> EosFilter {
@@ -168,7 +168,7 @@ pub(crate) fn chat_output_filter_from_profile(
 /// Parse and sanitize a request's `stop` field (string or array) the same way
 /// the Bun CLI does: drop empties, cap at 4 sequences, truncate each to 64
 /// bytes. Bounds adversarial/oversized input before it reaches the filter.
-pub(crate) fn normalize_request_stop_sequences(value: Option<&serde_json::Value>) -> Vec<String> {
+pub fn normalize_request_stop_sequences(value: Option<&serde_json::Value>) -> Vec<String> {
     let Some(value) = value else {
         return Vec::new();
     };

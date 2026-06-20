@@ -1,0 +1,16 @@
+[package]
+name = "hipfire-serving-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared model-serving orchestration (load + generate paths, session/memory/event plumbing) used by the daemon bin and the eval harness."
+
+[dependencies]
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-generate = { path = "../hipfire-generate" }
+hipfire-prompt = { path = "../hipfire-prompt" }
+hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }
+serde_json = "1"
+tracing = "0.1"

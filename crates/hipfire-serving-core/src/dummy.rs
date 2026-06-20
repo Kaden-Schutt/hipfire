@@ -5,7 +5,7 @@
 //! The `hipfire:dummy` model backend — a GPU-free token/word counter used by
 //! tests and the batch-prefill harness to exercise the daemon protocol without
 //! loading real weights. Extracted verbatim from the former `main.rs` monolith
-//! (no behavior change); items are `pub(crate)`.
+//! (no behavior change); items are `pub`.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -17,18 +17,18 @@ use hipfire_generate::{GenerateBatchPrefillEnvelope, GenerateBatchPrefillSession
 /// by tests and the batch-prefill harness to drive the daemon protocol end to
 /// end without loading weights. Emits synthetic `dummy:N` tokens.
 #[derive(Default)]
-pub(crate) struct DummyModelState {
-    pub(crate) sessions: HashMap<String, usize>,
+pub struct DummyModelState {
+    pub sessions: HashMap<String, usize>,
 }
 
 impl DummyModelState {
     /// Drop all per-session counters (cold start).
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.sessions.clear();
     }
 
     /// Forget the given sessions; returns how many were actually present.
-    pub(crate) fn release_sessions(&mut self, sessions: &[String]) -> usize {
+    pub fn release_sessions(&mut self, sessions: &[String]) -> usize {
         sessions
             .iter()
             .filter(|session| self.sessions.remove(*session).is_some())
@@ -36,7 +36,7 @@ impl DummyModelState {
     }
 
     /// Number of resident sessions.
-    pub(crate) fn session_count(&self) -> usize {
+    pub fn session_count(&self) -> usize {
         self.sessions.len()
     }
 
@@ -50,10 +50,7 @@ impl DummyModelState {
 
     /// Advance a session's counter by its prompt/suffix token count (seeding the
     /// counter from `logical_position` on first sight); returns tokens consumed.
-    pub(crate) fn consume_prefill_session(
-        &mut self,
-        session: &GenerateBatchPrefillSession,
-    ) -> usize {
+    pub fn consume_prefill_session(&mut self, session: &GenerateBatchPrefillSession) -> usize {
         let consumed = match (&session.prompt, &session.suffix_tokens) {
             (Some(prompt), None) => {
                 Self::prompt_token_count(prompt)
@@ -77,7 +74,7 @@ impl DummyModelState {
     /// Stream `max_tokens` synthetic `dummy:N` token events then a `done`
     /// envelope, mirroring the real generate protocol (with an optional
     /// configurable delay) so clients can be exercised GPU-free.
-    pub(crate) fn generate(
+    pub fn generate(
         &mut self,
         stdout: &mut std::io::Stdout,
         id: &str,
@@ -157,7 +154,7 @@ fn dummy_generate_delay_ms() -> u64 {
 
 /// Emit the `generate_batch_prefill_ready` capability envelope advertising the
 /// dummy backend can serve a batch-prefill request.
-pub(crate) fn emit_dummy_generate_batch_prefill_ready(
+pub fn emit_dummy_generate_batch_prefill_ready(
     stdout: &mut std::io::Stdout,
     envelope: &GenerateBatchPrefillEnvelope,
 ) {
@@ -179,7 +176,7 @@ pub(crate) fn emit_dummy_generate_batch_prefill_ready(
 /// Run a dummy batch prefill: emit `started`, consume each session's tokens into
 /// its counter emitting a per-session `done`, then a batch `done` — the full
 /// protocol shape the real backends produce, GPU-free.
-pub(crate) fn run_generate_batch_prefill_dummy(
+pub fn run_generate_batch_prefill_dummy(
     dummy: &mut DummyModelState,
     stdout: &mut std::io::Stdout,
     envelope: &GenerateBatchPrefillEnvelope,

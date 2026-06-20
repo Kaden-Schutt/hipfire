@@ -1374,6 +1374,7 @@ dependencies = [
  "hipfire-npu",
  "hipfire-prompt",
  "hipfire-runtime",
+ "hipfire-serving-core",
  "hipfire-state",
  "hipfire-train",
  "rdna-compute",
@@ -1609,6 +1610,20 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "hipfire-serving-core"
+version = "0.2.1"
+dependencies = [
+ "hip-bridge",
+ "hipfire-arch-deepseek4",
+ "hipfire-generate",
+ "hipfire-prompt",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
