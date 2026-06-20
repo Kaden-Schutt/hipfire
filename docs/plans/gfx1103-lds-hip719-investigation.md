@@ -1701,6 +1701,14 @@ Latest artifact paths:
   failed earlier at sync/global 73 with the canonical coredump signature. The
   sleep knob was not promoted because the negative result is enough: the
   `PRE_SYNC_EACH_LAUNCH=1` pass is not explained by a simple 1 ms host delay.
+- A `9x4` pre-sync check
+  (`/tmp/hipfire-lds-direct-ab-9x4-presync-artifacts/`, throwaway worktree
+  `/tmp/hipfire-lds-direct-ab-9x4-presync-1781926807`) tested whether the
+  promoted `PRE_SYNC_EACH_LAUNCH=1` diagnostic generalized to the more square
+  READS=2 first-two-wave edge. It did not: one-child `9x4` `140` failed at
+  sync/global 47 with the canonical coredump signature. That is earlier than
+  the previously recorded normal `9x4 READS=2` `140` failure near global 133,
+  so pre-sync is shape-specific and can perturb the threshold downward.
 
 ## Current Narrowing
 
@@ -2084,6 +2092,10 @@ Reduction results after extending the standalone HIP GEMM probe:
   `11x3` edge, so the pre-sync improvement is not just wall-clock spacing
   between launches. The useful distinction is currently "extra HIP
   synchronization call" rather than "extra time".
+- The pre-sync diagnostic does not generalize to all first-two-wave READS=2
+  shapes. It fails for transposed `3x11` and fails even earlier for `9x4`.
+  The `11x3` pass is therefore a shape/orientation-specific host-sync effect,
+  not a broad workaround for the reduced trigger.
 - Phase-mode controls sharpen the process-boundary result. With the same
   direct-AB kernel body at reads=6/192/511x86, same-process `99 + 1` fails on
   phase2 launch 0 / global launch 99, and same-process `98 + 2` fails on
@@ -2472,6 +2484,7 @@ LDS-only control:
 | direct-AB multi-exec `9x4` block/layout, reads=1/2/3, 448 iters, 512x86, one child `150` | reads=1 PASS; reads=2 FAIL at launch 131; reads=3 FAIL at launch 98 | `_Z25lds_direct_ab_phase_probev` | 288 B | 22/24/34 | 2 | 0 | 32 |
 | direct-AB multi-exec `9x4` block/layout, reads=2, 448 iters, 512x86 | PASS at one-child `120`/`130`; FAIL at `140`/`150` | `_Z25lds_direct_ab_phase_probev` | 288 B | 24 | 2 | 0 | 32 |
 | direct-AB multi-exec `9x4` block/layout, reads=2, 448 iters, 512x86, split child | PASS for `130,10` and `120,20` total `140`; one-child `140` fails | `_Z25lds_direct_ab_phase_probev` | 288 B | 24 | 2 | 0 | 32 |
+| direct-AB pre-sync diagnostic `9x4` block/layout, reads=2, 448 iters, 512x86 | `PRE_SYNC_EACH_LAUNCH=1`: one-child `140` FAIL at sync/global 47 | `_Z25lds_direct_ab_phase_probev` | 288 B | 24 | 2 | 0 | 32 |
 | direct-AB multi-exec `9x4` block/layout, reads=1, 448 iters, 512x86 | PASS at one-child `220`/`260`/`300`/`500` | `_Z25lds_direct_ab_phase_probev` | 288 B | 22 | 2 | 0 | 32 |
 | direct-AB multi-exec `8x4` block/layout, reads=2, 448 iters, 512x86 | PASS at one-child `500`/`1000` | `_Z25lds_direct_ab_phase_probev` | 256 B | 24 | 2 | 0 | 32 |
 | direct-AB multi-exec `11x3`/`3x11` block/layout, reads=1, 448 iters, 512x86 | PASS at one-child `500` for both orientations | `_Z25lds_direct_ab_phase_probev` | 276 B | 22 | 2 | 0 | 32 |
