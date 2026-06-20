@@ -49,6 +49,21 @@ env/CLI surface (path + max size). See `TODO.md` "Vision embedding cache".
 timing + a cache-hit counter); LRU eviction holds the file under its cap across
 restarts; coherence unchanged on hit vs miss.
 
+**Progress (2026-06-20):** standalone lib crate `crates/hipfire-vision-cache`
+landed — GPU-free, one dep (`twox-hash`/xxhash64). 128-bit `(ns_hash, img_hash)`
+key (namespace = vision-config/arch identity, so towers never alias); value =
+`CachedEmbedding{n_rows,n_cols,data:Vec<f32>}`. On-disk: one `.vrow` payload file
+per entry (header + checksummed f32-LE payload, atomic tmp+rename, per-entry read)
++ a binary `manifest` (atomic replace; rebuilt by scanning `.vrow` headers if
+lost). Approximate-LRU (recency bumped in memory on `get`, flushed on
+insert/evict); evict never drops the just-inserted entry or below one entry.
+10 no-GPU unit tests: key determinism/namespace-scoping, byte-exact round-trip,
+**hit==miss equality** (Goal-4 evidence for Goal 1), eviction-holds-budget,
+LRU-recency, persist-across-reopen, manifest-rebuild, corruption→miss, replace.
+Not yet wired into the daemon (Goal 2). The `hipfire-eval` *battery row* asserting
+hit==miss across a **real encode** attaches under Goal 2 (needs the serve path);
+the deterministic hit==miss unit test is its pre-daemon stand-in.
+
 ## Goal 2 — Daemon arch-13 serving + video protocol (the gate) *(= original Phase 3)*
 
 **Why:** none of the vision work is reachable in production until medgemma serves

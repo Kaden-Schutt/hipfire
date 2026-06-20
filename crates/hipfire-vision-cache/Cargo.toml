@@ -1,0 +1,12 @@
+[package]
+name = "hipfire-vision-cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Content-addressed on-disk LRU cache for projected vision embeddings (xxh64-keyed). Skips the SigLIP encode on a repeat image/frame. GPU-free, no inference hot-path code."
+
+[dependencies]
+twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }
+
+[dev-dependencies]
+tempfile = "3"

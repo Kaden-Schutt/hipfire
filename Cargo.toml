@@ -16,6 +16,7 @@ members = [
     "crates/hipfire-lock",
     "crates/hipfire-media",
     "crates/hipfire-model",
+    "crates/hipfire-vision-cache",
     "crates/hipfire-npu",
     "crates/hipfire-prompt",
     "crates/hipfire-rocm",

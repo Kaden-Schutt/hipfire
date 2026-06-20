@@ -551,6 +551,14 @@ Decision deferred; Path A v1 ships first. See
 
 ## Vision embedding cache (xxh64-keyed, on-disk LRU)
 
+**Status: in-progress (chaingun, started 2026-06-20).** Goal 1 of
+`docs/plans/2026-06-20-medgemma-vision-pipeline-goals.md`. The standalone,
+GPU-free lib crate `crates/hipfire-vision-cache` is **landed** (128-bit
+`(ns_hash, img_hash)` xxh64 key, one `.vrow` payload file per entry + binary
+manifest, configurable byte budget + approximate-LRU eviction, persistent across
+reopen, checksum-guarded corruption tolerance; 10 no-GPU unit tests incl. the
+hit==miss equality check). **Not yet wired into the daemon** — that's Goal 2.
+
 The SigLIP encode is the dominant cost of a multimodal request (~44s/image on
 gfx1151 even after the `vit_attention_opt` fix; video makes it K× per request).
 The same image/frame is frequently re-submitted (re-runs, repeated frames across
