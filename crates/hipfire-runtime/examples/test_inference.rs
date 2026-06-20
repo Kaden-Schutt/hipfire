@@ -275,7 +275,7 @@ fn main() {
 
     // Test 9: VRAM leak detection — alloc/free cycle should return to baseline
     eprintln!("\n--- VRAM lifecycle ---");
-    // VRAM leak tests — CRITICAL for model eviction in Bun CLI daemon
+    // VRAM leak tests - CRITICAL for server model eviction
     // BUG: DeviceBuffer has no Drop impl. GPU memory is NEVER freed unless
     // gpu.free_tensor() is explicitly called. This means every KvCache,
     // DeltaNetState, Scratch, and VisionWeights that goes out of scope leaks.

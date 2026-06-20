@@ -43,5 +43,5 @@ bash -n tests/smoke/eval-harness-nogpu-smoke.sh
 bash -n tests/smoke/eval-harness-gpu-smoke.sh
 bash -n tests/smoke/eval-harness-model-eval-smoke.sh
 
-echo "== Legacy TypeScript CLI checks =="
-echo "Legacy TypeScript CLI support has been removed; no JS runtime checks are run."
+echo "== Legacy CLI checks =="
+echo "Legacy CLI support has been removed; no script-runtime checks are run."

@@ -5,7 +5,7 @@ use hipfire_model::{find_model_in, list_local_models_in};
 
 /// Resolve a model identifier to an absolute file path.
 ///
-/// Resolution order (mirrors Bun CLI findModel):
+/// Resolution order (preserves legacy CLI findModel behavior):
 /// 1. Direct file path — if the string exists on disk, use it as-is.
 /// 2. `~/.hipfire/models/<arg>` — if that exists.
 /// 3. `~/.hipfire/models/<arg>.hfq` — bare name + extension.

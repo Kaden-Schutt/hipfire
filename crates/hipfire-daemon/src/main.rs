@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! hipfire engine daemon — JSON lines over stdin/stdout.
-//! The Bun CLI spawns this process and communicates via IPC.
+//! The Rust server/CLI spawns this process and communicates via IPC.
 //! Usage: daemon (reads JSON from stdin, writes JSON to stdout)
 //!
 //! Exactly one daemon runs at a time per machine — enforced by an exclusive

@@ -190,7 +190,7 @@ PI_SYS="benchmarks/prompts/agentic_pi_system.txt"
 HERMES_SYS="benchmarks/prompts/agentic_hermes_system.txt"
 USER_READ="benchmarks/prompts/agentic_user_read.txt"
 
-# Registry-backed VRAM minimums were removed with the legacy TypeScript CLI.
+# Registry-backed VRAM minimums were removed with the legacy CLI.
 # Keep the skip flags for the downstream absence message shape, but do not
 # silently hide present models based on stale metadata.
 A3B_35_VRAM_SKIP=0

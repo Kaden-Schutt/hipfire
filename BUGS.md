@@ -6,8 +6,8 @@ into full investigations here.
 
 - Qwen3 no-output-gate FullAttention faults in fused Q/K/V MQ4 projection;
   split projection should be used until the fused kernel is shape-audited.
-- Rust/Axum `hipfire serve` still lacks Bun-equivalent request cancellation:
-  Bun sends daemon `{type:"abort", id}` on stream/non-stream client disconnect
+- Rust/Axum `hipfire serve` still lacks legacy request cancellation:
+  the legacy server sent daemon `{type:"abort", id}` on stream/non-stream client disconnect
   and `{type:"force_answer", id}` after the thinking watchdog, but the Rust
   daemon adapter currently owns stdin/stdout behind one mutable engine during
   generation and the daemon main loop is synchronous while generating. The

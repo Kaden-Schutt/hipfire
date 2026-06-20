@@ -172,7 +172,7 @@ pub fn chat_output_filter_from_profile(
 }
 
 /// Parse and sanitize a request's `stop` field (string or array) the same way
-/// the Bun CLI does: drop empties, cap at 4 sequences, truncate each to 64
+/// the legacy server did: drop empties, cap at 4 sequences, truncate each to 64
 /// bytes. Bounds adversarial/oversized input before it reaches the filter.
 pub fn normalize_request_stop_sequences(value: Option<&serde_json::Value>) -> Vec<String> {
     let Some(value) = value else {
