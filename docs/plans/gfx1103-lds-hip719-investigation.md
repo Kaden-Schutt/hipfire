@@ -2323,6 +2323,32 @@ control):
   sequence/work, supporting a target-specific accumulation model rather than
   pure process-launch volume.
 
+### Promoted Scalar-Control Jig
+
+- The standalone matrix runner now includes the scalar-control probes needed
+  for cross-machine 780M testing:
+  - `tile6_lds_counter_noextra_load4_consume4_pinned`
+  - `tile6_lds_counter_mask_noextra_load4_consume4_pinned`
+- Baseline cross-check command:
+
+```bash
+VARIANT=tile6_lds_counter_noextra_load4_consume4_pinned \
+MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 \
+scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-scalar-control-runs
+```
+
+- On the first 780M system, the counter-only variant passed one-launch smoke
+  and failed under the 100-launch full-shape run at `sync 98` with HIP `719`.
+  The object metadata stayed at `group_segment_fixed_size=144`,
+  `sgpr_count=5`, `vgpr_count=10`, `wavefront_size=32`, and no private
+  segment. The ISA delta from the pass-side no-extra shape is a loop-carried
+  scalar increment (`s_add_i32`) and sink, with no extra LDS operation and no
+  extra branch beyond the normal K-loop branch.
+- This sharpens the current suspect: in the second-store/four-waited-row-load
+  loop, a recurrent per-K scalar/control perturbation is enough to move the
+  pass-side no-extra shape into the faulting class under full-K repeated-launch
+  stress. It does not require an extra recurrent barrier.
+
 Compare pass/fail boundary for:
 
 - active lanes and waves per workgroup,
