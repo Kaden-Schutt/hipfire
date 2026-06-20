@@ -13,8 +13,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 pub use resolve::{
-    config_layers_from_document, resolve_config_layers, ConfigLayer, ConfigLayerKind,
-    ConfigResolution, ConfigValueSource, ResolvedConfigValue, UnknownConfigKey,
+    config_layers_from_document, config_layers_from_documents, resolve_config_layers, ConfigLayer,
+    ConfigLayerKind, ConfigResolution, ConfigValueSource, ResolvedConfigValue, UnknownConfigKey,
 };
 pub use schema::{
     config_schema, ConfigField, ConfigMutability, ConfigScope, ConfigType, Requirement,
@@ -252,6 +252,9 @@ pub struct LoadedConfig {
     pub config_path: PathBuf,
     pub raw_document: Value,
     pub read_error: Option<String>,
+    pub host_config_path: PathBuf,
+    pub host_raw_document: Value,
+    pub host_read_error: Option<String>,
     pub additional_layers: Vec<ConfigLayer>,
     pub layers: Vec<ConfigLayer>,
     pub config: HipfireConfig,
@@ -275,16 +278,18 @@ impl LoadedConfig {
     }
 
     pub fn resolve_for_model(&self, model_tag: &str) -> ResolvedTypedConfig {
-        resolve_typed_config_document_with_layers(
+        resolve_typed_config_documents_with_layers(
             &self.raw_document,
+            &self.host_raw_document,
             Some(model_tag),
             &self.additional_layers,
         )
     }
 
     fn refresh(&mut self) {
-        let resolved = resolve_typed_config_document_with_layers(
+        let resolved = resolve_typed_config_documents_with_layers(
             &self.raw_document,
+            &self.host_raw_document,
             None,
             &self.additional_layers,
         );
@@ -354,32 +359,26 @@ pub fn config_path() -> PathBuf {
     hipfire_dir().join("config.json")
 }
 
+pub fn host_config_path() -> PathBuf {
+    hipfire_dir().join("config.local.json")
+}
+
 pub fn models_dir() -> PathBuf {
     hipfire_dir().join("models")
 }
 
 pub fn load_config_bundle() -> LoadedConfig {
-    let path = config_path();
-    match std::fs::read_to_string(&path) {
-        Ok(raw) => match serde_json::from_str::<Value>(&raw) {
-            Ok(document) => loaded_config_from_document(path, document, None, Vec::new()),
-            Err(err) => loaded_config_from_document(
-                path,
-                Value::Object(Map::new()),
-                Some(format!("parse error: {err}")),
-                Vec::new(),
-            ),
-        },
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            loaded_config_from_document(path, Value::Object(Map::new()), None, Vec::new())
-        }
-        Err(err) => loaded_config_from_document(
-            path,
-            Value::Object(Map::new()),
-            Some(format!("read error: {err}")),
-            Vec::new(),
-        ),
-    }
+    let (path, document, read_error) = read_config_document(config_path());
+    let (host_path, host_document, host_read_error) = read_config_document(host_config_path());
+    loaded_config_from_documents(
+        path,
+        document,
+        read_error,
+        host_path,
+        host_document,
+        host_read_error,
+        Vec::new(),
+    )
 }
 
 pub fn load_config() -> HipfireConfig {
@@ -395,9 +394,23 @@ pub fn resolve_typed_config_document_with_layers(
     model_tag: Option<&str>,
     additional_layers: &[ConfigLayer],
 ) -> ResolvedTypedConfig {
-    let mut layers = config_layers_from_document(raw, model_tag);
+    resolve_typed_config_documents_with_layers(
+        raw,
+        &Value::Object(Map::new()),
+        model_tag,
+        additional_layers,
+    )
+}
+
+pub fn resolve_typed_config_documents_with_layers(
+    raw: &Value,
+    host_local: &Value,
+    model_tag: Option<&str>,
+    additional_layers: &[ConfigLayer],
+) -> ResolvedTypedConfig {
+    let mut layers = config_layers_from_documents(raw, Some(host_local), model_tag);
     layers.extend(additional_layers.iter().cloned());
-    resolve_typed_config_layers(&layers, model_overrides_from_document(raw))
+    resolve_typed_config_layers(&layers, model_overrides_from_documents(raw, host_local))
 }
 
 pub fn resolve_typed_config_layers(
@@ -421,17 +434,65 @@ pub fn loaded_config_from_document(
     read_error: Option<String>,
     additional_layers: Vec<ConfigLayer>,
 ) -> LoadedConfig {
-    let resolved =
-        resolve_typed_config_document_with_layers(&raw_document, None, &additional_layers);
+    loaded_config_from_documents(
+        config_path,
+        raw_document,
+        read_error,
+        host_config_path(),
+        Value::Object(Map::new()),
+        None,
+        additional_layers,
+    )
+}
+
+pub fn loaded_config_from_documents(
+    config_path: PathBuf,
+    raw_document: Value,
+    read_error: Option<String>,
+    host_config_path: PathBuf,
+    host_raw_document: Value,
+    host_read_error: Option<String>,
+    additional_layers: Vec<ConfigLayer>,
+) -> LoadedConfig {
+    let resolved = resolve_typed_config_documents_with_layers(
+        &raw_document,
+        &host_raw_document,
+        None,
+        &additional_layers,
+    );
     LoadedConfig {
         config_path,
         raw_document,
         read_error,
+        host_config_path,
+        host_raw_document,
+        host_read_error,
         additional_layers,
         layers: resolved.layers,
         config: resolved.config,
         resolution: resolved.resolution,
         diagnostics: resolved.diagnostics,
+    }
+}
+
+fn read_config_document(path: PathBuf) -> (PathBuf, Value, Option<String>) {
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => match serde_json::from_str::<Value>(&raw) {
+            Ok(document) => (path, document, None),
+            Err(err) => (
+                path,
+                Value::Object(Map::new()),
+                Some(format!("parse error: {err}")),
+            ),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            (path, Value::Object(Map::new()), None)
+        }
+        Err(err) => (
+            path,
+            Value::Object(Map::new()),
+            Some(format!("read error: {err}")),
+        ),
     }
 }
 
@@ -465,7 +526,15 @@ fn materialize_config(
     }
 }
 
-fn model_overrides_from_document(raw: &Value) -> HashMap<String, Value> {
+fn model_overrides_from_documents(raw: &Value, host_local: &Value) -> HashMap<String, Value> {
+    let mut overrides = model_overrides_from_single_document(raw);
+    for (key, value) in model_overrides_from_single_document(host_local) {
+        overrides.insert(key, value);
+    }
+    overrides
+}
+
+fn model_overrides_from_single_document(raw: &Value) -> HashMap<String, Value> {
     raw.get("model_overrides")
         .and_then(Value::as_object)
         .map(|object| {
@@ -568,6 +637,79 @@ mod tests {
         assert_eq!(resolved.config.temperature, 0.1);
         assert_eq!(resolved.config.max_tokens, 64);
         assert!(resolved.config.model_overrides.contains_key("qwen"));
+    }
+
+    #[test]
+    fn host_local_config_overrides_global_config() {
+        let loaded = loaded_config_from_documents(
+            PathBuf::from("/tmp/config.json"),
+            serde_json::json!({
+                "temperature": 0.4,
+                "max_tokens": 512
+            }),
+            None,
+            PathBuf::from("/tmp/config.local.json"),
+            serde_json::json!({
+                "temperature": 0.2
+            }),
+            None,
+            Vec::new(),
+        );
+
+        assert_eq!(loaded.config.temperature, 0.2);
+        assert_eq!(loaded.config.max_tokens, 512);
+        let temperature = loaded
+            .resolution
+            .values
+            .iter()
+            .find(|value| value.key == "temperature")
+            .expect("temperature");
+        assert_eq!(
+            temperature.source.as_ref().map(|source| source.kind),
+            Some(ConfigLayerKind::Host)
+        );
+    }
+
+    #[test]
+    fn host_local_model_overrides_win_over_global_model_overrides() {
+        let loaded = loaded_config_from_documents(
+            PathBuf::from("/tmp/config.json"),
+            serde_json::json!({
+                "temperature": 0.4,
+                "model_overrides": {
+                    "qwen": {
+                        "temperature": 0.2,
+                        "max_tokens": 128
+                    }
+                }
+            }),
+            None,
+            PathBuf::from("/tmp/config.local.json"),
+            serde_json::json!({
+                "temperature": 0.3,
+                "model_overrides": {
+                    "qwen": {
+                        "temperature": 0.1
+                    }
+                }
+            }),
+            None,
+            Vec::new(),
+        );
+
+        let resolved = loaded.resolve_for_model("qwen");
+        assert_eq!(resolved.config.temperature, 0.1);
+        assert_eq!(resolved.config.max_tokens, 128);
+        let temperature = resolved
+            .resolution
+            .values
+            .iter()
+            .find(|value| value.key == "temperature")
+            .expect("temperature");
+        assert_eq!(
+            temperature.source.as_ref().map(|source| source.kind),
+            Some(ConfigLayerKind::ModelHost)
+        );
     }
 
     #[test]

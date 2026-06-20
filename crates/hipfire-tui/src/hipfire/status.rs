@@ -36,6 +36,7 @@ impl StatusState {
             ("~/.hipfire".into(), paths.root.exists()),
             ("models".into(), paths.models.exists()),
             ("config.json".into(), paths.config.exists()),
+            ("config.local.json".into(), paths.host_config.exists()),
             (
                 "per_model_config.json".into(),
                 paths.per_model_config.exists(),

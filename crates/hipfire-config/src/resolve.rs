@@ -141,8 +141,19 @@ pub fn resolve_config_layers(fields: &[ConfigField], layers: &[ConfigLayer]) -> 
 }
 
 pub fn config_layers_from_document(raw: &Value, model_tag: Option<&str>) -> Vec<ConfigLayer> {
+    config_layers_from_documents(raw, None, model_tag)
+}
+
+pub fn config_layers_from_documents(
+    raw: &Value,
+    host_local: Option<&Value>,
+    model_tag: Option<&str>,
+) -> Vec<ConfigLayer> {
     let Some(object) = raw.as_object() else {
-        return Vec::new();
+        return host_local
+            .and_then(Value::as_object)
+            .map(|host_object| layers_from_host_object(host_object, model_tag))
+            .unwrap_or_default();
     };
 
     let mut global = ConfigLayer::new(ConfigLayerKind::Global);
@@ -155,6 +166,11 @@ pub fn config_layers_from_document(raw: &Value, model_tag: Option<&str>) -> Vec<
     let mut layers = Vec::new();
     if !global.values.is_empty() {
         layers.push(global);
+    }
+
+    let host_object = host_local.and_then(Value::as_object);
+    if let Some(host_object) = host_object {
+        layers.extend(layers_from_host_object(host_object, None));
     }
 
     if let Some(tag) = model_tag {
@@ -171,8 +187,54 @@ pub fn config_layers_from_document(raw: &Value, model_tag: Option<&str>) -> Vec<
                 }
             }
         }
+
+        if let Some(model_values) = host_object
+            .and_then(|object| object.get("model_overrides"))
+            .and_then(Value::as_object)
+            .and_then(|overrides| overrides.get(tag))
+        {
+            if let Some(layer) =
+                ConfigLayer::from_json_object(ConfigLayerKind::ModelHost, Some(tag), model_values)
+            {
+                if !layer.values.is_empty() {
+                    layers.push(layer);
+                }
+            }
+        }
     }
 
+    layers
+}
+
+fn layers_from_host_object(
+    host_object: &serde_json::Map<String, Value>,
+    model_tag: Option<&str>,
+) -> Vec<ConfigLayer> {
+    let mut layers = Vec::new();
+    let mut host = ConfigLayer::new(ConfigLayerKind::Host).with_id("local");
+    for (key, value) in host_object {
+        if key != "model_overrides" {
+            host.values.insert(key.clone(), value.clone());
+        }
+    }
+    if !host.values.is_empty() {
+        layers.push(host);
+    }
+    if let Some(tag) = model_tag {
+        if let Some(model_values) = host_object
+            .get("model_overrides")
+            .and_then(Value::as_object)
+            .and_then(|overrides| overrides.get(tag))
+        {
+            if let Some(layer) =
+                ConfigLayer::from_json_object(ConfigLayerKind::ModelHost, Some(tag), model_values)
+            {
+                if !layer.values.is_empty() {
+                    layers.push(layer);
+                }
+            }
+        }
+    }
     layers
 }
 

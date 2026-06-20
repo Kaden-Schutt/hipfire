@@ -61,8 +61,10 @@ fn resolved_config_json(loaded: &LoadedConfig, model: Option<&str>) -> Value {
     json!({
         "source": "active_runtime",
         "config_path": loaded.config_path.display().to_string(),
+        "host_config_path": loaded.host_config_path.display().to_string(),
         "model": model,
         "read_error": loaded.read_error.clone(),
+        "host_read_error": loaded.host_read_error.clone(),
         "diagnostics": diagnostics,
         "layers": layers,
         "resolution": resolution,

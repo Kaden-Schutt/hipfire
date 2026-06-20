@@ -14,6 +14,7 @@ pub struct HipfirePaths {
     pub root: PathBuf,
     pub models: PathBuf,
     pub config: PathBuf,
+    pub host_config: PathBuf,
     pub per_model_config: PathBuf,
     pub serve_pid: PathBuf,
     pub serve_log: PathBuf,
@@ -28,6 +29,7 @@ impl HipfirePaths {
         Self {
             models: root.join("models"),
             config: root.join("config.json"),
+            host_config: root.join("config.local.json"),
             per_model_config: root.join("per_model_config.json"),
             serve_pid: root.join("serve.pid"),
             serve_log: root.join("serve.log"),
