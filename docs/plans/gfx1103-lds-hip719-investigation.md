@@ -700,7 +700,13 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   same-loop synchronization epoch repeated across K iterations, with repeated
   launch/process state acting as the stress amplifier. Removing the second
   store, reducing the row-load width from four to three, or making the extra
-  barrier one-time-only keeps these no-extra barrier shapes pass-side.
+  barrier one-time-only keeps these no-extra barrier shapes pass-side. The
+  repeated prestore-barrier shape also has a high K-depth requirement:
+  `K_LIMIT=2815` (about 470 loop trips) remains pass-side at 100 launches,
+  while confirmation runs from `K_LIMIT=2880` upward (about 480+ loop trips)
+  fail with the same reset family. The exact top-end cutoff is stress-history
+  sensitive, so treat this as a work-depth envelope rather than a single
+  deterministic scalar threshold.
   Same-row and same-tile membership are no longer required by the current
   evidence, and neither extra-load-before-second-store nor extra-load-after-row
   ordering prevents the failure, though the separate-tile and preloop controls
@@ -1131,6 +1137,16 @@ Latest artifact paths:
   metadata is `group_segment_fixed_size=144`, `sgpr_count=5`, `vgpr_count=11`,
   `wavefront_size=32`, and no private segment. Live dmesg still ended at the
   earlier reset 528 after both passing runs.
+- `/tmp/hipfire-lds-prestore-barrier-klimit-bisect/` and
+  `/tmp/hipfire-lds-prestore-barrier-klimit-confirm/`: K-depth runs for the
+  repeated prestore-barrier no-extra shape. The first bisect reported a nominal
+  `K_LIMIT=2943` pass / `2944` fail boundary, but those values have the same
+  `TILE=6` loop-trip count, and manual repeats showed the top edge is
+  stress-history sensitive. Robust pass-side repeats: `K_LIMIT=2048`, `2559`,
+  and `2815`. Fail-side confirmation after reset pressure: `K_LIMIT=2880`,
+  `2910`, `2928`, `2934`, `2940`, `2941`, `2946`, and `2947`, all failing
+  under 100 launches with HIP 719 around sync 96-99. Live dmesg advanced
+  through the same MES `REMOVE_QUEUE` / MODE2 reset family, reaching reset 545.
 - `/tmp/hipfire-lds-crossrow-runs/`: cross-row extra-load controls. The first
   two-launch run failed adjacent to prior reset pressure, but a recovery
   `tile6_lds_second_store_only_read6` control passed, then clean
@@ -1434,6 +1450,10 @@ Evidence argues against these as sole causes:
   barrier passes, and a first-iteration-only extra barrier inside the K loop
   also passes 100 launches. The fail-side barrier controls require the extra
   sync epoch to repeat across K iterations.
+- Small K-depth alone for the repeated prestore-barrier branch: the same
+  two-store/four-load/four-barrier shape passes at `K_LIMIT=2815` under 100
+  launches. The fail-side reappears near the top of K, with confirmed failures
+  from `K_LIMIT=2880` upward after reset pressure.
 
 The `tile6` dmesg delta shows a driver-side device wedge, not a simple HIP
 runtime recoverable error. The latest v2 failing run again reset through the
