@@ -67,14 +67,13 @@ use dummy::{
     emit_dummy_generate_batch_prefill_ready, run_generate_batch_prefill_dummy, DummyModelState,
 };
 use events::{emit_error_with_id, write_error, MAX_BASE64_ENCODED_LEN};
-use hipfire_serving_core::{dummy, events, memory, model, output_filter, session};
-use model::{LoadedModel, RAW_OVERRIDE};
+use hipfire_serving_core::{dummy, events, load, model, output_filter, session};
+use load::*;
+use model::{CaskConfig, LoadedModel, RAW_OVERRIDE};
 use output_filter::{
     chat_output_filter_from_profile, normalize_daemon_prompt, normalize_request_stop_sequences,
 };
 use session::*;
-mod load;
-use load::*;
 mod generate_vl;
 use generate_vl::{generate_vl, generate_vl_dots_ocr};
 mod generate_arch;
@@ -84,19 +83,6 @@ mod qwen35_decode;
 use qwen35_decode::*;
 mod generate;
 use generate::*;
-
-/// CASK/TriAttention params forwarded by the CLI at load time. Zero-initialized
-/// CaskConfig{sidecar: None, ..} means no eviction — matches 0.1.7-alpha behavior.
-#[derive(Default)]
-pub(crate) struct CaskConfig {
-    pub(crate) sidecar: Option<String>,
-    /// true = CASK m-folding; false = plain TriAttention drop-eviction.
-    pub(crate) cask_m_folding: bool,
-    pub(crate) budget: usize,
-    pub(crate) beta: usize,
-    pub(crate) core_frac: f32,
-    pub(crate) fold_m: usize,
-}
 
 fn daemon_runtime_context(model: &LoadedModel) -> serde_json::Value {
     serde_json::json!({

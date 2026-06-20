@@ -34,6 +34,19 @@ use hipfire_state::ModelArtifactMemory;
 
 use crate::session::Qwen35RequestSessionState;
 
+/// CASK/TriAttention params forwarded by the CLI at load time. Zero-initialized
+/// CaskConfig{sidecar: None, ..} means no eviction — matches 0.1.7-alpha behavior.
+#[derive(Default)]
+pub struct CaskConfig {
+    pub sidecar: Option<String>,
+    /// true = CASK m-folding; false = plain TriAttention drop-eviction.
+    pub cask_m_folding: bool,
+    pub budget: usize,
+    pub beta: usize,
+    pub core_frac: f32,
+    pub fold_m: usize,
+}
+
 /// Eviction policy wrapper — dispatches to plain TriAttention or CASK m-folding.
 pub enum Eviction {
     Plain(EvictionCtx),

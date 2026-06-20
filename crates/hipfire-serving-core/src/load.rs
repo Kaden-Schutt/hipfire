@@ -11,7 +11,7 @@
 //! small config/metadata helpers (chat-template resolution, state-quant parsing,
 //! parameter counting, tiny-model bring-up). Extracted verbatim from the former
 //! `main.rs` monolith (no behavior change); items called from `main.rs` are
-//! `pub(crate)`.
+//! `pub`.
 
 use std::path::Path;
 
@@ -37,14 +37,14 @@ use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 
 use crate::memory::{hfq_model_memory, unknown_model_memory};
+use crate::model::CaskConfig;
 use crate::model::{DdtreeState, DflashState, Eviction, LoadedModel};
 use crate::session::{next_qwen35_state_allocation_epoch, QWEN35_LEGACY_SESSION_ID};
-use crate::CaskConfig;
 
 /// Resolve the effective chat template for a model: the HFQ-embedded
 /// `tokenizer_config.chat_template`, with sidecar/path fallbacks. `None` when
 /// the model ships no template (base/completion model).
-pub(crate) fn resolve_chat_template(
+pub fn resolve_chat_template(
     hfq: &hipfire_runtime::hfq::HfqFile,
     model_path: &str,
 ) -> Option<String> {
@@ -56,7 +56,7 @@ pub(crate) fn resolve_chat_template(
 /// Parse a resolved chat-template string into a `ChatTemplateProfile` (the
 /// stop-token / holdback / framing metadata the output filter and prompt
 /// framing consume).
-pub(crate) fn profile_chat_template(
+pub fn profile_chat_template(
     chat_template: Option<String>,
     tokenizer: Option<&hipfire_model::tokenizer::Tokenizer>,
 ) -> (Option<String>, Option<prompt_frame::ChatTemplateProfile>) {
@@ -77,7 +77,7 @@ pub(crate) fn profile_chat_template(
 
 /// Parse the DeltaNet state-quant mode from a load-message param string
 /// (e.g. `q8`/`fp16`), falling back to the arch default when absent/unknown.
-pub(crate) fn parse_state_quant(
+pub fn parse_state_quant(
     mode: Option<&str>,
 ) -> Result<hipfire_arch_qwen35::qwen35::StateQuant, String> {
     use hipfire_arch_qwen35::qwen35::StateQuant;
@@ -92,7 +92,7 @@ pub(crate) fn parse_state_quant(
 }
 
 /// Human-readable label for a `StateQuant` (for the `loaded` event / status).
-pub(crate) fn state_quant_label(q: hipfire_arch_qwen35::qwen35::StateQuant) -> &'static str {
+pub fn state_quant_label(q: hipfire_arch_qwen35::qwen35::StateQuant) -> &'static str {
     use hipfire_arch_qwen35::qwen35::StateQuant;
     match q {
         StateQuant::FP32 => "FP32",
@@ -103,7 +103,7 @@ pub(crate) fn state_quant_label(q: hipfire_arch_qwen35::qwen35::StateQuant) -> &
 
 /// Total parameter count across an HFQ's tensors (summed element counts), for
 /// the reported model size.
-pub(crate) fn hfq_parameter_count(hfq: &HfqFile) -> u128 {
+pub fn hfq_parameter_count(hfq: &HfqFile) -> u128 {
     hfq.tensors()
         .iter()
         .map(|t| {
@@ -116,7 +116,7 @@ pub(crate) fn hfq_parameter_count(hfq: &HfqFile) -> u128 {
 
 /// True if any tensor in the HFQ is stored as bf16 — gates the bf16-capable
 /// load path / dtype handling.
-pub(crate) fn hfq_has_bf16_weights(hfq: &HfqFile) -> bool {
+pub fn hfq_has_bf16_weights(hfq: &HfqFile) -> bool {
     hfq.tensors().iter().any(|t| t.quant_type == 16)
 }
 
@@ -132,7 +132,7 @@ pub(crate) fn hfq_has_bf16_weights(hfq: &HfqFile) -> bool {
 // An explicit override (state_quant="q8"/"q4" in JSON params) is honoured.
 /// Bring-up helper for the tiny smoke-test models: resolve their abbreviated
 /// config into the concrete state needed to load them.
-pub(crate) fn resolve_tiny_model_state(
+pub fn resolve_tiny_model_state(
     hfq: &HfqFile,
     override_str: Option<&str>,
     q: hipfire_arch_qwen35::qwen35::StateQuant,
@@ -181,7 +181,7 @@ pub(crate) fn resolve_tiny_model_state(
 /// scratch/KV/state for that family, resolve the chat template and eviction
 /// policy, and wire any optional DFlash drafter. The single-GPU entry point
 /// (multi-GPU goes through [`load_model_pp`]).
-pub(crate) fn load_model(
+pub fn load_model(
     path: &str,
     max_seq: usize,
     requested_physical_cap: Option<usize>,
@@ -1363,7 +1363,7 @@ pub(crate) fn load_model(
 }
 
 /// Load a model from a HuggingFace safetensors directory (ParoQuant, AWQ, etc.).
-pub(crate) fn load_model_safetensors(
+pub fn load_model_safetensors(
     path: &str,
     max_seq: usize,
     kv_mode: &str,
@@ -1657,7 +1657,7 @@ pub(crate) fn load_model_safetensors(
 /// `gpu` parameter is unused on this path. Eviction is refused at this layer
 /// because TriAttention/CASK/PFlash live on a single device and are not v1
 /// targets for pp>1 — physical_cap == max_seq accordingly.
-pub(crate) fn load_model_pp(
+pub fn load_model_pp(
     path: &str,
     max_seq: usize,
     kv_mode_override: Option<&str>,
@@ -1920,7 +1920,7 @@ pub(crate) fn load_model_pp(
 
 /// Pre-screen all Qwen3.5/3.6 weight matrices for MMQ safety (#87).
 /// Returns (n_safe, n_unsafe). Results are cached in gpu.mmq_screen_cache.
-pub(crate) fn screen_weights_qwen35(
+pub fn screen_weights_qwen35(
     weights: &qwen35::Qwen35Weights,
     gpu: &mut rdna_compute::Gpu,
 ) -> (usize, usize) {
@@ -1988,7 +1988,7 @@ pub(crate) fn screen_weights_qwen35(
 /// Free all GPU resources held by a loaded model (weights, scratch, KV/state,
 /// eviction scratch, DFlash drafter) by consuming it. Per-arch teardown mirrors
 /// whichever Option fields are populated.
-pub(crate) fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
+pub fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // Multi-GPU branch (Stage 7 of #58). Frees per-device tensors through the
     // Gpus orchestrator, then invalidates per-device caches so the next load
     // can't inherit stale verdicts at recycled device addresses. Order
@@ -2110,7 +2110,7 @@ pub(crate) fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
 /// Load the optional DFlash speculative-decoding drafter for a model: the draft
 /// weights/config/scratch, the hidden-state ring buffer + verify scratch, and
 /// (when `HIPFIRE_DDTREE_BUDGET` is set) the DDTree tree-verify side state.
-pub(crate) fn load_dflash_state(
+pub fn load_dflash_state(
     draft_path: &str,
     ctx_capacity: usize,
     target_config: &qwen35::Qwen35Config,
