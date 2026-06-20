@@ -44,7 +44,7 @@ GEMM (existing kernels accumulate-and-store **F32**):
 |------------|----------|------------------------|
 | `f16→f32`  | ✅ exists | `gemm_f16_wmma` (Wf16×Xf32), `gemm_f16_x_f16_wmma` (Wf16×Xf16→F32) |
 | `bf16→f32` | ✅ exists | `gemm_bf16_x_bf16_wmma` (named bf16×bf16 but **stores F32**) + `_gfx1151_m128` LDS large-M variant |
-| `f16→f16`  | ❌ missing| f32-accumulate (`wmma_f32_…_f16`) + bf16/f16-round store — see lesson below |
+| `f16→f16`  | ✅ done   | `gemm_f16_f16_wmma` (no-LDS, F32 accum + f16 store); parity test `examples/parity_gemm_f16_f16_wmma.rs`, validated on gfx1103 |
 | `bf16→bf16`| ✅ done   | `gemm_bf16_bf16_wmma` (no-LDS, F32 accum + bf16 store); parity test `examples/parity_gemm_bf16_bf16_wmma.rs`, validated on gfx1103 |
 | `iu8→i32`  | ❌ missing| only synthetic probe `bench_iu8_wmma_gfx1151` |
 | `iu4→i32`  | ⚠️ partial| `gemm_s4s4_wmma_tile_gfx1151` (signed-only, gfx1151-tagged) — generalize + test |
