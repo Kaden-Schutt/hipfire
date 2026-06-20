@@ -22,8 +22,8 @@ shapes and captures codegen artifacts without launching the reset-prone probe.
 
 Modes:
   --build-only  Safe compile/codegen capture under OUT-buildonly
-  --risky       Run focused READS=2 pass-side controls first, then the 9x4
-                first-two-wave direct-AB repro. This can trip HIP-719 and
+  --risky       Run focused READS=2 pass-side controls first, then the
+                33/34-lane direct-AB repros. This can trip HIP-719 and
                 wedge/reset affected gfx1103/780M stacks.
   --compare     Compare two direct-ab-artifact-summary.tsv files
 
@@ -97,6 +97,15 @@ print_reference() {
 #   gcvm_sig=MORE_FAULTS,PERMISSION_FAULTS,RW/cid=8/rw=1/vmid=8
 # READS=2 process-boundary control observed locally:
 #   active=9x4 block/layout=9x4 reads=2 iters=448 chunks=130,10 grid=512x86 exit=0
+# READS=2 one-wave controls observed locally:
+#   active=32x1 block/layout=32x1 reads=2 iters=448 chunks=500 grid=512x86 exit=0
+#   active=1x32 block/layout=1x32 reads=2 iters=448 chunks=500 grid=512x86 exit=0
+# READS=2 33/34-lane edge checks observed locally:
+#   active=33x1 block/layout=33x1 reads=2 iters=448 chunks=130 grid=512x86 exit=4
+#   active=1x33 block/layout=1x33 reads=2 iters=448 chunks=140 grid=512x86 exit=0
+#   active=1x33 block/layout=1x33 reads=2 iters=448 chunks=500 grid=512x86 exit=4
+#   active=17x2 block/layout=17x2 reads=2 iters=448 chunks=130 grid=512x86 exit=4
+#   active=2x17 block/layout=2x17 reads=2 iters=448 chunks=130 grid=512x86 exit=4
 EOF
 }
 
@@ -179,11 +188,25 @@ run_matrix() {
         run_case "01-build-9x4-r2-one-child-130" 9 4 9 4 9 4 2 448 512 86 130 pass 1 || failures=$((failures + 1))
         run_case "02-build-9x4-r2-split-130-10" 9 4 9 4 9 4 2 448 512 86 130,10 pass 1 || failures=$((failures + 1))
         run_case "03-build-9x4-r2-one-child-140" 9 4 9 4 9 4 2 448 512 86 140 fail 1 || failures=$((failures + 1))
+        run_case "04-build-32x1-r2-one-child-500" 32 1 32 1 32 1 2 448 512 86 500 pass 1 || failures=$((failures + 1))
+        run_case "05-build-1x32-r2-one-child-500" 1 32 1 32 1 32 2 448 512 86 500 pass 1 || failures=$((failures + 1))
+        run_case "06-build-33x1-r2-one-child-130" 33 1 33 1 33 1 2 448 512 86 130 fail 1 || failures=$((failures + 1))
+        run_case "07-build-1x33-r2-one-child-140" 1 33 1 33 1 33 2 448 512 86 140 pass 1 || failures=$((failures + 1))
+        run_case "08-build-1x33-r2-one-child-500" 1 33 1 33 1 33 2 448 512 86 500 fail 1 || failures=$((failures + 1))
+        run_case "09-build-17x2-r2-one-child-130" 17 2 17 2 17 2 2 448 512 86 130 fail 1 || failures=$((failures + 1))
+        run_case "10-build-2x17-r2-one-child-130" 2 17 2 17 2 17 2 448 512 86 130 fail 1 || failures=$((failures + 1))
     else
         run_case "00-control-8x4-r2-one-child-500" 8 4 8 4 8 4 2 448 512 86 500 pass 0 || failures=$((failures + 1))
-        run_case "01-control-9x4-r2-one-child-130" 9 4 9 4 9 4 2 448 512 86 130 pass 0 || failures=$((failures + 1))
-        run_case "02-control-9x4-r2-split-130-10" 9 4 9 4 9 4 2 448 512 86 130,10 pass 0 || failures=$((failures + 1))
-        run_case "03-fail-9x4-r2-one-child-140" 9 4 9 4 9 4 2 448 512 86 140 fail 0 || failures=$((failures + 1))
+        run_case "01-control-32x1-r2-one-child-500" 32 1 32 1 32 1 2 448 512 86 500 pass 0 || failures=$((failures + 1))
+        run_case "02-control-1x32-r2-one-child-500" 1 32 1 32 1 32 2 448 512 86 500 pass 0 || failures=$((failures + 1))
+        run_case "03-control-9x4-r2-one-child-130" 9 4 9 4 9 4 2 448 512 86 130 pass 0 || failures=$((failures + 1))
+        run_case "04-control-9x4-r2-split-130-10" 9 4 9 4 9 4 2 448 512 86 130,10 pass 0 || failures=$((failures + 1))
+        run_case "05-control-1x33-r2-one-child-140" 1 33 1 33 1 33 2 448 512 86 140 pass 0 || failures=$((failures + 1))
+        run_case "06-fail-9x4-r2-one-child-140" 9 4 9 4 9 4 2 448 512 86 140 fail 0 || failures=$((failures + 1))
+        run_case "07-fail-33x1-r2-one-child-130" 33 1 33 1 33 1 2 448 512 86 130 fail 0 || failures=$((failures + 1))
+        run_case "08-fail-1x33-r2-one-child-500" 1 33 1 33 1 33 2 448 512 86 500 fail 0 || failures=$((failures + 1))
+        run_case "09-fail-17x2-r2-one-child-130" 17 2 17 2 17 2 2 448 512 86 130 fail 0 || failures=$((failures + 1))
+        run_case "10-fail-2x17-r2-one-child-130" 2 17 2 17 2 17 2 448 512 86 130 fail 0 || failures=$((failures + 1))
     fi
 
     {
