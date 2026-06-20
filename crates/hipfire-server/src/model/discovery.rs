@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 
 use hipfire_config::{hipfire_dir, models_dir};
-use hipfire_model::{find_model_in, list_local_models_in};
+use hipfire_model::{
+    build_local_llm_registry, find_model_in, list_local_models_in, LlmModelRegistry,
+};
 
 /// Resolve a model identifier to an absolute file path.
 ///
@@ -20,4 +22,8 @@ pub fn find_model(arg: &str) -> Option<PathBuf> {
 /// List all non-sidecar .hfq files in the models directory.
 pub fn list_local_models() -> Vec<PathBuf> {
     list_local_models_in(&models_dir())
+}
+
+pub fn local_llm_registry() -> LlmModelRegistry {
+    build_local_llm_registry()
 }

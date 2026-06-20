@@ -7,7 +7,9 @@
 use serde::{Deserialize, Serialize};
 
 use hipfire_generate::{DoneEvent, ErrorEvent, GenerateTextRequest, TokenEvent, ToolCallsEvent};
-use hipfire_model::{AcceleratorInventory, ModelLoadRequest, ModelLoadedResponse};
+use hipfire_model::{
+    AcceleratorInventory, LlmModelRegistry, ModelLoadRequest, ModelLoadedResponse,
+};
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct RequestControl {
@@ -50,6 +52,7 @@ pub enum DaemonRequest {
     Reset,
     Ping,
     Inventory,
+    ModelRegistry,
     Generate(GenerateTextRequest),
     Abort(RequestControl),
     ForceAnswer(RequestControl),
@@ -64,6 +67,9 @@ pub enum DaemonResponse {
     Reset,
     Pong,
     Inventory(AcceleratorInventory),
+    ModelRegistry {
+        registry: LlmModelRegistry,
+    },
     Token(TokenEvent),
     ToolCalls(ToolCallsEvent),
     Done(DoneEvent),
@@ -240,6 +246,32 @@ mod tests {
         assert_eq!(inventory.devices[1].kind, "npu");
         assert_eq!(inventory.devices[1].device_id, "xdna1:0");
         assert_eq!(inventory.devices[1].arch.as_deref(), Some("xdna1"));
+    }
+
+    #[test]
+    fn model_registry_request_and_response_use_nested_registry_payload() {
+        let value = serde_json::to_value(DaemonRequest::ModelRegistry).unwrap();
+        assert_eq!(value, json!({"type": "model_registry"}));
+
+        let response: DaemonResponse = serde_json::from_value(json!({
+            "type": "model_registry",
+            "registry": {
+                "models_dir": "/home/user/.hipfire/models",
+                "triattn_dir": "/home/user/.hipfire/triattn",
+                "drafts_dir": "/home/user/.hipfire/drafts",
+                "templates_dir": "/home/user/.hipfire/templates",
+                "models": [],
+                "triattn": [],
+                "drafts": [],
+                "chat_templates": []
+            }
+        }))
+        .unwrap();
+
+        let DaemonResponse::ModelRegistry { registry } = response else {
+            panic!("expected model registry response");
+        };
+        assert_eq!(registry.model_count(), 0);
     }
 
     #[test]

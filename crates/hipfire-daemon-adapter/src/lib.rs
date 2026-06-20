@@ -14,7 +14,9 @@ use hipfire_daemon_protocol::{
     CollectRequest, CollectResponse, DaemonRequest, DaemonResponse, RequestControl,
 };
 use hipfire_generate::{DoneEvent, GenerateTextRequest, ToolCall};
-use hipfire_model::{AcceleratorInventory, ModelLoadParams, ModelLoadRequest, ModelLoadedResponse};
+use hipfire_model::{
+    AcceleratorInventory, LlmModelRegistry, ModelLoadParams, ModelLoadRequest, ModelLoadedResponse,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tracing::debug;
@@ -242,6 +244,23 @@ impl DaemonEngine {
                 DaemonResponse::Unknown => {}
                 other => {
                     tracing::warn!("unexpected response during inventory: {other:?}");
+                }
+            }
+        }
+    }
+
+    /// Send `model_registry` and wait for the daemon's startup model inventory.
+    pub async fn model_registry(&mut self) -> anyhow::Result<LlmModelRegistry> {
+        self.send(&DaemonRequest::ModelRegistry).await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::ModelRegistry { registry } => return Ok(registry),
+                DaemonResponse::Error(e) => {
+                    anyhow::bail!("daemon model_registry error: {}", e.message)
+                }
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during model_registry: {other:?}");
                 }
             }
         }

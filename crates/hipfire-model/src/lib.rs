@@ -791,6 +791,218 @@ pub fn list_local_models_in(models_dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ModelRegistryAsset {
+    pub id: String,
+    pub file: String,
+    pub path: String,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LlmModelRegistryEntry {
+    pub id: String,
+    pub file: String,
+    pub path: String,
+    pub bytes: u64,
+    pub triattn: Vec<ModelRegistryAsset>,
+    pub drafts: Vec<ModelRegistryAsset>,
+    pub chat_templates: Vec<ModelRegistryAsset>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LlmModelRegistry {
+    pub models_dir: String,
+    pub triattn_dir: String,
+    pub drafts_dir: String,
+    pub templates_dir: String,
+    pub models: Vec<LlmModelRegistryEntry>,
+    pub triattn: Vec<ModelRegistryAsset>,
+    pub drafts: Vec<ModelRegistryAsset>,
+    pub chat_templates: Vec<ModelRegistryAsset>,
+}
+
+impl LlmModelRegistry {
+    pub fn model_count(&self) -> usize {
+        self.models.len()
+    }
+
+    pub fn sidecar_count(&self) -> usize {
+        self.triattn.len() + self.drafts.len() + self.chat_templates.len()
+    }
+}
+
+pub fn build_local_llm_registry() -> LlmModelRegistry {
+    let hipfire = hipfire_config::hipfire_dir();
+    build_llm_registry_in(
+        &hipfire_config::models_dir(),
+        &hipfire.join("triattn"),
+        &hipfire.join("drafts"),
+        &hipfire.join("templates"),
+    )
+}
+
+pub fn build_llm_registry_in(
+    models_dir: &Path,
+    triattn_dir: &Path,
+    drafts_dir: &Path,
+    templates_dir: &Path,
+) -> LlmModelRegistry {
+    let triattn = scan_registry_assets(triattn_dir, is_triattn_file_name);
+    let drafts = scan_registry_assets(drafts_dir, is_draft_file_name);
+    let chat_templates = scan_registry_assets(templates_dir, is_chat_template_file_name);
+    let models = list_local_models_in(models_dir)
+        .into_iter()
+        .map(|model| {
+            let file = model
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let mut model_triattn =
+                matching_assets(&triattn, |asset| triattn_matches_model(&asset.file, &file));
+            model_triattn.extend(
+                scan_registry_assets(models_dir, is_triattn_file_name)
+                    .into_iter()
+                    .filter(|asset| triattn_matches_model(&asset.file, &file)),
+            );
+            model_triattn.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.path.cmp(&b.path)));
+            model_triattn.dedup_by(|a, b| a.path == b.path);
+
+            let mut model_drafts =
+                matching_assets(&drafts, |asset| draft_matches_model(&asset.file, &file));
+            model_drafts.extend(
+                scan_registry_assets(models_dir, is_draft_file_name)
+                    .into_iter()
+                    .filter(|asset| draft_matches_model(&asset.file, &file)),
+            );
+            model_drafts.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.path.cmp(&b.path)));
+            model_drafts.dedup_by(|a, b| a.path == b.path);
+
+            let model_templates = matching_assets(&chat_templates, |asset| {
+                template_matches_model(&asset.file, &file)
+            });
+
+            LlmModelRegistryEntry {
+                id: model_display_name(&model),
+                file,
+                path: model.to_string_lossy().to_string(),
+                bytes: file_len(&model),
+                triattn: model_triattn,
+                drafts: model_drafts,
+                chat_templates: model_templates,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    LlmModelRegistry {
+        models_dir: models_dir.to_string_lossy().to_string(),
+        triattn_dir: triattn_dir.to_string_lossy().to_string(),
+        drafts_dir: drafts_dir.to_string_lossy().to_string(),
+        templates_dir: templates_dir.to_string_lossy().to_string(),
+        models,
+        triattn,
+        drafts,
+        chat_templates,
+    }
+}
+
+fn scan_registry_assets(dir: &Path, predicate: impl Fn(&str) -> bool) -> Vec<ModelRegistryAsset> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter_map(|path| {
+            let file = path.file_name()?.to_string_lossy().to_string();
+            predicate(&file).then(|| registry_asset(path))
+        })
+        .collect::<Vec<_>>();
+    out.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.path.cmp(&b.path)));
+    out
+}
+
+fn registry_asset(path: PathBuf) -> ModelRegistryAsset {
+    let file = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    ModelRegistryAsset {
+        id: file
+            .trim_end_matches(".j2")
+            .trim_end_matches(".hfq")
+            .to_string(),
+        file,
+        bytes: file_len(&path),
+        path: path.to_string_lossy().to_string(),
+    }
+}
+
+fn matching_assets(
+    assets: &[ModelRegistryAsset],
+    predicate: impl Fn(&ModelRegistryAsset) -> bool,
+) -> Vec<ModelRegistryAsset> {
+    assets
+        .iter()
+        .filter(|asset| predicate(asset))
+        .cloned()
+        .collect()
+}
+
+fn file_len(path: &Path) -> u64 {
+    fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+}
+
+fn is_triattn_file_name(file: &str) -> bool {
+    file.to_ascii_lowercase().ends_with(".triattn.hfq")
+}
+
+fn is_draft_file_name(file: &str) -> bool {
+    let file = file.to_ascii_lowercase();
+    file.ends_with(".dflash.hfq") || file.ends_with(".draft.hfq")
+}
+
+fn is_chat_template_file_name(file: &str) -> bool {
+    let file = file.to_ascii_lowercase();
+    file.ends_with(".j2") || file.ends_with(".jinja") || file.ends_with(".tmpl")
+}
+
+fn triattn_matches_model(sidecar_file: &str, model_file: &str) -> bool {
+    sidecar_file.starts_with(&format!("{model_file}.triattn"))
+        || Path::new(model_file)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(|stem| sidecar_file.starts_with(&format!("{stem}.triattn")))
+            .unwrap_or(false)
+}
+
+fn draft_matches_model(draft_file: &str, model_file: &str) -> bool {
+    dflash_draft_candidates(model_file)
+        .iter()
+        .any(|candidate| candidate == draft_file)
+        || Path::new(model_file)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(|stem| draft_file.starts_with(stem))
+            .unwrap_or(false)
+}
+
+fn template_matches_model(template_file: &str, model_file: &str) -> bool {
+    template_file == format!("{model_file}.j2")
+        || Path::new(model_file)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(|stem| {
+                template_file == format!("{stem}.j2")
+                    || template_file == format!("{stem}.jinja")
+                    || template_file == format!("{stem}.tmpl")
+            })
+            .unwrap_or(false)
+}
+
 /// Discover a DFlash draft sidecar next to a target model artifact.
 pub fn discover_dflash_draft_for_model(model: &Path) -> Option<PathBuf> {
     if !model.is_file() {
@@ -1251,6 +1463,36 @@ mod tests {
                 ]
             })
         );
+    }
+
+    #[test]
+    fn llm_registry_scans_models_sidecars_drafts_and_templates() {
+        let root = temp_dir("hipfire-model-registry");
+        let models = root.join("models");
+        let triattn = root.join("triattn");
+        let drafts = root.join("drafts");
+        let templates = root.join("templates");
+        fs::create_dir_all(&models).unwrap();
+        fs::create_dir_all(&triattn).unwrap();
+        fs::create_dir_all(&drafts).unwrap();
+        fs::create_dir_all(&templates).unwrap();
+        fs::write(models.join("qwen3.5-9b-mq4.hfq"), "model").unwrap();
+        fs::write(models.join("qwen3.5-9b-mq4.mtp.hfq"), "mtp").unwrap();
+        fs::write(triattn.join("qwen3.5-9b-mq4.triattn.hfq"), "tri").unwrap();
+        fs::write(drafts.join("qwen3.5-9b-mq4.dflash.hfq"), "draft").unwrap();
+        fs::write(templates.join("qwen3.5-9b-mq4.hfq.j2"), "template").unwrap();
+
+        let registry = build_llm_registry_in(&models, &triattn, &drafts, &templates);
+
+        assert_eq!(registry.model_count(), 1);
+        assert_eq!(registry.sidecar_count(), 3);
+        let model = &registry.models[0];
+        assert_eq!(model.id, "qwen3.5-9b-mq4");
+        assert_eq!(model.triattn[0].file, "qwen3.5-9b-mq4.triattn.hfq");
+        assert_eq!(model.drafts[0].file, "qwen3.5-9b-mq4.dflash.hfq");
+        assert_eq!(model.chat_templates[0].file, "qwen3.5-9b-mq4.hfq.j2");
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

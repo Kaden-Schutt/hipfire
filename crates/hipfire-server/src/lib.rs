@@ -30,6 +30,10 @@ pub fn build_router(state: SharedState) -> Router {
             "/operator/config/resolved",
             get(routes::operator::get_resolved_config),
         )
+        .route(
+            "/operator/models/registry",
+            get(routes::models::get_model_registry),
+        )
         .route("/v1/models", get(routes::models::get_models))
         .route(
             "/v1/files",

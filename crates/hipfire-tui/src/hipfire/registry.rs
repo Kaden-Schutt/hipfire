@@ -6,11 +6,13 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::PathBuf,
+    time::Duration,
 };
 
 use serde::Deserialize;
+use serde_json::Value;
 
-use super::HipfirePaths;
+use super::{config::ConfigState, HipfirePaths};
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct ModelEntry {
@@ -62,6 +64,8 @@ pub struct ModelRow {
     pub downloaded: bool,
     pub has_triattn: bool,
     pub has_mtp: bool,
+    pub has_draft: bool,
+    pub has_template: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -91,7 +95,18 @@ pub enum RegistryAction {
 }
 
 impl RegistryState {
-    pub fn load(paths: &HipfirePaths) -> Self {
+    pub fn load(paths: &HipfirePaths, config: &ConfigState) -> Self {
+        match load_remote_registry(config) {
+            Ok(registry) => registry,
+            Err(err) => {
+                let mut fallback = Self::load_local(paths);
+                fallback.warning = Some(err);
+                fallback
+            }
+        }
+    }
+
+    fn load_local(paths: &HipfirePaths) -> Self {
         let local_files = list_local_models(paths);
         let local_names = local_files
             .iter()
@@ -127,6 +142,8 @@ impl RegistryState {
                     downloaded,
                     has_triattn,
                     has_mtp,
+                    has_draft: false,
+                    has_template: false,
                 }
             })
             .collect::<Vec<_>>();
@@ -146,6 +163,8 @@ impl RegistryState {
                     downloaded: true,
                     has_triattn: false,
                     has_mtp: false,
+                    has_draft: false,
+                    has_template: false,
                 }),
         );
         models.sort_by(|a, b| a.tag.cmp(&b.tag));
@@ -265,6 +284,95 @@ impl RegistryState {
             }
         }
     }
+}
+
+fn load_remote_registry(config: &ConfigState) -> Result<RegistryState, String> {
+    let url = format!(
+        "http://{}:{}/operator/models/registry",
+        config.probe_host(),
+        config.port
+    );
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_millis(650))
+        .build();
+    let body = agent
+        .get(&url)
+        .call()
+        .map_err(|err| format!("registry unavailable: {err}"))?
+        .into_string()
+        .map_err(|err| format!("registry read error: {err}"))?;
+    let payload = serde_json::from_str::<Value>(&body)
+        .map_err(|err| format!("registry parse error: {err}"))?;
+    let models = payload
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "registry endpoint returned unexpected JSON".to_string())?;
+    let mut local_files = Vec::new();
+    let mut rows = Vec::new();
+    for model in models {
+        let id = model
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let file = model
+            .get("file")
+            .and_then(Value::as_str)
+            .unwrap_or(id.as_str())
+            .to_string();
+        let bytes = model.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+        local_files.push(LocalModel {
+            file: file.clone(),
+            size: format_bytes(bytes),
+            bytes,
+        });
+        let has_triattn = non_empty_array(model.get("triattn"));
+        let has_mtp = false;
+        let has_draft = non_empty_array(model.get("drafts"));
+        let has_template = non_empty_array(model.get("chat_templates"));
+        let mut features = Vec::new();
+        if has_draft {
+            features.push("draft");
+        }
+        if has_template {
+            features.push("template");
+        }
+        rows.push(ModelRow {
+            tag: id,
+            entry: ModelEntry {
+                file,
+                size_gb: bytes as f64 / 1_000_000_000.0,
+                desc: if features.is_empty() {
+                    "daemon model registry".into()
+                } else {
+                    format!("daemon model registry ({})", features.join(", "))
+                },
+                ..ModelEntry::default()
+            },
+            downloaded: true,
+            has_triattn,
+            has_mtp,
+            has_draft,
+            has_template,
+        });
+    }
+    rows.sort_by(|a, b| a.tag.cmp(&b.tag));
+    local_files.sort_by(|a, b| a.file.cmp(&b.file));
+    Ok(RegistryState {
+        models: rows,
+        aliases: BTreeMap::new(),
+        local_files,
+        selected: 0,
+        expanded_groups: BTreeSet::new(),
+        loaded_path: None,
+        warning: None,
+    })
+}
+
+fn non_empty_array(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty())
 }
 
 fn group_key(tag: &str) -> String {

@@ -36,7 +36,7 @@ use hipfire_generate::{
     validate_generate_batch_decode, validate_generate_batch_prefill,
     validate_prefix_hash_preflight, GenerateVLParams, ImageSource,
 };
-use hipfire_model::is_qwen35_family_arch_id;
+use hipfire_model::{build_local_llm_registry, is_qwen35_family_arch_id};
 use hipfire_prompt as prompt_frame;
 use hipfire_runtime::llama;
 use hipfire_state::{
@@ -2198,6 +2198,16 @@ fn main() {
     let _daemon_lock = acquire_daemon_lock();
     let _resource_lease = hipfire_daemon_adapter::acquire_resource_lease_or_exit();
     hipfire_runtime::logging::init_stderr_logging("daemon");
+    let llm_registry = build_local_llm_registry();
+    eprintln!(
+        "[hipfire-daemon] model registry: {} model(s), {} sidecar/template artifact(s) (models={}, triattn={}, drafts={}, templates={})",
+        llm_registry.model_count(),
+        llm_registry.sidecar_count(),
+        llm_registry.models_dir,
+        llm_registry.triattn_dir,
+        llm_registry.drafts_dir,
+        llm_registry.templates_dir,
+    );
 
     let mut gpu = match rdna_compute::Gpu::init() {
         Ok(g) => g,
@@ -2261,6 +2271,17 @@ fn main() {
         };
 
         match msg_type {
+            "model_registry" => {
+                let _ = serde_json::to_writer(
+                    &mut stdout,
+                    &serde_json::json!({
+                        "type": "model_registry",
+                        "registry": llm_registry
+                    }),
+                );
+                let _ = writeln!(stdout);
+                let _ = stdout.flush();
+            }
             "load" => {
                 let requested_worker_id = message_worker_id(&msg);
                 // Unload previous if any. PFlash drafter goes first so

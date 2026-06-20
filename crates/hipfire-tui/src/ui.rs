@@ -366,18 +366,25 @@ fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
                     } else {
                         "remote"
                     };
-                    let extras = match (row.has_triattn, row.has_mtp) {
-                        (true, true) => "triattn mtp",
-                        (true, false) => "triattn",
-                        (false, true) => "mtp",
-                        _ => "",
-                    };
+                    let mut extras = Vec::new();
+                    if row.has_triattn {
+                        extras.push("triattn");
+                    }
+                    if row.has_mtp {
+                        extras.push("mtp");
+                    }
+                    if row.has_draft {
+                        extras.push("draft");
+                    }
+                    if row.has_template {
+                        extras.push("template");
+                    }
                     Row::new([
                         format!("  {}", row.tag),
                         status.into(),
                         format!("{:.1} GB", row.entry.size_gb),
                         format!("{:.0} GB", row.entry.min_vram_gb),
-                        extras.into(),
+                        extras.join(" "),
                         if row.entry.repo.is_empty() {
                             format!("{} (no remote repo)", row.entry.desc)
                         } else {

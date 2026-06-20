@@ -64,7 +64,7 @@ impl App {
     pub fn load() -> Result<Self> {
         let paths = HipfirePaths::discover();
         let config = ConfigState::load(&paths);
-        let registry = RegistryState::load(&paths);
+        let registry = RegistryState::load(&paths, &config);
         let status = StatusState::load(&paths, &config);
         let active_model = config.default_model.clone();
         Ok(Self {
@@ -83,7 +83,7 @@ impl App {
 
     pub fn reload(&mut self) {
         self.config = ConfigState::load(&self.paths);
-        self.registry = RegistryState::load(&self.paths);
+        self.registry = RegistryState::load(&self.paths, &self.config);
         self.status = StatusState::load(&self.paths, &self.config);
         self.last_reload = "reloaded config, registry, models, and serve status".into();
     }
