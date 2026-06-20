@@ -17,4 +17,7 @@
 
 pub mod dummy;
 pub mod events;
+pub mod memory;
+pub mod model;
 pub mod output_filter;
+pub mod session;

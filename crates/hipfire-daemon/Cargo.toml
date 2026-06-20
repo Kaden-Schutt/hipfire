@@ -11,8 +11,8 @@ path = "src/main.rs"
 
 [features]
 default = ["arch-lfm2moe", "deltanet"]
-arch-lfm2moe = ["hipfire-arch-lfm2moe"]
-deltanet = ["rdna-compute/deltanet"]
+arch-lfm2moe = ["hipfire-arch-lfm2moe", "hipfire-serving-core/arch-lfm2moe"]
+deltanet = ["rdna-compute/deltanet", "hipfire-serving-core/deltanet"]
 
 [dependencies]
 hipfire-runtime    = { path = "../hipfire-runtime" }

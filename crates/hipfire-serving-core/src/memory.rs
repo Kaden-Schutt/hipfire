@@ -5,7 +5,7 @@
 //! VRAM/host memory accounting for a loaded model — artifact bytes plus
 //! per-arch runtime scratch/KV/state byte tallies feeding the worker memory
 //! view. Extracted verbatim from the former `main.rs` monolith (no behavior
-//! change); helpers are `pub(crate)`.
+//! change); helpers are `pub`.
 
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35;
@@ -17,10 +17,7 @@ use crate::model::LoadedModel;
 
 /// Artifact memory for a loaded HFQ: on-disk file size plus the summed
 /// tensor-data bytes (resident weight footprint).
-pub(crate) fn hfq_model_memory(
-    path: &str,
-    hfq: &hipfire_runtime::hfq::HfqFile,
-) -> ModelArtifactMemory {
+pub fn hfq_model_memory(path: &str, hfq: &hipfire_runtime::hfq::HfqFile) -> ModelArtifactMemory {
     ModelArtifactMemory {
         model_file_bytes: std::fs::metadata(path)
             .map(|metadata| metadata.len() as usize)
@@ -35,7 +32,7 @@ pub(crate) fn hfq_model_memory(
 
 /// Artifact memory for a non-HFQ / unparsed model: file size only, weight bytes
 /// reported as 0 (unknown) rather than guessed.
-pub(crate) fn unknown_model_memory(path: &str) -> ModelArtifactMemory {
+pub fn unknown_model_memory(path: &str) -> ModelArtifactMemory {
     ModelArtifactMemory {
         model_file_bytes: std::fs::metadata(path)
             .map(|metadata| metadata.len() as usize)
@@ -45,23 +42,23 @@ pub(crate) fn unknown_model_memory(path: &str) -> ModelArtifactMemory {
 }
 
 /// Device-buffer byte size of one GPU tensor.
-pub(crate) fn tensor_bytes(tensor: &rdna_compute::GpuTensor) -> usize {
+pub fn tensor_bytes(tensor: &rdna_compute::GpuTensor) -> usize {
     tensor.buf.size()
 }
 
 /// [`tensor_bytes`] for an optional tensor; 0 when `None`.
-pub(crate) fn opt_tensor_bytes(tensor: Option<&rdna_compute::GpuTensor>) -> usize {
+pub fn opt_tensor_bytes(tensor: Option<&rdna_compute::GpuTensor>) -> usize {
     tensor.map(tensor_bytes).unwrap_or(0)
 }
 
 /// Summed [`tensor_bytes`] over a tensor slice (e.g. per-layer KV vectors).
-pub(crate) fn tensor_vec_bytes(tensors: &[rdna_compute::GpuTensor]) -> usize {
+pub fn tensor_vec_bytes(tensors: &[rdna_compute::GpuTensor]) -> usize {
     tensors.iter().map(tensor_bytes).sum::<usize>()
 }
 
 /// Resident bytes of a KV cache: K/V tensors, their quant scales, and the
 /// optional cached RoPE givens.
-pub(crate) fn kv_cache_bytes(kv: &llama::KvCache) -> usize {
+pub fn kv_cache_bytes(kv: &llama::KvCache) -> usize {
     tensor_vec_bytes(&kv.k_gpu)
         + tensor_vec_bytes(&kv.v_gpu)
         + tensor_vec_bytes(&kv.k_scales)
@@ -72,7 +69,7 @@ pub(crate) fn kv_cache_bytes(kv: &llama::KvCache) -> usize {
 
 /// Resident bytes of the DeltaNet linear-attention state: S-matrices, their
 /// scales, and the short-conv states.
-pub(crate) fn deltanet_state_bytes(dn: &DeltaNetState) -> usize {
+pub fn deltanet_state_bytes(dn: &DeltaNetState) -> usize {
     tensor_vec_bytes(&dn.s_matrices)
         + tensor_vec_bytes(&dn.s_scales)
         + tensor_vec_bytes(&dn.conv_states)
@@ -81,7 +78,7 @@ pub(crate) fn deltanet_state_bytes(dn: &DeltaNetState) -> usize {
 /// Resident bytes of the Qwen3.5 forward scratch: attention/DeltaNet/FlashAttn
 /// working buffers, the FFN buffers, and the optional grouped-MoE scratch.
 /// (`PrefillBatchScratch` has private fields and is reported as unknown / 0.)
-pub(crate) fn qwen35_scratch_bytes(scratch: &qwen35::Qwen35Scratch) -> usize {
+pub fn qwen35_scratch_bytes(scratch: &qwen35::Qwen35Scratch) -> usize {
     let mut total = scratch.pos_buf.size();
     total += tensor_bytes(&scratch.x)
         + tensor_bytes(&scratch.tmp)
@@ -133,7 +130,7 @@ pub(crate) fn qwen35_scratch_bytes(scratch: &qwen35::Qwen35Scratch) -> usize {
 }
 
 /// Resident bytes of the Qwen2 decode state, including its in-struct K/V cache.
-pub(crate) fn qwen2_state_bytes(state: &qwen2::Qwen2State) -> usize {
+pub fn qwen2_state_bytes(state: &qwen2::Qwen2State) -> usize {
     state.pos_buf.size()
         + tensor_bytes(&state.x)
         + tensor_bytes(&state.tmp)
@@ -154,7 +151,7 @@ pub(crate) fn qwen2_state_bytes(state: &qwen2::Qwen2State) -> usize {
 
 /// Resident bytes of the LLaMA/Qwen3 forward scratch (attention + FFN working
 /// buffers). The KV cache is separate ([`kv_cache_bytes`]).
-pub(crate) fn llama_scratch_bytes(scratch: &llama::ForwardScratch) -> usize {
+pub fn llama_scratch_bytes(scratch: &llama::ForwardScratch) -> usize {
     scratch.pos_buf.size()
         + tensor_bytes(&scratch.x)
         + tensor_bytes(&scratch.tmp)
@@ -176,7 +173,7 @@ pub(crate) fn llama_scratch_bytes(scratch: &llama::ForwardScratch) -> usize {
 
 /// Resident bytes of the MiniMax-M2 decode state: its KV cache plus the
 /// attention/FlashAttn, FFN, and MoE routing working buffers.
-pub(crate) fn minimax_state_bytes(state: &hipfire_arch_minimax::MiniMaxState) -> usize {
+pub fn minimax_state_bytes(state: &hipfire_arch_minimax::MiniMaxState) -> usize {
     state.pos_buf.size()
         + kv_cache_bytes(&state.kv)
         + tensor_bytes(&state.tmp)
@@ -205,7 +202,7 @@ pub(crate) fn minimax_state_bytes(state: &hipfire_arch_minimax::MiniMaxState) ->
 /// sums whichever arch's KV cache, DeltaNet state, and forward scratch are
 /// populated — the per-arch Option fields make this a simple `map().unwrap_or(0)`
 /// tally.
-pub(crate) fn loaded_model_runtime_base_bytes(m: &LoadedModel) -> usize {
+pub fn loaded_model_runtime_base_bytes(m: &LoadedModel) -> usize {
     let mut total = 0usize;
     total += m.kv_cache.as_ref().map(kv_cache_bytes).unwrap_or(0);
     total += m.dn_state.as_ref().map(deltanet_state_bytes).unwrap_or(0);
@@ -242,7 +239,7 @@ pub(crate) fn loaded_model_runtime_base_bytes(m: &LoadedModel) -> usize {
 /// Assemble the client-facing [`ModelWorkerMemoryView`]: artifact bytes plus the
 /// runtime base ([`loaded_model_runtime_base_bytes`]) and the per-session
 /// resident bytes summed from the supplied state-page descriptors.
-pub(crate) fn loaded_model_memory_view(
+pub fn loaded_model_memory_view(
     m: &LoadedModel,
     state_page_descriptors: &[SequenceStatePageDescriptor],
 ) -> ModelWorkerMemoryView {

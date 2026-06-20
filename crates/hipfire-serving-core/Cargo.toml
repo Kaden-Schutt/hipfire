@@ -5,11 +5,25 @@ edition.workspace = true
 license.workspace = true
 description = "Shared model-serving orchestration (load + generate paths, session/memory/event plumbing) used by the daemon bin and the eval harness."
 
+[features]
+default = ["arch-lfm2moe", "deltanet"]
+arch-lfm2moe = ["hipfire-arch-lfm2moe"]
+deltanet = ["rdna-compute/deltanet"]
+
 [dependencies]
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-generate = { path = "../hipfire-generate" }
 hipfire-prompt = { path = "../hipfire-prompt" }
+hipfire-model = { path = "../hipfire-model" }
+hipfire-state = { path = "../hipfire-state" }
+hipfire-npu = { path = "../hipfire-npu" }
 hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
+hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
+hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
+hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
+hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
+hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
+hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe", optional = true }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 serde_json = "1"

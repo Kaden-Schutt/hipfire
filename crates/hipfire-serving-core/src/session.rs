@@ -14,7 +14,7 @@
 //!     resident-worker status JSON the daemon reports.
 //!
 //! Extracted verbatim from the former `main.rs` monolith (no behavior change);
-//! items called from `main.rs` are `pub(crate)`.
+//! items called from `main.rs` are `pub`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,14 +42,14 @@ use crate::model::LoadedModel;
 
 /// Synthetic session id used by the legacy single-session `generate` path (the
 /// pre-multi-session code that didn't supply its own session id).
-pub(crate) const QWEN35_LEGACY_SESSION_ID: &str = "__legacy_generate__";
+pub const QWEN35_LEGACY_SESSION_ID: &str = "__legacy_generate__";
 /// Worker id assigned when a load message carries no explicit `worker_id`.
-pub(crate) const DEFAULT_MODEL_WORKER_ID: &str = "__default__";
+pub const DEFAULT_MODEL_WORKER_ID: &str = "__default__";
 static QWEN35_STATE_ALLOCATION_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 /// Monotonic epoch stamped onto each allocated session state, so a stale handle
 /// referencing freed/reallocated state can be detected and rejected.
-pub(crate) fn next_qwen35_state_allocation_epoch() -> u64 {
+pub fn next_qwen35_state_allocation_epoch() -> u64 {
     QWEN35_STATE_ALLOCATION_EPOCH.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -58,21 +58,21 @@ pub(crate) fn next_qwen35_state_allocation_epoch() -> u64 {
 /// conversation tokens, prefix hash, prefilled-suffix length) needed to swap a
 /// session out of and back into the single resident model slot. `allocation_epoch`
 /// stamps the generation so stale handles are rejected.
-pub(crate) struct Qwen35RequestSessionState {
-    pub(crate) seq_pos: usize,
-    pub(crate) conversation_tokens: Vec<u32>,
-    pub(crate) prefix_hash: Option<SequenceStatePrefixHash>,
-    pub(crate) kv_cache: llama::KvCache,
-    pub(crate) dn_state: DeltaNetState,
-    pub(crate) logits: rdna_compute::GpuTensor,
-    pub(crate) prefilled_generated_suffix_len: usize,
-    pub(crate) allocation_epoch: u64,
+pub struct Qwen35RequestSessionState {
+    pub seq_pos: usize,
+    pub conversation_tokens: Vec<u32>,
+    pub prefix_hash: Option<SequenceStatePrefixHash>,
+    pub kv_cache: llama::KvCache,
+    pub dn_state: DeltaNetState,
+    pub logits: rdna_compute::GpuTensor,
+    pub prefilled_generated_suffix_len: usize,
+    pub allocation_epoch: u64,
 }
 
 impl Qwen35RequestSessionState {
     /// Deep-copy one GPU tensor (fresh device allocation + device-to-device
     /// copy) — used to snapshot session state without aliasing the live buffers.
-    pub(crate) fn clone_gpu_tensor(
+    pub fn clone_gpu_tensor(
         gpu: &mut rdna_compute::Gpu,
         tensor: &rdna_compute::GpuTensor,
         label: &str,
@@ -96,7 +96,7 @@ impl Qwen35RequestSessionState {
 
     /// [`clone_gpu_tensor`] over a slice of tensors (e.g. the per-layer KV
     /// vectors), returning a freshly-allocated `Vec`.
-    pub(crate) fn clone_gpu_tensor_vec(
+    pub fn clone_gpu_tensor_vec(
         gpu: &mut rdna_compute::Gpu,
         tensors: &[rdna_compute::GpuTensor],
         label: &str,
@@ -108,7 +108,7 @@ impl Qwen35RequestSessionState {
             .collect()
     }
 
-    pub(crate) fn clone_kv_cache(
+    pub fn clone_kv_cache(
         gpu: &mut rdna_compute::Gpu,
         kv: &llama::KvCache,
     ) -> Result<llama::KvCache, String> {
@@ -146,7 +146,7 @@ impl Qwen35RequestSessionState {
         })
     }
 
-    pub(crate) fn clone_dn_state(
+    pub fn clone_dn_state(
         gpu: &mut rdna_compute::Gpu,
         dn: &DeltaNetState,
     ) -> Result<DeltaNetState, String> {
@@ -162,7 +162,7 @@ impl Qwen35RequestSessionState {
     /// Deep-copy an existing saved session into a new independent one (KV +
     /// DeltaNet + logits cloned), for branching a conversation without
     /// disturbing the source.
-    pub(crate) fn fork_from(
+    pub fn fork_from(
         gpu: &mut rdna_compute::Gpu,
         source: &Qwen35RequestSessionState,
     ) -> Result<Self, String> {
@@ -181,7 +181,7 @@ impl Qwen35RequestSessionState {
     /// Move the active model's live KV/DeltaNet/logits state out into an owned
     /// session snapshot (the "park" half of a session swap), leaving the slot
     /// ready to receive another session.
-    pub(crate) fn take_from_loaded(
+    pub fn take_from_loaded(
         m: &mut LoadedModel,
         gpu: &mut rdna_compute::Gpu,
     ) -> Result<Self, String> {
@@ -215,7 +215,7 @@ impl Qwen35RequestSessionState {
     /// Install this saved session back into the active model slot (the
     /// "activate" half of a session swap), restoring its KV/DeltaNet/logits and
     /// the KV cursor so generation resumes mid-conversation.
-    pub(crate) fn restore_into_loaded(
+    pub fn restore_into_loaded(
         self,
         m: &mut LoadedModel,
         gpu: &mut rdna_compute::Gpu,
@@ -241,7 +241,7 @@ impl Qwen35RequestSessionState {
         Ok(())
     }
 
-    pub(crate) fn reset(&mut self, gpu: &mut rdna_compute::Gpu) {
+    pub fn reset(&mut self, gpu: &mut rdna_compute::Gpu) {
         self.seq_pos = 0;
         self.conversation_tokens.clear();
         self.prefix_hash = None;
@@ -259,12 +259,12 @@ impl Qwen35RequestSessionState {
     }
 }
 
-pub(crate) fn qwen35_session_resident(m: &LoadedModel, session_id: &str) -> bool {
+pub fn qwen35_session_resident(m: &LoadedModel, session_id: &str) -> bool {
     m.q35_active_session_id.as_deref() == Some(session_id)
         || m.q35_sessions.contains_key(session_id)
 }
 
-pub(crate) fn qwen35_request_session_count(m: &LoadedModel) -> usize {
+pub fn qwen35_request_session_count(m: &LoadedModel) -> usize {
     let saved = m
         .q35_sessions
         .keys()
@@ -278,7 +278,7 @@ pub(crate) fn qwen35_request_session_count(m: &LoadedModel) -> usize {
     saved + active
 }
 
-pub(crate) fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescriptor> {
+pub fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescriptor> {
     let mut descriptors = Vec::new();
     let placement = format!("hip:arch{}:device0", m.arch_id);
     let mut push_session = |session_id: &str, session: &Qwen35RequestSessionState, role: &str| {
@@ -478,18 +478,18 @@ pub(crate) fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStat
 }
 
 /// Stable worker id for a loaded model, derived from its arch/pp/kv-mode parts.
-pub(crate) fn loaded_model_worker_id(m: &LoadedModel) -> ModelWorkerId {
+pub fn loaded_model_worker_id(m: &LoadedModel) -> ModelWorkerId {
     ModelWorkerId::from_runtime_parts(m.arch_id, m.pp, m.q35_kv_mode.as_deref())
 }
 
-pub(crate) fn loaded_model_state_arena_backend(m: &LoadedModel) -> SequenceStateArenaBackend {
+pub fn loaded_model_state_arena_backend(m: &LoadedModel) -> SequenceStateArenaBackend {
     SequenceStateArenaBackend::for_worker_parts(m.arch_id, m.pp)
 }
 
 /// Assemble the full runtime view the daemon reports for the active worker:
 /// worker id, context limits, arena backend, resident-session descriptors, and
 /// the memory view.
-pub(crate) fn loaded_model_worker_runtime_view(m: &LoadedModel) -> ModelWorkerRuntimeView {
+pub fn loaded_model_worker_runtime_view(m: &LoadedModel) -> ModelWorkerRuntimeView {
     let state_arena_backend = loaded_model_state_arena_backend(m);
     let resident_sessions = sequence_state_arena_resident_session_count(state_arena_backend, m);
     let state_page_descriptors = sequence_state_arena_page_descriptors(state_arena_backend, m);
@@ -509,13 +509,13 @@ pub(crate) fn loaded_model_worker_runtime_view(m: &LoadedModel) -> ModelWorkerRu
 
 /// Extract the requested `worker_id` from a message, defaulting to
 /// [`DEFAULT_MODEL_WORKER_ID`] when absent.
-pub(crate) fn message_worker_id(msg: &serde_json::Value) -> String {
+pub fn message_worker_id(msg: &serde_json::Value) -> String {
     parse_model_worker_id(msg, DEFAULT_MODEL_WORKER_ID).value
 }
 
 /// Park the currently-active model worker: save its live session out to the
 /// resident-session map so a different worker/session can take the slot.
-pub(crate) fn park_active_model(
+pub fn park_active_model(
     model: &mut Option<LoadedModel>,
     gpu: &mut rdna_compute::Gpu,
     active_worker_id: &str,
@@ -532,7 +532,7 @@ pub(crate) fn park_active_model(
     Ok(())
 }
 
-pub(crate) fn validate_qwen35_fused_grouped_moe_prefill_model_capability(
+pub fn validate_qwen35_fused_grouped_moe_prefill_model_capability(
     m: &LoadedModel,
     session_count: usize,
 ) -> Result<(), String> {
@@ -579,7 +579,7 @@ pub(crate) fn validate_qwen35_fused_grouped_moe_prefill_model_capability(
 
 /// Make the requested worker the active one, parking whatever was active first
 /// — the single-resident-slot worker swap.
-pub(crate) fn activate_model_worker(
+pub fn activate_model_worker(
     worker_id: &str,
     active_worker_id: &mut String,
     model: &mut Option<LoadedModel>,
@@ -604,7 +604,7 @@ pub(crate) fn activate_model_worker(
 
 /// Build the `resident_worker_status` JSON the daemon emits: which workers are
 /// resident, their runtime views, and accelerator inventory.
-pub(crate) fn resident_worker_status_json(
+pub fn resident_worker_status_json(
     active_worker_id: &str,
     model: Option<&LoadedModel>,
     resident_models: &std::collections::HashMap<String, LoadedModel>,
@@ -650,7 +650,7 @@ pub(crate) fn resident_worker_status_json(
     })
 }
 
-pub(crate) fn daemon_accelerator_inventory(gpu: &mut rdna_compute::Gpu) -> AcceleratorInventory {
+pub fn daemon_accelerator_inventory(gpu: &mut rdna_compute::Gpu) -> AcceleratorInventory {
     let hip_runtime = gpu
         .hip
         .runtime_version()
@@ -702,7 +702,7 @@ pub(crate) fn daemon_accelerator_inventory(gpu: &mut rdna_compute::Gpu) -> Accel
     AcceleratorInventory::from_devices("daemon", devices)
 }
 
-pub(crate) fn resident_state_reservation_budget_bytes() -> usize {
+pub fn resident_state_reservation_budget_bytes() -> usize {
     std::env::var("HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB")
         .or_else(|_| std::env::var("HIPFIRE_SERVER_RESIDENT_STATE_BUDGET_MB"))
         .ok()
@@ -711,7 +711,7 @@ pub(crate) fn resident_state_reservation_budget_bytes() -> usize {
         .unwrap_or(16 * 1024 * 1024 * 1024)
 }
 
-pub(crate) fn describe_loaded_model_sequence_state(
+pub fn describe_loaded_model_sequence_state(
     worker_id: &str,
     m: &LoadedModel,
     handle: &ParsedSequenceStateHandle,
@@ -738,7 +738,7 @@ pub(crate) fn describe_loaded_model_sequence_state(
     })
 }
 
-pub(crate) fn describe_loaded_sequence_state(
+pub fn describe_loaded_sequence_state(
     active_worker_id: &str,
     model: Option<&LoadedModel>,
     resident_models: &HashMap<String, LoadedModel>,
@@ -757,7 +757,7 @@ pub(crate) fn describe_loaded_sequence_state(
     None
 }
 
-pub(crate) fn release_loaded_model_sequence_state_handles(
+pub fn release_loaded_model_sequence_state_handles(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     handles: &[ParsedSequenceStateHandle],
@@ -794,7 +794,7 @@ pub(crate) fn release_loaded_model_sequence_state_handles(
     Ok((released, released_bytes))
 }
 
-pub(crate) fn release_loaded_sequence_state_handles(
+pub fn release_loaded_sequence_state_handles(
     model: &mut Option<LoadedModel>,
     resident_models: &mut HashMap<String, LoadedModel>,
     gpu: &mut rdna_compute::Gpu,
@@ -817,7 +817,7 @@ pub(crate) fn release_loaded_sequence_state_handles(
 
 /// Drop the named saved sessions (freeing their GPU state); returns how many
 /// were actually resident.
-pub(crate) fn qwen35_release_sessions(
+pub fn qwen35_release_sessions(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     session_ids: &[String],
@@ -854,7 +854,7 @@ pub(crate) fn qwen35_release_sessions(
 
 /// Absolute logical position (token count) of the active qwen35 session — the
 /// resume point for the next prefill/decode.
-pub(crate) fn qwen35_active_logical_position(m: &LoadedModel) -> Result<usize, String> {
+pub fn qwen35_active_logical_position(m: &LoadedModel) -> Result<usize, String> {
     let compact_offset = m
         .kv_cache
         .as_ref()
@@ -866,7 +866,7 @@ pub(crate) fn qwen35_active_logical_position(m: &LoadedModel) -> Result<usize, S
 /// Allocate (or reuse) the resident session-state slot for a session id,
 /// parking any other active session first; the entry point that makes a session
 /// the live one before prefill.
-pub(crate) fn qwen35_allocate_session_state(
+pub fn qwen35_allocate_session_state(
     m: &LoadedModel,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<Qwen35RequestSessionState, String> {
@@ -990,7 +990,7 @@ pub(crate) fn qwen35_allocate_session_state(
 
 /// Snapshot the active session's live state back into the resident-session map
 /// without giving up the slot (checkpoint without swap).
-pub(crate) fn qwen35_save_active_session(
+pub fn qwen35_save_active_session(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<(), String> {
@@ -1005,7 +1005,7 @@ pub(crate) fn qwen35_save_active_session(
 
 /// Restore a saved session into the active slot (parking the current one),
 /// resuming its multi-turn KV/DeltaNet state.
-pub(crate) fn qwen35_activate_session(
+pub fn qwen35_activate_session(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     session_id: &str,
@@ -1026,7 +1026,7 @@ pub(crate) fn qwen35_activate_session(
 
 /// Fork a saved session into a new session id (deep-copying its state), so a
 /// conversation can branch without disturbing the original.
-pub(crate) fn qwen35_fork_session_state(
+pub fn qwen35_fork_session_state(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     request: SequenceStateForkRequest<'_>,
@@ -1064,7 +1064,7 @@ pub(crate) fn qwen35_fork_session_state(
 /// Checkpoint a session at a validated logical position / prefix hash, after
 /// verifying the request matches the resident state (guards against stale or
 /// mismatched checkpoint requests).
-pub(crate) fn qwen35_checkpoint_session_state(
+pub fn qwen35_checkpoint_session_state(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     request: SequenceStateCheckpointRequest<'_>,
@@ -1107,7 +1107,7 @@ pub(crate) fn qwen35_checkpoint_session_state(
 
 /// Check a request's claimed prefix hash against the session's recorded hash —
 /// the prefix-cache safety check that prevents resuming on a divergent prompt.
-pub(crate) fn qwen35_validate_prefix_hash(
+pub fn qwen35_validate_prefix_hash(
     m: &LoadedModel,
     source_session_id: &str,
     requested: Option<&SequenceStatePrefixHash>,
@@ -1125,7 +1125,7 @@ pub(crate) fn qwen35_validate_prefix_hash(
 
 /// Reset the active session's KV cursor to cold (rewind to position 0) without
 /// freeing the allocation — a cheap O(1) restart for a fresh turn.
-pub(crate) fn qwen35_reset_active_session(
+pub fn qwen35_reset_active_session(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<(), String> {
@@ -1144,7 +1144,7 @@ pub(crate) fn qwen35_reset_active_session(
 
 /// Error unless the given arena backend supports `op` on this build — the guard
 /// every `sequence_state_arena_*` wrapper calls before dispatching.
-pub(crate) fn ensure_sequence_state_arena_backend_supported(
+pub fn ensure_sequence_state_arena_backend_supported(
     arena_backend: SequenceStateArenaBackend,
     m: &LoadedModel,
     op: &str,
@@ -1152,7 +1152,7 @@ pub(crate) fn ensure_sequence_state_arena_backend_supported(
     arena_backend.require_supported(m.arch_id, m.pp, op)
 }
 
-pub(crate) fn sequence_state_arena_resident_session_count(
+pub fn sequence_state_arena_resident_session_count(
     arena_backend: SequenceStateArenaBackend,
     m: &LoadedModel,
 ) -> usize {
@@ -1162,7 +1162,7 @@ pub(crate) fn sequence_state_arena_resident_session_count(
     }
 }
 
-pub(crate) fn sequence_state_arena_page_descriptors(
+pub fn sequence_state_arena_page_descriptors(
     arena_backend: SequenceStateArenaBackend,
     m: &LoadedModel,
 ) -> Vec<SequenceStatePageDescriptor> {
@@ -1172,7 +1172,7 @@ pub(crate) fn sequence_state_arena_page_descriptors(
     }
 }
 
-pub(crate) fn sequence_state_arena_is_session_resident(
+pub fn sequence_state_arena_is_session_resident(
     arena_backend: SequenceStateArenaBackend,
     m: &LoadedModel,
     session_id: &str,
@@ -1183,7 +1183,7 @@ pub(crate) fn sequence_state_arena_is_session_resident(
     }
 }
 
-pub(crate) fn sequence_state_arena_release_sessions(
+pub fn sequence_state_arena_release_sessions(
     arena_backend: SequenceStateArenaBackend,
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -1196,7 +1196,7 @@ pub(crate) fn sequence_state_arena_release_sessions(
     }
 }
 
-pub(crate) fn sequence_state_arena_activate_session(
+pub fn sequence_state_arena_activate_session(
     arena_backend: SequenceStateArenaBackend,
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -1209,7 +1209,7 @@ pub(crate) fn sequence_state_arena_activate_session(
     }
 }
 
-pub(crate) fn sequence_state_arena_reset_active_session(
+pub fn sequence_state_arena_reset_active_session(
     arena_backend: SequenceStateArenaBackend,
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -1221,7 +1221,7 @@ pub(crate) fn sequence_state_arena_reset_active_session(
     }
 }
 
-pub(crate) fn sequence_state_arena_active_logical_position(
+pub fn sequence_state_arena_active_logical_position(
     arena_backend: SequenceStateArenaBackend,
     m: &LoadedModel,
 ) -> Result<usize, String> {
@@ -1232,7 +1232,7 @@ pub(crate) fn sequence_state_arena_active_logical_position(
     }
 }
 
-pub(crate) fn sequence_state_arena_fork_session_state(
+pub fn sequence_state_arena_fork_session_state(
     arena_backend: SequenceStateArenaBackend,
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -1245,7 +1245,7 @@ pub(crate) fn sequence_state_arena_fork_session_state(
     }
 }
 
-pub(crate) fn sequence_state_arena_checkpoint_session_state(
+pub fn sequence_state_arena_checkpoint_session_state(
     arena_backend: SequenceStateArenaBackend,
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -1262,7 +1262,7 @@ pub(crate) fn sequence_state_arena_checkpoint_session_state(
 
 /// Restore a session into the active slot, emitting a protocol error event
 /// (rather than panicking) if the restore fails.
-pub(crate) fn qwen35_restore_or_error(
+pub fn qwen35_restore_or_error(
     stdout: &mut std::io::Stdout,
     id: &str,
     m: &mut LoadedModel,

@@ -8,7 +8,7 @@
 //! arch-tagged bundle of the typed config/weights/state for whichever family is
 //! resident (the Option-soup the E2 `ServingBackend` seam will eventually
 //! collapse). Extracted verbatim from the former `main.rs` monolith (no behavior
-//! change); fields are `pub(crate)` so the load/generate/memory/session modules
+//! change); fields are `pub` so the load/generate/memory/session modules
 //! that still live in `main.rs` (and sibling modules) can construct and read it.
 
 use hip_bridge::HipResult;
@@ -35,7 +35,7 @@ use hipfire_state::ModelArtifactMemory;
 use crate::session::Qwen35RequestSessionState;
 
 /// Eviction policy wrapper — dispatches to plain TriAttention or CASK m-folding.
-pub(crate) enum Eviction {
+pub enum Eviction {
     Plain(EvictionCtx),
     Cask(CaskCtx),
 }
@@ -43,7 +43,7 @@ pub(crate) enum Eviction {
 impl Eviction {
     /// Run one eviction pass when the physical KV occupancy warrants it,
     /// dispatching to the active policy; `Ok(None)` when nothing was evicted.
-    pub(crate) fn maybe_evict(
+    pub fn maybe_evict(
         &self,
         gpu: &mut rdna_compute::Gpu,
         kv: &mut llama::KvCache,
@@ -55,21 +55,21 @@ impl Eviction {
         }
     }
     /// Protected-core budget (slots kept before eviction begins).
-    pub(crate) fn budget(&self) -> usize {
+    pub fn budget(&self) -> usize {
         match self {
             Eviction::Plain(c) => c.budget,
             Eviction::Cask(c) => c.base.budget,
         }
     }
     /// Recency window (`beta`) preserved alongside the budget.
-    pub(crate) fn beta(&self) -> usize {
+    pub fn beta(&self) -> usize {
         match self {
             Eviction::Plain(c) => c.beta,
             Eviction::Cask(c) => c.base.beta,
         }
     }
     /// Release the policy's GPU-side scratch on unload.
-    pub(crate) fn free_gpu(self, gpu: &mut rdna_compute::Gpu) {
+    pub fn free_gpu(self, gpu: &mut rdna_compute::Gpu) {
         match self {
             Eviction::Plain(c) => c.free_gpu(gpu),
             Eviction::Cask(c) => c.free_gpu(gpu),
@@ -81,54 +81,54 @@ impl Eviction {
 /// a matching draft (.hfq arch=20) via `params.draft`. Used by the daemon's
 /// `generate` fast path when temperature == 0 — falls back to AR sampling
 /// otherwise (DFlash is greedy-only in this integration).
-pub(crate) struct DflashState {
-    pub(crate) draft_config: DflashConfig,
-    pub(crate) draft_weights: DflashWeights,
-    pub(crate) draft_scratch: DflashScratch,
-    pub(crate) hidden_rb: HiddenStateRingBuffer,
-    pub(crate) verify_scratch: VerifyScratch,
-    pub(crate) target_snap: DeltaNetSnapshot,
-    pub(crate) gdn_tape: GdnTape,
+pub struct DflashState {
+    pub draft_config: DflashConfig,
+    pub draft_weights: DflashWeights,
+    pub draft_scratch: DflashScratch,
+    pub hidden_rb: HiddenStateRingBuffer,
+    pub verify_scratch: VerifyScratch,
+    pub target_snap: DeltaNetSnapshot,
+    pub gdn_tape: GdnTape,
     /// CPU-side ring of target hidden states (num_extract × hidden per pos)
     /// — seeded from the prompt, extended by each verify's accepted rows.
     /// Drives the draft's diffusion forward.
-    pub(crate) target_hidden_host: Vec<f32>,
+    pub target_hidden_host: Vec<f32>,
     /// Max ctx the draft was initialized for (ring buffer cap).
-    pub(crate) ctx_capacity: usize,
+    pub ctx_capacity: usize,
     /// Block size the draft was trained at.
-    pub(crate) block_size: usize,
+    pub block_size: usize,
     /// Optional DDTree state. Populated only when `HIPFIRE_DDTREE_BUDGET` is
     /// set to a positive integer at daemon startup. None = DDTree disabled,
     /// the decode loop falls through to `spec_step_dflash` (chain mode).
     /// See `spec_step_ddtree_batched` for the tree-verify path.
-    pub(crate) ddtree: Option<DdtreeState>,
+    pub ddtree: Option<DdtreeState>,
 }
 
 /// Side state for DDTree-mode speculative decoding. Allocated alongside
 /// the rest of `DflashState` at model-load time when DDTree is enabled,
 /// reused across all decode cycles.
-pub(crate) struct DdtreeState {
+pub struct DdtreeState {
     /// Second DeltaNetSnapshot used by `spec_step_ddtree_batched`: snap0 =
     /// pre-seed (lives in `DflashState::target_snap`), snap1 = post-seed.
     /// The batched verify forward uses both to bracket the tree-verify pass.
-    pub(crate) post_seed_snap: DeltaNetSnapshot,
+    pub post_seed_snap: DeltaNetSnapshot,
     /// Persistent tree-verify scratch (attn_bias, parent_indices, kv-gather
     /// staging, pre-RoPE K capture). Sized for `budget` non-root nodes.
-    pub(crate) scratch: DdtreeScratch,
+    pub scratch: DdtreeScratch,
     /// Maximum non-root tree nodes per cycle. Read once at daemon startup
     /// from `HIPFIRE_DDTREE_BUDGET` (positive integer required to enable).
-    pub(crate) budget: usize,
+    pub budget: usize,
     /// Per-position top-K width fed into the DDTree builder. Read from
     /// `HIPFIRE_DDTREE_TOPK` (default 4 — matches paper Algorithm 1's
     /// typical setting on dense Qwen targets).
-    pub(crate) topk: usize,
+    pub topk: usize,
     /// Path C Phase 2 auxiliary snapshots. Used only when
     /// `HIPFIRE_DDTREE_PATH_C=phase2`. Allocated unconditionally when DDTree
     /// is enabled — DN state buffers are small (a few KB each on 27B) and
     /// avoiding the gate keeps allocation deterministic at session start.
     /// See `speculative::Phase2Snapshots` for what each snapshot holds.
-    pub(crate) path_c_parent_pre_snap: DeltaNetSnapshot,
-    pub(crate) path_c_main_end_snap: DeltaNetSnapshot,
+    pub path_c_parent_pre_snap: DeltaNetSnapshot,
+    pub path_c_main_end_snap: DeltaNetSnapshot,
 }
 
 thread_local! {
@@ -137,14 +137,14 @@ thread_local! {
     /// has no chat_template). Set at the top of the generate handler (the daemon
     /// processes generate messages synchronously on one thread), read by
     /// `effective_raw`. Reset every generate request, so no cross-request leak.
-    pub(crate) static RAW_OVERRIDE: std::cell::Cell<Option<bool>> =
+    pub static RAW_OVERRIDE: std::cell::Cell<Option<bool>> =
         const { std::cell::Cell::new(None) };
 }
 
 /// Effective raw-prompt flag for prompt framing. An explicit request `"raw"`
 /// wins; otherwise default to raw for base/completion models (no chat_template)
 /// and framed for chat models (has a chat_template).
-pub(crate) fn effective_raw(m: &LoadedModel) -> bool {
+pub fn effective_raw(m: &LoadedModel) -> bool {
     RAW_OVERRIDE
         .with(|c| c.get())
         .unwrap_or(m.chat_template.is_none())
@@ -156,84 +156,84 @@ pub(crate) fn effective_raw(m: &LoadedModel) -> bool {
 /// bookkeeping, and the optional DFlash/vision/chat-template side state. The
 /// request loop drives whichever arch is populated. The E2 `ServingBackend` seam
 /// will eventually collapse this Option-soup into one boxed backend.
-pub(crate) struct LoadedModel {
-    pub(crate) arch_id: u32,
+pub struct LoadedModel {
+    pub arch_id: u32,
     /// Pipeline-parallel degree. 1 = single-GPU (all existing fields below in
     /// use, q35_scratch populated). >1 = multi-GPU (pp_gpus + pp_scratch_set
     /// populated; q35_scratch stays None; kv_cache + dn_state still hold the
     /// per-layer-routed tensors since the struct types are the same as
     /// single-GPU). Refusal contracts in load_model_pp keep DFlash, CASK,
     /// PFlash, VL and arch_id < 5 out of this branch.
-    pub(crate) pp: usize,
+    pub pp: usize,
     /// Owned multi-GPU orchestrator when `pp > 1`. The single-GPU path
     /// continues to use the daemon's main `Gpu` directly.
-    pub(crate) pp_gpus: Option<Gpus>,
+    pub pp_gpus: Option<Gpus>,
     /// Per-device scratch when `pp > 1`. Replaces `q35_scratch`.
-    pub(crate) pp_scratch_set: Option<Qwen35ScratchSet>,
+    pub pp_scratch_set: Option<Qwen35ScratchSet>,
     /// LA-layer → device map returned by `DeltaNetState::new_with_quant_multi`,
     /// kept so `unload_model` and the reset handler can route per-layer
     /// memsets to the correct device.
-    pub(crate) pp_dn_la_to_device: Option<Vec<u8>>,
+    pub pp_dn_la_to_device: Option<Vec<u8>>,
     // Qwen3.5 state
-    pub(crate) q35_config: Option<qwen35::Qwen35Config>,
-    pub(crate) q35_weights: Option<qwen35::Qwen35Weights>,
-    pub(crate) q35_scratch: Option<qwen35::Qwen35Scratch>,
-    pub(crate) kv_cache: Option<llama::KvCache>,
-    pub(crate) dn_state: Option<DeltaNetState>,
-    pub(crate) q35_kv_mode: Option<String>,
-    pub(crate) q35_state_quant: Option<hipfire_arch_qwen35::qwen35::StateQuant>,
-    pub(crate) q35_sessions: std::collections::HashMap<String, Qwen35RequestSessionState>,
-    pub(crate) q35_active_session_id: Option<String>,
-    pub(crate) q35_active_state_allocation_epoch: u64,
-    pub(crate) q35_active_prefilled_generated_suffix_len: usize,
+    pub q35_config: Option<qwen35::Qwen35Config>,
+    pub q35_weights: Option<qwen35::Qwen35Weights>,
+    pub q35_scratch: Option<qwen35::Qwen35Scratch>,
+    pub kv_cache: Option<llama::KvCache>,
+    pub dn_state: Option<DeltaNetState>,
+    pub q35_kv_mode: Option<String>,
+    pub q35_state_quant: Option<hipfire_arch_qwen35::qwen35::StateQuant>,
+    pub q35_sessions: std::collections::HashMap<String, Qwen35RequestSessionState>,
+    pub q35_active_session_id: Option<String>,
+    pub q35_active_state_allocation_epoch: u64,
+    pub q35_active_prefilled_generated_suffix_len: usize,
     // Qwen3 state
-    pub(crate) llama_config: Option<llama::LlamaConfig>,
-    pub(crate) llama_weights: Option<llama::LlamaWeights>,
-    pub(crate) llama_scratch: Option<llama::ForwardScratch>,
-    pub(crate) llama_kv: Option<llama::KvCache>,
+    pub llama_config: Option<llama::LlamaConfig>,
+    pub llama_weights: Option<llama::LlamaWeights>,
+    pub llama_scratch: Option<llama::ForwardScratch>,
+    pub llama_kv: Option<llama::KvCache>,
     // Qwen2 state (arch_id=7 — hipfire-arch-qwen2 standalone). The
     // KV cache lives inside Qwen2State, so there's no separate
     // qwen2_kv field. None on every other arch path.
-    pub(crate) qwen2_config: Option<qwen2::Qwen2Config>,
-    pub(crate) qwen2_weights: Option<qwen2::Qwen2Weights>,
-    pub(crate) qwen2_state: Option<qwen2::Qwen2State>,
+    pub qwen2_config: Option<qwen2::Qwen2Config>,
+    pub qwen2_weights: Option<qwen2::Qwen2Weights>,
+    pub qwen2_state: Option<qwen2::Qwen2State>,
     // DeepSeek V4 Flash state (arch_id=9 — hipfire-arch-deepseek4).
     // Hyper-Connections + compressed-KV indexer + tail-only RoPE + raw
     // SWA cache. KV cache lives inside DeepseekV4State; no separate
     // deepseek4_kv field. None on every other arch path.
-    pub(crate) deepseek4_config: Option<deepseek4::DeepseekV4Config>,
-    pub(crate) deepseek4_weights: Option<deepseek4::DeepseekV4Weights>,
-    pub(crate) deepseek4_state: Option<deepseek4::DeepseekV4State>,
+    pub deepseek4_config: Option<deepseek4::DeepseekV4Config>,
+    pub deepseek4_weights: Option<deepseek4::DeepseekV4Weights>,
+    pub deepseek4_state: Option<deepseek4::DeepseekV4State>,
     /// Pre-allocated PrefillBatchScratch sized to `HIPFIRE_DEEPSEEK4_PP_BATCH`
     /// (default 64). Used by both batched prefill and the MTP spec-decode
     /// verify pass. Lazy-allocated on first arch_id=9 load — None on every
     /// other arch path.
-    pub(crate) deepseek4_pbs: Option<deepseek4::forward::PrefillBatchScratch>,
+    pub deepseek4_pbs: Option<deepseek4::forward::PrefillBatchScratch>,
     /// Cached `<｜end▁of▁sentence｜>` token id resolved at load time.
     /// Falls back to 1 (DeepSeek family default) if the tokenizer lacks
     /// the special-token entry.
-    pub(crate) deepseek4_eos_tok: u32,
+    pub deepseek4_eos_tok: u32,
     /// MTP config — parsed from load-message params, read at generate time.
     /// Arch-agnostic: currently only DeepSeek V4 (arch_id=9) evaluates these,
     /// but the namespace is intentionally not deepseek4-specific.
-    pub(crate) mtp_mode: String,
+    pub mtp_mode: String,
     /// Draft tokens per spec-decode window (1-10, default 3).
-    pub(crate) mtp_k: usize,
+    pub mtp_k: usize,
     /// Whether MTP head weights were found at load time. Set by the sibling-
     /// file scan (e.g. `<stem>-mtp.*`) or bundled MTP detection. Used by
     /// `mtp_mode = "auto"` to decide whether to enable spec-decode.
-    pub(crate) mtp_weights_present: bool,
+    pub mtp_weights_present: bool,
     // MiniMax-M2 state (arch_id=10 — hipfire-arch-minimax). Mixtral-style
     // MoE: GQA + per-layer QK-norm + partial RoPE + sigmoid-bias top-k
     // routing, no shared expert. KV cache lives inside MiniMaxState; no
     // separate field. NO PrefillBatchScratch — prefill is the per-token
     // `decode_step` loop. None on every other arch path.
-    pub(crate) minimax_config: Option<minimax::MiniMaxConfig>,
-    pub(crate) minimax_weights: Option<minimax::MiniMaxWeights>,
-    pub(crate) minimax_state: Option<minimax::MiniMaxState>,
+    pub minimax_config: Option<minimax::MiniMaxConfig>,
+    pub minimax_weights: Option<minimax::MiniMaxWeights>,
+    pub minimax_state: Option<minimax::MiniMaxState>,
     /// Cached EOS token id resolved at load time. Falls back to 1 if the
     /// tokenizer lacks the special-token entry.
-    pub(crate) minimax_eos_tok: u32,
+    pub minimax_eos_tok: u32,
     // LFM2.5-8B-A1B state (arch_id=11 — hipfire-arch-lfm2moe). Hybrid:
     // double-gated LIV short-conv mixers interleaved with GQA+QK-norm
     // attention, feeding a DeepSeek-style sigmoid-bias top-4 MoE FFN (or
@@ -242,48 +242,48 @@ pub(crate) struct LoadedModel {
     // PrefillBatchScratch — prefill is the per-token `decode_step` loop.
     // None on every other arch path. Structurally mirrors MiniMax (10).
     #[cfg(feature = "arch-lfm2moe")]
-    pub(crate) lfm2moe_config: Option<lfm2moe::config::Lfm2MoeConfig>,
+    pub lfm2moe_config: Option<lfm2moe::config::Lfm2MoeConfig>,
     #[cfg(feature = "arch-lfm2moe")]
-    pub(crate) lfm2moe_weights: Option<lfm2moe::lfm2moe::Lfm2MoeWeights>,
+    pub lfm2moe_weights: Option<lfm2moe::lfm2moe::Lfm2MoeWeights>,
     #[cfg(feature = "arch-lfm2moe")]
-    pub(crate) lfm2moe_state: Option<lfm2moe::lfm2moe::Lfm2MoeState>,
+    pub lfm2moe_state: Option<lfm2moe::lfm2moe::Lfm2MoeState>,
     /// Cached EOS token id resolved at load time. Falls back to 1 if the
     /// tokenizer lacks the special-token entry.
     #[cfg(feature = "arch-lfm2moe")]
-    pub(crate) lfm2moe_eos_tok: u32,
+    pub lfm2moe_eos_tok: u32,
     // dots.ocr state (arch_id=8 — Qwen2-VL family). The text decoder is
     // Qwen2: `dots_ocr_config.text` / `dots_ocr_weights.text` feed
     // `qwen2::forward_step*`, and the per-step decode state reuses the
     // `qwen2_state` field above. `dots_ocr_weights.vision` holds the
     // resident vision-tower weights for `dots_ocr::vision_forward`.
-    pub(crate) dots_ocr_config: Option<dots_ocr::DotsOcrConfig>,
-    pub(crate) dots_ocr_weights: Option<dots_ocr::DotsOcrWeights>,
+    pub dots_ocr_config: Option<dots_ocr::DotsOcrConfig>,
+    pub dots_ocr_weights: Option<dots_ocr::DotsOcrWeights>,
     // Vision state (VL models only)
-    pub(crate) vision_config: Option<qwen35_vl::VisionConfig>,
-    pub(crate) vision_weights: Option<qwen35_vl::VisionWeights>,
+    pub vision_config: Option<qwen35_vl::VisionConfig>,
+    pub vision_weights: Option<qwen35_vl::VisionWeights>,
     // Shared
-    pub(crate) tokenizer: Option<hipfire_model::tokenizer::Tokenizer>,
+    pub tokenizer: Option<hipfire_model::tokenizer::Tokenizer>,
     // Multi-turn conversation state
     //
     // `seq_pos` is the *physical* write position in the KV cache (the value
     // passed to `forward_scratch(..., pos, ...)`). With no eviction, physical
     // == absolute, so seq_pos simply grows. Under eviction, seq_pos is bounded
     // to `physical_cap`; absolute position = seq_pos + kv.compact_offset.
-    pub(crate) seq_pos: usize,
+    pub seq_pos: usize,
     /// Advertised context window — client-facing capacity, the upper bound on
     /// absolute conversation length. Without eviction this equals
     /// `physical_cap` (the buffer size); under eviction it can be much larger.
-    pub(crate) max_seq: usize,
+    pub max_seq: usize,
     /// Physical KV buffer capacity, in slots. Allocators size per-layer K/V
     /// for this many tokens. Under eviction, budget+beta <= physical_cap;
     /// without eviction, physical_cap may be lower than max_seq and grows by
     /// loading a larger worker.
-    pub(crate) physical_cap: usize,
+    pub physical_cap: usize,
     /// When Some(_), the daemon calls `maybe_evict` after every prefill-chunk
     /// and every decode-forward so the physical cache stays bounded by
     /// `physical_cap` even when `max_seq` advertises a much larger window.
-    pub(crate) eviction: Option<Eviction>,
-    pub(crate) conversation_tokens: Vec<u32>, // full token history for repeat penalty
+    pub eviction: Option<Eviction>,
+    pub conversation_tokens: Vec<u32>, // full token history for repeat penalty
 
     /// Per-turn token cache for V4F prefix-cache stability.
     ///
@@ -309,7 +309,7 @@ pub(crate) struct LoadedModel {
     /// back in a `messages` history will linger but never affect
     /// correctness (worst case: VRAM-free Vec<u32> memory growth on
     /// the host).
-    pub(crate) asst_turn_cache: std::collections::HashMap<u64, Vec<u32>>,
+    pub asst_turn_cache: std::collections::HashMap<u64, Vec<u32>>,
 
     /// Lazily-built decoded-vocab cache for grammar-guided sampling.
     /// `tokenizer.decode(&[id])` for every id ∈ `0..vocab_size`. Built
@@ -319,14 +319,14 @@ pub(crate) struct LoadedModel {
     /// allocation per id), adding tens of milliseconds of pure overhead
     /// to every tool-using turn. `None` until first build; cleared by
     /// `unload_model` via `LoadedModel` drop.
-    pub(crate) decoded_vocab: Option<std::sync::Arc<Vec<String>>>,
+    pub decoded_vocab: Option<std::sync::Arc<Vec<String>>>,
     // Target model file path — cached so the DFlash fast path can reopen the
     // HfqFile mmap to construct a transient ModelSlot without reloading
     // weights. `HfqFile::open` is a cheap mmap operation.
-    pub(crate) model_path: String,
-    pub(crate) memory: ModelArtifactMemory,
+    pub model_path: String,
+    pub memory: ModelArtifactMemory,
     // DFlash speculative decoding state (populated when load supplied a draft).
-    pub(crate) dflash: Option<DflashState>,
+    pub dflash: Option<DflashState>,
     // Upstream HF Jinja chat_template, extracted from the HFQ
     // `tokenizer_config.chat_template` at load time. `None` when the source
     // model didn't ship one (rare for instruct models). Only consumed when
@@ -335,6 +335,6 @@ pub(crate) struct LoadedModel {
     //
     // Stage 2 partial: AR generate() path only. DFlash, multi-GPU PP>1, and
     // VL paths still hit the Plain scaffold.
-    pub(crate) chat_template: Option<String>,
-    pub(crate) chat_template_profile: Option<prompt_frame::ChatTemplateProfile>,
+    pub chat_template: Option<String>,
+    pub chat_template_profile: Option<prompt_frame::ChatTemplateProfile>,
 }

@@ -59,22 +59,19 @@ use std::io::{BufRead, Write};
 use std::path::Path;
 use std::time::Instant;
 
-// `events`, `output_filter`, `dummy` now live in `hipfire-serving-core`
-// (workstream A0). Re-import them at the crate root so existing `crate::events`
-// / `crate::output_filter` / `crate::dummy` paths in the daemon's other modules
-// keep resolving unchanged.
-use events::{emit_error_with_id, write_error, MAX_BASE64_ENCODED_LEN};
-use hipfire_serving_core::{dummy, events, output_filter};
-use output_filter::{
-    chat_output_filter_from_profile, normalize_daemon_prompt, normalize_request_stop_sequences,
-};
-mod model;
-use model::{LoadedModel, RAW_OVERRIDE};
-mod memory;
+// These modules now live in `hipfire-serving-core` (workstream A0). Re-import
+// them at the crate root so existing `crate::events` / `crate::model` /
+// `crate::session` / … paths in the daemon's other modules keep resolving
+// unchanged.
 use dummy::{
     emit_dummy_generate_batch_prefill_ready, run_generate_batch_prefill_dummy, DummyModelState,
 };
-mod session;
+use events::{emit_error_with_id, write_error, MAX_BASE64_ENCODED_LEN};
+use hipfire_serving_core::{dummy, events, memory, model, output_filter, session};
+use model::{LoadedModel, RAW_OVERRIDE};
+use output_filter::{
+    chat_output_filter_from_profile, normalize_daemon_prompt, normalize_request_stop_sequences,
+};
 use session::*;
 mod load;
 use load::*;
@@ -4661,7 +4658,10 @@ fn main() {
                     wd: getf(&t, "wd", 0.0),
                     tau: getf(&t, "tau", 0.1),
                     eval_every: getu(&t, "eval_every", 15),
-                    report_train: t.get("report_train").and_then(|v| v.as_bool()).unwrap_or(false),
+                    report_train: t
+                        .get("report_train")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
                 };
                 let resp = serde_json::json!({
                     "type": "train_drafter",
