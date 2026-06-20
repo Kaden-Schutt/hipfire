@@ -143,6 +143,9 @@ The currently promoted standalone GEMM jig lives in the repo:
   `meta.txt`, `run.log`, `exit_code.txt`, dmesg deltas, devcoredump presence,
   saved ISA/readobj files, and short SHA-256 hashes for the captured HIP source,
   AMDGPU object, and AMDGPU ISA dump.
+- `scripts/lds_gemm_summary_compare.sh`: read-only TSV comparator for two
+  artifact summaries. It classifies differences as source drift, codegen drift,
+  same-codegen runtime difference, same-result environment difference, or same.
 - `scripts/narrow-gemm-lds-shape.sh`: runs the curated variant matrix and
   writes a TSV report plus summary.
 - `tests/gfx1103-lds-tail-snop-repro.sh`: focused cross-system pass/fail
@@ -2400,6 +2403,12 @@ columns first when comparing 780M machines. Matching source with different
 object/ISA hashes means compiler/toolchain or environment drift is part of the
 comparison; matching object/ISA hashes makes runtime/driver behavior the main
 remaining difference.
+
+Compare two summary TSVs directly with:
+
+```bash
+scripts/lds_gemm_summary_compare.sh local-summary.tsv other-780m-summary.tsv
+```
 
 - Safe build/codegen metadata capture without launching the repro:
 
