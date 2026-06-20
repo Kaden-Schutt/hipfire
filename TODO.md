@@ -508,14 +508,17 @@ fire-and-forget loop. Two ergonomics gaps surfaced while running it:
   and a `--quiet`/`--verbose` knob. Consider a tiny shared progress helper so other
   training examples (`overfit_supra50m`, `recovery_ft_supra50m`) can reuse it.
 
-- **TUI dashboard (eventual).** Build a proper `ratatui` dashboard for the trainer
-  (deps already added: `ratatui` 0.29 + `crossterm` 0.28 in hipfire-train, matching
-  hipfire-tui). Target panels: capture progress + ETA; live loss + eval-Spearman
-  sparkline vs the shallow bar; per-epoch/step timing + overall ETA; current
-  hyperparams (τ/lr/epochs) and checkpoint status. Should degrade gracefully to the
-  plain-line output when stdout isn't a TTY (CI / piped logs). Sits on top of the
-  progress-helper above. Not urgent — land after the P3 result and the
-  checkpoint/resume round-trip are solid.
+- **Operator UI clients (TUI + WebUI, eventual).** Keep the TUI optional, and let
+  both TUI and WebUI connect dynamically to a daemon/server that may be supervised
+  as a service. Shared scope: model/server/config/eval state plus training
+  feedback. Training panels should include capture progress + ETA; live loss +
+  eval-Spearman sparkline vs the shallow bar; per-epoch/step timing + overall
+  ETA; current hyperparams (τ/lr/epochs), checkpoint/resume status, and export /
+  admission handoff. Should degrade gracefully to plain-line output when stdout
+  isn't a TTY (CI / piped logs). Sits on top of the progress-helper above. See
+  `docs/plans/2026-06-20-operator-ui-clients.md`. Not urgent — land after the P3
+  result and the checkpoint/resume round-trip are solid.
+
 - **Checkpoint / resume.** Long runs can't currently be stopped and continued.
   Add: periodic checkpointing of the drafter weights + AdamW moment buffers
   (m/v/t) + RNG/epoch position to a `.hfq`-style or simple binary artifact, and a

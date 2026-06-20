@@ -2,6 +2,11 @@
 
 Prototype 1 of the Wick-shaped hipfire terminal home.
 
+Longer-term direction: `hipfire-tui` should remain optional and act as one
+operator client over daemon/server APIs. A future WebUI should use the same
+model/server/config/eval/training-feedback state and action vocabulary. See
+`../../docs/plans/2026-06-20-operator-ui-clients.md`.
+
 Run from the repository root:
 
 ```bash

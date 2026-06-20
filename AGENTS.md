@@ -10,6 +10,7 @@ For detailed notices, project operating guides, and testing playbooks, see the c
 
 ## Branch Policy
 - **Use `chaingun` as the reference branch for all further work.** New work should either happen directly on `chaingun` or be explicitly based on and compared against `chaingun`; do not treat `master` as the active development baseline unless the user says so.
+- **Keep git moving as you work.** Pull/rebase from the `chaingun` reference before starting meaningful changes, commit coherent work states with descriptive messages, and push the active branch regularly. If the worktree contains unrelated user changes, preserve them and only stage/commit the files that belong to the current task.
 
 ## Testing & Coherence Gates
 - **Coherence-gate-dflash is the canonical correctness gate.** Run `./tests/coherence-gate-dflash.sh` after any change touching kernels, quant formats, dispatch, fusion, rotation, rmsnorm, or the spec-decode path.
