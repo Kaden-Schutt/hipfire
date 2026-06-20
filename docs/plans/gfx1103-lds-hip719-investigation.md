@@ -205,7 +205,9 @@ The currently promoted standalone GEMM jig lives in the repo:
 - `scripts/lds_direct_ab_artifact_summary.sh`: read-only summarizer for
   direct-AB artifact roots. It writes `direct-ab-artifact-summary.tsv/.md` with
   shape/chunk metadata, exit/sync failure, code-object hashes/resources, dmesg
-  deltas, and decoded gfxhub/GCVM/GDS coredump fields.
+  deltas, decoded gfxhub/GCVM/GDS coredump fields, and compact ISA counters
+  (`s_barrier`, DS ops, `s_waitcnt`, scalar branches, and unique
+  `ds_store_2addr_b32 offset1` values).
 - `scripts/lds_direct_ab_summary_compare.sh`: read-only comparator for two
   direct-AB summary TSVs. It compares source/code-object hashes, normalized ISA,
   resource tuples, build/risk mode, runtime exit/sync result, environment, dmesg
@@ -1541,6 +1543,13 @@ Latest artifact paths:
   fault address `0x000074669d000000`, prot status `0x841051`, GCVM flags
   `MORE_FAULTS,PERMISSION_FAULTS,RW`, and GDS/GDS-VM registers
   `0x3f000007` / `0x0fc00113`.
+- Regenerating the asymmetric summary with the expanded direct-AB summarizer
+  shows the pass/fail boundary does not change barrier/DS/wait instruction
+  counts: every `chunks=150` boundary row has `isa_s_barrier=8`,
+  `isa_ds=28`, `isa_s_waitcnt=14`, `isa_s_cbranch=1`, `sgpr=2`, and `vgpr=34`.
+  The compact visible codegen difference at this boundary is
+  `ds_store_2addr_b32 offset1`: passing `30`/`32`-lane rows report `offset1=32`,
+  while failing `33`/`35`/`36`-lane rows report `offset1=36`.
 
 ## Current Narrowing
 
@@ -1842,6 +1851,13 @@ Reduction results after extending the standalone HIP GEMM probe:
   exact-square `6x6` artifact. It points at the first two-wave direct-AB LDS
   use as the load-bearing condition, with the launch-count/grid/work threshold
   still providing the timing edge.
+- The appended ISA counters argue against a simple "more barriers" or "more DS
+  instructions" explanation across that boundary: pass and fail rows have the
+  same `8` barriers, `28` DS ops, `14` waits, and one scalar loop branch.
+  What changes with the active-lane boundary is the LDS layout/codegen for the
+  paired A/B store (`offset1=32` on the <=32-lane pass side, `offset1=36` on
+  the 33+ fail side). Treat this as a correlation to preserve in follow-up
+  controls, not yet a standalone cause.
 - Phase-mode controls sharpen the process-boundary result. With the same
   direct-AB kernel body at reads=6/192/511x86, same-process `99 + 1` fails on
   phase2 launch 0 / global launch 99, and same-process `98 + 2` fails on
