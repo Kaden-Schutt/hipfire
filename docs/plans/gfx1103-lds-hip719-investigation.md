@@ -192,7 +192,9 @@ The currently promoted standalone GEMM jig lives in the repo:
 - `scripts/lds_direct_ab_multi_exec_matrix.sh`: build/run wrapper for the
   direct-AB multi-exec repro. It defaults to `BUILD_ONLY=1`, compiles the child
   and parent, captures ISA/readobj artifacts, and does not launch the risky
-  repro unless `BUILD_ONLY=0` is explicitly set.
+  repro unless `BUILD_ONLY=0` is explicitly set. `LAYOUT_X` / `LAYOUT_Y` can
+  be set independently of `ACTIVE_X` / `ACTIVE_Y` to pad the A/B LDS arrays
+  while preserving the active-lane shape.
 - `scripts/lds_direct_ab_780m_test_jig.sh`: one-command handoff jig for a
   second gfx1103/780M system. The default `--build-only` mode safely compiles
   the direct-AB active-shape controls and captures codegen artifacts under
@@ -206,8 +208,8 @@ The currently promoted standalone GEMM jig lives in the repo:
   direct-AB artifact roots. It writes `direct-ab-artifact-summary.tsv/.md` with
   shape/chunk metadata, exit/sync failure, code-object hashes/resources, dmesg
   deltas, decoded gfxhub/GCVM/GDS coredump fields, and compact ISA counters
-  (`s_barrier`, DS ops, `s_waitcnt`, scalar branches, and unique
-  `ds_store_2addr_b32 offset1` values).
+  (`s_barrier`, DS ops, `s_waitcnt`, scalar branches, unique
+  `ds_store_2addr_b32 offset1` values, and non-default layout).
 - `scripts/lds_direct_ab_summary_compare.sh`: read-only comparator for two
   direct-AB summary TSVs. It compares source/code-object hashes, normalized ISA,
   resource tuples, build/risk mode, runtime exit/sync result, environment, dmesg
@@ -1550,6 +1552,16 @@ Latest artifact paths:
   The compact visible codegen difference at this boundary is
   `ds_store_2addr_b32 offset1`: passing `30`/`32`-lane rows report `offset1=32`,
   while failing `33`/`35`/`36`-lane rows report `offset1=36`.
+- A follow-up padded-layout control
+  (`/tmp/hipfire-lds-direct-ab-layout-artifacts/`, throwaway worktree
+  `/tmp/hipfire-lds-direct-ab-layout-1781923273`) decoupled active lanes from
+  LDS footprint/offset. `8x4` active with `LAYOUT=9x4` and `4x8` active with
+  `LAYOUT=4x9` both passed at `reads=3`, `iters=448`, `chunks=150`,
+  `grid=512x86`, with `group_segment=288` and `isa_ds_store_offset1=36`.
+  The same run series failed the `6x6` anchor at sync/global launch 98 with
+  the same `0x841051` GCVM and GDS/GDS-VM signature. Therefore 288 B LDS and
+  `offset1=36` are not sufficient to trigger the failure without more than one
+  wavefront of active lanes.
 
 ## Current Narrowing
 
@@ -1858,6 +1870,11 @@ Reduction results after extending the standalone HIP GEMM probe:
   paired A/B store (`offset1=32` on the <=32-lane pass side, `offset1=36` on
   the 33+ fail side). Treat this as a correlation to preserve in follow-up
   controls, not yet a standalone cause.
+- The padded-layout controls make that correlation non-causal by itself:
+  exact-wave `8x4`/`4x8` shapes survive with the same `288 B` group segment and
+  `offset1=36` as failing `6x6`. The load-bearing condition is now better
+  stated as two-wave active direct-AB LDS traffic plus enough repeated
+  launch/grid work, not LDS footprint or A/B base spacing alone.
 - Phase-mode controls sharpen the process-boundary result. With the same
   direct-AB kernel body at reads=6/192/511x86, same-process `99 + 1` fails on
   phase2 launch 0 / global launch 99, and same-process `98 + 2` fails on
@@ -2241,6 +2258,7 @@ LDS-only control:
 | direct-AB multi-exec `11x3`/`3x11` block, reads=3, 448 iters, 512x86, one child `150` | FAIL at sync/global launch 98 | `_Z25lds_direct_ab_phase_probev` | 276 B | 34 | 2 | 0 | 32 |
 | direct-AB multi-exec `7x5`/`5x7` block, reads=3, 448 iters, 512x86, one child `150` | FAIL at sync/global launch 98-99 | `_Z25lds_direct_ab_phase_probev` | 284 B | 34 | 2 | 0 | 32 |
 | direct-AB multi-exec `6x6` block, reads=3, 448 iters, 512x86, one child `150` | FAIL at sync/global launch 99 | `_Z25lds_direct_ab_phase_probev` | 288 B | 34 | 2 | 0 | 32 |
+| direct-AB multi-exec `8x4` active / `9x4` layout and `4x8` active / `4x9` layout, reads=3, 448 iters, 512x86, one child `150` | PASS | `_Z25lds_direct_ab_phase_probev` | 288 B | 34 | 2 | 0 | 32 |
 | direct-AB no-output `8x4` active in `8x5` block, reads=6 | PASS at 512 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 256 B | 22 | 5 | 0 | 32 |
 
 ISA observations:

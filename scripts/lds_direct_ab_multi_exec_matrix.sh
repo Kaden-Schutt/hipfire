@@ -9,6 +9,8 @@ ACTIVE_X="${ACTIVE_X:-6}"
 ACTIVE_Y="${ACTIVE_Y:-6}"
 BLOCK_X="${BLOCK_X:-$ACTIVE_X}"
 BLOCK_Y="${BLOCK_Y:-$ACTIVE_Y}"
+LAYOUT_X="${LAYOUT_X:-$ACTIVE_X}"
+LAYOUT_Y="${LAYOUT_Y:-$ACTIVE_Y}"
 READS="${READS:-3}"
 ITERS="${ITERS:-448}"
 CHUNKS="${CHUNKS:-96,5}"
@@ -25,7 +27,7 @@ CLEAR_COREDUMP="${CLEAR_COREDUMP:-0}"
 WAIT_DEVCD_MS="${WAIT_DEVCD_MS:-8000}"
 
 tag_chunks="${CHUNKS//,/_}"
-tag="a${ACTIVE_X}x${ACTIVE_Y}_b${BLOCK_X}x${BLOCK_Y}_r${READS}_i${ITERS}_chunks${tag_chunks}_multi_${MODE}_g${GRID_X}x${GRID_Y}"
+tag="a${ACTIVE_X}x${ACTIVE_Y}_b${BLOCK_X}x${BLOCK_Y}_l${LAYOUT_X}x${LAYOUT_Y}_r${READS}_i${ITERS}_chunks${tag_chunks}_multi_${MODE}_g${GRID_X}x${GRID_Y}"
 dest="$OUT/$tag"
 mkdir -p "$dest/save-temps" "$dest/coredumps"
 
@@ -54,8 +56,9 @@ start_since="$(date -u '+%Y-%m-%d %H:%M:%S')"
 {
   echo "active=$ACTIVE_X x $ACTIVE_Y"
   echo "block=$BLOCK_X x $BLOCK_Y"
+  echo "layout=$LAYOUT_X x $LAYOUT_Y"
   echo "reads=$READS"
-  echo "lds_bytes=$((8 * ACTIVE_X * ACTIVE_Y))"
+  echo "lds_bytes=$((8 * LAYOUT_X * LAYOUT_Y))"
   echo "active_threads=$((ACTIVE_X * ACTIVE_Y))"
   echo "block_threads=$((BLOCK_X * BLOCK_Y))"
   echo "iters=$ITERS"
@@ -81,6 +84,7 @@ cp "$ROOT/lds_direct_ab_multi_exec_parent.cpp" "$dest/lds_direct_ab_multi_exec_p
   "$HIPCC" -O3 --offload-arch="$ARCH" -save-temps=obj \
     -DACTIVE_X="$ACTIVE_X" -DACTIVE_Y="$ACTIVE_Y" \
     -DBLOCK_X="$BLOCK_X" -DBLOCK_Y="$BLOCK_Y" \
+    -DLAYOUT_X="$LAYOUT_X" -DLAYOUT_Y="$LAYOUT_Y" \
     -DREADS="$READS" -DITERS="$ITERS" \
     "$ROOT/lds_direct_ab_phase_probe.hip" \
     -lhsa-runtime64 \

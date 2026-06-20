@@ -36,8 +36,12 @@ function require_columns(    need, n, i) {
     }
 }
 function key(row) {
+    layout = "";
+    if (row["layout"] != "" && row["layout"] != row["active"]) {
+        layout = "|layout=" row["layout"];
+    }
     return row["active"] "|" row["block"] "|" row["reads"] "|" row["iters"] "|" \
-        row["chunks"] "|" row["mode"] "|" row["grid"] "|" row["arch"];
+        row["chunks"] "|" row["mode"] "|" row["grid"] "|" row["arch"] layout;
 }
 function load_row(dst,    i) {
     for (i in col) {

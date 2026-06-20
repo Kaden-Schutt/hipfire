@@ -21,6 +21,14 @@
 #define BLOCK_Y ACTIVE_Y
 #endif
 
+#ifndef LAYOUT_X
+#define LAYOUT_X ACTIVE_X
+#endif
+
+#ifndef LAYOUT_Y
+#define LAYOUT_Y ACTIVE_Y
+#endif
+
 #ifndef READS
 #define READS 6
 #endif
@@ -38,9 +46,11 @@
 __global__ void lds_direct_ab_phase_probe() {
     static_assert(ACTIVE_X <= BLOCK_X, "ACTIVE_X must fit inside BLOCK_X");
     static_assert(ACTIVE_Y <= BLOCK_Y, "ACTIVE_Y must fit inside BLOCK_Y");
+    static_assert(ACTIVE_X <= LAYOUT_X, "ACTIVE_X must fit inside LAYOUT_X");
+    static_assert(ACTIVE_Y <= LAYOUT_Y, "ACTIVE_Y must fit inside LAYOUT_Y");
 
-    __shared__ float A[ACTIVE_Y][ACTIVE_X];
-    __shared__ float B[ACTIVE_Y][ACTIVE_X];
+    __shared__ float A[LAYOUT_Y][LAYOUT_X];
+    __shared__ float B[LAYOUT_Y][LAYOUT_X];
 
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
@@ -105,9 +115,10 @@ static int run_phase(const char* label, int launches, int grid_x, int grid_y,
     }
 
     std::printf("%s active=%dx%d block=%dx%d reads=%d iters=%d launches=%d "
-                "grid=%dx%d lds_bytes=%d OK\n",
+                "grid=%dx%d lds_bytes=%d layout=%dx%d OK\n",
                 label, ACTIVE_X, ACTIVE_Y, BLOCK_X, BLOCK_Y, READS, ITERS,
-                launches, grid_x, grid_y, 8 * ACTIVE_X * ACTIVE_Y);
+                launches, grid_x, grid_y, 8 * LAYOUT_X * LAYOUT_Y, LAYOUT_X,
+                LAYOUT_Y);
     return 0;
 }
 
@@ -141,9 +152,11 @@ static bool mode_is(const char* mode, const char* expected) {
 static int run_two_phase(int phase1, int phase2, int grid_x, int grid_y,
                          const char* mode) {
     std::printf("phase-probe mode=%s phase1=%d phase2=%d active=%dx%d "
-                "block=%dx%d reads=%d iters=%d grid=%dx%d lds_bytes=%d\n",
+                "block=%dx%d layout=%dx%d reads=%d iters=%d grid=%dx%d "
+                "lds_bytes=%d\n",
                 mode, phase1, phase2, ACTIVE_X, ACTIVE_Y, BLOCK_X, BLOCK_Y,
-                READS, ITERS, grid_x, grid_y, 8 * ACTIVE_X * ACTIVE_Y);
+                LAYOUT_X, LAYOUT_Y, READS, ITERS, grid_x, grid_y,
+                8 * LAYOUT_X * LAYOUT_Y);
 
     if (mode_is(mode, "same")) {
         int rc = run_phase("phase1", phase1, grid_x, grid_y, nullptr, false, 0);
