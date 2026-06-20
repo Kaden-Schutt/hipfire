@@ -37,6 +37,10 @@
 #define ITERS 320
 #endif
 
+#ifndef PRE_SYNC_EACH_LAUNCH
+#define PRE_SYNC_EACH_LAUNCH 0
+#endif
+
 #if ACTIVE_X == BLOCK_X && ACTIVE_Y == BLOCK_Y
 #define ALL_LANES_ACTIVE 1
 #else
@@ -92,6 +96,19 @@ static int run_phase(const char* label, int launches, int grid_x, int grid_y,
     dim3 block(BLOCK_X, BLOCK_Y, 1);
 
     for (int i = 0; i < launches; ++i) {
+#if PRE_SYNC_EACH_LAUNCH
+        hipError_t pre_sync_err =
+            stream_sync ? hipStreamSynchronize(stream) : hipDeviceSynchronize();
+        if (pre_sync_err != hipSuccess) {
+            std::fprintf(stderr,
+                         "%s pre-sync %d global %d failed: %s (%d)\n", label,
+                         i, global_offset + i,
+                         hipGetErrorString(pre_sync_err),
+                         static_cast<int>(pre_sync_err));
+            return 4;
+        }
+#endif
+
         hipLaunchKernelGGL(lds_direct_ab_phase_probe, grid, block, 0, stream);
 
         hipError_t launch_err = hipGetLastError();
@@ -115,10 +132,10 @@ static int run_phase(const char* label, int launches, int grid_x, int grid_y,
     }
 
     std::printf("%s active=%dx%d block=%dx%d reads=%d iters=%d launches=%d "
-                "grid=%dx%d lds_bytes=%d layout=%dx%d OK\n",
+                "grid=%dx%d lds_bytes=%d layout=%dx%d pre_sync=%d OK\n",
                 label, ACTIVE_X, ACTIVE_Y, BLOCK_X, BLOCK_Y, READS, ITERS,
                 launches, grid_x, grid_y, 8 * LAYOUT_X * LAYOUT_Y, LAYOUT_X,
-                LAYOUT_Y);
+                LAYOUT_Y, PRE_SYNC_EACH_LAUNCH);
     return 0;
 }
 

@@ -17,6 +17,7 @@ CHUNKS="${CHUNKS:-96,5}"
 GRID_X="${GRID_X:-512}"
 GRID_Y="${GRID_Y:-86}"
 MODE="${MODE:-plain}"
+PRE_SYNC_EACH_LAUNCH="${PRE_SYNC_EACH_LAUNCH:-0}"
 ARCH="${ARCH:-gfx1103}"
 HIPCC="${HIPCC:-/opt/rocm/bin/hipcc}"
 ROCMINFO="${ROCMINFO:-/opt/rocm/bin/rocminfo}"
@@ -27,7 +28,11 @@ CLEAR_COREDUMP="${CLEAR_COREDUMP:-0}"
 WAIT_DEVCD_MS="${WAIT_DEVCD_MS:-8000}"
 
 tag_chunks="${CHUNKS//,/_}"
-tag="a${ACTIVE_X}x${ACTIVE_Y}_b${BLOCK_X}x${BLOCK_Y}_l${LAYOUT_X}x${LAYOUT_Y}_r${READS}_i${ITERS}_chunks${tag_chunks}_multi_${MODE}_g${GRID_X}x${GRID_Y}"
+tag_extra=""
+if [ "$PRE_SYNC_EACH_LAUNCH" != "0" ]; then
+  tag_extra="_presync${PRE_SYNC_EACH_LAUNCH}"
+fi
+tag="a${ACTIVE_X}x${ACTIVE_Y}_b${BLOCK_X}x${BLOCK_Y}_l${LAYOUT_X}x${LAYOUT_Y}_r${READS}_i${ITERS}_chunks${tag_chunks}_multi_${MODE}${tag_extra}_g${GRID_X}x${GRID_Y}"
 dest="$OUT/$tag"
 mkdir -p "$dest/save-temps" "$dest/coredumps"
 
@@ -64,6 +69,7 @@ start_since="$(date -u '+%Y-%m-%d %H:%M:%S')"
   echo "iters=$ITERS"
   echo "chunks=$CHUNKS"
   echo "mode=$MODE"
+  echo "pre_sync_each_launch=$PRE_SYNC_EACH_LAUNCH"
   echo "grid=$GRID_X x $GRID_Y"
   echo "arch=$ARCH"
   echo "build_only=$BUILD_ONLY"
@@ -86,6 +92,7 @@ cp "$ROOT/lds_direct_ab_multi_exec_parent.cpp" "$dest/lds_direct_ab_multi_exec_p
     -DBLOCK_X="$BLOCK_X" -DBLOCK_Y="$BLOCK_Y" \
     -DLAYOUT_X="$LAYOUT_X" -DLAYOUT_Y="$LAYOUT_Y" \
     -DREADS="$READS" -DITERS="$ITERS" \
+    -DPRE_SYNC_EACH_LAUNCH="$PRE_SYNC_EACH_LAUNCH" \
     "$ROOT/lds_direct_ab_phase_probe.hip" \
     -lhsa-runtime64 \
     -o "$dest/lds_direct_ab_phase_probe" > "$dest/build-phase.log" 2>&1
