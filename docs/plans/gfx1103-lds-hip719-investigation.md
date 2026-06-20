@@ -1786,6 +1786,17 @@ Latest artifact paths:
   from the all-active extreme tuple: for example `32x1` in `34x1` READS=2 uses
   `sgpr=5`, `vgpr=10`, `s_barrier=8`, DS=16, `s_waitcnt=12`, `s_cbranch=9`,
   `offset1=36`.
+- 32 active lanes inside 33-lane layouts
+  (`/tmp/hipfire-lds-direct-ab-32in33-artifacts/`, same throwaway worktree)
+  passed all four one-child `500` controls: row/column orientations at READS=2
+  and READS=1. These controls keep the masked branch pattern
+  (`s_cbranch=9`) and `offset1=36` but use `group_segment=276` rather than
+  280. Static tuples line up closely with the failing 32-in-34 controls:
+  READS=2 row uses `sgpr=5`, `vgpr=10`, `s_barrier=8`, DS=16,
+  `s_waitcnt=12`; READS=2 column uses `vgpr=9`, DS=12; READS=1 uses `vgpr=7`,
+  DS=8. This makes the latest boundary more specific than "masked inactive
+  lane codegen": a 33-lane layout with the same masking structure is pass-side,
+  while the 34-lane / 280-byte layout is fail-side for several orientations.
 
 ## Current Narrowing
 
@@ -2086,8 +2097,9 @@ Reduction results after extending the standalone HIP GEMM probe:
   `7x5`/`5x7`, and `6x6` failed with the same GCVM/GDS signature, this is not
   an exact-square `6x6` artifact. Later masked-layout controls show this is an
   all-active boundary, not a universal active-lane rule: 32 active lanes inside
-  a 34-lane block/layout can still fail depending on orientation and READS.
-  The launch-count/grid/work threshold still provides the timing edge.
+  a 34-lane block/layout can still fail depending on orientation and READS,
+  while the matching 32-active-in-33-layout controls pass. The
+  launch-count/grid/work threshold still provides the timing edge.
 - The appended ISA counters argue against a simple "more barriers" or "more DS
   instructions" explanation across that boundary: pass and fail rows have the
   same `8` barriers, `28` DS ops, `14` waits, and one scalar loop branch.
@@ -2105,9 +2117,10 @@ Reduction results after extending the standalone HIP GEMM probe:
   later traffic-mask replay with the same normalized ISA/resource tuple failed
   with the canonical signature. The newer 32/33-active-in-34-layout controls
   make this more concrete: inactive-lane masking and the resulting branch-heavy
-  34-layout codegen can be fail-side even at 32 active lanes. The stable
-  all-active evidence remains the 32/33 active-lane boundary, but masked
-  two-wave block/layout participation is now part of the suspect surface.
+  34-layout codegen can be fail-side even at 32 active lanes, while the same
+  active count in 33-lane masked layouts passes. The stable all-active evidence
+  remains the 32/33 active-lane boundary, but masked two-wave block/layout
+  participation is now part of the suspect surface.
 - The `9x4` all-active read-pressure sweep shows the first-two-wave condition
   also needs enough LDS read work at the tested edge: `READS=1` survives at
   least `500` launches, while `READS=2` crosses between `130` and `140`
@@ -2187,7 +2200,9 @@ Reduction results after extending the standalone HIP GEMM probe:
   all-active boundary robust across both the compact `8x4` style and extreme
   row/column codegen families. It does not extend to masked 34-lane layouts:
   active `32x1` in `34x1` READS=2 passes, but active `1x32` in `1x34` READS=2
-  fails, and both READS=1 masked 34-layout orientations fail.
+  fails, and both READS=1 masked 34-layout orientations fail. The matching
+  masked 33-lane layouts pass, making the 280-byte / 34-lane layout boundary a
+  stronger suspect than masking alone.
 - Phase-mode controls sharpen the process-boundary result. With the same
   direct-AB kernel body at reads=6/192/511x86, same-process `99 + 1` fails on
   phase2 launch 0 / global launch 99, and same-process `98 + 2` fails on
@@ -2589,6 +2604,8 @@ LDS-only control:
 | direct-AB multi-exec active `33x1`/`1x33` in `34x1`/`1x34` block/layout, reads=1, 448 iters, 512x86 | FAIL one-child `500` at sync/global 52/51 | `_Z25lds_direct_ab_phase_probev` | 280 B | 7 | 5 | 0 | 32 |
 | direct-AB multi-exec active `32x1`/`1x32` in `34x1`/`1x34` block/layout, reads=2, 448 iters, 512x86 | `32x1` row orientation PASS one-child `500`; `1x32` column orientation FAIL first-risky repeat at sync/global 64 | `_Z25lds_direct_ab_phase_probev` | 280 B | 9-10 | 5 | 0 | 32 |
 | direct-AB multi-exec active `32x1`/`1x32` in `34x1`/`1x34` block/layout, reads=1, 448 iters, 512x86 | FAIL first-risky repeats at sync/global 66/114 | `_Z25lds_direct_ab_phase_probev` | 280 B | 7 | 5 | 0 | 32 |
+| direct-AB multi-exec active `32x1`/`1x32` in `33x1`/`1x33` block/layout, reads=2, 448 iters, 512x86 | PASS one-child `500` for both orientations | `_Z25lds_direct_ab_phase_probev` | 276 B | 9-10 | 5 | 0 | 32 |
+| direct-AB multi-exec active `32x1`/`1x32` in `33x1`/`1x33` block/layout, reads=1, 448 iters, 512x86 | PASS one-child `500` for both orientations | `_Z25lds_direct_ab_phase_probev` | 276 B | 7 | 5 | 0 | 32 |
 | direct-AB multi-exec `17x2`/`2x17` block/layout, reads=2, 448 iters, 512x86 | `17x2`: FAIL one-child `130` at sync/global 32; `2x17`: FAIL one-child `130` at sync/global 35 | `_Z25lds_direct_ab_phase_probev` | 280 B | 24 | 2 | 0 | 32 |
 | direct-AB pre-sync diagnostic `11x3`/`3x11` block/layout, reads=2, 448 iters, 512x86 | `PRE_SYNC_EACH_LAUNCH=1`: `11x3` one-child `133` PASS; `3x11` one-child `134` FAIL at sync/global 133 | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
 | direct-AB throwaway host-sleep diagnostic `11x3` block/layout, reads=2, 448 iters, 512x86 | local-only `PRE_LAUNCH_SLEEP_US=1000`: one-child `133` FAIL at sync/global 73 | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
