@@ -11714,6 +11714,7 @@ mod codec_golden {
         h("q8f16", &quantize_q8f16(&x));
         h("q8hfq", &quantize_q8hfq(&x, m, k).0);
         h("mq4g256", &quantize_mq4g256(&x, &s1, &s2));
+        h("mq4g256_clipsearch", &quantize_mq4g256_clipsearch(&x, &s1, &s2));
         h("mq6g256", &quantize_mq6g256(&x, &s1, &s2));
         h("mq8g256", &quantize_mq8g256(&x, &s1, &s2));
         h("mq3g256", &quantize_mq3g256(&x, &s1, &s2));
@@ -11753,6 +11754,7 @@ mod codec_golden {
         ("q8f16", "43be8c0f93de9cb3"),
         ("q8hfq", "29ca0c52ad9b58dc"),
         ("mq4g256", "6e9d532bbe5d38eb"),
+        ("mq4g256_clipsearch", "7978e3644f11ed99"),
         ("mq6g256", "c43cbf518aae87fe"),
         ("mq8g256", "8987f0aa7fdfb487"),
         ("mq3g256", "0c2f928a4236cf57"),
@@ -11792,6 +11794,24 @@ mod codec_golden {
             "codec byte output drifted:\n{}",
             drifted.join("\n")
         );
+    }
+
+    /// MQ4+ clip-search must not increase (and on outlier data, must reduce)
+    /// reconstruction error vs plain MQ4 — same byte layout, better-fitted scale.
+    #[test]
+    fn mq4_clipsearch_beats_or_matches_plain() {
+        // Outlier-heavy input (where clip-search helps most).
+        let x = det_input(1024, 11);
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let plain = dequant_mq4g256(&quantize_mq4g256(&x, &s1, &s2), x.len(), &s1, &s2);
+        let clip = dequant_mq4g256(&quantize_mq4g256_clipsearch(&x, &s1, &s2), x.len(), &s1, &s2);
+        let mse = |rec: &[f32]| -> f64 {
+            x.iter().zip(rec).map(|(a, b)| ((a - b) as f64).powi(2)).sum::<f64>() / x.len() as f64
+        };
+        let (mp, mc) = (mse(&plain), mse(&clip));
+        assert!(mc <= mp * 1.0001, "clip-search MSE {mc:.3e} worse than plain {mp:.3e}");
+        eprintln!("mq4 plain MSE={mp:.4e}  clipsearch MSE={mc:.4e}  ({:.1}% lower)", 100.0 * (mp - mc) / mp);
     }
 
     /// FWHT must be exactly invertible (forward then inverse = identity).

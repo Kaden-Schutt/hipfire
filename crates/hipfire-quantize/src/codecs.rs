@@ -376,6 +376,74 @@ pub(crate) fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32])
     output
 }
 
+/// MQ4+ codec: MQ4G256 with an MSE-optimal **clip-searched** affine range
+/// instead of plain min/max. Per FWHT-rotated group, search a symmetric clip
+/// factor that minimizes squared reconstruction error (clipping a few outliers
+/// to gain resolution on the bulk). Output is the IDENTICAL 136-byte MQ4G256
+/// layout (f32 scale + f32 min + 128 nibbles), so it decodes through the exact
+/// same kernel/dtype as MQ4 — only the chosen scale/min differ. Pairs with AWQ
+/// (activation-aware pre-scaling) to form the MQ4+ format. See
+/// `docs/kernels/quant-exploration-gfx1103.md` (E4/E6).
+pub(crate) fn quantize_mq4g256_clipsearch(
+    f32_data: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    const CLIP_GRID: [f32; 9] = [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6];
+    let group_size = 256;
+    let block_bytes = 136;
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let mut group = [0.0f32; 256];
+        let actual_len = end - start;
+        group[..actual_len].copy_from_slice(&f32_data[start..end]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+
+        let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mid = 0.5 * (min_val + max_val);
+        let half = 0.5 * (max_val - min_val);
+
+        // MSE-optimal symmetric clip of the affine range over the grid.
+        let (mut best_lo, mut best_scale) = (min_val, (max_val - min_val) / 15.0);
+        let mut best_err = f32::INFINITY;
+        for &c in &CLIP_GRID {
+            let lo = mid - c * half;
+            let scale = (2.0 * c * half / 15.0).max(1e-12);
+            let inv = 1.0 / scale;
+            let mut err = 0.0f32;
+            for &v in group.iter() {
+                let q = ((v - lo) * inv + 0.5).clamp(0.0, 15.0);
+                let d = v - (q * scale + lo);
+                err += d * d;
+            }
+            if err < best_err {
+                best_err = err;
+                best_lo = lo;
+                best_scale = scale;
+            }
+        }
+        let scale = if best_scale > 0.0 { best_scale } else { 1.0 };
+        let inv_scale = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
+        output[out_off + 4..out_off + 8].copy_from_slice(&best_lo.to_le_bytes());
+        for i in 0..128 {
+            let lo_q = ((group[2 * i] - best_lo) * inv_scale + 0.5).clamp(0.0, 15.0) as u8;
+            let hi_q = ((group[2 * i + 1] - best_lo) * inv_scale + 0.5).clamp(0.0, 15.0) as u8;
+            output[out_off + 8 + i] = lo_q | (hi_q << 4);
+        }
+    }
+
+    output
+}
+
 /// Dequantize MQ4G256 packed bytes back to f32, EXACTLY mirroring the GEMV
 /// kernel (and `quant_quality_mse`'s reference): per 136-byte group read scale+min
 /// (f32), expand 128 nibble bytes to 256 values `min + scale*q` (lo=2i, hi=2i+1),
