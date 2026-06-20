@@ -199,9 +199,9 @@ The currently promoted standalone GEMM jig lives in the repo:
   second gfx1103/780M system. The default `--build-only` mode safely compiles
   the direct-AB active-shape controls and captures codegen artifacts under
   `/tmp/hipfire-lds-direct-ab-780m-buildonly`. `--risky` runs the current
-  focused sequence: 4x4 one-child pass control, 5x5 one-child pass controls,
-  6x6 split-child pass control, then the 6x6 one-child fail-side repro. It
-  writes `report.tsv`, `summary.txt`, and
+  focused READS=2 sequence: 8x4 one-child pass control, 9x4 one-child
+  pass-side control, 9x4 split-child pass control, then the 9x4 one-child
+  fail-side repro. It writes `report.tsv`, `summary.txt`, and
   `direct-ab-artifact-summary.tsv/.md`, and `--compare` delegates to the
   direct-AB summary comparator for local-vs-remote result checks.
 - `scripts/lds_direct_ab_artifact_summary.sh`: read-only summarizer for
@@ -1605,6 +1605,14 @@ Latest artifact paths:
   run (`isa_norm=277a9cab2146459e`) but split total work across child
   processes. `130,10` and `120,20` both passed with no dmesg/devcoredump
   deltas, while the one-child `140` failed at sync/global launch 133.
+- A `READS=2` high-count one-wave control
+  (`/tmp/hipfire-lds-direct-ab-reads2-8x4-artifacts/`, throwaway worktree
+  `/tmp/hipfire-lds-direct-ab-reads2-8x4-1781924533`) kept the same
+  `iters=448`, `grid=512x86`, one-child shape but used all-active `8x4`
+  (`32` active lanes). It passed `500` and `1000` launches with no
+  dmesg/devcoredump deltas. The code object has the same static barrier/DS/wait
+  counts as `9x4 READS=2` (`8` / `20` / `12`) but the one-wave LDS layout
+  (`group_segment=256`, `offset1=32`, `isa_norm=5188faa843fa5475`).
 
 ## Current Narrowing
 
@@ -1937,6 +1945,12 @@ Reduction results after extending the standalone HIP GEMM probe:
   one child fails, but the same total split as `130,10` or `120,20` passes.
   This keeps pointing at per-process/queue lifetime state coupled to LDS read
   pressure rather than total parent-supervised launch count alone.
+- The `8x4 READS=2` high-count pass keeps the active-lane boundary stable under
+  read pressure: a one-wave `32`-lane shape survives `1000` one-child launches
+  with the same barrier/DS/wait counts as failing `9x4 READS=2`, while the
+  first-two-wave `36`-lane shape fails near `140`. That makes the current
+  trigger model "two-wave active LDS traffic plus enough LDS reads and
+  per-process launch lifetime" rather than LDS read count alone.
 - Phase-mode controls sharpen the process-boundary result. With the same
   direct-AB kernel body at reads=6/192/511x86, same-process `99 + 1` fails on
   phase2 launch 0 / global launch 99, and same-process `98 + 2` fails on
@@ -2326,6 +2340,7 @@ LDS-only control:
 | direct-AB multi-exec `9x4` block/layout, reads=2, 448 iters, 512x86 | PASS at one-child `120`/`130`; FAIL at `140`/`150` | `_Z25lds_direct_ab_phase_probev` | 288 B | 24 | 2 | 0 | 32 |
 | direct-AB multi-exec `9x4` block/layout, reads=2, 448 iters, 512x86, split child | PASS for `130,10` and `120,20` total `140`; one-child `140` fails | `_Z25lds_direct_ab_phase_probev` | 288 B | 24 | 2 | 0 | 32 |
 | direct-AB multi-exec `9x4` block/layout, reads=1, 448 iters, 512x86 | PASS at one-child `220`/`260`/`300`/`500` | `_Z25lds_direct_ab_phase_probev` | 288 B | 22 | 2 | 0 | 32 |
+| direct-AB multi-exec `8x4` block/layout, reads=2, 448 iters, 512x86 | PASS at one-child `500`/`1000` | `_Z25lds_direct_ab_phase_probev` | 256 B | 24 | 2 | 0 | 32 |
 | direct-AB no-output `8x4` active in `8x5` block, reads=6 | PASS at 512 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 256 B | 22 | 5 | 0 | 32 |
 
 ISA observations:
@@ -2714,6 +2729,28 @@ scripts/lds_gemm_780m_runbook.sh
 ```
 
 - One-command second-780M jig:
+
+```bash
+# Current direct-AB reduced repro. Safe: compiles and captures codegen only.
+scripts/lds_direct_ab_780m_test_jig.sh
+
+# Risky: expected pass-side controls followed by the READS=2 9x4 fail-side.
+scripts/lds_direct_ab_780m_test_jig.sh --risky
+```
+
+The direct-AB jig writes:
+
+```text
+/tmp/hipfire-lds-direct-ab-780m-buildonly/direct-ab-artifact-summary.tsv
+```
+
+Compare two machines' direct-AB summaries with:
+
+```bash
+scripts/lds_direct_ab_780m_test_jig.sh --compare local-direct-ab-summary.tsv other-780m-direct-ab-summary.tsv
+```
+
+- Legacy GEMM/tail-snop second-780M jig:
 
 ```bash
 # Safe: compiles and captures codegen artifacts only.

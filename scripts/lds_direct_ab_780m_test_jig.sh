@@ -22,9 +22,9 @@ shapes and captures codegen artifacts without launching the reset-prone probe.
 
 Modes:
   --build-only  Safe compile/codegen capture under OUT-buildonly
-  --risky       Run focused pass-side controls first, then the 6x6 fail-side
-                direct-AB repro. This can trip HIP-719 and wedge/reset affected
-                gfx1103/780M stacks.
+  --risky       Run focused READS=2 pass-side controls first, then the 9x4
+                first-two-wave direct-AB repro. This can trip HIP-719 and
+                wedge/reset affected gfx1103/780M stacks.
   --compare     Compare two direct-ab-artifact-summary.tsv files
 
 Environment:
@@ -87,18 +87,16 @@ print_reference() {
     cat <<'EOF'
 
 # Local gfx1103/780M direct-AB reference signatures
-# Split-child control observed locally:
-#   active=6x6 block=6x6 reads=3 iters=448 chunks=96,5 grid=512x86 exit=0
-# One-child fail-side observed locally:
-#   active=6x6 block=6x6 reads=3 iters=448 chunks=101 grid=512x86 exit=4
-#   sync_failure='phase1 sync 24 global 24 failed: unspecified launch failure (719)'
+# READS=2 one-wave pass-side observed locally:
+#   active=8x4 block/layout=8x4 reads=2 iters=448 chunks=500/1000 grid=512x86 exit=0
+# READS=2 first-two-wave fail-side observed locally:
+#   active=9x4 block/layout=9x4 reads=2 iters=448 chunks=140 grid=512x86 exit=4
+#   sync_failure='phase1 sync 133 global 133 failed: unspecified launch failure (719)'
 #   dmesg_remove_queue=3
 #   devcore_sig=1/0x000074669d000000/0x841051/0x3f000007/0x0fc00113
 #   gcvm_sig=MORE_FAULTS,PERMISSION_FAULTS,RW/cid=8/rw=1/vmid=8
-# Active-lane controls observed locally:
-#   active=4x4 chunks=101 exit=0
-#   active=5x5 chunks=101 exit=0
-#   active=5x5 chunks=200 exit=0
+# READS=2 process-boundary control observed locally:
+#   active=9x4 block/layout=9x4 reads=2 iters=448 chunks=130,10 grid=512x86 exit=0
 EOF
 }
 
@@ -106,9 +104,17 @@ run_case() {
     local case_name="$1"
     local active_x="$2"
     local active_y="$3"
-    local chunks="$4"
-    local expected="$5"
-    local build_only="$6"
+    local block_x="$4"
+    local block_y="$5"
+    local layout_x="$6"
+    local layout_y="$7"
+    local reads="$8"
+    local iters="$9"
+    local grid_x="${10}"
+    local grid_y="${11}"
+    local chunks="${12}"
+    local expected="${13}"
+    local build_only="${14}"
     local clear_coredump rc match reported_expected
 
     reported_expected="$expected"
@@ -119,7 +125,7 @@ run_case() {
         clear_coredump="${CLEAR_COREDUMP:-1}"
     fi
 
-    echo "[direct-ab-780m] case=$case_name active=${active_x}x${active_y} chunks=$chunks build_only=$build_only expected=$reported_expected out=$OUT" >&2
+    echo "[direct-ab-780m] case=$case_name active=${active_x}x${active_y} block=${block_x}x${block_y} layout=${layout_x}x${layout_y} reads=$reads iters=$iters grid=${grid_x}x${grid_y} chunks=$chunks build_only=$build_only expected=$reported_expected out=$OUT" >&2
 
     set +e
     ARCH="$ARCH" \
@@ -128,13 +134,15 @@ run_case() {
     WAIT_DEVCD_MS="${WAIT_DEVCD_MS:-12000}" \
     ACTIVE_X="$active_x" \
     ACTIVE_Y="$active_y" \
-    BLOCK_X="$active_x" \
-    BLOCK_Y="$active_y" \
-    READS=3 \
-    ITERS=448 \
+    BLOCK_X="$block_x" \
+    BLOCK_Y="$block_y" \
+    LAYOUT_X="$layout_x" \
+    LAYOUT_Y="$layout_y" \
+    READS="$reads" \
+    ITERS="$iters" \
     CHUNKS="$chunks" \
-    GRID_X=512 \
-    GRID_Y=86 \
+    GRID_X="$grid_x" \
+    GRID_Y="$grid_y" \
     MODE=plain \
     "$RUNNER" "$OUT" >"$OUT/$case_name.wrapper.log" 2>&1
     rc=$?
@@ -149,9 +157,11 @@ run_case() {
         match=1
     fi
 
-    printf '%s\t%sx%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$case_name" "$active_x" "$active_y" "$chunks" "$build_only" \
-        "$reported_expected" "$rc" "$match" "$OUT/$case_name.wrapper.log" >>"$report"
+    printf '%s\t%sx%s\t%sx%s\t%sx%s\t%s\t%s\t%sx%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$case_name" "$active_x" "$active_y" "$block_x" "$block_y" \
+        "$layout_x" "$layout_y" "$reads" "$iters" "$grid_x" "$grid_y" \
+        "$chunks" "$build_only" "$reported_expected" "$rc" "$match" \
+        "$OUT/$case_name.wrapper.log" >>"$report"
 
     [[ "$match" -eq 1 ]]
 }
@@ -162,19 +172,18 @@ run_matrix() {
 
     mkdir -p "$OUT"
     report="$OUT/report.tsv"
-    printf 'case\tactive\tchunks\tbuild_only\texpected\texit\tmatch\twrapper_log\n' >"$report"
+    printf 'case\tactive\tblock\tlayout\treads\titers\tgrid\tchunks\tbuild_only\texpected\texit\tmatch\twrapper_log\n' >"$report"
 
     if [[ "$build_only" == "1" ]]; then
-        run_case "00-build-4x4-one-child-101" 4 4 101 pass 1 || failures=$((failures + 1))
-        run_case "01-build-5x5-one-child-101" 5 5 101 pass 1 || failures=$((failures + 1))
-        run_case "02-build-6x6-split-96-5" 6 6 96,5 pass 1 || failures=$((failures + 1))
-        run_case "03-build-6x6-one-child-101" 6 6 101 fail 1 || failures=$((failures + 1))
+        run_case "00-build-8x4-r2-one-child-500" 8 4 8 4 8 4 2 448 512 86 500 pass 1 || failures=$((failures + 1))
+        run_case "01-build-9x4-r2-one-child-130" 9 4 9 4 9 4 2 448 512 86 130 pass 1 || failures=$((failures + 1))
+        run_case "02-build-9x4-r2-split-130-10" 9 4 9 4 9 4 2 448 512 86 130,10 pass 1 || failures=$((failures + 1))
+        run_case "03-build-9x4-r2-one-child-140" 9 4 9 4 9 4 2 448 512 86 140 fail 1 || failures=$((failures + 1))
     else
-        run_case "00-control-4x4-one-child-101" 4 4 101 pass 0 || failures=$((failures + 1))
-        run_case "01-control-5x5-one-child-101" 5 5 101 pass 0 || failures=$((failures + 1))
-        run_case "02-control-5x5-one-child-200" 5 5 200 pass 0 || failures=$((failures + 1))
-        run_case "03-control-6x6-split-96-5" 6 6 96,5 pass 0 || failures=$((failures + 1))
-        run_case "04-fail-6x6-one-child-101" 6 6 101 fail 0 || failures=$((failures + 1))
+        run_case "00-control-8x4-r2-one-child-500" 8 4 8 4 8 4 2 448 512 86 500 pass 0 || failures=$((failures + 1))
+        run_case "01-control-9x4-r2-one-child-130" 9 4 9 4 9 4 2 448 512 86 130 pass 0 || failures=$((failures + 1))
+        run_case "02-control-9x4-r2-split-130-10" 9 4 9 4 9 4 2 448 512 86 130,10 pass 0 || failures=$((failures + 1))
+        run_case "03-fail-9x4-r2-one-child-140" 9 4 9 4 9 4 2 448 512 86 140 fail 0 || failures=$((failures + 1))
     fi
 
     {
