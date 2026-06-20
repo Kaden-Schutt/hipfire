@@ -38,28 +38,43 @@ cascades won't reproduce. The 35B golden stays as the behavioral backstop.
   caller runs the **normal `--input` quantize path** (so it exercises the
   arch name-mapper + real codec — full-pipeline coverage). Has `preset()`
   (dense) and `moe_preset()`. Currently emits bf16.
-- **`crates/hipfire-runtime/examples/fixture_golden.rs`** — golden runner. BUT:
-  it is **qwen35-only** (hard-codes `qwen35::{config_from_hfq, load_weights,
-  forward_scratch}`) and **teacher-forced** — it feeds a *fixed* random token
-  stream and captures per-position argmax + an FNV-1a `logit_hash`. Because the
-  inputs are fixed, it **cannot produce an attractor** (an attractor needs the
-  model's own output fed back). This is the "single-position prefill golden"
-  §293 calls out as insufficient.
+- **`crates/hipfire-runtime/examples/fixture_golden.rs`** — golden runner. Now
+  has `--mode {tf,ar}` (AR landed in P1/D1, commit `82542fae`); still
+  qwen35-family only (handles both arch 5 dense and arch 6 MoE via the qwen35
+  module, so the current fixture set needs no separate arch dispatch).
+- **`tests/fixture-golden-gate.sh`** — already wires the tripwire: emits both
+  fixtures (dense + MoE) → quantizes (`mq4` only) → runs `fixture_golden`
+  (`tf`, `len=16`) and does **two checks: (1) determinism** (run twice, hashes
+  must match — catches a kernel going nondeterministic), **(2) baseline** drift
+  vs committed, **keyed per `gpu_arch × model_arch`**. On drift it prints
+  "escalate to the 35B golden (agentic-gate.sh)". `--record` rebaselines. So
+  the **determinism check, per-arch baselines, escalation framing, and
+  rebaseline command already exist** — earlier drafts of this plan
+  over-credited them as "delta"; they are not.
+- **`tests/fixture-golden-baselines.txt`** — committed goldens. Currently only
+  `gfx1151` (the halo box), `qwen3_5` + `qwen3_5_moe`, `mq4`, `len=16 tf`.
+- **`tests/fixture-roundtrip-nogpu.sh`** — emit→quantize round-trip, **already
+  in `no-gpu-ci.sh`** (no forward, so GPU-free).
+
+What the existing runner could NOT do: it was **teacher-forced** — fixed inputs,
+so it structurally **cannot produce an attractor**. D1 (below) fixed that.
 
 ## The delta to build
 
-### D1 — Free-running AR golden (the attractor-relevant upgrade)
-Generalize `fixture_golden.rs` from teacher-forced to **free-running greedy
-decode**: seed a short fixed prompt, then feed `argmax` back as the next token
-for a fixed length (§293: 256), growing the KV cache. This is what exercises
-the real decode loop + KV growth and what can actually surface an attractor.
-- Keep `logit_hash` as the *sensitive* tier and the produced **token sequence**
-  as the *robust* tier (both committed).
-- Add a `--mode {teacher-forced,ar}` so the existing prefill golden stays
-  available.
-- **Generalize across archs.** Today it is qwen35-only; dispatch on the
-  fixture's `arch_id` so dense (arch 5) and MoE (arch 6) both run. A per-arch
-  `forward` shim is fine; the runner just needs argmax + KV growth per arch.
+### D1 — Free-running AR golden (the attractor-relevant upgrade) — ✅ LANDED (82542fae)
+`fixture_golden.rs` now has `--mode {tf,ar}`. `ar` seeds a short fixed prompt
+(`--prompt-len`), then feeds `argmax` back as the next token for the rest of
+`--len`, growing the KV cache — the real decode loop, and the path that can
+surface an attractor. `tf` stays the default and is byte-preserved (validated:
+reproduces the committed `0xb9929ff22fec2015` gfx1151 baseline exactly; `ar` is
+deterministic across two runs). `logit_hash` (sensitive) + the argmax token
+sequence (robust) are both emitted.
+- No separate arch dispatch was needed: the runner already handles arch 5 dense
+  and arch 6 MoE through the qwen35 module (both current fixtures).
+- *Remaining for D1's gate side:* `fixture-golden-gate.sh` still calls `tf
+  len=16`; switching it to `ar` with a longer len (§293: 256) + rebaselining is
+  the P3 wiring step, gated on the MoE determinism pin (D3) since a long AR tail
+  is where the atomicAdd near-tie flips bite.
 
 ### D2 — The fixture *matrix* (arch × quant-format)
 §325 builds two fixtures (tiny dense arch 5, tiny MoE arch 6). Add the
@@ -94,9 +109,17 @@ coverage. The cell set is `{dense, MoE} × {formats}` minus unsupported combos.
   one golden per `(fixture-cell, arch-family)` and have each box check its own.
 
 ### D4 — Gate wiring (the two-tier policy from §325)
-- **Front tier:** a script (`tests/tiny-golden.sh`) runs the fixture matrix,
-  diffs against committed goldens. Seconds, runs in pre-commit whenever the
-  HOTSPOT set is touched (now including renames, post-`ACMR` fix).
+**Most of this already exists** in `tests/fixture-golden-gate.sh` (determinism +
+per-arch baseline + escalation message + `--record`). The real remaining wiring:
+- **Hook it into pre-commit.** The gate is currently standalone — `.githooks/
+  pre-commit` does NOT call it. Wire it ahead of the `coherence-gate.sh` call so
+  it actually runs as the cheap front tier whenever the HOTSPOT set is touched
+  (now including renames, post-`ACMR` fix). On front-tier drift, run the real
+  battery rather than blocking.
+- **Multi-arch baselines.** Only `gfx1151` is recorded; the fleet (gfx1100 /
+  gfx1201 / gfx1010) each need `--record` runs committed.
+- *(reference)* The front tier already diffs against committed goldens keyed per
+  `gpu_arch × model_arch`; the matrix (D2) just adds the format axis to the key.
 - **Escalation, not block:** on drift, print which cells drifted and **run the
   real `coherence-gate.sh`** (the 35B *golden*, not the coarse JSON-valid
   check). A drift is never a hard block by itself — that would recreate the
@@ -112,15 +135,16 @@ coverage. The cell set is `{dense, MoE} × {formats}` minus unsupported combos.
 
 ## Phasing
 
-- **P1 — D1:** free-running AR runner + arch dispatch. Land with the existing
-  qwen35 dense fixture; commit its golden. (No gate wiring yet — just the runner
-  + one golden + a unit test that it's stable across two runs.)
-- **P2 — D2/D3:** dense + MoE presets across the format axis; the MoE
-  deterministic-combine pin; regenerate-and-cache script.
-- **P3 — D4:** `tests/tiny-golden.sh` + escalation + rebaseline command; wire
-  into `.githooks/pre-commit` ahead of the `coherence-gate.sh` call.
-- **P4 — capture + commit** the per-arch-family golden set on each dev box in
-  the fleet (gfx1100 / gfx1201 / gfx1010 / gfx1151).
+- **P1 — D1 (AR runner):** ✅ landed (82542fae). `--mode ar` free-running greedy
+  decode; `tf` preserved; validated on gfx1151.
+- **P2 — D2/D3:** extend `fixture-golden-gate.sh` to the format axis (MQ3/Q8/
+  lloyd/MQ6, not just mq4); add the MoE deterministic-combine pin so a long AR
+  tail is stable; a regenerate-and-cache helper.
+- **P3 — D4:** switch the gate to `--mode ar` (longer len) + rebaseline; **wire
+  `fixture-golden-gate.sh` into `.githooks/pre-commit`** ahead of the
+  `coherence-gate.sh` call (it is standalone today).
+- **P4 — capture + commit** the per-arch-family golden set across the fleet
+  (gfx1100 / gfx1201 / gfx1010 — gfx1151 already recorded).
 
 ## Deferred (not in this plan)
 
