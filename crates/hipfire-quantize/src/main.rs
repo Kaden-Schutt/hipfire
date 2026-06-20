@@ -45,6 +45,10 @@ mod ldlq;
 // HFQM `.calib.hfq` Hessian reader (wired for QTIP-LDLQ).
 #[allow(dead_code)]
 mod hessian_io;
+// Retired HFHS-v1 sidecar reader — diagonal-only, to bridge an existing
+// *.hessian.bin into AWQ's in_sum2 (SmoothQuant per-channel stat) for MQ+.
+#[allow(dead_code)]
+mod hfhs_diag;
 // KVarN (Phase D) — variance-normalized 4-bit KV, clean-room CPU core.
 #[allow(dead_code)]
 mod kvarn;
