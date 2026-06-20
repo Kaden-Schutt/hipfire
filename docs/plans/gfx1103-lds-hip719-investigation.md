@@ -1914,6 +1914,20 @@ Latest artifact paths:
   state: the high-end shifted row shape is fail-capable, but staying below the
   per-child launch threshold avoids the fault for at least this 500-total
   envelope.
+- Child-process band controls after the early-boundary cleanup runs
+  (`/tmp/hipfire-lds-direct-ab-childband-pass-artifacts-baa8cec4/`,
+  `/tmp/hipfire-lds-direct-ab-childband-fail-artifacts-baa8cec4/`, and
+  `/tmp/hipfire-lds-direct-ab-childband-bracket-artifacts-baa8cec4/`,
+  throwaway worktree `/tmp/hipfire-lds-direct-ab-childband-current-baa8cec4`,
+  commit `baa8cec4`) clarify the process-exit claim. A split `40,40` passed
+  cleanly with the same selected normalized ISA hash `bb1a56b38225028e` and no
+  devcoredump. A split `20,480` passed the first child, then failed in the
+  second child at local sync 376 with the canonical GFXHUB/GDS signature. A
+  follow-up `20,376` after that failure also failed in the second child at
+  local sync 374, so treat that row as reset-pressure-sensitive rather than an
+  exact threshold. The key distinction is still useful: process exit clears the
+  low same-process early-boundary band around global 43-46, but an oversized
+  next child can still hit its own higher child-local launch threshold.
 - Same-process phase split control
   (`/tmp/hipfire-lds-direct-ab-phase-split-artifacts/`, same throwaway
   worktree) shows that an in-process phase boundary is not enough. Running the
@@ -2394,6 +2408,11 @@ Reduction results after extending the standalone HIP GEMM probe:
 - The matching shifted `30x1` plain `same` split at `20+480` failed in phase2
   at local/global `26/46`, so the early reset/API rows are effectively in the
   same threshold band as an ordinary early `hipDeviceSynchronize` boundary.
+- Matching child-process splits show what process exit does and does not buy:
+  `40,40` passes, while `20,480` fails in the second child at local sync `376`.
+  A post-failure `20,376` rerun failed at local `374`, so the child-local
+  threshold remains reset-pressure-sensitive. Process exit clears the low
+  same-process band, but it does not make an oversized child safe.
 - The `11x3` orientation behaves differently near the exact READS=2 edge:
   plain same-process `132+1` passes, while one-child `133` still fails. That
   points at a host phase boundary / final synchronization effect in addition
@@ -2845,6 +2864,7 @@ LDS-only control:
 | direct-AB promoted-source shifted active `31x1` in `34x1` block/layout, reads=2, 448 iters, 512x86 | start=0/1 PASS one-child `500`; start=2 FAIL at sync/global 374; start=3 FAIL at sync/global 179; all use DS=12 and failing rows keep the canonical gfxhub/GDS signature | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5-6 | 0 | 32 |
 | direct-AB promoted-source shifted active `30x1` in `34x1` block/layout, reads=2, 448 iters, 512x86 | start=2 PASS one-child `500`; start=3 FAIL at sync/global 179; start=4 FAIL at sync/global 375; all use DS=12 and failing rows keep the canonical gfxhub/GDS signature | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB promoted-source shifted active `30x1` start=3 in `34x1`, reads=2, 448 iters, 512x86 | same total `500` launches PASS when split across child processes `120,120,120,140`; one-child `500` repeat FAILS at sync/global 179 with identical selected ISA/resource tuple | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
+| direct-AB promoted-source shifted active `30x1` start=3 in `34x1`, child-process band controls, reads=2, 448 iters, 512x86 | `40,40` PASS; `20,480` FAILS in child1 at local sync 376; post-failure `20,376` FAILS in child1 at local sync 374; all use identical selected ISA/resource tuple and failing rows keep canonical devcoredump fields | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB promoted-source shifted active `30x1` start=3 in `34x1`, same-process phase split, reads=2, 448 iters, 512x86 | phase1 `120` + boundary `hipDeviceSynchronize` + phase2 `380` FAILS in phase2 at local sync 61 / global 181 with identical selected ISA/resource tuple | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB promoted-source shifted active `30x1` start=3 in `34x1`, same-process early phase split, reads=2, 448 iters, 512x86 | phase1 `20` + boundary `hipDeviceSynchronize` + phase2 `480` FAILS in phase2 at local sync 26 / global 46 with identical selected ISA/resource tuple and canonical devcoredump fields | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB promoted-source shifted active `30x1` start=3 in `34x1`, same-process stream-recreate phase split, reads=2, 448 iters, 512x86 | phase1 `120` + stream destroy/recreate + phase2 `380` FAILS in phase2 at local sync 57 / global 177 with identical selected ISA/resource tuple | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
@@ -2973,9 +2993,11 @@ Best current hypothesis:
 > `20 + 480` makes plain `hipDeviceSynchronize`, `hipDeviceReset()`,
 > `hipDevicePrimaryCtxReset(0)`, and `hipDevicePrimaryCtxRelease(0)` all return
 > success at the boundary, but phase2 still fails at global launch
-> 46/44/45/43 with the same codegen and coredump signature. That keeps process
-> exit as the only cleanup boundary observed to avoid the shifted-row
-> cumulative fault. A lower-risk `96+5`
+> 46/44/45/43 with the same codegen and coredump signature. Child-process band
+> controls refine the process-exit claim: `40,40` passes, while a next child of
+> `480` or reset-pressure `376` launches still fails at its own child-local
+> threshold. Process exit clears the low same-process band only when each child
+> stays below its own edge. A lower-risk `96+5`
 > split makes the parent-state picture cleaner: same-process `96+5` fails after
 > the boundary, same-process `97+4` passes, and exec-parent `96+5` passes in
 > plain and HIP-initialized parent modes across repeats. That points back to
