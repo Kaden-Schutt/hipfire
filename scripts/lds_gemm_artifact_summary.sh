@@ -33,16 +33,17 @@ dmesg_delta_count() {
     local pattern="$1"
     local before="$2"
     local after="$3"
-    local start=1
 
     if [[ ! -r "$after" ]]; then
         echo 0
         return
     fi
-    if [[ -r "$before" ]]; then
-        start="$(( $(wc -l <"$before") + 1 ))"
+    if [[ ! -r "$before" ]]; then
+        rg -c "$pattern" "$after" || true
+        return
     fi
-    awk -v start="$start" 'NR >= start' "$after" | rg -c "$pattern" || true
+    awk 'NR == FNR { seen[$0] = 1; next } !($0 in seen)' "$before" "$after" |
+        rg -c "$pattern" || true
 }
 
 short_sha256() {
