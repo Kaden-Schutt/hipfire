@@ -52,5 +52,8 @@ cat <<'EOF'
 #   this points at runtime/driver/device state.
 # - codegen-metadata-drift: normalized ISA matches, but raw object/disassembly
 #   metadata differs, usually from build path or object metadata noise.
+# - dmesg_sig compares remove-queue/MODE2/GDS dmesg delta counts.
+# - devcore_sig compares gfxhub page-fault, address/status, and GDS/GDS-VM
+#   protection fault fields from captured devcoredumps.
 # - same: summary rows match on the fields the comparator tracks.
 EOF

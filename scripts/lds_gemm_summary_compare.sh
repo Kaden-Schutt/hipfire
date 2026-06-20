@@ -46,6 +46,17 @@ function code_same(k) {
     }
     return same(left[k, "amdgpu_isa_sha256"], right[k, "amdgpu_isa_sha256"]);
 }
+function dmesg_sig(side, k) {
+    return side[k, "dmesg_remove_queue"] "/" side[k, "dmesg_mode2"] "/" side[k, "dmesg_gds"];
+}
+function devcore_sig(side, k) {
+    if (side[k, "devcoredump"] != "1") {
+        return "";
+    }
+    return side[k, "devcore_gfxhub_page_fault"] "/" side[k, "devcore_fault_addr"] "/" \
+        side[k, "devcore_prot_status"] "/" side[k, "devcore_gds_protection_fault"] "/" \
+        side[k, "devcore_gds_vm_protection_fault"];
+}
 function classify(k,    source_same, code_same_result, metadata_same, exit_same, driver_same, hipcc_same, verdict) {
     source_same = same(left[k, "source_sha256"], right[k, "source_sha256"]);
     code_same_result = code_same(k);
@@ -97,10 +108,11 @@ file_no == 2 {
     next;
 }
 END {
-    print "key\tstatus\tverdict\tleft_exit\tright_exit\tleft_sync\tright_sync\tsource\tobj\tisa\tisa_norm\tselected_isa\tdriver\thipcc\tleft_git\tright_git";
+    print "key\tstatus\tverdict\tleft_exit\tright_exit\tleft_sync\tright_sync\tsource\tobj\tisa\tisa_norm\tselected_isa\tdriver\thipcc\tdmesg_sig\tdevcore_sig\tleft_devcore\tright_devcore\tleft_git\tright_git";
     for (k in left_keys) {
         if (!(k in right_keys)) {
-            print k "\tleft-only\tmissing-right\t" left[k, "exit"] "\t\t" left[k, "sync_failure"] "\t\t\t\t\t\t\t\t\t" left[k, "git_commit"] "\t";
+            print k "\tleft-only\tmissing-right\t" left[k, "exit"] "\t\t" left[k, "sync_failure"] "\t\t\t\t\t\t\t\t\t" \
+                dmesg_sig(left, k) "\t\t" devcore_sig(left, k) "\t\t" left[k, "git_commit"] "\t";
             continue;
         }
         verdict = classify(k);
@@ -113,11 +125,15 @@ END {
             same(left[k, "selected_isa_norm_sha256"], right[k, "selected_isa_norm_sha256"]) "\t" \
             same(left[k, "driver"], right[k, "driver"]) "\t" \
             same(left[k, "hipcc"], right[k, "hipcc"]) "\t" \
+            same(dmesg_sig(left, k), dmesg_sig(right, k)) "\t" \
+            same(devcore_sig(left, k), devcore_sig(right, k)) "\t" \
+            devcore_sig(left, k) "\t" devcore_sig(right, k) "\t" \
             left[k, "git_commit"] "\t" right[k, "git_commit"];
     }
     for (k in right_keys) {
         if (!(k in left_keys)) {
-            print k "\tright-only\tmissing-left\t\t" right[k, "exit"] "\t\t" right[k, "sync_failure"] "\t\t\t\t\t\t\t\t\t" right[k, "git_commit"];
+            print k "\tright-only\tmissing-left\t\t" right[k, "exit"] "\t\t" right[k, "sync_failure"] "\t\t\t\t\t\t\t\t\t" \
+                "\t" dmesg_sig(right, k) "\t\t" devcore_sig(right, k) "\t\t" right[k, "git_commit"];
         }
     }
 }

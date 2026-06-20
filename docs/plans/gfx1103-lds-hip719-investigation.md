@@ -154,7 +154,10 @@ The currently promoted standalone GEMM jig lives in the repo:
   artifact summaries. It compares selected-variant ISA hashes first, then whole
   normalized ISA hashes, then raw object/disassembly hashes. It classifies
   differences as source drift, codegen drift, same-codegen runtime difference,
-  same-result environment difference, codegen metadata drift, or same.
+  same-result environment difference, codegen metadata drift, or same. The
+  compare output also includes `dmesg_sig` and `devcore_sig` checks so a second
+  780M run can show whether it hit the same remove-queue/MODE2/GDS dmesg family
+  and the same gfxhub/GDS devcoredump signature.
 - `scripts/lds_gemm_780m_runbook.sh`: command-only runbook printer for the
   second-780M flow: safe build-only preflight, risky repro, optional K-edge
   repro, summary regeneration, and summary comparison.
