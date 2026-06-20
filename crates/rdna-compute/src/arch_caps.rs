@@ -318,6 +318,14 @@ impl ArchCaps {
     pub fn is_rdna3p5(&self) -> bool {
         self.is_rdna3p5
     }
+    /// RDNA3 unified-memory (UMA) class for kernel selection: Phoenix
+    /// (`gfx1103`) plus RDNA3.5 Strix (`gfx115x`). These share system DRAM
+    /// with the CPU, so they prefer register-tiled (no-LDS) kernel bodies
+    /// over LDS staging. NOTE: `gfx1103` is RDNA3 but sits in neither
+    /// `is_rdna3_dgpu` nor `is_rdna3p5`, so it must be folded in explicitly.
+    pub fn is_rdna3_uma(&self) -> bool {
+        self.is_gfx1103 || self.is_rdna3p5
+    }
     pub fn is_rdna4(&self) -> bool {
         self.is_rdna4
     }
@@ -503,6 +511,16 @@ mod tests {
         assert!(caps.is_rdna3());
         assert!(!caps.is_rdna3_dgpu());
         assert!(!caps.is_rdna3p5());
+    }
+
+    #[test]
+    fn rdna3_uma_class_groups_phoenix_and_strix() {
+        // UMA: gfx1103 (Phoenix) + gfx115x (Strix); NOT the dGPUs.
+        assert!(make_caps("gfx1103").is_rdna3_uma());
+        assert!(make_caps("gfx1151").is_rdna3_uma());
+        assert!(make_caps("gfx1150").is_rdna3_uma());
+        assert!(!make_caps("gfx1100").is_rdna3_uma());
+        assert!(!make_caps("gfx1201").is_rdna3_uma());
     }
 
     // ── RDNA4 / CDNA3 / GCN5 tests ────────────────────────────────
