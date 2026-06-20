@@ -20,6 +20,10 @@ use tower_http::cors::{Any, CorsLayer};
 pub fn build_router(state: SharedState) -> Router {
     Router::new()
         .route("/health", get(routes::health::get_health))
+        .route(
+            "/operator/config/schema",
+            get(routes::operator::get_config_schema),
+        )
         .route("/v1/models", get(routes::models::get_models))
         .route(
             "/v1/files",
