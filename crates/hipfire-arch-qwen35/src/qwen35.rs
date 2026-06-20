@@ -13398,7 +13398,14 @@ pub fn forward_prefill_batch_with_pbs_opts(
         // When per-token hidden output is also requested, extract post-norm
         // hidden row-by-row into the caller's buffer.
         let dim = config.dim;
+        let last_idx = tokens.len().saturating_sub(1);
         for (i, &tok) in tokens.iter().enumerate() {
+            // lm_head (vocab-wide logits) only matters for the FINAL prefill
+            // token — earlier prompt tokens' logits are never read. Computing it
+            // every token was ~37% of prefill time on gfx1103 (rocprof). Skip
+            // lm_head for all non-final tokens via the no-logits forward; the
+            // last token still gets full logits in scratch.logits.
+            let skip_logits = needs_last_token_logits && i != last_idx;
             if let Some(rb) = hidden_rb.as_mut() {
                 forward_scratch_with_hidden(
                     gpu,
@@ -13411,7 +13418,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
                     scratch,
                     rb,
                 )?;
-            } else if per_token_hidden_out.is_some() && !needs_last_token_logits {
+            } else if (per_token_hidden_out.is_some() && !needs_last_token_logits) || skip_logits {
                 forward_scratch_no_logits(
                     gpu,
                     weights,
@@ -22537,7 +22544,16 @@ fn forward_scratch_layers(
     let rq_hand_optin = !weights.rq_corrections.is_empty()
         && std::env::var("HIPFIRE_RQ_HAND").as_deref() == Ok("1");
     if forward_lowered_enabled() && hidden_rb.is_none() && !rq_hand_optin {
-        return forward_scratch_layers_lowered(gpu, weights, config, pos, kv_cache, dn_state, s);
+        return forward_scratch_layers_lowered(
+            gpu,
+            weights,
+            config,
+            pos,
+            kv_cache,
+            dn_state,
+            s,
+            needs_last_token_logits,
+        );
     }
 
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -26824,6 +26840,7 @@ fn forward_scratch_layers_lowered(
     kv_cache: &mut llama::KvCache,
     dn_state: &DeltaNetState,
     s: &Qwen35Scratch,
+    needs_logits: bool,
 ) -> HipResult<()> {
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
@@ -26863,9 +26880,13 @@ fn forward_scratch_layers_lowered(
         dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "pertoken");
     }
 
-    // Final norm + logits into scratch.logits (mirrors forward_scratch_layers).
+    // Final norm always (cheap; populates s.tmp, the hidden some callers read).
+    // lm_head (vocab-wide gemv) only when logits are needed — in prefill only the
+    // FINAL token needs them, so non-final tokens skip this (~37% of prefill on
+    // gfx1103 per rocprof). Without this, the lowered path ignored the caller's
+    // no-logits request and computed lm_head every token.
     gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
-    {
+    if needs_logits {
         let ctx = DispatchCtx::new(gpu);
         let wr = weights.output.dispatch_ref();
         let step = Step::Gemv {
