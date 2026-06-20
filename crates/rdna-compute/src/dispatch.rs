@@ -45138,6 +45138,66 @@ impl Gpu {
         }
     }
 
+    /// Opus Quant W4A4 core: grouped signed-INT4 × INT4 GEMM with per-group scale
+    /// rescale in the f32 epilogue. `w_i4` [M,K/2] + `w_scales` [M,K/group] (f32),
+    /// `x_i4` [B,K/2] + `x_scales` [B,K/group] (f32), `y_f32` [B,M]. Requires
+    /// `k % group == 0` and `group % 16 == 0`. gfx1103 wave32, zero LDS.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq4_grouped_wmma(
+        &mut self,
+        w_i4: &GpuTensor,
+        w_scales: &GpuTensor,
+        x_i4: &GpuTensor,
+        x_scales: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(k % group, 0, "gemm_oq4_grouped_wmma: K must be a multiple of group");
+        assert_eq!(group % 16, 0, "gemm_oq4_grouped_wmma: group must be a multiple of 16");
+        self.ensure_kernel(
+            "gemm_oq4_grouped_wmma",
+            kernels::GEMM_OQ4_GROUPED_WMMA_SRC,
+            "gemm_oq4_grouped_wmma",
+        )?;
+        let wp = w_i4.buf.as_ptr();
+        let wsp = w_scales.buf.as_ptr();
+        let xp = x_i4.buf.as_ptr();
+        let xsp = x_scales.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &wsp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &xsp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        let grid_m = ((m + 15) / 16) as u32;
+        let grid_b = ((batch_size + 15) / 16) as u32;
+        let func = &self.functions["gemm_oq4_grouped_wmma"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_m, grid_b, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Generic kernel library: WMMA GEMM, signed INT8 inputs → INT32 output.
     /// `a_i8` [M,K], `x_i8` [B,K] (int8), `y_i32` [B,M] (int32).
     /// gfx1103/RDNA3 wave32, zero LDS. Requires `k % 16 == 0` and wave32 WMMA.

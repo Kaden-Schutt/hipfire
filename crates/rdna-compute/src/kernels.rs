@@ -3710,6 +3710,12 @@ pub const GEMM_IU8_I32_WMMA_SRC: &str =
 pub const GEMM_IU4_I32_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_iu4_i32_wmma.hip");
 
+/// Opus Quant W4A4 core: grouped signed-INT4 × INT4 GEMM with per-group scale
+/// rescale in the f32 epilogue (productionizes the host-tiled E5 recipe).
+/// gfx1103 wave32, zero LDS. See `kernels/src/gemm_oq4_grouped_wmma.hip`.
+pub const GEMM_OQ4_GROUPED_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq4_grouped_wmma.hip");
+
 // Generic kernel library GEMV tier (gfx1103 wave32, zero LDS, wave-shuffle
 // reduction; one wave per output row). Same-dtype weight/vector inputs.
 // See `docs/kernels/generic-kernel-library.md`.
