@@ -12,7 +12,7 @@
 //! on top: `generate_mtp` (MTP head), `generate_dflash` (DFlash diffusion
 //! drafter + DDTree), and `generate_multi` (multi-GPU pipeline-parallel).
 //! Extracted verbatim from the former `main.rs` monolith (no behavior change);
-//! items called from `main.rs` are `pub(crate)`.
+//! items called from `main.rs` are `pub`.
 
 use std::io::Write;
 use std::path::Path;
@@ -30,16 +30,18 @@ use hipfire_runtime::llama;
 use hipfire_runtime::sampler;
 
 use crate::events::{emit_committed_event, emit_filter_action, write_error};
+use crate::evidence::{
+    write_daemon_moe_router_evidence, write_daemon_runtime_oneshot_evidence,
+    DaemonMoeRouterHistogramGuard,
+};
 #[cfg(feature = "arch-lfm2moe")]
 use crate::generate_arch::generate_lfm2moe;
 use crate::generate_arch::{generate_deepseek4, generate_minimax, generate_qwen2};
 use crate::model::{effective_raw, LoadedModel};
+use crate::output_filter::chat_output_filter;
 use crate::output_filter::{chat_output_filter_from_profile, loop_guard_from_runtime_config};
+use crate::request::ThinkMode;
 use crate::session::{qwen35_restore_or_error, Qwen35RequestSessionState};
-use crate::{
-    chat_output_filter, write_daemon_moe_router_evidence, write_daemon_runtime_oneshot_evidence,
-    DaemonMoeRouterHistogramGuard, ThinkMode,
-};
 
 /// MTP (Multi-Token Prediction) spec-decode generate path for Qwen3.5/3.6.
 ///
@@ -52,7 +54,7 @@ use crate::{
 /// `m.model_path` per request and freed at function end (cache-on-slot is a
 /// future optimization).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn generate_mtp(
+pub fn generate_mtp(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     stdout: &mut std::io::Stdout,
@@ -472,7 +474,7 @@ pub(crate) fn generate_mtp(
 /// a time. With DDTree enabled it uses the tree-verify path instead of the
 /// linear chain. Single-turn: resets target state at entry (stateless
 /// chat-completions contract).
-pub(crate) fn generate_dflash(
+pub fn generate_dflash(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     stdout: &mut std::io::Stdout,
@@ -1150,7 +1152,7 @@ pub(crate) fn generate_dflash(
 /// `Gpus` orchestrator + `Qwen35ScratchSet` through prefill and the per-token
 /// decode loop, streaming tokens. Single-session; DFlash/MTP/CASK/VL are refused
 /// into this path at load time.
-pub(crate) fn generate_multi(
+pub fn generate_multi(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>,
@@ -1817,7 +1819,7 @@ pub(crate) fn generate_multi(
 /// Delegates to the spec-decode fast paths ([`generate_mtp`], [`generate_dflash`],
 /// [`generate_multi`]) and to the non-qwen35 arch paths ([`generate_deepseek4`]
 /// etc.) when the loaded model calls for them.
-pub(crate) fn generate(
+pub fn generate(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     drafter_gpu: Option<&mut rdna_compute::Gpu>,
@@ -2254,7 +2256,7 @@ pub(crate) fn generate(
     //   - bypass (non-Off, drafter loaded): alpha + bypass_reason
     //   - nothing: empty string so backwards-compatible clients see the
     //     original done shape
-    pub(crate) fn pflash_done_fragment(
+    pub fn pflash_done_fragment(
         s: &Option<hipfire_arch_qwen35::pflash::CompressedPrompt>,
         bypass_reason: &Option<String>,
         alpha: Option<f32>,

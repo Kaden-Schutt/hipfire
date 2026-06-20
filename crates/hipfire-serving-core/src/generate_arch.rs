@@ -9,7 +9,7 @@
 //! sample/stream loop against that arch's `forward_step`/`decode_step`. The
 //! qwen35 AR/DFlash/MTP paths and the shared `generate` dispatcher stay in
 //! `main.rs` for now. Extracted verbatim from the former `main.rs` monolith (no
-//! behavior change); items called from `main.rs` are `pub(crate)`.
+//! behavior change); items called from `main.rs` are `pub`.
 
 use std::io::Write;
 use std::time::Instant;
@@ -23,13 +23,13 @@ use hipfire_prompt as prompt_frame;
 
 use crate::events::{emit_committed_event, emit_error_with_id, emit_stream_event};
 use crate::model::{effective_raw, LoadedModel};
-use crate::ThinkMode;
+use crate::request::ThinkMode;
 
 /// DeepSeek V4 Flash generate path: prefill via the batched scratch, then a
 /// per-token decode loop that parses the model's DSML stream into
 /// token/reasoning/tool-call events ([`emit_stream_event`]). Honors think-mode
 /// and the optional MTP spec-decode head.
-pub(crate) fn generate_deepseek4(
+pub fn generate_deepseek4(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     stdout: &mut std::io::Stdout,
@@ -1092,7 +1092,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
 /// llama path uses.
 /// Qwen2 generate path: per-token prefill + greedy/sampled decode over
 /// `qwen2::forward_step`, streaming `token`/`done` events.
-pub(crate) fn generate_qwen2(
+pub fn generate_qwen2(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     stdout: &mut std::io::Stdout,
@@ -1263,7 +1263,7 @@ pub(crate) fn generate_qwen2(
 #[allow(clippy::too_many_arguments)]
 /// MiniMax-M2 generate path: per-token prefill + decode over
 /// `minimax::forward::decode_step` (Mixtral-style MoE), streaming events.
-pub(crate) fn generate_minimax(
+pub fn generate_minimax(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     stdout: &mut std::io::Stdout,
@@ -1535,7 +1535,7 @@ pub(crate) fn generate_minimax(
 /// LFM2.5-MoE generate path: per-token prefill + decode over the hybrid
 /// conv/attention + top-4 MoE `lfm2moe` forward, streaming events. Gated on the
 /// `arch-lfm2moe` feature.
-pub(crate) fn generate_lfm2moe(
+pub fn generate_lfm2moe(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     stdout: &mut std::io::Stdout,

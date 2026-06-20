@@ -64,27 +64,19 @@ use dummy::{
     emit_dummy_generate_batch_prefill_ready, run_generate_batch_prefill_dummy, DummyModelState,
 };
 use events::{emit_error_with_id, write_error, MAX_BASE64_ENCODED_LEN};
-use evidence::{
-    write_daemon_moe_router_evidence, write_daemon_runtime_oneshot_evidence,
-    DaemonMoeRouterHistogramGuard,
-};
+use generate::*;
 use generate_vl::{generate_vl, generate_vl_dots_ocr};
 use hipfire_serving_core::{
-    dummy, events, evidence, generate_vl, load, model, output_filter, qwen35_decode,
+    dummy, events, generate, generate_vl, load, model, output_filter, qwen35_decode,
     qwen35_prefill, request, session,
 };
 use load::*;
 use model::{CaskConfig, LoadedModel, RAW_OVERRIDE};
-use output_filter::{
-    chat_output_filter, normalize_daemon_prompt, normalize_request_stop_sequences,
-};
+use output_filter::{normalize_daemon_prompt, normalize_request_stop_sequences};
 use qwen35_decode::*;
 use qwen35_prefill::*;
 use request::ThinkMode;
 use session::*;
-mod generate;
-mod generate_arch;
-use generate::*;
 
 /// Acquire a machine-wide exclusive lock on ~/.hipfire/daemon.pid.
 ///

@@ -18,6 +18,8 @@
 pub mod dummy;
 pub mod events;
 pub mod evidence;
+pub mod generate;
+pub mod generate_arch;
 pub mod generate_vl;
 pub mod load;
 pub mod memory;
