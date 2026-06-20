@@ -229,7 +229,7 @@ first_devcoredump() {
     find "$dir/coredumps" -maxdepth 1 -type f -name '*.data' 2>/dev/null | sort | head -1 || true
 }
 
-printf 'artifact\tactive\tblock\treads\titers\tchunks\tmode\tgrid\tarch\tbuild_only\texit\tsync_failure\thip_error\tdriver\tgpu\thipcc\tsource_sha256\tamdgpu_obj_sha256\tamdgpu_isa_sha256\tamdgpu_isa_norm_sha256\tgroup_segment\tprivate_segment\tsgpr\tvgpr\twavefront\tdmesg_remove_queue\tdmesg_mode2\tdmesg_gds\tdevcoredump\tdevcore_file\tdevcore_gfxhub_page_fault\tdevcore_fault_addr\tdevcore_prot_status\tdevcore_gcvm_flags\tdevcore_gcvm_cid\tdevcore_gcvm_rw\tdevcore_gcvm_vmid\tdevcore_gds_protection_fault\tdevcore_gds_flags\tdevcore_gds_addr\tdevcore_gds_vm_protection_fault\tdevcore_gds_vm_flags\tdevcore_gds_vm_vmid\tdevcore_gds_vm_addr\tisa_s_barrier\tisa_ds\tisa_s_waitcnt\tisa_s_cbranch\tisa_ds_store_offset1\tlayout\n' >"$TSV"
+printf 'artifact\tactive\tblock\treads\titers\tchunks\tmode\tgrid\tarch\tbuild_only\texit\tsync_failure\thip_error\tdriver\tgpu\thipcc\tsource_sha256\tamdgpu_obj_sha256\tamdgpu_isa_sha256\tamdgpu_isa_norm_sha256\tgroup_segment\tprivate_segment\tsgpr\tvgpr\twavefront\tdmesg_remove_queue\tdmesg_mode2\tdmesg_gds\tdevcoredump\tdevcore_file\tdevcore_gfxhub_page_fault\tdevcore_fault_addr\tdevcore_prot_status\tdevcore_gcvm_flags\tdevcore_gcvm_cid\tdevcore_gcvm_rw\tdevcore_gcvm_vmid\tdevcore_gds_protection_fault\tdevcore_gds_flags\tdevcore_gds_addr\tdevcore_gds_vm_protection_fault\tdevcore_gds_vm_flags\tdevcore_gds_vm_vmid\tdevcore_gds_vm_addr\tisa_s_barrier\tisa_ds\tisa_s_waitcnt\tisa_s_cbranch\tisa_ds_store_offset1\tlayout\tactive_start\tforce_wrap_cndmask\n' >"$TSV"
 
 while IFS= read -r meta; do
     dir="$(dirname "$meta")"
@@ -242,6 +242,8 @@ while IFS= read -r meta; do
     dmesg_after="$dir/dmesg.after.txt"
 
     active="$(meta_value active "$meta" | sanitize)"
+    active_start="$(meta_value active_start "$meta" | sanitize)"
+    [[ -n "$active_start" ]] || active_start="0 x 0"
     block="$(meta_value block "$meta" | sanitize)"
     layout="$(meta_value layout "$meta" | sanitize)"
     [[ -n "$layout" ]] || layout="$active"
@@ -249,6 +251,8 @@ while IFS= read -r meta; do
     iters="$(meta_value iters "$meta" | sanitize)"
     chunks="$(meta_value chunks "$meta" | sanitize)"
     mode="$(meta_value mode "$meta" | sanitize)"
+    force_wrap_cndmask="$(meta_value force_wrap_cndmask "$meta" | sanitize)"
+    [[ -n "$force_wrap_cndmask" ]] || force_wrap_cndmask=0
     grid="$(meta_value grid "$meta" | sanitize)"
     arch="$(meta_value arch "$meta" | sanitize)"
     build_only="$(meta_value build_only "$meta" | sanitize)"
@@ -309,7 +313,7 @@ while IFS= read -r meta; do
     devcore_gds_vm_vmid="$(gds_vm_fault_vmid "$devcore_gds_vm_pf")"
     devcore_gds_vm_addr="$(gds_vm_fault_addr "$devcore_gds_vm_pf")"
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$rel" "$active" "$block" "$reads" "$iters" "$chunks" "$mode" "$grid" \
         "$arch" "$build_only" "$exit_code" "$sync_failure" "$hip_error" \
         "$driver" "$gpu" "$hipcc" "$source_sha" "$amdgpu_obj_sha" \
@@ -322,7 +326,7 @@ while IFS= read -r meta; do
         "$devcore_gds_addr" "$devcore_gds_vm_pf" "$devcore_gds_vm_flags" \
         "$devcore_gds_vm_vmid" "$devcore_gds_vm_addr" "$isa_s_barrier" \
         "$isa_ds" "$isa_s_waitcnt" "$isa_s_cbranch" "$isa_ds_offset1" \
-        "$layout" >>"$TSV"
+        "$layout" "$active_start" "$force_wrap_cndmask" >>"$TSV"
 done < <(find "$ROOT" -type f -name meta.txt | sort)
 
 {
@@ -332,15 +336,17 @@ done < <(find "$ROOT" -type f -name meta.txt | sort)
     echo "- generated: \`$(date -u +%Y-%m-%dT%H:%M:%SZ)\`"
     echo "- tsv: \`$TSV\`"
     echo
-    echo "| artifact | exit | active | layout | reads | iters | chunks | grid | obj | isa_norm | sgpr | vgpr | barrier | ds | wait | branch | offset1 | dmesg | devcore | gcvm | gds | sync |"
-    echo "|---|---:|---|---|---:|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---|---|---:|---|---|---|"
+    echo "| artifact | exit | active | start | layout | wrap | reads | iters | chunks | grid | obj | isa_norm | sgpr | vgpr | barrier | ds | wait | branch | offset1 | dmesg | devcore | gcvm | gds | sync |"
+    echo "|---|---:|---|---|---|---:|---:|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---|---|---:|---|---|---|"
     awk -F '\t' 'NR > 1 {
         sync_failure = ($12 == "") ? " " : $12;
         dmesg = "rq=" $26 ",mode2=" $27 ",gds=" $28;
         gds = $38 "/" $41;
         layout = ($50 == "") ? $2 : $50;
-        printf "| `%s` | `%s` | `%s` | `%s` | %s | %s | `%s` | `%s` | `%s` | `%s` | %s | %s | %s | %s | %s | %s | `%s` | `%s` | %s | `%s` | `%s` | %s |\n", \
-            $1, $11, $2, layout, $4, $5, $6, $8, $18, $20, $23, $24, $45, $46, $47, $48, $49, dmesg, $29, $34, gds, sync_failure;
+        active_start = ($51 == "") ? "0 x 0" : $51;
+        force_wrap = ($52 == "") ? 0 : $52;
+        printf "| `%s` | `%s` | `%s` | `%s` | `%s` | %s | %s | %s | `%s` | `%s` | `%s` | `%s` | %s | %s | %s | %s | %s | %s | `%s` | `%s` | %s | `%s` | `%s` | %s |\n", \
+            $1, $11, $2, active_start, layout, force_wrap, $4, $5, $6, $8, $18, $20, $23, $24, $45, $46, $47, $48, $49, dmesg, $29, $34, gds, sync_failure;
     }' "$TSV"
 } >"$MD"
 

@@ -13,6 +13,14 @@
 #define ACTIVE_Y 6
 #endif
 
+#ifndef ACTIVE_X_START
+#define ACTIVE_X_START 0
+#endif
+
+#ifndef ACTIVE_Y_START
+#define ACTIVE_Y_START 0
+#endif
+
 #ifndef BLOCK_X
 #define BLOCK_X ACTIVE_X
 #endif
@@ -41,7 +49,12 @@
 #define PRE_SYNC_EACH_LAUNCH 0
 #endif
 
-#if ACTIVE_X == BLOCK_X && ACTIVE_Y == BLOCK_Y
+#ifndef FORCE_WRAP_CNDMASK
+#define FORCE_WRAP_CNDMASK 0
+#endif
+
+#if ACTIVE_X_START == 0 && ACTIVE_Y_START == 0 && \
+    ACTIVE_X == BLOCK_X && ACTIVE_Y == BLOCK_Y
 #define ALL_LANES_ACTIVE 1
 #else
 #define ALL_LANES_ACTIVE 0
@@ -50,6 +63,16 @@
 __global__ void lds_direct_ab_phase_probe() {
     static_assert(ACTIVE_X <= BLOCK_X, "ACTIVE_X must fit inside BLOCK_X");
     static_assert(ACTIVE_Y <= BLOCK_Y, "ACTIVE_Y must fit inside BLOCK_Y");
+    static_assert(ACTIVE_X_START >= 0, "ACTIVE_X_START must be non-negative");
+    static_assert(ACTIVE_Y_START >= 0, "ACTIVE_Y_START must be non-negative");
+    static_assert(ACTIVE_X_START + ACTIVE_X <= BLOCK_X,
+                  "ACTIVE_X range must fit inside BLOCK_X");
+    static_assert(ACTIVE_Y_START + ACTIVE_Y <= BLOCK_Y,
+                  "ACTIVE_Y range must fit inside BLOCK_Y");
+    static_assert(ACTIVE_X_START + ACTIVE_X <= LAYOUT_X,
+                  "ACTIVE_X range must fit inside LAYOUT_X");
+    static_assert(ACTIVE_Y_START + ACTIVE_Y <= LAYOUT_Y,
+                  "ACTIVE_Y range must fit inside LAYOUT_Y");
     static_assert(ACTIVE_X <= LAYOUT_X, "ACTIVE_X must fit inside LAYOUT_X");
     static_assert(ACTIVE_Y <= LAYOUT_Y, "ACTIVE_Y must fit inside LAYOUT_Y");
 
@@ -61,7 +84,9 @@ __global__ void lds_direct_ab_phase_probe() {
 #if ALL_LANES_ACTIVE
     const bool active = true;
 #else
-    const bool active = tx < ACTIVE_X && ty < ACTIVE_Y;
+    const bool active =
+        tx >= ACTIVE_X_START && tx < ACTIVE_X_START + ACTIVE_X &&
+        ty >= ACTIVE_Y_START && ty < ACTIVE_Y_START + ACTIVE_Y;
 #endif
     float sum = 0.0f;
 
@@ -77,10 +102,27 @@ __global__ void lds_direct_ab_phase_probe() {
         if (active) {
 #pragma unroll
             for (int kk = 0; kk < READS; ++kk) {
-                const int ax = (tx + kk) % ACTIVE_X;
+#if FORCE_WRAP_CNDMASK
+                static_assert(READS <= 2,
+                              "FORCE_WRAP_CNDMASK is only valid for READS<=2");
+                const int ax_raw = tx + kk;
+                const int ax =
+                    ax_raw == ACTIVE_X_START + ACTIVE_X ? ACTIVE_X_START
+                                                        : ax_raw;
                 const int ay = ty;
                 const int bx = tx;
-                const int by = (ty + kk) % ACTIVE_Y;
+                const int by_raw = ty + kk;
+                const int by =
+                    by_raw == ACTIVE_Y_START + ACTIVE_Y ? ACTIVE_Y_START
+                                                        : by_raw;
+#else
+                const int ax =
+                    ACTIVE_X_START + ((tx - ACTIVE_X_START + kk) % ACTIVE_X);
+                const int ay = ty;
+                const int bx = tx;
+                const int by =
+                    ACTIVE_Y_START + ((ty - ACTIVE_Y_START + kk) % ACTIVE_Y);
+#endif
                 sum += A[ay][ax] * B[by][bx] * static_cast<float>(kk + 1);
             }
         }

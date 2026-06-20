@@ -40,8 +40,17 @@ function key(row) {
     if (row["layout"] != "" && row["layout"] != row["active"]) {
         layout = "|layout=" row["layout"];
     }
+    active_start = "";
+    if (row["active_start"] != "" && row["active_start"] != "0 x 0") {
+        active_start = "|start=" row["active_start"];
+    }
+    force_wrap = "";
+    if (row["force_wrap_cndmask"] != "" && row["force_wrap_cndmask"] != "0") {
+        force_wrap = "|wrapcnd=" row["force_wrap_cndmask"];
+    }
     return row["active"] "|" row["block"] "|" row["reads"] "|" row["iters"] "|" \
-        row["chunks"] "|" row["mode"] "|" row["grid"] "|" row["arch"] layout;
+        row["chunks"] "|" row["mode"] "|" row["grid"] "|" row["arch"] \
+        layout active_start force_wrap;
 }
 function load_row(dst,    i) {
     for (i in col) {

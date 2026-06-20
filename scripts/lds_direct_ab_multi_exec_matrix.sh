@@ -7,6 +7,8 @@ SUMMARY="${SUMMARY:-$ROOT/lds_direct_ab_artifact_summary.sh}"
 BUILD_ONLY="${BUILD_ONLY:-1}"
 ACTIVE_X="${ACTIVE_X:-6}"
 ACTIVE_Y="${ACTIVE_Y:-6}"
+ACTIVE_X_START="${ACTIVE_X_START:-0}"
+ACTIVE_Y_START="${ACTIVE_Y_START:-0}"
 BLOCK_X="${BLOCK_X:-$ACTIVE_X}"
 BLOCK_Y="${BLOCK_Y:-$ACTIVE_Y}"
 LAYOUT_X="${LAYOUT_X:-$ACTIVE_X}"
@@ -18,6 +20,7 @@ GRID_X="${GRID_X:-512}"
 GRID_Y="${GRID_Y:-86}"
 MODE="${MODE:-plain}"
 PRE_SYNC_EACH_LAUNCH="${PRE_SYNC_EACH_LAUNCH:-0}"
+FORCE_WRAP_CNDMASK="${FORCE_WRAP_CNDMASK:-0}"
 ARCH="${ARCH:-gfx1103}"
 HIPCC="${HIPCC:-/opt/rocm/bin/hipcc}"
 ROCMINFO="${ROCMINFO:-/opt/rocm/bin/rocminfo}"
@@ -31,6 +34,12 @@ tag_chunks="${CHUNKS//,/_}"
 tag_extra=""
 if [ "$PRE_SYNC_EACH_LAUNCH" != "0" ]; then
   tag_extra="_presync${PRE_SYNC_EACH_LAUNCH}"
+fi
+if [ "$FORCE_WRAP_CNDMASK" != "0" ]; then
+  tag_extra="${tag_extra}_wrapcnd${FORCE_WRAP_CNDMASK}"
+fi
+if [ "$ACTIVE_X_START" != "0" ] || [ "$ACTIVE_Y_START" != "0" ]; then
+  tag_extra="${tag_extra}_start${ACTIVE_X_START}x${ACTIVE_Y_START}"
 fi
 tag="a${ACTIVE_X}x${ACTIVE_Y}_b${BLOCK_X}x${BLOCK_Y}_l${LAYOUT_X}x${LAYOUT_Y}_r${READS}_i${ITERS}_chunks${tag_chunks}_multi_${MODE}${tag_extra}_g${GRID_X}x${GRID_Y}"
 dest="$OUT/$tag"
@@ -60,6 +69,7 @@ start_since="$(date -u '+%Y-%m-%d %H:%M:%S')"
 
 {
   echo "active=$ACTIVE_X x $ACTIVE_Y"
+  echo "active_start=$ACTIVE_X_START x $ACTIVE_Y_START"
   echo "block=$BLOCK_X x $BLOCK_Y"
   echo "layout=$LAYOUT_X x $LAYOUT_Y"
   echo "reads=$READS"
@@ -70,6 +80,7 @@ start_since="$(date -u '+%Y-%m-%d %H:%M:%S')"
   echo "chunks=$CHUNKS"
   echo "mode=$MODE"
   echo "pre_sync_each_launch=$PRE_SYNC_EACH_LAUNCH"
+  echo "force_wrap_cndmask=$FORCE_WRAP_CNDMASK"
   echo "grid=$GRID_X x $GRID_Y"
   echo "arch=$ARCH"
   echo "build_only=$BUILD_ONLY"
@@ -89,10 +100,12 @@ cp "$ROOT/lds_direct_ab_multi_exec_parent.cpp" "$dest/lds_direct_ab_multi_exec_p
   cd "$dest"
   "$HIPCC" -O3 --offload-arch="$ARCH" -save-temps=obj \
     -DACTIVE_X="$ACTIVE_X" -DACTIVE_Y="$ACTIVE_Y" \
+    -DACTIVE_X_START="$ACTIVE_X_START" -DACTIVE_Y_START="$ACTIVE_Y_START" \
     -DBLOCK_X="$BLOCK_X" -DBLOCK_Y="$BLOCK_Y" \
     -DLAYOUT_X="$LAYOUT_X" -DLAYOUT_Y="$LAYOUT_Y" \
     -DREADS="$READS" -DITERS="$ITERS" \
     -DPRE_SYNC_EACH_LAUNCH="$PRE_SYNC_EACH_LAUNCH" \
+    -DFORCE_WRAP_CNDMASK="$FORCE_WRAP_CNDMASK" \
     "$ROOT/lds_direct_ab_phase_probe.hip" \
     -lhsa-runtime64 \
     -o "$dest/lds_direct_ab_phase_probe" > "$dest/build-phase.log" 2>&1

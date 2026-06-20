@@ -32,6 +32,10 @@ Environment:
   ARCH=$ARCH
   HIPCC=/opt/rocm/bin/hipcc
   WAIT_DEVCD_MS=12000
+
+Artifacts:
+  OUT/direct-ab-artifact-summary.tsv is the file to send back for comparison.
+  Use --compare local.tsv other-780m.tsv to classify codegen/runtime drift.
 EOF
 }
 
@@ -108,6 +112,13 @@ print_reference() {
 #   active=1x34 block/layout=1x34 reads=2 iters=448 chunks=130 grid=512x86 exit=4
 #   active=17x2 block/layout=17x2 reads=2 iters=448 chunks=130 grid=512x86 exit=4
 #   active=2x17 block/layout=2x17 reads=2 iters=448 chunks=130 grid=512x86 exit=4
+# READS=2 narrowed 34-layout controls observed locally:
+#   active=30x1 start=0x0 block/layout=34x1 reads=2 iters=448 chunks=500 grid=512x86 exit=0
+#   active=31x1 start=0x0 block/layout=34x1 reads=2 iters=448 chunks=500 grid=512x86 exit=4
+#   active=31x1 start=1x0 block/layout=34x1 reads=2 iters=448 chunks=500 grid=512x86 exit=0
+#   active=31x1 start=2x0 block/layout=34x1 reads=2 iters=448 chunks=500 grid=512x86 exit=4
+#   active=1x32 start=0x0 block/layout=1x34 reads=2 iters=448 chunks=500 grid=512x86 force_wrap=0 exit=4
+#   active=1x32 start=0x0 block/layout=1x34 reads=2 iters=448 chunks=500 grid=512x86 force_wrap=1 exit=0
 EOF
 }
 
@@ -126,6 +137,9 @@ run_case() {
     local chunks="${12}"
     local expected="${13}"
     local build_only="${14}"
+    local active_x_start="${15:-0}"
+    local active_y_start="${16:-0}"
+    local force_wrap_cndmask="${17:-0}"
     local clear_coredump rc match reported_expected
 
     reported_expected="$expected"
@@ -136,7 +150,7 @@ run_case() {
         clear_coredump="${CLEAR_COREDUMP:-1}"
     fi
 
-    echo "[direct-ab-780m] case=$case_name active=${active_x}x${active_y} block=${block_x}x${block_y} layout=${layout_x}x${layout_y} reads=$reads iters=$iters grid=${grid_x}x${grid_y} chunks=$chunks build_only=$build_only expected=$reported_expected out=$OUT" >&2
+    echo "[direct-ab-780m] case=$case_name active=${active_x}x${active_y} start=${active_x_start}x${active_y_start} block=${block_x}x${block_y} layout=${layout_x}x${layout_y} reads=$reads iters=$iters grid=${grid_x}x${grid_y} chunks=$chunks force_wrap=$force_wrap_cndmask build_only=$build_only expected=$reported_expected out=$OUT" >&2
 
     set +e
     ARCH="$ARCH" \
@@ -145,12 +159,15 @@ run_case() {
     WAIT_DEVCD_MS="${WAIT_DEVCD_MS:-12000}" \
     ACTIVE_X="$active_x" \
     ACTIVE_Y="$active_y" \
+    ACTIVE_X_START="$active_x_start" \
+    ACTIVE_Y_START="$active_y_start" \
     BLOCK_X="$block_x" \
     BLOCK_Y="$block_y" \
     LAYOUT_X="$layout_x" \
     LAYOUT_Y="$layout_y" \
     READS="$reads" \
     ITERS="$iters" \
+    FORCE_WRAP_CNDMASK="$force_wrap_cndmask" \
     CHUNKS="$chunks" \
     GRID_X="$grid_x" \
     GRID_Y="$grid_y" \
@@ -168,9 +185,10 @@ run_case() {
         match=1
     fi
 
-    printf '%s\t%sx%s\t%sx%s\t%sx%s\t%s\t%s\t%sx%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%sx%s\t%sx%s\t%sx%s\t%sx%s\t%s\t%s\t%s\t%sx%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$case_name" "$active_x" "$active_y" "$block_x" "$block_y" \
-        "$layout_x" "$layout_y" "$reads" "$iters" "$grid_x" "$grid_y" \
+        "$layout_x" "$layout_y" "$active_x_start" "$active_y_start" \
+        "$force_wrap_cndmask" "$reads" "$iters" "$grid_x" "$grid_y" \
         "$chunks" "$build_only" "$reported_expected" "$rc" "$match" \
         "$OUT/$case_name.wrapper.log" >>"$report"
 
@@ -183,7 +201,7 @@ run_matrix() {
 
     mkdir -p "$OUT"
     report="$OUT/report.tsv"
-    printf 'case\tactive\tblock\tlayout\treads\titers\tgrid\tchunks\tbuild_only\texpected\texit\tmatch\twrapper_log\n' >"$report"
+    printf 'case\tactive\tblock\tlayout\tactive_start\tforce_wrap_cndmask\treads\titers\tgrid\tchunks\tbuild_only\texpected\texit\tmatch\twrapper_log\n' >"$report"
 
     if [[ "$build_only" == "1" ]]; then
         run_case "00-build-8x4-r2-one-child-500" 8 4 8 4 8 4 2 448 512 86 500 pass 1 || failures=$((failures + 1))
@@ -199,6 +217,12 @@ run_matrix() {
         run_case "10-build-1x34-r2-one-child-130" 1 34 1 34 1 34 2 448 512 86 130 fail 1 || failures=$((failures + 1))
         run_case "11-build-17x2-r2-one-child-130" 17 2 17 2 17 2 2 448 512 86 130 fail 1 || failures=$((failures + 1))
         run_case "12-build-2x17-r2-one-child-130" 2 17 2 17 2 17 2 448 512 86 130 fail 1 || failures=$((failures + 1))
+        run_case "13-build-30x1-in-34x1-r2-one-child-500" 30 1 34 1 34 1 2 448 512 86 500 pass 1 || failures=$((failures + 1))
+        run_case "14-build-31x1-in-34x1-r2-one-child-500" 31 1 34 1 34 1 2 448 512 86 500 fail 1 || failures=$((failures + 1))
+        run_case "15-build-31x1-start1-in-34x1-r2-one-child-500" 31 1 34 1 34 1 2 448 512 86 500 pass 1 1 0 || failures=$((failures + 1))
+        run_case "16-build-31x1-start2-in-34x1-r2-one-child-500" 31 1 34 1 34 1 2 448 512 86 500 fail 1 2 0 || failures=$((failures + 1))
+        run_case "17-build-1x32-in-1x34-r2-one-child-500" 1 32 1 34 1 34 2 448 512 86 500 fail 1 || failures=$((failures + 1))
+        run_case "18-build-1x32-in-1x34-r2-wrapcnd-one-child-500" 1 32 1 34 1 34 2 448 512 86 500 pass 1 0 0 1 || failures=$((failures + 1))
     else
         run_case "00-control-8x4-r2-one-child-500" 8 4 8 4 8 4 2 448 512 86 500 pass 0 || failures=$((failures + 1))
         run_case "01-control-32x1-r2-one-child-500" 32 1 32 1 32 1 2 448 512 86 500 pass 0 || failures=$((failures + 1))
@@ -213,6 +237,12 @@ run_matrix() {
         run_case "10-fail-1x34-r2-one-child-130" 1 34 1 34 1 34 2 448 512 86 130 fail 0 || failures=$((failures + 1))
         run_case "11-fail-17x2-r2-one-child-130" 17 2 17 2 17 2 2 448 512 86 130 fail 0 || failures=$((failures + 1))
         run_case "12-fail-2x17-r2-one-child-130" 2 17 2 17 2 17 2 448 512 86 130 fail 0 || failures=$((failures + 1))
+        run_case "13-control-30x1-in-34x1-r2-one-child-500" 30 1 34 1 34 1 2 448 512 86 500 pass 0 || failures=$((failures + 1))
+        run_case "14-fail-31x1-in-34x1-r2-one-child-500" 31 1 34 1 34 1 2 448 512 86 500 fail 0 || failures=$((failures + 1))
+        run_case "15-control-31x1-start1-in-34x1-r2-one-child-500" 31 1 34 1 34 1 2 448 512 86 500 pass 0 1 0 || failures=$((failures + 1))
+        run_case "16-fail-31x1-start2-in-34x1-r2-one-child-500" 31 1 34 1 34 1 2 448 512 86 500 fail 0 2 0 || failures=$((failures + 1))
+        run_case "17-fail-1x32-in-1x34-r2-one-child-500" 1 32 1 34 1 34 2 448 512 86 500 fail 0 || failures=$((failures + 1))
+        run_case "18-control-1x32-in-1x34-r2-wrapcnd-one-child-500" 1 32 1 34 1 34 2 448 512 86 500 pass 0 0 0 1 || failures=$((failures + 1))
     fi
 
     {
