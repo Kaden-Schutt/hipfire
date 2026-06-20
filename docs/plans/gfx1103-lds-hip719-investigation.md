@@ -141,14 +141,15 @@ The currently promoted standalone GEMM jig lives in the repo:
 - `scripts/lds_gemm_artifact_summary.sh`: read-only artifact summarizer for
   cross-machine repro results. It writes TSV and Markdown summaries from
   `meta.txt`, `run.log`, `exit_code.txt`, dmesg deltas, devcoredump presence,
-  saved ISA/readobj files, and short SHA-256 hashes for the captured HIP source,
-  AMDGPU object, raw AMDGPU ISA dump, normalized AMDGPU ISA dump, and the
-  selected variant's normalized ISA section when it can map the variant name to
-  a generated kernel symbol. The normalized whole-ISA hash strips the
-  disassembly file-format line because it embeds the artifact path and otherwise
-  produces false codegen-drift reports. Dmesg deltas are counted with a multiset
-  difference between `dmesg.before.txt` and `dmesg.after.txt`, which handles
-  kernel ring-buffer snapshots while preserving repeated new reset messages.
+  saved ISA/readobj files, key devcoredump fault fields, and short SHA-256
+  hashes for the captured HIP source, AMDGPU object, raw AMDGPU ISA dump,
+  normalized AMDGPU ISA dump, and the selected variant's normalized ISA section
+  when it can map the variant name to a generated kernel symbol. The normalized
+  whole-ISA hash strips the disassembly file-format line because it embeds the
+  artifact path and otherwise produces false codegen-drift reports. Dmesg
+  deltas are counted with a multiset difference between `dmesg.before.txt` and
+  `dmesg.after.txt`, which handles kernel ring-buffer snapshots while
+  preserving repeated new reset messages.
 - `scripts/lds_gemm_summary_compare.sh`: read-only TSV comparator for two
   artifact summaries. It compares selected-variant ISA hashes first, then whole
   normalized ISA hashes, then raw object/disassembly hashes. It classifies
@@ -1540,6 +1541,16 @@ Driver-source mapping from the local amdgpu tree:
   is true in `amd/amdgpu/amdgpu_amdkfd.c`.
 - `Failed to evict queue`, `Failed to evict process queues`, and
   `remove_all_kfd_queues_mes` are KFD queue eviction / MES queue removal paths.
+- In the installed `/usr/src/amdgpu-6.19.0-2307534.24.04` source,
+  `amd/amdgpu/mes_v11_0.c` emits `MES failed to respond to
+  msg=REMOVE_QUEUE` after `amdgpu_fence_wait_polling()` fails or the MES status
+  word is not written. `amd/amdkfd/kfd_device_queue_manager.c` then reports
+  `failed to remove hardware queue from MES`, marks the HWS path hung via
+  `kfd_hws_hang()`, and its eviction/remove-all callers emit the observed
+  `Failed to evict queue` / `remove_all_kfd_queues_mes` messages. On Phoenix's
+  soc21 path, `amd/amdgpu/soc21.c` emits `MODE2 reset`; `amd/amdgpu/amdgpu.h`
+  describes MODE2 as a lower-scope ASIC reset that avoids CPU-shared IPs and
+  memory-controller reset on APUs.
 
 With passwordless sudo, the devcoredump sysfs node can be sampled. The latest
 captured coredump is text-formatted, 64 KiB, and starts with:
