@@ -291,8 +291,16 @@ fn is_selectable_model_file(file: &str) -> bool {
         return false;
     }
     [
-        "-hf4.hfq", "-hf6.hfq", "-mq2.hfq", "-mq3.hfq", "-mq4.hfq", "-mq6.hfq",
-        "-q8.hfq", "-q8f16.hfq", "-hfp4.hfq", "-mfp4.hfq",
+        "-hf4.hfq",
+        "-hf6.hfq",
+        "-mq2.hfq",
+        "-mq3.hfq",
+        "-mq4.hfq",
+        "-mq6.hfq",
+        "-q8.hfq",
+        "-q8f16.hfq",
+        "-hfp4.hfq",
+        "-mfp4.hfq",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -360,6 +368,9 @@ mod tests {
             normalized_file_key("qwen3.5-27b-mq4.dflash.hfq"),
             "qwen3.5-27b-mq4.dflash.hfq"
         );
-        assert_eq!(normalized_file_key("qwen3.5-9b-hf4.hfq"), "qwen3.5-9b-hf4.hfq");
+        assert_eq!(
+            normalized_file_key("qwen3.5-9b-hf4.hfq"),
+            "qwen3.5-9b-hf4.hfq"
+        );
     }
 }
