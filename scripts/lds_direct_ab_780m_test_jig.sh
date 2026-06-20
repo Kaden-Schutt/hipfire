@@ -104,6 +104,8 @@ print_reference() {
 #   active=33x1 block/layout=33x1 reads=2 iters=448 chunks=130 grid=512x86 exit=4
 #   active=1x33 block/layout=1x33 reads=2 iters=448 chunks=140 grid=512x86 exit=0
 #   active=1x33 block/layout=1x33 reads=2 iters=448 chunks=500 grid=512x86 exit=4
+#   active=34x1 block/layout=34x1 reads=2 iters=448 chunks=130 grid=512x86 exit=4
+#   active=1x34 block/layout=1x34 reads=2 iters=448 chunks=130 grid=512x86 exit=4
 #   active=17x2 block/layout=17x2 reads=2 iters=448 chunks=130 grid=512x86 exit=4
 #   active=2x17 block/layout=2x17 reads=2 iters=448 chunks=130 grid=512x86 exit=4
 EOF
@@ -193,8 +195,10 @@ run_matrix() {
         run_case "06-build-33x1-r2-one-child-130" 33 1 33 1 33 1 2 448 512 86 130 fail 1 || failures=$((failures + 1))
         run_case "07-build-1x33-r2-one-child-140" 1 33 1 33 1 33 2 448 512 86 140 pass 1 || failures=$((failures + 1))
         run_case "08-build-1x33-r2-one-child-500" 1 33 1 33 1 33 2 448 512 86 500 fail 1 || failures=$((failures + 1))
-        run_case "09-build-17x2-r2-one-child-130" 17 2 17 2 17 2 2 448 512 86 130 fail 1 || failures=$((failures + 1))
-        run_case "10-build-2x17-r2-one-child-130" 2 17 2 17 2 17 2 448 512 86 130 fail 1 || failures=$((failures + 1))
+        run_case "09-build-34x1-r2-one-child-130" 34 1 34 1 34 1 2 448 512 86 130 fail 1 || failures=$((failures + 1))
+        run_case "10-build-1x34-r2-one-child-130" 1 34 1 34 1 34 2 448 512 86 130 fail 1 || failures=$((failures + 1))
+        run_case "11-build-17x2-r2-one-child-130" 17 2 17 2 17 2 2 448 512 86 130 fail 1 || failures=$((failures + 1))
+        run_case "12-build-2x17-r2-one-child-130" 2 17 2 17 2 17 2 448 512 86 130 fail 1 || failures=$((failures + 1))
     else
         run_case "00-control-8x4-r2-one-child-500" 8 4 8 4 8 4 2 448 512 86 500 pass 0 || failures=$((failures + 1))
         run_case "01-control-32x1-r2-one-child-500" 32 1 32 1 32 1 2 448 512 86 500 pass 0 || failures=$((failures + 1))
@@ -205,8 +209,10 @@ run_matrix() {
         run_case "06-fail-9x4-r2-one-child-140" 9 4 9 4 9 4 2 448 512 86 140 fail 0 || failures=$((failures + 1))
         run_case "07-fail-33x1-r2-one-child-130" 33 1 33 1 33 1 2 448 512 86 130 fail 0 || failures=$((failures + 1))
         run_case "08-fail-1x33-r2-one-child-500" 1 33 1 33 1 33 2 448 512 86 500 fail 0 || failures=$((failures + 1))
-        run_case "09-fail-17x2-r2-one-child-130" 17 2 17 2 17 2 2 448 512 86 130 fail 0 || failures=$((failures + 1))
-        run_case "10-fail-2x17-r2-one-child-130" 2 17 2 17 2 17 2 448 512 86 130 fail 0 || failures=$((failures + 1))
+        run_case "09-fail-34x1-r2-one-child-130" 34 1 34 1 34 1 2 448 512 86 130 fail 0 || failures=$((failures + 1))
+        run_case "10-fail-1x34-r2-one-child-130" 1 34 1 34 1 34 2 448 512 86 130 fail 0 || failures=$((failures + 1))
+        run_case "11-fail-17x2-r2-one-child-130" 17 2 17 2 17 2 2 448 512 86 130 fail 0 || failures=$((failures + 1))
+        run_case "12-fail-2x17-r2-one-child-130" 2 17 2 17 2 17 2 448 512 86 130 fail 0 || failures=$((failures + 1))
     fi
 
     {
