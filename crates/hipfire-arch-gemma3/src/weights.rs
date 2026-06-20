@@ -173,8 +173,19 @@ fn load_embed_tokens(
             let buf = gpu.upload_f32(&f32_data, &[cfg.vocab_size, cfg.hidden_size])?;
             Ok((buf, EmbeddingFormat::F32))
         }
+        16 => {
+            // bf16 source → promote to F32 (bf16 = high 16 bits of f32; there is
+            // no bf16 EmbeddingFormat, and a raw upload tagged otherwise corrupts
+            // the lookup). Mirrors the F16 (type 1) arm.
+            let f32_data: Vec<f32> = data
+                .chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect();
+            let buf = gpu.upload_f32(&f32_data, &[cfg.vocab_size, cfg.hidden_size])?;
+            Ok((buf, EmbeddingFormat::F32))
+        }
         qt => panic!(
-            "gemma3: unsupported embedding quant_type {qt}; handled 1/3/6/7. \
+            "gemma3: unsupported embedding quant_type {qt}; handled 1/3/6/7/16. \
              Extend load_embed_tokens."
         ),
     }
@@ -216,7 +227,16 @@ fn load_lm_head(
                 .collect();
             weight_tensor(gpu.upload_f32(&f32_data, &[m, k])?, DType::F32, m, k)
         }
-        qt => panic!("gemma3: unsupported lm_head quant_type {qt}; handled 1/3/6/7."),
+        16 => {
+            // bf16 → F32 (mirrors the F16 arm; bf16 = high 16 bits of f32).
+            let _ = embd_format;
+            let f32_data: Vec<f32> = data
+                .chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect();
+            weight_tensor(gpu.upload_f32(&f32_data, &[m, k])?, DType::F32, m, k)
+        }
+        qt => panic!("gemma3: unsupported lm_head quant_type {qt}; handled 1/3/6/7/16."),
     };
     Ok((weight, cfg.tie_word_embeddings))
 }
@@ -410,9 +430,19 @@ fn load_weight_tensor(
         7 => weight_tensor(gpu.upload_raw(&data, &[data.len()])?, DType::HFQ4G128, m, k),
         3 => weight_tensor(gpu.upload_raw(&data, &[data.len()])?, DType::Q8_0, m, k),
         1 => weight_tensor(gpu.upload_raw(&data, &[data.len()])?, DType::F16, m, k),
+        // bf16 stays bf16 on GPU (the gemm/gemv families dispatch a bf16 path,
+        // same as the gemma3-vl bf16 vision tower) — no F32 promotion needed. The
+        // *buffer's* dtype must be BF16, not just the WeightTensor's gpu_dtype:
+        // `gemm_bf16_x_bf16_wmma` asserts on the GpuTensor's dtype, and
+        // `upload_raw` tags the buffer `Raw`.
+        16 => {
+            let mut buf = gpu.upload_raw(&data, &[data.len()])?;
+            buf.dtype = DType::BF16;
+            weight_tensor(buf, DType::BF16, m, k)
+        }
         qt => panic!(
             "gemma3: unsupported linear quant_type {qt} for {name}; \
-             handled 1 (F16), 3 (Q8F16), 6 (HFQ4G256), 7 (HFQ4G128). Extend for MQ4/MQ6."
+             handled 1 (F16), 3 (Q8F16), 6 (HFQ4G256), 7 (HFQ4G128), 16 (BF16). Extend for MQ4/MQ6."
         ),
     };
     Ok(wt)
