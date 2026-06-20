@@ -2246,6 +2246,29 @@ Best current hypothesis:
 > total per-child LDS work and process-local state are involved.
 > Exec-mask structure alone does not appear to be the deciding factor.
 
+## Public Report Refresh
+
+Checked public gfx1103/780M ROCm reports again on 2026-06-20. The closest
+external symptom match remains ROCm/TheRock issue
+`AMD Radeon 780M (gfx1103) hanging, debugging tips?`, where a Ryzen 7840HS /
+Radeon 780M system reports `hipSyncError: 719` and display reset/recovery on a
+large rocBLAS `cgemm` workload, with ROCm 6.3.1 passing and 6.3.3 / 6.4.1 /
+7-rc failing:
+<https://github.com/ROCm/TheRock/issues/1264>. That issue is still not reduced
+to an LDS/backedge/kernel-lifetime trigger, but it does support the broader
+idea that gfx1103 can hit ROCm-stack 719/reset failures on matrix workloads.
+
+Other recent gfx1103 reports are less directly diagnostic for this bug:
+llama.cpp issue `#20839` and ROCm issue `#6049` focus on missing
+`TensileLibrary_lazy_gfx1103.dat`, rocBLAS routing, and WMMA/FlashAttention
+fallback behavior rather than an isolated custom-HIP LDS loop:
+<https://github.com/ggml-org/llama.cpp/issues/20839> and
+<https://github.com/ROCm/ROCm/issues/6049>. HIP's public error-code docs map
+illegal-memory failures to `hipErrorIllegalAddress` (`700`), not the observed
+HIP `719`, so the decisive evidence continues to be the amdgpu/MES dmesg and
+devcoredump signature captured locally:
+<https://rocm.docs.amd.com/projects/HIP/en/latest/reference/error_codes.html>.
+
 ## Next Evidence To Capture
 
 Continue improving the small repro matrix so it emits and preserves artifacts
