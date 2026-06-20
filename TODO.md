@@ -548,3 +548,32 @@ support, no re-quant loss).
 
 Decision deferred; Path A v1 ships first. See
 `docs/plans/2026-06-17-hipfire-train-phase3-hfq-export.md`.
+
+## Vision embedding cache (xxh64-keyed, on-disk LRU)
+
+The SigLIP encode is the dominant cost of a multimodal request (~44s/image on
+gfx1151 even after the `vit_attention_opt` fix; video makes it K× per request).
+The same image/frame is frequently re-submitted (re-runs, repeated frames across
+a video, multi-turn). Cache the *projected* image embeddings keyed by content
+hash so a repeat submission skips the tower entirely.
+
+- **Key:** `xxh64` of the **submitted image bytes** (computed at submission,
+  before decode/preprocess) — content-addressed, order-independent, collision-safe
+  enough for a cache. Include the vision-config / arch identity in the key (or a
+  namespace) so embeddings from different models/towers never alias.
+- **Value:** the post-projector rows (`mm_tokens × text_hidden` f32, e.g.
+  256×2560) — the thing spliced at the placeholders, so a hit bypasses
+  SigLIP + projector + the host download.
+- **Store:** a single on-disk cache file (or dir) with a **configurable max total
+  size** and **LRU eviction** when over budget. Persist across daemon restarts.
+  Pick a format that supports cheap append + per-entry mmap/pread (the loader
+  already prefers pread on UMA APUs).
+- **Lookup path:** daemon hashes on submission → probe cache → on hit, splice the
+  cached rows directly; on miss, encode then insert (respecting the size cap).
+- **Open questions:** whether to also cache the *pre-projector* SigLIP features
+  (lets the projector change without invalidating) vs the final rows (smaller,
+  fewer ops on hit); eviction granularity (per-image vs per-file); and a
+  `HIPFIRE_VISION_CACHE_*` env/CLI surface for path + max size. Ties into the
+  daemon arch-13 wiring (Phase 3 of the medgemma video work) and eventually the
+  NPU vision backend (same cache, different encoder). See
+  [[project_medgemma_video_multiimage]].
