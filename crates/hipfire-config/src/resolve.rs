@@ -6,12 +6,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::schema::{ConfigField, Requirement};
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigLayerKind {
     CompiledDefault,
@@ -27,7 +27,7 @@ pub enum ConfigLayerKind {
     Request,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ConfigLayer {
     pub kind: ConfigLayerKind,
     pub id: Option<String>,

@@ -8,7 +8,8 @@ pub mod resolve;
 pub mod schema;
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use serde_json::{Map, Value};
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 pub use resolve::{
@@ -220,91 +221,75 @@ pub struct HipfireConfig {
 impl HipfireConfig {
     /// Merge per-model overrides for `tag` on top of global config.
     pub fn resolve_for_model(&self, tag: &str) -> Self {
-        let mut merged = self.clone();
-        if let Some(overrides) = self.model_overrides.get(tag) {
-            if let Some(obj) = overrides.as_object() {
-                macro_rules! apply_str {
-                    ($key:literal, $field:ident) => {
-                        if let Some(v) = obj.get($key).and_then(|v| v.as_str()) {
-                            merged.$field = v.to_string();
-                        }
-                    };
-                }
-                macro_rules! apply_f64 {
-                    ($key:literal, $field:ident) => {
-                        if let Some(v) = obj.get($key).and_then(|v| v.as_f64()) {
-                            merged.$field = v;
-                        }
-                    };
-                }
-                macro_rules! apply_u32 {
-                    ($key:literal, $field:ident) => {
-                        if let Some(v) = obj.get($key).and_then(|v| v.as_u64()) {
-                            merged.$field = v as u32;
-                        }
-                    };
-                }
-                macro_rules! apply_i32 {
-                    ($key:literal, $field:ident) => {
-                        if let Some(v) = obj.get($key).and_then(|v| v.as_i64()) {
-                            merged.$field = v as i32;
-                        }
-                    };
-                }
-                macro_rules! apply_bool {
-                    ($key:literal, $field:ident) => {
-                        if let Some(v) = obj.get($key).and_then(|v| v.as_bool()) {
-                            merged.$field = v;
-                        }
-                    };
-                }
-                apply_str!("kv_cache", kv_cache);
-                apply_str!("kv_adaptive", kv_adaptive);
-                apply_str!("flash_mode", flash_mode);
-                apply_str!("dflash_mode", dflash_mode);
-                apply_bool!("dflash_adaptive_b", dflash_adaptive_b);
-                if let Some(v) = obj.get("dflash_ngram_block") {
-                    if v.is_boolean() || v.as_str() == Some("auto") {
-                        merged.dflash_ngram_block = v.clone();
-                    }
-                }
-                apply_str!("mtp_mode", mtp_mode);
-                apply_str!("thinking", thinking);
-                apply_bool!("prompt_normalize", prompt_normalize);
-                apply_str!("mmq_screen", mmq_screen);
-                apply_str!("prefill_compression", prefill_compression);
-                apply_f64!("temperature", temperature);
-                apply_f64!("top_p", top_p);
-                apply_f64!("repeat_penalty", repeat_penalty);
-                apply_f64!("cask_core_frac", cask_core_frac);
-                apply_f64!("mmq_screen_threshold", mmq_screen_threshold);
-                apply_f64!("prefill_keep_ratio", prefill_keep_ratio);
-                apply_f64!("prefill_alpha", prefill_alpha);
-                apply_u32!("max_tokens", max_tokens);
-                apply_u32!("max_seq", max_seq);
-                apply_u32!("mtp_k", mtp_k);
-                apply_bool!("cask_auto_attach", cask_auto_attach);
-                apply_bool!("cask", cask);
-                apply_u32!("cask_budget", cask_budget);
-                apply_u32!("cask_beta", cask_beta);
-                apply_u32!("cask_fold_m", cask_fold_m);
-                apply_u32!("prefill_threshold", prefill_threshold);
-                apply_u32!("prefill_min_keep", prefill_min_keep);
-                apply_u32!("prefill_sink", prefill_sink);
-                apply_u32!("prefill_recent", prefill_recent);
-                apply_u32!("prefill_block", prefill_block);
-                apply_i32!("prefill_drafter_device", prefill_drafter_device);
-                apply_bool!("prefill_profile", prefill_profile);
-                apply_u32!("prefill_sparse_threshold", prefill_sparse_threshold);
-                if let Some(v) = obj.get("cask_sidecar").and_then(|v| v.as_str()) {
-                    merged.cask_sidecar = Some(v.to_string());
-                }
-                if let Some(v) = obj.get("prefill_drafter").and_then(|v| v.as_str()) {
-                    merged.prefill_drafter = Some(v.to_string());
-                }
-            }
+        let raw = serde_json::to_value(self).unwrap_or_else(|_| Value::Object(Map::new()));
+        resolve_typed_config_document(&raw, Some(tag)).config
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigDiagnosticSeverity {
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigDiagnostic {
+    pub severity: ConfigDiagnosticSeverity,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolvedTypedConfig {
+    pub config: HipfireConfig,
+    pub layers: Vec<ConfigLayer>,
+    pub resolution: ConfigResolution,
+    pub diagnostics: Vec<ConfigDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LoadedConfig {
+    pub config_path: PathBuf,
+    pub raw_document: Value,
+    pub read_error: Option<String>,
+    pub additional_layers: Vec<ConfigLayer>,
+    pub config: HipfireConfig,
+    pub resolution: ConfigResolution,
+    pub diagnostics: Vec<ConfigDiagnostic>,
+}
+
+impl LoadedConfig {
+    pub fn from_config(config: HipfireConfig) -> Self {
+        let raw_document =
+            serde_json::to_value(&config).unwrap_or_else(|_| Value::Object(Map::new()));
+        loaded_config_from_document(config_path(), raw_document, None, Vec::new())
+    }
+
+    pub fn with_additional_layer(mut self, layer: ConfigLayer) -> Self {
+        if !layer.values.is_empty() {
+            self.additional_layers.push(layer);
+            self.refresh();
         }
-        merged
+        self
+    }
+
+    pub fn resolve_for_model(&self, model_tag: &str) -> ResolvedTypedConfig {
+        resolve_typed_config_document_with_layers(
+            &self.raw_document,
+            Some(model_tag),
+            &self.additional_layers,
+        )
+    }
+
+    fn refresh(&mut self) {
+        let resolved = resolve_typed_config_document_with_layers(
+            &self.raw_document,
+            None,
+            &self.additional_layers,
+        );
+        self.config = resolved.config;
+        self.resolution = resolved.resolution;
+        self.diagnostics = resolved.diagnostics;
     }
 }
 
@@ -371,53 +356,130 @@ pub fn models_dir() -> PathBuf {
     hipfire_dir().join("models")
 }
 
-pub fn load_config() -> HipfireConfig {
+pub fn load_config_bundle() -> LoadedConfig {
     let path = config_path();
-    if !path.exists() {
-        return HipfireConfig {
-            host: default_host(),
-            port: default_port(),
-            max_seq: default_max_seq(),
-            max_tokens: default_max_tokens(),
-            temperature: default_temperature(),
-            top_p: default_top_p(),
-            repeat_penalty: default_repeat_penalty(),
-            idle_timeout: default_idle_timeout(),
-            kv_cache: default_kv_cache(),
-            kv_adaptive: default_kv_adaptive(),
-            flash_mode: default_flash_mode(),
-            dflash_mode: default_dflash_mode(),
-            dflash_adaptive_b: default_dflash_adaptive_b(),
-            dflash_ngram_block: default_dflash_ngram_block(),
-            mtp_mode: default_mtp_mode(),
-            mtp_k: default_mtp_k(),
-            thinking: default_thinking(),
-            gpu_slab_load: default_gpu_slab_load(),
-            prompt_normalize: default_prompt_normalize(),
-            cask_auto_attach: default_cask_auto_attach(),
-            cask_budget: default_cask_budget(),
-            cask_beta: default_cask_beta(),
-            cask_core_frac: default_cask_core_frac(),
-            cask_fold_m: default_cask_fold_m(),
-            mmq_screen: default_mmq_screen(),
-            mmq_screen_threshold: default_mmq_screen_threshold(),
-            prefill_compression: default_prefill_compression(),
-            prefill_threshold: default_prefill_threshold(),
-            prefill_keep_ratio: default_prefill_keep_ratio(),
-            prefill_alpha: default_prefill_alpha(),
-            prefill_min_keep: default_prefill_min_keep(),
-            prefill_sink: default_prefill_sink(),
-            prefill_recent: default_prefill_recent(),
-            prefill_block: default_prefill_block(),
-            prefill_drafter_device: default_prefill_drafter_device(),
-            prefill_sparse_threshold: default_prefill_sparse_threshold(),
-            ..Default::default()
-        };
-    }
     match std::fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-        Err(_) => HipfireConfig::default(),
+        Ok(raw) => match serde_json::from_str::<Value>(&raw) {
+            Ok(document) => loaded_config_from_document(path, document, None, Vec::new()),
+            Err(err) => loaded_config_from_document(
+                path,
+                Value::Object(Map::new()),
+                Some(format!("parse error: {err}")),
+                Vec::new(),
+            ),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            loaded_config_from_document(path, Value::Object(Map::new()), None, Vec::new())
+        }
+        Err(err) => loaded_config_from_document(
+            path,
+            Value::Object(Map::new()),
+            Some(format!("read error: {err}")),
+            Vec::new(),
+        ),
     }
+}
+
+pub fn load_config() -> HipfireConfig {
+    load_config_bundle().config
+}
+
+pub fn resolve_typed_config_document(raw: &Value, model_tag: Option<&str>) -> ResolvedTypedConfig {
+    resolve_typed_config_document_with_layers(raw, model_tag, &[])
+}
+
+pub fn resolve_typed_config_document_with_layers(
+    raw: &Value,
+    model_tag: Option<&str>,
+    additional_layers: &[ConfigLayer],
+) -> ResolvedTypedConfig {
+    let mut layers = config_layers_from_document(raw, model_tag);
+    layers.extend(additional_layers.iter().cloned());
+    resolve_typed_config_layers(&layers, model_overrides_from_document(raw))
+}
+
+pub fn resolve_typed_config_layers(
+    layers: &[ConfigLayer],
+    model_overrides: HashMap<String, Value>,
+) -> ResolvedTypedConfig {
+    let resolution = resolve_config_layers(config_schema(), layers);
+    let mut diagnostics = Vec::new();
+    let config = materialize_config(&resolution, model_overrides, &mut diagnostics);
+    ResolvedTypedConfig {
+        config,
+        layers: layers.to_vec(),
+        resolution,
+        diagnostics,
+    }
+}
+
+pub fn loaded_config_from_document(
+    config_path: PathBuf,
+    raw_document: Value,
+    read_error: Option<String>,
+    additional_layers: Vec<ConfigLayer>,
+) -> LoadedConfig {
+    let resolved =
+        resolve_typed_config_document_with_layers(&raw_document, None, &additional_layers);
+    LoadedConfig {
+        config_path,
+        raw_document,
+        read_error,
+        additional_layers,
+        config: resolved.config,
+        resolution: resolved.resolution,
+        diagnostics: resolved.diagnostics,
+    }
+}
+
+fn materialize_config(
+    resolution: &ConfigResolution,
+    model_overrides: HashMap<String, Value>,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) -> HipfireConfig {
+    let mut object = Map::new();
+    for resolved in &resolution.values {
+        if let Some(value) = &resolved.value {
+            object.insert(resolved.key.clone(), value.clone());
+        }
+    }
+    if !model_overrides.is_empty() {
+        object.insert(
+            "model_overrides".to_string(),
+            Value::Object(model_overrides.into_iter().collect()),
+        );
+    }
+
+    match serde_json::from_value::<HipfireConfig>(Value::Object(object)) {
+        Ok(config) => config,
+        Err(err) => {
+            diagnostics.push(ConfigDiagnostic {
+                severity: ConfigDiagnosticSeverity::Error,
+                message: format!("failed to materialize typed config: {err}"),
+            });
+            HipfireConfig::default()
+        }
+    }
+}
+
+fn model_overrides_from_document(raw: &Value) -> HashMap<String, Value> {
+    raw.get("model_overrides")
+        .and_then(Value::as_object)
+        .map(|object| {
+            object
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn config_value_map(config: &HipfireConfig) -> BTreeMap<String, Value> {
+    serde_json::to_value(config)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .map(|object| object.into_iter().collect())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -426,45 +488,7 @@ mod tests {
 
     #[test]
     fn defaults_preserve_server_config_values() {
-        let cfg = HipfireConfig {
-            host: default_host(),
-            port: default_port(),
-            max_seq: default_max_seq(),
-            max_tokens: default_max_tokens(),
-            temperature: default_temperature(),
-            top_p: default_top_p(),
-            repeat_penalty: default_repeat_penalty(),
-            idle_timeout: default_idle_timeout(),
-            kv_cache: default_kv_cache(),
-            kv_adaptive: default_kv_adaptive(),
-            flash_mode: default_flash_mode(),
-            dflash_mode: default_dflash_mode(),
-            dflash_adaptive_b: default_dflash_adaptive_b(),
-            dflash_ngram_block: default_dflash_ngram_block(),
-            mtp_mode: default_mtp_mode(),
-            mtp_k: default_mtp_k(),
-            thinking: default_thinking(),
-            gpu_slab_load: default_gpu_slab_load(),
-            prompt_normalize: default_prompt_normalize(),
-            cask_auto_attach: default_cask_auto_attach(),
-            cask_budget: default_cask_budget(),
-            cask_beta: default_cask_beta(),
-            cask_core_frac: default_cask_core_frac(),
-            cask_fold_m: default_cask_fold_m(),
-            mmq_screen: default_mmq_screen(),
-            mmq_screen_threshold: default_mmq_screen_threshold(),
-            prefill_compression: default_prefill_compression(),
-            prefill_threshold: default_prefill_threshold(),
-            prefill_keep_ratio: default_prefill_keep_ratio(),
-            prefill_alpha: default_prefill_alpha(),
-            prefill_min_keep: default_prefill_min_keep(),
-            prefill_sink: default_prefill_sink(),
-            prefill_recent: default_prefill_recent(),
-            prefill_block: default_prefill_block(),
-            prefill_drafter_device: default_prefill_drafter_device(),
-            prefill_sparse_threshold: default_prefill_sparse_threshold(),
-            ..Default::default()
-        };
+        let cfg = HipfireConfig::default();
 
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.port, 11435);
@@ -504,6 +528,43 @@ mod tests {
         assert_eq!(cfg.prefill_drafter_device, -1);
         assert!(!cfg.prefill_profile);
         assert_eq!(cfg.prefill_sparse_threshold, 32768);
+    }
+
+    #[test]
+    fn schema_defaults_materialize_to_typed_defaults() {
+        let resolved = resolve_typed_config_document(&serde_json::json!({}), None);
+
+        assert!(resolved.diagnostics.is_empty());
+        assert_eq!(
+            config_value_map(&resolved.config),
+            config_value_map(&HipfireConfig::default())
+        );
+    }
+
+    #[test]
+    fn loaded_config_preserves_raw_model_overrides() {
+        let loaded = loaded_config_from_document(
+            PathBuf::from("/tmp/config.json"),
+            serde_json::json!({
+                "temperature": 0.4,
+                "model_overrides": {
+                    "qwen": {
+                        "temperature": 0.1,
+                        "max_tokens": 64
+                    }
+                }
+            }),
+            None,
+            Vec::new(),
+        );
+
+        assert_eq!(loaded.config.temperature, 0.4);
+        assert!(loaded.config.model_overrides.contains_key("qwen"));
+
+        let resolved = loaded.resolve_for_model("qwen");
+        assert_eq!(resolved.config.temperature, 0.1);
+        assert_eq!(resolved.config.max_tokens, 64);
+        assert!(resolved.config.model_overrides.contains_key("qwen"));
     }
 
     #[test]
