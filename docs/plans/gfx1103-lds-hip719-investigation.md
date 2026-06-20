@@ -2357,6 +2357,19 @@ scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-scalar-control-runs
   segment. The ISA places the only inserted `s_nop 0` after the final
   `s_barrier`/`buffer_gl0_inv` and immediately before the K-loop branch. A
   follow-up no-extra 100-launch recovery run passed.
+- A sequential K-limit sweep in
+  `/tmp/hipfire-lds-tail-snop-klimit-runs/` shows the tail-noop trigger is
+  concentrated near the top of the K loop. The initial concurrent
+  `K_LIMIT=2048`/`2816` run is invalid protocol and should be ignored: both
+  jobs were stressing the GPU at once and failed early. In clean sequential
+  runs, `K_LIMIT=512`, `1024`, `1536`, `2048`, `2560`, `2816`, `2880`,
+  `2944`, `3008`, `3024`, and `3030` passed 100 launches. Full depth
+  (`K_LIMIT=0`) failed at `sync 98`; `K_LIMIT=3040` failed at `sync 99`;
+  `K_LIMIT=3032` failed twice at `sync 99`; and `K_LIMIT=3031` first passed
+  then failed at `sync 99` after additional reset pressure. Follow-up
+  no-extra 100-launch recovery runs passed after the failing tail-noop runs.
+  This makes the upper edge stress-history-sensitive, but the robust pass
+  side currently extends through `K_LIMIT=3024`.
 - On the first 780M system, the counter-only variant passed one-launch smoke
   and failed under the 100-launch full-shape run at `sync 98` with HIP `719`.
   The object metadata stayed at `group_segment_fixed_size=144`,
