@@ -98,6 +98,7 @@ for node_props in /sys/class/kfd/kfd/topology/nodes/*/properties; do
         100100)         GPU_ARCH="gfx1010"; break ;;
         100300|100302)  GPU_ARCH="gfx1030"; break ;;
         110000|110001)  GPU_ARCH="gfx1100"; break ;;
+        110003)         GPU_ARCH="gfx1103"; break ;;
         110501)         GPU_ARCH="gfx1151"; break ;;
         120000)         GPU_ARCH="gfx1200"; break ;;
         120001)         GPU_ARCH="gfx1201"; break ;;
@@ -110,7 +111,7 @@ fi
 
 if [ "$GPU_ARCH" = "unknown" ]; then
     echo "  WARNING: Could not detect GPU architecture."
-    echo "  Supported: gfx906 gfx908 gfx1010 gfx1030 gfx1100 gfx1151 gfx1200 gfx1201"
+    echo "  Supported: gfx906 gfx908 gfx1010 gfx1030 gfx1100 gfx1103 gfx1151 gfx1200 gfx1201"
     GPU_ARCH=$(ask "  Enter your GPU arch [or Enter to skip]: " "unknown")
 fi
 echo "  GPU arch: $GPU_ARCH"
@@ -258,7 +259,7 @@ fi
 if [ -x "$BIN_DIR/hipfire-daemon" ]; then
     echo ""
     echo "Pre-compiling GPU kernels..."
-    "$BIN_DIR/hipfire-daemon" --precompile 2>/dev/null && echo "  Pre-compile complete ✓" || \
+    "$BIN_DIR/hipfire-daemon" --precompile && echo "  Pre-compile complete ✓" || \
         echo "  Pre-compile finished with warnings — missing kernels will JIT on first use."
 fi
 

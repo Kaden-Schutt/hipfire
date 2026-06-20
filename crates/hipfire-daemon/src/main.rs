@@ -2152,7 +2152,6 @@ fn main() {
     // compat paths (hfq4, hfq6, q8 weights × asym3, q8 KV) so models from any
     // era of the registry start instantly.
     if args.iter().any(|a| a == "--precompile") {
-        let _resource_lease = hipfire_daemon_adapter::acquire_resource_lease_or_exit();
         // Pre-create the expected precompiled-dir next to this binary so the
         // compiler's writeback path fires. Without this, Gpu::init probes for
         // an existing dir and silently disables writeback if it's missing —
@@ -2166,7 +2165,7 @@ fn main() {
             // will log the active dir.
             for arch in [
                 "gfx906", "gfx1010", "gfx1013", "gfx1030", "gfx1031", "gfx1100", "gfx1101",
-                "gfx1102", "gfx1151", "gfx1152", "gfx1200", "gfx1201",
+                "gfx1102", "gfx1103", "gfx1151", "gfx1152", "gfx1200", "gfx1201",
             ] {
                 let _ =
                     std::fs::create_dir_all(exe_dir.join("kernels").join("compiled").join(arch));
