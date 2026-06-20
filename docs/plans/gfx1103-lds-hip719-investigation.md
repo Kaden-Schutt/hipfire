@@ -1926,6 +1926,19 @@ Latest artifact paths:
   offset:12`. This separates a normal in-process synchronization boundary from
   a child-process boundary: only the latter avoided the cumulative fault in
   the paired split control.
+- Same-process `hipDeviceReset` phase split
+  (`/tmp/hipfire-lds-direct-ab-device-reset-artifacts/`, throwaway worktree
+  `/tmp/hipfire-lds-direct-ab-device-reset-current`, commit `61ba100a`) shows
+  that a successful `hipDeviceReset` between phases delays but does not clear
+  the shifted row fault. The same active `30x1` start=3 shape ran phase1 `120`,
+  completed `boundary hipDeviceReset OK`, then failed in phase2 at local sync
+  253 / global launch 373 with HIP `719`. The coredump kept the canonical
+  promoted direct-AB GFXHUB/GDS signature, and the selected normalized ISA hash
+  stayed `bb1a56b38225028e` with the same resource tuple and
+  `ds_load_b32 ... offset:12`. Compared with ordinary same-process `120+380`
+  failing at global 181 and child-process `120,120,120,140` passing, this
+  suggests `hipDeviceReset` perturbs or partially resets the accumulated state
+  but still does not provide the cleanup boundary that process exit provides.
 
 ## Current Narrowing
 
@@ -2756,6 +2769,7 @@ LDS-only control:
 | direct-AB promoted-source shifted active `30x1` in `34x1` block/layout, reads=2, 448 iters, 512x86 | start=2 PASS one-child `500`; start=3 FAIL at sync/global 179; start=4 FAIL at sync/global 375; all use DS=12 and failing rows keep the canonical gfxhub/GDS signature | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB promoted-source shifted active `30x1` start=3 in `34x1`, reads=2, 448 iters, 512x86 | same total `500` launches PASS when split across child processes `120,120,120,140`; one-child `500` repeat FAILS at sync/global 179 with identical selected ISA/resource tuple | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB promoted-source shifted active `30x1` start=3 in `34x1`, same-process phase split, reads=2, 448 iters, 512x86 | phase1 `120` + boundary `hipDeviceSynchronize` + phase2 `380` FAILS in phase2 at local sync 61 / global 181 with identical selected ISA/resource tuple | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
+| direct-AB promoted-source shifted active `30x1` start=3 in `34x1`, same-process device-reset phase split, reads=2, 448 iters, 512x86 | phase1 `120` + `hipDeviceReset` OK + phase2 `380` FAILS in phase2 at local sync 253 / global 373 with identical selected ISA/resource tuple | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB promoted-source shifted active `29x1` in `34x1` block/layout, reads=2, 448 iters, 512x86 | start=3/4 initially PASS one-child `500`; start=5 FAIL at sync/global 374; post-failure recovery rerun of start=4 FAILS at 379; all use DS=12 and failing rows keep the canonical gfxhub/GDS signature | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB promoted-source shifted active `28x1` in `34x1` block/layout, reads=2, 448 iters, 512x86 | start=6 FAIL at sync/global 177 with canonical gfxhub/GDS signature | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB multi-exec `17x2`/`2x17` block/layout, reads=2, 448 iters, 512x86 | `17x2`: FAIL one-child `130` at sync/global 32; `2x17`: FAIL one-child `130` at sync/global 35 | `_Z25lds_direct_ab_phase_probev` | 280 B | 24 | 2 | 0 | 32 |
