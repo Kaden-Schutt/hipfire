@@ -1857,8 +1857,9 @@ Latest artifact paths:
   worktree `/tmp/hipfire-lds-direct-ab-start0-current`, commit `bd2e4637`).
   Active `31x1` windows inside the `34x1` layout produced a tighter split:
   start=0 (lanes 0..30) passed one-child `500`; start=1 (lanes 1..31) also
-  passed one-child `500`; start=2 (lanes 2..32) failed at sync/global 374 with
-  HIP `719`. The start=2 failure kept the canonical promoted direct-AB
+  passed one-child `500`; start=2 (lanes 2..32) failed at sync/global 374; and
+  start=3 (lanes 3..33) failed at sync/global 179. Both promoted-source
+  failures reported HIP `719` and kept the canonical promoted direct-AB
   coredump signature: `dmesg_remove_queue=3`, GFXHUB fault address
   `0x000074669d000000`, protection status `0x841051`, decoded
   `MORE_FAULTS,PERMISSION_FAULTS,RW/cid=8/rw=1/vmid=8`, GDS
@@ -1870,8 +1871,9 @@ Latest artifact paths:
   `sgpr=5`, `vgpr=8`, `wavefront=32`, `s_barrier=8`, DS=12,
   `s_waitcnt=12`, `s_cbranch=9`, `offset1=36`); their visible ISA delta
   includes physical LDS load placement (`ds_load_b32 ... offset:4` for start=1
-  versus `offset:8` for start=2). Treat this as strong physical
-  LDS-address/codegen placement evidence, not a pure active-count boundary.
+  versus `offset:8` for start=2 and `offset:12` for start=3). Treat this as
+  strong physical LDS-address/codegen placement evidence, not a pure
+  active-count boundary.
 
 ## Current Narrowing
 
@@ -2698,7 +2700,7 @@ LDS-only control:
 | direct-AB multi-exec active `28x1`/`29x1`/`30x1` in `34x1` block/layout, reads=2, 448 iters, 512x86 | PASS one-child `500` for all three row-active masks; matching `31x1` repeat FAILS at sync/global 256 | `_Z25lds_direct_ab_phase_probev` | 280 B | 10 | 5 | 0 | 32 |
 | direct-AB multi-exec active `1x29`/`1x30` in `1x34` block/layout, reads=2, 448 iters, 512x86 | PASS one-child `500` for both column-active masks; previous `1x31` PASS, `1x32` FAIL at sync/global 64 | `_Z25lds_direct_ab_phase_probev` | 280 B | 9 | 6 | 0 | 32 |
 | direct-AB active `1x32` in `1x34` block/layout, reads=2, forced compare/cndmask wrap, 448 iters, 512x86 | PASS one-child `500`; normal `% 32`/`v_and 31` codegen FAILS at sync/global 64 | `_Z25lds_direct_ab_phase_probev` | 280 B | 9 | 6 | 0 | 32 |
-| direct-AB promoted-source shifted active `31x1` in `34x1` block/layout, reads=2, 448 iters, 512x86 | start=0 PASS one-child `500`; start=1 PASS one-child `500`; start=2 FAIL at sync/global 374 with canonical gfxhub/GDS signature; all use DS=12 | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5-6 | 0 | 32 |
+| direct-AB promoted-source shifted active `31x1` in `34x1` block/layout, reads=2, 448 iters, 512x86 | start=0/1 PASS one-child `500`; start=2 FAIL at sync/global 374; start=3 FAIL at sync/global 179; all use DS=12 and failing rows keep the canonical gfxhub/GDS signature | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5-6 | 0 | 32 |
 | direct-AB multi-exec `17x2`/`2x17` block/layout, reads=2, 448 iters, 512x86 | `17x2`: FAIL one-child `130` at sync/global 32; `2x17`: FAIL one-child `130` at sync/global 35 | `_Z25lds_direct_ab_phase_probev` | 280 B | 24 | 2 | 0 | 32 |
 | direct-AB pre-sync diagnostic `11x3`/`3x11` block/layout, reads=2, 448 iters, 512x86 | `PRE_SYNC_EACH_LAUNCH=1`: `11x3` one-child `133` PASS; `3x11` one-child `134` FAIL at sync/global 133 | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
 | direct-AB throwaway host-sleep diagnostic `11x3` block/layout, reads=2, 448 iters, 512x86 | local-only `PRE_LAUNCH_SLEEP_US=1000`: one-child `133` FAIL at sync/global 73 | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
