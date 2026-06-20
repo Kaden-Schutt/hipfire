@@ -4,11 +4,13 @@ set -euo pipefail
 OUT="${OUT:-/tmp/hipfire-lds-tail-snop-780m}"
 LOCAL_SUMMARY="${LOCAL_SUMMARY:-}"
 LOCAL_KEDGE_SUMMARY="${LOCAL_KEDGE_SUMMARY:-}"
+LOCAL_ISA_SUMMARY="${LOCAL_ISA_SUMMARY:-}"
 
 cat <<EOF
 # gfx1103 / 780M LDS tail-snop repro runbook
 
 # 0. One-command handoff jig. This defaults to the safe build-only preflight.
+#    It also writes OUT-buildonly/isa-placement-single/isa-summary.tsv.
 scripts/lds_gemm_780m_test_jig.sh
 
 #    The repro modes can reset affected machines.
@@ -18,6 +20,7 @@ scripts/lds_gemm_780m_test_jig.sh --kedge
 # 1. Optional safe codegen/metadata preflight. This compiles and captures
 #    codegen artifacts but does not launch the repro kernel.
 BUILD_ONLY=1 OUT=$OUT-buildonly tests/gfx1103-lds-tail-snop-repro.sh
+SINGLE_INSTANTIATION=1 scripts/lds_gemm_isa_compare.sh $OUT-buildonly/isa-placement-single
 
 # 2. Risky repro. This is expected to exercise the HIP-719/reset path on
 #    affected gfx1103 stacks. It writes report.tsv, summary.txt, and
@@ -31,8 +34,8 @@ PROFILE=kedge OUT=$OUT-kedge tests/gfx1103-lds-tail-snop-repro.sh
 scripts/lds_gemm_artifact_summary.sh $OUT
 scripts/lds_gemm_artifact_summary.sh $OUT-kedge
 
-# 5. Compare against a local/known summary TSV after copying it beside this
-#    checkout or setting LOCAL_SUMMARY.
+# 5. Compare against local/known summary TSVs after copying them beside this
+#    checkout or setting LOCAL_SUMMARY / LOCAL_ISA_SUMMARY.
 EOF
 
 if [[ -n "$LOCAL_SUMMARY" || -n "$LOCAL_KEDGE_SUMMARY" ]]; then
@@ -46,6 +49,16 @@ else
     cat <<EOF
 scripts/lds_gemm_summary_compare.sh /path/to/local-artifact-summary.tsv $OUT/artifact-summary.tsv
 scripts/lds_gemm_summary_compare.sh /path/to/local-kedge-summary.tsv $OUT-kedge/artifact-summary.tsv
+EOF
+fi
+
+if [[ -n "$LOCAL_ISA_SUMMARY" ]]; then
+    cat <<EOF
+scripts/lds_gemm_isa_summary_compare.sh $LOCAL_ISA_SUMMARY $OUT-buildonly/isa-placement-single/isa-summary.tsv
+EOF
+else
+    cat <<EOF
+scripts/lds_gemm_isa_summary_compare.sh /path/to/local-isa-summary.tsv $OUT-buildonly/isa-placement-single/isa-summary.tsv
 EOF
 fi
 
@@ -63,11 +76,14 @@ cat <<'EOF'
 # - devcore_sig compares gfxhub page-fault, address/status, and GDS/GDS-VM
 #   protection fault fields from captured devcoredumps.
 # - gcvm_sig compares decoded GCVM status flags, CID, RW, and VMID when present.
+# - placement-drift in the ISA summary comparator means scalar-control
+#   placement changed around the first LDS store or final barrier/backedge.
 # - same: summary rows match on the fields the comparator tracks.
 #
 # Local reference signatures from this gfx1103/780M stack:
 # - source_sha256=4267f867c3901afc
 # - baseline selected_isa_norm_sha256=07a8198f82d17006
 # - tail-snop selected_isa_norm_sha256=abcf16851242d139
+# - tail-snop ISA placement: tail_window=s_barrier;buffer_gl0_inv;s_nop;s_cbranch_scc0
 # - expected failing devcore_sig=1/0x0000000000000000/0x0/0x3f000007/0x0fc00113
 EOF

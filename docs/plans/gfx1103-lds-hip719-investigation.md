@@ -142,6 +142,10 @@ The currently promoted standalone GEMM jig lives in the repo:
   (`pre_ds_s_nop`, `pre_ds_s_add_i32`, `tail_s_nop`, `tail_s_add_i32`,
   `tail_window`) so pass/fail controls can be compared without manually
   reading the disassembly.
+- `scripts/lds_gemm_isa_summary_compare.sh`: read-only comparator for two
+  `isa-summary.tsv` files. It classifies rows as `same`, `placement-drift`,
+  `lds-control-drift`, `resource-drift`, `size-drift`, or missing on one side,
+  with explicit left/right tail-window and pre-DS/tail scalar counts.
 - `scripts/lds_gemm_artifact_summary.sh`: read-only artifact summarizer for
   cross-machine repro results. It writes TSV and Markdown summaries from
   `meta.txt`, `run.log`, `exit_code.txt`, dmesg deltas, devcoredump presence,
@@ -167,7 +171,8 @@ The currently promoted standalone GEMM jig lives in the repo:
   and decoded GCVM flags/CID/RW/VMID.
 - `scripts/lds_gemm_780m_runbook.sh`: command-only runbook printer for the
   second-780M flow: safe build-only preflight, risky repro, optional K-edge
-  repro, summary regeneration, and summary comparison.
+  repro, summary regeneration, runtime summary comparison, and placement-aware
+  ISA summary comparison.
 - `scripts/narrow-gemm-lds-shape.sh`: runs the curated variant matrix and
   writes a TSV report plus summary.
 - `scripts/lds_standalone_probe.hip`: promoted LDS-only store/load/barrier
@@ -2455,6 +2460,20 @@ scripts/lds_gemm_780m_test_jig.sh
 # Risky: expected to exercise the HIP-719/reset path on affected stacks.
 scripts/lds_gemm_780m_test_jig.sh --risky
 scripts/lds_gemm_780m_test_jig.sh --kedge
+```
+
+The default safe jig also writes:
+
+```text
+/tmp/hipfire-lds-tail-snop-780m-buildonly/isa-placement-single/isa-summary.tsv
+```
+
+Compare two machines' placement-aware ISA summaries with:
+
+```bash
+scripts/lds_gemm_isa_summary_compare.sh local-isa-summary.tsv other-780m-isa-summary.tsv
+# or:
+scripts/lds_gemm_780m_test_jig.sh --isa-compare local-isa-summary.tsv other-780m-isa-summary.tsv
 ```
 
 - Summarize an artifact root for cross-machine comparison:
