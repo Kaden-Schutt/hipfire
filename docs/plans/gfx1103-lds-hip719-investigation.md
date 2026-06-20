@@ -194,16 +194,20 @@ The currently promoted standalone GEMM jig lives in the repo:
   and parent, captures ISA/readobj artifacts, and does not launch the risky
   repro unless `BUILD_ONLY=0` is explicitly set. `LAYOUT_X` / `LAYOUT_Y` can
   be set independently of `ACTIVE_X` / `ACTIVE_Y` to pad the A/B LDS arrays
-  while preserving the active-lane shape. `PRE_SYNC_EACH_LAUNCH=1` is a
-  diagnostic mode that inserts an extra stream/device synchronize before each
-  launch and adds a `_presync1` artifact tag.
+  while preserving the active-lane shape. `ACTIVE_X_START` / `ACTIVE_Y_START`
+  shift the active window inside the block/layout, and
+  `FORCE_WRAP_CNDMASK=1` forces the READS<=2 wrap expression into compare /
+  cndmask form instead of the normal modulo lowering. `PRE_SYNC_EACH_LAUNCH=1`
+  is a diagnostic mode that inserts an extra stream/device synchronize before
+  each launch and adds a `_presync1` artifact tag.
 - `scripts/lds_direct_ab_780m_test_jig.sh`: one-command handoff jig for a
   second gfx1103/780M system. The default `--build-only` mode safely compiles
   the direct-AB active-shape controls and captures codegen artifacts under
   `/tmp/hipfire-lds-direct-ab-780m-buildonly`. `--risky` runs the current
-  focused READS=2 sequence: 8x4 one-child pass control, 9x4 one-child
-  pass-side control, 9x4 split-child pass control, then the 9x4 one-child
-  fail-side repro. It writes `report.tsv`, `summary.txt`, and
+  focused READS=2 sequence: one-wave and 9x4 pass-side controls, 9x4 split
+  control, 33/34-lane fail-side checks, the lower 30/31-in-34 row boundary,
+  shifted 31-lane row windows, and the normal-vs-forced-wrap `1x32` column
+  control. It writes `report.tsv`, `summary.txt`, and
   `direct-ab-artifact-summary.tsv/.md`, and `--compare` delegates to the
   direct-AB summary comparator for local-vs-remote result checks.
 - `scripts/lds_direct_ab_artifact_summary.sh`: read-only summarizer for
@@ -211,11 +215,13 @@ The currently promoted standalone GEMM jig lives in the repo:
   shape/chunk metadata, exit/sync failure, code-object hashes/resources, dmesg
   deltas, decoded gfxhub/GCVM/GDS coredump fields, and compact ISA counters
   (`s_barrier`, DS ops, `s_waitcnt`, scalar branches, unique
-  `ds_store_2addr_b32 offset1` values, and non-default layout).
+  `ds_store_2addr_b32 offset1` values, non-default layout, active-window start,
+  and forced-wrap mode).
 - `scripts/lds_direct_ab_summary_compare.sh`: read-only comparator for two
   direct-AB summary TSVs. It compares source/code-object hashes, normalized ISA,
-  resource tuples, build/risk mode, runtime exit/sync result, environment, dmesg
-  deltas, and devcore/GCVM/GDS signatures.
+  resource tuples, build/risk mode, runtime exit/sync result, environment,
+  active-window start, forced-wrap mode, dmesg deltas, and devcore/GCVM/GDS
+  signatures.
 - `tests/gfx1103-lds-tail-snop-repro.sh`: focused cross-system pass/fail
   wrapper for a second 780M. The default `PROFILE=repro` checks the no-extra
   baseline against the tail-loop `s_nop` repro and writes a TSV report under
@@ -1846,22 +1852,26 @@ Latest artifact paths:
   `s_barrier=8`, DS=12, `s_waitcnt=12`, `s_cbranch=9`, and `offset1=36`.
   This makes the column `1x32` failure specifically tied to the power-of-two
   modulo lowering, not just to the active mask value or compact resource tuple.
-- Throwaway shifted row-mask controls
-  (`/tmp/hipfire-lds-direct-ab-shiftrow34-artifacts/` and start=2 repeat
-  `/tmp/hipfire-lds-direct-ab-shiftrow34-start2-repeat-artifacts/`, local-only
-  `ACTIVE_X_START`/`ACTIVE_Y_START` patch in the same throwaway worktree)
-  tested active `31x1` windows inside the `34x1` layout. Start=1
-  (active lanes 1..31) passed one-child `500`; start=2 failed at sync/global
-  182 in the sequence and failed again as a one-case first-risky repeat at
-  sync/global 379; start=3 failed at sync/global 375 after reset pressure.
-  All failures kept the canonical coredump signature. These shifted controls
-  compile to a different compact tuple from the unshifted `31x1` row
-  (`vgpr=8`, DS=12 instead of `vgpr=10`, DS=16), and the start=1/start=2 ISA
-  diff includes LDS load offset changes (`ds_load_b32 ... offset:4` versus
-  `offset:8`), so treat them as physical LDS address-placement evidence rather
-  than a pure active-count repeat. The result nevertheless keeps the 34-layout
-  row-family suspect tight: moving the same 31-lane window within the 34-lane
-  layout can flip pass/fail.
+- Shifted row-mask controls now run from promoted `chaingun` source
+  (`/tmp/hipfire-lds-direct-ab-promoted-shiftrow-artifacts/`, throwaway
+  worktree `/tmp/hipfire-lds-direct-ab-start0-current`, commit `bd2e4637`).
+  Active `31x1` windows inside the `34x1` layout produced a tighter split:
+  start=0 (lanes 0..30) passed one-child `500`; start=1 (lanes 1..31) also
+  passed one-child `500`; start=2 (lanes 2..32) failed at sync/global 374 with
+  HIP `719`. The start=2 failure kept the canonical promoted direct-AB
+  coredump signature: `dmesg_remove_queue=3`, GFXHUB fault address
+  `0x000074669d000000`, protection status `0x841051`, decoded
+  `MORE_FAULTS,PERMISSION_FAULTS,RW/cid=8/rw=1/vmid=8`, GDS
+  `0x3f000007`, and GDS-VM `0x0fc00113`. The promoted generalized active
+  window changes the start=0 codegen from the older unshifted failing form:
+  start=0 now uses `vgpr=8`, DS=12 and passes, whereas the earlier unshifted
+  `31x1` fail used the old `vgpr=10`, DS=16 form. Start=1 and start=2 have
+  matching compact counts (`group_segment=280`, `private_segment=0`,
+  `sgpr=5`, `vgpr=8`, `wavefront=32`, `s_barrier=8`, DS=12,
+  `s_waitcnt=12`, `s_cbranch=9`, `offset1=36`); their visible ISA delta
+  includes physical LDS load placement (`ds_load_b32 ... offset:4` for start=1
+  versus `offset:8` for start=2). Treat this as strong physical
+  LDS-address/codegen placement evidence, not a pure active-count boundary.
 
 ## Current Narrowing
 
@@ -2687,8 +2697,8 @@ LDS-only control:
 | direct-AB multi-exec active `31x1`/`1x31` in `34x1`/`1x34` block/layout, reads=1, 448 iters, 512x86 | `31x1` row orientation MIXED: fail after reset pressure at sync/global 68, first-risky repeat PASS; `1x31` column orientation PASS one-child `500` | `_Z25lds_direct_ab_phase_probev` | 280 B | 7 | 5 | 0 | 32 |
 | direct-AB multi-exec active `28x1`/`29x1`/`30x1` in `34x1` block/layout, reads=2, 448 iters, 512x86 | PASS one-child `500` for all three row-active masks; matching `31x1` repeat FAILS at sync/global 256 | `_Z25lds_direct_ab_phase_probev` | 280 B | 10 | 5 | 0 | 32 |
 | direct-AB multi-exec active `1x29`/`1x30` in `1x34` block/layout, reads=2, 448 iters, 512x86 | PASS one-child `500` for both column-active masks; previous `1x31` PASS, `1x32` FAIL at sync/global 64 | `_Z25lds_direct_ab_phase_probev` | 280 B | 9 | 6 | 0 | 32 |
-| throwaway direct-AB active `1x32` in `1x34` block/layout, reads=2, forced compare/cndmask wrap, 448 iters, 512x86 | PASS one-child `500`; normal `% 32`/`v_and 31` codegen FAILS at sync/global 64 | `_Z25lds_direct_ab_phase_probev` | 280 B | 9 | 6 | 0 | 32 |
-| throwaway direct-AB shifted active `31x1` in `34x1` block/layout, reads=2, 448 iters, 512x86 | start=1 PASS one-child `500`; start=2 FAIL at sync/global 182 and repeat FAIL at 379; start=3 FAIL after reset pressure at 375 | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
+| direct-AB active `1x32` in `1x34` block/layout, reads=2, forced compare/cndmask wrap, 448 iters, 512x86 | PASS one-child `500`; normal `% 32`/`v_and 31` codegen FAILS at sync/global 64 | `_Z25lds_direct_ab_phase_probev` | 280 B | 9 | 6 | 0 | 32 |
+| direct-AB promoted-source shifted active `31x1` in `34x1` block/layout, reads=2, 448 iters, 512x86 | start=0 PASS one-child `500`; start=1 PASS one-child `500`; start=2 FAIL at sync/global 374 with canonical gfxhub/GDS signature; all use DS=12 | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5-6 | 0 | 32 |
 | direct-AB multi-exec `17x2`/`2x17` block/layout, reads=2, 448 iters, 512x86 | `17x2`: FAIL one-child `130` at sync/global 32; `2x17`: FAIL one-child `130` at sync/global 35 | `_Z25lds_direct_ab_phase_probev` | 280 B | 24 | 2 | 0 | 32 |
 | direct-AB pre-sync diagnostic `11x3`/`3x11` block/layout, reads=2, 448 iters, 512x86 | `PRE_SYNC_EACH_LAUNCH=1`: `11x3` one-child `133` PASS; `3x11` one-child `134` FAIL at sync/global 133 | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
 | direct-AB throwaway host-sleep diagnostic `11x3` block/layout, reads=2, 448 iters, 512x86 | local-only `PRE_LAUNCH_SLEEP_US=1000`: one-child `133` FAIL at sync/global 73 | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
