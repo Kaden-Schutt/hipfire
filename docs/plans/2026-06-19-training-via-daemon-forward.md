@@ -304,3 +304,30 @@ reinvent shallow-K; (b) accept ~+0.47 as near-free-but-weaker and test PFlash
 end-to-end tolerance vs shallow-K's +0.69; (c) shelve, PFlash keeps shallow-K.
 This closes the drafter architecture search — the lever was never the token-mixer,
 the head, capacity, data, or regularization; it is the context-free INPUT.
+
+### Option (b) — embedding-only PFlash scorer: offline envelope sweep (2026-06-20)
+
+Question: can the ~free embedding-only importance signal (no forward pass) replace
+the 0.8b drafter's shallow-K forward in PFlash? Baseline NIAH (9b target, 0.8b
+drafter, 16k, keep 0.30): **compress = 7343ms = 31% of TTFT** (the drafter's
+LinearAttention/SSM scan over 10881 source tokens) — so the cost prize is real.
+
+Offline needle-survival check (exact 16k tokens + 0.8b embed table, block-mean-embed
+cosine vs last token — the same math a real embedding-only scorer would run):
+- needle (random code, depth 0.50, mid-doc, no anchor) KEPT @ keep ≥ 0.105, ALL
+  block sizes (32/64/128/256); DROPPED @ keep 0.05.
+- BUT margin is only **0.8σ above filler median** — this is the MAXIMALLY distinctive
+  needle (random code); subtler facts or 128k-scale dilution likely fall below the
+  keep-0.30 cutoff.
+- Depth-invariant for a fixed doc-end token (cosine is content-based; filler
+  score-multiset unchanged by reordering) — distinctiveness + keep-ratio are the
+  risk axes, not depth. (A first shuffle test spuriously showed depth-dependence
+  because it moved the last-token reference — corrected.)
+
+**Verdict:** embedding-only is viable only in a NARROW envelope — keep-ratio ≳ 0.15
+AND distinctive (retrieval-style) needles. Inside it: a genuine ~30% TTFT win (kills
+the 7.3s compress). Outside it (keep 0.05, subtle needles): drops the needle. Same
+information wall as the oracle — raw embeddings give 0.8σ separation, and a build
+can't widen that. Build only if PFlash's real operating point is keep ≳ 0.15 with
+distinctive content; else the sweep already answers it. (PflashConfig default
+keep_ratio=0.05 → out of envelope; NIAH bench --pflash default 0.30 → in envelope.)
