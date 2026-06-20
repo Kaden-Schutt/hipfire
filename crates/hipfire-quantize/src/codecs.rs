@@ -337,6 +337,10 @@ pub(crate) fn quantize_hfq4g128(f32_data: &[f32]) -> Vec<u8> {
 /// Same binary format as HFQ4-G256 (136 bytes/group) — the rotation is baked
 /// into the weights. The GEMV kernel rotates x instead of inverse-rotating w.
 pub(crate) fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    // mqN+ modifier: route to the clip-searched variant (identical byte layout).
+    if crate::mq4_clipsearch_enabled() {
+        return quantize_mq4g256_clipsearch(f32_data, signs1, signs2);
+    }
     let group_size = 256;
     let block_bytes = 136;
     let n = f32_data.len();

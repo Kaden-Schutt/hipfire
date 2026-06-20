@@ -113,6 +113,16 @@ static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 // alpha=1 is pure activation-magnitude scaling (no smoothing).
 static AWQ_ALPHA: OnceLock<f32> = OnceLock::new();
 
+// MQ+ clip-search: when set (by an `mqN+` format), MQ codecs use the MSE-optimal
+// clip-searched affine range instead of plain min/max. Off by default, so the
+// baseline MQ path (and its golden hashes) is unchanged.
+static MQ4_CLIPSEARCH: OnceLock<bool> = OnceLock::new();
+
+/// Whether the `mqN+` clip-search variant is active for MQ codecs.
+pub(crate) fn mq4_clipsearch_enabled() -> bool {
+    MQ4_CLIPSEARCH.get().copied().unwrap_or(false)
+}
+
 // ─── Safetensors Parser ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -4526,7 +4536,16 @@ fn main() {
         arg_value(&args, "--chat-template-file").map(|p| read_chat_template_file(Path::new(p)));
 
     let format_arg = arg_value(&args, "--format").unwrap_or("q8f16");
-    let format_storage = normalize_format_flag(format_arg);
+    let mut format_storage = normalize_format_flag(format_arg);
+    // `mqN+` modifier: clip-search + AWQ on top of the base MQ format. Strip the
+    // trailing `+` so downstream format matching sees the base (e.g. "mq4"), and
+    // enable clip-search globally. AWQ is auto-enabled below.
+    let mq_plus = format_storage.ends_with('+');
+    if mq_plus {
+        format_storage.pop();
+        let _ = MQ4_CLIPSEARCH.set(true);
+        eprintln!("mq+ modifier: clip-search enabled; AWQ auto-on (needs --hessian/--imatrix)");
+    }
     let format = format_storage.as_str();
     eprintln!("Format: {format}");
 
@@ -5034,6 +5053,44 @@ fn main() {
         eprintln!("imatrix loaded from {}", path.display());
     }
 
+    // --hessian <path>: reuse an existing HFHS-v1 *.hessian.bin as the AWQ
+    // activation statistic. The per-input-channel Hessian diagonal
+    // H[j,j] = Σ_token x[j]² IS AWQ's in_sum2[j], so this feeds --awq without a
+    // separate llama.cpp imatrix GGUF. Keyed by the weight tensor name (HFHS
+    // stores the base name; AWQ looks up `<...>.weight`). Ignored if --imatrix
+    // already populated IMATRIX.
+    if IMATRIX.get().is_none() {
+        if let Some(hpath) = args
+            .iter()
+            .position(|a| a == "--hessian")
+            .and_then(|i| args.get(i + 1))
+            .map(PathBuf::from)
+        {
+            if !hpath.exists() {
+                eprintln!("error: --hessian path not found: {}", hpath.display());
+                std::process::exit(1);
+            }
+            match hfhs_diag::read_diagonals(&hpath) {
+                Ok(diags) => {
+                    let mut table: HashMap<String, Vec<f32>> = HashMap::with_capacity(diags.len() * 2);
+                    for (name, diag) in diags {
+                        table.insert(format!("{name}.weight"), diag.clone());
+                        table.insert(name, diag); // bare-name fallback
+                    }
+                    let n = table.len();
+                    IMATRIX
+                        .set(table)
+                        .expect("IMATRIX set twice — should not happen");
+                    eprintln!("imatrix derived from hessian diagonals ({hpath:?}): {n} keys");
+                }
+                Err(e) => {
+                    eprintln!("error: --hessian read failed ({}): {e}", hpath.display());
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
     // ── Phase A Stage A: AWQ (Activation-aware Weight Quantization) ──
     // --awq           → enable AWQ at default alpha=0.55
     // --awq-alpha <f> → enable AWQ at explicit alpha (overrides default)
@@ -5050,7 +5107,8 @@ fn main() {
     // outlier mitigation techniques" — MR-GPTQ is the right lever there,
     // tracked as Stage C). HFP4/MFP4 are explicitly NOT awq-pre-scaled
     // in this patch.
-    let awq_enabled = args.iter().any(|a| a == "--awq") || args.iter().any(|a| a == "--awq-alpha");
+    let awq_enabled =
+        mq_plus || args.iter().any(|a| a == "--awq") || args.iter().any(|a| a == "--awq-alpha");
     let awq_alpha = args
         .iter()
         .position(|a| a == "--awq-alpha")
