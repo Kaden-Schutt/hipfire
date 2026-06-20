@@ -47,6 +47,25 @@ impl Gemma3VlBackend {
             state,
         }
     }
+
+    /// Encode one image's bytes through SigLIP + projector into `mm_tokens × th`
+    /// text-hidden rows on the host (row-major, ready to splice at the image
+    /// placeholders). GPU scratch is freed before returning.
+    fn encode_image(&self, gpu: &mut Gpu, bytes: &[u8]) -> Result<Vec<f32>, String> {
+        let patches = preprocess_image_bytes(bytes, &self.vl_cfg.vision)?;
+        let vis = vision_forward(gpu, &self.weights.vision, &self.vl_cfg.vision, &patches)
+            .map_err(|e| format!("gemma3-vl: vision_forward: {e:?}"))?;
+        let img_embeds_gpu = project(gpu, &self.weights.projector, &self.vl_cfg, &vis)
+            .map_err(|e| format!("gemma3-vl: project: {e:?}"))?;
+        gpu.free_tensor(vis)
+            .map_err(|e| format!("gemma3-vl: free vis: {e:?}"))?;
+        let img_embeds = gpu
+            .download_f32(&img_embeds_gpu)
+            .map_err(|e| format!("gemma3-vl: download img_embeds: {e:?}"))?;
+        gpu.free_tensor(img_embeds_gpu)
+            .map_err(|e| format!("gemma3-vl: free img_embeds: {e:?}"))?;
+        Ok(img_embeds)
+    }
 }
 
 impl SimpleAr for Gemma3VlBackend {
@@ -86,34 +105,43 @@ impl SimpleAr for Gemma3VlBackend {
     }
 }
 
-/// Expand the begin-of-image (`boi`) placeholder in a tokenized prompt into the
+/// Expand each begin-of-image (`boi`) placeholder in a tokenized prompt into the
 /// full image block `[boi, image_soft_token × mm, eoi]` — mirroring the HF
 /// Gemma3 processor, which replaces each `<start_of_image>` with the soft tokens
-/// + `<end_of_image>`. If the framed prompt carries no `boi` (e.g. a caller that
-/// didn't template the image marker) the block is prepended after any leading
-/// `<bos>`, so an image request is never silently dropped.
-fn splice_image_tokens(vl: &Gemma3VlConfig, ids: &[u32]) -> Vec<u32> {
+/// + `<end_of_image>`. Multi-image: every `boi` in the prompt is expanded, so a
+/// prompt with `n_images` markers yields `n_images` blocks (`n_images × mm`
+/// placeholders) consuming the projected rows in order.
+///
+/// If the framed prompt carries fewer markers than `n_images` (e.g. a caller
+/// that didn't template the markers), the missing blocks are prepended after any
+/// leading `<bos>`, so an image request is never silently dropped.
+fn splice_image_tokens(vl: &Gemma3VlConfig, ids: &[u32], n_images: usize) -> Vec<u32> {
     let mm = vl.mm_tokens_per_image;
-    let mut out = Vec::with_capacity(ids.len() + mm + 1);
-    let mut spliced = false;
+    let push_block = |out: &mut Vec<u32>| {
+        out.push(vl.boi_token_index);
+        out.extend(std::iter::repeat(vl.image_token_index).take(mm));
+        out.push(vl.eoi_token_index);
+    };
+
+    let mut out = Vec::with_capacity(ids.len() + n_images * (mm + 2));
+    let mut expanded = 0usize;
     for &id in ids {
         if id == vl.boi_token_index {
-            out.push(vl.boi_token_index);
-            out.extend(std::iter::repeat(vl.image_token_index).take(mm));
-            out.push(vl.eoi_token_index);
-            spliced = true;
+            push_block(&mut out);
+            expanded += 1;
         } else {
             out.push(id);
         }
     }
-    if !spliced {
-        // No marker in the prompt: prepend the block (after a leading <bos>=0).
+
+    // Fewer markers than images: prepend the deficit after a leading <bos>=0.
+    if expanded < n_images {
         let insert_at = usize::from(ids.first() == Some(&0));
-        let mut block = Vec::with_capacity(mm + 2);
-        block.push(vl.boi_token_index);
-        block.extend(std::iter::repeat(vl.image_token_index).take(mm));
-        block.push(vl.eoi_token_index);
-        out.splice(insert_at..insert_at, block);
+        let mut blocks = Vec::with_capacity((n_images - expanded) * (mm + 2));
+        for _ in 0..(n_images - expanded) {
+            push_block(&mut blocks);
+        }
+        out.splice(insert_at..insert_at, blocks);
     }
     out
 }
@@ -134,10 +162,15 @@ impl ServingBackend for Gemma3VlBackend {
         self.text_cfg.eos_token_id
     }
 
-    /// Multimodal serve: encode the image (if any) through SigLIP + projector,
+    /// Multimodal serve: encode each image (if any) through SigLIP + projector,
     /// splice the projected rows into the prompt at the image placeholders during
-    /// prefill, then run the shared [`decode_loop`]. With no `image_bytes` this is
-    /// the plain gemma3 text path (tokenize → prefill → decode_loop).
+    /// prefill, then run the shared [`decode_loop`]. With no images this is the
+    /// plain gemma3 text path (tokenize → prefill → decode_loop).
+    ///
+    /// Multi-image: `ctx.images` carries one entry per image (a video's frames
+    /// arrive as a stack of images). Each is encoded to `mm` rows; the rows are
+    /// concatenated in image order and consumed left-to-right at the prompt's
+    /// `image_soft_token` placeholders.
     fn serve(
         &mut self,
         gpu: &mut Gpu,
@@ -151,27 +184,22 @@ impl ServingBackend for Gemma3VlBackend {
         }
 
         // Text-only request: no splice, plain dense-AR prefill + shared loop.
-        let Some(bytes) = ctx.image_bytes else {
+        if ctx.images.is_empty() {
             self.prefill(gpu, &ids)?;
             return decode_loop(gpu, self, tok, eos, ctx, ids.len(), ids.len());
-        };
+        }
 
-        // Vision: image bytes → SigLIP → projector → 256 text-hidden rows (host).
-        let patches = preprocess_image_bytes(bytes, &self.vl_cfg.vision)?;
-        let vis = vision_forward(gpu, &self.weights.vision, &self.vl_cfg.vision, &patches)
-            .map_err(|e| format!("gemma3-vl: vision_forward: {e:?}"))?;
-        let img_embeds_gpu = project(gpu, &self.weights.projector, &self.vl_cfg, &vis)
-            .map_err(|e| format!("gemma3-vl: project: {e:?}"))?;
-        gpu.free_tensor(vis)
-            .map_err(|e| format!("gemma3-vl: free vis: {e:?}"))?;
-        let img_embeds = gpu
-            .download_f32(&img_embeds_gpu)
-            .map_err(|e| format!("gemma3-vl: download img_embeds: {e:?}"))?;
-        gpu.free_tensor(img_embeds_gpu)
-            .map_err(|e| format!("gemma3-vl: free img_embeds: {e:?}"))?;
-
+        // Vision: each image → SigLIP → projector → mm text-hidden rows (host),
+        // concatenated in image order.
         let th = self.vl_cfg.text_hidden_size;
-        let stream = splice_image_tokens(&self.vl_cfg, &ids);
+        let n_images = ctx.images.len();
+        let mut img_embeds: Vec<f32> =
+            Vec::with_capacity(n_images * self.vl_cfg.mm_tokens_per_image * th);
+        for bytes in ctx.images {
+            img_embeds.extend(self.encode_image(gpu, bytes)?);
+        }
+
+        let stream = splice_image_tokens(&self.vl_cfg, &ids, n_images);
 
         // Prefill: text tokens via forward_step; each image placeholder consumes
         // the next projected row via forward_step_with_embed (no embed scaling —
@@ -241,7 +269,7 @@ mod tests {
         let vl = backend_cfg();
         // user … <boi> … prompt  →  user … [boi, img×4, eoi] … prompt
         let ids = vec![10, 11, vl.boi_token_index, 12, 13];
-        let out = splice_image_tokens(&vl, &ids);
+        let out = splice_image_tokens(&vl, &ids, 1);
         assert_eq!(
             out,
             vec![10, 11, 255999, 262144, 262144, 262144, 262144, 256000, 12, 13]
@@ -254,10 +282,33 @@ mod tests {
     fn splice_prepends_after_bos_when_no_marker() {
         let vl = backend_cfg();
         let ids = vec![0u32, 10, 11]; // leading <bos>=0
-        let out = splice_image_tokens(&vl, &ids);
+        let out = splice_image_tokens(&vl, &ids, 1);
         assert_eq!(
             out,
             vec![0, 255999, 262144, 262144, 262144, 262144, 256000, 10, 11]
         );
+    }
+
+    #[test]
+    fn splice_expands_each_marker_for_multi_image() {
+        let vl = backend_cfg();
+        // Two <boi> markers → two image blocks, 8 placeholders total.
+        let ids = vec![0u32, vl.boi_token_index, vl.boi_token_index, 12];
+        let out = splice_image_tokens(&vl, &ids, 2);
+        assert_eq!(out.iter().filter(|&&t| t == 262144).count(), 8);
+        assert_eq!(out.iter().filter(|&&t| t == vl.boi_token_index).count(), 2);
+        assert_eq!(out.iter().filter(|&&t| t == vl.eoi_token_index).count(), 2);
+    }
+
+    #[test]
+    fn splice_prepends_deficit_blocks_when_markers_missing() {
+        let vl = backend_cfg();
+        // 3 images requested, prompt has no markers → 3 blocks prepended after <bos>.
+        let ids = vec![0u32, 10, 11];
+        let out = splice_image_tokens(&vl, &ids, 3);
+        assert_eq!(out.iter().filter(|&&t| t == vl.boi_token_index).count(), 3);
+        assert_eq!(out.iter().filter(|&&t| t == 262144).count(), 12);
+        assert_eq!(out[0], 0, "bos stays first");
+        assert_eq!(out[1], vl.boi_token_index, "blocks after bos");
     }
 }

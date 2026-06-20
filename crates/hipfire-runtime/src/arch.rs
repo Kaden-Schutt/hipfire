@@ -384,10 +384,12 @@ pub struct GenerateCtx<'a> {
     pub max_think_tokens: usize,
     /// Visible-stream stop sequences (in addition to EOS).
     pub stop_sequences: &'a [String],
-    /// Raw encoded image bytes for a multimodal request; the backend decodes +
-    /// preprocesses (None for a text-only request). The `caps().vision` flag
-    /// says whether a backend can consume it.
-    pub image_bytes: Option<&'a [u8]>,
+    /// Raw encoded image bytes for a multimodal request — one entry per image,
+    /// in prompt order (empty for a text-only request). A video is decoded to a
+    /// stack of frames upstream, each frame appearing here as one image. The
+    /// backend decodes + preprocesses each; the `caps().vision` flag says whether
+    /// a backend can consume them.
+    pub images: &'a [&'a [u8]],
     /// Visible-token streaming sink (the daemon's JSONL stdout writer).
     pub sink: &'a mut dyn std::io::Write,
 }

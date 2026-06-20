@@ -23,3 +23,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 # HF Gemma3ImageProcessor bilinear convolution far more closely than image-crate
 # resampling, and is the fast per-frame path for future video preprocessing.
 fast_image_resize = "5"
+
+[dev-dependencies]
+# Video → frame decode for the multimodal bring-up example (--video).
+hipfire-media = { path = "../hipfire-media" }
