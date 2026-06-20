@@ -20,6 +20,19 @@ Reserve ids 32/33/34 (31 = Qtip3G256 is the current max; 22–27 are
 documented-reserved interop slots — do not reuse). Defining MQ+ as id 32 with
 its own `HfqInputFormat` keeps it separate from MQ4 per the directive.
 
+> **Status (2026-06-20):** build order diverged from the "MQ+ first" plan below —
+> **Opus Quant (id 34) was built first** (the W4A4 compute stack was the open
+> question). Shipped: `QuantType::Oq4G256 = 34` + `HfqInputFormat::Oq4`
+> (`--format oq4`, HFQ-source pipeline, rotation-only; AWQ-smooth sidecar TBD),
+> `DType::Oq4G256` + qwen35 loader (qt=34), and the **decode** forward dispatch
+> (`weight_gemv` Oq4G256 arm). Validated: e2e GPU capstone 19–22 dB
+> (`validate_opus_w4a4_e2e`), decode parity 15–17 dB rotation-only
+> (`oq4_weight_gemv_parity`), and `qwen3.5-0.8b-oq4.hfq` emits (537.8 MB).
+> **Still open:** prefill-batched/all-site routing (fused QKV/gate-up have no
+> Oq4 variant → needs an unfused Oq4 fallback or fused siblings — an
+> architecture decision), then 4B coherence. ids 32 (MQ+) / 33 (Opus-A8) remain
+> reserved and unbuilt.
+
 ## Pipeline (per format), reusing existing infra
 
 1. **Produce artifact:** `hipfire-quantize --input qwen3.5-0.8b-bf16.hfq

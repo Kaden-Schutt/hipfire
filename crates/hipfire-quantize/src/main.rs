@@ -1987,9 +1987,12 @@ enum QuantType {
     Qtip3G256 = 31,
     /// Opus Quant W4A4 — symmetric signed-INT4, FWHT-rotated, per-group f32
     /// scale. On-disk block = [f16 scale][128 nibbles] = 130 B/256-group
-    /// (codec `quantize_oq4g256`). Loader (qwen35 qt=32) repacks to the kernel
+    /// (codec `quantize_oq4g256`). Loader (qwen35 qt=34) repacks to the kernel
     /// layout; forward int4-quantizes activations and runs the iu4·iu4 GEMM.
-    Oq4G256 = 32,
+    /// Id 34 = the eval-plan's reserved "Opus Quant (W4A4)" slot (32=MQ+,
+    /// 33=Opus-A8 remain reserved for those formats; see
+    /// docs/quant-formats/opus-mqplus-eval-plan.md).
+    Oq4G256 = 34,
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -3080,7 +3083,7 @@ fn quantize_hfq_source_tensor(
             // Opus Quant W4A4. Requires 256-aligned K (FWHT-256); ragged dims fall
             // back to Q8. Rotation-only here (no AWQ smooth on the HFQ-source path);
             // the awq_scale sidecar / SmoothQuant lever lands with the safetensors
-            // emit path. Loader is qwen35 qt=32; forward int4-quantizes activations.
+            // emit path. Loader is qwen35 qt=34; forward int4-quantizes activations.
             if k % 256 != 0 {
                 return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
             }

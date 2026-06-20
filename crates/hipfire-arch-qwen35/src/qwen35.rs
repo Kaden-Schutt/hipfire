@@ -2695,8 +2695,10 @@ fn load_weight_tensor_raw(
             }
         },
         16 => load_bf16_matrix_weight(gpu, data, m, k),
-        32 => {
-            // Opus Quant W4A4 (OQ4G256). On-disk: [f16 scale][128 nibbles] per
+        34 => {
+            // Opus Quant W4A4 (OQ4G256, quant_type id 34 — the eval-plan's reserved
+            // "Opus Quant" slot; 32=MQ+, 33=Opus-A8 stay reserved for those).
+            // On-disk: [f16 scale][128 nibbles] per
             // 256-group, row-contiguous (codec `quantize_oq4g256`). Repack to the
             // kernel layout in ONE buffer — packed nibbles [M,K/2] followed by
             // per-group f32 scales [M,K/256] — so the forward derives the
