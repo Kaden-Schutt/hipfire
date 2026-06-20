@@ -706,7 +706,13 @@ All rows below use the same gfx1103 Phoenix APU unless noted.
   while confirmation runs from `K_LIMIT=2880` upward (about 480+ loop trips)
   fail with the same reset family. The exact top-end cutoff is stress-history
   sensitive, so treat this as a work-depth envelope rather than a single
-  deterministic scalar threshold.
+  deterministic scalar threshold. A periodic-predicate throwaway complicates
+  the "extra sync" interpretation: period-512, period-256, period-128,
+  period-64, period-32, period-16, and period-8 prestore-barrier controls all
+  failed at full K, but a period-512 no-barrier `s_nop 0` control also failed.
+  The direct first-iteration-only barrier still passed after those failures.
+  This keeps recurrent same-loop scalar/control-flow perturbation in the
+  suspect set alongside recurrent extra sync.
   Same-row and same-tile membership are no longer required by the current
   evidence, and neither extra-load-before-second-store nor extra-load-after-row
   ordering prevents the failure, though the separate-tile and preloop controls
@@ -1147,6 +1153,19 @@ Latest artifact paths:
   `2910`, `2928`, `2934`, `2940`, `2941`, `2946`, and `2947`, all failing
   under 100 launches with HIP 719 around sync 96-99. Live dmesg advanced
   through the same MES `REMOVE_QUEUE` / MODE2 reset family, reaching reset 545.
+- `/tmp/hipfire-lds-periodic-barrier-runs/`: periodic prestore-control
+  throwaway. Periodic extra-barrier controls with periods `512`, `256`, `128`,
+  `64`, `32`, `16`, and `8` all failed under 100 launches at full K, generally
+  around sync 95-96, with metadata `group_segment_fixed_size=144`,
+  `sgpr_count=5`, `vgpr_count=10`, `wavefront_size=32`, and no private segment.
+  The period-512 case should take the extra barrier only once for K=3072, but
+  its ISA carries a loop counter plus `s_and_b32` / branch predicate. A matching
+  period-512 no-barrier control that executes `s_nop 0` on the same predicate
+  also failed at sync 96 with the same resource tuple. The direct
+  `tile6_lds_firstiter_barrier_noextra_load4_consume4_pinned` control was
+  rerun afterward and passed 100 launches, with no new dmesg reset after the
+  pass. Live dmesg advanced through the same MES `REMOVE_QUEUE` / MODE2 reset
+  family during the periodic failures, reaching reset 553.
 - `/tmp/hipfire-lds-crossrow-runs/`: cross-row extra-load controls. The first
   two-launch run failed adjacent to prior reset pressure, but a recovery
   `tile6_lds_second_store_only_read6` control passed, then clean
@@ -1450,6 +1469,10 @@ Evidence argues against these as sole causes:
   barrier passes, and a first-iteration-only extra barrier inside the K loop
   also passes 100 launches. The fail-side barrier controls require the extra
   sync epoch to repeat across K iterations.
+- Taken extra barrier count alone as the root cause: a period-512 periodic
+  barrier control fails even though it should take only one extra barrier at
+  K=3072, and a matching period-512 periodic `s_nop 0` control with no extra
+  barrier also fails. The direct first-iteration-only barrier remains pass-side.
 - Small K-depth alone for the repeated prestore-barrier branch: the same
   two-store/four-load/four-barrier shape passes at `K_LIMIT=2815` under 100
   launches. The fail-side reappears near the top of K, with confirmed failures
