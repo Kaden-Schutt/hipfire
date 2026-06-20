@@ -91,15 +91,23 @@ coverage. The cell set is `{dense, MoE} × {formats}` minus unsupported combos.
   keeps regeneration cheap without an in-memory branch that could drift from the
   real path.
 
-### D3 — Determinism (so the golden is stable run-to-run)
-- **Dense (arch 5):** no `atomicAdd` → byte/token-exact golden is stable; any
-  drift is real signal.
-- **MoE (arch 6):** MoE-down combine uses `atomicAdd` with documented
-  non-deterministic final bits (`kernels.rs:3751`,
-  `gemv_hfq4g256_moe_down.hip:19–23`). **Pin the fixture golden to the in-tree
-  deterministic combine** (`moe_down_combine_k8_batched`, `kernels.rs:3748`).
-  Bonus: the harness then doubles as a **determinism gate** (catches anything
-  re-routing MoE-down through the atomicAdd path).
+### D3 — Determinism (so the golden is stable run-to-run) — ✅ verified (no pin needed)
+- **Dense (arch 5):** no `atomicAdd` → byte-exact golden is stable. Confirmed.
+- **MoE (arch 6):** the `atomicAdd` non-determinism (`kernels.rs:3751`,
+  `gemv_hfq4g256_moe_down.hip`) is in the **prefill/batched** path. The fixture
+  golden runs `forward_scratch` (the **decode** path), which **already** folds
+  MoE-down via the fixed-order `moe_down_combine_k8_batched` (no atomicAdd —
+  `qwen35.rs:7869`, which documents the exact attractor mechanism: ULP drift
+  crossing the top-1 margin at step ~7/~114). So no pin is needed for the golden
+  as structured — **verified byte-deterministic across 3 runs at `ar len=128`**.
+  The gate's determinism check (run-twice) still doubles as a guard against
+  anything re-routing decode MoE-down through the atomicAdd path.
+- **Argmax-collapse caveat (observed):** the random MoE fixture's greedy AR
+  collapses to a constant token (`[0,0,…]`) — so the *argmax line* is a
+  degenerate golden for random fixtures. The **`logit_hash`** (over the full
+  logit vector at every position, with a growing KV cache) stays sensitive +
+  deterministic, and is what the gate pins. The legible-preamble upgrade (§293,
+  deferred) is what would make the argmax line itself meaningful.
 - **Near-tie backstop:** the sensitive (random) tail tokens sit on decision
   boundaries. Where a token-exact diff proves too flaky even with the pinned
   combine, fall back to a **top-token-with-logit-margin** assertion rather than
@@ -137,9 +145,12 @@ per-arch baseline + escalation message + `--record`). The real remaining wiring:
 
 - **P1 — D1 (AR runner):** ✅ landed (82542fae). `--mode ar` free-running greedy
   decode; `tf` preserved; validated on gfx1151.
-- **P2 — D2/D3:** extend `fixture-golden-gate.sh` to the format axis (MQ3/Q8/
-  lloyd/MQ6, not just mq4); add the MoE deterministic-combine pin so a long AR
-  tail is stable; a regenerate-and-cache helper.
+- **P2 — D2/D3:** ✅ landed (576ea14d). `fixture-golden-gate.sh` now iterates
+  `FORMATS=(mq4 mq3 mq6 q8f16)` per fixture, baselines keyed by `gpu_arch ×
+  model_arch × format`, soft-skip on unsupported. 8 gfx1151 baselines recorded
+  (mq4 cells preserve the old values → strict superset). MoE determinism pin:
+  closed by verification (decode path already deterministic; see D3). *Remaining
+  D2:* lloyd/qtip3 formats (research-gated flags) + the wider arch fleet.
 - **P3 — D4:** switch the gate to `--mode ar` (longer len) + rebaseline; **wire
   `fixture-golden-gate.sh` into `.githooks/pre-commit`** ahead of the
   `coherence-gate.sh` call (it is standalone today).
