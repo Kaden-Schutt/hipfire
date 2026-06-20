@@ -151,9 +151,20 @@ per-arch baseline + escalation message + `--record`). The real remaining wiring:
   (mq4 cells preserve the old values → strict superset). MoE determinism pin:
   closed by verification (decode path already deterministic; see D3). *Remaining
   D2:* lloyd/qtip3 formats (research-gated flags) + the wider arch fleet.
-- **P3 — D4:** switch the gate to `--mode ar` (longer len) + rebaseline; **wire
-  `fixture-golden-gate.sh` into `.githooks/pre-commit`** ahead of the
-  `coherence-gate.sh` call (it is standalone today).
+- **P3 — D4:** ✅ landed (a07d42dd). `fixture-golden-gate.sh` now returns
+  distinct exit codes (0 confirmed / 1 drift / 3 no-baseline / 2 can't-run) and
+  is wired into `.githooks/pre-commit` as the cheap front tier: exit 0 SKIPS the
+  heavy coherence battery (the cost win), 1/2/3 fall through to it (never skip
+  safety on an inconclusive tripwire). Gates only the coherence battery, not the
+  DFlash gate. `set -e`-safe (`|| tg=$?`); all paths verified on gfx1151.
+  Overrides: `HIPFIRE_FORCE_COHERENCE=1`, `HIPFIRE_SKIP_TINY_GOLDEN=1`.
+  - **`--mode ar` switch deprioritized (finding).** Both tf and ar call the same
+    `forward_scratch` decode kernels — ar only differs in *input values* (own
+    argmax vs a fixed stream), and the random fixture's ar output collapses to a
+    constant, so the sensitive signal is `logit_hash` in *both* modes. ar would
+    only add more decode positions / larger KV at the cost of a rebaseline; low
+    value until the legible-preamble (§293) makes the argmax line meaningful.
+    Keeping the baselined `tf len=16` gate.
 - **P4 — capture + commit** the per-arch-family golden set across the fleet
   (gfx1100 / gfx1201 / gfx1010 — gfx1151 already recorded).
 
