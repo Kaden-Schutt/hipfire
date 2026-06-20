@@ -430,13 +430,13 @@ if (Test-Path "$TargetDir\release\hipfire-host-profile.exe") {
 # .hsaco blobs. We mirror the Linux flow (install.sh): seed any blobs that
 # happen to be present in the checkout (developer case), then run
 # daemon.exe --precompile to JIT-compile the default Qwen3.5 kernel set
-# into ~/.hipfire/bin/kernels/compiled/<arch>/. First `hipfire run` is then
-# instant instead of a multi-minute hipcc wall.
+# into ~/.hipfire/kernels/<arch>/. First `hipfire run` is then instant
+# instead of a multi-minute hipcc wall.
 Write-Host ""
 if ($GpuArch -ne "unknown") {
     Write-Host "Setting up kernels for $GpuArch..." -ForegroundColor Cyan
     $KernelSrc  = "$RepoDir\kernels\compiled\$GpuArch"
-    $KernelDest = "$BinDir\kernels\compiled\$GpuArch"
+    $KernelDest = "$HipfireDir\kernels\compiled\$GpuArch"
     New-Item -ItemType Directory -Force -Path $KernelDest | Out-Null
 
     if (Test-Path $KernelSrc) {
@@ -458,7 +458,7 @@ if ($GpuArch -ne "unknown") {
 
 # ─── Pre-compile via daemon (parity with install.sh) ─────
 # Fills in any missing kernels for the active GPU. Uses hipcc in the
-# background; writes back to ~/.hipfire/bin/kernels/compiled/<arch>/.
+# background; writes back to ~/.hipfire/kernels/<arch>/.
 # Runs even when GpuArch is "unknown"; Gpu::init resolves the active arch
 # at runtime regardless of install-time detection.
 $DaemonExe = "$BinDir\daemon.exe"

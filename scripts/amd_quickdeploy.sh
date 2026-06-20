@@ -170,7 +170,7 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
     # Nuke stale JIT kernel cache — the handoff note in
     # memory/feedback_dflash_nondeterminism.md explains this is mandatory
     # on kernel-touching rebuilds.
-    rm -rf .hipfire_kernels "$HOME/.hipfire/bin/kernels/compiled" 2>/dev/null || true
+    rm -rf "$HOME/.hipfire/kernels" 2>/dev/null || true
 
     export HIPFIRE_FP16=0
     log "building hipfire (release, deltanet)..."

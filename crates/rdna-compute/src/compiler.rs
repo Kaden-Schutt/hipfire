@@ -195,30 +195,31 @@ impl KernelCompiler {
         Ok(())
     }
 
+    fn default_kernel_root() -> PathBuf {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .map(|home| home.join(".hipfire").join("kernels"))
+            .unwrap_or_else(|| PathBuf::from(".hipfire").join("kernels"))
+    }
+
     pub fn new(arch: &str, extra_flags: String) -> HipResult<Self> {
-        // Cache (hot path) defaults to $CWD/.hipfire_kernels so parallel
-        // worktrees/agents on the same machine don't clobber each other's
-        // JIT'd .hsaco blobs. /tmp was shared state: two daemons from
-        // different git states wrote the same {name}.hsaco path and
-        // thrashed each other's hash sidecars. $CWD isolation fixes that.
-        // End-user / CI can pin the old location back via
-        // HIPFIRE_KERNEL_CACHE=/tmp/hipfire_kernels if tmpfs speed matters.
+        // Cache (hot path) defaults to ~/.hipfire/kernels so installed kernels
+        // live under hipfire's normal state directory. End-user / CI can pin a
+        // checkout-local or tmpfs location via HIPFIRE_KERNEL_CACHE.
         // Per-arch keying matters for hetero (gfx906 + gfx1031 in one process):
         // without it, both arches would race for the same `{name}.hsaco` path,
         // surviving correctness via the source+arch hash check but thrashing
-        // recompiles every cross-arch interleaving. Path layout matches the
-        // pre-compiled `kernels/compiled/{arch}/` install dir + the already-
-        // documented `.hipfire_kernels/{arch}/{name}.hsaco` shape in
-        // docs/perf-checkpoints/2026-05-04-gfx906-mmq-junroll.md.
+        // recompiles every cross-arch interleaving.
         let cache_root = std::env::var_os("HIPFIRE_KERNEL_CACHE")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(".hipfire_kernels"));
+            .unwrap_or_else(Self::default_kernel_root);
         let cache_dir = cache_root.join(arch);
         std::fs::create_dir_all(&cache_dir).map_err(|e| {
             hip_bridge::HipError::new(0, &format!("failed to create cache dir: {e}"))
         })?;
 
-        // Probe for pre-compiled kernels: exe-relative → CWD-relative → ~/.hipfire/bin/
+        // Probe for pre-compiled kernels: exe-relative → CWD-relative → ~/.hipfire/
         let precompiled_dir = std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
@@ -233,23 +234,13 @@ impl KernelCompiler {
                 }
             })
             .or_else(|| {
-                std::env::var("HOME")
-                    .ok()
-                    .map(|h| {
-                        PathBuf::from(h)
-                            .join(".hipfire/bin/kernels/compiled")
-                            .join(arch)
-                    })
-                    .filter(|p| p.is_dir())
+                let installed_path = Self::default_kernel_root().join("compiled").join(arch);
+                installed_path.is_dir().then_some(installed_path)
             });
 
-        // Seed the tmpfs hot path from the persistent install location. /tmp
-        // dies on reboot but the install blobs don't, so first-daemon-after-
-        // boot copies them in. Subsequent daemons see a warm /tmp and skip
-        // this. Copy is incremental — only copies files not already present
-        // (or with stale hash) to avoid churn when both locations agree.
-        // `hipfire update` wipes BOTH /tmp and the install dir, so after an
-        // update + restart we get a fully-fresh re-seed.
+        // Seed the active cache from the persistent install location. Copy is
+        // incremental — only copies files not already present (or with stale
+        // hash) to avoid churn when both locations agree.
         // cache_dir is already arch-keyed; the hot dir IS the cache dir.
         let hot_dir = cache_dir.clone();
         if let Some(ref cold) = precompiled_dir {

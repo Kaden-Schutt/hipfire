@@ -35,8 +35,8 @@ if [[ ! -f "$MODEL" ]]; then
 fi
 
 # Clear kernel cache so each variant compiles fresh. Cache defaults to
-# $CWD/.hipfire_kernels; /tmp kept for HIPFIRE_KERNEL_CACHE=/tmp pinning.
-rm -rf /tmp/hipfire_kernels/ .hipfire_kernels/
+# ~/.hipfire/kernels; /tmp kept for HIPFIRE_KERNEL_CACHE=/tmp pinning.
+rm -rf /tmp/hipfire_kernels/ "$HOME/.hipfire/kernels"/gfx*/
 
 VARIANT_NAMES=(
     ""
@@ -75,7 +75,7 @@ BEST_V=0
 
 for V in 1 2 3 4 5; do
     # Clear kernel cache between variants so each compiles its own source
-    rm -rf /tmp/hipfire_kernels/ .hipfire_kernels/
+    rm -rf /tmp/hipfire_kernels/ "$HOME/.hipfire/kernels"/gfx*/
 
     printf '─── %s ───\n' "${VARIANT_NAMES[$V]}"
 

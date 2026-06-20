@@ -32,7 +32,7 @@ log "=== BISECT: $LABEL ($COMMIT) === $(date '+%Y-%m-%d %H:%M:%S')"
 
 # ── 1. Checkout + clean kernel cache ─────────────────────────────────────────
 git checkout "$COMMIT" --quiet 2>&1
-rm -rf /tmp/hipfire_kernels/ .hipfire_kernels/
+rm -rf /tmp/hipfire_kernels/ "$HOME/.hipfire/kernels"/gfx*/
 log "checked out $COMMIT"
 
 # ── 2. Build quantizer + inference ───────────────────────────────────────────

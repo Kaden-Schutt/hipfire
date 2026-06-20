@@ -243,7 +243,7 @@ done
 # ─── Kernels ─────────────────────────────────────────────
 echo ""
 if [ "$GPU_ARCH" != "unknown" ]; then
-    KERNEL_DEST="$BIN_DIR/kernels/compiled/$GPU_ARCH"
+    KERNEL_DEST="$HIPFIRE_DIR/kernels/compiled/$GPU_ARCH"
     mkdir -p "$KERNEL_DEST"
     if [ -d "$REPO_DIR/kernels/compiled/$GPU_ARCH" ]; then
         cp "$REPO_DIR/kernels/compiled/$GPU_ARCH"/*.hsaco "$KERNEL_DEST/" 2>/dev/null || true

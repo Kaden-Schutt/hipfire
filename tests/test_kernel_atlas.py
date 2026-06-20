@@ -505,7 +505,7 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
         manifest = {
             "objects": [
                 {
-                    "path": ".hipfire_kernels/gfx1010/gemv_hfq4g256_multirow_default.hsaco",
+                    "path": "~/.hipfire/kernels/gfx1010/gemv_hfq4g256_multirow_default.hsaco",
                     "kernels": [
                         {
                             "name": "gemv_hfq4g256_multirow_r4",
@@ -523,7 +523,7 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
                     },
                 },
                 {
-                    "path": ".hipfire_kernels/gfx1010/unprofiled_candidate.hsaco",
+                    "path": "~/.hipfire/kernels/gfx1010/unprofiled_candidate.hsaco",
                     "kernels": [
                         {
                             "name": "unprofiled_candidate",
@@ -597,7 +597,7 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
         manifest = {
             "objects": [
                 {
-                    "path": ".hipfire_kernels/gfx1201/gemv_hfq4g256_multirow_default.hsaco",
+                    "path": "~/.hipfire/kernels/gfx1201/gemv_hfq4g256_multirow_default.hsaco",
                     "kernels": [{"name": "gemv_hfq4g256_multirow_r4", "vgpr_count": 56}],
                     "instruction_summary": {
                         "instruction_count": 10,
@@ -647,7 +647,7 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
         manifest = {
             "objects": [
                 {
-                    "path": ".hipfire_kernels/gfx1201/gemv_hfq4g256_multirow_default.hsaco",
+                    "path": "~/.hipfire/kernels/gfx1201/gemv_hfq4g256_multirow_default.hsaco",
                     "kernels": [{"name": "gemv_hfq4g256_multirow_r4", "vgpr_count": 56}],
                     "instruction_summary": {"instruction_count": 10, "category_counts": {"valu": 6}},
                 }
@@ -668,7 +668,7 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
         self.assertEqual(task["hot_kernel"]["name"], "gemv_hfq4g256_multirow_r4")
         self.assertEqual(task["hot_kernel"]["op"]["role"], "multirow_gemv")
         self.assertEqual(task["hot_kernel"]["source_files"][0]["path"], "kernels/src/gemv_hfq4g256_multirow.hip")
-        self.assertEqual(task["hot_kernel"]["isa_objects"][0]["path"], ".hipfire_kernels/gfx1201/gemv_hfq4g256_multirow_default.hsaco")
+        self.assertEqual(task["hot_kernel"]["isa_objects"][0]["path"], "~/.hipfire/kernels/gfx1201/gemv_hfq4g256_multirow_default.hsaco")
         self.assertEqual(task["constraints"]["allowed_files"], ["kernels/src/gemv_hfq4g256_multirow.hip"])
         self.assertEqual(task["eval"]["metric"], "gen_tok_s")
         self.assertEqual(task["eval"]["goal"], "maximize")

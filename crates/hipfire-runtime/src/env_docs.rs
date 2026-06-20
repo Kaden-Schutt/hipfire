@@ -1539,11 +1539,11 @@ pub const ENV_HIPFIRE_JINJA_CHAT: EnvVarDoc = EnvVarDoc {
     source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/qwen35_prefill.rs:208",
 };
 
-/// `HIPFIRE_KERNEL_CACHE` — HIPFIRE_KERNEL_CACHE=/tmp/hipfire_kernels if tmpfs speed matters
+/// `HIPFIRE_KERNEL_CACHE` — Overrides the default kernel cache root (`~/.hipfire/kernels`)
 pub const ENV_HIPFIRE_KERNEL_CACHE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KERNEL_CACHE",
-    description: "HIPFIRE_KERNEL_CACHE=/tmp/hipfire_kernels if tmpfs speed matters",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/compiler.rs:213",
+    description: "Overrides the default kernel cache root (`~/.hipfire/kernels`)",
+    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/compiler.rs:214",
 };
 
 /// `HIPFIRE_KLD_DIRECT_F16KV_ATTN` — Used to configure runtime execution by explicitly setting "HIPFIRE_KLD_DIRECT_F16KV_ATTN"
