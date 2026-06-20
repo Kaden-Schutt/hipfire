@@ -47,6 +47,9 @@ function load_row(dst,    i) {
 function same(a, b) {
     return a == b ? "same" : "diff";
 }
+function same_known(a, b) {
+    return a == "" || b == "" || a == b ? "same" : "diff";
+}
 function resource_sig(side, k) {
     return side[k, "group_segment"] "/" side[k, "private_segment"] "/" \
         side[k, "sgpr"] "/" side[k, "vgpr"] "/" side[k, "wavefront"];
@@ -84,15 +87,16 @@ function code_same(k) {
     }
     return same(left[k, "amdgpu_isa_sha256"], right[k, "amdgpu_isa_sha256"]);
 }
-function classify(k,    source_same, code_same_result, resource_same, exit_same, env_same, build_same) {
+function classify(k,    source_same, code_same_result, resource_same, exit_same, sync_same, env_same, build_same) {
     source_same = same(left[k, "source_sha256"], right[k, "source_sha256"]);
     code_same_result = code_same(k);
     resource_same = same(resource_sig(left, k), resource_sig(right, k));
     exit_same = same(left[k, "exit"], right[k, "exit"]);
-    env_same = (same(left[k, "driver"], right[k, "driver"]) == "same" && \
-        same(left[k, "gpu"], right[k, "gpu"]) == "same" && \
-        same(left[k, "hipcc"], right[k, "hipcc"]) == "same") ? "same" : "diff";
-    build_same = same(left[k, "build_only"], right[k, "build_only"]);
+    sync_same = same(left[k, "sync_failure"], right[k, "sync_failure"]);
+    env_same = (same_known(left[k, "driver"], right[k, "driver"]) == "same" && \
+        same_known(left[k, "gpu"], right[k, "gpu"]) == "same" && \
+        same_known(left[k, "hipcc"], right[k, "hipcc"]) == "same") ? "same" : "diff";
+    build_same = same_known(left[k, "build_only"], right[k, "build_only"]);
 
     if (source_same == "diff") {
         return "source-drift";
@@ -105,6 +109,9 @@ function classify(k,    source_same, code_same_result, resource_same, exit_same,
     }
     if (exit_same == "diff") {
         return "same-codegen-runtime-diff";
+    }
+    if (sync_same == "diff") {
+        return "same-codegen-sync-detail-diff";
     }
     if (build_same == "diff") {
         return "same-codegen-build-mode-diff";
@@ -164,13 +171,13 @@ function print_both(k,    verdict) {
     printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", \
         k, "both", verdict, left[k, "exit"], right[k, "exit"], \
         left[k, "sync_failure"], right[k, "sync_failure"], \
-        same(left[k, "build_only"], right[k, "build_only"]), \
+        same_known(left[k, "build_only"], right[k, "build_only"]), \
         same(left[k, "source_sha256"], right[k, "source_sha256"]), \
         same(left[k, "amdgpu_obj_sha256"], right[k, "amdgpu_obj_sha256"]), \
         same(left[k, "amdgpu_isa_norm_sha256"], right[k, "amdgpu_isa_norm_sha256"]), \
         same(resource_sig(left, k), resource_sig(right, k)), \
-        same(left[k, "driver"], right[k, "driver"]), \
-        same(left[k, "hipcc"], right[k, "hipcc"]), \
+        same_known(left[k, "driver"], right[k, "driver"]), \
+        same_known(left[k, "hipcc"], right[k, "hipcc"]), \
         same(dmesg_sig(left, k), dmesg_sig(right, k)), \
         same(devcore_sig(left, k), devcore_sig(right, k)), \
         same(gcvm_sig(left, k), gcvm_sig(right, k)), \

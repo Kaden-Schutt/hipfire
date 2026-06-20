@@ -2479,6 +2479,41 @@ returns 24-column `same` rows for build-only and risky saved roots. Artificial
 mutations correctly classify an exit/sync change as
 `same-codegen-runtime-diff`, a resource tuple change as `resource-drift`, and
 non-overlapping reads/iteration shapes as `left-only` / `right-only`.
+Legacy direct-AB artifacts that predate `build_only` / `hipcc` metadata treat
+those blank fields as unknown rather than drift. A same-exit but different
+sync-failure line is classified as `same-codegen-sync-detail-diff`.
+
+Fresh promoted risky run from detached throwaway worktree
+`/tmp/hipfire-lds-direct-ab-risky-c9522387/` at commit `c9522387`:
+
+```text
+BUILD_ONLY=0 CLEAR_COREDUMP=1 WAIT_DEVCD_MS=12000 CHUNKS=96,5 GRID_X=512 GRID_Y=86 READS=3 ITERS=448 MODE=plain \
+  scripts/lds_direct_ab_multi_exec_matrix.sh /tmp/hipfire-lds-direct-ab-risky-c9522387-artifacts
+
+BUILD_ONLY=0 CLEAR_COREDUMP=1 WAIT_DEVCD_MS=12000 CHUNKS=101 GRID_X=512 GRID_Y=86 READS=3 ITERS=448 MODE=plain \
+  scripts/lds_direct_ab_multi_exec_matrix.sh /tmp/hipfire-lds-direct-ab-risky-c9522387-artifacts
+```
+
+Results:
+
+- `chunks=96,5`: passed, exit `0`, no devcoredump, no dmesg delta.
+- `chunks=101`: failed, exit `4`, `phase1 sync 24 global 24 failed:
+  unspecified launch failure (719)`, with `dmesg_remove_queue=3` and a late
+  generic coredump at `coredumps/late_2000ms.devcd135.data`.
+- The failing promoted run reproduced the direct-AB fault signature:
+  `devcore_fault_addr=0x000074669d000000`,
+  `devcore_prot_status=0x841051`,
+  `devcore_gcvm_flags=MORE_FAULTS,PERMISSION_FAULTS,RW`,
+  `devcore_gcvm_cid=8`, `devcore_gcvm_rw=1`, `devcore_gcvm_vmid=8`,
+  `devcore_gds_protection_fault=0x3f000007`,
+  `devcore_gds_vm_protection_fault=0x0fc00113`.
+- Comparing this fresh root against
+  `/tmp/hipfire-lds-direct-ab-multi-exec-artifacts/direct-ab-artifact-summary-validate.tsv`
+  reports the `chunks=101` row as `same-codegen-sync-detail-diff`: normalized
+  ISA, resources, exit code, devcore, GCVM, and GDS signatures match, while the
+  failure point moved from old `sync 100/global 100` to fresh `sync 24/global
+  24`. This reinforces the state-sensitive threshold model while preserving the
+  same fault mechanism.
 
 ### Additional Sequence Sweep (Fresh)
 
