@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire - see LICENSE and NOTICE in the project root.
 
-use std::{collections::BTreeMap, fs};
+use std::{collections::BTreeMap, fs, time::Duration};
 
 use serde_json::Value;
 
@@ -17,6 +17,8 @@ pub struct ConfigState {
     pub per_model_count: usize,
     pub loaded_from_disk: bool,
     pub warning: Option<String>,
+    pub schema_field_count: Option<usize>,
+    pub schema_warning: Option<String>,
 }
 
 impl ConfigState {
@@ -57,6 +59,7 @@ impl ConfigState {
             .get("default_model")
             .cloned()
             .unwrap_or_else(|| "qwen3.5:9b".into());
+        let (schema_field_count, schema_warning) = load_remote_schema(&probe_host_for(&host), port);
 
         Self {
             host,
@@ -66,23 +69,21 @@ impl ConfigState {
             per_model_count,
             loaded_from_disk,
             warning,
+            schema_field_count,
+            schema_warning,
         }
     }
 
     pub fn probe_host(&self) -> String {
-        match self.host.as_str() {
-            "0.0.0.0" | "" => "127.0.0.1".into(),
-            "::" => "::1".into(),
-            other => other.to_string(),
-        }
+        probe_host_for(&self.host)
     }
 
-    pub fn easy_rows(&self) -> Vec<(&'static str, String, &'static str)> {
+    pub fn easy_rows(&self) -> Vec<(&'static str, String, String)> {
         vec![
             (
                 "Model",
                 self.default_model.clone(),
-                "Default model pre-warmed by serve and used by chat.",
+                "Default model pre-warmed by serve and used by chat.".into(),
             ),
             (
                 "Context",
@@ -90,7 +91,7 @@ impl ConfigState {
                     .get("max_seq")
                     .cloned()
                     .unwrap_or_else(|| "32768".into()),
-                "KV cache capacity allocated at load.",
+                "KV cache capacity allocated at load.".into(),
             ),
             (
                 "Spec decode",
@@ -98,7 +99,7 @@ impl ConfigState {
                     .get("dflash_mode")
                     .cloned()
                     .unwrap_or_else(|| "off".into()),
-                "DFlash mode. Keep off unless intentionally testing drafts.",
+                "DFlash mode. Keep off unless intentionally testing drafts.".into(),
             ),
             (
                 "KV cache",
@@ -106,7 +107,7 @@ impl ConfigState {
                     .get("kv_cache")
                     .cloned()
                     .unwrap_or_else(|| "auto".into()),
-                "Precision/memory tradeoff for attention cache.",
+                "Precision/memory tradeoff for attention cache.".into(),
             ),
             (
                 "Thinking",
@@ -114,14 +115,63 @@ impl ConfigState {
                     .get("thinking")
                     .cloned()
                     .unwrap_or_else(|| "on".into()),
-                "Whether reasoning models emit a hidden think block.",
+                "Whether reasoning models emit a hidden think block.".into(),
             ),
             (
                 "Serve",
                 format!("{}:{}", self.host, self.port),
-                "OpenAI-compatible endpoint used by chat and API clients.",
+                "OpenAI-compatible endpoint used by chat and API clients.".into(),
+            ),
+            (
+                "Schema",
+                self.schema_field_count
+                    .map(|count| format!("{count} live fields"))
+                    .unwrap_or_else(|| "offline".into()),
+                self.schema_warning
+                    .clone()
+                    .unwrap_or_else(|| "Loaded from daemon operator API.".into()),
             ),
         ]
+    }
+}
+
+fn probe_host_for(host: &str) -> String {
+    match host {
+        "0.0.0.0" | "" => "127.0.0.1".into(),
+        "::" => "::1".into(),
+        other => other.to_string(),
+    }
+}
+
+fn load_remote_schema(host: &str, port: u16) -> (Option<usize>, Option<String>) {
+    let url = format!("http://{host}:{port}/operator/config/schema");
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_millis(450))
+        .build();
+    match agent.get(&url).call() {
+        Ok(resp) => match resp
+            .into_string()
+            .ok()
+            .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+        {
+            Some(Value::Array(fields)) => (Some(fields.len()), None),
+            Some(_) => (
+                None,
+                Some("operator schema endpoint returned non-array JSON".into()),
+            ),
+            None => (None, Some("schema parse error".into())),
+        },
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            (
+                None,
+                Some(format!(
+                    "schema HTTP {code}: {}",
+                    text.chars().take(120).collect::<String>()
+                )),
+            )
+        }
+        Err(err) => (None, Some(format!("schema unavailable: {err}"))),
     }
 }
 
