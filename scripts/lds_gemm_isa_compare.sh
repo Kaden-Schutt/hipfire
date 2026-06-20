@@ -12,7 +12,10 @@ SINGLE_INSTANTIATION="${SINGLE_INSTANTIATION:-0}"
 
 DEFAULT_SYMBOLS=(
     "_Z72gemm_lds_store_then_load_dynamiccols_load4_noextra_consume4_pinned_probeILi6EEviiii"
+    "_Z52gemm_lds_counter_noextra_load4_consume4_pinned_probeILi6EEviiii"
+    "_Z49gemm_lds_snop_noextra_load4_consume4_pinned_probeILi6EEviiii"
     "_Z54gemm_lds_tail_snop_noextra_load4_consume4_pinned_probeILi6EEviiii"
+    "_Z57gemm_lds_counter_mask_noextra_load4_consume4_pinned_probeILi6EEviiii"
 )
 
 if [[ ! -f "$SRC" ]]; then
@@ -61,8 +64,17 @@ variant_for_symbol() {
         "_Z72gemm_lds_store_then_load_dynamiccols_load4_noextra_consume4_pinned_probeILi6EEviiii")
             echo "gemm_lds_store_then_load_dynamiccols_load4_noextra_consume4_pinned_probe"
             ;;
+        "_Z52gemm_lds_counter_noextra_load4_consume4_pinned_probeILi6EEviiii")
+            echo "gemm_lds_counter_noextra_load4_consume4_pinned_probe"
+            ;;
+        "_Z49gemm_lds_snop_noextra_load4_consume4_pinned_probeILi6EEviiii")
+            echo "gemm_lds_snop_noextra_load4_consume4_pinned_probe"
+            ;;
         "_Z54gemm_lds_tail_snop_noextra_load4_consume4_pinned_probeILi6EEviiii")
             echo "gemm_lds_tail_snop_noextra_load4_consume4_pinned_probe"
+            ;;
+        "_Z57gemm_lds_counter_mask_noextra_load4_consume4_pinned_probeILi6EEviiii")
+            echo "gemm_lds_counter_mask_noextra_load4_consume4_pinned_probe"
             ;;
         *)
             return 1
@@ -184,7 +196,9 @@ extract_section() {
 count_op() {
     local pattern="$1"
     local section="$2"
-    rg -c "$pattern" "$section" || true
+    local count
+    count="$(rg -c "$pattern" "$section" || true)"
+    echo "${count:-0}"
 }
 
 summary="$OUT/isa-summary.tsv"

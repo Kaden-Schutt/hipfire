@@ -132,7 +132,7 @@ The currently promoted standalone GEMM jig lives in the repo:
   preserves logs, code objects, ISA/readobj output, and dmesg snapshots.
 - `scripts/lds_gemm_isa_compare.sh`: compile-only helper that builds the
   standalone probe, does not launch any GPU kernel, and writes per-symbol
-  resource/ISA counters for the no-extra versus tail-loop `s_nop` comparison.
+  resource/ISA counters for the promoted scalar-control comparison.
   Set `SINGLE_INSTANTIATION=1` to compile each mapped kernel in its own
   generated source/object.
 - `scripts/narrow-gemm-lds-shape.sh`: runs the curated variant matrix and
@@ -2423,9 +2423,10 @@ SINGLE_INSTANTIATION=1 scripts/lds_gemm_isa_compare.sh /tmp/hipfire-lds-gemm-isa
 
 The helper writes `isa-summary.tsv` plus per-symbol ISA and key-op extracts,
 with `SYMBOLS="..."` available for later single-symbol comparisons. The
-single-instantiation pass emits the same counts for the current no-extra and
-tail-noop pair, so the saved full-object comparison is not being skewed by
-neighboring template variants.
+default symbol set now covers no-extra, counter-only, pre-store `s_nop`, tail
+`s_nop`, and counter-mask. Full-object and single-instantiation modes emit the
+same counts for these symbols, so the saved full-object comparison is not being
+skewed by neighboring template variants.
 - A sequential K-limit sweep in
   `/tmp/hipfire-lds-tail-snop-klimit-runs/` shows the tail-noop trigger is
   concentrated near the top of the K loop. The initial concurrent
@@ -2458,6 +2459,28 @@ neighboring template variants.
   segment. The ISA delta from the pass-side no-extra shape is a loop-carried
   scalar increment (`s_add_i32`) and sink, with no extra LDS operation and no
   extra branch beyond the normal K-loop branch.
+- The compile-only single-instantiation helper now covers all promoted
+  scalar-control variants. With `SINGLE_INSTANTIATION=1`, the current object
+  counts are:
+  - no-extra pass-side: 392 bytes, 79 instructions, five `s_nop 0` prologue
+    padding ops, two LDS stores, four LDS loads, three barriers, two scalar
+    branches.
+  - counter-only: 372 bytes, 74 instructions, zero `s_nop 0`, same LDS/barrier
+    counts, same branch count, with an extra loop-carried `s_add_i32` before
+    the first LDS store.
+  - pre-store `s_nop`: 368 bytes, 73 instructions, one `s_nop 0` before the
+    first LDS store, same LDS/barrier/branch counts.
+  - tail `s_nop`: 368 bytes, 73 instructions, one `s_nop 0` after the final
+    barrier/gl0 invalidation and before the loop branch, same
+    LDS/barrier/branch counts.
+  - counter-mask: 400 bytes, 80 instructions, zero `s_nop 0`, same LDS/barrier
+    counts, same branch count.
+  All five use `group_segment_fixed_size=144`,
+  `private_segment_fixed_size=0`, `sgpr_count=5`, `vgpr_count=10`, and
+  `wavefront_size=32`. This strengthens the scalar-control/backedge-timing
+  lead: the observed failures are not tracking LDS operation count, barrier
+  count, register pressure, LDS footprint, or total instruction count in a
+  monotonic way.
 - This sharpens the current suspect further: in the
   second-store/four-waited-row-load loop, a single recurrent scalar no-op is
   enough to move the pass-side no-extra shape into the faulting class under
