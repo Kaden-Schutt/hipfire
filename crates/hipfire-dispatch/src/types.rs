@@ -739,5 +739,10 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
             | MQ4G256Lloyd
             | MFP4G32
             | ParoQ4G128
+            // Opus W4A4: weight_gemv's Oq4G256 arm does the FWHT (rotate_x_mq_for)
+            // itself, then int4-quantizes x — so it must reach the match, not the
+            // run_auto early return. NOT added to dtype_rotation_plan: that drives
+            // run_auto/gemv_steps, which Oq4 never uses (it calls the kernels direct).
+            | Oq4G256
     )
 }

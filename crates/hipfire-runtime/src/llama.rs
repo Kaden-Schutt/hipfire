@@ -914,6 +914,33 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
             )
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
         }
+        // Opus Quant W4A4 (Oq4G256) — int4 activations + int4 weights. Distinct
+        // from every other dtype here: those keep f16 activations and dequant the
+        // weight in-kernel; Opus quantizes the (AWQ-divided, FWHT-rotated) x to
+        // int4 at runtime then runs an integer iu4·iu4 GEMM. Decode is B=1.
+        //   x → rotate_x_mq_for (x/=awq_scale if sidecar + FWHT-256) → x_rot (f32)
+        //     → quantize_act_oq4 (int4 + per-group f32 scale) → gemm_oq4_grouped_wmma
+        // Weight buffer holds [packed nibbles | per-group f32 scales]; the scale
+        // pointer is a sub_offset view (see the qt=32 loader arm).
+        DType::Oq4G256 => {
+            const GROUP: usize = 256;
+            assert_eq!(w.k % GROUP, 0, "Oq4G256 weight_gemv: K must be % 256");
+            let ng = w.k / GROUP;
+            gpu.ensure_mq_signs()?;
+            let xr = xr!();
+            rotate_x_mq_for(gpu, w, x, &xr, w.k)?;
+            // Ephemeral int4 activation scratch (B=1). TODO(perf): hoist to a
+            // persistent gpu scratch buffer like mq_x_rot to avoid per-call alloc.
+            let xq = gpu.upload_raw(&vec![0u8; w.k / 2], &[w.k / 2])?;
+            let xs = gpu.upload_raw(&vec![0u8; ng * 4], &[ng])?;
+            gpu.quantize_act_oq4(&xr, &xq, &xs, 1, w.k, GROUP)?;
+            // Weight scales view: byte offset M*(K/2) into the combined buffer.
+            let ws = w.buf.sub_offset(w.m * (w.k / 2), w.m * ng * 4);
+            let r = gpu.gemm_oq4_grouped_wmma(&w.buf, &ws, &xq, &xs, y, w.m, w.k, 1, GROUP);
+            let _ = gpu.free_tensor(xq);
+            let _ = gpu.free_tensor(xs);
+            r
+        }
         // All other FWHT-requiring dtypes (MQ4G256, MQ6G256, MQ3G256, MQ2G256,
         // MQ2G256Lloyd, MQ3G256Lloyd, MQ4G256Lloyd, MFP4G32):
         // ensure_mq_signs + rotate_x_mq_for + run_auto
