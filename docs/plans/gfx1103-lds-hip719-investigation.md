@@ -1613,6 +1613,17 @@ Latest artifact paths:
   dmesg/devcoredump deltas. The code object has the same static barrier/DS/wait
   counts as `9x4 READS=2` (`8` / `20` / `12`) but the one-wave LDS layout
   (`group_segment=256`, `offset1=32`, `isa_norm=5188faa843fa5475`).
+- A `READS=2` first-over-one-wave sweep
+  (`/tmp/hipfire-lds-direct-ab-r2-threshold-artifacts/`, throwaway worktree
+  `/tmp/hipfire-lds-direct-ab-r2-threshold-1781924934`) tested the same
+  `iters=448`, `grid=512x86`, one-child edge with 33 active lanes. Both
+  `11x3` and transposed `3x11` passed `130` launches and failed at `140`
+  launches (`11x3`: sync/global 132; `3x11`: sync/global 133). The `11x3`
+  `130,10` split-child run passed. Both failing rows kept the canonical
+  HIP-719 signature (`REMOVE_QUEUE=3`, GCVM
+  `MORE_FAULTS,PERMISSION_FAULTS,RW`, VMID 8, GDS-VM `0x0fc00113`) and the
+  same static counts as the `9x4 READS=2` failure (`s_barrier=8`, DS=20,
+  `s_waitcnt=12`, `sgpr=2`, `vgpr=24`, `offset1=36`, `group_segment=276`).
 
 ## Current Narrowing
 
@@ -1951,6 +1962,11 @@ Reduction results after extending the standalone HIP GEMM probe:
   first-two-wave `36`-lane shape fails near `140`. That makes the current
   trigger model "two-wave active LDS traffic plus enough LDS reads and
   per-process launch lifetime" rather than LDS read count alone.
+- The READS=2 first-over-one-wave sweep sharpens that boundary: `11x3` and
+  `3x11` are only `33` active lanes but both cross from pass at `130` to fail
+  at one-child `140`, while `11x3` split as `130,10` passes. The transposed
+  result argues against a single row-pitch special case; the edge follows
+  crossing into a second active wave plus per-process launch lifetime.
 - Phase-mode controls sharpen the process-boundary result. With the same
   direct-AB kernel body at reads=6/192/511x86, same-process `99 + 1` fails on
   phase2 launch 0 / global launch 99, and same-process `98 + 2` fails on
@@ -2341,6 +2357,7 @@ LDS-only control:
 | direct-AB multi-exec `9x4` block/layout, reads=2, 448 iters, 512x86, split child | PASS for `130,10` and `120,20` total `140`; one-child `140` fails | `_Z25lds_direct_ab_phase_probev` | 288 B | 24 | 2 | 0 | 32 |
 | direct-AB multi-exec `9x4` block/layout, reads=1, 448 iters, 512x86 | PASS at one-child `220`/`260`/`300`/`500` | `_Z25lds_direct_ab_phase_probev` | 288 B | 22 | 2 | 0 | 32 |
 | direct-AB multi-exec `8x4` block/layout, reads=2, 448 iters, 512x86 | PASS at one-child `500`/`1000` | `_Z25lds_direct_ab_phase_probev` | 256 B | 24 | 2 | 0 | 32 |
+| direct-AB multi-exec `11x3`/`3x11` block/layout, reads=2, 448 iters, 512x86 | PASS at one-child `130`; FAIL at one-child `140`; `11x3` split `130,10` PASS | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
 | direct-AB no-output `8x4` active in `8x5` block, reads=6 | PASS at 512 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 256 B | 22 | 5 | 0 | 32 |
 
 ISA observations:
