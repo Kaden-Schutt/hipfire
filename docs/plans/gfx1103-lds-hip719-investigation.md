@@ -1624,6 +1624,19 @@ Latest artifact paths:
   `MORE_FAULTS,PERMISSION_FAULTS,RW`, VMID 8, GDS-VM `0x0fc00113`) and the
   same static counts as the `9x4 READS=2` failure (`s_barrier=8`, DS=20,
   `s_waitcnt=12`, `sgpr=2`, `vgpr=24`, `offset1=36`, `group_segment=276`).
+- A follow-up exact-edge sweep
+  (`/tmp/hipfire-lds-direct-ab-r1r2-edge-artifacts/`, throwaway worktree
+  `/tmp/hipfire-lds-direct-ab-r1r2-edge-1781925201`) kept the 33-lane
+  `11x3`/`3x11`, `iters=448`, `grid=512x86` shapes and first ran READS=1
+  high-count controls. Both orientations passed `500` launches at READS=1
+  (`s_barrier=16`, DS=24, `s_waitcnt=16`, `vgpr=22`, `offset1=36`). The
+  READS=2 one-child threshold tightened to `11x3` passing `131`/`132` and
+  failing at `133` (sync/global 130), while `3x11` passed `131`/`132`/`133`
+  and failed at `134` (sync/global 132). Both failures kept the canonical
+  coredump signature. A split-at-edge `11x3` `132,1` run passed, but a later
+  `3x11` `133,1` run failed inside child 0 at global 131 after reset pressure,
+  so that transposed split is recorded as state-sensitive rather than clean
+  process-boundary evidence.
 
 ## Current Narrowing
 
@@ -1967,6 +1980,14 @@ Reduction results after extending the standalone HIP GEMM probe:
   at one-child `140`, while `11x3` split as `130,10` passes. The transposed
   result argues against a single row-pitch special case; the edge follows
   crossing into a second active wave plus per-process launch lifetime.
+- The exact 33-lane edge remains read-pressure dependent and mildly
+  orientation/state sensitive. READS=1 on both 33-lane orientations survived
+  `500` launches, while READS=2 failed at one-child `133` for `11x3` and `134`
+  for `3x11`. The same run showed a clean `11x3` process split pass at total
+  `133` (`132,1`), but the `3x11` split-at-edge replay shifted downward after
+  reset pressure and failed in child 0. Treat the one-child thresholds as tight
+  local edges, and treat split behavior near the edge as state-sensitive unless
+  reproduced from a freshly reset stack.
 - Phase-mode controls sharpen the process-boundary result. With the same
   direct-AB kernel body at reads=6/192/511x86, same-process `99 + 1` fails on
   phase2 launch 0 / global launch 99, and same-process `98 + 2` fails on
@@ -2357,7 +2378,8 @@ LDS-only control:
 | direct-AB multi-exec `9x4` block/layout, reads=2, 448 iters, 512x86, split child | PASS for `130,10` and `120,20` total `140`; one-child `140` fails | `_Z25lds_direct_ab_phase_probev` | 288 B | 24 | 2 | 0 | 32 |
 | direct-AB multi-exec `9x4` block/layout, reads=1, 448 iters, 512x86 | PASS at one-child `220`/`260`/`300`/`500` | `_Z25lds_direct_ab_phase_probev` | 288 B | 22 | 2 | 0 | 32 |
 | direct-AB multi-exec `8x4` block/layout, reads=2, 448 iters, 512x86 | PASS at one-child `500`/`1000` | `_Z25lds_direct_ab_phase_probev` | 256 B | 24 | 2 | 0 | 32 |
-| direct-AB multi-exec `11x3`/`3x11` block/layout, reads=2, 448 iters, 512x86 | PASS at one-child `130`; FAIL at one-child `140`; `11x3` split `130,10` PASS | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
+| direct-AB multi-exec `11x3`/`3x11` block/layout, reads=1, 448 iters, 512x86 | PASS at one-child `500` for both orientations | `_Z25lds_direct_ab_phase_probev` | 276 B | 22 | 2 | 0 | 32 |
+| direct-AB multi-exec `11x3`/`3x11` block/layout, reads=2, 448 iters, 512x86 | `11x3`: PASS `131`/`132`, FAIL `133`, split `132,1` PASS; `3x11`: PASS `131`-`133`, FAIL `134`, split replay MIXED after reset pressure | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
 | direct-AB no-output `8x4` active in `8x5` block, reads=6 | PASS at 512 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 256 B | 22 | 5 | 0 | 32 |
 
 ISA observations:
