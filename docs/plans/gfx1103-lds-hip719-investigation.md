@@ -138,6 +138,10 @@ The currently promoted standalone GEMM jig lives in the repo:
   resource/ISA counters for the promoted scalar-control comparison.
   Set `SINGLE_INSTANTIATION=1` to compile each mapped kernel in its own
   generated source/object.
+- `scripts/lds_gemm_artifact_summary.sh`: read-only artifact summarizer for
+  cross-machine repro results. It writes TSV and Markdown summaries from
+  `meta.txt`, `run.log`, `exit_code.txt`, dmesg deltas, devcoredump presence,
+  and saved ISA/readobj files.
 - `scripts/narrow-gemm-lds-shape.sh`: runs the curated variant matrix and
   writes a TSV report plus summary.
 - `tests/gfx1103-lds-tail-snop-repro.sh`: focused cross-system pass/fail
@@ -2383,6 +2387,12 @@ OUT=/tmp/hipfire-lds-tail-snop-780m tests/gfx1103-lds-tail-snop-repro.sh
 Use `PROFILE=kedge` for the current K-limit edge (`K_LIMIT=3024` pass-side,
 `K_LIMIT=3032` fail-side) or `PROFILE=full` for baseline, K-edge, and full-depth
 tail-noop checks in one run.
+
+- Summarize an artifact root for cross-machine comparison:
+
+```bash
+scripts/lds_gemm_artifact_summary.sh /tmp/hipfire-lds-tail-snop-780m
+```
 
 - Safe build/codegen metadata capture without launching the repro:
 
