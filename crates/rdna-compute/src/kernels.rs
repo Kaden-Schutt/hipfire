@@ -3193,6 +3193,9 @@ pub const VIT_ATTENTION_OPT_SRC: &str = include_str!("../../../kernels/src/vit_a
 /// Generic bidirectional flash attention, bf16 fused-qkv in → f32 out. Online
 /// softmax, no scores[N] materialisation. The bf16 vision tower's attention.
 pub const FLASH_ATTN_BF16_SRC: &str = include_str!("../../../kernels/src/flash_attn_bf16.hip");
+/// Split/pad fused f32 qkv → head-dim-padded q(f32)/k(f16)/v(f16), and unpad the
+/// attention output, for the f16-KV WMMA flash kernels (which require head_dim=128).
+pub const ATTN_PAD_F16KV_SRC: &str = include_str!("../../../kernels/src/attn_pad_f16kv.hip");
 
 /// Batched GEMM for F32: Y[M,N] = A[M,K] @ B[N,K]^T
 pub const GEMM_F32_SRC: &str = include_str!("../../../kernels/src/gemm_f32.hip");

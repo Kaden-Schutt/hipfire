@@ -144,18 +144,50 @@ pub fn vision_forward(
         );
         let qkv = timed!(0, linear_bf16(gpu, &lw.qkv_w, &tmp, &lw.qkv_b, 3 * h, h, n));
         gpu.free_tensor(tmp)?;
-        // Cast fused qkv → bf16, then bidirectional bf16 flash attention (online
-        // softmax, no causal mask). The flash kernel reads the fused qkv's q/k/v
-        // offsets directly, so no split is needed.
-        let qkv_bf16 = gpu.alloc_tensor(&[n * 3 * h], DType::BF16)?;
-        timed!(1, gpu.cast_f32_to_bf16(&qkv, &qkv_bf16));
-        gpu.free_tensor(qkv)?;
+        // Bidirectional attention (no causal mask). Fast path on WMMA archs
+        // (RDNA3/3.5/4): the f16-KV matrix-core flash, which needs head_dim=128 —
+        // split the fused qkv into padded q(f32)/k(f16)/v(f16), run, then unpad
+        // (~22× the generic kernel on this shape; zero-padded dims contribute
+        // nothing to QKᵀ/PV). Fallback on non-WMMA archs: the generic bf16 flash
+        // over the fused qkv directly.
         let attn_out = gpu.alloc_tensor(&[n * h], DType::F32)?;
-        timed!(
-            1,
-            gpu.flash_attn_bf16(&qkv_bf16, &attn_out, n, h, num_heads, head_dim)
-        );
-        gpu.free_tensor(qkv_bf16)?;
+        if gpu.arch_caps.has_wmma_w32() {
+            let hdp = 128usize;
+            let q_pad = gpu.alloc_tensor(&[n * num_heads * hdp], DType::F32)?;
+            let k_pad = gpu.alloc_tensor(&[n * num_heads * hdp], DType::F16)?;
+            let v_pad = gpu.alloc_tensor(&[n * num_heads * hdp], DType::F16)?;
+            timed!(
+                1,
+                gpu.attn_split_pad_f16kv(
+                    &qkv, &q_pad, &k_pad, &v_pad, n, h, num_heads, head_dim, hdp
+                )
+            );
+            gpu.free_tensor(qkv)?;
+            let attn_pad = gpu.alloc_tensor(&[n * num_heads * hdp], DType::F32)?;
+            timed!(
+                1,
+                gpu.attention_dflash_wmma_m64_n128_f16kv_v3_f32(
+                    &q_pad, &k_pad, &v_pad, &attn_pad, n, n, num_heads, num_heads, hdp,
+                )
+            );
+            gpu.free_tensor(q_pad)?;
+            gpu.free_tensor(k_pad)?;
+            gpu.free_tensor(v_pad)?;
+            timed!(
+                1,
+                gpu.attn_unpad(&attn_pad, &attn_out, n, num_heads, head_dim, hdp)
+            );
+            gpu.free_tensor(attn_pad)?;
+        } else {
+            let qkv_bf16 = gpu.alloc_tensor(&[n * 3 * h], DType::BF16)?;
+            timed!(1, gpu.cast_f32_to_bf16(&qkv, &qkv_bf16));
+            gpu.free_tensor(qkv)?;
+            timed!(
+                1,
+                gpu.flash_attn_bf16(&qkv_bf16, &attn_out, n, h, num_heads, head_dim)
+            );
+            gpu.free_tensor(qkv_bf16)?;
+        }
         let proj = timed!(
             0,
             linear_bf16(gpu, &lw.out_w, &attn_out, &lw.out_b, h, h, n)

@@ -41970,6 +41970,119 @@ impl Gpu {
         )
     }
 
+    /// Split a fused f32 qkv `[N, 3*hidden]` into head-dim-padded q(f32),
+    /// k(f16), v(f16) `[N, num_heads, hdp]` (dims `[head_dim, hdp)` zero-filled)
+    /// — the layout the f16-KV WMMA flash kernels (head_dim=128) consume.
+    pub fn attn_split_pad_f16kv(
+        &mut self,
+        qkv: &GpuTensor,
+        q_pad: &GpuTensor,
+        k_pad: &GpuTensor,
+        v_pad: &GpuTensor,
+        n: usize,
+        hidden: usize,
+        num_heads: usize,
+        head_dim: usize,
+        hdp: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "attn_split_pad_f16kv",
+            kernels::ATTN_PAD_F16KV_SRC,
+            "attn_split_pad_f16kv",
+        )?;
+        let mut qkvp = qkv.buf.as_ptr();
+        let mut qp = q_pad.buf.as_ptr();
+        let mut kp = k_pad.buf.as_ptr();
+        let mut vp = v_pad.buf.as_ptr();
+        let (mut ni, mut hi, mut nh, mut hd, mut hp) = (
+            n as i32,
+            hidden as i32,
+            num_heads as i32,
+            head_dim as i32,
+            hdp as i32,
+        );
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qkvp as *mut _ as *mut c_void,
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut hi as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut hp as *mut _ as *mut c_void,
+        ];
+        let total = (n * num_heads * hdp) as u32;
+        let grid = (total + 255) / 256;
+        self.launch_maybe_blob(
+            "attn_split_pad_f16kv",
+            [grid, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qkvp);
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_i32(ni);
+                b.push_i32(hi);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_i32(hp);
+                b
+            },
+        )
+    }
+
+    /// Inverse of [`Self::attn_split_pad_f16kv`]'s padding: attention output
+    /// `[N, num_heads, hdp]` → contiguous `[N, num_heads, head_dim]` = `[N, hidden]`.
+    pub fn attn_unpad(
+        &mut self,
+        input: &GpuTensor,
+        out: &GpuTensor,
+        n: usize,
+        num_heads: usize,
+        head_dim: usize,
+        hdp: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("attn_unpad", kernels::ATTN_PAD_F16KV_SRC, "attn_unpad")?;
+        let mut ip = input.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let (mut ni, mut nh, mut hd, mut hp) =
+            (n as i32, num_heads as i32, head_dim as i32, hdp as i32);
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ip as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut hp as *mut _ as *mut c_void,
+        ];
+        let total = (n * num_heads * head_dim) as u32;
+        let grid = (total + 255) / 256;
+        self.launch_maybe_blob(
+            "attn_unpad",
+            [grid, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ip);
+                b.push_ptr(op);
+                b.push_i32(ni);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_i32(hp);
+                b
+            },
+        )
+    }
+
     /// DFlash draft cross-attention: `B` queries attend to `L` keys/values
     /// with NO causal mask (bidirectional). Supports GQA; `n_heads` must be
     /// a multiple of `n_kv_heads`. See `kernels/src/attention_dflash.hip`

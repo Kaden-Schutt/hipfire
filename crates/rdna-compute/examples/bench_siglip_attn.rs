@@ -141,4 +141,79 @@ fn main() {
         }
     }
     eprintln!("  wmma_f32   rel_L1 vs ref = {:.3e}", rel_l1(&r_ref, &r_wm));
+
+    // ── flash_attn_bf16 (current tower kernel): fused bf16 qkv. ──
+    let fused_bf16: Vec<u8> = fused
+        .iter()
+        .flat_map(|&x| {
+            let u = x.to_bits();
+            let lsb = (u >> 16) & 1;
+            (((u + 0x7fff + lsb) >> 16) as u16).to_le_bytes()
+        })
+        .collect();
+    let mut d_fused_bf16 = gpu.upload_raw(&fused_bf16, &[n * 3 * hidden]).unwrap();
+    d_fused_bf16.dtype = DType::BF16;
+    let d_fb = gpu.zeros(&[n * hidden], DType::F32).unwrap();
+    {
+        let (d_fused_bf16, d_fb) = (&d_fused_bf16, &d_fb);
+        bench(
+            &mut gpu,
+            "flash_attn_bf16 (current, hd=72)",
+            Box::new(move |g: &mut Gpu| {
+                g.flash_attn_bf16(d_fused_bf16, d_fb, n, hidden, heads, hd)
+                    .unwrap();
+            }),
+        );
+    }
+    eprintln!(
+        "  flash_bf16 rel_L1 vs ref = {:.3e}",
+        rel_l1(&r_ref, &gpu.download_f32(&d_fb).unwrap())
+    );
+
+    // ── dots.ocr-champion WMMA flash, f16 K/V, head_dim padded 72→128. ──
+    let hd2 = 128usize;
+    let mut q128 = vec![0f32; n * heads * hd2];
+    let mut k128 = vec![0f32; n * heads * hd2];
+    let mut v128 = vec![0f32; n * heads * hd2];
+    for t in 0..n {
+        for h in 0..heads {
+            for d in 0..hd {
+                let src = (t * heads + h) * hd + d;
+                q128[(t * heads + h) * hd2 + d] = q[src];
+                k128[(t * heads + h) * hd2 + d] = k[src];
+                v128[(t * heads + h) * hd2 + d] = v[src];
+            }
+        }
+    }
+    let d_q128 = gpu.upload_f32(&q128, &[n * heads * hd2]).unwrap();
+    let d_k128f = gpu.upload_f32(&k128, &[n * heads * hd2]).unwrap();
+    let d_v128f = gpu.upload_f32(&v128, &[n * heads * hd2]).unwrap();
+    let d_k128 = gpu.alloc_tensor(&[n * heads * hd2], DType::F16).unwrap();
+    let d_v128 = gpu.alloc_tensor(&[n * heads * hd2], DType::F16).unwrap();
+    gpu.cast_f32_to_f16(&d_k128f, &d_k128).unwrap();
+    gpu.cast_f32_to_f16(&d_v128f, &d_v128).unwrap();
+    let d_v3 = gpu.zeros(&[n * heads * hd2], DType::F32).unwrap();
+    {
+        let (d_q128, d_k128, d_v128, d_v3) = (&d_q128, &d_k128, &d_v128, &d_v3);
+        bench(
+            &mut gpu,
+            "wmma_m64_n128_f16kv_v3 (hd=128)",
+            Box::new(move |g: &mut Gpu| {
+                g.attention_dflash_wmma_m64_n128_f16kv_v3_f32(
+                    d_q128, d_k128, d_v128, d_v3, n, n, heads, heads, hd2,
+                )
+                .unwrap();
+            }),
+        );
+    }
+    let r_v3_pad = gpu.download_f32(&d_v3).unwrap();
+    let mut r_v3 = vec![0f32; n * hidden];
+    for t in 0..n {
+        for h in 0..heads {
+            for d in 0..hd {
+                r_v3[(t * heads + h) * hd + d] = r_v3_pad[(t * heads + h) * hd2 + d];
+            }
+        }
+    }
+    eprintln!("  v3_f16kv   rel_L1 vs ref = {:.3e}", rel_l1(&r_ref, &r_v3));
 }
