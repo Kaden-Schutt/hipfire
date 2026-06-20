@@ -9,7 +9,7 @@
 
 // Helpers still defined in main.rs (crate root); codecs is a descendant module
 // so it can reference these private items. They will move here in a later batch.
-use crate::{cpu_fwht_256, f32_to_f16};
+use crate::{cpu_fwht_256, gen_fwht_signs, f16_to_f32, f32_to_f16};
 
 /// Quantize F32 weights to HFQ3-G256: 3-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][96B packed 3-bit] = 104 bytes per 256 weights (0.406 B/w).
@@ -508,4 +508,286 @@ pub(crate) fn quantize_mq8g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32])
     }
 
     output
+}
+
+// ─── HFQ4-G256 + HFP4/MFP4 (FP4) codecs ───
+/// MagnumQuant HFQ4-G256: FWHT-rotated 4-bit quantization.
+
+pub(crate) fn quantize_hfq4g256(f32_data: &[f32]) -> Vec<u8> {
+    let group_size = 256;
+    let block_bytes = 136;
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let group = &f32_data[start..end];
+
+        let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+        let range = max_val - min_val;
+        let scale = if range > 0.0 { range / 15.0 } else { 1.0 };
+        let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
+
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
+        output[out_off + 4..out_off + 8].copy_from_slice(&min_val.to_le_bytes());
+
+        let actual_len = end - start;
+        // Pack 256 weights into 128 bytes of nibbles
+        // byte[i] = weight[2*i] (lo nibble) | weight[2*i+1] (hi nibble)
+        for i in 0..128 {
+            let idx_lo = 2 * i;
+            let idx_hi = 2 * i + 1;
+            let lo_val = if idx_lo < actual_len {
+                group[idx_lo]
+            } else {
+                min_val
+            };
+            let hi_val = if idx_hi < actual_len {
+                group[idx_hi]
+            } else {
+                min_val
+            };
+
+            let lo_q = ((lo_val - min_val) * inv_scale + 0.5) as u8;
+            let hi_q = ((hi_val - min_val) * inv_scale + 0.5) as u8;
+
+            output[out_off + 8 + i] = lo_q.min(15) | (hi_q.min(15) << 4);
+        }
+    }
+
+    output
+}
+
+// ─── HFP4G32 — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale) ────────────────
+//
+// Spec: docs/quant-formats/hfp4.md
+//
+// Per-row layout: 16-B header (row_scale_a:f16, row_scale_b:f16, block_count:u16, flags:u8, ...)
+//                 followed by (K/32) blocks × 17 B (UE8M0:u8 + 16 B nibbles).
+// Per element:    value = row_scale_a * 2^(block_e - 127) * E2M1_LUT[nibble]
+
+/// OCP E2M1 magnitude lattice (signed 4-bit FP). 16 codes: {±0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}.
+/// Order: positive 0..7, then negative 0..7 (mirrors hardware-canonical sign-magnitude packing).
+pub(crate) const E2M1_LUT: [f32; 16] = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+];
+
+/// E2M1 round-to-nearest in the 16-code lattice. Returns the nibble (0..15).
+/// Ties broken away from zero (consistent with FP rounding).
+pub(crate) fn e2m1_round(x: f32) -> u8 {
+    let mut best_idx = 0u8;
+    let mut best_err = f32::INFINITY;
+    for (i, &code) in E2M1_LUT.iter().enumerate() {
+        let err = (code - x).abs();
+        // Strict < ensures consistent tie-breaking by code-table order.
+        // The lattice has +0 at index 0 and -0 at index 8; +0 wins ties at zero.
+        if err < best_err {
+            best_err = err;
+            best_idx = i as u8;
+        }
+    }
+    best_idx
+}
+
+/// Quantize one row of K FP32 weights to HFP4G32 byte format.
+///
+/// K must be a multiple of 32 (hipfire model dims always satisfy this).
+/// Returns 16-B header + (K/32) × 17-B blocks = 16 + 17 * (K/32) bytes.
+pub(crate) fn quantize_hfp4g32_row(row: &[f32]) -> Vec<u8> {
+    assert!(
+        row.len() % 32 == 0,
+        "HFP4G32 requires K%32 == 0, got K={}",
+        row.len()
+    );
+    let k = row.len();
+    let n_blocks = k / 32;
+    let row_bytes = 16 + n_blocks * 17;
+    let mut out = vec![0u8; row_bytes];
+
+    // Per-row FP16 second-level scale: row_scale_a = max_abs(row) / 6.0  (E2M1 max = 6.0).
+    let row_max_abs = row.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
+    let row_scale_a = if row_max_abs > 0.0 {
+        row_max_abs / 6.0
+    } else {
+        1.0
+    };
+    let inv_row_scale = if row_max_abs > 0.0 {
+        1.0 / row_scale_a
+    } else {
+        0.0
+    };
+
+    // Header.
+    out[0..2].copy_from_slice(&f32_to_f16(row_scale_a).to_le_bytes());
+    out[2..4].copy_from_slice(&0u16.to_le_bytes()); // row_scale_b unused in v1
+    out[4..6].copy_from_slice(&(n_blocks as u16).to_le_bytes()); // block_count
+    out[6] = 0u8; // format_flags = 0 (no rotation)
+    out[7] = 0u8; // reserved
+                  // out[8..16] reserved zeros (already zeroed by vec![0u8; ...])
+
+    // Per-block payload.
+    for b in 0..n_blocks {
+        let block_start = b * 32;
+        let block = &row[block_start..block_start + 32];
+
+        // Normalize block by row scale.
+        // block_max_normalized in units of [-6.0, +6.0] (because row_scale_a = max_abs/6.0).
+        // Pick UE8M0 block exponent so block fits cleanly into E2M1 lattice [-6, +6].
+        let block_max_abs = block.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
+        let block_max_normalized = block_max_abs * inv_row_scale;
+
+        // Choose smallest UE8M0 exponent that covers block_max_normalized without clipping:
+        //   6 * 2^(e - 127) ≥ block_max_normalized   →   e ≥ ceil(log2(block_max_normalized / 6)) + 127
+        // ceil (not round) prevents clipping; the precision cost is bounded by 1 bit at the top
+        // of the block. Clamp to UE8M0 range [0, 254] (255 = NaN, reserved per OCP spec).
+        let block_e: u8 = if block_max_normalized > 0.0 {
+            let log_ratio = (block_max_normalized / 6.0).log2();
+            let e_signed = log_ratio.ceil() as i32 + 127;
+            e_signed.clamp(0, 254) as u8
+        } else {
+            0u8 // empty block — smallest scale, all nibbles round to 0
+        };
+
+        let block_scale = (block_e as i32 - 127) as f32;
+        let block_scale_factor = block_scale.exp2(); // 2^(block_e - 127)
+        let inv_block_scale = if block_scale_factor > 0.0 {
+            1.0 / block_scale_factor
+        } else {
+            0.0
+        };
+
+        // Block payload offset in the row buffer.
+        let payload_off = 16 + b * 17;
+        out[payload_off] = block_e;
+
+        // Pack 32 elements as 16 bytes, low nibble = even index, high nibble = odd index.
+        for i in 0..16 {
+            let lo = block[2 * i] * inv_row_scale * inv_block_scale;
+            let hi = block[2 * i + 1] * inv_row_scale * inv_block_scale;
+            let lo_nibble = e2m1_round(lo);
+            let hi_nibble = e2m1_round(hi);
+            out[payload_off + 1 + i] = (lo_nibble & 0x0F) | ((hi_nibble & 0x0F) << 4);
+        }
+    }
+
+    out
+}
+
+/// Quantize a row-major 2D weight tensor of shape `[m, k]` to HFP4G32.
+/// Returns `m * (16 + 17 * (k/32))` bytes — 16-B row header + per-block payloads, repeated per row.
+///
+/// K%256 — not K%32 — because the v1 GEMV kernel
+/// (`crates/rdna-compute/src/dispatch.rs::gemv_hfp4g32`) iterates 256 elements
+/// per work-item and panics on K%256!=0. The byte format itself is K%32-aligned;
+/// the K%256 limit is a kernel-side constraint that v2 will lift. Refusing here
+/// makes the failure mode "quantize rejects bad input" rather than "runtime
+/// panics on first dispatch with a tensor a previous step already accepted."
+pub(crate) fn quantize_hfp4g32_2d(f32_data: &[f32], m: usize, k: usize) -> Vec<u8> {
+    assert_eq!(
+        f32_data.len(),
+        m * k,
+        "2D shape mismatch: {} vs {}*{}",
+        f32_data.len(),
+        m,
+        k
+    );
+    assert!(k % 256 == 0, "HFP4G32 v1 requires K%256==0 (gemv_hfp4g32 kernel constraint; v2 will lift to K%32==0), got K={}", k);
+    let row_bytes = 16 + 17 * (k / 32);
+    let mut out = Vec::with_capacity(m * row_bytes);
+    for r in 0..m {
+        let row = &f32_data[r * k..(r + 1) * k];
+        out.extend_from_slice(&quantize_hfp4g32_row(row));
+    }
+    out
+}
+
+/// MFP4G32 = HFP4G32 + offline FWHT rotation. Drop-in MQ4 replacement.
+///
+/// Applies the same per-256-element FWHT as `cpu_fwht_256` (used by MQ4) to the
+/// weight matrix before HFP4G32 quantization. Runtime path applies the same
+/// FWHT to activations via `mq_rotate_x`, so `dot(rot(W), rot(x)) == dot(W, x)`
+/// (the FWHT is orthogonal). K must be a multiple of LCM(32, 256) = 256.
+///
+/// Sets per-row `format_flags` to `0x05` (bit 0 = rotation present, bits 2-3 = 01
+/// = offline FWHT). This is metadata only — the kernel can still consume the
+/// row as plain HFP4G32 because the rotation is baked into the codes.
+pub(crate) fn quantize_mfp4g32_2d(
+    f32_data: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    assert_eq!(
+        f32_data.len(),
+        m * k,
+        "2D shape mismatch: {} vs {}*{}",
+        f32_data.len(),
+        m,
+        k
+    );
+    assert!(
+        k % 256 == 0,
+        "MFP4G32 requires k % 256 == 0 for 256-element FWHT, got k={}",
+        k
+    );
+    let row_bytes = 16 + 17 * (k / 32);
+    let mut out = Vec::with_capacity(m * row_bytes);
+
+    // Rotate one row's worth of weights in-place per 256-element segment, then
+    // quantize as HFP4G32 and stamp the rotation flag. Reuses signs1/signs2
+    // from the same `gen_fwht_signs(42, 256)` / `gen_fwht_signs(1042, 256)`
+    // pair MQ4 ships with so the runtime's mq_rotate_x undoes this rotation.
+    let mut row_buf = vec![0.0f32; k];
+    for r in 0..m {
+        row_buf.copy_from_slice(&f32_data[r * k..(r + 1) * k]);
+        // Apply 256-element FWHT to each segment of the row.
+        for seg in 0..(k / 256) {
+            cpu_fwht_256(&mut row_buf[seg * 256..(seg + 1) * 256], signs1, signs2);
+        }
+        let mut row_packed = quantize_hfp4g32_row(&row_buf);
+        // Stamp format_flags = 0x05 (bit 0 set + bits 2-3 = 01 = offline FWHT).
+        row_packed[6] = 0x05;
+        out.extend_from_slice(&row_packed);
+    }
+    out
+}
+
+/// CPU reference dequantization for HFP4G32 — bit-exact mirror of `gemv_hfp4g32.hip`'s dequant.
+/// Returns the K reconstructed FP32 weights for one row.
+#[allow(dead_code)] // used by tests + future round-trip diagnostics
+pub(crate) fn dequant_hfp4g32_row(packed: &[u8], k: usize) -> Vec<f32> {
+    assert!(k % 32 == 0, "HFP4G32 requires K%32 == 0");
+    let n_blocks = k / 32;
+    assert_eq!(
+        packed.len(),
+        16 + n_blocks * 17,
+        "HFP4G32 row size mismatch"
+    );
+
+    let row_scale_a_bits = u16::from_le_bytes([packed[0], packed[1]]);
+    let row_scale_a = f16_to_f32(row_scale_a_bits);
+
+    let mut out = vec![0.0f32; k];
+    for b in 0..n_blocks {
+        let payload_off = 16 + b * 17;
+        let block_e = packed[payload_off] as i32;
+        let block_scale = (block_e - 127) as f32;
+        let block_scale_factor = block_scale.exp2();
+        let scale = row_scale_a * block_scale_factor;
+
+        for i in 0..16 {
+            let byte = packed[payload_off + 1 + i];
+            let lo_nibble = (byte & 0x0F) as usize;
+            let hi_nibble = ((byte >> 4) & 0x0F) as usize;
+            out[b * 32 + 2 * i] = scale * E2M1_LUT[lo_nibble];
+            out[b * 32 + 2 * i + 1] = scale * E2M1_LUT[hi_nibble];
+        }
+    }
+    out
 }
