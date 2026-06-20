@@ -38,7 +38,14 @@
 set -e
 
 # List files staged for this commit.
-CHANGED=$(git diff --cached --name-only --diff-filter=ACM)
+#
+# `R` (renames) is included alongside ACM so that *moving* a hotspot file trips
+# the gate: a `git mv crates/hipfire-daemon/src/generate_arch.rs ...` is recorded
+# as a rename, and `--name-only` reports its destination path — which still has
+# to match the HOTSPOT patterns below. Without `R`, relocating a forward-pass
+# file across crates (e.g. the hipfire-serving-core extraction) silently skips
+# the coherence battery.
+CHANGED=$(git diff --cached --name-only --diff-filter=ACMR)
 
 # Docs and markdown can never affect forward-pass output or speed, but a path
 # like `docs/roughquant/...` matches the `quant` hotspot substring and would
