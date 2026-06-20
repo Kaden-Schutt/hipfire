@@ -186,12 +186,61 @@ are handled by K-tiling (one fused iu4 GEMM per K-group); a production kernel
 would fold the per-group rescale into the epilogue instead of per-group launches.
 Reproduce: `cargo run --release -p rdna-compute --example validate_w4a4_recipe`.
 
+## E6 — Two named formats: Opus Quant and MQ+
+
+`quant_opus_mqplus` compares the shipped MQ4 against two upgrades on identical
+data (output SQNR dB; M=128 K=2048 B=64, representative):
+
+| scheme | W | A | bits/w | compute | SQNR | vs MQ4 |
+|--------|---|---|-------:|--------:|-----:|-------:|
+| **MQ4** (as shipped) | affine4 | int8 | 4.25 | iu8 | 18.98 | — |
+| **MQ+** | affine4 | int8 | 4.25 | iu8 | 24.82 | +5.8 |
+| **Opus Quant** | sym4 | int4 | 4.13 | iu4 | 21.87 | +2.9 |
+| Opus-A8 (ref) | sym4 | int8 | 4.13 | iu8 | 24.37 | +5.4 |
+
+Stable across shapes (MQ+ +4.5…+8 dB over MQ4; Opus Quant ~2–3 dB below MQ+).
+
+### MQ+  (= MQ4 + SmoothQuant + clip-search)
+Keeps MQ4's affine-u4 / FWHT-256 / g256 format **and its iu8 GEMM kernel
+unchanged**. Adds two offline/runtime-cheap steps:
+- offline: clip-search the per-group range (MSE-optimal) instead of plain min/max;
+- runtime: SmoothQuant per-channel activation rescale `X/s` (foldable into the
+  preceding norm), with `W·s` folded offline.
+
+Result: **+5.8 dB output SQNR for zero kernel work** — a drop-in quality upgrade
+to MQ4 at the same 4.25 bits/w and the same W4A8-on-iu8 compute. This is the
+quality-first prefill format.
+
+### Opus Quant  (symmetric W4A4 on fused iu4 — "magnum → opus")
+New compute path for max prefill throughput:
+- symmetric signed-int4 weights (no zero-point) + clip-search, g128;
+- SmoothQuant + FWHT-256 front-end (shared with MQ+);
+- dynamic per-token **int4** activations, g32;
+- fused `gemm_iu4_i32_wmma` (W4A4), per-group scale rescale in the epilogue.
+
+~4.13 bits/w, validated end-to-end on gfx1103 (E5). It costs ~2–3 dB vs MQ+
+(the intrinsic A4-vs-A8 gap) in exchange for the iu4 compute path. Affine-vs-
+symmetric is a wash once SmoothQuant+clip are present (MQ+ ≈ Opus-A8), so the
+symmetric choice is free — it exists only to enable signed iu4.
+
+**Reuse map:** Opus Quant and MQ+ share the FWHT rotation, SmoothQuant, and
+clip-search front-end. MQ+ reuses MQ4's storage + iu8 kernel verbatim. Opus
+Quant forks the quantizer to symmetric and needs the new bits: a dynamic int4
+activation quantizer and a grouped-iu4 GEMM with in-epilogue rescale.
+
+Reproduce: `cargo run -p hipfire-quantize --example quant_opus_mqplus`.
+
 ## Net recommendation for gfx1103
 
-- **Weights: FWHT-rotated symmetric int4 (MQ4) at ~4.06 bits/w**, group scales,
-  with int8 (MQ8/q8) fallback for outlier-sensitive tensors. Matches existing
-  formats; no new format needed.
-- **The next lever is the GEMV kernel, not the format**: optimize the generic
+- **Decode (memory-bound):** FWHT-rotated int4 weights, f16 activations (W4A16),
+  dequant path — keep activation precision (free). The shipped MQ4 decode path
+  already does this.
+- **Prefill, quality-first:** **MQ+** (MQ4 + SmoothQuant + clip-search) — +5.8 dB
+  over MQ4 for zero kernel work, same iu8 W4A8 compute. Low-risk, do this first.
+- **Prefill, speed-first:** **Opus Quant** (symmetric W4A4 on fused iu4) — max
+  throughput at ~2–3 dB below MQ+, validated end-to-end on gfx1103.
+- **Fallback:** int8 (MQ8/q8) for outlier-sensitive tensors.
+- **The next kernel lever is the GEMV**: optimize the generic
   GEMV for memory throughput (vectorized loads) to convert the 4-bit byte saving
   into the full ~4× decode speedup. Tracked as a follow-up to the generic kernel
   library.
