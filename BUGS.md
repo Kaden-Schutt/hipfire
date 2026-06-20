@@ -42,9 +42,6 @@ into full investigations here.
   budget to hold the K_TOP routed expert module set for a token; cache16 is too
   small for K_TOP=10 and should reject before streaming, while cache128 can run
   the indexed MQ6 decode path.
-- The daemon example can leave a stale `~/.hipfire/daemon.pid` after a
-  subprocess kill in smoke harnesses; the next daemon start then reports
-  `FATAL: hipfire daemon already running` even though the PID is gone.
 - Qwen3.5-397B-A17B HFQM v2 paged grouped-MoE smoke matrix exposed a daemon
   exit when issuing a second independent `generate_batch_prefill` request in
   the same daemon process after the first batch completed; fresh-process
@@ -70,14 +67,6 @@ into full investigations here.
 - Location: crates/rdna-compute/src/dispatch.rs
 - Summary: The file is ~1.67MB, acting as a massive god-file for kernel dispatching.
 - Suggested fix: Split dispatch logic by architecture or kernel family into smaller files.
-- Scope: Architectural
-- Confidence: High
-
-## [High] crates/hipfire-runtime/examples/daemon.rs is a massive monolith
-- Category: Maintainability
-- Location: crates/hipfire-runtime/examples/daemon.rs
-- Summary: The file is ~16.5K lines, indicating poor module boundaries for the HTTP server and orchestration layer.
-- Suggested fix: Extract routing, state management, and request lifecycle logic into separate modules under `src/`.
 - Scope: Architectural
 - Confidence: High
 
@@ -120,22 +109,10 @@ into full investigations here.
   - This hides explicit configuration inputs and increases hidden coupling.
   - Suggested triage: list all env-backed globals and move them behind explicit config contexts when touching module boundaries.
 
-- [High] Potential panic hazard in `crates/hipfire-runtime/src/triattn.rs`:
-  - Uses `TAP_STATE.lock().unwrap()` in hot sections.
-  - A poisoned mutex now can take the process down during unrelated thread panics.
-  - Suggested triage: convert to recoverable lock error handling and include lock-loss telemetry.
-
 - [High] Unchecked `unwrap()`/`as_ref().unwrap()` patterns are still concentrated in project-critical paths:
-  - `crates/hipfire-runtime/src/weight_pager.rs` (`as_ref`, `PreadH2DTransport::open`, `pop_front`)
   - `crates/hipfire-runtime/src/llama.rs` around unsafe blocks.
   - Recommended: replace with explicit `Option`/`Result` handling and actionable error messages before crash.
 
 - [High] Architectural correctness bug candidates remain explicitly referenced in comments:
   - `crates/hipfire-arch-deepseek4/src/spec_decode.rs` and `crates/hipfire-arch-deepseek4/src/forward.rs`: chunk/ring overwrite edge-case comments.
-  - `crates/hipfire-arch-dots-ocr/src/dots_ocr.rs`: lane write-size mismatch comment (16-element target vs larger writes) and decoded prompt divergence.
-  - `crates/hipfire-arch-qwen35-vl/tests/channel_order.rs`: `(C,T,h,w)` vs `(T,C,h,w)` transpose path in `extract_patches`.
   - Suggested triage: validate each as still-reproducible and either close with explicit evidence or move to fixed list if already mitigated.
-
-- [Medium] Documentation-driven bug in archive guidance:
-  - `docs/CLI.md` in the legacy archive still indicates `.triattn.bin` extension as canonical.
-  - `AGENTS.md` and CLI code now require/allow canonical `.triattn.hfq` while continuing to parse legacy `.triattn.bin` for compatibility.
