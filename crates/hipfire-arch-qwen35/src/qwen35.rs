@@ -13372,7 +13372,16 @@ pub fn forward_prefill_batch_with_pbs_opts(
     // fallback for these cases.
     let kv_f32 = !kv_cache.quantized && !kv_cache.quant_q8 && !kv_cache.quant_hfq4;
     let kv_asym2_tree = kv_cache.quant_asym2 && tree_verify.is_some();
+    let pbs_eligible_base = eligible;
     let eligible = eligible && !kv_f32 && !kv_asym2_tree;
+    if std::env::var("HIPFIRE_DEBUG_PREFILL_ELIGIBLE").as_deref() == Ok("1") {
+        eprintln!(
+            "[prefill-eligible] final={eligible} base={pbs_eligible_base} kv_f32={kv_f32} \
+             kv_asym2_tree={kv_asym2_tree} dn_quant={:?} n={n} arch={arch} \
+             kv(q8={} hfq4={} quantized={})",
+            dn_state.quant, kv_cache.quant_q8, kv_cache.quant_hfq4, kv_cache.quantized
+        );
+    }
 
     if !eligible {
         assert!(
