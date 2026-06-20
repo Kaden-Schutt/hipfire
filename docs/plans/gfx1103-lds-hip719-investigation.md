@@ -197,6 +197,10 @@ The currently promoted standalone GEMM jig lives in the repo:
   direct-AB artifact roots. It writes `direct-ab-artifact-summary.tsv/.md` with
   shape/chunk metadata, exit/sync failure, code-object hashes/resources, dmesg
   deltas, and decoded gfxhub/GCVM/GDS coredump fields.
+- `scripts/lds_direct_ab_summary_compare.sh`: read-only comparator for two
+  direct-AB summary TSVs. It compares source/code-object hashes, normalized ISA,
+  resource tuples, build/risk mode, runtime exit/sync result, environment, dmesg
+  deltas, and devcore/GCVM/GDS signatures.
 - `tests/gfx1103-lds-tail-snop-repro.sh`: focused cross-system pass/fail
   wrapper for a second 780M. The default `PROFILE=repro` checks the no-extra
   baseline against the tail-loop `s_nop` repro and writes a TSV report under
@@ -2456,6 +2460,25 @@ the known failing rows with:
 `devcore_gcvm_flags=MORE_FAULTS,PERMISSION_FAULTS,RW`,
 `devcore_gds_protection_fault=0x3f000007`, and
 `devcore_gds_vm_protection_fault=0x0fc00113`.
+
+Compare two direct-AB summary TSVs directly with:
+
+```bash
+scripts/lds_direct_ab_summary_compare.sh \
+  /tmp/hipfire-lds-direct-ab-promote-buildonly/direct-ab-artifact-summary.tsv \
+  /path/to/other-direct-ab-artifact-summary.tsv
+```
+
+Comparator validation:
+
+```text
+scripts/lds_direct_ab_summary_compare.sh self self
+```
+
+returns 24-column `same` rows for build-only and risky saved roots. Artificial
+mutations correctly classify an exit/sync change as
+`same-codegen-runtime-diff`, a resource tuple change as `resource-drift`, and
+non-overlapping reads/iteration shapes as `left-only` / `right-only`.
 
 ### Additional Sequence Sweep (Fresh)
 
