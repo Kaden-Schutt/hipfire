@@ -4,12 +4,17 @@
 
 //! Shared CLI/server configuration and local filesystem paths.
 
+pub mod resolve;
 pub mod schema;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+pub use resolve::{
+    resolve_config_layers, ConfigLayer, ConfigLayerKind, ConfigResolution, ConfigValueSource,
+    ResolvedConfigValue, UnknownConfigKey,
+};
 pub use schema::{
     config_schema, ConfigField, ConfigMutability, ConfigScope, ConfigType, Requirement,
     RestartImpact,
