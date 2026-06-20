@@ -116,11 +116,11 @@ static AWQ_ALPHA: OnceLock<f32> = OnceLock::new();
 // MQ+ clip-search: when set (by an `mqN+` format), MQ codecs use the MSE-optimal
 // clip-searched affine range instead of plain min/max. Off by default, so the
 // baseline MQ path (and its golden hashes) is unchanged.
-static MQ4_CLIPSEARCH: OnceLock<bool> = OnceLock::new();
+static MQ_CLIPSEARCH: OnceLock<bool> = OnceLock::new();
 
 /// Whether the `mqN+` clip-search variant is active for MQ codecs.
-pub(crate) fn mq4_clipsearch_enabled() -> bool {
-    MQ4_CLIPSEARCH.get().copied().unwrap_or(false)
+pub(crate) fn mq_clipsearch_enabled() -> bool {
+    MQ_CLIPSEARCH.get().copied().unwrap_or(false)
 }
 
 // ─── Safetensors Parser ─────────────────────────────────────────────────────
@@ -4543,7 +4543,7 @@ fn main() {
     let mq_plus = format_storage.ends_with('+');
     if mq_plus {
         format_storage.pop();
-        let _ = MQ4_CLIPSEARCH.set(true);
+        let _ = MQ_CLIPSEARCH.set(true);
         eprintln!("mq+ modifier: clip-search enabled; AWQ auto-on (needs --hessian/--imatrix)");
     }
     let format = format_storage.as_str();
@@ -11773,6 +11773,10 @@ mod codec_golden {
         h("q8hfq", &quantize_q8hfq(&x, m, k).0);
         h("mq4g256", &quantize_mq4g256(&x, &s1, &s2));
         h("mq4g256_clipsearch", &quantize_mq4g256_clipsearch(&x, &s1, &s2));
+        h("mq6g256_clipsearch", &quantize_mq6g256_clipsearch(&x, &s1, &s2));
+        h("mq3g256_clipsearch", &quantize_mq3g256_clipsearch(&x, &s1, &s2));
+        h("mq2g256_clipsearch", &quantize_mq2g256_clipsearch(&x, &s1, &s2));
+        h("mq8g256_clipsearch", &quantize_mq8g256_clipsearch(&x, &s1, &s2));
         h("mq6g256", &quantize_mq6g256(&x, &s1, &s2));
         h("mq8g256", &quantize_mq8g256(&x, &s1, &s2));
         h("mq3g256", &quantize_mq3g256(&x, &s1, &s2));
@@ -11813,6 +11817,10 @@ mod codec_golden {
         ("q8hfq", "29ca0c52ad9b58dc"),
         ("mq4g256", "6e9d532bbe5d38eb"),
         ("mq4g256_clipsearch", "7978e3644f11ed99"),
+        ("mq6g256_clipsearch", "f906f337b9bd4df7"),
+        ("mq3g256_clipsearch", "a57eada9ebb78586"),
+        ("mq2g256_clipsearch", "a95cdd8e7672e915"),
+        ("mq8g256_clipsearch", "8987f0aa7fdfb487"),
         ("mq6g256", "c43cbf518aae87fe"),
         ("mq8g256", "8987f0aa7fdfb487"),
         ("mq3g256", "0c2f928a4236cf57"),

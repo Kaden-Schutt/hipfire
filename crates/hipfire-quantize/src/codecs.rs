@@ -338,7 +338,7 @@ pub(crate) fn quantize_hfq4g128(f32_data: &[f32]) -> Vec<u8> {
 /// into the weights. The GEMV kernel rotates x instead of inverse-rotating w.
 pub(crate) fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     // mqN+ modifier: route to the clip-searched variant (identical byte layout).
-    if crate::mq4_clipsearch_enabled() {
+    if crate::mq_clipsearch_enabled() {
         return quantize_mq4g256_clipsearch(f32_data, signs1, signs2);
     }
     let group_size = 256;
@@ -448,6 +448,178 @@ pub(crate) fn quantize_mq4g256_clipsearch(
     output
 }
 
+/// MSE-optimal symmetric clip of an affine range over a fixed grid. `group` is
+/// the (already FWHT-rotated) values; `levels` = 2^bits − 1. Returns (lo, scale)
+/// for dequant `q·scale + lo`. Shared by the mqN+ affine clip-search codecs.
+fn affine_clipsearch(group: &[f32], levels: f32) -> (f32, f32) {
+    const CLIP_GRID: [f32; 9] = [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6];
+    let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
+    let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mid = 0.5 * (min_val + max_val);
+    let half = 0.5 * (max_val - min_val);
+    let (mut best_lo, mut best_scale) = (min_val, (max_val - min_val) / levels);
+    let mut best_err = f32::INFINITY;
+    for &c in &CLIP_GRID {
+        let lo = mid - c * half;
+        let scale = (2.0 * c * half / levels).max(1e-12);
+        let inv = 1.0 / scale;
+        let mut err = 0.0f32;
+        for &v in group.iter() {
+            let q = ((v - lo) * inv + 0.5).clamp(0.0, levels);
+            let d = v - (q * scale + lo);
+            err += d * d;
+        }
+        if err < best_err {
+            best_err = err;
+            best_lo = lo;
+            best_scale = scale;
+        }
+    }
+    (best_lo, if best_scale > 0.0 { best_scale } else { 1.0 })
+}
+
+/// MSE-optimal symmetric clip of a signed-int scale. `qmax` = 2^(bits−1) − 1.
+/// Returns the scale for dequant `q·scale`. For the symmetric mqN+ codecs (MQ8).
+fn symmetric_clipsearch(group: &[f32], qmax: f32) -> f32 {
+    const CLIP_GRID: [f32; 9] = [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6];
+    let amax = group.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+    let (mut best_scale, mut best_err) = (amax / qmax, f32::INFINITY);
+    for &c in &CLIP_GRID {
+        let scale = (c * amax / qmax).max(1e-12);
+        let inv = 1.0 / scale;
+        let mut err = 0.0f32;
+        for &v in group.iter() {
+            let q = (v * inv).round().clamp(-qmax, qmax);
+            let d = v - q * scale;
+            err += d * d;
+        }
+        if err < best_err {
+            best_err = err;
+            best_scale = scale;
+        }
+    }
+    if best_scale > 0.0 { best_scale } else { 1.0 }
+}
+
+/// MQ6+ : MQ6G256 with clip-searched affine range (identical 200-byte layout).
+pub(crate) fn quantize_mq6g256_clipsearch(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    let (group_size, block_bytes) = (256usize, 200usize);
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let mut group = [0.0f32; 256];
+        group[..end - start].copy_from_slice(&f32_data[start..end]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let (lo, scale) = affine_clipsearch(&group, 63.0);
+        let inv = 1.0 / scale;
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
+        output[out_off + 4..out_off + 8].copy_from_slice(&lo.to_le_bytes());
+        for i in (0..256).step_by(4) {
+            let q = |j: usize| (((group[i + j] - lo) * inv + 0.5).clamp(0.0, 63.0)) as u8;
+            let (q0, q1, q2, q3) = (q(0), q(1), q(2), q(3));
+            let bo = out_off + 8 + (i / 4) * 3;
+            output[bo] = q0 | (q1 << 6);
+            output[bo + 1] = (q1 >> 2) | (q2 << 4);
+            output[bo + 2] = (q2 >> 4) | (q3 << 2);
+        }
+    }
+    output
+}
+
+/// MQ3+ : MQ3G256 with clip-searched affine range (identical 104-byte layout).
+pub(crate) fn quantize_mq3g256_clipsearch(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    let (group_size, block_bytes) = (256usize, 104usize);
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let mut group = [0.0f32; 256];
+        group[..end - start].copy_from_slice(&f32_data[start..end]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let (lo, scale) = affine_clipsearch(&group, 7.0);
+        let inv = 1.0 / scale;
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
+        output[out_off + 4..out_off + 8].copy_from_slice(&lo.to_le_bytes());
+        for chunk in 0..32 {
+            let ci = chunk * 8;
+            let mut q = [0u8; 8];
+            for j in 0..8 {
+                q[j] = ((group[ci + j] - lo) * inv + 0.5).clamp(0.0, 7.0) as u8;
+            }
+            let b0 = (q[0] & 7) | ((q[1] & 7) << 3) | ((q[2] & 3) << 6);
+            let b1 = ((q[2] >> 2) & 1) | ((q[3] & 7) << 1) | ((q[4] & 7) << 4) | ((q[5] & 1) << 7);
+            let b2 = ((q[5] >> 1) & 3) | ((q[6] & 7) << 2) | ((q[7] & 7) << 5);
+            let bo = out_off + 8 + chunk * 3;
+            output[bo] = b0;
+            output[bo + 1] = b1;
+            output[bo + 2] = b2;
+        }
+    }
+    output
+}
+
+/// MQ2+ : MQ2G256 with clip-searched affine range (identical 72-byte layout).
+pub(crate) fn quantize_mq2g256_clipsearch(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    let (group_size, block_bytes) = (256usize, 72usize);
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let mut group = [0.0f32; 256];
+        group[..end - start].copy_from_slice(&f32_data[start..end]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let (lo, scale) = affine_clipsearch(&group, 3.0);
+        let inv = 1.0 / scale;
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
+        output[out_off + 4..out_off + 8].copy_from_slice(&lo.to_le_bytes());
+        for i in 0..64 {
+            let mut byte_val = 0u8;
+            for j in 0..4 {
+                let q = (((group[4 * i + j] - lo) * inv + 0.5).clamp(0.0, 3.0)) as u8;
+                byte_val |= q << (j * 2);
+            }
+            output[out_off + 8 + i] = byte_val;
+        }
+    }
+    output
+}
+
+/// MQ8+ : MQ8G256 with clip-searched symmetric int8 scale (identical 258-byte layout).
+pub(crate) fn quantize_mq8g256_clipsearch(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    let (group_size, block_bytes) = (256usize, 258usize);
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let mut group = [0.0f32; 256];
+        group[..end - start].copy_from_slice(&f32_data[start..end]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let scale = symmetric_clipsearch(&group, 127.0);
+        let inv = 1.0 / scale;
+        let out_off = b * block_bytes;
+        let scale_f16 = f32_to_f16(scale);
+        output[out_off] = (scale_f16 & 0xFF) as u8;
+        output[out_off + 1] = (scale_f16 >> 8) as u8;
+        for i in 0..256 {
+            let q = (group[i] * inv).round().clamp(-128.0, 127.0) as i8;
+            output[out_off + 2 + i] = q as u8;
+        }
+    }
+    output
+}
+
 /// Dequantize MQ4G256 packed bytes back to f32, EXACTLY mirroring the GEMV
 /// kernel (and `quant_quality_mse`'s reference): per 136-byte group read scale+min
 /// (f32), expand 128 nibble bytes to 256 values `min + scale*q` (lo=2i, hi=2i+1),
@@ -488,6 +660,9 @@ pub(crate) fn dequant_mq4g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f
 /// Same binary format as HFQ6-G256 (200 bytes/group) — the rotation is baked
 /// into the weights. The GEMV kernel rotates x instead of inverse-rotating w.
 pub(crate) fn quantize_mq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    if crate::mq_clipsearch_enabled() {
+        return quantize_mq6g256_clipsearch(f32_data, signs1, signs2);
+    }
     let group_size = 256;
     let block_bytes = 200; // 8 (scale+zero) + 192 (packed 6-bit)
     let n = f32_data.len();
@@ -543,6 +718,9 @@ pub(crate) fn quantize_mq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32])
 /// Symmetric: scale = max(abs(group)) / 127, q = round(val / scale), no zero-point.
 /// Target: dp4a (v_dot4_i32_iu8) on gfx1100 for 4x VALU throughput.
 pub(crate) fn quantize_mq8g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    if crate::mq_clipsearch_enabled() {
+        return quantize_mq8g256_clipsearch(f32_data, signs1, signs2);
+    }
     let group_size = 256;
     let block_bytes = 258; // 2 (f16 scale) + 256 (int8 values)
     let n = f32_data.len();
@@ -1140,6 +1318,9 @@ pub(crate) fn quantize_q8hfq(f32_data: &[f32], m: usize, k: usize) -> (Vec<u8>, 
 /// Same binary format as HFQ3-G256 (104 bytes/group). Rotation is baked into
 /// the weights via cpu_fwht_256; the GEMV kernel rotates x instead.
 pub(crate) fn quantize_mq3g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    if crate::mq_clipsearch_enabled() {
+        return quantize_mq3g256_clipsearch(f32_data, signs1, signs2);
+    }
     let group_size = 256;
     let block_bytes = 104;
     let n = f32_data.len();
@@ -1194,6 +1375,9 @@ pub(crate) fn quantize_mq3g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32])
 /// Same binary format as HFQ2-G256 (72 bytes/group). Rotation is baked into
 /// the weights via cpu_fwht_256; the GEMV kernel rotates x instead.
 pub(crate) fn quantize_mq2g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    if crate::mq_clipsearch_enabled() {
+        return quantize_mq2g256_clipsearch(f32_data, signs1, signs2);
+    }
     let group_size = 256;
     let block_bytes = 72;
     let n = f32_data.len();
