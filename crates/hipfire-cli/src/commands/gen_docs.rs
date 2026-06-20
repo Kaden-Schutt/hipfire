@@ -78,7 +78,12 @@ fn render_markdown() -> String {
 /// One roff man page for the root command and one per subcommand, keyed by file
 /// name (`hipfire.1`, `hipfire-<sub>.1`).
 fn render_man_pages() -> anyhow::Result<Vec<(String, Vec<u8>)>> {
-    let cmd = Cli::command();
+    // The binary's runtime `--version` is a dynamic Git-derived identity
+    // (`hipfire_build_info::VERSION`, e.g. `v0.2.1-957-g…`). Pin the *man page*
+    // to the static crate version so the docs freshness gate stays
+    // deterministic — otherwise every commit would render a new `.TH`/VERSION
+    // line and the gate could never be satisfied.
+    let cmd = Cli::command().version(env!("CARGO_PKG_VERSION"));
     let mut out = Vec::new();
 
     let mut root = Vec::new();

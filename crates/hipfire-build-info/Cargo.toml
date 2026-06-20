@@ -1,0 +1,11 @@
+[package]
+name = "hipfire-build-info"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Build-time Git-derived version identity (vergen-gitcl) shared by hipfire binaries' --version output."
+
+[dependencies]
+
+[build-dependencies]
+vergen-gitcl = "10"

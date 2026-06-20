@@ -13,8 +13,10 @@ Current release: **v0.2.1** — dispatch unification (#397). DeepSeek V4 Flash s
 `chaingun` development builds use the Git-derived subpatch identity
 `vX.Y.Z-N-gSHA`, where `N` is the commit count since the release tag. The
 `chaingun-version` GitHub Action emits that identity on every accepted
-`chaingun` commit; `Cargo.toml` stays at the release SemVer until the next
-intentional release bump.
+`chaingun` commit, and the binaries report the same string from `--version`
+(embedded at build time by `hipfire-build-info` via `vergen-gitcl`, falling back
+to the static crate version when built without a `.git`). `Cargo.toml` stays at
+the release SemVer until the next intentional release bump.
 
 Discord: <https://discord.gg/F3BaywB8Rs>
 

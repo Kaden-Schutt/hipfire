@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
+hipfire-build-info = { path = "../hipfire-build-info" }
 hipfire-config = { path = "../hipfire-config" }
 hipfire-generate = { path = "../hipfire-generate" }
 hipfire-lock = { path = "../hipfire-lock" }

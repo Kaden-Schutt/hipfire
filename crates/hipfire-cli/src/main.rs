@@ -5,7 +5,11 @@ use clap::{Parser, Subcommand};
 use hipfire_config::load_config_bundle;
 
 #[derive(Debug, Parser)]
-#[command(name = "hipfire", version, about = "hipfire LLM inference CLI")]
+#[command(
+    name = "hipfire",
+    version = hipfire_build_info::VERSION,
+    about = "hipfire LLM inference CLI"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
