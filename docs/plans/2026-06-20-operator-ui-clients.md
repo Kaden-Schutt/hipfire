@@ -96,6 +96,9 @@ Training jobs need first-class progress events:
 The plain terminal log remains the fallback for CI and non-TTY runs. TUI and WebUI
 should subscribe to structured events when available.
 
+Detailed read-only training monitoring targets live in
+`docs/plans/2026-06-20-operator-training-monitoring.md`.
+
 ## Implementation Sequence
 
 1. Define shared operator state structs in a library crate or existing serving
