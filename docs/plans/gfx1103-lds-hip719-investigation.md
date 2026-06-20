@@ -1732,6 +1732,21 @@ Latest artifact paths:
   `33x1`/`1x33`, while dropping to `group_segment=256` and `offset1=32`.
   This strengthens the >32-active-lane boundary even for the extreme
   row/column codegen family.
+- 34-lane factor-pair checks
+  (`/tmp/hipfire-lds-direct-ab-17x2-edge-artifacts/`, throwaway worktree
+  `/tmp/hipfire-lds-direct-ab-17x2-edge-1781927347`; and
+  `/tmp/hipfire-lds-direct-ab-2x17-edge-artifacts/`, throwaway worktree
+  `/tmp/hipfire-lds-direct-ab-2x17-edge-1781927347`) both failed much earlier
+  than the 33-lane exact shapes. `17x2` READS=2 one-child `130` failed at
+  sync/global 32, and `2x17` failed at sync/global 35. Both kept the canonical
+  coredump signature (`0x841051`, GCVM
+  `MORE_FAULTS,PERMISSION_FAULTS,RW/cid=8/rw=1/vmid=8`,
+  GDS-VM `0x0fc00113`, `REMOVE_QUEUE=3`). Both compile to the same
+  `11x3`/`3x11` static tuple family except for a 280-byte LDS allocation:
+  `vgpr=24`, `sgpr=2`, `s_barrier=8`, DS=20, `s_waitcnt=12`, `offset1=36`.
+  That makes them useful factor-pair evidence: crossing from 33 to 34 active
+  lanes sharply lowers the failure threshold even when the static instruction
+  family stays close to the 33-lane exact-shape probes.
 
 ## Current Narrowing
 
@@ -2525,6 +2540,7 @@ LDS-only control:
 | direct-AB multi-exec/phase-mode `11x3`/`3x11` block/layout, reads=2, 448 iters, 512x86 | `11x3`: PASS `131`/`132`, FAIL one-child `133`, same-process `132+1` PASS, `device_reset 132+1` FAILS in phase1/global 130; `3x11`: PASS `131`-`133`, FAIL `134`, cross-process `132,1` PASS, same-process `132+1` FAIL at phase2 launch 0, `device_reset 132+1` PASS | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
 | direct-AB multi-exec `32x1`/`1x32` block/layout, reads=2, 448 iters, 512x86 | PASS at one-child `500` for both one-wave extreme orientations | `_Z25lds_direct_ab_phase_probev` | 256 B | 28 | 2 | 0 | 32 |
 | direct-AB multi-exec `33x1`/`1x33` block/layout, reads=2, 448 iters, 512x86 | `33x1`: FAIL one-child `130` at sync/global 41; `1x33`: PASS one-child `130`/`140`, FAIL one-child `500` at sync/global 359 | `_Z25lds_direct_ab_phase_probev` | 276 B | 28 | 2 | 0 | 32 |
+| direct-AB multi-exec `17x2`/`2x17` block/layout, reads=2, 448 iters, 512x86 | `17x2`: FAIL one-child `130` at sync/global 32; `2x17`: FAIL one-child `130` at sync/global 35 | `_Z25lds_direct_ab_phase_probev` | 280 B | 24 | 2 | 0 | 32 |
 | direct-AB pre-sync diagnostic `11x3`/`3x11` block/layout, reads=2, 448 iters, 512x86 | `PRE_SYNC_EACH_LAUNCH=1`: `11x3` one-child `133` PASS; `3x11` one-child `134` FAIL at sync/global 133 | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
 | direct-AB throwaway host-sleep diagnostic `11x3` block/layout, reads=2, 448 iters, 512x86 | local-only `PRE_LAUNCH_SLEEP_US=1000`: one-child `133` FAIL at sync/global 73 | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
 | direct-AB phase-mode `3x11` block/layout, reads=2, 448 iters, 512x86, first-risky cleanup modes | `stream_recreate 132+1` FAILS in phase1/global 69; `primary_ctx_reset 132+1` FAILS in phase1/global 33 | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
@@ -2921,7 +2937,8 @@ scripts/lds_gemm_780m_runbook.sh
 # Current direct-AB reduced repro. Safe: compiles and captures codegen only.
 scripts/lds_direct_ab_780m_test_jig.sh
 
-# Risky: expected pass-side controls followed by the READS=2 9x4 fail-side.
+# Risky: expected pass-side controls followed by READS=2 9x4 and
+# 33/34-lane fail-side checks.
 scripts/lds_direct_ab_780m_test_jig.sh --risky
 ```
 
