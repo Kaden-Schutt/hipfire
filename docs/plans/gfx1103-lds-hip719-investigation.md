@@ -1846,6 +1846,22 @@ Latest artifact paths:
   `s_barrier=8`, DS=12, `s_waitcnt=12`, `s_cbranch=9`, and `offset1=36`.
   This makes the column `1x32` failure specifically tied to the power-of-two
   modulo lowering, not just to the active mask value or compact resource tuple.
+- Throwaway shifted row-mask controls
+  (`/tmp/hipfire-lds-direct-ab-shiftrow34-artifacts/` and start=2 repeat
+  `/tmp/hipfire-lds-direct-ab-shiftrow34-start2-repeat-artifacts/`, local-only
+  `ACTIVE_X_START`/`ACTIVE_Y_START` patch in the same throwaway worktree)
+  tested active `31x1` windows inside the `34x1` layout. Start=1
+  (active lanes 1..31) passed one-child `500`; start=2 failed at sync/global
+  182 in the sequence and failed again as a one-case first-risky repeat at
+  sync/global 379; start=3 failed at sync/global 375 after reset pressure.
+  All failures kept the canonical coredump signature. These shifted controls
+  compile to a different compact tuple from the unshifted `31x1` row
+  (`vgpr=8`, DS=12 instead of `vgpr=10`, DS=16), and the start=1/start=2 ISA
+  diff includes LDS load offset changes (`ds_load_b32 ... offset:4` versus
+  `offset:8`), so treat them as physical LDS address-placement evidence rather
+  than a pure active-count repeat. The result nevertheless keeps the 34-layout
+  row-family suspect tight: moving the same 31-lane window within the 34-lane
+  layout can flip pass/fail.
 
 ## Current Narrowing
 
@@ -2257,11 +2273,13 @@ Reduction results after extending the standalone HIP GEMM probe:
   active `32x1` in `34x1` READS=2 passes, but active `1x32` in `1x34` READS=2
   fails, and both READS=1 masked 34-layout orientations fail. A row-oriented
   `31x1` in `34x1` READS=2 control also fails, while the column orientation
-  passes and row-oriented 28-30 active-lane controls pass; column-oriented
-  1x29-1x31 pass before normal `1x32` fails, and forced compare/cndmask wrap
-  makes `1x32` pass. The matching masked 33-lane layouts pass, making the
-  280-byte / 34-lane layout boundary plus orientation/read pressure and
-  modulo-lowering choice a stronger suspect than masking alone.
+  passes and row-oriented 28-30 active-lane controls pass. Shifted row-mask
+  controls show physical LDS address placement matters too: active lanes 1..31
+  pass, while lanes 2..32 fail. Column-oriented 1x29-1x31 pass before normal
+  `1x32` fails, and forced compare/cndmask wrap makes `1x32` pass. The matching
+  masked 33-lane layouts pass, making the 280-byte / 34-lane layout boundary
+  plus orientation/read pressure, address placement, and modulo-lowering choice
+  a stronger suspect than masking alone.
 - Phase-mode controls sharpen the process-boundary result. With the same
   direct-AB kernel body at reads=6/192/511x86, same-process `99 + 1` fails on
   phase2 launch 0 / global launch 99, and same-process `98 + 2` fails on
@@ -2670,6 +2688,7 @@ LDS-only control:
 | direct-AB multi-exec active `28x1`/`29x1`/`30x1` in `34x1` block/layout, reads=2, 448 iters, 512x86 | PASS one-child `500` for all three row-active masks; matching `31x1` repeat FAILS at sync/global 256 | `_Z25lds_direct_ab_phase_probev` | 280 B | 10 | 5 | 0 | 32 |
 | direct-AB multi-exec active `1x29`/`1x30` in `1x34` block/layout, reads=2, 448 iters, 512x86 | PASS one-child `500` for both column-active masks; previous `1x31` PASS, `1x32` FAIL at sync/global 64 | `_Z25lds_direct_ab_phase_probev` | 280 B | 9 | 6 | 0 | 32 |
 | throwaway direct-AB active `1x32` in `1x34` block/layout, reads=2, forced compare/cndmask wrap, 448 iters, 512x86 | PASS one-child `500`; normal `% 32`/`v_and 31` codegen FAILS at sync/global 64 | `_Z25lds_direct_ab_phase_probev` | 280 B | 9 | 6 | 0 | 32 |
+| throwaway direct-AB shifted active `31x1` in `34x1` block/layout, reads=2, 448 iters, 512x86 | start=1 PASS one-child `500`; start=2 FAIL at sync/global 182 and repeat FAIL at 379; start=3 FAIL after reset pressure at 375 | `_Z25lds_direct_ab_phase_probev` | 280 B | 8 | 5 | 0 | 32 |
 | direct-AB multi-exec `17x2`/`2x17` block/layout, reads=2, 448 iters, 512x86 | `17x2`: FAIL one-child `130` at sync/global 32; `2x17`: FAIL one-child `130` at sync/global 35 | `_Z25lds_direct_ab_phase_probev` | 280 B | 24 | 2 | 0 | 32 |
 | direct-AB pre-sync diagnostic `11x3`/`3x11` block/layout, reads=2, 448 iters, 512x86 | `PRE_SYNC_EACH_LAUNCH=1`: `11x3` one-child `133` PASS; `3x11` one-child `134` FAIL at sync/global 133 | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
 | direct-AB throwaway host-sleep diagnostic `11x3` block/layout, reads=2, 448 iters, 512x86 | local-only `PRE_LAUNCH_SLEEP_US=1000`: one-child `133` FAIL at sync/global 73 | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
