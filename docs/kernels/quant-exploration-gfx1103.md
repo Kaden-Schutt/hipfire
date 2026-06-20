@@ -85,6 +85,49 @@ Findings:
    or more rows per block) should raise absolute GB/s toward peak AND tighten
    the dtype scaling toward the ideal 2×/4×.
 
+## E3 — Activation precision & the fused-iu4 (W4A4) path
+
+`quant_wxax_explore` measures GEMM *output* SQNR (what model quality depends on)
+for combinations of weight/activation precision, with and without FWHT rotation
+of both operands. Activations modelled with strong per-channel outliers (the
+realistic LLM regime); M=128 K=2048 B=64 g=128:
+
+| scheme | no rotation | + FWHT (both) | fused path |
+|--------|------------:|--------------:|-----------|
+| W4A16 (deq→f16) | 14.5 | 18.1 | f16 wmma |
+| W8A8            | 32.3 | 41.2 | iu8 wmma |
+| W4A8 (mixed)    | 14.5 | 18.1 | upcast→iu8 |
+| **W4A4**        | **9.3** | **16.0** | **iu4 wmma** |
+
+Findings:
+1. **Naive 4-bit activations cost ~5 dB** of output SQNR vs W4A16 (14.5→9.3):
+   per-token int4 cannot absorb activation channel-outliers. Confirms the
+   intuition that W4A4 hurts quality.
+2. **8-bit activations are essentially free**: W4A8 ≈ W4A16 — the int4 *weight*
+   is the binding constraint, not the activation.
+3. **Rotation rescues W4A4**: +6.7 dB (9.3→16.0), within ~2 dB of W4A16+FWHT.
+   The orthogonal rotation is exact (`Y = X·Wᵀ = (XQ)(WQ)ᵀ`) and Gaussianizes
+   activations so int4 becomes tolerable (QuaRot/SpinQuant). The engine already
+   FWHT-rotates activations.
+
+Hardware caveats that shape the choice:
+- **No mixed iu4×iu8 WMMA on RDNA3.** Fused int matmul is iu4×iu4 or iu8×iu8
+  only. "W4A8" is therefore not one fused op — upcast the int4 weight to int8
+  and run iu8 WMMA: keeps the 4-bit *storage/bandwidth*, gets iu8 *compute* and
+  full weight quality.
+- **Regime decides whether A4 helps at all.** Decode (GEMV, B=1) is
+  memory-bound — A4 gives ~no speedup over A16 (the activation vector is tiny),
+  only quality loss. The fused-iu4 W4A4 win is the **compute-bound**
+  prefill/batched GEMM regime.
+
+Resolved choice by regime:
+
+| regime | choice | rationale |
+|--------|--------|-----------|
+| Decode (B=1) | **W4A16** (deq→f16) | bandwidth-bound; keep activations high-precision (free) |
+| Prefill, quality-first | **W4A8 via iu8** (upcast) | full weight quality, int8 compute, 4-bit storage |
+| Prefill, speed-first | **W4A4 fused iu4 + rotation** | fastest compute; rotation → within ~2 dB |
+
 ## Net recommendation for gfx1103
 
 - **Weights: FWHT-rotated symmetric int4 (MQ4) at ~4.06 bits/w**, group scales,
