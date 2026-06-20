@@ -266,3 +266,41 @@ lever). Pivot options:
 Open question worth one probe: is the mid-L15 cosine-K target itself learnable by
 ANY embedding-derived feature, or is the +0.51 a hard ceiling of the
 embedding→cosine-K path? (Train a LARGE head briefly as an oracle to bound it.)
+
+### Oracle probe — DECISIVE: it's an INFORMATION limit, not capacity/head (2026-06-20)
+
+21.6M body, 12 train chunks (max overfit), 150 epochs, train-ρ reported:
+
+| ep | train_ρ | eval |
+|----|---------|------|
+| 0   | +0.597 | +0.458 |
+| 75  | +0.595 | +0.431 |
+| 90  | +0.726 | +0.390 |
+| 120 | +0.917 | +0.409 |
+| 149 | **+0.976** | +0.365 |
+
+train_ρ → **+0.976** (fits the train ranking almost perfectly) while eval **falls**
+to +0.365. Conclusions:
+1. The cosine-K HEAD is NOT the bottleneck — abundant capacity represents arbitrary
+   rankings. We're in the generalization branch, not head-can't-fit.
+2. The generalizable signal caps at the random-init floor (+0.47). Perfect train fit
+   transfers to nothing; eval ends below init.
+
+**Root cause (the real finding):** block importance = cosine of the target's
+mid-layer (L15) K — a property of 24 layers of CONTEXTUAL processing. The
+embedding-only drafter does ZERO forward passes (token identities only), so it is
+structurally blind to context. The +0.47 floor is the embedding's context-free
+information about a context-dependent target; the residual to the +0.69 bar requires
+real contextual computation, which shallow-K HAS (partial forward to L3) and the
+embedding-only drafter CANNOT.
+
+**Weight-splitting verdict:** the oracle confirms the generalization branch where
+growth is the right tool — BUT growth adds parameters, not information. train_ρ is
+already +0.98; capacity isn't missing, INFORMATION is. Growth won't lift eval.
+
+**The embedding-only tiny drafter cannot beat shallow-K by construction** (strictly
+less information — no forward pass). Options collapse to: (a) give it cheap context =
+reinvent shallow-K; (b) accept ~+0.47 as near-free-but-weaker and test PFlash
+end-to-end tolerance vs shallow-K's +0.69; (c) shelve, PFlash keeps shallow-K.
+This closes the drafter architecture search — the lever was never the token-mixer,
+the head, capacity, data, or regularization; it is the context-free INPUT.
