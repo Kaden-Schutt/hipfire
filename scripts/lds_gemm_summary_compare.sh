@@ -57,6 +57,13 @@ function devcore_sig(side, k) {
         side[k, "devcore_prot_status"] "/" side[k, "devcore_gds_protection_fault"] "/" \
         side[k, "devcore_gds_vm_protection_fault"];
 }
+function gcvm_sig(side, k) {
+    if (side[k, "devcoredump"] != "1" || side[k, "devcore_gcvm_flags"] == "") {
+        return "";
+    }
+    return side[k, "devcore_gcvm_flags"] "/cid=" side[k, "devcore_gcvm_cid"] \
+        "/rw=" side[k, "devcore_gcvm_rw"] "/vmid=" side[k, "devcore_gcvm_vmid"];
+}
 function classify(k,    source_same, code_same_result, metadata_same, exit_same, driver_same, hipcc_same, verdict) {
     source_same = same(left[k, "source_sha256"], right[k, "source_sha256"]);
     code_same_result = code_same(k);
@@ -108,32 +115,41 @@ file_no == 2 {
     next;
 }
 END {
-    print "key\tstatus\tverdict\tleft_exit\tright_exit\tleft_sync\tright_sync\tsource\tobj\tisa\tisa_norm\tselected_isa\tdriver\thipcc\tdmesg_sig\tdevcore_sig\tleft_devcore\tright_devcore\tleft_git\tright_git";
+    print "key\tstatus\tverdict\tleft_exit\tright_exit\tleft_sync\tright_sync\tsource\tobj\tisa\tisa_norm\tselected_isa\tdriver\thipcc\tdmesg_sig\tdevcore_sig\tgcvm_sig\tleft_devcore\tright_devcore\tleft_gcvm\tright_gcvm\tleft_git\tright_git";
     for (k in left_keys) {
         if (!(k in right_keys)) {
-            print k "\tleft-only\tmissing-right\t" left[k, "exit"] "\t\t" left[k, "sync_failure"] "\t\t\t\t\t\t\t\t\t" \
-                dmesg_sig(left, k) "\t\t" devcore_sig(left, k) "\t\t" left[k, "git_commit"] "\t";
+            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", \
+                k, "left-only", "missing-right", left[k, "exit"], "", \
+                left[k, "sync_failure"], "", "", "", "", "", "", "", "", \
+                dmesg_sig(left, k), "", "", devcore_sig(left, k), "", \
+                gcvm_sig(left, k), "", left[k, "git_commit"], "";
             continue;
         }
         verdict = classify(k);
-        print k "\tboth\t" verdict "\t" left[k, "exit"] "\t" right[k, "exit"] "\t" \
-            left[k, "sync_failure"] "\t" right[k, "sync_failure"] "\t" \
-            same(left[k, "source_sha256"], right[k, "source_sha256"]) "\t" \
-            same(left[k, "amdgpu_obj_sha256"], right[k, "amdgpu_obj_sha256"]) "\t" \
-            same(left[k, "amdgpu_isa_sha256"], right[k, "amdgpu_isa_sha256"]) "\t" \
-            same(left[k, "amdgpu_isa_norm_sha256"], right[k, "amdgpu_isa_norm_sha256"]) "\t" \
-            same(left[k, "selected_isa_norm_sha256"], right[k, "selected_isa_norm_sha256"]) "\t" \
-            same(left[k, "driver"], right[k, "driver"]) "\t" \
-            same(left[k, "hipcc"], right[k, "hipcc"]) "\t" \
-            same(dmesg_sig(left, k), dmesg_sig(right, k)) "\t" \
-            same(devcore_sig(left, k), devcore_sig(right, k)) "\t" \
-            devcore_sig(left, k) "\t" devcore_sig(right, k) "\t" \
-            left[k, "git_commit"] "\t" right[k, "git_commit"];
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", \
+            k, "both", verdict, left[k, "exit"], right[k, "exit"], \
+            left[k, "sync_failure"], right[k, "sync_failure"], \
+            same(left[k, "source_sha256"], right[k, "source_sha256"]), \
+            same(left[k, "amdgpu_obj_sha256"], right[k, "amdgpu_obj_sha256"]), \
+            same(left[k, "amdgpu_isa_sha256"], right[k, "amdgpu_isa_sha256"]), \
+            same(left[k, "amdgpu_isa_norm_sha256"], right[k, "amdgpu_isa_norm_sha256"]), \
+            same(left[k, "selected_isa_norm_sha256"], right[k, "selected_isa_norm_sha256"]), \
+            same(left[k, "driver"], right[k, "driver"]), \
+            same(left[k, "hipcc"], right[k, "hipcc"]), \
+            same(dmesg_sig(left, k), dmesg_sig(right, k)), \
+            same(devcore_sig(left, k), devcore_sig(right, k)), \
+            same(gcvm_sig(left, k), gcvm_sig(right, k)), \
+            devcore_sig(left, k), devcore_sig(right, k), \
+            gcvm_sig(left, k), gcvm_sig(right, k), \
+            left[k, "git_commit"], right[k, "git_commit"];
     }
     for (k in right_keys) {
         if (!(k in left_keys)) {
-            print k "\tright-only\tmissing-left\t\t" right[k, "exit"] "\t\t" right[k, "sync_failure"] "\t\t\t\t\t\t\t\t\t" \
-                "\t" dmesg_sig(right, k) "\t\t" devcore_sig(right, k) "\t\t" right[k, "git_commit"];
+            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", \
+                k, "right-only", "missing-left", "", right[k, "exit"], \
+                "", right[k, "sync_failure"], "", "", "", "", "", "", "", \
+                dmesg_sig(right, k), "", "", "", devcore_sig(right, k), \
+                "", gcvm_sig(right, k), "", right[k, "git_commit"];
         }
     }
 }
