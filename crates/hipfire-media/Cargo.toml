@@ -1,0 +1,11 @@
+[package]
+name = "hipfire-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Video/multi-frame decode for the vision path — ffmpeg-subprocess frame extraction (quality-preserving), uniform slice sampling. GPU-independent, no inference hot-path code."
+
+[dependencies]
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
