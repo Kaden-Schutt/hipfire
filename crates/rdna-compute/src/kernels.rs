@@ -3190,6 +3190,9 @@ pub const GEMM_F16_BIAS_SRC: &str = include_str!("../../../kernels/src/gemm_f16_
 /// Optimized vision attention with tiled K/V loading and 4 queries per block.
 /// ~3-5x faster than naive vit_attention_f32 via shared memory K/V reuse.
 pub const VIT_ATTENTION_OPT_SRC: &str = include_str!("../../../kernels/src/vit_attention_opt.hip");
+/// Generic bidirectional flash attention, bf16 fused-qkv in → f32 out. Online
+/// softmax, no scores[N] materialisation. The bf16 vision tower's attention.
+pub const FLASH_ATTN_BF16_SRC: &str = include_str!("../../../kernels/src/flash_attn_bf16.hip");
 
 /// Batched GEMM for F32: Y[M,N] = A[M,K] @ B[N,K]^T
 pub const GEMM_F32_SRC: &str = include_str!("../../../kernels/src/gemm_f32.hip");
@@ -3227,8 +3230,7 @@ pub const SIGMOID_TRAIN_SRC: &str = include_str!("../../../kernels/src/sigmoid_t
 /// Gated linear-recurrence scan fwd+bwd (fp32), the token-mixer for the GLA-lite /
 /// minimal-selective-SSM PFlash drafter. `h[t]=g[t]*h[t-1]+(1-g[t])*u[t]`; per-channel
 /// diagonal recurrence, one thread per channel, NO shared memory (gfx1103 LDS lesson).
-pub const GATED_SCAN_TRAIN_SRC: &str =
-    include_str!("../../../kernels/src/gated_scan_train.hip");
+pub const GATED_SCAN_TRAIN_SRC: &str = include_str!("../../../kernels/src/gated_scan_train.hip");
 
 /// RoPE fwd+bwd (fp32), HF-Llama half-split convention, un-fused training path.
 pub const ROPE_TRAIN_SRC: &str = include_str!("../../../kernels/src/rope_train.hip");

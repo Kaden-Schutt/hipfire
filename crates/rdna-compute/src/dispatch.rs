@@ -41871,6 +41871,105 @@ impl Gpu {
         }
     }
 
+    /// Generic bidirectional flash attention over a fused **bf16** qkv
+    /// `[N, 3*hidden]` → f32 `out [N, hidden]`. Online softmax, f32 accumulation,
+    /// no causal mask. The bf16 vision tower's attention (replaces the f32
+    /// vit_attention_opt). `head_dim` must be ≤ 128 (the block width). See
+    /// `kernels/src/flash_attn_bf16.hip`.
+    pub fn flash_attn_bf16(
+        &mut self,
+        qkv_bf16: &GpuTensor,
+        out: &GpuTensor,
+        n: usize,
+        hidden: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            head_dim <= 128,
+            "flash_attn_bf16: head_dim={head_dim} must be <= 128 (block width)"
+        );
+        self.ensure_kernel(
+            "flash_attn_bf16",
+            kernels::FLASH_ATTN_BF16_SRC,
+            "flash_attn_bf16",
+        )?;
+        let func = &self.functions["flash_attn_bf16"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut qp = qkv_bf16.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut ni = n as i32;
+        let mut hi = hidden as i32;
+        let mut nh = num_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut hi as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        // LDS: q_sh[head_dim] + red[BLK=128].
+        let shared_mem = (head_dim as u32 + 128) * 4;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [num_heads as u32, n as u32, 1],
+                [128, 1, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Cast an F32 tensor to BF16 (round-to-nearest-even, top 16 bits). Mirrors
+    /// [`Self::cast_f32_to_f16`]; used to stage activations (e.g. the fused qkv)
+    /// into bf16 for the bf16 attention/GEMM path.
+    pub fn cast_f32_to_bf16(&mut self, src: &GpuTensor, dst: &GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(src.dtype, DType::F32, "cast_f32_to_bf16: src must be F32");
+        assert_eq!(dst.dtype, DType::BF16, "cast_f32_to_bf16: dst must be BF16");
+        let n_src: usize = src.shape.iter().product();
+        let n_dst: usize = dst.shape.iter().product();
+        assert_eq!(
+            n_src, n_dst,
+            "cast_f32_to_bf16: element counts must match (src={n_src}, dst={n_dst})"
+        );
+        self.ensure_kernel(
+            "convert_f32_to_bf16",
+            kernels::CONVERT_F32_TO_BF16_SRC,
+            "convert_f32_to_bf16",
+        )?;
+        let mut in_ptr = src.buf.as_ptr();
+        let mut out_ptr = dst.buf.as_ptr();
+        let mut n_val = n_src as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut in_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let grid = ((n_src + 255) / 256) as u32;
+        self.launch_maybe_blob(
+            "convert_f32_to_bf16",
+            [grid, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(in_ptr);
+                b.push_ptr(out_ptr);
+                b.push_i32(n_val);
+                b
+            },
+        )
+    }
+
     /// DFlash draft cross-attention: `B` queries attend to `L` keys/values
     /// with NO causal mask (bidirectional). Supports GQA; `n_heads` must be
     /// a multiple of `n_kv_heads`. See `kernels/src/attention_dflash.hip`

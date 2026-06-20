@@ -4,10 +4,14 @@
 //! `vision_forward`: SigLIP ViT over a `[num_patches, 3·patch²]` patch tensor →
 //! `[num_patches, hidden]` features. Mirrors `hipfire-arch-qwen35-vl`'s
 //! `vision_forward` minus the 2D-RoPE and spatial merger: SigLIP uses a learned
-//! position embedding (a plain add) and bidirectional attention. Reuses
-//! `gemm_f32_batched`/`transpose_f32`/`bias_add_f32` (linear), `layernorm_batched`
-//! (LayerNorm+bias), `vit_attention_opt` (bidirectional), `gelu_tanh_f32`, and
-//! `add_inplace_f32` (residual). F32 throughout (vision weights ship F32).
+//! position embedding (a plain add) and bidirectional attention.
+//!
+//! Mixed precision (encode is bandwidth-bound on unified-memory gfx1151): the
+//! per-layer linears run `gemm_bf16_x_bf16_wmma` (bf16 weights, f32 accumulation
+//! in the matrix cores) and attention runs the bf16 `flash_attn_bf16` (online
+//! softmax, no causal mask); `layernorm_batched`, `gelu_tanh_f32`, `bias_add_f32`,
+//! and `add_inplace_f32` stay F32 (negligible cost). The patch-embed linear stays
+//! F32 (its `k = 3·patch² = 588` is not a multiple of 16, so no WMMA).
 //!
 //! Output `[num_patches=4096, hidden=1152]` feeds the multimodal projector
 //! (avg-pool → `mm_soft_emb_norm` → `mm_input_projection`), the next phase.
@@ -45,6 +49,28 @@ fn linear_f32(
     Ok(y)
 }
 
+/// BF16-weight linear `Y[n, out] = X[n, in] · W[out, in]ᵀ + bias`.
+///
+/// `gemm_bf16_x_bf16_wmma`: bf16 weight `[out, in]`, f32 activation staged to
+/// bf16 once internally, **f32 accumulation in the matrix cores**, f32 output
+/// already `[n, out]` (no transpose). On unified-memory gfx1151 this halves
+/// weight bandwidth — the dominant cost — and uses the WMMA units f32 GEMM
+/// can't. 108 of these run per image, so it's the tower's hot loop.
+fn linear_bf16(
+    gpu: &mut Gpu,
+    w_bf16: &GpuTensor,
+    x: &GpuTensor,
+    bias: &GpuTensor,
+    out_dim: usize,
+    in_dim: usize,
+    n: usize,
+) -> HipResult<GpuTensor> {
+    let y = gpu.alloc_tensor(&[n * out_dim], DType::F32)?;
+    gpu.gemm_bf16_x_bf16_wmma(w_bf16, x, &y, out_dim, in_dim, n)?;
+    gpu.bias_add_f32(&y, bias, n, out_dim)?;
+    Ok(y)
+}
+
 /// Run the SigLIP encoder. `patches` is row-major `[num_patches, 3·patch²]`
 /// (im2col of the 896×896 image at 14×14 stride-14, channel-major within each
 /// patch — matching the flattened Conv2d weight layout). Returns the GPU tensor
@@ -70,49 +96,101 @@ pub fn vision_forward(
         patches.len()
     );
 
+    // Optional per-category timing (HIPFIRE_VISION_PROFILE=1): device-sync around
+    // each op group and accumulate. acc = [gemm, attn, norm, elem]. The syncs
+    // serialize the pipeline, so totals are upper bounds — use for *relative*
+    // attribution, not absolute speed.
+    let profile = std::env::var("HIPFIRE_VISION_PROFILE").is_ok();
+    let mut acc = [0f64; 4];
+    macro_rules! timed {
+        ($i:expr, $e:expr) => {{
+            if profile {
+                gpu.hip.device_synchronize()?;
+            }
+            let __t = std::time::Instant::now();
+            let __r = $e?;
+            if profile {
+                gpu.hip.device_synchronize()?;
+                acc[$i] += __t.elapsed().as_secs_f64();
+            }
+            __r
+        }};
+    }
+
     // Patch embedding: linear(patch_embed_w [h, patch_dim]) + bias → [n, h].
     let x_patches = gpu.upload_f32(patches, &[n * patch_dim])?;
-    let x = linear_f32(
-        gpu,
-        &weights.patch_embed_w,
-        &x_patches,
-        &weights.patch_embed_b,
-        h,
-        patch_dim,
-        n,
-    )?;
+    let x = timed!(
+        0,
+        linear_f32(
+            gpu,
+            &weights.patch_embed_w,
+            &x_patches,
+            &weights.patch_embed_b,
+            h,
+            patch_dim,
+            n,
+        )
+    );
     gpu.free_tensor(x_patches)?;
     // + learned position embedding (fixed grid, direct add — no interpolation).
-    gpu.add_inplace_f32(&x, &weights.pos_embed)?;
+    timed!(3, gpu.add_inplace_f32(&x, &weights.pos_embed));
 
     for lw in &weights.layers {
         // ── self-attention block (LN1 → attn → residual) ──
         let tmp = gpu.alloc_tensor(&[n * h], DType::F32)?;
-        gpu.layernorm_batched(&x, &lw.ln1_w, &lw.ln1_b, &tmp, n, h, eps)?;
-        let qkv = linear_f32(gpu, &lw.qkv_w, &tmp, &lw.qkv_b, 3 * h, h, n)?;
+        timed!(
+            2,
+            gpu.layernorm_batched(&x, &lw.ln1_w, &lw.ln1_b, &tmp, n, h, eps)
+        );
+        let qkv = timed!(0, linear_bf16(gpu, &lw.qkv_w, &tmp, &lw.qkv_b, 3 * h, h, n));
         gpu.free_tensor(tmp)?;
-        let attn_out = gpu.alloc_tensor(&[n * h], DType::F32)?;
-        // Bidirectional ViT attention (no causal mask), scale 1/√head_dim.
-        // vit_attention_opt: tiled K/V via shared memory, 4 queries/block —
-        // ~3× the naive vit_attention_f32 (the encode hot spot: ≈110s/image of
-        // the naive path on gfx1151), same math + signature.
-        gpu.vit_attention_opt(&qkv, &attn_out, n, h, num_heads, head_dim)?;
+        // Cast fused qkv → bf16, then bidirectional bf16 flash attention (online
+        // softmax, no causal mask). The flash kernel reads the fused qkv's q/k/v
+        // offsets directly, so no split is needed.
+        let qkv_bf16 = gpu.alloc_tensor(&[n * 3 * h], DType::BF16)?;
+        timed!(1, gpu.cast_f32_to_bf16(&qkv, &qkv_bf16));
         gpu.free_tensor(qkv)?;
-        let proj = linear_f32(gpu, &lw.out_w, &attn_out, &lw.out_b, h, h, n)?;
+        let attn_out = gpu.alloc_tensor(&[n * h], DType::F32)?;
+        timed!(
+            1,
+            gpu.flash_attn_bf16(&qkv_bf16, &attn_out, n, h, num_heads, head_dim)
+        );
+        gpu.free_tensor(qkv_bf16)?;
+        let proj = timed!(
+            0,
+            linear_bf16(gpu, &lw.out_w, &attn_out, &lw.out_b, h, h, n)
+        );
         gpu.free_tensor(attn_out)?;
-        gpu.add_inplace_f32(&x, &proj)?;
+        timed!(3, gpu.add_inplace_f32(&x, &proj));
         gpu.free_tensor(proj)?;
 
         // ── MLP block (LN2 → fc1 → gelu-tanh → fc2 → residual) ──
         let tmp2 = gpu.alloc_tensor(&[n * h], DType::F32)?;
-        gpu.layernorm_batched(&x, &lw.ln2_w, &lw.ln2_b, &tmp2, n, h, eps)?;
-        let fc1 = linear_f32(gpu, &lw.fc1_w, &tmp2, &lw.fc1_b, inter, h, n)?;
+        timed!(
+            2,
+            gpu.layernorm_batched(&x, &lw.ln2_w, &lw.ln2_b, &tmp2, n, h, eps)
+        );
+        let fc1 = timed!(
+            0,
+            linear_bf16(gpu, &lw.fc1_w, &tmp2, &lw.fc1_b, inter, h, n)
+        );
         gpu.free_tensor(tmp2)?;
-        gpu.gelu_tanh_f32(&fc1, &fc1, n * inter)?;
-        let fc2 = linear_f32(gpu, &lw.fc2_w, &fc1, &lw.fc2_b, h, inter, n)?;
+        timed!(3, gpu.gelu_tanh_f32(&fc1, &fc1, n * inter));
+        let fc2 = timed!(0, linear_bf16(gpu, &lw.fc2_w, &fc1, &lw.fc2_b, h, inter, n));
         gpu.free_tensor(fc1)?;
-        gpu.add_inplace_f32(&x, &fc2)?;
+        timed!(3, gpu.add_inplace_f32(&x, &fc2));
         gpu.free_tensor(fc2)?;
+    }
+
+    if profile {
+        eprintln!(
+            "[vision-profile] gemm={:.2}s attn={:.2}s norm={:.2}s elem={:.2}s (sum={:.2}s)",
+            acc[0],
+            acc[1],
+            acc[2],
+            acc[3],
+            acc.iter().sum::<f64>()
+        );
     }
 
     // Final post_layernorm → [n, h].

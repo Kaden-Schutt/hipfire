@@ -6,16 +6,18 @@
 //! SigLIP is a standard ViT: Conv2d patch embed (k=s=patch, loaded as a linear
 //! `[hidden, 3·patch²]`), a learned position-embedding table, N encoder layers
 //! (LayerNorm+bias → bidirectional self-attn → residual; LayerNorm+bias →
-//! gelu-tanh MLP → residual), and a final `post_layernorm`. Loaded F32 (vision
-//! towers are small). q/k/v are **fused at load** into one `[3·hidden, hidden]`
-//! weight so the forward can reuse `vit_attention_f32`'s fused-qkv layout.
+//! gelu-tanh MLP → residual), and a final `post_layernorm`. Matrix weights
+//! (qkv/out/fc1/fc2) load as **BF16** for the `gemm_bf16_x_bf16_wmma` matrix-core
+//! linears; biases, LayerNorms, and the position embedding stay F32. q/k/v are
+//! **fused at load** into one `[3·hidden, hidden]` weight matching the fused-qkv
+//! layout `flash_attn_bf16` consumes.
 //!
 //! The forward lives in `forward.rs` (next phase); this file is weights only.
 
 use hip_bridge::HipResult;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::f16_to_f32;
-use rdna_compute::{Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::config::SigLipConfig;
 
@@ -114,6 +116,38 @@ fn load_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<Gpu
     gpu.upload_f32(&v, &[n])
 }
 
+/// f32 → bf16 bits (round-to-nearest-even, top 16 bits of the f32).
+fn f32_to_bf16_bits(x: f32) -> u16 {
+    let u = x.to_bits();
+    let lsb = (u >> 16) & 1;
+    ((u + 0x7fff + lsb) >> 16) as u16
+}
+
+/// Upload an f32 host slice as a `DType::BF16` device tensor (for the bf16 WMMA
+/// linears — the matrix-core path halves weight bandwidth, the UMA bottleneck).
+fn upload_bf16(gpu: &Gpu, vals: &[f32]) -> HipResult<GpuTensor> {
+    let bytes: Vec<u8> = vals
+        .iter()
+        .flat_map(|&x| f32_to_bf16_bits(x).to_le_bytes())
+        .collect();
+    let mut t = gpu.upload_raw(&bytes, &[vals.len()])?;
+    t.dtype = DType::BF16;
+    Ok(t)
+}
+
+/// Like [`load_gpu`] but stores the weight as BF16 (matrix weights only — biases
+/// and norms stay F32).
+fn load_gpu_bf16(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
+    let v = read_f32(hfq, name);
+    assert_eq!(
+        v.len(),
+        n,
+        "gemma3-vl: tensor {name} has {} elems, expected {n}",
+        v.len()
+    );
+    upload_bf16(gpu, &v)
+}
+
 fn load_vision_weights(
     hfq: &mut HfqFile,
     cfg: &SigLipConfig,
@@ -163,18 +197,20 @@ fn load_vision_weights(
         qkv_b.extend(read_f32(hfq, &format!("{lp}.self_attn.k_proj.bias")));
         qkv_b.extend(read_f32(hfq, &format!("{lp}.self_attn.v_proj.bias")));
 
+        // Matrix weights → BF16 (consumed by gemm_bf16_x_bf16_wmma); biases and
+        // LayerNorm params stay F32.
         layers.push(SigLipLayerWeights {
             ln1_w: load_gpu(hfq, gpu, &format!("{lp}.layer_norm1.weight"), h)?,
             ln1_b: load_gpu(hfq, gpu, &format!("{lp}.layer_norm1.bias"), h)?,
-            qkv_w: gpu.upload_f32(&qkv_w, &[3 * h * h])?,
+            qkv_w: upload_bf16(gpu, &qkv_w)?,
             qkv_b: gpu.upload_f32(&qkv_b, &[3 * h])?,
-            out_w: load_gpu(hfq, gpu, &format!("{lp}.self_attn.out_proj.weight"), h * h)?,
+            out_w: load_gpu_bf16(hfq, gpu, &format!("{lp}.self_attn.out_proj.weight"), h * h)?,
             out_b: load_gpu(hfq, gpu, &format!("{lp}.self_attn.out_proj.bias"), h)?,
             ln2_w: load_gpu(hfq, gpu, &format!("{lp}.layer_norm2.weight"), h)?,
             ln2_b: load_gpu(hfq, gpu, &format!("{lp}.layer_norm2.bias"), h)?,
-            fc1_w: load_gpu(hfq, gpu, &format!("{lp}.mlp.fc1.weight"), inter * h)?,
+            fc1_w: load_gpu_bf16(hfq, gpu, &format!("{lp}.mlp.fc1.weight"), inter * h)?,
             fc1_b: load_gpu(hfq, gpu, &format!("{lp}.mlp.fc1.bias"), inter)?,
-            fc2_w: load_gpu(hfq, gpu, &format!("{lp}.mlp.fc2.weight"), h * inter)?,
+            fc2_w: load_gpu_bf16(hfq, gpu, &format!("{lp}.mlp.fc2.weight"), h * inter)?,
             fc2_b: load_gpu(hfq, gpu, &format!("{lp}.mlp.fc2.bias"), h)?,
         });
     }
