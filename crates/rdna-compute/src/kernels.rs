@@ -3716,6 +3716,12 @@ pub const GEMM_IU4_I32_WMMA_SRC: &str =
 pub const GEMM_OQ4_GROUPED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_oq4_grouped_wmma.hip");
 
+/// Opus Quant W4A4: dynamic per-token/group INT4 activation quantizer (f32 →
+/// signed int4 + per-group scales). Feeds `gemm_oq4_grouped_wmma`. gfx1103
+/// wave32, zero LDS. See `kernels/src/quantize_act_oq4.hip`.
+pub const QUANTIZE_ACT_OQ4_SRC: &str =
+    include_str!("../../../kernels/src/quantize_act_oq4.hip");
+
 // Generic kernel library GEMV tier (gfx1103 wave32, zero LDS, wave-shuffle
 // reduction; one wave per output row). Same-dtype weight/vector inputs.
 // See `docs/kernels/generic-kernel-library.md`.

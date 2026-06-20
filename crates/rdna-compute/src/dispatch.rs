@@ -45198,6 +45198,55 @@ impl Gpu {
         }
     }
 
+    /// Opus Quant W4A4: dynamic per-token/group INT4 activation quantizer.
+    /// `x_f32` [B,K] → `xq_i4` [B,K/2] (packed signed int4) + `xs` [B,K/group]
+    /// (f32 scales). gfx1103 wave32, zero LDS. `group % 32 == 0`, `k % group == 0`.
+    pub fn quantize_act_oq4(
+        &mut self,
+        x_f32: &GpuTensor,
+        xq_i4: &GpuTensor,
+        xs: &GpuTensor,
+        batch_size: usize,
+        k: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(group % 32, 0, "quantize_act_oq4: group must be a multiple of 32");
+        assert_eq!(k % group, 0, "quantize_act_oq4: K must be a multiple of group");
+        self.ensure_kernel(
+            "quantize_act_oq4",
+            kernels::QUANTIZE_ACT_OQ4_SRC,
+            "quantize_act_oq4",
+        )?;
+        let xp = x_f32.buf.as_ptr();
+        let xqp = xq_i4.buf.as_ptr();
+        let xsp = xs.buf.as_ptr();
+        let mut bi = batch_size as i32;
+        let mut ki = k as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &xqp as *const _ as *mut c_void,
+            &xsp as *const _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        let grid_g = (k / group) as u32;
+        let grid_b = batch_size as u32;
+        let func = &self.functions["quantize_act_oq4"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_g, grid_b, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Generic kernel library: WMMA GEMM, signed INT8 inputs → INT32 output.
     /// `a_i8` [M,K], `x_i8` [B,K] (int8), `y_i32` [B,M] (int32).
     /// gfx1103/RDNA3 wave32, zero LDS. Requires `k % 16 == 0` and wave32 WMMA.
