@@ -9,6 +9,7 @@ Examples:
 - CI-safe checks such as `no-gpu-ci.sh`
 - hardware gates such as `coherence-gate-dflash.sh`, `pp-gate.sh`, and
   `speed-gate.sh`
+- targeted hardware repros such as `gfx1103-lds-tail-snop-repro.sh`
 - server or daemon smoke tests that validate an end-to-end behavior
 - pytest files and small shell regression tests
 

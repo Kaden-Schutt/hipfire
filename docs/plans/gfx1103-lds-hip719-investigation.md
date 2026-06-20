@@ -132,6 +132,10 @@ The currently promoted standalone GEMM jig lives in the repo:
   preserves logs, code objects, ISA/readobj output, and dmesg snapshots.
 - `scripts/narrow-gemm-lds-shape.sh`: runs the curated variant matrix and
   writes a TSV report plus summary.
+- `tests/gfx1103-lds-tail-snop-repro.sh`: focused cross-system pass/fail
+  wrapper for a second 780M. The default `PROFILE=repro` checks the no-extra
+  baseline against the tail-loop `s_nop` repro and writes a TSV report under
+  `/tmp/hipfire-lds-tail-snop-repro`.
 
 Older throwaway-only HIP probes used during the investigation:
 
@@ -2338,6 +2342,16 @@ VARIANT=tile6_lds_snop_noextra_load4_consume4_pinned \
 MODE=full N_LAUNCH=100 M=512 N=3072 K=3072 K_LIMIT=0 \
 scripts/lds_gemm_standalone_matrix.sh /tmp/hipfire-lds-scalar-control-runs
 ```
+
+- Focused cross-system test jig:
+
+```bash
+OUT=/tmp/hipfire-lds-tail-snop-780m tests/gfx1103-lds-tail-snop-repro.sh
+```
+
+Use `PROFILE=kedge` for the current K-limit edge (`K_LIMIT=3024` pass-side,
+`K_LIMIT=3032` fail-side) or `PROFILE=full` for baseline, K-edge, and full-depth
+tail-noop checks in one run.
 
 - A tighter throwaway control in `/tmp/hipfire-lds-scalar-nop-runs/` shows
   `tile6_lds_snop_noextra_load4_consume4_pinned` passed one-launch smoke and
