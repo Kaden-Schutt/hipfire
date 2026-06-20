@@ -2681,10 +2681,19 @@ fn main() {
                             9 => "deepseek4",
                             10 => "minimax_m2",
                             11 => "lfm2moe",
+                            13 => "gemma3_vl",
                             _ => "qwen3",
                         };
-                        let vl = m.vision_config.is_some() || m.dots_ocr_config.is_some();
-                        let (dim, layers, vocab) = if let Some(ref c) = m.q35_config {
+                        let vl = m.vision_config.is_some()
+                            || m.dots_ocr_config.is_some()
+                            || m.gemma3_vl.is_some();
+                        let (dim, layers, vocab) = if let Some(ref b) = m.gemma3_vl {
+                            (
+                                b.text_cfg.hidden_size,
+                                b.text_cfg.num_hidden_layers,
+                                b.text_cfg.vocab_size,
+                            )
+                        } else if let Some(ref c) = m.q35_config {
                             (c.dim, c.n_layers, c.vocab_size)
                         } else if let Some(ref c) = m.llama_config {
                             (c.dim, c.n_layers, c.vocab_size)

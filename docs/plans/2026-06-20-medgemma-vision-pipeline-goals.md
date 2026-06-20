@@ -60,9 +60,9 @@ insert/evict); evict never drops the just-inserted entry or below one entry.
 10 no-GPU unit tests: key determinism/namespace-scoping, byte-exact round-trip,
 **hit==miss equality** (Goal-4 evidence for Goal 1), eviction-holds-budget,
 LRU-recency, persist-across-reopen, manifest-rebuild, corruption→miss, replace.
-Not yet wired into the daemon (Goal 2). The `hipfire-eval` *battery row* asserting
-hit==miss across a **real encode** attaches under Goal 2 (needs the serve path);
-the deterministic hit==miss unit test is its pre-daemon stand-in.
+**Wired into the daemon under Goal 2b** (`3e2d6e06`); hit==miss verified across a
+real encode on gfx1151 (2 daemon sessions, byte-identical output). The
+deterministic hit==miss unit test remains as the no-GPU stand-in.
 
 ## Goal 2 — Daemon arch-13 serving + video protocol (the gate) *(= original Phase 3)*
 
@@ -93,6 +93,34 @@ loader has no arch-13 branch.
 **Done when:** `hipfire serve` loads medgemma (arch 13) and answers a `generate`
 request with `image`/`images[]`/`video` over the JSONL protocol; multi-image and
 video both stream coherent output; integrates the Goal-1 cache on the hash path.
+
+**DONE (2026-06-20, validated on gfx1151 Strix Halo + medgemma-1.5-4b).**
+- **2a** (`4ff4945f`): `LoadedModel.gemma3_vl` + arch-13 load branch + daemon
+  dispatch (`decode_vl_frames` for image/video/base64) + `video`/`max_frames`
+  protocol. Routes to `generate_vl_gemma3` → `Gemma3VlBackend::serve`.
+- **coherence** (`41fe57eb`): `decode_loop` gained a repeat-penalty token pick
+  (greedy unchanged at penalty ≤ 1.0); daemon defaults arch-13 to 1.3; `images[]`
+  multi-image input. Bare greedy attractored on near-duplicate video slices
+  (`ình` wall) — penalty fixes it.
+- **2b** (`3e2d6e06`): Goal-1 cache wired on the encode path — `encode_image`
+  (pub) + `serve_with_embeds` split; per-frame xxh64 probe namespaced by
+  `model_path|gemma3vl|img|patch|mm|th`; `HIPFIRE_VISION_CACHE_*` env surface.
+- **reporting**: `loaded` event now reports `arch=gemma3_vl, dim=2560,
+  layers=34, vocab=262208, vl=true` for arch 13 (was `qwen3/0/0/0/false`).
+
+**E2E evidence (all greedy+1.3 penalty, daemon JSONL):**
+- single image → coherent, anatomy-aware (cerebrum/cerebellum/brainstem,
+  gray/white matter, ventricles).
+- video (3 MRI slices) → decode→encode→splice→coherent medical summary.
+- `images[]` (2 distinct MRI) → coherent comparison ("same structure,
+  different contrast … left side shows ventricles …").
+- cache: 2 fresh daemon sessions, shared dir → session 1 `misses=1`, session 2
+  `hits=1`, **byte-identical output (hit == miss)**; `.vrow` = 48B header +
+  256×2560×4 f32, persists across restart.
+
+**Remaining (Goal 4):** the `hipfire-eval` battery row formalizing this as a
+CI-runnable suite (the direct evidence above is recorded; the eval-harness suite
+is the canonical home and is the open Goal-4 item).
 
 ## Goal 3 — 8-bit variance-normalized KV ("KVarN-8")
 

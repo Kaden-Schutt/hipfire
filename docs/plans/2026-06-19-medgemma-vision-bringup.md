@@ -116,6 +116,18 @@ multimodal loader bundle, image preproc, forward_step_with_embed splice, the
 infer_gemma3_vl harness, arch-13 ingest, and both fixes.
 
 **Follow-ups (not blocking):** GPU avg-pool (currently host-side), medgemma-27b-it,
-daemon wiring (arch_id 13 ServingBackend), pan-and-scan for large images, and the
-prompt-frame specials check (the manual `<bos>`/turn-token construction in the
-example should move to the proper gemma chat template when daemon-wired).
+pan-and-scan for large images.
+
+**DONE since (2026-06-20, chaingun, `docs/plans/2026-06-20-medgemma-vision-pipeline-goals.md`):**
+- **Daemon wiring (arch_id 13)** — `LoadedModel.gemma3_vl` + arch-13 load branch +
+  daemon dispatch; `hipfire serve` answers `image`/`images[]`/`video` requests
+  over JSONL, validated coherent on gfx1151 (commits `4ff4945f`, `41fe57eb`,
+  `3e2d6e06`).
+- **Video + multi-image** — `hipfire-media` video→frames + true multi-image
+  splice, reachable through the daemon (`video`/`max_frames`/`images[]`).
+- **Vision-encode perf** — 138s → ~1.5s/image warm (~92×): `vit_attention_opt`
+  fix → bf16 WMMA tower → f16-KV WMMA flash (gfx1151-measured).
+- **Embedding cache** — xxh64-keyed on-disk LRU, wired on the encode path.
+- **Prompt framing** — the daemon path frames the gemma chat template as text
+  (`<bos>`/`<start_of_turn>`/`<start_of_image>` round-trip through `tok.encode`),
+  confirmed on the real medgemma tokenizer; the bare example still hand-builds tokens.
