@@ -42,7 +42,7 @@ dmesg_delta_count() {
         rg -c "$pattern" "$after" || true
         return
     fi
-    awk 'NR == FNR { seen[$0] = 1; next } !($0 in seen)' "$before" "$after" |
+    awk 'NR == FNR { seen[$0]++; next } seen[$0] > 0 { seen[$0]--; next } { print }' "$before" "$after" |
         rg -c "$pattern" || true
 }
 

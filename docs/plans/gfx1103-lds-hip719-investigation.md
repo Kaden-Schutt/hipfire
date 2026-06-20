@@ -142,10 +142,9 @@ The currently promoted standalone GEMM jig lives in the repo:
   cross-machine repro results. It writes TSV and Markdown summaries from
   `meta.txt`, `run.log`, `exit_code.txt`, dmesg deltas, devcoredump presence,
   saved ISA/readobj files, and short SHA-256 hashes for the captured HIP source,
-  AMDGPU object, and AMDGPU ISA dump. Dmesg deltas are counted as lines present
-  in `dmesg.after.txt` but absent from `dmesg.before.txt`, which handles kernel
-  ring-buffer snapshots where before/after line counts are equal but old lines
-  were replaced by new reset messages.
+  AMDGPU object, and AMDGPU ISA dump. Dmesg deltas are counted with a multiset
+  difference between `dmesg.before.txt` and `dmesg.after.txt`, which handles
+  kernel ring-buffer snapshots while preserving repeated new reset messages.
 - `scripts/lds_gemm_summary_compare.sh`: read-only TSV comparator for two
   artifact summaries. It classifies differences as source drift, codegen drift,
   same-codegen runtime difference, same-result environment difference, or same.
