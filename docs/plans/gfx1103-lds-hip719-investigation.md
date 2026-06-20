@@ -2359,11 +2359,8 @@ control):
   Treat the common
   in-process HIP reset APIs as already tested; only revisit teardown if a
   genuinely different ROCm mechanism is identified.
-- create a single-instantiation compile unit for the failing synthetic symbol
-  and the passing long-loop symbol so instruction counts can be per-symbol
-  instead of object-aggregate.
-- create single-instantiation LDS-only masked/no-mask compile units so resource
-  and instruction counts are not polluted by unused template variants.
+- create a single-instantiation compile unit for the passing long-loop symbol
+  so instruction counts can be per-symbol instead of object-aggregate.
 
 ### Additional Sequence Sweep (Fresh)
 
@@ -2560,9 +2557,17 @@ skewed by neighboring template variants.
   segment. The ISA delta from the pass-side no-extra shape is a loop-carried
   scalar increment (`s_add_i32`) and sink, with no extra LDS operation and no
   extra branch beyond the normal K-loop branch.
-- The compile-only single-instantiation helper now covers all promoted
-  scalar-control variants. With `SINGLE_INSTANTIATION=1`, the current object
-  counts are:
+- The compile-only single-instantiation helper now covers both LDS-only
+  synthetic probes plus all promoted scalar-control variants. With
+  `SINGLE_INSTANTIATION=1`, the current object counts are:
+  - unmasked synthetic GEMM-shaped `tile6_synth`: 300 bytes, 61 instructions,
+    zero `s_nop 0`, one LDS store, five LDS loads, two barriers, two scalar
+    branches, `group_segment_fixed_size=288`, `sgpr_count=5`, `vgpr_count=18`,
+    `wavefront_size=32`.
+  - masked synthetic GEMM-shaped `tile6_synth_masked`: 392 bytes,
+    84 instructions, twelve `s_nop 0`, one LDS store, five LDS loads,
+    two barriers, four scalar branches, `group_segment_fixed_size=288`,
+    `sgpr_count=7`, `vgpr_count=18`, `wavefront_size=32`.
   - no-extra pass-side: 392 bytes, 79 instructions, five `s_nop 0` prologue
     padding ops, two LDS stores, four LDS loads, three barriers, two scalar
     branches.
@@ -2576,12 +2581,15 @@ skewed by neighboring template variants.
     LDS/barrier/branch counts.
   - counter-mask: 400 bytes, 80 instructions, zero `s_nop 0`, same LDS/barrier
     counts, same branch count.
-  All five use `group_segment_fixed_size=144`,
+  The five scalar-control probes all use `group_segment_fixed_size=144`,
   `private_segment_fixed_size=0`, `sgpr_count=5`, `vgpr_count=10`, and
   `wavefront_size=32`. This strengthens the scalar-control/backedge-timing
   lead: the observed failures are not tracking LDS operation count, barrier
   count, register pressure, LDS footprint, or total instruction count in a
-  monotonic way.
+  monotonic way. Full-object mode and isolated mode agree for the masked synth
+  and scalar-control rows; the unmasked synthetic row differs in VGPR metadata
+  (`26` in the full object versus `18` isolated), so use
+  `SINGLE_INSTANTIATION=1` for resource-count evidence on that symbol.
 - This sharpens the current suspect further: in the
   second-store/four-waited-row-load loop, a single recurrent scalar no-op is
   enough to move the pass-side no-extra shape into the faulting class under

@@ -12,6 +12,8 @@ SRC="${SRC:-$ROOT/lds_gemm_standalone_probe.hip}"
 SINGLE_INSTANTIATION="${SINGLE_INSTANTIATION:-0}"
 
 DEFAULT_SYMBOLS=(
+    "_Z20gemm_lds_synth_probeILi6EEviiii"
+    "_Z27gemm_lds_synth_masked_probeILi6EEviiii"
     "_Z72gemm_lds_store_then_load_dynamiccols_load4_noextra_consume4_pinned_probeILi6EEviiii"
     "_Z52gemm_lds_counter_noextra_load4_consume4_pinned_probeILi6EEviiii"
     "_Z49gemm_lds_snop_noextra_load4_consume4_pinned_probeILi6EEviiii"
@@ -75,6 +77,12 @@ fi
 
 variant_for_symbol() {
     case "$1" in
+        "_Z20gemm_lds_synth_probeILi6EEviiii")
+            echo "gemm_lds_synth_probe"
+            ;;
+        "_Z27gemm_lds_synth_masked_probeILi6EEviiii")
+            echo "gemm_lds_synth_masked_probe"
+            ;;
         "_Z72gemm_lds_store_then_load_dynamiccols_load4_noextra_consume4_pinned_probeILi6EEviiii")
             echo "gemm_lds_store_then_load_dynamiccols_load4_noextra_consume4_pinned_probe"
             ;;
