@@ -223,8 +223,58 @@ count_op() {
     echo "${count:-0}"
 }
 
+line_number() {
+    local mode="$1"
+    local pattern="$2"
+    local section="$3"
+
+    if [[ "$mode" == "first" ]]; then
+        rg -n "$pattern" "$section" | head -1 | cut -d: -f1 || true
+    else
+        rg -n "$pattern" "$section" | tail -1 | cut -d: -f1 || true
+    fi
+}
+
+count_between_lines() {
+    local pattern="$1"
+    local start_line="$2"
+    local end_line="$3"
+    local section="$4"
+
+    if [[ -z "$start_line" || -z "$end_line" || "$start_line" -ge "$end_line" ]]; then
+        echo 0
+        return
+    fi
+
+    awk -v pattern="$pattern" -v start="$start_line" -v end="$end_line" '
+        NR > start && NR < end && $0 ~ pattern { count++ }
+        END { print count + 0 }
+    ' "$section"
+}
+
+mnemonic_window() {
+    local start_line="$1"
+    local end_line="$2"
+    local section="$3"
+
+    if [[ -z "$start_line" || -z "$end_line" || "$start_line" -gt "$end_line" ]]; then
+        return
+    fi
+
+    awk -v start="$start_line" -v end="$end_line" '
+        NR >= start && NR <= end && $1 ~ /^[A-Za-z_][A-Za-z0-9_]*$/ {
+            if (out != "") {
+                out = out ";" $1
+            } else {
+                out = $1
+            }
+        }
+        END { print out }
+    ' "$section"
+}
+
 summary="$OUT/isa-summary.tsv"
-printf 'symbol\tsize\tinstructions\ts_nop\tds_store\tds_load\ts_barrier\ts_cbranch\tgroup_segment\tprivate_segment\tsgpr\tvgpr\twavefront\tsection\n' >"$summary"
+printf 'symbol\tsize\tinstructions\ts_nop\tds_store\tds_load\ts_barrier\ts_cbranch\tpre_ds_s_nop\tpre_ds_s_add_i32\ttail_s_nop\ttail_s_add_i32\ttail_window\tgroup_segment\tprivate_segment\tsgpr\tvgpr\twavefront\tsection\n' >"$summary"
 
 while IFS=$'\t' read -r symbol obj; do
     safe="${symbol//[^A-Za-z0-9_]/_}"
@@ -258,15 +308,24 @@ while IFS=$'\t' read -r symbol obj; do
     ds_load="$(count_op '^\s+ds_load' "$section")"
     s_barrier="$(count_op '^\s+s_barrier' "$section")"
     s_cbranch="$(count_op '^\s+s_cbranch' "$section")"
+    first_ds_store_line="$(line_number first '^[[:space:]]+ds_store' "$section")"
+    last_barrier_line="$(line_number last '^[[:space:]]+s_barrier' "$section")"
+    last_branch_line="$(line_number last '^[[:space:]]+s_cbranch' "$section")"
+    pre_ds_s_nop="$(count_between_lines '^[[:space:]]+s_nop' 0 "$first_ds_store_line" "$section")"
+    pre_ds_s_add_i32="$(count_between_lines '^[[:space:]]+s_add_i32' 0 "$first_ds_store_line" "$section")"
+    tail_s_nop="$(count_between_lines '^[[:space:]]+s_nop' "$last_barrier_line" "$last_branch_line" "$section")"
+    tail_s_add_i32="$(count_between_lines '^[[:space:]]+s_add_i32' "$last_barrier_line" "$last_branch_line" "$section")"
+    tail_window="$(mnemonic_window "$last_barrier_line" "$last_branch_line" "$section")"
     group_segment="$(metadata_value_near_name "$readobj_txt" "$symbol" "group_segment_fixed_size")"
     private_segment="$(metadata_value_near_name "$readobj_txt" "$symbol" "private_segment_fixed_size")"
     sgpr="$(metadata_value_near_name "$readobj_txt" "$symbol" "sgpr_count")"
     vgpr="$(metadata_value_near_name "$readobj_txt" "$symbol" "vgpr_count")"
     wavefront="$(metadata_value_near_name "$readobj_txt" "$symbol" "wavefront_size")"
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$symbol" "$size" "$instructions" "$snop" "$ds_store" "$ds_load" \
-        "$s_barrier" "$s_cbranch" "$group_segment" "$private_segment" \
+        "$s_barrier" "$s_cbranch" "$pre_ds_s_nop" "$pre_ds_s_add_i32" \
+        "$tail_s_nop" "$tail_s_add_i32" "$tail_window" "$group_segment" "$private_segment" \
         "$sgpr" "$vgpr" "$wavefront" "$section" >>"$summary"
 done <"$OUT/object-list.txt"
 

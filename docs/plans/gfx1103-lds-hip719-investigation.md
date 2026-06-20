@@ -137,7 +137,11 @@ The currently promoted standalone GEMM jig lives in the repo:
   standalone probe, does not launch any GPU kernel, and writes per-symbol
   resource/ISA counters for the promoted scalar-control comparison.
   Set `SINGLE_INSTANTIATION=1` to compile each mapped kernel in its own
-  generated source/object.
+  generated source/object. The summary also records scalar-control placement
+  around the first LDS store and the final barrier/backedge window
+  (`pre_ds_s_nop`, `pre_ds_s_add_i32`, `tail_s_nop`, `tail_s_add_i32`,
+  `tail_window`) so pass/fail controls can be compared without manually
+  reading the disassembly.
 - `scripts/lds_gemm_artifact_summary.sh`: read-only artifact summarizer for
   cross-machine repro results. It writes TSV and Markdown summaries from
   `meta.txt`, `run.log`, `exit_code.txt`, dmesg deltas, devcoredump presence,
@@ -2539,9 +2543,11 @@ SINGLE_INSTANTIATION=1 scripts/lds_gemm_isa_compare.sh /tmp/hipfire-lds-gemm-isa
 The helper writes `isa-summary.tsv` plus per-symbol ISA and key-op extracts,
 with `SYMBOLS="..."` available for later single-symbol comparisons. The
 default symbol set now covers no-extra, counter-only, pre-store `s_nop`, tail
-`s_nop`, and counter-mask. Full-object and single-instantiation modes emit the
-same counts for these symbols, so the saved full-object comparison is not being
-skewed by neighboring template variants.
+`s_nop`, and counter-mask. The TSV now includes placement columns for the
+current scalar-control lead: `pre_ds_s_nop`, `pre_ds_s_add_i32`, `tail_s_nop`,
+`tail_s_add_i32`, and `tail_window`. Full-object and single-instantiation modes
+emit the same core counts for these symbols, so the saved full-object
+comparison is not being skewed by neighboring template variants.
 - A sequential K-limit sweep in
   `/tmp/hipfire-lds-tail-snop-klimit-runs/` shows the tail-noop trigger is
   concentrated near the top of the K loop. The initial concurrent
@@ -2600,7 +2606,25 @@ skewed by neighboring template variants.
     counts, same branch count.
   The five scalar-control probes all use `group_segment_fixed_size=144`,
   `private_segment_fixed_size=0`, `sgpr_count=5`, `vgpr_count=10`, and
-  `wavefront_size=32`. This strengthens the scalar-control/backedge-timing
+  `wavefront_size=32`. A fresh placement-aware compile-only summary at
+  `/tmp/hipfire-lds-gemm-isa-placement-single/` adds these scalar placement
+  facts:
+  - no-extra pass-side:
+    `pre_ds_s_nop=5`, `pre_ds_s_add_i32=0`, `tail_s_nop=0`,
+    `tail_window=s_barrier;buffer_gl0_inv;s_cbranch_scc0`.
+  - counter-only:
+    `pre_ds_s_nop=0`, `pre_ds_s_add_i32=1`, `tail_s_nop=0`,
+    `tail_window=s_barrier;buffer_gl0_inv;s_cbranch_scc0`.
+  - pre-store `s_nop`:
+    `pre_ds_s_nop=1`, `pre_ds_s_add_i32=0`, `tail_s_nop=0`,
+    `tail_window=s_barrier;buffer_gl0_inv;s_cbranch_scc0`.
+  - tail `s_nop`:
+    `pre_ds_s_nop=0`, `pre_ds_s_add_i32=0`, `tail_s_nop=1`,
+    `tail_window=s_barrier;buffer_gl0_inv;s_nop;s_cbranch_scc0`.
+  - counter-mask:
+    `pre_ds_s_nop=0`, `pre_ds_s_add_i32=1`, `tail_s_nop=0`,
+    `tail_window=s_barrier;buffer_gl0_inv;s_cbranch_scc0`.
+  This strengthens the scalar-control/backedge-timing
   lead: the observed failures are not tracking LDS operation count, barrier
   count, register pressure, LDS footprint, or total instruction count in a
   monotonic way. Full-object mode and isolated mode agree for the masked synth
