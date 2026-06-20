@@ -44740,6 +44740,54 @@ impl Gpu {
     /// `a_f16` [M,K], `x_f16` [B,K], `y_f16` [B,M], all raw F16 (u16) payloads.
     /// gfx1103/RDNA3 wave32, zero LDS. F32 accumulation, F16 round on store.
     /// Requires `k % 16 == 0` and wave32 WMMA.
+    /// Generic kernel library: WMMA GEMM, signed INT8 inputs → INT32 output.
+    /// `a_i8` [M,K], `x_i8` [B,K] (int8), `y_i32` [B,M] (int32).
+    /// gfx1103/RDNA3 wave32, zero LDS. Requires `k % 16 == 0` and wave32 WMMA.
+    pub fn gemm_iu8_i32_wmma(
+        &mut self,
+        a_i8: &GpuTensor,
+        x_i8: &GpuTensor,
+        y_i32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(k % 16, 0, "gemm_iu8_i32_wmma: K must be a multiple of 16");
+        self.ensure_kernel(
+            "gemm_iu8_i32_wmma",
+            kernels::GEMM_IU8_I32_WMMA_SRC,
+            "gemm_iu8_i32_wmma",
+        )?;
+        let ap = a_i8.buf.as_ptr();
+        let xp = x_i8.buf.as_ptr();
+        let yp = y_i32.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+        ];
+        let grid_m = ((m + 15) / 16) as u32;
+        let grid_b = ((batch_size + 15) / 16) as u32;
+        let func = &self.functions["gemm_iu8_i32_wmma"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_m, grid_b, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     pub fn gemm_f16_f16_wmma(
         &mut self,
         a_f16: &GpuTensor,
