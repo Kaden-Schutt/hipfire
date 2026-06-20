@@ -165,6 +165,27 @@ So the fused-iu4 W4A4 path is quality-viable for compute-bound prefill with the
 recipe **SmoothQuant → rotation → clip-search int4, A=g32**. Reproduce:
 `cargo run -p hipfire-quantize --example quant_w4a4_improve`.
 
+## E5 — End-to-end on-GPU validation of the W4A4 recipe
+
+`validate_w4a4_recipe` (rdna-compute example) runs the full recipe through the
+real fused iu4 kernel on gfx1103: SmoothQuant → FWHT-256 → clip-search int4
+(g128), then per-K-group fused `gemm_iu4_i32_wmma` with per-group scale rescale
+accumulated in f32. It checks GPU output against both the f32 reference (SQNR)
+and a CPU sim of the identical scheme.
+
+| M,K,B | CPU-sim SQNR | GPU SQNR | GPU vs CPU max-rel |
+|-------|-------------:|---------:|-------------------:|
+| 128,2048,64  | 21.29 | 21.29 | 8.6e-5 |
+| 256,4096,32  | 20.06 | 20.06 | 4.7e-4 |
+| 64,1024,128  | 22.58 | 22.58 | 2.1e-4 |
+| 512,2048,16  | 21.45 | 21.45 | 4.8e-4 |
+
+The fused-iu4 path realizes the recipe exactly (GPU == CPU sim) and the ~21 dB
+W4A4 quality holds on real hardware — vs ~9 dB for naive W4A4. Grouped scales
+are handled by K-tiling (one fused iu4 GEMM per K-group); a production kernel
+would fold the per-group rescale into the epilogue instead of per-group launches.
+Reproduce: `cargo run --release -p rdna-compute --example validate_w4a4_recipe`.
+
 ## Net recommendation for gfx1103
 
 - **Weights: FWHT-rotated symmetric int4 (MQ4) at ~4.06 bits/w**, group scales,
