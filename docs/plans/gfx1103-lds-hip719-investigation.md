@@ -1583,6 +1583,14 @@ Latest artifact paths:
   `ds=14`, `wait=8`, `branch=5`, `offset1=36`), so do not use the earlier
   pass as a stable disproof that a two-wave block/barrier can enter the failure
   family after reset pressure.
+- A read-pressure sweep on the stable all-active first-two-wave shape
+  (`/tmp/hipfire-lds-direct-ab-reads-artifacts/`, throwaway worktree
+  `/tmp/hipfire-lds-direct-ab-reads-1781924058`) used `9x4` active/block/layout,
+  `iters=448`, `grid=512x86`, and one child. At `chunks=150`, `READS=1`
+  passed, while `READS=2` failed at sync/global launch 131 and `READS=3`
+  failed at launch 98. A `READS=2` launch-count bracket with the same normalized
+  ISA (`277a9cab2146459e`) passed at `120` and `130` launches, then failed at
+  `140` and `150` with the same `0x841051` GCVM and GDS/GDS-VM signature.
 
 ## Current Narrowing
 
@@ -1903,6 +1911,11 @@ Reduction results after extending the standalone HIP GEMM probe:
   workgroup/barrier participation is harmless by itself. The more stable
   all-active evidence remains the 32/33 active-lane boundary: <=32 active lanes
   pass at the tested edge, while 33+ all-active lanes fail.
+- The `9x4` all-active read-pressure sweep shows the first-two-wave condition
+  also needs enough LDS read work at the tested edge: `READS=1` survives
+  `150` launches, while `READS=2` crosses between `130` and `140` launches and
+  `READS=3` fails earlier. The failure signature is unchanged, so this is the
+  same fault family with a shifted launch-count threshold, not a new error.
 - Phase-mode controls sharpen the process-boundary result. With the same
   direct-AB kernel body at reads=6/192/511x86, same-process `99 + 1` fails on
   phase2 launch 0 / global launch 99, and same-process `98 + 2` fails on
@@ -2288,6 +2301,8 @@ LDS-only control:
 | direct-AB multi-exec `6x6` block, reads=3, 448 iters, 512x86, one child `150` | FAIL at sync/global launch 99 | `_Z25lds_direct_ab_phase_probev` | 288 B | 34 | 2 | 0 | 32 |
 | direct-AB multi-exec `8x4` active / `9x4` layout and `4x8` active / `4x9` layout, reads=3, 448 iters, 512x86, one child `150` | PASS | `_Z25lds_direct_ab_phase_probev` | 288 B | 34 | 2 | 0 | 32 |
 | direct-AB multi-exec `8x4` active inside `9x4` block/layout, reads=3, 448 iters, 512x86, one child `150` | MIXED: initial pass; later same-ISA traffic-mask replay failed at sync/global launch 100; all-active `9x4` failed at 98 | `_Z25lds_direct_ab_phase_probev` | 288 B | 15 | 5 | 0 | 32 |
+| direct-AB multi-exec `9x4` block/layout, reads=1/2/3, 448 iters, 512x86, one child `150` | reads=1 PASS; reads=2 FAIL at launch 131; reads=3 FAIL at launch 98 | `_Z25lds_direct_ab_phase_probev` | 288 B | 22/24/34 | 2 | 0 | 32 |
+| direct-AB multi-exec `9x4` block/layout, reads=2, 448 iters, 512x86 | PASS at one-child `120`/`130`; FAIL at `140`/`150` | `_Z25lds_direct_ab_phase_probev` | 288 B | 24 | 2 | 0 | 32 |
 | direct-AB no-output `8x4` active in `8x5` block, reads=6 | PASS at 512 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 256 B | 22 | 5 | 0 | 32 |
 
 ISA observations:
