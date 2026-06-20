@@ -4,8 +4,8 @@
 ## Mission
 
 Build a Rust-native ML inference (and eventually training) engine for AMD RDNA GPUs,
-starting with the RX 5700 XT (gfx1010/RDNA1) on this machine (k9lin). The end goal is
-a portable method that works across ANY RDNA generation (RDNA1→RDNA4), not just this card.
+starting with the RX 5700 XT (gfx1010/RDNA1). The end goal is a portable method that
+works across ANY RDNA generation (RDNA1→RDNA4), not just this card.
 
 This project combines three efforts into one pipeline:
 1. **autorocm** — Map and unlock ROCm on consumer RDNA hardware
@@ -43,24 +43,15 @@ They define the methodology and architectural patterns we're following:
 ROCm support for RDNA1; consumer RDNA cards are artificially gated. The
 `HSA_OVERRIDE_GFX_VERSION=10.3.0` hack (treat gfx1010 as gfx1030) is unreliable,
 version-dependent, and segfaults — per Rule 5 it is NOT a permanent solution.
-The 5700 XT now lives on the **hipx** box (HIP device 0, ~7GB), not k9lin.
 
-**Current dev + validation fleet (RDNA1 → RDNA4, all native — no GFX override):**
-- **k9lin** (primary dev/perf host, local) — **gfx1100 / RX 7900 XTX, 24GB,
-  RDNA3** (Navi 31, `1002:744c`). The canonical perf box: the
-  perf-benchmarking methodology (±1–3% band, Δ≥5% investigate) is calibrated to
-  this card. Fits quantized 9B/27B/A3B; not full MiniMax-class.
-- **hipx** (ssh) — **gfx1151 / Strix Halo, RDNA3.5, ~96GB** carveout (HIP
-  device 1, pin `HIP_VISIBLE_DEVICES=1`) for big models + WMMA; plus the
-  **gfx1010 / RDNA1** 5700 XT (device 0, ~7GB).
-- **hiptrx** (ssh) — **4× AMD Radeon AI PRO R9700 / gfx1201, RDNA4, 32 GiB
-  each** (rocm-smi reports 34,208,743,424 B ≈ 34.2 GB; ~128 GiB aggregate) on a
-  Threadripper 9970X. RDNA4 coverage + multi-GPU pipeline-parallel.
+**Portability target:** every decision must hold across RDNA1→RDNA4 natively
+(no GFX override). The project validates across RDNA1/RDNA3/RDNA3.5/RDNA4.
 
-Cross-arch validation (e.g. #397's mandated gfx1100 RDNA3 + gfx1201 RDNA4
-gates, RDNA4 non-optional) maps natively: RDNA1 = hipx/gfx1010, RDNA3 =
-k9lin/gfx1100, RDNA3.5 = hipx/gfx1151, RDNA4 = hiptrx/gfx1201. Per-box
-`gpu-lock.sh` → genuine cross-box parallel validation.
+**The concrete dev + validation fleet (host names, per-box GPU arch, ssh
+targets, lock pins) is machine-specific and lives in `AGENTS.local.md`** — it
+is intentionally NOT committed here, since it drifts per checkout/host. Do not
+assume the box you are on from any static description: **trust a live probe
+(`rocminfo`) over any fleet map.**
 
 ## Orchestration Model
 

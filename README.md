@@ -279,8 +279,8 @@ back to this file.
 ## Mission and historical bootstrap context
 
 Build a Rust-native ML inference (and eventually training) engine for AMD RDNA GPUs,
-starting with the RX 5700 XT (gfx1010/RDNA1) on this machine (k9lin). The end goal is
-a portable method that works across ANY RDNA generation (RDNA1→RDNA4), not just this card.
+starting with the RX 5700 XT (gfx1010/RDNA1). The end goal is a portable method that
+works across ANY RDNA generation (RDNA1→RDNA4), not just this card.
 
 This project combines three efforts into one pipeline:
 1. **autorocm** — Map and unlock ROCm on consumer RDNA hardware
