@@ -122,6 +122,25 @@ pub fn hfq_has_bf16_weights(hfq: &HfqFile) -> bool {
     hfq.tensors().iter().any(|t| t.quant_type == 16)
 }
 
+/// True only when the model is *predominantly* BF16 (a full-precision artifact),
+/// not merely a quantized model that keeps a few small tensors (norms) at BF16.
+/// Decided on the 2-D weight tensors (the matmul projections): a full BF16 model
+/// has them all BF16 (qt==16); an MQ4/Q8 model has them quantized with only 1-D
+/// norms left at BF16. Used to decide whether to FORCE fp32 KV — quantized
+/// models must NOT be forced (it locks them out of batched prefill).
+pub fn hfq_is_bf16_dominant(hfq: &HfqFile) -> bool {
+    let (mut bf16_2d, mut total_2d) = (0usize, 0usize);
+    for t in hfq.tensors() {
+        if t.shape.len() == 2 {
+            total_2d += 1;
+            if t.quant_type == 16 {
+                bf16_2d += 1;
+            }
+        }
+    }
+    total_2d > 0 && bf16_2d * 2 > total_2d
+}
+
 // Auto-upgrade DeltaNet state to FP32 for low-redundancy models when the caller
 // has not made an explicit non-default choice. Q8/Q4 state accumulates quality
 // drift on long outputs; the recurrent state is the model's numerical anchor
@@ -226,16 +245,23 @@ pub fn load_model(
 
     let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let model_memory = hfq_model_memory(path, &hfq);
+    // Whether ANY tensor is BF16 — used to keep the DeltaNet *state* at FP32
+    // (the recurrent state's cumulative-error sensitivity; orthogonal to KV).
     let is_bf16_artifact = hfq_has_bf16_weights(&hfq);
-    // HIPFIRE_FORCE_QUANT_KV=1: diagnostic escape — keep the requested quantized
-    // KV even when a few BF16 tensors (e.g. norms) are present, to measure the
-    // batched-prefill path's speed. Not for production (KV/weight precision mix
-    // is intentional); see prefill eligibility investigation.
-    let allow_quant_kv = std::env::var("HIPFIRE_FORCE_QUANT_KV").as_deref() == Ok("1");
-    if is_bf16_artifact && !allow_quant_kv {
+    // KV precision policy:
+    //   * BF16-DOMINANT model (full-precision artifact) -> force fp32 KV (mixing
+    //     a quantized KV under bf16 weights is a precision mismatch).
+    //   * Quantized model (MQ4/Q8 weights, only norms BF16) -> honor an explicit
+    //     kv_mode; otherwise default to fp32 for now. A quantized KV (q8/asym/
+    //     KVarN) makes the model batched-prefill eligible (~32x prefill); the
+    //     prior rule wrongly force-fp32'd these via the BF16 norms, locking them
+    //     to the per-token path. Default flips to KVarN once it's a runtime mode.
+    if hfq_is_bf16_dominant(&hfq) {
         if kv_mode != "fp32" {
-            eprintln!("  BF16 tensors detected: forcing KV cache to fp32");
+            eprintln!("  BF16-dominant model: forcing KV cache to fp32");
         }
+        kv_mode = "fp32".to_string();
+    } else if kv_mode.is_empty() {
         kv_mode = "fp32".to_string();
     }
     let tokenizer = hipfire_model::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
@@ -1784,16 +1810,23 @@ pub fn load_model_pp(
         .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let model_memory = hfq_model_memory(path, &hfq);
+    // Whether ANY tensor is BF16 — used to keep the DeltaNet *state* at FP32
+    // (the recurrent state's cumulative-error sensitivity; orthogonal to KV).
     let is_bf16_artifact = hfq_has_bf16_weights(&hfq);
-    // HIPFIRE_FORCE_QUANT_KV=1: diagnostic escape — keep the requested quantized
-    // KV even when a few BF16 tensors (e.g. norms) are present, to measure the
-    // batched-prefill path's speed. Not for production (KV/weight precision mix
-    // is intentional); see prefill eligibility investigation.
-    let allow_quant_kv = std::env::var("HIPFIRE_FORCE_QUANT_KV").as_deref() == Ok("1");
-    if is_bf16_artifact && !allow_quant_kv {
+    // KV precision policy:
+    //   * BF16-DOMINANT model (full-precision artifact) -> force fp32 KV (mixing
+    //     a quantized KV under bf16 weights is a precision mismatch).
+    //   * Quantized model (MQ4/Q8 weights, only norms BF16) -> honor an explicit
+    //     kv_mode; otherwise default to fp32 for now. A quantized KV (q8/asym/
+    //     KVarN) makes the model batched-prefill eligible (~32x prefill); the
+    //     prior rule wrongly force-fp32'd these via the BF16 norms, locking them
+    //     to the per-token path. Default flips to KVarN once it's a runtime mode.
+    if hfq_is_bf16_dominant(&hfq) {
         if kv_mode != "fp32" {
-            eprintln!("  BF16 tensors detected: forcing KV cache to fp32");
+            eprintln!("  BF16-dominant model: forcing KV cache to fp32");
         }
+        kv_mode = "fp32".to_string();
+    } else if kv_mode.is_empty() {
         kv_mode = "fp32".to_string();
     }
     let tokenizer = hipfire_model::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
