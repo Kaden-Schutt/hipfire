@@ -2371,6 +2371,21 @@ tail-noop checks in one run.
   segment. The ISA places the only inserted `s_nop 0` after the final
   `s_barrier`/`buffer_gl0_inv` and immediately before the K-loop branch. A
   follow-up no-extra 100-launch recovery run passed.
+- Offline comparison of the saved code object from
+  `/tmp/hipfire-lds-snop-placement-runs/tail-n100/` rules out a larger-resource
+  explanation for the tail-noop failure. The pass-side no-extra symbol
+  (`tile6_lds_store_then_load_dynamiccols_load4_noextra_consume4_pinned`) is
+  392 bytes with 79 instructions, five `s_nop 0` instructions, two
+  `ds_store_b32`, four `ds_load_b32`, three `s_barrier`, and two scalar
+  branches. All five no-extra `s_nop 0` instructions are prologue/padding
+  before the loop body. The failing tail-noop symbol is smaller at 368 bytes
+  with 73 instructions, one `s_nop 0`, the same two LDS stores, four LDS
+  loads, three barriers, and two scalar branches. Both symbols use
+  `group_segment_fixed_size=144`, `private_segment_fixed_size=0`,
+  `sgpr_count=5`, `vgpr_count=10`, and `wavefront_size=32`. The distinguishing
+  delta is placement of the recurrent scalar padding at the loop tail/backedge,
+  after the final barrier/gl0 invalidation and before the branch, not total
+  instruction count, register pressure, or LDS footprint.
 - A sequential K-limit sweep in
   `/tmp/hipfire-lds-tail-snop-klimit-runs/` shows the tail-noop trigger is
   concentrated near the top of the K loop. The initial concurrent
