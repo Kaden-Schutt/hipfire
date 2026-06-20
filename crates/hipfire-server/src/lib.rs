@@ -34,6 +34,18 @@ pub fn build_router(state: SharedState) -> Router {
             "/operator/models/registry",
             get(routes::models::get_model_registry),
         )
+        .route(
+            "/operator/training/runs",
+            get(routes::training::list_training_runs_route),
+        )
+        .route(
+            "/operator/training/runs/{id}",
+            get(routes::training::get_training_run),
+        )
+        .route(
+            "/operator/training/runs/{id}/events",
+            get(routes::training::get_training_run_events),
+        )
         .route("/v1/models", get(routes::models::get_models))
         .route(
             "/v1/files",

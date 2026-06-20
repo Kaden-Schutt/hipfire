@@ -15,6 +15,7 @@ use crate::hipfire::{
     config::ConfigState,
     registry::{RegistryAction, RegistryState},
     status::{start_background_serve, StatusState},
+    training::TrainingState,
     HipfirePaths,
 };
 
@@ -23,15 +24,17 @@ pub enum Tab {
     Home,
     Chat,
     Models,
+    Training,
     Settings,
     System,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [
+    pub const ALL: [Tab; 6] = [
         Tab::Home,
         Tab::Chat,
         Tab::Models,
+        Tab::Training,
         Tab::Settings,
         Tab::System,
     ];
@@ -41,6 +44,7 @@ impl Tab {
             Tab::Home => "Home",
             Tab::Chat => "Chat",
             Tab::Models => "Models",
+            Tab::Training => "Training",
             Tab::Settings => "Settings",
             Tab::System => "System",
         }
@@ -52,6 +56,7 @@ pub struct App {
     pub config: ConfigState,
     pub registry: RegistryState,
     pub status: StatusState,
+    pub training: TrainingState,
     pub active_model: String,
     pub tab: Tab,
     pub settings_easy: bool,
@@ -66,12 +71,14 @@ impl App {
         let config = ConfigState::load(&paths);
         let registry = RegistryState::load(&paths, &config);
         let status = StatusState::load(&paths, &config);
+        let training = TrainingState::load(&paths, &config);
         let active_model = config.default_model.clone();
         Ok(Self {
             paths,
             config,
             registry,
             status,
+            training,
             active_model,
             tab: Tab::Home,
             settings_easy: true,
@@ -85,6 +92,7 @@ impl App {
         self.config = ConfigState::load(&self.paths);
         self.registry = RegistryState::load(&self.paths, &self.config);
         self.status = StatusState::load(&self.paths, &self.config);
+        self.training = TrainingState::load(&self.paths, &self.config);
         self.last_reload = "reloaded config, registry, models, and serve status".into();
     }
 
@@ -102,7 +110,20 @@ impl App {
         match self.tab {
             Tab::Chat => self.handle_chat_key(key),
             Tab::Models => self.handle_models_key(key),
+            Tab::Training => self.handle_training_key(key),
             Tab::Settings => self.handle_settings_key(key),
+            _ => {}
+        }
+    }
+
+    fn handle_training_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.training.select_delta(1, &self.paths, &self.config);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.training.select_delta(-1, &self.paths, &self.config);
+            }
             _ => {}
         }
     }

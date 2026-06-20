@@ -1561,6 +1561,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-operator"
+version = "0.2.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-prompt"
 version = "0.2.1"
 dependencies = [
@@ -1647,6 +1655,7 @@ dependencies = [
  "hipfire-daemon-adapter",
  "hipfire-generate",
  "hipfire-model",
+ "hipfire-operator",
  "hipfire-prompt",
  "hipfire-scheduler",
  "hipfire-state",
@@ -1722,6 +1731,7 @@ dependencies = [
  "anyhow",
  "crossterm",
  "hipfire-config",
+ "hipfire-operator",
  "ratatui",
  "serde",
  "serde_json",

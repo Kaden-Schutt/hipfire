@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify};
@@ -65,6 +66,7 @@ pub struct AppState {
     pub batches: Mutex<HashMap<String, StoredBatch>>,
     pub batch_order: Mutex<VecDeque<String>>,
     pub last_request_unix_secs: Mutex<u64>,
+    pub training_runs_dir: PathBuf,
 }
 
 impl AppState {
@@ -73,6 +75,15 @@ impl AppState {
     }
 
     pub fn new_loaded(loaded_config: LoadedConfig) -> Arc<Self> {
+        let training_runs_dir =
+            hipfire_operator::training::training_runs_dir(hipfire_config::hipfire_dir());
+        Self::new_loaded_with_training_runs_dir(loaded_config, training_runs_dir)
+    }
+
+    pub fn new_loaded_with_training_runs_dir(
+        loaded_config: LoadedConfig,
+        training_runs_dir: PathBuf,
+    ) -> Arc<Self> {
         let scheduler_env = SchedulerPolicyEnv::from_pairs(std::env::vars());
         let config = loaded_config.config.clone();
         Arc::new(Self {
@@ -93,6 +104,7 @@ impl AppState {
             batches: Mutex::new(HashMap::new()),
             batch_order: Mutex::new(VecDeque::new()),
             last_request_unix_secs: Mutex::new(now_secs()),
+            training_runs_dir,
         })
     }
 }

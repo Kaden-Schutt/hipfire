@@ -23,6 +23,7 @@ hipfire-config = { path = "../hipfire-config" }
 hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
 hipfire-generate = { path = "../hipfire-generate" }
 hipfire-model = { path = "../hipfire-model" }
+hipfire-operator = { path = "../hipfire-operator" }
 hipfire-prompt = { path = "../hipfire-prompt" }
 hipfire-scheduler = { path = "../hipfire-scheduler" }
 hipfire-state = { path = "../hipfire-state" }

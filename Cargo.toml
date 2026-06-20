@@ -17,6 +17,7 @@ members = [
     "crates/hipfire-build-info",
     "crates/hipfire-media",
     "crates/hipfire-model",
+    "crates/hipfire-operator",
     "crates/hipfire-vision-cache",
     "crates/hipfire-npu",
     "crates/hipfire-prompt",

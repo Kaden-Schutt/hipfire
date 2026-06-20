@@ -22,10 +22,12 @@ hipfire serve
 
 Current scope:
 
-- Ratatui shell with Home, Chat, Models, Settings, and System tabs.
+- Ratatui shell with Home, Chat, Models, Training, Settings, and System tabs.
 - Reads real `~/.hipfire` config, per-model overlays, and local model files.
 - Probes the existing `/health` endpoint and streams chat through
   `/v1/chat/completions`.
+- Monitors read-only training run summaries and structured events through the
+  operator API when available, with local `~/.hipfire/training/runs` fallback.
 - Chat can ask the Rust CLI to start `serve` when the endpoint is offline; the
   typed prompt stays in place so you can retry after health comes online.
 - The Models tab groups local model files by family.
@@ -38,5 +40,6 @@ Out of scope for this spike:
 
 - Replacing the `hipfire` command.
 - Mutating config values from the TUI.
+- Launching, cancelling, resuming, or checkpointing training runs.
 - Agent profiles, skills, plugins, or `/slash` generation.
 - Pull/install progress UI.

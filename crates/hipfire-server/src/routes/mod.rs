@@ -5,3 +5,4 @@ pub mod health;
 pub mod models;
 pub mod operator;
 pub mod responses;
+pub mod training;

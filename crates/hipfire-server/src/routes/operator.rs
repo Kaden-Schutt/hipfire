@@ -220,9 +220,60 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
     .source { color: var(--accent-2); }
     .muted { color: var(--muted); }
     .warn { color: var(--warn); }
+    .tabs {
+      display: flex;
+      gap: 8px;
+      padding-bottom: 16px;
+    }
+    .tab {
+      min-width: 96px;
+    }
+    .tab.active {
+      border-color: var(--accent);
+      color: var(--accent);
+      font-weight: 700;
+    }
+    .panel[hidden] { display: none; }
+    .grid {
+      display: grid;
+      grid-template-columns: minmax(260px, 0.9fr) minmax(340px, 1.1fr);
+      gap: 16px;
+      align-items: start;
+    }
+    .section-title {
+      margin: 0 0 10px;
+      font-size: 14px;
+      color: var(--muted);
+      font-weight: 700;
+    }
+    .event-list {
+      display: grid;
+      gap: 8px;
+    }
+    .event {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 9px 10px;
+      overflow-wrap: anywhere;
+    }
+    .event strong {
+      color: var(--accent);
+      font-size: 12px;
+    }
+    .event code {
+      display: block;
+      margin-top: 5px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: var(--muted);
+      white-space: pre-wrap;
+    }
+    tr.selectable { cursor: pointer; }
+    tr.selected { background: color-mix(in srgb, var(--accent) 14%, transparent); }
     @media (max-width: 820px) {
       header, main { padding-left: 14px; padding-right: 14px; }
       .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .grid { grid-template-columns: 1fr; }
       .status { width: 100%; text-align: left; margin-left: 0; }
       table { font-size: 13px; }
       th:nth-child(4), td:nth-child(4), th:nth-child(5), td:nth-child(5) { display: none; }
@@ -235,33 +286,81 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
     <div id="status" class="status">connecting</div>
   </header>
   <main>
-    <div class="toolbar">
-      <label>Model
-        <input id="model" name="model" autocomplete="off" placeholder="optional model tag">
-      </label>
-      <button id="refresh" type="button">Refresh</button>
-    </div>
-    <section class="summary" aria-label="Config summary">
-      <div class="metric"><span>Source</span><strong id="source">-</strong></div>
-      <div class="metric"><span>Path</span><strong id="path">-</strong></div>
-      <div class="metric"><span>Fields</span><strong id="fields">-</strong></div>
-      <div class="metric"><span>Diagnostics</span><strong id="diagnostics">-</strong></div>
+    <nav class="tabs" aria-label="Operator sections">
+      <button class="tab active" id="tab-config" type="button">Config</button>
+      <button class="tab" id="tab-training" type="button">Training</button>
+    </nav>
+    <section id="config-panel" class="panel">
+      <div class="toolbar">
+        <label>Model
+          <input id="model" name="model" autocomplete="off" placeholder="optional model tag">
+        </label>
+        <button id="refresh" type="button">Refresh</button>
+      </div>
+      <section class="summary" aria-label="Config summary">
+        <div class="metric"><span>Source</span><strong id="source">-</strong></div>
+        <div class="metric"><span>Path</span><strong id="path">-</strong></div>
+        <div class="metric"><span>Fields</span><strong id="fields">-</strong></div>
+        <div class="metric"><span>Diagnostics</span><strong id="diagnostics">-</strong></div>
+      </section>
+      <table>
+        <thead>
+          <tr>
+            <th>Key</th>
+            <th>Value</th>
+            <th>Source</th>
+            <th>Scope</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
     </section>
-    <table>
-      <thead>
-        <tr>
-          <th>Key</th>
-          <th>Value</th>
-          <th>Source</th>
-          <th>Scope</th>
-          <th>Description</th>
-        </tr>
-      </thead>
-      <tbody id="rows"></tbody>
-    </table>
+    <section id="training-panel" class="panel" hidden>
+      <div class="toolbar">
+        <button id="training-refresh" type="button">Refresh</button>
+      </div>
+      <section class="summary" aria-label="Training summary">
+        <div class="metric"><span>Runs</span><strong id="training-count">-</strong></div>
+        <div class="metric"><span>Active</span><strong id="training-active">-</strong></div>
+        <div class="metric"><span>Stale</span><strong id="training-stale">-</strong></div>
+        <div class="metric"><span>Directory</span><strong id="training-dir">-</strong></div>
+      </section>
+      <div class="grid">
+        <section>
+          <h2 class="section-title">Runs</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Status</th>
+                <th>Phase</th>
+                <th>Progress</th>
+                <th>Best</th>
+              </tr>
+            </thead>
+            <tbody id="training-rows"></tbody>
+          </table>
+        </section>
+        <section>
+          <h2 class="section-title">Selected Run</h2>
+          <section class="summary" aria-label="Selected training run">
+            <div class="metric"><span>Target</span><strong id="training-target">-</strong></div>
+            <div class="metric"><span>Artifact</span><strong id="training-artifact">-</strong></div>
+            <div class="metric"><span>Checkpoint</span><strong id="training-checkpoint">-</strong></div>
+            <div class="metric"><span>Admission</span><strong id="training-admission">-</strong></div>
+          </section>
+          <div id="training-events" class="event-list"></div>
+        </section>
+      </div>
+    </section>
   </main>
   <script>
     const statusEl = document.getElementById("status");
+    const tabConfigEl = document.getElementById("tab-config");
+    const tabTrainingEl = document.getElementById("tab-training");
+    const configPanelEl = document.getElementById("config-panel");
+    const trainingPanelEl = document.getElementById("training-panel");
     const modelEl = document.getElementById("model");
     const refreshEl = document.getElementById("refresh");
     const rowsEl = document.getElementById("rows");
@@ -269,6 +368,18 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
     const pathEl = document.getElementById("path");
     const fieldsEl = document.getElementById("fields");
     const diagnosticsEl = document.getElementById("diagnostics");
+    const trainingRefreshEl = document.getElementById("training-refresh");
+    const trainingCountEl = document.getElementById("training-count");
+    const trainingActiveEl = document.getElementById("training-active");
+    const trainingStaleEl = document.getElementById("training-stale");
+    const trainingDirEl = document.getElementById("training-dir");
+    const trainingRowsEl = document.getElementById("training-rows");
+    const trainingTargetEl = document.getElementById("training-target");
+    const trainingArtifactEl = document.getElementById("training-artifact");
+    const trainingCheckpointEl = document.getElementById("training-checkpoint");
+    const trainingAdmissionEl = document.getElementById("training-admission");
+    const trainingEventsEl = document.getElementById("training-events");
+    let selectedTrainingRun = null;
 
     function text(value) {
       if (value === null || value === undefined) return "";
@@ -295,6 +406,31 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
       const resolved = await resolvedResp.json();
       render(schema, resolved);
       statusEl.textContent = model ? `model ${model}` : "active runtime";
+    }
+
+    async function loadTraining() {
+      statusEl.textContent = "loading training";
+      const resp = await fetch("/operator/training/runs");
+      if (!resp.ok) throw new Error(`training ${resp.status}`);
+      const payload = await resp.json();
+      renderTraining(payload);
+      const ids = (payload.runs || []).map((run) => run.id);
+      const first = ids[0] || null;
+      if (!selectedTrainingRun || !ids.includes(selectedTrainingRun)) selectedTrainingRun = first;
+      if (selectedTrainingRun) {
+        await loadTrainingDetail(selectedTrainingRun);
+      } else {
+        clearTrainingDetail();
+      }
+      statusEl.textContent = "training";
+    }
+
+    async function loadTrainingDetail(id) {
+      selectedTrainingRun = id;
+      const resp = await fetch(`/operator/training/runs/${encodeURIComponent(id)}`);
+      if (!resp.ok) throw new Error(`training run ${resp.status}`);
+      const detail = await resp.json();
+      renderTrainingDetail(detail);
     }
 
     function render(schema, resolved) {
@@ -329,7 +465,134 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
       }));
     }
 
+    function isActiveRun(run) {
+      return ["queued", "capturing", "training", "evaluating", "checkpointing", "exporting"].includes(run.status || "");
+    }
+
+    function progressLabel(run) {
+      const progress = run.progress || {};
+      if (progress.percent !== undefined && progress.percent !== null) return `${Number(progress.percent).toFixed(1)}%`;
+      if (progress.current_step !== undefined && progress.total_steps !== undefined) return `${progress.current_step}/${progress.total_steps}`;
+      if (progress.current_step !== undefined) return String(progress.current_step);
+      return "-";
+    }
+
+    function metricLabel(run) {
+      const metrics = run.metrics || {};
+      const value = metrics.best_eval_metric ?? metrics.eval_metric;
+      return value === undefined || value === null ? "-" : Number(value).toFixed(4);
+    }
+
+    function renderTraining(payload) {
+      const runs = payload.runs || [];
+      trainingCountEl.textContent = String(runs.length);
+      trainingActiveEl.textContent = String(runs.filter(isActiveRun).length);
+      trainingStaleEl.textContent = String(runs.filter((run) => run.stale).length);
+      trainingDirEl.textContent = payload.runs_dir || "-";
+      trainingRowsEl.replaceChildren(...runs.map((run) => {
+        const tr = document.createElement("tr");
+        tr.className = `selectable${run.id === selectedTrainingRun ? " selected" : ""}`;
+        tr.addEventListener("click", () => loadTrainingDetail(run.id).catch(showError));
+        const id = document.createElement("td");
+        id.className = "key";
+        id.textContent = run.id || "-";
+        const status = document.createElement("td");
+        status.className = run.last_error || run.read_error ? "warn" : "";
+        status.textContent = run.stale ? `${run.status || "unknown"} stale` : run.status || "unknown";
+        const phase = document.createElement("td");
+        phase.textContent = (run.progress && run.progress.phase) || run.status || "unknown";
+        const progress = document.createElement("td");
+        progress.textContent = progressLabel(run);
+        const best = document.createElement("td");
+        best.textContent = metricLabel(run);
+        tr.append(id, status, phase, progress, best);
+        return tr;
+      }));
+      if (!runs.length) {
+        const row = document.createElement("tr");
+        const cell = document.createElement("td");
+        cell.colSpan = 5;
+        cell.className = "muted";
+        cell.textContent = "No training runs found.";
+        row.append(cell);
+        trainingRowsEl.replaceChildren(row);
+      }
+    }
+
+    function renderTrainingDetail(detail) {
+      const run = detail.summary || {};
+      trainingTargetEl.textContent = run.target_model || "-";
+      trainingArtifactEl.textContent = run.artifact || (run.handoff && run.handoff.artifact) || "-";
+      trainingCheckpointEl.textContent = run.checkpoint && (run.checkpoint.path || run.checkpoint.state) || "-";
+      trainingAdmissionEl.textContent = run.handoff && (run.handoff.admission_verdict || run.handoff.admission_status) || "-";
+      const events = detail.recent_events || [];
+      const errors = detail.event_errors || [];
+      const cards = [];
+      if (run.last_error || run.read_error) {
+        const div = document.createElement("div");
+        div.className = "event warn";
+        div.innerHTML = `<strong>latest issue</strong><code></code>`;
+        div.querySelector("code").textContent = (run.last_error && run.last_error.message) || run.read_error || "";
+        cards.push(div);
+      }
+      for (const record of events.slice(-12).reverse()) {
+        const div = document.createElement("div");
+        div.className = "event";
+        const event = record.event || {};
+        const title = document.createElement("strong");
+        title.textContent = `${record.line}: ${event.type || "unknown"}`;
+        const code = document.createElement("code");
+        code.textContent = JSON.stringify(event, null, 2);
+        div.append(title, code);
+        cards.push(div);
+      }
+      for (const err of errors.slice(-4)) {
+        const div = document.createElement("div");
+        div.className = "event warn";
+        const title = document.createElement("strong");
+        title.textContent = `line ${err.line}: malformed event`;
+        const code = document.createElement("code");
+        code.textContent = err.message;
+        div.append(title, code);
+        cards.push(div);
+      }
+      if (!cards.length) {
+        const div = document.createElement("div");
+        div.className = "event muted";
+        div.textContent = "No events recorded for this run.";
+        cards.push(div);
+      }
+      trainingEventsEl.replaceChildren(...cards);
+      for (const row of trainingRowsEl.querySelectorAll("tr")) {
+        const idCell = row.querySelector("td");
+        row.classList.toggle("selected", idCell && idCell.textContent === selectedTrainingRun);
+      }
+    }
+
+    function clearTrainingDetail() {
+      trainingTargetEl.textContent = "-";
+      trainingArtifactEl.textContent = "-";
+      trainingCheckpointEl.textContent = "-";
+      trainingAdmissionEl.textContent = "-";
+      const div = document.createElement("div");
+      div.className = "event muted";
+      div.textContent = "No selected training run.";
+      trainingEventsEl.replaceChildren(div);
+    }
+
+    function showTab(name) {
+      const training = name === "training";
+      configPanelEl.hidden = training;
+      trainingPanelEl.hidden = !training;
+      tabConfigEl.classList.toggle("active", !training);
+      tabTrainingEl.classList.toggle("active", training);
+      if (training) loadTraining().catch(showError);
+    }
+
     refreshEl.addEventListener("click", () => loadConfig().catch(showError));
+    trainingRefreshEl.addEventListener("click", () => loadTraining().catch(showError));
+    tabConfigEl.addEventListener("click", () => showTab("config"));
+    tabTrainingEl.addEventListener("click", () => showTab("training"));
     modelEl.addEventListener("keydown", (event) => {
       if (event.key === "Enter") loadConfig().catch(showError);
     });
@@ -367,6 +630,13 @@ mod tests {
     fn operator_index_fetches_config_endpoints() {
         assert!(OPERATOR_INDEX_HTML.contains("/operator/config/schema"));
         assert!(OPERATOR_INDEX_HTML.contains("/operator/config/resolved"));
+    }
+
+    #[test]
+    fn operator_index_exposes_training_surface() {
+        assert!(OPERATOR_INDEX_HTML.contains("Training"));
+        assert!(OPERATOR_INDEX_HTML.contains("/operator/training/runs"));
+        assert!(OPERATOR_INDEX_HTML.contains("training-events"));
     }
 
     #[test]

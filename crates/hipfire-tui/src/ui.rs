@@ -42,6 +42,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Tab::Home => draw_home(frame, app, root[1]),
         Tab::Chat => draw_chat(frame, app, root[1]),
         Tab::Models => draw_models(frame, app, root[1]),
+        Tab::Training => draw_training(frame, app, root[1]),
         Tab::Settings => draw_settings(frame, app, root[1]),
         Tab::System => draw_system(frame, app, root[1]),
     }
@@ -102,6 +103,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Tab::Models => {
             "Tab switch  Up/Down select  Enter expand/select  Left/Right fold  r refresh  q quit"
         }
+        Tab::Training => "Tab switch  Up/Down select run  r refresh  q quit",
         Tab::Settings => "Tab switch  e easy  a advanced  Up/Down select  r refresh  q quit",
         _ => "Tab switch  r refresh  q quit",
     };
@@ -513,6 +515,214 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
             chunks[1],
         );
     }
+}
+
+fn draw_training(frame: &mut Frame, app: &App, area: Rect) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
+        .split(pad(area, 1, 0));
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(5), Constraint::Min(8)])
+        .split(cols[0]);
+
+    let mut summary = vec![
+        Line::from(format!(
+            "Source     {}    runs: {}    active: {}    stale: {}",
+            app.training.source,
+            app.training.list.runs.len(),
+            app.training.active_count(),
+            app.training.stale_count()
+        )),
+        Line::from(format!("Directory  {}", app.training.list.runs_dir)),
+    ];
+    if let Some(warning) = &app.training.warning {
+        summary.push(Line::from(vec![
+            Span::styled("Fallback   ", Style::default().fg(YELLOW)),
+            Span::styled(warning.clone(), Style::default().fg(YELLOW)),
+        ]));
+    }
+    if !app.training.list.errors.is_empty() {
+        summary.push(Line::from(vec![
+            Span::styled("Reader     ", Style::default().fg(YELLOW)),
+            Span::styled(
+                app.training.list.errors.join("; "),
+                Style::default().fg(YELLOW),
+            ),
+        ]));
+    }
+    frame.render_widget(card("Training monitor", summary), left[0]);
+
+    let rows = app
+        .training
+        .list
+        .runs
+        .iter()
+        .enumerate()
+        .skip(scroll_start(app.training.selected, left[1].height, 3))
+        .take(visible_rows(left[1].height, 3))
+        .map(|(idx, run)| {
+            let status = if run.stale {
+                format!("{} stale", run.status_label())
+            } else {
+                run.status_label().to_string()
+            };
+            Row::new([
+                run.id.clone(),
+                status,
+                run.phase_label().to_string(),
+                run.progress_label(),
+                run.best_metric_label(),
+                run.artifact.clone().unwrap_or_else(|| "-".into()),
+            ])
+            .style(if idx == app.training.selected {
+                Style::default().fg(ACCENT).bg(PANEL_2)
+            } else if run.last_error.is_some() || run.read_error.is_some() {
+                Style::default().fg(YELLOW).bg(PANEL)
+            } else if run.is_active() {
+                Style::default().fg(GREEN).bg(PANEL)
+            } else {
+                Style::default().fg(TEXT).bg(PANEL)
+            })
+        })
+        .collect::<Vec<_>>();
+    let rows = if rows.is_empty() {
+        vec![Row::new([
+            "No runs".to_string(),
+            "unknown".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "Create ~/.hipfire/training/runs/<id>/status.json".to_string(),
+        ])
+        .style(Style::default().fg(MUTED).bg(PANEL))]
+    } else {
+        rows
+    };
+    frame.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(18),
+                Constraint::Length(14),
+                Constraint::Length(14),
+                Constraint::Length(10),
+                Constraint::Length(9),
+                Constraint::Min(20),
+            ],
+        )
+        .header(
+            Row::new(["Run", "Status", "Phase", "Progress", "Best", "Artifact"])
+                .style(Style::default().fg(MUTED)),
+        )
+        .block(block("Runs"))
+        .style(Style::default().fg(TEXT).bg(PANEL)),
+        left[1],
+    );
+
+    let detail_lines = training_detail_lines(app);
+    frame.render_widget(
+        Paragraph::new(Text::from(detail_lines))
+            .block(block("Selected run"))
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(TEXT).bg(PANEL)),
+        cols[1],
+    );
+}
+
+fn training_detail_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(detail) = &app.training.detail else {
+        return vec![Line::from(Span::styled(
+            "No selected training run.",
+            Style::default().fg(MUTED),
+        ))];
+    };
+    let run = &detail.summary;
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Run        ", Style::default().fg(MUTED)),
+            Span::styled(run.id.clone(), Style::default().fg(ACCENT)),
+        ]),
+        Line::from(format!(
+            "Target     {}",
+            run.target_model.clone().unwrap_or_else(|| "-".into())
+        )),
+        Line::from(format!(
+            "Artifact   {}",
+            run.artifact
+                .clone()
+                .or_else(|| run.handoff.as_ref().and_then(|h| h.artifact.clone()))
+                .unwrap_or_else(|| "-".into())
+        )),
+        Line::from(format!(
+            "Checkpoint {}",
+            run.checkpoint
+                .as_ref()
+                .and_then(|c| c.path.clone().or_else(|| c.state.clone()))
+                .unwrap_or_else(|| "-".into())
+        )),
+        Line::from(format!(
+            "Admission  {}",
+            run.handoff
+                .as_ref()
+                .and_then(|h| h
+                    .admission_verdict
+                    .clone()
+                    .or_else(|| h.admission_status.clone()))
+                .unwrap_or_else(|| "-".into())
+        )),
+    ];
+    if let Some(issue) = &run.last_error {
+        lines.push(Line::from(vec![
+            Span::styled("Issue      ", Style::default().fg(YELLOW)),
+            Span::styled(issue.message.clone(), Style::default().fg(YELLOW)),
+        ]));
+    }
+    if let Some(err) = &run.read_error {
+        lines.push(Line::from(vec![
+            Span::styled("Read       ", Style::default().fg(YELLOW)),
+            Span::styled(err.clone(), Style::default().fg(YELLOW)),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Recent events",
+        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+    )));
+    if detail.recent_events.is_empty() {
+        lines.push(Line::from("No structured events recorded."));
+    } else {
+        for record in detail.recent_events.iter().rev().take(10) {
+            let message = record
+                .event
+                .message()
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    serde_json::to_string(&record.event.payload)
+                        .unwrap_or_else(|_| "{}".into())
+                        .chars()
+                        .take(96)
+                        .collect::<String>()
+                });
+            lines.push(Line::from(format!(
+                "{:>4}  {:<18} {}",
+                record.line,
+                record.event.label(),
+                message
+            )));
+        }
+    }
+    for err in detail.event_errors.iter().take(4) {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("line {:>4}  malformed  ", err.line),
+                Style::default().fg(YELLOW),
+            ),
+            Span::styled(err.message.clone(), Style::default().fg(YELLOW)),
+        ]));
+    }
+    lines
 }
 
 fn draw_system(frame: &mut Frame, app: &App, area: Rect) {
