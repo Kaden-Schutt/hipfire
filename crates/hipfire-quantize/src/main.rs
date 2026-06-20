@@ -13353,3 +13353,140 @@ mod tests {
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Codec golden-hash characterization battery.
+//
+// Pins the byte-exact output of every pure quantize/dequant codec on a fixed
+// deterministic input, so the planned main.rs decomposition is provably
+// behavior-preserving: move a codec into a module → its golden hash must not
+// change. Reuses the in-tree xxh64. Harvest goldens with:
+//   cargo test -p hipfire-quantize --bin hipfire-quantize \
+//       codec_golden::harvest -- --ignored --nocapture
+// then paste the table into `GOLDENS` and the locked test enforces it.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod codec_golden {
+    use super::*;
+
+    /// Deterministic f32 stream with a few outliers (LCG; no rng dep).
+    fn det_input(n: usize, seed: u32) -> Vec<f32> {
+        let mut s = seed.max(1);
+        (0..n)
+            .map(|i| {
+                s = s.wrapping_mul(1_103_515_245).wrapping_add(12345) & 0x7fff_ffff;
+                let base = (s as f32 / 2_147_483_648.0) - 0.5;
+                if i % 137 == 0 { base * 12.0 } else { base } // sparse outliers
+            })
+            .collect()
+    }
+
+    /// (name, hash) for every characterized codec on the fixed input.
+    fn codec_hashes() -> Vec<(&'static str, String)> {
+        let x = det_input(1024, 7); // 4 groups of 256
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let (m, k) = (4usize, 256usize);
+        let mut out: Vec<(&'static str, String)> = Vec::new();
+        let mut h = |name: &'static str, bytes: &[u8]| out.push((name, xxh64_hex(bytes)));
+
+        h("q4f16_g64", &quantize_q4f16_g64(&x));
+        h("q4k", &quantize_q4k(&x));
+        h("q4_as_q8", &quantize_q4_as_q8(&x));
+        h("q8f16", &quantize_q8f16(&x));
+        h("q8hfq", &quantize_q8hfq(&x, m, k).0);
+        h("mq4g256", &quantize_mq4g256(&x, &s1, &s2));
+        h("mq6g256", &quantize_mq6g256(&x, &s1, &s2));
+        h("mq8g256", &quantize_mq8g256(&x, &s1, &s2));
+        h("mq3g256", &quantize_mq3g256(&x, &s1, &s2));
+        h("mq2g256", &quantize_mq2g256(&x, &s1, &s2));
+        h("mq3g256_lloyd", &quantize_mq3g256_lloyd(&x, &s1, &s2));
+        h("mq4g256_lloyd", &quantize_mq4g256_lloyd(&x, &s1, &s2));
+        h("mq2g256_lloyd", &quantize_mq2g256_lloyd(&x, &s1, &s2));
+        h("mq2g256_lloyd_k3", &quantize_mq2g256_lloyd_k3(&x, &s1, &s2));
+        h("hfq4g256", &quantize_hfq4g256(&x));
+        h("hfq4g128", &quantize_hfq4g128(&x));
+        h("hfq6g256", &quantize_hfq6g256(&x));
+        h("hfq3g256", &quantize_hfq3g256(&x));
+        h("hfq3g128", &quantize_hfq3g128(&x));
+        h("hfq2g256", &quantize_hfq2g256(&x));
+        h("hfq2g128", &quantize_hfq2g128(&x));
+        h("hfp4g32_2d", &quantize_hfp4g32_2d(&x, m, k));
+        out
+    }
+
+    #[test]
+    #[ignore = "harvest: run with --ignored --nocapture to print the GOLDENS table"]
+    fn harvest() {
+        println!("\n// ── paste into GOLDENS ──");
+        for (name, hash) in codec_hashes() {
+            println!("    (\"{name}\", \"{hash}\"),");
+        }
+        println!("// ── end ──\n");
+    }
+
+    /// Baked golden hashes (harvested 2026-06-20, pre-decomposition). Any change
+    /// means a codec's byte output changed — intentional only with a deliberate
+    /// re-harvest, NOT during a refactor.
+    const GOLDENS: &[(&str, &str)] = &[
+        ("q4f16_g64", "d73539f183a5fc5c"),
+        ("q4k", "a0e0ef608325a2b3"),
+        ("q4_as_q8", "40cc44f3ad42b5c1"),
+        ("q8f16", "43be8c0f93de9cb3"),
+        ("q8hfq", "29ca0c52ad9b58dc"),
+        ("mq4g256", "6e9d532bbe5d38eb"),
+        ("mq6g256", "c43cbf518aae87fe"),
+        ("mq8g256", "8987f0aa7fdfb487"),
+        ("mq3g256", "0c2f928a4236cf57"),
+        ("mq2g256", "59868cdc5c1365e5"),
+        ("mq3g256_lloyd", "74f67e18a2d18664"),
+        ("mq4g256_lloyd", "cb3d8d86986d7c96"),
+        ("mq2g256_lloyd", "03c6764c0758ee16"),
+        ("mq2g256_lloyd_k3", "00373d88942eb232"),
+        ("hfq4g256", "5992821562cf0292"),
+        ("hfq4g128", "faa7aa15210a17c0"),
+        ("hfq6g256", "3c03921c63d1e695"),
+        ("hfq3g256", "9e7c9e1a051a0af3"),
+        ("hfq3g128", "78bcc10ab672861d"),
+        ("hfq2g256", "5b4f21ad97442c8d"),
+        ("hfq2g128", "2c1e8211ff7f5e03"),
+        ("hfp4g32_2d", "ef22d36907fb8454"),
+    ];
+
+    /// Locked characterization: every codec's byte output must match its golden.
+    /// The safety net for the main.rs decomposition — moving a codec into a
+    /// module must not change its output.
+    #[test]
+    fn codec_outputs_are_byte_stable() {
+        let actual = codec_hashes();
+        let want: std::collections::HashMap<&str, &str> = GOLDENS.iter().copied().collect();
+        assert_eq!(actual.len(), GOLDENS.len(), "codec count drifted from goldens");
+        let mut drifted = Vec::new();
+        for (name, hash) in &actual {
+            match want.get(name) {
+                Some(g) if *g == hash.as_str() => {}
+                Some(g) => drifted.push(format!("  {name}: golden {g} != actual {hash}")),
+                None => drifted.push(format!("  {name}: missing from GOLDENS")),
+            }
+        }
+        assert!(
+            drifted.is_empty(),
+            "codec byte output drifted:\n{}",
+            drifted.join("\n")
+        );
+    }
+
+    /// FWHT must be exactly invertible (forward then inverse = identity).
+    #[test]
+    fn fwht_256_roundtrip_is_identity() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let orig = det_input(256, 3);
+        let mut buf = [0.0f32; 256];
+        buf.copy_from_slice(&orig);
+        cpu_fwht_256(&mut buf, &s1, &s2);
+        cpu_inv_fwht_256(&mut buf, &s1, &s2);
+        let max = orig.iter().zip(buf.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(max < 1e-4, "FWHT not invertible: max abs err {max}");
+    }
+}
