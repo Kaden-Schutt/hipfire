@@ -27,5 +27,6 @@ hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
 hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe", optional = true }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
+base64 = "0.22"
 serde_json = "1"
 tracing = "0.1"

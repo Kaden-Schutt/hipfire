@@ -10,7 +10,7 @@
 //! the serial reference, chunk-range planning, decode scratch allocation, and
 //! the runtime-surface / session-signature / model-capability validators.
 //! Extracted verbatim from the former `main.rs` monolith (no behavior change);
-//! items called from `main.rs` are `pub(crate)`.
+//! items called from `main.rs` are `pub`.
 
 use std::io::Write;
 use std::time::Instant;
@@ -41,7 +41,7 @@ use crate::session::{
 
 /// Gate: batched decode is single-GPU qwen35/qwen35-moe only, and incompatible
 /// with DFlash or active eviction.
-pub(crate) fn validate_qwen35_decode_batch_runtime_surface(
+pub fn validate_qwen35_decode_batch_runtime_surface(
     arch_id: u32,
     pp: usize,
     dflash_loaded: bool,
@@ -67,7 +67,7 @@ pub(crate) fn validate_qwen35_decode_batch_runtime_surface(
 
 /// Capture a session's KV/DeltaNet quant state signature, compared across
 /// sessions to confirm a batch can share the fused kernel.
-pub(crate) fn qwen35_fused_dense_decode_signature(
+pub fn qwen35_fused_dense_decode_signature(
     state: &Qwen35RequestSessionState,
 ) -> qwen35::DensePrefillSessionBatchStateSignature {
     qwen35::DensePrefillSessionBatchStateSignature {
@@ -85,7 +85,7 @@ pub(crate) fn qwen35_fused_dense_decode_signature(
 
 /// Validate that a batch of dense-decode session signatures satisfies the
 /// fused-prefix full-precision contract.
-pub(crate) fn validate_qwen35_fused_dense_decode_session_signatures(
+pub fn validate_qwen35_fused_dense_decode_session_signatures(
     config: &qwen35::Qwen35Config,
     signatures: &[qwen35::DensePrefillSessionBatchStateSignature],
     session_count: usize,
@@ -109,7 +109,7 @@ pub(crate) fn validate_qwen35_fused_dense_decode_session_signatures(
 
 /// Validate a batch of grouped-MoE decode session signatures against the q8
 /// state contract.
-pub(crate) fn validate_qwen35_grouped_moe_decode_session_signatures(
+pub fn validate_qwen35_grouped_moe_decode_session_signatures(
     config: &qwen35::Qwen35Config,
     signatures: &[qwen35::DensePrefillSessionBatchStateSignature],
     session_count: usize,
@@ -136,7 +136,7 @@ pub(crate) fn validate_qwen35_grouped_moe_decode_session_signatures(
 /// Confirm the loaded model is dense Qwen35 (arch_id 5) with FP32 KV + DeltaNet
 /// state and fused-kernel-compatible weights — the model-level gate for the
 /// fused-dense decode path.
-pub(crate) fn validate_qwen35_fused_dense_decode_model_capability(
+pub fn validate_qwen35_fused_dense_decode_model_capability(
     m: &LoadedModel,
     session_count: usize,
 ) -> Result<(), String> {
@@ -188,7 +188,7 @@ pub(crate) fn validate_qwen35_fused_dense_decode_model_capability(
 
 /// Model-level gate for the grouped-MoE decode path: Qwen35 MoE (arch_id 6),
 /// ≥2 sessions, grouped-MoE config + scratch present.
-pub(crate) fn validate_qwen35_grouped_moe_decode_model_capability(
+pub fn validate_qwen35_grouped_moe_decode_model_capability(
     m: &LoadedModel,
     session_count: usize,
     arch: &str,
@@ -233,7 +233,7 @@ pub(crate) fn validate_qwen35_grouped_moe_decode_model_capability(
 
 /// Confirm every session named in the decode request is actually resident
 /// before stepping the batch.
-pub(crate) fn validate_qwen35_decode_resident_sessions(
+pub fn validate_qwen35_decode_resident_sessions(
     m: &LoadedModel,
     envelope: &GenerateBatchDecodeEnvelope,
     backend_label: &str,
@@ -258,7 +258,7 @@ pub(crate) fn validate_qwen35_decode_resident_sessions(
 
 /// Resident-session check specialized for the fused-dense path (also collects
 /// the per-session signatures for the contract validators).
-pub(crate) fn validate_qwen35_fused_dense_decode_resident_sessions(
+pub fn validate_qwen35_fused_dense_decode_resident_sessions(
     m: &LoadedModel,
     envelope: &GenerateBatchDecodeEnvelope,
 ) -> Result<(), String> {
@@ -292,7 +292,7 @@ pub(crate) fn validate_qwen35_fused_dense_decode_resident_sessions(
 
 /// Emit the `generate_batch_prefill_ready` capability event for the real
 /// (non-dummy) qwen35 backend.
-pub(crate) fn emit_generate_batch_prefill_ready(
+pub fn emit_generate_batch_prefill_ready(
     stdout: &mut std::io::Stdout,
     envelope: &GenerateBatchPrefillEnvelope,
 ) {
@@ -311,7 +311,7 @@ pub(crate) fn emit_generate_batch_prefill_ready(
 
 /// Emit a `generate_batch_prefill_ready` event reporting the request is
 /// unsupported, with the reason.
-pub(crate) fn emit_generate_batch_prefill_unsupported(
+pub fn emit_generate_batch_prefill_unsupported(
     stdout: &mut std::io::Stdout,
     envelope: &GenerateBatchPrefillEnvelope,
     reason: &str,
@@ -332,7 +332,7 @@ pub(crate) fn emit_generate_batch_prefill_unsupported(
 /// serial reference), step every resident session one token, and emit the
 /// per-session outcomes + the batch done event. The multi-session decode entry
 /// point the request loop calls.
-pub(crate) fn run_generate_batch_decode_step_qwen35(
+pub fn run_generate_batch_decode_step_qwen35(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     stdout: &mut std::io::Stdout,
@@ -458,7 +458,7 @@ pub(crate) fn run_generate_batch_decode_step_qwen35(
 
 /// Max sessions per native-decode chunk for a given batch size (the kernels
 /// process the batch in chunks of at most this many rows).
-pub(crate) fn qwen35_decode_batch_max_chunk_size(session_count: usize) -> usize {
+pub fn qwen35_decode_batch_max_chunk_size(session_count: usize) -> usize {
     std::env::var("HIPFIRE_QWEN35_DECODE_BATCH_MAX")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -468,7 +468,7 @@ pub(crate) fn qwen35_decode_batch_max_chunk_size(session_count: usize) -> usize 
 }
 
 /// Whether the dense native-decode multi-row kernel is enabled (env override).
-pub(crate) fn qwen35_decode_dense_native_multirow_enabled() -> bool {
+pub fn qwen35_decode_dense_native_multirow_enabled() -> bool {
     matches!(
         std::env::var("HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW")
             .ok()
@@ -479,7 +479,7 @@ pub(crate) fn qwen35_decode_dense_native_multirow_enabled() -> bool {
 
 /// Whether internal parity-checking (native vs serial reference) is enabled
 /// (debug env override).
-pub(crate) fn qwen35_decode_internal_parity_enabled() -> bool {
+pub fn qwen35_decode_internal_parity_enabled() -> bool {
     matches!(
         std::env::var("HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY")
             .ok()
@@ -490,7 +490,7 @@ pub(crate) fn qwen35_decode_internal_parity_enabled() -> bool {
 
 /// Compact debug summary of a logits vector (argmax + a few stats) for the
 /// internal-parity diagnostics.
-pub(crate) fn qwen35_logits_debug_summary(
+pub fn qwen35_logits_debug_summary(
     gpu: &rdna_compute::Gpu,
     logits: &rdna_compute::GpuTensor,
     token_a: u32,
@@ -516,7 +516,7 @@ pub(crate) fn qwen35_logits_debug_summary(
 
 /// Sample/select the next token for one session from its decode logits and
 /// package the per-session [`Qwen35DecodeTokenOutcome`] (token + stop state).
-pub(crate) fn qwen35_decode_token_outcome(
+pub fn qwen35_decode_token_outcome(
     m: &LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     logits: &rdna_compute::GpuTensor,
@@ -554,7 +554,7 @@ pub(crate) fn qwen35_decode_token_outcome(
 
 /// Serial reference decode step: advance each session one token via the
 /// per-session forward — the correctness baseline and the universal fallback.
-pub(crate) fn qwen35_decode_step_serial_reference(
+pub fn qwen35_decode_step_serial_reference(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     stdout: &mut std::io::Stdout,
@@ -635,7 +635,7 @@ pub(crate) fn qwen35_decode_step_serial_reference(
     Ok(session_lines)
 }
 
-pub(crate) fn qwen35_decode_step_fused_dense_layer_chunked(
+pub fn qwen35_decode_step_fused_dense_layer_chunked(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     _stdout: &mut std::io::Stdout,
@@ -649,7 +649,7 @@ pub(crate) fn qwen35_decode_step_fused_dense_layer_chunked(
     qwen35_decode_step_fused_dense_native_chunks(m, gpu, envelope, im_end_token, chunk_size)
 }
 
-pub(crate) fn qwen35_decode_step_fused_grouped_moe_layer_chunked(
+pub fn qwen35_decode_step_fused_grouped_moe_layer_chunked(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     _stdout: &mut std::io::Stdout,
@@ -663,7 +663,7 @@ pub(crate) fn qwen35_decode_step_fused_grouped_moe_layer_chunked(
     qwen35_decode_step_fused_grouped_moe_native_chunks(m, gpu, envelope, im_end_token, chunk_size)
 }
 
-pub(crate) fn qwen35_decode_step_fused_dense_native_chunks(
+pub fn qwen35_decode_step_fused_dense_native_chunks(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     envelope: &GenerateBatchDecodeEnvelope,
@@ -696,7 +696,7 @@ pub(crate) fn qwen35_decode_step_fused_dense_native_chunks(
     })
 }
 
-pub(crate) fn qwen35_decode_step_fused_grouped_moe_native_chunks(
+pub fn qwen35_decode_step_fused_grouped_moe_native_chunks(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     envelope: &GenerateBatchDecodeEnvelope,
@@ -735,7 +735,7 @@ pub(crate) fn qwen35_decode_step_fused_grouped_moe_native_chunks(
     })
 }
 
-pub(crate) fn qwen35_decode_step_fused_grouped_moe_native_chunk(
+pub fn qwen35_decode_step_fused_grouped_moe_native_chunk(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     envelope: &GenerateBatchDecodeEnvelope,
@@ -931,7 +931,7 @@ pub(crate) fn qwen35_decode_step_fused_grouped_moe_native_chunk(
     result
 }
 
-pub(crate) fn qwen35_decode_native_chunk_ranges(
+pub fn qwen35_decode_native_chunk_ranges(
     session_count: usize,
     chunk_size: usize,
 ) -> Result<Vec<(usize, usize)>, String> {
@@ -948,7 +948,7 @@ pub(crate) fn qwen35_decode_native_chunk_ranges(
     Ok(ranges)
 }
 
-pub(crate) fn qwen35_ensure_decode_prefill_batch_scratch(
+pub fn qwen35_ensure_decode_prefill_batch_scratch(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     min_rows: usize,
@@ -984,7 +984,7 @@ pub(crate) fn qwen35_ensure_decode_prefill_batch_scratch(
     Ok(())
 }
 
-pub(crate) fn qwen35_decode_step_fused_dense_native_chunk(
+pub fn qwen35_decode_step_fused_dense_native_chunk(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     envelope: &GenerateBatchDecodeEnvelope,
@@ -1183,7 +1183,7 @@ pub(crate) fn qwen35_decode_step_fused_dense_native_chunk(
     result
 }
 
-pub(crate) fn qwen35_decode_step_fused_dense_native_singleton(
+pub fn qwen35_decode_step_fused_dense_native_singleton(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     envelope: &GenerateBatchDecodeEnvelope,

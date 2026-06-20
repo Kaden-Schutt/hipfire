@@ -10,7 +10,7 @@
 //! computation + preflight (for prefix-cache reuse), semantic-boundary
 //! checkpoints, and the per-session prefill-checkpoint emit helpers. Extracted
 //! verbatim from the former `main.rs` monolith (no behavior change); items
-//! called from `main.rs` are `pub(crate)`.
+//! called from `main.rs` are `pub`.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -55,7 +55,7 @@ use crate::session::{
 /// Emit a `generate_batch_prefill_session_done` checkpoint event for one
 /// session as the batch prefill advances past a semantic boundary (the hook the
 /// prefill kernels call so clients can resume from a cached prefix).
-pub(crate) fn emit_qwen35_prefill_checkpoint(
+pub fn emit_qwen35_prefill_checkpoint(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     arena_backend: SequenceStateArenaBackend,
@@ -83,7 +83,7 @@ pub(crate) fn emit_qwen35_prefill_checkpoint(
 /// Prefill the active session's prompt suffix into resident KV/DeltaNet state,
 /// selecting the batched (fused-dense / grouped-MoE) or serial backend and
 /// emitting per-boundary checkpoints. The single-session prefill entry point.
-pub(crate) fn qwen35_prefill_active_session(
+pub fn qwen35_prefill_active_session(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     tokens: &[u32],
@@ -149,7 +149,7 @@ pub(crate) fn qwen35_prefill_active_session(
 
 /// Serial-path prefill of one owned session's token segment (the per-session
 /// unit the serial batch driver loops over).
-pub(crate) fn qwen35_prefill_owned_session_serial_segment(
+pub fn qwen35_prefill_owned_session_serial_segment(
     gpu: &mut rdna_compute::Gpu,
     weights: &qwen35::Qwen35Weights,
     config: &qwen35::Qwen35Config,
@@ -178,7 +178,7 @@ pub(crate) fn qwen35_prefill_owned_session_serial_segment(
 /// Turn a batch-prefill session request (prompt text or pre-tokenized suffix +
 /// system prompt) into the concrete token sequence to prefill, applying the
 /// chat frame and prompt normalization.
-pub(crate) fn qwen35_materialize_batch_prefill_prompt(
+pub fn qwen35_materialize_batch_prefill_prompt(
     m: &LoadedModel,
     session: &GenerateBatchPrefillSession,
 ) -> Result<Vec<u32>, String> {
@@ -283,7 +283,7 @@ pub(crate) fn qwen35_materialize_batch_prefill_prompt(
 
 /// Compute the prefix-hash candidates for a session's prompt (one per semantic
 /// boundary), used to match against cached prefixes for KV reuse.
-pub(crate) fn qwen35_prefix_hash_candidates(
+pub fn qwen35_prefix_hash_candidates(
     m: &LoadedModel,
     session: &GenerateBatchPrefillSession,
 ) -> Result<Vec<PrefixHashPreflightCandidate>, String> {
@@ -293,7 +293,7 @@ pub(crate) fn qwen35_prefix_hash_candidates(
 
 /// [`qwen35_prefix_hash_candidates`] over an explicit token slice (the
 /// tokenizer-free core, shared by the request and preflight paths).
-pub(crate) fn qwen35_prefix_hash_candidates_for_tokens(
+pub fn qwen35_prefix_hash_candidates_for_tokens(
     m: &LoadedModel,
     session: &GenerateBatchPrefillSession,
     full_tokens: &[u32],
@@ -401,7 +401,7 @@ pub(crate) fn qwen35_prefix_hash_candidates_for_tokens(
 
 /// Compute the semantic-boundary token offsets (turn / message boundaries) at
 /// which prefill emits checkpoints and prefix hashes are anchored.
-pub(crate) fn qwen35_semantic_boundary_checkpoints(
+pub fn qwen35_semantic_boundary_checkpoints(
     m: &LoadedModel,
     session: &GenerateBatchPrefillSession,
     full_tokens: &[u32],
@@ -454,7 +454,7 @@ pub(crate) fn qwen35_semantic_boundary_checkpoints(
 /// Handle a `prefix_hash_preflight` request: compute the candidate hashes for a
 /// prompt and report which prefix lengths the client can reuse, before any GPU
 /// prefill work.
-pub(crate) fn run_prefix_hash_preflight_qwen35(
+pub fn run_prefix_hash_preflight_qwen35(
     m: &LoadedModel,
     stdout: &mut std::io::Stdout,
     envelope: &PrefixHashPreflightEnvelope,
@@ -481,7 +481,7 @@ pub(crate) fn run_prefix_hash_preflight_qwen35(
 /// Batched suffix prefill dispatcher: pick the fused-dense or grouped-MoE kernel
 /// for the loaded arch (falling back to the serial reference) and run it over
 /// the prompt suffix.
-pub(crate) fn qwen35_prefill_suffix_batch(
+pub fn qwen35_prefill_suffix_batch(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     batch_id: &str,
@@ -607,7 +607,7 @@ pub(crate) fn qwen35_prefill_suffix_batch(
 
 /// Checkpoint-emit variant for the owned-session serial segment path (mirrors
 /// [`emit_qwen35_prefill_checkpoint`] for serially-prefilled owned sessions).
-pub(crate) fn emit_qwen35_owned_prefill_checkpoint(
+pub fn emit_qwen35_owned_prefill_checkpoint(
     sessions: &mut HashMap<String, Qwen35RequestSessionState>,
     gpu: &mut rdna_compute::Gpu,
     hook: Qwen35PrefillCheckpointHook<'_>,
@@ -633,7 +633,7 @@ pub(crate) fn emit_qwen35_owned_prefill_checkpoint(
 /// Grouped-MoE batched suffix prefill: the fused kernel path for Qwen3.5 MoE
 /// (arch_id 6), prefilling the whole suffix in batched layer passes with the
 /// expert-grouped FFN.
-pub(crate) fn qwen35_prefill_suffix_batch_fused_grouped_moe(
+pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     batch_id: &str,
@@ -1049,7 +1049,7 @@ pub(crate) fn qwen35_prefill_suffix_batch_fused_grouped_moe(
 
 /// Fused-dense batched suffix prefill: the fused kernel path for dense Qwen3.5
 /// (arch_id 5), prefilling the suffix in batched layer passes.
-pub(crate) fn qwen35_prefill_suffix_batch_fused_dense(
+pub fn qwen35_prefill_suffix_batch_fused_dense(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     batch_id: &str,
@@ -1467,7 +1467,7 @@ pub(crate) fn qwen35_prefill_suffix_batch_fused_dense(
 /// Serial reference suffix prefill: one token at a time via the per-token
 /// forward — the correctness baseline the batched kernels are checked against
 /// and the fallback when no fused kernel applies.
-pub(crate) fn qwen35_prefill_suffix_batch_serial_reference(
+pub fn qwen35_prefill_suffix_batch_serial_reference(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     batch_id: &str,
@@ -1621,7 +1621,7 @@ pub(crate) fn qwen35_prefill_suffix_batch_serial_reference(
 /// Drive a multi-session `generate_batch_prefill` request serially: materialize
 /// each session's prompt, prefill it, save its state, and emit per-session +
 /// batch done events. The non-fused multi-session prefill entry point.
-pub(crate) fn run_generate_batch_prefill_serial_qwen35(
+pub fn run_generate_batch_prefill_serial_qwen35(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     stdout: &mut std::io::Stdout,

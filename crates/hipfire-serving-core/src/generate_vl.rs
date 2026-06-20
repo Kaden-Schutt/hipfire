@@ -10,7 +10,7 @@
 //! own vision tower). Both decode the image, build the multimodal prompt, and
 //! run the per-token sample/stream loop. Extracted verbatim from the former
 //! `main.rs` monolith (no behavior change); items called from `main.rs` are
-//! `pub(crate)`.
+//! `pub`.
 
 use std::io::Write;
 use std::path::Path;
@@ -36,7 +36,7 @@ use crate::output_filter::{block_attractor_unclosed_cpu, loop_guard_from_runtime
 /// tower (`qwen35_vl::vision_forward`), splice the image embeddings into the
 /// qwen35 text prompt, then run the per-token sample/stream loop (EOS filter +
 /// loop guard + attractor blocking), emitting `token`/`done` events.
-pub(crate) fn generate_vl(
+pub fn generate_vl(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     stdout: &mut std::io::Stdout,
@@ -573,7 +573,7 @@ pub(crate) fn generate_vl(
 /// dots.ocr generate path: same shape as [`generate_vl`] but for the dots.ocr
 /// family — its own vision tower feeding a Qwen2 text decoder
 /// (`qwen2::forward_step*`).
-pub(crate) fn generate_vl_dots_ocr(
+pub fn generate_vl_dots_ocr(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     stdout: &mut std::io::Stdout,
