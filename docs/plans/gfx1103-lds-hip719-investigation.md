@@ -1709,6 +1709,18 @@ Latest artifact paths:
   sync/global 47 with the canonical coredump signature. That is earlier than
   the previously recorded normal `9x4 READS=2` `140` failure near global 133,
   so pre-sync is shape-specific and can perturb the threshold downward.
+- Extreme 33-lane orientation checks
+  (`/tmp/hipfire-lds-direct-ab-33x1-edge-artifacts/`, throwaway worktree
+  `/tmp/hipfire-lds-direct-ab-33x1-edge-1781926955`; and
+  `/tmp/hipfire-lds-direct-ab-1x33-edge-artifacts/`, throwaway worktree
+  `/tmp/hipfire-lds-direct-ab-1x33-edge-1781926955`) show row/column shape
+  matters beyond active-lane count. `33x1` READS=2 one-child `130` failed
+  early at sync/global 41. `1x33` READS=2 passed one-child `130` and `140`,
+  then failed at one-child `500` sync/global 359. Both failing rows kept the
+  canonical coredump signature. These extreme shapes compile to a different
+  static tuple from `11x3`/`3x11` (`vgpr=28`, `s_barrier=14`, DS=28,
+  `s_waitcnt=21`, same `offset1=36`), so they are orientation/access-pattern
+  evidence rather than same-ISA controls.
 
 ## Current Narrowing
 
@@ -2096,6 +2108,12 @@ Reduction results after extending the standalone HIP GEMM probe:
   shapes. It fails for transposed `3x11` and fails even earlier for `9x4`.
   The `11x3` pass is therefore a shape/orientation-specific host-sync effect,
   not a broad workaround for the reduced trigger.
+- Extreme `33x1` versus `1x33` shapes make the orientation/access-pattern
+  sensitivity more obvious: the row-vector shape fails by global 41, while the
+  column-vector shape survives past `140` and fails only around global 359.
+  Because these dimensions also change static codegen, keep this as supporting
+  orientation evidence rather than merging it into the exact `11x3`/`3x11`
+  same-ISA boundary.
 - Phase-mode controls sharpen the process-boundary result. With the same
   direct-AB kernel body at reads=6/192/511x86, same-process `99 + 1` fails on
   phase2 launch 0 / global launch 99, and same-process `98 + 2` fails on
@@ -2489,6 +2507,7 @@ LDS-only control:
 | direct-AB multi-exec `8x4` block/layout, reads=2, 448 iters, 512x86 | PASS at one-child `500`/`1000` | `_Z25lds_direct_ab_phase_probev` | 256 B | 24 | 2 | 0 | 32 |
 | direct-AB multi-exec `11x3`/`3x11` block/layout, reads=1, 448 iters, 512x86 | PASS at one-child `500` for both orientations | `_Z25lds_direct_ab_phase_probev` | 276 B | 22 | 2 | 0 | 32 |
 | direct-AB multi-exec/phase-mode `11x3`/`3x11` block/layout, reads=2, 448 iters, 512x86 | `11x3`: PASS `131`/`132`, FAIL one-child `133`, same-process `132+1` PASS, `device_reset 132+1` FAILS in phase1/global 130; `3x11`: PASS `131`-`133`, FAIL `134`, cross-process `132,1` PASS, same-process `132+1` FAIL at phase2 launch 0, `device_reset 132+1` PASS | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
+| direct-AB multi-exec `33x1`/`1x33` block/layout, reads=2, 448 iters, 512x86 | `33x1`: FAIL one-child `130` at sync/global 41; `1x33`: PASS one-child `130`/`140`, FAIL one-child `500` at sync/global 359 | `_Z25lds_direct_ab_phase_probev` | 276 B | 28 | 2 | 0 | 32 |
 | direct-AB pre-sync diagnostic `11x3`/`3x11` block/layout, reads=2, 448 iters, 512x86 | `PRE_SYNC_EACH_LAUNCH=1`: `11x3` one-child `133` PASS; `3x11` one-child `134` FAIL at sync/global 133 | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
 | direct-AB throwaway host-sleep diagnostic `11x3` block/layout, reads=2, 448 iters, 512x86 | local-only `PRE_LAUNCH_SLEEP_US=1000`: one-child `133` FAIL at sync/global 73 | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
 | direct-AB phase-mode `3x11` block/layout, reads=2, 448 iters, 512x86, first-risky cleanup modes | `stream_recreate 132+1` FAILS in phase1/global 69; `primary_ctx_reset 132+1` FAILS in phase1/global 33 | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
