@@ -41,16 +41,22 @@ extern "C" __global__ void vit_attention_opt(
     float* k_tile = smem;                    // [K_TILE * head_dim]
     float* scores = smem + K_TILE * head_dim; // [N] — shared across QPB queries
     float* ws = scores + N;                  // [256] workspace for reduction
+    float* q_sh = ws + 256;                  // [head_dim] — current query, in LDS
 
     for (int qi_off = 0; qi_off < QPB; qi_off++) {
         int qi = qi_base + qi_off;
         if (qi >= N) continue;
 
-        // Load Q into a local buffer (read once)
-        float q_reg[72];  // up to head_dim=72
+        // Load Q into SHARED memory (read once, visible to all threads). Every
+        // thread needs the full Q vector for its dot product below, so Q must
+        // live in LDS — a thread-private register array (the original code)
+        // leaves every element a thread didn't personally load uninitialised,
+        // corrupting the scores. The leading sync guards q_sh against the
+        // previous query's phase-1 readers.
+        __syncthreads();
         const float* q_ptr = qkv + qi * stride + q_off;
         for (int d = tid; d < head_dim; d += blockDim.x) {
-            q_reg[d] = q_ptr[d];
+            q_sh[d] = q_ptr[d];
         }
         __syncthreads();
 
@@ -74,7 +80,7 @@ extern "C" __global__ void vit_attention_opt(
                 const float* kt = k_tile + t * head_dim;
                 #pragma unroll 8
                 for (int d = 0; d < head_dim; d++) {
-                    dot += q_reg[d] * kt[d];
+                    dot += q_sh[d] * kt[d];
                 }
                 scores[tile_start + t] = dot * scale;
             }

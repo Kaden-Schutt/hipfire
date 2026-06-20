@@ -6,7 +6,7 @@
 //! `vision_forward` minus the 2D-RoPE and spatial merger: SigLIP uses a learned
 //! position embedding (a plain add) and bidirectional attention. Reuses
 //! `gemm_f32_batched`/`transpose_f32`/`bias_add_f32` (linear), `layernorm_batched`
-//! (LayerNorm+bias), `vit_attention_f32` (bidirectional), `gelu_tanh_f32`, and
+//! (LayerNorm+bias), `vit_attention_opt` (bidirectional), `gelu_tanh_f32`, and
 //! `add_inplace_f32` (residual). F32 throughout (vision weights ship F32).
 //!
 //! Output `[num_patches=4096, hidden=1152]` feeds the multimodal projector
@@ -20,6 +20,12 @@ use crate::vision::SigLipWeights;
 
 /// Batched linear `Y[n, out] = X[n, in] · W[out, in]ᵀ + bias`, F32 — the SigLIP
 /// analogue of qwen35-vl's `linear_f16` (gemm → transpose → bias-add).
+///
+/// NOTE: kept on `gemm_f32_batched`+`transpose_f32`. A swap to
+/// `gemm_f32_register_tiled` (which would also drop the transpose) corrupted the
+/// vision embeddings — the model then reported "cannot process images" — so the
+/// register-tiled path is layout-incompatible for these shapes and was reverted.
+/// The attention kernel, not this GEMM, was the encode bottleneck.
 fn linear_f32(
     gpu: &mut Gpu,
     w: &GpuTensor,
@@ -87,7 +93,10 @@ pub fn vision_forward(
         gpu.free_tensor(tmp)?;
         let attn_out = gpu.alloc_tensor(&[n * h], DType::F32)?;
         // Bidirectional ViT attention (no causal mask), scale 1/√head_dim.
-        gpu.vit_attention_f32(&qkv, &attn_out, n, h, num_heads, head_dim)?;
+        // vit_attention_opt: tiled K/V via shared memory, 4 queries/block —
+        // ~3× the naive vit_attention_f32 (the encode hot spot: ≈110s/image of
+        // the naive path on gfx1151), same math + signature.
+        gpu.vit_attention_opt(&qkv, &attn_out, n, h, num_heads, head_dim)?;
         gpu.free_tensor(qkv)?;
         let proj = linear_f32(gpu, &lw.out_w, &attn_out, &lw.out_b, h, h, n)?;
         gpu.free_tensor(attn_out)?;

@@ -40713,6 +40713,7 @@ impl Gpu {
 
     /// Read-and-clear the HIP last-error flag (hipGetLastError). Returns the code.
     pub fn clear_last_error(&mut self) -> u32 {
+        // bind_thread: skip — pure error-flag query, no kernel dispatch / device work.
         self.hip.last_error()
     }
 
@@ -41077,7 +41078,11 @@ impl Gpu {
     /// Elementwise sigmoid forward (fp32). `x`→`out` `[n]`.
     pub fn sigmoid_train_fwd(&mut self, x: &GpuTensor, out: &GpuTensor, n: usize) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("sigmoid_train_fwd", kernels::SIGMOID_TRAIN_SRC, "sigmoid_train_fwd")?;
+        self.ensure_kernel(
+            "sigmoid_train_fwd",
+            kernels::SIGMOID_TRAIN_SRC,
+            "sigmoid_train_fwd",
+        )?;
         let func = &self.functions["sigmoid_train_fwd"];
         let mut xp = x.buf.as_ptr();
         let mut op = out.buf.as_ptr();
@@ -41089,7 +41094,14 @@ impl Gpu {
         ];
         let grid = (n as u32).div_ceil(256);
         unsafe {
-            self.hip.launch_kernel(func, [grid, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
         }
     }
 
@@ -41103,7 +41115,11 @@ impl Gpu {
         n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("sigmoid_train_bwd", kernels::SIGMOID_TRAIN_SRC, "sigmoid_train_bwd")?;
+        self.ensure_kernel(
+            "sigmoid_train_bwd",
+            kernels::SIGMOID_TRAIN_SRC,
+            "sigmoid_train_bwd",
+        )?;
         let func = &self.functions["sigmoid_train_bwd"];
         let mut dop = d_out.buf.as_ptr();
         let mut op = out.buf.as_ptr();
@@ -41117,7 +41133,14 @@ impl Gpu {
         ];
         let grid = (n as u32).div_ceil(256);
         unsafe {
-            self.hip.launch_kernel(func, [grid, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
         }
     }
 
@@ -41832,9 +41855,10 @@ impl Gpu {
         ];
         let qpb = 2u32;
         let grid_y = ((n as u32 + qpb - 1) / qpb) as u32;
-        // LDS: K_TILE * head_dim * 4 + N * 4 + 256 * 4
+        // LDS: k_tile[K_TILE*head_dim] + scores[N] + ws[256] + q_sh[head_dim]
         let k_tile = 64u32;
-        let shared_mem = (k_tile * head_dim as u32 * 4) + (n as u32 * 4) + (256 * 4);
+        let shared_mem =
+            (k_tile * head_dim as u32 * 4) + (n as u32 * 4) + (256 * 4) + (head_dim as u32 * 4);
         unsafe {
             self.hip.launch_kernel(
                 func,
