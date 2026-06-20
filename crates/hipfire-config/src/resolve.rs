@@ -52,6 +52,21 @@ impl ConfigLayer {
         self.values.insert(key.into(), value.into());
         self
     }
+
+    pub fn from_json_object(
+        kind: ConfigLayerKind,
+        id: Option<impl Into<String>>,
+        value: &Value,
+    ) -> Option<Self> {
+        let object = value.as_object()?;
+        let mut layer = ConfigLayer::new(kind);
+        layer.id = id.map(Into::into);
+        layer.values = object
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        Some(layer)
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
@@ -123,6 +138,42 @@ pub fn resolve_config_layers(fields: &[ConfigField], layers: &[ConfigLayer]) -> 
         values,
         unknown_keys,
     }
+}
+
+pub fn config_layers_from_document(raw: &Value, model_tag: Option<&str>) -> Vec<ConfigLayer> {
+    let Some(object) = raw.as_object() else {
+        return Vec::new();
+    };
+
+    let mut global = ConfigLayer::new(ConfigLayerKind::Global);
+    for (key, value) in object {
+        if key != "model_overrides" {
+            global.values.insert(key.clone(), value.clone());
+        }
+    }
+
+    let mut layers = Vec::new();
+    if !global.values.is_empty() {
+        layers.push(global);
+    }
+
+    if let Some(tag) = model_tag {
+        if let Some(model_values) = object
+            .get("model_overrides")
+            .and_then(Value::as_object)
+            .and_then(|overrides| overrides.get(tag))
+        {
+            if let Some(layer) =
+                ConfigLayer::from_json_object(ConfigLayerKind::Model, Some(tag), model_values)
+            {
+                if !layer.values.is_empty() {
+                    layers.push(layer);
+                }
+            }
+        }
+    }
+
+    layers
 }
 
 fn resolve_field(field: &ConfigField, layers: &[ConfigLayer]) -> ResolvedConfigValue {
@@ -237,6 +288,54 @@ mod tests {
         assert_eq!(
             resolution.unknown_keys[0].source.id.as_deref(),
             Some("strix-halo-01")
+        );
+    }
+
+    #[test]
+    fn builds_global_and_model_layers_from_config_document() {
+        let raw = json!({
+            "max_tokens": 256,
+            "temperature": 0.4,
+            "model_overrides": {
+                "qwen3.5:9b": {
+                    "temperature": 0.1,
+                    "kv_cache": "q8"
+                },
+                "other": {
+                    "temperature": 0.8
+                }
+            }
+        });
+
+        let layers = super::config_layers_from_document(&raw, Some("qwen3.5:9b"));
+        let resolution = resolve_config_layers(config_schema(), &layers);
+
+        let temperature = value(&resolution, "temperature");
+        assert_eq!(temperature.value, Some(json!(0.1)));
+        assert_eq!(
+            temperature.source.as_ref().map(|source| source.kind),
+            Some(ConfigLayerKind::Model)
+        );
+        assert_eq!(
+            temperature
+                .source
+                .as_ref()
+                .and_then(|source| source.id.as_deref()),
+            Some("qwen3.5:9b")
+        );
+
+        let max_tokens = value(&resolution, "max_tokens");
+        assert_eq!(max_tokens.value, Some(json!(256)));
+        assert_eq!(
+            max_tokens.source.as_ref().map(|source| source.kind),
+            Some(ConfigLayerKind::Global)
+        );
+
+        let model_overrides = value(&resolution, "model_overrides");
+        assert_eq!(model_overrides.value, Some(json!({})));
+        assert_eq!(
+            model_overrides.source.as_ref().map(|source| source.kind),
+            Some(ConfigLayerKind::CompiledDefault)
         );
     }
 }
