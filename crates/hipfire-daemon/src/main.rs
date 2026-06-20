@@ -3195,7 +3195,17 @@ fn main() {
                 // Clients can still opt in to a non-1.0 value per request.
                 // LFM2.5-MoE (arch_id 11): Liquid's card recommends
                 // repetition_penalty=1.05; default to it (others stay 1.0/off).
-                let default_repeat_penalty = if m.arch_id == 11 { 1.05_f64 } else { 1.0_f64 };
+                // gemma3-vl (arch 13) decodes greedily through `decode_loop`;
+                // near-identical video slices push bare greedy into a token
+                // attractor, so default to a 1.3 repeat penalty (matches the
+                // bring-up example) unless the client overrides it.
+                let default_repeat_penalty = if m.arch_id == 11 {
+                    1.05_f64
+                } else if m.arch_id == 13 {
+                    1.3_f64
+                } else {
+                    1.0_f64
+                };
                 let repeat_penalty = protocol_generate
                     .as_ref()
                     .and_then(|req| req.sampling.repeat_penalty)
@@ -3304,9 +3314,16 @@ fn main() {
                 let video = msg.get("video").and_then(|v| v.as_str());
                 let max_frames =
                     msg.get("max_frames").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                // `images`: a JSON array of paths for true multi-image (distinct
+                // images) on the gemma3-vl path. Non-string entries are skipped.
+                let images: Vec<&str> = msg
+                    .get("images")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
                 let is_dots_ocr = m.arch_id == 8;
                 let is_gemma3_vl = m.gemma3_vl.is_some(); // arch 13 (medgemma)
-                let has_media = has_image || video.is_some();
+                let has_media = has_image || video.is_some() || !images.is_empty();
                 let has_vl = m.vision_config.is_some() || is_dots_ocr || is_gemma3_vl;
 
                 if video.is_some() && !is_gemma3_vl {
@@ -3327,7 +3344,7 @@ fn main() {
                     } else {
                         max_think_tokens
                     };
-                    match decode_vl_frames(image, image_base64, video, max_frames) {
+                    match decode_vl_frames(image, &images, image_base64, video, max_frames) {
                         Ok(frames) => {
                             let params = GenerateVLParams {
                                 id,

@@ -459,8 +459,56 @@ pub fn run_simple_ar(
 /// absolute KV position after prefill; `prompt_tokens` is reported back in the
 /// [`ServeOutcome`] (the two differ when image rows expand the prompt).
 ///
-/// Greedy for now (matches the bring-up examples); top-p / repeat-penalty /
-/// loop-guard thread in as the daemon's sampler is migrated behind this driver.
+/// Token selection: GPU-argmax greedy when `penalty <= 1.0` (no host download),
+/// else a host-side argmax that divides each recently-committed token's logit by
+/// `penalty` once **per occurrence** in the trailing `window` — the same scheme
+/// the gemma3-vl bring-up example uses. Per-occurrence (not presence) penalty is
+/// what breaks the single-token / short-cycle attractors greedy falls into on
+/// out-of-distribution input (e.g. several near-identical video slices → an
+/// `ình` loop): a token repeated N times is suppressed by `penalty^N`.
+fn pick_next(
+    gpu: &mut Gpu,
+    backend: &mut dyn SimpleAr,
+    vocab: usize,
+    penalty: f32,
+    window: usize,
+    committed: &[u32],
+) -> Result<u32, String> {
+    if penalty <= 1.0 {
+        return gpu
+            .argmax_f32(backend.logits(), vocab)
+            .map_err(|e| format!("argmax: {e:?}"));
+    }
+    let mut logits = gpu
+        .download_f32(backend.logits())
+        .map_err(|e| format!("download logits: {e:?}"))?;
+    if logits.len() < vocab {
+        return Err(format!("logits len {} < vocab {}", logits.len(), vocab));
+    }
+    let start = committed.len().saturating_sub(window);
+    for &t in &committed[start..] {
+        if (t as usize) < vocab {
+            let l = &mut logits[t as usize];
+            *l = if *l > 0.0 { *l / penalty } else { *l * penalty };
+        }
+    }
+    let mut best = 0usize;
+    let mut best_v = f32::NEG_INFINITY;
+    for (i, &v) in logits[..vocab].iter().enumerate() {
+        if v > best_v {
+            best_v = v;
+            best = i;
+        }
+    }
+    Ok(best as u32)
+}
+
+/// Shared post-prefill decode loop: from the just-prefilled `backend.logits()`,
+/// pick the next token → stream a JSONL `token` event → `decode_step`, until EOS
+/// / `max_tokens` / a `stop_sequences` match / a single-token attractor, then a
+/// final `done`. Greedy by default; `ctx.repeat_penalty > 1.0` switches to the
+/// penalized host argmax (see [`pick_next`]) — needed for the gemma3-vl video
+/// path, where near-identical slices push bare greedy into a loop.
 pub fn decode_loop(
     gpu: &mut Gpu,
     backend: &mut dyn SimpleAr,
@@ -471,11 +519,16 @@ pub fn decode_loop(
     prompt_tokens: usize,
 ) -> Result<ServeOutcome, String> {
     let vocab = backend.vocab_size();
+    let penalty = ctx.repeat_penalty;
+    let window = if ctx.repeat_window == 0 {
+        64
+    } else {
+        ctx.repeat_window
+    };
 
     let mut pos = start_pos;
-    let mut next = gpu
-        .argmax_f32(backend.logits(), vocab)
-        .map_err(|e| format!("argmax: {e:?}"))?;
+    let mut committed: Vec<u32> = Vec::new();
+    let mut next = pick_next(gpu, backend, vocab, penalty, window, &committed)?;
     let mut generated = 0usize;
     let mut text = String::new();
     let mut stop = StopReason::MaxTokens;
@@ -483,6 +536,12 @@ pub fn decode_loop(
     while generated < ctx.max_tokens {
         if next == eos {
             stop = StopReason::Eos;
+            break;
+        }
+        // Safety net for a single-token attractor that slips past the penalty
+        // (or when penalty is off): if the same token would extend a run of 12,
+        // stop rather than emit a wall of garbage.
+        if committed.len() >= 11 && committed[committed.len() - 11..].iter().all(|&t| t == next) {
             break;
         }
         let frag = tok.decode(&[next]);
@@ -499,12 +558,11 @@ pub fn decode_loop(
         let _ = writeln!(ctx.sink, "{ev}");
         let _ = ctx.sink.flush();
         generated += 1;
+        committed.push(next);
 
         backend.decode_step(gpu, next, pos)?;
         pos += 1;
-        next = gpu
-            .argmax_f32(backend.logits(), vocab)
-            .map_err(|e| format!("argmax: {e:?}"))?;
+        next = pick_next(gpu, backend, vocab, penalty, window, &committed)?;
     }
 
     let done = serde_json::json!({ "type": "done", "id": ctx.id, "tokens": generated });

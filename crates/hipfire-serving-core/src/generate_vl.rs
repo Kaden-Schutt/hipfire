@@ -874,19 +874,38 @@ pub fn generate_vl_dots_ocr(
 /// `Gemma3VlBackend::serve` consumes (each goes through `preprocess_image_bytes`
 /// → SigLIP), so they are the *encoded* container bytes (PNG/JPEG), not pixels.
 ///
-/// Routing: a `video` path (or an `image` path that `hipfire_media::is_video`)
-/// is expanded to up to `max_frames` uniformly-sampled PNG frames in slice
-/// order; a still `image` path is read as one frame; a base64 payload (optional
-/// `data:…;base64,` prefix stripped) is decoded as one frame. `max_frames == 0`
-/// means "all frames". Precedence: `video` > `image` > `image_base64`.
+/// Routing (in precedence order): a `video` path (or an `image` path that
+/// `hipfire_media::is_video`) expands to up to `max_frames` uniformly-sampled PNG
+/// frames in slice order; a non-empty `images` list reads each path as one frame
+/// (true multi-image — the clean multi-frame case with distinct images); a still
+/// `image` path reads as one frame; a base64 payload (optional `data:…;base64,`
+/// prefix stripped) decodes as one frame. `max_frames == 0` means "all frames".
+/// Precedence: `video` > `images[]` > `image` > `image_base64`.
 pub fn decode_vl_frames(
     image: Option<&str>,
+    images: &[&str],
     image_base64: Option<&str>,
     video: Option<&str>,
     max_frames: usize,
 ) -> Result<Vec<Vec<u8>>, String> {
     if let Some(vp) = video {
         return hipfire_media::decode_frames(Path::new(vp), max_frames);
+    }
+    if !images.is_empty() {
+        let mut frames = Vec::with_capacity(images.len());
+        for ip in images {
+            let p = Path::new(ip);
+            // A video in the list still expands to its frames, concatenated in
+            // list order with the other images.
+            if hipfire_media::is_video(p) {
+                frames.extend(hipfire_media::decode_frames(p, max_frames)?);
+            } else {
+                frames.push(
+                    std::fs::read(p).map_err(|e| format!("gemma3-vl: read image {ip}: {e}"))?,
+                );
+            }
+        }
+        return Ok(frames);
     }
     if let Some(ip) = image {
         let p = Path::new(ip);
@@ -1000,7 +1019,7 @@ mod gemma3_vl_tests {
 
     #[test]
     fn decode_vl_frames_errors_without_input() {
-        let err = decode_vl_frames(None, None, None, 0).unwrap_err();
+        let err = decode_vl_frames(None, &[], None, None, 0).unwrap_err();
         assert!(err.contains("no image/video"), "got: {err}");
     }
 
@@ -1008,7 +1027,7 @@ mod gemma3_vl_tests {
     fn decode_vl_frames_decodes_base64_single_frame() {
         let payload = b"\x89PNG\r\n\x1a\n-pretend-bytes";
         let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
-        let frames = decode_vl_frames(None, Some(&b64), None, 0).unwrap();
+        let frames = decode_vl_frames(None, &[], Some(&b64), None, 0).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0], payload);
     }
@@ -1018,14 +1037,14 @@ mod gemma3_vl_tests {
         let payload = b"jpeg-ish";
         let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
         let data_url = format!("data:image/png;base64,{b64}");
-        let frames = decode_vl_frames(None, Some(&data_url), None, 0).unwrap();
+        let frames = decode_vl_frames(None, &[], Some(&data_url), None, 0).unwrap();
         assert_eq!(frames[0], payload);
     }
 
     #[test]
     fn decode_vl_frames_rejects_malformed_data_url() {
         // `data:` prefix but no comma separator.
-        let err = decode_vl_frames(None, Some("data:image/png;base64"), None, 0).unwrap_err();
+        let err = decode_vl_frames(None, &[], Some("data:image/png;base64"), None, 0).unwrap_err();
         assert!(err.contains("data URL"), "got: {err}");
     }
 
@@ -1035,7 +1054,7 @@ mod gemma3_vl_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("frame.png");
         std::fs::write(&p, b"not-really-png-but-bytes").unwrap();
-        let frames = decode_vl_frames(Some(p.to_str().unwrap()), None, None, 0).unwrap();
+        let frames = decode_vl_frames(Some(p.to_str().unwrap()), &[], None, None, 0).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0], b"not-really-png-but-bytes");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1043,7 +1062,24 @@ mod gemma3_vl_tests {
 
     #[test]
     fn decode_vl_frames_errors_on_missing_image_path() {
-        let err = decode_vl_frames(Some("/no/such/frame.png"), None, None, 0).unwrap_err();
+        let err = decode_vl_frames(Some("/no/such/frame.png"), &[], None, None, 0).unwrap_err();
         assert!(err.contains("read image"), "got: {err}");
+    }
+
+    #[test]
+    fn decode_vl_frames_reads_images_list_in_order() {
+        let dir = std::env::temp_dir().join(format!("hfvl-multi-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p0 = dir.join("a.png");
+        let p1 = dir.join("b.png");
+        std::fs::write(&p0, b"image-a").unwrap();
+        std::fs::write(&p1, b"image-b").unwrap();
+        let list = [p0.to_str().unwrap(), p1.to_str().unwrap()];
+        // `images[]` takes precedence over a single `image`, preserving order.
+        let frames = decode_vl_frames(Some("/ignored"), &list, None, None, 0).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0], b"image-a");
+        assert_eq!(frames[1], b"image-b");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
