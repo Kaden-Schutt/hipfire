@@ -44740,6 +44740,119 @@ impl Gpu {
     /// `a_f16` [M,K], `x_f16` [B,K], `y_f16` [B,M], all raw F16 (u16) payloads.
     /// gfx1103/RDNA3 wave32, zero LDS. F32 accumulation, F16 round on store.
     /// Requires `k % 16 == 0` and wave32 WMMA.
+    /// Generic kernel library GEMV launcher: one wave32 per output row, params
+    /// `(W, x, y, M, K)`, grid `[M]`, block `[32]`. Shared by all six
+    /// `gemv_*` generic-library kernels (gfx1103, zero LDS).
+    fn launch_gemv_generic(
+        &mut self,
+        name: &'static str,
+        src: &'static str,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(name, src, name)?;
+        let wp = w.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions[name];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Generic GEMV F16×F16 → F32: `w` [M,K], `x` [K], `y` [M]. gfx1103 wave32.
+    pub fn gemv_f16_f32(
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.launch_gemv_generic("gemv_f16_f32", kernels::GEMV_F16_F32_SRC, w, x, y, m, k)
+    }
+
+    /// Generic GEMV F16×F16 → F16: `w` [M,K], `x` [K], `y` [M]. gfx1103 wave32.
+    pub fn gemv_f16_f16(
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.launch_gemv_generic("gemv_f16_f16", kernels::GEMV_F16_F16_SRC, w, x, y, m, k)
+    }
+
+    /// Generic GEMV BF16×BF16 → F32: `w` [M,K], `x` [K], `y` [M]. gfx1103 wave32.
+    pub fn gemv_bf16_f32(
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.launch_gemv_generic("gemv_bf16_f32", kernels::GEMV_BF16_F32_SRC, w, x, y, m, k)
+    }
+
+    /// Generic GEMV BF16×BF16 → BF16: `w` [M,K], `x` [K], `y` [M]. gfx1103 wave32.
+    pub fn gemv_bf16_bf16(
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.launch_gemv_generic("gemv_bf16_bf16", kernels::GEMV_BF16_BF16_SRC, w, x, y, m, k)
+    }
+
+    /// Generic GEMV signed-INT8×INT8 → INT32: `w` [M,K], `x` [K], `y` [M].
+    pub fn gemv_iu8_i32(
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.launch_gemv_generic("gemv_iu8_i32", kernels::GEMV_IU8_I32_SRC, w, x, y, m, k)
+    }
+
+    /// Generic GEMV signed-INT4×INT4 → INT32: `w` [M,K/2], `x` [K/2] (packed
+    /// nibbles), `y` [M]. `k` is the logical K. gfx1103 wave32.
+    pub fn gemv_iu4_i32(
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.launch_gemv_generic("gemv_iu4_i32", kernels::GEMV_IU4_I32_SRC, w, x, y, m, k)
+    }
+
     /// Generic kernel library: WMMA GEMM, signed INT4 inputs → INT32 output.
     /// `a_i4` [M,K/2], `x_i4` [B,K/2] (packed nibbles, `k_even | k_odd<<4`),
     /// `y_i32` [B,M] (int32). gfx1103/RDNA3 wave32, zero LDS. Requires

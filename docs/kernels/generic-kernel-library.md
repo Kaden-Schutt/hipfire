@@ -49,12 +49,21 @@ GEMM (existing kernels accumulate-and-store **F32**):
 | `iu8→i32`  | ✅ done   | `gemm_iu8_i32_wmma` (signed int8, no-LDS, clamp=false); parity test `examples/parity_gemm_iu8_i32_wmma.rs`, EXACT match on gfx1103 |
 | `iu4→i32`  | ✅ done   | `gemm_iu4_i32_wmma` (signed int4, gfx1103-generic, no-LDS, clamp=false); parity test `examples/parity_gemm_iu4_i32_wmma.rs`, EXACT match on gfx1103 |
 
-GEMV:
+GEMV (one wave32 per output row, wave-shuffle reduce, zero LDS; same-dtype
+weight+vector inputs; B=1 matvec). All validated on gfx1103 via
+`examples/parity_gemv_generic.rs` (floats ULP-exact, ints EXACT):
 
-| Combo      | Status   | Existing kernel / note |
-|------------|----------|------------------------|
-| `f16→f32`  | ⚠️ partial| `gemv_f16_xf32` (Wf16×Xf32) — only this one |
-| all others | ❌ missing| no bf16 / iu8 / iu4 / →f16 GEMV |
+| Combo      | Status   | Kernel |
+|------------|----------|--------|
+| `f16→f32`  | ✅ done   | `gemv_f16_f32` |
+| `f16→f16`  | ✅ done   | `gemv_f16_f16` |
+| `bf16→f32` | ✅ done   | `gemv_bf16_f32` |
+| `bf16→bf16`| ✅ done   | `gemv_bf16_bf16` |
+| `iu8→i32`  | ✅ done   | `gemv_iu8_i32` |
+| `iu4→i32`  | ✅ done   | `gemv_iu4_i32` |
+
+(Pre-existing `gemv_f16_xf32` keeps F32 *activation* precision — a separate
+contract from the same-dtype `gemv_f16_f32`.)
 
 ## Arch-class strategy
 
@@ -128,8 +137,9 @@ follow the same shape.
 2. ✅ GEMM tier complete on gfx1103: `bf16→bf16`, `f16→f16`, `iu8→i32`,
    `iu4→i32` all built + parity-tested (floats: F32-accum+round store; ints:
    exact). `bf16→f32` / `f16→f32` reused from pre-existing kernels.
-3. ⏳ GEMV across all six (no-LDS register/dot bodies; UMA-first since GEMV is
-   memory-bound and the MI50/UMA story centers on it).
+3. ✅ GEMV tier complete on gfx1103: all six built (one wave32 per row,
+   wave-shuffle reduce, zero LDS) + parity-tested via `parity_gemv_generic`.
 4. Numeric tests for each (currently validated on gfx1103; re-run on
    gfx1100/gfx1151 when fleet access is available).
-5. Later phases: gfx906 V_DOT path, gfx1201 fp8/sparse.
+5. Later phases: gfx906 V_DOT path, gfx1201 fp8/sparse; perf tuning (GEMV is
+   bandwidth-bound — consider vectorized/`dot`-instruction loads on UMA).

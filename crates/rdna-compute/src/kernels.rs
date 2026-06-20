@@ -3705,6 +3705,16 @@ pub const GEMM_IU8_I32_WMMA_SRC: &str =
 pub const GEMM_IU4_I32_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_iu4_i32_wmma.hip");
 
+// Generic kernel library GEMV tier (gfx1103 wave32, zero LDS, wave-shuffle
+// reduction; one wave per output row). Same-dtype weight/vector inputs.
+// See `docs/kernels/generic-kernel-library.md`.
+pub const GEMV_F16_F32_SRC: &str = include_str!("../../../kernels/src/gemv_f16_f32.hip");
+pub const GEMV_F16_F16_SRC: &str = include_str!("../../../kernels/src/gemv_f16_f16.hip");
+pub const GEMV_BF16_F32_SRC: &str = include_str!("../../../kernels/src/gemv_bf16_f32.hip");
+pub const GEMV_BF16_BF16_SRC: &str = include_str!("../../../kernels/src/gemv_bf16_bf16.hip");
+pub const GEMV_IU8_I32_SRC: &str = include_str!("../../../kernels/src/gemv_iu8_i32.hip");
+pub const GEMV_IU4_I32_SRC: &str = include_str!("../../../kernels/src/gemv_iu4_i32.hip");
+
 /// Bulk F32→F16 conversion for staging WMMA activations. Named
 /// `deepseek4_convert_f32_to_f16` to avoid collision with the embedded
 /// `convert_f32_to_f16` helper in `GEMM_HFQ4G256_RESIDUAL_FP16_SRC`
