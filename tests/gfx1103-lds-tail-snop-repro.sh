@@ -3,12 +3,14 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNNER="$ROOT/scripts/lds_gemm_standalone_matrix.sh"
+SUMMARIZER="$ROOT/scripts/lds_gemm_artifact_summary.sh"
 OUT="${OUT:-/tmp/hipfire-lds-tail-snop-repro}"
 ARCH="${ARCH:-gfx1103}"
 M="${M:-512}"
 N="${N:-3072}"
 K="${K:-3072}"
 PROFILE="${PROFILE:-repro}"
+BUILD_ONLY="${BUILD_ONLY:-0}"
 
 if [[ ! -x "$RUNNER" ]]; then
     echo "missing runner: $RUNNER" >&2
@@ -33,6 +35,7 @@ run_case() {
 
     set +e
     ARCH="$ARCH" \
+    BUILD_ONLY="$BUILD_ONLY" \
     VARIANT="$variant" \
     MODE=full \
     N_LAUNCH="$launches" \
@@ -97,11 +100,28 @@ for entry in "${cases[@]}"; do
     fi
 done
 
+artifact_summary_status=0
+artifact_summary_tsv="$OUT/artifact-summary.tsv"
+artifact_summary_md="$OUT/artifact-summary.md"
+if [[ -x "$SUMMARIZER" ]]; then
+    set +e
+    "$SUMMARIZER" "$OUT" "$OUT/artifact-summary" >"$OUT/artifact-summary.log" 2>&1
+    artifact_summary_status=$?
+    set -e
+else
+    artifact_summary_status=127
+    echo "missing summarizer: $SUMMARIZER" >"$OUT/artifact-summary.log"
+fi
+
 {
     echo "profile=$PROFILE"
     echo "arch=$ARCH"
     echo "shape=${M}x${N}x${K}"
+    echo "build_only=$BUILD_ONLY"
     echo "report=$report"
+    echo "artifact_summary_status=$artifact_summary_status"
+    echo "artifact_summary_tsv=$artifact_summary_tsv"
+    echo "artifact_summary_md=$artifact_summary_md"
     echo "mismatches=$failures"
 } >"$OUT/summary.txt"
 

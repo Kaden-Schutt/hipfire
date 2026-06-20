@@ -151,7 +151,8 @@ The currently promoted standalone GEMM jig lives in the repo:
 - `tests/gfx1103-lds-tail-snop-repro.sh`: focused cross-system pass/fail
   wrapper for a second 780M. The default `PROFILE=repro` checks the no-extra
   baseline against the tail-loop `s_nop` repro and writes a TSV report under
-  `/tmp/hipfire-lds-tail-snop-repro`.
+  `/tmp/hipfire-lds-tail-snop-repro`; it also invokes the artifact summarizer
+  at the end of the run.
 
 Older throwaway-only HIP probes used during the investigation:
 
