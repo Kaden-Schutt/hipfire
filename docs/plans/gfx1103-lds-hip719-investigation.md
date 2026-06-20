@@ -1529,6 +1529,18 @@ Latest artifact paths:
   `/tmp/hipfire-lds-active-lane-fresh/act5_plain_scan_*`) show fresh one-child
   non-monotonic behavior (`4x4` fails at `279`, `5x5` fails at `280` and
   `300` but passes at `320`).
+- A fresh 512x86 asymmetric active-lane pass
+  (`/tmp/hipfire-lds-direct-ab-asym-artifacts/`, throwaway worktree
+  `/tmp/hipfire-lds-direct-ab-asym-1781922739`) pins the direct-AB one-child
+  `reads=3`, `iters=448`, `chunks=150` edge to crossing one wavefront:
+  `6x5` and `5x6` (30 active lanes, 248 B group segment) passed, `8x4` and
+  `4x8` (32 lanes, 256 B group segment) passed, while `11x3`/`3x11`
+  (33 lanes, 276 B), `7x5`/`5x7` (35 lanes, 284 B), and `6x6`
+  (36 lanes, 288 B) failed. All failing rows captured the same direct-AB
+  signature: HIP-719 at sync/global launch 98-99, `dmesg_remove_queue=3`,
+  fault address `0x000074669d000000`, prot status `0x841051`, GCVM flags
+  `MORE_FAULTS,PERMISSION_FAULTS,RW`, and GDS/GDS-VM registers
+  `0x3f000007` / `0x0fc00113`.
 
 ## Current Narrowing
 
@@ -1822,6 +1834,14 @@ Reduction results after extending the standalone HIP GEMM probe:
   while `4x4` pushes to `279` (`320`/`260` pass), and `6x6` fails at `135`.
   That pattern supports “work-per-thread + queue lifetime” coupling rather than
   a fixed launch-count constant.
+- The fresh 512x86 asymmetric pass sharpens that to a wavefront boundary for
+  the promoted direct-AB phase kernel at `reads=3`/`iters=448`/`chunks=150`:
+  <=32 active lanes pass and 33+ active lanes fail, independent of orientation.
+  Because `6x5`/`5x6` and `8x4`/`4x8` pass but `11x3`/`3x11`,
+  `7x5`/`5x7`, and `6x6` fail with the same GCVM/GDS signature, this is not an
+  exact-square `6x6` artifact. It points at the first two-wave direct-AB LDS
+  use as the load-bearing condition, with the launch-count/grid/work threshold
+  still providing the timing edge.
 - Phase-mode controls sharpen the process-boundary result. With the same
   direct-AB kernel body at reads=6/192/511x86, same-process `99 + 1` fails on
   phase2 launch 0 / global launch 99, and same-process `98 + 2` fails on
@@ -2200,6 +2220,11 @@ LDS-only control:
 | direct-AB multi-exec `6x6` block, reads=3, 448 iters, 384x86 | PASS through one-child 134; FAIL at one-child 135; PASS for 90,90 child splits | `_Z25lds_direct_ab_phase_probev` | 288 B | 34 | 2 | 0 | 32 |
 | direct-AB multi-exec `6x6` block, reads=3, 448 iters, 352x86 | PASS at one-child 150; FAIL at one-child 151+; PASS for 105,45 child splits | `_Z25lds_direct_ab_phase_probev` | 288 B | 34 | 2 | 0 | 32 |
 | direct-AB multi-exec `6x6` block, reads=3, 448 iters, 320x86 | PASS through one-child 162; FAIL at one-child 163+; PASS for 98,67 and 80,85 child splits | `_Z25lds_direct_ab_phase_probev` | 288 B | 34 | 2 | 0 | 32 |
+| direct-AB multi-exec `6x5`/`5x6` block, reads=3, 448 iters, 512x86, one child `150` | PASS | `_Z25lds_direct_ab_phase_probev` | 248 B | 34 | 2 | 0 | 32 |
+| direct-AB multi-exec `8x4`/`4x8` block, reads=3, 448 iters, 512x86, one child `150` | PASS | `_Z25lds_direct_ab_phase_probev` | 256 B | 34 | 2 | 0 | 32 |
+| direct-AB multi-exec `11x3`/`3x11` block, reads=3, 448 iters, 512x86, one child `150` | FAIL at sync/global launch 98 | `_Z25lds_direct_ab_phase_probev` | 276 B | 34 | 2 | 0 | 32 |
+| direct-AB multi-exec `7x5`/`5x7` block, reads=3, 448 iters, 512x86, one child `150` | FAIL at sync/global launch 98-99 | `_Z25lds_direct_ab_phase_probev` | 284 B | 34 | 2 | 0 | 32 |
+| direct-AB multi-exec `6x6` block, reads=3, 448 iters, 512x86, one child `150` | FAIL at sync/global launch 99 | `_Z25lds_direct_ab_phase_probev` | 288 B | 34 | 2 | 0 | 32 |
 | direct-AB no-output `8x4` active in `8x5` block, reads=6 | PASS at 512 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 256 B | 22 | 5 | 0 | 32 |
 
 ISA observations:
