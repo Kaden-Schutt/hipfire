@@ -1,0 +1,104 @@
+name: chaingun-version
+
+# Development builds use a Git-derived subpatch identity instead of committing
+# Cargo.toml version bumps on every accepted change. For a checkout described as
+# `v0.2.1-908-g97767a40`, the `908` is the commit count since tag `v0.2.1`.
+on:
+  push:
+    branches: [chaingun]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  describe:
+    name: describe accepted commit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute chaingun version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo_version="$(
+            awk '
+              /^\[workspace\.package\]/ { in_workspace_package = 1; next }
+              in_workspace_package && /^\[/ { exit }
+              in_workspace_package && $1 == "version" {
+                gsub(/"/, "", $3)
+                print $3
+                exit
+              }
+            ' Cargo.toml
+          )"
+          if [ -z "$cargo_version" ]; then
+            echo "::error ::could not read workspace.package.version from Cargo.toml"
+            exit 1
+          fi
+
+          release_tag="$(git describe --tags --match 'v[0-9]*' --abbrev=0)"
+          git_describe="$(git describe --tags --match 'v[0-9]*' --long --always --dirty --abbrev=8)"
+          commits_since_tag="$(git rev-list "${release_tag}..HEAD" --count)"
+          short_sha="$(git rev-parse --short=8 HEAD)"
+          semver_build="${release_tag#v}+${commits_since_tag}.g${short_sha}"
+
+          if [ "v${cargo_version}" != "$release_tag" ]; then
+            echo "::warning ::Cargo workspace version ${cargo_version} does not match nearest release tag ${release_tag}"
+          fi
+
+          {
+            echo "cargo_version=${cargo_version}"
+            echo "release_tag=${release_tag}"
+            echo "commits_since_tag=${commits_since_tag}"
+            echo "git_describe=${git_describe}"
+            echo "semver_build=${semver_build}"
+            echo "short_sha=${short_sha}"
+          } >> "$GITHUB_OUTPUT"
+
+          cat > hipfire-version.env <<EOF
+          HIPFIRE_CARGO_VERSION=${cargo_version}
+          HIPFIRE_RELEASE_TAG=${release_tag}
+          HIPFIRE_COMMITS_SINCE_TAG=${commits_since_tag}
+          HIPFIRE_GIT_DESCRIBE=${git_describe}
+          HIPFIRE_SEMVER_BUILD=${semver_build}
+          HIPFIRE_SHORT_SHA=${short_sha}
+          EOF
+
+          cat > hipfire-version.json <<EOF
+          {
+            "cargo_version": "${cargo_version}",
+            "release_tag": "${release_tag}",
+            "commits_since_tag": ${commits_since_tag},
+            "git_describe": "${git_describe}",
+            "semver_build": "${semver_build}",
+            "short_sha": "${short_sha}",
+            "sha": "${GITHUB_SHA}"
+          }
+          EOF
+
+          {
+            echo "### Chaingun Version"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Cargo workspace version | \`${cargo_version}\` |"
+            echo "| Release tag | \`${release_tag}\` |"
+            echo "| Commits since tag | \`${commits_since_tag}\` |"
+            echo "| Git describe | \`${git_describe}\` |"
+            echo "| SemVer build metadata | \`${semver_build}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload version metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: hipfire-chaingun-version-${{ github.sha }}
+          path: |
+            hipfire-version.env
+            hipfire-version.json

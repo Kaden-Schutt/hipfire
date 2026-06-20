@@ -10,6 +10,12 @@ hipfire serve           # OpenAI-compatible API on 0.0.0.0:11435
 
 Current release: **v0.2.1** — dispatch unification (#397). DeepSeek V4 Flash support landed in v0.2.0. See [CHANGELOG.md](CHANGELOG.md).
 
+`chaingun` development builds use the Git-derived subpatch identity
+`vX.Y.Z-N-gSHA`, where `N` is the commit count since the release tag. The
+`chaingun-version` GitHub Action emits that identity on every accepted
+`chaingun` commit; `Cargo.toml` stays at the release SemVer until the next
+intentional release bump.
+
 Discord: <https://discord.gg/F3BaywB8Rs>
 
 ## Why
