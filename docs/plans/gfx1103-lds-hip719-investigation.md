@@ -1721,6 +1721,17 @@ Latest artifact paths:
   static tuple from `11x3`/`3x11` (`vgpr=28`, `s_barrier=14`, DS=28,
   `s_waitcnt=21`, same `offset1=36`), so they are orientation/access-pattern
   evidence rather than same-ISA controls.
+- One-wave extreme controls
+  (`/tmp/hipfire-lds-direct-ab-32x1-control-artifacts/`, throwaway worktree
+  `/tmp/hipfire-lds-direct-ab-32x1-control-1781927170`; and
+  `/tmp/hipfire-lds-direct-ab-1x32-control-artifacts/`, throwaway worktree
+  `/tmp/hipfire-lds-direct-ab-1x32-control-1781927170`) tested the same
+  extreme row/column access style without crossing into a second wave. Both
+  `32x1` and `1x32` READS=2 passed one-child `500`. They share the extreme
+  static tuple (`vgpr=28`, `s_barrier=14`, DS=28, `s_waitcnt=21`) with
+  `33x1`/`1x33`, while dropping to `group_segment=256` and `offset1=32`.
+  This strengthens the >32-active-lane boundary even for the extreme
+  row/column codegen family.
 
 ## Current Narrowing
 
@@ -2114,6 +2125,11 @@ Reduction results after extending the standalone HIP GEMM probe:
   Because these dimensions also change static codegen, keep this as supporting
   orientation evidence rather than merging it into the exact `11x3`/`3x11`
   same-ISA boundary.
+- The matching `32x1` and `1x32` controls pass `500` launches with the same
+  extreme static instruction/resource tuple as the 33-lane extremes, except
+  for the expected one-wave LDS footprint/offset. That makes the 32/33 active
+  boundary robust across both the compact `8x4` style and extreme row/column
+  codegen families.
 - Phase-mode controls sharpen the process-boundary result. With the same
   direct-AB kernel body at reads=6/192/511x86, same-process `99 + 1` fails on
   phase2 launch 0 / global launch 99, and same-process `98 + 2` fails on
@@ -2507,6 +2523,7 @@ LDS-only control:
 | direct-AB multi-exec `8x4` block/layout, reads=2, 448 iters, 512x86 | PASS at one-child `500`/`1000` | `_Z25lds_direct_ab_phase_probev` | 256 B | 24 | 2 | 0 | 32 |
 | direct-AB multi-exec `11x3`/`3x11` block/layout, reads=1, 448 iters, 512x86 | PASS at one-child `500` for both orientations | `_Z25lds_direct_ab_phase_probev` | 276 B | 22 | 2 | 0 | 32 |
 | direct-AB multi-exec/phase-mode `11x3`/`3x11` block/layout, reads=2, 448 iters, 512x86 | `11x3`: PASS `131`/`132`, FAIL one-child `133`, same-process `132+1` PASS, `device_reset 132+1` FAILS in phase1/global 130; `3x11`: PASS `131`-`133`, FAIL `134`, cross-process `132,1` PASS, same-process `132+1` FAIL at phase2 launch 0, `device_reset 132+1` PASS | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
+| direct-AB multi-exec `32x1`/`1x32` block/layout, reads=2, 448 iters, 512x86 | PASS at one-child `500` for both one-wave extreme orientations | `_Z25lds_direct_ab_phase_probev` | 256 B | 28 | 2 | 0 | 32 |
 | direct-AB multi-exec `33x1`/`1x33` block/layout, reads=2, 448 iters, 512x86 | `33x1`: FAIL one-child `130` at sync/global 41; `1x33`: PASS one-child `130`/`140`, FAIL one-child `500` at sync/global 359 | `_Z25lds_direct_ab_phase_probev` | 276 B | 28 | 2 | 0 | 32 |
 | direct-AB pre-sync diagnostic `11x3`/`3x11` block/layout, reads=2, 448 iters, 512x86 | `PRE_SYNC_EACH_LAUNCH=1`: `11x3` one-child `133` PASS; `3x11` one-child `134` FAIL at sync/global 133 | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
 | direct-AB throwaway host-sleep diagnostic `11x3` block/layout, reads=2, 448 iters, 512x86 | local-only `PRE_LAUNCH_SLEEP_US=1000`: one-child `133` FAIL at sync/global 73 | `_Z25lds_direct_ab_phase_probev` | 276 B | 24 | 2 | 0 | 32 |
