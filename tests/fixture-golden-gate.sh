@@ -28,6 +28,11 @@ source ./scripts/gpu-lock.sh
 
 BASELINES="tests/fixture-golden-baselines.txt"
 ARCHS=(qwen3_5 qwen3_5_moe)
+# Format axis: each runtime quant format has its own dequant kernel path, so a
+# regression in one shows up as that cell's hash drifting. Support is
+# arch-conditional (e.g. mq3 is gfx11+), so an unrunnable cell is a soft SKIP,
+# not a failure — only a runnable-but-drifted cell fails.
+FORMATS=(mq4 mq3 mq6 q8f16)
 LEN=16
 WARMUP=2
 SEED=42
@@ -53,9 +58,9 @@ run_golden() { # arch hfq -> prints "<gpu_arch> <logit_hash>"
     echo "${ga:-unknown} ${hh:-MISSING}"
 }
 
-lookup_baseline() { # gpu_arch model_arch
+lookup_baseline() { # gpu_arch model_arch format
     [ -f "$BASELINES" ] || return 0
-    awk -v g="$1" -v m="$2" '$1==g && $2==m {print $3}' "$BASELINES" | head -1
+    awk -v g="$1" -v m="$2" -v f="$3" '$1==g && $2==m && $3==f {print $4}' "$BASELINES" | head -1
 }
 
 fail=0
@@ -63,38 +68,41 @@ declare -a RECORDED=()
 for arch in "${ARCHS[@]}"; do
     echo "== golden: $arch =="
     "$Q" --emit-fixture "$arch" --out "$TMP/$arch" --seed "$SEED" >/dev/null 2>&1
-    "$Q" --input "$TMP/$arch" --output "$TMP/$arch.hfq" --format mq4 >/dev/null 2>&1 \
-        || { echo "  FAIL: quantize $arch" >&2; fail=1; continue; }
+    for fmt in "${FORMATS[@]}"; do
+        hfq="$TMP/$arch-$fmt.hfq"
+        if ! "$Q" --input "$TMP/$arch" --output "$hfq" --format "$fmt" >/dev/null 2>&1; then
+            echo "  SKIP $fmt: quantize unsupported on this build/arch"; continue
+        fi
 
-    read -r gpu_arch h1 <<<"$(run_golden "$TMP/$arch.hfq")"
-    read -r _        h2 <<<"$(run_golden "$TMP/$arch.hfq")"
-    if [ "$h1" = "MISSING" ]; then echo "  FAIL: no logit_hash ($arch)"; fail=1; continue; fi
+        read -r gpu_arch h1 <<<"$(run_golden "$hfq")"
+        read -r _        h2 <<<"$(run_golden "$hfq")"
+        if [ "$h1" = "MISSING" ]; then echo "  SKIP $fmt: not runnable here (no logit_hash)"; continue; fi
 
-    # 1. Determinism.
-    if [ "$h1" != "$h2" ]; then
-        echo "  FAIL determinism: $h1 != $h2 (nondeterministic kernel on $arch)"
-        fail=1; continue
-    fi
-    echo "  deterministic: $h1 ($gpu_arch)"
-    RECORDED+=("$gpu_arch $arch $h1")
+        # 1. Determinism (hard — a runnable cell that flips is a real bug).
+        if [ "$h1" != "$h2" ]; then
+            echo "  FAIL determinism $fmt: $h1 != $h2 (nondeterministic kernel)"
+            fail=1; continue
+        fi
+        RECORDED+=("$gpu_arch $arch $fmt $h1")
 
-    # 2. Baseline.
-    base="$(lookup_baseline "$gpu_arch" "$arch")"
-    if [ "$RECORD" = 1 ]; then
-        :  # baselines written below
-    elif [ -z "$base" ]; then
-        echo "  NOTE: no baseline for $gpu_arch/$arch — observed $h1 (run --record to add)"
-    elif [ "$base" != "$h1" ]; then
-        echo "  FAIL drift: $h1 != baseline $base → escalate to 35B golden (agentic-gate.sh)"
-        fail=1
-    else
-        echo "  OK: matches baseline"
-    fi
+        # 2. Baseline (hard — a runnable cell that drifts from committed fails).
+        base="$(lookup_baseline "$gpu_arch" "$arch" "$fmt")"
+        if [ "$RECORD" = 1 ]; then
+            echo "  $fmt: $h1 ($gpu_arch) [record]"
+        elif [ -z "$base" ]; then
+            echo "  NOTE $fmt: no baseline for $gpu_arch — observed $h1 (run --record to add)"
+        elif [ "$base" != "$h1" ]; then
+            echo "  FAIL drift $fmt: $h1 != baseline $base → escalate to 35B golden (agentic-gate.sh)"
+            fail=1
+        else
+            echo "  OK $fmt: matches baseline ($h1)"
+        fi
+    done
 done
 
 if [ "$RECORD" = 1 ]; then
     {
-        echo "# gpu_arch  model_arch  logit_hash  (len=$LEN warmup=$WARMUP seed=$SEED)"
+        echo "# gpu_arch  model_arch  format  logit_hash  (len=$LEN warmup=$WARMUP seed=$SEED mode=tf)"
         printf '%s\n' "${RECORDED[@]}"
     } >"$BASELINES"
     echo "fixture-golden-gate: wrote ${#RECORDED[@]} baselines to $BASELINES"

@@ -1,3 +1,9 @@
-# gpu_arch  model_arch  logit_hash  (len=16 warmup=2 seed=42)
-gfx1151 qwen3_5 0xb9929ff22fec2015
-gfx1151 qwen3_5_moe 0x512ad6880ea52325
+# gpu_arch  model_arch  format  logit_hash  (len=16 warmup=2 seed=42 mode=tf)
+gfx1151 qwen3_5 mq4 0xb9929ff22fec2015
+gfx1151 qwen3_5 mq3 0x6f8a935956270f0d
+gfx1151 qwen3_5 mq6 0x856b777676bbda22
+gfx1151 qwen3_5 q8f16 0x4d79f42bf4299c24
+gfx1151 qwen3_5_moe mq4 0x512ad6880ea52325
+gfx1151 qwen3_5_moe mq3 0x1cf58fef54d34b2d
+gfx1151 qwen3_5_moe mq6 0x512ad6880ea52325
+gfx1151 qwen3_5_moe q8f16 0x6d9b924556410f2e
