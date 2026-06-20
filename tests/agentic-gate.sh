@@ -190,93 +190,11 @@ PI_SYS="benchmarks/prompts/agentic_pi_system.txt"
 HERMES_SYS="benchmarks/prompts/agentic_hermes_system.txt"
 USER_READ="benchmarks/prompts/agentic_user_read.txt"
 
-# ---- VRAM headroom check ---------------------------------------------------
-# Models declare min_vram_gb in cli/registry.json. If the host can't meet
-# that minimum, the model loads but silently OOMs during prefill and emits
-# zero tokens (looks like a tool-call regression — it isn't). Treat such
-# models as absent so the existing skip path covers this case too.
-#
-# Threshold semantics: min_vram_gb is interpreted as a strict floor expressed
-# in GiB (1024^3). Daemon overhead (KV cache, graph capture, scratch) is
-# assumed pre-included in the registry value — A3B-35B is an 18.7 GB blob
-# but declares min_vram_gb=22, i.e. ~3.3 GiB margin. We do NOT add a
-# secondary +1 GB headroom because (a) it'd compound, and (b) the registry
-# is the single source of truth for "needs N GiB". Comparison is in bytes
-# to avoid GiB-truncation false-positives on cards that report slightly
-# under their advertised size (e.g. a 24 GB card reading 23.98 GiB).
-#
-# Disable with HIPFIRE_AGENTIC_GATE_NO_VRAM_CHECK=1 (e.g., on hosts where
-# the registry minimums are conservative).
-REGISTRY="cli/registry.json"
-# Multi-card systems take the max VRAM across all DRM cards. iGPUs report
-# zero / a sliver, so max correctly picks the dGPU. On dual-dGPU hosts this
-# is optimistic — we don't know which card the daemon will use.
-VRAM_BYTES=0
-for f in /sys/class/drm/card*/device/mem_info_vram_total; do
-    [ -r "$f" ] || continue
-    v="$(cat "$f" 2>/dev/null)" || continue
-    [ "$v" -gt "$VRAM_BYTES" ] && VRAM_BYTES="$v"
-done
-if [ "$VRAM_BYTES" -lt 1073741824 ] && [ -r "scripts/_detect-gpu.sh" ]; then
-    # UMA/APU systems can report a tiny DRM "VRAM" aperture while ROCm exposes
-    # the real GPU-visible global pool through rocminfo.
-    # shellcheck disable=SC1091
-    . "scripts/_detect-gpu.sh"
-    case "${HIPFIRE_DETECTED_VRAM_GB:-}" in
-        ''|'?') ;;
-        *[!0-9]*) ;;
-        *) VRAM_BYTES=$(( HIPFIRE_DETECTED_VRAM_GB * 1073741824 )) ;;
-    esac
-fi
-VRAM_GB=$(( VRAM_BYTES / 1073741824 ))
-if [ "$VRAM_BYTES" -eq 0 ] && [ "${HIPFIRE_AGENTIC_GATE_NO_VRAM_CHECK:-0}" != "1" ]; then
-    echo "agentic-gate: VRAM detection unavailable (no /sys/class/drm/card*/device/mem_info_vram_total) - skipping VRAM check"
-fi
-
-model_fits_vram() {
-    local model_path="$1"
-    [ "${HIPFIRE_AGENTIC_GATE_NO_VRAM_CHECK:-0}" = "1" ] && return 0
-    [ -f "$REGISTRY" ] || return 0
-    [ "$VRAM_BYTES" -gt 0 ] || return 0
-    # python3 is a hard script-wide dep (self-check + JSONL builder). No guard.
-
-    local fname min_gb min_bytes
-    fname="$(basename "$model_path")"
-    min_gb="$(python3 -c '
-import json, sys
-fname = sys.argv[1]
-names = {fname}
-if fname.endswith(".hfq"):
-    names.add(fname[:-4])
-for name in list(names):
-    names.add(name.replace("-mq4", "-mq4.hfq"))
-    names.add(name.replace("-mq6", "-mq6.hfq"))
-    names.add(name.replace("-mq3", "-mq3.hfq"))
-with open(sys.argv[2]) as fh:
-    data = json.load(fh)
-for entry in data.get("models", {}).values():
-    if isinstance(entry, dict) and entry.get("file") in names:
-        v = entry.get("min_vram_gb")
-        if v is not None:
-            print(v)
-        break
-' "$fname" "$REGISTRY" 2>/dev/null)"
-    [ -n "$min_gb" ] || return 0
-
-    min_bytes=$(( min_gb * 1073741824 ))
-    if [ "$VRAM_BYTES" -lt "$min_bytes" ]; then
-        echo "agentic-gate: $fname needs ${min_gb} GB VRAM, host has ${VRAM_GB} GB - skipping cell"
-        return 1
-    fi
-    return 0
-}
-
-# Path-blank when over budget so the existing `[ -f "$A3B_..." ]` checks
-# downstream naturally treat these models as absent (`[ -f "" ]` is false).
+# Registry-backed VRAM minimums were removed with the legacy TypeScript CLI.
+# Keep the skip flags for the downstream absence message shape, but do not
+# silently hide present models based on stale metadata.
 A3B_35_VRAM_SKIP=0
 A3B_36_VRAM_SKIP=0
-if [ -f "$A3B_35" ] && ! model_fits_vram "$A3B_35"; then A3B_35=""; A3B_35_VRAM_SKIP=1; fi
-if [ -f "$A3B_36" ] && ! model_fits_vram "$A3B_36"; then A3B_36=""; A3B_36_VRAM_SKIP=1; fi
 
 # Skip-on-absence: both models missing -> exit 0. Distinguish absent-on-disk
 # from skipped-for-VRAM so the operator can tell which case fired.

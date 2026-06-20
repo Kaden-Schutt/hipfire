@@ -177,8 +177,8 @@ fn run_pp2(path: &str, prompt: &[u32]) -> Vec<u32> {
 }
 
 // `#[ignore]`d by default. The cargo-test environment doesn't pre-compile
-// the full hot-path kernel set the daemon ships with — JIT via hipcc fails
-// on NixOS (and any host without ROCm SDK on PATH). Run explicitly:
+// the full hot-path kernel set the daemon ships with — JIT via hipcc fails on
+// hosts without the ROCm SDK on PATH. Run explicitly:
 //
 //   HIP_VISIBLE_DEVICES=0,1 HIPFIRE_HAVE_2_GPU=1 \
 //       cargo test -p hipfire-arch-qwen35 --release --features deltanet \

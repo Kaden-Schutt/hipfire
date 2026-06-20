@@ -7,8 +7,7 @@ pass for layer 0 on a single token (248045 = <|im_start|>) at pos=0,
 and dumps every intermediate value for comparison with hipfire.
 
 Usage:
-  nix-shell -p python3Packages.torch python3Packages.safetensors \
-    --run "python3 scripts/paro_layer0_debug.py"
+  python3 scripts/paro_layer0_debug.py
 """
 
 import math

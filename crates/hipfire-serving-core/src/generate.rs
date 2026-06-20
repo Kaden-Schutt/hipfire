@@ -2217,7 +2217,7 @@ pub fn generate(
     //   1. raw_q_tokens (the user message itself).
     //   2. system_prompt -- the OpenAI serve path puts tool definitions
     //      and the `<tool_call>` format example in the system prompt
-    //      when `body.tools` is present (cli/index.ts buildSystem). A
+    //      when `body.tools` is present. A
     //      first-turn user message with tools therefore needs a system-
     //      prompt scan or it would slip through as Text and get its
     //      schema text mangled by compression.

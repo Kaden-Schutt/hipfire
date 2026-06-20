@@ -6994,9 +6994,9 @@ pub fn apply_special_token_attractor_block(
 /// `open_id`'s logit to `-INF` so the next sample cannot stack another
 /// nested opener. With `threshold = 2`, a second consecutive opener
 /// without an intervening closer is the last one the decoder is allowed
-/// to emit; the third+ are blocked. The downstream regex parser
-/// (`parseToolCalls` in cli/index.ts) tolerates a single nested opener
-/// by stripping the leading repeat before JSON parse.
+    /// to emit; the third+ are blocked. The downstream Hermes JSON parser
+    /// tolerates a single nested opener by stripping the leading repeat before
+    /// JSON parse.
 ///
 /// The depth saturates at 0 from below: a stray closer at the start of
 /// the window doesn't push depth negative and create false-allow.

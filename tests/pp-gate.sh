@@ -95,8 +95,8 @@ if [ -n "$SIMULATE" ] && [ "$DRY_RUN" != "1" ]; then
 fi
 
 # ── ROCm env ────────────────────────────────────────────────────────────
-# Auto-source rocm-env.sh so HIP libraries land on the loader path on
-# NixOS-style hosts. No-op if already loaded.
+# Auto-source rocm-env.sh so HIP libraries land on the loader path. No-op if
+# already loaded.
 if [ -r "./scripts/rocm-env.sh" ]; then
     # shellcheck disable=SC1091
     . ./scripts/rocm-env.sh

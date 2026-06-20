@@ -37,8 +37,8 @@ Sweep scope:
     scripts/**/*.sh
 
 Skips:
-    * any path under target/, .git/, .hipfire_kernels/, node_modules/,
-      .claude/worktrees/, .worktrees/
+    * any path under target/, .git/, .hipfire_kernels/, .claude/worktrees/,
+      .worktrees/
     * any path under a vendored/ / third_party/ / third-party/ dir
     * Markdown, TOML, JSON, YAML, dotfiles (out of scope)
     * binaries (gguf, safetensors, hfq, bin)
@@ -105,7 +105,6 @@ EXCLUDE_DIR_NAMES = {
     "target",
     ".git",
     ".hipfire_kernels",
-    "node_modules",
     "vendored",
     "third_party",
     "third-party",

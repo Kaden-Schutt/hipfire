@@ -32,7 +32,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_ALLOW_MQ3_LLOYD` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:6803` |
 | `HIPFIRE_ALLOW_MQ4_LLOYD` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:6853` |
 | `HIPFIRE_ALLOW_UNIT_IMATRIX` | Environment toggle value controls runtime behavior | `/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:6564` |
-| `HIPFIRE_ATTN_FLASH` | Honors HIPFIRE_ATTN_FLASH=never\\\\|0\\\\|off as an explicit override | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:8589` |
+| `HIPFIRE_ATTN_FLASH` | Honors HIPFIRE_ATTN_FLASH=never\\\\\|0\\\\\|off as an explicit override | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:8589` |
 | `HIPFIRE_AWQ_F1_ONLY` | F1-vs-F2 A/B gate. When "HIPFIRE_AWQ_F1_ONLY=1" is set, the F2 | `/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:5394` |
 | `HIPFIRE_BASELINE_ARCH` | Runtime variable controlling baseline arch in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/coherence_probe.rs:403` |
 | `HIPFIRE_BATCHES_STATE_MAX` | Parses "HIPFIRE_BATCHES_STATE_MAX" with fallback defaults | `/home/sadara/.hipfire/src/crates/hipfire-server/src/routes/batches.rs:687` |
@@ -312,13 +312,13 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_PERF_BASELINE` | Runtime variable controlling perf baseline in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-eval/src/executor_examples.rs:1158` |
 | `HIPFIRE_PERF_BASELINE_DIR` | Runtime variable controlling perf baseline dir in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-eval/src/executor_examples.rs:1171` |
 | `HIPFIRE_PERPLEXITY_BIN` | Runtime variable controlling perplexity bin in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-eval/src/lib.rs:971` |
-| `HIPFIRE_PFLASH_DAEMON_LABELS` | Runtime variable controlling pflash daemon labels in hipfire. | `/home/sadara/.hipfire/src/crates/hipfire-train/examples/ssm_drafter_train.rs:77` |
+| `HIPFIRE_PFLASH_DAEMON_LABELS` | Runtime variable controlling pflash daemon labels in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-train/examples/ssm_drafter_train.rs:77` |
 | `HIPFIRE_PFLASH_DEBUG` | Runtime variable controlling pflash debug in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/generate.rs:2284` |
 | `HIPFIRE_PFLASH_DRAFTER_KV` | Selects behavior from recognized values | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:533` |
 | `HIPFIRE_PFLASH_DRAFTER_STATE` | Hybrid drafter only stores K (and V for chat-path) at | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:620` |
 | `HIPFIRE_PFLASH_FRESH` | resume: reload weights + AdamW state from the checkpoint unless FRESH=1 | `/home/sadara/.hipfire/src/crates/hipfire-train/examples/pflash_drafter_train.rs:259` |
 | `HIPFIRE_PFLASH_NIAH_BENCH_BIN` | Runtime variable controlling pflash niah bench bin in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-eval/src/lib.rs:926` |
-| `HIPFIRE_PFLASH_REPORT_TRAIN` | Runtime variable controlling pflash report train in hipfire. | `/home/sadara/.hipfire/src/crates/hipfire-train/examples/ssm_drafter_train.rs:127` |
+| `HIPFIRE_PFLASH_REPORT_TRAIN` | Runtime variable controlling pflash report train in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-train/examples/ssm_drafter_train.rs:127` |
 | `HIPFIRE_PFLASH_SCORE_LAYER` | Parses "HIPFIRE_PFLASH_SCORE_LAYER" with fallback defaults | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:1081` |
 | `HIPFIRE_PP_DFLASH` | Environment toggle value controls runtime behavior | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:2627` |
 | `HIPFIRE_PP_LAYERS` | Runtime variable controlling pp layers in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/load.rs:1707` |

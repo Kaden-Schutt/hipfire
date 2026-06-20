@@ -16,7 +16,6 @@ RUST_MODULE = ROOT / "crates" / "hipfire-runtime" / "src" / "env_docs.rs"
 EXCLUDE_PREFIXES = (
     ROOT / "third_party",
     ROOT / "target",
-    ROOT / "node_modules",
 )
 
 COMMENT_PREFIXES = (

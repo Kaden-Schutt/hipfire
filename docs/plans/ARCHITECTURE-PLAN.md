@@ -30,7 +30,7 @@ The target crates for modular boundaries remain:
 - `hipfire-daemon-protocol` (created; owns daemon JSONL request/response contracts)
 - `hipfire-evidence` (created; owns evidence provenance, host-profile contracts/policy, and evidence hash policy)
 
-A `bun`-free control plane remains desirable but is deferred behind verified seam extraction.
+The active control plane is Rust-native; the legacy script runtime has been removed.
 
 Current prompt boundary status:
 - `hipfire-prompt` owns `AssistantPrefix`, `Role`, `Message`, `ToolCall`, `ChatFrame`, and `JinjaChatFrame`.

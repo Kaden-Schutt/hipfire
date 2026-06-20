@@ -2192,7 +2192,7 @@ fn main() {
 
     // Machine-wide mutex — prevents orphan daemons from silently coexisting
     // (observed 2026-04-13: two daemons at 100% CPU survived pkill -f rounds
-    // because they'd been reparented to PID 1 after their bun parent died).
+    // because they'd been reparented to PID 1 after their serve parent died).
     // Kept in a binding so the fd lives for the full process lifetime.
     let _daemon_lock = acquire_daemon_lock();
     let _resource_lease = hipfire_daemon_adapter::acquire_resource_lease_or_exit();
@@ -3279,7 +3279,7 @@ fn main() {
                 // closing the thinking block so the model commits to an
                 // answer with the remaining max_tokens budget. Caught by
                 // Codex stop-time review on 2026-04-28: the field had been
-                // shipping in genParams since cli/index.ts but the daemon
+                // shipping in genParams from the HTTP layer but the daemon
                 // was silently ignoring it, making the new reasoning.effort
                 // / enable_thinking knobs no-ops on the wire.
                 let max_think_tokens = protocol_generate
