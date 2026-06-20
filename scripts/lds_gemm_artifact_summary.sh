@@ -186,6 +186,34 @@ gds_vm_fault_addr() {
     printf '0x%x\n' "$(((raw & 0xffff0000) >> 16))"
 }
 
+gcvm_fault_field() {
+    local value="$1"
+    local mask="$2"
+    local shift="$3"
+    local raw
+    raw="$(hex_to_dec "$value")"
+    [[ -n "$raw" ]] || return 0
+    printf '%u\n' "$(((raw & mask) >> shift))"
+}
+
+gcvm_fault_flags() {
+    local raw
+    local flags=()
+    raw="$(hex_to_dec "$1")"
+    [[ -n "$raw" ]] || return 0
+    # GCVM_L2_PROTECTION_FAULT_STATUS masks from gfx11 gc_11_0_3_sh_mask.h.
+    ((raw & 0x00000001)) && flags+=("MORE_FAULTS")
+    ((raw & 0x0000000e)) && flags+=("WALKER_ERROR")
+    ((raw & 0x000000f0)) && flags+=("PERMISSION_FAULTS")
+    ((raw & 0x00000100)) && flags+=("MAPPING_ERROR")
+    ((raw & 0x00040000)) && flags+=("RW")
+    ((raw & 0x00080000)) && flags+=("ATOMIC")
+    ((raw & 0x01000000)) && flags+=("VF")
+    ((raw & 0x20000000)) && flags+=("PRT")
+    ((raw & 0x40000000)) && flags+=("FED")
+    join_flags "${flags[@]}"
+}
+
 first_artifact_file() {
     local dir="$1"
     local name="$2"
@@ -197,7 +225,7 @@ first_artifact_file() {
     } 2>/dev/null | sort | head -1 || true
 }
 
-printf 'artifact\tvariant\tmode\tlaunches\tshape\tk_limit\tarch\tbuild_only\texit\tsync_failure\thip_error\tgit_commit\tgit_dirty\thipcc\tdriver\tgpu\tsource_sha256\tamdgpu_obj_sha256\tamdgpu_isa_sha256\tdmesg_remove_queue\tdmesg_mode2\tdmesg_gds\tdevcoredump\tisa_files\tamdgpu_isa_norm_sha256\tselected_isa_symbol\tselected_isa_norm_sha256\tdevcore_gfxhub_page_fault\tdevcore_fault_addr\tdevcore_prot_status\tdevcore_gds_protection_fault\tdevcore_gds_vm_protection_fault\tdevcore_gds_flags\tdevcore_gds_addr\tdevcore_gds_vm_flags\tdevcore_gds_vm_vmid\tdevcore_gds_vm_addr\n' >"$TSV"
+printf 'artifact\tvariant\tmode\tlaunches\tshape\tk_limit\tarch\tbuild_only\texit\tsync_failure\thip_error\tgit_commit\tgit_dirty\thipcc\tdriver\tgpu\tsource_sha256\tamdgpu_obj_sha256\tamdgpu_isa_sha256\tdmesg_remove_queue\tdmesg_mode2\tdmesg_gds\tdevcoredump\tisa_files\tamdgpu_isa_norm_sha256\tselected_isa_symbol\tselected_isa_norm_sha256\tdevcore_gfxhub_page_fault\tdevcore_fault_addr\tdevcore_prot_status\tdevcore_gds_protection_fault\tdevcore_gds_vm_protection_fault\tdevcore_gds_flags\tdevcore_gds_addr\tdevcore_gds_vm_flags\tdevcore_gds_vm_vmid\tdevcore_gds_vm_addr\tdevcore_gcvm_flags\tdevcore_gcvm_more_faults\tdevcore_gcvm_walker_error\tdevcore_gcvm_permission_faults\tdevcore_gcvm_mapping_error\tdevcore_gcvm_cid\tdevcore_gcvm_rw\tdevcore_gcvm_atomic\tdevcore_gcvm_vmid\tdevcore_gcvm_vf\tdevcore_gcvm_vfid\tdevcore_gcvm_prt\tdevcore_gcvm_fed\n' >"$TSV"
 
 while IFS= read -r meta; do
     dir="$(dirname "$meta")"
@@ -257,6 +285,19 @@ while IFS= read -r meta; do
     devcore_gds_vm_flags="$(gds_vm_fault_flags "$devcore_gds_vm_pf")"
     devcore_gds_vm_vmid="$(gds_vm_fault_vmid "$devcore_gds_vm_pf")"
     devcore_gds_vm_addr="$(gds_vm_fault_addr "$devcore_gds_vm_pf")"
+    devcore_gcvm_flags="$(gcvm_fault_flags "$devcore_prot_status")"
+    devcore_gcvm_more_faults="$(gcvm_fault_field "$devcore_prot_status" 0x00000001 0)"
+    devcore_gcvm_walker_error="$(gcvm_fault_field "$devcore_prot_status" 0x0000000e 1)"
+    devcore_gcvm_permission_faults="$(gcvm_fault_field "$devcore_prot_status" 0x000000f0 4)"
+    devcore_gcvm_mapping_error="$(gcvm_fault_field "$devcore_prot_status" 0x00000100 8)"
+    devcore_gcvm_cid="$(gcvm_fault_field "$devcore_prot_status" 0x0003fe00 9)"
+    devcore_gcvm_rw="$(gcvm_fault_field "$devcore_prot_status" 0x00040000 18)"
+    devcore_gcvm_atomic="$(gcvm_fault_field "$devcore_prot_status" 0x00080000 19)"
+    devcore_gcvm_vmid="$(gcvm_fault_field "$devcore_prot_status" 0x00f00000 20)"
+    devcore_gcvm_vf="$(gcvm_fault_field "$devcore_prot_status" 0x01000000 24)"
+    devcore_gcvm_vfid="$(gcvm_fault_field "$devcore_prot_status" 0x1e000000 25)"
+    devcore_gcvm_prt="$(gcvm_fault_field "$devcore_prot_status" 0x20000000 29)"
+    devcore_gcvm_fed="$(gcvm_fault_field "$devcore_prot_status" 0x40000000 30)"
     isa_files=0
     if [[ -d "$dir/save-temps" ]]; then
         isa_files="$(find "$dir/save-temps" -maxdepth 1 -type f -name '*.isa.txt' 2>/dev/null | wc -l | tr -d ' ')"
@@ -270,7 +311,7 @@ while IFS= read -r meta; do
     selected_symbol="$(selected_isa_symbol "$variant")"
     selected_isa_norm_sha="$(selected_isa_sha256 "$amdgpu_isa" "$selected_symbol")"
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$rel" "$variant" "$mode" "$launches" "$shape" "$k_limit" "$arch" \
         "$build_only" "$exit_code" "$sync_failure" "$hip_error" "$git_commit" \
         "$git_dirty" "$hipcc" "$driver" "$gpu" "$source_sha" \
@@ -280,7 +321,11 @@ while IFS= read -r meta; do
         "$devcore_gfxhub_pf" "$devcore_fault_addr" "$devcore_prot_status" \
         "$devcore_gds_pf" "$devcore_gds_vm_pf" "$devcore_gds_flags" \
         "$devcore_gds_addr" "$devcore_gds_vm_flags" "$devcore_gds_vm_vmid" \
-        "$devcore_gds_vm_addr" >>"$TSV"
+        "$devcore_gds_vm_addr" "$devcore_gcvm_flags" "$devcore_gcvm_more_faults" \
+        "$devcore_gcvm_walker_error" "$devcore_gcvm_permission_faults" \
+        "$devcore_gcvm_mapping_error" "$devcore_gcvm_cid" "$devcore_gcvm_rw" \
+        "$devcore_gcvm_atomic" "$devcore_gcvm_vmid" "$devcore_gcvm_vf" \
+        "$devcore_gcvm_vfid" "$devcore_gcvm_prt" "$devcore_gcvm_fed" >>"$TSV"
 done < <(find "$ROOT" -type f -name meta.txt | sort)
 
 {
@@ -290,13 +335,13 @@ done < <(find "$ROOT" -type f -name meta.txt | sort)
     echo "- generated: \`$(date -u +%Y-%m-%dT%H:%M:%SZ)\`"
     echo "- tsv: \`$TSV\`"
     echo
-    echo "| artifact | variant | exit | sync failure | git | driver | gpu | src | obj | isa | isa_norm | selected_isa | remove_queue | mode2 | gds | devcoredump | gfxhub_pf | gds_pf | gds_addr | gds_vm_pf | vmid | vm_addr |"
-    echo "|---|---|---:|---|---|---|---|---|---|---|---|---|---:|---:|---:|---:|---:|---|---|---|---:|---|"
+    echo "| artifact | variant | exit | sync failure | git | driver | gpu | src | obj | isa | isa_norm | selected_isa | remove_queue | mode2 | gds | devcoredump | gfxhub_pf | gcvm | gcvm_cid | gcvm_vmid | gds_pf | gds_addr | gds_vm_pf | vmid | vm_addr |"
+    echo "|---|---|---:|---|---|---|---|---|---|---|---|---|---:|---:|---:|---:|---:|---|---:|---:|---|---|---|---:|---|"
     awk -F '\t' 'NR > 1 {
         dirty = ($13 == "1") ? " dirty" : "";
         sync_failure = ($10 == "") ? " " : $10;
-        printf "| `%s` | `%s` | `%s` | %s | `%s%s` | `%s` | `%s` | `%s` | `%s` | `%s` | `%s` | `%s` | %s | %s | %s | %s | %s | `%s` | `%s` | `%s` | %s | `%s` |\n", \
-            $1, $2, $9, sync_failure, $12, dirty, $15, $16, $17, $18, $19, $25, $27, $20, $21, $22, $23, $28, $31, $34, $32, $36, $37;
+        printf "| `%s` | `%s` | `%s` | %s | `%s%s` | `%s` | `%s` | `%s` | `%s` | `%s` | `%s` | `%s` | %s | %s | %s | %s | %s | `%s` | %s | %s | `%s` | `%s` | `%s` | %s | `%s` |\n", \
+            $1, $2, $9, sync_failure, $12, dirty, $15, $16, $17, $18, $19, $25, $27, $20, $21, $22, $23, $28, $38, $43, $46, $31, $34, $32, $36, $37;
     }' "$TSV"
 } >"$MD"
 

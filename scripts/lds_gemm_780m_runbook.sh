@@ -62,6 +62,7 @@ cat <<'EOF'
 # - dmesg_sig compares remove-queue/MODE2/GDS dmesg delta counts.
 # - devcore_sig compares gfxhub page-fault, address/status, and GDS/GDS-VM
 #   protection fault fields from captured devcoredumps.
+# - artifact-summary.tsv also decodes GCVM status into flags, CID, RW, and VMID.
 # - same: summary rows match on the fields the comparator tracks.
 #
 # Local reference signatures from this gfx1103/780M stack:

@@ -149,8 +149,8 @@ The currently promoted standalone GEMM jig lives in the repo:
   artifact path and otherwise produces false codegen-drift reports. Dmesg
   deltas are counted with a multiset difference between `dmesg.before.txt` and
   `dmesg.after.txt`, which handles kernel ring-buffer snapshots while
-  preserving repeated new reset messages. GDS/GDS-VM devcoredump registers are
-  decoded with the gfx11 masks from
+  preserving repeated new reset messages. GFXHUB/GCVM protection status plus
+  GDS/GDS-VM devcoredump registers are decoded with the gfx11 masks from
   `/usr/src/amdgpu-6.19.0-2307534.24.04/amd/include/asic_reg/gc/gc_11_0_3_sh_mask.h`.
 - `scripts/lds_gemm_summary_compare.sh`: read-only TSV comparator for two
   artifact summaries. It compares selected-variant ISA hashes first, then whole
@@ -1583,7 +1583,8 @@ regGDS_PROTECTION_FAULT                             0x3f000007
 regGDS_VM_PROTECTION_FAULT                          0x0fc00113
 ```
 
-Decoded against `gc_11_0_3_sh_mask.h`, the two GDS registers both have
+Decoded against `gc_11_0_3_sh_mask.h`, the GCVM protection status is clear
+(`0x0`) for this captured hipfire-run sample. The two GDS registers both have
 `WRITE_DIS`, `FAULT_DETECTED`, and `GRBM` set. Their decoded address field is
 `0xfc0`; `GDS_VM_PROTECTION_FAULT` reports `VMID=1`.
 
@@ -1619,6 +1620,11 @@ The GDS/GDS-VM protection registers match the earlier hipfire-run failure. The
 fault address differs: the earlier coredump captured address `0x0`, while the
 standalone GEMM captured a concrete process GPUVA-like address. Both paths
 still converge on the same MES reset and GDS protection state.
+The decoded GCVM status for `0x841051` is:
+`MORE_FAULTS,PERMISSION_FAULTS,RW`, `CID=8`, `VMID=8`, with no walker error,
+mapping error, atomic, VF/VFID, PRT, or FED bit set. This gives future
+second-780M comparisons a more precise gfxhub signature than the raw
+protection-status hex alone.
 
 Reduction results after extending the standalone HIP GEMM probe:
 
