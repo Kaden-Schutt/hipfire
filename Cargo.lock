@@ -1644,6 +1644,7 @@ dependencies = [
  "hipfire-prompt",
  "hipfire-runtime",
  "hipfire-state",
+ "hipfire-vision-cache",
  "rdna-compute",
  "serde_json",
  "tracing",

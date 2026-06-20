@@ -51,7 +51,11 @@ impl Gemma3VlBackend {
     /// Encode one image's bytes through SigLIP + projector into `mm_tokens × th`
     /// text-hidden rows on the host (row-major, ready to splice at the image
     /// placeholders). GPU scratch is freed before returning.
-    fn encode_image(&self, gpu: &mut Gpu, bytes: &[u8]) -> Result<Vec<f32>, String> {
+    ///
+    /// `pub` so a caller (the daemon's vision-embedding cache) can encode a
+    /// single frame on a cache miss and splice the cached rows back via
+    /// [`Gemma3VlBackend::serve_with_embeds`].
+    pub fn encode_image(&self, gpu: &mut Gpu, bytes: &[u8]) -> Result<Vec<f32>, String> {
         let patches = preprocess_image_bytes(bytes, &self.vl_cfg.vision)?;
         let vis = vision_forward(gpu, &self.weights.vision, &self.vl_cfg.vision, &patches)
             .map_err(|e| format!("gemma3-vl: vision_forward: {e:?}"))?;
@@ -65,6 +69,65 @@ impl Gemma3VlBackend {
         gpu.free_tensor(img_embeds_gpu)
             .map_err(|e| format!("gemma3-vl: free img_embeds: {e:?}"))?;
         Ok(img_embeds)
+    }
+
+    /// Splice pre-encoded image rows into the prompt and decode. The second half
+    /// of [`ServingBackend::serve`], split out so a caller can supply `img_embeds`
+    /// from a cache (skipping SigLIP+projector on a hit) instead of re-encoding.
+    ///
+    /// `img_embeds` is `n_images * mm_tokens_per_image * text_hidden` row-major
+    /// f32, in image order — exactly what `encode_image` concatenated per image
+    /// produces. Prefill feeds text tokens via `forward_step` and each image
+    /// placeholder the next projected row via `forward_step_with_embed` (no embed
+    /// scaling — projector output is already in the decoder's input space), then
+    /// the shared [`decode_loop`] streams the output.
+    pub fn serve_with_embeds(
+        &mut self,
+        gpu: &mut Gpu,
+        tok: &Tokenizer,
+        ctx: &mut GenerateCtx,
+        img_embeds: &[f32],
+        n_images: usize,
+    ) -> Result<ServeOutcome, String> {
+        let eos = self.text_cfg.eos_token_id;
+        let ids = tok.encode(ctx.prompt);
+        if ids.is_empty() {
+            return Err("gemma3-vl serve: empty prompt after tokenize".to_string());
+        }
+        let th = self.vl_cfg.text_hidden_size;
+        let expected = n_images * self.vl_cfg.mm_tokens_per_image * th;
+        if img_embeds.len() != expected {
+            return Err(format!(
+                "gemma3-vl serve_with_embeds: img_embeds len {} != n_images {} * mm {} * th {} = {}",
+                img_embeds.len(),
+                n_images,
+                self.vl_cfg.mm_tokens_per_image,
+                th,
+                expected,
+            ));
+        }
+        let stream = splice_image_tokens(&self.vl_cfg, &ids, n_images);
+
+        let mut img_row = 0usize;
+        for &id in &stream {
+            if id == self.vl_cfg.image_token_index {
+                let row = &img_embeds[img_row * th..(img_row + 1) * th];
+                forward_step_with_embed(
+                    gpu,
+                    &self.weights.text,
+                    &self.text_cfg,
+                    &mut self.state,
+                    row,
+                )
+                .map_err(|e| format!("gemma3-vl prefill embed splice: {e:?}"))?;
+                img_row += 1;
+            } else {
+                forward_step(gpu, &self.weights.text, &self.text_cfg, &mut self.state, id)
+                    .map_err(|e| format!("gemma3-vl prefill forward_step: {e:?}"))?;
+            }
+        }
+
+        decode_loop(gpu, self, tok, eos, ctx, stream.len(), stream.len())
     }
 }
 
@@ -190,7 +253,7 @@ impl ServingBackend for Gemma3VlBackend {
         }
 
         // Vision: each image → SigLIP → projector → mm text-hidden rows (host),
-        // concatenated in image order.
+        // concatenated in image order, then spliced + decoded.
         let th = self.vl_cfg.text_hidden_size;
         let n_images = ctx.images.len();
         let mut img_embeds: Vec<f32> =
@@ -198,32 +261,7 @@ impl ServingBackend for Gemma3VlBackend {
         for bytes in ctx.images {
             img_embeds.extend(self.encode_image(gpu, bytes)?);
         }
-
-        let stream = splice_image_tokens(&self.vl_cfg, &ids, n_images);
-
-        // Prefill: text tokens via forward_step; each image placeholder consumes
-        // the next projected row via forward_step_with_embed (no embed scaling —
-        // the projector output is already in the decoder's input space).
-        let mut img_row = 0usize;
-        for &id in &stream {
-            if id == self.vl_cfg.image_token_index {
-                let row = &img_embeds[img_row * th..(img_row + 1) * th];
-                forward_step_with_embed(
-                    gpu,
-                    &self.weights.text,
-                    &self.text_cfg,
-                    &mut self.state,
-                    row,
-                )
-                .map_err(|e| format!("gemma3-vl prefill embed splice: {e:?}"))?;
-                img_row += 1;
-            } else {
-                forward_step(gpu, &self.weights.text, &self.text_cfg, &mut self.state, id)
-                    .map_err(|e| format!("gemma3-vl prefill forward_step: {e:?}"))?;
-            }
-        }
-
-        decode_loop(gpu, self, tok, eos, ctx, stream.len(), stream.len())
+        self.serve_with_embeds(gpu, tok, ctx, &img_embeds, n_images)
     }
 
     fn reset_session(&mut self, _gpu: &mut Gpu, _session_id: &str) -> Result<(), String> {

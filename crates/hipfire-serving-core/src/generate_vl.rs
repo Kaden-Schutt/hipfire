@@ -25,7 +25,7 @@ use hipfire_generate::loop_guard::StopReason;
 use hipfire_generate::sampler::SamplerConfig;
 use hipfire_generate::{GenerateVLParams, ImageSource};
 use hipfire_prompt as prompt_frame;
-use hipfire_runtime::arch::{GenerateCtx, ServingBackend};
+use hipfire_runtime::arch::GenerateCtx;
 use hipfire_runtime::llama;
 use hipfire_runtime::sampler;
 
@@ -933,20 +933,19 @@ pub fn decode_vl_frames(
 /// Gemma3-VL (medgemma, arch_id=13) generate path.
 ///
 /// Builds the gemma3 chat-framed prompt with one `<start_of_image>` marker per
-/// frame (HF wraps every image as `\n\n<start_of_image>\n\n`), then hands the raw
-/// frame bytes to [`Gemma3VlBackend::serve`] via [`GenerateCtx`]. `serve` encodes
-/// each frame through SigLIP + projector, splices the projected rows at the image
-/// placeholders during prefill (`splice_image_tokens` expands every marker into
-/// `[boi, image_soft_token×mm, eoi]`, or front-prepends the blocks if the
-/// tokenizer didn't surface the marker), and streams the daemon's exact
-/// `token`/`done` schema through the shared greedy `decode_loop`.
+/// frame (HF wraps every image as `\n\n<start_of_image>\n\n`). Each frame's
+/// projected rows are resolved through the **vision-embedding cache** (Goal 1):
+/// `xxh64(frame bytes)` namespaced by the model + vision-config identity → on a
+/// hit the SigLIP + projector encode is skipped entirely; on a miss the frame is
+/// encoded via [`Gemma3VlBackend::encode_image`] and inserted. The concatenated
+/// rows are spliced + decoded by [`Gemma3VlBackend::serve_with_embeds`], which
+/// streams the daemon's exact `token`/`done` schema through `decode_loop`.
 ///
 /// `frames` is daemon-decoded (see [`decode_vl_frames`]): one raw encoded image
 /// per image/video-frame, in order. `params.image_source` is unused here (the
 /// bytes arrive via `frames`); the rest of `params` supplies id/prompt/system/
-/// sampling. Decode is greedy (`decode_loop`); the repeat-penalty / loop-guard
-/// sampler migration tracked on `decode_loop` is a follow-up, so near-duplicate
-/// frames under greedy can still attractor — validate with distinct frames.
+/// sampling. Decode uses `decode_loop` with `params.repeat_penalty` (the daemon
+/// defaults arch 13 to 1.3), which breaks the near-duplicate-frame attractor.
 pub fn generate_vl_gemma3(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -985,10 +984,71 @@ pub fn generate_vl_gemma3(
         );
         return;
     }
+    // Model identity for the cache namespace (captured before the backend borrow).
+    let model_path = m.model_path.clone();
     let tok = m.tokenizer.as_ref().unwrap();
     let backend = m.gemma3_vl.as_mut().unwrap();
 
-    let images: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+    let th = backend.vl_cfg.text_hidden_size;
+    let mm = backend.vl_cfg.mm_tokens_per_image;
+    let n_images = frames.len();
+
+    // Vision-embedding cache (Goal 1): key = xxh64(frame bytes) namespaced by the
+    // model + vision-config identity, so cached projected rows never alias across
+    // models/towers. A hit skips SigLIP + projector entirely for that frame.
+    let cache = open_vision_cache();
+    let namespace = {
+        let vc = &backend.vl_cfg;
+        format!(
+            "{model_path}|gemma3vl|img{}|p{}|mm{}|th{}",
+            vc.vision.image_size, vc.vision.patch_size, vc.mm_tokens_per_image, vc.text_hidden_size
+        )
+    };
+
+    let mut img_embeds: Vec<f32> = Vec::with_capacity(n_images * mm * th);
+    let mut hits = 0usize;
+    for frame in frames {
+        let key = cache
+            .as_ref()
+            .map(|_| hipfire_vision_cache::CacheKey::new(&namespace, frame.as_slice()));
+        // Probe: on a hit, splice the cached rows and skip the encode.
+        if let (Some(c), Some(k)) = (cache.as_ref(), key.as_ref()) {
+            match c.get(k) {
+                Ok(Some(emb)) => {
+                    img_embeds.extend_from_slice(&emb.data);
+                    hits += 1;
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("[gemma3-vl] vision cache get failed: {e}"),
+            }
+        }
+        // Miss (or cache disabled): encode through SigLIP + projector, then insert.
+        let rows = match backend.encode_image(gpu, frame.as_slice()) {
+            Ok(r) => r,
+            Err(e) => {
+                write_error(stdout, id, &format!("gemma3-vl encode: {e}"));
+                return;
+            }
+        };
+        if let (Some(c), Some(k)) = (cache.as_ref(), key.as_ref()) {
+            let emb = hipfire_vision_cache::CachedEmbedding::new(mm, th, rows.clone());
+            if let Err(e) = c.insert(k, &emb) {
+                eprintln!("[gemma3-vl] vision cache insert failed: {e}");
+            }
+        }
+        img_embeds.extend_from_slice(&rows);
+    }
+    if let Some(c) = cache.as_ref() {
+        let s = c.stats();
+        eprintln!(
+            "[gemma3-vl] vision cache: {hits}/{n_images} frame(s) hit (lifetime hits={}, misses={})",
+            s.hits, s.misses
+        );
+    }
+
+    // `serve_with_embeds` consumes `img_embeds` directly and ignores `ctx.images`.
+    let no_images: [&[u8]; 0] = [];
     let mut ctx = GenerateCtx {
         id,
         prompt: &framed,
@@ -1001,14 +1061,45 @@ pub fn generate_vl_gemma3(
         frequency_penalty: 0.0,
         max_think_tokens: params.max_think_tokens,
         stop_sequences: &[],
-        images: &images,
+        images: &no_images,
         sink: stdout,
     };
-    let result = backend.serve(gpu, tok, &mut ctx);
+    let result = backend.serve_with_embeds(gpu, tok, &mut ctx, &img_embeds, n_images);
     // `ctx` mutably borrows `stdout`; drop it before reusing `stdout` for errors.
     drop(ctx);
     if let Err(e) = result {
         write_error(stdout, id, &format!("gemma3-vl serve: {e}"));
+    }
+}
+
+/// Open the vision-embedding cache from the environment, or `None` when disabled
+/// / unopenable. `HIPFIRE_VISION_CACHE=0` disables it;
+/// `HIPFIRE_VISION_CACHE_DIR` overrides the path (default
+/// `${HIPFIRE_DIR:-$HOME/.hipfire}/cache/vision`);
+/// `HIPFIRE_VISION_CACHE_MAX_BYTES` sets the byte budget (default 4 GiB).
+fn open_vision_cache() -> Option<hipfire_vision_cache::VisionCache> {
+    if std::env::var("HIPFIRE_VISION_CACHE").ok().as_deref() == Some("0") {
+        return None;
+    }
+    let dir = std::env::var("HIPFIRE_VISION_CACHE_DIR").unwrap_or_else(|_| {
+        let base = std::env::var("HIPFIRE_DIR").unwrap_or_else(|_| {
+            format!(
+                "{}/.hipfire",
+                std::env::var("HOME").unwrap_or_else(|_| ".".into())
+            )
+        });
+        format!("{base}/cache/vision")
+    });
+    let max_bytes = std::env::var("HIPFIRE_VISION_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(4 * 1024 * 1024 * 1024);
+    match hipfire_vision_cache::VisionCache::open(&dir, max_bytes) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!("[gemma3-vl] vision cache disabled (open '{dir}' failed: {e})");
+            None
+        }
     }
 }
 
