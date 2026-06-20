@@ -183,6 +183,16 @@ The currently promoted standalone GEMM jig lives in the repo:
   for the LDS-only long-loop probe. It defaults to `SINGLE_INSTANTIATION=1`
   and writes per-symbol size, instruction, DS, barrier, wait, exec-mask,
   global-store, and code-object resource metadata.
+- `scripts/lds_direct_ab_phase_probe.hip`: promoted direct-AB no-output
+  reduced repro. It keeps two LDS arrays and repeated active-lane reads while
+  removing GEMM global-memory traffic.
+- `scripts/lds_direct_ab_multi_exec_parent.cpp`: parent process that runs the
+  phase probe through one or more fork/exec children so child-local launch
+  sequence length can be separated from total parent-supervised work.
+- `scripts/lds_direct_ab_multi_exec_matrix.sh`: build/run wrapper for the
+  direct-AB multi-exec repro. It defaults to `BUILD_ONLY=1`, compiles the child
+  and parent, captures ISA/readobj artifacts, and does not launch the risky
+  repro unless `BUILD_ONLY=0` is explicitly set.
 - `tests/gfx1103-lds-tail-snop-repro.sh`: focused cross-system pass/fail
   wrapper for a second 780M. The default `PROFILE=repro` checks the no-extra
   baseline against the tail-loop `s_nop` repro and writes a TSV report under
@@ -2387,6 +2397,46 @@ control):
 - rerun the passing long-loop symbol on the second 780M only if its compile-only
   ISA/resource rows drift from the local reference; the source and summarizer
   are now promoted in `scripts/`.
+
+### Promoted Direct-AB Multi-Exec Jig
+
+The strongest no-output reduced repro is now promoted into the repo:
+
+```bash
+# Safe: build child/parent and capture ISA/readobj only.
+BUILD_ONLY=1 scripts/lds_direct_ab_multi_exec_matrix.sh /tmp/hipfire-lds-direct-ab-promoted
+
+# Risky: one child at the known reads=3 / 448-iteration / 512x86 edge.
+BUILD_ONLY=0 CHUNKS=101 GRID_X=512 GRID_Y=86 \
+  scripts/lds_direct_ab_multi_exec_matrix.sh /tmp/hipfire-lds-direct-ab-promoted
+
+# Risky control: same total split across child processes.
+BUILD_ONLY=0 CHUNKS=96,5 GRID_X=512 GRID_Y=86 \
+  scripts/lds_direct_ab_multi_exec_matrix.sh /tmp/hipfire-lds-direct-ab-promoted
+```
+
+Validation on this checkout:
+
+```text
+BUILD_ONLY=1 scripts/lds_direct_ab_multi_exec_matrix.sh /tmp/hipfire-lds-direct-ab-promote-buildonly
+```
+
+The build-only artifact
+`/tmp/hipfire-lds-direct-ab-promote-buildonly/a6x6_b6x6_r3_i448_chunks96_5_multi_plain_g512x86/`
+compiled both binaries and captured the expected direct-AB kernel metadata:
+`group_segment_fixed_size=288`, `sgpr_count=2`, `vgpr_count=34`,
+`wavefront_size=32`.
+
+The earlier reads=6 / 192-iteration / 511x86 edge also compiles from the
+promoted source in build-only mode:
+
+```text
+READS=6 ITERS=192 CHUNKS=98,2 GRID_X=511 GRID_Y=86 BUILD_ONLY=1 \
+  scripts/lds_direct_ab_multi_exec_matrix.sh /tmp/hipfire-lds-direct-ab-promote-r6-buildonly
+```
+
+Its build-only artifact captured `group_segment_fixed_size=288`,
+`sgpr_count=2`, `vgpr_count=52`, and `wavefront_size=32`.
 
 ### Additional Sequence Sweep (Fresh)
 
