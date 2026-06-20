@@ -1985,6 +1985,11 @@ enum QuantType {
     /// the fused `gemv_qtip3g256` kernel (computed 1MAD codebook, zero LDS); the
     /// runtime FWHT-rotates x (shared mq_rotate_x path). See qtip.rs / Phase C2.
     Qtip3G256 = 31,
+    /// Opus Quant W4A4 — symmetric signed-INT4, FWHT-rotated, per-group f32
+    /// scale. On-disk block = [f16 scale][128 nibbles] = 130 B/256-group
+    /// (codec `quantize_oq4g256`). Loader (qwen35 qt=32) repacks to the kernel
+    /// layout; forward int4-quantizes activations and runs the iu4·iu4 GEMM.
+    Oq4G256 = 32,
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -2900,6 +2905,7 @@ enum HfqInputFormat {
     Mq6,
     Mq3,
     Qtip3,
+    Oq4,
 }
 
 impl HfqInputFormat {
@@ -2914,6 +2920,7 @@ impl HfqInputFormat {
             "mq6" | "mq6g256" => Some(Self::Mq6),
             "mq3" | "mq3g256" => Some(Self::Mq3),
             "qtip3" => Some(Self::Qtip3),
+            "oq4" | "oq4g256" | "opus" => Some(Self::Oq4),
             _ => None,
         }
     }
@@ -3067,6 +3074,21 @@ fn quantize_hfq_source_tensor(
                 QuantType::MQ3G256,
                 256,
                 "MQ3G256",
+            )
+        }
+        HfqInputFormat::Oq4 => {
+            // Opus Quant W4A4. Requires 256-aligned K (FWHT-256); ragged dims fall
+            // back to Q8. Rotation-only here (no AWQ smooth on the HFQ-source path);
+            // the awq_scale sidecar / SmoothQuant lever lands with the safetensors
+            // emit path. Loader is qwen35 qt=32; forward int4-quantizes activations.
+            if k % 256 != 0 {
+                return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
+            }
+            (
+                quantize_oq4g256(&f32_data, &signs1, &signs2),
+                QuantType::Oq4G256,
+                256,
+                "OQ4G256",
             )
         }
         HfqInputFormat::F16 | HfqInputFormat::Bf16 | HfqInputFormat::Qtip3 => unreachable!(),
@@ -4413,7 +4435,7 @@ INPUT SOURCES (--input):
     <file.gguf>   a single GGUF file
     <file.hfq>    an existing .hfq (e.g. a bf16 .hfq) for requantization.
                   The .hfq-source path supports --format
-                  bf16 / fp16 / q8f16 / hfq4 / hfq6 / mq4 / mq6 / mq3 / qtip3.
+                  bf16 / fp16 / q8f16 / hfq4 / hfq6 / mq4 / mq6 / mq3 / qtip3 / oq4.
                   Other formats (roughquant, lloyd-*, mfp4, …) require a HF/GGUF source.
 
 REQUIRED:
@@ -4423,6 +4445,7 @@ REQUIRED:
 FORMAT (--format <FMT>, default: q8f16):
     Full precision     bf16 (bfloat16) · fp16 (f16/float16) · f32 (oracle/passthrough)
     Production quant   q8f16 (q8) · mq4 (magnum) · mq6 · mq3 · hfq4 · hfq6 · mfp4 (hfp4g32) · q8hfq
+    Opus W4A4          oq4 (opus) — symmetric int4 weights + int4 activations (.hfq-source path)
     MoE / routed       mq4-mq6exp · mq4-routed-lloyd-mq-tiered (needs --imatrix) · antirez-mq · …
     Research (gated)   mq2 · lloyd-mq2 · lloyd-mq3 · lloyd-mq4 · qtip3 · qtip3-sim ·
                        roughquant (rq) · roughquant{{2,3,4}}-sim · permute5 (rq5)
