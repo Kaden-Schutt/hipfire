@@ -1571,8 +1571,18 @@ Latest artifact paths:
   sync/global launches 98-99 with the same `0x841051` GCVM and GDS/GDS-VM
   signature. The inactive-lane control compiles differently
   (`sgpr=5`, `vgpr=15`, `isa_s_barrier=4`, `isa_ds=14`, `isa_s_cbranch=5`),
-  so treat it specifically as evidence that a two-wave workgroup/barrier with
-  only 32 LDS-active lanes is not sufficient.
+  so it is not an ISA-matched replacement for the all-active shape comparisons.
+- A follow-up traffic-mask replay
+  (`/tmp/hipfire-lds-direct-ab-traffic-idle-artifacts/`, throwaway worktree
+  `/tmp/hipfire-lds-direct-ab-traffic-1781923745`) found that this inactive-wave
+  style control is itself state-sensitive. `9x4` active/block/layout with only
+  `8x4` LDS traffic and no extra active-lane arithmetic failed at sync/global
+  launch 100 with the same GCVM/GDS signature. Its normalized ISA hash and
+  resource tuple match the earlier passing `8x4`-active-inside-`9x4`-block
+  row (`isa_norm=9e53a96d22d0a718`, `sgpr=5`, `vgpr=15`, `barrier=4`,
+  `ds=14`, `wait=8`, `branch=5`, `offset1=36`), so do not use the earlier
+  pass as a stable disproof that a two-wave block/barrier can enter the failure
+  family after reset pressure.
 
 ## Current Narrowing
 
@@ -1886,13 +1896,13 @@ Reduction results after extending the standalone HIP GEMM probe:
   `offset1=36` as failing `6x6`. The load-bearing condition is now better
   stated as two-wave active direct-AB LDS traffic plus enough repeated
   launch/grid work, not LDS footprint or A/B base spacing alone.
-- The inactive-second-wave control sharpens "two-wave active": `8x4` active
-  lanes inside a `9x4` block with the same `288 B` layout and `offset1=36`
-  passed, while all-active `9x4` failed in the same artifact root. That rules
-  out a two-wave workgroup or barrier alone as sufficient; lanes in the second
-  wave have to participate in the LDS traffic. The compiler emits fewer
-  barriers/DS ops for the inactive-lane source, so this does not replace the
-  all-active shape comparisons, but it does constrain the trigger.
+- The inactive-second-wave controls are mixed after reset pressure. The first
+  `8x4`-active-inside-`9x4` run passed while all-active `9x4` failed, but a
+  later traffic-mask replay with the same normalized ISA/resource tuple failed
+  with the canonical signature. This weakens any claim that two-wave
+  workgroup/barrier participation is harmless by itself. The more stable
+  all-active evidence remains the 32/33 active-lane boundary: <=32 active lanes
+  pass at the tested edge, while 33+ all-active lanes fail.
 - Phase-mode controls sharpen the process-boundary result. With the same
   direct-AB kernel body at reads=6/192/511x86, same-process `99 + 1` fails on
   phase2 launch 0 / global launch 99, and same-process `98 + 2` fails on
@@ -2277,7 +2287,7 @@ LDS-only control:
 | direct-AB multi-exec `7x5`/`5x7` block, reads=3, 448 iters, 512x86, one child `150` | FAIL at sync/global launch 98-99 | `_Z25lds_direct_ab_phase_probev` | 284 B | 34 | 2 | 0 | 32 |
 | direct-AB multi-exec `6x6` block, reads=3, 448 iters, 512x86, one child `150` | FAIL at sync/global launch 99 | `_Z25lds_direct_ab_phase_probev` | 288 B | 34 | 2 | 0 | 32 |
 | direct-AB multi-exec `8x4` active / `9x4` layout and `4x8` active / `4x9` layout, reads=3, 448 iters, 512x86, one child `150` | PASS | `_Z25lds_direct_ab_phase_probev` | 288 B | 34 | 2 | 0 | 32 |
-| direct-AB multi-exec `8x4` active inside `9x4` block/layout, reads=3, 448 iters, 512x86, one child `150` | PASS; all-active `9x4` failed at sync/global launch 98 | `_Z25lds_direct_ab_phase_probev` | 288 B | 15 | 5 | 0 | 32 |
+| direct-AB multi-exec `8x4` active inside `9x4` block/layout, reads=3, 448 iters, 512x86, one child `150` | MIXED: initial pass; later same-ISA traffic-mask replay failed at sync/global launch 100; all-active `9x4` failed at 98 | `_Z25lds_direct_ab_phase_probev` | 288 B | 15 | 5 | 0 | 32 |
 | direct-AB no-output `8x4` active in `8x5` block, reads=6 | PASS at 512 iterations / 512x86 | `_Z19lds_direct_ab_probev` | 256 B | 22 | 5 | 0 | 32 |
 
 ISA observations:
