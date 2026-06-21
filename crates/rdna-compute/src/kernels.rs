@@ -3752,6 +3752,12 @@ pub const KVARN_QUANTIZE_TILE_SRC: &str =
 pub const KVARN_DEQUANT_TILE_SRC: &str =
     include_str!("../../../kernels/src/kvarn_dequant_tile.hip");
 
+/// KVarN write-side gather (Phase D1 #2): transpose a contiguous run of
+/// token-major K rows into the channel-major `[head_dim × GROUP]` tiles that
+/// `kvarn_quantize_tile` consumes. See `kernels/src/kvarn_gather_k_tiles.hip`.
+pub const KVARN_GATHER_K_TILES_SRC: &str =
+    include_str!("../../../kernels/src/kvarn_gather_k_tiles.hip");
+
 // Generic kernel library GEMV tier (gfx1103 wave32, zero LDS, wave-shuffle
 // reduction; one wave per output row). Same-dtype weight/vector inputs.
 // See `docs/kernels/generic-kernel-library.md`.

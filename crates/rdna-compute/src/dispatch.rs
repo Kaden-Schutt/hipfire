@@ -45382,6 +45382,53 @@ impl Gpu {
         }
     }
 
+    /// KVarN write-side gather: transpose a contiguous run of `n_blocks` token-
+    /// major K blocks (`k` = [n_blocks*group, kv_dim] f32) into the channel-major
+    /// `[head_dim × group]` tiles `kvarn_quantize_tile` expects (`tiles` =
+    /// [n_blocks*n_kv_heads, head_dim*group] f32). Caller then runs
+    /// `kvarn_quantize_tile` over `tiles` to fill the records. One block per tile.
+    pub fn kvarn_gather_k_tiles(
+        &mut self,
+        k: &GpuTensor,
+        tiles: &GpuTensor,
+        n_blocks: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "kvarn_gather_k_tiles",
+            kernels::KVARN_GATHER_K_TILES_SRC,
+            "kvarn_gather_k_tiles",
+        )?;
+        let kp = k.buf.as_ptr();
+        let tp = tiles.buf.as_ptr();
+        let mut nb = n_blocks as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut gp = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &kp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &mut nb as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut gp as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions["kvarn_gather_k_tiles"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [(n_blocks * n_kv_heads) as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Opus Quant W4A4 fused Gate+Up: gate_proj + up_proj grouped-iu4 GEMMs in
     /// one launch sharing the int4 activation (`xq`/`xs`). Each weight buffer is
     /// the combined `[nibbles | f32 scales]` layout (scales addressed internally
