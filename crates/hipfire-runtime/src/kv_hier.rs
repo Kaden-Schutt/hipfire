@@ -91,6 +91,18 @@ impl HierKvState {
             .unwrap_or(128usize)
             .min(hot_budget / 2)
             .max(1);
+        // Cold-tier compaction knobs. fold_m=1 disables the m:1 merge (cold = pure
+        // 4-bit KVarN, no token reduction, no RoPE-phase blur); higher = more
+        // compression but more blur. core_frac keeps the top fraction exact (1 slot).
+        let fold_m = std::env::var("HIPFIRE_KV_FOLD_M")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4usize)
+            .max(1);
+        let core_frac = std::env::var("HIPFIRE_KV_CORE_FRAC")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.125f32);
         let mut hot_k = Vec::with_capacity(n_layers);
         let mut hot_v = Vec::with_capacity(n_layers);
         if enabled {
@@ -103,8 +115,8 @@ impl HierKvState {
             enabled,
             hot_budget,
             migrate_batch,
-            core_frac: 0.125,
-            fold_m: 4,
+            core_frac,
+            fold_m,
             n_heads,
             n_kv_heads,
             hot_k,
