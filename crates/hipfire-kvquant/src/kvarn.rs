@@ -242,7 +242,7 @@ pub fn kvarn_record_bytes(r_dim: usize, c_dim: usize) -> usize {
 }
 
 // Reuse the crate's tested f16 conversions (handle subnormals/inf correctly).
-use crate::{f16_to_f32 as f16_bits_to_f32, f32_to_f16 as f32_to_f16_bits};
+use crate::conv::{f16_to_f32 as f16_bits_to_f32, f32_to_f16 as f32_to_f16_bits};
 
 /// Pack a `QuantTile` into its on-device record (4-bit q + fp16 metadata).
 pub fn pack_kvarn_tile(qt: &QuantTile) -> Vec<u8> {

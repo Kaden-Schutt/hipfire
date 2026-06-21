@@ -38,6 +38,7 @@ members = [
     "crates/hipfire-arch-minimax",
     "crates/hipfire-arch-dots-ocr",
     "crates/hipfire-quantize",
+    "crates/hipfire-kvquant",
     "crates/hipfire-detect",
     "crates/hipfire-atlas",
     "crates/hipfire-cli",

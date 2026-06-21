@@ -20,7 +20,7 @@
 #![allow(dead_code)]
 
 use crate::kvarn::{self, QuantTile};
-use crate::{cpu_fwht_256, gen_fwht_signs};
+use crate::fwht::{cpu_fwht_256, gen_fwht_signs};
 
 /// One compacted cold buffer for a contiguous range of (old) cold tokens. Slot
 /// structure is SHARED across kv-heads (CASK ranks tokens with a head-aggregated

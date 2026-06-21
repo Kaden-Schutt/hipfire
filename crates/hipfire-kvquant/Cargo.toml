@@ -1,0 +1,10 @@
+[package]
+name = "hipfire-kvquant"
+version.workspace = true
+edition.workspace = true
+
+# Leaf crate (no hipfire deps): the KVarN codec + deferred cold-tier compaction,
+# shared by the hipfire-quantize bin (offline) and the engine (runtime read path).
+
+[lib]
+path = "src/lib.rs"
