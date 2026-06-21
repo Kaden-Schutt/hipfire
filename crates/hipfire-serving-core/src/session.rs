@@ -143,6 +143,8 @@ impl Qwen35RequestSessionState {
             quant_fwht: kv.quant_fwht,
             layer_is_boundary: kv.layer_is_boundary.clone(),
             compact_offset: kv.compact_offset,
+            quant_kvarn: kv.quant_kvarn,
+            k_window: Self::clone_gpu_tensor_vec(gpu, &kv.k_window, "kv.k_window")?,
         })
     }
 
