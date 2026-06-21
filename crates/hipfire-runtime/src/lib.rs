@@ -34,6 +34,7 @@ pub mod hfq;
 pub mod hfq_modules;
 pub mod host_profile;
 pub mod kv;
+pub mod kv_hier;
 pub mod llama;
 pub mod logging;
 pub mod loop_guard;
