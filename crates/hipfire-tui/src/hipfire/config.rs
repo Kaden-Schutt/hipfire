@@ -183,7 +183,7 @@ fn load_remote_schema(host: &str, port: u16) -> (Option<usize>, Option<String>) 
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_millis(450))
         .build();
-    match agent.get(&url).call() {
+    match super::authorize_admin(agent.get(&url)).call() {
         Ok(resp) => match resp
             .into_string()
             .ok()
@@ -215,8 +215,7 @@ fn load_remote_resolved(host: &str, port: u16) -> Result<RemoteResolvedConfig, S
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_millis(650))
         .build();
-    let body = agent
-        .get(&url)
+    let body = super::authorize_admin(agent.get(&url))
         .call()
         .map_err(|err| format!("resolved config unavailable: {err}"))?
         .into_string()

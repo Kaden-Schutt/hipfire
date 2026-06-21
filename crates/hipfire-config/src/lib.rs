@@ -10,7 +10,7 @@ pub mod schema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub use resolve::{
     config_layers_from_document, config_layers_from_documents, resolve_config_layers, ConfigLayer,
@@ -29,6 +29,9 @@ fn default_port() -> u16 {
 }
 fn default_cors_allowed_origins() -> Vec<String> {
     Vec::new()
+}
+fn default_admin_user() -> String {
+    "admin".to_string()
 }
 fn default_max_seq() -> u32 {
     4096
@@ -144,6 +147,11 @@ pub struct HipfireConfig {
     /// allows any origin; otherwise an explicit allowlist of origins.
     #[serde(default = "default_cors_allowed_origins")]
     pub cors_allowed_origins: Vec<String>,
+    /// Username required to log into the `/admin` console. The password is
+    /// not stored here — set it with `hipfire admin set-password` (hash
+    /// lands in `~/.hipfire/admin.passwd`).
+    #[serde(default = "default_admin_user")]
+    pub admin_user: String,
     #[serde(default)]
     pub default_model: Option<String>,
     #[serde(default = "default_max_seq")]
@@ -314,6 +322,7 @@ impl Default for HipfireConfig {
             host: default_host(),
             port: default_port(),
             cors_allowed_origins: default_cors_allowed_origins(),
+            admin_user: default_admin_user(),
             default_model: None,
             max_seq: default_max_seq(),
             max_tokens: default_max_tokens(),
@@ -374,6 +383,125 @@ pub fn host_config_path() -> PathBuf {
 
 pub fn models_dir() -> PathBuf {
     hipfire_dir().join("models")
+}
+
+/// Path to the local admin bearer secret. Same-box clients (CLI/TUI) read
+/// this file and present it as `Authorization: Bearer <secret>` to skip the
+/// `/admin` login flow — "can read the file ⇒ you're the admin".
+pub fn admin_secret_path() -> PathBuf {
+    hipfire_dir().join("admin.secret")
+}
+
+/// Path to the argon2id hash of the `/admin` console password, written by
+/// `hipfire admin set-password`.
+pub fn admin_password_path() -> PathBuf {
+    hipfire_dir().join("admin.passwd")
+}
+
+/// Read the local admin bearer secret if it exists. Read-only: never creates
+/// the file (only the daemon does that, via [`ensure_admin_secret`]).
+pub fn read_admin_secret() -> Option<String> {
+    let secret = std::fs::read_to_string(admin_secret_path()).ok()?;
+    let secret = secret.trim().to_string();
+    (!secret.is_empty()).then_some(secret)
+}
+
+/// Read-or-create the local admin bearer secret (0600). Called by the daemon
+/// at startup so same-box CLI/TUI clients can authenticate without a password.
+pub fn ensure_admin_secret() -> std::io::Result<String> {
+    if let Some(existing) = read_admin_secret() {
+        return Ok(existing);
+    }
+    let path = admin_secret_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let secret = random_token();
+    write_private(&path, &secret)?;
+    Ok(secret)
+}
+
+/// Hash a password with argon2id (PHC string) and persist it to
+/// `admin.passwd` (0600). Used by `hipfire admin set-password`.
+pub fn set_admin_password(password: &str) -> std::io::Result<()> {
+    let hash = hash_admin_password(password)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+    let path = admin_password_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    write_private(&path, &hash)
+}
+
+/// Load the stored argon2id password hash, if a password has been set.
+pub fn read_admin_password_hash() -> Option<String> {
+    let hash = std::fs::read_to_string(admin_password_path()).ok()?;
+    let hash = hash.trim().to_string();
+    (!hash.is_empty()).then_some(hash)
+}
+
+/// Compute an argon2id PHC hash string for `password`.
+pub fn hash_admin_password(password: &str) -> Result<String, String> {
+    use argon2::password_hash::{PasswordHasher, SaltString};
+    use argon2::Argon2;
+    let salt = SaltString::encode_b64(&random_bytes::<16>()).map_err(|err| err.to_string())?;
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|err| err.to_string())
+}
+
+/// Verify `password` against a stored argon2id PHC hash.
+pub fn verify_admin_password(password: &str, phc_hash: &str) -> bool {
+    use argon2::password_hash::{PasswordHash, PasswordVerifier};
+    use argon2::Argon2;
+    let Ok(parsed) = PasswordHash::new(phc_hash) else {
+        return false;
+    };
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok()
+}
+
+/// Constant-time comparison of a presented bearer secret against the stored
+/// one. An empty stored secret never authorizes.
+pub fn verify_admin_secret(presented: &str, stored: &str) -> bool {
+    if stored.is_empty() {
+        return false;
+    }
+    let a = presented.as_bytes();
+    let b = stored.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn random_token() -> String {
+    random_bytes::<32>()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn random_bytes<const N: usize>() -> [u8; N] {
+    let mut bytes = [0u8; N];
+    getrandom::getrandom(&mut bytes).expect("getrandom failed");
+    bytes
+}
+
+fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    std::fs::write(path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 pub fn load_config_bundle() -> LoadedConfig {
@@ -574,6 +702,7 @@ mod tests {
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.port, 11435);
         assert!(cfg.cors_allowed_origins.is_empty());
+        assert_eq!(cfg.admin_user, "admin");
         assert_eq!(cfg.max_seq, 4096);
         assert_eq!(cfg.max_tokens, 512);
         assert_eq!(cfg.temperature, 0.3);
@@ -610,6 +739,24 @@ mod tests {
         assert_eq!(cfg.prefill_drafter_device, -1);
         assert!(!cfg.prefill_profile);
         assert_eq!(cfg.prefill_sparse_threshold, 32768);
+    }
+
+    #[test]
+    fn admin_password_hash_round_trips() {
+        let hash = hash_admin_password("hunter2").expect("hash");
+        assert!(hash.starts_with("$argon2"));
+        assert!(verify_admin_password("hunter2", &hash));
+        assert!(!verify_admin_password("wrong", &hash));
+        assert!(!verify_admin_password("hunter2", "not-a-phc-string"));
+    }
+
+    #[test]
+    fn admin_secret_compare_is_exact_and_rejects_empty() {
+        assert!(verify_admin_secret("abc123", "abc123"));
+        assert!(!verify_admin_secret("abc123", "abc124"));
+        assert!(!verify_admin_secret("abc", "abc123"));
+        assert!(!verify_admin_secret("", ""));
+        assert!(!verify_admin_secret("anything", ""));
     }
 
     #[test]

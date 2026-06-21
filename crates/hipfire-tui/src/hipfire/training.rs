@@ -82,8 +82,7 @@ fn load_remote(config: &ConfigState) -> Result<TrainingState, String> {
         config.probe_host(),
         config.port
     );
-    let body = agent()
-        .get(&url)
+    let body = super::authorize_admin(agent().get(&url))
         .call()
         .map_err(|err| err.to_string())?
         .into_string()
@@ -109,8 +108,7 @@ fn load_remote_detail(config: &ConfigState, run_id: &str) -> Result<TrainingRunD
         config.port,
         run_id
     );
-    let body = agent()
-        .get(&url)
+    let body = super::authorize_admin(agent().get(&url))
         .call()
         .map_err(|err| err.to_string())?
         .into_string()

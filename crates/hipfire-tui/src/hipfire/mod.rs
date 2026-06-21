@@ -10,6 +10,16 @@ pub mod training;
 
 use std::{env, path::PathBuf};
 
+/// Attach the local admin bearer secret to a request bound for a gated
+/// `/admin/*` endpoint, so the TUI authenticates the same way the CLI does.
+/// No-op when the secret file is absent (e.g. daemon never started).
+pub fn authorize_admin(request: ureq::Request) -> ureq::Request {
+    match hipfire_config::read_admin_secret() {
+        Some(secret) => request.set("Authorization", &format!("Bearer {secret}")),
+        None => request,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct HipfirePaths {
     pub root: PathBuf,

@@ -25,6 +25,7 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire admin diagnostics`↴](#hipfire-admin-diagnostics)
 * [`hipfire admin logs`↴](#hipfire-admin-logs)
 * [`hipfire admin get`↴](#hipfire-admin-get)
+* [`hipfire admin set-password`↴](#hipfire-admin-set-password)
 
 ## `hipfire`
 
@@ -190,6 +191,7 @@ Query the running hipfire admin API for scripts and agents
 * `diagnostics` — Filesystem, binary, kernel-cache, lock, and log diagnostics
 * `logs` — Tail known hipfire logs
 * `get` — GET an arbitrary admin/server path, e.g. /admin/training/runs
+* `set-password` — Set the /admin console password (argon2id hash -> ~/.hipfire/admin.passwd)
 
 ###### **Options:**
 
@@ -302,6 +304,18 @@ GET an arbitrary admin/server path, e.g. /admin/training/runs
 ###### **Arguments:**
 
 * `<PATH>` — Absolute or relative server path
+
+
+
+## `hipfire admin set-password`
+
+Set the /admin console password (argon2id hash -> ~/.hipfire/admin.passwd)
+
+**Usage:** `hipfire admin set-password [PASSWORD]`
+
+###### **Arguments:**
+
+* `<PASSWORD>` — New password. If omitted, read once from stdin (no echo when a TTY)
 
 
 

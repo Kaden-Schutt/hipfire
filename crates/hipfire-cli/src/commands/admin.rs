@@ -73,6 +73,11 @@ pub enum AdminCommand {
         /// Absolute or relative server path
         path: String,
     },
+    /// Set the /admin console password (argon2id hash -> ~/.hipfire/admin.passwd)
+    SetPassword {
+        /// New password. If omitted, read once from stdin (no echo when a TTY).
+        password: Option<String>,
+    },
 }
 
 pub async fn run(args: AdminArgs, config: HipfireConfig) -> anyhow::Result<()> {
@@ -165,6 +170,30 @@ pub async fn run(args: AdminArgs, config: HipfireConfig) -> anyhow::Result<()> {
                 .await?
         }
         AdminCommand::Get { path } => client.get(&normalize_path(&path)).await?,
+        AdminCommand::SetPassword { password } => {
+            let password = match password {
+                Some(password) => password,
+                None => {
+                    use std::io::Read;
+                    eprint!(
+                        "New /admin password (input may echo; pipe via stdin to avoid shell history): "
+                    );
+                    let mut buf = String::new();
+                    std::io::stdin().read_to_string(&mut buf)?;
+                    buf.trim().to_string()
+                }
+            };
+            if password.is_empty() {
+                anyhow::bail!("password must not be empty");
+            }
+            hipfire_config::set_admin_password(&password)
+                .map_err(|err| anyhow::anyhow!("failed to write admin password: {err}"))?;
+            println!(
+                "admin password set ({})",
+                hipfire_config::admin_password_path().display()
+            );
+            return Ok(());
+        }
     };
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
@@ -173,6 +202,9 @@ pub async fn run(args: AdminArgs, config: HipfireConfig) -> anyhow::Result<()> {
 struct AdminClient {
     base_url: String,
     http: reqwest::Client,
+    /// Local admin bearer secret, if present, so same-box calls to gated
+    /// `/admin/*` endpoints authenticate without a browser login.
+    secret: Option<String>,
 }
 
 impl AdminClient {
@@ -182,12 +214,20 @@ impl AdminClient {
         Self {
             base_url: base_url_for(&host, port),
             http: reqwest::Client::new(),
+            secret: hipfire_config::read_admin_secret(),
+        }
+    }
+
+    fn authed(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.secret {
+            Some(secret) => builder.bearer_auth(secret),
+            None => builder,
         }
     }
 
     async fn get(&self, path: &str) -> anyhow::Result<Value> {
         let url = format!("{}{}", self.base_url, normalize_path(path));
-        let response = self.http.get(&url).send().await?;
+        let response = self.authed(self.http.get(&url)).send().await?;
         let status = response.status();
         let text = response.text().await?;
         if !status.is_success() {
@@ -199,7 +239,7 @@ impl AdminClient {
 
     async fn post_json(&self, path: &str, body: &Value) -> anyhow::Result<Value> {
         let url = format!("{}{}", self.base_url, normalize_path(path));
-        let response = self.http.post(&url).json(body).send().await?;
+        let response = self.authed(self.http.post(&url).json(body)).send().await?;
         let status = response.status();
         let text = response.text().await?;
         if !status.is_success() {

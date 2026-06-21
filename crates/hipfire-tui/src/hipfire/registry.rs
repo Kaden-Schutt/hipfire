@@ -295,8 +295,7 @@ fn load_remote_registry(config: &ConfigState) -> Result<RegistryState, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_millis(650))
         .build();
-    let body = agent
-        .get(&url)
+    let body = super::authorize_admin(agent.get(&url))
         .call()
         .map_err(|err| format!("registry unavailable: {err}"))?
         .into_string()

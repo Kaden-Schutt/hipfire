@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod model;
 pub mod routes;
 pub mod scheduler;
@@ -38,10 +39,11 @@ fn cors_layer(allowed_origins: &[String]) -> Option<CorsLayer> {
 }
 
 pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> Router {
-    let router = Router::new()
-        .route("/health", get(routes::health::get_health))
-        .route("/admin", get(routes::admin::get_admin_index))
-        .route("/admin/", get(routes::admin::get_admin_index))
+    // Gated admin data endpoints: require a valid session cookie or the local
+    // bearer secret (see `auth::admin_gate`). The `/admin` shell and the
+    // login/logout endpoints below stay ungated so the page can load and the
+    // user can authenticate.
+    let admin_data = Router::new()
         .route(
             "/admin/config/schema",
             get(routes::admin::get_config_schema),
@@ -71,6 +73,18 @@ pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> Rout
             "/admin/training/runs/{id}/events",
             get(routes::training::get_training_run_events),
         )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::admin_gate,
+        ));
+
+    let router = Router::new()
+        .route("/health", get(routes::health::get_health))
+        .route("/admin", get(routes::admin::get_admin_index))
+        .route("/admin/", get(routes::admin::get_admin_index))
+        .route("/admin/login", post(auth::login))
+        .route("/admin/logout", post(auth::logout))
+        .merge(admin_data)
         .route("/v1/models", get(routes::models::get_models))
         .route(
             "/v1/files",

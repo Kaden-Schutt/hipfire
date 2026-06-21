@@ -164,6 +164,15 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         validation: "JSON array of origin strings, or [\"*\"]"
     ),
     field!(
+        "admin_user",
+        ConfigType::String,
+        Requirement::Optional,
+        Some("admin"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "Username for the /admin console login. The password is set separately with `hipfire admin set-password` (argon2id hash stored in ~/.hipfire/admin.passwd, never in config)."
+    ),
+    field!(
         "default_model",
         ConfigType::String,
         Requirement::Optional,

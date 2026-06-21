@@ -67,6 +67,11 @@ pub struct AppState {
     pub batch_order: Mutex<VecDeque<String>>,
     pub last_request_unix_secs: Mutex<u64>,
     pub training_runs_dir: PathBuf,
+    /// Local admin bearer secret (`~/.hipfire/admin.secret`); same-box
+    /// CLI/TUI present this to skip the `/admin` login flow.
+    pub admin_secret: String,
+    /// Active `/admin` browser sessions: token -> expiry (unix secs).
+    pub admin_sessions: Mutex<HashMap<String, u64>>,
 }
 
 impl AppState {
@@ -105,6 +110,8 @@ impl AppState {
             batch_order: Mutex::new(VecDeque::new()),
             last_request_unix_secs: Mutex::new(now_secs()),
             training_runs_dir,
+            admin_secret: hipfire_config::ensure_admin_secret().unwrap_or_default(),
+            admin_sessions: Mutex::new(HashMap::new()),
         })
     }
 }

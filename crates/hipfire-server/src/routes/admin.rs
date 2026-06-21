@@ -501,13 +501,50 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
       th:nth-child(4), td:nth-child(4), th:nth-child(5), td:nth-child(5) { display: none; }
       .tab { min-width: auto; }
     }
-  </style>
+    .overlay {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: color-mix(in srgb, var(--bg) 80%, black);
+      z-index: 10;
+    }
+    .overlay[hidden] { display: none; }
+    .login-card {
+      width: min(360px, 92vw);
+      display: grid;
+      gap: 12px;
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--panel);
+    }
+    .login-card h2 { margin: 0; font-size: 16px; }
+    .login-card .login-error { color: var(--warn); min-height: 16px; font-size: 12px; }
+    #logout { margin-left: 12px; }
 </head>
 <body>
   <header>
     <h1>hipfire admin console</h1>
-    <div id="status" class="status">connecting</div>
+    <div>
+      <span id="status" class="status">connecting</span>
+      <button id="logout" type="button" hidden>Log out</button>
+    </div>
   </header>
+  <div id="login" class="overlay" hidden>
+    <form id="login-form" class="login-card">
+      <h2>admin sign in</h2>
+      <label>User
+        <input id="login-user" name="login-user" autocomplete="username" value="admin">
+      </label>
+      <label>Password
+        <input id="login-password" name="login-password" type="password" autocomplete="current-password">
+      </label>
+      <div id="login-error" class="login-error"></div>
+      <button type="submit">Sign in</button>
+    </form>
+  </div>
   <main>
     <nav class="tabs" aria-label="Admin sections">
       <button class="tab active" data-tab="overview" type="button">Overview</button>
@@ -683,6 +720,13 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
   </main>
   <script>
     const statusEl = document.getElementById("status");
+    const loginOverlayEl = document.getElementById("login");
+    const loginFormEl = document.getElementById("login-form");
+    const loginUserEl = document.getElementById("login-user");
+    const loginPasswordEl = document.getElementById("login-password");
+    const loginErrorEl = document.getElementById("login-error");
+    const logoutEl = document.getElementById("logout");
+    let activeTab = "overview";
     const tabEls = [...document.querySelectorAll(".tab")];
     const panelEls = [...document.querySelectorAll(".panel")];
     const tabConfigEl = document.getElementById("tab-config");
@@ -748,10 +792,53 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
       return source.id ? `${source.kind}:${source.id}` : source.kind;
     }
 
+    function requireAuthorized(resp) {
+      if (resp.status === 401) {
+        showLogin();
+        throw new Error("admin authentication required");
+      }
+      return resp;
+    }
+
     async function fetchJson(path) {
-      const resp = await fetch(path);
+      const resp = requireAuthorized(await fetch(path));
       if (!resp.ok) throw new Error(`${path} ${resp.status}`);
       return await resp.json();
+    }
+
+    function showLogin() {
+      loginOverlayEl.hidden = false;
+      logoutEl.hidden = true;
+      loginPasswordEl.focus();
+    }
+
+    function hideLogin() {
+      loginOverlayEl.hidden = true;
+      logoutEl.hidden = false;
+      loginErrorEl.textContent = "";
+    }
+
+    async function submitLogin(event) {
+      event.preventDefault();
+      loginErrorEl.textContent = "";
+      const resp = await fetch("/admin/login", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({user: loginUserEl.value, password: loginPasswordEl.value}),
+      });
+      if (!resp.ok) {
+        loginErrorEl.textContent = resp.status === 401 ? "invalid credentials" : `login failed (${resp.status})`;
+        return;
+      }
+      loginPasswordEl.value = "";
+      hideLogin();
+      showTab(activeTab);
+    }
+
+    async function logout() {
+      await fetch("/admin/logout", {method: "POST"}).catch(() => {});
+      showLogin();
+      statusEl.textContent = "signed out";
     }
 
     function td(value, cls = "") {
@@ -992,6 +1079,8 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
         fetch("/admin/config/schema"),
         fetch(`/admin/config/resolved${suffix}`),
       ]);
+      requireAuthorized(schemaResp);
+      requireAuthorized(resolvedResp);
       if (!schemaResp.ok) throw new Error(`schema ${schemaResp.status}`);
       if (!resolvedResp.ok) throw new Error(`resolved ${resolvedResp.status}`);
       const schema = await schemaResp.json();
@@ -1173,6 +1262,7 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
     }
 
     function showTab(name) {
+      activeTab = name;
       for (const panel of panelEls) panel.hidden = panel.id !== `${name}-panel`;
       for (const tab of tabEls) tab.classList.toggle("active", tab.dataset.tab === name);
       const loaders = {
@@ -1210,6 +1300,8 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
     modelEl.addEventListener("keydown", (event) => {
       if (event.key === "Enter") loadConfig().catch(showError);
     });
+    loginFormEl.addEventListener("submit", (event) => submitLogin(event).catch(showError));
+    logoutEl.addEventListener("click", () => logout().catch(showError));
     function showError(error) {
       statusEl.textContent = error.message;
       statusEl.className = "status warn";
@@ -1244,6 +1336,15 @@ mod tests {
     fn admin_index_fetches_config_endpoints() {
         assert!(ADMIN_INDEX_HTML.contains("/admin/config/schema"));
         assert!(ADMIN_INDEX_HTML.contains("/admin/config/resolved"));
+    }
+
+    #[test]
+    fn admin_index_exposes_login_surface() {
+        assert!(ADMIN_INDEX_HTML.contains("/admin/login"));
+        assert!(ADMIN_INDEX_HTML.contains("/admin/logout"));
+        assert!(ADMIN_INDEX_HTML.contains("id=\"login-form\""));
+        assert!(ADMIN_INDEX_HTML.contains("function showLogin"));
+        assert!(ADMIN_INDEX_HTML.contains("requireAuthorized"));
     }
 
     #[test]

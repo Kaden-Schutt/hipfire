@@ -2,6 +2,7 @@
 
 | Key | Type | Required | Default | Scopes | Mutability | Impact | Description |
 |-----|------|----------|---------|--------|------------|--------|-------------|
+| `admin_user` | `string` | optional | `admin` | `global`, `runtime` | `static` | `none` | Username for the /admin console login. The password is set separately with `hipfire admin set-password` (argon2id hash stored in ~/.hipfire/admin.passwd, never in config). |
 | `cask` | `bool` | optional | `false` | `global`, `model`, `runtime` | `load_time` | `none` | Enable CASK/TriAttention behavior where supported. |
 | `cask_auto_attach` | `bool` | optional | `true` | `global`, `model`, `runtime` | `load_time` | `none` | Whether compatible CASK/TriAttention sidecars may auto-attach. |
 | `cask_beta` | `u32` | optional | `128` | `global`, `model`, `runtime` | `load_time` | `none` | CASK beta control value. |

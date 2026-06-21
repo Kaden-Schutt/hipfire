@@ -1,4 +1,16 @@
 [[field]]
+key = "admin_user"
+type = "string"
+requirement = "optional"
+default = "admin"
+scopes = ["global", "runtime"]
+mutability = "static"
+owner = "hipfire-config"
+description = "Username for the /admin console login. The password is set separately with `hipfire admin set-password` (argon2id hash stored in ~/.hipfire/admin.passwd, never in config)."
+secret = false
+restart_impact = "none"
+
+[[field]]
 key = "cask"
 type = "bool"
 requirement = "optional"
