@@ -123,7 +123,7 @@ Done when: per-expert down AWQ produces a coherent MoE file; coherence +
 KLD eval show quality gain vs non-AWQ down at equal size.
 Progress: _not started_
 
-## [ ] 4. MTP perf — non-hipGraph subset  — SMALL, ACTIVE HEAD
+## [x] 4. MTP perf — non-hipGraph subset  — LANDED (safe subset); bc5d005d deferred
 Source: `5ac96a8f` (+16/-11 mtp_head.rs: MTP-head lm_head WMMA → RDNA3/gfx11),
 `1495be04` (+29/-8 mtp_head.rs: chunked WMMA on gfx12), `bc5d005d` (+31/-2
 mtp_spec.rs + qwen35.rs: decouple + adaptive-K gfx11 MTP defaults, per-arch
@@ -139,7 +139,17 @@ build hipfire-arch-qwen35; run `coherence-gate-dflash` (spec-decode τ guard).
 Done when: ports land, build green, `coherence-gate-dflash` passes (no τ
 collapse / attractor). Perf delta is a bonus — verify per CLAUDE.md warm-cache
 protocol if claimed, but the bar to land is no coherence/τ regression.
-Progress: _not started — NEXT to execute_
+Progress: LANDED 2026-06-22 (commit 204bd576). Ported the two SAFE pieces:
+(1) 5ac96a8f — MTP-head lm_head → direct gemm_q8_0_wmma (has_wmma && k%32==0);
+(2) becc0610 — opt-in default-OFF HIPFIRE_MTP_VERIFY_DECOUPLE gate. Built +
+forced coherence-gate-dflash (HIPFIRE_FORCE_SPEC_GATE=1) PASS + speed gate PASS
+on gfx1151 (prefill 799.7/decode 66.0 vs 590.7/65.5 baseline). 1495be04 is
+superseded by 5ac96a8f (its final state). **bc5d005d DEFERRED for review**:
+it default-ON's decouple + adaptive-K (p_min=0.6, output-changing) via
+`arch.starts_with("gfx11")` which WRONGLY matches gfx1151 (its own prose says
+gfx1151 needs separate in-arch validation). To take it: gate to
+gfx1100/01/02 explicitly (or validate decouple+p_min on gfx1151 via dflash
+gate first), then land.
 
 ## [ ] 5. mfp4-E8 + GPTQ/LDLQ-on-E8  — LARGE, HIGHEST quality value
 Source (key anchors; see `git log chaingun..origin/master`): `f8fe55d5`
