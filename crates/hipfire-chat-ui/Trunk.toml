@@ -1,0 +1,3 @@
+[build]
+# Served from /chat in hipfire-server, so hashed asset URLs must be prefixed.
+public_url = "/chat/"

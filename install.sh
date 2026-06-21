@@ -218,28 +218,37 @@ cd "$REPO_DIR"
 # hipfire-daemon: the GPU inference worker
 cargo install "${INSTALL_OPTS[@]}" --path crates/hipfire-daemon --root "$HIPFIRE_DIR"
 
-# Admin console (Leptos/WASM) — optional, embedded into `hipfire` when the
+# Browser UIs (Leptos/WASM) — optional, embedded into `hipfire` when the
 # wasm toolchain is present. Best-effort: a missing/broken trunk just falls
-# back to the lightweight built-in console.
-ADMIN_UI_FEATURE=()
+# back to the lightweight built-in routes.
+UI_FEATURES=()
 if command -v trunk &>/dev/null && \
    rustup target list --installed 2>/dev/null | grep -q wasm32-unknown-unknown; then
     echo ""
     echo "Building admin console (Leptos/WASM)..."
-    if ( cd "$REPO_DIR/crates/hipfire-admin-ui" && trunk build --release ); then
-        ADMIN_UI_FEATURE=(--features admin-ui-embed)
+    if ( cd "$REPO_DIR/crates/hipfire-admin-ui" && env -u NO_COLOR trunk build --release ); then
+        UI_FEATURES+=(--features admin-ui-embed)
         echo "  Admin console built ✓"
     else
         echo "  Admin console build failed — installing without the embedded UI."
     fi
+
+    echo ""
+    echo "Building browser chat UI (Leptos/WASM)..."
+    if ( cd "$REPO_DIR/crates/hipfire-chat-ui" && env -u NO_COLOR trunk build --release ); then
+        UI_FEATURES+=(--features chat-ui-embed)
+        echo "  Browser chat UI built ✓"
+    else
+        echo "  Browser chat UI build failed — installing without the embedded UI."
+    fi
 else
     echo ""
-    echo "Admin console: trunk/wasm32 not found — skipping embedded UI."
+    echo "Browser UIs: trunk/wasm32 not found — skipping embedded UIs."
     echo "  Enable with: rustup target add wasm32-unknown-unknown && cargo install trunk"
 fi
 
 # hipfire: the CLI (serve / run / list)
-cargo install "${INSTALL_OPTS[@]}" "${ADMIN_UI_FEATURE[@]}" --path crates/hipfire-cli --root "$HIPFIRE_DIR"
+cargo install "${INSTALL_OPTS[@]}" "${UI_FEATURES[@]}" --path crates/hipfire-cli --root "$HIPFIRE_DIR"
 
 # hipfire-tui: optional terminal operator UI
 cargo install "${INSTALL_OPTS[@]}" --path crates/hipfire-tui --root "$HIPFIRE_DIR"

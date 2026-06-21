@@ -50,11 +50,12 @@ members = [
     "crates/hipfire-dispatch-tests",
     "crates/hipfire-train",
 ]
-# The Leptos admin UI targets wasm32 (leptos CSR + web-sys) and is built
-# standalone via `trunk`, so it must NOT be a workspace member — otherwise
-# `cargo check --workspace` would try to compile it for the native target.
+# The Leptos browser UIs target wasm32 (leptos CSR + web-sys) and are built
+# standalone via `trunk`, so they must NOT be workspace members — otherwise
+# `cargo check --workspace` would try to compile them for the native target.
 exclude = [
     "crates/hipfire-admin-ui",
+    "crates/hipfire-chat-ui",
 ]
 
 [workspace.package]

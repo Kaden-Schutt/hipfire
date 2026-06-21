@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hipfire Chat</title>
+  <link data-trunk rel="rust" data-wasm-opt="z" />
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f7f8f5;
+      --panel: #ffffff;
+      --text: #151716;
+      --muted: #5f6761;
+      --line: #d9ded8;
+      --accent: #126b5f;
+      --danger: #9b2d30;
+      --user: #e7f1ee;
+      --assistant: #f2f4f7;
+      --shadow: 0 1px 4px rgba(20, 24, 21, 0.08);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111412;
+        --panel: #191d1a;
+        --text: #edf0eb;
+        --muted: #a9b0aa;
+        --line: #323832;
+        --accent: #36a78f;
+        --danger: #e06d70;
+        --user: #19332e;
+        --assistant: #20252b;
+        --shadow: none;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 15px;
+      line-height: 1.45;
+    }
+    button, input, textarea { font: inherit; }
+    .shell { min-height: 100vh; display: grid; grid-template-rows: auto auto 1fr auto; }
+    header {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+    }
+    h1 { margin: 0; font-size: 18px; font-weight: 650; letter-spacing: 0; }
+    .status { color: var(--muted); font-size: 13px; min-height: 20px; text-align: right; }
+    .controls {
+      display: grid;
+      grid-template-columns: minmax(180px, 1fr) 96px 96px auto auto;
+      gap: 8px;
+      padding: 12px 18px;
+      border-bottom: 1px solid var(--line);
+      background: color-mix(in srgb, var(--panel), var(--bg) 28%);
+    }
+    label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; min-width: 0; }
+    input {
+      width: 100%;
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px 10px;
+      background: var(--panel);
+      color: var(--text);
+    }
+    .messages { overflow-y: auto; padding: 18px; display: grid; align-content: start; gap: 12px; }
+    .message {
+      width: min(900px, 100%);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      box-shadow: var(--shadow);
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .message .role {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+      text-transform: uppercase;
+    }
+    .message.user { justify-self: end; background: var(--user); }
+    .message.assistant { justify-self: start; background: var(--assistant); }
+    .message.error {
+      justify-self: start;
+      border-color: color-mix(in srgb, var(--danger), var(--line) 45%);
+      background: color-mix(in srgb, var(--danger), var(--panel) 88%);
+    }
+    form {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      padding: 14px 18px 18px;
+      border-top: 1px solid var(--line);
+      background: var(--panel);
+    }
+    textarea {
+      width: 100%;
+      min-height: 52px;
+      max-height: 180px;
+      resize: vertical;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      background: var(--bg);
+      color: var(--text);
+    }
+    button {
+      min-height: 38px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px 12px;
+      background: var(--panel);
+      color: var(--text);
+      cursor: pointer;
+    }
+    button.primary {
+      min-width: 84px;
+      align-self: end;
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #ffffff;
+      font-weight: 650;
+    }
+    button:disabled { cursor: wait; opacity: 0.65; }
+    .toggle {
+      display: flex;
+      align-items: end;
+      gap: 7px;
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    .toggle input { width: 18px; height: 18px; margin: 0 0 9px; }
+    @media (max-width: 760px) {
+      header { grid-template-columns: 1fr; }
+      .status { text-align: left; }
+      .controls { grid-template-columns: 1fr 1fr; }
+      .controls label:first-child { grid-column: 1 / -1; }
+      form { grid-template-columns: 1fr; }
+      button.primary { width: 100%; }
+    }
+  </style>
+</head>
+<body></body>
+</html>

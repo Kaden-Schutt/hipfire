@@ -10,9 +10,10 @@ name = "hipfire"
 path = "src/main.rs"
 
 [features]
-# Forward to hipfire-server: bake the prebuilt Leptos admin UI into `hipfire`.
-# Build crates/hipfire-admin-ui with `trunk build` first.
+# Forward to hipfire-server: bake prebuilt Leptos/WASM UIs into `hipfire`.
+# Build the corresponding UI crate with `trunk build` first.
 admin-ui-embed = ["hipfire-server/admin-ui-embed"]
+chat-ui-embed = ["hipfire-server/chat-ui-embed"]
 
 [dependencies]
 hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
