@@ -3767,6 +3767,12 @@ pub const KVARN_QUANTIZE_TILE_SRC: &str =
 pub const KVARN_DEQUANT_TILE_SRC: &str =
     include_str!("../../../kernels/src/kvarn_dequant_tile.hip");
 
+/// Deferred-hierarchical KV (Phase 2b): cold-slot decode attention — one query over
+/// the compacted cold tier's merged slots (all visible, GQA). Zero LDS (one wave/
+/// q-head, register online-softmax). See `kernels/src/attention_cold_slots.hip`.
+pub const ATTENTION_COLD_SLOTS_SRC: &str =
+    include_str!("../../../kernels/src/attention_cold_slots.hip");
+
 /// KVarN write-side gather (Phase D1 #2): transpose a contiguous run of
 /// token-major K rows into the channel-major `[head_dim × GROUP]` tiles that
 /// `kvarn_quantize_tile` consumes. See `kernels/src/kvarn_gather_k_tiles.hip`.

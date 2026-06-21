@@ -45706,6 +45706,59 @@ impl Gpu {
         }
     }
 
+    /// Cold-slot decode attention (deferred-hierarchical KV, Phase 2b): one query
+    /// `q` [n_heads × 256] over the compacted cold tier `k`/`v`
+    /// [n_kv_heads × n_slots × 256] (dequantized f32, all slots visible, GQA) →
+    /// `out` [n_heads × 256]. Zero LDS, one wave per q-head. head_dim must be 256.
+    /// Parity oracle: `hipfire_kvquant::ColdTier::two_tier_attend(.., n_hot=0)`.
+    pub fn attention_cold_slots(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        out: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        n_slots: usize,
+        scale: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "attention_cold_slots",
+            kernels::ATTENTION_COLD_SLOTS_SRC,
+            "attention_cold_slots",
+        )?;
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let vp = v.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut ns = n_slots as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut ns as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions["attention_cold_slots"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// KVarN tile dequantizer: unpack records → f16 tiles for the reused
     /// asym4/q8 flash attention. `recs` = [n_tiles, record_bytes]; `out` = f16
     /// [n_tiles, r_dim*c_dim]. One block per tile, zero LDS.
