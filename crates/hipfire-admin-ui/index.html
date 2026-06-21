@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>hipfire admin console</title>
+  <link data-trunk rel="rust" data-wasm-opt="z" />
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #111417; --panel: #171b20; --text: #e7ecef; --muted: #9aa5af;
+      --line: #29313a; --accent: #2dd4bf; --warn: #f59e0b;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font-size: 14px; }
+    .wrap { width: min(1100px, 100%); margin: 0 auto; padding: 20px 24px 40px; }
+    h1 { font-size: 18px; font-weight: 650; margin: 0 0 4px; }
+    .sub { color: var(--muted); font-size: 12px; margin: 0 0 18px; }
+    .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+    .card { border: 1px solid var(--line); background: var(--panel); border-radius: 10px; padding: 14px 16px; }
+    .card h2 { margin: 0 0 10px; font-size: 14px; color: var(--accent); }
+    .metric { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid var(--line); }
+    .metric:last-child { border-bottom: 0; }
+    .metric .k { color: var(--muted); }
+    .metric .v { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .bar { height: 6px; border-radius: 4px; background: var(--line); margin-top: 6px; overflow: hidden; }
+    .bar > span { display: block; height: 100%; background: var(--accent); }
+    .err { color: var(--warn); }
+  </style>
+</head>
+<body></body>
+</html>

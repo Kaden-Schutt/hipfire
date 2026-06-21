@@ -45,13 +45,11 @@ pub async fn get_admin_logs(Query(query): Query<AdminLogsQuery>) -> Json<Value> 
 }
 
 /// Live host/GPU telemetry snapshot for the dashboard (sysfs-backed).
-pub async fn get_admin_stats() -> Json<Value> {
-    let gpus = serde_json::to_value(crate::telemetry::read_gpu_telemetry())
-        .unwrap_or(Value::Array(Vec::new()));
-    Json(json!({
-        "generated_unix": now_unix_secs(),
-        "gpus": gpus,
-    }))
+pub async fn get_admin_stats() -> Json<hipfire_admin_types::AdminStats> {
+    Json(hipfire_admin_types::AdminStats {
+        generated_unix: now_unix_secs(),
+        gpus: crate::telemetry::read_gpu_telemetry(),
+    })
 }
 
 fn now_unix_secs() -> u64 {

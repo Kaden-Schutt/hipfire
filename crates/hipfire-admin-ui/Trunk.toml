@@ -1,0 +1,3 @@
+[build]
+# Served from /admin/ui in hipfire-server, so asset URLs must be prefixed.
+public_url = "/admin/ui/"

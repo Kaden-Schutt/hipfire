@@ -1,0 +1,25 @@
+[package]
+name = "hipfire-admin-ui"
+version = "0.2.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "Leptos (WASM) admin console for hipfire — built standalone via trunk."
+
+# NOTE: intentionally NOT a workspace member (see root Cargo.toml `exclude`).
+# Targets wasm32 via `trunk build`; `cargo check --workspace` must skip it.
+
+[dependencies]
+leptos = { version = "0.7", features = ["csr"] }
+hipfire-admin-types = { path = "../hipfire-admin-types" }
+gloo-net = { version = "0.6", features = ["http"] }
+console_error_panic_hook = "0.1"
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+
+# Standalone workspace: this crate is excluded from the parent workspace and
+# built independently by trunk (wasm32). An own `[workspace]` table makes cargo
+# resolve it as its own root instead of failing to find it under the parent.
+[workspace]

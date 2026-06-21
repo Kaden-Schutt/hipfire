@@ -4,6 +4,7 @@ members = [
     "crates/hip-bridge",
     "crates/hsa-bridge",
     "crates/rdna-compute",
+    "crates/hipfire-admin-types",
     "crates/hipfire-coherence",
     "crates/hipfire-config",
     "crates/hipfire-cpu",
@@ -48,6 +49,12 @@ members = [
     "crates/hipfire-dispatch",
     "crates/hipfire-dispatch-tests",
     "crates/hipfire-train",
+]
+# The Leptos admin UI targets wasm32 (leptos CSR + web-sys) and is built
+# standalone via `trunk`, so it must NOT be a workspace member — otherwise
+# `cargo check --workspace` would try to compile it for the native target.
+exclude = [
+    "crates/hipfire-admin-ui",
 ]
 
 [workspace.package]

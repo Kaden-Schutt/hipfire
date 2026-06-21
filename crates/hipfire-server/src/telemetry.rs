@@ -10,28 +10,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use hipfire_admin_types::GpuTelemetry;
 
 const DRM_ROOT: &str = "/sys/class/drm";
 const AMD_VENDOR_ID: &str = "0x1002";
-
-#[derive(Debug, Clone, Default, Serialize, PartialEq)]
-pub struct GpuTelemetry {
-    /// DRM card name, e.g. "card1".
-    pub card: String,
-    /// GPU utilization 0–100.
-    pub busy_percent: Option<u32>,
-    /// Dedicated VRAM in use (bytes). APU carveout only — see module note.
-    pub vram_used_bytes: Option<u64>,
-    /// Dedicated VRAM total (bytes). APU carveout only — see module note.
-    pub vram_total_bytes: Option<u64>,
-    /// Edge/junction temperature (°C).
-    pub temp_c: Option<f64>,
-    /// Average board power draw (W).
-    pub power_w: Option<f64>,
-    /// Active shader clock (MHz), from `pp_dpm_sclk`.
-    pub sclk_mhz: Option<u64>,
-}
 
 /// Read telemetry for every AMD GPU visible under `/sys/class/drm`.
 pub fn read_gpu_telemetry() -> Vec<GpuTelemetry> {

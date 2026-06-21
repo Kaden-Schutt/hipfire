@@ -9,6 +9,11 @@ description = "hipfire command-line interface — clap frontend that embeds hipf
 name = "hipfire"
 path = "src/main.rs"
 
+[features]
+# Forward to hipfire-server: bake the prebuilt Leptos admin UI into `hipfire`.
+# Build crates/hipfire-admin-ui with `trunk build` first.
+admin-ui-embed = ["hipfire-server/admin-ui-embed"]
+
 [dependencies]
 hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
 hipfire-build-info = { path = "../hipfire-build-info" }

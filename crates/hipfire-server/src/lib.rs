@@ -1,3 +1,4 @@
+pub mod admin_ui;
 pub mod auth;
 pub mod model;
 pub mod routes;
@@ -86,6 +87,11 @@ pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> Rout
         .route("/admin/", get(routes::admin::get_admin_index))
         .route("/admin/login", post(auth::login))
         .route("/admin/logout", post(auth::logout))
+        // New Leptos console (transitional path; shell + assets are not secret,
+        // the data endpoints it calls stay gated).
+        .route("/admin/ui", get(admin_ui::index))
+        .route("/admin/ui/", get(admin_ui::index))
+        .route("/admin/ui/{*path}", get(admin_ui::asset))
         .merge(admin_data)
         .route("/v1/models", get(routes::models::get_models))
         .route(

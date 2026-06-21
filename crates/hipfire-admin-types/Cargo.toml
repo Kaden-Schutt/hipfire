@@ -1,0 +1,9 @@
+[package]
+name = "hipfire-admin-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared serde types for the hipfire admin console (server + wasm UI)."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }

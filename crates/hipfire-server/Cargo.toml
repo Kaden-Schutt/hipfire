@@ -5,8 +5,15 @@ edition.workspace = true
 license.workspace = true
 description = "hipfire HTTP server and daemon client — axum routes, daemon engine, model discovery, config."
 
+[features]
+# Embed the prebuilt Leptos admin UI (crates/hipfire-admin-ui/dist) into the
+# binary. OFF by default so `cargo check --workspace` builds without a prior
+# `trunk build`; the install flow turns it on after building the UI.
+admin-ui-embed = ["dep:rust-embed"]
+
 [dependencies]
 axum = { version = "0.8", features = ["macros", "multipart"] }
+rust-embed = { version = "8", optional = true }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tower-http = { version = "0.6", features = ["cors"] }
@@ -19,6 +26,7 @@ reqwest = { version = "0.12", default-features = false, features = ["stream", "j
 futures = "0.3"
 async-stream = "0.3"
 anyhow = "1"
+hipfire-admin-types = { path = "../hipfire-admin-types" }
 hipfire-config = { path = "../hipfire-config" }
 hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
 hipfire-generate = { path = "../hipfire-generate" }

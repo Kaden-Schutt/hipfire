@@ -87,7 +87,15 @@ if [ -n "$STAGED_RS" ]; then
 
     PKGS=$(echo "$STAGED_RS" | sed -nE 's|^crates/([^/]+)/.*|\1|p' | sort -u)
     CLIPPY_PKGS=""
-    for p in $PKGS; do CLIPPY_PKGS="$CLIPPY_PKGS -p $p"; done
+    # Only clippy crates that are actual members of this workspace. Crates
+    # excluded from the workspace (e.g. the wasm-only hipfire-admin-ui, built
+    # standalone via trunk) aren't resolvable with `-p` here and would abort
+    # the hook; skip them.
+    for p in $PKGS; do
+        if cargo pkgid -p "$p" >/dev/null 2>&1; then
+            CLIPPY_PKGS="$CLIPPY_PKGS -p $p"
+        fi
+    done
     if [ -n "$CLIPPY_PKGS" ]; then
         echo "  clippy:$CLIPPY_PKGS --all-targets"
         if ! CLIPPY_OUT=$(cargo clippy $CLIPPY_PKGS --all-targets --locked 2>&1); then
