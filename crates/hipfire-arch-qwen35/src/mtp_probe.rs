@@ -44,7 +44,7 @@
 use crate::qwen35::{self, MaskEmbedOverride, PrefillBatchScratch, Qwen35Config, Qwen35Weights};
 use crate::speculative::ModelSlot;
 use hip_bridge::HipResult;
-use hipfire_runtime::llama::{self, EmbeddingFormat};
+use hipfire_runtime::weights::{self, EmbeddingFormat};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Maximum batch size per MTP probe cycle: 1 last_committed + 1
@@ -309,7 +309,14 @@ pub fn mtp_probe_step(
         DType::MQ4G256 => {
             // MQ4 needs FWHT-rotated x first; reuse `state.rot` as scratch.
             let rot_view = state.rot.sub_offset(0, n * w_out.k);
-            llama::rotate_x_mq_batched_for(gpu, w_out, &final_hidden_view, &rot_view, w_out.k, n)?;
+            weights::rotate_x_mq_batched_for(
+                gpu,
+                w_out,
+                &final_hidden_view,
+                &rot_view,
+                w_out.k,
+                n,
+            )?;
             gpu.gemm_hfq4g256_batched_lmhead(
                 &w_out.buf,
                 &rot_view,
@@ -321,7 +328,14 @@ pub fn mtp_probe_step(
         }
         DType::MQ3G256 => {
             let rot_view = state.rot.sub_offset(0, n * w_out.k);
-            llama::rotate_x_mq_batched_for(gpu, w_out, &final_hidden_view, &rot_view, w_out.k, n)?;
+            weights::rotate_x_mq_batched_for(
+                gpu,
+                w_out,
+                &final_hidden_view,
+                &rot_view,
+                w_out.k,
+                n,
+            )?;
             gpu.gemm_hfq3g256_batched_lmhead(
                 &w_out.buf,
                 &rot_view,
@@ -343,7 +357,14 @@ pub fn mtp_probe_step(
         }
         DType::MQ6G256 => {
             let rot_view = state.rot.sub_offset(0, n * w_out.k);
-            llama::rotate_x_mq_batched_for(gpu, w_out, &final_hidden_view, &rot_view, w_out.k, n)?;
+            weights::rotate_x_mq_batched_for(
+                gpu,
+                w_out,
+                &final_hidden_view,
+                &rot_view,
+                w_out.k,
+                n,
+            )?;
             gpu.gemm_hfq6g256_batched_lmhead(
                 &w_out.buf,
                 &rot_view,
@@ -358,7 +379,7 @@ pub fn mtp_probe_step(
             for i in 0..n {
                 let hidden_row = final_hidden_view.sub_offset(i * dim, dim);
                 let logits_row = logits_batch.sub_offset(i * vocab, vocab);
-                llama::weight_gemv(gpu, w_out, &hidden_row, &logits_row)?;
+                weights::weight_gemv(gpu, w_out, &hidden_row, &logits_row)?;
             }
         }
     }

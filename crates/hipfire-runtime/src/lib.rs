@@ -46,10 +46,12 @@ pub mod weights {
     //! Generic weight/embedding types + the GEMV/GEMM/rotate operations on them
     //! (not llama-specific).
     pub use crate::llama::{
-        fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_128_for, rotate_x_mq_batched_for,
+        fused_rmsnorm_rotate_for_mq, fused_rmsnorm_rotate_for_paro,
+        fused_rmsnorm_rotate_mq_batched_for, fused_silu_mul_rotate_mq_batched_for,
+        fused_silu_mul_rotate_mq_for, rotate_x_mq_128_for, rotate_x_mq_batched_for,
         rotate_x_mq_for, rotate_x_paro_for, weight_gemm, weight_gemv, weight_gemv_prerotated,
         weight_gemv_residual, weight_gemv_swiglu_residual, EmbeddingFormat, LayerWeights,
-        WeightTensor,
+        ParoRotation, WeightTensor,
     };
 }
 pub mod quant {

@@ -62,9 +62,10 @@
 use crate::qwen35::Qwen35Weights;
 use hip_bridge::{DeviceBuffer, HipResult};
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
-use hipfire_runtime::llama::{
-    self, f16_to_f32, fused_silu_mul_rotate_mq_batched_for, fused_silu_mul_rotate_mq_for,
-    rotate_x_mq_for, weight_gemv, EmbeddingFormat, WeightTensor,
+use hipfire_runtime::quant::f16_to_f32;
+use hipfire_runtime::weights::{
+    self, fused_silu_mul_rotate_mq_batched_for, fused_silu_mul_rotate_mq_for, rotate_x_mq_for,
+    weight_gemv, EmbeddingFormat, WeightTensor,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::Path;
@@ -610,7 +611,7 @@ impl Qwen35MtpHeadScratch {
 /// quality close to F32 (much higher precision than 3-bit), and is 4×
 /// smaller than F32 (2 KB / token vs 8 KB at hd=256, n_kv_heads=4).
 ///
-/// Internally wraps a single-layer [`llama::KvCache`] built via
+/// Internally wraps a single-layer [`kv::KvCache`] built via
 /// `new_gpu_q8` so we share buffer-sizing semantics with the trunk's
 /// `--kv-mode q8` path. Single-layer-ness means `inner.k_gpu[0]` /
 /// `inner.v_gpu[0]` are the only slots used.
@@ -654,7 +655,7 @@ impl MtpKvMode {
 }
 
 pub struct Qwen35MtpHeadKvCache {
-    pub inner: hipfire_runtime::llama::KvCache,
+    pub inner: hipfire_runtime::kv::KvCache,
     pub max_seq: usize,
     pub n_head_kv: usize,
     pub head_dim: usize,
@@ -674,21 +675,21 @@ impl Qwen35MtpHeadKvCache {
         kv_mode: MtpKvMode,
     ) -> HipResult<Self> {
         let inner = match kv_mode {
-            MtpKvMode::Q8 => hipfire_runtime::llama::KvCache::new_gpu_q8(
+            MtpKvMode::Q8 => hipfire_runtime::kv::KvCache::new_gpu_q8(
                 gpu,
                 /* n_layers */ 1,
                 config.n_head_kv,
                 config.head_dim,
                 config.max_seq,
             )?,
-            MtpKvMode::Asym3 => hipfire_runtime::llama::KvCache::new_gpu_asym3(
+            MtpKvMode::Asym3 => hipfire_runtime::kv::KvCache::new_gpu_asym3(
                 gpu,
                 /* n_layers */ 1,
                 config.n_head_kv,
                 config.head_dim,
                 config.max_seq,
             )?,
-            MtpKvMode::Fwht4 => hipfire_runtime::llama::KvCache::new_gpu_fwht4(
+            MtpKvMode::Fwht4 => hipfire_runtime::kv::KvCache::new_gpu_fwht4(
                 gpu,
                 /* n_layers */ 1,
                 config.n_head_kv,
@@ -2070,7 +2071,7 @@ pub fn mtp_head_apply_lm_head_batched(
         }
         DType::MQ4G256 => {
             let rot_view = rot_batched.sub_offset(0, n * lm_head_weights.k);
-            llama::rotate_x_mq_batched_for(
+            weights::rotate_x_mq_batched_for(
                 gpu,
                 lm_head_weights,
                 tmp_batched,
@@ -2089,7 +2090,7 @@ pub fn mtp_head_apply_lm_head_batched(
         }
         DType::MQ3G256 => {
             let rot_view = rot_batched.sub_offset(0, n * lm_head_weights.k);
-            llama::rotate_x_mq_batched_for(
+            weights::rotate_x_mq_batched_for(
                 gpu,
                 lm_head_weights,
                 tmp_batched,
@@ -2118,7 +2119,7 @@ pub fn mtp_head_apply_lm_head_batched(
         }
         DType::MQ6G256 => {
             let rot_view = rot_batched.sub_offset(0, n * lm_head_weights.k);
-            llama::rotate_x_mq_batched_for(
+            weights::rotate_x_mq_batched_for(
                 gpu,
                 lm_head_weights,
                 tmp_batched,
@@ -2296,7 +2297,7 @@ fn weight_gemm_batched(
         DType::MQ4G256 => {
             // MQ4 needs an FWHT-rotated x first (matches trunk lm_head + dflash patterns).
             let rot = rotated_x_scratch.expect("MQ4 batched gemm requires rotated_x_scratch");
-            llama::rotate_x_mq_batched_for(gpu, w, x_batched, rot, w.k, n)?;
+            weights::rotate_x_mq_batched_for(gpu, w, x_batched, rot, w.k, n)?;
             gpu.gemm_hfq4g256(&w.buf, rot, y_batched, w.m, w.k, n)
         }
         DType::F32 => {

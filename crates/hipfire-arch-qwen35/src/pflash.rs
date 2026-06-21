@@ -19,7 +19,8 @@
 use hip_bridge::HipResult;
 use hipfire_model::tokenizer::Tokenizer;
 use hipfire_runtime::hfq::{self, HfqFile};
-use hipfire_runtime::llama::{self, ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
+use hipfire_runtime::kv::KvCache;
+use hipfire_runtime::llama::{self, ForwardScratch, LlamaConfig, LlamaWeights};
 use rdna_compute::{DType, Gpu};
 use std::path::Path;
 
@@ -771,7 +772,7 @@ fn dequant_q8_kv_position(bytes: &[u8], n_kv_heads: usize, head_dim: usize, out:
         for blk in 0..blocks_per_head {
             let bb = &head_bytes[blk * 34..(blk + 1) * 34];
             let scale_bits = u16::from_le_bytes([bb[0], bb[1]]);
-            let scale = hipfire_runtime::llama::f16_to_f32(scale_bits);
+            let scale = hipfire_runtime::quant::f16_to_f32(scale_bits);
             for j in 0..32 {
                 let v = bb[2 + j] as i8;
                 head_out[blk * 32 + j] = (v as f32) * scale;
@@ -821,7 +822,7 @@ fn drafter_prefill(
     // Drafter KV must be one of the four modes we know how to score
     // against: Q8 (the historical default) or fwht{4,3,2} (the
     // LDS-cliff-free FWHT family). The asym{4,3,2} storage layouts with
-    // `quant_fwht=true` are how llama::KvCache encodes the fwht
+    // `quant_fwht=true` are how kv::KvCache encodes the fwht
     // variants (storage layout from asym*, rotation type from the
     // quant_fwht flag). asym* WITHOUT quant_fwht (Givens-rotated) is
     // intentionally rejected here — banned from drafter scoring per

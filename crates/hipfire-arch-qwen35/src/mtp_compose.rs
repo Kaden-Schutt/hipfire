@@ -58,7 +58,7 @@ use crate::speculative::{
 };
 use hip_bridge::HipResult;
 use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
-use hipfire_runtime::llama;
+use hipfire_runtime::weights;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ─── Public state ────────────────────────────────────────────────────────
@@ -227,16 +227,16 @@ pub fn spec_step_dflash_mtp(
     for (i, &tok) in block.iter().enumerate() {
         let dst = draft_scratch.x.sub_offset(i * h, h);
         match target.weights.embd_format {
-            llama::EmbeddingFormat::HFQ4G256 => {
+            weights::EmbeddingFormat::HFQ4G256 => {
                 gpu.embedding_lookup_hfq4g256(&target.weights.token_embd, &dst, tok, h)?
             }
-            llama::EmbeddingFormat::HFQ4G128 => {
+            weights::EmbeddingFormat::HFQ4G128 => {
                 gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
             }
-            llama::EmbeddingFormat::Q8_0 => {
+            weights::EmbeddingFormat::Q8_0 => {
                 gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
             }
-            llama::EmbeddingFormat::F32 => {
+            weights::EmbeddingFormat::F32 => {
                 gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
             }
             _ => panic!("dflash_mtp: unsupported target embedding format"),
@@ -311,7 +311,7 @@ pub fn spec_step_dflash_mtp(
             }
             DType::MQ4G256 => {
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
+                weights::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
                 gpu.gemm_hfq4g256_batched_lmhead(
                     &w_out.buf,
                     &rotated,
@@ -323,7 +323,7 @@ pub fn spec_step_dflash_mtp(
             }
             DType::MQ3G256 => {
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
+                weights::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
                 gpu.gemm_hfq3g256_batched_lmhead(
                     &w_out.buf,
                     &rotated,
@@ -345,7 +345,7 @@ pub fn spec_step_dflash_mtp(
             }
             DType::MQ6G256 => {
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
+                weights::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
                 gpu.gemm_hfq6g256_batched_lmhead(
                     &w_out.buf,
                     &rotated,
@@ -359,7 +359,7 @@ pub fn spec_step_dflash_mtp(
                 // Fallback per-row gemv.
                 for i in 1..b {
                     let hidden_row = draft_scratch.x.sub_offset(i * h, h);
-                    llama::weight_gemv(gpu, w_out, &hidden_row, &target.scratch.logits)?;
+                    weights::weight_gemv(gpu, w_out, &hidden_row, &target.scratch.logits)?;
                     let logits = gpu.download_f32(&target.scratch.logits)?;
                     drafted.push(argmax_u32(&logits));
                 }
@@ -816,16 +816,16 @@ pub fn spec_step_dflash_mtp_tree(
     for (i, &tok) in block.iter().enumerate() {
         let dst = draft_scratch.x.sub_offset(i * h, h);
         match target.weights.embd_format {
-            llama::EmbeddingFormat::HFQ4G256 => {
+            weights::EmbeddingFormat::HFQ4G256 => {
                 gpu.embedding_lookup_hfq4g256(&target.weights.token_embd, &dst, tok, h)?
             }
-            llama::EmbeddingFormat::HFQ4G128 => {
+            weights::EmbeddingFormat::HFQ4G128 => {
                 gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
             }
-            llama::EmbeddingFormat::Q8_0 => {
+            weights::EmbeddingFormat::Q8_0 => {
                 gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
             }
-            llama::EmbeddingFormat::F32 => {
+            weights::EmbeddingFormat::F32 => {
                 gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
             }
             _ => panic!("dflash_mtp_tree: unsupported target embedding format"),
@@ -895,7 +895,7 @@ pub fn spec_step_dflash_mtp_tree(
             )?,
             DType::MQ4G256 => {
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
+                weights::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
                 gpu.gemm_hfq4g256_batched_lmhead(
                     &w_out.buf,
                     &rotated,
@@ -907,7 +907,7 @@ pub fn spec_step_dflash_mtp_tree(
             }
             DType::MQ3G256 => {
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
+                weights::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
                 gpu.gemm_hfq3g256_batched_lmhead(
                     &w_out.buf,
                     &rotated,
@@ -927,7 +927,7 @@ pub fn spec_step_dflash_mtp_tree(
             )?,
             DType::MQ6G256 => {
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
+                weights::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
                 gpu.gemm_hfq6g256_batched_lmhead(
                     &w_out.buf,
                     &rotated,

@@ -41,7 +41,7 @@ use hipfire_runtime::multi_gpu::Gpus;
 // MERGE-COMBINE: union of OUR EmbeddingFormat (hetero drafter embed) + #352
 // Event/Graph/GraphExec/Stream (proposal-graph device-token-chain helpers).
 use hip_bridge::{Event, Graph, GraphExec, HipResult, Stream};
-use hipfire_runtime::llama::{self, EmbeddingFormat};
+use hipfire_runtime::weights::{self, EmbeddingFormat};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::time::Instant;
 
@@ -174,7 +174,7 @@ fn mtp_proposal_graph_eligible_for(
 }
 
 fn mtp_device_token_chain_eligible_for(
-    embd_format: llama::EmbeddingFormat,
+    embd_format: weights::EmbeddingFormat,
     use_sampling: bool,
     use_p_min: bool,
 ) -> bool {
@@ -182,7 +182,7 @@ fn mtp_device_token_chain_eligible_for(
         && !use_p_min
         && matches!(
             embd_format,
-            llama::EmbeddingFormat::HFQ4G256 | llama::EmbeddingFormat::Q8_0
+            weights::EmbeddingFormat::HFQ4G256 | weights::EmbeddingFormat::Q8_0
         )
 }
 
@@ -852,10 +852,10 @@ fn embed_device_token_into(
     dim: usize,
 ) -> HipResult<()> {
     match weights.embd_format {
-        llama::EmbeddingFormat::HFQ4G256 => {
+        weights::EmbeddingFormat::HFQ4G256 => {
             gpu.embedding_lookup_hfq4g256_batched(&weights.token_embd, out, token_id, 1, dim)
         }
-        llama::EmbeddingFormat::Q8_0 => {
+        weights::EmbeddingFormat::Q8_0 => {
             gpu.embedding_lookup_q8_batched(&weights.token_embd, out, token_id, 1, dim)
         }
         other => panic!("device-token MTP chain does not support embedding format {other:?}"),
@@ -1501,7 +1501,7 @@ pub fn spec_step_mtp(
         }
         DType::MQ4G256 => {
             let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
+            weights::rotate_x_mq_batched_for(
                 gpu,
                 w_out,
                 &state.verify_hidden,
@@ -1520,7 +1520,7 @@ pub fn spec_step_mtp(
         }
         DType::MQ3G256 => {
             let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
+            weights::rotate_x_mq_batched_for(
                 gpu,
                 w_out,
                 &state.verify_hidden,
@@ -1549,7 +1549,7 @@ pub fn spec_step_mtp(
         }
         DType::MQ6G256 => {
             let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
+            weights::rotate_x_mq_batched_for(
                 gpu,
                 w_out,
                 &state.verify_hidden,
@@ -1571,7 +1571,7 @@ pub fn spec_step_mtp(
             for i in 0..n_verify {
                 let row = state.verify_hidden.sub_offset(i * dim, dim);
                 let logits_row = state.verify_logits.sub_offset(i * vocab, vocab);
-                llama::weight_gemv(gpu, w_out, &row, &logits_row)?;
+                weights::weight_gemv(gpu, w_out, &row, &logits_row)?;
             }
         }
     }
@@ -1945,7 +1945,7 @@ pub fn spec_step_mtp_compressed(
         }
         DType::MQ4G256 => {
             let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
+            weights::rotate_x_mq_batched_for(
                 gpu,
                 w_out,
                 &state.verify_hidden,
@@ -1964,7 +1964,7 @@ pub fn spec_step_mtp_compressed(
         }
         DType::MQ3G256 => {
             let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
+            weights::rotate_x_mq_batched_for(
                 gpu,
                 w_out,
                 &state.verify_hidden,
@@ -1993,7 +1993,7 @@ pub fn spec_step_mtp_compressed(
         }
         DType::MQ6G256 => {
             let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
+            weights::rotate_x_mq_batched_for(
                 gpu,
                 w_out,
                 &state.verify_hidden,
@@ -2014,7 +2014,7 @@ pub fn spec_step_mtp_compressed(
             for i in 0..n_verify {
                 let row = state.verify_hidden.sub_offset(i * dim, dim);
                 let logits_row = state.verify_logits.sub_offset(i * vocab, vocab);
-                llama::weight_gemv(gpu, w_out, &row, &logits_row)?;
+                weights::weight_gemv(gpu, w_out, &row, &logits_row)?;
             }
         }
     }
@@ -2417,7 +2417,7 @@ pub fn spec_step_mtp_compressed_serial(
                     &state.mtp_scratch.tmp,
                     head.config.rms_norm_eps,
                 )?;
-                llama::weight_gemv(
+                weights::weight_gemv(
                     gpu,
                     &trunk_weights.output,
                     &state.mtp_scratch.tmp,
@@ -2747,7 +2747,7 @@ pub fn spec_step_mtp_compressed_serial(
         }
         DType::MQ4G256 => {
             let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
+            weights::rotate_x_mq_batched_for(
                 gpu,
                 w_out,
                 &state.verify_hidden,
@@ -2766,7 +2766,7 @@ pub fn spec_step_mtp_compressed_serial(
         }
         DType::MQ3G256 => {
             let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
+            weights::rotate_x_mq_batched_for(
                 gpu,
                 w_out,
                 &state.verify_hidden,
@@ -2795,7 +2795,7 @@ pub fn spec_step_mtp_compressed_serial(
         }
         DType::MQ6G256 => {
             let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
+            weights::rotate_x_mq_batched_for(
                 gpu,
                 w_out,
                 &state.verify_hidden,
@@ -2816,7 +2816,7 @@ pub fn spec_step_mtp_compressed_serial(
             for i in 0..n_verify {
                 let row = state.verify_hidden.sub_offset(i * dim, dim);
                 let logits_row = state.verify_logits.sub_offset(i * vocab, vocab);
-                llama::weight_gemv(gpu, w_out, &row, &logits_row)?;
+                weights::weight_gemv(gpu, w_out, &row, &logits_row)?;
             }
         }
     }
@@ -3348,7 +3348,7 @@ pub fn spec_step_mtp_compressed_serial_multi(
     output_device: usize,
     target_config: &qwen35::Qwen35Config,
     trunk_weights: &Qwen35Weights,
-    target_kv: &mut hipfire_runtime::llama::KvCache,
+    target_kv: &mut hipfire_runtime::kv::KvCache,
     target_dn: &mut qwen35::DeltaNetState,
     pp_scratch_set: &qwen35::Qwen35ScratchSet,
     head: &Qwen35MtpHead,
@@ -3585,7 +3585,7 @@ pub fn spec_step_mtp_compressed_serial_multi(
             }
             DType::MQ4G256 => {
                 let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-                llama::rotate_x_mq_batched_for(
+                weights::rotate_x_mq_batched_for(
                     target_gpu,
                     w_out,
                     &state.verify_hidden,
@@ -3604,7 +3604,7 @@ pub fn spec_step_mtp_compressed_serial_multi(
             }
             DType::MQ3G256 => {
                 let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-                llama::rotate_x_mq_batched_for(
+                weights::rotate_x_mq_batched_for(
                     target_gpu,
                     w_out,
                     &state.verify_hidden,
@@ -3633,7 +3633,7 @@ pub fn spec_step_mtp_compressed_serial_multi(
             }
             DType::MQ6G256 => {
                 let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-                llama::rotate_x_mq_batched_for(
+                weights::rotate_x_mq_batched_for(
                     target_gpu,
                     w_out,
                     &state.verify_hidden,
@@ -3654,7 +3654,7 @@ pub fn spec_step_mtp_compressed_serial_multi(
                 for i in 0..n_verify {
                     let row = state.verify_hidden.sub_offset(i * dim, dim);
                     let logits_row = state.verify_logits.sub_offset(i * vocab, vocab);
-                    llama::weight_gemv(target_gpu, w_out, &row, &logits_row)?;
+                    weights::weight_gemv(target_gpu, w_out, &row, &logits_row)?;
                 }
             }
         }
@@ -3864,27 +3864,27 @@ mod tests {
     #[test]
     fn device_token_chain_is_greedy_only_and_embedding_gated() {
         assert!(mtp_device_token_chain_eligible_for(
-            llama::EmbeddingFormat::HFQ4G256,
+            weights::EmbeddingFormat::HFQ4G256,
             false,
             false
         ));
         assert!(mtp_device_token_chain_eligible_for(
-            llama::EmbeddingFormat::Q8_0,
+            weights::EmbeddingFormat::Q8_0,
             false,
             false
         ));
         assert!(!mtp_device_token_chain_eligible_for(
-            llama::EmbeddingFormat::HFQ4G128,
+            weights::EmbeddingFormat::HFQ4G128,
             false,
             false
         ));
         assert!(!mtp_device_token_chain_eligible_for(
-            llama::EmbeddingFormat::HFQ4G256,
+            weights::EmbeddingFormat::HFQ4G256,
             true,
             false
         ));
         assert!(!mtp_device_token_chain_eligible_for(
-            llama::EmbeddingFormat::HFQ4G256,
+            weights::EmbeddingFormat::HFQ4G256,
             false,
             true
         ));

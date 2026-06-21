@@ -22,15 +22,17 @@ use hipfire_dispatch::types::{DispatchError, RotationPlan};
 use hipfire_model::ModelSource;
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use hipfire_runtime::hfq_modules::HfqModuleKind;
-use hipfire_runtime::llama::{
-    self, f16_to_f32, f32_to_f16, fused_rmsnorm_rotate_for_mq, fused_rmsnorm_rotate_for_paro,
+use hipfire_runtime::kv;
+use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_runtime::quant::{f16_to_f32, f32_to_f16};
+use hipfire_runtime::tp_shard::ShardConfig;
+use hipfire_runtime::weights::{
+    fused_rmsnorm_rotate_for_mq, fused_rmsnorm_rotate_for_paro,
     fused_rmsnorm_rotate_mq_batched_for, fused_silu_mul_rotate_mq_batched_for,
     fused_silu_mul_rotate_mq_for, rotate_x_mq_batched_for, rotate_x_mq_for, weight_gemv,
     weight_gemv_prerotated, weight_gemv_residual, weight_gemv_swiglu_residual, EmbeddingFormat,
     ParoRotation, WeightTensor,
 };
-use hipfire_runtime::multi_gpu::Gpus;
-use hipfire_runtime::tp_shard::ShardConfig;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -3442,19 +3444,19 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
 
     let f32_data: Vec<f32> = match info.quant_type {
         1 | 2 | 16 => hfq_plain_tensor_as_f32(info, &data, name),
-        3 => hipfire_runtime::llama::dequantize_q8_0(&data, n),
+        3 => hipfire_runtime::quant::dequantize_q8_0(&data, n),
         14 => {
             // MQ8-G256: [f16 scale][int8 × 256] = 258 bytes per 256 weights
             let group_size: usize = 256;
             let bytes_per_group: usize = 258;
             let n_groups = data.len() / bytes_per_group;
-            let signs1 = hipfire_runtime::llama::KvCache::gen_fwht_signs(42, 256);
-            let signs2 = hipfire_runtime::llama::KvCache::gen_fwht_signs(1042, 256);
+            let signs1 = hipfire_runtime::kv::KvCache::gen_fwht_signs(42, 256);
+            let signs2 = hipfire_runtime::kv::KvCache::gen_fwht_signs(1042, 256);
             let mut out = Vec::with_capacity(n_groups * group_size);
             for g in 0..n_groups {
                 let off = g * bytes_per_group;
                 let scale_bits = data[off] as u16 | ((data[off + 1] as u16) << 8);
-                let scale = hipfire_runtime::llama::f16_to_f32(scale_bits);
+                let scale = hipfire_runtime::quant::f16_to_f32(scale_bits);
                 let start = out.len();
                 for i in 0..256 {
                     let q = data[off + 2 + i] as i8;
@@ -3503,8 +3505,8 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             let mut out = Vec::with_capacity(n_groups * group_size);
             let (signs1, signs2) = if is_mq {
                 (
-                    Some(hipfire_runtime::llama::KvCache::gen_fwht_signs(42, 256)),
-                    Some(hipfire_runtime::llama::KvCache::gen_fwht_signs(1042, 256)),
+                    Some(hipfire_runtime::kv::KvCache::gen_fwht_signs(42, 256)),
+                    Some(hipfire_runtime::kv::KvCache::gen_fwht_signs(1042, 256)),
                 )
             } else {
                 (None, None)
@@ -3699,14 +3701,14 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             let bytes_per_group: usize = 112;
             let n_groups = data.len() / bytes_per_group;
             let mut out = Vec::with_capacity(n_groups * group_size);
-            let signs1 = hipfire_runtime::llama::KvCache::gen_fwht_signs(42, 256);
-            let signs2 = hipfire_runtime::llama::KvCache::gen_fwht_signs(1042, 256);
+            let signs1 = hipfire_runtime::kv::KvCache::gen_fwht_signs(42, 256);
+            let signs2 = hipfire_runtime::kv::KvCache::gen_fwht_signs(1042, 256);
             for g in 0..n_groups {
                 let off = g * bytes_per_group;
                 let mut cb = [0.0f32; 8];
                 for k in 0..8 {
                     let bits = u16::from_le_bytes([data[off + 2 * k], data[off + 2 * k + 1]]);
-                    cb[k] = hipfire_runtime::llama::f16_to_f32(bits);
+                    cb[k] = hipfire_runtime::quant::f16_to_f32(bits);
                 }
                 let start = out.len();
                 for chunk in 0..32 {
@@ -3764,14 +3766,14 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             let bytes_per_group: usize = 72;
             let n_groups = data.len() / bytes_per_group;
             let mut out = Vec::with_capacity(n_groups * group_size);
-            let signs1 = hipfire_runtime::llama::KvCache::gen_fwht_signs(42, 256);
-            let signs2 = hipfire_runtime::llama::KvCache::gen_fwht_signs(1042, 256);
+            let signs1 = hipfire_runtime::kv::KvCache::gen_fwht_signs(42, 256);
+            let signs2 = hipfire_runtime::kv::KvCache::gen_fwht_signs(1042, 256);
             for g in 0..n_groups {
                 let off = g * bytes_per_group;
                 let mut cb = [0.0f32; 4];
                 for k in 0..4 {
                     let bits = u16::from_le_bytes([data[off + 2 * k], data[off + 2 * k + 1]]);
-                    cb[k] = hipfire_runtime::llama::f16_to_f32(bits);
+                    cb[k] = hipfire_runtime::quant::f16_to_f32(bits);
                 }
                 let start = out.len();
                 for i in 0..64 {
@@ -3817,14 +3819,14 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             let bytes_per_group: usize = 160;
             let n_groups = data.len() / bytes_per_group;
             let mut out = Vec::with_capacity(n_groups * group_size);
-            let signs1 = hipfire_runtime::llama::KvCache::gen_fwht_signs(42, 256);
-            let signs2 = hipfire_runtime::llama::KvCache::gen_fwht_signs(1042, 256);
+            let signs1 = hipfire_runtime::kv::KvCache::gen_fwht_signs(42, 256);
+            let signs2 = hipfire_runtime::kv::KvCache::gen_fwht_signs(1042, 256);
             for g in 0..n_groups {
                 let off = g * bytes_per_group;
                 let mut cb = [0.0f32; 16];
                 for k in 0..16 {
                     let bits = u16::from_le_bytes([data[off + 2 * k], data[off + 2 * k + 1]]);
-                    cb[k] = hipfire_runtime::llama::f16_to_f32(bits);
+                    cb[k] = hipfire_runtime::quant::f16_to_f32(bits);
                 }
                 let start = out.len();
                 for i in 0..128 {
@@ -3866,8 +3868,8 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             let bytes_per_group: usize = if is_mq3 { 104 } else { 72 };
             let n_groups = data.len() / bytes_per_group;
             let mut out = Vec::with_capacity(n_groups * group_size);
-            let signs1 = hipfire_runtime::llama::KvCache::gen_fwht_signs(42, 256);
-            let signs2 = hipfire_runtime::llama::KvCache::gen_fwht_signs(1042, 256);
+            let signs1 = hipfire_runtime::kv::KvCache::gen_fwht_signs(42, 256);
+            let signs2 = hipfire_runtime::kv::KvCache::gen_fwht_signs(1042, 256);
             for g in 0..n_groups {
                 let off = g * bytes_per_group;
                 let scale =
@@ -4674,7 +4676,10 @@ pub fn capture_pflash_block_scores(
 ) -> HipResult<Vec<Vec<f32>>> {
     let n_tok = tokens.len();
     assert!(n_tok > 0, "capture_pflash_block_scores: empty tokens");
-    assert!(block_size > 0, "capture_pflash_block_scores: block_size must be > 0");
+    assert!(
+        block_size > 0,
+        "capture_pflash_block_scores: block_size must be > 0"
+    );
     for &l in layers {
         assert!(
             config.layer_types.get(l) == Some(&LayerType::FullAttention),
@@ -4682,7 +4687,7 @@ pub fn capture_pflash_block_scores(
         );
     }
 
-    let mut kv = llama::KvCache::new_gpu(
+    let mut kv = kv::KvCache::new_gpu(
         gpu,
         config.n_layers,
         config.n_kv_heads,
@@ -4738,7 +4743,11 @@ pub fn dump_embed_fp32(
     }
     let (vocab, dim) = (config.vocab_size, config.dim);
     let data = gpu.download_f32(&weights.token_embd)?;
-    assert_eq!(data.len(), vocab * dim, "dump_embed_fp32: embed size mismatch");
+    assert_eq!(
+        data.len(),
+        vocab * dim,
+        "dump_embed_fp32: embed size mismatch"
+    );
     let io_err = |e: std::io::Error| rdna_compute::HipError {
         code: u32::MAX,
         message: format!("dump_embed_fp32 io: {e}"),
@@ -4788,7 +4797,7 @@ pub fn collect_calibration_artifacts(
     }
 
     let n_tok = tokens.len();
-    let mut kv = llama::KvCache::new_gpu(
+    let mut kv = kv::KvCache::new_gpu(
         gpu,
         config.n_layers,
         config.n_kv_heads,
@@ -7622,7 +7631,7 @@ fn moe_ffn_decode_impl(
                     .paro
                     .as_ref()
                     .expect("routed_gate_up_paro implies experts[0].gate_up.paro.is_some()");
-                hipfire_runtime::llama::rotate_x_paro_for(
+                hipfire_runtime::weights::rotate_x_paro_for(
                     gpu,
                     paro,
                     x_norm,
@@ -8305,7 +8314,7 @@ fn moe_ffn_decode_impl(
     // Build one DispatchCtx per token (the family threads it through every
     // inner GEMV — no internal DispatchCtx::new reconstructions).
     let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
-    hipfire_runtime::llama::moe_family()
+    hipfire_runtime::dispatch::moe_family()
         .run(&ctx, gpu, &moe_params)
         .map_err(HipError::from)?;
     Ok(())
@@ -8322,7 +8331,7 @@ pub fn forward(
     config: &Qwen35Config,
     token: u32,
     pos: usize,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &mut kv::KvCache,
     dn_state: &mut DeltaNetState,
 ) -> HipResult<Vec<f32>> {
     let dim = config.dim;
@@ -8351,7 +8360,7 @@ fn forward_from_x(
     config: &Qwen35Config,
     x: GpuTensor,
     pos: usize,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &mut kv::KvCache,
     dn_state: &mut DeltaNetState,
 ) -> HipResult<Vec<f32>> {
     let logits_gpu = forward_from_x_gpu(gpu, weights, config, x, pos, kv_cache, dn_state)?;
@@ -8377,7 +8386,7 @@ fn forward_from_x_gpu(
     config: &Qwen35Config,
     x: GpuTensor,
     pos: usize,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &mut kv::KvCache,
     dn_state: &mut DeltaNetState,
 ) -> HipResult<GpuTensor> {
     let dim = config.dim;
@@ -8825,7 +8834,7 @@ pub fn forward_scratch(
     config: &Qwen35Config,
     token: u32,
     pos: usize,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &mut kv::KvCache,
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
@@ -9004,7 +9013,7 @@ pub fn forward_scratch_capture_gdn_tape(
     config: &Qwen35Config,
     token: u32,
     pos: usize,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &mut kv::KvCache,
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
     gdn_tape: &mut crate::speculative::GdnTape,
@@ -9175,7 +9184,7 @@ pub struct PrefillBatchScratch {
 pub struct DensePrefillSessionBatchRow<'a> {
     pub tokens: &'a [u32],
     pub start_pos: usize,
-    pub kv_cache: &'a mut llama::KvCache,
+    pub kv_cache: &'a mut kv::KvCache,
     pub dn_state: &'a mut DeltaNetState,
     pub logits: &'a GpuTensor,
 }
@@ -12400,7 +12409,7 @@ fn kld_direct_f16kv_attention_enabled() -> bool {
 
 fn kld_direct_f16kv_attention_eligible(
     gpu: &Gpu,
-    kv_cache: &llama::KvCache,
+    kv_cache: &kv::KvCache,
     config: &Qwen35Config,
     start_pos: usize,
     tree_verify: Option<&TreeVerifyCtx<'_>>,
@@ -12524,7 +12533,7 @@ fn q8_gdn_verify_serial_frames_enabled() -> bool {
 
 fn kld_fp32_gqa4_attention_eligible(
     gpu: &Gpu,
-    kv_cache: &llama::KvCache,
+    kv_cache: &kv::KvCache,
     config: &Qwen35Config,
     start_pos: usize,
     tree_verify: Option<&TreeVerifyCtx<'_>>,
@@ -12874,7 +12883,7 @@ pub fn forward_prefill_batch_single_chunk_captured(
     config: &Qwen35Config,
     tokens: &[u32],
     start_pos: usize,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &mut kv::KvCache,
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
     pbs: &PrefillBatchScratch,
@@ -12908,7 +12917,7 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
     config: &Qwen35Config,
     tokens: &[u32],
     start_pos: usize,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &mut kv::KvCache,
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
     pbs: &PrefillBatchScratch,
@@ -13159,7 +13168,7 @@ pub fn forward_prefill_batch(
     config: &Qwen35Config,
     tokens: &[u32],
     start_pos: usize,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &mut kv::KvCache,
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
     hidden_rb: Option<&mut HiddenStateRingBuffer>,
@@ -13193,7 +13202,7 @@ pub fn forward_prefill_batch_force_q8_gdn_per_token(
     config: &Qwen35Config,
     tokens: &[u32],
     start_pos: usize,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &mut kv::KvCache,
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
     hidden_rb: Option<&mut HiddenStateRingBuffer>,
@@ -13228,7 +13237,7 @@ pub fn forward_prefill_batch_with_pbs(
     config: &Qwen35Config,
     tokens: &[u32],
     start_pos: usize,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &mut kv::KvCache,
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
     hidden_rb: Option<&mut HiddenStateRingBuffer>,
@@ -13280,7 +13289,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
     config: &Qwen35Config,
     tokens: &[u32],
     start_pos: usize,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &mut kv::KvCache,
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
     mut hidden_rb: Option<&mut HiddenStateRingBuffer>,
@@ -13700,7 +13709,7 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
     // HFP4G32 / MFP4G32 (v2 #2 batched WMMA prefill): same arch gate as
     // MQ3. The 4 fused kernels (gemm_qkv/qkvza/gate_up/residual_hfp4g32_wmma)
     // ship in pairs for gfx11 + gfx12; identical eligibility to llama.rs
-    // (see hipfire_runtime::llama::is_batchable_la).
+    // (see hipfire_runtime::dispatch::is_batchable_la).
     let fp4_with_wmma = matches!(dt, DType::HFP4G32 | DType::MFP4G32)
         && matches!(
             arch,
@@ -14459,7 +14468,7 @@ fn run_plain_gemm_key(
         y,
         batch_size: n,
     };
-    hipfire_runtime::llama::gemm_family()
+    hipfire_runtime::dispatch::gemm_family()
         .run_key(key, &ctx, gpu, &params)
         .map_err(HipError::from)
 }
@@ -14510,7 +14519,7 @@ fn run_residual_gemm_key(
         y,
         batch_size: n,
     };
-    hipfire_runtime::llama::gemm_family()
+    hipfire_runtime::dispatch::gemm_family()
         .run_key(key, &ctx, gpu, &params)
         .map_err(HipError::from)
 }
@@ -14559,7 +14568,7 @@ fn run_fused_gate_up_key(
         rot_scratch: &[],
         batch_size: Some(n),
     };
-    hipfire_runtime::llama::fused_qkv_family()
+    hipfire_runtime::dispatch::fused_qkv_family()
         .run(&ctx, gpu, &params)
         .map_err(HipError::from)
 }
@@ -14608,7 +14617,7 @@ fn run_fused_qkv_key(
         rot_scratch: &[],
         batch_size: Some(n),
     };
-    hipfire_runtime::llama::fused_qkv_family()
+    hipfire_runtime::dispatch::fused_qkv_family()
         .run(&ctx, gpu, &params)
         .map_err(HipError::from)
 }
@@ -14655,7 +14664,7 @@ fn run_fused_qkvza_key(
         rot_scratch: &[],
         batch_size: Some(n),
     };
-    hipfire_runtime::llama::fused_qkv_family()
+    hipfire_runtime::dispatch::fused_qkv_family()
         .run(&ctx, gpu, &params)
         .map_err(HipError::from)
 }
@@ -14911,7 +14920,7 @@ fn prefill_moe_ffn_body_batched(
             y: router_logits,
             batch_size: n,
         };
-        hipfire_runtime::llama::gemm_family()
+        hipfire_runtime::dispatch::gemm_family()
             .run_key(key, &ctx, gpu, &params)
             .map_err(HipError::from)?;
     }
@@ -16225,7 +16234,7 @@ fn prefill_moe_ffn_body_batched(
         down_awq_scale,
         routed_out,
     };
-    hipfire_runtime::llama::moe_family()
+    hipfire_runtime::dispatch::moe_family()
         .run_prefill(ctx, gpu, &moe_prefill_params)
         .map_err(HipError::from)?;
 
@@ -16327,7 +16336,7 @@ fn forward_prefill_chunk(
     config: &Qwen35Config,
     tokens: &[u32],
     start_pos: usize,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &mut kv::KvCache,
     dn_state: &mut DeltaNetState,
     s: &Qwen35Scratch,
     pbs: &PrefillBatchScratch,
@@ -21692,7 +21701,7 @@ fn run_fa_layer_body(
     layer_idx: usize,
     _kv_layer_idx: usize,
     pos: usize,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &mut kv::KvCache,
     s: &Qwen35Scratch,
 ) -> HipResult<()> {
     let layer = match &weights.layers[layer_idx] {
@@ -22348,7 +22357,7 @@ pub fn forward_scratch_with_hidden(
     config: &Qwen35Config,
     token: u32,
     pos: usize,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &mut kv::KvCache,
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
     hidden_rb: &mut HiddenStateRingBuffer,
@@ -22396,7 +22405,7 @@ fn forward_scratch_no_logits(
     config: &Qwen35Config,
     token: u32,
     pos: usize,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &mut kv::KvCache,
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
@@ -22433,7 +22442,7 @@ pub fn forward_scratch_embed(
     config: &Qwen35Config,
     embedding_data: &[f32],
     pos: usize,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &mut kv::KvCache,
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
@@ -22575,7 +22584,7 @@ fn forward_scratch_layers(
     weights: &Qwen35Weights,
     config: &Qwen35Config,
     pos: usize,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &mut kv::KvCache,
     dn_state: &mut DeltaNetState,
     s: &Qwen35Scratch,
     hidden_rb: Option<&mut HiddenStateRingBuffer>,
@@ -23273,7 +23282,7 @@ fn forward_scratch_layers(
                     )?;
                 }
 
-                hipfire_runtime::llama::weight_gemv_swiglu_residual(
+                hipfire_runtime::weights::weight_gemv_swiglu_residual(
                     gpu,
                     &layer.w_down,
                     &s.gate_ffn,
@@ -24478,7 +24487,7 @@ fn forward_scratch_layers(
                     config.norm_eps,
                 )?;
 
-                hipfire_runtime::llama::weight_gemv_swiglu_residual(
+                hipfire_runtime::weights::weight_gemv_swiglu_residual(
                     gpu,
                     &layer.w_down,
                     &s.gate_ffn,
@@ -26211,7 +26220,7 @@ fn triattn_tap(
 fn kv_cache_attention_dispatch(
     ctx: &DispatchCtx,
     gpu: &mut Gpu,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &mut kv::KvCache,
     s: &Qwen35Scratch,
     config: &Qwen35Config,
     layer_idx: usize,
@@ -26385,7 +26394,7 @@ struct Qwen35Bindings<'a> {
     layer: &'a LayerWeights,
     s: &'a Qwen35Scratch,
     config: &'a Qwen35Config,
-    kv_cache: &'a mut llama::KvCache,
+    kv_cache: &'a mut kv::KvCache,
     dn_state: &'a DeltaNetState,
     pos: usize,
     layer_idx: usize,
@@ -26556,7 +26565,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     LayerWeights::FullAttn(l) => &l.w_down,
                     _ => return Err(HipError::new(0, "RESID_DOWN_SWIGLU on MoE layer")),
                 };
-                hipfire_runtime::llama::weight_gemv_swiglu_residual(
+                hipfire_runtime::weights::weight_gemv_swiglu_residual(
                     gpu,
                     w_down,
                     &s.gate_ffn,
@@ -26900,7 +26909,7 @@ fn forward_scratch_layers_lowered(
     weights: &Qwen35Weights,
     config: &Qwen35Config,
     pos: usize,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &mut kv::KvCache,
     dn_state: &DeltaNetState,
     s: &Qwen35Scratch,
     needs_logits: bool,
@@ -26995,7 +27004,7 @@ pub fn forward_ep(
     config: &Qwen35Config,
     token: u32,
     pos: usize,
-    kv_per_rank: &mut [llama::KvCache],
+    kv_per_rank: &mut [kv::KvCache],
     dn_per_rank: &[DeltaNetState],
     scratch_per_rank: &[Qwen35Scratch],
     partials: &[GpuTensor],
@@ -27167,7 +27176,7 @@ pub fn forward_prefill_batch_ep(
     config: &Qwen35Config,
     tokens: &[u32],
     start_pos: usize,
-    kv_per_rank: &mut [llama::KvCache],
+    kv_per_rank: &mut [kv::KvCache],
     dn_per_rank: &mut [DeltaNetState],
     scratch_per_rank: &[Qwen35Scratch],
     pbs_per_rank: &[PrefillBatchScratch],
@@ -27387,7 +27396,7 @@ fn forward_scratch_layers_multi(
     weights: &Qwen35Weights,
     config: &Qwen35Config,
     pos: usize,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &mut kv::KvCache,
     dn_state: &mut DeltaNetState,
     scratch_set: &Qwen35ScratchSet,
 ) -> HipResult<()> {
@@ -29118,7 +29127,7 @@ pub fn forward_scratch_multi(
     config: &Qwen35Config,
     token: u32,
     pos: usize,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &mut kv::KvCache,
     dn_state: &mut DeltaNetState,
     scratch_set: &Qwen35ScratchSet,
 ) -> HipResult<()> {
@@ -29203,7 +29212,7 @@ pub fn forward_prefill_batch_multi(
     config: &Qwen35Config,
     tokens: &[u32],
     start_pos: usize,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &mut kv::KvCache,
     dn_state: &mut DeltaNetState,
     scratch_set: &Qwen35ScratchSet,
 ) -> HipResult<()> {
@@ -29230,7 +29239,7 @@ pub fn forward_prefill_batch_multi_with_caps(
     config: &Qwen35Config,
     tokens: &[u32],
     start_pos: usize,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &mut kv::KvCache,
     dn_state: &mut DeltaNetState,
     scratch_set: &Qwen35ScratchSet,
     per_token_hidden_out: Option<&GpuTensor>,
@@ -29497,7 +29506,7 @@ pub fn forward_gpu(
     config: &Qwen35Config,
     token: u32,
     pos: usize,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &mut kv::KvCache,
     dn_state: &mut DeltaNetState,
 ) -> HipResult<GpuTensor> {
     let dim = config.dim;
@@ -29524,7 +29533,7 @@ pub fn forward_with_embedding(
     config: &Qwen35Config,
     embedding_data: &[f32],
     pos: usize,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &mut kv::KvCache,
     dn_state: &mut DeltaNetState,
 ) -> HipResult<Vec<f32>> {
     let x = gpu.upload_f32(embedding_data, &[config.dim])?;
