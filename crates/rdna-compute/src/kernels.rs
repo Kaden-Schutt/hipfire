@@ -3773,6 +3773,11 @@ pub const KVARN_DEQUANT_TILE_SRC: &str =
 pub const ATTENTION_COLD_SLOTS_SRC: &str =
     include_str!("../../../kernels/src/attention_cold_slots.hip");
 
+/// Phase 2b hot+cold tier merge: fold two flash-attention tiers' (out,m,l)
+/// partials into one via online softmax. See flash_tier_merge.hip.
+pub const FLASH_TIER_MERGE_SRC: &str =
+    include_str!("../../../kernels/src/flash_tier_merge.hip");
+
 /// KVarN write-side gather (Phase D1 #2): transpose a contiguous run of
 /// token-major K rows into the channel-major `[head_dim × GROUP]` tiles that
 /// `kvarn_quantize_tile` consumes. See `kernels/src/kvarn_gather_k_tiles.hip`.

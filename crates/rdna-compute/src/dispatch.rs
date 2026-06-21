@@ -45711,12 +45711,15 @@ impl Gpu {
     /// [n_kv_heads × n_slots × 256] (dequantized f32, all slots visible, GQA) →
     /// `out` [n_heads × 256]. Zero LDS, one wave per q-head. head_dim must be 256.
     /// Parity oracle: `hipfire_kvquant::ColdTier::two_tier_attend(.., n_hot=0)`.
+    #[allow(clippy::too_many_arguments)]
     pub fn attention_cold_slots(
         &mut self,
         q: &GpuTensor,
         k: &GpuTensor,
         v: &GpuTensor,
         out: &GpuTensor,
+        m_out: &GpuTensor, // [n_heads] flash max — for hot/cold tier merge
+        l_out: &GpuTensor, // [n_heads] flash denom
         n_heads: usize,
         n_kv_heads: usize,
         n_slots: usize,
@@ -45732,6 +45735,8 @@ impl Gpu {
         let kp = k.buf.as_ptr();
         let vp = v.buf.as_ptr();
         let op = out.buf.as_ptr();
+        let mop = m_out.buf.as_ptr();
+        let lop = l_out.buf.as_ptr();
         let mut nh = n_heads as i32;
         let mut nkv = n_kv_heads as i32;
         let mut ns = n_slots as i32;
@@ -45741,12 +45746,73 @@ impl Gpu {
             &kp as *const _ as *mut c_void,
             &vp as *const _ as *mut c_void,
             &op as *const _ as *mut c_void,
+            &mop as *const _ as *mut c_void,
+            &lop as *const _ as *mut c_void,
             &mut nh as *mut _ as *mut c_void,
             &mut nkv as *mut _ as *mut c_void,
             &mut ns as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
         ];
         let func = &self.functions["attention_cold_slots"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Phase 2b hot+cold merge: fold two flash tiers' (out,m,l) partials into one
+    /// via online softmax. `hot` = (out_a, m_a, l_a), `cold` = (out_b, m_b, l_b);
+    /// writes merged normalized `out` and (chainable) combined `m_out`,`l_out`.
+    /// One wave per q-head, zero LDS. See flash_tier_merge.hip.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_tier_merge(
+        &mut self,
+        out_a: &GpuTensor,
+        m_a: &GpuTensor,
+        l_a: &GpuTensor,
+        out_b: &GpuTensor,
+        m_b: &GpuTensor,
+        l_b: &GpuTensor,
+        out: &GpuTensor,
+        m_out: &GpuTensor,
+        l_out: &GpuTensor,
+        n_heads: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "flash_tier_merge",
+            kernels::FLASH_TIER_MERGE_SRC,
+            "flash_tier_merge",
+        )?;
+        let oap = out_a.buf.as_ptr();
+        let map = m_a.buf.as_ptr();
+        let lap = l_a.buf.as_ptr();
+        let obp = out_b.buf.as_ptr();
+        let mbp = m_b.buf.as_ptr();
+        let lbp = l_b.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mop = m_out.buf.as_ptr();
+        let lop = l_out.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &oap as *const _ as *mut c_void,
+            &map as *const _ as *mut c_void,
+            &lap as *const _ as *mut c_void,
+            &obp as *const _ as *mut c_void,
+            &mbp as *const _ as *mut c_void,
+            &lbp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mop as *const _ as *mut c_void,
+            &lop as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions["flash_tier_merge"];
         unsafe {
             self.hip.launch_kernel(
                 func,

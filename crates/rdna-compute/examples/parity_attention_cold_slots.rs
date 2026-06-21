@@ -67,7 +67,9 @@ fn main() {
     let kd = gpu.upload_f32(&k, &[nkv, ns, d]).unwrap();
     let vd = gpu.upload_f32(&v, &[nkv, ns, d]).unwrap();
     let od = gpu.alloc_tensor(&[nh * d], DType::F32).unwrap();
-    gpu.attention_cold_slots(&qd, &kd, &vd, &od, nh, nkv, ns, scale).unwrap();
+    let md = gpu.alloc_tensor(&[nh], DType::F32).unwrap();
+    let ld = gpu.alloc_tensor(&[nh], DType::F32).unwrap();
+    gpu.attention_cold_slots(&qd, &kd, &vd, &od, &md, &ld, nh, nkv, ns, scale).unwrap();
     gpu.device_synchronize().unwrap();
     let got = gpu.download_f32(&od).unwrap();
 

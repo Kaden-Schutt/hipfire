@@ -21,7 +21,9 @@ extern "C" __global__ void attention_cold_slots(
     const float* __restrict__ Q,   // [n_heads * 256]
     const float* __restrict__ K,   // [n_kv_heads * n_slots * 256]
     const float* __restrict__ V,   // [n_kv_heads * n_slots * 256]
-    float*       __restrict__ OUT, // [n_heads * 256]
+    float*       __restrict__ OUT, // [n_heads * 256] (normalized)
+    float*       __restrict__ M_OUT, // [n_heads] flash max (or null) — for tier merge
+    float*       __restrict__ L_OUT, // [n_heads] flash denom (or null)
     int n_heads, int n_kv_heads, int n_slots, float scale
 ) {
     const int hq = blockIdx.x;
@@ -65,4 +67,12 @@ extern "C" __global__ void attention_cold_slots(
     float* oh = OUT + (long long)hq * CHD + lane * CPL;
     #pragma unroll
     for (int i = 0; i < CPL; ++i) oh[i] = acc[i] * inv;
+
+    // Flash partials (wave-uniform: every lane holds the same m,l) — lane 0 emits.
+    // Lets a caller merge this tier with the hot KVarN flash via online softmax:
+    //   m = max(m_hot, m_cold); w_t = l_t·exp(m_t - m); out = Σ w_t·out_t / Σ w_t.
+    if (lane == 0) {
+        if (M_OUT) M_OUT[hq] = m;
+        if (L_OUT) L_OUT[hq] = l;
+    }
 }
