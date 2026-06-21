@@ -47,9 +47,19 @@ registry v1/dynamic fetch, **any hipGraph infra**, MTP-perf primitives.
 - Document non-applicability explicitly (a verified "n/a" is a valid result).
 
 ## Priority order (value ÷ effort)
-~~1 Registry v1~~ (BLOCKED — see below) → **2 MQ5 (active head)** → 3 MoE-AWQ
-down → 4 MTP-perf (non-hipGraph subset) → 5 mfp4-E8 → 6 Graded N-tier →
-7 gfx11-e8 / MTP hipGraph (defer).
+~~1 Registry v1~~ (BLOCKED) → ~~2 MQ5~~ (DEFERRED — review-grade, see below) →
+**4 MTP-perf non-hipGraph (active head — small/loopable)** → 3 MoE-AWQ down →
+5 mfp4-E8 → 6 Graded N-tier → 7 gfx11-e8 / MTP hipGraph (defer).
+
+> **Loopability finding (2026-06-22):** the big quant stacks (MQ5, mfp4-E8,
+> graded N-tier) are NOT safe single-turn auto-lands. They're 35+-conflict
+> merges that interleave with chaingun's divergent format arms (Qtip3/Oq4),
+> plus a quantizer function, plus relocations — and their quality can only be
+> validated by KLD eval (quantize a model + compare), which the coherence gate
+> alone won't catch. These want a sustained, human-reviewed session. The loop
+> should auto-land only the small/localized stacks (#4) and SCOPE the big ones
+> for review. MoE-AWQ (#3) is also quality/KLD-grade (reconciles with existing
+> AWQ) → review-grade too.
 
 ---
 
@@ -75,7 +85,7 @@ work):
 Progress: BLOCKED pending user decision (a) vs (b). Loop SKIPS this; resume
 only if the user picks (a). Active head moved to #2 (MQ5).
 
-## [ ] 2. MQ5G256 (5-bit FWHT MagnumQuant)  — MEDIUM, fills MQ4↔MQ6 gap
+## [DEFERRED] 2. MQ5G256 (5-bit FWHT MagnumQuant)  — review-grade, NOT auto-loopable
 Source: `f7efb940` (168 B/group, 5.25 bpw, full MoE decode parity).
 chaingun: absent.
 Approach: add `MQ5G256` DType + FWHT codec + decode/MoE kernels + dispatch
@@ -113,16 +123,23 @@ Done when: per-expert down AWQ produces a coherent MoE file; coherence +
 KLD eval show quality gain vs non-AWQ down at equal size.
 Progress: _not started_
 
-## [ ] 4. MTP perf — non-hipGraph subset  — SMALL cheap wins
-Source: `5ac96a8f` + `1495be04` (MTP-head lm_head WMMA routing),
-`bc5d005d` (decouple + adaptive-K MTP defaults), `becc0610` (gated small-B
-verify decouple). (Skip the hipGraph commits here — see item 7.)
-chaingun: MTP path exists (fp16_x just fixed); no hipGraph.
-Approach: route MTP-head lm_head through WMMA; add decouple/adaptive-K
-levers (per-arch, opt-out). These don't need hipGraph.
-Done when: MTP decode tok/s improves on gfx1151 with no τ/coherence
-regression (`coherence-gate-dflash`).
-Progress: _not started_
+## [ ] 4. MTP perf — non-hipGraph subset  — SMALL, ACTIVE HEAD
+Source: `5ac96a8f` (+16/-11 mtp_head.rs: MTP-head lm_head WMMA → RDNA3/gfx11),
+`1495be04` (+29/-8 mtp_head.rs: chunked WMMA on gfx12), `bc5d005d` (+31/-2
+mtp_spec.rs + qwen35.rs: decouple + adaptive-K gfx11 MTP defaults, per-arch
+opt-out), `becc0610` (+14/-2 qwen35.rs: gated small-B verify decouple).
+(Skip the hipGraph commits — see item 7.)
+chaingun: MTP path exists (fp16_x just fixed). SCOPED 2026-06-22 — all touched
+files EXIST (`mtp_head.rs`, `mtp_spec.rs`, `qwen35.rs`); ~90 lines total,
+localized → tractable for an auto-loop iteration. NB check the per-arch gate:
+"gfx11 defaults" may or may not include gfx1151 (RDNA3.5) — verify whether the
+change is active on this box before claiming a perf delta.
+Approach: cherry-pick/port the 4 commits in order; resolve minor conflicts;
+build hipfire-arch-qwen35; run `coherence-gate-dflash` (spec-decode τ guard).
+Done when: ports land, build green, `coherence-gate-dflash` passes (no τ
+collapse / attractor). Perf delta is a bonus — verify per CLAUDE.md warm-cache
+protocol if claimed, but the bar to land is no coherence/τ regression.
+Progress: _not started — NEXT to execute_
 
 ## [ ] 5. mfp4-E8 + GPTQ/LDLQ-on-E8  — LARGE, HIGHEST quality value
 Source (key anchors; see `git log chaingun..origin/master`): `f8fe55d5`
