@@ -173,15 +173,7 @@ pub async fn run(args: AdminArgs, config: HipfireConfig) -> anyhow::Result<()> {
         AdminCommand::SetPassword { password } => {
             let password = match password {
                 Some(password) => password,
-                None => {
-                    use std::io::Read;
-                    eprint!(
-                        "New /admin password (input may echo; pipe via stdin to avoid shell history): "
-                    );
-                    let mut buf = String::new();
-                    std::io::stdin().read_to_string(&mut buf)?;
-                    buf.trim().to_string()
-                }
+                None => read_password_interactive()?,
             };
             if password.is_empty() {
                 anyhow::bail!("password must not be empty");
@@ -289,6 +281,26 @@ fn url_encode(value: &str) -> String {
 
 fn url_encode_path_segment(value: &str) -> String {
     url_encode(value)
+}
+
+/// Read a password without echoing. On a TTY, prompt twice and confirm; when
+/// stdin is piped (`echo pw | hipfire admin set-password`), read one line.
+fn read_password_interactive() -> anyhow::Result<String> {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        let first = rpassword::prompt_password("New /admin password: ")?;
+        let confirm = rpassword::prompt_password("Confirm password: ")?;
+        if first != confirm {
+            anyhow::bail!("passwords did not match");
+        }
+        Ok(first)
+    } else {
+        // Piped (e.g. `echo pw | hipfire admin set-password`): not a terminal,
+        // so no echo to suppress — read one line with std and strip the EOL.
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        Ok(line.trim_end_matches(['\n', '\r']).to_string())
+    }
 }
 
 fn assistant_text(value: &Value) -> Option<&str> {

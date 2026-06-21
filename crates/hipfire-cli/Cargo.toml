@@ -30,6 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 indicatif = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls"] }
 anyhow = "1"
+rpassword = "7"
 uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
 clap-markdown = "0.1.5"
