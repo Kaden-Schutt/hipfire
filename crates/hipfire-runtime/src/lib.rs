@@ -54,13 +54,7 @@ pub mod weights {
         ParoRotation, WeightTensor,
     };
 }
-pub mod quant {
-    //! Generic dequant codecs + half/bf16 conversions (not llama-specific).
-    pub use crate::llama::{
-        convert_q4k_to_q4f16_g32, convert_q4k_to_q4f16_g64, dequantize_q4_0, dequantize_q4_k,
-        dequantize_q6_k, dequantize_q8_0, f16_to_f32, f32_to_f16,
-    };
-}
+pub mod quant;
 pub mod dispatch {
     //! Generic kernel-dispatch family accessors + dispatch types (not
     //! llama-specific; the family accessors and `hipfire_dispatch` re-exports

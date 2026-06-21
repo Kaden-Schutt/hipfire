@@ -19,7 +19,7 @@
 //! Optional second arg filters tensor names by substring.
 
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::f16_to_f32;
+use hipfire_runtime::quant::f16_to_f32;
 use std::path::Path;
 
 fn stats(values: &[f32]) -> (f32, f32, f32, f32) {

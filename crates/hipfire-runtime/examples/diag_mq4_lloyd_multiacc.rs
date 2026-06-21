@@ -18,7 +18,7 @@ use rdna_compute::Gpu;
 use std::path::Path;
 
 fn f16_to_f32(bits: u16) -> f32 {
-    hipfire_runtime::llama::f16_to_f32(bits)
+    hipfire_runtime::quant::f16_to_f32(bits)
 }
 
 /// CPU dequant of one MQ4-Lloyd-formatted row → flat f32 weights, FWHT

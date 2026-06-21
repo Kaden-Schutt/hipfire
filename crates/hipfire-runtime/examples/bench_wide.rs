@@ -18,9 +18,9 @@ fn main() {
 
     // Prepare all formats
     let d_q4k = gpu.upload_raw(raw, &[raw.len()]).unwrap();
-    let a_f32 = hipfire_runtime::llama::dequantize_q4_k(raw, m * k);
+    let a_f32 = hipfire_runtime::quant::dequantize_q4_k(raw, m * k);
     let d_f32 = gpu.upload_f32(&a_f32, &[m, k]).unwrap();
-    let q4f16 = hipfire_runtime::llama::convert_q4k_to_q4f16_g64(raw, m * k);
+    let q4f16 = hipfire_runtime::quant::convert_q4k_to_q4f16_g64(raw, m * k);
     let d_q4f16 = gpu.upload_raw(&q4f16, &[q4f16.len()]).unwrap();
 
     let n_warmup = 50;

@@ -16,14 +16,14 @@ fn main() {
     let k = 2048usize;
 
     // Prepare data
-    let a_f32 = hipfire_runtime::llama::dequantize_q4_k(raw_q4k, m * k);
+    let a_f32 = hipfire_runtime::quant::dequantize_q4_k(raw_q4k, m * k);
     let x_data: Vec<f32> = (0..k).map(|i| ((i % 7) as f32 - 3.0) * 0.01).collect();
     let d_x = gpu.upload_f32(&x_data, &[k]).unwrap();
 
     // Upload all formats
     let d_q4k = gpu.upload_raw(raw_q4k, &[raw_q4k.len()]).unwrap();
     let d_f32 = gpu.upload_f32(&a_f32, &[m, k]).unwrap();
-    let q4f16 = hipfire_runtime::llama::convert_q4k_to_q4f16_g64(raw_q4k, m * k);
+    let q4f16 = hipfire_runtime::quant::convert_q4k_to_q4f16_g64(raw_q4k, m * k);
     let d_q4f16 = gpu.upload_raw(&q4f16, &[q4f16.len()]).unwrap();
 
     let n_warmup = 20;

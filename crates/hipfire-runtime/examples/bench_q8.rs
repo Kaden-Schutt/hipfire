@@ -15,7 +15,7 @@ fn main() {
     let k = 2048usize;
 
     // Dequant Q4_K to F32 for reference
-    let a_f32 = hipfire_runtime::llama::dequantize_q4_k(raw_q4k, m * k);
+    let a_f32 = hipfire_runtime::quant::dequantize_q4_k(raw_q4k, m * k);
     let x_data: Vec<f32> = (0..k).map(|i| ((i % 7) as f32 - 3.0) * 0.01).collect();
     let d_x = gpu.upload_f32(&x_data, &[k]).unwrap();
 
@@ -31,7 +31,7 @@ fn main() {
         let inv_scale = if scale > 0.0 { 1.0 / scale } else { 0.0 };
 
         // Write f16 scale
-        let scale_f16 = hipfire_runtime::llama::f32_to_f16(scale);
+        let scale_f16 = hipfire_runtime::quant::f32_to_f16(scale);
         q8_data.extend_from_slice(&scale_f16.to_le_bytes());
 
         // Write int8 quantized values
@@ -141,7 +141,7 @@ fn main() {
             let scale = max_abs / 127.0;
             let inv_scale = if scale > 0.0 { 1.0 / scale } else { 0.0 };
             let row_off = row * row_stride;
-            let scale_f16 = hipfire_runtime::llama::f32_to_f16(scale);
+            let scale_f16 = hipfire_runtime::quant::f32_to_f16(scale);
             q8hfq_data[row_off + g * 2..row_off + g * 2 + 2]
                 .copy_from_slice(&scale_f16.to_le_bytes());
             for i in 0..32 {

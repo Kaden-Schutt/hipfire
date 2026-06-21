@@ -171,7 +171,7 @@ fn hfq_tensor_f32(
     let f32_data: Vec<f32> = match info.quant_type {
         1 => data
             .chunks_exact(2)
-            .map(|c| crate::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .map(|c| crate::quant::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect(),
         2 => data
             .chunks_exact(4)
@@ -239,7 +239,7 @@ fn hfq_weight(
             } else {
                 let f32_data: Vec<f32> = data
                     .chunks_exact(2)
-                    .map(|c| crate::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .map(|c| crate::quant::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                     .collect();
                 assert_eq!(f32_data.len(), m * k, "dflash {name} F16 size mismatch");
                 let buf = gpu.upload_f32(&f32_data, &[m * k])?;

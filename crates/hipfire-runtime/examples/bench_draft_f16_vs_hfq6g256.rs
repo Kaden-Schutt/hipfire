@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-use hipfire_runtime::llama::f32_to_f16;
+use hipfire_runtime::quant::f32_to_f16;
 use rdna_compute::{DType, Gpu};
 use std::time::Instant;
 

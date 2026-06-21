@@ -73,7 +73,7 @@ fn run() -> Result<String, Outcome> {
         ));
     }
 
-    let a_f32 = hipfire_runtime::llama::dequantize_q4_k(raw, m * k);
+    let a_f32 = hipfire_runtime::quant::dequantize_q4_k(raw, m * k);
     let mut y_ref = vec![0.0f32; m];
     for i in 0..m {
         for j in 0..k {

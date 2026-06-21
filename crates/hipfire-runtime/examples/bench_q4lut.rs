@@ -15,13 +15,13 @@ fn main() {
     let m = 2048usize;
     let k = 2048usize;
 
-    let a_f32 = hipfire_runtime::llama::dequantize_q4_k(raw_q4k, m * k);
+    let a_f32 = hipfire_runtime::quant::dequantize_q4_k(raw_q4k, m * k);
     let x_data: Vec<f32> = (0..k).map(|i| ((i % 7) as f32 - 3.0) * 0.01).collect();
     let d_x = gpu.upload_f32(&x_data, &[k]).unwrap();
 
     // Prepare all formats
     let q4lut = convert_q4k_to_q4lut(raw_q4k, m * k);
-    let q4f16g32 = hipfire_runtime::llama::convert_q4k_to_q4f16_g32(raw_q4k, m * k);
+    let q4f16g32 = hipfire_runtime::quant::convert_q4k_to_q4f16_g32(raw_q4k, m * k);
     let q8 = quantize_q8(&a_f32);
     let q4as8 = quantize_q4_as_q8(&a_f32); // 4-bit precision in Q8 storage
 
@@ -206,11 +206,11 @@ fn convert_q4k_to_q4lut(q4k_data: &[u8], n_elements: usize) -> Vec<u8> {
             break;
         }
 
-        let d = hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([
+        let d = hipfire_runtime::quant::f16_to_f32(u16::from_le_bytes([
             q4k_data[off],
             q4k_data[off + 1],
         ]));
-        let dmin = hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([
+        let dmin = hipfire_runtime::quant::f16_to_f32(u16::from_le_bytes([
             q4k_data[off + 2],
             q4k_data[off + 3],
         ]));
@@ -239,7 +239,7 @@ fn convert_q4k_to_q4lut(q4k_data: &[u8], n_elements: usize) -> Vec<u8> {
 
                 for n in 0..16u8 {
                     let val = eff_scale * n as f32 - eff_min;
-                    let f16_val = hipfire_runtime::llama::f32_to_f16(val);
+                    let f16_val = hipfire_runtime::quant::f32_to_f16(val);
                     let co = out_off + (n as usize) * 2;
                     output[co..co + 2].copy_from_slice(&f16_val.to_le_bytes());
                 }
@@ -269,7 +269,7 @@ fn quantize_q8(f32_data: &[f32]) -> Vec<u8> {
         let max_abs = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
         let scale = max_abs / 127.0;
         let inv_scale = if scale > 0.0 { 1.0 / scale } else { 0.0 };
-        output.extend_from_slice(&hipfire_runtime::llama::f32_to_f16(scale).to_le_bytes());
+        output.extend_from_slice(&hipfire_runtime::quant::f32_to_f16(scale).to_le_bytes());
         for &v in block {
             output.push((v * inv_scale).round().max(-128.0).min(127.0) as i8 as u8);
         }
@@ -284,7 +284,7 @@ fn quantize_q4_as_q8(f32_data: &[f32]) -> Vec<u8> {
         let max_abs = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
         let scale = max_abs / 7.0; // 4-bit range: -8 to 7
         let inv_scale = if scale > 0.0 { 1.0 / scale } else { 0.0 };
-        output.extend_from_slice(&hipfire_runtime::llama::f32_to_f16(scale).to_le_bytes());
+        output.extend_from_slice(&hipfire_runtime::quant::f32_to_f16(scale).to_le_bytes());
         for &v in block {
             output.push((v * inv_scale).round().max(-8.0).min(7.0) as i8 as u8);
         }

@@ -47,7 +47,7 @@ fn main() {
     // ═══ Stage 2: Numerical correctness vs CPU reference ═══
     eprintln!("\n=== Stage 2: Correctness vs CPU F32 reference ===");
     // CPU reference: dequantize + GEMV
-    let a_f32 = hipfire_runtime::llama::dequantize_q4_k(raw_data, m * k);
+    let a_f32 = hipfire_runtime::quant::dequantize_q4_k(raw_data, m * k);
     let mut y_ref = vec![0.0f32; m];
     for i in 0..m {
         let mut sum = 0.0f32;

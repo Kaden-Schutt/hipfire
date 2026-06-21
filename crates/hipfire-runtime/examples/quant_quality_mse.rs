@@ -27,7 +27,7 @@
 //!   quant_quality_mse <safetensors_dir> <model.hfq> [name_substring]
 
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::f16_to_f32;
+use hipfire_runtime::quant::f16_to_f32;
 use memmap2::Mmap;
 use serde_json::Value;
 use std::collections::HashMap;

@@ -12,7 +12,7 @@ use rdna_compute::Gpu;
 use std::path::Path;
 
 fn f16_to_f32(bits: u16) -> f32 {
-    hipfire_runtime::llama::f16_to_f32(bits)
+    hipfire_runtime::quant::f16_to_f32(bits)
 }
 
 fn cpu_gemv_mq3(row_bytes: &[u8], groups_per_row: usize, x: &[f32]) -> f32 {

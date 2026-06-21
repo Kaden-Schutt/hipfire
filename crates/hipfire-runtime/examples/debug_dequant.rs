@@ -5,7 +5,7 @@
 //! Debug: compare dequantized tensor values against a simple check.
 
 use hipfire_runtime::gguf::GgufFile;
-use hipfire_runtime::llama;
+use hipfire_runtime::quant;
 use std::path::Path;
 
 fn main() {
@@ -46,7 +46,7 @@ fn main() {
     );
 
     // Dequantize first block (256 elements)
-    let deq = llama::dequantize_q4_k(q_data, 256);
+    let deq = quant::dequantize_q4_k(q_data, 256);
     println!("  First 16 dequantized values:");
     for i in 0..16 {
         print!("  [{i}]={:.6}", deq[i]);
@@ -54,7 +54,7 @@ fn main() {
     println!();
 
     // Stats
-    let deq_full = llama::dequantize_q4_k(q_data, q_info.numel());
+    let deq_full = quant::dequantize_q4_k(q_data, q_info.numel());
     let min = deq_full.iter().cloned().fold(f32::INFINITY, f32::min);
     let max = deq_full.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mean: f32 = deq_full.iter().sum::<f32>() / deq_full.len() as f32;
@@ -71,14 +71,14 @@ fn main() {
         "\n=== blk.0.attn_v.weight (Q6_K, {} elements) ===",
         v_info.numel()
     );
-    let deq_v = llama::dequantize_q6_k(v_data, 256);
+    let deq_v = quant::dequantize_q6_k(v_data, 256);
     println!("  First 16 dequantized values:");
     for i in 0..16 {
         print!("  [{i}]={:.6}", deq_v[i]);
     }
     println!();
 
-    let deq_v_full = llama::dequantize_q6_k(v_data, v_info.numel());
+    let deq_v_full = quant::dequantize_q6_k(v_data, v_info.numel());
     let min = deq_v_full.iter().cloned().fold(f32::INFINITY, f32::min);
     let max = deq_v_full.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mean: f32 = deq_v_full.iter().sum::<f32>() / deq_v_full.len() as f32;
@@ -91,7 +91,7 @@ fn main() {
         "\n=== token_embd.weight (Q4_K, {} elements) ===",
         embd_info.numel()
     );
-    let deq_embd = llama::dequantize_q4_k(embd_data, embd_info.numel());
+    let deq_embd = quant::dequantize_q4_k(embd_data, embd_info.numel());
     let min = deq_embd.iter().cloned().fold(f32::INFINITY, f32::min);
     let max = deq_embd.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mean: f32 = deq_embd.iter().sum::<f32>() / deq_embd.len() as f32;

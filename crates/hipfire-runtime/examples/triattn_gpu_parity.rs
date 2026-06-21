@@ -16,7 +16,7 @@ fn main() {
 
 #[cfg(feature = "deltanet")]
 fn main() {
-    use hipfire_runtime::llama::f16_to_f32;
+    use hipfire_runtime::quant::f16_to_f32;
     use hipfire_runtime::triattn::{self, BandCenter, TriAttnCenters};
     use rdna_compute::{DType, Gpu};
 

@@ -6,8 +6,9 @@
 
 use crate::hfq_modules::{parse_module_table, validate_modules, HfqModuleRecord};
 use crate::llama::{
-    f16_to_f32, EmbeddingFormat, LayerWeights, LlamaConfig, LlamaWeights, ModelArch, WeightTensor,
+    EmbeddingFormat, LayerWeights, LlamaConfig, LlamaWeights, ModelArch, WeightTensor,
 };
+use crate::quant::f16_to_f32;
 use hip_bridge::{HipError, HipResult};
 use hipfire_model::{ModelSource, QuantConfig, TensorInfo};
 use memmap2::Mmap;
@@ -1321,7 +1322,7 @@ pub fn load_awq_scale(hfq: &HfqFile, gpu: &Gpu, weight_name: &str, k: usize) -> 
     // cost vs raw F16 is negligible at these sizes.
     let f32_data: Vec<f32> = sc_data
         .chunks_exact(2)
-        .map(|c| crate::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .map(|c| crate::quant::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
         .collect();
     let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
     gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok()
@@ -1829,7 +1830,7 @@ pub fn load_weights_hfq(
         let (embd_t, data) = hfq.tensor_data("model.embed_tokens.weight").unwrap();
         let n = config.vocab_size * config.dim;
         let f32_data: Vec<f32> = match embd_t.quant_type {
-            3 => crate::llama::dequantize_q8_0(data, n), // Q8F16 == GGML Q8_0 blocks
+            3 => crate::quant::dequantize_q8_0(data, n), // Q8F16 == GGML Q8_0 blocks
             2 => data
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))

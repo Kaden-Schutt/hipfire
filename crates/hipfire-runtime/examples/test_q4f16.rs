@@ -25,7 +25,7 @@ fn main() {
     );
 
     // CPU reference: dequant Q4_K to F32, then GEMV
-    let a_f32 = hipfire_runtime::llama::dequantize_q4_k(raw_q4k, n_elements);
+    let a_f32 = hipfire_runtime::quant::dequantize_q4_k(raw_q4k, n_elements);
     let x_data: Vec<f32> = (0..k).map(|i| ((i % 7) as f32 - 3.0) * 0.01).collect();
     let mut y_ref = vec![0.0f32; m];
     for i in 0..m {
@@ -38,8 +38,8 @@ fn main() {
     let d_x = gpu.upload_f32(&x_data, &[k]).unwrap();
 
     // Convert to both Q4_F16 formats
-    let q4f16_g32 = hipfire_runtime::llama::convert_q4k_to_q4f16_g32(raw_q4k, n_elements);
-    let q4f16_g64 = hipfire_runtime::llama::convert_q4k_to_q4f16_g64(raw_q4k, n_elements);
+    let q4f16_g32 = hipfire_runtime::quant::convert_q4k_to_q4f16_g32(raw_q4k, n_elements);
+    let q4f16_g64 = hipfire_runtime::quant::convert_q4k_to_q4f16_g64(raw_q4k, n_elements);
     eprintln!(
         "G32 data: {} bytes (Q4_K: {} bytes, ratio: {:.3}x)",
         q4f16_g32.len(),

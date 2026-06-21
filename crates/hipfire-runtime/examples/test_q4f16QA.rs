@@ -52,7 +52,7 @@ fn run() -> Result<String, Outcome> {
     let k = 2048usize;
     let n_elements = m * k;
 
-    let a_f32 = hipfire_runtime::llama::dequantize_q4_k(raw_q4k, n_elements);
+    let a_f32 = hipfire_runtime::quant::dequantize_q4_k(raw_q4k, n_elements);
     let x_data: Vec<f32> = (0..k).map(|i| ((i % 7) as f32 - 3.0) * 0.01).collect();
     let mut y_ref = vec![0.0f32; m];
     for i in 0..m {
@@ -64,8 +64,8 @@ fn run() -> Result<String, Outcome> {
     let d_x = gpu
         .upload_f32(&x_data, &[k])
         .map_err(|e| Outcome::Fail(format!("upload x failed: {e}")))?;
-    let q4f16_g32 = hipfire_runtime::llama::convert_q4k_to_q4f16_g32(raw_q4k, n_elements);
-    let q4f16_g64 = hipfire_runtime::llama::convert_q4k_to_q4f16_g64(raw_q4k, n_elements);
+    let q4f16_g32 = hipfire_runtime::quant::convert_q4k_to_q4f16_g32(raw_q4k, n_elements);
+    let q4f16_g64 = hipfire_runtime::quant::convert_q4k_to_q4f16_g64(raw_q4k, n_elements);
     let d_g32 = gpu
         .upload_raw(&q4f16_g32, &[q4f16_g32.len()])
         .map_err(|e| Outcome::Fail(format!("upload g32 failed: {e}")))?;

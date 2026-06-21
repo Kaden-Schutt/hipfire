@@ -133,10 +133,12 @@ fn decode_hfq_tensor(quant_type: u8, data: &[u8], n: usize) -> Result<Vec<f32>, 
             .chunks_exact(2)
             .map(|c| crate::hfq_patch::bf16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect()),
-        3 => Ok(hipfire_runtime::llama::dequantize_q8_0(data, n)),
-        31 => Err("Qtip3G256 .hfq decode not yet implemented in hipfire-train \
+        3 => Ok(hipfire_runtime::quant::dequantize_q8_0(data, n)),
+        31 => Err(
+            "Qtip3G256 .hfq decode not yet implemented in hipfire-train \
                    (use a bf16/qtip2-sim .hfq, or load from the source safetensors)"
-            .to_string()),
+                .to_string(),
+        ),
         other => Err(format!("unsupported quant_type {other} for hfq decode")),
     }
 }
@@ -156,18 +158,25 @@ pub fn load_llama_from_hfq(
         entries.iter().map(|e| (e.name.as_str(), e)).collect();
 
     let load = |gpu: &mut Gpu, name: &str, want: &[usize]| -> Result<GpuTensor, String> {
-        let e = map.get(name).ok_or_else(|| format!("missing tensor {name}"))?;
+        let e = map
+            .get(name)
+            .ok_or_else(|| format!("missing tensor {name}"))?;
         let data = &bytes[e.data_offset..e.data_offset + e.data_size];
         let n: usize = want.iter().product();
         let f32s = decode_hfq_tensor(e.quant_type, data, n).map_err(|x| format!("{name}: {x}"))?;
         if f32s.len() != n {
             return Err(format!("{name}: {} elems != {n}", f32s.len()));
         }
-        gpu.upload_f32(&f32s, want).map_err(|x| format!("upload {name}: {x:?}"))
+        gpu.upload_f32(&f32s, want)
+            .map_err(|x| format!("upload {name}: {x:?}"))
     };
 
-    let (h, q, kv, inter) =
-        (cfg.hidden_size, cfg.q_dim(), cfg.kv_dim(), cfg.intermediate_size);
+    let (h, q, kv, inter) = (
+        cfg.hidden_size,
+        cfg.q_dim(),
+        cfg.kv_dim(),
+        cfg.intermediate_size,
+    );
     let embed_tokens = load(gpu, "model.embed_tokens.weight", &[cfg.vocab_size, h])?;
     let final_norm = load(gpu, "model.norm.weight", &[h])?;
     let lm_head = if map.contains_key("lm_head.weight") {
@@ -194,7 +203,15 @@ pub fn load_llama_from_hfq(
             down_proj: load(gpu, &format!("{p}.mlp.down_proj.weight"), &[h, inter])?,
         });
     }
-    Ok((cfg, LlamaWeightsF32 { embed_tokens, layers, final_norm, lm_head }))
+    Ok((
+        cfg,
+        LlamaWeightsF32 {
+            embed_tokens,
+            layers,
+            final_norm,
+            lm_head,
+        },
+    ))
 }
 
 /// Convert little-endian safetensors bytes of the given dtype to fp32.
