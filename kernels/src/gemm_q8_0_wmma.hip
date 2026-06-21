@@ -33,13 +33,17 @@
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float    __attribute__((ext_vector_type(8)))  float8_t;
 
-// Occupancy bump 2026-05-26: was launch_bounds(32, 2) — at 2 waves/CU
-// the kernel was DRAM-latency-bound (profiler measured 7.3 GiB/s vs
-// 211 GB/s peak, 30× below DRAM cap). gfx1151 has 3 SIMDs × 32 waves/SIMD
-// = 96 max waves/CU; this kernel measures 70 VGPRs no spills, fits
-// 8 waves/CU comfortably (72 VGPR allocated, 8 waves × 72 / 3 SIMDs
-// = 192 VGPR/SIMD, well under 1536 cap).
+// Arch-split occupancy: gfx1151 (RDNA3.5 iGPU, 3 SIMDs × 32 waves/SIMD = 96
+// max waves/CU) benefits from (32, 8) — at 70 VGPRs fits 8 waves comfortably.
+// gfx1100/gfx1101 (RDNA3 dGPU) has a tighter VGPR budget: keep the validated
+// (32, 2) that gemm_q8_0_residual_wmma uses and that the existing gfx11
+// parity tests (test_gemm_q8_residual_wmma.rs) confirm correct.
+// gfx12 is a separate file (gemm_q8_0_wmma.gfx12.hip) — untouched.
+#if defined(__gfx1151__)
 __launch_bounds__(32, 8)
+#else
+__launch_bounds__(32, 2)
+#endif
 extern "C" __global__ void gemm_q8_0_wmma(
     const char*     __restrict__ A_q8,    // [M, K/32 * 34] packed Q8_0
     const _Float16* __restrict__ X,       // [N, K] FP16

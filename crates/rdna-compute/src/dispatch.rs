@@ -29262,12 +29262,23 @@ impl Gpu {
         self.ensure_kernel(kname, src, kname)?;
 
         // If caller pre-converted X to F16, use it directly. Otherwise
-        // convert F32 → F16 into the persistent fp16_x scratch.
+        // convert F32 → F16 UNCONDITIONALLY (no pointer-keyed cache).
+        //
+        // STALE-CACHE BUG (origin/master 49881383): the pointer-keyed
+        // `ensure_fp16_x` skips reconversion when the source ptr matches the
+        // last call. In the MTP decode path the `tmp_batched` lm_head scratch
+        // is a FIXED allocation (same device address) refilled with NEW content
+        // by `rmsnorm_batched` each step — so after step 0 warms the cache,
+        // every later step read stale step-0 FP16, producing wrong draft logits
+        // and collapsing τ (~1.85 → ~1.01 on gfx11). gfx12 / batched-verify
+        // dodged it by churning the shared scratch between proposals.
+        // `convert_fp16_x_uncached` always re-converts (one extra cheap F32→F16
+        // kernel per call, negligible vs the GEMM).
         let xp_owned = x.buf.as_ptr();
         let mut xp = if matches!(x.dtype, DType::F16) {
             xp_owned
         } else {
-            self.ensure_fp16_x(x, batch_size * k)?
+            self.convert_fp16_x_uncached(x, batch_size * k)?
         };
 
         let mut a_p = a.buf.as_ptr();
