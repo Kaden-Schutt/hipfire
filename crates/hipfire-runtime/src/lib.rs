@@ -54,22 +54,13 @@ pub mod weights {
         ParoRotation, WeightTensor,
     };
 }
-pub mod quant;
-pub mod dispatch {
-    //! Generic kernel-dispatch family accessors + dispatch types (not
-    //! llama-specific; the family accessors and `hipfire_dispatch` re-exports
-    //! historically lived under `llama`).
-    pub use crate::llama::{
-        attention_family, fused_qkv_family, gemm_family, gemv_family, is_batchable_la, moe_family,
-        AttnParams, DispatchCtx, FullAttnParams, FusedQkvParams, GemvVariant, KernelKey,
-        KvTierInputs, KvTierPlan, RotInput, RotateInputs, RotatedActivation, ShapeInfo,
-    };
-}
+pub mod dispatch;
 pub mod logging;
 pub mod loop_guard;
 pub mod model_source;
 pub mod mtp_mirror;
 pub mod multi_gpu;
+pub mod quant;
 pub mod safetensors_source;
 pub mod sampler;
 pub mod speed_bench;

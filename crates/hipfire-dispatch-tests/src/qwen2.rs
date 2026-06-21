@@ -10,7 +10,7 @@ use rdna_compute::DType;
 
 #[test]
 fn qwen2_prefill_batchable_formats() {
-    use hipfire_runtime::llama::is_batchable_la;
+    use hipfire_runtime::dispatch::is_batchable_la;
     // Qwen2 uses standard quant formats.
     for &arch in &["gfx1100", "gfx1030", "gfx906"] {
         assert!(

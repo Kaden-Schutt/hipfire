@@ -1414,7 +1414,7 @@ pub fn draft_forward_opts(
         // → acceptance patterns. Any future WMMA draft rung requires a dedicated
         // feedback_attention_precision sweep with acceptance-rate tracking.
         {
-            use crate::llama::{attention_family, DispatchCtx, FullAttnParams, KernelKey};
+            use crate::dispatch::{attention_family, DispatchCtx, FullAttnParams, KernelKey};
             let ctx = DispatchCtx::new(gpu);
             let family = attention_family();
             family

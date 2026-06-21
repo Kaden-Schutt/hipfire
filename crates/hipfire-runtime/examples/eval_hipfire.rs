@@ -44,8 +44,9 @@ fn main() {
 #[cfg(feature = "deltanet")]
 fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
+    use hipfire_runtime::dispatch::{gemv_family, DispatchCtx};
     use hipfire_runtime::hfq::{HfqFile, HfqPackage, HFQM_ARCH_NON_WEIGHT_PACKAGE};
-    use hipfire_runtime::llama::{gemv_family, DispatchCtx, KvCache};
+    use hipfire_runtime::kv::KvCache;
     use rdna_compute::DType;
     use std::fs::File;
     use std::io::{BufReader, BufWriter, Read, Write};

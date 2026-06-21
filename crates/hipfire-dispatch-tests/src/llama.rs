@@ -9,7 +9,7 @@ use rdna_compute::DType;
 
 #[test]
 fn llama_prefill_always_batchable() {
-    use hipfire_runtime::llama::is_batchable_la;
+    use hipfire_runtime::dispatch::is_batchable_la;
     let batchable_archs = &[
         "gfx906", "gfx1010", "gfx1030", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx942",
     ];
@@ -39,7 +39,7 @@ fn llama_prefill_always_batchable() {
 
 #[test]
 fn llama_prefill_mq3_on_wmma_or_gfx10_scalar() {
-    use hipfire_runtime::llama::is_batchable_la;
+    use hipfire_runtime::dispatch::is_batchable_la;
     for &arch in &[
         "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
     ] {
@@ -64,7 +64,7 @@ fn llama_prefill_mq3_on_wmma_or_gfx10_scalar() {
 
 #[test]
 fn llama_prefill_unsupported_dtypes() {
-    use hipfire_runtime::llama::is_batchable_la;
+    use hipfire_runtime::dispatch::is_batchable_la;
     assert!(!is_batchable_la(DType::Q4K, "gfx1100"));
     assert!(!is_batchable_la(DType::Q6K, "gfx1100"));
     assert!(!is_batchable_la(DType::F32, "gfx1100"));
@@ -82,7 +82,7 @@ fn llama_fallback_to_llama_path_for_unknown_arch_ids() {
 
 #[test]
 fn llama_runtime_copy_admits_fewer_dtypes_than_qwen35_copy() {
-    use hipfire_runtime::llama::is_batchable_la as runtime_is_batchable;
+    use hipfire_runtime::dispatch::is_batchable_la as runtime_is_batchable;
 
     // The runtime copy does NOT admit ParoQ4G128, F32, or Lloyd variants.
     assert!(

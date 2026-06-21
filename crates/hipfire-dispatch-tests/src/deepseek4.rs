@@ -8,7 +8,7 @@ use rdna_compute::DType;
 
 #[test]
 fn deepseek4_prefill_batchable_formats() {
-    use hipfire_runtime::llama::is_batchable_la;
+    use hipfire_runtime::dispatch::is_batchable_la;
     // DeepSeek V4 uses MQ4, Q8_0, and F16/F32 for its layers.
     for &arch in &["gfx1100", "gfx942"] {
         assert!(

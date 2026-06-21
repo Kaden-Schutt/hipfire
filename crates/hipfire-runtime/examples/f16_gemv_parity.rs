@@ -196,7 +196,7 @@ fn main() {
         if n == 1 && (k % 32 == 0 || !wmma) {
             use hipfire_dispatch::context::DispatchCtx;
             use hipfire_dispatch::families::gemv::WeightRef;
-            let gemv = hipfire_runtime::llama::gemv_family();
+            let gemv = hipfire_runtime::dispatch::gemv_family();
             let ctx = DispatchCtx::new(&gpu);
             let wr = WeightRef {
                 buf: &w_t,

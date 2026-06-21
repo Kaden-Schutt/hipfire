@@ -4,6 +4,7 @@
 
 //! Profile: measure time breakdown within a single forward pass.
 
+use hipfire_runtime::dispatch;
 use hipfire_runtime::gguf::GgufFile;
 use hipfire_runtime::llama::{self, KvCache, LlamaConfig};
 use std::path::Path;
@@ -80,9 +81,9 @@ fn main() {
     let q = gpu.zeros(&[q_dim], rdna_compute::DType::F32).unwrap();
     let t = Instant::now();
     for _ in 0..100 {
-        llama::gemv_family()
+        dispatch::gemv_family()
             .run_auto(
-                &llama::DispatchCtx::new(&mut gpu),
+                &dispatch::DispatchCtx::new(&mut gpu),
                 &mut gpu,
                 &weights.layers[0].wq.dispatch_ref(),
                 &tmp,

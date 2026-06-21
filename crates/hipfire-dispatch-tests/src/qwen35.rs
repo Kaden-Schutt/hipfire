@@ -16,7 +16,7 @@ use rdna_compute::DType;
 
 #[test]
 fn qwen35_prefill_always_batchable() {
-    use hipfire_runtime::llama::is_batchable_la;
+    use hipfire_runtime::dispatch::is_batchable_la;
     let batchable_archs = &[
         "gfx906", "gfx908", "gfx940", "gfx941", "gfx942", "gfx1010", "gfx1011", "gfx1012",
         "gfx1013", "gfx1030", "gfx1031", "gfx1032", "gfx1100", "gfx1101", "gfx1102", "gfx1103",
@@ -48,7 +48,7 @@ fn qwen35_prefill_always_batchable() {
 
 #[test]
 fn qwen35_prefill_mq3_on_wmma_or_gfx10_scalar() {
-    use hipfire_runtime::llama::is_batchable_la;
+    use hipfire_runtime::dispatch::is_batchable_la;
 
     for &arch in &[
         "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
@@ -76,7 +76,7 @@ fn qwen35_prefill_mq3_on_wmma_or_gfx10_scalar() {
 
 #[test]
 fn qwen35_prefill_fp4_only_on_wmma() {
-    use hipfire_runtime::llama::is_batchable_la;
+    use hipfire_runtime::dispatch::is_batchable_la;
     for &arch in &[
         "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
     ] {
@@ -99,7 +99,7 @@ fn qwen35_prefill_fp4_only_on_wmma() {
 
 #[test]
 fn qwen35_prefill_q4k_q6k_unsupported() {
-    use hipfire_runtime::llama::is_batchable_la;
+    use hipfire_runtime::dispatch::is_batchable_la;
     assert!(!is_batchable_la(DType::Q4K, "gfx1100"));
     assert!(!is_batchable_la(DType::Q6K, "gfx1100"));
 }

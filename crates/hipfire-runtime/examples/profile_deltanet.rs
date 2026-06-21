@@ -13,6 +13,7 @@ fn main() {
 #[cfg(feature = "deltanet")]
 fn main() {
     use hipfire_arch_qwen35::qwen35;
+    use hipfire_runtime::dispatch;
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama;
     use rdna_compute::DType;
@@ -70,8 +71,8 @@ fn main() {
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
 
-    let _gemv = llama::gemv_family();
-    let _ctx = llama::DispatchCtx::new(&mut gpu);
+    let _gemv = dispatch::gemv_family();
+    let _ctx = dispatch::DispatchCtx::new(&mut gpu);
 
     // Allocate persistent buffers
     let x = gpu.alloc_tensor(&[dim], DType::F32).unwrap();
