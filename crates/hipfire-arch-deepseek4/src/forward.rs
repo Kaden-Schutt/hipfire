@@ -127,7 +127,7 @@ fn gemv_auto(
     use hipfire_dispatch::context::DispatchCtx;
     use hipfire_dispatch::families::gemv::WeightRef;
 
-    let gemv = hipfire_runtime::llama::gemv_family();
+    let gemv = hipfire_runtime::dispatch::gemv_family();
     let ctx = DispatchCtx::new(gpu);
     let x = if weight_needs_fwht(weight) {
         x_rotated
@@ -3684,7 +3684,7 @@ fn ffn_routed(
             rot_batch,
             down_expanded,
         };
-        hipfire_runtime::llama::moe_family()
+        hipfire_runtime::dispatch::moe_family()
             .run_bias_aware(gpu, &moe_params)
             .map_err(|e| format!("ffn_routed l{layer_idx} dispatch: {e}"))?;
 
@@ -8060,7 +8060,7 @@ fn ffn_batched(
         rot_batch: &pbs.moe_rot_batch,
         down_expert_outputs: &pbs.moe_down_expert_outputs,
     };
-    hipfire_runtime::llama::moe_family()
+    hipfire_runtime::dispatch::moe_family()
         .run_bias_aware_prefill(gpu, &moe_params)
         .map_err(|e| format!("ffn_batched l{layer_idx} dispatch: {e}"))?;
 

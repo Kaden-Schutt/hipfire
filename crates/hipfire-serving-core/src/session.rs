@@ -25,7 +25,7 @@ use hipfire_model::{
     is_qwen35_family_arch_id, is_qwen35_moe_arch_id, parse_model_worker_id, AcceleratorDeviceInfo,
     AcceleratorInventory, ModelWorkerId,
 };
-use hipfire_runtime::llama;
+use hipfire_runtime::kv;
 use hipfire_state::{
     describe_sequence_state_descriptors, model_worker_runtime_view_json,
     parsed_handle_may_target_loaded_state, qwen35_sequence_state_handle,
@@ -62,7 +62,7 @@ pub struct Qwen35RequestSessionState {
     pub seq_pos: usize,
     pub conversation_tokens: Vec<u32>,
     pub prefix_hash: Option<SequenceStatePrefixHash>,
-    pub kv_cache: llama::KvCache,
+    pub kv_cache: kv::KvCache,
     pub dn_state: DeltaNetState,
     pub logits: rdna_compute::GpuTensor,
     pub prefilled_generated_suffix_len: usize,
@@ -110,9 +110,9 @@ impl Qwen35RequestSessionState {
 
     pub fn clone_kv_cache(
         gpu: &mut rdna_compute::Gpu,
-        kv: &llama::KvCache,
-    ) -> Result<llama::KvCache, String> {
-        Ok(llama::KvCache {
+        kv: &kv::KvCache,
+    ) -> Result<kv::KvCache, String> {
+        Ok(kv::KvCache {
             k_gpu: Self::clone_gpu_tensor_vec(gpu, &kv.k_gpu, "kv.k_gpu")?,
             v_gpu: Self::clone_gpu_tensor_vec(gpu, &kv.v_gpu, "kv.v_gpu")?,
             k_scales: Self::clone_gpu_tensor_vec(gpu, &kv.k_scales, "kv.k_scales")?,
@@ -885,7 +885,7 @@ pub fn qwen35_allocate_session_state(
                 .iter()
                 .map(|t| *t == LayerType::FullAttention)
                 .collect();
-            llama::KvCache::new_gpu_filtered(
+            kv::KvCache::new_gpu_filtered(
                 gpu,
                 &is_kv_layer,
                 config.n_kv_heads,
@@ -894,7 +894,7 @@ pub fn qwen35_allocate_session_state(
             )
             .map_err(|e| format!("{e}"))?
         }
-        "q8" => llama::KvCache::new_gpu_q8_capped(
+        "q8" => kv::KvCache::new_gpu_q8_capped(
             gpu,
             config.n_layers,
             config.n_kv_heads,
@@ -903,7 +903,7 @@ pub fn qwen35_allocate_session_state(
             m.physical_cap,
         )
         .map_err(|e| format!("{e}"))?,
-        "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_capped(
+        "asym4" | "turbo4" => kv::KvCache::new_gpu_asym4_capped(
             gpu,
             config.n_layers,
             config.n_kv_heads,
@@ -912,7 +912,7 @@ pub fn qwen35_allocate_session_state(
             m.physical_cap,
         )
         .map_err(|e| format!("{e}"))?,
-        "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2_capped(
+        "asym2" | "turbo2" => kv::KvCache::new_gpu_asym2_capped(
             gpu,
             config.n_layers,
             config.n_kv_heads,
@@ -922,7 +922,7 @@ pub fn qwen35_allocate_session_state(
         )
         .map_err(|e| format!("{e}"))?,
         "asym3" | "turbo3" | "turbo" if config.head_dim == 256 => {
-            llama::KvCache::new_gpu_asym3_capped(
+            kv::KvCache::new_gpu_asym3_capped(
                 gpu,
                 config.n_layers,
                 config.n_kv_heads,
@@ -932,7 +932,7 @@ pub fn qwen35_allocate_session_state(
             )
             .map_err(|e| format!("{e}"))?
         }
-        "auto" | "" if config.head_dim == 256 => llama::KvCache::new_gpu_asym3_capped(
+        "auto" | "" if config.head_dim == 256 => kv::KvCache::new_gpu_asym3_capped(
             gpu,
             config.n_layers,
             config.n_kv_heads,
@@ -941,7 +941,7 @@ pub fn qwen35_allocate_session_state(
             m.physical_cap,
         )
         .map_err(|e| format!("{e}"))?,
-        "auto" | "" => llama::KvCache::new_gpu_q8_capped(
+        "auto" | "" => kv::KvCache::new_gpu_q8_capped(
             gpu,
             config.n_layers,
             config.n_kv_heads,
@@ -958,7 +958,7 @@ pub fn qwen35_allocate_session_state(
         }
         other => {
             eprintln!("  batch-prefill KV cache: unrecognized '{other}', defaulting to asym3");
-            llama::KvCache::new_gpu_asym3_capped(
+            kv::KvCache::new_gpu_asym3_capped(
                 gpu,
                 config.n_layers,
                 config.n_kv_heads,

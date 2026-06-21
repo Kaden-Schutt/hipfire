@@ -34,10 +34,10 @@ use hipfire_dispatch::pipeline::superop::{
 };
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::{dtype_rotation_plan, DispatchError};
+use hipfire_runtime::dispatch::gemv_family;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{
-    f16_to_f32, gemv_family, weight_gemm, weight_gemv, EmbeddingFormat, WeightTensor,
-};
+use hipfire_runtime::quant::f16_to_f32;
+use hipfire_runtime::weights::{weight_gemm, weight_gemv, EmbeddingFormat, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Qwen2 model-shape constants parsed from `HfqFile::metadata_json`.
@@ -346,7 +346,7 @@ fn load_embed_tokens(
 /// For untied configs, load the separate `lm_head.weight` tensor.
 ///
 /// **F16 source caveat:** `EmbeddingFormat` has no `F16` variant
-/// (`hipfire_runtime::llama::EmbeddingFormat` is F32 / Q4K / HFQ4G256 /
+/// (`hipfire_runtime::weights::EmbeddingFormat` is F32 / Q4K / HFQ4G256 /
 /// HFQ4G128 / Q8_0). `load_embed_tokens` promotes F16 source to F32 on
 /// the host before upload; the tied-lm_head path here must do the
 /// same. Uploading raw F16 bytes while tagging `gpu_dtype = F32`

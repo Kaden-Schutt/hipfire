@@ -43,10 +43,13 @@ pub mod kv {
     pub use crate::llama::KvCache;
 }
 pub mod weights {
-    //! Generic weight/embedding primitives (not llama-specific).
+    //! Generic weight/embedding types + the GEMV/GEMM/rotate operations on them
+    //! (not llama-specific).
     pub use crate::llama::{
-        weight_gemv, weight_gemv_residual, weight_gemv_swiglu_residual, EmbeddingFormat,
-        LayerWeights, WeightTensor,
+        fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_128_for, rotate_x_mq_batched_for,
+        rotate_x_mq_for, rotate_x_paro_for, weight_gemm, weight_gemv, weight_gemv_prerotated,
+        weight_gemv_residual, weight_gemv_swiglu_residual, EmbeddingFormat, LayerWeights,
+        WeightTensor,
     };
 }
 pub mod quant {
@@ -54,6 +57,16 @@ pub mod quant {
     pub use crate::llama::{
         convert_q4k_to_q4f16_g32, convert_q4k_to_q4f16_g64, dequantize_q4_0, dequantize_q4_k,
         dequantize_q6_k, dequantize_q8_0, f16_to_f32, f32_to_f16,
+    };
+}
+pub mod dispatch {
+    //! Generic kernel-dispatch family accessors + dispatch types (not
+    //! llama-specific; the family accessors and `hipfire_dispatch` re-exports
+    //! historically lived under `llama`).
+    pub use crate::llama::{
+        attention_family, fused_qkv_family, gemm_family, gemv_family, is_batchable_la, moe_family,
+        AttnParams, DispatchCtx, FullAttnParams, FusedQkvParams, GemvVariant, KernelKey,
+        KvTierInputs, KvTierPlan, RotInput, RotateInputs, RotatedActivation, ShapeInfo,
     };
 }
 pub mod logging;

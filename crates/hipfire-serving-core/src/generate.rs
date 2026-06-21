@@ -1850,7 +1850,7 @@ pub fn generate(
 ) {
     // Seed the process-global CPU sampler RNG for this request. CPU fallback and
     // grammar/VL-style sampling should not inherit RNG state from prior requests.
-    hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
+    hipfire_runtime::sampler::reset_cpu_sampler_rng(0x13579BDF);
 
     // Compress runs on the PFlash drafter handle when one is set (hetero
     // sibling device), else on the target gpu. The handle is consumed at

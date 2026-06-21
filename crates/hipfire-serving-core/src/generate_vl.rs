@@ -26,7 +26,6 @@ use hipfire_generate::sampler::SamplerConfig;
 use hipfire_generate::{GenerateVLParams, ImageSource};
 use hipfire_prompt as prompt_frame;
 use hipfire_runtime::arch::GenerateCtx;
-use hipfire_runtime::llama;
 use hipfire_runtime::sampler;
 
 use crate::events::{emit_committed_event, write_error};
@@ -45,7 +44,7 @@ pub fn generate_vl(
 ) {
     // Keep host-side VL sampling deterministic per request instead of carrying
     // the global CPU sampler state across daemon calls.
-    hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
+    hipfire_runtime::sampler::reset_cpu_sampler_rng(0x13579BDF);
 
     let GenerateVLParams {
         id,
@@ -419,7 +418,7 @@ pub fn generate_vl(
             }
         }
         logits = gpu.download_f32(&scratch.logits).unwrap();
-        llama::apply_ngram_block(&mut logits, &m.conversation_tokens);
+        hipfire_runtime::sampler::apply_ngram_block(&mut logits, &m.conversation_tokens);
         if let Some((open, close)) = think_pair {
             block_attractor_unclosed_cpu(&mut logits, &m.conversation_tokens, open, close, 20, 2);
         }

@@ -34,6 +34,7 @@ use hipfire_prompt as prompt_frame;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::kv;
 use hipfire_runtime::llama;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
@@ -1256,7 +1257,7 @@ pub fn load_model(
             .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
             .collect();
         let kv = match kv_mode.as_str() {
-            "fp32" | "f32" => llama::KvCache::new_gpu_capped_filtered(
+            "fp32" | "f32" => kv::KvCache::new_gpu_capped_filtered(
                 gpu,
                 &is_kv_layer,
                 config.n_kv_heads,
@@ -1267,7 +1268,7 @@ pub fn load_model(
             .map_err(|e| format!("{e}"))?,
             "q8" => {
                 eprintln!("  KV cache: Q8");
-                llama::KvCache::new_gpu_q8_capped(
+                kv::KvCache::new_gpu_q8_capped(
                     gpu,
                     config.n_layers,
                     config.n_kv_heads,
@@ -1277,7 +1278,7 @@ pub fn load_model(
                 )
                 .map_err(|e| format!("{e}"))?
             }
-            "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_capped(
+            "asym4" | "turbo4" => kv::KvCache::new_gpu_asym4_capped(
                 gpu,
                 config.n_layers,
                 config.n_kv_heads,
@@ -1286,7 +1287,7 @@ pub fn load_model(
                 physical_cap,
             )
             .map_err(|e| format!("{e}"))?,
-            "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2_capped(
+            "asym2" | "turbo2" => kv::KvCache::new_gpu_asym2_capped(
                 gpu,
                 config.n_layers,
                 config.n_kv_heads,
@@ -1295,7 +1296,7 @@ pub fn load_model(
                 physical_cap,
             )
             .map_err(|e| format!("{e}"))?,
-            "asym3" | "turbo3" | "turbo" | "auto" | "" => llama::KvCache::new_gpu_asym3_capped(
+            "asym3" | "turbo3" | "turbo" | "auto" | "" => kv::KvCache::new_gpu_asym3_capped(
                 gpu,
                 config.n_layers,
                 config.n_kv_heads,
@@ -1306,7 +1307,7 @@ pub fn load_model(
             .map_err(|e| format!("{e}"))?,
             other => {
                 eprintln!("  KV cache: unrecognized '{other}', defaulting to asym3");
-                llama::KvCache::new_gpu_asym3_capped(
+                kv::KvCache::new_gpu_asym3_capped(
                     gpu,
                     config.n_layers,
                     config.n_kv_heads,
@@ -1522,7 +1523,7 @@ pub fn load_model(
         let config = <Llama as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
         let weights = <Llama as Architecture>::load_weights(&mut hfq, &config, gpu)?;
         eprintln!("  KV cache: Q8");
-        let kv = llama::KvCache::new_gpu_q8(
+        let kv = kv::KvCache::new_gpu_q8(
             gpu,
             config.n_layers,
             config.n_kv_heads,
@@ -1662,7 +1663,7 @@ pub fn load_model_safetensors(
         // the panicking constructor so caller-misconfigured runs surface.
         let asym3_auto = matches!(kv_mode, "turbo3" | "turbo" | "auto" | "");
         let kv = match kv_mode {
-            "q8" => llama::KvCache::new_gpu_q8_capped(
+            "q8" => kv::KvCache::new_gpu_q8_capped(
                 gpu,
                 config.n_layers,
                 config.n_kv_heads,
@@ -1670,7 +1671,7 @@ pub fn load_model_safetensors(
                 max_seq,
                 max_seq,
             ),
-            "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_capped(
+            "asym4" | "turbo4" => kv::KvCache::new_gpu_asym4_capped(
                 gpu,
                 config.n_layers,
                 config.n_kv_heads,
@@ -1678,7 +1679,7 @@ pub fn load_model_safetensors(
                 max_seq,
                 max_seq,
             ),
-            "asym3" => llama::KvCache::new_gpu_asym3_capped(
+            "asym3" => kv::KvCache::new_gpu_asym3_capped(
                 gpu,
                 config.n_layers,
                 config.n_kv_heads,
@@ -1686,7 +1687,7 @@ pub fn load_model_safetensors(
                 max_seq,
                 max_seq,
             ),
-            _ if asym3_auto && config.head_dim == 256 => llama::KvCache::new_gpu_asym3_capped(
+            _ if asym3_auto && config.head_dim == 256 => kv::KvCache::new_gpu_asym3_capped(
                 gpu,
                 config.n_layers,
                 config.n_kv_heads,
@@ -1694,7 +1695,7 @@ pub fn load_model_safetensors(
                 max_seq,
                 max_seq,
             ),
-            _ => llama::KvCache::new_gpu_q8_capped(
+            _ => kv::KvCache::new_gpu_q8_capped(
                 gpu,
                 config.n_layers,
                 config.n_kv_heads,
@@ -1794,7 +1795,7 @@ pub fn load_model_safetensors(
     // KV cache: default to asym3 (matches the main Qwen35 path)
     let effective_max_seq = max_seq;
     let kv_cache = match kv_mode {
-        "q8" => llama::KvCache::new_gpu_q8_capped(
+        "q8" => kv::KvCache::new_gpu_q8_capped(
             gpu,
             config.n_layers,
             config.n_kv_heads,
@@ -1802,7 +1803,7 @@ pub fn load_model_safetensors(
             max_seq,
             max_seq,
         ),
-        "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_capped(
+        "asym4" | "turbo4" => kv::KvCache::new_gpu_asym4_capped(
             gpu,
             config.n_layers,
             config.n_kv_heads,
@@ -1810,7 +1811,7 @@ pub fn load_model_safetensors(
             max_seq,
             max_seq,
         ),
-        _ => llama::KvCache::new_gpu_asym3_capped(
+        _ => kv::KvCache::new_gpu_asym3_capped(
             gpu,
             config.n_layers,
             config.n_kv_heads,
@@ -1993,7 +1994,7 @@ pub fn load_model_pp(
     // KV cache (asym3 default, q8/asym4/asym2/fwht{4,3,2} selectable).
     // physical_cap == max_seq on this path — eviction is refused at load.
     let kv = match kv_mode.as_str() {
-        "fp32" | "f32" => llama::KvCache::new_gpu_multi(
+        "fp32" | "f32" => kv::KvCache::new_gpu_multi(
             &mut gpus,
             config.n_layers,
             config.n_kv_heads,
@@ -2001,16 +2002,7 @@ pub fn load_model_pp(
             max_seq,
         )
         .map_err(|e| format!("{e}"))?,
-        "q8" => llama::KvCache::new_gpu_q8_capped_multi(
-            &mut gpus,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            max_seq,
-            max_seq,
-        )
-        .map_err(|e| format!("{e}"))?,
-        "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_capped_multi(
+        "q8" => kv::KvCache::new_gpu_q8_capped_multi(
             &mut gpus,
             config.n_layers,
             config.n_kv_heads,
@@ -2019,7 +2011,7 @@ pub fn load_model_pp(
             max_seq,
         )
         .map_err(|e| format!("{e}"))?,
-        "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2_capped_multi(
+        "asym4" | "turbo4" => kv::KvCache::new_gpu_asym4_capped_multi(
             &mut gpus,
             config.n_layers,
             config.n_kv_heads,
@@ -2028,7 +2020,7 @@ pub fn load_model_pp(
             max_seq,
         )
         .map_err(|e| format!("{e}"))?,
-        "asym3" | "turbo3" | "turbo" | "auto" | "" => llama::KvCache::new_gpu_asym3_capped_multi(
+        "asym2" | "turbo2" => kv::KvCache::new_gpu_asym2_capped_multi(
             &mut gpus,
             config.n_layers,
             config.n_kv_heads,
@@ -2037,7 +2029,7 @@ pub fn load_model_pp(
             max_seq,
         )
         .map_err(|e| format!("{e}"))?,
-        "fwht4" => llama::KvCache::new_gpu_fwht4_capped_multi(
+        "asym3" | "turbo3" | "turbo" | "auto" | "" => kv::KvCache::new_gpu_asym3_capped_multi(
             &mut gpus,
             config.n_layers,
             config.n_kv_heads,
@@ -2046,7 +2038,7 @@ pub fn load_model_pp(
             max_seq,
         )
         .map_err(|e| format!("{e}"))?,
-        "fwht3" => llama::KvCache::new_gpu_fwht3_capped_multi(
+        "fwht4" => kv::KvCache::new_gpu_fwht4_capped_multi(
             &mut gpus,
             config.n_layers,
             config.n_kv_heads,
@@ -2055,7 +2047,16 @@ pub fn load_model_pp(
             max_seq,
         )
         .map_err(|e| format!("{e}"))?,
-        "fwht2" => llama::KvCache::new_gpu_fwht2_capped_multi(
+        "fwht3" => kv::KvCache::new_gpu_fwht3_capped_multi(
+            &mut gpus,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            max_seq,
+            max_seq,
+        )
+        .map_err(|e| format!("{e}"))?,
+        "fwht2" => kv::KvCache::new_gpu_fwht2_capped_multi(
             &mut gpus,
             config.n_layers,
             config.n_kv_heads,
@@ -2066,7 +2067,7 @@ pub fn load_model_pp(
         .map_err(|e| format!("{e}"))?,
         other => {
             eprintln!("  KV cache: unrecognized '{other}', defaulting to asym3");
-            llama::KvCache::new_gpu_asym3_capped_multi(
+            kv::KvCache::new_gpu_asym3_capped_multi(
                 &mut gpus,
                 config.n_layers,
                 config.n_kv_heads,
@@ -2187,7 +2188,7 @@ pub fn screen_weights_qwen35(
 
     for layer in &weights.layers {
         // Collect all weight tensors for this layer that could use MMQ
-        let wts: Vec<(&hipfire_runtime::llama::WeightTensor, &str)> = match layer {
+        let wts: Vec<(&hipfire_runtime::weights::WeightTensor, &str)> = match layer {
             LayerWeights::DeltaNet(l) => vec![
                 (&l.wqkv, "qkvza.qkv"),
                 (&l.wz, "qkvza.z"),

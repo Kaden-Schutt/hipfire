@@ -28,7 +28,7 @@ use hipfire_dispatch::pipeline::superop::{
     self, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind, WeightSlot,
 };
 use hipfire_dispatch::types::DispatchError;
-use hipfire_runtime::llama::{
+use hipfire_runtime::weights::{
     fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_for, weight_gemv, weight_gemv_residual,
 };
 use rdna_compute::{DType, Gpu};

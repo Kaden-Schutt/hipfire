@@ -362,7 +362,7 @@ impl DeepseekV4 {
             .map(|i| {
                 let lo = bytes[i * 2];
                 let hi = bytes[i * 2 + 1];
-                hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([lo, hi]))
+                hipfire_runtime::quant::f16_to_f32(u16::from_le_bytes([lo, hi]))
             })
             .collect();
         gpu.upload_f32(&f32_vals, &shape)
@@ -705,7 +705,7 @@ impl DeepseekV4 {
                 ));
             }
             let scale =
-                hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]));
+                hipfire_runtime::quant::f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]));
             weights.hc_head_scale = scale;
         }
 
@@ -1178,7 +1178,7 @@ impl DeepseekV4 {
                         ));
                     }
                     mtp.mtp_hc_head_scale =
-                        hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([
+                        hipfire_runtime::quant::f16_to_f32(u16::from_le_bytes([
                             bytes[0], bytes[1],
                         ]));
                 }

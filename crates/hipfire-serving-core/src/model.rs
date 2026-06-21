@@ -29,6 +29,7 @@ use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_prompt as prompt_frame;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
+use hipfire_runtime::kv;
 use hipfire_runtime::llama;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::triattn::EvictionCtx;
@@ -61,7 +62,7 @@ impl Eviction {
     pub fn maybe_evict(
         &self,
         gpu: &mut rdna_compute::Gpu,
-        kv: &mut llama::KvCache,
+        kv: &mut kv::KvCache,
         physical: usize,
     ) -> HipResult<Option<hipfire_runtime::triattn::EvictionResult>> {
         match self {
@@ -193,7 +194,7 @@ pub struct LoadedModel {
     pub q35_config: Option<qwen35::Qwen35Config>,
     pub q35_weights: Option<qwen35::Qwen35Weights>,
     pub q35_scratch: Option<qwen35::Qwen35Scratch>,
-    pub kv_cache: Option<llama::KvCache>,
+    pub kv_cache: Option<kv::KvCache>,
     pub dn_state: Option<DeltaNetState>,
     pub q35_kv_mode: Option<String>,
     pub q35_state_quant: Option<hipfire_arch_qwen35::qwen35::StateQuant>,
@@ -205,7 +206,7 @@ pub struct LoadedModel {
     pub llama_config: Option<llama::LlamaConfig>,
     pub llama_weights: Option<llama::LlamaWeights>,
     pub llama_scratch: Option<llama::ForwardScratch>,
-    pub llama_kv: Option<llama::KvCache>,
+    pub llama_kv: Option<kv::KvCache>,
     // Qwen2 state (arch_id=7 — hipfire-arch-qwen2 standalone). The
     // KV cache lives inside Qwen2State, so there's no separate
     // qwen2_kv field. None on every other arch path.

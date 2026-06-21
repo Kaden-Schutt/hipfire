@@ -11,7 +11,9 @@
 //! w1‖w3 into the per-expert `gate_up` blob the indexed GEMV kernels expect.
 
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{f16_to_f32, KvCache, WeightTensor};
+use hipfire_runtime::kv::KvCache;
+use hipfire_runtime::quant::f16_to_f32;
+use hipfire_runtime::weights::WeightTensor;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde::Deserialize;
 

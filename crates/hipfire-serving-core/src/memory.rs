@@ -10,6 +10,7 @@
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::DeltaNetState;
+use hipfire_runtime::kv;
 use hipfire_runtime::llama;
 use hipfire_state::{ModelArtifactMemory, ModelWorkerMemoryView, SequenceStatePageDescriptor};
 
@@ -58,7 +59,7 @@ pub fn tensor_vec_bytes(tensors: &[rdna_compute::GpuTensor]) -> usize {
 
 /// Resident bytes of a KV cache: K/V tensors, their quant scales, and the
 /// optional cached RoPE givens.
-pub fn kv_cache_bytes(kv: &llama::KvCache) -> usize {
+pub fn kv_cache_bytes(kv: &kv::KvCache) -> usize {
     tensor_vec_bytes(&kv.k_gpu)
         + tensor_vec_bytes(&kv.v_gpu)
         + tensor_vec_bytes(&kv.k_scales)

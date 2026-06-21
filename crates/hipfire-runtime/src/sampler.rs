@@ -45,8 +45,8 @@ use rdna_compute::{Gpu, GpuTensor};
 pub use crate::llama::{
     apply_ngram_block, apply_repeat_penalty, apply_repeat_penalty_candidates,
     apply_special_token_attractor_block, apply_unclosed_attractor_block, argmax,
-    sample_top_p as sample_top_p_cpu, sample_top_p_from_candidates, sampler_rng_restore,
-    sampler_rng_snapshot, SamplingConfig,
+    reset_cpu_sampler_rng, sample_top_p as sample_top_p_cpu, sample_top_p_from_candidates,
+    sampler_rng_restore, sampler_rng_snapshot, SamplingConfig,
 };
 pub use hipfire_generate::sampler::{collect_unclosed_attractor_blocks, SamplerConfig};
 

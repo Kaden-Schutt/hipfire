@@ -17,13 +17,14 @@
 use hip_bridge::HipResult;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::{self, HfqFile};
-use hipfire_runtime::llama::{ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
+use hipfire_runtime::kv::KvCache;
+use hipfire_runtime::llama::{ForwardScratch, LlamaConfig, LlamaWeights};
 use rdna_compute::Gpu;
 
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::dtype_rotation_plan;
-use hipfire_runtime::llama::{attention_family, AttnParams, KvTierInputs, KvTierPlan};
+use hipfire_runtime::dispatch::{attention_family, AttnParams, KvTierInputs, KvTierPlan};
 
 /// Type marker for the LLaMA family — covers `arch_id = 0` (LLaMA /
 /// Mistral) and `arch_id = 1` (plain Qwen3 / Qwen2). All members of
