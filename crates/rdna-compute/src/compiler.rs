@@ -357,15 +357,18 @@ impl KernelCompiler {
             let _ = std::fs::write(&hash_path, &src_hash);
         }
 
-        // Ensure precompiled dir has valid hash + blob (writeback from cache or fresh compile)
+        // Ensure precompiled dir has valid hash + blob (writeback from cache or
+        // fresh compile). Skip when precompiled_dir is the cache dir itself: a
+        // std::fs::copy(X, X) truncates X to 0 bytes before reading (see the
+        // normalize_hipcc_output writeback note).
         if let Some(ref dir) = self.precompiled_dir {
+            let pre_hsaco = dir.join(format!("{name}.hsaco"));
             let pre_hash = dir.join(format!("{name}.hash"));
             let pre_valid = pre_hash.exists() && {
                 let stored = std::fs::read_to_string(&pre_hash).unwrap_or_default();
                 stored.trim() == src_hash
             };
-            if !pre_valid {
-                let pre_hsaco = dir.join(format!("{name}.hsaco"));
+            if !pre_valid && pre_hsaco != obj_path {
                 let _ = std::fs::copy(&obj_path, &pre_hsaco);
                 let _ = std::fs::write(&pre_hash, &src_hash);
             }
@@ -554,15 +557,16 @@ impl KernelCompiler {
             let cache_valid = Self::cache_valid(&obj_path, &hash_path, &src_hash);
 
             if cache_valid {
-                // Writeback to precompiled dir if missing
+                // Writeback to precompiled dir if missing. Skip when it is the
+                // cache dir itself (see normalize note): a self-copy truncates.
                 if let Some(ref dir) = self.precompiled_dir {
+                    let pre_hsaco = dir.join(format!("{name}.hsaco"));
                     let pre_hash = dir.join(format!("{name}.hash"));
                     let pre_valid = pre_hash.exists() && {
                         let stored = std::fs::read_to_string(&pre_hash).unwrap_or_default();
                         stored.trim() == src_hash
                     };
-                    if !pre_valid {
-                        let pre_hsaco = dir.join(format!("{name}.hsaco"));
+                    if !pre_valid && pre_hsaco != obj_path {
                         let _ = std::fs::copy(&obj_path, &pre_hsaco);
                         let _ = std::fs::write(&pre_hash, &src_hash);
                     }
@@ -615,12 +619,17 @@ impl KernelCompiler {
                     .and_then(|_| Self::normalize_hipcc_output(&arch, &obj_path, &name));
                     if result.is_ok() {
                         let _ = std::fs::write(&hash_path, &src_hash);
-                        // Write back to precompiled dir
+                        // Write back to precompiled dir. Skip when it resolves to
+                        // the cache dir itself (effective_precompiled == hot_dir):
+                        // std::fs::copy(X, X) truncates X to 0 bytes before reading,
+                        // which would corrupt the kernel we just compiled.
                         if let Some(ref dir) = precompiled_dir {
-                            let pre_hash = dir.join(format!("{name}.hash"));
                             let pre_hsaco = dir.join(format!("{name}.hsaco"));
-                            let _ = std::fs::copy(&obj_path, &pre_hsaco);
-                            let _ = std::fs::write(&pre_hash, &src_hash);
+                            if pre_hsaco != obj_path {
+                                let pre_hash = dir.join(format!("{name}.hash"));
+                                let _ = std::fs::copy(&obj_path, &pre_hsaco);
+                                let _ = std::fs::write(&pre_hash, &src_hash);
+                            }
                         }
                     }
                     let i = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
