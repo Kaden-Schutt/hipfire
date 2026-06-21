@@ -6434,8 +6434,9 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         // generate_gemma4: greedy requests route through
         // spec_step_gemma4_eagle when a drafter is loaded; temp > 0 falls
         // back to the AR sampling loop. We honour `system_prompt`, `temp`,
-        // `top_p`, and (via JinjaChatFrame) `messages_history` + `tools`
-        // rendering; thinking mode is out of scope for v1.
+        // `top_p`, `max_think_tokens` (gemma4's Harmony-style channel thinking,
+        // parsed inside generate_gemma4), and (via JinjaChatFrame)
+        // `messages_history` + `tools` rendering.
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
@@ -10315,6 +10316,289 @@ fn generate_lfm2moe(
     let _ = stdout.flush();
 }
 
+/// Streaming channel-router for gemma4's Harmony-style thinking format.
+///
+/// Gemma4's chat template does NOT use `<think>`/`</think>`. With
+/// `enable_thinking=true` the model is primed by `<|think|>` (injected into the
+/// system turn) and emits its reasoning inside a channel block
+/// `<|channel>thought\n{reasoning}\n<channel|>`, followed by the plain-text
+/// answer (everything OUTSIDE any `<|channel>…<channel|>` block — see the
+/// template's `strip_thinking` macro). This router runs a byte-streaming state
+/// machine over the DECODED token fragments and classifies each emitted run as
+/// reasoning (inside a `thought` channel) or answer (outside), while
+/// SUPPRESSING the structural markers themselves so they never leak to either
+/// channel.
+///
+/// Mirrors `generate_cohere2moe`'s marker state machine, but North's markers
+/// are SPECIAL TOKENS (matched by token id) whereas gemma4's are PLAIN TEXT
+/// (`<|think|>`, `<|channel>`, the channel-name word, `<channel|>`) that the
+/// tokenizer may split across several decoded fragments. The router therefore
+/// buffers a small tail that could be the start of a marker and only releases
+/// text it is sure is not part of one.
+///
+/// Suppressed marker strings: `<|think|>`, `<|channel>`, `<channel|>`. After an
+/// opening `<|channel>` the immediately-following channel-name word (e.g.
+/// `thought`) plus a single trailing newline is also consumed (it names the
+/// channel; only `thought` routes to reasoning — any other name routes to
+/// answer, matching the template treating non-thought channels as visible).
+struct Gemma4ChannelRouter {
+    /// Bytes received but not yet classified (may hold a partial marker).
+    buf: String,
+    /// True while inside a `<|channel>thought … <channel|>` block.
+    in_thought: bool,
+    /// Set right after a `<|channel>` open: we are consuming the channel-name
+    /// word (until the first newline) and deciding whether it is `thought`.
+    awaiting_channel_name: bool,
+    /// Accumulates the channel-name characters while `awaiting_channel_name`.
+    channel_name: String,
+}
+
+impl Gemma4ChannelRouter {
+    /// All markers we recognise/suppress. These are distinct strings tested
+    /// independently; `drain` always acts on the EARLIEST occurrence in the
+    /// buffer, so list order does not affect routing.
+    const MARKERS: [&'static str; 3] = ["<channel|>", "<|channel>", "<|think|>"];
+
+    fn new() -> Self {
+        Self {
+            buf: String::new(),
+            in_thought: false,
+            awaiting_channel_name: false,
+            channel_name: String::new(),
+        }
+    }
+
+    /// Could `s` be the beginning (a strict, non-empty prefix shorter than the
+    /// full marker) of one of our markers? Used to hold back a tail that might
+    /// complete into a marker on the next fragment.
+    fn is_partial_marker(s: &str) -> bool {
+        if s.is_empty() {
+            return false;
+        }
+        Self::MARKERS
+            .iter()
+            .any(|m| m.len() > s.len() && m.starts_with(s))
+    }
+
+    /// Feed one decoded fragment. Appends `(text, is_reasoning)` runs ready to
+    /// emit into `out`. Markers are consumed and never appear in `out`.
+    fn ingest(&mut self, frag: &str, out: &mut Vec<(String, bool)>) {
+        self.buf.push_str(frag);
+        self.drain(out, false);
+    }
+
+    /// End-of-stream: release whatever is buffered (a trailing partial marker
+    /// at EOS is incomplete and therefore real text, so flush it verbatim).
+    fn flush(&mut self, out: &mut Vec<(String, bool)>) {
+        self.drain(out, true);
+    }
+
+    fn drain(&mut self, out: &mut Vec<(String, bool)>, at_eos: bool) {
+        // Pull from the front of `buf` until we either consume everything or
+        // are blocked on a possible partial marker (unless at EOS).
+        'outer: loop {
+            // Channel-name capture mode: after `<|channel>` swallow the name
+            // word up to (and including) the first newline.
+            if self.awaiting_channel_name {
+                if let Some(nl) = self.buf.find('\n') {
+                    self.channel_name.push_str(&self.buf[..nl]);
+                    // Drop name + the newline.
+                    self.buf.drain(..nl + 1);
+                    self.awaiting_channel_name = false;
+                    self.in_thought = self.channel_name.trim() == "thought";
+                    self.channel_name.clear();
+                    continue 'outer;
+                } else {
+                    // No newline yet. Accumulate the whole buffer as name and
+                    // wait for more (or, at EOS, finalize on what we have).
+                    self.channel_name.push_str(&self.buf);
+                    self.buf.clear();
+                    if at_eos {
+                        self.awaiting_channel_name = false;
+                        self.in_thought = self.channel_name.trim() == "thought";
+                        self.channel_name.clear();
+                    }
+                    return;
+                }
+            }
+
+            // Find the earliest marker occurrence in the buffer.
+            let mut hit: Option<(usize, &'static str)> = None;
+            for m in Self::MARKERS.iter() {
+                if let Some(idx) = self.buf.find(m) {
+                    match hit {
+                        Some((h, _)) if h <= idx => {}
+                        _ => hit = Some((idx, m)),
+                    }
+                }
+            }
+
+            if let Some((idx, marker)) = hit {
+                // Emit text before the marker (routed by current section).
+                if idx > 0 {
+                    let text: String = self.buf[..idx].to_string();
+                    out.push((text, self.in_thought));
+                }
+                // Consume the marker.
+                self.buf.drain(..idx + marker.len());
+                match marker {
+                    "<|channel>" => {
+                        // Begin channel-name capture; routing decided once the
+                        // name word terminates.
+                        self.awaiting_channel_name = true;
+                        self.channel_name.clear();
+                    }
+                    "<channel|>" => {
+                        self.in_thought = false;
+                    }
+                    "<|think|>" => {
+                        // Prompt-priming marker; if it leaks into generation
+                        // just drop it (it does not itself open the channel).
+                    }
+                    _ => {}
+                }
+                continue 'outer;
+            }
+
+            // No complete marker. Decide how much of `buf` is safe to emit:
+            // hold back any suffix that could be the prefix of a marker.
+            if at_eos {
+                if !self.buf.is_empty() {
+                    let text = std::mem::take(&mut self.buf);
+                    out.push((text, self.in_thought));
+                }
+                return;
+            }
+
+            // Longest suffix of `buf` that is a partial marker → keep it.
+            let bytes = self.buf.len();
+            let mut keep_from = bytes;
+            // The longest marker is 10 bytes ("<channel|>"); only the last few
+            // bytes can be a partial. Scan suffixes from longest candidate.
+            let max_marker = Self::MARKERS.iter().map(|m| m.len()).max().unwrap_or(0);
+            let scan_start = bytes.saturating_sub(max_marker.saturating_sub(1));
+            for start in scan_start..bytes {
+                if self.buf.is_char_boundary(start) && Self::is_partial_marker(&self.buf[start..]) {
+                    keep_from = start;
+                    break;
+                }
+            }
+            if keep_from > 0 {
+                let emit: String = self.buf[..keep_from].to_string();
+                if !emit.is_empty() {
+                    out.push((emit, self.in_thought));
+                }
+                self.buf.drain(..keep_from);
+            }
+            // Whatever remains is a held-back partial marker (or empty). Wait
+            // for the next fragment.
+            break;
+        }
+    }
+}
+
+#[cfg(test)]
+mod gemma4_channel_router_tests {
+    use super::Gemma4ChannelRouter;
+
+    /// Feed `frags` one at a time, then flush, collapsing each emitted run into
+    /// (reasoning_text, answer_text). Asserts no marker substring leaks.
+    fn run(frags: &[&str]) -> (String, String) {
+        let mut r = Gemma4ChannelRouter::new();
+        let mut runs: Vec<(String, bool)> = Vec::new();
+        for f in frags {
+            r.ingest(f, &mut runs);
+        }
+        r.flush(&mut runs);
+        let mut think = String::new();
+        let mut ans = String::new();
+        for (t, is_think) in runs {
+            if is_think {
+                think.push_str(&t);
+            } else {
+                ans.push_str(&t);
+            }
+        }
+        for leak in ["<|channel>", "<channel|>", "<|think|>"] {
+            assert!(!think.contains(leak), "marker {leak:?} leaked into reasoning: {think:?}");
+            assert!(!ans.contains(leak), "marker {leak:?} leaked into answer: {ans:?}");
+        }
+        (think, ans)
+    }
+
+    #[test]
+    fn plain_answer_no_channel() {
+        let (think, ans) = run(&["Hello", " world"]);
+        assert_eq!(think, "");
+        assert_eq!(ans, "Hello world");
+    }
+
+    #[test]
+    fn single_fragment_full_block() {
+        let (think, ans) = run(&["<|channel>thought\nlet me reason<channel|>The answer is 42."]);
+        assert_eq!(think, "let me reason");
+        assert_eq!(ans, "The answer is 42.");
+    }
+
+    #[test]
+    fn empty_thought_channel_then_answer() {
+        // thinking-OFF priming: model gets `<|channel>thought\n<channel|>` then
+        // answers directly. The empty channel must route nothing to reasoning.
+        let (think, ans) = run(&["<|channel>thought\n<channel|>", "Direct answer."]);
+        assert_eq!(think, "");
+        assert_eq!(ans, "Direct answer.");
+    }
+
+    #[test]
+    fn markers_split_across_fragments() {
+        // Markers arrive byte-by-byte across fragments (the realistic case).
+        let (think, ans) = run(&[
+            "<|cha", "nnel>tho", "ught", "\n", "reason", "ing", "<chan", "nel|>", "ans", "wer",
+        ]);
+        assert_eq!(think, "reasoning");
+        assert_eq!(ans, "answer");
+    }
+
+    #[test]
+    fn channel_name_split_across_fragments() {
+        let (think, ans) = run(&["<|channel>", "thou", "ght\n", "r", "<channel|>", "a"]);
+        assert_eq!(think, "r");
+        assert_eq!(ans, "a");
+    }
+
+    #[test]
+    fn non_thought_channel_routes_to_answer() {
+        // A channel whose name is NOT `thought` is visible (matches the
+        // template treating non-thought channels as answer text).
+        let (think, ans) = run(&["<|channel>final\nvisible<channel|>"]);
+        assert_eq!(think, "");
+        assert_eq!(ans, "visible");
+    }
+
+    #[test]
+    fn stray_think_marker_suppressed() {
+        let (think, ans) = run(&["<|think|>", "answer"]);
+        assert_eq!(think, "");
+        assert_eq!(ans, "answer");
+    }
+
+    #[test]
+    fn lone_angle_bracket_is_text() {
+        // A `<` that never completes into a marker is real answer text.
+        let (think, ans) = run(&["1 < 2 and 3 > 2"]);
+        assert_eq!(think, "");
+        assert_eq!(ans, "1 < 2 and 3 > 2");
+    }
+
+    #[test]
+    fn partial_marker_at_eos_is_flushed_as_text() {
+        // `<|chan` at EOS never completes → must be emitted, not swallowed.
+        let (think, ans) = run(&["done<|chan"]);
+        assert_eq!(think, "");
+        assert_eq!(ans, "done<|chan");
+    }
+}
+
 /// Gemma 4 dense (arch_id=13) generate path — minimal AR bring-up.
 ///
 /// Mirrors `generate_lfm2moe`'s shape (per-token prefill loop, per-token
@@ -10327,11 +10611,15 @@ fn generate_lfm2moe(
 ///      BPE fragment instead of the single id=2 the template expects (see
 ///      the May-07 D4 wiring, c40c44eb). A BOS-prepend guard after encode
 ///      covers the no-bos render/fallback paths without ever doubling it.
-///   2. v1 is NON-THINKING: `enable_thinking: false` makes the template
-///      pre-fill the empty thought channel
-///      (`<|turn>model\n<|channel>thought\n<channel|>`) so the model answers
-///      directly instead of improvising the channel scaffold. Thinking-mode
-///      streaming/parsing is a follow-up.
+///   2. THINKING is Harmony-style CHANNELS, not `<think>`. The request's
+///      `max_think_tokens` gates it (`== 1` → closed/no-thinking): thinking
+///      OFF renders `enable_thinking=false` so the template pre-fills the empty
+///      thought channel (`<|turn>model\n<|channel>thought\n<channel|>`) and the
+///      model answers directly; thinking ON renders `enable_thinking=true` so
+///      `<|think|>` primes the system turn and the model emits a
+///      `<|channel>thought … <channel|>` reasoning block before the plain
+///      answer. The decode stream is parsed by `Gemma4ChannelRouter`: reasoning
+///      → `"reasoning":true`, answer → a normal token, markers suppressed.
 ///   3. Decode runs `gemma4::forward::decode_step_with_graph` (hipGraph
 ///      capture/replay, default ON, `HIPFIRE_GEMMA4_GRAPH=0` opt-out);
 ///      prefill stays on the eager `decode_step`.
@@ -10340,9 +10628,10 @@ fn generate_lfm2moe(
 ///      `<end_of_turn>`, resolved at load into `m.gemma4_eos_tok`). Stopping
 ///      on the scalar alone loops the end-of-turn token forever.
 ///
-/// Out of scope for v1 (and intentionally NOT wired): EAGLE/DFlash
-/// spec-decode, thinking mode, grammar, tool-call parsing/execution, repeat
-/// penalty, multi-GPU, eviction/prefix-cache. Correctness first.
+/// Out of scope for v1 (and intentionally NOT wired): DFlash spec-decode,
+/// grammar, tool-call parsing/execution, repeat penalty, multi-GPU,
+/// eviction/prefix-cache. (EAGLE spec-decode and Harmony-style channel
+/// thinking ARE wired — see items above.) Correctness first.
 #[allow(clippy::too_many_arguments)]
 fn generate_gemma4(
     m: &mut LoadedModel,
@@ -10370,9 +10659,14 @@ fn generate_gemma4(
         return;
     }
 
-    // v1 is non-thinking (see doc comment item 2); the think budget only
-    // gates thinking-capable paths.
-    let _ = max_think_tokens;
+    // Thinking gate. gemma4 uses a Harmony-style CHANNEL format, not
+    // `<think>`/`</think>`: with thinking ON the template primes `<|think|>` in
+    // the system turn and the model emits reasoning inside a
+    // `<|channel>thought … <channel|>` block before the plain answer; with
+    // thinking OFF the template pre-fills an empty thought channel so the model
+    // answers directly. Mirror the convention the qwen35 / minimax / cohere2moe
+    // paths use: `max_think_tokens == 1` means closed/no-thinking.
+    let want_thinking = max_think_tokens != 1;
 
     if m.tokenizer.is_none() {
         emit_error_with_id(stdout, id, "tokenizer not loaded".to_string());
@@ -10406,7 +10700,7 @@ fn generate_gemma4(
                 template,
                 system: system_prompt,
                 user: prompt,
-                enable_thinking: false,
+                enable_thinking: want_thinking,
                 bos_token: Some("<bos>"),
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
@@ -10540,6 +10834,46 @@ fn generate_gemma4(
     }
     let prefill_ms = t0.elapsed().as_millis();
 
+    // Channel-router for the Harmony-style thinking stream (see
+    // `Gemma4ChannelRouter`). Shared across the EAGLE and AR decode loops:
+    // text inside a `<|channel>thought … <channel|>` block is emitted with
+    // `"reasoning":true`; the plain answer outside any block is a normal token;
+    // the structural markers are suppressed. Running it unconditionally keeps
+    // any improvised marker from leaking even when thinking is off.
+    let mut channel = Gemma4ChannelRouter::new();
+    let emit_routed = |stdout: &mut std::io::Stdout, id: &str, frag: &str, channel: &mut Gemma4ChannelRouter| {
+        let mut runs: Vec<(String, bool)> = Vec::new();
+        channel.ingest(frag, &mut runs);
+        for (text, reasoning) in runs {
+            if text.is_empty() {
+                continue;
+            }
+            let envelope = if reasoning {
+                serde_json::json!({"type": "token", "id": id, "text": text, "reasoning": true})
+            } else {
+                serde_json::json!({"type": "token", "id": id, "text": text})
+            };
+            let _ = writeln!(stdout, "{}", envelope);
+            let _ = stdout.flush();
+        }
+    };
+    let flush_routed = |stdout: &mut std::io::Stdout, id: &str, channel: &mut Gemma4ChannelRouter| {
+        let mut runs: Vec<(String, bool)> = Vec::new();
+        channel.flush(&mut runs);
+        for (text, reasoning) in runs {
+            if text.is_empty() {
+                continue;
+            }
+            let envelope = if reasoning {
+                serde_json::json!({"type": "token", "id": id, "text": text, "reasoning": true})
+            } else {
+                serde_json::json!({"type": "token", "id": id, "text": text})
+            };
+            let _ = writeln!(stdout, "{}", envelope);
+            let _ = stdout.flush();
+        }
+    };
+
     // ── EAGLE spec-decode fast path (arch-22 drafter loaded; greedy only) ──
     //
     // Mirrors the DFlash dispatch contract: the accept rule is greedy-argmax,
@@ -10626,13 +10960,7 @@ fn generate_gemma4(
                     let tokenizer = m.tokenizer.as_ref().unwrap();
                     tokenizer.decode(&[t])
                 };
-                let envelope = serde_json::json!({
-                    "type": "token",
-                    "id": id,
-                    "text": frag,
-                });
-                let _ = writeln!(stdout, "{}", envelope);
-                let _ = stdout.flush();
+                emit_routed(stdout, id, &frag, &mut channel);
                 m.conversation_tokens.push(t);
                 generated_count += 1;
                 if generated_count >= max_tokens {
@@ -10672,6 +11000,10 @@ fn generate_gemma4(
             m.gemma4_state.as_mut().unwrap().n_tokens = prefill_end;
         }
         m.seq_pos = m.gemma4_state.as_ref().unwrap().n_tokens;
+
+        // Release any text held back in the channel router (a trailing partial
+        // marker at EOS is real text).
+        flush_routed(stdout, id, &mut channel);
 
         let decode_ms = decode_t0.elapsed().as_millis().max(1);
         let total_ms = t0.elapsed().as_millis().max(1);
@@ -10717,13 +11049,7 @@ fn generate_gemma4(
             let tokenizer = m.tokenizer.as_ref().unwrap();
             tokenizer.decode(&[next_tok])
         };
-        let envelope = serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": frag,
-        });
-        let _ = writeln!(stdout, "{}", envelope);
-        let _ = stdout.flush();
+        emit_routed(stdout, id, &frag, &mut channel);
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
@@ -10751,6 +11077,9 @@ fn generate_gemma4(
     }
 
     m.seq_pos = m.gemma4_state.as_ref().unwrap().n_tokens;
+
+    // Release any text held back in the channel router.
+    flush_routed(stdout, id, &mut channel);
 
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);
@@ -10807,7 +11136,7 @@ fn generate_gemma4_lowered(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
-    let _ = (max_think_tokens, tools, messages_history);
+    let _ = (tools, messages_history);
 
     if m.tokenizer.is_none() {
         emit_error_with_id(stdout, id, "tokenizer not loaded".to_string());
@@ -10818,33 +11147,56 @@ fn generate_gemma4_lowered(
         return;
     }
 
+    // Thinking gate (see the eager `generate_gemma4` note): gemma4 is
+    // Harmony-style channels, not `<think>`. `max_think_tokens == 1` means
+    // closed/no-thinking.
+    let want_thinking = max_think_tokens != 1;
+
     // ── Prompt build ──
     // Apply the gemma4 chat-template framing (matches templates/gemma-4-it.jinja
     // generation prompt) when the four turn/channel special tokens are present in
     // the tokenizer; otherwise fall back to raw tokenization (cannot regress).
     // Framing:
-    //   <bos><|turn>user\n{prompt}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>
-    // (optional `<|turn>system\n{system}<turn|>\n` before the user turn). The empty
-    // thought channel is pre-filled so the model emits the answer directly instead
-    // of improvising the `<|channel>thought…<channel|>` scaffold itself. `encode()`
-    // segments on the special tokens; BOS (2) is prepended manually (SPM-BPE doesn't).
+    //   thinking OFF:
+    //     <bos>[<|turn>system\n{system}<turn|>\n]<|turn>user\n{prompt}<turn|>\n
+    //     <|turn>model\n<|channel>thought\n<channel|>
+    //     (empty thought channel pre-filled → model answers directly)
+    //   thinking ON:
+    //     <bos><|turn>system\n<|think|>\n[{system}]<turn|>\n<|turn>user\n{prompt}<turn|>\n
+    //     <|turn>model\n
+    //     (`<|think|>` primes the system turn → model emits a
+    //      `<|channel>thought…<channel|>` reasoning block then the answer)
+    // `encode()` segments on the special tokens; BOS (2) is prepended manually
+    // (SPM-BPE doesn't).
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let framed_ok = ["<|turn>", "<turn|>", "<|channel>", "<channel|>"]
         .iter()
         .all(|t| tokenizer.special_token_id(t).is_some());
-    eprintln!("[gemma4 lowered chat] framed_ok={framed_ok}");
+    eprintln!("[gemma4 lowered chat] framed_ok={framed_ok} thinking={want_thinking}");
     let prompt_ids: Vec<u32> = {
         let mut ids = vec![2u32]; // BOS
         if framed_ok {
             let mut s = String::new();
-            if let Some(sys) = system_prompt {
-                if !sys.is_empty() {
-                    s.push_str(&format!("<|turn>system\n{sys}<turn|>\n"));
+            let has_sys = system_prompt.map(|x| !x.is_empty()).unwrap_or(false);
+            if want_thinking {
+                // System turn carries the `<|think|>` primer (and the optional
+                // system text). Mirrors template lines 180-184.
+                s.push_str("<|turn>system\n<|think|>\n");
+                if has_sys {
+                    s.push_str(system_prompt.unwrap());
                 }
+                s.push_str("<turn|>\n");
+                s.push_str(&format!(
+                    "<|turn>user\n{prompt}<turn|>\n<|turn>model\n"
+                ));
+            } else {
+                if has_sys {
+                    s.push_str(&format!("<|turn>system\n{}<turn|>\n", system_prompt.unwrap()));
+                }
+                s.push_str(&format!(
+                    "<|turn>user\n{prompt}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+                ));
             }
-            s.push_str(&format!(
-                "<|turn>user\n{prompt}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
-            ));
             ids.extend(tokenizer.encode(&s));
         } else {
             ids.extend(tokenizer.encode(prompt));
@@ -10960,6 +11312,28 @@ fn generate_gemma4_lowered(
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
 
+    // Channel-router for the Harmony-style thinking stream (see
+    // `Gemma4ChannelRouter`): reasoning inside `<|channel>thought … <channel|>`
+    // → `"reasoning":true`; the plain answer → a normal token; markers
+    // suppressed. Run unconditionally so improvised markers never leak.
+    let mut channel = Gemma4ChannelRouter::new();
+    let emit_routed = |stdout: &mut std::io::Stdout, id: &str, frag: &str, channel: &mut Gemma4ChannelRouter| {
+        let mut runs: Vec<(String, bool)> = Vec::new();
+        channel.ingest(frag, &mut runs);
+        for (text, reasoning) in runs {
+            if text.is_empty() {
+                continue;
+            }
+            let envelope = if reasoning {
+                serde_json::json!({"type": "token", "id": id, "text": text, "reasoning": true})
+            } else {
+                serde_json::json!({"type": "token", "id": id, "text": text})
+            };
+            let _ = writeln!(stdout, "{}", envelope);
+            let _ = stdout.flush();
+        }
+    };
+
     loop {
         if generated_count >= max_tokens {
             break;
@@ -10982,19 +11356,12 @@ fn generate_gemma4_lowered(
             break;
         }
 
-        // Emit token
+        // Emit token (routed through the channel state machine)
         let frag = {
             let tokenizer = m.tokenizer.as_ref().unwrap();
             tokenizer.decode(&[next_tok])
         };
-        let envelope = serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": frag,
-            "tok": next_tok,
-        });
-        let _ = writeln!(stdout, "{}", envelope);
-        let _ = stdout.flush();
+        emit_routed(stdout, id, &frag, &mut channel);
 
         generated_count += 1;
 
@@ -11023,6 +11390,25 @@ fn generate_gemma4_lowered(
         }
         m.seq_pos += 1;
         m.conversation_tokens.push(next_tok);
+    }
+
+    // Release any text held back in the channel router (trailing partial
+    // marker at EOS is real text).
+    {
+        let mut runs: Vec<(String, bool)> = Vec::new();
+        channel.flush(&mut runs);
+        for (text, reasoning) in runs {
+            if text.is_empty() {
+                continue;
+            }
+            let envelope = if reasoning {
+                serde_json::json!({"type": "token", "id": id, "text": text, "reasoning": true})
+            } else {
+                serde_json::json!({"type": "token", "id": id, "text": text})
+            };
+            let _ = writeln!(stdout, "{}", envelope);
+            let _ = stdout.flush();
+        }
     }
 
     // Measure prefill + decode separately for perf reporting.
