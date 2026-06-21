@@ -33322,6 +33322,106 @@ impl Gpu {
         result
     }
 
+    /// Routed batched attention with a KVarN K cache + Q8_0 V (microbatching).
+    /// Per-row session selects its caches from session-major pointer tables
+    /// (`rec_ptrs` = 4-bit K records, `win_ptrs` = f32 recent window, `v_ptrs` =
+    /// Q8_0 V); each row's `n_full_blocks` is derived from `positions[row]`.
+    /// Mirrors `attention_q8_0_routed_batched`; K dequant is in place.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_kvarn_routed_batched(
+        &mut self,
+        q: &GpuTensor,
+        rec_ptrs: &GpuTensor,
+        win_ptrs: &GpuTensor,
+        v_ptrs: &GpuTensor,
+        out: &GpuTensor,
+        row_session_indices: &GpuTensor,
+        positions: &GpuTensor,
+        ptr_layer_stride: usize,
+        layer_index: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "attention_kvarn_routed_batched",
+            kernels::ATTENTION_KVARN_ROUTED_BATCHED_SRC,
+            "attention_kvarn_routed_batched",
+        )?;
+        const GROUP: usize = 128;
+        let rec_bytes = (head_dim * GROUP).div_ceil(2) + head_dim * 2 * 2 + GROUP * 2;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let q_ptr = q.buf.as_ptr();
+        let rec_ptrs_ptr = rec_ptrs.buf.as_ptr();
+        let win_ptrs_ptr = win_ptrs.buf.as_ptr();
+        let v_ptrs_ptr = v_ptrs.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let rsi_ptr = row_session_indices.buf.as_ptr();
+        let pos_ptr = positions.buf.as_ptr();
+        let ptr_stride = ptr_layer_stride as i32;
+        let layer = layer_index as i32;
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let ms = max_seq as i32;
+        let sc = scale;
+        let rb = rec_bytes as i32;
+        let gp = GROUP as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &q_ptr as *const _ as *mut c_void,
+            &rec_ptrs_ptr as *const _ as *mut c_void,
+            &win_ptrs_ptr as *const _ as *mut c_void,
+            &v_ptrs_ptr as *const _ as *mut c_void,
+            &out_ptr as *const _ as *mut c_void,
+            &rsi_ptr as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &ptr_stride as *const _ as *mut c_void,
+            &layer as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &ms as *const _ as *mut c_void,
+            &sc as *const _ as *mut c_void,
+            &rb as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+        ];
+        let block_size = (max_ctx_len.max(head_dim) as u32)
+            .next_power_of_two()
+            .min(256);
+        let shared_mem = ((max_ctx_len + block_size as usize + head_dim) * 4) as u32;
+        self.launch_maybe_blob(
+            "attention_kvarn_routed_batched",
+            [n_heads as u32, batch_size as u32, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut bb = hip_bridge::KernargBlob::new();
+                bb.push_ptr(q_ptr);
+                bb.push_ptr(rec_ptrs_ptr);
+                bb.push_ptr(win_ptrs_ptr);
+                bb.push_ptr(v_ptrs_ptr);
+                bb.push_ptr(out_ptr);
+                bb.push_ptr(rsi_ptr);
+                bb.push_ptr(pos_ptr);
+                bb.push_i32(ptr_stride);
+                bb.push_i32(layer);
+                bb.push_i32(nh);
+                bb.push_i32(nkv);
+                bb.push_i32(hd);
+                bb.push_i32(ms);
+                bb.push_f32(sc);
+                bb.push_i32(rb);
+                bb.push_i32(gp);
+                bb
+            },
+        )
+    }
+
     /// FP32 causal attention specialized for GQA groups where four query heads
     /// share one KV head. This is a full-precision KLD prefill fast path: it
     /// preserves FP32 score/output arithmetic and only reduces redundant K/V

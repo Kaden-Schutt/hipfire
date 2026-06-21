@@ -2520,6 +2520,12 @@ pub const ATTENTION_Q8_0_KV_BATCHED_SRC: &str =
 pub const ATTENTION_Q8_0_ROUTED_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_routed_batched.hip");
 
+/// Routed batched attention with a KVarN K cache + Q8_0 V (microbatching): per-
+/// session record/window/V pointer tables, inline 4-bit K dequant. See
+/// `kernels/src/attention_kvarn_routed_batched.hip`.
+pub const ATTENTION_KVARN_ROUTED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/attention_kvarn_routed_batched.hip");
+
 /// Batched counterpart of ATTENTION_SRC for unquantized FP32 KV cache.
 /// Processes N queries in one launch with per-row causal windows from a
 /// positions[] array.
