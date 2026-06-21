@@ -13,7 +13,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::f16_to_f32;
+use hipfire_runtime::quant::f16_to_f32;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let argv: Vec<String> = std::env::args().collect();

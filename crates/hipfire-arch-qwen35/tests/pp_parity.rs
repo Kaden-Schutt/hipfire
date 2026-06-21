@@ -23,7 +23,7 @@ use hipfire_arch_qwen35::qwen35::{
 };
 use hipfire_model::tokenizer::Tokenizer;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::KvCache;
+use hipfire_runtime::kv::KvCache;
 use hipfire_runtime::multi_gpu::Gpus;
 use rdna_compute::Gpu;
 use std::path::Path;
