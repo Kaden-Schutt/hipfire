@@ -120,6 +120,22 @@ impl HierKvState {
         self.n_kv_heads * HD
     }
 
+    /// Reset all per-layer tier state for a new sequence (pos==0). Hot ring buffers
+    /// are kept (overwritten by `append_token`); cold segments are dropped. Call
+    /// once at sequence start. NB: dropped segment GpuTensors are not pool-returned
+    /// — a minor VRAM churn at the rare session boundary, not per-token.
+    pub fn reset(&mut self) {
+        for c in self.hot_count.iter_mut() {
+            *c = 0;
+        }
+        for m in self.migrated.iter_mut() {
+            *m = 0;
+        }
+        for segs in self.cold.iter_mut() {
+            segs.clear();
+        }
+    }
+
     /// Append one token's K/V (`fa_k`/`fa_v` = [kv_dim] head-major) into the hot
     /// ring at the current tail slot. Migrates the oldest `migrate_batch` tokens
     /// to a cold segment first if the ring is full.
