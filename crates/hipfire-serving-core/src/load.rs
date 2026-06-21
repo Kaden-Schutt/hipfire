@@ -51,9 +51,37 @@ pub fn resolve_chat_template(
     hfq: &hipfire_runtime::hfq::HfqFile,
     model_path: &str,
 ) -> Option<String> {
-    let resolved = prompt_frame::resolve_chat_template(model_path, hfq.chat_template())?;
-    prompt_frame::log_resolved_chat_template_source(&resolved.source);
-    Some(resolved.template)
+    match prompt_frame::resolve_chat_template(model_path, hfq.chat_template()) {
+        Some(resolved) => {
+            prompt_frame::log_resolved_chat_template_source(&resolved.source);
+            Some(resolved.template)
+        }
+        None => {
+            // Defensive tripwire. A `None` here means `effective_raw()` will
+            // default to true (see model::effective_raw) and the daemon serves
+            // the prompt RAW/unframed — correct for a base/completion model, but
+            // a disaster for a chat model: a bare prompt has no
+            // `<|im_start|>assistant` decode anchor and collapses heavily-quantized
+            // chat models into a token attractor. The normal quantize path always
+            // embeds the template (folding `chat_template.jinja`, and requant
+            // carries metadata forward), so a chat arch arriving template-less
+            // means a hand-built / corrupted HFQ. Warn loudly rather than
+            // silently mis-serving. Scoped to the qwen3.5/3.6 family (arch_id
+            // 5/6), the known chat arch this guards; base models of other arches
+            // legitimately resolve no template and must not be warned on.
+            if hipfire_model::is_qwen35_family_arch_id(hfq.arch_id) {
+                eprintln!(
+                    "[chat_template] WARNING: chat arch (arch_id={}) resolved NO chat template \
+                     for {model_path} — the daemon will serve RAW/unframed prompts, which can \
+                     collapse a chat model into a token attractor. Provide one via \
+                     HIPFIRE_CHAT_TEMPLATE_FILE, ~/.hipfire/templates/<model-basename>.j2, or \
+                     re-quantize from a source that embeds tokenizer_config.chat_template.",
+                    hfq.arch_id
+                );
+            }
+            None
+        }
+    }
 }
 
 /// Parse a resolved chat-template string into a `ChatTemplateProfile` (the

@@ -194,7 +194,11 @@ pub enum ChatTemplateSource {
 ///
 /// Precedence:
 /// 1. `HIPFIRE_CHAT_TEMPLATE_FILE`, when set and readable.
-/// 2. Per-model file at `$HOME/.hipfire/templates/<model-basename>.j2`.
+/// 2. Per-model file in `$HOME/.hipfire/templates/`, trying (in order)
+///    `<model-basename>.j2`, `<model-stem>.j2`, `<model-stem>.jinja`,
+///    `<model-stem>.tmpl`. These mirror `template_matches_model` in
+///    hipfire-model's registry scan, so a template the registry lists for a
+///    model is the same one the loader actually reads (no silent raw-serve).
 /// 3. Embedded model template.
 ///
 /// Read failures on override files are non-fatal and fall through to the next
@@ -222,15 +226,35 @@ pub fn resolve_chat_template(
     }
 
     if let Some(home) = std::env::var_os("HOME") {
-        let basename = Path::new(model_path)
+        let templates_dir = Path::new(&home).join(".hipfire").join("templates");
+        let model_file = Path::new(model_path);
+        let basename = model_file
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("");
+        let stem = model_file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        // Candidate per-model template filenames, in priority order. Mirrors
+        // `template_matches_model` in hipfire-model's registry scan so the
+        // template the registry advertises for this model is the same one the
+        // loader reads — otherwise a `<stem>.jinja`/`.tmpl` shows up in the
+        // registry but is silently ignored at serve and the model runs raw.
+        let mut candidates: Vec<String> = Vec::new();
         if !basename.is_empty() {
-            let per_model = Path::new(&home)
-                .join(".hipfire")
-                .join("templates")
-                .join(format!("{basename}.j2"));
+            candidates.push(format!("{basename}.j2"));
+        }
+        if !stem.is_empty() {
+            for ext in ["j2", "jinja", "tmpl"] {
+                let name = format!("{stem}.{ext}");
+                if !candidates.contains(&name) {
+                    candidates.push(name);
+                }
+            }
+        }
+        for name in &candidates {
+            let per_model = templates_dir.join(name);
             if per_model.is_file() {
                 match std::fs::read_to_string(&per_model) {
                     Ok(template) => {
@@ -1950,6 +1974,72 @@ mod tests {
                 .expect("embedded template");
         assert_eq!(resolved.template, "embedded");
         assert_eq!(resolved.source, ChatTemplateSource::Embedded);
+        snapshot.restore();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn chat_template_resolution_accepts_registry_spellings() {
+        // The loader must read the same per-model template spellings the
+        // hipfire-model registry advertises (`template_matches_model`):
+        // `<stem>.jinja` / `<stem>.tmpl` / `<stem>.j2`, not only
+        // `<basename>.j2`. Otherwise a registry-listed template is silently
+        // ignored and the model serves raw.
+        for (filename, body) in [
+            ("qwen3.5-9b-mq4.jinja", "stem-jinja"),
+            ("qwen3.5-9b-mq4.tmpl", "stem-tmpl"),
+            ("qwen3.5-9b-mq4.j2", "stem-j2"),
+        ] {
+            let _guard = ENV_LOCK.lock().unwrap();
+            let snapshot = EnvSnapshot::capture();
+            let root = temp_dir("registry-spelling-template");
+            let home = root.join("home");
+            let templates = home.join(".hipfire").join("templates");
+            std::fs::create_dir_all(&templates).unwrap();
+            let per_model = templates.join(filename);
+            std::fs::write(&per_model, body).unwrap();
+            unsafe {
+                std::env::set_var("HIPFIRE_CHAT_TEMPLATE_FILE", root.join("missing.j2"));
+                std::env::set_var("HOME", &home);
+            }
+
+            let resolved =
+                resolve_chat_template("/models/qwen3.5-9b-mq4.hfq", Some("embedded".to_string()))
+                    .expect("template");
+            assert_eq!(resolved.template, body, "spelling {filename}");
+            assert_eq!(
+                resolved.source,
+                ChatTemplateSource::PerModelFile(per_model.display().to_string()),
+                "spelling {filename}"
+            );
+
+            snapshot.restore();
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn chat_template_resolution_prefers_basename_j2_over_stem_spellings() {
+        // `<basename>.j2` is the most specific match and must win when both it
+        // and a `<stem>.*` variant are present (preserves prior precedence).
+        let _guard = ENV_LOCK.lock().unwrap();
+        let snapshot = EnvSnapshot::capture();
+        let root = temp_dir("basename-precedence-template");
+        let home = root.join("home");
+        let templates = home.join(".hipfire").join("templates");
+        std::fs::create_dir_all(&templates).unwrap();
+        std::fs::write(templates.join("qwen3.5-9b-mq4.hfq.j2"), "basename-j2").unwrap();
+        std::fs::write(templates.join("qwen3.5-9b-mq4.jinja"), "stem-jinja").unwrap();
+        unsafe {
+            std::env::set_var("HIPFIRE_CHAT_TEMPLATE_FILE", root.join("missing.j2"));
+            std::env::set_var("HOME", &home);
+        }
+
+        let resolved =
+            resolve_chat_template("/models/qwen3.5-9b-mq4.hfq", Some("embedded".to_string()))
+                .expect("template");
+        assert_eq!(resolved.template, "basename-j2");
+
         snapshot.restore();
         let _ = std::fs::remove_dir_all(root);
     }
