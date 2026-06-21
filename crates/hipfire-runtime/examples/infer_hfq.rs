@@ -11,6 +11,7 @@ use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv::KvCache;
 use hipfire_runtime::llama;
+use hipfire_runtime::sampler;
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -253,7 +254,7 @@ fn main() {
             prompt_tokens.len() as f64 / (prompt_ms as f64 / 1000.0)
         );
         let logits = gpu.download_f32(&scratch.logits).expect("download logits");
-        llama::argmax(&logits)
+        sampler::argmax(&logits)
     } else {
         for (pos, &token) in prompt_tokens.iter().enumerate() {
             let (_, rng) = llama::forward_scratch(

@@ -22,7 +22,7 @@ use hipfire_runtime::gguf::GgufFile;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv::KvCache;
 #[cfg(feature = "deltanet")]
-use hipfire_runtime::llama;
+use hipfire_runtime::sampler;
 #[cfg(feature = "deltanet")]
 use hipfire_runtime::tokenizer::Tokenizer;
 #[cfg(feature = "deltanet")]
@@ -830,8 +830,8 @@ fn prefill_batch_matches_sequential(ctx: &mut Context) -> CaseOutcome {
                     .download_f32(&scratch.logits)
                     .map_err(|e| e.to_string())?;
 
-                let seq_top = llama::argmax(&seq_logits);
-                let batch_top = llama::argmax(&batch_logits);
+                let seq_top = sampler::argmax(&seq_logits);
+                let batch_top = sampler::argmax(&batch_logits);
                 let (max_diff, mean_diff) = logit_diff_stats(&seq_logits, &batch_logits);
                 let selected_diff =
                     (seq_logits[seq_top as usize] - batch_logits[seq_top as usize]).abs();
@@ -877,8 +877,8 @@ fn prefill_batch_matches_sequential(ctx: &mut Context) -> CaseOutcome {
                     .download_f32(&scratch.logits)
                     .map_err(|e| e.to_string())?;
 
-                let seq_next_top = llama::argmax(&seq_next_logits);
-                let batch_next_top = llama::argmax(&batch_next_logits);
+                let seq_next_top = sampler::argmax(&seq_next_logits);
+                let batch_next_top = sampler::argmax(&batch_next_logits);
                 let (next_max_diff, next_mean_diff) =
                     logit_diff_stats(&seq_next_logits, &batch_next_logits);
                 let next_selected_diff = (seq_next_logits[seq_next_top as usize]
@@ -948,7 +948,7 @@ fn decode_speed_sanity(ctx: &mut Context) -> CaseOutcome {
                 &mut dn,
             )
             .map_err(|e: hip_bridge::HipError| e.to_string())?;
-            tok = llama::argmax(&logits);
+            tok = sampler::argmax(&logits);
             generated.push(tok);
         }
         let ms = t0.elapsed().as_millis();

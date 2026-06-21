@@ -13,7 +13,7 @@ use hipfire_arch_qwen35::qwen35::DeltaNetState;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv::KvCache;
-use hipfire_runtime::llama;
+use hipfire_runtime::sampler;
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -360,7 +360,7 @@ fn main() {
         }
     );
 
-    let sc = llama::SamplingConfig::text_thinking();
+    let sc = sampler::SamplingConfig::text_thinking();
     let scratch = qwen35::Qwen35Scratch::new(&mut gpu, &text_config, sc.repeat_window)
         .expect("failed to create scratch");
 
@@ -425,7 +425,7 @@ fn main() {
     } else {
         sc.answer_temp
     };
-    let mut next_token = llama::sample_top_p(&logits, temp, sc.top_p);
+    let mut next_token = sampler::sample_top_p(&logits, temp, sc.top_p);
 
     let t_gen = Instant::now();
     let mut token_history: Vec<u32> = prompt_tokens.clone();
@@ -490,15 +490,15 @@ fn main() {
         .expect("forward_scratch failed");
         logits = gpu.download_f32(&scratch.logits).unwrap();
         if !in_thinking {
-            llama::apply_ngram_block(&mut logits, &token_history);
+            sampler::apply_ngram_block(&mut logits, &token_history);
         }
-        llama::apply_repeat_penalty(
+        sampler::apply_repeat_penalty(
             &mut logits,
             &token_history,
             sc.repeat_window,
             sc.repeat_penalty,
         );
-        next_token = llama::sample_top_p(&logits, temp, sc.top_p);
+        next_token = sampler::sample_top_p(&logits, temp, sc.top_p);
     }
 
     let gen_ms = t_gen.elapsed().as_millis();

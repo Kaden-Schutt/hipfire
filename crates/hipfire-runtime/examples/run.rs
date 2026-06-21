@@ -15,7 +15,7 @@ fn main() {
 fn main() {
     use hipfire_arch_qwen35::qwen35;
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::llama;
+    use hipfire_runtime::sampler;
     use std::io::Write;
     use std::path::Path;
     use std::time::Instant;
@@ -451,7 +451,7 @@ fn main() {
     } else {
         None
     };
-    let sc = llama::SamplingConfig::text_thinking();
+    let sc = sampler::SamplingConfig::text_thinking();
 
     if session_reset_smoke {
         use serde_json::json;
@@ -507,7 +507,7 @@ fn main() {
                 slot.forward(gpu, tok, start_pos + i).unwrap();
             }
             let logits = gpu.download_f32(&slot.scratch.logits).unwrap();
-            let token = llama::sample_top_p(&logits, 0.0, top_p);
+            let token = sampler::sample_top_p(&logits, 0.0, top_p);
             (token, logits_hash(&logits))
         }
 
@@ -626,7 +626,7 @@ fn main() {
         }
         let prefill_secs = t_prefill.elapsed().as_secs_f64();
         let mut logits = gpu.download_f32(&target_slot.scratch.logits).unwrap();
-        let mut next_token = llama::sample_top_p(&logits, temp, sc.top_p);
+        let mut next_token = sampler::sample_top_p(&logits, temp, sc.top_p);
         let mut emitted: Vec<u32> = Vec::new();
         let mut conversation_tokens = new_tokens.clone();
         let t_decode = Instant::now();
@@ -652,15 +652,15 @@ fn main() {
             decode_forward_calls += 1;
             logits = gpu.download_f32(&target_slot.scratch.logits).unwrap();
             if !no_penalty {
-                llama::apply_ngram_block(&mut logits, &conversation_tokens);
-                llama::apply_repeat_penalty(
+                sampler::apply_ngram_block(&mut logits, &conversation_tokens);
+                sampler::apply_repeat_penalty(
                     &mut logits,
                     &conversation_tokens,
                     sc.repeat_window,
                     sc.repeat_penalty,
                 );
             }
-            next_token = llama::sample_top_p(&logits, temp, sc.top_p);
+            next_token = sampler::sample_top_p(&logits, temp, sc.top_p);
         }
         let decode_secs = t_decode.elapsed().as_secs_f64();
         let text = tokenizer.decode(&emitted);
@@ -921,7 +921,7 @@ fn main() {
         } else {
             // Target-only generation path (baseline, unchanged behavior).
             let mut logits = gpu.download_f32(&target_slot.scratch.logits).unwrap();
-            let mut next_token = llama::sample_top_p(&logits, temp, sc.top_p);
+            let mut next_token = sampler::sample_top_p(&logits, temp, sc.top_p);
             loop {
                 let stop = emit_token(
                     next_token,
@@ -944,15 +944,15 @@ fn main() {
                 target_slot.forward(&mut gpu, next_token, pos).unwrap();
                 logits = gpu.download_f32(&target_slot.scratch.logits).unwrap();
                 if !no_penalty {
-                    llama::apply_ngram_block(&mut logits, &conversation_tokens);
-                    llama::apply_repeat_penalty(
+                    sampler::apply_ngram_block(&mut logits, &conversation_tokens);
+                    sampler::apply_repeat_penalty(
                         &mut logits,
                         &conversation_tokens,
                         sc.repeat_window,
                         sc.repeat_penalty,
                     );
                 }
-                next_token = llama::sample_top_p(&logits, temp, sc.top_p);
+                next_token = sampler::sample_top_p(&logits, temp, sc.top_p);
             }
         }
 

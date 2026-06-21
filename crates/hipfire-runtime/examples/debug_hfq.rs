@@ -32,7 +32,7 @@ fn main() {
     let min = logits.iter().cloned().fold(f32::INFINITY, f32::min);
     let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mean = logits.iter().sum::<f32>() / logits.len() as f32;
-    let top = hipfire_runtime::llama::argmax(&logits);
+    let top = hipfire_runtime::sampler::argmax(&logits);
     println!("HFQ logits: min={min:.4} max={max:.4} mean={mean:.6} argmax={top}");
     println!("  first 10: {:?}", &logits[..10]);
 
@@ -57,7 +57,7 @@ fn main() {
     let min2 = logits2.iter().cloned().fold(f32::INFINITY, f32::min);
     let max2 = logits2.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mean2 = logits2.iter().sum::<f32>() / logits2.len() as f32;
-    let top2 = hipfire_runtime::llama::argmax(&logits2);
+    let top2 = hipfire_runtime::sampler::argmax(&logits2);
     println!("GGUF logits: min={min2:.4} max={max2:.4} mean={mean2:.6} argmax={top2}");
     println!("  first 10: {:?}", &logits2[..10]);
 }

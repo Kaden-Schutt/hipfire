@@ -20,7 +20,7 @@ fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::kv::KvCache;
-    use hipfire_runtime::llama;
+    use hipfire_runtime::sampler;
     use hipfire_runtime::tokenizer::Tokenizer;
     use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
     use rdna_compute::Gpu;
@@ -98,7 +98,7 @@ fn main() {
             .unwrap();
         }
         let mut logits = gpu.download_f32(&scratch.logits).unwrap();
-        let mut next = llama::argmax(&logits);
+        let mut next = sampler::argmax(&logits);
         let mut emitted = vec![next];
         for step in 0..gen_len {
             let pos = prompt_len + step;
@@ -107,7 +107,7 @@ fn main() {
             )
             .unwrap();
             logits = gpu.download_f32(&scratch.logits).unwrap();
-            next = llama::argmax(&logits);
+            next = sampler::argmax(&logits);
             emitted.push(next);
         }
         (emitted.clone(), tok.decode(&emitted))
@@ -144,7 +144,7 @@ fn main() {
         }
 
         let mut logits = gpu.download_f32(&scratch.logits).unwrap();
-        let mut next = llama::argmax(&logits);
+        let mut next = sampler::argmax(&logits);
         let mut emitted = vec![next];
         for _step in 0..gen_len {
             qwen35::forward_scratch(
@@ -156,7 +156,7 @@ fn main() {
                 physical = ev.new_physical;
             }
             logits = gpu.download_f32(&scratch.logits).unwrap();
-            next = llama::argmax(&logits);
+            next = sampler::argmax(&logits);
             emitted.push(next);
         }
         let ev = ctx.eviction_count.get();

@@ -26,7 +26,7 @@ fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch, StateQuant};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::kv::KvCache;
-    use hipfire_runtime::llama;
+    use hipfire_runtime::sampler;
     use std::io::Write;
     use std::path::Path;
 
@@ -312,7 +312,7 @@ fn main() {
     let mut next_token = force_tokens
         .first()
         .copied()
-        .unwrap_or_else(|| llama::argmax(&logits));
+        .unwrap_or_else(|| sampler::argmax(&logits));
     writeln!(out_tokens, "{next_token}").ok();
     {
         let t = top5(&logits);
@@ -346,7 +346,7 @@ fn main() {
         next_token = force_tokens
             .get(step)
             .copied()
-            .unwrap_or_else(|| llama::argmax(&logits));
+            .unwrap_or_else(|| sampler::argmax(&logits));
         writeln!(out_tokens, "{next_token}").ok();
         let t = top5(&logits);
         let margin = t[0].1 - t[1].1;

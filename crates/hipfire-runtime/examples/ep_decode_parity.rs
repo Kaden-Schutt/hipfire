@@ -52,6 +52,7 @@ fn main() {
     use hipfire_runtime::kv::KvCache;
     use hipfire_runtime::llama;
     use hipfire_runtime::multi_gpu::Gpus;
+    use hipfire_runtime::sampler;
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
     use rdna_compute::{DType, GpuTensor};
     use std::path::Path;
@@ -238,7 +239,7 @@ fn main() {
     );
     let mut gen_ep: Vec<u32> = Vec::with_capacity(steps);
     let mut step_ms: Vec<f64> = Vec::with_capacity(steps);
-    let mut next = llama::argmax(&logits);
+    let mut next = sampler::argmax(&logits);
     gen_ep.push(next);
     let base = prompt_tokens.len();
     for step in 1..steps {
@@ -264,7 +265,7 @@ fn main() {
             !logits.iter().any(|v| v.is_nan() || v.is_infinite()),
             "NaN/Inf at EP step {step}"
         );
-        next = llama::argmax(&logits);
+        next = sampler::argmax(&logits);
         gen_ep.push(next);
     }
     let text_ep = tokenizer.decode(&gen_ep);
@@ -325,7 +326,7 @@ fn main() {
             .expect("dl ref");
         let ref_max_logit = ref_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut gen_ref: Vec<u32> = Vec::with_capacity(steps);
-        let mut nref = llama::argmax(&ref_logits);
+        let mut nref = sampler::argmax(&ref_logits);
         gen_ref.push(nref);
         for step in 1..steps {
             qwen35::forward_scratch(
@@ -342,7 +343,7 @@ fn main() {
             let l = gpus.devices[0]
                 .download_f32(&scratch_ref.logits)
                 .expect("dl ref");
-            nref = llama::argmax(&l);
+            nref = sampler::argmax(&l);
             gen_ref.push(nref);
         }
         eprintln!("REF gen ids : {gen_ref:?}");

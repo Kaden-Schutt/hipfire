@@ -33,7 +33,7 @@ fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::kv::KvCache;
-    use hipfire_runtime::llama;
+    use hipfire_runtime::sampler;
     use rdna_compute::profile;
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -127,7 +127,7 @@ fn main() {
         t_prefill.elapsed().as_secs_f64() * 1000.0
     );
     let logits = gpu.download_f32(&scratch.logits).unwrap();
-    let mut next_token = llama::argmax(&logits);
+    let mut next_token = sampler::argmax(&logits);
 
     eprintln!("Warmup {warmup_len} steps (untimed)...");
     for step in 0..warmup_len {
@@ -144,7 +144,7 @@ fn main() {
         )
         .expect("warmup forward failed");
         let logits = gpu.download_f32(&scratch.logits).unwrap();
-        next_token = llama::argmax(&logits);
+        next_token = sampler::argmax(&logits);
     }
 
     // === PROFILED PHASE ===
@@ -168,7 +168,7 @@ fn main() {
         )
         .expect("profile forward failed");
         let logits = gpu.download_f32(&scratch.logits).unwrap();
-        next_token = llama::argmax(&logits);
+        next_token = sampler::argmax(&logits);
     }
     let profile_wall_ms = t_profile.elapsed().as_secs_f64() * 1000.0;
     let entries = profile::stop().unwrap_or_default();

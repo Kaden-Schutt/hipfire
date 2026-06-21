@@ -26,7 +26,7 @@ fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::kv::KvCache;
-    use hipfire_runtime::llama::{self, SamplingConfig};
+    use hipfire_runtime::sampler::{self, SamplingConfig};
     use std::io::Write;
     use std::path::Path;
     use std::time::Instant;
@@ -246,7 +246,7 @@ it?"
         // ── Decode ──
         println!("\n<<< TURN {} ASSISTANT:", turn_idx + 1);
         let mut logits = gpu.download_f32(&scratch.logits).unwrap();
-        let mut next_token = llama::sample_top_p(&logits, temp, top_p);
+        let mut next_token = sampler::sample_top_p(&logits, temp, top_p);
 
         let t_gen = Instant::now();
         let mut generated: Vec<u32> = Vec::new();
@@ -318,8 +318,8 @@ it?"
             // will stop us from generating anything sensible).
             // Only apply it over the current turn's own tokens.
             let turn_start = history.len() - generated.len();
-            llama::apply_ngram_block(&mut logits, &history[turn_start..]);
-            llama::apply_repeat_penalty(
+            sampler::apply_ngram_block(&mut logits, &history[turn_start..]);
+            sampler::apply_repeat_penalty(
                 &mut logits,
                 &history[turn_start..],
                 sc.repeat_window,
@@ -346,7 +346,7 @@ it?"
             } else {
                 sc.answer_temp
             };
-            next_token = llama::sample_top_p(&logits, t, top_p);
+            next_token = sampler::sample_top_p(&logits, t, top_p);
 
             if seq_pos + 4 >= max_seq {
                 eprintln!("\n[ctx exhausted at seq_pos={}]", seq_pos);

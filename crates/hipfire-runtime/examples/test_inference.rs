@@ -11,7 +11,7 @@ use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::DeltaNetState;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv::KvCache;
-use hipfire_runtime::llama;
+use hipfire_runtime::sampler;
 use std::path::Path;
 use std::time::Instant;
 
@@ -266,7 +266,7 @@ fn main() {
                 &mut dn,
             )
             .map_err(|e| format!("{e}"))?;
-            tok = llama::argmax(&logits);
+            tok = sampler::argmax(&logits);
         }
         let ms = t0.elapsed().as_millis();
         let tps = 20.0 / (ms as f64 / 1000.0);

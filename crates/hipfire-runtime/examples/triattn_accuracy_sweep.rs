@@ -27,7 +27,7 @@ fn main() {
     use hipfire_runtime::cask::CaskCtx;
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::kv::KvCache;
-    use hipfire_runtime::llama;
+    use hipfire_runtime::sampler;
     use hipfire_runtime::tokenizer::Tokenizer;
     use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
     use rdna_compute::Gpu;
@@ -250,7 +250,7 @@ fn main() {
                 }
             }
             let mut logits = gpu.download_f32(&scratch.logits).unwrap();
-            let mut next = llama::argmax(&logits);
+            let mut next = sampler::argmax(&logits);
             let mut emitted = vec![next];
             for _ in 0..gen_len {
                 qwen35::forward_scratch(
@@ -264,7 +264,7 @@ fn main() {
                     }
                 }
                 logits = gpu.download_f32(&scratch.logits).unwrap();
-                next = llama::argmax(&logits);
+                next = sampler::argmax(&logits);
                 emitted.push(next);
                 if next == config.eos_token {
                     break;

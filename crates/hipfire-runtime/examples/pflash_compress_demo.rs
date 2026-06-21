@@ -25,6 +25,7 @@ use hipfire_arch_qwen35::pflash::{
 use hipfire_runtime::hfq::{self, HfqFile};
 use hipfire_runtime::kv::KvCache;
 use hipfire_runtime::llama::{self, ForwardScratch};
+use hipfire_runtime::sampler;
 use hipfire_runtime::tokenizer::Tokenizer;
 use std::path::Path;
 use std::time::Instant;
@@ -305,7 +306,7 @@ fn main() {
     let logits = gpu
         .download_f32(&target_scratch.logits)
         .expect("download logits");
-    let first = llama::argmax(&logits);
+    let first = sampler::argmax(&logits);
     let mut next = first;
     let mut generated: Vec<u32> = vec![first];
     let t_dec = Instant::now();
@@ -334,7 +335,7 @@ fn main() {
         )
         .expect("compute");
         let logits = gpu.download_f32(&target_scratch.logits).expect("download");
-        next = llama::argmax(&logits);
+        next = sampler::argmax(&logits);
         generated.push(next);
         decode_steps += 1;
     }

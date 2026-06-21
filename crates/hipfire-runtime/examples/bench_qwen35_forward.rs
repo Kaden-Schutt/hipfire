@@ -19,7 +19,7 @@ fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::kv::KvCache;
-    use hipfire_runtime::llama;
+    use hipfire_runtime::sampler;
     use std::path::Path;
     use std::time::Instant;
 
@@ -52,7 +52,7 @@ fn main() {
     let mut dn_state =
         DeltaNetState::new_with_quant(&mut gpu, &config, qwen35::StateQuant::Q8).unwrap();
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
-    let sc = llama::SamplingConfig::text_thinking();
+    let sc = sampler::SamplingConfig::text_thinking();
 
     // Optional hidden-state ring buffer for Phase 3 overhead measurement.
     let mut hidden_rb = if with_extract {
@@ -145,8 +145,13 @@ fn main() {
         }
         if with_sample {
             let mut logits = gpu.download_f32(&scratch.logits).unwrap();
-            llama::apply_repeat_penalty(&mut logits, &history, sc.repeat_window, sc.repeat_penalty);
-            let _tok = llama::sample_top_p(&logits, sc.answer_temp, sc.top_p);
+            sampler::apply_repeat_penalty(
+                &mut logits,
+                &history,
+                sc.repeat_window,
+                sc.repeat_penalty,
+            );
+            let _tok = sampler::sample_top_p(&logits, sc.answer_temp, sc.top_p);
             let _ = rng_state;
             history.push(warmup_tok);
         }

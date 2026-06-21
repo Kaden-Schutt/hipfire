@@ -31,7 +31,7 @@ fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::kv::KvCache;
-    use hipfire_runtime::llama;
+    use hipfire_runtime::sampler;
     use rdna_compute::DType;
     use std::path::Path;
     use std::time::Instant;
@@ -131,7 +131,7 @@ fn main() {
     );
 
     let logits = gpu.download_f32(&scratch.logits).unwrap();
-    let mut next_token = llama::argmax(&logits);
+    let mut next_token = sampler::argmax(&logits);
 
     // 5 warmup decode steps to populate KV cache beyond prefill (and ensure kernel JIT)
     for step in 0..5 {
@@ -148,7 +148,7 @@ fn main() {
         )
         .expect("warmup forward failed");
         let logits = gpu.download_f32(&scratch.logits).unwrap();
-        next_token = llama::argmax(&logits);
+        next_token = sampler::argmax(&logits);
     }
     let current_pos = prefill_len + 5;
     eprintln!(

@@ -37,7 +37,7 @@ use hipfire_arch_qwen35::pflash::{
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, StateQuant};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv::KvCache;
-use hipfire_runtime::llama;
+use hipfire_runtime::sampler;
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
@@ -827,7 +827,7 @@ fn main() {
     // host-side argmax, not pending prefill kernels.
     let t_first_dec = Instant::now();
     let logits = gpu.download_f32(&scratch.logits).expect("download logits");
-    let first_token = llama::argmax(&logits);
+    let first_token = sampler::argmax(&logits);
     let first_decode_ms = t_first_dec.elapsed().as_millis();
     eprintln!("first dec:   {first_decode_ms} ms (download + argmax of prefill logits)");
 
@@ -856,7 +856,7 @@ fn main() {
         )
         .expect("forward_scratch");
         let logits = gpu.download_f32(&scratch.logits).expect("download logits");
-        next_token = llama::argmax(&logits);
+        next_token = sampler::argmax(&logits);
         generated.push(next_token);
         decode_steps += 1;
     }

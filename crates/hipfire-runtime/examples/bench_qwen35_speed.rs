@@ -19,7 +19,7 @@ fn main() {
 fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::llama;
+    use hipfire_runtime::sampler;
     use hipfire_runtime::speed_bench::{
         self, file_bytes, kv_mode_from_env, kv_seq_len, maybe_dpm_warmup, new_kv_cache,
         safetensors_dir_bytes, LatencyStats, SpeedBenchArgs,
@@ -516,7 +516,7 @@ fn main() {
 
         // Read logits to get a valid next token
         let logits = gpu.download_f32(&scratch.logits).unwrap();
-        let mut next_token = llama::argmax(&logits);
+        let mut next_token = sampler::argmax(&logits);
 
         // === WARMUP ===
         eprintln!("\n=== warmup ({warmup_len} tokens — untimed, lets JIT settle) ===");
@@ -538,7 +538,7 @@ fn main() {
             )
             .expect("warmup forward failed");
             let logits = gpu.download_f32(&scratch.logits).unwrap();
-            next_token = llama::argmax(&logits);
+            next_token = sampler::argmax(&logits);
         }
         let warmup_ms = t_warmup.elapsed().as_secs_f64() * 1000.0;
         eprintln!(
@@ -583,7 +583,7 @@ fn main() {
             let logits = gpu.download_f32(&scratch.logits).unwrap();
             let t_ms = t.elapsed().as_secs_f64() * 1000.0;
             per_token_ms.push(t_ms);
-            next_token = llama::argmax(&logits);
+            next_token = sampler::argmax(&logits);
         }
         let gen_total_ms = t_gen_start.elapsed().as_secs_f64() * 1000.0;
         if do_profile_decode {

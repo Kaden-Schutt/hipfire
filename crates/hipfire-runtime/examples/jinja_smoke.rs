@@ -27,7 +27,7 @@ use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
 use hipfire_prompt::{JinjaChatFrame, Message, Role, ToolCall};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv::KvCache;
-use hipfire_runtime::llama;
+use hipfire_runtime::sampler;
 use hipfire_runtime::tokenizer::Tokenizer;
 use serde_json::json;
 use std::collections::HashMap;
@@ -340,7 +340,7 @@ fn main() {
         None
     };
 
-    let sc = llama::SamplingConfig::text_thinking();
+    let sc = sampler::SamplingConfig::text_thinking();
     let temp = if enable_thinking {
         sc.think_temp
     } else {
@@ -358,9 +358,9 @@ fn main() {
     // to penalty=1.15, window=128.
     let sample_one = |logits: &mut [f32], history: &[u32]| -> u32 {
         if sc.repeat_penalty != 1.0 && sc.repeat_window > 0 {
-            llama::apply_repeat_penalty(logits, history, sc.repeat_window, sc.repeat_penalty);
+            sampler::apply_repeat_penalty(logits, history, sc.repeat_window, sc.repeat_penalty);
         }
-        llama::sample_top_p(logits, temp, sc.top_p)
+        sampler::sample_top_p(logits, temp, sc.top_p)
     };
 
     let mut next_token = sample_one(&mut logits, &token_history);

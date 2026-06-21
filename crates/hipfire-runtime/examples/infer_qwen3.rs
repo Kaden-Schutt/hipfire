@@ -308,7 +308,7 @@ fn main() {
             prompt_tokens.len(),
             prompt_tokens.len() as f64 / (prompt_ms as f64 / 1000.0)
         );
-        llama::argmax(&logits)
+        sampler::argmax(&logits)
     } else if use_guards {
         // Guards-on sequential prefill: use forward_scratch_compute so
         // the GPU sampler kernel does NOT also fire (we'll call

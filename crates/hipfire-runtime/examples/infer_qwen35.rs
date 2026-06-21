@@ -19,7 +19,6 @@ use hipfire_prompt::{AssistantPrefix, ChatFrame};
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv::KvCache;
-use hipfire_runtime::llama;
 use hipfire_runtime::loop_guard::LoopGuard;
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use std::io::Write;
@@ -278,7 +277,7 @@ fn main() {
         None
     };
 
-    let sc = llama::SamplingConfig::text_thinking();
+    let sc = sampler::SamplingConfig::text_thinking();
     let max_gen = 2048;
 
     let t2 = Instant::now();
@@ -327,7 +326,7 @@ fn main() {
             &mut rng_state_u32,
         )
     } else {
-        llama::sample_top_p(&logits, sc.think_temp, sc.top_p)
+        sampler::sample_top_p(&logits, sc.think_temp, sc.top_p)
     };
 
     for _gi in 0..max_gen {
@@ -467,11 +466,11 @@ fn main() {
 
             if sample_compare {
                 // Snapshot RNG so both samplers see the same state.
-                let rng_before = llama::sampler_rng_snapshot();
+                let rng_before = sampler::sampler_rng_snapshot();
 
                 // GPU-assisted path (advances RNG)
                 let mut cand_vals_gpu = cand_vals.clone();
-                let gpu_tok = llama::sample_top_p_from_candidates(
+                let gpu_tok = sampler::sample_top_p_from_candidates(
                     &cand_ids,
                     &mut cand_vals_gpu,
                     &token_history,
@@ -480,19 +479,19 @@ fn main() {
                     temp,
                     sc.top_p,
                 );
-                let rng_after_gpu = llama::sampler_rng_snapshot();
+                let rng_after_gpu = sampler::sampler_rng_snapshot();
 
                 // Restore and run full-CPU path
-                llama::sampler_rng_restore(rng_before);
+                sampler::sampler_rng_restore(rng_before);
                 logits = gpu.download_f32(&scratch.logits).unwrap();
-                llama::apply_repeat_penalty(
+                sampler::apply_repeat_penalty(
                     &mut logits,
                     &token_history,
                     sc.repeat_window,
                     sc.repeat_penalty,
                 );
-                let cpu_tok = llama::sample_top_p(&logits, temp, sc.top_p);
-                let rng_after_cpu = llama::sampler_rng_snapshot();
+                let cpu_tok = sampler::sample_top_p(&logits, temp, sc.top_p);
+                let rng_after_cpu = sampler::sampler_rng_snapshot();
 
                 if cpu_tok != gpu_tok || rng_after_cpu != rng_after_gpu {
                     eprintln!(
@@ -519,7 +518,7 @@ fn main() {
                 // Both matched and advanced RNG to the same state. Leave it at rng_after_gpu.
                 gpu_tok
             } else {
-                llama::sample_top_p_from_candidates(
+                sampler::sample_top_p_from_candidates(
                     &cand_ids,
                     &mut cand_vals,
                     &token_history,
@@ -531,13 +530,13 @@ fn main() {
             }
         } else {
             logits = gpu.download_f32(&scratch.logits).unwrap();
-            llama::apply_repeat_penalty(
+            sampler::apply_repeat_penalty(
                 &mut logits,
                 &token_history,
                 sc.repeat_window,
                 sc.repeat_penalty,
             );
-            llama::sample_top_p(&logits, temp, sc.top_p)
+            sampler::sample_top_p(&logits, temp, sc.top_p)
         };
     }
 

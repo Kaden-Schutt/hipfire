@@ -26,7 +26,7 @@ fn main() {
 
     let logits =
         hipfire_runtime::llama::forward(&mut gpu, &weights, &config, 1, 0, &mut kv).unwrap();
-    let top = hipfire_runtime::llama::argmax(&logits);
+    let top = hipfire_runtime::sampler::argmax(&logits);
     let min = logits.iter().cloned().fold(f32::INFINITY, f32::min);
     let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     println!("HFQ Q8: argmax={top} min={min:.4} max={max:.4}");
@@ -50,7 +50,7 @@ fn main() {
 
     let logits2 =
         hipfire_runtime::llama::forward(&mut gpu, &weights2, &config2, 1, 0, &mut kv2).unwrap();
-    let top2 = hipfire_runtime::llama::argmax(&logits2);
+    let top2 = hipfire_runtime::sampler::argmax(&logits2);
     let min2 = logits2.iter().cloned().fold(f32::INFINITY, f32::min);
     let max2 = logits2.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     println!("GGUF Q8: argmax={top2} min={min2:.4} max={max2:.4}");
@@ -74,7 +74,7 @@ fn main() {
 
     let logits3 =
         hipfire_runtime::llama::forward(&mut gpu, &weights3, &config3, 1, 0, &mut kv3).unwrap();
-    let top3 = hipfire_runtime::llama::argmax(&logits3);
+    let top3 = hipfire_runtime::sampler::argmax(&logits3);
     let min3 = logits3.iter().cloned().fold(f32::INFINITY, f32::min);
     let max3 = logits3.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     println!("GGUF Q4: argmax={top3} min={min3:.4} max={max3:.4}");

@@ -7,6 +7,7 @@
 use hipfire_runtime::gguf::GgufFile;
 use hipfire_runtime::kv::KvCache;
 use hipfire_runtime::llama::{self, LlamaConfig};
+use hipfire_runtime::sampler;
 use std::path::Path;
 use std::time::Instant;
 
@@ -66,7 +67,7 @@ fn main() {
             llama::forward(&mut gpu, &weights, &config, next_token, pos, &mut kv_cache).unwrap();
         let elapsed = t.elapsed().as_secs_f64() * 1000.0;
         times_ms.push(elapsed);
-        next_token = llama::argmax(&logits);
+        next_token = sampler::argmax(&logits);
     }
     let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
 

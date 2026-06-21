@@ -10,7 +10,7 @@ use hipfire_arch_qwen35::qwen35::DeltaNetState;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv::KvCache;
-use hipfire_runtime::llama;
+use hipfire_runtime::sampler;
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -193,7 +193,7 @@ fn main() {
     );
 
     // Zero-alloc scratch buffers (pre-allocated once, reused every token)
-    let sc = llama::SamplingConfig::vl_thinking();
+    let sc = sampler::SamplingConfig::vl_thinking();
     let scratch = qwen35::Qwen35Scratch::new(&mut gpu, &text_config, sc.repeat_window)
         .expect("failed to create scratch");
     let mut rng_state = 42u32;
@@ -281,13 +281,13 @@ fn main() {
 
     // First token: download logits from scratch, apply n-gram block, sample on CPU
     let mut logits = gpu.download_f32(&scratch.logits).unwrap();
-    llama::apply_ngram_block(&mut logits, &prompt_tokens);
+    sampler::apply_ngram_block(&mut logits, &prompt_tokens);
     let temp = if in_thinking {
         sc.think_temp
     } else {
         sc.answer_temp
     };
-    let mut next_token = llama::sample_top_p(&logits, temp, sc.top_p);
+    let mut next_token = sampler::sample_top_p(&logits, temp, sc.top_p);
 
     let t_gen = Instant::now();
     let mut token_history: Vec<u32> = prompt_tokens.clone();
@@ -350,7 +350,7 @@ fn main() {
         // Disabled for perf measurement — re-enable after implementing GPU n-gram kernel
         if std::env::var("NO_NGRAM").is_err() {
             logits = gpu.download_f32(&scratch.logits).unwrap();
-            llama::apply_ngram_block(&mut logits, &token_history);
+            sampler::apply_ngram_block(&mut logits, &token_history);
             let logits_bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(logits.as_ptr() as *const u8, logits.len() * 4)
             };

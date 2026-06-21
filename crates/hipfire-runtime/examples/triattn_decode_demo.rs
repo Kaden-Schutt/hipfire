@@ -23,7 +23,7 @@ fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::kv::KvCache;
-    use hipfire_runtime::llama;
+    use hipfire_runtime::sampler;
     use hipfire_runtime::tokenizer::Tokenizer;
     use hipfire_runtime::triattn::{self, TriAttnCenters};
     use rdna_compute::{DType, Gpu};
@@ -132,7 +132,7 @@ fn main() {
             .unwrap();
         }
         let mut logits = gpu.download_f32(&scratch.logits).unwrap();
-        let mut next = llama::argmax(&logits);
+        let mut next = sampler::argmax(&logits);
         let mut emitted = Vec::new();
         emitted.push(next);
         for step in 0..gen_len {
@@ -142,7 +142,7 @@ fn main() {
             )
             .unwrap();
             logits = gpu.download_f32(&scratch.logits).unwrap();
-            next = llama::argmax(&logits);
+            next = sampler::argmax(&logits);
             emitted.push(next);
         }
         let text = tok.decode(&emitted);
@@ -301,7 +301,7 @@ fn main() {
         // IMPORTANT: the logits from the prefill's last token are still
         // valid (they were computed before compaction). Sample from them.
         let mut logits = gpu.download_f32(&scratch.logits).unwrap();
-        let mut next = llama::argmax(&logits);
+        let mut next = sampler::argmax(&logits);
         let mut emitted = Vec::new();
         emitted.push(next);
         for step in 0..gen_len {
@@ -311,7 +311,7 @@ fn main() {
             )
             .unwrap();
             logits = gpu.download_f32(&scratch.logits).unwrap();
-            next = llama::argmax(&logits);
+            next = sampler::argmax(&logits);
             emitted.push(next);
         }
         let text = tok.decode(&emitted);

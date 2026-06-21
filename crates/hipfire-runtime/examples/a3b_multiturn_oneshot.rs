@@ -17,7 +17,7 @@ fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::kv::KvCache;
-    use hipfire_runtime::llama;
+    use hipfire_runtime::sampler;
     use std::path::Path;
 
     let model_path = std::env::args()
@@ -132,7 +132,7 @@ fn main() {
         .unwrap()
     } else {
         let l = gpu.download_f32(&scratch.logits).unwrap();
-        (llama::argmax(&l), rng_state)
+        (sampler::argmax(&l), rng_state)
     };
     let mut next = tok0;
     rng_state = rng0;
@@ -170,7 +170,7 @@ fn main() {
             rng_state = rng;
         } else {
             let l = gpu.download_f32(&scratch.logits).unwrap();
-            next = llama::argmax(&l);
+            next = sampler::argmax(&l);
         }
     }
     eprintln!("Turn 1 response ({} tokens): {}", t1_tokens, t1_resp);
@@ -209,7 +209,7 @@ fn main() {
         .unwrap()
     } else {
         let l = gpu.download_f32(&scratch.logits).unwrap();
-        (llama::argmax(&l), rng_state)
+        (sampler::argmax(&l), rng_state)
     };
     let mut next = tok2;
     rng_state = rng2;
@@ -242,7 +242,7 @@ fn main() {
             rng_state = rng;
         } else {
             let l = gpu.download_f32(&scratch.logits).unwrap();
-            next = llama::argmax(&l);
+            next = sampler::argmax(&l);
         }
     }
     println!("\n=== assistant turn 2 ===\n{}\n", out);

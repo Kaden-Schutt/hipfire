@@ -9,7 +9,7 @@
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv::KvCache;
-use hipfire_runtime::llama;
+use hipfire_runtime::sampler;
 use std::io::Write;
 use std::path::Path;
 
@@ -83,7 +83,7 @@ fn main() {
 
     // Get first token (greedy)
     let logits = gpu.download_f32(&scratch.logits).unwrap();
-    let mut next_token = llama::argmax(&logits);
+    let mut next_token = sampler::argmax(&logits);
 
     eprintln!("Generating 600 tokens (greedy)...");
     for step in 0..600 {
@@ -126,7 +126,7 @@ fn main() {
         .expect("generation forward failed");
 
         let new_logits = gpu.download_f32(&scratch.logits).unwrap();
-        next_token = llama::argmax(&new_logits);
+        next_token = sampler::argmax(&new_logits);
     }
 
     token_file.flush().unwrap();

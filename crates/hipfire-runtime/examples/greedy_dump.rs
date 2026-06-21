@@ -14,7 +14,7 @@ fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::kv::KvCache;
-    use hipfire_runtime::llama;
+    use hipfire_runtime::sampler;
     use std::io::Write;
     use std::path::Path;
 
@@ -136,7 +136,7 @@ fn main() {
     .expect("prefill forward failed");
 
     let mut logits = gpu.download_f32(&scratch.logits).unwrap();
-    let mut next_token = llama::argmax(&logits);
+    let mut next_token = sampler::argmax(&logits);
     writeln!(out, "{next_token}").ok();
     prompt_tokens.push(next_token);
 
@@ -157,7 +157,7 @@ fn main() {
         )
         .expect("forward failed");
         logits = gpu.download_f32(&scratch.logits).unwrap();
-        next_token = llama::argmax(&logits);
+        next_token = sampler::argmax(&logits);
         writeln!(out, "{next_token}").ok();
         prompt_tokens.push(next_token);
         if next_token == config.eos_token {

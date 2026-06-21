@@ -27,7 +27,7 @@ fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::kv::KvCache;
-    use hipfire_runtime::llama;
+    use hipfire_runtime::sampler;
     use std::path::Path;
 
     let args: Vec<String> = std::env::args().collect();
@@ -270,7 +270,7 @@ fn main() {
             timings.push(t0.elapsed());
             let has_nan = l.iter().any(|v| v.is_nan() || v.is_infinite());
             assert!(!has_nan, "NaN/Inf at step {step}");
-            next = llama::argmax(&l);
+            next = sampler::argmax(&l);
             let decoded = tokenizer.decode(&[next]);
             eprintln!(
                 "  step {step:2} -> {next:6} '{}'  ({} µs)",
