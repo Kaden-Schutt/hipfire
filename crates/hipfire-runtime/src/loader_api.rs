@@ -61,6 +61,13 @@ pub struct LoadCtx<'a> {
     pub path: &'a str,
     pub max_seq: usize,
     pub draft_path: Option<&'a str>,
+    /// Gemma 4 EAGLE drafter path (arch-22 `gemma4_unified_assistant`),
+    /// supplied via `params.drafter` on an arch_id=13 target. None on every
+    /// other arch / when no drafter requested.
+    pub gemma4_drafter: Option<&'a str>,
+    /// Gemma 4 EAGLE draft length (drafts per round). Defaulted by the caller
+    /// to the validated value when `params.spec` is absent.
+    pub gemma4_eagle_draft_len: usize,
     pub kv_mode_override: Option<&'a str>,
     pub kv_adaptive_override: Option<&'a str>,
     pub state_quant_override: Option<&'a str>,

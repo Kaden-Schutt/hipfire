@@ -1624,6 +1624,7 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
                 cfg.head_dim,
                 kv.inner.physical_cap,
                 &scratch.flash_partials,
+                0, // kv_window: 0 = full causal (qwen3.5 MTP asym3)
             )?;
         }
         MtpKvMode::Fwht4 => {

@@ -64,6 +64,11 @@ pub fn populate(registry: &mut KernelRegistry) {
     });
     registry.register(KernelVariant {
         key: KernelKey::GemmHfq4G256Wmma,
+        // gfx11 + gfx12: the host method (gemm.rs gemm_hfq4g256_wmma) selects
+        // the gfx11 _w32 source or the gfx12 sibling
+        // (gemm_hfq4g256_wmma.gfx12.hip, _w32_gfx12 builtin / half8 operands /
+        // rows-contiguous C) by arch_caps.is_rdna4() — same pattern as
+        // gemm_q8_0_wmma. HasWmma admits RDNA4.
         arch_required: ArchPredicate::HasWmma,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],

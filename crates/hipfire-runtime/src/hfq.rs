@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026 Kaden Schutt
+// Copyright (c) 2026 Kaden Schutt, Kate
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! HFQ (.hfq) file loader for hipfire-native Q4_F16 quantized models.

@@ -1279,6 +1279,16 @@ pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_WAVE64_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_indexed_wave64.hip");
 
+/// Q8_0 indexed MoE gate_up GEMV (Gemma 4 26B-A4B with --expert-q8).
+/// Same device-side expert-pointer table + topk_indices contract;
+/// Q8_0 weight layout (34 B/block of 32 elements).
+pub const GEMV_Q8_0_MOE_GATE_UP_K8_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_q8_0_moe_gate_up_k8_indexed.hip");
+
+/// Q8_0 indexed MoE down-projection with fused scaled atomicAdd.
+pub const GEMV_Q8_0_MOE_DOWN_RESIDUAL_SCALED_K8_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_q8_0_moe_down_residual_scaled_k8_indexed.hip");
+
 /// N-batched MoE router softmax + top-8 + renorm. Drop-in replacement
 /// for the single-token kernel when prefilling N tokens through an MoE
 /// layer; one workgroup per token. Enables batched MoE prefill.
@@ -2508,6 +2518,16 @@ pub const GEMV_Q6K_SRC: &str = include_str!("../../../kernels/src/gemv_q6k.hip")
 /// RMSNorm: y[i] = x[i] * weight[i] / sqrt(mean(x^2) + eps)
 pub const RMSNORM_SRC: &str = include_str!("../../../kernels/src/rmsnorm.hip");
 
+/// Fused sandwich post-norm + residual-add: out = residual + rmsnorm(x, weight).
+/// Collapses (rmsnorm + memcpy + add_inplace) 3 launches into 1 (gemma4 L4).
+pub const RMSNORM_RESIDUAL_ADD_SRC: &str =
+    include_str!("../../../kernels/src/rmsnorm_residual_add.hip");
+
+/// gemma4 L3: fused per-head weighted q/k RMSNorm + q prescale + dual RoPE.
+/// Collapses (q_norm + k_norm + scale_f32(q) + rope) 4 launches into 1.
+pub const FUSED_GEMMA4_QK_NORM_ROPE_SRC: &str =
+    include_str!("../../../kernels/src/fused_gemma4_qk_norm_rope.hip");
+
 /// TriAttention sidecar calibration: GPU band-statistics accumulator.
 /// Replaces the CPU BandAccumulator loop (99% of sidecar cal wall time).
 pub const TRIATTN_ACCUMULATE_SRC: &str =
@@ -2675,6 +2695,13 @@ pub const KV_CACHE_WRITE_Q8_0_SRC: &str =
 /// Attention with Q8_0 quantized KV cache — same format as GGML Q8_0.
 /// K and V caches stored as [max_seq × n_kv_heads × blocks_per_head × 34].
 pub const ATTENTION_Q8_0_KV_SRC: &str = include_str!("../../../kernels/src/attention_q8_0_kv.hip");
+
+/// Sliding-window variant of ATTENTION_Q8_0_KV_SRC. Adds a `window`
+/// parameter: 0 = full causal (identical to the baseline), >0 = attend only
+/// to the last `window` keys ([max(0, seq_len - window), seq_len)). Used by
+/// Gemma 4 sliding layers (window=1024); full layers call with window=0.
+pub const ATTENTION_Q8_0_KV_SWA_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_kv_swa.hip");
 
 /// Batched counterpart of ATTENTION_Q8_0_KV_SRC. Processes N queries in
 /// one launch with per-row causal windows from a positions[] array.
@@ -3116,6 +3143,18 @@ pub const ROPE_PARTIAL_INTERLEAVED_BATCHED_SRC: &str =
 pub const ROPE_PARTIAL_HALFSPLIT_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/rope_partial_halfsplit_batched.hip");
 
+/// Gemma 4 full-attention partial RoPE (HF `rotate_half` pairing). head_dim=512
+/// but only the first `n_rot_pairs` pairs (i, i+head_dim/2) rotate; the rest are
+/// NoPE pass-through. Pairs differ from the interleaved/halfsplit variants — see
+/// `kernels/src/rope_partial_halved.hip` for the proportional-RoPE math.
+pub const ROPE_PARTIAL_HALVED_SRC: &str =
+    include_str!("../../../kernels/src/rope_partial_halved.hip");
+
+/// Batched (N-token) counterpart to `ROPE_PARTIAL_HALVED_SRC`, used by Gemma 4
+/// batched prefill. Reads one i32 position per token from a device array.
+pub const ROPE_PARTIAL_HALVED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/rope_partial_halved_batched.hip");
+
 /// 1D causal depthwise convolution (kernel_size=4) with persistent ring buffer state.
 /// For decode: one token at a time. conv_state: [n_channels × 3] ring buffer.
 /// out[c] = w[0]*x[c] + w[1]*state[c][0] + w[2]*state[c][1] + w[3]*state[c][2]
@@ -3401,6 +3440,10 @@ pub const LAYERNORM_SRC: &str = include_str!("../../../kernels/src/layernorm.hip
 
 /// GELU activation (tanh approximation, matches gelu_pytorch_tanh).
 pub const GELU_TANH_SRC: &str = include_str!("../../../kernels/src/gelu_tanh.hip");
+
+/// Gemma 4 final-logit soft-capping (in-place): x = tanh(x/cap)*cap. Applied to
+/// the LM-head output before sampling. Gemma 4 has NO per-attention-layer softcap.
+pub const LOGIT_SOFTCAP_SRC: &str = include_str!("../../../kernels/src/logit_softcap.hip");
 
 /// Transpose: out[c, r] = in[r, c]. Converts [rows, cols] → [cols, rows].
 pub const TRANSPOSE_SRC: &str = include_str!("../../../kernels/src/transpose.hip");
@@ -3815,6 +3858,11 @@ pub const V4F_CONVERT_F32_TO_F16_SRC: &str =
 pub const GEMM_HFQ4G256_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_wmma.hip");
 
+/// gfx12 (RDNA4) sibling of GEMM_HFQ4G256_WMMA_SRC -- half8 operands,
+/// _w32_gfx12 builtin, rows-contiguous C mapping. Plain store (no residual).
+pub const GEMM_HFQ4G256_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_wmma.gfx12.hip");
+
 /// DeepSeek V4 compressor batched ALIGNED compress events. Replaces the
 /// 3-kernel per-event chain (overlap_concat × 2 + softmax_pool)
 /// with a single launch over N_events. Handles both overlap=true
@@ -3947,6 +3995,26 @@ pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_EXPANDED_K4_SRC: &str =
 /// ParoQuant Givens rotation: apply learned pairwise rotations + channel scaling
 /// to activations in-place. Called before each ParoQ4G128 GEMV.
 pub const GIVENS_ROTATE_SRC: &str = include_str!("../../../kernels/src/givens_rotate.hip");
+
+// ─── Gemma 4 hd512 attention + KV write kernels ─────────────────────────
+// (ROPE_PARTIAL_HALVED_SRC / LOGIT_SOFTCAP_SRC already defined above.)
+
+pub const ATTENTION_FLASH_ASYM3_TILE_HD512_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_asym3_tile_hd512.hip");
+pub const ATTENTION_FLASH_ASYM3_TILE_HD512_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_asym3_tile_hd512_batched.hip");
+pub const KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_asym_k_givens3_hd512.hip");
+pub const KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_asym_k_givens3_hd512_batched.hip");
+pub const KV_CACHE_WRITE_FWHT3_HD512_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_fwht3_hd512.hip");
+pub const KV_CACHE_WRITE_FWHT3_HD512_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_fwht3_hd512_batched.hip");
+pub const ATTENTION_FLASH_FWHT3_TILE_HD512_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_fwht3_tile_hd512.hip");
+pub const ATTENTION_FLASH_FWHT3_TILE_HD512_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_fwht3_tile_hd512_batched.hip");
 
 #[cfg(test)]
 mod dispatch_tests {

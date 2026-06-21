@@ -3,14 +3,19 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 // Flash attention tile for asym2: K at givens2 (rotated 2-bit), V at Q8_0.
-// Handles head_dim ∈ {128, 256} via 2-pass loop (same structure as asym4).
 // Output in normal space → reuses Q8_0 flash reduce.
+//
+// MAX_HALVES is a compile-time bound on head_dim/128 so the per-thread
+// mq/out_vec arrays stay in registers (zero scratch spill at the default
+// width). Two instantiations are exported:
+//   attention_flash_asym2_tile        — MAX_HALVES=2, head_dim ∈ {128, 256}
+//   attention_flash_asym2_tile_hd512  — MAX_HALVES=4, head_dim ∈ {384, 512}
 #include <hip/hip_runtime.h>
 #include "turbo_common.h"
 #include "givens_common.h"
 
-extern "C" __launch_bounds__(32, 16)
-__global__ void attention_flash_asym2_tile(
+template <int MAX_HALVES>
+__device__ __forceinline__ void asym2_tile_body(
     const float* __restrict__ q,
     const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache,
@@ -24,7 +29,11 @@ __global__ void attention_flash_asym2_tile(
     int max_seq,
     float scale_attn,
     int tile_size,
-    int max_tiles
+    int max_tiles,
+    // Sliding-window lookback. 0 = full causal.
+    int window_size,
+    // Ring-buffer cache capacity. 0 = no wrap.
+    int cache_capacity
 ) {
     const int seq_len = pos_buf[0] + 1;
     const int h = blockIdx.x;
@@ -35,10 +44,22 @@ __global__ void attention_flash_asym2_tile(
     if (tile_start >= seq_len) return;
     const int tile_len = tile_end - tile_start;
 
+    const int t_lo = (window_size > 0) ? max(0, seq_len - window_size) : 0;
+    if (window_size > 0 && tile_end <= t_lo) {
+        if (threadIdx.x == 0) {
+            float* p0 = partials + (h * max_tiles + tile_id) * (2 + head_dim);
+            p0[0] = -1e30f;
+            p0[1] = 0.0f;
+        }
+        return;
+    }
+
     const int kv_group = n_heads / n_kv_heads;
     const int kv_h = h / kv_group;
     const int tid = threadIdx.x;
-    const int n_halves = head_dim / 128;
+    // Compile-time clamp keeps mq/out_vec indices provably in range so they
+    // stay in VGPRs. Callers guarantee head_dim/128 <= MAX_HALVES.
+    const int n_halves = min(head_dim / 128, MAX_HALVES);
 
     // K geometry (givens2: 1 byte per 4 values)
     const int k_bytes_per_head = 4 + head_dim / 4;        // 36 (hd128) / 68 (hd256)
@@ -56,7 +77,7 @@ __global__ void attention_flash_asym2_tile(
 
     // Load Q + rotate (per half)
     const float* q_head = q + h * head_dim;
-    float mq[8];
+    float mq[MAX_HALVES * 4];
     for (int half = 0; half < n_halves; half++) {
         const int d0 = half * 128 + tid * 4;
         float a = q_head[d0 + 0];
@@ -74,21 +95,25 @@ __global__ void attention_flash_asym2_tile(
     // Phase A: Q·K (2-bit K)
     for (int t_local = 0; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
-        const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
-        float cnorm = *(const float*)kb;
+        const bool out_of_window = (window_size > 0) && (t < t_lo);
         float partial = 0.0f;
-        for (int half = 0; half < n_halves; half++) {
-            // Byte offset: 4 (cnorm) + half * 32 + tid.
-            unsigned char packed = kb[4 + half * 32 + tid];
-            partial += mq[half * 4 + 0] * (cnorm * TURBO_C2[(packed)      & 0x3])
-                     + mq[half * 4 + 1] * (cnorm * TURBO_C2[(packed >> 2) & 0x3])
-                     + mq[half * 4 + 2] * (cnorm * TURBO_C2[(packed >> 4) & 0x3])
-                     + mq[half * 4 + 3] * (cnorm * TURBO_C2[(packed >> 6) & 0x3]);
+        if (!out_of_window) {
+            const int k_slot = (cache_capacity > 0) ? (t % cache_capacity) : t;
+            const unsigned char* kb = k_cache + (size_t)k_slot * k_bytes_per_pos + k_head_off;
+            float cnorm = *(const float*)kb;
+            for (int half = 0; half < n_halves; half++) {
+                // Byte offset: 4 (cnorm) + half * 32 + tid.
+                unsigned char packed = kb[4 + half * 32 + tid];
+                partial += mq[half * 4 + 0] * (cnorm * TURBO_C2[(packed)      & 0x3])
+                         + mq[half * 4 + 1] * (cnorm * TURBO_C2[(packed >> 2) & 0x3])
+                         + mq[half * 4 + 2] * (cnorm * TURBO_C2[(packed >> 4) & 0x3])
+                         + mq[half * 4 + 3] * (cnorm * TURBO_C2[(packed >> 6) & 0x3]);
+            }
         }
         for (int off = 16; off > 0; off >>= 1)
             partial += __shfl_xor(partial, off);
         if (tid == 0)
-            scores[t_local] = partial * scale_attn;
+            scores[t_local] = out_of_window ? -1e30f : (partial * scale_attn);
     }
     __syncthreads();
 
@@ -112,12 +137,13 @@ __global__ void attention_flash_asym2_tile(
     float tile_sum = local_sum;
     __syncthreads();
 
-    // Phase D: V (Q8_0 normal space, 2 halves for hd=256)
-    float out_vec[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    // Phase D: V (Q8_0 normal space)
+    float out_vec[MAX_HALVES * 4] = {};
     for (int t_local = 0; t_local < tile_len; t_local++) {
         float w = scores[t_local];
         int t = tile_start + t_local;
-        const unsigned char* vb = v_cache + (size_t)t * v_row_stride;
+        const int v_slot = (cache_capacity > 0) ? (t % cache_capacity) : t;
+        const unsigned char* vb = v_cache + (size_t)v_slot * v_row_stride;
         for (int half = 0; half < n_halves; half++) {
             const int d_base = half * 128 + tid * 4;
             const int v_bi       = d_base / 32;
@@ -145,4 +171,40 @@ __global__ void attention_flash_asym2_tile(
         p[2 + d_base + 2] = out_vec[half * 4 + 2];
         p[2 + d_base + 3] = out_vec[half * 4 + 3];
     }
+}
+
+extern "C" __launch_bounds__(32, 16)
+__global__ void attention_flash_asym2_tile(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ partials,
+    const int* __restrict__ pos_buf,
+    const float* __restrict__ cos_theta,
+    const float* __restrict__ sin_theta,
+    int n_heads, int n_kv_heads, int head_dim, int max_seq,
+    float scale_attn, int tile_size, int max_tiles,
+    int window_size, int cache_capacity
+) {
+    asym2_tile_body<2>(q, k_cache, v_cache, partials, pos_buf, cos_theta, sin_theta,
+        n_heads, n_kv_heads, head_dim, max_seq, scale_attn, tile_size, max_tiles,
+        window_size, cache_capacity);
+}
+
+extern "C" __launch_bounds__(32, 16)
+__global__ void attention_flash_asym2_tile_hd512(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ partials,
+    const int* __restrict__ pos_buf,
+    const float* __restrict__ cos_theta,
+    const float* __restrict__ sin_theta,
+    int n_heads, int n_kv_heads, int head_dim, int max_seq,
+    float scale_attn, int tile_size, int max_tiles,
+    int window_size, int cache_capacity
+) {
+    asym2_tile_body<4>(q, k_cache, v_cache, partials, pos_buf, cos_theta, sin_theta,
+        n_heads, n_kv_heads, head_dim, max_seq, scale_attn, tile_size, max_tiles,
+        window_size, cache_capacity);
 }

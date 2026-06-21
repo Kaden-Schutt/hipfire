@@ -1584,6 +1584,7 @@ pub fn prefill_forward(
                 n_kv_heads,
                 head_dim,
                 batch,
+                0,
             )?;
             gpu.kv_cache_write_q8_0_batched(
                 &kv_cache.v_gpu[layer_idx],
@@ -1592,6 +1593,7 @@ pub fn prefill_forward(
                 n_kv_heads,
                 head_dim,
                 batch,
+                0,
             )?;
         } else {
             for i in 0..batch {
@@ -2348,6 +2350,7 @@ fn forward_prefill_chunk(
                 config.n_kv_heads,
                 config.head_dim,
                 n,
+                0,
             )?;
         } else if kv_cache.quant_asym2 {
             let ct = kv_cache.givens_cos.as_ref().unwrap();
@@ -2372,6 +2375,7 @@ fn forward_prefill_chunk(
                 config.n_kv_heads,
                 config.head_dim,
                 n,
+                0,
             )?;
             gpu.kv_cache_write_q8_0_batched(
                 &kv_cache.v_gpu[layer_idx],
@@ -2380,6 +2384,7 @@ fn forward_prefill_chunk(
                 config.n_kv_heads,
                 config.head_dim,
                 n,
+                0,
             )?;
         }
 
@@ -2428,6 +2433,8 @@ fn forward_prefill_chunk(
                 None,
                 0,
                 0,
+                0, // window_size: 0 = full causal (generic llama path, non-sliding)
+                0, // cache_capacity: 0 = no ring wrap
             )?;
         } else if kv_cache.quant_asym2 {
             let ct = kv_cache.givens_cos.as_ref().unwrap();
@@ -6174,8 +6181,8 @@ impl KvCache {
         physical_cap: usize,
     ) -> HipResult<Self> {
         assert!(
-            head_dim == 256,
-            "asym3 currently requires head_dim=256 (Qwen 3.5)"
+            head_dim == 256 || head_dim == 512,
+            "asym3 requires head_dim=256 or 512 (hd=512 added for gemma4)"
         );
         assert!(head_dim % 32 == 0);
         assert!(
@@ -6264,8 +6271,8 @@ impl KvCache {
         physical_cap: usize,
     ) -> HipResult<Self> {
         assert!(
-            head_dim == 256,
-            "fwht3 currently requires head_dim=256 (Qwen 3.5)"
+            head_dim == 256 || head_dim == 512,
+            "fwht3 requires head_dim=256 or 512 (hd=512 added for Gemma4 full-attention layers)"
         );
         assert!(head_dim % 32 == 0);
         assert!(
@@ -6279,8 +6286,9 @@ impl KvCache {
         let v_bpp = n_kv_heads * v_blocks_per_head * 34;
         let v_elems = (physical_cap * v_bpp + 3) / 4;
         let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, k_elems, v_elems, is_kv_layer)?;
-        // fwht_shfl_forward_256 reads signs[tid*8..tid*8+7], so 256 floats each.
-        let n_signs = 256;
+        // fwht_shfl_forward_256 reads signs[tid*8..tid*8+7] (256 floats);
+        // fwht_shfl_forward_512 reads signs[tid*16..tid*16+15] (512 floats).
+        let n_signs = head_dim;
         let s1_vals = Self::gen_fwht_signs(42, n_signs);
         let s2_vals = Self::gen_fwht_signs(1042, n_signs);
         let s1_bytes: Vec<u8> = s1_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
@@ -6337,8 +6345,8 @@ impl KvCache {
         physical_cap: usize,
     ) -> HipResult<Self> {
         assert!(
-            head_dim == 256,
-            "asym3 currently requires head_dim=256 (Qwen 3.5)"
+            head_dim == 256 || head_dim == 512,
+            "asym3 requires head_dim=256 or 512 (hd=512 added for gemma4)"
         );
         assert!(head_dim % 32 == 0);
         assert!(
@@ -7141,8 +7149,8 @@ impl KvCache {
         physical_cap: usize,
     ) -> HipResult<Self> {
         assert!(
-            head_dim == 256,
-            "asym3 currently requires head_dim=256 (Qwen 3.5)"
+            head_dim == 256 || head_dim == 512,
+            "asym3 requires head_dim=256 or 512 (hd=512 added for gemma4)"
         );
         assert!(head_dim % 32 == 0);
         assert!(physical_cap > 0 && physical_cap <= max_seq_len);
@@ -7557,8 +7565,8 @@ impl KvCache {
         physical_cap: usize,
     ) -> HipResult<Self> {
         assert!(
-            head_dim == 256,
-            "asym3 currently requires head_dim=256 (Qwen 3.5)"
+            head_dim == 256 || head_dim == 512,
+            "asym3 requires head_dim=256 or 512 (hd=512 added for gemma4)"
         );
         assert!(head_dim % 32 == 0);
         assert!(physical_cap > 0 && physical_cap <= max_seq_len);

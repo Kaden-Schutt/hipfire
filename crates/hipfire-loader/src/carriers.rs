@@ -559,6 +559,34 @@ impl Carrier for LlamaCarrier {
     }
 }
 
+// ─── Gemma4Carrier ───────────────────────────────────────────────────
+
+/// Gemma 4 (arch_id=13). Unlike the generic `HfqCarrier`, gemma4 needs `ctx`
+/// access during load: the EAGLE drafter path (`ctx.gemma4_drafter`) and the
+/// lowered-vs-eager selection both depend on load-time params, so it delegates
+/// to `crate::load_gemma4(hfq, tokenizer, ctx)`.
+pub struct Gemma4Carrier;
+impl Carrier for Gemma4Carrier {
+    fn name(&self) -> &'static str {
+        "gemma4"
+    }
+    fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool {
+        !is_dir && arch_id == 13
+    }
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        if ctx.pp > 1 {
+            return Err("gemma4: pipeline-parallel (pp>1) unsupported".into());
+        }
+        let ModelSource::Hfq(hfq) = src else {
+            return Err("gemma4: directory source unsupported".into());
+        };
+        let tokenizer =
+            hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+                .map_err(|e| format!("tokenizer not found: {e}"))?;
+        crate::load_gemma4(hfq, tokenizer, ctx)
+    }
+}
+
 // ─── Non-core carriers ───────────────────────────────────────────────
 
 /// Generic HFQ-only carrier: every non-core arch has the same load shape

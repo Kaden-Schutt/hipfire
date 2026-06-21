@@ -39,7 +39,12 @@ __global__ void attention_flash_q8_0_tile(
     int max_seq,
     float scale_attn,
     int tile_size,
-    int window                           // sliding-window span; <= 0 = full causal
+    int window,                          // sliding-window span; <= 0 = full causal
+    // Sliding-window lookback. 0 = full causal. When > 0, only positions t
+    // in [seq_len - window_size, seq_len - 1] contribute.
+    int window_size,
+    // Ring-buffer cache capacity. 0 = no wrap. > 0: slot = t % cache_capacity.
+    int cache_capacity
 ) {
     const int seq_len = pos_buf[0] + 1;
     // Sliding-window lower bound: keys at t < win_lo are outside the window
@@ -52,6 +57,18 @@ __global__ void attention_flash_q8_0_tile(
     const int tile_end = min(tile_start + tile_size, seq_len);
     if (tile_start >= seq_len) return;
     const int tile_len = tile_end - tile_start;
+
+    // Sliding-window: skip tiles entirely below the window.
+    const int t_lo = (window_size > 0) ? max(0, seq_len - window_size) : 0;
+    if (window_size > 0 && tile_end <= t_lo) {
+        if (threadIdx.x == 0) {
+            const int max_tiles_l = (max_seq + tile_size - 1) / tile_size;
+            float* p0 = partials + (h * max_tiles_l + tile_id) * (2 + head_dim);
+            p0[0] = -1e30f;
+            p0[1] = 0.0f;
+        }
+        return;
+    }
 
     const int kv_group = n_heads / n_kv_heads;
     const int kv_h = h / kv_group;
@@ -92,26 +109,31 @@ __global__ void attention_flash_q8_0_tile(
 
     for (int t_local = 0; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
-        if (t < win_lo) {                  // outside sliding window → mask, skip dot
-            if (tid == 0) scores[t_local] = -INFINITY;
-            continue;                      // t is wave-uniform, all lanes skip together
-        }
+        // Masked if outside EITHER sliding window: HEAD's `window` span
+        // (t < win_lo) OR gemma4's `window_size` lookback (t < t_lo). Both are
+        // wave-uniform, so all lanes agree and the dot is skipped together.
+        const bool out_of_window =
+            ((window > 0) && (t < win_lo)) ||
+            ((window_size > 0) && (t < t_lo));
         float partial = 0.0f;
-        for (int half = 0; half < n_halves; half++) {
-            const int k_bi = half * 4 + tid / 8;
-            const int k_blk_off = (kv_head_block_start + k_bi) * 34;
-            const unsigned char* kb = k_cache + (size_t)t * row_stride + k_blk_off;
-            float ks = (float)*((const _Float16*)kb);
-            const float* qb_thread = q_lds + k_bi * 32 + k_off;
-            partial += qb_thread[0] * (ks * (float)((signed char)kb[2 + k_off + 0]))
-                     + qb_thread[1] * (ks * (float)((signed char)kb[2 + k_off + 1]))
-                     + qb_thread[2] * (ks * (float)((signed char)kb[2 + k_off + 2]))
-                     + qb_thread[3] * (ks * (float)((signed char)kb[2 + k_off + 3]));
+        if (!out_of_window) {
+            const int k_slot = (cache_capacity > 0) ? (t % cache_capacity) : t;
+            for (int half = 0; half < n_halves; half++) {
+                const int k_bi = half * 4 + tid / 8;
+                const int k_blk_off = (kv_head_block_start + k_bi) * 34;
+                const unsigned char* kb = k_cache + (size_t)k_slot * row_stride + k_blk_off;
+                float ks = (float)*((const _Float16*)kb);
+                const float* qb_thread = q_lds + k_bi * 32 + k_off;
+                partial += qb_thread[0] * (ks * (float)((signed char)kb[2 + k_off + 0]))
+                         + qb_thread[1] * (ks * (float)((signed char)kb[2 + k_off + 1]))
+                         + qb_thread[2] * (ks * (float)((signed char)kb[2 + k_off + 2]))
+                         + qb_thread[3] * (ks * (float)((signed char)kb[2 + k_off + 3]));
+            }
         }
         for (int off = 16; off > 0; off >>= 1)
             partial += __shfl_xor(partial, off);
         if (tid == 0)
-            scores[t_local] = partial * scale_attn;
+            scores[t_local] = out_of_window ? -1e30f : (partial * scale_attn);
     }
     __syncthreads();
 
@@ -166,7 +188,8 @@ __global__ void attention_flash_q8_0_tile(
         for (int t_local = 0; t_local < tile_len; t_local++) {
             float w = scores[t_local];
             int t = tile_start + t_local;
-            const unsigned char* vb = v_cache + (size_t)t * row_stride + v_blk_off;
+            const int v_slot = (cache_capacity > 0) ? (t % cache_capacity) : t;
+            const unsigned char* vb = v_cache + (size_t)v_slot * row_stride + v_blk_off;
             float vs = (float)*((const _Float16*)vb);
             out0 += w * (vs * (float)((signed char)vb[2 + bj_base + 0]));
             out1 += w * (vs * (float)((signed char)vb[2 + bj_base + 1]));

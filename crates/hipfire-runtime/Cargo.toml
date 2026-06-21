@@ -112,6 +112,7 @@ hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
 hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
 hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
 hipfire-arch-cohere2moe = { path = "../hipfire-arch-cohere2moe" }
+hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
 hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
 hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
 hipfire-loader = { path = "../hipfire-loader" }
@@ -135,6 +136,18 @@ required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2"
 
 [[example]]
 name = "hfq_split"
+required-features = []
+
+[[example]]
+name = "gemma4_oracle"
+required-features = []
+
+[[example]]
+name = "build_kld_ref_native_gemma4"
+required-features = []
+
+[[example]]
+name = "eval_hipfire_gemma4"
 required-features = []
 
 [[example]]

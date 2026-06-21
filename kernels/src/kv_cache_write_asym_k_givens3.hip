@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026 Kaden Schutt
+// Copyright (c) 2026 Kaden Schutt, Kate
 // hipfire — see LICENSE and NOTICE in the project root.
 
 // K-only write for asym3: Givens rotation + 3-bit quantize (Lloyd-Max N(0, 1/256)).
@@ -37,13 +37,15 @@ extern "C" __global__ void kv_cache_write_asym_k_givens3(
     const int* __restrict__ pos_buf,
     const float* __restrict__ cos_theta,
     const float* __restrict__ sin_theta,
-    int n_kv_heads, int head_dim
+    int n_kv_heads, int head_dim,
+    int cache_capacity   // ring-buffer size; 0 = no wrap (direct pos addressing)
 ) {
     const int h = blockIdx.x;
     if (h >= n_kv_heads) return;
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
     const int pos = pos_buf[0];
+    const int slot = (cache_capacity > 0) ? (pos % cache_capacity) : pos;
 
     // 3-bit packed: 4B cnorm + 32 threads × 3 bytes
     const int bytes_per_head = 4 + (head_dim * 3) / 8;   // 100 for hd=256
@@ -54,7 +56,7 @@ extern "C" __global__ void kv_cache_write_asym_k_givens3(
     float* scratch = smem + head_dim;
 
     const float* src = k_src + h * head_dim;
-    unsigned char* out = k_dst + (size_t)pos * bytes_per_pos + h * bytes_per_head;
+    unsigned char* out = k_dst + (size_t)slot * bytes_per_pos + h * bytes_per_head;
 
     for (int d = tid; d < head_dim; d += nthreads) x[d] = src[d];
     __syncthreads();

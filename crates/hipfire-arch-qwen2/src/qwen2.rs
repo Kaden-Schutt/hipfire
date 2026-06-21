@@ -949,6 +949,7 @@ fn forward_step_after_x(
                 n_kv_heads,
                 head_dim,
                 state.max_seq,
+                0, // no sliding window
             )?;
         }
 
@@ -1471,6 +1472,7 @@ impl DenseArch for Qwen2Dense<'_> {
                 k.n_kv_heads,
                 k.head_dim,
                 st.max_seq,
+                0, // kv_window: qwen2 is dense full-attention, no sliding window
             )
         }
     }

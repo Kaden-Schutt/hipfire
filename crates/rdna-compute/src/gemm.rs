@@ -19735,6 +19735,17 @@ impl Gpu {
             )
         }
     }
+    /// Batched HFQ4G256 GEMM using wave32 WMMA.
+    ///
+    /// **F32→F16 conversion:** If `x_f16` is not already F16, this method
+    /// converts it to F16 via `ensure_fp16_x`, mirroring the `gemm_q8_0_wmma`
+    /// pattern. Callers that pre-convert (e.g. DeepSeek V4 staging) can
+    /// pass an F16 tensor directly to skip the conversion.
+    ///
+    /// **Bug fix (2026-06-09):** The original method took `x_f16` by name
+    /// but never verified or performed the F32→F16 conversion. Callers
+    /// passing F32 data (e.g. gemma4 prefill via GemmFamily dispatch)
+    /// would silently produce garbage — F32 bytes reinterpreted as F16.
     pub fn gemm_hfq4g256_wmma(
         &mut self,
         a_raw: &GpuTensor,
@@ -19745,18 +19756,41 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemm_hfq4g256_wmma",
-            kernels::GEMM_HFQ4G256_WMMA_SRC,
-            "gemm_hfq4g256_wmma",
-        )?;
-        let func = &self.functions["gemm_hfq4g256_wmma"];
+        debug_assert!(
+            self.arch_caps.has_wmma(),
+            "gemm_hfq4g256_wmma: requires wave32 WMMA (gfx11+); got arch {}",
+            self.arch
+        );
+        // Honor a pre-converted F16 activation; convert F32 input to F16
+        // on the fly (with cache by pointer, safe for per-token decode where
+        // x is a different tensor each call). For per-layer prefill,
+        // callers MUST NOT reuse the same scratch buffer across layers
+        // without invalidation — use convert_fp16_x_uncached or ensure
+        // x_f16 is already F16.
+        let x_f16_ptr = if matches!(x_f16.dtype, DType::F16) {
+            x_f16.buf.as_ptr()
+        } else {
+            self.ensure_fp16_x(x_f16, batch_size * k)?
+        };
+
+        // RDNA3/RDNA3.5 and RDNA4 wave32 WMMA use different operand widths
+        // and f32-accumulator output layouts; select the matching source.
+        // Launch geometry is identical (16x16 tile per wave32 block).
+        let (kname, ksrc): (&str, &str) = if self.arch_caps.is_rdna4() {
+            ("gemm_hfq4g256_wmma_gfx12", kernels::GEMM_HFQ4G256_WMMA_GFX12_SRC)
+        } else {
+            ("gemm_hfq4g256_wmma", kernels::GEMM_HFQ4G256_WMMA_SRC)
+        };
+        self.ensure_kernel(kname, ksrc, kname)?;
+        let func = &self.functions[kname];
         let ap = a_raw.buf.as_ptr();
-        let xp = x_f16.buf.as_ptr();
+        let xp = x_f16_ptr;
         let yp = y_f32.buf.as_ptr();
         let mut mi = m as i32;
         let mut ki = k as i32;
         let mut bi = batch_size as i32;
+        let bytes = a_raw.byte_size();
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
         let mut params: Vec<*mut c_void> = vec![
             &ap as *const _ as *mut c_void,
             &xp as *const _ as *mut c_void,
@@ -19767,16 +19801,27 @@ impl Gpu {
         ];
         let grid_m = ((m + 15) / 16) as u32;
         let grid_b = ((batch_size + 15) / 16) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid_m, grid_b, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
+        let result = self.launch_maybe_blob(
+            kname,
+            [grid_m, grid_b, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mi);
+                b.push_i32(ki);
+                b.push_i32(bi);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
         }
+        result
     }
     pub fn gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
         &mut self,

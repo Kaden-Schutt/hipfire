@@ -687,9 +687,9 @@ pub fn forward_batch(
             )
             .map_err(|e| format!("cohere2moe L{l} batch rope: {e:?}"))?;
         }
-        gpu.kv_cache_write_q8_0_batched(&state.kv.k_gpu[l], &fk, &pos_array, n_kv, head_dim, b)
+        gpu.kv_cache_write_q8_0_batched(&state.kv.k_gpu[l], &fk, &pos_array, n_kv, head_dim, b, 0)
             .map_err(|e| format!("cohere2moe L{l} batch kv k: {e:?}"))?;
-        gpu.kv_cache_write_q8_0_batched(&state.kv.v_gpu[l], &fv, &pos_array, n_kv, head_dim, b)
+        gpu.kv_cache_write_q8_0_batched(&state.kv.v_gpu[l], &fv, &pos_array, n_kv, head_dim, b, 0)
             .map_err(|e| format!("cohere2moe L{l} batch kv v: {e:?}"))?;
         // Flash (tiled, O(1)-LDS) batched Q8 attention — the ">15k" prefill path
         // (causal: tree_bias=None). Replaces the LDS-bound attention_q8_0_kv_batched.

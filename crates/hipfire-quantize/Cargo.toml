@@ -9,6 +9,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 byteorder = "1"
 rayon = "1"
+faer = "0.24"
 hipfire-reap = { path = "../hipfire-reap" }
 
 [dev-dependencies]

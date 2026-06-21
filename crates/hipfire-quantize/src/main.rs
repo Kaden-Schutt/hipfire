@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026 Kaden Schutt
-// Copyright (c) 2026 Nick Woolmer
+// Copyright (c) 2026 Kaden Schutt, Nick Woolmer, Kate
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! hipfire-quantize: Quantize raw FP16/BF16/FP32 model weights to Q4_F16 format.
@@ -14,6 +13,7 @@
 mod e8;
 mod e8_gptq;
 mod gguf_input;
+mod gptq;
 mod reap_overlay;
 
 use memmap2::Mmap;
@@ -256,6 +256,41 @@ fn f32_to_f16(val: f32) -> u16 {
         return ((sign << 15) | (f >> shift)) as u16;
     }
     ((sign << 15) | ((new_exp as u32) << 10) | (frac >> 13)) as u16
+}
+
+/// Returns true if the tensor `name` should be kept as F16 (skipping Q8
+/// quantization) when the `HIPFIRE_GEMMA4_F16_KEEP` env var is set.
+///
+/// The env var is a comma-separated list of substring tokens. A tensor
+/// matches if ANY token is a substring of its full safetensors name.
+/// Unset / empty env => always returns false (no effect on quantization).
+///
+/// Example:
+///   HIPFIRE_GEMMA4_F16_KEEP=embed,down_proj
+///   => keeps model.language_model.embed_tokens.weight and every down_proj at F16.
+fn gemma4_f16_keep(name: &str) -> bool {
+    let Ok(val) = std::env::var("HIPFIRE_GEMMA4_F16_KEEP") else {
+        return false;
+    };
+    val.split(',')
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .any(|token| name.contains(token))
+}
+
+/// True when  is a Gemma4 FFN projection (gate_proj / up_proj / down_proj,
+/// including the shared-expert variants). Used to route gemma4 FFN tensors through
+/// GPTQ instead of AWQ: Gemma4 lacks RMSNorm-anchored inputs (√d_model embedding
+/// scale, no per-layer pre-norm on FFN inputs), which makes AWQ's imatrix-saliency
+/// signal unreliable — GPTQ's column-sequential OBS correction is a better fit.
+fn gemma4_is_ffn_tensor(name: &str) -> bool {
+    name.ends_with("mlp.gate_proj.weight")
+        || name.ends_with("mlp.up_proj.weight")
+        || name.ends_with("mlp.down_proj.weight")
+        // shared expert FFN in gemma4 26B-A4B MoE
+        || name.ends_with("mlp.shared_expert.gate_proj.weight")
+        || name.ends_with("mlp.shared_expert.up_proj.weight")
+        || name.ends_with("mlp.shared_expert.down_proj.weight")
 }
 
 /// Convert raw tensor bytes to F32 based on dtype string
@@ -4223,6 +4258,10 @@ pub(crate) fn quantize_hfq6g256(f32_data: &[f32]) -> Vec<u8> {
 /// Quantize F32 weights to HFQ4-G128: flat 4-bit with 128-weight groups.
 /// Block: [f32 scale][f32 zero][64B nibbles] = 72 bytes per 128 weights (0.5625 B/w).
 /// 14 VGPRs, 100% occupancy. Better quality for small K dimensions.
+///
+/// **Panics** if called when the ragged-group kernel fix is not in place
+/// and k_dim % 128 != 0. Use `quantize_hfq4g128_or_q8` for the safe
+/// fallback.
 fn quantize_hfq4g128(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 128;
     let block_bytes = 72;
@@ -4269,6 +4308,53 @@ fn quantize_hfq4g128(f32_data: &[f32]) -> Vec<u8> {
     }
 
     output
+}
+
+/// Pure helper: given the alignment flags for an expert tensor's K dimension
+/// (with all higher-priority format flags absent/false — i.e. mq4 default with
+/// no --expert-q8 / --expert-hfq4 / --expert-mq6 etc.), return which QuantType
+/// the expert-arm cascade would choose for that K.
+///
+/// This mirrors the tail of the rayon closure at the MoE expert dispatch site:
+///   } else if supports_g256 { MQ4G256 }
+///   } else if supports_g128 { HFQ4G128 }  ← THE BUG LIVES HERE (ragged-K groups)
+///   } else { Q8F16 }
+///
+/// Called by tests to pin the ragged-K protection without invoking the full
+/// quantizer pipeline.
+///
+/// KEEP IN SYNC with the live cascade tail (search for `supports_g128` in
+/// the expert dispatch around line ~6300): this is a parallel
+/// re-implementation, so its tests pin intent only — the
+/// `fallback_g128_or_q8_*` tests are the ones that exercise live code.
+#[cfg(test)]
+fn expert_default_quant_type(inner_k: usize) -> QuantType {
+    let supports_g256 = inner_k % 256 == 0;
+    let supports_g128 = inner_k % 128 == 0;
+    if supports_g256 {
+        QuantType::MQ4G256
+    } else if supports_g128 {
+        QuantType::HFQ4G128
+    } else {
+        QuantType::Q8F16
+    }
+}
+
+/// Quantize a 2D weight tensor, choosing HFQ4G128 when k_dim is aligned
+/// to 128, or falling back to Q8_0 (32-byte blocks, always aligned) when
+/// k_dim % 128 != 0. Avoids the ragged-group kernel bug where whole-tensor
+/// packing disagrees with per-row stride for non-aligned K.
+///
+/// Returns (quantized_bytes, quant_type, group_size, label_str).
+fn quantize_fallback_g128_or_q8(f32_data: &[f32], k_dim: usize) -> (Vec<u8>, QuantType, u32, &'static str) {
+    if k_dim % 128 == 0 {
+        (quantize_hfq4g128(f32_data), QuantType::HFQ4G128, 128u32, "HFQ4G128")
+    } else {
+        eprintln!(
+            "  NOTE: K={k_dim} not divisible by 128, falling back to Q8_0 (group-quant ragged-K protection)"
+        );
+        (quantize_q8f16(f32_data), QuantType::Q8F16, 32u32, "Q8_0")
+    }
 }
 
 // ─── HFQ File Format ────────────────────────────────────────────────────────
@@ -4521,17 +4607,31 @@ fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -
         return QuantLevel::Promote6;
     }
 
-    // Mode 2 (typed): promote ffn_down and attn_v in all layers.
+    // Mode 2 (typed): promote ffn_down, attn_v, and edge-layer FFN everywhere.
+    // attn q/k/o are deliberately excluded — dense attn promotion regresses PPL
+    // +3.1% on 27B (see ppl_kmap_20260508.md). Edge layers promote FFN + v_proj
+    // only; attn q/k/o stay at Base even for edge layers.
+    // This mode is the default for gemma4 (arch_id 13).
     if kmap_mode == 2 {
         let is_down = name.contains("down_proj") || name.contains("ffn_down");
         let is_v = name.contains("v_proj") || name.contains("attn_v");
+        // Unconditionally promote down_proj and v_proj in all layers.
         if is_down || is_v {
             return QuantLevel::Promote6;
         }
+        // Edge layers: promote FFN tensors only — NOT attn q/k/o.
         if n_layers > 0 {
             if let Some(idx) = parse_layer_idx(name) {
                 if idx < 2 || idx >= n_layers.saturating_sub(2) {
-                    return QuantLevel::Promote6;
+                    let is_attn_qko = name.contains("q_proj")
+                        || name.contains("attn_q")
+                        || name.contains("k_proj")
+                        || name.contains("attn_k")
+                        || name.contains("o_proj")
+                        || name.contains("attn_o");
+                    if !is_attn_qko {
+                        return QuantLevel::Promote6;
+                    }
                 }
             }
         }
@@ -4892,6 +4992,8 @@ fn is_q8_tensor(name: &str) -> bool {
         // both at Q8 even in Q4-bulk modes.
         || name.ends_with("mlp.gate.weight")
         || name.ends_with("mlp.shared_expert_gate.weight")
+        // Gemma4 26B-A4B MoE router.
+        || name.ends_with("router.proj.weight")
 }
 
 /// Qwen3.5 DeltaNet conv1d weight: `{prefix}.linear_attn.conv1d.weight`,
@@ -5464,7 +5566,10 @@ fn awq_eligible(name: &str) -> bool {
         // as mlp.gate.weight: q8_router (set for is_minimax via is_moe_like)
         // keeps the router at Q8 so HFQ4 noise can't flip top-k selection.
         || name.ends_with("block_sparse_moe.gate.weight")
-        || name.ends_with("router.weight");
+        || name.ends_with("router.weight")
+        // Gemma4 26B-A4B MoE router: `router.proj.weight` (hidden_size × num_experts).
+        // Same precision-sensitivity as Qwen3.5's `mlp.gate.weight`.
+        || name.ends_with("router.proj.weight");
     if f1_only {
         return f1_match;
     }
@@ -5746,6 +5851,14 @@ fn run_gguf_pipeline(
         "qwen3" | "qwen2" => 1,
         "qwen3_5" | "qwen3_5_text" => 5,
         "qwen3moe" => 6,
+        // Gemma4 EAGLE drafter (arch_id 22) — must come before the gemma4
+        // catch-all below so that a GGUF with general.architecture =
+        // "gemma4_unified_assistant" is not mis-tagged as arch 13.
+        "gemma4_unified_assistant" => 22,
+        // Gemma 4 family (dense + MoE) => hipfire-arch-gemma4 (arch_id 13).
+        // Require a "gemma4"-prefixed arch string; bare "gemma"/"gemma2"/
+        // "gemma3" GGUFs are different architectures and must not be mis-tagged.
+        g4 if g4.starts_with("gemma4") => 13,
         other => {
             // Structural-pillar guard: a qwen3* GGUF that doesn't match an
             // explicit arm above must NOT be silently stamped arch_id=0
@@ -5821,6 +5934,7 @@ fn run_gguf_pipeline(
 
     // K-map setup for GGUF path
     let is_moe = arch_id == 6;
+    let _is_gemma4 = arch_id == 13;
     let n_layers: usize = config_json
         .get("num_hidden_layers")
         .and_then(|v| v.as_u64())
@@ -6205,14 +6319,29 @@ fn run_gguf_pipeline(
                     (q, QuantType::MFP2G32E8, 32u32, "MFP2G32E8")
                 }
             }
-        } else {
-            // K not divisible by 256 — fall back to HFQ4-G128 (no rotation).
-            // This branch fires for the rare ragged dim; ignores --format
-            // (no G128 variant of mq4/mq6 exists).
+        } else if k_dim % 128 == 0 {
+            // K not divisible by 256 but divisible by 128 — fall back to
+            // HFQ4-G128 (no rotation, no G256 variant of mq4/mq6 exists).
             let f32_data = gguf_input::tensor_to_f32(info, raw);
             let q = quantize_hfq4g128(&f32_data);
             quant_params += n_elements as u64;
             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+        } else {
+            // K not divisible by 128 either — group-quantized formats would
+            // produce misaligned groups (whole-tensor packing vs per-row
+            // stride). Fall back to Q8_0 which has 32-byte blocks and works
+            // for any K divisible by 32.
+            //
+            // Fires for: Gemma4 26B dense FFN down_proj (K=2112, 2112%128=64),
+            // and any future architecture with non-aligned intermediate dims.
+            eprintln!(
+                "  NOTE: K={k_dim} not divisible by 128, falling back to Q8_0 for {}",
+                info.name
+            );
+            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            let q = quantize_q8f16(&f32_data);
+            quant_params += n_elements as u64;
+            (q, QuantType::Q8F16, 32u32, "Q8_0")
         };
 
         total_bytes_out += data.len() as u64;
@@ -6333,6 +6462,10 @@ fn main() {
         eprintln!("reap: --reap-bake and --reap-overlay are mutually exclusive");
         std::process::exit(1);
     }
+
+    // Force Q8 quantization for MoE expert weights regardless of --format.
+    // Avoids the MQ4G256 quality cliff on small-magnitude expert weights.
+    let expert_q8_override = args.iter().any(|a| a == "--expert-q8");
 
     // Optional imatrix (llama.cpp GGUF format with .in_sum2 / .counts per-tensor).
     // When provided, MQ2-Lloyd quantization uses per-column importance weights
@@ -6886,11 +7019,14 @@ fn main() {
     // short context, win at long context — see benchmarks/results/
     // ppl_kmap_20260508.md). Maintainer directive 2026-05-08: "intends to
     // help ONLY (never on dense)" by default.
+    // Exception: gemma4 (arch_id 13) auto-enables kmap_mode=2 (typed) — see
+    // the arch-specific override after arch_id resolution below.
     let kmap_dense = args.iter().any(|a| a == "--kmap-dense");
     // K-map mode: 0=full (all candidates promoted), 1=alternating (edge + every 3rd),
-    // 2=typed (ffn_down+attn_v everywhere). Default: alternating — same PPL as full
-    // at 17% less model size on MoE (22.9 vs 27.7 GB, PPL 8K: 19.96 vs 20.07).
-    let kmap_mode: u8 = args
+    // 2=typed (ffn_down+attn_v everywhere, edge layers FFN+v only — no attn q/k/o).
+    // Default for MoE: alternating (same PPL as full at 17% less size).
+    // Default for gemma4 (arch_id 13): typed (mode 2) — auto-set after arch detection.
+    let kmap_mode_explicit: Option<u8> = args
         .iter()
         .position(|a| a == "--kmap-mode")
         .and_then(|i| args.get(i + 1))
@@ -6902,8 +7038,12 @@ fn main() {
                 eprintln!("warning: unknown --kmap-mode '{v}', using alternating");
                 1
             }
-        })
-        .unwrap_or(1);
+        });
+    // kmap_mode is finalised after arch_id is known (gemma4 override may apply).
+    // For the GGUF early-exit path the arch is not resolved until inside
+    // run_gguf_pipeline; use the CLI value directly there (gemma4 GGUF callers
+    // can pass --kmap-mode typed explicitly).
+    let kmap_mode: u8 = kmap_mode_explicit.unwrap_or(1);
 
     // ── Sub-4-bit guards (2026-04-30 sweep) ─────────────────────────────
     // MQ2 with the current uniform 4-level codebook collapses at every
@@ -7079,6 +7219,24 @@ fn main() {
         // shared expert; FP8 E4M3 + F32 weight_scale_inv block-128 storage;
         // split per-expert w1/w3/w2 (like deepseek_v4). Crate hipfire-arch-minimax.
         "minimax_m2" => 10,
+        // Gemma 4 family (dense + MoE) -> hipfire-arch-gemma4 (arch_id 13).
+        // 12B-unified (google/gemma-4-12B-it, model_type "gemma4_unified") is
+        // dense unified multimodal; we quantize ONLY the text decoder
+        // (model.language_model.*). GQA + SWA + dual-RoPE + GeGLU + 4 sandwich
+        // norms + logit softcap. 26B-A4B MoE uses model_type "gemma4" (3D
+        // stacked experts.gate_up_proj/down_proj + router.proj/router.scale).
+        "gemma4_unified" | "gemma4_unified_text" | "gemma4" | "gemma4_text" => 13,
+        // Gemma4 EAGLE drafter (google/gemma-4-12B-it-assistant): the 422M
+        // single-block speculative-decode draft head for the arch-13 target.
+        // FLAT `model.*` names (NOT `model.language_model.`-prefixed) + two
+        // top-level projections (pre_projection / post_projection). Text-only:
+        // no vision/audio tower to skip. 5 decoder layers, hybrid 3:1
+        // sliding(hd256)/full(hd512) attn, tied lm_head, per-layer scalar.
+        // Quantize everything Q8 (`--format q8`): it is a tiny draft model and
+        // draft accuracy directly gates spec-decode acceptance. arch_id 22 is
+        // the next free slot after 21 (Qwen3.5 MTP head). Crate (future):
+        // hipfire-arch-gemma4 drafter loader.
+        "gemma4_unified_assistant" => 22,
         // LFM2.5 (LiquidAI): hybrid short-conv + GQA-attn layers, SwiGLU FFN.
         //   "lfm2_moe" = A1B (dense MLP head layers + top-4 MoE); per-expert
         //               pre-split w1/w2/w3 → MQ4G256, everything else → Q8.
@@ -7113,6 +7271,12 @@ fn main() {
         eprintln!("Architecture: {arch_str} (id={arch_id})");
     }
     let is_moe = arch_id == 6;
+    let is_gemma4 = arch_id == 13;
+    // Covers both the dense arch-13 (12B/26B unified) and the EAGLE drafter
+    // (arch-22). Both have the same AWQ-unsuitability: √d_model embedding scale
+    // (not RMSNorm-anchored) corrupts AWQ saliency for FFN; embed/lm_head are
+    // tied + scaled by √3840 making AWQ scale saliency meaningless there.
+    let is_gemma4_family = arch_id == 13 || arch_id == 22;
     // DeepSeek V4 (arch_id=9 post-2026-05-26 upstream merge that promoted
     // Qwen2-dense to 7 and dots.ocr to 8) is also MoE but ships per-expert
     // separate 2D tensors (`layers.L.ffn.experts.E.{w1,w2,w3}.weight`)
@@ -7136,7 +7300,17 @@ fn main() {
     // kernel family). Raw HF tensor names are written verbatim (no rename);
     // the hipfire loader looks them up.
     let is_minimax = arch_id == 10;
-    let is_moe_like = is_moe || is_deepseek4 || is_lfm2moe || is_minimax || is_cohere2moe;
+    let is_moe_like =
+        is_moe || is_deepseek4 || is_lfm2moe || is_minimax || is_cohere2moe || is_gemma4;
+    // Gemma4 (arch_id 13) defaults to kmap_mode=2 (typed): promote down_proj,
+    // v_proj, and edge-layer non-attn-qko tensors. Attn q/k/o are excluded even
+    // in edge layers (dense attn promotion regresses PPL +3.1% on 27B).
+    // The explicit --kmap-mode flag overrides this default.
+    let kmap_mode: u8 = if is_gemma4 {
+        kmap_mode_explicit.unwrap_or(2)
+    } else {
+        kmap_mode
+    };
     // Q8 router: always on for MoE-class models.
     let q8_router = is_moe_like || q8_router_flag;
     if is_moe {
@@ -7284,9 +7458,16 @@ fn main() {
                 continue;
             }
             if let Some(stem) = name.strip_suffix(".scale") {
-                // Sibling weight name (drop `.scale`, add `.weight`).
-                let w_name = format!("{stem}.weight");
-                fp8_scale_for.insert(w_name, (fi, name.to_string()));
+                // FP8 scale siblings: `foo.scale` is the per-tensor scale for
+                // `foo.weight`. Skip from quantization; attach at quant time.
+                // Exception: Gemma4's `router.scale` is a real model weight
+                // (multiplicative scale on router input), NOT an FP8 scale.
+                if name.contains("router.scale") {
+                    all_tensors.push((name, fi));
+                } else {
+                    let w_name = format!("{stem}.weight");
+                    fp8_scale_for.insert(w_name, (fi, name.to_string()));
+                }
                 continue;
             }
             all_tensors.push((name, fi));
@@ -7466,7 +7647,10 @@ fn main() {
     // the K-map default-on path because the routed-expert promotion is
     // the headline win and the empirical regression there is tighter
     // (+1.7% PPL at 2K, gated below the dense regression threshold).
-    let kmap: HashMap<String, QuantLevel> = if no_kmap || (!is_moe && !kmap_dense) {
+    // K-map is enabled for: MoE models (default), gemma4 (arch_id 13,
+    // default mode=2), or any dense model with --kmap-dense.
+    // Suppress with --no-kmap / --uniform.
+    let kmap: HashMap<String, QuantLevel> = if no_kmap || (!is_moe && !is_gemma4 && !kmap_dense) {
         HashMap::new()
     } else {
         let mut map = HashMap::new();
@@ -7607,6 +7791,15 @@ fn main() {
             "  [filter] --include-prefix {p:?} — only tensors with this prefix will be ingested"
         );
     }
+    // Gemma4 (arch 13): unified multimodal checkpoints prefix the text decoder
+    // with `model.language_model.`; text-only checkpoints (model_type
+    // "gemma4_text") use flat `model.*` names. Only arm the tower-skip when the
+    // multimodal prefix actually exists, else a text-only checkpoint would be
+    // skipped wholesale.
+    let gemma4_skip_non_lm = arch_id == 13
+        && all_tensors
+            .iter()
+            .any(|(n, _)| n.starts_with("model.language_model."));
     let mut skipped_params = 0u64;
     // MiniMax AWQ: shared-per-layer expert scales, cached + sidecars emitted once.
     let mut mm_awq_cache: std::collections::HashMap<usize, Option<(Vec<f32>, Vec<f32>)>> =
@@ -7627,6 +7820,14 @@ fn main() {
         // dots.ocr names them `vision_tower.*`. Both fall through to the
         // F16 fallback path (see should_quantize: vision_tower.* is
         // skipped from quantization) when --include-vision is set.
+        // Gemma4 unified (arch 13): text-only bring-up — skip the vision/audio
+        // towers + multimodal projectors; quantize only the text decoder.
+        if gemma4_skip_non_lm && !name.starts_with("model.language_model.") {
+            let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
+            let n: usize = meta.shape.iter().product();
+            skipped_params += n as u64;
+            continue;
+        }
         let is_vision = name.starts_with("model.visual.")
             || name.starts_with("visual.")
             || name.starts_with("vision_tower.");
@@ -8587,11 +8788,16 @@ fn main() {
             // Fall through to standard path for non-MQ2 formats.
         }
 
-        if is_moe
-            && name.contains("mlp.experts.")
-            && (name.ends_with("gate_up_proj") || name.ends_with("down_proj"))
-            && meta.shape.len() == 3
-        {
+        // Gemma 4 26B-A4B uses the SAME layout but at a different prefix
+        // (no `mlp.` — tensors live directly under `.experts.`):
+        //   model.language_model.layers.{N}.experts.gate_up_proj
+        //   model.language_model.layers.{N}.experts.down_proj
+        // Name-suffix match + shape check handles both qwen3.5 (mlp.experts.*)
+        // and gemma4 (experts.*) without prefix-specific conditions.
+        let is_moe_expert_3d = (is_moe || is_gemma4)
+            && (name.ends_with("experts.gate_up_proj") || name.ends_with("experts.down_proj"))
+            && meta.shape.len() == 3;
+        if is_moe_expert_3d {
             let n_experts = meta.shape[0];
             let inner_n: usize = meta.shape[1..].iter().product();
             let elem_size = match meta.dtype.as_str() {
@@ -8617,6 +8823,7 @@ fn main() {
             let signs2 = gen_fwht_signs(1042, 256);
             let inner_k = inner_shape[1] as usize;
             let supports_g256 = inner_k % 256 == 0;
+            let supports_g128 = inner_k % 128 == 0;
             // K-map: check the parent tensor name directly. The parent
             // (e.g. "...mlp.experts.gate_up_proj") contains "mlp.experts."
             // so kmap_resolve rule 4 matches it. The kmap HashMap was built
@@ -9180,12 +9387,26 @@ fn main() {
                             &f32_slice, inner_m, inner_k_e, &signs1, &signs2,
                         );
                         (q, QuantType::MFP4G32E8SOA, 32u32)
+                    } else if use_q8 || expert_q8_override {
+                        // Q8 for all expert weights when --format q8f16 or --expert-q8.
+                        // Avoids MQ4G256 quality cliff on gate_up AND fixes
+                        // HFQ4G128 ragged-group bug on down_proj (K=704 not
+                        // divisible by 128). On 128 GB VRAM, Q8 experts add
+                        // ~12 GB over MQ4 — easily fits.
+                        let q = quantize_q8f16(&f32_slice);
+                        (q, QuantType::Q8F16, 256u32)
                     } else if supports_g256 {
                         let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ4G256, 256u32)
-                    } else {
+                    } else if supports_g128 {
                         let q = quantize_hfq4g128(&f32_slice);
                         (q, QuantType::HFQ4G128, 128u32)
+                    } else {
+                        // K not divisible by 128 — Q8_0 fallback.
+                        // Avoids ragged-group bug for expert down_proj
+                        // (e.g. Gemma4 26B expert K=704, 704%128=64).
+                        let q = quantize_q8f16(&f32_slice);
+                        (q, QuantType::Q8F16, 32u32)
                     };
                     let weight = HfqTensor {
                         name: format!("{parent_owned}{slot}.{base_owned}.weight"),
@@ -9271,10 +9492,14 @@ fn main() {
                 }
             } else if use_mfp4e8soa && supports_g256 {
                 "MFP4G32E8SOA"
+            } else if use_q8 || expert_q8_override {
+                "Q8_0"
             } else if supports_g256 {
                 "MQ4G256"
-            } else {
+            } else if supports_g128 {
                 "HFQ4G128"
+            } else {
+                "Q8_0"
             };
             let bytes_per = new_tensors.first().map(|t| t.data.len()).unwrap_or(0);
             eprintln!("  {label:>8}: {parent_owned}{{0..{n_out_experts}}}.{base_owned}.weight {:?} (×{n_out_experts} experts of {n_experts} || {:.1} KB/expert, parallel)",
@@ -9284,6 +9509,57 @@ fn main() {
             st_files[*file_idx].drop_tensor_pages(name);
             if let Some(ref mut s) = spill {
                 maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024); // 2 GB threshold
+            }
+            continue;
+        }
+
+        // ── HIPFIRE_GEMMA4_F16_KEEP knob ──────────────────────────────────────────
+        // Ablation/precision override for gemma4 (arch 13 / 22): any tensor whose
+        // name contains a token from the comma-separated HIPFIRE_GEMMA4_F16_KEEP env
+        // var is stored as F16 instead of Q8.  Only fires when the knob is set; in
+        // production (unset) this arm is a no-op and adds zero overhead.
+        //
+        // Typical use:
+        //   HIPFIRE_GEMMA4_F16_KEEP=embed,down_proj  -- keep embed + all down_proj at F16
+        //
+        // The arm runs before the deepseek4-q8-mtp short-circuit so it is truly the
+        // first format-specific override in the dispatch chain; it intentionally has
+        // no arch_id guard (safe to leave set for non-gemma4 experiments too).
+        if (arch_id == 13 || arch_id == 22) && gemma4_f16_keep(name) && n_elements >= 32 {
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            let src_dtype = meta.dtype.as_str();
+            let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                name,
+                raw_data,
+                meta,
+                &fp8_scale_for,
+                &st_files,
+            );
+            quantized_params += n_elements as u64;
+            let f16_bytes: Vec<u8> = f32_data
+                .iter()
+                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                .collect();
+            eprintln!(
+                "  {:>8}: {} {:?} ({} elements, {:.1} KB -> {:.1} KB) [src={src_dtype}, gemma4-f16-keep]",
+                "F16",
+                name,
+                meta.shape,
+                n_elements,
+                raw_data.len() as f64 / 1024.0,
+                f16_bytes.len() as f64 / 1024.0
+            );
+            hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: QuantType::F16,
+                shape,
+                group_size: 0,
+                data: f16_bytes,
+                spilled_len: 0,
+            });
+            st_files[*file_idx].drop_tensor_pages(name);
+            if let Some(ref mut s) = spill {
+                maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
             }
             continue;
         }
@@ -9449,7 +9725,27 @@ fn main() {
                 });
             } else {
                 // ── K-map override ──────────────────────────────────────────────
-                let kmap_level = kmap.get(&**name).copied().unwrap_or(QuantLevel::Base);
+                let mut kmap_level = kmap.get(&**name).copied().unwrap_or(QuantLevel::Base);
+                // Gemma4 (arch 13): attention projections are score-precision-
+                // sensitive (MQ4 corrupts QK scores / breaks coherence on random
+                // weights), so keep self_attn.{q,k,v,o}_proj at Q8 even when
+                // --format is mq4. HIPFIRE_GEMMA4_MQ4_ATTN=1 disables this to test
+                // MQ4 attention on real/QAT weights (byte reduction → faster decode).
+                if (arch_id == 13 || arch_id == 22)
+                    && name.contains("self_attn.")
+                    && name.ends_with("_proj.weight")
+                    && std::env::var_os("HIPFIRE_GEMMA4_MQ4_ATTN").is_none()
+                {
+                    // HIPFIRE_GEMMA4_MQ6_ATTN=1: promote attn to the 6-bit
+                    // variant of the base format (MQ6G256 under --format mq4)
+                    // instead of the default Q8 force — A/B lever for the
+                    // attn-precision KLD study.
+                    kmap_level = if std::env::var_os("HIPFIRE_GEMMA4_MQ6_ATTN").is_some() {
+                        QuantLevel::Promote6
+                    } else {
+                        QuantLevel::Q8
+                    };
+                }
 
                 // AWQ sidecar scales for this tensor — populated only inside the
                 // MQ4G256 arm when --awq is enabled and an imatrix entry exists
@@ -9458,6 +9754,36 @@ fn main() {
                 // the runtime can apply `x / s` before the rotation kernel at
                 // inference time.
                 let mut awq_sidecar_scales: Option<Vec<f32>> = None;
+
+                // ── HIPFIRE_GEMMA4_SOFTCAP_CALIB skeleton ─────────────────────────
+                // No-op guard for future softcap-aware lm_head calibration.
+                // See findings/gemma4_softcap_aware_calib.md for the full design.
+                //
+                // When HIPFIRE_GEMMA4_SOFTCAP_CALIB=1 is set AND this tensor is the
+                // tied lm_head / embed_tokens for a Gemma4 model, a future
+                // implementation would:
+                //   1. Load corpus activations x (post-final-RMSNorm, shape [n, dim])
+                //      collected by a separate `collect_softcap_calib` pass.
+                //   2. Run a softcap-aware AWQ scale search:
+                //         argmin_s || tanh(Wq(s)*(x/s)/cap)*cap
+                //                    - tanh(W*(x/s)/cap)*cap ||_F
+                //      over ~20 alpha candidates (same as standard AWQ grid).
+                //   3. Emit a `<lm_head_name>.awq_scale` sidecar distinct from the
+                //      embed_tokens sidecar (tied bytes, separate WeightTensor
+                //      dispatch site at forward time).
+                //
+                // Today this block is a no-op: it prints a diagnostic and falls
+                // through to the standard Q8 path unchanged.
+                if (arch_id == 13 || arch_id == 22)
+                    && std::env::var_os("HIPFIRE_GEMMA4_SOFTCAP_CALIB").is_some()
+                    && (name.contains("embed_tokens") || name.contains("lm_head"))
+                {
+                    eprintln!(
+                        "  [HIPFIRE_GEMMA4_SOFTCAP_CALIB] softcap-aware calibration                          for '{}' not yet implemented -- using standard Q8.                          See findings/gemma4_softcap_aware_calib.md.",
+                        name
+                    );
+                    // Fall through to the standard Q8 arm below (no `continue`).
+                }
 
                 let (quantized, qt, gs, label) = if q8_conv1d_default && is_conv1d_tensor(name) {
                     // DeltaNet conv1d defaults to Q8 (see --no-q8-conv1d to disable).
@@ -9761,8 +10087,8 @@ fn main() {
                                 let q = quantize_hfq4g256(&f32_data);
                                 (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
                             } else {
-                                let q = quantize_hfq4g128(&f32_data);
-                                (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                                let (q, qt, gs, lbl) = quantize_fallback_g128_or_q8(&f32_data, k_dim);
+                                (q, qt, gs, lbl)
                             }
                         }
                     } else if use_hfq6 {
@@ -9791,8 +10117,8 @@ fn main() {
                             (q, QuantType::HFQ2G256, 256u32, "HFQ2G256")
                         } else {
                             // Fallback to HFQ4 for non-256-aligned
-                            let q = quantize_hfq4g128(&f32_data);
-                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                            let (q, qt, gs, lbl) = quantize_fallback_g128_or_q8(&f32_data, k_dim);
+                            (q, qt, gs, lbl)
                         }
                     } else if use_mq8g256 && is_embed {
                         let q = quantize_q8f16(&f32_data);
@@ -9813,7 +10139,17 @@ fn main() {
                             let q = quantize_q8f16(&f32_data);
                             (q, QuantType::Q8F16, 32u32, "Q8_F16")
                         }
-                    } else if q8_router && is_q8_tensor(name) {
+                    } else if q8_router
+                        && is_q8_tensor(name)
+                        // Gemma4 (arch 13/22): HIPFIRE_GEMMA4_MQ4_ATTN=1 must also
+                        // bypass this q8_router catch-all (is_q8_tensor matches all
+                        // self_attn projections, not just routers) or the kmap-level
+                        // opt-out at the top of this arm is dead code for gemma4.
+                        && !((arch_id == 13 || arch_id == 22)
+                            && name.contains("self_attn.")
+                            && name.ends_with("_proj.weight")
+                            && std::env::var_os("HIPFIRE_GEMMA4_MQ4_ATTN").is_some())
+                    {
                         // Q8 router for MoE: keep mlp.gate.weight and
                         // shared_expert_gate.weight at Q8 regardless of --format.
                         let q = quantize_q8f16(&f32_data);
@@ -9853,6 +10189,22 @@ fn main() {
                         if k_dim % 256 == 0 {
                             let signs1 = gen_fwht_signs(42, 256);
                             let signs2 = gen_fwht_signs(1042, 256);
+                            // ── Gemma4 (arch 13/22): embed/lm_head MUST NOT reach AWQ ──────
+                            // embed_tokens and lm_head are always routed to Q8 via the K-map
+                            // (kmap_level == QuantLevel::Q8) before reaching this branch, so
+                            // they cannot arrive here. Assert that invariant to document it:
+                            // Gemma4 uses a tied embed/lm_head with an implicit √d_model
+                            // (√3840) scaling factor — there is no RMSNorm anchor on the
+                            // embedding dimension, making AWQ's imatrix-saliency ratio
+                            // meaningless and the per-channel pre-scale actively harmful.
+                            debug_assert!(
+                                !(is_gemma4_family
+                                    && (name.contains("embed_tokens")
+                                        || name.contains("lm_head"))),
+                                "gemma4 embed/lm_head reached the MQ4 AWQ path —                                  kmap Q8 guard should have prevented this (arch {} tensor {})",
+                                arch_id, name
+                            );
+
                             // Phase A Stage A — AWQ pre-scaling, when --awq is enabled
                             // AND we have imatrix data for this tensor AND the tensor
                             // is on the AWQ whitelist (see `awq_eligible`). Mutates a
@@ -9866,7 +10218,76 @@ fn main() {
                             // produces `(W·s)·x ≠ W·x` and catastrophically corrupts
                             // logits (KLD 0.67 → 13.5 measured on 0.8B Qwen3.5 before
                             // this guard landed). See `docs/plans/awq_fix_claude.md`.
-                            let q = if let (Some(alpha), Some(im_weights)) =
+                            //
+                            // ── Gemma4 (arch 13/22) FFN → GPTQ, not AWQ ─────────────────────
+                            // For Gemma4 gate_proj / up_proj / down_proj (and shared-expert
+                            // counterparts), AWQ is structurally unsound: the rotated FFN basis
+                            // (GeLU + GeGLU gate) has no stable RMSNorm-derived per-channel
+                            // activation scale to anchor AWQ's saliency ratio. Instead we use
+                            // `gptq::gptq_pipeline_mq4g256` with a diagonal Hessian approximation
+                            // built from the imatrix: H ≈ diag(im_weights²). This is a standard
+                            // approximation when full second-moment statistics are unavailable;
+                            // GPTQ's column-sequential OBS compensation works well even with a
+                            // diagonal Hessian and consistently beats AWQ on gemma-style rotated FFN.
+                            // Falls back to plain MQ4 if Cholesky fails (rare: only on degenerate
+                            // activation distributions).
+                            let q = if is_gemma4_family
+                                && gemma4_is_ffn_tensor(name)
+                                && awq_eligible(name)
+                            {
+                                // Gemma4 FFN: GPTQ path (with or without --awq flag — the
+                                // AWQ flag controls the general AWQ pass; GPTQ here is
+                                // unconditional for gemma4 FFN when imatrix is available).
+                                if let Some(im_weights) = imatrix_weights_for(name) {
+                                    debug_assert_eq!(
+                                        im_weights.len(),
+                                        k_dim,
+                                        "imatrix length ({}) != K dim ({}) for {}",
+                                        im_weights.len(),
+                                        k_dim,
+                                        name
+                                    );
+                                    let m_dim = meta.shape[0];
+                                    // Diagonal Hessian: H[i,i] = im_weights[i]², H[i,j≠i] = 0.
+                                    // Packed row-major as a K×K flat vec. This is the standard
+                                    // diagonal approximation used when full Hessians are not
+                                    // pre-collected; gptq_pipeline_mq4g256 handles the
+                                    // FWHT-similarity transform internally.
+                                    let h_diag: Vec<f32> = {
+                                        let mut h = vec![0.0f32; k_dim * k_dim];
+                                        for j in 0..k_dim {
+                                            h[j * k_dim + j] = (im_weights[j] as f32).powi(2);
+                                        }
+                                        h
+                                    };
+                                    // AWQ scales = identity (no AWQ pre-scaling for gemma4).
+                                    let awq_unit: Vec<f64> = vec![1.0f64; k_dim];
+                                    match gptq::gptq_pipeline_mq4g256(
+                                        &f32_data,
+                                        m_dim,
+                                        k_dim,
+                                        &h_diag,
+                                        &awq_unit,
+                                        &signs1,
+                                        &signs2,
+                                        1e-3,
+                                        1e3,
+                                        name,
+                                    ) {
+                                        Ok(bytes) => bytes,
+                                        Err(e) => {
+                                            eprintln!(
+                                                "  gptq: Cholesky failed for {} ({:?}) —                                                  falling back to plain MQ4",
+                                                name, e
+                                            );
+                                            quantize_mq4g256(&f32_data, &signs1, &signs2)
+                                        }
+                                    }
+                                } else {
+                                    // No imatrix: fall back to plain MQ4 (no AWQ sidecar).
+                                    quantize_mq4g256(&f32_data, &signs1, &signs2)
+                                }
+                            } else if let (Some(alpha), Some(im_weights)) =
                                 (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
                             {
                                 if awq_eligible(name) {
@@ -9901,8 +10322,8 @@ fn main() {
                             (q, QuantType::MQ4G256, 256u32, "MQ4G256")
                         } else {
                             // Fallback to standard HFQ4-G128 for non-256-aligned
-                            let q = quantize_hfq4g128(&f32_data);
-                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                            let (q, qt, gs, lbl) = quantize_fallback_g128_or_q8(&f32_data, k_dim);
+                            (q, qt, gs, lbl)
                         }
                     } else if use_hfp4 && is_embed {
                         // HFP4 embeddings stay Q8F16 (matches MQ4 / HFQ4 pattern — embedding lookup is
@@ -9921,8 +10342,8 @@ fn main() {
                             (q, QuantType::HFP4G32, 32u32, "HFP4G32")
                         } else {
                             // Fallback to HFQ4-G128 for non-32-aligned ragged dims (rare).
-                            let q = quantize_hfq4g128(&f32_data);
-                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                            let (q, qt, gs, lbl) = quantize_fallback_g128_or_q8(&f32_data, k_dim);
+                            (q, qt, gs, lbl)
                         }
                     } else if use_mfp4 && is_embed {
                         // MFP4 embeddings stay Q8F16 (same rationale as HFP4 / MQ4).
@@ -9943,8 +10364,8 @@ fn main() {
                         } else {
                             // Fallback to HFQ4-G128 for non-256-aligned ragged dims (rotation
                             // requires 256-element segments). Matches MQ4's ragged fallback.
-                            let q = quantize_hfq4g128(&f32_data);
-                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                            let (q, qt, gs, lbl) = quantize_fallback_g128_or_q8(&f32_data, k_dim);
+                            (q, qt, gs, lbl)
                         }
                     } else if use_mfp4l && is_embed {
                         let q = quantize_q8f16(&f32_data);
@@ -10205,8 +10626,8 @@ fn main() {
                             (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
                         } else {
                             // Fallback to HFQ4-G128 for non-256-aligned (no rotation).
-                            let q = quantize_hfq4g128(&f32_data);
-                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                            let (q, qt, gs, lbl) = quantize_fallback_g128_or_q8(&f32_data, k_dim);
+                            (q, qt, gs, lbl)
                         }
                     } else if use_mq3g256_lloyd {
                         let k_dim = if meta.shape.len() == 2 {
@@ -10392,8 +10813,8 @@ fn main() {
                             let q = quantize_hfq4g256(&f32_data);
                             (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
                         } else {
-                            let q = quantize_hfq4g128(&f32_data);
-                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                            let (q, qt, gs, lbl) = quantize_fallback_g128_or_q8(&f32_data, k_dim);
+                            (q, qt, gs, lbl)
                         }
                     } else if use_hfq4g256 {
                         // Auto-select G128 vs G256 based on K dimension
@@ -10408,12 +10829,12 @@ fn main() {
                             let q = quantize_hfq4g256(&f32_data);
                             (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
                         } else if k_dim % 128 == 0 {
-                            let q = quantize_hfq4g128(&f32_data);
-                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                            let (q, qt, gs, lbl) = quantize_fallback_g128_or_q8(&f32_data, k_dim);
+                            (q, qt, gs, lbl)
                         } else {
                             // Pad to 128-element boundary
-                            let q = quantize_hfq4g128(&f32_data);
-                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                            let (q, qt, gs, lbl) = quantize_fallback_g128_or_q8(&f32_data, k_dim);
+                            (q, qt, gs, lbl)
                         }
                     } else if this_q8 {
                         let q = quantize_q8f16(&f32_data);
@@ -10564,15 +10985,19 @@ fn main() {
             };
             let (quantized, gs) = if k_dim % 256 == 0 {
                 (quantize_hfq4g256(&f32_data), 256u32)
-            } else {
+            } else if k_dim % 128 == 0 {
                 (quantize_hfq4g128(&f32_data), 128u32)
+            } else {
+                (quantize_q8f16(&f32_data), 32u32)
             };
             let qt = if gs == 256 {
                 QuantType::HFQ4G256
-            } else {
+            } else if gs == 128 {
                 QuantType::HFQ4G128
+            } else {
+                QuantType::Q8F16
             };
-            let label = if gs == 256 { "HFQ4G256" } else { "HFQ4G128" };
+            let label = if gs == 256 { "HFQ4G256" } else if gs == 128 { "HFQ4G128" } else { "Q8_0" };
             eprintln!(
                 "  {label:>8}: {} {:?} ({} elements, {:.1} KB -> {:.1} KB) [vision]",
                 name,
@@ -13115,6 +13540,89 @@ mod tests {
         assert_eq!(
             kmap_resolve_mode("model.layers.15.mlp.gate_proj.weight", 40, false, 2),
             QuantLevel::Base
+        );
+    }
+
+    // ── Ragged-K protection regression tests ─────────────────────────────
+    //
+    // These tests pin two invariants that guard the known G128 ragged-K kernel
+    // bug (gemv/gemm_hfq4g128 uses floor-stride groups_per_row = K/128, which
+    // produces wrong results when K%128 != 0):
+    //
+    //   1. quantize_fallback_g128_or_q8 selects Q8F16 for ragged-K inputs.
+    //   2. The expert-arm cascade selects Q8F16 (not HFQ4G128) for ragged-K.
+    //   3. The inverse: aligned K values select the expected group formats.
+    //
+    // A refactor that reverts to unconditional quantize_hfq4g128 (as in the
+    // pre-merge branch at f63751a5:6196) would fail tests 1 and 2 immediately.
+    // A refactor that makes the alignment guard over-conservative would fail
+    // test 3.
+
+    #[test]
+    fn fallback_g128_or_q8_ragged_k_selects_q8f16() {
+        // K=704 (Gemma4-26B expert down_proj): 704 % 128 = 64 — ragged.
+        // Must NOT emit HFQ4G128; must fall back to Q8F16.
+        let data: Vec<f32> = vec![0.0f32; 704];
+        let (_bytes, qt, _gs, label) = quantize_fallback_g128_or_q8(&data, 704);
+        assert_eq!(qt, QuantType::Q8F16, "K=704 ragged: expected Q8F16, got {qt:?}");
+        assert_eq!(label, "Q8_0");
+
+        // K=2112 (Gemma4-26B dense FFN down_proj): 2112 % 128 = 64 — ragged.
+        let data2: Vec<f32> = vec![0.0f32; 2112];
+        let (_bytes2, qt2, _gs2, label2) = quantize_fallback_g128_or_q8(&data2, 2112);
+        assert_eq!(qt2, QuantType::Q8F16, "K=2112 ragged: expected Q8F16, got {qt2:?}");
+        assert_eq!(label2, "Q8_0");
+    }
+
+    #[test]
+    fn fallback_g128_or_q8_aligned_k_selects_hfq4g128() {
+        // K=640: 640 % 128 = 0, 640 % 256 = 128 — g128-aligned, not g256.
+        // Should select HFQ4G128 (not Q8F16, not HFQ4G256).
+        let data: Vec<f32> = vec![0.0f32; 640];
+        let (_bytes, qt, gs, label) = quantize_fallback_g128_or_q8(&data, 640);
+        assert_eq!(qt, QuantType::HFQ4G128, "K=640 g128-aligned: expected HFQ4G128, got {qt:?}");
+        assert_eq!(gs, 128u32);
+        assert_eq!(label, "HFQ4G128");
+
+        // K=768: 768 % 128 = 0, 768 % 256 = 0 — also g128-aligned.
+        let data2: Vec<f32> = vec![0.0f32; 768];
+        let (_bytes2, qt2, gs2, _label2) = quantize_fallback_g128_or_q8(&data2, 768);
+        assert_eq!(qt2, QuantType::HFQ4G128, "K=768 g128-aligned: expected HFQ4G128, got {qt2:?}");
+        assert_eq!(gs2, 128u32);
+    }
+
+    #[test]
+    fn expert_default_quant_type_ragged_k_selects_q8f16() {
+        // K=704 (Gemma4-26B expert down_proj): 704 % 128 = 64 — ragged.
+        // The expert cascade's alignment-tail must NOT select HFQ4G128.
+        assert_eq!(
+            expert_default_quant_type(704),
+            QuantType::Q8F16,
+            "K=704 expert ragged: expected Q8F16"
+        );
+        // K=2112 (Gemma4-26B dense FFN down_proj-equivalent): also ragged.
+        assert_eq!(
+            expert_default_quant_type(2112),
+            QuantType::Q8F16,
+            "K=2112 expert ragged: expected Q8F16"
+        );
+    }
+
+    #[test]
+    fn expert_default_quant_type_aligned_k_selects_correct_format() {
+        // K=768: 768 % 256 = 0 → MQ4G256 (default mq4 format, g256-aligned).
+        assert_eq!(
+            expert_default_quant_type(768),
+            QuantType::MQ4G256,
+            "K=768 g256-aligned: expected MQ4G256"
+        );
+        // K=640: 640 % 256 = 128, 640 % 128 = 0 → HFQ4G128.
+        // This tests the g128 arm is still reached for the right K values.
+        // (This arm is only safe when K%128==0, which K=640 satisfies.)
+        assert_eq!(
+            expert_default_quant_type(640),
+            QuantType::HFQ4G128,
+            "K=640 g128-aligned (not g256): expected HFQ4G128"
         );
     }
 }

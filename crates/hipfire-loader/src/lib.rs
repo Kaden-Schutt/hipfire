@@ -10,6 +10,8 @@ pub use carriers::*;
 use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
+use hipfire_arch_gemma4 as gemma4;
+use hipfire_arch_gemma4::lowered;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_qwen2::qwen2;
@@ -80,6 +82,7 @@ const REGISTRY: &[&dyn Carrier] = &[
         name: "cohere2moe",
         load: load_cohere2moe,
     },
+    &Gemma4Carrier,
 ];
 
 // ─── Constants ────────────────────────────────────────────────────────
@@ -92,6 +95,13 @@ const FROGGERIC_QWEN35_TEMPLATE: &str =
 /// Built-in LFM2.5 chat template.
 const LFM2_TEMPLATE: &str =
     include_str!("../../hipfire-runtime/templates/eval/lfm2-liquidai.jinja");
+
+/// Gemma 4 (arch 13) bundled template. Strict-undefined-safe copy of
+/// google/gemma's HF template (`'k' in x` probes instead of lenient
+/// `x['k']` truth-tests, byte-identical output) — the upstream template
+/// raises under our strict minijinja env and falls back to a raw prompt.
+const GEMMA4_TEMPLATE: &str =
+    include_str!("../../hipfire-runtime/templates/gemma-4-it.jinja");
 
 // ─── Eviction policy wrapper ──────────────────────────────────────────
 
@@ -277,6 +287,40 @@ pub struct Cohere2MoeBundle {
     pub eos_tok: u32,
 }
 
+// ─── Gemma 4 spec/lowered side state ──────────────────────────────────
+
+/// Optional Gemma 4 EAGLE speculative-decoding state (arch-22
+/// `gemma4_unified_assistant` drafter riding an arch-13 target). Populated
+/// when `load` supplies `params.drafter` on an arch_id=13 model. The drafter
+/// has NO KV cache of its own: `drafter_step` queries the TARGET's KV at a
+/// constant position, so the only per-session state is the target's
+/// `Gemma4State` plus the small reusable scratch held here.
+pub struct Gemma4EagleState {
+    pub drafter_config: gemma4::drafter::Gemma4DrafterConfig,
+    pub drafter_weights: gemma4::drafter::Gemma4DrafterWeights,
+    pub drafter_scratch: gemma4::drafter::Gemma4DrafterScratch,
+    /// Reusable seed/draft/verify hidden buffers for `spec_step_gemma4_eagle`,
+    /// sized for `draft_len` at load time.
+    pub spec_scratch: gemma4::speculative::Gemma4SpecScratch,
+    /// Drafts per round (verify block = draft_len + 1).
+    pub draft_len: usize,
+}
+
+/// Kevin-fork lowered (execute_steps/superop) Gemma 4 path state. Used for
+/// arch-13 MoE models (26B-A4B — the eager `gemma4::forward` path is dense
+/// only) and for the opt-in `HIPFIRE_BATCHED_PREFILL` / `HIPFIRE_WMMA_PREFILL`
+/// dense prefill path. Mutually exclusive with the eager `gemma4_*` fields:
+/// a given LoadedModel populates exactly one of the two Gemma 4
+/// representations.
+pub struct Gemma4LoweredState {
+    pub config: lowered::Gemma4Config,
+    pub weights: lowered::Gemma4Weights,
+    pub scratch: lowered::Gemma4Scratch,
+    pub kv_sliding: hipfire_runtime::llama::KvCache,
+    pub kv_full: hipfire_runtime::llama::KvCache,
+    pub eos_tok: u32,
+}
+
 // ─── LoadedModel ──────────────────────────────────────────────────────
 
 pub struct LoadedModel {
@@ -305,6 +349,23 @@ pub struct LoadedModel {
     // LFM2.5-8B-A1B (arch_id=11) and MiniMax-M2 (arch_id=10) live in
     // `state` as ModelState::{Lfm2Moe,Minimax} so unload teardown is
     // compiler-enforced (see ModelState).
+    // Gemma 4 dense state (arch_id=13 — hipfire-arch-gemma4). Eager dense path:
+    // both KV caches (sliding hd=256 + full hd=512) live inside Gemma4State.
+    // The MoE 26B-A4B variant + opt-in batched/WMMA dense prefill path live in
+    // `gemma4_lowered` instead (mutually exclusive with the eager fields).
+    // None on every other arch path.
+    pub gemma4_config: Option<gemma4::config::Gemma4Config>,
+    pub gemma4_weights: Option<gemma4::gemma4::Gemma4Weights>,
+    pub gemma4_state: Option<gemma4::gemma4::Gemma4State>,
+    /// End-of-turn token id resolved at load time (`<end_of_turn>` / `<turn|>`,
+    /// HF eos list `[1, 106]`; falls back to 106).
+    pub gemma4_eos_tok: u32,
+    /// Gemma 4 EAGLE spec-decode state (arch-22 drafter on an arch-13 target).
+    /// `Some` only when `load` supplied `params.drafter` and it loaded cleanly.
+    pub gemma4_eagle: Option<Gemma4EagleState>,
+    /// Kevin-fork lowered Gemma 4 state (arch-13 MoE + opt-in batched/WMMA
+    /// dense prefill). Mutually exclusive with the eager `gemma4_*` fields.
+    pub gemma4_lowered: Option<Gemma4LoweredState>,
     // MTP config
     pub mtp_mode: String,
     pub mtp_k: usize,
@@ -373,6 +434,12 @@ impl LoadedModel {
             deepseek4_pbs: None,
             deepseek4_eos_tok: 0,
             minimax_eos_tok: 0,
+            gemma4_config: None,
+            gemma4_weights: None,
+            gemma4_state: None,
+            gemma4_eos_tok: 0,
+            gemma4_eagle: None,
+            gemma4_lowered: None,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -551,6 +618,12 @@ fn resolve_chat_template(hfq: &HfqFile, model_path: &str) -> Option<String> {
             }
             return Some(LFM2_TEMPLATE.to_string());
         }
+        13 => {
+            // Gemma 4: prefer the BUNDLED strict-safe copy over the embedded
+            // one (mirror of the qwen 5|6 arm). Env / per-model overrides
+            // (steps 1-2) still win above.
+            return Some(GEMMA4_TEMPLATE.to_string());
+        }
         12 => {
             if let Some(t) = hfq.chat_template_named("tool_use") {
                 return Some(
@@ -722,10 +795,13 @@ fn finish_qwen35_load(
 
 /// Load a model from an HFQ file (or safetensors directory). This is the
 /// single arch-dispatch point via the carrier registry.
+#[allow(clippy::too_many_arguments)]
 pub fn load_model(
     path: &str,
     max_seq: usize,
     draft_path: Option<&str>,
+    gemma4_drafter: Option<&str>,
+    gemma4_eagle_draft_len: usize,
     kv_mode_override: Option<&str>,
     kv_adaptive_override: Option<&str>,
     state_quant_override: Option<&str>,
@@ -734,6 +810,21 @@ pub fn load_model(
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
     let src = ModelSource::from_path(path)?;
+
+    // Gemma 4 EAGLE drafter (arch-22) is only valid on arch_id=13 targets. Fail
+    // loudly before any weight upload when it's pointed at a different arch.
+    if gemma4_drafter.is_some() {
+        if let ModelSource::Hfq(ref hfq) = src {
+            if hfq.arch_id != 13 {
+                return Err(format!(
+                    "params.drafter (gemma4 EAGLE, arch-22) is only supported on \
+                     arch_id=13 (Gemma 4) targets; this model is arch_id={}. Use \
+                     params.draft for qwen3.5 DFlash instead.",
+                    hfq.arch_id
+                ));
+            }
+        }
+    }
 
     // DFlash lm_head quant check — only for HFQ sources
     if draft_path.is_some() {
@@ -810,6 +901,8 @@ pub fn load_model(
         path,
         max_seq,
         draft_path,
+        gemma4_drafter,
+        gemma4_eagle_draft_len,
         kv_mode_override,
         kv_adaptive_override,
         state_quant_override,
@@ -1060,6 +1153,208 @@ fn load_minimax(
             path.to_string(),
             chat_template,
         )
+    })
+}
+
+// ─── Gemma 4 load (arch_id=13) ────────────────────────────────────────
+
+/// Env opt-in for the gemma4 batched/WMMA prefill
+/// (`HIPFIRE_BATCHED_PREFILL=1` / `HIPFIRE_WMMA_PREFILL=1`). Routes dense
+/// models through the `lowered` path when set (and no drafter is present).
+fn gemma4_batched_prefill_optin(_gpu: &rdna_compute::Gpu) -> bool {
+    lowered::batched_prefill_enabled() || lowered::wmma_prefill_enabled()
+}
+
+/// Load the arch-22 EAGLE drafter for a Gemma 4 (arch-13) target and prime the
+/// batched verify path. File-missing / arch-mismatch is surfaced as an `Err`;
+/// the caller logs and serves AR-only.
+fn load_gemma4_eagle_state(
+    drafter_path: &str,
+    draft_len: usize,
+    target_cfg: &gemma4::config::Gemma4Config,
+    target_weights: &gemma4::gemma4::Gemma4Weights,
+    gpu: &mut Gpu,
+) -> Result<Gemma4EagleState, String> {
+    let dhfq =
+        HfqFile::open(Path::new(drafter_path)).map_err(|e| format!("open gemma4 drafter: {e}"))?;
+    if dhfq.arch_id != 22 {
+        return Err(format!(
+            "gemma4 EAGLE drafter must be arch_id=22 (gemma4_unified_assistant); \
+             got arch_id={} — a DFlash draft goes in params.draft on qwen3.5 \
+             targets, not params.drafter",
+            dhfq.arch_id
+        ));
+    }
+    let dcfg = gemma4::drafter::Gemma4DrafterConfig::from_hfq(&dhfq)?;
+    if dcfg.backbone_hidden != target_cfg.dim {
+        return Err(format!(
+            "drafter backbone_hidden ({}) != target hidden ({}) — this drafter \
+             was trained against a different target width",
+            dcfg.backbone_hidden, target_cfg.dim
+        ));
+    }
+    let drafter_weights = gemma4::drafter::Gemma4DrafterWeights::load(&dhfq, &dcfg, gpu)?;
+    let drafter_scratch = gemma4::drafter::Gemma4DrafterScratch::new(gpu, &dcfg)?;
+    let spec_scratch = gemma4::speculative::Gemma4SpecScratch::new(gpu, target_cfg, draft_len)?;
+
+    // ── Prime the batched verify path: b=1 then the real block size, each on a
+    // disposable throwaway state. ──
+    let warm_b = draft_len + 1;
+    {
+        let mut warm = gemma4::gemma4::Gemma4State::new_with_max_seq(gpu, target_cfg, warm_b + 4)
+            .map_err(|e| format!("gemma4-eagle: warm state: {e}"))?;
+        let _ = gemma4::forward::forward_batch(
+            target_cfg,
+            target_weights,
+            &mut warm,
+            gpu,
+            &[target_cfg.bos_token],
+            0,
+        );
+        let _ = gpu.hip.device_synchronize();
+        warm.free_gpu(gpu);
+    }
+    {
+        let mut warm = gemma4::gemma4::Gemma4State::new_with_max_seq(gpu, target_cfg, warm_b + 4)
+            .map_err(|e| format!("gemma4-eagle: warm state 2: {e}"))?;
+        let _ = gemma4::forward::forward_batch(
+            target_cfg,
+            target_weights,
+            &mut warm,
+            gpu,
+            &vec![target_cfg.bos_token; warm_b],
+            0,
+        );
+        let _ = gpu.hip.device_synchronize();
+        warm.free_gpu(gpu);
+    }
+
+    Ok(Gemma4EagleState {
+        drafter_config: dcfg,
+        drafter_weights,
+        drafter_scratch,
+        spec_scratch,
+        draft_len,
+    })
+}
+
+/// Load a Gemma 4 (arch_id=13) model: eager dense (default), eager dense +
+/// optional EAGLE drafter (when `ctx.gemma4_drafter` is set), or the lowered
+/// path (MoE 26B-A4B / opt-in batched/WMMA dense prefill).
+pub(crate) fn load_gemma4(
+    mut hfq: HfqFile,
+    tokenizer: hipfire_runtime::tokenizer::Tokenizer,
+    ctx: &mut LoadCtx,
+) -> Result<LoadedModel, String> {
+    let path = ctx.path;
+    let max_seq = ctx.max_seq;
+    if ctx.draft_path.is_some() {
+        return Err("params.draft (qwen3.5 DFlash) is not supported on \
+                    arch_id=13 (Gemma 4). For Gemma 4 spec-decode pass the \
+                    arch-22 EAGLE drafter via params.drafter instead."
+            .to_string());
+    }
+    if ctx.cask.sidecar.is_some() {
+        return Err("CASK eviction not supported on arch_id=13 (Gemma 4). \
+                    Reload without --cask-sidecar."
+            .to_string());
+    }
+    if ctx.pp > 1 {
+        return Err("pipeline-parallel (pp>1) not supported on arch_id=13 (Gemma 4).".to_string());
+    }
+
+    // ── Lowered (Kevin-fork execute_steps) path selection ──────────────
+    let lowered_cfg = lowered::config_from_hfq(&hfq)
+        .ok_or_else(|| "gemma4: lowered config_from_hfq failed".to_string())?;
+    let want_batched = gemma4_batched_prefill_optin(ctx.gpu);
+    let use_lowered = lowered_cfg.enable_moe_block || (want_batched && ctx.gemma4_drafter.is_none());
+    if use_lowered {
+        let weights = lowered::load_weights(&mut hfq, &lowered_cfg, ctx.gpu)
+            .map_err(|e| format!("gemma4 (lowered) load_weights: {e:?}"))?;
+        let scratch = lowered::Gemma4Scratch::new(ctx.gpu, &lowered_cfg, 1)
+            .map_err(|e| format!("gemma4 (lowered) scratch: {e:?}"))?;
+        lowered::init_scratch_constants(ctx.gpu, &scratch, lowered_cfg.full_head_dim)
+            .map_err(|e| format!("gemma4 (lowered) init_scratch_constants: {e:?}"))?;
+        let kv_sliding = hipfire_runtime::llama::KvCache::new_gpu_q8_capped(
+            ctx.gpu,
+            lowered_cfg.n_layers,
+            lowered_cfg.sliding_n_kv_heads,
+            lowered_cfg.sliding_head_dim,
+            max_seq,
+            lowered_cfg.sliding_window,
+        )
+        .map_err(|e| format!("gemma4 (lowered) sliding KV alloc (q8 ring): {e:?}"))?;
+        let kv_full = hipfire_runtime::llama::KvCache::new_gpu_asym3(
+            ctx.gpu,
+            lowered_cfg.n_layers,
+            lowered_cfg.full_n_kv_heads,
+            lowered_cfg.full_head_dim,
+            max_seq,
+        )
+        .map_err(|e| format!("gemma4 (lowered) full KV alloc: {e:?}"))?;
+        let eos_tok = tokenizer
+            .special_token_id("<end_of_turn>")
+            .or_else(|| tokenizer.special_token_id("<turn|>"))
+            .unwrap_or(106);
+        let chat_template = resolve_chat_template(&hfq, path);
+        eprintln!(
+            "  gemma4 lowered path: moe={} batched_opt_in={} (sliding q8-ring + full asym3 KV)",
+            lowered_cfg.enable_moe_block, want_batched,
+        );
+        let arch_id = hfq.arch_id;
+        return Ok(LoadedModel {
+            gemma4_eos_tok: eos_tok,
+            gemma4_lowered: Some(Gemma4LoweredState {
+                config: lowered_cfg,
+                weights,
+                scratch,
+                kv_sliding,
+                kv_full,
+                eos_tok,
+            }),
+            ..LoadedModel::skeleton(arch_id, tokenizer, max_seq, max_seq, path.to_string(), chat_template)
+        });
+    }
+
+    let config = gemma4::config::Gemma4Config::from_hfq(&hfq)?;
+    let weights = gemma4::gemma4::Gemma4Weights::load(&hfq, &config, ctx.gpu)?;
+    let state = gemma4::gemma4::Gemma4State::new_with_max_seq(ctx.gpu, &config, max_seq)
+        .map_err(|e| format!("gemma4: Gemma4State::new_with_max_seq failed: {e}"))?;
+    // Optional EAGLE drafter (arch-22). File-missing / arch-mismatch is logged
+    // and the model serves AR-only.
+    let gemma4_eagle = if let Some(dp) = ctx.gemma4_drafter {
+        match load_gemma4_eagle_state(dp, ctx.gemma4_eagle_draft_len, &config, &weights, ctx.gpu) {
+            Ok(st) => {
+                eprintln!(
+                    "  gemma4 EAGLE drafter loaded: {} (layers={}, hidden={}, draft_len={})",
+                    dp, st.drafter_config.n_layers, st.drafter_config.hidden, st.draft_len,
+                );
+                Some(st)
+            }
+            Err(e) => {
+                eprintln!(
+                    "  gemma4 EAGLE drafter load failed ({}): {} — falling back to AR only",
+                    dp, e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let eos_tok: u32 = tokenizer
+        .special_token_id("<end_of_turn>")
+        .or_else(|| tokenizer.special_token_id("<turn|>"))
+        .unwrap_or(106);
+    let chat_template = resolve_chat_template(&hfq, path);
+    let arch_id = hfq.arch_id;
+    Ok(LoadedModel {
+        gemma4_config: Some(config),
+        gemma4_weights: Some(weights),
+        gemma4_state: Some(state),
+        gemma4_eos_tok: eos_tok,
+        gemma4_eagle,
+        ..LoadedModel::skeleton(arch_id, tokenizer, max_seq, max_seq, path.to_string(), chat_template)
     })
 }
 
@@ -1685,6 +1980,14 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
         df.draft_weights.free_gpu(gpu);
         df.draft_scratch.free_gpu(gpu);
     }
+    // Gemma 4 EAGLE drafter: weights + per-step scratch + spec scratch each
+    // expose explicit frees (the drafter lm_head aliases embed_tokens and is
+    // skipped inside free_gpu, mirroring the target's tied-embedding rule).
+    if let Some(ge) = m.gemma4_eagle {
+        ge.drafter_weights.free_gpu(gpu);
+        ge.drafter_scratch.free_gpu(gpu);
+        ge.spec_scratch.free(gpu);
+    }
     if let Some(ev) = m.eviction {
         ev.free_gpu(gpu);
     }
@@ -1741,6 +2044,22 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     }
     if let Some(pbs) = m.deepseek4_pbs {
         pbs.free_gpu(gpu);
+    }
+    // Gemma 4 (arch_id=13) eager path: both KV caches + per-decode scratch live
+    // in Gemma4State — one free_gpu call handles all of it; weights freed below.
+    if let Some(s) = m.gemma4_state {
+        s.free_gpu(gpu);
+    }
+    if let Some(w) = m.gemma4_weights {
+        w.free_gpu(gpu);
+    }
+    // Gemma 4 lowered path (arch-13 MoE / opt-in batched prefill): weights +
+    // scratch + the two separate KV caches each expose explicit frees.
+    if let Some(lw) = m.gemma4_lowered {
+        lw.kv_sliding.free_gpu(gpu);
+        lw.kv_full.free_gpu(gpu);
+        lw.scratch.free_gpu(gpu);
+        lw.weights.free_gpu(gpu);
     }
     if let Some(w) = m.vision_weights {
         w.free_gpu(gpu);

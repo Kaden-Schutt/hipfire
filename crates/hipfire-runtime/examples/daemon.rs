@@ -25,6 +25,8 @@ use base64::Engine;
 use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
+use hipfire_arch_gemma4 as gemma4;
+use hipfire_arch_gemma4::lowered;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_qwen2::qwen2;
@@ -900,6 +902,61 @@ struct GenerateVLParams<'a> {
     max_think_tokens: usize,
 }
 
+
+
+
+/// v1 draft length for gemma4 EAGLE (`params.spec`). dl=3 is the validated
+/// config: spec == eager byte-identical for dl ≤ 4 on both the Q8 and
+/// MQ4-attn targets, +61% over AR (80.5 vs 50.1 tok/s, hiptrx/gfx1201) at
+/// dl=3, while dl ≥ 5 trips a pre-existing non-deterministic batched-MQ4
+/// `forward_batch` fault on gfx12 — see
+/// `crates/hipfire-arch-gemma4/examples/infer_gemma4_spec.rs`.
+const GEMMA4_EAGLE_DRAFT_LEN: usize = 3;
+
+
+/// Gate for the `params.spec` knob: draft_len 1..=5 accepted; absent means
+/// the validated default (`GEMMA4_EAGLE_DRAFT_LEN` = 3). dl <= 4 was
+/// parity-validated at the original EAGLE wiring; dl = 5 is parity-validated
+/// on hiptrx/gfx1201 (spec == eager byte-identical, `infer_gemma4_spec
+/// --check-eager`, deterministic across reruns) after the batched-verify Q8
+/// projections moved to `gemm_q8_0_batched_chunked` — the dl >= 5 fault
+/// previously blamed on batched-MQ4 rode the scalar `gemm_q8_0_batched`
+/// path that fix bypasses and no longer reproduces. dl > 5 stays refused
+/// (unvalidated) — refuse-don't-degrade, mirroring the DFlash contracts.
+fn gemma4_eagle_spec_len(spec: Option<u64>) -> Result<usize, String> {
+    match spec {
+        None => Ok(GEMMA4_EAGLE_DRAFT_LEN),
+        Some(n) if (1..=5).contains(&n) => Ok(n as usize),
+        Some(n) => Err(format!(
+            "gemma4 EAGLE supports spec=1..=5 (draft_len; default 3, dl <= 5 \
+             parity-validated on gfx1201); got spec={n} — reload with a \
+             supported spec or drop params.drafter."
+        )),
+    }
+}
+
+/// Env opt-in for the gemma4 batched/WMMA prefill
+/// (`HIPFIRE_BATCHED_PREFILL=1` / `HIPFIRE_WMMA_PREFILL=1`).
+///
+/// History: this used to refuse outside gfx11-class because batched prefill
+/// produced deterministic special-token garbage from token 0 on gfx1201.
+/// Root causes (both fixed 2026-06-10, validated gfx1201):
+///   1. `lowered::run_prefill_gemm` fed MQ4G256 GEMMs raw activations —
+///      MagnumQuant weights need a pre-FWHT-rotated x (now rotated, all arches);
+///   2. `attention_flash_asym_reduce_batched` covered only 256 dims/head —
+///      every full-attention layer's hd=512 output had its top half unwritten
+///      (kernel chunk-loop fix; was a silent-zero on every arch).
+/// WMMA on RDNA4 additionally needed the `gemm_hfq4g256_wmma_gfx12` sibling
+/// (half8 / _w32_gfx12 / rows-contiguous C). With those landed there is no
+/// arch refusal — `run_prefill_gemm` still hard-errors loudly if a WMMA
+/// kernel is missing for some dtype × arch.
+fn gemma4_batched_prefill_optin(_gpu: &rdna_compute::Gpu) -> bool {
+    lowered::batched_prefill_enabled() || lowered::wmma_prefill_enabled()
+}
+
+
+
+
 fn ckpt_resume_enabled() -> bool {
     std::env::var("HIPFIRE_CACHE_CKPT_RESUME").ok().as_deref() != Some("0")
 }
@@ -1246,6 +1303,38 @@ fn main() {
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
 
+                // Gemma 4 EAGLE drafter (arch-22 `gemma4_unified_assistant`).
+                // Deliberately a SEPARATE param from `params.draft` (the
+                // qwen3.5 DFlash knob) so a DFlash .hfq can never be routed
+                // into the EAGLE loader by accident. `params.spec` = draft
+                // length; 1..=5 accepted (see gemma4_eagle_spec_len).
+                let gemma4_drafter = msg
+                    .get("params")
+                    .and_then(|p| p.get("drafter"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+                let gemma4_draft_len = if gemma4_drafter.is_some() {
+                    let spec_raw = msg
+                        .get("params")
+                        .and_then(|p| p.get("spec"))
+                        .and_then(|v| v.as_u64());
+                    match gemma4_eagle_spec_len(spec_raw) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            let _ = writeln!(
+                                stdout,
+                                r#"{{"type":"error","message":"{}"}}"#,
+                                e.replace('"', "'")
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    }
+                } else {
+                    GEMMA4_EAGLE_DRAFT_LEN
+                };
+
                 // MTP speculative decode config. `mtp_mode` gates weight
                 // discovery at load time (off=skip, on=error-if-missing,
                 // auto=scan+log). `mtp_k` sets the draft window size.
@@ -1476,7 +1565,23 @@ fn main() {
                     let _ = stdout.flush();
                     continue;
                 }
+                if tp > 1 && gemma4_drafter.is_some() {
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"error","message":"EP serving (tp>1) does not support the gemma4 EAGLE drafter; reload without params.drafter."}}"#
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
                 if pp > 1 {
+                    if gemma4_drafter.is_some() {
+                        let _ = writeln!(
+                            stdout,
+                            r#"{{"type":"error","message":"gemma4 EAGLE spec-decode requires pp=1 (arch_id=13 has no pipeline-parallel path); reload without params.drafter."}}"#
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
                     if draft_path.is_some()
                         && std::env::var("HIPFIRE_PP_DFLASH").ok().as_deref() != Some("1")
                     {
@@ -1521,6 +1626,8 @@ fn main() {
                         path,
                         max_seq,
                         draft_path.as_deref(),
+                        gemma4_drafter.as_deref(),
+                        gemma4_draft_len,
                         kv_mode_override.as_deref(),
                         kv_adaptive_override.as_deref(),
                         state_quant_override.as_deref(),
@@ -1564,6 +1671,7 @@ fn main() {
                             10 => "minimax_m2",
                             11 => "lfm2moe",
                             12 => "north_mini_code",
+                            13 => "gemma4",
                             _ => "qwen3",
                         };
                         let vl = m.vision_config.is_some() || m.dots_ocr_config.is_some();
@@ -1585,7 +1693,11 @@ fn main() {
                                 b.config.vocab_size,
                             ),
                             _ => {
-                                if let Some(ref c) = m.dots_ocr_config {
+                                if let Some(ref c) = m.gemma4_config {
+                                    (c.dim, c.n_layers, c.vocab_size)
+                                } else if let Some(ref s) = m.gemma4_lowered {
+                                    (s.config.dim, s.config.n_layers, s.config.vocab_size)
+                                } else if let Some(ref c) = m.dots_ocr_config {
                                     (
                                         c.text.hidden_size,
                                         c.text.num_hidden_layers,
@@ -1653,6 +1765,14 @@ fn main() {
                         // exact failure that left the prompt cache dead when the
                         // installed CLI predated the allowlist. Source of truth
                         // lives here, next to the cache implementation.
+                        // arch_id 13 (gemma4) is intentionally absent: generate_gemma4 has
+                        // no LCP prefix-reuse logic (no lcp/conversation_tokens skip before
+                        // prefill). Adding 13 here would cause the CLI to skip the per-turn
+                        // reset and send only the last user message as prompt, but the
+                        // generate path re-renders the full conversation and prefills from
+                        // state.n_tokens (non-zero after turn 1) → wrong KV slot offsets.
+                        // Wire when generate_gemma4 gains an LCP block matching
+                        // generate_minimax's prefix-cache pattern (lines ~13875-13928).
                         let cache_capable = matches!(m.arch_id, 5 | 6 | 9 | 10 | 12);
                         let _ = writeln!(
                             stdout,
@@ -1952,10 +2072,14 @@ fn main() {
                     // models that fall into block-level attractors at lower
                     // temperatures — use the card-recommended temp=1.0/top_p=1.0.
                     (1.0_f64, 1.0_f64)
-                } else if m.arch_id == 12 {
-                    // Cohere2-MoE / North-Mini-Code: Cohere-style agentic
+                } else if m.arch_id == 12 || m.arch_id == 13 {
+                    // Cohere2-MoE / North-Mini-Code (12): Cohere-style agentic
                     // markers are sampled best with the model-card nucleus
                     // defaults.
+                    // Gemma 4 (13): Gemma family model cards recommend
+                    // temperature=1.0, top_p=0.95, top_k=64. The daemon
+                    // sampler is temp + top_p (the sample path's top-K is a
+                    // fixed candidate gather), so apply temp=1.0 + top_p=0.95.
                     (1.0_f64, 0.95_f64)
                 } else {
                     (0.3_f64, 0.8_f64)
@@ -2384,6 +2508,14 @@ fn main() {
                     if let Some(b) = m.minimax_mut() {
                         b.state.reset();
                     }
+                    // arch_id=13 (Gemma 4): clear the KV cursor between turns.
+                    // reset() is cursor-only; the captured decode hipGraph stays
+                    // valid across resets (position is re-staged via pos_host on
+                    // every replay and attention geometry is sized for max_seq —
+                    // see decode_step_with_graph's capture-safety invariants).
+                    if let Some(ref mut s) = m.gemma4_state {
+                        s.reset();
+                    }
                     // Restore adaptive-KV controller to start tier (q8/fwht4)
                     // so thresholds fire correctly on the fresh conversation
                     // instead of staying pinned at the floor tier.
@@ -2442,6 +2574,7 @@ fn main() {
                         10 => "minimax_m2",
                         11 => "lfm2moe",
                         12 => "north_mini_code",
+                        13 => "gemma4",
                         _ => "qwen3",
                     })
                     .unwrap_or("none");
@@ -2695,6 +2828,38 @@ fn main() {
                         }
                     }
                     ok
+                } else if m.arch_id == 13 {
+                    if let Some(state) = m.gemma4_state.as_mut() {
+                        // Eager path (dense + optional EAGLE): per-token
+                        // decode_step over the synthetic prompt. Saturates the
+                        // hybrid sliding/full attention + sandwich-norm + GeGLU
+                        // + softcap kernel set before any user-facing generate.
+                        // This IS the production prefill shape (per-token; the
+                        // hipGraph path only covers the decode loop).
+                        let config = m.gemma4_config.as_ref().unwrap();
+                        let weights = m.gemma4_weights.as_ref().unwrap();
+                        let mut ok = true;
+                        for (i, &tok) in synthetic.iter().enumerate() {
+                            if gemma4::forward::decode_step(
+                                config, weights, state, &mut gpu, tok, i as u32,
+                            )
+                            .is_err()
+                            {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        ok
+                    } else {
+                        // Lowered path (arch-13 MoE / opt-in batched prefill):
+                        // warm-pass SKIPPED. The lowered KV caches are keyed by
+                        // absolute position and overwritten from 0 each turn, so
+                        // a synthetic warm write to slots 0-127 would alias the
+                        // first real generate's KV. The lowered MoE branch's
+                        // batched scratch is instead primed at load (see the
+                        // arch-13 lowered load arm). Skip cleanly.
+                        true
+                    }
                 } else {
                     let ModelState::Llama(b) = m.state.as_mut().unwrap() else {
                         unreachable!()
@@ -2735,6 +2900,12 @@ fn main() {
                 // reset its cursor (no gpu) for a cold prefill on the next request.
                 if let Some(b) = m.minimax_mut() {
                     b.state.reset();
+                }
+                // Gemma 4 (arch_id=13): both KV caches + scratch share
+                // Gemma4State; reset its cursor (no gpu) for a cold prefill
+                // on the next request.
+                if let Some(ref mut s) = m.gemma4_state {
+                    s.reset();
                 }
 
                 if run_ok {
@@ -2793,6 +2964,19 @@ fn main() {
         }
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 /// Expert-parallel streaming generate (task #26, ds4 first). Greedy AR via
 /// `forward_ep` across the EP ranks; logits gathered on rank 0 and sampled on
@@ -3642,6 +3826,8 @@ fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str,
     }
     ep_emit_done(stdout, id, generated, prompt_n, prefill_ms, t_decode.elapsed().as_secs_f64() * 1000.0);
 }
+
+
 
 
 /// Outcome of the LCP prompt-cache decision (see [`plan_prompt_cache`]).
@@ -6225,6 +6411,41 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         );
         let _ = (repeat_penalty, repeat_window);
         generate_cohere2moe(
+            m,
+            gpu,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            temp,
+            top_p,
+            max_tokens,
+            max_think_tokens,
+            tools,
+            messages_history,
+        );
+        return;
+    }
+    if m.arch_id == 13 {
+        // arch_id=13 (Gemma 4 dense). Same shape as the lfm2moe
+        // short-circuit above. PFlash / DFlash / VL / multi-GPU /
+        // sampler-budget scaffolding all bypass (refused at load). EAGLE
+        // spec-decode (arch-22 drafter) is dispatched INSIDE
+        // generate_gemma4: greedy requests route through
+        // spec_step_gemma4_eagle when a drafter is loaded; temp > 0 falls
+        // back to the AR sampling loop. We honour `system_prompt`, `temp`,
+        // `top_p`, and (via JinjaChatFrame) `messages_history` + `tools`
+        // rendering; thinking mode is out of scope for v1.
+        let _ = (
+            budget_alert_at_tok,
+            budget_alert_text,
+            assistant_prefix,
+            pflash_state,
+            pflash_cfg,
+            think_mode,
+        );
+        let _ = (repeat_penalty, repeat_window);
+        generate_gemma4(
             m,
             gpu,
             stdout,
@@ -10094,6 +10315,458 @@ fn generate_lfm2moe(
     let _ = stdout.flush();
 }
 
+/// Gemma 4 dense (arch_id=13) generate path — minimal AR bring-up.
+///
+/// Mirrors `generate_lfm2moe`'s shape (per-token prefill loop, per-token
+/// decode loop, JSONL `token` / `done` events) with four gemma4-specifics:
+///
+///   1. Prompt build renders the arch-13 chat template (embedded or the
+///      bundled `templates/gemma-4-it.jinja`) through `JinjaChatFrame` with
+///      an EXPLICIT `bos_token: Some("<bos>")` — gemma4's tokenizer decodes
+///      bos_id to the LLaMA-cosmetic `<s>`, which re-tokenizes to a 3-token
+///      BPE fragment instead of the single id=2 the template expects (see
+///      the May-07 D4 wiring, c40c44eb). A BOS-prepend guard after encode
+///      covers the no-bos render/fallback paths without ever doubling it.
+///   2. v1 is NON-THINKING: `enable_thinking: false` makes the template
+///      pre-fill the empty thought channel
+///      (`<|turn>model\n<|channel>thought\n<channel|>`) so the model answers
+///      directly instead of improvising the channel scaffold. Thinking-mode
+///      streaming/parsing is a follow-up.
+///   3. Decode runs `gemma4::forward::decode_step_with_graph` (hipGraph
+///      capture/replay, default ON, `HIPFIRE_GEMMA4_GRAPH=0` opt-out);
+///      prefill stays on the eager `decode_step`.
+///   4. Stop set: gemma4's HF `eos_token_id` is the LIST `[1, 106]` —
+///      `<eos>` (config.eos_token) plus the end-of-turn marker (`<turn|>` /
+///      `<end_of_turn>`, resolved at load into `m.gemma4_eos_tok`). Stopping
+///      on the scalar alone loops the end-of-turn token forever.
+///
+/// Out of scope for v1 (and intentionally NOT wired): EAGLE/DFlash
+/// spec-decode, thinking mode, grammar, tool-call parsing/execution, repeat
+/// penalty, multi-GPU, eviction/prefix-cache. Correctness first.
+#[allow(clippy::too_many_arguments)]
+fn generate_gemma4(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) {
+    // Lowered (Kevin-fork) path: arch-13 MoE (26B-A4B) and the opt-in
+    // batched / WMMA dense prefill load populate `gemma4_lowered` instead of
+    // the eager `gemma4_state`. Delegate before the eager body (which assumes
+    // `gemma4_config` / `gemma4_state` are populated).
+    if m.gemma4_lowered.is_some() {
+        generate_gemma4_lowered(
+            m, gpu, stdout, id, prompt, system_prompt, temp, top_p, max_tokens,
+            max_think_tokens, tools, messages_history,
+        );
+        return;
+    }
+
+    // v1 is non-thinking (see doc comment item 2); the think budget only
+    // gates thinking-capable paths.
+    let _ = max_think_tokens;
+
+    if m.tokenizer.is_none() {
+        emit_error_with_id(stdout, id, "tokenizer not loaded".to_string());
+        return;
+    }
+    if m.gemma4_config.is_none() {
+        emit_error_with_id(
+            stdout,
+            id,
+            "gemma4_config missing on arch_id=13 generate".to_string(),
+        );
+        return;
+    }
+    let bos_tok = m.gemma4_config.as_ref().unwrap().bos_token;
+    let cfg_eos_tok = m.gemma4_config.as_ref().unwrap().eos_token;
+
+    // ── Prompt build (same two-path branch as the lfm2moe AR path) ──
+    let prompt_ids: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        // Jinja default-ON (flipped 2026-06-09): render through the model's
+        // chat template; opt out with HIPFIRE_JINJA_CHAT=0. Arch 13 always
+        // resolves a template (embedded or bundled), so the fallback below is
+        // render-failure / opt-out only.
+        let jinja_enabled =
+            std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        let mut ids: Vec<u32> = if try_jinja {
+            let template = m.chat_template.as_ref().unwrap();
+            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: system_prompt,
+                user: prompt,
+                enable_thinking: false,
+                bos_token: Some("<bos>"),
+            };
+            let render_result = if tools.is_some() || messages_history.is_some() {
+                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+                let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
+                    match messages_history {
+                        Some(h) => h,
+                        None => {
+                            let mut v = Vec::new();
+                            if let Some(sys) = system_prompt {
+                                v.push(hipfire_runtime::prompt_frame::Message {
+                                    role: hipfire_runtime::prompt_frame::Role::System,
+                                    content: sys.to_string(),
+                                    tool_calls: Vec::new(),
+                                    tool_call_id: None,
+                                    tool_plan: String::new(),
+                                });
+                            }
+                            v.push(hipfire_runtime::prompt_frame::Message {
+                                role: hipfire_runtime::prompt_frame::Role::User,
+                                content: prompt.to_string(),
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                                tool_plan: String::new(),
+                            });
+                            synthesized = v;
+                            &synthesized
+                        }
+                    };
+                frame.render_messages(messages_slice, tools, None)
+            } else {
+                frame.render()
+            };
+            match render_result {
+                Ok(rendered) => tokenizer.encode(&rendered),
+                Err(e) => {
+                    eprintln!(
+                        "[daemon] jinja render failed in gemma4 path ({e}) — \
+                         falling back to BOS + raw prompt"
+                    );
+                    // Raw fallback (NOT Plain ChatML — gemma4 never trained
+                    // on <|im_start|> framing): BOS + raw user prompt, same
+                    // shape as the infer_gemma4 example. Degraded (no
+                    // instruct framing) but coherent.
+                    tokenizer.encode(prompt)
+                }
+            }
+        } else {
+            tokenizer.encode(prompt)
+        };
+        // BOS guard: the jinja render emits `{{ bos_token }}` itself ("<bos>"
+        // → single id 2 via special-token segmentation); the raw fallback
+        // doesn't. Prepend only when absent so it is never doubled.
+        if ids.first() != Some(&bos_tok) {
+            ids.insert(0, bos_tok);
+        }
+        ids
+    };
+
+    if prompt_ids.is_empty() {
+        emit_error_with_id(stdout, id, "empty prompt after tokenize".to_string());
+        return;
+    }
+
+    // Stop set (see doc comment item 4). `m.gemma4_eos_tok` already resolved
+    // `<end_of_turn>` / `<turn|>` / 106 at load; union with config.eos_token
+    // (`<eos>`, id 1) and the documented 106 for robustness across exports.
+    let stop_set: Vec<u32> = {
+        let mut s = vec![cfg_eos_tok, m.gemma4_eos_tok];
+        if !s.contains(&106) {
+            s.push(106);
+        }
+        s.dedup();
+        s
+    };
+
+    // Capacity guard. No eviction on arch_id=13 — reset the KV cursors when
+    // the requested run would overflow the physical cache.
+    let overflow = {
+        let state = m.gemma4_state.as_ref().unwrap();
+        state.n_tokens + prompt_ids.len() + max_tokens > state.max_seq
+    };
+    if overflow {
+        let (n, cap) = {
+            let state = m.gemma4_state.as_ref().unwrap();
+            (state.n_tokens, state.max_seq)
+        };
+        eprintln!("[daemon] arch_id=13 context full ({n}/{cap}) — resetting Gemma4State");
+        m.gemma4_state.as_mut().unwrap().reset();
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+    }
+    // Hard refusal: even from a cold cache the prompt alone must fit (KV
+    // writes at pos >= max_seq would be out of bounds).
+    let cache_cap = m.gemma4_state.as_ref().unwrap().max_seq;
+    if prompt_ids.len() >= cache_cap {
+        emit_error_with_id(
+            stdout,
+            id,
+            format!(
+                "gemma4 prompt is {} tokens but max_seq is {cache_cap}",
+                prompt_ids.len()
+            ),
+        );
+        return;
+    }
+
+    let t0 = Instant::now();
+
+    // ── Prefill: eager decode_step per prompt token. The LAST decode_step's
+    // logits are the predictions for the first generated token. ──
+    let mut last_logits: Vec<f32> = Vec::new();
+    {
+        let cfg = m.gemma4_config.as_ref().unwrap();
+        let weights = m.gemma4_weights.as_ref().unwrap();
+        let state = m.gemma4_state.as_mut().unwrap();
+        let mut position = state.n_tokens as u32;
+        for &tok in &prompt_ids {
+            match gemma4::forward::decode_step(cfg, weights, state, gpu, tok, position) {
+                Ok(logits) => last_logits = logits,
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("gemma4 prefill failed: {e:?}"));
+                    return;
+                }
+            }
+            position += 1;
+        }
+    }
+    for &tok in &prompt_ids {
+        m.conversation_tokens.push(tok);
+    }
+    let prefill_ms = t0.elapsed().as_millis();
+
+    // ── EAGLE spec-decode fast path (arch-22 drafter loaded; greedy only) ──
+    //
+    // Mirrors the DFlash dispatch contract: the accept rule is greedy-argmax,
+    // so the committed stream is PROVABLY the target's greedy AR sequence —
+    // the same tokens the AR loop below would emit at temp 0. That invariant
+    // is the gate `infer_gemma4_spec --check-eager` validates byte-for-byte
+    // (spec == eager on hiptrx/gfx1201, Q8 and MQ4-attn targets, dl ≤ 4).
+    // temp > 0 falls through to the AR sampling loop, exactly like DFlash.
+    // Opt out with HIPFIRE_GEMMA4_EAGLE=0.
+    let eagle_active = m.gemma4_eagle.is_some()
+        && temp <= 1e-6
+        && std::env::var("HIPFIRE_GEMMA4_EAGLE").ok().as_deref() != Some("0");
+    if eagle_active {
+        let draft_len = m.gemma4_eagle.as_ref().unwrap().draft_len;
+        // Seed hidden = post-`model.norm` hidden of the last prompt position
+        // (left in `state.tmp` by the final prefill `decode_step` — the
+        // lm_head input). The seed TOKEN is the last prompt token; its KV is
+        // re-written (identically) at the top of the first verify. The first
+        // generated token comes out of round 1's verify (argmax_per_pos[0]),
+        // exactly as the AR loop's first sample from `last_logits` would —
+        // so `last_logits` is intentionally unused on this path.
+        {
+            let state = m.gemma4_state.as_ref().unwrap();
+            let eagle = m.gemma4_eagle.as_ref().unwrap();
+            if let Err(e) = eagle.spec_scratch.set_seed_hidden_from(gpu, &state.tmp) {
+                emit_error_with_id(stdout, id, format!("gemma4 eagle seed hidden: {e}"));
+                return;
+            }
+        }
+        let prefill_end = m.gemma4_state.as_ref().unwrap().n_tokens;
+        let mut seed_token = *prompt_ids.last().unwrap();
+        let mut generated_count = 0usize;
+        let mut rounds = 0usize;
+        let mut total_accepted = 0usize;
+        let mut stop = false;
+        let decode_t0 = Instant::now();
+        while !stop && generated_count < max_tokens {
+            let committed_len = m.gemma4_state.as_ref().unwrap().n_tokens;
+            // KV/seq bound: the verify block occupies [L-1, L-1+draft_len+1).
+            if committed_len + draft_len + 1 >= cache_cap {
+                break;
+            }
+            let spec = {
+                let cfg = m.gemma4_config.as_ref().unwrap();
+                let weights = m.gemma4_weights.as_ref().unwrap();
+                let state = m.gemma4_state.as_mut().unwrap();
+                let eagle = m.gemma4_eagle.as_mut().unwrap();
+                gemma4::speculative::spec_step_gemma4_eagle(
+                    gpu,
+                    weights,
+                    cfg,
+                    state,
+                    &eagle.drafter_weights,
+                    &eagle.drafter_config,
+                    &mut eagle.drafter_scratch,
+                    &mut eagle.spec_scratch,
+                    seed_token,
+                    committed_len,
+                    draft_len,
+                    0.0,
+                )
+            };
+            let spec = match spec {
+                Ok(s) => s,
+                Err(e) => {
+                    emit_error_with_id(
+                        stdout,
+                        id,
+                        format!("gemma4 eagle spec step failed: {e}"),
+                    );
+                    return;
+                }
+            };
+            rounds += 1;
+            total_accepted += spec.accept_len;
+            // Emit the committed tokens (accepted drafts ++ bonus); stop at
+            // EOS / max_tokens — identical to what the AR loop would commit.
+            for &t in &spec.committed {
+                if stop_set.contains(&t) {
+                    stop = true;
+                    break;
+                }
+                let frag = {
+                    let tokenizer = m.tokenizer.as_ref().unwrap();
+                    tokenizer.decode(&[t])
+                };
+                let envelope = serde_json::json!({
+                    "type": "token",
+                    "id": id,
+                    "text": frag,
+                });
+                let _ = writeln!(stdout, "{}", envelope);
+                let _ = stdout.flush();
+                m.conversation_tokens.push(t);
+                generated_count += 1;
+                if generated_count >= max_tokens {
+                    stop = true;
+                    break;
+                }
+            }
+            // Next round's seed = this round's bonus; its hidden is already
+            // staged in spec_scratch.seed_hidden by spec_step.
+            seed_token = spec.next_seed_token;
+        }
+
+        // ── Cursor settle. `spec_step` leaves n_tokens = L+accept_len+1 with
+        // the final bonus's KV slot unwritten, and an EOS mid-block leaves
+        // committed-but-not-emitted tokens counted. Re-anchor the cursor to
+        // the EMITTED extent and re-forward the last emitted token at its
+        // slot so every position < n_tokens carries valid KV — the same
+        // invariant the AR loop leaves behind. (KV writes are absolute-
+        // position keyed and deterministic, so the re-write is identical to
+        // a fresh forward — the same property the verify itself relies on
+        // when it re-writes the seed's KV each round.) ──
+        if generated_count > 0 {
+            let last_tok = *m.conversation_tokens.last().unwrap();
+            let cfg = m.gemma4_config.as_ref().unwrap();
+            let weights = m.gemma4_weights.as_ref().unwrap();
+            let state = m.gemma4_state.as_mut().unwrap();
+            let last_pos = (prefill_end + generated_count - 1) as u32;
+            if let Err(e) =
+                gemma4::forward::decode_step(cfg, weights, state, gpu, last_tok, last_pos)
+            {
+                // Non-fatal: the emitted stream is already correct; only the
+                // (reset-between-turns) cursor bookkeeping is affected.
+                eprintln!("[daemon] gemma4 eagle cursor settle failed: {e:?}");
+                state.n_tokens = prefill_end + generated_count;
+            }
+        } else {
+            m.gemma4_state.as_mut().unwrap().n_tokens = prefill_end;
+        }
+        m.seq_pos = m.gemma4_state.as_ref().unwrap().n_tokens;
+
+        let decode_ms = decode_t0.elapsed().as_millis().max(1);
+        let total_ms = t0.elapsed().as_millis().max(1);
+        let tok_s = if generated_count > 0 {
+            (generated_count as f64 * 1000.0) / decode_ms as f64
+        } else {
+            0.0
+        };
+        // τ = mean tokens committed per round (accepted drafts + 1 bonus).
+        let tau = if rounds > 0 {
+            (total_accepted + rounds) as f64 / rounds as f64
+        } else {
+            0.0
+        };
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{},"spec":"gemma4_eagle","rounds":{},"tau":{:.3},"draft_len":{}}}"#,
+            id, generated_count, tok_s, prefill_ms, total_ms, rounds, tau, draft_len,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    // ── Decode loop. Sample host-side from the running logits vector. ──
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15);
+    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+
+    let mut generated_count: usize = 0;
+    let decode_t0 = Instant::now();
+    loop {
+        if generated_count >= max_tokens {
+            break;
+        }
+        let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+        if stop_set.contains(&next_tok) {
+            break;
+        }
+
+        let frag = {
+            let tokenizer = m.tokenizer.as_ref().unwrap();
+            tokenizer.decode(&[next_tok])
+        };
+        let envelope = serde_json::json!({
+            "type": "token",
+            "id": id,
+            "text": frag,
+        });
+        let _ = writeln!(stdout, "{}", envelope);
+        let _ = stdout.flush();
+        m.conversation_tokens.push(next_tok);
+        generated_count += 1;
+
+        // KV-capacity guard: the next forward writes KV at slot n_tokens;
+        // forwarding at pos >= max_seq would write out of bounds. Stop
+        // cleanly here — the just-emitted token is still valid.
+        if m.gemma4_state.as_ref().unwrap().n_tokens >= cache_cap {
+            break;
+        }
+
+        let step = {
+            let cfg = m.gemma4_config.as_ref().unwrap();
+            let weights = m.gemma4_weights.as_ref().unwrap();
+            let state = m.gemma4_state.as_mut().unwrap();
+            let position = state.n_tokens as u32;
+            gemma4::forward::decode_step_with_graph(cfg, weights, state, gpu, next_tok, position)
+        };
+        match step {
+            Ok(logits) => last_logits = logits,
+            Err(e) => {
+                emit_error_with_id(stdout, id, format!("gemma4 decode failed: {e:?}"));
+                return;
+            }
+        }
+    }
+
+    m.seq_pos = m.gemma4_state.as_ref().unwrap().n_tokens;
+
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let total_ms = t0.elapsed().as_millis().max(1);
+    let tok_s = if generated_count > 0 {
+        (generated_count as f64 * 1000.0) / decode_ms as f64
+    } else {
+        0.0
+    };
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
+        id, generated_count, tok_s, prefill_ms, total_ms,
+    );
+    let _ = stdout.flush();
+}
+
 /// MiniMax-M2 (arch_id=10) generate path — minimal AR bring-up.
 ///
 /// Mirrors `generate_lfm2moe`'s shape (prefill loop / chunked batched prefill,
@@ -10111,6 +10784,276 @@ fn generate_lfm2moe(
 /// MTP, grammar-constrained decoding, tool-call parsing/execution, repeat
 /// penalty, multi-GPU, eviction/prefix-cache. Correctness first.
 #[allow(clippy::too_many_arguments)]
+/// Kevin-fork lowered (execute_steps / batched-prefill) Gemma 4 generate path.
+///
+/// Used for arch-13 MoE (26B-A4B) and the opt-in `HIPFIRE_BATCHED_PREFILL` /
+/// `HIPFIRE_WMMA_PREFILL` dense prefill path. Reads its config / weights /
+/// scratch / KV from `m.gemma4_lowered`; the eager `gemma4_*` fields are None
+/// on this path. Dispatched from `generate_gemma4` when `m.gemma4_lowered` is
+/// populated. No EAGLE spec-decode here (the drafter forces the eager path at
+/// load); sampling is host-side off the downloaded logits.
+#[allow(clippy::too_many_arguments)]
+fn generate_gemma4_lowered(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) {
+    let _ = (max_think_tokens, tools, messages_history);
+
+    if m.tokenizer.is_none() {
+        emit_error_with_id(stdout, id, "tokenizer not loaded".to_string());
+        return;
+    }
+    if m.gemma4_lowered.is_none() {
+        emit_error_with_id(stdout, id, "gemma4_lowered missing".to_string());
+        return;
+    }
+
+    // ── Prompt build ──
+    // Apply the gemma4 chat-template framing (matches templates/gemma-4-it.jinja
+    // generation prompt) when the four turn/channel special tokens are present in
+    // the tokenizer; otherwise fall back to raw tokenization (cannot regress).
+    // Framing:
+    //   <bos><|turn>user\n{prompt}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>
+    // (optional `<|turn>system\n{system}<turn|>\n` before the user turn). The empty
+    // thought channel is pre-filled so the model emits the answer directly instead
+    // of improvising the `<|channel>thought…<channel|>` scaffold itself. `encode()`
+    // segments on the special tokens; BOS (2) is prepended manually (SPM-BPE doesn't).
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+    let framed_ok = ["<|turn>", "<turn|>", "<|channel>", "<channel|>"]
+        .iter()
+        .all(|t| tokenizer.special_token_id(t).is_some());
+    eprintln!("[gemma4 lowered chat] framed_ok={framed_ok}");
+    let prompt_ids: Vec<u32> = {
+        let mut ids = vec![2u32]; // BOS
+        if framed_ok {
+            let mut s = String::new();
+            if let Some(sys) = system_prompt {
+                if !sys.is_empty() {
+                    s.push_str(&format!("<|turn>system\n{sys}<turn|>\n"));
+                }
+            }
+            s.push_str(&format!(
+                "<|turn>user\n{prompt}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+            ));
+            ids.extend(tokenizer.encode(&s));
+        } else {
+            ids.extend(tokenizer.encode(prompt));
+        }
+        ids
+    };
+    if prompt_ids.is_empty() {
+        emit_error_with_id(stdout, id, "empty prompt after tokenize".to_string());
+        return;
+    }
+    eprintln!("[gemma4 lowered prompt] {} tokens: {:?}", prompt_ids.len(), &prompt_ids[..prompt_ids.len().min(30)]);
+
+    // Context-length guard. Both the sliding and full KV caches are sized at
+    // `max_seq`; writing at pos >= max_seq would OOB. Refuse too-long prompts.
+    let cache_cap = m.gemma4_lowered.as_ref().unwrap().kv_full.max_seq;
+    if prompt_ids.len() >= cache_cap {
+        emit_error_with_id(stdout, id, format!(
+            "gemma4 prompt is {} tokens but max_seq is {}",
+            prompt_ids.len(), cache_cap,
+        ));
+        return;
+    }
+
+    let eos_tok = m.gemma4_lowered.as_ref().unwrap().eos_tok;
+    // Stop-token set. `config.eos_token` comes from `eos_token_id` parsed as a
+    // scalar, but gemma4's HF config sets it to a LIST `[1, 106]`: `<turn|>`
+    // (106, end-of-turn) is the real conversational stop and was being dropped,
+    // so decode looped `<turn|>` forever. Include `<eos>` plus the end-of-turn
+    // token (looked up by content, with the documented gemma4 id 106 as fallback).
+    let stop_set: Vec<u32> = {
+        let tk = m.tokenizer.as_ref().unwrap();
+        let mut s = vec![eos_tok];
+        for name in ["<turn|>", "<end_of_turn>"] {
+            if let Some(tid) = tk.special_token_id(name) {
+                if !s.contains(&tid) { s.push(tid); }
+            }
+        }
+        if !s.contains(&106) { s.push(106); } // gemma4 <turn|> end-of-turn
+        s
+    };
+    let t0 = Instant::now();
+
+    // ── Prefill ──
+    // When HIPFIRE_WMMA_PREFILL=1 and prompt is long enough, use batched
+    // prefill (WMMA projections + per-token attention). Otherwise per-token.
+    {
+        let lw = m.gemma4_lowered.as_mut().unwrap();
+        let config = &lw.config;
+        let weights = &lw.weights;
+        let scratch = &lw.scratch;
+        let kv_sliding = &mut lw.kv_sliding;
+        let kv_full = &mut lw.kv_full;
+        // Batched prefill only for dense models (no MoE). MoE per-token
+        // expert loop in v2's apply_moe_branch_batched has a download_f32
+        // path that produces token attractors. Dense 12B is verified coherent.
+        let has_moe = weights.layers.iter().any(|lw| match lw {
+            lowered::LayerWeights::Sliding(l) => l.moe.is_some(),
+            lowered::LayerWeights::Full(l) => l.moe.is_some(),
+        });
+        // Chunking lets >128-token prompts use batched projections instead of the
+        // CPU-submission-bound per-token forward_scratch path. The scalar batched
+        // path is coherent at any length (verified on the 1279-token prompt). The
+        // WMMA path's F16 projections corrupt the KV cache over multi-chunk prefill
+        // → attractor (verified: scalar-chunked coherent, wmma-chunked not), so
+        // WMMA is restricted to single-chunk (≤max_prefill_batch); longer WMMA
+        // prompts fall back to per-token (coherent). Long-context speedup is via
+        // HIPFIRE_BATCHED_PREFILL=1 (scalar) until the F16 precision issue is fixed.
+        let wmma = lowered::wmma_prefill_enabled();
+        let single_chunk = prompt_ids.len() <= scratch.max_prefill_batch;
+        // Env opt-in (all WMMA-class arches incl. RDNA4 — see
+        // gemma4_batched_prefill_optin doc comment for the fixed root causes).
+        let use_batched = gemma4_batched_prefill_optin(gpu)
+            && prompt_ids.len() >= 4
+            && !has_moe
+            && (single_chunk || !wmma);
+        if use_batched {
+            let chunk = scratch.max_prefill_batch.max(1);
+            let mut off = 0usize;
+            while off < prompt_ids.len() {
+                let end = (off + chunk).min(prompt_ids.len());
+                if let Err(e) = lowered::forward_prefill_batch(
+                    gpu, weights, config, &prompt_ids[off..end], off,
+                    kv_sliding, kv_full, scratch,
+                ) {
+                    emit_error_with_id(stdout, id,
+                        format!("gemma4 batched prefill failed at chunk [{off}..{end}]: {e:?}"));
+                    return;
+                }
+                off = end;
+            }
+        } else {
+            for (i, &tok) in prompt_ids.iter().enumerate() {
+                if let Err(e) = lowered::forward_scratch(
+                    gpu, weights, config, tok, i, kv_sliding, kv_full, scratch,
+                ) {
+                    emit_error_with_id(stdout, id, format!("gemma4 prefill failed at token {i}: {e:?}"));
+                    return;
+                }
+            }
+        }
+    }
+    for &tok in &prompt_ids {
+        m.conversation_tokens.push(tok);
+    }
+    m.seq_pos = prompt_ids.len();
+
+    // ── Decode loop ──
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15);
+    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+    let mut generated_count: usize = 0;
+    let decode_t0 = Instant::now();
+
+    loop {
+        if generated_count >= max_tokens {
+            break;
+        }
+
+        // Download logits and sample
+        let next_tok = {
+            let scratch = &m.gemma4_lowered.as_ref().unwrap().scratch;
+            let logits = match gpu.download_f32(&scratch.logits) {
+                Ok(l) => l,
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("logit download failed: {e:?}"));
+                    return;
+                }
+            };
+            deepseek4::sampling::sample_token(&logits, temp, 0, top_p, &mut rng)
+        };
+
+        if stop_set.contains(&next_tok) {
+            break;
+        }
+
+        // Emit token
+        let frag = {
+            let tokenizer = m.tokenizer.as_ref().unwrap();
+            tokenizer.decode(&[next_tok])
+        };
+        let envelope = serde_json::json!({
+            "type": "token",
+            "id": id,
+            "text": frag,
+            "tok": next_tok,
+        });
+        let _ = writeln!(stdout, "{}", envelope);
+        let _ = stdout.flush();
+
+        generated_count += 1;
+
+        // KV-cache capacity guard: the next forward writes KV at slot=`m.seq_pos`;
+        // forwarding at `pos >= max_seq` would write out of bounds. Stop cleanly
+        // here — the just-emitted token is still valid.
+        if m.seq_pos >= cache_cap {
+            break;
+        }
+
+        // Forward step for next token
+        {
+            let lw = m.gemma4_lowered.as_mut().unwrap();
+            let config = &lw.config;
+            let weights = &lw.weights;
+            let scratch = &lw.scratch;
+            let kv_sliding = &mut lw.kv_sliding;
+            let kv_full = &mut lw.kv_full;
+            let pos = m.seq_pos;
+            if let Err(e) = lowered::forward_scratch(
+                gpu, weights, config, next_tok, pos, kv_sliding, kv_full, scratch,
+            ) {
+                emit_error_with_id(stdout, id, format!("gemma4 decode failed: {e:?}"));
+                return;
+            }
+        }
+        m.seq_pos += 1;
+        m.conversation_tokens.push(next_tok);
+    }
+
+    // Measure prefill + decode separately for perf reporting.
+    let prefill_ms = decode_t0.duration_since(t0).as_millis();
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let _total_ms = t0.elapsed().as_millis().max(1);
+    let prefill_tok_s = if prefill_ms > 0 {
+        prompt_ids.len() as f64 / (prefill_ms as f64 / 1000.0)
+    } else {
+        0.0
+    };
+    let decode_tok_s = if decode_ms > 0 {
+        generated_count as f64 / (decode_ms as f64 / 1000.0)
+    } else {
+        0.0
+    };
+    let elapsed = t0.elapsed().as_secs_f64();
+    let tok_s = if elapsed > 0.0 {
+        (prompt_ids.len() + generated_count) as f64 / elapsed
+    } else {
+        0.0
+    };
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
+        id, generated_count, tok_s,
+        prompt_ids.len(), prefill_ms, prefill_tok_s, decode_tok_s, prefill_ms
+    );
+    let _ = stdout.flush();
+}
+
 fn generate_minimax(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -12401,6 +13344,44 @@ fn generate_vl_dots_ocr(
         prefill_s * 1000.0
     );
     let _ = stdout.flush();
+}
+
+#[cfg(test)]
+mod gemma4_eagle_param_tests {
+    use super::{gemma4_eagle_spec_len, GEMMA4_EAGLE_DRAFT_LEN};
+
+    #[test]
+    fn absent_spec_defaults_to_dl3() {
+        assert_eq!(gemma4_eagle_spec_len(None).unwrap(), GEMMA4_EAGLE_DRAFT_LEN);
+        assert_eq!(GEMMA4_EAGLE_DRAFT_LEN, 3);
+    }
+
+    #[test]
+    fn spec_3_accepted() {
+        assert_eq!(gemma4_eagle_spec_len(Some(3)).unwrap(), 3);
+    }
+
+    #[test]
+    fn dl_1_through_5_accepted() {
+        // dl <= 4 parity-validated at the original wiring; dl = 5 validated
+        // post chunked-WMMA verify fix (spec == eager IDENTICAL on gfx1201).
+        for ok in [1u64, 2, 4, 5] {
+            assert_eq!(gemma4_eagle_spec_len(Some(ok)).unwrap(), ok as usize);
+        }
+    }
+
+    #[test]
+    fn out_of_range_refused() {
+        // 0 and > 5 are refused (refuse-don't-degrade): dl > 5 is
+        // unvalidated, and the refusal names the supported range.
+        for bad in [0u64, 6, 16] {
+            let err = gemma4_eagle_spec_len(Some(bad)).unwrap_err();
+            assert!(
+                err.contains("spec=1..=5"),
+                "refusal should name the supported range: {err}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

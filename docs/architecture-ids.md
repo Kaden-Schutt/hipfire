@@ -17,6 +17,8 @@ file ids it actually loads.
 | 10 | MiniMax-M2 | `hipfire-arch-minimax` | Mixtral-style MoE: GQA + per-layer QK-norm + partial rotate_half RoPE + sigmoid+bias 256-expert routing. |
 | 11 | LFM2.5 / LFM2.5-MoE | `hipfire-arch-lfm2moe` | hybrid short-conv + GQA-attn; dense SwiGLU + top-4 MoE (sigmoid+expert_bias); tied embeddings. |
 | 12 | Cohere2-MoE (North-Mini-Code) | `hipfire-arch-cohere2moe` | parallel block (single mean-centered Cohere2LayerNorm feeds attn+ffn); interleaved sliding(RoPE)/global(NoPE) GQA; sigmoid 128-expert MoE (`norm_topk_prob=false`, no bias, no shared); dense layer-0 (`first_k_dense_replace=1`); tied embeddings. |
+| 13 | Gemma 4 dense text | `hipfire-arch-gemma4` | `google/gemma-4-12B-it` dense. Hybrid 5:1 sliding(hd256)/full(hd512) attn, K=V sharing on full layers, sandwich RMSNorm + per-layer scalar, dual RoPE (θ10000 full-rotate sliding / θ1e6 partial-0.25 full), gelu_pytorch_tanh SwiGLU, √dim embed scale, tied LM head, final logit softcap 30. MoE/E-series/vision dropped. |
+| 22 | Gemma 4 EAGLE drafter | `hipfire-arch-gemma4` (drafter) | `google/gemma-4-12B-it-assistant` 422M speculative-decode draft head for the arch-13 target. FLAT `model.*` names (no `model.language_model.` prefix) + top-level `pre_projection`/`post_projection`. 5 decoder layers, hybrid 3:1 sliding(hd256)/full(hd512) attn, K=V on full layer, tied lm_head, per-layer scalar, backbone_hidden 3840, num_centroids 2048 (clustered head disabled). Quantized Q8 end-to-end (tiny draft model). Converter arm in `hipfire-quantize`; forward/loader pending. |
 | 0xFF | toy / template | `hipfire-arch-toy` | never shipped; daemon refuses to dispatch |
 
 ## Notes

@@ -42,13 +42,6 @@ __global__ void attention_flash_asym_reduce_batched(
 
     const float* my_partials = partials + ((long long)local_bid * n_heads + h) * max_tiles * stride;
 
-    // Per-thread assignment: dims-per-thread = head_dim/32 (4 for hd=128, 8 for
-    // hd=256), matching the tile kernel's d0 = tid*dpt layout exactly. Partials
-    // are dim-indexed, so reduce MUST use the identical split or it reads the
-    // wrong slots / writes past `out` (head_dim).
-    const int dpt = head_dim / 32;
-    const int d_base = tid * dpt;
-
     // Pass 1: global max
     float global_max = -1e30f;
     for (int tile = 0; tile < n_tiles; tile++) {
@@ -57,25 +50,39 @@ __global__ void attention_flash_asym_reduce_batched(
             global_max = fmaxf(global_max, p[0]);
     }
 
-    // Pass 2: accumulate 8 dims per thread
-    float global_sum = 0.0f;
-    float g[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
-
-    for (int tile = 0; tile < n_tiles; tile++) {
-        const float* p = my_partials + tile * stride;
-        float tile_max = p[0];
-        float tile_sum = p[1];
-        if (tile_sum <= 0.0f) continue;
-        float corr = expf(tile_max - global_max);
-        for (int i = 0; i < dpt; i++)
-            g[i] += p[2 + d_base + i] * corr;
-        global_sum += tile_sum * corr;
-    }
-
-    float inv_sum = (global_sum > 0.0f) ? (1.0f / global_sum) : 0.0f;
-
+    // Pass 2: accumulate 8 dims per thread, looping head_dim/256 chunks.
+    //
+    // head_dim coverage: 32 threads × 8 dims = 256 dims per chunk. Gemma 4
+    // full-attention layers use head_dim=512, so loop `n_chunks = head_dim/256`
+    // chunks (matching the asym3 hd512 tile's lo/hi-chunk layout). Without
+    // this loop, dims 256..511 were never written — the upper half of every
+    // head's attention output silently kept the buffer's previous contents.
+    // (Same bug class as the q8 single-token reduce fix that loops
+    // n_halves=head_dim/128.) global_sum is identical across chunks; compute
+    // it once during chunk 0.
+    const int n_chunks = (head_dim + 255) / 256;
     const int q_dim = n_heads * head_dim;
     float* my_out = out + local_bid * q_dim + h * head_dim;
-    for (int i = 0; i < dpt; i++)
-        my_out[d_base + i] = g[i] * inv_sum;
+    float global_sum = 0.0f;
+    for (int chunk = 0; chunk < n_chunks; chunk++) {
+        const int d_base = chunk * 256 + tid * 8;
+        float g[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+
+        for (int tile = 0; tile < n_tiles; tile++) {
+            const float* p = my_partials + tile * stride;
+            float tile_max = p[0];
+            float tile_sum = p[1];
+            if (tile_sum <= 0.0f) continue;
+            float corr = expf(tile_max - global_max);
+            #pragma unroll
+            for (int i = 0; i < 8; i++)
+                if (d_base + i < head_dim) g[i] += p[2 + d_base + i] * corr;
+            if (chunk == 0) global_sum += tile_sum * corr;
+        }
+
+        float inv_sum = (global_sum > 0.0f) ? (1.0f / global_sum) : 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++)
+            if (d_base + i < head_dim) my_out[d_base + i] = g[i] * inv_sum;
+    }
 }
