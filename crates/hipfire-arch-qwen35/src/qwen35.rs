@@ -16352,12 +16352,29 @@ fn dump_hidden_localize(
         Ok(v) => v,
         Err(_) => return,
     };
+    use std::io::Write;
+    let path = format!("{prefix}.{tag}");
+    // Activation-capture mode (HIPFIRE_DUMP_HIDDEN_ALL=1): dump EVERY row for a
+    // single target layer (HIPFIRE_DUMP_HIDDEN_LAYER) as raw [dim] f32 each — no
+    // per-row header — so one prefill yields n_rows real-activation samples for an
+    // offline rotation/quant study. Otherwise the original single-position localize.
+    if std::env::var("HIPFIRE_DUMP_HIDDEN_ALL").as_deref() == Ok("1") {
+        let want_layer: usize = std::env::var("HIPFIRE_DUMP_HIDDEN_LAYER")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        if layer_idx != want_layer {
+            return;
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let take = (n_rows * dim).min(all.len());
+            let bytes: Vec<u8> = all[..take].iter().flat_map(|v| v.to_le_bytes()).collect();
+            let _ = f.write_all(&bytes);
+        }
+        return;
+    }
     let off = row * dim;
     if off + dim > all.len() {
         return;
     }
-    use std::io::Write;
-    let path = format!("{prefix}.{tag}");
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -18783,6 +18800,14 @@ fn forward_prefill_chunk(
                     n,
                     kv_cache.compact_offset as i32,
                 )?;
+                // KV-compression study capture: post-RoPE FA Q/K/V for a target FA
+                // layer (HIPFIRE_DUMP_HIDDEN_ALL=1 + HIPFIRE_DUMP_HIDDEN_LAYER).
+                dump_hidden_localize(gpu, &pbs.fa_q_batch, n, start_pos,
+                    config.n_heads * config.head_dim, layer_idx, "faq");
+                dump_hidden_localize(gpu, &pbs.fa_k_batch, n, start_pos,
+                    config.n_kv_heads * config.head_dim, layer_idx, "fak");
+                dump_hidden_localize(gpu, &pbs.fa_v_batch, n, start_pos,
+                    config.n_kv_heads * config.head_dim, layer_idx, "fav");
                 if let Some(tape) = gdn_tape.as_ref() {
                     if delta_layer_idx < tape.fa_bridge_valid.len()
                         && tape.fa_bridge_valid[delta_layer_idx]
