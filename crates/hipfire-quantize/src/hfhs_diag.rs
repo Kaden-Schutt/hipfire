@@ -89,6 +89,93 @@ pub fn read_diagonals(path: &Path) -> std::io::Result<HashMap<String, Vec<f32>>>
     Ok(out)
 }
 
+/// Lazy full-`[K,K]` reader for the HFHS-v1 sidecar — the off-diagonal payload
+/// the LDLQ (GPTQ/OBS) error-feedback weight quant needs (the diagonal alone is
+/// only enough for AWQ). Builds a name→(offset,k,dtype) index over the mmap at
+/// open; `get_full(name)` materializes one tensor's `k*k` f32 matrix on demand
+/// (the whole file is ~GBs, so we never hold all of them at once). Expert-indexed
+/// records (`expert_idx > 0`) are indexed too but keyed by name only (last wins);
+/// LDLQ is dense-only so callers look up dense tensor names.
+pub struct HfhsFull {
+    _mmap: Mmap,
+    index: HashMap<String, (usize, usize, u32)>, // name → (payload_offset, k, dtype)
+}
+
+impl HfhsFull {
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        let file = File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        let inval = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
+        if mmap.len() < 24 || &mmap[0..4] != HFHS_MAGIC {
+            return Err(inval("not an HFHS-v1 file (bad magic)"));
+        }
+        if LittleEndian::read_u32(&mmap[4..8]) != 1 {
+            return Err(inval("unsupported HFHS version"));
+        }
+        let n_tensors = LittleEndian::read_u64(&mmap[8..16]) as usize;
+        let mut index = HashMap::with_capacity(n_tensors);
+        let mut pos = 24usize;
+        for _ in 0..n_tensors {
+            if pos + 4 > mmap.len() {
+                return Err(inval("truncated at name_len"));
+            }
+            let name_len = LittleEndian::read_u32(&mmap[pos..pos + 4]) as usize;
+            pos += 4;
+            if pos + name_len + 12 > mmap.len() {
+                return Err(inval("truncated at name/header"));
+            }
+            let name = String::from_utf8_lossy(&mmap[pos..pos + name_len]).to_string();
+            pos += name_len;
+            let expert_idx = LittleEndian::read_u32(&mmap[pos..pos + 4]);
+            pos += 4;
+            let k = LittleEndian::read_u32(&mmap[pos..pos + 4]) as usize;
+            pos += 4;
+            let dtype = LittleEndian::read_u32(&mmap[pos..pos + 4]);
+            pos += 4;
+            let esz = match dtype {
+                DTYPE_F32 => 4usize,
+                DTYPE_F64 => 8usize,
+                d => return Err(inval(&format!("unknown HFHS dtype {d}"))),
+            };
+            let payload_bytes = k * k * esz;
+            if pos + payload_bytes > mmap.len() {
+                return Err(inval("truncated payload"));
+            }
+            if expert_idx == 0 {
+                index.insert(name, (pos, k, dtype));
+            }
+            pos += payload_bytes;
+        }
+        Ok(Self { _mmap: mmap, index })
+    }
+
+    pub fn k_of(&self, name: &str) -> Option<usize> {
+        self.index.get(name).map(|&(_, k, _)| k)
+    }
+
+    /// Materialize the full row-major `k*k` Hessian (f32) for `name`, or `None`.
+    pub fn get_full(&self, name: &str) -> Option<Vec<f32>> {
+        let &(off, k, dtype) = self.index.get(name)?;
+        let mut h = vec![0.0f32; k * k];
+        let bytes = &self._mmap;
+        match dtype {
+            DTYPE_F32 => {
+                for (i, hv) in h.iter_mut().enumerate() {
+                    let o = off + i * 4;
+                    *hv = LittleEndian::read_f32(&bytes[o..o + 4]);
+                }
+            }
+            _ => {
+                for (i, hv) in h.iter_mut().enumerate() {
+                    let o = off + i * 8;
+                    *hv = LittleEndian::read_f64(&bytes[o..o + 8]) as f32;
+                }
+            }
+        }
+        Some(h)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

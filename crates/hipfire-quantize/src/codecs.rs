@@ -480,7 +480,7 @@ fn affine_clipsearch(group: &[f32], levels: f32) -> (f32, f32) {
 
 /// MSE-optimal symmetric clip of a signed-int scale. `qmax` = 2^(bits−1) − 1.
 /// Returns the scale for dequant `q·scale`. For the symmetric mqN+ codecs (MQ8).
-fn symmetric_clipsearch(group: &[f32], qmax: f32) -> f32 {
+pub(crate) fn symmetric_clipsearch(group: &[f32], qmax: f32) -> f32 {
     const CLIP_GRID: [f32; 9] = [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6];
     let amax = group.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
     let (mut best_scale, mut best_err) = (amax / qmax, f32::INFINITY);

@@ -77,6 +77,13 @@ use twox_hash::XxHash64;
 // derive per-channel `RMS_act` for the smoothing-quant scale.
 static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 
+// `--ldlq`: full-Hessian error-feedback (GPTQ/OBS) weight quant for oq4. When
+// set, the Oq4 arm reads the tensor's full [K,K] Hessian from this index and
+// runs `ldlq::oq4_ldlq_pack` instead of plain RTN `quantize_oq4g256`. Opened from
+// the `--hessian` path (HFHS-v1, which carries the full [K,K], not just the
+// diagonal AWQ reads). None unless `--ldlq` + `--hessian` are both given.
+static OQ4_LDLQ_HESSIAN: OnceLock<crate::hfhs_diag::HfhsFull> = OnceLock::new();
+
 // Phase A Stage A — AWQ (Activation-aware Weight Quantization, Lin et al
 // 2023). When AWQ_ALPHA is set (via --awq [<alpha>=0.55]), each linear-layer
 // weight gets per-input-channel pre-scaling applied BEFORE the standard
@@ -3101,12 +3108,68 @@ fn quantize_hfq_source_tensor(
             if k % 256 != 0 {
                 return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
             }
-            let q = if let (Some(alpha), Some(im)) =
+            let m_dim = shape[0] as usize;
+            // `--ldlq`: full-Hessian error-feedback weight quant takes precedence
+            // over AWQ. Uses the SAME packed oq4 layout (so the loader/runtime are
+            // unchanged), but compensates each column's int4 error against the
+            // off-diagonal Hessian instead of RTN. No AWQ sidecar in this path.
+            let ldlq_q = OQ4_LDLQ_HESSIAN.get().and_then(|idx| {
+                let key = name.strip_suffix(".weight").unwrap_or(name);
+                let hk = idx.k_of(key).or_else(|| idx.k_of(name))?;
+                if hk != k {
+                    eprintln!("  ldlq: skip {name} (Hessian K={hk} != weight K={k})");
+                    return None;
+                }
+                let mut h = idx.get_full(key).or_else(|| idx.get_full(name))?;
+                // Optional AWQ composition: when --awq is also active, smooth the
+                // activation outliers into the weights (W·diag(s)) AND rebase the
+                // Hessian into the smoothed input space H' = diag(1/s) H diag(1/s),
+                // so the OBS feedback minimizes the SMOOTHED output error. Runtime
+                // divides x/s via the awq_scale sidecar → (W·s)·(x/s) = W·x.
+                let awq_scales = if let (Some(alpha), Some(im)) =
+                    (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                {
+                    if alpha > 0.0 && awq_eligible(name) {
+                        Some(compute_awq_scales(im, alpha))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let wbuf: std::borrow::Cow<[f32]> = if let Some(s) = &awq_scales {
+                    let mut scaled = f32_data.clone();
+                    awq_pre_scale_weights(&mut scaled, m_dim, k, s);
+                    for i in 0..k {
+                        let si = s[i] as f64;
+                        for j in 0..k {
+                            h[i * k + j] = (h[i * k + j] as f64 / (si * s[j] as f64)) as f32;
+                        }
+                    }
+                    std::borrow::Cow::Owned(scaled)
+                } else {
+                    std::borrow::Cow::Borrowed(&f32_data[..])
+                };
+                let diag_sum: f64 = (0..k).map(|i| h[i * k + i] as f64).sum();
+                let damp = 0.01 * (diag_sum / k as f64).max(1e-12);
+                let out = ldlq::oq4_ldlq_pack(&wbuf, m_dim, k, &h, &signs1, &signs2, damp);
+                if let Some(_) = &out {
+                    if let Some(s) = awq_scales {
+                        OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(s));
+                        eprintln!("  ldlq+awq: {name} [{m_dim}x{k}] OBS int4 + smooth");
+                    } else {
+                        eprintln!("  ldlq: {name} [{m_dim}x{k}] OBS error-feedback int4");
+                    }
+                }
+                out
+            });
+            let q = if let Some(q) = ldlq_q {
+                q
+            } else if let (Some(alpha), Some(im)) =
                 (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
             {
                 if alpha > 0.0 && awq_eligible(name) {
                     let scales = compute_awq_scales(im, alpha);
-                    let m_dim = shape[0] as usize;
                     let mut scaled = f32_data.clone();
                     awq_pre_scale_weights(&mut scaled, m_dim, k, &scales);
                     OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(scales));
@@ -4503,6 +4566,9 @@ OPTIONS:
     --imatrix <PATH>           llama.cpp imatrix GGUF; enables importance-weighted Lloyd and AWQ
     --awq                      activation-aware weight pre-scaling (alpha=0.55); requires --imatrix
     --awq-alpha <F>            enable AWQ at an explicit alpha (overrides the 0.55 default)
+    --ldlq                     oq4 only: full-Hessian (GPTQ/OBS) error-feedback int4
+                               weights instead of RTN; requires --hessian. Composes
+                               with --awq (smooths activations + rebases the Hessian)
     --chat-template-file <P>   override the embedded chat template (Jinja file)
     --threads <N>              rayon worker threads (default 80% of cores; env HIPFIRE_QUANT_THREADS)
     --arch-id <U32>            override the auto-detected arch id stamped in the .hfq header
@@ -5156,6 +5222,36 @@ fn main() {
                     eprintln!("error: --hessian read failed ({}): {e}", hpath.display());
                     std::process::exit(1);
                 }
+            }
+        }
+    }
+
+    // --ldlq: full-Hessian error-feedback weight quant (oq4 only, for now).
+    // Loads the full [K,K] payloads from the SAME --hessian HFHS-v1 file the AWQ
+    // diagonal came from. Requires --hessian; ignored (with a warning) otherwise.
+    if args.iter().any(|a| a == "--ldlq") {
+        match args
+            .iter()
+            .position(|a| a == "--hessian")
+            .and_then(|i| args.get(i + 1))
+            .map(PathBuf::from)
+        {
+            Some(hpath) if hpath.exists() => match hfhs_diag::HfhsFull::open(&hpath) {
+                Ok(full) => {
+                    OQ4_LDLQ_HESSIAN
+                        .set(full)
+                        .ok()
+                        .expect("OQ4_LDLQ_HESSIAN set twice");
+                    eprintln!("ldlq: full Hessian index opened ({hpath:?})");
+                }
+                Err(e) => {
+                    eprintln!("error: --ldlq could not open full Hessian ({hpath:?}): {e}");
+                    std::process::exit(1);
+                }
+            },
+            _ => {
+                eprintln!("error: --ldlq requires --hessian <HFHS .hessian.bin>");
+                std::process::exit(1);
             }
         }
     }
