@@ -57,6 +57,7 @@ use codecs::*;
 // KVarN (Phase D) — variance-normalized 4-bit KV, clean-room CPU core.
 #[allow(dead_code)]
 mod kvarn;
+mod kv_compact;
 // Tiny random-init model fixtures for fast kernel/plumbing gating.
 mod fixture;
 // RoughQuant Phase 2 — PCA rotation into the activation-Hessian eigenbasis.
