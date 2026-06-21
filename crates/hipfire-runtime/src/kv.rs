@@ -87,6 +87,11 @@ pub struct KvCache {
     /// so it stays `None` — kept for an optional shadow-build fallback).
     pub kvarn_shadow: Option<GpuTensor>,
     pub kvarn_tiles: Option<GpuTensor>,
+    /// Deferred-hierarchical two-tier KV (flag-gated `HIPFIRE_KV_HIERARCHICAL=1`).
+    /// `None` until lazily built at the first KVarN dispatch (needs `n_heads` from
+    /// the model config). When `Some(s)` with `s.enabled`, the KVarN decode path
+    /// uses the hot-ring + 4-bit cold-segment two-tier read. See `kv_hier`.
+    pub hier: Option<crate::kv_hier::HierKvState>,
 }
 
 impl KvCache {
@@ -139,6 +144,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -207,6 +213,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -258,6 +265,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -332,6 +340,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -436,6 +445,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -485,6 +495,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -534,6 +545,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -585,6 +597,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -638,6 +651,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -739,6 +753,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -813,6 +828,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -888,6 +904,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -990,6 +1007,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -1107,6 +1125,7 @@ impl KvCache {
             k_window,
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -1217,6 +1236,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -1287,6 +1307,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -1363,6 +1384,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -1449,6 +1471,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -1517,6 +1540,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -1592,6 +1616,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -1735,6 +1760,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -1778,6 +1804,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -1840,6 +1867,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -1883,6 +1911,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -1926,6 +1955,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -1974,6 +2004,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -2022,6 +2053,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -2091,6 +2123,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -2160,6 +2193,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -2229,6 +2263,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -2306,6 +2341,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -2376,6 +2412,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 
@@ -2445,6 +2482,7 @@ impl KvCache {
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 }

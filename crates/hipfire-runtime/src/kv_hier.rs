@@ -43,6 +43,8 @@ pub struct ColdSegmentGpu {
 
 /// Reusable read scratch (lazily sized to the largest cold segment seen).
 struct HierScratch {
+    acc_m: GpuTensor, // [n_heads] accumulator flash max
+    acc_l: GpuTensor, // [n_heads] accumulator flash denom
     out_c: GpuTensor,
     m_c: GpuTensor,
     l_c: GpuTensor,
@@ -214,6 +216,8 @@ impl HierKvState {
         if realloc {
             let slots = need_slots.max(self.migrate_batch).max(1);
             self.scr = Some(HierScratch {
+                acc_m: gpu.zeros(&[nh], DType::F32)?,
+                acc_l: gpu.zeros(&[nh], DType::F32)?,
                 out_c: gpu.zeros(&[nh * HD], DType::F32)?,
                 m_c: gpu.zeros(&[nh], DType::F32)?,
                 l_c: gpu.zeros(&[nh], DType::F32)?,
@@ -228,31 +232,31 @@ impl HierKvState {
 
     /// Two-tier decode read for one layer: hot (raw f32) ⊕ all cold segments, all
     /// folded by online-softmax merge into `out` ([n_heads × HD]). `q` = post-RoPE
-    /// fa_q ([n_heads × HD]). Accumulates into `out`/`out`-side (m,l) in place.
+    /// fa_q ([n_heads × HD]). The flash (m,l) accumulator is internal scratch.
     pub fn two_tier_read(
         &mut self,
         gpu: &mut Gpu,
         layer: usize,
         q: &GpuTensor,
         out: &GpuTensor,
-        m_out: &GpuTensor,
-        l_out: &GpuTensor,
     ) -> HipResult<()> {
         let scale = 1.0f32 / (HD as f32).sqrt();
         let nh = self.n_heads;
         let nkv = self.n_kv_heads;
         let max_seg = self.cold[layer].iter().map(|s| s.n_slots).max().unwrap_or(0);
         self.ensure_scratch(gpu, max_seg)?;
+        // Take the scratch out to satisfy the borrow checker, then restore.
+        let scr = self.scr.take().unwrap();
 
-        // Hot tier → accumulator (out/m/l). Slot-major f32, stride = hot_budget so
-        // the live count reads from a fixed-width ring.
+        // Hot tier → accumulator (out/acc_m/acc_l). Slot-major f32, stride =
+        // hot_budget so the live count reads from a fixed-width ring.
         gpu.attention_cold_slots(
             q,
             &self.hot_k[layer],
             &self.hot_v[layer],
             out,
-            m_out,
-            l_out,
+            &scr.acc_m,
+            &scr.acc_l,
             nh,
             nkv,
             self.hot_count[layer],
@@ -262,8 +266,6 @@ impl HierKvState {
         )?;
 
         // Fold each cold segment: dequant 4-bit → f16, channel-major attend, merge.
-        // Take the scratch out to satisfy the borrow checker, then restore.
-        let scr = self.scr.take().unwrap();
         for seg in &self.cold[layer] {
             gpu.kvarn_dequant_tile(&seg.k_recs, &scr.deq_k, nkv, HD, seg.n_slots, seg.rec_bytes)?;
             gpu.kvarn_dequant_tile(&seg.v_recs, &scr.deq_v, nkv, HD, seg.n_slots, seg.rec_bytes)?;
@@ -283,7 +285,8 @@ impl HierKvState {
             )?;
             // Merge cold segment into the accumulator (in place — safe, see kernel).
             gpu.flash_tier_merge(
-                out, m_out, l_out, &scr.out_c, &scr.m_c, &scr.l_c, out, m_out, l_out, nh,
+                out, &scr.acc_m, &scr.acc_l, &scr.out_c, &scr.m_c, &scr.l_c, out, &scr.acc_m,
+                &scr.acc_l, nh,
             )?;
         }
         self.scr = Some(scr);

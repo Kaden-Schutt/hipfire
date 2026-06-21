@@ -52,9 +52,7 @@ fn main() {
     let q = lcg(7, NH * HD);
     let qd = gpu.upload_f32(&q, &[NH, HD]).unwrap();
     let out = gpu.alloc_tensor(&[NH * HD], DType::F32).unwrap();
-    let mo = gpu.alloc_tensor(&[NH], DType::F32).unwrap();
-    let lo = gpu.alloc_tensor(&[NH], DType::F32).unwrap();
-    hier.two_tier_read(&mut gpu, 0, &qd, &out, &mo, &lo).unwrap();
+    hier.two_tier_read(&mut gpu, 0, &qd, &out).unwrap();
     gpu.device_synchronize().unwrap();
     let got = gpu.download_f32(&out).unwrap();
 

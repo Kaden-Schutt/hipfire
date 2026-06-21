@@ -26447,6 +26447,28 @@ fn kv_cache_attention_dispatch(
     // KVarN decode: single-token KV write (window append + block flush) + read
     // (build f16 shadow K) + f16/Q8 flash, handled outside the dispatch substrate.
     if kv_cache.quant_kvarn {
+        // ── Deferred-hierarchical two-tier KV (flag-gated HIPFIRE_KV_HIERARCHICAL=1).
+        // Lazily built on first dispatch (needs n_heads from the config). Replaces
+        // the single-tier KVarN read with hot-ring ⊕ 4-bit cold-segment two-tier
+        // attention. NO KVarN rotation: the hot ring stores raw fa_k and the cold
+        // segments compact with rotate=false, so fa_q is consumed un-rotated and
+        // both tiers' K are in the same (un-rotated, RoPE-baked) basis as Q.
+        // This is the ONLY KVarN attention entry point (prefill is per-token here
+        // too, n=1), so one hook covers prompt + decode.
+        if kv_cache.hier.is_none() {
+            kv_cache.hier = Some(hipfire_runtime::kv_hier::HierKvState::from_env(
+                gpu,
+                kv_cache.k_gpu.len(),
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+            )?);
+        }
+        if kv_cache.hier.as_ref().map(|h| h.enabled).unwrap_or(false) {
+            let h = kv_cache.hier.as_mut().unwrap();
+            h.append_token(gpu, layer_idx, &s.fa_k, &s.fa_v)?;
+            return h.two_tier_read(gpu, layer_idx, &s.fa_q, &s.fa_attn_out);
+        }
         // ── KVarN Hadamard-incoherence rotation (paper §method: "Hadamard
         // rotation FOLLOWED BY dual-scaling variance normalization"). The Sinkhorn
         // dual-scaling already runs in `kvarn_quantize_tile`; the missing half is
