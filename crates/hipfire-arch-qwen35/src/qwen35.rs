@@ -13730,6 +13730,41 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
                 | "gfx1201"
         );
 
+    // Opus W4A4 (Oq4G256): batched-prefill via the grouped/fused WMMA family
+    // (gemm_oq4_grouped_wmma / fused_qkvza_oq4_wmma / fused_gate_up_oq4_wmma).
+    // These kernels are wave32 WMMA with NO scalar fallback, so the arch gate is
+    // the same WMMA set as fp4 (gfx11 + gfx12). The dispatch arms for these
+    // layers live in forward_prefill_chunk (LA QKVZA/gate_up/wo/w_down + FA
+    // QKV/wo/FFN) and the FusedQkvFamily Oq4 arms — landed in the SAME change, so
+    // enabling this gate never routes oq4 to an unhandled batched path.
+    //
+    // OPT-IN (default OFF) — `HIPFIRE_OQ4_BATCHED_PREFILL=1`. The fused/grouped
+    // oq4 kernels are each parity-validated bit-exact in isolation, but the
+    // END-TO-END batched prefill diverges from the per-token reference by a
+    // measurable margin (≈0.63 mean / 3.95 max logit abs-diff on 0.8b vs the
+    // ≈0.018 mq4 W4A16 baseline; enough to flip greedy argmax and, on plain oq4,
+    // switch output language). Root cause is most likely that the batched
+    // rmsnorm+FWHT activation rotation is not bit-identical to the per-token
+    // RmsnormAutomatic rotation, and W4A4's int4 ACTIVATION quantization (a step
+    // nonlinearity) amplifies that small pre-quant delta. Per the project's
+    // coherence-first rule we do NOT enable a path that degrades output by
+    // default; the wiring ships behind this flag for continued root-causing.
+    // Decode is unaffected (always per-token oq4, known-good).
+    let oq4_with_wmma = matches!(dt, DType::Oq4G256)
+        && matches!(
+            arch,
+            "gfx1100"
+                | "gfx1101"
+                | "gfx1102"
+                | "gfx1103"
+                | "gfx1150"
+                | "gfx1151"
+                | "gfx1152"
+                | "gfx1200"
+                | "gfx1201"
+        )
+        && std::env::var("HIPFIRE_OQ4_BATCHED_PREFILL").as_deref() == Ok("1");
+
     // Lloyd-MQ3 (MQ3G256Lloyd) on gfx11: Phase 5 of issue #116 ships the
     // gemm_*_mq3g256_lloyd_wmma family alongside the existing HFQ3 WMMA
     // path; group stride differs (112 B Lloyd vs 104 B HFQ3) so dispatch
@@ -13778,6 +13813,7 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
         || lloyd_mq4_with_gfx11_wmma
         || lloyd_mq4_with_gfx12_wmma
         || fp4_with_wmma
+        || oq4_with_wmma
 }
 
 pub(crate) fn trace_finite_if_enabled(gpu: &Gpu, label: &str, tensor: &GpuTensor) -> HipResult<()> {
@@ -16717,11 +16753,17 @@ fn forward_prefill_chunk(
                         | DType::MQ3G256
                         | DType::MQ3G256Lloyd
                         | DType::MFP4G32
+                        // Opus W4A4: weights FWHT-rotated offline → x must be
+                        // FWHT(+AWQ)-rotated by the shared mq rotate path before
+                        // the int4 activation quantize (decode parity:
+                        // rotate_x_mq[_awq] → quantize_act_oq4).
+                        | DType::Oq4G256
                 );
                 let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let is_mq3 = matches!(layer.wqkv.gpu_dtype, DType::MQ3G256);
                 let is_mq3_lloyd = matches!(layer.wqkv.gpu_dtype, DType::MQ3G256Lloyd);
                 let is_fp4 = matches!(layer.wqkv.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+                let is_oq4 = matches!(layer.wqkv.gpu_dtype, DType::Oq4G256);
                 let is_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0);
                 let is_f32 = matches!(layer.wqkv.gpu_dtype, DType::F32);
                 let is_f16 = matches!(layer.wqkv.gpu_dtype, DType::F16 | DType::BF16);
@@ -17009,6 +17051,29 @@ fn forward_prefill_chunk(
                     run_fused_qkvza_key(
                         gpu,
                         hipfire_dispatch::types::KernelKey::FusedQkvzaHfp4G32,
+                        &layer.wqkv.buf,
+                        &layer.wz.buf,
+                        &layer.w_beta.buf,
+                        &layer.w_alpha.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.dn_qkv_batch,
+                        &pbs.dn_z_batch,
+                        &pbs.dn_beta_batch,
+                        &pbs.dn_alpha_batch,
+                        layer.wqkv.m,
+                        layer.wz.m,
+                        layer.w_beta.m,
+                        layer.w_alpha.m,
+                        layer.wqkv.k,
+                        n,
+                    )?;
+                } else if is_oq4 {
+                    // Opus W4A4: x_rot_batch is FWHT(+AWQ)-rotated above (is_mq).
+                    // The FusedQkvzaOq4G256 run-arm int4-quantizes it once then
+                    // runs the batched grouped-WMMA fused kernel.
+                    run_fused_qkvza_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedQkvzaOq4G256,
                         &layer.wqkv.buf,
                         &layer.wz.buf,
                         &layer.w_beta.buf,
@@ -17466,11 +17531,13 @@ fn forward_prefill_chunk(
                         | DType::MQ3G256
                         | DType::MQ3G256Lloyd
                         | DType::MFP4G32
+                        | DType::Oq4G256
                 );
                 let wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
                 let wo_is_mq3_lloyd = matches!(layer.wo.gpu_dtype, DType::MQ3G256Lloyd);
                 let wo_is_fp4 = matches!(layer.wo.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+                let wo_is_oq4 = matches!(layer.wo.gpu_dtype, DType::Oq4G256);
                 let wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
                 let wo_is_f32 = matches!(layer.wo.gpu_dtype, DType::F32);
                 let wo_is_f16 = matches!(layer.wo.gpu_dtype, DType::F16 | DType::BF16);
@@ -17505,6 +17572,18 @@ fn forward_prefill_chunk(
                         hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
                         &layer.wo.buf,
                         layer.wo.gpu_dtype,
+                        wo_input,
+                        &pbs.x_batch,
+                        layer.wo.m,
+                        layer.wo.k,
+                        n,
+                    )?;
+                } else if wo_is_oq4 {
+                    // Opus W4A4: wo_input is FWHT(+AWQ)-rotated above (wo_is_mq).
+                    // No fused oq4 residual kernel → grouped-WMMA GEMM into scratch
+                    // + add into the residual stream (pbs.x_batch).
+                    gpu.gemm_oq4_grouped_residual_act_batched(
+                        &layer.wo.buf,
                         wo_input,
                         &pbs.x_batch,
                         layer.wo.m,
@@ -17668,12 +17747,14 @@ fn forward_prefill_chunk(
                         | DType::MQ3G256
                         | DType::MQ3G256Lloyd
                         | DType::MFP4G32
+                        | DType::Oq4G256
                 );
                 let ffn_is_6bit =
                     matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let ffn_is_mq3 = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256);
                 let ffn_is_mq3_lloyd = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256Lloyd);
                 let ffn_is_fp4 = matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+                let ffn_is_oq4 = matches!(layer.w_gate.gpu_dtype, DType::Oq4G256);
                 let ffn_is_q8 = matches!(layer.w_gate.gpu_dtype, DType::Q8_0);
                 let ffn_is_f32 = matches!(layer.w_gate.gpu_dtype, DType::F32);
                 let ffn_is_f16 = matches!(layer.w_gate.gpu_dtype, DType::F16 | DType::BF16);
@@ -17873,6 +17954,21 @@ fn forward_prefill_chunk(
                         layer.w_gate.k,
                         n,
                     )?;
+                } else if ffn_is_oq4 {
+                    // Opus W4A4: x_rot_batch is FWHT(+AWQ)-rotated above (ffn_is_mq).
+                    run_fused_gate_up_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedGateUpOq4G256,
+                        &layer.w_gate.buf,
+                        &layer.w_up.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.gate_ffn_batch,
+                        &pbs.up_batch,
+                        layer.w_gate.m,
+                        layer.w_up.m,
+                        layer.w_gate.k,
+                        n,
+                    )?;
                 } else if gdn_tape.is_some() {
                     gpu.gemm_gate_up_hfq4g256_exact(
                         &layer.w_gate.buf,
@@ -17932,6 +18028,7 @@ fn forward_prefill_chunk(
                         | DType::MQ3G256
                         | DType::MQ3G256Lloyd
                         | DType::MFP4G32
+                        | DType::Oq4G256
                 );
                 let w_down_is_6bit =
                     matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
@@ -17939,6 +18036,7 @@ fn forward_prefill_chunk(
                 let w_down_is_mq3_lloyd = matches!(layer.w_down.gpu_dtype, DType::MQ3G256Lloyd);
                 let w_down_is_fp4 =
                     matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+                let w_down_is_oq4 = matches!(layer.w_down.gpu_dtype, DType::Oq4G256);
                 let w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
                 let w_down_is_f32 = matches!(layer.w_down.gpu_dtype, DType::F32);
                 let w_down_is_f16 = matches!(layer.w_down.gpu_dtype, DType::F16 | DType::BF16);
@@ -17984,6 +18082,18 @@ fn forward_prefill_chunk(
                         hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
                         &layer.w_down.buf,
                         layer.w_down.gpu_dtype,
+                        &pbs.ffn_hidden_batch,
+                        &pbs.x_batch,
+                        layer.w_down.m,
+                        layer.w_down.k,
+                        n,
+                    )?;
+                } else if w_down_is_oq4 {
+                    // Opus W4A4: ffn_hidden_batch is FWHT(+AWQ)-rotated above
+                    // (fused_silu_mul_rotate_mq, w_down_is_mq). grouped-WMMA GEMM
+                    // into scratch + residual add into the hidden stream.
+                    gpu.gemm_oq4_grouped_residual_act_batched(
+                        &layer.w_down.buf,
                         &pbs.ffn_hidden_batch,
                         &pbs.x_batch,
                         layer.w_down.m,
@@ -18160,11 +18270,13 @@ fn forward_prefill_chunk(
                         | DType::MQ3G256
                         | DType::MQ3G256Lloyd
                         | DType::MFP4G32
+                        | DType::Oq4G256
                 );
                 let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let qkv_is_mq3 = matches!(layer.wq.gpu_dtype, DType::MQ3G256);
                 let qkv_is_mq3_lloyd = matches!(layer.wq.gpu_dtype, DType::MQ3G256Lloyd);
                 let qkv_is_fp4 = matches!(layer.wq.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+                let qkv_is_oq4 = matches!(layer.wq.gpu_dtype, DType::Oq4G256);
                 let qkv_is_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0);
                 let qkv_is_f32 = matches!(layer.wq.gpu_dtype, DType::F32);
                 let qkv_is_f16 = matches!(layer.wq.gpu_dtype, DType::F16 | DType::BF16);
@@ -18313,6 +18425,40 @@ fn forward_prefill_chunk(
                         layer.wk.m,
                         layer.wv.m,
                         layer.wq.k,
+                        n,
+                    )?;
+                } else if qkv_is_oq4 && qkv_same_dtype {
+                    // Opus W4A4: no fused 3-way oq4 QKV kernel — int4-quantize the
+                    // shared FWHT(+AWQ)-rotated activation and run the grouped-WMMA
+                    // GEMM per projection (q/k/v). The quantize is re-run per call
+                    // (cheap vs the GEMM); all three read the same x_rot_batch.
+                    debug_assert!(
+                        matches!(layer.wk.gpu_dtype, DType::Oq4G256)
+                            && matches!(layer.wv.gpu_dtype, DType::Oq4G256),
+                        "FA qkv Oq4 dispatch requires all of wq/wk/wv to be Oq4G256",
+                    );
+                    gpu.gemm_oq4_grouped_act_batched(
+                        &layer.wq.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.fa_q_full_batch,
+                        layer.wq.m,
+                        layer.wq.k,
+                        n,
+                    )?;
+                    gpu.gemm_oq4_grouped_act_batched(
+                        &layer.wk.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.fa_k_batch,
+                        layer.wk.m,
+                        layer.wk.k,
+                        n,
+                    )?;
+                    gpu.gemm_oq4_grouped_act_batched(
+                        &layer.wv.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.fa_v_batch,
+                        layer.wv.m,
+                        layer.wv.k,
                         n,
                     )?;
                 } else if qkv_is_q8 && q8_wmma_arch && qkv_same_dtype {
@@ -19256,11 +19402,13 @@ fn forward_prefill_chunk(
                         | DType::MQ3G256
                         | DType::MQ3G256Lloyd
                         | DType::MFP4G32
+                        | DType::Oq4G256
                 );
                 let fa_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let fa_wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
                 let fa_wo_is_mq3_lloyd = matches!(layer.wo.gpu_dtype, DType::MQ3G256Lloyd);
                 let fa_wo_is_fp4 = matches!(layer.wo.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+                let fa_wo_is_oq4 = matches!(layer.wo.gpu_dtype, DType::Oq4G256);
                 let fa_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
                 let fa_wo_is_f32 = matches!(layer.wo.gpu_dtype, DType::F32);
                 let fa_wo_is_f16 = matches!(layer.wo.gpu_dtype, DType::F16 | DType::BF16);
@@ -19284,6 +19432,16 @@ fn forward_prefill_chunk(
                         hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
                         &layer.wo.buf,
                         layer.wo.gpu_dtype,
+                        fa_wo_input,
+                        &pbs.x_batch,
+                        layer.wo.m,
+                        layer.wo.k,
+                        n,
+                    )?;
+                } else if fa_wo_is_oq4 {
+                    // Opus W4A4: fa_wo_input is FWHT(+AWQ)-rotated above.
+                    gpu.gemm_oq4_grouped_residual_act_batched(
+                        &layer.wo.buf,
                         fa_wo_input,
                         &pbs.x_batch,
                         layer.wo.m,
@@ -19439,6 +19597,7 @@ fn forward_prefill_chunk(
                         | DType::MQ3G256
                         | DType::MQ3G256Lloyd
                         | DType::MFP4G32
+                        | DType::Oq4G256
                 );
                 let fa_ffn_is_6bit =
                     matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
@@ -19446,6 +19605,7 @@ fn forward_prefill_chunk(
                 let fa_ffn_is_mq3_lloyd = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256Lloyd);
                 let fa_ffn_is_fp4 =
                     matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+                let fa_ffn_is_oq4 = matches!(layer.w_gate.gpu_dtype, DType::Oq4G256);
                 let fa_ffn_is_q8 = matches!(layer.w_gate.gpu_dtype, DType::Q8_0);
                 let fa_ffn_is_f32 = matches!(layer.w_gate.gpu_dtype, DType::F32);
                 let fa_ffn_is_f16 = matches!(layer.w_gate.gpu_dtype, DType::F16 | DType::BF16);
@@ -19479,6 +19639,21 @@ fn forward_prefill_chunk(
                     run_fused_gate_up_key(
                         gpu,
                         hipfire_dispatch::types::KernelKey::FusedGateUpHfq6G256,
+                        &layer.w_gate.buf,
+                        &layer.w_up.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.gate_ffn_batch,
+                        &pbs.up_batch,
+                        layer.w_gate.m,
+                        layer.w_up.m,
+                        layer.w_gate.k,
+                        n,
+                    )?;
+                } else if fa_ffn_is_oq4 {
+                    // Opus W4A4: x_rot_batch is FWHT(+AWQ)-rotated above (fa_ffn_is_mq).
+                    run_fused_gate_up_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedGateUpOq4G256,
                         &layer.w_gate.buf,
                         &layer.w_up.buf,
                         &pbs.x_rot_batch,
@@ -19652,6 +19827,7 @@ fn forward_prefill_chunk(
                         | DType::MQ3G256
                         | DType::MQ3G256Lloyd
                         | DType::MFP4G32
+                        | DType::Oq4G256
                 );
                 let fa_w_down_is_6bit =
                     matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
@@ -19659,6 +19835,7 @@ fn forward_prefill_chunk(
                 let fa_w_down_is_mq3_lloyd = matches!(layer.w_down.gpu_dtype, DType::MQ3G256Lloyd);
                 let fa_w_down_is_fp4 =
                     matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+                let fa_w_down_is_oq4 = matches!(layer.w_down.gpu_dtype, DType::Oq4G256);
                 let fa_w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
                 let fa_w_down_is_f32 = matches!(layer.w_down.gpu_dtype, DType::F32);
                 let fa_w_down_is_f16 = matches!(layer.w_down.gpu_dtype, DType::F16 | DType::BF16);
@@ -19682,6 +19859,16 @@ fn forward_prefill_chunk(
                         hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
                         &layer.w_down.buf,
                         layer.w_down.gpu_dtype,
+                        &pbs.ffn_hidden_batch,
+                        &pbs.x_batch,
+                        layer.w_down.m,
+                        layer.w_down.k,
+                        n,
+                    )?;
+                } else if fa_w_down_is_oq4 {
+                    // Opus W4A4: ffn_hidden_batch is FWHT(+AWQ)-rotated above.
+                    gpu.gemm_oq4_grouped_residual_act_batched(
+                        &layer.w_down.buf,
                         &pbs.ffn_hidden_batch,
                         &pbs.x_batch,
                         layer.w_down.m,

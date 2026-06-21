@@ -380,6 +380,49 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             ))
         }
 
+        // ── Opus W4A4 (oq4) fused QKVZA — batched prefill only ──────────────
+        // W4A4: unlike the W4A16 dtypes above, the activation is int4-quantized.
+        // `params.x` is the FWHT(+AWQ)-rotated f32 activation [N×K]; quantize it
+        // ONCE into the shared batched scratch (the fusion win), then the batched
+        // grouped-WMMA kernel demuxes the four sub-projections over the shared
+        // int4 operand. Each weight is the combined `[nibbles | f32 scales]`
+        // buffer (the kernel derives the scale offset internally). Prefill-only:
+        // decode (`None`) is handled by the per-projection GEMV in
+        // `pipeline::steps::launch_fused`.
+        KernelKey::FusedQkvzaOq4G256 => {
+            let [wqkv, wz, w_beta, w_alpha] = <[&GpuTensor; 4]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [qkv, z, beta, alpha] = <[&GpuTensor; 4]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [mqkv, mz, mbeta, malpha] =
+                <[usize; 4]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let n = params.batch_size.ok_or(DispatchError::UnsupportedVariant {
+                family: "fused_qkv",
+                variant: "qkvza",
+                arch: "",
+                quant: "oq4g256 (prefill-only)",
+            })?;
+            const GROUP: usize = 256;
+            let ng = k / GROUP;
+            let m_max = mqkv.max(mz).max(mbeta).max(malpha);
+            hip!(gpu.ensure_oq4_scratch_batched(n, k, m_max))?;
+            let xq = GpuTensor {
+                buf: unsafe { gpu.oq4_xq_batch.as_ref().unwrap().buf.alias() },
+                shape: vec![n * (k / 2)],
+                dtype: rdna_compute::DType::Raw,
+            };
+            let xs = GpuTensor {
+                buf: unsafe { gpu.oq4_xs_batch.as_ref().unwrap().buf.alias() },
+                shape: vec![n * ng],
+                dtype: rdna_compute::DType::F32,
+            };
+            hip!(gpu.quantize_act_oq4(x, &xq, &xs, n, k, GROUP))?;
+            hip!(gpu.fused_qkvza_oq4_wmma(
+                wqkv, wz, w_beta, w_alpha, &xq, &xs, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha,
+                k, n, GROUP
+            ))
+        }
+
         // ── 2-way Fused Gate+Up (FFN) ────────────────────────
         //
         // Each arm is batch-aware via `params.batch_size`:
@@ -509,6 +552,40 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 quant: "hfp4g32 (prefill-only)",
             })?;
             hip!(gpu.gemm_gate_up_hfp4g32(w_gate, w_up, x, gate, up, mg, mu, k, n))
+        }
+        // ── Opus W4A4 (oq4) fused gate+up — batched prefill only ───────────
+        // W4A4 mirror of FusedQkvzaOq4G256: int4-quantize the FWHT(+AWQ)-rotated
+        // f32 activation once, then the batched grouped-WMMA gate+up kernel.
+        KernelKey::FusedGateUpOq4G256 => {
+            let [w_gate, w_up] = <[&GpuTensor; 2]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let [gate, up] = <[&GpuTensor; 2]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let [mg, mu] =
+                <[usize; 2]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let n = params.batch_size.ok_or(DispatchError::UnsupportedVariant {
+                family: "fused_qkv",
+                variant: "gate_up",
+                arch: "",
+                quant: "oq4g256 (prefill-only)",
+            })?;
+            const GROUP: usize = 256;
+            let ng = k / GROUP;
+            hip!(gpu.ensure_oq4_scratch_batched(n, k, mg.max(mu)))?;
+            let xq = GpuTensor {
+                buf: unsafe { gpu.oq4_xq_batch.as_ref().unwrap().buf.alias() },
+                shape: vec![n * (k / 2)],
+                dtype: rdna_compute::DType::Raw,
+            };
+            let xs = GpuTensor {
+                buf: unsafe { gpu.oq4_xs_batch.as_ref().unwrap().buf.alias() },
+                shape: vec![n * ng],
+                dtype: rdna_compute::DType::F32,
+            };
+            hip!(gpu.quantize_act_oq4(x, &xq, &xs, n, k, GROUP))?;
+            hip!(gpu.fused_gate_up_oq4_wmma(
+                w_gate, w_up, &xq, &xs, gate, up, mg, mu, k, n, GROUP
+            ))
         }
 
         // ── Paro fused Paro4G128T (dp4a) ────────────────────────────────

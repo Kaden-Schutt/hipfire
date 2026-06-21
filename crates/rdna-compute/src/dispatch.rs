@@ -466,6 +466,15 @@ pub struct Gpu {
     pub oq4_xs: Option<GpuTensor>,   // per-group f32 activation scales, K/256
     pub oq4_xr: Option<GpuTensor>,   // rotated f32 activation (Raw paths), K
     pub oq4_ytmp: Option<GpuTensor>, // f32 residual GEMM scratch, M
+    // Batched-prefill counterparts: int4-quantized activation for N tokens at
+    // once (W4A4 oq4 batched WMMA path). Sized lazily to hold N*K/2 packed
+    // nibbles / N*K/256 f32 scales / M*N f32 residual scratch; grown (never
+    // shrunk) on demand by `ensure_oq4_scratch_batched`. GpuTensor has no
+    // pool-return Drop, so growth leaks the old buffer — bounded because the
+    // capacity only ratchets up to the largest prefill chunk seen.
+    pub oq4_xq_batch: Option<GpuTensor>, // packed int4 activation, N*K/2 bytes
+    pub oq4_xs_batch: Option<GpuTensor>, // per-group f32 activation scales, N*K/256
+    pub oq4_ytmp_batch: Option<GpuTensor>, // f32 residual GEMM scratch, M*N
     pub paro_x_scratch: Option<GpuTensor>, // ParoQuant: scratch for rotated activation copy
     pub paro_fused_scratch: Option<Vec<GpuTensor>>, // ParoQuant fused paths: multiple rotation scratch buffers
     pub mq_x_q8: Option<hip_bridge::DeviceBuffer>,  // INT8 quantized rotated x for dp4a
@@ -868,6 +877,9 @@ impl Gpu {
             oq4_xs: None,
             oq4_xr: None,
             oq4_ytmp: None,
+            oq4_xq_batch: None,
+            oq4_xs_batch: None,
+            oq4_ytmp_batch: None,
             paro_x_scratch: None,
             paro_fused_scratch: None,
             mq_x_q8: None,
@@ -7772,6 +7784,33 @@ impl Gpu {
         self.oq4_xs = Some(self.alloc_tensor(&[128], DType::F32)?); // K/256 ≤ 128
         self.oq4_xr = Some(self.alloc_tensor(&[32768], DType::F32)?); // K ≤ 32768
         self.oq4_ytmp = Some(self.alloc_tensor(&[32768], DType::F32)?); // M ≤ 32768
+        Ok(())
+    }
+
+    /// Ensure the batched-prefill int4-activation scratch holds `n` tokens of a
+    /// K-wide activation: `oq4_xq_batch` ≥ n*k/2 bytes (packed nibbles),
+    /// `oq4_xs_batch` ≥ n*k/256 f32 scales, `oq4_ytmp_batch` ≥ m_max*n f32
+    /// residual scratch. Capacity ratchets up (never shrinks) so repeated chunks
+    /// of the same or smaller size reuse one allocation. `m_max` is the largest
+    /// output-row count fed to a residual GEMM in this layer family (pass the
+    /// model hidden_dim — every wo/w_down output ≤ dim for the dense path).
+    pub fn ensure_oq4_scratch_batched(&mut self, n: usize, k: usize, m_max: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        let need_xq = n * (k / 2);
+        let need_xs = n * (k / 256);
+        let need_y = n * m_max;
+        let grow = |cur: &Option<GpuTensor>, need: usize| -> bool {
+            cur.as_ref().map(|t| t.numel() < need).unwrap_or(true)
+        };
+        if grow(&self.oq4_xq_batch, need_xq) {
+            self.oq4_xq_batch = Some(self.alloc_tensor(&[need_xq], DType::Raw)?);
+        }
+        if grow(&self.oq4_xs_batch, need_xs) {
+            self.oq4_xs_batch = Some(self.alloc_tensor(&[need_xs], DType::F32)?);
+        }
+        if grow(&self.oq4_ytmp_batch, need_y) {
+            self.oq4_ytmp_batch = Some(self.alloc_tensor(&[need_y], DType::F32)?);
+        }
         Ok(())
     }
 
@@ -46118,6 +46157,63 @@ impl Gpu {
                 &mut params,
             )
         }
+    }
+
+    /// Batched W4A4 (Opus oq4) GEMM for prefill: int4-quantize the FWHT-rotated
+    /// activation `x_rot` [N×K] ONCE into the shared batched scratch, then a
+    /// grouped WMMA GEMM into `y` [N×M]. `w_combined` is the loader's
+    /// `[nibbles M*K/2 | f32 scales M*ng]` Raw buffer; the scale view is derived
+    /// via `sub_offset`. group is fixed at 256 (oq4 codec). This is the batched
+    /// counterpart of the decode `gemv_oq4_grouped` quantize+GEMV.
+    pub fn gemm_oq4_grouped_act_batched(
+        &mut self,
+        w_combined: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        const GROUP: usize = 256;
+        self.ensure_oq4_scratch_batched(n, k, m)?;
+        let ng = k / GROUP;
+        let xq = GpuTensor {
+            buf: unsafe { self.oq4_xq_batch.as_ref().unwrap().buf.alias() },
+            shape: vec![n * (k / 2)],
+            dtype: DType::Raw,
+        };
+        let xs = GpuTensor {
+            buf: unsafe { self.oq4_xs_batch.as_ref().unwrap().buf.alias() },
+            shape: vec![n * ng],
+            dtype: DType::F32,
+        };
+        self.quantize_act_oq4(x_rot, &xq, &xs, n, k, GROUP)?;
+        let ws = w_combined.sub_offset(m * (k / 2), m * ng * 4);
+        self.gemm_oq4_grouped_wmma(w_combined, &ws, &xq, &xs, y, m, k, n, GROUP)
+    }
+
+    /// Batched W4A4 oq4 GEMM with residual add: `residual[N×M] += W·x_rot`.
+    /// GEMMs into the persistent batched f32 scratch (`oq4_ytmp_batch`, sized for
+    /// M*N here) then a single elementwise add — there is no fused oq4 residual
+    /// kernel, mirroring the decode `GemvResidual` Oq4 arm.
+    pub fn gemm_oq4_grouped_residual_act_batched(
+        &mut self,
+        w_combined: &GpuTensor,
+        x_rot: &GpuTensor,
+        residual: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.ensure_oq4_scratch_batched(n, k, m)?;
+        let tmp = GpuTensor {
+            buf: unsafe { self.oq4_ytmp_batch.as_ref().unwrap().buf.alias() },
+            shape: vec![n * m],
+            dtype: DType::F32,
+        };
+        self.gemm_oq4_grouped_act_batched(w_combined, x_rot, &tmp, m, k, n)?;
+        let res_n = residual.sub_offset(0, n * m);
+        self.add_inplace_f32(&res_n, &tmp)
     }
 
     /// Generic kernel library: WMMA GEMM, signed INT8 inputs → INT32 output.

@@ -99,6 +99,12 @@ pub fn populate(registry: &mut KernelRegistry) {
         // NO scalar/dp4a fallback. Mirrors the FusedQkvHfp4G32 row above.
         // HasWmma (includes gfx12).
         (KernelKey::FusedQkvzaHfp4G32, ArchPredicate::HasWmma),
+        // Opus W4A4 (oq4) fused QKVZA — batched prefill only. The run-arm
+        // int4-quantizes the shared activation then calls
+        // `gpu.fused_qkvza_oq4_wmma` (wave32 WMMA grouped GEMM, no scalar/dp4a
+        // fallback). HasWmma (= has_wmma(), includes gfx12). Decode (`None`) is
+        // handled by the per-projection GEMV in `pipeline::steps::launch_fused`.
+        (KernelKey::FusedQkvzaOq4G256, ArchPredicate::HasWmma),
     ];
     for &(key, arch) in qkvza_variants {
         registry.register(KernelVariant {
@@ -154,6 +160,10 @@ pub fn populate(registry: &mut KernelRegistry) {
         // Q8_0 gate+up: plain wave32 kernel (`gpu.fused_gate_up_q8_0`),
         // no arch gate — mirrors the Q4K row. Used by qwen2 FFN.
         (KernelKey::FusedGateUpQ8_0, ArchPredicate::Always),
+        // Opus W4A4 (oq4) fused gate+up — batched prefill only. WMMA-only
+        // (`gpu.fused_gate_up_oq4_wmma`, no scalar fallback). HasWmma (includes
+        // gfx12). Mirrors FusedQkvzaOq4G256.
+        (KernelKey::FusedGateUpOq4G256, ArchPredicate::HasWmma),
     ];
     for &(key, arch) in gate_up_variants {
         registry.register(KernelVariant {
