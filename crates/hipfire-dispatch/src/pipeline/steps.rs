@@ -192,6 +192,14 @@ pub(crate) fn guard_qkvza_hfq4g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
     matches!(dt, DType::MQ4G256 | DType::HFQ4G256) && gemv_steps_uniform(steps, dt, true)
 }
 
+/// Opus W4A4 fused QKVZA — all four LA weights Oq4G256, prerotated activation.
+pub(crate) fn guard_qkvza_oq4g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if ctx.flags.force_unfused {
+        return false;
+    }
+    steps.len() == 5 && gemv_steps_uniform(steps, DType::Oq4G256, true)
+}
+
 /// Covers both DType::HFQ6G256 and DType::MQ6G256 — both use dp4a.
 pub(crate) fn guard_qkvza_hfq6g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
     if !dp4a_eligible(ctx) {
@@ -221,6 +229,14 @@ pub(crate) fn guard_gate_up_mq3g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> b
         return false;
     }
     steps.len() == 3 && gemv_steps_uniform(steps, DType::MQ3G256Lloyd, true)
+}
+
+/// Opus W4A4 fused Gate+Up — both weights Oq4G256, prerotated activation.
+pub(crate) fn guard_gate_up_oq4g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if ctx.flags.force_unfused {
+        return false;
+    }
+    steps.len() == 3 && gemv_steps_uniform(steps, DType::Oq4G256, true)
 }
 
 pub(crate) fn guard_gate_up_hfq4g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
@@ -430,6 +446,11 @@ const FUSED_TABLE: &[FusedPattern] = &[
     // ── QKVZA 4-way (DeltaNet linear attention) ────────────────────────────
     FusedPattern {
         ops: QKVZA4,
+        key: KernelKey::FusedQkvzaOq4G256,
+        guard: guard_qkvza_oq4g256,
+    },
+    FusedPattern {
+        ops: QKVZA4,
         key: KernelKey::FusedQkvzaMq4G256Lloyd,
         guard: guard_qkvza_mq4g256lloyd,
     },
@@ -449,6 +470,11 @@ const FUSED_TABLE: &[FusedPattern] = &[
         guard: guard_qkvza_hfq6g256,
     },
     // ── Gate+Up 2-way ───────────────────────────────────────────────────────
+    FusedPattern {
+        ops: GATE_UP2,
+        key: KernelKey::FusedGateUpOq4G256,
+        guard: guard_gate_up_oq4g256,
+    },
     FusedPattern {
         ops: GATE_UP2,
         key: KernelKey::FusedGateUpMq4G256Lloyd,
@@ -855,6 +881,49 @@ fn launch_fused(
     let fused_qkv = FUSED_QKV.get_or_init(FusedQkvFamily::new);
 
     match key {
+        // ── Opus W4A4 fused projections ──────────────────────────────────────
+        // `activated` is the FWHT-rotated f32 activation. Int4-quantize it ONCE
+        // (the fusion win), then run the dedicated fused iu4 kernel that demuxes
+        // the sub-projections over the shared int4 operand.
+        KernelKey::FusedQkvzaOq4G256 => {
+            let hip = |e: rdna_compute::HipError| DispatchError::Hip(e.to_string());
+            let (wqkv, qkv) = gemv_weight_out(&steps[1]);
+            let (wz, z) = gemv_weight_out(&steps[2]);
+            let (wb, beta) = gemv_weight_out(&steps[3]);
+            let (wa, alpha) = gemv_weight_out(&steps[4]);
+            let k = wqkv.k;
+            let xq = gpu.alloc_tensor(&[k / 2], DType::Raw).map_err(hip)?;
+            let xs = gpu.alloc_tensor(&[k / 256], DType::F32).map_err(hip)?;
+            let r = (|| {
+                gpu.quantize_act_oq4(activated, &xq, &xs, 1, k, 256).map_err(hip)?;
+                gpu.fused_qkvza_oq4_wmma(
+                    wqkv.buf, wz.buf, wb.buf, wa.buf, &xq, &xs, qkv, z, beta, alpha, wqkv.m,
+                    wz.m, wb.m, wa.m, k, 1, 256,
+                )
+                .map_err(hip)
+            })();
+            let _ = gpu.free_tensor(xq);
+            let _ = gpu.free_tensor(xs);
+            r
+        }
+        KernelKey::FusedGateUpOq4G256 => {
+            let hip = |e: rdna_compute::HipError| DispatchError::Hip(e.to_string());
+            let (wg, gate) = gemv_weight_out(&steps[1]);
+            let (wu, up) = gemv_weight_out(&steps[2]);
+            let k = wg.k;
+            let xq = gpu.alloc_tensor(&[k / 2], DType::Raw).map_err(hip)?;
+            let xs = gpu.alloc_tensor(&[k / 256], DType::F32).map_err(hip)?;
+            let r = (|| {
+                gpu.quantize_act_oq4(activated, &xq, &xs, 1, k, 256).map_err(hip)?;
+                gpu.fused_gate_up_oq4_wmma(
+                    wg.buf, wu.buf, &xq, &xs, gate, up, wg.m, wu.m, k, 1, 256,
+                )
+                .map_err(hip)
+            })();
+            let _ = gpu.free_tensor(xq);
+            let _ = gpu.free_tensor(xs);
+            r
+        }
         KernelKey::FusedQkvMq4G256Lloyd
         | KernelKey::FusedQkvMq3G256Lloyd
         | KernelKey::FusedQkvHfq4G256
