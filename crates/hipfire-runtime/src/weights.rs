@@ -347,21 +347,27 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
             assert_eq!(w.k % GROUP, 0, "Oq4G256 weight_gemv: K must be % 256");
             let ng = w.k / GROUP;
             gpu.ensure_mq_signs()?;
+            gpu.ensure_oq4_scratch()?;
             let xr = xr!();
             rotate_x_mq_for(gpu, w, x, &xr, w.k)?;
-            // Ephemeral int4 activation scratch (B=1). Pool-backed alloc — NOT
-            // upload_raw, which would malloc + memcpy_htod a zero-filled host vec
-            // every call (~100 pointless H2D uploads/token, the dominant decode
-            // hipMemcpy caller found via rocprof). quantize_act_oq4 fully overwrites.
-            let xq = gpu.alloc_tensor(&[w.k / 2], DType::Raw)?;
-            let xs = gpu.alloc_tensor(&[ng], DType::F32)?;
+            // Persistent int4 activation scratch (B=1) — aliased, NOT per-call
+            // alloc, so the forward stays hipGraph-capture-clean (no hipMalloc/Free
+            // inside the captured region). quantize_act_oq4 fully overwrites xq/xs;
+            // stream-ordered reuse across sequential projections is safe.
+            let xq = GpuTensor {
+                buf: unsafe { gpu.oq4_xq.as_ref().unwrap().buf.alias() },
+                shape: vec![w.k / 2],
+                dtype: DType::Raw,
+            };
+            let xs = GpuTensor {
+                buf: unsafe { gpu.oq4_xs.as_ref().unwrap().buf.alias() },
+                shape: vec![ng],
+                dtype: DType::F32,
+            };
             gpu.quantize_act_oq4(&xr, &xq, &xs, 1, w.k, GROUP)?;
             // Weight scales view: byte offset M*(K/2) into the combined buffer.
             let ws = w.buf.sub_offset(w.m * (w.k / 2), w.m * ng * 4);
-            let r = gpu.gemm_oq4_grouped_wmma(&w.buf, &ws, &xq, &xs, y, w.m, w.k, 1, GROUP);
-            let _ = gpu.free_tensor(xq);
-            let _ = gpu.free_tensor(xs);
-            r
+            gpu.gemm_oq4_grouped_wmma(&w.buf, &ws, &xq, &xs, y, w.m, w.k, 1, GROUP)
         }
         // All other FWHT-requiring dtypes (MQ4G256, MQ6G256, MQ3G256, MQ2G256,
         // MQ2G256Lloyd, MQ3G256Lloyd, MQ4G256Lloyd, MFP4G32):

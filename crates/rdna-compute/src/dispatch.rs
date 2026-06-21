@@ -457,6 +457,15 @@ pub struct Gpu {
     pub mq_signs1_128: Option<GpuTensor>,
     pub mq_signs2_128: Option<GpuTensor>,
     pub mq_x_rot: Option<GpuTensor>, // scratch for rotated x, sized to max K
+    // Opus Quant W4A4 persistent decode scratch (B=1). Hoisted out of the
+    // per-projection dispatch so the forward issues ZERO hipMalloc/hipFree inside
+    // the (future) hipGraph-captured region — per-call alloc would trip
+    // "hipMalloc not permitted under stream capture". Stream-ordered reuse across
+    // sequential projections is safe (one stream, in-order). Sized to max K/M.
+    pub oq4_xq: Option<GpuTensor>,   // packed int4 activation, K/2 bytes
+    pub oq4_xs: Option<GpuTensor>,   // per-group f32 activation scales, K/256
+    pub oq4_xr: Option<GpuTensor>,   // rotated f32 activation (Raw paths), K
+    pub oq4_ytmp: Option<GpuTensor>, // f32 residual GEMM scratch, M
     pub paro_x_scratch: Option<GpuTensor>, // ParoQuant: scratch for rotated activation copy
     pub paro_fused_scratch: Option<Vec<GpuTensor>>, // ParoQuant fused paths: multiple rotation scratch buffers
     pub mq_x_q8: Option<hip_bridge::DeviceBuffer>,  // INT8 quantized rotated x for dp4a
@@ -855,6 +864,10 @@ impl Gpu {
             mq_signs1_128: None,
             mq_signs2_128: None,
             mq_x_rot: None,
+            oq4_xq: None,
+            oq4_xs: None,
+            oq4_xr: None,
+            oq4_ytmp: None,
             paro_x_scratch: None,
             paro_fused_scratch: None,
             mq_x_q8: None,
@@ -7743,6 +7756,22 @@ impl Gpu {
         self.mq_x_rot = Some(x_rot);
         self.mq_x_q8 = Some(x_q8);
         self.mq_x_scales = Some(x_scales);
+        Ok(())
+    }
+
+    /// Lazily allocate the Opus Quant W4A4 persistent decode scratch (B=1).
+    /// Sized to 32768-element max (K/M ≤ 32768) — mirrors `mq_x_rot`. Idempotent.
+    /// Callers alias these (`oq4_xq`/`oq4_xs`/`oq4_xr`/`oq4_ytmp`) so the per-token
+    /// forward does NO hipMalloc/hipFree → hipGraph-capture-clean.
+    pub fn ensure_oq4_scratch(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.oq4_xq.is_some() {
+            return Ok(());
+        }
+        self.oq4_xq = Some(self.alloc_tensor(&[16384], DType::Raw)?); // K/2 ≤ 16384
+        self.oq4_xs = Some(self.alloc_tensor(&[128], DType::F32)?); // K/256 ≤ 128
+        self.oq4_xr = Some(self.alloc_tensor(&[32768], DType::F32)?); // K ≤ 32768
+        self.oq4_ytmp = Some(self.alloc_tensor(&[32768], DType::F32)?); // M ≤ 32768
         Ok(())
     }
 
