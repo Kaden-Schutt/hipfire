@@ -332,7 +332,7 @@ fn synth_activations(batch_size: usize, k: usize, seed: u64) -> Vec<f32> {
 fn get_weight_for_site<'a>(
     layer: &'a hipfire_arch_qwen35::qwen35::LayerWeights,
     site_name: &str,
-) -> Option<&'a hipfire_runtime::llama::WeightTensor> {
+) -> Option<&'a hipfire_runtime::weights::WeightTensor> {
     use hipfire_arch_qwen35::qwen35::LayerWeights;
     match layer {
         LayerWeights::DeltaNet(l) => match site_name {
@@ -415,7 +415,7 @@ fn sites_for_layer(layer: &hipfire_arch_qwen35::qwen35::LayerWeights) -> &'stati
 #[cfg(feature = "deltanet")]
 fn compare_residual(
     gpu: &mut rdna_compute::Gpu,
-    weight: &hipfire_runtime::llama::WeightTensor,
+    weight: &hipfire_runtime::weights::WeightTensor,
     x_data: &[f32],
     m: usize,
     k: usize,
@@ -434,7 +434,7 @@ fn compare_residual(
 #[cfg(feature = "deltanet")]
 fn compare_residual_raw(
     gpu: &mut rdna_compute::Gpu,
-    weight: &hipfire_runtime::llama::WeightTensor,
+    weight: &hipfire_runtime::weights::WeightTensor,
     x_data: &[f32],
     m: usize,
     k: usize,

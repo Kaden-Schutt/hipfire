@@ -16,7 +16,7 @@
 //!
 //!   cargo run --release -p hipfire-runtime --example oq4_weight_gemv_parity [M K]
 
-use hipfire_runtime::llama::{weight_gemv, WeightTensor};
+use hipfire_runtime::weights::{weight_gemv, WeightTensor};
 use rdna_compute::{gen_fwht_signs, DType, Gpu};
 
 fn lcg(seed: u32, n: usize) -> Vec<f32> {
@@ -25,7 +25,11 @@ fn lcg(seed: u32, n: usize) -> Vec<f32> {
         .map(|i| {
             s = s.wrapping_mul(1_103_515_245).wrapping_add(12345) & 0x7fff_ffff;
             let v = (s as f32 / 2_147_483_648.0) - 0.5;
-            if i % 89 == 0 { v * 8.0 } else { v } // sparse outliers
+            if i % 89 == 0 {
+                v * 8.0
+            } else {
+                v
+            } // sparse outliers
         })
         .collect()
 }
@@ -65,7 +69,10 @@ fn main() {
 
     let mut gpu = Gpu::init().unwrap();
     if !gpu.arch_caps.has_wmma_w32() {
-        println!("SKIP oq4_weight_gemv_parity: {} lacks wave32 WMMA", gpu.arch);
+        println!(
+            "SKIP oq4_weight_gemv_parity: {} lacks wave32 WMMA",
+            gpu.arch
+        );
         return;
     }
 
@@ -136,7 +143,10 @@ fn main() {
     };
 
     let xd = gpu
-        .upload_raw(&x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(), &[k])
+        .upload_raw(
+            &x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
+            &[k],
+        )
         .unwrap();
     let yd = gpu.upload_raw(&vec![0u8; m * 4], &[m]).unwrap();
     weight_gemv(&mut gpu, &wt, &xd, &yd).unwrap();

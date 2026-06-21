@@ -5,10 +5,9 @@
 //! HFQ (.hfq) file loader for hipfire-native Q4_F16 quantized models.
 
 use crate::hfq_modules::{parse_module_table, validate_modules, HfqModuleRecord};
-use crate::llama::{
-    EmbeddingFormat, LayerWeights, LlamaConfig, LlamaWeights, ModelArch, WeightTensor,
-};
+use crate::llama::{LlamaConfig, LlamaWeights, ModelArch};
 use crate::quant::f16_to_f32;
+use crate::weights::{EmbeddingFormat, LayerWeights, WeightTensor};
 use hip_bridge::{HipError, HipResult};
 use hipfire_model::{ModelSource, QuantConfig, TensorInfo};
 use memmap2::Mmap;
@@ -2196,7 +2195,7 @@ fn load_paroquant_weight_from_source(
     group_size: u32,
     krot: u8,
 ) -> HipResult<WeightTensor> {
-    use crate::llama::ParoRotation;
+    use crate::weights::ParoRotation;
 
     let qw_name = format!("{tensor_prefix}.qweight");
     let qz_name = format!("{tensor_prefix}.qzeros");

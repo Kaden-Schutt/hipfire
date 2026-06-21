@@ -34,25 +34,14 @@ pub mod hfq_modules;
 pub mod host_profile;
 pub mod llama;
 // Neutral homes for the GENERIC primitives historically defined under `llama`
-// (they are not llama-specific — every arch uses them). Callers should import
-// from these modules, not `llama`. The definitions still physically live in
-// `llama` for now; relocating them is a no-API-change follow-up. See the
-// de-llama-ify cleanup.
+// (they are not llama-specific — every arch uses them). Callers import from
+// these modules, not `llama`. The `quant`, `dispatch`, and `weights` modules
+// now own their definitions outright (relocated out of `llama.rs` in the
+// de-llama-ify cleanup); `kv` still re-exports `KvCache` from `llama` pending
+// the final slice.
 pub mod kv {
     //! Generic KV cache (not llama-specific).
     pub use crate::llama::KvCache;
-}
-pub mod weights {
-    //! Generic weight/embedding types + the GEMV/GEMM/rotate operations on them
-    //! (not llama-specific).
-    pub use crate::llama::{
-        fused_rmsnorm_rotate_for_mq, fused_rmsnorm_rotate_for_paro,
-        fused_rmsnorm_rotate_mq_batched_for, fused_silu_mul_rotate_mq_batched_for,
-        fused_silu_mul_rotate_mq_for, rotate_x_mq_128_for, rotate_x_mq_batched_for,
-        rotate_x_mq_for, rotate_x_paro_for, weight_gemm, weight_gemv, weight_gemv_prerotated,
-        weight_gemv_residual, weight_gemv_swiglu_residual, EmbeddingFormat, LayerWeights,
-        ParoRotation, WeightTensor,
-    };
 }
 pub mod dispatch;
 pub mod logging;
@@ -71,3 +60,4 @@ pub mod tp_shard;
 pub mod triattn;
 #[cfg(feature = "deltanet")]
 pub mod weight_pager;
+pub mod weights;

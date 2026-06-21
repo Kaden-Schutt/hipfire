@@ -38,8 +38,8 @@ fn main() {
     use hipfire_runtime::hfq::{
         write_hfqm_package_from_files, HfqPackageWriteEntry, HFQM_ARCH_NON_WEIGHT_PACKAGE,
     };
-    use hipfire_runtime::llama::weight_gemv;
     use hipfire_runtime::llama::KvCache;
+    use hipfire_runtime::weights::weight_gemv;
     use rayon::prelude::*;
     use rdna_compute::{DType, Gpu, GpuTensor};
     use serde_json::json;

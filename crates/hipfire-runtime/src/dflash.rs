@@ -27,7 +27,7 @@
 //!   one whole layer of persistence bookkeeping.
 
 use crate::hfq::{load_awq_scale, HfqFile};
-use crate::llama::WeightTensor;
+use crate::weights::WeightTensor;
 use hip_bridge::{Graph, GraphExec, HipResult};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::{HashMap, HashSet};
@@ -783,7 +783,7 @@ fn gemm_dispatch(
                 // through to the plain `rotate_x_mq_batched` and is
                 // numerically identical to the prior dispatch.
                 if let Err(e) =
-                    crate::llama::rotate_x_mq_batched_for(gpu, w, &x_chunk, &rot_view, w.k, n)
+                    crate::weights::rotate_x_mq_batched_for(gpu, w, &x_chunk, &rot_view, w.k, n)
                 {
                     chunked = Err(e);
                     break;
@@ -828,7 +828,7 @@ fn gemm_dispatch(
                 // before the HFQ3 GEMM; pre-fix this silently produced
                 // wrong drafts on AWQ-calibrated drafters.
                 if let Err(e) =
-                    crate::llama::rotate_x_mq_batched_for(gpu, w, &x_chunk, &rot_view, w.k, n)
+                    crate::weights::rotate_x_mq_batched_for(gpu, w, &x_chunk, &rot_view, w.k, n)
                 {
                     chunked = Err(e);
                     break;
