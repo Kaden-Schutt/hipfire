@@ -3778,6 +3778,12 @@ pub const ATTENTION_COLD_SLOTS_SRC: &str =
 pub const FLASH_TIER_MERGE_SRC: &str =
     include_str!("../../../kernels/src/flash_tier_merge.hip");
 
+/// Phase 2b hot-tier (m,l) extract: re-read the KVarN/asym flash's per-tile
+/// partials and emit the final softmax (max, denom) so the hot tier can feed
+/// flash_tier_merge. See flash_partials_ml.hip.
+pub const FLASH_PARTIALS_ML_SRC: &str =
+    include_str!("../../../kernels/src/flash_partials_ml.hip");
+
 /// KVarN write-side gather (Phase D1 #2): transpose a contiguous run of
 /// token-major K rows into the channel-major `[head_dim × GROUP]` tiles that
 /// `kvarn_quantize_tile` consumes. See `kernels/src/kvarn_gather_k_tiles.hip`.

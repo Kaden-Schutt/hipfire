@@ -45825,6 +45825,70 @@ impl Gpu {
         }
     }
 
+    /// Phase 2b: extract the hot KVarN/asym flash's final softmax (m,l) from the
+    /// per-tile `partials` buffer it already filled, so the hot tier can feed
+    /// `flash_tier_merge`. `max_tiles` and the seq-len convention (positions vs
+    /// block_start+block_cols) MUST match the flash that produced `partials`.
+    /// Writes `m_out`,`l_out` = [sub_batch × n_heads]. Zero LDS, one thread/(head,pos).
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_partials_ml(
+        &mut self,
+        partials: &GpuTensor,
+        positions: &GpuTensor,
+        m_out: &GpuTensor,
+        l_out: &GpuTensor,
+        n_heads: usize,
+        head_dim: usize,
+        tile_size: usize,
+        max_tiles: usize,
+        sub_batch: usize,
+        batch_offset: usize,
+        block_start: usize,
+        block_cols: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "flash_partials_ml",
+            kernels::FLASH_PARTIALS_ML_SRC,
+            "flash_partials_ml",
+        )?;
+        let pp = partials.buf.as_ptr();
+        let posp = positions.buf.as_ptr();
+        let mop = m_out.buf.as_ptr();
+        let lop = l_out.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut ts = tile_size as i32;
+        let mut mt = max_tiles as i32;
+        let mut bo = batch_offset as i32;
+        let mut bs = block_start as i32;
+        let mut bc = block_cols as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &posp as *const _ as *mut c_void,
+            &mop as *const _ as *mut c_void,
+            &lop as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut ts as *mut _ as *mut c_void,
+            &mut mt as *mut _ as *mut c_void,
+            &mut bo as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut bc as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions["flash_partials_ml"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, sub_batch as u32, 1],
+                [1, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// KVarN tile dequantizer: unpack records → f16 tiles for the reused
     /// asym4/q8 flash attention. `recs` = [n_tiles, record_bytes]; `out` = f16
     /// [n_tiles, r_dim*c_dim]. One block per tile, zero LDS.
