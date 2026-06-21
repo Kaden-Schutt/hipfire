@@ -8,7 +8,7 @@ model architecture support — all welcome.
 
 Both paths below use only the installer-provided binaries (the
 `hipfire` wrapper, daemon, and quantizer dropped into `~/.hipfire/bin/`
-by `scripts/install.sh`). No `cargo`, no ROCm SDK, no source build.
+by `install.sh`). No `cargo`, no ROCm SDK, no source build.
 
 ### 1. Run the bench matrix on your GPU
 

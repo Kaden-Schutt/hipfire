@@ -57,7 +57,7 @@ eviction with `hipfire config cask-profile balanced`. See
 Linux with ROCm 6+:
 
 ```bash
-curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash
+curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/install.sh | bash
 ```
 
 For source builds and verifying the install:
