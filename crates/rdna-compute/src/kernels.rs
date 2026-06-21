@@ -3747,6 +3747,11 @@ pub const GEMV_OQ4_GROUPED_SRC: &str =
 pub const KVARN_QUANTIZE_TILE_SRC: &str =
     include_str!("../../../kernels/src/kvarn_quantize_tile.hip");
 
+/// KVarN tile dequantizer (Phase D1 read-side): unpack record → f16 tile for the
+/// reused asym4/q8 flash attention. Zero LDS. See `kernels/src/kvarn_dequant_tile.hip`.
+pub const KVARN_DEQUANT_TILE_SRC: &str =
+    include_str!("../../../kernels/src/kvarn_dequant_tile.hip");
+
 // Generic kernel library GEMV tier (gfx1103 wave32, zero LDS, wave-shuffle
 // reduction; one wave per output row). Same-dtype weight/vector inputs.
 // See `docs/kernels/generic-kernel-library.md`.

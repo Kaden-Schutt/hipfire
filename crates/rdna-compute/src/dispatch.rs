@@ -45337,6 +45337,51 @@ impl Gpu {
         }
     }
 
+    /// KVarN tile dequantizer: unpack records → f16 tiles for the reused
+    /// asym4/q8 flash attention. `recs` = [n_tiles, record_bytes]; `out` = f16
+    /// [n_tiles, r_dim*c_dim]. One block per tile, zero LDS.
+    pub fn kvarn_dequant_tile(
+        &mut self,
+        recs: &GpuTensor,
+        out: &GpuTensor,
+        n_tiles: usize,
+        r_dim: usize,
+        c_dim: usize,
+        record_bytes: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "kvarn_dequant_tile",
+            kernels::KVARN_DEQUANT_TILE_SRC,
+            "kvarn_dequant_tile",
+        )?;
+        let rp = recs.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mut nt = n_tiles as i32;
+        let mut rd = r_dim as i32;
+        let mut cd = c_dim as i32;
+        let mut rb = record_bytes as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &rp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nt as *mut _ as *mut c_void,
+            &mut rd as *mut _ as *mut c_void,
+            &mut cd as *mut _ as *mut c_void,
+            &mut rb as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions["kvarn_dequant_tile"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_tiles as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Opus Quant W4A4 fused Gate+Up: gate_proj + up_proj grouped-iu4 GEMMs in
     /// one launch sharing the int4 activation (`xq`/`xs`). Each weight buffer is
     /// the combined `[nibbles | f32 scales]` layout (scales addressed internally

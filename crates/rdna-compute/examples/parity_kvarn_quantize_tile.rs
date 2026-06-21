@@ -100,6 +100,19 @@ fn main() {
     }
     let cs = cos_sim(&deq, &tile);
 
+    // GPU dequant kernel: must match the host dequant of the same record.
+    let outd = gpu.upload_raw(&vec![0u8; n * 2], &[n]).unwrap();
+    gpu.kvarn_dequant_tile(&rd, &outd, 1, r, c, record_bytes).unwrap();
+    gpu.device_synchronize().unwrap();
+    let outb = gpu.download_raw(&outd, n * 2).unwrap();
+    let mut gpu_deq = vec![0.0f32; n];
+    let mut max_deq_err = 0.0f32;
+    for i in 0..n {
+        gpu_deq[i] = f16_to_f32(u16::from_le_bytes([outb[i * 2], outb[i * 2 + 1]]));
+        max_deq_err = max_deq_err.max((gpu_deq[i] - deq[i]).abs() / deq[i].abs().max(1e-4));
+    }
+    let cs_gpu_deq = cos_sim(&gpu_deq, &tile);
+
     // Naive per-row 4-bit (no variance-normalization) baseline.
     let mut naive = vec![0.0f32; n];
     for ri in 0..r {
@@ -113,9 +126,12 @@ fn main() {
     }
     let cs_naive = cos_sim(&naive, &tile);
 
-    let pass = cs >= 0.99 && cs > cs_naive;
+    // GPU dequant must agree with host dequant (f16 round-trip tolerance) and
+    // reproduce the same reconstruction quality.
+    let pass = cs >= 0.99 && cs > cs_naive && max_deq_err < 5e-3 && (cs_gpu_deq - cs).abs() < 1e-3;
     println!(
-        "parity_kvarn_quantize_tile r={r} c={c} on {}: GPU cos-sim={cs:.5}  naive-4bit={cs_naive:.5}  -> {}",
+        "parity_kvarn_quantize_tile r={r} c={c} on {}: GPU cos-sim={cs:.5}  naive-4bit={cs_naive:.5}  \
+         deq-kernel cos-sim={cs_gpu_deq:.5} max-rel-err={max_deq_err:.2e}  -> {}",
         gpu.arch,
         if pass { "PASS" } else { "FAIL" }
     );
