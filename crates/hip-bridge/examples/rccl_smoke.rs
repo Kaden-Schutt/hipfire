@@ -75,13 +75,17 @@ fn main() {
         for _ in 0..warmup {
             rccl.group_start().expect("group_start");
             for r in 0..n_ranks {
-                rccl.all_reduce_sum_f32(
-                    r,
-                    send_bufs[r].as_ptr() as *const f32,
-                    recv_bufs[r].as_ptr() as *mut f32,
-                    count,
-                    streams[r].raw_ptr(),
-                )
+                // SAFETY: send/recv bufs hold `count` f32 elements on rank `r`
+                // and `streams[r]` is that rank's live stream.
+                unsafe {
+                    rccl.all_reduce_sum_f32(
+                        r,
+                        send_bufs[r].as_ptr() as *const f32,
+                        recv_bufs[r].as_ptr() as *mut f32,
+                        count,
+                        streams[r].raw_ptr(),
+                    )
+                }
                 .expect("all_reduce warm");
             }
             rccl.group_end().expect("group_end");
@@ -97,13 +101,17 @@ fn main() {
             let t = Instant::now();
             rccl.group_start().expect("group_start");
             for r in 0..n_ranks {
-                rccl.all_reduce_sum_f32(
-                    r,
-                    send_bufs[r].as_ptr() as *const f32,
-                    recv_bufs[r].as_ptr() as *mut f32,
-                    count,
-                    streams[r].raw_ptr(),
-                )
+                // SAFETY: send/recv bufs hold `count` f32 elements on rank `r`
+                // and `streams[r]` is that rank's live stream.
+                unsafe {
+                    rccl.all_reduce_sum_f32(
+                        r,
+                        send_bufs[r].as_ptr() as *const f32,
+                        recv_bufs[r].as_ptr() as *mut f32,
+                        count,
+                        streams[r].raw_ptr(),
+                    )
+                }
                 .expect("all_reduce");
             }
             rccl.group_end().expect("group_end");

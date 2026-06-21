@@ -462,9 +462,9 @@ pub struct Gpu {
     // the (future) hipGraph-captured region — per-call alloc would trip
     // "hipMalloc not permitted under stream capture". Stream-ordered reuse across
     // sequential projections is safe (one stream, in-order). Sized to max K/M.
-    pub oq4_xq: Option<GpuTensor>,   // packed int4 activation, K/2 bytes
-    pub oq4_xs: Option<GpuTensor>,   // per-group f32 activation scales, K/256
-    pub oq4_xr: Option<GpuTensor>,   // rotated f32 activation (Raw paths), K
+    pub oq4_xq: Option<GpuTensor>, // packed int4 activation, K/2 bytes
+    pub oq4_xs: Option<GpuTensor>, // per-group f32 activation scales, K/256
+    pub oq4_xr: Option<GpuTensor>, // rotated f32 activation (Raw paths), K
     pub oq4_ytmp: Option<GpuTensor>, // f32 residual GEMM scratch, M
     // Batched-prefill counterparts: int4-quantized activation for N tokens at
     // once (W4A4 oq4 batched WMMA path). Sized lazily to hold N*K/2 packed
@@ -7794,7 +7794,12 @@ impl Gpu {
     /// of the same or smaller size reuse one allocation. `m_max` is the largest
     /// output-row count fed to a residual GEMM in this layer family (pass the
     /// model hidden_dim — every wo/w_down output ≤ dim for the dense path).
-    pub fn ensure_oq4_scratch_batched(&mut self, n: usize, k: usize, m_max: usize) -> HipResult<()> {
+    pub fn ensure_oq4_scratch_batched(
+        &mut self,
+        n: usize,
+        k: usize,
+        m_max: usize,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         let need_xq = n * (k / 2);
         let need_xs = n * (k / 256);
@@ -22920,7 +22925,9 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "moe_gate_up_unscatter_k8",
-            [grid_x, m_total as u32, 1],
+            // m_total in grid.x (limit 2^31), mi-tile in grid.y — m_total exceeds
+            // the 65535 grid.y limit past ~8k prefill tokens (m_total = N*K_TOP).
+            [m_total as u32, grid_x, 1],
             [block, 1, 1],
             0,
             &mut params,
@@ -45565,8 +45572,16 @@ impl Gpu {
         group: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert_eq!(k % group, 0, "gemm_oq4_grouped_wmma: K must be a multiple of group");
-        assert_eq!(group % 16, 0, "gemm_oq4_grouped_wmma: group must be a multiple of 16");
+        assert_eq!(
+            k % group,
+            0,
+            "gemm_oq4_grouped_wmma: K must be a multiple of group"
+        );
+        assert_eq!(
+            group % 16,
+            0,
+            "gemm_oq4_grouped_wmma: group must be a multiple of 16"
+        );
         self.ensure_kernel(
             "gemm_oq4_grouped_wmma",
             kernels::GEMM_OQ4_GROUPED_WMMA_SRC,
@@ -45625,8 +45640,16 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         assert_eq!(group, 256, "gemv_oq4_grouped: group must be 256");
-        assert_eq!(k % group, 0, "gemv_oq4_grouped: K must be a multiple of group");
-        self.ensure_kernel("gemv_oq4_grouped", kernels::GEMV_OQ4_GROUPED_SRC, "gemv_oq4_grouped")?;
+        assert_eq!(
+            k % group,
+            0,
+            "gemv_oq4_grouped: K must be a multiple of group"
+        );
+        self.ensure_kernel(
+            "gemv_oq4_grouped",
+            kernels::GEMV_OQ4_GROUPED_SRC,
+            "gemv_oq4_grouped",
+        )?;
         let wp = w_i4.buf.as_ptr();
         let wsp = w_scales.buf.as_ptr();
         let xp = x_i4.buf.as_ptr();
@@ -45672,8 +45695,15 @@ impl Gpu {
         record_bytes: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(r_dim <= 256 && c_dim <= 256, "kvarn_quantize_tile: r,c must be <= 256");
-        assert_eq!(c_dim % 2, 0, "kvarn_quantize_tile: c_dim must be even (nibble rows)");
+        assert!(
+            r_dim <= 256 && c_dim <= 256,
+            "kvarn_quantize_tile: r,c must be <= 256"
+        );
+        assert_eq!(
+            c_dim % 2,
+            0,
+            "kvarn_quantize_tile: c_dim must be even (nibble rows)"
+        );
         self.ensure_kernel(
             "kvarn_quantize_tile",
             kernels::KVARN_QUANTIZE_TILE_SRC,
@@ -45980,8 +46010,16 @@ impl Gpu {
         group: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert_eq!(k % group, 0, "fused_gate_up_oq4_wmma: K must be a multiple of group");
-        assert_eq!(group % 16, 0, "fused_gate_up_oq4_wmma: group must be a multiple of 16");
+        assert_eq!(
+            k % group,
+            0,
+            "fused_gate_up_oq4_wmma: K must be a multiple of group"
+        );
+        assert_eq!(
+            group % 16,
+            0,
+            "fused_gate_up_oq4_wmma: group must be a multiple of 16"
+        );
         self.ensure_kernel(
             "fused_gate_up_oq4_wmma",
             kernels::FUSED_GATE_UP_OQ4_WMMA_SRC,
@@ -46051,8 +46089,16 @@ impl Gpu {
         group: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert_eq!(k % group, 0, "fused_qkvza_oq4_wmma: K must be a multiple of group");
-        assert_eq!(group % 16, 0, "fused_qkvza_oq4_wmma: group must be a multiple of 16");
+        assert_eq!(
+            k % group,
+            0,
+            "fused_qkvza_oq4_wmma: K must be a multiple of group"
+        );
+        assert_eq!(
+            group % 16,
+            0,
+            "fused_qkvza_oq4_wmma: group must be a multiple of 16"
+        );
         self.ensure_kernel(
             "fused_qkvza_oq4_wmma",
             kernels::FUSED_QKVZA_OQ4_WMMA_SRC,
@@ -46123,8 +46169,16 @@ impl Gpu {
         group: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert_eq!(group % 32, 0, "quantize_act_oq4: group must be a multiple of 32");
-        assert_eq!(k % group, 0, "quantize_act_oq4: K must be a multiple of group");
+        assert_eq!(
+            group % 32,
+            0,
+            "quantize_act_oq4: group must be a multiple of 32"
+        );
+        assert_eq!(
+            k % group,
+            0,
+            "quantize_act_oq4: K must be a multiple of group"
+        );
         self.ensure_kernel(
             "quantize_act_oq4",
             kernels::QUANTIZE_ACT_OQ4_SRC,

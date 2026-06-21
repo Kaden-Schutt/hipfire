@@ -561,13 +561,18 @@ impl Gpus {
                     ),
                 )
             })?;
-            rccl.all_reduce_sum_f32(
-                r,
-                buf.as_ptr() as *const f32,
-                buf.as_ptr() as *mut f32,
-                count,
-                stream.raw_ptr(),
-            )
+            // SAFETY: `buf` is a live device buffer on rank `r` with `count`
+            // f32 elements, and `stream` is the rank's active stream (checked
+            // above). Same in/out ptr performs an in-place all-reduce.
+            unsafe {
+                rccl.all_reduce_sum_f32(
+                    r,
+                    buf.as_ptr() as *const f32,
+                    buf.as_ptr() as *mut f32,
+                    count,
+                    stream.raw_ptr(),
+                )
+            }
             .map_err(|e| HipError::new(0, &format!("ncclAllReduce rank={r}: {e}")))?;
         }
         rccl.group_end()

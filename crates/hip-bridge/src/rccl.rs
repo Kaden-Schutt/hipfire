@@ -309,7 +309,13 @@ impl RcclComms {
 
     /// Typed convenience for f32 sum — the load-bearing TP all-reduce
     /// shape (residual stream summation across ranks).
-    pub fn all_reduce_sum_f32(
+    ///
+    /// # Safety
+    /// Caller asserts `sendbuff`/`recvbuff` point to `count` valid f32
+    /// elements of device memory associated with `rank`, and that `stream`
+    /// is a live stream on that device. See `all_reduce` for the rest of the
+    /// safety contract.
+    pub unsafe fn all_reduce_sum_f32(
         &self,
         rank: usize,
         sendbuff: *const f32,
@@ -317,17 +323,15 @@ impl RcclComms {
         count: usize,
         stream: *mut c_void,
     ) -> RcclResult<()> {
-        unsafe {
-            self.all_reduce(
-                rank,
-                sendbuff as *const c_void,
-                recvbuff as *mut c_void,
-                count,
-                RcclDataType::Float32,
-                RcclRedOp::Sum,
-                stream,
-            )
-        }
+        self.all_reduce(
+            rank,
+            sendbuff as *const c_void,
+            recvbuff as *mut c_void,
+            count,
+            RcclDataType::Float32,
+            RcclRedOp::Sum,
+            stream,
+        )
     }
 
     /// Typed convenience for fp16 sum (residual stream in mixed-precision).
