@@ -14273,8 +14273,20 @@ pub fn prefill_batch_pbs_eligible(
     arch: &str,
     moe_router_logits_present: bool,
 ) -> bool {
-    // HIPFIRE_PREFILL_BATCHED=0 forces the per-token fallback (escape hatch).
-    let force_fallback = std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() == Some("0");
+    // HIPFIRE_PREFILL_BATCHED=0 forces the per-token fallback — an escape hatch
+    // for the LARGE seed prefill (gfx11 24GB OOM + a batched-seed correctness bug
+    // that collapses MTP τ→1.0). But the small-B MTP verify (n = K+1, ≤ ~32) is
+    // cheap and its BATCHED path is the dominant gfx11 decode lever. Decouple:
+    // let the small-B verify batch even when the flag forces the seed per-token.
+    // Opt-in (HIPFIRE_MTP_VERIFY_DECOUPLE=1) until the batched verify is validated
+    // coherent + τ-preserving per-arch. (Ported from origin/master becc0610; the
+    // gfx11 default-on follow-up bc5d005d is intentionally NOT taken here — its
+    // `starts_with("gfx11")` gate wrongly includes this gfx1151 box, where the
+    // lever is unvalidated; see the plan doc.)
+    let verify_decouple =
+        n <= 32 && std::env::var("HIPFIRE_MTP_VERIFY_DECOUPLE").ok().as_deref() == Some("1");
+    let force_fallback =
+        !verify_decouple && std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() == Some("0");
     // MoE batched path requires K_TOP=8 (hard-coded in the indexed kernels) and
     // num_experts ≤ 1024 (bound of the batched top-K shared mem).
     let moe_topk_ok =
@@ -26437,9 +26449,8 @@ fn kv_cache_attention_dispatch(
         // Requires head_dim == 256 (the FWHT-256 group). Opt out with
         // HIPFIRE_KVARN_ROTATE=0 for A/B.
         static KVARN_ROTATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let kvarn_rotate = *KVARN_ROTATE.get_or_init(|| {
-            std::env::var("HIPFIRE_KVARN_ROTATE").ok().as_deref() != Some("0")
-        });
+        let kvarn_rotate = *KVARN_ROTATE
+            .get_or_init(|| std::env::var("HIPFIRE_KVARN_ROTATE").ok().as_deref() != Some("0"));
         if kvarn_rotate && config.head_dim == 256 {
             // In-place: mq_rotate_x loads each 256-group into registers (ds_swizzle
             // butterfly, zero LDS) before storing, so x_in == x_out is safe. n=1
@@ -26452,8 +26463,10 @@ fn kv_cache_attention_dispatch(
         // The fused KVarN flash (Phase D2) reads records in place, so no f16
         // shadow K buffer is needed anymore.
         if kv_cache.kvarn_tiles.is_none() {
-            let tiles = gpu
-                .alloc_tensor(&[config.n_kv_heads * config.head_dim * 128], rdna_compute::DType::F32)?;
+            let tiles = gpu.alloc_tensor(
+                &[config.n_kv_heads * config.head_dim * 128],
+                rdna_compute::DType::F32,
+            )?;
             kv_cache.kvarn_tiles = Some(tiles);
         }
         // The KV-write/flash kernels read positions from a GpuTensor; `s.pos_buf`
