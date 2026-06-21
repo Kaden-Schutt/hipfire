@@ -45724,6 +45724,13 @@ impl Gpu {
         n_kv_heads: usize,
         n_slots: usize,
         scale: f32,
+        // 0 = slot-major [nkv×stride×hd]; 1 = channel-major [nkv×hd×stride]
+        // (the kvarn_dequant_tile output layout — lets the cold tier read straight
+        // off its dequantized 4-bit records).
+        kv_layout: usize,
+        // Per-kv-head slot row stride (the padded tile width); attend the first
+        // `n_slots` slots. Pass 0 to default to n_slots (dense, no padding).
+        slot_stride: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -45741,6 +45748,8 @@ impl Gpu {
         let mut nkv = n_kv_heads as i32;
         let mut ns = n_slots as i32;
         let mut sc = scale;
+        let mut kl = kv_layout as i32;
+        let mut sstride = slot_stride as i32;
         let mut params: Vec<*mut c_void> = vec![
             &qp as *const _ as *mut c_void,
             &kp as *const _ as *mut c_void,
@@ -45752,6 +45761,8 @@ impl Gpu {
             &mut nkv as *mut _ as *mut c_void,
             &mut ns as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
+            &mut kl as *mut _ as *mut c_void,
+            &mut sstride as *mut _ as *mut c_void,
         ];
         let func = &self.functions["attention_cold_slots"];
         unsafe {

@@ -12,6 +12,7 @@
 // Parity oracle: hipfire_kvquant::ColdTier::two_tier_attend with n_hot = 0.
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 
 #define CHD 256       // head_dim
 #define CPL 8         // CHD / 32 elements per lane
@@ -24,8 +25,22 @@ extern "C" __global__ void attention_cold_slots(
     float*       __restrict__ OUT, // [n_heads * 256] (normalized)
     float*       __restrict__ M_OUT, // [n_heads] flash max (or null) — for tier merge
     float*       __restrict__ L_OUT, // [n_heads] flash denom (or null)
-    int n_heads, int n_kv_heads, int n_slots, float scale
+    int n_heads, int n_kv_heads, int n_slots, float scale,
+    // K/V memory layout per kv-head. 0 = SLOT-major: [n_kv_heads × slot_stride × 256],
+    // element (s,d) at (kv*slot_stride+s)*256 + d (contiguous head vec per slot).
+    // 1 = CHANNEL-major __half: [n_kv_heads × 256 × slot_stride], element (s,d) at
+    // kv*256*slot_stride + d*slot_stride + s — the kvarn_dequant_tile output layout
+    // (which emits f16), so the cold tier reads straight off its dequantized 4-bit
+    // records with no transpose and no f32 widening. K/V are reinterpreted as
+    // const __half* in this mode (Q stays f32). slot-major (0) keeps K/V f32.
+    int kv_layout,
+    // Per-kv-head slot row stride. Attend over the first `n_slots` slots but index
+    // with this stride (= the padded tile width n_slots_padded), so an odd valid
+    // count can read an even-padded KVarN tile without the pad slot polluting the
+    // softmax. Pass 0 to default to n_slots (dense, no padding).
+    int slot_stride
 ) {
+    const int sstride = (slot_stride > 0) ? slot_stride : n_slots;
     const int hq = blockIdx.x;
     if (hq >= n_heads) return;
     const int lane = threadIdx.x;          // 0..31
@@ -42,12 +57,28 @@ extern "C" __global__ void attention_cold_slots(
     #pragma unroll
     for (int i = 0; i < CPL; ++i) acc[i] = 0.0f;
 
-    const long long kv_base = (long long)kv * n_slots * CHD + lane * CPL;
+    const long long slot_base = (long long)kv * sstride * CHD + lane * CPL; // slot-major
+    const long long ch_base   = (long long)kv * CHD * sstride + lane * CPL * (long long)sstride; // channel-major
     for (int s = 0; s < n_slots; ++s) {
-        const float* k = K + kv_base + (long long)s * CHD;
+        float kk[CPL], vv[CPL];
+        if (kv_layout == 0) {
+            const float* k = K + slot_base + (long long)s * CHD;
+            const float* v = V + slot_base + (long long)s * CHD;
+            #pragma unroll
+            for (int i = 0; i < CPL; ++i) { kk[i] = k[i]; vv[i] = v[i]; }
+        } else {
+            // channel-major f16: dim (lane*CPL+i) of slot s is at ch_base + i*sstride + s.
+            const __half* k = (const __half*)K + ch_base + s;
+            const __half* v = (const __half*)V + ch_base + s;
+            #pragma unroll
+            for (int i = 0; i < CPL; ++i) {
+                kk[i] = __half2float(k[(long long)i * sstride]);
+                vv[i] = __half2float(v[(long long)i * sstride]);
+            }
+        }
         float d = 0.0f;
         #pragma unroll
-        for (int i = 0; i < CPL; ++i) d += q[i] * k[i];
+        for (int i = 0; i < CPL; ++i) d += q[i] * kk[i];
         // butterfly all-reduce across the 32-lane wave → every lane holds the sum.
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1) d += __shfl_xor(d, off);
@@ -57,9 +88,8 @@ extern "C" __global__ void attention_cold_slots(
         const float corr = __expf(m - m_new);   // <= 1
         const float p = __expf(d - m_new);
         l = l * corr + p;
-        const float* v = V + kv_base + (long long)s * CHD;
         #pragma unroll
-        for (int i = 0; i < CPL; ++i) acc[i] = acc[i] * corr + p * v[i];
+        for (int i = 0; i < CPL; ++i) acc[i] = acc[i] * corr + p * vv[i];
         m = m_new;
     }
 
