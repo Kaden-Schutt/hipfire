@@ -291,6 +291,14 @@ fn main() {
             kv_max,
         )
         .unwrap(),
+        "kvarn" => KvCache::new_gpu_kvarn(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_max,
+        )
+        .unwrap(),
         "asym3" => KvCache::new_gpu_asym3(
             &mut gpu,
             config.n_layers,

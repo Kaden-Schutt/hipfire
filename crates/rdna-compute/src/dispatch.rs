@@ -45566,6 +45566,8 @@ impl Gpu {
         positions: &GpuTensor,
         out: &GpuTensor,
         flash_partials: &GpuTensor,
+        shadow: &GpuTensor,
+        tiles: &GpuTensor,
         n: usize,
         start_pos: usize,
         n_heads: usize,
@@ -45586,7 +45588,7 @@ impl Gpu {
         self.kv_cache_write_q8_0_batched(v_cache, fa_v, positions, n_kv_heads, head_dim, n)?;
 
         // 2. K write: append to window, flush each completed 128-token block.
-        let tiles = self.alloc_tensor(&[n_kv_heads * head_dim * GROUP], DType::F32)?;
+        // `tiles`/`shadow` are caller-owned reusable scratch (see KvCache::kvarn_*).
         let mut written = 0usize;
         while written < n {
             let t = start_pos + written;
@@ -45606,25 +45608,25 @@ impl Gpu {
             if slot + take == GROUP {
                 // Block complete in the window → gather + variance-norm 4-bit pack
                 // into records[block].
-                self.kvarn_gather_k_tiles(window, &tiles, 1, n_kv_heads, head_dim, GROUP)?;
+                self.kvarn_gather_k_tiles(window, tiles, 1, n_kv_heads, head_dim, GROUP)?;
                 let rec_off_elems = block * n_kv_heads * rec_bytes / 4;
                 let rec_view = records.sub_offset(rec_off_elems, n_kv_heads * rec_bytes / 4);
-                self.kvarn_quantize_tile(&tiles, &rec_view, n_kv_heads, head_dim, GROUP, rec_bytes)?;
+                self.kvarn_quantize_tile(tiles, &rec_view, n_kv_heads, head_dim, GROUP, rec_bytes)?;
             }
         }
 
-        // 3. Build f16 shadow K [seq_len × kv_dim].
+        // 3. Build f16 shadow K [seq_len × kv_dim] into the reusable scratch (sized
+        // for physical_cap; build writes the first seq_len rows, flash reads them).
         let n_full_blocks = seq_len / GROUP;
         let tail_len = seq_len % GROUP;
-        let shadow = self.alloc_tensor(&[seq_len * kv_dim], DType::F16)?;
         self.kvarn_build_kcache(
-            records, window, &shadow, n_full_blocks, tail_len, n_kv_heads, head_dim, GROUP, rec_bytes,
+            records, window, shadow, n_full_blocks, tail_len, n_kv_heads, head_dim, GROUP, rec_bytes,
         )?;
 
         // 4. f16-K / Q8-V flash over [0, seq_len) with causal masking via positions.
         self.attention_flash_f16k_q8v_batched_masked(
             fa_q,
-            &shadow,
+            shadow,
             v_cache,
             out,
             positions,
