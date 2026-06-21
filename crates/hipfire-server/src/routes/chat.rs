@@ -108,6 +108,52 @@ fn maybe_dump_request(body: &ChatRequest) {
     }
 }
 
+fn debug_chat_enabled() -> bool {
+    std::env::var("HIPFIRE_DEBUG_CHAT").ok().as_deref() == Some("1")
+}
+
+fn maybe_log_debug_chat_request(req_id: &str, model: &str, stream: bool, body: &ChatRequest) {
+    if !debug_chat_enabled() {
+        return;
+    }
+    let request = serde_json::to_string_pretty(body)
+        .unwrap_or_else(|e| format!("<failed to serialize request: {e}>"));
+    tracing::info!(
+        target: "hipfire_chat_debug",
+        request_id = %req_id,
+        model = %model,
+        stream,
+        request = %request,
+        "chat request"
+    );
+}
+
+fn maybe_log_debug_chat_reply(
+    req_id: &str,
+    model: &str,
+    stream: bool,
+    raw_content: &str,
+    tool_calls: &[Value],
+    done: &hipfire_generate::DoneEvent,
+) {
+    if !debug_chat_enabled() {
+        return;
+    }
+    let tool_calls = serde_json::to_string_pretty(tool_calls)
+        .unwrap_or_else(|e| format!("<failed to serialize tool calls: {e}>"));
+    tracing::info!(
+        target: "hipfire_chat_debug",
+        request_id = %req_id,
+        model = %model,
+        stream,
+        finish_reason = done.finish_reason.as_deref().unwrap_or("stop"),
+        tokens = done.tokens,
+        raw_content = %raw_content,
+        tool_calls = %tool_calls,
+        "chat reply"
+    );
+}
+
 fn load_params_from_config(cfg: &HipfireConfig) -> ModelLoadParams {
     ModelLoadParams::from_hipfire_config(cfg)
 }
@@ -1411,6 +1457,7 @@ where
             json!({"error": {"message": "no model specified", "type": "invalid_request_error"}}),
         );
     };
+    maybe_log_debug_chat_request(&req_id, &model_arg, false, &body);
     let preserve_thinking = preserve_thinking(&body);
     let stop = match normalize_stop_sequences(body.stop.as_ref()) {
         Ok(stop) => stop,
@@ -1517,6 +1564,7 @@ where
     match result {
         Ok(Some(done)) => {
             *engine_guard = Some(engine);
+            let raw_reply = raw_text.clone();
             let mut text = strip_visible_thinking(raw_text, preserve_thinking, true);
             let mut tool_calls = daemon_tool_calls_to_openai(raw_tool_calls, &req_id);
             if tool_calls.is_empty() {
@@ -1526,6 +1574,7 @@ where
             } else if let Some((before, _)) = text.split_once("<tool_call>") {
                 text = before.trim().to_string();
             }
+            maybe_log_debug_chat_reply(&req_id, &model_arg, false, &raw_reply, &tool_calls, &done);
             Ok(Some(BlockingChatResult {
                 req_id,
                 created,
@@ -1699,6 +1748,7 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
                 return;
             }
         };
+        maybe_log_debug_chat_request(&req_id, &model_arg, true, &body);
         let preserve_thinking = preserve_thinking(&body);
         let include_usage = include_stream_usage(&body);
         let has_tools = tools_present(body.tools.as_ref());
@@ -1791,6 +1841,8 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
         let tx_cb = tx.clone();
         let mut think_filter = ThinkStreamFilter::default();
         let mut accumulated_tool_text = String::new();
+        let mut debug_raw_text = String::new();
+        let mut debug_structured_tool_calls = Vec::new();
         let mut structured_tool_calls_emitted = false;
         let mut next_tool_call_index = 0usize;
 
@@ -1819,6 +1871,7 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
                     if tx_cb.is_closed() {
                         return GenerateStreamControl::Cancel;
                     }
+                    debug_raw_text.push_str(&token);
                     if has_tools {
                         accumulated_tool_text.push_str(&token);
                         return GenerateStreamControl::Continue;
@@ -1858,6 +1911,7 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
                     }
                     let tool_calls = daemon_tool_calls_to_openai(calls, &req_id_cb);
                     for tool_call in tool_calls {
+                        debug_structured_tool_calls.push(tool_call.clone());
                         structured_tool_calls_emitted = true;
                         let chunk = openai_chat_completion_tool_call_chunk_json(
                             &req_id_cb,
@@ -1890,6 +1944,14 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
                         let stripped =
                             strip_visible_thinking(accumulated_tool_text, preserve_thinking, true);
                         let (content, tool_calls) = parse_inline_tool_calls(&stripped, &req_id);
+                        maybe_log_debug_chat_reply(
+                            &req_id,
+                            &model_arg,
+                            true,
+                            &debug_raw_text,
+                            &tool_calls,
+                            &done,
+                        );
                         let truncation = if tool_calls.is_empty() {
                             detect_tool_call_truncation(&stripped, done.tokens, request_max_tokens)
                         } else {
@@ -1932,6 +1994,14 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
                             )
                         }
                     } else {
+                        maybe_log_debug_chat_reply(
+                            &req_id,
+                            &model_arg,
+                            true,
+                            &debug_raw_text,
+                            &debug_structured_tool_calls,
+                            &done,
+                        );
                         openai_chat_completion_finish_chunk_json(
                             &req_id,
                             created,
@@ -1940,6 +2010,14 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
                         )
                     }
                 } else {
+                    maybe_log_debug_chat_reply(
+                        &req_id,
+                        &model_arg,
+                        true,
+                        &debug_raw_text,
+                        &[],
+                        &done,
+                    );
                     let mut chunk =
                         openai_chat_completion_done_chunk_json(&req_id, &model_arg, &done);
                     chunk["created"] = json!(created);

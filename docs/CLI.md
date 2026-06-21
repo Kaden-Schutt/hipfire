@@ -57,6 +57,7 @@ Start the hipfire HTTP server (OpenAI-compatible)
 * `--host <HOST>` — Override bind host
 * `-p`, `--port <PORT>` — Override bind port
 * `-m`, `--model <MODEL>` — Pre-load a model on startup
+* `--debug-chat` — Log full raw chat requests and raw model replies
 
 
 

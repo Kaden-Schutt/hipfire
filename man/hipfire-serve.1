@@ -4,7 +4,7 @@
 .SH NAME
 hipfire\-serve \- Start the hipfire HTTP server (OpenAI\-compatible)
 .SH SYNOPSIS
-\fBhipfire\-serve\fR [\fB\-\-host\fR] [\fB\-p\fR|\fB\-\-port\fR] [\fB\-m\fR|\fB\-\-model\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBhipfire\-serve\fR [\fB\-\-host\fR] [\fB\-p\fR|\fB\-\-port\fR] [\fB\-m\fR|\fB\-\-model\fR] [\fB\-\-debug\-chat\fR] [\fB\-h\fR|\fB\-\-help\fR]
 .SH DESCRIPTION
 Start the hipfire HTTP server (OpenAI\-compatible)
 .SH OPTIONS
@@ -17,6 +17,9 @@ Override bind port
 .TP
 \fB\-m\fR, \fB\-\-model\fR \fI<MODEL>\fR
 Pre\-load a model on startup
+.TP
+\fB\-\-debug\-chat\fR
+Log full raw chat requests and raw model replies
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help

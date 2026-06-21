@@ -13,6 +13,9 @@ pub struct ServeArgs {
     /// Pre-load a model on startup
     #[arg(long, short)]
     pub model: Option<String>,
+    /// Log full raw chat requests and raw model replies.
+    #[arg(long)]
+    pub debug_chat: bool,
 }
 
 pub async fn run(args: ServeArgs, config: LoadedConfig) -> anyhow::Result<()> {
@@ -27,6 +30,9 @@ pub async fn run(args: ServeArgs, config: LoadedConfig) -> anyhow::Result<()> {
         cli_layer
             .values
             .insert("default_model".to_string(), json!(m));
+    }
+    if args.debug_chat {
+        std::env::set_var("HIPFIRE_DEBUG_CHAT", "1");
     }
     hipfire_server::serve_loaded(config.with_additional_layer(cli_layer)).await
 }
