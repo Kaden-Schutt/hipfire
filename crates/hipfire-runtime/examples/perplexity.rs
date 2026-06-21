@@ -17,7 +17,7 @@
 
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::KvCache;
+use hipfire_runtime::kv::KvCache;
 use rdna_compute::Gpu;
 use std::path::Path;
 use std::time::Instant;

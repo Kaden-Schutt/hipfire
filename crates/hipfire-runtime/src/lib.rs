@@ -35,15 +35,11 @@ pub mod host_profile;
 pub mod llama;
 // Neutral homes for the GENERIC primitives historically defined under `llama`
 // (they are not llama-specific — every arch uses them). Callers import from
-// these modules, not `llama`. The `quant`, `dispatch`, and `weights` modules
-// now own their definitions outright (relocated out of `llama.rs` in the
-// de-llama-ify cleanup); `kv` still re-exports `KvCache` from `llama` pending
-// the final slice.
-pub mod kv {
-    //! Generic KV cache (not llama-specific).
-    pub use crate::llama::KvCache;
-}
+// these modules, not `llama`. The `kv`, `quant`, `dispatch`, and `weights`
+// modules now own their definitions outright, relocated out of `llama.rs` in
+// the de-llama-ify cleanup.
 pub mod dispatch;
+pub mod kv;
 pub mod logging;
 pub mod loop_guard;
 pub mod model_source;

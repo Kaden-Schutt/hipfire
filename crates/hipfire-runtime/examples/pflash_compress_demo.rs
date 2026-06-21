@@ -23,7 +23,8 @@ use hipfire_arch_qwen35::pflash::{
     self, BypassReason, PflashConfig, PflashDecision, PflashMode, PflashState, RequestKind,
 };
 use hipfire_runtime::hfq::{self, HfqFile};
-use hipfire_runtime::llama::{self, ForwardScratch, KvCache};
+use hipfire_runtime::kv::KvCache;
+use hipfire_runtime::llama::{self, ForwardScratch};
 use hipfire_runtime::tokenizer::Tokenizer;
 use std::path::Path;
 use std::time::Instant;

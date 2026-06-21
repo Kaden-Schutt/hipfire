@@ -32,7 +32,8 @@ fn main() {
 fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::llama::{self, KvCache};
+    use hipfire_runtime::kv::KvCache;
+    use hipfire_runtime::llama;
     use rdna_compute::profile;
     use std::collections::BTreeMap;
     use std::path::Path;

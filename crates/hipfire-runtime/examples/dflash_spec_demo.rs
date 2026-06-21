@@ -50,6 +50,8 @@
 //! example of the latter shape). Smoke / correctness tests that
 //! don't compare numbers across sessions can inline prompts safely.
 
+use hipfire_runtime::kv::KvCache;
+
 #[cfg(not(feature = "deltanet"))]
 fn main() {
     eprintln!("build with --features deltanet");
@@ -77,7 +79,7 @@ fn main() {
         fn maybe_evict(
             &self,
             gpu: &mut rdna_compute::Gpu,
-            kv: &mut hipfire_runtime::llama::KvCache,
+            kv: &mut KvCache,
             physical: usize,
         ) -> hip_bridge::HipResult<Option<EvictionResult>> {
             match self {

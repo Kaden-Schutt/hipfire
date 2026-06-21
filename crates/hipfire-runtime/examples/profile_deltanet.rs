@@ -15,7 +15,7 @@ fn main() {
     use hipfire_arch_qwen35::qwen35;
     use hipfire_runtime::dispatch;
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::llama;
+    use hipfire_runtime::kv::KvCache;
     use rdna_compute::DType;
     use std::path::Path;
     use std::time::Instant;
@@ -33,7 +33,7 @@ fn main() {
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
     let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights failed");
     let mut dn_state = qwen35::DeltaNetState::new(&mut gpu, &config).unwrap();
-    let mut kv_cache = llama::KvCache::new_gpu(
+    let mut kv_cache = KvCache::new_gpu(
         &mut gpu,
         config.n_layers,
         config.n_kv_heads,

@@ -36,7 +36,8 @@
 use hipfire_arch_llama::Llama;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{self, KvCache};
+use hipfire_runtime::kv::KvCache;
+use hipfire_runtime::llama;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;

@@ -44,6 +44,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
+use crate::kv::KvCache;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -930,7 +931,7 @@ impl EvictionCtx {
     pub fn maybe_evict(
         &self,
         gpu: &mut Gpu,
-        kv: &mut crate::llama::KvCache,
+        kv: &mut KvCache,
         current_physical: usize,
     ) -> HipResult<Option<EvictionResult>> {
         if current_physical < self.budget + self.beta {

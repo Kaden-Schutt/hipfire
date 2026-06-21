@@ -7,7 +7,7 @@
 //! Arch examples keep their typed load/state/forward code locally. This module
 //! owns the common harness pieces that should not be copied between arches.
 
-use crate::llama::KvCache;
+use crate::kv::KvCache;
 use rdna_compute::Gpu;
 use std::path::Path;
 

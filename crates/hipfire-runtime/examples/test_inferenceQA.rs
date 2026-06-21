@@ -20,6 +20,7 @@ use hipfire_arch_qwen35::qwen35::DeltaNetState;
 use hipfire_runtime::gguf::GgufFile;
 #[cfg(feature = "deltanet")]
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::kv::KvCache;
 #[cfg(feature = "deltanet")]
 use hipfire_runtime::llama;
 #[cfg(feature = "deltanet")]
@@ -466,30 +467,30 @@ fn kv_cache_for_mode(
     config: &qwen35::Qwen35Config,
     mode: &str,
     seq_len: usize,
-) -> Result<llama::KvCache, String> {
+) -> Result<KvCache, String> {
     match mode {
-        "q8" => llama::KvCache::new_gpu_q8(
+        "q8" => KvCache::new_gpu_q8(
             gpu,
             config.n_layers,
             config.n_kv_heads,
             config.head_dim,
             seq_len,
         ),
-        "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4(
+        "asym4" | "turbo4" => KvCache::new_gpu_asym4(
             gpu,
             config.n_layers,
             config.n_kv_heads,
             config.head_dim,
             seq_len,
         ),
-        "asym3" | "turbo3" | "turbo" => llama::KvCache::new_gpu_asym3(
+        "asym3" | "turbo3" | "turbo" => KvCache::new_gpu_asym3(
             gpu,
             config.n_layers,
             config.n_kv_heads,
             config.head_dim,
             seq_len,
         ),
-        "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2(
+        "asym2" | "turbo2" => KvCache::new_gpu_asym2(
             gpu,
             config.n_layers,
             config.n_kv_heads,
@@ -505,7 +506,7 @@ fn kv_cache_for_mode(
 fn forward_finite_logits(ctx: &mut Context) -> CaseOutcome {
     match (|| -> Result<String, String> {
         let kv_seq = 128usize;
-        let mut kv = llama::KvCache::new_gpu_q8(
+        let mut kv = KvCache::new_gpu_q8(
             &mut ctx.gpu,
             ctx.config.n_layers,
             ctx.config.n_kv_heads,
@@ -553,7 +554,7 @@ fn forward_finite_logits(ctx: &mut Context) -> CaseOutcome {
 fn forward_scratch_matches(ctx: &mut Context) -> CaseOutcome {
     match (|| -> Result<String, String> {
         let kv_seq = 128usize;
-        let mut kv1 = llama::KvCache::new_gpu_q8(
+        let mut kv1 = KvCache::new_gpu_q8(
             &mut ctx.gpu,
             ctx.config.n_layers,
             ctx.config.n_kv_heads,
@@ -563,7 +564,7 @@ fn forward_scratch_matches(ctx: &mut Context) -> CaseOutcome {
         .map_err(|e| e.to_string())?;
         let mut dn1 = DeltaNetState::new(&mut ctx.gpu, &ctx.config)
             .map_err(|e: hip_bridge::HipError| e.to_string())?;
-        let mut kv2 = llama::KvCache::new_gpu_q8(
+        let mut kv2 = KvCache::new_gpu_q8(
             &mut ctx.gpu,
             ctx.config.n_layers,
             ctx.config.n_kv_heads,
@@ -626,7 +627,7 @@ fn forward_scratch_matches(ctx: &mut Context) -> CaseOutcome {
 fn sequence_no_hang(ctx: &mut Context) -> CaseOutcome {
     match (|| -> Result<String, String> {
         let kv_seq = 128usize;
-        let mut kv = llama::KvCache::new_gpu_q8(
+        let mut kv = KvCache::new_gpu_q8(
             &mut ctx.gpu,
             ctx.config.n_layers,
             ctx.config.n_kv_heads,
@@ -692,7 +693,7 @@ fn chatml_single_tokens(ctx: &mut Context) -> CaseOutcome {
 
 #[cfg(feature = "deltanet")]
 fn givens4_cache_allocates(ctx: &mut Context) -> CaseOutcome {
-    match llama::KvCache::new_gpu_asym3(
+    match KvCache::new_gpu_asym3(
         &mut ctx.gpu,
         ctx.config.n_layers,
         ctx.config.n_kv_heads,
@@ -716,7 +717,7 @@ fn givens4_cache_allocates(ctx: &mut Context) -> CaseOutcome {
 #[cfg(feature = "deltanet")]
 fn givens4_forward_no_hang(ctx: &mut Context) -> CaseOutcome {
     match (|| -> Result<String, String> {
-        let mut kv = llama::KvCache::new_gpu_asym3(
+        let mut kv = KvCache::new_gpu_asym3(
             &mut ctx.gpu,
             ctx.config.n_layers,
             ctx.config.n_kv_heads,
@@ -909,7 +910,7 @@ fn prefill_batch_matches_sequential(ctx: &mut Context) -> CaseOutcome {
 fn decode_speed_sanity(ctx: &mut Context) -> CaseOutcome {
     match (|| -> Result<String, String> {
         let kv_seq = 256usize;
-        let mut kv = llama::KvCache::new_gpu_q8(
+        let mut kv = KvCache::new_gpu_q8(
             &mut ctx.gpu,
             ctx.config.n_layers,
             ctx.config.n_kv_heads,
@@ -970,7 +971,7 @@ fn vram_leak_signal(ctx: &mut Context) -> CaseOutcome {
     match (|| -> Result<String, String> {
         let (free_before, _) = ctx.gpu.hip.get_vram_info().map_err(|e| e.to_string())?;
         {
-            let kv = llama::KvCache::new_gpu_q8(
+            let kv = KvCache::new_gpu_q8(
                 &mut ctx.gpu,
                 ctx.config.n_layers,
                 ctx.config.n_kv_heads,

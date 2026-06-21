@@ -7,7 +7,8 @@
 //! Usage: bench_early_exit <model.hfq>
 
 use hipfire_runtime::hfq::{self, HfqFile};
-use hipfire_runtime::llama::{self, ForwardScratch, KvCache};
+use hipfire_runtime::kv::KvCache;
+use hipfire_runtime::llama::{self, ForwardScratch};
 use std::path::Path;
 use std::time::Instant;
 

@@ -10,6 +10,7 @@
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::DeltaNetState;
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::kv::KvCache;
 use hipfire_runtime::llama;
 use std::path::Path;
 use std::time::Instant;
@@ -72,7 +73,7 @@ fn main() {
     eprintln!("\n--- Forward path ---");
     test!("forward() produces finite logits", 10000, {
         let kv_seq = 128;
-        let mut kv = llama::KvCache::new_gpu_q8(
+        let mut kv = KvCache::new_gpu_q8(
             &mut gpu,
             config.n_layers,
             config.n_kv_heads,
@@ -93,7 +94,7 @@ fn main() {
     // Test 2: forward_scratch() matches forward()
     test!("forward_scratch() matches forward()", 10000, {
         let kv_seq = 128;
-        let mut kv1 = llama::KvCache::new_gpu_q8(
+        let mut kv1 = KvCache::new_gpu_q8(
             &mut gpu,
             config.n_layers,
             config.n_kv_heads,
@@ -102,7 +103,7 @@ fn main() {
         )
         .map_err(|e| format!("{e}"))?;
         let mut dn1 = DeltaNetState::new(&mut gpu, &config).map_err(|e| format!("{e}"))?;
-        let mut kv2 = llama::KvCache::new_gpu_q8(
+        let mut kv2 = KvCache::new_gpu_q8(
             &mut gpu,
             config.n_layers,
             config.n_kv_heads,
@@ -140,7 +141,7 @@ fn main() {
     // Test 3: Multi-token sequence doesn't hang
     test!("10-token sequence completes (no hang)", 15000, {
         let kv_seq = 128;
-        let mut kv = llama::KvCache::new_gpu_q8(
+        let mut kv = KvCache::new_gpu_q8(
             &mut gpu,
             config.n_layers,
             config.n_kv_heads,
@@ -194,7 +195,7 @@ fn main() {
     // Test 6: Givens4 KV cache allocates correctly
     test!("givens4 KV cache allocates", 5000, {
         let kv_seq = 128;
-        let kv = llama::KvCache::new_gpu_asym3(
+        let kv = KvCache::new_gpu_asym3(
             &mut gpu,
             config.n_layers,
             config.n_kv_heads,
@@ -214,7 +215,7 @@ fn main() {
     // Test 7: Givens4 forward doesn't hang
     test!("givens4 forward completes (no hang)", 15000, {
         let kv_seq = 128;
-        let mut kv = llama::KvCache::new_gpu_asym3(
+        let mut kv = KvCache::new_gpu_asym3(
             &mut gpu,
             config.n_layers,
             config.n_kv_heads,
@@ -236,7 +237,7 @@ fn main() {
     // Test 8: Speed sanity check (should be >10 tok/s for any model)
     test!("decode speed > 10 tok/s", 30000, {
         let kv_seq = 256;
-        let mut kv = llama::KvCache::new_gpu_q8(
+        let mut kv = KvCache::new_gpu_q8(
             &mut gpu,
             config.n_layers,
             config.n_kv_heads,
@@ -282,7 +283,7 @@ fn main() {
     // These tests document the current state and will FAIL until Drop is implemented.
     test!("VRAM: KV cache free_gpu + drain returns memory", 10000, {
         let (free_before, _) = gpu.hip.get_vram_info().map_err(|e| format!("{e}"))?;
-        let kv = llama::KvCache::new_gpu_q8(
+        let kv = KvCache::new_gpu_q8(
             &mut gpu,
             config.n_layers,
             config.n_kv_heads,

@@ -13,7 +13,8 @@
 //! Usage: cargo run --release --example smoke_llama_prefill_batch -- <model.hfq>
 
 use hipfire_runtime::hfq::{self, HfqFile};
-use hipfire_runtime::llama::{self, ForwardScratch, KvCache, PrefillBatchScratch};
+use hipfire_runtime::kv::KvCache;
+use hipfire_runtime::llama::{self, ForwardScratch, PrefillBatchScratch};
 use std::path::Path;
 use std::time::Instant;
 

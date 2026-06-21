@@ -24,7 +24,7 @@ fn main() {
 fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::llama::KvCache;
+    use hipfire_runtime::kv::KvCache;
     use std::io::Write;
     use std::path::Path;
 

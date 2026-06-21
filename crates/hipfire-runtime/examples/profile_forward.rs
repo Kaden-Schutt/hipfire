@@ -3,6 +3,8 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Profile one forward pass: time each operation category.
+use hipfire_runtime::kv::KvCache;
+
 fn main() {
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init");
 
@@ -15,7 +17,7 @@ fn main() {
     eprintln!("Loaded: {} layers, dim={}", config.n_layers, config.dim);
 
     let kv_seq_len = config.max_seq_len.min(2048);
-    let mut kv = hipfire_runtime::llama::KvCache::new_gpu(
+    let mut kv = KvCache::new_gpu(
         &mut gpu,
         config.n_layers,
         config.n_kv_heads,

@@ -23,7 +23,7 @@
 
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama;
+use hipfire_runtime::kv::KvCache;
 use hipfire_runtime::tokenizer::Tokenizer;
 use std::path::Path;
 use std::time::Instant;
@@ -114,28 +114,18 @@ fn main() {
     // KV caches sized for prompt + n_steps + headroom.
     let kv_seq = prompt_tokens.len() + n_steps + 16;
     let kv_mode_str = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "asym3".into());
-    let mk_kv = |gpu: &mut rdna_compute::Gpu, cfg: &qwen35::Qwen35Config| -> llama::KvCache {
+    let mk_kv = |gpu: &mut rdna_compute::Gpu, cfg: &qwen35::Qwen35Config| -> KvCache {
         match kv_mode_str.as_str() {
-            "asym3" => llama::KvCache::new_gpu_asym3(
-                gpu,
-                cfg.n_layers,
-                cfg.n_kv_heads,
-                cfg.head_dim,
-                kv_seq,
-            )
-            .unwrap(),
-            "asym4" => llama::KvCache::new_gpu_asym4(
-                gpu,
-                cfg.n_layers,
-                cfg.n_kv_heads,
-                cfg.head_dim,
-                kv_seq,
-            )
-            .unwrap(),
-            _ => {
-                llama::KvCache::new_gpu_q8(gpu, cfg.n_layers, cfg.n_kv_heads, cfg.head_dim, kv_seq)
+            "asym3" => {
+                KvCache::new_gpu_asym3(gpu, cfg.n_layers, cfg.n_kv_heads, cfg.head_dim, kv_seq)
                     .unwrap()
             }
+            "asym4" => {
+                KvCache::new_gpu_asym4(gpu, cfg.n_layers, cfg.n_kv_heads, cfg.head_dim, kv_seq)
+                    .unwrap()
+            }
+            _ => KvCache::new_gpu_q8(gpu, cfg.n_layers, cfg.n_kv_heads, cfg.head_dim, kv_seq)
+                .unwrap(),
         }
     };
     let mut small_kv = mk_kv(&mut gpu, &small_cfg);

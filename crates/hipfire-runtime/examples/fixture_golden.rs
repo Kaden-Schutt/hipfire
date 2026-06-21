@@ -22,7 +22,7 @@
 
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::KvCache;
+use hipfire_runtime::kv::KvCache;
 use std::path::Path;
 
 /// splitmix64 — same generator as the fixture emitter, for a reproducible

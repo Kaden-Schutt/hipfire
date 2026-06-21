@@ -18,6 +18,7 @@ fn main() {
 fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
+    use hipfire_runtime::kv::KvCache;
     use hipfire_runtime::llama;
     use std::path::Path;
     use std::time::Instant;
@@ -40,7 +41,7 @@ fn main() {
     eprintln!("Loaded: {} layers, dim={}", config.n_layers, config.dim);
 
     let max_seq = 2048;
-    let mut kv_cache = llama::KvCache::new_gpu_q8(
+    let mut kv_cache = KvCache::new_gpu_q8(
         &mut gpu,
         config.n_layers,
         config.n_kv_heads,

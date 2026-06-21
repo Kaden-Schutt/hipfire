@@ -36,7 +36,8 @@ use hipfire_arch_qwen35::pflash::{
 };
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, StateQuant};
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{self, KvCache};
+use hipfire_runtime::kv::KvCache;
+use hipfire_runtime::llama;
 use std::fs;
 use std::path::Path;
 use std::time::Instant;

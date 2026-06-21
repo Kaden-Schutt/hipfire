@@ -9,7 +9,8 @@
 use hipfire_arch_llama::Llama;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{self, KvCache};
+use hipfire_runtime::kv::KvCache;
+use hipfire_runtime::llama;
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};

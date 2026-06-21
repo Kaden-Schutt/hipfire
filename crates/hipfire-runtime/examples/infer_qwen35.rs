@@ -18,6 +18,7 @@ use hipfire_arch_qwen35::qwen35::DeltaNetState;
 use hipfire_prompt::{AssistantPrefix, ChatFrame};
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::kv::KvCache;
 use hipfire_runtime::llama;
 use hipfire_runtime::loop_guard::LoopGuard;
 use hipfire_runtime::sampler::{self, SamplerConfig};
@@ -159,7 +160,7 @@ fn main() {
     let mut kv_cache = match kv_mode.as_str() {
         "givens4" => {
             eprintln!("KV cache: givens4");
-            llama::KvCache::new_gpu_asym3(
+            KvCache::new_gpu_asym3(
                 &mut gpu,
                 config.n_layers,
                 config.n_kv_heads,
@@ -170,7 +171,7 @@ fn main() {
         }
         "givens2" => {
             eprintln!("KV cache: givens2");
-            llama::KvCache::new_gpu_asym2(
+            KvCache::new_gpu_asym2(
                 &mut gpu,
                 config.n_layers,
                 config.n_kv_heads,
@@ -179,7 +180,7 @@ fn main() {
             )
             .unwrap()
         }
-        _ => llama::KvCache::new_gpu_q8(
+        _ => KvCache::new_gpu_q8(
             &mut gpu,
             config.n_layers,
             config.n_kv_heads,

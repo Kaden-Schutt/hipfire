@@ -12,6 +12,7 @@ use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::DeltaNetState;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::kv::KvCache;
 use hipfire_runtime::llama;
 use std::io::Write;
 use std::path::Path;
@@ -220,7 +221,7 @@ fn main() {
     let kv_seq = 4096usize;
     eprintln!("KV cache: {kv_mode}");
     let mut kv_cache = match kv_mode {
-        "givens4" => llama::KvCache::new_gpu_asym3(
+        "givens4" => KvCache::new_gpu_asym3(
             &mut gpu,
             text_config.n_layers,
             text_config.n_kv_heads,
@@ -228,7 +229,7 @@ fn main() {
             kv_seq,
         )
         .unwrap(),
-        "givens2" => llama::KvCache::new_gpu_asym2(
+        "givens2" => KvCache::new_gpu_asym2(
             &mut gpu,
             text_config.n_layers,
             text_config.n_kv_heads,
@@ -236,7 +237,7 @@ fn main() {
             kv_seq,
         )
         .unwrap(),
-        _ => llama::KvCache::new_gpu_q8(
+        _ => KvCache::new_gpu_q8(
             &mut gpu,
             text_config.n_layers,
             text_config.n_kv_heads,
@@ -248,7 +249,7 @@ fn main() {
     let mut dn_state = DeltaNetState::new(&mut gpu, &text_config).unwrap();
 
     if debug_cmp {
-        let mut kv2 = llama::KvCache::new_gpu(
+        let mut kv2 = KvCache::new_gpu(
             &mut gpu,
             text_config.n_layers,
             text_config.n_kv_heads,
@@ -521,9 +522,9 @@ fn debug_compare(
     weights: &hipfire_arch_qwen35::qwen35::Qwen35Weights,
     config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
     token: u32,
-    kv_cache1: &mut hipfire_runtime::llama::KvCache,
+    kv_cache1: &mut KvCache,
     dn_state1: &mut hipfire_arch_qwen35::qwen35::DeltaNetState,
-    kv_cache2: &mut hipfire_runtime::llama::KvCache,
+    kv_cache2: &mut KvCache,
     dn_state2: &mut hipfire_arch_qwen35::qwen35::DeltaNetState,
     scratch: &hipfire_arch_qwen35::qwen35::Qwen35Scratch,
 ) {

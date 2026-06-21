@@ -5,7 +5,8 @@
 //! Benchmark: profile where time is spent in the forward pass.
 
 use hipfire_runtime::gguf::GgufFile;
-use hipfire_runtime::llama::{self, KvCache, LlamaConfig};
+use hipfire_runtime::kv::KvCache;
+use hipfire_runtime::llama::{self, LlamaConfig};
 use std::path::Path;
 use std::time::Instant;
 

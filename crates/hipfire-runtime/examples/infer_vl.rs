@@ -9,6 +9,7 @@ use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::DeltaNetState;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::kv::KvCache;
 use hipfire_runtime::llama;
 use std::io::Write;
 use std::path::Path;
@@ -148,7 +149,7 @@ fn main() {
         .expect("failed to load text weights");
 
     let kv_seq = 2048usize;
-    let mut kv_cache = llama::KvCache::new_gpu(
+    let mut kv_cache = KvCache::new_gpu(
         &mut gpu,
         text_config.n_layers,
         text_config.n_kv_heads,
