@@ -349,10 +349,12 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
             gpu.ensure_mq_signs()?;
             let xr = xr!();
             rotate_x_mq_for(gpu, w, x, &xr, w.k)?;
-            // Ephemeral int4 activation scratch (B=1). TODO(perf): hoist to a
-            // persistent gpu scratch buffer like mq_x_rot to avoid per-call alloc.
-            let xq = gpu.upload_raw(&vec![0u8; w.k / 2], &[w.k / 2])?;
-            let xs = gpu.upload_raw(&vec![0u8; ng * 4], &[ng])?;
+            // Ephemeral int4 activation scratch (B=1). Pool-backed alloc — NOT
+            // upload_raw, which would malloc + memcpy_htod a zero-filled host vec
+            // every call (~100 pointless H2D uploads/token, the dominant decode
+            // hipMemcpy caller found via rocprof). quantize_act_oq4 fully overwrites.
+            let xq = gpu.alloc_tensor(&[w.k / 2], DType::Raw)?;
+            let xs = gpu.alloc_tensor(&[ng], DType::F32)?;
             gpu.quantize_act_oq4(&xr, &xq, &xs, 1, w.k, GROUP)?;
             // Weight scales view: byte offset M*(K/2) into the combined buffer.
             let ws = w.buf.sub_offset(w.m * (w.k / 2), w.m * ng * 4);
