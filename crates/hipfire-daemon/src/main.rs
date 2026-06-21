@@ -2145,7 +2145,7 @@ fn main() {
     }
 
     // --precompile: compile all kernels for this GPU, write hash files, exit.
-    // Used by install.sh and `hipfire update` so first `hipfire run`
+    // Used by install.sh and `hipfire update` so first `hipfire chat`
     // isn't a 2-minute hipcc wait.
     //
     // Covers the current default path (mq4 weights + asym3 KV) plus the legacy

@@ -42,7 +42,7 @@
 //! correctness baseline.
 //!
 //! R3 resolved: daemon arm wired (arch_id=7 → `generate_qwen2` in
-//! daemon.rs). `hipfire run /path/to/qwen2.hfq "prompt"` works
+//! daemon.rs). `hipfire chat -m /path/to/qwen2.hfq "prompt"` works
 //! end-to-end at ~96 tok/s on the Q8 model. Bring-up scope —
 //! DFlash / CASK / PFlash / VL / ChatML / repeat penalty / top-p /
 //! `<think>` / multi-GPU are explicitly refused or skipped on this

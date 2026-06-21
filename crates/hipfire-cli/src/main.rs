@@ -20,7 +20,7 @@ enum Command {
     /// Start the hipfire HTTP server (OpenAI-compatible)
     Serve(commands::serve::ServeArgs),
     /// Load a model and generate a response (one-shot)
-    Run(commands::run::RunArgs),
+    Chat(commands::chat::ChatArgs),
     /// List locally available models
     #[command(alias = "models")]
     List,
@@ -68,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Serve(args) => commands::serve::run(args, loaded_config).await,
-        Command::Run(args) => commands::run::run(args, config).await,
+        Command::Chat(args) => commands::chat::run(args, config).await,
         Command::List => {
             commands::list::run();
             Ok(())

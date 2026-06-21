@@ -1,0 +1,25 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH hipfire-chat 1  "hipfire-chat " 
+.SH NAME
+hipfire\-chat \- Load a model and generate a response (one\-shot)
+.SH SYNOPSIS
+\fBhipfire\-chat\fR [\fB\-m\fR|\fB\-\-model\fR] [\fB\-\-max\-tokens\fR] [\fB\-\-temperature\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROMPT\fR> 
+.SH DESCRIPTION
+Load a model and generate a response (one\-shot)
+.SH OPTIONS
+.TP
+\fB\-m\fR, \fB\-\-model\fR \fI<MODEL>\fR
+Model name, alias, or path. Falls back to the `default_model` config value when omitted
+.TP
+\fB\-\-max\-tokens\fR \fI<MAX_TOKENS>\fR
+Max tokens to generate
+.TP
+\fB\-\-temperature\fR \fI<TEMPERATURE>\fR
+Sampling temperature
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROMPT\fR>
+Prompt text

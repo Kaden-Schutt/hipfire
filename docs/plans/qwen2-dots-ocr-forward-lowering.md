@@ -478,7 +478,7 @@ use hipfire_dispatch::types::DispatchError;
 
 ### dots-ocr follow-up
 - [ ] Verify dots-ocr text decode uses the qwen2 lowered path (automatic — no code change)
-- [ ] End-to-end coherence: `hipfire run dots-ocr` with an image prompt
+- [ ] End-to-end coherence: `hipfire chat -m dots-ocr` with an image prompt
 - [ ] Vision tower stays on direct `gpu.*` path (no lowering — out of scope)
 
 ## 11 · File impact summary

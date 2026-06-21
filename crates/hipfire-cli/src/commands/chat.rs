@@ -10,9 +10,11 @@ use uuid::Uuid;
 use crate::model::find_model;
 
 #[derive(Debug, Args)]
-pub struct RunArgs {
-    /// Model name, alias, or path
-    pub model: String,
+pub struct ChatArgs {
+    /// Model name, alias, or path. Falls back to the `default_model` config
+    /// value when omitted.
+    #[arg(long, short)]
+    pub model: Option<String>,
     /// Prompt text
     pub prompt: String,
     /// Max tokens to generate
@@ -36,9 +38,20 @@ fn generate_request_from_prompt(
     GenerateTextRequest::from_prompt(id, prompt, sampling).with_worker_key_id(worker_key_id)
 }
 
-pub async fn run(args: RunArgs, config: HipfireConfig) -> anyhow::Result<()> {
-    let model_path = find_model(&args.model)
-        .ok_or_else(|| anyhow::anyhow!("model not found: {}", args.model))?;
+pub async fn run(args: ChatArgs, config: HipfireConfig) -> anyhow::Result<()> {
+    let model = args
+        .model
+        .as_deref()
+        .or(config.default_model.as_deref())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no model specified and no `default_model` configured; \
+                 pass --model <name> or set `default_model` in {}",
+                hipfire_config::config_path().display()
+            )
+        })?;
+    let model_path =
+        find_model(model).ok_or_else(|| anyhow::anyhow!("model not found: {model}"))?;
 
     let bin = find_daemon_bin_or_error()?;
 

@@ -430,7 +430,7 @@ if (Test-Path "$TargetDir\release\hipfire-host-profile.exe") {
 # .hsaco blobs. We mirror the Linux flow (install.sh): seed any blobs that
 # happen to be present in the checkout (developer case), then run
 # daemon.exe --precompile to JIT-compile the default Qwen3.5 kernel set
-# into ~/.hipfire/kernels/<arch>/. First `hipfire run` is then instant
+# into ~/.hipfire/kernels/<arch>/. First `hipfire chat` is then instant
 # instead of a multi-minute hipcc wall.
 Write-Host ""
 if ($GpuArch -ne "unknown") {
@@ -545,7 +545,7 @@ Write-Host "=== hipfire installed ===" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Quick start:" -ForegroundColor Green
 Write-Host "  hipfire list                        # see local models"
-Write-Host "  hipfire run <model.hfq> `"Hello`"    # generate text"
+Write-Host "  hipfire chat -m <model.hfq> `"Hello`" # generate text"
 Write-Host "  hipfire serve                       # start OpenAI-compatible API"
 Write-Host ""
 Write-Host "Models go in $ModelsDir"

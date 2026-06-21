@@ -4,8 +4,8 @@ LLM inference for AMD RDNA GPUs. Rust + HIP. Single binary. No Python
 in the hot path. Ollama-style UX.
 
 ```bash
-hipfire run  qwen3.5:9b "What is the capital of France?"
-hipfire serve           # OpenAI-compatible API on 0.0.0.0:11435
+hipfire chat -m qwen3.5:9b "What is the capital of France?"
+hipfire serve              # OpenAI-compatible API on 0.0.0.0:11435
 ```
 
 Current release: **v0.2.1** — dispatch unification (#397). DeepSeek V4 Flash support landed in v0.2.0. See [CHANGELOG.md](CHANGELOG.md).
@@ -802,12 +802,12 @@ If you're testing an actual user UX flow:
 hipfire pull qwen3.5:9b
 hipfire pull qwen3.5:9b-draft
 hipfire config set dflash_mode auto    # opt in (default since 2026-04-26: off)
-hipfire run qwen3.5:9b "Write a Python function to find the longest substring without repeating characters"
+hipfire chat -m qwen3.5:9b "Write a Python function to find the longest substring without repeating characters"
 # expected: daemon logs '[hipfire] DFlash draft detected: ...'
 # response generates at ≥250 tok/s on a 9B target with a paired draft
 ```
 
-Without the `dflash_mode auto` config, `hipfire run` runs pure AR
+Without the `dflash_mode auto` config, `hipfire chat` runs pure AR
 even when a paired draft is on disk — the daemon explicitly logs
 `[hipfire] DFlash disabled (dflash_mode=off).` This is the "I pulled
 the draft but DFlash isn't firing" pitfall.

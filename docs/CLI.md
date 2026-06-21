@@ -6,7 +6,7 @@ This document contains the help content for the `hipfire` command-line program.
 
 * [`hipfire`↴](#hipfire)
 * [`hipfire serve`↴](#hipfire-serve)
-* [`hipfire run`↴](#hipfire-run)
+* [`hipfire chat`↴](#hipfire-chat)
 * [`hipfire list`↴](#hipfire-list)
 * [`hipfire eval`↴](#hipfire-eval)
 * [`hipfire host-profile`↴](#hipfire-host-profile)
@@ -36,7 +36,7 @@ hipfire LLM inference CLI
 ###### **Subcommands:**
 
 * `serve` — Start the hipfire HTTP server (OpenAI-compatible)
-* `run` — Load a model and generate a response (one-shot)
+* `chat` — Load a model and generate a response (one-shot)
 * `list` — List locally available models
 * `eval` — Run the quant admission/model evaluation harness
 * `host-profile` — Measure host, GPU-copy, and model storage bandwidth
@@ -60,19 +60,19 @@ Start the hipfire HTTP server (OpenAI-compatible)
 
 
 
-## `hipfire run`
+## `hipfire chat`
 
 Load a model and generate a response (one-shot)
 
-**Usage:** `hipfire run [OPTIONS] <MODEL> <PROMPT>`
+**Usage:** `hipfire chat [OPTIONS] <PROMPT>`
 
 ###### **Arguments:**
 
-* `<MODEL>` — Model name, alias, or path
 * `<PROMPT>` — Prompt text
 
 ###### **Options:**
 
+* `-m`, `--model <MODEL>` — Model name, alias, or path. Falls back to the `default_model` config value when omitted
 * `--max-tokens <MAX_TOKENS>` — Max tokens to generate
 * `--temperature <TEMPERATURE>` — Sampling temperature
 
