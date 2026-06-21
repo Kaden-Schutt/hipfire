@@ -498,11 +498,19 @@ fn symmetric_clipsearch(group: &[f32], qmax: f32) -> f32 {
             best_scale = scale;
         }
     }
-    if best_scale > 0.0 { best_scale } else { 1.0 }
+    if best_scale > 0.0 {
+        best_scale
+    } else {
+        1.0
+    }
 }
 
 /// MQ6+ : MQ6G256 with clip-searched affine range (identical 200-byte layout).
-pub(crate) fn quantize_mq6g256_clipsearch(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+pub(crate) fn quantize_mq6g256_clipsearch(
+    f32_data: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
     let (group_size, block_bytes) = (256usize, 200usize);
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
@@ -531,7 +539,11 @@ pub(crate) fn quantize_mq6g256_clipsearch(f32_data: &[f32], signs1: &[f32], sign
 }
 
 /// MQ3+ : MQ3G256 with clip-searched affine range (identical 104-byte layout).
-pub(crate) fn quantize_mq3g256_clipsearch(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+pub(crate) fn quantize_mq3g256_clipsearch(
+    f32_data: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
     let (group_size, block_bytes) = (256usize, 104usize);
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
@@ -566,7 +578,11 @@ pub(crate) fn quantize_mq3g256_clipsearch(f32_data: &[f32], signs1: &[f32], sign
 }
 
 /// MQ2+ : MQ2G256 with clip-searched affine range (identical 72-byte layout).
-pub(crate) fn quantize_mq2g256_clipsearch(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+pub(crate) fn quantize_mq2g256_clipsearch(
+    f32_data: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
     let (group_size, block_bytes) = (256usize, 72usize);
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
@@ -595,7 +611,11 @@ pub(crate) fn quantize_mq2g256_clipsearch(f32_data: &[f32], signs1: &[f32], sign
 }
 
 /// MQ8+ : MQ8G256 with clip-searched symmetric int8 scale (identical 258-byte layout).
-pub(crate) fn quantize_mq8g256_clipsearch(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+pub(crate) fn quantize_mq8g256_clipsearch(
+    f32_data: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
     let (group_size, block_bytes) = (256usize, 258usize);
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
@@ -657,6 +677,9 @@ pub(crate) fn quantize_oq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32])
 
 /// Dequantize OQ4G256 (round-trip oracle for the Opus codec / tests).
 /// `[f16 scale][128 signed nibbles]` per 256-group → `scale·sext4`, inverse FWHT.
+/// Test-only oracle (its sole caller is the `oq4_roundtrip_comparable_to_mq4`
+/// test); gated on `cfg(test)` so non-test builds don't compile it as dead code.
+#[cfg(test)]
 pub(crate) fn dequant_oq4g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
     let (group_size, block_bytes) = (256usize, 130usize);
     let n_blocks = n.div_ceil(group_size);
@@ -1775,7 +1798,6 @@ pub(crate) fn quantize_mq4g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &
     output
 }
 
-
 // ─── MQ2-Lloyd codecs ───
 pub(crate) fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     use rayon::prelude::*;
@@ -1921,7 +1943,11 @@ pub(crate) fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &
 /// 72 B/group (true 1.58-bpw packing — 5 ternary/byte — is a mechanical
 /// follow-up once coherence is established). Gated by HIPFIRE_LLOYD_K3=1 on the
 /// `--format lloyd-mq2` path. Output DType = MQ2G256Lloyd (kernel-agnostic to K).
-pub(crate) fn quantize_mq2g256_lloyd_k3(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+pub(crate) fn quantize_mq2g256_lloyd_k3(
+    f32_data: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
     use rayon::prelude::*;
     let group_size = 256;
     let block_bytes = 72;
