@@ -3735,6 +3735,11 @@ pub const FUSED_GATE_UP_OQ4_WMMA_SRC: &str =
 pub const FUSED_QKVZA_OQ4_WMMA_SRC: &str =
     include_str!("../../../kernels/src/fused_qkvza_oq4_wmma.hip");
 
+/// Opus Quant W4A4 DECODE GEMV (batch=1): one wave32 per output row, no WMMA
+/// N-tile waste, weight-bandwidth-bound. See `kernels/src/gemv_oq4_grouped.hip`.
+pub const GEMV_OQ4_GROUPED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq4_grouped.hip");
+
 // Generic kernel library GEMV tier (gfx1103 wave32, zero LDS, wave-shuffle
 // reduction; one wave per output row). Same-dtype weight/vector inputs.
 // See `docs/kernels/generic-kernel-library.md`.

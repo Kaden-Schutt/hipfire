@@ -45238,6 +45238,57 @@ impl Gpu {
         }
     }
 
+    /// Opus Quant W4A4 DECODE GEMV (batch=1): one wave32 per output row, no WMMA
+    /// N-tile waste. `w_i4`/`w_scales` are the combined-buffer base + sub_offset
+    /// scale view (same as gemm_oq4_grouped_wmma); `x_i4`/`x_scales` are the
+    /// int4-quantized activation. `group` must be 256.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_oq4_grouped(
+        &mut self,
+        w_i4: &GpuTensor,
+        w_scales: &GpuTensor,
+        x_i4: &GpuTensor,
+        x_scales: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(group, 256, "gemv_oq4_grouped: group must be 256");
+        assert_eq!(k % group, 0, "gemv_oq4_grouped: K must be a multiple of group");
+        self.ensure_kernel("gemv_oq4_grouped", kernels::GEMV_OQ4_GROUPED_SRC, "gemv_oq4_grouped")?;
+        let wp = w_i4.buf.as_ptr();
+        let wsp = w_scales.buf.as_ptr();
+        let xp = x_i4.buf.as_ptr();
+        let xsp = x_scales.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &wsp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &xsp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions["gemv_oq4_grouped"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Opus Quant W4A4 fused Gate+Up: gate_proj + up_proj grouped-iu4 GEMMs in
     /// one launch sharing the int4 activation (`xq`/`xs`). Each weight buffer is
     /// the combined `[nibbles | f32 scales]` layout (scales addressed internally

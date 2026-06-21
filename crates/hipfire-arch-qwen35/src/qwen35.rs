@@ -8937,6 +8937,12 @@ pub fn forward_scratch(
     // forward is direct-only. Policy infra (`ar_forward_kernel_dirty`,
     // `ar_forward_replay_enabled`, `end_decode_turn()`, `drop_captured_graph()`)
     // is preserved on Gpu so the path can be flipped on once the bug is fixed.
+    // AR-forward hipGraph stays OFF. Tested 2026-06-21: with persistent Opus
+    // scratch the capture/replay attractor is GONE (replay is coherent), but
+    // replay gives NO speedup — decode is kernel-execution-bound, not
+    // launch-overhead-bound, so eliminating per-launch cost nets ~0 (40.6 vs
+    // 41.5 tok/s). Not worth the capture complexity. See
+    // project_gfx1103_decode_memcpy_bound memory.
     let use_graph = false;
     let _ = (graph_enabled, allow_moe, gpu.ar_forward_replay_enabled); // suppress unused warnings
 
