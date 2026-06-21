@@ -1287,6 +1287,15 @@ pub fn load_model(
                 physical_cap,
             )
             .map_err(|e| format!("{e}"))?,
+            "kvarn" => kv::KvCache::new_gpu_kvarn_capped(
+                gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                max_seq,
+                physical_cap,
+            )
+            .map_err(|e| format!("{e}"))?,
             "asym2" | "turbo2" => kv::KvCache::new_gpu_asym2_capped(
                 gpu,
                 config.n_layers,
@@ -1679,6 +1688,14 @@ pub fn load_model_safetensors(
                 max_seq,
                 max_seq,
             ),
+            "kvarn" => kv::KvCache::new_gpu_kvarn_capped(
+                gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                max_seq,
+                max_seq,
+            ),
             "asym3" => kv::KvCache::new_gpu_asym3_capped(
                 gpu,
                 config.n_layers,
@@ -1804,6 +1821,14 @@ pub fn load_model_safetensors(
             max_seq,
         ),
         "asym4" | "turbo4" => kv::KvCache::new_gpu_asym4_capped(
+            gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            max_seq,
+            max_seq,
+        ),
+        "kvarn" => kv::KvCache::new_gpu_kvarn_capped(
             gpu,
             config.n_layers,
             config.n_kv_heads,

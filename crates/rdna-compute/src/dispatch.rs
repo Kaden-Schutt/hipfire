@@ -45537,6 +45537,110 @@ impl Gpu {
         }
     }
 
+    /// End-to-end KVarN KV-write + attention for a contiguous run of `n` tokens
+    /// at absolute positions `[start_pos, start_pos+n)`. Unifies prefill (`n>1`)
+    /// and decode (`n==1`):
+    ///   1. V → Q8_0 by position (reused `kv_cache_write_q8_0_batched`).
+    ///   2. K → append rows to the f32 recent-window (slot = pos % GROUP); each
+    ///      time a 128-token block completes, gather+quantize it into the
+    ///      block-tiled records (`records` = `k_gpu[layer]`). The window holds
+    ///      the trailing partial block.
+    ///   3. Build a token-major f16 shadow K `[seq_len × kv_dim]` from the full
+    ///      blocks (records) + the window tail (`kvarn_build_kcache`).
+    ///   4. f16-K / Q8-V flash (`attention_flash_f16k_q8v_batched_masked`).
+    ///
+    /// `records`/`window` are F32-typed buffers (byte-addressed by the kernels).
+    /// Scratch (shadow K, gather tiles) is pooled per call — v1 rebuilds the full
+    /// history each step (correct, not yet perf-tuned; Phase-2 fuses dequant into
+    /// the flash). Tree-verify (`tree_bias`) is passed through but the block
+    /// write assumes contiguous causal positions — callers guard tree mode off.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kvarn_attend(
+        &mut self,
+        records: &GpuTensor,
+        window: &GpuTensor,
+        v_cache: &GpuTensor,
+        fa_q: &GpuTensor,
+        fa_k: &GpuTensor,
+        fa_v: &GpuTensor,
+        positions: &GpuTensor,
+        out: &GpuTensor,
+        flash_partials: &GpuTensor,
+        n: usize,
+        start_pos: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        physical_cap: usize,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+    ) -> HipResult<()> {
+        const GROUP: usize = 128;
+        let kv_dim = n_kv_heads * head_dim;
+        // kvarn_record_bytes(head_dim, GROUP), divisible by 4 → expressible as F32 elems.
+        let rec_bytes = (head_dim * GROUP).div_ceil(2) + head_dim * 2 * 2 + GROUP * 2;
+        let seq_len = start_pos + n;
+
+        // 1. V write (Q8_0) by absolute position.
+        self.kv_cache_write_q8_0_batched(v_cache, fa_v, positions, n_kv_heads, head_dim, n)?;
+
+        // 2. K write: append to window, flush each completed 128-token block.
+        let tiles = self.alloc_tensor(&[n_kv_heads * head_dim * GROUP], DType::F32)?;
+        let mut written = 0usize;
+        while written < n {
+            let t = start_pos + written;
+            let slot = t % GROUP;
+            let block = t / GROUP;
+            let take = (GROUP - slot).min(n - written);
+            // Contiguous append: fa_k rows [written, written+take) → window slots
+            // [slot, slot+take) (both token-major, kv_dim stride).
+            self.memcpy_dtod_at_auto(
+                &window.buf,
+                slot * kv_dim * 4,
+                &fa_k.buf,
+                written * kv_dim * 4,
+                take * kv_dim * 4,
+            )?;
+            written += take;
+            if slot + take == GROUP {
+                // Block complete in the window → gather + variance-norm 4-bit pack
+                // into records[block].
+                self.kvarn_gather_k_tiles(window, &tiles, 1, n_kv_heads, head_dim, GROUP)?;
+                let rec_off_elems = block * n_kv_heads * rec_bytes / 4;
+                let rec_view = records.sub_offset(rec_off_elems, n_kv_heads * rec_bytes / 4);
+                self.kvarn_quantize_tile(&tiles, &rec_view, n_kv_heads, head_dim, GROUP, rec_bytes)?;
+            }
+        }
+
+        // 3. Build f16 shadow K [seq_len × kv_dim].
+        let n_full_blocks = seq_len / GROUP;
+        let tail_len = seq_len % GROUP;
+        let shadow = self.alloc_tensor(&[seq_len * kv_dim], DType::F16)?;
+        self.kvarn_build_kcache(
+            records, window, &shadow, n_full_blocks, tail_len, n_kv_heads, head_dim, GROUP, rec_bytes,
+        )?;
+
+        // 4. f16-K / Q8-V flash over [0, seq_len) with causal masking via positions.
+        self.attention_flash_f16k_q8v_batched_masked(
+            fa_q,
+            &shadow,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            physical_cap,
+            seq_len,
+            n,
+            flash_partials,
+            tree_bias,
+            block_start,
+            block_cols,
+        )
+    }
+
     /// Opus Quant W4A4 fused Gate+Up: gate_proj + up_proj grouped-iu4 GEMMs in
     /// one launch sharing the int4 activation (`xq`/`xs`). Each weight buffer is
     /// the combined `[nibbles | f32 scales]` layout (scales addressed internally

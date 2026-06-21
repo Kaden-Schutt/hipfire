@@ -26232,6 +26232,38 @@ fn kv_cache_attention_dispatch(
     layer_idx: usize,
     pos: usize,
 ) -> HipResult<()> {
+    // KVarN decode: single-token KV write (window append + block flush) + read
+    // (build f16 shadow K) + f16/Q8 flash, handled outside the dispatch substrate.
+    if kv_cache.quant_kvarn {
+        // The KV-write/flash kernels read positions from a GpuTensor; `s.pos_buf`
+        // is a raw 4-byte i32 DeviceBuffer (positions use F32 as a 4-byte i32
+        // container, see PrefillBatchScratch). Wrap a non-owning [1] view.
+        let pos_view = rdna_compute::GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(s.pos_buf.as_ptr(), 4) },
+            shape: vec![1],
+            dtype: rdna_compute::DType::F32,
+        };
+        return gpu.kvarn_attend(
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.k_window[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &s.fa_q,
+            &s.fa_k,
+            &s.fa_v,
+            &pos_view,
+            &s.fa_attn_out,
+            &s.flash_partials,
+            1,
+            pos,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_cache.physical_cap,
+            None,
+            0,
+            0,
+        );
+    }
     let plan = KvTierPlan::derive(KvTierInputs {
         quant_asym4: kv_cache.quant_asym4,
         quant_asym3: kv_cache.quant_asym3,
