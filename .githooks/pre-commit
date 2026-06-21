@@ -68,7 +68,12 @@ if [ -n "$STAGED_RS" ]; then
     FMT_OUT=$(cargo fmt --all --check 2>&1 || true)
     BLOCK_FMT=0
     for f in $STAGED_RS; do
-        if echo "$FMT_OUT" | grep -qF "$f"; then
+        # Match only rustfmt's "Diff in <path>:" header lines, not arbitrary
+        # substrings. Some files (e.g. env_docs.rs) embed absolute source
+        # paths like `source: ".../qwen35.rs:123"` in their content; a bare
+        # `grep -F "$f"` matched those and false-positive-blocked an
+        # already-formatted staged file whenever an unrelated file was drifted.
+        if echo "$FMT_OUT" | grep -F "Diff in " | grep -qF "$f"; then
             echo "  rustfmt: needs formatting -> $f"
             BLOCK_FMT=1
         fi
