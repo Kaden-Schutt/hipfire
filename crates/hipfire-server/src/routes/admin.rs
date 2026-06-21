@@ -523,6 +523,7 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
     .login-card h2 { margin: 0; font-size: 16px; }
     .login-card .login-error { color: var(--warn); min-height: 16px; font-size: 12px; }
     #logout { margin-left: 12px; }
+  </style>
 </head>
 <body>
   <header>
@@ -1345,6 +1346,30 @@ mod tests {
         assert!(ADMIN_INDEX_HTML.contains("id=\"login-form\""));
         assert!(ADMIN_INDEX_HTML.contains("function showLogin"));
         assert!(ADMIN_INDEX_HTML.contains("requireAuthorized"));
+    }
+
+    #[test]
+    fn admin_index_html_tags_are_balanced() {
+        // An unclosed <style> swallows the whole <body> as CSS text and the
+        // page renders blank below the head — guard the structural tags.
+        for (open, close) in [
+            ("<style>", "</style>"),
+            ("<head>", "</head>"),
+            ("<body>", "</body>"),
+            ("<main>", "</main>"),
+            ("<script>", "</script>"),
+        ] {
+            assert_eq!(
+                ADMIN_INDEX_HTML.matches(open).count(),
+                ADMIN_INDEX_HTML.matches(close).count(),
+                "unbalanced {open}/{close} in admin console HTML"
+            );
+            assert_eq!(
+                ADMIN_INDEX_HTML.matches(open).count(),
+                1,
+                "expected exactly one {open}"
+            );
+        }
     }
 
     #[test]
