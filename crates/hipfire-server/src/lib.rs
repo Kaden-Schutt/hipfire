@@ -3,6 +3,7 @@ pub mod model;
 pub mod routes;
 pub mod scheduler;
 pub mod state;
+pub mod telemetry;
 
 pub use state::{AppState, SharedState};
 
@@ -57,6 +58,7 @@ pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> Rout
             get(routes::admin::get_admin_diagnostics),
         )
         .route("/admin/logs", get(routes::admin::get_admin_logs))
+        .route("/admin/stats", get(routes::admin::get_admin_stats))
         .route(
             "/admin/models/registry",
             get(routes::models::get_model_registry),

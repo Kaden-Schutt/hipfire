@@ -44,6 +44,23 @@ pub async fn get_admin_logs(Query(query): Query<AdminLogsQuery>) -> Json<Value> 
     }))
 }
 
+/// Live host/GPU telemetry snapshot for the dashboard (sysfs-backed).
+pub async fn get_admin_stats() -> Json<Value> {
+    let gpus = serde_json::to_value(crate::telemetry::read_gpu_telemetry())
+        .unwrap_or(Value::Array(Vec::new()));
+    Json(json!({
+        "generated_unix": now_unix_secs(),
+        "gpus": gpus,
+    }))
+}
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 pub async fn get_config_schema() -> Json<Value> {
     Json(config_schema_json())
 }
