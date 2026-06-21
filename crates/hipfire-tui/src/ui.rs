@@ -6,12 +6,12 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Row, Table, Tabs, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Row, Table, Tabs, Wrap},
     Frame,
 };
 
 use crate::{
-    app::{App, Tab},
+    app::{App, ControlAction, Tab},
     hipfire::registry::ModelListItem,
 };
 
@@ -24,6 +24,12 @@ const ACCENT: Color = Color::Rgb(237, 45, 57);
 const GREEN: Color = Color::Rgb(102, 217, 139);
 const YELLOW: Color = Color::Rgb(238, 190, 95);
 const RED: Color = Color::Rgb(255, 95, 104);
+/// Darker green for the "online" host indicator in the title bar.
+const DARK_GREEN: Color = Color::Rgb(56, 142, 84);
+/// Spinner glyph color — distinct from BLUE so it doesn't read as faked.
+const SPINNER: Color = Color::Rgb(120, 200, 220);
+/// Bright blue marks statically faked data that has no backend source yet.
+const BLUE: Color = Color::Rgb(80, 170, 255);
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -40,6 +46,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_header(frame, app, root[0]);
     match app.tab {
         Tab::Home => draw_home(frame, app, root[1]),
+
         Tab::Chat => draw_chat(frame, app, root[1]),
         Tab::Models => draw_models(frame, app, root[1]),
         Tab::Runtime => draw_runtime(frame, app, root[1]),
@@ -57,27 +64,49 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Length(2), Constraint::Length(3)])
         .split(area);
 
+    // Title row: [spinner | hipfire | host status] .... [GPU load bar].
+    let bar = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(20), Constraint::Length(26)])
+        .split(chunks[0]);
+
+    let online = app.status.serve_http_ok;
+    let host_status = if online {
+        Span::styled(
+            "online",
+            Style::default().fg(DARK_GREEN).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        // Matches the offline color of the Status pane "Serve" line.
+        Span::styled(
+            "offline",
+            Style::default().fg(RED).add_modifier(Modifier::BOLD),
+        )
+    };
     let title = Line::from(vec![
+        Span::styled(
+            format!("{} ", app.spinner_frame()),
+            Style::default().fg(SPINNER),
+        ),
         Span::styled(
             "hipfire",
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" / wick spike", Style::default().fg(ACCENT)),
+        Span::raw("    "),
         Span::styled(
-            format!(
-                "    serve: {}    model: {}",
-                app.status.serve_label(),
-                app.active_model
-            ),
+            format!("host: {} ", app.status.hostname),
             Style::default().fg(MUTED),
         ),
+        host_status,
     ]);
     frame.render_widget(
         Paragraph::new(title)
             .style(Style::default().bg(BG))
-            .alignment(Alignment::Center),
-        chunks[0],
+            .alignment(Alignment::Left),
+        bar[0],
     );
+
+    draw_gpu_bar(frame, bar[1]);
 
     let titles = Tab::ALL
         .iter()
@@ -92,9 +121,30 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
                 .border_style(Style::default().fg(PANEL_2)),
         )
         .style(Style::default().fg(MUTED).bg(BG))
-        .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+        .highlight_style(Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))
         .divider(Span::styled(" | ", Style::default().fg(PANEL_2)));
     frame.render_widget(tabs, chunks[1]);
+}
+
+/// Title-bar GPU load gauge. FAKED (bright blue) — no GPU-utilization source is
+/// wired yet; this is a placeholder bar at a fixed percentage.
+fn draw_gpu_bar(frame: &mut Frame, area: Rect) {
+    const FAKE_GPU_PCT: u16 = 62;
+    // Reserve "GPU " prefix (4) + " 100%" suffix (5) from the cell width.
+    let track = (area.width as usize).saturating_sub(9).max(1);
+    let filled = track * FAKE_GPU_PCT as usize / 100;
+    let bar: String = "█".repeat(filled) + &"░".repeat(track.saturating_sub(filled));
+    let line = Line::from(vec![
+        Span::styled("GPU ", Style::default().fg(MUTED)),
+        Span::styled(bar, Style::default().fg(BLUE)),
+        Span::styled(format!(" {FAKE_GPU_PCT}%"), Style::default().fg(BLUE)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line)
+            .style(Style::default().bg(BG))
+            .alignment(Alignment::Left),
+        area,
+    );
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
@@ -109,6 +159,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Tab::Runtime => "Tab switch  r refresh health/kernels/locks  q quit",
         Tab::Logs => "Tab switch  r refresh log tails  q quit",
         Tab::Settings => "Tab switch  e easy  a advanced  Up/Down select  r refresh  q quit",
+        Tab::Home => {
+            "Tab switch  s/x/t serve start/stop/restart  c chat  d admin  click controls  r refresh  q quit"
+        }
         _ => "Tab switch  r refresh  q quit",
     };
     frame.render_widget(
@@ -124,20 +177,30 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_home(frame: &mut Frame, app: &mut App, area: Rect) {
+    app.control_buttons.clear();
+
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(pad(area, 1, 0));
     let left = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(10), Constraint::Min(8)])
+        .constraints([Constraint::Length(11), Constraint::Min(6)])
         .split(cols[0]);
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(12), Constraint::Min(6)])
+        .constraints([Constraint::Length(9), Constraint::Min(6)])
         .split(cols[1]);
 
+    draw_home_status(frame, app, left[0]);
+    draw_home_models(frame, app, left[1]);
+    draw_home_control(frame, app, right[0]);
+    draw_home_connections(frame, right[1]);
+}
+
+/// Status pane: serve health, full endpoint URLs, and live serve/daemon PIDs.
+fn draw_home_status(frame: &mut Frame, app: &App, area: Rect) {
     let serve_color = if app.status.serve_http_ok {
         GREEN
     } else if app.status.serve_pid_alive || app.status.serve_pid.is_some() {
@@ -145,122 +208,207 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         RED
     };
-    let mut status = vec![
-        Line::from(vec![
-            Span::raw("Serve      "),
-            Span::styled(app.status.serve_label(), Style::default().fg(serve_color)),
-        ]),
-        Line::from(format!(
-            "Endpoint   {}:{}",
-            app.config.probe_host(),
-            app.config.port
-        )),
-        Line::from(format!(
-            "PID        {}",
-            app.status
-                .serve_pid
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "-".into())
-        )),
-        Line::from(format!("Active     {}", app.active_model)),
-        Line::from(format!(
-            "Config     {} ({})",
-            app.config.default_model,
-            if app.config.loaded_from_disk {
-                "custom"
-            } else {
-                "defaults"
-            }
-        )),
-        Line::from(format!(
-            "Overrides  {} model overlays",
-            app.config.per_model_count
-        )),
-        Line::from(format!(
-            "Models     {} local / {} registry",
-            app.registry.local_files.len(),
-            app.registry.models.len()
-        )),
-    ];
+
+    let pid_list = |pids: &[u32]| {
+        if pids.is_empty() {
+            "-".to_string()
+        } else {
+            pids.iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+
+    let mut status = vec![Line::from(vec![
+        Span::raw("Serve       "),
+        Span::styled(app.status.serve_label(), Style::default().fg(serve_color)),
+    ])];
+    for (idx, url) in app.status.endpoints.iter().enumerate() {
+        let label = if idx == 0 {
+            "Endpoint    "
+        } else {
+            "            "
+        };
+        status.push(Line::from(vec![
+            Span::raw(label),
+            Span::styled(url.clone(), Style::default().fg(TEXT)),
+        ]));
+    }
+    status.push(Line::from(format!(
+        "serve PID   {}",
+        pid_list(&app.status.serve_pids)
+    )));
+    status.push(Line::from(format!(
+        "daemon PID  {}",
+        pid_list(&app.status.daemon_pids)
+    )));
     if let Some(warning) = &app.config.warning {
         status.push(Line::from(vec![
-            Span::styled("Config     ", Style::default().fg(YELLOW)),
+            Span::styled("Config      ", Style::default().fg(YELLOW)),
             Span::styled(warning.clone(), Style::default().fg(YELLOW)),
         ]));
     }
     if let Some(warning) = &app.registry.warning {
         status.push(Line::from(vec![
-            Span::styled("Registry   ", Style::default().fg(YELLOW)),
+            Span::styled("Registry    ", Style::default().fg(YELLOW)),
             Span::styled(warning.clone(), Style::default().fg(YELLOW)),
         ]));
     }
-    frame.render_widget(card("Runtime", status), left[0]);
+    frame.render_widget(card("Status", status), area);
+}
 
-    let actions = vec![
-        ListItem::new("Chat: use the Chat tab; it streams through existing hipfire serve."),
-        ListItem::new("Models: browse registry and local downloads."),
-        ListItem::new("Settings: easy/advanced split, read-only in prototype 1."),
-        ListItem::new("Runtime: daemon health, batches, kernel caches, resource locks."),
-        ListItem::new("Logs: tails serve.log and ~/.hipfire/logs/*.log."),
-        ListItem::new("System: hardware, path checks, and local model files."),
+/// Models pane: each loaded model with its resident size and override flag.
+/// The active model name is real; resident size and the override badge are
+/// FAKED (bright blue) until the daemon exposes a loaded-model inventory.
+fn draw_home_models(frame: &mut Frame, app: &App, area: Rect) {
+    // (name, resident, total, override, name_is_real) — the first row is the
+    // real active model; the rest are illustrative placeholders (blue) for the
+    // multi-model layout.
+    let models: Vec<(String, &str, &str, bool, bool)> = vec![
+        (
+            app.active_model.clone(),
+            "7.8",
+            "8.0",
+            app.config.per_model_count > 0,
+            true,
+        ),
+        ("gemma3-vl-4b".into(), "3.1", "4.2", false, false),
     ];
-    frame.render_widget(
-        List::new(actions)
-            .block(block("Prototype map"))
-            .style(Style::default().fg(TEXT).bg(PANEL)),
-        left[1],
-    );
 
-    let philosophy = Text::from(vec![
-        Line::from(Span::styled(
-            "Spike leash",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )),
-        Line::from("This is Wick-shaped, but still hipfire-owned."),
-        Line::from("No command replacement, no plugin runtime, no generated skills yet."),
-        Line::from("Every active surface reads real local state or talks to the existing daemon."),
-        Line::from("The disabled tool cards below mark the next vertical slice."),
-    ]);
-    frame.render_widget(
-        Paragraph::new(philosophy)
-            .block(block("Intent"))
-            .wrap(Wrap { trim: false })
-            .style(Style::default().fg(TEXT).bg(PANEL)),
-        right[0],
-    );
+    let mut lines = Vec::new();
+    for (name, resident, total, has_override, name_is_real) in &models {
+        let name_color = if *name_is_real { TEXT } else { BLUE };
+        let mut spans = vec![
+            Span::styled(
+                name.clone(),
+                Style::default().fg(name_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  ({resident}/{total} GB in RAM)"),
+                Style::default().fg(BLUE),
+            ),
+        ];
+        if *has_override {
+            spans.push(Span::styled(
+                "  [config override]",
+                Style::default().fg(BLUE),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "resident size + override flags are placeholder data (blue)",
+        Style::default().fg(MUTED),
+    )));
 
-    let tools = vec![
-        Row::new([
-            "Quantizer",
-            "planned",
-            "front-end existing hipfire quantize flow",
-        ]),
-        Row::new(["AWQ import", "planned", "model conversion/install workflow"]),
-        Row::new([
-            "TriAttention",
-            "planned",
-            "sidecar generation/validation wizard",
-        ]),
-        Row::new([
-            "Agent profiles",
-            "later",
-            "/default, /agent, /code profile system",
-        ]),
+    frame.render_widget(card("Models", lines), area);
+}
+
+/// Control pane: start/stop/restart serve plus chat/admin endpoint toggles.
+/// Each row is a clickable button (mouse) and has a keyboard hotkey. Serve
+/// actions are real; the endpoint toggles are FAKED state (blue).
+fn draw_home_control(frame: &mut Frame, app: &mut App, area: Rect) {
+    frame.render_widget(block("Control"), area);
+    let inner = Rect {
+        x: area.x.saturating_add(2),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(4),
+        height: area.height.saturating_sub(2),
+    };
+
+    let on_off = |on: bool| if on { "on" } else { "off" };
+    let buttons: [(ControlAction, Span, Span); 5] = [
+        (
+            ControlAction::StartServe,
+            Span::styled("[s] Start serve", Style::default().fg(TEXT)),
+            Span::styled("", Style::default()),
+        ),
+        (
+            ControlAction::StopServe,
+            Span::styled("[x] Stop serve", Style::default().fg(TEXT)),
+            Span::styled("", Style::default()),
+        ),
+        (
+            ControlAction::RestartServe,
+            Span::styled("[t] Restart serve", Style::default().fg(TEXT)),
+            Span::styled("", Style::default()),
+        ),
+        (
+            ControlAction::ToggleChatEndpoint,
+            Span::styled("[c] Chat endpoint", Style::default().fg(TEXT)),
+            Span::styled(
+                on_off(app.chat_endpoint_on).to_string(),
+                Style::default().fg(BLUE),
+            ),
+        ),
+        (
+            ControlAction::ToggleAdminConsole,
+            Span::styled("[d] Admin console", Style::default().fg(TEXT)),
+            Span::styled(
+                on_off(app.admin_console_on).to_string(),
+                Style::default().fg(BLUE),
+            ),
+        ),
     ];
+
+    for (idx, (action, label, state)) in buttons.into_iter().enumerate() {
+        let y = inner.y.saturating_add(idx as u16);
+        if y >= inner.y.saturating_add(inner.height) {
+            break;
+        }
+        let row = Rect {
+            x: inner.x,
+            y,
+            width: inner.width,
+            height: 1,
+        };
+        let mut spans = vec![label];
+        if !state.content.is_empty() {
+            spans.push(Span::raw("  "));
+            spans.push(state);
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(PANEL)),
+            row,
+        );
+        app.control_buttons.push((row, action));
+    }
+}
+
+/// Connections pane: who is connected to the server. FAKED (bright blue) — the
+/// auth/account layer is not finished, so client IPs and accounts are stubbed.
+fn draw_home_connections(frame: &mut Frame, area: Rect) {
+    let rows = [
+        ("192.168.0.10", "alice", "2"),
+        ("192.168.0.42", "bob", "1"),
+        ("127.0.0.1", "local-cli", "1"),
+    ];
+    let total: u32 = rows
+        .iter()
+        .filter_map(|(_, _, n)| n.parse::<u32>().ok())
+        .sum();
+
+    let table_rows = rows.iter().map(|(ip, account, conns)| {
+        Row::new([ip.to_string(), account.to_string(), conns.to_string()])
+            .style(Style::default().fg(BLUE))
+    });
     frame.render_widget(
         Table::new(
-            tools,
+            table_rows,
             [
-                Constraint::Length(16),
-                Constraint::Length(12),
-                Constraint::Min(20),
+                Constraint::Length(18),
+                Constraint::Min(12),
+                Constraint::Length(6),
             ],
         )
-        .header(Row::new(["Tooling", "Status", "Reason"]).style(Style::default().fg(MUTED)))
-        .block(block("Tooling runway"))
-        .style(Style::default().fg(TEXT).bg(PANEL))
-        .row_highlight_style(Style::default().bg(PANEL_2)),
-        right[1],
+        .header(Row::new(["Client IP", "Account", "Conns"]).style(Style::default().fg(MUTED)))
+        .block(block(&format!(
+            "Connections  ({total} active, placeholder)"
+        )))
+        .style(Style::default().bg(PANEL)),
+        area,
     );
 }
 

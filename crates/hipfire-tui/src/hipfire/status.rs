@@ -24,6 +24,14 @@ pub struct StatusState {
     pub kernel_lines: Vec<String>,
     pub lock_lines: Vec<String>,
     pub log_lines: Vec<String>,
+    /// Live PIDs of `hipfire-serve` processes (scanned from /proc).
+    pub serve_pids: Vec<u32>,
+    /// Live PIDs of `hipfire-daemon` processes (daemon.pid + /proc scan).
+    pub daemon_pids: Vec<u32>,
+    /// Full `/v1/` endpoint URLs, including any `/etc/hosts` IP forms.
+    pub endpoints: Vec<String>,
+    /// Local system hostname for the title bar.
+    pub hostname: String,
 }
 
 impl StatusState {
@@ -52,6 +60,35 @@ impl StatusState {
         let kernel_lines = kernel_cache_lines(&paths.kernels);
         let lock_lines = resource_lock_lines(Path::new("/tmp/hipfire-resource-locks"));
         let log_lines = log_tail_lines(paths, 160);
+
+        // hipfire-serve PIDs: prefer the recorded serve.pid, then any matching
+        // /proc comm so multiple workers are surfaced.
+        let mut serve_pids = pids_by_comm("hipfire-serve");
+        if let Some(pid) = serve_pid {
+            if !serve_pids.contains(&pid) && Path::new(&format!("/proc/{pid}")).exists() {
+                serve_pids.push(pid);
+            }
+        }
+        serve_pids.sort_unstable();
+        serve_pids.dedup();
+
+        // hipfire-daemon PIDs: the singleton records itself in daemon.pid; also
+        // scan /proc in case the lock file is stale or missing.
+        let mut daemon_pids = pids_by_comm("hipfire-daemon");
+        if let Some(pid) = fs::read_to_string(&paths.daemon_pid)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        {
+            if !daemon_pids.contains(&pid) && Path::new(&format!("/proc/{pid}")).exists() {
+                daemon_pids.push(pid);
+            }
+        }
+        daemon_pids.sort_unstable();
+        daemon_pids.dedup();
+
+        let hostname = system_hostname();
+        let endpoints = endpoint_urls(config, &hostname);
+
         Self {
             serve_pid,
             serve_pid_alive,
@@ -62,6 +99,10 @@ impl StatusState {
             kernel_lines,
             lock_lines,
             log_lines,
+            serve_pids,
+            daemon_pids,
+            endpoints,
+            hostname,
         }
     }
 
@@ -78,6 +119,79 @@ impl StatusState {
     }
 }
 
+/// Read the local system hostname (`/etc/hostname`, then `$HOSTNAME`).
+fn system_hostname() -> String {
+    if let Ok(raw) = fs::read_to_string("/etc/hostname") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".into())
+}
+
+/// Scan `/proc/<pid>/comm` for processes whose command name matches `target`.
+/// Linux truncates comm to 15 bytes; `hipfire-serve`/`hipfire-daemon` both fit.
+fn pids_by_comm(target: &str) -> Vec<u32> {
+    let mut pids = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return pids;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let comm = fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+        if comm.trim() == target {
+            pids.push(pid);
+        }
+    }
+    pids.sort_unstable();
+    pids
+}
+
+/// Build the set of `/v1/` endpoint URLs a client could hit: the configured
+/// reachable host, plus any `/etc/hosts` IP that maps to this hostname.
+fn endpoint_urls(config: &ConfigState, hostname: &str) -> Vec<String> {
+    let port = config.port;
+    let mut urls = vec![format!("http://{}:{}/v1/", config.probe_host(), port)];
+    // Reverse-map the local hostname through /etc/hosts so the IP form is shown
+    // alongside the name form (no std reverse-DNS; parse the file directly).
+    for (name, ip) in parse_etc_hosts() {
+        if name == hostname && !ip.starts_with("127.") && ip != "::1" {
+            urls.push(format!("http://{ip}:{port}/v1/"));
+            urls.push(format!("http://{name}:{port}/v1/"));
+        }
+    }
+    urls.sort();
+    urls.dedup();
+    urls
+}
+
+/// Parse `/etc/hosts` into (name, ip) pairs. Best-effort; comments stripped.
+fn parse_etc_hosts() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Ok(text) = fs::read_to_string("/etc/hosts") else {
+        return out;
+    };
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let Some(ip) = fields.next() else { continue };
+        for name in fields {
+            out.push((name.to_string(), ip.to_string()));
+        }
+    }
+    out
+}
+
 pub fn start_background_serve() -> Result<()> {
     Command::new("hipfire")
         .arg("serve")
@@ -87,6 +201,27 @@ pub fn start_background_serve() -> Result<()> {
         .spawn()
         .map_err(|err| anyhow!("failed to launch `hipfire serve`: {err}"))?;
     Ok(())
+}
+
+/// Send SIGTERM to the given PIDs (graceful stop). Returns how many signals
+/// were dispatched without error.
+pub fn stop_pids(pids: &[u32]) -> Result<usize> {
+    if pids.is_empty() {
+        return Err(anyhow!("no running process to stop"));
+    }
+    let mut stopped = 0;
+    for pid in pids {
+        let ok = Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            stopped += 1;
+        }
+    }
+    Ok(stopped)
 }
 
 fn probe_health(config: &ConfigState) -> (bool, String) {

@@ -16,7 +16,6 @@ pub struct ConfigState {
     pub default_model: String,
     pub values: BTreeMap<String, String>,
     pub per_model_count: usize,
-    pub loaded_from_disk: bool,
     pub warning: Option<String>,
     pub schema_field_count: Option<usize>,
     pub schema_warning: Option<String>,
@@ -26,13 +25,11 @@ pub struct ConfigState {
 impl ConfigState {
     pub fn load(paths: &HipfirePaths) -> Self {
         let mut values = defaults();
-        let mut loaded_from_disk = false;
         let mut warning = None;
 
         match fs::read_to_string(&paths.config) {
             Ok(raw) => match serde_json::from_str::<Value>(&raw) {
                 Ok(Value::Object(map)) => {
-                    loaded_from_disk = true;
                     for (k, v) in map {
                         values.insert(k, value_to_string(&v));
                     }
@@ -92,7 +89,6 @@ impl ConfigState {
             default_model,
             values,
             per_model_count,
-            loaded_from_disk,
             warning,
             schema_field_count,
             schema_warning,
