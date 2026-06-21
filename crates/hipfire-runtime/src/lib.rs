@@ -25,6 +25,7 @@ pub mod cpu_router;
 pub mod ddtree;
 #[cfg(feature = "deltanet")]
 pub mod dflash;
+pub mod dispatch;
 pub mod env_docs;
 pub mod eos_filter;
 pub mod ep;
@@ -32,14 +33,8 @@ pub mod gguf;
 pub mod hfq;
 pub mod hfq_modules;
 pub mod host_profile;
-pub mod llama;
-// Neutral homes for the GENERIC primitives historically defined under `llama`
-// (they are not llama-specific — every arch uses them). Callers import from
-// these modules, not `llama`. The `kv`, `quant`, `dispatch`, and `weights`
-// modules now own their definitions outright, relocated out of `llama.rs` in
-// the de-llama-ify cleanup.
-pub mod dispatch;
 pub mod kv;
+pub mod llama;
 pub mod logging;
 pub mod loop_guard;
 pub mod model_source;
