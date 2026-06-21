@@ -45289,6 +45289,54 @@ impl Gpu {
         }
     }
 
+    /// KVarN tile quantizer: variance-normalize (Sinkhorn) + 4-bit affine + pack
+    /// to the on-device KVarN record. `tiles` = [n_tiles, r_dim*c_dim] f32; `recs`
+    /// = [n_tiles, record_bytes] (kvarn_record_bytes(r,c)). c_dim must be even.
+    /// One block per tile. Validated vs the kvarn.rs CPU oracle.
+    pub fn kvarn_quantize_tile(
+        &mut self,
+        tiles: &GpuTensor,
+        recs: &GpuTensor,
+        n_tiles: usize,
+        r_dim: usize,
+        c_dim: usize,
+        record_bytes: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(r_dim <= 256 && c_dim <= 256, "kvarn_quantize_tile: r,c must be <= 256");
+        assert_eq!(c_dim % 2, 0, "kvarn_quantize_tile: c_dim must be even (nibble rows)");
+        self.ensure_kernel(
+            "kvarn_quantize_tile",
+            kernels::KVARN_QUANTIZE_TILE_SRC,
+            "kvarn_quantize_tile",
+        )?;
+        let tp = tiles.buf.as_ptr();
+        let rp = recs.buf.as_ptr();
+        let mut nt = n_tiles as i32;
+        let mut rd = r_dim as i32;
+        let mut cd = c_dim as i32;
+        let mut rb = record_bytes as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &tp as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &mut nt as *mut _ as *mut c_void,
+            &mut rd as *mut _ as *mut c_void,
+            &mut cd as *mut _ as *mut c_void,
+            &mut rb as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions["kvarn_quantize_tile"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_tiles as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Opus Quant W4A4 fused Gate+Up: gate_proj + up_proj grouped-iu4 GEMMs in
     /// one launch sharing the int4 activation (`xq`/`xs`). Each weight buffer is
     /// the combined `[nibbles | f32 scales]` layout (scales addressed internally

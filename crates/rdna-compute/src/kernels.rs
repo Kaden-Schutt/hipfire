@@ -3740,6 +3740,13 @@ pub const FUSED_QKVZA_OQ4_WMMA_SRC: &str =
 pub const GEMV_OQ4_GROUPED_SRC: &str =
     include_str!("../../../kernels/src/gemv_oq4_grouped.hip");
 
+/// KVarN tile quantizer (Phase D1): log-domain Sinkhorn variance-normalize +
+/// per-row 4-bit affine quantize + pack to the on-device KVarN record. One block
+/// per tile; tile in global, scales in LDS (gfx1103-safe). Golden oracle =
+/// `kvarn.rs`. See `kernels/src/kvarn_quantize_tile.hip`.
+pub const KVARN_QUANTIZE_TILE_SRC: &str =
+    include_str!("../../../kernels/src/kvarn_quantize_tile.hip");
+
 // Generic kernel library GEMV tier (gfx1103 wave32, zero LDS, wave-shuffle
 // reduction; one wave per output row). Same-dtype weight/vector inputs.
 // See `docs/kernels/generic-kernel-library.md`.
