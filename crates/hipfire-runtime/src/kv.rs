@@ -77,12 +77,14 @@ pub struct KvCache {
     /// f32, holding the K rows of the not-yet-quantized trailing block. Empty
     /// unless `quant_kvarn`. A block is flush-quantized into `k_gpu` once full.
     pub k_window: Vec<GpuTensor>,
-    /// KVarN read-side scratch, reused across every (layer, position) so the
+    /// KVarN write-side scratch, reused across every (layer, position) so the
     /// attention path does NOT allocate per call (GpuTensor has no pool-return
     /// Drop — per-call `alloc_tensor` would leak and wedge the GPU). Lazily
-    /// allocated on first KVarN attention: `kvarn_shadow` = [physical_cap × kv_dim]
-    /// f16 token-major shadow K; `kvarn_tiles` = [n_kv_heads × head_dim × GROUP]
-    /// f32 gather staging for one block flush.
+    /// allocated on first KVarN attention: `kvarn_tiles` = [n_kv_heads × head_dim
+    /// × GROUP] f32 gather staging for one block flush.
+    /// `kvarn_shadow` is reserved (the v1 read path materialized a [physical_cap ×
+    /// kv_dim] f16 shadow K here; the Phase-D2 fused flash reads records in place,
+    /// so it stays `None` — kept for an optional shadow-build fallback).
     pub kvarn_shadow: Option<GpuTensor>,
     pub kvarn_tiles: Option<GpuTensor>,
 }

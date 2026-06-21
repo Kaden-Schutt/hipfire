@@ -33640,6 +33640,186 @@ impl Gpu {
         )
     }
 
+    /// Fused KVarN flash (Phase D2): like `attention_flash_f16k_q8v_batched_masked`
+    /// but Phase A dequants the 4-bit K records IN PLACE (`records` =
+    /// `k_gpu[layer]`) for the `n_full_blocks` full tiles + reads the f32
+    /// `window` for the trailing partial tile — no f16 shadow K, no build pass.
+    /// V stays Q8_0 (`v_cache`). Tile+reduce path; shares the asym reduce kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_kvarn_batched_masked(
+        &mut self,
+        q: &GpuTensor,
+        records: &GpuTensor,
+        window: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+        n_full_blocks: usize,
+        rec_bytes: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const TILE_SIZE: usize = 128; // == KVARN_GROUP
+        let max_tiles = max_ctx_len.div_ceil(TILE_SIZE);
+        let stride = 2 + head_dim;
+        let per_pos_bytes = n_heads * max_tiles * stride * 4;
+        let partials_capacity = partials.numel() * 4;
+        let sub_batch = if per_pos_bytes > 0 {
+            (partials_capacity / per_pos_bytes).max(1).min(batch_size)
+        } else {
+            batch_size
+        };
+        self.ensure_kernel(
+            "attention_flash_kvarn_tile_batched",
+            kernels::ATTENTION_FLASH_KVARN_TILE_BATCHED_SRC,
+            "attention_flash_kvarn_tile_batched",
+        )?;
+        self.ensure_kernel(
+            "attention_flash_asym_reduce_batched",
+            kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC,
+            "attention_flash_asym_reduce_batched",
+        )?;
+        let q_dim = n_heads * head_dim;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut offset = 0usize;
+        while offset < batch_size {
+            let chunk = (batch_size - offset).min(sub_batch);
+            {
+                let q_ptr =
+                    unsafe { (q.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut c_void };
+                let rec_ptr = records.buf.as_ptr();
+                let win_ptr = window.buf.as_ptr();
+                let v_ptr = v_cache.buf.as_ptr();
+                let p_ptr = partials.buf.as_ptr();
+                let pos_ptr = positions.buf.as_ptr();
+                let bias_ptr: *mut std::ffi::c_void = match tree_bias {
+                    Some(t) => t.buf.as_ptr(),
+                    None => std::ptr::null_mut(),
+                };
+                let nh = n_heads as i32;
+                let nkv = n_kv_heads as i32;
+                let hd = head_dim as i32;
+                let ms = max_seq as i32;
+                let sc = scale;
+                let ts = TILE_SIZE as i32;
+                let mt = max_tiles as i32;
+                let bo = offset as i32;
+                let bs = block_start as i32;
+                let bc = block_cols as i32;
+                let nfb = n_full_blocks as i32;
+                let rb = rec_bytes as i32;
+                let mut params: Vec<*mut c_void> = vec![
+                    &q_ptr as *const _ as *mut c_void,
+                    &rec_ptr as *const _ as *mut c_void,
+                    &win_ptr as *const _ as *mut c_void,
+                    &v_ptr as *const _ as *mut c_void,
+                    &p_ptr as *const _ as *mut c_void,
+                    &pos_ptr as *const _ as *mut c_void,
+                    &bias_ptr as *const _ as *mut c_void,
+                    &nh as *const _ as *mut c_void,
+                    &nkv as *const _ as *mut c_void,
+                    &hd as *const _ as *mut c_void,
+                    &ms as *const _ as *mut c_void,
+                    &sc as *const _ as *mut c_void,
+                    &ts as *const _ as *mut c_void,
+                    &mt as *const _ as *mut c_void,
+                    &bo as *const _ as *mut c_void,
+                    &bs as *const _ as *mut c_void,
+                    &bc as *const _ as *mut c_void,
+                    &nfb as *const _ as *mut c_void,
+                    &rb as *const _ as *mut c_void,
+                ];
+                self.launch_maybe_blob(
+                    "attention_flash_kvarn_tile_batched",
+                    [n_heads as u32, max_tiles as u32, chunk as u32],
+                    [32, 1, 1],
+                    (TILE_SIZE * 4) as u32,
+                    &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(q_ptr);
+                        b.push_ptr(rec_ptr);
+                        b.push_ptr(win_ptr);
+                        b.push_ptr(v_ptr);
+                        b.push_ptr(p_ptr);
+                        b.push_ptr(pos_ptr);
+                        b.push_ptr(bias_ptr);
+                        b.push_i32(nh);
+                        b.push_i32(nkv);
+                        b.push_i32(hd);
+                        b.push_i32(ms);
+                        b.push_f32(sc);
+                        b.push_i32(ts);
+                        b.push_i32(mt);
+                        b.push_i32(bo);
+                        b.push_i32(bs);
+                        b.push_i32(bc);
+                        b.push_i32(nfb);
+                        b.push_i32(rb);
+                        b
+                    },
+                )?;
+            }
+            {
+                let p_ptr = partials.buf.as_ptr();
+                let o_ptr =
+                    unsafe { (out.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut c_void };
+                let pos_ptr = positions.buf.as_ptr();
+                let nh = n_heads as i32;
+                let hd = head_dim as i32;
+                let ts = TILE_SIZE as i32;
+                let mt = max_tiles as i32;
+                let bo = offset as i32;
+                let bs = block_start as i32;
+                let bc = block_cols as i32;
+                let mut params: Vec<*mut c_void> = vec![
+                    &p_ptr as *const _ as *mut c_void,
+                    &o_ptr as *const _ as *mut c_void,
+                    &pos_ptr as *const _ as *mut c_void,
+                    &nh as *const _ as *mut c_void,
+                    &hd as *const _ as *mut c_void,
+                    &ts as *const _ as *mut c_void,
+                    &mt as *const _ as *mut c_void,
+                    &bo as *const _ as *mut c_void,
+                    &bs as *const _ as *mut c_void,
+                    &bc as *const _ as *mut c_void,
+                ];
+                self.launch_maybe_blob(
+                    "attention_flash_asym_reduce_batched",
+                    [n_heads as u32, chunk as u32, 1],
+                    [32, 1, 1],
+                    0,
+                    &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(p_ptr);
+                        b.push_ptr(o_ptr);
+                        b.push_ptr(pos_ptr);
+                        b.push_i32(nh);
+                        b.push_i32(hd);
+                        b.push_i32(ts);
+                        b.push_i32(mt);
+                        b.push_i32(bo);
+                        b.push_i32(bs);
+                        b.push_i32(bc);
+                        b
+                    },
+                )?;
+            }
+            offset += chunk;
+        }
+        Ok(())
+    }
+
     /// Flash attention with Q8_0 KV cache — tile + reduce two-kernel path.
     /// Tiles seq_len into chunks of `tile_size`, launches [n_heads, n_tiles]
     /// blocks for the tile kernel, then [n_heads] blocks for the reduce.
@@ -45566,7 +45746,6 @@ impl Gpu {
         positions: &GpuTensor,
         out: &GpuTensor,
         flash_partials: &GpuTensor,
-        shadow: &GpuTensor,
         tiles: &GpuTensor,
         n: usize,
         start_pos: usize,
@@ -45615,18 +45794,15 @@ impl Gpu {
             }
         }
 
-        // 3. Build f16 shadow K [seq_len × kv_dim] into the reusable scratch (sized
-        // for physical_cap; build writes the first seq_len rows, flash reads them).
+        // 3. Fused KVarN flash over [0, seq_len): dequant the 4-bit records in
+        // place for the `n_full_blocks` full tiles + read the f32 window for the
+        // trailing partial tile. No f16 shadow build (Phase D2). Causal masking
+        // via positions.
         let n_full_blocks = seq_len / GROUP;
-        let tail_len = seq_len % GROUP;
-        self.kvarn_build_kcache(
-            records, window, shadow, n_full_blocks, tail_len, n_kv_heads, head_dim, GROUP, rec_bytes,
-        )?;
-
-        // 4. f16-K / Q8-V flash over [0, seq_len) with causal masking via positions.
-        self.attention_flash_f16k_q8v_batched_masked(
+        self.attention_flash_kvarn_batched_masked(
             fa_q,
-            shadow,
+            records,
+            window,
             v_cache,
             out,
             positions,
@@ -45640,6 +45816,8 @@ impl Gpu {
             tree_bias,
             block_start,
             block_cols,
+            n_full_blocks,
+            rec_bytes,
         )
     }
 

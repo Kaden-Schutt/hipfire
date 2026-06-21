@@ -2596,6 +2596,11 @@ pub const ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC: &str =
 /// with Phase A reading K directly as f16 from a token-major shadow cache.
 pub const ATTENTION_FLASH_F16K_Q8V_TILE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_f16k_q8v_tile_batched.hip");
+/// Fused KVarN flash tile (Phase D2): Phase A dequants the 4-bit K records
+/// in-place (full tiles) + reads the f32 window (partial tile); V Q8_0. Removes
+/// the v1 build_kcache pass + shadow buffer. See attention_flash_kvarn_tile_batched.hip.
+pub const ATTENTION_FLASH_KVARN_TILE_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_kvarn_tile_batched.hip");
 pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_asym_reduce_batched.hip");
 

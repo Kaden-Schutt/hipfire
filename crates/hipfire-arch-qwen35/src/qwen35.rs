@@ -26235,15 +26235,13 @@ fn kv_cache_attention_dispatch(
     // KVarN decode: single-token KV write (window append + block flush) + read
     // (build f16 shadow K) + f16/Q8 flash, handled outside the dispatch substrate.
     if kv_cache.quant_kvarn {
-        // Lazily allocate the reusable read-side scratch (once per cache — never
+        // Lazily allocate the reusable gather-tile scratch (once per cache — never
         // per call: GpuTensor has no pool-return Drop, so per-call alloc leaks).
-        let kv_dim = config.n_kv_heads * config.head_dim;
-        if kv_cache.kvarn_shadow.is_none() {
-            let shadow =
-                gpu.alloc_tensor(&[kv_cache.physical_cap * kv_dim], rdna_compute::DType::F16)?;
+        // The fused KVarN flash (Phase D2) reads records in place, so no f16
+        // shadow K buffer is needed anymore.
+        if kv_cache.kvarn_tiles.is_none() {
             let tiles = gpu
                 .alloc_tensor(&[config.n_kv_heads * config.head_dim * 128], rdna_compute::DType::F32)?;
-            kv_cache.kvarn_shadow = Some(shadow);
             kv_cache.kvarn_tiles = Some(tiles);
         }
         // The KV-write/flash kernels read positions from a GpuTensor; `s.pos_buf`
@@ -26264,7 +26262,6 @@ fn kv_cache_attention_dispatch(
             &pos_view,
             &s.fa_attn_out,
             &s.flash_partials,
-            kv_cache.kvarn_shadow.as_ref().unwrap(),
             kv_cache.kvarn_tiles.as_ref().unwrap(),
             1,
             pos,
