@@ -15,6 +15,15 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire gpu-lock acquire`↴](#hipfire-gpu-lock-acquire)
 * [`hipfire gpu-lock release`↴](#hipfire-gpu-lock-release)
 * [`hipfire gpu-lock status`↴](#hipfire-gpu-lock-status)
+* [`hipfire operator`↴](#hipfire-operator)
+* [`hipfire operator status`↴](#hipfire-operator-status)
+* [`hipfire operator health`↴](#hipfire-operator-health)
+* [`hipfire operator models`↴](#hipfire-operator-models)
+* [`hipfire operator config`↴](#hipfire-operator-config)
+* [`hipfire operator training`↴](#hipfire-operator-training)
+* [`hipfire operator diagnostics`↴](#hipfire-operator-diagnostics)
+* [`hipfire operator logs`↴](#hipfire-operator-logs)
+* [`hipfire operator get`↴](#hipfire-operator-get)
 
 ## `hipfire`
 
@@ -31,6 +40,7 @@ hipfire LLM inference CLI
 * `host-profile` — Measure host, GPU-copy, and model storage bandwidth
 * `collect-artifacts` — Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one model load
 * `gpu-lock` — GPU mutex for multi-agent coordination (acquire/release/status)
+* `operator` — Query the running hipfire operator API for scripts and agents
 
 
 
@@ -159,6 +169,116 @@ Release the GPU lock (SIGTERM the holder recorded in the lockfile)
 Print lock status: "gpu is free" or "gpu BUSY: <holder>"
 
 **Usage:** `hipfire gpu-lock status`
+
+
+
+## `hipfire operator`
+
+Query the running hipfire operator API for scripts and agents
+
+**Usage:** `hipfire operator [OPTIONS] <COMMAND>`
+
+###### **Subcommands:**
+
+* `status` — Combined status snapshot for scripts and agents
+* `health` — Raw /health payload
+* `models` — Local model registry from the operator API
+* `config` — Resolved runtime config
+* `training` — Training run summaries or one run detail
+* `diagnostics` — Filesystem, binary, kernel-cache, lock, and log diagnostics
+* `logs` — Tail known hipfire logs
+* `get` — GET an arbitrary operator/server path, e.g. /operator/training/runs
+
+###### **Options:**
+
+* `--host <HOST>` — Override operator API host. Defaults to config host, with 0.0.0.0 mapped to 127.0.0.1
+* `--port <PORT>` — Override operator API port. Defaults to config port
+
+
+
+## `hipfire operator status`
+
+Combined status snapshot for scripts and agents
+
+**Usage:** `hipfire operator status`
+
+
+
+## `hipfire operator health`
+
+Raw /health payload
+
+**Usage:** `hipfire operator health`
+
+
+
+## `hipfire operator models`
+
+Local model registry from the operator API
+
+**Usage:** `hipfire operator models`
+
+
+
+## `hipfire operator config`
+
+Resolved runtime config
+
+**Usage:** `hipfire operator config [OPTIONS]`
+
+###### **Options:**
+
+* `--model <MODEL>` — Resolve config for a specific model tag
+
+
+
+## `hipfire operator training`
+
+Training run summaries or one run detail
+
+**Usage:** `hipfire operator training [OPTIONS] [ID]`
+
+###### **Arguments:**
+
+* `<ID>` — Optional run ID
+
+###### **Options:**
+
+* `--events` — Return full events for the run ID
+
+
+
+## `hipfire operator diagnostics`
+
+Filesystem, binary, kernel-cache, lock, and log diagnostics
+
+**Usage:** `hipfire operator diagnostics`
+
+
+
+## `hipfire operator logs`
+
+Tail known hipfire logs
+
+**Usage:** `hipfire operator logs [OPTIONS]`
+
+###### **Options:**
+
+* `--lines <LINES>` — Number of lines per log file
+
+  Default value: `120`
+
+
+
+## `hipfire operator get`
+
+GET an arbitrary operator/server path, e.g. /operator/training/runs
+
+**Usage:** `hipfire operator get <PATH>`
+
+###### **Arguments:**
+
+* `<PATH>` — Absolute or relative server path
 
 
 

@@ -4,6 +4,7 @@
 
 use std::{
     fs,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::Duration,
 };
@@ -20,6 +21,9 @@ pub struct StatusState {
     pub health_text: String,
     pub gpu_lines: Vec<String>,
     pub paths_ok: Vec<(String, bool)>,
+    pub kernel_lines: Vec<String>,
+    pub lock_lines: Vec<String>,
+    pub log_lines: Vec<String>,
 }
 
 impl StatusState {
@@ -42,7 +46,12 @@ impl StatusState {
                 paths.per_model_config.exists(),
             ),
             ("serve.log".into(), paths.serve_log.exists()),
+            ("logs".into(), paths.logs.exists()),
+            ("kernels".into(), paths.kernels.exists()),
         ];
+        let kernel_lines = kernel_cache_lines(&paths.kernels);
+        let lock_lines = resource_lock_lines(Path::new("/tmp/hipfire-resource-locks"));
+        let log_lines = log_tail_lines(paths, 160);
         Self {
             serve_pid,
             serve_pid_alive,
@@ -50,6 +59,9 @@ impl StatusState {
             health_text,
             gpu_lines,
             paths_ok,
+            kernel_lines,
+            lock_lines,
+            log_lines,
         }
     }
 
@@ -120,4 +132,113 @@ fn detect_gpu_lines() -> Vec<String> {
         lines.push("No GPU lines from lspci. Run hipfire diag for full probe.".into());
     }
     lines
+}
+
+fn kernel_cache_lines(kernel_root: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(kernel_root) else {
+        return vec![format!(
+            "No kernel cache directory at {}",
+            kernel_root.display()
+        )];
+    };
+    let mut lines = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let mut hsaco = 0;
+        let mut hash = 0;
+        if let Ok(files) = fs::read_dir(&path) {
+            for file in files.flatten() {
+                match file.path().extension().and_then(|ext| ext.to_str()) {
+                    Some("hsaco") => hsaco += 1,
+                    Some("hash") => hash += 1,
+                    _ => {}
+                }
+            }
+        }
+        let arch = entry.file_name().to_string_lossy().to_string();
+        let balance = if hsaco == hash {
+            "balanced"
+        } else {
+            "mismatch"
+        };
+        lines.push(format!("{arch}: {hsaco} hsaco / {hash} hash ({balance})"));
+    }
+    lines.sort();
+    if lines.is_empty() {
+        lines.push(format!(
+            "No architecture kernel caches under {}",
+            kernel_root.display()
+        ));
+    }
+    lines
+}
+
+fn resource_lock_lines(lock_dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(lock_dir) else {
+        return vec![format!(
+            "No resource lock directory at {}",
+            lock_dir.display()
+        )];
+    };
+    let mut lines = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_file() {
+                return None;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let content = fs::read_to_string(&path)
+                .unwrap_or_default()
+                .lines()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" ");
+            Some(format!("{name}: {content}"))
+        })
+        .collect::<Vec<_>>();
+    lines.sort();
+    if lines.is_empty() {
+        lines.push(format!("No active lock files under {}", lock_dir.display()));
+    }
+    lines
+}
+
+fn log_tail_lines(paths: &HipfirePaths, count: usize) -> Vec<String> {
+    let mut files = vec![paths.serve_log.clone()];
+    if let Ok(entries) = fs::read_dir(&paths.logs) {
+        let mut extra = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("log"))
+            .collect::<Vec<PathBuf>>();
+        extra.sort();
+        files.extend(extra);
+    }
+
+    let mut lines = Vec::new();
+    for path in files {
+        if !path.is_file() {
+            continue;
+        }
+        let tail = tail_file(&path, count.min(200));
+        lines.push(format!("== {} ==", path.display()));
+        lines.extend(tail.lines().map(str::to_string));
+    }
+    if lines.is_empty() {
+        lines.push("No known hipfire log files found.".into());
+    }
+    lines
+}
+
+fn tail_file(path: &Path, count: usize) -> String {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return String::new();
+    };
+    let mut selected = raw.lines().rev().take(count).collect::<Vec<_>>();
+    selected.reverse();
+    selected.join("\n")
 }

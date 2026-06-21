@@ -42,6 +42,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Tab::Home => draw_home(frame, app, root[1]),
         Tab::Chat => draw_chat(frame, app, root[1]),
         Tab::Models => draw_models(frame, app, root[1]),
+        Tab::Runtime => draw_runtime(frame, app, root[1]),
+        Tab::Logs => draw_logs(frame, app, root[1]),
         Tab::Training => draw_training(frame, app, root[1]),
         Tab::Settings => draw_settings(frame, app, root[1]),
         Tab::System => draw_system(frame, app, root[1]),
@@ -104,6 +106,8 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             "Tab switch  Up/Down select  Enter expand/select  Left/Right fold  r refresh  q quit"
         }
         Tab::Training => "Tab switch  Up/Down select run  r refresh  q quit",
+        Tab::Runtime => "Tab switch  r refresh health/kernels/locks  q quit",
+        Tab::Logs => "Tab switch  r refresh log tails  q quit",
         Tab::Settings => "Tab switch  e easy  a advanced  Up/Down select  r refresh  q quit",
         _ => "Tab switch  r refresh  q quit",
     };
@@ -196,7 +200,9 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
         ListItem::new("Chat: use the Chat tab; it streams through existing hipfire serve."),
         ListItem::new("Models: browse registry and local downloads."),
         ListItem::new("Settings: easy/advanced split, read-only in prototype 1."),
-        ListItem::new("System: hardware and path checks."),
+        ListItem::new("Runtime: daemon health, batches, kernel caches, resource locks."),
+        ListItem::new("Logs: tails serve.log and ~/.hipfire/logs/*.log."),
+        ListItem::new("System: hardware, path checks, and local model files."),
     ];
     frame.render_widget(
         List::new(actions)
@@ -432,6 +438,128 @@ fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
     .block(block("Registry browser"))
     .style(Style::default().bg(PANEL));
     frame.render_widget(table, chunks[1]);
+}
+
+fn draw_runtime(frame: &mut Frame, app: &App, area: Rect) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
+        .split(pad(area, 1, 0));
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Min(6),
+        ])
+        .split(cols[0]);
+
+    let serve_color = if app.status.serve_http_ok {
+        GREEN
+    } else if app.status.serve_pid_alive || app.status.serve_pid.is_some() {
+        YELLOW
+    } else {
+        RED
+    };
+    let runtime = vec![
+        Line::from(vec![
+            Span::raw("Serve      "),
+            Span::styled(app.status.serve_label(), Style::default().fg(serve_color)),
+        ]),
+        Line::from(format!(
+            "Endpoint   {}:{}",
+            app.config.probe_host(),
+            app.config.port
+        )),
+        Line::from(format!(
+            "PID        {}",
+            app.status
+                .serve_pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "-".into())
+        )),
+        Line::from(format!("Active     {}", app.active_model)),
+        Line::from(format!("Default    {}", app.config.default_model)),
+        Line::from(format!(
+            "Profiles   {} overlays",
+            app.config.per_model_count
+        )),
+    ];
+    frame.render_widget(card("Daemon", runtime), left[0]);
+
+    let kernel_lines = app
+        .status
+        .kernel_lines
+        .iter()
+        .map(|line| Line::from(line.clone()))
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(kernel_lines)
+            .block(block("Kernel cache"))
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(TEXT).bg(PANEL)),
+        left[1],
+    );
+
+    let lock_lines = app
+        .status
+        .lock_lines
+        .iter()
+        .map(|line| Line::from(line.clone()))
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lock_lines)
+            .block(block("Resource locks"))
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(TEXT).bg(PANEL)),
+        left[2],
+    );
+
+    let mut health_lines = vec![Line::from(Span::styled(
+        "Health response",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    ))];
+    health_lines.extend(
+        app.status
+            .health_text
+            .lines()
+            .map(|line| Line::from(line.to_string())),
+    );
+    if app.status.health_text.is_empty() {
+        health_lines.push(Line::from("No health body returned."));
+    }
+    frame.render_widget(
+        Paragraph::new(Text::from(health_lines))
+            .block(block("Raw /health"))
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(TEXT).bg(PANEL)),
+        cols[1],
+    );
+}
+
+fn draw_logs(frame: &mut Frame, app: &App, area: Rect) {
+    let lines = app
+        .status
+        .log_lines
+        .iter()
+        .map(|line| {
+            if line.starts_with("== ") && line.ends_with(" ==") {
+                Line::from(Span::styled(
+                    line.clone(),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(line.clone())
+            }
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block("Log tails"))
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(TEXT).bg(PANEL)),
+        pad(area, 1, 0),
+    );
 }
 
 fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {

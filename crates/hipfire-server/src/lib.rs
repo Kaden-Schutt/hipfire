@@ -31,6 +31,11 @@ pub fn build_router(state: SharedState) -> Router {
             get(routes::operator::get_resolved_config),
         )
         .route(
+            "/operator/diagnostics",
+            get(routes::operator::get_operator_diagnostics),
+        )
+        .route("/operator/logs", get(routes::operator::get_operator_logs))
+        .route(
             "/operator/models/registry",
             get(routes::models::get_model_registry),
         )

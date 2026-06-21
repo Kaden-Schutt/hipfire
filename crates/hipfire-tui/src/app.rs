@@ -24,16 +24,20 @@ pub enum Tab {
     Home,
     Chat,
     Models,
+    Runtime,
+    Logs,
     Training,
     Settings,
     System,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 6] = [
+    pub const ALL: [Tab; 8] = [
         Tab::Home,
         Tab::Chat,
         Tab::Models,
+        Tab::Runtime,
+        Tab::Logs,
         Tab::Training,
         Tab::Settings,
         Tab::System,
@@ -44,6 +48,8 @@ impl Tab {
             Tab::Home => "Home",
             Tab::Chat => "Chat",
             Tab::Models => "Models",
+            Tab::Runtime => "Runtime",
+            Tab::Logs => "Logs",
             Tab::Training => "Training",
             Tab::Settings => "Settings",
             Tab::System => "System",

@@ -19,6 +19,8 @@ pub struct HipfirePaths {
     pub per_model_config: PathBuf,
     pub serve_pid: PathBuf,
     pub serve_log: PathBuf,
+    pub logs: PathBuf,
+    pub kernels: PathBuf,
     pub training_runs: PathBuf,
 }
 
@@ -35,6 +37,8 @@ impl HipfirePaths {
             per_model_config: root.join("per_model_config.json"),
             serve_pid: root.join("serve.pid"),
             serve_log: root.join("serve.log"),
+            logs: root.join("logs"),
+            kernels: root.join("kernels"),
             training_runs: root.join("training").join("runs"),
             root,
         }

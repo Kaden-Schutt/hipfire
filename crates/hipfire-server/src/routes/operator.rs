@@ -5,11 +5,43 @@ use axum::{
 use hipfire_config::{config_schema, LoadedConfig};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::{fs, path::Path};
 
 use crate::SharedState;
 
 pub async fn get_operator_index() -> Html<&'static str> {
     Html(OPERATOR_INDEX_HTML)
+}
+
+pub async fn get_operator_diagnostics(State(state): State<SharedState>) -> Json<Value> {
+    let loaded = state.loaded_config.lock().await;
+    let root = hipfire_config::hipfire_dir();
+    Json(json!({
+        "hipfire_dir": root.display().to_string(),
+        "config_path": loaded.config_path.display().to_string(),
+        "host_config_path": loaded.host_config_path.display().to_string(),
+        "config_read_error": loaded.read_error,
+        "host_config_read_error": loaded.host_read_error,
+        "paths": path_statuses(&root),
+        "binaries": binary_statuses(&root.join("bin")),
+        "kernel_caches": kernel_cache_statuses(&root.join("kernels")),
+        "resource_locks": resource_lock_statuses(Path::new("/tmp/hipfire-resource-locks")),
+        "logs": log_file_statuses(&root),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OperatorLogsQuery {
+    pub lines: Option<usize>,
+}
+
+pub async fn get_operator_logs(Query(query): Query<OperatorLogsQuery>) -> Json<Value> {
+    let root = hipfire_config::hipfire_dir();
+    let lines = query.lines.unwrap_or(120).clamp(1, 1000);
+    Json(json!({
+        "lines": lines,
+        "logs": log_tails(&root, lines),
+    }))
 }
 
 pub async fn get_config_schema() -> Json<Value> {
@@ -70,6 +102,162 @@ fn resolved_config_json(loaded: &LoadedConfig, model: Option<&str>) -> Value {
         "resolution": resolution,
         "config": config,
     })
+}
+
+fn path_statuses(root: &Path) -> Vec<Value> {
+    [
+        ("hipfire_dir", root.to_path_buf()),
+        ("models", root.join("models")),
+        ("config", root.join("config.json")),
+        ("host_config", root.join("config.local.json")),
+        ("per_model_config", root.join("per_model_config.json")),
+        ("training_runs", root.join("training").join("runs")),
+        ("logs", root.join("logs")),
+        ("kernels", root.join("kernels")),
+    ]
+    .into_iter()
+    .map(|(name, path)| {
+        json!({
+            "name": name,
+            "path": path.display().to_string(),
+            "exists": path.exists(),
+            "is_dir": path.is_dir(),
+            "is_file": path.is_file(),
+        })
+    })
+    .collect()
+}
+
+fn binary_statuses(bin_dir: &Path) -> Vec<Value> {
+    [
+        "hipfire",
+        "hipfire-daemon",
+        "hipfire-tui",
+        "hipfire-eval",
+        "hipfire-host-profile",
+    ]
+    .into_iter()
+    .map(|name| {
+        let path = bin_dir.join(name);
+        json!({
+            "name": name,
+            "path": path.display().to_string(),
+            "exists": path.exists(),
+        })
+    })
+    .collect()
+}
+
+fn kernel_cache_statuses(kernel_root: &Path) -> Vec<Value> {
+    let Ok(entries) = fs::read_dir(kernel_root) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let arch = entry.file_name().to_string_lossy().to_string();
+        let (hsaco, hash) = count_kernel_files(&path);
+        out.push(json!({
+            "arch": arch,
+            "path": path.display().to_string(),
+            "hsaco": hsaco,
+            "hash": hash,
+            "balanced": hsaco == hash,
+        }));
+    }
+    out.sort_by(|a, b| a["arch"].as_str().cmp(&b["arch"].as_str()));
+    out
+}
+
+fn count_kernel_files(path: &Path) -> (usize, usize) {
+    let Ok(entries) = fs::read_dir(path) else {
+        return (0, 0);
+    };
+    let mut hsaco = 0;
+    let mut hash = 0;
+    for entry in entries.flatten() {
+        match entry.path().extension().and_then(|ext| ext.to_str()) {
+            Some("hsaco") => hsaco += 1,
+            Some("hash") => hash += 1,
+            _ => {}
+        }
+    }
+    (hsaco, hash)
+}
+
+fn resource_lock_statuses(lock_dir: &Path) -> Vec<Value> {
+    let Ok(entries) = fs::read_dir(lock_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_file() {
+                return None;
+            }
+            Some(json!({
+                "name": entry.file_name().to_string_lossy(),
+                "path": path.display().to_string(),
+                "bytes": fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                "content": fs::read_to_string(&path).unwrap_or_default().chars().take(500).collect::<String>(),
+            }))
+        })
+        .collect()
+}
+
+fn log_file_statuses(root: &Path) -> Vec<Value> {
+    candidate_log_files(root)
+        .into_iter()
+        .map(|path| {
+            let metadata = fs::metadata(&path).ok();
+            json!({
+                "path": path.display().to_string(),
+                "exists": metadata.is_some(),
+                "bytes": metadata.map(|m| m.len()).unwrap_or(0),
+            })
+        })
+        .collect()
+}
+
+fn log_tails(root: &Path, lines: usize) -> Vec<Value> {
+    candidate_log_files(root)
+        .into_iter()
+        .filter(|path| path.is_file())
+        .map(|path| {
+            json!({
+                "path": path.display().to_string(),
+                "text": tail_file(&path, lines),
+            })
+        })
+        .collect()
+}
+
+fn candidate_log_files(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut paths = vec![root.join("serve.log")];
+    let logs_dir = root.join("logs");
+    if let Ok(entries) = fs::read_dir(&logs_dir) {
+        let mut extra = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("log"))
+            .collect::<Vec<_>>();
+        extra.sort();
+        paths.extend(extra);
+    }
+    paths
+}
+
+fn tail_file(path: &Path, lines: usize) -> String {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return String::new();
+    };
+    let mut selected = raw.lines().rev().take(lines).collect::<Vec<_>>();
+    selected.reverse();
+    selected.join("\n")
 }
 
 const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
@@ -250,6 +438,10 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
       display: grid;
       gap: 8px;
     }
+    .stack {
+      display: grid;
+      gap: 12px;
+    }
     .event {
       border: 1px solid var(--line);
       background: var(--panel);
@@ -267,6 +459,19 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       color: var(--muted);
       white-space: pre-wrap;
+    }
+    pre {
+      margin: 0;
+      overflow: auto;
+      max-height: 520px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 10px;
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.45;
     }
     tr.selectable { cursor: pointer; }
     tr.selected { background: color-mix(in srgb, var(--accent) 14%, transparent); }
@@ -287,10 +492,87 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
   </header>
   <main>
     <nav class="tabs" aria-label="Operator sections">
-      <button class="tab active" id="tab-config" type="button">Config</button>
-      <button class="tab" id="tab-training" type="button">Training</button>
+      <button class="tab active" data-tab="overview" type="button">Overview</button>
+      <button class="tab" data-tab="models" type="button">Models</button>
+      <button class="tab" data-tab="runtime" type="button">Runtime</button>
+      <button class="tab" data-tab="diagnostics" type="button">Diagnostics</button>
+      <button class="tab" data-tab="logs" type="button">Logs</button>
+      <button class="tab" data-tab="config" id="tab-config" type="button">Config</button>
+      <button class="tab" data-tab="training" id="tab-training" type="button">Training</button>
     </nav>
-    <section id="config-panel" class="panel">
+    <section id="overview-panel" class="panel">
+      <div class="toolbar">
+        <button id="overview-refresh" type="button">Refresh</button>
+      </div>
+      <section class="summary" aria-label="Overview summary">
+        <div class="metric"><span>Health</span><strong id="overview-health">-</strong></div>
+        <div class="metric"><span>PID</span><strong id="overview-pid">-</strong></div>
+        <div class="metric"><span>Model</span><strong id="overview-model">-</strong></div>
+        <div class="metric"><span>Training</span><strong id="overview-training">-</strong></div>
+      </section>
+      <div class="grid">
+        <section>
+          <h2 class="section-title">Runtime</h2>
+          <table><tbody id="overview-runtime"></tbody></table>
+        </section>
+        <section>
+          <h2 class="section-title">Recent Issues</h2>
+          <div id="overview-issues" class="event-list"></div>
+        </section>
+      </div>
+    </section>
+    <section id="models-panel" class="panel" hidden>
+      <div class="toolbar">
+        <button id="models-refresh" type="button">Refresh</button>
+      </div>
+      <section class="summary" aria-label="Model summary">
+        <div class="metric"><span>Registry Models</span><strong id="models-count">-</strong></div>
+        <div class="metric"><span>Aliases</span><strong id="models-aliases">-</strong></div>
+        <div class="metric"><span>Local Files</span><strong id="models-local">-</strong></div>
+        <div class="metric"><span>Loaded</span><strong id="models-loaded">-</strong></div>
+      </section>
+      <table>
+        <thead><tr><th>ID</th><th>File</th><th>Size</th><th>VRAM</th><th>Sidecars</th></tr></thead>
+        <tbody id="models-rows"></tbody>
+      </table>
+    </section>
+    <section id="runtime-panel" class="panel" hidden>
+      <div class="toolbar">
+        <button id="runtime-refresh" type="button">Refresh</button>
+      </div>
+      <section class="summary" aria-label="Runtime summary">
+        <div class="metric"><span>Status</span><strong id="runtime-status">-</strong></div>
+        <div class="metric"><span>Idle Timeout</span><strong id="runtime-idle">-</strong></div>
+        <div class="metric"><span>Prefill Queue</span><strong id="runtime-prefill">-</strong></div>
+        <div class="metric"><span>Batches</span><strong id="runtime-batches">-</strong></div>
+      </section>
+      <pre id="runtime-json"></pre>
+    </section>
+    <section id="diagnostics-panel" class="panel" hidden>
+      <div class="toolbar">
+        <button id="diagnostics-refresh" type="button">Refresh</button>
+      </div>
+      <div class="grid">
+        <section>
+          <h2 class="section-title">Paths and Binaries</h2>
+          <table><tbody id="diagnostics-paths"></tbody></table>
+        </section>
+        <section>
+          <h2 class="section-title">Kernel Cache and Locks</h2>
+          <table><tbody id="diagnostics-kernels"></tbody></table>
+        </section>
+      </div>
+    </section>
+    <section id="logs-panel" class="panel" hidden>
+      <div class="toolbar">
+        <label>Lines
+          <input id="logs-lines" type="number" min="1" max="1000" value="160">
+        </label>
+        <button id="logs-refresh" type="button">Refresh</button>
+      </div>
+      <div id="logs-list" class="stack"></div>
+    </section>
+    <section id="config-panel" class="panel" hidden>
       <div class="toolbar">
         <label>Model
           <input id="model" name="model" autocomplete="off" placeholder="optional model tag">
@@ -357,10 +639,32 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
   </main>
   <script>
     const statusEl = document.getElementById("status");
+    const tabEls = [...document.querySelectorAll(".tab")];
+    const panelEls = [...document.querySelectorAll(".panel")];
     const tabConfigEl = document.getElementById("tab-config");
     const tabTrainingEl = document.getElementById("tab-training");
     const configPanelEl = document.getElementById("config-panel");
     const trainingPanelEl = document.getElementById("training-panel");
+    const overviewHealthEl = document.getElementById("overview-health");
+    const overviewPidEl = document.getElementById("overview-pid");
+    const overviewModelEl = document.getElementById("overview-model");
+    const overviewTrainingEl = document.getElementById("overview-training");
+    const overviewRuntimeEl = document.getElementById("overview-runtime");
+    const overviewIssuesEl = document.getElementById("overview-issues");
+    const modelsCountEl = document.getElementById("models-count");
+    const modelsAliasesEl = document.getElementById("models-aliases");
+    const modelsLocalEl = document.getElementById("models-local");
+    const modelsLoadedEl = document.getElementById("models-loaded");
+    const modelsRowsEl = document.getElementById("models-rows");
+    const runtimeStatusEl = document.getElementById("runtime-status");
+    const runtimeIdleEl = document.getElementById("runtime-idle");
+    const runtimePrefillEl = document.getElementById("runtime-prefill");
+    const runtimeBatchesEl = document.getElementById("runtime-batches");
+    const runtimeJsonEl = document.getElementById("runtime-json");
+    const diagnosticsPathsEl = document.getElementById("diagnostics-paths");
+    const diagnosticsKernelsEl = document.getElementById("diagnostics-kernels");
+    const logsLinesEl = document.getElementById("logs-lines");
+    const logsListEl = document.getElementById("logs-list");
     const modelEl = document.getElementById("model");
     const refreshEl = document.getElementById("refresh");
     const rowsEl = document.getElementById("rows");
@@ -390,6 +694,174 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
     function sourceLabel(source) {
       if (!source) return "";
       return source.id ? `${source.kind}:${source.id}` : source.kind;
+    }
+
+    async function fetchJson(path) {
+      const resp = await fetch(path);
+      if (!resp.ok) throw new Error(`${path} ${resp.status}`);
+      return await resp.json();
+    }
+
+    function td(value, cls = "") {
+      const cell = document.createElement("td");
+      if (cls) cell.className = cls;
+      cell.textContent = text(value) || "-";
+      return cell;
+    }
+
+    function keyValueRows(entries) {
+      return entries.map(([key, value, cls]) => {
+        const tr = document.createElement("tr");
+        tr.append(td(key, "key"), td(value, cls || "value"));
+        return tr;
+      });
+    }
+
+    function issueCard(title, detail, warn = false) {
+      const div = document.createElement("div");
+      div.className = warn ? "event warn" : "event";
+      const strong = document.createElement("strong");
+      strong.textContent = title;
+      const code = document.createElement("code");
+      code.textContent = detail || "";
+      div.append(strong, code);
+      return div;
+    }
+
+    async function loadOverview() {
+      statusEl.textContent = "loading overview";
+      const [health, diagnostics, training] = await Promise.all([
+        fetchJson("/health"),
+        fetchJson("/operator/diagnostics"),
+        fetchJson("/operator/training/runs"),
+      ]);
+      overviewHealthEl.textContent = health.status || "-";
+      overviewPidEl.textContent = health.pid || "-";
+      overviewModelEl.textContent = health.model || "none";
+      const runs = training.runs || [];
+      overviewTrainingEl.textContent = `${runs.filter(isActiveRun).length} active / ${runs.length} runs`;
+      overviewRuntimeEl.replaceChildren(...keyValueRows([
+        ["Bind", location.origin],
+        ["Idle timeout", `${health.idle_timeout_sec || 0}s`],
+        ["Prefill queue", health.prefill_batch && (health.prefill_batch.queue_size ?? health.prefill_batch.queued)],
+        ["Batches", health.batches && `${health.batches.queued || 0} queued / ${health.batches.total || 0} total`],
+        ["Kernel caches", (diagnostics.kernel_caches || []).map((k) => `${k.arch}:${k.hsaco}/${k.hash}`).join(", ") || "none"],
+        ["Resource locks", (diagnostics.resource_locks || []).length],
+      ]));
+      const issues = [];
+      for (const path of diagnostics.paths || []) {
+        if (!path.exists && ["config", "models", "kernels"].includes(path.name)) {
+          issues.push(issueCard(`missing ${path.name}`, path.path, true));
+        }
+      }
+      for (const cache of diagnostics.kernel_caches || []) {
+        if (!cache.balanced) issues.push(issueCard(`kernel cache mismatch ${cache.arch}`, `${cache.hsaco} hsaco / ${cache.hash} hash`, true));
+      }
+      if (!issues.length) issues.push(issueCard("No current operator issues", "Health, diagnostics, and kernel cache checks did not report a warning."));
+      overviewIssuesEl.replaceChildren(...issues);
+      statusEl.textContent = "overview";
+    }
+
+    async function loadModels() {
+      statusEl.textContent = "loading models";
+      const [health, registry] = await Promise.all([
+        fetchJson("/health"),
+        fetchJson("/operator/models/registry"),
+      ]);
+      const models = registry.models || [];
+      const aliases = registry.aliases || {};
+      modelsCountEl.textContent = String(models.length);
+      modelsAliasesEl.textContent = String(Object.keys(aliases).length);
+      modelsLocalEl.textContent = String(models.filter((m) => m.path || m.file).length);
+      modelsLoadedEl.textContent = health.model || "none";
+      modelsRowsEl.replaceChildren(...models.map((model) => {
+        const tr = document.createElement("tr");
+        const sidecarText = [
+          ...(model.triattn || []),
+          ...(model.drafts || []),
+          ...(model.chat_templates || []),
+        ].map((s) => typeof s === "string" ? s : (s.file || s.path || s.id || "")).filter(Boolean).join(", ");
+        tr.append(
+          td(model.id || model.tag || "-", "key"),
+          td(model.file || model.path || "-", "value"),
+          td(model.bytes ? `${(model.bytes / 1_000_000_000).toFixed(2)} GB` : (model.size_gb ? `${model.size_gb} GB` : "-")),
+          td(model.min_vram_gb ? `${model.min_vram_gb} GB` : "-"),
+          td(sidecarText || "-")
+        );
+        return tr;
+      }));
+      if (!models.length) {
+        const tr = document.createElement("tr");
+        const cell = td("No models found", "muted");
+        cell.colSpan = 5;
+        tr.append(cell);
+        modelsRowsEl.replaceChildren(tr);
+      }
+      statusEl.textContent = "models";
+    }
+
+    async function loadRuntime() {
+      statusEl.textContent = "loading runtime";
+      const health = await fetchJson("/health");
+      runtimeStatusEl.textContent = health.status || "-";
+      runtimeIdleEl.textContent = `${health.idle_timeout_sec || 0}s`;
+      runtimePrefillEl.textContent = health.prefill_batch ? `${health.prefill_batch.queue_size || health.prefill_batch.queued || 0}` : "-";
+      runtimeBatchesEl.textContent = health.batches ? `${health.batches.queued || 0} queued / ${health.batches.total || 0} total` : "-";
+      runtimeJsonEl.textContent = JSON.stringify(health, null, 2);
+      statusEl.textContent = "runtime";
+    }
+
+    async function loadDiagnostics() {
+      statusEl.textContent = "loading diagnostics";
+      const diagnostics = await fetchJson("/operator/diagnostics");
+      const paths = [...(diagnostics.paths || []), ...(diagnostics.binaries || [])];
+      diagnosticsPathsEl.replaceChildren(...paths.map((item) => {
+        const tr = document.createElement("tr");
+        tr.append(td(item.name, "key"), td(item.exists ? "present" : "missing", item.exists ? "" : "warn"), td(item.path, "value"));
+        return tr;
+      }));
+      const kernels = diagnostics.kernel_caches || [];
+      const locks = diagnostics.resource_locks || [];
+      const rows = kernels.map((kernel) => {
+        const tr = document.createElement("tr");
+        tr.append(td(kernel.arch, "key"), td(`${kernel.hsaco} hsaco / ${kernel.hash} hash`, kernel.balanced ? "" : "warn"), td(kernel.path, "value"));
+        return tr;
+      });
+      rows.push(...locks.map((lock) => {
+        const tr = document.createElement("tr");
+        tr.append(td(lock.name, "key"), td("lock"), td(lock.content || lock.path, "value"));
+        return tr;
+      }));
+      if (!rows.length) {
+        const tr = document.createElement("tr");
+        const cell = td("No kernel caches or locks found", "muted");
+        cell.colSpan = 3;
+        tr.append(cell);
+        rows.push(tr);
+      }
+      diagnosticsKernelsEl.replaceChildren(...rows);
+      statusEl.textContent = "diagnostics";
+    }
+
+    async function loadLogs() {
+      statusEl.textContent = "loading logs";
+      const lines = Number(logsLinesEl.value || 160);
+      const payload = await fetchJson(`/operator/logs?lines=${Math.max(1, Math.min(1000, lines))}`);
+      const logs = payload.logs || [];
+      logsListEl.replaceChildren(...logs.map((log) => {
+        const section = document.createElement("section");
+        const title = document.createElement("h2");
+        title.className = "section-title";
+        title.textContent = log.path;
+        const pre = document.createElement("pre");
+        pre.textContent = log.text || "";
+        section.append(title, pre);
+        return section;
+      }));
+      if (!logs.length) {
+        logsListEl.replaceChildren(issueCard("No logs found", "No known hipfire log files were present."));
+      }
+      statusEl.textContent = "logs";
     }
 
     async function loadConfig() {
@@ -581,18 +1053,28 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
     }
 
     function showTab(name) {
-      const training = name === "training";
-      configPanelEl.hidden = training;
-      trainingPanelEl.hidden = !training;
-      tabConfigEl.classList.toggle("active", !training);
-      tabTrainingEl.classList.toggle("active", training);
-      if (training) loadTraining().catch(showError);
+      for (const panel of panelEls) panel.hidden = panel.id !== `${name}-panel`;
+      for (const tab of tabEls) tab.classList.toggle("active", tab.dataset.tab === name);
+      const loaders = {
+        overview: loadOverview,
+        models: loadModels,
+        runtime: loadRuntime,
+        diagnostics: loadDiagnostics,
+        logs: loadLogs,
+        config: loadConfig,
+        training: loadTraining,
+      };
+      (loaders[name] || loadOverview)().catch(showError);
     }
 
+    document.getElementById("overview-refresh").addEventListener("click", () => loadOverview().catch(showError));
+    document.getElementById("models-refresh").addEventListener("click", () => loadModels().catch(showError));
+    document.getElementById("runtime-refresh").addEventListener("click", () => loadRuntime().catch(showError));
+    document.getElementById("diagnostics-refresh").addEventListener("click", () => loadDiagnostics().catch(showError));
+    document.getElementById("logs-refresh").addEventListener("click", () => loadLogs().catch(showError));
     refreshEl.addEventListener("click", () => loadConfig().catch(showError));
     trainingRefreshEl.addEventListener("click", () => loadTraining().catch(showError));
-    tabConfigEl.addEventListener("click", () => showTab("config"));
-    tabTrainingEl.addEventListener("click", () => showTab("training"));
+    for (const tab of tabEls) tab.addEventListener("click", () => showTab(tab.dataset.tab));
     modelEl.addEventListener("keydown", (event) => {
       if (event.key === "Enter") loadConfig().catch(showError);
     });
@@ -600,7 +1082,7 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
       statusEl.textContent = error.message;
       statusEl.className = "status warn";
     }
-    loadConfig().catch(showError);
+    loadOverview().catch(showError);
   </script>
 </body>
 </html>"#;
@@ -637,6 +1119,30 @@ mod tests {
         assert!(OPERATOR_INDEX_HTML.contains("Training"));
         assert!(OPERATOR_INDEX_HTML.contains("/operator/training/runs"));
         assert!(OPERATOR_INDEX_HTML.contains("training-events"));
+    }
+
+    #[test]
+    fn operator_index_exposes_runtime_diagnostics_and_logs_surfaces() {
+        assert!(OPERATOR_INDEX_HTML.contains("Overview"));
+        assert!(OPERATOR_INDEX_HTML.contains("Models"));
+        assert!(OPERATOR_INDEX_HTML.contains("Runtime"));
+        assert!(OPERATOR_INDEX_HTML.contains("Diagnostics"));
+        assert!(OPERATOR_INDEX_HTML.contains("Logs"));
+        assert!(OPERATOR_INDEX_HTML.contains("/operator/diagnostics"));
+        assert!(OPERATOR_INDEX_HTML.contains("/operator/logs"));
+        assert!(OPERATOR_INDEX_HTML.contains("/operator/models/registry"));
+    }
+
+    #[test]
+    fn tail_file_limits_lines() {
+        let path =
+            std::env::temp_dir().join(format!("hipfire-operator-tail-{}.log", std::process::id()));
+        std::fs::write(&path, "one\ntwo\nthree\nfour\n").expect("write log");
+
+        let tail = tail_file(&path, 2);
+
+        let _ = std::fs::remove_file(path);
+        assert_eq!(tail, "three\nfour");
     }
 
     #[test]
