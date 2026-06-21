@@ -3722,6 +3722,19 @@ pub const GEMM_OQ4_GROUPED_WMMA_SRC: &str =
 pub const QUANTIZE_ACT_OQ4_SRC: &str =
     include_str!("../../../kernels/src/quantize_act_oq4.hip");
 
+/// Opus Quant W4A4 fused Gate+Up: gate_proj + up_proj grouped-iu4 GEMMs in one
+/// launch over a shared int4 activation (blockIdx tile-range demux). gfx1103
+/// wave32, zero LDS. See `kernels/src/fused_gate_up_oq4_wmma.hip`.
+pub const FUSED_GATE_UP_OQ4_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/fused_gate_up_oq4_wmma.hip");
+
+/// Opus Quant W4A4 fused QKVZA: in_proj_qkv + in_proj_z + in_proj_beta +
+/// in_proj_alpha grouped-iu4 GEMMs in one launch over a shared int4 activation
+/// (4-way blockIdx tile-range demux). gfx1103 wave32, zero LDS.
+/// See `kernels/src/fused_qkvza_oq4_wmma.hip`.
+pub const FUSED_QKVZA_OQ4_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/fused_qkvza_oq4_wmma.hip");
+
 // Generic kernel library GEMV tier (gfx1103 wave32, zero LDS, wave-shuffle
 // reduction; one wave per output row). Same-dtype weight/vector inputs.
 // See `docs/kernels/generic-kernel-library.md`.
