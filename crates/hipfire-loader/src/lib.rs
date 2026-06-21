@@ -1247,7 +1247,26 @@ pub(crate) fn load_gemma4(
     ctx: &mut LoadCtx,
 ) -> Result<LoadedModel, String> {
     let path = ctx.path;
-    let max_seq = ctx.max_seq;
+    // SWA shared-mem cap (gfx12/RDNA 64KB LDS). The `attention_q8_0_kv_swa`
+    // kernel preloads up to `max_seq` attention scores into LDS:
+    //   shared_mem = (max_seq + block_size + head_dim) * 4,  block_size <= 256.
+    // Worst case is the full-attention layer (head_dim 512): a max_seq beyond
+    // ~15.6K overflows the 64KB limit -> hipModuleLaunchKernel "invalid argument"
+    // (this is exactly why gemma4 SERVE failed at the default max_seq=16384 while
+    // the harness, using a small max_seq, worked). Cap with margin for the
+    // kernel's static LDS. TODO: chunk the full-attention scores (flash-style
+    // online softmax) to lift this for gemma4's long context.
+    const SWA_LDS_BUDGET: usize = 60 * 1024; // bytes, under the 64KB hard limit
+    let swa_max_seq = (SWA_LDS_BUDGET / 4).saturating_sub(256 + 512); // = 14592
+    let max_seq = if ctx.max_seq > swa_max_seq {
+        eprintln!(
+            "[hipfire] gemma4: capping max_seq {} -> {} (SWA kernel LDS limit; long context needs a chunked-scores kernel)",
+            ctx.max_seq, swa_max_seq
+        );
+        swa_max_seq
+    } else {
+        ctx.max_seq
+    };
     if ctx.draft_path.is_some() {
         return Err("params.draft (qwen3.5 DFlash) is not supported on \
                     arch_id=13 (Gemma 4). For Gemma 4 spec-decode pass the \
