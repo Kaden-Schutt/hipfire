@@ -30,8 +30,8 @@ echo "== Python CPU tests =="
 "$PYTHON" -m mypy tests scripts benchmarks tools --config-file pyproject.toml
 "$PYTHON" -m pytest tests
 
-echo "== Env/docs drift check =="
-"$PYTHON" scripts/check-env-docs.py
+echo "== Env-var docs freshness (docs/env-vars.md + env_docs.rs vs source) =="
+cargo run -q -p hipfire-cli -- gen-env-docs --check
 
 echo "== CLI docs freshness (docs/CLI.md + man/ vs clap definition) =="
 cargo run -q -p hipfire-cli -- gen-docs --check

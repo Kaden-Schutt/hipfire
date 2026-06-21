@@ -2,8 +2,8 @@
 
 // SPDX-License-Identifier: Apache-2.0
 //
-// Generated automatically from source env usage by scripts/gen-env-docs.py.
-// Do not hand-edit. Re-run `./scripts/regen-env-vars-doc.sh`.
+// Generated automatically from source env usage by `hipfire gen-env-docs`.
+// Do not hand-edit. Re-run `cargo run -p hipfire-cli -- gen-env-docs`.
 
 /// Canonical environment-variable documentation registry.
 ///
@@ -24,3248 +24,3286 @@ impl EnvVarDoc {
 pub const ENV_BENCH_BATCH: EnvVarDoc = EnvVarDoc {
     name: "BENCH_BATCH",
     description: "Runtime variable controlling bench batch in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/examples/bench_stream_overlap.rs:56",
+    source: "crates/rdna-compute/examples/bench_stream_overlap.rs:56",
 };
 
 /// `BENCH_DRAFT_K` — Runtime variable controlling bench draft k in hipfire
 pub const ENV_BENCH_DRAFT_K: EnvVarDoc = EnvVarDoc {
     name: "BENCH_DRAFT_K",
     description: "Runtime variable controlling bench draft k in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/examples/bench_stream_overlap.rs:188",
+    source: "crates/rdna-compute/examples/bench_stream_overlap.rs:188",
 };
 
 /// `BENCH_DRAFT_LAYERS` — Runtime variable controlling bench draft layers in hipfire
 pub const ENV_BENCH_DRAFT_LAYERS: EnvVarDoc = EnvVarDoc {
     name: "BENCH_DRAFT_LAYERS",
     description: "Runtime variable controlling bench draft layers in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/examples/bench_stream_overlap.rs:215",
+    source: "crates/rdna-compute/examples/bench_stream_overlap.rs:215",
 };
 
 /// `BENCH_DRAFT_M` — Runtime variable controlling bench draft m in hipfire
 pub const ENV_BENCH_DRAFT_M: EnvVarDoc = EnvVarDoc {
     name: "BENCH_DRAFT_M",
     description: "Runtime variable controlling bench draft m in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/examples/bench_stream_overlap.rs:184",
+    source: "crates/rdna-compute/examples/bench_stream_overlap.rs:184",
 };
 
 /// `BENCH_DRAFT_N` — Runtime variable controlling bench draft n in hipfire
 pub const ENV_BENCH_DRAFT_N: EnvVarDoc = EnvVarDoc {
     name: "BENCH_DRAFT_N",
     description: "Runtime variable controlling bench draft n in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/examples/bench_stream_overlap.rs:192",
+    source: "crates/rdna-compute/examples/bench_stream_overlap.rs:192",
 };
 
 /// `BENCH_K` — Runtime variable controlling bench k in hipfire
 pub const ENV_BENCH_K: EnvVarDoc = EnvVarDoc {
     name: "BENCH_K",
     description: "Runtime variable controlling bench k in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/examples/bench_stream_overlap.rs:52",
+    source: "crates/rdna-compute/examples/bench_stream_overlap.rs:52",
 };
 
 /// `BENCH_M` — Runtime variable controlling bench m in hipfire
 pub const ENV_BENCH_M: EnvVarDoc = EnvVarDoc {
     name: "BENCH_M",
     description: "Runtime variable controlling bench m in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/examples/bench_stream_overlap.rs:48",
+    source: "crates/rdna-compute/examples/bench_stream_overlap.rs:48",
 };
 
 /// `BENCH_VERIFY_LAYERS` — Runtime variable controlling bench verify layers in hipfire
 pub const ENV_BENCH_VERIFY_LAYERS: EnvVarDoc = EnvVarDoc {
     name: "BENCH_VERIFY_LAYERS",
     description: "Runtime variable controlling bench verify layers in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/examples/bench_stream_overlap.rs:219",
+    source: "crates/rdna-compute/examples/bench_stream_overlap.rs:219",
 };
 
 /// `CARGO_FEATURE_NPU_KERNELS` — Runtime variable controlling cargo feature npu kernels in hipfire
 pub const ENV_CARGO_FEATURE_NPU_KERNELS: EnvVarDoc = EnvVarDoc {
     name: "CARGO_FEATURE_NPU_KERNELS",
     description: "Runtime variable controlling cargo feature npu kernels in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/build.rs:29",
+    source: "crates/hipfire-arch-qwen35/build.rs:29",
 };
 
 /// `CARGO_MANIFEST_DIR` — CARGO_MANIFEST_DIR = <workspace>/crates/hipfire-arch-qwen35
 pub const ENV_CARGO_MANIFEST_DIR: EnvVarDoc = EnvVarDoc {
     name: "CARGO_MANIFEST_DIR",
     description: "CARGO_MANIFEST_DIR = <workspace>/crates/hipfire-arch-qwen35",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/build.rs:591",
+    source: "crates/hipfire-arch-qwen35/build.rs:591",
+};
+
+/// `CARGO_PKG_VERSION` — Defaults to unknown when unset
+pub const ENV_CARGO_PKG_VERSION: EnvVarDoc = EnvVarDoc {
+    name: "CARGO_PKG_VERSION",
+    description: "Defaults to unknown when unset",
+    source: "crates/hipfire-build-info/build.rs:24",
 };
 
 /// `DDTREE_TIMING` — pre_verify / verify. The draft and top-K are fused into one GPU-
 pub const ENV_DDTREE_TIMING: EnvVarDoc = EnvVarDoc {
     name: "DDTREE_TIMING",
     description: "pre_verify / verify. The draft and top-K are fused into one GPU-",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:11125",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:11126",
 };
 
 /// `DEBUG_LAYERS` — Runtime variable controlling debug layers in hipfire
 pub const ENV_DEBUG_LAYERS: EnvVarDoc = EnvVarDoc {
     name: "DEBUG_LAYERS",
     description: "Runtime variable controlling debug layers in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:8352",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:8409",
 };
 
 /// `DFLASH_LIVE_TAU` — Runtime variable controlling dflash live tau in hipfire
 pub const ENV_DFLASH_LIVE_TAU: EnvVarDoc = EnvVarDoc {
     name: "DFLASH_LIVE_TAU",
     description: "Runtime variable controlling dflash live tau in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:1512",
+    source: "crates/hipfire-runtime/examples/dflash_spec_demo.rs:1514",
 };
 
 /// `FP32_STATE` — Runtime variable controlling fp32 state in hipfire
 pub const ENV_FP32_STATE: EnvVarDoc = EnvVarDoc {
     name: "FP32_STATE",
     description: "Runtime variable controlling fp32 state in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/infer_qwen35.rs:191",
+    source: "crates/hipfire-runtime/examples/infer_qwen35.rs:192",
 };
 
 /// `GPU_LOCK_TIMEOUT` — Runtime variable controlling gpu lock timeout in hipfire
 pub const ENV_GPU_LOCK_TIMEOUT: EnvVarDoc = EnvVarDoc {
     name: "GPU_LOCK_TIMEOUT",
     description: "Runtime variable controlling gpu lock timeout in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-cli/src/commands/gpu_lock.rs:83",
+    source: "crates/hipfire-cli/src/commands/gpu_lock.rs:83",
 };
 
 /// `GPU_POLL_INTERVAL` — Runtime variable controlling gpu poll interval in hipfire
 pub const ENV_GPU_POLL_INTERVAL: EnvVarDoc = EnvVarDoc {
     name: "GPU_POLL_INTERVAL",
     description: "Runtime variable controlling gpu poll interval in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-cli/src/commands/gpu_lock.rs:76",
+    source: "crates/hipfire-cli/src/commands/gpu_lock.rs:76",
 };
 
-/// `HFHS_REAL` — Runtime variable controlling hfhs real in hipfire.
+/// `HFHS_REAL` — Runtime variable controlling hfhs real in hipfire
 pub const ENV_HFHS_REAL: EnvVarDoc = EnvVarDoc {
     name: "HFHS_REAL",
-    description: "Runtime variable controlling hfhs real in hipfire.",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/hfhs_diag.rs:136",
+    description: "Runtime variable controlling hfhs real in hipfire",
+    source: "crates/hipfire-quantize/src/hfhs_diag.rs:136",
 };
 
 /// `HFQ_TEST_N_ITER` — Parses "HFQ_TEST_N_ITER" with fallback defaults
 pub const ENV_HFQ_TEST_N_ITER: EnvVarDoc = EnvVarDoc {
     name: "HFQ_TEST_N_ITER",
     description: "Parses \"HFQ_TEST_N_ITER\" with fallback defaults",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/examples/test_hfq4_residual_dp4a.rs:74",
+    source: "crates/rdna-compute/examples/test_hfq4_residual_dp4a.rs:74",
 };
 
 /// `HFQ_TEST_SCALE_LOG10` — Parses "HFQ_TEST_SCALE_LOG10" with fallback defaults
 pub const ENV_HFQ_TEST_SCALE_LOG10: EnvVarDoc = EnvVarDoc {
     name: "HFQ_TEST_SCALE_LOG10",
     description: "Parses \"HFQ_TEST_SCALE_LOG10\" with fallback defaults",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/examples/test_hfq4_residual_dp4a.rs:196",
+    source: "crates/rdna-compute/examples/test_hfq4_residual_dp4a.rs:196",
 };
 
 /// `HFQ_TEST_ZP_MAX` — Parses "HFQ_TEST_ZP_MAX" with fallback defaults
 pub const ENV_HFQ_TEST_ZP_MAX: EnvVarDoc = EnvVarDoc {
     name: "HFQ_TEST_ZP_MAX",
     description: "Parses \"HFQ_TEST_ZP_MAX\" with fallback defaults",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/examples/test_hfq4_residual_dp4a.rs:200",
+    source: "crates/rdna-compute/examples/test_hfq4_residual_dp4a.rs:200",
 };
 
 /// `HIPFIRE_ADAPTIVE_B_DOWN` — Runtime variable controlling adaptive b down in hipfire
 pub const ENV_HIPFIRE_ADAPTIVE_B_DOWN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ADAPTIVE_B_DOWN",
     description: "Runtime variable controlling adaptive b down in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:1779",
+    source: "crates/hipfire-runtime/examples/dflash_spec_demo.rs:1781",
 };
 
 /// `HIPFIRE_ADAPTIVE_B_UNSAFE` — the user explicitly widens. Opt out via HIPFIRE_ADAPTIVE_B_UNSAFE=1
 pub const ENV_HIPFIRE_ADAPTIVE_B_UNSAFE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ADAPTIVE_B_UNSAFE",
     description: "the user explicitly widens. Opt out via HIPFIRE_ADAPTIVE_B_UNSAFE=1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:921",
+    source: "crates/hipfire-runtime/examples/dflash_spec_demo.rs:923",
 };
 
 /// `HIPFIRE_ADAPTIVE_B_UP` — HIPFIRE_ADAPTIVE_B_UP=0.XX / HIPFIRE_ADAPTIVE_B_DOWN=0.XX
 pub const ENV_HIPFIRE_ADAPTIVE_B_UP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ADAPTIVE_B_UP",
     description: "HIPFIRE_ADAPTIVE_B_UP=0.XX / HIPFIRE_ADAPTIVE_B_DOWN=0.XX",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:1775",
+    source: "crates/hipfire-runtime/examples/dflash_spec_demo.rs:1777",
 };
 
 /// `HIPFIRE_ALLOW_MIXED_ARCH` — Runtime variable controlling allow mixed arch in hipfire
 pub const ENV_HIPFIRE_ALLOW_MIXED_ARCH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ALLOW_MIXED_ARCH",
     description: "Runtime variable controlling allow mixed arch in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:103",
+    source: "crates/hipfire-runtime/src/config.rs:103",
 };
 
 /// `HIPFIRE_ALLOW_MQ2` — Enabled when set to 1
 pub const ENV_HIPFIRE_ALLOW_MQ2: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ALLOW_MQ2",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:5163",
+    source: "crates/hipfire-quantize/src/main.rs:5232",
 };
 
 /// `HIPFIRE_ALLOW_MQ2_LLOYD` — Enabled when set to 1
 pub const ENV_HIPFIRE_ALLOW_MQ2_LLOYD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ALLOW_MQ2_LLOYD",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:5198",
+    source: "crates/hipfire-quantize/src/main.rs:5267",
 };
 
 /// `HIPFIRE_ALLOW_MQ3_LLOYD` — Enabled when set to 1
 pub const ENV_HIPFIRE_ALLOW_MQ3_LLOYD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ALLOW_MQ3_LLOYD",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:5183",
+    source: "crates/hipfire-quantize/src/main.rs:5252",
 };
 
 /// `HIPFIRE_ALLOW_MQ4_LLOYD` — Enabled when set to 1
 pub const ENV_HIPFIRE_ALLOW_MQ4_LLOYD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ALLOW_MQ4_LLOYD",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:5233",
+    source: "crates/hipfire-quantize/src/main.rs:5302",
 };
 
 /// `HIPFIRE_ALLOW_UNIT_IMATRIX` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_ALLOW_UNIT_IMATRIX: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ALLOW_UNIT_IMATRIX",
     description: "Environment toggle value controls runtime behavior",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:4905",
+    source: "crates/hipfire-quantize/src/main.rs:4974",
 };
 
-/// `HIPFIRE_ATTN_FLASH` — Honors HIPFIRE_ATTN_FLASH=never\\\\\|0\\\\\|off as an explicit override
+/// `HIPFIRE_ATTN_FLASH` — Honors HIPFIRE_ATTN_FLASH=never|0|off as an explicit override
 pub const ENV_HIPFIRE_ATTN_FLASH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ATTN_FLASH",
-    description: "Honors HIPFIRE_ATTN_FLASH=never\\\\\\\\\\|0\\\\\\\\\\|off as an explicit override",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:8589",
+    description: "Honors HIPFIRE_ATTN_FLASH=never|0|off as an explicit override",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:8646",
 };
 
 /// `HIPFIRE_AWQ_F1_ONLY` — F1-vs-F2 A/B gate. When "HIPFIRE_AWQ_F1_ONLY=1" is set, the F2
 pub const ENV_HIPFIRE_AWQ_F1_ONLY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_AWQ_F1_ONLY",
     description: "F1-vs-F2 A/B gate. When \"HIPFIRE_AWQ_F1_ONLY=1\" is set, the F2",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:3726",
+    source: "crates/hipfire-quantize/src/main.rs:3794",
 };
 
 /// `HIPFIRE_BASELINE_ARCH` — Runtime variable controlling baseline arch in hipfire
 pub const ENV_HIPFIRE_BASELINE_ARCH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_BASELINE_ARCH",
     description: "Runtime variable controlling baseline arch in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/coherence_probe.rs:403",
+    source: "crates/hipfire-runtime/examples/coherence_probe.rs:403",
 };
 
 /// `HIPFIRE_BATCHES_STATE_MAX` — Parses "HIPFIRE_BATCHES_STATE_MAX" with fallback defaults
 pub const ENV_HIPFIRE_BATCHES_STATE_MAX: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_BATCHES_STATE_MAX",
     description: "Parses \"HIPFIRE_BATCHES_STATE_MAX\" with fallback defaults",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-server/src/routes/batches.rs:687",
+    source: "crates/hipfire-server/src/routes/batches.rs:687",
 };
 
 /// `HIPFIRE_BENCH_QWEN35_SPEED_BIN` — Runtime variable controlling bench qwen35 speed bin in hipfire
 pub const ENV_HIPFIRE_BENCH_QWEN35_SPEED_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_BENCH_QWEN35_SPEED_BIN",
     description: "Runtime variable controlling bench qwen35 speed bin in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-eval/src/lib.rs:909",
+    source: "crates/hipfire-eval/src/lib.rs:909",
 };
 
 /// `HIPFIRE_BF16_DENSE_M128` — Enabled by default; set to 0 to disable
 pub const ENV_HIPFIRE_BF16_DENSE_M128: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_BF16_DENSE_M128",
     description: "Enabled by default; set to 0 to disable",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:45272",
+    source: "crates/rdna-compute/src/dispatch.rs:45622",
 };
 
 /// `HIPFIRE_BF16_MOE_M256` — Enabled when set to 1
 pub const ENV_HIPFIRE_BF16_MOE_M256: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_BF16_MOE_M256",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:22418",
+    source: "crates/rdna-compute/src/dispatch.rs:22458",
 };
 
 /// `HIPFIRE_BF16_WEIGHTS` — Runtime variable controlling bf16 weights in hipfire
 pub const ENV_HIPFIRE_BF16_WEIGHTS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_BF16_WEIGHTS",
     description: "Runtime variable controlling bf16 weights in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:220",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:222",
 };
 
 /// `HIPFIRE_BLOB_FORCE` — Graph / capture / deterministic
 pub const ENV_HIPFIRE_BLOB_FORCE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_BLOB_FORCE",
     description: "Graph / capture / deterministic",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:276",
+    source: "crates/rdna-compute/src/feature_flags.rs:276",
 };
 
 /// `HIPFIRE_CALIB_F64_AUDIT` — Enabled when set to 1
 pub const ENV_HIPFIRE_CALIB_F64_AUDIT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_CALIB_F64_AUDIT",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/calibration.rs:100",
+    source: "crates/hipfire-runtime/src/calibration.rs:100",
 };
 
 /// `HIPFIRE_CALIB_PROFILE` — Enable with HIPFIRE_CALIB_PROFILE=1; emits to stderr
 pub const ENV_HIPFIRE_CALIB_PROFILE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_CALIB_PROFILE",
     description: "Enable with HIPFIRE_CALIB_PROFILE=1; emits to stderr",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/triattn_validate.rs:40",
+    source: "crates/hipfire-runtime/examples/triattn_validate.rs:40",
 };
 
 /// `HIPFIRE_CASK_OFF` — HIPFIRE_CASK_OFF=1 is an ops escape hatch: forces no auto-attach
 pub const ENV_HIPFIRE_CASK_OFF: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_CASK_OFF",
     description: "HIPFIRE_CASK_OFF=1 is an ops escape hatch: forces no auto-attach",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-server/src/routes/chat.rs:212",
+    source: "crates/hipfire-server/src/routes/chat.rs:212",
 };
 
 /// `HIPFIRE_CHATML` — Enabled when set to 1
 pub const ENV_HIPFIRE_CHATML: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_CHATML",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/probe_argmax_agreement.rs:58",
+    source: "crates/hipfire-runtime/examples/probe_argmax_agreement.rs:58",
 };
 
 /// `HIPFIRE_CHAT_TEMPLATE_FILE` — 1. Env-var override
 pub const ENV_HIPFIRE_CHAT_TEMPLATE_FILE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_CHAT_TEMPLATE_FILE",
     description: "1. Env-var override",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-prompt/src/lib.rs:1933",
+    source: "crates/hipfire-prompt/src/lib.rs:1933",
 };
 
 /// `HIPFIRE_COLLECT_ARTIFACTS_BIN` — Runtime variable controlling collect artifacts bin in hipfire
 pub const ENV_HIPFIRE_COLLECT_ARTIFACTS_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_COLLECT_ARTIFACTS_BIN",
     description: "Runtime variable controlling collect artifacts bin in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-eval/src/lib.rs:956",
+    source: "crates/hipfire-eval/src/lib.rs:956",
 };
 
 /// `HIPFIRE_COMP_DUMP` — Stage-bisect dump: HIPFIRE_COMP_DUMP="<pos>,<layer>" prints each
 pub const ENV_HIPFIRE_COMP_DUMP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_COMP_DUMP",
     description: "Stage-bisect dump: HIPFIRE_COMP_DUMP=\"<pos>,<layer>\" prints each",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:643",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:643",
 };
 
 /// `HIPFIRE_CONV1D_TREE_GFX1151` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_CONV1D_TREE_GFX1151: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_CONV1D_TREE_GFX1151",
     description: "Environment toggle value controls runtime behavior",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/examples/bench_conv1d_tree_gfx1151.rs:22",
+    source: "crates/rdna-compute/examples/bench_conv1d_tree_gfx1151.rs:22",
 };
 
 /// `HIPFIRE_DAEMON_BIN` — Runtime variable controlling daemon bin in hipfire
 pub const ENV_HIPFIRE_DAEMON_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DAEMON_BIN",
     description: "Runtime variable controlling daemon bin in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-daemon-adapter/src/lib.rs:864",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:864",
 };
 
 /// `HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB` — Runtime variable controlling daemon resident state budget mb in hipfire
 pub const ENV_HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB",
     description: "Runtime variable controlling daemon resident state budget mb in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/session.rs:706",
+    source: "crates/hipfire-serving-core/src/session.rs:706",
 };
 
 /// `HIPFIRE_DDTREE_BUDGET` — Runtime variable controlling DDTree budget in hipfire
 pub const ENV_HIPFIRE_DDTREE_BUDGET: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DDTREE_BUDGET",
     description: "Runtime variable controlling DDTree budget in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/load.rs:2280",
+    source: "crates/hipfire-serving-core/src/load.rs:2434",
 };
 
 /// `HIPFIRE_DDTREE_FORCE_SLOW` — HIPFIRE_DDTREE_FORCE_SLOW=1: force the slow (re-verify) path even when
 pub const ENV_HIPFIRE_DDTREE_FORCE_SLOW: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DDTREE_FORCE_SLOW",
     description: "HIPFIRE_DDTREE_FORCE_SLOW=1: force the slow (re-verify) path even when",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:11352",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:11353",
 };
 
 /// `HIPFIRE_DDTREE_LOGW_CUTOFF` — Adaptive-B usage report — only meaningful when --adaptive-b is on
 pub const ENV_HIPFIRE_DDTREE_LOGW_CUTOFF: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DDTREE_LOGW_CUTOFF",
     description: "Adaptive-B usage report — only meaningful when --adaptive-b is on",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:2517",
+    source: "crates/hipfire-runtime/examples/dflash_spec_demo.rs:2519",
 };
 
 /// `HIPFIRE_DDTREE_PATH_B_CAPTURE` — Path B slow-path-kill (opt-in, WIP). Replaces the ~40-50 ms full
 pub const ENV_HIPFIRE_DDTREE_PATH_B_CAPTURE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DDTREE_PATH_B_CAPTURE",
     description: "Path B slow-path-kill (opt-in, WIP). Replaces the ~40-50 ms full",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:11391",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:11392",
 };
 
 /// `HIPFIRE_DDTREE_PATH_C` — Resolve "HIPFIRE_DDTREE_PATH_C" ONCE before the decode loop. The
 pub const ENV_HIPFIRE_DDTREE_PATH_C: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DDTREE_PATH_C",
     description: "Resolve \"HIPFIRE_DDTREE_PATH_C\" ONCE before the decode loop. The",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/generate.rs:846",
+    source: "crates/hipfire-serving-core/src/generate.rs:846",
 };
 
 /// `HIPFIRE_DDTREE_PATH_C_VERBOSE` — Runtime variable controlling DDTree path c verbose in hipfire
 pub const ENV_HIPFIRE_DDTREE_PATH_C_VERBOSE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DDTREE_PATH_C_VERBOSE",
     description: "Runtime variable controlling DDTree path c verbose in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:11916",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:11917",
 };
 
 /// `HIPFIRE_DDTREE_PATH_C_VERIFY_GRAPH` — Runtime variable controlling DDTree path c verify graph in hipfire
 pub const ENV_HIPFIRE_DDTREE_PATH_C_VERIFY_GRAPH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DDTREE_PATH_C_VERIFY_GRAPH",
     description: "Runtime variable controlling DDTree path c verify graph in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:202",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:203",
 };
 
 /// `HIPFIRE_DDTREE_TAPE_DUMP` — Enabled when set to 1
 pub const ENV_HIPFIRE_DDTREE_TAPE_DUMP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DDTREE_TAPE_DUMP",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:11371",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:11372",
 };
 
 /// `HIPFIRE_DDTREE_TOPK` — Runtime variable controlling DDTree topk in hipfire
 pub const ENV_HIPFIRE_DDTREE_TOPK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DDTREE_TOPK",
     description: "Runtime variable controlling DDTree topk in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/load.rs:2352",
+    source: "crates/hipfire-serving-core/src/load.rs:2506",
 };
 
 /// `HIPFIRE_DDTREE_TREE_LA` — Opt out with HIPFIRE_DDTREE_TREE_LA=0 if a regression is suspected
 pub const ENV_HIPFIRE_DDTREE_TREE_LA: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DDTREE_TREE_LA",
     description: "Opt out with HIPFIRE_DDTREE_TREE_LA=0 if a regression is suspected",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:11233",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:11234",
+};
+
+/// `HIPFIRE_DEBUG_PREFILL_ELIGIBLE` — Environment toggle value controls runtime behavior
+pub const ENV_HIPFIRE_DEBUG_PREFILL_ELIGIBLE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_DEBUG_PREFILL_ELIGIBLE",
+    description: "Environment toggle value controls runtime behavior",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:13440",
 };
 
 /// `HIPFIRE_DEBUG_PREFIX_BOUNDARIES` — Runtime variable controlling debug prefix boundaries in hipfire
 pub const ENV_HIPFIRE_DEBUG_PREFIX_BOUNDARIES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEBUG_PREFIX_BOUNDARIES",
     description: "Runtime variable controlling debug prefix boundaries in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/qwen35_prefill.rs:581",
+    source: "crates/hipfire-serving-core/src/qwen35_prefill.rs:581",
 };
 
 /// `HIPFIRE_DEEPSEEK4_ATTN` — main model's final_norm_and_head head-HC reduction. Without
 pub const ENV_HIPFIRE_DEEPSEEK4_ATTN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_ATTN",
     description: "main model's final_norm_and_head head-HC reduction. Without",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:73",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:73",
 };
 
 /// `HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT` — DEBUG: in-kernel bisect (HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT=1)
 pub const ENV_HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT",
     description: "DEBUG: in-kernel bisect (HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT=1)",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:6220",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:6220",
 };
 
 /// `HIPFIRE_DEEPSEEK4_ATTN_PER_POS` — DEBUG: HIPFIRE_DEEPSEEK4_ATTN_PER_POS=1 substitutes a per-position loop
 pub const ENV_HIPFIRE_DEEPSEEK4_ATTN_PER_POS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_ATTN_PER_POS",
     description: "DEBUG: HIPFIRE_DEEPSEEK4_ATTN_PER_POS=1 substitutes a per-position loop",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:6153",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:6153",
 };
 
 /// `HIPFIRE_DEEPSEEK4_ATTN_TOPK_DIRECT` — Runtime variable controlling deepseek4 attn topk direct in hipfire
 pub const ENV_HIPFIRE_DEEPSEEK4_ATTN_TOPK_DIRECT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_ATTN_TOPK_DIRECT",
     description: "Runtime variable controlling deepseek4 attn topk direct in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:6502",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:6502",
 };
 
 /// `HIPFIRE_DEEPSEEK4_ATTN_TWIN` — DEBUG: same-process twin-call test (HIPFIRE_DEEPSEEK4_ATTN_TWIN=1)
 pub const ENV_HIPFIRE_DEEPSEEK4_ATTN_TWIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_ATTN_TWIN",
     description: "DEBUG: same-process twin-call test (HIPFIRE_DEEPSEEK4_ATTN_TWIN=1)",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:6198",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:6198",
 };
 
 /// `HIPFIRE_DEEPSEEK4_BATCH_HEAD` — Opt-out: HIPFIRE_DEEPSEEK4_BATCH_HEAD=0 forces the legacy per-position
 pub const ENV_HIPFIRE_DEEPSEEK4_BATCH_HEAD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_BATCH_HEAD",
     description: "Opt-out: HIPFIRE_DEEPSEEK4_BATCH_HEAD=0 forces the legacy per-position",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:8162",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:8162",
 };
 
 /// `HIPFIRE_DEEPSEEK4_CACHE_TRACE` — Runtime variable controlling deepseek4 cache trace in hipfire
 pub const ENV_HIPFIRE_DEEPSEEK4_CACHE_TRACE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_CACHE_TRACE",
     description: "Runtime variable controlling deepseek4 cache trace in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/generate_arch.rs:967",
+    source: "crates/hipfire-serving-core/src/generate_arch.rs:968",
 };
 
 /// `HIPFIRE_DEEPSEEK4_CHAT_RAW` — Enabled when set to 1
 pub const ENV_HIPFIRE_DEEPSEEK4_CHAT_RAW: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_CHAT_RAW",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs:161",
+    source: "crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs:161",
 };
 
 /// `HIPFIRE_DEEPSEEK4_COMP_F16_WMMA` — Opt out via HIPFIRE_DEEPSEEK4_COMP_F16_WMMA=0
 pub const ENV_HIPFIRE_DEEPSEEK4_COMP_F16_WMMA: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_COMP_F16_WMMA",
     description: "Opt out via HIPFIRE_DEEPSEEK4_COMP_F16_WMMA=0",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:6573",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:6573",
 };
 
 /// `HIPFIRE_DEEPSEEK4_COMP_ROPE_POS` — Runtime variable controlling deepseek4 comp rope pos in hipfire
 pub const ENV_HIPFIRE_DEEPSEEK4_COMP_ROPE_POS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_COMP_ROPE_POS",
     description: "Runtime variable controlling deepseek4 comp rope pos in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:5234",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:5234",
 };
 
 /// `HIPFIRE_DEEPSEEK4_DSA_WMMA` — Head-batched f16-WMMA gathered DSA attention; f32 fallback on
 pub const ENV_HIPFIRE_DEEPSEEK4_DSA_WMMA: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_DSA_WMMA",
     description: "Head-batched f16-WMMA gathered DSA attention; f32 fallback on",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:7111",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:7111",
 };
 
 /// `HIPFIRE_DEEPSEEK4_DUMP_PROMPT` — Runtime variable controlling deepseek4 dump prompt in hipfire
 pub const ENV_HIPFIRE_DEEPSEEK4_DUMP_PROMPT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_DUMP_PROMPT",
     description: "Runtime variable controlling deepseek4 dump prompt in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/generate_arch.rs:317",
+    source: "crates/hipfire-serving-core/src/generate_arch.rs:318",
 };
 
 /// `HIPFIRE_DEEPSEEK4_DUMP_STATE` — Selects behavior from recognized values
 pub const ENV_HIPFIRE_DEEPSEEK4_DUMP_STATE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_DUMP_STATE",
     description: "Selects behavior from recognized values",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:203",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:203",
 };
 
 /// `HIPFIRE_DEEPSEEK4_DUMP_TOPK` — Gate 1 validation (2026-05-22): dump per-layer topk_indices to a
 pub const ENV_HIPFIRE_DEEPSEEK4_DUMP_TOPK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_DUMP_TOPK",
     description: "Gate 1 validation (2026-05-22): dump per-layer topk_indices to a",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-dispatch/src/pipeline/mod.rs:1072",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1072",
 };
 
 /// `HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END` — Runtime variable controlling deepseek4 expert layer end in hipfire
 pub const ENV_HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END",
     description: "Runtime variable controlling deepseek4 expert layer end in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/arch.rs:599",
+    source: "crates/hipfire-arch-deepseek4/src/arch.rs:599",
 };
 
 /// `HIPFIRE_DEEPSEEK4_F32_TRACE` — Runtime variable controlling deepseek4 f32 trace in hipfire
 pub const ENV_HIPFIRE_DEEPSEEK4_F32_TRACE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_F32_TRACE",
     description: "Runtime variable controlling deepseek4 f32 trace in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:231",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:231",
 };
 
 /// `HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU` — Measured perf at PP_BATCH=512 / 2.1k-tok prompt: -0.4% prefill —
 pub const ENV_HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU",
     description: "Measured perf at PP_BATCH=512 / 2.1k-tok prompt: -0.4% prefill —",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-dispatch/src/pipeline/mod.rs:1163",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1163",
 };
 
 /// `HIPFIRE_DEEPSEEK4_GEN_TOKENS` — Runtime variable controlling deepseek4 gen tokens in hipfire
 pub const ENV_HIPFIRE_DEEPSEEK4_GEN_TOKENS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_GEN_TOKENS",
     description: "Runtime variable controlling deepseek4 gen tokens in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs:157",
+    source: "crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs:157",
 };
 
 /// `HIPFIRE_DEEPSEEK4_GRAPH` — Selects behavior from recognized values
 pub const ENV_HIPFIRE_DEEPSEEK4_GRAPH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_GRAPH",
     description: "Selects behavior from recognized values",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:1564",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:1564",
 };
 
 /// `HIPFIRE_DEEPSEEK4_HFQ4_WMMA` — HFQ4G256/Raw. WMMA route requires F16 input staging
 pub const ENV_HIPFIRE_DEEPSEEK4_HFQ4_WMMA: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_HFQ4_WMMA",
     description: "HFQ4G256/Raw. WMMA route requires F16 input staging",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:328",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:328",
 };
 
 /// `HIPFIRE_DEEPSEEK4_INDEXER_WMMA` — Runtime variable controlling deepseek4 indexer wmma in hipfire
 pub const ENV_HIPFIRE_DEEPSEEK4_INDEXER_WMMA: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_INDEXER_WMMA",
     description: "Runtime variable controlling deepseek4 indexer wmma in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:6928",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:6928",
 };
 
 /// `HIPFIRE_DEEPSEEK4_LOAD_MTP` — Runtime variable controlling deepseek4 load MTP in hipfire
 pub const ENV_HIPFIRE_DEEPSEEK4_LOAD_MTP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_LOAD_MTP",
     description: "Runtime variable controlling deepseek4 load MTP in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/arch.rs:998",
+    source: "crates/hipfire-arch-deepseek4/src/arch.rs:998",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS` — ratio == 128: identity gather, no indexer. Per-batch n_compressed
 pub const ENV_HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS",
     description: "ratio == 128: identity gather, no indexer. Per-batch n_compressed",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:7010",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:7010",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MODEL` — Runtime variable controlling deepseek4 model in hipfire
 pub const ENV_HIPFIRE_DEEPSEEK4_MODEL: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MODEL",
     description: "Runtime variable controlling deepseek4 model in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs:154",
+    source: "crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs:154",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE` — Layers 0..num_hash_layers use STATIC tid2eid routing per upstream DeepSeek V4
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE",
     description: "Layers 0..num_hash_layers use STATIC tid2eid routing per upstream DeepSeek V4",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:7454",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:7454",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE_8W` — Lever 3 (HIPFIRE_DEEPSEEK4_MOE_8W=1): 8-warp variant (shares staged X
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_8W: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_8W",
     description: "Lever 3 (HIPFIRE_DEEPSEEK4_MOE_8W=1): 8-warp variant (shares staged X",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-dispatch/src/pipeline/mod.rs:1112",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1112",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE_CND` — Lever 2 (HIPFIRE_DEEPSEEK4_MOE_CND=1): cndmask dequant on the n16 4w
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_CND: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_CND",
     description: "Lever 2 (HIPFIRE_DEEPSEEK4_MOE_CND=1): cndmask dequant on the n16 4w",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-dispatch/src/pipeline/mod.rs:1111",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1111",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC",
     description: "Environment toggle value controls runtime behavior",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-dispatch/src/pipeline/mod.rs:1264",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1264",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE_GROUPED` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_GROUPED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_GROUPED",
     description: "Environment toggle value controls runtime behavior",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-dispatch/src/pipeline/mod.rs:1101",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1101",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE` — HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE overrides the threshold for
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE",
     description: "HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE overrides the threshold for",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-dispatch/src/pipeline/mod.rs:1096",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1096",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W` — RECONCILED (#355 + #356): same 4w default + levers as gate_up above
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W",
     description: "RECONCILED (#355 + #356): same 4w default + levers as gate_up above",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-dispatch/src/pipeline/mod.rs:1104",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1104",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE_MMQLOAD` — n32_env / cnd_env / eightw_env reused from the gate_up block above
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_MMQLOAD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_MMQLOAD",
     description: "n32_env / cnd_env / eightw_env reused from the gate_up block above",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-dispatch/src/pipeline/mod.rs:1113",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1113",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE_N32` — Lever 1 (HIPFIRE_DEEPSEEK4_MOE_N32=1): N_TILE=32 tile-pairing on the
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_N32: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_N32",
     description: "Lever 1 (HIPFIRE_DEEPSEEK4_MOE_N32=1): N_TILE=32 tile-pairing on the",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-dispatch/src/pipeline/mod.rs:1110",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1110",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE_NOSYNC` — n32_env / cnd_env / eightw_env reused from the gate_up block above
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_NOSYNC: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_NOSYNC",
     description: "n32_env / cnd_env / eightw_env reused from the gate_up block above",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-dispatch/src/pipeline/mod.rs:1114",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1114",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MTP_ADDON` — Convention 1: append ".mtp-addon.hfq" (legacy)
 pub const ENV_HIPFIRE_DEEPSEEK4_MTP_ADDON: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MTP_ADDON",
     description: "Convention 1: append \".mtp-addon.hfq\" (legacy)",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/arch.rs:619",
+    source: "crates/hipfire-arch-deepseek4/src/arch.rs:619",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MTP_HEAD_HC` — Runtime variable controlling deepseek4 MTP head hc in hipfire
 pub const ENV_HIPFIRE_DEEPSEEK4_MTP_HEAD_HC: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MTP_HEAD_HC",
     description: "Runtime variable controlling deepseek4 MTP head hc in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:86",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:86",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MTP_SKIP_HEAD` — 3. Batched MTP fill — single pass through the MTP layer for all
 pub const ENV_HIPFIRE_DEEPSEEK4_MTP_SKIP_HEAD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MTP_SKIP_HEAD",
     description: "3. Batched MTP fill — single pass through the MTP layer for all",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:9011",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:9011",
 };
 
 /// `HIPFIRE_DEEPSEEK4_POST_SCALE` — Runtime variable controlling deepseek4 post scale in hipfire
 pub const ENV_HIPFIRE_DEEPSEEK4_POST_SCALE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_POST_SCALE",
     description: "Runtime variable controlling deepseek4 post scale in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:8357",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:8357",
 };
 
 /// `HIPFIRE_DEEPSEEK4_PP_BATCH` — on 2026-05-26). PP_BATCH sweep on the 2.1k-tok bench (3 trials/cell):
 pub const ENV_HIPFIRE_DEEPSEEK4_PP_BATCH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_PP_BATCH",
     description: "on 2026-05-26). PP_BATCH sweep on the 2.1k-tok bench (3 trials/cell):",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/load.rs:702",
+    source: "crates/hipfire-serving-core/src/load.rs:831",
 };
 
 /// `HIPFIRE_DEEPSEEK4_Q8_4W` — Opt out via HIPFIRE_DEEPSEEK4_Q8_4W=0 for diagnosis
 pub const ENV_HIPFIRE_DEEPSEEK4_Q8_4W: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_Q8_4W",
     description: "Opt out via HIPFIRE_DEEPSEEK4_Q8_4W=0 for diagnosis",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:292",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:292",
 };
 
 /// `HIPFIRE_DEEPSEEK4_Q8_WMMA` — bench_q8_wmma_variants. Opt-out via HIPFIRE_DEEPSEEK4_Q8_WMMA=0
 pub const ENV_HIPFIRE_DEEPSEEK4_Q8_WMMA: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_Q8_WMMA",
     description: "bench_q8_wmma_variants. Opt-out via HIPFIRE_DEEPSEEK4_Q8_WMMA=0",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:246",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:246",
 };
 
 /// `HIPFIRE_DEEPSEEK4_ROUTE_SCALE` — Runtime variable controlling deepseek4 route scale in hipfire
 pub const ENV_HIPFIRE_DEEPSEEK4_ROUTE_SCALE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_ROUTE_SCALE",
     description: "Runtime variable controlling deepseek4 route scale in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:7474",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:7474",
 };
 
 /// `HIPFIRE_DEEPSEEK4_SEED` — Runtime variable controlling deepseek4 seed in hipfire
 pub const ENV_HIPFIRE_DEEPSEEK4_SEED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_SEED",
     description: "Runtime variable controlling deepseek4 seed in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/generate_arch.rs:541",
+    source: "crates/hipfire-serving-core/src/generate_arch.rs:542",
 };
 
 /// `HIPFIRE_DEEPSEEK4_SPEC_DECODE` — Priority: 1. legacy env var → 2. generic env var → 3. stored config → default
 pub const ENV_HIPFIRE_DEEPSEEK4_SPEC_DECODE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_SPEC_DECODE",
     description: "Priority: 1. legacy env var → 2. generic env var → 3. stored config → default",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/generate_arch.rs:339",
+    source: "crates/hipfire-serving-core/src/generate_arch.rs:340",
 };
 
 /// `HIPFIRE_DEEPSEEK4_SPEC_K` — Runtime variable controlling deepseek4 spec k in hipfire
 pub const ENV_HIPFIRE_DEEPSEEK4_SPEC_K: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_SPEC_K",
     description: "Runtime variable controlling deepseek4 spec k in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/generate_arch.rs:347",
+    source: "crates/hipfire-serving-core/src/generate_arch.rs:348",
 };
 
 /// `HIPFIRE_DEEPSEEK4_TEMP` — Runtime variable controlling deepseek4 temp in hipfire
 pub const ENV_HIPFIRE_DEEPSEEK4_TEMP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_TEMP",
     description: "Runtime variable controlling deepseek4 temp in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs:162",
+    source: "crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs:162",
 };
 
 /// `HIPFIRE_DEEPSEEK4_TOP_K` — for local deployment; we honor that as the default. Pure greedy
 pub const ENV_HIPFIRE_DEEPSEEK4_TOP_K: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_TOP_K",
     description: "for local deployment; we honor that as the default. Pure greedy",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/generate_arch.rs:537",
+    source: "crates/hipfire-serving-core/src/generate_arch.rs:538",
 };
 
 /// `HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS` — without them). Opt out with "HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS=0"
 pub const ENV_HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS",
     description: "without them). Opt out with \"HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS=0\"",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/arch.rs:595",
+    source: "crates/hipfire-arch-deepseek4/src/arch.rs:595",
 };
 
 /// `HIPFIRE_DEEPSEEK4_WO_MULTIROW` — Q8_0 contract: plain (non-FWHT) input. Same layout
 pub const ENV_HIPFIRE_DEEPSEEK4_WO_MULTIROW: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_WO_MULTIROW",
     description: "Q8_0 contract: plain (non-FWHT) input. Same layout",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:7215",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:7215",
 };
 
 /// `HIPFIRE_DEEPSEEK4_WO_Q8_WMMA` — Runtime variable controlling deepseek4 wo Q8 wmma in hipfire
 pub const ENV_HIPFIRE_DEEPSEEK4_WO_Q8_WMMA: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_WO_Q8_WMMA",
     description: "Runtime variable controlling deepseek4 wo Q8 wmma in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:50348",
+    source: "crates/rdna-compute/src/dispatch.rs:50698",
 };
 
 /// `HIPFIRE_DELTANET_STATE` — Interprets "HIPFIRE_DELTANET_STATE" from environment to select behavior
 pub const ENV_HIPFIRE_DELTANET_STATE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DELTANET_STATE",
     description: "Interprets \"HIPFIRE_DELTANET_STATE\" from environment to select behavior",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/greedy_dump_top5.rs:245",
+    source: "crates/hipfire-runtime/examples/greedy_dump_top5.rs:246",
 };
 
 /// `HIPFIRE_DETERMINISTIC` — Enabled when set to 1
 pub const ENV_HIPFIRE_DETERMINISTIC: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DETERMINISTIC",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:278",
+    source: "crates/rdna-compute/src/feature_flags.rs:278",
 };
 
 /// `HIPFIRE_DEVICES` — Runtime variable controlling devices in hipfire
 pub const ENV_HIPFIRE_DEVICES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEVICES",
     description: "Runtime variable controlling devices in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:102",
+    source: "crates/hipfire-runtime/src/config.rs:102",
 };
 
 /// `HIPFIRE_DFLASH_DRAFT` — Runtime variable controlling dflash draft in hipfire
 pub const ENV_HIPFIRE_DFLASH_DRAFT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_DRAFT",
     description: "Runtime variable controlling dflash draft in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-server/src/routes/chat.rs:196",
+    source: "crates/hipfire-server/src/routes/chat.rs:196",
 };
 
 /// `HIPFIRE_DFLASH_LOOP_BREAK` — Memory: HashSet<u64>, ≤ max_tokens / 12 entries (~125 for max=1500)
 pub const ENV_HIPFIRE_DFLASH_LOOP_BREAK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_LOOP_BREAK",
     description: "Memory: HashSet<u64>, ≤ max_tokens / 12 entries (~125 for max=1500)",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:1433",
+    source: "crates/hipfire-runtime/examples/dflash_spec_demo.rs:1435",
 };
 
 /// `HIPFIRE_DFLASH_LOOP_BREAK_MAX_ESCALATIONS` — Runtime variable controlling dflash loop break max escalations in hipfire
 pub const ENV_HIPFIRE_DFLASH_LOOP_BREAK_MAX_ESCALATIONS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_LOOP_BREAK_MAX_ESCALATIONS",
     description: "Runtime variable controlling dflash loop break max escalations in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:1462",
+    source: "crates/hipfire-runtime/examples/dflash_spec_demo.rs:1464",
 };
 
 /// `HIPFIRE_DFLASH_LOOP_BREAK_RECOVERY` — Runtime variable controlling dflash loop break recovery in hipfire
 pub const ENV_HIPFIRE_DFLASH_LOOP_BREAK_RECOVERY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_LOOP_BREAK_RECOVERY",
     description: "Runtime variable controlling dflash loop break recovery in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:1457",
+    source: "crates/hipfire-runtime/examples/dflash_spec_demo.rs:1459",
 };
 
 /// `HIPFIRE_DFLASH_LOOP_BREAK_RP_MAX` — Runtime variable controlling dflash loop break rp max in hipfire
 pub const ENV_HIPFIRE_DFLASH_LOOP_BREAK_RP_MAX: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_LOOP_BREAK_RP_MAX",
     description: "Runtime variable controlling dflash loop break rp max in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:1453",
+    source: "crates/hipfire-runtime/examples/dflash_spec_demo.rs:1455",
 };
 
 /// `HIPFIRE_DFLASH_LOOP_BREAK_RP_STEP` — Runtime variable controlling dflash loop break rp step in hipfire
 pub const ENV_HIPFIRE_DFLASH_LOOP_BREAK_RP_STEP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_LOOP_BREAK_RP_STEP",
     description: "Runtime variable controlling dflash loop break rp step in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:1449",
+    source: "crates/hipfire-runtime/examples/dflash_spec_demo.rs:1451",
 };
 
 /// `HIPFIRE_DFLASH_LOOP_BREAK_STOP_AFTER` — Runtime variable controlling dflash loop break stop after in hipfire
 pub const ENV_HIPFIRE_DFLASH_LOOP_BREAK_STOP_AFTER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_LOOP_BREAK_STOP_AFTER",
     description: "Runtime variable controlling dflash loop break stop after in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:1445",
+    source: "crates/hipfire-runtime/examples/dflash_spec_demo.rs:1447",
 };
 
 /// `HIPFIRE_DFLASH_LOOP_BREAK_TEMP` — Runtime variable controlling dflash loop break temp in hipfire
 pub const ENV_HIPFIRE_DFLASH_LOOP_BREAK_TEMP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_LOOP_BREAK_TEMP",
     description: "Runtime variable controlling dflash loop break temp in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:1441",
+    source: "crates/hipfire-runtime/examples/dflash_spec_demo.rs:1443",
 };
 
 /// `HIPFIRE_DFLASH_MODE` — Defaults to off when unset
 pub const ENV_HIPFIRE_DFLASH_MODE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_MODE",
     description: "Defaults to off when unset",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:74",
+    source: "crates/hipfire-runtime/src/config.rs:74",
 };
 
 /// `HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH` — Runtime variable controlling dflash moe draft ffn graph in hipfire
 pub const ENV_HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH",
     description: "Runtime variable controlling dflash moe draft ffn graph in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:7102",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:7103",
 };
 
 /// `HIPFIRE_DFLASH_MOE_VERIFY_GRAPH_LMHEAD` — Runtime variable controlling dflash moe verify graph lmhead in hipfire
 pub const ENV_HIPFIRE_DFLASH_MOE_VERIFY_GRAPH_LMHEAD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_MOE_VERIFY_GRAPH_LMHEAD",
     description: "Runtime variable controlling dflash moe verify graph lmhead in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:6473",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:6474",
 };
 
 /// `HIPFIRE_DFLASH_NGRAM_BLOCK` — Enabled when set to 1
 pub const ENV_HIPFIRE_DFLASH_NGRAM_BLOCK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_NGRAM_BLOCK",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-server/src/routes/chat.rs:135",
+    source: "crates/hipfire-server/src/routes/chat.rs:135",
 };
 
 /// `HIPFIRE_DFLASH_Q8_LMHEAD_WMMA` — Selects behavior from recognized values
 pub const ENV_HIPFIRE_DFLASH_Q8_LMHEAD_WMMA: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_Q8_LMHEAD_WMMA",
     description: "Selects behavior from recognized values",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:113",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:114",
 };
 
 /// `HIPFIRE_DFLASH_ROLLBACK_COMPARE` — Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_COMPARE"
 pub const ENV_HIPFIRE_DFLASH_ROLLBACK_COMPARE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_ROLLBACK_COMPARE",
     description: "Used to configure runtime execution by explicitly setting \"HIPFIRE_DFLASH_ROLLBACK_COMPARE\"",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:12446",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:12447",
 };
 
 /// `HIPFIRE_DFLASH_ROLLBACK_FA_RAW_ATOL` — Runtime variable controlling dflash rollback fa raw atol in hipfire
 pub const ENV_HIPFIRE_DFLASH_ROLLBACK_FA_RAW_ATOL: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_ROLLBACK_FA_RAW_ATOL",
     description: "Runtime variable controlling dflash rollback fa raw atol in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:1089",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:1090",
 };
 
 /// `HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS` — Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS"
 pub const ENV_HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS",
     description: "Used to configure runtime execution by explicitly setting \"HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS\"",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:12470",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:12471",
 };
 
 /// `HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY` — Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY"
 pub const ENV_HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY",
     description: "Used to configure runtime execution by explicitly setting \"HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY\"",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:12374",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:12375",
 };
 
 /// `HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY` — Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY"
 pub const ENV_HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY",
     description: "Used to configure runtime execution by explicitly setting \"HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY\"",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:12342",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:12343",
 };
 
 /// `HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE` — Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE"
 pub const ENV_HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE",
     description: "Used to configure runtime execution by explicitly setting \"HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE\"",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:12422",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:12423",
 };
 
 /// `HIPFIRE_DFLASH_ROLLBACK_VERIFY_FRAMES` — Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_VERIFY_FRAMES"
 pub const ENV_HIPFIRE_DFLASH_ROLLBACK_VERIFY_FRAMES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_ROLLBACK_VERIFY_FRAMES",
     description: "Used to configure runtime execution by explicitly setting \"HIPFIRE_DFLASH_ROLLBACK_VERIFY_FRAMES\"",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:12398",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:12399",
 };
 
 /// `HIPFIRE_DFLASH_ROLLBACK_X_IN_ATOL` — Parses "HIPFIRE_DFLASH_ROLLBACK_X_IN_ATOL" with fallback defaults
 pub const ENV_HIPFIRE_DFLASH_ROLLBACK_X_IN_ATOL: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_ROLLBACK_X_IN_ATOL",
     description: "Parses \"HIPFIRE_DFLASH_ROLLBACK_X_IN_ATOL\" with fallback defaults",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:1097",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:1098",
 };
 
 /// `HIPFIRE_DFLASH_SEED_ORACLE` — Enabled when set to 1
 pub const ENV_HIPFIRE_DFLASH_SEED_ORACLE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_SEED_ORACLE",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:7742",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:7743",
 };
 
 /// `HIPFIRE_DFLASH_SERIAL_QKVZA_SELF_COMPARE` — Runtime variable controlling dflash serial qKVza self compare in hipfire
 pub const ENV_HIPFIRE_DFLASH_SERIAL_QKVZA_SELF_COMPARE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_SERIAL_QKVZA_SELF_COMPARE",
     description: "Runtime variable controlling dflash serial qKVza self compare in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:13750",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:13829",
 };
 
 /// `HIPFIRE_DFLASH_SERIAL_TAPE_X_IN_COMPARE` — Runtime variable controlling dflash serial tape x in compare in hipfire
 pub const ENV_HIPFIRE_DFLASH_SERIAL_TAPE_X_IN_COMPARE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_SERIAL_TAPE_X_IN_COMPARE",
     description: "Runtime variable controlling dflash serial tape x in compare in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:13755",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:13834",
 };
 
 /// `HIPFIRE_DFLASH_SPEC_DEMO_BIN` — Runtime variable controlling dflash spec demo bin in hipfire
 pub const ENV_HIPFIRE_DFLASH_SPEC_DEMO_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_SPEC_DEMO_BIN",
     description: "Runtime variable controlling dflash spec demo bin in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-eval/src/lib.rs:894",
+    source: "crates/hipfire-eval/src/lib.rs:894",
 };
 
 /// `HIPFIRE_DFLASH_TRACE_EXPECTED_TOKEN` — Runtime variable controlling dflash trace expected token in hipfire
 pub const ENV_HIPFIRE_DFLASH_TRACE_EXPECTED_TOKEN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_TRACE_EXPECTED_TOKEN",
     description: "Runtime variable controlling dflash trace expected token in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:137",
+    source: "crates/hipfire-runtime/examples/dflash_spec_demo.rs:139",
 };
 
 /// `HIPFIRE_DFLASH_TRACE_POSITION` — Runtime variable controlling dflash trace position in hipfire
 pub const ENV_HIPFIRE_DFLASH_TRACE_POSITION: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_TRACE_POSITION",
     description: "Runtime variable controlling dflash trace position in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:131",
+    source: "crates/hipfire-runtime/examples/dflash_spec_demo.rs:133",
 };
 
 /// `HIPFIRE_DFLASH_TRACE_TOKEN_INDEX` — Runtime variable controlling dflash trace token index in hipfire
 pub const ENV_HIPFIRE_DFLASH_TRACE_TOKEN_INDEX: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_TRACE_TOKEN_INDEX",
     description: "Runtime variable controlling dflash trace token index in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:1804",
+    source: "crates/hipfire-runtime/examples/dflash_spec_demo.rs:1806",
 };
 
-/// `HIPFIRE_DIR` — Runtime variable controlling dir in hipfire.
+/// `HIPFIRE_DIR` — Runtime variable controlling dir in hipfire
 pub const ENV_HIPFIRE_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIR",
-    description: "Runtime variable controlling dir in hipfire.",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/generate_vl.rs:1085",
+    description: "Runtime variable controlling dir in hipfire",
+    source: "crates/hipfire-serving-core/src/generate_vl.rs:1084",
 };
 
 /// `HIPFIRE_DN_STATE_EF` — Runtime variable controlling dn state ef in hipfire
 pub const ENV_HIPFIRE_DN_STATE_EF: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DN_STATE_EF",
     description: "Runtime variable controlling dn state ef in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:1430",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:1432",
 };
 
 /// `HIPFIRE_DN_STATE_FP32_BELOW` — Used to configure runtime execution by explicitly setting "HIPFIRE_DN_STATE_FP32_BELOW"
 pub const ENV_HIPFIRE_DN_STATE_FP32_BELOW: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DN_STATE_FP32_BELOW",
-    description: "Used to configure runtime execution by explicitly setting \"HIPFIRE_DN_STATE_FP32_BELOW\"",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:29509",
+    description:
+        "Used to configure runtime execution by explicitly setting \"HIPFIRE_DN_STATE_FP32_BELOW\"",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:29608",
 };
 
 /// `HIPFIRE_DOT2_GEMV` — Interprets "HIPFIRE_DOT2_GEMV" from environment to select behavior
 pub const ENV_HIPFIRE_DOT2_GEMV: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DOT2_GEMV",
     description: "Interprets \"HIPFIRE_DOT2_GEMV\" from environment to select behavior",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:177",
+    source: "crates/rdna-compute/src/feature_flags.rs:177",
 };
 
 /// `HIPFIRE_DOTS_OCR_BF16_RESIDUAL` — HF cast x to bf16 at vision forward entry (modeling_dots_vision.py
 pub const ENV_HIPFIRE_DOTS_OCR_BF16_RESIDUAL: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DOTS_OCR_BF16_RESIDUAL",
     description: "HF cast x to bf16 at vision forward entry (modeling_dots_vision.py",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-dots-ocr/src/dots_ocr.rs:1119",
+    source: "crates/hipfire-arch-dots-ocr/src/dots_ocr.rs:1119",
 };
 
 /// `HIPFIRE_DOTS_OCR_DUMP_DIR` — HIPFIRE_DOTS_OCR_DUMP_DIR=<path>: dump full per-stage tensor
 pub const ENV_HIPFIRE_DOTS_OCR_DUMP_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DOTS_OCR_DUMP_DIR",
     description: "HIPFIRE_DOTS_OCR_DUMP_DIR=<path>: dump full per-stage tensor",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-dots-ocr/src/dots_ocr.rs:1021",
+    source: "crates/hipfire-arch-dots-ocr/src/dots_ocr.rs:1021",
 };
 
 /// `HIPFIRE_DOTS_OCR_TRACE` — HIPFIRE_DOTS_OCR_TRACE=1: sync after every step + print probe so
 pub const ENV_HIPFIRE_DOTS_OCR_TRACE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DOTS_OCR_TRACE",
     description: "HIPFIRE_DOTS_OCR_TRACE=1: sync after every step + print probe so",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-dots-ocr/src/dots_ocr.rs:1149",
+    source: "crates/hipfire-arch-dots-ocr/src/dots_ocr.rs:1149",
 };
 
 /// `HIPFIRE_DPM_WARMUP_SECS` — Runtime variable controlling dpm warmup secs in hipfire
 pub const ENV_HIPFIRE_DPM_WARMUP_SECS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DPM_WARMUP_SECS",
     description: "Runtime variable controlling dpm warmup secs in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/examples/bench_stream_overlap.rs:60",
+    source: "crates/rdna-compute/examples/bench_stream_overlap.rs:60",
 };
 
 /// `HIPFIRE_DRAFT_F16` — Enabled by default; set to 0 to disable
 pub const ENV_HIPFIRE_DRAFT_F16: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DRAFT_F16",
     description: "Enabled by default; set to 0 to disable",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:75",
+    source: "crates/hipfire-runtime/src/config.rs:75",
 };
 
 /// `HIPFIRE_DRAFT_GEMM_DUMP` — Enabled when set to 1
 pub const ENV_HIPFIRE_DRAFT_GEMM_DUMP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DRAFT_GEMM_DUMP",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:76",
+    source: "crates/hipfire-runtime/src/config.rs:76",
 };
 
 /// `HIPFIRE_DRAFT_SUBPHASE` — Enabled when set to 1
 pub const ENV_HIPFIRE_DRAFT_SUBPHASE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DRAFT_SUBPHASE",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:77",
+    source: "crates/hipfire-runtime/src/config.rs:77",
 };
 
 /// `HIPFIRE_DTOH_DUMP` — Enabled when set to 1
 pub const ENV_HIPFIRE_DTOH_DUMP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DTOH_DUMP",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hip-bridge/src/ffi.rs:938",
+    source: "crates/hip-bridge/src/ffi.rs:938",
 };
 
 /// `HIPFIRE_DUMMY_GENERATE_DELAY_MS` — Parses "HIPFIRE_DUMMY_GENERATE_DELAY_MS" with fallback defaults
 pub const ENV_HIPFIRE_DUMMY_GENERATE_DELAY_MS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DUMMY_GENERATE_DELAY_MS",
     description: "Parses \"HIPFIRE_DUMMY_GENERATE_DELAY_MS\" with fallback defaults",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/dummy.rs:140",
+    source: "crates/hipfire-serving-core/src/dummy.rs:140",
 };
 
 /// `HIPFIRE_DUMMY_PREFILL_DELAY_MS` — Parses "HIPFIRE_DUMMY_PREFILL_DELAY_MS" with fallback defaults
 pub const ENV_HIPFIRE_DUMMY_PREFILL_DELAY_MS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DUMMY_PREFILL_DELAY_MS",
     description: "Parses \"HIPFIRE_DUMMY_PREFILL_DELAY_MS\" with fallback defaults",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/dummy.rs:129",
+    source: "crates/hipfire-serving-core/src/dummy.rs:129",
 };
 
 /// `HIPFIRE_DUMP_HIDDEN` — DIAG: dump router logits before softmax (mirrors qwen35 HIPFIRE_DUMP_HIDDEN)
 pub const ENV_HIPFIRE_DUMP_HIDDEN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DUMP_HIDDEN",
     description: "DIAG: dump router logits before softmax (mirrors qwen35 HIPFIRE_DUMP_HIDDEN)",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-dispatch/src/pipeline/mod.rs:386",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:386",
 };
 
 /// `HIPFIRE_DUMP_HIDDEN_POS` — Runtime variable controlling dump hidden pos in hipfire
 pub const ENV_HIPFIRE_DUMP_HIDDEN_POS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DUMP_HIDDEN_POS",
     description: "Runtime variable controlling dump hidden pos in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:16222",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:16301",
 };
 
 /// `HIPFIRE_DUMP_REQUEST` — a strace. Off by default — gigantic for typical agent prompts
 pub const ENV_HIPFIRE_DUMP_REQUEST: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DUMP_REQUEST",
     description: "a strace. Off by default — gigantic for typical agent prompts",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-server/src/routes/chat.rs:85",
+    source: "crates/hipfire-server/src/routes/chat.rs:85",
 };
 
 /// `HIPFIRE_EMIT_TOKEN_IDS` — or "\" in it would corrupt the line, breaking the client's JSONL
 pub const ENV_HIPFIRE_EMIT_TOKEN_IDS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMIT_TOKEN_IDS",
     description: "or \"\\\" in it would corrupt the line, breaking the client's JSONL",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/events.rs:111",
+    source: "crates/hipfire-serving-core/src/events.rs:111",
 };
 
 /// `HIPFIRE_EP_DECODE_TIMING` — 2. Per-layer EP program (Attend replicated; Moe all-reduce-EP'd)
 pub const ENV_HIPFIRE_EP_DECODE_TIMING: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EP_DECODE_TIMING",
     description: "2. Per-layer EP program (Attend replicated; Moe all-reduce-EP'd)",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-minimax/src/forward.rs:1292",
+    source: "crates/hipfire-arch-minimax/src/forward.rs:1292",
 };
 
 /// `HIPFIRE_EP_DUMP_IDX` — top-k chaos. HIPFIRE_EP_DUMP_IDX=1 to enable
 pub const ENV_HIPFIRE_EP_DUMP_IDX: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EP_DUMP_IDX",
     description: "top-k chaos. HIPFIRE_EP_DUMP_IDX=1 to enable",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:2428",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:2428",
 };
 
 /// `HIPFIRE_EP_DUMP_POS` — Divergence-localization dump: HIPFIRE_EP_DUMP_POS="0,64,...,302" prints a
 pub const ENV_HIPFIRE_EP_DUMP_POS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EP_DUMP_POS",
     description: "Divergence-localization dump: HIPFIRE_EP_DUMP_POS=\"0,64,...,302\" prints a",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:2363",
+    source: "crates/hipfire-arch-deepseek4/src/forward.rs:2363",
 };
 
 /// `HIPFIRE_EP_KV_SEQ` — Runtime variable controlling ep KV seq in hipfire
 pub const ENV_HIPFIRE_EP_KV_SEQ: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EP_KV_SEQ",
     description: "Runtime variable controlling ep KV seq in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/ep_decode_parity.rs:70",
+    source: "crates/hipfire-runtime/examples/ep_decode_parity.rs:71",
 };
 
 /// `HIPFIRE_EP_PEER_ALLREDUCE` — RCCL with HIPFIRE_EP_PEER_ALLREDUCE=0. The peer temps live in Gpus (shared
 pub const ENV_HIPFIRE_EP_PEER_ALLREDUCE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EP_PEER_ALLREDUCE",
     description: "RCCL with HIPFIRE_EP_PEER_ALLREDUCE=0. The peer temps live in Gpus (shared",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:27149",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:27248",
 };
 
 /// `HIPFIRE_EP_PEER_ALLREDUCE_DECODE` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_EP_PEER_ALLREDUCE_DECODE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EP_PEER_ALLREDUCE_DECODE",
     description: "Environment toggle value controls runtime behavior",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/ep.rs:135",
+    source: "crates/hipfire-runtime/src/ep.rs:135",
 };
 
 /// `HIPFIRE_EP_PREFILL` — Prefill mode: HIPFIRE_EP_PREFILL=batched → WMMA batched prefill EP (E6b)
 pub const ENV_HIPFIRE_EP_PREFILL: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EP_PREFILL",
     description: "Prefill mode: HIPFIRE_EP_PREFILL=batched → WMMA batched prefill EP (E6b)",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/ep_decode_parity.rs:97",
+    source: "crates/hipfire-runtime/examples/ep_decode_parity.rs:98",
 };
 
 /// `HIPFIRE_EP_PREFILL_TIMING` — Gpus::all_reduce_sum_f32_peer (direct P2P copy + local add), which is ~1 ms
 pub const ENV_HIPFIRE_EP_PREFILL_TIMING: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EP_PREFILL_TIMING",
     description: "Gpus::all_reduce_sum_f32_peer (direct P2P copy + local add), which is ~1 ms",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:27142",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:27241",
 };
 
 /// `HIPFIRE_EP_SKIP_ALLREDUCE` — Gpus::all_reduce_sum_f32_peer (direct P2P copy + local add), which is ~1 ms
 pub const ENV_HIPFIRE_EP_SKIP_ALLREDUCE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EP_SKIP_ALLREDUCE",
     description: "Gpus::all_reduce_sum_f32_peer (direct P2P copy + local add), which is ~1 ms",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:27143",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:27242",
 };
 
 /// `HIPFIRE_EVAL_DATASET_MIRROR` — Runtime variable controlling eval dataset mirror in hipfire
 pub const ENV_HIPFIRE_EVAL_DATASET_MIRROR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EVAL_DATASET_MIRROR",
     description: "Runtime variable controlling eval dataset mirror in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-eval/src/datasets.rs:203",
+    source: "crates/hipfire-eval/src/datasets.rs:203",
 };
 
 /// `HIPFIRE_EVAL_EVIDENCE_DIR` — Runtime variable controlling eval evidence dir in hipfire
 pub const ENV_HIPFIRE_EVAL_EVIDENCE_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EVAL_EVIDENCE_DIR",
     description: "Runtime variable controlling eval evidence dir in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/run.rs:231",
+    source: "crates/hipfire-runtime/examples/run.rs:231",
 };
 
 /// `HIPFIRE_EVAL_HIPFIRE_BIN` — Runtime variable controlling eval hipfire bin in hipfire
 pub const ENV_HIPFIRE_EVAL_HIPFIRE_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EVAL_HIPFIRE_BIN",
     description: "Runtime variable controlling eval hipfire bin in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-eval/src/lib.rs:986",
+    source: "crates/hipfire-eval/src/lib.rs:986",
 };
 
 /// `HIPFIRE_EVAL_KLDREF` — Runtime variable controlling eval kldref in hipfire
 pub const ENV_HIPFIRE_EVAL_KLDREF: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EVAL_KLDREF",
     description: "Runtime variable controlling eval kldref in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-eval/src/executor_examples.rs:512",
+    source: "crates/hipfire-eval/src/executor_examples.rs:512",
 };
 
 /// `HIPFIRE_EVAL_PERPLEXITY_CORPUS` — Runtime variable controlling eval perplexity corpus in hipfire
 pub const ENV_HIPFIRE_EVAL_PERPLEXITY_CORPUS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EVAL_PERPLEXITY_CORPUS",
     description: "Runtime variable controlling eval perplexity corpus in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-eval/src/run.rs:175",
+    source: "crates/hipfire-eval/src/run.rs:175",
 };
 
 /// `HIPFIRE_EVAL_PERPLEXITY_CTX` — Parses "HIPFIRE_EVAL_PERPLEXITY_CTX" with fallback defaults
 pub const ENV_HIPFIRE_EVAL_PERPLEXITY_CTX: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EVAL_PERPLEXITY_CTX",
     description: "Parses \"HIPFIRE_EVAL_PERPLEXITY_CTX\" with fallback defaults",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-eval/src/executor_examples.rs:598",
+    source: "crates/hipfire-eval/src/executor_examples.rs:598",
 };
 
 /// `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` — cache so the model "sees" them as part of its own trajectory,
 pub const ENV_HIPFIRE_EXPERIMENTAL_BUDGET_ALERT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EXPERIMENTAL_BUDGET_ALERT",
     description: "cache so the model \"sees\" them as part of its own trajectory,",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:3292",
+    source: "crates/hipfire-daemon/src/main.rs:3304",
 };
 
 /// `HIPFIRE_FILES_STATE_MAX` — Parses "HIPFIRE_FILES_STATE_MAX" with fallback defaults
 pub const ENV_HIPFIRE_FILES_STATE_MAX: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_FILES_STATE_MAX",
     description: "Parses \"HIPFIRE_FILES_STATE_MAX\" with fallback defaults",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-server/src/routes/files.rs:174",
+    source: "crates/hipfire-server/src/routes/files.rs:174",
 };
 
 /// `HIPFIRE_FLASH_PARTIALS_BATCH` — Parses "HIPFIRE_FLASH_PARTIALS_BATCH" with fallback defaults
 pub const ENV_HIPFIRE_FLASH_PARTIALS_BATCH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_FLASH_PARTIALS_BATCH",
     description: "Parses \"HIPFIRE_FLASH_PARTIALS_BATCH\" with fallback defaults",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:87",
+    source: "crates/hipfire-runtime/src/config.rs:87",
 };
 
 /// `HIPFIRE_FORCE_UNFUSED` — Interpreter Phase 2a
 pub const ENV_HIPFIRE_FORCE_UNFUSED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_FORCE_UNFUSED",
     description: "Interpreter Phase 2a",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:306",
+    source: "crates/rdna-compute/src/feature_flags.rs:306",
 };
 
 /// `HIPFIRE_FORWARD_LOWERED` — Enabled by default; set to 0 to disable
 pub const ENV_HIPFIRE_FORWARD_LOWERED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_FORWARD_LOWERED",
     description: "Enabled by default; set to 0 to disable",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:26812",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:26906",
 };
 
 /// `HIPFIRE_FP16` — escape hatch to the LA qkvza projection while debugging DFlash
 pub const ENV_HIPFIRE_FP16: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_FP16",
     description: "escape hatch to the LA qkvza projection while debugging DFlash",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:185",
+    source: "crates/rdna-compute/src/feature_flags.rs:185",
 };
 
 /// `HIPFIRE_FP8_WMMA` — Interprets "HIPFIRE_FP8_WMMA" from environment to select behavior
 pub const ENV_HIPFIRE_FP8_WMMA: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_FP8_WMMA",
     description: "Interprets \"HIPFIRE_FP8_WMMA\" from environment to select behavior",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:176",
+    source: "crates/rdna-compute/src/feature_flags.rs:176",
 };
 
 /// `HIPFIRE_FUSED_HFQ4_2ROW_GFX1151` — Selects behavior from recognized values
 pub const ENV_HIPFIRE_FUSED_HFQ4_2ROW_GFX1151: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_FUSED_HFQ4_2ROW_GFX1151",
     description: "Selects behavior from recognized values",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:24701",
+    source: "crates/rdna-compute/src/dispatch.rs:24741",
 };
 
 /// `HIPFIRE_GATE_UP_VARIANT` — Runtime variable controlling gate up variant in hipfire
 pub const ENV_HIPFIRE_GATE_UP_VARIANT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GATE_UP_VARIANT",
     description: "Runtime variable controlling gate up variant in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:231",
+    source: "crates/rdna-compute/src/feature_flags.rs:231",
 };
 
 /// `HIPFIRE_GDN_Q8_REG_GFX1151` — HIPFIRE_GDN_Q8_REG_GFX1151=1 enables the gfx1151 register-state
 pub const ENV_HIPFIRE_GDN_Q8_REG_GFX1151: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GDN_Q8_REG_GFX1151",
     description: "HIPFIRE_GDN_Q8_REG_GFX1151=1 enables the gfx1151 register-state",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:39359",
+    source: "crates/rdna-compute/src/dispatch.rs:39399",
 };
 
 /// `HIPFIRE_GEMM_DUMP` — Enabled when set to 1
 pub const ENV_HIPFIRE_GEMM_DUMP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GEMM_DUMP",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:277",
+    source: "crates/rdna-compute/src/feature_flags.rs:277",
 };
 
 /// `HIPFIRE_GEMV_ROWS` — Runtime variable controlling gemv rows in hipfire
 pub const ENV_HIPFIRE_GEMV_ROWS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GEMV_ROWS",
     description: "Runtime variable controlling gemv rows in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:157",
+    source: "crates/rdna-compute/src/feature_flags.rs:157",
 };
 
 /// `HIPFIRE_GEN` — Runtime variable controlling gen in hipfire
 pub const ENV_HIPFIRE_GEN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GEN",
     description: "Runtime variable controlling gen in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/a3b_multiturn_oneshot.rs:25",
+    source: "crates/hipfire-runtime/examples/a3b_multiturn_oneshot.rs:26",
 };
 
 /// `HIPFIRE_GENERATE_BATCH_PREFILL_DEBUG_SAMPLE` — Runtime variable controlling generate batch prefill debug sample in hipfire
 pub const ENV_HIPFIRE_GENERATE_BATCH_PREFILL_DEBUG_SAMPLE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GENERATE_BATCH_PREFILL_DEBUG_SAMPLE",
     description: "Runtime variable controlling generate batch prefill debug sample in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/qwen35_prefill.rs:1551",
+    source: "crates/hipfire-serving-core/src/qwen35_prefill.rs:1551",
 };
 
 /// `HIPFIRE_GFX942_GEMV_V3` — Interprets "HIPFIRE_GFX942_GEMV_V3" from environment to select behavior
 pub const ENV_HIPFIRE_GFX942_GEMV_V3: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GFX942_GEMV_V3",
     description: "Interprets \"HIPFIRE_GFX942_GEMV_V3\" from environment to select behavior",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:233",
+    source: "crates/rdna-compute/src/feature_flags.rs:233",
 };
 
 /// `HIPFIRE_GFX942_MFMA_PREFILL` — Interprets "HIPFIRE_GFX942_MFMA_PREFILL" from environment to select behavior
 pub const ENV_HIPFIRE_GFX942_MFMA_PREFILL: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GFX942_MFMA_PREFILL",
     description: "Interprets \"HIPFIRE_GFX942_MFMA_PREFILL\" from environment to select behavior",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:236",
+    source: "crates/rdna-compute/src/feature_flags.rs:236",
 };
 
 /// `HIPFIRE_GFX942_RMSNORM_SPLIT` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_GFX942_RMSNORM_SPLIT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GFX942_RMSNORM_SPLIT",
     description: "Environment toggle value controls runtime behavior",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:235",
+    source: "crates/rdna-compute/src/feature_flags.rs:235",
 };
 
 /// `HIPFIRE_GPTQ_DAMPING` — Inject env override since the quantizer reads it at fn entry
 pub const ENV_HIPFIRE_GPTQ_DAMPING: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GPTQ_DAMPING",
     description: "Inject env override since the quantizer reads it at fn entry",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:9313",
+    source: "crates/hipfire-quantize/src/main.rs:9382",
 };
 
 /// `HIPFIRE_GPU_LOCKFILE` — Runtime variable controlling gpu lockfile in hipfire
 pub const ENV_HIPFIRE_GPU_LOCKFILE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GPU_LOCKFILE",
     description: "Runtime variable controlling gpu lockfile in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-lock/src/lib.rs:200",
+    source: "crates/hipfire-lock/src/lib.rs:200",
 };
 
 /// `HIPFIRE_GPU_SLAB_LOAD` — Runtime variable controlling gpu slab load in hipfire
 pub const ENV_HIPFIRE_GPU_SLAB_LOAD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GPU_SLAB_LOAD",
     description: "Runtime variable controlling gpu slab load in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:4904",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:4961",
 };
 
 /// `HIPFIRE_GPU_SLAB_MIB` — Parses "HIPFIRE_GPU_SLAB_MIB" with fallback defaults
 pub const ENV_HIPFIRE_GPU_SLAB_MIB: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GPU_SLAB_MIB",
     description: "Parses \"HIPFIRE_GPU_SLAB_MIB\" with fallback defaults",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:3953",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:4003",
 };
 
 /// `HIPFIRE_GPU_TOPK` — HIPFIRE_GPU_TOPK=1 enables the GPU topk_logits_f32 kernel + CPU
 pub const ENV_HIPFIRE_GPU_TOPK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GPU_TOPK",
     description: "HIPFIRE_GPU_TOPK=1 enables the GPU topk_logits_f32 kernel + CPU",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/infer_qwen35.rs:221",
+    source: "crates/hipfire-runtime/examples/infer_qwen35.rs:222",
 };
 
 /// `HIPFIRE_GQA_CHUNK` — Runtime variable controlling gqa chunk in hipfire
 pub const ENV_HIPFIRE_GQA_CHUNK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GQA_CHUNK",
     description: "Runtime variable controlling gqa chunk in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:31911",
+    source: "crates/rdna-compute/src/dispatch.rs:31951",
 };
 
 /// `HIPFIRE_GQA_FUSED` — Fused variant (opt-in via HIPFIRE_GQA_FUSED=1): single launch
 pub const ENV_HIPFIRE_GQA_FUSED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GQA_FUSED",
     description: "Fused variant (opt-in via HIPFIRE_GQA_FUSED=1): single launch",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen2/src/qwen2.rs:1720",
+    source: "crates/hipfire-arch-qwen2/src/qwen2.rs:1720",
 };
 
 /// `HIPFIRE_GRAPH` — Used to configure runtime execution by explicitly setting "HIPFIRE_GRAPH"
 pub const ENV_HIPFIRE_GRAPH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GRAPH",
     description: "Used to configure runtime execution by explicitly setting \"HIPFIRE_GRAPH\"",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/prefill_microbench.rs:124",
+    source: "crates/hipfire-runtime/examples/prefill_microbench.rs:124",
 };
 
 /// `HIPFIRE_GRAPH_MOE` — - gfx11 (RDNA3 / 3.5): default-ON. +0.6-0.7% decode on 9B and
 pub const ENV_HIPFIRE_GRAPH_MOE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GRAPH_MOE",
     description: "- gfx11 (RDNA3 / 3.5): default-ON. +0.6-0.7% decode on 9B and",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:8838",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:8895",
 };
 
 /// `HIPFIRE_GRAPH_PREFILL` — HIPFIRE_GRAPH_PREFILL=1: route the timed prefill loop through
 pub const ENV_HIPFIRE_GRAPH_PREFILL: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GRAPH_PREFILL",
     description: "HIPFIRE_GRAPH_PREFILL=1: route the timed prefill loop through",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/bench_qwen35_speed.rs:186",
+    source: "crates/hipfire-runtime/examples/bench_qwen35_speed.rs:186",
 };
 
 /// `HIPFIRE_HAVE_2_GPU` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_HAVE_2_GPU: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HAVE_2_GPU",
     description: "Environment toggle value controls runtime behavior",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/tests/pp_parity.rs:193",
+    source: "crates/hipfire-arch-qwen35/tests/pp_parity.rs:193",
 };
 
 /// `HIPFIRE_HETERO_DIFF` — above (#352's GPU greedy-accept path doesn't materialize it),
 pub const ENV_HIPFIRE_HETERO_DIFF: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HETERO_DIFF",
     description: "above (#352's GPU greedy-accept path doesn't materialize it),",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/mtp_spec.rs:2981",
+    source: "crates/hipfire-arch-qwen35/src/mtp_spec.rs:2981",
 };
 
 /// `HIPFIRE_HFQ4G128_MMQ` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_HFQ4G128_MMQ: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HFQ4G128_MMQ",
     description: "Environment toggle value controls runtime behavior",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:226",
+    source: "crates/rdna-compute/src/feature_flags.rs:226",
 };
 
 /// `HIPFIRE_HFQ4G256_MMQ_GFX1151` — Selects behavior from recognized values
 pub const ENV_HIPFIRE_HFQ4G256_MMQ_GFX1151: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HFQ4G256_MMQ_GFX1151",
     description: "Selects behavior from recognized values",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:24684",
+    source: "crates/rdna-compute/src/dispatch.rs:24724",
 };
 
 /// `HIPFIRE_HFQ4_GATE_UP_FAST` — HIPFIRE_HFQ4_GATE_UP_FAST=0 narrows the escape hatch to the
 pub const ENV_HIPFIRE_HFQ4_GATE_UP_FAST: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HFQ4_GATE_UP_FAST",
     description: "HIPFIRE_HFQ4_GATE_UP_FAST=0 narrows the escape hatch to the",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:199",
+    source: "crates/rdna-compute/src/feature_flags.rs:199",
 };
 
 /// `HIPFIRE_HFQ4_MMQ_GFX906_Y64` — Runtime variable controlling hfQ4 mmq gfx906 y64 in hipfire
 pub const ENV_HIPFIRE_HFQ4_MMQ_GFX906_Y64: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HFQ4_MMQ_GFX906_Y64",
     description: "Runtime variable controlling hfQ4 mmq gfx906 y64 in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:229",
+    source: "crates/rdna-compute/src/feature_flags.rs:229",
 };
 
 /// `HIPFIRE_HFQ4_QKVZA_FAST` — HIPFIRE_HFQ4_QKVZA_FAST=0 narrows the FP16/WMMA/dot2 prefill
 pub const ENV_HIPFIRE_HFQ4_QKVZA_FAST: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HFQ4_QKVZA_FAST",
     description: "HIPFIRE_HFQ4_QKVZA_FAST=0 narrows the FP16/WMMA/dot2 prefill",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:191",
+    source: "crates/rdna-compute/src/feature_flags.rs:191",
 };
 
 /// `HIPFIRE_HFQ4_QKV_FAST` — HIPFIRE_HFQ4_QKV_FAST=0 narrows the escape hatch to the
 pub const ENV_HIPFIRE_HFQ4_QKV_FAST: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HFQ4_QKV_FAST",
     description: "HIPFIRE_HFQ4_QKV_FAST=0 narrows the escape hatch to the",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:195",
+    source: "crates/rdna-compute/src/feature_flags.rs:195",
 };
 
 /// `HIPFIRE_HFQ4_RESIDUAL_FAST` — HIPFIRE_HFQ4_RESIDUAL_FAST=0 narrows the residual-projection
 pub const ENV_HIPFIRE_HFQ4_RESIDUAL_FAST: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HFQ4_RESIDUAL_FAST",
     description: "HIPFIRE_HFQ4_RESIDUAL_FAST=0 narrows the residual-projection",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:203",
+    source: "crates/rdna-compute/src/feature_flags.rs:203",
 };
 
 /// `HIPFIRE_HFQ6_QKVZA_4W` — Interprets "HIPFIRE_HFQ6_QKVZA_4W" from environment to select behavior
 pub const ENV_HIPFIRE_HFQ6_QKVZA_4W: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HFQ6_QKVZA_4W",
     description: "Interprets \"HIPFIRE_HFQ6_QKVZA_4W\" from environment to select behavior",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:26792",
+    source: "crates/rdna-compute/src/dispatch.rs:26832",
 };
 
 /// `HIPFIRE_HFQ6_QKV_4W` — Interprets "HIPFIRE_HFQ6_QKV_4W" from environment to select behavior
 pub const ENV_HIPFIRE_HFQ6_QKV_4W: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HFQ6_QKV_4W",
     description: "Interprets \"HIPFIRE_HFQ6_QKV_4W\" from environment to select behavior",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:27545",
+    source: "crates/rdna-compute/src/dispatch.rs:27585",
 };
 
 /// `HIPFIRE_HFQ6_RESIDUAL_4W` — Interprets "HIPFIRE_HFQ6_RESIDUAL_4W" from environment to select behavior
 pub const ENV_HIPFIRE_HFQ6_RESIDUAL_4W: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HFQ6_RESIDUAL_4W",
     description: "Interprets \"HIPFIRE_HFQ6_RESIDUAL_4W\" from environment to select behavior",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:26399",
+    source: "crates/rdna-compute/src/dispatch.rs:26439",
 };
 
 /// `HIPFIRE_HIPCC_EXTRA_FLAGS` — Parses "HIPFIRE_HIPCC_EXTRA_FLAGS" with fallback defaults
 pub const ENV_HIPFIRE_HIPCC_EXTRA_FLAGS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HIPCC_EXTRA_FLAGS",
     description: "Parses \"HIPFIRE_HIPCC_EXTRA_FLAGS\" with fallback defaults",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:303",
+    source: "crates/rdna-compute/src/feature_flags.rs:303",
 };
 
 /// `HIPFIRE_HIP_WAIT` — Runtime variable controlling hip wait in hipfire
 pub const ENV_HIPFIRE_HIP_WAIT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HIP_WAIT",
     description: "Runtime variable controlling hip wait in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:754",
+    source: "crates/rdna-compute/src/dispatch.rs:774",
 };
 
 /// `HIPFIRE_HOST_PROFILE_BIN` — Runtime variable controlling host profile bin in hipfire
 pub const ENV_HIPFIRE_HOST_PROFILE_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HOST_PROFILE_BIN",
     description: "Runtime variable controlling host profile bin in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-eval/src/lib.rs:1001",
+    source: "crates/hipfire-eval/src/lib.rs:1001",
 };
 
 /// `HIPFIRE_HOST_TIMING` — HIPFIRE_HOST_TIMING=1: dump per-cycle host-side wall-clock breakdown
 pub const ENV_HIPFIRE_HOST_TIMING: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HOST_TIMING",
     description: "HIPFIRE_HOST_TIMING=1: dump per-cycle host-side wall-clock breakdown",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:1732",
+    source: "crates/hipfire-runtime/examples/dflash_spec_demo.rs:1734",
 };
 
 /// `HIPFIRE_JINJA_CHAT` — Enabled when set to 1
 pub const ENV_HIPFIRE_JINJA_CHAT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_JINJA_CHAT",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/qwen35_prefill.rs:208",
+    source: "crates/hipfire-serving-core/src/qwen35_prefill.rs:208",
 };
 
-/// `HIPFIRE_KERNEL_CACHE` — Overrides the default kernel cache root (`~/.hipfire/kernels`)
+/// `HIPFIRE_KERNEL_CACHE` — Overrides the default kernel cache root ("~/.hipfire/kernels")
 pub const ENV_HIPFIRE_KERNEL_CACHE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KERNEL_CACHE",
-    description: "Overrides the default kernel cache root (`~/.hipfire/kernels`)",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/compiler.rs:214",
+    description: "Overrides the default kernel cache root (\"~/.hipfire/kernels\")",
+    source: "crates/rdna-compute/src/compiler.rs:214",
 };
 
 /// `HIPFIRE_KLD_DIRECT_F16KV_ATTN` — Used to configure runtime execution by explicitly setting "HIPFIRE_KLD_DIRECT_F16KV_ATTN"
 pub const ENV_HIPFIRE_KLD_DIRECT_F16KV_ATTN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KLD_DIRECT_F16KV_ATTN",
     description: "Used to configure runtime execution by explicitly setting \"HIPFIRE_KLD_DIRECT_F16KV_ATTN\"",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:699",
+    source: "crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:699",
 };
 
 /// `HIPFIRE_KLD_DIRECT_WMMA_ATTN` — Used to configure runtime execution by explicitly setting "HIPFIRE_KLD_DIRECT_WMMA_ATTN"
 pub const ENV_HIPFIRE_KLD_DIRECT_WMMA_ATTN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KLD_DIRECT_WMMA_ATTN",
-    description: "Used to configure runtime execution by explicitly setting \"HIPFIRE_KLD_DIRECT_WMMA_ATTN\"",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:698",
+    description:
+        "Used to configure runtime execution by explicitly setting \"HIPFIRE_KLD_DIRECT_WMMA_ATTN\"",
+    source: "crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:698",
 };
 
 /// `HIPFIRE_KLD_FP32_GQA4_ATTN` — Used to configure runtime execution by explicitly setting "HIPFIRE_KLD_FP32_GQA4_ATTN"
 pub const ENV_HIPFIRE_KLD_FP32_GQA4_ATTN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KLD_FP32_GQA4_ATTN",
-    description: "Used to configure runtime execution by explicitly setting \"HIPFIRE_KLD_FP32_GQA4_ATTN\"",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:702",
+    description:
+        "Used to configure runtime execution by explicitly setting \"HIPFIRE_KLD_FP32_GQA4_ATTN\"",
+    source: "crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:702",
 };
 
 /// `HIPFIRE_KLD_GPU_TOPK` — Enabled by default; set to 0 to disable
 pub const ENV_HIPFIRE_KLD_GPU_TOPK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KLD_GPU_TOPK",
     description: "Enabled by default; set to 0 to disable",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:956",
+    source: "crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:956",
 };
 
 /// `HIPFIRE_KLD_GRAPH` — Enabled by default; set to 0 to disable
 pub const ENV_HIPFIRE_KLD_GRAPH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KLD_GRAPH",
     description: "Enabled by default; set to 0 to disable",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:677",
+    source: "crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:677",
 };
 
 /// `HIPFIRE_KLD_NO_ACTIVE_STREAM` — Runtime variable controlling kld no active stream in hipfire
 pub const ENV_HIPFIRE_KLD_NO_ACTIVE_STREAM: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KLD_NO_ACTIVE_STREAM",
     description: "Runtime variable controlling kld no active stream in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:291",
+    source: "crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:291",
 };
 
 /// `HIPFIRE_KLD_PREFILL_ONLY` — Enabled when set to 1
 pub const ENV_HIPFIRE_KLD_PREFILL_ONLY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KLD_PREFILL_ONLY",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:844",
+    source: "crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:844",
 };
 
 /// `HIPFIRE_KLD_SOURCE_SHA256` — Enabled when set to 1
 pub const ENV_HIPFIRE_KLD_SOURCE_SHA256: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KLD_SOURCE_SHA256",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:840",
+    source: "crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:840",
 };
 
 /// `HIPFIRE_KVARN_SIM` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_KVARN_SIM: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KVARN_SIM",
     description: "Environment toggle value controls runtime behavior",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/perplexity.rs:210",
+    source: "crates/hipfire-runtime/examples/perplexity.rs:210",
 };
 
 /// `HIPFIRE_KV_MODE` — Runtime variable controlling KV mode in hipfire
 pub const ENV_HIPFIRE_KV_MODE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_MODE",
     description: "Runtime variable controlling KV mode in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/load.rs:1779",
+    source: "crates/hipfire-serving-core/src/load.rs:1915",
 };
 
 /// `HIPFIRE_KV_PHYSICAL_CAP` — Parses "HIPFIRE_KV_PHYSICAL_CAP" with fallback defaults
 pub const ENV_HIPFIRE_KV_PHYSICAL_CAP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_PHYSICAL_CAP",
     description: "Parses \"HIPFIRE_KV_PHYSICAL_CAP\" with fallback defaults",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/load.rs:372",
+    source: "crates/hipfire-serving-core/src/load.rs:404",
 };
 
 /// `HIPFIRE_LFM2_CAPTURE_POSTMIXER` — Runtime variable controlling lfm2 capture postmixer in hipfire
 pub const ENV_HIPFIRE_LFM2_CAPTURE_POSTMIXER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LFM2_CAPTURE_POSTMIXER",
     description: "Runtime variable controlling lfm2 capture postmixer in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-lfm2moe/src/forward.rs:140",
+    source: "crates/hipfire-arch-lfm2moe/src/forward.rs:140",
 };
 
 /// `HIPFIRE_LFM2_EXPERT_MQ6` — opt-in via HIPFIRE_LFM2_EXPERT_MQ6 for higher quality), else mq4
 pub const ENV_HIPFIRE_LFM2_EXPERT_MQ6: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LFM2_EXPERT_MQ6",
     description: "opt-in via HIPFIRE_LFM2_EXPERT_MQ6 for higher quality), else mq4",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:6208",
+    source: "crates/hipfire-quantize/src/main.rs:6277",
 };
 
 /// `HIPFIRE_LFM2_GRAPH` — Interprets "HIPFIRE_LFM2_GRAPH" from environment to select behavior
 pub const ENV_HIPFIRE_LFM2_GRAPH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LFM2_GRAPH",
     description: "Interprets \"HIPFIRE_LFM2_GRAPH\" from environment to select behavior",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-lfm2moe/src/forward.rs:65",
+    source: "crates/hipfire-arch-lfm2moe/src/forward.rs:65",
 };
 
 /// `HIPFIRE_LFM2_PROJ_MQ4` — Runtime variable controlling lfm2 proj mQ4 in hipfire
 pub const ENV_HIPFIRE_LFM2_PROJ_MQ4: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LFM2_PROJ_MQ4",
     description: "Runtime variable controlling lfm2 proj mQ4 in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:6289",
+    source: "crates/hipfire-quantize/src/main.rs:6358",
 };
 
 /// `HIPFIRE_LFM2_PROJ_MQ6` — MQ6 variant (HIPFIRE_LFM2_PROJ_MQ6=1) is the lower-quality-loss
 pub const ENV_HIPFIRE_LFM2_PROJ_MQ6: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LFM2_PROJ_MQ6",
     description: "MQ6 variant (HIPFIRE_LFM2_PROJ_MQ6=1) is the lower-quality-loss",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:6288",
+    source: "crates/hipfire-quantize/src/main.rs:6357",
 };
 
 /// `HIPFIRE_LLOYD_FORCE_BASELINE` — Runtime variable controlling lloyd force baseline in hipfire
 pub const ENV_HIPFIRE_LLOYD_FORCE_BASELINE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LLOYD_FORCE_BASELINE",
     description: "Runtime variable controlling lloyd force baseline in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:294",
+    source: "crates/rdna-compute/src/feature_flags.rs:294",
 };
 
 /// `HIPFIRE_LLOYD_GFX12` — Used to configure runtime execution by explicitly setting "HIPFIRE_LLOYD_GFX12"
 pub const ENV_HIPFIRE_LLOYD_GFX12: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LLOYD_GFX12",
-    description: "Used to configure runtime execution by explicitly setting \"HIPFIRE_LLOYD_GFX12\"",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/prefill_microbench.rs:145",
+    description:
+        "Used to configure runtime execution by explicitly setting \"HIPFIRE_LLOYD_GFX12\"",
+    source: "crates/hipfire-runtime/examples/prefill_microbench.rs:145",
 };
 
 /// `HIPFIRE_LLOYD_K3` — Fallback to HFQ2-G128 for non-256-aligned (no rotation)
 pub const ENV_HIPFIRE_LLOYD_K3: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LLOYD_K3",
     description: "Fallback to HFQ2-G128 for non-256-aligned (no rotation)",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:7586",
+    source: "crates/hipfire-quantize/src/main.rs:7655",
 };
 
 /// `HIPFIRE_LLOYD_MB4` — Force MB4=0 to skip the size-gated routing
 pub const ENV_HIPFIRE_LLOYD_MB4: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LLOYD_MB4",
     description: "Force MB4=0 to skip the size-gated routing",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/examples/test_gemm_mq4g256_lloyd_residual_wmma.rs:274",
+    source: "crates/rdna-compute/examples/test_gemm_mq4g256_lloyd_residual_wmma.rs:274",
 };
 
 /// `HIPFIRE_LM_HEAD_F16` — Runtime variable controlling lm head f16 in hipfire
 pub const ENV_HIPFIRE_LM_HEAD_F16: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LM_HEAD_F16",
     description: "Runtime variable controlling lm head f16 in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:108",
+    source: "crates/hipfire-runtime/src/config.rs:108",
 };
 
 /// `HIPFIRE_LM_HEAD_OVERWRITE` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_LM_HEAD_OVERWRITE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LM_HEAD_OVERWRITE",
     description: "Environment toggle value controls runtime behavior",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:207",
+    source: "crates/rdna-compute/src/feature_flags.rs:207",
 };
 
 /// `HIPFIRE_LM_HEAD_WMMA` — Runtime variable controlling lm head wmma in hipfire
 pub const ENV_HIPFIRE_LM_HEAD_WMMA: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LM_HEAD_WMMA",
     description: "Runtime variable controlling lm head wmma in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:205",
+    source: "crates/rdna-compute/src/feature_flags.rs:205",
 };
 
 /// `HIPFIRE_LOAD_TRANSPORT` — Selects behavior from recognized values
 pub const ENV_HIPFIRE_LOAD_TRANSPORT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LOAD_TRANSPORT",
     description: "Selects behavior from recognized values",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/weight_pager.rs:768",
+    source: "crates/hipfire-runtime/src/weight_pager.rs:768",
 };
 
 /// `HIPFIRE_LOCAL` — Force local-spawn behavior and skip serve HTTP in documented workflows
 pub const ENV_HIPFIRE_LOCAL: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LOCAL",
     description: "Force local-spawn behavior and skip serve HTTP in documented workflows",
-    source: "/home/sadara/.hipfire/src/README.md:962",
+    source: "README.md:962",
 };
 
 /// `HIPFIRE_MEMSET_DUMP` — Enabled when set to 1
 pub const ENV_HIPFIRE_MEMSET_DUMP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MEMSET_DUMP",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hip-bridge/src/ffi.rs:1012",
+    source: "crates/hip-bridge/src/ffi.rs:1012",
 };
 
 /// `HIPFIRE_MINIMAX_CAPTURE_POSTATTN` — Runtime variable controlling minimax capture postattn in hipfire
 pub const ENV_HIPFIRE_MINIMAX_CAPTURE_POSTATTN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MINIMAX_CAPTURE_POSTATTN",
     description: "Runtime variable controlling minimax capture postattn in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-minimax/src/forward.rs:131",
+    source: "crates/hipfire-arch-minimax/src/forward.rs:131",
 };
 
 /// `HIPFIRE_MINIMAX_DOWN_FORMAT` — Runtime variable controlling minimax down format in hipfire
 pub const ENV_HIPFIRE_MINIMAX_DOWN_FORMAT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MINIMAX_DOWN_FORMAT",
     description: "Runtime variable controlling minimax down format in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:6527",
+    source: "crates/hipfire-quantize/src/main.rs:6596",
 };
 
 /// `HIPFIRE_MINIMAX_ENABLE_DOWN_AWQ` — down-AWQ harmful (shared s_down bad approx); opt-in
 pub const ENV_HIPFIRE_MINIMAX_ENABLE_DOWN_AWQ: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MINIMAX_ENABLE_DOWN_AWQ",
     description: "down-AWQ harmful (shared s_down bad approx); opt-in",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-minimax/src/minimax.rs:445",
+    source: "crates/hipfire-arch-minimax/src/minimax.rs:447",
 };
 
 /// `HIPFIRE_MINIMAX_EXPERT_MQ2L` — dispatches expert dtype per-layer (experts[0].gpu_dtype), so the model
 pub const ENV_HIPFIRE_MINIMAX_EXPERT_MQ2L: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MINIMAX_EXPERT_MQ2L",
     description: "dispatches expert dtype per-layer (experts[0].gpu_dtype), so the model",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:6506",
+    source: "crates/hipfire-quantize/src/main.rs:6575",
 };
 
 /// `HIPFIRE_MINIMAX_EXPERT_MQ3L` — dispatches expert dtype per-layer (experts[0].gpu_dtype), so the model
 pub const ENV_HIPFIRE_MINIMAX_EXPERT_MQ3L: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MINIMAX_EXPERT_MQ3L",
     description: "dispatches expert dtype per-layer (experts[0].gpu_dtype), so the model",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:6508",
+    source: "crates/hipfire-quantize/src/main.rs:6577",
 };
 
 /// `HIPFIRE_MINIMAX_EXPERT_MQ6` — _MQ6 hold comma-separated layer ranges ("12-45,50") whose experts are
 pub const ENV_HIPFIRE_MINIMAX_EXPERT_MQ6: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MINIMAX_EXPERT_MQ6",
     description: "_MQ6 hold comma-separated layer ranges (\"12-45,50\") whose experts are",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:6504",
+    source: "crates/hipfire-quantize/src/main.rs:6573",
 };
 
 /// `HIPFIRE_MMQ` — Selects behavior from recognized values
 pub const ENV_HIPFIRE_MMQ: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MMQ",
     description: "Selects behavior from recognized values",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:179",
+    source: "crates/rdna-compute/src/feature_flags.rs:179",
 };
 
 /// `HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY` — Runtime variable controlling mmq diag quantize only in hipfire
 pub const ENV_HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY",
     description: "Runtime variable controlling mmq diag quantize only in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:218",
+    source: "crates/rdna-compute/src/feature_flags.rs:218",
 };
 
 /// `HIPFIRE_MMQ_SCREEN` — Runtime variable controlling mmq screen in hipfire
 pub const ENV_HIPFIRE_MMQ_SCREEN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MMQ_SCREEN",
     description: "Runtime variable controlling mmq screen in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:210",
+    source: "crates/rdna-compute/src/feature_flags.rs:210",
 };
 
 /// `HIPFIRE_MMQ_SCREEN_THRESHOLD` — Runtime variable controlling mmq screen threshold in hipfire
 pub const ENV_HIPFIRE_MMQ_SCREEN_THRESHOLD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MMQ_SCREEN_THRESHOLD",
     description: "Runtime variable controlling mmq screen threshold in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:214",
+    source: "crates/rdna-compute/src/feature_flags.rs:214",
 };
 
 /// `HIPFIRE_MODELS_DIR` — Runtime variable controlling models dir in hipfire
 pub const ENV_HIPFIRE_MODELS_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MODELS_DIR",
     description: "Runtime variable controlling models dir in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-eval/src/run.rs:416",
+    source: "crates/hipfire-eval/src/run.rs:416",
 };
 
 /// `HIPFIRE_MOE_GROUPED_GEMM` — Runtime variable controlling moe grouped gemm in hipfire
 pub const ENV_HIPFIRE_MOE_GROUPED_GEMM: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MOE_GROUPED_GEMM",
     description: "Runtime variable controlling moe grouped gemm in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:268",
+    source: "crates/rdna-compute/src/feature_flags.rs:268",
 };
 
 /// `HIPFIRE_MOE_GROUPED_I8` — HIPFIRE_MOE_GROUPED_I8_K8: gfx1151 HFQ4 grouped MoE k8 control;
 pub const ENV_HIPFIRE_MOE_GROUPED_I8: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MOE_GROUPED_I8",
     description: "HIPFIRE_MOE_GROUPED_I8_K8: gfx1151 HFQ4 grouped MoE k8 control;",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:238",
+    source: "crates/rdna-compute/src/feature_flags.rs:238",
 };
 
 /// `HIPFIRE_MOE_GROUPED_I8_4W` — default on for gfx1151, set to 0 to test k4 or base k2 variants
 pub const ENV_HIPFIRE_MOE_GROUPED_I8_4W: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MOE_GROUPED_I8_4W",
     description: "default on for gfx1151, set to 0 to test k4 or base k2 variants",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:243",
+    source: "crates/rdna-compute/src/feature_flags.rs:243",
 };
 
 /// `HIPFIRE_MOE_GROUPED_I8_K4` — HIPFIRE_MOE_GROUPED_I8_K4: opt-in gfx1151 HFQ4 grouped MoE k4
 pub const ENV_HIPFIRE_MOE_GROUPED_I8_K4: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MOE_GROUPED_I8_K4",
     description: "HIPFIRE_MOE_GROUPED_I8_K4: opt-in gfx1151 HFQ4 grouped MoE k4",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:254",
+    source: "crates/rdna-compute/src/feature_flags.rs:254",
 };
 
 /// `HIPFIRE_MOE_GROUPED_I8_K4_GFX12` — HIPFIRE_MOE_HFQ6_V2: opt-in HFQ6 grouped MoE v2 path; on
 pub const ENV_HIPFIRE_MOE_GROUPED_I8_K4_GFX12: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MOE_GROUPED_I8_K4_GFX12",
     description: "HIPFIRE_MOE_HFQ6_V2: opt-in HFQ6 grouped MoE v2 path; on",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:255",
+    source: "crates/rdna-compute/src/feature_flags.rs:255",
 };
 
 /// `HIPFIRE_MOE_GROUPED_I8_K8` — variant; use with HIPFIRE_MOE_GROUPED_I8_K8=0. Default off
 pub const ENV_HIPFIRE_MOE_GROUPED_I8_K8: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MOE_GROUPED_I8_K8",
     description: "variant; use with HIPFIRE_MOE_GROUPED_I8_K8=0. Default off",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:249",
+    source: "crates/rdna-compute/src/feature_flags.rs:249",
 };
 
 /// `HIPFIRE_MOE_GROUPED_M2` — HIPFIRE_MOE_HFQ6_V2: opt-in HFQ6 grouped MoE v2 path; on
 pub const ENV_HIPFIRE_MOE_GROUPED_M2: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MOE_GROUPED_M2",
     description: "HIPFIRE_MOE_HFQ6_V2: opt-in HFQ6 grouped MoE v2 path; on",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:257",
+    source: "crates/rdna-compute/src/feature_flags.rs:257",
 };
 
 /// `HIPFIRE_MOE_HFQ6_4W` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_MOE_HFQ6_4W: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MOE_HFQ6_4W",
     description: "Environment toggle value controls runtime behavior",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:265",
+    source: "crates/rdna-compute/src/feature_flags.rs:265",
 };
 
 /// `HIPFIRE_MOE_HFQ6_V2` — HIPFIRE_MOE_HFQ6_V2: opt-in HFQ6 grouped MoE v2 path; on
 pub const ENV_HIPFIRE_MOE_HFQ6_V2: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MOE_HFQ6_V2",
     description: "HIPFIRE_MOE_HFQ6_V2: opt-in HFQ6 grouped MoE v2 path; on",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:261",
+    source: "crates/rdna-compute/src/feature_flags.rs:261",
 };
 
 /// `HIPFIRE_MOE_INDEXED_2ROW_GFX1151` — Opt-in ("1") gfx1151 two-row indexed MoE HFQ4 decode probe for gate/up and expanded down; default off after flat A3B measurements
 pub const ENV_HIPFIRE_MOE_INDEXED_2ROW_GFX1151: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MOE_INDEXED_2ROW_GFX1151",
     description: "Opt-in (\"1\") gfx1151 two-row indexed MoE HFQ4 decode probe for gate/up and expanded down; default off after flat A3B measurements",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:24719",
+    source: "crates/rdna-compute/src/dispatch.rs:24759",
 };
 
 /// `HIPFIRE_MOE_MQ2L_N32_GFX1151` — Runtime variable controlling moe mq2l n32 gfx1151 in hipfire
 pub const ENV_HIPFIRE_MOE_MQ2L_N32_GFX1151: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MOE_MQ2L_N32_GFX1151",
     description: "Runtime variable controlling moe mq2l n32 gfx1151 in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:14298",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:14377",
 };
 
 /// `HIPFIRE_MOE_PARO_I8` — Runtime variable controlling moe paro i8 in hipfire
 pub const ENV_HIPFIRE_MOE_PARO_I8: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MOE_PARO_I8",
     description: "Runtime variable controlling moe paro i8 in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:15914",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:15993",
 };
 
 /// `HIPFIRE_MOE_PARO_I8_K8` — Runtime variable controlling moe paro i8 k8 in hipfire
 pub const ENV_HIPFIRE_MOE_PARO_I8_K8: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MOE_PARO_I8_K8",
     description: "Runtime variable controlling moe paro i8 k8 in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:15918",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:15997",
 };
 
 /// `HIPFIRE_MQ3_MB4` — Used to configure runtime execution by explicitly setting "HIPFIRE_MQ3_MB4"
 pub const ENV_HIPFIRE_MQ3_MB4: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MQ3_MB4",
     description: "Used to configure runtime execution by explicitly setting \"HIPFIRE_MQ3_MB4\"",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/examples/test_gemm_hfq3g256_wmma.rs:92",
+    source: "crates/rdna-compute/examples/test_gemm_hfq3g256_wmma.rs:92",
 };
 
 /// `HIPFIRE_MTP_DEVICE_TOKEN_CHAIN` — Default on: this path is token-identical in greedy mode and removes the
 pub const ENV_HIPFIRE_MTP_DEVICE_TOKEN_CHAIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MTP_DEVICE_TOKEN_CHAIN",
     description: "Default on: this path is token-identical in greedy mode and removes the",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/mtp_spec.rs:82",
+    source: "crates/hipfire-arch-qwen35/src/mtp_spec.rs:82",
 };
 
 /// `HIPFIRE_MTP_GPU_ACCEPT` — Default on for greedy device-token-chain MTP: candidates and verify
 pub const ENV_HIPFIRE_MTP_GPU_ACCEPT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MTP_GPU_ACCEPT",
     description: "Default on for greedy device-token-chain MTP: candidates and verify",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/mtp_spec.rs:107",
+    source: "crates/hipfire-arch-qwen35/src/mtp_spec.rs:107",
 };
 
 /// `HIPFIRE_MTP_K` — Runtime variable controlling MTP k in hipfire
 pub const ENV_HIPFIRE_MTP_K: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MTP_K",
     description: "Runtime variable controlling MTP k in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/generate_arch.rs:351",
+    source: "crates/hipfire-serving-core/src/generate_arch.rs:352",
 };
 
 /// `HIPFIRE_MTP_MODE` — Defaults to auto when unset
 pub const ENV_HIPFIRE_MTP_MODE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MTP_MODE",
     description: "Defaults to auto when unset",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/generate_arch.rs:342",
+    source: "crates/hipfire-serving-core/src/generate_arch.rs:343",
 };
 
 /// `HIPFIRE_MTP_PHASE_TIMERS` — Env-gated phase timers (HIPFIRE_MTP_PHASE_TIMERS=1). The existing
 pub const ENV_HIPFIRE_MTP_PHASE_TIMERS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MTP_PHASE_TIMERS",
     description: "Env-gated phase timers (HIPFIRE_MTP_PHASE_TIMERS=1). The existing",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/mtp_spec.rs:1321",
+    source: "crates/hipfire-arch-qwen35/src/mtp_spec.rs:1321",
 };
 
 /// `HIPFIRE_MTP_PROPOSAL_GRAPH` — Runtime variable controlling MTP proposal graph in hipfire
 pub const ENV_HIPFIRE_MTP_PROPOSAL_GRAPH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MTP_PROPOSAL_GRAPH",
     description: "Runtime variable controlling MTP proposal graph in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/mtp_spec.rs:160",
+    source: "crates/hipfire-arch-qwen35/src/mtp_spec.rs:160",
 };
 
 /// `HIPFIRE_MTP_Q8_VERIFY_WMMA` — Runtime variable controlling MTP Q8 verify wmma in hipfire
 pub const ENV_HIPFIRE_MTP_Q8_VERIFY_WMMA: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MTP_Q8_VERIFY_WMMA",
     description: "Runtime variable controlling MTP Q8 verify wmma in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/mtp_spec.rs:131",
+    source: "crates/hipfire-arch-qwen35/src/mtp_spec.rs:131",
 };
 
 /// `HIPFIRE_MTP_SMOKE_HEAD` — Runtime variable controlling MTP smoke head in hipfire
 pub const ENV_HIPFIRE_MTP_SMOKE_HEAD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MTP_SMOKE_HEAD",
     description: "Runtime variable controlling MTP smoke head in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/examples/mtp_head_smoke.rs:28",
+    source: "crates/hipfire-arch-qwen35/examples/mtp_head_smoke.rs:28",
 };
 
 /// `HIPFIRE_MTP_SMOKE_TRUNK` — Runtime variable controlling MTP smoke trunk in hipfire
 pub const ENV_HIPFIRE_MTP_SMOKE_TRUNK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MTP_SMOKE_TRUNK",
     description: "Runtime variable controlling MTP smoke trunk in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/examples/mtp_head_smoke.rs:24",
+    source: "crates/hipfire-arch-qwen35/examples/mtp_head_smoke.rs:24",
 };
 
 /// `HIPFIRE_MTP_SNAPSHOT_OVERLAP` — Default off: current gfx1201 benches show this stream split regresses,
 pub const ENV_HIPFIRE_MTP_SNAPSHOT_OVERLAP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MTP_SNAPSHOT_OVERLAP",
     description: "Default off: current gfx1201 benches show this stream split regresses,",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/mtp_spec.rs:94",
+    source: "crates/hipfire-arch-qwen35/src/mtp_spec.rs:94",
 };
 
 /// `HIPFIRE_MW16` — Runtime variable controlling mw16 in hipfire
 pub const ENV_HIPFIRE_MW16: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MW16",
     description: "Runtime variable controlling mw16 in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:279",
+    source: "crates/rdna-compute/src/feature_flags.rs:279",
 };
 
 /// `HIPFIRE_NGRAM_LOOP_THRESHOLD` — Parses "HIPFIRE_NGRAM_LOOP_THRESHOLD" with fallback defaults
 pub const ENV_HIPFIRE_NGRAM_LOOP_THRESHOLD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_NGRAM_LOOP_THRESHOLD",
     description: "Parses \"HIPFIRE_NGRAM_LOOP_THRESHOLD\" with fallback defaults",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:94",
+    source: "crates/hipfire-runtime/src/config.rs:94",
 };
 
 /// `HIPFIRE_NGRAM_WINDOW` — Runtime variable controlling ngram window in hipfire
 pub const ENV_HIPFIRE_NGRAM_WINDOW: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_NGRAM_WINDOW",
     description: "Runtime variable controlling ngram window in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:98",
+    source: "crates/hipfire-runtime/src/config.rs:98",
 };
 
 /// `HIPFIRE_NORMALIZE_PROMPT` — Opt-out must skip CRLF/NBSP/trailing-ws too, not just newline collapse
 pub const ENV_HIPFIRE_NORMALIZE_PROMPT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_NORMALIZE_PROMPT",
     description: "Opt-out must skip CRLF/NBSP/trailing-ws too, not just newline collapse",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/output_filter.rs:30",
+    source: "crates/hipfire-serving-core/src/output_filter.rs:30",
 };
 
 /// `HIPFIRE_NPU_ATTN_GATE_CONFIGS` — Runtime variable controlling npu attn gate configs in hipfire
 pub const ENV_HIPFIRE_NPU_ATTN_GATE_CONFIGS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_NPU_ATTN_GATE_CONFIGS",
     description: "Runtime variable controlling npu attn gate configs in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/build.rs:193",
+    source: "crates/hipfire-arch-qwen35/build.rs:193",
 };
 
 /// `HIPFIRE_NPU_DIR` — Defaults to target/npu when unset
 pub const ENV_HIPFIRE_NPU_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_NPU_DIR",
     description: "Defaults to target/npu when unset",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:2053",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:2055",
 };
 
 /// `HIPFIRE_NPU_HEADNORM_CONFIGS` — Parse "n_heads:n_kv_heads:head_dim" tuples (n_rot field ignored if present)
 pub const ENV_HIPFIRE_NPU_HEADNORM_CONFIGS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_NPU_HEADNORM_CONFIGS",
     description: "Parse \"n_heads:n_kv_heads:head_dim\" tuples (n_rot field ignored if present)",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/build.rs:156",
+    source: "crates/hipfire-arch-qwen35/build.rs:156",
 };
 
 /// `HIPFIRE_NPU_HEADNORM_ROPE_CONFIGS` — Runtime variable controlling npu headnorm rope configs in hipfire
 pub const ENV_HIPFIRE_NPU_HEADNORM_ROPE_CONFIGS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_NPU_HEADNORM_ROPE_CONFIGS",
     description: "Runtime variable controlling npu headnorm rope configs in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/build.rs:277",
+    source: "crates/hipfire-arch-qwen35/build.rs:277",
 };
 
 /// `HIPFIRE_NPU_HIDDEN_SIZES` — Runtime variable controlling npu hidden sizes in hipfire
 pub const ENV_HIPFIRE_NPU_HIDDEN_SIZES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_NPU_HIDDEN_SIZES",
     description: "Runtime variable controlling npu hidden sizes in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/build.rs:54",
+    source: "crates/hipfire-arch-qwen35/build.rs:54",
 };
 
 /// `HIPFIRE_NPU_PYTHON` — Runtime variable controlling npu python in hipfire
 pub const ENV_HIPFIRE_NPU_PYTHON: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_NPU_PYTHON",
     description: "Runtime variable controlling npu python in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/build.rs:600",
+    source: "crates/hipfire-arch-qwen35/build.rs:600",
 };
 
 /// `HIPFIRE_NPU_RMSNORM_SIZES` — Runtime variable controlling npu rmsnorm sizes in hipfire
 pub const ENV_HIPFIRE_NPU_RMSNORM_SIZES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_NPU_RMSNORM_SIZES",
     description: "Runtime variable controlling npu rmsnorm sizes in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/build.rs:89",
+    source: "crates/hipfire-arch-qwen35/build.rs:89",
 };
 
 /// `HIPFIRE_NPU_ROPE_CONFIGS` — Parse "n_heads:n_kv_heads:head_dim:n_rot" tuples
 pub const ENV_HIPFIRE_NPU_ROPE_CONFIGS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_NPU_ROPE_CONFIGS",
     description: "Parse \"n_heads:n_kv_heads:head_dim:n_rot\" tuples",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/build.rs:118",
+    source: "crates/hipfire-arch-qwen35/build.rs:118",
 };
 
 /// `HIPFIRE_NPU_SOFTMAX_CONFIGS` — Parse "n_heads:ctx_len1+ctx_len2+..." entries
 pub const ENV_HIPFIRE_NPU_SOFTMAX_CONFIGS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_NPU_SOFTMAX_CONFIGS",
     description: "Parse \"n_heads:ctx_len1+ctx_len2+...\" entries",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/build.rs:232",
+    source: "crates/hipfire-arch-qwen35/build.rs:232",
 };
 
 /// `HIPFIRE_NPU_TARGETS` — Runtime variable controlling npu targets in hipfire
 pub const ENV_HIPFIRE_NPU_TARGETS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_NPU_TARGETS",
     description: "Runtime variable controlling npu targets in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/build.rs:60",
+    source: "crates/hipfire-arch-qwen35/build.rs:60",
+};
+
+/// `HIPFIRE_OQ4_TRACE` — Runtime variable controlling oQ4 trace in hipfire
+pub const ENV_HIPFIRE_OQ4_TRACE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_OQ4_TRACE",
+    description: "Runtime variable controlling oQ4 trace in hipfire",
+    source: "crates/hipfire-runtime/src/weights.rs:382",
 };
 
 /// `HIPFIRE_PAGED_MOE_DEBUG` — Enabled when set to 1
 pub const ENV_HIPFIRE_PAGED_MOE_DEBUG: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PAGED_MOE_DEBUG",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:7435",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:7492",
 };
 
 /// `HIPFIRE_PARO_BATCHED` — Runtime variable controlling paro batched in hipfire
 pub const ENV_HIPFIRE_PARO_BATCHED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_BATCHED",
     description: "Runtime variable controlling paro batched in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:14226",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:14305",
 };
 
 /// `HIPFIRE_PARO_FA3_FUSED` — Runtime variable controlling paro fa3 fused in hipfire
 pub const ENV_HIPFIRE_PARO_FA3_FUSED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_FA3_FUSED",
     description: "Runtime variable controlling paro fa3 fused in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:28564",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:28663",
 };
 
 /// `HIPFIRE_PARO_FUSED_PACK2` — Runtime variable controlling paro fused pack2 in hipfire
 pub const ENV_HIPFIRE_PARO_FUSED_PACK2: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_FUSED_PACK2",
     description: "Runtime variable controlling paro fused pack2 in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:5002",
+    source: "crates/rdna-compute/src/dispatch.rs:5026",
 };
 
 /// `HIPFIRE_PARO_FUSE_RMSNORM` — time per call. Net loss on every site. Default OFF; explicit opt-in for
 pub const ENV_HIPFIRE_PARO_FUSE_RMSNORM: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_FUSE_RMSNORM",
     description: "time per call. Net loss on every site. Default OFF; explicit opt-in for",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/llama.rs:1030",
+    source: "crates/hipfire-runtime/src/weights.rs:495",
 };
 
 /// `HIPFIRE_PARO_GATE_UP_FUSED` — Runtime variable controlling paro gate up fused in hipfire
 pub const ENV_HIPFIRE_PARO_GATE_UP_FUSED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_GATE_UP_FUSED",
     description: "Runtime variable controlling paro gate up fused in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:28162",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:28261",
 };
 
 /// `HIPFIRE_PARO_LA2_FUSED` — Runtime variable controlling paro la2 fused in hipfire
 pub const ENV_HIPFIRE_PARO_LA2_FUSED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_LA2_FUSED",
     description: "Runtime variable controlling paro la2 fused in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:28264",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:28363",
 };
 
 /// `HIPFIRE_PARO_LA4_FUSED` — Runtime variable controlling paro la4 fused in hipfire
 pub const ENV_HIPFIRE_PARO_LA4_FUSED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_LA4_FUSED",
     description: "Runtime variable controlling paro la4 fused in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:28260",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:28359",
 };
 
 /// `HIPFIRE_PARO_LA_GATES_MQ4G128` — Used to configure runtime execution by explicitly setting "HIPFIRE_PARO_LA_GATES_MQ4G128"
 pub const ENV_HIPFIRE_PARO_LA_GATES_MQ4G128: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_LA_GATES_MQ4G128",
     description: "Used to configure runtime execution by explicitly setting \"HIPFIRE_PARO_LA_GATES_MQ4G128\"",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/paro_la_gates_codec.rs:325",
+    source: "crates/hipfire-arch-qwen35/src/paro_la_gates_codec.rs:325",
 };
 
 /// `HIPFIRE_PARO_PACK1` — Runtime variable controlling paro pack1 in hipfire
 pub const ENV_HIPFIRE_PARO_PACK1: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_PACK1",
     description: "Runtime variable controlling paro pack1 in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:4791",
+    source: "crates/rdna-compute/src/dispatch.rs:4815",
 };
 
 /// `HIPFIRE_PARO_PACK2` — Runtime variable controlling paro pack2 in hipfire
 pub const ENV_HIPFIRE_PARO_PACK2: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_PACK2",
     description: "Runtime variable controlling paro pack2 in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:4794",
+    source: "crates/rdna-compute/src/dispatch.rs:4818",
 };
 
 /// `HIPFIRE_PARO_PACK4` — Runtime variable controlling paro pack4 in hipfire
 pub const ENV_HIPFIRE_PARO_PACK4: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_PACK4",
     description: "Runtime variable controlling paro pack4 in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:4797",
+    source: "crates/rdna-compute/src/dispatch.rs:4821",
 };
 
 /// `HIPFIRE_PARO_PREROTATE` — Runtime variable controlling paro prerotate in hipfire
 pub const ENV_HIPFIRE_PARO_PREROTATE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_PREROTATE",
     description: "Runtime variable controlling paro prerotate in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/llama.rs:1583",
+    source: "crates/hipfire-runtime/src/weights.rs:1048",
 };
 
 /// `HIPFIRE_PARO_SHARED_PAIRS` — Runtime variable controlling paro shared pairs in hipfire
 pub const ENV_HIPFIRE_PARO_SHARED_PAIRS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_SHARED_PAIRS",
     description: "Runtime variable controlling paro shared pairs in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:4996",
+    source: "crates/rdna-compute/src/dispatch.rs:5020",
 };
 
 /// `HIPFIRE_PARO_SWIGLU_FUSED` — Runtime variable controlling paro swiglu fused in hipfire
 pub const ENV_HIPFIRE_PARO_SWIGLU_FUSED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_SWIGLU_FUSED",
     description: "Runtime variable controlling paro swiglu fused in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/llama.rs:1600",
+    source: "crates/hipfire-runtime/src/weights.rs:1065",
 };
 
 /// `HIPFIRE_PERF_BASELINE` — Runtime variable controlling perf baseline in hipfire
 pub const ENV_HIPFIRE_PERF_BASELINE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PERF_BASELINE",
     description: "Runtime variable controlling perf baseline in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-eval/src/executor_examples.rs:1158",
+    source: "crates/hipfire-eval/src/executor_examples.rs:1158",
 };
 
 /// `HIPFIRE_PERF_BASELINE_DIR` — Runtime variable controlling perf baseline dir in hipfire
 pub const ENV_HIPFIRE_PERF_BASELINE_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PERF_BASELINE_DIR",
     description: "Runtime variable controlling perf baseline dir in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-eval/src/executor_examples.rs:1171",
+    source: "crates/hipfire-eval/src/executor_examples.rs:1171",
 };
 
 /// `HIPFIRE_PERPLEXITY_BIN` — Runtime variable controlling perplexity bin in hipfire
 pub const ENV_HIPFIRE_PERPLEXITY_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PERPLEXITY_BIN",
     description: "Runtime variable controlling perplexity bin in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-eval/src/lib.rs:971",
+    source: "crates/hipfire-eval/src/lib.rs:971",
 };
 
 /// `HIPFIRE_PFLASH_DAEMON_LABELS` — Runtime variable controlling pflash daemon labels in hipfire
 pub const ENV_HIPFIRE_PFLASH_DAEMON_LABELS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PFLASH_DAEMON_LABELS",
     description: "Runtime variable controlling pflash daemon labels in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-train/examples/ssm_drafter_train.rs:40",
+    source: "crates/hipfire-train/examples/ssm_drafter_train.rs:40",
 };
 
 /// `HIPFIRE_PFLASH_DEBUG` — Runtime variable controlling pflash debug in hipfire
 pub const ENV_HIPFIRE_PFLASH_DEBUG: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PFLASH_DEBUG",
     description: "Runtime variable controlling pflash debug in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/generate.rs:2284",
+    source: "crates/hipfire-serving-core/src/generate.rs:2314",
 };
 
 /// `HIPFIRE_PFLASH_DRAFTER_KV` — Selects behavior from recognized values
 pub const ENV_HIPFIRE_PFLASH_DRAFTER_KV: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PFLASH_DRAFTER_KV",
     description: "Selects behavior from recognized values",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:533",
+    source: "crates/hipfire-arch-qwen35/src/pflash.rs:534",
 };
 
 /// `HIPFIRE_PFLASH_DRAFTER_STATE` — Hybrid drafter only stores K (and V for chat-path) at
 pub const ENV_HIPFIRE_PFLASH_DRAFTER_STATE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PFLASH_DRAFTER_STATE",
     description: "Hybrid drafter only stores K (and V for chat-path) at",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:620",
+    source: "crates/hipfire-arch-qwen35/src/pflash.rs:621",
 };
 
 /// `HIPFIRE_PFLASH_FRESH` — resume: reload weights + AdamW state from the checkpoint unless FRESH=1
 pub const ENV_HIPFIRE_PFLASH_FRESH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PFLASH_FRESH",
     description: "resume: reload weights + AdamW state from the checkpoint unless FRESH=1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-train/examples/pflash_drafter_train.rs:259",
+    source: "crates/hipfire-train/examples/pflash_drafter_train.rs:259",
 };
 
 /// `HIPFIRE_PFLASH_NIAH_BENCH_BIN` — Runtime variable controlling pflash niah bench bin in hipfire
 pub const ENV_HIPFIRE_PFLASH_NIAH_BENCH_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PFLASH_NIAH_BENCH_BIN",
     description: "Runtime variable controlling pflash niah bench bin in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-eval/src/lib.rs:926",
+    source: "crates/hipfire-eval/src/lib.rs:926",
 };
 
 /// `HIPFIRE_PFLASH_REPORT_TRAIN` — Runtime variable controlling pflash report train in hipfire
 pub const ENV_HIPFIRE_PFLASH_REPORT_TRAIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PFLASH_REPORT_TRAIN",
     description: "Runtime variable controlling pflash report train in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-train/examples/ssm_drafter_train.rs:71",
+    source: "crates/hipfire-train/examples/ssm_drafter_train.rs:71",
 };
 
 /// `HIPFIRE_PFLASH_SCORE_LAYER` — Parses "HIPFIRE_PFLASH_SCORE_LAYER" with fallback defaults
 pub const ENV_HIPFIRE_PFLASH_SCORE_LAYER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PFLASH_SCORE_LAYER",
     description: "Parses \"HIPFIRE_PFLASH_SCORE_LAYER\" with fallback defaults",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:1081",
+    source: "crates/hipfire-arch-qwen35/src/pflash.rs:1082",
 };
 
 /// `HIPFIRE_PP_DFLASH` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_PP_DFLASH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PP_DFLASH",
     description: "Environment toggle value controls runtime behavior",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:2649",
+    source: "crates/hipfire-daemon/src/main.rs:2654",
 };
 
 /// `HIPFIRE_PP_LAYERS` — Runtime variable controlling pp layers in hipfire
 pub const ENV_HIPFIRE_PP_LAYERS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PP_LAYERS",
     description: "Runtime variable controlling pp layers in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/load.rs:1815",
+    source: "crates/hipfire-serving-core/src/load.rs:1963",
 };
 
 /// `HIPFIRE_PP_PARITY_MODEL` — Runtime variable controlling pp parity model in hipfire
 pub const ENV_HIPFIRE_PP_PARITY_MODEL: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PP_PARITY_MODEL",
     description: "Runtime variable controlling pp parity model in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/tests/pp_parity.rs:197",
+    source: "crates/hipfire-arch-qwen35/tests/pp_parity.rs:197",
 };
 
 /// `HIPFIRE_PP_PFLASH` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_PP_PFLASH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PP_PFLASH",
     description: "Environment toggle value controls runtime behavior",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:2667",
+    source: "crates/hipfire-daemon/src/main.rs:2672",
 };
 
 /// `HIPFIRE_PREFILL_ALPHA` — Runtime variable controlling prefill alpha in hipfire
 pub const ENV_HIPFIRE_PREFILL_ALPHA: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PREFILL_ALPHA",
     description: "Runtime variable controlling prefill alpha in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:124",
+    source: "crates/hipfire-arch-qwen35/src/pflash.rs:125",
 };
 
 /// `HIPFIRE_PREFILL_BATCHED` — Enabled by default; set to 0 to disable
 pub const ENV_HIPFIRE_PREFILL_BATCHED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PREFILL_BATCHED",
     description: "Enabled by default; set to 0 to disable",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:86",
+    source: "crates/hipfire-runtime/src/config.rs:86",
 };
 
 /// `HIPFIRE_PREFILL_BLOCK` — Runtime variable controlling prefill block in hipfire
 pub const ENV_HIPFIRE_PREFILL_BLOCK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PREFILL_BLOCK",
     description: "Runtime variable controlling prefill block in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:144",
+    source: "crates/hipfire-arch-qwen35/src/pflash.rs:145",
 };
 
 /// `HIPFIRE_PREFILL_COMPRESSION` — Runtime variable controlling prefill compression in hipfire
 pub const ENV_HIPFIRE_PREFILL_COMPRESSION: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PREFILL_COMPRESSION",
     description: "Runtime variable controlling prefill compression in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:104",
+    source: "crates/hipfire-arch-qwen35/src/pflash.rs:105",
 };
 
 /// `HIPFIRE_PREFILL_DRAFTER` — Runtime variable controlling prefill drafter in hipfire
 pub const ENV_HIPFIRE_PREFILL_DRAFTER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PREFILL_DRAFTER",
     description: "Runtime variable controlling prefill drafter in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:157",
+    source: "crates/hipfire-arch-qwen35/src/pflash.rs:158",
 };
 
 /// `HIPFIRE_PREFILL_KEEP_RATIO` — Runtime variable controlling prefill keep ratio in hipfire
 pub const ENV_HIPFIRE_PREFILL_KEEP_RATIO: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PREFILL_KEEP_RATIO",
     description: "Runtime variable controlling prefill keep ratio in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:114",
+    source: "crates/hipfire-arch-qwen35/src/pflash.rs:115",
 };
 
 /// `HIPFIRE_PREFILL_MAX_BATCH` — Runtime variable controlling prefill max batch in hipfire
 pub const ENV_HIPFIRE_PREFILL_MAX_BATCH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PREFILL_MAX_BATCH",
     description: "Runtime variable controlling prefill max batch in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/qwen35_prefill.rs:1347",
+    source: "crates/hipfire-serving-core/src/qwen35_prefill.rs:1347",
 };
 
 /// `HIPFIRE_PREFILL_MAX_LAYER` — Runtime variable controlling prefill max layer in hipfire
 pub const ENV_HIPFIRE_PREFILL_MAX_LAYER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PREFILL_MAX_LAYER",
     description: "Runtime variable controlling prefill max layer in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:13078",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:13141",
 };
 
 /// `HIPFIRE_PREFILL_MIN_KEEP` — Runtime variable controlling prefill min keep in hipfire
 pub const ENV_HIPFIRE_PREFILL_MIN_KEEP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PREFILL_MIN_KEEP",
     description: "Runtime variable controlling prefill min keep in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:129",
+    source: "crates/hipfire-arch-qwen35/src/pflash.rs:130",
 };
 
 /// `HIPFIRE_PREFILL_PROFILE` — Enabled when set to 1
 pub const ENV_HIPFIRE_PREFILL_PROFILE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PREFILL_PROFILE",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:154",
+    source: "crates/hipfire-arch-qwen35/src/pflash.rs:155",
 };
 
 /// `HIPFIRE_PREFILL_RECENT` — Runtime variable controlling prefill recent in hipfire
 pub const ENV_HIPFIRE_PREFILL_RECENT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PREFILL_RECENT",
     description: "Runtime variable controlling prefill recent in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:139",
+    source: "crates/hipfire-arch-qwen35/src/pflash.rs:140",
 };
 
 /// `HIPFIRE_PREFILL_REUSE_PBS` — Used to configure runtime execution by explicitly setting "HIPFIRE_PREFILL_REUSE_PBS"
 pub const ENV_HIPFIRE_PREFILL_REUSE_PBS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PREFILL_REUSE_PBS",
-    description: "Used to configure runtime execution by explicitly setting \"HIPFIRE_PREFILL_REUSE_PBS\"",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/prefill_microbench.rs:126",
+    description:
+        "Used to configure runtime execution by explicitly setting \"HIPFIRE_PREFILL_REUSE_PBS\"",
+    source: "crates/hipfire-runtime/examples/prefill_microbench.rs:126",
 };
 
 /// `HIPFIRE_PREFILL_SINK` — Runtime variable controlling prefill sink in hipfire
 pub const ENV_HIPFIRE_PREFILL_SINK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PREFILL_SINK",
     description: "Runtime variable controlling prefill sink in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:134",
+    source: "crates/hipfire-arch-qwen35/src/pflash.rs:135",
 };
 
 /// `HIPFIRE_PREFILL_SPARSE_THRESHOLD` — Runtime variable controlling prefill sparse threshold in hipfire
 pub const ENV_HIPFIRE_PREFILL_SPARSE_THRESHOLD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PREFILL_SPARSE_THRESHOLD",
     description: "Runtime variable controlling prefill sparse threshold in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:149",
+    source: "crates/hipfire-arch-qwen35/src/pflash.rs:150",
 };
 
 /// `HIPFIRE_PREFILL_STOP_AFTER_LA_LAYER` — Parses "HIPFIRE_PREFILL_STOP_AFTER_LA_LAYER" with fallback defaults
 pub const ENV_HIPFIRE_PREFILL_STOP_AFTER_LA_LAYER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PREFILL_STOP_AFTER_LA_LAYER",
     description: "Parses \"HIPFIRE_PREFILL_STOP_AFTER_LA_LAYER\" with fallback defaults",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:16324",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:16403",
 };
 
 /// `HIPFIRE_PREFILL_STOP_STAGE` — Runtime variable controlling prefill stop stage in hipfire
 pub const ENV_HIPFIRE_PREFILL_STOP_STAGE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PREFILL_STOP_STAGE",
     description: "Runtime variable controlling prefill stop stage in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:16330",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:16409",
 };
 
 /// `HIPFIRE_PREFILL_STOP_STAGE_LAYER` — Parses "HIPFIRE_PREFILL_STOP_STAGE_LAYER" with fallback defaults
 pub const ENV_HIPFIRE_PREFILL_STOP_STAGE_LAYER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PREFILL_STOP_STAGE_LAYER",
     description: "Parses \"HIPFIRE_PREFILL_STOP_STAGE_LAYER\" with fallback defaults",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:16327",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:16406",
 };
 
 /// `HIPFIRE_PREFILL_THRESHOLD` — Runtime variable controlling prefill threshold in hipfire
 pub const ENV_HIPFIRE_PREFILL_THRESHOLD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PREFILL_THRESHOLD",
     description: "Runtime variable controlling prefill threshold in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:109",
+    source: "crates/hipfire-arch-qwen35/src/pflash.rs:110",
 };
 
 /// `HIPFIRE_PREFIX_BOUNDARY_CHECKPOINTS` — Interprets "HIPFIRE_PREFIX_BOUNDARY_CHECKPOINTS" from environment to select behavior
 pub const ENV_HIPFIRE_PREFIX_BOUNDARY_CHECKPOINTS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PREFIX_BOUNDARY_CHECKPOINTS",
-    description: "Interprets \"HIPFIRE_PREFIX_BOUNDARY_CHECKPOINTS\" from environment to select behavior",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/qwen35_prefill.rs:413",
+    description:
+        "Interprets \"HIPFIRE_PREFIX_BOUNDARY_CHECKPOINTS\" from environment to select behavior",
+    source: "crates/hipfire-serving-core/src/qwen35_prefill.rs:413",
 };
 
 /// `HIPFIRE_PROFILE` — HIPFIRE_PROFILE=1 + HIPFIRE_PROFILE_CYCLES=N: per-kernel profiling
 pub const ENV_HIPFIRE_PROFILE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PROFILE",
     description: "HIPFIRE_PROFILE=1 + HIPFIRE_PROFILE_CYCLES=N: per-kernel profiling",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/mtp_only_demo.rs:495",
+    source: "crates/hipfire-runtime/examples/mtp_only_demo.rs:495",
 };
 
 /// `HIPFIRE_PROFILE_CYCLES` — Runtime variable controlling profile cycles in hipfire
 pub const ENV_HIPFIRE_PROFILE_CYCLES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PROFILE_CYCLES",
     description: "Runtime variable controlling profile cycles in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/mtp_only_demo.rs:496",
+    source: "crates/hipfire-runtime/examples/mtp_only_demo.rs:496",
 };
 
 /// `HIPFIRE_PROFILE_DECODE` — Enabled when set to 1
 pub const ENV_HIPFIRE_PROFILE_DECODE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PROFILE_DECODE",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/bench_qwen35_speed.rs:559",
+    source: "crates/hipfire-runtime/examples/bench_qwen35_speed.rs:559",
 };
 
 /// `HIPFIRE_PROMPT_HEAT_JSON` — Enabled when set to 1
 pub const ENV_HIPFIRE_PROMPT_HEAT_JSON: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PROMPT_HEAT_JSON",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:62",
+    source: "crates/hipfire-runtime/src/config.rs:62",
 };
 
 /// `HIPFIRE_PROMPT_HEAT_LIMIT` — Runtime variable controlling prompt heat limit in hipfire
 pub const ENV_HIPFIRE_PROMPT_HEAT_LIMIT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PROMPT_HEAT_LIMIT",
     description: "Runtime variable controlling prompt heat limit in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:63",
+    source: "crates/hipfire-runtime/src/config.rs:63",
 };
 
 /// `HIPFIRE_PROMPT_TOKEN_HEAT` — Enabled when set to 1
 pub const ENV_HIPFIRE_PROMPT_TOKEN_HEAT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PROMPT_TOKEN_HEAT",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:60",
+    source: "crates/hipfire-runtime/src/config.rs:60",
 };
 
 /// `HIPFIRE_PYTHON` — Python interpreter used by the no-GPU CI shell gate for Python tooling and tests
 pub const ENV_HIPFIRE_PYTHON: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PYTHON",
     description: "Python interpreter used by the no-GPU CI shell gate for Python tooling and tests",
-    source: "/home/sadara/.hipfire/src/.github/CONTRIBUTING.md:86",
+    source: ".github/CONTRIBUTING.md:86",
 };
 
 /// `HIPFIRE_Q8_BATCHED_LEGACY` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_Q8_BATCHED_LEGACY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_Q8_BATCHED_LEGACY",
     description: "Environment toggle value controls runtime behavior",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:280",
+    source: "crates/rdna-compute/src/feature_flags.rs:280",
 };
 
 /// `HIPFIRE_Q8_FA_ATTENTION_IGNORE_TREE_BIAS` — Interprets "HIPFIRE_Q8_FA_ATTENTION_IGNORE_TREE_BIAS" from environment to select behavior
 pub const ENV_HIPFIRE_Q8_FA_ATTENTION_IGNORE_TREE_BIAS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_Q8_FA_ATTENTION_IGNORE_TREE_BIAS",
     description: "Interprets \"HIPFIRE_Q8_FA_ATTENTION_IGNORE_TREE_BIAS\" from environment to select behavior",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:12445",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:12508",
 };
 
 /// `HIPFIRE_Q8_FA_ATTENTION_ROW_LOOP` — Interprets "HIPFIRE_Q8_FA_ATTENTION_ROW_LOOP" from environment to select behavior
 pub const ENV_HIPFIRE_Q8_FA_ATTENTION_ROW_LOOP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_Q8_FA_ATTENTION_ROW_LOOP",
-    description: "Interprets \"HIPFIRE_Q8_FA_ATTENTION_ROW_LOOP\" from environment to select behavior",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:12409",
+    description:
+        "Interprets \"HIPFIRE_Q8_FA_ATTENTION_ROW_LOOP\" from environment to select behavior",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:12472",
 };
 
 /// `HIPFIRE_Q8_FA_ATTENTION_SCALAR_LOOP` — Interprets "HIPFIRE_Q8_FA_ATTENTION_SCALAR_LOOP" from environment to select behavior
 pub const ENV_HIPFIRE_Q8_FA_ATTENTION_SCALAR_LOOP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_Q8_FA_ATTENTION_SCALAR_LOOP",
-    description: "Interprets \"HIPFIRE_Q8_FA_ATTENTION_SCALAR_LOOP\" from environment to select behavior",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:12421",
+    description:
+        "Interprets \"HIPFIRE_Q8_FA_ATTENTION_SCALAR_LOOP\" from environment to select behavior",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:12484",
 };
 
 /// `HIPFIRE_Q8_FA_ATTENTION_SERIAL_KV_LOOP` — Interprets "HIPFIRE_Q8_FA_ATTENTION_SERIAL_KV_LOOP" from environment to select behavior
 pub const ENV_HIPFIRE_Q8_FA_ATTENTION_SERIAL_KV_LOOP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_Q8_FA_ATTENTION_SERIAL_KV_LOOP",
-    description: "Interprets \"HIPFIRE_Q8_FA_ATTENTION_SERIAL_KV_LOOP\" from environment to select behavior",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:12433",
+    description:
+        "Interprets \"HIPFIRE_Q8_FA_ATTENTION_SERIAL_KV_LOOP\" from environment to select behavior",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:12496",
 };
 
 /// `HIPFIRE_Q8_GATE_UP_4W` — Disabled when set to 0
 pub const ENV_HIPFIRE_Q8_GATE_UP_4W: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_Q8_GATE_UP_4W",
     description: "Disabled when set to 0",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/examples/test_gemm_q8_gate_up_wmma.rs:130",
+    source: "crates/rdna-compute/examples/test_gemm_q8_gate_up_wmma.rs:130",
 };
 
 /// `HIPFIRE_Q8_GATE_UP_BENCH` — Enabled when set to 1
 pub const ENV_HIPFIRE_Q8_GATE_UP_BENCH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_Q8_GATE_UP_BENCH",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/examples/test_gemm_q8_gate_up_wmma.rs:129",
+    source: "crates/rdna-compute/examples/test_gemm_q8_gate_up_wmma.rs:129",
 };
 
 /// `HIPFIRE_Q8_GDN_VERIFY_PER_TOKEN` — Interprets "HIPFIRE_Q8_GDN_VERIFY_PER_TOKEN" from environment to select behavior
 pub const ENV_HIPFIRE_Q8_GDN_VERIFY_PER_TOKEN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_Q8_GDN_VERIFY_PER_TOKEN",
-    description: "Interprets \"HIPFIRE_Q8_GDN_VERIFY_PER_TOKEN\" from environment to select behavior",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:12457",
+    description:
+        "Interprets \"HIPFIRE_Q8_GDN_VERIFY_PER_TOKEN\" from environment to select behavior",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:12520",
 };
 
 /// `HIPFIRE_Q8_GDN_VERIFY_SERIAL_FRAMES` — Interprets "HIPFIRE_Q8_GDN_VERIFY_SERIAL_FRAMES" from environment to select behavior
 pub const ENV_HIPFIRE_Q8_GDN_VERIFY_SERIAL_FRAMES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_Q8_GDN_VERIFY_SERIAL_FRAMES",
-    description: "Interprets \"HIPFIRE_Q8_GDN_VERIFY_SERIAL_FRAMES\" from environment to select behavior",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:12469",
+    description:
+        "Interprets \"HIPFIRE_Q8_GDN_VERIFY_SERIAL_FRAMES\" from environment to select behavior",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:12532",
 };
 
 /// `HIPFIRE_Q8_WMMA_4W` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_Q8_WMMA_4W: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_Q8_WMMA_4W",
     description: "Environment toggle value controls runtime behavior",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:29158",
+    source: "crates/rdna-compute/src/dispatch.rs:29198",
 };
 
 /// `HIPFIRE_Q8_WMMA_X64` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_Q8_WMMA_X64: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_Q8_WMMA_X64",
     description: "Environment toggle value controls runtime behavior",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:28969",
+    source: "crates/rdna-compute/src/dispatch.rs:29009",
 };
 
 /// `HIPFIRE_QA_KV_MODES` — Defaults to q8,asym4,asym3,asym2 when unset
 pub const ENV_HIPFIRE_QA_KV_MODES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QA_KV_MODES",
     description: "Defaults to q8,asym4,asym3,asym2 when unset",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/test_inferenceQA.rs:761",
+    source: "crates/hipfire-runtime/examples/test_inferenceQA.rs:762",
 };
 
 /// `HIPFIRE_QTIP_EVAL_ST` — Selects behavior from recognized values
 pub const ENV_HIPFIRE_QTIP_EVAL_ST: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QTIP_EVAL_ST",
     description: "Selects behavior from recognized values",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/qtip.rs:749",
+    source: "crates/hipfire-quantize/src/qtip.rs:749",
 };
 
 /// `HIPFIRE_QTIP_HESSIAN` — Runtime variable controlling qtip hessian in hipfire
 pub const ENV_HIPFIRE_QTIP_HESSIAN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QTIP_HESSIAN",
     description: "Runtime variable controlling qtip hessian in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:4716",
+    source: "crates/hipfire-quantize/src/main.rs:4785",
 };
 
 /// `HIPFIRE_QUANT_DIAG_PATH` — Runtime variable controlling quant diag path in hipfire
 pub const ENV_HIPFIRE_QUANT_DIAG_PATH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QUANT_DIAG_PATH",
     description: "Runtime variable controlling quant diag path in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:11038",
+    source: "crates/hipfire-quantize/src/main.rs:11107",
 };
 
 /// `HIPFIRE_QUANT_THREADS` — Runtime variable controlling quant threads in hipfire
 pub const ENV_HIPFIRE_QUANT_THREADS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QUANT_THREADS",
     description: "Runtime variable controlling quant threads in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:4517",
+    source: "crates/hipfire-quantize/src/main.rs:4586",
 };
 
 /// `HIPFIRE_QWEN35_DECODE_BATCH` — Defaults to auto when unset
 pub const ENV_HIPFIRE_QWEN35_DECODE_BATCH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_DECODE_BATCH",
     description: "Defaults to auto when unset",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/qwen35_decode.rs:348",
+    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:348",
 };
 
 /// `HIPFIRE_QWEN35_DECODE_BATCH_MAX` — Runtime variable controlling qwen35 decode batch max in hipfire
 pub const ENV_HIPFIRE_QWEN35_DECODE_BATCH_MAX: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_DECODE_BATCH_MAX",
     description: "Runtime variable controlling qwen35 decode batch max in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/qwen35_decode.rs:462",
+    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:462",
 };
 
 /// `HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY` — Interprets "HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY" from environment to select behavior
 pub const ENV_HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY",
-    description: "Interprets \"HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY\" from environment to select behavior",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/qwen35_decode.rs:484",
+    description:
+        "Interprets \"HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY\" from environment to select behavior",
+    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:484",
 };
 
 /// `HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW` — Interprets "HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW" from environment to select behavior
 pub const ENV_HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW",
-    description: "Interprets \"HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW\" from environment to select behavior",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/qwen35_decode.rs:473",
+    description:
+        "Interprets \"HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW\" from environment to select behavior",
+    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:473",
 };
 
 /// `HIPFIRE_QWEN35_EXPERT_CACHE_MB` — Parses "HIPFIRE_QWEN35_EXPERT_CACHE_MB" with fallback defaults
 pub const ENV_HIPFIRE_QWEN35_EXPERT_CACHE_MB: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_EXPERT_CACHE_MB",
     description: "Parses \"HIPFIRE_QWEN35_EXPERT_CACHE_MB\" with fallback defaults",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:699",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:701",
 };
 
 /// `HIPFIRE_QWEN35_EXPERT_CACHE_TRACE` — Interprets "HIPFIRE_QWEN35_EXPERT_CACHE_TRACE" from environment to select behavior
 pub const ENV_HIPFIRE_QWEN35_EXPERT_CACHE_TRACE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_EXPERT_CACHE_TRACE",
-    description: "Interprets \"HIPFIRE_QWEN35_EXPERT_CACHE_TRACE\" from environment to select behavior",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:5175",
+    description:
+        "Interprets \"HIPFIRE_QWEN35_EXPERT_CACHE_TRACE\" from environment to select behavior",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:5232",
 };
 
 /// `HIPFIRE_QWEN35_FFN_BF16` — Selects behavior from recognized values
 pub const ENV_HIPFIRE_QWEN35_FFN_BF16: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_FFN_BF16",
     description: "Selects behavior from recognized values",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/ffn_bf16.rs:57",
+    source: "crates/hipfire-arch-qwen35/src/ffn_bf16.rs:57",
 };
 
 /// `HIPFIRE_QWEN35_FFN_BF16_LAYER` — Selects behavior from recognized values
 pub const ENV_HIPFIRE_QWEN35_FFN_BF16_LAYER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_FFN_BF16_LAYER",
     description: "Selects behavior from recognized values",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/ffn_bf16.rs:71",
+    source: "crates/hipfire-arch-qwen35/src/ffn_bf16.rs:71",
 };
 
 /// `HIPFIRE_QWEN35_FFN_BF16_TRACE` — Parses "HIPFIRE_QWEN35_FFN_BF16_TRACE" with fallback defaults
 pub const ENV_HIPFIRE_QWEN35_FFN_BF16_TRACE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_FFN_BF16_TRACE",
     description: "Parses \"HIPFIRE_QWEN35_FFN_BF16_TRACE\" with fallback defaults",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/ffn_bf16.rs:83",
+    source: "crates/hipfire-arch-qwen35/src/ffn_bf16.rs:83",
 };
 
 /// `HIPFIRE_QWEN35_FINITE_TRACE` — Runtime variable controlling qwen35 finite trace in hipfire
 pub const ENV_HIPFIRE_QWEN35_FINITE_TRACE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_FINITE_TRACE",
     description: "Runtime variable controlling qwen35 finite trace in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:13705",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:13784",
 };
 
 /// `HIPFIRE_QWEN35_PAGED_EXPERTS` — Interprets "HIPFIRE_QWEN35_PAGED_EXPERTS" from environment to select behavior
 pub const ENV_HIPFIRE_QWEN35_PAGED_EXPERTS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_PAGED_EXPERTS",
     description: "Interprets \"HIPFIRE_QWEN35_PAGED_EXPERTS\" from environment to select behavior",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:3988",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:4038",
 };
 
 /// `HIPFIRE_QWEN35_PREFILL_SESSION_BATCH` — Runtime variable controlling qwen35 prefill session batch in hipfire
 pub const ENV_HIPFIRE_QWEN35_PREFILL_SESSION_BATCH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_PREFILL_SESSION_BATCH",
     description: "Runtime variable controlling qwen35 prefill session batch in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/qwen35_prefill.rs:1656",
+    source: "crates/hipfire-serving-core/src/qwen35_prefill.rs:1656",
 };
 
 /// `HIPFIRE_QWEN35_ROUTED_ONLY_MOE_FORWARD` — Runtime variable controlling qwen35 routed only moe forward in hipfire
 pub const ENV_HIPFIRE_QWEN35_ROUTED_ONLY_MOE_FORWARD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_ROUTED_ONLY_MOE_FORWARD",
     description: "Runtime variable controlling qwen35 routed only moe forward in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:7445",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:7502",
 };
 
 /// `HIPFIRE_QWEN35_STAGE_SYNC` — Runtime variable controlling qwen35 stage sync in hipfire
 pub const ENV_HIPFIRE_QWEN35_STAGE_SYNC: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_STAGE_SYNC",
     description: "Runtime variable controlling qwen35 stage sync in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:13739",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:13818",
 };
 
 /// `HIPFIRE_QWEN35_STAGE_TRACE` — Runtime variable controlling qwen35 stage trace in hipfire
 pub const ENV_HIPFIRE_QWEN35_STAGE_TRACE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_STAGE_TRACE",
     description: "Runtime variable controlling qwen35 stage trace in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:13733",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:13812",
 };
 
 /// `HIPFIRE_QWEN35_XDNA1_INSTR` — Runtime variable controlling qwen35 xdna1 instr in hipfire
 pub const ENV_HIPFIRE_QWEN35_XDNA1_INSTR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_XDNA1_INSTR",
     description: "Runtime variable controlling qwen35 xdna1 instr in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-npu/src/lib.rs:72",
+    source: "crates/hipfire-npu/src/lib.rs:72",
 };
 
 /// `HIPFIRE_QWEN35_XDNA1_XCLBIN` — Runtime variable controlling qwen35 xdna1 xclbin in hipfire
 pub const ENV_HIPFIRE_QWEN35_XDNA1_XCLBIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_XDNA1_XCLBIN",
     description: "Runtime variable controlling qwen35 xdna1 xclbin in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-npu/src/lib.rs:69",
+    source: "crates/hipfire-npu/src/lib.rs:69",
 };
 
 /// `HIPFIRE_RDNA2_VARIANT` — Runtime variable controlling rdna2 variant in hipfire
 pub const ENV_HIPFIRE_RDNA2_VARIANT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RDNA2_VARIANT",
     description: "Runtime variable controlling rdna2 variant in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:298",
+    source: "crates/rdna-compute/src/feature_flags.rs:298",
 };
 
 /// `HIPFIRE_RECOVER_MODE` — HIPFIRE_RECOVER_MODE=lora+norms → LoRA + layernorms (default, more capacity)
 pub const ENV_HIPFIRE_RECOVER_MODE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RECOVER_MODE",
     description: "HIPFIRE_RECOVER_MODE=lora+norms → LoRA + layernorms (default, more capacity)",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-train/examples/coherence_recovery_supra50m.rs:152",
+    source: "crates/hipfire-train/examples/coherence_recovery_supra50m.rs:152",
 };
 
 /// `HIPFIRE_REPLAY_GRAPH` — Enabled when set to 1
 pub const ENV_HIPFIRE_REPLAY_GRAPH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_REPLAY_GRAPH",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:5080",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:5081",
 };
 
 /// `HIPFIRE_RESOURCE_LOCK` — HIPFIRE_RESOURCE_LOCK=0 disables daemon startup resource leases
 pub const ENV_HIPFIRE_RESOURCE_LOCK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RESOURCE_LOCK",
     description: "HIPFIRE_RESOURCE_LOCK=0 disables daemon startup resource leases",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-daemon-adapter/src/lib.rs:740",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:740",
 };
 
 /// `HIPFIRE_RESOURCE_LOCK_CPU_CORES` — HIPFIRE_RESOURCE_LOCK_CPU_CORES=0,2-4 adds daemon startup leases for CPU cores
 pub const ENV_HIPFIRE_RESOURCE_LOCK_CPU_CORES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RESOURCE_LOCK_CPU_CORES",
     description: "HIPFIRE_RESOURCE_LOCK_CPU_CORES=0,2-4 adds daemon startup leases for CPU cores",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-daemon-adapter/src/lib.rs:644",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:644",
 };
 
 /// `HIPFIRE_RESOURCE_LOCK_DIR` — HIPFIRE_RESOURCE_LOCK_DIR overrides the daemon resource-lock root directory
 pub const ENV_HIPFIRE_RESOURCE_LOCK_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RESOURCE_LOCK_DIR",
     description: "HIPFIRE_RESOURCE_LOCK_DIR overrides the daemon resource-lock root directory",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-daemon-adapter/src/lib.rs:756",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:756",
 };
 
 /// `HIPFIRE_RESOURCE_LOCK_NPUS` — HIPFIRE_RESOURCE_LOCK_NPUS=1 leases every detected NPU; comma lists lease explicit NPU IDs
 pub const ENV_HIPFIRE_RESOURCE_LOCK_NPUS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RESOURCE_LOCK_NPUS",
-    description: "HIPFIRE_RESOURCE_LOCK_NPUS=1 leases every detected NPU; comma lists lease explicit NPU IDs",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-daemon-adapter/src/lib.rs:609",
+    description:
+        "HIPFIRE_RESOURCE_LOCK_NPUS=1 leases every detected NPU; comma lists lease explicit NPU IDs",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:609",
 };
 
 /// `HIPFIRE_RESOURCE_LOCK_WAIT_MS` — HIPFIRE_RESOURCE_LOCK_WAIT_MS waits for busy daemon resource leases before failing startup
 pub const ENV_HIPFIRE_RESOURCE_LOCK_WAIT_MS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RESOURCE_LOCK_WAIT_MS",
-    description: "HIPFIRE_RESOURCE_LOCK_WAIT_MS waits for busy daemon resource leases before failing startup",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-daemon-adapter/src/lib.rs:760",
+    description:
+        "HIPFIRE_RESOURCE_LOCK_WAIT_MS waits for busy daemon resource leases before failing startup",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:760",
 };
 
 /// `HIPFIRE_RESPONSES_STATE_MAX` — Runtime variable controlling responses state max in hipfire
 pub const ENV_HIPFIRE_RESPONSES_STATE_MAX: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RESPONSES_STATE_MAX",
     description: "Runtime variable controlling responses state max in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-server/src/routes/responses.rs:660",
+    source: "crates/hipfire-server/src/routes/responses.rs:660",
 };
 
 /// `HIPFIRE_ROCBLAS_ALL_ARCHS` — Runtime variable controlling rocblas all archs in hipfire
 pub const ENV_HIPFIRE_ROCBLAS_ALL_ARCHS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ROCBLAS_ALL_ARCHS",
     description: "Runtime variable controlling rocblas all archs in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:288",
+    source: "crates/rdna-compute/src/feature_flags.rs:288",
 };
 
 /// `HIPFIRE_ROCBLAS_OFF` — Enabled when set to 1
 pub const ENV_HIPFIRE_ROCBLAS_OFF: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ROCBLAS_OFF",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:290",
+    source: "crates/rdna-compute/src/feature_flags.rs:290",
 };
 
 /// `HIPFIRE_ROCPROF_BIN` — Runtime variable controlling rocprof bin in hipfire
 pub const ENV_HIPFIRE_ROCPROF_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ROCPROF_BIN",
     description: "Runtime variable controlling rocprof bin in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-eval/src/rocprof.rs:275",
+    source: "crates/hipfire-eval/src/rocprof.rs:275",
 };
 
 /// `HIPFIRE_ROCPROF_CSV` — Runtime variable controlling rocprof csv in hipfire
 pub const ENV_HIPFIRE_ROCPROF_CSV: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ROCPROF_CSV",
     description: "Runtime variable controlling rocprof csv in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/bench_qwen35_speed.rs:325",
+    source: "crates/hipfire-runtime/examples/bench_qwen35_speed.rs:325",
 };
 
 /// `HIPFIRE_ROPE_INTERLEAVED_LEGACY` — Runtime variable controlling rope interleaved legacy in hipfire
 pub const ENV_HIPFIRE_ROPE_INTERLEAVED_LEGACY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ROPE_INTERLEAVED_LEGACY",
     description: "Runtime variable controlling rope interleaved legacy in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:281",
+    source: "crates/rdna-compute/src/feature_flags.rs:281",
 };
 
 /// `HIPFIRE_RQ2_BULK_BITS` — Runtime variable controlling rq2 bulk bits in hipfire
 pub const ENV_HIPFIRE_RQ2_BULK_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ2_BULK_BITS",
     description: "Runtime variable controlling rq2 bulk bits in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:8168",
+    source: "crates/hipfire-quantize/src/main.rs:8237",
 };
 
 /// `HIPFIRE_RQ2_DAMP` — De-risk B: single shared, foldable residual-stream rotation. With
 pub const ENV_HIPFIRE_RQ2_DAMP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ2_DAMP",
     description: "De-risk B: single shared, foldable residual-stream rotation. With",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:8172",
+    source: "crates/hipfire-quantize/src/main.rs:8241",
 };
 
 /// `HIPFIRE_RQ2_PROTECT_FRAC` — Runtime variable controlling rq2 protect frac in hipfire
 pub const ENV_HIPFIRE_RQ2_PROTECT_FRAC: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ2_PROTECT_FRAC",
     description: "Runtime variable controlling rq2 protect frac in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:8164",
+    source: "crates/hipfire-quantize/src/main.rs:8233",
 };
 
 /// `HIPFIRE_RQ2_Q8_EMBED` — Q8 (~20% of params on a tied-embedding 0.8B). With HIPFIRE_RQ2_Q8_EMBED=1,
 pub const ENV_HIPFIRE_RQ2_Q8_EMBED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ2_Q8_EMBED",
     description: "Q8 (~20% of params on a tied-embedding 0.8B). With HIPFIRE_RQ2_Q8_EMBED=1,",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:8290",
+    source: "crates/hipfire-quantize/src/main.rs:8359",
 };
 
 /// `HIPFIRE_RQ2_SHARE_RESID` — HIPFIRE_RQ2_SHARE_RESID=1, every k==1024 weight (the d_model residual
 pub const ENV_HIPFIRE_RQ2_SHARE_RESID: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ2_SHARE_RESID",
     description: "HIPFIRE_RQ2_SHARE_RESID=1, every k==1024 weight (the d_model residual",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:8186",
+    source: "crates/hipfire-quantize/src/main.rs:8255",
 };
 
 /// `HIPFIRE_RQ3_BULK_BITS` — Runtime variable controlling rq3 bulk bits in hipfire
 pub const ENV_HIPFIRE_RQ3_BULK_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ3_BULK_BITS",
     description: "Runtime variable controlling rq3 bulk bits in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:8327",
+    source: "crates/hipfire-quantize/src/main.rs:8396",
 };
 
 /// `HIPFIRE_RQ3_PROTECT_FRAC` — Runtime variable controlling rq3 protect frac in hipfire
 pub const ENV_HIPFIRE_RQ3_PROTECT_FRAC: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ3_PROTECT_FRAC",
     description: "Runtime variable controlling rq3 protect frac in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:8323",
+    source: "crates/hipfire-quantize/src/main.rs:8392",
 };
 
 /// `HIPFIRE_RQ3_Q8_EMBED` — Iso-bit embed for an honest mq4 comparison (same as roughquant2 de-risk A)
 pub const ENV_HIPFIRE_RQ3_Q8_EMBED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ3_Q8_EMBED",
     description: "Iso-bit embed for an honest mq4 comparison (same as roughquant2 de-risk A)",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:8389",
+    source: "crates/hipfire-quantize/src/main.rs:8458",
 };
 
 /// `HIPFIRE_RQ4_BULK` — Bulk codec: "mq4" → real mq4 format (fair mq4+protect-vs-mq4 test, set
 pub const ENV_HIPFIRE_RQ4_BULK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_BULK",
     description: "Bulk codec: \"mq4\" → real mq4 format (fair mq4+protect-vs-mq4 test, set",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:8430",
+    source: "crates/hipfire-quantize/src/main.rs:8499",
 };
 
 /// `HIPFIRE_RQ4_BULK_BITS` — Bulk codec: "mq4" → real mq4 format (fair mq4+protect-vs-mq4 test, set
 pub const ENV_HIPFIRE_RQ4_BULK_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_BULK_BITS",
     description: "Bulk codec: \"mq4\" → real mq4 format (fair mq4+protect-vs-mq4 test, set",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:8424",
+    source: "crates/hipfire-quantize/src/main.rs:8493",
 };
 
 /// `HIPFIRE_RQ4_DUMP_RANK` — HIPFIRE_RQ4_DUMP_RANK=1: print the residual-channel saliency ranking
 pub const ENV_HIPFIRE_RQ4_DUMP_RANK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_DUMP_RANK",
     description: "HIPFIRE_RQ4_DUMP_RANK=1: print the residual-channel saliency ranking",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:8536",
+    source: "crates/hipfire-quantize/src/main.rs:8605",
 };
 
 /// `HIPFIRE_RQ4_INVERT` — HIPFIRE_RQ4_INVERT=1: protect the LOWEST-saliency channels instead of the
 pub const ENV_HIPFIRE_RQ4_INVERT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_INVERT",
     description: "HIPFIRE_RQ4_INVERT=1: protect the LOWEST-saliency channels instead of the",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:8554",
+    source: "crates/hipfire-quantize/src/main.rs:8623",
 };
 
 /// `HIPFIRE_RQ4_MQ_BITS` — Uniform bulk bit-width for the mq bulk (4=mq4, 5, 6=mq6). protect_frac=0
 pub const ENV_HIPFIRE_RQ4_MQ_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_MQ_BITS",
     description: "Uniform bulk bit-width for the mq bulk (4=mq4, 5, 6=mq6). protect_frac=0",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:8440",
+    source: "crates/hipfire-quantize/src/main.rs:8509",
 };
 
 /// `HIPFIRE_RQ4_OBS_DAMP` — Uniform bulk bit-width for the mq bulk (4=mq4, 5, 6=mq6). protect_frac=0
 pub const ENV_HIPFIRE_RQ4_OBS_DAMP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_OBS_DAMP",
     description: "Uniform bulk bit-width for the mq bulk (4=mq4, 5, 6=mq6). protect_frac=0",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:8434",
+    source: "crates/hipfire-quantize/src/main.rs:8503",
 };
 
 /// `HIPFIRE_RQ4_PROTECT_FRAC` — diag(H) residual-channel energy from true residual readers
 pub const ENV_HIPFIRE_RQ4_PROTECT_FRAC: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_PROTECT_FRAC",
     description: "diag(H) residual-channel energy from true residual readers",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:9010",
+    source: "crates/hipfire-quantize/src/main.rs:9079",
 };
 
 /// `HIPFIRE_RQ4_PROTECT_Q8` — on diag(H) alone). diag = E[x²] (activation energy); wnorm = ‖W[:,c]‖²
 pub const ENV_HIPFIRE_RQ4_PROTECT_Q8: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_PROTECT_Q8",
     description: "on diag(H) alone). diag = E[x²] (activation energy); wnorm = ‖W[:,c]‖²",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:8445",
+    source: "crates/hipfire-quantize/src/main.rs:8514",
 };
 
 /// `HIPFIRE_RQ4_Q8_EMBED` — Enabled when set to 1
 pub const ENV_HIPFIRE_RQ4_Q8_EMBED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_Q8_EMBED",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:8796",
+    source: "crates/hipfire-quantize/src/main.rs:8865",
 };
 
 /// `HIPFIRE_RQ4_RANDOM_SEED` — Runtime variable controlling rQ4 random seed in hipfire
 pub const ENV_HIPFIRE_RQ4_RANDOM_SEED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_RANDOM_SEED",
     description: "Runtime variable controlling rQ4 random seed in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:8659",
+    source: "crates/hipfire-quantize/src/main.rs:8728",
 };
 
 /// `HIPFIRE_RQ4_SALIENCY` — (weight energy); product = ‖W[:,c]‖²·E[x²] (output-error contribution)
 pub const ENV_HIPFIRE_RQ4_SALIENCY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_SALIENCY",
     description: "(weight energy); product = ‖W[:,c]‖²·E[x²] (output-error contribution)",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:8449",
+    source: "crates/hipfire-quantize/src/main.rs:8518",
 };
 
 /// `HIPFIRE_RQ4_VOID_ONLY` — Runtime variable controlling rQ4 void only in hipfire
 pub const ENV_HIPFIRE_RQ4_VOID_ONLY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_VOID_ONLY",
     description: "Runtime variable controlling rQ4 void only in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:8578",
+    source: "crates/hipfire-quantize/src/main.rs:8647",
 };
 
 /// `HIPFIRE_RQ_BULK_BITS` — Runtime variable controlling rq bulk bits in hipfire
 pub const ENV_HIPFIRE_RQ_BULK_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ_BULK_BITS",
     description: "Runtime variable controlling rq bulk bits in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:8097",
+    source: "crates/hipfire-quantize/src/main.rs:8166",
 };
 
 /// `HIPFIRE_RQ_GROUP` — Runtime variable controlling rq group in hipfire
 pub const ENV_HIPFIRE_RQ_GROUP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ_GROUP",
     description: "Runtime variable controlling rq group in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:8101",
+    source: "crates/hipfire-quantize/src/main.rs:8170",
 };
 
 /// `HIPFIRE_RQ_HAND` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_RQ_HAND: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ_HAND",
     description: "Environment toggle value controls runtime behavior",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:22538",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:22617",
 };
 
 /// `HIPFIRE_RQ_PROTECT_FRAC` — Runtime variable controlling rq protect frac in hipfire
 pub const ENV_HIPFIRE_RQ_PROTECT_FRAC: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ_PROTECT_FRAC",
     description: "Runtime variable controlling rq protect frac in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:8093",
+    source: "crates/hipfire-quantize/src/main.rs:8162",
 };
 
 /// `HIPFIRE_RUN_EXAMPLE_BIN` — Runtime variable controlling run example bin in hipfire
 pub const ENV_HIPFIRE_RUN_EXAMPLE_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RUN_EXAMPLE_BIN",
     description: "Runtime variable controlling run example bin in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-eval/src/lib.rs:941",
+    source: "crates/hipfire-eval/src/lib.rs:941",
 };
 
 /// `HIPFIRE_SAMPLE_COMPARE` — Enabled when set to 1
 pub const ENV_HIPFIRE_SAMPLE_COMPARE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_SAMPLE_COMPARE",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/infer_qwen35.rs:222",
+    source: "crates/hipfire-runtime/examples/infer_qwen35.rs:223",
 };
 
 /// `HIPFIRE_SERVER_RESIDENT_STATE_BUDGET_MB` — Runtime variable controlling server resident state budget mb in hipfire
 pub const ENV_HIPFIRE_SERVER_RESIDENT_STATE_BUDGET_MB: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_SERVER_RESIDENT_STATE_BUDGET_MB",
     description: "Runtime variable controlling server resident state budget mb in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/session.rs:707",
+    source: "crates/hipfire-serving-core/src/session.rs:707",
 };
 
 /// `HIPFIRE_SMOKE_KV` — Select KV cache quant via HIPFIRE_SMOKE_KV (default q8, matches the
 pub const ENV_HIPFIRE_SMOKE_KV: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_SMOKE_KV",
     description: "Select KV cache quant via HIPFIRE_SMOKE_KV (default q8, matches the",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/a3b_smoke_forward.rs:109",
+    source: "crates/hipfire-runtime/examples/a3b_smoke_forward.rs:110",
 };
 
 /// `HIPFIRE_SMOKE_KV_SEQ` — production CLI default). asym3/asym4 engage the Givens-rotated 3/4-bit
 pub const ENV_HIPFIRE_SMOKE_KV_SEQ: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_SMOKE_KV_SEQ",
     description: "production CLI default). asym3/asym4 engage the Givens-rotated 3/4-bit",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/a3b_smoke_forward.rs:102",
+    source: "crates/hipfire-runtime/examples/a3b_smoke_forward.rs:103",
 };
 
 /// `HIPFIRE_SMOKE_MODE` — raw (default for back-compat): tokenize "Hello" and decode from pos=0
 pub const ENV_HIPFIRE_SMOKE_MODE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_SMOKE_MODE",
     description: "raw (default for back-compat): tokenize \"Hello\" and decode from pos=0",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/a3b_smoke_forward.rs:157",
+    source: "crates/hipfire-runtime/examples/a3b_smoke_forward.rs:158",
 };
 
 /// `HIPFIRE_SMOKE_PROMPT` — Defaults to Hello when unset
 pub const ENV_HIPFIRE_SMOKE_PROMPT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_SMOKE_PROMPT",
     description: "Defaults to Hello when unset",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/a3b_smoke_forward.rs:158",
+    source: "crates/hipfire-runtime/examples/a3b_smoke_forward.rs:159",
 };
 
 /// `HIPFIRE_SMOKE_STEPS` — Runtime variable controlling smoke steps in hipfire
 pub const ENV_HIPFIRE_SMOKE_STEPS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_SMOKE_STEPS",
     description: "Runtime variable controlling smoke steps in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/a3b_smoke_forward.rs:38",
+    source: "crates/hipfire-runtime/examples/a3b_smoke_forward.rs:39",
 };
 
 /// `HIPFIRE_SPEC_PHASES` — Enabled when set to 1
 pub const ENV_HIPFIRE_SPEC_PHASES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_SPEC_PHASES",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:7069",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:7070",
 };
 
 /// `HIPFIRE_STATE` — Interprets "HIPFIRE_STATE" from environment to select behavior
 pub const ENV_HIPFIRE_STATE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_STATE",
     description: "Interprets \"HIPFIRE_STATE\" from environment to select behavior",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/greedy_dump_top5.rs:245",
+    source: "crates/hipfire-runtime/examples/greedy_dump_top5.rs:246",
 };
 
 /// `HIPFIRE_TARGET_ARCH` — Runtime variable controlling target arch in hipfire
 pub const ENV_HIPFIRE_TARGET_ARCH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TARGET_ARCH",
     description: "Runtime variable controlling target arch in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:783",
+    source: "crates/rdna-compute/src/dispatch.rs:803",
 };
 
 /// `HIPFIRE_TIER_RATIO` — Runtime variable controlling tier ratio in hipfire
 pub const ENV_HIPFIRE_TIER_RATIO: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TIER_RATIO",
     description: "Runtime variable controlling tier ratio in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:4948",
+    source: "crates/hipfire-quantize/src/main.rs:5017",
 };
 
 /// `HIPFIRE_TP_BENCH_ITERS` — Runtime variable controlling tp bench iters in hipfire
 pub const ENV_HIPFIRE_TP_BENCH_ITERS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TP_BENCH_ITERS",
     description: "Runtime variable controlling tp bench iters in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hip-bridge/examples/rccl_smoke.rs:19",
+    source: "crates/hip-bridge/examples/rccl_smoke.rs:19",
 };
 
 /// `HIPFIRE_TP_BENCH_N` — Runtime variable controlling tp bench n in hipfire
 pub const ENV_HIPFIRE_TP_BENCH_N: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TP_BENCH_N",
     description: "Runtime variable controlling tp bench n in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hip-bridge/examples/rccl_smoke.rs:15",
+    source: "crates/hip-bridge/examples/rccl_smoke.rs:15",
 };
 
 /// `HIPFIRE_TP_EXPERT_ASSIGN` — Selects behavior from recognized values
 pub const ENV_HIPFIRE_TP_EXPERT_ASSIGN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TP_EXPERT_ASSIGN",
     description: "Selects behavior from recognized values",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/tp_shard.rs:57",
+    source: "crates/hipfire-runtime/src/tp_shard.rs:57",
 };
 
 /// `HIPFIRE_TP_USE_RCCL` — Runtime variable controlling tp use rccl in hipfire
 pub const ENV_HIPFIRE_TP_USE_RCCL: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TP_USE_RCCL",
     description: "Runtime variable controlling tp use rccl in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:90",
+    source: "crates/hipfire-runtime/src/config.rs:90",
 };
 
 /// `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` — Runtime variable controlling uniform vram tolerance gb in hipfire
 pub const ENV_HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB",
     description: "Runtime variable controlling uniform vram tolerance gb in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:105",
+    source: "crates/hipfire-runtime/src/config.rs:105",
 };
 
 /// `HIPFIRE_VERIFY_GRAPH` — Runtime variable controlling verify graph in hipfire
 pub const ENV_HIPFIRE_VERIFY_GRAPH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_VERIFY_GRAPH",
     description: "Runtime variable controlling verify graph in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:6531",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:6532",
 };
 
 /// `HIPFIRE_VERIFY_GRAPH_TIMING` — (HIPFIRE_VERIFY_GRAPH_TIMING=1). Two device-sync points bracket the
 pub const ENV_HIPFIRE_VERIFY_GRAPH_TIMING: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_VERIFY_GRAPH_TIMING",
     description: "(HIPFIRE_VERIFY_GRAPH_TIMING=1). Two device-sync points bracket the",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:6546",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:6547",
 };
 
 /// `HIPFIRE_VERIFY_GRAPH_TREE` — Enabled when set to 1
 pub const ENV_HIPFIRE_VERIFY_GRAPH_TREE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_VERIFY_GRAPH_TREE",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:6521",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:6522",
 };
 
 /// `HIPFIRE_VISION_CACHE` — Disabled when set to 0
 pub const ENV_HIPFIRE_VISION_CACHE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_VISION_CACHE",
     description: "Disabled when set to 0",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/generate_vl.rs:1081",
+    source: "crates/hipfire-serving-core/src/generate_vl.rs:1080",
 };
 
-/// `HIPFIRE_VISION_CACHE_DIR` — Runtime variable controlling vision cache dir in hipfire.
+/// `HIPFIRE_VISION_CACHE_DIR` — Runtime variable controlling vision cache dir in hipfire
 pub const ENV_HIPFIRE_VISION_CACHE_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_VISION_CACHE_DIR",
-    description: "Runtime variable controlling vision cache dir in hipfire.",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/generate_vl.rs:1084",
+    description: "Runtime variable controlling vision cache dir in hipfire",
+    source: "crates/hipfire-serving-core/src/generate_vl.rs:1083",
 };
 
 /// `HIPFIRE_VISION_CACHE_MAX_BYTES` — Parses "HIPFIRE_VISION_CACHE_MAX_BYTES" with fallback defaults
 pub const ENV_HIPFIRE_VISION_CACHE_MAX_BYTES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_VISION_CACHE_MAX_BYTES",
     description: "Parses \"HIPFIRE_VISION_CACHE_MAX_BYTES\" with fallback defaults",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-serving-core/src/generate_vl.rs:1093",
+    source: "crates/hipfire-serving-core/src/generate_vl.rs:1092",
 };
 
 /// `HIPFIRE_VISION_PROFILE` — Optional per-category timing (HIPFIRE_VISION_PROFILE=1): device-sync around
 pub const ENV_HIPFIRE_VISION_PROFILE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_VISION_PROFILE",
     description: "Optional per-category timing (HIPFIRE_VISION_PROFILE=1): device-sync around",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-gemma3-vl/src/forward.rs:105",
+    source: "crates/hipfire-arch-gemma3-vl/src/forward.rs:105",
 };
 
 /// `HIPFIRE_VL_DUMP_DIR` — little-endian f32 blobs + JSON sidecars to $HIPFIRE_VL_DUMP_DIR
 pub const ENV_HIPFIRE_VL_DUMP_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_VL_DUMP_DIR",
     description: "little-endian f32 blobs + JSON sidecars to $HIPFIRE_VL_DUMP_DIR",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/infer.rs:148",
+    source: "crates/hipfire-runtime/examples/infer.rs:149",
 };
 
 /// `HIPFIRE_WO_MMQ` — Enabled when set to 1
 pub const ENV_HIPFIRE_WO_MMQ: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_WO_MMQ",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:204",
+    source: "crates/rdna-compute/src/feature_flags.rs:204",
 };
 
 /// `HIPFIRE_WO_WMMA_VARIANT` — Runtime variable controlling wo wmma variant in hipfire
 pub const ENV_HIPFIRE_WO_WMMA_VARIANT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_WO_WMMA_VARIANT",
     description: "Runtime variable controlling wo wmma variant in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:285",
+    source: "crates/rdna-compute/src/feature_flags.rs:285",
 };
 
 /// `HIPFIRE_XDNA1_LIB` — Runtime variable controlling xdna1 lib in hipfire
 pub const ENV_HIPFIRE_XDNA1_LIB: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_XDNA1_LIB",
     description: "Runtime variable controlling xdna1 lib in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-npu/src/lib.rs:65",
+    source: "crates/hipfire-npu/src/lib.rs:65",
 };
 
 /// `HIP_PATH` — fails with "file not found". Add well-known candidates as -I flags;
 pub const ENV_HIP_PATH: EnvVarDoc = EnvVarDoc {
     name: "HIP_PATH",
     description: "fails with \"file not found\". Add well-known candidates as -I flags;",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/compiler.rs:476",
+    source: "crates/rdna-compute/src/compiler.rs:467",
 };
 
 /// `HIP_VISIBLE_DEVICES` — Used to configure runtime execution by explicitly setting "HIP_VISIBLE_DEVICES"
 pub const ENV_HIP_VISIBLE_DEVICES: EnvVarDoc = EnvVarDoc {
     name: "HIP_VISIBLE_DEVICES",
-    description: "Used to configure runtime execution by explicitly setting \"HIP_VISIBLE_DEVICES\"",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-daemon-adapter/src/lib.rs:1146",
+    description:
+        "Used to configure runtime execution by explicitly setting \"HIP_VISIBLE_DEVICES\"",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:1146",
 };
 
 /// `HOME` — Runtime variable controlling home in hipfire
 pub const ENV_HOME: EnvVarDoc = EnvVarDoc {
     name: "HOME",
     description: "Runtime variable controlling home in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/compiler.rs:236",
+    source: "crates/rdna-compute/src/compiler.rs:199",
 };
 
 /// `HOSTNAME` — Runtime variable controlling hostname in hipfire
 pub const ENV_HOSTNAME: EnvVarDoc = EnvVarDoc {
     name: "HOSTNAME",
     description: "Runtime variable controlling hostname in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/coherence_probe.rs:416",
+    source: "crates/hipfire-runtime/examples/coherence_probe.rs:416",
 };
 
 /// `MAX_TOKENS` — Parses "MAX_TOKENS" with fallback defaults
 pub const ENV_MAX_TOKENS: EnvVarDoc = EnvVarDoc {
     name: "MAX_TOKENS",
     description: "Parses \"MAX_TOKENS\" with fallback defaults",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/greedy_dump.rs:112",
+    source: "crates/hipfire-runtime/examples/greedy_dump.rs:113",
 };
 
 /// `MMQ_TEST_MODE` — Defaults to residual when unset
 pub const ENV_MMQ_TEST_MODE: EnvVarDoc = EnvVarDoc {
     name: "MMQ_TEST_MODE",
     description: "Defaults to residual when unset",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/examples/test_gfx906_mmq_correctness.rs:65",
+    source: "crates/rdna-compute/examples/test_gfx906_mmq_correctness.rs:65",
 };
 
 /// `NO_NGRAM` — Disabled for perf measurement — re-enable after implementing GPU n-gram kernel
 pub const ENV_NO_NGRAM: EnvVarDoc = EnvVarDoc {
     name: "NO_NGRAM",
     description: "Disabled for perf measurement — re-enable after implementing GPU n-gram kernel",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/infer_vl.rs:350",
+    source: "crates/hipfire-runtime/examples/infer_vl.rs:351",
 };
 
 /// `PATH` — Runtime variable controlling path in hipfire
 pub const ENV_PATH: EnvVarDoc = EnvVarDoc {
     name: "PATH",
     description: "Runtime variable controlling path in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-eval/src/rocprof.rs:285",
+    source: "crates/hipfire-eval/src/rocprof.rs:285",
 };
 
 /// `PROMPT_MODE` — Defaults to thinking when unset
 pub const ENV_PROMPT_MODE: EnvVarDoc = EnvVarDoc {
     name: "PROMPT_MODE",
     description: "Defaults to thinking when unset",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/greedy_dump_top5.rs:91",
+    source: "crates/hipfire-runtime/examples/greedy_dump_top5.rs:92",
 };
 
 /// `QWEN35_TEST_MODEL` — Runtime variable controlling qwen35 test model in hipfire
 pub const ENV_QWEN35_TEST_MODEL: EnvVarDoc = EnvVarDoc {
     name: "QWEN35_TEST_MODEL",
     description: "Runtime variable controlling qwen35 test model in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/test_qwen35_loadQA.rs:22",
+    source: "crates/hipfire-runtime/examples/test_qwen35_loadQA.rs:22",
 };
 
 /// `ROCM_PATH` — Runtime variable controlling rocm path in hipfire
 pub const ENV_ROCM_PATH: EnvVarDoc = EnvVarDoc {
     name: "ROCM_PATH",
     description: "Runtime variable controlling rocm path in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/compiler.rs:133",
+    source: "crates/rdna-compute/src/compiler.rs:133",
 };
 
 /// `ROCR_VISIBLE_DEVICES` — Runtime variable controlling rocr visible devices in hipfire
 pub const ENV_ROCR_VISIBLE_DEVICES: EnvVarDoc = EnvVarDoc {
     name: "ROCR_VISIBLE_DEVICES",
     description: "Runtime variable controlling rocr visible devices in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-daemon-adapter/src/lib.rs:568",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:568",
 };
 
 /// `TINYLLAMA_GGUF` — Runtime variable controlling tinyllama gguf in hipfire
 pub const ENV_TINYLLAMA_GGUF: EnvVarDoc = EnvVarDoc {
     name: "TINYLLAMA_GGUF",
     description: "Runtime variable controlling tinyllama gguf in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/test_q4f16QA.rs:38",
+    source: "crates/hipfire-runtime/examples/test_q4f16QA.rs:38",
 };
 
 /// `TRIALS` — Runtime variable controlling trials in hipfire
 pub const ENV_TRIALS: EnvVarDoc = EnvVarDoc {
     name: "TRIALS",
     description: "Runtime variable controlling trials in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/examples/bench_gfx1151_hfq4_s4_mmq.rs:151",
+    source: "crates/rdna-compute/examples/bench_gfx1151_hfq4_s4_mmq.rs:151",
 };
 
 /// `USERPROFILE` — Runtime variable controlling userprofile in hipfire
 pub const ENV_USERPROFILE: EnvVarDoc = EnvVarDoc {
     name: "USERPROFILE",
     description: "Runtime variable controlling userprofile in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:100",
+    source: "crates/rdna-compute/src/compiler.rs:200",
 };
 
 /// `USE_SAMPLE` — Enabled when set to 1
 pub const ENV_USE_SAMPLE: EnvVarDoc = EnvVarDoc {
     name: "USE_SAMPLE",
     description: "Enabled when set to 1",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/a3b_multiturn_oneshot.rs:117",
+    source: "crates/hipfire-runtime/examples/a3b_multiturn_oneshot.rs:118",
 };
 
 /// All documented environment variables in deterministic order.
@@ -3280,6 +3318,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_BENCH_VERIFY_LAYERS,
     ENV_CARGO_FEATURE_NPU_KERNELS,
     ENV_CARGO_MANIFEST_DIR,
+    ENV_CARGO_PKG_VERSION,
     ENV_DDTREE_TIMING,
     ENV_DEBUG_LAYERS,
     ENV_DFLASH_LIVE_TAU,
@@ -3328,6 +3367,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_DDTREE_TAPE_DUMP,
     ENV_HIPFIRE_DDTREE_TOPK,
     ENV_HIPFIRE_DDTREE_TREE_LA,
+    ENV_HIPFIRE_DEBUG_PREFILL_ELIGIBLE,
     ENV_HIPFIRE_DEBUG_PREFIX_BOUNDARIES,
     ENV_HIPFIRE_DEEPSEEK4_ATTN,
     ENV_HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT,
@@ -3563,6 +3603,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_NPU_ROPE_CONFIGS,
     ENV_HIPFIRE_NPU_SOFTMAX_CONFIGS,
     ENV_HIPFIRE_NPU_TARGETS,
+    ENV_HIPFIRE_OQ4_TRACE,
     ENV_HIPFIRE_PAGED_MOE_DEBUG,
     ENV_HIPFIRE_PARO_BATCHED,
     ENV_HIPFIRE_PARO_FA3_FUSED,

@@ -100,8 +100,9 @@
   - Keep TriAttention sidecar examples and naming in active docs on
     `.triattn.hfq` as canonical; mention `.triattn.bin` only as explicit legacy
     compatibility.
-  - Regenerate `docs/env-vars.md` from `./scripts/regen-env-vars-doc.sh` after
-    source/env surface changes.
+  - Regenerate `docs/env-vars.md` (+ `crates/hipfire-runtime/src/env_docs.rs`)
+    with `cargo run -p hipfire-cli -- gen-env-docs` after source/env surface
+    changes; `tests/no-gpu-ci.sh` enforces freshness via `--check`.
 
 ### Deferred
 

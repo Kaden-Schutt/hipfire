@@ -1360,6 +1360,7 @@ dependencies = [
  "hipfire-server",
  "indicatif",
  "libc",
+ "regex",
  "reqwest",
  "serde_json",
  "tokio",

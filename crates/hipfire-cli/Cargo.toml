@@ -18,6 +18,7 @@ hipfire-lock = { path = "../hipfire-lock" }
 hipfire-model = { path = "../hipfire-model" }
 hipfire-server = { path = "../hipfire-server" }
 clap = { version = "4", features = ["derive", "cargo"] }
+regex = "1"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

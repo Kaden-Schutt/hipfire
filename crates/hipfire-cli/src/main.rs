@@ -44,6 +44,12 @@ enum Command {
     /// and operator UI schema artifacts.
     #[command(hide = true)]
     GenConfigSchema(commands::gen_config_schema::GenConfigSchemaArgs),
+    /// Regenerate the committed env-var docs (docs/env-vars.md +
+    /// crates/hipfire-runtime/src/env_docs.rs) by scanning the source tree.
+    /// Hidden: a maintenance command; run via
+    /// `cargo run -p hipfire-cli -- gen-env-docs`.
+    #[command(hide = true)]
+    GenEnvDocs(commands::gen_env_docs::GenEnvDocsArgs),
 }
 
 #[tokio::main]
@@ -74,5 +80,6 @@ async fn main() -> anyhow::Result<()> {
         Command::Operator(args) => commands::operator::run(args, config).await,
         Command::GenDocs(args) => commands::gen_docs::run(args),
         Command::GenConfigSchema(args) => commands::gen_config_schema::run(args),
+        Command::GenEnvDocs(args) => commands::gen_env_docs::run(args),
     }
 }
