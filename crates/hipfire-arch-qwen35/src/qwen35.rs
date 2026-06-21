@@ -26422,6 +26422,31 @@ fn kv_cache_attention_dispatch(
     // KVarN decode: single-token KV write (window append + block flush) + read
     // (build f16 shadow K) + f16/Q8 flash, handled outside the dispatch substrate.
     if kv_cache.quant_kvarn {
+        // ── KVarN Hadamard-incoherence rotation (paper §method: "Hadamard
+        // rotation FOLLOWED BY dual-scaling variance normalization"). The Sinkhorn
+        // dual-scaling already runs in `kvarn_quantize_tile`; the missing half is
+        // the rotation that Gaussianizes the per-channel K distribution so the
+        // 4-bit quant has less error (the codec's own self-test: un-rotated core
+        // cos-sim 0.995 → 0.999 with the FWHT). We rotate K *and* Q by the SAME
+        // orthonormal per-head FWHT-256 (mq signs); since the rotation is
+        // orthonormal, (RQ)·(RK)ᵀ = Q·Kᵀ exactly, so scores are preserved with NO
+        // flash/dequant changes and NO Q-side un-rotation. K is written to the
+        // cache rotated (window + records both derive from the rotated fa_k), so
+        // the whole KVarN frame is self-consistent. V (Q8) is left un-rotated, so
+        // the attention output stays in the original basis and o_proj is unchanged.
+        // Requires head_dim == 256 (the FWHT-256 group). Opt out with
+        // HIPFIRE_KVARN_ROTATE=0 for A/B.
+        static KVARN_ROTATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let kvarn_rotate = *KVARN_ROTATE.get_or_init(|| {
+            std::env::var("HIPFIRE_KVARN_ROTATE").ok().as_deref() != Some("0")
+        });
+        if kvarn_rotate && config.head_dim == 256 {
+            // In-place: mq_rotate_x loads each 256-group into registers (ds_swizzle
+            // butterfly, zero LDS) before storing, so x_in == x_out is safe. n=1
+            // (single-token decode / oq4 per-token prefill).
+            gpu.rotate_x_mq_batched(&s.fa_k, &s.fa_k, config.n_kv_heads * config.head_dim, 1)?;
+            gpu.rotate_x_mq_batched(&s.fa_q, &s.fa_q, config.n_heads * config.head_dim, 1)?;
+        }
         // Lazily allocate the reusable gather-tile scratch (once per cache — never
         // per call: GpuTensor has no pool-return Drop, so per-call alloc leaks).
         // The fused KVarN flash (Phase D2) reads records in place, so no f16
