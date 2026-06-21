@@ -47,23 +47,33 @@ registry v1/dynamic fetch, **any hipGraph infra**, MTP-perf primitives.
 - Document non-applicability explicitly (a verified "n/a" is a valid result).
 
 ## Priority order (value ÷ effort)
-1 Registry v1 → 2 MQ5 → 3 MoE-AWQ down → 4 MTP-perf (non-hipGraph subset)
-→ 5 mfp4-E8 → 6 Graded N-tier → 7 gfx11-e8 / MTP hipGraph (defer).
+~~1 Registry v1~~ (BLOCKED — see below) → **2 MQ5 (active head)** → 3 MoE-AWQ
+down → 4 MTP-perf (non-hipGraph subset) → 5 mfp4-E8 → 6 Graded N-tier →
+7 gfx11-e8 / MTP hipGraph (defer).
 
 ---
 
-## [ ] 1. Registry v1 + dynamic fetch (#47)  — LOW risk, HIGH ROI, no GPU
-Source: `25fbb01a` (v1.json generator + daily HF-probe workflow),
-`828a5bc7` (dynamic registry fetch + 24h cache + bundled fallback),
-`e86841cd` (readme).
-chaingun: daemon-side inventory only; no v1.json / dynamic fetch.
-Approach: add a `registry/v1.json` generator + bundled fallback + 24h-cached
-dynamic fetch, adapted to chaingun's reworked CLI (`hipfire chat`, registry
-hook). Tooling only — not the hot path, so no coherence gate.
-Done when: `hipfire` can list/pull from a dynamically fetched (cached,
-bundled-fallback) registry; freshness check wired into no-gpu-ci; docs
-regenerated.
-Progress: _not started_
+## [BLOCKED] 1. Registry v1 + dynamic fetch (#47)  — needs product decision
+Source: `25fbb01a` (Python `scripts/registry_gen.py` + v1.json + daily
+HF-probe workflow), `828a5bc7` (TS `cli/registry_loader.ts` dynamic fetch +
+24h cache + bundled fallback), `e86841cd` (readme).
+**Verified non-portable (2026-06-22):** the entire stack targets the **bun/TS
+distribution CLI** (`cli/*.ts`) + a Python generator. chaingun **deleted the
+bun CLI** (converged to Rust `hipfire-cli`) and has **no model pull/download
+or remote-registry subsystem at all** — only `hipfire list` of LOCAL models;
+distribution relies on the local model dir + `/srv/huggingface` mount. No
+`cli/`, no `registry/*.json`, no `HIPFIRE_REGISTRY*`, no HF/raw.githubusercontent
+fetch in the Rust tree (reqwest exists only for server/admin).
+There is nothing to port onto. Two paths, both a PRODUCT DECISION (not loop
+work):
+  (a) Build a NEW Rust model-pull/distribution feature in `hipfire-cli`
+      (`hipfire pull <id>`, registry fetch + 24h cache + bundled fallback,
+      sha256/size verification) — a sizable greenfield feature, not a port.
+  (b) Skip — chaingun's local+mount workflow doesn't need a distribution
+      registry. (Likely the right call given the Rust-native/converge-and-delete
+      stance.)
+Progress: BLOCKED pending user decision (a) vs (b). Loop SKIPS this; resume
+only if the user picks (a). Active head moved to #2 (MQ5).
 
 ## [ ] 2. MQ5G256 (5-bit FWHT MagnumQuant)  — MEDIUM, fills MQ4↔MQ6 gap
 Source: `f7efb940` (168 B/group, 5.25 bpw, full MoE decode parity).
