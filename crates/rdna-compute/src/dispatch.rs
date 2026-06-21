@@ -45429,6 +45429,64 @@ impl Gpu {
         }
     }
 
+    /// KVarN read-side build: materialize a token-major f16 shadow K cache
+    /// (`out` = [n_full_blocks*group + tail_len, kv_dim] f16) from the block-tiled
+    /// records `recs` (full blocks) + the f32 recent-window `window` (tail). The
+    /// chosen v1 read path feeds this shadow into the f16-K / Q8-V flash kernel.
+    /// One block per output token, zero LDS.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kvarn_build_kcache(
+        &mut self,
+        recs: &GpuTensor,
+        window: &GpuTensor,
+        out: &GpuTensor,
+        n_full_blocks: usize,
+        tail_len: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        group: usize,
+        record_bytes: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "kvarn_build_kcache",
+            kernels::KVARN_BUILD_KCACHE_SRC,
+            "kvarn_build_kcache",
+        )?;
+        let rp = recs.buf.as_ptr();
+        let wp = window.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mut nfb = n_full_blocks as i32;
+        let mut tl = tail_len as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut gp = group as i32;
+        let mut rb = record_bytes as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &rp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nfb as *mut _ as *mut c_void,
+            &mut tl as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut gp as *mut _ as *mut c_void,
+            &mut rb as *mut _ as *mut c_void,
+        ];
+        let n_out_tokens = n_full_blocks * group + tail_len;
+        let func = &self.functions["kvarn_build_kcache"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_out_tokens as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Opus Quant W4A4 fused Gate+Up: gate_proj + up_proj grouped-iu4 GEMMs in
     /// one launch sharing the int4 activation (`xq`/`xs`). Each weight buffer is
     /// the combined `[nibbles | f32 scales]` layout (scales addressed internally

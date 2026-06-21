@@ -3758,6 +3758,12 @@ pub const KVARN_DEQUANT_TILE_SRC: &str =
 pub const KVARN_GATHER_K_TILES_SRC: &str =
     include_str!("../../../kernels/src/kvarn_gather_k_tiles.hip");
 
+/// KVarN read-side build (Phase D1 #3): materialize a token-major f16 shadow K
+/// cache from the block-tiled records (full blocks) + f32 recent-window (tail).
+/// See `kernels/src/kvarn_build_kcache.hip`.
+pub const KVARN_BUILD_KCACHE_SRC: &str =
+    include_str!("../../../kernels/src/kvarn_build_kcache.hip");
+
 // Generic kernel library GEMV tier (gfx1103 wave32, zero LDS, wave-shuffle
 // reduction; one wave per output row). Same-dtype weight/vector inputs.
 // See `docs/kernels/generic-kernel-library.md`.
