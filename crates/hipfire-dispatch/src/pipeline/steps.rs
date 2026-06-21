@@ -526,6 +526,59 @@ pub fn execute_steps(
     Ok(())
 }
 
+/// Opus Quant W4A4 (Oq4G256) GEMV: the only int4-activation path. The dispatch
+/// families have no Oq4 GEMV kernel (activations must be int4-quantized at
+/// runtime), so every Oq4 `Step::Gemv*` routes here instead of `gemv.run*`.
+///   - `already_rotated`: x is the FWHT-rotated (and awq-divided) activation from
+///     the upstream RmsnormAutomatic step → just int4-quantize + grouped GEMM.
+///   - else: FWHT-rotate x here (applying the awq sidecar if present), then
+///     quantize + GEMM. Used for standalone GEMVs (lm_head, residual Raw).
+/// Weight buffer is the combined `[nibbles | f32 scales]` layout; the scale
+/// pointer is a sub_offset view at M*(K/2). Single-token (B=1).
+fn oq4_gemv_into(
+    gpu: &mut Gpu,
+    w: &WeightRef,
+    x: &rdna_compute::GpuTensor,
+    already_rotated: bool,
+    out: &rdna_compute::GpuTensor,
+) -> Result<(), DispatchError> {
+    const GROUP: usize = 256;
+    let hip = |e: rdna_compute::HipError| DispatchError::Hip(e.to_string());
+    let (m, k) = (w.m, w.k);
+    let ng = k / GROUP;
+    gpu.ensure_mq_signs().map_err(hip)?;
+
+    // Rotated f32 activation (own a scratch only when we must rotate here).
+    let rotated_scratch = if already_rotated {
+        None
+    } else {
+        let xr = gpu.alloc_tensor(&[k], DType::F32).map_err(hip)?;
+        if let Some(awq) = w.awq_scale {
+            gpu.rotate_x_mq_awq(x, awq, &xr, k).map_err(hip)?;
+        } else {
+            gpu.rotate_x_mq(x, &xr, k).map_err(hip)?;
+        }
+        Some(xr)
+    };
+    let xr: &rdna_compute::GpuTensor = rotated_scratch.as_ref().unwrap_or(x);
+
+    // Int4-quantize the rotated activation (B=1), then grouped iu4 GEMM.
+    let xq = gpu.alloc_tensor(&[k / 2], DType::Raw).map_err(hip)?;
+    let xs = gpu.alloc_tensor(&[ng], DType::F32).map_err(hip)?;
+    let r = (|| {
+        gpu.quantize_act_oq4(xr, &xq, &xs, 1, k, GROUP).map_err(hip)?;
+        let ws = w.buf.sub_offset(m * (k / 2), m * ng * 4);
+        gpu.gemm_oq4_grouped_wmma(w.buf, &ws, &xq, &xs, out, m, k, 1, GROUP)
+            .map_err(hip)
+    })();
+    let _ = gpu.free_tensor(xq);
+    let _ = gpu.free_tensor(xs);
+    if let Some(s) = rotated_scratch {
+        let _ = gpu.free_tensor(s);
+    }
+    r
+}
+
 /// Per-op fallback. FULL enum match (no catch-all) so the compiler forces every
 /// op to have an arm (spec F4 — a missing arm would be a silent runtime error).
 fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), DispatchError> {
@@ -535,6 +588,9 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             input: GemvInput::Raw(x),
             out,
         } => {
+            if w.dtype == DType::Oq4G256 {
+                return oq4_gemv_into(gpu, w, x, false, out);
+            }
             if w.dtype == DType::BF16 {
                 return gpu
                     .gemm_bf16_x_bf16_wmma(w.buf, x, out, w.m, w.k, 1)
@@ -548,6 +604,9 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             input: GemvInput::Prerotated(xr),
             out,
         } => {
+            if w.dtype == DType::Oq4G256 {
+                return oq4_gemv_into(gpu, w, xr, true, out);
+            }
             if w.dtype == DType::BF16 {
                 return gpu
                     .gemm_bf16_x_bf16_wmma(w.buf, xr, out, w.m, w.k, 1)
@@ -574,6 +633,18 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             residual,
             out: _,
         } => {
+            if w.dtype == DType::Oq4G256 {
+                // No fused Oq4 residual kernel: GEMM into a temp, then add.
+                let tmp = gpu
+                    .alloc_tensor(&[w.m], DType::F32)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                oq4_gemv_into(gpu, w, xr, true, &tmp)?;
+                gpu.add_inplace_f32(residual, &tmp)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                return gpu
+                    .free_tensor(tmp)
+                    .map_err(|e| DispatchError::Hip(e.to_string()));
+            }
             // MQ-family with a fused residual kernel: writes `residual` in-place via
             // GemvVariant::WithResidual. `out` is NOT written — it is scratch for the
             // fallback path only (see the Raw arm below). Nothing downstream reads
@@ -599,6 +670,17 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             residual,
             out,
         } => {
+            if w.dtype == DType::Oq4G256 {
+                let tmp = gpu
+                    .alloc_tensor(&[w.m], DType::F32)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                oq4_gemv_into(gpu, w, x, false, &tmp)?;
+                gpu.add_inplace_f32(residual, &tmp)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                return gpu
+                    .free_tensor(tmp)
+                    .map_err(|e| DispatchError::Hip(e.to_string()));
+            }
             // For dtypes WITHOUT a fused residual kernel (Q8_0, Q4K, F32), the
             // fallback path runs a plain GEMV then `residual += result`. `out` may
             // be used as scratch ONLY when it does not alias `residual`; when it

@@ -947,6 +947,13 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
         // The fused MFP4G32 optimization is handled inside
         // GemvFamily::run() -> Prerotated arm.
         _ => {
+            debug_assert!(
+                w.gpu_dtype != DType::Oq4G256,
+                "Oq4G256 reached weight_gemv generic arm — should hit the dedicated arm"
+            );
+            if std::env::var_os("HIPFIRE_OQ4_TRACE").is_some() {
+                eprintln!("[oq4-trace] weight_gemv generic _ => arm dtype={:?}", w.gpu_dtype);
+            }
             gpu.ensure_mq_signs()?;
             let xr = xr!();
             rotate_x_mq_for(gpu, w, x, &xr, w.k)?;

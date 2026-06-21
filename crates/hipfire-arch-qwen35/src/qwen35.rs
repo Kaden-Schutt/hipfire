@@ -25541,7 +25541,13 @@ fn forward_scratch_layers(
     // Final norm into scratch.tmp; optionally emit logits into scratch.logits.
     gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
     if needs_last_token_logits {
-        {
+        if weights.output.gpu_dtype == DType::Oq4G256 {
+            // Opus W4A4 lm_head: the dispatch pipeline has no Oq4 GEMV entry
+            // (it needs runtime int4 activation quant), so route through the
+            // dedicated weight_gemv Oq4 arm (rotate → quantize_act_oq4 → grouped
+            // iu4 GEMM). Same treatment the layer projections get.
+            weight_gemv(gpu, &weights.output, &s.tmp, &s.logits)?;
+        } else {
             let ctx = DispatchCtx::new(gpu);
             let wr = weights.output.dispatch_ref();
             let step = Step::Gemv {

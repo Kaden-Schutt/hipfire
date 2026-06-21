@@ -113,6 +113,10 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
     match dtype {
         MQ4G256 | MQ3G256 | Qtip3G256 | MQ2G256 | MQ6G256 | MQ2G256Lloyd | MQ3G256Lloyd
         | MQ4G256Lloyd | MFP4G32 => RotationPlan::FwhtG256,
+        // Opus W4A4: weights are offline FWHT-256-rotated; the pipeline rotates x
+        // to match (RmsnormAutomatic → x_rot), then the Oq4 Gemv arm int4-quantizes
+        // x_rot before the grouped iu4 GEMM (see launch_op / oq4_gemv_into).
+        Oq4G256 => RotationPlan::FwhtG256,
         MQ4G128 => RotationPlan::FwhtG128,
         MQ8G256 => RotationPlan::Mq8Internal,
         ParoQ4G128 => RotationPlan::Givens,
@@ -128,7 +132,7 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
     match dtype {
         ParoQ4G128 => GemvVariant::Plain,
         MQ4G256 | MQ3G256 | Qtip3G256 | MQ2G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd
-        | MQ3G256Lloyd | MQ4G256Lloyd | MFP4G32 | MQ4G128 => GemvVariant::Prerotated,
+        | MQ3G256Lloyd | MQ4G256Lloyd | MFP4G32 | MQ4G128 | Oq4G256 => GemvVariant::Prerotated,
         _ => GemvVariant::Plain,
     }
 }
