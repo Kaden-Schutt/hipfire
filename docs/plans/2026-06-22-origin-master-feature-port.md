@@ -83,7 +83,23 @@ family wiring + quantizer `--format mq5` path, following the `MQ6G256`
 shape. 22-file but single-commit reference.
 Done when: quantize→serve a model at mq5; parity test vs scalar passes;
 coherence gate green; astrea/KLD shows it sits between mq4 and mq6.
-Progress: _not started_
+Progress: SCOPED 2026-06-22 (manual port, NOT cherry-pick). `git cherry-pick
+-n f7efb940` result: the **9 new kernel .hip files apply clean**
+(gemv_hfq5g256*.hip + gemv_mq5g256.hip), `qwen35.rs` + `families/gemv.rs`
+auto-merge clean; **11 conflicts**. Key STRUCTURAL task: master added 423
+lines of MQ5 gemv launchers to `crates/rdna-compute/src/gemv.rs`, but that
+file is **DELETED in chaingun** (launchers live in `dispatch.rs` now) — so
+relocate those launchers into `rdna-compute/src/dispatch.rs`. Other conflicts
+are mechanical enum/arm additions: `types.rs` (add `DType::MQ5G256`, qt **31**;
+size + supports_awq_sidecar), `tables/gemv_table.rs`, `families/moe.rs`
+(routed_indexable_mq5 decode arm), `pipeline/mod.rs`, `tests.rs` +
+`coverage_tests.rs`, `rdna-compute/{dispatch,kernels}.rs` (SRC registration),
+`hfq.rs` (loader qt=31), `quantize/src/main.rs` (`--format mq5`,
+`quantize_mq5g256` 8-vals/5-bytes pack, `HIPFIRE_MOE_{EXPERTS,DOWN}_MQ5`).
+Known upstream gaps (non-blocking, mirror them): batched-prefill rejects MQ5
+(per-token fallback), shared-expert prefill fused gate+up MQ5 unbuilt, mixed
+gu4_dn5 not indexable. Next iteration: execute the port, `cargo build` all 4
+crates, then coherence + KLD gate.
 
 ## [ ] 3. MoE-AWQ per-expert down-proj  — MEDIUM, MoE quality
 Source: `6198851e` (quantizer per-expert AWQ), `459a9eb4` (down-proj AWQ
