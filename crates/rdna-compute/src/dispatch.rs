@@ -33590,6 +33590,56 @@ impl Gpu {
         )
     }
 
+    /// Flash attention with an f16 K cache + Q8_0 V cache (KVarN v1 read path).
+    /// Same tile+reduce machinery as `attention_flash_q8_0_batched_masked`, but
+    /// `k_cache` is a token-major `[max_seq × kv_dim]` f16 shadow (materialized
+    /// by `kvarn_build_kcache`) read directly instead of dequantizing Q8 blocks.
+    /// V stays Q8_0. cos/sin are unused (K unrotated) — `q` is passed for them
+    /// to satisfy the shared dispatcher ABI.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_f16k_q8v_batched_masked(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_asym_flash_batched(
+            "attention_flash_f16k_q8v_tile_batched",
+            kernels::ATTENTION_FLASH_F16K_Q8V_TILE_BATCHED_SRC,
+            "attention_flash_f16k_q8v_tile_batched",
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            q,
+            q,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+        )
+    }
+
     /// Flash attention with Q8_0 KV cache — tile + reduce two-kernel path.
     /// Tiles seq_len into chunks of `tile_size`, launches [n_heads, n_tiles]
     /// blocks for the tile kernel, then [n_heads] blocks for the reduce.

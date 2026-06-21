@@ -2592,6 +2592,10 @@ pub const ATTENTION_FLASH_ASYM2_TILE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_asym2_tile_batched.hip");
 pub const ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_tile_batched.hip");
+/// f16 K + Q8_0 V batched flash tile (KVarN v1 read path). Clone of the Q8 tile
+/// with Phase A reading K directly as f16 from a token-major shadow cache.
+pub const ATTENTION_FLASH_F16K_Q8V_TILE_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_f16k_q8v_tile_batched.hip");
 pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_asym_reduce_batched.hip");
 
