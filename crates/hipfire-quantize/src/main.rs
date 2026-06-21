@@ -113,6 +113,16 @@ static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 // alpha=1 is pure activation-magnitude scaling (no smoothing).
 static AWQ_ALPHA: OnceLock<f32> = OnceLock::new();
 
+// Carries the AWQ sidecar scales out of the HFQ-source per-tensor quantizer
+// (`quantize_hfq_source_tensor`'s Oq4 arm) up to the tensor-write loop, which
+// emits the `<weight>.awq_scale.weight` sidecar. The HFQ-source path returns a
+// fixed 4-tuple with many early returns, so a thread-local avoids re-plumbing
+// every arm. Set inside the Oq4 arm, consumed (taken) right after the push.
+thread_local! {
+    static OQ4_AWQ_SIDECAR: std::cell::RefCell<Option<Vec<f32>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 // MQ+ clip-search: when set (by an `mqN+` format), MQ codecs use the MSE-optimal
 // clip-searched affine range instead of plain min/max. Off by default, so the
 // baseline MQ path (and its golden hashes) is unchanged.
@@ -3081,18 +3091,33 @@ fn quantize_hfq_source_tensor(
         }
         HfqInputFormat::Oq4 => {
             // Opus Quant W4A4. Requires 256-aligned K (FWHT-256); ragged dims fall
-            // back to Q8. Rotation-only here (no AWQ smooth on the HFQ-source path);
-            // the awq_scale sidecar / SmoothQuant lever lands with the safetensors
-            // emit path. Loader is qwen35 qt=34; forward int4-quantizes activations.
+            // back to Q8. Loader is qwen35 qt=34; forward int4-quantizes activations.
+            // SmoothQuant/AWQ: when --awq + an imatrix (e.g. via --hessian) are
+            // present and the tensor is awq_eligible, fold W·s offline (in the
+            // UNROTATED basis, before the codec's FWHT) and stash s for the
+            // `<weight>.awq_scale.weight` sidecar — the runtime divides x/s before
+            // its FWHT+int4-quant, completing (W·s)·(x/s)=W·x. This is the dominant
+            // W4A4 quality lever (migrates activation outliers into the weight).
             if k % 256 != 0 {
                 return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
             }
-            (
-                quantize_oq4g256(&f32_data, &signs1, &signs2),
-                QuantType::Oq4G256,
-                256,
-                "OQ4G256",
-            )
+            let q = if let (Some(alpha), Some(im)) =
+                (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+            {
+                if alpha > 0.0 && awq_eligible(name) {
+                    let scales = compute_awq_scales(im, alpha);
+                    let m_dim = shape[0] as usize;
+                    let mut scaled = f32_data.clone();
+                    awq_pre_scale_weights(&mut scaled, m_dim, k, &scales);
+                    OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(scales));
+                    quantize_oq4g256(&scaled, &signs1, &signs2)
+                } else {
+                    quantize_oq4g256(&f32_data, &signs1, &signs2)
+                }
+            } else {
+                quantize_oq4g256(&f32_data, &signs1, &signs2)
+            };
+            (q, QuantType::Oq4G256, 256, "OQ4G256")
         }
         HfqInputFormat::F16 | HfqInputFormat::Bf16 | HfqInputFormat::Qtip3 => unreachable!(),
     };
@@ -3255,6 +3280,24 @@ fn run_hfq_source_pipeline(
             data,
             spilled_len: 0,
         });
+        // Emit the AWQ sidecar if the Oq4 arm produced SmoothQuant scales for
+        // this tensor (`<weight>.awq_scale.weight`, 1D F16, length K).
+        if let Some(scales) = OQ4_AWQ_SIDECAR.with(|c| c.borrow_mut().take()) {
+            let sidecar_name = match t.name.strip_suffix(".weight") {
+                Some(stem) => format!("{stem}.awq_scale.weight"),
+                None => format!("{}.awq_scale.weight", t.name),
+            };
+            let bytes = awq_scales_to_f16_bytes(&scales);
+            eprintln!("    AWQ:    {sidecar_name} [{}] (1D F16, {} B)", scales.len(), bytes.len());
+            hfq_tensors.push(HfqTensor {
+                name: sidecar_name,
+                quant_type: QuantType::F16,
+                shape: vec![scales.len() as u32],
+                group_size: 0,
+                data: bytes,
+                spilled_len: 0,
+            });
+        }
     }
 
     // Real QTIP-3 is a post-pass over the BF16-staged 2D weights, shared with
