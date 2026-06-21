@@ -14,7 +14,7 @@
 //! storing `min_v` at zero is correct: `scale * 0 + min_v = min_v`. Nibble formula:
 //! `q = round((x - min_v) * inv_scale).clamp(0, 15)`.
 
-use hipfire_runtime::llama::f16_to_f32;
+use hipfire_runtime::quant::f16_to_f32;
 
 const GROUP_SIZE: usize = 128;
 const BYTES_PER_GROUP: usize = 72; // 4-byte scale + 4-byte zero + 64 packed nibbles
@@ -164,7 +164,7 @@ pub fn should_quantize_la_gate(prefix: &str, arch: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hipfire_runtime::llama::{f16_to_f32, f32_to_f16};
+    use hipfire_runtime::quant::{f16_to_f32, f32_to_f16};
 
     #[test]
     fn encoder_produces_expected_byte_count() {
