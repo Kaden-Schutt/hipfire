@@ -18,6 +18,30 @@ pub struct OperatorArgs {
 pub enum OperatorCommand {
     /// Combined status snapshot for scripts and agents
     Status,
+    /// Send one non-streaming chat request through /v1/chat/completions
+    Chat {
+        /// Model tag/path. Defaults to server config when omitted.
+        #[arg(long)]
+        model: Option<String>,
+        /// Optional system message
+        #[arg(long)]
+        system: Option<String>,
+        /// Max tokens to generate
+        #[arg(long)]
+        max_tokens: Option<u32>,
+        /// Sampling temperature
+        #[arg(long)]
+        temperature: Option<f64>,
+        /// Nucleus sampling top-p
+        #[arg(long)]
+        top_p: Option<f64>,
+        /// Print only the assistant message text
+        #[arg(long)]
+        text: bool,
+        /// User prompt text
+        #[arg(required = true, trailing_var_arg = true)]
+        prompt: Vec<String>,
+    },
     /// Raw /health payload
     Health,
     /// Local model registry from the operator API
@@ -66,6 +90,45 @@ pub async fn run(args: OperatorArgs, config: HipfireConfig) -> anyhow::Result<()
                 "models": models,
                 "training": training,
             })
+        }
+        OperatorCommand::Chat {
+            model,
+            system,
+            max_tokens,
+            temperature,
+            top_p,
+            text,
+            prompt,
+        } => {
+            let mut messages = Vec::new();
+            if let Some(system) = system {
+                messages.push(json!({"role": "system", "content": system}));
+            }
+            messages.push(json!({"role": "user", "content": prompt.join(" ")}));
+
+            let mut body = json!({
+                "stream": false,
+                "messages": messages,
+            });
+            if let Some(model) = model {
+                body["model"] = json!(model);
+            }
+            if let Some(max_tokens) = max_tokens {
+                body["max_tokens"] = json!(max_tokens);
+            }
+            if let Some(temperature) = temperature {
+                body["temperature"] = json!(temperature);
+            }
+            if let Some(top_p) = top_p {
+                body["top_p"] = json!(top_p);
+            }
+
+            let value = client.post_json("/v1/chat/completions", &body).await?;
+            if text {
+                println!("{}", assistant_text(&value).unwrap_or_default());
+                return Ok(());
+            }
+            value
         }
         OperatorCommand::Health => client.get("/health").await?,
         OperatorCommand::Models => client.get("/operator/models/registry").await?,
@@ -133,6 +196,18 @@ impl OperatorClient {
         serde_json::from_str(&text)
             .map_err(|err| anyhow::anyhow!("GET {url}: JSON parse error: {err}; body: {text}"))
     }
+
+    async fn post_json(&self, path: &str, body: &Value) -> anyhow::Result<Value> {
+        let url = format!("{}{}", self.base_url, normalize_path(path));
+        let response = self.http.post(&url).json(body).send().await?;
+        let status = response.status();
+        let text = response.text().await?;
+        if !status.is_success() {
+            anyhow::bail!("POST {url} failed with {status}: {text}");
+        }
+        serde_json::from_str(&text)
+            .map_err(|err| anyhow::anyhow!("POST {url}: JSON parse error: {err}; body: {text}"))
+    }
 }
 
 fn probe_host_for(host: &str) -> String {
@@ -176,6 +251,15 @@ fn url_encode_path_segment(value: &str) -> String {
     url_encode(value)
 }
 
+fn assistant_text(value: &Value) -> Option<&str> {
+    value
+        .get("choices")?
+        .get(0)?
+        .get("message")?
+        .get("content")?
+        .as_str()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +287,19 @@ mod tests {
     fn encodes_operator_query_values_and_path_segments() {
         assert_eq!(url_encode("qwen3.5:9b"), "qwen3.5%3A9b");
         assert_eq!(url_encode_path_segment("run/a b"), "run%2Fa%20b");
+    }
+
+    #[test]
+    fn extracts_assistant_text_from_chat_completion() {
+        let payload = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "pong"
+                }
+            }]
+        });
+
+        assert_eq!(assistant_text(&payload), Some("pong"));
     }
 }

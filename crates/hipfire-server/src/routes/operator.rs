@@ -332,7 +332,7 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
       font-size: 12px;
       font-weight: 600;
     }
-    input, button {
+    input, textarea, button {
       height: 34px;
       border: 1px solid var(--line);
       border-radius: 6px;
@@ -340,9 +340,17 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
       color: var(--text);
       font: inherit;
     }
-    input {
+    input, textarea {
       width: min(360px, 76vw);
       padding: 0 10px;
+    }
+    textarea {
+      width: 100%;
+      min-height: 112px;
+      height: auto;
+      padding: 10px;
+      resize: vertical;
+      line-height: 1.4;
     }
     button {
       padding: 0 12px;
@@ -460,6 +468,15 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
       color: var(--muted);
       white-space: pre-wrap;
     }
+    .chat-transcript {
+      min-height: 260px;
+      max-height: 560px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 10px;
+    }
     pre {
       margin: 0;
       overflow: auto;
@@ -482,6 +499,7 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
       .status { width: 100%; text-align: left; margin-left: 0; }
       table { font-size: 13px; }
       th:nth-child(4), td:nth-child(4), th:nth-child(5), td:nth-child(5) { display: none; }
+      .tab { min-width: auto; }
     }
   </style>
 </head>
@@ -493,6 +511,7 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
   <main>
     <nav class="tabs" aria-label="Operator sections">
       <button class="tab active" data-tab="overview" type="button">Overview</button>
+      <button class="tab" data-tab="chat" type="button">Chat</button>
       <button class="tab" data-tab="models" type="button">Models</button>
       <button class="tab" data-tab="runtime" type="button">Runtime</button>
       <button class="tab" data-tab="diagnostics" type="button">Diagnostics</button>
@@ -518,6 +537,31 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
         <section>
           <h2 class="section-title">Recent Issues</h2>
           <div id="overview-issues" class="event-list"></div>
+        </section>
+      </div>
+    </section>
+    <section id="chat-panel" class="panel" hidden>
+      <div class="toolbar">
+        <label>Model
+          <input id="chat-model" name="chat-model" autocomplete="off" placeholder="default runtime model">
+        </label>
+        <label>Max tokens
+          <input id="chat-max-tokens" type="number" min="1" max="32768" value="256">
+        </label>
+        <label>Temperature
+          <input id="chat-temperature" type="number" min="0" max="2" step="0.05" value="0.7">
+        </label>
+        <button id="chat-send" type="button">Send</button>
+        <button id="chat-clear" type="button">Clear</button>
+      </div>
+      <div class="grid">
+        <section>
+          <h2 class="section-title">Messages</h2>
+          <div id="chat-transcript" class="chat-transcript event-list"></div>
+        </section>
+        <section>
+          <h2 class="section-title">Prompt</h2>
+          <textarea id="chat-prompt" autocomplete="off" spellcheck="true" placeholder="Ask the loaded/default model"></textarea>
         </section>
       </div>
     </section>
@@ -651,6 +695,13 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
     const overviewTrainingEl = document.getElementById("overview-training");
     const overviewRuntimeEl = document.getElementById("overview-runtime");
     const overviewIssuesEl = document.getElementById("overview-issues");
+    const chatModelEl = document.getElementById("chat-model");
+    const chatMaxTokensEl = document.getElementById("chat-max-tokens");
+    const chatTemperatureEl = document.getElementById("chat-temperature");
+    const chatPromptEl = document.getElementById("chat-prompt");
+    const chatSendEl = document.getElementById("chat-send");
+    const chatClearEl = document.getElementById("chat-clear");
+    const chatTranscriptEl = document.getElementById("chat-transcript");
     const modelsCountEl = document.getElementById("models-count");
     const modelsAliasesEl = document.getElementById("models-aliases");
     const modelsLocalEl = document.getElementById("models-local");
@@ -684,6 +735,7 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
     const trainingAdmissionEl = document.getElementById("training-admission");
     const trainingEventsEl = document.getElementById("training-events");
     let selectedTrainingRun = null;
+    let chatMessages = [];
 
     function text(value) {
       if (value === null || value === undefined) return "";
@@ -726,6 +778,74 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
       code.textContent = detail || "";
       div.append(strong, code);
       return div;
+    }
+
+    function chatCard(message) {
+      const div = document.createElement("div");
+      div.className = "event";
+      const role = document.createElement("strong");
+      role.textContent = message.role || "message";
+      const code = document.createElement("code");
+      code.textContent = typeof message.content === "string" ? message.content : text(message.content);
+      div.append(role, code);
+      return div;
+    }
+
+    function renderChat() {
+      if (!chatMessages.length) {
+        chatTranscriptEl.replaceChildren(issueCard("No messages", "Send a prompt to /v1/chat/completions."));
+        return;
+      }
+      chatTranscriptEl.replaceChildren(...chatMessages.map(chatCard));
+      chatTranscriptEl.scrollTop = chatTranscriptEl.scrollHeight;
+    }
+
+    async function loadChat() {
+      if (!chatModelEl.value.trim()) {
+        const health = await fetchJson("/health");
+        chatModelEl.value = health.model || "";
+      }
+      renderChat();
+      statusEl.textContent = "chat";
+    }
+
+    async function sendChat() {
+      const prompt = chatPromptEl.value.trim();
+      if (!prompt) {
+        statusEl.textContent = "empty prompt";
+        return;
+      }
+      const nextMessages = [...chatMessages, {role: "user", content: prompt}];
+      const body = {
+        stream: false,
+        messages: nextMessages,
+        max_tokens: Math.max(1, Number(chatMaxTokensEl.value || 256)),
+        temperature: Number(chatTemperatureEl.value || 0.7),
+      };
+      const model = chatModelEl.value.trim();
+      if (model) body.model = model;
+      statusEl.textContent = "sending chat";
+      chatSendEl.disabled = true;
+      try {
+        const resp = await fetch("/v1/chat/completions", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(body),
+        });
+        const payload = await resp.json();
+        if (!resp.ok || payload.error) {
+          throw new Error((payload.error && payload.error.message) || `chat ${resp.status}`);
+        }
+        const choice = payload.choices && payload.choices[0];
+        const message = choice && choice.message || {};
+        const content = message.content || (message.tool_calls ? JSON.stringify(message.tool_calls, null, 2) : "");
+        chatMessages = [...nextMessages, {role: "assistant", content}];
+        chatPromptEl.value = "";
+        renderChat();
+        statusEl.textContent = "chat complete";
+      } finally {
+        chatSendEl.disabled = false;
+      }
     }
 
     async function loadOverview() {
@@ -1057,6 +1177,7 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
       for (const tab of tabEls) tab.classList.toggle("active", tab.dataset.tab === name);
       const loaders = {
         overview: loadOverview,
+        chat: loadChat,
         models: loadModels,
         runtime: loadRuntime,
         diagnostics: loadDiagnostics,
@@ -1068,6 +1189,17 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
     }
 
     document.getElementById("overview-refresh").addEventListener("click", () => loadOverview().catch(showError));
+    chatSendEl.addEventListener("click", () => sendChat().catch(showError));
+    chatClearEl.addEventListener("click", () => {
+      chatMessages = [];
+      renderChat();
+      statusEl.textContent = "chat cleared";
+    });
+    chatPromptEl.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+        sendChat().catch(showError);
+      }
+    });
     document.getElementById("models-refresh").addEventListener("click", () => loadModels().catch(showError));
     document.getElementById("runtime-refresh").addEventListener("click", () => loadRuntime().catch(showError));
     document.getElementById("diagnostics-refresh").addEventListener("click", () => loadDiagnostics().catch(showError));
@@ -1124,10 +1256,12 @@ mod tests {
     #[test]
     fn operator_index_exposes_runtime_diagnostics_and_logs_surfaces() {
         assert!(OPERATOR_INDEX_HTML.contains("Overview"));
+        assert!(OPERATOR_INDEX_HTML.contains("Chat"));
         assert!(OPERATOR_INDEX_HTML.contains("Models"));
         assert!(OPERATOR_INDEX_HTML.contains("Runtime"));
         assert!(OPERATOR_INDEX_HTML.contains("Diagnostics"));
         assert!(OPERATOR_INDEX_HTML.contains("Logs"));
+        assert!(OPERATOR_INDEX_HTML.contains("/v1/chat/completions"));
         assert!(OPERATOR_INDEX_HTML.contains("/operator/diagnostics"));
         assert!(OPERATOR_INDEX_HTML.contains("/operator/logs"));
         assert!(OPERATOR_INDEX_HTML.contains("/operator/models/registry"));

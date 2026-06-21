@@ -17,6 +17,7 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire gpu-lock status`↴](#hipfire-gpu-lock-status)
 * [`hipfire operator`↴](#hipfire-operator)
 * [`hipfire operator status`↴](#hipfire-operator-status)
+* [`hipfire operator chat`↴](#hipfire-operator-chat)
 * [`hipfire operator health`↴](#hipfire-operator-health)
 * [`hipfire operator models`↴](#hipfire-operator-models)
 * [`hipfire operator config`↴](#hipfire-operator-config)
@@ -181,6 +182,7 @@ Query the running hipfire operator API for scripts and agents
 ###### **Subcommands:**
 
 * `status` — Combined status snapshot for scripts and agents
+* `chat` — Send one non-streaming chat request through /v1/chat/completions
 * `health` — Raw /health payload
 * `models` — Local model registry from the operator API
 * `config` — Resolved runtime config
@@ -201,6 +203,27 @@ Query the running hipfire operator API for scripts and agents
 Combined status snapshot for scripts and agents
 
 **Usage:** `hipfire operator status`
+
+
+
+## `hipfire operator chat`
+
+Send one non-streaming chat request through /v1/chat/completions
+
+**Usage:** `hipfire operator chat [OPTIONS] <PROMPT>...`
+
+###### **Arguments:**
+
+* `<PROMPT>` — User prompt text
+
+###### **Options:**
+
+* `--model <MODEL>` — Model tag/path. Defaults to server config when omitted
+* `--system <SYSTEM>` — Optional system message
+* `--max-tokens <MAX_TOKENS>` — Max tokens to generate
+* `--temperature <TEMPERATURE>` — Sampling temperature
+* `--top-p <TOP_P>` — Nucleus sampling top-p
+* `--text` — Print only the assistant message text
 
 
 
