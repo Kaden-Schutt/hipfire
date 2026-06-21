@@ -70,11 +70,11 @@ pub struct KvCache {
     pub compact_offset: usize,
     /// True = KVarN mode: K stored as variance-normalized 4-bit block records
     /// (`kvarn.rs` tile = `[head_dim × GROUP]`, GROUP=128) for full 128-token
-    /// blocks, plus an fp16 recent-window ring for the partial trailing block;
+    /// blocks, plus an f32 recent-window ring for the partial trailing block;
     /// V stays Q8_0 (reuses the asym4 V layout). See `new_gpu_kvarn_capped`.
     pub quant_kvarn: bool,
-    /// KVarN fp16 recent-window ring: `[n_layers]` buffers, each `GROUP × kv_dim`
-    /// f16, holding the K rows of the not-yet-quantized trailing block. Empty
+    /// KVarN recent-window staging ring: `[n_layers]` buffers, each `GROUP × kv_dim`
+    /// f32, holding the K rows of the not-yet-quantized trailing block. Empty
     /// unless `quant_kvarn`. A block is flush-quantized into `k_gpu` once full.
     pub k_window: Vec<GpuTensor>,
 }
@@ -1031,8 +1031,11 @@ impl KvCache {
         for _ in 0..n_layers {
             k_gpu.push(gpu.zeros(&[k_elems], DType::F32)?);
             v_gpu.push(gpu.zeros(&[v_elems], DType::F32)?);
-            // fp16 recent-window ring: GROUP tokens × kv_dim.
-            k_window.push(gpu.zeros(&[group * kv_dim], DType::F16)?);
+            // Recent-window staging ring: GROUP tokens × kv_dim, stored F32 so
+            // the existing `kv_cache_write_f32_batched` can append rows and the
+            // gather/quantize kernels share one input dtype. It holds at most one
+            // 128-token block, so the f32-vs-f16 size cost is negligible.
+            k_window.push(gpu.zeros(&[group * kv_dim], DType::F32)?);
         }
         let k_bph = rec_bytes / n_kv_heads.max(1); // informational; record is per-head already
         let v_bph = v_bpp / n_kv_heads;
