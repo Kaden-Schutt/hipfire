@@ -78,7 +78,7 @@ impl TrainingState {
 
 fn load_remote(config: &ConfigState) -> Result<TrainingState, String> {
     let url = format!(
-        "http://{}:{}/operator/training/runs",
+        "http://{}:{}/admin/training/runs",
         config.probe_host(),
         config.port
     );
@@ -104,7 +104,7 @@ fn load_remote(config: &ConfigState) -> Result<TrainingState, String> {
 
 fn load_remote_detail(config: &ConfigState, run_id: &str) -> Result<TrainingRunDetail, String> {
     let url = format!(
-        "http://{}:{}/operator/training/runs/{}",
+        "http://{}:{}/admin/training/runs/{}",
         config.probe_host(),
         config.port,
         run_id

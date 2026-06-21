@@ -9,11 +9,11 @@ use std::{fs, path::Path};
 
 use crate::SharedState;
 
-pub async fn get_operator_index() -> Html<&'static str> {
-    Html(OPERATOR_INDEX_HTML)
+pub async fn get_admin_index() -> Html<&'static str> {
+    Html(ADMIN_INDEX_HTML)
 }
 
-pub async fn get_operator_diagnostics(State(state): State<SharedState>) -> Json<Value> {
+pub async fn get_admin_diagnostics(State(state): State<SharedState>) -> Json<Value> {
     let loaded = state.loaded_config.lock().await;
     let root = hipfire_config::hipfire_dir();
     Json(json!({
@@ -31,11 +31,11 @@ pub async fn get_operator_diagnostics(State(state): State<SharedState>) -> Json<
 }
 
 #[derive(Debug, Deserialize)]
-pub struct OperatorLogsQuery {
+pub struct AdminLogsQuery {
     pub lines: Option<usize>,
 }
 
-pub async fn get_operator_logs(Query(query): Query<OperatorLogsQuery>) -> Json<Value> {
+pub async fn get_admin_logs(Query(query): Query<AdminLogsQuery>) -> Json<Value> {
     let root = hipfire_config::hipfire_dir();
     let lines = query.lines.unwrap_or(120).clamp(1, 1000);
     Json(json!({
@@ -260,12 +260,12 @@ fn tail_file(path: &Path, lines: usize) -> String {
     selected.join("\n")
 }
 
-const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
+const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>hipfire operator</title>
+  <title>hipfire admin console</title>
   <style>
     :root {
       color-scheme: light dark;
@@ -505,11 +505,11 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
 </head>
 <body>
   <header>
-    <h1>hipfire operator</h1>
+    <h1>hipfire admin console</h1>
     <div id="status" class="status">connecting</div>
   </header>
   <main>
-    <nav class="tabs" aria-label="Operator sections">
+    <nav class="tabs" aria-label="Admin sections">
       <button class="tab active" data-tab="overview" type="button">Overview</button>
       <button class="tab" data-tab="chat" type="button">Chat</button>
       <button class="tab" data-tab="models" type="button">Models</button>
@@ -852,8 +852,8 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
       statusEl.textContent = "loading overview";
       const [health, diagnostics, training] = await Promise.all([
         fetchJson("/health"),
-        fetchJson("/operator/diagnostics"),
-        fetchJson("/operator/training/runs"),
+        fetchJson("/admin/diagnostics"),
+        fetchJson("/admin/training/runs"),
       ]);
       overviewHealthEl.textContent = health.status || "-";
       overviewPidEl.textContent = health.pid || "-";
@@ -877,7 +877,7 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
       for (const cache of diagnostics.kernel_caches || []) {
         if (!cache.balanced) issues.push(issueCard(`kernel cache mismatch ${cache.arch}`, `${cache.hsaco} hsaco / ${cache.hash} hash`, true));
       }
-      if (!issues.length) issues.push(issueCard("No current operator issues", "Health, diagnostics, and kernel cache checks did not report a warning."));
+      if (!issues.length) issues.push(issueCard("No current admin issues", "Health, diagnostics, and kernel cache checks did not report a warning."));
       overviewIssuesEl.replaceChildren(...issues);
       statusEl.textContent = "overview";
     }
@@ -886,7 +886,7 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
       statusEl.textContent = "loading models";
       const [health, registry] = await Promise.all([
         fetchJson("/health"),
-        fetchJson("/operator/models/registry"),
+        fetchJson("/admin/models/registry"),
       ]);
       const models = registry.models || [];
       const aliases = registry.aliases || {};
@@ -933,7 +933,7 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
 
     async function loadDiagnostics() {
       statusEl.textContent = "loading diagnostics";
-      const diagnostics = await fetchJson("/operator/diagnostics");
+      const diagnostics = await fetchJson("/admin/diagnostics");
       const paths = [...(diagnostics.paths || []), ...(diagnostics.binaries || [])];
       diagnosticsPathsEl.replaceChildren(...paths.map((item) => {
         const tr = document.createElement("tr");
@@ -966,7 +966,7 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
     async function loadLogs() {
       statusEl.textContent = "loading logs";
       const lines = Number(logsLinesEl.value || 160);
-      const payload = await fetchJson(`/operator/logs?lines=${Math.max(1, Math.min(1000, lines))}`);
+      const payload = await fetchJson(`/admin/logs?lines=${Math.max(1, Math.min(1000, lines))}`);
       const logs = payload.logs || [];
       logsListEl.replaceChildren(...logs.map((log) => {
         const section = document.createElement("section");
@@ -989,8 +989,8 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
       const suffix = model ? `?model=${encodeURIComponent(model)}` : "";
       statusEl.textContent = "loading";
       const [schemaResp, resolvedResp] = await Promise.all([
-        fetch("/operator/config/schema"),
-        fetch(`/operator/config/resolved${suffix}`),
+        fetch("/admin/config/schema"),
+        fetch(`/admin/config/resolved${suffix}`),
       ]);
       if (!schemaResp.ok) throw new Error(`schema ${schemaResp.status}`);
       if (!resolvedResp.ok) throw new Error(`resolved ${resolvedResp.status}`);
@@ -1002,7 +1002,7 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
 
     async function loadTraining() {
       statusEl.textContent = "loading training";
-      const resp = await fetch("/operator/training/runs");
+      const resp = await fetch("/admin/training/runs");
       if (!resp.ok) throw new Error(`training ${resp.status}`);
       const payload = await resp.json();
       renderTraining(payload);
@@ -1019,7 +1019,7 @@ const OPERATOR_INDEX_HTML: &str = r#"<!doctype html>
 
     async function loadTrainingDetail(id) {
       selectedTrainingRun = id;
-      const resp = await fetch(`/operator/training/runs/${encodeURIComponent(id)}`);
+      const resp = await fetch(`/admin/training/runs/${encodeURIComponent(id)}`);
       if (!resp.ok) throw new Error(`training run ${resp.status}`);
       const detail = await resp.json();
       renderTrainingDetail(detail);
@@ -1241,36 +1241,36 @@ mod tests {
     }
 
     #[test]
-    fn operator_index_fetches_config_endpoints() {
-        assert!(OPERATOR_INDEX_HTML.contains("/operator/config/schema"));
-        assert!(OPERATOR_INDEX_HTML.contains("/operator/config/resolved"));
+    fn admin_index_fetches_config_endpoints() {
+        assert!(ADMIN_INDEX_HTML.contains("/admin/config/schema"));
+        assert!(ADMIN_INDEX_HTML.contains("/admin/config/resolved"));
     }
 
     #[test]
-    fn operator_index_exposes_training_surface() {
-        assert!(OPERATOR_INDEX_HTML.contains("Training"));
-        assert!(OPERATOR_INDEX_HTML.contains("/operator/training/runs"));
-        assert!(OPERATOR_INDEX_HTML.contains("training-events"));
+    fn admin_index_exposes_training_surface() {
+        assert!(ADMIN_INDEX_HTML.contains("Training"));
+        assert!(ADMIN_INDEX_HTML.contains("/admin/training/runs"));
+        assert!(ADMIN_INDEX_HTML.contains("training-events"));
     }
 
     #[test]
-    fn operator_index_exposes_runtime_diagnostics_and_logs_surfaces() {
-        assert!(OPERATOR_INDEX_HTML.contains("Overview"));
-        assert!(OPERATOR_INDEX_HTML.contains("Chat"));
-        assert!(OPERATOR_INDEX_HTML.contains("Models"));
-        assert!(OPERATOR_INDEX_HTML.contains("Runtime"));
-        assert!(OPERATOR_INDEX_HTML.contains("Diagnostics"));
-        assert!(OPERATOR_INDEX_HTML.contains("Logs"));
-        assert!(OPERATOR_INDEX_HTML.contains("/v1/chat/completions"));
-        assert!(OPERATOR_INDEX_HTML.contains("/operator/diagnostics"));
-        assert!(OPERATOR_INDEX_HTML.contains("/operator/logs"));
-        assert!(OPERATOR_INDEX_HTML.contains("/operator/models/registry"));
+    fn admin_index_exposes_runtime_diagnostics_and_logs_surfaces() {
+        assert!(ADMIN_INDEX_HTML.contains("Overview"));
+        assert!(ADMIN_INDEX_HTML.contains("Chat"));
+        assert!(ADMIN_INDEX_HTML.contains("Models"));
+        assert!(ADMIN_INDEX_HTML.contains("Runtime"));
+        assert!(ADMIN_INDEX_HTML.contains("Diagnostics"));
+        assert!(ADMIN_INDEX_HTML.contains("Logs"));
+        assert!(ADMIN_INDEX_HTML.contains("/v1/chat/completions"));
+        assert!(ADMIN_INDEX_HTML.contains("/admin/diagnostics"));
+        assert!(ADMIN_INDEX_HTML.contains("/admin/logs"));
+        assert!(ADMIN_INDEX_HTML.contains("/admin/models/registry"));
     }
 
     #[test]
     fn tail_file_limits_lines() {
         let path =
-            std::env::temp_dir().join(format!("hipfire-operator-tail-{}.log", std::process::id()));
+            std::env::temp_dir().join(format!("hipfire-admin-tail-{}.log", std::process::id()));
         std::fs::write(&path, "one\ntwo\nthree\nfour\n").expect("write log");
 
         let tail = tail_file(&path, 2);

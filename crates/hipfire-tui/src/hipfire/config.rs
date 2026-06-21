@@ -52,7 +52,7 @@ impl ConfigState {
         let probe_host = values
             .get("host")
             .cloned()
-            .unwrap_or_else(|| "0.0.0.0".into());
+            .unwrap_or_else(|| "127.0.0.1".into());
         let probe_port = values
             .get("port")
             .and_then(|s| s.parse::<u16>().ok())
@@ -75,7 +75,7 @@ impl ConfigState {
         let host = values
             .get("host")
             .cloned()
-            .unwrap_or_else(|| "0.0.0.0".into());
+            .unwrap_or_else(|| "127.0.0.1".into());
         let port = values
             .get("port")
             .and_then(|s| s.parse::<u16>().ok())
@@ -179,7 +179,7 @@ fn probe_host_for(host: &str) -> String {
 }
 
 fn load_remote_schema(host: &str, port: u16) -> (Option<usize>, Option<String>) {
-    let url = format!("http://{host}:{port}/operator/config/schema");
+    let url = format!("http://{host}:{port}/admin/config/schema");
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_millis(450))
         .build();
@@ -211,7 +211,7 @@ fn load_remote_schema(host: &str, port: u16) -> (Option<usize>, Option<String>) 
 }
 
 fn load_remote_resolved(host: &str, port: u16) -> Result<RemoteResolvedConfig, String> {
-    let url = format!("http://{host}:{port}/operator/config/resolved");
+    let url = format!("http://{host}:{port}/admin/config/resolved");
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_millis(650))
         .build();

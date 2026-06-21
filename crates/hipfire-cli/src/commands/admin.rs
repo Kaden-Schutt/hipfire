@@ -3,19 +3,19 @@ use hipfire_config::HipfireConfig;
 use serde_json::{json, Value};
 
 #[derive(Debug, Args)]
-pub struct OperatorArgs {
-    /// Override operator API host. Defaults to config host, with 0.0.0.0 mapped to 127.0.0.1.
+pub struct AdminArgs {
+    /// Override admin API host. Defaults to config host, with 0.0.0.0 mapped to 127.0.0.1.
     #[arg(long, global = true)]
     pub host: Option<String>,
-    /// Override operator API port. Defaults to config port.
+    /// Override admin API port. Defaults to config port.
     #[arg(long, global = true)]
     pub port: Option<u16>,
     #[command(subcommand)]
-    pub command: OperatorCommand,
+    pub command: AdminCommand,
 }
 
 #[derive(Debug, Subcommand)]
-pub enum OperatorCommand {
+pub enum AdminCommand {
     /// Combined status snapshot for scripts and agents
     Status,
     /// Send one non-streaming chat request through /v1/chat/completions
@@ -44,7 +44,7 @@ pub enum OperatorCommand {
     },
     /// Raw /health payload
     Health,
-    /// Local model registry from the operator API
+    /// Local model registry from the admin API
     Models,
     /// Resolved runtime config
     Config {
@@ -68,21 +68,21 @@ pub enum OperatorCommand {
         #[arg(long, default_value_t = 120)]
         lines: usize,
     },
-    /// GET an arbitrary operator/server path, e.g. /operator/training/runs
+    /// GET an arbitrary admin/server path, e.g. /admin/training/runs
     Get {
         /// Absolute or relative server path
         path: String,
     },
 }
 
-pub async fn run(args: OperatorArgs, config: HipfireConfig) -> anyhow::Result<()> {
-    let client = OperatorClient::new(args.host, args.port, &config);
+pub async fn run(args: AdminArgs, config: HipfireConfig) -> anyhow::Result<()> {
+    let client = AdminClient::new(args.host, args.port, &config);
     let value = match args.command {
-        OperatorCommand::Status => {
+        AdminCommand::Status => {
             let health = client.get("/health").await?;
-            let diagnostics = client.get("/operator/diagnostics").await?;
-            let models = client.get("/operator/models/registry").await?;
-            let training = client.get("/operator/training/runs").await?;
+            let diagnostics = client.get("/admin/diagnostics").await?;
+            let models = client.get("/admin/models/registry").await?;
+            let training = client.get("/admin/training/runs").await?;
             json!({
                 "base_url": client.base_url,
                 "health": health,
@@ -91,7 +91,7 @@ pub async fn run(args: OperatorArgs, config: HipfireConfig) -> anyhow::Result<()
                 "training": training,
             })
         }
-        OperatorCommand::Chat {
+        AdminCommand::Chat {
             model,
             system,
             max_tokens,
@@ -130,20 +130,20 @@ pub async fn run(args: OperatorArgs, config: HipfireConfig) -> anyhow::Result<()
             }
             value
         }
-        OperatorCommand::Health => client.get("/health").await?,
-        OperatorCommand::Models => client.get("/operator/models/registry").await?,
-        OperatorCommand::Config { model } => {
+        AdminCommand::Health => client.get("/health").await?,
+        AdminCommand::Models => client.get("/admin/models/registry").await?,
+        AdminCommand::Config { model } => {
             let path = match model {
-                Some(model) => format!("/operator/config/resolved?model={}", url_encode(&model)),
-                None => "/operator/config/resolved".to_string(),
+                Some(model) => format!("/admin/config/resolved?model={}", url_encode(&model)),
+                None => "/admin/config/resolved".to_string(),
             };
             client.get(&path).await?
         }
-        OperatorCommand::Training { id, events } => match (id, events) {
+        AdminCommand::Training { id, events } => match (id, events) {
             (Some(id), true) => {
                 client
                     .get(&format!(
-                        "/operator/training/runs/{}/events",
+                        "/admin/training/runs/{}/events",
                         url_encode_path_segment(&id)
                     ))
                     .await?
@@ -151,31 +151,31 @@ pub async fn run(args: OperatorArgs, config: HipfireConfig) -> anyhow::Result<()
             (Some(id), false) => {
                 client
                     .get(&format!(
-                        "/operator/training/runs/{}",
+                        "/admin/training/runs/{}",
                         url_encode_path_segment(&id)
                     ))
                     .await?
             }
-            (None, _) => client.get("/operator/training/runs").await?,
+            (None, _) => client.get("/admin/training/runs").await?,
         },
-        OperatorCommand::Diagnostics => client.get("/operator/diagnostics").await?,
-        OperatorCommand::Logs { lines } => {
+        AdminCommand::Diagnostics => client.get("/admin/diagnostics").await?,
+        AdminCommand::Logs { lines } => {
             client
-                .get(&format!("/operator/logs?lines={}", lines.clamp(1, 1000)))
+                .get(&format!("/admin/logs?lines={}", lines.clamp(1, 1000)))
                 .await?
         }
-        OperatorCommand::Get { path } => client.get(&normalize_path(&path)).await?,
+        AdminCommand::Get { path } => client.get(&normalize_path(&path)).await?,
     };
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
 
-struct OperatorClient {
+struct AdminClient {
     base_url: String,
     http: reqwest::Client,
 }
 
-impl OperatorClient {
+impl AdminClient {
     fn new(host: Option<String>, port: Option<u16>, config: &HipfireConfig) -> Self {
         let host = host.unwrap_or_else(|| probe_host_for(&config.host));
         let port = port.unwrap_or(config.port);
@@ -278,13 +278,13 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_operator_paths() {
+    fn normalizes_admin_paths() {
         assert_eq!(normalize_path("health"), "/health");
-        assert_eq!(normalize_path("/operator/logs"), "/operator/logs");
+        assert_eq!(normalize_path("/admin/logs"), "/admin/logs");
     }
 
     #[test]
-    fn encodes_operator_query_values_and_path_segments() {
+    fn encodes_admin_query_values_and_path_segments() {
         assert_eq!(url_encode("qwen3.5:9b"), "qwen3.5%3A9b");
         assert_eq!(url_encode_path_segment("run/a b"), "run%2Fa%20b");
     }

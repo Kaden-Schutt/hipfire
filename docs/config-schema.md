@@ -9,13 +9,14 @@
 | `cask_core_frac` | `f64` | optional | `0.5` | `global`, `model`, `runtime` | `load_time` | `none` | Fraction of CASK core candidates to keep. |
 | `cask_fold_m` | `u32` | optional | `2` | `global`, `model`, `runtime` | `load_time` | `none` | CASK fold factor. |
 | `cask_sidecar` | `path` | required when `cask == true && cask_auto_attach == false` | - | `global`, `model`, `runtime` | `load_time` | `none` | Explicit CASK/TriAttention sidecar path. |
+| `cors_allowed_origins` | `json` | optional | `[]` | `global`, `runtime` | `static` | `none` | Browser origins allowed to call the HTTP API cross-origin. Empty disables CORS (same-origin only); ["*"] allows any origin; otherwise an explicit allowlist such as ["http://localhost:8080"]. |
 | `default_model` | `string` | optional | - | `global`, `runtime` | `load_time` | `none` | Model tag, alias, or path to pre-load or use by default. |
 | `dflash_adaptive_b` | `bool` | optional | `true` | `global`, `model`, `runtime` | `load_time` | `none` | Whether DFlash may adapt draft batch size. |
 | `dflash_mode` | `enum(off|auto|on)` | optional | `off` | `global`, `model`, `runtime` | `load_time` | `none` | DFlash speculative decode mode. |
 | `dflash_ngram_block` | `json` | optional | `"auto"` | `global`, `model`, `runtime` | `load_time` | `none` | DFlash n-gram blocking policy; accepts boolean or auto. |
 | `flash_mode` | `enum(auto|always|never)` | optional | `auto` | `global`, `model`, `runtime` | `load_time` | `none` | Flash-attention selection policy. |
 | `gpu_slab_load` | `enum(auto|off|on)` | optional | `auto` | `global`, `model`, `runtime` | `load_time` | `none` | GPU slab loading policy for model weights. |
-| `host` | `string` | optional | `0.0.0.0` | `global`, `runtime` | `static` | `none` | Bind host for the OpenAI-compatible HTTP server. |
+| `host` | `string` | optional | `127.0.0.1` | `global`, `runtime` | `static` | `none` | Bind host for the OpenAI-compatible HTTP server. Defaults to loopback; set to 0.0.0.0 to expose on all interfaces. |
 | `idle_timeout` | `u32` | optional | `300` | `global`, `runtime` | `runtime_reloadable` | `none` | Seconds of inactivity before the server may evict an idle model. |
 | `kv_adaptive` | `enum(off|auto)` | optional | `off` | `global`, `model`, `runtime` | `load_time` | `none` | Adaptive KV-cache policy. |
 | `kv_cache` | `enum(auto|q8|asym2|asym3|asym4)` | optional | `auto` | `global`, `model`, `runtime` | `load_time` | `none` | KV-cache precision and memory policy. |

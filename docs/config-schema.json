@@ -155,6 +155,27 @@
     "env": []
   },
   {
+    "key": "cors_allowed_origins",
+    "type": {
+      "kind": "json"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "[]",
+    "scopes": [
+      "global",
+      "runtime"
+    ],
+    "mutability": "static",
+    "owner": "hipfire-config",
+    "description": "Browser origins allowed to call the HTTP API cross-origin. Empty disables CORS (same-origin only); [\"*\"] allows any origin; otherwise an explicit allowlist such as [\"http://localhost:8080\"].",
+    "validation": "JSON array of origin strings, or [\"*\"]",
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
     "key": "default_model",
     "type": {
       "kind": "string"
@@ -308,14 +329,14 @@
     "requirement": {
       "kind": "optional"
     },
-    "default": "0.0.0.0",
+    "default": "127.0.0.1",
     "scopes": [
       "global",
       "runtime"
     ],
     "mutability": "static",
     "owner": "hipfire-config",
-    "description": "Bind host for the OpenAI-compatible HTTP server.",
+    "description": "Bind host for the OpenAI-compatible HTTP server. Defaults to loopback; set to 0.0.0.0 to expose on all interfaces.",
     "validation": "valid IP address or hostname",
     "secret": false,
     "restart_impact": "none",

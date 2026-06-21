@@ -15,16 +15,16 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire gpu-lock acquire`↴](#hipfire-gpu-lock-acquire)
 * [`hipfire gpu-lock release`↴](#hipfire-gpu-lock-release)
 * [`hipfire gpu-lock status`↴](#hipfire-gpu-lock-status)
-* [`hipfire operator`↴](#hipfire-operator)
-* [`hipfire operator status`↴](#hipfire-operator-status)
-* [`hipfire operator chat`↴](#hipfire-operator-chat)
-* [`hipfire operator health`↴](#hipfire-operator-health)
-* [`hipfire operator models`↴](#hipfire-operator-models)
-* [`hipfire operator config`↴](#hipfire-operator-config)
-* [`hipfire operator training`↴](#hipfire-operator-training)
-* [`hipfire operator diagnostics`↴](#hipfire-operator-diagnostics)
-* [`hipfire operator logs`↴](#hipfire-operator-logs)
-* [`hipfire operator get`↴](#hipfire-operator-get)
+* [`hipfire admin`↴](#hipfire-admin)
+* [`hipfire admin status`↴](#hipfire-admin-status)
+* [`hipfire admin chat`↴](#hipfire-admin-chat)
+* [`hipfire admin health`↴](#hipfire-admin-health)
+* [`hipfire admin models`↴](#hipfire-admin-models)
+* [`hipfire admin config`↴](#hipfire-admin-config)
+* [`hipfire admin training`↴](#hipfire-admin-training)
+* [`hipfire admin diagnostics`↴](#hipfire-admin-diagnostics)
+* [`hipfire admin logs`↴](#hipfire-admin-logs)
+* [`hipfire admin get`↴](#hipfire-admin-get)
 
 ## `hipfire`
 
@@ -41,7 +41,7 @@ hipfire LLM inference CLI
 * `host-profile` — Measure host, GPU-copy, and model storage bandwidth
 * `collect-artifacts` — Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one model load
 * `gpu-lock` — GPU mutex for multi-agent coordination (acquire/release/status)
-* `operator` — Query the running hipfire operator API for scripts and agents
+* `admin` — Query the running hipfire admin API for scripts and agents
 
 
 
@@ -173,44 +173,44 @@ Print lock status: "gpu is free" or "gpu BUSY: <holder>"
 
 
 
-## `hipfire operator`
+## `hipfire admin`
 
-Query the running hipfire operator API for scripts and agents
+Query the running hipfire admin API for scripts and agents
 
-**Usage:** `hipfire operator [OPTIONS] <COMMAND>`
+**Usage:** `hipfire admin [OPTIONS] <COMMAND>`
 
 ###### **Subcommands:**
 
 * `status` — Combined status snapshot for scripts and agents
 * `chat` — Send one non-streaming chat request through /v1/chat/completions
 * `health` — Raw /health payload
-* `models` — Local model registry from the operator API
+* `models` — Local model registry from the admin API
 * `config` — Resolved runtime config
 * `training` — Training run summaries or one run detail
 * `diagnostics` — Filesystem, binary, kernel-cache, lock, and log diagnostics
 * `logs` — Tail known hipfire logs
-* `get` — GET an arbitrary operator/server path, e.g. /operator/training/runs
+* `get` — GET an arbitrary admin/server path, e.g. /admin/training/runs
 
 ###### **Options:**
 
-* `--host <HOST>` — Override operator API host. Defaults to config host, with 0.0.0.0 mapped to 127.0.0.1
-* `--port <PORT>` — Override operator API port. Defaults to config port
+* `--host <HOST>` — Override admin API host. Defaults to config host, with 0.0.0.0 mapped to 127.0.0.1
+* `--port <PORT>` — Override admin API port. Defaults to config port
 
 
 
-## `hipfire operator status`
+## `hipfire admin status`
 
 Combined status snapshot for scripts and agents
 
-**Usage:** `hipfire operator status`
+**Usage:** `hipfire admin status`
 
 
 
-## `hipfire operator chat`
+## `hipfire admin chat`
 
 Send one non-streaming chat request through /v1/chat/completions
 
-**Usage:** `hipfire operator chat [OPTIONS] <PROMPT>...`
+**Usage:** `hipfire admin chat [OPTIONS] <PROMPT>...`
 
 ###### **Arguments:**
 
@@ -227,27 +227,27 @@ Send one non-streaming chat request through /v1/chat/completions
 
 
 
-## `hipfire operator health`
+## `hipfire admin health`
 
 Raw /health payload
 
-**Usage:** `hipfire operator health`
+**Usage:** `hipfire admin health`
 
 
 
-## `hipfire operator models`
+## `hipfire admin models`
 
-Local model registry from the operator API
+Local model registry from the admin API
 
-**Usage:** `hipfire operator models`
+**Usage:** `hipfire admin models`
 
 
 
-## `hipfire operator config`
+## `hipfire admin config`
 
 Resolved runtime config
 
-**Usage:** `hipfire operator config [OPTIONS]`
+**Usage:** `hipfire admin config [OPTIONS]`
 
 ###### **Options:**
 
@@ -255,11 +255,11 @@ Resolved runtime config
 
 
 
-## `hipfire operator training`
+## `hipfire admin training`
 
 Training run summaries or one run detail
 
-**Usage:** `hipfire operator training [OPTIONS] [ID]`
+**Usage:** `hipfire admin training [OPTIONS] [ID]`
 
 ###### **Arguments:**
 
@@ -271,19 +271,19 @@ Training run summaries or one run detail
 
 
 
-## `hipfire operator diagnostics`
+## `hipfire admin diagnostics`
 
 Filesystem, binary, kernel-cache, lock, and log diagnostics
 
-**Usage:** `hipfire operator diagnostics`
+**Usage:** `hipfire admin diagnostics`
 
 
 
-## `hipfire operator logs`
+## `hipfire admin logs`
 
 Tail known hipfire logs
 
-**Usage:** `hipfire operator logs [OPTIONS]`
+**Usage:** `hipfire admin logs [OPTIONS]`
 
 ###### **Options:**
 
@@ -293,11 +293,11 @@ Tail known hipfire logs
 
 
 
-## `hipfire operator get`
+## `hipfire admin get`
 
-GET an arbitrary operator/server path, e.g. /operator/training/runs
+GET an arbitrary admin/server path, e.g. /admin/training/runs
 
-**Usage:** `hipfire operator get <PATH>`
+**Usage:** `hipfire admin get <PATH>`
 
 ###### **Arguments:**
 

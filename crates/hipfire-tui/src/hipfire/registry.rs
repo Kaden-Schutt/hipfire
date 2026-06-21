@@ -288,7 +288,7 @@ impl RegistryState {
 
 fn load_remote_registry(config: &ConfigState) -> Result<RegistryState, String> {
     let url = format!(
-        "http://{}:{}/operator/models/registry",
+        "http://{}:{}/admin/models/registry",
         config.probe_host(),
         config.port
     );

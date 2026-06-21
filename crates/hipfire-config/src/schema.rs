@@ -138,10 +138,10 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "host",
         ConfigType::String,
         Requirement::Optional,
-        Some("0.0.0.0"),
+        Some("127.0.0.1"),
         GLOBAL_RUNTIME,
         ConfigMutability::Static,
-        "Bind host for the OpenAI-compatible HTTP server.",
+        "Bind host for the OpenAI-compatible HTTP server. Defaults to loopback; set to 0.0.0.0 to expose on all interfaces.",
         validation: "valid IP address or hostname"
     ),
     field!(
@@ -152,6 +152,16 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         GLOBAL_RUNTIME,
         ConfigMutability::Static,
         "Bind port for the OpenAI-compatible HTTP server."
+    ),
+    field!(
+        "cors_allowed_origins",
+        ConfigType::Json,
+        Requirement::Optional,
+        Some("[]"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "Browser origins allowed to call the HTTP API cross-origin. Empty disables CORS (same-origin only); [\"*\"] allows any origin; otherwise an explicit allowlist such as [\"http://localhost:8080\"].",
+        validation: "JSON array of origin strings, or [\"*\"]"
     ),
     field!(
         "default_model",

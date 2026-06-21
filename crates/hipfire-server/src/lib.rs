@@ -7,7 +7,7 @@ pub use state::{AppState, SharedState};
 
 use axum::{
     body::Body,
-    http::{Method, Request},
+    http::{HeaderValue, Method, Request},
     middleware::{self, Next},
     response::Response,
     routing::{get, post},
@@ -15,40 +15,60 @@ use axum::{
 };
 use hipfire_config::{HipfireConfig, LoadedConfig};
 use hipfire_generate::{GenerateTextRequest, GenerationSamplingPolicy};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
-pub fn build_router(state: SharedState) -> Router {
-    Router::new()
+/// Build a CORS layer from the configured allowlist.
+///
+/// - empty list -> `None` (no CORS layer; same-origin requests only)
+/// - `["*"]`    -> allow any origin
+/// - otherwise  -> explicit origin allowlist
+fn cors_layer(allowed_origins: &[String]) -> Option<CorsLayer> {
+    if allowed_origins.is_empty() {
+        return None;
+    }
+    let base = CorsLayer::new().allow_methods(Any).allow_headers(Any);
+    if allowed_origins.iter().any(|origin| origin == "*") {
+        return Some(base.allow_origin(Any));
+    }
+    let origins: Vec<HeaderValue> = allowed_origins
+        .iter()
+        .filter_map(|origin| origin.parse::<HeaderValue>().ok())
+        .collect();
+    Some(base.allow_origin(AllowOrigin::list(origins)))
+}
+
+pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> Router {
+    let router = Router::new()
         .route("/health", get(routes::health::get_health))
-        .route("/operator", get(routes::operator::get_operator_index))
-        .route("/operator/", get(routes::operator::get_operator_index))
+        .route("/admin", get(routes::admin::get_admin_index))
+        .route("/admin/", get(routes::admin::get_admin_index))
         .route(
-            "/operator/config/schema",
-            get(routes::operator::get_config_schema),
+            "/admin/config/schema",
+            get(routes::admin::get_config_schema),
         )
         .route(
-            "/operator/config/resolved",
-            get(routes::operator::get_resolved_config),
+            "/admin/config/resolved",
+            get(routes::admin::get_resolved_config),
         )
         .route(
-            "/operator/diagnostics",
-            get(routes::operator::get_operator_diagnostics),
+            "/admin/diagnostics",
+            get(routes::admin::get_admin_diagnostics),
         )
-        .route("/operator/logs", get(routes::operator::get_operator_logs))
+        .route("/admin/logs", get(routes::admin::get_admin_logs))
         .route(
-            "/operator/models/registry",
+            "/admin/models/registry",
             get(routes::models::get_model_registry),
         )
         .route(
-            "/operator/training/runs",
+            "/admin/training/runs",
             get(routes::training::list_training_runs_route),
         )
         .route(
-            "/operator/training/runs/{id}",
+            "/admin/training/runs/{id}",
             get(routes::training::get_training_run),
         )
         .route(
-            "/operator/training/runs/{id}/events",
+            "/admin/training/runs/{id}/events",
             get(routes::training::get_training_run_events),
         )
         .route("/v1/models", get(routes::models::get_models))
@@ -77,13 +97,12 @@ pub fn build_router(state: SharedState) -> Router {
             "/v1/chat/completions",
             post(routes::chat::post_chat_completions),
         )
-        .route("/v1/responses", post(routes::responses::post_responses))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        .route("/v1/responses", post(routes::responses::post_responses));
+    let router = match cors_layer(cors_allowed_origins) {
+        Some(cors) => router.layer(cors),
+        None => router,
+    };
+    router
         .layer(middleware::from_fn_with_state(
             state.clone(),
             touch_last_request,
@@ -97,6 +116,7 @@ pub async fn serve(config: HipfireConfig) -> anyhow::Result<()> {
 
 pub async fn serve_loaded(config: LoadedConfig) -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.config.host, config.config.port);
+    let cors_allowed_origins = config.config.cors_allowed_origins.clone();
     let state = AppState::new_loaded(config);
 
     prewarm_default_model(&state).await;
@@ -106,7 +126,7 @@ pub async fn serve_loaded(config: LoadedConfig) -> anyhow::Result<()> {
         idle_unload_loop(idle_state).await;
     });
 
-    let app = build_router(state.clone());
+    let app = build_router(state.clone(), &cors_allowed_origins);
     tracing::info!("hipfire listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app)
@@ -248,6 +268,17 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cors_layer_disabled_when_no_origins() {
+        assert!(cors_layer(&[]).is_none());
+    }
+
+    #[test]
+    fn cors_layer_present_for_wildcard_and_allowlist() {
+        assert!(cors_layer(&["*".to_string()]).is_some());
+        assert!(cors_layer(&["http://localhost:8080".to_string()]).is_some());
+    }
 
     #[test]
     fn idle_touch_ignores_probe_routes() {

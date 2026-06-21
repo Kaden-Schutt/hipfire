@@ -22,10 +22,13 @@ pub use schema::{
 };
 
 fn default_host() -> String {
-    "0.0.0.0".to_string()
+    "127.0.0.1".to_string()
 }
 fn default_port() -> u16 {
     11435
+}
+fn default_cors_allowed_origins() -> Vec<String> {
+    Vec::new()
 }
 fn default_max_seq() -> u32 {
     4096
@@ -136,6 +139,11 @@ pub struct HipfireConfig {
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    /// Cross-origin origins allowed to call the HTTP API from a browser.
+    /// Empty (default) disables CORS entirely (same-origin only); `["*"]`
+    /// allows any origin; otherwise an explicit allowlist of origins.
+    #[serde(default = "default_cors_allowed_origins")]
+    pub cors_allowed_origins: Vec<String>,
     #[serde(default)]
     pub default_model: Option<String>,
     #[serde(default = "default_max_seq")]
@@ -305,6 +313,7 @@ impl Default for HipfireConfig {
         Self {
             host: default_host(),
             port: default_port(),
+            cors_allowed_origins: default_cors_allowed_origins(),
             default_model: None,
             max_seq: default_max_seq(),
             max_tokens: default_max_tokens(),
@@ -562,8 +571,9 @@ mod tests {
     fn defaults_preserve_server_config_values() {
         let cfg = HipfireConfig::default();
 
-        assert_eq!(cfg.host, "0.0.0.0");
+        assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.port, 11435);
+        assert!(cfg.cors_allowed_origins.is_empty());
         assert_eq!(cfg.max_seq, 4096);
         assert_eq!(cfg.max_tokens, 512);
         assert_eq!(cfg.temperature, 0.3);
