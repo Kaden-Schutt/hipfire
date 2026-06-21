@@ -82,6 +82,8 @@ pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> Rout
         ));
 
     let router = Router::new()
+        .route("/", get(routes::chat_ui::get_chat_index))
+        .route("/chat", get(routes::chat_ui::get_chat_index))
         .route("/health", get(routes::health::get_health))
         .route("/admin", get(routes::admin::get_admin_index))
         .route("/admin/", get(routes::admin::get_admin_index))
