@@ -3725,6 +3725,10 @@ pub const QUANTIZE_ACT_INT8_PER_TOKEN_SRC: &str =
 pub const DEQUANT_I32_ROWCOL_SRC: &str =
     include_str!("../../../kernels/src/dequant_i32_rowcol.hip");
 
+/// Reference kernel layer: packed int4 → int8 weight expand (W4A8 feeds the iu8 core).
+pub const NIBBLE_EXPAND_INT4_TO_INT8_SRC: &str =
+    include_str!("../../../kernels/src/nibble_expand_int4_to_int8.hip");
+
 /// Generic kernel library: WMMA signed-INT4 × INT4 → INT32 GEMM, (B, M) output.
 /// gfx1103 (RDNA3 UMA) wave32, register-tiled, zero LDS. Packed nibbles
 /// (`byte = k_even | k_odd<<4`), `v_wmma_i32_16x16x16_iu4`, both operands

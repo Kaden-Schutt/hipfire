@@ -46621,6 +46621,40 @@ impl Gpu {
         }
     }
 
+    /// Reference kernel layer: expand packed int4 weights `wp_i4` [M,K/2] → int8
+    /// `w8_i8` [M,K] (sign-extended), the W4A8 input to the iu8 WMMA core.
+    pub fn nibble_expand_int4_to_int8(
+        &mut self,
+        wp_i4: &GpuTensor,
+        w8_i8: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "nibble_expand_int4_to_int8",
+            kernels::NIBBLE_EXPAND_INT4_TO_INT8_SRC,
+            "nibble_expand_int4_to_int8",
+        )?;
+        let pp = wp_i4.buf.as_ptr();
+        let op = w8_i8.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+        ];
+        let n = m * k;
+        let grid = ((n + 255) / 256) as u32;
+        let func = &self.functions["nibble_expand_int4_to_int8"];
+        unsafe {
+            self.hip
+                .launch_kernel(func, [grid, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)
+        }
+    }
+
     pub fn gemm_f16_f16_wmma(
         &mut self,
         a_f16: &GpuTensor,
