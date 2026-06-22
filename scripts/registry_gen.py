@@ -175,6 +175,8 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
         return 11
     if family == "north-mini-code":
         return 12
+    if family == "vibethinker":
+        return 7   # Qwen2 dense (WeiboAI/VibeThinker-3B base)
     return None
 
 

@@ -465,6 +465,20 @@
         "presence_penalty": 1.5
       },
       "desc": "Qwen3.5-35B-A3B agentic MoE (nex-agi, SWE-bench Verified 74.4). 88 tok/s. T3-3L graded experts (MQ6/MQ4/MQ3L). Tool-use: qwen3 reasoning / qwen3_coder tool-call format."
+    },
+    "vibethinker:3b": {
+      "repo": "xfivetide/VibeThinker-3B-hipfire",
+      "file": "vibethinker-3b.mq4.hfq",
+      "size_gb": 1.82,
+      "min_vram_gb": 3.5,
+      "desc": "VibeThinker-3B (WeiboAI), Qwen2 MQ4. ~36-90 tok/s on gfx1151."
+    },
+    "vibethinker:3b-mq6": {
+      "repo": "xfivetide/VibeThinker-3B-hipfire",
+      "file": "vibethinker-3b.mq6.hfq",
+      "size_gb": 2.51,
+      "min_vram_gb": 5.0,
+      "desc": "VibeThinker-3B (WeiboAI), Qwen2 MQ6 6-bit. ~25-60 tok/s on gfx1151."
     }
   },
   "aliases": {
@@ -504,6 +518,7 @@
     "qwen3.5:9b:draft": "qwen3.5:9b-draft",
     "qwen3.5:27b:draft": "qwen3.5:27b-draft",
     "qwen3.6:27b:draft": "qwen3.6:27b-draft",
-    "qwen3.5:2b-mq4": "qwen3.5:2b"
+    "qwen3.5:2b-mq4": "qwen3.5:2b",
+    "vibethinker": "vibethinker:3b"
   }
 }
