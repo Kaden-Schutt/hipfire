@@ -741,6 +741,63 @@ pub(crate) fn quantize_oq8g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32])
     output
 }
 
+/// OQ+ magnitude-tiered (Opus Plus W4A8 with the top-`w8_frac` weights kept at
+/// W8A8) — a SINGLE iu8 grouped-WMMA kernel, mixed weight precision. Per
+/// 256-group: FWHT-rotate, pick an INT4-tuned clip-search scale (so the bulk
+/// gets int4 resolution), then quantize the bulk to int4 `[-7,7]` and the top
+/// `w8_frac` weights by |rotated value| to full int8 `[-127,127]` using the SAME
+/// group scale — so a large-magnitude rotated weight that would saturate int4
+/// keeps its value (8-bit), while the bulk stays 4-bit. On-disk is the Oq8 format
+/// (`[f16 scale][256 int8]`, 258 B/group), so the existing qt=35 loader + iu8
+/// W8A8 forward consume it UNCHANGED — "top X% stored as W8A8, same WMMA as the
+/// rest". Storage here is int8 (a faithful quality probe of the compute scheme);
+/// the compact int4-bulk + sparse-int8-outlier encoding (~4 b/w) is a follow-up.
+pub(crate) fn quantize_oqplus_tiered(
+    f32_data: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+    w8_frac: f32,
+) -> Vec<u8> {
+    let (group_size, block_bytes) = (256usize, 258usize); // 2 (f16 scale) + 256 int8
+    let n = f32_data.len();
+    let n_blocks = n.div_ceil(group_size);
+    let n_out = ((w8_frac as f64 * group_size as f64).round() as usize).clamp(1, group_size);
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let mut group = [0.0f32; 256];
+        group[..end - start].copy_from_slice(&f32_data[start..end]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        // INT4-tuned scale: the bulk uses [-7,7] at this resolution; the top-frac
+        // outliers reuse the SAME scale but extend to the int8 range [-127,127].
+        let scale = symmetric_clipsearch(&group, 7.0);
+        let inv = 1.0 / scale;
+        // Outlier set = top n_out positions by |rotated value| in this group.
+        let mut idx: [usize; 256] = core::array::from_fn(|i| i);
+        idx.sort_unstable_by(|&a, &c| {
+            group[c]
+                .abs()
+                .partial_cmp(&group[a].abs())
+                .unwrap_or(core::cmp::Ordering::Equal)
+        });
+        let mut is_w8 = [false; 256];
+        for &i in &idx[..n_out] {
+            is_w8[i] = true;
+        }
+        let out_off = b * block_bytes;
+        let scale_f16 = f32_to_f16(scale);
+        output[out_off] = (scale_f16 & 0xFF) as u8;
+        output[out_off + 1] = (scale_f16 >> 8) as u8;
+        for i in 0..256 {
+            let lim = if is_w8[i] { 127.0 } else { 7.0 };
+            let q = (group[i] * inv).round().clamp(-lim, lim) as i8;
+            output[out_off + 2 + i] = q as u8;
+        }
+    }
+    output
+}
+
 /// Dequantize OQ8G256 (round-trip oracle for the Opus W8A8 codec / tests).
 /// `[f16 scale][256 signed int8]` per 256-group → `scale·q`, inverse FWHT.
 /// Test-only oracle; gated on `cfg(test)` so non-test builds don't compile it as

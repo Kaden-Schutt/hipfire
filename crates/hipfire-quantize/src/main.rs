@@ -127,6 +127,20 @@ static OQ4_LDLQ_HESSIAN: OnceLock<crate::hfhs_diag::HfhsFull> = OnceLock::new();
 // alpha=1 is pure activation-magnitude scaling (no smoothing).
 static AWQ_ALPHA: OnceLock<f32> = OnceLock::new();
 
+// --sq-split [<frac>]: outlier-aware SmoothQuant. When set, `compute_awq_scales`
+// partitions input channels into the top-`frac` by activation energy (outliers)
+// and the remaining bulk, and geo-mean-normalizes EACH group SEPARATELY — so the
+// bulk's per-channel migration scale isn't skewed by the outliers' huge energy
+// (each group's geo-mean = 1 independently). Default frac = 0.01. Unset = the
+// original single-group (uniform) normalization across all K channels.
+static SQ_OUTLIER_SPLIT: OnceLock<f32> = OnceLock::new();
+
+// --w8-top <frac>: OQ+ magnitude-tiered. The top-`frac` weights per 256-group
+// (by |rotated value|) are stored at full int8 (W8A8); the bulk stays int4
+// (W4A8). One iu8 grouped-WMMA kernel, one group scale. Default frac = 0.01.
+// Consumed by the `oq+t` (OqPlusTiered) format's codec.
+static OQPLUS_W8_FRAC: OnceLock<f32> = OnceLock::new();
+
 // Carries the AWQ sidecar scales out of the HFQ-source per-tensor quantizer
 // (`quantize_hfq_source_tensor`'s Oq4 arm) up to the tensor-write loop, which
 // emits the `<weight>.awq_scale.weight` sidecar. The HFQ-source path returns a
@@ -2860,6 +2874,7 @@ enum HfqInputFormat {
     Qtip3,
     Oq4,
     OqPlus,
+    OqPlusTiered,
     Oq8,
 }
 
@@ -2878,6 +2893,7 @@ impl HfqInputFormat {
             "oq4" | "oq4g256" | "opus" => Some(Self::Oq4),
             "oq+" | "oqplus" | "oq4+" | "opus-plus" | "opusplus" | "opus+" | "opusa8"
             | "oq4a8" => Some(Self::OqPlus),
+            "oq+t" | "oqplus-tiered" | "oq+8" | "opus-plus-tiered" => Some(Self::OqPlusTiered),
             "oq8" | "oq8g256" | "opus8" => Some(Self::Oq8),
             _ => None,
         }
@@ -3143,6 +3159,35 @@ fn quantize_hfq_source_tensor(
                 256,
                 "OQ8G256",
             )
+        }
+        HfqInputFormat::OqPlusTiered => {
+            // OQ+ magnitude-tiered W4A8: bulk int4, top-`w8_frac` weights/group at
+            // int8 — ONE iu8 grouped-WMMA kernel. On-disk = Oq8 format (258 B/group)
+            // so it loads via the existing qt=35 Oq8 path and the W8A8 forward
+            // unchanged. Composes AWQ (W·s offline + x/s sidecar) like the Oq4 arm.
+            // (LDLQ not composed here — it produces int4-only; tiering is orthogonal.)
+            if k % 256 != 0 {
+                return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
+            }
+            let m_dim = shape[0] as usize;
+            let w8_frac = OQPLUS_W8_FRAC.get().copied().unwrap_or(0.01);
+            let q = if let (Some(alpha), Some(im)) =
+                (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+            {
+                if alpha > 0.0 && awq_eligible(name) {
+                    let scales = compute_awq_scales(im, alpha);
+                    let mut scaled = f32_data.clone();
+                    awq_pre_scale_weights(&mut scaled, m_dim, k, &scales);
+                    OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(scales));
+                    quantize_oqplus_tiered(&scaled, &signs1, &signs2, w8_frac)
+                } else {
+                    quantize_oqplus_tiered(&f32_data, &signs1, &signs2, w8_frac)
+                }
+            } else {
+                quantize_oqplus_tiered(&f32_data, &signs1, &signs2, w8_frac)
+            };
+            // Emit the Oq8 tag/layout — the tiered values ride the W8A8 path.
+            (q, QuantType::Oq8G256, 256, "OQ+T")
         }
         HfqInputFormat::F16 | HfqInputFormat::Bf16 | HfqInputFormat::Qtip3 => unreachable!(),
     };
@@ -3711,7 +3756,7 @@ fn compute_awq_scales(in_sum2: &[f32], alpha: f32) -> Vec<f32> {
     // wide dynamic-range imatrix values).
     let half_alpha = (alpha as f64) * 0.5;
     let mut log_s_raw = Vec::with_capacity(k);
-    let mut sum_log: f64 = 0.0;
+    let mut energy = Vec::with_capacity(k); // clamped in_sum2, for outlier ranking
     for &v in in_sum2 {
         // Floor dead channels to 1e-12 (NaN also maps here: f64::max returns the
         // non-NaN arg) AND cap non-finite / pathologically-large values to a
@@ -3724,14 +3769,52 @@ fn compute_awq_scales(in_sum2: &[f32], alpha: f32) -> Vec<f32> {
         // Capping the input keeps mean_log finite; the output clamp then bounds
         // the final scale. 1e30 is well inside f64 range (ln ≈ 69).
         let v_clamped = (v as f64).max(1e-12).min(1e30);
-        let log_s = half_alpha * v_clamped.ln(); // log(v^(alpha/2)) = (alpha/2) * log(v)
-        log_s_raw.push(log_s);
-        sum_log += log_s;
+        log_s_raw.push(half_alpha * v_clamped.ln()); // log(v^(alpha/2)) = (alpha/2)·log(v)
+        energy.push(v_clamped);
     }
-    let mean_log = sum_log / (k as f64);
 
-    // Step 3: subtract mean in log space, then exp back. After this,
-    // geo_mean(s) = exp(0) = 1.0 exactly (within floating-point precision).
+    // Per-channel log-space normalization offset. Default: ONE geo-mean over all
+    // K channels (subtracting it makes geo_mean(s) = 1 exactly). With --sq-split
+    // (SQ_OUTLIER_SPLIT): the top-`frac` channels by activation energy (outliers)
+    // and the remaining bulk are geo-mean-normalized SEPARATELY — each group gets
+    // its OWN mean_log, so the bulk's migration isn't skewed by the outliers' huge
+    // energy. The split changes only the s VALUES, not the per-channel cancellation
+    // (W·s)·(x/s)=W·x; each group's geo-mean stays 1, so overall weight magnitude
+    // is preserved for the downstream int4 scale fitter.
+    let offset: Vec<f64> = match SQ_OUTLIER_SPLIT.get().copied() {
+        Some(frac) if frac > 0.0 && frac < 1.0 && k >= 2 => {
+            let n_out = (((frac as f64) * k as f64).round() as usize).clamp(1, k - 1);
+            let mut order: Vec<usize> = (0..k).collect();
+            order.sort_unstable_by(|&a, &b| {
+                energy[b]
+                    .partial_cmp(&energy[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut is_outlier = vec![false; k];
+            for &i in &order[..n_out] {
+                is_outlier[i] = true;
+            }
+            let (mut sum_o, mut sum_r) = (0.0f64, 0.0f64);
+            for j in 0..k {
+                if is_outlier[j] {
+                    sum_o += log_s_raw[j];
+                } else {
+                    sum_r += log_s_raw[j];
+                }
+            }
+            let mean_o = sum_o / n_out as f64;
+            let mean_r = sum_r / (k - n_out) as f64;
+            (0..k)
+                .map(|j| if is_outlier[j] { mean_o } else { mean_r })
+                .collect()
+        }
+        _ => {
+            let mean_log = log_s_raw.iter().sum::<f64>() / k as f64;
+            vec![mean_log; k]
+        }
+    };
+
+    // Subtract the (per-group) mean in log space, then exp back.
     //
     // Step 4 (CRITICAL — f16 safety): clamp to an f16-representable,
     // non-exploding range. The geo-mean is 1.0 by construction, so the bulk
@@ -3752,7 +3835,8 @@ fn compute_awq_scales(in_sum2: &[f32], alpha: f32) -> Vec<f32> {
     const AWQ_SCALE_MAX: f32 = 1e2;
     log_s_raw
         .into_iter()
-        .map(|l| ((l - mean_log).exp() as f32).clamp(AWQ_SCALE_MIN, AWQ_SCALE_MAX))
+        .zip(offset)
+        .map(|(l, m)| ((l - m).exp() as f32).clamp(AWQ_SCALE_MIN, AWQ_SCALE_MAX))
         .collect()
 }
 
@@ -5264,6 +5348,41 @@ fn main() {
             .set(awq_alpha)
             .expect("AWQ_ALPHA set twice — should not happen");
         eprintln!("AWQ pre-scaling: ENABLED (alpha={awq_alpha}, formula: s[j]=(RMS_act[j])^alpha, geo-mean normalized to 1)");
+    }
+    // --sq-split [<frac>]: outlier-aware SmoothQuant (separate geo-mean
+    // normalization for the top-frac activation-energy channels vs the bulk).
+    // Default frac = 0.01. Requires AWQ to be active (it tunes the AWQ scale).
+    if let Some(i) = args.iter().position(|a| a == "--sq-split") {
+        let frac = args
+            .get(i + 1)
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|f| *f > 0.0 && *f < 1.0)
+            .unwrap_or(0.01);
+        if !awq_enabled {
+            eprintln!("warning: --sq-split has no effect without --awq (it normalizes the AWQ scale)");
+        }
+        SQ_OUTLIER_SPLIT
+            .set(frac)
+            .expect("SQ_OUTLIER_SPLIT set twice — should not happen");
+        eprintln!(
+            "SmoothQuant outlier-split: ENABLED (outlier_frac={frac}, top-{:.2}% channels by energy normalized separately from the bulk)",
+            frac * 100.0
+        );
+    }
+    // --w8-top <frac>: OQ+ magnitude-tiered top-frac weights kept at W8A8.
+    if let Some(i) = args.iter().position(|a| a == "--w8-top") {
+        let frac = args
+            .get(i + 1)
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|f| *f > 0.0 && *f < 1.0)
+            .unwrap_or(0.01);
+        OQPLUS_W8_FRAC
+            .set(frac)
+            .expect("OQPLUS_W8_FRAC set twice — should not happen");
+        eprintln!(
+            "OQ+ magnitude-tiering: ENABLED (top-{:.2}% weights/group kept at W8A8, bulk W4A8, single iu8 kernel)",
+            frac * 100.0
+        );
     }
     // K-map gate: applies to MoE models by default. Dense models opt in
     // via --kmap-dense (the K-map dense PPL effect is mixed: regression at
