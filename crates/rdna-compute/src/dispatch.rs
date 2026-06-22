@@ -46540,6 +46540,87 @@ impl Gpu {
         }
     }
 
+    /// Reference kernel layer: per-token symmetric int8 activation quant.
+    /// `x_f32` [B,K] → `xq_i8` [B,K] int8 + `xs_f32` [B] per-row scale. Zero LDS.
+    pub fn quantize_act_int8_per_token(
+        &mut self,
+        x_f32: &GpuTensor,
+        xq_i8: &GpuTensor,
+        xs_f32: &GpuTensor,
+        batch_size: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "quantize_act_int8_per_token",
+            kernels::QUANTIZE_ACT_INT8_PER_TOKEN_SRC,
+            "quantize_act_int8_per_token",
+        )?;
+        let xp = x_f32.buf.as_ptr();
+        let qp = xq_i8.buf.as_ptr();
+        let sp = xs_f32.buf.as_ptr();
+        let mut bi = batch_size as i32;
+        let mut ki = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &qp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions["quantize_act_int8_per_token"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [batch_size as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Reference kernel layer: int32 → f32 dequant by per-row × per-col scales.
+    /// `y_i32` [B,M] · `x_scale` [B] · `w_scale` [M] → `y_f32` [B,M].
+    pub fn dequant_i32_rowcol(
+        &mut self,
+        y_i32: &GpuTensor,
+        x_scale: &GpuTensor,
+        w_scale: &GpuTensor,
+        y_f32: &GpuTensor,
+        batch_size: usize,
+        m: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "dequant_i32_rowcol",
+            kernels::DEQUANT_I32_ROWCOL_SRC,
+            "dequant_i32_rowcol",
+        )?;
+        let yp = y_i32.buf.as_ptr();
+        let xsp = x_scale.buf.as_ptr();
+        let wsp = w_scale.buf.as_ptr();
+        let op = y_f32.buf.as_ptr();
+        let mut bi = batch_size as i32;
+        let mut mi = m as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &yp as *const _ as *mut c_void,
+            &xsp as *const _ as *mut c_void,
+            &wsp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+        ];
+        let n = batch_size * m;
+        let grid = ((n + 255) / 256) as u32;
+        let func = &self.functions["dequant_i32_rowcol"];
+        unsafe {
+            self.hip
+                .launch_kernel(func, [grid, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)
+        }
+    }
+
     pub fn gemm_f16_f16_wmma(
         &mut self,
         a_f16: &GpuTensor,

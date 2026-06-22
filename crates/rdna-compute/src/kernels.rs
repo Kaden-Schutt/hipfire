@@ -3717,6 +3717,14 @@ pub const GEMM_F16_F16_WMMA_SRC: &str =
 pub const GEMM_IU8_I32_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_iu8_i32_wmma.hip");
 
+/// Reference kernel layer: per-token symmetric int8 activation quant (W8A8/W4A8 A8 input).
+pub const QUANTIZE_ACT_INT8_PER_TOKEN_SRC: &str =
+    include_str!("../../../kernels/src/quantize_act_int8_per_token.hip");
+
+/// Reference kernel layer: int32 → f32 dequant by per-row (token) × per-col (channel) scales.
+pub const DEQUANT_I32_ROWCOL_SRC: &str =
+    include_str!("../../../kernels/src/dequant_i32_rowcol.hip");
+
 /// Generic kernel library: WMMA signed-INT4 × INT4 → INT32 GEMM, (B, M) output.
 /// gfx1103 (RDNA3 UMA) wave32, register-tiled, zero LDS. Packed nibbles
 /// (`byte = k_even | k_odd<<4`), `v_wmma_i32_16x16x16_iu4`, both operands
