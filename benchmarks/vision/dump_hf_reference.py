@@ -1,42 +1,142 @@
 #!/usr/bin/env python3
 """
-Dump HuggingFace Qwen3.5-0.8B-VL vision-tower intermediate activations on a
-single image, for hipfire numerical-diff debugging.
+Dump a HuggingFace vision-tower's per-stage activations on an image, for
+hipfire numerical-diff debugging (`diff_dumps.py`).
 
-Outputs are written to hf-ref/<image_stem>/ as .npy files:
-  pixel_values.npy        # post-preprocessor, shape (n_patches, 1536)
-  patch_embed.npy         # post patch_embed conv, shape (n_patches, 1152)
-  post_pos_embed.npy      # patch_embed + pos_embed, shape (n_patches, 1152)
-  block_{nn}.npy          # post-block-nn output, shape (n_patches, 1152), for all 27 blocks
-  pre_merger.npy          # final ViT output before merger (= block_26)
-  post_merger.npy         # post merger output, shape (n_patches / 4, lm_hidden)
-  grid_thw.npy            # (1, 3) [temporal, h_patches, w_patches]
-  meta.json               # image size, patch_size, merge_size, dims
+Multi-family: the vision-tower module layout differs per model family, so a
+small registry (keyed by `config.model_type`) describes how to locate the
+patch-embed, encoder blocks, final norm, and projector/merger for each. Add a
+new family by adding one `VisionFamily` entry — see `FAMILIES` below.
 
-The 0.8B variant has identical vision-tower architecture (n_embd=1152, 27 blocks)
-to the 9B that hipfire is shipping; vision-tower dumps match across LM sizes.
+Currently supported families:
+  * qwen3_vl / qwen2_5_vl / qwen2_vl  — `model.model.visual` (blocks + merger,
+    grid_thw-driven).
+  * gemma3 / gemma3_vl                — `model.model.vision_tower.vision_model`
+    (SigLIP: patch_embedding conv, position_embedding, encoder.layers,
+    post_layernorm) + `model.model.multi_modal_projector`.
+
+Outputs (per image) to <out>/<image_stem>/ as .npy:
+  pixel_values.npy        # post-preprocessor
+  patch_embed.npy         # post patch-embed
+  block_{nn}.npy          # per encoder block output
+  pre_merger.npy          # final pre-projector features (post final-norm)
+  post_merger.npy         # projector/merger output (image embeddings)
+  pos_embed_full.npy      # raw learned position-embedding table (when present)
+  image_features.npy      # model.get_image_features(...) (splice-ready rows)
+  meta.json
+
+Usage:
+  dump_hf_reference.py IMAGE... --model google/medgemma-1.5-4b-it
+  dump_hf_reference.py IMAGE... --model medgemma-4b          # alias (see ALIASES)
 """
 import argparse
 import json
-import sys
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable, Optional
 
 import numpy as np
 import torch
 from PIL import Image
-from transformers import AutoProcessor, AutoModelForImageTextToText
+from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
+
+# Convenience aliases → HF id or local snapshot path. Any HF id / path also works
+# directly. Local snapshots avoid re-downloading the (large) weights.
+ALIASES = {
+    "qwen-0.8b": "Qwen/Qwen3.5-0.8B",
+    "medgemma-4b": "/srv/huggingface/models--google--medgemma-1.5-4b-it/snapshots/91850547d9f0b2fdd21aa7c5f4f3d1a8a52c243b",
+    "medgemma-27b": "/srv/huggingface/models--google--medgemma-27b-it",
+    "gemma3-4b": "google/gemma-3-4b-it",
+}
 
 
-HF_MODEL_PATH = "Qwen/Qwen3.5-0.8B"  # cached at ~/.cache/huggingface/hub
+@dataclass
+class VisionFamily:
+    """How to navigate one model family's vision tower for activation capture."""
+
+    name: str
+    # model_type strings this family matches.
+    model_types: tuple
+    # model -> the vision transformer module whose submodules we hook.
+    vision_tower: Callable
+    # vision_tower module -> the patch-embed submodule (hooked as "patch_embed").
+    patch_embed: Callable
+    # vision_tower -> iterable of encoder block modules (hooked block_NN).
+    blocks: Callable
+    # vision_tower -> final norm module, or None (hooked "pre_merger").
+    final_norm: Optional[Callable]
+    # model -> the projector/merger module (hooked "post_merger"), or None.
+    projector: Callable
+    # vision_tower -> raw position-embedding tensor, or None.
+    pos_embed: Optional[Callable] = None
+    # processor-output keys to persist + pass to get_image_features (e.g. grids).
+    extra_inputs: tuple = field(default_factory=tuple)
 
 
-def dump_one(image_path: Path, out_dir: Path, model, processor, device: str):
+def _getattr_path(obj, path):
+    for part in path.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+def _as_tensor(x):
+    """Coerce a model output (tensor, tuple, or *Output dataclass) to a tensor."""
+    if isinstance(x, torch.Tensor):
+        return x
+    for attr in ("last_hidden_state", "image_embeds", "image_features", "pooler_output"):
+        v = getattr(x, attr, None)
+        if isinstance(v, torch.Tensor):
+            return v
+    if isinstance(x, (list, tuple)) and x and isinstance(x[0], torch.Tensor):
+        return x[0]
+    return None
+
+
+FAMILIES = [
+    VisionFamily(
+        name="qwen-vl",
+        model_types=("qwen3_vl", "qwen2_5_vl", "qwen2_vl"),
+        vision_tower=lambda m: _getattr_path(m, "model.visual"),
+        patch_embed=lambda v: v.patch_embed,
+        blocks=lambda v: v.blocks,
+        final_norm=None,
+        projector=lambda m: _getattr_path(m, "model.visual.merger"),
+        pos_embed=lambda v: getattr(getattr(v, "pos_embed", None), "weight", None),
+        extra_inputs=("image_grid_thw",),
+    ),
+    VisionFamily(
+        name="gemma3-siglip",
+        model_types=("gemma3", "gemma3_vl", "gemma3_text"),
+        # SiglipVisionModel -> SiglipVisionTransformer
+        vision_tower=lambda m: _getattr_path(m, "model.vision_tower.vision_model"),
+        patch_embed=lambda v: v.embeddings,  # patch + position embedding
+        blocks=lambda v: v.encoder.layers,
+        final_norm=lambda v: v.post_layernorm,
+        projector=lambda m: _getattr_path(m, "model.multi_modal_projector"),
+        # SigLIP position embedding is an nn.Embedding inside .embeddings.
+        pos_embed=lambda v: getattr(
+            getattr(v.embeddings, "position_embedding", None), "weight", None
+        ),
+    ),
+]
+
+
+def pick_family(model_type: str) -> VisionFamily:
+    for fam in FAMILIES:
+        if model_type in fam.model_types:
+            return fam
+    known = sorted({mt for f in FAMILIES for mt in f.model_types})
+    raise SystemExit(
+        f"unsupported model_type {model_type!r}; known: {known}. "
+        f"Add a VisionFamily entry to dump_hf_reference.py."
+    )
+
+
+def dump_one(image_path, out_dir, model, processor, family, device):
     out_dir.mkdir(parents=True, exist_ok=True)
-
     image = Image.open(image_path).convert("RGB")
-    print(f"  image: {image.size} ({image.width}x{image.height})")
+    print(f"  image: {image.width}x{image.height}")
 
-    # Use the same prompt-shape the daemon uses (single-turn user msg + image).
     messages = [{
         "role": "user",
         "content": [
@@ -45,115 +145,92 @@ def dump_one(image_path: Path, out_dir: Path, model, processor, device: str):
         ],
     }]
     inputs = processor.apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=True,
-        return_dict=True,
-        return_tensors="pt",
+        messages, tokenize=True, add_generation_prompt=True,
+        return_dict=True, return_tensors="pt",
     ).to(device)
 
-    pixel_values = inputs["pixel_values"]
-    grid_thw = inputs["image_grid_thw"]
-    print(f"  pixel_values: shape={tuple(pixel_values.shape)} dtype={pixel_values.dtype}")
-    print(f"  grid_thw: {grid_thw.tolist()}")
+    np.save(out_dir / "pixel_values.npy", inputs["pixel_values"].cpu().float().numpy())
+    for key in family.extra_inputs:
+        if key in inputs:
+            np.save(out_dir / f"{key}.npy", inputs[key].cpu().numpy())
 
-    # --- save preprocessor outputs ---
-    np.save(out_dir / "pixel_values.npy", pixel_values.cpu().float().numpy())
-    np.save(out_dir / "grid_thw.npy", grid_thw.cpu().numpy())
-
-    # --- find vision tower module + hook all sub-modules we care about ---
-    visual = model.model.visual
-
-    # Hooks
+    visual = family.vision_tower(model)
     captured = {}
 
     def make_hook(name):
         def _h(_m, _i, o):
             t = o[0] if isinstance(o, tuple) else o
+            t = getattr(t, "last_hidden_state", t)
             if isinstance(t, torch.Tensor):
                 captured[name] = t.detach().cpu().float().numpy()
         return _h
 
-    handles = []
-    handles.append(visual.patch_embed.register_forward_hook(make_hook("patch_embed")))
-    if hasattr(visual, "pos_embed"):
-        # pos_embed is a Parameter, not a Module — capture after block 0 input instead.
-        pass
-    for i, blk in enumerate(visual.blocks):
+    handles = [family.patch_embed(visual).register_forward_hook(make_hook("patch_embed"))]
+    for i, blk in enumerate(family.blocks(visual)):
         handles.append(blk.register_forward_hook(make_hook(f"block_{i:02d}")))
-    handles.append(visual.merger.register_forward_hook(make_hook("post_merger")))
+    if family.final_norm is not None:
+        handles.append(family.final_norm(visual).register_forward_hook(make_hook("pre_merger")))
+    proj = family.projector(model)
+    if proj is not None:
+        handles.append(proj.register_forward_hook(make_hook("post_merger")))
 
-    # --- run vision encoder ---
+    # Drive the full image-feature path so the projector/merger hook fires.
     with torch.no_grad():
-        # The visual module accepts (pixel_values, grid_thw) and returns either
-        # a Tensor (older transformers) or BaseModelOutputWithPooling (newer).
-        out = visual(pixel_values, grid_thw=grid_thw)
-        if hasattr(out, "last_hidden_state"):
-            image_features = out.last_hidden_state
-        elif isinstance(out, tuple):
-            image_features = out[0]
-        else:
-            image_features = out
-        print(f"  image_features: shape={tuple(image_features.shape)} dtype={image_features.dtype}")
+        feats = model.get_image_features(**{
+            k: inputs[k] for k in ("pixel_values", *family.extra_inputs) if k in inputs
+        })
+    feats = _as_tensor(feats)
+    feats_shape = list(feats.shape) if feats is not None else None
+    if feats is not None:
+        np.save(out_dir / "image_features.npy", feats.detach().cpu().float().numpy())
 
     for h in handles:
         h.remove()
 
-    # --- save captures ---
-    for name, arr in captured.items():
+    for name, arr in sorted(captured.items()):
         np.save(out_dir / f"{name}.npy", arr)
-        print(f"  saved {name}.npy  shape={arr.shape}  mean={arr.mean():+.4f} std={arr.std():.4f}")
+        print(f"  {name:14s} shape={str(arr.shape):22s} mean={arr.mean():+.4f} std={arr.std():.4f}")
 
-    # Convenience aliases
-    if "block_26" in captured:
-        np.save(out_dir / "pre_merger.npy", captured["block_26"])
-    np.save(out_dir / "image_features.npy", image_features.cpu().float().numpy())
-
-    # Also dump the raw pos_embed table (for direct hipfire compare).
-    if hasattr(visual, "pos_embed"):
-        pe = visual.pos_embed
-        pe_t = pe.weight if hasattr(pe, "weight") else pe
-        pos_embed = pe_t.detach().cpu().float().numpy()
-        np.save(out_dir / "pos_embed_full.npy", pos_embed)
-        print(f"  saved pos_embed_full.npy  shape={pos_embed.shape}")
+    if family.pos_embed is not None:
+        pe = family.pos_embed(visual)
+        if pe is not None:
+            np.save(out_dir / "pos_embed_full.npy", pe.detach().cpu().float().numpy())
+            print(f"  pos_embed_full shape={tuple(pe.shape)}")
 
     meta = {
         "image_path": str(image_path),
-        "image_size": image.size,
-        "pixel_values_shape": list(pixel_values.shape),
-        "grid_thw": grid_thw.tolist(),
-        "image_features_shape": list(image_features.shape),
-        "model": HF_MODEL_PATH,
+        "image_size": list(image.size),
+        "family": family.name,
+        "image_features_shape": feats_shape,
         "captured_keys": sorted(captured.keys()),
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
-    print(f"  meta written to {out_dir}/meta.json")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("images", nargs="+", help="image paths")
-    ap.add_argument("--out", default="hf-ref", help="output directory root")
+    ap.add_argument("--model", required=True,
+                    help="HF id, local snapshot path, or alias: " + ", ".join(ALIASES))
+    ap.add_argument("--out", default="hf-ref")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
-    print(f"loading {HF_MODEL_PATH} on {args.device}...")
-    processor = AutoProcessor.from_pretrained(HF_MODEL_PATH)
+    model_path = ALIASES.get(args.model, args.model)
+    cfg = AutoConfig.from_pretrained(model_path)
+    family = pick_family(cfg.model_type)
+    print(f"model_type={cfg.model_type} → family={family.name}; loading on {args.device}...")
+
+    processor = AutoProcessor.from_pretrained(model_path)
     model = AutoModelForImageTextToText.from_pretrained(
-        HF_MODEL_PATH,
-        dtype=torch.bfloat16,
-        device_map=args.device,
-    )
-    model.eval()
-    print(f"loaded. visual: {type(model.model.visual).__name__}, "
-          f"n_blocks={len(model.model.visual.blocks)}")
+        model_path, dtype=torch.bfloat16, device_map=args.device,
+    ).eval()
 
     out_root = Path(args.out)
-    for img_path_arg in args.images:
-        img_path = Path(img_path_arg)
-        print(f"\n== {img_path.name} ==")
-        dump_one(img_path, out_root / img_path.stem, model, processor, args.device)
-
+    for img in args.images:
+        p = Path(img)
+        print(f"\n== {p.name} ==")
+        dump_one(p, out_root / p.stem, model, processor, family, args.device)
     print(f"\nDone. Dumps at: {out_root.absolute()}")
 
 
