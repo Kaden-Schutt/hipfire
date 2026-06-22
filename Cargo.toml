@@ -14,6 +14,7 @@ members = [
     "crates/hipfire-evidence",
     "crates/hipfire-generate",
     "crates/hipfire-hash",
+    "crates/hipfire-kld",
     "crates/hipfire-lock",
     "crates/hipfire-build-info",
     "crates/hipfire-media",

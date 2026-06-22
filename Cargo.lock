@@ -1564,6 +1564,13 @@ name = "hipfire-hash"
 version = "0.2.1"
 
 [[package]]
+name = "hipfire-kld"
+version = "0.2.1"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "hipfire-kvquant"
 version = "0.2.1"
 
