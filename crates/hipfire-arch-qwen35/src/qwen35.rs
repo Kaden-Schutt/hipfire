@@ -2697,9 +2697,67 @@ fn load_weight_tensor_raw(
             }
         },
         16 => load_bf16_matrix_weight(gpu, data, m, k),
+        33 => {
+            // OQ+ / Opus Plus W4A8 (quant_type id 33). On-disk bytes are IDENTICAL
+            // to Oq4 (qt=34): [f16 scale][128 signed nibbles] per 256-group, from
+            // codec `quantize_oq4g256` (incl. its LDLQ/AWQ calibration). The format
+            // difference is the runtime contract: nibble-EXPAND the int4 weights to
+            // int8 here and tag the tensor Oq8G256 so it dispatches the W8A8 iu8
+            // grouped-WMMA path with int8 ACTIVATIONS. Weight VALUES stay 4-bit (16
+            // levels in [-8,7]); activations gain int8 precision (W4A8). Layout
+            // becomes the Oq8 kernel buffer [int8 M*K | f32 scales M*ng] — the exact
+            // upcast the `quantize_oq4g256` doc names. AWQ smooth, when present, is
+            // applied to x by the wrapper via the awq_scale sidecar (unchanged).
+            const GROUP: usize = 256;
+            const BLOCK: usize = 130; // 2 (f16 scale) + 128 nibbles
+            assert_eq!(k % GROUP, 0, "OQPLUS requires K % 256 == 0 (got K={k})");
+            let ng = k / GROUP;
+            let weight_bytes = m * k; // one int8 per weight after expand
+            let scales_bytes = m * ng * 4;
+            let expect = m * ng * BLOCK;
+            assert_eq!(
+                data.len(),
+                expect,
+                "OQPLUS weight byte length {} != M*ng*130 = {expect} (M={m} K={k})",
+                data.len()
+            );
+            let sext4 = |nib: u8| -> i8 {
+                let v = (nib & 0xf) as i8;
+                if v > 7 {
+                    v - 16
+                } else {
+                    v
+                }
+            };
+            let mut combined = vec![0u8; weight_bytes + scales_bytes];
+            for r in 0..m {
+                for g in 0..ng {
+                    let src = (r * ng + g) * BLOCK;
+                    let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+                    let dst = r * k + g * GROUP;
+                    for i in 0..128 {
+                        let byte = data[src + 2 + i];
+                        combined[dst + 2 * i] = sext4(byte & 0xf) as u8;
+                        combined[dst + 2 * i + 1] = sext4(byte >> 4) as u8;
+                    }
+                    let so = weight_bytes + (r * ng + g) * 4;
+                    combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
+                }
+            }
+            let buf = gpu.upload_raw(&combined, &[combined.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::Oq8G256,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         34 => {
             // Opus Quant W4A4 (OQ4G256, quant_type id 34 — the eval-plan's reserved
-            // "Opus Quant" slot; 32=MQ+, 33=Opus-A8 stay reserved for those).
+            // "Opus Quant" slot; 32=MQ+, 33=OQ+/Opus Plus stay reserved for those).
             // On-disk: [f16 scale][128 nibbles] per
             // 256-group, row-contiguous (codec `quantize_oq4g256`). Repack to the
             // kernel layout in ONE buffer — packed nibbles [M,K/2] followed by

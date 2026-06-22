@@ -367,6 +367,10 @@ impl DType {
                 // weight offline (W·s); the forward divides x by the awq_scale
                 // sidecar before FWHT+int4-quantize, completing (W·s)·(x/s) = W·x.
                 | DType::Oq4G256
+                // OQ+ / Opus Plus W4A8 loads as Oq8G256 (int4 weights upcast to
+                // int8); same AWQ contract — the forward divides x by the sidecar
+                // before FWHT+int8-quantize. (Real W8A8 Oq8 has no sidecar → no-op.)
+                | DType::Oq8G256
         )
     }
 }

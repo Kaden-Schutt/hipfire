@@ -1924,10 +1924,19 @@ enum QuantType {
     /// scale. On-disk block = [f16 scale][128 nibbles] = 130 B/256-group
     /// (codec `quantize_oq4g256`). Loader (qwen35 qt=34) repacks to the kernel
     /// layout; forward int4-quantizes activations and runs the iu4·iu4 GEMM.
-    /// Id 34 = the eval-plan's reserved "Opus Quant (W4A4)" slot (32=MQ+,
-    /// 33=Opus-A8 remain reserved for those formats; see
-    /// docs/quant-formats/opus-mqplus-eval-plan.md).
+    /// Id 34 = the eval-plan's reserved "Opus Quant (W4A4)" slot (32=MQ+;
+    /// 33=OQ+/Opus Plus, see [`QuantType::OqPlusG256`]).
     Oq4G256 = 34,
+    /// OQ+ / Opus Plus (W4A8) — the symmetric-int4 analog of MQ4+: the SAME
+    /// on-disk bytes as [`QuantType::Oq4G256`] (symmetric signed-INT4, FWHT,
+    /// per-group f32 scale, codec `quantize_oq4g256`, including its LDLQ/AWQ
+    /// calibration), but the loader (qwen35 qt=33) nibble-EXPANDS the int4
+    /// weights to int8 and dispatches the iu8 W8A8 grouped-WMMA path with int8
+    /// ACTIVATIONS. Weight values stay 4-bit (16 levels); activations gain int8
+    /// precision. The int8-activation variant the `quantize_oq4g256` doc calls
+    /// out — Opus Quant : OQ+ :: A4 : A8, mirroring MQ4 : MQ4+. Id 33 = the
+    /// eval-plan's reserved Opus-A8 slot (renamed OQ+ to match mq4+).
+    OqPlusG256 = 33,
     /// Opus Quant W8A8 — symmetric signed-INT8, FWHT-rotated, per-group f32
     /// scale. On-disk block = [f16 scale][256 int8] = 258 B/256-group (codec
     /// `quantize_oq8g256`). Loader (qwen35 qt=35) repacks to the kernel layout;
@@ -2850,6 +2859,7 @@ enum HfqInputFormat {
     Mq3,
     Qtip3,
     Oq4,
+    OqPlus,
     Oq8,
 }
 
@@ -2866,6 +2876,8 @@ impl HfqInputFormat {
             "mq3" | "mq3g256" => Some(Self::Mq3),
             "qtip3" => Some(Self::Qtip3),
             "oq4" | "oq4g256" | "opus" => Some(Self::Oq4),
+            "oq+" | "oqplus" | "oq4+" | "opus-plus" | "opusplus" | "opus+" | "opusa8"
+            | "oq4a8" => Some(Self::OqPlus),
             "oq8" | "oq8g256" | "opus8" => Some(Self::Oq8),
             _ => None,
         }
@@ -3022,8 +3034,14 @@ fn quantize_hfq_source_tensor(
                 "MQ3G256",
             )
         }
-        HfqInputFormat::Oq4 => {
-            // Opus Quant W4A4. Requires 256-aligned K (FWHT-256); ragged dims fall
+        HfqInputFormat::Oq4 | HfqInputFormat::OqPlus => {
+            // Opus Quant W4A4 (Oq4) / OQ+ Opus Plus W4A8 (OqPlus). IDENTICAL weight
+            // quantization — symmetric signed-int4, FWHT-256, clip-search, plus the
+            // shared LDLQ/AWQ calibration below — producing the same packed bytes.
+            // The two formats differ ONLY in the runtime contract: Oq4 → qt=34
+            // (int4 activations, iu4 path); OQ+ → qt=33 (loader nibble-expands to
+            // int8, int8 activations, iu8 W8A8 path). See QuantType::OqPlusG256.
+            // Requires 256-aligned K (FWHT-256); ragged dims fall
             // back to Q8. Loader is qwen35 qt=34; forward int4-quantizes activations.
             // SmoothQuant/AWQ: when --awq + an imatrix (e.g. via --hessian) are
             // present and the tensor is awq_eligible, fold W·s offline (in the
@@ -3106,7 +3124,11 @@ fn quantize_hfq_source_tensor(
             } else {
                 quantize_oq4g256(&f32_data, &signs1, &signs2)
             };
-            (q, QuantType::Oq4G256, 256, "OQ4G256")
+            // Same packed int4 bytes; the format tag selects W4A4 vs W4A8 dispatch.
+            match format {
+                HfqInputFormat::OqPlus => (q, QuantType::OqPlusG256, 256, "OQPLUS"),
+                _ => (q, QuantType::Oq4G256, 256, "OQ4G256"),
+            }
         }
         HfqInputFormat::Oq8 => {
             // Opus Quant W8A8 (plain RTN, first pass — no AWQ/LDLQ yet). Requires
@@ -4612,6 +4634,14 @@ fn main() {
 
     let format_arg = arg_value(&args, "--format").unwrap_or("q8f16");
     let mut format_storage = normalize_format_flag(format_arg);
+    // OQ+ / Opus Plus is a distinct W4A8 FORMAT, not the generic `+` (clip+AWQ)
+    // modifier. Canonicalize its `+`-spellings to `oqplus` BEFORE the mq_plus
+    // strip below, so the `+` isn't consumed (which would leave a bare `oq`) and
+    // so calibration-free OQ+ doesn't trip the AWQ-needs-imatrix guard. Clip-search
+    // is unconditional in the Opus codec; AWQ stays opt-in via --awq --imatrix.
+    if matches!(format_storage.as_str(), "oq+" | "oq4+" | "opus+") {
+        format_storage = "oqplus".to_string();
+    }
     // `mqN+` modifier: clip-search + AWQ on top of the base MQ format. Strip the
     // trailing `+` so downstream format matching sees the base (e.g. "mq4"), and
     // enable clip-search globally. AWQ is auto-enabled below.
