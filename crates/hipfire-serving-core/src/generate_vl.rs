@@ -57,6 +57,7 @@ pub fn generate_vl(
         repeat_penalty,
         repeat_window,
         max_think_tokens,
+        encode_only: _, // qwen35-vl path always decodes
     } = *params;
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let vision_config = m.vision_config.as_ref().unwrap();
@@ -1044,6 +1045,17 @@ pub fn generate_vl_gemma3(
             "[gemma3-vl] vision cache: {hits}/{n_images} frame(s) hit (lifetime hits={}, misses={})",
             s.hits, s.misses
         );
+    }
+
+    // Cache-warm mode: the encode + cache insert above is all we need; skip the
+    // (expensive, per-token) LM decode and report the frames processed.
+    if params.encode_only {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"done","id":"{id}","tokens":0,"frames":{n_images},"cache_hits":{hits},"encode_only":true}}"#
+        );
+        let _ = stdout.flush();
+        return;
     }
 
     // `serve_with_embeds` consumes `img_embeds` directly and ignores `ctx.images`.

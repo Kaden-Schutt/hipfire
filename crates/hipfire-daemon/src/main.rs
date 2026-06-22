@@ -3353,6 +3353,13 @@ fn main() {
                 );
 
                 let has_image = image_base64.is_some() || image.is_some();
+                // Cache-warm: encode + cache the image embeddings, skip LM decode
+                // (gemma3-vl only). Lets a dataset be pre-encoded into the vision
+                // cache cheaply without the per-token prefill cost.
+                let vision_cache_only = msg
+                    .get("vision_cache_only")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let video = msg.get("video").and_then(|v| v.as_str());
                 let max_frames =
                     msg.get("max_frames").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -3400,6 +3407,7 @@ fn main() {
                                 repeat_penalty,
                                 repeat_window,
                                 max_think_tokens: vl_max_think_tokens,
+                                encode_only: vision_cache_only,
                             };
                             generate_vl_gemma3(m, &mut gpu, &mut stdout, &params, &frames);
                         }
@@ -3449,6 +3457,7 @@ fn main() {
                         repeat_penalty,
                         repeat_window,
                         max_think_tokens: vl_max_think_tokens,
+                        encode_only: false, // qwen35-vl / dots-ocr always decode
                     };
                     if is_dots_ocr {
                         generate_vl_dots_ocr(m, &mut gpu, &mut stdout, &params);

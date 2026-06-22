@@ -212,6 +212,9 @@ pub struct GenerateVLParams<'a> {
     pub repeat_penalty: f32,
     pub repeat_window: usize,
     pub max_think_tokens: usize,
+    /// Encode + cache the image embeddings only, then return without running the
+    /// LM decode. Used to pre-warm the vision-embedding cache for a dataset.
+    pub encode_only: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
