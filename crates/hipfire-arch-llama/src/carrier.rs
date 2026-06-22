@@ -48,7 +48,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
     };
     let kv = KvCache::from_mode(
         hipfire_runtime::kv_mode::resolve(
-            "",
+            ctx.kv_mode_override.unwrap_or(""),
             &hipfire_runtime::kv_mode::LLAMA_HFQ_POLICY,
             config.head_dim,
         )
