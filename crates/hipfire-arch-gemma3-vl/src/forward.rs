@@ -153,15 +153,31 @@ pub fn vision_forward(
         // nothing to QKᵀ/PV). Fallback on non-WMMA archs: the generic bf16 flash
         // over the fused qkv directly.
         let attn_out = gpu.alloc_tensor(&[n * h], DType::F32)?;
-        if gpu.arch_caps.has_wmma_w32() {
+        // WMMA f16-KV flash by default (fast path). After the q-prescale fix
+        // (correct 1/sqrt(head_dim) scale despite the kernel's fixed 1/sqrt(hdp))
+        // this path is numerically equivalent to the generic bf16 flash —
+        // verified byte-identical decode output across both. HIPFIRE_GEMMA3_
+        // VISION_NOWMMA=1 forces the generic path for A/B diagnostics.
+        let use_wmma = gpu.arch_caps.has_wmma_w32()
+            && std::env::var("HIPFIRE_GEMMA3_VISION_NOWMMA")
+                .ok()
+                .as_deref()
+                != Some("1");
+        if use_wmma {
             let hdp = 128usize;
             let q_pad = gpu.alloc_tensor(&[n * num_heads * hdp], DType::F32)?;
             let k_pad = gpu.alloc_tensor(&[n * num_heads * hdp], DType::F16)?;
             let v_pad = gpu.alloc_tensor(&[n * num_heads * hdp], DType::F16)?;
+            // The WMMA flash below bakes a fixed 1/sqrt(hdp) softmax scale, but
+            // SigLIP's real head_dim (e.g. 72) != hdp (128). Pre-scale Q by
+            // sqrt(hdp/head_dim) so the effective scale is the correct
+            // 1/sqrt(head_dim); without this the attention is over-smoothed
+            // (~0.75x scores) and vision features lose spatial discrimination.
+            let q_scale = (hdp as f32 / head_dim as f32).sqrt();
             timed!(
                 1,
                 gpu.attn_split_pad_f16kv(
-                    &qkv, &q_pad, &k_pad, &v_pad, n, h, num_heads, head_dim, hdp
+                    &qkv, &q_pad, &k_pad, &v_pad, n, h, num_heads, head_dim, hdp, q_scale,
                 )
             );
             gpu.free_tensor(qkv)?;

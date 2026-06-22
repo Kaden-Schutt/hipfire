@@ -42411,6 +42411,10 @@ impl Gpu {
         num_heads: usize,
         head_dim: usize,
         hdp: usize,
+        // Pre-scale applied to Q so a fixed-1/sqrt(hdp) downstream flash kernel
+        // gets the correct 1/sqrt(head_dim) softmax scale: pass
+        // sqrt(hdp/head_dim) when head_dim != hdp, else 1.0.
+        q_scale: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -42429,6 +42433,7 @@ impl Gpu {
             head_dim as i32,
             hdp as i32,
         );
+        let mut qs = q_scale;
         let mut params: Vec<*mut c_void> = vec![
             &mut qkvp as *mut _ as *mut c_void,
             &mut qp as *mut _ as *mut c_void,
@@ -42439,6 +42444,7 @@ impl Gpu {
             &mut nh as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut hp as *mut _ as *mut c_void,
+            &mut qs as *mut _ as *mut c_void,
         ];
         let total = (n * num_heads * hdp) as u32;
         let grid = (total + 255) / 256;
@@ -42459,6 +42465,7 @@ impl Gpu {
                 b.push_i32(nh);
                 b.push_i32(hd);
                 b.push_i32(hp);
+                b.push_f32(qs);
                 b
             },
         )
