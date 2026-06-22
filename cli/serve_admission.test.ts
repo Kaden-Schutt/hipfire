@@ -46,6 +46,53 @@ test("isValidSocketPath: over 255 chars is invalid", () => {
   expect(isValidSocketPath("/" + "a".repeat(255))).toBe(false);
 });
 
+// ─── Task 4: resolveServeBind ────────────────────────────────────────────────
+
+import { resolveServeBind } from "./serve_admission";
+
+const base = { cliSocketPath: null, cliHost: null, cliPort: null,
+               cfgSocketPath: "", cfgHost: "127.0.0.1", cfgPort: 11435 };
+
+test("resolveServeBind: CLI socket + CLI host is mutually exclusive (error)", () => {
+  const r = resolveServeBind({ ...base, cliSocketPath: "/run/hf.sock", cliHost: "0.0.0.0" });
+  expect("error" in r && r.error).toContain("mutually exclusive");
+});
+
+test("resolveServeBind: CLI socket + CLI port is mutually exclusive (error)", () => {
+  const r = resolveServeBind({ ...base, cliSocketPath: "/run/hf.sock", cliPort: 9000 });
+  expect("error" in r && r.error).toContain("mutually exclusive");
+});
+
+test("resolveServeBind: non-absolute CLI socket is an error", () => {
+  const r = resolveServeBind({ ...base, cliSocketPath: "run/hf.sock" });
+  expect("error" in r && r.error).toContain("absolute");
+});
+
+test("resolveServeBind: absolute CLI socket → unix bind", () => {
+  const r = resolveServeBind({ ...base, cliSocketPath: "/run/hf.sock" });
+  expect(r).toEqual({ bind: { kind: "unix", path: "/run/hf.sock" } });
+});
+
+test("resolveServeBind: CLI host/port → tcp bind (CLI wins over cfg)", () => {
+  const r = resolveServeBind({ ...base, cliHost: "0.0.0.0", cliPort: 9000, cfgPort: 11435 });
+  expect(r).toEqual({ bind: { kind: "tcp", host: "0.0.0.0", port: 9000 } });
+});
+
+test("resolveServeBind: cfg socket_path → unix bind when no CLI bind", () => {
+  const r = resolveServeBind({ ...base, cfgSocketPath: "/run/cfg.sock" });
+  expect(r).toEqual({ bind: { kind: "unix", path: "/run/cfg.sock" } });
+});
+
+test("resolveServeBind: nothing set → tcp from cfg defaults", () => {
+  const r = resolveServeBind(base);
+  expect(r).toEqual({ bind: { kind: "tcp", host: "127.0.0.1", port: 11435 } });
+});
+
+test("resolveServeBind: explicit CLI socket wins over cfg host/port", () => {
+  const r = resolveServeBind({ ...base, cliSocketPath: "/run/cli.sock", cfgHost: "0.0.0.0", cfgPort: 9000 });
+  expect(r).toEqual({ bind: { kind: "unix", path: "/run/cli.sock" } });
+});
+
 // ─── Task 1: ServeBind + pure bind helpers ───────────────────────────────────
 
 test("formatBind: tcp renders host:port", () => {

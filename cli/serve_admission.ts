@@ -581,6 +581,37 @@ export function isValidSocketPath(value: string): boolean {
     && (value === "" || value.startsWith("/"));
 }
 
+// ─── Task 4: resolveServeBind ────────────────────────────────────────────────
+
+// The SINGLE precedence point for "which transport does this serve bind".
+// Explicit CLI intent always wins over config; within one invocation a CLI
+// socket and an explicit CLI host/port are mutually exclusive (spec §6.3).
+export function resolveServeBind(i: {
+  cliSocketPath: string | null;
+  cliHost: string | null;
+  cliPort: number | null;
+  cfgSocketPath: string;
+  cfgHost: string;
+  cfgPort: number;
+}): { bind: ServeBind } | { error: string } {
+  if (i.cliSocketPath !== null) {
+    if (i.cliHost !== null || i.cliPort !== null) {
+      return { error: "--socket-path and an explicit host/port are mutually exclusive" };
+    }
+    if (!isValidSocketPath(i.cliSocketPath) || i.cliSocketPath === "") {
+      return { error: "--socket-path must be an absolute path (<=255 chars, no NUL)" };
+    }
+    return { bind: { kind: "unix", path: i.cliSocketPath } };
+  }
+  if (i.cliHost !== null || i.cliPort !== null) {
+    return { bind: { kind: "tcp", host: i.cliHost ?? i.cfgHost, port: i.cliPort ?? i.cfgPort } };
+  }
+  if (i.cfgSocketPath !== "") {
+    return { bind: { kind: "unix", path: i.cfgSocketPath } };
+  }
+  return { bind: { kind: "tcp", host: i.cfgHost, port: i.cfgPort } };
+}
+
 // ─── Task 1: ServeBind union + pure bind helpers ─────────────────────────────
 
 // Mirrors index.ts DEFAULT_PORT (index.ts:63). Kept local to avoid a circular
