@@ -111,6 +111,27 @@ Known upstream gaps (non-blocking, mirror them): batched-prefill rejects MQ5
 gu4_dn5 not indexable. Next iteration: execute the port, `cargo build` all 4
 crates, then coherence + KLD gate.
 
+DE-RISKED 2026-06-22 (attempted on throwaway branch `mq5-port`, aborted clean —
+multi-hour/multi-session, does NOT fit one turn). Findings for whoever resumes:
+- SAFE to insert MQ5G256 mid-`DType` enum: `DType` has no `#[repr]` and is never
+  cast `as u8/u32`; qt↔DType is an explicit match (`31 => MQ5G256`), so enum
+  order is cosmetic. No discriminant-shift hazard to existing .hfq files.
+- RESOLUTION RULE for the 35 conflicts: keep HEAD (retains chaingun's Qtip3/Oq4
+  arms) + add `MQ5G256` to each match arm — EXCEPT `DType::supports_awq_sidecar`:
+  do NOT add MQ5 there. **Apply c7371552's fixup**: it reverted MQ5/MQ6 from
+  supports_awq_sidecar (post-#458). MQ5 is NOT an AWQ-sidecar format.
+- dispatch.rs (DType enum + supports_awq_sidecar) already worked out; the rest
+  (types.rs ×10, quantize/main.rs ×9, pipeline ×3, coverage_tests ×3, gemv_table
+  ×2, families/moe ×2, tests ×1, hfq ×1) follow the same rule.
+- RELOCATION: f7efb940 adds 8 launchers to `rdna-compute/src/gemv.rs` (DELETED in
+  chaingun) → paste them into `dispatch.rs`'s `impl Gpu` (helpers ensure_kernel/
+  launch_maybe_blob/ensure_fp16_x all present there). Names: gemv_mq5g256_with_rotate,
+  _prerotated, gemv_hfq5g256{,_residual,_residual_sigmoid_scaled_gpu_batched,
+  _moe_gate_up_k8_indexed{,_batched},_moe_down_k8_indexed_batched_expanded}.
+- VALIDATION: build all 4 crates → coherence gate → KLD (quantize a model to mq5,
+  compare vs mq4/mq6 — the only real quality check; gate alone won't catch a bad
+  byte-pack). Effort estimate: a dedicated multi-session port, not a loop step.
+
 ## [ ] 3. MoE-AWQ per-expert down-proj  — MEDIUM, MoE quality
 Source: `6198851e` (quantizer per-expert AWQ), `459a9eb4` (down-proj AWQ
 kernel: indexed silu-mul-rotate), `3e5f2e9c` (dispatch wiring), `7b71833a`,
