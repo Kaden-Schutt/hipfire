@@ -773,6 +773,28 @@
       "size_bytes": 19820755200,
       "arch_id": 6,
       "quant": "mq4p"
+    },
+    "vibethinker:3b": {
+      "repo": "xfivetide/VibeThinker-3B-hipfire",
+      "file": "vibethinker-3b.mq4.hfq",
+      "size_gb": 1.82,
+      "min_vram_gb": 3.5,
+      "desc": "VibeThinker-3B (WeiboAI), Qwen2 MQ4. ~36-90 tok/s on gfx1151.",
+      "sha256": "b5e3f901a2ba5cab5f34051a9d711940edee5356f877e88a424e07ed4ddc6c1c",
+      "size_bytes": 1818198016,
+      "arch_id": 7,
+      "quant": "mq4"
+    },
+    "vibethinker:3b-mq6": {
+      "repo": "xfivetide/VibeThinker-3B-hipfire",
+      "file": "vibethinker-3b.mq6.hfq",
+      "size_gb": 2.51,
+      "min_vram_gb": 5.0,
+      "desc": "VibeThinker-3B (WeiboAI), Qwen2 MQ6 6-bit. ~25-60 tok/s on gfx1151.",
+      "sha256": "813a451d3aa90981776fccad3abd5d22fbbe96834e42c6d812fb158b14599048",
+      "size_bytes": 2511831040,
+      "arch_id": 7,
+      "quant": "mq6"
     }
   },
   "aliases": {
@@ -812,6 +834,7 @@
     "qwen3.5:9b:draft": "qwen3.5:9b-draft",
     "qwen3.5:27b:draft": "qwen3.5:27b-draft",
     "qwen3.6:27b:draft": "qwen3.6:27b-draft",
-    "qwen3.5:2b-mq4": "qwen3.5:2b"
+    "qwen3.5:2b-mq4": "qwen3.5:2b",
+    "vibethinker": "vibethinker:3b"
   }
 }
