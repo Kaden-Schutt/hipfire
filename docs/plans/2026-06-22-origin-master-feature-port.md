@@ -123,7 +123,7 @@ Done when: per-expert down AWQ produces a coherent MoE file; coherence +
 KLD eval show quality gain vs non-AWQ down at equal size.
 Progress: _not started_
 
-## [x] 4. MTP perf — non-hipGraph subset  — LANDED (safe subset); bc5d005d deferred
+## [x] 4. MTP perf — non-hipGraph subset  — FULLY LANDED (incl. bc5d005d, arch-corrected)
 Source: `5ac96a8f` (+16/-11 mtp_head.rs: MTP-head lm_head WMMA → RDNA3/gfx11),
 `1495be04` (+29/-8 mtp_head.rs: chunked WMMA on gfx12), `bc5d005d` (+31/-2
 mtp_spec.rs + qwen35.rs: decouple + adaptive-K gfx11 MTP defaults, per-arch
@@ -150,6 +150,13 @@ it default-ON's decouple + adaptive-K (p_min=0.6, output-changing) via
 gfx1151 needs separate in-arch validation). To take it: gate to
 gfx1100/01/02 explicitly (or validate decouple+p_min on gfx1151 via dflash
 gate first), then land.
+UPDATE 2026-06-22 (commit 2ede1173): bc5d005d LANDED with the arch gate
+corrected to `gfx110x` (gfx1100/01/02 only) — fixes master's over-broad
+`starts_with("gfx11")` that wrongly caught gfx1151. adaptive-K p_min=0.6 +
+decouple are now default-ON for RDNA3 dGPU, opt-in elsewhere (HIPFIRE_MTP_P_MIN
+/ HIPFIRE_MTP_VERIFY_DECOUPLE). Inert on this gfx1151 box; forced dflash + speed
+gates PASS. gfx1151 default-on left for separate in-arch benchmarking. #4 fully
+complete.
 
 ## [ ] 5. mfp4-E8 + GPTQ/LDLQ-on-E8  — LARGE, HIGHEST quality value
 Source (key anchors; see `git log chaingun..origin/master`): `f8fe55d5`
