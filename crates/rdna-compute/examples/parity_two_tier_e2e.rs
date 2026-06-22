@@ -74,7 +74,7 @@ fn main() {
     let importance: Vec<f32> = (0..n_cold_tok).map(|t| 0.1 + (t as f32 / n_cold_tok as f32)).collect();
 
     // REAL cold compaction: KVarN 4-bit, FWHT-rotated, fold_m=4, 12.5% core exact.
-    let cold = compact_cold_kv(&cold_k, &cold_v, n_cold_tok, NKV, HD, &importance, 0.125, 4, true, false);
+    let cold = compact_cold_kv(&cold_k, &cold_v, n_cold_tok, NKV, HD, &importance, 0.125, 4, true, false, 15.0);
     let nvc = cold.n_valid;
 
     // Hot tier raw [nkv × w × HD] (regroup token-major → head-major slabs).

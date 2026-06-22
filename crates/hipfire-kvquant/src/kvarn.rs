@@ -176,6 +176,15 @@ pub struct QuantTile {
 /// per-row Sinkhorn scale `s_row` into (scale, zp) so dequant only needs the
 /// per-column scale at runtime: `deq = (q*scale_abs + zp_abs) * s_col`.
 pub fn quantize_tile(tile: &[f32], r_dim: usize, c_dim: usize) -> QuantTile {
+    quantize_tile_qmax(tile, r_dim, c_dim, QMAX)
+}
+
+/// As `quantize_tile`, but with an explicit max code `qmax` (15 = 4-bit, 7 =
+/// 3-bit, 3 = 2-bit, 1 = 1-bit). Codes ≤ 15 still pack into the same 4-bit
+/// nibble container + dequant kernel, so a lower qmax measures lower-precision
+/// quant QUALITY with no storage/GPU change (the storage win comes later from a
+/// real sub-nibble packing). Used by the cold-tier 2-bit probe.
+pub fn quantize_tile_qmax(tile: &[f32], r_dim: usize, c_dim: usize, qmax: f32) -> QuantTile {
     let bal = variance_normalize(tile, r_dim, c_dim, SINKHORN_ITERS);
     let mut q = vec![0u8; r_dim * c_dim];
     let mut scale_abs = vec![0.0f32; r_dim];
@@ -189,10 +198,10 @@ pub fn quantize_tile(tile: &[f32], r_dim: usize, c_dim: usize) -> QuantTile {
             lo = lo.min(v);
             hi = hi.max(v);
         }
-        let scale = ((hi - lo) / QMAX).max(1e-8);
+        let scale = ((hi - lo) / qmax).max(1e-8);
         for c in 0..c_dim {
             let v = bal.balanced[r * c_dim + c];
-            let code = (((v - lo) / scale).round()).clamp(0.0, QMAX);
+            let code = (((v - lo) / scale).round()).clamp(0.0, qmax);
             q[r * c_dim + c] = code as u8;
         }
         // Absorb the per-row Sinkhorn scale so deq*(s_col) reconstructs the

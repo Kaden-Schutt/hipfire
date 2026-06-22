@@ -92,6 +92,8 @@ pub struct HierKvState {
     /// Group merged (non-core) cold tokens by adjacent position (similar RoPE
     /// phase → less merge blur) rather than importance rank. Default on.
     pub position_local: bool,
+    /// Max quant code for cold tiles (15=4-bit default, 3=2-bit probe).
+    pub cold_qmax: f32,
     pub n_heads: usize,
     pub n_kv_heads: usize,
     pub hot_k: Vec<GpuTensor>, // [n_layers] slot-major [nkv × hot_budget × HD] f32
@@ -144,6 +146,14 @@ impl HierKvState {
             &std::env::var("HIPFIRE_KV_IMPORTANCE").unwrap_or_else(|_| "vnorm".to_string()),
         );
         let position_local = std::env::var("HIPFIRE_KV_POS_LOCAL").ok().as_deref() != Some("0");
+        // Cold-tile quant precision probe: code max = 2^bits - 1 (4-bit=15 default,
+        // 2-bit=3). Same nibble storage; this measures lower-precision quant QUALITY.
+        let cold_bits: u32 = std::env::var("HIPFIRE_KV_COLD_BITS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4)
+            .clamp(1, 4);
+        let cold_qmax = ((1u32 << cold_bits) - 1) as f32;
         let mut hot_k = Vec::with_capacity(n_layers);
         let mut hot_v = Vec::with_capacity(n_layers);
         let mut attn_mass = Vec::with_capacity(n_layers);
@@ -162,6 +172,7 @@ impl HierKvState {
             fold_m,
             importance_mode,
             position_local,
+            cold_qmax,
             n_heads,
             n_kv_heads,
             hot_k,
@@ -277,7 +288,7 @@ impl HierKvState {
             .collect();
         let cold = compact_cold_kv(
             &ck, &cv, mb, nkv, HD, &importance, self.core_frac, self.fold_m, false,
-            self.position_local,
+            self.position_local, self.cold_qmax,
         );
         let n_slots = cold.n_slots;
         let rec_bytes = kvarn_record_bytes(HD, n_slots);
