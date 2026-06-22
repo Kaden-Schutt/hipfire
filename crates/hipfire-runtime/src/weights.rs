@@ -179,10 +179,27 @@ fn dense_swiglu_residual_route(dtype: DType) -> DenseSwigluResidualRoute {
     }
 }
 
+/// Convert a dispatch-family error into a `HipError`, preserving the
+/// capability-gap signal: every `DispatchError` variant except `Hip` means
+/// "no kernel route for this (dtype, op, arch)" — so map those to
+/// `HipError::unsupported` (classifiable by `is_unsupported()`), and only a
+/// genuine `Hip` runtime failure to a plain error. Without this, an unsupported
+/// dtype surfaced as a generic code-0 error and got mistaken for an infra crash.
+fn dispatch_err_to_hip(e: hipfire_dispatch::types::DispatchError) -> hip_bridge::HipError {
+    use hipfire_dispatch::types::DispatchError as DE;
+    let msg = e.to_string();
+    match e {
+        DE::Hip(_) => hip_bridge::HipError::new(0, &msg),
+        _ => hip_bridge::HipError::unsupported(&msg),
+    }
+}
+
 pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
     use hipfire_dispatch::context::DispatchCtx;
     use hipfire_dispatch::families::gemv::{GemvParams, WeightRef};
-    use hipfire_dispatch::types::{dtype_needs_rotation, GemvVariant};
+    use hipfire_dispatch::types::{
+        dtype_needs_rotation, dtype_rotation_plan, GemvVariant, RotationPlan,
+    };
 
     let gemv = gemv_family();
     let ctx = DispatchCtx::new(gpu);
@@ -203,7 +220,7 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
         }
         return gemv
             .run_auto(&ctx, gpu, &wr, x, y)
-            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()));
+            .map_err(dispatch_err_to_hip);
     }
 
     macro_rules! xr {
@@ -413,6 +430,22 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
         // The fused MFP4G32 optimization is handled inside
         // GemvFamily::run() -> Prerotated arm.
         _ => {
+            // This generic arm FWHT-G256-rotates the activation and runs a
+            // *prerotated* GEMV — it is correct ONLY for FWHT-G256 MagnumQuant-
+            // family weights. Any other dtype reaching here (e.g. a quant variant
+            // with no FWHT rotation plan) would have its activation rotated against
+            // an unrotated weight: garbage logits, or a panic inside the prerotated
+            // kernel asserting on layout/scale-tail size. Refuse honestly — a typed
+            // capability gap (HipError::is_unsupported), not a crash 40 frames deep.
+            // `dtype_rotation_plan` is the authority, so this gate can't drift from
+            // what the rotation pipeline actually does.
+            if dtype_rotation_plan(w.gpu_dtype) != RotationPlan::FwhtG256 {
+                return Err(hip_bridge::HipError::unsupported(&format!(
+                    "weight_gemv: no GEMV route for dtype {:?} on {} \
+                     (generic arm handles FWHT-G256 MagnumQuant only)",
+                    w.gpu_dtype, gpu.arch
+                )));
+            }
             debug_assert!(
                 w.gpu_dtype != DType::Oq4G256,
                 "Oq4G256 reached weight_gemv generic arm — should hit the dedicated arm"
@@ -445,7 +478,7 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
                     up: None,
                 },
             )
-            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+            .map_err(dispatch_err_to_hip)
         }
     }
 }

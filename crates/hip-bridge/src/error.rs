@@ -17,6 +17,14 @@ pub const HIP_ERROR_PEER_ACCESS_UNSUPPORTED: HipErrorCode = 217;
 pub const HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED: HipErrorCode = 704;
 pub const HIP_ERROR_PEER_ACCESS_NOT_ENABLED: HipErrorCode = 705;
 
+/// Sentinel code for an "unsupported dispatch route": a requested (op, dtype,
+/// arch) combination that hipfire has no kernel path for. Deliberately outside
+/// the real HIP error-code range so consumers (eval, serving admission) can
+/// classify it as a *capability gap* — not an infra failure or crash — via
+/// [`HipError::is_unsupported`]. This is the typed substitute for the old
+/// "silently misroute into a kernel that panics" behavior.
+pub const HIPFIRE_ERROR_UNSUPPORTED: HipErrorCode = 0xF1F1_0001;
+
 #[derive(Debug)]
 pub struct HipError {
     pub code: HipErrorCode,
@@ -29,6 +37,23 @@ impl HipError {
             code,
             message: format!("{context} (hipError={code})"),
         }
+    }
+
+    /// Build an "unsupported dispatch route" error — a capability gap, not a
+    /// crash. `context` should name the op, dtype, and arch, e.g.
+    /// `"weight_gemv: no route for dtype Rq5Protect on gfx1103"`.
+    pub fn unsupported(context: &str) -> Self {
+        Self {
+            code: HIPFIRE_ERROR_UNSUPPORTED,
+            message: format!("unsupported dispatch: {context}"),
+        }
+    }
+
+    /// True iff this is a capability-gap error (see [`HipError::unsupported`]).
+    /// Lets a caller distinguish "this config isn't implemented here" from a
+    /// genuine runtime failure, so it can skip/mark rather than crash.
+    pub fn is_unsupported(&self) -> bool {
+        self.code == HIPFIRE_ERROR_UNSUPPORTED
     }
 
     pub(crate) fn from_code(
@@ -64,3 +89,20 @@ impl fmt::Display for HipError {
 }
 
 impl std::error::Error for HipError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_is_classified_apart_from_real_errors() {
+        let gap = HipError::unsupported("weight_gemv: no route for dtype Rq5Protect on gfx1103");
+        assert!(gap.is_unsupported());
+        assert_eq!(gap.code, HIPFIRE_ERROR_UNSUPPORTED);
+        assert!(gap.message.contains("Rq5Protect"));
+
+        // A genuine HIP runtime failure must NOT be mistaken for a capability gap.
+        let real = HipError::new(700, "out of memory");
+        assert!(!real.is_unsupported());
+    }
+}
