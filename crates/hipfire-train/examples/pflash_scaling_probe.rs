@@ -21,9 +21,9 @@
 //!
 //! Run:
 //!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "pflash-scaling"
+//!   hipfire gpu-lock acquire "pflash-scaling"
 //!   cargo run -p hipfire-train --release --example pflash_scaling_probe
-//!   gpu_release
+//!   hipfire gpu-lock release
 
 use hipfire_model::tokenizer::Tokenizer;
 use hipfire_train::block::BlockActivations;
@@ -37,14 +37,38 @@ use std::path::{Path, PathBuf};
 /// explicitly or VRAM climbs ~2GB/forward and OOMs on the larger models.
 fn free_block(gpu: &mut Gpu, b: BlockActivations) {
     let BlockActivations {
-        xn1, rinv1, hq, hv, q_r, k_r, v, p_all, ctx, x_mid, xn2, rinv2, gate, up, act, pos,
+        xn1,
+        rinv1,
+        hq,
+        hv,
+        q_r,
+        k_r,
+        v,
+        p_all,
+        ctx,
+        x_mid,
+        xn2,
+        rinv2,
+        gate,
+        up,
+        act,
+        pos,
     } = b;
-    for t in [xn1, rinv1, hq, hv, q_r, k_r, v, p_all, ctx, x_mid, xn2, rinv2, gate, up, act, pos] {
+    for t in [
+        xn1, rinv1, hq, hv, q_r, k_r, v, p_all, ctx, x_mid, xn2, rinv2, gate, up, act, pos,
+    ] {
         let _ = gpu.free_tensor(t);
     }
 }
 fn free_acts(gpu: &mut Gpu, a: ModelActivations) {
-    let ModelActivations { layer_inputs, layer_acts, x_last, rinv_final, xf, logits } = a;
+    let ModelActivations {
+        layer_inputs,
+        layer_acts,
+        x_last,
+        rinv_final,
+        xf,
+        logits,
+    } = a;
     for t in layer_inputs {
         let _ = gpu.free_tensor(t);
     }
@@ -72,7 +96,11 @@ const LADDER: &[(&str, &str)] = &[
 
 fn snapshot_dir(repo: &str) -> Option<PathBuf> {
     let snaps = Path::new(HF).join(repo).join("snapshots");
-    std::fs::read_dir(&snaps).ok()?.flatten().map(|e| e.path()).find(|p| p.is_dir())
+    std::fs::read_dir(&snaps)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.is_dir())
 }
 
 // ── stats helpers ──────────────────────────────────────────────────────────
@@ -87,7 +115,10 @@ fn rank(a: &[f32]) -> Vec<f32> {
 }
 fn pearson(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len() as f64;
-    let (ma, mb) = (a.iter().sum::<f32>() as f64 / n, b.iter().sum::<f32>() as f64 / n);
+    let (ma, mb) = (
+        a.iter().sum::<f32>() as f64 / n,
+        b.iter().sum::<f32>() as f64 / n,
+    );
     let (mut c, mut va, mut vb) = (0.0, 0.0, 0.0);
     for i in 0..a.len() {
         let (da, db) = (a[i] as f64 - ma, b[i] as f64 - mb);
@@ -95,7 +126,11 @@ fn pearson(a: &[f32], b: &[f32]) -> f32 {
         va += da * da;
         vb += db * db;
     }
-    if va == 0.0 || vb == 0.0 { 0.0 } else { (c / (va.sqrt() * vb.sqrt())) as f32 }
+    if va == 0.0 || vb == 0.0 {
+        0.0
+    } else {
+        (c / (va.sqrt() * vb.sqrt())) as f32
+    }
 }
 fn spearman(a: &[f32], b: &[f32]) -> f32 {
     pearson(&rank(a), &rank(b))
@@ -104,7 +139,11 @@ fn spearman(a: &[f32], b: &[f32]) -> f32 {
 fn partial_spearman(x: &[f32], y: &[f32], z: &[f32]) -> f32 {
     let (rxy, rxz, ryz) = (spearman(x, y), spearman(x, z), spearman(y, z));
     let denom = ((1.0 - rxz * rxz) * (1.0 - ryz * ryz)).sqrt();
-    if denom == 0.0 { 0.0 } else { (rxy - rxz * ryz) / denom }
+    if denom == 0.0 {
+        0.0
+    } else {
+        (rxy - rxz * ryz) / denom
+    }
 }
 /// 1-based rank of index `i` in `a` (1 = largest value).
 fn rank_of(a: &[f32], i: usize) -> usize {
@@ -123,7 +162,11 @@ fn block_scores(k: &[f32], seq: usize, n_kv: usize, hd: usize, block: usize) -> 
             na += (a[i] as f64).powi(2);
             nb_ += (b[i] as f64).powi(2);
         }
-        if na == 0.0 || nb_ == 0.0 { 0.0 } else { d / (na.sqrt() * nb_.sqrt()) }
+        if na == 0.0 || nb_ == 0.0 {
+            0.0
+        } else {
+            d / (na.sqrt() * nb_.sqrt())
+        }
     };
     let mut scores = vec![0.0f32; nb];
     for b in 0..nb {
@@ -218,16 +261,23 @@ fn run_model(gpu: &mut Gpu, label: &str, dir: &Path) -> Result<Row, String> {
     )
     .map_err(|e| format!("tokenizer: {e:?}"))?;
     let (cfg, w) = load_llama_fp32(gpu, dir)?;
-    let (n_kv, hd, vocab, n_layers) =
-        (cfg.num_key_value_heads, cfg.head_dim, cfg.vocab_size, cfg.num_hidden_layers);
-    let model = LlamaModel::from_f32_weights(gpu, &cfg, w, SEQ, 4, 8.0).map_err(|e| format!("{e:?}"))?;
+    let (n_kv, hd, vocab, n_layers) = (
+        cfg.num_key_value_heads,
+        cfg.head_dim,
+        cfg.vocab_size,
+        cfg.num_hidden_layers,
+    );
+    let model =
+        LlamaModel::from_f32_weights(gpu, &cfg, w, SEQ, 4, 8.0).map_err(|e| format!("{e:?}"))?;
     let pos: Vec<f32> = (0..SEQ).map(|t| t as f32).collect();
 
     let (ids, filler_tok, answer_tok) = build_needle(&tok);
 
     // baseline
     let base = model_forward(gpu, &model, &ids, &pos).map_err(|e| format!("{e:?}"))?;
-    let logits_all = gpu.download_f32(&base.logits).map_err(|e| format!("{e:?}"))?;
+    let logits_all = gpu
+        .download_f32(&base.logits)
+        .map_err(|e| format!("{e:?}"))?;
     let base_last = logits_all[(SEQ - 1) * vocab..SEQ * vocab].to_vec();
     let probs = softmax(&base_last);
     let retrieved_prob = probs[answer_tok as usize];
@@ -239,8 +289,12 @@ fn run_model(gpu: &mut Gpu, label: &str, dir: &Path) -> Result<Row, String> {
         == Some(answer_tok);
 
     let mid_layer = (n_layers / 2).min(base.layer_acts.len() - 1);
-    let k_shallow = gpu.download_f32(&base.layer_acts[SHALLOW].k_r).map_err(|e| format!("{e:?}"))?;
-    let k_mid = gpu.download_f32(&base.layer_acts[mid_layer].k_r).map_err(|e| format!("{e:?}"))?;
+    let k_shallow = gpu
+        .download_f32(&base.layer_acts[SHALLOW].k_r)
+        .map_err(|e| format!("{e:?}"))?;
+    let k_mid = gpu
+        .download_f32(&base.layer_acts[mid_layer].k_r)
+        .map_err(|e| format!("{e:?}"))?;
     let metric_all = block_scores(&k_shallow, SEQ, n_kv, hd, BLOCK);
     let metric_mid_all = block_scores(&k_mid, SEQ, n_kv, hd, BLOCK);
     // everything we need from the baseline is now on host (base_last, k_*); free
@@ -257,7 +311,9 @@ fn run_model(gpu: &mut Gpu, label: &str, dir: &Path) -> Result<Row, String> {
             ab[t] = filler_tok;
         }
         let abf = model_forward(gpu, &model, &ab, &pos).map_err(|e| format!("{e:?}"))?;
-        let abl = gpu.download_f32(&abf.logits).map_err(|e| format!("{e:?}"))?;
+        let abl = gpu
+            .download_f32(&abf.logits)
+            .map_err(|e| format!("{e:?}"))?;
         let ab_last = &abl[(SEQ - 1) * vocab..SEQ * vocab];
         oracle[b] = kl(&base_last, ab_last);
         free_acts(gpu, abf); // return this forward's buffers to the pool
@@ -290,7 +346,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // sidestepping the non-releasing device allocator). e.g. `... -- Llama-3.2-3B`.
     let filter = std::env::args().nth(1);
     let mut gpu = Gpu::init().expect("Gpu::init failed");
-    println!("arch: {}  SEQ={SEQ} BLOCK={BLOCK} needle@block{NEEDLE_BLOCK} shallow=L{SHALLOW}\n", gpu.arch);
+    println!(
+        "arch: {}  SEQ={SEQ} BLOCK={BLOCK} needle@block{NEEDLE_BLOCK} shallow=L{SHALLOW}\n",
+        gpu.arch
+    );
 
     for (label, repo) in LADDER {
         if let Some(f) = &filter {
@@ -323,9 +382,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // single machine-greppable summary line for the bash loop to collect
                 println!(
                     "ROW\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{:.4}",
-                    r.label, r.layers, r.mid_layer, r.sp_metric, r.partial, r.partial_mid,
-                    r.needle_rank_oracle, r.needle_rank_recency, r.needle_rank_metric,
-                    r.needle_rank_mid, r.retrieved_prob
+                    r.label,
+                    r.layers,
+                    r.mid_layer,
+                    r.sp_metric,
+                    r.partial,
+                    r.partial_mid,
+                    r.needle_rank_oracle,
+                    r.needle_rank_recency,
+                    r.needle_rank_metric,
+                    r.needle_rank_mid,
+                    r.retrieved_prob
                 );
                 println!();
             }

@@ -6,9 +6,9 @@
 //!
 //! Run:
 //!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "gradcheck-ce"
+//!   hipfire gpu-lock acquire "gradcheck-ce"
 //!   cargo run -p hipfire-train --release --example gradcheck_cross_entropy
-//!   gpu_release
+//!   hipfire gpu-lock release
 
 use hipfire_train::ops::cross_entropy::cross_entropy;
 use rdna_compute::{DType, Gpu, GpuTensor, HipResult};

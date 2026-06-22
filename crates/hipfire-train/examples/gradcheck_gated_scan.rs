@@ -3,7 +3,7 @@
 //! Never train on an unverified gradient.
 //!
 //!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "gated-scan-gradcheck"
+//!   hipfire gpu-lock acquire "gated-scan-gradcheck"
 //!   cargo run -p hipfire-train --release --example gradcheck_gated_scan
 
 use hipfire_train::ops::gated_scan::{gated_scan_backward, gated_scan_forward};
@@ -20,7 +20,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // deterministic pseudo-random g∈(0,1), u∈[-1,1), loss weights w∈[-1,1)
     let mut s: u64 = 0x9E3779B97F4A7C15;
     let mut rng = || {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((s >> 33) as f32) / (1u64 << 31) as f32 // ~[0,1)
     };
     let mut g: Vec<f32> = (0..n).map(|_| 0.05 + 0.9 * rng()).collect(); // keep off the edges
@@ -52,7 +54,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let h_step = 1e-3f32;
     let (atol, rtol) = (1e-3f32, 2e-2f32);
     // spread across early/mid/late timesteps and channels
-    let idxs = [0usize, 3, D, D + 5, 5 * D + 2, 7 * D, (SEQ - 1) * D + 1, (SEQ - 1) * D + 7];
+    let idxs = [
+        0usize,
+        3,
+        D,
+        D + 5,
+        5 * D + 2,
+        7 * D,
+        (SEQ - 1) * D + 1,
+        (SEQ - 1) * D + 7,
+    ];
     let mut max_abs = 0.0f32;
     let mut all_ok = true;
 
@@ -71,7 +82,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ok = abs <= tol;
         all_ok &= ok;
         max_abs = max_abs.max(abs);
-        println!("  {i:>5} {a:>14.6} {fd:>12.6} {abs:>10.2e} {tol:>8.2e}   {}", if ok { "✓" } else { "✗" });
+        println!(
+            "  {i:>5} {a:>14.6} {fd:>12.6} {abs:>10.2e} {tol:>8.2e}   {}",
+            if ok { "✓" } else { "✗" }
+        );
     }
 
     println!("\n-- dL/du --\n  idx      analytic         fd        abs_err   tol      ok");
@@ -89,7 +103,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ok = abs <= tol;
         all_ok &= ok;
         max_abs = max_abs.max(abs);
-        println!("  {i:>5} {a:>14.6} {fd:>12.6} {abs:>10.2e} {tol:>8.2e}   {}", if ok { "✓" } else { "✗" });
+        println!(
+            "  {i:>5} {a:>14.6} {fd:>12.6} {abs:>10.2e} {tol:>8.2e}   {}",
+            if ok { "✓" } else { "✗" }
+        );
     }
 
     println!("\n  max_abs_err={max_abs:.2e}  (atol={atol:.0e} rtol={rtol:.0e})");

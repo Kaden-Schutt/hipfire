@@ -18,6 +18,7 @@
 #   DMODEL=4096 CTX=512 RANKS="0 1 2 4 8 16 32 64 128 512 2048 4000 4090 4095" \
 #   scripts/roughquant_ablation_oracle.sh
 set -uo pipefail
+HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 cd /home/sadara/.hipfire/src
 
 MODEL=${MODEL:-/srv/huggingface/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17}
@@ -40,8 +41,7 @@ if [ -z "${RANKS:-}" ]; then
   RANKS="$RANKS $((DMODEL*83/100)) $((DMODEL*90/100)) $((DMODEL*95/100)) $((DMODEL-24)) $((DMODEL-14)) $((DMODEL-9)) $((DMODEL-6)) $((DMODEL-4)) $((DMODEL-3)) $((DMODEL-2)) $last"
 fi
 
-source scripts/gpu-lock.sh 2>/dev/null || true
-gpu_acquire "ablation-oracle" 2>/dev/null || true
+"$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "ablation-oracle" --watch-pid "$$" 2>/dev/null || true
 
 # --- bf16 KLD reference (teacher-forced top-K logprobs of the bf16 model) ---
 if [ ! -f "$REF" ]; then
@@ -70,5 +70,5 @@ for r in $RANKS; do
   rm -f /tmp/abo.hfq
   echo -e "${r}\t${ch}\t${en}\t${K}" | tee -a "$OUT"
 done
-gpu_release 2>/dev/null || true
+"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true
 echo "=== done -> $OUT ==="

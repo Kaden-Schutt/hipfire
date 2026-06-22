@@ -2,7 +2,8 @@
 
 This directory is for operator utilities and reusable helpers: diagnostics,
 data conversion, corpus collection, profiling, installs, code generation,
-benchmark helpers, and shared shell utilities such as `gpu-lock.sh`.
+and benchmark helpers. (GPU coordination now lives in the engine: daemons
+self-lock, and non-daemon binaries use `hipfire gpu-lock`.)
 
 Do not add new pass/fail test entrypoints here. Put those under `../tests/`
 instead. A script is a test entrypoint when its main purpose is to validate a

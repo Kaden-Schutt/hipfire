@@ -53,9 +53,9 @@
 //! cannot win.
 //!
 //! Run:
-//!   source scripts/gpu-lock.sh && gpu_acquire pp-overlap-bench && \
+//!   hipfire gpu-lock acquire pp-overlap-bench && \
 //!   env HIPFIRE_ALLOW_MIXED_ARCH=1 HIPFIRE_PP_LAYERS=48,16 \
-//!   ./target/release/examples/pp_overlap_microbench && gpu_release
+//!   ./target/release/examples/pp_overlap_microbench && hipfire gpu-lock release
 
 use hipfire_runtime::multi_gpu::Gpus;
 use rdna_compute::{DType, Gpu};

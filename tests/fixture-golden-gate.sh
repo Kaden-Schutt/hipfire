@@ -17,14 +17,13 @@
 #   ./tests/fixture-golden-gate.sh            # check vs baselines
 #   ./tests/fixture-golden-gate.sh --record   # (re)write baselines for this GPU
 set -uo pipefail
+HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 RECORD=0
 [ "${1:-}" = "--record" ] && RECORD=1
 
-# shellcheck source=scripts/gpu-lock.sh
-source ./scripts/gpu-lock.sh
 
 BASELINES="tests/fixture-golden-baselines.txt"
 ARCHS=(qwen3_5 qwen3_5_moe)
@@ -42,11 +41,11 @@ cargo build --release -p hipfire-quantize --example fixture_golden -p hipfire-ru
 Q="$ROOT/target/release/hipfire-quantize"
 GOLD="$ROOT/target/release/examples/fixture_golden"
 
-gpu_acquire "fixture-golden-gate" || { echo "could not acquire GPU lock" >&2; exit 2; }
-trap 'gpu_release 2>/dev/null || true' EXIT
+"$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "fixture-golden-gate" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 
 TMP="$(mktemp -d)"
-trap 'gpu_release 2>/dev/null || true; rm -rf "$TMP"' EXIT
+trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true; rm -rf "$TMP"' EXIT
 
 run_golden() { # arch hfq -> prints "<gpu_arch> <logit_hash>"
     local hfq="$1"

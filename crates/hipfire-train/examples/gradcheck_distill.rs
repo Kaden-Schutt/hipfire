@@ -7,9 +7,9 @@
 //!
 //! Run:
 //!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "gradcheck-distill"
+//!   hipfire gpu-lock acquire "gradcheck-distill"
 //!   cargo run -p hipfire-train --release --example gradcheck_distill
-//!   gpu_release
+//!   hipfire gpu-lock release
 
 use hipfire_train::ops::distill::distill_kl;
 use rdna_compute::{DType, Gpu, GpuTensor, HipResult};

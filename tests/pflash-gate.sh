@@ -241,12 +241,11 @@ if [ ! -f "$TARGET" ] || [ ! -f "$DRAFTER" ]; then
     exit 2
 fi
 
-LOCK="./scripts/gpu-lock.sh"
-if [ -r "$LOCK" ]; then
+HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
+if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
     # shellcheck disable=SC1090
-    . "$LOCK"
-    gpu_acquire "pflash-gate" || { echo "could not acquire GPU lock" >&2; exit 2; }
-    trap 'gpu_release 2>/dev/null || true' EXIT
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "pflash-gate" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
 echo "pflash-gate: baseline=$BASELINE tolerance=±${TOLERANCE_PCT}%"

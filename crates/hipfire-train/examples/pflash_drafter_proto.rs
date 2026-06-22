@@ -11,9 +11,9 @@
 //!
 //! Run:
 //!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "pflash-drafter"
+//!   hipfire gpu-lock acquire "pflash-drafter"
 //!   cargo run -p hipfire-train --release --example pflash_drafter_proto
-//!   gpu_release
+//!   hipfire gpu-lock release
 
 use hipfire_model::tokenizer::Tokenizer;
 use hipfire_train::drafter::{drafter_forward, Drafter, DrafterConfig};
@@ -31,7 +31,11 @@ const NEEDLE_BLOCK: usize = 1;
 
 fn snapshot_dir(repo: &str) -> Option<PathBuf> {
     let snaps = Path::new(HF).join(repo).join("snapshots");
-    std::fs::read_dir(&snaps).ok()?.flatten().map(|e| e.path()).find(|p| p.is_dir())
+    std::fs::read_dir(&snaps)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.is_dir())
 }
 
 fn rank(a: &[f32]) -> Vec<f32> {
@@ -45,7 +49,10 @@ fn rank(a: &[f32]) -> Vec<f32> {
 }
 fn pearson(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len() as f64;
-    let (ma, mb) = (a.iter().sum::<f32>() as f64 / n, b.iter().sum::<f32>() as f64 / n);
+    let (ma, mb) = (
+        a.iter().sum::<f32>() as f64 / n,
+        b.iter().sum::<f32>() as f64 / n,
+    );
     let (mut c, mut va, mut vb) = (0.0, 0.0, 0.0);
     for i in 0..a.len() {
         let (da, db) = (a[i] as f64 - ma, b[i] as f64 - mb);
@@ -53,7 +60,11 @@ fn pearson(a: &[f32], b: &[f32]) -> f32 {
         va += da * da;
         vb += db * db;
     }
-    if va == 0.0 || vb == 0.0 { 0.0 } else { (c / (va.sqrt() * vb.sqrt())) as f32 }
+    if va == 0.0 || vb == 0.0 {
+        0.0
+    } else {
+        (c / (va.sqrt() * vb.sqrt())) as f32
+    }
 }
 fn spearman(a: &[f32], b: &[f32]) -> f32 {
     pearson(&rank(a), &rank(b))
@@ -74,7 +85,11 @@ fn block_scores(k: &[f32], seq: usize, n_kv: usize, hd: usize, block: usize) -> 
             na += (a[i] as f64).powi(2);
             nb_ += (b[i] as f64).powi(2);
         }
-        if na == 0.0 || nb_ == 0.0 { 0.0 } else { d / (na.sqrt() * nb_.sqrt()) }
+        if na == 0.0 || nb_ == 0.0 {
+            0.0
+        } else {
+            d / (na.sqrt() * nb_.sqrt())
+        }
     };
     let mut scores = vec![0.0f32; nb];
     for b in 0..nb {
@@ -133,8 +148,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── P1: capture target labels ────────────────────────────────────────────
     let (cfg, w) = load_llama_fp32(&mut gpu, &dir)?;
-    let (n_kv_t, hd_t, h_t, vocab) =
-        (cfg.num_key_value_heads, cfg.head_dim, cfg.hidden_size, cfg.vocab_size);
+    let (n_kv_t, hd_t, h_t, vocab) = (
+        cfg.num_key_value_heads,
+        cfg.head_dim,
+        cfg.hidden_size,
+        cfg.vocab_size,
+    );
     let rope_base = cfg.rope_theta;
     let eps = cfg.rms_norm_eps;
     let n_layers = cfg.num_hidden_layers;

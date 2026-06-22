@@ -158,7 +158,7 @@ fi
 EXE="./target/release/hipfire-daemon"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 OUT="${HIPFIRE_AGENTIC_GATE_OUT:-/tmp/agentic-gate-$(date +%Y%m%d-%H%M%S).md}"
-LOCK_SCRIPT="./scripts/gpu-lock.sh"
+HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 
 find_model_file() {
     local name="$1"
@@ -256,14 +256,13 @@ cleanup() {
         kill -9 "$DAEMON_PID" 2>/dev/null
     fi
     DAEMON_PID=""
-    gpu_release 2>/dev/null || true
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true
 }
 
 # GPU lock
-if [ -r "$LOCK_SCRIPT" ]; then
+if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
     # shellcheck disable=SC1090
-    . "$LOCK_SCRIPT"
-    gpu_acquire "agentic-gate" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "agentic-gate" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
     trap cleanup EXIT
 fi
 

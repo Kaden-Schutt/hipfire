@@ -5,9 +5,9 @@
 //!
 //! Run:
 //!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "gradcheck-block"
+//!   hipfire gpu-lock acquire "gradcheck-block"
 //!   cargo run -p hipfire-train --release --example gradcheck_block
-//!   gpu_release
+//!   hipfire gpu-lock release
 
 use hipfire_train::block::{block_backward, block_forward, BlockDims, BlockLora, BlockWeights};
 use rdna_compute::{Gpu, GpuTensor, HipResult};

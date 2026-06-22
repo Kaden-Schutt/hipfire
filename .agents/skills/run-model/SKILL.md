@@ -30,15 +30,18 @@ previous deadlock that was diagnosed and fixed in `hfq.rs`.
 
 ## GPU lock
 
-Always acquire before running anything that touches the GPU:
+`hipfire-daemon` auto-acquires a flock(2) GPU lease before HIP init and releases
+it on exit, so running models through the daemon needs no manual locking. For
+non-daemon GPU binaries (cargo `--example` benches), coordinate via the native
+CLI mutex:
 
 ```bash
-source scripts/gpu-lock.sh && gpu_acquire "run-model"
+hipfire gpu-lock acquire "run-model" --watch-pid $$   # blocks until free
 # ... run stuff ...
-gpu_release
+hipfire gpu-lock release                              # or let it release on pid death
 ```
 
-Check current holder: `cat /tmp/hipfire-gpu.lock 2>/dev/null || echo free`
+Check current holder: `hipfire gpu-lock status`
 
 Check free VRAM: `rocm-smi --showmeminfo vram`
 

@@ -6,7 +6,7 @@
 //!
 //! The single home for hipfire's `flock`-based mutexes — previously hand-rolled
 //! separately in the daemon singleton lock (`~/.hipfire/daemon.pid`) and the GPU
-//! mutex (`hipfire gpu-lock` / `scripts/gpu-lock.sh`, on `/tmp/hipfire-gpu.lock`).
+//! mutex (`hipfire gpu-lock`, on `/tmp/hipfire-gpu.lock`).
 //! Both reduce to: open a lockfile, take `LOCK_EX` (non-blocking or blocking with
 //! a poll/timeout), optionally write a human-readable holder line, and rely on
 //! the kernel to drop the lock when the holding fd closes (incl. SIGKILL) — so
@@ -14,7 +14,7 @@
 //!
 //! `flock` is a kernel primitive, so a [`FlockGuard`] interoperates with **any**
 //! process holding `flock` on the same inode regardless of language — which is
-//! why `scripts/gpu-lock.sh` (bash) and a Python `fcntl.flock` wrapper share the
+//! why a bash `flock` caller and a Python `fcntl.flock` wrapper share the
 //! same mutex as the Rust callers without any FFI: same path + same syscall.
 //!
 //! Unix only. On non-unix the guard opens the file but performs no kernel
@@ -192,8 +192,8 @@ pub fn probe(path: impl AsRef<Path>) -> io::Result<LockState> {
 }
 
 /// Canonical GPU-mutex lockfile path — the single source of truth for the
-/// path/env-var contract shared by `hipfire gpu-lock`, `scripts/gpu-lock.sh`,
-/// and any future participant (Python, etc.). Resolves `$HIPFIRE_GPU_LOCKFILE`,
+/// path/env-var contract shared by `hipfire gpu-lock` and any future
+/// participant (Python, etc.). Resolves `$HIPFIRE_GPU_LOCKFILE`,
 /// else `<tmpdir>/hipfire-gpu.lock`. Because `flock` keys on the inode, every
 /// participant that opens *this* path shares one mutex regardless of language.
 pub fn gpu_lock_path() -> PathBuf {

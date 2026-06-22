@@ -295,9 +295,9 @@ else:
         fi
 
         # GPU lock — eval_hipfire takes hours; coordinate with other jobs.
-        if [ -f "scripts/gpu-lock.sh" ]; then
-            source scripts/gpu-lock.sh
-            gpu_acquire "quant_cohort-${LABEL}-${VARIANT}" 2>&1 | tail -1 || true
+        HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
+        if [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; then
+            "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "quant_cohort-${LABEL}-${VARIANT}" --watch-pid "$$" 2>&1 | tail -1 || true
         fi
 
         EVAL_START=$(date +%s)
@@ -311,8 +311,8 @@ else:
         EVAL_WALL=$(( $(date +%s) - EVAL_START ))
         echo "    eval_hipfire wall: ${EVAL_WALL}s"
 
-        if [ -f "scripts/gpu-lock.sh" ]; then
-            gpu_release "quant_cohort-${LABEL}-${VARIANT}" 2>&1 | tail -1 || true
+        if [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; then
+            "$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>&1 | tail -1 || true
         fi
 
         if [ "$EVAL_OK" = "1" ] && [ -f "${PV}.kldseq" ]; then

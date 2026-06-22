@@ -9,9 +9,9 @@
 //! via `mtp_mirror::peer_clone_tensor`, downloads a slice from both, and
 //! verifies byte-equality.
 //!
-//! Run: source scripts/gpu-lock.sh && gpu_acquire mtp-mirror-smoke && \
+//! Run: hipfire gpu-lock acquire mtp-mirror-smoke && \
 //!      ./target/release/examples/mtp_mirror_smoke \
-//!          --target /local/hipfire/qwen3.6-27b-mq4.hfq && gpu_release
+//!          --target /local/hipfire/qwen3.6-27b-mq4.hfq && hipfire gpu-lock release
 //!
 //! Reports VRAM accounting on both devices before / after the mirror.
 

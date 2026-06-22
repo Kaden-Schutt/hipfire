@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// hipfire — native GPU mutex (replaces scripts/gpu-lock.sh).
+// hipfire — native GPU mutex (the legacy scripts/gpu-lock.sh shell adapter has been removed).
 //
 //! `hipfire gpu-lock {acquire,release,status}` — a flock(2)-backed GPU mutex for
 //! multi-agent coordination, owned by the engine instead of a shell script.

@@ -4,7 +4,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-source scripts/gpu-lock.sh
+HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 
 CTX="${CTX:-2048}"
 WARMUP="${WARMUP:-8}"
@@ -43,14 +43,14 @@ for model in "${MODELS[@]}"; do
   echo "=== $model ==="
   size_bytes=$(stat -c%s "$model")
   size_mb=$(printf "%.1f" "$(echo "$size_bytes/1024/1024" | bc -l)")
-  gpu_acquire "ppl-$(basename "$model")"
+  "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "ppl-$(basename "$model")" --watch-pid "$$"
   log="/tmp/_ppl_$(basename "$model").log"
   ./target/release/examples/perplexity "$model" "$CORPUS" --ctx "$CTX" --warmup "$WARMUP" 2>&1 | tee "$log" || {
     echo "  ERROR: $model"
-    gpu_release
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock release
     continue
   }
-  gpu_release
+  "$HIPFIRE_GPULOCK_BIN" gpu-lock release
   scored=$(grep -E "^Scored:" "$log" | awk '{print $2}')
   nll=$(grep -E "^NLL/tok:" "$log" | awk '{print $2}')
   ppl=$(grep -E "^PPL:" "$log" | awk '{print $2}')

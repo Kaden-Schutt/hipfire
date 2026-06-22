@@ -521,8 +521,9 @@ instead of relying on a shell-only GPU mutex.
   list of explicit NPU IDs
 - Bypass: `HIPFIRE_RESOURCE_LOCK=0`
 
-Legacy test gates may still wrap `scripts/gpu-lock.sh`, but daemon startup is
-the canonical runtime lock.
+Daemon startup is the canonical runtime lock. Non-daemon GPU binaries (cargo
+`--example` benches, `hipfire eval`, `hipfire-quantize`) do not self-lock — test
+gates coordinate them via the native CLI mutex `hipfire gpu-lock {acquire,release,status}`.
 
 ---
 

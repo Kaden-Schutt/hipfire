@@ -12,13 +12,13 @@ cd "$(dirname "$0")/.."
 
 EXE=./target/release/examples/dflash_spec_demo
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
-LOCK_SCRIPT=./scripts/gpu-lock.sh
+HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 MAX_TOKENS="${HIPFIRE_BENCH_MAX:-192}"
 RUNS="${HIPFIRE_BENCH_RUNS:-3}"
 
-if [ -r "$LOCK_SCRIPT" ]; then . "$LOCK_SCRIPT"
-    gpu_acquire "dflash-sweep" || { echo "could not acquire GPU lock" >&2; exit 2; }
-    trap 'gpu_release 2>/dev/null || true' EXIT
+if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "dflash-sweep" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
 # LRU-cache prompt — keeps the model in pure code gen for 100+ tokens

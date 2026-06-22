@@ -5,9 +5,9 @@
 //!
 //! Run:
 //!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "gradcheck-softmax"
+//!   hipfire gpu-lock acquire "gradcheck-softmax"
 //!   cargo run -p hipfire-train --release --example gradcheck_softmax
-//!   gpu_release
+//!   hipfire gpu-lock release
 
 use hipfire_train::ops::softmax::{softmax_backward, softmax_forward};
 use rdna_compute::{DType, Gpu, GpuTensor, HipResult};

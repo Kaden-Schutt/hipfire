@@ -26,8 +26,8 @@
 //! ~80 ms cycle = 12%). Anything above ~1 ms of pure sync overhead eats
 //! most of that headroom.
 //!
-//! Run: source scripts/gpu-lock.sh && gpu_acquire mtp-peer-bench && \
-//!      ./target/release/examples/mtp_peer_copy_microbench && gpu_release
+//! Run: hipfire gpu-lock acquire mtp-peer-bench && \
+//!      ./target/release/examples/mtp_peer_copy_microbench && hipfire gpu-lock release
 
 use hip_bridge::HipRuntime;
 use std::time::Instant;

@@ -457,7 +457,7 @@ export HIPFIRE_DETERMINISTIC=1
 EXE="./target/release/hipfire-daemon"
 EXAMPLES_DIR="./target/release/examples"
 MODEL="${HIPFIRE_PP_GATE_MODEL:-$HOME/.hipfire/models/qwen3.5-0.8b-mq4.hfq}"
-LOCK_SCRIPT="./scripts/gpu-lock.sh"
+HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 
 if [ ! -f "$MODEL" ]; then
     echo "pp-gate: model not found at $MODEL — skipping"
@@ -497,14 +497,12 @@ fi
 
 # ── GPU lock ─────────────────────────────────────────────────────────────
 # Only acquire if no caller has already taken it. Otherwise we'd
-# deadlock on the parent's lock — gpu_acquire polls indefinitely and
+# deadlock on the parent's lock — the CLI mutex polls indefinitely and
 # doesn't recognize a parent agent's reservation. Detection: lockfile
 # present at script start.
-if [ -r "$LOCK_SCRIPT" ] && [ ! -f /tmp/hipfire-gpu.lock ]; then
-    # shellcheck disable=SC1090
-    . "$LOCK_SCRIPT"
-    gpu_acquire "pp-gate" || { echo "could not acquire GPU lock" >&2; exit 2; }
-    trap 'gpu_release 2>/dev/null || true' EXIT
+if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; } && [ ! -f /tmp/hipfire-gpu.lock ]; then
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "pp-gate" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
 fail=0

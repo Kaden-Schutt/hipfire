@@ -8,9 +8,9 @@
 //!
 //! Run:
 //!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "qtip-coherence"
+//!   hipfire gpu-lock acquire "qtip-coherence"
 //!   cargo run -p hipfire-train --release --example coherence_recovery_supra50m
-//!   gpu_release
+//!   hipfire gpu-lock release
 
 use hipfire_model::tokenizer::Tokenizer;
 use hipfire_train::loader::{load_llama_fp32, LlamaWeightsF32};
@@ -150,11 +150,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //   HIPFIRE_RECOVER_MODE=norms      → layernorm-only (faithful QTIP, Path A export)
     //   HIPFIRE_RECOVER_MODE=lora+norms → LoRA + layernorms (default, more capacity)
     let norms_only = std::env::var("HIPFIRE_RECOVER_MODE").as_deref() == Ok("norms");
-    let sizes = if norms_only { student.norm_param_sizes() } else { student.recovery_param_sizes() };
+    let sizes = if norms_only {
+        student.norm_param_sizes()
+    } else {
+        student.recovery_param_sizes()
+    };
     let mut opt = AdamW::new(&mut gpu, &sizes, LR, 0.9, 0.999, 1e-8, 0.0)?;
     println!(
         "recovery FT [{}] ({} trainable tensors)...",
-        if norms_only { "norms-only" } else { "lora+norms" },
+        if norms_only {
+            "norms-only"
+        } else {
+            "lora+norms"
+        },
         sizes.len()
     );
     let mut last = 0.0f32;

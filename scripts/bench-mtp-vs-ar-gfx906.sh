@@ -26,7 +26,7 @@ MODEL="${HIPFIRE_PP_MODEL:-/local/hipfire/qwen3.6-27b-mq4.hfq}"
 MTP_HEAD="${HIPFIRE_PP_MTP_HEAD:-/data/hipfire/qwen3.6-27b-cvs16384.mtp}"
 MAX="${HIPFIRE_BENCH_MAX:-256}"
 OUT="${HIPFIRE_BENCH_OUT:-/tmp/mtp-vs-ar-gfx906-$(date +%Y%m%d-%H%M%S).md}"
-LOCK_SCRIPT="./scripts/gpu-lock.sh"
+HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 
 # Byte-identical to note 14's split bench (same md5).
 PROMPT="Write a Python function that implements an LRU cache with a configurable capacity, using an OrderedDict. Include get and put methods, and a docstring."
@@ -35,10 +35,9 @@ PROMPT="Write a Python function that implements an LRU cache with a configurable
 [ -f "$MODEL" ]    || { echo "model not found: $MODEL" >&2; exit 2; }
 [ -f "$MTP_HEAD" ] || { echo "mtp head not found: $MTP_HEAD" >&2; exit 2; }
 
-if [ -r "$LOCK_SCRIPT" ]; then
-    . "$LOCK_SCRIPT"
-    gpu_acquire "bench-mtp-vs-ar" || { echo "could not acquire GPU lock" >&2; exit 2; }
-    trap 'gpu_release 2>/dev/null || true' EXIT
+if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "bench-mtp-vs-ar" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
 prompt_md5=$(printf '%s' "$PROMPT" | md5sum | awk '{print $1}')

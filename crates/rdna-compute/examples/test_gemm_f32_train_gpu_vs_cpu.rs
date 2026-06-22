@@ -11,9 +11,9 @@
 //!
 //! Run:
 //!   source ./scripts/rocm-env.sh
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "gemm-train-test"
+//!   hipfire gpu-lock acquire "gemm-train-test"
 //!   cargo run -p rdna-compute --release --example test_gemm_f32_train_gpu_vs_cpu
-//!   gpu_release
+//!   hipfire gpu-lock release
 
 use rdna_compute::{DType, Gpu};
 

@@ -23,6 +23,7 @@
 #
 # Run:  nohup ./scripts/pflash_drafter_quality_matrix.sh >/tmp/pfmatrix.out 2>&1 &
 set -u
+HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 
 cd "$(dirname "$0")/.." || exit 1
 export HIPFIRE_MODELS_DIR=/local/hipfire
@@ -58,7 +59,6 @@ if [ ! -x "$BENCH" ]; then
   cargo build --release --features deltanet --example pflash_niah_bench 2>&1 | tail -2 | tee -a "$SUMMARY"
 fi
 
-source scripts/gpu-lock.sh
 
 run_cell() {
   local label="$1" dpath="$2" keep="$3" fixture="$4" tag="$5"
@@ -99,18 +99,18 @@ run_cell() {
 for d in "${DRAFTERS[@]}"; do
   label="${d%%|*}"; dpath="${d##*|}"
   for keep in "${KEEPS[@]}"; do
-    gpu_acquire "pfmatrix-$label-$keep" 2>/dev/null
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "pfmatrix-$label-$keep" --watch-pid "$$" 2>/dev/null
     run_cell "$label" "$dpath" "$keep" "$FIXTURE" "multi64k"
-    gpu_release 2>/dev/null
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null
   done
 done
 
 # ── Single-needle sanity at keep=0.15 for each drafter (cheap regression). ──
 for d in "${DRAFTERS[@]}"; do
   label="${d%%|*}"; dpath="${d##*|}"
-  gpu_acquire "pfmatrix-$label-single" 2>/dev/null
+  "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "pfmatrix-$label-single" --watch-pid "$$" 2>/dev/null
   run_cell "$label" "$dpath" "0.15" "$SINGLE" "single32k"
-  gpu_release 2>/dev/null
+  "$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null
 done
 
 echo "" | tee -a "$SUMMARY"

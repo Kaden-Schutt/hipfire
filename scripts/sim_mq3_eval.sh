@@ -25,6 +25,7 @@
 # than baseline MQ4 but the gap is too large to bound from this harness.
 # See sim_mq3.py docstring for the full derivation.
 set -u
+HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 cd "$(dirname "$0")/.."
 
 EXE="./target/release/hipfire-daemon"
@@ -70,9 +71,8 @@ print("".join(json.loads(l).get("text","") for l in sys.stdin if "token" in l))'
     echo "$text"
 }
 
-source ./scripts/gpu-lock.sh
-gpu_acquire "mq3-sim-eval" || { echo "could not acquire GPU lock" >&2; exit 2; }
-trap 'gpu_release 2>/dev/null || true' EXIT
+"$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "mq3-sim-eval" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 
 {
     echo "# MQ3 simulation A/B"

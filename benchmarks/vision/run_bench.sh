@@ -24,7 +24,7 @@ GGUF_Q4=/data/models/unsloth/Qwen3.5-9B/Qwen3.5-9B-Q4_K_M.gguf
 GGUF_Q8=/data/models/unsloth/Qwen3.5-9B/Qwen3.5-9B-Q8_0.gguf
 HIPFIRE_HFQ=$HOME/models-local/qwen3.5-9b-q8head-vision-f16-spliced-mq4.hfq
 
-source $HOME/git/hipfire/scripts/gpu-lock.sh
+HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo "$HOME/git/hipfire/target/release/hipfire")}"
 
 run_llama() {
   # $1 = label (e.g. q4km), $2 = gguf path, $3 = image path, $4 = prompt, $5 = out file
@@ -63,8 +63,8 @@ run_hipfire_cli() {
 }
 
 # === Pass 1: llama.cpp (Q4_K_M and Q8_0) ===
-gpu_acquire "vision-bench-llama"
-trap 'gpu_release' EXIT
+"$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "vision-bench-llama" --watch-pid "$$"
+trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release' EXIT
 
 for img in "${IMAGES[@]}"; do
   mkdir -p "$OUT/${img%.*}"
@@ -84,7 +84,7 @@ for img in "${IMAGES[@]}"; do
   done
 done
 
-gpu_release
+"$HIPFIRE_GPULOCK_BIN" gpu-lock release
 trap - EXIT
 
 # === Pass 2: hipfire (q8head-vision-f16-spliced) ===

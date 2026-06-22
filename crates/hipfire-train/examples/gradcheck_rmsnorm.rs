@@ -5,9 +5,9 @@
 //!
 //! Run:
 //!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "gradcheck-rmsnorm"
+//!   hipfire gpu-lock acquire "gradcheck-rmsnorm"
 //!   cargo run -p hipfire-train --release --example gradcheck_rmsnorm
-//!   gpu_release
+//!   hipfire gpu-lock release
 
 use hipfire_train::ops::rmsnorm::{rmsnorm_backward, rmsnorm_forward};
 use rdna_compute::{DType, Gpu, GpuTensor, HipResult};

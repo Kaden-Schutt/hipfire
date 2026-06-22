@@ -9,9 +9,9 @@
 //!
 //! Run:
 //!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "qtip-recovery"
+//!   hipfire gpu-lock acquire "qtip-recovery"
 //!   cargo run -p hipfire-train --release --example recovery_ft_supra50m
-//!   gpu_release
+//!   hipfire gpu-lock release
 
 use hipfire_train::loader::{load_llama_fp32, LlamaWeightsF32};
 use hipfire_train::model::{

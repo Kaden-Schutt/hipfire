@@ -7,9 +7,9 @@
 //!
 //! Run:
 //!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "qtip-damage"
+//!   hipfire gpu-lock acquire "qtip-damage"
 //!   cargo run -p hipfire-train --release --example quantize_damage_supra50m
-//!   gpu_release
+//!   hipfire gpu-lock release
 
 use hipfire_train::loader::{load_llama_fp32, LlamaWeightsF32};
 use hipfire_train::model::{model_forward, LlamaModel};

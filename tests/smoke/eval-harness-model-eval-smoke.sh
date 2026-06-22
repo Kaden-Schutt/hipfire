@@ -61,12 +61,11 @@ EVAL_BIN="$(pick_eval_bin)"
 OUT="$OUT_ROOT/model-eval-${STAMP}"
 mkdir -p "$OUT_ROOT"
 
-LOCK_SCRIPT="$ROOT/scripts/gpu-lock.sh"
-if [ -r "$LOCK_SCRIPT" ]; then
+HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo "$ROOT/target/release/hipfire")}"
+if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
     # shellcheck disable=SC1090
-    . "$LOCK_SCRIPT"
-    gpu_acquire "eval-harness-model-eval-smoke"
-    trap 'gpu_release 2>/dev/null || true' EXIT
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "eval-harness-model-eval-smoke" --watch-pid "$$"
+    trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
 QUALITY_JSON="$OUT_ROOT/model-eval-quality-${STAMP}.json"

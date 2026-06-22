@@ -72,12 +72,11 @@ echo "smoke: target=$TARGET"
 echo "smoke: drafter=$DRAFT"
 
 # GPU lock — same pattern as coherence-gate-dflash.sh.
-LOCK_SCRIPT="./scripts/gpu-lock.sh"
-if [ -r "$LOCK_SCRIPT" ]; then
+HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
+if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
     # shellcheck disable=SC1090
-    . "$LOCK_SCRIPT"
-    gpu_acquire "dflash-bench-resident-smoke" || { echo "smoke: could not acquire GPU lock" >&2; exit 2; }
-    trap 'gpu_release 2>/dev/null || true' EXIT
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "dflash-bench-resident-smoke" --watch-pid "$$" || { echo "smoke: could not acquire GPU lock" >&2; exit 2; }
+    trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
 # Two-row manifest with IDENTICAL prompts. Under --temp 0 the
@@ -85,7 +84,7 @@ fi
 # state reset is missing between rows.
 MANIFEST=$(mktemp /tmp/dflash_smoke_manifest.XXXXXX.jsonl)
 OUT=$(mktemp /tmp/dflash_smoke_out.XXXXXX.log)
-trap 'rm -f "$MANIFEST" "$OUT"; gpu_release 2>/dev/null || true' EXIT
+trap 'rm -f "$MANIFEST" "$OUT"; "$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 
 # Per CLAUDE.md "Prompt-structure τ sensitivity" and
 # docs/methodology/perf-benchmarking.md: the prompt must be a

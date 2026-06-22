@@ -6,9 +6,9 @@
 //!
 //! Run:
 //!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "gradcheck-lora"
+//!   hipfire gpu-lock acquire "gradcheck-lora"
 //!   cargo run -p hipfire-train --release --example gradcheck_lora
-//!   gpu_release
+//!   hipfire gpu-lock release
 
 use hipfire_train::ops::lora::{lora_backward, lora_forward};
 use rdna_compute::{DType, Gpu, GpuTensor, HipResult};

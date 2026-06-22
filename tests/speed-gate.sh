@@ -15,15 +15,16 @@ cd "$(dirname "$0")/.."
 
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 BASELINE_ROOT="${HIPFIRE_PERF_BASELINE_DIR:-benchmarks/perf-baselines}"
-LOCK_SCRIPT="./scripts/gpu-lock.sh"
+HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
+GPULOCK_HELD=0
 FAST=0
 VERBOSE=0
 MODEL_TMP_DIR=""
 SPEED_GATE_ATTEMPTS="${HIPFIRE_SPEED_GATE_ATTEMPTS:-2}"
 
 cleanup() {
-    if declare -F gpu_release >/dev/null 2>&1; then
-        gpu_release 2>/dev/null || true
+    if [ "$GPULOCK_HELD" = 1 ]; then
+        "$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true
     fi
     [ -n "$MODEL_TMP_DIR" ] && rm -rf "$MODEL_TMP_DIR"
 }
@@ -177,10 +178,9 @@ else
     SIZES=("0.8b" "4b" "9b" "27b")
 fi
 
-if [ -r "$LOCK_SCRIPT" ]; then
-    # shellcheck disable=SC1090
-    . "$LOCK_SCRIPT"
-    gpu_acquire "speed-gate" || { color red "could not acquire GPU lock"; echo; exit 2; }
+if [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; then
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "speed-gate" --watch-pid "$$" || { color red "could not acquire GPU lock"; echo; exit 2; }
+    GPULOCK_HELD=1
 fi
 
 color bold "=== MQ4 Speed Gate via hipfire-eval ==="; echo

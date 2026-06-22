@@ -5,9 +5,9 @@
 //!
 //! Run:
 //!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "overfit-supra"
+//!   hipfire gpu-lock acquire "overfit-supra"
 //!   cargo run -p hipfire-train --release --example overfit_supra50m
-//!   gpu_release
+//!   hipfire gpu-lock release
 
 use hipfire_train::loader::load_llama_fp32;
 use hipfire_train::model::{flatten_lora_grads, model_forward, model_loss_backward, LlamaModel};

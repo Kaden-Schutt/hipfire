@@ -442,17 +442,21 @@ only. Drift >5% from the current q8/max256 baseline is a regression
 
 ## GPU Lock Protocol (Multi-Agent)
 
-When multiple Claude Code agents work in parallel (e.g. via worktrees), they coordinate
-GPU access through `scripts/gpu-lock.sh`. **Coordination is currently MANUAL** — there is
-no committed hook that auto-acquires the lock. (`.claude/settings.json` is not tracked in
-the repo; if you want `cargo` commands to auto-acquire/release, wire a PreToolUse/PostToolUse
-hook in your own local `.claude/settings.json` that sources `scripts/gpu-lock.sh`.)
+The lock now lives in the engine. `hipfire-daemon` auto-acquires a flock(2) GPU
+resource lease (`/tmp/hipfire-resource-locks/hip-gpu-0.lock`) before HIP init and
+releases it on exit — so any daemon-driven workload (serve, chat, gates) is
+coordinated automatically. The legacy `scripts/gpu-lock.sh` shell adapter has been
+removed.
 
-- Lock file: `/tmp/hipfire-gpu.lock`
-- Contains a human-readable status like `model-ingestion agent is using the gpu`
-- Agents poll every 5s (configurable via `GPU_POLL_INTERVAL`) when the GPU is busy
-- Manual usage: `source scripts/gpu-lock.sh && gpu_acquire "<branch>" && gpu_release`
-- Check status: `source scripts/gpu-lock.sh && gpu_status`
+For **non-daemon** GPU binaries (cargo `--example` benches, `hipfire eval`,
+`hipfire-quantize`) that do not self-lock, coordinate explicitly via the native
+CLI mutex:
+
+- `hipfire gpu-lock acquire "<label>" --watch-pid $$` — blocks until free, then
+  spawns a detached holder that auto-releases when the watched pid dies (no stale
+  locks). Exit code 2 on timeout (honors `GPU_POLL_INTERVAL` / `GPU_LOCK_TIMEOUT`).
+- `hipfire gpu-lock release` — release early (otherwise released on pid death).
+- `hipfire gpu-lock status` — show the current holder.
 
 ## Rules
 

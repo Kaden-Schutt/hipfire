@@ -13,15 +13,14 @@ EXE="./target/release/examples/dflash_spec_demo"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
 TARGET_27B="$MODELS_DIR/qwen3.5-27b-mq4.hfq"
 DRAFT_27B="$MODELS_DIR/qwen3.5-27b-mq4.dflash.hfq"
-LOCK_SCRIPT="./scripts/gpu-lock.sh"
+HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 MAX_TOKENS="${HIPFIRE_BENCH_MAX:-192}"
 RUNS="${HIPFIRE_BENCH_RUNS:-3}"
 
-if [ -r "$LOCK_SCRIPT" ]; then
+if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
     # shellcheck disable=SC1090
-    . "$LOCK_SCRIPT"
-    gpu_acquire "tree-graph-bench" || { echo "could not acquire GPU lock" >&2; exit 2; }
-    trap 'gpu_release 2>/dev/null || true' EXIT
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "tree-graph-bench" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
 PROSE_PROMPT="The Roman Empire, at its height, stretched from the windswept moors of northern Britain to the sands of the Arabian peninsula. Its decline was not a single event but a long slow unraveling that took centuries. Several factors contributed to this gradual collapse. The first and perhaps most important was"

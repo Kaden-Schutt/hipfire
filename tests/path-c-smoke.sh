@@ -73,7 +73,7 @@ fi
 
 OUT="${HIPFIRE_PATH_C_OUT:-/tmp/path-c-smoke-$(date +%Y%m%d-%H%M%S).md}"
 TRACE_JSON_OUT="${HIPFIRE_PATH_C_TRACE_JSON:-${OUT%.md}.path_c_trace.json}"
-LOCK_SCRIPT="./scripts/gpu-lock.sh"
+HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 
 # ── Build dflash_spec_demo if needed ──────────────────────────────────────
 rebuild=0
@@ -99,11 +99,10 @@ if [ "$rebuild" -eq 1 ]; then
 fi
 
 # ── GPU lock ──────────────────────────────────────────────────────────────
-if [ -r "$LOCK_SCRIPT" ]; then
+if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
     # shellcheck disable=SC1090
-    . "$LOCK_SCRIPT"
-    gpu_acquire "path-c-smoke" || { echo "could not acquire GPU lock" >&2; exit 2; }
-    trap 'gpu_release 2>/dev/null || true' EXIT
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "path-c-smoke" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
 if [ -z "$TARGET" ] || [ -z "$DRAFT" ] || [ ! -f "$TARGET" ] || [ ! -f "$DRAFT" ]; then

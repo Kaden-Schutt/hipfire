@@ -36,7 +36,7 @@ EXE="./target/release/hipfire-daemon"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
 OUT="${HIPFIRE_SWEEP_OUT:-$HOME/.hipfire/mq3-tests/sweep-$(date +%Y%m%d-%H%M%S).md}"
 PROMPTS_DIR="${HIPFIRE_SWEEP_PROMPTS_DIR:-./benchmarks/prompts/sweep}"
-LOCK_SCRIPT="./scripts/gpu-lock.sh"
+HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 
 if [ ! -x "$EXE" ]; then
     echo "$EXE missing — run: cargo build --release -p hipfire-daemon --bin hipfire-daemon" >&2
@@ -49,20 +49,19 @@ if [ ! -d "$PROMPTS_DIR" ]; then
 fi
 
 USE_GPU_LOCK=0
-if [ -r "$LOCK_SCRIPT" ]; then
+if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
     # shellcheck disable=SC1090
-    . "$LOCK_SCRIPT"
-    gpu_acquire "mq3-mq2-sweep" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "mq3-mq2-sweep" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
     USE_GPU_LOCK=1
 fi
 # Single composed EXIT trap so adding the scratch-dir cleanup below doesn't
-# clobber the gpu_release call. Both invocations are best-effort.
+# clobber the "$HIPFIRE_GPULOCK_BIN" gpu-lock release call. Both invocations are best-effort.
 sweep_exit_trap() {
     if [ -n "${SCRATCH_DIR:-}" ] && [ -d "$SCRATCH_DIR" ]; then
         rm -rf "$SCRATCH_DIR"
     fi
     if [ "$USE_GPU_LOCK" = 1 ]; then
-        gpu_release 2>/dev/null || true
+        "$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true
     fi
 }
 trap sweep_exit_trap EXIT

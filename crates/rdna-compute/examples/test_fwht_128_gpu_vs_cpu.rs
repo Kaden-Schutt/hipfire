@@ -8,9 +8,9 @@
 //!
 //! Run:
 //!   source ./scripts/rocm-env.sh
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "fwht128-test"
+//!   hipfire gpu-lock acquire "fwht128-test"
 //!   cargo run -p rdna-compute --release --example test_fwht_128_gpu_vs_cpu
-//!   gpu_release
+//!   hipfire gpu-lock release
 
 use rdna_compute::{gen_fwht_signs, DType, Gpu};
 

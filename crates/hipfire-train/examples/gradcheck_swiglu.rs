@@ -5,9 +5,9 @@
 //!
 //! Run:
 //!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "gradcheck-swiglu"
+//!   hipfire gpu-lock acquire "gradcheck-swiglu"
 //!   cargo run -p hipfire-train --release --example gradcheck_swiglu
-//!   gpu_release
+//!   hipfire gpu-lock release
 
 use hipfire_train::ops::swiglu::{swiglu_backward, swiglu_forward};
 use rdna_compute::{DType, Gpu, GpuTensor, HipResult};

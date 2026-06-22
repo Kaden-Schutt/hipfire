@@ -41,7 +41,7 @@ EXE="./target/release/hipfire-daemon"
 MODEL="${HIPFIRE_PP_MODEL:-/local/hipfire/qwen3.6-27b-mq4.hfq}"
 MTP_HEAD="${HIPFIRE_PP_MTP_HEAD:-/data/hipfire/qwen3.6-27b-cvs16384.mtp}"
 OUT="${HIPFIRE_COHERENCE_PP_OUT:-/tmp/coherence-pp-$(date +%Y%m%d-%H%M%S).md}"
-LOCK_SCRIPT="./scripts/gpu-lock.sh"
+HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 PROMPT="${HIPFIRE_PP_PROMPT:-Write a Python function to compute the sum of an array using a loop.}"
 MAX_TOKENS="${HIPFIRE_PP_MAX_TOKENS:-64}"
 TAU_REGRESSION_THRESHOLD="${HIPFIRE_PP_TAU_REGRESSION:-0.05}"  # fraction; 0.05 = 5%
@@ -85,11 +85,10 @@ if [ ! -f "$MTP_HEAD" ]; then
 fi
 
 # ── GPU lock ──────────────────────────────────────────────────────────
-if [ -r "$LOCK_SCRIPT" ]; then
+if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
     # shellcheck disable=SC1090
-    . "$LOCK_SCRIPT"
-    gpu_acquire "coherence-gate-pp" || { echo "could not acquire GPU lock" >&2; exit 2; }
-    trap 'gpu_release 2>/dev/null || true' EXIT
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "coherence-gate-pp" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
 # ── Init report ───────────────────────────────────────────────────────

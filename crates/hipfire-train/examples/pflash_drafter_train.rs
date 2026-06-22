@@ -6,16 +6,16 @@
 //! so a win is genuinely drop-in. Listwise (ListNet top-1) loss, AdamW.
 //!
 //!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "pflash-train"
+//!   hipfire gpu-lock acquire "pflash-train"
 //!   cargo run -p hipfire-train --release --example pflash_drafter_train
 
 use hipfire_model::tokenizer::Tokenizer;
+use hipfire_train::block::free_block_acts;
+use hipfire_train::checkpoint::{load_drafter, load_labels, save_drafter, save_labels};
 use hipfire_train::drafter::{
     drafter_backward, drafter_forward_train, free_drafter_acts, free_drafter_grads, Drafter,
     DrafterConfig,
 };
-use hipfire_train::block::free_block_acts;
-use hipfire_train::checkpoint::{load_drafter, load_labels, save_drafter, save_labels};
 use hipfire_train::loader::load_llama_fp32;
 use hipfire_train::model::{model_block_activations, LlamaModel};
 use hipfire_train::ops::pflash_score::pflash_score_forward;
@@ -31,10 +31,16 @@ const CKPT_EVERY: usize = 30;
 const EVAL_EVERY: usize = 15;
 
 fn env_usize(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(d)
 }
 fn env_f32(k: &str, d: f32) -> f32 {
-    std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(d)
 }
 
 const HF: &str = "/srv/huggingface";
@@ -49,7 +55,11 @@ const TAU: f32 = 0.1;
 
 fn snapshot_dir(repo: &str) -> Option<PathBuf> {
     let snaps = Path::new(HF).join(repo).join("snapshots");
-    std::fs::read_dir(&snaps).ok()?.flatten().map(|e| e.path()).find(|p| p.is_dir())
+    std::fs::read_dir(&snaps)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.is_dir())
 }
 
 /// Load drafter training labels emitted by the daemon `pflash_labels` op (real
@@ -62,20 +72,40 @@ fn snapshot_dir(repo: &str) -> Option<PathBuf> {
 fn load_daemon_labels(
     gpu: &mut Gpu,
     jsonl: &str,
-) -> Result<(Vec<Vec<u32>>, Vec<Vec<f32>>, Vec<Vec<f32>>, rdna_compute::GpuTensor, usize, usize, f32, f32), Box<dyn std::error::Error>>
-{
+) -> Result<
+    (
+        Vec<Vec<u32>>,
+        Vec<Vec<f32>>,
+        Vec<Vec<f32>>,
+        rdna_compute::GpuTensor,
+        usize,
+        usize,
+        f32,
+        f32,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let text = std::fs::read_to_string(jsonl)?;
     let (mut chunks, mut label_mid, mut base_shallow) = (Vec::new(), Vec::new(), Vec::new());
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let v: serde_json::Value = serde_json::from_str(line)?;
         let arr_u32 = |k: &str| -> Vec<u32> {
-            v[k].as_array().map(|a| a.iter().map(|x| x.as_u64().unwrap_or(0) as u32).collect()).unwrap_or_default()
+            v[k].as_array()
+                .map(|a| a.iter().map(|x| x.as_u64().unwrap_or(0) as u32).collect())
+                .unwrap_or_default()
         };
         let arr_f32 = |k: &str| -> Vec<f32> {
-            v[k].as_array().map(|a| a.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect()).unwrap_or_default()
+            v[k].as_array()
+                .map(|a| a.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect())
+                .unwrap_or_default()
         };
         let toks = arr_u32("tokens");
-        assert_eq!(toks.len(), SEQ, "daemon label chunk len {} != SEQ {SEQ}", toks.len());
+        assert_eq!(
+            toks.len(),
+            SEQ,
+            "daemon label chunk len {} != SEQ {SEQ}",
+            toks.len()
+        );
         chunks.push(toks);
         label_mid.push(arr_f32("mid_scores"));
         base_shallow.push(arr_f32("shallow_scores"));
@@ -87,12 +117,26 @@ fn load_daemon_labels(
     }
     let vocab = u32::from_le_bytes(bytes[4..8].try_into()?) as usize;
     let dim = u32::from_le_bytes(bytes[8..12].try_into()?) as usize;
-    let data: Vec<f32> =
-        bytes[12..].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let data: Vec<f32> = bytes[12..]
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
     assert_eq!(data.len(), vocab * dim, "embed sidecar size mismatch");
     let embed = gpu.upload_f32(&data, &[vocab, dim])?;
-    println!("daemon labels: {} chunks, embed [{vocab}×{dim}]", chunks.len());
-    Ok((chunks, label_mid, base_shallow, embed, dim, vocab, 10000.0, 1e-5))
+    println!(
+        "daemon labels: {} chunks, embed [{vocab}×{dim}]",
+        chunks.len()
+    );
+    Ok((
+        chunks,
+        label_mid,
+        base_shallow,
+        embed,
+        dim,
+        vocab,
+        10000.0,
+        1e-5,
+    ))
 }
 
 fn corpus_tokens(tok: &Tokenizer) -> Vec<u32> {
@@ -130,15 +174,26 @@ fn rank(a: &[f32]) -> Vec<f32> {
 }
 fn pearson(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len() as f64;
-    let (ma, mb) = (a.iter().sum::<f32>() as f64 / n, b.iter().sum::<f32>() as f64 / n);
+    let (ma, mb) = (
+        a.iter().sum::<f32>() as f64 / n,
+        b.iter().sum::<f32>() as f64 / n,
+    );
     let (mut c, mut va, mut vb) = (0.0, 0.0, 0.0);
     for i in 0..a.len() {
         let (da, db) = (a[i] as f64 - ma, b[i] as f64 - mb);
-        c += da * db; va += da * da; vb += db * db;
+        c += da * db;
+        va += da * da;
+        vb += db * db;
     }
-    if va == 0.0 || vb == 0.0 { 0.0 } else { (c / (va.sqrt() * vb.sqrt())) as f32 }
+    if va == 0.0 || vb == 0.0 {
+        0.0
+    } else {
+        (c / (va.sqrt() * vb.sqrt())) as f32
+    }
 }
-fn spearman(a: &[f32], b: &[f32]) -> f32 { pearson(&rank(a), &rank(b)) }
+fn spearman(a: &[f32], b: &[f32]) -> f32 {
+    pearson(&rank(a), &rank(b))
+}
 
 fn softmax_t(x: &[f32], tau: f32) -> Vec<f32> {
     let m = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -151,7 +206,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu = Gpu::init().expect("Gpu::init failed");
     let nb = SEQ / BLOCK;
     let last = SEQ - 1;
-    println!("arch: {}  SEQ={SEQ} BLOCK={BLOCK} blocks={nb} train={N_TRAIN} eval={N_EVAL}", gpu.arch);
+    println!(
+        "arch: {}  SEQ={SEQ} BLOCK={BLOCK} blocks={nb} train={N_TRAIN} eval={N_EVAL}",
+        gpu.arch
+    );
 
     let pos: Vec<f32> = (0..SEQ).map(|t| t as f32).collect();
 
@@ -180,11 +238,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if toks.len() < nc * SEQ {
             return Err(format!("corpus too small: {} toks < {}", toks.len(), nc * SEQ).into());
         }
-        let mut chunks: Vec<Vec<u32>> =
-            (0..nc).map(|i| toks[i * SEQ..(i + 1) * SEQ].to_vec()).collect();
+        let mut chunks: Vec<Vec<u32>> = (0..nc)
+            .map(|i| toks[i * SEQ..(i + 1) * SEQ].to_vec())
+            .collect();
         let (cfg, w) = load_llama_fp32(&mut gpu, &dir)?;
-        let (n_kv_t, hd_t, h_t, vocab) =
-            (cfg.num_key_value_heads, cfg.head_dim, cfg.hidden_size, cfg.vocab_size);
+        let (n_kv_t, hd_t, h_t, vocab) = (
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            cfg.hidden_size,
+            cfg.vocab_size,
+        );
         let kvd_t = n_kv_t * hd_t;
         let (rope_base, eps, n_layers) = (cfg.rope_theta, cfg.rms_norm_eps, cfg.num_hidden_layers);
         let mid = n_layers / 2;
@@ -197,13 +260,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             h.finish()
         };
         let sc = gpu.zeros(&[nb], DType::F32)?;
-        let (label_mid, base_shallow) = if let Some((cached, lm, bs)) = load_labels(LABELS_PATH, key) {
+        let (label_mid, base_shallow) = if let Some((cached, lm, bs)) =
+            load_labels(LABELS_PATH, key)
+        {
             println!("labels: cache HIT {LABELS_PATH} ({} chunks)", lm.len());
             chunks = cached;
             (lm, bs)
         } else {
             let max_id = chunks.iter().flatten().copied().max().unwrap_or(0);
-            assert!((max_id as usize) < vocab, "token id {max_id} ≥ vocab {vocab}");
+            assert!(
+                (max_id as usize) < vocab,
+                "token id {max_id} ≥ vocab {vocab}"
+            );
             println!("labels: cache miss — capturing (mid-layer partial forward)…");
             let mut label_mid: Vec<Vec<f32>> = Vec::new();
             let mut base_shallow: Vec<Vec<f32>> = Vec::new();
@@ -211,7 +279,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let acts = model_block_activations(&mut gpu, &target, ids, &pos, mid)?;
                 pflash_score_forward(&mut gpu, &acts[mid].k_r, &sc, SEQ, kvd_t, BLOCK, nb, last)?;
                 label_mid.push(gpu.download_f32(&sc)?);
-                pflash_score_forward(&mut gpu, &acts[SHALLOW].k_r, &sc, SEQ, kvd_t, BLOCK, nb, last)?;
+                pflash_score_forward(
+                    &mut gpu,
+                    &acts[SHALLOW].k_r,
+                    &sc,
+                    SEQ,
+                    kvd_t,
+                    BLOCK,
+                    nb,
+                    last,
+                )?;
                 base_shallow.push(gpu.download_f32(&sc)?);
                 for b in acts {
                     free_block_acts(&mut gpu, b)?;
@@ -224,7 +301,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let _ = gpu.free_tensor(sc);
         let embed = std::mem::replace(&mut target.embed, gpu.zeros(&[1], DType::F32)?);
-        (chunks, label_mid, base_shallow, embed, h_t, vocab, rope_base, eps)
+        (
+            chunks,
+            label_mid,
+            base_shallow,
+            embed,
+            h_t,
+            vocab,
+            rope_base,
+            eps,
+        )
     };
 
     let n_chunks = chunks.len();
@@ -237,7 +323,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // shallow baseline vs mid label (the bar to beat), eval split
     let bar: f32 = (N_TRAIN..n_chunks)
         .map(|i| spearman(&base_shallow[i], &label_mid[i]))
-        .sum::<f32>() / N_EVAL as f32;
+        .sum::<f32>()
+        / N_EVAL as f32;
 
     // ── P2/P3: drafter + training ─────────────────────────────────────────────
     let dcfg = DrafterConfig::tiny(rope_base, eps);
@@ -284,7 +371,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!("  bar  Spearman(shallow, mid) [eval] = {bar:+.3}  ← drafter must beat this");
-    println!("  init Spearman(drafter, mid) [eval] = {:+.3}\n", eval(&mut gpu, &drafter));
+    println!(
+        "  init Spearman(drafter, mid) [eval] = {:+.3}\n",
+        eval(&mut gpu, &drafter)
+    );
 
     // best-eval checkpointing: the drafter overfits past its peak, so keep the
     // best-generalizing weights rather than the final (decayed) ones.
@@ -294,7 +384,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut ep_loss = 0.0f32;
         for i in 0..N_TRAIN {
             let acts = drafter_forward_train(&mut gpu, &drafter, &chunks[i], &pos)?;
-            pflash_score_forward(&mut gpu, &acts.score_k, &scores_dev, SEQ, kvd_d, BLOCK, nb, last)?;
+            pflash_score_forward(
+                &mut gpu,
+                &acts.score_k,
+                &scores_dev,
+                SEQ,
+                kvd_d,
+                BLOCK,
+                nb,
+                last,
+            )?;
             let pred = gpu.download_f32(&scores_dev)?;
             // ListNet top-1: L = -Σ p_label log p_pred ; dL/dpred = (p_pred - p_label)/τ
             let pl = softmax_t(&label_mid[i], tau);
@@ -323,7 +422,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if ep % 30 == 0 || ep == epochs - 1 {
                 println!(
                     "  ep {ep:>3}  train_loss {:.4}  eval {:+.3}  (best {:+.3} @ ep {})",
-                    ep_loss / N_TRAIN as f32, corr, best_corr, best_ep
+                    ep_loss / N_TRAIN as f32,
+                    corr,
+                    best_corr,
+                    best_ep
                 );
             }
         }

@@ -9,9 +9,9 @@
 //!
 //! Run:
 //!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "pflash-m0"
+//!   hipfire gpu-lock acquire "pflash-m0"
 //!   cargo run -p hipfire-train --release --example pflash_m0_probe
-//!   gpu_release
+//!   hipfire gpu-lock release
 
 use hipfire_model::tokenizer::Tokenizer;
 use hipfire_train::loader::load_llama_fp32;
@@ -70,7 +70,11 @@ fn block_scores(k: &[f32], seq: usize, n_kv: usize, hd: usize, block: usize) -> 
             na += (a[i] as f64).powi(2);
             nb_ += (b[i] as f64).powi(2);
         }
-        if na == 0.0 || nb_ == 0.0 { 0.0 } else { d / (na.sqrt() * nb_.sqrt()) }
+        if na == 0.0 || nb_ == 0.0 {
+            0.0
+        } else {
+            d / (na.sqrt() * nb_.sqrt())
+        }
     };
     let mut scores = vec![0.0f32; nb];
     for b in 0..nb {
@@ -105,7 +109,10 @@ fn rank(a: &[f32]) -> Vec<f32> {
 
 fn pearson(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len() as f64;
-    let (ma, mb) = (a.iter().sum::<f32>() as f64 / n, b.iter().sum::<f32>() as f64 / n);
+    let (ma, mb) = (
+        a.iter().sum::<f32>() as f64 / n,
+        b.iter().sum::<f32>() as f64 / n,
+    );
     let (mut c, mut va, mut vb) = (0.0, 0.0, 0.0);
     for i in 0..a.len() {
         let (da, db) = (a[i] as f64 - ma, b[i] as f64 - mb);
@@ -113,7 +120,11 @@ fn pearson(a: &[f32], b: &[f32]) -> f32 {
         va += da * da;
         vb += db * db;
     }
-    if va == 0.0 || vb == 0.0 { 0.0 } else { (c / (va.sqrt() * vb.sqrt())) as f32 }
+    if va == 0.0 || vb == 0.0 {
+        0.0
+    } else {
+        (c / (va.sqrt() * vb.sqrt())) as f32
+    }
 }
 
 fn topk_recall(small: &[f32], big: &[f32], frac: f32) -> f32 {
@@ -121,7 +132,9 @@ fn topk_recall(small: &[f32], big: &[f32], frac: f32) -> f32 {
     let top = |a: &[f32]| {
         let mut idx: Vec<usize> = (0..a.len()).collect();
         idx.sort_by(|&i, &j| a[j].partial_cmp(&a[i]).unwrap());
-        idx.into_iter().take(k).collect::<std::collections::HashSet<_>>()
+        idx.into_iter()
+            .take(k)
+            .collect::<std::collections::HashSet<_>>()
     };
     let (s, g) = (top(small), top(big));
     s.intersection(&g).count() as f32 / k as f32
@@ -172,11 +185,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("    recency↔shallow Spearman {r_rs:+.3}");
         for frac in [0.10f32, 0.25] {
             let r = topk_recall(&s_shallow, &s_deep, frac);
-            println!("    top-{:>2}% recall  {r:.2}  (random ≈ {frac:.2})", (frac * 100.0) as i32);
+            println!(
+                "    top-{:>2}% recall  {r:.2}  (random ≈ {frac:.2})",
+                (frac * 100.0) as i32
+            );
         }
     }
     println!("\nInterpret: shallow↔deep ≫ recency↔deep → shallow K carries a real importance");
     println!("signal beyond recency → first-few-layers teacher / tiny drafter is viable.");
-    println!("If shallow↔deep ≈ recency↔deep → the ranking is mostly recency; a drafter buys little.");
+    println!(
+        "If shallow↔deep ≈ recency↔deep → the ranking is mostly recency; a drafter buys little."
+    );
     Ok(())
 }

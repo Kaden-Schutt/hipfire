@@ -44,7 +44,7 @@ done
 EXE="./target/release/hipfire-daemon"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 OUT="${HIPFIRE_COHERENCE_OUT:-/tmp/coherence-$(date +%Y%m%d-%H%M%S).md}"
-LOCK_SCRIPT="./scripts/gpu-lock.sh"
+HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 
 # ── Rebuild daemon if any relevant source is newer than the binary ────────
 rebuild=0
@@ -119,11 +119,10 @@ find_model_file() {
 }
 
 # ── GPU lock ──────────────────────────────────────────────────────────────
-if [ -r "$LOCK_SCRIPT" ]; then
+if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
     # shellcheck disable=SC1090
-    . "$LOCK_SCRIPT"
-    gpu_acquire "coherence-gate" || { echo "could not acquire GPU lock" >&2; exit 2; }
-    trap 'gpu_release 2>/dev/null || true' EXIT
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "coherence-gate" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
 # ── Test matrix ───────────────────────────────────────────────────────────
@@ -508,7 +507,7 @@ echo "no hard errors — review $OUT for coherence, then commit if satisfied"
 # verdicts haven't regressed against the committed baseline. Skipped
 # when target/drafter aren't present or when HIPFIRE_SKIP_PFLASH_GATE=1.
 # Release the daemon GPU lock first so pflash-gate.sh can acquire its own.
-gpu_release 2>/dev/null || true
+"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true
 trap - EXIT
 
 if [ "${HIPFIRE_SKIP_PFLASH_GATE:-0}" = "1" ]; then

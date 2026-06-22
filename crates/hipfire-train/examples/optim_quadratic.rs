@@ -4,9 +4,9 @@
 //!
 //! Run:
 //!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "optim-quad"
+//!   hipfire gpu-lock acquire "optim-quad"
 //!   cargo run -p hipfire-train --release --example optim_quadratic
-//!   gpu_release
+//!   hipfire gpu-lock release
 
 use hipfire_train::optim::AdamW;
 use rdna_compute::Gpu;

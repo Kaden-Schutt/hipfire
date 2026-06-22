@@ -7,6 +7,7 @@
 # prints VRAM-after-load deltas on each device.
 
 set -euo pipefail
+HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 cd "$(dirname "$0")/.."
 
 MODEL=${MODEL:-/local/hipfire/qwen3.6-27b-mq4.hfq}
@@ -25,7 +26,6 @@ if [ ! -f "$MODEL" ]; then
 fi
 
 # shellcheck disable=SC1091
-source scripts/gpu-lock.sh
 
 run_one() {
     local filter="$1"
@@ -67,8 +67,8 @@ print(joined[:200].replace(chr(10), " | "))
     rm -f "$logfile"
 }
 
-gpu_acquire "kv-filter-validate"
-trap gpu_release EXIT
+"$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "kv-filter-validate" --watch-pid "$$"
+trap "$HIPFIRE_GPULOCK_BIN" gpu-lock release EXIT
 
 echo "=== filter=0 (today's unfiltered _multi) ==="
 run_one 0

@@ -6,9 +6,9 @@
 //!
 //! Run:
 //!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "train-load"
+//!   hipfire gpu-lock acquire "train-load"
 //!   cargo run -p hipfire-train --release --example train_load_supra50m
-//!   gpu_release
+//!   hipfire gpu-lock release
 
 use hipfire_train::loader::load_llama_fp32;
 use rdna_compute::Gpu;

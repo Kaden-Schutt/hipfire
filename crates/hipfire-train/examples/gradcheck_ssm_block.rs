@@ -4,7 +4,7 @@
 //! one MLP weight (wdown). Never train on an unverified gradient.
 //!
 //!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "ssm-block-gradcheck"
+//!   hipfire gpu-lock acquire "ssm-block-gradcheck"
 //!   cargo run -p hipfire-train --release --example gradcheck_ssm_block
 
 use hipfire_train::ssm_block::{
@@ -21,7 +21,9 @@ fn rng_fill(n: usize, seed: u64, scale: f32) -> Vec<f32> {
     let mut s = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (((s >> 33) as f32) / (1u64 << 31) as f32 - 1.0) * scale
         })
         .collect()
@@ -29,7 +31,12 @@ fn rng_fill(n: usize, seed: u64, scale: f32) -> Vec<f32> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu = Gpu::init().expect("Gpu::init failed");
-    let dims = SsmBlockDims { seq: SEQ, h: H, inter: INTER, eps: EPS };
+    let dims = SsmBlockDims {
+        seq: SEQ,
+        h: H,
+        inter: INTER,
+        eps: EPS,
+    };
     println!("gradcheck ssm_block: seq={SEQ} h={H} inter={INTER}");
 
     // host weights (kept so we can perturb + re-upload for FD)
@@ -65,8 +72,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let wu2 = gpu.upload_f32(&wup, &[INTER, H]).unwrap();
         let wd = gpu.upload_f32(wdown, &[H, INTER]).unwrap();
         let w = SsmBlockWeights {
-            norm1: &n1, w_u: &wu, w_g: &wg, w_o: &wo, norm2: &n2,
-            wgate: &wgt, wup: &wu2, wdown: &wd,
+            norm1: &n1,
+            w_u: &wu,
+            w_g: &wg,
+            w_o: &wo,
+            norm2: &n2,
+            wgate: &wgt,
+            wup: &wu2,
+            wdown: &wd,
         };
         let (xout, acts) = ssm_block_forward(gpu, &xd, &w, &dims).unwrap();
         let hh = gpu.download_f32(&xout).unwrap();
@@ -88,8 +101,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let wu2 = gpu.upload_f32(&wup, &[INTER, H])?;
     let wd = gpu.upload_f32(&wdown, &[H, INTER])?;
     let w = SsmBlockWeights {
-        norm1: &n1, w_u: &wu, w_g: &wg, w_o: &wo, norm2: &n2,
-        wgate: &wgt, wup: &wu2, wdown: &wd,
+        norm1: &n1,
+        w_u: &wu,
+        w_g: &wg,
+        w_o: &wo,
+        norm2: &n2,
+        wgate: &wgt,
+        wup: &wu2,
+        wdown: &wd,
     };
     let (xout, acts) = ssm_block_forward(&mut gpu, &xd, &w, &dims)?;
     let _ = gpu.free_tensor(xout);
@@ -108,11 +127,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut max_abs = 0.0f32;
 
     let mut check = |gpu: &mut Gpu,
-                    name: &str,
-                    vec: &mut Vec<f32>,
-                    analytic: &[f32],
-                    idxs: &[usize],
-                    which: u8| {
+                     name: &str,
+                     vec: &mut Vec<f32>,
+                     analytic: &[f32],
+                     idxs: &[usize],
+                     which: u8| {
         println!("\n-- dL/d{name} --\n  idx      analytic         fd        abs_err   tol      ok");
         for &i in idxs {
             let orig = vec[i];
@@ -142,7 +161,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let ok = abs <= tol;
             all_ok &= ok;
             max_abs = max_abs.max(abs);
-            println!("  {i:>5} {a:>14.6} {fd:>12.6} {abs:>10.2e} {tol:>8.2e}   {}", if ok { "✓" } else { "✗" });
+            println!(
+                "  {i:>5} {a:>14.6} {fd:>12.6} {abs:>10.2e} {tol:>8.2e}   {}",
+                if ok { "✓" } else { "✗" }
+            );
         }
     };
 
@@ -155,7 +177,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut xv = x.clone();
     check(&mut gpu, "x", &mut xv, &dx_host, &idx_x, 0);
     let mut n1v = norm1.clone();
-    check(&mut gpu, "norm1", &mut n1v, &dn1_host, &[0usize, 2, 5, 7], 1);
+    check(
+        &mut gpu,
+        "norm1",
+        &mut n1v,
+        &dn1_host,
+        &[0usize, 2, 5, 7],
+        1,
+    );
     let mut wuv = w_u.clone();
     check(&mut gpu, "w_u", &mut wuv, &dwu_host, &idx_w, 2);
     let mut wgv = w_g.clone();
@@ -163,7 +192,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut wov = w_o.clone();
     check(&mut gpu, "w_o", &mut wov, &dwo_host, &idx_w, 4);
     let mut wdv = wdown.clone();
-    check(&mut gpu, "wdown", &mut wdv, &dwd_host, &[0usize, 1, INTER + 2, 3 * INTER + 3, H * INTER - 1], 5);
+    check(
+        &mut gpu,
+        "wdown",
+        &mut wdv,
+        &dwd_host,
+        &[0usize, 1, INTER + 2, 3 * INTER + 3, H * INTER - 1],
+        5,
+    );
 
     // silence unused-mut warnings on the originals (perturbed via clones above)
     let _ = (&mut norm1, &mut w_u, &mut w_g, &mut w_o, &mut wdown, &mut x);

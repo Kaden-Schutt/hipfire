@@ -5,6 +5,7 @@
 # Nohup-safe: no stdin required, timestamped report path printed at start.
 # Usage: nohup bash scripts/bench-eval-all.sh > /tmp/bench-eval-all.log 2>&1 &
 set -euo pipefail
+HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 cd "$(dirname "$0")/.."
 
 TIER=${1:-medium}
@@ -18,9 +19,8 @@ log "bench-eval-all start — report: $REPORT"
 echo "REPORT: $REPORT"
 
 # ── GPU lock ──────────────────────────────────────────────────────────────────
-source scripts/gpu-lock.sh
-gpu_acquire "bench-eval-all"
-trap 'gpu_release' EXIT
+"$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "bench-eval-all" --watch-pid "$$"
+trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release' EXIT
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 section "Build"

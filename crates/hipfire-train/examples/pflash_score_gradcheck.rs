@@ -2,7 +2,7 @@
 //! Never train on an unverified gradient.
 //!
 //!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "pflash-gradcheck"
+//!   hipfire gpu-lock acquire "pflash-gradcheck"
 //!   cargo run -p hipfire-train --release --example pflash_score_gradcheck
 
 use hipfire_train::ops::pflash_score::{pflash_score_backward, pflash_score_forward};
@@ -21,7 +21,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // deterministic pseudo-random k and loss weights w
     let mut s: u64 = 0x243F6A8885A308D3;
     let mut rng = || {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((s >> 33) as f32) / (1u64 << 31) as f32 - 1.0 // ~[-1,1)
     };
     let mut k: Vec<f32> = (0..N_POS * KV_DIM).map(|_| rng()).collect();
@@ -50,7 +52,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is unstable for small-magnitude components in fp32 FD).
     let h = 1e-3f32;
     let (atol, rtol) = (1e-3f32, 2e-2f32);
-    let idxs = [0usize, 1, 5, 17, 33, LAST * KV_DIM, LAST * KV_DIM + 7, 3 * KV_DIM + 2];
+    let idxs = [
+        0usize,
+        1,
+        5,
+        17,
+        33,
+        LAST * KV_DIM,
+        LAST * KV_DIM + 7,
+        3 * KV_DIM + 2,
+    ];
     let mut max_abs = 0.0f32;
     let mut all_ok = true;
     println!("\n  idx      analytic         fd        abs_err   tol      ok");
@@ -68,7 +79,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ok = abs <= tol;
         all_ok &= ok;
         max_abs = max_abs.max(abs);
-        println!("  {i:>5} {a:>14.6} {fd:>12.6} {abs:>10.2e} {tol:>8.2e}   {}", if ok { "✓" } else { "✗" });
+        println!(
+            "  {i:>5} {a:>14.6} {fd:>12.6} {abs:>10.2e} {tol:>8.2e}   {}",
+            if ok { "✓" } else { "✗" }
+        );
     }
     println!("\n  max_abs_err={max_abs:.2e}  (atol={atol:.0e} rtol={rtol:.0e})");
     if all_ok {

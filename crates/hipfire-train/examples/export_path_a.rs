@@ -9,10 +9,10 @@
 //!
 //! Run:
 //!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "export-path-a"
+//!   hipfire gpu-lock acquire "export-path-a"
 //!   cargo run -p hipfire-train --release --example export_path_a -- \
 //!       <served.hfq> <recovered.hfq>
-//!   gpu_release
+//!   hipfire gpu-lock release
 
 use hipfire_model::tokenizer::Tokenizer;
 use hipfire_train::hfq_patch::{is_norm, parse_hfq, patch_norms_inplace};
@@ -41,8 +41,12 @@ culture continue to influence the modern world to this day in countless ways.";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let in_hfq = args.next().ok_or("usage: export_path_a <in.hfq> <out.hfq>")?;
-    let out_hfq = args.next().ok_or("usage: export_path_a <in.hfq> <out.hfq>")?;
+    let in_hfq = args
+        .next()
+        .ok_or("usage: export_path_a <in.hfq> <out.hfq>")?;
+    let out_hfq = args
+        .next()
+        .ok_or("usage: export_path_a <in.hfq> <out.hfq>")?;
     let dir = Path::new(MODEL_DIR);
 
     let mut gpu = Gpu::init().expect("Gpu::init failed");
@@ -56,7 +60,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (cfg, w_teacher) = load_llama_fp32(&mut gpu, dir)?;
     let (scfg, w_student) = load_llama_from_hfq(&mut gpu, Path::new(&in_hfq))?;
     let vocab = cfg.vocab_size;
-    println!("student loaded directly from served {in_hfq} (decoded), {} layers", scfg.num_hidden_layers);
+    println!(
+        "student loaded directly from served {in_hfq} (decoded), {} layers",
+        scfg.num_hidden_layers
+    );
 
     let teacher = LlamaModel::from_f32_weights(&mut gpu, &cfg, w_teacher, L, 16, 32.0)?;
     let student = LlamaModel::from_f32_weights(&mut gpu, &scfg, w_student, L, 16, 32.0)?;
@@ -79,13 +86,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // norms-only recovery
     let sizes = student.norm_param_sizes();
     let mut opt = AdamW::new(&mut gpu, &sizes, LR, 0.9, 0.999, 1e-8, 0.0)?;
-    println!("norms-only recovery ({} norm tensors, {n_chunks} chunks)...", sizes.len());
+    println!(
+        "norms-only recovery ({} norm tensors, {n_chunks} chunks)...",
+        sizes.len()
+    );
     let mut last = 0.0f32;
     for step in 0..STEPS {
         let mut total = 0.0f32;
         for (ci, toks) in chunks.iter().enumerate() {
             let acts = model_forward(&mut gpu, &student, toks, &pos)?;
-            let (kl, grads, d_final) = model_distill_backward(&mut gpu, &student, &acts, &teacher_p[ci])?;
+            let (kl, grads, d_final) =
+                model_distill_backward(&mut gpu, &student, &acts, &teacher_p[ci])?;
             total += kl;
             let params = student.norm_params();
             let gflat = flatten_norm_grads(&grads, &d_final);
@@ -101,10 +112,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // collect tuned norms → name map
     let mut tuned: HashMap<String, Vec<f32>> = HashMap::new();
     for (i, (w, _)) in student.layers.iter().enumerate() {
-        tuned.insert(format!("model.layers.{i}.input_layernorm.weight"), gpu.download_f32(&w.norm1)?);
-        tuned.insert(format!("model.layers.{i}.post_attention_layernorm.weight"), gpu.download_f32(&w.norm2)?);
+        tuned.insert(
+            format!("model.layers.{i}.input_layernorm.weight"),
+            gpu.download_f32(&w.norm1)?,
+        );
+        tuned.insert(
+            format!("model.layers.{i}.post_attention_layernorm.weight"),
+            gpu.download_f32(&w.norm2)?,
+        );
     }
-    tuned.insert("model.norm.weight".to_string(), gpu.download_f32(&student.final_norm)?);
+    tuned.insert(
+        "model.norm.weight".to_string(),
+        gpu.download_f32(&student.final_norm)?,
+    );
     // sanity: every tuned name must be a norm
     assert!(tuned.keys().all(|k| is_norm(k)));
 
@@ -115,7 +135,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(&out_hfq, &bytes)?;
     println!("\npatched {n}/{} norm tensors → {out_hfq}", tuned.len());
     if n != tuned.len() {
-        return Err(format!("patched {n} but had {} tuned norms — name mismatch", tuned.len()).into());
+        return Err(format!(
+            "patched {n} but had {} tuned norms — name mismatch",
+            tuned.len()
+        )
+        .into());
     }
     println!("OK — recovered .hfq written (codes/weights unchanged, norms tuned).");
     Ok(())

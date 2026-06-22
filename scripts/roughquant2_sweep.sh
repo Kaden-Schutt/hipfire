@@ -3,6 +3,7 @@
 # Qwen3.5-0.8B. quantize (CPU, roughquant2-sim) -> PPL (GPU) -> delete .hfq.
 # Byte-identical corpus; gpu-lock coordinated. Compare to mq4 gate 29.08.
 set -euo pipefail
+HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 cd "$(dirname "$0")/.."
 
 MODEL=${MODEL:-/srv/huggingface/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17}
@@ -24,7 +25,6 @@ CONFIGS=(
   "2 0.0" "2 0.015" "2 0.03" "2 0.06" "2 0.12"
 )
 
-source scripts/gpu-lock.sh 2>/dev/null || true
 
 echo -e "bulk_bits\tprotect_frac\tavg_bits_est\tnll_tok\tppl" | tee "$OUT"
 for cfg in "${CONFIGS[@]}"; do
@@ -34,9 +34,9 @@ for cfg in "${CONFIGS[@]}"; do
   HIPFIRE_RQ2_BULK_BITS=$BITS HIPFIRE_RQ2_PROTECT_FRAC=$FRAC HIPFIRE_RQ2_DAMP=0.01 \
     "$Q" --input "$MODEL" --output "$TMP" --format roughquant2-sim >/tmp/rq2_quant.log 2>&1 || {
       echo "QUANTIZE FAILED bits=$BITS frac=$FRAC; tail:"; tail -20 /tmp/rq2_quant.log; exit 1; }
-  gpu_acquire "roughquant2-sweep-b${BITS}-f${FRAC}" 2>/dev/null || true
+  "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "roughquant2-sweep-b${BITS}-f${FRAC}" --watch-pid "$$" 2>/dev/null || true
   RES=$("$PPL" "$TMP" "$CORPUS" --ctx 2048 --warmup 8 --offset 0 2>/dev/null | grep -E "NLL/tok|PPL")
-  gpu_release 2>/dev/null || true
+  "$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true
   NLL=$(echo "$RES" | grep NLL | awk '{print $2}')
   PPLV=$(echo "$RES" | grep PPL | awk '{print $2}')
   echo -e "${BITS}\t${FRAC}\t${AVGBITS}\t${NLL}\t${PPLV}" | tee -a "$OUT"

@@ -3,7 +3,7 @@
 //! full capture pipeline.
 //!
 //!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "gemm-bench"
+//!   hipfire gpu-lock acquire "gemm-bench"
 //!   cargo run -p hipfire-train --release --example gemm_f32_train_bench
 
 use rdna_compute::{DType, Gpu};
@@ -36,7 +36,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (m, n, k) = (512usize, 3072usize, 3072usize);
     let mut s: u64 = 0x1234567;
     let mut rng = || {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((s >> 40) as f32) / (1u64 << 23) as f32 - 0.5
     };
     let xa: Vec<f32> = (0..m * k).map(|_| rng()).collect();
@@ -98,7 +100,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flop = 3.0 * 2.0 * m as f64 * n as f64 * k as f64 * iters as f64;
     println!(
         "\n3 matmuls × {iters} iters: {:.3}s → {:.1} GFLOP/s",
-        dt, flop / dt / 1e9
+        dt,
+        flop / dt / 1e9
     );
     Ok(())
 }

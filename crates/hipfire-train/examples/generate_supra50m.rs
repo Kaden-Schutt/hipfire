@@ -9,9 +9,9 @@
 //!
 //! Run:
 //!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "gen-supra"
+//!   hipfire gpu-lock acquire "gen-supra"
 //!   cargo run -p hipfire-train --release --example generate_supra50m
-//!   gpu_release
+//!   hipfire gpu-lock release
 
 use hipfire_model::tokenizer::Tokenizer;
 use hipfire_train::loader::load_llama_fp32;

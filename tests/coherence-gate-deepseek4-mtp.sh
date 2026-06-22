@@ -61,7 +61,7 @@ V4F_MODEL="$MODELS_DIR/deepseek-v4-flash-lloyd-mq2.hfq"
 V4F_ADDON="$MODELS_DIR/deepseek-v4-flash-mtp-lloyd-mq2.hfq"
 OUT="${HIPFIRE_COHERENCE_OUT:-/tmp/coherence-deepseek4-mtp-$(date +%Y%m%d-%H%M%S).md}"
 CASE_TIMEOUT="${HIPFIRE_COHERENCE_TIMEOUT:-240}"
-LOCK_SCRIPT="./scripts/gpu-lock.sh"
+HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 
 # ── Rebuild daemon if any DeepSeek V4 / spec_decode source is newer than the binary ─
 rebuild=0
@@ -107,11 +107,10 @@ if [ ! -f "$V4F_MODEL" ]; then
 fi
 
 # ── GPU lock ──────────────────────────────────────────────────────────────
-if [ -r "$LOCK_SCRIPT" ]; then
+if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
     # shellcheck disable=SC1090
-    . "$LOCK_SCRIPT"
-    gpu_acquire "coherence-gate-deepseek4-mtp" || { echo "could not acquire GPU lock" >&2; exit 2; }
-    trap 'gpu_release 2>/dev/null || true' EXIT
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "coherence-gate-deepseek4-mtp" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
 # ── Prompts ───────────────────────────────────────────────────────────────

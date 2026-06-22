@@ -5,9 +5,9 @@
 //!
 //! Run:
 //!   source ./scripts/rocm-env.sh && export ROCM_PATH=/opt/rocm
-//!   source ./scripts/gpu-lock.sh && gpu_acquire "gradcheck-model"
+//!   hipfire gpu-lock acquire "gradcheck-model"
 //!   cargo run -p hipfire-train --release --example gradcheck_model
-//!   gpu_release
+//!   hipfire gpu-lock release
 
 use hipfire_train::block::BlockDims;
 use hipfire_train::model::{model_forward, model_loss_backward};

@@ -28,9 +28,9 @@
 //!   - > 2 ms            → host-staging hit; abort Stage 2 until
 //!                          peer-access ordering is verified.
 //!
-//! Run: source scripts/gpu-lock.sh && gpu_acquire pp-boundary-bench && \
+//! Run: hipfire gpu-lock acquire pp-boundary-bench && \
 //!      env HIPFIRE_ALLOW_MIXED_ARCH=1 HIPFIRE_PP_LAYERS=48,16 \
-//!      ./target/release/examples/pp_boundary_microbench && gpu_release
+//!      ./target/release/examples/pp_boundary_microbench && hipfire gpu-lock release
 
 use hipfire_runtime::multi_gpu::Gpus;
 use rdna_compute::{DType, Gpu};

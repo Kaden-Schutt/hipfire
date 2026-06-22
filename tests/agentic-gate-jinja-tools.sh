@@ -41,7 +41,7 @@ cd "$(dirname "$0")/.."
 # ---- Setup -----------------------------------------------------------------
 EXE="./target/release/hipfire-daemon"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
-LOCK_SCRIPT="./scripts/gpu-lock.sh"
+HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 
 # Model preference order: prefer Qwen3.6 over 3.5 (newer chat_template),
 # dense over MoE (lower VRAM ceiling), and within each family the
@@ -157,12 +157,11 @@ cleanup() {
         kill -9 "$DAEMON_PID" 2>/dev/null
     fi
     DAEMON_PID=""
-    gpu_release 2>/dev/null || true
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true
 }
-if [ -r "$LOCK_SCRIPT" ]; then
+if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
     # shellcheck disable=SC1090
-    . "$LOCK_SCRIPT"
-    gpu_acquire "agentic-gate-jinja-tools" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "agentic-gate-jinja-tools" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
     trap cleanup EXIT
 fi
 
