@@ -28,11 +28,17 @@ import {
   decideProcfsPortOwnership,
   serveProbeHost,
   isValidSocketPath,
+  resolveServeBind,
+  formatBind,
+  bindFetchTarget,
+  bindFromPidRecord,
   type ServePidRecord,
   type PidEvidence,
+  type ServeBind,
 } from "./serve_admission";
 // serveProbeHost moved to serve_admission.ts (pure). Re-exported for chat.ts.
 export { serveProbeHost } from "./serve_admission";
+export { formatBind, bindFetchTarget, resolveServeBind } from "./serve_admission";
 import {
   EXIT,
   formatErrorMessage,
@@ -1679,12 +1685,11 @@ function probePortOwner(pid: number, port: number): boolean | undefined {
 // BUG pid-reuse: hit http://<host>:<port>/health and return the echoed instance
 // token (the bun serve now includes `token` in its /health JSON). undefined when
 // /health is unreachable or carries no token. Pure-TS probe (no daemon).
-async function probeHealthToken(host: string | undefined, port: number | undefined): Promise<string | undefined> {
-  if (port === undefined) return undefined;
-  const h = serveProbeHost(host ?? "127.0.0.1");
+async function probeHealthToken(bind: ServeBind): Promise<string | undefined> {
   try {
+    const t = bindFetchTarget(bind, "/health");
     const ctl = AbortSignal.timeout(800);
-    const r = await fetch(`http://${h}:${port}/health`, { signal: ctl });
+    const r = await fetch(t.url, { unix: t.unix, signal: ctl });
     if (!r.ok) return undefined;
     const j = await r.json() as any;
     return typeof j?.token === "string" ? j.token : undefined;
@@ -1698,7 +1703,7 @@ async function probeHealthToken(host: string | undefined, port: number | undefin
 // rec.port, so legacy bare-pid records get a real port probe too), AND the
 // /health-echoed token on that target port. Best-effort: any field we can't
 // read stays undefined (the validator handles partial evidence).
-async function gatherPidEvidence(rec: ServePidRecord, targetPort: number): Promise<PidEvidence> {
+async function gatherPidEvidence(rec: ServePidRecord, bind: ServeBind): Promise<PidEvidence> {
   const ev: PidEvidence = {};
   if (process.platform === "linux") {
     try {
@@ -1719,15 +1724,20 @@ async function gatherPidEvidence(rec: ServePidRecord, targetPort: number): Promi
   // PORT FIRST: probe whether the recorded pid owns the RESOLVED TARGET port.
   // This is authoritative in the validator and applies to legacy records too
   // (which carry no rec.port) — we always probe the port the caller is acting on.
-  {
-    const owns = probePortOwner(rec.pid, targetPort);
+  if (bind.kind === "tcp") {
+    const owns = probePortOwner(rec.pid, bind.port);
     if (owns !== undefined) ev.ownsPort = owns;
-  }
-  // /health token echo (definitive ownership when it matches rec.token), probed
-  // on the target port. Only meaningful for new records (legacy carries no token).
-  if (rec.token !== undefined) {
-    const tok = await probeHealthToken(rec.host, targetPort);
-    if (tok !== undefined) ev.healthToken = tok;
+    // /health token echo (definitive ownership when it matches rec.token), probed
+    // on the target bind. Only meaningful for new records (legacy carries no token).
+    if (rec.token !== undefined) {
+      const tok = await probeHealthToken(bind);
+      if (tok !== undefined) ev.healthToken = tok;
+    }
+  } else {
+    // unix: no TCP port signal — leave ownsPort undefined and rely on the
+    // token-first path in validatePidOwnership (spec §6.6).
+    ev.ownsPort = undefined;
+    ev.healthToken = await probeHealthToken(bind);
   }
   return ev;
 }
@@ -1738,23 +1748,19 @@ async function gatherPidEvidence(rec: ServePidRecord, targetPort: number): Promi
 // gathered evidence (proc + target-port ownership + /health token). NEVER kill on
 // a false verdict — the caller unlinks the stale pidfile instead. async because
 // it probes /health.
-async function validateServePid(rec: ServePidRecord, targetPort: number): Promise<{ owned: boolean; reason: string }> {
+async function validateServePid(rec: ServePidRecord, bind: ServeBind): Promise<{ owned: boolean; reason: string }> {
   const alive = isPidAlive(rec.pid);
   if (!alive) return validatePidOwnership(rec, {}, false);
-  const ev = await gatherPidEvidence(rec, targetPort);
+  const ev = await gatherPidEvidence(rec, bind);
   return validatePidOwnership(rec, ev, alive);
 }
 
-export function formatServeBind(host: string, port: number): string {
-  const h = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
-  return `${h}:${port}`;
-}
-
 // Cheap liveness probe: 500ms health check. Used by `run` to decide HTTP vs local spawn.
-export async function isServeUp(port: number, host = "127.0.0.1"): Promise<boolean> {
+export async function isServeUp(bind: ServeBind): Promise<boolean> {
   try {
+    const t = bindFetchTarget(bind, "/health");
     const ctl = AbortSignal.timeout(500);
-    const r = await fetch(`http://${serveProbeHost(host)}:${port}/health`, { signal: ctl });
+    const r = await fetch(t.url, { unix: t.unix, signal: ctl });
     return r.ok;
   } catch { return false; }
 }
@@ -1762,7 +1768,7 @@ export async function isServeUp(port: number, host = "127.0.0.1"): Promise<boole
 // Drive `hipfire run` through an existing serve's /v1/chat/completions stream.
 // Returns false if it couldn't connect (caller falls back to local spawn).
 async function runViaHttp(
-  port: number, host: string, model: string, prompt: string,
+  bind: ServeBind, model: string, prompt: string,
   image: string | undefined,
   temp: number, maxTokens: number, repeatPenalty: number, topP: number,
   system?: string,
@@ -1815,7 +1821,9 @@ async function runViaHttp(
 
   let resp: Response;
   try {
-    resp = await fetch(`http://${serveProbeHost(host)}:${port}/v1/chat/completions`, {
+    const t = bindFetchTarget(bind, "/v1/chat/completions");
+    resp = await fetch(t.url, {
+      unix: t.unix,
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -2298,8 +2306,14 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   const wantsLocalControl = extra.kvMode !== undefined
     || extra.jsonOut === true || extra.noStream === true;
   const useLocal = process.env.HIPFIRE_LOCAL === "1" || wantsLocalControl;
-  if (!useLocal && await isServeUp(cfg.port, cfg.host)) {
-    const ok = await runViaHttp(cfg.port, cfg.host, model, prompt, image, temp, maxTokens, repeatPenalty, topP, system, extra.sampling);
+  const runBind = resolveServeBind({
+    cliSocketPath: null, cliHost: null, cliPort: null,
+    cfgSocketPath: cfg.socket_path, cfgHost: cfg.host, cfgPort: cfg.port,
+  });
+  if ("error" in runBind) { console.error(runBind.error); process.exit(EXIT.USAGE); }
+  const bind = runBind.bind;
+  if (!useLocal && await isServeUp(bind)) {
+    const ok = await runViaHttp(bind, model, prompt, image, temp, maxTokens, repeatPenalty, topP, system, extra.sampling);
     if (ok) return;
     // runViaHttp logged its own failure reason.
     // hunt3 B-6: only fall back to a LOCAL daemon if the serve is now GONE.
@@ -2307,7 +2321,7 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     // LOCK_EX|LOCK_NB flock → daemon FATAL "already running" → process.exit.
     // The HTTP request failed for a per-request reason (e.g. a transient
     // serve error), not because the GPU is free — surface it and bail.
-    if (await isServeUp(cfg.port, cfg.host)) {
+    if (await isServeUp(bind)) {
       console.error(`[hipfire] serve is up but the request failed — not spawning a local daemon (would collide with the serve's GPU lock).`);
       console.error(`  Retry, or stop the serve first: hipfire stop`);
       process.exit(1);
@@ -2435,7 +2449,7 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   await e.stop();
 }
 
-async function serve(port: number, host: string) {
+async function serve(bind: ServeBind) {
   applyConfigEnv(cfg);
   // Write the PID so `hipfire stop` / `hipfire ps` / `hipfire run` can find us.
   // Cleanup on normal exit; stale PID on crash is tolerated (isPidAlive catches it).
@@ -2450,10 +2464,21 @@ async function serve(port: number, host: string) {
     // overwrite the live daemon's pid file, then (on exit, cleanupPid below)
     // DELETE it — orphaning the detached daemon's VRAM. Before claiming the
     // pid file, refuse to start if another serve is already live on this bind.
-    if (await isServeUp(port, host)) {
-      const existing = readServePid();
-      console.error(`hipfire serve already running${existing ? ` (PID ${existing})` : ""} on ${formatServeBind(host, port)}.`);
-      console.error(`  Stop it first: hipfire stop`);
+    // Dedup: an already-running serve on ANY transport must refuse a new one
+    // (daemon/GPU/pidfile are singletons — spec §1). Validate the existing record
+    // on ITS OWN bind, and also probe the NEW bind in case something else answers.
+    const existingRec = readServePidRecord();
+    if (existingRec) {
+      const existingBind = bindFromPidRecord(existingRec);
+      const ev = await validateServePid(existingRec, existingBind);
+      if (ev.owned && (await isServeUp(existingBind))) {
+        console.error(`hipfire serve already running on ${formatBind(existingBind)} (PID ${existingRec.pid}).`);
+        console.error(`  Stop it first: hipfire stop`);
+        process.exit(1);
+      }
+    }
+    if (await isServeUp(bind)) {
+      console.error(`already running on ${formatBind(bind)}`);
       process.exit(1);
     }
     try {
@@ -2464,9 +2489,10 @@ async function serve(port: number, host: string) {
       const rec: ServePidRecord = {
         pid: process.pid,
         startTime: readOwnProcStartTime() ?? Date.now(),
-        host,
-        port,
         token: serveToken,
+        ...(bind.kind === "unix"
+            ? { socketPath: bind.path }
+            : { host: bind.host, port: bind.port }),
       };
       require("fs").writeFileSync(SERVE_PID_FILE, serializeServePidRecord(rec));
     } catch {}
@@ -2484,10 +2510,40 @@ async function serve(port: number, host: string) {
       if (mine) require("fs").unlinkSync(SERVE_PID_FILE);
     } catch {}
   };
-  process.on("exit", cleanupPid);
-  process.on("SIGTERM", () => { cleanupPid(); process.exit(0); });
-  process.on("SIGINT", () => { cleanupPid(); process.exit(0); });
 
+  // Stale-socket pre-bind unlink (unix only). UNCONDITIONAL — NOT gated on
+  // ownsPidFile (so it also runs for a HIPFIRE_NO_PID_FILE=1 chat-spawned
+  // serve). A live owner answering /health → already up; a non-socket file at
+  // the path → refuse; a stale socket → remove it.
+  if (bind.kind === "unix") {
+    const fs = require("fs");
+    if (await isServeUp(bind)) {
+      console.error(`already running on ${formatBind(bind)}`);
+      process.exit(1);
+    }
+    let st: import("fs").Stats | null = null;
+    try { st = fs.lstatSync(bind.path); } catch { st = null; }
+    if (st) {
+      if (!st.isSocket()) {
+        console.error(`refusing to bind: ${bind.path} exists and is not a socket`);
+        process.exit(1);
+      }
+      try { fs.unlinkSync(bind.path); } catch {}
+    }
+  }
+
+  // boundSocket is set ONLY after successful Bun.serve (below), so a serve
+  // that throws before binding never deletes a socket it did not create.
+  let boundSocket: string | null = null;
+  const cleanupBoundSocket = () => {
+    if (boundSocket === null) return;
+    try { require("fs").unlinkSync(boundSocket); } catch {}
+  };
+  process.on("exit", cleanupBoundSocket);
+
+  process.on("exit", cleanupPid);
+  process.on("SIGTERM", () => { cleanupPid(); cleanupBoundSocket(); process.exit(0); });
+  process.on("SIGINT", () => { cleanupPid(); cleanupBoundSocket(); process.exit(0); });
   const e = new Engine();
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
@@ -2688,11 +2744,16 @@ async function serve(port: number, host: string) {
     }
   }
 
-  console.error(`[hipfire] http://${formatServeBind(host, port)}/v1/chat/completions`);
+  if (bind.kind === "unix") {
+    console.error(`[hipfire] listening on unix:${bind.path} (POST /v1/chat/completions — connect with curl --unix-socket ${bind.path})`);
+  } else {
+    console.error(`[hipfire] http://${formatBind(bind)}/v1/chat/completions`);
+  }
 
-  Bun.serve({
-    hostname: host,
-    port,
+  let server;
+  try {
+    server = Bun.serve({
+      ...(bind.kind === "unix" ? { unix: bind.path } : { hostname: bind.host, port: bind.port }),
     idleTimeout: 255, // max allowed — model loading can take 30s+
     async fetch(req) {
       const url = new URL(req.url);
@@ -4744,6 +4805,19 @@ async function serve(port: number, host: string) {
       }
     }
   });
+  } catch (e: any) {
+    if (e && (e.code === "EADDRINUSE" || String(e).includes("EADDRINUSE"))) {
+      const hint = bind.kind === "unix"
+        ? `socket ${bind.path} is in use; another serve may own it, or run scripts/serve-restart.sh --socket ${bind.path}`
+        : `${formatBind(bind)} is in use`;
+      console.error(hint);
+      process.exit(1);
+    }
+    throw e;
+  }
+  // Set ONLY after a successful bind so a serve that throws before binding never
+  // deletes a socket it did not create (spec §6.9.5).
+  boundSocket = bind.kind === "unix" ? bind.path : null;
 }
 
 // Drive `hipfire serve` / `hipfire restart`: parse args, resolve bind +
@@ -4905,6 +4979,13 @@ async function runServe(args: string[]) {
   host = host ?? cfg.host;
   port = port ?? cfg.port;
 
+  const rb = resolveServeBind({
+    cliSocketPath, cliHost: host, cliPort: port,
+    cfgSocketPath: cfg.socket_path, cfgHost: cfg.host, cfgPort: cfg.port,
+  });
+  if ("error" in rb) { console.error(rb.error); process.exit(EXIT.USAGE); }
+  const bind = rb.bind;
+
   // BUG ep-ignores-kvmode: the daemon EP/multi-GPU load currently drops
   // kv_mode_override. When the operator asks for BOTH tp>1 and a non-default
   // --kv-mode, warn loudly so they aren't misled into thinking it took effect.
@@ -4919,12 +5000,12 @@ async function runServe(args: string[]) {
     // Refuse to start a second one — but ONLY when the pidfile names a pid that
     // VALIDATES as a live hipfire serve (BUG pid-reuse). A stale pidfile whose
     // pid was reused by an unrelated process must NOT block a new serve; unlink
-    // it and proceed.
+    // it and proceed. Validate on the existing record's OWN bind.
     const existingRec = readServePidRecord();
     if (existingRec) {
-      const v = await validateServePid(existingRec, port);
+      const v = await validateServePid(existingRec, bindFromPidRecord(existingRec));
       if (v.owned) {
-        console.error(`hipfire serve already running (PID ${existingRec.pid}) on port ${port}.`);
+        console.error(`hipfire serve already running (PID ${existingRec.pid}) on ${formatBind(bindFromPidRecord(existingRec))}.`);
         console.error(`  Stop it: hipfire stop   |   Replace it: hipfire restart`);
         process.exit(1);
       } else {
@@ -4935,12 +5016,14 @@ async function runServe(args: string[]) {
     // Fork a detached child. `setsid` gives it its own session so Ctrl-C in the
     // parent shell doesn't reach it; `nohup` ignores SIGHUP; stdout + stderr go
     // to the log file. HIPFIRE_DETACHED prevents infinite forking. The child
-    // re-runs `serve host port`; all passthrough flags ride along as env vars.
+    // re-runs `serve` with the same bind.
     const runBg = process.platform === "win32" ? ["cmd", "/c", "start", "/b"] : ["setsid", "nohup"];
     const self = process.argv[0];
     const script = process.argv[1];
     const logFd = require("fs").openSync(SERVE_LOG_FILE, "a");
-    const childArgs = ["serve", host, String(port)];
+    const childArgs = bind.kind === "unix"
+      ? ["serve", "--socket-path", bind.path]
+      : ["serve", bind.host, String(bind.port)];
     const child = Bun.spawn([...runBg, self, script, ...childArgs], {
       stdin: "ignore",
       stdout: logFd,
@@ -4958,7 +5041,7 @@ async function runServe(args: string[]) {
     let nextProgressAt = 30;                // seconds
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 500));
-      if (await isServeUp(port, host)) break;
+      if (await isServeUp(bind)) break;
       // Progress every ~30s, computed off the FIXED start (not the deadline).
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
       if (elapsed >= nextProgressAt) {
@@ -4966,9 +5049,8 @@ async function runServe(args: string[]) {
         nextProgressAt += 30;
       }
     }
-    if (await isServeUp(port, host)) {
-      const bind = formatServeBind(host, port);
-      console.log(`hipfire serve started in background (PID ${child.pid}, bind ${bind})`);
+    if (await isServeUp(bind)) {
+      console.log(`hipfire serve started in background (PID ${child.pid}, bind ${formatBind(bind)})`);
       console.log(`  log:  ${SERVE_LOG_FILE}`);
       console.log(`  stop: hipfire stop`);
     } else {
@@ -4977,7 +5059,7 @@ async function runServe(args: string[]) {
     }
     return;
   }
-  await serve(port, host);
+  await serve(bind);
 }
 
 // ─── Quantize ───────────────────────────────────────────
@@ -7404,7 +7486,7 @@ switch (cmd) {
     // unlink the stale pidfile.
     const trackedRec = readServePidRecord();
     if (trackedRec) {
-      const v = await validateServePid(trackedRec, restartPort);
+      const v = await validateServePid(trackedRec, bindFromPidRecord(trackedRec));
       if (!v.owned) {
         console.error(`[restart] not killing PID ${trackedRec.pid}: ${v.reason} — removing stale pidfile`);
         try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {}
@@ -7463,7 +7545,7 @@ switch (cmd) {
     // BUG pid-reuse: validate ownership before killing. A pidfile whose pid was
     // reused by an unrelated process must NOT be killed — unlink it instead.
     const stopRec = readServePidRecord();
-    const stopVerdict = stopRec ? await validateServePid(stopRec, stopPort) : null;
+    const stopVerdict = stopRec ? await validateServePid(stopRec, bindFromPidRecord(stopRec)) : null;
     if (stopRec && stopVerdict && stopVerdict.owned) {
       const pid = stopRec.pid;
       try {
@@ -7791,7 +7873,7 @@ Examples:
     const port = cfg.port;
     const portInUse = sh(`ss -tlnp 2>/dev/null | grep :${port}`);
     const detachedPid = readServePid();
-    const bind = formatServeBind(host, port);
+    const bind = formatBind({ kind: "tcp", host, port });
     if (detachedPid) {
       console.log(`\nserve ${bind}: ACTIVE (detached, PID ${detachedPid})`);
       console.log(`  stop: hipfire stop    |    log: tail -f ${SERVE_LOG_FILE}`);
