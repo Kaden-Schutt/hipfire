@@ -11,7 +11,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::future::BoxFuture;
 use hipfire_daemon_protocol::{
-    CollectRequest, CollectResponse, DaemonRequest, DaemonResponse, RequestControl,
+    CollectRequest, CollectResponse, DaemonRequest, DaemonResponse, KldChunkEvent, KldEvalRequest,
+    KldEvalResponse, RequestControl,
 };
 use hipfire_generate::{DoneEvent, GenerateTextRequest, ToolCall};
 use hipfire_model::{
@@ -278,6 +279,26 @@ impl DaemonEngine {
                 other => {
                     tracing::warn!("unexpected response during collect: {other:?}");
                 }
+            }
+        }
+    }
+
+    /// Send `kld_eval` (build a KLD reference and/or score the resident model
+    /// against one, with no reload) and wait for the final result. Per-chunk
+    /// `KldChunk` progress frames are passed to `on_chunk` as they stream.
+    pub async fn kld_eval(
+        &mut self,
+        req: KldEvalRequest,
+        mut on_chunk: impl FnMut(&KldChunkEvent),
+    ) -> anyhow::Result<KldEvalResponse> {
+        self.send(&DaemonRequest::KldEval(req)).await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::KldChunk(ev) => on_chunk(&ev),
+                DaemonResponse::KldEvaled(resp) => return Ok(resp),
+                DaemonResponse::Error(e) => anyhow::bail!("daemon kld_eval error: {}", e.message),
+                DaemonResponse::Unknown => {}
+                other => tracing::warn!("unexpected response during kld_eval: {other:?}"),
             }
         }
     }
