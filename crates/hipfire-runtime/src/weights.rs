@@ -14,6 +14,7 @@
 
 use crate::dispatch::gemv_family;
 use hip_bridge::HipResult;
+use rdna_compute::generic_warn::{warn_generic_once, KernelMode, Quality};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 pub struct ParoRotation {
@@ -1105,6 +1106,21 @@ pub fn weight_gemm(
         DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G128 => gpu.gemm_hfq4g128(&w.buf, x, y, w.m, w.k, batch_size),
         _ => {
+            // Generic fallback: no batched kernel for this weight dtype, so loop a
+            // per-token GEMV. Correct but slow — warn once per (dtype, mode, arch) so
+            // the missing batched-kernel coverage shows up in logs (reference layer).
+            let mode = if batch_size > 1 {
+                KernelMode::Prefill
+            } else {
+                KernelMode::Decode
+            };
+            warn_generic_once(
+                "weight_gemm",
+                &format!("{:?}", w.gpu_dtype),
+                mode,
+                &gpu.arch,
+                Quality::Reference,
+            );
             // Fallback: repeated GEMV (no batched kernel for this format)
             let x_tok = gpu.alloc_tensor(&[w.k], DType::F32)?;
             let y_tok = gpu.alloc_tensor(&[w.m], DType::F32)?;
