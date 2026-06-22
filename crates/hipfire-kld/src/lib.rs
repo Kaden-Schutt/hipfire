@@ -23,13 +23,20 @@
 //! - [`refblock`] — [`RefBlock`](refblock::RefBlock) reference-distribution
 //!   block + canonical (de)serialize.
 //! - [`hfkseq`] — per-chunk result file (`HFKSEQ`) read/write.
+//! - [`meta`]   — [`RefMeta`](meta::RefMeta) self-describing header +
+//!   [`compat`](meta::compat) guard against cross-version/config/arch scoring.
+//! - [`codec`]  — per-blob payload codecs (bit-packed ids; reserved fp16/zstd).
 
+pub mod codec;
 pub mod config;
 pub mod hfkseq;
 pub mod math;
+pub mod meta;
 pub mod refblock;
 
+pub use codec::BlobCodec;
 pub use config::KldConfig;
 pub use hfkseq::ChunkResult;
 pub use math::{log_z, score_position, top_k_log_softmax, PositionScore, TopKReduction};
+pub use meta::{compat, CompatReport, Mismatch, ProducerInfo, RefMeta, RunEnv, Severity};
 pub use refblock::RefBlock;

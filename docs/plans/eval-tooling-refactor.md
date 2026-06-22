@@ -53,10 +53,49 @@ Single source of truth for the pure scoring core:
   `FP32_GQA4_ATTN`, `DIRECT_F16KV_ATTN`, `PREFILL_MAX_BATCH`,
   `NORMALIZE_PROMPT`, …). Ref-build and score read the SAME config; they cannot
   diverge.
-- `refblock`: `KldRefBlock` struct + legacy binary (de)serialize (pure bytes;
+- `refblock`: `RefBlock` view + canonical block (de)serialize (pure bytes;
   HFQM blob slices passed in by the caller to stay model-independent).
 - `hfkseq`: per-chunk result (mean_kld/p99_kld/mean_nll) read/write
   (`HFKSEQ\0\0`, v2).
+- `meta`: `RefMeta` self-describing header + `compat()` guard (see below).
+- `codec`: per-blob payload codecs (bit-packed ids now; fp16/zstd reserved).
+
+Precision policy: **wide accumulate, narrow store.** f64 is an accumulator type
+only (the `log_z` partition sum over the full vocab, the K-term cross-entropy);
+per-position `kld`/`nll` are stored `f32` (a KLD of ~1e-3 needs ~4 sig figs, f32
+gives 7), so the high-volume arrays / per-layer divergence matrices stay in the
+cheap SIMD+bandwidth lane. f64 is retained only for the ≤~1175 per-chunk HFKSEQ
+aggregates (on-disk format compatibility).
+
+### Reference artifact format (`.kldref`)
+
+A full 0.8B/1175-chunk ref is ~2.47 GB, dominated by two equal arrays:
+`top_indices` (u32, 1.23 GB) and `top_log_probs` (f32, 1.23 GB).
+
+**Compression** (per-blob codec tag in the header):
+- `top_indices` → **bit-pack to `ceil(log2(n_vocab))` bits** (vocab 248k → 18
+  bits): deterministic ~44%, lossless. Shipped.
+- `top_log_probs` → **fp16** (~2×) is the natural win but **lossy on the
+  reference baseline**; reserved behind a measured KLD-shift tolerance, not a
+  default. (Block-fp is more complex for marginal extra gain.)
+- `zstd` wrap (lossless, ~1.5–2× on the structured blobs) reserved pending the
+  dependency decision.
+- Net: ~2.47 GB → ~1.2 GB lossless (bit-pack + zstd), ~0.7 GB with fp16 logprobs.
+
+**Self-containment**: the artifact embeds `kldref.tokens` (the *tokenized* slice
+the eval scores against) so it is functionally portable without the slice file;
+provenance is `slice_md5` + `source_model_sha256` + `producer_cmd`. Raw slice
+*text* is referenced, not embedded (optional ~3 MB zstd add for full archival).
+
+**Self-describing metadata + `compat()` guard** — the operative lesson from the
+2.85 bisection. The ref records the COMPLETE `(code, config, arch, tokenizer)` it
+was built under: `git_commit`/`git_describe`/`git_dirty` (was **null** — the gap
+that hid the cross-version comparison), the full `KldConfig`, `scoring_mode`,
+`tokenizer_sha256`, `arch_id`/`n_vocab`, and a payload `content_sha256` (integrity
++ daemon resident-cache key). On score, the consumer's `RunEnv` is diffed against
+the ref: **Error** (refuse) on arch/vocab/tokenizer mismatch; **Warn** on differing
+`git_commit`, GPU arch, or any `KldConfig` flag. This makes silently scoring a
+ref with diverged code/config unrepresentable.
 
 ### 2. Daemon `kld_eval` op
 
