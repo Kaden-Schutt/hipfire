@@ -13,18 +13,38 @@
 //!     GPU and are dequantized on-the-fly each step (`kvarn_dequant_tile` → f16)
 //!     and read by the channel-major mode of `attention_cold_slots`.
 //!
-//! The two tiers are folded by `flash_tier_merge` (online softmax). Migration
-//! (hot → cold) fires when the hot ring fills; the heavy compaction is intended
-//! to run in idle gaps between turns, but the overflow path keeps it correct
-//! during long single-turn generation too. The hot tier being raw-f32 (not 4-bit)
-//! costs `hot_budget × kv_dim × 4` B/layer — small; the storage win lives in the
-//! 4-bit cold tier that holds the bulk of a long context.
+//! The two tiers are folded by `flash_tier_merge` (online softmax). The hot tier
+//! being raw-f32 (not 4-bit) costs `hot_budget × kv_dim × 4` B/layer — small; the
+//! storage win lives in the compacted cold tier that holds the bulk of a long
+//! context. head_dim is fixed at 256 (the kernels' CHD).
 //!
-//! v1 uses `rotate=false` compaction (sidesteps the FWHT Q/K basis-cancel
-//! question); rotation is a later quality lever. head_dim is fixed at 256 (the
-//! kernels' CHD). Parity oracle: `ColdTier::two_tier_attend` + the GPU kernels
-//! validated in rdna-compute/examples/parity_{cold_slots,flash_tier_merge,
-//! flash_partials_ml,two_tier_e2e,cold_4bit_read}.
+//! Migration (hot → cold) has two paths: an overflow fallback on the critical path
+//! (`migrate_n(migrate_batch)` when the ring fills), and `idle_compact` — the
+//! deferred drain run between turns (off the latency path; see
+//! `qwen35_prefill_active_session`). Both fold a token range into ONE cold segment
+//! via `compact_cold_kv`.
+//!
+//! Cold compaction is tunable (defaults shown):
+//!   * importance (`HIPFIRE_KV_IMPORTANCE`): vnorm (best) | uniform | knorm |
+//!     kvnorm | attn — ranks which cold tokens stay exact (core) and weights the
+//!     merge average; vnorm beats the others (attn underperforms — see commit log).
+//!   * merge (`HIPFIRE_KV_FOLD_M`=4, `HIPFIRE_KV_CORE_FRAC`=0.125,
+//!     `HIPFIRE_KV_POS_LOCAL`=on): m:1 importance-weighted average of the non-core
+//!     tail, grouped by adjacent position to limit RoPE-phase blur (the dominant
+//!     merge cost). fold_m=1 = no merge (lossless, no compression).
+//!   * precision (`HIPFIRE_KV_COLD_BITS`=4): 2 halves cold-code storage at ~+1.6%
+//!     PPL — quant is cheap even at 2-bit (Sinkhorn variance-norm does the
+//!     incoherence job a rotation would, so `rotate=false` and no ConQuR needed).
+//!
+//! Window/drain knobs: `HIPFIRE_KV_HOT_BUDGET`(256), `HIPFIRE_KV_MIGRATE_BATCH`(128),
+//! `HIPFIRE_KV_IDLE_KEEP`(0 = full between-turns drain).
+//!
+//! Constraint: this is an inherently per-token-attention feature (it lives in
+//! `kv_cache_attention_dispatch`); the batched session-batch prefill bypasses that
+//! and is guarded against hier. Parity oracle: `ColdTier::two_tier_attend` + the
+//! GPU kernels validated in rdna-compute/examples/parity_{attention_cold_slots,
+//! flash_tier_merge,flash_partials_ml,two_tier_e2e,cold_4bit_read} and
+//! hipfire-runtime/examples/parity_kv_hier.
 
 use hipfire_kvquant::kv_compact::compact_cold_kv;
 use hipfire_kvquant::kvarn::{kvarn_record_bytes_bits, pack_kvarn_tile_bits};
@@ -345,11 +365,8 @@ impl HierKvState {
                     rem * 4,
                 )?;
             }
-            // Zero everything from `rem` on (host fill then re-upload would alloc;
-            // re-zero the whole buffer and the live prefix is restored by the shift
-            // above — but that order is wrong, so zero only the tail via fill of a
-            // sub-view). fill_f32 zeroes the whole tensor, so instead zero-fill the
-            // tail through a sub_offset view.
+            // Zero the vacated tail [rem, hot_budget) so reused slots start at 0
+            // (the shift above already moved the surviving prefix down).
             let tail = hb - rem;
             if tail > 0 {
                 let tail_view = self.attn_mass[layer].sub_offset(rem, tail);

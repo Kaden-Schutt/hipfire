@@ -1640,6 +1640,69 @@ pub const ENV_HIPFIRE_KV_PHYSICAL_CAP: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-serving-core/src/load.rs:404",
 };
 
+/// `HIPFIRE_KV_HIERARCHICAL` — deferred-hierarchical two-tier KV (KVarN only).
+pub const ENV_HIPFIRE_KV_HIERARCHICAL: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_KV_HIERARCHICAL",
+    description: "1 = enable deferred-hierarchical two-tier KV (hot ring + compacted 4-bit cold tier); default off. KVarN + per-token prefill only.",
+    source: "crates/hipfire-runtime/src/kv_hier.rs",
+};
+
+/// `HIPFIRE_KV_HOT_BUDGET` — recent-token window kept exact (f32) in the hot ring.
+pub const ENV_HIPFIRE_KV_HOT_BUDGET: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_KV_HOT_BUDGET",
+    description: "Hierarchical KV: number of most-recent tokens kept exact in the hot ring (default 256).",
+    source: "crates/hipfire-runtime/src/kv_hier.rs",
+};
+
+/// `HIPFIRE_KV_MIGRATE_BATCH` — hot→cold eviction batch on the overflow fallback.
+pub const ENV_HIPFIRE_KV_MIGRATE_BATCH: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_KV_MIGRATE_BATCH",
+    description: "Hierarchical KV: tokens evicted per overflow migration (default 128, capped at hot_budget/2).",
+    source: "crates/hipfire-runtime/src/kv_hier.rs",
+};
+
+/// `HIPFIRE_KV_FOLD_M` — cold-tier m:1 merge factor (1 = no merge).
+pub const ENV_HIPFIRE_KV_FOLD_M: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_KV_FOLD_M",
+    description: "Hierarchical KV: cold-tier importance-weighted merge factor m:1 (default 4; 1 = no merge, no compression).",
+    source: "crates/hipfire-runtime/src/kv_hier.rs",
+};
+
+/// `HIPFIRE_KV_CORE_FRAC` — fraction of cold tokens kept exact (singleton slots).
+pub const ENV_HIPFIRE_KV_CORE_FRAC: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_KV_CORE_FRAC",
+    description: "Hierarchical KV: top fraction of cold tokens (by importance) kept exact, not merged (default 0.125).",
+    source: "crates/hipfire-runtime/src/kv_hier.rs",
+};
+
+/// `HIPFIRE_KV_IMPORTANCE` — cold-tier importance signal for core/merge.
+pub const ENV_HIPFIRE_KV_IMPORTANCE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_KV_IMPORTANCE",
+    description: "Hierarchical KV cold importance: uniform | vnorm (default, best) | knorm | kvnorm | attn (accumulated attention mass).",
+    source: "crates/hipfire-runtime/src/kv_hier.rs",
+};
+
+/// `HIPFIRE_KV_POS_LOCAL` — position-local cold merge grouping.
+pub const ENV_HIPFIRE_KV_POS_LOCAL: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_KV_POS_LOCAL",
+    description: "Hierarchical KV: 0 disables position-local cold merge grouping (default on; groups merged tokens by adjacent position to limit RoPE-phase blur).",
+    source: "crates/hipfire-runtime/src/kv_hier.rs",
+};
+
+/// `HIPFIRE_KV_COLD_BITS` — cold-tile quant precision (4 or 2).
+pub const ENV_HIPFIRE_KV_COLD_BITS: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_KV_COLD_BITS",
+    description: "Hierarchical KV: bits per cold-tile quant code, 4 (default) or 2 (2x storage cut, +1.6% PPL).",
+    source: "crates/hipfire-runtime/src/kv_hier.rs",
+};
+
+/// `HIPFIRE_KV_IDLE_KEEP` — recent tokens retained by the between-turns idle drain.
+pub const ENV_HIPFIRE_KV_IDLE_KEEP: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_KV_IDLE_KEEP",
+    description: "Hierarchical KV: tokens kept hot when idle_compact drains the ring between turns (default 0 = full drain to cold).",
+    source: "crates/hipfire-serving-core/src/qwen35_prefill.rs",
+};
+
 /// `HIPFIRE_LFM2_CAPTURE_POSTMIXER` — Runtime variable controlling lfm2 capture postmixer in hipfire
 pub const ENV_HIPFIRE_LFM2_CAPTURE_POSTMIXER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LFM2_CAPTURE_POSTMIXER",
@@ -3539,6 +3602,15 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_KVARN_SIM,
     ENV_HIPFIRE_KV_MODE,
     ENV_HIPFIRE_KV_PHYSICAL_CAP,
+    ENV_HIPFIRE_KV_HIERARCHICAL,
+    ENV_HIPFIRE_KV_HOT_BUDGET,
+    ENV_HIPFIRE_KV_MIGRATE_BATCH,
+    ENV_HIPFIRE_KV_FOLD_M,
+    ENV_HIPFIRE_KV_CORE_FRAC,
+    ENV_HIPFIRE_KV_IMPORTANCE,
+    ENV_HIPFIRE_KV_POS_LOCAL,
+    ENV_HIPFIRE_KV_COLD_BITS,
+    ENV_HIPFIRE_KV_IDLE_KEEP,
     ENV_HIPFIRE_LFM2_CAPTURE_POSTMIXER,
     ENV_HIPFIRE_LFM2_EXPERT_MQ6,
     ENV_HIPFIRE_LFM2_GRAPH,
