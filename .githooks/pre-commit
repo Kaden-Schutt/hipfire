@@ -187,6 +187,30 @@ if echo "$CHANGED" | grep -qE "$SERVE_HOTSPOT"; then
         exit 1
     fi
     echo
+
+    # qwen2 (arch_id=7) per-request reset regression (#462 bundle class).
+    # serve-loop-gate above is qwen3.5/DeltaNet-only; this exercises the plain
+    # qwen2 reset path that the Qwen2Carrier bundle migration broke — the reset
+    # handler rewound the dead `m.qwen2_state` field, not the live ModelState::
+    # Qwen2 bundle state, so next_pos bled across requests. Only a real reset
+    # no-op (exit 1) blocks; SKIP (3, no qwen2 model) / infra (2) warn-only.
+    if [ -r ./scripts/qwen2-reset-gate.sh ]; then
+        echo "=== qwen2 per-request reset gate ==="
+        bash ./scripts/qwen2-reset-gate.sh; q2rc=$?
+        if [ "$q2rc" -eq 1 ]; then
+            echo
+            echo "========================================================================"
+            echo "COMMIT BLOCKED: qwen2 per-request reset no-op — next_pos bled across requests."
+            echo "========================================================================"
+            echo
+            echo "The daemon reset handler must rewind the live ModelState::Qwen2 bundle"
+            echo "state via m.qwen2_mut(), not just the dots-ocr-only m.qwen2_state field."
+            echo "  ./scripts/qwen2-reset-gate.sh   # re-run"
+            echo
+            exit 1
+        fi
+        echo
+    fi
 fi
 
 echo

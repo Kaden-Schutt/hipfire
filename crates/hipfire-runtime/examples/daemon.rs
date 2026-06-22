@@ -2155,6 +2155,12 @@ fn main() {
                         if let Some(ref mut s) = m.qwen2_state {
                             s.reset();
                         }
+                        // Live plain-qwen2 state is in the ModelState::Qwen2
+                        // bundle, not the (dots-ocr-only) qwen2_state field —
+                        // rewind it too for defense-in-depth.
+                        if let Some(b) = m.qwen2_mut() {
+                            b.state.reset();
+                        }
                         if let Some(ref mut s) = m.deepseek4_state {
                             s.reset();
                         }
@@ -2338,13 +2344,20 @@ fn main() {
                     if let Some(ModelState::Llama(b)) = m.state.as_mut() {
                         b.kv.compact_offset = 0;
                     }
-                    // arch_id=7: rewind the Qwen2State position cursor so
-                    // the next prefill writes from KV[0]. Without this, a
-                    // reset between turns would leak the prior turn's KV
-                    // entries into attention for the new turn — fluent
-                    // garbage, no panic. See `Qwen2State::reset` doc.
+                    // arch_id=7: rewind the live Qwen2State position cursor so
+                    // the next prefill writes from KV[0]. Without this, a reset
+                    // between turns leaks the prior turn's KV into attention —
+                    // fluent garbage, no panic. The live state lives in the
+                    // ModelState::Qwen2 bundle (built by Qwen2Carrier); the
+                    // `qwen2_state` direct field is None for plain qwen2 and is
+                    // only populated by dots-ocr (arch_id=8). Rewind BOTH so the
+                    // reset is not a silent no-op. See `Qwen2State::reset` and
+                    // scripts/qwen2-reset-gate.sh.
                     if let Some(ref mut s) = m.qwen2_state {
                         s.reset();
+                    }
+                    if let Some(b) = m.qwen2_mut() {
+                        b.state.reset();
                     }
                     // arch_id=9: same rationale for DeepSeek V4. Prior to
                     // 2026-05-24 the V4F state was NEVER reset, so
@@ -2562,9 +2575,14 @@ fn main() {
                 reset_qwen35_recurrent(m, &mut gpu);
                 // Qwen2 (arch_id=7) doesn't have a separate KV buffer — the cache
                 // and the per-step scratch share `Qwen2State`. Reset its position
-                // cursor here so bench_prefill measures cold prefill.
+                // cursor here so bench_prefill measures cold prefill. The live
+                // state is in the ModelState::Qwen2 bundle; `qwen2_state` is only
+                // dots-ocr's — rewind both, else this measures warm prefill.
                 if let Some(ref mut s) = m.qwen2_state {
                     s.reset();
+                }
+                if let Some(b) = m.qwen2_mut() {
+                    b.state.reset();
                 }
                 if let Some(b) = m.cohere2moe_mut() {
                     let _ = b.state.reset(&mut gpu);

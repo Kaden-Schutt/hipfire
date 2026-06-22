@@ -412,6 +412,18 @@ impl LoadedModel {
         }
     }
 
+    /// Qwen2 bundle if this model is arch_id=7 (plain qwen2 via `Qwen2Carrier`),
+    /// else None. The live `Qwen2State` is at `.state`. NOTE: this is NOT the
+    /// `qwen2_state` direct field — that is None for plain qwen2 and is only
+    /// populated by dots-ocr (arch_id=8). Reset/checkpoint sites must rewind
+    /// BOTH or the reset silently no-ops (see scripts/qwen2-reset-gate.sh).
+    pub fn qwen2_mut(&mut self) -> Option<&mut hipfire_arch_qwen2::Qwen2Bundle> {
+        match &mut self.state {
+            Some(ModelState::Qwen2(b)) => Some(b),
+            _ => None,
+        }
+    }
+
     /// Cohere2-MoE bundle if this model is arch_id=12, else None.
     pub fn cohere2moe(&self) -> Option<&Cohere2MoeBundle> {
         match &self.state {
