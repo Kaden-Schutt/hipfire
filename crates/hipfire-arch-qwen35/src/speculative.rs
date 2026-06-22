@@ -16,6 +16,8 @@
 //! on different models sharing the same MQ scratch (which we won't, since
 //! speculative decode serializes draft-generate then target-verify).
 
+use crate::mtp_compose::{MtpArTreeState, build_mtp_tree_ar};
+use crate::mtp_head::Qwen35MtpHead;
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hip_bridge::{DeviceBuffer, HipResult, Stream};
 use hipfire_dispatch::families::kv_tier::KTier;
@@ -4740,6 +4742,8 @@ pub fn spec_step_ddtree_batched(
     ctx_slice: Option<usize>,
     tree_budget: usize,
     tree_topk: usize,
+    mtp_ar_head: Option<&Qwen35MtpHead>,
+    mut mtp_ar_state: Option<&mut MtpArTreeState>,
 ) -> HipResult<SpecStepResult> {
     let b = draft_cfg.block_size;
     let vocab = target.config.vocab_size;
@@ -4768,42 +4772,63 @@ pub fn spec_step_ddtree_batched(
     let debug_tm = std::env::var("DDTREE_TIMING").is_ok();
     let t_all = std::time::Instant::now();
 
-    // ── 1+2. GPU-resident draft + per-row top-K + log-sum-exp ────────────
-    // Keeps logits on device; returns only (b-1) × k indices + log-probs
-    // to the host. Replaces the prior 15 MB D2H + CPU sort pair (~34 ms)
-    // with an on-device top-K (~µs) plus a ~480 byte D2H.
-    let (top_tokens, top_log_probs) = run_dflash_draft_for_topk_gpu(
-        gpu,
-        target,
-        draft_weights,
-        draft_cfg,
-        draft_scratch,
-        target_hidden_host,
-        position,
-        seed_token,
-        ctx_slice,
-        b,
-        tree_topk,
-    )?;
-
-    let t_draft = t_all.elapsed();
-    let t_topk = t_draft; // fused with draft now
-
-    // ── 3. Build the DDTree ───────────────────────────────────────────────
-    // HIPFIRE_DDTREE_LOGW_CUTOFF=<f32> enables the meta-verifier pruner: stop
-    // heap expansion when the next candidate's cumulative log-probability
-    // drops below -cutoff. Per-cycle dynamic budget. Disabled (= 0.0 or
-    // unset) preserves the fixed-budget behaviour.
-    let tree = hipfire_runtime::ddtree::build_ddtree_tree_with_cutoff(
-        &top_tokens,
-        &top_log_probs,
-        b - 1,
-        tree_topk,
-        tree_budget,
-        ddtree_logw_cutoff(),
-    );
+    // ── 1+2+3. Build speculation tree (MTP-AR or DFlash) ────────────────
+    // HIPFIRE_MTP_AR_TREE=1: use MTP head alone (no DFlash drafter).
+    // Default: GPU-resident DFlash draft + top-K + DDTree build.
+    let use_mtp_ar = std::env::var("HIPFIRE_MTP_AR_TREE").ok().as_deref() == Some("1");
+    let tree = if use_mtp_ar {
+        if let (Some(head), Some(ar_state)) = (mtp_ar_head, mtp_ar_state.as_deref_mut()) {
+            // Clone the prev_hidden_scratch shape so we can pass a sub-offset view.
+            let ph_numel = ar_state.prev_hidden_scratch.shape[0];
+            let ph_view = ar_state.prev_hidden_scratch.sub_offset(0, ph_numel);
+            build_mtp_tree_ar(
+                gpu,
+                head,
+                ar_state,
+                &target.weights,
+                &ph_view,
+                seed_token,
+                position,
+                tree_budget,
+                tree_topk.min(8),
+            )?
+        } else {
+            eprintln!("[mtp-ar] HIPFIRE_MTP_AR_TREE=1 but mtp_ar_state/head not provided; falling back to DFlash");
+            let (top_tokens, top_log_probs) = run_dflash_draft_for_topk_gpu(
+                gpu, target, draft_weights, draft_cfg, draft_scratch,
+                target_hidden_host, position, seed_token, ctx_slice, b, tree_topk,
+            )?;
+            hipfire_runtime::ddtree::build_ddtree_tree_with_cutoff(
+                &top_tokens, &top_log_probs, b - 1, tree_topk, tree_budget, ddtree_logw_cutoff(),
+            )
+        }
+    } else {
+        let (top_tokens, top_log_probs) = run_dflash_draft_for_topk_gpu(
+            gpu,
+            target,
+            draft_weights,
+            draft_cfg,
+            draft_scratch,
+            target_hidden_host,
+            position,
+            seed_token,
+            ctx_slice,
+            b,
+            tree_topk,
+        )?;
+        hipfire_runtime::ddtree::build_ddtree_tree_with_cutoff(
+            &top_tokens,
+            &top_log_probs,
+            b - 1,
+            tree_topk,
+            tree_budget,
+            ddtree_logw_cutoff(),
+        )
+    };
     record_ddtree_meta_nodes(tree.num_nodes());
 
+    let t_draft = t_all.elapsed();
+    let t_topk = t_draft;
     let t_build = t_all.elapsed();
 
     // Empty-tree shortcut (identical to spec_step_ddtree's path).
@@ -5315,6 +5340,51 @@ pub fn spec_step_ddtree_batched(
             total.as_secs_f64() * 1000.0,
             big_n, accept_len,
         );
+    }
+
+    // ── 12. Capture root prev_hidden for next MTP-AR cycle ──────────────
+    // We need the trunk's post-output-norm hidden at position+accept_len
+    // (i.e., the hidden that the bonus token's prediction came from).
+    //
+    // This hidden is ALREADY computed and in verify_scratch.final_hidden:
+    //   - bonus's linearization slot = accepted_node_indices[accept_len-1]+1
+    //     (if accept_len > 0), or 0 (if accept_len == 0).
+    //   - For the slow path re-verify: final_hidden[accept_len*dim]  (last
+    //     committed token = position+accept_len).
+    //   - We unify: use accept_len (== 0: slot 0; else: last accepted slot).
+    //
+    // NOTE: For the slow path, step 10 re-ran verify_dflash_block over
+    // committed[..accept_len+1], so final_hidden[accept_len] is the correct
+    // hidden at position+accept_len. For the fast path, final_hidden comes
+    // from the tree verify and has the correct slot for accepted_node_indices.
+    // Both cases: the relevant row is at index `bonus_src_row` defined below.
+    //
+    // No extra forward needed — no DN-state advancement side-effect.
+    let _ = mtp_ar_head; // suppress unused warning
+    if use_mtp_ar {
+        if let Some(ar_state) = mtp_ar_state {
+            let dim = target.config.dim;
+            // bonus_src_row: linearization slot whose hidden == trunk's hidden
+            // at position+accept_len (the position MTP predicts FROM).
+            let bonus_src_row = if accept_len == 0 {
+                0
+            } else if fast_tape_ok {
+                // Fast path: tree verify final_hidden; slot = node_index + 1.
+                accepted_node_indices[accept_len - 1] + 1
+            } else {
+                // Slow path: re-verify of committed[..accept_len+1] in order;
+                // last row = accept_len.
+                accept_len
+            };
+            let byte_off = bonus_src_row * dim * 4;
+            gpu.hip.memcpy_dtod_at(
+                &ar_state.prev_hidden_scratch.buf,
+                0,
+                &verify_scratch.final_hidden.buf,
+                byte_off,
+                dim * 4,
+            )?;
+        }
     }
 
     Ok(SpecStepResult {
