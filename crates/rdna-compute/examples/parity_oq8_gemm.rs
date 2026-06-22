@@ -140,7 +140,74 @@ fn main() {
         if act_pass { "PASS" } else { "FAIL" }
     );
 
-    if !pass || !act_pass {
+    // QUALITY vs full precision: run the REAL W8A8 GPU path (int8-quantize both
+    // operands, grouped-iu8 GEMM) and compare to the TRUE f32 matmul. This is the
+    // near-lossless question — measured against f32, not a lower-bit quant. (No
+    // FWHT here, so this is a conservative floor; the rotation only tightens int8
+    // quant. The definitive model-level number is rung 3: KLD vs bf16.)
+    let mut s2 = 99u32;
+    let mut rndf = |scale: f32| {
+        s2 = s2.wrapping_mul(1_103_515_245).wrapping_add(12345) & 0x7fff_ffff;
+        ((s2 as f32 / 2_147_483_648.0) - 0.5) * scale
+    };
+    let wf: Vec<f32> = (0..m * k).map(|_| rndf(2.0)).collect();
+    let xf2: Vec<f32> = (0..b * k).map(|_| rndf(2.0)).collect();
+    // True f32 matmul reference (the bf16/f32 baseline).
+    let mut y_true = vec![0.0f32; b * m];
+    for bb in 0..b {
+        for mm in 0..m {
+            let mut acc = 0.0f32;
+            for kk in 0..k {
+                acc += xf2[bb * k + kk] * wf[mm * k + kk];
+            }
+            y_true[bb * m + mm] = acc;
+        }
+    }
+    // Weight quant: per-group symmetric int8 (absmax/127), the codec's RTN path.
+    let mut qwf = vec![0u8; m * k];
+    let mut swf = vec![0.0f32; m * ng];
+    for mm in 0..m {
+        for g in 0..ng {
+            let mut amax = 0.0f32;
+            for kk in 0..group {
+                amax = amax.max(wf[mm * k + g * group + kk].abs());
+            }
+            let sc = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+            swf[mm * ng + g] = sc;
+            let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+            for kk in 0..group {
+                let idx = mm * k + g * group + kk;
+                qwf[idx] = ((wf[idx] * inv).round().clamp(-127.0, 127.0) as i8) as u8;
+            }
+        }
+    }
+    let mut wq_combined = qwf.clone();
+    wq_combined.extend_from_slice(&f32_bytes(&swf));
+    let wqd = gpu.upload_raw(&wq_combined, &[wq_combined.len()]).unwrap();
+    let wqs = wqd.sub_offset(m * k, m * ng * 4);
+    // Activation quant via the real GPU kernel.
+    let xf2d = gpu.upload_f32(&xf2, &[b, k]).unwrap();
+    let xq2 = gpu.upload_raw(&vec![0u8; b * k], &[b, k]).unwrap();
+    let xs2 = gpu.upload_raw(&vec![0u8; b * ng * 4], &[b, ng]).unwrap();
+    gpu.quantize_act_oq8(&xf2d, &xq2, &xs2, b, k, group).unwrap();
+    let yq = gpu.upload_raw(&vec![0u8; b * m * 4], &[b, m]).unwrap();
+    gpu.gemm_oq8_grouped_wmma(&wqd, &wqs, &xq2, &xs2, &yq, m, k, b, group)
+        .unwrap();
+    gpu.device_synchronize().unwrap();
+    let y_q = gpu.download_f32(&yq).unwrap();
+    let (mut qsig, mut qnoise) = (0.0f64, 0.0f64);
+    for (&t, &q) in y_true.iter().zip(&y_q) {
+        qsig += (t as f64).powi(2);
+        qnoise += ((t - q) as f64).powi(2);
+    }
+    let gemm_sqnr = 10.0 * (qsig / qnoise.max(1e-30)).log10();
+    let gemm_pass = gemm_sqnr > 35.0;
+    println!(
+        "W8A8 GEMM vs f32 matmul (real kernels, no FWHT floor): SQNR={gemm_sqnr:.2} dB -> {}",
+        if gemm_pass { "PASS" } else { "FAIL" }
+    );
+
+    if !pass || !act_pass || !gemm_pass {
         std::process::exit(1);
     }
 }
