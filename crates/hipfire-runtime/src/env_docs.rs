@@ -1717,6 +1717,13 @@ pub const ENV_HIPFIRE_KV_IDLE_KEEP: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-serving-core/src/qwen35_prefill.rs",
 };
 
+/// `HIPFIRE_WARN_GENERIC` — warn on reference (generic) kernel fallback.
+pub const ENV_HIPFIRE_WARN_GENERIC: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_WARN_GENERIC",
+    description: "Reference kernel layer: 1 (default) warns once per (op,precision,mode,arch) when a generic/reference kernel runs for lack of an optimized overlay; 0 silences.",
+    source: "crates/rdna-compute/src/generic_warn.rs",
+};
+
 /// `HIPFIRE_LFM2_CAPTURE_POSTMIXER` — Runtime variable controlling lfm2 capture postmixer in hipfire
 pub const ENV_HIPFIRE_LFM2_CAPTURE_POSTMIXER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LFM2_CAPTURE_POSTMIXER",
@@ -3634,6 +3641,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_KV_POS_LOCAL,
     ENV_HIPFIRE_KV_COLD_BITS,
     ENV_HIPFIRE_KV_IDLE_KEEP,
+    ENV_HIPFIRE_WARN_GENERIC,
     ENV_HIPFIRE_LFM2_CAPTURE_POSTMIXER,
     ENV_HIPFIRE_LFM2_EXPERT_MQ6,
     ENV_HIPFIRE_LFM2_GRAPH,

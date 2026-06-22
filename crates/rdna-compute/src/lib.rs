@@ -8,6 +8,7 @@ pub mod arch_caps;
 mod compiler;
 mod dispatch;
 pub mod feature_flags;
+pub mod generic_warn;
 mod kernels;
 pub mod pool;
 pub mod profile;
