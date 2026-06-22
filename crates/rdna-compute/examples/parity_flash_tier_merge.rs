@@ -66,7 +66,7 @@ fn main() {
         let od = gpu.alloc_tensor(&[nh * d], DType::F32).unwrap();
         let md = gpu.alloc_tensor(&[nh], DType::F32).unwrap();
         let ld = gpu.alloc_tensor(&[nh], DType::F32).unwrap();
-        gpu.attention_cold_slots(&qd, &kd, &vd, &od, &md, &ld, nh, nkv, ns, scale, 0, 0).unwrap();
+        gpu.attention_cold_slots(&qd, &kd, &vd, &od, &md, &ld, nh, nkv, ns, scale, 0, 0, None).unwrap();
         (od, md, ld)
     };
 

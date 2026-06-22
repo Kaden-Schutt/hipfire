@@ -38,7 +38,13 @@ extern "C" __global__ void attention_cold_slots(
     // with this stride (= the padded tile width n_slots_padded), so an odd valid
     // count can read an even-padded KVarN tile without the pad slot polluting the
     // softmax. Pass 0 to default to n_slots (dense, no padding).
-    int slot_stride
+    int slot_stride,
+    // Optional per-slot attention-mass accumulator [n_slots] (or null). When set,
+    // a second pass adds this query's normalized attention weight to MASS_OUT[s]
+    // (atomic, summed over q-heads). The hot tier accumulates this across decode
+    // steps → a real CASK-style per-token importance for cold compaction. Reading
+    // it costs one extra K pass; pass null on the cold read (no accumulation).
+    float* __restrict__ MASS_OUT
 ) {
     const int sstride = (slot_stride > 0) ? slot_stride : n_slots;
     const int hq = blockIdx.x;
@@ -104,5 +110,24 @@ extern "C" __global__ void attention_cold_slots(
     if (lane == 0) {
         if (M_OUT) M_OUT[hq] = m;
         if (L_OUT) L_OUT[hq] = l;
+    }
+
+    // Optional attention-mass accumulation: second pass recomputes each slot's
+    // logit and adds its normalized weight exp(d_s - m)/l to MASS_OUT[s] (atomic,
+    // so all q-heads sum into the same per-token mass). Only the hot tier passes
+    // MASS_OUT; slot-major f32 only (the hot ring is f32).
+    if (MASS_OUT) {
+        for (int s = 0; s < n_slots; ++s) {
+            const float* k = K + slot_base + (long long)s * CHD;
+            float d = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < CPL; ++i) d += q[i] * k[i];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) d += __shfl_xor(d, off);
+            d *= scale;
+            if (lane == 0) {
+                atomicAdd(&MASS_OUT[s], __expf(d - m) * inv);
+            }
+        }
     }
 }

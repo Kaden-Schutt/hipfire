@@ -26470,7 +26470,7 @@ fn kv_cache_attention_dispatch(
             // In serve this fires only at session start; mid-session/decode never
             // hits pos==0, so continued context is preserved.
             if pos == 0 && layer_idx == 0 {
-                h.reset();
+                h.reset(gpu)?;
             }
             h.append_token(gpu, layer_idx, &s.fa_k, &s.fa_v)?;
             return h.two_tier_read(gpu, layer_idx, &s.fa_q, &s.fa_attn_out);

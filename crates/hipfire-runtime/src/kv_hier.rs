@@ -39,6 +39,9 @@ pub enum ImportanceMode {
     VNorm,
     KNorm,
     KvNorm,
+    /// Real accumulated attention mass (CASK): Σ over q-heads & decode steps of the
+    /// normalized attention weight each token received while in the hot window.
+    Attn,
 }
 
 impl ImportanceMode {
@@ -47,6 +50,7 @@ impl ImportanceMode {
             "uniform" => ImportanceMode::Uniform,
             "knorm" => ImportanceMode::KNorm,
             "kvnorm" => ImportanceMode::KvNorm,
+            "attn" => ImportanceMode::Attn,
             _ => ImportanceMode::VNorm, // default
         }
     }
@@ -92,6 +96,10 @@ pub struct HierKvState {
     pub n_kv_heads: usize,
     pub hot_k: Vec<GpuTensor>, // [n_layers] slot-major [nkv × hot_budget × HD] f32
     pub hot_v: Vec<GpuTensor>,
+    /// Per-layer per-hot-slot accumulated attention mass [hot_budget] f32 (CASK
+    /// importance). Filled by the hot read's mass pass; only used when
+    /// importance_mode == Attn. Zeroed at reset, shifted on migrate.
+    pub attn_mass: Vec<GpuTensor>,
     pub hot_count: Vec<usize>, // live hot tokens per layer
     pub migrated: Vec<usize>,  // tokens already moved to cold per layer
     pub cold: Vec<Vec<ColdSegmentGpu>>, // [n_layers][segments]
@@ -138,10 +146,12 @@ impl HierKvState {
         let position_local = std::env::var("HIPFIRE_KV_POS_LOCAL").ok().as_deref() != Some("0");
         let mut hot_k = Vec::with_capacity(n_layers);
         let mut hot_v = Vec::with_capacity(n_layers);
+        let mut attn_mass = Vec::with_capacity(n_layers);
         if enabled {
             for _ in 0..n_layers {
                 hot_k.push(gpu.zeros(&[n_kv_heads * hot_budget * HD], DType::F32)?);
                 hot_v.push(gpu.zeros(&[n_kv_heads * hot_budget * HD], DType::F32)?);
+                attn_mass.push(gpu.zeros(&[hot_budget], DType::F32)?);
             }
         }
         Ok(Self {
@@ -156,6 +166,7 @@ impl HierKvState {
             n_kv_heads,
             hot_k,
             hot_v,
+            attn_mass,
             hot_count: vec![0; n_layers],
             migrated: vec![0; n_layers],
             cold: (0..n_layers).map(|_| Vec::new()).collect(),
@@ -168,10 +179,11 @@ impl HierKvState {
     }
 
     /// Reset all per-layer tier state for a new sequence (pos==0). Hot ring buffers
-    /// are kept (overwritten by `append_token`); cold segments are dropped. Call
-    /// once at sequence start. NB: dropped segment GpuTensors are not pool-returned
-    /// — a minor VRAM churn at the rare session boundary, not per-token.
-    pub fn reset(&mut self) {
+    /// are kept (overwritten by `append_token`); cold segments are dropped; the
+    /// attention-mass accumulators are zeroed. Call once at sequence start. NB:
+    /// dropped segment GpuTensors are not pool-returned — a minor VRAM churn at the
+    /// rare session boundary, not per-token.
+    pub fn reset(&mut self, gpu: &mut Gpu) -> HipResult<()> {
         for c in self.hot_count.iter_mut() {
             *c = 0;
         }
@@ -181,6 +193,12 @@ impl HierKvState {
         for segs in self.cold.iter_mut() {
             segs.clear();
         }
+        if self.importance_mode == ImportanceMode::Attn {
+            for mass in self.attn_mass.iter() {
+                gpu.fill_f32(mass, 0.0)?;
+            }
+        }
+        Ok(())
     }
 
     /// Append one token's K/V (`fa_k`/`fa_v` = [kv_dim] head-major) into the hot
@@ -235,7 +253,13 @@ impl HierKvState {
         }
         // Per-token importance for core selection + merge weighting. Norm proxies
         // pull the merged K toward the dominant token's RoPE phase (less blur) and
-        // keep high-norm tokens exact; uniform = the old average merge.
+        // keep high-norm tokens exact; Attn = real accumulated attention mass
+        // (CASK); uniform = the old average merge.
+        let mass = if self.importance_mode == ImportanceMode::Attn {
+            gpu.download_f32(&self.attn_mass[layer])?
+        } else {
+            Vec::new()
+        };
         let importance: Vec<f32> = (0..mb)
             .map(|t| {
                 let base = t * kv_dim;
@@ -246,6 +270,8 @@ impl HierKvState {
                     ImportanceMode::VNorm => vn(),
                     ImportanceMode::KNorm => kn(),
                     ImportanceMode::KvNorm => kn() * vn(),
+                    // Small floor so an unattended token still sorts/weights sanely.
+                    ImportanceMode::Attn => mass[t] + 1e-6,
                 }
             })
             .collect();
@@ -280,6 +306,29 @@ impl HierKvState {
                 let src = ((kv * hb + mb) * HD) * 4;
                 gpu.memcpy_dtod_at_auto(&self.hot_k[layer].buf, dst, &self.hot_k[layer].buf, src, rem * HD * 4)?;
                 gpu.memcpy_dtod_at_auto(&self.hot_v[layer].buf, dst, &self.hot_v[layer].buf, src, rem * HD * 4)?;
+            }
+        }
+        // Mirror the shift for the attention-mass ring (slot s holds token s's mass),
+        // then zero the vacated tail [rem, hot_budget) so reused slots start at 0.
+        if self.importance_mode == ImportanceMode::Attn {
+            if rem > 0 {
+                gpu.memcpy_dtod_at_auto(
+                    &self.attn_mass[layer].buf,
+                    0,
+                    &self.attn_mass[layer].buf,
+                    mb * 4,
+                    rem * 4,
+                )?;
+            }
+            // Zero everything from `rem` on (host fill then re-upload would alloc;
+            // re-zero the whole buffer and the live prefix is restored by the shift
+            // above — but that order is wrong, so zero only the tail via fill of a
+            // sub-view). fill_f32 zeroes the whole tensor, so instead zero-fill the
+            // tail through a sub_offset view.
+            let tail = hb - rem;
+            if tail > 0 {
+                let tail_view = self.attn_mass[layer].sub_offset(rem, tail);
+                gpu.fill_f32(&tail_view, 0.0)?;
             }
         }
         self.hot_count[layer] = rem;
@@ -329,7 +378,13 @@ impl HierKvState {
         let scr = self.scr.take().unwrap();
 
         // Hot tier → accumulator (out/acc_m/acc_l). Slot-major f32, stride =
-        // hot_budget so the live count reads from a fixed-width ring.
+        // hot_budget so the live count reads from a fixed-width ring. When using
+        // attention-mass importance, accumulate this query's per-token weight.
+        let mass = if self.importance_mode == ImportanceMode::Attn {
+            Some(&self.attn_mass[layer])
+        } else {
+            None
+        };
         gpu.attention_cold_slots(
             q,
             &self.hot_k[layer],
@@ -343,6 +398,7 @@ impl HierKvState {
             scale,
             0,
             self.hot_budget,
+            mass,
         )?;
 
         // Fold each cold segment: dequant 4-bit → f16, channel-major attend, merge.
@@ -362,6 +418,7 @@ impl HierKvState {
                 scale,
                 1,
                 seg.n_slots,
+                None, // cold tier: no mass accumulation
             )?;
             // Merge cold segment into the accumulator (in place — safe, see kernel).
             gpu.flash_tier_merge(

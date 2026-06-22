@@ -100,7 +100,7 @@ fn main() {
     let od = gpu.alloc_tensor(&[NH * HD], DType::F32).unwrap();
     let md = gpu.alloc_tensor(&[NH], DType::F32).unwrap();
     let ld = gpu.alloc_tensor(&[NH], DType::F32).unwrap();
-    gpu.attention_cold_slots(&qd, &kdq, &vdq, &od, &md, &ld, NH, NKV, nvc, scale, 1, ns).unwrap();
+    gpu.attention_cold_slots(&qd, &kdq, &vdq, &od, &md, &ld, NH, NKV, nvc, scale, 1, ns, None).unwrap();
 
     gpu.device_synchronize().unwrap();
     let got = gpu.download_f32(&od).unwrap();

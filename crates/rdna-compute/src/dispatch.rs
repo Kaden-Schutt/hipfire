@@ -45731,6 +45731,8 @@ impl Gpu {
         // Per-kv-head slot row stride (the padded tile width); attend the first
         // `n_slots` slots. Pass 0 to default to n_slots (dense, no padding).
         slot_stride: usize,
+        // Optional per-slot attention-mass accumulator [n_slots] (CASK importance).
+        mass_out: Option<&GpuTensor>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -45744,6 +45746,10 @@ impl Gpu {
         let op = out.buf.as_ptr();
         let mop = m_out.buf.as_ptr();
         let lop = l_out.buf.as_ptr();
+        let massp: *mut std::ffi::c_void = match mass_out {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
         let mut nh = n_heads as i32;
         let mut nkv = n_kv_heads as i32;
         let mut ns = n_slots as i32;
@@ -45763,6 +45769,7 @@ impl Gpu {
             &mut sc as *mut _ as *mut c_void,
             &mut kl as *mut _ as *mut c_void,
             &mut sstride as *mut _ as *mut c_void,
+            &massp as *const _ as *mut c_void,
         ];
         let func = &self.functions["attention_cold_slots"];
         unsafe {
