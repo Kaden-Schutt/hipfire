@@ -50,6 +50,12 @@ enum Command {
     /// `cargo run -p hipfire-cli -- gen-env-docs`.
     #[command(hide = true)]
     GenEnvDocs(commands::gen_env_docs::GenEnvDocsArgs),
+    /// Regenerate the model-support matrix artifacts (the generated tables in
+    /// crates/hipfire-model + the chart in MODEL-SUPPORT.md) from
+    /// docs/model-support.toml. Hidden: a maintenance command; run via
+    /// `cargo run -p hipfire-cli -- gen-model-support`.
+    #[command(hide = true)]
+    GenModelSupport(commands::gen_model_support::GenModelSupportArgs),
 }
 
 #[tokio::main]
@@ -81,5 +87,6 @@ async fn main() -> anyhow::Result<()> {
         Command::GenDocs(args) => commands::gen_docs::run(args),
         Command::GenConfigSchema(args) => commands::gen_config_schema::run(args),
         Command::GenEnvDocs(args) => commands::gen_env_docs::run(args),
+        Command::GenModelSupport(args) => commands::gen_model_support::run(args),
     }
 }

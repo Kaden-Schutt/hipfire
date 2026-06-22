@@ -1,0 +1,168 @@
+# Canonical hipfire model-support matrix — SINGLE SOURCE OF TRUTH.
+#
+# Edit THIS file, then regenerate the derived artifacts:
+#     cargo run -p hipfire-cli -- gen-model-support
+# which writes:
+#   - crates/hipfire-model/src/model_support_generated.rs  (the compiled tables
+#     that `arch_features` / admission consume)
+#   - the matrix chart inside MODEL-SUPPORT.md (between the generated markers)
+#
+# CI freshness gate (tests/no-gpu-ci.sh) runs `gen-model-support --check`, which
+# fails if the committed artifacts have drifted from this file.
+#
+# support marks: "full" | "partial" | "none"  (rendered ✓ / ~ / · in the chart;
+# `full` is the only value admission gating treats as a pass — see is_full()).
+
+# ── Per-arch capability matrix (keyed by HFQ arch_id) ──────────────────────────
+
+[[arch]]
+ids = [5, 6]
+label = "qwen3.5"
+prefill = "full"
+dflash = "full"
+mtp = "full"
+kv = "full"
+vision = "partial"
+
+[[arch]]
+ids = [9]
+label = "deepseek4"
+prefill = "full"
+dflash = "none"
+mtp = "partial"
+kv = "fp32"
+vision = "none"
+
+[[arch]]
+ids = [10]
+label = "minimax"
+prefill = "partial"
+dflash = "none"
+mtp = "partial"
+kv = "fp32"
+vision = "none"
+
+[[arch]]
+ids = [11]
+label = "lfm2-moe"
+prefill = "partial"
+dflash = "none"
+mtp = "none"
+kv = "fp32"
+vision = "none"
+
+[[arch]]
+ids = [12]
+label = "gemma3"
+prefill = "full"
+dflash = "none"
+mtp = "none"
+kv = "fp32+q8"
+vision = "none"
+
+[[arch]]
+ids = [13]
+label = "gemma3-vl"
+prefill = "full"
+dflash = "none"
+mtp = "none"
+kv = "fp32+q8"
+vision = "full"
+
+[[arch]]
+ids = [7]
+label = "qwen2"
+prefill = "full"
+dflash = "none"
+mtp = "none"
+kv = "fp32"
+vision = "none"
+
+[[arch]]
+ids = [8]
+label = "dots-ocr"
+prefill = "full"
+dflash = "none"
+mtp = "none"
+kv = "fp32"
+vision = "full"
+
+[[arch]]
+ids = [0, 1]
+label = "llama"
+prefill = "partial"
+dflash = "none"
+mtp = "none"
+kv = "fp32"
+vision = "none"
+
+# ── Quant-format catalog (the authored per-quant axis) ─────────────────────────
+# status: "stable" | "opt-in" | "experimental"
+
+[[quant]]
+name = "bf16"
+label = "BF16 (unquantized)"
+weight_bits = 16
+act_bits = 16
+status = "stable"
+
+[[quant]]
+name = "q8"
+label = "Q8 (W8A16)"
+weight_bits = 8
+act_bits = 16
+status = "stable"
+
+[[quant]]
+name = "mq4"
+label = "Magnum / MQ4 (W4A16)"
+weight_bits = 4
+act_bits = 16
+status = "stable"
+
+[[quant]]
+name = "mq6"
+label = "Magnum / MQ6 (W6A16)"
+weight_bits = 6
+act_bits = 16
+status = "stable"
+
+[[quant]]
+name = "oq4"
+label = "Opus / OQ4 (W4A4)"
+weight_bits = 4
+act_bits = 4
+status = "opt-in"
+
+[[quant]]
+name = "oq8"
+label = "Opus / OQ8 (W8A8)"
+weight_bits = 8
+act_bits = 8
+status = "experimental"
+
+[[quant]]
+name = "mq3"
+label = "Magnum / MQ3 (W3A16, mixed-precision only)"
+weight_bits = 3
+act_bits = 16
+status = "experimental"
+
+# ── Intentional (arch × quant × feature) gates ─────────────────────────────────
+# Overrides an arch-level capability for a specific quant. The per-quant axis the
+# arch matrix can't express: e.g. qwen3.5 prefill is `full`, but W4A4 prefill is
+# parity-gated and opt-in. Admission consults these BEFORE green-lighting.
+
+[[gate]]
+arch = 5
+quant = "oq4"
+feature = "prefill"
+support = "partial"
+note = "W4A4 (OQ4) batched prefill is parity-gated / opt-in (HIPFIRE WMMA path)"
+
+[[gate]]
+arch = 5
+quant = "oq8"
+feature = "prefill"
+support = "partial"
+note = "W8A8 (OQ8) batched-prefill WMMA path is experimental / parity-gated"

@@ -24,6 +24,53 @@ This is the **canonical model-support matrix** for hipfire. It tracks what is
 
 Legend: ✅ full · 🟡 partial / limited · ❌ not implemented (explicitly refused at load/serve) · — not applicable (e.g. expert sharding on a dense arch)
 
+## Generated capability matrix
+
+The tables below are generated from `docs/model-support.toml` (the single source
+of truth, shared with `crates/hipfire-model/src/model_support_generated.rs`). Do
+not hand-edit between the markers — run `cargo run -p hipfire-cli -- gen-model-support`.
+The richer hand-maintained roster (microbatch / PP / EP columns) follows.
+
+<!-- BEGIN GENERATED model-support (source: docs/model-support.toml — run `cargo run -p hipfire-cli -- gen-model-support`) -->
+
+### Capability matrix (generated)
+
+Machine-readable subset consumed by `arch_features` / admission. Edit `docs/model-support.toml`.
+
+| Arch (arch_id) | Batched prefill | DFlash spec | MTP spec | KV quant | Vision |
+|---|---|---|---|---|---|
+| qwen3.5 (5, 6) | ✅ | ✅ | ✅ | full | 🟡 |
+| deepseek4 (9) | ✅ | ❌ | 🟡 | fp32 | ❌ |
+| minimax (10) | 🟡 | ❌ | 🟡 | fp32 | ❌ |
+| lfm2-moe (11) | 🟡 | ❌ | ❌ | fp32 | ❌ |
+| gemma3 (12) | ✅ | ❌ | ❌ | fp32+q8 | ❌ |
+| gemma3-vl (13) | ✅ | ❌ | ❌ | fp32+q8 | ✅ |
+| qwen2 (7) | ✅ | ❌ | ❌ | fp32 | ❌ |
+| dots-ocr (8) | ✅ | ❌ | ❌ | fp32 | ✅ |
+| llama (0, 1) | 🟡 | ❌ | ❌ | fp32 | ❌ |
+
+### Quant formats (generated)
+
+| Quant | Weight bits | Act bits | Status |
+|---|---|---|---|
+| bf16 (BF16 (unquantized)) | 16 | 16 | stable |
+| q8 (Q8 (W8A16)) | 8 | 16 | stable |
+| mq4 (Magnum / MQ4 (W4A16)) | 4 | 16 | stable |
+| mq6 (Magnum / MQ6 (W6A16)) | 6 | 16 | stable |
+| oq4 (Opus / OQ4 (W4A4)) | 4 | 4 | opt-in |
+| oq8 (Opus / OQ8 (W8A8)) | 8 | 8 | experimental |
+| mq3 (Magnum / MQ3 (W3A16, mixed-precision only)) | 3 | 16 | experimental |
+
+### Intentional gates (generated)
+
+Per-quant overrides of an arch capability (admission consults these before green-lighting).
+
+| Arch | Quant | Feature | Support | Note |
+|---|---|---|---|---|
+| 5 | oq4 | prefill | 🟡 | W4A4 (OQ4) batched prefill is parity-gated / opt-in (HIPFIRE WMMA path) |
+| 5 | oq8 | prefill | 🟡 | W8A8 (OQ8) batched-prefill WMMA path is experimental / parity-gated |
+<!-- END GENERATED model-support -->
+
 ## Feature matrix vs flagship qwen3.5
 
 | Arch (arch_id) | Decode | Batched prefill | Server microbatch | DFlash spec | MTP spec | KV quant modes | Lowered/superop pipeline | Layer shard (PP) | Expert shard (EP/TP) | Vision |

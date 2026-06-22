@@ -5,6 +5,10 @@
 //! Shared model artifact identity helpers and model-source contracts.
 
 pub mod gguf;
+/// Generated model-support tables (`ARCH_ROWS`/`QUANT_TABLE`/`GATE_TABLE`).
+/// Source of truth: `docs/model-support.toml`; regenerate with
+/// `cargo run -p hipfire-cli -- gen-model-support`.
+pub mod model_support_generated;
 pub mod tokenizer;
 
 use serde::{Deserialize, Serialize};
@@ -588,7 +592,7 @@ impl FeatureSupport {
 
 /// Per-arch capability summary, keyed by HFQ arch_id. Mirrors the feature
 /// matrix in MODEL-SUPPORT.md.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ArchFeatures {
     pub label: &'static str,
     /// Batched (multi-token) prefill.
@@ -603,36 +607,22 @@ pub struct ArchFeatures {
     pub vision: FeatureSupport,
 }
 
-/// Look up the capability summary for an HFQ arch_id. Source of truth:
-/// MODEL-SUPPORT.md — update both together.
+/// Look up the capability summary for an HFQ arch_id. Backed by the generated
+/// `ARCH_ROWS` table (source of truth: `docs/model-support.toml`, kept in sync
+/// by `hipfire gen-model-support` + the no-gpu-ci `--check` drift gate).
 pub fn arch_features(arch_id: u32) -> ArchFeatures {
-    use FeatureSupport::{Full as Y, None as N, Partial as P};
-    let f = |label, prefill, dflash, mtp, kv, vision| ArchFeatures {
-        label,
-        prefill,
-        dflash,
-        mtp,
-        kv,
-        vision,
-    };
-    match arch_id {
-        5 | 6 => f("qwen3.5", Y, Y, Y, "full", P),
-        9 => f("deepseek4", Y, N, P, "fp32", N),
-        10 => f("minimax", P, N, P, "fp32", N),
-        11 => f("lfm2-moe", P, N, N, "fp32", N),
-        12 => f("gemma3", Y, N, N, "fp32+q8", N),
-        13 => f("gemma3-vl", Y, N, N, "fp32+q8", Y),
-        7 => f("qwen2", Y, N, N, "fp32", N),
-        8 => f("dots-ocr", Y, N, N, "fp32", Y),
-        0 | 1 => f("llama", P, N, N, "fp32", N),
-        _ => f(
-            "unknown",
-            FeatureSupport::Unknown,
-            FeatureSupport::Unknown,
-            FeatureSupport::Unknown,
-            "?",
-            FeatureSupport::Unknown,
-        ),
+    for row in model_support_generated::ARCH_ROWS {
+        if row.ids.contains(&arch_id) {
+            return row.features;
+        }
+    }
+    ArchFeatures {
+        label: "unknown",
+        prefill: FeatureSupport::Unknown,
+        dflash: FeatureSupport::Unknown,
+        mtp: FeatureSupport::Unknown,
+        kv: "?",
+        vision: FeatureSupport::Unknown,
     }
 }
 

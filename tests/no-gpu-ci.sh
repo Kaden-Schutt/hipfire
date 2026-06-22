@@ -39,6 +39,9 @@ cargo run -q -p hipfire-cli -- gen-docs --check
 echo "== Config schema freshness (docs/config-schema.* vs schema registry) =="
 cargo run -q -p hipfire-cli -- gen-config-schema --format json --output docs/config-schema.json --check
 cargo run -q -p hipfire-cli -- gen-config-schema --format toml --output docs/config-schema.toml --check
+
+echo "== Model-support freshness (model_support_generated.rs + MODEL-SUPPORT.md vs docs/model-support.toml) =="
+cargo run -q -p hipfire-cli -- gen-model-support --check
 cargo run -q -p hipfire-cli -- gen-config-schema --format markdown --output docs/config-schema.md --check
 
 echo "== Artifact naming check =="
