@@ -11934,7 +11934,28 @@ fn generate_qwen2(
     let weights = &state_ref.weights;
     let state = &mut state_ref.state;
 
-    let prompt_ids = tokenizer.encode(prompt);
+    // Apply the model's chat template (if present) so instruct-tuned qwen2
+    // models receive properly-framed ChatML input. Falls back to raw encoding
+    // when no template is loaded (e.g. base/pre-train weights).
+    let prompt_ids = if let Some(template) = m.chat_template.as_ref() {
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer,
+            template,
+            system: _system_prompt,
+            user: prompt,
+            enable_thinking: true,
+            bos_token: None,
+        };
+        match frame.render() {
+            Ok(rendered) => tokenizer.encode(&rendered),
+            Err(e) => {
+                eprintln!("[daemon] qwen2 jinja render failed ({e}) — falling back to raw encode");
+                tokenizer.encode(prompt)
+            }
+        }
+    } else {
+        tokenizer.encode(prompt)
+    };
     if prompt_ids.is_empty() {
         let _ = writeln!(
             stdout,
