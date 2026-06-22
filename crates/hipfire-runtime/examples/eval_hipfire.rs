@@ -44,7 +44,6 @@ fn main() {
 #[cfg(feature = "deltanet")]
 fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
-    use hipfire_runtime::dispatch::{gemv_family, DispatchCtx};
     use hipfire_runtime::hfq::{HfqFile, HfqPackage, HFQM_ARCH_NON_WEIGHT_PACKAGE};
     use hipfire_runtime::kv::KvCache;
     use rdna_compute::DType;
@@ -714,6 +713,7 @@ fn main() {
             // Other lm_head dtypes (Q8, MQ4, etc.) keep the per-position
             // weight_gemv path until a batched variant is wired for each.
             let f16_lmhead = weights.output.gpu_dtype == DType::F16;
+            let bf16_lmhead = weights.output.gpu_dtype == DType::BF16;
             let batched_logits: Option<rdna_compute::GpuTensor> = if f16_lmhead {
                 let alloc = gpu
                     .alloc_tensor(&[scored_per_chunk, config.vocab_size], DType::F32)
@@ -728,6 +728,40 @@ fn main() {
                 )
                 .expect("gemm_f16_batched_lmhead");
                 Some(alloc)
+            } else if bf16_lmhead {
+                // BF16 lm_head (e.g. the bf16 reference model itself, tied
+                // embeddings). Batch like the f16 path via gemm_bf16_x_bf16_wmma,
+                // mirroring build_kld_ref's proven layout. The WMMA kernel tiles
+                // the batch dim in groups of 16 and ensure_bf16_x does NOT pad,
+                // so a non-16-multiple batch (scored_per_chunk=1023) over-reads
+                // the staged x on its last tile → OOB → HIP 719 on gfx1103. Pad
+                // the batch up to a multiple of 16; the extra rows are zero and
+                // their logits are discarded by the scoring loop (j < scored).
+                let pad = scored_per_chunk.div_ceil(16) * 16;
+                let h_pad_owned: Option<rdna_compute::GpuTensor> = if pad != scored_per_chunk {
+                    let hp = gpu
+                        .zeros(&[pad, config.dim], DType::F32)
+                        .expect("alloc padded hidden for bf16 lm_head");
+                    gpu.copy_d2d(h_buf, &hp, scored_per_chunk * config.dim * 4)
+                        .expect("copy hidden into padded buffer");
+                    Some(hp)
+                } else {
+                    None
+                };
+                let h_in = h_pad_owned.as_ref().unwrap_or(h_buf);
+                let alloc = gpu
+                    .alloc_tensor(&[pad, config.vocab_size], DType::F32)
+                    .expect("alloc batched bf16 lm_head logits");
+                gpu.gemm_bf16_x_bf16_wmma(
+                    &weights.output.buf,
+                    h_in,
+                    &alloc,
+                    config.vocab_size,
+                    config.dim,
+                    pad,
+                )
+                .expect("gemm_bf16_x_bf16_wmma lm_head");
+                Some(alloc)
             } else {
                 None
             };
@@ -737,16 +771,18 @@ fn main() {
                     all_logits.sub_offset(j * config.vocab_size, config.vocab_size)
                 } else {
                     let row_view = h_buf.sub_offset(j * config.dim, config.dim);
-                    let ctx = DispatchCtx::new(&gpu);
-                    let _ = gemv_family()
-                        .run_auto(
-                            &ctx,
-                            &mut gpu,
-                            &weights.output.dispatch_ref(),
-                            &row_view,
-                            &scratch.logits,
-                        )
-                        .expect("gemv lm_head");
+                    // Route through weight_gemv (not gemv_family().run_auto): it
+                    // carries the full per-dtype lowering, incl. the BF16 lm_head
+                    // WMMA path that the bare dispatch family has no entry for
+                    // (a tied-embedding bf16 output otherwise panics
+                    // UnsupportedVariant{"unknown"}).
+                    hipfire_runtime::weights::weight_gemv(
+                        &mut gpu,
+                        &weights.output,
+                        &row_view,
+                        &scratch.logits,
+                    )
+                    .expect("weight_gemv lm_head");
                     scratch.logits.sub_offset(0, config.vocab_size)
                 };
                 let pos = scoring_start + j;
