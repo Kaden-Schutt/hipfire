@@ -384,6 +384,16 @@ pub fn run_generate_batch_decode_step_qwen35(
     {
         backend = Qwen35DecodeBatchBackend::FusedGroupedMoeLayerChunked;
     }
+    // Hierarchical KV is a per-token-attention feature (hot-ring read lives in
+    // kv_cache_attention_dispatch). The fused layer-chunked decode backends run
+    // their own batched attention and bypass it → the two-tier cache is never read
+    // and decode degenerates. Force the SerialReference decode (per-token
+    // forward_scratch per session), which honours the dispatch. Per-token decode is
+    // slower but correct; hier is a KV-memory feature, not a throughput one. (Mirrors
+    // the prefill-side override in qwen35_prefill_suffix_batch.)
+    if std::env::var("HIPFIRE_KV_HIERARCHICAL").ok().as_deref() == Some("1") {
+        backend = Qwen35DecodeBatchBackend::SerialReference;
+    }
     if backend == Qwen35DecodeBatchBackend::FusedDenseLayerChunked {
         validate_qwen35_fused_dense_decode_model_capability(m, envelope.session_count)?;
     } else if backend == Qwen35DecodeBatchBackend::FusedGroupedMoeLayerChunked {

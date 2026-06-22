@@ -508,6 +508,18 @@ pub fn qwen35_prefill_suffix_batch(
     plan: GenerateBatchPrefillPlan,
     backend: Qwen35PrefillBatchBackend,
 ) -> Result<Qwen35PrefillBatchResult, String> {
+    // Hierarchical KV is a per-token-attention feature (hot-ring append + two-tier
+    // read live in kv_cache_attention_dispatch); the fused batched-attention
+    // backends bypass it. Route every session through the SerialReference path
+    // (→ qwen35_prefill_active_session → per-token forward_scratch), which honours
+    // the dispatch and the between-turns idle_compact hook. Serial per-token prefill
+    // is slower than the fused batch, but hier is a KV-memory feature, not a
+    // throughput one, so the trade is correct.
+    let backend = if std::env::var("HIPFIRE_KV_HIERARCHICAL").ok().as_deref() == Some("1") {
+        Qwen35PrefillBatchBackend::SerialReference
+    } else {
+        backend
+    };
     let (attach_only, non_empty): (Vec<_>, Vec<_>) = prepared
         .iter()
         .partition(|session| session.tokens.is_empty());
@@ -1669,25 +1681,12 @@ pub fn run_generate_batch_prefill_serial_qwen35(
     if pflash_active {
         return Err("generate_batch_prefill does not support PFlash compression yet".to_string());
     }
-    // Hierarchical KV is an inherently per-token feature: its hot-ring append + two-
-    // tier read live in kv_cache_attention_dispatch, which the batched session-batch
-    // forward bypasses (it runs its own batched attention). Running it here would
-    // silently leave the hot ring unpopulated. Refuse, like CASK eviction / PFlash —
-    // hierarchical sessions must take the per-token prefill path
-    // (qwen35_prefill_active_session), which honours the dispatch + idle_compact hook.
-    if m
-        .kv_cache
-        .as_ref()
-        .and_then(|c| c.hier.as_ref())
-        .map(|h| h.enabled)
-        .unwrap_or(false)
-    {
-        return Err(
-            "generate_batch_prefill does not support hierarchical KV (HIPFIRE_KV_HIERARCHICAL=1); \
-             use per-token prefill (it requires the per-token attention dispatch)"
-                .to_string(),
-        );
-    }
+    // Hierarchical KV (HIPFIRE_KV_HIERARCHICAL=1) is supported here: the dispatcher
+    // `qwen35_prefill_suffix_batch` forces the SerialReference backend for it, so
+    // every session is prefilled per-token via `qwen35_prefill_active_session` (which
+    // honours kv_cache_attention_dispatch + the idle_compact hook). No guard needed —
+    // we route rather than refuse. (Fused batched-attention backends bypass the
+    // per-token dispatch and cannot populate the hot ring; the override avoids them.)
     let arena_backend = loaded_model_state_arena_backend(m);
 
     let plan = plan_generate_batch_prefill_qwen35(m.arch_id, envelope.session_count);
