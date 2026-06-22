@@ -1501,11 +1501,12 @@ export function validateConfigActionArgs(action: string, tail: string[], key: st
   return { ok: true };
 }
 
-// Reap ORPHAN daemon / quantize processes and free a serve port. Mirrors
+// Reap ORPHAN daemon / quantize processes and free the serve bind. Mirrors
 // scripts/serve-restart.sh: `pkill -x daemon` (exact-name, NOT -f, so the bun
-// CLI itself is never matched) + `fuser -k <port>/tcp`. Used by
-// `hipfire stop --force` / `--all`. Returns a short human summary per action.
-function reapOrphans(port: number, all: boolean): string[] {
+// CLI itself is never matched) + `fuser -k <port>/tcp` for TCP, or pgrep -f
+// cmdline-match + socket unlink for unix. Used by `hipfire stop --force` / `--all`.
+// Returns a short human summary per action.
+function reapOrphans(bind: ServeBind, all: boolean): string[] {
   const out: string[] = [];
   const sh = (cmd: string): { code: number; out: string } => {
     try {
@@ -1520,11 +1521,17 @@ function reapOrphans(port: number, all: boolean): string[] {
   const plan = reapPlanForPlatform(process.platform);
   if (!plan.supported) {
     out.push(`orphan reap unsupported: ${plan.note}`);
-    // Best-effort port-owner identification (don't claim a kill we can't do).
-    const owner = sh(`lsof -ti tcp:${port} 2>/dev/null || true`).out
-      || sh(`ss -ltnp 2>/dev/null | grep -w ${port} || true`).out;
-    if (owner) out.push(`port ${port} held by: ${owner} (kill it manually; reap is Linux-only)`);
-    else out.push(`port ${port}: could not determine owner (no lsof/ss); not freed`);
+    if (bind.kind === "unix") {
+      out.push(`socket reap unsupported off Linux; remove ${bind.path} manually if needed`);
+      // Portable best-effort unlink (no shell, so the path is safe regardless).
+      try { require("fs").unlinkSync(bind.path); out.push(`removed socket ${bind.path}`); } catch {}
+    } else {
+      // Best-effort port-owner identification (don't claim a kill we can't do).
+      const owner = sh(`lsof -ti tcp:${bind.port} 2>/dev/null || true`).out
+        || sh(`ss -ltnp 2>/dev/null | grep -w ${bind.port} || true`).out;
+      if (owner) out.push(`port ${bind.port} held by: ${owner} (kill it manually; reap is Linux-only)`);
+      else out.push(`port ${bind.port}: could not determine owner (no lsof/ss); not freed`);
+    }
     return out;
   }
   // The configurable daemon cmdline (default `daemon`). Lets a non-standard
@@ -1564,13 +1571,30 @@ function reapOrphans(port: number, all: boolean): string[] {
       out.push("no orphan quantize procs");
     }
   }
-  // Free the serve port (fuser -k SIGKILLs whatever holds <port>/tcp).
-  const before = sh(`fuser ${port}/tcp 2>/dev/null`).out;
-  if (before) {
-    sh(`fuser -k ${port}/tcp 2>/dev/null`);
-    out.push(`freed port ${port} (was held by:${before})`);
+  if (bind.kind === "tcp") {
+    // Free the serve port (fuser -k SIGKILLs whatever holds <port>/tcp).
+    const before = sh(`fuser ${bind.port}/tcp 2>/dev/null`).out;
+    if (before) {
+      sh(`fuser -k ${bind.port}/tcp 2>/dev/null`);
+      out.push(`freed port ${bind.port} (was held by:${before})`);
+    } else {
+      out.push(`port ${bind.port} already free`);
+    }
   } else {
-    out.push(`port ${port} already free`);
+    // Unix: match serves by their --socket-path / --unix-socket cmdline arg,
+    // kill them, then unlink the socket file. Use Bun.spawnSync with argv array
+    // (no bash -c) so the path is never interpreted by a shell.
+    for (const pat of [`--socket-path ${bind.path}`, `--unix-socket ${bind.path}`]) {
+      try {
+        const r = Bun.spawnSync(["pgrep", "-f", "--", pat], { stdout: "pipe", stderr: "pipe" });
+        const pids = (r.stdout?.toString() ?? "").trim().split("\n").filter(Boolean);
+        for (const p of pids) {
+          Bun.spawnSync(["kill", "-9", p], { stdout: "pipe", stderr: "pipe" });
+          out.push(`killed socket serve pid ${p}`);
+        }
+      } catch {}
+    }
+    try { require("fs").unlinkSync(bind.path); out.push(`removed socket ${bind.path}`); } catch {}
   }
   return out;
 }
@@ -7506,9 +7530,23 @@ switch (cmd) {
         }
       }
     }
-    // Force-reap any orphans + free the port so the new serve binds cleanly.
-    for (const line of reapOrphans(restartPort, false)) console.error(`[restart] ${line}`);
-    // Brief settle so the port leaves TIME_WAIT/closing before rebind.
+    // Force-reap any orphans + free the bind so the new serve can bind cleanly.
+    // N4 fix: use the tracked record's bind (not cfg.port) so a socket-mode
+    // restart doesn't fuser -k the TCP port instead.
+    const restartBind: ServeBind = trackedRec
+      ? bindFromPidRecord(trackedRec)
+      : { kind: "tcp", host: cfg.host, port: restartPort };
+    for (const line of reapOrphans(restartBind, false)) console.error(`[restart] ${line}`);
+    // Same-transport relaunch: if args carry no explicit bind and the tracked
+    // record was a unix socket, inject --socket-path so the new serve rebinds
+    // the same socket (spec §6.7, same-transport relaunch).
+    const hasExplicitBind =
+      args.some(a => a === "--socket-path" || a === "--unix-socket") ||
+      parseRestartPort(args, -1) !== -1;
+    if (!hasExplicitBind && trackedRec?.socketPath) {
+      args.unshift("--socket-path", trackedRec.socketPath);
+    }
+    // Brief settle so the port/socket leaves TIME_WAIT/closing before rebind.
     await new Promise(r => setTimeout(r, 500));
     console.error(`[restart] starting serve...`);
     await runServe(args);
@@ -7517,35 +7555,45 @@ switch (cmd) {
   case "stop": {
     const stopArgs = rest.slice();
     if (takeFlag(stopArgs, "-h", "--help")) {
-      console.error(`Usage: hipfire stop [port] [--force] [--all]\n\n`
+      console.error(`Usage: hipfire stop [port] [--socket <path>] [--force] [--all]\n\n`
         + `Stops the tracked background serve (the PID in ${SERVE_PID_FILE}).\n\n`
-        + `  [port]     Port to free when --force/--all is given (default: cfg.port = ${cfg.port})\n`
-        + `  --force    Beyond the tracked PID, reap ORPHAN daemon procs\n`
-        + `             (\`pkill -x daemon\`) and free the port (\`fuser -k <port>/tcp\`)\n`
-        + `  --all      Like --force, and also reap orphan quantize procs\n\n`
+        + `  [port]          Port to free when --force/--all is given (default: cfg.port = ${cfg.port})\n`
+        + `  --socket <path> Socket path to reap when --force/--all is given (mutually exclusive with [port])\n`
+        + `  --force         Beyond the tracked PID, reap ORPHAN daemon procs\n`
+        + `                  (\`pkill -x daemon\`) and free the port (\`fuser -k <port>/tcp\`)\n`
+        + `  --all           Like --force, and also reap orphan quantize procs\n\n`
         + `Plain \`hipfire stop\` only touches the tracked PID. Use --force when a\n`
         + `stale daemon holds VRAM or the port after a crash (\"port in use\").\n`);
       process.exit(0);
     }
     const force = takeFlag(stopArgs, "--force");
     const all = takeFlag(stopArgs, "--all");
+    // Optional --socket <path> flag (unix socket path for force/all reap).
+    const stopSocketPath = takeFlagValue(stopArgs, "--socket");
     // Optional positional port (used only by the force/all reap).
     let stopPort = cfg.port;
+    let stopPortExplicit = false;
     for (const a of stopArgs) {
       if (/^\d+$/.test(a)) {
         const n = parseInt(a, 10);
-        if (n >= 1 && n <= 65535) stopPort = n;
+        if (n >= 1 && n <= 65535) { stopPort = n; stopPortExplicit = true; }
         else { console.error(`Invalid stop port: ${a}`); process.exit(1); }
       } else {
-        console.error(`Unknown stop argument: ${a} (expected [port] [--force] [--all])`);
+        console.error(`Unknown stop argument: ${a} (expected [port] [--socket <path>] [--force] [--all])`);
         process.exit(1);
       }
+    }
+    // --socket and a positional port are mutually exclusive.
+    if (stopSocketPath !== null && stopPortExplicit) {
+      console.error(`--socket and a positional port are mutually exclusive`);
+      process.exit(EXIT.USAGE);
     }
 
     // BUG pid-reuse: validate ownership before killing. A pidfile whose pid was
     // reused by an unrelated process must NOT be killed — unlink it instead.
     const stopRec = readServePidRecord();
-    const stopVerdict = stopRec ? await validateServePid(stopRec, bindFromPidRecord(stopRec)) : null;
+    const stopRecBind = stopRec ? bindFromPidRecord(stopRec) : null;
+    const stopVerdict = stopRec && stopRecBind ? await validateServePid(stopRec, stopRecBind) : null;
     if (stopRec && stopVerdict && stopVerdict.owned) {
       const pid = stopRec.pid;
       try {
@@ -7560,6 +7608,11 @@ switch (cmd) {
           try { process.kill(pid, "SIGKILL"); } catch {}
         }
         try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {}
+        // After stopping a unix-mode serve, unlink the socket (SIGKILL skips cleanup
+        // handlers, so the socket file may linger).
+        if (stopRecBind?.kind === "unix") {
+          try { require("fs").unlinkSync(stopRecBind.path); } catch {}
+        }
         console.log(`hipfire serve stopped (PID ${pid})`);
       } catch (err: any) {
         console.error(`Failed to stop serve (PID ${pid}): ${err?.message ?? err}`);
@@ -7578,9 +7631,14 @@ switch (cmd) {
     }
 
     // --force / --all: reap orphan daemon (and, with --all, quantize) procs and
-    // free the port, per scripts/serve-restart.sh. Plain `stop` skips this.
+    // free the bind. Build the reap bind: --socket wins; else pidfile; else cfg TCP.
     if (force || all) {
-      for (const line of reapOrphans(stopPort, all)) console.log(`  ${line}`);
+      const stopBind: ServeBind = stopSocketPath !== null
+        ? { kind: "unix", path: stopSocketPath }
+        : stopRec
+          ? bindFromPidRecord(stopRec)
+          : { kind: "tcp", host: cfg.host, port: stopPort };
+      for (const line of reapOrphans(stopBind, all)) console.log(`  ${line}`);
     }
     break;
   }
@@ -7827,22 +7885,21 @@ Examples:
       else if (/hf upload/.test(args)) { groups[2].entries.push(entry); uploadRecs.push(rec); }
     }
     if (psJson) {
-      const port0 = cfg.port;
-      const portInUse0 = sh(`ss -tlnp 2>/dev/null | grep :${port0}`);
+      const psRec0 = readServePidRecord();
+      const psBind0: ServeBind = psRec0 ? bindFromPidRecord(psRec0) : { kind: "tcp", host: cfg.host, port: cfg.port };
       const detachedPid0 = readServePid();
+      const portInUse0 = psBind0.kind === "tcp" ? sh(`ss -tlnp 2>/dev/null | grep :${psBind0.port}`) : "";
+      const isUp0 = psBind0.kind === "unix" ? !!detachedPid0 : !!(detachedPid0 || portInUse0);
+      const serveJson0 = psBind0.kind === "unix"
+        ? { transport: "unix" as const, socket_path: psBind0.path, pid: detachedPid0, up: isUp0, detached: !!detachedPid0 }
+        : { transport: "tcp" as const, host: psBind0.host, port: psBind0.port, pid: detachedPid0, up: isUp0, detached: !!detachedPid0 };
       console.log(JSON.stringify({
         platform: process.platform,
         process_scan: psLinux ? "linux" : `unavailable (ps/ss are Linux-only; running on ${process.platform})`,
         daemons: daemonRecs,
         quantize: quantizeRecs,
         uploads: uploadRecs,
-        serve: {
-          host: cfg.host,
-          port: port0,
-          pid: detachedPid0,
-          up: !!(detachedPid0 || portInUse0),
-          detached: !!detachedPid0,
-        },
+        serve: serveJson0,
       }, null, 2));
       break;
     }
@@ -7868,19 +7925,21 @@ Examples:
       console.log(`\n[${g.label}]`);
       for (const e of g.entries) console.log(e);
     }
-    // Show local serve port availability + detached PID (if any)
-    const host = cfg.host;
-    const port = cfg.port;
-    const portInUse = sh(`ss -tlnp 2>/dev/null | grep :${port}`);
+    // Show serve status: derive bind from the pidfile (actual transport), fall
+    // back to cfg TCP bind when no pidfile exists.
+    const psRec = readServePidRecord();
+    const psBind: ServeBind = psRec ? bindFromPidRecord(psRec) : { kind: "tcp", host: cfg.host, port: cfg.port };
     const detachedPid = readServePid();
-    const bind = formatBind({ kind: "tcp", host, port });
+    // Skip the ss :port probe for unix-mode serves — no TCP port to probe.
+    const portInUse = psBind.kind === "tcp" ? sh(`ss -tlnp 2>/dev/null | grep :${psBind.port}`) : "";
+    const bindLabel = formatBind(psBind);
     if (detachedPid) {
-      console.log(`\nserve ${bind}: ACTIVE (detached, PID ${detachedPid})`);
+      console.log(`\nserve ${bindLabel}: ACTIVE (detached, PID ${detachedPid})`);
       console.log(`  stop: hipfire stop    |    log: tail -f ${SERVE_LOG_FILE}`);
     } else if (portInUse) {
-      console.log(`\nserve ${bind}: ACTIVE (foreground)`);
+      console.log(`\nserve ${bindLabel}: ACTIVE (foreground)`);
     } else {
-      console.log(`\nserve ${bind}: free`);
+      console.log(`\nserve ${bindLabel}: free`);
     }
     break;
   }

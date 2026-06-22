@@ -275,6 +275,7 @@ export function parseServePidFile(raw: string | null | undefined): ServePidRecor
           host: typeof o.host === "string" ? o.host : undefined,
           port: typeof o.port === "number" ? o.port : undefined,
           token: typeof o.token === "string" ? o.token : undefined,
+          socketPath: typeof o.socketPath === "string" ? o.socketPath : undefined,
           legacy: false,
         };
       }
