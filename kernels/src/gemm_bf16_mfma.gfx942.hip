@@ -174,3 +174,80 @@ void gemm_bf16_mfma_gfx942(
         }
     }
 }
+
+
+// f32 -> bf16 elementwise (writes bf16 bits into a 2-byte buffer; the Rust
+// side hands an F16-typed GpuTensor as the raw container). Used to stage the
+// per-step lm_head activations (out, dlogits) for the bf16-MFMA GEMM.
+extern "C" __global__ void to_bf16_f32(const float* __restrict__ src,
+                                       __bf16* __restrict__ dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = (__bf16) src[i];
+}
+
+// lm_head bf16 GEMM v2 (gfx942): D[batch,M] += sum_K A[M,K]*B[batch,K].
+// Same math as gemm_bf16_mfma_gfx942 but A is staged through LDS with
+// COALESCED loads (the v1 lane-strided A reads ran at ~6% HBM BW), and the
+// K reduction splits over grid.y (atomicAdd fp32 partials) so the bwd
+// direction (M=d_tgt -> only M/32 WGs) fills all 304 CUs.
+//   grid = (ceil(M/32), ksplit)  block = 256 (4 waves, 2x2 over 32x32 tile)
+//   caller MUST pre-zero D (gpu.zeros).
+extern "C" __global__ __launch_bounds__(256)
+void gemm_bf16_mfma_splitk_gfx942(
+    const __bf16* __restrict__ A,   // [M, K]
+    const __bf16* __restrict__ B,   // [batch, K]
+    float* __restrict__ D,          // [batch, M] (pre-zeroed)
+    int M, int K, int batch, int kchunks_per_split)
+{
+    __shared__ __bf16 lds_a[32 * 128];
+    __shared__ __bf16 lds_b[32 * 128];
+    const int tid   = threadIdx.x;
+    const int wave  = tid >> 6;
+    const int lane  = tid & 63;
+    const int nlane = lane & 15;
+    const int strip = (lane >> 4) & 3;
+    const int m_off = blockIdx.x * 32 + ((wave & 2) ? 16 : 0);
+    const int b_off = (wave & 1) ? 16 : 0;
+    const int m_base = blockIdx.x * 32;
+
+    const int kc_beg = blockIdx.y * kchunks_per_split * 128;
+    long long kc_end = (long long)kc_beg + (long long)kchunks_per_split * 128;
+    if (kc_end > K) kc_end = K;
+
+    vfloat4 c = {0.f, 0.f, 0.f, 0.f};
+    for (int kc = kc_beg; kc < kc_end; kc += 128) {
+        __syncthreads();
+        // coalesced stage: 256 threads x 16 contiguous K-elems = the full
+        // 32x128 tile in one pass (8 threads cover a row -> 32B/thread chunks)
+        {
+            int row  = tid >> 3;                // 0..31
+            int kseg = (tid & 7) * 16;          // 0..112
+            #pragma unroll
+            for (int e = 0; e < 16; e++) {
+                int gk = kc + kseg + e;
+                int gm = m_base + row;
+                lds_a[row * 128 + kseg + e] = (gm < M && gk < K) ? A[(long long)gm * K + gk] : (__bf16)0;
+                lds_b[row * 128 + kseg + e] = (row < batch && gk < K) ? B[(long long)row * K + gk] : (__bf16)0;
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int kk = 0; kk < 128; kk += 16) {
+            bf16x4 a_reg, b_reg;
+            int kbase = kk + strip * 4;
+            int a_row = ((wave & 2) ? 16 : 0) + nlane;
+            #pragma unroll
+            for (int r = 0; r < 4; r++) {
+                a_reg[r] = lds_a[a_row * 128 + kbase + r];
+                b_reg[r] = lds_b[(b_off + nlane) * 128 + kbase + r];
+            }
+            c = mfma_bf16(a_reg, b_reg, c);
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+        const int gm = m_off + strip * 4 + r;
+        const int gb = b_off + nlane;
+        if (gm < M && gb < batch) atomicAdd(&D[(long long)gb * M + gm], c[r]);
+    }
+}

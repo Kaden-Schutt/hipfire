@@ -21,6 +21,7 @@ pub mod arch;
 pub mod config;
 pub mod forward;
 pub mod lfm2moe;
+pub mod dflash_train;
 
 pub use arch::Lfm2Moe;
 pub use config::{config_from_source, Lfm2MoeConfig, MixerKind};

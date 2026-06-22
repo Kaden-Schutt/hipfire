@@ -1715,6 +1715,560 @@ impl Gpu {
     /// [batch, channels, K-1] history, applies the C_gate post-gate into
     /// `out_y` [batch, channels], and advances `state` in place. kernel_size K
     /// is a runtime arg (LFM2 K=3); conv_bias is always false.
+    /// Batched (block-parallel) LFM2 gated short-conv forward. Processes `bb`
+    /// block positions of one sequence at once, seeded by `state` (the K-1 bx
+    /// history from the committed prefix; READ-ONLY). Pair with
+    /// `conv1d_gated_state_advance_f32` to advance the state after the block.
+    pub fn conv1d_gated_batched_f32(
+        &mut self,
+        bcx: &GpuTensor,
+        state: &GpuTensor,
+        weight: &GpuTensor,
+        out_y: &GpuTensor,
+        bb: usize,
+        channels: usize,
+        kernel_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "conv1d_gated_batched",
+            kernels::CONV1D_GATED_BATCHED_SRC,
+            "conv1d_gated_batched_f32",
+        )?;
+        let func = &self.functions["conv1d_gated_batched_f32"];
+        let mut bp = bcx.buf.as_ptr();
+        let mut sp = state.buf.as_ptr();
+        let mut wp = weight.buf.as_ptr();
+        let mut oyp = out_y.buf.as_ptr();
+        let mut bbv = bb as i32;
+        let mut cc = channels as i32;
+        let mut kk = kernel_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut bp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut oyp as *mut _ as *mut c_void,
+            &mut bbv as *mut _ as *mut c_void,
+            &mut cc as *mut _ as *mut c_void,
+            &mut kk as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = (((bb * channels) as u32) + block - 1) / block;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Advance the LFM2 conv state to the last (K-1) bx of a processed block.
+    /// `state_in` is the pre-block state (read only when bb < K-1); `state_out`
+    /// receives the new state. Race-free counterpart to the batched forward.
+    pub fn conv1d_gated_state_advance_f32(
+        &mut self,
+        bcx: &GpuTensor,
+        state_in: &GpuTensor,
+        state_out: &GpuTensor,
+        bb: usize,
+        channels: usize,
+        kernel_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "conv1d_gated_batched",
+            kernels::CONV1D_GATED_BATCHED_SRC,
+            "conv1d_gated_state_advance_f32",
+        )?;
+        let func = &self.functions["conv1d_gated_state_advance_f32"];
+        let mut bp = bcx.buf.as_ptr();
+        let mut sip = state_in.buf.as_ptr();
+        let mut sop = state_out.buf.as_ptr();
+        let mut bbv = bb as i32;
+        let mut cc = channels as i32;
+        let mut kk = kernel_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut bp as *mut _ as *mut c_void,
+            &mut sip as *mut _ as *mut c_void,
+            &mut sop as *mut _ as *mut c_void,
+            &mut bbv as *mut _ as *mut c_void,
+            &mut cc as *mut _ as *mut c_void,
+            &mut kk as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let hist = kernel_size.saturating_sub(1);
+        let grid = (((channels * hist) as u32) + block - 1) / block;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Backward of the batched LFM2 gated short-conv. Given upstream `g_out`
+    /// [Bb,C], writes `d_bcx` [Bb,3C] (B_gate|C_gate|xin grads), `d_weight`
+    /// [C,K], `d_state` [C,K-1]; `d_conv` [Bb,C] is a scratch buffer. Runs three
+    /// race-free kernels (dconv -> {dbx, dweight}); all outputs are fully
+    /// written so no pre-zero is required.
+    pub fn conv1d_gated_batched_bwd(
+        &mut self,
+        bcx: &GpuTensor,
+        state: &GpuTensor,
+        weight: &GpuTensor,
+        g_out: &GpuTensor,
+        d_bcx: &GpuTensor,
+        d_weight: &GpuTensor,
+        d_state: &GpuTensor,
+        d_conv: &GpuTensor,
+        bb: usize,
+        channels: usize,
+        kernel_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "conv1d_gated_batched",
+            kernels::CONV1D_GATED_BATCHED_SRC,
+            "conv1d_gated_bwd_dconv_f32",
+        )?;
+        self.ensure_kernel(
+            "conv1d_gated_batched",
+            kernels::CONV1D_GATED_BATCHED_SRC,
+            "conv1d_gated_bwd_dbx_f32",
+        )?;
+        self.ensure_kernel(
+            "conv1d_gated_batched",
+            kernels::CONV1D_GATED_BATCHED_SRC,
+            "conv1d_gated_bwd_dweight_f32",
+        )?;
+        let hist = kernel_size.saturating_sub(1);
+        let mut bbv = bb as i32;
+        let mut cc = channels as i32;
+        let mut kk = kernel_size as i32;
+        let block = 256u32;
+        // 1: d_conv + d_C_gate
+        {
+            let func = &self.functions["conv1d_gated_bwd_dconv_f32"];
+            let mut bp = bcx.buf.as_ptr();
+            let mut sp = state.buf.as_ptr();
+            let mut wp = weight.buf.as_ptr();
+            let mut gp = g_out.buf.as_ptr();
+            let mut dcp = d_conv.buf.as_ptr();
+            let mut dbp = d_bcx.buf.as_ptr();
+            let mut params: Vec<*mut c_void> = vec![
+                &mut bp as *mut _ as *mut c_void,
+                &mut sp as *mut _ as *mut c_void,
+                &mut wp as *mut _ as *mut c_void,
+                &mut gp as *mut _ as *mut c_void,
+                &mut dcp as *mut _ as *mut c_void,
+                &mut dbp as *mut _ as *mut c_void,
+                &mut bbv as *mut _ as *mut c_void,
+                &mut cc as *mut _ as *mut c_void,
+                &mut kk as *mut _ as *mut c_void,
+            ];
+            let grid = (((bb * channels) as u32) + block - 1) / block;
+            unsafe {
+                self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params)?;
+            }
+        }
+        // 2: d_bx -> d_B_gate / d_xin / d_state
+        {
+            let func = &self.functions["conv1d_gated_bwd_dbx_f32"];
+            let mut bp = bcx.buf.as_ptr();
+            let mut wp = weight.buf.as_ptr();
+            let mut dcp = d_conv.buf.as_ptr();
+            let mut dbp = d_bcx.buf.as_ptr();
+            let mut dsp = d_state.buf.as_ptr();
+            let mut params: Vec<*mut c_void> = vec![
+                &mut bp as *mut _ as *mut c_void,
+                &mut wp as *mut _ as *mut c_void,
+                &mut dcp as *mut _ as *mut c_void,
+                &mut dbp as *mut _ as *mut c_void,
+                &mut dsp as *mut _ as *mut c_void,
+                &mut bbv as *mut _ as *mut c_void,
+                &mut cc as *mut _ as *mut c_void,
+                &mut kk as *mut _ as *mut c_void,
+            ];
+            let grid = ((((bb + hist) * channels) as u32) + block - 1) / block;
+            unsafe {
+                self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params)?;
+            }
+        }
+        // 3: d_weight
+        {
+            let func = &self.functions["conv1d_gated_bwd_dweight_f32"];
+            let mut bp = bcx.buf.as_ptr();
+            let mut sp = state.buf.as_ptr();
+            let mut dcp = d_conv.buf.as_ptr();
+            let mut dwp = d_weight.buf.as_ptr();
+            let mut params: Vec<*mut c_void> = vec![
+                &mut bp as *mut _ as *mut c_void,
+                &mut sp as *mut _ as *mut c_void,
+                &mut dcp as *mut _ as *mut c_void,
+                &mut dwp as *mut _ as *mut c_void,
+                &mut bbv as *mut _ as *mut c_void,
+                &mut cc as *mut _ as *mut c_void,
+                &mut kk as *mut _ as *mut c_void,
+            ];
+            let grid = (((channels * kernel_size) as u32) + block - 1) / block;
+            unsafe {
+                self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// DFlash trainer: clean row-major dense linear forward.
+    /// `Y[M,N] = X[M,K] . W[N,K]^T` ; X,W,Y all `[rows, cols]` row-major
+    /// (W is PyTorch nn.Linear.weight layout). No bias.
+    pub fn linear_fwd_f32(
+        &mut self,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("dflash_train", kernels::DFLASH_TRAIN_SRC, "linear_fwd_f32")?;
+        let func = &self.functions["linear_fwd_f32"];
+        let mut xp = x.buf.as_ptr();
+        let mut wp = w.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n as u32, m as u32, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// DFlash trainer: naive GQA block-attention forward with injected context.
+    /// `q` [B,nH,hd], `k`/`v` [L,nKV,hd] (L=n_ctx+B, ctx first then block),
+    /// `o` [B,nH,hd]. Full (bidirectional) attention over all L keys; RoPE +
+    /// qk-norm applied before. One warp per (query,head), online softmax.
+    pub fn attn_block_ctx_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        o: &GpuTensor,
+        b: usize,
+        l: usize,
+        n_heads: usize,
+        n_kv: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("dflash_train", kernels::DFLASH_TRAIN_SRC, "attn_block_ctx_f32")?;
+        let func = &self.functions["attn_block_ctx_f32"];
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k.buf.as_ptr();
+        let mut vp = v.buf.as_ptr();
+        let mut op = o.buf.as_ptr();
+        let mut bi = b as i32;
+        let mut li = l as i32;
+        let mut nhi = n_heads as i32;
+        let mut nkvi = n_kv as i32;
+        let mut hdi = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut li as *mut _ as *mut c_void,
+            &mut nhi as *mut _ as *mut c_void,
+            &mut nkvi as *mut _ as *mut c_void,
+            &mut hdi as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let grid = ((b * n_heads) as u32).max(1);
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// linear backward dX = dY·W. dY[M,N], W[N,K], dX[M,K].
+    pub fn linear_bwd_dx_f32(&mut self, dy: &GpuTensor, w: &GpuTensor, dx: &GpuTensor, m: usize, k: usize, n: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("dflash_train", kernels::DFLASH_TRAIN_SRC, "linear_bwd_dx_f32")?;
+        let func = &self.functions["linear_bwd_dx_f32"];
+        let mut dyp = dy.buf.as_ptr(); let mut wp = w.buf.as_ptr(); let mut dxp = dx.buf.as_ptr();
+        let mut mi = m as i32; let mut ki = k as i32; let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dyp as *mut _ as *mut c_void, &mut wp as *mut _ as *mut c_void, &mut dxp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void, &mut ki as *mut _ as *mut c_void, &mut ni as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [m as u32, k as u32, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// linear backward dW = dY^T·X. dY[M,N], X[M,K], dW[N,K] (overwrites dW).
+    pub fn linear_bwd_dw_f32(&mut self, dy: &GpuTensor, x: &GpuTensor, dw: &GpuTensor, m: usize, k: usize, n: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("dflash_train", kernels::DFLASH_TRAIN_SRC, "linear_bwd_dw_f32")?;
+        let func = &self.functions["linear_bwd_dw_f32"];
+        let mut dyp = dy.buf.as_ptr(); let mut xp = x.buf.as_ptr(); let mut dwp = dw.buf.as_ptr();
+        let mut mi = m as i32; let mut ki = k as i32; let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dyp as *mut _ as *mut c_void, &mut xp as *mut _ as *mut c_void, &mut dwp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void, &mut ki as *mut _ as *mut c_void, &mut ni as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [n as u32, k as u32, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// MFMA-accelerated dW (gfx942): dW[N,K] = sum_m dY[m,N]*X[m,K], M=batch<=16.
+    /// One v_mfma_f32_16x16x16bf16 per 16x16 tile. f32 in (bf16-cast), f32 out.
+    pub fn linear_bwd_dw_mfma_f32(&mut self, dy: &GpuTensor, x: &GpuTensor, dw: &GpuTensor, m: usize, k: usize, n_dim: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("dflash_train", kernels::DFLASH_TRAIN_SRC, "linear_bwd_dw_mfma_gfx942")?;
+        let func = &self.functions["linear_bwd_dw_mfma_gfx942"];
+        let mut dyp = dy.buf.as_ptr(); let mut xp = x.buf.as_ptr(); let mut dwp = dw.buf.as_ptr();
+        let mut mi = m as i32; let mut ki = k as i32; let mut ni = n_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dyp as *mut _ as *mut c_void, &mut xp as *mut _ as *mut c_void, &mut dwp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void, &mut ki as *mut _ as *mut c_void, &mut ni as *mut _ as *mut c_void,
+        ];
+        let gx = ((n_dim as u32) + 31) / 32; let gy = ((k as u32) + 31) / 32;
+        unsafe { self.hip.launch_kernel(func, [gx, gy, 1], [256, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// f32 -> bf16 elementwise into a 2-byte (F16-container) tensor.
+    pub fn to_bf16_f32(&mut self, src: &GpuTensor, dst: &GpuTensor, n: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gemm_bf16_mfma", kernels::GEMM_BF16_MFMA_SRC, "to_bf16_f32")?;
+        let func = &self.functions["to_bf16_f32"];
+        let mut sp = src.buf.as_ptr(); let mut dp = dst.buf.as_ptr(); let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut sp as *mut _ as *mut c_void, &mut dp as *mut _ as *mut c_void, &mut ni as *mut _ as *mut c_void,
+        ];
+        let blk = 256u32; let grid = (((n as u32) + blk - 1) / blk).max(1);
+        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [blk, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// bf16 x bf16 -> f32 MFMA GEMM (gfx942): D[batch,M] = sum_K A[M,K]*B[batch,K].
+    /// A, B are bf16 (F16-container) tensors; D is f32. Mirrors gemm_f32_register_tiled.
+    pub fn gemm_bf16_mfma(&mut self, a: &GpuTensor, b: &GpuTensor, d: &GpuTensor, m: usize, k: usize, batch: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gemm_bf16_mfma", kernels::GEMM_BF16_MFMA_SRC, "gemm_bf16_mfma_gfx942")?;
+        let func = &self.functions["gemm_bf16_mfma_gfx942"];
+        let mut ap = a.buf.as_ptr(); let mut bp = b.buf.as_ptr(); let mut dp = d.buf.as_ptr();
+        let mut mi = m as i32; let mut ki = k as i32; let mut bi = batch as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void, &mut bp as *mut _ as *mut c_void, &mut dp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void, &mut ki as *mut _ as *mut c_void, &mut bi as *mut _ as *mut c_void,
+        ];
+        let gx = ((m as u32) + 31) / 32; let gy = ((batch as u32) + 31) / 32;
+        unsafe { self.hip.launch_kernel(func, [gx, gy, 1], [256, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// lm_head bf16 GEMM v2: coalesced LDS A-stage + split-K (atomicAdd).
+    /// D MUST be pre-zeroed. ksplit chosen for >=2048 WGs (304-CU fill).
+    pub fn gemm_bf16_mfma_splitk(&mut self, a: &GpuTensor, b: &GpuTensor, d: &GpuTensor, m: usize, k: usize, batch: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gemm_bf16_mfma", kernels::GEMM_BF16_MFMA_SRC, "gemm_bf16_mfma_splitk_gfx942")?;
+        let func = &self.functions["gemm_bf16_mfma_splitk_gfx942"];
+        let gx = ((m as u32) + 31) / 32;
+        let kchunks = ((k as u32) + 127) / 128;
+        let want = ((2048 + gx - 1) / gx).max(1);
+        let ksplit = want.min(kchunks).max(1);
+        let kcps = ((kchunks + ksplit - 1) / ksplit).max(1);
+        let mut ap = a.buf.as_ptr(); let mut bp = b.buf.as_ptr(); let mut dp = d.buf.as_ptr();
+        let mut mi = m as i32; let mut ki = k as i32; let mut bi = batch as i32; let mut kc = kcps as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void, &mut bp as *mut _ as *mut c_void, &mut dp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void, &mut ki as *mut _ as *mut c_void, &mut bi as *mut _ as *mut c_void,
+            &mut kc as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [gx, ksplit, 1], [256, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// MFMA dX (gfx942): dX[batch,K] = sum_n dY[batch,n]*W[n,k], batch<=16.
+    /// Native A[m,k]*B[k,n] form -- W read directly & coalesced (no transpose).
+    pub fn linear_bwd_dx_mfma_f32(&mut self, dy: &GpuTensor, w: &GpuTensor, dx: &GpuTensor, batch: usize, k: usize, n_dim: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("dflash_train", kernels::DFLASH_TRAIN_SRC, "linear_bwd_dx_mfma_gfx942")?;
+        let func = &self.functions["linear_bwd_dx_mfma_gfx942"];
+        let mut dyp = dy.buf.as_ptr(); let mut wp = w.buf.as_ptr(); let mut dxp = dx.buf.as_ptr();
+        let mut bi = batch as i32; let mut ki = k as i32; let mut ni = n_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dyp as *mut _ as *mut c_void, &mut wp as *mut _ as *mut c_void, &mut dxp as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void, &mut ki as *mut _ as *mut c_void, &mut ni as *mut _ as *mut c_void,
+        ];
+        let gx = ((k as u32) + 63) / 64; let gy = ((n_dim as u32) + 255) / 256;
+        unsafe { self.hip.launch_kernel(func, [gx, gy, 1], [256, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// RMSNorm backward. x [rows,n], g [n], dy [rows,n] -> dx [rows,n], dG [n]
+    /// (dG accumulated via atomics — PRE-ZERO it).
+    pub fn rmsnorm_bwd_f32(&mut self, x: &GpuTensor, g: &GpuTensor, dy: &GpuTensor, dx: &GpuTensor, dg: &GpuTensor, rows: usize, n: usize, eps: f32) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("dflash_train", kernels::DFLASH_TRAIN_SRC, "rmsnorm_bwd_f32")?;
+        let func = &self.functions["rmsnorm_bwd_f32"];
+        let mut xp = x.buf.as_ptr(); let mut gp = g.buf.as_ptr(); let mut dyp = dy.buf.as_ptr();
+        let mut dxp = dx.buf.as_ptr(); let mut dgp = dg.buf.as_ptr();
+        let mut ri = rows as i32; let mut ni = n as i32; let mut epsv = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void, &mut gp as *mut _ as *mut c_void, &mut dyp as *mut _ as *mut c_void,
+            &mut dxp as *mut _ as *mut c_void, &mut dgp as *mut _ as *mut c_void,
+            &mut ri as *mut _ as *mut c_void, &mut ni as *mut _ as *mut c_void, &mut epsv as *mut _ as *mut c_void,
+        ];
+        let block = if n >= 256 { 256u32 } else { n as u32 };
+        unsafe { self.hip.launch_kernel(func, [rows as u32, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// SwiGLU backward. out = silu(g)·u -> dG, dU.
+    pub fn silu_mul_bwd_f32(&mut self, g: &GpuTensor, u: &GpuTensor, d_out: &GpuTensor, dg: &GpuTensor, du: &GpuTensor, n: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("dflash_train", kernels::DFLASH_TRAIN_SRC, "silu_mul_bwd_f32")?;
+        let func = &self.functions["silu_mul_bwd_f32"];
+        let mut gp = g.buf.as_ptr(); let mut up = u.buf.as_ptr(); let mut dop = d_out.buf.as_ptr();
+        let mut dgp = dg.buf.as_ptr(); let mut dup = du.buf.as_ptr(); let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gp as *mut _ as *mut c_void, &mut up as *mut _ as *mut c_void, &mut dop as *mut _ as *mut c_void,
+            &mut dgp as *mut _ as *mut c_void, &mut dup as *mut _ as *mut c_void, &mut ni as *mut _ as *mut c_void,
+        ];
+        let block = 256u32; let grid = ((n as u32) + block - 1) / block;
+        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// RoPE backward (rotate_half, in place on the grad). `positions` i32.
+    pub fn rope_rows_bwd_f32(&mut self, grad: &GpuTensor, positions: &GpuTensor, n_heads: usize, head_dim: usize, freq_base: f32, rows: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("dflash_train", kernels::DFLASH_TRAIN_SRC, "rope_rows_bwd_f32")?;
+        let func = &self.functions["rope_rows_bwd_f32"];
+        let mut gp = grad.buf.as_ptr(); let mut pp = positions.buf.as_ptr();
+        let mut nh = n_heads as i32; let mut hd = head_dim as i32; let mut fb = freq_base; let mut rw = rows as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gp as *mut _ as *mut c_void, &mut pp as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void, &mut fb as *mut _ as *mut c_void, &mut rw as *mut _ as *mut c_void,
+        ];
+        let half = (head_dim / 2) as u32; let block = 256u32.min(half.max(1));
+        let grid_x = (half + block - 1) / block;
+        unsafe { self.hip.launch_kernel(func, [grid_x, rows as u32, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// GQA block attention backward. q/k/v [.,.,hd] (post-rope/qknorm) + dO -> dQ
+    /// (overwritten), dK/dV (atomic-accumulated — PRE-ZERO them).
+    pub fn attn_block_ctx_bwd_f32(&mut self, q: &GpuTensor, k: &GpuTensor, v: &GpuTensor, d_o: &GpuTensor, dq: &GpuTensor, dk: &GpuTensor, dv: &GpuTensor, b: usize, l: usize, n_heads: usize, n_kv: usize, head_dim: usize, scale: f32) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("dflash_train", kernels::DFLASH_TRAIN_SRC, "attn_block_ctx_bwd_f32")?;
+        let func = &self.functions["attn_block_ctx_bwd_f32"];
+        let mut qp = q.buf.as_ptr(); let mut kp = k.buf.as_ptr(); let mut vp = v.buf.as_ptr(); let mut dop = d_o.buf.as_ptr();
+        let mut dqp = dq.buf.as_ptr(); let mut dkp = dk.buf.as_ptr(); let mut dvp = dv.buf.as_ptr();
+        let mut bi = b as i32; let mut li = l as i32; let mut nhi = n_heads as i32; let mut nkvi = n_kv as i32; let mut hdi = head_dim as i32; let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void, &mut kp as *mut _ as *mut c_void, &mut vp as *mut _ as *mut c_void, &mut dop as *mut _ as *mut c_void,
+            &mut dqp as *mut _ as *mut c_void, &mut dkp as *mut _ as *mut c_void, &mut dvp as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void, &mut li as *mut _ as *mut c_void, &mut nhi as *mut _ as *mut c_void,
+            &mut nkvi as *mut _ as *mut c_void, &mut hdi as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
+        ];
+        let grid = ((b * n_heads) as u32).max(1);
+        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Softmax-CE backward + per-row loss with per-row weight. logits [B,V],
+    /// targets [B] i32, weights [B] -> dlogits [B,V], loss [B].
+    pub fn ce_loss_bwd_f32(&mut self, logits: &GpuTensor, targets: &GpuTensor, weights: &GpuTensor, dlogits: &GpuTensor, loss: &GpuTensor, b: usize, v: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("dflash_train", kernels::DFLASH_TRAIN_SRC, "ce_loss_bwd_f32")?;
+        let func = &self.functions["ce_loss_bwd_f32"];
+        let mut lp = logits.buf.as_ptr(); let mut tp = targets.buf.as_ptr(); let mut wp = weights.buf.as_ptr();
+        let mut dp = dlogits.buf.as_ptr(); let mut losp = loss.buf.as_ptr();
+        let mut bi = b as i32; let mut vi = v as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut lp as *mut _ as *mut c_void, &mut tp as *mut _ as *mut c_void, &mut wp as *mut _ as *mut c_void,
+            &mut dp as *mut _ as *mut c_void, &mut losp as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void, &mut vi as *mut _ as *mut c_void,
+        ];
+        let block = if v >= 256 { 256u32 } else { (v as u32).next_power_of_two().max(1) };
+        unsafe { self.hip.launch_kernel(func, [b as u32, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// AdamW step (fp32 m/v). `bc1`/`bc2` = 1/(1-beta^t) bias-correction (host).
+    #[allow(clippy::too_many_arguments)]
+    pub fn adam_step_f32(&mut self, w: &GpuTensor, g: &GpuTensor, m: &GpuTensor, v: &GpuTensor, lr: f32, b1: f32, b2: f32, eps: f32, wd: f32, bc1: f32, bc2: f32, n: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("dflash_train", kernels::DFLASH_TRAIN_SRC, "adam_step_f32")?;
+        let func = &self.functions["adam_step_f32"];
+        let mut wp = w.buf.as_ptr(); let mut gp = g.buf.as_ptr(); let mut mp = m.buf.as_ptr(); let mut vp = v.buf.as_ptr();
+        let (mut lrv, mut b1v, mut b2v, mut epsv, mut wdv, mut bc1v, mut bc2v) = (lr, b1, b2, eps, wd, bc1, bc2);
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut wp as *mut _ as *mut c_void, &mut gp as *mut _ as *mut c_void, &mut mp as *mut _ as *mut c_void, &mut vp as *mut _ as *mut c_void,
+            &mut lrv as *mut _ as *mut c_void, &mut b1v as *mut _ as *mut c_void, &mut b2v as *mut _ as *mut c_void,
+            &mut epsv as *mut _ as *mut c_void, &mut wdv as *mut _ as *mut c_void, &mut bc1v as *mut _ as *mut c_void, &mut bc2v as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        let block = 256u32; let grid = ((n as u32) + block - 1) / block;
+        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Add inj[d] (broadcast over block) into the C_gate slice of bcx [block,3d].
+    pub fn cgate_add_f32(&mut self, bcx: &GpuTensor, inj: &GpuTensor, block: usize, d: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("dflash_train", kernels::DFLASH_TRAIN_SRC, "cgate_add_f32")?;
+        let func = &self.functions["cgate_add_f32"];
+        let mut bp = bcx.buf.as_ptr(); let mut ip = inj.buf.as_ptr();
+        let mut bl = block as i32; let mut dd = d as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut bp as *mut _ as *mut c_void, &mut ip as *mut _ as *mut c_void,
+            &mut bl as *mut _ as *mut c_void, &mut dd as *mut _ as *mut c_void,
+        ];
+        let blk = 256u32; let grid = (((block * d) as u32) + blk - 1) / blk;
+        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [blk, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Strided column-sum: out[c] = scale * sum_j x[j*row_stride + col_off + c].
+    #[allow(clippy::too_many_arguments)]
+    pub fn colsum_strided_f32(&mut self, x: &GpuTensor, out: &GpuTensor, rows: usize, row_stride: usize, col_off: usize, d: usize, scale: f32) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("dflash_train", kernels::DFLASH_TRAIN_SRC, "colsum_strided_f32")?;
+        let func = &self.functions["colsum_strided_f32"];
+        let mut xp = x.buf.as_ptr(); let mut op = out.buf.as_ptr();
+        let mut rw = rows as i32; let mut rs = row_stride as i32; let mut co = col_off as i32; let mut dd = d as i32; let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+            &mut rw as *mut _ as *mut c_void, &mut rs as *mut _ as *mut c_void,
+            &mut co as *mut _ as *mut c_void, &mut dd as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
+        ];
+        let blk = 256u32; let grid = ((d as u32) + blk - 1) / blk;
+        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [blk, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
     pub fn conv1d_gated_decode_f32(
         &mut self,
         bcx: &GpuTensor,
