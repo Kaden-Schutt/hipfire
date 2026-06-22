@@ -58,19 +58,41 @@ Key established facts (the "why" for the follow-ups):
 
 ## Follow-up tasks (rough priority order)
 
-### 1. True multi-session batched-prefill support
-Today the batched session-batch prefill (`forward_prefill_dense/grouped_session_batch`,
-own batched attention) is **guarded off** for hier; multi-session sessions must take
-the per-token path. To actually run hier under the batched server, either:
-- (a) **Per-token routing split**: in the batch runner, peel hier sessions out of the
-  session-batch rows and prefill them via `qwen35_prefill_active_session` (per-token
-  `forward_scratch`), batching only the non-hier sessions. Lower risk; loses batched
-  throughput for hier sessions (acceptable — hier is a memory play, not a speed one).
-- (b) **Batched two-tier attention**: a session-batch attention kernel that does the
-  hot-ring + cold-segment two-tier read per row. Much larger; only worth it if hier
-  needs batched-prefill throughput.
-Recommend (a). Prereq: confirm the single-session per-token path's serve coherence
-on a real multi-turn daemon session (the `idle_compact` hook fires there).
+### 1. Multi-session batched-prefill support — **DONE (routing), commit db6f87bf**
+Implemented approach (a) at the backend-selection layer rather than splitting rows:
+the multi-session **batch protocol** (`generate_batch_prefill` /
+`generate_batch_decode_step`) now forces the `SerialReference` backend when
+`HIPFIRE_KV_HIERARCHICAL=1`, for BOTH prefill (`qwen35_prefill_suffix_batch`) and
+decode (`run_generate_batch_decode_step_qwen35`). SerialReference activates each
+session and runs per-token `forward_scratch` through `kv_cache_attention_dispatch`
+(per-session isolated) — the path where the hot-ring/two-tier-read/idle hook live.
+Correct by extension of the `infer_qwen35` proof (forward_scratch+kvarn+hier coherent).
+Replaced the prior hard guard. Slower than fused batch; hier is a memory feature.
+
+### 1b. **NEW PREREQUISITE (discovered during #1 validation): kvarn in the daemon `generate` path**
+Validation surfaced a **larger, pre-existing gap**: the daemon's single-session
+`generate` path prefills via `forward_prefill_batch_chunked` (batched attention),
+which bypasses the per-token dispatch — so **plain kvarn is garbage in single
+`generate`** (q8 is fine; verified on `hipfire-daemon`), and hier degenerates there
+too. This is independent of hier — kvarn was only ever exercised via per-token paths
+(`infer_qwen35`, `eval_hipfire`), never the daemon serve path. Until this is fixed,
+hier is usable only via the multi-session batch protocol (#1), not single `generate`.
+- **Fix**: route the daemon `generate` prefill (and any batched decode) to per-token
+  `forward_scratch` when the active cache is `quant_kvarn` (mirror the #1 overrides;
+  detect `m.kv_cache.quant_kvarn`, not just the env flag, so plain kvarn benefits).
+  Lives in the 18k-line `hipfire-daemon/src/main.rs` `generate()` (≈13986) + the
+  chunked-prefill call site. Cross-cutting; treat as its own task.
+- **Validation gate**: a `hipfire-daemon` multi-turn session (kvarn + hier) that stays
+  coherent across two turns (turn 2 fires `idle_compact`). This is the real end-to-end
+  test that #1 could not run (it requires either fixing 1b, or driving the batch
+  protocol envelope directly).
+- **Quick win**: this fix ALSO makes plain kvarn work in the daemon — worth doing
+  regardless of hier.
+
+### 1c. (Optional) batched two-tier attention
+Only if hier ever needs batched-prefill *throughput*: a session-batch attention
+kernel doing the hot-ring + cold-segment two-tier read per row. Large; the
+per-token serial route (#1) is correct and sufficient for a memory feature.
 
 ### 2. Segment defragmentation
 `idle_compact` folds each turn's drain into ONE cold segment, so segments accumulate
