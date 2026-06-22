@@ -4762,6 +4762,169 @@ pub fn dump_embed_fp32(
     Ok((vocab, dim))
 }
 
+/// Outcome of a daemon-resident KLD evaluation pass.
+pub struct KldEvalOutcome {
+    pub n_chunk: usize,
+    pub total_scored: usize,
+    pub mean_kld: f32,
+    pub p99_kld: f32,
+    pub mean_nll: f32,
+    pub per_chunk: Vec<hipfire_kld::ChunkResult>,
+}
+
+fn kld_mean_f32(v: &[f32]) -> f32 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    (v.iter().map(|&x| x as f64).sum::<f64>() / v.len() as f64) as f32
+}
+
+fn kld_p99_f32(v: &[f32]) -> f32 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.total_cmp(b));
+    let idx = (((s.len() as f64) * 0.99).ceil() as usize)
+        .saturating_sub(1)
+        .min(s.len() - 1);
+    s[idx]
+}
+
+/// Run the resident model over `chunk` (per-token decode, fresh KV + DeltaNet
+/// state) and invoke `at_scored(j, full_logits, actual_next)` for each scored
+/// position `j` in `[scoring_start, n_ctx-1)`. The single forward path that both
+/// reference build and candidate scoring funnel through.
+fn forward_chunk_scored(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    chunk: &[u32],
+    scoring_start: usize,
+    mut at_scored: impl FnMut(usize, &[f32], usize),
+) -> HipResult<()> {
+    let n = chunk.len();
+    let mut kv = kv::KvCache::new_gpu(
+        gpu,
+        config.n_layers,
+        config.n_kv_heads,
+        config.head_dim,
+        n + 16,
+    )?;
+    let mut dn = DeltaNetState::new(gpu, config)?;
+    let scratch = Qwen35Scratch::new(gpu, config, 64)?;
+    for pos in 0..n.saturating_sub(1) {
+        forward_scratch(
+            gpu, weights, config, chunk[pos], pos, &mut kv, &mut dn, &scratch,
+        )?;
+        if pos >= scoring_start {
+            let lg = gpu.download_f32(&scratch.logits)?;
+            at_scored(pos - scoring_start, &lg, chunk[pos + 1] as usize);
+        }
+    }
+    Ok(())
+}
+
+/// Self-consistency KLD against the resident model, no reload.
+///
+/// Pass 1 builds a reference (top-K log-softmax per scored position) from the
+/// loaded model over each `n_ctx` chunk; pass 2 scores the SAME model against
+/// that in-memory reference via a second forward through the identical code.
+/// Because reference build and scoring share one forward path on one loaded
+/// model + config, a healthy run returns ≈0 on ANY arch — this is the guard that
+/// would have caught the historical two-binary 2.85-nat drift in seconds. A
+/// non-zero result is a real forward non-determinism or plumbing bug.
+#[allow(clippy::too_many_arguments)]
+pub fn kld_eval_self_score(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    n_ctx: usize,
+    top_k: usize,
+    max_chunks: Option<usize>,
+    mut on_chunk: impl FnMut(usize, usize, usize, f32),
+) -> HipResult<KldEvalOutcome> {
+    use hipfire_kld::{score_position, top_k_log_softmax, RefBlock, TopKReduction};
+
+    let scoring_start = n_ctx / 2;
+    let n_chunk_avail = tokens.len() / n_ctx;
+    let n_chunk = max_chunks.map_or(n_chunk_avail, |m| m.min(n_chunk_avail));
+
+    let mut per_chunk = Vec::with_capacity(n_chunk);
+    let mut global_kld_sum = 0.0f64;
+    let mut total_scored = 0usize;
+    let mut global_nll_sum = 0.0f64;
+    let mut global_nll_n = 0usize;
+
+    for c in 0..n_chunk {
+        let chunk = &tokens[c * n_ctx..c * n_ctx + n_ctx];
+
+        // Pass 1: reference top-K reductions for the scored positions.
+        let mut reds: Vec<TopKReduction> = Vec::new();
+        forward_chunk_scored(
+            gpu,
+            weights,
+            config,
+            chunk,
+            scoring_start,
+            |_j, lg, _next| {
+                reds.push(top_k_log_softmax(lg, top_k));
+            },
+        )?;
+
+        // Pass 2: score the same model against the in-memory reference.
+        let mut klds: Vec<f32> = Vec::with_capacity(reds.len());
+        let mut nlls: Vec<f32> = Vec::new();
+        forward_chunk_scored(gpu, weights, config, chunk, scoring_start, |j, lg, next| {
+            let red = &reds[j];
+            let rb = RefBlock {
+                top_indices: &red.indices,
+                top_log_probs: &red.log_probs,
+                residual_mass: red.residual_mass,
+            };
+            let s = score_position(&rb, lg, next);
+            klds.push(s.kld);
+            if let Some(n) = s.nll {
+                nlls.push(n);
+            }
+        })?;
+
+        let mean_kld = kld_mean_f32(&klds);
+        global_kld_sum += klds.iter().map(|&x| x as f64).sum::<f64>();
+        total_scored += klds.len();
+        global_nll_sum += nlls.iter().map(|&x| x as f64).sum::<f64>();
+        global_nll_n += nlls.len();
+        on_chunk(c, n_chunk, klds.len(), mean_kld);
+        per_chunk.push(hipfire_kld::ChunkResult {
+            mean_kld: mean_kld as f64,
+            p99_kld: kld_p99_f32(&klds) as f64,
+            mean_nll: kld_mean_f32(&nlls) as f64,
+        });
+    }
+
+    let mean_kld = if total_scored > 0 {
+        (global_kld_sum / total_scored as f64) as f32
+    } else {
+        0.0
+    };
+    let mean_nll = if global_nll_n > 0 {
+        (global_nll_sum / global_nll_n as f64) as f32
+    } else {
+        0.0
+    };
+    let chunk_means: Vec<f32> = per_chunk.iter().map(|c| c.mean_kld as f32).collect();
+
+    Ok(KldEvalOutcome {
+        n_chunk,
+        total_scored,
+        mean_kld,
+        p99_kld: kld_p99_f32(&chunk_means),
+        mean_nll,
+        per_chunk,
+    })
+}
+
 /// Single-load calibration driver: arm the [`CalibCollector`] on the resident
 /// weights, run the engine forward over `tokens` (capturing per-tensor Hessian +
 /// imatrix, the MoE router histogram for MoE models, and optionally KLDREF), and

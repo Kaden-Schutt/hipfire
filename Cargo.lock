@@ -1330,6 +1330,7 @@ dependencies = [
  "hip-bridge",
  "hipfire-cpu",
  "hipfire-dispatch",
+ "hipfire-kld",
  "hipfire-model",
  "hipfire-npu",
  "hipfire-rocm",
@@ -1450,6 +1451,7 @@ dependencies = [
  "hipfire-daemon-adapter",
  "hipfire-evidence",
  "hipfire-generate",
+ "hipfire-kld",
  "hipfire-lock",
  "hipfire-model",
  "hipfire-npu",
@@ -1485,6 +1487,7 @@ name = "hipfire-daemon-protocol"
 version = "0.2.1"
 dependencies = [
  "hipfire-generate",
+ "hipfire-kld",
  "hipfire-model",
  "hipfire-prompt",
  "serde",

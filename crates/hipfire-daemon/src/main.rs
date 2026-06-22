@@ -4406,6 +4406,138 @@ fn main() {
                 }
             }
 
+            // Daemon-resident KLD evaluation (no reload). `self_score` builds a
+            // reference from the loaded model and scores the SAME model against
+            // it through one forward path → ≈0 on a healthy run; the guard that
+            // catches the historical two-binary drift. build_ref/score (with the
+            // .kldref container) land next.
+            "kld_eval" => {
+                let mode = msg.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+                if mode != "self_score" {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        format!(
+                            "kld_eval: only mode=self_score is wired so far (got {mode:?}); \
+                             build_ref/score pending the .kldref container path"
+                        ),
+                    );
+                    continue;
+                }
+                let Some(corpus) = msg.get("corpus").and_then(|v| v.as_str()).map(String::from)
+                else {
+                    emit_error_with_id(&mut stdout, "", "kld_eval: missing 'corpus'".to_string());
+                    continue;
+                };
+                let n_ctx = msg
+                    .get("n_ctx")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(2048);
+                let max_chunks = msg
+                    .get("max_chunks")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
+                let top_k = msg
+                    .get("config")
+                    .and_then(|c| c.get("top_k"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(256);
+                let output = msg.get("output").and_then(|v| v.as_str()).map(String::from);
+                let Some(m) = model.as_ref() else {
+                    emit_error_with_id(&mut stdout, "", "kld_eval: no model loaded".to_string());
+                    continue;
+                };
+                if m.pp != 1 {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "kld_eval: requires a single-GPU resident model (pp == 1)".to_string(),
+                    );
+                    continue;
+                }
+                let (Some(weights), Some(config), Some(tokenizer)) = (
+                    m.q35_weights.as_ref(),
+                    m.q35_config.as_ref(),
+                    m.tokenizer.as_ref(),
+                ) else {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "kld_eval: resident model is not a qwen3.5-family model with a tokenizer"
+                            .to_string(),
+                    );
+                    continue;
+                };
+                let text = match std::fs::read_to_string(&corpus) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            format!("kld_eval: read {corpus}: {e}"),
+                        );
+                        continue;
+                    }
+                };
+                let tokens = tokenizer.encode(&text);
+                let result = qwen35::kld_eval_self_score(
+                    &mut gpu,
+                    weights,
+                    config,
+                    &tokens,
+                    n_ctx,
+                    top_k,
+                    max_chunks,
+                    |c, n_chunk, scored, mean_kld| {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({
+                                "type": "kld_chunk", "chunk": c, "n_chunk": n_chunk,
+                                "scored": scored, "mean_kld": mean_kld,
+                            })
+                        );
+                        let _ = stdout.flush();
+                    },
+                );
+                match result {
+                    Ok(out) => {
+                        let mut seq_output = serde_json::Value::Null;
+                        if let Some(path) = output.as_deref() {
+                            match hipfire_kld::hfkseq::write_file(
+                                std::path::Path::new(path),
+                                &out.per_chunk,
+                            ) {
+                                Ok(()) => seq_output = serde_json::json!(path),
+                                Err(e) => emit_error_with_id(
+                                    &mut stdout,
+                                    "",
+                                    format!("kld_eval: write {path}: {e}"),
+                                ),
+                            }
+                        }
+                        let ppl = (out.mean_nll as f64).exp();
+                        let resp = serde_json::json!({
+                            "type": "kld_evaled",
+                            "mode": "self_score",
+                            "n_chunk": out.n_chunk,
+                            "total_scored": out.total_scored,
+                            "mean_kld": out.mean_kld,
+                            "p99_kld": out.p99_kld,
+                            "mean_nll": out.mean_nll,
+                            "ppl": ppl,
+                            "seq_output": seq_output,
+                            "compat_findings": [],
+                        });
+                        let _ = writeln!(stdout, "{resp}");
+                        let _ = stdout.flush();
+                    }
+                    Err(e) => emit_error_with_id(&mut stdout, "", format!("kld_eval: {e}")),
+                }
+            }
+
             // PFlash drafter TEACHER: forward the resident qwen3.5 target over a
             // corpus and emit per-chunk per-block cosine-K scores at the shallow +
             // mid FullAttention layers — the labels `pflash_drafter_train` distils
