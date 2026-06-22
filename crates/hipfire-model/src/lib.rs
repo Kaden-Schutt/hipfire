@@ -548,6 +548,201 @@ pub fn model_display_name(path: &Path) -> String {
         .to_string()
 }
 
+// ---------------------------------------------------------------------------
+// Model card: shared, GPU-free capability + artifact description
+//
+// Single source of truth for "what can this model do / what ships with it",
+// consumed by `hipfire list` (display) and serving admission (gating). The
+// arch-feature matrix mirrors MODEL-SUPPORT.md; keep the two in sync.
+// ---------------------------------------------------------------------------
+
+/// Tri-state support level for an arch capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FeatureSupport {
+    /// Implemented and exercised on this arch.
+    Full,
+    /// Partial / limited / single-token-only path.
+    Partial,
+    /// Not implemented or not applicable.
+    None,
+    /// Arch id was unreadable / unrecognized.
+    Unknown,
+}
+
+impl FeatureSupport {
+    /// Compact ASCII mark: `y`/`~`/`-`/`?`.
+    pub fn mark(self) -> &'static str {
+        match self {
+            FeatureSupport::Full => "y",
+            FeatureSupport::Partial => "~",
+            FeatureSupport::None => "-",
+            FeatureSupport::Unknown => "?",
+        }
+    }
+    /// True only for a fully-supported capability — the conservative answer for
+    /// admission gating (Partial/Unknown do not pass).
+    pub fn is_full(self) -> bool {
+        matches!(self, FeatureSupport::Full)
+    }
+}
+
+/// Per-arch capability summary, keyed by HFQ arch_id. Mirrors the feature
+/// matrix in MODEL-SUPPORT.md.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArchFeatures {
+    pub label: &'static str,
+    /// Batched (multi-token) prefill.
+    pub prefill: FeatureSupport,
+    /// DFlash speculative decode.
+    pub dflash: FeatureSupport,
+    /// MTP speculative decode.
+    pub mtp: FeatureSupport,
+    /// KV-quant menu, e.g. "full" / "fp32+q8" / "fp32".
+    pub kv: &'static str,
+    /// Vision / multimodal input.
+    pub vision: FeatureSupport,
+}
+
+/// Look up the capability summary for an HFQ arch_id. Source of truth:
+/// MODEL-SUPPORT.md — update both together.
+pub fn arch_features(arch_id: u32) -> ArchFeatures {
+    use FeatureSupport::{Full as Y, None as N, Partial as P};
+    let f = |label, prefill, dflash, mtp, kv, vision| ArchFeatures {
+        label,
+        prefill,
+        dflash,
+        mtp,
+        kv,
+        vision,
+    };
+    match arch_id {
+        5 | 6 => f("qwen3.5", Y, Y, Y, "full", P),
+        9 => f("deepseek4", Y, N, P, "fp32", N),
+        10 => f("minimax", P, N, P, "fp32", N),
+        11 => f("lfm2-moe", P, N, N, "fp32", N),
+        12 => f("gemma3", Y, N, N, "fp32+q8", N),
+        13 => f("gemma3-vl", Y, N, N, "fp32+q8", Y),
+        7 => f("qwen2", Y, N, N, "fp32", N),
+        8 => f("dots-ocr", Y, N, N, "fp32", Y),
+        0 | 1 => f("llama", P, N, N, "fp32", N),
+        _ => f(
+            "unknown",
+            FeatureSupport::Unknown,
+            FeatureSupport::Unknown,
+            FeatureSupport::Unknown,
+            "?",
+            FeatureSupport::Unknown,
+        ),
+    }
+}
+
+/// On-disk companion artifacts bundled with or sitting beside a model.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sidecars {
+    /// Chat template present in the HFQ metadata header.
+    pub template: bool,
+    /// MTP draft: `<base>.mtp.hfq` sidecar or bundled (`+mtp`).
+    pub mtp: bool,
+    /// DFlash draft: `<base>.dflash.hfq` sidecar or bundled (`+dflash`).
+    pub dflash: bool,
+    /// TriAttention sidecar: `<base>.triattn.hfq`.
+    pub triattn: bool,
+    /// Hessian / calibration sidecar: `<base>.calib.hfq`.
+    pub hessian: bool,
+}
+
+/// Quant/format token of a model display name. Scans `-`-delimited segments for
+/// a known format prefix (mq4, oq4, qtip3, q8, bf16, …) so calibration modifiers
+/// that trail the format (e.g. `oq4-ldlq`) don't mask it; falls back to the last
+/// segment. A bundled `+feature` suffix is stripped.
+pub fn quant_token(display: &str) -> String {
+    const FORMATS: &[&str] = &[
+        "bf16", "fp16", "f16", "q8", "mq2", "mq3", "mq4", "mq6", "mq8", "oq4", "oq8", "qtip2",
+        "qtip3", "iu8", "w4a8", "w8a8",
+    ];
+    let mut best: Option<&str> = None;
+    for seg in display.split('-') {
+        let head = seg.split('+').next().unwrap_or(seg);
+        let low = head.to_ascii_lowercase();
+        if FORMATS.iter().any(|fmt| low.starts_with(fmt)) {
+            best = Some(head);
+        }
+    }
+    best.map(str::to_string).unwrap_or_else(|| {
+        display
+            .rsplit('-')
+            .next()
+            .unwrap_or(display)
+            .split('+')
+            .next()
+            .unwrap_or(display)
+            .to_string()
+    })
+}
+
+/// Detect template + sidecar artifacts for a primary model file (GPU-free:
+/// reads only the metadata header and stats sibling files).
+pub fn detect_sidecars(path: &Path) -> Sidecars {
+    let full = path.to_string_lossy();
+    let base = full.strip_suffix(".hfq").unwrap_or(&full);
+    let sib = |role: &str| Path::new(&format!("{base}.{role}.hfq")).exists();
+
+    // Bundled features ride the `+feature` filename tokens (mq4+mtp, …).
+    let display = model_display_name(path);
+    let bundled: Vec<&str> = display.split('+').skip(1).collect();
+    let has_bundled = |needle: &str| bundled.iter().any(|b| b.contains(needle));
+
+    // Chat template lives in tokenizer_config.chat_template (HF convention);
+    // some artifacts stash it top-level. Present + non-empty in either place.
+    let template = read_hfq_metadata(path)
+        .ok()
+        .and_then(|m| serde_json::from_str::<Value>(&m.metadata_json).ok())
+        .map(|v| {
+            let nonempty = |t: Option<&Value>| {
+                t.and_then(|x| x.as_str())
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false)
+            };
+            nonempty(v.get("chat_template"))
+                || nonempty(v.get("tokenizer_config").and_then(|tc| tc.get("chat_template")))
+        })
+        .unwrap_or(false);
+
+    Sidecars {
+        template,
+        mtp: sib("mtp") || has_bundled("mtp"),
+        dflash: sib("dflash") || has_bundled("dflash"),
+        triattn: sib("triattn"),
+        hessian: sib("calib"),
+    }
+}
+
+/// Full GPU-free description of a local model: identity, quant, arch capability,
+/// and bundled/sidecar artifacts. The shared card consumed by `hipfire list`
+/// (display) and serving admission (gating).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ModelCard {
+    pub name: String,
+    pub quant: String,
+    /// HFQ arch_id, or `None` if the metadata header was unreadable.
+    pub arch_id: Option<u32>,
+    pub features: ArchFeatures,
+    pub sidecars: Sidecars,
+}
+
+/// Build a [`ModelCard`] for a primary model file.
+pub fn model_card(path: &Path) -> ModelCard {
+    let name = model_display_name(path);
+    let arch_id = read_hfq_metadata(path).ok().map(|m| m.arch_id);
+    ModelCard {
+        quant: quant_token(&name),
+        features: arch_features(arch_id.unwrap_or(u32::MAX)),
+        sidecars: detect_sidecars(path),
+        arch_id,
+        name,
+    }
+}
+
 pub fn openai_model_list_json<I, P>(models: I) -> Value
 where
     I: IntoIterator<Item = P>,
