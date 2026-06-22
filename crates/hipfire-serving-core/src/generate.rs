@@ -2080,7 +2080,18 @@ pub fn generate(
         return;
     }
 
+    // KVarN (and the deferred-hierarchical two-tier cache built on it) require the
+    // per-token attention dispatch (kv_cache_attention_dispatch). The spec-decode
+    // paths (DFlash, MTP) batch-prefill the prompt and would bypass it, leaving the
+    // KVarN window/records (and hier hot ring) unpopulated → garbage. Route kvarn
+    // models to the plain AR path below (per-token forward_scratch prefill+decode).
+    let kvarn_active = m
+        .kv_cache
+        .as_ref()
+        .map(|c| c.quant_kvarn)
+        .unwrap_or(false);
     if m.dflash.is_some()
+        && !kvarn_active
         && temp <= 1e-6
         && is_qwen35_family_arch_id(m.arch_id)
         && !budgeted_thinking_needs_ar
@@ -2145,6 +2156,7 @@ pub fn generate(
     if m.dflash.is_none()
         && m.mtp_weights_present
         && m.mtp_mode != "off"
+        && !kvarn_active
         && temp <= 1e-6
         && is_qwen35_family_arch_id(m.arch_id)
         && !prefill_already_done
@@ -2634,7 +2646,37 @@ pub fn generate(
         // when physical is at post-evict `budget`, a full `beta`-sized chunk
         // can run before the next eviction fires.
         if !prefill_already_done {
-            if let Some(ref ev) = m.eviction {
+            // Deferred-hierarchical KV: on a continued turn (seq_pos > 0), drain the
+            // hot ring into cold here at the prefill entry — the between-turns idle
+            // gap, off the decode critical path — before the new prompt tokens append.
+            // (The batch-protocol path does this in qwen35_prefill_active_session;
+            // single `generate` prefills inline, so mirror it here.)
+            if session.seq_pos > 0 {
+                if let Some(h) = kv.hier.as_mut() {
+                    if h.enabled {
+                        let keep = std::env::var("HIPFIRE_KV_IDLE_KEEP")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0usize);
+                        h.idle_compact(gpu, keep).unwrap();
+                    }
+                }
+            }
+            if kv.quant_kvarn {
+                // KVarN (and the deferred-hierarchical two-tier cache built on it)
+                // require the per-token attention dispatch (kv_cache_attention_dispatch):
+                // the batched forward_prefill_batch runs its own batched attention and
+                // never populates the KVarN window/records (nor the hier hot ring), so
+                // the prompt KV is wrong and decode degenerates. Prefill per-token via
+                // forward_scratch — the same path decode already uses below, and the one
+                // proven coherent for kvarn/hier (infer_qwen35). Slower prefill, but
+                // kvarn is a KV-memory mode, not a throughput one.
+                for &tok in &new_tokens {
+                    qwen35::forward_scratch(gpu, weights, config, tok, session.seq_pos, kv, dn, scratch)
+                        .unwrap();
+                    session.seq_pos += 1;
+                }
+            } else if let Some(ref ev) = m.eviction {
                 let window = ev.budget() + ev.beta();
                 let mut remaining: &[u32] = &new_tokens;
                 while !remaining.is_empty() {
