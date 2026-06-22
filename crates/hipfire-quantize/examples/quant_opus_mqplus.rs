@@ -16,6 +16,33 @@
 //! Metric: GEMM output SQNR (dB) vs f32, on outlier-heavy activations.
 //!
 //!   cargo run -p hipfire-quantize --example quant_opus_mqplus [M K B]
+//!
+//! ## ORDERING NOTE: SmoothQuant runs BEFORE the bit-tier split (whole-layer)
+//!
+//! `prep()` applies `smoothquant()` over the *entire* layer (one per-input-channel
+//! scale `s[c] = max|W_:,c|^α / ...`, applied to ALL rows), then `rotate()`, and
+//! every downstream scheme — including the salient/mixed-resolution tiering in
+//! `quant_mixed_salient` ("Idea 4") — quantizes the already-smoothed weights.
+//! There is NO per-tier or post-split smoothing.
+//!
+//! This has a real hazard for any mixed-precision / lower-bit-tier scheme (e.g.
+//! sending the lowest-scoring 50% of weights to qtip2/int4): SmoothQuant's `W·s`
+//! step *migrates activation magnitude into the weights*, keyed on **activation
+//! magnitude** — a different axis from the **weight sensitivity** used to tier.
+//! So a high-activation / low-sensitivity column gets its weights inflated AND
+//! dropped into the low-bit bin — i.e. smoothing dumps difficulty onto exactly
+//! the weights about to be crushed hardest. `quant_mixed_salient` keys its
+//! upgrade on per-group amax *energy* computed AFTER smoothing, so it catches
+//! columns smoothing inflated (a partial, accidental mitigation), but it is NOT
+//! the protect-sensitive-first ordering that would avoid the problem.
+//!
+//! The clean fixes (NOT implemented here): (a) protect/permute the sensitive +
+//! hot channels into a high-bit (bf16/Q8) bin FIRST, then smooth only the
+//! remaining low tier; or (b) skip SmoothQuant entirely and use activation-
+//! magnitude **permutation** to isolate the hot channels — handling the outliers
+//! without ever migrating magnitude into the to-be-crushed weights. (b) is the
+//! "permutation can replace SmoothQuant" idea; this harness does neither, so its
+//! numbers reflect the smooth-first-global ordering only.
 
 fn lcg_gauss(seed: u32, n: usize) -> Vec<f32> {
     let mut s = seed.max(1);
@@ -634,6 +661,11 @@ fn main() {
     }
 
     // Helper: apply optional SmoothQuant, then rotation, returning rotated X,W.
+    // ORDERING: SmoothQuant here is WHOLE-LAYER and runs BEFORE any bit-tier
+    // split — every scheme below (incl. quant_mixed_salient) quantizes these
+    // already-smoothed weights. See the module-level "ORDERING NOTE" for the
+    // hazard this creates for low-bit tiers (smoothing migrates activation
+    // magnitude into weights that may then be crushed to qtip2/int4).
     let prep = |smooth: bool| -> (Vec<f32>, Vec<f32>) {
         let (mut xf, mut wf) = if smooth {
             smoothquant(&x, &w, b, m, k, 0.5)
