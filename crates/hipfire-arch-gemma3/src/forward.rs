@@ -219,6 +219,29 @@ pub fn forward_step_with_embed(
     Ok(())
 }
 
+/// Debug: when `HIPFIRE_LM_DUMP=<dir>` is set, write a decoder-stage tensor to
+/// `<dir>/<name>.bin` (f32 LE) + `<dir>/<name>.json` for validation against an
+/// HF reference (benchmarks/vision/diff_dumps.py). Called per forward, so for a
+/// per-token prefill the LAST call's tensors (= last prompt position) survive.
+/// No-op when unset.
+fn maybe_dump_lm(gpu: &mut Gpu, t: &GpuTensor, name: &str, shape: &[usize]) {
+    let dir = match std::env::var("HIPFIRE_LM_DUMP") {
+        Ok(d) if !d.is_empty() => d,
+        _ => return,
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    if let Ok(data) = gpu.download_f32(t) {
+        let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let _ = std::fs::write(format!("{dir}/{name}.bin"), bytes);
+        let _ = std::fs::write(
+            format!("{dir}/{name}.json"),
+            format!("{{\"shape\":{shape:?}}}"),
+        );
+    }
+}
+
 fn forward_after_x(
     gpu: &mut Gpu,
     weights: &Gemma3Weights,
@@ -334,11 +357,18 @@ fn forward_after_x(
         // post_feedforward_layernorm, also inside the residual.
         gpu.rmsnorm_f32(&state.o, &layer.post_ffn_norm, &state.tmp, eps)?;
         gpu.add_f32(&state.x, &state.tmp, &state.x)?;
+        maybe_dump_lm(
+            gpu,
+            &state.x,
+            &format!("lm_block_{layer_idx:02}"),
+            &[cfg.hidden_size],
+        );
     }
 
     // Final norm + lm_head.
     gpu.rmsnorm_f32(&state.x, &weights.output_norm, &state.tmp, eps)?;
     weight_gemv(gpu, &weights.output, &state.tmp, &state.logits)?;
+    maybe_dump_lm(gpu, &state.logits, "lm_logits", &[cfg.vocab_size]);
     Ok(())
 }
 
