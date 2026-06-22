@@ -25,7 +25,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> Result<()> {
     // Non-interactive argument handling (headless-safe, no TTY required).
-    for arg in std::env::args().skip(1) {
+    if let Some(arg) = std::env::args().nth(1) {
         match arg.as_str() {
             "--version" | "-V" => {
                 println!("hipfire-tui {VERSION}");
@@ -77,7 +77,11 @@ fn run_check() -> Result<()> {
     let app = App::load()?;
     println!("hipfire-tui --check OK");
     println!("  config: default_model = {:?}", app.config.default_model);
-    println!("  registry: {} models, {} aliases", app.registry.models.len(), app.registry.aliases.len());
+    println!(
+        "  registry: {} models, {} aliases",
+        app.registry.models.len(),
+        app.registry.aliases.len()
+    );
     println!("  local models: {}", app.registry.local_files.len());
     if let Some(warn) = &app.registry.warning {
         println!("  registry warning: {warn}");
@@ -115,7 +119,11 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
     // Attempt every step independently so an early failure can't leave mouse
     // capture, the alternate screen, or raw mode enabled. Return the first
     // error after all steps have been tried.
-    let leave = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
+    let leave = execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    );
     let cursor = terminal.show_cursor();
     let raw = disable_raw_mode();
     leave?;
@@ -409,7 +417,11 @@ mod tests {
             &mut app,
             mouse(MouseEventKind::Down(MouseButton::Left), 12, 10),
         );
-        assert_eq!(app.tab, Tab::Home, "a click off the tab row changes nothing");
+        assert_eq!(
+            app.tab,
+            Tab::Home,
+            "a click off the tab row changes nothing"
+        );
     }
 
     #[test]
@@ -430,7 +442,10 @@ mod tests {
         app.settings_easy = true;
         app.settings_selected = 0;
         handle_mouse(&mut app, mouse(MouseEventKind::ScrollDown, 0, 0));
-        assert_eq!(app.settings_selected, 1, "scroll down advances the selection");
+        assert_eq!(
+            app.settings_selected, 1,
+            "scroll down advances the selection"
+        );
         handle_mouse(&mut app, mouse(MouseEventKind::ScrollUp, 0, 0));
         assert_eq!(app.settings_selected, 0, "scroll up retreats it");
     }

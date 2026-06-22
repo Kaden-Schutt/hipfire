@@ -2033,7 +2033,11 @@ fn main() {
                     .unwrap_or(m.rec_presence_penalty.unwrap_or(0.0) as f64)
                     as f32)
                     .max(0.0);
-                let frequency_penalty = (msg.get("frequency_penalty").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32).max(0.0);
+                let frequency_penalty = (msg
+                    .get("frequency_penalty")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32)
+                    .max(0.0);
                 // Request-driven top_k / min_p (W7 P2). Fallback ladder:
                 // explicit request field > .hfq/registry-baked rec_top_k /
                 // rec_min_p > None. None reproduces the legacy sampler exactly
@@ -2306,10 +2310,25 @@ fn main() {
                         continue;
                     }
                     generate(
-                        m, &mut gpu, pflash_drafter_gpu.as_mut(), &mut stdout, id, prompt, system,
-                        temp, top_p, top_k, min_p, max_tokens, repeat_penalty, repeat_window,
-                        presence_penalty, frequency_penalty,
-                        budget_alert_at_tok, &budget_alert_text, max_think_tokens,
+                        m,
+                        &mut gpu,
+                        pflash_drafter_gpu.as_mut(),
+                        &mut stdout,
+                        id,
+                        prompt,
+                        system,
+                        temp,
+                        top_p,
+                        top_k,
+                        min_p,
+                        max_tokens,
+                        repeat_penalty,
+                        repeat_window,
+                        presence_penalty,
+                        frequency_penalty,
+                        budget_alert_at_tok,
+                        &budget_alert_text,
+                        max_think_tokens,
                         assistant_prefix,
                         pflash_state.as_mut(),
                         pf_cfg_owned.as_ref(),
@@ -2966,8 +2985,29 @@ fn generate_ep(
         m.deepseek4_eos_tok
     };
     match m.arch_id {
-        10 => ep_serve_minimax(m, stdout, id, &prompt_ids, eos_tok, max_tokens, stop, primed_think, sampling),
-        _ => ep_serve_ds4(m, stdout, id, &prompt_ids, eos_tok, max_tokens, think_mode, tools, stop, sampling),
+        10 => ep_serve_minimax(
+            m,
+            stdout,
+            id,
+            &prompt_ids,
+            eos_tok,
+            max_tokens,
+            stop,
+            primed_think,
+            sampling,
+        ),
+        _ => ep_serve_ds4(
+            m,
+            stdout,
+            id,
+            &prompt_ids,
+            eos_tok,
+            max_tokens,
+            think_mode,
+            tools,
+            stop,
+            sampling,
+        ),
     }
 }
 
@@ -3044,7 +3084,12 @@ fn ep_reset_after_abort(m: &mut LoadedModel) {
 
 /// FIX #3: emit the standard `aborted` + `done(finish_reason=aborted)` event
 /// pair (mirrors the single-GPU AR abort path) then reset EP state.
-fn ep_emit_abort(stdout: &mut std::io::Stdout, id: &str, m: &mut LoadedModel, completion_tokens: usize) {
+fn ep_emit_abort(
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    m: &mut LoadedModel,
+    completion_tokens: usize,
+) {
     let _ = writeln!(
         stdout,
         r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
@@ -3060,9 +3105,20 @@ fn ep_emit_abort(stdout: &mut std::io::Stdout, id: &str, m: &mut LoadedModel, co
 }
 
 /// ds4 EP prefill + greedy decode.
-fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, prompt_ids: &[u32], eos_tok: u32, max_tokens: usize, think_mode: ThinkMode, tools: Option<&[serde_json::Value]>, stop: &[String], sampling: EpSampling) {
-    use std::time::Instant;
+fn ep_serve_ds4(
+    m: &mut LoadedModel,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt_ids: &[u32],
+    eos_tok: u32,
+    max_tokens: usize,
+    think_mode: ThinkMode,
+    tools: Option<&[serde_json::Value]>,
+    stop: &[String],
+    sampling: EpSampling,
+) {
     use hipfire_arch_deepseek4::dsml::StreamEvent;
+    use std::time::Instant;
 
     let prompt_n = prompt_ids.len();
 
@@ -3223,8 +3279,15 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
                 aborted_in_prefill = true;
                 break;
             }
-            if let Err(e) = deepseek4::forward::forward_ep(gpus, weights, config, state, partials, t, pos as u32) {
-                let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"forward_ep prefill: {}"}}"#, id, format!("{e}").replace('"', "'"));
+            if let Err(e) = deepseek4::forward::forward_ep(
+                gpus, weights, config, state, partials, t, pos as u32,
+            ) {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"error","id":"{}","message":"forward_ep prefill: {}"}}"#,
+                    id,
+                    format!("{e}").replace('"', "'")
+                );
                 let _ = stdout.flush();
                 return;
             }
@@ -3261,7 +3324,12 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
             Some(l) => match gpus.devices[0].download_f32(l) {
                 Ok(v) => v,
                 Err(e) => {
-                    let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP first-logits download failed: {}"}}"#, id, format!("{e:?}").replace('"', "'"));
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"error","id":"{}","message":"EP first-logits download failed: {}"}}"#,
+                        id,
+                        format!("{e:?}").replace('"', "'")
+                    );
                     let _ = stdout.flush();
                     return;
                 }
@@ -3305,7 +3373,9 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
             sampling.top_k,
             sampling.min_p,
         );
-        if next == eos_tok { break; }
+        if next == eos_tok {
+            break;
+        }
         let piece = m.tokenizer.as_ref().unwrap().decode(&[next]);
         for ev in parser.feed(&piece) {
             absorb_event(&ev);
@@ -3358,7 +3428,12 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
             Some(l) => match gpus.devices[0].download_f32(l) {
                 Ok(v) => v,
                 Err(e) => {
-                    let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP decode logits download failed: {}"}}"#, id, format!("{e:?}").replace('"', "'"));
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"error","id":"{}","message":"EP decode logits download failed: {}"}}"#,
+                        id,
+                        format!("{e:?}").replace('"', "'")
+                    );
                     let _ = stdout.flush();
                     return;
                 }
@@ -3435,7 +3510,17 @@ fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, pro
 /// reuse — see generate_minimax for the full rationale). `primed_think`
 /// re-emits the MiniMax `<think>\n` opener display-only for a well-formed turn.
 #[allow(clippy::too_many_arguments)]
-fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, prompt_ids: &[u32], eos_tok: u32, max_tokens: usize, stop: &[String], primed_think: bool, sampling: EpSampling) {
+fn ep_serve_minimax(
+    m: &mut LoadedModel,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt_ids: &[u32],
+    eos_tok: u32,
+    max_tokens: usize,
+    stop: &[String],
+    primed_think: bool,
+    sampling: EpSampling,
+) {
     use std::time::Instant;
     let prompt_n = prompt_ids.len();
 
@@ -3556,7 +3641,9 @@ fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str,
     // prefix is kept). On a mid-prefill abort, ep_emit_abort resets every
     // rank's KV cursor, so leaving conversation_tokens at the prefix keeps the
     // cache consistent with KV state.
-    for &t in &prompt_ids[prefill_from..prefill_from + prefilled_n] { m.conversation_tokens.push(t); }
+    for &t in &prompt_ids[prefill_from..prefill_from + prefilled_n] {
+        m.conversation_tokens.push(t);
+    }
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
     // FIX #1 / FIX #3 (ep-no-abort): client cancel during prefill → stop
     // cleanly. `aborted_in_prefill` already consumed the signal mid-loop; the
@@ -3588,7 +3675,12 @@ fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str,
         match gpus.devices[0].download_f32(&state[0].logits) {
             Ok(v) => v,
             Err(e) => {
-                let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP first-logits download failed: {}"}}"#, id, format!("{e:?}").replace('"', "'"));
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"error","id":"{}","message":"EP first-logits download failed: {}"}}"#,
+                    id,
+                    format!("{e:?}").replace('"', "'")
+                );
                 let _ = stdout.flush();
                 return;
             }
@@ -3616,7 +3708,9 @@ fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str,
             sampling.top_k,
             sampling.min_p,
         );
-        if next == eos_tok { break; }
+        if next == eos_tok {
+            break;
+        }
         let piece = m.tokenizer.as_ref().unwrap().decode(&[next]);
         generated += 1;
         m.conversation_tokens.push(next);
@@ -3652,15 +3746,26 @@ fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str,
         logits = match gpus.devices[0].download_f32(&state[0].logits) {
             Ok(v) => v,
             Err(e) => {
-                let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP decode logits download failed: {}"}}"#, id, format!("{e:?}").replace('"', "'"));
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"error","id":"{}","message":"EP decode logits download failed: {}"}}"#,
+                    id,
+                    format!("{e:?}").replace('"', "'")
+                );
                 let _ = stdout.flush();
                 return;
             }
         };
     }
-    ep_emit_done(stdout, id, generated, prompt_n, prefill_ms, t_decode.elapsed().as_secs_f64() * 1000.0);
+    ep_emit_done(
+        stdout,
+        id,
+        generated,
+        prompt_n,
+        prefill_ms,
+        t_decode.elapsed().as_secs_f64() * 1000.0,
+    );
 }
-
 
 /// Outcome of the LCP prompt-cache decision (see [`plan_prompt_cache`]).
 struct PromptCachePlan {
@@ -5082,7 +5187,11 @@ fn generate_multi(
 ) {
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
-    if m.seq_pos.saturating_add(prompt_est).saturating_add(max_tokens) > m.max_seq {
+    if m.seq_pos
+        .saturating_add(prompt_est)
+        .saturating_add(max_tokens)
+        > m.max_seq
+    {
         eprintln!(
             "[daemon] context full ({}/{}) — resetting conversation",
             m.seq_pos, m.max_seq
@@ -5939,7 +6048,11 @@ fn generate_multi(
             let need_kv = m
                 .seq_pos
                 .saturating_add(nudge_len)
-                .saturating_add(max_tokens.saturating_sub(generated).saturating_sub(nudge_len))
+                .saturating_add(
+                    max_tokens
+                        .saturating_sub(generated)
+                        .saturating_sub(nudge_len),
+                )
                 .saturating_add(nl.len());
             if nudge_len > 0 && need_kv <= m.physical_cap {
                 for &tok in &nudge_tokens[..nudge_len] {
@@ -6123,7 +6236,34 @@ fn generate_multi(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Option<&mut rdna_compute::Gpu>, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, top_k: Option<u32>, min_p: Option<f32>, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, presence_penalty: f32, frequency_penalty: f32, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>, think_mode: ThinkMode, stop: &[String]) {
+fn generate(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    drafter_gpu: Option<&mut rdna_compute::Gpu>,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    budget_alert_at_tok: usize,
+    budget_alert_text: &str,
+    max_think_tokens: usize,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>,
+    pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    think_mode: ThinkMode,
+    stop: &[String],
+) {
     // hunt3 M-E: seed the process-global CPU sampler RNG with this request's
     // fixed seed so the grammar/CPU-fallback sample stream is deterministic per
     // request and does not carry RNG state across requests. Matches the u32 the
@@ -6141,8 +6281,26 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         // which loops on ds4's quantized instruct model (card mandates
         // temp=1.0/top_p=1.0). reset_cpu_sampler_rng(0x13579BDF) was already
         // called above, so the host-side draw in ep_serve_* is deterministic.
-        let ep_sampling = EpSampling { temp, top_p, top_k, min_p };
-        generate_ep(m, stdout, id, prompt, system_prompt, max_tokens, max_think_tokens, think_mode, tools, messages_history, stop, ep_sampling);
+        let ep_sampling = EpSampling {
+            temp,
+            top_p,
+            top_k,
+            min_p,
+        };
+        generate_ep(
+            m,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            max_tokens,
+            max_think_tokens,
+            think_mode,
+            tools,
+            messages_history,
+            stop,
+            ep_sampling,
+        );
         return;
     }
     // Compress runs on the PFlash drafter handle when one is set (hetero
@@ -6319,10 +6477,26 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // doesn't need to thread any of those args through.
     if m.pp > 1 {
         generate_multi(
-            m, gpu, pflash_state, pflash_cfg, stdout, id, prompt, system_prompt,
-            temp, top_p, top_k, min_p, max_tokens, repeat_penalty, repeat_window,
-            presence_penalty, frequency_penalty,
-            budget_alert_at_tok, budget_alert_text, max_think_tokens,
+            m,
+            gpu,
+            pflash_state,
+            pflash_cfg,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            temp,
+            top_p,
+            top_k,
+            min_p,
+            max_tokens,
+            repeat_penalty,
+            repeat_window,
+            presence_penalty,
+            frequency_penalty,
+            budget_alert_at_tok,
+            budget_alert_text,
+            max_think_tokens,
             assistant_prefix,
             tools,
             messages_history,
@@ -6431,7 +6605,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         );
     }
     if m.eviction.is_none()
-        && m.seq_pos.saturating_add(prompt_est).saturating_add(max_tokens) > m.max_seq
+        && m.seq_pos
+            .saturating_add(prompt_est)
+            .saturating_add(max_tokens)
+            > m.max_seq
     {
         eprintln!(
             "[daemon] context full ({}/{}) — resetting conversation",
@@ -7248,11 +7425,11 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     );
     if m.eviction.is_none() {
         if m.seq_pos
-        .saturating_add(new_tokens.len())
-        .saturating_add(max_tokens)
-        .saturating_add(trailer)
-        > m.physical_cap
-    {
+            .saturating_add(new_tokens.len())
+            .saturating_add(max_tokens)
+            .saturating_add(trailer)
+            > m.physical_cap
+        {
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"error","id":"{}","message":"request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > physical_cap={} — reload model with a larger max_seq"}}"#,
@@ -8140,9 +8317,14 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                 // eviction the physical check is trivially satisfied (budget
                 // always holds post-evict), but we still respect the check for
                 // the non-eviction path.
-                let need_kv = m.seq_pos
+                let need_kv = m
+                    .seq_pos
                     .saturating_add(nudge_len)
-                    .saturating_add(max_tokens.saturating_sub(generated).saturating_sub(nudge_len))
+                    .saturating_add(
+                        max_tokens
+                            .saturating_sub(generated)
+                            .saturating_sub(nudge_len),
+                    )
                     .saturating_add(nl.len());
                 if nudge_len > 0 && (m.eviction.is_some() || need_kv <= m.physical_cap) {
                     for &tok in &nudge_tokens[..nudge_len] {
@@ -10026,7 +10208,10 @@ fn generate_lfm2moe(
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
-            id, prompt_ids.len(), max_tokens, cap
+            id,
+            prompt_ids.len(),
+            max_tokens,
+            cap
         );
         let _ = stdout.flush();
         return;
@@ -10315,7 +10500,10 @@ fn generate_minimax(
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
-                id, prompt_ids.len(), max_tokens, cap
+                id,
+                prompt_ids.len(),
+                max_tokens,
+                cap
             );
             let _ = stdout.flush();
             return;
@@ -11455,7 +11643,10 @@ fn generate_qwen2(
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
-                id, prompt_ids.len(), max_tokens, cap
+                id,
+                prompt_ids.len(),
+                max_tokens,
+                cap
             );
             let _ = stdout.flush();
             return;
@@ -11675,7 +11866,10 @@ fn generate_vl(
     let prompt_est = tokenizer.encode(prompt).len() + system_est + n_visual_tokens + 20;
 
     if m.eviction.is_none()
-        && m.seq_pos.saturating_add(prompt_est).saturating_add(max_tokens) > m.max_seq
+        && m.seq_pos
+            .saturating_add(prompt_est)
+            .saturating_add(max_tokens)
+            > m.max_seq
     {
         eprintln!(
             "[daemon/vl] context full ({}/{}) — resetting conversation",
