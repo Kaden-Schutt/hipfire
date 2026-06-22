@@ -3749,6 +3749,19 @@ pub const GEMM_OQ4_GROUPED_WMMA_SRC: &str =
 pub const QUANTIZE_ACT_OQ4_SRC: &str =
     include_str!("../../../kernels/src/quantize_act_oq4.hip");
 
+/// Opus Quant W8A8 core: grouped signed-INT8 × signed-INT8 GEMM with per-group
+/// scale rescale (v_wmma_i32_16x16x16_iu8). The int8 generalization of
+/// `gemm_oq4_grouped_wmma` — near-lossless, matrix-core-fast. gfx1103 wave32,
+/// zero LDS. See `kernels/src/gemm_oq8_grouped_wmma.hip`.
+pub const GEMM_OQ8_GROUPED_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq8_grouped_wmma.hip");
+
+/// Opus Quant W8A8: dynamic per-token/group INT8 activation quantizer (f32 →
+/// signed int8 + per-group scales). Feeds `gemm_oq8_grouped_wmma`. gfx1103
+/// wave32, zero LDS. See `kernels/src/quantize_act_oq8.hip`.
+pub const QUANTIZE_ACT_OQ8_SRC: &str =
+    include_str!("../../../kernels/src/quantize_act_oq8.hip");
+
 /// Opus Quant W4A4 fused Gate+Up: gate_proj + up_proj grouped-iu4 GEMMs in one
 /// launch over a shared int4 activation (blockIdx tile-range demux). gfx1103
 /// wave32, zero LDS. See `kernels/src/fused_gate_up_oq4_wmma.hip`.
