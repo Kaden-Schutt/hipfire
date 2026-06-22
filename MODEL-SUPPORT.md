@@ -13,6 +13,10 @@ This is the **canonical model-support matrix** for hipfire. It tracks what is
   and `load.rs` (where unsupported features are explicitly refused per `arch_id`).
 - This table reflects **implemented + served** capability, not the forward-looking
   family roster (that lives in `docs/plans/2026-06-19-arch-roster-feature-matrix.md`).
+- **Quant formats** (Magnum/MQ, Opus/OQ4, HFQ, PARO, …) and their
+  weight/activation/calibration tradeoffs: `docs/quant-formats/opus-mqplus-eval-plan.md`.
+- **Per-quant × per-GPU-arch kernel coverage** (which formats have tuned
+  decode/prefill/WMMA kernels vs generic fallback): see "Kernel coverage" below.
 
 **Last verified:** 2026-06-23 (against `chaingun`).
 
@@ -104,6 +108,52 @@ multi-GPU orchestrator drives devices from a single host thread.
    before any other arch can microbatch or shard.
 6. **Multi-host inference** — no cross-node communicator exists (RCCL is single-node
    `ncclCommInitAll`). Would need rank/uniqueId bootstrap + a transport.
+
+## Kernel coverage (per-quant × per-GPU-arch tuned kernels)
+
+Whether a quant format runs on a *tuned* kernel vs a *generic fallback* is set by
+three things: the **decode** GEMV arm (`weight_gemv`), the **prefill** GEMM arm
+(`weight_gemm`, batched), and whether it has **`_for_arch` selectors** (per-GPU-arch
+WMMA + multi-batch mb2/mb4 variants — the deeply-tuned tier). Missing prefill arms
+fall to `W8A8Ref` generic reference (instrumented by `warn_generic_once`, silence
+with `HIPFIRE_WARN_GENERIC=0`).
+
+Ground truth: `crates/hipfire-runtime/src/weights.rs` (dispatch arms),
+`crates/rdna-compute/src/{dispatch,kernels,generic_warn}.rs`.
+
+| Quant (DType) | Decode GEMV | Fused decode | Prefill GEMM (batched) | Per-arch tuned (`_for_arch`) | Primary model-archs |
+|---|---|---|---|---|---|
+| **MQ4G256-Lloyd** | ✅ | ✅ resid/swiglu | ✅ WMMA mb2/mb4 + fused QKV/gate-up | ✅ | qwen35 |
+| **MQ3G256-Lloyd** | ✅ | ✅ | ✅ WMMA mb4 + fused QKV/gate-up | ✅ | qwen35 |
+| **HFQ4G256** | ✅ | ✅ resid | ✅ `gemm_hfq4g256` | ✅ | qwen35, general |
+| **HFQ3G256** | ✅ | ✅ resid | ✅ residual WMMA | ✅ | qwen35 |
+| HFP4G32 | ✅ | — | 🟡 | ✅ | fp4 path |
+| MQ4G256 (plain "magnum") | ✅ | ✅ resid/swiglu | 🟡 via Lloyd/generic | partial | qwen35, lfm2 experts |
+| ParoQ4G128 | ✅ | ✅ resid/swiglu | ✅ paro gemm | ❌ | PARO variants |
+| MQ8G256 | ✅ | ✅ prerotated | 🟡 | ❌ | q8 weights |
+| MQ6G256 / HFQ6G256 | ✅ (HFQ6 indexed-MoE) | 🟡 | 🟡 | ❌ | lfm2 experts (mq6e) |
+| MQ2G256(-Lloyd) | ✅ | ✅ (Lloyd) | 🟡 | ❌ | minimax MoE |
+| **Oq4G256 (opus)** | ✅ decode only | ❌ | ❌ no prefill arm | ❌ | qwen35 (decode shipped) |
+| MFP4G32 | ✅ | — | 🟡 | ❌ | microscaling fp4 |
+| Q4F16 g32/g64 | ✅ | — | 🟡 | ❌ | gguf-ish |
+| Qtip3G256 | 🟡 | — | ❌ | ❌ | trellis |
+| W8A8Ref | generic ref (fallback) | — | generic | ❌ | fallback only |
+
+**GPU-arch tuning:** the `_for_arch` tuned variants target **gfx1100 (RDNA3 dGPU)**
+and **gfx1151 (RDNA3.5 Strix Halo APU)**. `arch_caps` also recognizes gfx1103,
+gfx1152, RDNA4, CDNA3, gfx906, but those JIT the same kernel without a dedicated
+tuned variant. wave32 (RDNA) vs wave64 (CDNA/GCN) is auto-selected.
+
+**Takeaways:**
+- The deeply-tuned tier (per-arch WMMA, mb2/mb4 batched prefill, fused QKV/gate-up/
+  residual) is **MQ4/MQ3-Lloyd + HFQ4/HFQ3 + HFP4**, and lives in **qwen35** — another
+  qwen35 concentration.
+- **Prefill is the coverage cliff:** ~14 formats have decode GEMV, only ~5 have tuned
+  batched prefill; the rest hit `W8A8Ref` generic or have no batched path.
+- **Opus (Oq4) is decode-only** — no prefill kernel yet (eval-plan open item: fused
+  QKV/gate-up have no Oq4 variant).
+- Non-qwen35 archs mostly run generic/decode paths: lfm2 experts (MQ4/MQ6, HFQ6
+  indexed-MoE), minimax (MQ2-Lloyd MoE), gemma3 (bf16/Q8).
 
 ## Maintaining this file
 
