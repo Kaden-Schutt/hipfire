@@ -227,7 +227,9 @@ impl HierKvState {
         fa_v: &GpuTensor,
     ) -> HipResult<()> {
         if self.hot_count[layer] >= self.hot_budget {
-            self.migrate(gpu, layer)?;
+            // Overflow fallback (on the critical path): evict the oldest batch. The
+            // idle/between-turns path (idle_compact) keeps this from firing often.
+            self.migrate_n(gpu, layer, self.migrate_batch)?;
         }
         let slot = self.hot_count[layer];
         let hb = self.hot_budget;
@@ -242,10 +244,11 @@ impl HierKvState {
         Ok(())
     }
 
-    /// Migrate the oldest `migrate_batch` hot tokens into a new cold segment,
-    /// then shift the remaining hot tokens down to the front of the ring.
-    fn migrate(&mut self, gpu: &mut Gpu, layer: usize) -> HipResult<()> {
-        let mb = self.migrate_batch.min(self.hot_count[layer]);
+    /// Migrate the oldest `n_req` hot tokens into ONE new cold segment, then shift
+    /// the remaining hot tokens down to the front of the ring. Used both by the
+    /// overflow fallback (n_req = migrate_batch) and idle_compact (n_req = drain).
+    fn migrate_n(&mut self, gpu: &mut Gpu, layer: usize, n_req: usize) -> HipResult<()> {
+        let mb = n_req.min(self.hot_count[layer]);
         if mb == 0 {
             return Ok(());
         }
@@ -354,6 +357,28 @@ impl HierKvState {
             }
         }
         self.hot_count[layer] = rem;
+        Ok(())
+    }
+
+    /// Deferred between-turns compaction (the "deferred-hierarchical" thesis). Run
+    /// in the idle gap after a turn ends, off the latency-critical path: drain each
+    /// layer's hot ring down to `keep_recent` tokens, folding everything older into
+    /// ONE cold segment per layer (big tile → better merge + amortized scale
+    /// overhead). The next turn then starts with a near-empty hot ring but the full
+    /// history present, compressed, in cold. No-op when a layer is already at/below
+    /// `keep_recent`. Heavy compaction is justified here precisely because the user
+    /// isn't waiting (single-user chat). Safe to call repeatedly.
+    pub fn idle_compact(&mut self, gpu: &mut Gpu, keep_recent: usize) -> HipResult<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let n_layers = self.hot_count.len();
+        for layer in 0..n_layers {
+            let hc = self.hot_count[layer];
+            if hc > keep_recent {
+                self.migrate_n(gpu, layer, hc - keep_recent)?;
+            }
+        }
         Ok(())
     }
 

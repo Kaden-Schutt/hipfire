@@ -49,6 +49,14 @@ fn main() {
         hier.append_token(&mut gpu, 0, &kd, &vd).unwrap();
     }
 
+    // Optional: exercise the deferred between-turns drain. idle_compact moves hot
+    // tokens into cold; the read+oracle below validate it preserves attention.
+    if std::env::var("HIPFIRE_KV_HIER_TEST_IDLE").ok().as_deref() == Some("1") {
+        let keep: usize = std::env::var("HIPFIRE_KV_HIER_KEEP").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+        hier.idle_compact(&mut gpu, keep).unwrap();
+        eprintln!("after idle_compact(keep={keep}): hot_count={} cold_segs={}", hier.hot_count[0], hier.cold[0].len());
+    }
+
     let q = lcg(7, NH * HD);
     let qd = gpu.upload_f32(&q, &[NH, HD]).unwrap();
     let out = gpu.alloc_tensor(&[NH * HD], DType::F32).unwrap();

@@ -120,6 +120,23 @@ pub fn qwen35_prefill_active_session(
         .dn_state
         .as_mut()
         .ok_or_else(|| "qwen35 active session missing DeltaNet state".to_string())?;
+    // Deferred-hierarchical KV: on a CONTINUED turn (history present, seq_pos > 0),
+    // drain the hot ring into cold here at the prefill entry — i.e. during the idle
+    // gap between turns, off the decode critical path. The next turn's prompt then
+    // prefills into a near-empty hot ring with full (compressed) history in cold.
+    // Flag-gated (hier.enabled); no-op for fresh sessions (seq_pos == 0 → reset path).
+    if m.seq_pos > 0 {
+        if let Some(h) = kv.hier.as_mut() {
+            if h.enabled {
+                let keep = std::env::var("HIPFIRE_KV_IDLE_KEEP")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0usize);
+                h.idle_compact(gpu, keep)
+                    .map_err(|e| format!("qwen35 hierarchical idle_compact failed: {e:?}"))?;
+            }
+        }
+    }
     if replay_as_generated_suffix {
         for &token in tokens {
             m.conversation_tokens.push(token);
