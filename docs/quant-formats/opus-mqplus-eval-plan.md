@@ -1,8 +1,14 @@
-# Eval program: MQ4 vs MQ+ vs Opus Quant vs Opus-A8 (KLD / PPL / tok-s)
+# Eval program: MQ4 vs MQ+ vs Opus Quant vs Opus Plus (KLD / PPL / tok-s)
 
 Goal: benchmark all four W4 quant schemes on a real model across **KLD**,
 **perplexity**, and **tok/s**. **MQ+ is kept as a distinct format** (its own
 quant-type id and artifact), not a flag on MQ4.
+
+**Canonical names (2026-06-23):**
+- **Magnum** = MQ4 · **Magnum Plus** = MQ+ (both W4A8 / iu8; "Plus" = clip-search + SmoothQuant calibration).
+- **Opus Quant** = OQ4 (W4A4 / iu4) · **Opus Plus** = **Opus-A8** (W4A8 / iu8 —
+  symmetric int4 weights expanded to int8 for `V_WMMA_I32_16X16X16_IU8`).
+  "Opus-A8" is the legacy internal name; **Opus Plus** is the canonical name.
 
 Anchor model (local): `~/.hipfire/models/qwen3.5-0.8b-bf16.hfq` (reference) and
 `-mq4.hfq` (baseline already runs today).
@@ -13,7 +19,7 @@ Anchor model (local): `~/.hipfire/models/qwen3.5-0.8b-bf16.hfq` (reference) and
 |------|--------------:|--------|------------|----------------|----------|
 | MQ4 (baseline) | 13 (exists) | affine u4, FWHT g256 | int8 (Q8_1) | iu8 mmq | none |
 | **MQ+** | **32 (reserve)** | affine u4 + clip + SmoothQuant | int8 | **iu8 mmq (unchanged)** | offline only |
-| **Opus-A8** | **33 (reserve)** | symmetric s4 + clip + SmoothQuant | int8 | sym-int4→iu8 | loader+kernel |
+| **Opus Plus (Opus-A8)** | **33 (reserve)** | symmetric s4 + clip + SmoothQuant | int8 | sym-int4→iu8 | loader+kernel |
 | **Opus Quant** | **34 (reserve)** | symmetric s4 + clip + SmoothQuant | int4 | grouped iu4 | loader+kernel+act-quant |
 
 Reserve ids 32/33/34 (31 = Qtip3G256 is the current max; 22–27 are
@@ -30,7 +36,7 @@ its own `HfqInputFormat` keeps it separate from MQ4 per the directive.
 > (`oq4_weight_gemv_parity`), and `qwen3.5-0.8b-oq4.hfq` emits (537.8 MB).
 > **Still open:** prefill-batched/all-site routing (fused QKV/gate-up have no
 > Oq4 variant → needs an unfused Oq4 fallback or fused siblings — an
-> architecture decision), then 4B coherence. ids 32 (MQ+) / 33 (Opus-A8) remain
+> architecture decision), then 4B coherence. ids 32 (MQ+) / 33 (Opus Plus / Opus-A8) remain
 > reserved and unbuilt.
 
 ## Pipeline (per format), reusing existing infra
@@ -59,7 +65,7 @@ its own `HfqInputFormat` keeps it separate from MQ4 per the directive.
   `DType::MQ4G256` (same kernel) but the file is its own thing.
 - ⇒ KLD/PPL/tok-s all available immediately; tok/s ≈ MQ4 (same kernel).
 
-### Opus-A8 (id 33) — symmetric W4, int8 activations
+### Opus Plus (Opus-A8, id 33) — symmetric W4, int8 activations
 - **Quantizer:** symmetric s4 (no zero-point) + clip + SmoothQuant
   (`quant_sym` from the prototype). New `--format opus-a8`.
 - **Loader:** new `DType::OpusS4G128` (hfq.rs match arm + rdna-compute DType).
@@ -69,7 +75,7 @@ its own `HfqInputFormat` keeps it separate from MQ4 per the directive.
   MQ4.
 
 ### Opus Quant (id 34) — fused iu4 (W4A4), biggest lift
-- **Quantizer:** symmetric s4 weights + clip + SmoothQuant (shares Opus-A8
+- **Quantizer:** symmetric s4 weights + clip + SmoothQuant (shares Opus Plus (Opus-A8)
   front-end). New `--format opus`.
 - **Loader:** `DType::OpusS4G128` (shared) tagged for the iu4 path.
 - **Forward (new):**
@@ -90,7 +96,7 @@ quant gives KLD/PPL for all four quickly; tok/s still needs the native path.
 
 ## Open decision
 
-- **SmoothQuant activation calibration corpus.** MQ+/Opus-A8/Opus need
+- **SmoothQuant activation calibration corpus.** MQ+/Opus Plus/Opus need
   per-channel activation max stats. The repo has Hessian/imatrix infra
   (`crates/hipfire-quantize/src/gptq.rs`, `hessian_io.rs`). Decision: reuse an
   existing imatrix/calibration corpus or pick one (e.g. a wikitext/code slice).
@@ -100,7 +106,7 @@ quant gives KLD/PPL for all four quickly; tok/s still needs the native path.
 1. Anchor: run KLD/PPL/tok-s on existing `mq4` vs `bf16` → baseline + harness check.
 2. **MQ+** (offline-only) → first new data point, validates the SmoothQuant+clip
    front-end against real KLD/PPL with zero kernel risk.
-3. **Opus-A8** (symmetric W4, int8 acts) → isolates symmetric-vs-affine and the
+3. **Opus Plus** (Opus-A8: symmetric W4, int8 acts) → isolates symmetric-vs-affine and the
    sym-int4→iu8 path.
 4. **Opus Quant** (fused iu4 + int4 acts) → the full W4A4, reusing 2–3's
    front-end + the validated iu4 kernel.

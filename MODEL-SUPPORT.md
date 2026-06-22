@@ -13,8 +13,10 @@ This is the **canonical model-support matrix** for hipfire. It tracks what is
   and `load.rs` (where unsupported features are explicitly refused per `arch_id`).
 - This table reflects **implemented + served** capability, not the forward-looking
   family roster (that lives in `docs/plans/2026-06-19-arch-roster-feature-matrix.md`).
-- **Quant formats** (Magnum/MQ, Opus/OQ4, HFQ, PARO, …) and their
-  weight/activation/calibration tradeoffs: `docs/quant-formats/opus-mqplus-eval-plan.md`.
+- **Quant formats** and their weight/activation/calibration tradeoffs:
+  `docs/quant-formats/opus-mqplus-eval-plan.md`. Canonical names: **Magnum**=MQ4 /
+  **Magnum Plus**=MQ+ (both W4A8) · **Opus Quant**=OQ4 (W4A4) / **Opus Plus**=Opus-A8
+  (W4A8). "Plus" = clip-search + SmoothQuant calibration; Opus = symmetric-int4 weights.
 - **Per-quant × per-GPU-arch kernel coverage** (which formats have tuned
   decode/prefill/WMMA kernels vs generic fallback): see "Kernel coverage" below.
 
