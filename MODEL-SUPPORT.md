@@ -14,25 +14,32 @@ This is the **canonical model-support matrix** for hipfire. It tracks what is
 - This table reflects **implemented + served** capability, not the forward-looking
   family roster (that lives in `docs/plans/2026-06-19-arch-roster-feature-matrix.md`).
 
-**Last verified:** 2026-06-22 (against `chaingun`).
+**Last verified:** 2026-06-23 (against `chaingun`).
 
 Legend: ✅ full · 🟡 partial / limited · ❌ not implemented (explicitly refused at load/serve)
 
 ## Feature matrix vs flagship qwen3.5
 
-| Arch (arch_id) | Decode | Batched prefill | DFlash spec | MTP spec | KV quant modes | Lowered/superop pipeline | CASK evict / PP | Vision |
-|---|---|---|---|---|---|---|---|---|
-| **qwen3.5 dense / MoE (5 / 6)** — flagship | ✅ | ✅ | ✅ | ✅ | ✅ full menu | ✅ | ✅ | via qwen35-vl |
-| qwen3.5-VL (5/6 + splice) | ✅ | ✅ | ✅ (family) | ✅ (family) | ✅ full | ✅ | ✅ | ✅ |
-| deepseek4-flash (9) | ✅ | ✅ (own kernels) | ❌ | 🟡 native MTP head loads, not wired to spec-serving | 🟡 fp32 only | ✅ | ❌ | ❌ |
-| minimax-m2 (10) | ✅ | ❌ per-token | ❌ | 🟡 config plumbing only | 🟡 fp32 only | ✅ | ❌ | ❌ |
-| lfm2-moe (11) | ✅ | ❌ per-token | ❌ | ❌ | 🟡 fp32 only | ✅ | ❌ | ❌ |
-| gemma3 text (12) | ✅ | ✅ | ❌ | ❌ | 🟡 fp32 + q8 | ❌ | ❌ | ❌ |
-| gemma3-VL / medgemma (13) | ✅ | ✅ | ❌ | ❌ | 🟡 fp32 + q8 | ❌ | ✅ | ✅ |
-| qwen2 (7) | ✅ | ✅ | ❌ | ❌ | 🟡 fp32 only | ✅ | ❌ | ❌ |
-| dots-ocr (8) | ✅ | ✅ | ❌ | ❌ | 🟡 fp32 only | 🟡 | ❌ | ✅ (OCR) |
-| llama / mistral (0), qwen3-legacy (1) | ✅ | 🟡 (llama path) | ❌ | ❌ | 🟡 fp32 | 🟡 | ❌ | ❌ |
-| toy | test fixture only | — | — | — | — | — | — | — |
+| Arch (arch_id) | Decode | Batched prefill | Server microbatch | DFlash spec | MTP spec | KV quant modes | Lowered/superop pipeline | Multi-GPU shard (PP / EP-TP) | Vision |
+|---|---|---|---|---|---|---|---|---|---|
+| **qwen3.5 dense / MoE (5 / 6)** — flagship | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ full menu | ✅ | ✅ (PP; EP/TP on MoE) | via qwen35-vl |
+| qwen3.5-VL (5/6 + splice) | ✅ | ✅ | ✅ (family) | ✅ (family) | ✅ (family) | ✅ full | ✅ | ✅ (family) | ✅ |
+| deepseek4-flash (9) | ✅ | ✅ (own kernels) | ❌ | ❌ | 🟡 native MTP head loads, not wired to spec-serving | 🟡 fp32 only | ✅ | ❌ | ❌ |
+| minimax-m2 (10) | ✅ | ❌ per-token | ❌ | ❌ | 🟡 config plumbing only | 🟡 fp32 only | ✅ | ❌ | ❌ |
+| lfm2-moe (11) | ✅ | ❌ per-token | ❌ | ❌ | ❌ | 🟡 fp32 only | ✅ | ❌ | ❌ |
+| gemma3 text (12) | ✅ | ✅ | ❌ | ❌ | ❌ | 🟡 fp32 + q8 | ❌ | ❌ | ❌ |
+| gemma3-VL / medgemma (13) | ✅ | ✅ | ❌ | ❌ | ❌ | 🟡 fp32 + q8 | ❌ | ❌ | ✅ |
+| qwen2 (7) | ✅ | ✅ | ❌ | ❌ | ❌ | 🟡 fp32 only | ✅ | ❌ | ❌ |
+| dots-ocr (8) | ✅ | ✅ | ❌ | ❌ | ❌ | 🟡 fp32 only | 🟡 | ❌ | ✅ (OCR) |
+| llama / mistral (0), qwen3-legacy (1) | ✅ | 🟡 (llama path) | ❌ | ❌ | ❌ | 🟡 fp32 | 🟡 | ❌ | ❌ |
+| toy | test fixture only | — | — | — | — | — | — | — | — |
+
+> **Server microbatch** = serving many *concurrent* request streams batched
+> together (continuous batching), distinct from in-request *batched prefill* (one
+> prompt, many tokens). It's a bespoke qwen35 subsystem (`Qwen35RequestSessionState`
+> + `qwen35_decode_batch`), gated to arch 5/6; the grouped-MoE fused batch worker
+> requires `arch_id=6`. All other archs run single-session AR only and emit
+> `generate_batch_prefill_unsupported`.
 
 ## The headline
 
@@ -63,6 +70,24 @@ and every other arch *explicitly errors* if asked for them:
 - **llama / legacy (0 / 1)** — the original baseline path; functional decode, none
   of the modern levers.
 
+## Multi-GPU & sharding (layer / expert / host)
+
+Like the fast paths above, **all sharding is qwen3.5-family-only and single-host.**
+
+| Sharding axis | Status | Scope | Where |
+|---|---|---|---|
+| **Layer sharding (pipeline-parallel, PP)** | ✅ implemented | qwen35 family only (5/6); `pp>1` explicitly refused for all other archs | `hipfire-runtime/src/multi_gpu.rs` (`Gpus`: layer bands, boundary copy, peer-access). `HIPFIRE_PP_LAYERS=48,16` sets per-device bands. Issue #58 Stage 7. |
+| **Expert sharding (expert-parallel, EP)** | ✅ implemented | qwen35-**MoE** (arch 6) — each rank computes only its owned experts + shared expert on rank 0, then all-reduce combine | `hipfire-runtime/src/ep.rs`. `HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1` for peer-direct combine. |
+| **Tensor sharding (TP: Q/KV heads, weight sub-ranges)** | ✅ implemented | qwen35-MoE A3B (Qwen3.5-30B-A3B); `expert_to_rank[e] = e % tp_size` (or contiguous); KV replicated when `tp_size > n_kv_heads` (TP=4 on A3B) | `hipfire-runtime/src/tp_shard.rs`; see `docs/plans/multi-gpu-tp-a3b.md`. |
+| **Collectives backend** | ✅ implemented | single-node, multi-GPU | `hip-bridge/src/rccl.rs` — RCCL (AMD NCCL) FFI: `ncclCommInitAll` over local device ids; backs `Gpus::all_reduce_sum`. ~3× faster than a host-driven ring on gfx1201. |
+| **Across hosts (multi-node / cross-node)** | ❌ **not implemented** | — | No `ncclCommInitRank` / `ncclUniqueId` / TCP bootstrap / `node_rank`. RCCL init is single-node only. Multi-host inference is unsupported. |
+
+**Summary:** layer + expert + tensor sharding all work **across GPUs on one host**,
+and only for the qwen3.5 family (TP/EP tuned specifically for the 30B-A3B MoE).
+**Nothing shards across hosts** — there is no cross-node communicator or bootstrap.
+HIP work is also single-threaded (one OS thread for all `Gpu::*` calls), so the
+multi-GPU orchestrator drives devices from a single host thread.
+
 ## Biggest gaps to close (flagship-parity order)
 
 1. **Batched prefill for minimax + lfm2** — both per-token today; long-prompt
@@ -73,6 +98,12 @@ and every other arch *explicitly errors* if asked for them:
    qwen35; deepseek4's native MTP head is the cheapest candidate to wire next.
 4. **Lowered pipeline for gemma3 / gemma3-vl** — the only "modern" archs still on
    the legacy forward path.
+5. **Server microbatch + sharding generalization** — continuous batching, PP, and
+   EP/TP are all welded to qwen35 (`Qwen35RequestSessionState`, `qwen35_decode_batch`,
+   `*_qwen35` planners). A generic per-arch session/shard abstraction is needed
+   before any other arch can microbatch or shard.
+6. **Multi-host inference** — no cross-node communicator exists (RCCL is single-node
+   `ncclCommInitAll`). Would need rank/uniqueId bootstrap + a transport.
 
 ## Maintaining this file
 
