@@ -33,6 +33,7 @@ reqwest = { version = "0.12", default-features = false, features = ["stream", "j
 anyhow = "1"
 rpassword = "7"
 uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
 libc = "0.2"
 clap-markdown = "0.1.5"
 clap_mangen = "0.3.0"
