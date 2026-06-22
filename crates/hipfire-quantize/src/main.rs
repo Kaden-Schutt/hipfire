@@ -3171,7 +3171,59 @@ fn quantize_hfq_source_tensor(
             }
             let m_dim = shape[0] as usize;
             let w8_frac = OQPLUS_W8_FRAC.get().copied().unwrap_or(0.01);
-            let q = if let (Some(alpha), Some(im)) =
+            // `--ldlq`: tiered GPTQ/OBS error-feedback (Hessian) → tiered int8
+            // layout. Composes AWQ exactly like the Oq4 LDLQ arm (W·s offline +
+            // rebase H' = diag(1/s) H diag(1/s) + x/s sidecar).
+            let ldlq_q = OQ4_LDLQ_HESSIAN.get().and_then(|idx| {
+                let key = name.strip_suffix(".weight").unwrap_or(name);
+                let hk = idx.k_of(key).or_else(|| idx.k_of(name))?;
+                if hk != k {
+                    eprintln!("  ldlq: skip {name} (Hessian K={hk} != weight K={k})");
+                    return None;
+                }
+                let mut h = idx.get_full(key).or_else(|| idx.get_full(name))?;
+                let awq_scales = if let (Some(alpha), Some(im)) =
+                    (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                {
+                    if alpha > 0.0 && awq_eligible(name) {
+                        Some(compute_awq_scales(im, alpha))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let wbuf: std::borrow::Cow<[f32]> = if let Some(s) = &awq_scales {
+                    let mut scaled = f32_data.clone();
+                    awq_pre_scale_weights(&mut scaled, m_dim, k, s);
+                    for i in 0..k {
+                        let si = s[i] as f64;
+                        for j in 0..k {
+                            h[i * k + j] = (h[i * k + j] as f64 / (si * s[j] as f64)) as f32;
+                        }
+                    }
+                    std::borrow::Cow::Owned(scaled)
+                } else {
+                    std::borrow::Cow::Borrowed(&f32_data[..])
+                };
+                let diag_sum: f64 = (0..k).map(|i| h[i * k + i] as f64).sum();
+                let damp = 0.01 * (diag_sum / k as f64).max(1e-12);
+                let out = ldlq::oqplus_tiered_ldlq_pack(
+                    &wbuf, m_dim, k, &h, &signs1, &signs2, damp, w8_frac,
+                );
+                if out.is_some() {
+                    if let Some(s) = awq_scales {
+                        OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(s));
+                        eprintln!("  ldlq+awq: {name} [{m_dim}x{k}] tiered OBS int4/int8 + smooth");
+                    } else {
+                        eprintln!("  ldlq: {name} [{m_dim}x{k}] tiered OBS int4/int8");
+                    }
+                }
+                out
+            });
+            let q = if let Some(q) = ldlq_q {
+                q
+            } else if let (Some(alpha), Some(im)) =
                 (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
             {
                 if alpha > 0.0 && awq_eligible(name) {
