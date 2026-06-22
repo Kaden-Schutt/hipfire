@@ -773,12 +773,27 @@ pub(crate) fn quantize_oqplus_tiered(
         // outliers reuse the SAME scale but extend to the int8 range [-127,127].
         let scale = symmetric_clipsearch(&group, 7.0);
         let inv = 1.0 / scale;
-        // Outlier set = top n_out positions by |rotated value| in this group.
+        // Outlier set = top n_out positions by the int8-UPGRADE GAIN, not raw
+        // magnitude. FWHT-256 equalizes per-position activation energy across the
+        // group (≈ uniform), so output-error saliency reduces to the weight-side
+        // gain g_i = int4_err_i² − int8_err_i²: protect the positions int4
+        // quantizes WORST (saturated past ±7, or badly-rounded), where promoting to
+        // int8 recovers the most. (Pure magnitude misses well-rounded large values
+        // and badly-rounded mid values; this is output-error-optimal given the
+        // rotation flattens the activation side — cf. the study's method-5
+        // "activation outlier decomposition" being redundant with FWHT.)
+        let gain = |i: usize| -> f32 {
+            let v = group[i];
+            let q4 = (v * inv).round().clamp(-7.0, 7.0);
+            let q8 = (v * inv).round().clamp(-127.0, 127.0);
+            let e4 = v - q4 * scale;
+            let e8 = v - q8 * scale;
+            e4 * e4 - e8 * e8
+        };
         let mut idx: [usize; 256] = core::array::from_fn(|i| i);
         idx.sort_unstable_by(|&a, &c| {
-            group[c]
-                .abs()
-                .partial_cmp(&group[a].abs())
+            gain(c)
+                .partial_cmp(&gain(a))
                 .unwrap_or(core::cmp::Ordering::Equal)
         });
         let mut is_w8 = [false; 256];
