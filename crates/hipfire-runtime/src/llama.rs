@@ -149,6 +149,27 @@ pub struct LlamaWeights {
 }
 
 impl LlamaWeights {
+    /// Every linear weight that is dispatched through `weight_gemv` / `weight_gemm`,
+    /// as `(gpu_dtype, has_awq)` pairs: the lm_head (`output`) plus each layer's
+    /// qkv/o/gate/up/down projections. Feeds `weights::preflight_gemv_dtypes` so an
+    /// unsupported quant is refused up front rather than panicking at the lm_head
+    /// GEMV mid-forward. `token_embd`/norms are excluded (not GEMV-dispatched).
+    pub fn linear_weight_dtypes(&self) -> Vec<(DType, bool)> {
+        let mut out = Vec::with_capacity(1 + self.layers.len() * 7);
+        let mut push = |w: &WeightTensor| out.push((w.gpu_dtype, w.awq_scale.is_some()));
+        push(&self.output);
+        for l in &self.layers {
+            push(&l.wq);
+            push(&l.wk);
+            push(&l.wv);
+            push(&l.wo);
+            push(&l.w_gate);
+            push(&l.w_up);
+            push(&l.w_down);
+        }
+        out
+    }
+
     /// Return all GPU buffers to the pool (drained on unload). Consumes self.
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.token_embd);

@@ -75,8 +75,14 @@ impl Architecture for Llama {
     ) -> Result<Self::Weights, String> {
         // `hfq::load_weights_hfq` is the LLaMA-family HFQ tensor
         // loader. Same colocation reasoning as `config_from_hfq`.
-        hfq::load_weights_hfq(hfq, cfg, gpu)
-            .map_err(|e| format!("llama: load_weights_hfq failed: {e:?}"))
+        let weights = hfq::load_weights_hfq(hfq, cfg, gpu)
+            .map_err(|e| format!("llama: load_weights_hfq failed: {e:?}"))?;
+        // Pre-flight gate: refuse a model whose linear-weight dtype the GEMV path
+        // cannot dispatch (e.g. an unsupported quant variant) BEFORE the forward,
+        // with one legible error — instead of panicking deep in the lm_head GEMV.
+        hipfire_runtime::weights::preflight_gemv_dtypes(&weights.linear_weight_dtypes())
+            .map_err(|e| format!("llama: {e}"))?;
+        Ok(weights)
     }
 
     fn new_state(gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String> {

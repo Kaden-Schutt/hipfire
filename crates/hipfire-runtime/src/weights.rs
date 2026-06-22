@@ -194,6 +194,130 @@ fn dispatch_err_to_hip(e: hipfire_dispatch::types::DispatchError) -> hip_bridge:
     }
 }
 
+/// Pre-flight (no-GPU, no-execute) check: would `weight_gemv` accept this weight
+/// dtype, or refuse it as unsupported? Mirrors `weight_gemv`'s dispatch decision
+/// exactly, so the gate can never pass something the GEMV path then rejects:
+///   - `BF16` → dedicated `gemm_bf16_x_bf16_wmma` path.
+///   - rotation-free dtypes → the `run_auto` path needs a `for_gemv*` kernel key.
+///   - rotation-needing dtypes → either a dedicated `weight_gemv` arm (handles its
+///     own rotation/quant) or the generic FWHT-G256 arm (the Layer-1 gate).
+///
+/// `Err(is_unsupported)` is the capability gap a caller can surface *before* the
+/// expensive run instead of discovering it mid-forward (the rq-protect lm_head
+/// class). The dedicated-arm list below MUST track `weight_gemv`'s match arms —
+/// the `preflight_dtype_contract` test locks the two together.
+pub fn gemv_dtype_supported(dtype: DType, has_awq: bool) -> Result<(), hip_bridge::HipError> {
+    use hipfire_dispatch::types::{
+        dtype_needs_rotation, dtype_post_rotation_variant, dtype_rotation_plan, GemvVariant,
+        KernelKey, RotationPlan,
+    };
+    use DType::*;
+
+    if dtype == BF16 {
+        return Ok(());
+    }
+
+    if !dtype_needs_rotation(dtype) {
+        // run_auto path: requires a dispatch-family key for its auto variant.
+        let key = match dtype_post_rotation_variant(dtype) {
+            GemvVariant::Plain => KernelKey::for_gemv(dtype, GemvVariant::Plain, has_awq),
+            GemvVariant::Prerotated => KernelKey::for_gemv_prerotated(dtype),
+            GemvVariant::WithResidual => KernelKey::for_gemv_residual(dtype),
+            GemvVariant::WithSwiGLUResidual => KernelKey::for_gemv_swiglu_residual(dtype),
+        };
+        return key.map(|_| ()).map_err(dispatch_err_to_hip);
+    }
+
+    // Rotation-needing dtypes reach `weight_gemv`'s match. Dedicated arms handle
+    // their own rotation/quant; everything else must be FWHT-G256 for the generic
+    // arm (mirrors the Layer-1 gate in that arm).
+    match dtype {
+        MQ8G256 | MQ4G128 | ParoQ4G128 | Oq4G256 | Oq8G256 => Ok(()),
+        _ if dtype_rotation_plan(dtype) == RotationPlan::FwhtG256 => Ok(()),
+        _ => Err(hip_bridge::HipError::unsupported(&format!(
+            "weight_gemv: no GEMV route for dtype {dtype:?}"
+        ))),
+    }
+}
+
+/// Pre-flight gate over a model's weight dtypes. Returns one aggregated
+/// `is_unsupported` error naming every distinct dtype the GEMV path cannot
+/// dispatch, or `Ok(())` if all are supported. Call it once the model's weight
+/// dtypes are known but before running the forward: it turns "panic deep in the
+/// lm_head GEMV" into a single legible up-front refusal that lists the gaps.
+pub fn preflight_gemv_dtypes(dtypes: &[(DType, bool)]) -> Result<(), hip_bridge::HipError> {
+    let mut bad: Vec<String> = Vec::new();
+    let mut seen: Vec<(DType, bool)> = Vec::new();
+    for &(dtype, has_awq) in dtypes {
+        if seen.contains(&(dtype, has_awq)) {
+            continue;
+        }
+        seen.push((dtype, has_awq));
+        if gemv_dtype_supported(dtype, has_awq).is_err() {
+            bad.push(format!(
+                "{dtype:?}{}",
+                if has_awq { " (awq)" } else { "" }
+            ));
+        }
+    }
+    if bad.is_empty() {
+        Ok(())
+    } else {
+        Err(hip_bridge::HipError::unsupported(&format!(
+            "model has weight dtype(s) with no GEMV route: {}",
+            bad.join(", ")
+        )))
+    }
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::*;
+
+    #[test]
+    fn preflight_dtype_contract() {
+        // Supported set — every dtype weight_gemv accepts must pass the gate.
+        // Oq4G256 / MQ4G128 are the false-negative regression guards: they are
+        // rotation-needing dtypes handled by dedicated arms with NO dispatch-family
+        // prerotated key, so a naive family lookup would wrongly reject them.
+        for d in [
+            DType::BF16,
+            DType::F16,
+            DType::F32,
+            DType::Q8_0,
+            DType::HFQ4G256,
+            DType::MQ4G256,
+            DType::MQ3G256,
+            DType::Qtip3G256,
+            DType::MFP4G32,
+            DType::MQ8G256,
+            DType::MQ4G128,
+            DType::ParoQ4G128,
+            DType::Oq4G256,
+            DType::Oq8G256,
+        ] {
+            assert!(
+                gemv_dtype_supported(d, false).is_ok(),
+                "{d:?} must be supported by weight_gemv but the gate rejected it"
+            );
+        }
+
+        // No-route dtypes — must be refused with a classifiable unsupported error.
+        for d in [DType::Raw, DType::W8A8Ref] {
+            let e = gemv_dtype_supported(d, false).expect_err("must be unsupported");
+            assert!(e.is_unsupported(), "{d:?} -> wrong error class: {e}");
+        }
+
+        // Aggregator: names every gap, classifiable.
+        let e = preflight_gemv_dtypes(&[(DType::F16, false), (DType::Raw, false)])
+            .expect_err("Raw makes the set unsupported");
+        assert!(e.is_unsupported());
+        assert!(e.message.contains("Raw"));
+        // All-supported set passes.
+        assert!(preflight_gemv_dtypes(&[(DType::MQ4G256, false), (DType::Oq4G256, false)]).is_ok());
+    }
+}
+
 pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
     use hipfire_dispatch::context::DispatchCtx;
     use hipfire_dispatch::families::gemv::{GemvParams, WeightRef};
