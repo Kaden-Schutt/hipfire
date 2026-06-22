@@ -4,6 +4,14 @@
 
 //! build_kld_ref_hipfire — first-party KLD reference producer.
 //!
+//! DEPRECATED (2026-06-22, eval-tooling refactor WS1). Superseded by the
+//! daemon-resident `kld_eval` op (`mode: build_ref`), which builds the
+//! reference and scores candidates through ONE resident forward + the shared
+//! `hipfire-kld` core — eliminating the standalone-binary drift that produced a
+//! spurious 2.85-nat self-inconsistency (see `docs/plans/eval-tooling-refactor.md`).
+//! This binary is retained only until the `hipfire-eval` batteries and scripts
+//! migrate to the daemon op + the HFKREF reference format; do not extend it.
+//!
 //! Loads a Hipfire HFQ model, tokenizes a slice, runs direct Hipfire forward
 //! passes, top-K-reduces reference log-probs, and writes a metadata-rich
 //! HFQM `.kldref.hfq` package consumed by `eval_hipfire`.

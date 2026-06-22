@@ -120,10 +120,23 @@ Remove `build_kld_ref_hipfire` / `eval_hipfire` once the daemon op covers them.
 
 ## Migration order (low-risk first)
 
-1. `hipfire-kld` crate: pure math + config + formats + CPU unit tests (no GPU).
-2. Daemon `kld_eval` op (build_ref/score/self_score, streaming) on the resident model.
-3. Instrument suite + `self_consistency` guard.
-4. Repoint `hipfire-eval`; delete standalone bins.
+1. ✅ DONE — `hipfire-kld` crate: math + config + refblock/hfkseq + codec
+   (bit-pack) + meta/`compat()` + HFKREF `archive`. 28 CPU tests, no-GPU-CI.
+2. ✅ DONE — daemon `kld_eval` op: `self_score`, `build_ref`, `score`, streaming
+   per-chunk, `compat()` guard on score. **Validated on local gfx1103** (the arch
+   that produced the 2.85): self_score and build_ref→persist→score both return
+   mean_kld ≈ 8.43e-10. `qwen35::{kld_eval_self_score,kld_build_ref,kld_score}` +
+   the daemon handler; client via `hipfire-daemon-adapter::kld_eval`.
+3. TODO — gated instrument suite (per-layer hidden capture, logit dump,
+   scoring-mode toggle). `self_consistency` already shipped as `self_score`.
+4. TODO (STAGED — do not big-bang) — repoint `hipfire-eval` KLD batteries at the
+   daemon op via `executor_daemon`, migrate the ~25 scripts/consumers off the
+   standalone bins, THEN delete `build_kld_ref_hipfire`/`eval_hipfire`. Both bins
+   now carry a DEPRECATED notice pointing here. Note: the new HFKREF reference is
+   a *different format* from the legacy HFQM `.kldref.hfq`, so consumers migrate
+   to "build ref resident → score" (or self_score) rather than loading old refs;
+   the old refs lack the provenance (`git_commit` was null) the `compat()` guard
+   needs, so regenerating them via the resident `build_ref` is the intended path.
 5. (WS3) per-arch eval becomes a cheap warm daemon call → arch-coverage matrix
    (gfx1103 first-class: dispatch gaps, eval arch-map, perf baseline).
 

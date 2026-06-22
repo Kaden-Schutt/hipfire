@@ -4,6 +4,16 @@
 
 //! eval_hipfire — KLD eval for hipfire quant variants against a BF16 reference.
 //!
+//! DEPRECATED (2026-06-22, eval-tooling refactor WS1). Superseded by the
+//! daemon-resident `kld_eval` op (`mode: score`), which scores against a
+//! reference through the SAME resident forward that built it, runs the
+//! `hipfire-kld` `compat()` guard (refusing/flagging code/config/arch mismatch),
+//! and needs no model reload. This standalone binary reloaded the model and
+//! rolled its own forward/lm-head/top-k path, which drifted from the reference
+//! producer — the root cause of the 2.85-nat self-inconsistency (see
+//! `docs/plans/eval-tooling-refactor.md`). Retained only until `hipfire-eval`
+//! and scripts migrate to the daemon op; do not extend it.
+//!
 //! Loads a hipfire model, reads the BF16 reference from a metadata-rich HFQM
 //! `hipfire.kldref` package, runs forward inference
 //! chunk-by-chunk over the matched eval tokens, computes per-token KLD via
