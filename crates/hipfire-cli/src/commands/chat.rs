@@ -1,7 +1,7 @@
 use std::io::Write;
 
 use clap::Args;
-use hipfire_config::HipfireConfig;
+use hipfire_config::{HipfireConfig, LoadedConfig};
 use hipfire_daemon_adapter::{find_daemon_bin_or_error, DaemonEngine};
 use hipfire_generate::{GenerateTextRequest, GenerationSamplingPolicy};
 use hipfire_model::ModelLoadParams;
@@ -38,20 +38,25 @@ fn generate_request_from_prompt(
     GenerateTextRequest::from_prompt(id, prompt, sampling).with_worker_key_id(worker_key_id)
 }
 
-pub async fn run(args: ChatArgs, config: HipfireConfig) -> anyhow::Result<()> {
+pub async fn run(args: ChatArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
+    // Resolve the model first (using the global config for `default_model`),
+    // then re-resolve the config with that model's tag so per-model overrides
+    // (e.g. a model-specific `max_seq`/`kv_cache` in `[model_overrides]`) apply.
     let model = args
         .model
         .as_deref()
-        .or(config.default_model.as_deref())
+        .or(loaded.config.default_model.as_deref())
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "no model specified and no `default_model` configured; \
                  pass --model <name> or set `default_model` in {}",
                 hipfire_config::config_path().display()
             )
-        })?;
+        })?
+        .to_string();
     let model_path =
-        find_model(model).ok_or_else(|| anyhow::anyhow!("model not found: {model}"))?;
+        find_model(&model).ok_or_else(|| anyhow::anyhow!("model not found: {model}"))?;
+    let config: HipfireConfig = loaded.resolve_for_model(&model).config;
 
     let bin = find_daemon_bin_or_error()?;
 

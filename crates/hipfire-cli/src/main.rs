@@ -68,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Serve(args) => commands::serve::run(args, loaded_config).await,
-        Command::Chat(args) => commands::chat::run(args, config).await,
+        Command::Chat(args) => commands::chat::run(args, loaded_config).await,
         Command::List => {
             commands::list::run();
             Ok(())
