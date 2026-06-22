@@ -38,7 +38,13 @@ from typing import Callable, Optional
 import numpy as np
 import torch
 from PIL import Image
-from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoProcessor,
+    AutoTokenizer,
+)
 
 # Convenience aliases → HF id or local snapshot path. Any HF id / path also works
 # directly. Local snapshots avoid re-downloading the (large) weights.
@@ -214,8 +220,9 @@ def dump_lm(prompt, out_dir, model, processor, device):
     trivial)."""
     out_dir.mkdir(parents=True, exist_ok=True)
     tok = getattr(processor, "tokenizer", processor)
-    messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
-    ids = tok.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt").to(device)
+    messages = [{"role": "user", "content": prompt}]
+    enc = tok.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt")
+    ids = (enc["input_ids"] if hasattr(enc, "keys") else enc).to(device)
     with torch.no_grad():
         out = model(input_ids=ids, output_hidden_states=True, use_cache=False)
     hs = out.hidden_states  # (embed, layer0_out, ..., layerN_out), each [1, M, dim]
@@ -245,12 +252,21 @@ def main():
 
     model_path = ALIASES.get(args.model, args.model)
     cfg = AutoConfig.from_pretrained(model_path)
-    print(f"model_type={cfg.model_type}; loading on {args.device}...")
+    # Text-only models (e.g. gemma3_text) aren't ImageTextToText — load them as
+    # plain CausalLM. VL models keep the multimodal class for the vision dump.
+    is_text_only = str(cfg.model_type).endswith("_text") or not hasattr(cfg, "vision_config")
+    print(f"model_type={cfg.model_type} (text_only={is_text_only}); loading on {args.device}...")
 
-    processor = AutoProcessor.from_pretrained(model_path)
-    model = AutoModelForImageTextToText.from_pretrained(
-        model_path, dtype=torch.bfloat16, device_map=args.device,
-    ).eval()
+    if is_text_only:
+        processor = AutoTokenizer.from_pretrained(model_path)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, dtype=torch.bfloat16, device_map=args.device,
+        ).eval()
+    else:
+        processor = AutoProcessor.from_pretrained(model_path)
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_path, dtype=torch.bfloat16, device_map=args.device,
+        ).eval()
 
     out_root = Path(args.out)
     if args.lm_prompt is not None:
