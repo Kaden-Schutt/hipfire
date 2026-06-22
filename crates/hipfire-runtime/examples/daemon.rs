@@ -2916,6 +2916,19 @@ fn main() {
                         }
                     }
                     ok
+                } else if m.arch_id == 8 {
+                    // dots.ocr: Qwen2 text decoder via qwen2_state + dots_ocr fields.
+                    let state = m.qwen2_state.as_mut().unwrap();
+                    let config = m.dots_ocr_config.as_ref().unwrap();
+                    let weights = m.dots_ocr_weights.as_ref().unwrap();
+                    let mut ok = true;
+                    for &tok in &synthetic {
+                        if qwen2::forward_step(&mut gpu, &weights.text, &config.text, state, tok).is_err() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
                 } else {
                     let ModelState::Llama(b) = m.state.as_mut().unwrap() else {
                         unreachable!()
@@ -8253,6 +8266,37 @@ fn generate(
             max_think_tokens,
             tools,
             messages_history,
+        );
+        return;
+    }
+    if m.arch_id == 8 {
+        // dots.ocr (Qwen2-VL family, stateless vision). Text-only generate:
+        // Qwen2 text decoder via qwen2_state + dots_ocr_config/dots_ocr_weights.
+        // No PFlash / DFlash / VL / multi-GPU / sampler-budget / grammar /
+        // tools-execution — those bypass, matching the arch_id=7 pattern.
+        let _ = (
+            budget_alert_at_tok,
+            budget_alert_text,
+            max_think_tokens,
+            assistant_prefix,
+            pflash_state,
+            pflash_cfg,
+            tools,
+            messages_history,
+        );
+        let _ = (repeat_penalty, repeat_window);
+        let _ = stop;
+        let _ = (top_k, min_p, presence_penalty, frequency_penalty);
+        generate_dots_ocr_text(
+            m,
+            gpu,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            temp,
+            top_p,
+            max_tokens,
         );
         return;
     }
@@ -14696,6 +14740,185 @@ fn run_dots_ocr_ngram_loop(
         prefill_s * 1000.0,
         tau,
         spec_cycles
+    );
+    let _ = stdout.flush();
+}
+
+fn generate_dots_ocr_text(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    _system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+) {
+    let _ = (temp, top_p); // greedy decode for now; sampling left for future work
+    let t0 = Instant::now();
+
+    let max_seq = m.max_seq;
+
+    // Model state (disjoint field borrows of `m`).
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+    let config = m.dots_ocr_config.as_ref().unwrap();
+    let weights = m.dots_ocr_weights.as_ref().unwrap();
+    let state = m.qwen2_state.as_mut().unwrap();
+    let text_cfg = &config.text;
+    let dim = text_cfg.hidden_size;
+
+    // Tokenize the text prompt directly (no image tokens).
+    let prompt_ids = tokenizer.encode(prompt);
+    if prompt_ids.len().saturating_add(max_tokens) > max_seq {
+        write_error(stdout, id, &format!(
+            "dots.ocr text request ({} prompt + {} gen) exceeds KV budget ({}); reload with a larger --max-seq",
+            prompt_ids.len(), max_tokens, max_seq));
+        return;
+    }
+
+    // Prefill: build the [seq × dim] embedding matrix via per-token
+    // embedding lookup dispatch, then run through batched prefill.
+    state.reset();
+    let t_prefill = Instant::now();
+    let mut embeds = vec![0f32; prompt_ids.len() * dim];
+    let emb_scratch = match gpu.alloc_tensor(&[dim], rdna_compute::DType::F32) {
+        Ok(t) => t,
+        Err(e) => {
+            write_error(
+                stdout,
+                id,
+                &format!("dots.ocr embed scratch alloc failed: {e:?}"),
+            );
+            return;
+        }
+    };
+    let mut embed_err: Option<String> = None;
+    for (pos, &token) in prompt_ids.iter().enumerate() {
+        let lookup = hipfire_runtime::llama::embedding_lookup_dispatch(
+            gpu,
+            weights.text.embd_format,
+            &weights.text.token_embd,
+            &emb_scratch,
+            token,
+            dim,
+        );
+        if let Err(e) = lookup {
+            embed_err = Some(format!("embedding lookup: {e:?}"));
+            break;
+        }
+        match gpu.download_f32(&emb_scratch) {
+            Ok(row) => embeds[pos * dim..(pos + 1) * dim].copy_from_slice(&row),
+            Err(e) => {
+                embed_err = Some(format!("embedding download: {e:?}"));
+                break;
+            }
+        }
+    }
+    let _ = gpu.free_tensor(emb_scratch);
+    if let Some(e) = embed_err {
+        write_error(
+            stdout,
+            id,
+            &format!("dots.ocr prefill embed build failed: {e}"),
+        );
+        return;
+    }
+    if let Err(e) =
+        qwen2::forward_prefill_batch_embeds(gpu, &weights.text, text_cfg, state, &embeds)
+    {
+        write_error(
+            stdout,
+            id,
+            &format!("dots.ocr batched prefill failed: {e:?}"),
+        );
+        return;
+    }
+    let prefill_tokens = prompt_ids.len();
+    let prefill_s = t_prefill.elapsed().as_secs_f64();
+
+    // Greedy decode, streaming in the daemon JSONL protocol.
+    let eos_set: Vec<u32> = if text_cfg.eos_token_ids.is_empty() {
+        vec![text_cfg.eos_token_id]
+    } else {
+        text_cfg.eos_token_ids.clone()
+    };
+    let mut next = match gpu.argmax_f32(&state.logits, text_cfg.vocab_size) {
+        Ok(t) => t,
+        Err(e) => {
+            write_error(stdout, id, &format!("dots.ocr argmax failed: {e:?}"));
+            return;
+        }
+    };
+    let t_gen = Instant::now();
+    let mut streamed: Vec<u32> = Vec::new();
+    let mut emitted_bytes = 0usize;
+    let mut generated = 0usize;
+
+    while generated < max_tokens {
+        if eos_set.contains(&next) {
+            break;
+        }
+        emit_committed_event(stdout, id, next, generated, t0.elapsed().as_millis() as u64);
+        generated += 1;
+        streamed.push(next);
+
+        // Incremental UTF-8 streaming — only emit complete code points.
+        let all_bytes = tokenizer.decode_bytes(&streamed);
+        let new_bytes = &all_bytes[emitted_bytes..];
+        let valid_len = match std::str::from_utf8(new_bytes) {
+            Ok(_) => new_bytes.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        if valid_len > 0 {
+            let text = std::str::from_utf8(&new_bytes[..valid_len]).unwrap();
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"token","id":"{}","text":{}}}"#,
+                id,
+                serde_json::to_string(&text).unwrap_or_default()
+            );
+            let _ = stdout.flush();
+            emitted_bytes += valid_len;
+        }
+
+        match qwen2::forward_step_greedy(gpu, &weights.text, text_cfg, state, next) {
+            Ok(t) => next = t,
+            Err(e) => {
+                write_error(stdout, id, &format!("dots.ocr decode failed: {e:?}"));
+                return;
+            }
+        }
+    }
+
+    let decode_s = t_gen.elapsed().as_secs_f64();
+    let total_s = t0.elapsed().as_secs_f64();
+    let tok_s = if total_s > 0.0 {
+        generated as f64 / total_s
+    } else {
+        0.0
+    };
+    let prefill_tok_s = if prefill_s > 0.0 {
+        prefill_tokens as f64 / prefill_s
+    } else {
+        0.0
+    };
+    let decode_tok_s = if decode_s > 0.0 {
+        generated as f64 / decode_s
+    } else {
+        0.0
+    };
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
+        id,
+        generated,
+        tok_s,
+        prefill_tokens,
+        prefill_s * 1000.0,
+        prefill_tok_s,
+        decode_tok_s,
+        prefill_s * 1000.0
     );
     let _ = stdout.flush();
 }
