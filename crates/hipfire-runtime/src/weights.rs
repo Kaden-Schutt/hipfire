@@ -316,6 +316,61 @@ mod preflight_tests {
         // All-supported set passes.
         assert!(preflight_gemv_dtypes(&[(DType::MQ4G256, false), (DType::Oq4G256, false)]).is_ok());
     }
+
+    /// Derived-axis cross-validation — the structural guard against the rq-protect
+    /// class. The AUTHORED quant catalog (docs/model-support.toml → QUANT_TABLE)
+    /// must not claim a quant is *usable* (status stable|opt-in) unless its weight
+    /// dtype has a real GEMV route, as DERIVED from the dispatch code itself
+    /// (`gemv_dtype_supported`). If someone adds a quant to the catalog without
+    /// wiring its kernel — or removes a route a catalogued quant depends on — this
+    /// fails in no-gpu-ci instead of panicking deep in the lm_head GEMV at runtime.
+    ///
+    /// Scope: validates the GEMV/decode + lm_head route (where rq-protect lived).
+    /// qwen3.5's fused-prefill path is guarded separately by the Layer-3 loader
+    /// refusal (an unknown quant_type can't load), not by this GEMV predicate.
+    #[test]
+    fn quant_catalog_matches_derived_gemv_routes() {
+        use hipfire_model::model_support_generated::QUANT_TABLE;
+
+        // The quant→DType bridge: the dtype each catalogued quant's weights load
+        // as. Type-checked (can't name a removed DType); `None` forces an explicit
+        // failure so a new catalog entry can't silently skip the route check.
+        fn dtype_of(quant_name: &str) -> Option<DType> {
+            Some(match quant_name {
+                "bf16" => DType::BF16,
+                "q8" => DType::Q8_0,
+                "mq4" => DType::MQ4G256,
+                "mq6" => DType::MQ6G256,
+                "oq4" => DType::Oq4G256,
+                "oq8" => DType::Oq8G256,
+                "mq3" => DType::MQ3G256,
+                _ => return None,
+            })
+        }
+
+        for q in QUANT_TABLE {
+            let dt = dtype_of(q.name).unwrap_or_else(|| {
+                panic!(
+                    "quant `{}` is in the model-support catalog but has no DType in the \
+                     derived cross-validation bridge — add it to dtype_of() and confirm \
+                     gemv_dtype_supported, so the catalog can't claim an unroutable quant",
+                    q.name
+                )
+            });
+            if matches!(q.status, "stable" | "opt-in") {
+                let route = gemv_dtype_supported(dt, false);
+                assert!(
+                    route.is_ok(),
+                    "model-support.toml claims quant `{}` is `{}` (usable), but the GEMV \
+                     dispatch has no route for {dt:?}: {}. Either wire the kernel or mark \
+                     the quant `experimental`.",
+                    q.name,
+                    q.status,
+                    route.unwrap_err()
+                );
+            }
+        }
+    }
 }
 
 pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
