@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use hipfire_generate::{DoneEvent, ErrorEvent, GenerateTextRequest, TokenEvent, ToolCallsEvent};
+use hipfire_kld::KldConfig;
 use hipfire_model::{
     AcceleratorInventory, LlmModelRegistry, ModelLoadRequest, ModelLoadedResponse,
 };
@@ -44,6 +45,84 @@ pub struct CollectResponse {
     pub max_consistency: f32,
 }
 
+/// What a [`KldEvalRequest`] does against the resident model — without reload.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KldEvalMode {
+    /// Build a KLD reference from the resident model over the corpus → `.kldref`.
+    BuildRef,
+    /// Score the resident model against an existing reference → `.kldseq`.
+    Score,
+    /// Build a reference AND score the same resident model against it in one
+    /// session — the self-consistency check (must be ≈0). The reference build
+    /// and the scoring share the identical resident forward + config, so the
+    /// historical two-binary drift is impossible by construction.
+    SelfScore,
+}
+
+/// Daemon-resident KLD evaluation: reference build and/or candidate scoring
+/// against the loaded model, with no reload. The unified scoring core lives in
+/// `hipfire-kld`; this request carries the same [`KldConfig`] the math uses, so
+/// the wire config and the scoring config cannot diverge.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct KldEvalRequest {
+    pub mode: KldEvalMode,
+    /// Corpus/slice file (build_ref / self_score). For `Score` the tokens come
+    /// from the reference, so this may be omitted.
+    #[serde(default)]
+    pub corpus: Option<String>,
+    /// Reference path — output for `build_ref`, input for `score`. `self_score`
+    /// keeps it in memory unless a path is given (to also persist it).
+    #[serde(default)]
+    pub ref_path: Option<String>,
+    /// Output `.kldseq` (score / self_score).
+    #[serde(default)]
+    pub output: Option<String>,
+    #[serde(default)]
+    pub max_chunks: Option<usize>,
+    #[serde(default)]
+    pub n_ctx: Option<usize>,
+    /// Scoring/determinism contract. Absent → the canonical [`KldConfig`] default.
+    #[serde(default)]
+    pub config: Option<KldConfig>,
+    /// Instrument: capture per-layer hidden states for diagnosis.
+    #[serde(default)]
+    pub capture_hidden_layers: bool,
+    /// Instrument: dump per-position logits.
+    #[serde(default)]
+    pub dump_logits: bool,
+}
+
+/// Final result of a [`DaemonRequest::KldEval`] op.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct KldEvalResponse {
+    pub mode: KldEvalMode,
+    pub n_chunk: usize,
+    pub total_scored: usize,
+    /// Slice-mean KLD (score / self_score); `None` for `build_ref`.
+    pub mean_kld: Option<f32>,
+    pub p99_kld: Option<f32>,
+    pub mean_nll: Option<f32>,
+    pub ppl: Option<f32>,
+    /// Written reference path (`build_ref` / `self_score` if persisted).
+    pub ref_output: Option<String>,
+    /// Written `.kldseq` path (score / self_score).
+    pub seq_output: Option<String>,
+    /// `RefMeta` compat findings (score mode): non-empty means the candidate's
+    /// (code, config, arch, tokenizer) differed from the reference's.
+    #[serde(default)]
+    pub compat_findings: Vec<String>,
+}
+
+/// Per-chunk streaming progress for a [`DaemonRequest::KldEval`] op.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct KldChunkEvent {
+    pub chunk: usize,
+    pub n_chunk: usize,
+    pub scored: usize,
+    pub mean_kld: f32,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonRequest {
@@ -57,6 +136,7 @@ pub enum DaemonRequest {
     Abort(RequestControl),
     ForceAnswer(RequestControl),
     Collect(CollectRequest),
+    KldEval(KldEvalRequest),
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,6 +155,8 @@ pub enum DaemonResponse {
     Done(DoneEvent),
     Error(ErrorEvent),
     Collected(CollectResponse),
+    KldChunk(KldChunkEvent),
+    KldEvaled(KldEvalResponse),
     #[serde(other)]
     Unknown,
 }
@@ -188,6 +270,38 @@ mod tests {
         assert_eq!(req.messages.as_ref().unwrap()[0].role, Role::System);
         assert_eq!(req.sampling.top_p, Some(0.8));
         assert_eq!(req.worker_key_id.as_deref(), Some("worker-a"));
+    }
+
+    #[test]
+    fn kld_eval_request_round_trips_with_config() {
+        let req: DaemonRequest = serde_json::from_value(json!({
+            "type": "kld_eval",
+            "mode": "self_score",
+            "corpus": "slice.txt",
+            "max_chunks": 4,
+            "config": { "scoring_mode": "prefill", "top_k": 256, "kv_mode": "fp32",
+                        "normalize_prompt": false, "graph": false, "fp32_gqa4_attn": true,
+                        "direct_f16kv_attn": false, "reuse_pbs": true, "prefill_max_batch": null },
+            "capture_hidden_layers": true,
+            "ignored_legacy": 1
+        }))
+        .unwrap();
+        let DaemonRequest::KldEval(req) = req else {
+            panic!("expected kld_eval request");
+        };
+        assert_eq!(req.mode, KldEvalMode::SelfScore);
+        assert_eq!(req.max_chunks, Some(4));
+        assert!(req.capture_hidden_layers && !req.dump_logits);
+        assert!(req.config.as_ref().unwrap().fp32_gqa4_attn);
+
+        // Minimal form: only mode required, config defaults applied downstream.
+        let min: DaemonRequest =
+            serde_json::from_value(json!({"type": "kld_eval", "mode": "build_ref"})).unwrap();
+        let DaemonRequest::KldEval(min) = min else {
+            panic!("expected kld_eval");
+        };
+        assert_eq!(min.mode, KldEvalMode::BuildRef);
+        assert!(min.config.is_none() && min.corpus.is_none());
     }
 
     #[test]
