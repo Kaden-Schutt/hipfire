@@ -2789,7 +2789,13 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
             })
         }
-        _ => panic!("unsupported quant_type {} for qwen35 weight", quant_type),
+        // Honest refusal (Layer 3): an unrecognized quant_type is a capability
+        // gap, not a crash. Refusing at LOAD — the earliest point — means the
+        // forward never runs an unsupported weight, so this can't resurface as a
+        // panic deep in a fused/GEMV dispatch. Classifiable via is_unsupported().
+        _ => Err(HipError::unsupported(&format!(
+            "qwen35 weight: unsupported quant_type {quant_type}"
+        ))),
     }
 }
 
@@ -3985,7 +3991,14 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             }
             out
         }
-        _ => panic!("unsupported quant_type {} for {name}", info.quant_type),
+        // Honest refusal (Layer 3): unrecognized quant_type → typed capability
+        // gap instead of a load-time panic. See load_weight_tensor_raw.
+        _ => {
+            return Err(HipError::unsupported(&format!(
+                "qwen35 {name}: unsupported quant_type {}",
+                info.quant_type
+            )))
+        }
     };
     gpu.upload_f32(&f32_data[..n], &[n])
 }
