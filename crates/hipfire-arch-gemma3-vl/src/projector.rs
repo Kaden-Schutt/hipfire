@@ -151,12 +151,15 @@ pub fn project(
     gpu.rmsnorm_batched(&pooled_gpu, &proj.soft_emb_norm, &normed, n_tok, vh, 1e-6)?;
     gpu.free_tensor(pooled_gpu)?;
 
-    // Projection: [n_tok, vh] @ Wᵀ[th, vh]ᵀ = [n_tok, th]. (gemm → transpose.)
-    let yt = gpu.alloc_tensor(&[th * n_tok], DType::F32)?;
-    gpu.gemm_f32_batched(&proj.input_projection_t, &normed, &yt, th, vh, n_tok)?;
-    gpu.free_tensor(normed)?;
+    // Projection: out[n_tok, th] = normed[n_tok, vh] @ W[vh, th], with
+    // input_projection_t = Wᵀ [th, vh]. gemm_f32_batched writes its result as
+    // [n_tok, th] directly (Y[n*th + m]) — that's the layout we want, so NO
+    // transpose (a prior transpose here scrambled the image embeddings; the
+    // vision tower was correct but post_merger was the transpose of the right
+    // values — bisected vs the HF SigLIP reference).
     let out = gpu.alloc_tensor(&[n_tok * th], DType::F32)?;
-    gpu.transpose_f32(&yt, &out, th, n_tok)?;
-    gpu.free_tensor(yt)?;
+    gpu.gemm_f32_batched(&proj.input_projection_t, &normed, &out, th, vh, n_tok)?;
+    gpu.free_tensor(normed)?;
+    crate::forward::maybe_dump_stage(gpu, &out, "post_merger", &[n_tok, th]);
     Ok(out)
 }

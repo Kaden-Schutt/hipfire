@@ -24,14 +24,36 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use crate::config::SigLipConfig;
 use crate::vision::SigLipWeights;
 
-/// Batched linear `Y[n, out] = X[n, in] · W[out, in]ᵀ + bias`, F32 — the SigLIP
-/// analogue of qwen35-vl's `linear_f16` (gemm → transpose → bias-add).
+/// Debug: when `HIPFIRE_VISION_DUMP=<dir>` is set, write a vision-tower stage
+/// to `<dir>/<name>.bin` (raw f32 LE) + `<dir>/<name>.json` ({"shape":[...]}) so
+/// `benchmarks/vision/diff_dumps.py` can bisect against an HF reference. No-op
+/// when unset. Errors are swallowed (diagnostic-only).
+pub(crate) fn maybe_dump_stage(gpu: &mut Gpu, t: &GpuTensor, name: &str, shape: &[usize]) {
+    let dir = match std::env::var("HIPFIRE_VISION_DUMP") {
+        Ok(d) if !d.is_empty() => d,
+        _ => return,
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    if let Ok(data) = gpu.download_f32(t) {
+        let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let _ = std::fs::write(format!("{dir}/{name}.bin"), bytes);
+        let _ = std::fs::write(
+            format!("{dir}/{name}.json"),
+            format!("{{\"shape\":{shape:?}}}"),
+        );
+    }
+}
+
+/// Batched linear `Y[n, out] = X[n, in] · W[out, in]ᵀ + bias`, F32.
 ///
-/// NOTE: kept on `gemm_f32_batched`+`transpose_f32`. A swap to
-/// `gemm_f32_register_tiled` (which would also drop the transpose) corrupted the
-/// vision embeddings — the model then reported "cannot process images" — so the
-/// register-tiled path is layout-incompatible for these shapes and was reverted.
-/// The attention kernel, not this GEMM, was the encode bottleneck.
+/// `gemm_f32_batched` already writes its result as `[n, out]` (one warp per
+/// (out, token) cell, `Y[n*out_dim + m]`), which is exactly the layout we want —
+/// so NO transpose is applied. (A prior version transposed the result, which
+/// scrambled every patch embedding: the patch-embed conv came out as the
+/// transpose of the correct values, breaking vision grounding entirely. Bisected
+/// against the HF SigLIP reference — see benchmarks/vision/diff_dumps.py.)
 fn linear_f32(
     gpu: &mut Gpu,
     w: &GpuTensor,
@@ -41,12 +63,8 @@ fn linear_f32(
     in_dim: usize,
     n: usize,
 ) -> HipResult<GpuTensor> {
-    // Y_t[out, n] = W[out, in] @ X[n, in]ᵀ
-    let yt = gpu.alloc_tensor(&[out_dim * n], DType::F32)?;
-    gpu.gemm_f32_batched(w, x, &yt, out_dim, in_dim, n)?;
     let y = gpu.alloc_tensor(&[n * out_dim], DType::F32)?;
-    gpu.transpose_f32(&yt, &y, out_dim, n)?;
-    gpu.free_tensor(yt)?;
+    gpu.gemm_f32_batched(w, x, &y, out_dim, in_dim, n)?;
     gpu.bias_add_f32(&y, bias, n, out_dim)?;
     Ok(y)
 }
@@ -121,6 +139,7 @@ pub fn vision_forward(
 
     // Patch embedding: linear(patch_embed_w [h, patch_dim]) + bias → [n, h].
     let x_patches = gpu.upload_f32(patches, &[n * patch_dim])?;
+    maybe_dump_stage(gpu, &x_patches, "patches_raw", &[n, patch_dim]);
     let x = timed!(
         0,
         linear_f32(
@@ -136,8 +155,10 @@ pub fn vision_forward(
     gpu.free_tensor(x_patches)?;
     // + learned position embedding (fixed grid, direct add — no interpolation).
     timed!(3, gpu.add_inplace_f32(&x, &weights.pos_embed));
+    // HF's `embeddings` hook captures patch+position embedding together; match it.
+    maybe_dump_stage(gpu, &x, "patch_embed", &[n, h]);
 
-    for lw in &weights.layers {
+    for (li, lw) in weights.layers.iter().enumerate() {
         // ── self-attention block (LN1 → attn → residual) ──
         let tmp = gpu.alloc_tensor(&[n * h], DType::F32)?;
         timed!(
@@ -230,6 +251,7 @@ pub fn vision_forward(
         gpu.free_tensor(fc1)?;
         timed!(3, gpu.add_inplace_f32(&x, &fc2));
         gpu.free_tensor(fc2)?;
+        maybe_dump_stage(gpu, &x, &format!("block_{li:02}"), &[n, h]);
     }
 
     if profile {
@@ -247,5 +269,6 @@ pub fn vision_forward(
     let out = gpu.alloc_tensor(&[n * h], DType::F32)?;
     gpu.layernorm_batched(&x, &weights.post_ln_w, &weights.post_ln_b, &out, n, h, eps)?;
     gpu.free_tensor(x)?;
+    maybe_dump_stage(gpu, &out, "pre_merger", &[n, h]);
     Ok(out)
 }
