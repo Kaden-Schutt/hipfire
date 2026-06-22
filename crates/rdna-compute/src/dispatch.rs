@@ -253,6 +253,10 @@ pub enum DType {
     // [M,K/2] followed by per-group f32 scales [M,K/256] in one buffer. The forward
     // quantizes activations to int4 at runtime (`quantize_act_oq4`) and dispatches
     // `gemm_oq4_grouped_wmma` — the only W4A4 (int4-activation) path in the engine.
+    W8A8Ref, // Reference kernel layer W8A8: per-channel symmetric int8 weights followed by
+    // per-channel f32 scales in one buffer ([M*K int8 | M f32]). A8 activations are
+    // quantized per-token at runtime; iu8 WMMA + dequant by w_scale·x_scale. Boring
+    // reference (no grouping/rotation) — produced by quantize-on-load (HIPFIRE_W8A8=1).
     Raw, // raw bytes, no element interpretation
 }
 
@@ -288,6 +292,7 @@ impl DType {
             | DType::MFP4G32
             | DType::ParoQ4G128
             | DType::Oq4G256
+            | DType::W8A8Ref
             | DType::Raw => 1, // byte-level
         }
     }

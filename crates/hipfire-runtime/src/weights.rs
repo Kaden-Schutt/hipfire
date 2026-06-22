@@ -1105,6 +1105,25 @@ pub fn weight_gemm(
         DType::BF16 => gpu.gemm_bf16_x_bf16_wmma(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G128 => gpu.gemm_hfq4g128(&w.buf, x, y, w.m, w.k, batch_size),
+        DType::W8A8Ref => {
+            // W8A8 reference path. buf = [M*K int8 weights | M f32 per-channel scales].
+            // Quantize activations per-token to int8, iu8 WMMA, dequant by w·x scale.
+            // Per-call scratch (alloc/free, mirrors the fallback) — correctness over
+            // perf for the reference floor; warn so the slow path is visible.
+            warn_generic_once("weight_gemm", "W8A8", KernelMode::Prefill, &gpu.arch, Quality::Reference);
+            let xq = gpu.alloc_tensor(&[batch_size * w.k], DType::Raw)?; // int8
+            let xs = gpu.alloc_tensor(&[batch_size], DType::F32)?;
+            let yi = gpu.alloc_tensor(&[batch_size * w.m * 4], DType::Raw)?; // int32
+            // Per-channel scale lives in the byte tail of buf (W8A8Ref is byte-level).
+            let w_scale = w.buf.sub_offset(w.m * w.k, w.m * 4);
+            gpu.quantize_act_int8_per_token(x, &xq, &xs, batch_size, w.k)?;
+            gpu.gemm_iu8_i32_wmma(&w.buf, &xq, &yi, w.m, w.k, batch_size)?;
+            gpu.dequant_i32_rowcol(&yi, &xs, &w_scale, y, batch_size, w.m)?;
+            gpu.free_tensor(xq)?;
+            gpu.free_tensor(xs)?;
+            gpu.free_tensor(yi)?;
+            Ok(())
+        }
         _ => {
             // Generic fallback: no batched kernel for this weight dtype, so loop a
             // per-token GEMV. Correct but slow — warn once per (dtype, mode, arch) so
