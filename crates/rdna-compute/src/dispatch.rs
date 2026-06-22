@@ -45918,6 +45918,7 @@ impl Gpu {
         r_dim: usize,
         c_dim: usize,
         record_bytes: usize,
+        bits: usize, // bits per code: 4 = legacy nibble layout, 2 = packed 2-bit
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -45931,6 +45932,7 @@ impl Gpu {
         let mut rd = r_dim as i32;
         let mut cd = c_dim as i32;
         let mut rb = record_bytes as i32;
+        let mut bt = bits as i32;
         let mut params: Vec<*mut c_void> = vec![
             &rp as *const _ as *mut c_void,
             &op as *const _ as *mut c_void,
@@ -45938,6 +45940,7 @@ impl Gpu {
             &mut rd as *mut _ as *mut c_void,
             &mut cd as *mut _ as *mut c_void,
             &mut rb as *mut _ as *mut c_void,
+            &mut bt as *mut _ as *mut c_void,
         ];
         let func = &self.functions["kvarn_dequant_tile"];
         unsafe {

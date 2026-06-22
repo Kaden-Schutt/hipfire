@@ -245,9 +245,16 @@ pub fn dequantize_tile(qt: &QuantTile) -> Vec<f32> {
 // The dequant kernel reads this → fp16 scratch: deq[r,c]=(q*scale_abs[r]+zp_abs[r])*s_col[c].
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Byte length of a packed KVarN tile record for an `r_dim × c_dim` tile.
+/// Byte length of a packed KVarN tile record for an `r_dim × c_dim` tile (4-bit).
 pub fn kvarn_record_bytes(r_dim: usize, c_dim: usize) -> usize {
-    (r_dim * c_dim).div_ceil(2) + r_dim * 2 * 2 + c_dim * 2
+    kvarn_record_bytes_bits(r_dim, c_dim, 4)
+}
+
+/// Byte length of a packed KVarN tile record at `bits` per code (2 or 4). Codes
+/// pack `8/bits` per byte; the fp16 scale/zp/s_col blocks are bit-width-independent.
+pub fn kvarn_record_bytes_bits(r_dim: usize, c_dim: usize, bits: usize) -> usize {
+    let cpb = 8 / bits; // codes per byte
+    (r_dim * c_dim).div_ceil(cpb) + r_dim * 2 * 2 + c_dim * 2
 }
 
 // Reuse the crate's tested f16 conversions (handle subnormals/inf correctly).
@@ -255,19 +262,24 @@ use crate::conv::{f16_to_f32 as f16_bits_to_f32, f32_to_f16 as f32_to_f16_bits};
 
 /// Pack a `QuantTile` into its on-device record (4-bit q + fp16 metadata).
 pub fn pack_kvarn_tile(qt: &QuantTile) -> Vec<u8> {
+    pack_kvarn_tile_bits(qt, 4)
+}
+
+/// Pack a `QuantTile` at `bits` per code (2 or 4): `8/bits` codes per byte,
+/// LSB-first within the byte, then the fp16 scale/zp/s_col blocks. bits=4 is
+/// byte-identical to the legacy nibble layout. The GPU dequant kernel must be
+/// passed the same `bits`.
+pub fn pack_kvarn_tile_bits(qt: &QuantTile, bits: usize) -> Vec<u8> {
     let (r, c) = (qt.r_dim, qt.c_dim);
-    let mut out = vec![0u8; kvarn_record_bytes(r, c)];
+    let mut out = vec![0u8; kvarn_record_bytes_bits(r, c, bits)];
     let n = r * c;
-    // 4-bit pack (two nibbles per byte).
+    let cpb = 8 / bits; // codes per byte
+    let mask = (1u8 << bits) - 1;
     for i in 0..n {
-        let nib = qt.q[i] & 0xf;
-        if i % 2 == 0 {
-            out[i / 2] = nib;
-        } else {
-            out[i / 2] |= nib << 4;
-        }
+        let code = qt.q[i] & mask;
+        out[i / cpb] |= code << ((i % cpb) * bits);
     }
-    let mut off = n.div_ceil(2);
+    let mut off = n.div_ceil(cpb);
     for &s in &qt.scale_abs {
         out[off..off + 2].copy_from_slice(&f32_to_f16_bits(s).to_le_bytes());
         off += 2;
@@ -285,13 +297,20 @@ pub fn pack_kvarn_tile(qt: &QuantTile) -> Vec<u8> {
 
 /// Unpack a KVarN tile record → `QuantTile` (fp16 metadata widened to f32).
 pub fn unpack_kvarn_tile(rec: &[u8], r_dim: usize, c_dim: usize) -> QuantTile {
+    unpack_kvarn_tile_bits(rec, r_dim, c_dim, 4)
+}
+
+/// Unpack a KVarN tile record packed at `bits` per code (mirror of pack_kvarn_tile_bits).
+pub fn unpack_kvarn_tile_bits(rec: &[u8], r_dim: usize, c_dim: usize, bits: usize) -> QuantTile {
     let n = r_dim * c_dim;
+    let cpb = 8 / bits;
+    let mask = (1u8 << bits) - 1;
     let mut q = vec![0u8; n];
     for i in 0..n {
-        let byte = rec[i / 2];
-        q[i] = if i % 2 == 0 { byte & 0xf } else { byte >> 4 };
+        let byte = rec[i / cpb];
+        q[i] = (byte >> ((i % cpb) * bits)) & mask;
     }
-    let mut off = n.div_ceil(2);
+    let mut off = n.div_ceil(cpb);
     let rd = |off: &mut usize| -> f32 {
         let v = f16_bits_to_f32(u16::from_le_bytes([rec[*off], rec[*off + 1]]));
         *off += 2;

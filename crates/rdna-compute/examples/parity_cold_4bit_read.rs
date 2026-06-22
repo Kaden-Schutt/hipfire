@@ -92,8 +92,8 @@ fn main() {
     // emits __half; r=HD, c=ns). 2 bytes/elem.
     let kdq = gpu.upload_raw(&vec![0u8; NKV * HD * ns * 2], &[NKV * HD * ns]).unwrap();
     let vdq = gpu.upload_raw(&vec![0u8; NKV * HD * ns * 2], &[NKV * HD * ns]).unwrap();
-    gpu.kvarn_dequant_tile(&krecs_d, &kdq, NKV, HD, ns, rec_bytes).unwrap();
-    gpu.kvarn_dequant_tile(&vrecs_d, &vdq, NKV, HD, ns, rec_bytes).unwrap();
+    gpu.kvarn_dequant_tile(&krecs_d, &kdq, NKV, HD, ns, rec_bytes, 4).unwrap();
+    gpu.kvarn_dequant_tile(&vrecs_d, &vdq, NKV, HD, ns, rec_bytes, 4).unwrap();
 
     // Channel-major attention over the nvc valid slots: count = nvc, stride = ns
     // (the padded tile width), so the pad slot (when nvc is odd) is never read.

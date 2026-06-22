@@ -7,8 +7,8 @@
 // deq[r,c] = (q*scale_abs[r] + zp_abs[r]) * s_col[c]. One block per tile, no
 // Sinkhorn (pure read) — fully parallel, zero LDS.
 //
-// Record layout (== kvarn_quantize_tile / pack_kvarn_tile):
-//   [ (r*c+1)/2 ]  4-bit packed q (2 nibbles/byte, row-major)
+// Record layout (== kvarn_quantize_tile / pack_kvarn_tile_bits):
+//   [ (r*c)/(8/bits) ]  q codes, 8/bits per byte LSB-first (bits=4 = 2 nibbles/byte)
 //   [ r_dim*2  ]   scale_abs[r] fp16
 //   [ r_dim*2  ]   zp_abs[r]    fp16
 //   [ c_dim*2  ]   s_col[c]     fp16
@@ -23,7 +23,8 @@ __launch_bounds__(256)
 extern "C" __global__ void kvarn_dequant_tile(
     const uint8_t* __restrict__ REC,   // [n_tiles, record_bytes]
     __half*        __restrict__ OUT,    // [n_tiles, r_dim*c_dim]
-    int n_tiles, int r_dim, int c_dim, int record_bytes
+    int n_tiles, int r_dim, int c_dim, int record_bytes,
+    int bits // bits per code; codes/byte = 8/bits. 4 = legacy nibble layout, 2 = 2-bit.
 ) {
     const int t = blockIdx.x;
     if (t >= n_tiles) return;
@@ -33,7 +34,9 @@ extern "C" __global__ void kvarn_dequant_tile(
     __half* out = OUT + (long long)t * r_dim * c_dim;
 
     const int n = r_dim * c_dim;
-    const int qbytes = (n + 1) / 2;
+    const int cpb = 8 / bits;              // codes per byte
+    const int mask = (1 << bits) - 1;
+    const int qbytes = (n + cpb - 1) / cpb;
     const int off_scale = qbytes;
     const int off_zp = off_scale + r_dim * 2;
     const int off_scol = off_zp + r_dim * 2;
@@ -44,8 +47,8 @@ extern "C" __global__ void kvarn_dequant_tile(
     for (int i = tid; i < n; i += nth) {
         const int r = i / c_dim;
         const int c = i - r * c_dim;
-        const uint8_t byte = rec[i >> 1];
-        const float q = (float)((i & 1) == 0 ? (byte & 0xf) : (byte >> 4));
+        const uint8_t byte = rec[i / cpb];
+        const float q = (float)((byte >> ((i % cpb) * bits)) & mask);
         const float sa = __half2float(scale_abs[r]);
         const float za = __half2float(zp_abs[r]);
         const float sc = __half2float(s_col[c]);

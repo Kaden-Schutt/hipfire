@@ -9,7 +9,7 @@
 //!
 //!   cargo run --release -p hipfire-runtime --example parity_kv_hier [n_tokens]
 
-use hipfire_kvquant::kvarn::{dequantize_tile, unpack_kvarn_tile};
+use hipfire_kvquant::kvarn::{dequantize_tile, unpack_kvarn_tile_bits};
 use hipfire_runtime::kv_hier::HierKvState;
 use rdna_compute::{DType, Gpu};
 
@@ -85,8 +85,8 @@ fn main() {
         let vrec: Vec<u8> = vrec_f32.iter().flat_map(|x| x.to_bits().to_le_bytes()).collect();
         for kv in 0..NKV {
             let off = kv * seg.rec_bytes;
-            let kt = dequantize_tile(&unpack_kvarn_tile(&krec[off..off + seg.rec_bytes], HD, seg.n_slots)); // [HD × n_slots]
-            let vt = dequantize_tile(&unpack_kvarn_tile(&vrec[off..off + seg.rec_bytes], HD, seg.n_slots));
+            let kt = dequantize_tile(&unpack_kvarn_tile_bits(&krec[off..off + seg.rec_bytes], HD, seg.n_slots, seg.bits)); // [HD × n_slots]
+            let vt = dequantize_tile(&unpack_kvarn_tile_bits(&vrec[off..off + seg.rec_bytes], HD, seg.n_slots, seg.bits));
             for s in 0..seg.n_valid {
                 let mut ka = [0.0f32; HD];
                 let mut va = [0.0f32; HD];
