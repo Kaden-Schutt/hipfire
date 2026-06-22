@@ -109,12 +109,31 @@ fn detect_artifacts(path: &Path, display: &str) -> Artifacts {
     }
 }
 
+/// Render a boolean as a tick/cross glyph.
+fn yn(v: bool) -> &'static str {
+    if v {
+        "✓"
+    } else {
+        "·"
+    }
+}
+
+/// Render a tri-state arch-feature mark ("y"/"~"/"-"/"?") as a glyph.
+fn tri(m: &str) -> &'static str {
+    match m {
+        "y" => "✓",
+        "~" => "~",
+        "?" => "?",
+        _ => "·",
+    }
+}
+
 struct Row {
     name: String,
     quant: String,
     arch: String,
-    artifacts: String,
-    feats: String,
+    art: Artifacts,
+    feat: Option<ArchFeat>,
 }
 
 pub fn run() {
@@ -127,69 +146,49 @@ pub fn run() {
     let mut rows: Vec<Row> = Vec::with_capacity(models.len());
     for p in &models {
         let name = model_display_name(p);
-        let meta = read_hfq_metadata(p).ok();
-        let arch_id = meta.as_ref().map(|m| m.arch_id);
+        let arch_id = read_hfq_metadata(p).ok().map(|m| m.arch_id);
         let art = detect_artifacts(p, &name);
-
-        // Artifacts column: list only what's present (— if none).
-        let mut a: Vec<&str> = Vec::new();
-        if art.template {
-            a.push("tmpl");
-        }
-        if art.mtp {
-            a.push("mtp");
-        }
-        if art.dflash {
-            a.push("dflash");
-        }
-        if art.triattn {
-            a.push("triattn");
-        }
-        if art.hessian {
-            a.push("hess");
-        }
-        let artifacts = if a.is_empty() { "—".to_string() } else { a.join(",") };
-
-        let (arch, feats) = match arch_id {
-            Some(id) => {
-                let f = arch_feat(id);
-                (
-                    format!("{} ({id})", f.label),
-                    format!(
-                        "prefill:{} dflash:{} mtp:{} kv:{} vis:{}",
-                        f.prefill, f.dflash, f.mtp, f.kv, f.vision
-                    ),
-                )
-            }
-            None => ("?".to_string(), "(unreadable HFQ metadata)".to_string()),
-        };
-
         rows.push(Row {
-            name: name.clone(),
             quant: quant_token(&name),
-            arch,
-            artifacts,
-            feats,
+            arch: arch_id.map_or_else(|| "?".to_string(), |id| format!("{} ({id})", arch_feat(id).label)),
+            feat: arch_id.map(arch_feat),
+            name,
+            art,
         });
     }
 
     let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(5).max(5);
     let quant_w = rows.iter().map(|r| r.quant.len()).max().unwrap_or(5).max(5);
     let arch_w = rows.iter().map(|r| r.arch.len()).max().unwrap_or(4).max(4);
-    let art_w = rows.iter().map(|r| r.artifacts.len()).max().unwrap_or(9).max(9);
 
+    // Group banner over the tick columns.
     println!(
-        "{:<name_w$}  {:<quant_w$}  {:<arch_w$}  {:<art_w$}  FEATURES",
-        "MODEL", "QUANT", "ARCH", "ARTIFACTS"
+        "{:<name_w$}  {:<quant_w$}  {:<arch_w$}  {:^17}   {:^21}",
+        "", "", "", "─ on disk ─", "─ arch features ─"
+    );
+    println!(
+        "{:<name_w$}  {:<quant_w$}  {:<arch_w$}  {:>3} {:>3} {:>3} {:>3} {:>4}   {:>4} {:>4} {:>3} {:>7} {:>3}",
+        "MODEL", "QUANT", "ARCH", "tpl", "mtp", "dfl", "tri", "hess", "pfil", "dfl", "mtp", "kv", "vis"
     );
     for r in &rows {
+        let f = r.feat.as_ref();
         println!(
-            "{:<name_w$}  {:<quant_w$}  {:<arch_w$}  {:<art_w$}  {}",
-            r.name, r.quant, r.arch, r.artifacts, r.feats
+            "{:<name_w$}  {:<quant_w$}  {:<arch_w$}  {:>3} {:>3} {:>3} {:>3} {:>4}   {:>4} {:>4} {:>3} {:>7} {:>3}",
+            r.name,
+            r.quant,
+            r.arch,
+            yn(r.art.template),
+            yn(r.art.mtp),
+            yn(r.art.dflash),
+            yn(r.art.triattn),
+            yn(r.art.hessian),
+            f.map_or("?", |f| tri(f.prefill)),
+            f.map_or("?", |f| tri(f.dflash)),
+            f.map_or("?", |f| tri(f.mtp)),
+            f.map_or("?", |f| f.kv),
+            f.map_or("?", |f| tri(f.vision)),
         );
     }
-    println!(
-        "\nartifacts: tmpl=chat template · mtp/dflash=draft (sidecar or bundled) · triattn sidecar · hess=Hessian/calib"
-    );
-    println!("features (per MODEL-SUPPORT.md): y=full · ~=partial · -=none · kv=quant menu");
+    println!("\non disk: tpl=chat template · mtp/dfl/tri=draft/TriAttn sidecar (or bundled) · hess=Hessian/calib");
+    println!("arch features (per MODEL-SUPPORT.md): ✓=full · ~=partial · ·=none · pfil=batched prefill · kv=quant menu");
 }
