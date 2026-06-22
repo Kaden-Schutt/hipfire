@@ -14276,15 +14276,20 @@ pub fn prefill_batch_pbs_eligible(
     // HIPFIRE_PREFILL_BATCHED=0 forces the per-token fallback — an escape hatch
     // for the LARGE seed prefill (gfx11 24GB OOM + a batched-seed correctness bug
     // that collapses MTP τ→1.0). But the small-B MTP verify (n = K+1, ≤ ~32) is
-    // cheap and its BATCHED path is the dominant gfx11 decode lever. Decouple:
+    // cheap and its BATCHED path is the dominant RDNA3 decode lever. Decouple:
     // let the small-B verify batch even when the flag forces the seed per-token.
-    // Opt-in (HIPFIRE_MTP_VERIFY_DECOUPLE=1) until the batched verify is validated
-    // coherent + τ-preserving per-arch. (Ported from origin/master becc0610; the
-    // gfx11 default-on follow-up bc5d005d is intentionally NOT taken here — its
-    // `starts_with("gfx11")` gate wrongly includes this gfx1151 box, where the
-    // lever is unvalidated; see the plan doc.)
-    let verify_decouple =
-        n <= 32 && std::env::var("HIPFIRE_MTP_VERIFY_DECOUPLE").ok().as_deref() == Some("1");
+    // DEFAULT-ON for RDNA3 dGPU (gfx110x) — the arch origin/master validated
+    // (bc5d005d / W3x: byte-identical output vs per-token at 240-tok ctx, +20%
+    // mq4). Opt-out HIPFIRE_MTP_VERIFY_DECOUPLE=0. Other archs are opt-in (=1)
+    // until validated in-arch. NB master gated on `starts_with("gfx11")`, which
+    // wrongly matched gfx1151 (RDNA3.5) despite its prose excluding it; we narrow
+    // to `gfx110` (gfx1100/01/02) so gfx1151 stays opt-in. The seed stays
+    // per-token for LONG prompts (n>32 → force_fallback under PREFILL_BATCHED=0).
+    let decouple_env = std::env::var("HIPFIRE_MTP_VERIFY_DECOUPLE").ok();
+    let is_rdna3_dgpu = arch.starts_with("gfx110");
+    let verify_decouple = n <= 32
+        && decouple_env.as_deref() != Some("0")
+        && (is_rdna3_dgpu || decouple_env.as_deref() == Some("1"));
     let force_fallback =
         !verify_decouple && std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() == Some("0");
     // MoE batched path requires K_TOP=8 (hard-coded in the indexed kernels) and
