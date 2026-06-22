@@ -591,14 +591,18 @@ fn infer_name_from_var(var: &str, source: &str) -> String {
         .replace("q8", "Q8")
         .replace("q4", "Q4");
     label = collapse_ws(&label);
+    // No trailing period: `normalize_description` strips it on re-read, so a
+    // period here would make the generated docs a 2-pass fixed point (the first
+    // regen writes ".", the second strips it). Match the stripped form directly
+    // so a single `gen-env-docs` run is idempotent and `--check` is stable.
     if !label.is_empty() {
-        format!("Runtime variable controlling {label} in hipfire.")
+        format!("Runtime variable controlling {label} in hipfire")
     } else {
         let file = Path::new(source)
             .file_name()
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_default();
-        format!("Runtime control variable `{var}` defined in {file}.")
+        format!("Runtime control variable `{var}` defined in {file}")
     }
 }
 
