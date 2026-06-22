@@ -708,6 +708,69 @@ pub(crate) fn dequant_oq4g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f
     out
 }
 
+/// Opus-Quant W8A8 weight codec (Oq8G256). Per 256-group block =
+/// `[f16 scale][256 signed int8]` = 258 B/group (8.0625 b/w). FWHT-256 rotated,
+/// symmetric clip-searched scale, `q in [-127, 127]` (signed 8-bit, avoid -128 to
+/// keep magnitude symmetric, matching the iu8 GEMM's signed range use). Dequant:
+/// `scale · q`, inverse FWHT. This is the int8 generalization of
+/// [`quantize_oq4g256`] — the nibble packing disappears (one byte per weight) and
+/// it feeds the iu8 grouped-WMMA path (Opus Quant W8A8) for near-lossless,
+/// matrix-core-fast inference.
+// Wired into the format dispatch in the Oq8 dispatch rung; until then only the
+// round-trip test exercises it.
+#[allow(dead_code)]
+pub(crate) fn quantize_oq8g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    let (group_size, block_bytes) = (256usize, 258usize); // 2 (f16 scale) + 256 int8
+    let n = f32_data.len();
+    let n_blocks = n.div_ceil(group_size);
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let mut group = [0.0f32; 256];
+        group[..end - start].copy_from_slice(&f32_data[start..end]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let scale = symmetric_clipsearch(&group, 127.0);
+        let inv = 1.0 / scale;
+        let out_off = b * block_bytes;
+        let scale_f16 = f32_to_f16(scale);
+        output[out_off] = (scale_f16 & 0xFF) as u8;
+        output[out_off + 1] = (scale_f16 >> 8) as u8;
+        for i in 0..256 {
+            let q = (group[i] * inv).round().clamp(-127.0, 127.0) as i8;
+            output[out_off + 2 + i] = q as u8;
+        }
+    }
+    output
+}
+
+/// Dequantize OQ8G256 (round-trip oracle for the Opus W8A8 codec / tests).
+/// `[f16 scale][256 signed int8]` per 256-group → `scale·q`, inverse FWHT.
+/// Test-only oracle; gated on `cfg(test)` so non-test builds don't compile it as
+/// dead code.
+#[cfg(test)]
+pub(crate) fn dequant_oq8g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
+    let (group_size, block_bytes) = (256usize, 258usize);
+    let n_blocks = n.div_ceil(group_size);
+    let mut out = Vec::with_capacity(n_blocks * group_size);
+    for b in 0..n_blocks {
+        let off = b * block_bytes;
+        if off + block_bytes > data.len() {
+            break;
+        }
+        let scale = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        let mut grp = [0.0f32; 256];
+        for i in 0..256 {
+            grp[i] = scale * (data[off + 2 + i] as i8 as f32);
+        }
+        // inverse FWHT (forward with signs swapped)
+        cpu_fwht_256(&mut grp, signs2, signs1);
+        out.extend_from_slice(&grp);
+    }
+    out.truncate(n);
+    out
+}
+
 /// Dequantize MQ4G256 packed bytes back to f32, EXACTLY mirroring the GEMV
 /// kernel (and `quant_quality_mse`'s reference): per 136-byte group read scale+min
 /// (f32), expand 128 nibble bytes to 256 values `min + scale*q` (lo=2i, hi=2i+1),

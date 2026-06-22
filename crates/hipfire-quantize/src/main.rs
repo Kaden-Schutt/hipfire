@@ -11985,6 +11985,38 @@ mod codec_golden {
         assert!(o > m - 3.0, "oq4 {o:.2} dB >3 dB worse than mq4 {m:.2} dB");
     }
 
+    /// W8A8 weight codec (Oq8G256) is near-lossless and far better than the W4A4
+    /// (int4) codec — 4 extra bits ≈ +24 dB SQNR. Rung 1 of the W8A8 test ladder.
+    #[test]
+    fn oq8_roundtrip_is_near_lossless() {
+        let x = det_input(1024, 5);
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let oq4 = dequant_oq4g256(&quantize_oq4g256(&x, &s1, &s2), x.len(), &s1, &s2);
+        let oq8 = dequant_oq8g256(&quantize_oq8g256(&x, &s1, &s2), x.len(), &s1, &s2);
+        let sqnr = |rec: &[f32]| -> f64 {
+            let (mut sig, mut noise) = (0.0f64, 0.0f64);
+            for (&a, &b) in x.iter().zip(rec) {
+                sig += (a as f64).powi(2);
+                noise += ((a - b) as f64).powi(2);
+            }
+            10.0 * (sig / noise.max(1e-30)).log10()
+        };
+        let (o4, o8) = (sqnr(&oq4), sqnr(&oq8));
+        eprintln!(
+            "oq4 SQNR={o4:.2} dB  oq8 SQNR={o8:.2} dB  (+{:.1} dB)",
+            o8 - o4
+        );
+        assert!(
+            o8 > 35.0,
+            "oq8 SQNR {o8:.2} dB not near-lossless (broken codec?)"
+        );
+        assert!(
+            o8 > o4 + 15.0,
+            "oq8 {o8:.2} dB should be >=15 dB better than oq4 {o4:.2} dB"
+        );
+    }
+
     /// FWHT must be exactly invertible (forward then inverse = identity).
     #[test]
     fn fwht_256_roundtrip_is_identity() {
