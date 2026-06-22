@@ -4413,22 +4413,11 @@ fn main() {
             // .kldref container) land next.
             "kld_eval" => {
                 let mode = msg.get("mode").and_then(|v| v.as_str()).unwrap_or("");
-                if mode != "self_score" {
-                    emit_error_with_id(
-                        &mut stdout,
-                        "",
-                        format!(
-                            "kld_eval: only mode=self_score is wired so far (got {mode:?}); \
-                             build_ref/score pending the .kldref container path"
-                        ),
-                    );
-                    continue;
-                }
-                let Some(corpus) = msg.get("corpus").and_then(|v| v.as_str()).map(String::from)
-                else {
-                    emit_error_with_id(&mut stdout, "", "kld_eval: missing 'corpus'".to_string());
-                    continue;
-                };
+                let corpus = msg.get("corpus").and_then(|v| v.as_str()).map(String::from);
+                let ref_path = msg
+                    .get("ref_path")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 let n_ctx = msg
                     .get("n_ctx")
                     .and_then(|v| v.as_u64())
@@ -4470,71 +4459,263 @@ fn main() {
                     );
                     continue;
                 };
-                let text = match std::fs::read_to_string(&corpus) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        emit_error_with_id(
-                            &mut stdout,
-                            "",
-                            format!("kld_eval: read {corpus}: {e}"),
-                        );
-                        continue;
-                    }
-                };
-                let tokens = tokenizer.encode(&text);
-                let result = qwen35::kld_eval_self_score(
-                    &mut gpu,
-                    weights,
-                    config,
-                    &tokens,
-                    n_ctx,
-                    top_k,
-                    max_chunks,
-                    |c, n_chunk, scored, mean_kld| {
-                        let _ = writeln!(
-                            stdout,
-                            "{}",
-                            serde_json::json!({
-                                "type": "kld_chunk", "chunk": c, "n_chunk": n_chunk,
-                                "scored": scored, "mean_kld": mean_kld,
-                            })
-                        );
-                        let _ = stdout.flush();
-                    },
-                );
-                match result {
-                    Ok(out) => {
-                        let mut seq_output = serde_json::Value::Null;
-                        if let Some(path) = output.as_deref() {
-                            match hipfire_kld::hfkseq::write_file(
-                                std::path::Path::new(path),
-                                &out.per_chunk,
-                            ) {
-                                Ok(()) => seq_output = serde_json::json!(path),
-                                Err(e) => emit_error_with_id(
-                                    &mut stdout,
-                                    "",
-                                    format!("kld_eval: write {path}: {e}"),
-                                ),
-                            }
+                let arch_id = m.arch_id;
+                let base_model = m.model_path.clone();
+                let cfg: hipfire_kld::KldConfig = msg
+                    .get("config")
+                    .and_then(|c| serde_json::from_value(c.clone()).ok())
+                    .unwrap_or_default();
+                let version = hipfire_build_info::VERSION.to_string();
+
+                macro_rules! kld_chunk_cb {
+                    () => {
+                        |c, n, s, k| {
+                            let _ = writeln!(
+                                stdout,
+                                "{}",
+                                serde_json::json!({"type":"kld_chunk","chunk":c,"n_chunk":n,"scored":s,"mean_kld":k})
+                            );
+                            let _ = stdout.flush();
                         }
-                        let ppl = (out.mean_nll as f64).exp();
+                    };
+                }
+                macro_rules! emit_kld_evaled {
+                    ($mode:expr, $out:expr, $seq:expr, $findings:expr) => {{
                         let resp = serde_json::json!({
-                            "type": "kld_evaled",
-                            "mode": "self_score",
-                            "n_chunk": out.n_chunk,
-                            "total_scored": out.total_scored,
-                            "mean_kld": out.mean_kld,
-                            "p99_kld": out.p99_kld,
-                            "mean_nll": out.mean_nll,
-                            "ppl": ppl,
-                            "seq_output": seq_output,
-                            "compat_findings": [],
+                            "type": "kld_evaled", "mode": $mode,
+                            "n_chunk": $out.n_chunk, "total_scored": $out.total_scored,
+                            "mean_kld": $out.mean_kld, "p99_kld": $out.p99_kld,
+                            "mean_nll": $out.mean_nll, "ppl": ($out.mean_nll as f64).exp(),
+                            "seq_output": $seq, "compat_findings": $findings,
                         });
                         let _ = writeln!(stdout, "{resp}");
                         let _ = stdout.flush();
+                    }};
+                }
+
+                match mode {
+                    "self_score" | "build_ref" => {
+                        let Some(corpus) = corpus.clone() else {
+                            emit_error_with_id(
+                                &mut stdout,
+                                "",
+                                format!("kld_eval: mode={mode} requires 'corpus'"),
+                            );
+                            continue;
+                        };
+                        let text = match std::fs::read_to_string(&corpus) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                emit_error_with_id(
+                                    &mut stdout,
+                                    "",
+                                    format!("kld_eval: read {corpus}: {e}"),
+                                );
+                                continue;
+                            }
+                        };
+                        let tokens = tokenizer.encode(&text);
+                        if mode == "self_score" {
+                            match qwen35::kld_eval_self_score(
+                                &mut gpu,
+                                weights,
+                                config,
+                                &tokens,
+                                n_ctx,
+                                top_k,
+                                max_chunks,
+                                kld_chunk_cb!(),
+                            ) {
+                                Ok(out) => {
+                                    let mut seq = serde_json::Value::Null;
+                                    if let Some(p) = output.as_deref() {
+                                        match hipfire_kld::hfkseq::write_file(
+                                            std::path::Path::new(p),
+                                            &out.per_chunk,
+                                        ) {
+                                            Ok(()) => seq = serde_json::json!(p),
+                                            Err(e) => emit_error_with_id(
+                                                &mut stdout,
+                                                "",
+                                                format!("kld_eval: write {p}: {e}"),
+                                            ),
+                                        }
+                                    }
+                                    emit_kld_evaled!("self_score", out, seq, serde_json::json!([]));
+                                }
+                                Err(e) => {
+                                    emit_error_with_id(&mut stdout, "", format!("kld_eval: {e}"))
+                                }
+                            }
+                        } else {
+                            let Some(ref_out) = ref_path.clone() else {
+                                emit_error_with_id(
+                                    &mut stdout,
+                                    "",
+                                    "kld_eval: build_ref requires 'ref_path'".to_string(),
+                                );
+                                continue;
+                            };
+                            match qwen35::kld_build_ref(
+                                &mut gpu,
+                                weights,
+                                config,
+                                &tokens,
+                                n_ctx,
+                                top_k,
+                                max_chunks,
+                                |c, n, s| {
+                                    let _ = writeln!(
+                                        stdout,
+                                        "{}",
+                                        serde_json::json!({"type":"kld_chunk","chunk":c,"n_chunk":n,"scored":s,"mean_kld":0.0})
+                                    );
+                                    let _ = stdout.flush();
+                                },
+                            ) {
+                                Ok(p) => {
+                                    let meta = hipfire_kld::RefMeta {
+                                        schema: 2,
+                                        base_model_id: base_model.clone(),
+                                        source_model_sha256: String::new(),
+                                        tokenizer_sha256: None,
+                                        arch_id,
+                                        n_vocab: p.n_vocab,
+                                        n_ctx: p.n_ctx,
+                                        n_chunk: p.n_chunk,
+                                        scored_per_chunk: p.scored_per_chunk,
+                                        scoring_start: p.n_ctx / 2,
+                                        top_k: p.top_k,
+                                        total_scored: p.n_chunk * p.scored_per_chunk,
+                                        slice_path: corpus.clone(),
+                                        slice_md5: String::new(),
+                                        config: cfg.clone(),
+                                        producer: hipfire_kld::ProducerInfo {
+                                            hipfire_version: version.clone(),
+                                            git_commit: Some(version.clone()),
+                                            git_describe: Some(version.clone()),
+                                            git_dirty: Some(version.contains("dirty")),
+                                            gpu_arch: gpu.arch.clone(),
+                                            producer_cmd: None,
+                                        },
+                                        payload_codecs: Default::default(),
+                                        content_sha256: None,
+                                    };
+                                    let archive = hipfire_kld::RefArchive {
+                                        meta,
+                                        tokens: p.tokens,
+                                        top_indices: p.top_indices,
+                                        top_log_probs: p.top_log_probs,
+                                        residual_mass: p.residual_mass,
+                                    };
+                                    let mut ref_output = serde_json::Value::Null;
+                                    match archive.write_file(std::path::Path::new(&ref_out)) {
+                                        Ok(()) => ref_output = serde_json::json!(ref_out),
+                                        Err(e) => emit_error_with_id(
+                                            &mut stdout,
+                                            "",
+                                            format!("kld_eval: write ref {ref_out}: {e}"),
+                                        ),
+                                    }
+                                    let resp = serde_json::json!({
+                                        "type": "kld_evaled", "mode": "build_ref",
+                                        "n_chunk": p.n_chunk,
+                                        "total_scored": p.n_chunk * p.scored_per_chunk,
+                                        "ref_output": ref_output, "compat_findings": [],
+                                    });
+                                    let _ = writeln!(stdout, "{resp}");
+                                    let _ = stdout.flush();
+                                }
+                                Err(e) => {
+                                    emit_error_with_id(&mut stdout, "", format!("kld_eval: {e}"))
+                                }
+                            }
+                        }
                     }
-                    Err(e) => emit_error_with_id(&mut stdout, "", format!("kld_eval: {e}")),
+                    "score" => {
+                        let Some(ref_in) = ref_path.clone() else {
+                            emit_error_with_id(
+                                &mut stdout,
+                                "",
+                                "kld_eval: score requires 'ref_path'".to_string(),
+                            );
+                            continue;
+                        };
+                        let archive =
+                            match hipfire_kld::RefArchive::read_file(std::path::Path::new(&ref_in))
+                            {
+                                Ok(a) => a,
+                                Err(e) => {
+                                    emit_error_with_id(
+                                        &mut stdout,
+                                        "",
+                                        format!("kld_eval: read ref {ref_in}: {e}"),
+                                    );
+                                    continue;
+                                }
+                            };
+                        let run = hipfire_kld::RunEnv {
+                            git_commit: Some(version.clone()),
+                            gpu_arch: gpu.arch.clone(),
+                            arch_id,
+                            n_vocab: config.vocab_size,
+                            tokenizer_sha256: None,
+                            config: cfg.clone(),
+                        };
+                        let report = hipfire_kld::compat(&archive.meta, &run);
+                        if report.has_errors() {
+                            let errs: Vec<String> = report
+                                .errors()
+                                .map(|m| format!("{}: {}", m.field, m.detail))
+                                .collect();
+                            emit_error_with_id(
+                                &mut stdout,
+                                "",
+                                format!(
+                                    "kld_eval: refusing score — ref incompatible: {}",
+                                    errs.join("; ")
+                                ),
+                            );
+                            continue;
+                        }
+                        let findings: Vec<String> = report
+                            .mismatches
+                            .iter()
+                            .map(|m| format!("{:?} {}: {}", m.severity, m.field, m.detail))
+                            .collect();
+                        match qwen35::kld_score(
+                            &mut gpu,
+                            weights,
+                            config,
+                            &archive,
+                            max_chunks,
+                            kld_chunk_cb!(),
+                        ) {
+                            Ok(out) => {
+                                let mut seq = serde_json::Value::Null;
+                                if let Some(p) = output.as_deref() {
+                                    match hipfire_kld::hfkseq::write_file(
+                                        std::path::Path::new(p),
+                                        &out.per_chunk,
+                                    ) {
+                                        Ok(()) => seq = serde_json::json!(p),
+                                        Err(e) => emit_error_with_id(
+                                            &mut stdout,
+                                            "",
+                                            format!("kld_eval: write {p}: {e}"),
+                                        ),
+                                    }
+                                }
+                                emit_kld_evaled!("score", out, seq, serde_json::json!(findings));
+                            }
+                            Err(e) => emit_error_with_id(&mut stdout, "", format!("kld_eval: {e}")),
+                        }
+                    }
+                    other => emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        format!("kld_eval: unknown mode {other:?}"),
+                    ),
                 }
             }
 
