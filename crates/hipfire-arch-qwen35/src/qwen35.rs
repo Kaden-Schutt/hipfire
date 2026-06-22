@@ -2745,6 +2745,50 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
             })
         }
+        35 => {
+            // Opus Quant W8A8 (OQ8G256, quant_type id 35). On-disk: [f16 scale]
+            // [256 int8] per 256-group, row-contiguous (codec `quantize_oq8g256`).
+            // Repack to the kernel layout in ONE buffer — int8 weights [M,K]
+            // followed by per-group f32 scales [M,K/256] — so the forward derives
+            // the weight-scale pointer via `sub_offset(M*K, ..)` and feeds
+            // `gemm_oq8_grouped_wmma`. Activations are int8-quantized at runtime
+            // (`quantize_act_oq8`); weights are FWHT-rotated offline so the forward
+            // FWHT-rotates x to match.
+            const GROUP: usize = 256;
+            const BLOCK: usize = 258; // 2 (f16 scale) + 256 int8
+            assert_eq!(k % GROUP, 0, "OQ8G256 requires K % 256 == 0 (got K={k})");
+            let ng = k / GROUP;
+            let weight_bytes = m * k;
+            let scales_bytes = m * ng * 4;
+            let expect = m * ng * BLOCK;
+            assert_eq!(
+                data.len(),
+                expect,
+                "OQ8G256 weight byte length {} != M*ng*258 = {expect} (M={m} K={k})",
+                data.len()
+            );
+            let mut combined = vec![0u8; weight_bytes + scales_bytes];
+            for r in 0..m {
+                for g in 0..ng {
+                    let src = (r * ng + g) * BLOCK;
+                    let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+                    let dst = r * k + g * GROUP;
+                    combined[dst..dst + 256].copy_from_slice(&data[src + 2..src + BLOCK]);
+                    let so = weight_bytes + (r * ng + g) * 4;
+                    combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
+                }
+            }
+            let buf = gpu.upload_raw(&combined, &[combined.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::Oq8G256,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         _ => panic!("unsupported quant_type {} for qwen35 weight", quant_type),
     }
 }

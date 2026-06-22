@@ -248,6 +248,7 @@ pub enum DType {
     // is that weight_gemv applies Givens rotation to activations before GEMV.
     // Rotation metadata (pairs, theta, channel_scales) lives on WeightTensor::paro.
     Oq4G256, // Opus Quant W4A4: symmetric signed-INT4, FWHT-rotated, per-group f32 scale.
+    Oq8G256, // Opus Quant W8A8: symmetric signed-INT8, FWHT-rotated, per-group f32 scale (iu8 WMMA).
     // On-disk storage is [f16 scale][128 nibbles]/256-group (130 B/group, codec
     // `quantize_oq4g256`). The loader repacks to the kernel layout: packed nibbles
     // [M,K/2] followed by per-group f32 scales [M,K/256] in one buffer. The forward
@@ -293,6 +294,7 @@ impl DType {
             | DType::ParoQ4G128
             | DType::Oq4G256
             | DType::W8A8Ref
+            | DType::Oq8G256
             | DType::Raw => 1, // byte-level
         }
     }

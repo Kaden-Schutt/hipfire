@@ -1928,6 +1928,12 @@ enum QuantType {
     /// 33=Opus-A8 remain reserved for those formats; see
     /// docs/quant-formats/opus-mqplus-eval-plan.md).
     Oq4G256 = 34,
+    /// Opus Quant W8A8 — symmetric signed-INT8, FWHT-rotated, per-group f32
+    /// scale. On-disk block = [f16 scale][256 int8] = 258 B/256-group (codec
+    /// `quantize_oq8g256`). Loader (qwen35 qt=35) repacks to the kernel layout;
+    /// forward int8-quantizes activations and runs the iu8 GEMM. Near-lossless,
+    /// matrix-core-fast.
+    Oq8G256 = 35,
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -2844,6 +2850,7 @@ enum HfqInputFormat {
     Mq3,
     Qtip3,
     Oq4,
+    Oq8,
 }
 
 impl HfqInputFormat {
@@ -2859,6 +2866,7 @@ impl HfqInputFormat {
             "mq3" | "mq3g256" => Some(Self::Mq3),
             "qtip3" => Some(Self::Qtip3),
             "oq4" | "oq4g256" | "opus" => Some(Self::Oq4),
+            "oq8" | "oq8g256" | "opus8" => Some(Self::Oq8),
             _ => None,
         }
     }
@@ -3099,6 +3107,20 @@ fn quantize_hfq_source_tensor(
                 quantize_oq4g256(&f32_data, &signs1, &signs2)
             };
             (q, QuantType::Oq4G256, 256, "OQ4G256")
+        }
+        HfqInputFormat::Oq8 => {
+            // Opus Quant W8A8 (plain RTN, first pass — no AWQ/LDLQ yet). Requires
+            // 256-aligned K (FWHT-256); ragged dims fall back to Q8. Loader is
+            // qwen35 qt=35; forward int8-quantizes activations and runs the iu8 GEMM.
+            if k % 256 != 0 {
+                return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
+            }
+            (
+                quantize_oq8g256(&f32_data, &signs1, &signs2),
+                QuantType::Oq8G256,
+                256,
+                "OQ8G256",
+            )
         }
         HfqInputFormat::F16 | HfqInputFormat::Bf16 | HfqInputFormat::Qtip3 => unreachable!(),
     };

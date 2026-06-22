@@ -716,9 +716,6 @@ pub(crate) fn dequant_oq4g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f
 /// [`quantize_oq4g256`] — the nibble packing disappears (one byte per weight) and
 /// it feeds the iu8 grouped-WMMA path (Opus Quant W8A8) for near-lossless,
 /// matrix-core-fast inference.
-// Wired into the format dispatch in the Oq8 dispatch rung; until then only the
-// round-trip test exercises it.
-#[allow(dead_code)]
 pub(crate) fn quantize_oq8g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     let (group_size, block_bytes) = (256usize, 258usize); // 2 (f16 scale) + 256 int8
     let n = f32_data.len();

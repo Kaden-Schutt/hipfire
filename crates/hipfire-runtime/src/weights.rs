@@ -386,6 +386,27 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
             gpu.free_tensor(yi)?;
             Ok(())
         }
+        // Opus Quant W8A8 (Oq8G256) — int8 activations + int8 weights, near-lossless.
+        // The int8 generalization of the Oq4 arm (no nibble packing; iu8 WMMA).
+        // x → rotate_x_mq_for (FWHT-256) → quantize_act_oq8 (int8 + per-group scale)
+        // → gemm_oq8_grouped_wmma. Weight buffer = [int8 M*K | f32 scales M*ng].
+        // The decode path (attn-output / lm_head) reaches Oq8 through
+        // dispatch_ref → run_auto → GemvOq8G256Prerotated in the gemv registry;
+        // generate and other direct weight_gemv callers hit this arm.
+        DType::Oq8G256 => {
+            const GROUP: usize = 256;
+            assert_eq!(w.k % GROUP, 0, "Oq8G256 weight_gemv: K must be % 256");
+            let ng = w.k / GROUP;
+            gpu.ensure_mq_signs()?;
+            gpu.ensure_oq4_scratch()?;
+            let xr = xr!();
+            rotate_x_mq_for(gpu, w, x, &xr, w.k)?;
+            let xq = gpu.alloc_tensor(&[w.k], DType::Raw)?;
+            let xs = gpu.alloc_tensor(&[ng], DType::F32)?;
+            gpu.quantize_act_oq8(&xr, &xq, &xs, 1, w.k, GROUP)?;
+            let ws = w.buf.sub_offset(w.m * w.k, w.m * ng * 4);
+            gpu.gemm_oq8_grouped_wmma(&w.buf, &ws, &xq, &xs, y, w.m, w.k, 1, GROUP)
+        }
         // All other FWHT-requiring dtypes (MQ4G256, MQ6G256, MQ3G256, MQ2G256,
         // MQ2G256Lloyd, MQ3G256Lloyd, MQ4G256Lloyd, MFP4G32):
         // ensure_mq_signs + rotate_x_mq_for + run_auto

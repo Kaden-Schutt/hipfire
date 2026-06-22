@@ -116,7 +116,7 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
         // Opus W4A4: weights are offline FWHT-256-rotated; the pipeline rotates x
         // to match (RmsnormAutomatic → x_rot), then the Oq4 Gemv arm int4-quantizes
         // x_rot before the grouped iu4 GEMM (see launch_op / oq4_gemv_into).
-        Oq4G256 => RotationPlan::FwhtG256,
+        Oq4G256 | Oq8G256 => RotationPlan::FwhtG256,
         MQ4G128 => RotationPlan::FwhtG128,
         MQ8G256 => RotationPlan::Mq8Internal,
         ParoQ4G128 => RotationPlan::Givens,
@@ -132,7 +132,9 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
     match dtype {
         ParoQ4G128 => GemvVariant::Plain,
         MQ4G256 | MQ3G256 | Qtip3G256 | MQ2G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd
-        | MQ3G256Lloyd | MQ4G256Lloyd | MFP4G32 | MQ4G128 | Oq4G256 => GemvVariant::Prerotated,
+        | MQ3G256Lloyd | MQ4G256Lloyd | MFP4G32 | MQ4G128 | Oq4G256 | Oq8G256 => {
+            GemvVariant::Prerotated
+        }
         _ => GemvVariant::Plain,
     }
 }
@@ -219,6 +221,9 @@ pub enum KernelKey {
     GemvMq3G256LloydPrerotated,
     GemvMq4G256LloydPrerotated,
     GemvMfp4G32Prerotated,
+    // Opus Quant W8A8 — prerotated int8 activation + int8 grouped-WMMA weight.
+    // x arrives FWHT-rotated; launch quantizes to int8 then dispatches gemm_oq8.
+    GemvOq8G256Prerotated,
     // GEMV residual
     GemvHfq4G256Residual,
     GemvHfq3G256Residual,
@@ -586,6 +591,7 @@ impl KernelKey {
             MQ3G256Lloyd => Ok(Self::GemvMq3G256LloydPrerotated),
             MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydPrerotated),
             MFP4G32 => Ok(Self::GemvMfp4G32Prerotated),
+            Oq8G256 => Ok(Self::GemvOq8G256Prerotated),
             // Q8/Paro have no separate "prerotated" kernel: Q8 is not FWHT-rotated
             // (prerotated input == raw input → gemv_q8_0), and Paro's Givens-rotated
             // input feeds the same gemv_hfq4g128 kernel as its Plain path. launch()
@@ -682,8 +688,9 @@ impl KernelKey {
             Qtip3G256 => ArchPredicate::Always,
             MQ6G256 | HFQ6G256 => ArchPredicate::HasMmq,
             MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWmma,
-            // Opus Quant W4A4 — int4 activations + int4 weights via iu4 WMMA.
-            Oq4G256 => ArchPredicate::HasWmma,
+            // Opus Quant W4A4 / W8A8 (grouped, FWHT-rotated) — int activations +
+            // int weights via iu4/iu8 grouped WMMA.
+            Oq4G256 | Oq8G256 => ArchPredicate::HasWmma,
             // W8A8 reference — int8 weights + per-token int8 activations via iu8 WMMA.
             W8A8Ref => ArchPredicate::HasWmma,
             Q8HFQ | Raw => ArchPredicate::Always,
@@ -752,5 +759,8 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
             // run_auto early return. NOT added to dtype_rotation_plan: that drives
             // run_auto/gemv_steps, which Oq4 never uses (it calls the kernels direct).
             | Oq4G256
+            // Opus W8A8: weight_gemv's Oq8G256 arm does the FWHT + int8 act-quant
+            // itself; same rationale as Oq4G256 above.
+            | Oq8G256
     )
 }

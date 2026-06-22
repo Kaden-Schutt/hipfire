@@ -502,6 +502,23 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
             hip!(gpu.gemv_mq4g256_lloyd(w.buf, x, y, m, k))
         }
         K::GemvMfp4G32Prerotated => hip!(gpu.gemv_mfp4g32_prerotated(w.buf, x, y, m, k)),
+        // Opus Quant W8A8: x is FWHT-rotated f32. Quantize to int8 per 256-group
+        // (absmax/127 + per-group f32 scale), then grouped-iu8-WMMA against the
+        // int8 weight. Weight buffer layout: [int8 M*K | f32 scales M*ng].
+        K::GemvOq8G256Prerotated => {
+            const GROUP: usize = 256;
+            let ng = k / GROUP;
+            let xq = hip!(gpu.alloc_tensor(&[k], DType::Raw))?;
+            let xs = hip!(gpu.alloc_tensor(&[ng], DType::F32))?;
+            let res = (|| {
+                hip!(gpu.quantize_act_oq8(x, &xq, &xs, 1, k, GROUP))?;
+                let ws = w.buf.sub_offset(m * k, m * ng * 4);
+                hip!(gpu.gemm_oq8_grouped_wmma(w.buf, &ws, &xq, &xs, y, m, k, 1, GROUP))
+            })();
+            let _ = gpu.free_tensor(xq);
+            let _ = gpu.free_tensor(xs);
+            res
+        }
         other => return Err(DispatchError::MissingImpl { key: other }),
     }
 }
