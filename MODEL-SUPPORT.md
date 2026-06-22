@@ -16,23 +16,23 @@ This is the **canonical model-support matrix** for hipfire. It tracks what is
 
 **Last verified:** 2026-06-23 (against `chaingun`).
 
-Legend: ✅ full · 🟡 partial / limited · ❌ not implemented (explicitly refused at load/serve)
+Legend: ✅ full · 🟡 partial / limited · ❌ not implemented (explicitly refused at load/serve) · — not applicable (e.g. expert sharding on a dense arch)
 
 ## Feature matrix vs flagship qwen3.5
 
-| Arch (arch_id) | Decode | Batched prefill | Server microbatch | DFlash spec | MTP spec | KV quant modes | Lowered/superop pipeline | Multi-GPU shard (PP / EP-TP) | Vision |
-|---|---|---|---|---|---|---|---|---|---|
-| **qwen3.5 dense / MoE (5 / 6)** — flagship | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ full menu | ✅ | ✅ (PP; EP/TP on MoE) | via qwen35-vl |
-| qwen3.5-VL (5/6 + splice) | ✅ | ✅ | ✅ (family) | ✅ (family) | ✅ (family) | ✅ full | ✅ | ✅ (family) | ✅ |
-| deepseek4-flash (9) | ✅ | ✅ (own kernels) | ❌ | ❌ | 🟡 native MTP head loads, not wired to spec-serving | 🟡 fp32 only | ✅ | ❌ | ❌ |
-| minimax-m2 (10) | ✅ | ❌ per-token | ❌ | ❌ | 🟡 config plumbing only | 🟡 fp32 only | ✅ | ❌ | ❌ |
-| lfm2-moe (11) | ✅ | ❌ per-token | ❌ | ❌ | ❌ | 🟡 fp32 only | ✅ | ❌ | ❌ |
-| gemma3 text (12) | ✅ | ✅ | ❌ | ❌ | ❌ | 🟡 fp32 + q8 | ❌ | ❌ | ❌ |
-| gemma3-VL / medgemma (13) | ✅ | ✅ | ❌ | ❌ | ❌ | 🟡 fp32 + q8 | ❌ | ❌ | ✅ |
-| qwen2 (7) | ✅ | ✅ | ❌ | ❌ | ❌ | 🟡 fp32 only | ✅ | ❌ | ❌ |
-| dots-ocr (8) | ✅ | ✅ | ❌ | ❌ | ❌ | 🟡 fp32 only | 🟡 | ❌ | ✅ (OCR) |
-| llama / mistral (0), qwen3-legacy (1) | ✅ | 🟡 (llama path) | ❌ | ❌ | ❌ | 🟡 fp32 | 🟡 | ❌ | ❌ |
-| toy | test fixture only | — | — | — | — | — | — | — | — |
+| Arch (arch_id) | Decode | Batched prefill | Server microbatch | DFlash spec | MTP spec | KV quant modes | Lowered/superop pipeline | Layer shard (PP) | Expert shard (EP/TP) | Vision |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **qwen3.5 dense / MoE (5 / 6)** — flagship | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ full menu | ✅ | ✅ | ✅ (MoE) | via qwen35-vl |
+| qwen3.5-VL (5/6 + splice) | ✅ | ✅ | ✅ (family) | ✅ (family) | ✅ (family) | ✅ full | ✅ | ✅ (family) | ✅ (MoE) | ✅ |
+| deepseek4-flash (9) | ✅ | ✅ (own kernels) | ❌ | ❌ | 🟡 native MTP head loads, not wired to spec-serving | 🟡 fp32 only | ✅ | ❌ | ❌ (MoE, unsharded) | ❌ |
+| minimax-m2 (10) | ✅ | ❌ per-token | ❌ | ❌ | 🟡 config plumbing only | 🟡 fp32 only | ✅ | ❌ | ❌ (MoE, unsharded) | ❌ |
+| lfm2-moe (11) | ✅ | ❌ per-token | ❌ | ❌ | ❌ | 🟡 fp32 only | ✅ | ❌ | ❌ (MoE, unsharded) | ❌ |
+| gemma3 text (12) | ✅ | ✅ | ❌ | ❌ | ❌ | 🟡 fp32 + q8 | ❌ | ❌ | — (dense) | ❌ |
+| gemma3-VL / medgemma (13) | ✅ | ✅ | ❌ | ❌ | ❌ | 🟡 fp32 + q8 | ❌ | ❌ | — (dense) | ✅ |
+| qwen2 (7) | ✅ | ✅ | ❌ | ❌ | ❌ | 🟡 fp32 only | ✅ | ❌ | — (dense) | ❌ |
+| dots-ocr (8) | ✅ | ✅ | ❌ | ❌ | ❌ | 🟡 fp32 only | 🟡 | ❌ | — (dense) | ✅ (OCR) |
+| llama / mistral (0), qwen3-legacy (1) | ✅ | 🟡 (llama path) | ❌ | ❌ | ❌ | 🟡 fp32 | 🟡 | ❌ | — (dense) | ❌ |
+| toy | test fixture only | — | — | — | — | — | — | — | — | — |
 
 > **Server microbatch** = serving many *concurrent* request streams batched
 > together (continuous batching), distinct from in-request *batched prefill* (one
