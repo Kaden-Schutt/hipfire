@@ -32,6 +32,26 @@ use rdna_compute::{DType, Gpu, GpuTensor, HipResult};
 
 const HD: usize = 256; // head_dim (kernel CHD)
 
+/// Per-token importance proxy used to rank/weight cold compaction.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ImportanceMode {
+    Uniform,
+    VNorm,
+    KNorm,
+    KvNorm,
+}
+
+impl ImportanceMode {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "uniform" => ImportanceMode::Uniform,
+            "knorm" => ImportanceMode::KNorm,
+            "kvnorm" => ImportanceMode::KvNorm,
+            _ => ImportanceMode::VNorm, // default
+        }
+    }
+}
+
 /// One compacted cold segment, 4-bit-resident on GPU (per kv-head record tiles).
 pub struct ColdSegmentGpu {
     pub k_recs: GpuTensor, // [n_kv_heads × rec_bytes] as f32-view (bytes/4 elems)
@@ -59,6 +79,12 @@ pub struct HierKvState {
     pub migrate_batch: usize,
     pub core_frac: f32,
     pub fold_m: usize,
+    /// Per-token importance signal for cold compaction (core selection + merge
+    /// weighting). "uniform" (meaningless, average merge), "vnorm" (‖V_t‖),
+    /// "knorm" (‖K_t‖), "kvnorm" (‖K_t‖·‖V_t‖). A real attention-mass signal
+    /// (CASK) would need per-key accumulation in the hot read; norms are the
+    /// zero-tracking proxy.
+    pub importance_mode: ImportanceMode,
     pub n_heads: usize,
     pub n_kv_heads: usize,
     pub hot_k: Vec<GpuTensor>, // [n_layers] slot-major [nkv × hot_budget × HD] f32
@@ -103,6 +129,9 @@ impl HierKvState {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.125f32);
+        let importance_mode = ImportanceMode::from_str(
+            &std::env::var("HIPFIRE_KV_IMPORTANCE").unwrap_or_else(|_| "vnorm".to_string()),
+        );
         let mut hot_k = Vec::with_capacity(n_layers);
         let mut hot_v = Vec::with_capacity(n_layers);
         if enabled {
@@ -117,6 +146,7 @@ impl HierKvState {
             migrate_batch,
             core_frac,
             fold_m,
+            importance_mode,
             n_heads,
             n_kv_heads,
             hot_k,
@@ -198,8 +228,22 @@ impl HierKvState {
                 cv[dst..dst + HD].copy_from_slice(&hv[src..src + HD]);
             }
         }
-        // Uniform importance (the evicted batch is the oldest, ~equal age) → average merge.
-        let importance = vec![1.0f32; mb];
+        // Per-token importance for core selection + merge weighting. Norm proxies
+        // pull the merged K toward the dominant token's RoPE phase (less blur) and
+        // keep high-norm tokens exact; uniform = the old average merge.
+        let importance: Vec<f32> = (0..mb)
+            .map(|t| {
+                let base = t * kv_dim;
+                let kn = || (0..kv_dim).map(|d| ck[base + d] * ck[base + d]).sum::<f32>().sqrt();
+                let vn = || (0..kv_dim).map(|d| cv[base + d] * cv[base + d]).sum::<f32>().sqrt();
+                match self.importance_mode {
+                    ImportanceMode::Uniform => 1.0,
+                    ImportanceMode::VNorm => vn(),
+                    ImportanceMode::KNorm => kn(),
+                    ImportanceMode::KvNorm => kn() * vn(),
+                }
+            })
+            .collect();
         let cold = compact_cold_kv(&ck, &cv, mb, nkv, HD, &importance, self.core_frac, self.fold_m, false);
         let n_slots = cold.n_slots;
         let rec_bytes = kvarn_record_bytes(HD, n_slots);
