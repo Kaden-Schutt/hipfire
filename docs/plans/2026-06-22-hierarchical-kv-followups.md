@@ -69,25 +69,22 @@ session and runs per-token `forward_scratch` through `kv_cache_attention_dispatc
 Correct by extension of the `infer_qwen35` proof (forward_scratch+kvarn+hier coherent).
 Replaced the prior hard guard. Slower than fused batch; hier is a memory feature.
 
-### 1b. **NEW PREREQUISITE (discovered during #1 validation): kvarn in the daemon `generate` path**
-Validation surfaced a **larger, pre-existing gap**: the daemon's single-session
-`generate` path prefills via `forward_prefill_batch_chunked` (batched attention),
-which bypasses the per-token dispatch — so **plain kvarn is garbage in single
-`generate`** (q8 is fine; verified on `hipfire-daemon`), and hier degenerates there
-too. This is independent of hier — kvarn was only ever exercised via per-token paths
-(`infer_qwen35`, `eval_hipfire`), never the daemon serve path. Until this is fixed,
-hier is usable only via the multi-session batch protocol (#1), not single `generate`.
-- **Fix**: route the daemon `generate` prefill (and any batched decode) to per-token
-  `forward_scratch` when the active cache is `quant_kvarn` (mirror the #1 overrides;
-  detect `m.kv_cache.quant_kvarn`, not just the env flag, so plain kvarn benefits).
-  Lives in the 18k-line `hipfire-daemon/src/main.rs` `generate()` (≈13986) + the
-  chunked-prefill call site. Cross-cutting; treat as its own task.
-- **Validation gate**: a `hipfire-daemon` multi-turn session (kvarn + hier) that stays
-  coherent across two turns (turn 2 fires `idle_compact`). This is the real end-to-end
-  test that #1 could not run (it requires either fixing 1b, or driving the batch
-  protocol envelope directly).
-- **Quick win**: this fix ALSO makes plain kvarn work in the daemon — worth doing
-  regardless of hier.
+### 1b. kvarn/hier in the daemon `generate` path — **DONE, commit a5140860**
+The pre-existing gap (kvarn garbage in the daemon serve path, q8 fine) had TWO causes
+in `hipfire_serving_core::generate::generate()` (not the daemon main; the actual AR
+entry), both bypassing the per-token `kv_cache_attention_dispatch` kvarn requires:
+1. Models with a bundled MTP head (e.g. qwen3.5-0.8b-mq4, `mtp_mode=auto`) routed to
+   `generate_mtp` spec-decode (batched prefill) and returned before the AR block.
+2. The AR block itself prefilled via batched `forward_prefill_batch`.
+Fix (3 changes in `generate()`): a `kvarn_active` guard skips the DFlash + MTP spec
+paths for kvarn caches → AR path; the AR prefill uses per-token `forward_scratch` for
+kvarn; and a between-turns `idle_compact` drain fires on continued turns (seq_pos>0).
+Validated on `hipfire-daemon`: plain kvarn went from `!!!!` garbage to a coherent
+semaphore definition (**also fixes plain-kvarn daemon serve**, the quick win); hier
+multi-turn (hot=64, 2-bit cold) is coherent across both turns, turn 2 firing the idle
+drain. Debugging note: cargo can recompile `hipfire-serving-core` without relinking
+`hipfire-daemon` — `touch crates/hipfire-daemon/src/main.rs` to force the relink when
+testing daemon changes (cost ~1hr of stale-binary confusion).
 
 ### 1c. (Optional) batched two-tier attention
 Only if hier ever needs batched-prefill *throughput*: a session-batch attention
