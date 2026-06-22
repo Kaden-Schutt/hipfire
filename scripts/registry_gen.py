@@ -62,6 +62,7 @@ KNOWN_QUANTS = {
     "mq3p",
     "mq4",
     "mq4p",
+    "mq4r",
     "mq5",
     "mq6",
     "mfp4",

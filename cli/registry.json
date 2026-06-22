@@ -140,9 +140,16 @@
     "qwen3.6:35b-a3b-mq4": {
       "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
       "file": "qwen3.6-35b-a3b.mq4",
+      "size_gb": 19.4,
+      "min_vram_gb": 22,
+      "desc": "MQ4 with Q8 attention + router (uniform MQ4 routed experts) - quality-protected 4-bit default; Q8 protects the precision-sensitive attention. ~122 tok/s decode (gfx1100)."
+    },
+    "qwen3.6:35b-a3b-mq4r": {
+      "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
+      "file": "qwen3.6-35b-a3b.mq4r",
       "size_gb": 18.7,
       "min_vram_gb": 22,
-      "desc": "Uniform MQ4 (plain, no dense-AWQ) \u2014 coherent on all arches (the dense-AWQ mq4 build was the lobotomy; this is the validated plain build)."
+      "desc": "MQ4 redline - uniform MQ4 everything incl. attention, fused gate path. Fastest 4-bit (~149 tok/s decode, +21% vs mq4), lower quality (unprotected attention)."
     },
     "qwen3.6:27b": {
       "repo": "schuttdev/hipfire-qwen3.6-27b",
