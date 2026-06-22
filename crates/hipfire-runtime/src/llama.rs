@@ -5039,19 +5039,21 @@ impl KvCache {
             KvMode::Asym3Auto,
             "from_mode received unresolved sentinel"
         );
-        // GATE: the asym4 single-token flash-attention decode (AttnFlashAsym4)
-        // is correct only at head_dim=256 (validated via qwen35). At head_dim=128
-        // it deterministically produces garbage — the write/tile/reduce kernels
-        // nominally accept head_dim 128, but the flash decode path is broken
-        // there (tracked, not yet root-caused). Fail the load loudly here rather
-        // than let an asym4@128 cache silently emit garbage at inference.
-        if matches!(mode, KvMode::Asym4) && dims.head_dim != 256 {
+        // GATE: asym4 and asym3 require head_dim=256. Both are validated only on
+        // Qwen 3.5 (head_dim=256); the constructors hard-assert head_dim==256 and
+        // the flash-decode paths are untested below that. Return a clean error here
+        // rather than panicking or emitting garbage inside the constructor.
+        if matches!(mode, KvMode::Asym4 | KvMode::Asym3) && dims.head_dim != 256 {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "asym4 KV cache is unsupported at head_dim={} (the single-token \
-                     flash-attention path is broken below head_dim=256; gated to \
-                     prevent silent garbage output). Use --kv-mode q8.",
+                    "{} KV cache requires head_dim=256 (validated on Qwen 3.5); \
+                     head_dim={} is unsupported. Use --kv-mode q8.",
+                    match mode {
+                        KvMode::Asym4 => "asym4",
+                        KvMode::Asym3 => "asym3",
+                        _ => unreachable!(),
+                    },
                     dims.head_dim
                 ),
             ));
