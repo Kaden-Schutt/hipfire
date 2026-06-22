@@ -4775,6 +4775,8 @@ async function runServe(args: string[]) {
     }
     process.env.HIPFIRE_IDLE_TIMEOUT = String(n); // serve() honors env over cfg
   }
+  const cliSocketPath = takeFlagValue(args, "--socket-path")
+                     ?? takeFlagValue(args, "--unix-socket");
 
   let detach = false;
   const setPort = (raw: string) => {
@@ -4859,7 +4861,10 @@ async function runServe(args: string[]) {
         + `  --kv-mode <m>         KV cache mode this run (q8, asym4, asym3, asym2, fwht4/3/2, auto)\n`
         + `  --idle-timeout <s>    Unload model after <s> idle seconds (0 = never; max 86400)\n`
         + `  --no-prewarm          Skip pre-warm; load the model lazily on the first request\n`
-        + `  --tp N                Expert-parallel across N GPUs (MiniMax-M2 / DeepSeek-V4; needs N GPUs)\n\n`
+        + `  --tp N                Expert-parallel across N GPUs (MiniMax-M2 / DeepSeek-V4; needs N GPUs)\n`
+        + `  --socket-path <p>     Listen on a Unix socket at <p> (absolute) instead of\n`
+        + `                        host:port (alias: --unix-socket). Frees CI/gates from\n`
+        + `                        TCP port contention.\n\n`
         + `Background daemon:\n`
         + `  hipfire serve -d                       # start in background\n`
         + `  hipfire serve qwen3.5:9b 0.0.0.0:11435 -d\n`
