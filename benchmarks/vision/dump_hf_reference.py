@@ -207,19 +207,45 @@ def dump_one(image_path, out_dir, model, processor, family, device):
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
 
+def dump_lm(prompt, out_dir, model, processor, device):
+    """Dump the LANGUAGE-MODEL forward for a text-only prompt: per-decoder-layer
+    hidden states + final logits + input_ids, to validate hipfire's gemma3
+    decoder prefill against HF ground truth (no image, so token alignment is
+    trivial)."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tok = getattr(processor, "tokenizer", processor)
+    messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+    ids = tok.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt").to(device)
+    with torch.no_grad():
+        out = model(input_ids=ids, output_hidden_states=True, use_cache=False)
+    hs = out.hidden_states  # (embed, layer0_out, ..., layerN_out), each [1, M, dim]
+    np.save(out_dir / "lm_input_ids.npy", ids.cpu().numpy())
+    np.save(out_dir / "lm_embed.npy", hs[0].detach().cpu().float().numpy())
+    for i, h in enumerate(hs[1:]):
+        np.save(out_dir / f"lm_block_{i:02d}.npy", h.detach().cpu().float().numpy())
+    np.save(out_dir / "lm_logits.npy", out.logits.detach().cpu().float().numpy())
+    print(f"  prompt M={ids.shape[1]} tokens, {len(hs)-1} layers, hidden={hs[0].shape[-1]}")
+    print(f"  last-pos top-5 token ids: {out.logits[0, -1].topk(5).indices.tolist()}")
+    (out_dir / "lm_meta.json").write_text(json.dumps({
+        "prompt": prompt, "n_tokens": int(ids.shape[1]),
+        "n_layers": len(hs) - 1, "hidden": int(hs[0].shape[-1]),
+    }, indent=2))
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("images", nargs="+", help="image paths")
+    ap.add_argument("images", nargs="*", help="image paths (vision dump)")
     ap.add_argument("--model", required=True,
                     help="HF id, local snapshot path, or alias: " + ", ".join(ALIASES))
     ap.add_argument("--out", default="hf-ref")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--lm-prompt", default=None,
+                    help="dump the LM forward (hidden states + logits) for this text prompt")
     args = ap.parse_args()
 
     model_path = ALIASES.get(args.model, args.model)
     cfg = AutoConfig.from_pretrained(model_path)
-    family = pick_family(cfg.model_type)
-    print(f"model_type={cfg.model_type} → family={family.name}; loading on {args.device}...")
+    print(f"model_type={cfg.model_type}; loading on {args.device}...")
 
     processor = AutoProcessor.from_pretrained(model_path)
     model = AutoModelForImageTextToText.from_pretrained(
@@ -227,10 +253,15 @@ def main():
     ).eval()
 
     out_root = Path(args.out)
-    for img in args.images:
-        p = Path(img)
-        print(f"\n== {p.name} ==")
-        dump_one(p, out_root / p.stem, model, processor, family, args.device)
+    if args.lm_prompt is not None:
+        print("\n== LM forward ==")
+        dump_lm(args.lm_prompt, out_root / "lm", model, processor, args.device)
+    if args.images:
+        family = pick_family(cfg.model_type)
+        for img in args.images:
+            p = Path(img)
+            print(f"\n== {p.name} ({family.name}) ==")
+            dump_one(p, out_root / p.stem, model, processor, family, args.device)
     print(f"\nDone. Dumps at: {out_root.absolute()}")
 
 

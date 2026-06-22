@@ -13,12 +13,15 @@
 //! uses. Its [`SimpleAr`] impl covers the text-only fallback (no image bytes) and
 //! the per-step decode the loop drives.
 
-use hipfire_arch_gemma3::{forward_step, forward_step_with_embed, Gemma3Config, Gemma3State};
+use hipfire_arch_gemma3::{
+    embed_token, forward_prefill_batch, forward_step, forward_step_with_embed, Gemma3Config,
+    Gemma3State,
+};
 use hipfire_runtime::arch::{
     decode_loop, ArchCaps, GenerateCtx, ServeOutcome, ServingBackend, SimpleAr,
 };
 use hipfire_runtime::tokenizer::Tokenizer;
-use rdna_compute::{Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::config::Gemma3VlConfig;
 use crate::loader::Gemma3VlWeights;
@@ -109,27 +112,87 @@ impl Gemma3VlBackend {
             ));
         }
         let stream = splice_image_tokens(&self.vl_cfg, &ids, n_images);
+        let m = stream.len();
+        // Batched prefill by default: read each weight once for all M tokens
+        // instead of M per-token forwards (huge win for image-heavy prompts).
+        // Numerically equivalent to the per-token path (both full-causal); opt
+        // out with HIPFIRE_GEMMA3_NO_BATCHED_PREFILL=1 for A/B.
+        let batched = m > 1
+            && std::env::var("HIPFIRE_GEMMA3_NO_BATCHED_PREFILL")
+                .ok()
+                .as_deref()
+                != Some("1");
 
-        let mut img_row = 0usize;
-        for &id in &stream {
-            if id == self.vl_cfg.image_token_index {
-                let row = &img_embeds[img_row * th..(img_row + 1) * th];
-                forward_step_with_embed(
-                    gpu,
-                    &self.weights.text,
-                    &self.text_cfg,
-                    &mut self.state,
-                    row,
+        if batched {
+            let dim = self.text_cfg.hidden_size; // == th for gemma3-vl
+            let x_batch = gpu
+                .alloc_tensor(&[m * dim], DType::F32)
+                .map_err(|e| format!("gemma3-vl prefill x_batch alloc: {e:?}"))?;
+            let img_gpu = gpu
+                .upload_f32(
+                    img_embeds,
+                    &[n_images.max(1) * self.vl_cfg.mm_tokens_per_image * th],
                 )
-                .map_err(|e| format!("gemma3-vl prefill embed splice: {e:?}"))?;
-                img_row += 1;
-            } else {
-                forward_step(gpu, &self.weights.text, &self.text_cfg, &mut self.state, id)
-                    .map_err(|e| format!("gemma3-vl prefill forward_step: {e:?}"))?;
+                .map_err(|e| format!("gemma3-vl prefill img upload: {e:?}"))?;
+            let mut img_row = 0usize;
+            for (i, &id) in stream.iter().enumerate() {
+                if id == self.vl_cfg.image_token_index {
+                    gpu.memcpy_dtod_at_auto(
+                        &x_batch.buf,
+                        i * dim * 4,
+                        &img_gpu.buf,
+                        img_row * th * 4,
+                        dim * 4,
+                    )
+                    .map_err(|e| format!("gemma3-vl prefill img copy: {e:?}"))?;
+                    img_row += 1;
+                } else {
+                    embed_token(gpu, &self.weights.text, &self.text_cfg, &self.state.x, id)
+                        .map_err(|e| format!("gemma3-vl prefill embed: {e:?}"))?;
+                    gpu.memcpy_dtod_at_auto(
+                        &x_batch.buf,
+                        i * dim * 4,
+                        &self.state.x.buf,
+                        0,
+                        dim * 4,
+                    )
+                    .map_err(|e| format!("gemma3-vl prefill embed copy: {e:?}"))?;
+                }
+            }
+            forward_prefill_batch(
+                gpu,
+                &self.weights.text,
+                &self.text_cfg,
+                &mut self.state,
+                &x_batch,
+                m,
+                0,
+            )
+            .map_err(|e| format!("gemma3-vl batched prefill: {e:?}"))?;
+            let _ = gpu.free_tensor(x_batch);
+            let _ = gpu.free_tensor(img_gpu);
+        } else {
+            let mut img_row = 0usize;
+            for &id in &stream {
+                if id == self.vl_cfg.image_token_index {
+                    let row = &img_embeds[img_row * th..(img_row + 1) * th];
+                    forward_step_with_embed(
+                        gpu,
+                        &self.weights.text,
+                        &self.text_cfg,
+                        &mut self.state,
+                        row,
+                    )
+                    .map_err(|e| format!("gemma3-vl prefill embed splice: {e:?}"))?;
+                    img_row += 1;
+                } else {
+                    forward_step(gpu, &self.weights.text, &self.text_cfg, &mut self.state, id)
+                        .map_err(|e| format!("gemma3-vl prefill forward_step: {e:?}"))?;
+                }
             }
         }
 
-        decode_loop(gpu, self, tok, eos, ctx, stream.len(), stream.len())
+        decode_loop(gpu, self, tok, eos, ctx, m, m)
     }
 }
 

@@ -26,7 +26,7 @@
 //! pre-scale baked into `q_norm` (see `load_weights`).
 
 use hip_bridge::{DeviceBuffer, HipResult};
-use hipfire_runtime::weights::{weight_gemv, EmbeddingFormat};
+use hipfire_runtime::weights::{weight_gemm, weight_gemv, EmbeddingFormat};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::config::Gemma3Config;
@@ -176,28 +176,9 @@ pub fn forward_step(
     token: u32,
 ) -> HipResult<()> {
     let pos = prelude(gpu, state)?;
-    let dim = cfg.hidden_size;
 
-    // Embedding lookup → x.
-    match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => {
-            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &state.x, token, dim)?
-        }
-        EmbeddingFormat::HFQ4G128 => {
-            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &state.x, token, dim)?
-        }
-        EmbeddingFormat::Q8_0 => {
-            gpu.embedding_lookup_q8(&weights.token_embd, &state.x, token, dim)?
-        }
-        EmbeddingFormat::Q4K => {
-            gpu.embedding_lookup_q4k(&weights.token_embd, &state.x, token, dim)?
-        }
-        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &state.x, token, dim)?,
-    }
-    // Gemma scales the embedding by √hidden_size before the first layer; the
-    // scale rides the residual stream (it is NOT normalized away — rmsnorm
-    // cancels it locally but each residual add re-injects it).
-    gpu.scale_f32(&state.x, cfg.embed_scale())?;
+    // Embedding lookup + Gemma √hidden scale → x.
+    embed_token(gpu, weights, cfg, &state.x, token)?;
 
     forward_after_x(gpu, weights, cfg, state, pos)?;
     state.next_pos += 1;
@@ -358,6 +339,180 @@ fn forward_after_x(
     // Final norm + lm_head.
     gpu.rmsnorm_f32(&state.x, &weights.output_norm, &state.tmp, eps)?;
     weight_gemv(gpu, &weights.output, &state.tmp, &state.logits)?;
+    Ok(())
+}
+
+/// Embed one text token (format-dispatched lookup + Gemma √hidden scale) into
+/// `dest` (`[dim]`). The embedding step shared by `forward_step` and the
+/// batched-prefill input builder. Image rows bypass this (spliced unscaled).
+pub fn embed_token(
+    gpu: &mut Gpu,
+    weights: &Gemma3Weights,
+    cfg: &Gemma3Config,
+    dest: &GpuTensor,
+    token: u32,
+) -> HipResult<()> {
+    let dim = cfg.hidden_size;
+    match weights.embd_format {
+        EmbeddingFormat::HFQ4G256 => {
+            gpu.embedding_lookup_hfq4g256(&weights.token_embd, dest, token, dim)?
+        }
+        EmbeddingFormat::HFQ4G128 => {
+            gpu.embedding_lookup_hfq4g128(&weights.token_embd, dest, token, dim)?
+        }
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, dest, token, dim)?,
+        EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, dest, token, dim)?,
+        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, dest, token, dim)?,
+    }
+    // Gemma scales the embedding by √hidden_size before the first layer; the
+    // scale rides the residual stream (rmsnorm cancels it locally but each
+    // residual add re-injects it).
+    gpu.scale_f32(dest, cfg.embed_scale())?;
+    Ok(())
+}
+
+/// Batched prefill of `m` already-embedded tokens. `x_batch` is `[m, dim]`
+/// row-major — the caller embeds text tokens (×`embed_scale`) and splices image
+/// rows (unscaled) just like the per-token path. Writes KV for absolute
+/// positions `start_pos..start_pos+m`, advances `state.next_pos`, and leaves the
+/// LAST position's logits in `state.logits`. Numerically equivalent to running
+/// `m` sequential `forward_step`s (both full-causal) but reads each weight once
+/// instead of `m` times — the multi-image / long-prompt prefill speedup.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_batch(
+    gpu: &mut Gpu,
+    weights: &Gemma3Weights,
+    cfg: &Gemma3Config,
+    state: &mut Gemma3State,
+    x_batch: &GpuTensor,
+    m: usize,
+    start_pos: usize,
+) -> HipResult<()> {
+    let dim = cfg.hidden_size;
+    let n_heads = cfg.num_attention_heads;
+    let n_kv_heads = cfg.num_key_value_heads;
+    let head_dim = cfg.head_dim;
+    let q_dim = n_heads * head_dim;
+    let kv_dim = n_kv_heads * head_dim;
+    let inter = cfg.intermediate_size;
+    let eps = cfg.rms_norm_eps;
+    let max_ctx = start_pos + m;
+
+    // Absolute positions start_pos..start_pos+m as an i32 device table (dtype is
+    // cosmetic — the rope/attention/kv kernels read it as `const int*`).
+    let pos_vals: Vec<i32> = (start_pos as i32..(start_pos + m) as i32).collect();
+    let positions = gpu.alloc_tensor(&[m], DType::F32)?;
+    {
+        let bytes: Vec<u8> = pos_vals.iter().flat_map(|p| p.to_ne_bytes()).collect();
+        gpu.hip.memcpy_htod(&positions.buf, &bytes)?;
+    }
+
+    // Batched scratch.
+    let tmp = gpu.alloc_tensor(&[m * dim], DType::F32)?;
+    let q = gpu.alloc_tensor(&[m * q_dim], DType::F32)?;
+    let k = gpu.alloc_tensor(&[m * kv_dim], DType::F32)?;
+    let v = gpu.alloc_tensor(&[m * kv_dim], DType::F32)?;
+    let attn_out = gpu.alloc_tensor(&[m * q_dim], DType::F32)?;
+    let o = gpu.alloc_tensor(&[m * dim], DType::F32)?;
+    let gate = gpu.alloc_tensor(&[m * inter], DType::F32)?;
+    let up = gpu.alloc_tensor(&[m * inter], DType::F32)?;
+    let ffn = gpu.alloc_tensor(&[m * inter], DType::F32)?;
+
+    for layer_idx in 0..cfg.num_hidden_layers {
+        let layer = &weights.layers[layer_idx];
+
+        // ── Attention block ──
+        gpu.rmsnorm_batched(x_batch, &layer.input_norm, &tmp, m, dim, eps)?;
+        weight_gemm(gpu, &layer.wq, &tmp, &q, m)?;
+        weight_gemm(gpu, &layer.wk, &tmp, &k, m)?;
+        weight_gemm(gpu, &layer.wv, &tmp, &v, m)?;
+
+        // Per-head QK-norm (q_norm carries the baked Q pre-scale): m*heads groups.
+        gpu.rmsnorm_batched(&q, &layer.q_norm, &q, m * n_heads, head_dim, eps)?;
+        gpu.rmsnorm_batched(&k, &layer.k_norm, &k, m * n_kv_heads, head_dim, eps)?;
+
+        gpu.rope_batched_f32(
+            &q,
+            &k,
+            &positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            cfg.rope_base_for_layer(layer_idx),
+            m,
+        )?;
+
+        if state.kv_quant_q8 {
+            gpu.kv_cache_write_q8_0_batched(
+                &state.k_cache[layer_idx],
+                &k,
+                &positions,
+                n_kv_heads,
+                head_dim,
+                m,
+            )?;
+            gpu.kv_cache_write_q8_0_batched(
+                &state.v_cache[layer_idx],
+                &v,
+                &positions,
+                n_kv_heads,
+                head_dim,
+                m,
+            )?;
+            gpu.attention_q8_0_kv_batched(
+                &q,
+                &state.k_cache[layer_idx],
+                &state.v_cache[layer_idx],
+                &attn_out,
+                &positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                state.max_seq,
+                max_ctx,
+                m,
+            )?;
+        } else {
+            gpu.kv_cache_write_f32_batched(&state.k_cache[layer_idx], &k, &positions, kv_dim, m)?;
+            gpu.kv_cache_write_f32_batched(&state.v_cache[layer_idx], &v, &positions, kv_dim, m)?;
+            gpu.attention_f32_batched(
+                &q,
+                &state.k_cache[layer_idx],
+                &state.v_cache[layer_idx],
+                &attn_out,
+                &positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                state.max_seq,
+                max_ctx,
+                m,
+            )?;
+        }
+
+        weight_gemm(gpu, &layer.wo, &attn_out, &o, m)?;
+        gpu.rmsnorm_batched(&o, &layer.post_attn_norm, &tmp, m, dim, eps)?;
+        gpu.add_f32(x_batch, &tmp, x_batch)?;
+
+        // ── FFN block (GeGLU) ──
+        gpu.rmsnorm_batched(x_batch, &layer.pre_ffn_norm, &tmp, m, dim, eps)?;
+        weight_gemm(gpu, &layer.w_gate, &tmp, &gate, m)?;
+        weight_gemm(gpu, &layer.w_up, &tmp, &up, m)?;
+        gpu.gelu_mul_f32(&gate, &up, &ffn)?;
+        weight_gemm(gpu, &layer.w_down, &ffn, &o, m)?;
+        gpu.rmsnorm_batched(&o, &layer.post_ffn_norm, &tmp, m, dim, eps)?;
+        gpu.add_f32(x_batch, &tmp, x_batch)?;
+    }
+
+    // Final norm + lm_head on the LAST position only (the next-token logits).
+    gpu.memcpy_dtod_at_auto(&state.x.buf, 0, &x_batch.buf, (m - 1) * dim * 4, dim * 4)?;
+    gpu.rmsnorm_f32(&state.x, &weights.output_norm, &state.tmp, eps)?;
+    weight_gemv(gpu, &weights.output, &state.tmp, &state.logits)?;
+
+    for t in [tmp, q, k, v, attn_out, o, gate, up, ffn, positions] {
+        let _ = gpu.free_tensor(t);
+    }
+    state.next_pos = start_pos + m;
     Ok(())
 }
 
