@@ -27,6 +27,7 @@
 //!   [`compat`](meta::compat) guard against cross-version/config/arch scoring.
 //! - [`codec`]  — per-blob payload codecs (bit-packed ids; reserved fp16/zstd).
 
+pub mod archive;
 pub mod codec;
 pub mod config;
 pub mod hfkseq;
@@ -34,6 +35,7 @@ pub mod math;
 pub mod meta;
 pub mod refblock;
 
+pub use archive::RefArchive;
 pub use codec::BlobCodec;
 pub use config::KldConfig;
 pub use hfkseq::ChunkResult;
