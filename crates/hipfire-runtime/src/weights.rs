@@ -370,6 +370,22 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
             let ws = w.buf.sub_offset(w.m * (w.k / 2), w.m * ng * 4);
             gpu.gemm_oq4_grouped_wmma(&w.buf, &ws, &xq, &xs, y, w.m, w.k, 1, GROUP)
         }
+        // W8A8 reference (decode = B=1): reuse the weight_gemm path. buf =
+        // [M*K int8 | M f32]. Per-vector int8 act-quant, iu8 WMMA (B=1), rowcol dequant.
+        DType::W8A8Ref => {
+            warn_generic_once("weight_gemv", "W8A8", KernelMode::Decode, &gpu.arch, Quality::Reference);
+            let xq = gpu.alloc_tensor(&[w.k], DType::Raw)?; // int8
+            let xs = gpu.alloc_tensor(&[1], DType::F32)?;
+            let yi = gpu.alloc_tensor(&[w.m * 4], DType::Raw)?; // int32
+            let w_scale = w.buf.sub_offset(w.m * w.k, w.m * 4);
+            gpu.quantize_act_int8_per_token(x, &xq, &xs, 1, w.k)?;
+            gpu.gemm_iu8_i32_wmma(&w.buf, &xq, &yi, w.m, w.k, 1)?;
+            gpu.dequant_i32_rowcol(&yi, &xs, &w_scale, y, 1, w.m)?;
+            gpu.free_tensor(xq)?;
+            gpu.free_tensor(xs)?;
+            gpu.free_tensor(yi)?;
+            Ok(())
+        }
         // All other FWHT-requiring dtypes (MQ4G256, MQ6G256, MQ3G256, MQ2G256,
         // MQ2G256Lloyd, MQ3G256Lloyd, MQ4G256Lloyd, MFP4G32):
         // ensure_mq_signs + rotate_x_mq_for + run_auto
