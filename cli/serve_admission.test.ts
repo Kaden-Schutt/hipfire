@@ -19,7 +19,54 @@ import {
   sanitizeDaemonName,
   parseListenInodesForPort,
   decideProcfsPortOwnership,
+  type ServeBind,
+  formatBind,
+  bindFetchTarget,
+  bindFromPidRecord,
+  serveProbeHost,
 } from "./serve_admission";
+
+// ─── Task 1: ServeBind + pure bind helpers ───────────────────────────────────
+
+test("formatBind: tcp renders host:port", () => {
+  expect(formatBind({ kind: "tcp", host: "127.0.0.1", port: 11435 })).toBe("127.0.0.1:11435");
+});
+
+test("formatBind: tcp brackets IPv6 host", () => {
+  expect(formatBind({ kind: "tcp", host: "::1", port: 11435 })).toBe("[::1]:11435");
+});
+
+test("formatBind: unix renders unix:path", () => {
+  expect(formatBind({ kind: "unix", path: "/run/hf.sock" })).toBe("unix:/run/hf.sock");
+});
+
+test("bindFetchTarget: tcp builds a probe URL via serveProbeHost", () => {
+  const t = bindFetchTarget({ kind: "tcp", host: "0.0.0.0", port: 11435 }, "/health");
+  expect(t.url).toBe("http://127.0.0.1:11435/health");
+  expect(t.unix).toBeUndefined();
+});
+
+test("bindFetchTarget: unix uses localhost placeholder + unix path", () => {
+  const t = bindFetchTarget({ kind: "unix", path: "/run/hf.sock" }, "/v1/chat/completions");
+  expect(t.url).toBe("http://localhost/v1/chat/completions");
+  expect(t.unix).toBe("/run/hf.sock");
+});
+
+test("bindFromPidRecord: socketPath present → unix bind", () => {
+  const b = bindFromPidRecord({ pid: 1, socketPath: "/run/hf.sock" });
+  expect(b).toEqual({ kind: "unix", path: "/run/hf.sock" });
+});
+
+test("bindFromPidRecord: legacy/TCP record → tcp bind with defaults", () => {
+  expect(bindFromPidRecord({ pid: 1 })).toEqual({ kind: "tcp", host: "127.0.0.1", port: 11435 });
+  expect(bindFromPidRecord({ pid: 1, host: "0.0.0.0", port: 9000 }))
+    .toEqual({ kind: "tcp", host: "0.0.0.0", port: 9000 });
+});
+
+test("serveProbeHost maps wildcard hosts to loopback", () => {
+  expect(serveProbeHost("0.0.0.0")).toBe("127.0.0.1");
+  expect(serveProbeHost("192.168.1.5")).toBe("192.168.1.5");
+});
 
 // ─── req-body-no-cap: Content-Length size check ─────────────────────────────
 

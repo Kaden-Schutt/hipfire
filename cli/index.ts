@@ -26,9 +26,12 @@ import {
   sanitizeDaemonName,
   parseListenInodesForPort,
   decideProcfsPortOwnership,
+  serveProbeHost,
   type ServePidRecord,
   type PidEvidence,
 } from "./serve_admission";
+// serveProbeHost moved to serve_admission.ts (pure). Re-exported for chat.ts.
+export { serveProbeHost } from "./serve_admission";
 import {
   EXIT,
   formatErrorMessage,
@@ -1732,12 +1735,6 @@ async function validateServePid(rec: ServePidRecord, targetPort: number): Promis
   if (!alive) return validatePidOwnership(rec, {}, false);
   const ev = await gatherPidEvidence(rec, targetPort);
   return validatePidOwnership(rec, ev, alive);
-}
-
-export function serveProbeHost(host: string): string {
-  if (host === "0.0.0.0" || host === "::" || host === "") return "127.0.0.1";
-  if (host.includes(":") && !host.startsWith("[")) return `[${host}]`;
-  return host;
 }
 
 export function formatServeBind(host: string, port: number): string {

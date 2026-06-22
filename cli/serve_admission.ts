@@ -248,6 +248,10 @@ export interface ServePidRecord {
   host?: string;
   port?: number;
   token?: string;
+  // Non-empty when the serve bound a Unix domain socket instead of host:port.
+  // Populated in Task 5; parsed in Task 7. Added here (Task 1) so bindFromPidRecord
+  // compiles without a forward reference.
+  socketPath?: string;
   // true when parsed from a legacy bare-numeric serve.pid (pre-record format).
   // Callers MUST do best-effort validation only (skip the new /proc checks) so
   // an old daemon stays stoppable.
@@ -564,4 +568,44 @@ export function epKvModeWarning(tp: number, kvMode: string | null | undefined): 
   if (kvMode == null || kvMode === "" || kvMode === "auto") return null;
   return `--kv-mode ${kvMode} is currently IGNORED on the EP/multi-GPU path (tp=${tp}); `
     + `the daemon falls back to its per-arch default KV mode. This is a known limitation (O2b).`;
+}
+
+// ─── Task 1: ServeBind union + pure bind helpers ─────────────────────────────
+
+// Mirrors index.ts DEFAULT_PORT (index.ts:63). Kept local to avoid a circular
+// import (index.ts imports this file).
+const DEFAULT_PORT = 11435;
+
+// A serve listens on exactly one transport. The whole tcp-vs-unix decision is
+// confined to this union and the helpers below (Approach B).
+export type ServeBind =
+  | { kind: "tcp"; host: string; port: number }
+  | { kind: "unix"; path: string };
+
+// Map a bind/listen host to the host a *client* should connect to: wildcard
+// listen addresses are not connectable, so probe loopback instead.
+export function serveProbeHost(host: string): string {
+  if (host === "0.0.0.0" || host === "" || host === "::") return "127.0.0.1";
+  return host;
+}
+
+export function formatBind(b: ServeBind): string {
+  if (b.kind === "unix") return `unix:${b.path}`;
+  // bracket IPv6 literals
+  const h = b.host.includes(":") ? `[${b.host}]` : b.host;
+  return `${h}:${b.port}`;
+}
+
+// How to reach a bind with fetch(). Bun ignores `unix: undefined`, so the tcp
+// path is a plain URL with no extra option.
+export function bindFetchTarget(b: ServeBind, path: string): { url: string; unix?: string } {
+  if (b.kind === "unix") return { url: `http://localhost${path}`, unix: b.path };
+  return { url: `http://${serveProbeHost(b.host)}:${b.port}${path}` };
+}
+
+// The single place a lifecycle command turns a tracked pid record into the bind
+// it must operate on. socketPath wins; otherwise legacy/TCP with defaults.
+export function bindFromPidRecord(rec: ServePidRecord): ServeBind {
+  if (rec.socketPath) return { kind: "unix", path: rec.socketPath };
+  return { kind: "tcp", host: rec.host ?? "127.0.0.1", port: rec.port ?? DEFAULT_PORT };
 }
