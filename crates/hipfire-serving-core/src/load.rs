@@ -29,7 +29,7 @@ use hipfire_arch_qwen35::speculative::{
     DdtreeScratch, DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, VerifyScratch,
 };
 use hipfire_arch_qwen35_vl::qwen35_vl;
-use hipfire_model::{is_qwen35_dense_arch_id, is_qwen35_family_arch_id};
+use hipfire_model::{arch_features, is_qwen35_dense_arch_id, is_qwen35_family_arch_id, FeatureSupport};
 use hipfire_prompt as prompt_frame;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
@@ -43,6 +43,30 @@ use crate::memory::{hfq_model_memory, unknown_model_memory};
 use crate::model::CaskConfig;
 use crate::model::{DdtreeState, DflashState, Eviction, LoadedModel};
 use crate::session::{next_qwen35_state_allocation_epoch, QWEN35_LEGACY_SESSION_ID};
+
+/// Matrix-backed admission gate: refuse a request for `feature` on a model whose
+/// arch capability matrix (the generated `arch_features`, source
+/// `docs/model-support.toml`) does not mark it fully supported. Returns a clean,
+/// operator-facing reason. This is the single authority — adding an arch to the
+/// matrix as feature-capable enables it here without touching this code.
+fn require_arch_feature(
+    arch_id: u32,
+    feature: &str,
+    support: FeatureSupport,
+) -> Result<(), String> {
+    if support.is_full() {
+        return Ok(());
+    }
+    let f = arch_features(arch_id);
+    Err(format!(
+        "{feature} requested but arch {} (arch_id={arch_id}) does not support it \
+         (capability matrix: {}={}). Reload without it. See MODEL-SUPPORT.md / \
+         docs/model-support.toml.",
+        f.label,
+        feature,
+        support.mark()
+    ))
+}
 
 /// Resolve the effective chat template for a model: the HFQ-embedded
 /// `tokenizer_config.chat_template`, with sidecar/path fallbacks. `None` when
@@ -373,6 +397,13 @@ pub fn load_model(
     // hfq::load_weights_hfq do at runtime, so the qt we read here is the
     // qt that will end up driving `weights.output.gpu_dtype`.
     if draft_path.is_some() {
+        // Arch-level capability gate FIRST (matrix-backed). DFlash spec-decode
+        // only runs on archs whose matrix marks it Full — the generate() router
+        // requires it. Without this an operator could attach a draft to a
+        // non-DFlash arch, pass the lm_head dtype check below, then silently get
+        // plain AR decode (a no-op draft). Refuse up front with the matrix reason.
+        require_arch_feature(hfq.arch_id, "DFlash spec-decode", arch_features(hfq.arch_id).dflash)?;
+
         let lm_qt = hfq
             .tensor_data("lm_head.weight")
             .or_else(|| hfq.tensor_data("model.language_model.lm_head.weight"))
@@ -2695,4 +2726,29 @@ pub fn load_dflash_state(
         block_size,
         ddtree,
     })
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    /// The DFlash load gate is driven by the generated capability matrix, not a
+    /// hard-coded arch list: qwen3.5 (5/6) is admitted; archs whose matrix marks
+    /// dflash != full are refused with an operator-facing, matrix-derived reason.
+    /// Guards the silent-no-op gap (draft attached to a non-DFlash arch → load
+    /// succeeds, then generate() falls through to plain AR).
+    #[test]
+    fn dflash_admission_is_matrix_backed() {
+        for arch in [5u32, 6] {
+            assert!(
+                require_arch_feature(arch, "DFlash spec-decode", arch_features(arch).dflash).is_ok(),
+                "qwen3.5 arch {arch} must admit DFlash"
+            );
+        }
+        // llama (0) and gemma3 (12) have dflash=none → refused.
+        let e = require_arch_feature(0, "DFlash spec-decode", arch_features(0).dflash)
+            .expect_err("llama must be refused");
+        assert!(e.contains("llama") && e.contains("does not support"), "msg: {e}");
+        assert!(require_arch_feature(12, "DFlash spec-decode", arch_features(12).dflash).is_err());
+    }
 }
