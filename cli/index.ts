@@ -27,6 +27,7 @@ import {
   parseListenInodesForPort,
   decideProcfsPortOwnership,
   serveProbeHost,
+  isValidSocketPath,
   type ServePidRecord,
   type PidEvidence,
 } from "./serve_admission";
@@ -124,6 +125,11 @@ export interface HipfireConfig {
   max_total_think_tokens: number; // re-arm-proof TOTAL <think> budget across the turn (0 = off). Force-closes + blocks <think> re-open at the cap; hard-EOS past it. Bounds models that re-open <think> and out-think client timeouts.
   host: string;           // default serve bind address
   port: number;           // default serve port
+  // serve: when non-empty, listen on this ABSOLUTE Unix domain socket path
+  // instead of host:port. "" (default) = TCP mode. Opt-in; CLI --socket-path
+  // overrides. Must be absolute so detached children and later run/chat
+  // invocations from other cwds resolve the SAME path.
+  socket_path: string;
   idle_timeout: number;   // serve: seconds of inactivity before unloading the model (0 = never)
   // serve: max /v1/chat/completions request body, bytes. Checked from
   // Content-Length BEFORE acquiring the serve lock (→ HTTP 413) so a giant
@@ -329,6 +335,7 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   max_total_think_tokens: 0,
   host: DEFAULT_HOST,
   port: DEFAULT_PORT,
+  socket_path: "",
   idle_timeout: 300,
   max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
   serve_max_queue: 64,
@@ -416,6 +423,7 @@ function validateConfigValue(key: string, value: any): boolean {
     case "max_total_think_tokens": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 1000000;
     case "host": return typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= 255 && !/\s/.test(value);
     case "port": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
+    case "socket_path": return typeof value === "string" && isValidSocketPath(value);
     case "idle_timeout": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 86400;
     case "max_request_bytes": return typeof value === "number" && Number.isInteger(value) && value >= 4096 && value <= 4 * 1024 * 1024 * 1024;
     case "serve_max_queue": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 100000;
@@ -6458,6 +6466,10 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       desc: "HTTP port for `hipfire serve` (OpenAI-compatible API)",
       range: [1, 65535], step: 1,
     },
+    socket_path: {
+      label: "socket_path",
+      desc: 'absolute Unix socket path, or "" for TCP mode',
+    },
     idle_timeout: {
       label: "idle_timeout",
       desc: "serve: seconds idle before unloading model (frees VRAM; 0 = never unload)",
@@ -9021,6 +9033,7 @@ Examples:
           max_think_tokens: "integer 0-32768. Budget for reasoning tokens (0 = unlimited).",
           host: "non-empty bind address without whitespace (examples: 127.0.0.1, 0.0.0.0, ::1)",
           port: "integer between 1 and 65535",
+          socket_path: 'absolute Unix socket path (e.g. /run/user/1000/hf.sock), or "" to disable (use TCP)',
           idle_timeout: "seconds of inactivity before serve unloads the model (0 = never, max 86400)",
           default_model: "non-empty model tag",
         };

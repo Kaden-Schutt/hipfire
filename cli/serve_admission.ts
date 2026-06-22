@@ -570,6 +570,17 @@ export function epKvModeWarning(tp: number, kvMode: string | null | undefined): 
     + `the daemon falls back to its per-arch default KV mode. This is a known limitation (O2b).`;
 }
 
+// ─── Task 2: socket path validation ─────────────────────────────────────────
+
+// "" disables (TCP mode); otherwise an ABSOLUTE filesystem path <=255 bytes,
+// no NUL. Absoluteness is required so detached children / later run|chat from
+// other cwds resolve the SAME path the serve bound (spec §6.1, M10).
+export function isValidSocketPath(value: string): boolean {
+  return value.length <= 255
+    && !value.includes("\0")
+    && (value === "" || value.startsWith("/"));
+}
+
 // ─── Task 1: ServeBind union + pure bind helpers ─────────────────────────────
 
 // Mirrors index.ts DEFAULT_PORT (index.ts:63). Kept local to avoid a circular

@@ -26,6 +26,26 @@ import {
   serveProbeHost,
 } from "./serve_admission";
 
+// ─── Task 2: isValidSocketPath ───────────────────────────────────────────────
+
+import { isValidSocketPath } from "./serve_admission";
+
+test("isValidSocketPath: empty string is valid (disabled)", () => {
+  expect(isValidSocketPath("")).toBe(true);
+});
+test("isValidSocketPath: absolute path is valid", () => {
+  expect(isValidSocketPath("/run/user/1000/hf.sock")).toBe(true);
+});
+test("isValidSocketPath: relative path is invalid", () => {
+  expect(isValidSocketPath("run/hf.sock")).toBe(false);
+});
+test("isValidSocketPath: NUL byte is invalid", () => {
+  expect(isValidSocketPath("/run/hf\0.sock")).toBe(false);
+});
+test("isValidSocketPath: over 255 chars is invalid", () => {
+  expect(isValidSocketPath("/" + "a".repeat(255))).toBe(false);
+});
+
 // ─── Task 1: ServeBind + pure bind helpers ───────────────────────────────────
 
 test("formatBind: tcp renders host:port", () => {
