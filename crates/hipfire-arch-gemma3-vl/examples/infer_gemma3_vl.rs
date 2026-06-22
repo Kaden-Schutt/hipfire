@@ -147,8 +147,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     ids.extend(tok.encode(&format!("{prompt}<end_of_turn>\n<start_of_turn>model\n")));
 
-    let mut state = g3::Gemma3State::new_with_max_seq(&mut gpu, text_cfg, ids.len() + max_new + 16)
-        .map_err(|e| format!("state: {e:?}"))?;
+    let mut state =
+        g3::Gemma3State::new_with_max_seq(&mut gpu, text_cfg, ids.len() + max_new + 16, false)
+            .map_err(|e| format!("state: {e:?}"))?;
 
     // Prefill: text tokens via forward_step; image placeholders consume the
     // projected embedding rows in order via forward_step_with_embed.

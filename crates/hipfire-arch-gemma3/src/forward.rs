@@ -54,27 +54,46 @@ pub struct Gemma3State {
     pub k_cache: Vec<GpuTensor>,
     pub v_cache: Vec<GpuTensor>,
     pub max_seq: usize,
+    /// When true, `k_cache`/`v_cache` hold q8_0 (int8 + per-32-block fp16 scale)
+    /// instead of F32 — ~4× smaller KV, letting larger contexts fit. Requires
+    /// `head_dim % 32 == 0` (true for gemma3: 128 @27b, 256 @4b).
+    pub kv_quant_q8: bool,
     /// Next absolute KV write slot; bumped by `forward_step`.
     pub next_pos: usize,
 }
 
 impl Gemma3State {
     pub fn new(gpu: &mut Gpu, cfg: &Gemma3Config) -> Result<Self, String> {
-        Self::new_with_max_seq(gpu, cfg, DEFAULT_MAX_SEQ)
+        Self::new_with_max_seq(gpu, cfg, DEFAULT_MAX_SEQ, false)
             .map_err(|e| format!("gemma3: Gemma3State::new failed: {e:?}"))
     }
 
-    pub fn new_with_max_seq(gpu: &mut Gpu, cfg: &Gemma3Config, max_seq: usize) -> HipResult<Self> {
+    pub fn new_with_max_seq(
+        gpu: &mut Gpu,
+        cfg: &Gemma3Config,
+        max_seq: usize,
+        quant_q8: bool,
+    ) -> HipResult<Self> {
         let dim = cfg.hidden_size;
         let q_dim = cfg.num_attention_heads * cfg.head_dim;
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
         let hidden_dim = cfg.intermediate_size;
 
+        // q8_0 KV requires head_dim divisible by the 32-element block; fall back
+        // to F32 otherwise. K/V cache slots are q8_0 blocks (32 int8 + fp16
+        // scale = 34 bytes each), allocated as an F32 tensor sized by bytes.
+        let kv_quant_q8 = quant_q8 && cfg.head_dim % 32 == 0;
         let mut k_cache = Vec::with_capacity(cfg.num_hidden_layers);
         let mut v_cache = Vec::with_capacity(cfg.num_hidden_layers);
+        let cache_elems = if kv_quant_q8 {
+            let total_blocks = cfg.num_key_value_heads * (cfg.head_dim / 32);
+            (max_seq * total_blocks * 34).div_ceil(4)
+        } else {
+            max_seq * kv_dim
+        };
         for _ in 0..cfg.num_hidden_layers {
-            k_cache.push(gpu.zeros(&[max_seq * kv_dim], DType::F32)?);
-            v_cache.push(gpu.zeros(&[max_seq * kv_dim], DType::F32)?);
+            k_cache.push(gpu.zeros(&[cache_elems], DType::F32)?);
+            v_cache.push(gpu.zeros(&[cache_elems], DType::F32)?);
         }
 
         Ok(Self {
@@ -93,6 +112,7 @@ impl Gemma3State {
             k_cache,
             v_cache,
             max_seq,
+            kv_quant_q8,
             next_pos: 0,
         })
     }
@@ -271,24 +291,53 @@ fn forward_after_x(
             cfg.rope_base_for_layer(layer_idx),
         )?;
 
-        gpu.kv_cache_write(&state.k_cache[layer_idx], &state.k, &state.pos_buf, kv_dim)?;
-        gpu.kv_cache_write(&state.v_cache[layer_idx], &state.v, &state.pos_buf, kv_dim)?;
-
         // GQA attention (full causal; sliding-window mask deferred — only
-        // affects ctx > sliding_window, see the bring-up plan).
-        Gpu::attention_f32(
-            gpu,
-            &state.q,
-            &state.k_cache[layer_idx],
-            &state.v_cache[layer_idx],
-            &state.attn_out,
-            &state.pos_buf,
-            pos + 1,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            state.max_seq,
-        )?;
+        // affects ctx > sliding_window, see the bring-up plan). KV is stored
+        // F32 or q8_0 depending on the state's quant mode.
+        if state.kv_quant_q8 {
+            gpu.kv_cache_write_q8_0(
+                &state.k_cache[layer_idx],
+                &state.k,
+                &state.pos_buf,
+                n_kv_heads,
+                head_dim,
+            )?;
+            gpu.kv_cache_write_q8_0(
+                &state.v_cache[layer_idx],
+                &state.v,
+                &state.pos_buf,
+                n_kv_heads,
+                head_dim,
+            )?;
+            gpu.attention_q8_0_kv(
+                &state.q,
+                &state.k_cache[layer_idx],
+                &state.v_cache[layer_idx],
+                &state.attn_out,
+                &state.pos_buf,
+                pos + 1,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                state.max_seq,
+            )?;
+        } else {
+            gpu.kv_cache_write(&state.k_cache[layer_idx], &state.k, &state.pos_buf, kv_dim)?;
+            gpu.kv_cache_write(&state.v_cache[layer_idx], &state.v, &state.pos_buf, kv_dim)?;
+            Gpu::attention_f32(
+                gpu,
+                &state.q,
+                &state.k_cache[layer_idx],
+                &state.v_cache[layer_idx],
+                &state.attn_out,
+                &state.pos_buf,
+                pos + 1,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                state.max_seq,
+            )?;
+        }
 
         weight_gemv(gpu, &layer.wo, &state.attn_out, &state.o)?;
         // post_attention_layernorm sits INSIDE the residual: norm(o) then add.

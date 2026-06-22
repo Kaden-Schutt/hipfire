@@ -141,7 +141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let mut gpu = Gpu::init()?;
     let weights = gemma3::load_weights(&mut hfq, &cfg, &mut gpu)?;
-    let mut state = gemma3::Gemma3State::new_with_max_seq(&mut gpu, &cfg, args.max_seq)
+    let mut state = gemma3::Gemma3State::new_with_max_seq(&mut gpu, &cfg, args.max_seq, false)
         .map_err(|e| format!("Gemma3State::new failed: {e:?}"))?;
 
     eprintln!("[forward] prefilling {} tokens", prompt_ids.len());
