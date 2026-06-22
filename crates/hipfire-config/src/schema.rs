@@ -185,7 +185,7 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "max_seq",
         ConfigType::U32,
         Requirement::Optional,
-        Some("4096"),
+        Some("8192"),
         GLOBAL_MODEL_RUNTIME,
         ConfigMutability::LoadTime,
         "Maximum context/KV-cache capacity allocated at model load."

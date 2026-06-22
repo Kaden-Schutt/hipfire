@@ -21,7 +21,7 @@
 | `idle_timeout` | `u32` | optional | `300` | `global`, `runtime` | `runtime_reloadable` | `none` | Seconds of inactivity before the server may evict an idle model. |
 | `kv_adaptive` | `enum(off|auto)` | optional | `off` | `global`, `model`, `runtime` | `load_time` | `none` | Adaptive KV-cache policy. |
 | `kv_cache` | `enum(auto|q8|asym2|asym3|asym4)` | optional | `auto` | `global`, `model`, `runtime` | `load_time` | `none` | KV-cache precision and memory policy. |
-| `max_seq` | `u32` | optional | `4096` | `global`, `model`, `runtime` | `load_time` | `none` | Maximum context/KV-cache capacity allocated at model load. |
+| `max_seq` | `u32` | optional | `8192` | `global`, `model`, `runtime` | `load_time` | `none` | Maximum context/KV-cache capacity allocated at model load. |
 | `max_tokens` | `u32` | optional | `512` | `global`, `model`, `request` | `request_only` | `none` | Default maximum number of generated tokens per request. |
 | `mmq_screen` | `enum(auto|off|on)` | optional | `auto` | `global`, `model`, `runtime` | `load_time` | `none` | MMQ safety screening mode. |
 | `mmq_screen_threshold` | `f64` | optional | `0.10` | `global`, `model`, `runtime` | `load_time` | `none` | MMQ screening rejection threshold. |

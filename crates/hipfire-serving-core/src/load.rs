@@ -170,6 +170,58 @@ pub fn hfq_is_bf16_dominant(hfq: &HfqFile) -> bool {
     total_2d > 0 && bf16_2d * 2 > total_2d
 }
 
+/// Read the model's trained context window (`max_position_embeddings`) from the
+/// HFQ metadata JSON. Handles the multimodal wrapper shape (gemma3-vl etc.)
+/// where the decoder config is nested under `text_config`.
+fn model_max_position_embeddings(metadata_json: &str) -> Option<usize> {
+    let v: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
+    let read = |obj: &serde_json::Value| {
+        obj.get("max_position_embeddings")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+    };
+    // HFQ metadata wraps the HF config under `config`; multimodal wrappers
+    // (gemma3-vl etc.) nest the decoder shape under `config.text_config`. Also
+    // accept the field at the top level for formats that hoist it. Mirrors
+    // `hipfire_arch_gemma3::config_from_metadata_json`.
+    let config = v.get("config");
+    None.or_else(|| config.and_then(|c| c.get("text_config")).and_then(read))
+        .or_else(|| config.and_then(read))
+        .or_else(|| v.get("text_config").and_then(read))
+        .or_else(|| read(&v))
+}
+
+/// Clamp a requested `max_seq` to the model's trained context window. Allocating
+/// KV for more than `max_position_embeddings` wastes memory (and on RDNA APUs
+/// can OOM the shared GTT pool) for context the model was never trained to use.
+/// An operator can opt out with `HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE=1` (a warning is
+/// printed either way).
+fn clamp_max_seq_to_model_context(max_seq: usize, metadata_json: &str) -> usize {
+    match model_max_position_embeddings(metadata_json) {
+        Some(model_max) if max_seq > model_max => {
+            if std::env::var("HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
+                eprintln!(
+                    "  WARNING: max_seq={max_seq} exceeds model max_position_embeddings={model_max}; \
+                     HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE=1 set — proceeding with {max_seq} \
+                     (may exceed trained context and/or OOM the KV allocation)"
+                );
+                max_seq
+            } else {
+                eprintln!(
+                    "  WARNING: max_seq={max_seq} exceeds model max_position_embeddings={model_max}; \
+                     clamping to {model_max}. Set HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE=1 to force the larger value."
+                );
+                model_max
+            }
+        }
+        _ => max_seq,
+    }
+}
+
 // Auto-upgrade DeltaNet state to FP32 for low-redundancy models when the caller
 // has not made an explicit non-default choice. Q8/Q4 state accumulates quality
 // drift on long outputs; the recurrent state is the model's numerical anchor
@@ -273,6 +325,7 @@ pub fn load_model(
     }
 
     let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let max_seq = clamp_max_seq_to_model_context(max_seq, &hfq.metadata_json);
     let model_memory = hfq_model_memory(path, &hfq);
     // Whether ANY tensor is BF16 — used to keep the DeltaNet *state* at FP32
     // (the recurrent state's cumulative-error sensitivity; orthogonal to KV).
@@ -285,12 +338,14 @@ pub fn load_model(
     //     KVarN) makes the model batched-prefill eligible (~32x prefill); the
     //     prior rule wrongly force-fp32'd these via the BF16 norms, locking them
     //     to the per-token path. Default flips to KVarN once it's a runtime mode.
-    if hfq_is_bf16_dominant(&hfq) {
-        if kv_mode != "fp32" {
-            eprintln!("  BF16-dominant model: forcing KV cache to fp32");
-        }
-        kv_mode = "fp32".to_string();
-    } else if kv_mode.is_empty() {
+    // KV precision: respect an explicit kv_mode (config/CLI/JSON) for ALL
+    // models, including BF16-dominant ones. Default to fp32 only when the
+    // caller left it unspecified. (Previously BF16-dominant artifacts were
+    // force-overridden to fp32 even when the operator asked for q8/asym/KVarN
+    // — that silently discarded the requested KV quant. fp32 remains the
+    // safe default; quantizing KV under bf16 weights is now an opt-in the
+    // operator owns.)
+    if kv_mode.is_empty() {
         kv_mode = "fp32".to_string();
     }
     let tokenizer = hipfire_model::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
@@ -1967,6 +2022,7 @@ pub fn load_model_pp(
         .map(|s| s.to_string())
         .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let max_seq = clamp_max_seq_to_model_context(max_seq, &hfq.metadata_json);
     let model_memory = hfq_model_memory(path, &hfq);
     // Whether ANY tensor is BF16 — used to keep the DeltaNet *state* at FP32
     // (the recurrent state's cumulative-error sensitivity; orthogonal to KV).
@@ -1979,12 +2035,14 @@ pub fn load_model_pp(
     //     KVarN) makes the model batched-prefill eligible (~32x prefill); the
     //     prior rule wrongly force-fp32'd these via the BF16 norms, locking them
     //     to the per-token path. Default flips to KVarN once it's a runtime mode.
-    if hfq_is_bf16_dominant(&hfq) {
-        if kv_mode != "fp32" {
-            eprintln!("  BF16-dominant model: forcing KV cache to fp32");
-        }
-        kv_mode = "fp32".to_string();
-    } else if kv_mode.is_empty() {
+    // KV precision: respect an explicit kv_mode (config/CLI/JSON) for ALL
+    // models, including BF16-dominant ones. Default to fp32 only when the
+    // caller left it unspecified. (Previously BF16-dominant artifacts were
+    // force-overridden to fp32 even when the operator asked for q8/asym/KVarN
+    // — that silently discarded the requested KV quant. fp32 remains the
+    // safe default; quantizing KV under bf16 weights is now an opt-in the
+    // operator owns.)
+    if kv_mode.is_empty() {
         kv_mode = "fp32".to_string();
     }
     let tokenizer = hipfire_model::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)

@@ -2371,7 +2371,7 @@ fn main() {
                             .and_then(|v| v.as_u64())
                             .map(|v| v as usize)
                     })
-                    .unwrap_or(4096);
+                    .unwrap_or(8192);
                 let requested_physical_cap = protocol_load
                     .as_ref()
                     .and_then(|req| req.params.physical_cap.map(|v| v as usize))

@@ -34,7 +34,7 @@ fn default_admin_user() -> String {
     "admin".to_string()
 }
 fn default_max_seq() -> u32 {
-    4096
+    8192
 }
 fn default_max_tokens() -> u32 {
     512
@@ -703,7 +703,7 @@ mod tests {
         assert_eq!(cfg.port, 11435);
         assert!(cfg.cors_allowed_origins.is_empty());
         assert_eq!(cfg.admin_user, "admin");
-        assert_eq!(cfg.max_seq, 4096);
+        assert_eq!(cfg.max_seq, 8192);
         assert_eq!(cfg.max_tokens, 512);
         assert_eq!(cfg.temperature, 0.3);
         assert_eq!(cfg.top_p, 0.8);

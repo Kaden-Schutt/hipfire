@@ -447,7 +447,7 @@
     "requirement": {
       "kind": "optional"
     },
-    "default": "4096",
+    "default": "8192",
     "scopes": [
       "global",
       "model",
