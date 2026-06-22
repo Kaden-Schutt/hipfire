@@ -64,6 +64,7 @@ __pycache__/
 .claude/
 # Personal CLI instructions
 cli/CLAUDE.md
+CLAUDE.local.md
 .pr_body_0_1_7_alpha.md
 .bench_0_1_7_alpha/
 
