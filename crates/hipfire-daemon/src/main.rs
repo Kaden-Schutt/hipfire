@@ -3370,6 +3370,17 @@ fn main() {
                     .and_then(|v| v.as_array())
                     .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
                     .unwrap_or_default();
+                // Optional per-image text labels (gemma3-vl), emitted before each
+                // image so the model can order/reference distinct slices.
+                let image_labels: Vec<String> = msg
+                    .get("image_labels")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .map(|v| v.as_str().unwrap_or("").to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let is_dots_ocr = m.arch_id == 8;
                 let is_gemma3_vl = m.gemma3_vl.is_some(); // arch 13 (medgemma)
                 let has_media = has_image || video.is_some() || !images.is_empty();
@@ -3409,7 +3420,14 @@ fn main() {
                                 max_think_tokens: vl_max_think_tokens,
                                 encode_only: vision_cache_only,
                             };
-                            generate_vl_gemma3(m, &mut gpu, &mut stdout, &params, &frames);
+                            generate_vl_gemma3(
+                                m,
+                                &mut gpu,
+                                &mut stdout,
+                                &params,
+                                &frames,
+                                &image_labels,
+                            );
                         }
                         Err(e) => write_error(&mut stdout, id, &e),
                     }

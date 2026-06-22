@@ -952,6 +952,11 @@ pub fn generate_vl_gemma3(
     stdout: &mut std::io::Stdout,
     params: &GenerateVLParams,
     frames: &[Vec<u8>],
+    // Optional per-image text labels, emitted before each `<start_of_image>` so
+    // the model can order/reference distinct images (e.g. slice stacks). When
+    // empty and there are >1 images, an "Image N of M:" label is auto-inserted.
+    // gemma3 is trained on interleaved image-text, so this is in-distribution.
+    image_labels: &[String],
 ) {
     let id = params.id;
 
@@ -965,8 +970,16 @@ pub fn generate_vl_gemma3(
         framed.push_str(sys);
         framed.push_str("\n\n");
     }
-    for _ in 0..frames.len() {
-        framed.push_str("\n\n<start_of_image>\n\n");
+    let n = frames.len();
+    for i in 0..n {
+        framed.push_str("\n\n");
+        if let Some(label) = image_labels.get(i).filter(|s| !s.is_empty()) {
+            framed.push_str(label);
+            framed.push('\n');
+        } else if n > 1 {
+            framed.push_str(&format!("Image {} of {}:\n", i + 1, n));
+        }
+        framed.push_str("<start_of_image>\n\n");
     }
     framed.push_str(params.prompt);
     framed.push_str("<end_of_turn>\n<start_of_turn>model\n");
