@@ -148,6 +148,7 @@ impl Qwen35RequestSessionState {
             // Read-side scratch is lazily re-allocated on first KVarN attention.
             kvarn_shadow: None,
             kvarn_tiles: None,
+            hier: None,
         })
     }
 

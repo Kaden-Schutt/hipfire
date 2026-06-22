@@ -45747,6 +45747,207 @@ impl Gpu {
         }
     }
 
+    /// Cold-slot decode attention (deferred-hierarchical KV, Phase 2b): one query
+    /// `q` [n_heads × 256] over the compacted cold tier `k`/`v`
+    /// [n_kv_heads × n_slots × 256] (dequantized f32, all slots visible, GQA) →
+    /// `out` [n_heads × 256]. Zero LDS, one wave per q-head. head_dim must be 256.
+    /// Parity oracle: `hipfire_kvquant::ColdTier::two_tier_attend(.., n_hot=0)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_cold_slots(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        out: &GpuTensor,
+        m_out: &GpuTensor, // [n_heads] flash max — for hot/cold tier merge
+        l_out: &GpuTensor, // [n_heads] flash denom
+        n_heads: usize,
+        n_kv_heads: usize,
+        n_slots: usize,
+        scale: f32,
+        // 0 = slot-major [nkv×stride×hd]; 1 = channel-major [nkv×hd×stride]
+        // (the kvarn_dequant_tile output layout — lets the cold tier read straight
+        // off its dequantized 4-bit records).
+        kv_layout: usize,
+        // Per-kv-head slot row stride (the padded tile width); attend the first
+        // `n_slots` slots. Pass 0 to default to n_slots (dense, no padding).
+        slot_stride: usize,
+        // Optional per-slot attention-mass accumulator [n_slots] (CASK importance).
+        mass_out: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "attention_cold_slots",
+            kernels::ATTENTION_COLD_SLOTS_SRC,
+            "attention_cold_slots",
+        )?;
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let vp = v.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mop = m_out.buf.as_ptr();
+        let lop = l_out.buf.as_ptr();
+        let massp: *mut std::ffi::c_void = match mass_out {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut ns = n_slots as i32;
+        let mut sc = scale;
+        let mut kl = kv_layout as i32;
+        let mut sstride = slot_stride as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mop as *const _ as *mut c_void,
+            &lop as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut ns as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut kl as *mut _ as *mut c_void,
+            &mut sstride as *mut _ as *mut c_void,
+            &massp as *const _ as *mut c_void,
+        ];
+        let func = &self.functions["attention_cold_slots"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Phase 2b hot+cold merge: fold two flash tiers' (out,m,l) partials into one
+    /// via online softmax. `hot` = (out_a, m_a, l_a), `cold` = (out_b, m_b, l_b);
+    /// writes merged normalized `out` and (chainable) combined `m_out`,`l_out`.
+    /// One wave per q-head, zero LDS. See flash_tier_merge.hip.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_tier_merge(
+        &mut self,
+        out_a: &GpuTensor,
+        m_a: &GpuTensor,
+        l_a: &GpuTensor,
+        out_b: &GpuTensor,
+        m_b: &GpuTensor,
+        l_b: &GpuTensor,
+        out: &GpuTensor,
+        m_out: &GpuTensor,
+        l_out: &GpuTensor,
+        n_heads: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "flash_tier_merge",
+            kernels::FLASH_TIER_MERGE_SRC,
+            "flash_tier_merge",
+        )?;
+        let oap = out_a.buf.as_ptr();
+        let map = m_a.buf.as_ptr();
+        let lap = l_a.buf.as_ptr();
+        let obp = out_b.buf.as_ptr();
+        let mbp = m_b.buf.as_ptr();
+        let lbp = l_b.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mop = m_out.buf.as_ptr();
+        let lop = l_out.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &oap as *const _ as *mut c_void,
+            &map as *const _ as *mut c_void,
+            &lap as *const _ as *mut c_void,
+            &obp as *const _ as *mut c_void,
+            &mbp as *const _ as *mut c_void,
+            &lbp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mop as *const _ as *mut c_void,
+            &lop as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions["flash_tier_merge"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Phase 2b: extract the hot KVarN/asym flash's final softmax (m,l) from the
+    /// per-tile `partials` buffer it already filled, so the hot tier can feed
+    /// `flash_tier_merge`. `max_tiles` and the seq-len convention (positions vs
+    /// block_start+block_cols) MUST match the flash that produced `partials`.
+    /// Writes `m_out`,`l_out` = [sub_batch × n_heads]. Zero LDS, one thread/(head,pos).
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_partials_ml(
+        &mut self,
+        partials: &GpuTensor,
+        positions: &GpuTensor,
+        m_out: &GpuTensor,
+        l_out: &GpuTensor,
+        n_heads: usize,
+        head_dim: usize,
+        tile_size: usize,
+        max_tiles: usize,
+        sub_batch: usize,
+        batch_offset: usize,
+        block_start: usize,
+        block_cols: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "flash_partials_ml",
+            kernels::FLASH_PARTIALS_ML_SRC,
+            "flash_partials_ml",
+        )?;
+        let pp = partials.buf.as_ptr();
+        let posp = positions.buf.as_ptr();
+        let mop = m_out.buf.as_ptr();
+        let lop = l_out.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut ts = tile_size as i32;
+        let mut mt = max_tiles as i32;
+        let mut bo = batch_offset as i32;
+        let mut bs = block_start as i32;
+        let mut bc = block_cols as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &posp as *const _ as *mut c_void,
+            &mop as *const _ as *mut c_void,
+            &lop as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut ts as *mut _ as *mut c_void,
+            &mut mt as *mut _ as *mut c_void,
+            &mut bo as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut bc as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions["flash_partials_ml"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, sub_batch as u32, 1],
+                [1, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// KVarN tile dequantizer: unpack records → f16 tiles for the reused
     /// asym4/q8 flash attention. `recs` = [n_tiles, record_bytes]; `out` = f16
     /// [n_tiles, r_dim*c_dim]. One block per tile, zero LDS.
@@ -45758,6 +45959,7 @@ impl Gpu {
         r_dim: usize,
         c_dim: usize,
         record_bytes: usize,
+        bits: usize, // bits per code: 4 = legacy nibble layout, 2 = packed 2-bit
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -45771,6 +45973,7 @@ impl Gpu {
         let mut rd = r_dim as i32;
         let mut cd = c_dim as i32;
         let mut rb = record_bytes as i32;
+        let mut bt = bits as i32;
         let mut params: Vec<*mut c_void> = vec![
             &rp as *const _ as *mut c_void,
             &op as *const _ as *mut c_void,
@@ -45778,6 +45981,7 @@ impl Gpu {
             &mut rd as *mut _ as *mut c_void,
             &mut cd as *mut _ as *mut c_void,
             &mut rb as *mut _ as *mut c_void,
+            &mut bt as *mut _ as *mut c_void,
         ];
         let func = &self.functions["kvarn_dequant_tile"];
         unsafe {

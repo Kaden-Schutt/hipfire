@@ -1563,6 +1563,10 @@ name = "hipfire-hash"
 version = "0.2.1"
 
 [[package]]
+name = "hipfire-kvquant"
+version = "0.2.1"
+
+[[package]]
 name = "hipfire-lock"
 version = "0.2.1"
 dependencies = [
@@ -1624,6 +1628,7 @@ version = "0.2.1"
 dependencies = [
  "byteorder",
  "faer",
+ "hipfire-kvquant",
  "memmap2",
  "rayon",
  "serde",
@@ -1658,6 +1663,7 @@ dependencies = [
  "hipfire-eval",
  "hipfire-evidence",
  "hipfire-generate",
+ "hipfire-kvquant",
  "hipfire-model",
  "hipfire-prompt",
  "libc",
@@ -2953,6 +2959,7 @@ name = "rdna-compute"
 version = "0.2.1"
 dependencies = [
  "hip-bridge",
+ "hipfire-kvquant",
 ]
 
 [[package]]

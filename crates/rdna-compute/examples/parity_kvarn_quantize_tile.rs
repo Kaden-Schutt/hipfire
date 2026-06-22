@@ -102,7 +102,7 @@ fn main() {
 
     // GPU dequant kernel: must match the host dequant of the same record.
     let outd = gpu.upload_raw(&vec![0u8; n * 2], &[n]).unwrap();
-    gpu.kvarn_dequant_tile(&rd, &outd, 1, r, c, record_bytes).unwrap();
+    gpu.kvarn_dequant_tile(&rd, &outd, 1, r, c, record_bytes, 4).unwrap();
     gpu.device_synchronize().unwrap();
     let outb = gpu.download_raw(&outd, n * 2).unwrap();
     let mut gpu_deq = vec![0.0f32; n];

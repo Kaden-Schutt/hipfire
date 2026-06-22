@@ -292,9 +292,9 @@ fn main() {
                 let v = argv[i + 1].clone();
                 if !matches!(
                     v.as_str(),
-                    "fp32" | "f32" | "q8" | "asym2" | "asym3" | "asym4"
+                    "fp32" | "f32" | "q8" | "asym2" | "asym3" | "asym4" | "kvarn"
                 ) {
-                    eprintln!("--kv-mode must be one of: fp32 q8 asym2 asym3 asym4 (got {v})");
+                    eprintln!("--kv-mode must be one of: fp32 q8 asym2 asym3 asym4 kvarn (got {v})");
                     std::process::exit(1);
                 }
                 kv_mode = v;
@@ -490,6 +490,14 @@ fn main() {
         )
         .unwrap(),
         "asym2" => KvCache::new_gpu_asym2(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_max,
+        )
+        .unwrap(),
+        "kvarn" => KvCache::new_gpu_kvarn(
             &mut gpu,
             config.n_layers,
             config.n_kv_heads,

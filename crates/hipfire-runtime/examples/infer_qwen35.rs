@@ -179,6 +179,20 @@ fn main() {
             )
             .unwrap()
         }
+        "kvarn" => {
+            eprintln!(
+                "KV cache: kvarn (HIPFIRE_KV_HIERARCHICAL={})",
+                std::env::var("HIPFIRE_KV_HIERARCHICAL").unwrap_or_default()
+            );
+            KvCache::new_gpu_kvarn(
+                &mut gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_seq,
+            )
+            .unwrap()
+        }
         _ => KvCache::new_gpu_q8(
             &mut gpu,
             config.n_layers,

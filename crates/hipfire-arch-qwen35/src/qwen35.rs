@@ -16369,12 +16369,29 @@ fn dump_hidden_localize(
         Ok(v) => v,
         Err(_) => return,
     };
+    use std::io::Write;
+    let path = format!("{prefix}.{tag}");
+    // Activation-capture mode (HIPFIRE_DUMP_HIDDEN_ALL=1): dump EVERY row for a
+    // single target layer (HIPFIRE_DUMP_HIDDEN_LAYER) as raw [dim] f32 each — no
+    // per-row header — so one prefill yields n_rows real-activation samples for an
+    // offline rotation/quant study. Otherwise the original single-position localize.
+    if std::env::var("HIPFIRE_DUMP_HIDDEN_ALL").as_deref() == Ok("1") {
+        let want_layer: usize = std::env::var("HIPFIRE_DUMP_HIDDEN_LAYER")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        if layer_idx != want_layer {
+            return;
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let take = (n_rows * dim).min(all.len());
+            let bytes: Vec<u8> = all[..take].iter().flat_map(|v| v.to_le_bytes()).collect();
+            let _ = f.write_all(&bytes);
+        }
+        return;
+    }
     let off = row * dim;
     if off + dim > all.len() {
         return;
     }
-    use std::io::Write;
-    let path = format!("{prefix}.{tag}");
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -18800,6 +18817,14 @@ fn forward_prefill_chunk(
                     n,
                     kv_cache.compact_offset as i32,
                 )?;
+                // KV-compression study capture: post-RoPE FA Q/K/V for a target FA
+                // layer (HIPFIRE_DUMP_HIDDEN_ALL=1 + HIPFIRE_DUMP_HIDDEN_LAYER).
+                dump_hidden_localize(gpu, &pbs.fa_q_batch, n, start_pos,
+                    config.n_heads * config.head_dim, layer_idx, "faq");
+                dump_hidden_localize(gpu, &pbs.fa_k_batch, n, start_pos,
+                    config.n_kv_heads * config.head_dim, layer_idx, "fak");
+                dump_hidden_localize(gpu, &pbs.fa_v_batch, n, start_pos,
+                    config.n_kv_heads * config.head_dim, layer_idx, "fav");
                 if let Some(tape) = gdn_tape.as_ref() {
                     if delta_layer_idx < tape.fa_bridge_valid.len()
                         && tape.fa_bridge_valid[delta_layer_idx]
@@ -26439,6 +26464,34 @@ fn kv_cache_attention_dispatch(
     // KVarN decode: single-token KV write (window append + block flush) + read
     // (build f16 shadow K) + f16/Q8 flash, handled outside the dispatch substrate.
     if kv_cache.quant_kvarn {
+        // ── Deferred-hierarchical two-tier KV (flag-gated HIPFIRE_KV_HIERARCHICAL=1).
+        // Lazily built on first dispatch (needs n_heads from the config). Replaces
+        // the single-tier KVarN read with hot-ring ⊕ 4-bit cold-segment two-tier
+        // attention. NO KVarN rotation: the hot ring stores raw fa_k and the cold
+        // segments compact with rotate=false, so fa_q is consumed un-rotated and
+        // both tiers' K are in the same (un-rotated, RoPE-baked) basis as Q.
+        // This is the ONLY KVarN attention entry point (prefill is per-token here
+        // too, n=1), so one hook covers prompt + decode.
+        if kv_cache.hier.is_none() {
+            kv_cache.hier = Some(hipfire_runtime::kv_hier::HierKvState::from_env(
+                gpu,
+                kv_cache.k_gpu.len(),
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+            )?);
+        }
+        if kv_cache.hier.as_ref().map(|h| h.enabled).unwrap_or(false) {
+            let h = kv_cache.hier.as_mut().unwrap();
+            // pos==0 at layer 0 = a new sequence (prompt start) → reset both tiers.
+            // In serve this fires only at session start; mid-session/decode never
+            // hits pos==0, so continued context is preserved.
+            if pos == 0 && layer_idx == 0 {
+                h.reset(gpu)?;
+            }
+            h.append_token(gpu, layer_idx, &s.fa_k, &s.fa_v)?;
+            return h.two_tier_read(gpu, layer_idx, &s.fa_q, &s.fa_attn_out);
+        }
         // ── KVarN Hadamard-incoherence rotation (paper §method: "Hadamard
         // rotation FOLLOWED BY dual-scaling variance normalization"). The Sinkhorn
         // dual-scaling already runs in `kvarn_quantize_tile`; the missing half is

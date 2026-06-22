@@ -120,7 +120,26 @@ pub fn qwen35_prefill_active_session(
         .dn_state
         .as_mut()
         .ok_or_else(|| "qwen35 active session missing DeltaNet state".to_string())?;
-    if replay_as_generated_suffix {
+    let hier_enabled = kv.hier.as_ref().map(|h| h.enabled).unwrap_or(false);
+    // Deferred-hierarchical KV: on a CONTINUED turn (history present, seq_pos > 0),
+    // drain the hot ring into cold here at the prefill entry — i.e. during the idle
+    // gap between turns, off the decode critical path. The next turn's prompt then
+    // prefills into a near-empty hot ring with full (compressed) history in cold.
+    // Flag-gated (hier.enabled); no-op for fresh sessions (seq_pos == 0 → reset path).
+    if hier_enabled && m.seq_pos > 0 {
+        if let Some(h) = kv.hier.as_mut() {
+            let keep = std::env::var("HIPFIRE_KV_IDLE_KEEP")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0usize);
+            h.idle_compact(gpu, keep)
+                .map_err(|e| format!("qwen35 hierarchical idle_compact failed: {e:?}"))?;
+        }
+    }
+    // Hierarchical KV requires the per-token attention dispatch (its hot-ring append
+    // + two-tier read live there); the batched forward_prefill_batch path bypasses
+    // it. Force the per-token forward_scratch prefill so the hot ring is populated.
+    if replay_as_generated_suffix || hier_enabled {
         for &token in tokens {
             m.conversation_tokens.push(token);
             qwen35::forward_scratch(gpu, weights, config, token, m.seq_pos, kv, dn, scratch)
@@ -1649,6 +1668,25 @@ pub fn run_generate_batch_prefill_serial_qwen35(
     }
     if pflash_active {
         return Err("generate_batch_prefill does not support PFlash compression yet".to_string());
+    }
+    // Hierarchical KV is an inherently per-token feature: its hot-ring append + two-
+    // tier read live in kv_cache_attention_dispatch, which the batched session-batch
+    // forward bypasses (it runs its own batched attention). Running it here would
+    // silently leave the hot ring unpopulated. Refuse, like CASK eviction / PFlash —
+    // hierarchical sessions must take the per-token prefill path
+    // (qwen35_prefill_active_session), which honours the dispatch + idle_compact hook.
+    if m
+        .kv_cache
+        .as_ref()
+        .and_then(|c| c.hier.as_ref())
+        .map(|h| h.enabled)
+        .unwrap_or(false)
+    {
+        return Err(
+            "generate_batch_prefill does not support hierarchical KV (HIPFIRE_KV_HIERARCHICAL=1); \
+             use per-token prefill (it requires the per-token attention dispatch)"
+                .to_string(),
+        );
     }
     let arena_backend = loaded_model_state_arena_backend(m);
 

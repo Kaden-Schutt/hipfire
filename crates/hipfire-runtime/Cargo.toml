@@ -52,6 +52,7 @@ arch-lfm2moe = []
 arch-dots-ocr = []
 experimental-examples = []
 [dependencies]
+hipfire-kvquant = { path = "../hipfire-kvquant" }
 hipfire-coherence = { path = "../hipfire-coherence" }
 hipfire-eval = { path = "../hipfire-eval" }
 hipfire-evidence = { path = "../hipfire-evidence" }
