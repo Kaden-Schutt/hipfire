@@ -14091,10 +14091,19 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
         // (HIPFIRE_PARO_BATCHED=1) — admitting them here keeps non-PARO
         // models unaffected because no production checkpoint sets
         // wqkv.gpu_dtype = ParoQ4G128 outside the shisa-PARO codepath.
-        | DType::ParoQ4G128 | DType::F32 | DType::F16 | DType::BF16
+        | DType::ParoQ4G128 | DType::F32 | DType::F16
     );
     if always_ok {
         return true;
+    }
+    // BUG-001 guard: the batched FullAttention BF16 q/k/v projection inflates
+    // `fa_q` ~9x on gfx1151 → garbage output (q8/asym KV enables the batched
+    // arm). F16/F32 batched are fine; only BF16 is broken on this arch. Route
+    // BF16 prefill through the per-token forward_scratch path here (correct,
+    // slightly slower) until the batched-arm projection is fixed; gfx1103 et al.
+    // keep the fast batched path. See BUGS.md / trigger a21dccf75.
+    if dt == DType::BF16 {
+        return arch != "gfx1151";
     }
     // MQ3 (uniform / HFQ3 family) is batchable on archs with a WMMA
     // family ported. As of this commit:
@@ -16798,11 +16807,17 @@ fn dump_hidden_localize(
     // offline rotation/quant study. Otherwise the original single-position localize.
     if std::env::var("HIPFIRE_DUMP_HIDDEN_ALL").as_deref() == Ok("1") {
         let want_layer: usize = std::env::var("HIPFIRE_DUMP_HIDDEN_LAYER")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         if layer_idx != want_layer {
             return;
         }
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
             let take = (n_rows * dim).min(all.len());
             let bytes: Vec<u8> = all[..take].iter().flat_map(|v| v.to_le_bytes()).collect();
             let _ = f.write_all(&bytes);
@@ -19240,12 +19255,33 @@ fn forward_prefill_chunk(
                 )?;
                 // KV-compression study capture: post-RoPE FA Q/K/V for a target FA
                 // layer (HIPFIRE_DUMP_HIDDEN_ALL=1 + HIPFIRE_DUMP_HIDDEN_LAYER).
-                dump_hidden_localize(gpu, &pbs.fa_q_batch, n, start_pos,
-                    config.n_heads * config.head_dim, layer_idx, "faq");
-                dump_hidden_localize(gpu, &pbs.fa_k_batch, n, start_pos,
-                    config.n_kv_heads * config.head_dim, layer_idx, "fak");
-                dump_hidden_localize(gpu, &pbs.fa_v_batch, n, start_pos,
-                    config.n_kv_heads * config.head_dim, layer_idx, "fav");
+                dump_hidden_localize(
+                    gpu,
+                    &pbs.fa_q_batch,
+                    n,
+                    start_pos,
+                    config.n_heads * config.head_dim,
+                    layer_idx,
+                    "faq",
+                );
+                dump_hidden_localize(
+                    gpu,
+                    &pbs.fa_k_batch,
+                    n,
+                    start_pos,
+                    config.n_kv_heads * config.head_dim,
+                    layer_idx,
+                    "fak",
+                );
+                dump_hidden_localize(
+                    gpu,
+                    &pbs.fa_v_batch,
+                    n,
+                    start_pos,
+                    config.n_kv_heads * config.head_dim,
+                    layer_idx,
+                    "fav",
+                );
                 if let Some(tape) = gdn_tape.as_ref() {
                     if delta_layer_idx < tape.fa_bridge_valid.len()
                         && tape.fa_bridge_valid[delta_layer_idx]
