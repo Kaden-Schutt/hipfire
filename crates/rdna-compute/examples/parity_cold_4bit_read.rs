@@ -42,7 +42,7 @@ fn main() {
     let importance: Vec<f32> = (0..n_cold_tok).map(|t| 0.1 + (t as f32 / n_cold_tok as f32)).collect();
 
     // v1 cold tier: rotate=false (no FWHT basis juggling for the GPU read).
-    let cold = compact_cold_kv(&ck, &cv, n_cold_tok, NKV, HD, &importance, 0.125, 4, false);
+    let cold = compact_cold_kv(&ck, &cv, n_cold_tok, NKV, HD, &importance, 0.125, 4, false, false);
     let nvc = cold.n_valid;
     let ns = cold.n_slots; // padded even — tile width
     let rec_bytes = kvarn_record_bytes(HD, ns);

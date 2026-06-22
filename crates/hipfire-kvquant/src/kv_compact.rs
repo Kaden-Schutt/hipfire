@@ -46,6 +46,11 @@ fn fwht(v: &mut [f32], s1: &[f32], s2: &[f32]) {
 /// aggregated) score; higher = keep exact. `core_frac` of tokens stay singleton
 /// (exact), the rest fold `fold_m:1` by importance-weighted average. `rotate` =
 /// FWHT-256 incoherence per head before quantize. head_dim must be 256 (KVarN v1).
+///
+/// `position_local`: when true, the to-be-merged (non-core) tokens are grouped by
+/// adjacent POSITION rather than by importance rank, so each merged slot averages
+/// K vectors with similar RoPE phase (less phase-blur — the dominant cold-merge
+/// quality cost). Core selection stays importance-based either way.
 #[allow(clippy::too_many_arguments)]
 pub fn compact_cold_kv(
     k: &[f32],
@@ -57,6 +62,7 @@ pub fn compact_cold_kv(
     core_frac: f32,
     fold_m: usize,
     rotate: bool,
+    position_local: bool,
 ) -> ColdTier {
     assert_eq!(head_dim, 256, "KVarN v1 FWHT is 256-wide");
     assert!(fold_m >= 1);
@@ -72,7 +78,14 @@ pub fn compact_cold_kv(
     });
     let ncore = ((core_frac * n_tok as f32) as usize).min(n_tok);
     let core = &order[..ncore];
-    let scratch = &order[ncore..];
+    // The non-core tokens to merge. Position-local grouping sorts them back into
+    // ascending position so each fold_m group is position-contiguous (similar
+    // RoPE phase); otherwise they stay in importance-rank order.
+    let mut scratch_owned: Vec<usize> = order[ncore..].to_vec();
+    if position_local {
+        scratch_owned.sort_unstable();
+    }
+    let scratch = &scratch_owned[..];
     let nb = if fold_m > 0 { scratch.len() / fold_m } else { 0 };
 
     let mut slot_members: Vec<Vec<u32>> = Vec::with_capacity(ncore + nb + fold_m);
@@ -313,7 +326,7 @@ mod tests {
         let ref_out = attn(&q, &k, &v, nt, d);
 
         for &(cf, m) in &[(0.25f32, 8usize), (0.125, 16), (0.5, 4)] {
-            let cold = compact_cold_kv(&k, &v, nt, h, d, &importance, cf, m, true);
+            let cold = compact_cold_kv(&k, &v, nt, h, d, &importance, cf, m, true, false);
             let (kr, vr) = cold.dequant_head(0);
             let out = attn_slots(&q, &kr, &vr, &cold, d);
             let c = cos(&out, &ref_out);
@@ -348,7 +361,7 @@ mod tests {
             *x = rng.n();
         }
         let imp: Vec<f32> = (0..nt).map(|t| 1.0 + (t % 5) as f32).collect(); // varied weights
-        let cold = compact_cold_kv(&k, &v, nt, 1, d, &imp, 0.0, 8, true); // all merged
+        let cold = compact_cold_kv(&k, &v, nt, 1, d, &imp, 0.0, 8, true, false); // all merged
         let (kr, _) = cold.dequant_head(0);
         // recompute the true weighted-average of slot 0's members and compare.
         let mem = &cold.slot_members[0];
@@ -385,7 +398,7 @@ mod tests {
         let imp: Vec<f32> = (0..n_cold)
             .map(|t| (0..d).map(|i| dir[i] * k[t * d + i]).sum::<f32>())
             .collect();
-        let cold = compact_cold_kv(&k[..n_cold * d], &v[..n_cold * d], n_cold, 1, d, &imp, 0.25, 8, true);
+        let cold = compact_cold_kv(&k[..n_cold * d], &v[..n_cold * d], n_cold, 1, d, &imp, 0.25, 8, true, false);
         let (ck, cv) = cold.dequant_head(0);
         let hot_k = &k[n_cold * d..];
         let hot_v = &v[n_cold * d..];
@@ -420,7 +433,7 @@ mod tests {
             }
         }
         let imp: Vec<f32> = (0..nt).map(|t| (0..d).map(|i| q[i] * k[t * d + i]).sum::<f32>()).collect();
-        let cold = compact_cold_kv(&k, &v, nt, h, d, &imp, 0.25, 4, false);
+        let cold = compact_cold_kv(&k, &v, nt, h, d, &imp, 0.25, 4, false, false);
         let (kr, _vr) = cold.dequant_head(0);
         assert_eq!(kr.len(), cold.n_valid * d);
         assert!(kr.iter().all(|x| x.is_finite()));

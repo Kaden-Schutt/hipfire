@@ -85,6 +85,9 @@ pub struct HierKvState {
     /// (CASK) would need per-key accumulation in the hot read; norms are the
     /// zero-tracking proxy.
     pub importance_mode: ImportanceMode,
+    /// Group merged (non-core) cold tokens by adjacent position (similar RoPE
+    /// phase → less merge blur) rather than importance rank. Default on.
+    pub position_local: bool,
     pub n_heads: usize,
     pub n_kv_heads: usize,
     pub hot_k: Vec<GpuTensor>, // [n_layers] slot-major [nkv × hot_budget × HD] f32
@@ -132,6 +135,7 @@ impl HierKvState {
         let importance_mode = ImportanceMode::from_str(
             &std::env::var("HIPFIRE_KV_IMPORTANCE").unwrap_or_else(|_| "vnorm".to_string()),
         );
+        let position_local = std::env::var("HIPFIRE_KV_POS_LOCAL").ok().as_deref() != Some("0");
         let mut hot_k = Vec::with_capacity(n_layers);
         let mut hot_v = Vec::with_capacity(n_layers);
         if enabled {
@@ -147,6 +151,7 @@ impl HierKvState {
             core_frac,
             fold_m,
             importance_mode,
+            position_local,
             n_heads,
             n_kv_heads,
             hot_k,
@@ -244,7 +249,10 @@ impl HierKvState {
                 }
             })
             .collect();
-        let cold = compact_cold_kv(&ck, &cv, mb, nkv, HD, &importance, self.core_frac, self.fold_m, false);
+        let cold = compact_cold_kv(
+            &ck, &cv, mb, nkv, HD, &importance, self.core_frac, self.fold_m, false,
+            self.position_local,
+        );
         let n_slots = cold.n_slots;
         let rec_bytes = kvarn_record_bytes(HD, n_slots);
         let mut krecs = Vec::with_capacity(nkv * rec_bytes);
