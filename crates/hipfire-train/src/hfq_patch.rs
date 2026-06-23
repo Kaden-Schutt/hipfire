@@ -108,7 +108,7 @@ pub fn is_norm(name: &str) -> bool {
         || name == "model.norm.weight"
 }
 
-fn f32_to_bf16_bits(f: f32) -> u16 {
+pub fn f32_to_bf16_bits(f: f32) -> u16 {
     let bits = f.to_bits();
     if (bits >> 23) & 0xFF == 0xFF {
         return (bits >> 16) as u16; // inf/nan: truncate high half
