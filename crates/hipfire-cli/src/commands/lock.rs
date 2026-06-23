@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-// hipfire — native GPU mutex (the legacy scripts/gpu-lock.sh shell adapter has been removed).
+// hipfire — native GPU resource lock (the legacy scripts/gpu-lock.sh shell adapter has been removed).
 //
-//! `hipfire gpu-lock {acquire,release,status}` — a flock(2)-backed GPU mutex for
-//! multi-agent coordination, owned by the engine instead of a shell script.
+//! `hipfire lock {acquire,release,status}` (alias: `gpu-lock`) — a flock(2)-backed
+//! GPU resource mutex for multi-agent coordination, owned by the engine instead
+//! of a shell script. Locks `hipfire_lock::gpu_resource_lock_path()` (=
+//! `resource_lock_path("hip-gpu-0")`) — the SAME inode the daemon's default GPU
+//! resource lease uses, so non-daemon GPU binaries and the daemon coordinate.
 //!
 //! Mechanism (flock + lock-holder helper):
 //! - `acquire <label>` opens the lockfile, takes a blocking `LOCK_EX` (polling
 //!   with a `busy` message + optional timeout), writes holder metadata, then
-//!   spawns a detached `setsid` holder (`gpu-lock hold`, hidden) that INHERITS
+//!   spawns a detached `setsid` holder (`lock hold`, hidden) that INHERITS
 //!   the already-locked fd. The acquiring process then exits; its fd copy
 //!   closes, but the holder's inherited copy keeps the lock on the same open
 //!   file description. So `acquire` returns immediately with the lock held.
@@ -31,13 +34,13 @@ use std::process::{Command, Stdio};
 use clap::{Args, Subcommand};
 
 #[derive(Debug, Args)]
-pub struct GpuLockArgs {
+pub struct LockArgs {
     #[command(subcommand)]
-    action: GpuLockAction,
+    action: LockAction,
 }
 
 #[derive(Debug, Subcommand)]
-enum GpuLockAction {
+enum LockAction {
     /// Acquire the GPU lock (blocks until free). A detached holder keeps it
     /// until `release` or the calling shell exits.
     Acquire {
@@ -89,7 +92,7 @@ fn default_timeout() -> u64 {
 fn lockfile_path() -> PathBuf {
     // The canonical path/env-var contract lives in `hipfire-lock` so the daemon,
     // gpu-lock.sh, and any future participant agree on one file + env var.
-    hipfire_lock::gpu_lock_path()
+    hipfire_lock::gpu_resource_lock_path()
 }
 
 fn pid_alive(pid: i32) -> bool {
@@ -100,20 +103,20 @@ fn pid_alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 || *libc::__errno_location() == libc::EPERM }
 }
 
-pub fn run(args: GpuLockArgs) -> anyhow::Result<()> {
+pub fn run(args: LockArgs) -> anyhow::Result<()> {
     match args.action {
-        GpuLockAction::Acquire {
+        LockAction::Acquire {
             label,
             watch_pid,
             timeout_secs,
             poll_secs,
         } => acquire(&label, watch_pid, timeout_secs, poll_secs.max(1)),
-        GpuLockAction::Release => release(),
-        GpuLockAction::Status => {
+        LockAction::Release => release(),
+        LockAction::Status => {
             println!("{}", status_line());
             Ok(())
         }
-        GpuLockAction::Hold {
+        LockAction::Hold {
             lock_fd,
             watch_pid,
             poll_secs,
@@ -163,7 +166,7 @@ fn acquire(
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
     cmd.args([
-        "gpu-lock",
+        "lock",
         "hold",
         "--lock-fd",
         &fd.to_string(),

@@ -19,8 +19,8 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `DEBUG_LAYERS` | Runtime variable controlling debug layers in hipfire | `crates/hipfire-arch-qwen35/src/qwen35.rs:8928` |
 | `DFLASH_LIVE_TAU` | Runtime variable controlling dflash live tau in hipfire | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:1514` |
 | `FP32_STATE` | Runtime variable controlling fp32 state in hipfire | `crates/hipfire-runtime/examples/infer_qwen35.rs:205` |
-| `GPU_LOCK_TIMEOUT` | Runtime variable controlling gpu lock timeout in hipfire | `crates/hipfire-cli/src/commands/gpu_lock.rs:83` |
-| `GPU_POLL_INTERVAL` | Runtime variable controlling gpu poll interval in hipfire | `crates/hipfire-cli/src/commands/gpu_lock.rs:76` |
+| `GPU_LOCK_TIMEOUT` | Runtime variable controlling gpu lock timeout in hipfire | `crates/hipfire-cli/src/commands/lock.rs:86` |
+| `GPU_POLL_INTERVAL` | Runtime variable controlling gpu poll interval in hipfire | `crates/hipfire-cli/src/commands/lock.rs:79` |
 | `HFHS_REAL` | Runtime variable controlling hfhs real in hipfire | `crates/hipfire-quantize/src/hfhs_diag.rs:223` |
 | `HFQ_TEST_N_ITER` | Parses "HFQ_TEST_N_ITER" with fallback defaults | `crates/rdna-compute/examples/test_hfq4_residual_dp4a.rs:74` |
 | `HFQ_TEST_SCALE_LOG10` | Parses "HFQ_TEST_SCALE_LOG10" with fallback defaults | `crates/rdna-compute/examples/test_hfq4_residual_dp4a.rs:196` |
@@ -51,7 +51,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_COLLECT_ARTIFACTS_BIN` | Runtime variable controlling collect artifacts bin in hipfire | `crates/hipfire-eval/src/lib.rs:956` |
 | `HIPFIRE_COMP_DUMP` | Stage-bisect dump: HIPFIRE_COMP_DUMP="<pos>,<layer>" prints each | `crates/hipfire-arch-deepseek4/src/forward.rs:643` |
 | `HIPFIRE_CONV1D_TREE_GFX1151` | Environment toggle value controls runtime behavior | `crates/rdna-compute/examples/bench_conv1d_tree_gfx1151.rs:22` |
-| `HIPFIRE_DAEMON_BIN` | Runtime variable controlling daemon bin in hipfire | `crates/hipfire-daemon-adapter/src/lib.rs:853` |
+| `HIPFIRE_DAEMON_BIN` | Runtime variable controlling daemon bin in hipfire | `crates/hipfire-daemon-adapter/src/lib.rs:855` |
 | `HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB` | Runtime variable controlling daemon resident state budget mb in hipfire | `crates/hipfire-serving-core/src/session.rs:777` |
 | `HIPFIRE_DDTREE_BUDGET` | Runtime variable controlling DDTree budget in hipfire | `crates/hipfire-serving-core/src/load.rs:2605` |
 | `HIPFIRE_DDTREE_FORCE_SLOW` | HIPFIRE_DDTREE_FORCE_SLOW=1: force the slow (re-verify) path even when | `crates/hipfire-arch-qwen35/src/speculative.rs:11353` |
@@ -203,7 +203,6 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_GFX942_MFMA_PREFILL` | Interprets "HIPFIRE_GFX942_MFMA_PREFILL" from environment to select behavior | `crates/rdna-compute/src/feature_flags.rs:251` |
 | `HIPFIRE_GFX942_RMSNORM_SPLIT` | Environment toggle value controls runtime behavior | `crates/rdna-compute/src/feature_flags.rs:250` |
 | `HIPFIRE_GPTQ_DAMPING` | Inject env override since the quantizer reads it at fn entry | `crates/hipfire-quantize/src/main.rs:9643` |
-| `HIPFIRE_GPU_LOCKFILE` | Runtime variable controlling gpu lockfile in hipfire | `crates/hipfire-lock/src/lib.rs:200` |
 | `HIPFIRE_GPU_SLAB_LOAD` | Runtime variable controlling gpu slab load in hipfire | `crates/hipfire-arch-qwen35/src/qwen35.rs:5480` |
 | `HIPFIRE_GPU_SLAB_MIB` | Parses "HIPFIRE_GPU_SLAB_MIB" with fallback defaults | `crates/hipfire-arch-qwen35/src/qwen35.rs:4216` |
 | `HIPFIRE_GPU_TOPK` | HIPFIRE_GPU_TOPK=1 enables the GPU topk_logits_f32 kernel + CPU | `crates/hipfire-runtime/examples/infer_qwen35.rs:235` |
@@ -418,11 +417,11 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_RDNA2_VARIANT` | Runtime variable controlling rdna2 variant in hipfire | `crates/rdna-compute/src/feature_flags.rs:313` |
 | `HIPFIRE_RECOVER_MODE` | HIPFIRE_RECOVER_MODE=lora+norms → LoRA + layernorms (default, more capacity) | `crates/hipfire-train/examples/coherence_recovery_supra50m.rs:152` |
 | `HIPFIRE_REPLAY_GRAPH` | Enabled when set to 1 | `crates/hipfire-arch-qwen35/src/speculative.rs:5081` |
-| `HIPFIRE_RESOURCE_LOCK` | HIPFIRE_RESOURCE_LOCK=0 disables daemon startup resource leases | `crates/hipfire-daemon-adapter/src/lib.rs:729` |
+| `HIPFIRE_RESOURCE_LOCK` | HIPFIRE_RESOURCE_LOCK=0 disables daemon startup resource leases | `crates/hipfire-daemon-adapter/src/lib.rs:731` |
 | `HIPFIRE_RESOURCE_LOCK_CPU_CORES` | HIPFIRE_RESOURCE_LOCK_CPU_CORES=0,2-4 adds daemon startup leases for CPU cores | `crates/hipfire-daemon-adapter/src/lib.rs:663` |
 | `HIPFIRE_RESOURCE_LOCK_DIR` | HIPFIRE_RESOURCE_LOCK_DIR overrides the daemon resource-lock root directory | `crates/hipfire-lock/src/lib.rs:213` |
 | `HIPFIRE_RESOURCE_LOCK_NPUS` | HIPFIRE_RESOURCE_LOCK_NPUS=1 leases every detected NPU; comma lists lease explicit NPU IDs | `crates/hipfire-daemon-adapter/src/lib.rs:628` |
-| `HIPFIRE_RESOURCE_LOCK_WAIT_MS` | HIPFIRE_RESOURCE_LOCK_WAIT_MS waits for busy daemon resource leases before failing startup | `crates/hipfire-daemon-adapter/src/lib.rs:748` |
+| `HIPFIRE_RESOURCE_LOCK_WAIT_MS` | HIPFIRE_RESOURCE_LOCK_WAIT_MS waits for busy daemon resource leases before failing startup | `crates/hipfire-daemon-adapter/src/lib.rs:750` |
 | `HIPFIRE_RESPONSES_STATE_MAX` | Runtime variable controlling responses state max in hipfire | `crates/hipfire-server/src/routes/responses.rs:660` |
 | `HIPFIRE_ROCBLAS_ALL_ARCHS` | Runtime variable controlling rocblas all archs in hipfire | `crates/rdna-compute/src/feature_flags.rs:303` |
 | `HIPFIRE_ROCBLAS_OFF` | Enabled when set to 1 | `crates/rdna-compute/src/feature_flags.rs:305` |
@@ -484,7 +483,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_WO_WMMA_VARIANT` | Runtime variable controlling wo wmma variant in hipfire | `crates/rdna-compute/src/feature_flags.rs:300` |
 | `HIPFIRE_XDNA1_LIB` | Runtime variable controlling xdna1 lib in hipfire | `crates/hipfire-npu/src/lib.rs:65` |
 | `HIP_PATH` | fails with "file not found". Add well-known candidates as -I flags; | `crates/rdna-compute/src/compiler.rs:470` |
-| `HIP_VISIBLE_DEVICES` | Used to configure runtime execution by explicitly setting "HIP_VISIBLE_DEVICES" | `crates/hipfire-daemon-adapter/src/lib.rs:1135` |
+| `HIP_VISIBLE_DEVICES` | Used to configure runtime execution by explicitly setting "HIP_VISIBLE_DEVICES" | `crates/hipfire-daemon-adapter/src/lib.rs:1137` |
 | `HOME` | Runtime variable controlling home in hipfire | `crates/rdna-compute/src/compiler.rs:199` |
 | `HOSTNAME` | Runtime variable controlling hostname in hipfire | `crates/hipfire-tui/src/hipfire/status.rs:130` |
 | `MAX_TOKENS` | Parses "MAX_TOKENS" with fallback defaults | `crates/hipfire-runtime/examples/greedy_dump.rs:113` |
@@ -500,6 +499,6 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `USERPROFILE` | Runtime variable controlling userprofile in hipfire | `crates/rdna-compute/src/compiler.rs:200` |
 | `USE_SAMPLE` | Enabled when set to 1 | `crates/hipfire-runtime/examples/a3b_multiturn_oneshot.rs:118` |
 
-- Total env vars: **495**
-- `HIPFIRE_*` vars: **458**
+- Total env vars: **494**
+- `HIPFIRE_*` vars: **457**
 - non-`HIPFIRE_*` vars: **37**

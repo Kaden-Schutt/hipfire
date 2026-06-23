@@ -129,14 +129,14 @@ pub const ENV_FP32_STATE: EnvVarDoc = EnvVarDoc {
 pub const ENV_GPU_LOCK_TIMEOUT: EnvVarDoc = EnvVarDoc {
     name: "GPU_LOCK_TIMEOUT",
     description: "Runtime variable controlling gpu lock timeout in hipfire",
-    source: "crates/hipfire-cli/src/commands/gpu_lock.rs:83",
+    source: "crates/hipfire-cli/src/commands/lock.rs:86",
 };
 
 /// `GPU_POLL_INTERVAL` — Runtime variable controlling gpu poll interval in hipfire
 pub const ENV_GPU_POLL_INTERVAL: EnvVarDoc = EnvVarDoc {
     name: "GPU_POLL_INTERVAL",
     description: "Runtime variable controlling gpu poll interval in hipfire",
-    source: "crates/hipfire-cli/src/commands/gpu_lock.rs:76",
+    source: "crates/hipfire-cli/src/commands/lock.rs:79",
 };
 
 /// `HFHS_REAL` — Runtime variable controlling hfhs real in hipfire
@@ -353,7 +353,7 @@ pub const ENV_HIPFIRE_CONV1D_TREE_GFX1151: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DAEMON_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DAEMON_BIN",
     description: "Runtime variable controlling daemon bin in hipfire",
-    source: "crates/hipfire-daemon-adapter/src/lib.rs:853",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:855",
 };
 
 /// `HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB` — Runtime variable controlling daemon resident state budget mb in hipfire
@@ -1412,13 +1412,6 @@ pub const ENV_HIPFIRE_GPTQ_DAMPING: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GPTQ_DAMPING",
     description: "Inject env override since the quantizer reads it at fn entry",
     source: "crates/hipfire-quantize/src/main.rs:9643",
-};
-
-/// `HIPFIRE_GPU_LOCKFILE` — Runtime variable controlling gpu lockfile in hipfire
-pub const ENV_HIPFIRE_GPU_LOCKFILE: EnvVarDoc = EnvVarDoc {
-    name: "HIPFIRE_GPU_LOCKFILE",
-    description: "Runtime variable controlling gpu lockfile in hipfire",
-    source: "crates/hipfire-lock/src/lib.rs:200",
 };
 
 /// `HIPFIRE_GPU_SLAB_LOAD` — Runtime variable controlling gpu slab load in hipfire
@@ -2937,7 +2930,7 @@ pub const ENV_HIPFIRE_REPLAY_GRAPH: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_RESOURCE_LOCK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RESOURCE_LOCK",
     description: "HIPFIRE_RESOURCE_LOCK=0 disables daemon startup resource leases",
-    source: "crates/hipfire-daemon-adapter/src/lib.rs:729",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:731",
 };
 
 /// `HIPFIRE_RESOURCE_LOCK_CPU_CORES` — HIPFIRE_RESOURCE_LOCK_CPU_CORES=0,2-4 adds daemon startup leases for CPU cores
@@ -2967,7 +2960,7 @@ pub const ENV_HIPFIRE_RESOURCE_LOCK_WAIT_MS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RESOURCE_LOCK_WAIT_MS",
     description:
         "HIPFIRE_RESOURCE_LOCK_WAIT_MS waits for busy daemon resource leases before failing startup",
-    source: "crates/hipfire-daemon-adapter/src/lib.rs:748",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:750",
 };
 
 /// `HIPFIRE_RESPONSES_STATE_MAX` — Runtime variable controlling responses state max in hipfire
@@ -3402,7 +3395,7 @@ pub const ENV_HIP_VISIBLE_DEVICES: EnvVarDoc = EnvVarDoc {
     name: "HIP_VISIBLE_DEVICES",
     description:
         "Used to configure runtime execution by explicitly setting \"HIP_VISIBLE_DEVICES\"",
-    source: "crates/hipfire-daemon-adapter/src/lib.rs:1135",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:1137",
 };
 
 /// `HOME` — Runtime variable controlling home in hipfire
@@ -3704,7 +3697,6 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_GFX942_MFMA_PREFILL,
     ENV_HIPFIRE_GFX942_RMSNORM_SPLIT,
     ENV_HIPFIRE_GPTQ_DAMPING,
-    ENV_HIPFIRE_GPU_LOCKFILE,
     ENV_HIPFIRE_GPU_SLAB_LOAD,
     ENV_HIPFIRE_GPU_SLAB_MIB,
     ENV_HIPFIRE_GPU_TOPK,

@@ -44,7 +44,12 @@ pub fn run() {
     let arch_cells: Vec<String> = cards.iter().map(arch_cell).collect();
 
     let name_w = cards.iter().map(|c| c.name.len()).max().unwrap_or(5).max(5);
-    let quant_w = cards.iter().map(|c| c.quant.len()).max().unwrap_or(5).max(5);
+    let quant_w = cards
+        .iter()
+        .map(|c| c.quant.len())
+        .max()
+        .unwrap_or(5)
+        .max(5);
     let arch_w = arch_cells.iter().map(|a| a.len()).max().unwrap_or(4).max(4);
 
     // Grouped banner over the tick columns.
@@ -57,8 +62,21 @@ pub fn run() {
         "MODEL", "QUANT", "ARCH", "tpl", "mtp", "dfl", "tri", "hess", "pfil", "dfl", "mtp", "kv", "vis"
     );
     for (card, arch) in cards.iter().zip(&arch_cells) {
-        let Sidecars { template, mtp, dflash, triattn, hessian } = card.sidecars;
-        let ArchFeatures { prefill, dflash: f_dflash, mtp: f_mtp, kv, vision, .. } = card.features;
+        let Sidecars {
+            template,
+            mtp,
+            dflash,
+            triattn,
+            hessian,
+        } = card.sidecars;
+        let ArchFeatures {
+            prefill,
+            dflash: f_dflash,
+            mtp: f_mtp,
+            kv,
+            vision,
+            ..
+        } = card.features;
         println!(
             "{:<name_w$}  {:<quant_w$}  {:<arch_w$}  {:>3} {:>3} {:>3} {:>3} {:>4}   {:>4} {:>4} {:>3} {:>7} {:>3}",
             card.name,

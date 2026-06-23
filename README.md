@@ -512,7 +512,8 @@ instead of relying on a shell-only GPU mutex.
   `HIPFIRE_RESOURCE_LOCK_DIR`); the `hipfire-lock` `resource_lock_root()` contract
 - Lock shape: a `flock(2)` lockfile per scoped resource, e.g. `hip-gpu-0.lock`,
   `npu-accel0.lock`, `cpu-core-3.lock` — the same `FlockGuard` primitive as the
-  `hipfire gpu-lock` CLI
+  `hipfire lock` CLI, which flocks `hip-gpu-0.lock` (`gpu_resource_lock_path()`)
+  on the same inode so daemon and non-daemon callers coordinate
 - Holder metadata: each lockfile holds a one-line `pid=… host=… resource=…
   started_ms=… cmd=…` holder string for status display
 - Stale lock handling: none needed — `flock` is released by the kernel when the
@@ -526,7 +527,8 @@ instead of relying on a shell-only GPU mutex.
 
 Daemon startup is the canonical runtime lock. Non-daemon GPU binaries (cargo
 `--example` benches, `hipfire eval`, `hipfire-quantize`) do not self-lock — test
-gates coordinate them via the native CLI mutex `hipfire gpu-lock {acquire,release,status}`.
+gates coordinate them via the native CLI mutex `hipfire lock {acquire,release,status}`
+(alias `gpu-lock`).
 
 ---
 

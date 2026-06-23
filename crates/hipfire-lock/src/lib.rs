@@ -191,15 +191,15 @@ pub fn probe(path: impl AsRef<Path>) -> io::Result<LockState> {
     }
 }
 
-/// Canonical GPU-mutex lockfile path — the single source of truth for the
-/// path/env-var contract shared by `hipfire gpu-lock` and any future
-/// participant (Python, etc.). Resolves `$HIPFIRE_GPU_LOCKFILE`,
-/// else `<tmpdir>/hipfire-gpu.lock`. Because `flock` keys on the inode, every
-/// participant that opens *this* path shares one mutex regardless of language.
-pub fn gpu_lock_path() -> PathBuf {
-    std::env::var_os("HIPFIRE_GPU_LOCKFILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("hipfire-gpu.lock"))
+/// The canonical single-GPU resource lockfile — `resource_lock_path("hip-gpu-0")`.
+/// This is the **one** GPU mutex: the `hipfire lock` CLI (for non-daemon GPU
+/// binaries) and the daemon's default GPU resource lease both open *this* inode,
+/// so they actually coordinate. Because `flock` keys on the inode, every
+/// participant that opens this path shares one mutex regardless of language.
+/// (Replaces the former separate `gpu_lock_path()` / `HIPFIRE_GPU_LOCKFILE` file,
+/// which did not coordinate with the daemon's `hip-gpu-0` lease.)
+pub fn gpu_resource_lock_path() -> PathBuf {
+    resource_lock_path("hip-gpu-0")
 }
 
 /// Root directory holding the per-resource flock lockfiles (one

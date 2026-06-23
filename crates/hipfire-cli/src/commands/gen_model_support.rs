@@ -26,7 +26,10 @@ pub struct GenModelSupportArgs {
     #[arg(long, default_value = "docs/model-support.toml")]
     pub source: String,
     /// Generated Rust tables module (repo-relative).
-    #[arg(long, default_value = "crates/hipfire-model/src/model_support_generated.rs")]
+    #[arg(
+        long,
+        default_value = "crates/hipfire-model/src/model_support_generated.rs"
+    )]
     pub rust_module: String,
     /// Markdown doc whose generated section is rewritten (repo-relative).
     #[arg(long, default_value = "MODEL-SUPPORT.md")]
@@ -244,7 +247,9 @@ fn render_chart(spec: &Spec) -> String {
     let mut s = String::new();
     s.push_str("### Capability matrix (generated)\n\n");
     s.push_str("Machine-readable subset consumed by `arch_features` / admission. Edit `docs/model-support.toml`.\n\n");
-    s.push_str("| Arch (arch_id) | Batched prefill | DFlash spec | MTP spec | KV quant | Vision |\n");
+    s.push_str(
+        "| Arch (arch_id) | Batched prefill | DFlash spec | MTP spec | KV quant | Vision |\n",
+    );
     s.push_str("|---|---|---|---|---|---|\n");
     for a in &spec.arch {
         let ids = a
@@ -308,7 +313,9 @@ fn splice_section(existing: &str, inner: &str) -> Option<String> {
 }
 
 fn check_file(path: &Path, expected: &[u8], stale: &mut Vec<String>) {
-    let matches = std::fs::read(path).map(|got| got == expected).unwrap_or(false);
+    let matches = std::fs::read(path)
+        .map(|got| got == expected)
+        .unwrap_or(false);
     if !matches {
         stale.push(path.display().to_string());
     }
@@ -330,7 +337,10 @@ fn rustfmt(src: &str) -> anyhow::Result<String> {
         .write_all(src.as_bytes())?;
     let out = child.wait_with_output()?;
     if !out.status.success() {
-        anyhow::bail!("rustfmt failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        anyhow::bail!(
+            "rustfmt failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(String::from_utf8(out.stdout)?)
 }

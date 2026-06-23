@@ -11,10 +11,10 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire eval`↴](#hipfire-eval)
 * [`hipfire host-profile`↴](#hipfire-host-profile)
 * [`hipfire collect-artifacts`↴](#hipfire-collect-artifacts)
-* [`hipfire gpu-lock`↴](#hipfire-gpu-lock)
-* [`hipfire gpu-lock acquire`↴](#hipfire-gpu-lock-acquire)
-* [`hipfire gpu-lock release`↴](#hipfire-gpu-lock-release)
-* [`hipfire gpu-lock status`↴](#hipfire-gpu-lock-status)
+* [`hipfire lock`↴](#hipfire-lock)
+* [`hipfire lock acquire`↴](#hipfire-lock-acquire)
+* [`hipfire lock release`↴](#hipfire-lock-release)
+* [`hipfire lock status`↴](#hipfire-lock-status)
 * [`hipfire admin`↴](#hipfire-admin)
 * [`hipfire admin status`↴](#hipfire-admin-status)
 * [`hipfire admin chat`↴](#hipfire-admin-chat)
@@ -41,7 +41,7 @@ hipfire LLM inference CLI
 * `eval` — Run the quant admission/model evaluation harness
 * `host-profile` — Measure host, GPU-copy, and model storage bandwidth
 * `collect-artifacts` — Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one model load
-* `gpu-lock` — GPU mutex for multi-agent coordination (acquire/release/status)
+* `lock` — GPU resource lock for multi-agent coordination (acquire/release/status)
 * `admin` — Query the running hipfire admin API for scripts and agents
 
 
@@ -76,6 +76,7 @@ Load a model and generate a response (one-shot)
 * `-m`, `--model <MODEL>` — Model name, alias, or path. Falls back to the `default_model` config value when omitted
 * `--max-tokens <MAX_TOKENS>` — Max tokens to generate
 * `--temperature <TEMPERATURE>` — Sampling temperature
+* `--attach <FILE>` — Attach a file to the prompt (repeatable). The type is detected from the extension. Only images are wired today (PNG/JPEG/WebP/GIF/BMP); text, video, and audio are recognized but not yet supported and will error
 
 
 
@@ -123,11 +124,11 @@ Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one m
 
 
 
-## `hipfire gpu-lock`
+## `hipfire lock`
 
-GPU mutex for multi-agent coordination (acquire/release/status)
+GPU resource lock for multi-agent coordination (acquire/release/status)
 
-**Usage:** `hipfire gpu-lock <COMMAND>`
+**Usage:** `hipfire lock <COMMAND>`
 
 ###### **Subcommands:**
 
@@ -137,11 +138,11 @@ GPU mutex for multi-agent coordination (acquire/release/status)
 
 
 
-## `hipfire gpu-lock acquire`
+## `hipfire lock acquire`
 
 Acquire the GPU lock (blocks until free). A detached holder keeps it until `release` or the calling shell exits
 
-**Usage:** `hipfire gpu-lock acquire [OPTIONS] <LABEL>`
+**Usage:** `hipfire lock acquire [OPTIONS] <LABEL>`
 
 ###### **Arguments:**
 
@@ -159,19 +160,19 @@ Acquire the GPU lock (blocks until free). A detached holder keeps it until `rele
 
 
 
-## `hipfire gpu-lock release`
+## `hipfire lock release`
 
 Release the GPU lock (SIGTERM the holder recorded in the lockfile)
 
-**Usage:** `hipfire gpu-lock release`
+**Usage:** `hipfire lock release`
 
 
 
-## `hipfire gpu-lock status`
+## `hipfire lock status`
 
 Print lock status: "gpu is free" or "gpu BUSY: <holder>"
 
-**Usage:** `hipfire gpu-lock status`
+**Usage:** `hipfire lock status`
 
 
 

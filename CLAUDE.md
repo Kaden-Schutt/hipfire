@@ -446,20 +446,22 @@ The lock now lives in the engine. `hipfire-daemon` auto-acquires a `flock(2)` GP
 resource lease (`~/.hipfire/locks/hip-gpu-0.lock`, plus per-NPU/CPU resource files)
 before HIP init and releases it on exit — so any daemon-driven workload (serve,
 chat, gates) is coordinated automatically. It uses the same `hipfire-lock`
-`FlockGuard` primitive (and `resource_lock_root()` path contract) as the
-`hipfire gpu-lock` CLI; override the root with `HIPFIRE_RESOURCE_LOCK_DIR`. `flock`
-is released by the kernel when the holder exits, so a crashed daemon never strands
-a lock. The legacy `scripts/gpu-lock.sh` shell adapter has been removed.
+`FlockGuard` primitive (and `resource_lock_root()` / `gpu_resource_lock_path()`
+path contract) as the `hipfire lock` CLI — they flock the **same** `hip-gpu-0.lock`
+inode, so they actually coordinate; override the root with
+`HIPFIRE_RESOURCE_LOCK_DIR`. `flock` is released by the kernel when the holder
+exits, so a crashed daemon never strands a lock. The legacy `scripts/gpu-lock.sh`
+shell adapter has been removed.
 
 For **non-daemon** GPU binaries (cargo `--example` benches, `hipfire eval`,
 `hipfire-quantize`) that do not self-lock, coordinate explicitly via the native
-CLI mutex:
+CLI mutex `hipfire lock` (alias `gpu-lock`):
 
-- `hipfire gpu-lock acquire "<label>" --watch-pid $$` — blocks until free, then
+- `hipfire lock acquire "<label>" --watch-pid $$` — blocks until free, then
   spawns a detached holder that auto-releases when the watched pid dies (no stale
   locks). Exit code 2 on timeout (honors `GPU_POLL_INTERVAL` / `GPU_LOCK_TIMEOUT`).
-- `hipfire gpu-lock release` — release early (otherwise released on pid death).
-- `hipfire gpu-lock status` — show the current holder.
+- `hipfire lock release` — release early (otherwise released on pid death).
+- `hipfire lock status` — show the current holder.
 
 ## Rules
 
