@@ -442,15 +442,26 @@ only. Drift >5% from the current q8/max256 baseline is a regression
 
 ## GPU Lock Protocol (Multi-Agent)
 
-The lock now lives in the engine. `hipfire-daemon` auto-acquires a flock(2) GPU
-resource lease (`/tmp/hipfire-resource-locks/hip-gpu-0.lock`) before HIP init and
-releases it on exit — so any daemon-driven workload (serve, chat, gates) is
-coordinated automatically. The legacy `scripts/gpu-lock.sh` shell adapter has been
-removed.
+The lock now lives in the engine. `hipfire-daemon` auto-acquires a **flock(2)** GPU
+resource lease before HIP init and holds it for its lifetime — so any daemon-driven
+workload (serve, chat, gates) is coordinated automatically. The legacy
+`scripts/gpu-lock.sh` shell adapter has been removed.
+
+**The daemon's single-GPU lease and the `hipfire gpu-lock` CLI share ONE inode** —
+`hipfire_lock::gpu_lock_path()` (`$HIPFIRE_GPU_LOCKFILE`, else `/tmp/hipfire-gpu.lock`).
+Because it's `flock(2)`, the kernel releases it when the holder fd closes for **any**
+reason — normal exit, SIGTERM, or SIGKILL/crash — so there are **no stale GPU locks
+to clean up** (no PID-reuse edge, no manual `rm`). Multi-GPU / NPU / CPU leases get
+their own flock file under `$HIPFIRE_RESOURCE_LOCK_DIR` (default
+`/tmp/hipfire-resource-locks/<resource>.lock`). `HIPFIRE_RESOURCE_LOCK_WAIT_MS>0`
+blocks for a busy lease; `0` (default) fails fast; `HIPFIRE_RESOURCE_LOCK=0` bypasses.
+(History: this was a mkdir+`owner.json` dir-lock with dead-PID stale detection until
+2026-06-23; converged onto the shared flock primitive in `crates/hipfire-lock`.)
 
 For **non-daemon** GPU binaries (cargo `--example` benches, `hipfire eval`,
 `hipfire-quantize`) that do not self-lock, coordinate explicitly via the native
-CLI mutex:
+CLI mutex — it flocks the **same** `gpu_lock_path()` inode, so it mutually excludes
+with a running daemon:
 
 - `hipfire gpu-lock acquire "<label>" --watch-pid $$` — blocks until free, then
   spawns a detached holder that auto-releases when the watched pid dies (no stale

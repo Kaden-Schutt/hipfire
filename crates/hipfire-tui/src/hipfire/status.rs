@@ -312,32 +312,41 @@ fn kernel_cache_lines(kernel_root: &Path) -> Vec<String> {
 }
 
 fn resource_lock_lines(lock_dir: &Path) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(lock_dir) else {
-        return vec![format!(
-            "No resource lock directory at {}",
-            lock_dir.display()
-        )];
-    };
-    let mut lines = entries
-        .flatten()
-        .filter_map(|entry| {
+    // flock(2)-based leases: probe the live kernel lock state for the shared GPU
+    // lock (`hipfire_lock::gpu_lock_path`) + any per-resource flock files under
+    // lock_dir. A lockfile existing is NOT "held" — only the kernel flock is.
+    use hipfire_lock::{gpu_lock_path, probe, LockState};
+    let mut targets: Vec<(String, std::path::PathBuf)> = Vec::new();
+    let gpu = gpu_lock_path();
+    if gpu.exists() {
+        targets.push(("gpu".to_string(), gpu));
+    }
+    if let Ok(entries) = fs::read_dir(lock_dir) {
+        for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_file() {
-                return None;
+            if path.is_file() && path.extension().and_then(|x| x.to_str()) == Some("lock") {
+                let name = path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                targets.push((name, path));
             }
-            let name = entry.file_name().to_string_lossy().to_string();
-            let content = fs::read_to_string(&path)
-                .unwrap_or_default()
-                .lines()
-                .take(3)
-                .collect::<Vec<_>>()
-                .join(" ");
-            Some(format!("{name}: {content}"))
+        }
+    }
+    let mut lines: Vec<String> = targets
+        .into_iter()
+        .map(|(name, path)| match probe(&path) {
+            Ok(LockState::Busy(holder)) => {
+                let h = if holder.is_empty() { "held" } else { &holder };
+                format!("{name}: BUSY {h}")
+            }
+            Ok(LockState::Free) => format!("{name}: free"),
+            Err(_) => format!("{name}: (probe failed)"),
         })
-        .collect::<Vec<_>>();
+        .collect();
     lines.sort();
     if lines.is_empty() {
-        lines.push(format!("No active lock files under {}", lock_dir.display()));
+        lines.push("No resource locks held".to_string());
     }
     lines
 }

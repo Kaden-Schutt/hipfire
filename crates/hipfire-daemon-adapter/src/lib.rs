@@ -4,10 +4,14 @@
 
 //! Async daemon JSONL process adapter.
 
+/// Re-exported so resource-lock status consumers (admin API, TUI) can match the
+/// live flock state without a direct `hipfire-lock` dependency.
+pub use hipfire_lock::LockState;
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::future::BoxFuture;
 use hipfire_daemon_protocol::{
@@ -512,17 +516,16 @@ fn repo_root() -> Option<PathBuf> {
     }
 }
 
+/// Held GPU/NPU/CPU resource leases for the daemon's lifetime. Each entry is a
+/// `flock(2)` guard ([`hipfire_lock::FlockGuard`]); dropping the lease closes the
+/// fds, and the kernel releases the locks — including on SIGKILL / crash, so there
+/// are no stale leases to reclaim (unlike the old mkdir+owner.json scheme). The
+/// single-GPU lease shares [`hipfire_lock::gpu_lock_path`]'s inode with the
+/// `hipfire gpu-lock` CLI, so daemon and non-daemon GPU users mutually exclude.
 #[derive(Debug)]
 pub struct ResourceLease {
-    dirs: Vec<PathBuf>,
-}
-
-impl Drop for ResourceLease {
-    fn drop(&mut self) {
-        for dir in self.dirs.drain(..).rev() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
+    #[allow(dead_code)] // held purely for its Drop (releases the flocks)
+    guards: Vec<hipfire_lock::FlockGuard>,
 }
 
 pub fn sanitize_resource_id(id: &str) -> String {
@@ -671,26 +674,6 @@ pub fn resource_lock_requests() -> Result<Vec<String>, String> {
     Ok(resources)
 }
 
-#[cfg(unix)]
-fn pid_is_alive(pid: i64) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    rc == 0
-}
-
-#[cfg(not(unix))]
-fn pid_is_alive(_pid: i64) -> bool {
-    true
-}
-
-fn read_lock_owner(lock_dir: &Path) -> Option<serde_json::Value> {
-    std::fs::read_to_string(lock_dir.join("owner.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-}
-
 fn current_hostname() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .or_else(|_| std::fs::read_to_string("/etc/hostname"))
@@ -700,66 +683,64 @@ fn current_hostname() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn write_lock_owner(lock_dir: &Path, resource: &str) -> std::io::Result<()> {
-    let command = std::env::args().collect::<Vec<_>>().join(" ");
-    let owner = serde_json::json!({
-        "pid": std::process::id(),
-        "host": current_hostname(),
-        "command": command,
-        "started_at_unix_ms": SystemTime::now()
+/// Lockfile path for a daemon resource lease. The single GPU resource (the common
+/// case) shares [`hipfire_lock::gpu_lock_path`] with the `hipfire gpu-lock` CLI —
+/// same inode, so daemon and non-daemon GPU users mutually exclude via ONE flock.
+/// Multi-GPU / NPU / CPU resources get their own flock file under `root`.
+pub fn resource_lock_path(root: &Path, resource: &str, gpu_resource_count: usize) -> PathBuf {
+    if resource.starts_with("hip-gpu-") && gpu_resource_count <= 1 {
+        hipfire_lock::gpu_lock_path()
+    } else {
+        root.join(format!("{resource}.lock"))
+    }
+}
+
+/// Holder line written into a lease lockfile (under the held flock), mirroring the
+/// `hipfire gpu-lock` CLI format so `status`/`probe` show a consistent owner.
+fn lease_holder_line(resource: &str) -> String {
+    format!(
+        "daemon resource={resource} pid={} host={} acquired_epoch={}",
+        std::process::id(),
+        current_hostname(),
+        SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis(),
-        "resource": resource,
-    });
-    let path = lock_dir.join("owner.json");
-    std::fs::write(path, format!("{owner:#}\n"))
+    )
 }
 
-pub fn try_acquire_resource_lock(root: &Path, resource: &str) -> Result<PathBuf, String> {
-    std::fs::create_dir_all(root).map_err(|e| format!("create {}: {e}", root.display()))?;
-    let lock_dir = root.join(format!("{resource}.lock"));
-    match std::fs::create_dir(&lock_dir) {
-        Ok(()) => {
-            write_lock_owner(&lock_dir, resource)
-                .map_err(|e| format!("write {}: {e}", lock_dir.join("owner.json").display()))?;
-            return Ok(lock_dir);
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(format!("create {}: {e}", lock_dir.display())),
+/// Probe every resource lease lockfile and report (name, path, live flock state).
+/// Enumerates the shared GPU lock plus any per-resource flock files under `root`,
+/// so the report reflects what is *actually* held right now (kernel `flock` probe),
+/// not a stale lockfile — used by the admin API and the TUI status view.
+pub fn resource_lock_report(root: &Path) -> Vec<(String, PathBuf, hipfire_lock::LockState)> {
+    let mut out: Vec<(String, PathBuf, hipfire_lock::LockState)> = Vec::new();
+    let gpu = hipfire_lock::gpu_lock_path();
+    if gpu.exists() {
+        let st = hipfire_lock::probe(&gpu).unwrap_or(hipfire_lock::LockState::Free);
+        out.push(("gpu".to_string(), gpu.clone(), st));
     }
-
-    let owner = read_lock_owner(&lock_dir);
-    let owner_pid = owner
-        .as_ref()
-        .and_then(|v| v.get("pid"))
-        .and_then(|v| v.as_i64());
-    if owner_pid.is_some_and(|pid| !pid_is_alive(pid)) {
-        let _ = std::fs::remove_dir_all(&lock_dir);
-        match std::fs::create_dir(&lock_dir) {
-            Ok(()) => {
-                write_lock_owner(&lock_dir, resource)
-                    .map_err(|e| format!("write {}: {e}", lock_dir.join("owner.json").display()))?;
-                return Ok(lock_dir);
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("lock") {
+                let name = p
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let st = hipfire_lock::probe(&p).unwrap_or(hipfire_lock::LockState::Free);
+                out.push((name, p, st));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(format!("create {}: {e}", lock_dir.display())),
         }
     }
-
-    let owner_text = owner
-        .as_ref()
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "unknown owner".to_string());
-    Err(format!(
-        "hipfire resource {resource} is already locked by {owner_text}"
-    ))
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 pub fn acquire_resource_lease_or_exit() -> ResourceLease {
     // HIPFIRE_RESOURCE_LOCK=0 disables daemon startup resource leases.
     if std::env::var("HIPFIRE_RESOURCE_LOCK").ok().as_deref() == Some("0") {
-        return ResourceLease { dirs: Vec::new() };
+        return ResourceLease { guards: Vec::new() };
     }
 
     let resources = match resource_lock_requests() {
@@ -770,53 +751,73 @@ pub fn acquire_resource_lease_or_exit() -> ResourceLease {
         }
     };
     if resources.is_empty() {
-        return ResourceLease { dirs: Vec::new() };
+        return ResourceLease { guards: Vec::new() };
     }
 
-    // HIPFIRE_RESOURCE_LOCK_DIR overrides the daemon resource-lock root directory.
+    // HIPFIRE_RESOURCE_LOCK_DIR overrides the per-resource flock-file root.
     let root = std::env::var("HIPFIRE_RESOURCE_LOCK_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("hipfire-resource-locks"));
-    // HIPFIRE_RESOURCE_LOCK_WAIT_MS waits for busy daemon resource leases before failing startup.
+    // HIPFIRE_RESOURCE_LOCK_WAIT_MS waits for busy leases before failing startup.
+    // 0 = fail-fast (single try); >0 = block up to that many ms per resource.
     let wait_ms = std::env::var("HIPFIRE_RESOURCE_LOCK_WAIT_MS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .unwrap_or(0);
-    let deadline = Instant::now() + Duration::from_millis(wait_ms);
-    let mut dirs = Vec::new();
+    let timeout = (wait_ms > 0).then(|| Duration::from_millis(wait_ms));
+    let gpu_count = resources.iter().filter(|r| r.starts_with("hip-gpu-")).count();
+    let mut guards: Vec<hipfire_lock::FlockGuard> = Vec::new();
 
     for resource in &resources {
-        loop {
-            match try_acquire_resource_lock(&root, resource) {
-                Ok(dir) => {
-                    dirs.push(dir);
-                    break;
-                }
-                Err(_) if wait_ms > 0 && Instant::now() < deadline => {
-                    std::thread::sleep(
-                        Duration::from_millis(250)
-                            .min(deadline.saturating_duration_since(Instant::now())),
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    for dir in dirs.drain(..).rev() {
-                        let _ = std::fs::remove_dir_all(dir);
-                    }
-                    eprintln!("FATAL: {e}");
-                    eprintln!(
-                        "Set HIPFIRE_RESOURCE_LOCK_WAIT_MS to wait, or HIPFIRE_RESOURCE_LOCK=0 to bypass."
-                    );
-                    std::process::exit(1);
-                }
+        let path = resource_lock_path(&root, resource, gpu_count);
+        let mut guard = match hipfire_lock::FlockGuard::open(&path) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("FATAL: open resource lockfile {}: {e}", path.display());
+                std::process::exit(1); // `guards` drops → kernel releases held flocks
+            }
+        };
+        // wait_ms==0 → single try_lock (fail-fast); wait_ms>0 → block up to timeout.
+        let acquired = match timeout {
+            Some(t) => guard.lock_blocking(Duration::from_millis(250), Some(t), |holder| {
+                eprintln!(
+                    "[hipfire] waiting for resource {resource} (held by {})",
+                    if holder.is_empty() { "another process" } else { holder }
+                );
+            }),
+            None => guard.try_lock(),
+        };
+        match acquired {
+            Ok(true) => {
+                let _ = guard.write_holder(&lease_holder_line(resource));
+                guards.push(guard);
+            }
+            Ok(false) => {
+                let holder = match hipfire_lock::probe(&path) {
+                    Ok(hipfire_lock::LockState::Busy(h)) => h,
+                    _ => String::new(),
+                };
+                eprintln!(
+                    "FATAL: hipfire resource {resource} ({}) is locked by {}",
+                    path.display(),
+                    if holder.is_empty() { "another process" } else { &holder }
+                );
+                eprintln!(
+                    "Set HIPFIRE_RESOURCE_LOCK_WAIT_MS to wait, or HIPFIRE_RESOURCE_LOCK=0 to bypass."
+                );
+                std::process::exit(1); // `guards` drops → kernel releases held flocks
+            }
+            Err(e) => {
+                eprintln!("FATAL: lock resource {resource} ({}): {e}", path.display());
+                std::process::exit(1);
             }
         }
     }
     eprintln!(
-        "[hipfire] resource locks acquired: {}",
+        "[hipfire] resource locks acquired (flock): {}",
         resources.join(", ")
     );
-    ResourceLease { dirs }
+    ResourceLease { guards }
 }
 
 #[cfg(test)]
@@ -1176,23 +1177,46 @@ mod tests {
     }
 
     #[test]
-    fn resource_lock_rejects_live_owner_and_reclaims_stale_owner() {
-        let root = temp_lock_root("reclaim");
-        let first = try_acquire_resource_lock(&root, "hip-gpu-0").unwrap();
-        let busy = try_acquire_resource_lock(&root, "hip-gpu-0").unwrap_err();
-        assert!(busy.contains("hipfire resource hip-gpu-0 is already locked"));
-        std::fs::remove_dir_all(&first).unwrap();
+    fn resource_lock_path_maps_single_gpu_to_cli_path() {
+        // Single GPU → shares the canonical `hipfire gpu-lock` inode.
+        let root = temp_lock_root("path-map");
+        assert_eq!(
+            resource_lock_path(&root, "hip-gpu-0", 1),
+            hipfire_lock::gpu_lock_path()
+        );
+        // Multi-GPU / NPU / CPU → per-resource flock file under root.
+        assert_eq!(
+            resource_lock_path(&root, "hip-gpu-1", 2),
+            root.join("hip-gpu-1.lock")
+        );
+        assert_eq!(
+            resource_lock_path(&root, "npu-0", 1),
+            root.join("npu-0.lock")
+        );
+    }
 
-        let stale = root.join("hip-gpu-0.lock");
-        std::fs::create_dir_all(&stale).unwrap();
-        std::fs::write(
-            stale.join("owner.json"),
-            r#"{"pid":-1,"host":"test","command":"old","resource":"hip-gpu-0"}"#,
-        )
-        .unwrap();
-        let replacement = try_acquire_resource_lock(&root, "hip-gpu-0").unwrap();
-        let owner = std::fs::read_to_string(replacement.join("owner.json")).unwrap();
-        assert!(owner.contains(&format!("\"pid\": {}", std::process::id())));
+    #[test]
+    fn resource_lock_flock_excludes_then_releases_on_drop() {
+        // The flock guard is held while alive and released (kernel-level) on drop —
+        // a second probe sees Busy, then Free after the first guard drops. No stale
+        // lockfile to reclaim (the inode lock, not the file's existence, is the lock).
+        let root = temp_lock_root("flock");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("hip-gpu-7.lock");
+
+        let mut a = hipfire_lock::FlockGuard::open(&path).unwrap();
+        assert!(a.try_lock().unwrap());
+        a.write_holder(&lease_holder_line("hip-gpu-7")).unwrap();
+        assert!(matches!(
+            hipfire_lock::probe(&path).unwrap(),
+            hipfire_lock::LockState::Busy(_)
+        ));
+
+        drop(a); // kernel releases — equivalent to the holding process dying
+        assert!(matches!(
+            hipfire_lock::probe(&path).unwrap(),
+            hipfire_lock::LockState::Free
+        ));
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
