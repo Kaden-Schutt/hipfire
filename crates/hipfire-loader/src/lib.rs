@@ -1238,7 +1238,8 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
     let arch_id = hfq.arch_id;
     let n_exp = config.n_routed_experts;
 
-    let gpus = Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    let gpus =
+        Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
     let n = gpus.devices.len();
     if n != tp {
         return Err(format!(
@@ -1246,8 +1247,13 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
         ));
     }
     eprintln!("[loader] EP load: tp={tp} arch=ds4 experts={n_exp} (rank r owns e%{tp}==r)");
-    let shard = ShardConfig::new(tp, /*tp_kv_replicate=*/ true, n_exp, ExpertAssign::Stride)
-        .map_err(|e| format!("ShardConfig: {e:?}"))?;
+    let shard = ShardConfig::new(
+        tp,
+        /*tp_kv_replicate=*/ true,
+        n_exp,
+        ExpertAssign::Stride,
+    )
+    .map_err(|e| format!("ShardConfig: {e:?}"))?;
     // Transactional partial-load: build per-rank weights/state/partials INTO the
     // staging guard. Every `?` below early-returns while `staging` is alive, so
     // its `Drop` frees the ranks already loaded.
@@ -1338,7 +1344,8 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
     let arch_id = hfq.arch_id;
     let n_exp = config.num_local_experts;
 
-    let gpus = Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    let gpus =
+        Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
     let n = gpus.devices.len();
     if n != tp {
         return Err(format!(
@@ -1346,8 +1353,13 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
         ));
     }
     eprintln!("[loader] EP load: tp={tp} arch=minimax experts={n_exp} (rank r owns e%{tp}==r)");
-    let shard = ShardConfig::new(tp, /*tp_kv_replicate=*/ true, n_exp, ExpertAssign::Stride)
-        .map_err(|e| format!("ShardConfig: {e:?}"))?;
+    let shard = ShardConfig::new(
+        tp,
+        /*tp_kv_replicate=*/ true,
+        n_exp,
+        ExpertAssign::Stride,
+    )
+    .map_err(|e| format!("ShardConfig: {e:?}"))?;
     let fail_rank = ep_fail_rank();
     let _ = fail_rank;
     let mut staging = MinimaxEpStaging::new(gpus);
