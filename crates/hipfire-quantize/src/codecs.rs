@@ -813,6 +813,69 @@ pub(crate) fn quantize_oqplus_tiered(
     output
 }
 
+/// COMPACT magnitude-tiered OQ+ (Opus Plus W4A8 + top-`w8_frac` W8A8) at ~4 b/w.
+/// Same tiered VALUES as [`quantize_oqplus_tiered`], but stored compactly: per
+/// 256-group `[f16 scale][128 int4 nibbles][N_out × (u8 index, i8 value)]` =
+/// `130 + 2·N_out` B/group, where the bulk lives in the nibbles and the top
+/// `N_out = round(w8_frac·256)` weights (by int8-upgrade gain) get a sparse
+/// `(index, int8)` overlay. The loader derives `N_out` from the byte length,
+/// expands nibbles→int8, overlays the outliers, and dispatches the iu8 W8A8
+/// kernel. Nibble slots at outlier positions still hold the int4 clamp (graceful
+/// fallback). For `w8_frac=0.01`: N_out=3 → 136 B/group ≈ 4.25 b/w.
+pub(crate) fn quantize_oqplus_compact(
+    f32_data: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+    w8_frac: f32,
+) -> Vec<u8> {
+    let group_size = 256usize;
+    let n_out = ((w8_frac as f64 * group_size as f64).round() as usize).clamp(1, 255);
+    let block_bytes = 130 + 2 * n_out; // [f16][128 nibbles][n_out×(u8 idx, i8 val)]
+    let n = f32_data.len();
+    let n_blocks = n.div_ceil(group_size);
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let mut group = [0.0f32; 256];
+        group[..end - start].copy_from_slice(&f32_data[start..end]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let scale = symmetric_clipsearch(&group, 7.0);
+        let inv = 1.0 / scale;
+        // Top n_out by int8-upgrade gain (= the tiered codec's criterion).
+        let gain = |i: usize| -> f32 {
+            let v = group[i];
+            let q4 = (v * inv).round().clamp(-7.0, 7.0);
+            let q8 = (v * inv).round().clamp(-127.0, 127.0);
+            let e4 = v - q4 * scale;
+            let e8 = v - q8 * scale;
+            e4 * e4 - e8 * e8
+        };
+        let mut idx: [usize; 256] = core::array::from_fn(|i| i);
+        idx.sort_unstable_by(|&a, &c| {
+            gain(c).partial_cmp(&gain(a)).unwrap_or(core::cmp::Ordering::Equal)
+        });
+        let out_off = b * block_bytes;
+        let scale_f16 = f32_to_f16(scale);
+        output[out_off] = (scale_f16 & 0xFF) as u8;
+        output[out_off + 1] = (scale_f16 >> 8) as u8;
+        // Bulk int4 nibbles (every position; outlier slots get overridden on load).
+        for i in 0..128 {
+            let qlo = (group[2 * i] * inv).round().clamp(-7.0, 7.0) as i8;
+            let qhi = (group[2 * i + 1] * inv).round().clamp(-7.0, 7.0) as i8;
+            output[out_off + 2 + i] = ((qlo as u8) & 0xf) | (((qhi as u8) & 0xf) << 4);
+        }
+        // Sparse int8 outlier overlay: (u8 index-in-group, i8 value).
+        let tbl = out_off + 130;
+        for (s, &pos) in idx[..n_out].iter().enumerate() {
+            let q8 = (group[pos] * inv).round().clamp(-127.0, 127.0) as i8;
+            output[tbl + 2 * s] = pos as u8;
+            output[tbl + 2 * s + 1] = q8 as u8;
+        }
+    }
+    output
+}
+
 /// Dequantize OQ8G256 (round-trip oracle for the Opus W8A8 codec / tests).
 /// `[f16 scale][256 signed int8]` per 256-group → `scale·q`, inverse FWHT.
 /// Test-only oracle; gated on `cfg(test)` so non-test builds don't compile it as

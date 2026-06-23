@@ -1957,6 +1957,13 @@ enum QuantType {
     /// forward int8-quantizes activations and runs the iu8 GEMM. Near-lossless,
     /// matrix-core-fast.
     Oq8G256 = 35,
+    /// OQ+ compact magnitude-tiered (Opus Plus W4A8, ~4 b/w). On-disk block =
+    /// `[f16 scale][128 int4 nibbles][N_out × (u8 idx, i8 val)]` = 130 + 2·N_out
+    /// B/256-group (codec `quantize_oqplus_compact`; N_out = round(w8_frac·256)).
+    /// Loader (qwen35 qt=36) derives N_out from the byte length, expands the int4
+    /// bulk to int8 and overlays the sparse int8 outliers → the iu8 W8A8 buffer.
+    /// Same compute/values as the int8 OQ+ tiered probe, ~half the storage.
+    OqPlusCompact = 36,
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -2875,6 +2882,7 @@ enum HfqInputFormat {
     Oq4,
     OqPlus,
     OqPlusTiered,
+    OqPlusCompact,
     Oq8,
 }
 
@@ -2894,6 +2902,7 @@ impl HfqInputFormat {
             "oq+" | "oqplus" | "oq4+" | "opus-plus" | "opusplus" | "opus+" | "opusa8"
             | "oq4a8" => Some(Self::OqPlus),
             "oq+t" | "oqplus-tiered" | "oq+8" | "opus-plus-tiered" => Some(Self::OqPlusTiered),
+            "oq+c" | "oqplus-compact" | "oq+4" | "opus-plus-compact" => Some(Self::OqPlusCompact),
             "oq8" | "oq8g256" | "opus8" => Some(Self::Oq8),
             _ => None,
         }
@@ -3160,12 +3169,13 @@ fn quantize_hfq_source_tensor(
                 "OQ8G256",
             )
         }
-        HfqInputFormat::OqPlusTiered => {
+        HfqInputFormat::OqPlusTiered | HfqInputFormat::OqPlusCompact => {
             // OQ+ magnitude-tiered W4A8: bulk int4, top-`w8_frac` weights/group at
-            // int8 — ONE iu8 grouped-WMMA kernel. On-disk = Oq8 format (258 B/group)
-            // so it loads via the existing qt=35 Oq8 path and the W8A8 forward
-            // unchanged. Composes AWQ (W·s offline + x/s sidecar) like the Oq4 arm.
-            // (LDLQ not composed here — it produces int4-only; tiering is orthogonal.)
+            // int8 — ONE iu8 grouped-WMMA kernel. `OqPlusTiered` stores the int8
+            // Oq8 layout (258 B/group, qt=35 loader); `OqPlusCompact` stores the
+            // compact ~4 b/w layout (130 + 2·N_out B/group, qt=36 loader). Same
+            // tiered VALUES either way. Composes AWQ + LDLQ like the Oq4 arm.
+            let compact = matches!(format, HfqInputFormat::OqPlusCompact);
             if k % 256 != 0 {
                 return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
             }
@@ -3208,9 +3218,11 @@ fn quantize_hfq_source_tensor(
                 };
                 let diag_sum: f64 = (0..k).map(|i| h[i * k + i] as f64).sum();
                 let damp = 0.01 * (diag_sum / k as f64).max(1e-12);
-                let out = ldlq::oqplus_tiered_ldlq_pack(
-                    &wbuf, m_dim, k, &h, &signs1, &signs2, damp, w8_frac,
-                );
+                let out = if compact {
+                    ldlq::oqplus_compact_ldlq_pack(&wbuf, m_dim, k, &h, &signs1, &signs2, damp, w8_frac)
+                } else {
+                    ldlq::oqplus_tiered_ldlq_pack(&wbuf, m_dim, k, &h, &signs1, &signs2, damp, w8_frac)
+                };
                 if out.is_some() {
                     if let Some(s) = awq_scales {
                         OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(s));
@@ -3231,15 +3243,27 @@ fn quantize_hfq_source_tensor(
                     let mut scaled = f32_data.clone();
                     awq_pre_scale_weights(&mut scaled, m_dim, k, &scales);
                     OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(scales));
-                    quantize_oqplus_tiered(&scaled, &signs1, &signs2, w8_frac)
+                    if compact {
+                        quantize_oqplus_compact(&scaled, &signs1, &signs2, w8_frac)
+                    } else {
+                        quantize_oqplus_tiered(&scaled, &signs1, &signs2, w8_frac)
+                    }
+                } else if compact {
+                    quantize_oqplus_compact(&f32_data, &signs1, &signs2, w8_frac)
                 } else {
                     quantize_oqplus_tiered(&f32_data, &signs1, &signs2, w8_frac)
                 }
+            } else if compact {
+                quantize_oqplus_compact(&f32_data, &signs1, &signs2, w8_frac)
             } else {
                 quantize_oqplus_tiered(&f32_data, &signs1, &signs2, w8_frac)
             };
-            // Emit the Oq8 tag/layout — the tiered values ride the W8A8 path.
-            (q, QuantType::Oq8G256, 256, "OQ+T")
+            // OQ+C → compact qt=36 layout; OQ+T → int8 Oq8 qt=35 layout.
+            if compact {
+                (q, QuantType::OqPlusCompact, 256, "OQ+C")
+            } else {
+                (q, QuantType::Oq8G256, 256, "OQ+T")
+            }
         }
         HfqInputFormat::F16 | HfqInputFormat::Bf16 | HfqInputFormat::Qtip3 => unreachable!(),
     };

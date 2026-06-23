@@ -2697,6 +2697,76 @@ fn load_weight_tensor_raw(
             }
         },
         16 => load_bf16_matrix_weight(gpu, data, m, k),
+        36 => {
+            // OQ+ compact magnitude-tiered W4A8 (quant_type id 36, ~4 b/w). On-disk
+            // block = [f16 scale][128 int4 nibbles][N_out × (u8 idx, i8 val)] =
+            // 130 + 2·N_out B/256-group (codec `quantize_oqplus_compact`). N_out is
+            // DERIVED from the byte length (no extra metadata): expand the int4 bulk
+            // nibbles to int8, then overlay the sparse int8 outliers at their
+            // in-group indices → the Oq8 kernel buffer [int8 M*K | f32 scales M*ng].
+            // Tagged Oq8G256 → the single iu8 W8A8 forward, unchanged. AWQ sidecar
+            // (when present) is applied to x by the wrapper (Oq8G256 is allow-listed).
+            const GROUP: usize = 256;
+            assert_eq!(k % GROUP, 0, "OQ+C requires K % 256 == 0 (got K={k})");
+            let ng = k / GROUP;
+            let n_groups = m * ng;
+            assert!(n_groups > 0 && !data.is_empty(), "OQ+C empty tensor");
+            assert_eq!(
+                data.len() % n_groups,
+                0,
+                "OQ+C byte length {} not divisible by n_groups {n_groups}",
+                data.len()
+            );
+            let block_bytes = data.len() / n_groups;
+            assert!(
+                block_bytes >= 132 && (block_bytes - 130) % 2 == 0,
+                "OQ+C block_bytes {block_bytes} invalid (expected 130 + 2·N_out)"
+            );
+            let n_out = (block_bytes - 130) / 2;
+            let sext4 = |nib: u8| -> i8 {
+                let v = (nib & 0xf) as i8;
+                if v > 7 {
+                    v - 16
+                } else {
+                    v
+                }
+            };
+            let weight_bytes = m * k; // one int8 per weight after expand
+            let scales_bytes = m * ng * 4;
+            let mut combined = vec![0u8; weight_bytes + scales_bytes];
+            for r in 0..m {
+                for g in 0..ng {
+                    let src = (r * ng + g) * block_bytes;
+                    let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+                    let dst = r * k + g * GROUP;
+                    // Expand the 128 int4 nibble bytes → 256 int8 (bulk).
+                    for i in 0..128 {
+                        let byte = data[src + 2 + i];
+                        combined[dst + 2 * i] = sext4(byte & 0xf) as u8;
+                        combined[dst + 2 * i + 1] = sext4(byte >> 4) as u8;
+                    }
+                    // Overlay the sparse int8 outliers: (u8 idx, i8 val) × N_out.
+                    let tbl = src + 130;
+                    for s in 0..n_out {
+                        let idx = data[tbl + 2 * s] as usize;
+                        let val = data[tbl + 2 * s + 1];
+                        combined[dst + idx] = val;
+                    }
+                    let so = weight_bytes + (r * ng + g) * 4;
+                    combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
+                }
+            }
+            let buf = gpu.upload_raw(&combined, &[combined.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::Oq8G256,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         33 => {
             // OQ+ / Opus Plus W4A8 (quant_type id 33). On-disk bytes are IDENTICAL
             // to Oq4 (qt=34): [f16 scale][128 signed nibbles] per 256-group, from

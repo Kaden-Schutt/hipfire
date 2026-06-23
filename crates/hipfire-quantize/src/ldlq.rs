@@ -471,6 +471,146 @@ pub fn oqplus_tiered_ldlq_pack(
     Some(out)
 }
 
+/// COMPACT (~4 b/w) variant of [`oqplus_tiered_ldlq_pack`]: identical GPTQ/OBS
+/// error-feedback and tiered quantization, but emits the compact per-256-group
+/// layout `[f16 scale][128 int4 nibbles][N_out × (u8 idx, i8 val)]` (matching
+/// `codecs::quantize_oqplus_compact`) instead of the int8 Oq8 layout. The OBS
+/// residual uses the actual tiered value (int8 for outliers → ~0 error → little
+/// propagation; int4 for the bulk), so the feedback compensates the bulk exactly
+/// as in the int8 packer — same dequantized values, ~half the bytes.
+#[allow(clippy::too_many_arguments)]
+pub fn oqplus_compact_ldlq_pack(
+    weights_f32: &[f32],
+    m: usize,
+    k: usize,
+    h_rowmajor_f32: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+    damp: f64,
+    w8_frac: f32,
+) -> Option<Vec<u8>> {
+    use rayon::prelude::*;
+    assert_eq!(weights_f32.len(), m * k);
+    assert_eq!(h_rowmajor_f32.len(), k * k);
+    assert_eq!(k % 256, 0, "oqplus_compact_ldlq_pack requires k % 256 == 0");
+
+    let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
+    rotate_hessian(&mut h, k, signs1, signs2);
+    let hd = Mat::<f64>::from_fn(k, k, |i, j| h[i * k + j] + if i == j { damp } else { 0.0 });
+    let chol = hd.llt(Side::Lower).ok()?;
+    let hinv = chol.solve(Mat::<f64>::identity(k, k));
+    let l = hinv.llt(Side::Lower).ok()?.L().to_owned();
+
+    let nb = k / 256;
+    let mut residual = vec![0.0f64; m * k];
+    residual.par_chunks_mut(k).enumerate().for_each(|(row, rr)| {
+        let base = row * k;
+        let mut buf = [0.0f32; 256];
+        for b in 0..nb {
+            for c in 0..256 {
+                buf[c] = weights_f32[base + b * 256 + c];
+            }
+            crate::cpu_fwht_256(&mut buf, signs1, signs2);
+            for c in 0..256 {
+                rr[b * 256 + c] = buf[c] as f64;
+            }
+        }
+    });
+
+    let n_out = ((w8_frac as f64 * 256.0).round() as usize).clamp(1, 255);
+    let block_bytes = 130 + 2 * n_out; // [f16][128 nibbles][n_out×(u8 idx, i8 val)]
+    let mut out = vec![0u8; m * nb * block_bytes];
+
+    for blk in 0..nb {
+        let c0 = blk * 256;
+        let c1 = c0 + 256;
+        let results: Vec<(Vec<f64>, Vec<u8>)> = residual
+            .par_chunks(k)
+            .map(|rr_row| {
+                let mut grp = [0.0f32; 256];
+                for (c, g) in grp.iter_mut().enumerate() {
+                    *g = rr_row[c0 + c] as f32;
+                }
+                let scale = crate::codecs::symmetric_clipsearch(&grp, 7.0);
+                let inv = 1.0 / scale;
+                let gain = |i: usize| -> f32 {
+                    let v = grp[i];
+                    let q4 = (v * inv).round().clamp(-7.0, 7.0);
+                    let q8 = (v * inv).round().clamp(-127.0, 127.0);
+                    let e4 = v - q4 * scale;
+                    let e8 = v - q8 * scale;
+                    e4 * e4 - e8 * e8
+                };
+                let mut idx: [usize; 256] = core::array::from_fn(|i| i);
+                idx.sort_unstable_by(|&a, &c| {
+                    gain(c).partial_cmp(&gain(a)).unwrap_or(core::cmp::Ordering::Equal)
+                });
+                let mut is_w8 = [false; 256];
+                for &i in &idx[..n_out] {
+                    is_w8[i] = true;
+                }
+                let mut block = vec![0u8; block_bytes];
+                let s16 = crate::f32_to_f16(scale);
+                block[0] = (s16 & 0xFF) as u8;
+                block[1] = (s16 >> 8) as u8;
+                let mut err = vec![0.0f64; 256];
+                // Quantize each position to its tier; nibbles store the int4 clamp
+                // (outlier slots overridden by the sparse table on load), err uses
+                // the ACTUAL tiered value.
+                for i in 0..128 {
+                    let q4lo = (grp[2 * i] * inv).round().clamp(-7.0, 7.0) as i8;
+                    let q4hi = (grp[2 * i + 1] * inv).round().clamp(-7.0, 7.0) as i8;
+                    block[2 + i] = ((q4lo as u8) & 0xf) | (((q4hi as u8) & 0xf) << 4);
+                }
+                for i in 0..256 {
+                    let lim = if is_w8[i] { 127.0 } else { 7.0 };
+                    let q = (grp[i] * inv).round().clamp(-lim, lim);
+                    let u = l[(c0 + i, c0 + i)];
+                    err[i] = if u > 0.0 {
+                        (grp[i] as f64 - (q * scale) as f64) / u
+                    } else {
+                        0.0
+                    };
+                }
+                let tbl = 130;
+                for (s, &pos) in idx[..n_out].iter().enumerate() {
+                    let q8 = (grp[pos] * inv).round().clamp(-127.0, 127.0) as i8;
+                    block[tbl + 2 * s] = pos as u8;
+                    block[tbl + 2 * s + 1] = q8 as u8;
+                }
+                (err, block)
+            })
+            .collect();
+
+        for (row, (_, block)) in results.iter().enumerate() {
+            let off = (row * nb + blk) * block_bytes;
+            out[off..off + block_bytes].copy_from_slice(block);
+        }
+
+        if c1 < k {
+            residual
+                .par_chunks_mut(k)
+                .zip(results.par_iter())
+                .for_each(|(rr, (err, _))| {
+                    for (c, &ec) in err.iter().enumerate() {
+                        if ec == 0.0 {
+                            continue;
+                        }
+                        let col = c0 + c;
+                        for f in c1..k {
+                            let usf = l[(f, col)];
+                            if usf != 0.0 {
+                                rr[f] -= ec * usf;
+                            }
+                        }
+                    }
+                });
+        }
+    }
+
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
