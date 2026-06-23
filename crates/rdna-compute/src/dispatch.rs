@@ -45738,8 +45738,7 @@ impl Gpu {
         &mut self,
         w_i8: &GpuTensor,
         w_scales: &GpuTensor,
-        x_i8: &GpuTensor,
-        x_scales: &GpuTensor,
+        x_f32: &GpuTensor,
         y_f32: &GpuTensor,
         m: usize,
         k: usize,
@@ -45755,8 +45754,7 @@ impl Gpu {
         )?;
         let wp = w_i8.buf.as_ptr();
         let wsp = w_scales.buf.as_ptr();
-        let xp = x_i8.buf.as_ptr();
-        let xsp = x_scales.buf.as_ptr();
+        let xp = x_f32.buf.as_ptr();
         let yp = y_f32.buf.as_ptr();
         let mut mi = m as i32;
         let mut ki = k as i32;
@@ -45765,7 +45763,6 @@ impl Gpu {
             &wp as *const _ as *mut c_void,
             &wsp as *const _ as *mut c_void,
             &xp as *const _ as *mut c_void,
-            &xsp as *const _ as *mut c_void,
             &yp as *const _ as *mut c_void,
             &mut mi as *mut _ as *mut c_void,
             &mut ki as *mut _ as *mut c_void,
@@ -46532,8 +46529,7 @@ impl Gpu {
         w_z: &GpuTensor,
         w_beta: &GpuTensor,
         w_alpha: &GpuTensor,
-        xq: &GpuTensor,
-        xs: &GpuTensor,
+        x_f32: &GpuTensor,
         y_qkv: &GpuTensor,
         y_z: &GpuTensor,
         y_beta: &GpuTensor,
@@ -46557,8 +46553,7 @@ impl Gpu {
         let p_wz = w_z.buf.as_ptr();
         let p_wbeta = w_beta.buf.as_ptr();
         let p_walpha = w_alpha.buf.as_ptr();
-        let p_xq = xq.buf.as_ptr();
-        let p_xs = xs.buf.as_ptr();
+        let p_x = x_f32.buf.as_ptr();
         let p_yqkv = y_qkv.buf.as_ptr();
         let p_yz = y_z.buf.as_ptr();
         let p_ybeta = y_beta.buf.as_ptr();
@@ -46574,8 +46569,7 @@ impl Gpu {
             &p_wz as *const _ as *mut c_void,
             &p_wbeta as *const _ as *mut c_void,
             &p_walpha as *const _ as *mut c_void,
-            &p_xq as *const _ as *mut c_void,
-            &p_xs as *const _ as *mut c_void,
+            &p_x as *const _ as *mut c_void,
             &p_yqkv as *const _ as *mut c_void,
             &p_yz as *const _ as *mut c_void,
             &p_ybeta as *const _ as *mut c_void,
@@ -46601,8 +46595,7 @@ impl Gpu {
         &mut self,
         w_gate: &GpuTensor,
         w_up: &GpuTensor,
-        xq: &GpuTensor,
-        xs: &GpuTensor,
+        x_f32: &GpuTensor,
         y_gate: &GpuTensor,
         y_up: &GpuTensor,
         gate_m: usize,
@@ -46620,8 +46613,7 @@ impl Gpu {
         )?;
         let wgp = w_gate.buf.as_ptr();
         let wup = w_up.buf.as_ptr();
-        let xqp = xq.buf.as_ptr();
-        let xsp = xs.buf.as_ptr();
+        let xp = x_f32.buf.as_ptr();
         let ygp = y_gate.buf.as_ptr();
         let yup = y_up.buf.as_ptr();
         let mut gmi = gate_m as i32;
@@ -46631,8 +46623,7 @@ impl Gpu {
         let mut params: Vec<*mut c_void> = vec![
             &wgp as *const _ as *mut c_void,
             &wup as *const _ as *mut c_void,
-            &xqp as *const _ as *mut c_void,
-            &xsp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
             &ygp as *const _ as *mut c_void,
             &yup as *const _ as *mut c_void,
             &mut gmi as *mut _ as *mut c_void,

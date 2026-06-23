@@ -2,17 +2,23 @@
 // Copyright (c) 2026 hipfire contributors
 // hipfire — see LICENSE and NOTICE in the project root.
 
-// Opus Quant W8A8 DECODE GEMV (batch=1): y[m] = Σ_g sw[m,g]·sx[g]·Σ_{k∈g} qw·qx.
-// One wave32 per output row, ZERO LDS, wave-shuffle reduction. The int8
-// generalization of gemv_oq4_grouped — unlike the WMMA grouped GEMM
-// (gemm_oq8_grouped_wmma), this wastes no 16×16 N-tile lanes at B=1, so the
-// kernel is weight-bandwidth-bound instead of WMMA-occupancy-bound. group MUST
-// be 256 (group/32 = 8 int8 per lane = two aligned int32 loads).
+// Opus Quant W4A8 DECODE GEMV (batch=1): y[m] = Σ_g sw[m,g]·Σ_{k∈g} qw·x[k].
+// One wave32 per output row, ZERO LDS, single wave-shuffle reduction.
+//
+// DECODE numerics note: at B=1 there is no WMMA, so we do NOT quantize the
+// activation to int8 (that exists only to feed the iu8 WMMA tiles in the
+// batched prefill path). Instead we dequantize the int8 weight inline and
+// multiply by the FULL-PRECISION f32 activation — exactly like the mq4
+// decode GEMV (fused_qkvza_hfq4g256). This (a) eliminates the separate
+// quantize_act_oq8 launch per projection (the dominant decode launch cost),
+// and (b) is numerically MORE accurate than W8A8 (acts stay f32). The AWQ
+// math (W·s)·(x/s)=W·x still holds: the awq divide is folded into x_rot by
+// the fused rmsnorm, the s is baked into the int8 weight at quantize time.
+// group MUST be 256 (group/32 = 8 int8 per lane = two aligned int32 loads).
 //
 //   W  : [M, K] signed int8 weights              row stride = K
 //   Ws : [M, K/256] f32 per-group weight scales
-//   X  : [K] signed int8 activation (batch=1)
-//   Xs : [K/256] f32 per-group activation scales
+//   X  : [K] f32 activation (batch=1, rotated)
 //   Y  : [M] f32
 
 #include <hip/hip_runtime.h>
@@ -22,8 +28,7 @@ __launch_bounds__(32)
 extern "C" __global__ void gemv_oq8_grouped(
     const int8_t*  __restrict__ W,
     const float*   __restrict__ Ws,
-    const int8_t*  __restrict__ X,
-    const float*   __restrict__ Xs,
+    const float*   __restrict__ X,
     float*         __restrict__ Y,
     int M, int K, int group
 ) {
@@ -39,23 +44,18 @@ extern "C" __global__ void gemv_oq8_grouped(
         const int boff = g * group + lane * 8; // 8 int8 = two int32 per lane
         const int32_t w0 = *(const int32_t*)(w_row + boff);
         const int32_t w1 = *(const int32_t*)(w_row + boff + 4);
-        const int32_t x0 = *(const int32_t*)(X + boff);
-        const int32_t x1 = *(const int32_t*)(X + boff + 4);
-        int isum = 0;
+        float gsum = 0.0f;
         #pragma unroll
         for (int n = 0; n < 4; ++n) {
-            int qw = (int)((w0 >> (8 * n)) & 0xff); qw = (qw << 24) >> 24; // sext int8
-            int qx = (int)((x0 >> (8 * n)) & 0xff); qx = (qx << 24) >> 24;
-            isum += qw * qx;
+            int qw0 = (int)((w0 >> (8 * n)) & 0xff); qw0 = (qw0 << 24) >> 24; // sext int8
             int qw1 = (int)((w1 >> (8 * n)) & 0xff); qw1 = (qw1 << 24) >> 24;
-            int qx1 = (int)((x1 >> (8 * n)) & 0xff); qx1 = (qx1 << 24) >> 24;
-            isum += qw1 * qx1;
+            gsum += (float)qw0 * X[boff + n];
+            gsum += (float)qw1 * X[boff + 4 + n];
         }
-        for (int off = 16; off > 0; off >>= 1) {
-            isum += __shfl_down(isum, off);
-        }
-        isum = __shfl(isum, 0);
-        facc += (float)isum * ws_row[g] * Xs[g];
+        facc += gsum * ws_row[g];
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        facc += __shfl_down(facc, off);
     }
     if (lane == 0) {
         Y[row] = facc;

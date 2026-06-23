@@ -651,7 +651,6 @@ fn oq8_gemv_into(
     let ng = k / GROUP;
     gpu.ensure_mq_signs().map_err(hip)?;
     gpu.ensure_oq4_scratch().map_err(hip)?; // oq4_xr reused as the rotate target
-    gpu.ensure_oq8_scratch().map_err(hip)?;
     let alias = |t: &rdna_compute::GpuTensor, n: usize, dt: DType| rdna_compute::GpuTensor {
         buf: unsafe { t.buf.alias() },
         shape: vec![n],
@@ -670,11 +669,10 @@ fn oq8_gemv_into(
     };
     let xr: &rdna_compute::GpuTensor = rotated.as_ref().unwrap_or(x);
 
-    let xq = alias(gpu.oq8_xq.as_ref().unwrap(), k, DType::Raw); // K int8 bytes
-    let xs = alias(gpu.oq8_xs.as_ref().unwrap(), ng, DType::F32);
-    gpu.quantize_act_oq8(xr, &xq, &xs, 1, k, GROUP).map_err(hip)?;
+    // DECODE (B=1): consume the f32 rotated activation directly — dequant the
+    // int8 weight inline (W4A16 decode, mq4-style). No quantize_act_oq8 launch.
     let ws = w.buf.sub_offset(m * k, m * ng * 4);
-    gpu.gemv_oq8_grouped(w.buf, &ws, &xq, &xs, out, m, k, GROUP)
+    gpu.gemv_oq8_grouped(w.buf, &ws, xr, out, m, k, GROUP)
         .map_err(hip)
 }
 
@@ -1047,10 +1045,12 @@ fn launch_fused(
             }
             Ok(())
         }
-        // ── Opus W8A8 (OQ+) fused projections (decode) ───────────────────────
-        // int8 analog of the Oq4 arms: int8-quantize the shared FWHT-rotated
-        // activation ONCE (the fusion win), then one wave-per-row gemv_oq8_grouped
-        // per sub-projection. Weights are [int8 M*K | f32 scales M*ng].
+        // ── Opus W4A8 (OQ+) fused projections (decode) ───────────────────────
+        // mq4-style decode: consume the shared FWHT-rotated f32 activation
+        // DIRECTLY in one fused GEMV-demux launch — the int8 weight is
+        // dequantized inline (W4A16 at B=1), so there is NO quantize_act_oq8
+        // launch (the dominant decode launch cost). Weights are
+        // [int8 M*K | f32 scales M*ng]; the kernel derives the scale ptr.
         KernelKey::FusedQkvzaOq8G256 => {
             let hip = |e: rdna_compute::HipError| DispatchError::Hip(e.to_string());
             let (wqkv, qkv) = gemv_weight_out(&steps[1]);
@@ -1058,24 +1058,8 @@ fn launch_fused(
             let (wb, beta) = gemv_weight_out(&steps[3]);
             let (wa, alpha) = gemv_weight_out(&steps[4]);
             let k = wqkv.k;
-            gpu.ensure_oq8_scratch().map_err(hip)?;
-            let xq = rdna_compute::GpuTensor {
-                buf: unsafe { gpu.oq8_xq.as_ref().unwrap().buf.alias() },
-                shape: vec![k],
-                dtype: DType::Raw,
-            };
-            let xs = rdna_compute::GpuTensor {
-                buf: unsafe { gpu.oq8_xs.as_ref().unwrap().buf.alias() },
-                shape: vec![k / 256],
-                dtype: DType::F32,
-            };
-            gpu.quantize_act_oq8(activated, &xq, &xs, 1, k, 256).map_err(hip)?;
-            // ONE fused launch demuxing all 4 projections (vs 4 gemv launches) — the
-            // decode launch-count win on the per-token-launch-bound gfx1103 path.
-            // Each weight buf is the combined [int8 M*K | f32 scales]; the kernel
-            // derives the scale pointer internally.
             gpu.fused_qkvza_oq8_gemv(
-                wqkv.buf, wz.buf, wb.buf, wa.buf, &xq, &xs, qkv, z, beta, alpha,
+                wqkv.buf, wz.buf, wb.buf, wa.buf, activated, qkv, z, beta, alpha,
                 wqkv.m, wz.m, wb.m, wa.m, k, 256,
             )
             .map_err(hip)?;
@@ -1086,20 +1070,7 @@ fn launch_fused(
             let (wg, gate) = gemv_weight_out(&steps[1]);
             let (wu, up) = gemv_weight_out(&steps[2]);
             let k = wg.k;
-            gpu.ensure_oq8_scratch().map_err(hip)?;
-            let xq = rdna_compute::GpuTensor {
-                buf: unsafe { gpu.oq8_xq.as_ref().unwrap().buf.alias() },
-                shape: vec![k],
-                dtype: DType::Raw,
-            };
-            let xs = rdna_compute::GpuTensor {
-                buf: unsafe { gpu.oq8_xs.as_ref().unwrap().buf.alias() },
-                shape: vec![k / 256],
-                dtype: DType::F32,
-            };
-            gpu.quantize_act_oq8(activated, &xq, &xs, 1, k, 256).map_err(hip)?;
-            // ONE fused launch for gate+up (vs 2 gemv launches), gemv-demux (no waste).
-            gpu.fused_gate_up_oq8_gemv(wg.buf, wu.buf, &xq, &xs, gate, up, wg.m, wu.m, k, 256)
+            gpu.fused_gate_up_oq8_gemv(wg.buf, wu.buf, activated, gate, up, wg.m, wu.m, k, 256)
                 .map_err(hip)?;
             Ok(())
         }
