@@ -32,7 +32,331 @@ pub(crate) fn daemon_battery_rows(
             examples_battery_rows(battery, config, ctx, datasets)
         }
         BatteryId::Vision => Some(run_daemon_vision_rows(config, ctx)),
+        BatteryId::Quality => Some(run_daemon_quality_rows(config, ctx)),
         _ => None,
+    }
+}
+
+// ── Quality battery (resident KLD scoring; replaces the eval_hipfire example) ──
+//
+// Drives the daemon `kld_eval` op: builds a KLD reference from the full-precision
+// anchor (`--reference`) over the committed wikitext slice, then scores each
+// candidate model against that reference — all through ONE resident forward +
+// the shared `hipfire-kld` core (the drift the standalone two-binary path caused
+// is impossible by construction). An existing HFKREF (`--kldref`) short-circuits
+// the build. The daemon op is qwen3.5-only; non-qwen35 models surface the daemon's
+// own error as a Fail row.
+
+const KLD_CORPUS_SLICE: &str = "benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt";
+
+/// Minimal load params for KLD scoring: only `max_seq` + `kv_cache`. KLD runs the
+/// plain scoring forward, so DFlash / draft / CASK (generate-time spec-decode
+/// machinery in `daemon_model_load_params`) must NOT be enabled — they change the
+/// forward path and are irrelevant to reference build / scoring.
+fn daemon_kld_load_params(config: &EvalConfig, max_seq: usize) -> ModelLoadParams {
+    ModelLoadParams {
+        max_seq: max_seq.min(u32::MAX as usize) as u32,
+        kv_cache: config.kv_mode.clone(),
+        ..Default::default()
+    }
+}
+
+pub(crate) fn run_daemon_quality_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
+    if !Path::new(&config.model).exists() {
+        return vec![daemon_quality_skip_row(
+            config,
+            ctx,
+            &config.model,
+            "daemon quality executor requires --model to be a local filesystem path",
+        )];
+    }
+    let Some(bin) = hipfire_daemon_adapter::find_daemon_bin() else {
+        return vec![daemon_quality_skip_row(
+            config,
+            ctx,
+            &config.model,
+            "daemon binary not found; build with `cargo build -p hipfire-daemon --bin hipfire-daemon`",
+        )];
+    };
+    let started = SystemTime::now();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            return vec![daemon_quality_skip_row(
+                config,
+                ctx,
+                &config.model,
+                &format!("create daemon executor runtime: {err}"),
+            )]
+        }
+    };
+    match runtime.block_on(run_daemon_quality_rows_async(config, ctx, &bin)) {
+        Ok(mut rows) => {
+            let elapsed_ms = elapsed_since_ms(started);
+            for r in &mut rows {
+                if r.elapsed_ms == 0 {
+                    r.elapsed_ms = elapsed_ms;
+                }
+            }
+            rows
+        }
+        Err(err) => vec![daemon_quality_fail_row(
+            config,
+            ctx,
+            &config.model,
+            &format!("daemon-backed quality executor failed: {err}"),
+            elapsed_since_ms(started),
+        )],
+    }
+}
+
+pub(crate) async fn run_daemon_quality_rows_async(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    bin: &Path,
+) -> anyhow::Result<Vec<EvalResult>> {
+    use hipfire_daemon_protocol::{KldEvalMode, KldEvalRequest};
+
+    let max_seq = 4096; // n_ctx=2048 chunks + headroom
+    let mut engine = hipfire_daemon_adapter::DaemonEngine::spawn(bin).await?;
+    let evidence_dir = runtime_evidence_dir(config, "kld_reference_slice", &config.model);
+    let _ = fs::create_dir_all(&evidence_dir);
+
+    // ── Resolve the reference: an existing HFKREF, else build one resident from
+    // the full-precision anchor (`--reference`). ──
+    let ref_path: String = if let Some(p) = config.kldref.as_ref().filter(|p| p.exists()) {
+        p.display().to_string()
+    } else if let Some(ref_model) = config.reference.as_ref() {
+        if !Path::new(ref_model).exists() {
+            return Ok(vec![daemon_quality_skip_row(
+                config,
+                ctx,
+                &config.model,
+                &format!("--reference model {ref_model} is not a local filesystem path"),
+            )]);
+        }
+        let Some(corpus) = resolve_repo_path(KLD_CORPUS_SLICE).map(|p| p.display().to_string())
+        else {
+            return Ok(vec![daemon_quality_skip_row(
+                config,
+                ctx,
+                &config.model,
+                &format!("KLD corpus slice not found ({KLD_CORPUS_SLICE})"),
+            )]);
+        };
+        engine
+            .load(ref_model, daemon_kld_load_params(config, max_seq))
+            .await?;
+        let ref_out = evidence_dir.join(format!("{}.kldref", model_artifact_stem(ref_model)));
+        let resp = engine
+            .kld_eval(
+                KldEvalRequest {
+                    mode: KldEvalMode::BuildRef,
+                    corpus: Some(corpus),
+                    ref_path: Some(ref_out.display().to_string()),
+                    output: None,
+                    max_chunks: config.quality_max_chunks,
+                    n_ctx: None,
+                    config: None,
+                    capture_hidden_layers: false,
+                    dump_logits: false,
+                },
+                |_| {},
+            )
+            .await?;
+        resp.ref_output
+            .unwrap_or_else(|| ref_out.display().to_string())
+    } else {
+        return Ok(vec![daemon_quality_skip_row(
+            config,
+            ctx,
+            &config.model,
+            "no KLD reference: pass --reference <full-precision model> to build one, or --kldref <ref.kldref>",
+        )]);
+    };
+
+    // ── Score each candidate against the resident reference. ──
+    let mut rows = Vec::new();
+    for model in evaluation_models(config) {
+        if !Path::new(&model).exists() {
+            rows.push(daemon_quality_skip_row(
+                config,
+                ctx,
+                &model,
+                "quality KLD requires each evaluated model to be a local filesystem path",
+            ));
+            continue;
+        }
+        if let Err(err) = engine
+            .load(&model, daemon_kld_load_params(config, max_seq))
+            .await
+        {
+            rows.push(daemon_quality_fail_row(
+                config,
+                ctx,
+                &model,
+                &format!("daemon load failed: {err}"),
+                0,
+            ));
+            continue;
+        }
+        let output_path = evidence_dir.join(format!("{}.kldseq", model_artifact_stem(&model)));
+        let resp = engine
+            .kld_eval(
+                KldEvalRequest {
+                    mode: KldEvalMode::Score,
+                    corpus: None,
+                    ref_path: Some(ref_path.clone()),
+                    output: Some(output_path.display().to_string()),
+                    max_chunks: config.quality_max_chunks,
+                    n_ctx: None,
+                    config: None,
+                    capture_hidden_layers: false,
+                    dump_logits: false,
+                },
+                |_| {},
+            )
+            .await;
+        rows.push(daemon_quality_row_from_resp(
+            config,
+            ctx,
+            &model,
+            &ref_path,
+            &output_path,
+            resp,
+        ));
+    }
+    Ok(rows)
+}
+
+fn daemon_quality_base_metrics(ref_path: &str) -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        ("implemented".to_string(), json!(true)),
+        ("executor".to_string(), json!("daemon")),
+        ("suite".to_string(), json!("daemon_kld_reference")),
+        ("kldref".to_string(), json!(ref_path)),
+    ])
+}
+
+fn daemon_quality_skip_row(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    model: &str,
+    reason: &str,
+) -> EvalResult {
+    row_for_model(
+        BatteryId::Quality,
+        None,
+        "kld_reference_slice",
+        None,
+        EvalStatus::Skip,
+        Some(reason.to_string()),
+        BTreeMap::from([("executor".to_string(), json!("daemon"))]),
+        config,
+        ctx,
+        prompt("benchmarks/quality-baselines/harness/canary.md"),
+        0,
+        model.to_string(),
+    )
+}
+
+fn daemon_quality_fail_row(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    model: &str,
+    reason: &str,
+    elapsed_ms: u128,
+) -> EvalResult {
+    row_for_model(
+        BatteryId::Quality,
+        None,
+        "kld_reference_slice",
+        None,
+        EvalStatus::Fail,
+        Some(reason.to_string()),
+        BTreeMap::from([
+            ("executor".to_string(), json!("daemon")),
+            ("implemented".to_string(), json!(true)),
+        ]),
+        config,
+        ctx,
+        prompt("benchmarks/quality-baselines/harness/canary.md"),
+        elapsed_ms,
+        model.to_string(),
+    )
+}
+
+fn daemon_quality_row_from_resp(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    model: &str,
+    ref_path: &str,
+    output_path: &Path,
+    resp: anyhow::Result<hipfire_daemon_protocol::KldEvalResponse>,
+) -> EvalResult {
+    let prompt_ref = prompt("benchmarks/quality-baselines/harness/canary.md");
+    match resp {
+        Ok(resp) => {
+            let mut metrics = daemon_quality_base_metrics(ref_path);
+            metrics.insert("scoring_mode".to_string(), json!("kld_reference_slice"));
+            metrics.insert("n_chunks".to_string(), json!(resp.n_chunk));
+            metrics.insert("total_scored".to_string(), json!(resp.total_scored));
+            metrics.insert(
+                "kldseq_path".to_string(),
+                json!(output_path.display().to_string()),
+            );
+            if let Some(v) = resp.mean_kld {
+                metrics.insert("mean_kld".to_string(), json!(v));
+            }
+            if let Some(v) = resp.p99_kld {
+                metrics.insert("p99_kld".to_string(), json!(v));
+            }
+            if let Some(v) = resp.mean_nll {
+                metrics.insert("mean_nll".to_string(), json!(v));
+            }
+            if let Some(v) = resp.ppl {
+                metrics.insert("ppl".to_string(), json!(v));
+            }
+            if !resp.compat_findings.is_empty() {
+                metrics.insert(
+                    "compat_findings".to_string(),
+                    json!(resp.compat_findings.clone()),
+                );
+            }
+            let finite = resp.mean_kld.map(|v| v.is_finite()).unwrap_or(false);
+            let (status, reason) = if !finite {
+                (
+                    EvalStatus::Fail,
+                    Some("daemon kld_eval returned no finite mean_kld".to_string()),
+                )
+            } else {
+                (EvalStatus::Pass, None)
+            };
+            row_for_model(
+                BatteryId::Quality,
+                None,
+                "kld_reference_slice",
+                None,
+                status,
+                reason,
+                metrics,
+                config,
+                ctx,
+                prompt_ref,
+                0,
+                model.to_string(),
+            )
+        }
+        Err(err) => daemon_quality_fail_row(
+            config,
+            ctx,
+            model,
+            &format!("daemon kld_eval score failed: {err}"),
+            0,
+        ),
     }
 }
 
