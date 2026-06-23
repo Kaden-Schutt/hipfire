@@ -4,7 +4,7 @@
 # Per docs/plans/qwen35-mq4-quality-gap.md §F1. For each alpha:
 #   1. Delete prior AWQ quant (space-bounded — single slot)
 #   2. Quantize 9B BF16 safetensors → MQ4G256 + AWQ pre-scaling at this alpha
-#   3. Run eval_hipfire against the BF16 kldref, capture KLD .kldseq
+#   3. Score each variant against the BF16 HFKREF via the daemon kld_eval op
 #   4. Aggregate per-variant KLD/PPL into a CSV-style log
 #
 # Per-variant cost on gfx906 (estimated):
@@ -25,31 +25,45 @@ cd "$(dirname "$0")/.."
 # ── paths ─────────────────────────────────────────────────────────────
 BF16_DIR=/local/hipfire/Qwen3.5-9B-BF16-st
 IMATRIX=benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.imatrix.gguf
-KLDREF=/data/hipfire/qwen3.5-9b-bf16.kldref.bin
 QUANT_BIN=target/release/hipfire-quantize
-EVAL_BIN=target/release/examples/eval_hipfire
+
+# KLD reference is now a hipfire-self HFKREF, built ONCE by the daemon from a BF16
+# hipfire model (the cross-engine `.kldref.bin` format has been removed). Provide
+# REF_HFQ (a BF16 .hfq) to build it, or a pre-built KLDREF (.kldref). CORPUS is the
+# scoring slice. Scoring runs through the daemon kld_eval op (lib/kld_daemon.sh).
+REF_HFQ=${REF_HFQ:-/local/hipfire/qwen3.5-9b-bf16.hfq}
+KLDREF=${KLDREF:-/local/hipfire/qwen3.5-9b-bf16.kldref}
+CORPUS=${CORPUS:-benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt}
+source "$(dirname "$0")/lib/kld_daemon.sh"
 
 QUANT_SLOT=/local/hipfire/qwen3.5-9b-awq-current-mq4.hfq
 
 # ── sweep params ──────────────────────────────────────────────────────
 MAX_CHUNKS=${MAX_CHUNKS:-50}
 KV_MODE=${KV_MODE:-asym3}
-SCORING=${SCORING:-prefill}
 RESULTS_LABEL=${RESULTS_LABEL:-2026-05-14-awq-alpha-sweep-9b-gfx906}
 RESULTS_DIR=benchmarks/quality-baselines/results/$RESULTS_LABEL
 mkdir -p "$RESULTS_DIR/per-variant"
 SUMMARY="$RESULTS_DIR/summary.tsv"
 if [ ! -f "$SUMMARY" ]; then
-    printf "alpha\tquantize_sec\teval_sec\tkldseq_path\n" > "$SUMMARY"
+    printf "alpha\tquantize_sec\teval_sec\tmean_kld\tppl\tkldseq_path\n" > "$SUMMARY"
 fi
 
 # ── pre-flight ────────────────────────────────────────────────────────
-for f in "$BF16_DIR" "$IMATRIX" "$KLDREF" "$QUANT_BIN" "$EVAL_BIN"; do
+for f in "$BF16_DIR" "$IMATRIX" "$QUANT_BIN" "$CORPUS"; do
     if [ ! -e "$f" ]; then
         echo "FATAL: missing $f" >&2
         exit 2
     fi
 done
+
+# Build the hipfire-self KLD reference once (daemon build_ref) if not present.
+if [ ! -f "$KLDREF" ]; then
+    [ -f "$REF_HFQ" ] || { echo "FATAL: need REF_HFQ ($REF_HFQ, a BF16 .hfq) to build the KLD reference, or a pre-built KLDREF ($KLDREF)" >&2; exit 2; }
+    echo "building HFKREF $KLDREF from $REF_HFQ (n=$MAX_CHUNKS, kv=$KV_MODE)"
+    kld_build_ref "$REF_HFQ" "$CORPUS" "$KLDREF" "$MAX_CHUNKS" "$KV_MODE" >/dev/null \
+        || { echo "FATAL: daemon build_ref failed" >&2; exit 1; }
+fi
 
 if [ $# -eq 0 ]; then
     echo "usage: $0 <alpha> [<alpha> ...]" >&2
@@ -109,23 +123,18 @@ for ALPHA in "$@"; do
     AWQ_SIDECAR_COUNT=$(grep -c "^    AWQ:    " "$QUANT_LOG")
     echo "  self-check OK: AWQ sidecars=$AWQ_SIDECAR_COUNT (expect 248 for 9B F2; 184 with HIPFIRE_AWQ_F1_ONLY=1), conv1d=Q8, imatrix loaded"
 
-    # 3. Eval
-    echo "  eval (n=$MAX_CHUNKS, kv=$KV_MODE, $SCORING)"
+    # 3. Eval — daemon kld_eval Score against the hipfire-self HFKREF.
+    echo "  eval (n=$MAX_CHUNKS, kv=$KV_MODE, daemon kld_eval)"
     ESTART=$SECONDS
-    "$EVAL_BIN" \
-        --model "$QUANT_SLOT" \
-        --ref "$KLDREF" \
-        --output "$KLDSEQ" \
-        --kv-mode "$KV_MODE" \
-        --scoring-mode "$SCORING" \
-        --max-chunks "$MAX_CHUNKS" \
-        > "$EVAL_LOG" 2>&1 \
-    || { echo "  EVAL FAILED — see $EVAL_LOG" >&2; tail -30 "$EVAL_LOG" >&2; exit 1; }
+    EVAL_LINE=$(KLD_DAEMON_LOG="$EVAL_LOG" kld_score "$QUANT_SLOT" "$KLDREF" "$KLDSEQ" "$MAX_CHUNKS" "$KV_MODE") \
+        || { echo "  EVAL FAILED — see $EVAL_LOG" >&2; echo "$EVAL_LINE" >&2; exit 1; }
+    MEAN_KLD=$(kld_field "$EVAL_LINE" mean_kld)
+    PPL=$(kld_field "$EVAL_LINE" ppl)
     ESEC=$((SECONDS - ESTART))
-    echo "  eval done in ${ESEC}s; kldseq=$KLDSEQ"
+    echo "  eval done in ${ESEC}s; mean_kld=$MEAN_KLD ppl=$PPL kldseq=$KLDSEQ"
 
     # 4. Record
-    printf "%s\t%d\t%d\t%s\n" "$ALPHA" "$QSEC" "$ESEC" "$KLDSEQ" >> "$SUMMARY"
+    printf "%s\t%d\t%d\t%s\t%s\t%s\n" "$ALPHA" "$QSEC" "$ESEC" "$MEAN_KLD" "$PPL" "$KLDSEQ" >> "$SUMMARY"
 
     echo ""
 done

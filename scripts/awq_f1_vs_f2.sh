@@ -15,20 +15,33 @@ cd "$(dirname "$0")/.."
 
 BF16_DIR=/local/hipfire/Qwen3.5-9B-BF16-st
 IMATRIX=benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.imatrix.gguf
-KLDREF=/data/hipfire/qwen3.5-9b-bf16.kldref.bin
 QUANT_BIN=target/release/hipfire-quantize
-EVAL_BIN=target/release/examples/eval_hipfire
 QUANT_SLOT=/local/hipfire/qwen3.5-9b-awq-current-mq4.hfq
+
+# KLD reference is a hipfire-self HFKREF, built once by the daemon from a BF16 .hfq
+# (the cross-engine `.kldref.bin` format has been removed). Scoring runs through the
+# daemon kld_eval op (scripts/lib/kld_daemon.sh).
+REF_HFQ=${REF_HFQ:-/local/hipfire/qwen3.5-9b-bf16.hfq}
+KLDREF=${KLDREF:-/local/hipfire/qwen3.5-9b-bf16.kldref}
+CORPUS=${CORPUS:-benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt}
+source "$(dirname "$0")/lib/kld_daemon.sh"
 
 ALPHA=${ALPHA:-0.55}
 MAX_CHUNKS=${MAX_CHUNKS:-256}
 KV_MODE=${KV_MODE:-q8}
-SCORING=${SCORING:-prefill}
 
 OUT_DIR=benchmarks/quality-baselines/results/2026-05-14-f1-vs-f2-n${MAX_CHUNKS}-kv${KV_MODE}-9b-gfx906
 mkdir -p "$OUT_DIR"
 SUMMARY="$OUT_DIR/summary.tsv"
-[ -f "$SUMMARY" ] || printf "variant\tsidecars\tquantize_sec\teval_sec\tkldseq_path\n" > "$SUMMARY"
+[ -f "$SUMMARY" ] || printf "variant\tsidecars\tquantize_sec\teval_sec\tmean_kld\tppl\tkldseq_path\n" > "$SUMMARY"
+
+# Build the hipfire-self KLD reference once if not present.
+if [ ! -f "$KLDREF" ]; then
+    [ -f "$REF_HFQ" ] || { echo "FATAL: need REF_HFQ ($REF_HFQ, a BF16 .hfq) or a pre-built KLDREF ($KLDREF)" >&2; exit 2; }
+    echo "building HFKREF $KLDREF from $REF_HFQ"
+    kld_build_ref "$REF_HFQ" "$CORPUS" "$KLDREF" "$MAX_CHUNKS" "$KV_MODE" >/dev/null \
+        || { echo "FATAL: daemon build_ref failed" >&2; exit 1; }
+fi
 
 run_one() {
     local tag="$1"     # f1 or f2
@@ -55,13 +68,15 @@ run_one() {
     echo "  $tag sidecars=$sidecars quantize=${QSEC}s"
 
     ESTART=$SECONDS
-    "$EVAL_BIN" --model "$QUANT_SLOT" --ref "$KLDREF" --output "$kld" \
-        --kv-mode "$KV_MODE" --scoring-mode "$SCORING" --max-chunks "$MAX_CHUNKS" \
-        > "$elog" 2>&1
+    local line
+    line=$(KLD_DAEMON_LOG="$elog" kld_score "$QUANT_SLOT" "$KLDREF" "$kld" "$MAX_CHUNKS" "$KV_MODE") \
+        || { echo "  $tag EVAL FAILED — see $elog" >&2; echo "$line" >&2; exit 1; }
+    local mean_kld ppl
+    mean_kld=$(kld_field "$line" mean_kld); ppl=$(kld_field "$line" ppl)
     ESEC=$((SECONDS - ESTART))
-    echo "  $tag eval=${ESEC}s → $kld"
+    echo "  $tag eval=${ESEC}s mean_kld=$mean_kld ppl=$ppl → $kld"
 
-    printf "%s\t%d\t%d\t%d\t%s\n" "$tag-a${ALPHA}" "$sidecars" "$QSEC" "$ESEC" "$kld" >> "$SUMMARY"
+    printf "%s\t%d\t%d\t%d\t%s\t%s\t%s\n" "$tag-a${ALPHA}" "$sidecars" "$QSEC" "$ESEC" "$mean_kld" "$ppl" "$kld" >> "$SUMMARY"
 }
 
 run_one f1 1
