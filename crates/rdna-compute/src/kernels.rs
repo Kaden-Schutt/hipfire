@@ -3554,6 +3554,13 @@ pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_K2_SRC: &str =
 pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2.hip");
 
+/// i8 WMMA MMQ MoE grouped-GEMM for MQ2-Lloyd weights on gfx1151. Decodes the
+/// 2-bit Lloyd index via an in-kernel int8-codebook LUT and runs i8 WMMA at
+/// ~2x the FP16 rate. Drop-in for the FP16 `_4w_k2` sibling (same kernarg
+/// layout + trailing x_src_rows).
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_MMQ_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_mmq.gfx1151.hip");
+
 pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_N32_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32.hip");
 

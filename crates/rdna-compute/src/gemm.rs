@@ -10729,6 +10729,87 @@ impl Gpu {
         result
     }
 
+    /// gfx1151 i8 MMQ MoE grouped GEMM for MQ2-Lloyd weights. Drop-in for the
+    /// FP16 `gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2` (same args + trailing
+    /// `x_src_rows`): X is auto-quantized to Q8_1, the 2-bit Lloyd index is
+    /// decoded via an in-kernel int8-codebook LUT, and i8 WMMA runs at ~2x the
+    /// FP16 rate. Opt-in via `HIPFIRE_DEEPSEEK4_MOE_I8=1`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor, // [E] u64
+        expert_tile_ids: &GpuTensor,    // [m_total / 16] i32
+        sorted_slot_index: &GpuTensor,  // [m_total] i32
+        x_src: &GpuTensor,              // [x_src_rows × K] f32 (auto-converted to Q8_1)
+        y_grouped: &GpuTensor,          // [m_total × M] f32, written direct
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let kernel_name = "gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151";
+        let kernel_src = kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_MMQ_GFX1151_SRC;
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+        // Q8_1 pre-pass (reuses the shared MMQ X scratch).
+        let x_q8_ptr = self.ensure_q8_1_mmq_x(x_src, x_src_rows, k)?;
+
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_q8_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val = m_total as i32;
+        let xsr_val = x_src_rows as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+            &xsr_val as *const _ as *mut c_void,
+        ];
+
+        let row_tiles = ((m + 15) / 16) as u32;
+        let slot_tiles = ((m_total + 15) / 16) as u32;
+        let bytes = (m_total * k) + (m_total * m) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, slot_tiles, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep);
+                b.push_ptr(tp);
+                b.push_ptr(sp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(xrd_val);
+                b.push_i32(mt_val);
+                b.push_i32(xsr_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// gfx1151 (Strix Halo iGPU) i8 MMQ MoE grouped GEMM — k4 (deeper
     /// K-tile pipeline) variant. Drop-in for `gemm_hfq4g256_moe_grouped_mmq_gfx1151`
     /// — same kernarg layout, same grid/block geometry, same scatter
