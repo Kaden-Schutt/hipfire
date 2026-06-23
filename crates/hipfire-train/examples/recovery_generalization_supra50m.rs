@@ -22,7 +22,7 @@ use hipfire_train::block::BlockLoraGrad;
 use hipfire_train::loader::{load_llama_fp32, LlamaWeightsF32};
 use hipfire_train::model::{
     flatten_norm_grads, flatten_recovery_grads, free_model_acts, model_distill_backward,
-    model_forward, LlamaModel,
+    model_distill_backward_tail, model_forward, LlamaModel,
 };
 use hipfire_train::oqplus_quant::oqplus_simquant;
 use hipfire_train::ops::softmax::softmax_forward;
@@ -70,6 +70,23 @@ fn oqplus_quantize_linears(gpu: &mut Gpu, w: &mut LlamaWeightsF32) -> Result<(),
     Ok(())
 }
 
+/// Distill backward — tail-scored (last `n_score` positions) when n_score>0,
+/// else full-sequence. Tail scoring is the leak-free KVarN+CASK measurement.
+#[allow(clippy::type_complexity)]
+fn distill(
+    gpu: &mut Gpu,
+    model: &LlamaModel,
+    acts: &hipfire_train::model::ModelActivations,
+    tp: &GpuTensor,
+    n_score: usize,
+) -> Result<(f32, Vec<BlockLoraGrad>, GpuTensor), Box<dyn std::error::Error>> {
+    if n_score > 0 {
+        Ok(model_distill_backward_tail(gpu, model, acts, tp, n_score)?)
+    } else {
+        Ok(model_distill_backward(gpu, model, acts, tp)?)
+    }
+}
+
 /// Mean held-out KL (forward + distill backward, discard grads, free acts).
 fn heldout_kl(
     gpu: &mut Gpu,
@@ -77,17 +94,19 @@ fn heldout_kl(
     chunks: &[Vec<u32>],
     teacher_p: &[GpuTensor],
     pos: &[f32],
+    n_score: usize,
 ) -> Result<f32, Box<dyn std::error::Error>> {
+    let per = if n_score > 0 { n_score } else { L };
     let mut total = 0.0f32;
     for (ci, toks) in chunks.iter().enumerate() {
         let acts = model_forward(gpu, student, toks, pos)?;
-        let (kl, g, d_final) = model_distill_backward(gpu, student, &acts, &teacher_p[ci])?;
+        let (kl, g, d_final) = distill(gpu, student, &acts, &teacher_p[ci], n_score)?;
         total += kl;
         free_grads(gpu, g)?;
         gpu.free_tensor(d_final)?;
         free_model_acts(gpu, acts)?;
     }
-    Ok(total / (chunks.len() * L) as f32)
+    Ok(total / (chunks.len() * per) as f32)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -100,9 +119,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mode = std::env::var("HIPFIRE_RECOVER_NOISE").unwrap_or_else(|_| "oqplus".into());
     let norms_only = std::env::var("HIPFIRE_RECOVER_MODE").as_deref() == Ok("norms");
     let lr = envf("HIPFIRE_RECOVER_LR", 3e-4);
+    // HIPFIRE_SCORE_TAIL=N → score only the last N query positions (leak-free for
+    // KVarN+CASK: tail queries read merged cold keys strictly in their past). 0 =
+    // score all positions (only valid when there's no cross-token KV merge).
+    let n_score = std::env::var("HIPFIRE_SCORE_TAIL").ok().and_then(|v| v.parse().ok()).unwrap_or(0usize);
+    let per_tok = if n_score > 0 { n_score } else { L };
 
     let mut gpu = Gpu::init().expect("Gpu::init failed");
-    println!("arch: {}  mode={mode}  recover={}  lr={lr}", gpu.arch,
+    println!("arch: {}  mode={mode}  recover={}  lr={lr}  score_tail={n_score}", gpu.arch,
         if norms_only { "norms" } else { "lora+norms" });
 
     let tok = Tokenizer::from_hf_json(&std::fs::read_to_string(dir.join("tokenizer.json"))?)
@@ -155,19 +179,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut opt = AdamW::new(&mut gpu, &sizes, lr, 0.9, 0.999, 1e-8, 0.0)?;
 
     let kl0_train;
-    let kl0_held = heldout_kl(&mut gpu, &student, held_c, held_p, &pos)?;
+    let kl0_held = heldout_kl(&mut gpu, &student, held_c, held_p, &pos, n_score)?;
     {
         // measure starting train KL too
         let mut t = 0.0f32;
         for (ci, toks) in train_c.iter().enumerate() {
             let acts = model_forward(&mut gpu, &student, toks, &pos)?;
-            let (kl, g, d_final) = model_distill_backward(&mut gpu, &student, &acts, &train_p[ci])?;
+            let (kl, g, d_final) = distill(&mut gpu, &student, &acts, &train_p[ci], n_score)?;
             t += kl;
             free_grads(&mut gpu, g)?;
             gpu.free_tensor(d_final)?;
             free_model_acts(&mut gpu, acts)?;
         }
-        kl0_train = t / (TRAIN_CHUNKS * L) as f32;
+        kl0_train = t / (TRAIN_CHUNKS * per_tok) as f32;
     }
     println!("\nstart: train KL {kl0_train:.4}  held-out KL {kl0_held:.4} nats/tok");
 
@@ -177,7 +201,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut total = 0.0f32;
         for (ci, toks) in train_c.iter().enumerate() {
             let acts = model_forward(&mut gpu, &student, toks, &pos)?;
-            let (kl, grads, d_final) = model_distill_backward(&mut gpu, &student, &acts, &train_p[ci])?;
+            let (kl, grads, d_final) = distill(&mut gpu, &student, &acts, &train_p[ci], n_score)?;
             total += kl;
             if norms_only {
                 let params = student.norm_params();
@@ -192,13 +216,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             gpu.free_tensor(d_final)?;
             free_model_acts(&mut gpu, acts)?;
         }
-        last_train = total / (TRAIN_CHUNKS * L) as f32;
+        last_train = total / (TRAIN_CHUNKS * per_tok) as f32;
         if !last_train.is_finite() {
             println!("step {step:3}: train KL diverged (NaN/inf) — stopping; STE instability, lower HIPFIRE_RECOVER_LR");
             break;
         }
         if step % 20 == 0 || step == STEPS {
-            last_held = heldout_kl(&mut gpu, &student, held_c, held_p, &pos)?;
+            last_held = heldout_kl(&mut gpu, &student, held_c, held_p, &pos, n_score)?;
             println!("step {step:3}: train KL {last_train:.4}  held-out KL {last_held:.4}");
         }
     }

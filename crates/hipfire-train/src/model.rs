@@ -525,3 +525,59 @@ fn clone_tensor(gpu: &mut Gpu, t: &GpuTensor) -> HipResult<GpuTensor> {
     gpu.memcpy_dtod_auto(&out.buf, &t.buf, bytes)?;
     Ok(out)
 }
+
+/// Like `model_distill_backward` but scores ONLY the last `n_score` query
+/// positions (zeros the loss/gradient on earlier rows). Used by the KVarN+CASK
+/// retest: in a full-sequence forward, only tail queries read merged cold keys
+/// that are strictly in their causal past, so scoring the tail is leak-free
+/// (an earlier query inside a merged fold would otherwise attend to a key
+/// blended with its own future — an acausal leak that confounds the measurement).
+pub fn model_distill_backward_tail(
+    gpu: &mut Gpu,
+    model: &LlamaModel,
+    acts: &ModelActivations,
+    teacher_p: &GpuTensor,
+    n_score: usize,
+) -> HipResult<(f32, Vec<BlockLoraGrad>, GpuTensor)> {
+    let (seq, h, vocab) = (model.dims.seq, model.dims.h, model.vocab);
+    debug_assert!(model.lm_head.is_none(), "backward supports tied embeddings only");
+    let n_score = n_score.min(seq).max(1);
+    let first_scored = seq - n_score;
+
+    let loss = gpu.zeros(&[seq], DType::F32)?;
+    let d_logits = gpu.zeros(&[seq * vocab], DType::F32)?;
+    distill_kl(gpu, &acts.logits, teacher_p, &loss, &d_logits, seq, vocab)?;
+    // Mask to the last n_score rows (host zero — correctness over speed).
+    let mut dl = gpu.download_f32(&d_logits)?;
+    for v in dl[..first_scored * vocab].iter_mut() {
+        *v = 0.0;
+    }
+    gpu.free_tensor(d_logits)?;
+    let d_logits = gpu.upload_f32(&dl, &[seq * vocab])?;
+    let loss_sum: f32 = gpu.download_f32(&loss)?[first_scored..].iter().sum();
+
+    let d_xf = gpu.zeros(&[seq * h], DType::F32)?;
+    linear_backward_x(gpu, &d_logits, &model.embed, &d_xf, seq, h, vocab, false)?;
+    let d_x_last = gpu.zeros(&[seq * h], DType::F32)?;
+    let d_final_norm = gpu.zeros(&[h], DType::F32)?;
+    rmsnorm_backward(
+        gpu, &d_xf, &acts.x_last, &model.final_norm, &acts.rinv_final, &d_x_last, &d_final_norm, seq, h,
+    )?;
+
+    let mut grads: Vec<BlockLoraGrad> = Vec::with_capacity(model.layers.len());
+    let mut d_x = d_x_last;
+    for i in (0..model.layers.len()).rev() {
+        let (lw, ll) = &model.layers[i];
+        let (d_in, g) = block_backward(
+            gpu, &d_x, &acts.layer_inputs[i], &lw.as_block(), &ll.as_block(),
+            &acts.layer_acts[i], &model.dims,
+        )?;
+        grads.push(g);
+        d_x = d_in;
+    }
+    grads.reverse();
+    gpu.free_tensor(d_logits)?;
+    gpu.free_tensor(loss)?;
+    gpu.free_tensor(d_xf)?;
+    Ok((loss_sum, grads, d_final_norm))
+}
