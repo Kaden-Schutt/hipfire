@@ -442,11 +442,14 @@ only. Drift >5% from the current q8/max256 baseline is a regression
 
 ## GPU Lock Protocol (Multi-Agent)
 
-The lock now lives in the engine. `hipfire-daemon` auto-acquires a flock(2) GPU
-resource lease (`/tmp/hipfire-resource-locks/hip-gpu-0.lock`) before HIP init and
-releases it on exit — so any daemon-driven workload (serve, chat, gates) is
-coordinated automatically. The legacy `scripts/gpu-lock.sh` shell adapter has been
-removed.
+The lock now lives in the engine. `hipfire-daemon` auto-acquires a `flock(2)` GPU
+resource lease (`~/.hipfire/locks/hip-gpu-0.lock`, plus per-NPU/CPU resource files)
+before HIP init and releases it on exit — so any daemon-driven workload (serve,
+chat, gates) is coordinated automatically. It uses the same `hipfire-lock`
+`FlockGuard` primitive (and `resource_lock_root()` path contract) as the
+`hipfire gpu-lock` CLI; override the root with `HIPFIRE_RESOURCE_LOCK_DIR`. `flock`
+is released by the kernel when the holder exits, so a crashed daemon never strands
+a lock. The legacy `scripts/gpu-lock.sh` shell adapter has been removed.
 
 For **non-daemon** GPU binaries (cargo `--example` benches, `hipfire eval`,
 `hipfire-quantize`) that do not self-lock, coordinate explicitly via the native

@@ -25,7 +25,7 @@ pub async fn get_admin_diagnostics(State(state): State<SharedState>) -> Json<Val
         "paths": path_statuses(&root),
         "binaries": binary_statuses(&root.join("bin")),
         "kernel_caches": kernel_cache_statuses(&root.join("kernels")),
-        "resource_locks": resource_lock_statuses(Path::new("/tmp/hipfire-resource-locks")),
+        "resource_locks": resource_lock_statuses(&hipfire_lock::resource_lock_root()),
         "logs": log_file_statuses(&root),
     }))
 }

@@ -513,16 +513,14 @@ fn repo_root() -> Option<PathBuf> {
 }
 
 #[derive(Debug)]
+/// Held leases for the resources this daemon acquired. Each is a
+/// [`hipfire_lock::FlockGuard`] keeping `flock(2)` on its per-resource lockfile;
+/// dropping the lease closes the fds, which the kernel releases automatically —
+/// so a crashed daemon never strands a lock (no pid-liveness reclamation hack
+/// needed, unlike the former `create_dir`-as-mutex scheme).
 pub struct ResourceLease {
-    dirs: Vec<PathBuf>,
-}
-
-impl Drop for ResourceLease {
-    fn drop(&mut self) {
-        for dir in self.dirs.drain(..).rev() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
+    #[allow(dead_code)]
+    guards: Vec<hipfire_lock::FlockGuard>,
 }
 
 pub fn sanitize_resource_id(id: &str) -> String {
@@ -671,24 +669,22 @@ pub fn resource_lock_requests() -> Result<Vec<String>, String> {
     Ok(resources)
 }
 
-#[cfg(unix)]
-fn pid_is_alive(pid: i64) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    rc == 0
-}
-
-#[cfg(not(unix))]
-fn pid_is_alive(_pid: i64) -> bool {
-    true
-}
-
-fn read_lock_owner(lock_dir: &Path) -> Option<serde_json::Value> {
-    std::fs::read_to_string(lock_dir.join("owner.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
+/// One-line holder string written into a resource lockfile by the holder, for
+/// the status readers (`/admin`, TUI) and the "already locked by …" error.
+fn lock_holder_line(resource: &str) -> String {
+    let command = std::env::args().collect::<Vec<_>>().join(" ");
+    let started_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!(
+        "pid={} host={} resource={} started_ms={} cmd={}",
+        std::process::id(),
+        current_hostname(),
+        resource,
+        started_ms,
+        command,
+    )
 }
 
 fn current_hostname() -> String {
@@ -700,66 +696,40 @@ fn current_hostname() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn write_lock_owner(lock_dir: &Path, resource: &str) -> std::io::Result<()> {
-    let command = std::env::args().collect::<Vec<_>>().join(" ");
-    let owner = serde_json::json!({
-        "pid": std::process::id(),
-        "host": current_hostname(),
-        "command": command,
-        "started_at_unix_ms": SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-        "resource": resource,
-    });
-    let path = lock_dir.join("owner.json");
-    std::fs::write(path, format!("{owner:#}\n"))
-}
-
-pub fn try_acquire_resource_lock(root: &Path, resource: &str) -> Result<PathBuf, String> {
-    std::fs::create_dir_all(root).map_err(|e| format!("create {}: {e}", root.display()))?;
-    let lock_dir = root.join(format!("{resource}.lock"));
-    match std::fs::create_dir(&lock_dir) {
-        Ok(()) => {
-            write_lock_owner(&lock_dir, resource)
-                .map_err(|e| format!("write {}: {e}", lock_dir.join("owner.json").display()))?;
-            return Ok(lock_dir);
+/// Acquire `flock(2)` on the per-resource lockfile under `root` (e.g.
+/// `root/hip-gpu-0.lock`). On success returns the held [`FlockGuard`] (caller
+/// keeps it alive to hold the lease); on contention returns the current holder
+/// line. No pid-liveness reclamation is needed — the kernel releases `flock`
+/// when the holder's fd closes (process exit/crash), so a stale file never
+/// blocks acquisition.
+pub fn try_acquire_resource_lock(
+    root: &Path,
+    resource: &str,
+) -> Result<hipfire_lock::FlockGuard, String> {
+    let path = root.join(format!("{resource}.lock"));
+    let mut guard = hipfire_lock::FlockGuard::open(&path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    match guard.try_lock() {
+        Ok(true) => {
+            let _ = guard.write_holder(&lock_holder_line(resource));
+            Ok(guard)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(format!("create {}: {e}", lock_dir.display())),
-    }
-
-    let owner = read_lock_owner(&lock_dir);
-    let owner_pid = owner
-        .as_ref()
-        .and_then(|v| v.get("pid"))
-        .and_then(|v| v.as_i64());
-    if owner_pid.is_some_and(|pid| !pid_is_alive(pid)) {
-        let _ = std::fs::remove_dir_all(&lock_dir);
-        match std::fs::create_dir(&lock_dir) {
-            Ok(()) => {
-                write_lock_owner(&lock_dir, resource)
-                    .map_err(|e| format!("write {}: {e}", lock_dir.join("owner.json").display()))?;
-                return Ok(lock_dir);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(format!("create {}: {e}", lock_dir.display())),
+        Ok(false) => {
+            let holder = guard
+                .holder()
+                .unwrap_or_else(|| "unknown owner".to_string());
+            Err(format!(
+                "hipfire resource {resource} is already locked by {holder}"
+            ))
         }
+        Err(e) => Err(format!("flock {}: {e}", path.display())),
     }
-
-    let owner_text = owner
-        .as_ref()
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "unknown owner".to_string());
-    Err(format!(
-        "hipfire resource {resource} is already locked by {owner_text}"
-    ))
 }
 
 pub fn acquire_resource_lease_or_exit() -> ResourceLease {
     // HIPFIRE_RESOURCE_LOCK=0 disables daemon startup resource leases.
     if std::env::var("HIPFIRE_RESOURCE_LOCK").ok().as_deref() == Some("0") {
-        return ResourceLease { dirs: Vec::new() };
+        return ResourceLease { guards: Vec::new() };
     }
 
     let resources = match resource_lock_requests() {
@@ -770,26 +740,27 @@ pub fn acquire_resource_lease_or_exit() -> ResourceLease {
         }
     };
     if resources.is_empty() {
-        return ResourceLease { dirs: Vec::new() };
+        return ResourceLease { guards: Vec::new() };
     }
 
-    // HIPFIRE_RESOURCE_LOCK_DIR overrides the daemon resource-lock root directory.
-    let root = std::env::var("HIPFIRE_RESOURCE_LOCK_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir().join("hipfire-resource-locks"));
+    // Resource-lock root: $HIPFIRE_RESOURCE_LOCK_DIR else ~/.hipfire/locks (the
+    // shared flock-path contract in hipfire-lock).
+    let root = hipfire_lock::resource_lock_root();
     // HIPFIRE_RESOURCE_LOCK_WAIT_MS waits for busy daemon resource leases before failing startup.
     let wait_ms = std::env::var("HIPFIRE_RESOURCE_LOCK_WAIT_MS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .unwrap_or(0);
     let deadline = Instant::now() + Duration::from_millis(wait_ms);
-    let mut dirs = Vec::new();
+    // Held guards keep the flock leases alive; dropping the lease releases them
+    // (kernel closes the fds). No filesystem cleanup needed.
+    let mut guards = Vec::new();
 
     for resource in &resources {
         loop {
             match try_acquire_resource_lock(&root, resource) {
-                Ok(dir) => {
-                    dirs.push(dir);
+                Ok(guard) => {
+                    guards.push(guard);
                     break;
                 }
                 Err(_) if wait_ms > 0 && Instant::now() < deadline => {
@@ -800,9 +771,8 @@ pub fn acquire_resource_lease_or_exit() -> ResourceLease {
                     continue;
                 }
                 Err(e) => {
-                    for dir in dirs.drain(..).rev() {
-                        let _ = std::fs::remove_dir_all(dir);
-                    }
+                    // Drop already-held guards (releases their flocks) before exit.
+                    drop(guards);
                     eprintln!("FATAL: {e}");
                     eprintln!(
                         "Set HIPFIRE_RESOURCE_LOCK_WAIT_MS to wait, or HIPFIRE_RESOURCE_LOCK=0 to bypass."
@@ -816,7 +786,7 @@ pub fn acquire_resource_lease_or_exit() -> ResourceLease {
         "[hipfire] resource locks acquired: {}",
         resources.join(", ")
     );
-    ResourceLease { dirs }
+    ResourceLease { guards }
 }
 
 #[cfg(test)]
@@ -1176,23 +1146,24 @@ mod tests {
     }
 
     #[test]
-    fn resource_lock_rejects_live_owner_and_reclaims_stale_owner() {
-        let root = temp_lock_root("reclaim");
+    fn resource_lock_rejects_live_holder_and_frees_on_drop() {
+        let root = temp_lock_root("flock");
+        // Acquiring twice (separate flock open-descriptions) → the second is
+        // blocked while the first guard is held.
         let first = try_acquire_resource_lock(&root, "hip-gpu-0").unwrap();
         let busy = try_acquire_resource_lock(&root, "hip-gpu-0").unwrap_err();
         assert!(busy.contains("hipfire resource hip-gpu-0 is already locked"));
-        std::fs::remove_dir_all(&first).unwrap();
+        // The holder line is readable for status display.
+        let lock_file = root.join("hip-gpu-0.lock");
+        let holder = std::fs::read_to_string(&lock_file).unwrap();
+        assert!(holder.contains(&format!("pid={}", std::process::id())));
 
-        let stale = root.join("hip-gpu-0.lock");
-        std::fs::create_dir_all(&stale).unwrap();
-        std::fs::write(
-            stale.join("owner.json"),
-            r#"{"pid":-1,"host":"test","command":"old","resource":"hip-gpu-0"}"#,
-        )
-        .unwrap();
-        let replacement = try_acquire_resource_lock(&root, "hip-gpu-0").unwrap();
-        let owner = std::fs::read_to_string(replacement.join("owner.json")).unwrap();
-        assert!(owner.contains(&format!("\"pid\": {}", std::process::id())));
-        std::fs::remove_dir_all(&root).unwrap();
+        // Dropping the first guard releases the flock (kernel closes the fd) —
+        // no manual cleanup, no pid-liveness hack — so the next acquire wins.
+        drop(first);
+        let second = try_acquire_resource_lock(&root, "hip-gpu-0").unwrap();
+        assert!(second.is_locked());
+        drop(second);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -508,12 +508,15 @@ sessions find it without grepping.
 `hipfire serve`, daemon JSONL, and `--precompile` startups contend in-process
 instead of relying on a shell-only GPU mutex.
 
-- Lock root: `/tmp/hipfire-resource-locks` by default
-- Lock shape: one directory per scoped resource, e.g. `hip-gpu-0.lock`,
-  `npu-accel0.lock`, `cpu-core-3.lock`
-- Owner metadata: each lock contains `owner.json` with PID, host, command,
-  timestamp, and resource name
-- Stale lock handling: dead-PID owners are reclaimed automatically
+- Lock root: `~/.hipfire/locks` by default (override with
+  `HIPFIRE_RESOURCE_LOCK_DIR`); the `hipfire-lock` `resource_lock_root()` contract
+- Lock shape: a `flock(2)` lockfile per scoped resource, e.g. `hip-gpu-0.lock`,
+  `npu-accel0.lock`, `cpu-core-3.lock` — the same `FlockGuard` primitive as the
+  `hipfire gpu-lock` CLI
+- Holder metadata: each lockfile holds a one-line `pid=… host=… resource=…
+  started_ms=… cmd=…` holder string for status display
+- Stale lock handling: none needed — `flock` is released by the kernel when the
+  holder process exits, so a crashed daemon never strands a lock
 - Wait behavior: set `HIPFIRE_RESOURCE_LOCK_WAIT_MS=<ms>` to wait for busy
   resources instead of failing fast
 - Scope controls: `HIPFIRE_RESOURCE_LOCK_CPU_CORES=0,2-4` adds CPU-core

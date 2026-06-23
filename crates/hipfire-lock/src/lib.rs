@@ -202,6 +202,32 @@ pub fn gpu_lock_path() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("hipfire-gpu.lock"))
 }
 
+/// Root directory holding the per-resource flock lockfiles (one
+/// `<resource>.lock` file per GPU/NPU/CPU resource the daemon leases). The
+/// single source of truth shared by the daemon's resource-lease acquirer and
+/// the status readers (server `/admin`, TUI). Resolves `$HIPFIRE_RESOURCE_LOCK_DIR`,
+/// else `~/.hipfire/locks` (persistent, consistent across process/sandbox
+/// contexts — flock auto-releases on process death, so persistence is safe),
+/// else `<tmpdir>/hipfire-resource-locks` when `$HOME` is unset.
+pub fn resource_lock_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("HIPFIRE_RESOURCE_LOCK_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home).join(".hipfire").join("locks");
+        }
+    }
+    std::env::temp_dir().join("hipfire-resource-locks")
+}
+
+/// Per-resource flock lockfile path, e.g. `resource_lock_path("hip-gpu-0")` →
+/// `~/.hipfire/locks/hip-gpu-0.lock`. `flock` keys on the inode, so every
+/// participant opening this exact path shares one mutex for that resource.
+pub fn resource_lock_path(resource: &str) -> PathBuf {
+    resource_lock_root().join(format!("{resource}.lock"))
+}
+
 fn read_holder_line(path: &Path) -> Option<String> {
     let mut s = String::new();
     File::open(path).ok()?.read_to_string(&mut s).ok()?;

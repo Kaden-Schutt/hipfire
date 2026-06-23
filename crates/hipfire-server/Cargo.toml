@@ -32,6 +32,7 @@ anyhow = "1"
 hipfire-admin-types = { path = "../hipfire-admin-types" }
 hipfire-config = { path = "../hipfire-config" }
 hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
+hipfire-lock = { path = "../hipfire-lock" }
 hipfire-generate = { path = "../hipfire-generate" }
 hipfire-model = { path = "../hipfire-model" }
 hipfire-operator = { path = "../hipfire-operator" }

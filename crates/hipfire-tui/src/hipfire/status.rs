@@ -58,7 +58,7 @@ impl StatusState {
             ("kernels".into(), paths.kernels.exists()),
         ];
         let kernel_lines = kernel_cache_lines(&paths.kernels);
-        let lock_lines = resource_lock_lines(Path::new("/tmp/hipfire-resource-locks"));
+        let lock_lines = resource_lock_lines(&hipfire_lock::resource_lock_root());
         let log_lines = log_tail_lines(paths, 160);
 
         // hipfire-serve PIDs: prefer the recorded serve.pid, then any matching
