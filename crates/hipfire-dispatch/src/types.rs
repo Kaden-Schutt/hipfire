@@ -303,6 +303,7 @@ pub enum KernelKey {
     FusedQkvHfp4G32,
     // Fused QKVZA (linear attention)
     FusedQkvzaOq4G256, // Opus W4A4 — shared int4 activation, fused_qkvza_oq4_wmma
+    FusedQkvzaOq8G256, // Opus W8A8 (OQ+) — shared int8 activation, gemv_oq8_grouped (decode) / fused_qkvza_oq8_wmma (prefill)
     FusedQkvzaHfq4G256,
     FusedQkvzaMq3G256Lloyd,
     FusedQkvzaMq4G256Lloyd,
@@ -313,6 +314,7 @@ pub enum KernelKey {
     FusedQkvzaHfp4G32,
     // Fused Gate+Up
     FusedGateUpOq4G256, // Opus W4A4 — shared int4 activation, fused_gate_up_oq4_wmma
+    FusedGateUpOq8G256, // Opus W8A8 (OQ+) — shared int8 activation, gemv_oq8_grouped (decode) / fused_gate_up_oq8_wmma (prefill)
     FusedGateUpHfq4G256,
     FusedGateUpMq3G256Lloyd,
     FusedGateUpMq4G256Lloyd,

@@ -200,6 +200,14 @@ pub(crate) fn guard_qkvza_oq4g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
     steps.len() == 5 && gemv_steps_uniform(steps, DType::Oq4G256, true)
 }
 
+/// Opus W8A8 (OQ+) fused QKVZA — all four LA weights Oq8G256, prerotated activation.
+pub(crate) fn guard_qkvza_oq8g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if ctx.flags.force_unfused {
+        return false;
+    }
+    steps.len() == 5 && gemv_steps_uniform(steps, DType::Oq8G256, true)
+}
+
 /// Covers both DType::HFQ6G256 and DType::MQ6G256 — both use dp4a.
 pub(crate) fn guard_qkvza_hfq6g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
     if !dp4a_eligible(ctx) {
@@ -237,6 +245,14 @@ pub(crate) fn guard_gate_up_oq4g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
         return false;
     }
     steps.len() == 3 && gemv_steps_uniform(steps, DType::Oq4G256, true)
+}
+
+/// Opus W8A8 (OQ+) fused Gate+Up — both weights Oq8G256, prerotated activation.
+pub(crate) fn guard_gate_up_oq8g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if ctx.flags.force_unfused {
+        return false;
+    }
+    steps.len() == 3 && gemv_steps_uniform(steps, DType::Oq8G256, true)
 }
 
 pub(crate) fn guard_gate_up_hfq4g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
@@ -451,6 +467,11 @@ const FUSED_TABLE: &[FusedPattern] = &[
     },
     FusedPattern {
         ops: QKVZA4,
+        key: KernelKey::FusedQkvzaOq8G256,
+        guard: guard_qkvza_oq8g256,
+    },
+    FusedPattern {
+        ops: QKVZA4,
         key: KernelKey::FusedQkvzaMq4G256Lloyd,
         guard: guard_qkvza_mq4g256lloyd,
     },
@@ -474,6 +495,11 @@ const FUSED_TABLE: &[FusedPattern] = &[
         ops: GATE_UP2,
         key: KernelKey::FusedGateUpOq4G256,
         guard: guard_gate_up_oq4g256,
+    },
+    FusedPattern {
+        ops: GATE_UP2,
+        key: KernelKey::FusedGateUpOq8G256,
+        guard: guard_gate_up_oq8g256,
     },
     FusedPattern {
         ops: GATE_UP2,
@@ -607,6 +633,51 @@ fn oq4_gemv_into(
         .map_err(hip)
 }
 
+/// Opus W8A8 (OQ+) single-projection decode GEMV (B=1) — int8 analog of
+/// `oq4_gemv_into`. Quantizes the (rotated) activation to int8 into persistent
+/// scratch, then runs the one-wave-per-row `gemv_oq8_grouped` (no WMMA N-tile
+/// waste at B=1). Weight buffer is `[int8 M*K | f32 scales M*ng]`; scale pointer
+/// is a sub_offset view at M*K (one int8 per weight, not nibble-packed).
+fn oq8_gemv_into(
+    gpu: &mut Gpu,
+    w: &WeightRef,
+    x: &rdna_compute::GpuTensor,
+    already_rotated: bool,
+    out: &rdna_compute::GpuTensor,
+) -> Result<(), DispatchError> {
+    const GROUP: usize = 256;
+    let hip = |e: rdna_compute::HipError| DispatchError::Hip(e.to_string());
+    let (m, k) = (w.m, w.k);
+    let ng = k / GROUP;
+    gpu.ensure_mq_signs().map_err(hip)?;
+    gpu.ensure_oq4_scratch().map_err(hip)?; // oq4_xr reused as the rotate target
+    gpu.ensure_oq8_scratch().map_err(hip)?;
+    let alias = |t: &rdna_compute::GpuTensor, n: usize, dt: DType| rdna_compute::GpuTensor {
+        buf: unsafe { t.buf.alias() },
+        shape: vec![n],
+        dtype: dt,
+    };
+    let rotated = if already_rotated {
+        None
+    } else {
+        let xr = alias(gpu.oq4_xr.as_ref().unwrap(), k, DType::F32);
+        if let Some(awq) = w.awq_scale {
+            gpu.rotate_x_mq_awq(x, awq, &xr, k).map_err(hip)?;
+        } else {
+            gpu.rotate_x_mq(x, &xr, k).map_err(hip)?;
+        }
+        Some(xr)
+    };
+    let xr: &rdna_compute::GpuTensor = rotated.as_ref().unwrap_or(x);
+
+    let xq = alias(gpu.oq8_xq.as_ref().unwrap(), k, DType::Raw); // K int8 bytes
+    let xs = alias(gpu.oq8_xs.as_ref().unwrap(), ng, DType::F32);
+    gpu.quantize_act_oq8(xr, &xq, &xs, 1, k, GROUP).map_err(hip)?;
+    let ws = w.buf.sub_offset(m * k, m * ng * 4);
+    gpu.gemv_oq8_grouped(w.buf, &ws, &xq, &xs, out, m, k, GROUP)
+        .map_err(hip)
+}
+
 /// Per-op fallback. FULL enum match (no catch-all) so the compiler forces every
 /// op to have an arm (spec F4 — a missing arm would be a silent runtime error).
 fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), DispatchError> {
@@ -618,6 +689,9 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
         } => {
             if w.dtype == DType::Oq4G256 {
                 return oq4_gemv_into(gpu, w, x, false, out);
+            }
+            if w.dtype == DType::Oq8G256 {
+                return oq8_gemv_into(gpu, w, x, false, out);
             }
             if w.dtype == DType::BF16 {
                 return gpu
@@ -634,6 +708,9 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
         } => {
             if w.dtype == DType::Oq4G256 {
                 return oq4_gemv_into(gpu, w, xr, true, out);
+            }
+            if w.dtype == DType::Oq8G256 {
+                return oq8_gemv_into(gpu, w, xr, true, out);
             }
             if w.dtype == DType::BF16 {
                 return gpu
@@ -940,6 +1017,62 @@ fn launch_fused(
             for (wt, out) in [(wg, gate), (wu, up)] {
                 let ws = wt.buf.sub_offset(wt.m * (k / 2), wt.m * ng * 4);
                 gpu.gemv_oq4_grouped(wt.buf, &ws, &xq, &xs, out, wt.m, k, 256)
+                    .map_err(hip)?;
+            }
+            Ok(())
+        }
+        // ── Opus W8A8 (OQ+) fused projections (decode) ───────────────────────
+        // int8 analog of the Oq4 arms: int8-quantize the shared FWHT-rotated
+        // activation ONCE (the fusion win), then one wave-per-row gemv_oq8_grouped
+        // per sub-projection. Weights are [int8 M*K | f32 scales M*ng].
+        KernelKey::FusedQkvzaOq8G256 => {
+            let hip = |e: rdna_compute::HipError| DispatchError::Hip(e.to_string());
+            let (wqkv, qkv) = gemv_weight_out(&steps[1]);
+            let (wz, z) = gemv_weight_out(&steps[2]);
+            let (wb, beta) = gemv_weight_out(&steps[3]);
+            let (wa, alpha) = gemv_weight_out(&steps[4]);
+            let k = wqkv.k;
+            gpu.ensure_oq8_scratch().map_err(hip)?;
+            let xq = rdna_compute::GpuTensor {
+                buf: unsafe { gpu.oq8_xq.as_ref().unwrap().buf.alias() },
+                shape: vec![k],
+                dtype: DType::Raw,
+            };
+            let xs = rdna_compute::GpuTensor {
+                buf: unsafe { gpu.oq8_xs.as_ref().unwrap().buf.alias() },
+                shape: vec![k / 256],
+                dtype: DType::F32,
+            };
+            gpu.quantize_act_oq8(activated, &xq, &xs, 1, k, 256).map_err(hip)?;
+            let ng = k / 256;
+            for (wt, out) in [(wqkv, qkv), (wz, z), (wb, beta), (wa, alpha)] {
+                let ws = wt.buf.sub_offset(wt.m * k, wt.m * ng * 4);
+                gpu.gemv_oq8_grouped(wt.buf, &ws, &xq, &xs, out, wt.m, k, 256)
+                    .map_err(hip)?;
+            }
+            Ok(())
+        }
+        KernelKey::FusedGateUpOq8G256 => {
+            let hip = |e: rdna_compute::HipError| DispatchError::Hip(e.to_string());
+            let (wg, gate) = gemv_weight_out(&steps[1]);
+            let (wu, up) = gemv_weight_out(&steps[2]);
+            let k = wg.k;
+            gpu.ensure_oq8_scratch().map_err(hip)?;
+            let xq = rdna_compute::GpuTensor {
+                buf: unsafe { gpu.oq8_xq.as_ref().unwrap().buf.alias() },
+                shape: vec![k],
+                dtype: DType::Raw,
+            };
+            let xs = rdna_compute::GpuTensor {
+                buf: unsafe { gpu.oq8_xs.as_ref().unwrap().buf.alias() },
+                shape: vec![k / 256],
+                dtype: DType::F32,
+            };
+            gpu.quantize_act_oq8(activated, &xq, &xs, 1, k, 256).map_err(hip)?;
+            let ng = k / 256;
+            for (wt, out) in [(wg, gate), (wu, up)] {
+                let ws = wt.buf.sub_offset(wt.m * k, wt.m * ng * 4);
+                gpu.gemv_oq8_grouped(wt.buf, &ws, &xq, &xs, out, wt.m, k, 256)
                     .map_err(hip)?;
             }
             Ok(())

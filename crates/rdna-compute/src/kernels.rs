@@ -3780,6 +3780,12 @@ pub const FUSED_QKVZA_OQ4_WMMA_SRC: &str =
 pub const GEMV_OQ4_GROUPED_SRC: &str =
     include_str!("../../../kernels/src/gemv_oq4_grouped.hip");
 
+/// Opus Quant W8A8 DECODE GEMV (batch=1): int8 generalization of
+/// `gemv_oq4_grouped` — one wave32 per output row, 8 int8/lane (two int32 loads),
+/// no WMMA N-tile waste, weight-bandwidth-bound. See `kernels/src/gemv_oq8_grouped.hip`.
+pub const GEMV_OQ8_GROUPED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq8_grouped.hip");
+
 /// KVarN tile quantizer (Phase D1): log-domain Sinkhorn variance-normalize +
 /// per-row 4-bit affine quantize + pack to the on-device KVarN record. One block
 /// per tile; tile in global, scales in LDS (gfx1103-safe). Golden oracle =

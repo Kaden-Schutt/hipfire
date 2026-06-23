@@ -486,6 +486,11 @@ pub struct Gpu {
     pub oq4_xq_batch: Option<GpuTensor>, // packed int4 activation, N*K/2 bytes
     pub oq4_xs_batch: Option<GpuTensor>, // per-group f32 activation scales, N*K/256
     pub oq4_ytmp_batch: Option<GpuTensor>, // f32 residual GEMM scratch, M*N
+    // Opus W8A8 (OQ+) decode scratch: int8 activation (K bytes) + per-group f32
+    // scales (K/256). Aliased by the fused-decode dispatch so the per-token
+    // forward quantizes the shared activation ONCE (no per-projection re-quant).
+    pub oq8_xq: Option<GpuTensor>, // int8 activation, K bytes
+    pub oq8_xs: Option<GpuTensor>, // per-group f32 activation scales, K/256
     pub paro_x_scratch: Option<GpuTensor>, // ParoQuant: scratch for rotated activation copy
     pub paro_fused_scratch: Option<Vec<GpuTensor>>, // ParoQuant fused paths: multiple rotation scratch buffers
     pub mq_x_q8: Option<hip_bridge::DeviceBuffer>,  // INT8 quantized rotated x for dp4a
@@ -890,6 +895,8 @@ impl Gpu {
             oq4_ytmp: None,
             oq4_xq_batch: None,
             oq4_xs_batch: None,
+            oq8_xq: None,
+            oq8_xs: None,
             oq4_ytmp_batch: None,
             paro_x_scratch: None,
             paro_fused_scratch: None,
@@ -7795,6 +7802,19 @@ impl Gpu {
         self.oq4_xs = Some(self.alloc_tensor(&[128], DType::F32)?); // K/256 ≤ 128
         self.oq4_xr = Some(self.alloc_tensor(&[32768], DType::F32)?); // K ≤ 32768
         self.oq4_ytmp = Some(self.alloc_tensor(&[32768], DType::F32)?); // M ≤ 32768
+        Ok(())
+    }
+
+    /// Opus W8A8 (OQ+) decode scratch: int8 activation (K bytes) + per-group f32
+    /// scales (K/256). Aliased by the fused-decode dispatch so the shared
+    /// activation is int8-quantized ONCE per token (no per-projection re-quant).
+    pub fn ensure_oq8_scratch(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.oq8_xq.is_some() {
+            return Ok(());
+        }
+        self.oq8_xq = Some(self.alloc_tensor(&[32768], DType::Raw)?); // K ≤ 32768 int8 bytes
+        self.oq8_xs = Some(self.alloc_tensor(&[128], DType::F32)?); // K/256 ≤ 128
         Ok(())
     }
 
@@ -45698,6 +45718,60 @@ impl Gpu {
             &mut gi as *mut _ as *mut c_void,
         ];
         let func = &self.functions["gemv_oq4_grouped"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Opus Quant W8A8 DECODE GEMV (batch=1): y[m] = Σ_g sw·sx·Σ qw·qx. One
+    /// wave32 per output row, zero LDS. int8 generalization of gemv_oq4_grouped:
+    /// rows are K int8 bytes (stride K), weights+acts are signed int8.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_oq8_grouped(
+        &mut self,
+        w_i8: &GpuTensor,
+        w_scales: &GpuTensor,
+        x_i8: &GpuTensor,
+        x_scales: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(group, 256, "gemv_oq8_grouped: group must be 256");
+        assert_eq!(k % group, 0, "gemv_oq8_grouped: K must be a multiple of group");
+        self.ensure_kernel(
+            "gemv_oq8_grouped",
+            kernels::GEMV_OQ8_GROUPED_SRC,
+            "gemv_oq8_grouped",
+        )?;
+        let wp = w_i8.buf.as_ptr();
+        let wsp = w_scales.buf.as_ptr();
+        let xp = x_i8.buf.as_ptr();
+        let xsp = x_scales.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &wsp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &xsp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions["gemv_oq8_grouped"];
         unsafe {
             self.hip.launch_kernel(
                 func,
