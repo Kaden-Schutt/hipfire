@@ -89,20 +89,19 @@ fn families() -> &'static [FamilyPlan] {
             // (LDLQ); emits bf16, which only the qwen3.5 loader accepts.
             calibrated: &["qtip3-sim"],
         },
-        // MoE path coverage: 3D-stacked expert quant + grouped-expert GEMV +
+        // MoE path coverage: 3D-stacked expert quant + per-expert decode loop +
         // 99-tensor collect (dense attn + router captured; routed experts are
-        // imatrix-only). Only q8f16/mq3 are finite — mq4 AND mq6 grouped-MoE
-        // produce NaN logits on this tiny A3B fixture, independent of
-        // moe_intermediate_size (verified 128 and 256). This is NOT new: the
-        // committed gfx1151 golden (tests/fixture-golden-baselines.txt) already
-        // shows qwen3_5_moe mq4 == mq6 (identical hash 0x512ad6…), the same
-        // degenerate signature — i.e. a latent grouped-MoE mq4/mq6 issue on the
-        // random fixture, cross-arch (gfx1103 + gfx1151). Gate only q8f16 here;
-        // root-cause against a real A3B checkpoint is a separate kernel task.
+        // imatrix-only). mq4 == mq6 here because the quantizer tiers both
+        // `--format mq4` and `mq6` routed experts to the identical
+        // gate_up=MQ6G256 / down=HFQ4G128 layout — kept as two cells to verify
+        // both CLI paths produce finite output. (These cells NaN'd before the
+        // qwen35.rs per-expert-loop fix that stopped feeding MQ6 gate_up through
+        // the MQ4-only pre-rotated GEMV — see that commit; the committed gfx1151
+        // golden's identical mq4==mq6 hash was the latent symptom.)
         FamilyPlan {
             arch: "qwen3_5_moe",
             anchor: "fp16",
-            candidates: &["q8f16"],
+            candidates: &["q8f16", "mq6", "mq4", "mq3"],
             quant_flags: &[],
             calibrated: &[],
         },

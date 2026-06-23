@@ -8679,7 +8679,19 @@ fn moe_ffn_decode_impl(
             // Per-expert fallback for layers that aren't all-MQ4 or have k != 8.
             for (&expert_idx, &weight) in topk_indices.iter().zip(topk_weights.iter()) {
                 let expert = &ffn.experts[expert_idx];
-                if let Some(xr) = x_rot_local {
+                // The MQ4 pre-rotated GEMV is an MQ4G256-ONLY dequant kernel
+                // (136 B/group). `x_rot_local` is `Some` for *any* rotated
+                // gate_up dtype (`needs_x_rot_local` includes MQ6/mq2-lloyd/paro),
+                // so gating the pre-rotated call on `x_rot_local.is_some()` fed
+                // MQ6G256 gate_up (200 B/group — what `--format mq4`/`mq6` tier
+                // routed experts to) through the MQ4 kernel → misread groups →
+                // NaN logits (the cross-arch qwen3.5-MoE mq4/mq6 NaN). Use the
+                // pre-rotated fast path ONLY for genuine MQ4 gate_up; every other
+                // dtype goes through `weight_gemv`, which dispatches the correct
+                // per-dtype dequant (and applies its own rotation internally).
+                if routed_gate_up_mq4 {
+                    let xr = x_rot_local
+                        .expect("routed_gate_up_mq4 ⇒ needs_x_rot_local ⇒ x_rot_local is Some");
                     gpu.gemv_mq4g256_prerotated(
                         &expert.gate_up.buf,
                         xr,
