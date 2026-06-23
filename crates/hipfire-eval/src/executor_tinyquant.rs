@@ -91,9 +91,14 @@ fn families() -> &'static [FamilyPlan] {
         },
         // MoE path coverage: 3D-stacked expert quant + grouped-expert GEMV +
         // 99-tensor collect (dense attn + router captured; routed experts are
-        // imatrix-only). Only q8f16 is exercised — mq4/mq6 grouped-MoE produce
-        // NaN logits on this tiny random fixture (TODO: confirm real kernel bug
-        // vs random-model pathology against a real A3B checkpoint before gating).
+        // imatrix-only). Only q8f16/mq3 are finite — mq4 AND mq6 grouped-MoE
+        // produce NaN logits on this tiny A3B fixture, independent of
+        // moe_intermediate_size (verified 128 and 256). This is NOT new: the
+        // committed gfx1151 golden (tests/fixture-golden-baselines.txt) already
+        // shows qwen3_5_moe mq4 == mq6 (identical hash 0x512ad6…), the same
+        // degenerate signature — i.e. a latent grouped-MoE mq4/mq6 issue on the
+        // random fixture, cross-arch (gfx1103 + gfx1151). Gate only q8f16 here;
+        // root-cause against a real A3B checkpoint is a separate kernel task.
         FamilyPlan {
             arch: "qwen3_5_moe",
             anchor: "fp16",

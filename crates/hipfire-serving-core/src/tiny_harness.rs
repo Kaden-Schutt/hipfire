@@ -195,8 +195,23 @@ impl TinyModel {
     /// routed experts (indexed-GEMV, not `weight_gemv`) are intentionally absent.
     pub fn capture_names(&self) -> HashMap<usize, String> {
         match self {
-            // qwen35 already ships a typed walker (covers dense + MoE).
-            Self::Qwen35 { weights, .. } => qwen35::build_capture_names(weights),
+            // qwen35 ships a typed walker, but it labels tensors with the
+            // real-checkpoint `model.language_model.` prefix. The tiny fixtures
+            // use the short `model.` prefix, and the quantizer keys the Hessian
+            // sidecar by the .hfq weight name (short) — so normalize the prefix
+            // here, else qtip3-sim LDLQ matches 0 tensors and silently falls back
+            // to plain QTIP. (The real collect path keeps the long prefix; both
+            // sides agree there.)
+            Self::Qwen35 { weights, .. } => qwen35::build_capture_names(weights)
+                .into_iter()
+                .map(|(ptr, name)| {
+                    let short = name
+                        .strip_prefix("model.language_model.")
+                        .map(|rest| format!("model.{rest}"))
+                        .unwrap_or(name);
+                    (ptr, short)
+                })
+                .collect(),
             Self::Qwen2 { weights, .. } => {
                 let mut m = HashMap::new();
                 let mut put = |w: &WeightTensor, n: String| {
