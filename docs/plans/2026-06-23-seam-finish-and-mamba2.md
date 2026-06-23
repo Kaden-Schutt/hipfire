@@ -90,6 +90,15 @@ infrastructure rather than two more special cases. The existing qwen35 hybrid
    `enum Mixer { FullAttn, Swa, ShortConv, DeltaNet, Mamba2 }` + per-layer
    heterogeneous state with a **no-KV path**. The design keystone. Validate
    against the existing qwen35 FA+DeltaNet hybrid.
+   - **P2a ✅ (taxonomy keystone landed).** New `hipfire-mixer` crate — pure,
+     GPU-free `MixerKind` + `MixerProfile` with `needs_kv_cache()` (the no-KV
+     detector that replaces `is_qwen35_family_arch_id`), `is_hybrid()`, per-kind
+     counts. 4 unit tests (pure-SSM/pure-attn/qwen35-hybrid) pass in the no-GPU
+     subset. Buffer layouts deliberately unpinned — migration reuses existing
+     `KvCache`/`DeltaNetState` allocations.
+   - **P2b (next).** Build the `MixerLayerState` buffer model on the taxonomy and
+     wire serving-core's KV-allocation + `is_qwen35_family_arch_id` branches to
+     query `MixerProfile` instead. Touches the serving layer → coherence-gated.
 3. **P3 — wire the daemon to the seam + migrate the dense archs.** Resolve the
    daemon-wiring decision point via the **full-collapse** route (goal is
    organization, not a quick ship): thread the daemon sampler/sessions/streaming

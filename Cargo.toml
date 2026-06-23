@@ -27,6 +27,7 @@ members = [
     "crates/hipfire-runtime",
     "crates/hipfire-scheduler",
     "crates/hipfire-state",
+    "crates/hipfire-mixer",
     "crates/hipfire-arch-qwen35",
     "crates/hipfire-arch-qwen35-vl",
     "crates/hipfire-arch-llama",
