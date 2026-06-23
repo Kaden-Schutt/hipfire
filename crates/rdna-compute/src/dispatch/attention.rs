@@ -5204,30 +5204,6 @@ impl Gpu {
         // bind_thread: skip — unimplemented stub (no GPU work; returns Err)
         Err(hip_bridge::HipError::new(801, "not yet implemented"))
     }
-    #[allow(clippy::too_many_arguments)]
-    pub fn attention_flash_asym4_wmma_tile_batched_gfx12(
-        &mut self,
-        _q: &GpuTensor,
-        _k_cache: &GpuTensor,
-        _v_cache: &GpuTensor,
-        _out: &GpuTensor,
-        _positions: &GpuTensor,
-        _ct: &GpuTensor,
-        _st: &GpuTensor,
-        _n_heads: usize,
-        _n_kv_heads: usize,
-        _head_dim: usize,
-        _physical_cap: usize,
-        _max_ctx_len: usize,
-        _batch_size: usize,
-        _partials: &GpuTensor,
-        _tree_bias: Option<&GpuTensor>,
-        _block_start: usize,
-        _block_cols: usize,
-    ) -> HipResult<()> {
-        // bind_thread: skip — unimplemented stub (no GPU work; returns Err)
-        Err(hip_bridge::HipError::new(801, "not yet implemented"))
-    }
     /// Cold-slot decode attention (deferred-hierarchical KV, Phase 2b): one query
     /// `q` [n_heads × 256] over the compacted cold tier `k`/`v`
     /// [n_kv_heads × n_slots × 256] (dequantized f32, all slots visible, GQA) →

@@ -35,6 +35,7 @@ mod kv;
 mod misc;
 mod moe;
 mod norm;
+mod overlays;
 mod quant;
 mod rocblas;
 mod rope;
