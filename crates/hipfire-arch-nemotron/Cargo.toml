@@ -1,0 +1,11 @@
+[package]
+name = "hipfire-arch-nemotron"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "nemotron_h architecture (Mamba-2 + attention + MLP hybrid) for hipfire — config + block taxonomy (N0)"
+
+[dependencies]
+hipfire-mixer = { path = "../hipfire-mixer" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

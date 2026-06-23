@@ -1313,6 +1313,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-nemotron"
+version = "0.2.1"
+dependencies = [
+ "hipfire-mixer",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-qwen2"
 version = "0.2.1"
 dependencies = [

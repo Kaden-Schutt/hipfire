@@ -39,6 +39,7 @@ members = [
     "crates/hipfire-arch-lfm2moe",
     "crates/hipfire-arch-minimax",
     "crates/hipfire-arch-dots-ocr",
+    "crates/hipfire-arch-nemotron",
     "crates/hipfire-quantize",
     "crates/hipfire-kvquant",
     "crates/hipfire-detect",
