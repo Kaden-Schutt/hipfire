@@ -317,6 +317,31 @@ fn kld_metrics(
 pub(crate) fn tiny_quant_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
     let gpu_arch = ctx.arch.clone().unwrap_or_else(|| "unknown".to_string());
     let record = std::env::var("HIPFIRE_TINYQUANT_RECORD").ok().as_deref() == Some("1");
+    // Optional comma-separated family allowlist (`HIPFIRE_TINYQUANT_FAMILIES`).
+    // Lets a host run a subset — e.g. skip a family whose kernels fault on a
+    // specific arch (minimax topk GPU-faults on gfx1151) so the rest still
+    // record. Empty/unset ⇒ all families. Excluded families are logged, not
+    // silently dropped.
+    let only: Option<Vec<String>> = std::env::var("HIPFIRE_TINYQUANT_FAMILIES").ok().map(|s| {
+        s.split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
+    });
+    if let Some(ref allow) = only {
+        let skipped: Vec<&str> = families()
+            .iter()
+            .map(|p| p.arch)
+            .filter(|a| !allow.iter().any(|x| x == a))
+            .collect();
+        if !skipped.is_empty() {
+            eprintln!(
+                "tiny_quant: HIPFIRE_TINYQUANT_FAMILIES={} → skipping {}",
+                allow.join(","),
+                skipped.join(",")
+            );
+        }
+    }
     let mut rows = Vec::new();
 
     let (Some(quant), Some(probe)) = (resolve_quantize_bin(), resolve_probe_bin()) else {
@@ -365,6 +390,11 @@ pub(crate) fn tiny_quant_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<Eva
 
     for plan in families() {
         let fam = plan.arch;
+        if let Some(ref allow) = only {
+            if !allow.iter().any(|x| x == fam) {
+                continue;
+            }
+        }
         let dir = work.join(fam);
         // ── emit ──
         let emit = Command::new(&quant)
