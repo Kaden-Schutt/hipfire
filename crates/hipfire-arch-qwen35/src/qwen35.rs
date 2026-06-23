@@ -1625,6 +1625,30 @@ impl DeltaNetState {
     }
 }
 
+/// Plug `DeltaNetState` into the neutral family-seam state container
+/// (`hipfire_runtime::sequence_state`). The serving layer holds the recurrent
+/// state as `Box<dyn RecurrentMixerState>` inside a `SequenceState`, and
+/// recovers the concrete `&DeltaNetState` for its monomorphized hot path via
+/// `SequenceState::recurrent_as::<DeltaNetState>()` — no per-token dyn cost.
+/// See docs/plans/2026-06-23-seam-finish-and-mamba2.md (P2c, Slice 1).
+impl hipfire_runtime::sequence_state::RecurrentMixerState for DeltaNetState {
+    fn reset(&mut self, gpu: &mut Gpu) -> HipResult<()> {
+        // The inherent `reset` zeros every recurrent buffer (s_matrices /
+        // s_scales / conv_states / s_ef_residual) and swallows memset errors,
+        // so it is infallible — always report Ok.
+        DeltaNetState::reset(self, gpu);
+        Ok(())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
 // ─── Weight loading ─────────────────────────────────────────────────────
 
 fn qwen35_tensor_name_candidates(name: &str) -> Vec<String> {
