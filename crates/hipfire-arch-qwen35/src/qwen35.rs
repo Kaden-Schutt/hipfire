@@ -23987,10 +23987,10 @@ fn forward_scratch_layers(
                     )?;
                 }
 
-                // Phase-A block-local recovery capture: pre-MLP residual (x_mid)
-                // = post-mixer residual feeding ffn_norm. Pairs with the "pertoken"
-                // (block-output) dump at the loop tail to isolate the MLP for
-                // norm-recovery without running the DeltaNet mixer in the trainer.
+                // Phase-A norm-recovery capture: the FFN-norm INPUT (what gate_up
+                // normalizes). The trainer recomputes the bf16 FFN output from this
+                // (so no FFN-output capture is needed — avoids the attention-residual
+                // contamination that the residual-difference targets had).
                 dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "premlp");
                 // ── FFN ──
                 gate_up_via_execute_steps(
@@ -24274,11 +24274,6 @@ fn forward_scratch_layers(
                         hidden_row_bytes,
                     )?;
                 }
-                // Phase-A capture: pre-FFN residual (= x_in + attn_out). With the
-                // block-output "pertoken" dump, ffn_out = pertoken − preffn isolates
-                // the FFN contribution (this is a parallel block: gate/up read
-                // ffn_norm(x_in) BEFORE the attn wo-residual add).
-                dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "preffn");
                 weight_gemv_swiglu_residual_bf16_probe(
                     gpu,
                     layer_idx,
@@ -24289,10 +24284,6 @@ fn forward_scratch_layers(
                     &s.ffn_hidden,
                     &s.x,
                 )?;
-                // Phase-A capture: s.x right after the FFN swiglu-residual. With
-                // premlp (= gate_up norm input), ffn_out = ffnout − premlp isolates
-                // the FFN contribution at its exact boundary, uniformly across arms.
-                dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "ffnout");
                 // RoughQuant residual-writer correction (DeltaNet mlp.down_proj).
                 // w_down's logical input is silu(gate)*up in ORIGINAL frame (the
                 // fused kernel rotates internally), so recompute it explicitly.
@@ -25232,8 +25223,6 @@ fn forward_scratch_layers(
                     config.dim,
                     &[(RqProj::Wgate, &s.gate_ffn), (RqProj::Wup, &s.up)],
                 )?;
-                // Phase-A capture: pre-FFN residual (x_in + attn_out) — see DeltaNet arm.
-                dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "preffn");
                 // Fused SwiGLU + w_down residual GEMV:
                 //   MQ4: fused_silu_rotate(gate,up) + gemv_residual(w_down, rotated, x)
                 //   HF4: silu_mul + weight_gemv_residual (unchanged)
@@ -25247,8 +25236,6 @@ fn forward_scratch_layers(
                     &s.ffn_hidden,
                     &s.x,
                 )?;
-                // Phase-A capture: s.x right after the FFN swiglu-residual (see DeltaNet arm).
-                dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "ffnout");
                 // RoughQuant residual-writer correction (FullAttn mlp.down_proj).
                 if let Some(c) = weights
                     .rq_corrections

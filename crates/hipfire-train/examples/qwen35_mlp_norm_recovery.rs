@@ -158,35 +158,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // OQ+ sim-quant the projections (frozen student weights). HIPFIRE_NO_QUANT=1
-        // skips quant → start MSE should be ~0 (forward-fidelity sanity check).
-        let q = |w: &[f32]| if std::env::var("HIPFIRE_NO_QUANT").as_deref() == Ok("1") {
-            w.to_vec()
-        } else {
-            oqplus_simquant(w)
-        };
-        let w_gate = gpu.upload_f32(&q(&w_gate_h), &[inter, dim])?;
-        let w_up = gpu.upload_f32(&q(&w_up_h), &[inter, dim])?;
-        let w_down = gpu.upload_f32(&q(&w_down_h), &[dim, inter])?;
-
-        // Captured residuals. This is a PARALLEL block: gate/up read ffn_norm(x_in)
-        // where x_in = premlp (pre-attn). The FFN contribution the model added is
-        //   ffn_target = pertoken − preffn   (preffn = x_in + attn_out).
-        // Student reconstructs it: down(swiglu(gate(norm_γ(x_in)), up(norm_γ(x_in)))).
-        // FFN contribution = ffnout − preffn (both straddle the swiglu-residual),
-        // which isolates exactly what the FFN added — uniform across DeltaNet
-        // (parallel block: gate_up reads pre-attn x) and FullAttn (sequential),
-        // NO per-layer special-casing. Norm input = premlp (= what gate_up norms).
+        // Only the FFN INPUT (premlp = what gate_up norms) is taken from the daemon
+        // capture — verified bit-exact (norm + gate outputs match the model). The
+        // teacher FFN output is computed IN THE TRAINER from bf16 weights, so it is
+        // correct for EVERY layer (no dependence on residual-difference captures,
+        // which are contaminated by the attention add for the first few layers).
         let (xin_h, rows) = read_cap(&cap_dir, "premlp", i, dim)?;
-        let (preffn_h, r2) = read_cap(&cap_dir, "preffn", i, dim)?;
-        let (ffnout_h, r3) = read_cap(&cap_dir, "ffnout", i, dim)?;
-        if rows != r2 || rows != r3 {
-            return Err(format!("L{i}: row mismatch premlp {rows} preffn {r2} ffnout {r3}").into());
-        }
-        let ffn_target_h: Vec<f32> = ffnout_h.iter().zip(&preffn_h).map(|(o, p)| o - p).collect();
         let x_in = gpu.upload_f32(&xin_h, &[rows * dim])?;
 
-        // Trainable γ.
+        // Trainable γ (init = bf16 norm, with (1+γ) already folded above).
         let gamma = gpu.upload_f32(&gamma_h, &[dim])?;
         let mut opt = AdamW::new(&mut gpu, &[dim], lr, 0.9, 0.999, 1e-8, 0.0)?;
 
@@ -203,27 +183,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let d_yn = gpu.zeros(&[rows * dim], DType::F32)?;
         let d_xmid_unused = gpu.zeros(&[rows * dim], DType::F32)?;
 
-        // forward: predicted FFN contribution = down(swiglu(gate(norm(x_in)), up(...)))
-        let fwd_ffn = |gpu: &mut Gpu| -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        // FFN forward parameterized by weights: down(swiglu(gate(norm_γ(x_in)),up)).
+        let run_fwd = |gpu: &mut Gpu, wg: &rdna_compute::GpuTensor, wu: &rdna_compute::GpuTensor, wd: &rdna_compute::GpuTensor|
+         -> Result<Vec<f32>, Box<dyn std::error::Error>> {
             rmsnorm_forward(gpu, &x_in, &gamma, &yn, &rinv, rows, dim, eps)?;
-            linear_forward(gpu, &yn, &w_gate, &g, rows, dim, inter)?;
-            linear_forward(gpu, &yn, &w_up, &u, rows, dim, inter)?;
+            linear_forward(gpu, &yn, wg, &g, rows, dim, inter)?;
+            linear_forward(gpu, &yn, wu, &u, rows, dim, inter)?;
             swiglu_forward(gpu, &g, &u, &act, rows * inter)?;
-            linear_forward(gpu, &act, &w_down, &mlp, rows, inter, dim)?;
-            gpu.download_f32(&mlp)
-                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+            linear_forward(gpu, &act, wd, &mlp, rows, inter, dim)?;
+            gpu.download_f32(&mlp).map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
         };
 
-        // Diagnostic: reconstruction fidelity + norm-weight stats per layer.
+        // Teacher target = bf16 FFN output (computed here, not captured).
+        let wg_bf = gpu.upload_f32(&w_gate_h, &[inter, dim])?;
+        let wu_bf = gpu.upload_f32(&w_up_h, &[inter, dim])?;
+        let wd_bf = gpu.upload_f32(&w_down_h, &[dim, inter])?;
+        let ffn_target_h = run_fwd(&mut gpu, &wg_bf, &wu_bf, &wd_bf)?;
+        for t in [wg_bf, wu_bf, wd_bf] { gpu.free_tensor(t)?; }
+
+        // Student weights = OQ+ sim-quant (HIPFIRE_NO_QUANT=1 → identity sanity check).
+        let q = |w: &[f32]| if std::env::var("HIPFIRE_NO_QUANT").as_deref() == Ok("1") {
+            w.to_vec()
+        } else {
+            oqplus_simquant(w)
+        };
+        let w_gate = gpu.upload_f32(&q(&w_gate_h), &[inter, dim])?;
+        let w_up = gpu.upload_f32(&q(&w_up_h), &[inter, dim])?;
+        let w_down = gpu.upload_f32(&q(&w_down_h), &[dim, inter])?;
+
+        let fwd_ffn = |gpu: &mut Gpu| -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+            run_fwd(gpu, &w_gate, &w_up, &w_down)
+        };
+
+        // Diagnostic: quant-vs-bf16 fidelity per layer (target is the bf16 FFN).
         if std::env::var("HIPFIRE_DIAG").as_deref() == Ok("1") {
             let pred = fwd_ffn(&mut gpu)?;
-            let rms = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
             let e = ffn_target_h.iter().map(|v| v * v).sum::<f32>() / ffn_target_h.len() as f32;
-            // gamma_h here already has +1 folded if HIPFIRE_NORM_PLUS1=1.
+            let cos = {
+                let dot: f32 = pred.iter().zip(&ffn_target_h).map(|(a, b)| a * b).sum();
+                let na = pred.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let nb = ffn_target_h.iter().map(|x| x * x).sum::<f32>().sqrt();
+                dot / (na * nb).max(1e-12)
+            };
             println!(
-                "  DIAG L{i:2}: rel={:.3}  rms x_in={:.3} γ={:.3} pred={:.3} ffn_out={:.3}",
-                mse(&pred, &ffn_target_h) / e.max(1e-12),
-                rms(&xin_h), rms(&gamma_h), rms(&pred), rms(&ffn_target_h)
+                "  DIAG L{i:2}: rel={:.4} cos={:.4}  rows={rows}",
+                mse(&pred, &ffn_target_h) / e.max(1e-12), cos
             );
         }
         let start_mse = mse(&fwd_ffn(&mut gpu)?, &ffn_target_h);
