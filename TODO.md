@@ -160,6 +160,34 @@ Status: deferred.
 
 ## further investigate using packed 4 bit operations on gfx1151/RDNA3/RDNA3.5
 
+## Family-seam state-container unification (P2c) follow-ups (2026-06-23)
+
+Plan: `docs/plans/2026-06-23-seam-finish-and-mamba2.md`. P2c unified the qwen35
+per-decode state (KV cache + DeltaNet recurrent state) into one
+`hipfire_runtime::sequence_state::SequenceState` container on both
+`Qwen35RequestSessionState` (Slice 2, `0d32f82d7`) and `LoadedModel` (Slice 3a,
+`d2681ebb5`). Two items were deliberately deferred:
+
+- **Slice 3b — migrate the spec-decode `ModelSlot` to `SequenceState`.** The
+  transient `ModelSlot` (`hipfire-arch-qwen35::speculative`) still holds its own
+  separate `kv_cache: KvCache` + `dn_state: DeltaNetState` fields; it's built from
+  / torn back into the model via `take_qwen35_state_from_model` /
+  `put_qwen35_state_into_model`. This is arch-internal (does not block the no-KV
+  path or Mamba-2), so it was left as-is. Migrating it would remove the last
+  separate kv/dn pair and let the take/put helpers move a whole `SequenceState`.
+  Optional cleanup.
+
+- **Tighten the pre-commit hook's forward/kernel relevance globs.** Slice 3a
+  touched the canonical + DFlash *serving* path (`hipfire-serving-core`
+  `generate.rs`/`session.rs`/`load.rs`/`qwen35_prefill.rs`, `hipfire-daemon`
+  `main.rs`) but the `.githooks/pre-commit` relevance check ran **lint only** — it
+  did NOT trigger the coherence-gate-dflash + MQ4 speed gate (Slice 1's
+  `qwen35.rs` change DID). The serving-path files that drive prefill/decode/
+  spec-decode dispatch should be in the hook's forward/kernel glob set so a
+  serving-layer change auto-triggers coherence validation instead of relying on a
+  manual gate run. (Slice 3a was validated by running
+  `./tests/coherence-gate-dflash.sh` by hand — all 4 cells OK.)
+
 ## DeltaNet state precision (follow-ups to Phase A gate, 2026-06-15)
 
 Phase A made the DeltaNet recurrent state default to **FP32** for all
