@@ -599,18 +599,31 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
         // dispatch_ref → run_auto → GemvOq8G256Prerotated in the gemv registry;
         // generate and other direct weight_gemv callers hit this arm.
         DType::Oq8G256 => {
+            // B=1 decode GEMV. Uses PERSISTENT oq8 scratch (no per-call alloc/leak)
+            // and the one-wave-per-row gemv_oq8_grouped (no WMMA N-tile waste at B=1),
+            // matching the execute_steps fused-decode path. (Previously alloc'd xq/xs
+            // each call without freeing — a per-token leak — and ran gemm_oq8 at B=1.)
             const GROUP: usize = 256;
             assert_eq!(w.k % GROUP, 0, "Oq8G256 weight_gemv: K must be % 256");
             let ng = w.k / GROUP;
             gpu.ensure_mq_signs()?;
-            gpu.ensure_oq4_scratch()?;
+            gpu.ensure_oq4_scratch()?; // oq4_xr = rotate target
+            gpu.ensure_oq8_scratch()?; // persistent int8 act + scales
             let xr = xr!();
             rotate_x_mq_for(gpu, w, x, &xr, w.k)?;
-            let xq = gpu.alloc_tensor(&[w.k], DType::Raw)?;
-            let xs = gpu.alloc_tensor(&[ng], DType::F32)?;
+            let xq = GpuTensor {
+                buf: unsafe { gpu.oq8_xq.as_ref().unwrap().buf.alias() },
+                shape: vec![w.k],
+                dtype: DType::Raw,
+            };
+            let xs = GpuTensor {
+                buf: unsafe { gpu.oq8_xs.as_ref().unwrap().buf.alias() },
+                shape: vec![ng],
+                dtype: DType::F32,
+            };
             gpu.quantize_act_oq8(&xr, &xq, &xs, 1, w.k, GROUP)?;
             let ws = w.buf.sub_offset(w.m * w.k, w.m * ng * 4);
-            gpu.gemm_oq8_grouped_wmma(&w.buf, &ws, &xq, &xs, y, w.m, w.k, 1, GROUP)
+            gpu.gemv_oq8_grouped(&w.buf, &ws, &xq, &xs, y, w.m, w.k, GROUP)
         }
         // All other FWHT-requiring dtypes (MQ4G256, MQ6G256, MQ3G256, MQ2G256,
         // MQ2G256Lloyd, MQ3G256Lloyd, MQ4G256Lloyd, MFP4G32):
