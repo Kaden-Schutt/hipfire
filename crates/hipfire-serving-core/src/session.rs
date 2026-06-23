@@ -27,6 +27,7 @@ use hipfire_model::{
     AcceleratorInventory, ModelWorkerId,
 };
 use hipfire_runtime::kv;
+use hipfire_runtime::sequence_state::SequenceState;
 use hipfire_state::{
     describe_sequence_state_descriptors, model_worker_runtime_view_json,
     parsed_handle_may_target_loaded_state, qwen35_sequence_state_handle,
@@ -63,14 +64,46 @@ pub struct Qwen35RequestSessionState {
     pub seq_pos: usize,
     pub conversation_tokens: Vec<u32>,
     pub prefix_hash: Option<SequenceStatePrefixHash>,
-    pub kv_cache: kv::KvCache,
-    pub dn_state: DeltaNetState,
+    /// Unified per-sequence decode state (KV cache + DeltaNet recurrent state),
+    /// keyed by the qwen35 hybrid MixerProfile. P2c: replaces the former separate
+    /// `kv_cache: KvCache` + `dn_state: DeltaNetState` fields. Simple read sites
+    /// use the `kv_cache()`/`dn_state()` accessors; disjoint-borrow hot-path
+    /// sites access `sequence_state.kv` / `sequence_state.recurrent` directly.
+    pub sequence_state: SequenceState,
     pub logits: rdna_compute::GpuTensor,
     pub prefilled_generated_suffix_len: usize,
     pub allocation_epoch: u64,
 }
 
 impl Qwen35RequestSessionState {
+    /// The session's KV cache (a qwen35 session always has one). For single
+    /// reads/mutations; sites needing KV **and** DeltaNet simultaneously must
+    /// use the disjoint `sequence_state.kv` / `sequence_state.recurrent` fields
+    /// directly (a method borrows all of `self`).
+    pub fn kv_cache(&self) -> &kv::KvCache {
+        self.sequence_state
+            .kv()
+            .expect("qwen35 session always has KV")
+    }
+    /// Mutable KV cache (single-access only — see [`Self::kv_cache`]).
+    pub fn kv_cache_mut(&mut self) -> &mut kv::KvCache {
+        self.sequence_state
+            .kv_mut()
+            .expect("qwen35 session always has KV")
+    }
+    /// The session's DeltaNet recurrent state (concrete downcast).
+    pub fn dn_state(&self) -> &DeltaNetState {
+        self.sequence_state
+            .recurrent_as::<DeltaNetState>()
+            .expect("qwen35 session recurrent state is DeltaNetState")
+    }
+    /// Mutable DeltaNet recurrent state (single-access only).
+    pub fn dn_state_mut(&mut self) -> &mut DeltaNetState {
+        self.sequence_state
+            .recurrent_as_mut::<DeltaNetState>()
+            .expect("qwen35 session recurrent state is DeltaNetState")
+    }
+
     /// Deep-copy one GPU tensor (fresh device allocation + device-to-device
     /// copy) — used to snapshot session state without aliasing the live buffers.
     pub fn clone_gpu_tensor(
@@ -173,12 +206,17 @@ impl Qwen35RequestSessionState {
         gpu: &mut rdna_compute::Gpu,
         source: &Qwen35RequestSessionState,
     ) -> Result<Self, String> {
+        let kv = Self::clone_kv_cache(gpu, source.kv_cache())?;
+        let dn = Self::clone_dn_state(gpu, source.dn_state())?;
         Ok(Self {
             seq_pos: source.seq_pos,
             conversation_tokens: source.conversation_tokens.clone(),
             prefix_hash: source.prefix_hash.clone(),
-            kv_cache: Self::clone_kv_cache(gpu, &source.kv_cache)?,
-            dn_state: Self::clone_dn_state(gpu, &source.dn_state)?,
+            sequence_state: SequenceState::new(
+                source.sequence_state.profile.clone(),
+                Some(kv),
+                Some(Box::new(dn)),
+            ),
             logits: Self::clone_gpu_tensor(gpu, &source.logits, "logits")?,
             prefilled_generated_suffix_len: source.prefilled_generated_suffix_len,
             allocation_epoch: next_qwen35_state_allocation_epoch(),
@@ -207,12 +245,19 @@ impl Qwen35RequestSessionState {
             .map_err(|e| format!("alloc qwen35 session logits snapshot: {e:?}"))?;
         gpu.memcpy_dtod_auto(&logits.buf, &scratch.logits.buf, scratch.logits.buf.size())
             .map_err(|e| format!("save qwen35 session logits snapshot: {e:?}"))?;
+        let profile = qwen35_mixer_profile(
+            &m.q35_config
+                .as_ref()
+                .ok_or_else(|| "qwen35 session missing config".to_string())?
+                .layer_types,
+        );
+        let kv = m.kv_cache.take().unwrap();
+        let dn = m.dn_state.take().unwrap();
         Ok(Self {
             seq_pos: m.seq_pos,
             conversation_tokens: std::mem::take(&mut m.conversation_tokens),
             prefix_hash: None,
-            kv_cache: m.kv_cache.take().unwrap(),
-            dn_state: m.dn_state.take().unwrap(),
+            sequence_state: SequenceState::new(profile, Some(kv), Some(Box::new(dn))),
             logits,
             prefilled_generated_suffix_len: m.q35_active_prefilled_generated_suffix_len,
             allocation_epoch: next_qwen35_state_allocation_epoch(),
@@ -241,8 +286,7 @@ impl Qwen35RequestSessionState {
         // Prefix hash metadata is kept with saved Qwen35 request sessions.
         // The loaded singleton path computes it when checkpointable prefill
         // sessions are saved back into the session map.
-        m.kv_cache = Some(self.kv_cache);
-        m.dn_state = Some(self.dn_state);
+        restore_sequence_state_into_model(m, self.sequence_state);
         m.q35_active_state_allocation_epoch = allocation_epoch;
         m.q35_active_prefilled_generated_suffix_len = self.prefilled_generated_suffix_len;
         Ok(())
@@ -253,17 +297,30 @@ impl Qwen35RequestSessionState {
         self.conversation_tokens.clear();
         self.prefix_hash = None;
         self.prefilled_generated_suffix_len = 0;
-        for s in &self.dn_state.s_matrices {
+        for s in &self.dn_state().s_matrices {
             let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
         }
-        for s in &self.dn_state.s_scales {
+        for s in &self.dn_state().s_scales {
             let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
         }
-        for s in &self.dn_state.conv_states {
+        for s in &self.dn_state().conv_states {
             let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
         }
-        self.kv_cache.compact_offset = 0;
+        self.kv_cache_mut().compact_offset = 0;
     }
+}
+
+/// Transitional bridge: move a session's unified `SequenceState` back into the
+/// LoadedModel's still-separate `kv_cache`/`dn_state` Option fields (those are
+/// unified later, at which point this collapses to a single move).
+pub(crate) fn restore_sequence_state_into_model(m: &mut LoadedModel, ss: SequenceState) {
+    let (kv, recurrent) = ss.into_parts();
+    m.kv_cache = kv;
+    m.dn_state = recurrent.map(|r| {
+        *r.into_any()
+            .downcast::<DeltaNetState>()
+            .expect("qwen35 session recurrent state is DeltaNetState")
+    });
 }
 
 pub fn qwen35_session_resident(m: &LoadedModel, session_id: &str) -> bool {
@@ -292,16 +349,16 @@ pub fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDe
         if session_id == QWEN35_LEGACY_SESSION_ID {
             return;
         }
-        let logical_position = session.seq_pos + session.kv_cache.compact_offset;
+        let logical_position = session.seq_pos + session.kv_cache().compact_offset;
         let handle = qwen35_sequence_state_handle(session_id, session.allocation_epoch);
         let owns_pages = session.allocation_epoch != 0;
         let kv_bytes = session
-            .kv_cache
+            .kv_cache()
             .k_gpu
             .iter()
-            .chain(session.kv_cache.v_gpu.iter())
-            .chain(session.kv_cache.k_scales.iter())
-            .chain(session.kv_cache.v_scales.iter())
+            .chain(session.kv_cache().v_gpu.iter())
+            .chain(session.kv_cache().k_scales.iter())
+            .chain(session.kv_cache().v_scales.iter())
             .map(|tensor| tensor.buf.size())
             .sum::<usize>();
         descriptors.push(SequenceStatePageDescriptor {
@@ -314,20 +371,20 @@ pub fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDe
             allocation_epoch: session.allocation_epoch,
             owns_pages,
             shape: vec![
-                session.kv_cache.k_gpu.len(),
-                session.kv_cache.physical_cap,
-                session.kv_cache.n_kv_heads,
-                session.kv_cache.head_dim,
+                session.kv_cache().k_gpu.len(),
+                session.kv_cache().physical_cap,
+                session.kv_cache().n_kv_heads,
+                session.kv_cache().head_dim,
             ],
             placement: placement.clone(),
             role: role.to_string(),
         });
         let dn_bytes = session
-            .dn_state
+            .dn_state()
             .s_matrices
             .iter()
-            .chain(session.dn_state.s_scales.iter())
-            .chain(session.dn_state.conv_states.iter())
+            .chain(session.dn_state().s_scales.iter())
+            .chain(session.dn_state().conv_states.iter())
             .map(|tensor| tensor.buf.size())
             .sum::<usize>();
         descriptors.push(SequenceStatePageDescriptor {
@@ -340,9 +397,9 @@ pub fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDe
             allocation_epoch: session.allocation_epoch,
             owns_pages,
             shape: vec![
-                session.dn_state.s_matrices.len(),
-                session.dn_state.s_scales.len(),
-                session.dn_state.conv_states.len(),
+                session.dn_state().s_matrices.len(),
+                session.dn_state().s_scales.len(),
+                session.dn_state().conv_states.len(),
             ],
             placement: placement.clone(),
             role: role.to_string(),
@@ -995,12 +1052,16 @@ pub fn qwen35_allocate_session_state(
     })?;
     let dn_state = DeltaNetState::new_with_quant(gpu, config, dn_quant)
         .map_err(|e| format!("DeltaNetState::new_with_quant: {e:?}"))?;
+    let sequence_state = SequenceState::new(
+        qwen35_mixer_profile(&config.layer_types),
+        Some(kv_cache),
+        Some(Box::new(dn_state)),
+    );
     Ok(Qwen35RequestSessionState {
         seq_pos: 0,
         conversation_tokens: Vec::new(),
         prefix_hash: None,
-        kv_cache,
-        dn_state,
+        sequence_state,
         logits: gpu
             .alloc_tensor(&[config.vocab_size], rdna_compute::DType::F32)
             .map_err(|e| format!("alloc qwen35 session logits snapshot: {e:?}"))?,
@@ -1103,7 +1164,7 @@ pub fn qwen35_checkpoint_session_state(
             .q35_sessions
             .get(request.source_session_id)
             .expect("source residency was validated");
-        let logical_position = source.seq_pos + source.kv_cache.compact_offset;
+        let logical_position = source.seq_pos + source.kv_cache().compact_offset;
         validate_checkpoint_logical_position(
             request.source_session_id,
             request.expected_logical_position,

@@ -63,6 +63,10 @@ pub trait RecurrentMixerState: Send {
     fn as_any(&self) -> &dyn std::any::Any;
     /// Mutable downcast hook.
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+    /// Owning downcast hook: recover the concrete recurrent state by value, e.g.
+    /// `*state.into_any().downcast::<DeltaNetState>().unwrap()`. Used by the
+    /// transitional [`SequenceState::into_parts`] swap bridge.
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any>;
 }
 
 /// The unified per-sequence decode state for one loaded model.
@@ -138,6 +142,14 @@ impl SequenceState {
         }
         Ok(())
     }
+
+    /// Consume the container into its raw `(kv, recurrent)` parts. Transitional
+    /// bridge for the staged migration: the still-separate `LoadedModel`
+    /// `kv_cache`/`dn_state` fields are fed from these until that side is unified
+    /// too (Slice 3 / P6), at which point this collapses to a single move.
+    pub fn into_parts(self) -> (Option<KvCache>, Option<Box<dyn RecurrentMixerState>>) {
+        (self.kv, self.recurrent)
+    }
 }
 
 #[cfg(test)]
@@ -159,6 +171,9 @@ mod tests {
             self
         }
         fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
             self
         }
     }

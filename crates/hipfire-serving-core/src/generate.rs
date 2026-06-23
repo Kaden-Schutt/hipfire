@@ -2085,11 +2085,7 @@ pub fn generate(
     // paths (DFlash, MTP) batch-prefill the prompt and would bypass it, leaving the
     // KVarN window/records (and hier hot ring) unpopulated → garbage. Route kvarn
     // models to the plain AR path below (per-token forward_scratch prefill+decode).
-    let kvarn_active = m
-        .kv_cache
-        .as_ref()
-        .map(|c| c.quant_kvarn)
-        .unwrap_or(false);
+    let kvarn_active = m.kv_cache.as_ref().map(|c| c.quant_kvarn).unwrap_or(false);
     if m.dflash.is_some()
         && !kvarn_active
         && temp <= 1e-6
@@ -2541,7 +2537,7 @@ pub fn generate(
         new_tokens.len()
     };
     let absolute_pos = if let Some(session) = q35_session.as_ref() {
-        session.seq_pos + session.kv_cache.compact_offset
+        session.seq_pos + session.kv_cache().compact_offset
     } else {
         m.seq_pos + m.llama_kv.as_ref().map(|kv| kv.compact_offset).unwrap_or(0)
     };
@@ -2603,7 +2599,7 @@ pub fn generate(
         // continuing from session.seq_pos (KV cache + DeltaNet state are cumulative)
         let mut session = q35_session.take().expect("qwen35 request session state");
         if prefill_already_done {
-            let current_position = session.seq_pos + session.kv_cache.compact_offset;
+            let current_position = session.seq_pos + session.kv_cache().compact_offset;
             let expected_position = prefilled_prompt_tokens.unwrap_or(new_tokens.len());
             if current_position != expected_position {
                 write_error(
@@ -2622,8 +2618,21 @@ pub fn generate(
         let config = m.q35_config.as_ref().unwrap();
         let weights = m.q35_weights.as_ref().unwrap();
         let scratch = m.q35_scratch.as_ref().unwrap();
-        let kv = &mut session.kv_cache;
-        let dn = &mut session.dn_state;
+        // Disjoint field-path borrow: kv and dn are distinct fields of
+        // session.sequence_state, so both &mut live simultaneously.
+        let kv = session
+            .sequence_state
+            .kv
+            .as_mut()
+            .expect("qwen35 session always has KV");
+        let dn = session
+            .sequence_state
+            .recurrent
+            .as_mut()
+            .expect("qwen35 session has DeltaNet state")
+            .as_any_mut()
+            .downcast_mut::<qwen35::DeltaNetState>()
+            .expect("qwen35 session recurrent state is DeltaNetState");
         let moe_router_histogram = DaemonMoeRouterHistogramGuard::start(evidence_dir, config);
 
         // Prefill this turn's tokens via the batched prefill entry point.
@@ -2672,8 +2681,17 @@ pub fn generate(
                 // proven coherent for kvarn/hier (infer_qwen35). Slower prefill, but
                 // kvarn is a KV-memory mode, not a throughput one.
                 for &tok in &new_tokens {
-                    qwen35::forward_scratch(gpu, weights, config, tok, session.seq_pos, kv, dn, scratch)
-                        .unwrap();
+                    qwen35::forward_scratch(
+                        gpu,
+                        weights,
+                        config,
+                        tok,
+                        session.seq_pos,
+                        kv,
+                        dn,
+                        scratch,
+                    )
+                    .unwrap();
                     session.seq_pos += 1;
                 }
             } else if let Some(ref ev) = m.eviction {

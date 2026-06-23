@@ -130,11 +130,22 @@ infrastructure rather than two more special cases. The existing qwen35 hybrid
      - **Slice 0 ✅** `hipfire-runtime::sequence_state` — `RecurrentMixerState`
        trait + `SequenceState` container, GPU-free unit tests (pure-SSM no-KV
        shape, empty-profile, downcast). Additive, nothing migrated.
-     - **Slice 1** impl `RecurrentMixerState for DeltaNetState`.
-     - **Slice 2** construct `SequenceState` at qwen35 load, parallel + asserted.
-     - **Slice 3+** migrate access sites cluster-by-cluster (session-alloc →
-       prefill → decode → spec-decode), each coherence-gate-dflash + perf gated;
-       final cluster deletes the old `LoadedModel` fields (P6 overlap).
+     - **Slice 1 ✅** impl `RecurrentMixerState for DeltaNetState` (d18e61fd4,
+       passed coherence + MQ4 speed gate).
+     - **Slice 2 ✅** `Qwen35RequestSessionState` migrated to one `SequenceState`.
+       Approach decision: the qwen35 forward fns take *separate* `&mut KvCache,
+       &mut DeltaNetState`, so ~25 session call sites rely on simultaneous
+       disjoint mut-borrows. Option A (thread `&mut SequenceState` through ~30
+       forward/spec-step fns) was rejected as too deep; **option B (field-path
+       access)** chosen: simple reads use `kv_cache()`/`dn_state()` accessors,
+       disjoint hot-path sites use `state.sequence_state.kv` /
+       `.recurrent` directly (Rust tracks nested-field disjointness). Touches
+       session.rs + generate.rs + qwen35_decode.rs + qwen35_prefill.rs;
+       behavior-preserving; the `LoadedModel` side stays separate via an
+       `into_parts` swap bridge (collapsed in Slice 3).
+     - **Slice 3** collapse `LoadedModel` kv_cache/dn_state → `SequenceState`
+       (removes the bridge); migrate the spec-decode `ModelSlot` (its own
+       kv/dn). P6 overlap. Each coherence-gate-dflash + perf gated.
 3. **P3 — wire the daemon to the seam + migrate the dense archs.** Resolve the
    daemon-wiring decision point via the **full-collapse** route (goal is
    organization, not a quick ship): thread the daemon sampler/sessions/streaming

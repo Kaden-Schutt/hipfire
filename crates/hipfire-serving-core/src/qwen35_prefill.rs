@@ -183,8 +183,15 @@ pub fn qwen35_prefill_owned_session_serial_segment(
             config,
             token,
             state.seq_pos,
-            &mut state.kv_cache,
-            &mut state.dn_state,
+            state.sequence_state.kv.as_mut().expect("qwen35 session KV"),
+            state
+                .sequence_state
+                .recurrent
+                .as_mut()
+                .expect("qwen35 session dn")
+                .as_any_mut()
+                .downcast_mut::<qwen35::DeltaNetState>()
+                .expect("qwen35 session dn"),
             scratch,
         )
         .map_err(|e| format!("qwen35 serial boundary prefill segment failed: {e:?}"))?;
@@ -562,7 +569,7 @@ pub fn qwen35_prefill_suffix_batch(
                     session.id
                 )
             })?;
-            let logical_position = saved.seq_pos + saved.kv_cache.compact_offset;
+            let logical_position = saved.seq_pos + saved.kv_cache().compact_offset;
             let prefix_hash = compute_qwen35_prefix_hash(
                 m.arch_id,
                 m.q35_kv_mode.as_deref(),
@@ -647,7 +654,7 @@ pub fn emit_qwen35_owned_prefill_checkpoint(
     if qwen35_prefill_checkpoint_boundary_kind(hook).is_empty() {
         return Err("qwen35 prefill checkpoint boundary kind is empty".to_string());
     }
-    let logical_position = source.seq_pos + source.kv_cache.compact_offset;
+    let logical_position = source.seq_pos + source.kv_cache().compact_offset;
     if logical_position != hook.logical_position {
         return Err(format!(
             "qwen35 owned prefill checkpoint source {} logical_position mismatch: expected={} resident={}",
@@ -847,8 +854,15 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
                         (progress[idx] < end).then(|| qwen35::DensePrefillSessionBatchRow {
                             tokens: &prepared[idx].tokens[progress[idx]..end],
                             start_pos: state.seq_pos,
-                            kv_cache: &mut state.kv_cache,
-                            dn_state: &mut state.dn_state,
+                            kv_cache: state.sequence_state.kv.as_mut().expect("qwen35 session KV"),
+                            dn_state: state
+                                .sequence_state
+                                .recurrent
+                                .as_mut()
+                                .expect("qwen35 session dn")
+                                .as_any_mut()
+                                .downcast_mut::<qwen35::DeltaNetState>()
+                                .expect("qwen35 session dn"),
                             logits: &state.logits,
                         })
                     })
@@ -912,7 +926,7 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
         let mut sessions = Vec::with_capacity(owned_sessions.len());
         for (idx, (id, mut state)) in owned_sessions.into_iter().enumerate() {
             state.prefilled_generated_suffix_len = 0;
-            let logical_position = state.seq_pos + state.kv_cache.compact_offset;
+            let logical_position = state.seq_pos + state.kv_cache().compact_offset;
             let prefix_hash = compute_qwen35_prefix_hash(
                 m.arch_id,
                 m.q35_kv_mode.as_deref(),
@@ -982,8 +996,15 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
             .map(|((_, state), spec)| qwen35::DensePrefillSessionBatchRow {
                 tokens: &spec.tokens,
                 start_pos: state.seq_pos,
-                kv_cache: &mut state.kv_cache,
-                dn_state: &mut state.dn_state,
+                kv_cache: state.sequence_state.kv.as_mut().expect("qwen35 session KV"),
+                dn_state: state
+                    .sequence_state
+                    .recurrent
+                    .as_mut()
+                    .expect("qwen35 session dn")
+                    .as_any_mut()
+                    .downcast_mut::<qwen35::DeltaNetState>()
+                    .expect("qwen35 session dn"),
                 logits: &state.logits,
             })
             .collect();
@@ -1014,7 +1035,7 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
         } else {
             0
         };
-        let logical_position = state.seq_pos + state.kv_cache.compact_offset;
+        let logical_position = state.seq_pos + state.kv_cache().compact_offset;
         let debug_sample_token = if spec.replay_as_generated_suffix
             && std::env::var_os("HIPFIRE_GENERATE_BATCH_PREFILL_DEBUG_SAMPLE").is_some()
         {
@@ -1267,8 +1288,15 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
                         (progress[idx] < end).then(|| qwen35::DensePrefillSessionBatchRow {
                             tokens: &contract.sessions[idx].tokens[progress[idx]..end],
                             start_pos: state.seq_pos,
-                            kv_cache: &mut state.kv_cache,
-                            dn_state: &mut state.dn_state,
+                            kv_cache: state.sequence_state.kv.as_mut().expect("qwen35 session KV"),
+                            dn_state: state
+                                .sequence_state
+                                .recurrent
+                                .as_mut()
+                                .expect("qwen35 session dn")
+                                .as_any_mut()
+                                .downcast_mut::<qwen35::DeltaNetState>()
+                                .expect("qwen35 session dn"),
                             logits: &state.logits,
                         })
                     })
@@ -1332,7 +1360,7 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
         let mut sessions = Vec::with_capacity(owned_sessions.len());
         for (idx, (id, mut state)) in owned_sessions.into_iter().enumerate() {
             state.prefilled_generated_suffix_len = 0;
-            let logical_position = state.seq_pos + state.kv_cache.compact_offset;
+            let logical_position = state.seq_pos + state.kv_cache().compact_offset;
             let prefix_hash = compute_qwen35_prefix_hash(
                 m.arch_id,
                 m.q35_kv_mode.as_deref(),
@@ -1400,8 +1428,15 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
             .map(|((_, state), spec)| qwen35::DensePrefillSessionBatchRow {
                 tokens: spec.tokens,
                 start_pos: state.seq_pos,
-                kv_cache: &mut state.kv_cache,
-                dn_state: &mut state.dn_state,
+                kv_cache: state.sequence_state.kv.as_mut().expect("qwen35 session KV"),
+                dn_state: state
+                    .sequence_state
+                    .recurrent
+                    .as_mut()
+                    .expect("qwen35 session dn")
+                    .as_any_mut()
+                    .downcast_mut::<qwen35::DeltaNetState>()
+                    .expect("qwen35 session dn"),
                 logits: &state.logits,
             })
             .collect();
@@ -1430,7 +1465,7 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
         } else {
             0
         };
-        let logical_position = state.seq_pos + state.kv_cache.compact_offset;
+        let logical_position = state.seq_pos + state.kv_cache().compact_offset;
         let debug_sample_token = if spec.replay_as_generated_suffix
             && std::env::var_os("HIPFIRE_GENERATE_BATCH_PREFILL_DEBUG_SAMPLE").is_some()
         {
