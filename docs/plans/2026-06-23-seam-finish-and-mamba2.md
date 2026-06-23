@@ -96,16 +96,27 @@ infrastructure rather than two more special cases. The existing qwen35 hybrid
      counts. 4 unit tests (pure-SSM/pure-attn/qwen35-hybrid) pass in the no-GPU
      subset. Buffer layouts deliberately unpinned — migration reuses existing
      `KvCache`/`DeltaNetState` allocations.
-   - **P2b ▸ in progress.** First integration landed: serving-core's qwen35
-     KV-allocation mask (`session.rs` `qwen35_allocate_session_state`, fp32 mode)
-     now derives its per-layer KV filter from `MixerProfile::kv_layer_mask()` via
-     a `qwen35_mixer_profile(layer_types)` helper, replacing the hand-rolled
-     `layer_types == FullAttention` map. Behavior-preserving (identical boolean
-     mapping); makes `MixerProfile` load-bearing in production serving. **Next:**
-     extend the same profile-derived mask to the q8/asym KV-mode branches, then
-     build the `MixerLayerState` buffer model. NB: the `is_qwen35_family_arch_id`
-     branches are qwen35 *fast-path* gates (DeltaNet serving machinery), **not**
-     KV-topology decisions — those are dissolved in P5, not rewired here.
+   - **P2b ▸ in progress.** `MixerProfile` is now the authoritative source for
+     qwen35 KV-topology across serving-core, via a shared
+     `qwen35_mixer_profile(layer_types)` helper (`FullAttention→FullAttn` KV,
+     `LinearAttention→DeltaNet` no-KV). Consolidated three hand-rolled
+     `layer_types == FullAttention` derivations, all **behavior-preserving**:
+     - `session.rs` `qwen35_allocate_session_state` (fp32) KV mask →
+       `MixerProfile::kv_layer_mask()`.
+     - `load.rs` load-time KV mask (fp32) → `kv_layer_mask()`.
+     - `load.rs` CASK/TriAttention eviction `fa_layer_ids` →
+       `MixerProfile::kv_layer_indices()`.
+
+     **Deliberately deferred (NOT behavior-preserving):** flipping the q8/asym
+     KV-mode branches from dense (`config.n_layers`) to the existing
+     `new_gpu_q8_capped_filtered` is a real **VRAM optimization** (placeholders
+     for DeltaNet layers), and it interacts with the spec-decode snapshot/rollback
+     path — so it needs `coherence-gate-dflash` + the q8/max256 perf gate, not a
+     blind edit. Tracked as a P2b/P5 optimization, not done here. The
+     spec-decode `n_fa_layers` count (`load.rs` DDTree setup) is left for P5.
+     **Next:** build the `MixerLayerState` buffer model on the taxonomy. NB the
+     `is_qwen35_family_arch_id` branches are qwen35 *fast-path* gates, **not**
+     KV-topology — dissolved in P5, not rewired here.
 3. **P3 — wire the daemon to the seam + migrate the dense archs.** Resolve the
    daemon-wiring decision point via the **full-collapse** route (goal is
    organization, not a quick ship): thread the daemon sampler/sessions/streaming

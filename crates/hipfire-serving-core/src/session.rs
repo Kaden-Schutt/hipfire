@@ -876,7 +876,7 @@ pub fn qwen35_active_logical_position(m: &LoadedModel) -> Result<usize, String> 
 /// [`MixerProfile::kv_layer_mask`] to skip the recurrent layers — the neutral
 /// replacement for the hand-rolled `layer_types == FullAttention` mask. See
 /// docs/plans/2026-06-23-seam-finish-and-mamba2.md (P2b).
-fn qwen35_mixer_profile(layer_types: &[LayerType]) -> MixerProfile {
+pub(crate) fn qwen35_mixer_profile(layer_types: &[LayerType]) -> MixerProfile {
     MixerProfile::new(
         layer_types
             .iter()

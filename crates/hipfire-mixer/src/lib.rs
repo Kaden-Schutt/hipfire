@@ -159,6 +159,17 @@ impl MixerProfile {
     pub fn kv_layer_mask(&self) -> Vec<bool> {
         self.layers.iter().map(|m| m.uses_kv()).collect()
     }
+
+    /// Indices of the KV-backed (attention) layers, in layer order — the
+    /// full-attention layer ids that KV-eviction / CASK-style policies operate
+    /// on. Equivalent to the set bits of [`MixerProfile::kv_layer_mask`].
+    pub fn kv_layer_indices(&self) -> Vec<usize> {
+        self.layers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| m.uses_kv().then_some(i))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -211,11 +222,15 @@ mod tests {
             MixerKind::FullAttn,
         ]);
         assert_eq!(p.kv_layer_mask(), vec![false, false, false, true]);
+        assert_eq!(p.kv_layer_indices(), vec![3]);
         // pure-SSM: no KV layers at all.
         assert_eq!(
             MixerProfile::uniform(MixerKind::Mamba2, 3).kv_layer_mask(),
             vec![false, false, false]
         );
+        assert!(MixerProfile::uniform(MixerKind::Mamba2, 3)
+            .kv_layer_indices()
+            .is_empty());
     }
 
     #[test]

@@ -29,7 +29,9 @@ use hipfire_arch_qwen35::speculative::{
     DdtreeScratch, DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, VerifyScratch,
 };
 use hipfire_arch_qwen35_vl::qwen35_vl;
-use hipfire_model::{arch_features, is_qwen35_dense_arch_id, is_qwen35_family_arch_id, FeatureSupport};
+use hipfire_model::{
+    arch_features, is_qwen35_dense_arch_id, is_qwen35_family_arch_id, FeatureSupport,
+};
 use hipfire_prompt as prompt_frame;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
@@ -402,7 +404,11 @@ pub fn load_model(
         // requires it. Without this an operator could attach a draft to a
         // non-DFlash arch, pass the lm_head dtype check below, then silently get
         // plain AR decode (a no-op draft). Refuse up front with the matrix reason.
-        require_arch_feature(hfq.arch_id, "DFlash spec-decode", arch_features(hfq.arch_id).dflash)?;
+        require_arch_feature(
+            hfq.arch_id,
+            "DFlash spec-decode",
+            arch_features(hfq.arch_id).dflash,
+        )?;
 
         let lm_qt = hfq
             .tensor_data("lm_head.weight")
@@ -1371,11 +1377,7 @@ pub fn load_model(
         // physical_cap derived above. Without eviction, physical_cap may still
         // be smaller than max_seq; the server reloads a larger worker when a
         // request needs more physical rows.
-        let is_kv_layer: Vec<bool> = config
-            .layer_types
-            .iter()
-            .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
-            .collect();
+        let is_kv_layer = crate::session::qwen35_mixer_profile(&config.layer_types).kv_layer_mask();
         let kv = match kv_mode.as_str() {
             "fp32" | "f32" => kv::KvCache::new_gpu_capped_filtered(
                 gpu,
@@ -1487,18 +1489,8 @@ pub fn load_model(
                 };
                 format!("cask sidecar load failed — {why} (regen: hipfire sidecar-gen, or HIPFIRE_CASK_OFF=1)")
             })?;
-            let fa_layer_ids: Vec<usize> = config
-                .layer_types
-                .iter()
-                .enumerate()
-                .filter_map(|(i, t)| {
-                    if *t == LayerType::FullAttention {
-                        Some(i)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            let fa_layer_ids =
+                crate::session::qwen35_mixer_profile(&config.layer_types).kv_layer_indices();
             if fa_layer_ids.is_empty() {
                 eprintln!("  cask_sidecar set but model has no FullAttention layers — ignoring");
                 None
@@ -2741,14 +2733,18 @@ mod admission_tests {
     fn dflash_admission_is_matrix_backed() {
         for arch in [5u32, 6] {
             assert!(
-                require_arch_feature(arch, "DFlash spec-decode", arch_features(arch).dflash).is_ok(),
+                require_arch_feature(arch, "DFlash spec-decode", arch_features(arch).dflash)
+                    .is_ok(),
                 "qwen3.5 arch {arch} must admit DFlash"
             );
         }
         // llama (0) and gemma3 (12) have dflash=none → refused.
         let e = require_arch_feature(0, "DFlash spec-decode", arch_features(0).dflash)
             .expect_err("llama must be refused");
-        assert!(e.contains("llama") && e.contains("does not support"), "msg: {e}");
+        assert!(
+            e.contains("llama") && e.contains("does not support"),
+            "msg: {e}"
+        );
         assert!(require_arch_feature(12, "DFlash spec-decode", arch_features(12).dflash).is_err());
     }
 }
