@@ -112,6 +112,21 @@ pub struct FeatureFlags {
     /// fused-vs-unfused validation. Env: HIPFIRE_FORCE_UNFUSED=1. Single-GPU
     /// decode projection fusions only (see Phase-2a spec §4b honest-scope).
     pub force_unfused: bool,
+
+    /// Force the reference kernel floor by disabling the per-arch whole-method
+    /// dispatch overlays (the `*_gfxNNNN` methods isolated in
+    /// `dispatch/overlays/`). Env: HIPFIRE_FORCE_GENERIC=1. When set, every
+    /// `ArchCaps::is_gfxNNNN()` getter returns false, so each
+    /// `if arch_caps.is_gfxNNNN() { return self.<overlay>() }` selection falls
+    /// through to the in-family reference path. **Honest scope:** this disables
+    /// per-exact-arch whole-method overlays only; capability-based optimization
+    /// selected by *derived* caps (WMMA via `has_wmma`, MMQ via `has_mmq`, wave
+    /// size) stays active — those reflect genuine hardware capability the
+    /// reference kernel also needs, and are computed from raw arch locals in
+    /// `ArchCaps::new()`, not the gated getters. Purpose: a reference-floor test
+    /// cell (pairs with `generic_warn.rs`) so a reference-kernel bug isn't hidden
+    /// by the arch overlay, and overlay-vs-reference output can be diffed.
+    pub force_generic: bool,
 }
 
 impl FeatureFlags {
@@ -306,6 +321,10 @@ impl FeatureFlags {
             force_unfused: std::env::var("HIPFIRE_FORCE_UNFUSED")
                 .map(|v| v == "1")
                 .unwrap_or(false),
+            // Force the reference kernel floor — disable per-arch dispatch overlays
+            force_generic: std::env::var("HIPFIRE_FORCE_GENERIC")
+                .map(|v| v == "1")
+                .unwrap_or(false),
         }
     }
 
@@ -445,6 +464,7 @@ impl FeatureFlags {
             rdna2_variant: None,
             hipcc_extra_flags: String::new(),
             force_unfused: false,
+            force_generic: false,
         }
     }
 }

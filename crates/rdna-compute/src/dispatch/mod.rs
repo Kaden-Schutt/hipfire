@@ -881,6 +881,15 @@ impl Gpu {
 
         let flags = Arc::new(FeatureFlags::from_env(&arch));
         let arch_caps = crate::arch_caps::ArchCaps::new(&arch, flags.clone());
+        if flags.force_generic {
+            // Operator-visible confirmation the reference-floor test cell is
+            // active (HIPFIRE_FORCE_GENERIC=1): every is_gfxNNNN() getter is
+            // masked, so per-arch whole-method dispatch overlays are skipped.
+            eprintln!(
+                "[force-generic] HIPFIRE_FORCE_GENERIC=1 on {arch}: per-arch dispatch \
+                 overlays DISABLED (reference-floor cell; derived caps WMMA/MMQ/wave intact)"
+            );
+        }
 
         let compiler = KernelCompiler::new(&arch, flags.hipcc_extra_flags.clone())?;
 

@@ -233,64 +233,64 @@ impl ArchCaps {
 
     // ── Atoms ─────────────────────────────────────────────────────
     pub fn is_gfx906(&self) -> bool {
-        self.is_gfx906
+        self.is_gfx906 && !self.flags.force_generic
     }
     pub fn is_gfx908(&self) -> bool {
-        self.is_gfx908
+        self.is_gfx908 && !self.flags.force_generic
     }
     pub fn is_gfx1010(&self) -> bool {
-        self.is_gfx1010
+        self.is_gfx1010 && !self.flags.force_generic
     }
     pub fn is_gfx1011(&self) -> bool {
-        self.is_gfx1011
+        self.is_gfx1011 && !self.flags.force_generic
     }
     pub fn is_gfx1012(&self) -> bool {
-        self.is_gfx1012
+        self.is_gfx1012 && !self.flags.force_generic
     }
     pub fn is_gfx1030(&self) -> bool {
-        self.is_gfx1030
+        self.is_gfx1030 && !self.flags.force_generic
     }
     pub fn is_gfx1031(&self) -> bool {
-        self.is_gfx1031
+        self.is_gfx1031 && !self.flags.force_generic
     }
     pub fn is_gfx1032(&self) -> bool {
-        self.is_gfx1032
+        self.is_gfx1032 && !self.flags.force_generic
     }
     pub fn is_gfx1100(&self) -> bool {
-        self.is_gfx1100
+        self.is_gfx1100 && !self.flags.force_generic
     }
     pub fn is_gfx1101(&self) -> bool {
-        self.is_gfx1101
+        self.is_gfx1101 && !self.flags.force_generic
     }
     pub fn is_gfx1102(&self) -> bool {
-        self.is_gfx1102
+        self.is_gfx1102 && !self.flags.force_generic
     }
     pub fn is_gfx1103(&self) -> bool {
-        self.is_gfx1103
+        self.is_gfx1103 && !self.flags.force_generic
     }
     pub fn is_gfx1150(&self) -> bool {
-        self.is_gfx1150
+        self.is_gfx1150 && !self.flags.force_generic
     }
     pub fn is_gfx1151(&self) -> bool {
-        self.is_gfx1151
+        self.is_gfx1151 && !self.flags.force_generic
     }
     pub fn is_gfx1152(&self) -> bool {
-        self.is_gfx1152
+        self.is_gfx1152 && !self.flags.force_generic
     }
     pub fn is_gfx1200(&self) -> bool {
-        self.is_gfx1200
+        self.is_gfx1200 && !self.flags.force_generic
     }
     pub fn is_gfx1201(&self) -> bool {
-        self.is_gfx1201
+        self.is_gfx1201 && !self.flags.force_generic
     }
     pub fn is_gfx940(&self) -> bool {
-        self.is_gfx940
+        self.is_gfx940 && !self.flags.force_generic
     }
     pub fn is_gfx941(&self) -> bool {
-        self.is_gfx941
+        self.is_gfx941 && !self.flags.force_generic
     }
     pub fn is_gfx942(&self) -> bool {
-        self.is_gfx942
+        self.is_gfx942 && !self.flags.force_generic
     }
 
     // ── Molecules ─────────────────────────────────────────────────
@@ -614,6 +614,31 @@ mod tests {
         assert!(make_caps("gfx1200").has_wmma());
         assert!(!make_caps("gfx1030").has_wmma());
         assert!(!make_caps("gfx906").has_wmma());
+    }
+
+    #[test]
+    fn force_generic_disables_arch_getters_but_keeps_derived_caps() {
+        let mut flags = FeatureFlags::from_env_for_test("gfx1151");
+        flags.force_generic = true;
+        let caps = ArchCaps::new("gfx1151", Arc::new(flags));
+        // The per-arch overlay getters report false -> overlay selections fall
+        // through to the reference floor.
+        assert!(!caps.is_gfx1151(), "force_generic must mask is_gfx1151()");
+        assert!(!caps.is_gfx1152());
+        // Derived caps reflect genuine hardware capability and MUST stay true
+        // (the reference kernel needs them; computed from raw locals, not the
+        // gated getters).
+        assert!(
+            caps.has_wmma(),
+            "force_generic must not disable WMMA capability"
+        );
+        assert!(
+            caps.is_rdna3p5(),
+            "force_generic must not disable arch family"
+        );
+        assert!(caps.is_rdna3_uma());
+        // Sanity: without the flag the getter is true.
+        assert!(make_caps("gfx1151").is_gfx1151());
     }
 
     #[test]
