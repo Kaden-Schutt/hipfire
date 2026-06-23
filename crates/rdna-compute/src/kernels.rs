@@ -3786,6 +3786,29 @@ pub const GEMV_OQ4_GROUPED_SRC: &str =
 pub const GEMV_OQ8_GROUPED_SRC: &str =
     include_str!("../../../kernels/src/gemv_oq8_grouped.hip");
 
+/// OQ+ (W8A8) fused QKVZA: in_proj_qkv/z/beta/alpha grouped-iu8 GEMMs in ONE launch
+/// over a shared int8 activation (int8 generalization of fused_qkvza_oq4_wmma).
+/// gfx1103 wave32, zero LDS. See `kernels/src/fused_qkvza_oq8_wmma.hip`.
+pub const FUSED_QKVZA_OQ8_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/fused_qkvza_oq8_wmma.hip");
+
+/// OQ+ (W8A8) fused Gate+Up: gate_proj + up_proj grouped-iu8 GEMMs in ONE launch
+/// over a shared int8 activation. gfx1103 wave32, zero LDS.
+/// See `kernels/src/fused_gate_up_oq8_wmma.hip`.
+pub const FUSED_GATE_UP_OQ8_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/fused_gate_up_oq8_wmma.hip");
+
+/// OQ+ (W8A8) fused QKVZA DECODE (B=1): one wave32 per output row, blockIdx demux
+/// across the 4 projections — 1 launch, no WMMA N-tile waste (the B=1 decode win).
+/// See `kernels/src/fused_qkvza_oq8_gemv.hip`.
+pub const FUSED_QKVZA_OQ8_GEMV_SRC: &str =
+    include_str!("../../../kernels/src/fused_qkvza_oq8_gemv.hip");
+
+/// OQ+ (W8A8) fused Gate+Up DECODE (B=1): one wave32 per output row, blockIdx demux
+/// gate vs up — 1 launch, no N-tile waste. See `kernels/src/fused_gate_up_oq8_gemv.hip`.
+pub const FUSED_GATE_UP_OQ8_GEMV_SRC: &str =
+    include_str!("../../../kernels/src/fused_gate_up_oq8_gemv.hip");
+
 /// KVarN tile quantizer (Phase D1): log-domain Sinkhorn variance-normalize +
 /// per-row 4-bit affine quantize + pack to the on-device KVarN record. One block
 /// per tile; tile in global, scales in LDS (gfx1103-safe). Golden oracle =

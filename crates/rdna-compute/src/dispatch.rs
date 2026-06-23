@@ -46302,6 +46302,71 @@ impl Gpu {
     /// the combined `[nibbles | f32 scales]` layout (scales addressed internally
     /// at offset M*(K/2)). Outputs `y_gate` [B,gate_m], `y_up` [B,up_m].
     #[allow(clippy::too_many_arguments)]
+    /// OQ+ (W8A8) fused Gate+Up — int8 generalization of fused_gate_up_oq4_wmma.
+    /// Weight buffers are the combined [int8 M*K | f32 scales] layout; shared int8
+    /// activation xq + per-group scales xs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_gate_up_oq8_wmma(
+        &mut self,
+        w_gate: &GpuTensor,
+        w_up: &GpuTensor,
+        xq: &GpuTensor,
+        xs: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+        batch_size: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(k % group, 0, "fused_gate_up_oq8_wmma: K must be a multiple of group");
+        assert_eq!(group % 16, 0, "fused_gate_up_oq8_wmma: group must be a multiple of 16");
+        self.ensure_kernel(
+            "fused_gate_up_oq8_wmma",
+            kernels::FUSED_GATE_UP_OQ8_WMMA_SRC,
+            "fused_gate_up_oq8_wmma",
+        )?;
+        let wgp = w_gate.buf.as_ptr();
+        let wup = w_up.buf.as_ptr();
+        let xqp = xq.buf.as_ptr();
+        let xsp = xs.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let mut gmi = gate_m as i32;
+        let mut umi = up_m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wgp as *const _ as *mut c_void,
+            &wup as *const _ as *mut c_void,
+            &xqp as *const _ as *mut c_void,
+            &xsp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &mut gmi as *mut _ as *mut c_void,
+            &mut umi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        let grid_x = (((gate_m + 15) / 16) + ((up_m + 15) / 16)) as u32;
+        let grid_b = ((batch_size + 15) / 16) as u32;
+        let func = &self.functions["fused_gate_up_oq8_wmma"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_x, grid_b, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     pub fn fused_gate_up_oq4_wmma(
         &mut self,
         w_gate: &GpuTensor,
@@ -46375,6 +46440,213 @@ impl Gpu {
     /// one launch sharing the int4 activation. Each weight buffer is the combined
     /// `[nibbles | f32 scales]` layout. Outputs the four projections separately.
     #[allow(clippy::too_many_arguments)]
+    /// OQ+ (W8A8) fused QKVZA — int8 generalization of fused_qkvza_oq4_wmma.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_qkvza_oq8_wmma(
+        &mut self,
+        w_qkv: &GpuTensor,
+        w_z: &GpuTensor,
+        w_beta: &GpuTensor,
+        w_alpha: &GpuTensor,
+        xq: &GpuTensor,
+        xs: &GpuTensor,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+        batch_size: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(k % group, 0, "fused_qkvza_oq8_wmma: K must be a multiple of group");
+        assert_eq!(group % 16, 0, "fused_qkvza_oq8_wmma: group must be a multiple of 16");
+        self.ensure_kernel(
+            "fused_qkvza_oq8_wmma",
+            kernels::FUSED_QKVZA_OQ8_WMMA_SRC,
+            "fused_qkvza_oq8_wmma",
+        )?;
+        let p_wqkv = w_qkv.buf.as_ptr();
+        let p_wz = w_z.buf.as_ptr();
+        let p_wbeta = w_beta.buf.as_ptr();
+        let p_walpha = w_alpha.buf.as_ptr();
+        let p_xq = xq.buf.as_ptr();
+        let p_xs = xs.buf.as_ptr();
+        let p_yqkv = y_qkv.buf.as_ptr();
+        let p_yz = y_z.buf.as_ptr();
+        let p_ybeta = y_beta.buf.as_ptr();
+        let p_yalpha = y_alpha.buf.as_ptr();
+        let mut qm = qkv_m as i32;
+        let mut zm = z_m as i32;
+        let mut bm = beta_m as i32;
+        let mut am = alpha_m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &p_wqkv as *const _ as *mut c_void,
+            &p_wz as *const _ as *mut c_void,
+            &p_wbeta as *const _ as *mut c_void,
+            &p_walpha as *const _ as *mut c_void,
+            &p_xq as *const _ as *mut c_void,
+            &p_xs as *const _ as *mut c_void,
+            &p_yqkv as *const _ as *mut c_void,
+            &p_yz as *const _ as *mut c_void,
+            &p_ybeta as *const _ as *mut c_void,
+            &p_yalpha as *const _ as *mut c_void,
+            &mut qm as *mut _ as *mut c_void,
+            &mut zm as *mut _ as *mut c_void,
+            &mut bm as *mut _ as *mut c_void,
+            &mut am as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        let tiles = |m: usize| (m + 15) / 16;
+        let grid_x = (tiles(qkv_m) + tiles(z_m) + tiles(beta_m) + tiles(alpha_m)) as u32;
+        let grid_b = ((batch_size + 15) / 16) as u32;
+        let func = &self.functions["fused_qkvza_oq8_wmma"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_x, grid_b, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// OQ+ (W8A8) fused QKVZA DECODE (B=1): one wave32 per output row, blockIdx
+    /// demux across the 4 projections — 1 launch, no WMMA N-tile waste. Each weight
+    /// buf is the combined [int8 M*K | f32 scales].
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_qkvza_oq8_gemv(
+        &mut self,
+        w_qkv: &GpuTensor,
+        w_z: &GpuTensor,
+        w_beta: &GpuTensor,
+        w_alpha: &GpuTensor,
+        xq: &GpuTensor,
+        xs: &GpuTensor,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(group, 256, "fused_qkvza_oq8_gemv: group must be 256");
+        assert_eq!(k % group, 0, "fused_qkvza_oq8_gemv: K must be a multiple of group");
+        self.ensure_kernel(
+            "fused_qkvza_oq8_gemv",
+            kernels::FUSED_QKVZA_OQ8_GEMV_SRC,
+            "fused_qkvza_oq8_gemv",
+        )?;
+        let p_wqkv = w_qkv.buf.as_ptr();
+        let p_wz = w_z.buf.as_ptr();
+        let p_wbeta = w_beta.buf.as_ptr();
+        let p_walpha = w_alpha.buf.as_ptr();
+        let p_xq = xq.buf.as_ptr();
+        let p_xs = xs.buf.as_ptr();
+        let p_yqkv = y_qkv.buf.as_ptr();
+        let p_yz = y_z.buf.as_ptr();
+        let p_ybeta = y_beta.buf.as_ptr();
+        let p_yalpha = y_alpha.buf.as_ptr();
+        let mut qm = qkv_m as i32;
+        let mut zm = z_m as i32;
+        let mut bm = beta_m as i32;
+        let mut am = alpha_m as i32;
+        let mut ki = k as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &p_wqkv as *const _ as *mut c_void,
+            &p_wz as *const _ as *mut c_void,
+            &p_wbeta as *const _ as *mut c_void,
+            &p_walpha as *const _ as *mut c_void,
+            &p_xq as *const _ as *mut c_void,
+            &p_xs as *const _ as *mut c_void,
+            &p_yqkv as *const _ as *mut c_void,
+            &p_yz as *const _ as *mut c_void,
+            &p_ybeta as *const _ as *mut c_void,
+            &p_yalpha as *const _ as *mut c_void,
+            &mut qm as *mut _ as *mut c_void,
+            &mut zm as *mut _ as *mut c_void,
+            &mut bm as *mut _ as *mut c_void,
+            &mut am as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        let grid_x = (qkv_m + z_m + beta_m + alpha_m) as u32;
+        let func = &self.functions["fused_qkvza_oq8_gemv"];
+        unsafe {
+            self.hip.launch_kernel(func, [grid_x, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
+        }
+    }
+
+    /// OQ+ (W8A8) fused Gate+Up DECODE (B=1): one wave32 per output row, blockIdx
+    /// demux gate vs up — 1 launch, no N-tile waste.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_gate_up_oq8_gemv(
+        &mut self,
+        w_gate: &GpuTensor,
+        w_up: &GpuTensor,
+        xq: &GpuTensor,
+        xs: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(group, 256, "fused_gate_up_oq8_gemv: group must be 256");
+        assert_eq!(k % group, 0, "fused_gate_up_oq8_gemv: K must be a multiple of group");
+        self.ensure_kernel(
+            "fused_gate_up_oq8_gemv",
+            kernels::FUSED_GATE_UP_OQ8_GEMV_SRC,
+            "fused_gate_up_oq8_gemv",
+        )?;
+        let wgp = w_gate.buf.as_ptr();
+        let wup = w_up.buf.as_ptr();
+        let xqp = xq.buf.as_ptr();
+        let xsp = xs.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let mut gmi = gate_m as i32;
+        let mut umi = up_m as i32;
+        let mut ki = k as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wgp as *const _ as *mut c_void,
+            &wup as *const _ as *mut c_void,
+            &xqp as *const _ as *mut c_void,
+            &xsp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &mut gmi as *mut _ as *mut c_void,
+            &mut umi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        let grid_x = (gate_m + up_m) as u32;
+        let func = &self.functions["fused_gate_up_oq8_gemv"];
+        unsafe {
+            self.hip.launch_kernel(func, [grid_x, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
+        }
+    }
+
     pub fn fused_qkvza_oq4_wmma(
         &mut self,
         w_qkv: &GpuTensor,

@@ -751,6 +751,20 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                     .add_inplace_f32(residual, &tmp)
                     .map_err(|e| DispatchError::Hip(e.to_string()));
             }
+            if w.dtype == DType::Oq8G256 {
+                // wo/down residual: B=1 gemv_oq8 (no WMMA N-tile waste) into scratch
+                // + add, instead of gemm_oq8 at B=1 (16× wasteful) via WithResidual.
+                gpu.ensure_oq4_scratch().map_err(|e| DispatchError::Hip(e.to_string()))?;
+                let tmp = rdna_compute::GpuTensor {
+                    buf: unsafe { gpu.oq4_ytmp.as_ref().unwrap().buf.alias() },
+                    shape: vec![w.m],
+                    dtype: DType::F32,
+                };
+                oq8_gemv_into(gpu, w, xr, true, &tmp)?;
+                return gpu
+                    .add_inplace_f32(residual, &tmp)
+                    .map_err(|e| DispatchError::Hip(e.to_string()));
+            }
             // MQ-family with a fused residual kernel: writes `residual` in-place via
             // GemvVariant::WithResidual. `out` is NOT written — it is scratch for the
             // fallback path only (see the Raw arm below). Nothing downstream reads
@@ -784,6 +798,18 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                     dtype: DType::F32,
                 };
                 oq4_gemv_into(gpu, w, x, false, &tmp)?;
+                return gpu
+                    .add_inplace_f32(residual, &tmp)
+                    .map_err(|e| DispatchError::Hip(e.to_string()));
+            }
+            if w.dtype == DType::Oq8G256 {
+                gpu.ensure_oq4_scratch().map_err(|e| DispatchError::Hip(e.to_string()))?;
+                let tmp = rdna_compute::GpuTensor {
+                    buf: unsafe { gpu.oq4_ytmp.as_ref().unwrap().buf.alias() },
+                    shape: vec![w.m],
+                    dtype: DType::F32,
+                };
+                oq8_gemv_into(gpu, w, x, false, &tmp)?;
                 return gpu
                     .add_inplace_f32(residual, &tmp)
                     .map_err(|e| DispatchError::Hip(e.to_string()));
@@ -1044,12 +1070,15 @@ fn launch_fused(
                 dtype: DType::F32,
             };
             gpu.quantize_act_oq8(activated, &xq, &xs, 1, k, 256).map_err(hip)?;
-            let ng = k / 256;
-            for (wt, out) in [(wqkv, qkv), (wz, z), (wb, beta), (wa, alpha)] {
-                let ws = wt.buf.sub_offset(wt.m * k, wt.m * ng * 4);
-                gpu.gemv_oq8_grouped(wt.buf, &ws, &xq, &xs, out, wt.m, k, 256)
-                    .map_err(hip)?;
-            }
+            // ONE fused launch demuxing all 4 projections (vs 4 gemv launches) — the
+            // decode launch-count win on the per-token-launch-bound gfx1103 path.
+            // Each weight buf is the combined [int8 M*K | f32 scales]; the kernel
+            // derives the scale pointer internally.
+            gpu.fused_qkvza_oq8_gemv(
+                wqkv.buf, wz.buf, wb.buf, wa.buf, &xq, &xs, qkv, z, beta, alpha,
+                wqkv.m, wz.m, wb.m, wa.m, k, 256,
+            )
+            .map_err(hip)?;
             Ok(())
         }
         KernelKey::FusedGateUpOq8G256 => {
@@ -1069,12 +1098,9 @@ fn launch_fused(
                 dtype: DType::F32,
             };
             gpu.quantize_act_oq8(activated, &xq, &xs, 1, k, 256).map_err(hip)?;
-            let ng = k / 256;
-            for (wt, out) in [(wg, gate), (wu, up)] {
-                let ws = wt.buf.sub_offset(wt.m * k, wt.m * ng * 4);
-                gpu.gemv_oq8_grouped(wt.buf, &ws, &xq, &xs, out, wt.m, k, 256)
-                    .map_err(hip)?;
-            }
+            // ONE fused launch for gate+up (vs 2 gemv launches), gemv-demux (no waste).
+            gpu.fused_gate_up_oq8_gemv(wg.buf, wu.buf, &xq, &xs, gate, up, wg.m, wu.m, k, 256)
+                .map_err(hip)?;
             Ok(())
         }
         KernelKey::FusedQkvMq4G256Lloyd
