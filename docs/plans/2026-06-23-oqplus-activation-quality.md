@@ -119,23 +119,39 @@ almost certainly **unfused per-projection Oq8 GEMVs** (mq4+ has fused qkv/gate-u
 decode kernels; Oq8 W8A8 apparently lacks them, and gfx1103 decode is memcpy-sync-
 bound so unfused = many more per-token syncs). Engineering gap, fixable.
 
-**Daemon load:** OQ+ (qt=33) does NOT load via the daemon serve path on this UMA
-box — the **slab loader** (`load_weight_tensor_from_slabs`, auto-on for UMA/gfx1103)
-lacks the qt=33 arm that `load_weight_tensor_raw` has (cf387d42 wired only the raw
-path). So `hipfire eval`/serve panic on load; only the direct infer/perplexity raw
-path works. Promotion blocker #2.
+**Daemon load: NOT a real blocker — it was a STALE INSTALLED DAEMON (RESOLVED).**
+Initial diagnosis (slab loader lacks qt=33) was WRONG. The slab loader correctly
+returns None for qt=33 (`slab_dtype_for_quant`) and falls back to
+`load_weight_tensor_raw`, which HAS the qt=33 arm — no code change needed. The real
+cause: `find_daemon_bin` (hipfire-daemon-adapter) prioritizes `~/.hipfire/bin/
+hipfire-daemon` OVER `target/release`, and the installed copy was from 06-22 18:08
+(before cf387d42 added qt=33 at 20:00). Every eval/chat spawned that stale daemon →
+"unsupported quant_type 33" panic at a stale line. FIX: refreshed `~/.hipfire/bin/`
+with current binaries. OQ+ then loads + serves coherently on the daemon. (Lesson:
+when the daemon panics but infer_qwen35/perplexity don't, suspect the installed
+`~/.hipfire/bin` daemon, not the source.)
+
+**Full daemon eval (smoke,coherence,quality,speed; fresh daemon):** OQ+ and mq4+
+BOTH 9 pass / 1 fail / 1 skip — the one fail is the SAME `tool_call_read_file`
+coherence detector on both (parity, not an OQ+ regression; 0.8b fast-tier quirk),
+quality skipped at fast tier (KLD already measured separately). Daemon speed
+confirms the perf gap on the production path: OQ+ decode 14.3 / prefill 16.0 tok/s
+vs mq4+ decode 59.7 / prefill 104.8 — **4.2× slower decode, 6.5× slower prefill.**
 
 **Quality (confirmed, the motivation):** KLD 0.046 (1.7× better than mq4+),
 coherent on capital/reasoning prompts, no attractor.
 
-**VERDICT: do NOT promote OQ+ yet.** Quality wins decisively but it is 4× slower
-and won't serve on UMA daemons. Promotion is gated on TWO engineering items, not
-quality:
-1. **Fused Oq8 W8A8 decode kernels** (qkv/gate-up), mirroring the mq4 fused path —
-   the 4× decode gap. (Prefill-batched fused Oq8 may also be missing.)
-2. **qt=33 (and 34/35/36) arm in the slab loader** so OQ+ serves on UMA daemons.
-Until both land, mq4+ remains the production W4A8. The LDLQ+AWQ recipe + its KLD win
-are the standing motivation to fund that kernel work.
+**VERDICT: do NOT promote OQ+ yet — ONE blocker remains (perf).** Quality wins
+decisively (KLD 0.046 vs mq4+ 0.078), loads + serves + coheres at parity on the
+daemon, but is 4.2× slower decode / 6.5× slower prefill. Promotion is gated on a
+single engineering item, not quality and not loading:
+1. **Fused Oq8 W8A8 kernels** — fused qkv/gate-up DECODE (the 4.2× gap) and
+   BATCHED-PREFILL (the 6.5× gap), mirroring the mq4 fused path. gfx1103 decode is
+   memcpy-sync-bound, so unfused per-projection Oq8 GEMVs = many extra syncs.
+(The earlier "blocker #2: slab-loader qt=33" was a misdiagnosis — it was a stale
+installed daemon, now fixed; OQ+ serves fine.)
+Until the fused Oq8 kernels land, mq4+ remains production W4A8. The LDLQ+AWQ recipe
++ its KLD win are the standing motivation to fund that kernel work.
 
 ## Cross-cutting note
 
