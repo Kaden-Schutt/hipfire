@@ -63,11 +63,29 @@ infrastructure rather than two more special cases. The existing qwen35 hybrid
 
 ## Phases (strangler-fig; commit each; coherence gate on every forward-touching step)
 
-1. **P1 — neutralize the base.** Relocate `KvCache`, generic scratch, and
-   session-state types out of `hipfire-arch-qwen35` / `hipfire-runtime::llama`
-   into a neutral home (extend `hipfire-state`, or a new `hipfire-mixer` crate).
-   Removes the "qwen35 is a de-facto base crate" coupling that blocks everything
-   else. *(Deferred in the original plan; the full migration needs it.)*
+1. **P1 — neutralize the base. ✅ Already satisfied on `chaingun` (verified
+   2026-06-23).** The original premise ("5 arch crates depend on qwen35;
+   relocate `KvCache`/scratch/session-state out of it") no longer holds — prior
+   branch work already broke it:
+   - `KvCache` already lives in a neutral home, `hipfire-runtime/src/kv.rs`
+     (the seam plan's "lives in `hipfire-runtime::llama`" is stale).
+   - The four sibling arch crates (qwen2, minimax, qwen35-vl, dots-ocr) carry
+     **no real `hipfire-arch-qwen35` dependency** — the Cargo references that
+     remain are comments, and there are zero `hipfire_arch_qwen35::` symbol uses
+     in their source.
+   - `hipfire-runtime`'s only `hipfire-arch-qwen35` edge is a **dev-dependency**
+     (examples/tests); its library source references qwen35 only in doc
+     comments. So the arch→runtime direction is clean (no cycle).
+   - Proof: `cargo tree -i hipfire-arch-qwen35 -e normal` lists **only**
+     `hipfire-daemon` and `hipfire-serving-core` as non-dev dependents.
+
+   The residual qwen35 coupling is therefore confined to the **serving /
+   fast-path layer** (serving-core + daemon: `DeltaNetState`, `Qwen35ScratchSet`,
+   `LayerType`, `StateQuant`, `pflash`, `mtp`, `speculative::ModelSlot`). Those
+   types are genuinely DeltaNet/qwen35-specific and belong with the qwen35
+   backend — they are dissolved by **P3 (daemon wiring)** and **P5 (qwen35 fast
+   paths behind `ArchCaps`)**, not by a P1 type-relocation. **Net: P1 needs no
+   code move; proceed directly to P2.**
 2. **P2 — generalize `State` into a per-layer `Mixer` state model.** Define
    `enum Mixer { FullAttn, Swa, ShortConv, DeltaNet, Mamba2 }` + per-layer
    heterogeneous state with a **no-KV path**. The design keystone. Validate
