@@ -72,6 +72,37 @@ A single recommended OQ+ recipe + its KLD/ppl/coherence, and a go/no-go vs mq4+:
   ships as the W4A8 production format (symmetric-int4, the cleaner iu8 path).
 - If it can't beat mq4+ → OQ+ stays a research format; mq4+ remains production W4A8.
 
+## RESULTS (2026-06-23, qwen3.5-0.8b, KLD-vs-bf16 991 positions, held-out calib)
+
+Hypothesis **CONFIRMED** — LDLQ helps W4A8 strongly (opposite of W4A4):
+
+| recipe | KLD | ppl | size |
+|--------|----:|----:|-----:|
+| OQ+ RTN | 0.1568 | 38.95 | 538MB |
+| OQ+ AWQ (prior best) | 0.0912 | 35.99 | 538MB |
+| OQ+ LDLQ | 0.1181 | 37.84 | 538MB |
+| **OQ+ LDLQ+AWQ** | **0.0459** | 33.15 | 538MB |
+| OQ+ compact w8=3% LDLQ+AWQ | **0.0408** | 33.24 | 569MB |
+| OQ+ compact w8=6.25% LDLQ+AWQ | 0.0411 | 33.28 | 601MB |
+| — mq4+ (incumbent W4A8) | 0.0780 | 33.58 | 550MB |
+| — mq4 | 0.1439 | 34.14 | 549MB |
+| — bf16 (ref) | 0 | 31.32 | — |
+
+- **LDLQ+AWQ nearly halves AWQ-alone** (0.046 vs 0.091); LDLQ-alone beats RTN
+  (0.118 vs 0.157). For W4A4 LDLQ added ~nothing over AWQ — the W4A8 clean-int8-
+  activation regime is exactly why weight error-feedback now pays. Hypothesis holds.
+- **OQ+ LDLQ+AWQ beats the mq4+ incumbent by ~1.7× lower KLD** at equal (4-bit)
+  weight memory and the same iu8 kernel — and is coherent ("...is **Paris**.",
+  clean `<|im_end|>`, no attractor; the recovery fixes plain oq4's loop failure).
+- Compact (sparse int8 outliers) knee at **w8=3%**: KLD 0.0408 (+6% size, −11% KLD);
+  past ~3% outliers no further gain (0.0625 flat). Plain LDLQ+AWQ is the smallest
+  recipe that already beats mq4+.
+
+**DECISION: OQ+ LDLQ+AWQ is the recommended W4A8 recipe** (compact-3% if the +6%
+storage is acceptable for the extra quality). It supersedes the AWQ-only OQ+ and
+beats mq4+. Remaining (lower priority): formal `coherence-gate.sh`, larger-model
+(9B/27B) confirmation, AWQ-α / per-group-activation only if more headroom is wanted.
+
 ## Cross-cutting note
 
 This is **offline-quant** quality work — orthogonal to and cheaper than the
