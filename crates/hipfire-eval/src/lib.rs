@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{c_void, CString, OsStr};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -979,21 +979,6 @@ fn resolve_perplexity_bin() -> Option<PathBuf> {
     newest_existing_path([
         repo.join(format!("target/release/examples/perplexity{exe}")),
         repo.join(format!("target/debug/examples/perplexity{exe}")),
-    ])
-}
-
-fn resolve_eval_hipfire_bin() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("HIPFIRE_EVAL_HIPFIRE_BIN") {
-        let p = PathBuf::from(path);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    let exe = std::env::consts::EXE_SUFFIX;
-    let repo = repo_root()?;
-    newest_existing_path([
-        repo.join(format!("target/release/examples/eval_hipfire{exe}")),
-        repo.join(format!("target/debug/examples/eval_hipfire{exe}")),
     ])
 }
 
@@ -1975,47 +1960,6 @@ mod tests {
         assert_eq!(cfg.host_memory_class.as_deref(), Some("lpddr5x"));
         assert_eq!(cfg.host_memory_width_bits, Some(256));
         assert_eq!(cfg.host_memory_bandwidth_gbps, Some(273.5));
-    }
-
-    #[test]
-    fn derives_kldref_names_from_model_artifacts() {
-        assert_eq!(
-            kldref_name_for_model("/models/qwen3.5-0.8b-bf16.hfq").as_deref(),
-            Some("qwen3.5-0.8b-bf16.kldref.hfq")
-        );
-        assert_eq!(
-            kldref_name_for_model("/models/qwen3.5-0.8b-mq4.hfq").as_deref(),
-            Some("qwen3.5-0.8b-bf16.kldref.hfq")
-        );
-        assert_eq!(
-            kldref_name_for_model("/models/qwen3.5-35b-a3b-mq4.hfq").as_deref(),
-            Some("qwen3.5-35b-a3b-bf16.kldref.hfq")
-        );
-    }
-
-    #[test]
-    fn parses_hfkseq_v2_metrics() {
-        let path = temp_path("quality-row.kldseq");
-        let mut body = Vec::new();
-        body.extend_from_slice(b"HFKSEQ\0\0");
-        body.extend_from_slice(&2u32.to_le_bytes());
-        body.extend_from_slice(&2u32.to_le_bytes());
-        body.extend_from_slice(&0u32.to_le_bytes());
-        for (mean, p99, nll) in [(0.1f64, 0.3f64, 2.0f64), (0.2, 0.4, 4.0)] {
-            body.extend_from_slice(&mean.to_le_bytes());
-            body.extend_from_slice(&p99.to_le_bytes());
-            body.extend_from_slice(&nll.to_le_bytes());
-        }
-        fs::write(&path, body).unwrap();
-
-        let metrics = parse_hfkseq_metrics(&path).unwrap();
-        assert_eq!(metrics["n_chunks"], json!(2));
-        assert_eq!(metrics["mean_kld"], json!(0.15000000000000002));
-        assert_eq!(metrics["p99_kld"], json!(0.4));
-        assert_eq!(metrics["mean_nll"], json!(3.0));
-        assert_eq!(metrics["ppl"], json!(3.0f64.exp()));
-
-        let _ = fs::remove_file(path);
     }
 
     #[test]

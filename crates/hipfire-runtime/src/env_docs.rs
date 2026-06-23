@@ -1239,13 +1239,6 @@ pub const ENV_HIPFIRE_EVAL_EVIDENCE_DIR: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-runtime/examples/run.rs:231",
 };
 
-/// `HIPFIRE_EVAL_HIPFIRE_BIN` — Runtime variable controlling eval hipfire bin in hipfire
-pub const ENV_HIPFIRE_EVAL_HIPFIRE_BIN: EnvVarDoc = EnvVarDoc {
-    name: "HIPFIRE_EVAL_HIPFIRE_BIN",
-    description: "Runtime variable controlling eval hipfire bin in hipfire",
-    source: "crates/hipfire-eval/src/lib.rs:986",
-};
-
 /// `HIPFIRE_EVAL_KLDREF` — Runtime variable controlling eval kldref in hipfire
 pub const ENV_HIPFIRE_EVAL_KLDREF: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EVAL_KLDREF",
@@ -1572,7 +1565,7 @@ pub const ENV_HIPFIRE_HIP_WAIT: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_HOST_PROFILE_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HOST_PROFILE_BIN",
     description: "Runtime variable controlling host profile bin in hipfire",
-    source: "crates/hipfire-eval/src/lib.rs:1001",
+    source: "crates/hipfire-eval/src/lib.rs:986",
 };
 
 /// `HIPFIRE_HOST_TIMING` — HIPFIRE_HOST_TIMING=1: dump per-cycle host-side wall-clock breakdown
@@ -1600,7 +1593,7 @@ pub const ENV_HIPFIRE_KERNEL_CACHE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_KLD_DIRECT_F16KV_ATTN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KLD_DIRECT_F16KV_ATTN",
     description: "Used to configure runtime execution by explicitly setting \"HIPFIRE_KLD_DIRECT_F16KV_ATTN\"",
-    source: "crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:707",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:12898",
 };
 
 /// `HIPFIRE_KLD_DIRECT_WMMA_ATTN` — Used to configure runtime execution by explicitly setting "HIPFIRE_KLD_DIRECT_WMMA_ATTN"
@@ -1608,7 +1601,7 @@ pub const ENV_HIPFIRE_KLD_DIRECT_WMMA_ATTN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KLD_DIRECT_WMMA_ATTN",
     description:
         "Used to configure runtime execution by explicitly setting \"HIPFIRE_KLD_DIRECT_WMMA_ATTN\"",
-    source: "crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:706",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:12897",
 };
 
 /// `HIPFIRE_KLD_FP32_GQA4_ATTN` — Used to configure runtime execution by explicitly setting "HIPFIRE_KLD_FP32_GQA4_ATTN"
@@ -1616,35 +1609,7 @@ pub const ENV_HIPFIRE_KLD_FP32_GQA4_ATTN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KLD_FP32_GQA4_ATTN",
     description:
         "Used to configure runtime execution by explicitly setting \"HIPFIRE_KLD_FP32_GQA4_ATTN\"",
-    source: "crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:710",
-};
-
-/// `HIPFIRE_KLD_GPU_TOPK` — Enabled by default; set to 0 to disable
-pub const ENV_HIPFIRE_KLD_GPU_TOPK: EnvVarDoc = EnvVarDoc {
-    name: "HIPFIRE_KLD_GPU_TOPK",
-    description: "Enabled by default; set to 0 to disable",
-    source: "crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:964",
-};
-
-/// `HIPFIRE_KLD_GRAPH` — Enabled by default; set to 0 to disable
-pub const ENV_HIPFIRE_KLD_GRAPH: EnvVarDoc = EnvVarDoc {
-    name: "HIPFIRE_KLD_GRAPH",
-    description: "Enabled by default; set to 0 to disable",
-    source: "crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:685",
-};
-
-/// `HIPFIRE_KLD_NO_ACTIVE_STREAM` — Runtime variable controlling kld no active stream in hipfire
-pub const ENV_HIPFIRE_KLD_NO_ACTIVE_STREAM: EnvVarDoc = EnvVarDoc {
-    name: "HIPFIRE_KLD_NO_ACTIVE_STREAM",
-    description: "Runtime variable controlling kld no active stream in hipfire",
-    source: "crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:299",
-};
-
-/// `HIPFIRE_KLD_PREFILL_ONLY` — Enabled when set to 1
-pub const ENV_HIPFIRE_KLD_PREFILL_ONLY: EnvVarDoc = EnvVarDoc {
-    name: "HIPFIRE_KLD_PREFILL_ONLY",
-    description: "Enabled when set to 1",
-    source: "crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:852",
+    source: "crates/hipfire-arch-qwen35/src/qwen35.rs:12951",
 };
 
 /// `HIPFIRE_KLD_SCORING_MODE` — Runtime variable controlling kld scoring mode in hipfire
@@ -1652,13 +1617,6 @@ pub const ENV_HIPFIRE_KLD_SCORING_MODE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KLD_SCORING_MODE",
     description: "Runtime variable controlling kld scoring mode in hipfire",
     source: "crates/hipfire-kld/src/config.rs:102",
-};
-
-/// `HIPFIRE_KLD_SOURCE_SHA256` — Enabled when set to 1
-pub const ENV_HIPFIRE_KLD_SOURCE_SHA256: EnvVarDoc = EnvVarDoc {
-    name: "HIPFIRE_KLD_SOURCE_SHA256",
-    description: "Enabled when set to 1",
-    source: "crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:848",
 };
 
 /// `HIPFIRE_KLD_TOP_K` — Runtime variable controlling kld top k in hipfire
@@ -1680,6 +1638,41 @@ pub const ENV_HIPFIRE_KVARN_SIM: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KVARN_SIM",
     description: "Environment toggle value controls runtime behavior",
     source: "crates/hipfire-runtime/examples/perplexity.rs:210",
+};
+
+/// `HIPFIRE_KVNOISE` — Environment toggle value controls runtime behavior
+pub const ENV_HIPFIRE_KVNOISE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_KVNOISE",
+    description: "Environment toggle value controls runtime behavior",
+    source: "crates/hipfire-train/src/kv_noise.rs:36",
+};
+
+/// `HIPFIRE_KVNOISE_BITS` — Defaults to 4 when unset
+pub const ENV_HIPFIRE_KVNOISE_BITS: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_KVNOISE_BITS",
+    description: "Defaults to 4 when unset",
+    source: "crates/hipfire-train/examples/kvnoise_recovery_supra50m.rs:88",
+};
+
+/// `HIPFIRE_KVNOISE_FOLD` — Defaults to 4 when unset
+pub const ENV_HIPFIRE_KVNOISE_FOLD: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_KVNOISE_FOLD",
+    description: "Defaults to 4 when unset",
+    source: "crates/hipfire-train/examples/kvnoise_recovery_supra50m.rs:87",
+};
+
+/// `HIPFIRE_KVNOISE_HOT` — Defaults to 4 when unset
+pub const ENV_HIPFIRE_KVNOISE_HOT: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_KVNOISE_HOT",
+    description: "Defaults to 4 when unset",
+    source: "crates/hipfire-train/examples/kvnoise_recovery_supra50m.rs:86",
+};
+
+/// `HIPFIRE_KVNOISE_LR` — Runtime variable controlling KVnoise lr in hipfire
+pub const ENV_HIPFIRE_KVNOISE_LR: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_KVNOISE_LR",
+    description: "Runtime variable controlling KVnoise lr in hipfire",
+    source: "crates/hipfire-train/examples/kvnoise_recovery_supra50m.rs:41",
 };
 
 /// `HIPFIRE_KV_COLD_BITS` — Cold-tile quant precision probe: code max = 2^bits - 1 (4-bit=15 default,
@@ -3672,7 +3665,6 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_EP_SKIP_ALLREDUCE,
     ENV_HIPFIRE_EVAL_DATASET_MIRROR,
     ENV_HIPFIRE_EVAL_EVIDENCE_DIR,
-    ENV_HIPFIRE_EVAL_HIPFIRE_BIN,
     ENV_HIPFIRE_EVAL_KLDREF,
     ENV_HIPFIRE_EVAL_PERPLEXITY_CORPUS,
     ENV_HIPFIRE_EVAL_PERPLEXITY_CTX,
@@ -3726,15 +3718,15 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_KLD_DIRECT_F16KV_ATTN,
     ENV_HIPFIRE_KLD_DIRECT_WMMA_ATTN,
     ENV_HIPFIRE_KLD_FP32_GQA4_ATTN,
-    ENV_HIPFIRE_KLD_GPU_TOPK,
-    ENV_HIPFIRE_KLD_GRAPH,
-    ENV_HIPFIRE_KLD_NO_ACTIVE_STREAM,
-    ENV_HIPFIRE_KLD_PREFILL_ONLY,
     ENV_HIPFIRE_KLD_SCORING_MODE,
-    ENV_HIPFIRE_KLD_SOURCE_SHA256,
     ENV_HIPFIRE_KLD_TOP_K,
     ENV_HIPFIRE_KVARN_ROTATE,
     ENV_HIPFIRE_KVARN_SIM,
+    ENV_HIPFIRE_KVNOISE,
+    ENV_HIPFIRE_KVNOISE_BITS,
+    ENV_HIPFIRE_KVNOISE_FOLD,
+    ENV_HIPFIRE_KVNOISE_HOT,
+    ENV_HIPFIRE_KVNOISE_LR,
     ENV_HIPFIRE_KV_COLD_BITS,
     ENV_HIPFIRE_KV_CORE_FRAC,
     ENV_HIPFIRE_KV_FOLD_M,

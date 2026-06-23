@@ -626,20 +626,12 @@ pub(crate) fn run_battery(
         if let Some(rows) = quality_json_rows(config, ctx) {
             return rows;
         }
-        // Daemon-resident KLD scoring is the canonical Quality path (one resident
-        // forward + the shared hipfire-kld core — supersedes the deprecated
-        // eval_hipfire example). Route Daemon/Auto here; Examples/Direct keep the
-        // legacy bin path until it is removed (Phase C of the eval-tooling refactor).
-        if matches!(
-            config.executor,
-            EvalExecutorMode::Daemon | EvalExecutorMode::Auto
-        ) {
-            return run_daemon_quality_rows(config, ctx);
-        }
+        // Daemon-resident KLD scoring is the ONLY model-backed Quality path: one
+        // resident forward + the shared hipfire-kld core. The standalone eval_hipfire
+        // example (and the cross-engine HFKLDR `.kldref.bin` it read) has been
+        // removed. Mock falls through to mock rows.
         if !matches!(config.executor, EvalExecutorMode::Mock) {
-            if let Some(rows) = kld_reference_rows(config, ctx) {
-                return rows;
-            }
+            return run_daemon_quality_rows(config, ctx);
         }
     }
     if battery == BatteryId::Speed {
