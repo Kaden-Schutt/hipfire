@@ -29,3 +29,4 @@ pub mod qwen35_decode;
 pub mod qwen35_prefill;
 pub mod request;
 pub mod session;
+pub mod tiny_harness;

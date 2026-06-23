@@ -381,6 +381,15 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
     };
 
     let gemv = gemv_family();
+    // Calibration tap: when a Hessian/imatrix collector is armed
+    // (`gpu.active_capture`) and this weight is a known target
+    // (`gpu.capture_names`), accumulate the input activation. Zero-cost
+    // (one `is_none()` branch) and byte-identical to the prior forward when
+    // no collector is armed. Placed before `DispatchCtx::new` borrows `gpu`.
+    // This is the single chokepoint that makes activation capture work for
+    // every arch that routes its linears through `weight_gemv` (qwen2,
+    // gemma3, minimax dense, qwen35 dense) — not just qwen35's fused kernels.
+    gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
     let ctx = DispatchCtx::new(gpu);
     let wr = WeightRef {
         buf: &w.buf,

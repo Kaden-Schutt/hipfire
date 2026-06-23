@@ -59,6 +59,8 @@ mod executor_examples;
 use executor_examples::*;
 mod executor_mock;
 use executor_mock::*;
+mod executor_tinyquant;
+use executor_tinyquant::*;
 mod host_profile;
 use host_profile::*;
 mod evidence;
@@ -163,6 +165,7 @@ pub enum BatteryId {
     Profile,
     Calibrate,
     Perplexity,
+    TinyQuant,
 }
 
 impl BatteryId {
@@ -186,6 +189,7 @@ impl BatteryId {
             "profile" => Ok(Self::Profile),
             "calibrate" | "calibration" => Ok(Self::Calibrate),
             "perplexity" | "ppl" => Ok(Self::Perplexity),
+            "tinyquant" | "tiny_quant" | "tiny-quant" => Ok(Self::TinyQuant),
             other => Err(format!("unknown battery: {other}")),
         }
     }
@@ -210,6 +214,7 @@ impl BatteryId {
             Self::Profile => "profile",
             Self::Calibrate => "calibrate",
             Self::Perplexity => "perplexity",
+            Self::TinyQuant => "tiny_quant",
         }
     }
 }

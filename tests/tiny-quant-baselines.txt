@@ -1,0 +1,13 @@
+# tiny-quant KLD baselines — gpu_arch family format mean_kld rel_tol
+# regenerate per GPU: HIPFIRE_TINYQUANT_RECORD=1 ./tests/tiny-quant-gate.sh --record
+gfx1103 gemma3 hfq4 0.15877441 0.25
+gfx1103 gemma3 q8f16 0.00158926 0.25
+gfx1103 minimax mq4 0.00104174 0.25
+gfx1103 qwen2 hfq4 0.00266174 0.25
+gfx1103 qwen2 q8f16 0.00000870 0.25
+gfx1103 qwen3_5 mq3 0.52648510 0.25
+gfx1103 qwen3_5 mq4 0.23503346 0.25
+gfx1103 qwen3_5 mq6 0.02604116 0.25
+gfx1103 qwen3_5 q8f16 0.00113526 0.25
+gfx1103 qwen3_5 qtip3-sim-calib 0.35869091 0.25
+gfx1103 qwen3_5_moe q8f16 0.14122965 0.25
