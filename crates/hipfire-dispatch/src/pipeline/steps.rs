@@ -623,13 +623,12 @@ fn oq4_gemv_into(
     };
     let xr: &rdna_compute::GpuTensor = rotated.as_ref().unwrap_or(x);
 
-    let xq = alias(gpu.oq4_xq.as_ref().unwrap(), k / 2, DType::Raw);
-    let xs = alias(gpu.oq4_xs.as_ref().unwrap(), ng, DType::F32);
-    gpu.quantize_act_oq4(xr, &xq, &xs, 1, k, GROUP).map_err(hip)?;
     let ws = w.buf.sub_offset(m * (k / 2), m * ng * 4);
-    // Decode is B=1 → the one-wave-per-row GEMV (no WMMA N-tile waste) is the
-    // weight-bandwidth-bound path; the WMMA grouped GEMM is for batched prefill.
-    gpu.gemv_oq4_grouped(w.buf, &ws, &xq, &xs, out, m, k, GROUP)
+    // OQ4+ decode (B=1): consume the f32 rotated activation directly — unpack the
+    // 4-bit-resident weight inline (W4A16). No quantize_act_oq4 launch, no WMMA
+    // N-tile waste; reads half the bytes of OQ8+ (nibbles vs int8). WMMA grouped
+    // GEMM remains the batched-prefill path.
+    gpu.gemv_oq4_grouped(w.buf, &ws, xr, out, m, k, GROUP)
         .map_err(hip)
 }
 
@@ -986,10 +985,12 @@ fn launch_fused(
     let fused_qkv = FUSED_QKV.get_or_init(FusedQkvFamily::new);
 
     match key {
-        // ── Opus W4A4 fused projections ──────────────────────────────────────
-        // `activated` is the FWHT-rotated f32 activation. Int4-quantize it ONCE
-        // (the fusion win), then run the dedicated fused iu4 kernel that demuxes
-        // the sub-projections over the shared int4 operand.
+        // ── OQ4+ fused projections (decode) ──────────────────────────────────
+        // `activated` is the FWHT-rotated f32 activation, consumed DIRECTLY:
+        // W4A16 decode (unpack the 4-bit-resident weight inline, f32 acts) — no
+        // quantize_act_oq4 launch, mq4-style. One wave-per-row GEMV per
+        // sub-projection (leaner than the batched WMMA which wastes 15/16 of its
+        // N-tile at B=1; the WMMA fused kernel stays for batched prefill).
         KernelKey::FusedQkvzaOq4G256 => {
             let hip = |e: rdna_compute::HipError| DispatchError::Hip(e.to_string());
             let (wqkv, qkv) = gemv_weight_out(&steps[1]);
@@ -997,25 +998,10 @@ fn launch_fused(
             let (wb, beta) = gemv_weight_out(&steps[3]);
             let (wa, alpha) = gemv_weight_out(&steps[4]);
             let k = wqkv.k;
-            gpu.ensure_oq4_scratch().map_err(hip)?;
-            let xq = rdna_compute::GpuTensor {
-                buf: unsafe { gpu.oq4_xq.as_ref().unwrap().buf.alias() },
-                shape: vec![k / 2],
-                dtype: DType::Raw,
-            };
-            let xs = rdna_compute::GpuTensor {
-                buf: unsafe { gpu.oq4_xs.as_ref().unwrap().buf.alias() },
-                shape: vec![k / 256],
-                dtype: DType::F32,
-            };
-            gpu.quantize_act_oq4(activated, &xq, &xs, 1, k, 256).map_err(hip)?;
-            // Decode B=1: quantize the shared activation once (the fusion win),
-            // then one wave-per-row GEMV per sub-projection — leaner than the
-            // batched WMMA fused kernel which wastes 15/16 of its N-tile at B=1.
             let ng = k / 256;
             for (wt, out) in [(wqkv, qkv), (wz, z), (wb, beta), (wa, alpha)] {
                 let ws = wt.buf.sub_offset(wt.m * (k / 2), wt.m * ng * 4);
-                gpu.gemv_oq4_grouped(wt.buf, &ws, &xq, &xs, out, wt.m, k, 256)
+                gpu.gemv_oq4_grouped(wt.buf, &ws, activated, out, wt.m, k, 256)
                     .map_err(hip)?;
             }
             Ok(())
@@ -1025,22 +1011,10 @@ fn launch_fused(
             let (wg, gate) = gemv_weight_out(&steps[1]);
             let (wu, up) = gemv_weight_out(&steps[2]);
             let k = wg.k;
-            gpu.ensure_oq4_scratch().map_err(hip)?;
-            let xq = rdna_compute::GpuTensor {
-                buf: unsafe { gpu.oq4_xq.as_ref().unwrap().buf.alias() },
-                shape: vec![k / 2],
-                dtype: DType::Raw,
-            };
-            let xs = rdna_compute::GpuTensor {
-                buf: unsafe { gpu.oq4_xs.as_ref().unwrap().buf.alias() },
-                shape: vec![k / 256],
-                dtype: DType::F32,
-            };
-            gpu.quantize_act_oq4(activated, &xq, &xs, 1, k, 256).map_err(hip)?;
             let ng = k / 256;
             for (wt, out) in [(wg, gate), (wu, up)] {
                 let ws = wt.buf.sub_offset(wt.m * (k / 2), wt.m * ng * 4);
-                gpu.gemv_oq4_grouped(wt.buf, &ws, &xq, &xs, out, wt.m, k, 256)
+                gpu.gemv_oq4_grouped(wt.buf, &ws, activated, out, wt.m, k, 256)
                     .map_err(hip)?;
             }
             Ok(())

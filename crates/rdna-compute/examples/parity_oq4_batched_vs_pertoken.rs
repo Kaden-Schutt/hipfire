@@ -55,7 +55,9 @@ fn main() {
         for r in 0..nn {
             let xr = xb.sub_offset(r*k, k);
             gpu.quantize_act_oq4(&xr, &q1, &s1, 1, k, group).unwrap();
-            gpu.gemv_oq4_grouped(&w, &ws, &q1, &s1, &yy, m, k, group).unwrap();
+            // Per-token W4A4 reference: the iu4 WMMA GEMM at B=1 (the decode
+            // gemv_oq4_grouped is now W4A16, so it is no longer the W4A4 oracle).
+            gpu.gemm_oq4_grouped_wmma(&w, &ws, &q1, &s1, &yy, m, k, 1, group).unwrap();
             gpu.device_synchronize().unwrap();
             fpn[r*m..(r+1)*m].copy_from_slice(&gpu.download_f32(&yy).unwrap());
         }

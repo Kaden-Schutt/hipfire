@@ -45680,8 +45680,7 @@ impl Gpu {
         &mut self,
         w_i4: &GpuTensor,
         w_scales: &GpuTensor,
-        x_i4: &GpuTensor,
-        x_scales: &GpuTensor,
+        x_f32: &GpuTensor,
         y_f32: &GpuTensor,
         m: usize,
         k: usize,
@@ -45701,8 +45700,7 @@ impl Gpu {
         )?;
         let wp = w_i4.buf.as_ptr();
         let wsp = w_scales.buf.as_ptr();
-        let xp = x_i4.buf.as_ptr();
-        let xsp = x_scales.buf.as_ptr();
+        let xp = x_f32.buf.as_ptr();
         let yp = y_f32.buf.as_ptr();
         let mut mi = m as i32;
         let mut ki = k as i32;
@@ -45711,7 +45709,6 @@ impl Gpu {
             &wp as *const _ as *mut c_void,
             &wsp as *const _ as *mut c_void,
             &xp as *const _ as *mut c_void,
-            &xsp as *const _ as *mut c_void,
             &yp as *const _ as *mut c_void,
             &mut mi as *mut _ as *mut c_void,
             &mut ki as *mut _ as *mut c_void,

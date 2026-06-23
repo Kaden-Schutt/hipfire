@@ -549,6 +549,11 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
         // Weight buffer holds [packed nibbles | per-group f32 scales]; the scale
         // pointer is a sub_offset view (see the qt=32 loader arm).
         DType::Oq4G256 => {
+            // OQ4+ decode (B=1), mq4-style W4A16: FWHT-rotate the activation, then
+            // consume the f32 rotated activation DIRECTLY in gemv_oq4_grouped
+            // (4-bit-resident weight unpacked inline). No quantize_act_oq4 launch
+            // and no WMMA N-tile waste; reads half the bytes of OQ8+. The iu4 WMMA
+            // GEMM stays the batched-prefill path. Matches execute_steps decode.
             const GROUP: usize = 256;
             assert_eq!(w.k % GROUP, 0, "Oq4G256 weight_gemv: K must be % 256");
             let ng = w.k / GROUP;
@@ -556,24 +561,9 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
             gpu.ensure_oq4_scratch()?;
             let xr = xr!();
             rotate_x_mq_for(gpu, w, x, &xr, w.k)?;
-            // Persistent int4 activation scratch (B=1) — aliased, NOT per-call
-            // alloc, so the forward stays hipGraph-capture-clean (no hipMalloc/Free
-            // inside the captured region). quantize_act_oq4 fully overwrites xq/xs;
-            // stream-ordered reuse across sequential projections is safe.
-            let xq = GpuTensor {
-                buf: unsafe { gpu.oq4_xq.as_ref().unwrap().buf.alias() },
-                shape: vec![w.k / 2],
-                dtype: DType::Raw,
-            };
-            let xs = GpuTensor {
-                buf: unsafe { gpu.oq4_xs.as_ref().unwrap().buf.alias() },
-                shape: vec![ng],
-                dtype: DType::F32,
-            };
-            gpu.quantize_act_oq4(&xr, &xq, &xs, 1, w.k, GROUP)?;
             // Weight scales view: byte offset M*(K/2) into the combined buffer.
             let ws = w.buf.sub_offset(w.m * (w.k / 2), w.m * ng * 4);
-            gpu.gemm_oq4_grouped_wmma(&w.buf, &ws, &xq, &xs, y, w.m, w.k, 1, GROUP)
+            gpu.gemv_oq4_grouped(&w.buf, &ws, &xr, y, w.m, w.k, GROUP)
         }
         // W8A8 reference (decode = B=1): reuse the weight_gemm path. buf =
         // [M*K int8 | M f32]. Per-vector int8 act-quant, iu8 WMMA (B=1), rowcol dequant.
