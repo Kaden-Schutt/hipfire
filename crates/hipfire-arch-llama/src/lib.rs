@@ -57,4 +57,4 @@ pub mod arch;
 /// See the module-level doc above for why the body lives in runtime.
 pub use hipfire_runtime::llama;
 
-pub use arch::Llama;
+pub use arch::{Llama, LlamaBackend};

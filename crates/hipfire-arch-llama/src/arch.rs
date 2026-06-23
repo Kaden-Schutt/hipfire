@@ -15,11 +15,14 @@
 //! same trait surface for LLaMA-family bring-up.
 
 use hip_bridge::HipResult;
-use hipfire_runtime::arch::Architecture;
+use hipfire_runtime::arch::{
+    run_simple_ar, ArchCaps, Architecture, GenerateCtx, ServeOutcome, ServingBackend, SimpleAr,
+};
 use hipfire_runtime::hfq::{self, HfqFile};
 use hipfire_runtime::kv::KvCache;
-use hipfire_runtime::llama::{ForwardScratch, LlamaConfig, LlamaWeights};
-use rdna_compute::Gpu;
+use hipfire_runtime::llama::{self, ForwardScratch, LlamaConfig, LlamaWeights};
+use hipfire_runtime::tokenizer::Tokenizer;
+use rdna_compute::{Gpu, GpuTensor};
 
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
@@ -384,5 +387,118 @@ impl Llama {
             repeat_window,
             repeat_penalty,
         )
+    }
+}
+
+/// Serving backend for the dense LLaMA / Mistral / plain-Qwen3 family (arch_id
+/// 0/1) — routes through the shared `ServingBackend::serve` seam
+/// (`run_simple_ar` → prefill → `decode_loop`) instead of the qwen35-shared
+/// `generate()` path. Owns its config/weights/decode scratch/KV cache. P3.2.
+pub struct LlamaBackend {
+    pub arch_id: u32,
+    pub config: LlamaConfig,
+    pub weights: LlamaWeights,
+    pub scratch: ForwardScratch,
+    pub kv_cache: KvCache,
+}
+
+impl LlamaBackend {
+    pub fn new(
+        arch_id: u32,
+        config: LlamaConfig,
+        weights: LlamaWeights,
+        scratch: ForwardScratch,
+        kv_cache: KvCache,
+    ) -> Self {
+        Self {
+            arch_id,
+            config,
+            weights,
+            scratch,
+            kv_cache,
+        }
+    }
+}
+
+impl SimpleAr for LlamaBackend {
+    fn prefill(&mut self, gpu: &mut Gpu, tokens: &[u32]) -> Result<(), String> {
+        // Leaves the final-position logits in `scratch.logits`; the batched path
+        // falls back to a per-token embed+compute loop for short/ineligible
+        // prompts, so any token slice is safe.
+        llama::forward_prefill_batch(
+            gpu,
+            &self.weights,
+            &self.config,
+            tokens,
+            0,
+            &mut self.kv_cache,
+            &self.scratch,
+            None,
+        )
+        .map_err(|e| format!("llama prefill forward_prefill_batch: {e:?}"))
+    }
+
+    fn decode_step(&mut self, gpu: &mut Gpu, token: u32, pos: usize) -> Result<(), String> {
+        // Logits-only decode: embed the token then run the layer stack, leaving
+        // logits in `scratch.logits` for the daemon sampler (the sampling
+        // `forward_scratch` is intentionally bypassed — `decode_loop` samples).
+        llama::forward_scratch_embed(gpu, &self.weights, &self.config, token, pos, &self.scratch)
+            .map_err(|e| format!("llama decode forward_scratch_embed: {e:?}"))?;
+        llama::forward_scratch_compute(
+            gpu,
+            &self.weights,
+            &self.config,
+            pos,
+            &mut self.kv_cache,
+            &self.scratch,
+        )
+        .map_err(|e| format!("llama decode forward_scratch_compute: {e:?}"))
+    }
+
+    fn logits(&self) -> &GpuTensor {
+        &self.scratch.logits
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
+}
+
+/// Dense-AR family: no fast-path caps; the shared `run_simple_ar` loop over the
+/// `SimpleAr` impl drives generation.
+impl ServingBackend for LlamaBackend {
+    fn arch_id(&self) -> u32 {
+        self.arch_id
+    }
+
+    fn caps(&self) -> ArchCaps {
+        ArchCaps::default()
+    }
+
+    fn eos_token(&self) -> u32 {
+        self.config.eos_token
+    }
+
+    fn serve(
+        &mut self,
+        gpu: &mut Gpu,
+        tok: &Tokenizer,
+        ctx: &mut GenerateCtx,
+    ) -> Result<ServeOutcome, String> {
+        let eos = self.config.eos_token;
+        run_simple_ar(gpu, self, tok, eos, ctx)
+    }
+
+    fn reset_session(&mut self, _gpu: &mut Gpu, _session_id: &str) -> Result<(), String> {
+        // Single-session bring-up: rewind the KV write cursor.
+        self.kv_cache.compact_offset = 0;
+        Ok(())
+    }
+
+    fn unload(self: Box<Self>, gpu: &mut Gpu) {
+        let b = *self;
+        b.weights.free_gpu(gpu);
+        b.scratch.free_gpu(gpu);
+        b.kv_cache.free_gpu(gpu);
     }
 }

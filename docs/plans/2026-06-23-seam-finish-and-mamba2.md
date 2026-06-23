@@ -169,8 +169,20 @@ infrastructure rather than two more special cases. The existing qwen35 hybrid
      Compiles + clippy + qwen2 dispatch tests clean. **Runtime validation
      pending** — needs a quantized qwen2 `.hfq` (only HF sources local; the
      standard coherence gate uses qwen35, not arch-7).
-   - **P3.2 llama**, **P3.3 thread daemon sampler/sessions/streaming through
-     `decode_loop`** (the greedy-only → full-sampling upgrade) remain.
+   - **P3.3 ✅** (b70be1b15, gate-passed): `decode_loop` now drives the shared GPU
+     sampler (`crate::sampler::sample`) — temperature + top-p + repeat/presence/
+     frequency penalties from `GenerateCtx`, replacing greedy argmax. `temp==0`
+     stays greedy (gates unchanged); `temp>0` samples. Every seam arch
+     (qwen2/gemma3/future llama) gets full sampling without a bespoke loop.
+   - **P3.2 ▸ crate side done** (LlamaBackend impl SimpleAr+ServingBackend in
+     hipfire-arch-llama; prefill=forward_prefill_batch, decode_step=
+     forward_scratch_embed+compute logits-only, serve=run_simple_ar). **Daemon
+     routing pending and NOT a mechanical qwen2 mirror:** `generate()` applies
+     `JinjaChatFrame` chat-framing for the llama path, so `generate_llama` must
+     replicate that framing before `serve()` or instruct llama models lose their
+     chat template. Next: `LoadedModel.llama_backend` field + build at arch-0/1
+     load + framing-aware `generate_llama` + route at the `generate()` dispatch
+     top. Validate on `llama-3.2-1b-instruct-mq4.hfq` (local).
 4. **P4 — migrate the bespoke loops.** minimax, lfm2moe, deepseek4, and the VL
    archs (gemma3-vl, dots-ocr) as `serve` overrides behind `ArchCaps`.
 5. **P5 — migrate qwen35 (risk-concentrated).** DFlash/MTP/PP/grouped-MoE as
