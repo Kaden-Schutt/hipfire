@@ -140,8 +140,76 @@ Remove `build_kld_ref_hipfire` / `eval_hipfire` once the daemon op covers them.
 5. (WS3) per-arch eval becomes a cheap warm daemon call → arch-coverage matrix
    (gfx1103 first-class: dispatch gaps, eval arch-map, perf baseline).
 
+## Step 4 — finalized scope (2026-06-23)
+
+Decisions locked: scripts **drive the daemon op directly** (no wrapper CLI);
+**delete the 2 qwen35 bins only** (`eval_hipfire`, `build_kld_ref_hipfire`).
+`eval_hipfire_llama` stays — the daemon op is qwen3.5-only
+(`hipfire-daemon/src/main.rs:4437` arch-gate); llama migration is a separate task.
+`build_kld_ref` (cross-engine) and `eval_gguf` (GGUF anchor) are different-purpose,
+out of scope.
+
+### Phase A — repoint `hipfire-eval` Quality battery (Rust)
+- `crates/hipfire-eval/Cargo.toml`: add deps `hipfire-kld`, `hipfire-daemon-adapter`,
+  `hipfire-daemon-protocol` (none present today).
+- `crates/hipfire-eval/src/executor_daemon.rs:21-36` (`daemon_battery_rows`): add a
+  `BatteryId::Quality` arm. For each candidate: ensure the daemon has the candidate
+  model loaded, then `adapter.kld_eval(KldEvalRequest{ mode: Score, ref_path, output,
+  .. })`; map `KldEvalResponse{ mean_kld, p99_kld, mean_nll, ppl }` → eval rows.
+  Reuse the existing daemon harness the other batteries use (spawn/connect + lock).
+- `crates/hipfire-eval/src/quality.rs:161-263` (`run_kld_reference_row`): delete the
+  `std::process::Command::new(eval_hipfire)` spawn (+ `resolve_eval_hipfire_bin`,
+  the arg builder, and the HFKSEQ-file reparse). Reference production moves to
+  daemon `build_ref` (resident) — drop the `build_kld_ref_hipfire` dependency.
+- `crates/hipfire-eval/src/driver.rs:625-634`: Quality now routes via the daemon
+  executor, not `kld_reference_rows`→examples.
+- Ref-format note: HFKREF ≠ legacy HFQM `.kldref.hfq`. The battery regenerates refs
+  via resident `build_ref` (or `self_score`); old refs are not reused (no provenance
+  for `compat()`).
+
+### Phase B — rewrite the 8 scripts to drive the daemon
+Pattern (one resident daemon per sweep, sequential `load`+`kld_eval` per variant
+over the JSON-lines stdin protocol — no per-variant process spawn, no `eval_hipfire`):
+```
+{ echo '{"type":"load","model":"<ref-model>", ...}'
+  echo '{"type":"kld_eval","mode":"build_ref","ref_path":"<ref>", ...}'
+  for v in variants; do
+    echo '{"type":"load","model":"'$v'", ...}'
+    echo '{"type":"kld_eval","mode":"score","ref_path":"<ref>","output":"'$v.kldseq'"}'
+  done
+} | hipfire-daemon | jq -c 'select(.type=="kld_evaled")'
+```
+Scripts to convert: `scripts/quant_cohort.sh` (158/255/373), `scripts/awq_alpha_sweep.sh`
+(30/47), `scripts/awq_f1_vs_f2.sh` (24), `scripts/awq_f2_alpha_sweep_wait.sh` (8),
+`scripts/mi300x_bootstrap.sh` (187-192), `scripts/mi300x_sub_0_10_attempt.sh` (25/28),
+`scripts/mi300x_v3_matrix.sh` (41/69), `tests/mi300x_smoke_gfx942.sh` (14/20/22).
+Drop the `cargo build --example eval_hipfire` lines; build `hipfire-daemon` instead.
+The mi300x scripts also need the daemon's resource-lock env (`HIPFIRE_RESOURCE_LOCK_WAIT_MS`).
+
+### Phase C — delete the 2 bins (only after A+B land + green)
+- Delete `crates/hipfire-runtime/examples/eval_hipfire.rs`,
+  `crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs`.
+- Remove their `[[example]]` entries from `crates/hipfire-runtime/Cargo.toml`
+  (`eval_hipfire` 334-336; the `build_kld_ref_hipfire` entry).
+- Update `benchmarks/quality-baselines/README.md` (drops the two entries; keep
+  `build_kld_ref`, `eval_gguf`).
+- Verify: `./tests/no-gpu-ci.sh`, then a warm Quality battery run on gfx1103, and
+  re-run one migrated sweep (e.g. `awq_alpha_sweep.sh`) to confirm parity.
+
+### Risks / sequencing
+- A before B before C (scripts must stop referencing the bins before deletion).
+- Daemon op is qwen35-only: any script pointed at a non-qwen35 model must keep
+  `eval_hipfire_llama`/`eval_gguf` (don't force those onto the daemon op).
+- Parity check: one variant scored old-path vs daemon-path should match within
+  the established 8.43e-10 self-consistency band before mass-converting scripts.
+
 ## Out of scope (separate workstreams)
 
 - WS2 format registry/codec trait in `hipfire-quantize` (makes the 8-bit W8A8
-  format land cleanly; ~18-edit friction today).
+  format land cleanly; ~18-edit friction today). **Partly addressed** 2026-06-23:
+  W8A8 (Oq8G256), OQ+/OQ+T/OQ+C (Opus Plus W4A8 tiers) landed without the trait,
+  but each new format still touches QuantType/HfqInputFormat/from_flag/loader-arm
+  by hand — the registry would collapse that.
+- Llama (and other non-qwen35 arch) support in the daemon `kld_eval` op — would let
+  `eval_hipfire_llama` migrate + delete; needs arch-generalizing the handler gate.
 - WS4 wire `hipfire-detect` into the bash gates (remove ~1200 lines inline Python).
