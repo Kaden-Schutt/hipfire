@@ -1777,6 +1777,7 @@ dependencies = [
  "crossterm",
  "glob",
  "half",
+ "hipfire-kvquant",
  "hipfire-model",
  "hipfire-runtime",
  "ratatui",

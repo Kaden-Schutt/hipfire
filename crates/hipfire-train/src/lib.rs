@@ -17,6 +17,7 @@ pub mod drafter;
 pub mod hfq_patch;
 pub mod loader;
 pub mod model;
+pub mod oqplus_quant;
 pub mod ops;
 pub mod optim;
 pub mod labels;
