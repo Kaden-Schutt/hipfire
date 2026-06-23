@@ -16851,6 +16851,53 @@ fn dump_hidden_localize(
         Ok(p) => p,
         Err(_) => return,
     };
+    use std::io::Write;
+    let path = format!("{prefix}.{tag}");
+    // Activation-capture mode (HIPFIRE_DUMP_HIDDEN_ALL=1): dump EVERY row of `x`
+    // as raw [dim] f32 each (no per-row header) — so one prefill yields n_rows
+    // real-activation samples for an offline rotation/quant study, AND a per-token
+    // decode appends its single row each call → the file accumulates the whole
+    // sequence. This mode IGNORES the single-position POS gate (which only makes
+    // sense for the localize path below); it must fire at every position.
+    if std::env::var("HIPFIRE_DUMP_HIDDEN_ALL").as_deref() == Ok("1") {
+        // Two sub-modes:
+        //  - default: restrict to one target layer (HIPFIRE_DUMP_HIDDEN_LAYER,
+        //    default 0), one file `{prefix}.{tag}` (the kv-compression study path).
+        //  - HIPFIRE_DUMP_HIDDEN_ALLLAYERS=1: capture EVERY layer to per-layer
+        //    files `{prefix}.{tag}.L{layer_idx}` — the Phase-A block-local
+        //    recovery capture (residual-stream in/mid/out for all blocks).
+        let all_layers = std::env::var("HIPFIRE_DUMP_HIDDEN_ALLLAYERS").as_deref() == Ok("1");
+        let layer_path = if all_layers {
+            format!("{path}.L{layer_idx}")
+        } else {
+            let want_layer: usize = std::env::var("HIPFIRE_DUMP_HIDDEN_LAYER")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            if layer_idx != want_layer {
+                return;
+            }
+            path.clone()
+        };
+        if gpu.hip.device_synchronize().is_err() {
+            return;
+        }
+        let all = match gpu.download_f32(x) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&layer_path)
+        {
+            let take = (n_rows * dim).min(all.len());
+            let bytes: Vec<u8> = all[..take].iter().flat_map(|v| v.to_le_bytes()).collect();
+            let _ = f.write_all(&bytes);
+        }
+        return;
+    }
+    // Single-position localize path (PARO batched-vs-pertoken diff).
     let target: usize = std::env::var("HIPFIRE_DUMP_HIDDEN_POS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -16869,31 +16916,6 @@ fn dump_hidden_localize(
         Ok(v) => v,
         Err(_) => return,
     };
-    use std::io::Write;
-    let path = format!("{prefix}.{tag}");
-    // Activation-capture mode (HIPFIRE_DUMP_HIDDEN_ALL=1): dump EVERY row for a
-    // single target layer (HIPFIRE_DUMP_HIDDEN_LAYER) as raw [dim] f32 each — no
-    // per-row header — so one prefill yields n_rows real-activation samples for an
-    // offline rotation/quant study. Otherwise the original single-position localize.
-    if std::env::var("HIPFIRE_DUMP_HIDDEN_ALL").as_deref() == Ok("1") {
-        let want_layer: usize = std::env::var("HIPFIRE_DUMP_HIDDEN_LAYER")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        if layer_idx != want_layer {
-            return;
-        }
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            let take = (n_rows * dim).min(all.len());
-            let bytes: Vec<u8> = all[..take].iter().flat_map(|v| v.to_le_bytes()).collect();
-            let _ = f.write_all(&bytes);
-        }
-        return;
-    }
     let off = row * dim;
     if off + dim > all.len() {
         return;
@@ -23965,6 +23987,11 @@ fn forward_scratch_layers(
                     )?;
                 }
 
+                // Phase-A block-local recovery capture: pre-MLP residual (x_mid)
+                // = post-mixer residual feeding ffn_norm. Pairs with the "pertoken"
+                // (block-output) dump at the loop tail to isolate the MLP for
+                // norm-recovery without running the DeltaNet mixer in the trainer.
+                dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "premlp");
                 // ── FFN ──
                 gate_up_via_execute_steps(
                     gpu,
@@ -25037,6 +25064,9 @@ fn forward_scratch_layers(
                     }
                 }
 
+                // Phase-A block-local recovery capture: pre-MLP residual (x_mid)
+                // for full-attention layers (post-attn residual feeding ffn_norm).
+                dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "premlp");
                 // FFN: fused rmsnorm + rotate for w_gate/w_up.
                 let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu,
