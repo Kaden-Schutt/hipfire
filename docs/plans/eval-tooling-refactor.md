@@ -149,6 +149,30 @@ Decisions locked: scripts **drive the daemon op directly** (no wrapper CLI);
 `build_kld_ref` (cross-engine) and `eval_gguf` (GGUF anchor) are different-purpose,
 out of scope.
 
+### STATUS (2026-06-23): Phases A/B/C DONE; old llama format removed
+
+Decision evolved mid-execution: rather than preserve cross-engine validation, we
+**removed all support for the old llama (cross-engine HFKLDR `.kldref.bin`) KLD
+format** and consolidated everything onto the hipfire-self daemon path.
+
+- **Phase A (c0eb9942):** hipfire-eval Quality battery → daemon `kld_eval` (validated
+  green: OQ+C vs resident wikitext ref, mean_kld=0.0507).
+- **Removal (cf730a87):** deleted `build_kld_ref` (HFKLDR producer), `eval_hipfire` +
+  `eval_hipfire_llama` (HFKLDR/HFQM scorers), `eval_gguf` (llama-perplexity + HFKLDR),
+  `convert_kldref`, `build_kld_ref_hipfire` (HFQM self-builder, replaced by daemon) +
+  their Cargo entries; stripped the eval_hipfire-spawning path from hipfire-eval;
+  Quality now routes through the daemon for every non-Mock executor.
+- **Phase B/C (09878ce4):** `scripts/lib/kld_daemon.sh` (kld_build_ref/kld_score/
+  kld_field) + converted all 8 scripts (awq_*, quant_cohort, mi300x_*) off
+  eval_hipfire/`.kldref.bin` onto the daemon op. gfx942 bring-up scripts converted
+  mechanically (untested on-box, flagged in headers).
+
+Residual (optional follow-up): peripheral Python/shell tools still *mention* the old
+format in comments/paths — `scripts/cross_engine_check.py`, `scripts/fetch-eval-refs.sh`,
+`scripts/astrea.py` (a source-file list). Not on the KLD path; clean up if revisited.
+
+---
+
 ### Phase A — repoint `hipfire-eval` Quality battery (Rust)
 - `crates/hipfire-eval/Cargo.toml`: add deps `hipfire-kld`, `hipfire-daemon-adapter`,
   `hipfire-daemon-protocol` (none present today).
