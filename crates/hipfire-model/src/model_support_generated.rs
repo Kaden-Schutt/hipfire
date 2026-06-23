@@ -161,10 +161,10 @@ pub const QUANT_TABLE: &[QuantInfo] = &[
     },
     QuantInfo {
         name: "oq8",
-        label: "Opus / OQ8 (W8A8)",
-        weight_bits: 8,
+        label: "Opus / OQ8+ (W4A8, 4-bit weights int8-resident)",
+        weight_bits: 4,
         act_bits: 8,
-        status: "experimental",
+        status: "opt-in",
     },
     QuantInfo {
         name: "mq3",

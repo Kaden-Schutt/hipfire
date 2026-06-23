@@ -153,6 +153,35 @@ installed daemon, now fixed; OQ+ serves fine.)
 Until the fused Oq8 kernels land, mq4+ remains production W4A8. The LDLQ+AWQ recipe
 + its KLD win are the standing motivation to fund that kernel work.
 
+## PROMOTED as OQ8+ (2026-06-23) — decode blocker substantially closed
+
+The fused Oq8 decode kernels landed (commits d810f54b, 15a48ba9). Decode went
+**14.1 → 42.7 tok/s** (3.0×) via:
+- GEMV-demux fused QKVZA + gate-up (one launch, one wave/output-row, no WMMA
+  N-tile waste at B=1), B=1 wo/down residual via gemv (not gemm_oq8).
+- **W4A16 decode**: the rotated f32 activation is consumed directly and the int8
+  weight is dequantized inline (mq4-style) — no quantize_act_oq8 launch.
+
+**Profiling correction (rocprofv3, 0.8B):** this decode path is **96.7% kernel
+time, 3.3% memcpy** — NOT memcpy-sync-bound (that finding was the daemon path on
+bigger models). The residual gap to mq4+ (42.7 vs 59) is **weight-bandwidth**:
+OQ+ stores 4-bit weights but expands them to int8 in VRAM at load, so decode
+reads ~2× the bytes mq4 does. Per-launch the oq8 in-proj GEMVs are 1.4–1.5×
+slower, tracking the int8-vs-int4 byte ratio. No decode-side fusion can close
+this — only 4-bit-resident weights can.
+
+**DECISION (user, 2026-06-23): PROMOTE OQ8+** at decode 42.7 / KLD 0.046330
+(W4A16-decode numerics; still 1.7× better than mq4+ 0.078; coherent). The
+int8-resident weight-bandwidth gap is accepted; closing it is the **OQ4+**
+(4-bit-resident W4A8) follow-on, tracked separately.
+
+- Canonical artifact: `~/.hipfire/models/qwen3.5-0.8b-oq8+.hfq`
+  (md5 94ad6e0be70b1768af4b5c6342a6900c; from `/tmp/oqp-ldlqawq.hfq`,
+  LDLQ+AWQ recipe, qt=33).
+- Registry: `oq8` quant status experimental → **opt-in**; label corrected to
+  W4A8 (weight_bits=4, act_bits=8). Batched-prefill WMMA path remains
+  `partial`/parity-gated (the [[gate]] entry is unchanged — Tier 2 still open).
+
 ## Cross-cutting note
 
 This is **offline-quant** quality work — orthogonal to and cheaper than the
