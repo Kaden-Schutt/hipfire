@@ -188,6 +188,19 @@ per-decode state (KV cache + DeltaNet recurrent state) into one
   manual gate run. (Slice 3a was validated by running
   `./tests/coherence-gate-dflash.sh` by hand — all 4 cells OK.)
 
+- **Reference-vs-overlay kernel test coverage + `dispatch.rs` split.** The gate
+  on this gfx1151 box only exercises the arch-specific *overlay* path; the
+  generic *reference* floor (`kernels/src/*.hip`, the portability floor every
+  un-optimized/new arch runs) is shadowed and untested, and nothing diffs
+  overlay-vs-reference output. Add a `HIPFIRE_FORCE_GENERIC` dispatch flag + a
+  second "reference" gate cell + a differential parity check (the
+  `generic_warn.rs` count/reset infra already supports the CI assertions). The
+  kernel *sources* are already path-separated (`kernels/src/<arch>/*` overlays vs
+  the un-suffixed floor), but the *selection* is in one 52k-line `dispatch.rs`,
+  so per-path test-scoping is blocked on splitting it — plan:
+  `docs/plans/2026-06-23-dispatch-refactor.md` (op-family split, then per-arch
+  overlay extraction). Ties to the pre-commit-glob item above.
+
 ## DeltaNet state precision (follow-ups to Phase A gate, 2026-06-15)
 
 Phase A made the DeltaNet recurrent state default to **FP32** for all
