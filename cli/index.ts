@@ -5000,11 +5000,17 @@ async function runServe(args: string[]) {
     // per-model config still resolves (findModel handles a path too).
     process.env.HIPFIRE_MODEL = modelArg;
   }
+  // Save CLI-explicit values before applying cfg defaults: resolveServeBind
+  // must receive null for cliHost/cliPort when the user did not pass them on
+  // the command line (passing cfg defaults as "cli" would trigger the
+  // mutual-exclusion guard when --socket-path is also set).
+  const cliHostArg = host;
+  const cliPortArg = port;
   host = host ?? cfg.host;
   port = port ?? cfg.port;
 
   const rb = resolveServeBind({
-    cliSocketPath, cliHost: host, cliPort: port,
+    cliSocketPath, cliHost: cliHostArg, cliPort: cliPortArg,
     cfgSocketPath: cfg.socket_path, cfgHost: cfg.host, cfgPort: cfg.port,
   });
   if ("error" in rb) { console.error(rb.error); process.exit(EXIT.USAGE); }
