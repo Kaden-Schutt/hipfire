@@ -24274,6 +24274,11 @@ fn forward_scratch_layers(
                         hidden_row_bytes,
                     )?;
                 }
+                // Phase-A capture: pre-FFN residual (= x_in + attn_out). With the
+                // block-output "pertoken" dump, ffn_out = pertoken − preffn isolates
+                // the FFN contribution (this is a parallel block: gate/up read
+                // ffn_norm(x_in) BEFORE the attn wo-residual add).
+                dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "preffn");
                 weight_gemv_swiglu_residual_bf16_probe(
                     gpu,
                     layer_idx,
@@ -25223,6 +25228,8 @@ fn forward_scratch_layers(
                     config.dim,
                     &[(RqProj::Wgate, &s.gate_ffn), (RqProj::Wup, &s.up)],
                 )?;
+                // Phase-A capture: pre-FFN residual (x_in + attn_out) — see DeltaNet arm.
+                dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "preffn");
                 // Fused SwiGLU + w_down residual GEMV:
                 //   MQ4: fused_silu_rotate(gate,up) + gemv_residual(w_down, rotated, x)
                 //   HF4: silu_mul + weight_gemv_residual (unchanged)

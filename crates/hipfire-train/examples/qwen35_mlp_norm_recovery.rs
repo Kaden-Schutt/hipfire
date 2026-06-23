@@ -1,0 +1,305 @@
+//! Phase A (qwen3.5 OQ+ norm recovery): MLP-norm block-local distillation.
+//!
+//! For each layer, recover the `post_attention_layernorm` weight (γ) so the
+//! OQ+-quantized MLP reproduces the bf16 teacher's block output — using ONLY the
+//! daemon-captured residuals, so the (non-differentiable) DeltaNet/attn mixer is
+//! never run. Per layer i:
+//!   input  = x_mid_i  (captured `qwen35.premlp.L{i}`  — post-mixer, pre-FFN)
+//!   target = x_out_i  (captured `qwen35.pertoken.L{i}` — block output)
+//!   student: x_mid → rmsnorm(γ, trainable) → gate/up (OQ+ sim-quant, frozen)
+//!            → swiglu → down (OQ+) → + x_mid  ==>  predict x_out
+//!   loss = MSE(pred, x_out); AdamW on γ only.
+//! Because the residual x_mid is identical on both sides, MSE isolates the MLP
+//! quant error — exactly what γ can partially compensate.
+//!
+//! Capture first (see commit 402392f8):
+//!   HIPFIRE_FORWARD_LOWERED=0 HIPFIRE_DUMP_HIDDEN=/tmp/residcap/qwen35 \
+//!   HIPFIRE_DUMP_HIDDEN_ALL=1 HIPFIRE_DUMP_HIDDEN_ALLLAYERS=1 HIPFIRE_MAX_GEN=4 \
+//!   infer_qwen35 ~/.hipfire/models/qwen3.5-0.8b-bf16.hfq --guards off "<text>"
+//!
+//! Run:
+//!   hipfire gpu-lock acquire "qwen35-mlp-norm" --watch-pid $$
+//!   cargo run -p hipfire-train --release --example qwen35_mlp_norm_recovery
+//!   hipfire gpu-lock release
+//! Env: HIPFIRE_CAP_DIR (default /tmp/residcap), HIPFIRE_MODEL (bf16 .hfq),
+//!      HIPFIRE_RECOVER_LR (3e-4), HIPFIRE_RECOVER_STEPS (200).
+
+use hipfire_train::hfq_patch::{bf16_bits_to_f32, parse_hfq, HfqEntry};
+use hipfire_train::optim::AdamW;
+use hipfire_train::oqplus_quant::oqplus_simquant;
+use hipfire_train::ops::linear::{linear_backward_x, linear_forward};
+use hipfire_train::ops::rmsnorm::{rmsnorm_backward, rmsnorm_forward};
+use hipfire_train::ops::swiglu::{swiglu_backward, swiglu_forward};
+use rdna_compute::{DType, Gpu};
+use std::collections::HashMap;
+
+const QT_BF16: u8 = 16;
+
+fn envs(k: &str, d: &str) -> String {
+    std::env::var(k).unwrap_or_else(|_| d.to_string())
+}
+fn envf(k: &str, d: f32) -> f32 {
+    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+}
+fn envu(k: &str, d: usize) -> usize {
+    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+}
+
+/// Read a bf16-stored tensor from the parsed .hfq bytes as f32.
+fn read_bf16(bytes: &[u8], e: &HfqEntry) -> Result<Vec<f32>, String> {
+    if e.quant_type != QT_BF16 {
+        return Err(format!("{}: quant_type {} != bf16(16)", e.name, e.quant_type));
+    }
+    let n = e.data_size / 2;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let off = e.data_offset + i * 2;
+        out.push(bf16_bits_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]])));
+    }
+    Ok(out)
+}
+
+/// Read a captured residual file `{dir}/qwen35.{tag}.L{i}` as rows × dim f32.
+fn read_cap(dir: &str, tag: &str, i: usize, dim: usize) -> Result<(Vec<f32>, usize), String> {
+    let p = format!("{dir}/qwen35.{tag}.L{i}");
+    let raw = std::fs::read(&p).map_err(|e| format!("{p}: {e}"))?;
+    if raw.len() % (dim * 4) != 0 {
+        return Err(format!("{p}: {} bytes not a multiple of dim*4", raw.len()));
+    }
+    let rows = raw.len() / (dim * 4);
+    let mut out = Vec::with_capacity(rows * dim);
+    for c in raw.chunks_exact(4) {
+        out.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+    }
+    Ok((out, rows))
+}
+
+fn mse(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>() / a.len() as f32
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cap_dir = envs("HIPFIRE_CAP_DIR", "/tmp/residcap");
+    let model = envs(
+        "HIPFIRE_MODEL",
+        &format!("{}/.hipfire/models/qwen3.5-0.8b-bf16.hfq", std::env::var("HOME").unwrap()),
+    );
+    let lr = envf("HIPFIRE_RECOVER_LR", 3e-4);
+    let steps = envu("HIPFIRE_RECOVER_STEPS", 200);
+
+    let bytes = std::fs::read(&model)?;
+    let (entries, meta) = parse_hfq(&bytes).map_err(|e| format!("parse_hfq: {e}"))?;
+    let by_name: HashMap<&str, &HfqEntry> = entries.iter().map(|e| (e.name.as_str(), e)).collect();
+
+    // dims from metadata json — config nests under config.text_config.
+    let mj: serde_json::Value = serde_json::from_str(&meta)?;
+    let tc = mj.get("config").and_then(|c| c.get("text_config"))
+        .or_else(|| mj.get("config"))
+        .unwrap_or(&mj);
+    let getu = |k: &str| -> usize {
+        tc.get(k).or_else(|| mj.get(k)).and_then(|v| v.as_u64()).unwrap_or(0) as usize
+    };
+    let dim = if getu("dim") > 0 { getu("dim") } else { getu("hidden_size") };
+    let inter = if getu("hidden_dim") > 0 { getu("hidden_dim") } else { getu("intermediate_size") };
+    let n_layers = if getu("n_layers") > 0 { getu("n_layers") } else { getu("num_hidden_layers") };
+    let eps = (tc.get("norm_eps").or_else(|| tc.get("rms_norm_eps"))
+        .and_then(|v| v.as_f64()).unwrap_or(1e-6)) as f32;
+    println!("model: dim={dim} inter={inter} layers={n_layers} eps={eps}  lr={lr} steps={steps}");
+
+    let mut gpu = Gpu::init().expect("Gpu::init failed");
+    println!("arch: {}\n", gpu.arch);
+
+    // Find the layer-prefix scheme by probing a known tensor name (qwen3.5-VL
+    // nests under model.language_model.layers; text-only under model.layers).
+    let prefix = |i: usize, leaf: &str| -> String {
+        for base in ["model.language_model.layers", "model.layers", "layers"] {
+            let cand = format!("{base}.{i}.{leaf}");
+            if by_name.contains_key(cand.as_str()) {
+                return cand;
+            }
+        }
+        format!("model.language_model.layers.{i}.{leaf}") // default; error surfaces on lookup
+    };
+
+    let mut total_start = 0.0f64;
+    let mut total_final = 0.0f64;
+    let mut n_done = 0usize;
+    let mut tuned_norms: HashMap<String, Vec<f32>> = HashMap::new();
+
+    for i in 0..n_layers {
+        // Load this layer's MLP weights + norm. Skip layers whose MLP tensors
+        // aren't present as bf16 (e.g. MoE layers) — Phase A is dense-MLP norms.
+        let names = [
+            (prefix(i, "mlp.gate_proj.weight"), "gate"),
+            (prefix(i, "mlp.up_proj.weight"), "up"),
+            (prefix(i, "mlp.down_proj.weight"), "down"),
+            (prefix(i, "post_attention_layernorm.weight"), "norm"),
+        ];
+        let mut missing = false;
+        for (nm, _) in &names {
+            match by_name.get(nm.as_str()) {
+                Some(e) if e.quant_type == QT_BF16 => {}
+                _ => { missing = true; }
+            }
+        }
+        if missing {
+            continue;
+        }
+        let w_gate_h = read_bf16(&bytes, by_name[names[0].0.as_str()])?;
+        let w_up_h = read_bf16(&bytes, by_name[names[1].0.as_str()])?;
+        let w_down_h = read_bf16(&bytes, by_name[names[2].0.as_str()])?;
+        let norm_name = names[3].0.clone();
+        let mut gamma_h = read_bf16(&bytes, by_name[norm_name.as_str()])?;
+        // qwen3.5 may store RMSNorm weight as (1+γ) (Gemma-style). HIPFIRE_NORM_PLUS1=1
+        // adds 1.0 so the effective scale is ~1 (stored values centered near 0).
+        if std::env::var("HIPFIRE_NORM_PLUS1").as_deref() == Ok("1") {
+            for v in gamma_h.iter_mut() {
+                *v += 1.0;
+            }
+        }
+
+        // OQ+ sim-quant the projections (frozen student weights). HIPFIRE_NO_QUANT=1
+        // skips quant → start MSE should be ~0 (forward-fidelity sanity check).
+        let q = |w: &[f32]| if std::env::var("HIPFIRE_NO_QUANT").as_deref() == Ok("1") {
+            w.to_vec()
+        } else {
+            oqplus_simquant(w)
+        };
+        let w_gate = gpu.upload_f32(&q(&w_gate_h), &[inter, dim])?;
+        let w_up = gpu.upload_f32(&q(&w_up_h), &[inter, dim])?;
+        let w_down = gpu.upload_f32(&q(&w_down_h), &[dim, inter])?;
+
+        // Captured residuals. This is a PARALLEL block: gate/up read ffn_norm(x_in)
+        // where x_in = premlp (pre-attn). The FFN contribution the model added is
+        //   ffn_target = pertoken − preffn   (preffn = x_in + attn_out).
+        // Student reconstructs it: down(swiglu(gate(norm_γ(x_in)), up(norm_γ(x_in)))).
+        let (xin_h, rows) = read_cap(&cap_dir, "premlp", i, dim)?;
+        let (preffn_h, r2) = read_cap(&cap_dir, "preffn", i, dim)?;
+        let (xout_h, r3) = read_cap(&cap_dir, "pertoken", i, dim)?;
+        if rows != r2 || rows != r3 {
+            return Err(format!("L{i}: row mismatch premlp {rows} preffn {r2} pertoken {r3}").into());
+        }
+        let ffn_target_h: Vec<f32> = xout_h.iter().zip(&preffn_h).map(|(o, p)| o - p).collect();
+        let x_in = gpu.upload_f32(&xin_h, &[rows * dim])?;
+
+        // Trainable γ.
+        let gamma = gpu.upload_f32(&gamma_h, &[dim])?;
+        let mut opt = AdamW::new(&mut gpu, &[dim], lr, 0.9, 0.999, 1e-8, 0.0)?;
+
+        // scratch
+        let yn = gpu.zeros(&[rows * dim], DType::F32)?;
+        let rinv = gpu.zeros(&[rows], DType::F32)?;
+        let g = gpu.zeros(&[rows * inter], DType::F32)?;
+        let u = gpu.zeros(&[rows * inter], DType::F32)?;
+        let act = gpu.zeros(&[rows * inter], DType::F32)?;
+        let mlp = gpu.zeros(&[rows * dim], DType::F32)?;
+        let d_act = gpu.zeros(&[rows * inter], DType::F32)?;
+        let d_g = gpu.zeros(&[rows * inter], DType::F32)?;
+        let d_u = gpu.zeros(&[rows * inter], DType::F32)?;
+        let d_yn = gpu.zeros(&[rows * dim], DType::F32)?;
+        let d_xmid_unused = gpu.zeros(&[rows * dim], DType::F32)?;
+
+        // forward: predicted FFN contribution = down(swiglu(gate(norm(x_in)), up(...)))
+        let fwd_ffn = |gpu: &mut Gpu| -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+            rmsnorm_forward(gpu, &x_in, &gamma, &yn, &rinv, rows, dim, eps)?;
+            linear_forward(gpu, &yn, &w_gate, &g, rows, dim, inter)?;
+            linear_forward(gpu, &yn, &w_up, &u, rows, dim, inter)?;
+            swiglu_forward(gpu, &g, &u, &act, rows * inter)?;
+            linear_forward(gpu, &act, &w_down, &mlp, rows, inter, dim)?;
+            gpu.download_f32(&mlp)
+                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+        };
+
+        // Diagnostic: which (norm-input × target) pairing does the bf16 MLP match?
+        if std::env::var("HIPFIRE_DIAG").as_deref() == Ok("1") && i < 6 {
+            let pred = fwd_ffn(&mut gpu)?; // norm input = premlp (x_in)
+            let t_op = |a: &[f32], b: &[f32]| -> Vec<f32> {
+                a.iter().zip(b).map(|(x, y)| x - y).collect()
+            };
+            let rel = |t: &[f32]| {
+                let e = t.iter().map(|v| v * v).sum::<f32>() / t.len() as f32;
+                mse(&pred, t) / e.max(1e-12)
+            };
+            let t1 = t_op(&xout_h, &preffn_h); // pertoken - preffn
+            let t2 = t_op(&xout_h, &xin_h); // pertoken - premlp
+            let t3 = t_op(&preffn_h, &xin_h); // preffn - premlp
+            println!(
+                "  DIAG L{i}: norm=premlp  rel(pertoken-preffn)={:.3} rel(pertoken-premlp)={:.3} rel(preffn-premlp)={:.3}",
+                rel(&t1), rel(&t2), rel(&t3)
+            );
+            // and with norm input = preffn (sequential-block hypothesis)
+            let xpf = gpu.upload_f32(&preffn_h, &[rows * dim])?;
+            rmsnorm_forward(&mut gpu, &xpf, &gamma, &yn, &rinv, rows, dim, eps)?;
+            linear_forward(&mut gpu, &yn, &w_gate, &g, rows, dim, inter)?;
+            linear_forward(&mut gpu, &yn, &w_up, &u, rows, dim, inter)?;
+            swiglu_forward(&mut gpu, &g, &u, &act, rows * inter)?;
+            linear_forward(&mut gpu, &act, &w_down, &mlp, rows, inter, dim)?;
+            let pred2 = gpu.download_f32(&mlp)?;
+            gpu.free_tensor(xpf)?;
+            let rel2 = |t: &[f32]| {
+                let e = t.iter().map(|v| v * v).sum::<f32>() / t.len() as f32;
+                mse(&pred2, t) / e.max(1e-12)
+            };
+            println!(
+                "  DIAG L{i}: norm=preffn  rel(pertoken-preffn)={:.3} rel(pertoken-premlp)={:.3}",
+                rel2(&t1), rel2(&t2)
+            );
+            let rms = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
+            let ynh = gpu.download_f32(&yn)?;
+            println!(
+                "  DIAG L{i}: rms x_in={:.3} w_gate={:.3} w_up={:.3} w_down={:.3} norm(yn)={:.3} pred={:.3} t1={:.3} | w_gate[0..3]={:?}",
+                rms(&xin_h), rms(&w_gate_h), rms(&w_up_h), rms(&w_down_h), rms(&ynh), rms(&pred), rms(&t1),
+                &w_gate_h[0..3]
+            );
+        }
+        let start_mse = mse(&fwd_ffn(&mut gpu)?, &ffn_target_h);
+
+        let mut last_mse = start_mse;
+        let n = (rows * dim) as f32;
+        for _ in 0..steps {
+            let pred_h = fwd_ffn(&mut gpu)?;
+            last_mse = mse(&pred_h, &ffn_target_h);
+            // d_mlp = 2/N·(pred_ffn − ffn_target)
+            let d_mlp_h: Vec<f32> =
+                pred_h.iter().zip(&ffn_target_h).map(|(p, t)| 2.0 * (p - t) / n).collect();
+            let d_mlp = gpu.upload_f32(&d_mlp_h, &[rows * dim])?;
+            // backward MLP
+            linear_backward_x(&mut gpu, &d_mlp, &w_down, &d_act, rows, inter, dim, false)?;
+            swiglu_backward(&mut gpu, &d_act, &g, &u, &d_g, &d_u, rows * inter)?;
+            linear_backward_x(&mut gpu, &d_g, &w_gate, &d_yn, rows, dim, inter, false)?;
+            linear_backward_x(&mut gpu, &d_u, &w_up, &d_yn, rows, dim, inter, true)?;
+            // rmsnorm backward → d_gamma (fresh zeros; bwd atomic-accumulates)
+            let d_gamma = gpu.zeros(&[dim], DType::F32)?;
+            rmsnorm_backward(&mut gpu, &d_yn, &x_in, &gamma, &rinv, &d_xmid_unused, &d_gamma, rows, dim)?;
+            opt.step(&mut gpu, &[&gamma], &[&d_gamma])?;
+            gpu.free_tensor(d_gamma)?;
+            gpu.free_tensor(d_mlp)?;
+        }
+
+        let tuned = gpu.download_f32(&gamma)?;
+        tuned_norms.insert(norm_name.clone(), tuned);
+        let rec = 100.0 * (start_mse - last_mse) / start_mse.max(1e-12);
+        // relative error vs the FFN-output energy (mse/energy): tells "wrong
+        // reconstruction" (rel~1) from "right but large-magnitude" (rel<<1).
+        let energy = ffn_target_h.iter().map(|v| v * v).sum::<f32>() / ffn_target_h.len() as f32;
+        let rel0 = start_mse / energy.max(1e-12);
+        let rel1 = last_mse / energy.max(1e-12);
+        println!("L{i:2}: FFN MSE {start_mse:.3e}→{last_mse:.3e} ({rec:5.1}%)  rel {rel0:.3e}→{rel1:.3e}  rows={rows}");
+        total_start += start_mse as f64;
+        total_final += last_mse as f64;
+        n_done += 1;
+
+        for t in [w_gate, w_up, w_down, x_in, gamma, yn, rinv, g, u, act, mlp,
+                  d_act, d_g, d_u, d_yn, d_xmid_unused] {
+            gpu.free_tensor(t)?;
+        }
+    }
+
+    let rec = 100.0 * (total_start - total_final) / total_start.max(1e-12);
+    println!("\n{n_done} MLP norms recovered: Σ MSE {total_start:.4e} → {total_final:.4e}  ({rec:.1}% block-local)");
+    // Persist tuned norms for the Path-A export step.
+    let out = format!("{cap_dir}/tuned_mlp_norms.json");
+    std::fs::write(&out, serde_json::to_string(&tuned_norms)?)?;
+    println!("wrote {} tuned norm tensors → {out}", tuned_norms.len());
+    Ok(())
+}
