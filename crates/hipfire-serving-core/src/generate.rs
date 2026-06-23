@@ -36,7 +36,9 @@ use crate::evidence::{
 };
 #[cfg(feature = "arch-lfm2moe")]
 use crate::generate_arch::generate_lfm2moe;
-use crate::generate_arch::{generate_deepseek4, generate_gemma3, generate_minimax, generate_qwen2};
+use crate::generate_arch::{
+    generate_deepseek4, generate_gemma3, generate_llama, generate_minimax, generate_qwen2,
+};
 use crate::model::{effective_raw, LoadedModel};
 use crate::output_filter::chat_output_filter;
 use crate::output_filter::{chat_output_filter_from_profile, loop_guard_from_runtime_config};
@@ -1867,6 +1869,36 @@ pub fn generate(
     // Qwen2 model. Route here BEFORE PFlash / DFlash / multi-GPU
     // / ChatML scaffolding since none of those are wired for
     // arch_id=7 yet (R3 bring-up scope).
+    if m.arch_id == 0 || m.arch_id == 1 {
+        // LLaMA / Mistral / plain-Qwen3 — routed through the ServingBackend seam
+        // (P3.2). generate_llama applies the chat-framing then prefill +
+        // decode_loop. Fast paths (DFlash/MTP/tools-execution) not on this path.
+        let _ = (
+            budget_alert_at_tok,
+            budget_alert_text,
+            pflash_state,
+            pflash_cfg,
+            prefill_already_done,
+        );
+        generate_llama(
+            m,
+            gpu,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            temp,
+            top_p,
+            max_tokens,
+            repeat_penalty,
+            repeat_window,
+            max_think_tokens,
+            assistant_prefix,
+            tools,
+            messages_history,
+        );
+        return;
+    }
     if m.arch_id == 7 {
         // Silence the qwen35/llama-only params we deliberately don't
         // honor on this path. See generate_qwen2 doc for the deferral

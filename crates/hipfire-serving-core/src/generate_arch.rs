@@ -19,7 +19,7 @@ use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_prompt as prompt_frame;
-use hipfire_runtime::arch::{GenerateCtx, ServingBackend};
+use hipfire_runtime::arch::{decode_loop, GenerateCtx, ServingBackend, SimpleAr};
 
 use crate::events::{emit_committed_event, emit_error_with_id, emit_stream_event};
 use crate::model::{effective_raw, LoadedModel};
@@ -1141,6 +1141,155 @@ pub fn generate_qwen2(
     drop(ctx);
     if let Err(e) = result {
         emit_error_with_id(stdout, id, format!("qwen2 serve: {e}"));
+    }
+}
+
+/// LLaMA / Mistral / plain-Qwen3 (arch_id 0/1) generate path — routes through the
+/// `ServingBackend` seam (P3.2). Unlike qwen2, llama needs chat-framing, so this
+/// builds `prompt_tokens` (the model's jinja `chat_template` when
+/// `HIPFIRE_JINJA_CHAT=1`, else the hand-rolled `ChatFrame` scaffold honoring
+/// `assistant_prefix` / raw-completion) — the same framing the qwen35-shared
+/// `generate()` applied — then prefills those tokens and runs the shared
+/// `decode_loop` (full temperature/top-p sampling via P3.3). Fast paths
+/// (DFlash/MTP/tools-execution) are out of scope here; correctness first.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_llama(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    max_think_tokens: usize,
+    assistant_prefix: prompt_frame::AssistantPrefix,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[prompt_frame::Message]>,
+) {
+    if m.tokenizer.is_none() {
+        emit_error_with_id(stdout, id, "tokenizer not loaded".to_string());
+        return;
+    }
+    if m.llama_backend.is_none() {
+        emit_error_with_id(
+            stdout,
+            id,
+            "llama backend not loaded (arch 0/1 not active)".to_string(),
+        );
+        return;
+    }
+
+    // Build the framed prompt tokens up front (releases the shared `m` borrows
+    // before the backend `&mut` borrow below).
+    let raw = effective_raw(m);
+    let prompt_tokens: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let try_jinja = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1")
+            && m.chat_template.is_some();
+        if try_jinja {
+            let template = m.chat_template.as_ref().unwrap();
+            let frame = prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: system_prompt,
+                user: prompt,
+                enable_thinking: max_think_tokens != 1,
+                bos_token: None,
+            };
+            let rendered = if tools.is_some() || messages_history.is_some() {
+                let synthesized: Vec<prompt_frame::Message>;
+                let messages_slice: &[prompt_frame::Message] = match messages_history {
+                    Some(mh) => mh,
+                    None => {
+                        let mut v = Vec::new();
+                        if let Some(sys) = system_prompt {
+                            v.push(prompt_frame::Message {
+                                role: prompt_frame::Role::System,
+                                content: sys.to_string(),
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                            });
+                        }
+                        v.push(prompt_frame::Message {
+                            role: prompt_frame::Role::User,
+                            content: prompt.to_string(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                        });
+                        synthesized = v;
+                        &synthesized
+                    }
+                };
+                frame.render_messages(messages_slice, tools, None)
+            } else {
+                frame.render()
+            };
+            match rendered {
+                Ok(text) => tokenizer.encode(&text),
+                Err(e) => {
+                    eprintln!("[daemon] llama jinja render failed ({e}) — Plain fallback");
+                    prompt_frame::ChatFrame {
+                        tokenizer,
+                        system: system_prompt,
+                        user: prompt,
+                        assistant_prefix,
+                        raw,
+                    }
+                    .build()
+                }
+            }
+        } else {
+            prompt_frame::ChatFrame {
+                tokenizer,
+                system: system_prompt,
+                user: prompt,
+                assistant_prefix,
+                raw,
+            }
+            .build()
+        }
+    };
+    if prompt_tokens.is_empty() {
+        emit_error_with_id(stdout, id, "empty prompt after framing".to_string());
+        return;
+    }
+
+    // Disjoint field borrows: tokenizer (shared) + backend (mut).
+    let tok = m.tokenizer.as_ref().unwrap();
+    let backend = m.llama_backend.as_mut().unwrap();
+    let eos = backend.eos_token();
+
+    // Pre-tokenized prefill (the framing already produced tokens), then the
+    // shared streaming/sampling decode loop.
+    if let Err(e) = SimpleAr::prefill(backend, gpu, &prompt_tokens) {
+        emit_error_with_id(stdout, id, format!("llama prefill: {e}"));
+        return;
+    }
+    let n = prompt_tokens.len();
+    let no_images: [&[u8]; 0] = [];
+    let mut ctx = GenerateCtx {
+        id,
+        prompt: "", // unused: prefill already consumed the framed tokens
+        temperature: temp,
+        top_p,
+        max_tokens,
+        repeat_penalty,
+        repeat_window,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        max_think_tokens: 0,
+        stop_sequences: &[],
+        images: &no_images,
+        sink: stdout,
+    };
+    let result = decode_loop(gpu, backend, tok, eos, &mut ctx, n, n);
+    drop(ctx);
+    if let Err(e) = result {
+        emit_error_with_id(stdout, id, format!("llama decode: {e}"));
     }
 }
 

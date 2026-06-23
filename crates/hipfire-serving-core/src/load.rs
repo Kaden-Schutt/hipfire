@@ -581,6 +581,7 @@ pub fn load_model(
             llama_weights: None,
             llama_scratch: None,
             llama_kv: None,
+            llama_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
@@ -678,6 +679,7 @@ pub fn load_model(
             llama_weights: None,
             llama_scratch: None,
             llama_kv: None,
+            llama_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
@@ -779,6 +781,7 @@ pub fn load_model(
             llama_weights: None,
             llama_scratch: None,
             llama_kv: None,
+            llama_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
@@ -876,6 +879,7 @@ pub fn load_model(
             llama_weights: None,
             llama_scratch: None,
             llama_kv: None,
+            llama_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: Some(state),
@@ -994,6 +998,7 @@ pub fn load_model(
             llama_weights: None,
             llama_scratch: None,
             llama_kv: None,
+            llama_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
@@ -1118,6 +1123,7 @@ pub fn load_model(
             llama_weights: None,
             llama_scratch: None,
             llama_kv: None,
+            llama_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
@@ -1255,6 +1261,7 @@ pub fn load_model(
                 llama_weights: None,
                 llama_scratch: None,
                 llama_kv: None,
+                llama_backend: None,
                 qwen2_config: None,
                 qwen2_weights: None,
                 qwen2_state: None,
@@ -1596,6 +1603,7 @@ pub fn load_model(
             llama_weights: None,
             llama_scratch: None,
             llama_kv: None,
+            llama_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
@@ -1683,6 +1691,7 @@ pub fn load_model(
             llama_weights: Some(weights),
             llama_scratch: Some(scratch),
             llama_kv: Some(kv),
+            llama_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
@@ -1845,6 +1854,12 @@ pub fn load_model_safetensors(
         let scratch = llama::ForwardScratch::new(gpu, &config)
             .map_err(|e| format!("ForwardScratch::new: {e:?}"))?;
 
+        // P3.2: route arch 0/1 through the ServingBackend seam — assemble the
+        // backend (owns config/weights/scratch/kv); the separate llama_* fields
+        // stay None.
+        let llama_backend =
+            hipfire_arch_llama::LlamaBackend::new(arch_id, config, weights, scratch, kv);
+
         return Ok(LoadedModel {
             arch_id,
             pp: 1,
@@ -1867,10 +1882,11 @@ pub fn load_model_safetensors(
             q35_active_session_id: None,
             q35_active_state_allocation_epoch: 0,
             q35_active_prefilled_generated_suffix_len: 0,
-            llama_config: Some(config),
-            llama_weights: Some(weights),
-            llama_scratch: Some(scratch),
-            llama_kv: Some(kv),
+            llama_config: None,
+            llama_weights: None,
+            llama_scratch: None,
+            llama_kv: None,
+            llama_backend: Some(llama_backend),
             deepseek4_config: None,
             deepseek4_weights: None,
             deepseek4_state: None,
@@ -2003,6 +2019,7 @@ pub fn load_model_safetensors(
         llama_weights: None,
         llama_scratch: None,
         llama_kv: None,
+        llama_backend: None,
         deepseek4_config: None,
         deepseek4_weights: None,
         deepseek4_state: None,
@@ -2287,6 +2304,7 @@ pub fn load_model_pp(
         llama_weights: None,
         llama_scratch: None,
         llama_kv: None,
+        llama_backend: None,
         qwen2_config: None,
         qwen2_weights: None,
         qwen2_state: None,

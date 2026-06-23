@@ -211,6 +211,11 @@ pub struct LoadedModel {
     pub llama_weights: Option<llama::LlamaWeights>,
     pub llama_scratch: Option<llama::ForwardScratch>,
     pub llama_kv: Option<kv::KvCache>,
+    /// Assembled LLaMA/Qwen3 serving backend (arch_id 0/1), driven through the
+    /// shared `ServingBackend::serve` seam — mirrors `qwen2_backend`/`gemma3_text`.
+    /// Owns its own config/weights/scratch/KV; the separate `llama_*` fields above
+    /// stay `None` on the backend path. P3.2.
+    pub llama_backend: Option<hipfire_arch_llama::LlamaBackend>,
     // Qwen2 state (arch_id=7 — hipfire-arch-qwen2 standalone). The
     // KV cache lives inside Qwen2State, so there's no separate
     // qwen2_kv field. None on every other arch path.

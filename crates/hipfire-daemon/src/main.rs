@@ -38,7 +38,6 @@ use hipfire_generate::{
 };
 use hipfire_model::{build_local_llm_registry, is_qwen35_family_arch_id};
 use hipfire_prompt as prompt_frame;
-use hipfire_runtime::llama;
 use hipfire_state::{
     described_sequence_state_json, model_worker_runtime_view_json,
     parse_describe_sequence_state_request, parse_release_sequence_state_request,
@@ -5371,17 +5370,15 @@ fn main() {
                     {
                         false
                     }
-                } else if let Some(config) = m.llama_config.as_ref() {
-                    let weights = m.llama_weights.as_ref().unwrap();
-                    let scratch = m.llama_scratch.as_ref().unwrap();
-                    let kv = m.llama_kv.as_mut().unwrap();
+                } else if let Some(backend) = m.llama_backend.as_mut() {
+                    // LLaMA/Qwen3 (arch 0/1) warm-pass via the ServingBackend
+                    // (P3.2): per-token decode_step saturates the dense
+                    // attention/GEMV/RoPE kernel set before the first real
+                    // request. Logits-only (decode_loop samples in production).
+                    use hipfire_runtime::arch::SimpleAr;
                     let mut ok = true;
                     for (i, &tok) in synthetic.iter().enumerate() {
-                        if llama::forward_scratch(
-                            &mut gpu, weights, config, tok, i, kv, scratch, 0.0, 1.0, 42, 0, 1.0,
-                        )
-                        .is_err()
-                        {
+                        if backend.decode_step(&mut gpu, tok, i).is_err() {
                             ok = false;
                             break;
                         }
