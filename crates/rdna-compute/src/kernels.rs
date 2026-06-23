@@ -1698,6 +1698,12 @@ pub const MOE_UNSCATTER_SILU_CLAMP_K8_SRC: &str =
 /// reuse per block vs the single-warp 16×16 kernel.
 pub const GEMM_Q8_0_WMMA_4W_SRC: &str = include_str!("../../../kernels/src/gemm_q8_0_wmma_4w.hip");
 
+/// Dense i8-WMMA MMQ GEMM for Q8_0 weights — 4-warp 64x64 tile (gfx1151). i8
+/// port of gemm_q8_0_wmma_4w: int8 weights direct + Q8_1 activations + i8 WMMA
+/// at ~2x. Y[N,M] = X[N,K] @ W[M,K]^T. Requires M%64==0, N%64==0, K%128==0.
+pub const GEMM_Q8_0_MMQ_4W_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_q8_0_mmq_4w.gfx1151.hip");
+
 /// Path 2 combine for down: per (token, m) iterates K_TOP slots via
 /// `inverse_perm[token*K_TOP + k]`, applies topk_weights, and += into
 /// x_residual. No atomic contention (each token's m column is owned by

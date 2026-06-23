@@ -19668,6 +19668,64 @@ impl Gpu {
         }
         result
     }
+    /// Dense i8-WMMA MMQ GEMM for Q8_0 weights — 64x64 4-warp tile (gfx1151).
+    /// Takes F32 `x` (auto-quantized to Q8_1), int8 WMMA at ~2x. Drop-in for
+    /// `gemm_q8_0_wmma_4w`. Requires M%64==0, N%64==0, K%128==0.
+    pub fn gemm_q8_0_mmq_4w_gfx1151(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let kernel_name = "gemm_q8_0_mmq_4w_gfx1151";
+        self.ensure_kernel(kernel_name, kernels::GEMM_Q8_0_MMQ_4W_GFX1151_SRC, kernel_name)?;
+        let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+
+        let ap = a.buf.as_ptr();
+        let xp = x_q8_ptr;
+        let yp = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+        ];
+        let row_tiles = ((m + 63) / 64) as u32;
+        let col_tiles = ((batch_size + 63) / 64) as u32;
+        let bytes = (m * k) + (batch_size * m) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, col_tiles, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     pub fn gemm_q8_0_wmma_4w(
         &mut self,
         a: &GpuTensor,
