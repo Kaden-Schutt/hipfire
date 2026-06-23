@@ -726,6 +726,28 @@ pub fn try_acquire_resource_lock(
     }
 }
 
+/// Emit a fatal startup error on **both** streams, then exit(1): a structured
+/// `{"type":"error",...}` JSON line on stdout so a JSONL client (e.g. a piped
+/// request stream) sees a real error event instead of just a closed pipe, plus
+/// the human-readable text + optional hint on stderr.
+pub fn fatal_startup_error(message: &str, hint: Option<&str>) -> ! {
+    use std::io::Write;
+    let event = serde_json::json!({
+        "type": "error",
+        "message": message,
+        "fatal": true,
+        "stage": "startup",
+    });
+    let mut stdout = std::io::stdout();
+    let _ = writeln!(stdout, "{event}");
+    let _ = stdout.flush();
+    eprintln!("FATAL: {message}");
+    if let Some(h) = hint {
+        eprintln!("{h}");
+    }
+    std::process::exit(1);
+}
+
 pub fn acquire_resource_lease_or_exit() -> ResourceLease {
     // HIPFIRE_RESOURCE_LOCK=0 disables daemon startup resource leases.
     if std::env::var("HIPFIRE_RESOURCE_LOCK").ok().as_deref() == Some("0") {
@@ -735,8 +757,7 @@ pub fn acquire_resource_lease_or_exit() -> ResourceLease {
     let resources = match resource_lock_requests() {
         Ok(resources) => resources,
         Err(e) => {
-            eprintln!("FATAL: invalid hipfire resource lock config: {e}");
-            std::process::exit(1);
+            fatal_startup_error(&format!("invalid hipfire resource lock config: {e}"), None);
         }
     };
     if resources.is_empty() {
@@ -773,11 +794,12 @@ pub fn acquire_resource_lease_or_exit() -> ResourceLease {
                 Err(e) => {
                     // Drop already-held guards (releases their flocks) before exit.
                     drop(guards);
-                    eprintln!("FATAL: {e}");
-                    eprintln!(
-                        "Set HIPFIRE_RESOURCE_LOCK_WAIT_MS to wait, or HIPFIRE_RESOURCE_LOCK=0 to bypass."
+                    fatal_startup_error(
+                        &e,
+                        Some(
+                            "Set HIPFIRE_RESOURCE_LOCK_WAIT_MS to wait, or HIPFIRE_RESOURCE_LOCK=0 to bypass.",
+                        ),
                     );
-                    std::process::exit(1);
                 }
             }
         }

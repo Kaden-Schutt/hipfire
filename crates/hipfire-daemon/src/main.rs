@@ -113,11 +113,12 @@ fn acquire_daemon_lock() -> hipfire_lock::FlockGuard {
             let pid = holder.trim();
             let pid_display = if pid.is_empty() { "<unknown>" } else { pid };
             let kill_arg = if pid.is_empty() { "<pid>" } else { pid };
-            eprintln!(
-                "FATAL: hipfire daemon already running (PID {}). Run `kill {}` and retry.",
-                pid_display, kill_arg
+            hipfire_daemon_adapter::fatal_startup_error(
+                &format!(
+                    "hipfire daemon already running (PID {pid_display}). Run `kill {kill_arg}` and retry."
+                ),
+                None,
             );
-            std::process::exit(1);
         }
         Err(e) => panic!("failed to flock ~/.hipfire/daemon.pid: {e}"),
     }
