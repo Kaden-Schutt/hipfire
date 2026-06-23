@@ -24289,6 +24289,10 @@ fn forward_scratch_layers(
                     &s.ffn_hidden,
                     &s.x,
                 )?;
+                // Phase-A capture: s.x right after the FFN swiglu-residual. With
+                // premlp (= gate_up norm input), ffn_out = ffnout − premlp isolates
+                // the FFN contribution at its exact boundary, uniformly across arms.
+                dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "ffnout");
                 // RoughQuant residual-writer correction (DeltaNet mlp.down_proj).
                 // w_down's logical input is silu(gate)*up in ORIGINAL frame (the
                 // fused kernel rotates internally), so recompute it explicitly.
@@ -25243,6 +25247,8 @@ fn forward_scratch_layers(
                     &s.ffn_hidden,
                     &s.x,
                 )?;
+                // Phase-A capture: s.x right after the FFN swiglu-residual (see DeltaNet arm).
+                dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "ffnout");
                 // RoughQuant residual-writer correction (FullAttn mlp.down_proj).
                 if let Some(c) = weights
                     .rq_corrections

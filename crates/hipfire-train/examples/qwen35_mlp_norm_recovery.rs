@@ -173,13 +173,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // where x_in = premlp (pre-attn). The FFN contribution the model added is
         //   ffn_target = pertoken − preffn   (preffn = x_in + attn_out).
         // Student reconstructs it: down(swiglu(gate(norm_γ(x_in)), up(norm_γ(x_in)))).
+        // FFN contribution = ffnout − preffn (both straddle the swiglu-residual),
+        // which isolates exactly what the FFN added — uniform across DeltaNet
+        // (parallel block: gate_up reads pre-attn x) and FullAttn (sequential),
+        // NO per-layer special-casing. Norm input = premlp (= what gate_up norms).
         let (xin_h, rows) = read_cap(&cap_dir, "premlp", i, dim)?;
         let (preffn_h, r2) = read_cap(&cap_dir, "preffn", i, dim)?;
-        let (xout_h, r3) = read_cap(&cap_dir, "pertoken", i, dim)?;
+        let (ffnout_h, r3) = read_cap(&cap_dir, "ffnout", i, dim)?;
         if rows != r2 || rows != r3 {
-            return Err(format!("L{i}: row mismatch premlp {rows} preffn {r2} pertoken {r3}").into());
+            return Err(format!("L{i}: row mismatch premlp {rows} preffn {r2} ffnout {r3}").into());
         }
-        let ffn_target_h: Vec<f32> = xout_h.iter().zip(&preffn_h).map(|(o, p)| o - p).collect();
+        let ffn_target_h: Vec<f32> = ffnout_h.iter().zip(&preffn_h).map(|(o, p)| o - p).collect();
         let x_in = gpu.upload_f32(&xin_h, &[rows * dim])?;
 
         // Trainable γ.
@@ -210,46 +214,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
         };
 
-        // Diagnostic: which (norm-input × target) pairing does the bf16 MLP match?
-        if std::env::var("HIPFIRE_DIAG").as_deref() == Ok("1") && i < 6 {
-            let pred = fwd_ffn(&mut gpu)?; // norm input = premlp (x_in)
-            let t_op = |a: &[f32], b: &[f32]| -> Vec<f32> {
-                a.iter().zip(b).map(|(x, y)| x - y).collect()
-            };
-            let rel = |t: &[f32]| {
-                let e = t.iter().map(|v| v * v).sum::<f32>() / t.len() as f32;
-                mse(&pred, t) / e.max(1e-12)
-            };
-            let t1 = t_op(&xout_h, &preffn_h); // pertoken - preffn
-            let t2 = t_op(&xout_h, &xin_h); // pertoken - premlp
-            let t3 = t_op(&preffn_h, &xin_h); // preffn - premlp
-            println!(
-                "  DIAG L{i}: norm=premlp  rel(pertoken-preffn)={:.3} rel(pertoken-premlp)={:.3} rel(preffn-premlp)={:.3}",
-                rel(&t1), rel(&t2), rel(&t3)
-            );
-            // and with norm input = preffn (sequential-block hypothesis)
-            let xpf = gpu.upload_f32(&preffn_h, &[rows * dim])?;
-            rmsnorm_forward(&mut gpu, &xpf, &gamma, &yn, &rinv, rows, dim, eps)?;
-            linear_forward(&mut gpu, &yn, &w_gate, &g, rows, dim, inter)?;
-            linear_forward(&mut gpu, &yn, &w_up, &u, rows, dim, inter)?;
-            swiglu_forward(&mut gpu, &g, &u, &act, rows * inter)?;
-            linear_forward(&mut gpu, &act, &w_down, &mlp, rows, inter, dim)?;
-            let pred2 = gpu.download_f32(&mlp)?;
-            gpu.free_tensor(xpf)?;
-            let rel2 = |t: &[f32]| {
-                let e = t.iter().map(|v| v * v).sum::<f32>() / t.len() as f32;
-                mse(&pred2, t) / e.max(1e-12)
-            };
-            println!(
-                "  DIAG L{i}: norm=preffn  rel(pertoken-preffn)={:.3} rel(pertoken-premlp)={:.3}",
-                rel2(&t1), rel2(&t2)
-            );
+        // Diagnostic: reconstruction fidelity + norm-weight stats per layer.
+        if std::env::var("HIPFIRE_DIAG").as_deref() == Ok("1") {
+            let pred = fwd_ffn(&mut gpu)?;
             let rms = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
-            let ynh = gpu.download_f32(&yn)?;
+            let e = ffn_target_h.iter().map(|v| v * v).sum::<f32>() / ffn_target_h.len() as f32;
+            // gamma_h here already has +1 folded if HIPFIRE_NORM_PLUS1=1.
             println!(
-                "  DIAG L{i}: rms x_in={:.3} w_gate={:.3} w_up={:.3} w_down={:.3} norm(yn)={:.3} pred={:.3} t1={:.3} | w_gate[0..3]={:?}",
-                rms(&xin_h), rms(&w_gate_h), rms(&w_up_h), rms(&w_down_h), rms(&ynh), rms(&pred), rms(&t1),
-                &w_gate_h[0..3]
+                "  DIAG L{i:2}: rel={:.3}  rms x_in={:.3} γ={:.3} pred={:.3} ffn_out={:.3}",
+                mse(&pred, &ffn_target_h) / e.max(1e-12),
+                rms(&xin_h), rms(&gamma_h), rms(&pred), rms(&ffn_target_h)
             );
         }
         let start_mse = mse(&fwd_ffn(&mut gpu)?, &ffn_target_h);
