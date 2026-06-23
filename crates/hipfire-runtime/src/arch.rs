@@ -466,49 +466,42 @@ pub fn run_simple_ar(
 /// what breaks the single-token / short-cycle attractors greedy falls into on
 /// out-of-distribution input (e.g. several near-identical video slices → an
 /// `ình` loop): a token repeated N times is suppressed by `penalty^N`.
+/// Sample the next token via the shared GPU sampler ([`crate::sampler::sample`]):
+/// temperature + top-p nucleus + repeat/presence/frequency penalties, per the
+/// [`crate::sampler::SamplerConfig`] built from the request's `GenerateCtx`. At
+/// `temperature == 0` this is greedy argmax (so a temp-0 gate run is unchanged);
+/// `temperature > 0` gets real sampling — the P3.3 upgrade that lets non-greedy
+/// archs ride the seam without a bespoke loop.
+#[allow(clippy::too_many_arguments)]
 fn pick_next(
     gpu: &mut Gpu,
     backend: &mut dyn SimpleAr,
     vocab: usize,
-    penalty: f32,
-    window: usize,
-    committed: &[u32],
+    sample_buf: &GpuTensor,
+    repeat_buf: &GpuTensor,
+    cfg: &crate::sampler::SamplerConfig,
+    history: &[u32],
+    rng_state: &mut u32,
 ) -> Result<u32, String> {
-    if penalty <= 1.0 {
-        return gpu
-            .argmax_f32(backend.logits(), vocab)
-            .map_err(|e| format!("argmax: {e:?}"));
-    }
-    let mut logits = gpu
-        .download_f32(backend.logits())
-        .map_err(|e| format!("download logits: {e:?}"))?;
-    if logits.len() < vocab {
-        return Err(format!("logits len {} < vocab {}", logits.len(), vocab));
-    }
-    let start = committed.len().saturating_sub(window);
-    for &t in &committed[start..] {
-        if (t as usize) < vocab {
-            let l = &mut logits[t as usize];
-            *l = if *l > 0.0 { *l / penalty } else { *l * penalty };
-        }
-    }
-    let mut best = 0usize;
-    let mut best_v = f32::NEG_INFINITY;
-    for (i, &v) in logits[..vocab].iter().enumerate() {
-        if v > best_v {
-            best_v = v;
-            best = i;
-        }
-    }
-    Ok(best as u32)
+    Ok(crate::sampler::sample(
+        gpu,
+        backend.logits(),
+        sample_buf,
+        repeat_buf,
+        vocab,
+        history,
+        cfg,
+        rng_state,
+    ))
 }
 
 /// Shared post-prefill decode loop: from the just-prefilled `backend.logits()`,
 /// pick the next token → stream a JSONL `token` event → `decode_step`, until EOS
 /// / `max_tokens` / a `stop_sequences` match / a single-token attractor, then a
-/// final `done`. Greedy by default; `ctx.repeat_penalty > 1.0` switches to the
-/// penalized host argmax (see [`pick_next`]) — needed for the gemma3-vl video
-/// path, where near-identical slices push bare greedy into a loop.
+/// final `done`. Sampling goes through the shared GPU sampler (see [`pick_next`]):
+/// temperature + top-p + repeat/presence/frequency penalties from `ctx`. At
+/// `ctx.temperature == 0` this is greedy argmax; `> 0` samples — so every seam
+/// arch (qwen2, gemma3, …) gets full sampling without a bespoke loop (P3.3).
 pub fn decode_loop(
     gpu: &mut Gpu,
     backend: &mut dyn SimpleAr,
@@ -519,16 +512,44 @@ pub fn decode_loop(
     prompt_tokens: usize,
 ) -> Result<ServeOutcome, String> {
     let vocab = backend.vocab_size();
-    let penalty = ctx.repeat_penalty;
     let window = if ctx.repeat_window == 0 {
         64
     } else {
         ctx.repeat_window
     };
 
+    // P3.3: drive the shared GPU sampler (temperature + top-p + penalties) from
+    // the request ctx, instead of greedy argmax. `repeat_buf` caps the penalty
+    // window the kernel reads; `sample_buf` is the 2-slot reduction scratch.
+    let sample_buf = gpu
+        .alloc_tensor(&[2], rdna_compute::DType::F32)
+        .map_err(|e| format!("decode_loop sample_buf: {e:?}"))?;
+    let repeat_buf = gpu
+        .alloc_tensor(&[window.max(64)], rdna_compute::DType::F32)
+        .map_err(|e| format!("decode_loop repeat_buf: {e:?}"))?;
+    let cfg = crate::sampler::SamplerConfig {
+        temperature: ctx.temperature,
+        top_p: ctx.top_p,
+        repeat_penalty: ctx.repeat_penalty,
+        repeat_window: window,
+        presence_penalty: ctx.presence_penalty,
+        frequency_penalty: ctx.frequency_penalty,
+        blocked_tokens: Vec::new(),
+    };
+    let mut rng_state: u32 = 0x13579BDF;
+
     let mut pos = start_pos;
     let mut committed: Vec<u32> = Vec::new();
-    let mut next = pick_next(gpu, backend, vocab, penalty, window, &committed)?;
+    let mut next = pick_next(
+        gpu,
+        backend,
+        vocab,
+        &sample_buf,
+        &repeat_buf,
+        &cfg,
+        &committed,
+        &mut rng_state,
+    )?;
     let mut generated = 0usize;
     let mut text = String::new();
     let mut stop = StopReason::MaxTokens;
@@ -567,7 +588,16 @@ pub fn decode_loop(
 
         backend.decode_step(gpu, next, pos)?;
         pos += 1;
-        next = pick_next(gpu, backend, vocab, penalty, window, &committed)?;
+        next = pick_next(
+            gpu,
+            backend,
+            vocab,
+            &sample_buf,
+            &repeat_buf,
+            &cfg,
+            &committed,
+            &mut rng_state,
+        )?;
     }
 
     let done = serde_json::json!({ "type": "done", "id": ctx.id, "tokens": generated });
