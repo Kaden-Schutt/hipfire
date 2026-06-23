@@ -14,6 +14,8 @@
 //! `tiny_quant_probe` example (`kld` / `collect`, see
 //! `hipfire-serving-core::tiny_harness`).
 //!
+//! **Adding a model family:** see `docs/howto/add-tiny-quant-family.md`.
+//!
 //! Verdict (computed in-executor, not via admission — the baseline is a file
 //! keyed by `gpu_arch × family × format`, not a same-case reference row):
 //!   - crash / panic / nonzero exit                       → Fail
@@ -59,6 +61,17 @@ struct FamilyPlan {
 /// MQ4/MQ6 experts so its anchor is mq6; qwen3.5 is the broad arch).
 fn families() -> &'static [FamilyPlan] {
     &[
+        // LLaMA/Mistral (arch 0): simplest dense family — no bias, no QK-norm.
+        // Its loader supports q8f16/hfq4/mq4/mq3 but NOT F16/BF16 weights, so the
+        // anchor is q8f16 (not fp16) and there's no calibrated cell (qtip3-sim
+        // emits bf16, which this loader can't load — same as qwen2/gemma3).
+        FamilyPlan {
+            arch: "llama",
+            anchor: "q8f16",
+            candidates: &["hfq4", "mq4", "mq3"],
+            quant_flags: &[],
+            calibrated: &[],
+        },
         FamilyPlan {
             arch: "qwen2",
             anchor: "fp16",

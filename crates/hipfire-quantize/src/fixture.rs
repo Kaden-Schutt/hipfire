@@ -667,6 +667,82 @@ impl MiniMaxTiny {
     }
 }
 
+/// Tiny LLaMA / Mistral (arch 0) dense text config — the simplest supported
+/// family: dense full-attention, RMSNorm + SwiGLU, standard 1-D RoPE, GQA, and
+/// (unlike qwen2) NO Q/K/V bias and NO QK-norm. `model_type:"llama"` auto-detects
+/// to arch_id 0 (the LLaMA-family loader rejects bias tensors, so don't emit
+/// any). Untied `lm_head` to exercise the separate output-projection load.
+struct LlamaTiny {
+    hidden: usize,
+    inter: usize,
+    vocab: usize,
+    layers: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+}
+
+impl LlamaTiny {
+    fn preset() -> Self {
+        Self {
+            hidden: 256,
+            inter: 512,
+            vocab: 4096,
+            layers: 2,
+            n_heads: 2,
+            n_kv_heads: 1,
+            head_dim: 128,
+        }
+    }
+
+    fn config_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": self.hidden,
+            "intermediate_size": self.inter,
+            "vocab_size": self.vocab,
+            "num_hidden_layers": self.layers,
+            "num_attention_heads": self.n_heads,
+            "num_key_value_heads": self.n_kv_heads,
+            "head_dim": self.head_dim,
+            "hidden_act": "silu",
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 500_000.0,
+            "max_position_embeddings": 4096,
+            "tie_word_embeddings": false,
+            "dtype": "bfloat16",
+            "_comment": "hipfire tiny random-init gating fixture — not a real model",
+        })
+    }
+
+    fn manifest(&self) -> Vec<TensorSpec> {
+        let h = self.hidden;
+        let q_dim = self.n_heads * self.head_dim;
+        let kv_dim = self.n_kv_heads * self.head_dim;
+        let mut t = Vec::new();
+        // Untied: embed + separate lm_head.
+        t.push(TensorSpec::new("model.embed_tokens.weight", vec![self.vocab, h], Init::Uniform(0.05)));
+        t.push(TensorSpec::f16("model.norm.weight", vec![h], Init::NormOnes));
+        t.push(TensorSpec::new("lm_head.weight", vec![self.vocab, h], Init::Uniform(0.05)));
+        for i in 0..self.layers {
+            let p = format!("model.layers.{i}");
+            let sa = format!("{p}.self_attn");
+            t.push(TensorSpec::f16(format!("{p}.input_layernorm.weight"), vec![h], Init::NormOnes));
+            // No bias, no q_norm/k_norm — the LLaMA loader rejects bias tensors.
+            t.push(TensorSpec::new(format!("{sa}.q_proj.weight"), vec![q_dim, h], Init::Uniform(0.05)));
+            t.push(TensorSpec::new(format!("{sa}.k_proj.weight"), vec![kv_dim, h], Init::Uniform(0.05)));
+            t.push(TensorSpec::new(format!("{sa}.v_proj.weight"), vec![kv_dim, h], Init::Uniform(0.05)));
+            t.push(TensorSpec::new(format!("{sa}.o_proj.weight"), vec![h, q_dim], Init::Uniform(0.05)));
+            t.push(TensorSpec::f16(format!("{p}.post_attention_layernorm.weight"), vec![h], Init::NormOnes));
+            t.push(TensorSpec::new(format!("{p}.mlp.gate_proj.weight"), vec![self.inter, h], Init::Uniform(0.05)));
+            t.push(TensorSpec::new(format!("{p}.mlp.up_proj.weight"), vec![self.inter, h], Init::Uniform(0.05)));
+            t.push(TensorSpec::new(format!("{p}.mlp.down_proj.weight"), vec![h, self.inter], Init::Uniform(0.05)));
+        }
+        t
+    }
+}
+
 /// Generate little-endian bytes for one tensor at its declared dtype.
 fn gen_bytes(spec: &TensorSpec, rng: &mut SplitMix64) -> Vec<u8> {
     let n: usize = spec.shape.iter().product();
@@ -749,12 +825,16 @@ pub fn emit_fixture(arch: &str, out_dir: &Path, seed: u64) -> Result<(), String>
             let m = MiniMaxTiny::preset();
             (m.config_json(), m.manifest())
         }
+        "llama" | "mistral" => {
+            let m = LlamaTiny::preset();
+            (m.config_json(), m.manifest())
+        }
         other => {
             return Err(format!(
                 "--emit-fixture: unsupported arch '{other}'. Supported: qwen3_5 \
                  (arch 5 dense), qwen3_5_moe (arch 6 MoE), qwen2 (arch 7, quantize \
-                 with --arch-id 7), gemma3 (arch 12), minimax (arch 10). Add a tiny \
-                 preset per arch as support lands."
+                 with --arch-id 7), gemma3 (arch 12), minimax (arch 10), llama \
+                 (arch 0). Add a tiny preset per arch as support lands."
             ));
         }
     };
@@ -886,9 +966,22 @@ mod tests {
     }
 
     #[test]
+    fn llama_manifest_is_bias_free_and_tiny() {
+        let m = LlamaTiny::preset();
+        let specs = m.manifest();
+        let has = |suf: &str| specs.iter().any(|s| s.name.ends_with(suf));
+        assert!(has("lm_head.weight"), "untied lm_head");
+        assert!(has("mlp.gate_proj.weight"), "dense SwiGLU");
+        // The LLaMA loader rejects bias + qk-norm tensors — must emit none.
+        assert!(!specs.iter().any(|s| s.name.ends_with(".bias")), "no biases");
+        assert!(!specs.iter().any(|s| s.name.contains("q_norm") || s.name.contains("k_norm")));
+        assert!(n_params(&specs) < 10_000_000, "llama fixture must stay <10M params");
+    }
+
+    #[test]
     fn emit_new_families_are_deterministic() {
         let base = std::env::temp_dir().join(format!("hipfire-fx-fam-{}", std::process::id()));
-        for arch in ["qwen2", "gemma3", "minimax"] {
+        for arch in ["qwen2", "gemma3", "minimax", "llama"] {
             let dir = base.join(arch);
             emit_fixture(arch, &dir, 7).unwrap();
             let a = std::fs::read(dir.join("model.safetensors")).unwrap();

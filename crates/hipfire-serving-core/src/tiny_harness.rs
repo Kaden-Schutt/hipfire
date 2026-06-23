@@ -32,6 +32,9 @@ use hipfire_arch_gemma3 as gemma3;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
+// LLaMA/Mistral (arch 0/1) live in the runtime crate (HFQ config + loader +
+// forward), surfaced via the hipfire-arch-llama Architecture impl.
+use hipfire_runtime::llama::{self, ForwardScratch, LlamaConfig, LlamaWeights};
 
 /// Which arch family a fixture belongs to. Parsed from the `--arch` flag (the
 /// caller always knows it — it emitted the fixture), so no arch-id sniffing.
@@ -42,6 +45,7 @@ pub enum TinyArch {
     Qwen2,
     Gemma3,
     MiniMax,
+    Llama,
 }
 
 impl TinyArch {
@@ -52,13 +56,17 @@ impl TinyArch {
             "qwen2" => Ok(Self::Qwen2),
             "gemma3" | "gemma3_text" => Ok(Self::Gemma3),
             "minimax" | "minimax_m2" => Ok(Self::MiniMax),
-            other => Err(format!("unknown --arch '{other}' (qwen3_5|qwen3_5_moe|qwen2|gemma3|minimax)")),
+            "llama" | "mistral" => Ok(Self::Llama),
+            other => Err(format!(
+                "unknown --arch '{other}' (qwen3_5|qwen3_5_moe|qwen2|gemma3|minimax|llama)"
+            )),
         }
     }
 
     /// The `.hfq` arch_id this family writes (for the HFQM calib metadata).
     pub fn arch_id(self) -> u32 {
         match self {
+            Self::Llama => 0,
             Self::Qwen35 => 5,
             Self::Qwen35Moe => 6,
             Self::Qwen2 => 7,
@@ -74,6 +82,7 @@ impl TinyArch {
             Self::Qwen2 => "qwen2",
             Self::Gemma3 => "gemma3",
             Self::MiniMax => "minimax",
+            Self::Llama => "llama",
         }
     }
 }
@@ -102,6 +111,12 @@ pub enum TinyModel {
         config: minimax::MiniMaxConfig,
         weights: minimax::MiniMaxWeights,
         state: minimax::MiniMaxState,
+    },
+    Llama {
+        config: LlamaConfig,
+        weights: LlamaWeights,
+        kv: KvCache,
+        scratch: ForwardScratch,
     },
 }
 
@@ -150,6 +165,23 @@ impl TinyModel {
                 let state = minimax::MiniMaxState::new_with_max_seq(gpu, &config, max_seq)?;
                 Ok(Self::MiniMax { config, weights, state })
             }
+            TinyArch::Llama => {
+                let config = hipfire_runtime::hfq::config_from_hfq(&hfq)
+                    .ok_or("llama: config_from_hfq failed")?;
+                let weights = hipfire_runtime::hfq::load_weights_hfq(&mut hfq, &config, gpu)
+                    .map_err(|e| format!("llama load_weights_hfq: {e:?}"))?;
+                let kv = KvCache::new_gpu_q8(
+                    gpu,
+                    config.n_layers,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    max_seq + 16,
+                )
+                .map_err(|e| format!("llama kv: {e:?}"))?;
+                let scratch =
+                    ForwardScratch::new(gpu, &config).map_err(|e| format!("llama scratch: {e:?}"))?;
+                Ok(Self::Llama { config, weights, kv, scratch })
+            }
         }
     }
 
@@ -159,6 +191,7 @@ impl TinyModel {
             Self::Qwen2 { config, .. } => config.vocab_size,
             Self::Gemma3 { config, .. } => config.vocab_size,
             Self::MiniMax { config, .. } => config.vocab_size,
+            Self::Llama { config, .. } => config.vocab_size,
         }
     }
 
@@ -185,6 +218,16 @@ impl TinyModel {
             }
             Self::MiniMax { config, weights, state } => {
                 minimax::forward::decode_step(config, weights, state, gpu, token, pos as u32)
+            }
+            Self::Llama { config, weights, kv, scratch } => {
+                // forward_scratch computes logits into scratch.logits, THEN samples.
+                // We pass greedy/no-op sampling params and read the raw pre-sample
+                // logits (the sampled-token return value is discarded).
+                llama::forward_scratch(
+                    gpu, weights, config, token, pos, kv, scratch, 0.0, 1.0, 0, 0, 1.0,
+                )
+                .map_err(|e| format!("llama forward: {e:?}"))?;
+                gpu.download_f32(&scratch.logits).map_err(|e| format!("dl logits: {e:?}"))
             }
         }
     }
@@ -258,6 +301,23 @@ impl TinyModel {
                     put(&l.wv, format!("{p}.self_attn.v_proj"));
                     put(&l.wo, format!("{p}.self_attn.o_proj"));
                     put(&l.router, format!("{p}.block_sparse_moe.gate"));
+                }
+                m
+            }
+            Self::Llama { weights, .. } => {
+                let mut m = HashMap::new();
+                let mut put = |w: &WeightTensor, n: String| {
+                    m.insert(w.buf.buf.as_ptr() as usize, n);
+                };
+                for (i, l) in weights.layers.iter().enumerate() {
+                    let p = format!("model.layers.{i}");
+                    put(&l.wq, format!("{p}.self_attn.q_proj"));
+                    put(&l.wk, format!("{p}.self_attn.k_proj"));
+                    put(&l.wv, format!("{p}.self_attn.v_proj"));
+                    put(&l.wo, format!("{p}.self_attn.o_proj"));
+                    put(&l.w_gate, format!("{p}.mlp.gate_proj"));
+                    put(&l.w_up, format!("{p}.mlp.up_proj"));
+                    put(&l.w_down, format!("{p}.mlp.down_proj"));
                 }
                 m
             }
