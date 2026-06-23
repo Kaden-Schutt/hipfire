@@ -1668,6 +1668,11 @@ pub fn load_model(
         )
         .map_err(|e| format!("{e}"))?;
         let scratch = <Llama as Architecture>::new_state(gpu, &config)?;
+        // P3.2: assemble the ServingBackend (owns config/weights/scratch/kv); the
+        // separate llama_* fields stay None. (HFQ load path — mirrors the
+        // safetensors path below.)
+        let llama_backend =
+            hipfire_arch_llama::LlamaBackend::new(hfq.arch_id, config, weights, scratch, kv);
         let chat_template = resolve_chat_template(&hfq, path);
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
@@ -1687,11 +1692,11 @@ pub fn load_model(
             q35_active_session_id: None,
             q35_active_state_allocation_epoch: 0,
             q35_active_prefilled_generated_suffix_len: 0,
-            llama_config: Some(config),
-            llama_weights: Some(weights),
-            llama_scratch: Some(scratch),
-            llama_kv: Some(kv),
-            llama_backend: None,
+            llama_config: None,
+            llama_weights: None,
+            llama_scratch: None,
+            llama_kv: None,
+            llama_backend: Some(llama_backend),
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
