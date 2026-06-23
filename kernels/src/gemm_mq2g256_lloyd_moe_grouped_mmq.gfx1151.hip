@@ -122,6 +122,24 @@ extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151(
             sc_row[j] = __shfl(sc_self, src_lane);
         }
 
+        // Load the whole group's 64-byte 2-bit index region (16 K-tiles × one
+        // u32 each) up front via four 128-bit loads, into registers. The inner
+        // K-tile loop then reads from registers — the kernel is memory-unit
+        // bound (93% MemUnitBusy), so collapsing 16 scalar u32 loads into 4
+        // vector loads cuts load-instruction pressure 4x.
+        unsigned int pk_all[16];
+        {
+            const int32x4_t* pkp = (const int32x4_t*)(gp + 8);
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                int32x4_t v = pkp[i];
+                pk_all[i * 4 + 0] = (unsigned int)v[0];
+                pk_all[i * 4 + 1] = (unsigned int)v[1];
+                pk_all[i * 4 + 2] = (unsigned int)v[2];
+                pk_all[i * 4 + 3] = (unsigned int)v[3];
+            }
+        }
+
         for (int kb_in_group = 0; kb_in_group < 2; kb_in_group++) {
             const int kb_q8 = 2 * g + kb_in_group;
             if (kb_q8 >= blocks128) break;
@@ -145,8 +163,8 @@ extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151(
                 for (int kt = 0; kt < 2; kt++) {
                     // K-offset within the 256-element group.
                     const int k_off = kb_in_group * 128 + sb * 32 + kt * 16;
-                    // 16 × 2-bit indices = 32 bits = one u32 at gp+8 + k_off/4.
-                    const unsigned int pk = *(const unsigned int*)(gp + 8 + k_off / 4);
+                    // 16 × 2-bit indices = 32 bits = pre-loaded u32 (k_off/16).
+                    const unsigned int pk = pk_all[k_off / 16];
 
                     // A operand: 2-bit index → int8 codebook via byte-extract LUT.
                     int8x16_t a_vec;
