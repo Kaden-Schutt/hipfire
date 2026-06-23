@@ -1,0 +1,770 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! MoE gating/routing dispatch (router top-k, expert gather). NB the moe_scalar_indexed_wrappers! macro + its 4 invocations stay in mod.rs for now (they delegate to gemv_* methods). Pure move (Phase 1 M2).
+
+use super::{Gpu, GpuTensor};
+use crate::kernels;
+use hip_bridge::HipResult;
+use std::ffi::c_void;
+
+impl Gpu {
+    /// MoE router GPU softmax + top-K + (optional) renormalize. One
+    /// workgroup, no D2H sync. Writes [k_top] i32 indices and [k_top]
+    /// f32 weights to device buffers. Hardcoded k_top=8 to match A3B.
+    pub fn moe_softmax_topk_renorm_k8(
+        &mut self,
+        logits: &GpuTensor,
+        topk_idx: &GpuTensor, // i32 [k_top]
+        topk_w: &GpuTensor,   // f32 [k_top]
+        n_exp: usize,
+        norm_topk: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_softmax_topk_k8",
+            kernels::MOE_SOFTMAX_TOPK_K8_SRC,
+            "moe_softmax_topk_renorm_k8",
+        )?;
+        let lp = logits.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let n = n_exp as i32;
+        let nr = if norm_topk { 1i32 } else { 0i32 };
+        let mut params: Vec<*mut c_void> = vec![
+            &lp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &n as *const _ as *mut c_void,
+            &nr as *const _ as *mut c_void,
+        ];
+        let bytes = n_exp * 4 + 8 * 8;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "elementwise",
+            "moe_softmax_topk_renorm_k8",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "moe_softmax_topk_renorm_k8",
+            [1, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_i32(n);
+                b.push_i32(nr);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// MoE top-K + renorm given pre-softmaxed probs. Companion to the
+    /// regular `softmax_f32`. The dispatch site runs `softmax_f32` first,
+    /// then this kernel — same softmax math everywhere, no 1-ULP
+    /// divergence between the routing path and a CPU reference.
+    pub fn moe_topk_renorm_k8(
+        &mut self,
+        probs: &GpuTensor,    // [n_exp] f32, pre-softmaxed
+        topk_idx: &GpuTensor, // i32 [k_top]
+        topk_w: &GpuTensor,   // f32 [k_top]
+        n_exp: usize,
+        norm_topk: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_topk_renorm_k8",
+            kernels::MOE_TOPK_RENORM_K8_SRC,
+            "moe_topk_renorm_k8",
+        )?;
+        let lp = probs.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let n = n_exp as i32;
+        let nr = if norm_topk { 1i32 } else { 0i32 };
+        let mut params: Vec<*mut c_void> = vec![
+            &lp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &n as *const _ as *mut c_void,
+            &nr as *const _ as *mut c_void,
+        ];
+        let bytes = n_exp * 4 + 8 * 8;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "elementwise", "moe_topk_renorm_k8", bytes);
+        let result = self.launch_maybe_blob(
+            "moe_topk_renorm_k8",
+            [1, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_i32(n);
+                b.push_i32(nr);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// N-batched MoE softmax + top-K + renorm. Grid = (N, 1, 1); one
+    /// workgroup per token. `logits` is [N × n_exp], `topk_idx` is
+    /// [N × K_TOP] i32, `topk_w` is [N × K_TOP] f32.
+    pub fn moe_softmax_topk_renorm_k8_batched(
+        &mut self,
+        logits: &GpuTensor,
+        topk_idx: &GpuTensor,
+        topk_w: &GpuTensor,
+        n_exp: usize,
+        norm_topk: bool,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_softmax_topk_k8_batched",
+            kernels::MOE_SOFTMAX_TOPK_K8_BATCHED_SRC,
+            "moe_softmax_topk_renorm_k8_batched",
+        )?;
+        let lp = logits.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let n = n_exp as i32;
+        let nr = if norm_topk { 1i32 } else { 0i32 };
+        let mut params: Vec<*mut c_void> = vec![
+            &lp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &n as *const _ as *mut c_void,
+            &nr as *const _ as *mut c_void,
+        ];
+        let bytes = (n_exp * 4 + 8 * 8) * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "elementwise",
+            "moe_softmax_topk_renorm_k8_batched",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "moe_softmax_topk_renorm_k8_batched",
+            [batch_size as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_i32(n);
+                b.push_i32(nr);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// Batched companion of `moe_topk_renorm_k8` for the prefill path.
+    /// Takes pre-softmaxed probs of shape `[batch_size × n_exp]` and writes
+    /// `[batch_size × K_TOP]` indices and weights. Caller must run a batched
+    /// softmax (`gpu.softmax_f32` on a [batch_size × n_exp] tensor) before
+    /// calling this kernel.
+    pub fn moe_topk_renorm_k8_batched(
+        &mut self,
+        probs: &GpuTensor,
+        topk_idx: &GpuTensor,
+        topk_w: &GpuTensor,
+        n_exp: usize,
+        norm_topk: bool,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_topk_renorm_k8_batched",
+            kernels::MOE_TOPK_RENORM_K8_BATCHED_SRC,
+            "moe_topk_renorm_k8_batched",
+        )?;
+        let lp = probs.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let n = n_exp as i32;
+        let nr = if norm_topk { 1i32 } else { 0i32 };
+        let mut params: Vec<*mut c_void> = vec![
+            &lp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &n as *const _ as *mut c_void,
+            &nr as *const _ as *mut c_void,
+        ];
+        let bytes = (n_exp * 4 + 8 * 8) * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "elementwise",
+            "moe_topk_renorm_k8_batched",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "moe_topk_renorm_k8_batched",
+            [batch_size as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_i32(n);
+                b.push_i32(nr);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// Combine pass for the atomic-free MoE down path. Sums K_TOP expert
+    /// outputs per (token, m) weighted by topk_weights, accumulates into
+    /// the residual stream. No cross-token contention — each token writes
+    /// to its own M-column slice.
+    pub fn moe_down_combine_k8_batched(
+        &mut self,
+        expert_outputs: &GpuTensor, // [batch_size × k_top × m] f32
+        topk_weights: &GpuTensor,   // [batch_size × k_top] f32
+        x_residual: &GpuTensor,     // [batch_size × m] f32 in-place +=
+        m: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_down_combine_k8_batched",
+            kernels::MOE_DOWN_COMBINE_K8_BATCHED_SRC,
+            "moe_down_combine_k8_batched",
+        )?;
+        let eop = expert_outputs.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let xrp = x_residual.buf.as_ptr();
+        let m_val = m as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &eop as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        // BW: expert_outputs read N*K_TOP*M, topk_weights N*K_TOP, x_residual r+w 2*N*M.
+        let bytes = (batch_size * k_top * m + batch_size * k_top + 2 * batch_size * m) * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "elementwise",
+            "moe_down_combine_k8_batched",
+            bytes,
+        );
+        let block_m: u32 = 256;
+        let grid_x = (m as u32 + block_m - 1) / block_m;
+        let result = self.launch_maybe_blob(
+            "moe_down_combine_k8_batched",
+            [grid_x, batch_size as u32, 1],
+            [block_m, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(eop);
+                b.push_ptr(wp);
+                b.push_ptr(xrp);
+                b.push_i32(m_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// SGLang-style MoE scatter pipeline — Phase 1: per-expert histogram.
+    /// Single-CTA LDS-atomic histogram of `topk_indices[total_slots]`.
+    /// Output `expert_token_counts[num_experts]` holds RAW counts; Phase 2
+    /// rewrites them in place as padded counts.
+    pub fn moe_scatter_histogram_k8(
+        &mut self,
+        topk_indices: &GpuTensor,        // [total_slots] i32
+        expert_token_counts: &GpuTensor, // [num_experts] i32, written
+        total_slots: usize,
+        num_experts: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_scatter_histogram_k8",
+            kernels::MOE_SCATTER_HISTOGRAM_K8_SRC,
+            "moe_scatter_histogram_k8",
+        )?;
+        let ip = topk_indices.buf.as_ptr();
+        let cp = expert_token_counts.buf.as_ptr();
+        let ts_val = total_slots as i32;
+        let ne_val = num_experts as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ip as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &ts_val as *const _ as *mut c_void,
+            &ne_val as *const _ as *mut c_void,
+        ];
+        let lds_bytes = (num_experts * 4) as u32;
+        let bytes = (total_slots + num_experts) * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "elementwise",
+            "moe_scatter_histogram_k8",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "moe_scatter_histogram_k8",
+            [1, 1, 1],
+            [256, 1, 1],
+            lds_bytes,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ip);
+                b.push_ptr(cp);
+                b.push_i32(ts_val);
+                b.push_i32(ne_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// SGLang-style MoE scatter pipeline — Phase 2: pad + exclusive scan.
+    /// Rewrites `expert_token_counts` raw → padded (to a multiple of
+    /// `block_m`) and writes `expert_offsets[num_experts + 1]` with the
+    /// exclusive prefix sum. `expert_offsets[num_experts]` is M_total.
+    pub fn moe_scatter_offsets_k8(
+        &mut self,
+        expert_token_counts: &GpuTensor, // [E] i32, in: raw, out: padded
+        expert_offsets: &GpuTensor,      // [E+1] i32, written
+        num_experts: usize,
+        block_m: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_scatter_offsets_k8",
+            kernels::MOE_SCATTER_OFFSETS_K8_SRC,
+            "moe_scatter_offsets_k8",
+        )?;
+        let cp = expert_token_counts.buf.as_ptr();
+        let op = expert_offsets.buf.as_ptr();
+        let ne_val = num_experts as i32;
+        let bm_val = block_m as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &ne_val as *const _ as *mut c_void,
+            &bm_val as *const _ as *mut c_void,
+        ];
+        let lds_bytes = (num_experts * 4) as u32;
+        let bytes = (3 * num_experts + 1) * 4;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "elementwise", "moe_scatter_offsets_k8", bytes);
+        let result = self.launch_maybe_blob(
+            "moe_scatter_offsets_k8",
+            [1, 1, 1],
+            [256, 1, 1],
+            lds_bytes,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(cp);
+                b.push_ptr(op);
+                b.push_i32(ne_val);
+                b.push_i32(bm_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// SGLang-style MoE scatter pipeline — Phase 3: scatter + tile ids.
+    /// Writes `sorted_slot_index[m_total]` with each flat slot index at
+    /// its bucket position (padding stays at the -1 sentinel) and
+    /// `expert_tile_ids[m_total / block_m]` for the grouped-GEMM loop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_scatter_permute_k8(
+        &mut self,
+        topk_indices: &GpuTensor,      // [total_slots] i32
+        expert_offsets: &GpuTensor,    // [E+1] i32, exclusive padded scan
+        sorted_slot_index: &GpuTensor, // [m_total] i32, written
+        expert_tile_ids: &GpuTensor,   // [m_total / block_m] i32, written
+        inverse_perm: &GpuTensor,      // [total_slots] i32, written: flat → sorted_pos
+        total_slots: usize,
+        num_experts: usize,
+        m_total: usize,
+        block_m: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_scatter_permute_k8",
+            kernels::MOE_SCATTER_PERMUTE_K8_SRC,
+            "moe_scatter_permute_k8",
+        )?;
+        let ip = topk_indices.buf.as_ptr();
+        let op = expert_offsets.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let invp = inverse_perm.buf.as_ptr();
+        let ts_val = total_slots as i32;
+        let ne_val = num_experts as i32;
+        let mt_val = m_total as i32;
+        let bm_val = block_m as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ip as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &invp as *const _ as *mut c_void,
+            &ts_val as *const _ as *mut c_void,
+            &ne_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+            &bm_val as *const _ as *mut c_void,
+        ];
+        let lds_bytes = (num_experts * 4) as u32;
+        // BW: topk_indices + offsets + sorted_slot_index (init + writes)
+        //     + expert_tile_ids (writes).
+        let bytes = (total_slots + num_experts + 2 * m_total + m_total / block_m.max(1)) * 4;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "elementwise", "moe_scatter_permute_k8", bytes);
+        let result = self.launch_maybe_blob(
+            "moe_scatter_permute_k8",
+            [1, 1, 1],
+            [256, 1, 1],
+            lds_bytes,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ip);
+                b.push_ptr(op);
+                b.push_ptr(sp);
+                b.push_ptr(tp);
+                b.push_ptr(invp);
+                b.push_i32(ts_val);
+                b.push_i32(ne_val);
+                b.push_i32(mt_val);
+                b.push_i32(bm_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// Fused single-CTA scatter pipeline. Replaces histogram + offsets +
+    /// permute with one launch — saves ~2 launches × ~75µs per MoE layer
+    /// (≈2-3ms across 40 A3B layers).
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_scatter_fused_k8(
+        &mut self,
+        topk_indices: &GpuTensor,        // [total_slots] i32
+        expert_token_counts: &GpuTensor, // [E] i32, out: padded
+        expert_offsets: &GpuTensor,      // [E+1] i32, out: exclusive scan
+        sorted_slot_index: &GpuTensor,   // [m_total_max] i32, out
+        expert_tile_ids: &GpuTensor,     // [m_total / block_m] i32, out
+        inverse_perm: &GpuTensor,        // [total_slots] i32, out
+        total_slots: usize,
+        num_experts: usize,
+        m_total_max: usize,
+        block_m: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_scatter_fused_k8",
+            kernels::MOE_SCATTER_FUSED_K8_SRC,
+            "moe_scatter_fused_k8",
+        )?;
+        let ip = topk_indices.buf.as_ptr();
+        let cp = expert_token_counts.buf.as_ptr();
+        let op = expert_offsets.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let invp = inverse_perm.buf.as_ptr();
+        let ts_val = total_slots as i32;
+        let ne_val = num_experts as i32;
+        let mtm_val = m_total_max as i32;
+        let bm_val = block_m as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ip as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &invp as *const _ as *mut c_void,
+            &ts_val as *const _ as *mut c_void,
+            &ne_val as *const _ as *mut c_void,
+            &mtm_val as *const _ as *mut c_void,
+            &bm_val as *const _ as *mut c_void,
+        ];
+        let lds_bytes = (num_experts * 4) as u32;
+        let bytes = (total_slots + 2 * num_experts + 2 * total_slots + num_experts) * 4;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "elementwise", "moe_scatter_fused_k8", bytes);
+        let result = self.launch_maybe_blob(
+            "moe_scatter_fused_k8",
+            [1, 1, 1],
+            [256, 1, 1],
+            lds_bytes,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ip);
+                b.push_ptr(cp);
+                b.push_ptr(op);
+                b.push_ptr(sp);
+                b.push_ptr(tp);
+                b.push_ptr(invp);
+                b.push_i32(ts_val);
+                b.push_i32(ne_val);
+                b.push_i32(mtm_val);
+                b.push_i32(bm_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// Path 2 down combine. Per (token, m) iterates K_TOP slots via
+    /// `inverse_perm[token*K_TOP + k]`, applies topk_weights, and += into
+    /// `x_residual`. No atomic contention (each (token, m) is owned by
+    /// one thread).
+    pub fn moe_down_combine_grouped_k8(
+        &mut self,
+        y_down_grouped: &GpuTensor, // [m_total × dim] f32
+        inverse_perm: &GpuTensor,   // [N*K_TOP] i32
+        topk_weights: &GpuTensor,   // [N × K_TOP] f32
+        x_residual: &GpuTensor,     // [N × dim] f32 in-place +=
+        dim: usize,
+        k_top: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_down_combine_grouped_k8",
+            kernels::MOE_DOWN_COMBINE_GROUPED_K8_SRC,
+            "moe_down_combine_grouped_k8",
+        )?;
+        let yp = y_down_grouped.buf.as_ptr();
+        let ip = inverse_perm.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let xrp = x_residual.buf.as_ptr();
+        let dim_val = dim as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &yp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &dim_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let block: u32 = 256;
+        let grid_x = (dim as u32 + block - 1) / block;
+        let bytes = (n * dim * 4 * 2 + n * k_top * 4 + n * k_top * 4) as usize;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "elementwise",
+            "moe_down_combine_grouped_k8",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "moe_down_combine_grouped_k8",
+            [grid_x, n as u32, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(yp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(xrp);
+                b.push_i32(dim_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// Path 2 unscatter combine for gate_up. Reads Y_grouped[m_total ×
+    /// 2*mi] and writes the gate half (rows 0..mi) into `y_gate[token,
+    /// k_rank, :]` and the up half (rows mi..2*mi) into `y_up[token,
+    /// k_rank, :]`, where (token, k_rank) is recovered from
+    /// `sorted_slot_index[slot]`. Padding slots are skipped.
+    pub fn moe_gate_up_unscatter_k8(
+        &mut self,
+        y_grouped: &GpuTensor,         // [m_total × (2*mi)] f32
+        sorted_slot_index: &GpuTensor, // [m_total] i32
+        y_gate: &GpuTensor,            // [N × K_TOP × mi] f32, written
+        y_up: &GpuTensor,              // [N × K_TOP × mi] f32, written
+        mi: usize,
+        k_top: usize,
+        m_total: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_gate_up_unscatter_k8",
+            kernels::MOE_GATE_UP_UNSCATTER_K8_SRC,
+            "moe_gate_up_unscatter_k8",
+        )?;
+        let yp = y_grouped.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let gp = y_gate.buf.as_ptr();
+        let up = y_up.buf.as_ptr();
+        let mi_val = mi as i32;
+        let kt_val = k_top as i32;
+        let mt_val = m_total as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &yp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &up as *const _ as *mut c_void,
+            &mi_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+        ];
+        let block: u32 = 256;
+        let grid_x = (mi as u32 + block - 1) / block;
+        // BW: Y_grouped read (m_total*2*mi*4) + y_gate write (m_total*mi*4)
+        //     + y_up write (m_total*mi*4) + sorted_slot_index (m_total*4).
+        let bytes = (m_total * 2 * mi + m_total * 2 * mi + m_total) * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "elementwise",
+            "moe_gate_up_unscatter_k8",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "moe_gate_up_unscatter_k8",
+            // m_total in grid.x (limit 2^31), mi-tile in grid.y — m_total exceeds
+            // the 65535 grid.y limit past ~8k prefill tokens (m_total = N*K_TOP).
+            [m_total as u32, grid_x, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(yp);
+                b.push_ptr(sp);
+                b.push_ptr(gp);
+                b.push_ptr(up);
+                b.push_i32(mi_val);
+                b.push_i32(kt_val);
+                b.push_i32(mt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// Phase D1 fused unscatter + SwiGLU + asymmetric clamp.
+    /// Combines `moe_gate_up_unscatter_k8` + `deepseek4_silu_mul_clamp_f32_batched`
+    /// into one launch. Writes silu(clamp(gate)) * clamp(up) directly to
+    /// `moe_gate_batch`. The `moe_up_batch` intermediate is no longer
+    /// produced — caller stops allocating it on the fused path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_unscatter_silu_clamp_k8(
+        &mut self,
+        y_grouped: &GpuTensor,         // [m_total × (2*mi)] f32
+        sorted_slot_index: &GpuTensor, // [m_total] i32
+        moe_gate_batch: &GpuTensor,    // [N × K_TOP × mi] f32, written
+        mi: usize,
+        k_top: usize,
+        m_total: usize,
+        swiglu_limit: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_unscatter_silu_clamp_k8",
+            kernels::MOE_UNSCATTER_SILU_CLAMP_K8_SRC,
+            "moe_unscatter_silu_clamp_k8",
+        )?;
+        let yp = y_grouped.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let gp = moe_gate_batch.buf.as_ptr();
+        let mi_val = mi as i32;
+        let kt_val = k_top as i32;
+        let mt_val = m_total as i32;
+        let mut swiglu_lim = swiglu_limit;
+        let mut params: Vec<*mut c_void> = vec![
+            &yp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &mi_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+            &mut swiglu_lim as *mut _ as *mut c_void,
+        ];
+        let block: u32 = 256;
+        let grid_x = (mi as u32 + block - 1) / block;
+        // BW: Y_grouped read (m_total*2*mi*4) + moe_gate_batch write
+        // (m_total*mi*4) + sorted_slot_index (m_total*4).  Half the
+        // write traffic vs the unfused path (no y_up output).
+        let bytes = (m_total * 2 * mi + m_total * mi + m_total) * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "elementwise",
+            "moe_unscatter_silu_clamp_k8",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "moe_unscatter_silu_clamp_k8",
+            [grid_x, m_total as u32, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(yp);
+                b.push_ptr(sp);
+                b.push_ptr(gp);
+                b.push_i32(mi_val);
+                b.push_i32(kt_val);
+                b.push_i32(mt_val);
+                b.push_f32(swiglu_lim);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+}
