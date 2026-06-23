@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::{DeltaNetState, LayerType};
+use hipfire_mixer::{MixerKind, MixerProfile};
 use hipfire_model::{
     is_qwen35_family_arch_id, is_qwen35_moe_arch_id, parse_model_worker_id, AcceleratorDeviceInfo,
     AcceleratorInventory, ModelWorkerId,
@@ -869,6 +870,24 @@ pub fn qwen35_active_logical_position(m: &LoadedModel) -> Result<usize, String> 
     Ok(m.seq_pos + compact_offset)
 }
 
+/// Per-layer token-mixer profile for a qwen3.5 hybrid stack: `FullAttention`
+/// layers are KV-backed [`MixerKind::FullAttn`], `LinearAttention` layers are
+/// recurrent [`MixerKind::DeltaNet`] (no KV). The KV allocator consumes
+/// [`MixerProfile::kv_layer_mask`] to skip the recurrent layers — the neutral
+/// replacement for the hand-rolled `layer_types == FullAttention` mask. See
+/// docs/plans/2026-06-23-seam-finish-and-mamba2.md (P2b).
+fn qwen35_mixer_profile(layer_types: &[LayerType]) -> MixerProfile {
+    MixerProfile::new(
+        layer_types
+            .iter()
+            .map(|t| match t {
+                LayerType::FullAttention => MixerKind::FullAttn,
+                LayerType::LinearAttention => MixerKind::DeltaNet,
+            })
+            .collect(),
+    )
+}
+
 /// Allocate (or reuse) the resident session-state slot for a session id,
 /// parking any other active session first; the entry point that makes a session
 /// the live one before prefill.
@@ -886,11 +905,7 @@ pub fn qwen35_allocate_session_state(
         .ok_or_else(|| "qwen35 KV mode missing; reload model before batch prefill".to_string())?;
     let kv_cache = match kv_mode {
         "fp32" | "f32" => {
-            let is_kv_layer: Vec<bool> = config
-                .layer_types
-                .iter()
-                .map(|t| *t == LayerType::FullAttention)
-                .collect();
+            let is_kv_layer = qwen35_mixer_profile(&config.layer_types).kv_layer_mask();
             kv::KvCache::new_gpu_filtered(
                 gpu,
                 &is_kv_layer,

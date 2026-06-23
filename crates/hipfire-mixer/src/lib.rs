@@ -150,6 +150,15 @@ impl MixerProfile {
     pub fn count<F: Fn(MixerKind) -> bool>(&self, pred: F) -> usize {
         self.layers.iter().copied().filter(|&m| pred(m)).count()
     }
+
+    /// Per-layer boolean: does layer `i` keep a KV cache? This is the mask the
+    /// KV allocator consumes to skip recurrent (no-KV) layers in a hybrid stack
+    /// — e.g. qwen35 allocates KV only for its `FullAttention` layers and skips
+    /// the DeltaNet (`LinearAttention`) ones. For a pure-SSM model this is all
+    /// `false`; for a pure-transformer stack, all `true`.
+    pub fn kv_layer_mask(&self) -> Vec<bool> {
+        self.layers.iter().map(|m| m.uses_kv()).collect()
+    }
 }
 
 #[cfg(test)]
@@ -190,6 +199,23 @@ mod tests {
         assert!(p.needs_kv_cache());
         assert_eq!(p.count(|m| m == MixerKind::FullAttn), 6);
         assert_eq!(p.count(MixerKind::is_recurrent), 18);
+    }
+
+    #[test]
+    fn kv_layer_mask_matches_uses_kv() {
+        // qwen35-style 3:1 DeltaNet:FullAttn block.
+        let p = MixerProfile::new(vec![
+            MixerKind::DeltaNet,
+            MixerKind::DeltaNet,
+            MixerKind::DeltaNet,
+            MixerKind::FullAttn,
+        ]);
+        assert_eq!(p.kv_layer_mask(), vec![false, false, false, true]);
+        // pure-SSM: no KV layers at all.
+        assert_eq!(
+            MixerProfile::uniform(MixerKind::Mamba2, 3).kv_layer_mask(),
+            vec![false, false, false]
+        );
     }
 
     #[test]

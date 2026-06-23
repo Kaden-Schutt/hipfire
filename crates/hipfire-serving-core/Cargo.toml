@@ -16,6 +16,7 @@ hipfire-evidence = { path = "../hipfire-evidence" }
 hipfire-generate = { path = "../hipfire-generate" }
 hipfire-prompt = { path = "../hipfire-prompt" }
 hipfire-model = { path = "../hipfire-model" }
+hipfire-mixer = { path = "../hipfire-mixer" }
 hipfire-state = { path = "../hipfire-state" }
 hipfire-npu = { path = "../hipfire-npu" }
 hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }

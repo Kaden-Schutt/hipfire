@@ -96,9 +96,16 @@ infrastructure rather than two more special cases. The existing qwen35 hybrid
      counts. 4 unit tests (pure-SSM/pure-attn/qwen35-hybrid) pass in the no-GPU
      subset. Buffer layouts deliberately unpinned — migration reuses existing
      `KvCache`/`DeltaNetState` allocations.
-   - **P2b (next).** Build the `MixerLayerState` buffer model on the taxonomy and
-     wire serving-core's KV-allocation + `is_qwen35_family_arch_id` branches to
-     query `MixerProfile` instead. Touches the serving layer → coherence-gated.
+   - **P2b ▸ in progress.** First integration landed: serving-core's qwen35
+     KV-allocation mask (`session.rs` `qwen35_allocate_session_state`, fp32 mode)
+     now derives its per-layer KV filter from `MixerProfile::kv_layer_mask()` via
+     a `qwen35_mixer_profile(layer_types)` helper, replacing the hand-rolled
+     `layer_types == FullAttention` map. Behavior-preserving (identical boolean
+     mapping); makes `MixerProfile` load-bearing in production serving. **Next:**
+     extend the same profile-derived mask to the q8/asym KV-mode branches, then
+     build the `MixerLayerState` buffer model. NB: the `is_qwen35_family_arch_id`
+     branches are qwen35 *fast-path* gates (DeltaNet serving machinery), **not**
+     KV-topology decisions — those are dissolved in P5, not rewired here.
 3. **P3 — wire the daemon to the seam + migrate the dense archs.** Resolve the
    daemon-wiring decision point via the **full-collapse** route (goal is
    organization, not a quick ship): thread the daemon sampler/sessions/streaming
