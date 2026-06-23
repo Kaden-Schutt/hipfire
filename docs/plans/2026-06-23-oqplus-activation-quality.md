@@ -182,6 +182,31 @@ int8-resident weight-bandwidth gap is accepted; closing it is the **OQ4+**
   W4A8 (weight_bits=4, act_bits=8). Batched-prefill WMMA path remains
   `partial`/parity-gated (the [[gate]] entry is unchanged — Tier 2 still open).
 
+## OQ4+ supersedes OQ8+ at decode (2026-06-23)
+
+Applying the same W4A16 decode to oq4's **4-bit-resident** (nibble-packed) weights
+gives the prize OQ8+ couldn't: mq4-class decode speed AND OQ8+ quality.
+
+| format | weight residency | decode KLD | decode tok/s | VRAM |
+|--------|------------------|-----------:|-------------:|-----:|
+| mq4+   | 4-bit (int4)     | 0.078      | 59           | 0.55 GB |
+| OQ8+   | int8 (expanded)  | 0.046330   | 42.7         | 0.54 GB (loads int8) |
+| **OQ4+** | **4-bit (int4)** | **0.046337** | **54.9**   | **0.54 GB** |
+
+OQ4+ = `oq4` (Oq4G256) 4-bit-resident + LDLQ+AWQ weights + **W4A16 decode**
+(gemv_oq4_grouped unpacks the nibble weight inline × f32 act; no quantize_act_oq4,
+no WMMA waste). Commit 48a8d07b.
+- KLD 0.046337 == OQ8+ 0.046330 (same 4-bit weights) → 1.7× better than mq4+.
+- Decode 54.9 (93% of mq4+, +29% over OQ8+) — the 4-bit-resident weight halves the
+  decode read bytes vs OQ8+'s int8 expansion, closing the bandwidth gap.
+- **W4A4 int4-activation attractor is GONE** (list-primes loop): W4A16 decode
+  sidesteps the int4 acts that were the W4A4 damage.
+- **OQ4+ DOMINATES OQ8+ at decode**: same quality, faster, half the loaded weight
+  bytes. Canonical artifact `~/.hipfire/models/qwen3.5-0.8b-oq4+.hfq`
+  (md5 5f91fba8…, oq4-ldlqawq weights). Registry `oq4` label updated to OQ4+.
+- Remaining: W4A4 **batched-prefill** still parity-gated (the [[gate]] entry) — the
+  W4A16/W8A8 batched-prefill path is the next perf item; decode is the win here.
+
 ## Cross-cutting note
 
 This is **offline-quant** quality work — orthogonal to and cheaper than the

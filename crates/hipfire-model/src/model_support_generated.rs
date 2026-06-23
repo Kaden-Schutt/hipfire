@@ -154,7 +154,7 @@ pub const QUANT_TABLE: &[QuantInfo] = &[
     },
     QuantInfo {
         name: "oq4",
-        label: "Opus / OQ4 (W4A4)",
+        label: "Opus / OQ4+ (4-bit-resident; W4A16 decode, W4A4 batched prefill)",
         weight_bits: 4,
         act_bits: 4,
         status: "opt-in",
