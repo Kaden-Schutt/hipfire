@@ -160,6 +160,17 @@ infrastructure rather than two more special cases. The existing qwen35 hybrid
    organization, not a quick ship): thread the daemon sampler/sessions/streaming
    through `decode_loop` so the seam is not greedy-only, and route
    llama/qwen2/gemma3 through `ServingBackend` end-to-end.
+   - **gemma3 (arch 12) ✅ already routed** — `LoadedModel.gemma3_text:
+     Gemma3Backend`, `generate_gemma3` → `.serve()` over `run_simple_ar`.
+   - **P3.1 qwen2 (arch 7) ✅** routed: added `LoadedModel.qwen2_backend:
+     Option<Qwen2Backend>` (the triple stays only for dots-ocr's `qwen2_state`
+     reuse), built in the load arch-7 block, `generate_qwen2` rewritten to
+     `.serve()` (mirrors gemma3; gains repeat-penalty via `decode_loop`).
+     Compiles + clippy + qwen2 dispatch tests clean. **Runtime validation
+     pending** — needs a quantized qwen2 `.hfq` (only HF sources local; the
+     standard coherence gate uses qwen35, not arch-7).
+   - **P3.2 llama**, **P3.3 thread daemon sampler/sessions/streaming through
+     `decode_loop`** (the greedy-only → full-sampling upgrade) remain.
 4. **P4 — migrate the bespoke loops.** minimax, lfm2moe, deepseek4, and the VL
    archs (gemma3-vl, dots-ocr) as `serve` overrides behind `ArchCaps`.
 5. **P5 — migrate qwen35 (risk-concentrated).** DFlash/MTP/PP/grouped-MoE as

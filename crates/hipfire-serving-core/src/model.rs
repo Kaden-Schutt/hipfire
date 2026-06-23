@@ -217,6 +217,12 @@ pub struct LoadedModel {
     pub qwen2_config: Option<qwen2::Qwen2Config>,
     pub qwen2_weights: Option<qwen2::Qwen2Weights>,
     pub qwen2_state: Option<qwen2::Qwen2State>,
+    /// Assembled Qwen2 serving backend (arch_id=7), driven through the shared
+    /// `ServingBackend::serve` seam — mirrors `gemma3_text`. Owns its own
+    /// config/weights/state; the separate `qwen2_*` fields above stay `None` on
+    /// the arch-7 path and are retained only for dots-ocr's reuse of
+    /// `qwen2_state`. P3.1.
+    pub qwen2_backend: Option<hipfire_arch_qwen2::Qwen2Backend>,
     // DeepSeek V4 Flash state (arch_id=9 — hipfire-arch-deepseek4).
     // Hyper-Connections + compressed-KV indexer + tail-only RoPE + raw
     // SWA cache. KV cache lives inside DeepseekV4State; no separate

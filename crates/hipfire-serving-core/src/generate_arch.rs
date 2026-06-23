@@ -18,7 +18,6 @@ use hipfire_arch_deepseek4 as deepseek4;
 #[cfg(feature = "arch-lfm2moe")]
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
-use hipfire_arch_qwen2::qwen2;
 use hipfire_prompt as prompt_frame;
 use hipfire_runtime::arch::{GenerateCtx, ServingBackend};
 
@@ -1086,13 +1085,9 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
 /// `temp` is currently honored only as a "≤ 1e-6 means greedy"
 /// signal; anything else falls back to greedy too (no sampler wired).
 ///
-/// Conversation state on the daemon side advances via
-/// `m.seq_pos` (mirrors the qwen35/llama bookkeeping) plus
-/// `state.next_pos` inside `Qwen2State`. On context overflow we hard
-/// reset (no CASK eviction on arch_id=7) — same fallback the
-/// llama path uses.
-/// Qwen2 generate path: per-token prefill + greedy/sampled decode over
-/// `qwen2::forward_step`, streaming `token`/`done` events.
+/// P3.1: now routed through `ServingBackend::serve` (the shared
+/// `run_simple_ar` / `decode_loop` seam, mirroring `generate_gemma3`). The
+/// per-token prefill/decode loop and streaming live inside `Qwen2Backend`.
 pub fn generate_qwen2(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -1100,149 +1095,53 @@ pub fn generate_qwen2(
     id: &str,
     prompt: &str,
     _system_prompt: Option<&str>,
-    _temp: f32,
-    _top_p: f32,
+    temp: f32,
+    top_p: f32,
     max_tokens: usize,
-    _repeat_penalty: f32,
-    _repeat_window: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
 ) {
-    let tokenizer = match m.tokenizer.as_ref() {
-        Some(t) => t,
-        None => {
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"error","id":"{}","message":"tokenizer not loaded"}}"#,
-                id
-            );
-            let _ = stdout.flush();
-            return;
-        }
-    };
-    let cfg = match m.qwen2_config.as_ref() {
-        Some(c) => c,
-        None => {
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"error","id":"{}","message":"qwen2_config missing on arch_id=7 generate"}}"#,
-                id
-            );
-            let _ = stdout.flush();
-            return;
-        }
-    };
-    let weights = m
-        .qwen2_weights
-        .as_ref()
-        .expect("qwen2_weights missing on arch_id=7 generate");
-    let state = m
-        .qwen2_state
-        .as_mut()
-        .expect("qwen2_state missing on arch_id=7 generate");
-
-    let prompt_ids = tokenizer.encode(prompt);
-    if prompt_ids.is_empty() {
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"error","id":"{}","message":"empty prompt after tokenize"}}"#,
-            id
-        );
-        let _ = stdout.flush();
+    // P3.1: route through the shared `ServingBackend::serve` seam
+    // (`run_simple_ar` → tokenize → prefill → `decode_loop`), mirroring
+    // `generate_gemma3`. `decode_loop` honors `repeat_penalty`; greedy otherwise.
+    if m.tokenizer.is_none() {
+        emit_error_with_id(stdout, id, "tokenizer not loaded".to_string());
         return;
     }
-
-    // Capacity guard. No eviction on arch_id=7 yet — reset state when
-    // the requested run would overflow the KV budget.
-    if state.next_pos + prompt_ids.len() + max_tokens > state.max_seq {
-        eprintln!(
-            "[daemon] arch_id=7 context full ({}/{}) — resetting Qwen2State.next_pos",
-            state.next_pos, state.max_seq,
+    if m.qwen2_backend.is_none() {
+        emit_error_with_id(
+            stdout,
+            id,
+            "qwen2 backend not loaded (arch 7 not active)".to_string(),
         );
-        state.reset();
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
+        return;
     }
+    // Disjoint field borrows: tokenizer (shared) + backend (mut).
+    let tok = m.tokenizer.as_ref().unwrap();
+    let backend = m.qwen2_backend.as_mut().unwrap();
 
-    let t0 = Instant::now();
-
-    // Prefill: forward_step per prompt token. The last call leaves
-    // logits in state.logits — these are the predictions for the
-    // first generated token.
-    for &tok in &prompt_ids {
-        if let Err(e) = qwen2::forward_step(gpu, weights, cfg, state, tok) {
-            emit_error_with_id(stdout, id, format!("qwen2 prefill failed: {e:?}"));
-            let _ = stdout.flush();
-            return;
-        }
-        m.conversation_tokens.push(tok);
-    }
-    let prefill_ms = t0.elapsed().as_millis();
-
-    // Decode loop. Greedy argmax for now (see fn doc for sampling
-    // scope). The first generated token is argmax of the prefill's
-    // final logits; each subsequent token requires another
-    // forward_step.
-    let mut generated_count: usize = 0;
-    let eos_set: &[u32] = &cfg.eos_token_ids;
-    let decode_t0 = Instant::now();
-    let mut next_tok = match gpu.argmax_f32(&state.logits, cfg.vocab_size) {
-        Ok(t) => t,
-        Err(e) => {
-            emit_error_with_id(stdout, id, format!("argmax failed: {e:?}"));
-            let _ = stdout.flush();
-            return;
-        }
+    let no_images: [&[u8]; 0] = [];
+    let mut ctx = GenerateCtx {
+        id,
+        prompt,
+        temperature: temp,
+        top_p,
+        max_tokens,
+        repeat_penalty,
+        repeat_window,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        max_think_tokens: 0,
+        stop_sequences: &[],
+        images: &no_images,
+        sink: stdout,
     };
-
-    loop {
-        if generated_count >= max_tokens {
-            break;
-        }
-        if eos_set.contains(&next_tok) {
-            break;
-        }
-        // Emit text fragment for this token. Tokenizer.decode handles
-        // BPE byte-fragment reassembly; for special tokens that decode
-        // to an empty string we still advance the loop. Build through
-        // serde_json so `id` (user-supplied) and `frag` (arbitrary
-        // UTF-8 with possible `"` / `\` / control chars) can't corrupt
-        // the JSONL line.
-        let frag = tokenizer.decode(&[next_tok]);
-        let envelope = serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": frag,
-        });
-        let _ = writeln!(stdout, "{}", envelope);
-        let _ = stdout.flush();
-        m.conversation_tokens.push(next_tok);
-        generated_count += 1;
-
-        match qwen2::forward_step_greedy(gpu, weights, cfg, state, next_tok) {
-            Ok(t) => next_tok = t,
-            Err(e) => {
-                emit_error_with_id(stdout, id, format!("forward_step_greedy failed: {e:?}"));
-                let _ = stdout.flush();
-                return;
-            }
-        }
+    let result = backend.serve(gpu, tok, &mut ctx);
+    // `ctx` mutably borrows `stdout`; drop before reusing it for errors.
+    drop(ctx);
+    if let Err(e) = result {
+        emit_error_with_id(stdout, id, format!("qwen2 serve: {e}"));
     }
-
-    // Daemon bookkeeping: seq_pos matches Qwen2State's internal cursor.
-    m.seq_pos = state.next_pos;
-
-    let decode_ms = decode_t0.elapsed().as_millis().max(1);
-    let total_ms = t0.elapsed().as_millis().max(1);
-    let tok_s = if generated_count > 0 && decode_ms > 0 {
-        (generated_count as f64 * 1000.0) / decode_ms as f64
-    } else {
-        0.0
-    };
-    let _ = writeln!(
-        stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
-        id, generated_count, tok_s, prefill_ms, total_ms,
-    );
-    let _ = stdout.flush();
 }
 
 /// MiniMax-M2 (arch_id=10) generate path — minimal AR bring-up.

@@ -75,4 +75,4 @@
 pub mod arch;
 pub mod qwen2;
 
-pub use arch::Qwen2;
+pub use arch::{Qwen2, Qwen2Backend};
