@@ -21,7 +21,7 @@
 //!   - crash / panic / nonzero exit                       → Fail
 //!   - non-finite KLD or zero positions scored            → Fail
 //!   - baseline present and |kld − base| > drift budget   → Fail
-//!   - baseline absent                                    → Pass (soft note)
+//!   - baseline absent                                    → Skip (Pass under --record)
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -274,7 +274,7 @@ fn run_kld(probe: &Path, arch: &str, anchor: &Path, cand: &Path) -> Result<KldCe
 }
 
 /// Verdict for a KLD cell. `base` = committed `(mean, rel_tol)` if any.
-fn kld_status(cell: &KldCell, base: Option<(f64, f64)>) -> (EvalStatus, Option<String>) {
+fn kld_status(cell: &KldCell, base: Option<(f64, f64)>, record: bool) -> (EvalStatus, Option<String>) {
     if !cell.finite || !cell.mean_kld.is_finite() {
         return (EvalStatus::Fail, Some("non-finite KLD".into()));
     }
@@ -296,7 +296,13 @@ fn kld_status(cell: &KldCell, base: Option<(f64, f64)>) -> (EvalStatus, Option<S
                 (EvalStatus::Pass, None)
             }
         }
-        None => (EvalStatus::Pass, Some("no baseline recorded".into())),
+        // No committed baseline → the cell ran but nothing was COMPARED. Report
+        // Skip (not Pass), so a fresh gpu_arch / newly-added format isn't a
+        // misleading green — it mirrors fixture-golden's "inconclusive" status.
+        // The hard-fail checks above still catch crashes/NaN/zero-token cells.
+        // During `--record` we ARE establishing the baseline this run, so Pass.
+        None if record => (EvalStatus::Pass, Some("recording new baseline".into())),
+        None => (EvalStatus::Skip, Some("no committed baseline (run --record)".into())),
     }
 }
 
@@ -515,7 +521,7 @@ pub(crate) fn tiny_quant_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<Eva
                     if record && cell.finite {
                         observed.push((gpu_arch.clone(), fam.to_string(), fmt.to_string(), cell.mean_kld));
                     }
-                    let (st, rs) = kld_status(&cell, base);
+                    let (st, rs) = kld_status(&cell, base, record);
                     let m = kld_metrics(fam, fmt, false, &gpu_arch, &cell, base);
                     push(fam, &format!("kld:{fmt}"), st, rs, m, &mut rows);
                 }
@@ -562,7 +568,7 @@ pub(crate) fn tiny_quant_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<Eva
                     if record && cell.finite {
                         observed.push((gpu_arch.clone(), fam.to_string(), key, cell.mean_kld));
                     }
-                    let (st, rs) = kld_status(&cell, base);
+                    let (st, rs) = kld_status(&cell, base, record);
                     let m = kld_metrics(fam, fmt, true, &gpu_arch, &cell, base);
                     push(fam, &format!("kld:{fmt}(calib)"), st, rs, m, &mut rows);
                 }
@@ -588,17 +594,19 @@ pub(crate) fn tiny_quant_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<Eva
 }
 
 /// Rewrite `tests/tiny-quant-baselines.txt` from observed cells (`--record`).
-/// Merges with any existing rows for *other* gpu_archs so a single-GPU record
-/// run doesn't drop other boards' baselines.
+/// Upserts per `(gpu_arch, family, format)` CELL: only cells present in this run's
+/// observation set are replaced; every other existing row is preserved verbatim —
+/// other GPUs AND same-GPU families/formats not recorded this run (e.g. a subset
+/// record via `HIPFIRE_TINYQUANT_FAMILIES`, or minimax excluded on a faulting arch).
 fn write_baselines(observed: &[(String, String, String, f64)]) -> std::io::Result<()> {
     let path = repo_root()
         .map(|r| r.join(TINYQUANT_BASELINES))
         .ok_or_else(|| std::io::Error::other("repo root not found"))?;
-    // Keep existing rows whose gpu_arch is not being re-recorded now, and
-    // remember any hand-tuned per-cell tolerances so a re-record preserves them
-    // instead of resetting to the default.
-    let recording: std::collections::HashSet<&str> =
-        observed.iter().map(|(g, _, _, _)| g.as_str()).collect();
+    // Set of cells being (re-)recorded this run, keyed by the full cell.
+    let recording: std::collections::HashSet<(&str, &str, &str)> = observed
+        .iter()
+        .map(|(g, fam, fmt, _)| (g.as_str(), fam.as_str(), fmt.as_str()))
+        .collect();
     let mut kept: Vec<String> = Vec::new();
     let mut prior_tol: BTreeMap<(String, String, String), f64> = BTreeMap::new();
     if let Ok(body) = std::fs::read_to_string(&path) {
@@ -608,17 +616,20 @@ fn write_baselines(observed: &[(String, String, String, f64)]) -> std::io::Resul
                 continue;
             }
             let f: Vec<&str> = t.split_whitespace().collect();
-            let g = f.first().copied().unwrap_or("");
-            if recording.contains(g) {
-                if f.len() >= 5 {
-                    if let Ok(tol) = f[4].parse::<f64>() {
-                        prior_tol.insert(
-                            (f[0].to_string(), f[1].to_string(), f[2].to_string()),
-                            tol,
-                        );
-                    }
+            if f.len() < 4 {
+                continue; // malformed row — drop
+            }
+            let key = (f[0], f[1], f[2]);
+            if recording.contains(&key) {
+                // Re-recorded this run: remember a hand-tuned tol so the rewrite
+                // preserves it instead of resetting to the default; drop the row
+                // (it's re-added from `observed` below).
+                if let Some(tol) = f.get(4).and_then(|s| s.parse::<f64>().ok()) {
+                    prior_tol.insert((f[0].into(), f[1].into(), f[2].into()), tol);
                 }
             } else {
+                // Not in this observation set — preserve verbatim (other GPUs,
+                // and same-GPU families/formats skipped this run).
                 kept.push(t.to_string());
             }
         }
