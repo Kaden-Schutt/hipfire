@@ -61,6 +61,7 @@ hipfire-model = { path = "../hipfire-model" }
 hipfire-prompt = { path = "../hipfire-prompt" }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
+hipfire-mixer = { path = "../hipfire-mixer" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
 memmap2 = "0.9"
 serde = { version = "1", features = ["derive"] }

@@ -114,9 +114,27 @@ infrastructure rather than two more special cases. The existing qwen35 hybrid
      path — so it needs `coherence-gate-dflash` + the q8/max256 perf gate, not a
      blind edit. Tracked as a P2b/P5 optimization, not done here. The
      spec-decode `n_fa_layers` count (`load.rs` DDTree setup) is left for P5.
-     **Next:** build the `MixerLayerState` buffer model on the taxonomy. NB the
-     `is_qwen35_family_arch_id` branches are qwen35 *fast-path* gates, **not**
-     KV-topology — dissolved in P5, not rewired here.
+     NB the `is_qwen35_family_arch_id` branches are qwen35 *fast-path* gates,
+     **not** KV-topology — dissolved in P5, not rewired here.
+   - **P2c ▸ in progress — the state-container unification.** Unify the
+     `LoadedModel` state cluster (`kv_cache: Option<KvCache>` + the `DeltaNetState`
+     inside the qwen35 session state) under ONE `SequenceState` container, keyed
+     by `MixerProfile`. **Container, not buffer-merge**: it owns `Option<KvCache>`
+     + `Option<Box<dyn RecurrentMixerState>>` (KvCache's 49 quant codecs and
+     DeltaNetState's S-matrix/conv storage stay in their own types); the no-KV
+     path falls out (Mamba-2 → `kv: None`). Hot path stays monomorphized via an
+     `Any` downcast (`recurrent_as::<DeltaNetState>()`). Sized honestly: **~265
+     access sites** (88 `.kv_cache` + 177 `.q35_`) + 136 spec-decode snapshot
+     refs + 49 KV constructors → effectively P6 pulled forward, **gate-mandatory**.
+     Landed as small testable slices (not one mega-commit):
+     - **Slice 0 ✅** `hipfire-runtime::sequence_state` — `RecurrentMixerState`
+       trait + `SequenceState` container, GPU-free unit tests (pure-SSM no-KV
+       shape, empty-profile, downcast). Additive, nothing migrated.
+     - **Slice 1** impl `RecurrentMixerState for DeltaNetState`.
+     - **Slice 2** construct `SequenceState` at qwen35 load, parallel + asserted.
+     - **Slice 3+** migrate access sites cluster-by-cluster (session-alloc →
+       prefill → decode → spec-decode), each coherence-gate-dflash + perf gated;
+       final cluster deletes the old `LoadedModel` fields (P6 overlap).
 3. **P3 — wire the daemon to the seam + migrate the dense archs.** Resolve the
    daemon-wiring decision point via the **full-collapse** route (goal is
    organization, not a quick ship): thread the daemon sampler/sessions/streaming

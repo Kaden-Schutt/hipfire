@@ -44,6 +44,7 @@ pub mod multi_gpu;
 pub mod quant;
 pub mod safetensors_source;
 pub mod sampler;
+pub mod sequence_state;
 pub mod speed_bench;
 pub mod tokenizer;
 pub mod tool_call;
