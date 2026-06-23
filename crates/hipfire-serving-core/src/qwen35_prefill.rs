@@ -112,14 +112,21 @@ pub fn qwen35_prefill_active_session(
         .q35_scratch
         .as_ref()
         .ok_or_else(|| "qwen35 scratch missing; PP batch-prefill is not supported".to_string())?;
-    let kv = m
-        .kv_cache
+    let ss = m
+        .sequence_state
+        .as_mut()
+        .ok_or_else(|| "qwen35 active session missing decode state".to_string())?;
+    let kv = ss
+        .kv
         .as_mut()
         .ok_or_else(|| "qwen35 active session missing KV cache".to_string())?;
-    let dn = m
-        .dn_state
+    let dn = ss
+        .recurrent
         .as_mut()
-        .ok_or_else(|| "qwen35 active session missing DeltaNet state".to_string())?;
+        .ok_or_else(|| "qwen35 active session missing DeltaNet state".to_string())?
+        .as_any_mut()
+        .downcast_mut::<qwen35::DeltaNetState>()
+        .ok_or_else(|| "qwen35 active recurrent state is DeltaNetState".to_string())?;
     let hier_enabled = kv.hier.as_ref().map(|h| h.enabled).unwrap_or(false);
     // Deferred-hierarchical KV: on a CONTINUED turn (history present, seq_pos > 0),
     // drain the hot ring into cold here at the prefill entry — i.e. during the idle

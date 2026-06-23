@@ -205,8 +205,8 @@ pub fn minimax_state_bytes(state: &hipfire_arch_minimax::MiniMaxState) -> usize 
 /// tally.
 pub fn loaded_model_runtime_base_bytes(m: &LoadedModel) -> usize {
     let mut total = 0usize;
-    total += m.kv_cache.as_ref().map(kv_cache_bytes).unwrap_or(0);
-    total += m.dn_state.as_ref().map(deltanet_state_bytes).unwrap_or(0);
+    total += m.kv_cache().map(kv_cache_bytes).unwrap_or(0);
+    total += m.dn_state().map(deltanet_state_bytes).unwrap_or(0);
     total += m
         .q35_scratch
         .as_ref()

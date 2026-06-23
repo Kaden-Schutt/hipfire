@@ -4125,8 +4125,7 @@ fn main() {
                     m.q35_sessions.clear();
                     m.q35_active_session_id = if is_qwen35_family_arch_id(m.arch_id)
                         && m.pp == 1
-                        && m.kv_cache.is_some()
-                        && m.dn_state.is_some()
+                        && m.sequence_state.is_some()
                     {
                         m.q35_active_state_allocation_epoch = next_qwen35_state_allocation_epoch();
                         Some(QWEN35_LEGACY_SESSION_ID.to_string())
@@ -4140,8 +4139,10 @@ fn main() {
                     // alone — its scratch state isn't aliased to per-device
                     // tensors when pp > 1.
                     if m.pp > 1 {
-                        if let (Some(ref dn), Some(ref mut gpus), Some(ref la)) = (
-                            m.dn_state.as_ref(),
+                        if let (Some(dn), Some(ref mut gpus), Some(ref la)) = (
+                            m.sequence_state
+                                .as_ref()
+                                .and_then(|s| s.recurrent_as::<qwen35::DeltaNetState>()),
                             m.pp_gpus.as_mut(),
                             m.pp_dn_la_to_device.as_ref(),
                         ) {
@@ -4161,7 +4162,11 @@ fn main() {
                                 let _ = g.hip.memset(&s.buf, 0, s.buf.size());
                             }
                         }
-                    } else if let Some(ref dn) = m.dn_state {
+                    } else if let Some(dn) = m
+                        .sequence_state
+                        .as_ref()
+                        .and_then(|s| s.recurrent_as::<qwen35::DeltaNetState>())
+                    {
                         // Zero DeltaNet recurrent state (Qwen3.5)
                         for s in &dn.s_matrices {
                             let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
@@ -4173,7 +4178,7 @@ fn main() {
                             let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
                         }
                     }
-                    if let Some(kv) = m.kv_cache.as_mut() {
+                    if let Some(kv) = m.sequence_state.as_mut().and_then(|s| s.kv_mut()) {
                         kv.compact_offset = 0;
                     }
                     if let Some(kv) = m.llama_kv.as_mut() {
@@ -5221,7 +5226,11 @@ fn main() {
                 // prefill-on-top-of-prior-state.
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
-                if let Some(ref dn) = m.dn_state {
+                if let Some(dn) = m
+                    .sequence_state
+                    .as_ref()
+                    .and_then(|s| s.recurrent_as::<qwen35::DeltaNetState>())
+                {
                     for s in &dn.s_matrices {
                         let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
                     }
@@ -5260,8 +5269,18 @@ fn main() {
                     let config = m.q35_config.as_ref().unwrap();
                     let weights = m.q35_weights.as_ref().unwrap();
                     let scratch = m.q35_scratch.as_ref().unwrap();
-                    let kv = m.kv_cache.as_mut().unwrap();
-                    let dn = m.dn_state.as_mut().unwrap();
+                    let ss = m
+                        .sequence_state
+                        .as_mut()
+                        .expect("qwen35 active state present");
+                    let kv = ss.kv.as_mut().expect("qwen35 active state has KV");
+                    let dn = ss
+                        .recurrent
+                        .as_mut()
+                        .expect("qwen35 active state has DeltaNet")
+                        .as_any_mut()
+                        .downcast_mut::<qwen35::DeltaNetState>()
+                        .expect("qwen35 active recurrent state is DeltaNetState");
                     qwen35::forward_prefill_batch(
                         &mut gpu, weights, config, &synthetic, 0, kv, dn, scratch, None, None,
                         None, None,
@@ -5382,7 +5401,11 @@ fn main() {
                 // DeltaNet state that the next real request must not inherit.
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
-                if let Some(ref dn) = m.dn_state {
+                if let Some(dn) = m
+                    .sequence_state
+                    .as_ref()
+                    .and_then(|s| s.recurrent_as::<qwen35::DeltaNetState>())
+                {
                     for s in &dn.s_matrices {
                         let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
                     }

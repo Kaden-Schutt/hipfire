@@ -45,6 +45,7 @@ use crate::memory::{hfq_model_memory, unknown_model_memory};
 use crate::model::CaskConfig;
 use crate::model::{DdtreeState, DflashState, Eviction, LoadedModel};
 use crate::session::{next_qwen35_state_allocation_epoch, QWEN35_LEGACY_SESSION_ID};
+use hipfire_runtime::sequence_state::SequenceState;
 
 /// Matrix-backed admission gate: refuse a request for `feature` on a model whose
 /// arch capability matrix (the generated `arch_features`, source
@@ -568,8 +569,7 @@ pub fn load_model(
             q35_config: None,
             q35_weights: None,
             q35_scratch: None,
-            kv_cache: None,
-            dn_state: None,
+            sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
             q35_sessions: std::collections::HashMap::new(),
@@ -665,8 +665,7 @@ pub fn load_model(
             q35_config: None,
             q35_weights: None,
             q35_scratch: None,
-            kv_cache: None,
-            dn_state: None,
+            sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
             q35_sessions: std::collections::HashMap::new(),
@@ -766,8 +765,7 @@ pub fn load_model(
             q35_config: None,
             q35_weights: None,
             q35_scratch: None,
-            kv_cache: None,
-            dn_state: None,
+            sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
             q35_sessions: std::collections::HashMap::new(),
@@ -863,8 +861,7 @@ pub fn load_model(
             q35_config: None,
             q35_weights: None,
             q35_scratch: None,
-            kv_cache: None,
-            dn_state: None,
+            sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
             q35_sessions: std::collections::HashMap::new(),
@@ -981,8 +978,7 @@ pub fn load_model(
             q35_config: None,
             q35_weights: None,
             q35_scratch: None,
-            kv_cache: None,
-            dn_state: None,
+            sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
             q35_sessions: std::collections::HashMap::new(),
@@ -1105,8 +1101,7 @@ pub fn load_model(
             q35_config: None,
             q35_weights: None,
             q35_scratch: None,
-            kv_cache: None,
-            dn_state: None,
+            sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
             q35_sessions: std::collections::HashMap::new(),
@@ -1242,8 +1237,7 @@ pub fn load_model(
                 q35_config: None,
                 q35_weights: None,
                 q35_scratch: None,
-                kv_cache: None,
-                dn_state: None,
+                sequence_state: None,
                 q35_kv_mode: None,
                 q35_state_quant: None,
                 q35_sessions: std::collections::HashMap::new(),
@@ -1569,6 +1563,11 @@ pub fn load_model(
         let chat_template = resolve_chat_template(&hfq, path);
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
+        let sequence_state = Some(SequenceState::new(
+            crate::session::qwen35_mixer_profile(&config.layer_types),
+            Some(kv),
+            Some(Box::new(dn)),
+        ));
         Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
@@ -1578,8 +1577,7 @@ pub fn load_model(
             q35_config: Some(config),
             q35_weights: Some(weights),
             q35_scratch: Some(scratch),
-            kv_cache: Some(kv),
-            dn_state: Some(dn),
+            sequence_state,
             q35_kv_mode: Some(kv_mode.clone()),
             q35_state_quant: Some(dn_quant),
             q35_sessions: std::collections::HashMap::new(),
@@ -1665,8 +1663,7 @@ pub fn load_model(
             q35_config: None,
             q35_weights: None,
             q35_scratch: None,
-            kv_cache: None,
-            dn_state: None,
+            sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
             q35_sessions: std::collections::HashMap::new(),
@@ -1852,8 +1849,7 @@ pub fn load_model_safetensors(
             qwen2_state: None,
             dots_ocr_config: None,
             dots_ocr_weights: None,
-            kv_cache: None,
-            dn_state: None,
+            sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
             q35_sessions: std::collections::HashMap::new(),
@@ -1965,6 +1961,11 @@ pub fn load_model_safetensors(
     let (chat_template, chat_template_profile) =
         profile_chat_template(chat_template, Some(&tokenizer));
 
+    let sequence_state = Some(SequenceState::new(
+        crate::session::qwen35_mixer_profile(&config.layer_types),
+        Some(kv_cache),
+        Some(Box::new(dn_state)),
+    ));
     Ok(LoadedModel {
         arch_id,
         pp: 1,
@@ -1979,8 +1980,7 @@ pub fn load_model_safetensors(
         qwen2_state: None,
         dots_ocr_config: None,
         dots_ocr_weights: None,
-        kv_cache: Some(kv_cache),
-        dn_state: Some(dn_state),
+        sequence_state,
         q35_kv_mode: Some(kv_mode.to_string()),
         q35_state_quant: Some(hipfire_arch_qwen35::qwen35::StateQuant::Q8),
         q35_sessions: std::collections::HashMap::new(),
@@ -2250,6 +2250,11 @@ pub fn load_model_pp(
     let (chat_template, chat_template_profile) =
         profile_chat_template(chat_template, Some(&tokenizer));
 
+    let sequence_state = Some(SequenceState::new(
+        crate::session::qwen35_mixer_profile(&config.layer_types),
+        Some(kv),
+        Some(Box::new(dn)),
+    ));
     Ok(LoadedModel {
         arch_id: hfq.arch_id,
         pp,
@@ -2259,8 +2264,7 @@ pub fn load_model_pp(
         q35_config: Some(config),
         q35_weights: Some(weights),
         q35_scratch: None,
-        kv_cache: Some(kv),
-        dn_state: Some(dn),
+        sequence_state,
         q35_kv_mode: None,
         q35_state_quant: None,
         q35_sessions: std::collections::HashMap::new(),
@@ -2386,7 +2390,7 @@ pub fn screen_weights_qwen35(
 /// Free all GPU resources held by a loaded model (weights, scratch, KV/state,
 /// eviction scratch, DFlash drafter) by consuming it. Per-arch teardown mirrors
 /// whichever Option fields are populated.
-pub fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
+pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // Multi-GPU branch (Stage 7 of #58). Frees per-device tensors through the
     // Gpus orchestrator, then invalidates per-device caches so the next load
     // can't inherit stale verdicts at recycled device addresses. Order
@@ -2397,12 +2401,19 @@ pub fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
         if let Some(scratch_set) = m.pp_scratch_set {
             scratch_set.free_gpu_multi(&mut gpus);
         }
-        if let Some(kv) = m.kv_cache {
-            kv.free_gpu_multi(&mut gpus);
-        }
-        if let Some(dn) = m.dn_state {
-            let la_to_device = m.pp_dn_la_to_device.expect("pp>1 must carry la_to_device");
-            dn.free_gpu_multi(&mut gpus, &la_to_device);
+        if let Some(ss) = m.sequence_state.take() {
+            let (kv, recurrent) = ss.into_parts();
+            if let Some(kv) = kv {
+                kv.free_gpu_multi(&mut gpus);
+            }
+            if let Some(r) = recurrent {
+                let dn = *r
+                    .into_any()
+                    .downcast::<DeltaNetState>()
+                    .expect("qwen35 recurrent state is DeltaNetState");
+                let la_to_device = m.pp_dn_la_to_device.expect("pp>1 must carry la_to_device");
+                dn.free_gpu_multi(&mut gpus, &la_to_device);
+            }
         }
         if let Some(w) = m.q35_weights {
             w.free_gpu_multi(&mut gpus);
@@ -2429,11 +2440,18 @@ pub fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
         ev.free_gpu(gpu);
     }
     // Free KV cache + DeltaNet state + scratch first (small fraction of VRAM).
-    if let Some(kv) = m.kv_cache {
-        kv.free_gpu(gpu);
-    }
-    if let Some(dn) = m.dn_state {
-        dn.free_gpu(gpu);
+    if let Some(ss) = m.sequence_state.take() {
+        let (kv, recurrent) = ss.into_parts();
+        if let Some(kv) = kv {
+            kv.free_gpu(gpu);
+        }
+        if let Some(r) = recurrent {
+            let dn = *r
+                .into_any()
+                .downcast::<DeltaNetState>()
+                .expect("qwen35 recurrent state is DeltaNetState");
+            dn.free_gpu(gpu);
+        }
     }
     if let Some(s) = m.q35_scratch {
         s.free_gpu(gpu);

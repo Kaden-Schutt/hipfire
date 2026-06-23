@@ -32,6 +32,7 @@ use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::kv;
 use hipfire_runtime::llama;
 use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_runtime::sequence_state::SequenceState;
 use hipfire_runtime::triattn::EvictionCtx;
 use hipfire_state::ModelArtifactMemory;
 
@@ -194,8 +195,11 @@ pub struct LoadedModel {
     pub q35_config: Option<qwen35::Qwen35Config>,
     pub q35_weights: Option<qwen35::Qwen35Weights>,
     pub q35_scratch: Option<qwen35::Qwen35Scratch>,
-    pub kv_cache: Option<kv::KvCache>,
-    pub dn_state: Option<DeltaNetState>,
+    /// Active session's live decode state (KV cache + DeltaNet recurrent state)
+    /// as one unified container. `None` when no session is resident or the arch
+    /// carries no such state. P2c Slice 3: replaces the former separate
+    /// `kv_cache: Option<KvCache>` + `dn_state: Option<DeltaNetState>` fields.
+    pub sequence_state: Option<SequenceState>,
     pub q35_kv_mode: Option<String>,
     pub q35_state_quant: Option<hipfire_arch_qwen35::qwen35::StateQuant>,
     pub q35_sessions: std::collections::HashMap<String, Qwen35RequestSessionState>,
@@ -364,4 +368,30 @@ pub struct LoadedModel {
     // VL paths still hit the Plain scaffold.
     pub chat_template: Option<String>,
     pub chat_template_profile: Option<prompt_frame::ChatTemplateProfile>,
+}
+
+impl LoadedModel {
+    /// Active session's KV cache, if any. Replaces the former `kv_cache.as_ref()`
+    /// on the unified `sequence_state`. Sites needing KV **and** DeltaNet
+    /// simultaneously bind `sequence_state.as_mut()` once, then borrow its
+    /// disjoint `.kv` / `.recurrent` fields.
+    pub fn kv_cache(&self) -> Option<&kv::KvCache> {
+        self.sequence_state.as_ref().and_then(|s| s.kv())
+    }
+    /// Mutable active KV cache (single-access only — see [`Self::kv_cache`]).
+    pub fn kv_cache_mut(&mut self) -> Option<&mut kv::KvCache> {
+        self.sequence_state.as_mut().and_then(|s| s.kv_mut())
+    }
+    /// Active session's DeltaNet recurrent state, if any.
+    pub fn dn_state(&self) -> Option<&DeltaNetState> {
+        self.sequence_state
+            .as_ref()
+            .and_then(|s| s.recurrent_as::<DeltaNetState>())
+    }
+    /// Mutable active DeltaNet recurrent state (single-access only).
+    pub fn dn_state_mut(&mut self) -> Option<&mut DeltaNetState> {
+        self.sequence_state
+            .as_mut()
+            .and_then(|s| s.recurrent_as_mut::<DeltaNetState>())
+    }
 }

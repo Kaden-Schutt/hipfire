@@ -143,9 +143,18 @@ infrastructure rather than two more special cases. The existing qwen35 hybrid
        session.rs + generate.rs + qwen35_decode.rs + qwen35_prefill.rs;
        behavior-preserving; the `LoadedModel` side stays separate via an
        `into_parts` swap bridge (collapsed in Slice 3).
-     - **Slice 3** collapse `LoadedModel` kv_cache/dn_state → `SequenceState`
-       (removes the bridge); migrate the spec-decode `ModelSlot` (its own
-       kv/dn). P6 overlap. Each coherence-gate-dflash + perf gated.
+     - **Slice 3a ✅** `LoadedModel.kv_cache`/`dn_state` Option fields collapsed
+       into one `sequence_state: Option<SequenceState>` field. ~53 sites across
+       model.rs, load.rs, generate.rs, generate_vl.rs, memory.rs, qwen35_prefill,
+       daemon main.rs. `LoadedModel` accessors (`kv_cache()`/`dn_state()`) for the
+       simple sites; disjoint / `m.tokenizer`-conflicting sites use field-path
+       `m.sequence_state.as_mut()...kv`/`.recurrent`. ModelSlot build/teardown via
+       `take_qwen35_state_from_model(&mut m.sequence_state)` /
+       `put_qwen35_state_into_model`; the session-swap `into_parts` bridge is gone
+       (`restore_*` is now a single move). ModelSlot kept its own kv/dn (arch
+       internal). Behavior-preserving; full workspace compiles, clippy clean.
+     - **Slice 3b (optional/deferred)** migrate the spec-decode `ModelSlot` itself
+       to `SequenceState` — arch-internal, not blocking; defer.
 3. **P3 — wire the daemon to the seam + migrate the dense archs.** Resolve the
    daemon-wiring decision point via the **full-collapse** route (goal is
    organization, not a quick ship): thread the daemon sampler/sessions/streaming

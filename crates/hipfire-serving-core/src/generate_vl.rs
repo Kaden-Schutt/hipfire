@@ -165,7 +165,11 @@ pub fn generate_vl(
         );
         m.seq_pos = 0;
         m.conversation_tokens.clear();
-        if let Some(ref dn) = m.dn_state {
+        if let Some(dn) = m
+            .sequence_state
+            .as_ref()
+            .and_then(|s| s.recurrent_as::<qwen35::DeltaNetState>())
+        {
             for s in &dn.s_matrices {
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
@@ -176,7 +180,7 @@ pub fn generate_vl(
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
         }
-        if let Some(kv) = m.kv_cache.as_mut() {
+        if let Some(kv) = m.sequence_state.as_mut().and_then(|s| s.kv_mut()) {
             kv.compact_offset = 0;
         }
     }
@@ -200,8 +204,18 @@ pub fn generate_vl(
     let scratch = m.q35_scratch.as_ref().unwrap();
     // Compute the raw-prompt flag before the mutable kv/dn borrows below.
     let vl_raw = effective_raw(m);
-    let kv = m.kv_cache.as_mut().unwrap();
-    let dn = m.dn_state.as_mut().unwrap();
+    let ss = m
+        .sequence_state
+        .as_mut()
+        .expect("qwen35 active state present");
+    let kv = ss.kv.as_mut().expect("qwen35 active state has KV");
+    let dn = ss
+        .recurrent
+        .as_mut()
+        .expect("qwen35 active state has DeltaNet")
+        .as_any_mut()
+        .downcast_mut::<qwen35::DeltaNetState>()
+        .expect("qwen35 active recurrent state is DeltaNetState");
 
     // Build the actual prompt token sequence BEFORE running the GPU vision
     // encoder so the hard capacity check uses the real prefill length, not

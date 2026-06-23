@@ -230,11 +230,8 @@ impl Qwen35RequestSessionState {
         m: &mut LoadedModel,
         gpu: &mut rdna_compute::Gpu,
     ) -> Result<Self, String> {
-        if m.kv_cache.is_none() {
-            return Err("qwen35 session missing KV cache".to_string());
-        }
-        if m.dn_state.is_none() {
-            return Err("qwen35 session missing DeltaNet state".to_string());
+        if m.sequence_state.is_none() {
+            return Err("qwen35 session missing decode state".to_string());
         }
         let scratch = m
             .q35_scratch
@@ -245,19 +242,11 @@ impl Qwen35RequestSessionState {
             .map_err(|e| format!("alloc qwen35 session logits snapshot: {e:?}"))?;
         gpu.memcpy_dtod_auto(&logits.buf, &scratch.logits.buf, scratch.logits.buf.size())
             .map_err(|e| format!("save qwen35 session logits snapshot: {e:?}"))?;
-        let profile = qwen35_mixer_profile(
-            &m.q35_config
-                .as_ref()
-                .ok_or_else(|| "qwen35 session missing config".to_string())?
-                .layer_types,
-        );
-        let kv = m.kv_cache.take().unwrap();
-        let dn = m.dn_state.take().unwrap();
         Ok(Self {
             seq_pos: m.seq_pos,
             conversation_tokens: std::mem::take(&mut m.conversation_tokens),
             prefix_hash: None,
-            sequence_state: SequenceState::new(profile, Some(kv), Some(Box::new(dn))),
+            sequence_state: m.sequence_state.take().expect("checked is_none above"),
             logits,
             prefilled_generated_suffix_len: m.q35_active_prefilled_generated_suffix_len,
             allocation_epoch: next_qwen35_state_allocation_epoch(),
@@ -310,17 +299,39 @@ impl Qwen35RequestSessionState {
     }
 }
 
-/// Transitional bridge: move a session's unified `SequenceState` back into the
-/// LoadedModel's still-separate `kv_cache`/`dn_state` Option fields (those are
-/// unified later, at which point this collapses to a single move).
+/// Install a session's unified `SequenceState` as the model's active state.
 pub(crate) fn restore_sequence_state_into_model(m: &mut LoadedModel, ss: SequenceState) {
-    let (kv, recurrent) = ss.into_parts();
-    m.kv_cache = kv;
-    m.dn_state = recurrent.map(|r| {
-        *r.into_any()
-            .downcast::<DeltaNetState>()
-            .expect("qwen35 session recurrent state is DeltaNetState")
-    });
+    m.sequence_state = Some(ss);
+}
+
+/// Build the model's active `SequenceState` from raw KV + DeltaNet parts (e.g.
+/// tearing down a transient spec-decode `ModelSlot` back into the model). The
+/// hybrid profile is derived from the loaded qwen35 config.
+pub(crate) fn put_qwen35_state_into_model(m: &mut LoadedModel, kv: kv::KvCache, dn: DeltaNetState) {
+    let profile = m
+        .q35_config
+        .as_ref()
+        .map(|c| qwen35_mixer_profile(&c.layer_types))
+        .expect("qwen35 config present when installing active state");
+    m.sequence_state = Some(SequenceState::new(profile, Some(kv), Some(Box::new(dn))));
+}
+
+/// Take the model's active state out as raw KV + DeltaNet parts (e.g. to build a
+/// transient spec-decode `ModelSlot`). Leaves `m.sequence_state == None`.
+pub(crate) fn take_qwen35_state_from_model(
+    seq: &mut Option<SequenceState>,
+) -> (kv::KvCache, DeltaNetState) {
+    let (kv, recurrent) = seq
+        .take()
+        .expect("qwen35 active state present")
+        .into_parts();
+    let kv = kv.expect("qwen35 active state has KV");
+    let dn = *recurrent
+        .expect("qwen35 active state has DeltaNet")
+        .into_any()
+        .downcast::<DeltaNetState>()
+        .expect("qwen35 active recurrent state is DeltaNetState");
+    (kv, dn)
 }
 
 pub fn qwen35_session_resident(m: &LoadedModel, session_id: &str) -> bool {
@@ -440,7 +451,7 @@ pub fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDe
     }
     if let Some(active_id) = m.q35_active_session_id.as_deref() {
         if active_id != QWEN35_LEGACY_SESSION_ID {
-            let compact_offset = m.kv_cache.as_ref().map(|kv| kv.compact_offset).unwrap_or(0);
+            let compact_offset = m.kv_cache().map(|kv| kv.compact_offset).unwrap_or(0);
             let logical_position = m.seq_pos + compact_offset;
             let allocation_epoch = m.q35_active_state_allocation_epoch;
             let owns_pages = allocation_epoch != 0;
@@ -452,8 +463,7 @@ pub fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDe
                 label: "qwen35.kv_cache.active".to_string(),
                 logical_position,
                 resident_bytes: m
-                    .kv_cache
-                    .as_ref()
+                    .kv_cache()
                     .map(|kv| {
                         kv.k_gpu
                             .iter()
@@ -465,8 +475,7 @@ pub fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDe
                     })
                     .unwrap_or(0),
                 shape: m
-                    .kv_cache
-                    .as_ref()
+                    .kv_cache()
                     .map(|kv| vec![kv.k_gpu.len(), kv.physical_cap, kv.n_kv_heads, kv.head_dim])
                     .unwrap_or_default(),
                 allocation_epoch,
@@ -481,8 +490,7 @@ pub fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDe
                 label: "qwen35.deltanet_state.active".to_string(),
                 logical_position,
                 resident_bytes: m
-                    .dn_state
-                    .as_ref()
+                    .dn_state()
                     .map(|dn| {
                         dn.s_matrices
                             .iter()
@@ -493,8 +501,7 @@ pub fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDe
                     })
                     .unwrap_or(0),
                 shape: m
-                    .dn_state
-                    .as_ref()
+                    .dn_state()
                     .map(|dn| vec![dn.s_matrices.len(), dn.s_scales.len(), dn.conv_states.len()])
                     .unwrap_or_default(),
                 allocation_epoch,
@@ -920,8 +927,7 @@ pub fn qwen35_release_sessions(
 /// resume point for the next prefill/decode.
 pub fn qwen35_active_logical_position(m: &LoadedModel) -> Result<usize, String> {
     let compact_offset = m
-        .kv_cache
-        .as_ref()
+        .kv_cache()
         .ok_or_else(|| "qwen35 active session missing KV cache".to_string())?
         .compact_offset;
     Ok(m.seq_pos + compact_offset)

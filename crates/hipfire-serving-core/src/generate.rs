@@ -41,7 +41,10 @@ use crate::model::{effective_raw, LoadedModel};
 use crate::output_filter::chat_output_filter;
 use crate::output_filter::{chat_output_filter_from_profile, loop_guard_from_runtime_config};
 use crate::request::ThinkMode;
-use crate::session::{qwen35_restore_or_error, Qwen35RequestSessionState};
+use crate::session::{
+    put_qwen35_state_into_model, qwen35_restore_or_error, take_qwen35_state_from_model,
+    Qwen35RequestSessionState,
+};
 
 /// MTP (Multi-Token Prediction) spec-decode generate path for Qwen3.5/3.6.
 ///
@@ -153,7 +156,7 @@ pub fn generate_mtp(
     m.seq_pos = 0;
     m.conversation_tokens.clear();
     {
-        let dn = m.dn_state.as_ref().unwrap();
+        let dn = m.dn_state().unwrap();
         for s in &dn.s_matrices {
             let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
         }
@@ -168,14 +171,12 @@ pub fn generate_mtp(
     // Assemble a transient ModelSlot, mirroring generate_dflash's take/putback.
     let target_config = m.q35_config.as_ref().unwrap().clone();
     let weights = m.q35_weights.take().expect("q35 weights");
-    let kv_cache = m.kv_cache.take().expect("kv cache");
-    let dn_state = m.dn_state.take().expect("dn state");
+    let (kv_cache, dn_state) = take_qwen35_state_from_model(&mut m.sequence_state);
     let scratch = m.q35_scratch.take().expect("q35 scratch");
     macro_rules! putback {
         ($t:expr) => {{
             m.q35_weights = Some($t.weights);
-            m.kv_cache = Some($t.kv_cache);
-            m.dn_state = Some($t.dn_state);
+            put_qwen35_state_into_model(m, $t.kv_cache, $t.dn_state);
             m.q35_scratch = Some($t.scratch);
         }};
     }
@@ -184,8 +185,7 @@ pub fn generate_mtp(
         Err(e) => {
             write_error(stdout, id, &format!("reopen model: {e}"));
             m.q35_weights = Some(weights);
-            m.kv_cache = Some(kv_cache);
-            m.dn_state = Some(dn_state);
+            put_qwen35_state_into_model(m, kv_cache, dn_state);
             m.q35_scratch = Some(scratch);
             return;
         }
@@ -586,7 +586,7 @@ pub fn generate_dflash(
     m.seq_pos = 0;
     m.conversation_tokens.clear();
     {
-        let dn = m.dn_state.as_ref().unwrap();
+        let dn = m.dn_state().unwrap();
         for s in &dn.s_matrices {
             let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
         }
@@ -610,8 +610,7 @@ pub fn generate_dflash(
     // actually touch it. Reopening via mmap is essentially free (few µs).
     let target_config = m.q35_config.as_ref().unwrap().clone();
     let weights = m.q35_weights.take().expect("q35 weights");
-    let kv_cache = m.kv_cache.take().expect("kv cache");
-    let dn_state = m.dn_state.take().expect("dn state");
+    let (kv_cache, dn_state) = take_qwen35_state_from_model(&mut m.sequence_state);
     let scratch = m.q35_scratch.take().expect("q35 scratch");
     let hfq = match HfqFile::open(Path::new(&m.model_path)) {
         Ok(h) => h,
@@ -623,8 +622,7 @@ pub fn generate_dflash(
             );
             let _ = stdout.flush();
             m.q35_weights = Some(weights);
-            m.kv_cache = Some(kv_cache);
-            m.dn_state = Some(dn_state);
+            put_qwen35_state_into_model(m, kv_cache, dn_state);
             m.q35_scratch = Some(scratch);
             return;
         }
@@ -667,8 +665,7 @@ pub fn generate_dflash(
         );
         let _ = stdout.flush();
         m.q35_weights = Some(target.weights);
-        m.kv_cache = Some(target.kv_cache);
-        m.dn_state = Some(target.dn_state);
+        put_qwen35_state_into_model(m, target.kv_cache, target.dn_state);
         m.q35_scratch = Some(target.scratch);
         return;
     }
@@ -680,8 +677,7 @@ pub fn generate_dflash(
         );
         let _ = stdout.flush();
         m.q35_weights = Some(target.weights);
-        m.kv_cache = Some(target.kv_cache);
-        m.dn_state = Some(target.dn_state);
+        put_qwen35_state_into_model(m, target.kv_cache, target.dn_state);
         m.q35_scratch = Some(target.scratch);
         return;
     }
@@ -704,8 +700,7 @@ pub fn generate_dflash(
         );
         let _ = stdout.flush();
         m.q35_weights = Some(target.weights);
-        m.kv_cache = Some(target.kv_cache);
-        m.dn_state = Some(target.dn_state);
+        put_qwen35_state_into_model(m, target.kv_cache, target.dn_state);
         m.q35_scratch = Some(target.scratch);
         return;
     }
@@ -737,8 +732,7 @@ pub fn generate_dflash(
             );
             let _ = stdout.flush();
             m.q35_weights = Some(target.weights);
-            m.kv_cache = Some(target.kv_cache);
-            m.dn_state = Some(target.dn_state);
+            put_qwen35_state_into_model(m, target.kv_cache, target.dn_state);
             m.q35_scratch = Some(target.scratch);
             return;
         }
@@ -1078,8 +1072,7 @@ pub fn generate_dflash(
     // (reset) state. We zero DN/kv on entry anyway, but we still need the
     // ownership back.
     m.q35_weights = Some(target.weights);
-    m.kv_cache = Some(target.kv_cache);
-    m.dn_state = Some(target.dn_state);
+    put_qwen35_state_into_model(m, target.kv_cache, target.dn_state);
     m.q35_scratch = Some(target.scratch);
     m.seq_pos = position;
     m.conversation_tokens = emitted.clone();
@@ -1185,8 +1178,10 @@ pub fn generate_multi(
         );
         m.seq_pos = 0;
         m.conversation_tokens.clear();
-        if let (Some(ref dn), Some(ref mut gpus), Some(ref la)) = (
-            m.dn_state.as_ref(),
+        if let (Some(dn), Some(ref mut gpus), Some(ref la)) = (
+            m.sequence_state
+                .as_ref()
+                .and_then(|s| s.recurrent_as::<qwen35::DeltaNetState>()),
             m.pp_gpus.as_mut(),
             m.pp_dn_la_to_device.as_ref(),
         ) {
@@ -1206,7 +1201,7 @@ pub fn generate_multi(
                 let _ = g.hip.memset(&s.buf, 0, s.buf.size());
             }
         }
-        if let Some(kv) = m.kv_cache.as_mut() {
+        if let Some(kv) = m.sequence_state.as_mut().and_then(|s| s.kv_mut()) {
             kv.compact_offset = 0;
         }
     }
@@ -1412,8 +1407,18 @@ pub fn generate_multi(
     let config = m.q35_config.as_ref().unwrap();
     let weights = m.q35_weights.as_ref().unwrap();
     let scratch_set = m.pp_scratch_set.as_ref().unwrap();
-    let kv = m.kv_cache.as_mut().unwrap();
-    let dn = m.dn_state.as_mut().unwrap();
+    let ss = m
+        .sequence_state
+        .as_mut()
+        .expect("qwen35 active state present");
+    let kv = ss.kv.as_mut().expect("qwen35 active state has KV");
+    let dn = ss
+        .recurrent
+        .as_mut()
+        .expect("qwen35 active state has DeltaNet")
+        .as_any_mut()
+        .downcast_mut::<qwen35::DeltaNetState>()
+        .expect("qwen35 active recurrent state is DeltaNetState");
     let gpus = m.pp_gpus.as_mut().unwrap();
 
     let dev_last = gpus.output_device;
@@ -2085,7 +2090,7 @@ pub fn generate(
     // paths (DFlash, MTP) batch-prefill the prompt and would bypass it, leaving the
     // KVarN window/records (and hier hot ring) unpopulated → garbage. Route kvarn
     // models to the plain AR path below (per-token forward_scratch prefill+decode).
-    let kvarn_active = m.kv_cache.as_ref().map(|c| c.quant_kvarn).unwrap_or(false);
+    let kvarn_active = m.kv_cache().map(|c| c.quant_kvarn).unwrap_or(false);
     if m.dflash.is_some()
         && !kvarn_active
         && temp <= 1e-6
