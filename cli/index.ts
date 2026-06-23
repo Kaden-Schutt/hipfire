@@ -39,6 +39,7 @@ import {
 // serveProbeHost moved to serve_admission.ts (pure). Re-exported for chat.ts.
 export { serveProbeHost } from "./serve_admission";
 export { formatBind, bindFetchTarget, resolveServeBind } from "./serve_admission";
+export type { ServeBind } from "./serve_admission";
 import {
   EXIT,
   formatErrorMessage,
@@ -1583,8 +1584,11 @@ function reapOrphans(bind: ServeBind, all: boolean): string[] {
   } else {
     // Unix: match serves by their --socket-path / --unix-socket cmdline arg,
     // kill them, then unlink the socket file. Use Bun.spawnSync with argv array
-    // (no bash -c) so the path is never interpreted by a shell.
-    for (const pat of [`--socket-path ${bind.path}`, `--unix-socket ${bind.path}`]) {
+    // (no bash -c) so the path is never interpreted by a shell. pgrep -f treats
+    // the pattern as an ERE, so escape regex metacharacters in the path (a literal
+    // `.` must not match any char) to avoid killing an unrelated serve.
+    const pathRe = bind.path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    for (const pat of [`--socket-path ${pathRe}`, `--unix-socket ${pathRe}`]) {
       try {
         const r = Bun.spawnSync(["pgrep", "-f", "--", pat], { stdout: "pipe", stderr: "pipe" });
         const pids = (r.stdout?.toString() ?? "").trim().split("\n").filter(Boolean);
@@ -2493,7 +2497,7 @@ async function serve(bind: ServeBind) {
     // on ITS OWN bind, and also probe the NEW bind in case something else answers.
     const existingRec = readServePidRecord();
     if (existingRec) {
-      const existingBind = bindFromPidRecord(existingRec);
+      const existingBind = bindFromPidRecord(existingRec, { host: cfg.host, port: cfg.port });
       const ev = await validateServePid(existingRec, existingBind);
       if (ev.owned && (await isServeUp(existingBind))) {
         console.error(`hipfire serve already running on ${formatBind(existingBind)} (PID ${existingRec.pid}).`);
@@ -2774,9 +2778,8 @@ async function serve(bind: ServeBind) {
     console.error(`[hipfire] http://${formatBind(bind)}/v1/chat/completions`);
   }
 
-  let server;
   try {
-    server = Bun.serve({
+    Bun.serve({
       ...(bind.kind === "unix" ? { unix: bind.path } : { hostname: bind.host, port: bind.port }),
     idleTimeout: 255, // max allowed — model loading can take 30s+
     async fetch(req) {
@@ -5033,9 +5036,10 @@ async function runServe(args: string[]) {
     // it and proceed. Validate on the existing record's OWN bind.
     const existingRec = readServePidRecord();
     if (existingRec) {
-      const v = await validateServePid(existingRec, bindFromPidRecord(existingRec));
+      const existingBind = bindFromPidRecord(existingRec, { host: cfg.host, port: cfg.port });
+      const v = await validateServePid(existingRec, existingBind);
       if (v.owned) {
-        console.error(`hipfire serve already running (PID ${existingRec.pid}) on ${formatBind(bindFromPidRecord(existingRec))}.`);
+        console.error(`hipfire serve already running (PID ${existingRec.pid}) on ${formatBind(existingBind)}.`);
         console.error(`  Stop it: hipfire stop   |   Replace it: hipfire restart`);
         process.exit(1);
       } else {
@@ -7516,7 +7520,7 @@ switch (cmd) {
     // unlink the stale pidfile.
     const trackedRec = readServePidRecord();
     if (trackedRec) {
-      const v = await validateServePid(trackedRec, bindFromPidRecord(trackedRec));
+      const v = await validateServePid(trackedRec, bindFromPidRecord(trackedRec, { host: cfg.host, port: restartPort }));
       if (!v.owned) {
         console.error(`[restart] not killing PID ${trackedRec.pid}: ${v.reason} — removing stale pidfile`);
         try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {}
@@ -7540,7 +7544,7 @@ switch (cmd) {
     // N4 fix: use the tracked record's bind (not cfg.port) so a socket-mode
     // restart doesn't fuser -k the TCP port instead.
     const restartBind: ServeBind = trackedRec
-      ? bindFromPidRecord(trackedRec)
+      ? bindFromPidRecord(trackedRec, { host: cfg.host, port: restartPort })
       : { kind: "tcp", host: cfg.host, port: restartPort };
     for (const line of reapOrphans(restartBind, false)) console.error(`[restart] ${line}`);
     // Same-transport relaunch: if args carry no explicit bind and the tracked
@@ -7598,7 +7602,7 @@ switch (cmd) {
     // BUG pid-reuse: validate ownership before killing. A pidfile whose pid was
     // reused by an unrelated process must NOT be killed — unlink it instead.
     const stopRec = readServePidRecord();
-    const stopRecBind = stopRec ? bindFromPidRecord(stopRec) : null;
+    const stopRecBind = stopRec ? bindFromPidRecord(stopRec, { host: cfg.host, port: stopPort }) : null;
     const stopVerdict = stopRec && stopRecBind ? await validateServePid(stopRec, stopRecBind) : null;
     if (stopRec && stopVerdict && stopVerdict.owned) {
       const pid = stopRec.pid;
@@ -7642,7 +7646,7 @@ switch (cmd) {
       const stopBind: ServeBind = stopSocketPath !== null
         ? { kind: "unix", path: stopSocketPath }
         : stopRec
-          ? bindFromPidRecord(stopRec)
+          ? bindFromPidRecord(stopRec, { host: cfg.host, port: stopPort })
           : { kind: "tcp", host: cfg.host, port: stopPort };
       for (const line of reapOrphans(stopBind, all)) console.log(`  ${line}`);
     }
@@ -7892,7 +7896,7 @@ Examples:
     }
     if (psJson) {
       const psRec0 = readServePidRecord();
-      const psBind0: ServeBind = psRec0 ? bindFromPidRecord(psRec0) : { kind: "tcp", host: cfg.host, port: cfg.port };
+      const psBind0: ServeBind = psRec0 ? bindFromPidRecord(psRec0, { host: cfg.host, port: cfg.port }) : { kind: "tcp", host: cfg.host, port: cfg.port };
       const detachedPid0 = readServePid();
       const portInUse0 = psBind0.kind === "tcp" ? sh(`ss -tlnp 2>/dev/null | grep :${psBind0.port}`) : "";
       const isUp0 = psBind0.kind === "unix" ? !!detachedPid0 : !!(detachedPid0 || portInUse0);
@@ -7934,7 +7938,7 @@ Examples:
     // Show serve status: derive bind from the pidfile (actual transport), fall
     // back to cfg TCP bind when no pidfile exists.
     const psRec = readServePidRecord();
-    const psBind: ServeBind = psRec ? bindFromPidRecord(psRec) : { kind: "tcp", host: cfg.host, port: cfg.port };
+    const psBind: ServeBind = psRec ? bindFromPidRecord(psRec, { host: cfg.host, port: cfg.port }) : { kind: "tcp", host: cfg.host, port: cfg.port };
     const detachedPid = readServePid();
     // Skip the ss :port probe for unix-mode serves — no TCP port to probe.
     const portInUse = psBind.kind === "tcp" ? sh(`ss -tlnp 2>/dev/null | grep :${psBind.port}`) : "";

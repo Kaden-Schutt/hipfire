@@ -103,6 +103,10 @@ test("formatBind: tcp brackets IPv6 host", () => {
   expect(formatBind({ kind: "tcp", host: "::1", port: 11435 })).toBe("[::1]:11435");
 });
 
+test("formatBind: does not double-bracket an already-bracketed IPv6 host", () => {
+  expect(formatBind({ kind: "tcp", host: "[::1]", port: 11435 })).toBe("[::1]:11435");
+});
+
 test("formatBind: unix renders unix:path", () => {
   expect(formatBind({ kind: "unix", path: "/run/hf.sock" })).toBe("unix:/run/hf.sock");
 });
@@ -111,6 +115,11 @@ test("bindFetchTarget: tcp builds a probe URL via serveProbeHost", () => {
   const t = bindFetchTarget({ kind: "tcp", host: "0.0.0.0", port: 11435 }, "/health");
   expect(t.url).toBe("http://127.0.0.1:11435/health");
   expect(t.unix).toBeUndefined();
+});
+
+test("bindFetchTarget: tcp brackets an IPv6 host (else the URL is malformed)", () => {
+  const t = bindFetchTarget({ kind: "tcp", host: "::1", port: 11435 }, "/health");
+  expect(t.url).toBe("http://[::1]:11435/health");
 });
 
 test("bindFetchTarget: unix uses localhost placeholder + unix path", () => {

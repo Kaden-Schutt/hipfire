@@ -13,7 +13,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 if [ -n "$SOCK" ]; then
   echo "[serve-restart] killing socket serve $SOCK"
   MATCHED=0
-  for pat in "--socket-path $SOCK" "--unix-socket $SOCK"; do
+  # pgrep -f treats its pattern as an ERE, so escape regex metacharacters in the
+  # path (a literal `.` must not match any char) before matching.
+  SOCK_RE=$(printf '%s' "$SOCK" | sed -E 's/[][(){}.^$*+?|\\]/\\&/g')
+  for pat in "--socket-path $SOCK_RE" "--unix-socket $SOCK_RE"; do
     pids=$(pgrep -f -- "$pat" || true)
     for p in $pids; do kill -9 "$p" 2>/dev/null && MATCHED=$((MATCHED+1)); done
   done

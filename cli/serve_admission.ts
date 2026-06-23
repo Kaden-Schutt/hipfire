@@ -632,23 +632,36 @@ export function serveProbeHost(host: string): string {
   return host;
 }
 
+// Wrap an IPv6 literal in [] so it is a valid URL authority. IPv4 addresses and
+// hostnames pass through unchanged; an already-bracketed literal is left as-is
+// (no double-bracketing). The single place IPv6 bracketing lives.
+function bracketHost(host: string): string {
+  if (host.startsWith("[")) return host;
+  return host.includes(":") ? `[${host}]` : host;
+}
+
 export function formatBind(b: ServeBind): string {
   if (b.kind === "unix") return `unix:${b.path}`;
-  // bracket IPv6 literals
-  const h = b.host.includes(":") ? `[${b.host}]` : b.host;
-  return `${h}:${b.port}`;
+  return `${bracketHost(b.host)}:${b.port}`;
 }
 
 // How to reach a bind with fetch(). Bun ignores `unix: undefined`, so the tcp
-// path is a plain URL with no extra option.
+// path is a plain URL with no extra option. IPv6 hosts MUST be bracketed or the
+// URL is malformed (`http://::1:11435` is invalid).
 export function bindFetchTarget(b: ServeBind, path: string): { url: string; unix?: string } {
   if (b.kind === "unix") return { url: `http://localhost${path}`, unix: b.path };
-  return { url: `http://${serveProbeHost(b.host)}:${b.port}${path}` };
+  return { url: `http://${bracketHost(serveProbeHost(b.host))}:${b.port}${path}` };
 }
 
 // The single place a lifecycle command turns a tracked pid record into the bind
-// it must operate on. socketPath wins; otherwise legacy/TCP with defaults.
-export function bindFromPidRecord(rec: ServePidRecord): ServeBind {
+// it must operate on. socketPath wins; otherwise legacy/TCP. A legacy bare-pid
+// record carries no host/port — callers pass `fallback` (the cfg bind) so the
+// validator probes the port the user actually configured, not a hardcoded one.
+export function bindFromPidRecord(rec: ServePidRecord, fallback?: { host: string; port: number }): ServeBind {
   if (rec.socketPath) return { kind: "unix", path: rec.socketPath };
-  return { kind: "tcp", host: rec.host ?? "127.0.0.1", port: rec.port ?? DEFAULT_PORT };
+  return {
+    kind: "tcp",
+    host: rec.host ?? fallback?.host ?? "127.0.0.1",
+    port: rec.port ?? fallback?.port ?? DEFAULT_PORT,
+  };
 }
