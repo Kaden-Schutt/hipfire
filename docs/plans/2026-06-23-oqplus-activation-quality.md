@@ -103,6 +103,40 @@ storage is acceptable for the extra quality). It supersedes the AWQ-only OQ+ and
 beats mq4+. Remaining (lower priority): formal `coherence-gate.sh`, larger-model
 (9B/27B) confirmation, AWQ-α / per-group-activation only if more headroom is wanted.
 
+## BENCH + FULL-EVAL before promotion (2026-06-23) — NOT PROMOTABLE AS-IS
+
+Benching before promoting (correctly) caught two blockers that KLD-alone missed:
+
+**Perf (gfx1103, warmed, fixed prompt, HIPFIRE_MAX_GEN=128, infer_qwen35 raw path):**
+| model | prefill tok/s | decode tok/s |
+|-------|-------------:|------------:|
+| OQ+ LDLQ+AWQ | 12 | **14.1** |
+| mq4+ (incumbent) | 60 | **59.1** |
+| bf16 | 16 | 16.0 |
+OQ+ decode is **4.2× slower than mq4+** (slower than bf16). No generic-GEMV warn
+fired → not the catch-all fallback; it's a structurally slow Oq8 W8A8 DECODE path —
+almost certainly **unfused per-projection Oq8 GEMVs** (mq4+ has fused qkv/gate-up
+decode kernels; Oq8 W8A8 apparently lacks them, and gfx1103 decode is memcpy-sync-
+bound so unfused = many more per-token syncs). Engineering gap, fixable.
+
+**Daemon load:** OQ+ (qt=33) does NOT load via the daemon serve path on this UMA
+box — the **slab loader** (`load_weight_tensor_from_slabs`, auto-on for UMA/gfx1103)
+lacks the qt=33 arm that `load_weight_tensor_raw` has (cf387d42 wired only the raw
+path). So `hipfire eval`/serve panic on load; only the direct infer/perplexity raw
+path works. Promotion blocker #2.
+
+**Quality (confirmed, the motivation):** KLD 0.046 (1.7× better than mq4+),
+coherent on capital/reasoning prompts, no attractor.
+
+**VERDICT: do NOT promote OQ+ yet.** Quality wins decisively but it is 4× slower
+and won't serve on UMA daemons. Promotion is gated on TWO engineering items, not
+quality:
+1. **Fused Oq8 W8A8 decode kernels** (qkv/gate-up), mirroring the mq4 fused path —
+   the 4× decode gap. (Prefill-batched fused Oq8 may also be missing.)
+2. **qt=33 (and 34/35/36) arm in the slab loader** so OQ+ serves on UMA daemons.
+Until both land, mq4+ remains the production W4A8. The LDLQ+AWQ recipe + its KLD win
+are the standing motivation to fund that kernel work.
+
 ## Cross-cutting note
 
 This is **offline-quant** quality work — orthogonal to and cheaper than the
