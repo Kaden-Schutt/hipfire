@@ -45879,6 +45879,81 @@ impl Gpu {
         })
     }
 
+    /// OQ4+ interleaved-layout decode GEMV with FUSED residual (Y += W·x).
+    pub fn gemv_oq4_interleaved_residual(
+        &mut self,
+        w_il: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gemv_oq4_interleaved_residual", kernels::GEMV_OQ4_INTERLEAVED_RESIDUAL_SRC, "gemv_oq4_interleaved_residual")?;
+        let wp = w_il.buf.as_ptr(); let xp = x_f32.buf.as_ptr(); let yp = y_f32.buf.as_ptr();
+        let mut mi = m as i32; let mut ki = k as i32; let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void, &xp as *const _ as *mut c_void, &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void, &mut ki as *mut _ as *mut c_void, &mut gi as *mut _ as *mut c_void];
+        self.launch_maybe_blob("gemv_oq4_interleaved_residual", [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(wp); b.push_ptr(xp); b.push_ptr(yp); b.push_i32(mi); b.push_i32(ki); b.push_i32(gi); b
+        })
+    }
+
+    /// OQ4+ interleaved-layout fused QKVZA decode (4-way demux, one launch).
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_qkvza_oq4_interleaved(
+        &mut self, w_qkv: &GpuTensor, w_z: &GpuTensor, w_beta: &GpuTensor, w_alpha: &GpuTensor,
+        x_f32: &GpuTensor, y_qkv: &GpuTensor, y_z: &GpuTensor, y_beta: &GpuTensor, y_alpha: &GpuTensor,
+        qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize, k: usize, group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("fused_qkvza_oq4_interleaved", kernels::FUSED_QKVZA_OQ4_INTERLEAVED_SRC, "fused_qkvza_oq4_interleaved")?;
+        let p_wqkv = w_qkv.buf.as_ptr(); let p_wz = w_z.buf.as_ptr(); let p_wbeta = w_beta.buf.as_ptr(); let p_walpha = w_alpha.buf.as_ptr();
+        let p_x = x_f32.buf.as_ptr();
+        let p_yqkv = y_qkv.buf.as_ptr(); let p_yz = y_z.buf.as_ptr(); let p_ybeta = y_beta.buf.as_ptr(); let p_yalpha = y_alpha.buf.as_ptr();
+        let mut qm = qkv_m as i32; let mut zm = z_m as i32; let mut bm = beta_m as i32; let mut am = alpha_m as i32;
+        let mut ki = k as i32; let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &p_wqkv as *const _ as *mut c_void, &p_wz as *const _ as *mut c_void, &p_wbeta as *const _ as *mut c_void, &p_walpha as *const _ as *mut c_void,
+            &p_x as *const _ as *mut c_void,
+            &p_yqkv as *const _ as *mut c_void, &p_yz as *const _ as *mut c_void, &p_ybeta as *const _ as *mut c_void, &p_yalpha as *const _ as *mut c_void,
+            &mut qm as *mut _ as *mut c_void, &mut zm as *mut _ as *mut c_void, &mut bm as *mut _ as *mut c_void, &mut am as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void, &mut gi as *mut _ as *mut c_void];
+        let grid_x = (qkv_m + z_m + beta_m + alpha_m) as u32;
+        self.launch_maybe_blob("fused_qkvza_oq4_interleaved", [grid_x, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(p_wqkv); b.push_ptr(p_wz); b.push_ptr(p_wbeta); b.push_ptr(p_walpha); b.push_ptr(p_x);
+            b.push_ptr(p_yqkv); b.push_ptr(p_yz); b.push_ptr(p_ybeta); b.push_ptr(p_yalpha);
+            b.push_i32(qm); b.push_i32(zm); b.push_i32(bm); b.push_i32(am); b.push_i32(ki); b.push_i32(gi); b
+        })
+    }
+
+    /// OQ4+ interleaved-layout fused gate+up decode (2-way demux, one launch).
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_gate_up_oq4_interleaved(
+        &mut self, w_gate: &GpuTensor, w_up: &GpuTensor, x_f32: &GpuTensor,
+        y_gate: &GpuTensor, y_up: &GpuTensor, gate_m: usize, up_m: usize, k: usize, group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("fused_gate_up_oq4_interleaved", kernels::FUSED_GATE_UP_OQ4_INTERLEAVED_SRC, "fused_gate_up_oq4_interleaved")?;
+        let wgp = w_gate.buf.as_ptr(); let wup = w_up.buf.as_ptr(); let xp = x_f32.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr(); let yup = y_up.buf.as_ptr();
+        let mut gmi = gate_m as i32; let mut umi = up_m as i32; let mut ki = k as i32; let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wgp as *const _ as *mut c_void, &wup as *const _ as *mut c_void, &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void, &yup as *const _ as *mut c_void,
+            &mut gmi as *mut _ as *mut c_void, &mut umi as *mut _ as *mut c_void, &mut ki as *mut _ as *mut c_void, &mut gi as *mut _ as *mut c_void];
+        let grid_x = (gate_m + up_m) as u32;
+        self.launch_maybe_blob("fused_gate_up_oq4_interleaved", [grid_x, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(wgp); b.push_ptr(wup); b.push_ptr(xp); b.push_ptr(ygp); b.push_ptr(yup);
+            b.push_i32(gmi); b.push_i32(umi); b.push_i32(ki); b.push_i32(gi); b
+        })
+    }
+
     /// OQ4+ fused QKVZA DECODE (B=1) W4A8 dp4a (`v_dot4_i32_iu8`/`sudot4`): 4
     /// in-proj GEMVs in ONE capture-safe launch over the int8-quantized activation
     /// (Xq/Xs from quantize_act_oq8). Arch-dispatched source (gfx1151 has its own

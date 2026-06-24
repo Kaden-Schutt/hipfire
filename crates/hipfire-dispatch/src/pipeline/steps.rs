@@ -636,15 +636,15 @@ fn oq4_gemv_into_impl(
     };
     let xr: &rdna_compute::GpuTensor = rotated.as_ref().unwrap_or(x);
 
-    let ws = w.buf.sub_offset(m * (k / 2), m * ng * 4);
-    // OQ4+ decode (B=1): consume the f32 rotated activation directly — unpack the
-    // 4-bit-resident weight inline (W4A16). No quantize_act_oq4 launch, no WMMA
-    // N-tile waste. `residual` fuses the residual add (out += W·x) into the gemv.
+    // OQ4+ decode (B=1): read the INTERLEAVED weight region ([f32 scale][128
+    // nibbles]/group, one coalesced stream) appended after the split region by the
+    // loader. `residual` fuses the residual add (out += W·x) into the gemv.
+    let il = w.buf.sub_offset(m * (k / 2) + m * ng * 4, m * ng * 132);
     if residual {
-        gpu.gemv_oq4_grouped_residual(w.buf, &ws, xr, out, m, k, GROUP)
+        gpu.gemv_oq4_interleaved_residual(&il, xr, out, m, k, GROUP)
             .map_err(hip)
     } else {
-        gpu.gemv_oq4_grouped(w.buf, &ws, xr, out, m, k, GROUP)
+        gpu.gemv_oq4_interleaved(&il, xr, out, m, k, GROUP)
             .map_err(hip)
     }
 }
@@ -1005,39 +1005,18 @@ fn launch_fused(
             let (wa, alpha) = gemv_weight_out(&steps[4]);
             let k = wqkv.k;
             let ng = k / 256;
-            // dot8-insts (v_dot4_i32_iu8 / sudot4) exists only on RDNA3+ (gfx11)
-            // and RDNA4 (gfx12). On gfx10 (RDNA1/2, incl. the gfx1010 5700XT) and
-            // CDNA the builtin does NOT compile — fall back to the W4A16 GEMV loop.
-            let has_dot8 = gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12");
-            if has_dot8 {
-                // W4A8 dp4a decode: int8-quantize the shared rotated activation ONCE,
-                // then one fused sudot4 launch (4 int8 MACs/instr). Arch-dispatched
-                // kernel source (gfx1151 has its own variant).
-                gpu.ensure_oq8_scratch().map_err(hip)?;
-                let xq = rdna_compute::GpuTensor {
-                    buf: unsafe { gpu.oq8_xq.as_ref().unwrap().buf.alias() },
-                    shape: vec![k],
-                    dtype: DType::Raw,
-                };
-                let xs = rdna_compute::GpuTensor {
-                    buf: unsafe { gpu.oq8_xs.as_ref().unwrap().buf.alias() },
-                    shape: vec![ng],
-                    dtype: DType::F32,
-                };
-                gpu.quantize_act_oq8(activated, &xq, &xs, 1, k, 256).map_err(hip)?;
-                gpu.fused_qkvza_oq4_dp4a(
-                    wqkv.buf, wz.buf, wb.buf, wa.buf, &xq, &xs, qkv, z, beta, alpha,
-                    wqkv.m, wz.m, wb.m, wa.m, k, 256,
-                )
-                .map_err(hip)?;
-            } else {
-                // W4A16 fallback (no dot8): per-projection nibble-unpack f32 GEMV.
-                for (wt, out) in [(wqkv, qkv), (wz, z), (wb, beta), (wa, alpha)] {
-                    let ws = wt.buf.sub_offset(wt.m * (k / 2), wt.m * ng * 4);
-                    gpu.gemv_oq4_grouped(wt.buf, &ws, activated, out, wt.m, k, 256)
-                        .map_err(hip)?;
-                }
-            }
+            // INTERLEAVED-layout fused decode: one launch over the contiguous
+            // [scale][nibbles] region (one coalesced stream/group), appended after
+            // the split region by the loader.
+            let il_qkv = wqkv.buf.sub_offset(wqkv.m * (k / 2) + wqkv.m * ng * 4, wqkv.m * ng * 132);
+            let il_z = wz.buf.sub_offset(wz.m * (k / 2) + wz.m * ng * 4, wz.m * ng * 132);
+            let il_b = wb.buf.sub_offset(wb.m * (k / 2) + wb.m * ng * 4, wb.m * ng * 132);
+            let il_a = wa.buf.sub_offset(wa.m * (k / 2) + wa.m * ng * 4, wa.m * ng * 132);
+            gpu.fused_qkvza_oq4_interleaved(
+                &il_qkv, &il_z, &il_b, &il_a, activated, qkv, z, beta, alpha,
+                wqkv.m, wz.m, wb.m, wa.m, k, 256,
+            )
+            .map_err(hip)?;
             Ok(())
         }
         KernelKey::FusedGateUpOq4G256 => {
@@ -1045,9 +1024,10 @@ fn launch_fused(
             let (wg, gate) = gemv_weight_out(&steps[1]);
             let (wu, up) = gemv_weight_out(&steps[2]);
             let k = wg.k;
-            // ONE fused gate+up launch (vs 2 gemv_oq4_grouped) — cuts per-token
-            // dispatch count toward mq4's fused_gate_up_hfq4g256.
-            gpu.fused_gate_up_oq4_gemv(wg.buf, wu.buf, activated, gate, up, wg.m, wu.m, k, 256)
+            let ng = k / 256;
+            let il_g = wg.buf.sub_offset(wg.m * (k / 2) + wg.m * ng * 4, wg.m * ng * 132);
+            let il_u = wu.buf.sub_offset(wu.m * (k / 2) + wu.m * ng * 4, wu.m * ng * 132);
+            gpu.fused_gate_up_oq4_interleaved(&il_g, &il_u, activated, gate, up, wg.m, wu.m, k, 256)
                 .map_err(hip)?;
             Ok(())
         }

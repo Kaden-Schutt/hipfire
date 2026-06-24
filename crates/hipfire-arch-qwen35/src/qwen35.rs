@@ -2851,7 +2851,17 @@ fn load_weight_tensor_raw(
                 "OQ4G256 weight byte length {} != M*ng*130 = {expect} (M={m} K={k})",
                 data.len()
             );
-            let mut combined = vec![0u8; packed_bytes + scales_bytes];
+            // Layout: [split nibbles M*(K/2)] [split f32 scales M*ng] [INTERLEAVED
+            // M*ng*132], where each interleaved group record is [f32 scale][128
+            // nibbles] (132 B, contiguous → one coalesced memory stream). Prefill
+            // (MMQ/f16) reads the split region (sub_offset 0); decode GEMVs read the
+            // interleaved region (sub_offset packed+scales). The +~0.25 GB is the
+            // cost of dual-layout while decode is migrated; collapse to interleaved-
+            // only once prefill is moved too. See gemv_oq4_interleaved.
+            const ILB: usize = 4 + 128; // [f32 scale][128 nibbles]
+            let il_bytes = m * ng * ILB;
+            let mut combined = vec![0u8; packed_bytes + scales_bytes + il_bytes];
+            let il_base = packed_bytes + scales_bytes;
             for r in 0..m {
                 for g in 0..ng {
                     let src = (r * ng + g) * BLOCK;
@@ -2860,6 +2870,10 @@ fn load_weight_tensor_raw(
                     combined[dst..dst + 128].copy_from_slice(&data[src + 2..src + BLOCK]);
                     let so = packed_bytes + (r * ng + g) * 4;
                     combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
+                    // interleaved record: [f32 scale][128 nibbles]
+                    let io = il_base + (r * ng + g) * ILB;
+                    combined[io..io + 4].copy_from_slice(&scale.to_le_bytes());
+                    combined[io + 4..io + ILB].copy_from_slice(&data[src + 2..src + BLOCK]);
                 }
             }
             let buf = gpu.upload_raw(&combined, &[combined.len()])?;

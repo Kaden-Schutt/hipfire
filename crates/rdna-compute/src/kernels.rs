@@ -3775,6 +3775,12 @@ pub const FUSED_GATE_UP_OQ4_GEMV_SRC: &str =
 /// fix the split-layout's two-stream access pattern. See the .hip.
 pub const GEMV_OQ4_INTERLEAVED_SRC: &str =
     include_str!("../../../kernels/src/gemv_oq4_interleaved.hip");
+pub const GEMV_OQ4_INTERLEAVED_RESIDUAL_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq4_interleaved_residual.hip");
+pub const FUSED_QKVZA_OQ4_INTERLEAVED_SRC: &str =
+    include_str!("../../../kernels/src/fused_qkvza_oq4_interleaved.hip");
+pub const FUSED_GATE_UP_OQ4_INTERLEAVED_SRC: &str =
+    include_str!("../../../kernels/src/fused_gate_up_oq4_interleaved.hip");
 pub const FUSED_QKVZA_OQ4_DP4A_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gfx1151/fused_qkvza_oq4_dp4a.gfx1151.hip");
 
