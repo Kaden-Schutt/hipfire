@@ -1028,9 +1028,16 @@ pub fn forward_batch(
     if b == 0 {
         return Err("minimax forward_batch: empty token slice".to_string());
     }
-    if b > 64 {
+    // The attention/MoE batched kernels take B as a grid dimension and scale
+    // freely; the dense projections go through `gemm_q8_0_batched_chunked`
+    // (which internally tiles to the GEMM kernel's MAX_BATCH=64). So large
+    // prefill chunks are supported — the only ceiling is the grid-Z limit
+    // (65535) and the non-flash attention LDS ctx bound (~12k). Bigger chunks
+    // amortize the 79 GB expert-weight read across more tokens (the dominant
+    // prefill cost at 256 experts / top-8).
+    if b > 4096 {
         return Err(format!(
-            "minimax forward_batch: B={b} exceeds kernel cap 64"
+            "minimax forward_batch: B={b} exceeds supported prefill chunk 4096"
         ));
     }
     let hidden = cfg.hidden_size;
@@ -1091,11 +1098,11 @@ pub fn forward_batch(
         // ── Attention (batched, per-row causal via positions) ──────────────
         gpu.rmsnorm_batched(&x, &layer.attn_norm, &tmp, b, hidden, eps)
             .map_err(|e| format!("minimax L{l} batch attn rmsnorm: {e:?}"))?;
-        gpu.gemm_q8_0_batched(&layer.wq.buf, &tmp, &fq, q_dim, hidden, b)
+        gpu.gemm_q8_0_batched_chunked(&layer.wq.buf, &tmp, &fq, q_dim, hidden, b)
             .map_err(|e| format!("minimax L{l} batch q_proj: {e:?}"))?;
-        gpu.gemm_q8_0_batched(&layer.wk.buf, &tmp, &fk, kv_dim, hidden, b)
+        gpu.gemm_q8_0_batched_chunked(&layer.wk.buf, &tmp, &fk, kv_dim, hidden, b)
             .map_err(|e| format!("minimax L{l} batch k_proj: {e:?}"))?;
-        gpu.gemm_q8_0_batched(&layer.wv.buf, &tmp, &fv, kv_dim, hidden, b)
+        gpu.gemm_q8_0_batched_chunked(&layer.wv.buf, &tmp, &fv, kv_dim, hidden, b)
             .map_err(|e| format!("minimax L{l} batch v_proj: {e:?}"))?;
         if cfg.use_qk_norm {
             // Per-row RMSNorm over the full flat q/k vector (MiniMax convention).
@@ -1152,7 +1159,7 @@ pub fn forward_batch(
             b,
         )
         .map_err(|e| format!("minimax L{l} batch attention: {e:?}"))?;
-        gpu.gemm_q8_0_batched(&layer.wo.buf, &attn_out, &o, hidden, q_dim, b)
+        gpu.gemm_q8_0_batched_chunked(&layer.wo.buf, &attn_out, &o, hidden, q_dim, b)
             .map_err(|e| format!("minimax L{l} batch o_proj: {e:?}"))?;
         gpu.add_inplace_f32(&x, &o)
             .map_err(|e| format!("minimax L{l} batch o residual: {e:?}"))?;
@@ -1171,7 +1178,7 @@ pub fn forward_batch(
             b,
         )
         .map_err(|e| format!("minimax L{l} batch ffn rotate: {e}"))?;
-        gpu.gemm_q8_0_batched(
+        gpu.gemm_q8_0_batched_chunked(
             &layer.router.buf,
             &ffn_tmp,
             &router_logits,
