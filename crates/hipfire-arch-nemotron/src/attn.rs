@@ -185,6 +185,65 @@ impl NemotronAttnGpu {
         Ok(&self.out)
     }
 
+    /// Batched prefill over a whole `seq`-token prompt (N6), starting at position
+    /// 0. q/k/v projected batched, k/v written contiguously into the (pos-major)
+    /// cache, then one causal-masked GQA flash over all queries (NoPE), then
+    /// o_proj. Leaves the cache populated for positions `0..seq` so a subsequent
+    /// `forward(pos=seq)` continues. Returns `[seq * hidden]`. F32 weights only
+    /// (see [`crate::weight::LinearWeight::gemm_seq`]); scratch allocated per
+    /// call. Single-block masked flash (`block_cols = seq`) — adequate for normal
+    /// prompt lengths; chunked blocking for very long prompts is a follow-up.
+    pub fn prefill(&mut self, gpu: &mut Gpu, x: &GpuTensor, seq: usize) -> HipResult<GpuTensor> {
+        const F32B: usize = std::mem::size_of::<f32>();
+        let q_dim = self.cfg.num_heads * self.cfg.head_dim;
+        let kv_dim = self.cfg.num_kv_heads * self.cfg.head_dim;
+
+        let q = gpu.zeros(&[seq * q_dim], DType::F32)?;
+        let k = gpu.zeros(&[seq * kv_dim], DType::F32)?;
+        let v = gpu.zeros(&[seq * kv_dim], DType::F32)?;
+        let attn_out = gpu.zeros(&[seq * q_dim], DType::F32)?;
+        let out = gpu.zeros(&[seq * self.hidden], DType::F32)?;
+
+        // q/k/v projections (no bias, no rope)
+        self.q_proj.gemm_seq(gpu, x, &q, seq, q_dim, self.hidden)?;
+        self.k_proj.gemm_seq(gpu, x, &k, seq, kv_dim, self.hidden)?;
+        self.v_proj.gemm_seq(gpu, x, &v, seq, kv_dim, self.hidden)?;
+
+        // Cache is pos-major (`dst[pos*kv_dim + i]`), so writing the [seq, kv_dim]
+        // projections from position 0 is a contiguous copy.
+        gpu.memcpy_dtod_at_auto(&self.k_cache.buf, 0, &k.buf, 0, seq * kv_dim * F32B)?;
+        gpu.memcpy_dtod_at_auto(&self.v_cache.buf, 0, &v.buf, 0, seq * kv_dim * F32B)?;
+
+        // per-query absolute positions [0..seq] for the causal mask.
+        let pos_bytes: Vec<u8> = (0..seq as i32).flat_map(|p| p.to_le_bytes()).collect();
+        let positions = gpu.upload_raw(&pos_bytes, &[seq])?;
+
+        gpu.attention_f32_batched_masked(
+            &q,
+            &self.k_cache,
+            &self.v_cache,
+            &attn_out,
+            &positions,
+            self.cfg.num_heads,
+            self.cfg.num_kv_heads,
+            self.cfg.head_dim,
+            self.max_seq,
+            seq,  // max_ctx_len
+            seq,  // batch_size (queries)
+            None, // no tree bias
+            0,    // block_start
+            seq,  // block_cols
+        )?;
+
+        self.o_proj
+            .gemm_seq(gpu, &attn_out, &out, seq, self.hidden, q_dim)?;
+
+        for t in [q, k, v, attn_out, positions] {
+            let _ = gpu.free_tensor(t);
+        }
+        Ok(out)
+    }
+
     pub fn hidden(&self) -> usize {
         self.hidden
     }
