@@ -17548,6 +17548,68 @@ impl Gpu {
         Ok(())
     }
 
+    /// Resolve and dispatch the Q8_0 dense prefill GEMM (`Y[N,M] = X[N,K] @
+    /// A_q8[M,K]^T`). Picks the i8-MMQ / f16-WMMA / scalar-chunked kernel from
+    /// arch caps, feature flags, and shape — so arch forward passes carry no
+    /// kernel-selection knowledge (mirrors the minimax dense path, which calls
+    /// `gemm_q8_0_batched_chunked` blind).
+    ///
+    /// `x` is the plain F32 activation batch. `x_f16_scratch` is a caller-owned
+    /// F16 staging tensor the f16-WMMA kernels require; the i8-MMQ kernel reads
+    /// the int8 weights directly and quantizes `x` internally, and the scalar
+    /// chunked fallback takes F32 — both ignore the scratch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q8_0_wmma_prefill_auto(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        x_f16_scratch: Option<&GpuTensor>,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        let wmma_on = !self.flags.deepseek4_q8_wmma_off;
+        if wmma_on && self.arch_caps.is_rdna4() {
+            // RDNA4 (gfx12): upstream-tuned gating.
+            if let Some(scratch) = x_f16_scratch {
+                let nn = (n * k) as i64;
+                self.deepseek4_convert_f32_to_f16(x, scratch, nn)?;
+                let use_4w = !self.flags.deepseek4_q8_4w_off
+                    && n >= 256
+                    && m >= 4096
+                    && m % 64 == 0
+                    && k % 32 == 0
+                    && n % 64 == 0;
+                if use_4w {
+                    return self.gemm_q8_0_wmma_4w(weight, scratch, y, m, k, n);
+                }
+                return self.gemm_q8_0_wmma(weight, scratch, y, m, k, n);
+            }
+        } else if wmma_on && self.arch_caps.has_wmma() && m % 64 == 0 && k % 32 == 0 {
+            // i8-MMQ 64×64 dense path (gfx1151): int8 weights direct + Q8_1
+            // activations + i8 WMMA at ~2x. ~1.4-1.56x over the f16 64×64 kernel
+            // at the q-LoRA projection shapes (M=4096, batch≥256).
+            if self.arch == "gfx1151" && n % 64 == 0 && k % 128 == 0 {
+                return self.gemm_q8_0_mmq_4w_gfx1151(weight, x, y, m, k, n);
+            }
+            // gfx11 / RDNA3.5 (gfx1151) Q8_0 WMMA prefill. The activation is
+            // pre-converted to F16 in `scratch`; the kernels honor the F16 dtype
+            // (no re-convert). 4-warp 64×64-tile kernel for batch%64==0 (~12%
+            // over single-warp 16×16; weight-bandwidth-bound); the 4w opt-out
+            // forces single-warp.
+            if let Some(scratch) = x_f16_scratch {
+                let nn = (n * k) as i64;
+                self.deepseek4_convert_f32_to_f16(x, scratch, nn)?;
+                if !self.flags.deepseek4_q8_4w_off && n >= 64 && n % 64 == 0 {
+                    return self.gemm_q8_0_wmma_4w(weight, scratch, y, m, k, n);
+                }
+                return self.gemm_q8_0_wmma(weight, scratch, y, m, k, n);
+            }
+        }
+        self.gemm_q8_0_batched_chunked(weight, x, y, m, k, n)
+    }
+
     /// WMMA Q8_0 GEMM (no residual). Y[N, M] = X[N, K] @ A_q8[M, K]^T.
     /// gfx12 (RDNA4) only. Drop-in replacement for `gemm_q8_0_batched`;
     /// the scalar 1-wave-per-row kernel was 65% of A3B prefill GPU time

@@ -243,62 +243,19 @@ fn gemv_auto_batched_wmma(
                 .map_err(|e| format!("gemm_f32_register_tiled: {e:?}"))
         }
         DType::Q8_0 => {
-            let wmma_on = std::env::var("HIPFIRE_DEEPSEEK4_Q8_WMMA")
-                .map(|s| s != "0")
-                .unwrap_or(true);
-            if wmma_on && gpu.arch_caps.is_rdna4() {
-                // RDNA4 (gfx12): upstream-tuned gating (unchanged).
-                if let Some(scratch) = x_f16_scratch {
-                    let n = (batch_size * k) as i64;
-                    gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
-                        .map_err(|e| format!("convert_f32_to_f16 (Q8 WMMA): {e:?}"))?;
-                    let opt_out = std::env::var("HIPFIRE_DEEPSEEK4_Q8_4W").as_deref() == Ok("0");
-                    let use_4w = !opt_out
-                        && batch_size >= 256
-                        && m >= 4096
-                        && m % 64 == 0
-                        && k % 32 == 0
-                        && batch_size % 64 == 0;
-                    if use_4w {
-                        return gpu
-                            .gemm_q8_0_wmma_4w(weight, scratch, y, m, k, batch_size)
-                            .map_err(|e| format!("gemm_q8_0_wmma_4w: {e:?}"));
-                    }
-                    return gpu
-                        .gemm_q8_0_wmma(weight, scratch, y, m, k, batch_size)
-                        .map_err(|e| format!("gemm_q8_0_wmma: {e:?}"));
-                }
-            } else if wmma_on && gpu.arch_caps.has_wmma() && m % 64 == 0 && k % 32 == 0 {
-                // i8-MMQ 64×64 dense path (gfx1151): int8 weights direct + Q8_1
-                // activations + i8 WMMA at ~2x. ~1.4-1.56x over the f16 64×64
-                // kernel at the q-LoRA projection shapes (M=4096, batch≥256).
-                if gpu.arch == "gfx1151" && batch_size % 64 == 0 && k % 128 == 0 {
-                    return gpu
-                        .gemm_q8_0_mmq_4w_gfx1151(weight, x_plain_batch, y, m, k, batch_size)
-                        .map_err(|e| format!("gemm_q8_0_mmq_4w_gfx1151: {e:?}"));
-                }
-                // gfx11 / RDNA3.5 (gfx1151) Q8_0 WMMA prefill. The activation
-                // is pre-converted to F16 in `scratch`; the kernels honor the
-                // F16 dtype (no re-convert). 4-warp 64×64-tile kernel for
-                // batch%64==0 (~12% over single-warp 16×16; weight-bandwidth-
-                // bound); HIPFIRE_DEEPSEEK4_Q8_4W=0 forces single-warp.
-                if let Some(scratch) = x_f16_scratch {
-                    let n = (batch_size * k) as i64;
-                    gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
-                        .map_err(|e| format!("convert_f32_to_f16 (Q8 WMMA): {e:?}"))?;
-                    let opt_out_4w = std::env::var("HIPFIRE_DEEPSEEK4_Q8_4W").as_deref() == Ok("0");
-                    if !opt_out_4w && batch_size >= 64 && batch_size % 64 == 0 {
-                        return gpu
-                            .gemm_q8_0_wmma_4w(weight, scratch, y, m, k, batch_size)
-                            .map_err(|e| format!("gemm_q8_0_wmma_4w: {e:?}"));
-                    }
-                    return gpu
-                        .gemm_q8_0_wmma(weight, scratch, y, m, k, batch_size)
-                        .map_err(|e| format!("gemm_q8_0_wmma: {e:?}"));
-                }
-            }
-            gpu.gemm_q8_0_batched_chunked(weight, x_plain_batch, y, m, k, batch_size)
-                .map_err(|e| format!("gemm_q8_0_batched_chunked: {e:?}"))
+            // Kernel selection (i8-MMQ / f16-WMMA / scalar) lives in the
+            // dispatch layer (rdna-compute), not here — the resolver reads arch
+            // caps + flags + shape. See `gemm_q8_0_wmma_prefill_auto`.
+            gpu.gemm_q8_0_wmma_prefill_auto(
+                weight,
+                x_plain_batch,
+                x_f16_scratch,
+                y,
+                m,
+                k,
+                batch_size,
+            )
+            .map_err(|e| format!("gemm_q8_0_wmma_prefill_auto: {e:?}"))
         }
         DType::F16 => {
             // gfx12/RDNA4: route through the VALIDATED gfx12 f16 WMMA kernel
