@@ -1,0 +1,106 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! nemotron_h dense MLP (`-`) block — ReLU² FFN, CPU oracle + GPU forward.
+//!
+//! `out = down_proj @ relu2(up_proj @ x)` — a plain (un-gated) MLP with a
+//! squared-ReLU activation (`mlp_hidden_act = "relu2"`), NOT SwiGLU. Both
+//! projections are bias-free (`mlp_bias = false`). Shapes:
+//! `up_proj [intermediate, hidden]`, `down_proj [hidden, intermediate]`.
+
+use hip_bridge::HipResult;
+use rdna_compute::{DType, Gpu, GpuTensor};
+
+#[inline]
+fn relu2(x: f32) -> f32 {
+    let r = x.max(0.0);
+    r * r
+}
+
+/// Row-major matvec `out[i] = Σ_j w[i*in + j] * x[j]`, `w` is `[out, in]`.
+fn matvec(w: &[f32], x: &[f32], out: usize, n_in: usize, dst: &mut [f32]) {
+    for i in 0..out {
+        let row = &w[i * n_in..i * n_in + n_in];
+        dst[i] = row.iter().zip(x).map(|(a, b)| a * b).sum();
+    }
+}
+
+/// CPU reference: `down @ relu2(up @ x)`. `up` is `[intermediate, hidden]`,
+/// `down` is `[hidden, intermediate]`; returns `[hidden]`.
+pub fn mlp_relu2(
+    up: &[f32],
+    down: &[f32],
+    x: &[f32],
+    hidden: usize,
+    intermediate: usize,
+) -> Vec<f32> {
+    let mut u = vec![0.0f32; intermediate];
+    matvec(up, x, intermediate, hidden, &mut u);
+    for v in u.iter_mut() {
+        *v = relu2(*v);
+    }
+    let mut out = vec![0.0f32; hidden];
+    matvec(down, &u, hidden, intermediate, &mut out);
+    out
+}
+
+/// GPU-resident ReLU² MLP block (`up`/`down` weights + reused scratch).
+pub struct MlpRelu2Gpu {
+    hidden: usize,
+    intermediate: usize,
+    up: GpuTensor,
+    down: GpuTensor,
+    u: GpuTensor,
+    a: GpuTensor,
+    out: GpuTensor,
+}
+
+impl MlpRelu2Gpu {
+    pub fn new(
+        gpu: &mut Gpu,
+        hidden: usize,
+        intermediate: usize,
+        up: &[f32],
+        down: &[f32],
+    ) -> HipResult<Self> {
+        Ok(Self {
+            hidden,
+            intermediate,
+            up: gpu.upload_f32(up, &[intermediate, hidden])?,
+            down: gpu.upload_f32(down, &[hidden, intermediate])?,
+            u: gpu.zeros(&[intermediate], DType::F32)?,
+            a: gpu.zeros(&[intermediate], DType::F32)?,
+            out: gpu.zeros(&[hidden], DType::F32)?,
+        })
+    }
+
+    /// `out = down @ relu2(up @ x)`. Reads `x` `[hidden]`, returns `[hidden]`.
+    pub fn forward(&mut self, gpu: &mut Gpu, x: &GpuTensor) -> HipResult<&GpuTensor> {
+        gpu.gemv_f32(&self.up, x, &self.u)?;
+        gpu.relu2_f32(&self.u, &self.a)?;
+        gpu.gemv_f32(&self.down, &self.a, &self.out)?;
+        Ok(&self.out)
+    }
+
+    pub fn hidden(&self) -> usize {
+        self.hidden
+    }
+    pub fn intermediate(&self) -> usize {
+        self.intermediate
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_relu2_mlp_basic() {
+        // hidden=2, intermediate=2, identity-ish: up=I, down=I → out=relu2(x).
+        let up = vec![1.0, 0.0, 0.0, 1.0];
+        let down = vec![1.0, 0.0, 0.0, 1.0];
+        let out = mlp_relu2(&up, &down, &[2.0, -3.0], 2, 2);
+        assert_eq!(out, vec![4.0, 0.0]); // relu2(2)=4, relu2(-3)=0
+    }
+}

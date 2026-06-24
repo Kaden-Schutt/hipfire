@@ -16,6 +16,7 @@
 
 pub mod block;
 pub mod block_gpu;
+pub mod mlp;
 pub mod ssd;
 
 use hipfire_mixer::{MixerKind, MixerProfile};
