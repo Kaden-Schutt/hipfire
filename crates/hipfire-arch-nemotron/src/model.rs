@@ -23,6 +23,7 @@
 use crate::attn::{gqa_attention, NemotronAttnGpu};
 use crate::block::{mamba2_block_decode_step, Mamba2BlockState, Mamba2BlockWeights};
 use crate::mlp::{mlp_relu2, MlpRelu2Gpu};
+use crate::weight::LinearWeight;
 use crate::{BlockKind, NemotronHConfig};
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -78,7 +79,7 @@ pub struct NemotronModel {
     layer_norm: Vec<GpuTensor>,
     layers: Vec<Block>,
     norm_f: GpuTensor,
-    lm_head: GpuTensor,
+    lm_head: LinearWeight,
     // scratch
     h: GpuTensor,
     normed: GpuTensor,
@@ -99,7 +100,7 @@ impl NemotronModel {
         let dims = cfg.mamba2_dims();
 
         let embeddings = gpu.upload_f32(&w.embeddings, &[vocab, hidden])?;
-        let lm_head = gpu.upload_f32(&w.lm_head, &[vocab, hidden])?;
+        let lm_head = LinearWeight::F32(gpu.upload_f32(&w.lm_head, &[vocab, hidden])?);
         let norm_f = gpu.upload_f32(&w.norm_f, &[hidden])?;
 
         let mut layer_norm = Vec::with_capacity(cfg.num_layers);
@@ -185,7 +186,7 @@ impl NemotronModel {
             }
         }
         gpu.rmsnorm_f32(&self.h, &self.norm_f, &self.normed, eps)?;
-        gpu.gemv_f32(&self.lm_head, &self.normed, &self.logits)?;
+        self.lm_head.gemv(gpu, &self.normed, &self.logits)?;
         Ok(())
     }
 
@@ -227,7 +228,7 @@ impl NemotronModel {
             caps.push(gpu.download_f32(&self.h)?);
         }
         gpu.rmsnorm_f32(&self.h, &self.norm_f, &self.normed, eps)?;
-        gpu.gemv_f32(&self.lm_head, &self.normed, &self.logits)?;
+        self.lm_head.gemv(gpu, &self.normed, &self.logits)?;
         gpu.hip.device_synchronize()?;
         let logits = gpu.download_f32(&self.logits)?;
         Ok((caps, logits))
@@ -266,7 +267,7 @@ impl NemotronModel {
     /// Free all GPU tensors (consumes the model).
     pub fn free(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.embeddings);
-        let _ = gpu.free_tensor(self.lm_head);
+        self.lm_head.free(gpu);
         let _ = gpu.free_tensor(self.norm_f);
         let _ = gpu.free_tensor(self.h);
         let _ = gpu.free_tensor(self.normed);

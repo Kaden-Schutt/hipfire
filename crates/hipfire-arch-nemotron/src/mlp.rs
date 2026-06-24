@@ -9,6 +9,7 @@
 //! projections are bias-free (`mlp_bias = false`). Shapes:
 //! `up_proj [intermediate, hidden]`, `down_proj [hidden, intermediate]`.
 
+use crate::weight::LinearWeight;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -49,8 +50,8 @@ pub fn mlp_relu2(
 pub struct MlpRelu2Gpu {
     hidden: usize,
     intermediate: usize,
-    up: GpuTensor,
-    down: GpuTensor,
+    up: LinearWeight,
+    down: LinearWeight,
     u: GpuTensor,
     a: GpuTensor,
     out: GpuTensor,
@@ -64,11 +65,34 @@ impl MlpRelu2Gpu {
         up: &[f32],
         down: &[f32],
     ) -> HipResult<Self> {
+        let up = LinearWeight::F32(gpu.upload_f32(up, &[intermediate, hidden])?);
+        let down = LinearWeight::F32(gpu.upload_f32(down, &[hidden, intermediate])?);
+        Self::assemble(gpu, hidden, intermediate, up, down)
+    }
+
+    /// HFQ path: `up`/`down` are pre-built quantized [`LinearWeight`]s.
+    pub fn new_quant(
+        gpu: &mut Gpu,
+        hidden: usize,
+        intermediate: usize,
+        up: LinearWeight,
+        down: LinearWeight,
+    ) -> HipResult<Self> {
+        Self::assemble(gpu, hidden, intermediate, up, down)
+    }
+
+    fn assemble(
+        gpu: &mut Gpu,
+        hidden: usize,
+        intermediate: usize,
+        up: LinearWeight,
+        down: LinearWeight,
+    ) -> HipResult<Self> {
         Ok(Self {
             hidden,
             intermediate,
-            up: gpu.upload_f32(up, &[intermediate, hidden])?,
-            down: gpu.upload_f32(down, &[hidden, intermediate])?,
+            up,
+            down,
             u: gpu.zeros(&[intermediate], DType::F32)?,
             a: gpu.zeros(&[intermediate], DType::F32)?,
             out: gpu.zeros(&[hidden], DType::F32)?,
@@ -77,9 +101,9 @@ impl MlpRelu2Gpu {
 
     /// `out = down @ relu2(up @ x)`. Reads `x` `[hidden]`, returns `[hidden]`.
     pub fn forward(&mut self, gpu: &mut Gpu, x: &GpuTensor) -> HipResult<&GpuTensor> {
-        gpu.gemv_f32(&self.up, x, &self.u)?;
+        self.up.gemv(gpu, x, &self.u)?;
         gpu.relu2_f32(&self.u, &self.a)?;
-        gpu.gemv_f32(&self.down, &self.a, &self.out)?;
+        self.down.gemv(gpu, &self.a, &self.out)?;
         Ok(&self.out)
     }
 
@@ -92,7 +116,9 @@ impl MlpRelu2Gpu {
 
     /// Free all GPU tensors (consumes the block).
     pub fn free(self, gpu: &mut Gpu) {
-        for t in [self.up, self.down, self.u, self.a, self.out] {
+        self.up.free(gpu);
+        self.down.free(gpu);
+        for t in [self.u, self.a, self.out] {
             let _ = gpu.free_tensor(t);
         }
     }

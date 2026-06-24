@@ -16,6 +16,7 @@
 //! KV cache layout matches qwen2: `[max_seq × n_kv_heads × head_dim]` flat per
 //! block, written at `pos*kv_dim`. f32 / decode-only.
 
+use crate::weight::LinearWeight;
 use crate::AttnConfig;
 use hip_bridge::{DeviceBuffer, HipResult};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -72,11 +73,11 @@ pub struct NemotronAttnGpu {
     cfg: AttnConfig,
     hidden: usize,
     max_seq: usize,
-    // weights (bias-free)
-    q_proj: GpuTensor,
-    k_proj: GpuTensor,
-    v_proj: GpuTensor,
-    o_proj: GpuTensor,
+    // weights (bias-free) — F32 or quantized.
+    q_proj: LinearWeight,
+    k_proj: LinearWeight,
+    v_proj: LinearWeight,
+    o_proj: LinearWeight,
     // KV cache + position
     k_cache: GpuTensor,
     v_cache: GpuTensor,
@@ -104,15 +105,36 @@ impl NemotronAttnGpu {
     ) -> HipResult<Self> {
         let q_dim = cfg.num_heads * cfg.head_dim;
         let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+        let q = LinearWeight::F32(gpu.upload_f32(q_proj, &[q_dim, hidden])?);
+        let k = LinearWeight::F32(gpu.upload_f32(k_proj, &[kv_dim, hidden])?);
+        let v = LinearWeight::F32(gpu.upload_f32(v_proj, &[kv_dim, hidden])?);
+        let o = LinearWeight::F32(gpu.upload_f32(o_proj, &[hidden, q_dim])?);
+        Self::new_quant(gpu, cfg, hidden, max_seq, q, k, v, o)
+    }
+
+    /// HFQ path: q/k/v/o are pre-built quantized [`LinearWeight`]s.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_quant(
+        gpu: &mut Gpu,
+        cfg: AttnConfig,
+        hidden: usize,
+        max_seq: usize,
+        q_proj: LinearWeight,
+        k_proj: LinearWeight,
+        v_proj: LinearWeight,
+        o_proj: LinearWeight,
+    ) -> HipResult<Self> {
+        let q_dim = cfg.num_heads * cfg.head_dim;
+        let kv_dim = cfg.num_kv_heads * cfg.head_dim;
         let n_chunks_max = max_seq.div_ceil(128);
         Ok(Self {
             cfg,
             hidden,
             max_seq,
-            q_proj: gpu.upload_f32(q_proj, &[q_dim, hidden])?,
-            k_proj: gpu.upload_f32(k_proj, &[kv_dim, hidden])?,
-            v_proj: gpu.upload_f32(v_proj, &[kv_dim, hidden])?,
-            o_proj: gpu.upload_f32(o_proj, &[hidden, q_dim])?,
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
             k_cache: gpu.zeros(&[max_seq * kv_dim], DType::F32)?,
             v_cache: gpu.zeros(&[max_seq * kv_dim], DType::F32)?,
             pos_buf: gpu.hip.malloc(4)?,
@@ -136,9 +158,9 @@ impl NemotronAttnGpu {
             .memcpy_htod(&self.pos_buf, &(pos as i32).to_ne_bytes())?;
 
         // q/k/v projections (no bias, no rope)
-        gpu.gemv_f32(&self.q_proj, x, &self.q)?;
-        gpu.gemv_f32(&self.k_proj, x, &self.k)?;
-        gpu.gemv_f32(&self.v_proj, x, &self.v)?;
+        self.q_proj.gemv(gpu, x, &self.q)?;
+        self.k_proj.gemv(gpu, x, &self.k)?;
+        self.v_proj.gemv(gpu, x, &self.v)?;
 
         // KV cache write at pos
         gpu.kv_cache_write(&self.k_cache, &self.k, &self.pos_buf, kv_dim)?;
@@ -159,7 +181,7 @@ impl NemotronAttnGpu {
         )?;
 
         // output projection
-        gpu.gemv_f32(&self.o_proj, &self.attn_out, &self.out)?;
+        self.o_proj.gemv(gpu, &self.attn_out, &self.out)?;
         Ok(&self.out)
     }
 
@@ -170,11 +192,11 @@ impl NemotronAttnGpu {
     /// Free all GPU tensors + the pos buffer (consumes the block).
     pub fn free(self, gpu: &mut Gpu) {
         let _ = gpu.hip.free(self.pos_buf);
+        self.q_proj.free(gpu);
+        self.k_proj.free(gpu);
+        self.v_proj.free(gpu);
+        self.o_proj.free(gpu);
         for t in [
-            self.q_proj,
-            self.k_proj,
-            self.v_proj,
-            self.o_proj,
             self.k_cache,
             self.v_cache,
             self.q,

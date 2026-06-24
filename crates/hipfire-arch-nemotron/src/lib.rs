@@ -22,6 +22,7 @@ pub mod loader;
 pub mod mlp;
 pub mod model;
 pub mod ssd;
+pub mod weight;
 
 use hipfire_mixer::{MixerKind, MixerProfile};
 use serde::Deserialize;

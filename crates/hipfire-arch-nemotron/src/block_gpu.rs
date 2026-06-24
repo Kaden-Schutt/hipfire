@@ -20,6 +20,7 @@
 //! `examples/test_block_gpu.rs`. f32 / decode-only; chunked prefill is N6.
 
 use crate::block::{Mamba2BlockWeights, Mamba2Dims};
+use crate::weight::LinearWeight;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -28,15 +29,16 @@ const F32: usize = std::mem::size_of::<f32>();
 /// GPU-resident weights + recurrent state + scratch for one Mamba-2 block.
 pub struct Mamba2BlockGpu {
     pub dims: Mamba2Dims,
-    // weights
-    in_proj: GpuTensor,
+    // weights — in_proj/out_proj are F32 or quantized (LinearWeight); the
+    // recurrence tensors (conv/A_log/D/dt_bias/norm) are always F32.
+    in_proj: LinearWeight,
     conv_weight: GpuTensor,
     conv_bias: GpuTensor,
     a_log: GpuTensor,
     d: GpuTensor,
     dt_bias: GpuTensor,
     norm_weight: GpuTensor,
-    out_proj: GpuTensor,
+    out_proj: LinearWeight,
     // recurrent state (zero-initialized)
     conv_state: GpuTensor,
     ssm_state: GpuTensor,
@@ -58,6 +60,67 @@ impl Mamba2BlockGpu {
     /// Upload `w` (host f32 slices) and allocate state + scratch. State starts
     /// at zero (matching the CPU oracle's `Mamba2BlockState::zeros`).
     pub fn new(gpu: &mut Gpu, dims: Mamba2Dims, w: &Mamba2BlockWeights) -> HipResult<Self> {
+        let in_proj = LinearWeight::F32(
+            gpu.upload_f32(w.in_proj, &[dims.projection_size(), dims.hidden_size])?,
+        );
+        let out_proj =
+            LinearWeight::F32(gpu.upload_f32(w.out_proj, &[dims.hidden_size, dims.d_inner()])?);
+        Self::assemble(
+            gpu,
+            dims,
+            in_proj,
+            out_proj,
+            w.conv_weight,
+            w.conv_bias,
+            w.a_log,
+            w.d,
+            w.dt_bias,
+            w.norm_weight,
+        )
+    }
+
+    /// HFQ path: `in_proj`/`out_proj` are pre-built quantized [`LinearWeight`]s;
+    /// the recurrence tensors come as host f32 slices (kept F16/F32 in the HFQ).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_quant(
+        gpu: &mut Gpu,
+        dims: Mamba2Dims,
+        in_proj: LinearWeight,
+        out_proj: LinearWeight,
+        conv_weight: &[f32],
+        conv_bias: &[f32],
+        a_log: &[f32],
+        d: &[f32],
+        dt_bias: &[f32],
+        norm_weight: &[f32],
+    ) -> HipResult<Self> {
+        Self::assemble(
+            gpu,
+            dims,
+            in_proj,
+            out_proj,
+            conv_weight,
+            conv_bias,
+            a_log,
+            d,
+            dt_bias,
+            norm_weight,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        gpu: &mut Gpu,
+        dims: Mamba2Dims,
+        in_proj: LinearWeight,
+        out_proj: LinearWeight,
+        conv_weight: &[f32],
+        conv_bias: &[f32],
+        a_log: &[f32],
+        d: &[f32],
+        dt_bias: &[f32],
+        norm_weight: &[f32],
+    ) -> HipResult<Self> {
         let d_inner = dims.d_inner();
         let conv_dim = dims.conv_dim();
         let nh = dims.num_heads;
@@ -66,14 +129,14 @@ impl Mamba2BlockGpu {
         let hist = dims.conv_kernel - 1;
 
         Ok(Self {
-            in_proj: gpu.upload_f32(w.in_proj, &[proj_sz, dims.hidden_size])?,
-            conv_weight: gpu.upload_f32(w.conv_weight, &[conv_dim, dims.conv_kernel])?,
-            conv_bias: gpu.upload_f32(w.conv_bias, &[conv_dim])?,
-            a_log: gpu.upload_f32(w.a_log, &[nh])?,
-            d: gpu.upload_f32(w.d, &[nh])?,
-            dt_bias: gpu.upload_f32(w.dt_bias, &[nh])?,
-            norm_weight: gpu.upload_f32(w.norm_weight, &[d_inner])?,
-            out_proj: gpu.upload_f32(w.out_proj, &[dims.hidden_size, d_inner])?,
+            in_proj,
+            out_proj,
+            conv_weight: gpu.upload_f32(conv_weight, &[conv_dim, dims.conv_kernel])?,
+            conv_bias: gpu.upload_f32(conv_bias, &[conv_dim])?,
+            a_log: gpu.upload_f32(a_log, &[nh])?,
+            d: gpu.upload_f32(d, &[nh])?,
+            dt_bias: gpu.upload_f32(dt_bias, &[nh])?,
+            norm_weight: gpu.upload_f32(norm_weight, &[d_inner])?,
             conv_state: gpu.zeros(&[conv_dim, hist], DType::F32)?,
             ssm_state: gpu.zeros(&[nh * dims.head_dim, dims.state_size], DType::F32)?,
             proj: gpu.zeros(&[proj_sz], DType::F32)?,
@@ -100,7 +163,7 @@ impl Mamba2BlockGpu {
         let nss = d.n_groups * d.state_size;
 
         // 1. in_proj
-        gpu.gemv_f32(&self.in_proj, hidden, &self.proj)?;
+        self.in_proj.gemv(gpu, hidden, &self.proj)?;
 
         // 2. slice proj → z | xBC | dt_raw
         gpu.memcpy_dtod_at_auto(&self.z.buf, 0, &self.proj.buf, 0, d_inner * F32)?;
@@ -173,7 +236,7 @@ impl Mamba2BlockGpu {
         )?;
 
         // 7. out_proj
-        gpu.gemv_f32(&self.out_proj, &self.y_norm, &self.out)?;
+        self.out_proj.gemv(gpu, &self.y_norm, &self.out)?;
         Ok(&self.out)
     }
 
@@ -186,15 +249,15 @@ impl Mamba2BlockGpu {
 
     /// Free all GPU tensors (consumes the block).
     pub fn free(self, gpu: &mut Gpu) {
+        self.in_proj.free(gpu);
+        self.out_proj.free(gpu);
         for t in [
-            self.in_proj,
             self.conv_weight,
             self.conv_bias,
             self.a_log,
             self.d,
             self.dt_bias,
             self.norm_weight,
-            self.out_proj,
             self.conv_state,
             self.ssm_state,
             self.proj,
