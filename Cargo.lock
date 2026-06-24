@@ -1316,7 +1316,9 @@ dependencies = [
 name = "hipfire-arch-nemotron"
 version = "0.2.1"
 dependencies = [
+ "hip-bridge",
  "hipfire-mixer",
+ "rdna-compute",
  "serde",
  "serde_json",
 ]
