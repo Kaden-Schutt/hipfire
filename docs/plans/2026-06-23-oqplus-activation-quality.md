@@ -207,6 +207,38 @@ no WMMA waste). Commit 48a8d07b.
 - Remaining: W4A4 **batched-prefill** still parity-gated (the [[gate]] entry) — the
   W4A16/W8A8 batched-prefill path is the next perf item; decode is the win here.
 
+## OQ4+ prefill investigation (2026-06-24)
+
+After the decode wins, looked at the prefill axis. Findings (daemon path; note
+`infer_qwen35` prefill is per-token-sequential and is NOT a batched-prefill harness):
+
+- **Daemon OQ4+ prefill ≈ 92 tok/s** (240-token speed battery) vs **mq4+ ≈ 105** —
+  already **88% of mq4 parity**, much better than the old `infer_qwen35` per-token
+  number (~55) suggested. Decode 55.6 (matches the standalone measurement).
+- **W4A4 batched prefill output is COHERENT on OQ4+** and byte-identical to the
+  per-token path on the long prompts tested (agentic_hermes 318-tok + BST question:
+  clean BST paragraph, identical with `HIPFIRE_OQ4_BATCHED_PREFILL` 0 and 1). The
+  memory's batched-prefill divergence warning was on PLAIN oq4 (RTN-ish weights);
+  the well-conditioned LDLQ+AWQ OQ4+ weights do not flip greedy argmax into
+  incoherence on these inputs. Fast-tier coherence battery: identical pass set
+  flag 0 vs 1.
+- **Caveat (unresolved):** the speed battery showed prefill 92 tok/s for BOTH flag
+  values, so it's not yet confirmed the batched WMMA *projections* are the source of
+  the 92 (vs chunked prefill with per-token projections + batched attention). The
+  env-flag's effect through the eval-spawned daemon child wasn't isolated. Treat 92
+  as the current OQ4+ daemon prefill rate; whether batched-projection WMMA raises it
+  further is unverified.
+
+**Remaining lever to mq4 prefill parity = W4A16 batched prefill** (the clean,
+divergence-free path, matching the W4A16 decode quality): dequant the 4-bit weight
+to f16 inline and use f16×f16 WMMA against f16 activations — exactly mq4's
+`gemm_*_hfq4g256_wmma` family (reads f16 X, `a_reg = sc*nib + zp`,
+`wmma_f32_16x16x16_f16_w32`). For OQ4+ this is a 4-kernel port (qkv / qkvza /
+gate_up / residual) with the symmetric split layout (scale-only, sign-extend, no
+zp) + dispatch wiring + is_batchable_la(Oq4G256) un-gating. This avoids the int4-act
+divergence entirely (no act quant) and would match OQ4+ decode quality. Scoped, not
+yet built — decode was the priority and is done.
+
 ## Cross-cutting note
 
 This is **offline-quant** quality work — orthogonal to and cheaper than the
