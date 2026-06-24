@@ -272,11 +272,7 @@ fn gemv_auto_batched_wmma(
                 // i8-MMQ 64×64 dense path (gfx1151): int8 weights direct + Q8_1
                 // activations + i8 WMMA at ~2x. ~1.4-1.56x over the f16 64×64
                 // kernel at the q-LoRA projection shapes (M=4096, batch≥256).
-                if std::env::var("HIPFIRE_DEEPSEEK4_Q8_I8").as_deref() == Ok("1")
-                    && gpu.arch == "gfx1151"
-                    && batch_size % 64 == 0
-                    && k % 128 == 0
-                {
+                if gpu.arch == "gfx1151" && batch_size % 64 == 0 && k % 128 == 0 {
                     return gpu
                         .gemm_q8_0_mmq_4w_gfx1151(weight, x_plain_batch, y, m, k, batch_size)
                         .map_err(|e| format!("gemm_q8_0_mmq_4w_gfx1151: {e:?}"));
