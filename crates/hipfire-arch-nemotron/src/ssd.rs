@@ -118,6 +118,140 @@ pub fn ssd_decode_step(
     }
 }
 
+/// Sequential multi-token reference (N6): run the decode recurrence over
+/// `seq_len` tokens, emitting every per-position output. This is the **ground
+/// truth** the chunked prefill — both the CPU [`ssd_chunked`] decomposition and
+/// the eventual GPU chunk-scan kernel — must match. `state` is updated to the
+/// post-sequence recurrent state (so prefill can hand off to decode).
+///
+/// Layout: `x_seq` `[seq_len * num_heads*head_dim]`, `b_seq`/`c_seq`
+/// `[seq_len * n_groups*state_size]`, `dt_seq` `[seq_len * num_heads]`,
+/// `y_seq` (out) `[seq_len * num_heads*head_dim]` — all position-major.
+#[allow(clippy::too_many_arguments)]
+pub fn ssd_sequence(
+    p: &SsdParams,
+    state: &mut [f32],
+    x_seq: &[f32],
+    b_seq: &[f32],
+    c_seq: &[f32],
+    dt_seq: &[f32],
+    y_seq: &mut [f32],
+) {
+    let (h, dh, n, g) = (p.num_heads, p.head_dim, p.state_size, p.n_groups);
+    let xd = h * dh;
+    let bd = g * n;
+    let seq = x_seq.len() / xd;
+    for t in 0..seq {
+        ssd_decode_step(
+            p,
+            state,
+            &x_seq[t * xd..t * xd + xd],
+            &b_seq[t * bd..t * bd + bd],
+            &c_seq[t * bd..t * bd + bd],
+            &dt_seq[t * h..t * h + h],
+            &mut y_seq[t * xd..t * xd + xd],
+        );
+    }
+}
+
+/// Chunked-SSD scan (N6) — the **parallel-friendly decomposition** of
+/// [`ssd_sequence`], processing the sequence in chunks of `chunk_size`. Within a
+/// chunk the recurrence unrolls into (per head, per `head_dim` channel `p`):
+/// ```text
+///   y_t[p] = exp(S_t)·(C_t · h_in[p])                      # inter-chunk (state)
+///          + Σ_{s≤t} exp(S_t − S_s)·dt_s·(C_t · B_s)·x_s[p] # intra-chunk (L⊙G)
+///          + D·x_t[p]                                       # skip
+///   h_out[p][n] = exp(S_{L-1})·h_in[p][n]
+///               + Σ_s exp(S_{L-1} − S_s)·dt_s·B_s[n]·x_s[p] # carry to next chunk
+/// ```
+/// where `S_t = Σ_{r≤t} dt_r·A` is the cumulative log-decay (A = −exp(A_log)).
+/// Using `exp(S_t − S_s)` (a difference of cumulative SUMS) rather than a product
+/// of `dA` keeps the lower-triangular decay matrix numerically stable for long
+/// chunks. Mathematically identical to the sequential scan; f32 reassociation
+/// makes it match within ~1e-4 (the gpu-vs-cpu validation bar). The GPU kernel
+/// computes the `C·B` Gram and `L` decay matrices as matmuls; this CPU form is
+/// the explicit double-loop oracle.
+#[allow(clippy::too_many_arguments)]
+pub fn ssd_chunked(
+    p: &SsdParams,
+    state: &mut [f32],
+    x_seq: &[f32],
+    b_seq: &[f32],
+    c_seq: &[f32],
+    dt_seq: &[f32],
+    y_seq: &mut [f32],
+    chunk_size: usize,
+) {
+    let (h, dh, n, g) = (p.num_heads, p.head_dim, p.state_size, p.n_groups);
+    let xd = h * dh;
+    let bd = g * n;
+    let seq = x_seq.len() / xd;
+
+    let mut t0 = 0;
+    while t0 < seq {
+        let chunk = chunk_size.min(seq - t0);
+        for head in 0..h {
+            let grp = p.group_of(head);
+            let a = -(p.a_log[head].exp());
+            // per-position dt and inclusive cumulative log-decay S_t = Σ_{r≤t} dt_r·A.
+            let mut dt = vec![0.0f32; chunk];
+            let mut s_cum = vec![0.0f32; chunk];
+            let mut run = 0.0f32;
+            for ti in 0..chunk {
+                let v = softplus(dt_seq[(t0 + ti) * h + head] + p.dt_bias[head])
+                    .clamp(p.dt_min, p.dt_max);
+                dt[ti] = v;
+                run += v * a;
+                s_cum[ti] = run;
+            }
+            let s_end = s_cum[chunk - 1];
+            for pp in 0..dh {
+                let base = (head * dh + pp) * n;
+                // h_in for this (head, channel) — read for all outputs, updated last.
+                let h_in: Vec<f32> = state[base..base + n].to_vec();
+
+                for ti in 0..chunk {
+                    let c_t = &c_seq[(t0 + ti) * bd + grp * n..(t0 + ti) * bd + grp * n + n];
+                    // inter-chunk state term: exp(S_t)·(C_t · h_in)
+                    let mut ch = 0.0f32;
+                    for nn in 0..n {
+                        ch += c_t[nn] * h_in[nn];
+                    }
+                    let mut y = s_cum[ti].exp() * ch;
+                    // intra-chunk: Σ_{s≤t} exp(S_t − S_s)·dt_s·(C_t·B_s)·x_s
+                    for s in 0..=ti {
+                        let l_ts = (s_cum[ti] - s_cum[s]).exp();
+                        let b_s = &b_seq[(t0 + s) * bd + grp * n..(t0 + s) * bd + grp * n + n];
+                        let mut cb = 0.0f32;
+                        for nn in 0..n {
+                            cb += c_t[nn] * b_s[nn];
+                        }
+                        y += l_ts * dt[s] * cb * x_seq[(t0 + s) * xd + head * dh + pp];
+                    }
+                    let x_t = x_seq[(t0 + ti) * xd + head * dh + pp];
+                    y_seq[(t0 + ti) * xd + head * dh + pp] = y + p.d[head] * x_t;
+                }
+
+                // carry state to the next chunk: h_out = exp(S_end)·h_in + intra.
+                let srow = &mut state[base..base + n];
+                let decay_end = s_end.exp();
+                for nn in 0..n {
+                    srow[nn] = decay_end * h_in[nn];
+                }
+                for s in 0..chunk {
+                    let l = (s_end - s_cum[s]).exp();
+                    let b_s = &b_seq[(t0 + s) * bd + grp * n..(t0 + s) * bd + grp * n + n];
+                    let coef = l * dt[s] * x_seq[(t0 + s) * xd + head * dh + pp];
+                    for nn in 0..n {
+                        srow[nn] += coef * b_s[nn];
+                    }
+                }
+            }
+        }
+        t0 += chunk;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +307,92 @@ mod tests {
         assert!((state[0] - expected_h).abs() < 1e-5);
         assert!((state[1] - expected_h).abs() < 1e-5);
         assert!((y[0] - 4.0 * ln2).abs() < 1e-5);
+    }
+
+    // ── chunked-prefill (N6) equivalence: ssd_chunked == ssd_sequence ────────
+
+    /// Deterministic pseudo-random fill in [-0.5, 0.5).
+    fn fill(seed: &mut u32, n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                *seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (*seed >> 8) as f32 / 16_777_216.0 - 0.5
+            })
+            .collect()
+    }
+
+    fn rand_params(seed: &mut u32, h: usize, dh: usize, n: usize, g: usize) -> SsdParams {
+        // A_log small so A = -exp(A_log) is a sane decay; dt bounds match nemotron.
+        SsdParams {
+            num_heads: h,
+            head_dim: dh,
+            state_size: n,
+            n_groups: g,
+            dt_min: 0.0,
+            dt_max: f32::INFINITY,
+            a_log: fill(seed, h).iter().map(|v| v * 0.5).collect(),
+            d: fill(seed, h),
+            dt_bias: fill(seed, h),
+        }
+    }
+
+    /// Run both forms on the same random sequence; assert max-abs agreement.
+    fn assert_chunked_matches(h: usize, dh: usize, n: usize, g: usize, seq: usize, chunk: usize) {
+        let mut seed = 0x00C0FFEEu32 ^ (seq as u32).wrapping_mul(2654435761);
+        let p = rand_params(&mut seed, h, dh, n, g);
+        let xd = h * dh;
+        let bd = g * n;
+        let x = fill(&mut seed, seq * xd);
+        let b = fill(&mut seed, seq * bd);
+        let c = fill(&mut seed, seq * bd);
+        let dt = fill(&mut seed, seq * h);
+
+        let mut st_seq = vec![0.0f32; h * dh * n];
+        let mut y_seq = vec![0.0f32; seq * xd];
+        ssd_sequence(&p, &mut st_seq, &x, &b, &c, &dt, &mut y_seq);
+
+        let mut st_chunk = vec![0.0f32; h * dh * n];
+        let mut y_chunk = vec![0.0f32; seq * xd];
+        ssd_chunked(&p, &mut st_chunk, &x, &b, &c, &dt, &mut y_chunk, chunk);
+
+        let max_y = y_seq
+            .iter()
+            .zip(&y_chunk)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let max_s = st_seq
+            .iter()
+            .zip(&st_chunk)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_y < 1e-3,
+            "y mismatch (seq={seq},chunk={chunk}): max|Δ|={max_y}"
+        );
+        assert!(
+            max_s < 1e-3,
+            "final-state mismatch (seq={seq},chunk={chunk}): max|Δ|={max_s}"
+        );
+    }
+
+    #[test]
+    fn chunked_single_chunk_matches_sequential() {
+        // seq <= chunk → one chunk, no state passing.
+        assert_chunked_matches(4, 8, 16, 2, 12, 256);
+    }
+
+    #[test]
+    fn chunked_multi_chunk_matches_sequential() {
+        // seq spans several chunks → exercises inter-chunk state carry.
+        assert_chunked_matches(4, 8, 16, 2, 200, 64);
+        assert_chunked_matches(6, 5, 8, 3, 257, 256); // crosses the 256 boundary by 1
+    }
+
+    #[test]
+    fn chunked_chunk_size_one_matches_sequential() {
+        // chunk_size=1 degenerates to the per-token scan — the tightest check
+        // that the decomposition's intra/inter split is consistent.
+        assert_chunked_matches(3, 4, 8, 1, 40, 1);
     }
 
     #[test]
