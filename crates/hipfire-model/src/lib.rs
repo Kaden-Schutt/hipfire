@@ -141,6 +141,7 @@ pub const ARCH_ID_DOTS_OCR: u32 = 8;
 pub const ARCH_ID_DEEPSEEK4_FLASH: u32 = 9;
 pub const ARCH_ID_MINIMAX_M2: u32 = 10;
 pub const ARCH_ID_LFM2_MOE: u32 = 11;
+pub const ARCH_ID_NEMOTRON_H: u32 = 14;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModelArchFamily {
@@ -694,7 +695,10 @@ pub fn detect_sidecars(path: &Path) -> Sidecars {
                     .unwrap_or(false)
             };
             nonempty(v.get("chat_template"))
-                || nonempty(v.get("tokenizer_config").and_then(|tc| tc.get("chat_template")))
+                || nonempty(
+                    v.get("tokenizer_config")
+                        .and_then(|tc| tc.get("chat_template")),
+                )
         })
         .unwrap_or(false);
 

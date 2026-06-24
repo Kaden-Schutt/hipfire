@@ -17,6 +17,7 @@
 pub mod attn;
 pub mod block;
 pub mod block_gpu;
+pub mod loader;
 pub mod mlp;
 pub mod model;
 pub mod ssd;

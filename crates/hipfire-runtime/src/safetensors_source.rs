@@ -212,6 +212,11 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
         if arch_lower.contains("llama") || arch_lower.contains("mistral") {
             return 0;
         }
+        // NemotronHForCausalLM (Mamba-2 + attn + MLP hybrid). Match the "H"
+        // hybrid specifically so plain (llama-based) Nemotron isn't caught.
+        if arch_lower.contains("nemotronh") {
+            return 14;
+        }
     }
 
     // Fallback: check model_type
@@ -231,6 +236,7 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
         }
         "qwen3" | "qwen2" => 1,
         "llama" | "mistral" => 0,
+        "nemotron_h" => 14,
         _ => {
             eprintln!(
                 "warning: unknown model_type '{model_type}', defaulting to arch_id=5 (Qwen3.5)"
