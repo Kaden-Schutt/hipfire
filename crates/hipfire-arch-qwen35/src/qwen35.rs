@@ -9446,7 +9446,10 @@ pub fn forward_scratch(
     // launch-overhead-bound, so eliminating per-launch cost nets ~0 (40.6 vs
     // 41.5 tok/s). Not worth the capture complexity. See
     // project_gfx1103_decode_memcpy_bound memory.
-    let use_graph = false;
+    // EXPERIMENT (2026-06-24): re-enable AR-forward hipGraph behind HIPFIRE_GRAPH=1
+    // (default still OFF) to A/B mq4+ vs OQ4+/OQ8+ capture-safety + perf. The
+    // 2026-05-15 hard-disable stays the default (use_graph=false unless opted in).
+    let use_graph = graph_override.unwrap_or(false);
     let _ = (graph_enabled, allow_moe, gpu.ar_forward_replay_enabled); // suppress unused warnings
 
     // Embedding lookup into scratch.x (always direct, changes per token)

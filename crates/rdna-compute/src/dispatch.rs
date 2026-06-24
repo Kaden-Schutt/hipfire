@@ -45714,17 +45714,20 @@ impl Gpu {
             &mut ki as *mut _ as *mut c_void,
             &mut gi as *mut _ as *mut c_void,
         ];
-        let func = &self.functions["gemv_oq4_grouped"];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        // Capture-safe launch (mirrors mq4 gemv_hfq4g256): under hipGraph capture
+        // use a heap KernargBlob (kept alive in capture_blobs, 16B-padded) instead
+        // of stack kernargs that would not survive replay.
+        self.launch_maybe_blob("gemv_oq4_grouped", [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(wp);
+            b.push_ptr(wsp);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_i32(mi);
+            b.push_i32(ki);
+            b.push_i32(gi);
+            b
+        })
     }
 
     /// OQ4+ batched PREFILL: W4A16 grouped GEMM. `x` is the f32 FWHT(+AWQ)-rotated
@@ -45813,17 +45816,18 @@ impl Gpu {
             &mut ki as *mut _ as *mut c_void,
             &mut gi as *mut _ as *mut c_void,
         ];
-        let func = &self.functions["gemv_oq8_grouped"];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        // Capture-safe launch (mirrors mq4 gemv_hfq4g256) — see gemv_oq4_grouped.
+        self.launch_maybe_blob("gemv_oq8_grouped", [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(wp);
+            b.push_ptr(wsp);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_i32(mi);
+            b.push_i32(ki);
+            b.push_i32(gi);
+            b
+        })
     }
 
     /// KVarN tile quantizer: variance-normalize (Sinkhorn) + 4-bit affine + pack
@@ -46627,10 +46631,26 @@ impl Gpu {
             &mut gi as *mut _ as *mut c_void,
         ];
         let grid_x = (qkv_m + z_m + beta_m + alpha_m) as u32;
-        let func = &self.functions["fused_qkvza_oq8_gemv"];
-        unsafe {
-            self.hip.launch_kernel(func, [grid_x, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
-        }
+        // Capture-safe launch (mirrors mq4 fused_qkvza_hfq4g256).
+        self.launch_maybe_blob("fused_qkvza_oq8_gemv", [grid_x, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(p_wqkv);
+            b.push_ptr(p_wz);
+            b.push_ptr(p_wbeta);
+            b.push_ptr(p_walpha);
+            b.push_ptr(p_x);
+            b.push_ptr(p_yqkv);
+            b.push_ptr(p_yz);
+            b.push_ptr(p_ybeta);
+            b.push_ptr(p_yalpha);
+            b.push_i32(qm);
+            b.push_i32(zm);
+            b.push_i32(bm);
+            b.push_i32(am);
+            b.push_i32(ki);
+            b.push_i32(gi);
+            b
+        })
     }
 
     /// OQ+ (W8A8) fused Gate+Up DECODE (B=1): one wave32 per output row, blockIdx
@@ -46677,10 +46697,20 @@ impl Gpu {
             &mut gi as *mut _ as *mut c_void,
         ];
         let grid_x = (gate_m + up_m) as u32;
-        let func = &self.functions["fused_gate_up_oq8_gemv"];
-        unsafe {
-            self.hip.launch_kernel(func, [grid_x, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
-        }
+        // Capture-safe launch (mirrors mq4 fused_gate_up_hfq4g256).
+        self.launch_maybe_blob("fused_gate_up_oq8_gemv", [grid_x, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(wgp);
+            b.push_ptr(wup);
+            b.push_ptr(xp);
+            b.push_ptr(ygp);
+            b.push_ptr(yup);
+            b.push_i32(gmi);
+            b.push_i32(umi);
+            b.push_i32(ki);
+            b.push_i32(gi);
+            b
+        })
     }
 
     pub fn fused_qkvza_oq4_wmma(
