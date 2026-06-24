@@ -216,6 +216,11 @@ pub struct LoadedModel {
     /// Owns its own config/weights/scratch/KV; the separate `llama_*` fields above
     /// stay `None` on the backend path. P3.2.
     pub llama_backend: Option<hipfire_arch_llama::LlamaBackend>,
+    /// Assembled nemotron_h serving backend (arch_id 14), driven through the
+    /// shared `ServingBackend::serve` seam. `NemotronModel` owns its own
+    /// weights + per-block recurrent/KV state; there are no separate
+    /// `nemotron_*` Option fields. N5b.
+    pub nemotron_backend: Option<hipfire_arch_nemotron::model::NemotronModel>,
     // Qwen2 state (arch_id=7 — hipfire-arch-qwen2 standalone). The
     // KV cache lives inside Qwen2State, so there's no separate
     // qwen2_kv field. None on every other arch path.

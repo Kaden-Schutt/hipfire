@@ -37,7 +37,8 @@ use crate::evidence::{
 #[cfg(feature = "arch-lfm2moe")]
 use crate::generate_arch::generate_lfm2moe;
 use crate::generate_arch::{
-    generate_deepseek4, generate_gemma3, generate_llama, generate_minimax, generate_qwen2,
+    generate_deepseek4, generate_gemma3, generate_llama, generate_minimax, generate_nemotron,
+    generate_qwen2,
 };
 use crate::model::{effective_raw, LoadedModel};
 use crate::output_filter::chat_output_filter;
@@ -1881,6 +1882,35 @@ pub fn generate(
             prefill_already_done,
         );
         generate_llama(
+            m,
+            gpu,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            temp,
+            top_p,
+            max_tokens,
+            repeat_penalty,
+            repeat_window,
+            max_think_tokens,
+            assistant_prefix,
+            tools,
+            messages_history,
+        );
+        return;
+    }
+    if m.arch_id == 14 {
+        // nemotron_h — routed through the ServingBackend seam (N5b), same dense-AR
+        // path as llama. Fast paths (DFlash/MTP/tools-execution) not on this path.
+        let _ = (
+            budget_alert_at_tok,
+            budget_alert_text,
+            pflash_state,
+            pflash_cfg,
+            prefill_already_done,
+        );
+        generate_nemotron(
             m,
             gpu,
             stdout,

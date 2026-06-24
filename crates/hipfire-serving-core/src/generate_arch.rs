@@ -1152,6 +1152,150 @@ pub fn generate_qwen2(
 /// `generate()` applied — then prefills those tokens and runs the shared
 /// `decode_loop` (full temperature/top-p sampling via P3.3). Fast paths
 /// (DFlash/MTP/tools-execution) are out of scope here; correctness first.
+/// nemotron_h (arch_id 14) generate path — the same dense-AR `ServingBackend`
+/// seam as `generate_llama`, driving the `NemotronModel` backend. Frames the
+/// prompt (jinja `chat_template` when `HIPFIRE_JINJA_CHAT=1`, else the
+/// hand-rolled `ChatFrame`), prefills the framed tokens (which builds the
+/// per-block Mamba conv/SSM + attention KV state), then runs the shared
+/// `decode_loop`. Fast paths are out of scope; correctness first.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_nemotron(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    max_think_tokens: usize,
+    assistant_prefix: prompt_frame::AssistantPrefix,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[prompt_frame::Message]>,
+) {
+    if m.tokenizer.is_none() {
+        emit_error_with_id(stdout, id, "tokenizer not loaded".to_string());
+        return;
+    }
+    if m.nemotron_backend.is_none() {
+        emit_error_with_id(
+            stdout,
+            id,
+            "nemotron backend not loaded (arch 14 not active)".to_string(),
+        );
+        return;
+    }
+
+    // Frame the prompt up front (releases the shared `m` borrows before the
+    // backend `&mut` borrow below). Same scaffold as generate_llama.
+    let raw = effective_raw(m);
+    let prompt_tokens: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let try_jinja = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1")
+            && m.chat_template.is_some();
+        if try_jinja {
+            let template = m.chat_template.as_ref().unwrap();
+            let frame = prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: system_prompt,
+                user: prompt,
+                enable_thinking: max_think_tokens != 1,
+                bos_token: None,
+            };
+            let rendered = if tools.is_some() || messages_history.is_some() {
+                let synthesized: Vec<prompt_frame::Message>;
+                let messages_slice: &[prompt_frame::Message] = match messages_history {
+                    Some(mh) => mh,
+                    None => {
+                        let mut v = Vec::new();
+                        if let Some(sys) = system_prompt {
+                            v.push(prompt_frame::Message {
+                                role: prompt_frame::Role::System,
+                                content: sys.to_string(),
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                            });
+                        }
+                        v.push(prompt_frame::Message {
+                            role: prompt_frame::Role::User,
+                            content: prompt.to_string(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                        });
+                        synthesized = v;
+                        &synthesized
+                    }
+                };
+                frame.render_messages(messages_slice, tools, None)
+            } else {
+                frame.render()
+            };
+            match rendered {
+                Ok(text) => tokenizer.encode(&text),
+                Err(e) => {
+                    eprintln!("[daemon] nemotron jinja render failed ({e}) — Plain fallback");
+                    prompt_frame::ChatFrame {
+                        tokenizer,
+                        system: system_prompt,
+                        user: prompt,
+                        assistant_prefix,
+                        raw,
+                    }
+                    .build()
+                }
+            }
+        } else {
+            prompt_frame::ChatFrame {
+                tokenizer,
+                system: system_prompt,
+                user: prompt,
+                assistant_prefix,
+                raw,
+            }
+            .build()
+        }
+    };
+    if prompt_tokens.is_empty() {
+        emit_error_with_id(stdout, id, "empty prompt after framing".to_string());
+        return;
+    }
+
+    let tok = m.tokenizer.as_ref().unwrap();
+    let backend = m.nemotron_backend.as_mut().unwrap();
+    let eos = backend.eos_token();
+
+    if let Err(e) = SimpleAr::prefill(backend, gpu, &prompt_tokens) {
+        emit_error_with_id(stdout, id, format!("nemotron prefill: {e}"));
+        return;
+    }
+    let n = prompt_tokens.len();
+    let no_images: [&[u8]; 0] = [];
+    let mut ctx = GenerateCtx {
+        id,
+        prompt: "", // unused: prefill already consumed the framed tokens
+        temperature: temp,
+        top_p,
+        max_tokens,
+        repeat_penalty,
+        repeat_window,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        max_think_tokens: 0,
+        stop_sequences: &[],
+        images: &no_images,
+        sink: stdout,
+    };
+    let result = decode_loop(gpu, backend, tok, eos, &mut ctx, n, n);
+    drop(ctx);
+    if let Err(e) = result {
+        emit_error_with_id(stdout, id, format!("nemotron decode: {e}"));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn generate_llama(
     m: &mut LoadedModel,

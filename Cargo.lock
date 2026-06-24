@@ -1767,6 +1767,7 @@ dependencies = [
  "hipfire-arch-lfm2moe",
  "hipfire-arch-llama",
  "hipfire-arch-minimax",
+ "hipfire-arch-nemotron",
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
