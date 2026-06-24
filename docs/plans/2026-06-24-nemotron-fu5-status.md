@@ -11,11 +11,11 @@ ReLU²-MLP hybrid).
 | FU | Title | State |
 |----|-------|-------|
 | FU2 | HF-reference numeric bisect | **DONE** (committed earlier) |
-| FU3 | quantizer → nemotron_h mq4 .hfq | **DONE** |
+| FU3 | quantizer → nemotron_h mq4/q8 .hfq | **DONE** |
 | FU4 | loader compat (load .hfq + quantized gemv) + serving | **DONE** |
 | FU5 | N6 batched prefill + q8 SSM state | **mostly done** — q8 state + benchmarks remain |
 | FU6 | Nano-30B MoE ('E' block) | not started |
-| FU1 | chat-template / coherence | blocked (newline attractor; EOS/Jinja/CLI controls fixed; valid CUDA/vLLM ref needed) |
+| FU1 | chat-template / coherence | blocked (EOS/Jinja/CLI controls fixed; q8 matches f32 but generation still lacks a coherent reference) |
 
 ## FU1 update (2026-06-25)
 
@@ -40,13 +40,23 @@ Validation on gfx1151 still reproduces the FU1 blocker:
 - HF tokenizer rendering is byte/ID-identical to Hipfire for reasoning-off
   ChatML (`[10,25708,1010,11,...,12,13]` for the 2+2 prompt).
 - Local HF pure-Torch fallback (with `mamba_ssm` stubs and trained `dt_bias`
-  restored from safetensors) also generated newline-only output for the same
-  prompt: `new_ids = [1010 x16]`.
+  restored from safetensors) matches Hipfire f32 at the first-token boundary for
+  the same prompt: top-2 are `<|im_end|>` id 11 then newline id 1010.
+- `/tmp/nano4b-mq4.hfq` flips that close f32 boundary to newline:
+  f32 argmax=11, mq4 argmax=1010, logit cosine 0.989951, top-5 overlap 4/5.
+- `/tmp/nano4b-q8.hfq` tracks f32: argmax=11, identical top-5, logit cosine
+  0.999967, mean|delta|=0.01770, max|delta|=0.11181.
+- Q8 serving therefore avoids the newline loop on the closed-think 2+2 prompt,
+  but greedy generation emits 0 tokens because the first token is `<|im_end|>`.
+  A reasoning-on sampled haiku prompt still produced incoherent numeric text.
 
-So FU1 is no longer "do the chat-template work." What remains is to get a valid
-reference path for this checkpoint (CUDA/mamba-ssm, vLLM, or another NVIDIA
-runtime) or otherwise prove the correct generation convention. The ROCm
-pure-Torch fallback is not a coherence oracle.
+So FU1 is no longer "do the chat-template work." The immediate conclusion is
+that mq4 is too lossy for this uncalibrated Nano-4B artifact at a close
+generation boundary; q8 is numerically faithful but still does not prove
+coherent serving. What remains is to get a valid reference path for this
+checkpoint (CUDA/mamba-ssm, vLLM, or another NVIDIA runtime) or otherwise prove
+the correct generation convention. The ROCm pure-Torch fallback is useful for
+first-token diagnostics, but not a coherence oracle.
 
 ## FU4 (DONE, committed)
 
@@ -138,21 +148,25 @@ introduces a new **'E' (MoE) block**: `BlockKind::Moe` + `NemotronMoeGpu` (route
 
 ## FU1 (coherence) — standing blocker
 
-Daemon generation produces a newline attractor. Forward NUMERICS are validated
-(FU4 cos 0.99; FU5 prefill==decode), and the concrete EOS/Jinja/thinking-control
-work is done. The remaining blocker is reference quality: Nemotron-H needs
-`mamba_ssm` CUDA kernels for the intended HF fast path, while the local ROCm
-pure-Torch fallback also emits newline-only output and therefore cannot be used
-as a coherence oracle.
+Daemon generation with the original mq4 artifact produces a newline attractor;
+the q8 artifact follows f32 and stops immediately on the closed-think 2+2 prompt.
+Forward numerics are validated (FU4/FU5 prefill==decode, q8-vs-f32 cosine
+0.999967), and the concrete EOS/Jinja/thinking-control work is done. The
+remaining blocker is reference quality: Nemotron-H needs `mamba_ssm` CUDA
+kernels for the intended HF fast path, while the local ROCm pure-Torch fallback
+can only serve as a first-token diagnostic, not as a coherence oracle.
 
 Next useful FU1 work:
 
 1. Capture a valid CUDA/vLLM/NVIDIA-runtime reference for Nano-4B on 3-4 prompts,
    including the exact rendered ChatML IDs and first generated token logits.
-2. Compare Hipfire against that reference at the generation boundary. If the
-   reference is coherent, bisect the first divergence against the already-added
-   per-layer/block hooks.
-3. Only after a coherent reference exists, tune sampling/repeat penalties or
+2. Compare Hipfire f32/q8 against that reference at the generation boundary. If
+   the reference is coherent, bisect the first divergence against the already
+   added per-layer/block hooks.
+3. Treat mq4 Nano-4B as a sensitivity issue until calibrated: either promote
+   recurrence-adjacent projection-back weights to q8 for this arch, or run an
+   imatrix/AWQ/Lloyd pass before claiming mq4 coherence.
+4. Only after a coherent reference exists, tune sampling/repeat penalties or
    prompt policy. Current prompt/EOS-only changes do not fix the blocker.
 
 ## Validation entry points (all gpu-tcas-coordinated via `hipfire lock`)

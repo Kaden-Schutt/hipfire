@@ -1,9 +1,11 @@
 # Nemotron-H follow-ups + quantized-serving roadmap
 
 Status as of 2026-06-25: **nemotron_h (Nano-4B) serves end-to-end** (arch_id 14,
-loads and streams tokens), but coherent chat output remains blocked by the FU1
-newline attractor — see `docs/plans/2026-06-24-nemotron-fu5-status.md` for the
-current evidence and `docs/plans/2026-06-24-nemotron-h-mamba2.md` for N0–N5.
+loads and streams tokens), but coherent chat output remains blocked by FU1. The
+original mq4 artifact flips a close f32/q8 `<|im_end|>` boundary into a newline
+loop; q8 tracks f32 but still stops immediately or samples incoherently without a
+valid external reference. See `docs/plans/2026-06-24-nemotron-fu5-status.md` for
+the current evidence and `docs/plans/2026-06-24-nemotron-h-mamba2.md` for N0–N5.
 This doc plans the six follow-ups, each self-contained and grounded in the
 current code/checkpoints. Effort tags: **S** ≈ hours, **M** ≈ 1–2 days, **L** ≈
 several days.
@@ -32,10 +34,11 @@ live code: arch 14 resolves EOS from tokenizer `<|im_end|>`, Jinja is the defaul
 when the embedded template exists, and `hipfire chat` forwards thinking-off
 controls (`closed_think`, `max_think_tokens = 1`) just like the HTTP path.
 
-This did **not** resolve coherence. Current `target/debug/hipfire-daemon` still
-emits newline-only output for Nano-4B, and the local HF pure-Torch fallback with
-trained `dt_bias` restored also emits newline-only output for the same
-byte-identical prompt. Treat the remaining FU1 task as "obtain a valid
+This did **not** resolve coherence. Current `target/debug/hipfire-daemon` with
+the original mq4 Nano-4B artifact emits newline-only output. A q8 artifact tracks
+f32 at the first-token boundary and avoids the newline loop, but greedy
+closed-think generation stops immediately and a sampled reasoning-on prompt is
+still incoherent. Treat the remaining FU1 task as "obtain a valid
 CUDA/vLLM/NVIDIA-runtime reference and compare generation," not as another
 chat-template tweak.
 
@@ -126,7 +129,8 @@ serves at ~4 GB instead of ~16 GB f32.
      mixer/gated norm), `backbone.norm_f.weight`.
 3. **Sensitivity:** the Mamba-2 `in_proj` drives dt/B/C — consider a higher-bit
    group or imatrix calibration (the `astrea` skill) for `in_proj`/`out_proj`
-   before trusting mq4 there.
+   before trusting mq4 there. Current local evidence says uncalibrated mq4 is too
+   noisy at the first generated token for Nano-4B, while q8 matches f32.
 
 **Reuse.** The existing quantize codecs/mq4 pipeline; per-arch name-pattern skip
 logic.
