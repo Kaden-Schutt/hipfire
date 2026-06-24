@@ -24,15 +24,15 @@ fn main() {
     let mut gpu = Gpu::init().expect("GPU init failed");
     eprintln!("GPU: {}", gpu.arch);
 
-    // Small but structurally faithful: 4 heads × 8 head_dim (d_inner=32),
-    // state 16, 2 groups, K=4. hidden 32. group_size = 32/2 = 16.
-    // NOTE: hidden_size and d_inner are powers of two so the gemv_f32
-    // block-reduction (which requires power-of-two blockDim for K<256) is
-    // exact — see the non-pow2 gemv_f32 caveat noted during N3 bring-up.
+    // Small but structurally faithful, with deliberately NON-power-of-two
+    // hidden_size (24) and d_inner (4×10=40) so both gemv_f32 calls take K<256
+    // non-pow2 — exercising the gemv_f32 block-reduction pow2-rounding fix
+    // (these dims produced a ~7% mismatch before that fix). state 16, 2 groups,
+    // K=4, group_size = 40/2 = 20.
     let dims = Mamba2Dims {
-        hidden_size: 32,
+        hidden_size: 24,
         num_heads: 4,
-        head_dim: 8,
+        head_dim: 10,
         state_size: 16,
         n_groups: 2,
         conv_kernel: 4,

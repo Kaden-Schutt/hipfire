@@ -137,8 +137,12 @@ impl Gpu {
             &mut beta_val as *mut _ as *mut c_void,
         ];
 
-        // One block per row, 256 threads per block with shared memory reduction
-        let block_size = 256u32.min(k as u32);
+        // One block per row, up to 256 threads per block with a shared-memory
+        // tree reduction. The reduction (`for s = blockDim/2; s>0; s>>=1`)
+        // requires a POWER-OF-TWO blockDim, else it silently drops an element;
+        // round up to the next pow2 (≤256). Threads with tid≥K contribute 0
+        // (the strided sum loop guards `k < K`), so over-launching is safe.
+        let block_size = (k as u32).min(256).next_power_of_two();
         let shared_mem = block_size * 4; // one float per thread
         let bytes = (m as usize) * (k as usize) * 4 + (k as usize) * 4 + (m as usize) * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_f32", bytes);
