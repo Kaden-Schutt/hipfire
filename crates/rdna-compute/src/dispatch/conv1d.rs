@@ -116,6 +116,63 @@ impl Gpu {
         }
     }
 
+    /// Mamba-2 xBC short-conv **prefill** scan (N6): process a whole `seq_len`
+    /// prompt in one launch (vs `seq_len` `conv1d_bias_silu_decode_f32` launches),
+    /// advancing `state` in place to the last K-1 inputs for the decode hand-off.
+    /// Bit-faithful to the decode kernel repeated. See
+    /// `kernels/src/conv1d_bias_silu_seq.hip`.
+    ///
+    /// - `output` (out): `[seq_len * n_channels]`
+    /// - `input`: `[seq_len * n_channels]`
+    /// - `weight`: `[4 * n_channels]`, `bias`: `[n_channels]`
+    /// - `state`: `[n_channels * 3]` (in/out)
+    pub fn conv1d_bias_silu_seq_f32(
+        &mut self,
+        output: &GpuTensor,
+        input: &GpuTensor,
+        weight: &GpuTensor,
+        bias: &GpuTensor,
+        state: &GpuTensor,
+        seq_len: usize,
+        n_channels: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "conv1d_bias_silu_seq",
+            kernels::CONV1D_BIAS_SILU_SEQ_SRC,
+            "conv1d_bias_silu_seq_f32",
+        )?;
+        let op = output.buf.as_ptr();
+        let ip = input.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let bp = bias.buf.as_ptr();
+        let sp = state.buf.as_ptr();
+        let sl = seq_len as i32;
+        let nc = n_channels as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &op as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &sl as *const _ as *mut c_void,
+            &nc as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = (n_channels as u32).div_ceil(block);
+        let func = &self.functions["conv1d_bias_silu_seq_f32"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// LFM2 LIV double-gated short-conv, single-token decode. Reads the in_proj
     /// output `bcx` [batch, 3*channels] (B | C_gate | x layout), applies the
     /// B*x pre-gate, runs the depthwise causal conv over the rolling `state`
