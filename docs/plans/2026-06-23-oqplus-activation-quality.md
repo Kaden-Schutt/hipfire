@@ -253,10 +253,16 @@ retired). Opt out with `=0`.
 - Parity vs CPU W4A16 oracle: max_abs 0.03% (PASS). Coherent: the server
   batched-prefill path (`forward_prefill_batch`) emits fluent on-topic output;
   numerically equivalent to the coherent W4A16 decode.
-- **Still 3.6× behind mq4+** (1586.8): that gap is kernel optimization — mq4 has
-  3-way qkv fusion + K2-unroll/software-pipelining (`gemm_qkv_hfq4g256_wmma`); the
-  OQ4+ kernel is a simple per-projection grouped WMMA. Porting those optimizations
-  is the remaining prefill lever.
+- **K2-unroll + software pipelining (commits 866c55d6 + fix 55d9df52):** issuing
+  both tiles' weight+act loads up front so loads overlap the WMMA took prefill
+  **436.7 → 1278.4 tok/s (2.9×), now 81% of mq4+** (1586.8); decode 56.7. Parity
+  0.03%, coherent. (NB: 866c55d6's DEQ16 macro had a vector-to-pointer compile
+  bug — the .hip JIT-compiles at runtime so the Rust build passed but it'd panic
+  on first use; 55d9df52 fixes it. The interim "1106" was a stale-cache reading.)
+  K4-unroll was tried and REVERTED — register pressure dropped occupancy (494 tok/s).
+- **Remaining ~1.24× to mq4+:** mq4 uses an MMQ/dp4a (int8) backend +
+  multi-projection fusion (204 vs 372 launches). Porting those is the next lever;
+  the f16-WMMA path shipped is the correct + coherent baseline.
 
 **Harness note:** single-prompt **chat/eval prefill is per-token** by design
 (`forward_scratch`; trace shows `gemv_oq4_grouped` ×130946, batched kernel ×0) —
