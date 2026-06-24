@@ -110,8 +110,8 @@ impl MlpRelu2Gpu {
     /// Batched prefill: `out[seq, hidden] = down @ relu2(up @ x)` over a whole
     /// prompt. MLP is position-independent, so it equals `forward` per position;
     /// `relu2_f32` is elementwise (works on `[seq*intermediate]`). Returns the
-    /// `[seq * hidden]` output; scratch is allocated per call. F32 weights only
-    /// (see [`crate::weight::LinearWeight::gemm_seq`]).
+    /// `[seq * hidden]` output; scratch is allocated per call. F32 and supported
+    /// HFQ/MQ/Q8 weights route through [`crate::weight::LinearWeight::gemm_seq`].
     pub fn prefill(&mut self, gpu: &mut Gpu, x: &GpuTensor, seq: usize) -> HipResult<GpuTensor> {
         let u = gpu.zeros(&[seq * self.intermediate], DType::F32)?;
         let a = gpu.zeros(&[seq * self.intermediate], DType::F32)?;

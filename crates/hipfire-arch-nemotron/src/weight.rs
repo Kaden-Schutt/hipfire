@@ -15,7 +15,7 @@ use hip_bridge::{HipError, HipResult};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_runtime::weights::WeightTensor;
-use rdna_compute::{Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// A `[out, in]` linear weight, plain-f32 or quantized.
 pub enum LinearWeight {
@@ -48,10 +48,10 @@ impl LinearWeight {
     }
 
     /// Batched prefill matmul: `out[seq, m] = x[seq, k] · Wᵀ` (W stored `[m, k]`,
-    /// like the gemv path). F32 uses `gemm_f32_train` with `trans_b`. The
-    /// quantized batched-gemm path is not yet wired — the prefill integration
-    /// validates the F32 floor first; quantized prefill falls back to the
-    /// per-token decode loop until the batched quant gemm lands.
+    /// like the gemv path). F32 uses `gemm_f32_train` with `trans_b`; quantized
+    /// weights route through the existing batched GEMM kernels. MQ4G256
+    /// pre-rotates the whole `[seq, k]` activation once, then reuses the HFQ4G256
+    /// GEMM because MQ4 weights are stored in the same rotated HFQ4 layout.
     pub fn gemm_seq(
         &self,
         gpu: &mut Gpu,
@@ -67,10 +67,31 @@ impl LinearWeight {
                 // from stored W[m,k] (trans_b, ldb=k).
                 gpu.gemm_f32_train(x, w, out, seq, m, k, k, k, false, true)
             }
-            LinearWeight::Quant(_) => Err(HipError::new(
-                0,
-                "nemotron prefill: quantized batched gemm not yet wired",
-            )),
+            LinearWeight::Quant(wt) => {
+                debug_assert_eq!(wt.m, m);
+                debug_assert_eq!(wt.k, k);
+                match wt.gpu_dtype {
+                    DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(&wt.buf, x, out, m, k, seq),
+                    DType::HFQ4G256 => gpu.gemm_hfq4g256(&wt.buf, x, out, m, k, seq),
+                    DType::HFQ4G128 => gpu.gemm_hfq4g128(&wt.buf, x, out, m, k, seq),
+                    DType::MQ4G256 => {
+                        let x_rot = gpu.zeros(&[seq * k], DType::F32)?;
+                        let res = (|| {
+                            if let Some(awq) = wt.awq_scale.as_ref() {
+                                gpu.rotate_x_mq_awq_batched(x, awq, &x_rot, k, seq)?;
+                            } else {
+                                gpu.rotate_x_mq_batched(x, &x_rot, k, seq)?;
+                            }
+                            gpu.gemm_hfq4g256(&wt.buf, &x_rot, out, m, k, seq)
+                        })();
+                        let _ = gpu.free_tensor(x_rot);
+                        res
+                    }
+                    other => Err(HipError::unsupported(&format!(
+                        "nemotron prefill: no quantized batched gemm for {other:?}"
+                    ))),
+                }
+            }
         }
     }
 

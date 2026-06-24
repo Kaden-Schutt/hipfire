@@ -75,10 +75,9 @@ enum Block {
 /// GPU-resident nemotron_h model (decode forward).
 pub struct NemotronModel {
     cfg: NemotronHConfig,
-    /// Whether the batched N6 prefill path can run: true for f32 weights
-    /// (`new`), false for the HFQ path (`from_hfq`) until the quantized batched
-    /// gemm (`LinearWeight::gemm_seq` Quant arm) is wired — quant models keep the
-    /// per-token prefill loop.
+    /// Whether the batched N6 prefill path can run. Both f32 and the supported
+    /// HFQ linear formats use [`LinearWeight::gemm_seq`]; unsupported future
+    /// quant dtypes fail there with a classifiable capability-gap error.
     batched_prefill: bool,
     embeddings: EmbeddingTable,
     layer_norm: Vec<GpuTensor>,
@@ -293,7 +292,7 @@ impl NemotronModel {
             h: gpu.zeros(&[hidden], DType::F32).map_err(e)?,
             normed: gpu.zeros(&[hidden], DType::F32).map_err(e)?,
             logits: gpu.zeros(&[vocab], DType::F32).map_err(e)?,
-            batched_prefill: false,
+            batched_prefill: true,
             cfg,
         })
     }

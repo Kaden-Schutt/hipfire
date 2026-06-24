@@ -262,8 +262,8 @@ impl Mamba2BlockGpu {
     /// strided split → conv1d-seq → strided split → ssd-seq → gated-norm-seq →
     /// gemm out_proj, so it is equivalent to running `decode_step` over the
     /// tokens (validated gpu-vs-cpu in `examples/test_block_prefill_gpu.rs`).
-    /// Scratch is allocated per call. F32 weights only for now (the quantized
-    /// batched gemm is a follow-up — see [`LinearWeight::gemm_seq`]).
+    /// Scratch is allocated per call. F32 and supported HFQ/MQ/Q8 weights route
+    /// through [`LinearWeight::gemm_seq`].
     pub fn prefill(
         &mut self,
         gpu: &mut Gpu,

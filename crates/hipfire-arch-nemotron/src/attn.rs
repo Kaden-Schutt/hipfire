@@ -189,10 +189,11 @@ impl NemotronAttnGpu {
     /// 0. q/k/v projected batched, k/v written contiguously into the (pos-major)
     /// cache, then one causal-masked GQA flash over all queries (NoPE), then
     /// o_proj. Leaves the cache populated for positions `0..seq` so a subsequent
-    /// `forward(pos=seq)` continues. Returns `[seq * hidden]`. F32 weights only
-    /// (see [`crate::weight::LinearWeight::gemm_seq`]); scratch allocated per
-    /// call. Single-block masked flash (`block_cols = seq`) — adequate for normal
-    /// prompt lengths; chunked blocking for very long prompts is a follow-up.
+    /// `forward(pos=seq)` continues. Returns `[seq * hidden]`. F32 and supported
+    /// HFQ/MQ/Q8 weights route through [`crate::weight::LinearWeight::gemm_seq`];
+    /// scratch allocated per call. Single-block masked flash (`block_cols = seq`)
+    /// is adequate for normal prompt lengths; chunked blocking for very long
+    /// prompts is a follow-up.
     pub fn prefill(&mut self, gpu: &mut Gpu, x: &GpuTensor, seq: usize) -> HipResult<GpuTensor> {
         const F32B: usize = std::mem::size_of::<f32>();
         let q_dim = self.cfg.num_heads * self.cfg.head_dim;
