@@ -4,7 +4,7 @@
 .SH NAME
 hipfire\-chat \- Load a model and generate a response (one\-shot)
 .SH SYNOPSIS
-\fBhipfire\-chat\fR [\fB\-m\fR|\fB\-\-model\fR] [\fB\-\-max\-tokens\fR] [\fB\-\-temperature\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROMPT\fR> 
+\fBhipfire\-chat\fR [\fB\-m\fR|\fB\-\-model\fR] [\fB\-\-max\-tokens\fR] [\fB\-\-temperature\fR] [\fB\-\-attach\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROMPT\fR> 
 .SH DESCRIPTION
 Load a model and generate a response (one\-shot)
 .SH OPTIONS
@@ -17,6 +17,9 @@ Max tokens to generate
 .TP
 \fB\-\-temperature\fR \fI<TEMPERATURE>\fR
 Sampling temperature
+.TP
+\fB\-\-attach\fR \fI<FILE>\fR
+Attach a file to the prompt (repeatable). The type is detected from the extension. Only images are wired today (PNG/JPEG/WebP/GIF/BMP); text, video, and audio are recognized but not yet supported and will error
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help

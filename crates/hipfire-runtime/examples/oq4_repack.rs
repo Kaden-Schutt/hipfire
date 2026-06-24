@@ -37,6 +37,20 @@ use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqFile, HfqMemTensor};
 /// Canonical (general, portable) on-disk OQ4 quant_type.
 const CANONICAL_OQ4_QT: u8 = 34;
 
+/// Best-effort live GPU arch probe (e.g. "gfx1103"). Read-only
+/// `hipGetDeviceProperties` on device 0 — no GPU lock, no compute context, so it
+/// coexists with a running daemon. Returns `None` if HIP can't be loaded or no
+/// device is present (then the caller requires an explicit `--arch`).
+fn probe_gpu_arch() -> Option<String> {
+    let hip = hip_bridge::HipRuntime::load().ok()?;
+    let arch = hip.get_arch(0).ok()?;
+    if arch.starts_with("gfx") {
+        Some(arch)
+    } else {
+        None
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut input: Option<PathBuf> = None;
@@ -72,12 +86,32 @@ fn main() {
         eprintln!("usage: oq4_repack <in.hfq> [-o <out.hfq>] [--arch <gfx>]");
         std::process::exit(2);
     });
+
+    // Resolve the target arch: explicit --arch wins; otherwise probe the live
+    // GPU (a read-only hipGetDeviceProperties — no GPU lock, no compute context).
+    // This is just a device-name query, so it coexists with a running daemon.
+    let arch = arch.unwrap_or_else(|| match probe_gpu_arch() {
+        Some(a) => {
+            eprintln!("detected GPU arch: {a} (override with --arch)");
+            a
+        }
+        None => {
+            eprintln!(
+                "could not detect a GPU arch; pass --arch <gfx> (e.g. --arch gfx1103)"
+            );
+            std::process::exit(2);
+        }
+    });
+
+    // Default output is arch-tagged beside the input: `<stem>.<arch>.hfq`
+    // (e.g. qwen3.5-0.8b-oq4+.hfq -> qwen3.5-0.8b-oq4+.gfx1103.hfq). file_stem
+    // strips only the trailing `.hfq`, so dotted model versions survive.
     let output = output.unwrap_or_else(|| {
         let stem = input
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "model".into());
-        input.with_file_name(format!("{stem}-packed.hfq"))
+        input.with_file_name(format!("{stem}.{arch}.hfq"))
     });
 
     // Index-only open: parse header/index without mmapping (let alone paging in)
@@ -100,13 +134,12 @@ fn main() {
         std::process::exit(1);
     }
 
-    if let Some(a) = &arch {
-        // Informational for now: the combined layout is identical across current
-        // RDNA/CDNA arches, so quant_type 37 is portable among them. The flag is
-        // the hook for future per-arch layouts (group size / interleave width),
-        // at which point a distinct arch will take a distinct quant_type code.
-        eprintln!("note: --arch {a} recorded; combined layout v1 is arch-independent (qt {OQ4_ARCH_PACKED_QT})");
-    }
+    // Informational for now: the combined layout is identical across current
+    // RDNA/CDNA arches, so quant_type 37 is portable among them — the arch only
+    // tags the output name. The flag/probe is the hook for future per-arch
+    // layouts (group size / interleave width), at which point a distinct arch
+    // will take a distinct quant_type code (and a header arch-gate at load).
+    eprintln!("packing for {arch} (combined layout v1, qt {OQ4_ARCH_PACKED_QT})");
 
     let infos: Vec<_> = hfq.tensors().to_vec();
     let mut out_tensors: Vec<HfqMemTensor> = Vec::with_capacity(infos.len());

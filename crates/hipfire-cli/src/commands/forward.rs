@@ -75,6 +75,34 @@ pub struct CollectArtifactsArgs {
     pub args: Vec<OsString>,
 }
 
+const REPACK_HELP: &str = r#"hipfire repack - reshuffle a .hfq into an arch-optimal weight layout
+
+Takes a canonical (general, portable) .hfq and writes an arch-tagged
+<model>.<arch>.hfq whose weights are pre-packed into the device layout that
+arch's kernels want — so the model loads with no per-load repack. The canonical
+file is the source of truth and is never modified.
+
+Currently repacks OQ4 (Opus W4A4) tensors into the combined interleaved-decode
+layout (quant_type 34 -> 37). Other tensors are copied through.
+
+Usage:
+  hipfire repack <model.hfq> [--arch <gfx>] [-o <out.hfq>]
+
+  --arch defaults to the live GPU (probed read-only). Default output is
+  <model>.<arch>.hfq beside the input, e.g.
+    qwen3.5-0.8b-oq4+.hfq -> qwen3.5-0.8b-oq4+.gfx1103.hfq
+
+Build runner:
+  cargo build --release -p hipfire-runtime --example oq4_repack"#;
+
+#[derive(Debug, Args)]
+#[command(disable_help_flag = true, trailing_var_arg = true)]
+pub struct RepackArgs {
+    /// Arguments forwarded to the oq4_repack runner
+    #[arg(allow_hyphen_values = true)]
+    pub args: Vec<OsString>,
+}
+
 pub fn run_eval(args: EvalArgs) -> anyhow::Result<()> {
     run_forwarded(
         Runner::eval(),
@@ -105,6 +133,17 @@ pub fn run_collect_artifacts(args: CollectArtifactsArgs) -> anyhow::Result<()> {
         "collect_artifacts",
         COLLECT_ARTIFACTS_HELP,
         "cargo build --release -p hipfire-runtime --example collect_artifacts",
+    )
+}
+
+pub fn run_repack(args: RepackArgs) -> anyhow::Result<()> {
+    run_forwarded(
+        Runner::repack(),
+        args.args,
+        "HIPFIRE_REPACK_BIN",
+        "oq4_repack",
+        REPACK_HELP,
+        "cargo build --release -p hipfire-runtime --example oq4_repack",
     )
 }
 
@@ -175,6 +214,14 @@ impl Runner {
         Self {
             release_name: "collect_artifacts",
             debug_name: Some("collect_artifacts"),
+            is_example: true,
+        }
+    }
+
+    fn repack() -> Self {
+        Self {
+            release_name: "oq4_repack",
+            debug_name: Some("oq4_repack"),
             is_example: true,
         }
     }

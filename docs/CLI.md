@@ -11,6 +11,7 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire eval`↴](#hipfire-eval)
 * [`hipfire host-profile`↴](#hipfire-host-profile)
 * [`hipfire collect-artifacts`↴](#hipfire-collect-artifacts)
+* [`hipfire repack`↴](#hipfire-repack)
 * [`hipfire gpu-lock`↴](#hipfire-gpu-lock)
 * [`hipfire gpu-lock acquire`↴](#hipfire-gpu-lock-acquire)
 * [`hipfire gpu-lock release`↴](#hipfire-gpu-lock-release)
@@ -41,6 +42,7 @@ hipfire LLM inference CLI
 * `eval` — Run the quant admission/model evaluation harness
 * `host-profile` — Measure host, GPU-copy, and model storage bandwidth
 * `collect-artifacts` — Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one model load
+* `repack` — Reshuffle a canonical .hfq into an arch-optimal layout (<model>.<arch>.hfq)
 * `gpu-lock` — GPU mutex for multi-agent coordination (acquire/release/status)
 * `admin` — Query the running hipfire admin API for scripts and agents
 
@@ -76,6 +78,7 @@ Load a model and generate a response (one-shot)
 * `-m`, `--model <MODEL>` — Model name, alias, or path. Falls back to the `default_model` config value when omitted
 * `--max-tokens <MAX_TOKENS>` — Max tokens to generate
 * `--temperature <TEMPERATURE>` — Sampling temperature
+* `--attach <FILE>` — Attach a file to the prompt (repeatable). The type is detected from the extension. Only images are wired today (PNG/JPEG/WebP/GIF/BMP); text, video, and audio are recognized but not yet supported and will error
 
 
 
@@ -120,6 +123,18 @@ Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one m
 ###### **Arguments:**
 
 * `<ARGS>` — Arguments forwarded to the collect_artifacts runner
+
+
+
+## `hipfire repack`
+
+Reshuffle a canonical .hfq into an arch-optimal layout (<model>.<arch>.hfq)
+
+**Usage:** `hipfire repack [ARGS]...`
+
+###### **Arguments:**
+
+* `<ARGS>` — Arguments forwarded to the oq4_repack runner
 
 
 
