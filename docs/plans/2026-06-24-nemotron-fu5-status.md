@@ -15,7 +15,7 @@ ReLU²-MLP hybrid).
 | FU4 | loader compat (load .hfq + quantized gemv) + serving | **DONE** |
 | FU5 | N6 batched prefill + q8 SSM state | **mostly done** — q8 state + benchmarks remain |
 | FU6 | Nano-30B MoE ('E' block) | not started |
-| FU1 | chat-template / coherence | blocked (EOS/Jinja/CLI controls fixed; q8 matches f32 but generation still lacks a coherent reference) |
+| FU1 | chat-template / coherence | blocked (EOS/Jinja/CLI controls fixed; vLLM reference is coherent; Hipfire/native-HF diverge at first token) |
 
 ## FU1 update (2026-06-25)
 
@@ -62,20 +62,27 @@ Validation on gfx1151 still reproduces the FU1 blocker:
   readers already fall back to Q8 on ragged K=3136. The protected artifact
   matches f32 at the closed-think boundary: argmax=11, identical top-5, logit
   cosine 0.999967, mean|delta|=0.01770, max|delta|=0.11181.
+- `/home/sadara/vllm0.22.1` provides a coherent external reference when run with
+  its ROCm environment repaired for this host (`PYTHONPATH` for bundled AMD SMI,
+  executable bits restored on the venv Python/script entrypoints, and
+  `VLLM_ROCM_USE_SKINNY_GEMM=0 VLLM_ROCM_USE_AITER_LINEAR=0
+  VLLM_ROCM_USE_AITER_TRITON_GEMM=0` to avoid the missing `_rocm_C.wvSplitK`
+  path). With byte-identical prompt ids, vLLM generates `2 + 2 equals 4.` and
+  first-token top-5 `[1050, 31035, 1052, 2757, 16489]` (`2`, `Four`, `4`, `It`,
+  `Two`).
 - Q8 serving therefore avoids the newline loop on the closed-think 2+2 prompt,
-  but greedy generation emits 0 tokens because the first token is `<|im_end|>`.
-  A reasoning-on sampled haiku prompt still produced incoherent numeric text.
+  but greedy Hipfire/native-HF generation emits 0 tokens because the first token
+  is `<|im_end|>`. A reasoning-on sampled haiku prompt still produced incoherent
+  numeric text.
 
 So FU1 is no longer "do the chat-template work." The immediate conclusion is
 that unprotected mq4 is too lossy for this uncalibrated Nano-4B artifact at a
-close generation boundary; protected mq4/q8 is numerically faithful but still
-does not prove coherent serving. The refreshed Python/native-Mamba reference
-proves the Hipfire f32 forward/generation boundary for the closed-think prompt,
-but it still says the correct greedy first token is immediate `<|im_end|>`. What
-remains is to get a coherent generation convention or a production reference path
-for this checkpoint (CUDA/mamba-ssm, vLLM, or another NVIDIA runtime). The local
-Python reference is useful for first-token and per-layer diagnostics, but not by
-itself a coherence oracle.
+close generation boundary; protected mq4/q8 is numerically faithful to Hipfire
+f32 but still follows the wrong boundary relative to vLLM. The refreshed
+Python/native-Mamba reference proves the Hipfire f32 boundary for the
+closed-think prompt, but vLLM shows that boundary is not the intended production
+generation convention. What remains is a vLLM-vs-Hipfire/native-HF bisect to find
+the first divergence.
 
 ## FU4 (DONE, committed)
 
@@ -168,26 +175,24 @@ introduces a new **'E' (MoE) block**: `BlockKind::Moe` + `NemotronMoeGpu` (route
 ## FU1 (coherence) — standing blocker
 
 Daemon generation with the original unprotected mq4 artifact produces a newline
-attractor; q8 and the fresh protected-mq4 artifact follow f32 and stop
+attractor; q8 and the fresh protected-mq4 artifact follow Hipfire f32 and stop
 immediately on the closed-think 2+2 prompt. Forward numerics are validated
 (FU4/FU5 prefill==decode, protected-mq4/q8-vs-f32 cosine 0.999967), and the
 concrete EOS/Jinja/thinking-control work is done. The Python native-Mamba
 reference now gives a repeatable local first-token/per-layer oracle and matches
-Hipfire f32 on the closed-think prompt. The remaining blocker is
-coherence/reference quality: the reference boundary itself chooses immediate
-`<|im_end|>` for that prompt, and the local ROCm/Python path is not enough to
-prove the intended production generation convention.
+Hipfire f32 on the closed-think prompt. vLLM 0.22.1 on the same prompt is
+coherent, so the remaining blocker is now a concrete first-token divergence:
+vLLM chooses `2` while Hipfire/native-HF choose immediate `<|im_end|>`.
 
 Next useful FU1 work:
 
 1. Use `benchmarks/nemotron/dump_hf_reference.py` as the first local oracle for
    every prompt under investigation; keep the rendered ChatML IDs and first-token
    top-k with the evidence.
-2. Capture a valid CUDA/vLLM/NVIDIA-runtime reference for Nano-4B on 3-4 prompts
-   if the local native-Mamba reference still stops or samples incoherently.
-3. Compare Hipfire f32/q8 against that reference at the generation boundary. If
-   the reference is coherent, bisect the first divergence against the already
-   added per-layer/block hooks.
+2. Use `benchmarks/nemotron/run_vllm_reference.py` to capture vLLM 0.22.1
+   references for 3-4 prompts, starting with the closed-think 2+2 prompt.
+3. Compare Hipfire f32/q8 against vLLM at the generation boundary, then bisect
+   the first divergence against the already added per-layer/block hooks.
 4. Treat real 4-bit Nano-4B as a sensitivity issue until calibrated. The current
    `--format mq4` policy protects projection-back residual writers as q8; an
    imatrix/AWQ/Lloyd pass is required before claiming true mq4 coherence.
@@ -219,4 +224,16 @@ python3 benchmarks/nemotron/compare_bisect.py /tmp/nemo_hf_ref_closed2p2.npz /tm
 hipfire-quantize --input <Nano-4B-BF16-snapshot> --output /tmp/nano4b-mq4-protected.hfq --format mq4 --threads 16
 NEMO_TOKENS='10,25708,1010,11,1010,10,3263,1010,31106,1294,1925,4958,19286,1058,5675,1395,1032,1050,1043,1050,1063,11,1010,10,1503,19464,1010,12,13' \
   cargo run -p hipfire-arch-nemotron --example hfq_vs_f32 -- /tmp/nano4b-mq4-protected.hfq
+
+# vLLM 0.22.1 coherent reference on this host:
+PYTHONPATH=/home/sadara/vllm0.22.1/lib/python3.12/site-packages/_rocm_sdk_core/share/amd_smi \
+VLLM_ROCM_USE_SKINNY_GEMM=0 \
+VLLM_ROCM_USE_AITER_LINEAR=0 \
+VLLM_ROCM_USE_AITER_TRITON_GEMM=0 \
+/home/sadara/vllm0.22.1/bin/python3 benchmarks/nemotron/run_vllm_reference.py \
+  --thinking off \
+  --text 'Answer in one short sentence: What is 2+2?' \
+  --temperature 0 \
+  --max-tokens 16 \
+  --out /tmp/nemotron_vllm_closed2p2.json
 ```
