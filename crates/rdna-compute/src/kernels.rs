@@ -3769,6 +3769,12 @@ pub const GEMV_OQ4_GROUPED_RESIDUAL_SRC: &str =
 /// cuts the per-token dispatch count vs looping gemv_oq4_grouped. See the .hip.
 pub const FUSED_GATE_UP_OQ4_GEMV_SRC: &str =
     include_str!("../../../kernels/src/fused_gate_up_oq4_gemv.hip");
+
+/// OQ4+ W4A16 decode GEMV reading the INTERLEAVED group layout ([f32 scale][128
+/// nibbles] contiguous per 256-group) — candidate for a per-arch loader repack to
+/// fix the split-layout's two-stream access pattern. See the .hip.
+pub const GEMV_OQ4_INTERLEAVED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq4_interleaved.hip");
 pub const FUSED_QKVZA_OQ4_DP4A_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gfx1151/fused_qkvza_oq4_dp4a.gfx1151.hip");
 

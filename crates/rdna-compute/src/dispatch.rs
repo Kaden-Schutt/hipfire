@@ -45835,6 +45835,50 @@ impl Gpu {
         })
     }
 
+    /// OQ4+ W4A16 decode GEMV over the INTERLEAVED layout ([f32 scale][128
+    /// nibbles] contiguous per group; row stride = ng*132 bytes). Capture-safe.
+    pub fn gemv_oq4_interleaved(
+        &mut self,
+        w_il: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(group, 256, "gemv_oq4_interleaved: group must be 256");
+        self.ensure_kernel(
+            "gemv_oq4_interleaved",
+            kernels::GEMV_OQ4_INTERLEAVED_SRC,
+            "gemv_oq4_interleaved",
+        )?;
+        let wp = w_il.buf.as_ptr();
+        let xp = x_f32.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob("gemv_oq4_interleaved", [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(wp);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_i32(mi);
+            b.push_i32(ki);
+            b.push_i32(gi);
+            b
+        })
+    }
+
     /// OQ4+ fused QKVZA DECODE (B=1) W4A8 dp4a (`v_dot4_i32_iu8`/`sudot4`): 4
     /// in-proj GEMVs in ONE capture-safe launch over the int8-quantized activation
     /// (Xq/Xs from quantize_act_oq8). Arch-dispatched source (gfx1151 has its own
