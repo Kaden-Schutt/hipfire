@@ -30,12 +30,12 @@
 use crate::minimax::{MiniMaxConfig, MiniMaxLayerWeights, MiniMaxState, MiniMaxWeights};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::superop::{
-    self, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind, WeightSlot,
+    self, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind,
 };
-use hipfire_dispatch::types::DispatchError;
+use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
+use hipfire_dispatch::types::{dtype_rotation_plan, DispatchError};
 use hipfire_runtime::llama::{
     fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for, rotate_x_mq_for, weight_gemv,
-    weight_gemv_residual,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -233,15 +233,11 @@ fn decode_step_body(
     }
 
     for (l, layer) in weights.layers.iter().enumerate() {
+        let ctx = DispatchCtx::new(gpu);
         // ── Attention block (Q8 projections → plain input) ──────────────────
-        gpu.rmsnorm_f32(&state.h, &layer.attn_norm, &state.tmp, eps)
-            .map_err(|e| format!("minimax L{l}: attn rmsnorm: {e:?}"))?;
-        weight_gemv(gpu, &layer.wq, &state.tmp, &state.fa_q)
-            .map_err(|e| format!("minimax L{l}: q_proj: {e}"))?;
-        weight_gemv(gpu, &layer.wk, &state.tmp, &state.fa_k)
-            .map_err(|e| format!("minimax L{l}: k_proj: {e}"))?;
-        weight_gemv(gpu, &layer.wv, &state.tmp, &state.fa_v)
-            .map_err(|e| format!("minimax L{l}: v_proj: {e}"))?;
+        // QKV (attn-norm + q/k/v) via execute_steps → FusedQkvQ8_0.
+        qkv_via_execute_steps(gpu, &ctx, layer, state, eps)
+            .map_err(|e| format!("minimax L{l}: {e}"))?;
 
         // Per-LAYER QK-norm: RMSNorm over the whole flat q[q_dim]/k[kv_dim]
         // vector (batch=1), BEFORE head reshape.
@@ -299,9 +295,19 @@ fn decode_step_body(
         )
         .map_err(|e| format!("minimax L{l}: attention: {e:?}"))?;
 
-        // o_proj + residual: h += W_o · attn_out.
-        weight_gemv_residual(gpu, &layer.wo, &state.fa_attn_out, &state.h)
-            .map_err(|e| format!("minimax L{l}: o_proj: {e}"))?;
+        // o_proj + residual: h += W_o · attn_out (via execute_steps).
+        let wro = layer.wo.dispatch_ref();
+        execute_steps(
+            gpu,
+            &ctx,
+            &[Step::GemvResidual {
+                w: &wro,
+                input: GemvInput::Raw(&state.fa_attn_out),
+                residual: &state.h,
+                out: &state.h,
+            }],
+        )
+        .map_err(|e| format!("minimax L{l}: o_proj: {e:?}"))?;
 
         if capture_postattn {
             if let Some(cap) = capture.as_deref_mut() {
@@ -523,6 +529,53 @@ fn decode_step_body(
 // mirror the hand-loop arms verbatim; the lowered handlers call them.
 // ─────────────────────────────────────────────────────────────────────────
 
+/// QKV projection (attn-norm folded in) via the canonical `execute_steps`
+/// interpreter. minimax's q/k/v are Q8_0 (no Givens/AWQ), so the `QKV3` pattern
+/// fuses into the single `FusedQkvQ8_0` kernel; otherwise it falls through to
+/// per-op GEMV. Reads `h`, writes `fa_q/fa_k/fa_v`; uses `tmp` (x_plain) +
+/// `x_rot` (rmsnorm output) as scratch. Mirrors qwen35's `qkv_via_execute_steps`
+/// non-Givens arm — the existing Q8 fused-QKV consumer.
+fn qkv_via_execute_steps(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    layer: &MiniMaxLayerWeights,
+    state: &MiniMaxState,
+    eps: f32,
+) -> Result<(), String> {
+    let rotation = dtype_rotation_plan(layer.wq.gpu_dtype);
+    let wrq = layer.wq.dispatch_ref();
+    let wrk = layer.wk.dispatch_ref();
+    let wrv = layer.wv.dispatch_ref();
+    let steps = [
+        Step::RmsnormAutomatic {
+            x: &state.h,
+            norm_weight: &layer.attn_norm,
+            x_plain: &state.tmp,
+            out: &state.x_rot,
+            awq_scale: layer.wq.awq_scale.as_ref(),
+            k: layer.wq.k,
+            eps,
+            rotation,
+        },
+        Step::Gemv {
+            w: &wrq,
+            input: GemvInput::Prerotated(&state.x_rot),
+            out: &state.fa_q,
+        },
+        Step::Gemv {
+            w: &wrk,
+            input: GemvInput::Prerotated(&state.x_rot),
+            out: &state.fa_k,
+        },
+        Step::Gemv {
+            w: &wrv,
+            input: GemvInput::Prerotated(&state.x_rot),
+            out: &state.fa_v,
+        },
+    ];
+    execute_steps(gpu, ctx, &steps).map_err(|e| format!("minimax qkv: {e:?}"))
+}
+
 /// Attention block (attn-norm folded in). Mirrors the hand-loop attention arm.
 fn minimax_attn_block(
     gpu: &mut Gpu,
@@ -534,14 +587,10 @@ fn minimax_attn_block(
     let q_dim = cfg.q_dim();
     let kv_dim = cfg.kv_dim();
     let eps = cfg.rms_norm_eps;
-    gpu.rmsnorm_f32(&state.h, &layer.attn_norm, &state.tmp, eps)
-        .map_err(|e| format!("minimax L{l}: attn rmsnorm: {e:?}"))?;
-    weight_gemv(gpu, &layer.wq, &state.tmp, &state.fa_q)
-        .map_err(|e| format!("minimax L{l}: q_proj: {e}"))?;
-    weight_gemv(gpu, &layer.wk, &state.tmp, &state.fa_k)
-        .map_err(|e| format!("minimax L{l}: k_proj: {e}"))?;
-    weight_gemv(gpu, &layer.wv, &state.tmp, &state.fa_v)
-        .map_err(|e| format!("minimax L{l}: v_proj: {e}"))?;
+    let ctx = DispatchCtx::new(gpu);
+    // QKV (attn-norm + q/k/v) via execute_steps → FusedQkvQ8_0.
+    qkv_via_execute_steps(gpu, &ctx, layer, state, eps)
+        .map_err(|e| format!("minimax L{l}: {e}"))?;
     if cfg.use_qk_norm {
         gpu.rmsnorm_batched(&state.fa_q, &layer.q_norm, &state.fa_q, 1, q_dim, eps)
             .map_err(|e| format!("minimax L{l}: q_norm: {e:?}"))?;
@@ -569,7 +618,6 @@ fn minimax_attn_block(
     // the dispatch arm passes pos+1. The attended-position count comes from
     // pos_buf either way, so output is unchanged — VALIDATED by hand≡lowered A/B.
     let pos = state.pos_host[0] as usize;
-    let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
     let plan = hipfire_dispatch::families::kv_tier::KvTierPlan::derive(
         hipfire_dispatch::families::kv_tier::KvTierInputs {
             pos,
@@ -609,8 +657,19 @@ fn minimax_attn_block(
         &[hipfire_dispatch::pipeline::Step::Attend { plan, io }],
     )
     .map_err(|e| format!("minimax L{l}: attention: {e:?}"))?;
-    weight_gemv_residual(gpu, &layer.wo, &state.fa_attn_out, &state.h)
-        .map_err(|e| format!("minimax L{l}: o_proj: {e}"))
+    // o_proj + residual: h += W_o · attn_out (via execute_steps).
+    let wro = layer.wo.dispatch_ref();
+    execute_steps(
+        gpu,
+        &ctx,
+        &[Step::GemvResidual {
+            w: &wro,
+            input: GemvInput::Raw(&state.fa_attn_out),
+            residual: &state.h,
+            out: &state.h,
+        }],
+    )
+    .map_err(|e| format!("minimax L{l}: o_proj: {e:?}"))
 }
 
 /// MoE block (ffn-norm folded in). Mirrors the hand-loop MoE arm (8-arm dtype dispatch).
