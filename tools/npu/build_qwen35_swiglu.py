@@ -156,13 +156,26 @@ def build(hidden_size: int, out_dir: Path, tile_size: int = 16,
         include_dirs=include_dirs,
     )
 
-    gate_buf = np.zeros(hidden_size, dtype=bfloat16)
-    up_buf   = np.zeros(hidden_size, dtype=bfloat16)
-    out_buf  = np.zeros(hidden_size, dtype=bfloat16)
-
-    mlir_module = transform_parallel_binary(
-        kernel, gate_buf, up_buf, out_buf, tile_size=tile_size
-    )
+    # IRON's transform_parallel_binary changed shape across mlir-aie versions:
+    #   old (≤ nix1 build box): (func, in0_buf, in1_buf, out_buf, tile_size=...)
+    #     — three concrete numpy buffers.
+    #   new (mlir-aie ≥ 1.3.3.dev): (func, tensor_ty, tile_size=...)
+    #     — a single numpy ndarray TYPE descriptor; the two-in/one-out fake
+    #     tensors are synthesized internally.
+    # Detect which is installed so this builds on both boxes.
+    import inspect
+    if "tensor_ty" in inspect.signature(transform_parallel_binary).parameters:
+        tensor_ty: Any = np.ndarray[(hidden_size,), np.dtype[bfloat16]]
+        mlir_module = transform_parallel_binary(
+            kernel, tensor_ty, tile_size=tile_size
+        )
+    else:
+        gate_buf = np.zeros(hidden_size, dtype=bfloat16)
+        up_buf   = np.zeros(hidden_size, dtype=bfloat16)
+        out_buf  = np.zeros(hidden_size, dtype=bfloat16)
+        mlir_module = transform_parallel_binary(
+            kernel, gate_buf, up_buf, out_buf, tile_size=tile_size
+        )
 
     with tempfile.TemporaryDirectory(prefix="hipfire_npu_build_") as tmp:
         tmp_path   = Path(tmp)
