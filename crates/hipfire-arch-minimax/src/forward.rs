@@ -1095,6 +1095,43 @@ pub fn forward_batch(
         gpu.free_tensor(x_single).ok();
     }
 
+    // ── Grouped-MoE prefill decision + scratch ─────────────────────────────
+    // The indexed-batched GEMV re-reads each expert weight ONCE PER ROUTED
+    // TOKEN — at 256 experts/top-8 that dominates prefill (rocprofv3: 93%).
+    // The scatter-grouped path reads each expert weight ONCE PER CHUNK and
+    // runs WMMA, but needs enough rows/expert to be worth the BLOCK_M padding.
+    // Gate on chunk size: below the threshold the per-token indexed path wins.
+    const MOE_BLOCK_M: usize = 16;
+    let grouped_gate: usize = std::env::var("HIPFIRE_MINIMAX_MOE_GROUPED_GATE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256);
+    let moe_grouped = b >= grouped_gate
+        && std::env::var("HIPFIRE_MINIMAX_MOE_GROUPED").as_deref() != Ok("0")
+        && gpu.arch_caps.has_wmma()
+        && matches!(
+            weights.layers[0].experts[0].gate_up.gpu_dtype,
+            DType::MQ2G256Lloyd
+        );
+    let m_total_max = b * k_top + n_exp * MOE_BLOCK_M;
+    // i32 scratch lives in F32-sized buffers (kernels read raw bytes as i32,
+    // same convention as topk_idx above). `None` when the indexed path is used.
+    let alloc_opt =
+        |g: &mut Gpu, want: bool, n: usize, label: &str| -> Result<Option<GpuTensor>, String> {
+            if want {
+                Ok(Some(alloc(g, n, label)?))
+            } else {
+                Ok(None)
+            }
+        };
+    let g_counts = alloc_opt(gpu, moe_grouped, n_exp, "moe_g_counts")?;
+    let g_offsets = alloc_opt(gpu, moe_grouped, n_exp + 1, "moe_g_offsets")?;
+    let g_sorted = alloc_opt(gpu, moe_grouped, m_total_max, "moe_g_sorted")?;
+    let g_tiles = alloc_opt(gpu, moe_grouped, m_total_max / MOE_BLOCK_M, "moe_g_tiles")?;
+    let g_inv = alloc_opt(gpu, moe_grouped, b * k_top, "moe_g_inv")?;
+    let g_y_gu = alloc_opt(gpu, moe_grouped, m_total_max * 2 * inter, "moe_g_y_gu")?;
+    let g_y_dn = alloc_opt(gpu, moe_grouped, m_total_max * hidden, "moe_g_y_dn")?;
+
     for (l, layer) in weights.layers.iter().enumerate() {
         // ── Attention (batched, per-row causal via positions) ──────────────
         gpu.rmsnorm_batched(&x, &layer.attn_norm, &tmp, b, hidden, eps)
@@ -1201,6 +1238,110 @@ pub fn forward_batch(
             b as i32,
         )
         .map_err(|e| format!("minimax L{l} batch topk: {e:?}"))?;
+
+        if moe_grouped {
+            // ── Scatter-grouped MoE (large chunks): read each expert weight
+            //    ONCE per chunk via WMMA grouped GEMM, vs once-per-routed-token
+            //    in the indexed path. Mirrors the deepseek4 SGLang-style
+            //    pipeline (scatter → grouped gate_up → unscatter → AWQ
+            //    silu·mul·rotate → grouped down → weighted combine into x). ──
+            let g_counts = g_counts.as_ref().unwrap();
+            let g_offsets = g_offsets.as_ref().unwrap();
+            let g_sorted = g_sorted.as_ref().unwrap();
+            let g_tiles = g_tiles.as_ref().unwrap();
+            let g_inv = g_inv.as_ref().unwrap();
+            let g_y_gu = g_y_gu.as_ref().unwrap();
+            let g_y_dn = g_y_dn.as_ref().unwrap();
+
+            gpu.moe_scatter_fused_k8(
+                &topk_idx,
+                g_counts,
+                g_offsets,
+                g_sorted,
+                g_tiles,
+                g_inv,
+                b * k_top,
+                n_exp,
+                m_total_max,
+                MOE_BLOCK_M,
+            )
+            .map_err(|e| format!("minimax L{l} grouped scatter: {e:?}"))?;
+
+            // Grouped gate_up GEMM (MQ2-Lloyd): gathers ffn_x_rot rows by token
+            // (x_row_div=k_top) → y_gate_up_grouped [m_total, 2*inter].
+            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
+                &layer.expert_gate_up_ptrs,
+                g_tiles,
+                g_sorted,
+                &ffn_x_rot,
+                g_y_gu,
+                2 * inter,
+                hidden,
+                k_top,
+                m_total_max,
+                b,
+            )
+            .map_err(|e| format!("minimax L{l} grouped gate_up: {e:?}"))?;
+
+            // Unscatter grouped → natural [B*k_top, inter] gate/up.
+            gpu.moe_gate_up_unscatter_k8(g_y_gu, g_sorted, &gate, &up, inter, k_top, m_total_max)
+                .map_err(|e| format!("minimax L{l} grouped unscatter: {e:?}"))?;
+
+            // AWQ-aware silu·mul·rotate (down weight) → rot [B*k_top, inter].
+            fused_silu_mul_rotate_mq_batched_for(
+                gpu,
+                &layer.experts[0].down,
+                &gate,
+                &up,
+                &rot,
+                inter,
+                b * k_top,
+            )
+            .map_err(|e| format!("minimax L{l} grouped silu_mul_rotate: {e}"))?;
+
+            // Grouped down GEMM: gathers rot rows (x_row_div=1) → y_down_grouped.
+            let ddt = layer.experts[0].down.gpu_dtype;
+            match ddt {
+                DType::MQ3G256Lloyd => gpu
+                    .gemm_mq3g256_lloyd_moe_grouped_wmma(
+                        &layer.expert_down_ptrs,
+                        g_tiles,
+                        g_sorted,
+                        &rot,
+                        g_y_dn,
+                        hidden,
+                        inter,
+                        1,
+                        m_total_max,
+                        b * k_top,
+                    )
+                    .map_err(|e| format!("minimax L{l} grouped down mq3l: {e:?}"))?,
+                DType::MQ2G256Lloyd => gpu
+                    .gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
+                        &layer.expert_down_ptrs,
+                        g_tiles,
+                        g_sorted,
+                        &rot,
+                        g_y_dn,
+                        hidden,
+                        inter,
+                        1,
+                        m_total_max,
+                        b * k_top,
+                    )
+                    .map_err(|e| format!("minimax L{l} grouped down mq2l: {e:?}"))?,
+                other => {
+                    return Err(format!(
+                        "minimax L{l} grouped down dtype {other:?} unsupported"
+                    ))
+                }
+            }
+
+            // Weighted combine (inverse_perm + topk_w) → x in-place (residual).
+            gpu.moe_down_combine_grouped_k8(g_y_dn, g_inv, &topk_w, &x, hidden, k_top, b)
+                .map_err(|e| format!("minimax L{l} grouped combine: {e:?}"))?;
+            continue;
+        }
 
         let edt = layer.experts[0].gate_up.gpu_dtype;
         match edt {
@@ -1337,6 +1478,16 @@ pub fn forward_batch(
         pos_array,
         x_last,
     ] {
+        gpu.free_tensor(t).ok();
+    }
+    // Grouped-MoE scratch (only allocated when the grouped path ran). GpuTensor
+    // has no Drop, so free explicitly.
+    for t in [
+        g_counts, g_offsets, g_sorted, g_tiles, g_inv, g_y_gu, g_y_dn,
+    ]
+    .into_iter()
+    .flatten()
+    {
         gpu.free_tensor(t).ok();
     }
     Ok(logits)
