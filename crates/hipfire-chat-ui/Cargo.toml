@@ -1,6 +1,6 @@
 [package]
 name = "hipfire-chat-ui"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Leptos (WASM) browser chat console for hipfire - built standalone via trunk."

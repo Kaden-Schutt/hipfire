@@ -79,7 +79,7 @@ fn render_markdown() -> String {
 /// name (`hipfire.1`, `hipfire-<sub>.1`).
 fn render_man_pages() -> anyhow::Result<Vec<(String, Vec<u8>)>> {
     // The binary's runtime `--version` is a dynamic Git-derived identity
-    // (`hipfire_build_info::VERSION`, e.g. `v0.2.1-957-g…`). Pin the *man page*
+    // (`hipfire_build_info::VERSION`, e.g. `v0.3.0-957-g...`). Pin the *man page*
     // to the static crate version so the docs freshness gate stays
     // deterministic — otherwise every commit would render a new `.TH`/VERSION
     // line and the gate could never be satisfied.

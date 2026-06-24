@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.3.0 — chaingun runtime, Opus quantization, and operator surfaces
+
+This release promotes `chaingun` from the post-0.2.1 development line into the
+new 0.3.0 baseline. The runtime now owns long-lived serving state directly:
+session arenas, prefix checkpoint hashes, typed worker/reservation/release
+contracts, scheduler health, model memory accounting, daemon JSONL adapters,
+and resource leases are split into dedicated crates instead of living behind
+ad-hoc runtime facades. The server and CLI consume those contracts directly,
+and version reporting now carries Git-derived `v0.3.0-*` development versions.
+
+Quantization moved forward substantially. Opus Plus/OQ4+ is the headline 4-bit
+path: W4A4/W4A8 codecs, LDLQ/AWQ recipes, capture-safe decode kernels, W4A16
+and int8-WMMA prefill backends, architecture-packed `.hfq` repacking, and
+artifact admission checks now make the OQ family loadable, routable, and
+benchable. OQ4+ is promoted over OQ8+ for the current product path: same KLD
+target in the recorded sweeps, faster decode, and half the VRAM of OQ8+. MQ+
+clip-search formats were generalized across mq2/mq3/mq4/mq6/mq8, and QTIP-3
+and RoughQuant investigations are documented with explicit stop/go evidence.
+
+Serving and memory management gained the hierarchical KV path. KVarN and
+two-tier hot/cold KV can now quantize, compact, and read cold segments in GPU
+kernels, route through daemon single-generate, clamp model context correctly,
+and opt out of incompatible batch-prefill paths. MTP verification was tightened
+with default-on decoupling for gfx110x, direct WMMA lm_head routing, and a fix
+for stale `fp16_x` cache corruption during speculative decode.
+
+Model and UX coverage expanded. Gemma 3 text and Gemma 3 VL now have serving
+paths, BF16 loading fixes, SigLIP/projector corrections, multi-image framing,
+vision embedding cache warmup, and a hipfire-eval Vision battery for medgemma.
+The CLI now uses `hipfire chat`, supports image attachments and per-model config
+overrides, and lists artifacts/features from a generated support matrix. New
+browser chat, TUI, operator, and authenticated admin console surfaces land with
+GPU telemetry and shared admin types.
+
+Evaluation, evidence, and correctness gates were reorganized around daemon-owned
+operations. `hipfire-kld`, HFKREF archives, daemon `kld_eval`, runtime evidence
+artifacts, admission verdicts, tiny-quant matrices, and model-support drift gates
+replace older standalone KLD flows. GPU/resource locking converged on flock-based
+leases shared by the daemon and native `hipfire gpu-lock`; the old shell lock
+adapter is gone.
+
+Also in this release: LFM2.5 registry entries; NPU/AIE2 BF16 kernel experiments
+and documented int8 blockers; DFlash rollback diagnostics and serial tape
+stabilization; generic primitive relocation out of `llama.rs`; kernel fallback
+warnings; reference W4A8/W8A8 paths; installer and precompile fixes; local config
+overrides; installed kernels moved under hipfire state; and docs updated around
+canonical artifact naming, model support, and future work.
+
 ## v0.2.1 — Dispatch unification (#397)
 
 The centralized kernel-dispatch program lands: every GEMV/GEMM/attention/
