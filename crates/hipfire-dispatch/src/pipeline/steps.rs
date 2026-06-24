@@ -999,10 +999,38 @@ fn launch_fused(
             let (wa, alpha) = gemv_weight_out(&steps[4]);
             let k = wqkv.k;
             let ng = k / 256;
-            for (wt, out) in [(wqkv, qkv), (wz, z), (wb, beta), (wa, alpha)] {
-                let ws = wt.buf.sub_offset(wt.m * (k / 2), wt.m * ng * 4);
-                gpu.gemv_oq4_grouped(wt.buf, &ws, activated, out, wt.m, k, 256)
-                    .map_err(hip)?;
+            // dot8-insts (v_dot4_i32_iu8 / sudot4) exists only on RDNA3+ (gfx11)
+            // and RDNA4 (gfx12). On gfx10 (RDNA1/2, incl. the gfx1010 5700XT) and
+            // CDNA the builtin does NOT compile — fall back to the W4A16 GEMV loop.
+            let has_dot8 = gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12");
+            if has_dot8 {
+                // W4A8 dp4a decode: int8-quantize the shared rotated activation ONCE,
+                // then one fused sudot4 launch (4 int8 MACs/instr). Arch-dispatched
+                // kernel source (gfx1151 has its own variant).
+                gpu.ensure_oq8_scratch().map_err(hip)?;
+                let xq = rdna_compute::GpuTensor {
+                    buf: unsafe { gpu.oq8_xq.as_ref().unwrap().buf.alias() },
+                    shape: vec![k],
+                    dtype: DType::Raw,
+                };
+                let xs = rdna_compute::GpuTensor {
+                    buf: unsafe { gpu.oq8_xs.as_ref().unwrap().buf.alias() },
+                    shape: vec![ng],
+                    dtype: DType::F32,
+                };
+                gpu.quantize_act_oq8(activated, &xq, &xs, 1, k, 256).map_err(hip)?;
+                gpu.fused_qkvza_oq4_dp4a(
+                    wqkv.buf, wz.buf, wb.buf, wa.buf, &xq, &xs, qkv, z, beta, alpha,
+                    wqkv.m, wz.m, wb.m, wa.m, k, 256,
+                )
+                .map_err(hip)?;
+            } else {
+                // W4A16 fallback (no dot8): per-projection nibble-unpack f32 GEMV.
+                for (wt, out) in [(wqkv, qkv), (wz, z), (wb, beta), (wa, alpha)] {
+                    let ws = wt.buf.sub_offset(wt.m * (k / 2), wt.m * ng * 4);
+                    gpu.gemv_oq4_grouped(wt.buf, &ws, activated, out, wt.m, k, 256)
+                        .map_err(hip)?;
+                }
             }
             Ok(())
         }

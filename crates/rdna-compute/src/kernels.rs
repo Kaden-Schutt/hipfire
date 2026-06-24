@@ -3751,6 +3751,26 @@ pub const GEMM_OQ4_GROUPED_WMMA_SRC: &str =
 pub const GEMM_OQ4_GROUPED_F16_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_oq4_grouped_f16_wmma.hip");
 
+/// OQ4+ fused QKVZA DECODE (B=1) W4A8 dp4a (v_dot4_i32_iu8 / `__builtin_amdgcn_
+/// sudot4`, RDNA3 dot8-insts) — int8-quantized activation, 4 int8 MACs/instr.
+/// gfx1103/RDNA3 default + a separate gfx1151/RDNA3.5 variant (it carries both
+/// dot1 and dot8; kept separate per the arch-port convention for independent
+/// tuning). Select with `fused_qkvza_oq4_dp4a_for_arch`.
+pub const FUSED_QKVZA_OQ4_DP4A_SRC: &str =
+    include_str!("../../../kernels/src/fused_qkvza_oq4_dp4a.hip");
+pub const FUSED_QKVZA_OQ4_DP4A_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gfx1151/fused_qkvza_oq4_dp4a.gfx1151.hip");
+
+/// Pick the dp4a QKVZA decode kernel source for `arch`. gfx1151 → its own
+/// variant; all other RDNA3+ (gfx1100/1/2/3, gfx12) → the default.
+pub fn fused_qkvza_oq4_dp4a_for_arch(arch: &str) -> &'static str {
+    if arch.starts_with("gfx1151") || arch.starts_with("gfx1150") || arch.starts_with("gfx1152") {
+        FUSED_QKVZA_OQ4_DP4A_GFX1151_SRC
+    } else {
+        FUSED_QKVZA_OQ4_DP4A_SRC
+    }
+}
+
 /// OQ4+ MMQ (int8-WMMA, LDS-staged) batched GEMM — the int8 backend matching
 /// mq4's MMQ (gemm_hfq4g256_residual_mmq). Reuses the shared q8_1 activation
 /// quantizer (quantize_q8_1_mmq_ds4 via ensure_q8_1_mmq_x); only the weight-tile

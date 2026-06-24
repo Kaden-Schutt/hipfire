@@ -45730,6 +45730,91 @@ impl Gpu {
         })
     }
 
+    /// OQ4+ fused QKVZA DECODE (B=1) W4A8 dp4a (`v_dot4_i32_iu8`/`sudot4`): 4
+    /// in-proj GEMVs in ONE capture-safe launch over the int8-quantized activation
+    /// (Xq/Xs from quantize_act_oq8). Arch-dispatched source (gfx1151 has its own
+    /// variant). Each weight buf is the combined `[nibbles | f32 scales]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_qkvza_oq4_dp4a(
+        &mut self,
+        w_qkv: &GpuTensor,
+        w_z: &GpuTensor,
+        w_beta: &GpuTensor,
+        w_alpha: &GpuTensor,
+        xq: &GpuTensor,
+        xs: &GpuTensor,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(group, 256, "fused_qkvza_oq4_dp4a: group must be 256");
+        let src = kernels::fused_qkvza_oq4_dp4a_for_arch(&self.arch);
+        self.ensure_kernel("fused_qkvza_oq4_dp4a", src, "fused_qkvza_oq4_dp4a")?;
+        let p_wqkv = w_qkv.buf.as_ptr();
+        let p_wz = w_z.buf.as_ptr();
+        let p_wbeta = w_beta.buf.as_ptr();
+        let p_walpha = w_alpha.buf.as_ptr();
+        let p_xq = xq.buf.as_ptr();
+        let p_xs = xs.buf.as_ptr();
+        let p_yqkv = y_qkv.buf.as_ptr();
+        let p_yz = y_z.buf.as_ptr();
+        let p_ybeta = y_beta.buf.as_ptr();
+        let p_yalpha = y_alpha.buf.as_ptr();
+        let mut qm = qkv_m as i32;
+        let mut zm = z_m as i32;
+        let mut bm = beta_m as i32;
+        let mut am = alpha_m as i32;
+        let mut ki = k as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &p_wqkv as *const _ as *mut c_void,
+            &p_wz as *const _ as *mut c_void,
+            &p_wbeta as *const _ as *mut c_void,
+            &p_walpha as *const _ as *mut c_void,
+            &p_xq as *const _ as *mut c_void,
+            &p_xs as *const _ as *mut c_void,
+            &p_yqkv as *const _ as *mut c_void,
+            &p_yz as *const _ as *mut c_void,
+            &p_ybeta as *const _ as *mut c_void,
+            &p_yalpha as *const _ as *mut c_void,
+            &mut qm as *mut _ as *mut c_void,
+            &mut zm as *mut _ as *mut c_void,
+            &mut bm as *mut _ as *mut c_void,
+            &mut am as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        let grid_x = (qkv_m + z_m + beta_m + alpha_m) as u32;
+        self.launch_maybe_blob("fused_qkvza_oq4_dp4a", [grid_x, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(p_wqkv);
+            b.push_ptr(p_wz);
+            b.push_ptr(p_wbeta);
+            b.push_ptr(p_walpha);
+            b.push_ptr(p_xq);
+            b.push_ptr(p_xs);
+            b.push_ptr(p_yqkv);
+            b.push_ptr(p_yz);
+            b.push_ptr(p_ybeta);
+            b.push_ptr(p_yalpha);
+            b.push_i32(qm);
+            b.push_i32(zm);
+            b.push_i32(bm);
+            b.push_i32(am);
+            b.push_i32(ki);
+            b.push_i32(gi);
+            b
+        })
+    }
+
     /// OQ4+ batched PREFILL: W4A16 grouped GEMM. `x` is the f32 FWHT(+AWQ)-rotated
     /// activation batch [b, k]; it is converted to f16 once (ensure_fp16_x) and the
     /// 4-bit-resident weight is dequantized to f16 inline for f16×f16 WMMA. Weight
