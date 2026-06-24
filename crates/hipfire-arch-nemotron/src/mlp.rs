@@ -107,6 +107,25 @@ impl MlpRelu2Gpu {
         Ok(&self.out)
     }
 
+    /// Batched prefill: `out[seq, hidden] = down @ relu2(up @ x)` over a whole
+    /// prompt. MLP is position-independent, so it equals `forward` per position;
+    /// `relu2_f32` is elementwise (works on `[seq*intermediate]`). Returns the
+    /// `[seq * hidden]` output; scratch is allocated per call. F32 weights only
+    /// (see [`crate::weight::LinearWeight::gemm_seq`]).
+    pub fn prefill(&mut self, gpu: &mut Gpu, x: &GpuTensor, seq: usize) -> HipResult<GpuTensor> {
+        let u = gpu.zeros(&[seq * self.intermediate], DType::F32)?;
+        let a = gpu.zeros(&[seq * self.intermediate], DType::F32)?;
+        let out = gpu.zeros(&[seq * self.hidden], DType::F32)?;
+        self.up
+            .gemm_seq(gpu, x, &u, seq, self.intermediate, self.hidden)?;
+        gpu.relu2_f32(&u, &a)?;
+        self.down
+            .gemm_seq(gpu, &a, &out, seq, self.hidden, self.intermediate)?;
+        let _ = gpu.free_tensor(u);
+        let _ = gpu.free_tensor(a);
+        Ok(out)
+    }
+
     pub fn hidden(&self) -> usize {
         self.hidden
     }
