@@ -47,6 +47,33 @@ impl LinearWeight {
         }
     }
 
+    /// Batched prefill matmul: `out[seq, m] = x[seq, k] · Wᵀ` (W stored `[m, k]`,
+    /// like the gemv path). F32 uses `gemm_f32_train` with `trans_b`. The
+    /// quantized batched-gemm path is not yet wired — the prefill integration
+    /// validates the F32 floor first; quantized prefill falls back to the
+    /// per-token decode loop until the batched quant gemm lands.
+    pub fn gemm_seq(
+        &self,
+        gpu: &mut Gpu,
+        x: &GpuTensor,
+        out: &GpuTensor,
+        seq: usize,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        match self {
+            LinearWeight::F32(w) => {
+                // C[seq,m] = x[seq,k] · Wᵀ ; op(A)=[seq,k] (lda=k), op(B)=Wᵀ=[k,m]
+                // from stored W[m,k] (trans_b, ldb=k).
+                gpu.gemm_f32_train(x, w, out, seq, m, k, k, k, false, true)
+            }
+            LinearWeight::Quant(_) => Err(HipError::new(
+                0,
+                "nemotron prefill: quantized batched gemm not yet wired",
+            )),
+        }
+    }
+
     /// Free the GPU storage (consumes the weight).
     pub fn free(self, gpu: &mut Gpu) {
         match self {

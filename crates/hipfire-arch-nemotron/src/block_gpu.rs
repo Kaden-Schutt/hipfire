@@ -255,6 +255,130 @@ impl Mamba2BlockGpu {
         Ok(&self.out)
     }
 
+    /// Prefill a whole `seq`-token prompt in batched form (N6), advancing the
+    /// conv + SSM state in place to the post-sequence value (so a subsequent
+    /// `decode_step` continues seamlessly). Returns the `[seq * hidden_size]`
+    /// mixer output. Mirrors `decode_step` op-for-op but batched: gemm in_proj →
+    /// strided split → conv1d-seq → strided split → ssd-seq → gated-norm-seq →
+    /// gemm out_proj, so it is equivalent to running `decode_step` over the
+    /// tokens (validated gpu-vs-cpu in `examples/test_block_prefill_gpu.rs`).
+    /// Scratch is allocated per call. F32 weights only for now (the quantized
+    /// batched gemm is a follow-up — see [`LinearWeight::gemm_seq`]).
+    pub fn prefill(
+        &mut self,
+        gpu: &mut Gpu,
+        hidden_seq: &GpuTensor,
+        seq: usize,
+    ) -> HipResult<GpuTensor> {
+        let d = self.dims.clone();
+        let d_inner = d.d_inner();
+        let conv_dim = d.conv_dim();
+        let proj_sz = d.projection_size();
+        let nss = d.n_groups * d.state_size;
+        let nh = d.num_heads;
+        let hidden = d.hidden_size;
+
+        // seq-sized scratch.
+        let proj = gpu.zeros(&[seq * proj_sz], DType::F32)?;
+        let z = gpu.zeros(&[seq * d_inner], DType::F32)?;
+        let xbc = gpu.zeros(&[seq * conv_dim], DType::F32)?;
+        let dt = gpu.zeros(&[seq * nh], DType::F32)?;
+        let xbc_act = gpu.zeros(&[seq * conv_dim], DType::F32)?;
+        let x = gpu.zeros(&[seq * d_inner], DType::F32)?;
+        let b = gpu.zeros(&[seq * nss], DType::F32)?;
+        let c = gpu.zeros(&[seq * nss], DType::F32)?;
+        let y = gpu.zeros(&[seq * d_inner], DType::F32)?;
+        let y_norm = gpu.zeros(&[seq * d_inner], DType::F32)?;
+        let out = gpu.zeros(&[seq * hidden], DType::F32)?;
+
+        // 1. in_proj → proj [seq, proj_sz]
+        self.in_proj
+            .gemm_seq(gpu, hidden_seq, &proj, seq, proj_sz, hidden)?;
+        // 2. split proj → z | xBC | dt (strided gather, element offsets)
+        gpu.strided_copy_2d(&proj, 0, proj_sz, &z, 0, d_inner, seq, d_inner, false)?;
+        gpu.strided_copy_2d(
+            &proj, d_inner, proj_sz, &xbc, 0, conv_dim, seq, conv_dim, false,
+        )?;
+        gpu.strided_copy_2d(
+            &proj,
+            d_inner + conv_dim,
+            proj_sz,
+            &dt,
+            0,
+            nh,
+            seq,
+            nh,
+            false,
+        )?;
+        // 3. conv1d + bias + SiLU over the sequence (advances conv_state)
+        gpu.conv1d_bias_silu_seq_f32(
+            &xbc_act,
+            &xbc,
+            &self.conv_weight,
+            &self.conv_bias,
+            &self.conv_state,
+            seq,
+            conv_dim,
+        )?;
+        // 4. split xBC_act → x | B | C
+        gpu.strided_copy_2d(&xbc_act, 0, conv_dim, &x, 0, d_inner, seq, d_inner, false)?;
+        gpu.strided_copy_2d(&xbc_act, d_inner, conv_dim, &b, 0, nss, seq, nss, false)?;
+        gpu.strided_copy_2d(
+            &xbc_act,
+            d_inner + nss,
+            conv_dim,
+            &c,
+            0,
+            nss,
+            seq,
+            nss,
+            false,
+        )?;
+        // 5. SSD selective scan over the sequence (advances ssm_state)
+        gpu.mamba2_ssd_seq_f32(
+            &y,
+            &self.ssm_state,
+            &x,
+            &b,
+            &c,
+            &dt,
+            &self.a_log,
+            &self.d,
+            &self.dt_bias,
+            seq,
+            nh,
+            d.head_dim,
+            d.state_size,
+            d.n_groups,
+            d.dt_min,
+            d.dt_max,
+        )?;
+        // 6. gated group-RMSNorm over the sequence
+        let group_size = d.norm_group_size();
+        let num_norm_groups = d_inner / group_size;
+        gpu.mamba2_gated_norm_seq_f32(
+            &y_norm,
+            &y,
+            &z,
+            &self.norm_weight,
+            seq,
+            num_norm_groups,
+            group_size,
+            d.rms_norm_eps,
+        )?;
+        // 7. out_proj (+ residual rescale on the HFQ path)
+        self.out_proj
+            .gemm_seq(gpu, &y_norm, &out, seq, hidden, d_inner)?;
+        if self.out_proj_scale != 1.0 {
+            gpu.scale_f32(&out, self.out_proj_scale)?;
+        }
+
+        for t in [proj, z, xbc, dt, xbc_act, x, b, c, y, y_norm] {
+            let _ = gpu.free_tensor(t);
+        }
+        Ok(out)
+    }
+
     /// Zero the recurrent conv + SSM state for a fresh sequence.
     pub fn reset(&mut self, gpu: &mut Gpu) -> HipResult<()> {
         gpu.fill_f32(&self.conv_state, 0.0)?;
