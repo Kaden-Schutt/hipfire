@@ -619,7 +619,6 @@ fn dequantize_e4m3_f32scale_to_f32(
 
 // ─── Q4_F16_G64 Quantization ────────────────────────────────────────────────
 
-
 /// Quantize F32 weights to HFQ4-G256: flat 4-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][128B nibbles] = 136 bytes per 256 weights (0.531 B/w).
 /// 18 VGPRs, 100% occupancy on RDNA1. Beats Q4_K at all matrix sizes.
@@ -1039,7 +1038,6 @@ fn roughquant4_infer_dmodel(tensors: &[HfqTensor]) -> Option<usize> {
         .max_by_key(|&(dmodel, count)| (count, dmodel))
         .map(|(dmodel, _)| dmodel)
 }
-
 
 #[cfg(test)]
 mod awq_tests {
@@ -1803,7 +1801,6 @@ fn quantize_mq2g256_lloyd_gptq(
     output
 }
 
-
 /// Inverse FWHT for MQ-family dequantization (sibling of cpu_fwht_256).
 fn cpu_inv_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
     assert!(x.len() == 256);
@@ -2055,6 +2052,7 @@ fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -
     // Rule 2: embeddings, lm_head, output projection
     if name.contains("embed_tokens")
         || name.contains("token_embd")
+        || name.ends_with("embeddings.weight") // nemotron_h: backbone.embeddings.weight
         || name.contains("lm_head")
         || name.ends_with("output.weight")
     {
@@ -2695,6 +2693,14 @@ fn should_quantize(name: &str) -> bool {
     if name.contains("norm") || name.contains("bias") {
         return false;
     }
+    // Depthwise causal short-conv filters (Mamba-2 / nemotron_h `*.conv1d.weight`,
+    // LFM2 / GDN convs) are tiny per-channel recurrence filters of shape
+    // [channels, 1, K] — NOT a 2D linear weight. Keep them F16: quantizing a
+    // recurrence filter corrupts the SSM/conv state, and the 3D shape isn't a
+    // valid mq4 [out, in] matrix anyway. (`conv1d.bias` is already caught above.)
+    if name.contains("conv1d") {
+        return false;
+    }
     // Quantize everything including embeddings (Q8 embedding saves ~2.3GB for 8B models)
     name.contains("weight")
 }
@@ -2899,8 +2905,9 @@ impl HfqInputFormat {
             "mq3" | "mq3g256" => Some(Self::Mq3),
             "qtip3" => Some(Self::Qtip3),
             "oq4" | "oq4g256" | "opus" => Some(Self::Oq4),
-            "oq+" | "oqplus" | "oq4+" | "opus-plus" | "opusplus" | "opus+" | "opusa8"
-            | "oq4a8" => Some(Self::OqPlus),
+            "oq+" | "oqplus" | "oq4+" | "opus-plus" | "opusplus" | "opus+" | "opusa8" | "oq4a8" => {
+                Some(Self::OqPlus)
+            }
             "oq+t" | "oqplus-tiered" | "oq+8" | "opus-plus-tiered" => Some(Self::OqPlusTiered),
             "oq+c" | "oqplus-compact" | "oq+4" | "opus-plus-compact" => Some(Self::OqPlusCompact),
             "oq8" | "oq8g256" | "opus8" => Some(Self::Oq8),
@@ -3219,9 +3226,13 @@ fn quantize_hfq_source_tensor(
                 let diag_sum: f64 = (0..k).map(|i| h[i * k + i] as f64).sum();
                 let damp = 0.01 * (diag_sum / k as f64).max(1e-12);
                 let out = if compact {
-                    ldlq::oqplus_compact_ldlq_pack(&wbuf, m_dim, k, &h, &signs1, &signs2, damp, w8_frac)
+                    ldlq::oqplus_compact_ldlq_pack(
+                        &wbuf, m_dim, k, &h, &signs1, &signs2, damp, w8_frac,
+                    )
                 } else {
-                    ldlq::oqplus_tiered_ldlq_pack(&wbuf, m_dim, k, &h, &signs1, &signs2, damp, w8_frac)
+                    ldlq::oqplus_tiered_ldlq_pack(
+                        &wbuf, m_dim, k, &h, &signs1, &signs2, damp, w8_frac,
+                    )
                 };
                 if out.is_some() {
                     if let Some(s) = awq_scales {
@@ -3434,7 +3445,11 @@ fn run_hfq_source_pipeline(
                 None => format!("{}.awq_scale.weight", t.name),
             };
             let bytes = awq_scales_to_f16_bytes(&scales);
-            eprintln!("    AWQ:    {sidecar_name} [{}] (1D F16, {} B)", scales.len(), bytes.len());
+            eprintln!(
+                "    AWQ:    {sidecar_name} [{}] (1D F16, {} B)",
+                scales.len(),
+                bytes.len()
+            );
             hfq_tensors.push(HfqTensor {
                 name: sidecar_name,
                 quant_type: QuantType::F16,
@@ -5337,7 +5352,8 @@ fn main() {
             }
             match hfhs_diag::read_diagonals(&hpath) {
                 Ok(diags) => {
-                    let mut table: HashMap<String, Vec<f32>> = HashMap::with_capacity(diags.len() * 2);
+                    let mut table: HashMap<String, Vec<f32>> =
+                        HashMap::with_capacity(diags.len() * 2);
                     for (name, diag) in diags {
                         table.insert(format!("{name}.weight"), diag.clone());
                         table.insert(name, diag); // bare-name fallback
@@ -5435,7 +5451,9 @@ fn main() {
             .filter(|f| *f > 0.0 && *f < 1.0)
             .unwrap_or(0.01);
         if !awq_enabled {
-            eprintln!("warning: --sq-split has no effect without --awq (it normalizes the AWQ scale)");
+            eprintln!(
+                "warning: --sq-split has no effect without --awq (it normalizes the AWQ scale)"
+            );
         }
         SQ_OUTLIER_SPLIT
             .set(frac)
@@ -5691,6 +5709,11 @@ fn main() {
         // sliding-window interleave, GeGLU gelu-tanh. Crate hipfire-arch-gemma3.
         // See docs/plans/2026-06-19-gemma3-bringup.md.
         "gemma3_text" | "gemma3" => 12,
+        // nemotron_h (NVIDIA Nemotron-3): Mamba-2 + GQA-attn + ReLU²-MLP hybrid
+        // (Nano-4B dense; Nano-30B adds MoE). Crate hipfire-arch-nemotron
+        // (arch_id 14). Quantizes the linear projections; keeps conv1d/A_log/D/
+        // dt_bias/norms F16 (see should_quantize).
+        "nemotron_h" => 14,
         other => {
             eprintln!("Warning: unknown architecture '{other}', treating as llama");
             0
@@ -11716,6 +11739,44 @@ mod tests {
     }
 
     #[test]
+    fn nemotron_h_keep_list() {
+        // Quantize the linear projections (the bulk).
+        for n in [
+            "backbone.layers.0.mixer.in_proj.weight",
+            "backbone.layers.0.mixer.out_proj.weight",
+            "backbone.layers.1.mixer.up_proj.weight",
+            "backbone.layers.1.mixer.down_proj.weight",
+            "backbone.layers.12.mixer.q_proj.weight",
+            "backbone.layers.12.mixer.k_proj.weight",
+            "backbone.layers.12.mixer.v_proj.weight",
+            "backbone.layers.12.mixer.o_proj.weight",
+            "backbone.embeddings.weight",
+            "lm_head.weight",
+        ] {
+            assert!(should_quantize(n), "{n} should quantize");
+        }
+        // Keep F16: recurrence + norm tensors (quantizing these corrupts the SSM).
+        for n in [
+            "backbone.layers.0.mixer.conv1d.weight", // depthwise filter [conv_dim,1,K]
+            "backbone.layers.0.mixer.conv1d.bias",
+            "backbone.layers.0.mixer.A_log",
+            "backbone.layers.0.mixer.D",
+            "backbone.layers.0.mixer.dt_bias",
+            "backbone.layers.0.mixer.norm.weight", // RMSNormGated
+            "backbone.layers.0.norm.weight",       // pre-block RMSNorm
+            "backbone.norm_f.weight",              // final norm
+        ] {
+            assert!(!should_quantize(n), "{n} should stay F16");
+        }
+        // Embeddings + lm_head → Q8 (not base mq4).
+        assert_eq!(
+            kmap_resolve("backbone.embeddings.weight", 42, false),
+            QuantLevel::Q8
+        );
+        assert_eq!(kmap_resolve("lm_head.weight", 42, false), QuantLevel::Q8);
+    }
+
+    #[test]
     fn kmap_moe_router_q8() {
         assert_eq!(
             kmap_resolve("model.language_model.layers.5.mlp.gate.weight", 64, true),
@@ -12082,7 +12143,11 @@ mod codec_golden {
             .map(|i| {
                 s = s.wrapping_mul(1_103_515_245).wrapping_add(12345) & 0x7fff_ffff;
                 let base = (s as f32 / 2_147_483_648.0) - 0.5;
-                if i % 137 == 0 { base * 12.0 } else { base } // sparse outliers
+                if i % 137 == 0 {
+                    base * 12.0
+                } else {
+                    base
+                } // sparse outliers
             })
             .collect()
     }
@@ -12102,11 +12167,26 @@ mod codec_golden {
         h("q8f16", &quantize_q8f16(&x));
         h("q8hfq", &quantize_q8hfq(&x, m, k).0);
         h("mq4g256", &quantize_mq4g256(&x, &s1, &s2));
-        h("mq4g256_clipsearch", &quantize_mq4g256_clipsearch(&x, &s1, &s2));
-        h("mq6g256_clipsearch", &quantize_mq6g256_clipsearch(&x, &s1, &s2));
-        h("mq3g256_clipsearch", &quantize_mq3g256_clipsearch(&x, &s1, &s2));
-        h("mq2g256_clipsearch", &quantize_mq2g256_clipsearch(&x, &s1, &s2));
-        h("mq8g256_clipsearch", &quantize_mq8g256_clipsearch(&x, &s1, &s2));
+        h(
+            "mq4g256_clipsearch",
+            &quantize_mq4g256_clipsearch(&x, &s1, &s2),
+        );
+        h(
+            "mq6g256_clipsearch",
+            &quantize_mq6g256_clipsearch(&x, &s1, &s2),
+        );
+        h(
+            "mq3g256_clipsearch",
+            &quantize_mq3g256_clipsearch(&x, &s1, &s2),
+        );
+        h(
+            "mq2g256_clipsearch",
+            &quantize_mq2g256_clipsearch(&x, &s1, &s2),
+        );
+        h(
+            "mq8g256_clipsearch",
+            &quantize_mq8g256_clipsearch(&x, &s1, &s2),
+        );
         h("oq4g256", &quantize_oq4g256(&x, &s1, &s2));
         h("mq6g256", &quantize_mq6g256(&x, &s1, &s2));
         h("mq8g256", &quantize_mq8g256(&x, &s1, &s2));
@@ -12178,7 +12258,11 @@ mod codec_golden {
     fn codec_outputs_are_byte_stable() {
         let actual = codec_hashes();
         let want: std::collections::HashMap<&str, &str> = GOLDENS.iter().copied().collect();
-        assert_eq!(actual.len(), GOLDENS.len(), "codec count drifted from goldens");
+        assert_eq!(
+            actual.len(),
+            GOLDENS.len(),
+            "codec count drifted from goldens"
+        );
         let mut drifted = Vec::new();
         for (name, hash) in &actual {
             match want.get(name) {
@@ -12203,13 +12287,28 @@ mod codec_golden {
         let s1 = gen_fwht_signs(42, 256);
         let s2 = gen_fwht_signs(1042, 256);
         let plain = dequant_mq4g256(&quantize_mq4g256(&x, &s1, &s2), x.len(), &s1, &s2);
-        let clip = dequant_mq4g256(&quantize_mq4g256_clipsearch(&x, &s1, &s2), x.len(), &s1, &s2);
+        let clip = dequant_mq4g256(
+            &quantize_mq4g256_clipsearch(&x, &s1, &s2),
+            x.len(),
+            &s1,
+            &s2,
+        );
         let mse = |rec: &[f32]| -> f64 {
-            x.iter().zip(rec).map(|(a, b)| ((a - b) as f64).powi(2)).sum::<f64>() / x.len() as f64
+            x.iter()
+                .zip(rec)
+                .map(|(a, b)| ((a - b) as f64).powi(2))
+                .sum::<f64>()
+                / x.len() as f64
         };
         let (mp, mc) = (mse(&plain), mse(&clip));
-        assert!(mc <= mp * 1.0001, "clip-search MSE {mc:.3e} worse than plain {mp:.3e}");
-        eprintln!("mq4 plain MSE={mp:.4e}  clipsearch MSE={mc:.4e}  ({:.1}% lower)", 100.0 * (mp - mc) / mp);
+        assert!(
+            mc <= mp * 1.0001,
+            "clip-search MSE {mc:.3e} worse than plain {mp:.3e}"
+        );
+        eprintln!(
+            "mq4 plain MSE={mp:.4e}  clipsearch MSE={mc:.4e}  ({:.1}% lower)",
+            100.0 * (mp - mc) / mp
+        );
     }
 
     /// Opus OQ4 (symmetric signed-int4) must round-trip with quality comparable
@@ -12223,7 +12322,10 @@ mod codec_golden {
         let oq4 = dequant_oq4g256(&quantize_oq4g256(&x, &s1, &s2), x.len(), &s1, &s2);
         let sqnr = |rec: &[f32]| -> f64 {
             let (mut sig, mut noise) = (0.0f64, 0.0f64);
-            for (&a, &b) in x.iter().zip(rec) { sig += (a as f64).powi(2); noise += ((a-b) as f64).powi(2); }
+            for (&a, &b) in x.iter().zip(rec) {
+                sig += (a as f64).powi(2);
+                noise += ((a - b) as f64).powi(2);
+            }
             10.0 * (sig / noise.max(1e-30)).log10()
         };
         let (m, o) = (sqnr(&mq4), sqnr(&oq4));
@@ -12274,7 +12376,11 @@ mod codec_golden {
         buf.copy_from_slice(&orig);
         cpu_fwht_256(&mut buf, &s1, &s2);
         cpu_inv_fwht_256(&mut buf, &s1, &s2);
-        let max = orig.iter().zip(buf.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let max = orig
+            .iter()
+            .zip(buf.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         assert!(max < 1e-4, "FWHT not invertible: max abs err {max}");
     }
 }
