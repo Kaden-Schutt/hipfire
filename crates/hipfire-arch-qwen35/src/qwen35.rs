@@ -14262,6 +14262,12 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
     // coherence-first rule we do NOT enable a path that degrades output by
     // default; the wiring ships behind this flag for continued root-causing.
     // Decode is unaffected (always per-token oq4, known-good).
+    // OQ4+ batched prefill is now the divergence-free W4A16 path (dequant 4-bit
+    // weight to f16, f16×f16 WMMA, no int4 act-quant) — coherent like mq4, so it
+    // is ON BY DEFAULT for gfx11+ (no longer gated behind HIPFIRE_OQ4_BATCHED_
+    // PREFILL). The old gate existed because the W4A4 int4-act batched path
+    // diverged (flipped greedy argmax); that path is retired for OQ4+ prefill.
+    // Opt OUT with HIPFIRE_OQ4_BATCHED_PREFILL=0 (falls back to per-token prefill).
     let oq4_with_wmma = matches!(dt, DType::Oq4G256)
         && matches!(
             arch,
@@ -14275,7 +14281,7 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
                 | "gfx1200"
                 | "gfx1201"
         )
-        && std::env::var("HIPFIRE_OQ4_BATCHED_PREFILL").as_deref() == Ok("1");
+        && std::env::var("HIPFIRE_OQ4_BATCHED_PREFILL").as_deref() != Ok("0");
 
     // Lloyd-MQ3 (MQ3G256Lloyd) on gfx11: Phase 5 of issue #116 ships the
     // gemm_*_mq3g256_lloyd_wmma family alongside the existing HFQ3 WMMA

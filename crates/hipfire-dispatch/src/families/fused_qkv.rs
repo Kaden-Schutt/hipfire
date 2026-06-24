@@ -403,24 +403,17 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 quant: "oq4g256 (prefill-only)",
             })?;
             const GROUP: usize = 256;
-            let ng = k / GROUP;
-            let m_max = mqkv.max(mz).max(mbeta).max(malpha);
-            hip!(gpu.ensure_oq4_scratch_batched(n, k, m_max))?;
-            let xq = GpuTensor {
-                buf: unsafe { gpu.oq4_xq_batch.as_ref().unwrap().buf.alias() },
-                shape: vec![n * (k / 2)],
-                dtype: rdna_compute::DType::Raw,
-            };
-            let xs = GpuTensor {
-                buf: unsafe { gpu.oq4_xs_batch.as_ref().unwrap().buf.alias() },
-                shape: vec![n * ng],
-                dtype: rdna_compute::DType::F32,
-            };
-            hip!(gpu.quantize_act_oq4(x, &xq, &xs, n, k, GROUP))?;
-            hip!(gpu.fused_qkvza_oq4_wmma(
-                wqkv, wz, w_beta, w_alpha, &xq, &xs, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha,
-                k, n, GROUP
-            ))
+            // OQ4+ W4A16 batched prefill: dequant the 4-bit weight to f16 and run
+            // f16×f16 WMMA against the f16 activation (no int4 act-quant → no
+            // batched-vs-pertoken divergence amplification). Per-projection GEMM —
+            // prefill is compute-bound at B>1, so the fused-demux launch saving is
+            // moot; the f16 grouped WMMA matches the W4A16 decode numerics.
+            for (w, y, mm) in
+                [(wqkv, qkv, mqkv), (wz, z, mz), (w_beta, beta, mbeta), (w_alpha, alpha, malpha)]
+            {
+                hip!(gpu.gemm_oq4_grouped_f16_wmma(w, x, y, mm, k, n, GROUP))?;
+            }
+            Ok(())
         }
 
         // ── 2-way Fused Gate+Up (FFN) ────────────────────────
@@ -570,22 +563,12 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 quant: "oq4g256 (prefill-only)",
             })?;
             const GROUP: usize = 256;
-            let ng = k / GROUP;
-            hip!(gpu.ensure_oq4_scratch_batched(n, k, mg.max(mu)))?;
-            let xq = GpuTensor {
-                buf: unsafe { gpu.oq4_xq_batch.as_ref().unwrap().buf.alias() },
-                shape: vec![n * (k / 2)],
-                dtype: rdna_compute::DType::Raw,
-            };
-            let xs = GpuTensor {
-                buf: unsafe { gpu.oq4_xs_batch.as_ref().unwrap().buf.alias() },
-                shape: vec![n * ng],
-                dtype: rdna_compute::DType::F32,
-            };
-            hip!(gpu.quantize_act_oq4(x, &xq, &xs, n, k, GROUP))?;
-            hip!(gpu.fused_gate_up_oq4_wmma(
-                w_gate, w_up, &xq, &xs, gate, up, mg, mu, k, n, GROUP
-            ))
+            // OQ4+ W4A16 batched prefill (see FusedQkvzaOq4G256): per-projection
+            // f16 grouped WMMA, 4-bit weight dequantized inline, no int4 act-quant.
+            for (w, y, mm) in [(w_gate, gate, mg), (w_up, up, mu)] {
+                hip!(gpu.gemm_oq4_grouped_f16_wmma(w, x, y, mm, k, n, GROUP))?;
+            }
+            Ok(())
         }
 
         // ── Paro fused Paro4G128T (dp4a) ────────────────────────────────

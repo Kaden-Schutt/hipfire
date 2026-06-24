@@ -45727,6 +45727,54 @@ impl Gpu {
         }
     }
 
+    /// OQ4+ batched PREFILL: W4A16 grouped GEMM. `x` is the f32 FWHT(+AWQ)-rotated
+    /// activation batch [b, k]; it is converted to f16 once (ensure_fp16_x) and the
+    /// 4-bit-resident weight is dequantized to f16 inline for f16×f16 WMMA. Weight
+    /// buf = `[nibbles M*(K/2) | f32 scales M*ng]`; the scale view is `w_scales`.
+    pub fn gemm_oq4_grouped_f16_wmma(
+        &mut self,
+        w_i4: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        b: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(group, 256, "gemm_oq4_grouped_f16_wmma: group must be 256");
+        assert_eq!(k % group, 0, "gemm_oq4_grouped_f16_wmma: K must be a multiple of group");
+        self.ensure_kernel(
+            "gemm_oq4_grouped_f16_wmma",
+            kernels::GEMM_OQ4_GROUPED_F16_WMMA_SRC,
+            "gemm_oq4_grouped_f16_wmma",
+        )?;
+        let x_fp16 = self.ensure_fp16_x(x_f32, b * k)?;
+        let wp = w_i4.buf.as_ptr();
+        let mut xp = x_fp16;
+        let yp = y_f32.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = b as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        let grid_x = m.div_ceil(16) as u32;
+        let grid_y = b.div_ceil(16) as u32;
+        let func = &self.functions["gemm_oq4_grouped_f16_wmma"];
+        unsafe {
+            self.hip
+                .launch_kernel(func, [grid_x, grid_y, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
+        }
+    }
+
     /// Opus Quant W8A8 DECODE GEMV (batch=1): y[m] = Σ_g sw·sx·Σ qw·qx. One
     /// wave32 per output row, zero LDS. int8 generalization of gemv_oq4_grouped:
     /// rows are K int8 bytes (stride K), weights+acts are signed int8.
@@ -46918,22 +46966,12 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<()> {
+        // OQ4+ W4A16 batched prefill: dequant the 4-bit weight to f16 and run
+        // f16×f16 WMMA against the f16 (converted) activation — no int4 act-quant,
+        // so no batched-vs-pertoken divergence amplification. Matches the W4A16
+        // decode numerics. (Was: quantize_act_oq4 → gemm_oq4_grouped_wmma, W4A4.)
         const GROUP: usize = 256;
-        self.ensure_oq4_scratch_batched(n, k, m)?;
-        let ng = k / GROUP;
-        let xq = GpuTensor {
-            buf: unsafe { self.oq4_xq_batch.as_ref().unwrap().buf.alias() },
-            shape: vec![n * (k / 2)],
-            dtype: DType::Raw,
-        };
-        let xs = GpuTensor {
-            buf: unsafe { self.oq4_xs_batch.as_ref().unwrap().buf.alias() },
-            shape: vec![n * ng],
-            dtype: DType::F32,
-        };
-        self.quantize_act_oq4(x_rot, &xq, &xs, n, k, GROUP)?;
-        let ws = w_combined.sub_offset(m * (k / 2), m * ng * 4);
-        self.gemm_oq4_grouped_wmma(w_combined, &ws, &xq, &xs, y, m, k, n, GROUP)
+        self.gemm_oq4_grouped_f16_wmma(w_combined, x_rot, y, m, k, n, GROUP)
     }
 
     /// Batched W4A4 oq4 GEMM with residual add: `residual[N×M] += W·x_rot`.

@@ -3743,6 +3743,14 @@ pub const GEMM_IU4_I32_WMMA_SRC: &str =
 pub const GEMM_OQ4_GROUPED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_oq4_grouped_wmma.hip");
 
+/// OQ4+ batched PREFILL: W4A16 grouped GEMM (4-bit-resident weight dequantized
+/// to f16 inline, f16×f16 WMMA against full-precision f16 activations). The
+/// batched analog of the W4A16 decode GEMV; replaces the W4A4 int4-act path for
+/// OQ4+ prefill (no act-quant → no batched-vs-pertoken divergence amplification).
+/// gfx1100+ wave32 WMMA, zero LDS. See `kernels/src/gemm_oq4_grouped_f16_wmma.hip`.
+pub const GEMM_OQ4_GROUPED_F16_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq4_grouped_f16_wmma.hip");
+
 /// Opus Quant W4A4: dynamic per-token/group INT4 activation quantizer (f32 →
 /// signed int4 + per-group scales). Feeds `gemm_oq4_grouped_wmma`. gfx1103
 /// wave32, zero LDS. See `kernels/src/quantize_act_oq4.hip`.
