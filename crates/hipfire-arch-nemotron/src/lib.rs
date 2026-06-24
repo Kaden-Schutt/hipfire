@@ -14,6 +14,7 @@
 //! MLP, the per-block forward, weight loader, and serving impls land in later
 //! loop iterations (N1+).
 
+pub mod attn;
 pub mod block;
 pub mod block_gpu;
 pub mod mlp;
