@@ -261,8 +261,18 @@ retired). Opt out with `=0`.
   on first use; 55d9df52 fixes it. The interim "1106" was a stale-cache reading.)
   K4-unroll was tried and REVERTED — register pressure dropped occupancy (494 tok/s).
 - **Remaining ~1.24× to mq4+:** mq4 uses an MMQ/dp4a (int8) backend +
-  multi-projection fusion (204 vs 372 launches). Porting those is the next lever;
-  the f16-WMMA path shipped is the correct + coherent baseline.
+  multi-projection fusion (204 vs 372 launches). The f16-WMMA per-projection path
+  shipped is the correct + coherent baseline.
+- **Multi-projection FUSION tried + REVERTED (negative result, 2026-06-24).** Built
+  3 fused W4A16 kernels (gemm_qkvza/gate_up/qkv_oq4_f16_wmma, blockIdx demux over
+  concatenated row-tiles, shared single f16-conversion) and wired all LA+FA arms.
+  Warm prefill **1124 vs 1271 tok/s per-projection — ~12% SLOWER.** At B=512 the
+  GEMMs are compute-bound, so the fusion wins (fewer launches, one f16 conversion)
+  are negligible while the heterogeneous demux grid (qkv m=6144 tiles mixed with
+  beta/alpha m=16 single-tiles) + the per-block demux branch cost more than they
+  save. mq4's fusion pays off only paired with its MMQ backend; for the f16-WMMA
+  path, clean uniform per-projection grids win. Reverted to per-projection K2.
+  The only remaining prefill lever is the MMQ/dp4a backend port (large).
 
 **Harness note:** single-prompt **chat/eval prefill is per-token** by design
 (`forward_scratch`; trace shows `gemv_oq4_grouped` ×130946, batched kernel ×0) —
