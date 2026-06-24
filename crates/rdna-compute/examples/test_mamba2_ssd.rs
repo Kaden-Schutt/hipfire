@@ -33,9 +33,9 @@ fn cpu_ssd_step_full(
     y: &mut [f32],
 ) {
     let softplus = |v: f32| if v > 20.0 { v } else { v.exp().ln_1p() };
-    let heads_per_group = num_heads / n_groups;
     for head in 0..num_heads {
-        let grp = head / heads_per_group;
+        // HF tile-expansion: head h uses group h % n_groups (see ssd.rs).
+        let grp = head % n_groups;
         let a = -(a_log[head].exp());
         let dt = softplus(dt_raw[head] + dt_bias[head]).clamp(dt_min, dt_max);
         let da = (dt * a).exp();
@@ -69,7 +69,7 @@ fn main() {
 
     // Small but representative shapes (n_groups < num_heads to exercise sharing).
     let (num_heads, head_dim, state_size, n_groups) = (4usize, 8usize, 16usize, 2usize);
-    let (dt_min, dt_max) = (0.001f32, 0.1f32);
+    let (dt_min, dt_max) = (0.0f32, f32::INFINITY); // forward clamp is (0, inf)
 
     // Deterministic pseudo-random params.
     let mut seed = 0x2545F491u32;

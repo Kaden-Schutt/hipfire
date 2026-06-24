@@ -189,6 +189,50 @@ impl NemotronModel {
         Ok(())
     }
 
+    /// Like `forward_gpu`, but downloads the residual-stream hidden state after
+    /// the embedding and after **each** block (43 vectors for 42 layers), plus
+    /// the final `[vocab]` logits — for the HF-reference numeric bisect (FU2).
+    /// `hidden[0]` = embeddings, `hidden[l+1]` = residual stream after block `l`
+    /// (before `norm_f`), matching HF `output_hidden_states`.
+    pub fn forward_capture(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+        pos: usize,
+    ) -> HipResult<(Vec<Vec<f32>>, Vec<f32>)> {
+        let hidden = self.cfg.hidden_size;
+        let eps = self.cfg.rms_norm_eps;
+        let mut caps: Vec<Vec<f32>> = Vec::with_capacity(self.layers.len() + 1);
+
+        gpu.embedding_lookup(&self.embeddings, &self.h, token, hidden)?;
+        gpu.hip.device_synchronize()?;
+        caps.push(gpu.download_f32(&self.h)?);
+        for l in 0..self.layers.len() {
+            gpu.rmsnorm_f32(&self.h, &self.layer_norm[l], &self.normed, eps)?;
+            match &mut self.layers[l] {
+                Block::Mamba2(b) => {
+                    let o = b.decode_step(gpu, &self.normed)?;
+                    gpu.add_inplace_f32(&self.h, o)?;
+                }
+                Block::Mlp(b) => {
+                    let o = b.forward(gpu, &self.normed)?;
+                    gpu.add_inplace_f32(&self.h, o)?;
+                }
+                Block::Attn(b) => {
+                    let o = b.forward(gpu, &self.normed, pos)?;
+                    gpu.add_inplace_f32(&self.h, o)?;
+                }
+            }
+            gpu.hip.device_synchronize()?;
+            caps.push(gpu.download_f32(&self.h)?);
+        }
+        gpu.rmsnorm_f32(&self.h, &self.norm_f, &self.normed, eps)?;
+        gpu.gemv_f32(&self.lm_head, &self.normed, &self.logits)?;
+        gpu.hip.device_synchronize()?;
+        let logits = gpu.download_f32(&self.logits)?;
+        Ok((caps, logits))
+    }
+
     /// Decode one token at `pos`; returns the downloaded `[vocab]` logits.
     /// (Convenience for examples/tests; the serving path uses `forward_gpu` +
     /// the on-device `logits()` tensor.)

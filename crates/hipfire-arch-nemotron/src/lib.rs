@@ -137,6 +137,12 @@ impl NemotronHConfig {
         let raw: RawConfig =
             serde_json::from_value(c.clone()).map_err(|e| format!("nemotron_h config: {e}"))?;
         let blocks = parse_block_pattern(&raw.hybrid_override_pattern)?;
+        // dt forward clamp = `time_step_limit` (a [min,max] pair), default
+        // (0, +inf) when absent/null — i.e. effectively no clamp.
+        let (dt_min, dt_max) = match raw.time_step_limit.as_ref() {
+            Some(v) if v.len() == 2 => (v[0], v[1]),
+            _ => (0.0f32, f32::INFINITY),
+        };
         if blocks.len() != raw.num_hidden_layers {
             return Err(format!(
                 "hybrid_override_pattern length {} != num_hidden_layers {}",
@@ -161,8 +167,12 @@ impl NemotronHConfig {
                 chunk_size: raw.chunk_size,
                 use_conv_bias: raw.use_conv_bias,
                 proj_bias: raw.mamba_proj_bias,
-                dt_min: raw.time_step_min,
-                dt_max: raw.time_step_max,
+                // The SSM forward clamps dt by `time_step_limit` (default
+                // (0, inf) — a no-op). `time_step_min/max` are INIT-only (used
+                // for dt_bias initialization), NOT the forward clamp — clamping
+                // the forward to [0.001, 0.1] is wrong (verified vs HF dump).
+                dt_min: dt_min,
+                dt_max: dt_max,
             },
             attn: AttnConfig {
                 num_heads: raw.num_attention_heads,
@@ -240,10 +250,16 @@ struct RawConfig {
     use_conv_bias: bool,
     #[serde(default)]
     mamba_proj_bias: bool,
+    // INIT-only (dt_bias init); NOT the forward clamp. Kept for completeness.
     #[serde(default = "default_dt_min")]
+    #[allow(dead_code)]
     time_step_min: f32,
     #[serde(default = "default_dt_max")]
+    #[allow(dead_code)]
     time_step_max: f32,
+    /// The forward dt clamp `[min, max]` (default (0, +inf) when null/absent).
+    #[serde(default)]
+    time_step_limit: Option<Vec<f32>>,
     num_attention_heads: usize,
     num_key_value_heads: usize,
     head_dim: usize,
@@ -355,8 +371,9 @@ mod tests {
         assert_eq!(cfg.mamba.d_inner(), 7680);
         assert_eq!(cfg.count(BlockKind::Attention), 4);
         assert_eq!(cfg.mlp_act, "relu2");
-        assert_eq!(cfg.mamba.dt_min, 0.001);
-        assert_eq!(cfg.mamba.dt_max, 0.1);
+        // No time_step_limit in the json → forward dt clamp is (0, +inf).
+        assert_eq!(cfg.mamba.dt_min, 0.0);
+        assert!(cfg.mamba.dt_max.is_infinite());
         // config → block dims bridge folds in hidden_size + eps.
         let dims = cfg.mamba2_dims();
         assert_eq!(dims.hidden_size, 3136);

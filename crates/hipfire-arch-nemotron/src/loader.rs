@@ -78,6 +78,14 @@ pub fn load_nemotron_weights(
         get(src, "lm_head.weight")?
     };
 
+    // nemotron_h applies the GPT-2 residual-rescale (`_init_weights`,
+    // `rescale_prenorm_residual`) to the Mamba mixer `out_proj.weight` at LOAD:
+    // `out_proj /= sqrt(num_layers)`. The checkpoint stores the un-rescaled
+    // weight, so we must apply it here to match the reference forward (verified
+    // exact vs the HF dump: ratio == sqrt(num_layers)). Only the Mamba
+    // `out_proj` is rescaled — NOT attention `o_proj` or MLP `down_proj`.
+    let out_proj_scale = 1.0f32 / (cfg.num_layers as f32).sqrt();
+
     let mut layer_norm = Vec::with_capacity(cfg.num_layers);
     let mut blocks = Vec::with_capacity(cfg.num_layers);
     for (l, kind) in cfg.blocks.iter().enumerate() {
@@ -95,7 +103,13 @@ pub fn load_nemotron_weights(
                 d: get(src, &format!("{m}.D"))?,
                 dt_bias: get(src, &format!("{m}.dt_bias"))?,
                 mixer_norm: get(src, &format!("{m}.norm.weight"))?,
-                out_proj: get(src, &format!("{m}.out_proj.weight"))?,
+                out_proj: {
+                    let mut w = get(src, &format!("{m}.out_proj.weight"))?;
+                    for v in w.iter_mut() {
+                        *v *= out_proj_scale;
+                    }
+                    w
+                },
             },
             BlockKind::Mlp => HostBlock::Mlp {
                 up: get(src, &format!("{m}.up_proj.weight"))?,

@@ -46,8 +46,11 @@ pub struct SsdParams {
 }
 
 impl SsdParams {
+    /// B/C group for a head. HF expands groups with `B.repeat(num_heads //
+    /// n_groups)` — a **tile**, so head `h` uses group `h % n_groups` (NOT the
+    /// interleave `h / (num_heads/n_groups)`). Verified exact vs the HF dump.
     fn group_of(&self, head: usize) -> usize {
-        head / (self.num_heads / self.n_groups)
+        head % self.n_groups
     }
 }
 

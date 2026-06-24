@@ -14,7 +14,7 @@
 //   state[(head*HD + p)*N + n] = dA*state + (dt*B[n])*x[head*HD+p]
 //   y[head*HD + p]             = Σ_n C[n]*state  + D[head]*x[head*HD+p]
 //
-// B/C are shared across the heads of a group: group = head / (num_heads/n_groups).
+// B/C are shared across the heads of a group: group = head % n_groups (HF tile).
 
 #include <hip/hip_runtime.h>
 
@@ -48,8 +48,9 @@ extern "C" __global__ void mamba2_ssd_decode_f32(
     int head = idx / head_dim;
     int p = idx - head * head_dim;
 
-    int heads_per_group = num_heads / n_groups;
-    int grp = head / heads_per_group;
+    // HF expands B/C groups via `B.repeat(num_heads/n_groups)` — a tile, so
+    // head h uses group h % n_groups (NOT the interleave h/(num_heads/n_groups)).
+    int grp = head % n_groups;
 
     float a = -expf(A_log[head]);
     float dt = softplus_stable(dt_raw[head] + dt_bias[head]);
