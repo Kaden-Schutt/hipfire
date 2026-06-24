@@ -1113,6 +1113,12 @@ pub fn forward_batch(
             weights.layers[0].experts[0].gate_up.gpu_dtype,
             DType::MQ2G256Lloyd
         );
+    // i8 MMQ grouped GEMM (gfx1151): 2-bit Lloyd → int8 codebook LUT + i8 WMMA
+    // at ~1.7x the FP16 grouped rate (PR #476). gate_up (MQ2) has the i8 kernel;
+    // down (MQ3) keeps FP16 until the mq3 i8 kernel lands. Opt-in for now.
+    let moe_i8 = moe_grouped
+        && std::env::var("HIPFIRE_MINIMAX_MOE_I8").as_deref() == Ok("1")
+        && gpu.arch.starts_with("gfx1151");
     let m_total_max = b * k_top + n_exp * MOE_BLOCK_M;
     // i32 scratch lives in F32-sized buffers (kernels read raw bytes as i32,
     // same convention as topk_idx above). `None` when the indexed path is used.
@@ -1268,20 +1274,37 @@ pub fn forward_batch(
             .map_err(|e| format!("minimax L{l} grouped scatter: {e:?}"))?;
 
             // Grouped gate_up GEMM (MQ2-Lloyd): gathers ffn_x_rot rows by token
-            // (x_row_div=k_top) → y_gate_up_grouped [m_total, 2*inter].
-            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
-                &layer.expert_gate_up_ptrs,
-                g_tiles,
-                g_sorted,
-                &ffn_x_rot,
-                g_y_gu,
-                2 * inter,
-                hidden,
-                k_top,
-                m_total_max,
-                b,
-            )
-            .map_err(|e| format!("minimax L{l} grouped gate_up: {e:?}"))?;
+            // (x_row_div=k_top) → y_gate_up_grouped [m_total, 2*inter]. i8 MMQ
+            // when enabled (gfx1151, shape ok), else FP16 WMMA.
+            if moe_i8 && (2 * inter) % 16 == 0 && hidden % 256 == 0 {
+                gpu.gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151(
+                    &layer.expert_gate_up_ptrs,
+                    g_tiles,
+                    g_sorted,
+                    &ffn_x_rot,
+                    g_y_gu,
+                    2 * inter,
+                    hidden,
+                    k_top,
+                    m_total_max,
+                    b,
+                )
+                .map_err(|e| format!("minimax L{l} grouped gate_up i8: {e:?}"))?;
+            } else {
+                gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
+                    &layer.expert_gate_up_ptrs,
+                    g_tiles,
+                    g_sorted,
+                    &ffn_x_rot,
+                    g_y_gu,
+                    2 * inter,
+                    hidden,
+                    k_top,
+                    m_total_max,
+                    b,
+                )
+                .map_err(|e| format!("minimax L{l} grouped gate_up: {e:?}"))?;
+            }
 
             // Unscatter grouped → natural [B*k_top, inter] gate/up.
             gpu.moe_gate_up_unscatter_k8(g_y_gu, g_sorted, &gate, &up, inter, k_top, m_total_max)
@@ -1300,8 +1323,24 @@ pub fn forward_batch(
             .map_err(|e| format!("minimax L{l} grouped silu_mul_rotate: {e}"))?;
 
             // Grouped down GEMM: gathers rot rows (x_row_div=1) → y_down_grouped.
+            // i8 MMQ when enabled (gfx1151, K=inter%256==0, M=hidden%16==0).
             let ddt = layer.experts[0].down.gpu_dtype;
+            let down_i8 = moe_i8 && hidden % 16 == 0 && inter % 256 == 0;
             match ddt {
+                DType::MQ3G256Lloyd if down_i8 => gpu
+                    .gemm_mq3g256_lloyd_moe_grouped_mmq_gfx1151(
+                        &layer.expert_down_ptrs,
+                        g_tiles,
+                        g_sorted,
+                        &rot,
+                        g_y_dn,
+                        hidden,
+                        inter,
+                        1,
+                        m_total_max,
+                        b * k_top,
+                    )
+                    .map_err(|e| format!("minimax L{l} grouped down mq3l i8: {e:?}"))?,
                 DType::MQ3G256Lloyd => gpu
                     .gemm_mq3g256_lloyd_moe_grouped_wmma(
                         &layer.expert_down_ptrs,
@@ -1316,6 +1355,20 @@ pub fn forward_batch(
                         b * k_top,
                     )
                     .map_err(|e| format!("minimax L{l} grouped down mq3l: {e:?}"))?,
+                DType::MQ2G256Lloyd if down_i8 => gpu
+                    .gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151(
+                        &layer.expert_down_ptrs,
+                        g_tiles,
+                        g_sorted,
+                        &rot,
+                        g_y_dn,
+                        hidden,
+                        inter,
+                        1,
+                        m_total_max,
+                        b * k_top,
+                    )
+                    .map_err(|e| format!("minimax L{l} grouped down mq2l i8: {e:?}"))?,
                 DType::MQ2G256Lloyd => gpu
                     .gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
                         &layer.expert_down_ptrs,
