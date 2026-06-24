@@ -3,9 +3,11 @@
 Status as of 2026-06-25: **nemotron_h (Nano-4B) serves end-to-end** (arch_id 14,
 loads and streams tokens), but coherent chat output remains blocked by FU1. The
 original mq4 artifact flips a close f32/q8 `<|im_end|>` boundary into a newline
-loop; q8 tracks f32 but still stops immediately or samples incoherently without a
-valid external reference. See `docs/plans/2026-06-24-nemotron-fu5-status.md` for
-the current evidence and `docs/plans/2026-06-24-nemotron-h-mamba2.md` for N0–N5.
+loop; q8 tracks f32 but still stops immediately or samples incoherently.
+`benchmarks/nemotron/dump_hf_reference.py` is now the repeatable local
+Python/native-Mamba first-token and per-layer reference. See
+`docs/plans/2026-06-24-nemotron-fu5-status.md` for the current evidence and
+`docs/plans/2026-06-24-nemotron-h-mamba2.md` for N0–N5.
 This doc plans the six follow-ups, each self-contained and grounded in the
 current code/checkpoints. Effort tags: **S** ≈ hours, **M** ≈ 1–2 days, **L** ≈
 several days.
@@ -38,9 +40,11 @@ This did **not** resolve coherence. Current `target/debug/hipfire-daemon` with
 the original mq4 Nano-4B artifact emits newline-only output. A q8 artifact tracks
 f32 at the first-token boundary and avoids the newline loop, but greedy
 closed-think generation stops immediately and a sampled reasoning-on prompt is
-still incoherent. Treat the remaining FU1 task as "obtain a valid
-CUDA/vLLM/NVIDIA-runtime reference and compare generation," not as another
-chat-template tweak.
+still incoherent. The local Python/native-Mamba reference now matches Hipfire f32
+on the closed-think 2+2 prompt (top-5 `[11, 1010, 1058, 1050, 1319]`, logit
+relative delta 0.0221), so treat the remaining FU1 task as "find a coherent
+generation convention or production CUDA/vLLM/NVIDIA-runtime reference," not as
+another chat-template tweak.
 
 **Problem (root-caused).** The N5 serve test stopped after 8 tokens ("We need to
 answer in one sentence.") — an early/odd halt. Cause is concrete:
@@ -88,8 +92,9 @@ vision-scoped. No text/nemotron HF-ref path.
 
 **Approach.**
 1. Python (tooling only, not hot path): load HF model with `trust_remote_code`,
-   register forward hooks on each `NemotronHBlock` (input + output) and the final
-   logits for a fixed token sequence; dump to `.safetensors`/`.npy`.
+   register forward hooks on each `NemotronHBlock` output and the final logits
+   for a fixed token sequence; dump to `.npz`. This now lives in
+   `benchmarks/nemotron/dump_hf_reference.py`.
 2. Rust example in `hipfire-arch-nemotron` (gpu, gated on the checkpoint): run the
    same tokens through `NemotronModel`, dumping each block's input/output (add a
    debug hook to `forward_gpu`), compare against the HF dump, report the

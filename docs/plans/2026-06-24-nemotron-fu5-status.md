@@ -10,7 +10,7 @@ ReLU²-MLP hybrid).
 
 | FU | Title | State |
 |----|-------|-------|
-| FU2 | HF-reference numeric bisect | **DONE** (committed earlier) |
+| FU2 | HF-reference numeric bisect | **DONE** (committed earlier; Python native-Mamba reference refreshed) |
 | FU3 | quantizer → nemotron_h mq4/q8 .hfq | **DONE** |
 | FU4 | loader compat (load .hfq + quantized gemv) + serving | **DONE** |
 | FU5 | N6 batched prefill + q8 SSM state | **mostly done** — q8 state + benchmarks remain |
@@ -42,6 +42,15 @@ Validation on gfx1151 still reproduces the FU1 blocker:
 - Local HF pure-Torch fallback (with `mamba_ssm` stubs and trained `dt_bias`
   restored from safetensors) matches Hipfire f32 at the first-token boundary for
   the same prompt: top-2 are `<|im_end|>` id 11 then newline id 1010.
+- `benchmarks/nemotron/dump_hf_reference.py` is now the repeatable Python
+  reference harness for this comparison. It can render the same Jinja ChatML
+  prompt as Hipfire, restore trained `dt_bias`, patch Nemotron Mamba mixers to
+  Transformers' canonical `Mamba2Mixer.torch_forward`, dump Hipfire-aligned
+  per-block hidden states, and record first-token top-k/generation metadata.
+- The closed-think 2+2 reference dump compared against `bisect_nano4b`
+  (`CAP_POS=last`, pos 28) has no per-layer divergence above 5%; final logits
+  match top-5 `[11, 1010, 1058, 1050, 1319]`, logit max|delta|=0.33261,
+  relative logit delta=0.0221.
 - `/tmp/nano4b-mq4.hfq` flips that close f32 boundary to newline:
   f32 argmax=11, mq4 argmax=1010, logit cosine 0.989951, top-5 overlap 4/5.
 - `/tmp/nano4b-q8.hfq` tracks f32: argmax=11, identical top-5, logit cosine
@@ -53,10 +62,13 @@ Validation on gfx1151 still reproduces the FU1 blocker:
 So FU1 is no longer "do the chat-template work." The immediate conclusion is
 that mq4 is too lossy for this uncalibrated Nano-4B artifact at a close
 generation boundary; q8 is numerically faithful but still does not prove
-coherent serving. What remains is to get a valid reference path for this
-checkpoint (CUDA/mamba-ssm, vLLM, or another NVIDIA runtime) or otherwise prove
-the correct generation convention. The ROCm pure-Torch fallback is useful for
-first-token diagnostics, but not a coherence oracle.
+coherent serving. The refreshed Python/native-Mamba reference proves the Hipfire
+f32 forward/generation boundary for the closed-think prompt, but it still says
+the correct greedy first token is immediate `<|im_end|>`. What remains is to get
+a coherent generation convention or a production reference path for this
+checkpoint (CUDA/mamba-ssm, vLLM, or another NVIDIA runtime). The local Python
+reference is useful for first-token and per-layer diagnostics, but not by itself
+a coherence oracle.
 
 ## FU4 (DONE, committed)
 
@@ -151,22 +163,27 @@ introduces a new **'E' (MoE) block**: `BlockKind::Moe` + `NemotronMoeGpu` (route
 Daemon generation with the original mq4 artifact produces a newline attractor;
 the q8 artifact follows f32 and stops immediately on the closed-think 2+2 prompt.
 Forward numerics are validated (FU4/FU5 prefill==decode, q8-vs-f32 cosine
-0.999967), and the concrete EOS/Jinja/thinking-control work is done. The
-remaining blocker is reference quality: Nemotron-H needs `mamba_ssm` CUDA
-kernels for the intended HF fast path, while the local ROCm pure-Torch fallback
-can only serve as a first-token diagnostic, not as a coherence oracle.
+0.999967), and the concrete EOS/Jinja/thinking-control work is done. The Python
+native-Mamba reference now gives a repeatable local first-token/per-layer oracle
+and matches Hipfire f32 on the closed-think prompt. The remaining blocker is
+coherence/reference quality: the reference boundary itself chooses immediate
+`<|im_end|>` for that prompt, and the local ROCm/Python path is not enough to
+prove the intended production generation convention.
 
 Next useful FU1 work:
 
-1. Capture a valid CUDA/vLLM/NVIDIA-runtime reference for Nano-4B on 3-4 prompts,
-   including the exact rendered ChatML IDs and first generated token logits.
-2. Compare Hipfire f32/q8 against that reference at the generation boundary. If
+1. Use `benchmarks/nemotron/dump_hf_reference.py` as the first local oracle for
+   every prompt under investigation; keep the rendered ChatML IDs and first-token
+   top-k with the evidence.
+2. Capture a valid CUDA/vLLM/NVIDIA-runtime reference for Nano-4B on 3-4 prompts
+   if the local native-Mamba reference still stops or samples incoherently.
+3. Compare Hipfire f32/q8 against that reference at the generation boundary. If
    the reference is coherent, bisect the first divergence against the already
    added per-layer/block hooks.
-3. Treat mq4 Nano-4B as a sensitivity issue until calibrated: either promote
+4. Treat mq4 Nano-4B as a sensitivity issue until calibrated: either promote
    recurrence-adjacent projection-back weights to q8 for this arch, or run an
    imatrix/AWQ/Lloyd pass before claiming mq4 coherence.
-4. Only after a coherent reference exists, tune sampling/repeat penalties or
+5. Only after a coherent reference exists, tune sampling/repeat penalties or
    prompt policy. Current prompt/EOS-only changes do not fix the blocker.
 
 ## Validation entry points (all gpu-tcas-coordinated via `hipfire lock`)
@@ -181,4 +198,12 @@ cargo run -p hipfire-arch-nemotron --example test_attn_prefill_gpu   # attention
 cargo run -p hipfire-arch-nemotron --example test_model_prefill_gpu  # full model (FU5 gate)
 cargo run -p hipfire-arch-nemotron --example test_model_prefill_hfq_gpu # full HFQ model
 cargo run -p hipfire-arch-nemotron --example hfq_vs_f32              # FU4 quant loader
+
+# Python native-Mamba reference + Hipfire-side bisect for a rendered prompt:
+python3 benchmarks/nemotron/dump_hf_reference.py --mode jinja --thinking off \
+  --text 'Answer in one short sentence: What is 2+2?' \
+  --max-new-tokens 1 --out /tmp/nemo_hf_ref_closed2p2.npz
+NEMO_TOKENS='10,25708,1010,11,1010,10,3263,1010,31106,1294,1925,4958,19286,1058,5675,1395,1032,1050,1043,1050,1063,11,1010,10,1503,19464,1010,12,13' \
+  CAP_POS=last cargo run -p hipfire-arch-nemotron --example bisect_nano4b -- /tmp/nemo_hipfire_closed2p2.bin
+python3 benchmarks/nemotron/compare_bisect.py /tmp/nemo_hf_ref_closed2p2.npz /tmp/nemo_hipfire_closed2p2.bin 28
 ```
