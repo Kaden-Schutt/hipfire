@@ -226,4 +226,56 @@ impl Gpu {
             )
         }
     }
+
+    /// Mamba-2 `RMSNormGated` **prefill** form (N6): batched gate-then-group-
+    /// RMSNorm over `seq_len` positions in one launch (vs `seq_len`
+    /// `mamba2_gated_norm_f32` launches). `y`/`z`/`out` are `[seq_len * d_inner]`
+    /// (position-major); `weight` is `[d_inner]` (shared across positions). See
+    /// `kernels/src/mamba2_gated_norm_seq.hip`.
+    pub fn mamba2_gated_norm_seq_f32(
+        &mut self,
+        out: &GpuTensor,
+        y: &GpuTensor,
+        z: &GpuTensor,
+        weight: &GpuTensor,
+        seq_len: usize,
+        n_groups: usize,
+        group_size: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "mamba2_gated_norm_seq",
+            kernels::MAMBA2_GATED_NORM_SEQ_SRC,
+            "mamba2_gated_norm_seq_f32",
+        )?;
+        let op = out.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let zp = z.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let sl = seq_len as i32;
+        let ng = n_groups as i32;
+        let gs = group_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &op as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &zp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sl as *const _ as *mut c_void,
+            &ng as *const _ as *mut c_void,
+            &gs as *const _ as *mut c_void,
+            &eps as *const _ as *mut c_void,
+        ];
+        let func = &self.functions["mamba2_gated_norm_seq_f32"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_groups as u32, seq_len as u32, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
 }
