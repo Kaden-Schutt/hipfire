@@ -19011,39 +19011,44 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if qkv_is_oq4 && qkv_same_dtype {
-                    // Opus W4A4: no fused 3-way oq4 QKV kernel — int4-quantize the
-                    // shared FWHT(+AWQ)-rotated activation and run the grouped-WMMA
-                    // GEMM per projection (q/k/v). The quantize is re-run per call
-                    // (cheap vs the GEMM); all three read the same x_rot_batch.
+                    // OQ4+ batched prefill FA QKV: int8-WMMA MMQ (n>=64) quantizing
+                    // the shared FWHT(+AWQ)-rotated activation to q8_1 ONCE across
+                    // q/k/v; gemm_oq4_qkv_mmq falls back to the f16 grouped path for
+                    // tiny batches internally via gemm_oq4_grouped_act_batched.
                     debug_assert!(
                         matches!(layer.wk.gpu_dtype, DType::Oq4G256)
                             && matches!(layer.wv.gpu_dtype, DType::Oq4G256),
                         "FA qkv Oq4 dispatch requires all of wq/wk/wv to be Oq4G256",
                     );
-                    gpu.gemm_oq4_grouped_act_batched(
-                        &layer.wq.buf,
-                        &pbs.x_rot_batch,
-                        &pbs.fa_q_full_batch,
-                        layer.wq.m,
-                        layer.wq.k,
-                        n,
-                    )?;
-                    gpu.gemm_oq4_grouped_act_batched(
-                        &layer.wk.buf,
-                        &pbs.x_rot_batch,
-                        &pbs.fa_k_batch,
-                        layer.wk.m,
-                        layer.wk.k,
-                        n,
-                    )?;
-                    gpu.gemm_oq4_grouped_act_batched(
-                        &layer.wv.buf,
-                        &pbs.x_rot_batch,
-                        &pbs.fa_v_batch,
-                        layer.wv.m,
-                        layer.wv.k,
-                        n,
-                    )?;
+                    if n >= 64 {
+                        gpu.gemm_oq4_qkv_mmq(
+                            &layer.wq.buf,
+                            &layer.wk.buf,
+                            &layer.wv.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.fa_q_full_batch,
+                            &pbs.fa_k_batch,
+                            &pbs.fa_v_batch,
+                            layer.wq.m,
+                            layer.wk.m,
+                            layer.wv.m,
+                            layer.wq.k,
+                            n,
+                        )?;
+                    } else {
+                        gpu.gemm_oq4_grouped_act_batched(
+                            &layer.wq.buf, &pbs.x_rot_batch, &pbs.fa_q_full_batch,
+                            layer.wq.m, layer.wq.k, n,
+                        )?;
+                        gpu.gemm_oq4_grouped_act_batched(
+                            &layer.wk.buf, &pbs.x_rot_batch, &pbs.fa_k_batch,
+                            layer.wk.m, layer.wk.k, n,
+                        )?;
+                        gpu.gemm_oq4_grouped_act_batched(
+                            &layer.wv.buf, &pbs.x_rot_batch, &pbs.fa_v_batch,
+                            layer.wv.m, layer.wv.k, n,
+                        )?;
+                    }
                 } else if qkv_is_q8 && q8_wmma_arch && qkv_same_dtype {
                     debug_assert!(
                         matches!(layer.wk.gpu_dtype, DType::Q8_0)

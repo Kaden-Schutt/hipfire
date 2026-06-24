@@ -403,15 +403,21 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 quant: "oq4g256 (prefill-only)",
             })?;
             const GROUP: usize = 256;
-            // OQ4+ W4A16 batched prefill: dequant the 4-bit weight to f16 and run
-            // f16×f16 WMMA against the f16 activation (no int4 act-quant → no
-            // batched-vs-pertoken divergence amplification). Per-projection GEMM —
-            // prefill is compute-bound at B>1, so the fused-demux launch saving is
-            // moot; the f16 grouped WMMA matches the W4A16 decode numerics.
-            for (w, y, mm) in
-                [(wqkv, qkv, mqkv), (wz, z, mz), (w_beta, beta, mbeta), (w_alpha, alpha, malpha)]
-            {
-                hip!(gpu.gemm_oq4_grouped_f16_wmma(w, x, y, mm, k, n, GROUP))?;
+            // OQ4+ batched prefill. n>=64: int8-WMMA MMQ (mq4-class fast path —
+            // int8 operands + LDS activation reuse), quantizing the shared
+            // activation to q8_1 ONCE across the 4 projections. n<64: f16-WMMA
+            // grouped (MMQ's 128-col tiling underutilizes tiny batches).
+            if n >= 64 {
+                hip!(gpu.gemm_oq4_qkvza_mmq(
+                    wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k,
+                    n
+                ))?;
+            } else {
+                for (w, y, mm) in
+                    [(wqkv, qkv, mqkv), (wz, z, mz), (w_beta, beta, mbeta), (w_alpha, alpha, malpha)]
+                {
+                    hip!(gpu.gemm_oq4_grouped_f16_wmma(w, x, y, mm, k, n, GROUP))?;
+                }
             }
             Ok(())
         }
@@ -563,10 +569,14 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 quant: "oq4g256 (prefill-only)",
             })?;
             const GROUP: usize = 256;
-            // OQ4+ W4A16 batched prefill (see FusedQkvzaOq4G256): per-projection
-            // f16 grouped WMMA, 4-bit weight dequantized inline, no int4 act-quant.
-            for (w, y, mm) in [(w_gate, gate, mg), (w_up, up, mu)] {
-                hip!(gpu.gemm_oq4_grouped_f16_wmma(w, x, y, mm, k, n, GROUP))?;
+            // OQ4+ batched prefill gate+up (see FusedQkvzaOq4G256): n>=64 int8-WMMA
+            // MMQ (quantize once across both projections), else f16-WMMA grouped.
+            if n >= 64 {
+                hip!(gpu.gemm_oq4_gate_up_mmq(w_gate, w_up, x, gate, up, mg, mu, k, n))?;
+            } else {
+                for (w, y, mm) in [(w_gate, gate, mg), (w_up, up, mu)] {
+                    hip!(gpu.gemm_oq4_grouped_f16_wmma(w, x, y, mm, k, n, GROUP))?;
+                }
             }
             Ok(())
         }

@@ -3751,6 +3751,15 @@ pub const GEMM_OQ4_GROUPED_WMMA_SRC: &str =
 pub const GEMM_OQ4_GROUPED_F16_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_oq4_grouped_f16_wmma.hip");
 
+/// OQ4+ MMQ (int8-WMMA, LDS-staged) batched GEMM — the int8 backend matching
+/// mq4's MMQ (gemm_hfq4g256_residual_mmq). Reuses the shared q8_1 activation
+/// quantizer (quantize_q8_1_mmq_ds4 via ensure_q8_1_mmq_x); only the weight-tile
+/// loader differs (OQ4+ split sign-extended-int4, zp=0). int8-WMMA +
+/// LDS-activation-reuse ≈ 1.5× the f16 path on gfx1103. See
+/// `kernels/src/gemm_oq4_residual_mmq.hip`.
+pub const GEMM_OQ4_RESIDUAL_MMQ_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq4_residual_mmq.hip");
+
 /// Opus Quant W4A4: dynamic per-token/group INT4 activation quantizer (f32 →
 /// signed int4 + per-group scales). Feeds `gemm_oq4_grouped_wmma`. gfx1103
 /// wave32, zero LDS. See `kernels/src/quantize_act_oq4.hip`.
