@@ -11,7 +11,7 @@ ReLU²-MLP hybrid).
 | FU | Title | State |
 |----|-------|-------|
 | FU2 | HF-reference numeric bisect | **DONE** (committed earlier; Python native-Mamba reference refreshed) |
-| FU3 | quantizer → nemotron_h mq4/q8 .hfq | **DONE** |
+| FU3 | quantizer → nemotron_h mq4/q8 .hfq | **DONE** — mq4 protects Nemotron residual writers as q8 |
 | FU4 | loader compat (load .hfq + quantized gemv) + serving | **DONE** |
 | FU5 | N6 batched prefill + q8 SSM state | **mostly done** — q8 state + benchmarks remain |
 | FU6 | Nano-30B MoE ('E' block) | not started |
@@ -55,20 +55,27 @@ Validation on gfx1151 still reproduces the FU1 blocker:
   f32 argmax=11, mq4 argmax=1010, logit cosine 0.989951, top-5 overlap 4/5.
 - `/tmp/nano4b-q8.hfq` tracks f32: argmax=11, identical top-5, logit cosine
   0.999967, mean|delta|=0.01770, max|delta|=0.11181.
+- `hipfire-quantize --format mq4` now protects Nemotron-H residual writers
+  (`*.mixer.out_proj.weight`, `*.mixer.down_proj.weight`, `*.mixer.o_proj.weight`)
+  as Q8. On Nano-4B this makes the fresh protected artifact
+  `/tmp/nano4b-mq4-protected.hfq` Q8-sized (4.0G) because the remaining linear
+  readers already fall back to Q8 on ragged K=3136. The protected artifact
+  matches f32 at the closed-think boundary: argmax=11, identical top-5, logit
+  cosine 0.999967, mean|delta|=0.01770, max|delta|=0.11181.
 - Q8 serving therefore avoids the newline loop on the closed-think 2+2 prompt,
   but greedy generation emits 0 tokens because the first token is `<|im_end|>`.
   A reasoning-on sampled haiku prompt still produced incoherent numeric text.
 
 So FU1 is no longer "do the chat-template work." The immediate conclusion is
-that mq4 is too lossy for this uncalibrated Nano-4B artifact at a close
-generation boundary; q8 is numerically faithful but still does not prove
-coherent serving. The refreshed Python/native-Mamba reference proves the Hipfire
-f32 forward/generation boundary for the closed-think prompt, but it still says
-the correct greedy first token is immediate `<|im_end|>`. What remains is to get
-a coherent generation convention or a production reference path for this
-checkpoint (CUDA/mamba-ssm, vLLM, or another NVIDIA runtime). The local Python
-reference is useful for first-token and per-layer diagnostics, but not by itself
-a coherence oracle.
+that unprotected mq4 is too lossy for this uncalibrated Nano-4B artifact at a
+close generation boundary; protected mq4/q8 is numerically faithful but still
+does not prove coherent serving. The refreshed Python/native-Mamba reference
+proves the Hipfire f32 forward/generation boundary for the closed-think prompt,
+but it still says the correct greedy first token is immediate `<|im_end|>`. What
+remains is to get a coherent generation convention or a production reference path
+for this checkpoint (CUDA/mamba-ssm, vLLM, or another NVIDIA runtime). The local
+Python reference is useful for first-token and per-layer diagnostics, but not by
+itself a coherence oracle.
 
 ## FU4 (DONE, committed)
 
@@ -160,12 +167,13 @@ introduces a new **'E' (MoE) block**: `BlockKind::Moe` + `NemotronMoeGpu` (route
 
 ## FU1 (coherence) — standing blocker
 
-Daemon generation with the original mq4 artifact produces a newline attractor;
-the q8 artifact follows f32 and stops immediately on the closed-think 2+2 prompt.
-Forward numerics are validated (FU4/FU5 prefill==decode, q8-vs-f32 cosine
-0.999967), and the concrete EOS/Jinja/thinking-control work is done. The Python
-native-Mamba reference now gives a repeatable local first-token/per-layer oracle
-and matches Hipfire f32 on the closed-think prompt. The remaining blocker is
+Daemon generation with the original unprotected mq4 artifact produces a newline
+attractor; q8 and the fresh protected-mq4 artifact follow f32 and stop
+immediately on the closed-think 2+2 prompt. Forward numerics are validated
+(FU4/FU5 prefill==decode, protected-mq4/q8-vs-f32 cosine 0.999967), and the
+concrete EOS/Jinja/thinking-control work is done. The Python native-Mamba
+reference now gives a repeatable local first-token/per-layer oracle and matches
+Hipfire f32 on the closed-think prompt. The remaining blocker is
 coherence/reference quality: the reference boundary itself chooses immediate
 `<|im_end|>` for that prompt, and the local ROCm/Python path is not enough to
 prove the intended production generation convention.
@@ -180,9 +188,9 @@ Next useful FU1 work:
 3. Compare Hipfire f32/q8 against that reference at the generation boundary. If
    the reference is coherent, bisect the first divergence against the already
    added per-layer/block hooks.
-4. Treat mq4 Nano-4B as a sensitivity issue until calibrated: either promote
-   recurrence-adjacent projection-back weights to q8 for this arch, or run an
-   imatrix/AWQ/Lloyd pass before claiming mq4 coherence.
+4. Treat real 4-bit Nano-4B as a sensitivity issue until calibrated. The current
+   `--format mq4` policy protects projection-back residual writers as q8; an
+   imatrix/AWQ/Lloyd pass is required before claiming true mq4 coherence.
 5. Only after a coherent reference exists, tune sampling/repeat penalties or
    prompt policy. Current prompt/EOS-only changes do not fix the blocker.
 
@@ -206,4 +214,9 @@ python3 benchmarks/nemotron/dump_hf_reference.py --mode jinja --thinking off \
 NEMO_TOKENS='10,25708,1010,11,1010,10,3263,1010,31106,1294,1925,4958,19286,1058,5675,1395,1032,1050,1043,1050,1063,11,1010,10,1503,19464,1010,12,13' \
   CAP_POS=last cargo run -p hipfire-arch-nemotron --example bisect_nano4b -- /tmp/nemo_hipfire_closed2p2.bin
 python3 benchmarks/nemotron/compare_bisect.py /tmp/nemo_hf_ref_closed2p2.npz /tmp/nemo_hipfire_closed2p2.bin 28
+
+# Quantizer policy smoke: protected mq4 should no longer flip EOS to newline.
+hipfire-quantize --input <Nano-4B-BF16-snapshot> --output /tmp/nano4b-mq4-protected.hfq --format mq4 --threads 16
+NEMO_TOKENS='10,25708,1010,11,1010,10,3263,1010,31106,1294,1925,4958,19286,1058,5675,1395,1032,1050,1043,1050,1063,11,1010,10,1503,19464,1010,12,13' \
+  cargo run -p hipfire-arch-nemotron --example hfq_vs_f32 -- /tmp/nano4b-mq4-protected.hfq
 ```

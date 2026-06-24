@@ -2754,6 +2754,20 @@ fn is_conv1d_tensor(name: &str) -> bool {
     name.ends_with("conv1d.weight")
 }
 
+/// Nemotron-H projections that write back into the residual stream.
+///
+/// Local Nano-4B evidence (native-Mamba Python reference + Hipfire f32/Q8/MQ4
+/// comparison) shows uncalibrated MQ4 flips the close first-token boundary from
+/// `<|im_end|>` to newline when these projection-back weights are lossy. Keep
+/// them Q8 for base MQ4-family artifacts until an imatrix/AWQ/Lloyd policy is
+/// validated for this arch.
+fn is_nemotron_h_residual_writer(name: &str) -> bool {
+    name.starts_with("backbone.layers.")
+        && (name.ends_with(".mixer.out_proj.weight")
+            || name.ends_with(".mixer.down_proj.weight")
+            || name.ends_with(".mixer.o_proj.weight"))
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 /// Resolve a model input to a local directory path.
@@ -3035,6 +3049,9 @@ fn quantize_hfq_source_tensor(
             )
         }
         HfqInputFormat::Mq4 => {
+            if is_nemotron_h_residual_writer(name) {
+                return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
+            }
             if k % 256 != 0 {
                 // MQ4G256 needs k%256==0. Sub-256 columns fall back to HFQ4G128
                 // (k%128==0) or, when k divides neither (nemotron_h hidden=3136),
@@ -7643,6 +7660,17 @@ fn main() {
                     // are both embedding tables — keep them Q8 (row-lookup-able; Q4 is too lossy).
                     let is_embed =
                         name.contains("embed_tokens") || name.ends_with("embeddings.weight");
+                    let use_mq4_family = use_mq4g256
+                        || use_mq4_mq6exp
+                        || use_mq4_routed_lloyd_mq2_exp
+                        || use_mq4_routed_lloyd_mq2_native
+                        || use_mq4_routed_lloyd_mq2_kmap
+                        || use_mq4_routed_lloyd_mq2_imatrix
+                        || use_mq4_routed_lloyd_mq3_kmap
+                        || use_mq4_routed_lloyd_mq_tiered
+                        || use_mq4_routed_lloyd_mq_antirez
+                        || use_mq4_routed_lloyd_mq_antirez_gptq
+                        || use_mq4_routed_lloyd_mq2_gptq_all;
 
                     if use_hfq_mixed {
                         // hfq-mixed: Q8 for attention, HFQ4 for FFN (fits 9B in 8GB VRAM)
@@ -7717,33 +7745,13 @@ fn main() {
                             let q = quantize_q8f16(&f32_data);
                             (q, QuantType::Q8F16, 32u32, "Q8_F16")
                         }
-                    } else if (use_mq4g256
-                        || use_mq4_mq6exp
-                        || use_mq4_routed_lloyd_mq2_exp
-                        || use_mq4_routed_lloyd_mq2_native
-                        || use_mq4_routed_lloyd_mq2_kmap
-                        || use_mq4_routed_lloyd_mq2_imatrix
-                        || use_mq4_routed_lloyd_mq3_kmap
-                        || use_mq4_routed_lloyd_mq_tiered
-                        || use_mq4_routed_lloyd_mq_antirez
-                        || use_mq4_routed_lloyd_mq_antirez_gptq
-                        || use_mq4_routed_lloyd_mq2_gptq_all)
-                        && is_embed
-                    {
+                    } else if use_mq4_family && is_embed {
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                    } else if use_mq4g256
-                        || use_mq4_mq6exp
-                        || use_mq4_routed_lloyd_mq2_exp
-                        || use_mq4_routed_lloyd_mq2_native
-                        || use_mq4_routed_lloyd_mq2_kmap
-                        || use_mq4_routed_lloyd_mq2_imatrix
-                        || use_mq4_routed_lloyd_mq3_kmap
-                        || use_mq4_routed_lloyd_mq_tiered
-                        || use_mq4_routed_lloyd_mq_antirez
-                        || use_mq4_routed_lloyd_mq_antirez_gptq
-                        || use_mq4_routed_lloyd_mq2_gptq_all
-                    {
+                    } else if use_mq4_family && is_nemotron_h_residual_writer(name) {
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    } else if use_mq4_family {
                         let k_dim = if meta.shape.len() == 2 {
                             meta.shape[1]
                         } else {
@@ -11573,6 +11581,35 @@ mod tests {
         assert!(err.contains("only source-precision HFQ tensors are supported"));
     }
 
+    #[test]
+    fn hfq_input_nemotron_mq4_promotes_residual_writers_to_q8() {
+        let raw = f32_slice_to_f16_bytes(&vec![0.125; 2 * 256]);
+
+        let (_, qt, group, label) = quantize_hfq_source_tensor(
+            "backbone.layers.0.mixer.out_proj.weight",
+            &raw,
+            QuantType::F16 as u8,
+            &[2, 256],
+            HfqInputFormat::Mq4,
+        )
+        .unwrap();
+        assert_eq!(qt as u8, QuantType::Q8F16 as u8);
+        assert_eq!(group, 32);
+        assert_eq!(label, "Q8_F16");
+
+        let (_, qt, group, label) = quantize_hfq_source_tensor(
+            "backbone.layers.0.mixer.in_proj.weight",
+            &raw,
+            QuantType::F16 as u8,
+            &[2, 256],
+            HfqInputFormat::Mq4,
+        )
+        .unwrap();
+        assert_eq!(qt as u8, QuantType::MQ4G256 as u8);
+        assert_eq!(group, 256);
+        assert_eq!(label, "MQ4G256");
+    }
+
     fn roughquant4_test_tensor(name: &str, shape: &[u32]) -> HfqTensor {
         HfqTensor {
             name: name.to_string(),
@@ -11796,6 +11833,17 @@ mod tests {
             QuantLevel::Q8
         );
         assert_eq!(kmap_resolve("lm_head.weight", 42, false), QuantLevel::Q8);
+
+        for n in [
+            "backbone.layers.0.mixer.out_proj.weight",
+            "backbone.layers.1.mixer.down_proj.weight",
+            "backbone.layers.12.mixer.o_proj.weight",
+        ] {
+            assert!(is_nemotron_h_residual_writer(n), "{n} should be protected");
+        }
+        assert!(!is_nemotron_h_residual_writer(
+            "backbone.layers.0.mixer.in_proj.weight"
+        ));
     }
 
     #[test]

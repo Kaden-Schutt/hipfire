@@ -5,7 +5,9 @@ loads and streams tokens), but coherent chat output remains blocked by FU1. The
 original mq4 artifact flips a close f32/q8 `<|im_end|>` boundary into a newline
 loop; q8 tracks f32 but still stops immediately or samples incoherently.
 `benchmarks/nemotron/dump_hf_reference.py` is now the repeatable local
-Python/native-Mamba first-token and per-layer reference. See
+Python/native-Mamba first-token and per-layer reference. `--format mq4` now
+protects Nemotron residual writers as Q8, so fresh Nano-4B protected-mq4
+artifacts follow f32/Q8 instead of the original newline flip. See
 `docs/plans/2026-06-24-nemotron-fu5-status.md` for the current evidence and
 `docs/plans/2026-06-24-nemotron-h-mamba2.md` for N0–N5.
 This doc plans the six follow-ups, each self-contained and grounded in the
@@ -42,9 +44,10 @@ f32 at the first-token boundary and avoids the newline loop, but greedy
 closed-think generation stops immediately and a sampled reasoning-on prompt is
 still incoherent. The local Python/native-Mamba reference now matches Hipfire f32
 on the closed-think 2+2 prompt (top-5 `[11, 1010, 1058, 1050, 1319]`, logit
-relative delta 0.0221), so treat the remaining FU1 task as "find a coherent
-generation convention or production CUDA/vLLM/NVIDIA-runtime reference," not as
-another chat-template tweak.
+relative delta 0.0221). Fresh protected-mq4 artifacts also match that boundary
+because Nemotron residual writers are promoted to Q8. Treat the remaining FU1
+task as "find a coherent generation convention or production
+CUDA/vLLM/NVIDIA-runtime reference," not as another chat-template tweak.
 
 **Problem (root-caused).** The N5 serve test stopped after 8 tokens ("We need to
 answer in one sentence.") — an early/odd halt. Cause is concrete:
@@ -132,10 +135,12 @@ serves at ~4 GB instead of ~16 GB f32.
    - **Keep f16/f32 (small + recurrence-sensitive):** `*.conv1d.weight`,
      `*.conv1d.bias`, `*.A_log`, `*.D`, `*.dt_bias`, `*.norm.weight` (block +
      mixer/gated norm), `backbone.norm_f.weight`.
-3. **Sensitivity:** the Mamba-2 `in_proj` drives dt/B/C — consider a higher-bit
-   group or imatrix calibration (the `astrea` skill) for `in_proj`/`out_proj`
-   before trusting mq4 there. Current local evidence says uncalibrated mq4 is too
-   noisy at the first generated token for Nano-4B, while q8 matches f32.
+3. **Sensitivity:** the Mamba-2 `in_proj` drives dt/B/C, and the projection-back
+   writers feed the residual stream. Current local evidence says uncalibrated
+   mq4 is too noisy at the first generated token for Nano-4B, while q8 matches
+   f32. The live `--format mq4` policy therefore promotes Nemotron residual
+   writers (`out_proj` / `down_proj` / `o_proj`) to Q8 until a calibrated
+   imatrix/AWQ/Lloyd policy proves true 4-bit coherence.
 
 **Reuse.** The existing quantize codecs/mq4 pipeline; per-arch name-pattern skip
 logic.
