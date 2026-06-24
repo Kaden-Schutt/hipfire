@@ -39,6 +39,11 @@ pub struct Mamba2BlockGpu {
     dt_bias: GpuTensor,
     norm_weight: GpuTensor,
     out_proj: LinearWeight,
+    /// Post-`out_proj` scalar (nemotron_h residual rescale `1/√num_layers`).
+    /// The f32 path folds this into the weight at load (so it's `1.0` here); the
+    /// HFQ path can't rescale quantized bytes, so it carries the scale and
+    /// applies it to the gemv output instead. Both yield the same result.
+    out_proj_scale: f32,
     // recurrent state (zero-initialized)
     conv_state: GpuTensor,
     ssm_state: GpuTensor,
@@ -65,11 +70,14 @@ impl Mamba2BlockGpu {
         );
         let out_proj =
             LinearWeight::F32(gpu.upload_f32(w.out_proj, &[dims.hidden_size, dims.d_inner()])?);
+        // f32 path: out_proj already carries the residual rescale (folded in by
+        // the loader), so the runtime scale is the identity.
         Self::assemble(
             gpu,
             dims,
             in_proj,
             out_proj,
+            1.0,
             w.conv_weight,
             w.conv_bias,
             w.a_log,
@@ -87,6 +95,7 @@ impl Mamba2BlockGpu {
         dims: Mamba2Dims,
         in_proj: LinearWeight,
         out_proj: LinearWeight,
+        out_proj_scale: f32,
         conv_weight: &[f32],
         conv_bias: &[f32],
         a_log: &[f32],
@@ -99,6 +108,7 @@ impl Mamba2BlockGpu {
             dims,
             in_proj,
             out_proj,
+            out_proj_scale,
             conv_weight,
             conv_bias,
             a_log,
@@ -114,6 +124,7 @@ impl Mamba2BlockGpu {
         dims: Mamba2Dims,
         in_proj: LinearWeight,
         out_proj: LinearWeight,
+        out_proj_scale: f32,
         conv_weight: &[f32],
         conv_bias: &[f32],
         a_log: &[f32],
@@ -131,6 +142,7 @@ impl Mamba2BlockGpu {
         Ok(Self {
             in_proj,
             out_proj,
+            out_proj_scale,
             conv_weight: gpu.upload_f32(conv_weight, &[conv_dim, dims.conv_kernel])?,
             conv_bias: gpu.upload_f32(conv_bias, &[conv_dim])?,
             a_log: gpu.upload_f32(a_log, &[nh])?,
@@ -235,8 +247,11 @@ impl Mamba2BlockGpu {
             d.rms_norm_eps,
         )?;
 
-        // 7. out_proj
+        // 7. out_proj (+ residual rescale on the HFQ path; identity on f32)
         self.out_proj.gemv(gpu, &self.y_norm, &self.out)?;
+        if self.out_proj_scale != 1.0 {
+            gpu.scale_f32(&self.out, self.out_proj_scale)?;
+        }
         Ok(&self.out)
     }
 

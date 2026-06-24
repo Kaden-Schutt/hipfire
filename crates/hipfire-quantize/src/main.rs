@@ -2988,7 +2988,9 @@ fn quantize_hfq_source_tensor(
         let (data, qt, label) = source_precision_tensor_bytes(raw, src_dtype, &f32_data);
         return Ok((data, qt, 0, label));
     }
-    let is_embed = name.contains("embed_tokens");
+    // `embed_tokens` (llama/qwen/…) and `backbone.embeddings.weight` (nemotron_h)
+    // are both embedding tables — keep them Q8 (row-lookup-able; Q4 is too lossy).
+    let is_embed = name.contains("embed_tokens") || name.ends_with("embeddings.weight");
     let is_moe_router =
         name.ends_with("mlp.gate.weight") || name.ends_with("mlp.shared_expert_gate.weight");
     if is_embed || is_moe_router || is_conv1d_tensor(name) || shape.len() != 2 {
@@ -3008,13 +3010,17 @@ fn quantize_hfq_source_tensor(
                     256,
                     "HFQ4G256",
                 )
-            } else {
+            } else if k % 128 == 0 {
                 (
                     quantize_hfq4g128(&f32_data),
                     QuantType::HFQ4G128,
                     128,
                     "HFQ4G128",
                 )
+            } else {
+                // k divides neither 256 nor 128 (e.g. nemotron_h hidden=3136 =
+                // 64·49) → no valid HFQ4 grouping; fall back to Q8 (group 32).
+                (quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16")
             }
         }
         HfqInputFormat::Hfq6 => {
@@ -3030,12 +3036,19 @@ fn quantize_hfq_source_tensor(
         }
         HfqInputFormat::Mq4 => {
             if k % 256 != 0 {
-                return Ok((
-                    quantize_hfq4g128(&f32_data),
-                    QuantType::HFQ4G128,
-                    128,
-                    "HFQ4G128",
-                ));
+                // MQ4G256 needs k%256==0. Sub-256 columns fall back to HFQ4G128
+                // (k%128==0) or, when k divides neither (nemotron_h hidden=3136),
+                // to Q8 (group 32) — HFQ4G128 on k%128!=0 emits garbage.
+                return Ok(if k % 128 == 0 {
+                    (
+                        quantize_hfq4g128(&f32_data),
+                        QuantType::HFQ4G128,
+                        128,
+                        "HFQ4G128",
+                    )
+                } else {
+                    (quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16")
+                });
             }
             (
                 quantize_mq4g256(&f32_data, &signs1, &signs2),
@@ -7626,7 +7639,10 @@ fn main() {
 
                     // Embeddings stored as Q8 in HFQ4 mode — Q4 is too lossy for
                     // large-dim models (9B: dim=4096, values ~0.016, Q4 step ~0.007)
-                    let is_embed = name.contains("embed_tokens");
+                    // `embed_tokens` (llama/qwen/…) and `backbone.embeddings.weight` (nemotron_h)
+                    // are both embedding tables — keep them Q8 (row-lookup-able; Q4 is too lossy).
+                    let is_embed =
+                        name.contains("embed_tokens") || name.ends_with("embeddings.weight");
 
                     if use_hfq_mixed {
                         // hfq-mixed: Q8 for attention, HFQ4 for FFN (fits 9B in 8GB VRAM)
@@ -7782,10 +7798,16 @@ fn main() {
                                 quantize_mq4g256(&f32_data, &signs1, &signs2)
                             };
                             (q, QuantType::MQ4G256, 256u32, "MQ4G256")
-                        } else {
-                            // Fallback to standard HFQ4-G128 for non-256-aligned
+                        } else if k_dim % 128 == 0 {
+                            // Non-256 but 128-aligned → HFQ4-G128.
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        } else {
+                            // k divides neither 256 nor 128 (nemotron_h hidden=3136
+                            // = 64·49) → HFQ4-G128 would emit garbage (the kernel
+                            // assumes k%128==0). Fall back to Q8 (group 32).
+                            let q = quantize_q8f16(&f32_data);
+                            (q, QuantType::Q8F16, 32u32, "Q8_F16")
                         }
                     } else if use_hfp4 && is_embed {
                         // HFP4 embeddings stay Q8F16 (matches MQ4 / HFQ4 pattern — embedding lookup is

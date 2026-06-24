@@ -133,3 +133,106 @@ pub fn load_nemotron_weights(
         lm_head,
     })
 }
+
+// ── HFQ (quantized) loading ──────────────────────────────────────────────────
+
+use crate::weight::{EmbeddingTable, LinearWeight};
+use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::weights::WeightTensor;
+use rdna_compute::{DType, Gpu};
+
+/// quant_type byte → quantized linear `DType` (None ⇒ stored as a plain
+/// precision, handle via `dequant_qt`). See `qt_name` in hipfire-quantize.
+fn linear_dtype(qt: u8) -> Option<DType> {
+    match qt {
+        3 => Some(DType::Q8_0), // Q8F16
+        6 => Some(DType::HFQ4G256),
+        7 => Some(DType::HFQ4G128),
+        13 => Some(DType::MQ4G256),
+        _ => None,
+    }
+}
+
+/// Dequantize a plain-precision HFQ tensor (F16=1, F32=2, BF16=16) to f32.
+fn dequant_qt(qt: u8, bytes: &[u8]) -> Result<Vec<f32>, String> {
+    match qt {
+        1 => dequant("F16", bytes),
+        2 => dequant("F32", bytes),
+        16 => dequant("BF16", bytes),
+        other => Err(format!(
+            "nemotron hfq: unsupported plain quant_type {other}"
+        )),
+    }
+}
+
+fn hfq_tensor<'a>(hfq: &'a HfqFile, name: &str) -> Result<(u8, Vec<u8>), String> {
+    let (info, data) = hfq
+        .tensor_data_vec(name)
+        .ok_or_else(|| format!("nemotron hfq: missing tensor {name:?}"))?;
+    let _ = &info.shape;
+    Ok((info.quant_type, data))
+}
+
+/// Load one linear weight as a `LinearWeight` (quantized when 4-bit/Q8, else an
+/// F32 upload). `m`=out rows, `k`=in cols. The nemotron HFQ has no awq sidecars,
+/// so MQ4's FWHT rotation is applied automatically by the dispatched gemv.
+pub fn load_linear_hfq(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+) -> Result<LinearWeight, String> {
+    let (qt, data) = hfq_tensor(hfq, name)?;
+    if let Some(dtype) = linear_dtype(qt) {
+        let buf = gpu
+            .upload_raw(&data, &[data.len()])
+            .map_err(|e| format!("nemotron hfq upload {name}: {e:?}"))?;
+        Ok(LinearWeight::Quant(Box::new(WeightTensor {
+            buf,
+            gpu_dtype: dtype,
+            m,
+            k,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+        })))
+    } else {
+        let f = dequant_qt(qt, &data)?;
+        Ok(LinearWeight::F32(
+            gpu.upload_f32(&f, &[m, k])
+                .map_err(|e| format!("nemotron hfq f32 {name}: {e:?}"))?,
+        ))
+    }
+}
+
+/// Load a tensor stored at plain precision (BF16/F16/F32) as host f32 — for the
+/// recurrence + norm tensors the quantizer keeps un-quantized.
+pub fn load_f32_hfq(hfq: &HfqFile, name: &str) -> Result<Vec<f32>, String> {
+    let (qt, data) = hfq_tensor(hfq, name)?;
+    dequant_qt(qt, &data)
+}
+
+/// Load the embedding table: Q8 (kept quantized, looked up via
+/// `embedding_lookup_q8`) or a plain-precision f32 upload.
+pub fn load_embeddings_hfq(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    vocab: usize,
+    hidden: usize,
+) -> Result<EmbeddingTable, String> {
+    let (qt, data) = hfq_tensor(hfq, name)?;
+    if qt == 3 {
+        let buf = gpu
+            .upload_raw(&data, &[data.len()])
+            .map_err(|e| format!("nemotron hfq emb {name}: {e:?}"))?;
+        Ok(EmbeddingTable::Q8(buf))
+    } else {
+        let f = dequant_qt(qt, &data)?;
+        Ok(EmbeddingTable::F32(
+            gpu.upload_f32(&f, &[vocab, hidden])
+                .map_err(|e| format!("nemotron hfq emb f32 {name}: {e:?}"))?,
+        ))
+    }
+}

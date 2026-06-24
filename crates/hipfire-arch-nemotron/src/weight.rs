@@ -57,3 +57,29 @@ impl LinearWeight {
         }
     }
 }
+
+/// The token embedding table — plain f32 (safetensors) or Q8 (HFQ). Looked up
+/// by row, not gemv'd, so it needs its own dispatch.
+pub enum EmbeddingTable {
+    F32(GpuTensor),
+    /// Q8_0 storage (`embedding_lookup_q8` dequantizes the looked-up row).
+    Q8(GpuTensor),
+}
+
+impl EmbeddingTable {
+    /// Copy/dequantize the embedding row for `token` into `out` `[dim]`.
+    pub fn lookup(&self, gpu: &mut Gpu, out: &GpuTensor, token: u32, dim: usize) -> HipResult<()> {
+        match self {
+            EmbeddingTable::F32(t) => gpu.embedding_lookup(t, out, token, dim),
+            EmbeddingTable::Q8(t) => gpu.embedding_lookup_q8(t, out, token, dim),
+        }
+    }
+
+    pub fn free(self, gpu: &mut Gpu) {
+        match self {
+            EmbeddingTable::F32(t) | EmbeddingTable::Q8(t) => {
+                let _ = gpu.free_tensor(t);
+            }
+        }
+    }
+}

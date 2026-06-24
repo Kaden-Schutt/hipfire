@@ -23,7 +23,7 @@
 use crate::attn::{gqa_attention, NemotronAttnGpu};
 use crate::block::{mamba2_block_decode_step, Mamba2BlockState, Mamba2BlockWeights};
 use crate::mlp::{mlp_relu2, MlpRelu2Gpu};
-use crate::weight::LinearWeight;
+use crate::weight::{EmbeddingTable, LinearWeight};
 use crate::{BlockKind, NemotronHConfig};
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -75,7 +75,7 @@ enum Block {
 /// GPU-resident nemotron_h model (decode forward).
 pub struct NemotronModel {
     cfg: NemotronHConfig,
-    embeddings: GpuTensor,
+    embeddings: EmbeddingTable,
     layer_norm: Vec<GpuTensor>,
     layers: Vec<Block>,
     norm_f: GpuTensor,
@@ -99,7 +99,7 @@ impl NemotronModel {
         let vocab = cfg.vocab_size;
         let dims = cfg.mamba2_dims();
 
-        let embeddings = gpu.upload_f32(&w.embeddings, &[vocab, hidden])?;
+        let embeddings = EmbeddingTable::F32(gpu.upload_f32(&w.embeddings, &[vocab, hidden])?);
         let lm_head = LinearWeight::F32(gpu.upload_f32(&w.lm_head, &[vocab, hidden])?);
         let norm_f = gpu.upload_f32(&w.norm_f, &[hidden])?;
 
@@ -161,13 +161,143 @@ impl NemotronModel {
         })
     }
 
+    /// Build the model from a quantized HFQ container (FU4). The linear weights
+    /// (`in/out/up/down`, `q/k/v/o`, `lm_head`) load as quantized
+    /// [`LinearWeight`]s — mq4/hfq4/q8, with MQ4 auto-FWHT-rotated by the
+    /// dispatched gemv; the recurrence + norm tensors dequantize from BF16;
+    /// embeddings stay Q8 (`embedding_lookup_q8`). The Mamba `out_proj` residual
+    /// rescale (`1/√num_layers`) is applied at runtime — the quantized bytes
+    /// can't be pre-scaled the way the safetensors loader folds it into the
+    /// weight. Returns `Err(String)` on a missing/unsupported tensor.
+    pub fn from_hfq(
+        gpu: &mut Gpu,
+        hfq: &hipfire_runtime::hfq::HfqFile,
+        cfg: NemotronHConfig,
+        max_seq: usize,
+    ) -> Result<Self, String> {
+        use crate::loader::{load_embeddings_hfq, load_f32_hfq, load_linear_hfq};
+        let hidden = cfg.hidden_size;
+        let vocab = cfg.vocab_size;
+        let dims = cfg.mamba2_dims();
+        let out_proj_scale = 1.0f32 / (cfg.num_layers as f32).sqrt();
+        let e = |x: hip_bridge::HipError| format!("nemotron hfq gpu: {x:?}");
+
+        let embeddings =
+            load_embeddings_hfq(hfq, gpu, "backbone.embeddings.weight", vocab, hidden)?;
+        let lm_head = load_linear_hfq(hfq, gpu, "lm_head.weight", vocab, hidden)?;
+        let norm_f = gpu
+            .upload_f32(&load_f32_hfq(hfq, "backbone.norm_f.weight")?, &[hidden])
+            .map_err(e)?;
+
+        let mut layer_norm = Vec::with_capacity(cfg.num_layers);
+        let mut layers = Vec::with_capacity(cfg.num_layers);
+        for (l, kind) in cfg.blocks.iter().enumerate() {
+            let p = format!("backbone.layers.{l}");
+            layer_norm.push(
+                gpu.upload_f32(&load_f32_hfq(hfq, &format!("{p}.norm.weight"))?, &[hidden])
+                    .map_err(e)?,
+            );
+            let m = format!("{p}.mixer");
+            let block = match kind {
+                BlockKind::Mamba2 => {
+                    let in_proj = load_linear_hfq(
+                        hfq,
+                        gpu,
+                        &format!("{m}.in_proj.weight"),
+                        dims.projection_size(),
+                        hidden,
+                    )?;
+                    let out_proj = load_linear_hfq(
+                        hfq,
+                        gpu,
+                        &format!("{m}.out_proj.weight"),
+                        hidden,
+                        dims.d_inner(),
+                    )?;
+                    let conv_weight = load_f32_hfq(hfq, &format!("{m}.conv1d.weight"))?;
+                    let conv_bias = load_f32_hfq(hfq, &format!("{m}.conv1d.bias"))?;
+                    let a_log = load_f32_hfq(hfq, &format!("{m}.A_log"))?;
+                    let d = load_f32_hfq(hfq, &format!("{m}.D"))?;
+                    let dt_bias = load_f32_hfq(hfq, &format!("{m}.dt_bias"))?;
+                    let mixer_norm = load_f32_hfq(hfq, &format!("{m}.norm.weight"))?;
+                    Block::Mamba2(Box::new(
+                        crate::block_gpu::Mamba2BlockGpu::new_quant(
+                            gpu,
+                            dims.clone(),
+                            in_proj,
+                            out_proj,
+                            out_proj_scale,
+                            &conv_weight,
+                            &conv_bias,
+                            &a_log,
+                            &d,
+                            &dt_bias,
+                            &mixer_norm,
+                        )
+                        .map_err(e)?,
+                    ))
+                }
+                BlockKind::Mlp => {
+                    let up = load_linear_hfq(
+                        hfq,
+                        gpu,
+                        &format!("{m}.up_proj.weight"),
+                        cfg.mlp_intermediate,
+                        hidden,
+                    )?;
+                    let down = load_linear_hfq(
+                        hfq,
+                        gpu,
+                        &format!("{m}.down_proj.weight"),
+                        hidden,
+                        cfg.mlp_intermediate,
+                    )?;
+                    Block::Mlp(
+                        MlpRelu2Gpu::new_quant(gpu, hidden, cfg.mlp_intermediate, up, down)
+                            .map_err(e)?,
+                    )
+                }
+                BlockKind::Attention => {
+                    let a = cfg.attn;
+                    let q_dim = a.num_heads * a.head_dim;
+                    let kv_dim = a.num_kv_heads * a.head_dim;
+                    let q =
+                        load_linear_hfq(hfq, gpu, &format!("{m}.q_proj.weight"), q_dim, hidden)?;
+                    let k =
+                        load_linear_hfq(hfq, gpu, &format!("{m}.k_proj.weight"), kv_dim, hidden)?;
+                    let v =
+                        load_linear_hfq(hfq, gpu, &format!("{m}.v_proj.weight"), kv_dim, hidden)?;
+                    let o =
+                        load_linear_hfq(hfq, gpu, &format!("{m}.o_proj.weight"), hidden, q_dim)?;
+                    Block::Attn(
+                        NemotronAttnGpu::new_quant(gpu, a, hidden, max_seq, q, k, v, o)
+                            .map_err(e)?,
+                    )
+                }
+            };
+            layers.push(block);
+        }
+
+        Ok(Self {
+            embeddings,
+            lm_head,
+            norm_f,
+            layer_norm,
+            layers,
+            h: gpu.zeros(&[hidden], DType::F32).map_err(e)?,
+            normed: gpu.zeros(&[hidden], DType::F32).map_err(e)?,
+            logits: gpu.zeros(&[vocab], DType::F32).map_err(e)?,
+            cfg,
+        })
+    }
+
     /// Decode one token at `pos`, leaving the `[vocab]` logits in `self.logits`
     /// **on the GPU** (no download/sync) for the daemon sampler.
     pub fn forward_gpu(&mut self, gpu: &mut Gpu, token: u32, pos: usize) -> HipResult<()> {
         let hidden = self.cfg.hidden_size;
         let eps = self.cfg.rms_norm_eps;
 
-        gpu.embedding_lookup(&self.embeddings, &self.h, token, hidden)?;
+        self.embeddings.lookup(gpu, &self.h, token, hidden)?;
         for l in 0..self.layers.len() {
             gpu.rmsnorm_f32(&self.h, &self.layer_norm[l], &self.normed, eps)?;
             match &mut self.layers[l] {
@@ -205,7 +335,7 @@ impl NemotronModel {
         let eps = self.cfg.rms_norm_eps;
         let mut caps: Vec<Vec<f32>> = Vec::with_capacity(self.layers.len() + 1);
 
-        gpu.embedding_lookup(&self.embeddings, &self.h, token, hidden)?;
+        self.embeddings.lookup(gpu, &self.h, token, hidden)?;
         gpu.hip.device_synchronize()?;
         caps.push(gpu.download_f32(&self.h)?);
         for l in 0..self.layers.len() {
@@ -266,7 +396,7 @@ impl NemotronModel {
 
     /// Free all GPU tensors (consumes the model).
     pub fn free(self, gpu: &mut Gpu) {
-        let _ = gpu.free_tensor(self.embeddings);
+        self.embeddings.free(gpu);
         self.lm_head.free(gpu);
         let _ = gpu.free_tensor(self.norm_f);
         let _ = gpu.free_tensor(self.h);
