@@ -57,25 +57,25 @@ extern "C" __global__ void gemm_oq4_grouped_f16_wmma(
     float8_t acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 
     // Dequant 16 signed-int4 nibbles (two uint32) → half16, scaled by sw.
+    // areg is a half16_t vector lvalue (subscript-assigned directly).
     #define DEQ16(areg, pk0, pk1, sw) do { \
         _Float16 _s = (sw); \
-        _Float16* _a = (areg); \
-        _a[0]=_s*(_Float16)(float)((((int)((pk0)      &0xFu))<<28)>>28); \
-        _a[1]=_s*(_Float16)(float)((((int)(((pk0)>>4) &0xFu))<<28)>>28); \
-        _a[2]=_s*(_Float16)(float)((((int)(((pk0)>>8) &0xFu))<<28)>>28); \
-        _a[3]=_s*(_Float16)(float)((((int)(((pk0)>>12)&0xFu))<<28)>>28); \
-        _a[4]=_s*(_Float16)(float)((((int)(((pk0)>>16)&0xFu))<<28)>>28); \
-        _a[5]=_s*(_Float16)(float)((((int)(((pk0)>>20)&0xFu))<<28)>>28); \
-        _a[6]=_s*(_Float16)(float)((((int)(((pk0)>>24)&0xFu))<<28)>>28); \
-        _a[7]=_s*(_Float16)(float)((((int)(((pk0)>>28)&0xFu))<<28)>>28); \
-        _a[8]=_s*(_Float16)(float)((((int)((pk1)      &0xFu))<<28)>>28); \
-        _a[9]=_s*(_Float16)(float)((((int)(((pk1)>>4) &0xFu))<<28)>>28); \
-        _a[10]=_s*(_Float16)(float)((((int)(((pk1)>>8) &0xFu))<<28)>>28); \
-        _a[11]=_s*(_Float16)(float)((((int)(((pk1)>>12)&0xFu))<<28)>>28); \
-        _a[12]=_s*(_Float16)(float)((((int)(((pk1)>>16)&0xFu))<<28)>>28); \
-        _a[13]=_s*(_Float16)(float)((((int)(((pk1)>>20)&0xFu))<<28)>>28); \
-        _a[14]=_s*(_Float16)(float)((((int)(((pk1)>>24)&0xFu))<<28)>>28); \
-        _a[15]=_s*(_Float16)(float)((((int)(((pk1)>>28)&0xFu))<<28)>>28); \
+        (areg)[0]=_s*(_Float16)(float)((((int)((pk0)      &0xFu))<<28)>>28); \
+        (areg)[1]=_s*(_Float16)(float)((((int)(((pk0)>>4) &0xFu))<<28)>>28); \
+        (areg)[2]=_s*(_Float16)(float)((((int)(((pk0)>>8) &0xFu))<<28)>>28); \
+        (areg)[3]=_s*(_Float16)(float)((((int)(((pk0)>>12)&0xFu))<<28)>>28); \
+        (areg)[4]=_s*(_Float16)(float)((((int)(((pk0)>>16)&0xFu))<<28)>>28); \
+        (areg)[5]=_s*(_Float16)(float)((((int)(((pk0)>>20)&0xFu))<<28)>>28); \
+        (areg)[6]=_s*(_Float16)(float)((((int)(((pk0)>>24)&0xFu))<<28)>>28); \
+        (areg)[7]=_s*(_Float16)(float)((((int)(((pk0)>>28)&0xFu))<<28)>>28); \
+        (areg)[8]=_s*(_Float16)(float)((((int)((pk1)      &0xFu))<<28)>>28); \
+        (areg)[9]=_s*(_Float16)(float)((((int)(((pk1)>>4) &0xFu))<<28)>>28); \
+        (areg)[10]=_s*(_Float16)(float)((((int)(((pk1)>>8) &0xFu))<<28)>>28); \
+        (areg)[11]=_s*(_Float16)(float)((((int)(((pk1)>>12)&0xFu))<<28)>>28); \
+        (areg)[12]=_s*(_Float16)(float)((((int)(((pk1)>>16)&0xFu))<<28)>>28); \
+        (areg)[13]=_s*(_Float16)(float)((((int)(((pk1)>>20)&0xFu))<<28)>>28); \
+        (areg)[14]=_s*(_Float16)(float)((((int)(((pk1)>>24)&0xFu))<<28)>>28); \
+        (areg)[15]=_s*(_Float16)(float)((((int)(((pk1)>>28)&0xFu))<<28)>>28); \
     } while (0)
 
     for (int g = 0; g < n_groups; ++g) {
