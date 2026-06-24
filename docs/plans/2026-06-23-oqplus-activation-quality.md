@@ -229,15 +229,41 @@ After the decode wins, looked at the prefill axis. Findings (daemon path; note
   as the current OQ4+ daemon prefill rate; whether batched-projection WMMA raises it
   further is unverified.
 
-**Remaining lever to mq4 prefill parity = W4A16 batched prefill** (the clean,
-divergence-free path, matching the W4A16 decode quality): dequant the 4-bit weight
-to f16 inline and use f16×f16 WMMA against f16 activations — exactly mq4's
-`gemm_*_hfq4g256_wmma` family (reads f16 X, `a_reg = sc*nib + zp`,
-`wmma_f32_16x16x16_f16_w32`). For OQ4+ this is a 4-kernel port (qkv / qkvza /
-gate_up / residual) with the symmetric split layout (scale-only, sign-extend, no
-zp) + dispatch wiring + is_batchable_la(Oq4G256) un-gating. This avoids the int4-act
-divergence entirely (no act quant) and would match OQ4+ decode quality. Scoped, not
-yet built — decode was the priority and is done.
+## W4A16 batched prefill SHIPPED (2026-06-24, commit 0b2b02bb)
+
+Built the divergence-free W4A16 batched prefill: one kernel
+`gemm_oq4_grouped_f16_wmma` (dequant 4-bit weight to f16 inline, f16×f16 WMMA
+against f16 acts; `ensure_fp16_x` converts the f32 rotated activation once).
+Wired into ALL oq4 batched arms (LA qkv/gate_up via the FusedQkvza/GateUp arms;
+FA-qkv + wo/down via `gemm_oq4_grouped_act_batched`). Per-projection (not fused-
+demux) — prefill is compute-bound at B>1 so the launch saving is moot.
+`is_batchable_la(Oq4)` is now **default-on** for gfx11+ (was gated behind
+`HIPFIRE_OQ4_BATCHED_PREFILL=1` due to the W4A4 int4-act divergence; that path is
+retired). Opt out with `=0`.
+
+**Measured (qwen3.5-0.8b, gfx1103, `bench_qwen35_speed --prefill 512`):**
+| format | prefill tok/s | decode tok/s |
+|--------|-------------:|-------------:|
+| mq4+ | 1586.8 | 59.2 |
+| **OQ4+ W4A16 batched (new)** | **436.7** | 53.7 |
+| OQ4+ per-token (old) | 90.2 | 54.0 |
+| oq8+ (not batched) | 61.8 | 42.3 |
+
+- **4.8× prefill** over per-token; OQ4+ now dominates oq8+ on prefill too.
+- Parity vs CPU W4A16 oracle: max_abs 0.03% (PASS). Coherent: the server
+  batched-prefill path (`forward_prefill_batch`) emits fluent on-topic output;
+  numerically equivalent to the coherent W4A16 decode.
+- **Still 3.6× behind mq4+** (1586.8): that gap is kernel optimization — mq4 has
+  3-way qkv fusion + K2-unroll/software-pipelining (`gemm_qkv_hfq4g256_wmma`); the
+  OQ4+ kernel is a simple per-projection grouped WMMA. Porting those optimizations
+  is the remaining prefill lever.
+
+**Harness note:** single-prompt **chat/eval prefill is per-token** by design
+(`forward_scratch`; trace shows `gemv_oq4_grouped` ×130946, batched kernel ×0) —
+it does NOT use this path. The batched win applies to the **server**
+continuous-batching path and `bench_qwen35_speed`. Measuring it needs the bench
+or the server, NOT chat/eval one-shot (env flags also don't propagate to the
+eval-spawned daemon).
 
 ## Cross-cutting note
 
