@@ -25,12 +25,19 @@ the one genuinely-new kernel (Mamba-2 SSD) without MoE/attention confounds. The
   `n_groups: 8`, `conv_kernel: 4`, `chunk_size: 256`, `time_step_*` bounds,
   `use_conv_bias: true`, `mamba_proj_bias: false`, `mamba_hidden_act: silu`.
   - conv operates on `xBC = [x(7680) | B(n_groups·ssm=1024) | C(1024)]` = 9728.
-  - in_proj → `[z(7680) | xBC(9728) | dt(heads=96)]` (confirm exact widths from
-    the checkpoint tensor shapes at loader time).
+  - in_proj → `[z(7680) | xBC(9728) | dt(heads=96)]`. **CONFIRMED** from
+    `modeling_nemotron_h.py`: `projection_size = intermediate_size + conv_dim +
+    num_heads`; the HF split is `[d_mlp, d_mlp, gate(z), hidden_states_B_C, dt]`
+    with **d_mlp=0** for nemotron_h (pure Mamba, no inline gated MLP), so the
+    effective split is `[z | xBC | dt]`. `conv_dim = intermediate_size +
+    2·n_groups·ssm_state_size = 9728`.
 - **Attention (`*`):** `head_dim: 128`, `num_attention_heads: 40`,
   `num_key_value_heads: 8` (GQA), `attention_bias: false`, no sliding window,
-  `max_position_embeddings: 262144`. (RoPE? check checkpoint — nemotron_h attn
-  may be NoPE/partial; verify.)
+  `max_position_embeddings: 262144`. **NoPE (to confirm at impl):** the HF
+  `NemotronHAttention` class carries a `position_embeddings #TODO` and applies no
+  rotary in forward — nemotron_h attention appears positional-information-free
+  (the Mamba layers supply position). Verify against the checkpoint (absence of
+  `rotary_emb` / `inv_freq` tensors) before wiring RoPE; default to NoPE.
 - **MLP (`-`):** `mlp_hidden_act: relu2` (ReLU-squared, **not** SwiGLU),
   `intermediate_size: 12544`, `mlp_bias: false`. Up→ReLU²→down.
 
@@ -42,7 +49,11 @@ the one genuinely-new kernel (Mamba-2 SSD) without MoE/attention confounds. The
   derived from the mixer blocks; `needs_kv_cache()` true (has `*` attention).
 - **conv1d kernels** (`conv1d_silu_split*`) — basis for the xBC short-conv
   (conv_kernel=4, rolling K-1 decode state). Needs a Mamba2 xBC-split variant.
-- **`gated_norm.hip`** — Mamba-2's `RMSNormGated` (the y = norm(y)·silu(z) gate).
+- ~~`gated_norm.hip`~~ — **NOT reusable** (confirmed from HF source). qwen35's
+  `gated_norm.hip` is norm-then-gate per-head over head_dim; nemotron_h's
+  `MambaRMSNormGated` is **gate-then-group-RMSNorm** (`norm_before_gate=False`)
+  with `group_size = intermediate_size / n_groups = 960`. New kernel
+  `mamba2_gated_norm.hip` written + validated gpu-vs-cpu (max|Δ|=4.8e-6).
 - **GQA attention** — existing flash/batched attention for the `*` blocks.
 - **The seam** (`SimpleAr`/`ServingBackend`/`decode_loop` with P3.3 sampling).
 
@@ -73,11 +84,16 @@ the one genuinely-new kernel (Mamba-2 SSD) without MoE/attention confounds. The
 - **N0 ✅ (this) — crate scaffold + config.** `hipfire-arch-nemotron` with the
   config struct, `BlockKind {Mamba2, Attention, Mlp}`, `hybrid_override_pattern`
   parser → `Vec<BlockKind>`, derived `MixerProfile`. Pure, no-GPU, unit-tested.
-- **N1 — Mamba-2 SSD f32 decode kernel** (single-token) + a CPU reference +
-  gpu-vs-cpu test (`crates/rdna-compute/examples`, gpu-tcas-coordinated).
-- **N2 — conv1d xBC variant** + ReLU² MLP kernel/epilogue, each gpu-vs-cpu tested.
-- **N3 — Mamba2 block forward** (in_proj → conv+silu → SSD → gated_norm →
-  out_proj) wired on `SequenceState` recurrent slot, f32.
+- **N1 ✅ — Mamba-2 SSD f32 decode kernel** (single-token) + CPU reference +
+  gpu-vs-cpu test (max|Δy|=1.2e-7). `mamba2_ssd_decode_f32`.
+- **N2 — conv1d xBC variant** + ReLU² MLP kernel + gated-norm:
+  - ✅ ReLU² (`relu2_f32`, max|Δ|=0) — nemotron_h MLP act.
+  - ✅ `mamba2_gated_norm_f32` (gate-then-group-RMSNorm, max|Δ|=4.8e-6) — the
+    `RMSNormGated` epilogue; qwen35's `gated_norm` was confirmed not reusable.
+  - ⏳ conv1d xBC depthwise causal (K=4) decode-rolling-state variant.
+- **N3 — Mamba2 block forward** (in_proj GEMV → conv+silu → split x/B/C → SSD →
+  `mamba2_gated_norm` → out_proj GEMV) wired on `SequenceState` recurrent slot,
+  f32. (gated-norm + SSD kernels now in hand; needs conv1d-xBC + in_proj wiring.)
 - **N4 — nemotron_h forward** (per-block M/*/- dispatch over the pattern;
   attention reuses GQA, MLP reuses dense GEMV + ReLU²) + loader for the BF16
   checkpoint.

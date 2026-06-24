@@ -91,4 +91,53 @@ impl Gpu {
             )
         }
     }
+
+    /// Mamba-2 `RMSNormGated` (gate-then-group-RMSNorm): `out = group_rmsnorm(y *
+    /// silu(z)) * weight`, over `n_groups` groups of `group_size`
+    /// (`group_size = d_inner / n_groups`). See
+    /// `kernels/src/mamba2_gated_norm.hip`. (Distinct from `gated_norm_f32`,
+    /// which is qwen35's norm-then-gate per-head.)
+    pub fn mamba2_gated_norm_f32(
+        &mut self,
+        out: &GpuTensor,
+        y: &GpuTensor,
+        z: &GpuTensor,
+        weight: &GpuTensor,
+        n_groups: usize,
+        group_size: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "mamba2_gated_norm",
+            kernels::MAMBA2_GATED_NORM_SRC,
+            "mamba2_gated_norm_f32",
+        )?;
+        let op = out.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let zp = z.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let ng = n_groups as i32;
+        let gs = group_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &op as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &zp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &ng as *const _ as *mut c_void,
+            &gs as *const _ as *mut c_void,
+            &eps as *const _ as *mut c_void,
+        ];
+        let func = &self.functions["mamba2_gated_norm_f32"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_groups as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
 }
