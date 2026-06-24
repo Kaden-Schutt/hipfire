@@ -2709,6 +2709,7 @@ fn main() {
                             11 => "lfm2moe",
                             12 => "gemma3",
                             13 => "gemma3_vl",
+                            14 => "nemotron_h",
                             _ => "qwen3",
                         };
                         let vl = m.vision_config.is_some()
@@ -5110,6 +5111,7 @@ fn main() {
                         9 => "deepseek4",
                         10 => "minimax_m2",
                         11 => "lfm2moe",
+                        14 => "nemotron_h",
                         _ => "qwen3",
                     })
                     .unwrap_or("none");
