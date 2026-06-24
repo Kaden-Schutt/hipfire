@@ -75,6 +75,9 @@ pub struct Mamba2Config {
     pub chunk_size: usize,
     pub use_conv_bias: bool,
     pub proj_bias: bool,
+    /// `dt` clamp bounds (`time_step_min` / `time_step_max`); Nano-4B = 0.001/0.1.
+    pub dt_min: f32,
+    pub dt_max: f32,
 }
 
 impl Mamba2Config {
@@ -86,6 +89,11 @@ impl Mamba2Config {
     /// Width of the conv'd `xBC = [x | B | C]` stream.
     pub fn conv_dim(&self) -> usize {
         self.d_inner() + 2 * self.n_groups * self.state_size
+    }
+    /// `in_proj` output width = `d_inner + conv_dim + num_heads` (`[z|xBC|dt]`,
+    /// `d_mlp=0` for nemotron_h).
+    pub fn projection_size(&self) -> usize {
+        self.d_inner() + self.conv_dim() + self.num_heads
     }
 }
 
@@ -145,6 +153,8 @@ impl NemotronHConfig {
                 chunk_size: raw.chunk_size,
                 use_conv_bias: raw.use_conv_bias,
                 proj_bias: raw.mamba_proj_bias,
+                dt_min: raw.time_step_min,
+                dt_max: raw.time_step_max,
             },
             attn: AttnConfig {
                 num_heads: raw.num_attention_heads,
@@ -155,6 +165,23 @@ impl NemotronHConfig {
             mlp_intermediate: raw.intermediate_size,
             mlp_act: raw.mlp_hidden_act,
         })
+    }
+
+    /// Bridge the Mamba-2 mixer shape to the GPU/CPU block dims
+    /// ([`block::Mamba2Dims`]), folding in the top-level `hidden_size` and
+    /// `rms_norm_eps`.
+    pub fn mamba2_dims(&self) -> block::Mamba2Dims {
+        block::Mamba2Dims {
+            hidden_size: self.hidden_size,
+            num_heads: self.mamba.num_heads,
+            head_dim: self.mamba.head_dim,
+            state_size: self.mamba.state_size,
+            n_groups: self.mamba.n_groups,
+            conv_kernel: self.mamba.conv_kernel,
+            rms_norm_eps: self.rms_norm_eps,
+            dt_min: self.mamba.dt_min,
+            dt_max: self.mamba.dt_max,
+        }
     }
 
     /// Number of blocks of each kind.
@@ -203,6 +230,10 @@ struct RawConfig {
     use_conv_bias: bool,
     #[serde(default)]
     mamba_proj_bias: bool,
+    #[serde(default = "default_dt_min")]
+    time_step_min: f32,
+    #[serde(default = "default_dt_max")]
+    time_step_max: f32,
     num_attention_heads: usize,
     num_key_value_heads: usize,
     head_dim: usize,
@@ -218,6 +249,12 @@ fn default_eps() -> f32 {
 }
 fn default_chunk() -> usize {
     256
+}
+fn default_dt_min() -> f32 {
+    0.001
+}
+fn default_dt_max() -> f32 {
+    0.1
 }
 fn default_act() -> String {
     "relu2".to_string()
@@ -264,9 +301,12 @@ mod tests {
             chunk_size: 256,
             use_conv_bias: true,
             proj_bias: false,
+            dt_min: 0.001,
+            dt_max: 0.1,
         };
         assert_eq!(m.d_inner(), 7680); // heads*head_dim, NOT expand*hidden
         assert_eq!(m.conv_dim(), 7680 + 2 * 8 * 128); // x + B + C
+        assert_eq!(m.projection_size(), 7680 + 9728 + 96);
     }
 
     #[test]
@@ -293,6 +333,8 @@ mod tests {
             "attention_bias": false,
             "intermediate_size": 12544,
             "mlp_hidden_act": "relu2",
+            "time_step_min": 0.001,
+            "time_step_max": 0.1,
         });
         let cfg = NemotronHConfig::from_json(&json).unwrap();
         assert_eq!(cfg.num_layers, 42);
@@ -300,6 +342,14 @@ mod tests {
         assert_eq!(cfg.mamba.d_inner(), 7680);
         assert_eq!(cfg.count(BlockKind::Attention), 4);
         assert_eq!(cfg.mlp_act, "relu2");
+        assert_eq!(cfg.mamba.dt_min, 0.001);
+        assert_eq!(cfg.mamba.dt_max, 0.1);
+        // config → block dims bridge folds in hidden_size + eps.
+        let dims = cfg.mamba2_dims();
+        assert_eq!(dims.hidden_size, 3136);
+        assert_eq!(dims.d_inner(), 7680);
+        assert_eq!(dims.conv_dim(), 9728);
+        assert_eq!(dims.norm_group_size(), 960);
         // MixerProfile excludes the MLP blocks (25 mixers: 21 Mamba2 + 4 attn).
         let prof = cfg.mixer_profile();
         assert_eq!(prof.n_layers(), 25);

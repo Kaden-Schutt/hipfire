@@ -104,6 +104,33 @@ the one genuinely-new kernel (Mamba-2 SSD) without MoE/attention confounds. The
 - **Then:** Nano-30B (adds MoE — reuse qwen35/lfm2moe MoE) and the broader P4–P6
   seam finish.
 
+## Confirmed checkpoint facts (N4 loader map)
+
+From the real `NVIDIA-Nemotron-3-Nano-4B-BF16` checkpoint (config.json +
+safetensors header, 263 tensors). All weights BF16; dequant to f32 for the
+reference forward.
+
+- **NoPE CONFIRMED**: config has NO `rope_theta` / `rope_scaling` /
+  `position_embedding_type` / any rotary key. Attention is pure GQA, no
+  positional embedding. Do NOT wire RoPE.
+- **dt clamp**: `time_step_min=0.001`, `time_step_max=0.1` (`time_step_limit`
+  absent/None). NOT [0, ∞].
+- **Every block** has `backbone.layers.{L}.norm.weight` [hidden] (pre-block
+  RMSNorm) + a `.mixer.` namespace (MLP weights live under `.mixer.` too).
+  Block kind comes from `hybrid_override_pattern`, not the tensor names.
+- **M (Mamba-2)** `…mixer.`: `in_proj.weight` [proj_sz, 3136],
+  `conv1d.weight` [conv_dim,1,4] + `conv1d.bias` [conv_dim], `A_log`/`D`/
+  `dt_bias` [96], `norm.weight` [7680] (RMSNormGated), `out_proj.weight`
+  [3136, 7680].
+- **- (MLP)** `…mixer.`: `up_proj.weight` [12544, 3136],
+  `down_proj.weight` [3136, 12544]. Forward = `down(relu2(up(x)))`, NO gate.
+- **\* (Attention)** `…mixer.`: `q_proj` [5120,3136] (40×128),
+  `k_proj`/`v_proj` [1024,3136] (8×128 GQA), `o_proj` [3136,5120]. No bias.
+- **Global**: `backbone.embeddings.weight` [131072,3136],
+  `backbone.norm_f.weight` [3136] (final norm), `lm_head.weight` [131072,3136]
+  (untied — `tie_word_embeddings=false`).
+- **Per-block forward**: pre-norm residual — `h = h + mixer(rmsnorm(h, norm.w))`.
+
 ## Validation
 
 - No-GPU: `./tests/no-gpu-ci.sh` for config/parser changes.
