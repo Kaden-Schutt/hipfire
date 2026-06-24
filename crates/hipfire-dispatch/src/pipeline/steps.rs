@@ -594,6 +594,19 @@ fn oq4_gemv_into(
     already_rotated: bool,
     out: &rdna_compute::GpuTensor,
 ) -> Result<(), DispatchError> {
+    oq4_gemv_into_impl(gpu, w, x, already_rotated, out, false)
+}
+
+/// As `oq4_gemv_into` but `residual=true` does the residual add in-kernel
+/// (`out += W·x`, gemv_oq4_grouped_residual) — no separate add_inplace_f32.
+fn oq4_gemv_into_impl(
+    gpu: &mut Gpu,
+    w: &WeightRef,
+    x: &rdna_compute::GpuTensor,
+    already_rotated: bool,
+    out: &rdna_compute::GpuTensor,
+    residual: bool,
+) -> Result<(), DispatchError> {
     const GROUP: usize = 256;
     let hip = |e: rdna_compute::HipError| DispatchError::Hip(e.to_string());
     let (m, k) = (w.m, w.k);
@@ -626,10 +639,14 @@ fn oq4_gemv_into(
     let ws = w.buf.sub_offset(m * (k / 2), m * ng * 4);
     // OQ4+ decode (B=1): consume the f32 rotated activation directly — unpack the
     // 4-bit-resident weight inline (W4A16). No quantize_act_oq4 launch, no WMMA
-    // N-tile waste; reads half the bytes of OQ8+ (nibbles vs int8). WMMA grouped
-    // GEMM remains the batched-prefill path.
-    gpu.gemv_oq4_grouped(w.buf, &ws, xr, out, m, k, GROUP)
-        .map_err(hip)
+    // N-tile waste. `residual` fuses the residual add (out += W·x) into the gemv.
+    if residual {
+        gpu.gemv_oq4_grouped_residual(w.buf, &ws, xr, out, m, k, GROUP)
+            .map_err(hip)
+    } else {
+        gpu.gemv_oq4_grouped(w.buf, &ws, xr, out, m, k, GROUP)
+            .map_err(hip)
+    }
 }
 
 /// Opus W8A8 (OQ+) single-projection decode GEMV (B=1) — int8 analog of
@@ -736,16 +753,13 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             out: _,
         } => {
             if w.dtype == DType::Oq4G256 {
-                // No fused Oq4 residual kernel: GEMM into persistent scratch, add.
-                gpu.ensure_oq4_scratch().map_err(|e| DispatchError::Hip(e.to_string()))?;
-                let tmp = rdna_compute::GpuTensor {
-                    buf: unsafe { gpu.oq4_ytmp.as_ref().unwrap().buf.alias() },
-                    shape: vec![w.m],
-                    dtype: DType::F32,
-                };
-                oq4_gemv_into(gpu, w, xr, true, &tmp)?;
+                // FUSED residual gemv (Y += W·x) in one launch — eliminates the
+                // separate add_inplace_f32 (the standout decode-gap item vs mq4's
+                // gemv_hfq4g256_residual). xr is already rotated.
+                let ng = w.k / 256;
+                let ws = w.buf.sub_offset(w.m * (w.k / 2), w.m * ng * 4);
                 return gpu
-                    .add_inplace_f32(residual, &tmp)
+                    .gemv_oq4_grouped_residual(w.buf, &ws, xr, residual, w.m, w.k, 256)
                     .map_err(|e| DispatchError::Hip(e.to_string()));
             }
             if w.dtype == DType::Oq8G256 {
@@ -788,16 +802,8 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             out,
         } => {
             if w.dtype == DType::Oq4G256 {
-                gpu.ensure_oq4_scratch().map_err(|e| DispatchError::Hip(e.to_string()))?;
-                let tmp = rdna_compute::GpuTensor {
-                    buf: unsafe { gpu.oq4_ytmp.as_ref().unwrap().buf.alias() },
-                    shape: vec![w.m],
-                    dtype: DType::F32,
-                };
-                oq4_gemv_into(gpu, w, x, false, &tmp)?;
-                return gpu
-                    .add_inplace_f32(residual, &tmp)
-                    .map_err(|e| DispatchError::Hip(e.to_string()));
+                // FUSED residual gemv (rotate x, then out += W·x in one launch).
+                return oq4_gemv_into_impl(gpu, w, x, false, residual, true);
             }
             if w.dtype == DType::Oq8G256 {
                 gpu.ensure_oq4_scratch().map_err(|e| DispatchError::Hip(e.to_string()))?;
@@ -1039,12 +1045,10 @@ fn launch_fused(
             let (wg, gate) = gemv_weight_out(&steps[1]);
             let (wu, up) = gemv_weight_out(&steps[2]);
             let k = wg.k;
-            let ng = k / 256;
-            for (wt, out) in [(wg, gate), (wu, up)] {
-                let ws = wt.buf.sub_offset(wt.m * (k / 2), wt.m * ng * 4);
-                gpu.gemv_oq4_grouped(wt.buf, &ws, activated, out, wt.m, k, 256)
-                    .map_err(hip)?;
-            }
+            // ONE fused gate+up launch (vs 2 gemv_oq4_grouped) — cuts per-token
+            // dispatch count toward mq4's fused_gate_up_hfq4g256.
+            gpu.fused_gate_up_oq4_gemv(wg.buf, wu.buf, activated, gate, up, wg.m, wu.m, k, 256)
+                .map_err(hip)?;
             Ok(())
         }
         // ── Opus W4A8 (OQ+) fused projections (decode) ───────────────────────

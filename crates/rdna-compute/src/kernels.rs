@@ -3758,6 +3758,17 @@ pub const GEMM_OQ4_GROUPED_F16_WMMA_SRC: &str =
 /// tuning). Select with `fused_qkvza_oq4_dp4a_for_arch`.
 pub const FUSED_QKVZA_OQ4_DP4A_SRC: &str =
     include_str!("../../../kernels/src/fused_qkvza_oq4_dp4a.hip");
+
+/// OQ4+ W4A16 decode GEMV with FUSED residual add (Y += W·x, one launch) —
+/// eliminates the separate add_inplace_f32 of the unfused wo/down path (the
+/// standout decode-gap item vs mq4's gemv_hfq4g256_residual). See the .hip file.
+pub const GEMV_OQ4_GROUPED_RESIDUAL_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq4_grouped_residual.hip");
+
+/// OQ4+ W4A16 fused gate+up DECODE (B=1): 2 GEMVs in one launch (blockIdx demux),
+/// cuts the per-token dispatch count vs looping gemv_oq4_grouped. See the .hip.
+pub const FUSED_GATE_UP_OQ4_GEMV_SRC: &str =
+    include_str!("../../../kernels/src/fused_gate_up_oq4_gemv.hip");
 pub const FUSED_QKVZA_OQ4_DP4A_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gfx1151/fused_qkvza_oq4_dp4a.gfx1151.hip");
 

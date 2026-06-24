@@ -45730,6 +45730,111 @@ impl Gpu {
         })
     }
 
+    /// OQ4+ W4A16 fused gate+up DECODE (B=1): 2 GEMVs in ONE capture-safe launch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_gate_up_oq4_gemv(
+        &mut self,
+        w_gate: &GpuTensor,
+        w_up: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(group, 256, "fused_gate_up_oq4_gemv: group must be 256");
+        self.ensure_kernel(
+            "fused_gate_up_oq4_gemv",
+            kernels::FUSED_GATE_UP_OQ4_GEMV_SRC,
+            "fused_gate_up_oq4_gemv",
+        )?;
+        let wgp = w_gate.buf.as_ptr();
+        let wup = w_up.buf.as_ptr();
+        let xp = x_f32.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let mut gmi = gate_m as i32;
+        let mut umi = up_m as i32;
+        let mut ki = k as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wgp as *const _ as *mut c_void,
+            &wup as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &mut gmi as *mut _ as *mut c_void,
+            &mut umi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        let grid_x = (gate_m + up_m) as u32;
+        self.launch_maybe_blob("fused_gate_up_oq4_gemv", [grid_x, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(wgp);
+            b.push_ptr(wup);
+            b.push_ptr(xp);
+            b.push_ptr(ygp);
+            b.push_ptr(yup);
+            b.push_i32(gmi);
+            b.push_i32(umi);
+            b.push_i32(ki);
+            b.push_i32(gi);
+            b
+        })
+    }
+
+    /// OQ4+ W4A16 decode GEMV with FUSED residual add (Y += W·x). Capture-safe.
+    /// Eliminates the separate add_inplace_f32 of the unfused wo/down path.
+    pub fn gemv_oq4_grouped_residual(
+        &mut self,
+        w_i4: &GpuTensor,
+        w_scales: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(group, 256, "gemv_oq4_grouped_residual: group must be 256");
+        self.ensure_kernel(
+            "gemv_oq4_grouped_residual",
+            kernels::GEMV_OQ4_GROUPED_RESIDUAL_SRC,
+            "gemv_oq4_grouped_residual",
+        )?;
+        let wp = w_i4.buf.as_ptr();
+        let wsp = w_scales.buf.as_ptr();
+        let xp = x_f32.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &wsp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob("gemv_oq4_grouped_residual", [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(wp);
+            b.push_ptr(wsp);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_i32(mi);
+            b.push_i32(ki);
+            b.push_i32(gi);
+            b
+        })
+    }
+
     /// OQ4+ fused QKVZA DECODE (B=1) W4A8 dp4a (`v_dot4_i32_iu8`/`sudot4`): 4
     /// in-proj GEMVs in ONE capture-safe launch over the int8-quantized activation
     /// (Xq/Xs from quantize_act_oq8). Arch-dispatched source (gfx1151 has its own
