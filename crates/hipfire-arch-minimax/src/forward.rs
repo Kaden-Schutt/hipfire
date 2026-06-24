@@ -1112,13 +1112,24 @@ pub fn forward_batch(
             weights.layers[0].experts[0].gate_up.gpu_dtype,
             DType::MQ2G256Lloyd
         );
-    // i8 MMQ grouped GEMM (gfx1151): 2-bit Lloyd → int8 codebook LUT + i8 WMMA
-    // at ~1.7x the FP16 grouped rate (PR #476). gate_up (MQ2) has the i8 kernel;
-    // down (MQ3) keeps FP16 until the mq3 i8 kernel lands. Opt-in for now.
+    // i8 MMQ grouped GEMM (gfx1151): 2-bit/3-bit Lloyd → int8 codebook LUT +
+    // i8 WMMA at ~1.7x the FP16 grouped rate (gate_up via PR #476, down via the
+    // mq3 i8 kernel here). +10% prefill (166→185 tok/s). DEFAULT-ON after the
+    // minimax_coherence_battery passed it clean (18/18 cells coherent, no
+    // attractors); cosine vs indexed 0.9948 (FP16 grouped is 0.9982). Opt out
+    // with HIPFIRE_MINIMAX_MOE_I8=0 to fall back to FP16 grouped.
     let moe_i8 = moe_grouped
-        && std::env::var("HIPFIRE_MINIMAX_MOE_I8").as_deref() == Ok("1")
+        && std::env::var("HIPFIRE_MINIMAX_MOE_I8").as_deref() != Ok("0")
         && gpu.arch.starts_with("gfx1151");
-    let m_total_max = b * k_top + n_exp * MOE_BLOCK_M;
+    // Round the padded-scatter bound UP to a whole number of BLOCK_M tiles.
+    // The grouped kernels' grid is ceil(m_total/16) tiles and each tile reads
+    // expert_tile_ids[tile_y]; sizing that buffer at `m_total_max / 16`
+    // (integer-div) must therefore not truncate. b*k_top is only 16-aligned
+    // when b is even (k_top=8), so an odd-length last prefill chunk left the
+    // grid one tile longer than the buffer → OOB read → GPU page fault. Caught
+    // by the coherence battery's odd-b prompts; would also hit a production
+    // prompt whose final 512-chunk has odd length.
+    let m_total_max = (b * k_top + n_exp * MOE_BLOCK_M).next_multiple_of(MOE_BLOCK_M);
     // i32 scratch lives in F32-sized buffers (kernels read raw bytes as i32,
     // same convention as topk_idx above). `None` when the indexed path is used.
     let alloc_opt =
