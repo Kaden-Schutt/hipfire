@@ -65,6 +65,57 @@ impl Gpu {
         }
         result
     }
+
+    /// Mamba-2 (nemotron_h) xBC short-conv decode step: depthwise causal conv1d
+    /// (kernel_size=4) over `n_channels = conv_dim` channels, + per-channel bias
+    /// (`use_conv_bias=true`), then SiLU over all channels. The caller splits the
+    /// activated output into x / B / C afterwards. `state` is `[n_channels × 3]`
+    /// (rolling K-1 history, updated in place). See
+    /// `kernels/src/conv1d_bias_silu_decode.hip`.
+    pub fn conv1d_bias_silu_decode_f32(
+        &mut self,
+        output: &GpuTensor,
+        input: &GpuTensor,
+        weight: &GpuTensor,
+        bias: &GpuTensor,
+        state: &GpuTensor,
+        n_channels: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "conv1d_bias_silu_decode",
+            kernels::CONV1D_BIAS_SILU_DECODE_SRC,
+            "conv1d_bias_silu_decode_f32",
+        )?;
+        let op = output.buf.as_ptr();
+        let ip = input.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let bp = bias.buf.as_ptr();
+        let sp = state.buf.as_ptr();
+        let nc = n_channels as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &op as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &nc as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = (n_channels as u32).div_ceil(block);
+        let func = &self.functions["conv1d_bias_silu_decode_f32"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// LFM2 LIV double-gated short-conv, single-token decode. Reads the in_proj
     /// output `bcx` [batch, 3*channels] (B | C_gate | x layout), applies the
     /// B*x pre-gate, runs the depthwise causal conv over the rolling `state`

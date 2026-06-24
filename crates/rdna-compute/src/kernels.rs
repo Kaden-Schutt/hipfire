@@ -2937,6 +2937,8 @@ pub const GATED_NORM_SRC: &str = include_str!("../../../kernels/src/gated_norm.h
 pub const MAMBA2_SSD_DECODE_SRC: &str = include_str!("../../../kernels/src/mamba2_ssd_decode.hip");
 pub const RELU2_SRC: &str = include_str!("../../../kernels/src/relu2.hip");
 pub const MAMBA2_GATED_NORM_SRC: &str = include_str!("../../../kernels/src/mamba2_gated_norm.hip");
+pub const CONV1D_BIAS_SILU_DECODE_SRC: &str =
+    include_str!("../../../kernels/src/conv1d_bias_silu_decode.hip");
 
 /// Gated Delta Net — tiled LDS + warp-shuffle.
 /// S[128×128] tiled into TILE_ROWS=8 row chunks. Each tile = 8×128×4 = 4KB LDS.
