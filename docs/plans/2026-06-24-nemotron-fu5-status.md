@@ -1,4 +1,4 @@
-# Nemotron follow-ups — status (2026-06-24)
+# Nemotron follow-ups — status (2026-06-24; updated 2026-06-25)
 
 Branch: `chaingun`. Source of truth for scope: `docs/plans/2026-06-24-nemotron-followups.md`.
 
@@ -15,7 +15,38 @@ ReLU²-MLP hybrid).
 | FU4 | loader compat (load .hfq + quantized gemv) + serving | **DONE** |
 | FU5 | N6 batched prefill + q8 SSM state | **mostly done** — q8 state + benchmarks remain |
 | FU6 | Nano-30B MoE ('E' block) | not started |
-| FU1 | chat-template / coherence | blocked (newline attractor; no valid HF ref) |
+| FU1 | chat-template / coherence | blocked (newline attractor; EOS/Jinja/CLI controls fixed; valid CUDA/vLLM ref needed) |
+
+## FU1 update (2026-06-25)
+
+The originally planned chat-template fixes are now live:
+
+- arch 14 resolves serving EOS from tokenizer `<|im_end|>` (id 11), not
+  `config.eos_token_id` (`</s>` = 2), in both safetensors and HFQ load paths.
+- `generate_nemotron` defaults to the embedded Jinja chat template when present
+  (opt out with `HIPFIRE_JINJA_CHAT=0`).
+- `hipfire chat` now forwards config-derived thinking controls to the daemon:
+  default `thinking = "off"` maps to `assistant_prefix = "closed_think"` and
+  `max_think_tokens = 1`, matching the HTTP path.
+
+Validation on gfx1151 still reproduces the FU1 blocker:
+
+- `/tmp/nano4b-mq4.hfq` via current `target/debug/hipfire-daemon` emits 11
+  newline tokens for `Answer in one short sentence: What is 2+2?`.
+- The same result occurs with the Plain ChatFrame fallback
+  (`HIPFIRE_JINJA_CHAT=0`) and with a non-empty system prompt.
+- The model-card prompt `Write a haiku about GPUs` with `temperature=1.0`
+  produced incoherent sampled text, not a usable answer.
+- HF tokenizer rendering is byte/ID-identical to Hipfire for reasoning-off
+  ChatML (`[10,25708,1010,11,...,12,13]` for the 2+2 prompt).
+- Local HF pure-Torch fallback (with `mamba_ssm` stubs and trained `dt_bias`
+  restored from safetensors) also generated newline-only output for the same
+  prompt: `new_ids = [1010 x16]`.
+
+So FU1 is no longer "do the chat-template work." What remains is to get a valid
+reference path for this checkpoint (CUDA/mamba-ssm, vLLM, or another NVIDIA
+runtime) or otherwise prove the correct generation convention. The ROCm
+pure-Torch fallback is not a coherence oracle.
 
 ## FU4 (DONE, committed)
 
@@ -108,12 +139,21 @@ introduces a new **'E' (MoE) block**: `BlockKind::Moe` + `NemotronMoeGpu` (route
 ## FU1 (coherence) — standing blocker
 
 Daemon generation produces a newline attractor. Forward NUMERICS are validated
-(FU4 cos 0.99; FU5 prefill==decode). The attractor is a generation/chat-template/
-sampling issue with no valid HF reference (nemotron_h needs mamba-ssm CUDA
-kernels that don't build on ROCm; HF's pure-torch `torch_forward` is itself
-broken for generation). Possibly addressable via a repeat penalty / chat-template
-fix (cf. the medgemma `*`-attractor → repeat-penalty fix), but not yet
-investigated. See memory `project_nemotron_mamba2`.
+(FU4 cos 0.99; FU5 prefill==decode), and the concrete EOS/Jinja/thinking-control
+work is done. The remaining blocker is reference quality: Nemotron-H needs
+`mamba_ssm` CUDA kernels for the intended HF fast path, while the local ROCm
+pure-Torch fallback also emits newline-only output and therefore cannot be used
+as a coherence oracle.
+
+Next useful FU1 work:
+
+1. Capture a valid CUDA/vLLM/NVIDIA-runtime reference for Nano-4B on 3-4 prompts,
+   including the exact rendered ChatML IDs and first generated token logits.
+2. Compare Hipfire against that reference at the generation boundary. If the
+   reference is coherent, bisect the first divergence against the already-added
+   per-layer/block hooks.
+3. Only after a coherent reference exists, tune sampling/repeat penalties or
+   prompt policy. Current prompt/EOS-only changes do not fix the blocker.
 
 ## Validation entry points (all gpu-tcas-coordinated via `hipfire lock`)
 

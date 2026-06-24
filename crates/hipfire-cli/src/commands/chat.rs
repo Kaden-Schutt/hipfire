@@ -118,6 +118,27 @@ fn generate_request_from_prompt(
     GenerateTextRequest::from_prompt(id, prompt, sampling).with_worker_key_id(worker_key_id)
 }
 
+fn thinking_controls_from_config(
+    config: &HipfireConfig,
+) -> (Option<String>, Option<String>, Option<u32>) {
+    let thinking_disabled = config.thinking.eq_ignore_ascii_case("off");
+    let thinking_mode = if thinking_disabled {
+        "chat"
+    } else {
+        "thinking"
+    };
+    let assistant_prefix = if thinking_disabled {
+        "closed_think"
+    } else {
+        "open_think"
+    };
+    (
+        Some(thinking_mode.to_string()),
+        Some(assistant_prefix.to_string()),
+        thinking_disabled.then_some(1),
+    )
+}
+
 pub async fn run(args: ChatArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     // Resolve the model first (using the global config for `default_model`),
     // then re-resolve the config with that model's tag so per-model overrides
@@ -154,6 +175,8 @@ pub async fn run(args: ChatArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
         )
         .await?;
 
+    let (thinking_mode, assistant_prefix, max_think_tokens) =
+        thinking_controls_from_config(&config);
     let gen_req = generate_request_from_prompt(
         Uuid::new_v4().to_string(),
         &args.prompt,
@@ -168,7 +191,8 @@ pub async fn run(args: ChatArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
             args.max_tokens,
         ),
         engine.worker_key_id.clone(),
-    );
+    )
+    .with_thinking_controls(None, thinking_mode, assistant_prefix, max_think_tokens);
     let gen_req = match &image_attachment {
         Some(img) => attach_image(gen_req, img)?,
         None => gen_req,
@@ -292,5 +316,42 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(serde_json::to_value(&messages[0]).unwrap()["role"], "user");
         assert_eq!(messages[0].content, "hello");
+    }
+
+    #[test]
+    fn thinking_controls_follow_config_default_off() {
+        let config = HipfireConfig::default();
+        let (thinking_mode, assistant_prefix, max_think_tokens) =
+            thinking_controls_from_config(&config);
+        assert_eq!(thinking_mode.as_deref(), Some("chat"));
+        assert_eq!(assistant_prefix.as_deref(), Some("closed_think"));
+        assert_eq!(max_think_tokens, Some(1));
+
+        let req = generate_request_from_prompt(
+            "req-1".to_string(),
+            "hello",
+            GenerationSamplingPolicy::greedy(8),
+            None,
+        )
+        .with_thinking_controls(None, thinking_mode, assistant_prefix, max_think_tokens);
+
+        assert_eq!(req.thinking_mode.as_deref(), Some("chat"));
+        assert_eq!(req.assistant_prefix.as_deref(), Some("closed_think"));
+        assert_eq!(req.max_think_tokens, Some(1));
+    }
+
+    #[test]
+    fn thinking_controls_enable_open_think_when_config_on() {
+        let config = HipfireConfig {
+            thinking: "on".to_string(),
+            ..Default::default()
+        };
+
+        let (thinking_mode, assistant_prefix, max_think_tokens) =
+            thinking_controls_from_config(&config);
+
+        assert_eq!(thinking_mode.as_deref(), Some("thinking"));
+        assert_eq!(assistant_prefix.as_deref(), Some("open_think"));
+        assert_eq!(max_think_tokens, None);
     }
 }

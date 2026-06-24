@@ -1,7 +1,9 @@
 # Nemotron-H follow-ups + quantized-serving roadmap
 
-Status as of 2026-06-24: **nemotron_h (Nano-4B) serves end-to-end** (arch_id 14,
-coherent output) — see `docs/plans/2026-06-24-nemotron-h-mamba2.md` for N0–N5.
+Status as of 2026-06-25: **nemotron_h (Nano-4B) serves end-to-end** (arch_id 14,
+loads and streams tokens), but coherent chat output remains blocked by the FU1
+newline attractor — see `docs/plans/2026-06-24-nemotron-fu5-status.md` for the
+current evidence and `docs/plans/2026-06-24-nemotron-h-mamba2.md` for N0–N5.
 This doc plans the six follow-ups, each self-contained and grounded in the
 current code/checkpoints. Effort tags: **S** ≈ hours, **M** ≈ 1–2 days, **L** ≈
 several days.
@@ -9,20 +11,33 @@ several days.
 ## Recommended sequencing (dependencies)
 
 ```
-1. chat-template refinement      (S)  ── usability; unblocks real eval
+1. chat-template refinement      (S)  ── done; FU1 coherence still needs a valid reference
 2. HF-ref numeric bisect         (M)  ── lock correctness before scaling
 3. quantizer compatibility       (M) ─┐ the "real-use memory" track
 4. loader compatibility          (L) ─┘ (16GB f32 → ~4GB mq4); 4 depends on 3
 5. N6 chunked-prefill + q8 state (L)  ── throughput (independent of 3/4)
 6. Nano-30B (MoE 'E' block)      (L)  ── new model/feature (independent)
 ```
-1, 2, 5, 6 are mutually independent; 4 depends on 3. Do 1 first (cheap, makes
-the model actually usable), then pick the track by priority: correctness (2),
-memory (3+4), speed (5), or scale (6).
+1, 2, 5, 6 are mutually independent; 4 depends on 3. The chat-template sub-work
+in 1 is done; the remaining FU1 coherence work needs a valid CUDA/vLLM/NVIDIA
+reference before more sampling or prompt-policy tuning is meaningful. Then pick
+the track by priority: correctness (2), memory (3+4), speed (5), or scale (6).
 
 ---
 
 ## 1. Chat-template refinement (S)
+
+**Current state (2026-06-25).** The concrete template items below are done in the
+live code: arch 14 resolves EOS from tokenizer `<|im_end|>`, Jinja is the default
+when the embedded template exists, and `hipfire chat` forwards thinking-off
+controls (`closed_think`, `max_think_tokens = 1`) just like the HTTP path.
+
+This did **not** resolve coherence. Current `target/debug/hipfire-daemon` still
+emits newline-only output for Nano-4B, and the local HF pure-Torch fallback with
+trained `dt_bias` restored also emits newline-only output for the same
+byte-identical prompt. Treat the remaining FU1 task as "obtain a valid
+CUDA/vLLM/NVIDIA-runtime reference and compare generation," not as another
+chat-template tweak.
 
 **Problem (root-caused).** The N5 serve test stopped after 8 tokens ("We need to
 answer in one sentence.") — an early/odd halt. Cause is concrete:
@@ -52,9 +67,10 @@ answer in one sentence.") — an early/odd halt. Cause is concrete:
 `crates/hipfire-arch-nemotron/src/lib.rs` (eos resolution) or the load path
 (`load.rs` arch-14 branch) to set the chat-eos id.
 
-**Validation.** Serve 3–4 prompts; expect full multi-sentence answers ending
-cleanly at `<|im_end|>`, with the `<think>` trace handled per think-mode. No
-mid-answer halt.
+**Validation.** The old validation expectation ("serve 3-4 prompts and expect
+clean answers") is not met on ROCm today. New validation target: capture a
+coherent external reference first, then compare Hipfire prompt IDs, first-token
+logits, and generated text against that reference.
 
 ---
 
