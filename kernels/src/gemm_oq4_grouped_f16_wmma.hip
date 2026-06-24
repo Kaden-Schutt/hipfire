@@ -56,27 +56,49 @@ extern "C" __global__ void gemm_oq4_grouped_f16_wmma(
 
     float8_t acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 
+    // Dequant 16 signed-int4 nibbles (two uint32) → half16, scaled by sw.
+    #define DEQ16(areg, pk0, pk1, sw) do { \
+        _Float16 _s = (sw); \
+        _Float16* _a = (areg); \
+        _a[0]=_s*(_Float16)(float)((((int)((pk0)      &0xFu))<<28)>>28); \
+        _a[1]=_s*(_Float16)(float)((((int)(((pk0)>>4) &0xFu))<<28)>>28); \
+        _a[2]=_s*(_Float16)(float)((((int)(((pk0)>>8) &0xFu))<<28)>>28); \
+        _a[3]=_s*(_Float16)(float)((((int)(((pk0)>>12)&0xFu))<<28)>>28); \
+        _a[4]=_s*(_Float16)(float)((((int)(((pk0)>>16)&0xFu))<<28)>>28); \
+        _a[5]=_s*(_Float16)(float)((((int)(((pk0)>>20)&0xFu))<<28)>>28); \
+        _a[6]=_s*(_Float16)(float)((((int)(((pk0)>>24)&0xFu))<<28)>>28); \
+        _a[7]=_s*(_Float16)(float)((((int)(((pk0)>>28)&0xFu))<<28)>>28); \
+        _a[8]=_s*(_Float16)(float)((((int)((pk1)      &0xFu))<<28)>>28); \
+        _a[9]=_s*(_Float16)(float)((((int)(((pk1)>>4) &0xFu))<<28)>>28); \
+        _a[10]=_s*(_Float16)(float)((((int)(((pk1)>>8) &0xFu))<<28)>>28); \
+        _a[11]=_s*(_Float16)(float)((((int)(((pk1)>>12)&0xFu))<<28)>>28); \
+        _a[12]=_s*(_Float16)(float)((((int)(((pk1)>>16)&0xFu))<<28)>>28); \
+        _a[13]=_s*(_Float16)(float)((((int)(((pk1)>>20)&0xFu))<<28)>>28); \
+        _a[14]=_s*(_Float16)(float)((((int)(((pk1)>>24)&0xFu))<<28)>>28); \
+        _a[15]=_s*(_Float16)(float)((((int)(((pk1)>>28)&0xFu))<<28)>>28); \
+    } while (0)
+
     for (int g = 0; g < n_groups; ++g) {
         const _Float16 sw = (_Float16)ws_row[g];     // this A-row's group scale
         const int g_byte = g * (group / 2);
         const _Float16* x_g = x_prow + g * group;
-        for (int kt = 0; kt < tiles_per_group; ++kt) {
-            const uint32_t pk0 = *(const uint32_t*)(w_row + g_byte + kt * 8);
-            const uint32_t pk1 = *(const uint32_t*)(w_row + g_byte + kt * 8 + 4);
+        // 2× K-tile unroll with software pipelining: load tile B's weight+act
+        // while tile A's WMMA is in flight (mirrors mq4 gemm_qkv_hfq4g256_wmma K2).
+        for (int kt = 0; kt < tiles_per_group; kt += 2) {
+            const uint32_t a0 = *(const uint32_t*)(w_row + g_byte + kt * 8);
+            const uint32_t a1 = *(const uint32_t*)(w_row + g_byte + kt * 8 + 4);
+            const uint32_t b0 = *(const uint32_t*)(w_row + g_byte + (kt + 1) * 8);
+            const uint32_t b1 = *(const uint32_t*)(w_row + g_byte + (kt + 1) * 8 + 4);
+            half16_t xa = *(const half16_t*)(x_g + kt * 16);
+            half16_t xb = *(const half16_t*)(x_g + (kt + 1) * 16);
             half16_t a_reg;
-            #define DQ(i, pk, sh) do { \
-                int _v = (int)(((pk) >> (sh)) & 0xFu); _v = (_v << 28) >> 28; \
-                a_reg[i] = sw * (_Float16)(float)_v; \
-            } while (0)
-            DQ(0,  pk0,  0); DQ(1,  pk0,  4); DQ(2,  pk0,  8); DQ(3,  pk0, 12);
-            DQ(4,  pk0, 16); DQ(5,  pk0, 20); DQ(6,  pk0, 24); DQ(7,  pk0, 28);
-            DQ(8,  pk1,  0); DQ(9,  pk1,  4); DQ(10, pk1,  8); DQ(11, pk1, 12);
-            DQ(12, pk1, 16); DQ(13, pk1, 20); DQ(14, pk1, 24); DQ(15, pk1, 28);
-            #undef DQ
-            half16_t b_reg = *(const half16_t*)(x_g + kt * 16);
-            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_reg, b_reg, acc);
+            DEQ16(a_reg, a0, a1, sw);
+            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_reg, xa, acc);
+            DEQ16(a_reg, b0, b1, sw);
+            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_reg, xb, acc);
         }
     }
+    #undef DEQ16
 
     const int out_col = batch_start + lane;
     if (out_col < B) {
