@@ -174,6 +174,27 @@ impl Gpu {
                 .launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, None, &mut params)
         }
     }
+    /// ReLU-squared: `out = max(0, x)^2` (nemotron_h dense MLP activation).
+    pub fn relu2_f32(&mut self, x: &GpuTensor, out: &GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("relu2", kernels::RELU2_SRC, "relu2_f32")?;
+        let func = &self.functions["relu2_f32"];
+        let n = x.numel() as i32;
+        let mut out_ptr = out.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut n_val = n;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        unsafe {
+            self.hip
+                .launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, None, &mut params)
+        }
+    }
     /// out = silu(gate) * up — fused to avoid intermediate buffer
     /// Fused GeGLU: `out = gelu_tanh(gate) * up`. Gemma-family gated MLP
     /// (`gelu_pytorch_tanh`); same launch shape as [`Self::silu_mul_f32`].
