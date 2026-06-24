@@ -10891,6 +10891,99 @@ impl Gpu {
         result
     }
 
+    /// Arch-resolved MQ2-Lloyd grouped MoE GEMM (the dispatcher entry — callers
+    /// stay arch-agnostic). Picks the i8 MMQ kernel on gfx1151 (~1.7x FP16) when
+    /// the shape qualifies (M%16, K%256), else the FP16 WMMA 4w_k2 kernel.
+    /// Same args as both: trailing `x_src_rows` is the Q8_1/F16 source row count.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq2g256_lloyd_moe_grouped(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        if self.arch_caps.is_gfx1151() && m % 16 == 0 && k % 256 == 0 {
+            self.gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151(
+                expert_weight_ptrs,
+                expert_tile_ids,
+                sorted_slot_index,
+                x_src,
+                y_grouped,
+                m,
+                k,
+                x_row_div,
+                m_total,
+                x_src_rows,
+            )
+        } else {
+            self.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
+                expert_weight_ptrs,
+                expert_tile_ids,
+                sorted_slot_index,
+                x_src,
+                y_grouped,
+                m,
+                k,
+                x_row_div,
+                m_total,
+                x_src_rows,
+            )
+        }
+    }
+
+    /// Arch-resolved MQ3-Lloyd grouped MoE GEMM (dispatcher entry). Picks the i8
+    /// MMQ kernel on gfx1151 (M%16, K%256) else the FP16 WMMA dispatcher
+    /// (`gemm_mq3g256_lloyd_moe_grouped_wmma`, which itself selects gfx12 vs k2).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq3g256_lloyd_moe_grouped(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        if self.arch_caps.is_gfx1151() && m % 16 == 0 && k % 256 == 0 {
+            self.gemm_mq3g256_lloyd_moe_grouped_mmq_gfx1151(
+                expert_weight_ptrs,
+                expert_tile_ids,
+                sorted_slot_index,
+                x_src,
+                y_grouped,
+                m,
+                k,
+                x_row_div,
+                m_total,
+                x_src_rows,
+            )
+        } else {
+            self.gemm_mq3g256_lloyd_moe_grouped_wmma(
+                expert_weight_ptrs,
+                expert_tile_ids,
+                sorted_slot_index,
+                x_src,
+                y_grouped,
+                m,
+                k,
+                x_row_div,
+                m_total,
+                x_src_rows,
+            )
+        }
+    }
+
     /// gfx1151 (Strix Halo iGPU) i8 MMQ MoE grouped GEMM — k4 (deeper
     /// K-tile pipeline) variant. Drop-in for `gemm_hfq4g256_moe_grouped_mmq_gfx1151`
     /// — same kernarg layout, same grid/block geometry, same scatter

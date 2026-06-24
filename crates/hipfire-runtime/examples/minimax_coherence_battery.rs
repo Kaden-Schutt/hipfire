@@ -48,7 +48,9 @@ fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let mut model: Option<PathBuf> = None;
     let mut max: usize = 256;
-    let mut modes: Vec<String> = vec!["indexed".into(), "grouped_fp16".into(), "grouped_i8".into()];
+    // i8 vs FP16 grouped is now arch-gated (no env knob): on gfx1151 "grouped"
+    // runs the i8 path, elsewhere FP16. So the matrix is indexed vs grouped.
+    let mut modes: Vec<String> = vec!["indexed".into(), "grouped".into()];
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -115,17 +117,12 @@ fn main() {
     ];
 
     let apply_mode = |mode: &str| {
-        // Reset, then set per-mode levers (forward_batch reads these per call).
-        std::env::remove_var("HIPFIRE_MINIMAX_MOE_GROUPED");
+        // Per-mode levers (forward_batch reads these per call). Gate=8 forces
+        // grouped even on the short prompts so the grouped kernels are exercised.
         std::env::set_var("HIPFIRE_MINIMAX_MOE_GROUPED_GATE", "8");
-        // i8 is default-on, so the fp16 mode must explicitly opt OUT.
         match mode {
-            "indexed" => {
-                std::env::set_var("HIPFIRE_MINIMAX_MOE_GROUPED", "0");
-                std::env::set_var("HIPFIRE_MINIMAX_MOE_I8", "0");
-            }
-            "grouped_fp16" => std::env::set_var("HIPFIRE_MINIMAX_MOE_I8", "0"),
-            "grouped_i8" => std::env::set_var("HIPFIRE_MINIMAX_MOE_I8", "1"),
+            "indexed" => std::env::set_var("HIPFIRE_MINIMAX_MOE_GROUPED", "0"),
+            "grouped" => std::env::remove_var("HIPFIRE_MINIMAX_MOE_GROUPED"),
             other => panic!("unknown mode {other}"),
         }
     };
