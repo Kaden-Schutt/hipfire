@@ -1954,16 +1954,23 @@ pub fn load_model_safetensors(
         let cfg_json = meta
             .get("config")
             .ok_or("nemotron: metadata_json missing 'config'")?;
-        let cfg = hipfire_arch_nemotron::NemotronHConfig::from_json(cfg_json)
+        let mut cfg = hipfire_arch_nemotron::NemotronHConfig::from_json(cfg_json)
             .map_err(|e| format!("nemotron config: {e}"))?;
+        // Chat serving stops on the ChatML turn delimiter `<|im_end|>`, not the
+        // base `eos_token_id` (`</s>` = 2 for Nano). Resolve it from the
+        // tokenizer; fall back to the config eos if the model isn't ChatML.
+        if let Some(im_end) = tokenizer.special_token_id("<|im_end|>") {
+            cfg.eos_token_id = im_end;
+        }
         eprintln!(
-            "  nemotron_h: hidden={}, layers={} ({} M / {} * / {} -), vocab={}",
+            "  nemotron_h: hidden={}, layers={} ({} M / {} * / {} -), vocab={}, eos={}",
             cfg.hidden_size,
             cfg.num_layers,
             cfg.count(hipfire_arch_nemotron::BlockKind::Mamba2),
             cfg.count(hipfire_arch_nemotron::BlockKind::Attention),
             cfg.count(hipfire_arch_nemotron::BlockKind::Mlp),
             cfg.vocab_size,
+            cfg.eos_token_id,
         );
         let weights = hipfire_arch_nemotron::loader::load_nemotron_weights(&source, &cfg)?;
         let model = hipfire_arch_nemotron::model::NemotronModel::new(gpu, cfg, &weights, max_seq)

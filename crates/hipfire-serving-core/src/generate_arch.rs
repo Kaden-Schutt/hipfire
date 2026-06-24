@@ -1194,8 +1194,11 @@ pub fn generate_nemotron(
     let raw = effective_raw(m);
     let prompt_tokens: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let try_jinja = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1")
-            && m.chat_template.is_some();
+        // nemotron_h ships a correct ChatML jinja template (`<|im_start|>` /
+        // `<|im_end|>`), so default to it when present (opt out with
+        // HIPFIRE_JINJA_CHAT=0). The hand-rolled Plain ChatFrame is the fallback.
+        let try_jinja = m.chat_template.is_some()
+            && std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
             let frame = prompt_frame::JinjaChatFrame {
