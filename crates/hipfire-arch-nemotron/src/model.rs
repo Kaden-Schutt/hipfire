@@ -160,8 +160,9 @@ impl NemotronModel {
         })
     }
 
-    /// Decode one token at absolute position `pos`; returns `[vocab]` logits.
-    pub fn forward(&mut self, gpu: &mut Gpu, token: u32, pos: usize) -> HipResult<Vec<f32>> {
+    /// Decode one token at `pos`, leaving the `[vocab]` logits in `self.logits`
+    /// **on the GPU** (no download/sync) for the daemon sampler.
+    pub fn forward_gpu(&mut self, gpu: &mut Gpu, token: u32, pos: usize) -> HipResult<()> {
         let hidden = self.cfg.hidden_size;
         let eps = self.cfg.rms_norm_eps;
 
@@ -185,8 +186,57 @@ impl NemotronModel {
         }
         gpu.rmsnorm_f32(&self.h, &self.norm_f, &self.normed, eps)?;
         gpu.gemv_f32(&self.lm_head, &self.normed, &self.logits)?;
+        Ok(())
+    }
+
+    /// Decode one token at `pos`; returns the downloaded `[vocab]` logits.
+    /// (Convenience for examples/tests; the serving path uses `forward_gpu` +
+    /// the on-device `logits()` tensor.)
+    pub fn forward(&mut self, gpu: &mut Gpu, token: u32, pos: usize) -> HipResult<Vec<f32>> {
+        self.forward_gpu(gpu, token, pos)?;
         gpu.hip.device_synchronize()?;
         gpu.download_f32(&self.logits)
+    }
+
+    /// The most recent step's logits tensor (`[vocab]`), on the GPU.
+    pub fn logits_tensor(&self) -> &GpuTensor {
+        &self.logits
+    }
+
+    pub fn config(&self) -> &NemotronHConfig {
+        &self.cfg
+    }
+
+    /// Zero the recurrent state (Mamba conv/SSM) for a fresh generation. The
+    /// attention KV caches need no zeroing — they're overwritten per `pos` and
+    /// only read over `0..=pos`.
+    pub fn reset(&mut self, gpu: &mut Gpu) -> HipResult<()> {
+        for b in &mut self.layers {
+            if let Block::Mamba2(m) = b {
+                m.reset(gpu)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Free all GPU tensors (consumes the model).
+    pub fn free(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.embeddings);
+        let _ = gpu.free_tensor(self.lm_head);
+        let _ = gpu.free_tensor(self.norm_f);
+        let _ = gpu.free_tensor(self.h);
+        let _ = gpu.free_tensor(self.normed);
+        let _ = gpu.free_tensor(self.logits);
+        for n in self.layer_norm {
+            let _ = gpu.free_tensor(n);
+        }
+        for b in self.layers {
+            match b {
+                Block::Mamba2(m) => m.free(gpu),
+                Block::Mlp(m) => m.free(gpu),
+                Block::Attn(a) => a.free(gpu),
+            }
+        }
     }
 }
 

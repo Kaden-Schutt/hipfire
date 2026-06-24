@@ -176,4 +176,40 @@ impl Mamba2BlockGpu {
         gpu.gemv_f32(&self.out_proj, &self.y_norm, &self.out)?;
         Ok(&self.out)
     }
+
+    /// Zero the recurrent conv + SSM state for a fresh sequence.
+    pub fn reset(&mut self, gpu: &mut Gpu) -> HipResult<()> {
+        gpu.fill_f32(&self.conv_state, 0.0)?;
+        gpu.fill_f32(&self.ssm_state, 0.0)?;
+        Ok(())
+    }
+
+    /// Free all GPU tensors (consumes the block).
+    pub fn free(self, gpu: &mut Gpu) {
+        for t in [
+            self.in_proj,
+            self.conv_weight,
+            self.conv_bias,
+            self.a_log,
+            self.d,
+            self.dt_bias,
+            self.norm_weight,
+            self.out_proj,
+            self.conv_state,
+            self.ssm_state,
+            self.proj,
+            self.xbc_in,
+            self.xbc_act,
+            self.dt_raw,
+            self.z,
+            self.x,
+            self.b,
+            self.c,
+            self.y,
+            self.y_norm,
+            self.out,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
 }

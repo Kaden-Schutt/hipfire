@@ -89,6 +89,13 @@ impl MlpRelu2Gpu {
     pub fn intermediate(&self) -> usize {
         self.intermediate
     }
+
+    /// Free all GPU tensors (consumes the block).
+    pub fn free(self, gpu: &mut Gpu) {
+        for t in [self.up, self.down, self.u, self.a, self.out] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
 }
 
 #[cfg(test)]

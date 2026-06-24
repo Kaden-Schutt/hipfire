@@ -14,6 +14,7 @@
 //! MLP, the per-block forward, weight loader, and serving impls land in later
 //! loop iterations (N1+).
 
+pub mod arch;
 pub mod attn;
 pub mod block;
 pub mod block_gpu;
@@ -118,6 +119,8 @@ pub struct NemotronHConfig {
     pub num_layers: usize,
     pub rms_norm_eps: f32,
     pub tie_word_embeddings: bool,
+    /// EOS / end-of-turn token id (`eos_token_id`); Nano-4B = 2.
+    pub eos_token_id: u32,
     /// Per-block kinds, parsed from `hybrid_override_pattern` (length == num_layers).
     pub blocks: Vec<BlockKind>,
     pub mamba: Mamba2Config,
@@ -147,6 +150,7 @@ impl NemotronHConfig {
             num_layers: raw.num_hidden_layers,
             rms_norm_eps: raw.rms_norm_eps,
             tie_word_embeddings: raw.tie_word_embeddings,
+            eos_token_id: raw.eos_token_id,
             blocks,
             mamba: Mamba2Config {
                 num_heads: raw.mamba_num_heads,
@@ -222,6 +226,8 @@ struct RawConfig {
     rms_norm_eps: f32,
     #[serde(default)]
     tie_word_embeddings: bool,
+    #[serde(default = "default_eos")]
+    eos_token_id: u32,
     hybrid_override_pattern: String,
     mamba_num_heads: usize,
     mamba_head_dim: usize,
@@ -253,6 +259,9 @@ fn default_eps() -> f32 {
 }
 fn default_chunk() -> usize {
     256
+}
+fn default_eos() -> u32 {
+    2
 }
 fn default_dt_min() -> f32 {
     0.001

@@ -166,6 +166,27 @@ impl NemotronAttnGpu {
     pub fn hidden(&self) -> usize {
         self.hidden
     }
+
+    /// Free all GPU tensors + the pos buffer (consumes the block).
+    pub fn free(self, gpu: &mut Gpu) {
+        let _ = gpu.hip.free(self.pos_buf);
+        for t in [
+            self.q_proj,
+            self.k_proj,
+            self.v_proj,
+            self.o_proj,
+            self.k_cache,
+            self.v_cache,
+            self.q,
+            self.k,
+            self.v,
+            self.attn_out,
+            self.attn_partials,
+            self.out,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
 }
 
 #[cfg(test)]
