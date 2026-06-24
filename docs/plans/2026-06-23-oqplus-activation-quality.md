@@ -260,9 +260,17 @@ retired). Opt out with `=0`.
   bug — the .hip JIT-compiles at runtime so the Rust build passed but it'd panic
   on first use; 55d9df52 fixes it. The interim "1106" was a stale-cache reading.)
   K4-unroll was tried and REVERTED — register pressure dropped occupancy (494 tok/s).
-- **Remaining ~1.24× to mq4+:** mq4 uses an MMQ/dp4a (int8) backend +
-  multi-projection fusion (204 vs 372 launches). The f16-WMMA per-projection path
-  shipped is the correct + coherent baseline.
+- **MMQ int8-WMMA backend SHIPPED — OQ4+ prefill now BEATS mq4+ (commit e769832c,
+  2026-06-24).** Isolation (`HIPFIRE_MMQ=0`) proved OQ4+'s f16-WMMA (1267) already
+  beat mq4's f16-WMMA (1060); mq4's whole lead was its MMQ backend (1585). Ported
+  MMQ to oq4 (`gemm_oq4_residual_mmq.hip`): mq4's q8_1 + LDS-staged i8-WMMA
+  machinery, weight loader swapped for OQ4+'s split sign-extended-int4 (zp=0).
+  Multi-projection methods quantize the shared activation ONCE; full_set/full_add
+  (no-bounds, M&N%128==0) was decisive (1288 generic → **1610 tok/s**). Gated
+  n>=64 (f16 fallback for tiny batches). Parity 0.4% (int8-act noise), coherent
+  (server MMQ prefill). **OQ4+ prefill 1610 > mq4+ 1578**; decode unchanged 56.7.
+  Only remaining gap to mq4+ is the ~7% decode (per-projection GEMV launch
+  overhead — the decode-fusion lever, deferred since fusion gave ~0 on oq8).
 - **Multi-projection FUSION tried + REVERTED (negative result, 2026-06-24).** Built
   3 fused W4A16 kernels (gemm_qkvza/gate_up/qkv_oq4_f16_wmma, blockIdx demux over
   concatenated row-tiles, shared single f16-conversion) and wired all LA+FA arms.
