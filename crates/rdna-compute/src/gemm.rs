@@ -11499,7 +11499,7 @@ impl Gpu {
     /// FP16 `gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2` (same args + trailing
     /// `x_src_rows`): X is auto-quantized to Q8_1, the 2-bit Lloyd index is
     /// decoded via an in-kernel int8-codebook LUT, and i8 WMMA runs at ~2x the
-    /// FP16 rate. Opt-in via `HIPFIRE_DEEPSEEK4_MOE_I8=1`.
+    /// FP16 rate. Default path on gfx1151 (no env gate).
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151(
         &mut self,
@@ -20691,7 +20691,11 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let kernel_name = "gemm_q8_0_mmq_4w_gfx1151";
-        self.ensure_kernel(kernel_name, kernels::GEMM_Q8_0_MMQ_4W_GFX1151_SRC, kernel_name)?;
+        self.ensure_kernel(
+            kernel_name,
+            kernels::GEMM_Q8_0_MMQ_4W_GFX1151_SRC,
+            kernel_name,
+        )?;
         let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
 
         let ap = a.buf.as_ptr();

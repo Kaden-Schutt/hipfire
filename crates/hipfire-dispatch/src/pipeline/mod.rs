@@ -1931,8 +1931,7 @@ pub fn run_moe_prefill_bias_aware(
     let mmqload_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD").as_deref() == Ok("1");
     let nosync_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC").as_deref() == Ok("1");
     // i8 MMQ path (gfx1151 only): 2-bit Lloyd → int8 codebook LUT + i8 WMMA.
-    let i8_moe = std::env::var("HIPFIRE_DEEPSEEK4_MOE_I8").as_deref() == Ok("1")
-        && gpu.arch.starts_with("gfx1151");
+    let i8_moe = gpu.arch.starts_with("gfx1151");
 
     if use_grouped {
         const BLOCK_M: usize = 16;
