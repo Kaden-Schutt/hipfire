@@ -629,6 +629,117 @@ pub fn load_model(
         });
     }
 
+    if hfq.arch_id == 14 {
+        // nemotron_h (Mamba-2 + GQA + ReLU² MLP hybrid) from a quantized (or
+        // bf16) .hfq, driven through the ServingBackend seam (N5b → generate_
+        // nemotron). `from_hfq` loads quantized Q8 / MQ4G256 linear weights via
+        // the dispatched gemv AND plain bf16 tensors (→ f32), so it serves both
+        // quantized and bf16 artifacts; the raw-safetensors f32 path
+        // (NemotronModel::new) lives in load_model_safetensors. Validated vs f32
+        // in examples/hfq_vs_f32.rs (argmax match, cosine 0.99).
+        if draft_path.is_some() {
+            return Err(
+                "DFlash not supported on arch_id=14 (nemotron_h). Reload without a draft."
+                    .to_string(),
+            );
+        }
+        let _ = kv_mode;
+        let _ = state_quant_override;
+        let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
+            .map_err(|e| format!("nemotron metadata parse: {e}"))?;
+        let cfg_json = meta
+            .get("config")
+            .ok_or("nemotron: metadata_json missing 'config'")?;
+        let mut cfg = hipfire_arch_nemotron::NemotronHConfig::from_json(cfg_json)
+            .map_err(|e| format!("nemotron config: {e}"))?;
+        // Chat serving stops on the ChatML turn delimiter `<|im_end|>`, not the
+        // base `eos_token_id` (`</s>` = 2 for Nano).
+        if let Some(im_end) = tokenizer.special_token_id("<|im_end|>") {
+            cfg.eos_token_id = im_end;
+        }
+        eprintln!(
+            "  nemotron_h: hidden={}, layers={} ({} M / {} * / {} -), vocab={}, eos={}",
+            cfg.hidden_size,
+            cfg.num_layers,
+            cfg.count(hipfire_arch_nemotron::BlockKind::Mamba2),
+            cfg.count(hipfire_arch_nemotron::BlockKind::Attention),
+            cfg.count(hipfire_arch_nemotron::BlockKind::Mlp),
+            cfg.vocab_size,
+            cfg.eos_token_id,
+        );
+        let model = hipfire_arch_nemotron::model::NemotronModel::from_hfq(gpu, &hfq, cfg, max_seq)
+            .map_err(|e| format!("nemotron NemotronModel::from_hfq: {e}"))?;
+        let chat_template = resolve_chat_template(&hfq, path);
+        let (chat_template, chat_template_profile) =
+            profile_chat_template(chat_template, Some(&tokenizer));
+        return Ok(LoadedModel {
+            arch_id: hfq.arch_id,
+            pp: 1,
+            pp_gpus: None,
+            pp_scratch_set: None,
+            pp_dn_la_to_device: None,
+            q35_config: None,
+            q35_weights: None,
+            q35_scratch: None,
+            sequence_state: None,
+            q35_kv_mode: None,
+            q35_state_quant: None,
+            q35_sessions: std::collections::HashMap::new(),
+            q35_active_session_id: None,
+            q35_active_state_allocation_epoch: 0,
+            q35_active_prefilled_generated_suffix_len: 0,
+            llama_config: None,
+            llama_weights: None,
+            llama_scratch: None,
+            llama_kv: None,
+            llama_backend: None,
+            nemotron_backend: Some(model),
+            qwen2_config: None,
+            qwen2_weights: None,
+            qwen2_state: None,
+            qwen2_backend: None,
+            deepseek4_config: None,
+            deepseek4_weights: None,
+            deepseek4_state: None,
+            deepseek4_pbs: None,
+            deepseek4_eos_tok: 0,
+            mtp_mode: "auto".to_string(),
+            mtp_k: 3,
+            mtp_weights_present: false,
+            minimax_config: None,
+            minimax_weights: None,
+            minimax_state: None,
+            minimax_eos_tok: 0,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2moe_config: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2moe_weights: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2moe_state: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2moe_eos_tok: 0,
+            dots_ocr_config: None,
+            dots_ocr_weights: None,
+            vision_config: None,
+            vision_weights: None,
+            gemma3_vl: None,
+            gemma3_text: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0,
+            max_seq,
+            physical_cap: max_seq,
+            eviction: None,
+            conversation_tokens: Vec::new(),
+            asst_turn_cache: std::collections::HashMap::new(),
+            decoded_vocab: None,
+            model_path: path.to_string(),
+            memory: model_memory,
+            dflash: None,
+            chat_template,
+            chat_template_profile,
+        });
+    }
+
     if hfq.arch_id == 12 {
         // Gemma3 text (medgemma-*-text). Plain dense-AR: the gemma3 decoder +
         // its own decode state in `Gemma3Backend`, served via the same
