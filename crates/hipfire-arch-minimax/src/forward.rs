@@ -1099,14 +1099,13 @@ pub fn forward_batch(
     // TOKEN — at 256 experts/top-8 that dominates prefill (rocprofv3: 93%).
     // The scatter-grouped path reads each expert weight ONCE PER CHUNK and
     // runs WMMA, but needs enough rows/expert to be worth the BLOCK_M padding.
-    // Gate on chunk size: below the threshold the per-token indexed path wins.
+    // Gate on chunk size: below MOE_GROUPED_GATE rows the 256 experts get too
+    // few rows each to fill a BLOCK_M tile, so the per-token indexed path wins;
+    // at/above it the grouped path is unconditionally faster + coherent
+    // (validated by coherence-gate-minimax.sh).
     const MOE_BLOCK_M: usize = 16;
-    let grouped_gate: usize = std::env::var("HIPFIRE_MINIMAX_MOE_GROUPED_GATE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(256);
-    let moe_grouped = b >= grouped_gate
-        && std::env::var("HIPFIRE_MINIMAX_MOE_GROUPED").as_deref() != Ok("0")
+    const MOE_GROUPED_GATE: usize = 256;
+    let moe_grouped = b >= MOE_GROUPED_GATE
         && gpu.arch_caps.has_wmma()
         && matches!(
             weights.layers[0].experts[0].gate_up.gpu_dtype,
