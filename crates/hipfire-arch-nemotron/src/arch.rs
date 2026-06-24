@@ -20,10 +20,17 @@ impl SimpleAr for NemotronModel {
         if tokens.is_empty() {
             return Err("nemotron prefill: empty prompt".to_string());
         }
-        // Fresh sequence: zero the recurrent (conv/SSM) state, then stream the
-        // prompt token-by-token so the last token's logits land in `self.logits`.
+        // Fresh sequence: zero the recurrent (conv/SSM) state.
         self.reset(gpu)
             .map_err(|e| format!("nemotron reset: {e:?}"))?;
+        if self.can_batched_prefill() {
+            // N6 batched prefill (f32): one launch per recurrent kernel instead
+            // of per token. Leaves the last token's logits in `self.logits`.
+            return self
+                .prefill_batched(gpu, tokens)
+                .map_err(|e| format!("nemotron batched prefill: {e:?}"));
+        }
+        // Quantized models: per-token loop until the batched quant gemm lands.
         for (pos, &t) in tokens.iter().enumerate() {
             self.forward_gpu(gpu, t, pos)
                 .map_err(|e| format!("nemotron prefill forward[{pos}]: {e:?}"))?;

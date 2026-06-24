@@ -75,6 +75,11 @@ enum Block {
 /// GPU-resident nemotron_h model (decode forward).
 pub struct NemotronModel {
     cfg: NemotronHConfig,
+    /// Whether the batched N6 prefill path can run: true for f32 weights
+    /// (`new`), false for the HFQ path (`from_hfq`) until the quantized batched
+    /// gemm (`LinearWeight::gemm_seq` Quant arm) is wired — quant models keep the
+    /// per-token prefill loop.
+    batched_prefill: bool,
     embeddings: EmbeddingTable,
     layer_norm: Vec<GpuTensor>,
     layers: Vec<Block>,
@@ -157,6 +162,7 @@ impl NemotronModel {
             h: gpu.zeros(&[hidden], DType::F32)?,
             normed: gpu.zeros(&[hidden], DType::F32)?,
             logits: gpu.zeros(&[vocab], DType::F32)?,
+            batched_prefill: true,
             cfg,
         })
     }
@@ -287,6 +293,7 @@ impl NemotronModel {
             h: gpu.zeros(&[hidden], DType::F32).map_err(e)?,
             normed: gpu.zeros(&[hidden], DType::F32).map_err(e)?,
             logits: gpu.zeros(&[vocab], DType::F32).map_err(e)?,
+            batched_prefill: false,
             cfg,
         })
     }
@@ -317,6 +324,61 @@ impl NemotronModel {
         }
         gpu.rmsnorm_f32(&self.h, &self.norm_f, &self.normed, eps)?;
         self.lm_head.gemv(gpu, &self.normed, &self.logits)?;
+        Ok(())
+    }
+
+    /// Whether the batched N6 prefill ([`Self::prefill_batched`]) is available
+    /// (f32 weights). Quantized models fall back to the per-token loop.
+    pub fn can_batched_prefill(&self) -> bool {
+        self.batched_prefill
+    }
+
+    /// Batched N6 prefill: process the whole prompt through the residual stream
+    /// in batched form (embed → per-block `prefill` with `rmsnorm_batched`
+    /// pre-norm + residual add), leaving the **last position's** `[vocab]` logits
+    /// in `self.logits` and every block's recurrent/KV state at the post-prompt
+    /// value — equivalent to `forward_gpu` over `tokens`, but with one launch per
+    /// recurrent kernel instead of per token. Assumes fresh state (caller resets).
+    /// F32 weights only; see [`Self::can_batched_prefill`].
+    pub fn prefill_batched(&mut self, gpu: &mut Gpu, tokens: &[u32]) -> HipResult<()> {
+        const F32B: usize = std::mem::size_of::<f32>();
+        let seq = tokens.len();
+        let hidden = self.cfg.hidden_size;
+        let eps = self.cfg.rms_norm_eps;
+
+        let h_seq = gpu.zeros(&[seq * hidden], DType::F32)?;
+        let normed_seq = gpu.zeros(&[seq * hidden], DType::F32)?;
+
+        // embed each token into the residual stream rows.
+        for (p, &t) in tokens.iter().enumerate() {
+            self.embeddings.lookup(gpu, &self.h, t, hidden)?;
+            gpu.memcpy_dtod_at_auto(&h_seq.buf, p * hidden * F32B, &self.h.buf, 0, hidden * F32B)?;
+        }
+
+        for l in 0..self.layers.len() {
+            gpu.rmsnorm_batched(&h_seq, &self.layer_norm[l], &normed_seq, seq, hidden, eps)?;
+            let out = match &mut self.layers[l] {
+                Block::Mamba2(b) => b.prefill(gpu, &normed_seq, seq)?,
+                Block::Mlp(b) => b.prefill(gpu, &normed_seq, seq)?,
+                Block::Attn(b) => b.prefill(gpu, &normed_seq, seq)?,
+            };
+            gpu.add_inplace_f32(&h_seq, &out)?;
+            let _ = gpu.free_tensor(out);
+        }
+
+        gpu.rmsnorm_batched(&h_seq, &self.norm_f, &normed_seq, seq, hidden, eps)?;
+        // lm_head on the LAST position only (the next-token distribution).
+        gpu.memcpy_dtod_at_auto(
+            &self.normed.buf,
+            0,
+            &normed_seq.buf,
+            (seq - 1) * hidden * F32B,
+            hidden * F32B,
+        )?;
+        self.lm_head.gemv(gpu, &self.normed, &self.logits)?;
+
+        let _ = gpu.free_tensor(h_seq);
+        let _ = gpu.free_tensor(normed_seq);
         Ok(())
     }
 
