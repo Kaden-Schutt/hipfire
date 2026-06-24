@@ -1,0 +1,306 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! nemotron_h full model decode forward (N4) — composes the three validated
+//! per-block structs into the flat hybrid stack, plus a host-side CPU oracle.
+//!
+//! ```text
+//!   h = embeddings[token]
+//!   for each layer L (kind from hybrid_override_pattern):
+//!       hn = rmsnorm(h, layers[L].norm.weight)         # standard RMSNorm
+//!       h  = h + block_L(hn)                            # pre-norm residual
+//!         M → Mamba2BlockGpu::decode_step
+//!         * → NemotronAttnGpu::forward(pos)
+//!         - → MlpRelu2Gpu::forward
+//!   h = rmsnorm(h, norm_f.weight)
+//!   logits = lm_head @ h                                # [vocab]
+//! ```
+//! f32 / decode-only (single token). The host weights ([`NemotronWeights`]) are
+//! the loader's target representation. Validated gpu-vs-cpu in
+//! `examples/test_model_gpu.rs`.
+
+use crate::attn::{gqa_attention, NemotronAttnGpu};
+use crate::block::{mamba2_block_decode_step, Mamba2BlockState, Mamba2BlockWeights};
+use crate::mlp::{mlp_relu2, MlpRelu2Gpu};
+use crate::{BlockKind, NemotronHConfig};
+use hip_bridge::HipResult;
+use rdna_compute::{DType, Gpu, GpuTensor};
+
+/// Host-side per-block weights (the loader's target). One per stack layer.
+pub enum HostBlock {
+    Mamba2 {
+        in_proj: Vec<f32>,
+        conv_weight: Vec<f32>,
+        conv_bias: Vec<f32>,
+        a_log: Vec<f32>,
+        d: Vec<f32>,
+        dt_bias: Vec<f32>,
+        mixer_norm: Vec<f32>,
+        out_proj: Vec<f32>,
+    },
+    Mlp {
+        up: Vec<f32>,
+        down: Vec<f32>,
+    },
+    Attn {
+        q: Vec<f32>,
+        k: Vec<f32>,
+        v: Vec<f32>,
+        o: Vec<f32>,
+    },
+}
+
+/// Host-side full nemotron_h weights (dequantized f32). Loader target.
+pub struct NemotronWeights {
+    /// `[vocab * hidden]`.
+    pub embeddings: Vec<f32>,
+    /// Per-layer pre-block RMSNorm weight `[hidden]`.
+    pub layer_norm: Vec<Vec<f32>>,
+    /// Per-layer block weights (len == num_layers, aligned with `cfg.blocks`).
+    pub blocks: Vec<HostBlock>,
+    /// Final RMSNorm `[hidden]`.
+    pub norm_f: Vec<f32>,
+    /// `[vocab * hidden]` (== embeddings if tied).
+    pub lm_head: Vec<f32>,
+}
+
+enum Block {
+    Mamba2(Box<crate::block_gpu::Mamba2BlockGpu>),
+    Mlp(MlpRelu2Gpu),
+    Attn(NemotronAttnGpu),
+}
+
+/// GPU-resident nemotron_h model (decode forward).
+pub struct NemotronModel {
+    cfg: NemotronHConfig,
+    embeddings: GpuTensor,
+    layer_norm: Vec<GpuTensor>,
+    layers: Vec<Block>,
+    norm_f: GpuTensor,
+    lm_head: GpuTensor,
+    // scratch
+    h: GpuTensor,
+    normed: GpuTensor,
+    logits: GpuTensor,
+}
+
+impl NemotronModel {
+    /// Upload `w` and build the GPU model. `max_seq` is the KV-cache budget for
+    /// the attention blocks.
+    pub fn new(
+        gpu: &mut Gpu,
+        cfg: NemotronHConfig,
+        w: &NemotronWeights,
+        max_seq: usize,
+    ) -> HipResult<Self> {
+        let hidden = cfg.hidden_size;
+        let vocab = cfg.vocab_size;
+        let dims = cfg.mamba2_dims();
+
+        let embeddings = gpu.upload_f32(&w.embeddings, &[vocab, hidden])?;
+        let lm_head = gpu.upload_f32(&w.lm_head, &[vocab, hidden])?;
+        let norm_f = gpu.upload_f32(&w.norm_f, &[hidden])?;
+
+        let mut layer_norm = Vec::with_capacity(cfg.num_layers);
+        let mut layers = Vec::with_capacity(cfg.num_layers);
+        for (l, hb) in w.blocks.iter().enumerate() {
+            layer_norm.push(gpu.upload_f32(&w.layer_norm[l], &[hidden])?);
+            let block = match hb {
+                HostBlock::Mamba2 {
+                    in_proj,
+                    conv_weight,
+                    conv_bias,
+                    a_log,
+                    d,
+                    dt_bias,
+                    mixer_norm,
+                    out_proj,
+                } => {
+                    let bw = Mamba2BlockWeights {
+                        in_proj,
+                        conv_weight,
+                        conv_bias,
+                        a_log,
+                        d,
+                        dt_bias,
+                        norm_weight: mixer_norm,
+                        out_proj,
+                    };
+                    Block::Mamba2(Box::new(crate::block_gpu::Mamba2BlockGpu::new(
+                        gpu,
+                        dims.clone(),
+                        &bw,
+                    )?))
+                }
+                HostBlock::Mlp { up, down } => Block::Mlp(MlpRelu2Gpu::new(
+                    gpu,
+                    hidden,
+                    cfg.mlp_intermediate,
+                    up,
+                    down,
+                )?),
+                HostBlock::Attn { q, k, v, o } => Block::Attn(NemotronAttnGpu::new(
+                    gpu, cfg.attn, hidden, max_seq, q, k, v, o,
+                )?),
+            };
+            layers.push(block);
+        }
+
+        Ok(Self {
+            embeddings,
+            lm_head,
+            norm_f,
+            layer_norm,
+            layers,
+            h: gpu.zeros(&[hidden], DType::F32)?,
+            normed: gpu.zeros(&[hidden], DType::F32)?,
+            logits: gpu.zeros(&[vocab], DType::F32)?,
+            cfg,
+        })
+    }
+
+    /// Decode one token at absolute position `pos`; returns `[vocab]` logits.
+    pub fn forward(&mut self, gpu: &mut Gpu, token: u32, pos: usize) -> HipResult<Vec<f32>> {
+        let hidden = self.cfg.hidden_size;
+        let eps = self.cfg.rms_norm_eps;
+
+        gpu.embedding_lookup(&self.embeddings, &self.h, token, hidden)?;
+        for l in 0..self.layers.len() {
+            gpu.rmsnorm_f32(&self.h, &self.layer_norm[l], &self.normed, eps)?;
+            match &mut self.layers[l] {
+                Block::Mamba2(b) => {
+                    let o = b.decode_step(gpu, &self.normed)?;
+                    gpu.add_inplace_f32(&self.h, o)?;
+                }
+                Block::Mlp(b) => {
+                    let o = b.forward(gpu, &self.normed)?;
+                    gpu.add_inplace_f32(&self.h, o)?;
+                }
+                Block::Attn(b) => {
+                    let o = b.forward(gpu, &self.normed, pos)?;
+                    gpu.add_inplace_f32(&self.h, o)?;
+                }
+            }
+        }
+        gpu.rmsnorm_f32(&self.h, &self.norm_f, &self.normed, eps)?;
+        gpu.gemv_f32(&self.lm_head, &self.normed, &self.logits)?;
+        gpu.hip.device_synchronize()?;
+        gpu.download_f32(&self.logits)
+    }
+}
+
+// ── CPU oracle ──────────────────────────────────────────────────────────────
+
+#[inline]
+fn rmsnorm_cpu(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+    let n = x.len();
+    let ms = x.iter().map(|v| v * v).sum::<f32>() / n as f32;
+    let inv = 1.0f32 / (ms + eps).sqrt();
+    (0..n).map(|i| x[i] * w[i] * inv).collect()
+}
+
+fn matvec(w: &[f32], x: &[f32], out: usize, n_in: usize) -> Vec<f32> {
+    (0..out)
+        .map(|i| {
+            w[i * n_in..i * n_in + n_in]
+                .iter()
+                .zip(x)
+                .map(|(a, b)| a * b)
+                .sum()
+        })
+        .collect()
+}
+
+/// Per-layer recurrent CPU state for the oracle (Mamba conv/ssm, attn KV hist).
+pub enum CpuBlockState {
+    Mamba2(Mamba2BlockState),
+    Attn {
+        k_hist: Vec<Vec<f32>>,
+        v_hist: Vec<Vec<f32>>,
+    },
+    Mlp,
+}
+
+/// Build the per-layer CPU state aligned with `cfg.blocks`.
+pub fn cpu_state(cfg: &NemotronHConfig) -> Vec<CpuBlockState> {
+    let dims = cfg.mamba2_dims();
+    cfg.blocks
+        .iter()
+        .map(|k| match k {
+            BlockKind::Mamba2 => CpuBlockState::Mamba2(Mamba2BlockState::zeros(&dims)),
+            BlockKind::Attention => CpuBlockState::Attn {
+                k_hist: Vec::new(),
+                v_hist: Vec::new(),
+            },
+            BlockKind::Mlp => CpuBlockState::Mlp,
+        })
+        .collect()
+}
+
+/// CPU reference forward for one token at `pos`; returns `[vocab]` logits.
+pub fn forward_cpu(
+    cfg: &NemotronHConfig,
+    w: &NemotronWeights,
+    state: &mut [CpuBlockState],
+    token: u32,
+    pos: usize,
+) -> Vec<f32> {
+    let hidden = cfg.hidden_size;
+    let eps = cfg.rms_norm_eps;
+    let dims = cfg.mamba2_dims();
+
+    let mut h = w.embeddings[token as usize * hidden..(token as usize + 1) * hidden].to_vec();
+
+    for l in 0..cfg.blocks.len() {
+        let hn = rmsnorm_cpu(&h, &w.layer_norm[l], eps);
+        let out = match (&w.blocks[l], &mut state[l]) {
+            (
+                HostBlock::Mamba2 {
+                    in_proj,
+                    conv_weight,
+                    conv_bias,
+                    a_log,
+                    d,
+                    dt_bias,
+                    mixer_norm,
+                    out_proj,
+                },
+                CpuBlockState::Mamba2(st),
+            ) => {
+                let bw = Mamba2BlockWeights {
+                    in_proj,
+                    conv_weight,
+                    conv_bias,
+                    a_log,
+                    d,
+                    dt_bias,
+                    norm_weight: mixer_norm,
+                    out_proj,
+                };
+                mamba2_block_decode_step(&dims, &bw, st, &hn)
+            }
+            (HostBlock::Mlp { up, down }, CpuBlockState::Mlp) => {
+                mlp_relu2(up, down, &hn, hidden, cfg.mlp_intermediate)
+            }
+            (HostBlock::Attn { q, k, v, o }, CpuBlockState::Attn { k_hist, v_hist }) => {
+                let a = cfg.attn;
+                let q_dim = a.num_heads * a.head_dim;
+                let kv_dim = a.num_kv_heads * a.head_dim;
+                let qv = matvec(q, &hn, q_dim, hidden);
+                k_hist.push(matvec(k, &hn, kv_dim, hidden));
+                v_hist.push(matvec(v, &hn, kv_dim, hidden));
+                let att =
+                    gqa_attention(&qv, k_hist, v_hist, a.num_heads, a.num_kv_heads, a.head_dim);
+                matvec(o, &att, hidden, q_dim)
+            }
+            _ => unreachable!("block/state kind mismatch at layer {l}"),
+        };
+        for i in 0..hidden {
+            h[i] += out[i];
+        }
+    }
+    let _ = pos;
+    let hf = rmsnorm_cpu(&h, &w.norm_f, eps);
+    matvec(&w.lm_head, &hf, cfg.vocab_size, hidden)
+}
