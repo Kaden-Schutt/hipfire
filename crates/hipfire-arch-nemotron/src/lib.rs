@@ -15,6 +15,7 @@
 //! loop iterations (N1+).
 
 pub mod block;
+pub mod block_gpu;
 pub mod ssd;
 
 use hipfire_mixer::{MixerKind, MixerProfile};

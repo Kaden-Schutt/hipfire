@@ -153,7 +153,7 @@ mod tests {
         // x=[2], B=[1,1], C=[1,1], D=0, state init [0,0].
         // h[n] = 0.5*0 + (ln2 * 2) * 1 = 2*ln2 each.
         // y = C·h = 2*(2*ln2) = 4*ln2.
-        let mut p = params(1, 1, 2, 1);
+        let p = params(1, 1, 2, 1);
         let mut state = vec![0.0; 2];
         let x = vec![2.0];
         let b = vec![1.0, 1.0];
@@ -171,7 +171,7 @@ mod tests {
     #[test]
     fn decay_applies_on_second_step() {
         // Two steps with x=0 on the second: state should decay by da, y -> C·(da*h).
-        let mut p = params(1, 1, 1, 1);
+        let p = params(1, 1, 1, 1);
         let mut state = vec![0.0; 1];
         let b = vec![1.0];
         let c = vec![1.0];
