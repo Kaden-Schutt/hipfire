@@ -84,6 +84,48 @@ closed-think prompt, but vLLM shows that boundary is not the intended production
 generation convention. What remains is a vLLM-vs-Hipfire/native-HF bisect to find
 the first divergence.
 
+## Local `~/Models` control check (2026-06-25)
+
+The user-requested `~/Model` check resolved to `/home/sadara/Models` on this
+host; `/home/sadara/Model` does not exist. The only local snapshot there is
+`models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`,
+which is a Qwen3.5-4B VL/text wrapper, not a Nemotron-H checkpoint. It is useful
+as a control for the Qwen3.5 text path and for validating the fallback reference
+machinery after vLLM proved brittle.
+
+Evidence:
+
+- vLLM 0.22.1 on `/home/sadara/vllm0.22.1` loads the Qwen3.5-4B text-only model
+  when run with the same host fixes used for Nemotron plus
+  `HIPFIRE_VLLM_HIDE_FLASH_ATTN=1 --language-model-only`. Without that flag,
+  the broken local `flash_attn_2_cuda` extension aborts import; without
+  text-only mode, vLLM's multimodal dummy profiling tries to allocate 256 GiB.
+- Even with `--language-model-only --max-num-seqs 1 --max-num-batched-tokens 256`
+  and eager execution, vLLM hangs after loading 7.99 GiB of weights and logging
+  GDN/Triton plus Mamba/attention page sizing. The engine spins CPU-bound and
+  never reaches generation, so vLLM is not a usable reference for this local
+  Qwen snapshot on this host.
+- `benchmarks/nemotron/run_transformers_reference.py` is now the generic CPU
+  Transformers fallback reference. With GPU visibility disabled, it runs the
+  same closed-think 2+2 prompt in float32 on CPU and writes
+  `/tmp/qwen35_4b_transformers_cpu_closed2p2.json`: generated text
+  `2 + 2 equals 4.<|im_end|>`, tokens
+  `[17, 478, 220, 17, 16327, 220, 19, 13, 248046]`, ~1.83 tok/s.
+- `hipfire-quantize --format mq4` successfully converted the local snapshot to
+  `/home/sadara/.hipfire/models/qwen3.5-4b-local-models-mq4.hfq`, 2.59 GB on
+  disk. The quantizer skipped 454M visual/MTP params by default, wrote 426 text
+  tensors, and stamped arch `qwen3_5`.
+- `hipfire chat` loaded that MQ4 artifact through the normal daemon path
+  (2.40 GiB payload, Q8 KV cache, FP32 DeltaNet state) and generated
+  `2+2 equals 4.` in 8 tokens at ~61 tok/s.
+- `greedy_dump_top5` over the exact CPU-reference prompt token IDs produced
+  `2 plus 2 equals 4.<|im_end|>`; this run force-switched KV to FP32 because the
+  artifact still contains BF16 side tensors, so it is a diagnostic rather than a
+  byte-identical chat replay. The first divergence from the CPU reference is a
+  near-tie at generated step 1: CPU FP32 ranks token `478` (`" +"`) first and
+  token `5346` (`" plus"`) third, while Hipfire MQ4 ranks `5346` first and
+  `478` second with margin 0.142. The answer remains coherent.
+
 ## FU4 (DONE, committed)
 
 - `86e86b8b3` — `NemotronModel::from_hfq`: quantized HFQ loader (Q8 + MQ4G256 via
@@ -236,4 +278,18 @@ VLLM_ROCM_USE_AITER_TRITON_GEMM=0 \
   --temperature 0 \
   --max-tokens 16 \
   --out /tmp/nemotron_vllm_closed2p2.json
+
+# Generic Transformers CPU fallback reference (used when vLLM is not usable):
+CUDA_VISIBLE_DEVICES= \
+HIPFIRE_HIDE_FLASH_ATTN=1 \
+OMP_NUM_THREADS=16 \
+MKL_NUM_THREADS=16 \
+/home/sadara/vllm0.22.1/bin/python3 benchmarks/nemotron/run_transformers_reference.py \
+  --model /home/sadara/Models/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a \
+  --thinking off \
+  --text 'Answer in one short sentence: What is 2+2?' \
+  --dtype float32 \
+  --device cpu \
+  --max-new-tokens 16 \
+  --out /tmp/qwen35_4b_transformers_cpu_closed2p2.json
 ```

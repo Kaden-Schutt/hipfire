@@ -8,9 +8,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 from transformers import AutoTokenizer
+
+if os.environ.get("HIPFIRE_VLLM_HIDE_FLASH_ATTN") == "1":
+    import importlib.util
+
+    _find_spec = importlib.util.find_spec
+
+    def _find_spec_without_flash_attn(name: str, *args, **kwargs):
+        if name == "flash_attn" or name.startswith("flash_attn."):
+            return None
+        return _find_spec(name, *args, **kwargs)
+
+    importlib.util.find_spec = _find_spec_without_flash_attn
+
 from vllm import LLM, SamplingParams
 
 
@@ -38,6 +52,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--logprobs", type=int, default=5)
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--ignore-eos", action="store_true")
+    ap.add_argument("--language-model-only", action="store_true")
+    ap.add_argument("--skip-mm-profiling", action="store_true")
+    ap.add_argument("--max-num-batched-tokens", type=int, default=None)
+    ap.add_argument("--max-num-seqs", type=int, default=None)
     return ap.parse_args()
 
 
@@ -69,10 +87,11 @@ def main() -> None:
     if 2 not in stop_ids:
         stop_ids.append(2)
 
-    print("prompt_ids", prompt_ids)
-    print("prompt_repr", repr(prompt))
-    print("stop_ids", stop_ids)
+    print("prompt_ids", prompt_ids, flush=True)
+    print("prompt_repr", repr(prompt), flush=True)
+    print("stop_ids", stop_ids, flush=True)
 
+    print("llm_init_start", flush=True)
     llm = LLM(
         model=model,
         tokenizer=model,
@@ -81,7 +100,12 @@ def main() -> None:
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=True,
         max_model_len=args.max_model_len,
+        language_model_only=args.language_model_only,
+        skip_mm_profiling=args.skip_mm_profiling,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        max_num_seqs=args.max_num_seqs,
     )
+    print("llm_init_done", flush=True)
     params = SamplingParams(
         temperature=args.temperature,
         top_p=args.top_p,
@@ -92,7 +116,9 @@ def main() -> None:
         skip_special_tokens=False,
         logprobs=args.logprobs,
     )
+    print("generate_start", flush=True)
     result = llm.generate([prompt], params)[0]
+    print("generate_done", flush=True)
 
     payload = {
         "model": model,
