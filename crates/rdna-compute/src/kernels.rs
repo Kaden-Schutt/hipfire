@@ -2935,6 +2935,7 @@ pub const CONV1D_GATED_DECODE_SRC: &str =
 #[cfg(feature = "deltanet")]
 pub const GATED_NORM_SRC: &str = include_str!("../../../kernels/src/gated_norm.hip");
 pub const MAMBA2_SSD_DECODE_SRC: &str = include_str!("../../../kernels/src/mamba2_ssd_decode.hip");
+pub const MAMBA2_SSD_SEQ_SRC: &str = include_str!("../../../kernels/src/mamba2_ssd_seq.hip");
 pub const RELU2_SRC: &str = include_str!("../../../kernels/src/relu2.hip");
 pub const MAMBA2_GATED_NORM_SRC: &str = include_str!("../../../kernels/src/mamba2_gated_norm.hip");
 pub const CONV1D_BIAS_SILU_DECODE_SRC: &str =
