@@ -4,12 +4,10 @@
 #
 # Sends a diverse prompt matrix as chat `messages` so the daemon renders the
 # MiniMax chat template → the model answers and emits EOS naturally (no greedy
-# rambling). Each request is run through the daemon in two MoE-prefill modes:
-#
-#   grouped : production path (scatter-grouped MoE; i8 on gfx1151 by arch).
-#             Forced on even for short prompts via MOE_GROUPED_GATE=8 so the
-#             grouped kernels are exercised; chunk 512.
-#   indexed : per-token indexed-GEMV baseline (HIPFIRE_MINIMAX_MOE_GROUPED=0).
+# rambling). Runs the production path with no env levers: short prompts use the
+# per-token indexed MoE GEMV, while the long passage (>=256 rows/chunk) drives
+# the scatter-grouped MoE prefill (i8 on gfx1151 by arch). Both must stay
+# coherent.
 #
 # Hard-fails (exit 1) if any request's visible chat output is degenerate:
 #   - zero tokens, OR max single-word frequency > 0.50 (true attractor), OR
@@ -36,6 +34,21 @@ PROMPTS=(
   "List the first ten prime numbers."
   "Explain in a short paragraph how binary search works."
   "Summarize how photosynthesis works in two sentences."
+  # Long prompt (>=256 rendered tokens) so the prefill chunk hits the
+  # scatter-grouped MoE path (b>=256), not just the indexed path.
+  "Read the following passage and then summarize it in one sentence. \
+Photosynthesis is the process by which green plants, algae, and some bacteria \
+convert light energy into chemical energy stored in glucose. It takes place in \
+the chloroplasts, which contain the pigment chlorophyll. The process has two \
+main stages. In the light-dependent reactions, energy from sunlight is captured \
+and used to split water molecules, producing oxygen as a byproduct and \
+generating the energy carriers ATP and NADPH. In the light-independent \
+reactions, also called the Calvin cycle, the ATP and NADPH are used to fix \
+carbon dioxide from the air into three-carbon sugars, which are then assembled \
+into glucose. Photosynthesis is fundamental to life on Earth because it produces \
+the oxygen we breathe and forms the base of nearly every food chain. The overall \
+balanced equation is six carbon dioxide plus six water, in the presence of light \
+energy, yielding one glucose molecule plus six oxygen molecules."
 )
 
 if [ ! -x "$EXE" ] || [ crates/hipfire-runtime/examples/daemon.rs -nt "$EXE" ]; then
@@ -116,10 +129,10 @@ run_mode() {
   rm -f "$in_file" "$out_file"
 }
 
-# Production path: grouped (i8 on gfx1151), gate low so short chats group too.
-run_mode "grouped (i8 on gfx1151)" HIPFIRE_MINIMAX_MOE_GROUPED_GATE=8 HIPFIRE_MINIMAX_PREFILL_CHUNK=512
-# Baseline: per-token indexed GEMV.
-run_mode "indexed baseline" HIPFIRE_MINIMAX_MOE_GROUPED=0
+# Production path (no env levers): short prompts use the indexed MoE GEMV,
+# the long prompt (>=256 rows/chunk) exercises the scatter-grouped MoE (i8 on
+# gfx1151). Both must stay coherent through the chat template.
+run_mode "production (indexed short + grouped-i8 long)"
 
 echo "" >> "$OUT"
 if [ "$hard_fail" -ne 0 ]; then

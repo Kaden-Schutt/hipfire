@@ -12472,18 +12472,12 @@ fn generate_minimax(
             && minimax::forward::forward_batch_supported(weights);
         if batch_prefill && !prefill_ids.is_empty() {
             let mut pos = state.n_tokens;
-            // Large prefill chunks let forward_batch's scatter-grouped MoE
+            // 512-token prefill chunks let forward_batch's scatter-grouped MoE
             // (>=256 rows/chunk) read each expert weight once per chunk via
             // WMMA instead of once per routed token — ~2.2x prefill on
-            // MiniMax-M2 (256 experts/top-8). Below the grouped gate the
-            // chunk still works (falls to the indexed path). Override with
-            // HIPFIRE_MINIMAX_PREFILL_CHUNK.
-            let prefill_chunk = std::env::var("HIPFIRE_MINIMAX_PREFILL_CHUNK")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .filter(|&c| c > 0)
-                .unwrap_or(512);
-            for chunk in prefill_ids.chunks(prefill_chunk) {
+            // MiniMax-M2 (256 experts/top-8). Shorter prompts fall to the
+            // indexed path inside forward_batch (below the grouped gate).
+            for chunk in prefill_ids.chunks(512) {
                 match minimax::forward::forward_batch(cfg, weights, state, gpu, chunk, pos) {
                     Ok(logits) => last_logits = logits,
                     Err(e) => {
