@@ -33,9 +33,10 @@ fn cpu_ssd_step_full(
     y: &mut [f32],
 ) {
     let softplus = |v: f32| if v > 20.0 { v } else { v.exp().ln_1p() };
+    let heads_per_group = num_heads / n_groups;
     for head in 0..num_heads {
-        // HF tile-expansion: head h uses group h % n_groups (see ssd.rs).
-        let grp = head % n_groups;
+        // Interleave (mamba-ssm fast path / HF decode): head h → group h/(H/G).
+        let grp = head / heads_per_group;
         let a = -(a_log[head].exp());
         let dt = softplus(dt_raw[head] + dt_bias[head]).clamp(dt_min, dt_max);
         let da = (dt * a).exp();

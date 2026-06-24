@@ -25,8 +25,16 @@ use std::io::Write;
 use std::path::PathBuf;
 
 const DEFAULT_DIR: &str = "/srv/huggingface/models--nvidia--NVIDIA-Nemotron-3-Nano-4B-BF16/snapshots/dfaf35de3e30f1867dd8dbc38a7fc9fb52d3914f";
-// "The capital of France is" per the HF dump (must match exactly).
+// "The capital of France is" per the HF dump (must match exactly). Override
+// with NEMO_TOKENS=comma,separated,ids to test a longer sequence.
 const TOKENS: [u32; 5] = [1784, 8961, 1307, 5498, 1395];
+
+fn tokens() -> Vec<u32> {
+    match std::env::var("NEMO_TOKENS") {
+        Ok(s) => s.split(',').map(|x| x.trim().parse().unwrap()).collect(),
+        Err(_) => TOKENS.to_vec(),
+    }
+}
 
 fn main() {
     let out = std::env::args()
@@ -52,19 +60,20 @@ fn main() {
 
     // Capture position: 0 isolates block math (fresh state); env CAP_POS=last
     // builds state over the whole prompt and captures the final position.
+    let toks = tokens();
     let cap_last = std::env::var("CAP_POS").ok().as_deref() == Some("last");
     let (caps, logits) = if cap_last {
-        for (pos, &t) in TOKENS.iter().enumerate().take(TOKENS.len() - 1) {
+        for (pos, &t) in toks.iter().enumerate().take(toks.len() - 1) {
             model.forward_gpu(&mut gpu, t, pos).unwrap();
         }
-        let last = TOKENS.len() - 1;
-        model.forward_capture(&mut gpu, TOKENS[last], last).unwrap()
+        let last = toks.len() - 1;
+        model.forward_capture(&mut gpu, toks[last], last).unwrap()
     } else {
-        model.forward_capture(&mut gpu, TOKENS[0], 0).unwrap()
+        model.forward_capture(&mut gpu, toks[0], 0).unwrap()
     };
     eprintln!(
         "captured at position {}",
-        if cap_last { TOKENS.len() - 1 } else { 0 }
+        if cap_last { toks.len() - 1 } else { 0 }
     );
 
     let hidden = cfg.hidden_size;

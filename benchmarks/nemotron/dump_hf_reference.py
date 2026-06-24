@@ -89,6 +89,7 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", default="/tmp/nemo_hf_ref.npz")
     ap.add_argument("--text", default="The capital of France is")
+    ap.add_argument("--token-ids", default="", help="comma-separated ids (overrides --text)")
     ap.add_argument("--max-layers-print", type=int, default=0)
     args = ap.parse_args()
 
@@ -123,7 +124,11 @@ def main():
                 n_restored += 1
     print(f"restored {n_restored} stored dt_bias tensors (HF randomizes them at load)")
 
-    ids = tok(args.text, return_tensors="pt").input_ids.to(dev)
+    if args.token_ids:
+        idlist = [int(x) for x in args.token_ids.split(",")]
+        ids = torch.tensor([idlist], device=dev)
+    else:
+        ids = tok(args.text, return_tensors="pt").input_ids.to(dev)
     print("input_ids:", ids.tolist())
 
     with torch.no_grad():

@@ -46,11 +46,15 @@ pub struct SsdParams {
 }
 
 impl SsdParams {
-    /// B/C group for a head. HF expands groups with `B.repeat(num_heads //
-    /// n_groups)` — a **tile**, so head `h` uses group `h % n_groups` (NOT the
-    /// interleave `h / (num_heads/n_groups)`). Verified exact vs the HF dump.
+    /// B/C group for a head — the **interleave** `h / (num_heads/n_groups)`,
+    /// matching mamba-ssm's fast path (`mamba_chunk_scan_combined` /
+    /// `selective_state_update`) and HF's *decode* path. (HF's *prefill*
+    /// torch_forward uses `B.repeat` → `h % n_groups`, which is inconsistent
+    /// with its own decode path — a torch-fallback bug; we follow the fast path
+    /// since hipfire is a decode-style implementation and that's the trained
+    /// convention.)
     fn group_of(&self, head: usize) -> usize {
-        head % self.n_groups
+        head / (self.num_heads / self.n_groups)
     }
 }
 

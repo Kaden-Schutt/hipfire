@@ -48,9 +48,10 @@ extern "C" __global__ void mamba2_ssd_decode_f32(
     int head = idx / head_dim;
     int p = idx - head * head_dim;
 
-    // HF expands B/C groups via `B.repeat(num_heads/n_groups)` — a tile, so
-    // head h uses group h % n_groups (NOT the interleave h/(num_heads/n_groups)).
-    int grp = head % n_groups;
+    // Interleave: head h uses group h/(num_heads/n_groups) — mamba-ssm fast
+    // path + HF decode convention (HF prefill torch_forward's h%n_groups is an
+    // inconsistent fallback bug). hipfire is decode-style → use the fast path.
+    int grp = head / (num_heads / n_groups);
 
     float a = -expf(A_log[head]);
     float dt = softplus_stable(dt_raw[head] + dt_bias[head]);
