@@ -44,6 +44,7 @@ CLAUDE.local.md
 # Local secrets (lmx api key, etc.) — never commit
 .env
 .env.*
+.env.gemini
 docs/superpowers/
 .worktrees/
 .dflash-reference/
