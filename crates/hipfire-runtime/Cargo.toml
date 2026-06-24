@@ -142,6 +142,10 @@ name = "load_transport_probe"
 required-features = ["deltanet"]
 
 [[example]]
+name = "oq4_repack"
+required-features = ["arch-qwen35"]
+
+[[example]]
 name = "infer_qwen35"
 required-features = ["arch-qwen35"]
 

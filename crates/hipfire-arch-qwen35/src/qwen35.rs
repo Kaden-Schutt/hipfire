@@ -2403,6 +2403,69 @@ fn load_bf16_matrix_weight(gpu: &Gpu, data: &[u8], m: usize, k: usize) -> HipRes
 
 /// Load weight tensor from raw bytes + quant_type (no name lookup needed).
 ///
+/// On-disk quant_type for the arch-packed OQ4 layout produced by the
+/// `oq4_repack` tool. The canonical/general OQ4 form is quant_type 34
+/// (`[f16 scale][128 nibbles]`/group, portable across every arch); 37 means the
+/// tensor data is ALREADY the arch combined device layout from
+/// [`oq4_pack_arch_combined`], so the loader uploads it verbatim with no
+/// transform. The quant_type code IS the layout version: any future change to
+/// the combined layout takes a NEW code, so a stale arch-packed artifact refuses
+/// via the loader's catch-all (honest capability gap) instead of reading as
+/// garbage. The decoded `WeightTensor` is identical to the qt=34 path
+/// (`DType::Oq4G256`) — only the on-disk parse differs.
+pub const OQ4_ARCH_PACKED_QT: u8 = 37;
+
+/// Byte length of the OQ4 arch combined device layout for an `[m, k]` matrix:
+/// `[split nibbles m*(k/2)] [split f32 scales m*ng] [interleaved m*ng*132]`.
+pub fn oq4_arch_combined_len(m: usize, k: usize) -> usize {
+    let ng = k / 256;
+    m * (k / 2) + m * ng * 4 + m * ng * (4 + 128)
+}
+
+/// Repack canonical on-disk OQ4 (quant_type 34: `[f16 scale][128 nibbles]` per
+/// 256-group, row-contiguous) into the arch combined device layout uploaded by
+/// the loader. This is the SINGLE source of truth for that transform — both the
+/// qt=34 load path and the `oq4_repack` tool call it, so they cannot drift.
+///
+/// Output layout (`[m, k]`, `ng = k/256`):
+///   `[split nibbles m*(k/2)]` — for prefill MMQ/f16 (`sub_offset 0`)
+///   `[split f32 scales m*ng]` — prefill weight-scale region
+///   `[interleaved m*ng*132]`  — decode GEMVs: per group `[f32 scale][128 nibbles]`
+///                               contiguous → one coalesced stream (mq4-style).
+pub fn oq4_pack_arch_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
+    const GROUP: usize = 256;
+    const BLOCK: usize = 130; // 2 (f16 scale) + 128 nibbles
+    const ILB: usize = 4 + 128; // [f32 scale][128 nibbles]
+    assert_eq!(k % GROUP, 0, "OQ4G256 requires K % 256 == 0 (got K={k})");
+    let ng = k / GROUP;
+    let packed_bytes = m * (k / 2);
+    let scales_bytes = m * ng * 4;
+    let il_bytes = m * ng * ILB;
+    let expect = m * ng * BLOCK;
+    assert_eq!(
+        data.len(),
+        expect,
+        "OQ4G256 weight byte length {} != M*ng*130 = {expect} (M={m} K={k})",
+        data.len()
+    );
+    let mut combined = vec![0u8; packed_bytes + scales_bytes + il_bytes];
+    let il_base = packed_bytes + scales_bytes;
+    for r in 0..m {
+        for g in 0..ng {
+            let src = (r * ng + g) * BLOCK;
+            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+            let dst = r * (k / 2) + g * (GROUP / 2);
+            combined[dst..dst + 128].copy_from_slice(&data[src + 2..src + BLOCK]);
+            let so = packed_bytes + (r * ng + g) * 4;
+            combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
+            let io = il_base + (r * ng + g) * ILB;
+            combined[io..io + 4].copy_from_slice(&scale.to_le_bytes());
+            combined[io + 4..io + ILB].copy_from_slice(&data[src + 2..src + BLOCK]);
+        }
+    }
+    combined
+}
+
 /// TODO(transformer-extraction): cross-arch duplicate. The Qwen2 variant
 /// in `hipfire-arch-qwen2::qwen2::load_weight_tensor` inlines a subset
 /// of this match (only HFQ4G256, HFQ4G128, F16 — the formats Qwen2 HFQ
@@ -2838,45 +2901,40 @@ fn load_weight_tensor_raw(
             // weights are already FWHT-rotated offline, so the forward FWHT-rotates
             // x to match (shared mq_rotate_x path). AWQ smooth, when present, is
             // applied to x by the wrapper via the awq_scale sidecar.
-            const GROUP: usize = 256;
-            const BLOCK: usize = 130; // 2 (f16 scale) + 128 nibbles
-            assert_eq!(k % GROUP, 0, "OQ4G256 requires K % 256 == 0 (got K={k})");
-            let ng = k / GROUP;
-            let packed_bytes = m * (k / 2);
-            let scales_bytes = m * ng * 4;
-            let expect = m * ng * BLOCK;
+            // Repack the canonical on-disk form to the arch combined device
+            // layout (see `oq4_pack_arch_combined` for the layout doc). The
+            // `oq4_repack` tool can do this transform ahead-of-time and store it
+            // as quant_type 37 (uploaded verbatim below) — same bytes, no per-load
+            // repack. Prefill (MMQ/f16) reads the split region (sub_offset 0);
+            // decode GEMVs read the interleaved region. The +~0.25 GB dual-layout
+            // is the cost while decode is migrated; collapse to interleaved-only
+            // once prefill is moved too. See gemv_oq4_interleaved.
+            let combined = oq4_pack_arch_combined(data, m, k);
+            let buf = gpu.upload_raw(&combined, &[combined.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::Oq4G256,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        37 => {
+            // Arch-packed OQ4 (`oq4_repack` output): the on-disk data IS the arch
+            // combined device layout already, so upload it verbatim — no per-load
+            // transform. Byte-identical to the qt=34 result; the quant_type code
+            // is the layout version (a future layout change takes a new code, so a
+            // stale artifact refuses via the catch-all rather than reading garbage).
+            let expect = oq4_arch_combined_len(m, k);
             assert_eq!(
                 data.len(),
                 expect,
-                "OQ4G256 weight byte length {} != M*ng*130 = {expect} (M={m} K={k})",
+                "OQ4 arch-packed byte length {} != combined len {expect} (M={m} K={k})",
                 data.len()
             );
-            // Layout: [split nibbles M*(K/2)] [split f32 scales M*ng] [INTERLEAVED
-            // M*ng*132], where each interleaved group record is [f32 scale][128
-            // nibbles] (132 B, contiguous → one coalesced memory stream). Prefill
-            // (MMQ/f16) reads the split region (sub_offset 0); decode GEMVs read the
-            // interleaved region (sub_offset packed+scales). The +~0.25 GB is the
-            // cost of dual-layout while decode is migrated; collapse to interleaved-
-            // only once prefill is moved too. See gemv_oq4_interleaved.
-            const ILB: usize = 4 + 128; // [f32 scale][128 nibbles]
-            let il_bytes = m * ng * ILB;
-            let mut combined = vec![0u8; packed_bytes + scales_bytes + il_bytes];
-            let il_base = packed_bytes + scales_bytes;
-            for r in 0..m {
-                for g in 0..ng {
-                    let src = (r * ng + g) * BLOCK;
-                    let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
-                    let dst = r * (k / 2) + g * (GROUP / 2);
-                    combined[dst..dst + 128].copy_from_slice(&data[src + 2..src + BLOCK]);
-                    let so = packed_bytes + (r * ng + g) * 4;
-                    combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
-                    // interleaved record: [f32 scale][128 nibbles]
-                    let io = il_base + (r * ng + g) * ILB;
-                    combined[io..io + 4].copy_from_slice(&scale.to_le_bytes());
-                    combined[io + 4..io + ILB].copy_from_slice(&data[src + 2..src + BLOCK]);
-                }
-            }
-            let buf = gpu.upload_raw(&combined, &[combined.len()])?;
+            let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::Oq4G256,
