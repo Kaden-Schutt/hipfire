@@ -303,7 +303,9 @@ fn main() {
                     v.as_str(),
                     "fp32" | "f32" | "q8" | "asym2" | "asym3" | "asym4" | "kvarn"
                 ) {
-                    eprintln!("--kv-mode must be one of: fp32 q8 asym2 asym3 asym4 kvarn (got {v})");
+                    eprintln!(
+                        "--kv-mode must be one of: fp32 q8 asym2 asym3 asym4 kvarn (got {v})"
+                    );
                     std::process::exit(1);
                 }
                 kv_mode = v;

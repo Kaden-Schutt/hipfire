@@ -37,8 +37,8 @@ fn clone_tensor(gpu: &mut Gpu, t: &GpuTensor) -> HipResult<GpuTensor> {
 /// Shape/size hyperparameters for the drafter body (independent of the target).
 #[derive(Clone, Copy)]
 pub struct DrafterConfig {
-    pub h_draft: usize,   // drafter hidden width (≪ target)
-    pub n_layers: usize,  // small (2–4)
+    pub h_draft: usize,  // drafter hidden width (≪ target)
+    pub n_layers: usize, // small (2–4)
     pub n_heads: usize,
     pub n_kv: usize,
     pub head_dim: usize,
@@ -75,9 +75,9 @@ pub struct Drafter {
     pub vocab: usize,
     pub in_proj: GpuTensor, // [h_draft, h_t]
     pub layers: Vec<(LayerWeights, LayerLora)>,
-    pub out_norm: GpuTensor,  // [h_draft] final RMSNorm before the score K-head
-    pub wk_score: GpuTensor,  // [kv_dim, h_draft] scoring K projection (post-rope)
-    pub dims: BlockDims, // h = h_draft
+    pub out_norm: GpuTensor, // [h_draft] final RMSNorm before the score K-head
+    pub wk_score: GpuTensor, // [kv_dim, h_draft] scoring K projection (post-rope)
+    pub dims: BlockDims,     // h = h_draft
 }
 
 /// Deterministic LCG pseudo-random fill in [-scale, scale).
@@ -85,7 +85,9 @@ fn rand_fill(n: usize, seed: u64, scale: f32) -> Vec<f32> {
     let mut s = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let u = ((s >> 33) as f32) / (1u64 << 31) as f32; // ~[0,2)
             (u - 1.0) * scale
         })
@@ -137,9 +139,15 @@ impl Drafter {
             // makes these the trainable adapters (or we train the base directly).
             let r = 4;
             let lora = LayerLora {
-                aq: gpu.upload_f32(&rand_fill(r * hd, s + 8, 1.0 / (hd as f32).sqrt()), &[r * hd])?,
+                aq: gpu.upload_f32(
+                    &rand_fill(r * hd, s + 8, 1.0 / (hd as f32).sqrt()),
+                    &[r * hd],
+                )?,
                 bq: gpu.zeros(&[qd * r], DType::F32)?,
-                av: gpu.upload_f32(&rand_fill(r * hd, s + 9, 1.0 / (hd as f32).sqrt()), &[r * hd])?,
+                av: gpu.upload_f32(
+                    &rand_fill(r * hd, s + 9, 1.0 / (hd as f32).sqrt()),
+                    &[r * hd],
+                )?,
                 bv: gpu.zeros(&[kvd * r], DType::F32)?,
             };
             layers.push((weights, lora));
@@ -158,7 +166,16 @@ impl Drafter {
             lora_rank: 4,
         };
 
-        Ok(Drafter { embed, h_t, vocab, in_proj, layers, out_norm, wk_score, dims })
+        Ok(Drafter {
+            embed,
+            h_t,
+            vocab,
+            in_proj,
+            layers,
+            out_norm,
+            wk_score,
+            dims,
+        })
     }
 
     /// Trainable params in a fixed order (matches `DrafterGrads::flat`):
@@ -183,20 +200,23 @@ impl Drafter {
     }
 
     pub fn param_sizes(&self) -> Vec<usize> {
-        self.params().iter().map(|t| t.shape.iter().product()).collect()
+        self.params()
+            .iter()
+            .map(|t| t.shape.iter().product())
+            .collect()
     }
 }
 
 /// Saved activations for the training backward pass.
 pub struct DrafterActs {
-    pub emb: GpuTensor,                   // [seq*h_t] frozen-embedding lookup
-    pub layer_inputs: Vec<GpuTensor>,     // input to each block
+    pub emb: GpuTensor,               // [seq*h_t] frozen-embedding lookup
+    pub layer_inputs: Vec<GpuTensor>, // input to each block
     pub layer_acts: Vec<BlockActivations>,
-    pub x_last: GpuTensor,                // last block output [seq*h]
-    pub xn_out: GpuTensor,                // out_norm output [seq*h]
-    pub rinv_out: GpuTensor,              // [seq]
-    pub score_k: GpuTensor,               // post-rope scoring K [seq*kv_dim]
-    pub pos: GpuTensor,                   // [seq] positions (rope bwd)
+    pub x_last: GpuTensor,   // last block output [seq*h]
+    pub xn_out: GpuTensor,   // out_norm output [seq*h]
+    pub rinv_out: GpuTensor, // [seq]
+    pub score_k: GpuTensor,  // post-rope scoring K [seq*kv_dim]
+    pub pos: GpuTensor,      // [seq] positions (rope bwd)
 }
 
 /// Per-layer base grads + the two norm grads (norm grads come from the LoRA-grad
@@ -231,15 +251,41 @@ impl DrafterGrads {
 
 /// Return a forward's saved activations to the pool (no Drop on GpuTensor).
 pub fn free_drafter_acts(gpu: &mut Gpu, a: DrafterActs) -> HipResult<()> {
-    let DrafterActs { emb, layer_inputs, layer_acts, x_last, xn_out, rinv_out, score_k, pos } = a;
+    let DrafterActs {
+        emb,
+        layer_inputs,
+        layer_acts,
+        x_last,
+        xn_out,
+        rinv_out,
+        score_k,
+        pos,
+    } = a;
     for t in layer_inputs {
         gpu.free_tensor(t)?;
     }
     for b in layer_acts {
         let BlockActivations {
-            xn1, rinv1, hq, hv, q_r, k_r, v, p_all, ctx, x_mid, xn2, rinv2, gate, up, act, pos,
+            xn1,
+            rinv1,
+            hq,
+            hv,
+            q_r,
+            k_r,
+            v,
+            p_all,
+            ctx,
+            x_mid,
+            xn2,
+            rinv2,
+            gate,
+            up,
+            act,
+            pos,
         } = b;
-        for t in [xn1, rinv1, hq, hv, q_r, k_r, v, p_all, ctx, x_mid, xn2, rinv2, gate, up, act, pos] {
+        for t in [
+            xn1, rinv1, hq, hv, q_r, k_r, v, p_all, ctx, x_mid, xn2, rinv2, gate, up, act, pos,
+        ] {
             gpu.free_tensor(t)?;
         }
     }
@@ -251,10 +297,23 @@ pub fn free_drafter_acts(gpu: &mut Gpu, a: DrafterActs) -> HipResult<()> {
 
 /// Return a backward's grads to the pool after the optimizer step.
 pub fn free_drafter_grads(gpu: &mut Gpu, g: DrafterGrads) -> HipResult<()> {
-    let DrafterGrads { d_in_proj, layers, d_out_norm, d_wk_score } = g;
+    let DrafterGrads {
+        d_in_proj,
+        layers,
+        d_out_norm,
+        d_wk_score,
+    } = g;
     gpu.free_tensor(d_in_proj)?;
     for (wg, dn1, dn2) in layers {
-        let BlockWeightGrad { dwq, dwk, dwv, dwo, dwgate, dwup, dwdown } = wg;
+        let BlockWeightGrad {
+            dwq,
+            dwk,
+            dwv,
+            dwo,
+            dwgate,
+            dwup,
+            dwdown,
+        } = wg;
         for t in [dwq, dwk, dwv, dwo, dwgate, dwup, dwdown, dn1, dn2] {
             gpu.free_tensor(t)?;
         }
@@ -267,10 +326,22 @@ pub fn free_drafter_grads(gpu: &mut Gpu, g: DrafterGrads) -> HipResult<()> {
 fn block_views<'a>(lw: &'a LayerWeights, ll: &'a LayerLora) -> (BlockWeights<'a>, BlockLora<'a>) {
     (
         BlockWeights {
-            norm1: &lw.norm1, wq: &lw.wq, wk: &lw.wk, wv: &lw.wv, wo: &lw.wo,
-            norm2: &lw.norm2, wgate: &lw.wgate, wup: &lw.wup, wdown: &lw.wdown,
+            norm1: &lw.norm1,
+            wq: &lw.wq,
+            wk: &lw.wk,
+            wv: &lw.wv,
+            wo: &lw.wo,
+            norm2: &lw.norm2,
+            wgate: &lw.wgate,
+            wup: &lw.wup,
+            wdown: &lw.wdown,
         },
-        BlockLora { aq: &ll.aq, bq: &ll.bq, av: &ll.av, bv: &ll.bv },
+        BlockLora {
+            aq: &ll.aq,
+            bq: &ll.bq,
+            av: &ll.av,
+            bv: &ll.bv,
+        },
     )
 }
 
@@ -288,7 +359,17 @@ pub fn drafter_forward_train(
 
     let emb = gpu.zeros(&[seq * h_t], DType::F32)?;
     for (t, &tok) in token_ids.iter().enumerate() {
-        gpu.strided_copy_2d(&d.embed, tok as usize * h_t, h_t, &emb, t * h_t, h_t, 1, h_t, false)?;
+        gpu.strided_copy_2d(
+            &d.embed,
+            tok as usize * h_t,
+            h_t,
+            &emb,
+            t * h_t,
+            h_t,
+            1,
+            h_t,
+            false,
+        )?;
     }
     let x0 = gpu.zeros(&[seq * hd], DType::F32)?;
     linear_forward(gpu, &emb, &d.in_proj, &x0, seq, h_t, hd)?;
@@ -307,15 +388,42 @@ pub fn drafter_forward_train(
 
     let xn_out = gpu.zeros(&[seq * hd], DType::F32)?;
     let rinv_out = gpu.zeros(&[seq], DType::F32)?;
-    rmsnorm_forward(gpu, &x_last, &d.out_norm, &xn_out, &rinv_out, seq, hd, d.dims.eps)?;
+    rmsnorm_forward(
+        gpu,
+        &x_last,
+        &d.out_norm,
+        &xn_out,
+        &rinv_out,
+        seq,
+        hd,
+        d.dims.eps,
+    )?;
 
     let ks = gpu.zeros(&[seq * kvd], DType::F32)?;
     linear_forward(gpu, &xn_out, &d.wk_score, &ks, seq, hd, kvd)?;
     let pos = gpu.upload_f32(pos_host, &[seq])?;
     let score_k = gpu.zeros(&[seq * kvd], DType::F32)?;
-    rope_forward(gpu, &ks, &score_k, &pos, seq * n_kv, n_kv, head_dim, d.dims.rope_base)?;
+    rope_forward(
+        gpu,
+        &ks,
+        &score_k,
+        &pos,
+        seq * n_kv,
+        n_kv,
+        head_dim,
+        d.dims.rope_base,
+    )?;
 
-    Ok(DrafterActs { emb, layer_inputs, layer_acts, x_last, xn_out, rinv_out, score_k, pos })
+    Ok(DrafterActs {
+        emb,
+        layer_inputs,
+        layer_acts,
+        x_last,
+        xn_out,
+        rinv_out,
+        score_k,
+        pos,
+    })
 }
 
 /// Training backward: `dscores` `[n_blocks]` (grad of loss w.r.t. the block
@@ -334,10 +442,27 @@ pub fn drafter_backward(
     let (kvd, n_kv, head_dim) = (d.dims.kv_dim(), d.dims.n_kv, d.dims.head_dim);
 
     // score head: dscores → d(score_k) → d(ks) (derope) → wk_score grad + d(xn_out)
-    let d_score_k =
-        pflash_score_backward(gpu, &acts.score_k, dscores, seq, kvd, block_size, n_blocks, last_pos)?;
+    let d_score_k = pflash_score_backward(
+        gpu,
+        &acts.score_k,
+        dscores,
+        seq,
+        kvd,
+        block_size,
+        n_blocks,
+        last_pos,
+    )?;
     let d_ks = gpu.zeros(&[seq * kvd], DType::F32)?;
-    rope_backward(gpu, &d_score_k, &d_ks, &acts.pos, seq * n_kv, n_kv, head_dim, d.dims.rope_base)?;
+    rope_backward(
+        gpu,
+        &d_score_k,
+        &d_ks,
+        &acts.pos,
+        seq * n_kv,
+        n_kv,
+        head_dim,
+        d.dims.rope_base,
+    )?;
     let d_wk_score = gpu.zeros(&[kvd * hd], DType::F32)?;
     linear_backward_w(gpu, &d_ks, &acts.xn_out, &d_wk_score, seq, hd, kvd, false)?;
     let d_xn_out = gpu.zeros(&[seq * hd], DType::F32)?;
@@ -349,7 +474,15 @@ pub fn drafter_backward(
     let d_x_last = gpu.zeros(&[seq * hd], DType::F32)?;
     let d_out_norm = gpu.zeros(&[hd], DType::F32)?;
     rmsnorm_backward(
-        gpu, &d_xn_out, &acts.x_last, &d.out_norm, &acts.rinv_out, &d_x_last, &d_out_norm, seq, hd,
+        gpu,
+        &d_xn_out,
+        &acts.x_last,
+        &d.out_norm,
+        &acts.rinv_out,
+        &d_x_last,
+        &d_out_norm,
+        seq,
+        hd,
     )?;
     gpu.free_tensor(d_xn_out)?;
 
@@ -360,11 +493,25 @@ pub fn drafter_backward(
     for i in (0..d.layers.len()).rev() {
         let (lw, ll) = &d.layers[i];
         let (bw, bl) = block_views(lw, ll);
-        let (d_in, lora_g, wg) =
-            block_backward_full(gpu, &d_x, &acts.layer_inputs[i], &bw, &bl, &acts.layer_acts[i], &d.dims)?;
+        let (d_in, lora_g, wg) = block_backward_full(
+            gpu,
+            &d_x,
+            &acts.layer_inputs[i],
+            &bw,
+            &bl,
+            &acts.layer_acts[i],
+            &d.dims,
+        )?;
         gpu.free_tensor(d_x)?; // consumed; free before reassigning
-        // we only train norms (dnorm1/dnorm2); LoRA grads are unused → free.
-        let crate::block::BlockLoraGrad { daq, dbq, dav, dbv, dnorm1, dnorm2 } = lora_g;
+                               // we only train norms (dnorm1/dnorm2); LoRA grads are unused → free.
+        let crate::block::BlockLoraGrad {
+            daq,
+            dbq,
+            dav,
+            dbv,
+            dnorm1,
+            dnorm2,
+        } = lora_g;
         for t in [daq, dbq, dav, dbv] {
             gpu.free_tensor(t)?;
         }
@@ -378,7 +525,12 @@ pub fn drafter_backward(
     linear_backward_w(gpu, &d_x, &acts.emb, &d_in_proj, seq, h_t, hd, false)?;
     gpu.free_tensor(d_x)?;
 
-    Ok(DrafterGrads { d_in_proj, layers: layer_grads, d_out_norm, d_wk_score })
+    Ok(DrafterGrads {
+        d_in_proj,
+        layers: layer_grads,
+        d_out_norm,
+        d_wk_score,
+    })
 }
 
 /// Forward the drafter and return the LAST block's post-rope K (`[seq*kv_dim]`),
@@ -395,7 +547,17 @@ pub fn drafter_forward(
     // embedding lookup at target width → [seq*h_t]
     let emb = gpu.zeros(&[seq * h_t], DType::F32)?;
     for (t, &tok) in token_ids.iter().enumerate() {
-        gpu.strided_copy_2d(&d.embed, tok as usize * h_t, h_t, &emb, t * h_t, h_t, 1, h_t, false)?;
+        gpu.strided_copy_2d(
+            &d.embed,
+            tok as usize * h_t,
+            h_t,
+            &emb,
+            t * h_t,
+            h_t,
+            1,
+            h_t,
+            false,
+        )?;
     }
     // input projection h_t → h_draft
     let mut x = gpu.zeros(&[seq * hd], DType::F32)?;
@@ -415,7 +577,12 @@ pub fn drafter_forward(
             wup: &lw.wup,
             wdown: &lw.wdown,
         };
-        let bl = BlockLora { aq: &ll.aq, bq: &ll.bq, av: &ll.av, bv: &ll.bv };
+        let bl = BlockLora {
+            aq: &ll.aq,
+            bq: &ll.bq,
+            av: &ll.av,
+            bv: &ll.bv,
+        };
         let (x_out, acts) = block_forward(gpu, &x, &bw, &bl, &d.dims, pos_host)?;
         last_k = Some(acts.k_r);
         x = x_out;

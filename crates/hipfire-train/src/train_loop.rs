@@ -8,8 +8,8 @@
 //! the loss, the eval metric, and best-eval tracking. Progress is surfaced via
 //! the `on_epoch` callback (the example prints; the daemon emits JSONL).
 
-use crate::optim::AdamW;
 use crate::ops::pflash_score::pflash_score_forward;
+use crate::optim::AdamW;
 use crate::ssm_drafter::{
     free_ssm_drafter_acts, free_ssm_drafter_grads, ssm_drafter_backward, ssm_drafter_forward_train,
     SsmDrafter,
@@ -59,7 +59,10 @@ pub fn rank(a: &[f32]) -> Vec<f32> {
 
 pub fn pearson(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len() as f64;
-    let (ma, mb) = (a.iter().sum::<f32>() as f64 / n, b.iter().sum::<f32>() as f64 / n);
+    let (ma, mb) = (
+        a.iter().sum::<f32>() as f64 / n,
+        b.iter().sum::<f32>() as f64 / n,
+    );
     let (mut c, mut va, mut vb) = (0.0, 0.0, 0.0);
     for i in 0..a.len() {
         let (da, db) = (a[i] as f64 - ma, b[i] as f64 - mb);
@@ -123,7 +126,15 @@ pub fn eval_ssm_drafter(
     cfg: &TrainCfg,
 ) -> f32 {
     let n_chunks = chunks.len();
-    eval_ssm_drafter_range(gpu, drafter, chunks, label_mid, n_chunks - cfg.n_eval, n_chunks, cfg)
+    eval_ssm_drafter_range(
+        gpu,
+        drafter,
+        chunks,
+        label_mid,
+        n_chunks - cfg.n_eval,
+        n_chunks,
+        cfg,
+    )
 }
 
 /// Train an SSM drafter to reproduce the target's mid-layer block ranking.
@@ -165,7 +176,16 @@ pub fn train_ssm_drafter_loop(
         let mut ep_loss = 0.0f32;
         for i in 0..n_train {
             let acts = ssm_drafter_forward_train(gpu, drafter, &chunks[i], &pos)?;
-            pflash_score_forward(gpu, &acts.score_k, &scores_dev, cfg.seq, kvd, cfg.block, nb, last)?;
+            pflash_score_forward(
+                gpu,
+                &acts.score_k,
+                &scores_dev,
+                cfg.seq,
+                kvd,
+                cfg.block,
+                nb,
+                last,
+            )?;
             let pred = gpu.download_f32(&scores_dev)?;
             // ListNet top-1: L = -Σ p_label log p_pred ; dL/dpred = (p_pred - p_label)/τ
             let pl = softmax_t(&label_mid[i], cfg.tau);
@@ -188,7 +208,12 @@ pub fn train_ssm_drafter_loop(
         // (every-`eval_every`) eval prints, so long runs are never silent/blind.
         {
             use std::io::Write;
-            eprint!("\r  [train] ep {:>4}/{}  loss {:.4}   ", ep + 1, cfg.epochs, ep_loss / n_train as f32);
+            eprint!(
+                "\r  [train] ep {:>4}/{}  loss {:.4}   ",
+                ep + 1,
+                cfg.epochs,
+                ep_loss / n_train as f32
+            );
             let _ = std::io::stderr().flush();
         }
         if ep % cfg.eval_every == 0 || ep == cfg.epochs - 1 {
@@ -205,14 +230,29 @@ pub fn train_ssm_drafter_loop(
                     .collect::<HipResult<_>>()?;
             }
             let train_corr = if cfg.report_train {
-                Some(eval_ssm_drafter_range(gpu, drafter, chunks, label_mid, 0, n_train, cfg))
+                Some(eval_ssm_drafter_range(
+                    gpu, drafter, chunks, label_mid, 0, n_train, cfg,
+                ))
             } else {
                 None
             };
-            on_epoch(ep, ep_loss / n_train as f32, corr, best_eval, best_epoch, train_corr);
+            on_epoch(
+                ep,
+                ep_loss / n_train as f32,
+                corr,
+                best_eval,
+                best_epoch,
+                train_corr,
+            );
         }
     }
 
     let _ = gpu.free_tensor(scores_dev);
-    Ok(DrafterTrainReport { best_eval, best_epoch, bar, final_eval, best_weights })
+    Ok(DrafterTrainReport {
+        best_eval,
+        best_epoch,
+        bar,
+        final_eval,
+        best_weights,
+    })
 }

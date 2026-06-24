@@ -583,9 +583,7 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 dtype: rdna_compute::DType::F32,
             };
             hip!(gpu.quantize_act_oq4(x, &xq, &xs, n, k, GROUP))?;
-            hip!(gpu.fused_gate_up_oq4_wmma(
-                w_gate, w_up, &xq, &xs, gate, up, mg, mu, k, n, GROUP
-            ))
+            hip!(gpu.fused_gate_up_oq4_wmma(w_gate, w_up, &xq, &xs, gate, up, mg, mu, k, n, GROUP))
         }
 
         // ── Paro fused Paro4G128T (dp4a) ────────────────────────────────

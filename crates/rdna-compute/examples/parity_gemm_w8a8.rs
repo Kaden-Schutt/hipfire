@@ -70,9 +70,12 @@ fn main() {
     let yi_dev = gpu.upload_raw(&vec![0u8; b * m * 4], &[b, m]).unwrap(); // int32
     let yf_dev = gpu.alloc_tensor(&[b * m], DType::F32).unwrap();
 
-    gpu.quantize_act_int8_per_token(&x_dev, &xq_dev, &xs_dev, b, k).unwrap();
-    gpu.gemm_iu8_i32_wmma(&w_dev, &xq_dev, &yi_dev, m, k, b).unwrap();
-    gpu.dequant_i32_rowcol(&yi_dev, &xs_dev, &ws_dev, &yf_dev, b, m).unwrap();
+    gpu.quantize_act_int8_per_token(&x_dev, &xq_dev, &xs_dev, b, k)
+        .unwrap();
+    gpu.gemm_iu8_i32_wmma(&w_dev, &xq_dev, &yi_dev, m, k, b)
+        .unwrap();
+    gpu.dequant_i32_rowcol(&yi_dev, &xs_dev, &ws_dev, &yf_dev, b, m)
+        .unwrap();
     gpu.device_synchronize().unwrap();
     let y = gpu.download_f32(&yf_dev).unwrap();
 

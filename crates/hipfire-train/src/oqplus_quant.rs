@@ -93,6 +93,9 @@ mod tests {
         let var: f32 = w.iter().map(|v| v * v).sum::<f32>() / w.len() as f32;
         let sqnr_db = 10.0 * (var / mse).log10();
         // 4-bit symmetric should land in a sane SQNR band, not identity, not garbage.
-        assert!(sqnr_db > 8.0 && sqnr_db < 40.0, "sqnr {sqnr_db} dB out of band");
+        assert!(
+            sqnr_db > 8.0 && sqnr_db < 40.0,
+            "sqnr {sqnr_db} dB out of band"
+        );
     }
 }

@@ -47,7 +47,10 @@ fn main() {
 
     let mut gpu = Gpu::init().unwrap();
     if !gpu.arch_caps.has_wmma_w32() {
-        println!("SKIP parity_fused_gate_up_oq4: {} lacks wave32 WMMA", gpu.arch);
+        println!(
+            "SKIP parity_fused_gate_up_oq4: {} lacks wave32 WMMA",
+            gpu.arch
+        );
         return;
     }
 
@@ -62,10 +65,16 @@ fn main() {
     let xsd = gpu.upload_raw(&xs, &[b, ng]).unwrap();
 
     // Fused.
-    let ygd = gpu.upload_raw(&vec![0u8; b * gate_m * 4], &[b, gate_m]).unwrap();
-    let yud = gpu.upload_raw(&vec![0u8; b * up_m * 4], &[b, up_m]).unwrap();
-    gpu.fused_gate_up_oq4_wmma(&wgd, &wud, &xqd, &xsd, &ygd, &yud, gate_m, up_m, k, b, group)
+    let ygd = gpu
+        .upload_raw(&vec![0u8; b * gate_m * 4], &[b, gate_m])
         .unwrap();
+    let yud = gpu
+        .upload_raw(&vec![0u8; b * up_m * 4], &[b, up_m])
+        .unwrap();
+    gpu.fused_gate_up_oq4_wmma(
+        &wgd, &wud, &xqd, &xsd, &ygd, &yud, gate_m, up_m, k, b, group,
+    )
+    .unwrap();
     gpu.device_synchronize().unwrap();
     let yg_fused = gpu.download_f32(&ygd).unwrap();
     let yu_fused = gpu.download_f32(&yud).unwrap();
@@ -73,15 +82,25 @@ fn main() {
     // Reference: two separate grouped GEMMs with split scale views.
     let wgs = wgd.sub_offset(gate_m * (k / 2), gate_m * ng * 4);
     let wus = wud.sub_offset(up_m * (k / 2), up_m * ng * 4);
-    let ygr = gpu.upload_raw(&vec![0u8; b * gate_m * 4], &[b, gate_m]).unwrap();
-    let yur = gpu.upload_raw(&vec![0u8; b * up_m * 4], &[b, up_m]).unwrap();
-    gpu.gemm_oq4_grouped_wmma(&wgd, &wgs, &xqd, &xsd, &ygr, gate_m, k, b, group).unwrap();
-    gpu.gemm_oq4_grouped_wmma(&wud, &wus, &xqd, &xsd, &yur, up_m, k, b, group).unwrap();
+    let ygr = gpu
+        .upload_raw(&vec![0u8; b * gate_m * 4], &[b, gate_m])
+        .unwrap();
+    let yur = gpu
+        .upload_raw(&vec![0u8; b * up_m * 4], &[b, up_m])
+        .unwrap();
+    gpu.gemm_oq4_grouped_wmma(&wgd, &wgs, &xqd, &xsd, &ygr, gate_m, k, b, group)
+        .unwrap();
+    gpu.gemm_oq4_grouped_wmma(&wud, &wus, &xqd, &xsd, &yur, up_m, k, b, group)
+        .unwrap();
     gpu.device_synchronize().unwrap();
     let yg_ref = gpu.download_f32(&ygr).unwrap();
     let yu_ref = gpu.download_f32(&yur).unwrap();
 
-    let max = |f: &[f32], r: &[f32]| f.iter().zip(r).fold(0.0f32, |m, (&x, &y)| m.max((x - y).abs()));
+    let max = |f: &[f32], r: &[f32]| {
+        f.iter()
+            .zip(r)
+            .fold(0.0f32, |m, (&x, &y)| m.max((x - y).abs()))
+    };
     let dg = max(&yg_fused, &yg_ref);
     let du = max(&yu_fused, &yu_ref);
     let pass = dg == 0.0 && du == 0.0;

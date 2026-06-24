@@ -40,7 +40,10 @@ fn main() {
 
     let mut gpu = Gpu::init().unwrap();
     if !gpu.arch_caps.has_wmma_w32() {
-        println!("SKIP parity_weight_gemm_w8a8: {} lacks wave32 WMMA", gpu.arch);
+        println!(
+            "SKIP parity_weight_gemm_w8a8: {} lacks wave32 WMMA",
+            gpu.arch
+        );
         return;
     }
 

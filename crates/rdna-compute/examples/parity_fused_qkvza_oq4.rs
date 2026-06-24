@@ -48,7 +48,10 @@ fn main() {
 
     let mut gpu = Gpu::init().unwrap();
     if !gpu.arch_caps.has_wmma_w32() {
-        println!("SKIP parity_fused_qkvza_oq4: {} lacks wave32 WMMA", gpu.arch);
+        println!(
+            "SKIP parity_fused_qkvza_oq4: {} lacks wave32 WMMA",
+            gpu.arch
+        );
         return;
     }
 
@@ -60,10 +63,15 @@ fn main() {
     let d_xs = gpu.upload_raw(&lcgf(6, b * ng), &[b, ng]).unwrap();
 
     let mk = |gpu: &mut Gpu, m: usize| gpu.upload_raw(&vec![0u8; b * m * 4], &[b, m]).unwrap();
-    let (yq, yz, yb, ya) = (mk(&mut gpu, qkv), mk(&mut gpu, z), mk(&mut gpu, beta), mk(&mut gpu, alpha));
+    let (yq, yz, yb, ya) = (
+        mk(&mut gpu, qkv),
+        mk(&mut gpu, z),
+        mk(&mut gpu, beta),
+        mk(&mut gpu, alpha),
+    );
     gpu.fused_qkvza_oq4_wmma(
-        &d_wqkv, &d_wz, &d_wbeta, &d_walpha, &d_xq, &d_xs, &yq, &yz, &yb, &ya, qkv, z, beta,
-        alpha, k, b, group,
+        &d_wqkv, &d_wz, &d_wbeta, &d_walpha, &d_xq, &d_xs, &yq, &yz, &yb, &ya, qkv, z, beta, alpha,
+        k, b, group,
     )
     .unwrap();
     gpu.device_synchronize().unwrap();
@@ -76,7 +84,8 @@ fn main() {
     let refm = |gpu: &mut Gpu, w: &GpuTensor, m: usize| -> Vec<f32> {
         let ws = w.sub_offset(m * (k / 2), m * ng * 4);
         let y = gpu.upload_raw(&vec![0u8; b * m * 4], &[b, m]).unwrap();
-        gpu.gemm_oq4_grouped_wmma(w, &ws, &d_xq, &d_xs, &y, m, k, b, group).unwrap();
+        gpu.gemm_oq4_grouped_wmma(w, &ws, &d_xq, &d_xs, &y, m, k, b, group)
+            .unwrap();
         gpu.device_synchronize().unwrap();
         gpu.download_f32(&y).unwrap()
     };
@@ -85,8 +94,17 @@ fn main() {
     let r_b = refm(&mut gpu, &d_wbeta, beta);
     let r_a = refm(&mut gpu, &d_walpha, alpha);
 
-    let mx = |f: &[f32], r: &[f32]| f.iter().zip(r).fold(0.0f32, |m, (&x, &y)| m.max((x - y).abs()));
-    let (dq, dz, db, da) = (mx(&f_q, &r_q), mx(&f_z, &r_z), mx(&f_b, &r_b), mx(&f_a, &r_a));
+    let mx = |f: &[f32], r: &[f32]| {
+        f.iter()
+            .zip(r)
+            .fold(0.0f32, |m, (&x, &y)| m.max((x - y).abs()))
+    };
+    let (dq, dz, db, da) = (
+        mx(&f_q, &r_q),
+        mx(&f_z, &r_z),
+        mx(&f_b, &r_b),
+        mx(&f_a, &r_a),
+    );
     let pass = dq == 0.0 && dz == 0.0 && db == 0.0 && da == 0.0;
     println!(
         "parity_fused_qkvza_oq4 qkv={qkv} z={z} beta={beta} alpha={alpha} K={k} B={b} on {}: \

@@ -67,7 +67,7 @@ impl LayerLora {
 }
 
 pub struct LlamaModel {
-    pub embed: GpuTensor,      // [vocab, h] (input embedding; also lm_head when tied)
+    pub embed: GpuTensor, // [vocab, h] (input embedding; also lm_head when tied)
     pub lm_head: Option<GpuTensor>, // [vocab, h] separate output proj; None ⇒ tied (use embed)
     pub final_norm: GpuTensor, // [h]
     pub layers: Vec<(LayerWeights, LayerLora)>,
@@ -266,15 +266,39 @@ pub struct ModelActivations {
 /// of `model_forward` calls (e.g. capturing labels over a corpus) climbs ~2 GB/
 /// forward and OOMs without this.
 pub fn free_model_acts(gpu: &mut Gpu, a: ModelActivations) -> HipResult<()> {
-    let ModelActivations { layer_inputs, layer_acts, x_last, rinv_final, xf, logits } = a;
+    let ModelActivations {
+        layer_inputs,
+        layer_acts,
+        x_last,
+        rinv_final,
+        xf,
+        logits,
+    } = a;
     for t in layer_inputs {
         gpu.free_tensor(t)?;
     }
     for b in layer_acts {
         let BlockActivations {
-            xn1, rinv1, hq, hv, q_r, k_r, v, p_all, ctx, x_mid, xn2, rinv2, gate, up, act, pos,
+            xn1,
+            rinv1,
+            hq,
+            hv,
+            q_r,
+            k_r,
+            v,
+            p_all,
+            ctx,
+            x_mid,
+            xn2,
+            rinv2,
+            gate,
+            up,
+            act,
+            pos,
         } = b;
-        for t in [xn1, rinv1, hq, hv, q_r, k_r, v, p_all, ctx, x_mid, xn2, rinv2, gate, up, act, pos] {
+        for t in [
+            xn1, rinv1, hq, hv, q_r, k_r, v, p_all, ctx, x_mid, xn2, rinv2, gate, up, act, pos,
+        ] {
             gpu.free_tensor(t)?;
         }
     }
@@ -299,15 +323,31 @@ pub fn model_block_activations(
     assert_eq!(token_ids.len(), seq);
     let x0 = gpu.zeros(&[seq * h], DType::F32)?;
     for (t, &tok) in token_ids.iter().enumerate() {
-        gpu.strided_copy_2d(&model.embed, tok as usize * h, h, &x0, t * h, h, 1, h, false)?;
+        gpu.strided_copy_2d(
+            &model.embed,
+            tok as usize * h,
+            h,
+            &x0,
+            t * h,
+            h,
+            1,
+            h,
+            false,
+        )?;
     }
     let last = up_to.min(model.layers.len() - 1);
     let mut out = Vec::with_capacity(last + 1);
     let mut x = x0;
     for i in 0..=last {
         let (lw, ll) = &model.layers[i];
-        let (x_out, acts) =
-            block_forward(gpu, &x, &lw.as_block(), &ll.as_block(), &model.dims, pos_host)?;
+        let (x_out, acts) = block_forward(
+            gpu,
+            &x,
+            &lw.as_block(),
+            &ll.as_block(),
+            &model.dims,
+            pos_host,
+        )?;
         out.push(acts);
         x = x_out;
     }
@@ -396,7 +436,10 @@ pub fn model_loss_backward(
     ignore_index: i32,
 ) -> HipResult<(f32, Vec<BlockLoraGrad>)> {
     let (seq, h, vocab) = (model.dims.seq, model.dims.h, model.vocab);
-    debug_assert!(model.lm_head.is_none(), "backward supports tied embeddings only");
+    debug_assert!(
+        model.lm_head.is_none(),
+        "backward supports tied embeddings only"
+    );
 
     // Loss + d_logits (sum-reduction).
     let tgt = gpu.upload_f32(targets, &[seq])?;
@@ -476,7 +519,10 @@ pub fn model_distill_backward(
     teacher_p: &GpuTensor,
 ) -> HipResult<(f32, Vec<BlockLoraGrad>, GpuTensor)> {
     let (seq, h, vocab) = (model.dims.seq, model.dims.h, model.vocab);
-    debug_assert!(model.lm_head.is_none(), "backward supports tied embeddings only");
+    debug_assert!(
+        model.lm_head.is_none(),
+        "backward supports tied embeddings only"
+    );
 
     let loss = gpu.zeros(&[seq], DType::F32)?;
     let d_logits = gpu.zeros(&[seq * vocab], DType::F32)?;

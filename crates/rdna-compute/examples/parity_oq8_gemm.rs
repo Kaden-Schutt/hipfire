@@ -189,7 +189,8 @@ fn main() {
     let xf2d = gpu.upload_f32(&xf2, &[b, k]).unwrap();
     let xq2 = gpu.upload_raw(&vec![0u8; b * k], &[b, k]).unwrap();
     let xs2 = gpu.upload_raw(&vec![0u8; b * ng * 4], &[b, ng]).unwrap();
-    gpu.quantize_act_oq8(&xf2d, &xq2, &xs2, b, k, group).unwrap();
+    gpu.quantize_act_oq8(&xf2d, &xq2, &xs2, b, k, group)
+        .unwrap();
     let yq = gpu.upload_raw(&vec![0u8; b * m * 4], &[b, m]).unwrap();
     gpu.gemm_oq8_grouped_wmma(&wqd, &wqs, &xq2, &xs2, &yq, m, k, b, group)
         .unwrap();

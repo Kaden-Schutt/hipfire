@@ -6,9 +6,20 @@
 
 use rdna_compute::{DType, Gpu};
 
-fn step(gpu: &mut Gpu, label: &str, a: &rdna_compute::GpuTensor, b: &rdna_compute::GpuTensor,
-        c: &rdna_compute::GpuTensor, m: usize, n: usize, k: usize, lda: usize, ldb: usize,
-        ta: bool, tb: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn step(
+    gpu: &mut Gpu,
+    label: &str,
+    a: &rdna_compute::GpuTensor,
+    b: &rdna_compute::GpuTensor,
+    c: &rdna_compute::GpuTensor,
+    m: usize,
+    n: usize,
+    k: usize,
+    lda: usize,
+    ldb: usize,
+    ta: bool,
+    tb: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("STEP {label}: launch M={m} N={n} K={k} ta={ta} tb={tb}");
     gpu.gemm_f32_train(a, b, c, m, n, k, lda, ldb, ta, tb)?;
     let _ = gpu.download_f32(c)?; // sync barrier — surfaces a fault here

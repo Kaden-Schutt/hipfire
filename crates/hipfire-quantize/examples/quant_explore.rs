@@ -211,7 +211,7 @@ fn quant_nf4(w: &[f32], group: usize) -> Recon {
         let base = gi * group;
         for (j, &v) in chunk.iter().enumerate() {
             let t = v / amax; // in [-1, 1]
-            // nearest NF4 level
+                              // nearest NF4 level
             let mut best = 0usize;
             let mut bd = f32::INFINITY;
             for (li, &lv) in NF4_LEVELS.iter().enumerate() {
@@ -258,14 +258,14 @@ fn main() {
         ("gaussian", lcg_gauss(1, n)),
         ("gauss+1%x8 outliers", gauss_outliers(2, n, 0.01, 8.0)),
         ("gauss+0.1%x20 outliers", gauss_outliers(3, n, 0.001, 20.0)),
-        ("channel outliers (16 cols x12)", channel_outliers(4, rows, k, 16, 12.0)),
+        (
+            "channel outliers (16 cols x12)",
+            channel_outliers(4, rows, k, 16, 12.0),
+        ),
     ];
 
     println!("quant_explore  rows={rows} k={k}  (SQNR dB, higher=better)\n");
-    println!(
-        "{:<34} {:>10} {:>9}",
-        "scheme", "bits/w", "note"
-    );
+    println!("{:<34} {:>10} {:>9}", "scheme", "bits/w", "note");
     println!("{}", "-".repeat(80));
 
     // (label, recon-fn closure result, maps-to-native-int-matmul?)
@@ -273,14 +273,46 @@ fn main() {
     let s1c = s1.clone();
     let s2c = s2.clone();
     let schemes: Vec<Scheme> = vec![
-        ("int8 sym g128", Box::new(|w: &[f32]| quant_sym(w, 128, 8)), "native iu8"),
-        ("int8 sym per-row(k)", Box::new(move |w: &[f32]| quant_sym(w, k, 8)), "native iu8"),
-        ("int4 sym per-row(k)", Box::new(move |w: &[f32]| quant_sym(w, k, 4)), "native iu4"),
-        ("int4 sym g128", Box::new(|w: &[f32]| quant_sym(w, 128, 4)), "native iu4"),
-        ("int4 sym g32", Box::new(|w: &[f32]| quant_sym(w, 32, 4)), "native iu4"),
-        ("int4 affine g128", Box::new(|w: &[f32]| quant_affine(w, 128, 4)), "int4+zp corr"),
-        ("int4 sym+FWHT g256", Box::new(move |w: &[f32]| quant_sym_fwht(w, 4, &s1c, &s2c)), "iu4 (rot act)"),
-        ("nf4 g128 (non-uniform)", Box::new(|w: &[f32]| quant_nf4(w, 128)), "dequant->f16"),
+        (
+            "int8 sym g128",
+            Box::new(|w: &[f32]| quant_sym(w, 128, 8)),
+            "native iu8",
+        ),
+        (
+            "int8 sym per-row(k)",
+            Box::new(move |w: &[f32]| quant_sym(w, k, 8)),
+            "native iu8",
+        ),
+        (
+            "int4 sym per-row(k)",
+            Box::new(move |w: &[f32]| quant_sym(w, k, 4)),
+            "native iu4",
+        ),
+        (
+            "int4 sym g128",
+            Box::new(|w: &[f32]| quant_sym(w, 128, 4)),
+            "native iu4",
+        ),
+        (
+            "int4 sym g32",
+            Box::new(|w: &[f32]| quant_sym(w, 32, 4)),
+            "native iu4",
+        ),
+        (
+            "int4 affine g128",
+            Box::new(|w: &[f32]| quant_affine(w, 128, 4)),
+            "int4+zp corr",
+        ),
+        (
+            "int4 sym+FWHT g256",
+            Box::new(move |w: &[f32]| quant_sym_fwht(w, 4, &s1c, &s2c)),
+            "iu4 (rot act)",
+        ),
+        (
+            "nf4 g128 (non-uniform)",
+            Box::new(|w: &[f32]| quant_nf4(w, 128)),
+            "dequant->f16",
+        ),
     ];
 
     for (dname, w) in &dists {
@@ -288,7 +320,10 @@ fn main() {
         for (label, f, note) in &schemes {
             let r = f(w);
             let q = sqnr_db(w, &r.rec);
-            println!("{:<34} {:>10.3} {:>9}  SQNR={:>7.2} dB", label, r.bits_per_weight, note, q);
+            println!(
+                "{:<34} {:>10.3} {:>9}  SQNR={:>7.2} dB",
+                label, r.bits_per_weight, note, q
+            );
         }
     }
 

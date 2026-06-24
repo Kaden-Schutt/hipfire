@@ -1074,7 +1074,7 @@ impl KvCache {
         let rec_bytes = Self::kvarn_k_record_bytes(head_dim);
         let k_bytes = n_blocks * n_kv_heads * rec_bytes;
         let k_elems = k_bytes.div_ceil(4); // store as F32 buffer (byte-addressed by kernels)
-        // V: Q8_0, identical layout to asym4 (34 bytes per 32-elem block).
+                                           // V: Q8_0, identical layout to asym4 (34 bytes per 32-elem block).
         let v_blocks_per_head = head_dim / 32;
         let v_bpp = n_kv_heads * v_blocks_per_head * 34;
         let v_elems = (physical_cap * v_bpp).div_ceil(4);

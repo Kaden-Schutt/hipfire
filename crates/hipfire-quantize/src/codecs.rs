@@ -853,7 +853,9 @@ pub(crate) fn quantize_oqplus_compact(
         };
         let mut idx: [usize; 256] = core::array::from_fn(|i| i);
         idx.sort_unstable_by(|&a, &c| {
-            gain(c).partial_cmp(&gain(a)).unwrap_or(core::cmp::Ordering::Equal)
+            gain(c)
+                .partial_cmp(&gain(a))
+                .unwrap_or(core::cmp::Ordering::Equal)
         });
         let out_off = b * block_bytes;
         let scale_f16 = f32_to_f16(scale);

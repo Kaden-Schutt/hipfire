@@ -16,19 +16,18 @@ fn lcg(seed: u32, n: usize) -> Vec<f32> {
         .map(|i| {
             s = s.wrapping_mul(1_103_515_245).wrapping_add(12345) & 0x7fff_ffff;
             let base = (s as f32 / 2_147_483_648.0) - 0.5;
-            if i % 97 == 0 { base * 9.0 } else { base } // sparse outliers
+            if i % 97 == 0 {
+                base * 9.0
+            } else {
+                base
+            } // sparse outliers
         })
         .collect()
 }
 
 /// Symmetric int4 per-group quant. Returns (packed nibbles [rows,K/2], scales
 /// [rows,K/group], dequant-able q values [rows,K] as i8 for the reference).
-fn quant_i4(
-    src: &[f32],
-    rows: usize,
-    k: usize,
-    group: usize,
-) -> (Vec<u8>, Vec<f32>, Vec<i8>) {
+fn quant_i4(src: &[f32], rows: usize, k: usize, group: usize) -> (Vec<u8>, Vec<f32>, Vec<i8>) {
     let ng = k / group;
     let mut packed = vec![0u8; rows * (k / 2)];
     let mut scales = vec![0f32; rows * ng];
@@ -66,7 +65,10 @@ fn main() {
 
     let mut gpu = Gpu::init().unwrap();
     if !gpu.arch_caps.has_wmma_w32() {
-        println!("SKIP gemm_oq4_grouped_wmma parity: {} lacks wave32 WMMA", gpu.arch);
+        println!(
+            "SKIP gemm_oq4_grouped_wmma parity: {} lacks wave32 WMMA",
+            gpu.arch
+        );
         return;
     }
     let ng = k / group;
@@ -96,11 +98,17 @@ fn main() {
     // GPU
     let wd = gpu.upload_raw(&wp, &[m, k / 2]).unwrap();
     let wsd = gpu
-        .upload_raw(&ws.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(), &[m, ng])
+        .upload_raw(
+            &ws.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
+            &[m, ng],
+        )
         .unwrap();
     let xd = gpu.upload_raw(&xp, &[b, k / 2]).unwrap();
     let xsd = gpu
-        .upload_raw(&xs.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(), &[b, ng])
+        .upload_raw(
+            &xs.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
+            &[b, ng],
+        )
         .unwrap();
     let yd = gpu.upload_raw(&vec![0u8; b * m * 4], &[b, m]).unwrap();
     gpu.gemm_oq4_grouped_wmma(&wd, &wsd, &xd, &xsd, &yd, m, k, b, group)

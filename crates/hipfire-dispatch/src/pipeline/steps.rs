@@ -599,7 +599,8 @@ fn oq4_gemv_into(
 
     let xq = alias(gpu.oq4_xq.as_ref().unwrap(), k / 2, DType::Raw);
     let xs = alias(gpu.oq4_xs.as_ref().unwrap(), ng, DType::F32);
-    gpu.quantize_act_oq4(xr, &xq, &xs, 1, k, GROUP).map_err(hip)?;
+    gpu.quantize_act_oq4(xr, &xq, &xs, 1, k, GROUP)
+        .map_err(hip)?;
     let ws = w.buf.sub_offset(m * (k / 2), m * ng * 4);
     // Decode is B=1 → the one-wave-per-row GEMV (no WMMA N-tile waste) is the
     // weight-bandwidth-bound path; the WMMA grouped GEMM is for batched prefill.
@@ -663,7 +664,8 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
         } => {
             if w.dtype == DType::Oq4G256 {
                 // No fused Oq4 residual kernel: GEMM into persistent scratch, add.
-                gpu.ensure_oq4_scratch().map_err(|e| DispatchError::Hip(e.to_string()))?;
+                gpu.ensure_oq4_scratch()
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
                 let tmp = rdna_compute::GpuTensor {
                     buf: unsafe { gpu.oq4_ytmp.as_ref().unwrap().buf.alias() },
                     shape: vec![w.m],
@@ -700,7 +702,8 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             out,
         } => {
             if w.dtype == DType::Oq4G256 {
-                gpu.ensure_oq4_scratch().map_err(|e| DispatchError::Hip(e.to_string()))?;
+                gpu.ensure_oq4_scratch()
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
                 let tmp = rdna_compute::GpuTensor {
                     buf: unsafe { gpu.oq4_ytmp.as_ref().unwrap().buf.alias() },
                     shape: vec![w.m],
@@ -907,7 +910,8 @@ fn launch_fused(
                 shape: vec![k / 256],
                 dtype: DType::F32,
             };
-            gpu.quantize_act_oq4(activated, &xq, &xs, 1, k, 256).map_err(hip)?;
+            gpu.quantize_act_oq4(activated, &xq, &xs, 1, k, 256)
+                .map_err(hip)?;
             // Decode B=1: quantize the shared activation once (the fusion win),
             // then one wave-per-row GEMV per sub-projection — leaner than the
             // batched WMMA fused kernel which wastes 15/16 of its N-tile at B=1.
@@ -935,7 +939,8 @@ fn launch_fused(
                 shape: vec![k / 256],
                 dtype: DType::F32,
             };
-            gpu.quantize_act_oq4(activated, &xq, &xs, 1, k, 256).map_err(hip)?;
+            gpu.quantize_act_oq4(activated, &xq, &xs, 1, k, 256)
+                .map_err(hip)?;
             let ng = k / 256;
             for (wt, out) in [(wg, gate), (wu, up)] {
                 let ws = wt.buf.sub_offset(wt.m * (k / 2), wt.m * ng * 4);

@@ -19,11 +19,19 @@ fn f16_to_f32(bits: u16) -> f32 {
     let v = if e == 0 {
         (m as f32) * 2f32.powi(-24)
     } else if e == 31 {
-        if m == 0 { f32::INFINITY } else { f32::NAN }
+        if m == 0 {
+            f32::INFINITY
+        } else {
+            f32::NAN
+        }
     } else {
         (1.0 + m as f32 / 1024.0) * 2f32.powi(e as i32 - 15)
     };
-    if s == 1 { -v } else { v }
+    if s == 1 {
+        -v
+    } else {
+        v
+    }
 }
 
 fn lcg_normal(seed: u32, n: usize) -> Vec<f32> {
@@ -67,16 +75,25 @@ fn main() {
         }
     }
     let kd = gpu
-        .upload_raw(&k.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(), &[n_full * kv_dim])
+        .upload_raw(
+            &k.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
+            &[n_full * kv_dim],
+        )
         .unwrap();
     let td = gpu
-        .upload_raw(&vec![0u8; n_tiles * tile_elems * 4], &[n_tiles * tile_elems])
+        .upload_raw(
+            &vec![0u8; n_tiles * tile_elems * 4],
+            &[n_tiles * tile_elems],
+        )
         .unwrap();
     gpu.kvarn_gather_k_tiles(&kd, &td, n_full_blocks, n_kv_heads, head_dim, group)
         .unwrap();
     let record_bytes = tile_elems.div_ceil(2) + head_dim * 2 * 2 + group * 2;
     let rd = gpu
-        .upload_raw(&vec![0u8; n_tiles * record_bytes], &[n_tiles * record_bytes])
+        .upload_raw(
+            &vec![0u8; n_tiles * record_bytes],
+            &[n_tiles * record_bytes],
+        )
         .unwrap();
     gpu.kvarn_quantize_tile(&td, &rd, n_tiles, head_dim, group, record_bytes)
         .unwrap();
@@ -92,13 +109,31 @@ fn main() {
         }
     }
     let wd = gpu
-        .upload_raw(&window.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(), &[group * kv_dim])
+        .upload_raw(
+            &window
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+            &[group * kv_dim],
+        )
         .unwrap();
 
     // Build the f16 shadow K.
-    let outd = gpu.upload_raw(&vec![0u8; n_tokens * kv_dim * 2], &[n_tokens * kv_dim]).unwrap();
-    gpu.kvarn_build_kcache(&rd, &wd, &outd, n_full_blocks, tail_len, n_kv_heads, head_dim, group, record_bytes)
+    let outd = gpu
+        .upload_raw(&vec![0u8; n_tokens * kv_dim * 2], &[n_tokens * kv_dim])
         .unwrap();
+    gpu.kvarn_build_kcache(
+        &rd,
+        &wd,
+        &outd,
+        n_full_blocks,
+        tail_len,
+        n_kv_heads,
+        head_dim,
+        group,
+        record_bytes,
+    )
+    .unwrap();
     gpu.device_synchronize().unwrap();
     let outb = gpu.download_raw(&outd, n_tokens * kv_dim * 2).unwrap();
     let out_f32: Vec<f32> = (0..n_tokens * kv_dim)

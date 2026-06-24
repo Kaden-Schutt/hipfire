@@ -19,8 +19,8 @@
 // engine wiring (two-tier flash) and the tests below; not yet called from the bin.
 #![allow(dead_code)]
 
-use crate::kvarn::{self, QuantTile};
 use crate::fwht::{cpu_fwht_256, gen_fwht_signs};
+use crate::kvarn::{self, QuantTile};
 
 /// One compacted cold buffer for a contiguous range of (old) cold tokens. Slot
 /// structure is SHARED across kv-heads (CASK ranks tokens with a head-aggregated
@@ -89,20 +89,33 @@ pub fn compact_cold_kv(
         scratch_owned.sort_unstable();
     }
     let scratch = &scratch_owned[..];
-    let nb = if fold_m > 0 { scratch.len() / fold_m } else { 0 };
+    let nb = if fold_m > 0 {
+        scratch.len() / fold_m
+    } else {
+        0
+    };
 
     let mut slot_members: Vec<Vec<u32>> = Vec::with_capacity(ncore + nb + fold_m);
     for &t in core {
         slot_members.push(vec![t as u32]);
     }
     for g in 0..nb {
-        slot_members.push(scratch[g * fold_m..(g + 1) * fold_m].iter().map(|&x| x as u32).collect());
+        slot_members.push(
+            scratch[g * fold_m..(g + 1) * fold_m]
+                .iter()
+                .map(|&x| x as u32)
+                .collect(),
+        );
     }
     for &t in &scratch[nb * fold_m..] {
         slot_members.push(vec![t as u32]); // leftover scratch kept singleton
     }
     let n_valid = slot_members.len();
-    let n_slots = if n_valid % 2 == 0 { n_valid } else { n_valid + 1 }; // KVarN c_dim even
+    let n_slots = if n_valid % 2 == 0 {
+        n_valid
+    } else {
+        n_valid + 1
+    }; // KVarN c_dim even
     let slot_repr_pos: Vec<u32> = slot_members
         .iter()
         .map(|m| *m.iter().max().unwrap())
@@ -117,13 +130,20 @@ pub fn compact_cold_kv(
         let mut ktile = vec![0.0f32; head_dim * n_slots];
         let mut vtile = vec![0.0f32; head_dim * n_slots];
         for (s, mem) in slot_members.iter().enumerate() {
-            let wsum: f32 = mem.iter().map(|&t| importance[t as usize].max(0.0)).sum::<f32>();
+            let wsum: f32 = mem
+                .iter()
+                .map(|&t| importance[t as usize].max(0.0))
+                .sum::<f32>();
             let wsum = if wsum > 0.0 { wsum } else { mem.len() as f32 }; // unif if all-zero
             let mut kvec = vec![0.0f32; head_dim];
             let mut vvec = vec![0.0f32; head_dim];
             for &t in mem {
                 let iw = importance[t as usize].max(0.0);
-                let w = if wsum > 0.0 { (if iw > 0.0 { iw } else { 1.0 }) / wsum } else { 1.0 / mem.len() as f32 };
+                let w = if wsum > 0.0 {
+                    (if iw > 0.0 { iw } else { 1.0 }) / wsum
+                } else {
+                    1.0 / mem.len() as f32
+                };
                 let base = t as usize * kv_dim + h * head_dim;
                 for d in 0..head_dim {
                     kvec[d] += w * k[base + d];
@@ -214,19 +234,25 @@ impl ColdTier {
         let n_cold = self.n_valid;
         let mut logits = Vec::with_capacity(n_hot + n_cold);
         let mut idx: Vec<(bool, usize)> = Vec::with_capacity(n_hot + n_cold); // (is_cold, idx)
-        // Hot tier — causal.
+                                                                              // Hot tier — causal.
         for t in 0..n_hot {
             if hot_base_pos + t > q_pos {
                 continue;
             }
-            let s: f32 = (0..head_dim).map(|i| q[i] * hot_k[t * head_dim + i]).sum::<f32>() * sc;
+            let s: f32 = (0..head_dim)
+                .map(|i| q[i] * hot_k[t * head_dim + i])
+                .sum::<f32>()
+                * sc;
             logits.push(s);
             idx.push((false, t));
         }
         // Cold tier — all merged slots visible (repr_pos < hot_base_pos ≤ q_pos).
         for s_i in 0..n_cold {
             debug_assert!((self.slot_repr_pos[s_i] as usize) < hot_base_pos.max(1));
-            let s: f32 = (0..head_dim).map(|i| q[i] * cold_k[s_i * head_dim + i]).sum::<f32>() * sc;
+            let s: f32 = (0..head_dim)
+                .map(|i| q[i] * cold_k[s_i * head_dim + i])
+                .sum::<f32>()
+                * sc;
             logits.push(s);
             idx.push((true, s_i));
         }
@@ -238,7 +264,11 @@ impl ColdTier {
         }
         let mut o = vec![0.0f32; head_dim];
         for (k, &(is_cold, j)) in idx.iter().enumerate() {
-            let src = if is_cold { &cold_v[j * head_dim..] } else { &hot_v[j * head_dim..] };
+            let src = if is_cold {
+                &cold_v[j * head_dim..]
+            } else {
+                &hot_v[j * head_dim..]
+            };
             for i in 0..head_dim {
                 o[i] += p[k] * src[i];
             }
@@ -260,7 +290,10 @@ mod tests {
     struct Lcg(u64);
     impl Lcg {
         fn f(&mut self) -> f32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((self.0 >> 33) as f32 / (1u64 << 31) as f32) - 1.0
         }
         fn n(&mut self) -> f32 {
@@ -317,7 +350,11 @@ mod tests {
             let important = t % 37 == 0; // ~14 important tokens
             for i in 0..d {
                 // important tokens: K aligned with q (high score) + larger norm.
-                k[t * d + i] = if important { q[i] * 1.6 + rng.n() * 0.3 } else { rng.n() * 0.5 };
+                k[t * d + i] = if important {
+                    q[i] * 1.6 + rng.n() * 0.3
+                } else {
+                    rng.n() * 0.5
+                };
                 v[t * d + i] = rng.n();
             }
         }
@@ -348,7 +385,10 @@ mod tests {
             let out_d = attn_slots(&qd, &kr, &vr, &cold, d);
             let cd = cos(&out_d, &ref_d);
             eprintln!("  diffuse-query out_cos={cd:.4}");
-            assert!(cd > 0.85, "core={cf} m={m}: diffuse output cosine {cd:.4} too low");
+            assert!(
+                cd > 0.85,
+                "core={cf} m={m}: diffuse output cosine {cd:.4} too low"
+            );
         }
     }
 
@@ -377,7 +417,11 @@ mod tests {
             }
         }
         let got = &kr[0..d];
-        assert!(cos(got, &avg) > 0.99, "merged slot roundtrip cos {:.4}", cos(got, &avg));
+        assert!(
+            cos(got, &avg) > 0.99,
+            "merged slot roundtrip cos {:.4}",
+            cos(got, &avg)
+        );
     }
 
     #[test]
@@ -394,14 +438,30 @@ mod tests {
         for t in 0..n_tok {
             let important = t < n_cold && t % 29 == 0;
             for i in 0..d {
-                k[t * d + i] = if important { dir[i] * 1.5 + rng.n() * 0.3 } else { rng.n() * 0.6 };
+                k[t * d + i] = if important {
+                    dir[i] * 1.5 + rng.n() * 0.3
+                } else {
+                    rng.n() * 0.6
+                };
                 v[t * d + i] = rng.n();
             }
         }
         let imp: Vec<f32> = (0..n_cold)
             .map(|t| (0..d).map(|i| dir[i] * k[t * d + i]).sum::<f32>())
             .collect();
-        let cold = compact_cold_kv(&k[..n_cold * d], &v[..n_cold * d], n_cold, 1, d, &imp, 0.25, 8, true, false, 15.0);
+        let cold = compact_cold_kv(
+            &k[..n_cold * d],
+            &v[..n_cold * d],
+            n_cold,
+            1,
+            d,
+            &imp,
+            0.25,
+            8,
+            true,
+            false,
+            15.0,
+        );
         let (ck, cv) = cold.dequant_head(0);
         let hot_k = &k[n_cold * d..];
         let hot_v = &v[n_cold * d..];
@@ -435,7 +495,9 @@ mod tests {
                 v[t * d + i] = rng.n();
             }
         }
-        let imp: Vec<f32> = (0..nt).map(|t| (0..d).map(|i| q[i] * k[t * d + i]).sum::<f32>()).collect();
+        let imp: Vec<f32> = (0..nt)
+            .map(|t| (0..d).map(|i| q[i] * k[t * d + i]).sum::<f32>())
+            .collect();
         let cold = compact_cold_kv(&k, &v, nt, h, d, &imp, 0.25, 4, false, false, 15.0);
         let (kr, _vr) = cold.dequant_head(0);
         assert_eq!(kr.len(), cold.n_valid * d);

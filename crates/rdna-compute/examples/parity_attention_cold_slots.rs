@@ -54,7 +54,10 @@ fn host_cold_attn(
 }
 
 fn main() {
-    let ns: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(88);
+    let ns: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(88);
     let (nh, nkv, d) = (8usize, 2usize, 256usize); // qwen3.5-0.8b FA shape
     let scale = 1.0 / (d as f32).sqrt();
 
@@ -69,7 +72,8 @@ fn main() {
     let od = gpu.alloc_tensor(&[nh * d], DType::F32).unwrap();
     let md = gpu.alloc_tensor(&[nh], DType::F32).unwrap();
     let ld = gpu.alloc_tensor(&[nh], DType::F32).unwrap();
-    gpu.attention_cold_slots(&qd, &kd, &vd, &od, &md, &ld, nh, nkv, ns, scale, 0, 0, None).unwrap();
+    gpu.attention_cold_slots(&qd, &kd, &vd, &od, &md, &ld, nh, nkv, ns, scale, 0, 0, None)
+        .unwrap();
     gpu.device_synchronize().unwrap();
     let got = gpu.download_f32(&od).unwrap();
 

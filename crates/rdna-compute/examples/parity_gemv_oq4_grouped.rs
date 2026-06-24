@@ -38,7 +38,10 @@ fn main() {
 
     let mut gpu = Gpu::init().unwrap();
     if !gpu.arch_caps.has_wmma_w32() {
-        println!("SKIP parity_gemv_oq4_grouped: {} lacks wave32 WMMA", gpu.arch);
+        println!(
+            "SKIP parity_gemv_oq4_grouped: {} lacks wave32 WMMA",
+            gpu.arch
+        );
         return;
     }
 
@@ -55,13 +58,15 @@ fn main() {
 
     // GEMV (decode).
     let yg = gpu.upload_raw(&vec![0u8; m * 4], &[1, m]).unwrap();
-    gpu.gemv_oq4_grouped(&wd, &ws, &xqd, &xsd, &yg, m, k, group).unwrap();
+    gpu.gemv_oq4_grouped(&wd, &ws, &xqd, &xsd, &yg, m, k, group)
+        .unwrap();
     gpu.device_synchronize().unwrap();
     let y_gemv = gpu.download_f32(&yg).unwrap();
 
     // Reference: WMMA grouped GEMM at B=1.
     let yr = gpu.upload_raw(&vec![0u8; m * 4], &[1, m]).unwrap();
-    gpu.gemm_oq4_grouped_wmma(&wd, &ws, &xqd, &xsd, &yr, m, k, 1, group).unwrap();
+    gpu.gemm_oq4_grouped_wmma(&wd, &ws, &xqd, &xsd, &yr, m, k, 1, group)
+        .unwrap();
     gpu.device_synchronize().unwrap();
     let y_ref = gpu.download_f32(&yr).unwrap();
 

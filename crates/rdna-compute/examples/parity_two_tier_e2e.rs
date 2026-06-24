@@ -54,9 +54,18 @@ fn pack_kv(per_head: &[Vec<f32>], slots: usize) -> Vec<f32> {
 }
 
 fn main() {
-    let nt: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(512);
-    let w: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(96);
-    assert!(w < nt, "hot window must be smaller than total (nt={nt} w={w})");
+    let nt: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512);
+    let w: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(96);
+    assert!(
+        w < nt,
+        "hot window must be smaller than total (nt={nt} w={w})"
+    );
     let n_cold_tok = nt - w;
     let scale = 1.0 / (HD as f32).sqrt();
     let kv_dim = NKV * HD;
@@ -71,10 +80,24 @@ fn main() {
     let cold_v: Vec<f32> = v_all[..n_cold_tok * kv_dim].to_vec();
     let hot_off = n_cold_tok * kv_dim;
     // Importance: recency-ish weighting so the merge is non-uniform (older = lower).
-    let importance: Vec<f32> = (0..n_cold_tok).map(|t| 0.1 + (t as f32 / n_cold_tok as f32)).collect();
+    let importance: Vec<f32> = (0..n_cold_tok)
+        .map(|t| 0.1 + (t as f32 / n_cold_tok as f32))
+        .collect();
 
     // REAL cold compaction: KVarN 4-bit, FWHT-rotated, fold_m=4, 12.5% core exact.
-    let cold = compact_cold_kv(&cold_k, &cold_v, n_cold_tok, NKV, HD, &importance, 0.125, 4, true, false, 15.0);
+    let cold = compact_cold_kv(
+        &cold_k,
+        &cold_v,
+        n_cold_tok,
+        NKV,
+        HD,
+        &importance,
+        0.125,
+        4,
+        true,
+        false,
+        15.0,
+    );
     let nvc = cold.n_valid;
 
     // Hot tier raw [nkv × w × HD] (regroup token-major → head-major slabs).
@@ -97,8 +120,14 @@ fn main() {
 
     // Cold tier dequantized [nkv × nvc × HD] (what BOTH tiers attend over).
     let cold_deq: Vec<(Vec<f32>, Vec<f32>)> = (0..NKV).map(|h| cold.dequant_head(h)).collect();
-    let cold_k_packed = pack_kv(&cold_deq.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(), nvc);
-    let cold_v_packed = pack_kv(&cold_deq.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(), nvc);
+    let cold_k_packed = pack_kv(
+        &cold_deq.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+        nvc,
+    );
+    let cold_v_packed = pack_kv(
+        &cold_deq.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(),
+        nvc,
+    );
     let hot_k_packed = pack_kv(&hot_slabs, w);
     let hot_v_packed = pack_kv(&hot_v_slabs, w);
 
@@ -133,7 +162,8 @@ fn main() {
         let od = gpu.alloc_tensor(&[NH * HD], DType::F32).unwrap();
         let md = gpu.alloc_tensor(&[NH], DType::F32).unwrap();
         let ld = gpu.alloc_tensor(&[NH], DType::F32).unwrap();
-        gpu.attention_cold_slots(&qd, &kd, &vd, &od, &md, &ld, NH, NKV, ns, scale, 0, 0, None).unwrap();
+        gpu.attention_cold_slots(&qd, &kd, &vd, &od, &md, &ld, NH, NKV, ns, scale, 0, 0, None)
+            .unwrap();
         (od, md, ld)
     };
 
@@ -143,7 +173,8 @@ fn main() {
     let om = gpu.alloc_tensor(&[NH * HD], DType::F32).unwrap();
     let mm = gpu.alloc_tensor(&[NH], DType::F32).unwrap();
     let lm = gpu.alloc_tensor(&[NH], DType::F32).unwrap();
-    gpu.flash_tier_merge(&oh, &mh, &lh, &oc, &mc, &lc, &om, &mm, &lm, NH).unwrap();
+    gpu.flash_tier_merge(&oh, &mh, &lh, &oc, &mc, &lc, &om, &mm, &lm, NH)
+        .unwrap();
 
     gpu.device_synchronize().unwrap();
     let got = gpu.download_f32(&om).unwrap();

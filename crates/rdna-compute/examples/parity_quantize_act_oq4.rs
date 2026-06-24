@@ -16,7 +16,11 @@ fn lcg(seed: u32, n: usize) -> Vec<f32> {
         .map(|i| {
             s = s.wrapping_mul(1_103_515_245).wrapping_add(12345) & 0x7fff_ffff;
             let base = (s as f32 / 2_147_483_648.0) - 0.5;
-            if i % 53 == 0 { base * 12.0 } else { base }
+            if i % 53 == 0 {
+                base * 12.0
+            } else {
+                base
+            }
         })
         .collect()
 }
@@ -31,7 +35,10 @@ fn main() {
 
     let mut gpu = Gpu::init().unwrap();
     if !gpu.arch_caps.has_wmma_w32() {
-        println!("SKIP quantize_act_oq4 parity: {} lacks wave32 WMMA", gpu.arch);
+        println!(
+            "SKIP quantize_act_oq4 parity: {} lacks wave32 WMMA",
+            gpu.arch
+        );
         return;
     }
 
@@ -61,9 +68,14 @@ fn main() {
 
     // GPU.
     let xd = gpu
-        .upload_raw(&x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(), &[b, k])
+        .upload_raw(
+            &x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
+            &[b, k],
+        )
         .unwrap();
-    let xqd = gpu.upload_raw(&vec![0u8; b * (k / 2)], &[b, k / 2]).unwrap();
+    let xqd = gpu
+        .upload_raw(&vec![0u8; b * (k / 2)], &[b, k / 2])
+        .unwrap();
     let xsd = gpu.upload_raw(&vec![0u8; b * ng * 4], &[b, ng]).unwrap();
     gpu.quantize_act_oq4(&xd, &xqd, &xsd, b, k, group).unwrap();
     gpu.device_synchronize().unwrap();

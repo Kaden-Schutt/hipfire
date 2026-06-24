@@ -26,14 +26,14 @@ pub struct SsmBlockDims {
 
 /// Trainable weights for one GLA-lite block (HF row-major `[out, in]`).
 pub struct SsmBlockWeights<'a> {
-    pub norm1: &'a GpuTensor,  // [h]
-    pub w_u: &'a GpuTensor,    // [h, h]   input projection
-    pub w_g: &'a GpuTensor,    // [h, h]   gate projection
-    pub w_o: &'a GpuTensor,    // [h, h]   output projection (post-scan)
-    pub norm2: &'a GpuTensor,  // [h]
-    pub wgate: &'a GpuTensor,  // [inter, h]
-    pub wup: &'a GpuTensor,    // [inter, h]
-    pub wdown: &'a GpuTensor,  // [h, inter]
+    pub norm1: &'a GpuTensor, // [h]
+    pub w_u: &'a GpuTensor,   // [h, h]   input projection
+    pub w_g: &'a GpuTensor,   // [h, h]   gate projection
+    pub w_o: &'a GpuTensor,   // [h, h]   output projection (post-scan)
+    pub norm2: &'a GpuTensor, // [h]
+    pub wgate: &'a GpuTensor, // [inter, h]
+    pub wup: &'a GpuTensor,   // [inter, h]
+    pub wdown: &'a GpuTensor, // [h, inter]
 }
 
 /// Gradients for every trainable weight of one GLA-lite block.
@@ -110,7 +110,19 @@ pub fn ssm_block_forward(
     gpu.add_f32(&x_mid, &down, &x_out)?;
     gpu.free_tensor(down)?;
 
-    let acts = SsmBlockActivations { xn1, rinv1, u, g, hs, x_mid, xn2, rinv2, gate, up, act };
+    let acts = SsmBlockActivations {
+        xn1,
+        rinv1,
+        u,
+        g,
+        hs,
+        x_mid,
+        xn2,
+        rinv2,
+        gate,
+        up,
+        act,
+    };
     Ok((x_out, acts))
 }
 
@@ -138,7 +150,15 @@ pub fn ssm_block_backward(
     // swiglu bwd: d_act → d_gate, d_up.
     let d_gate = gpu.zeros(&[seq * inter], DType::F32)?;
     let d_up = gpu.zeros(&[seq * inter], DType::F32)?;
-    swiglu_backward(gpu, &d_act, &acts.gate, &acts.up, &d_gate, &d_up, seq * inter)?;
+    swiglu_backward(
+        gpu,
+        &d_act,
+        &acts.gate,
+        &acts.up,
+        &d_gate,
+        &d_up,
+        seq * inter,
+    )?;
     gpu.free_tensor(d_act)?;
 
     // wgate, wup grads + d_xn2 (two contributions, accumulate).
@@ -155,7 +175,17 @@ pub fn ssm_block_backward(
     // rmsnorm2 bwd → d_xmid_norm (+dnorm2); add into d_x_mid.
     let d_xmid_norm = gpu.zeros(&[seq * h], DType::F32)?;
     let dnorm2 = gpu.zeros(&[h], DType::F32)?;
-    rmsnorm_backward(gpu, &d_xn2, &acts.x_mid, w.norm2, &acts.rinv2, &d_xmid_norm, &dnorm2, seq, h)?;
+    rmsnorm_backward(
+        gpu,
+        &d_xn2,
+        &acts.x_mid,
+        w.norm2,
+        &acts.rinv2,
+        &d_xmid_norm,
+        &dnorm2,
+        seq,
+        h,
+    )?;
     gpu.free_tensor(d_xn2)?;
     gpu.add_inplace_f32(&d_x_mid, &d_xmid_norm)?;
     gpu.free_tensor(d_xmid_norm)?;
@@ -193,18 +223,49 @@ pub fn ssm_block_backward(
     // rmsnorm1 bwd → d_xnorm (+dnorm1); add into d_x.
     let d_xnorm = gpu.zeros(&[seq * h], DType::F32)?;
     let dnorm1 = gpu.zeros(&[h], DType::F32)?;
-    rmsnorm_backward(gpu, &d_xn1, x_in, w.norm1, &acts.rinv1, &d_xnorm, &dnorm1, seq, h)?;
+    rmsnorm_backward(
+        gpu,
+        &d_xn1,
+        x_in,
+        w.norm1,
+        &acts.rinv1,
+        &d_xnorm,
+        &dnorm1,
+        seq,
+        h,
+    )?;
     gpu.free_tensor(d_xn1)?;
     gpu.add_inplace_f32(&d_x, &d_xnorm)?;
     gpu.free_tensor(d_xnorm)?;
 
-    let grad = SsmBlockGrad { dnorm1, dw_u, dw_g, dw_o, dnorm2, dwgate, dwup, dwdown };
+    let grad = SsmBlockGrad {
+        dnorm1,
+        dw_u,
+        dw_g,
+        dw_o,
+        dnorm2,
+        dwgate,
+        dwup,
+        dwdown,
+    };
     Ok((d_x, grad))
 }
 
 /// Return a forward's saved activations to the pool (GpuTensor has no Drop).
 pub fn free_ssm_block_acts(gpu: &mut Gpu, a: SsmBlockActivations) -> HipResult<()> {
-    let SsmBlockActivations { xn1, rinv1, u, g, hs, x_mid, xn2, rinv2, gate, up, act } = a;
+    let SsmBlockActivations {
+        xn1,
+        rinv1,
+        u,
+        g,
+        hs,
+        x_mid,
+        xn2,
+        rinv2,
+        gate,
+        up,
+        act,
+    } = a;
     for t in [xn1, rinv1, u, g, hs, x_mid, xn2, rinv2, gate, up, act] {
         gpu.free_tensor(t)?;
     }
@@ -213,7 +274,16 @@ pub fn free_ssm_block_acts(gpu: &mut Gpu, a: SsmBlockActivations) -> HipResult<(
 
 /// Return a backward's weight grads to the pool after the optimizer step.
 pub fn free_ssm_block_grad(gpu: &mut Gpu, g: SsmBlockGrad) -> HipResult<()> {
-    let SsmBlockGrad { dnorm1, dw_u, dw_g, dw_o, dnorm2, dwgate, dwup, dwdown } = g;
+    let SsmBlockGrad {
+        dnorm1,
+        dw_u,
+        dw_g,
+        dw_o,
+        dnorm2,
+        dwgate,
+        dwup,
+        dwdown,
+    } = g;
     for t in [dnorm1, dw_u, dw_g, dw_o, dnorm2, dwgate, dwup, dwdown] {
         gpu.free_tensor(t)?;
     }

@@ -80,7 +80,8 @@ pub fn parse_hfq(bytes: &[u8]) -> Result<(Vec<HfqEntry>, String), String> {
     for _ in 0..n_tensors {
         let name_len = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
         pos += 2;
-        let name = String::from_utf8(bytes[pos..pos + name_len].to_vec()).map_err(|e| e.to_string())?;
+        let name =
+            String::from_utf8(bytes[pos..pos + name_len].to_vec()).map_err(|e| e.to_string())?;
         pos += name_len;
         let quant_type = bytes[pos];
         pos += 1;
@@ -95,7 +96,13 @@ pub fn parse_hfq(bytes: &[u8]) -> Result<(Vec<HfqEntry>, String), String> {
         pos += 4;
         let data_size = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap()) as usize;
         pos += 8;
-        entries.push(HfqEntry { name, quant_type, shape, data_offset: cum, data_size });
+        entries.push(HfqEntry {
+            name,
+            quant_type,
+            shape,
+            data_offset: cum,
+            data_size,
+        });
         cum += data_size;
     }
     Ok((entries, metadata_json))
@@ -131,14 +138,22 @@ pub fn patch_norms_inplace(
 ) -> Result<usize, String> {
     let mut n = 0;
     for e in entries {
-        let Some(vals) = tuned.get(&e.name) else { continue };
+        let Some(vals) = tuned.get(&e.name) else {
+            continue;
+        };
         if e.quant_type != QT_BF16 {
-            return Err(format!("{}: expected BF16 norm (qt {}), refusing", e.name, e.quant_type));
+            return Err(format!(
+                "{}: expected BF16 norm (qt {}), refusing",
+                e.name, e.quant_type
+            ));
         }
         if vals.len() * 2 != e.data_size {
             return Err(format!(
                 "{}: tuned len {} (×2={}) != data_size {}",
-                e.name, vals.len(), vals.len() * 2, e.data_size
+                e.name,
+                vals.len(),
+                vals.len() * 2,
+                e.data_size
             ));
         }
         for (i, &v) in vals.iter().enumerate() {
