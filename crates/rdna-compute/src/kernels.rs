@@ -2934,6 +2934,7 @@ pub const CONV1D_GATED_DECODE_SRC: &str =
 /// x and z are [n_heads × head_dim]. weight is [head_dim] (shared across heads).
 #[cfg(feature = "deltanet")]
 pub const GATED_NORM_SRC: &str = include_str!("../../../kernels/src/gated_norm.hip");
+pub const MAMBA2_SSD_DECODE_SRC: &str = include_str!("../../../kernels/src/mamba2_ssd_decode.hip");
 
 /// Gated Delta Net — tiled LDS + warp-shuffle.
 /// S[128×128] tiled into TILE_ROWS=8 row chunks. Each tile = 8×128×4 = 4KB LDS.
@@ -3706,16 +3707,14 @@ pub const GEMM_BF16_BF16_WMMA_SRC: &str =
 /// (`v_wmma_f32_16x16x16_f16`) with an F16 round on store. See
 /// `kernels/src/gemm_f16_f16_wmma.hip` and
 /// `docs/kernels/generic-kernel-library.md`.
-pub const GEMM_F16_F16_WMMA_SRC: &str =
-    include_str!("../../../kernels/src/gemm_f16_f16_wmma.hip");
+pub const GEMM_F16_F16_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_f16_f16_wmma.hip");
 
 /// Generic kernel library: WMMA signed-INT8 × INT8 → INT32 GEMM, (B, M) output.
 /// gfx1103 (RDNA3 UMA) wave32, register-tiled, zero LDS.
 /// `v_wmma_i32_16x16x16_iu8`, both operands signed, clamp=false. See
 /// `kernels/src/gemm_iu8_i32_wmma.hip` and
 /// `docs/kernels/generic-kernel-library.md`.
-pub const GEMM_IU8_I32_WMMA_SRC: &str =
-    include_str!("../../../kernels/src/gemm_iu8_i32_wmma.hip");
+pub const GEMM_IU8_I32_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_iu8_i32_wmma.hip");
 
 /// Reference kernel layer: per-token symmetric int8 activation quant (W8A8/W4A8 A8 input).
 pub const QUANTIZE_ACT_INT8_PER_TOKEN_SRC: &str =
@@ -3734,8 +3733,7 @@ pub const NIBBLE_EXPAND_INT4_TO_INT8_SRC: &str =
 /// (`byte = k_even | k_odd<<4`), `v_wmma_i32_16x16x16_iu4`, both operands
 /// signed, clamp=false. See `kernels/src/gemm_iu4_i32_wmma.hip` and
 /// `docs/kernels/generic-kernel-library.md`.
-pub const GEMM_IU4_I32_WMMA_SRC: &str =
-    include_str!("../../../kernels/src/gemm_iu4_i32_wmma.hip");
+pub const GEMM_IU4_I32_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_iu4_i32_wmma.hip");
 
 /// Opus Quant W4A4 core: grouped signed-INT4 × INT4 GEMM with per-group scale
 /// rescale in the f32 epilogue (productionizes the host-tiled E5 recipe).
@@ -3746,8 +3744,7 @@ pub const GEMM_OQ4_GROUPED_WMMA_SRC: &str =
 /// Opus Quant W4A4: dynamic per-token/group INT4 activation quantizer (f32 →
 /// signed int4 + per-group scales). Feeds `gemm_oq4_grouped_wmma`. gfx1103
 /// wave32, zero LDS. See `kernels/src/quantize_act_oq4.hip`.
-pub const QUANTIZE_ACT_OQ4_SRC: &str =
-    include_str!("../../../kernels/src/quantize_act_oq4.hip");
+pub const QUANTIZE_ACT_OQ4_SRC: &str = include_str!("../../../kernels/src/quantize_act_oq4.hip");
 
 /// Opus Quant W8A8 core: grouped signed-INT8 × signed-INT8 GEMM with per-group
 /// scale rescale (v_wmma_i32_16x16x16_iu8). The int8 generalization of
@@ -3759,8 +3756,7 @@ pub const GEMM_OQ8_GROUPED_WMMA_SRC: &str =
 /// Opus Quant W8A8: dynamic per-token/group INT8 activation quantizer (f32 →
 /// signed int8 + per-group scales). Feeds `gemm_oq8_grouped_wmma`. gfx1103
 /// wave32, zero LDS. See `kernels/src/quantize_act_oq8.hip`.
-pub const QUANTIZE_ACT_OQ8_SRC: &str =
-    include_str!("../../../kernels/src/quantize_act_oq8.hip");
+pub const QUANTIZE_ACT_OQ8_SRC: &str = include_str!("../../../kernels/src/quantize_act_oq8.hip");
 
 /// Opus Quant W4A4 fused Gate+Up: gate_proj + up_proj grouped-iu4 GEMMs in one
 /// launch over a shared int4 activation (blockIdx tile-range demux). gfx1103
@@ -3777,8 +3773,7 @@ pub const FUSED_QKVZA_OQ4_WMMA_SRC: &str =
 
 /// Opus Quant W4A4 DECODE GEMV (batch=1): one wave32 per output row, no WMMA
 /// N-tile waste, weight-bandwidth-bound. See `kernels/src/gemv_oq4_grouped.hip`.
-pub const GEMV_OQ4_GROUPED_SRC: &str =
-    include_str!("../../../kernels/src/gemv_oq4_grouped.hip");
+pub const GEMV_OQ4_GROUPED_SRC: &str = include_str!("../../../kernels/src/gemv_oq4_grouped.hip");
 
 /// KVarN tile quantizer (Phase D1): log-domain Sinkhorn variance-normalize +
 /// per-row 4-bit affine quantize + pack to the on-device KVarN record. One block
@@ -3800,14 +3795,12 @@ pub const ATTENTION_COLD_SLOTS_SRC: &str =
 
 /// Phase 2b hot+cold tier merge: fold two flash-attention tiers' (out,m,l)
 /// partials into one via online softmax. See flash_tier_merge.hip.
-pub const FLASH_TIER_MERGE_SRC: &str =
-    include_str!("../../../kernels/src/flash_tier_merge.hip");
+pub const FLASH_TIER_MERGE_SRC: &str = include_str!("../../../kernels/src/flash_tier_merge.hip");
 
 /// Phase 2b hot-tier (m,l) extract: re-read the KVarN/asym flash's per-tile
 /// partials and emit the final softmax (max, denom) so the hot tier can feed
 /// flash_tier_merge. See flash_partials_ml.hip.
-pub const FLASH_PARTIALS_ML_SRC: &str =
-    include_str!("../../../kernels/src/flash_partials_ml.hip");
+pub const FLASH_PARTIALS_ML_SRC: &str = include_str!("../../../kernels/src/flash_partials_ml.hip");
 
 /// KVarN write-side gather (Phase D1 #2): transpose a contiguous run of
 /// token-major K rows into the channel-major `[head_dim × GROUP]` tiles that

@@ -32,6 +32,7 @@ mod gemm_misc;
 mod gemm_qkv;
 mod gemv;
 mod kv;
+mod mamba2;
 mod misc;
 mod moe;
 mod norm;
