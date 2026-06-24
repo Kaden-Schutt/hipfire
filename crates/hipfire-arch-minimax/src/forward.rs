@@ -991,6 +991,7 @@ pub fn forward_batch_supported(weights: &MiniMaxWeights) -> bool {
                 | DType::MQ6G256
                 | DType::HFQ6G256
                 | DType::MQ2G256Lloyd
+                | DType::MQ3G256Lloyd
         );
         gate_up_ok && down_ok
     })
@@ -1443,6 +1444,19 @@ pub fn forward_batch(
                     b,
                 )
                 .map_err(|e| format!("minimax L{l} batch down mq2l: {e:?}"))?,
+            DType::MQ3G256Lloyd => gpu
+                .deepseek4_gemv_mq3g256_lloyd_moe_down_residual_scaled_indexed_batched_k4(
+                    &layer.expert_down_ptrs,
+                    &topk_idx,
+                    &topk_w,
+                    &rot,
+                    &x,
+                    hidden,
+                    inter,
+                    k_top,
+                    b,
+                )
+                .map_err(|e| format!("minimax L{l} batch down mq3l: {e:?}"))?,
             other => {
                 return Err(format!(
                     "minimax L{l} forward_batch: down dtype {other:?} has no batched kernel yet"
