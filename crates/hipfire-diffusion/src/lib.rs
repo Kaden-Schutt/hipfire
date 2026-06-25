@@ -204,6 +204,9 @@ pub struct DiffusionHipPreflight {
     pub guidance_kernel_probe: DiffusionHipKernelProbe,
     pub scheduler_kernel_probe: DiffusionHipKernelProbe,
     pub tensor_add_kernel_probe: DiffusionHipKernelProbe,
+    pub add_channel_bias_kernel_probe: DiffusionHipKernelProbe,
+    pub nchw_to_bsc_kernel_probe: DiffusionHipKernelProbe,
+    pub bsc_to_nchw_kernel_probe: DiffusionHipKernelProbe,
     pub conv2d_kernel_probe: DiffusionHipKernelProbe,
     pub group_norm_kernel_probe: DiffusionHipKernelProbe,
     pub silu_kernel_probe: DiffusionHipKernelProbe,
@@ -2498,6 +2501,72 @@ impl DiffusionPipeline {
                 "HIP diffusion tensor-add kernel output differed from CPU reference".to_string(),
             ));
         }
+        let channel_bias_input = CpuTensor {
+            shape: vec![2, 3, 2, 2],
+            data: (0..24)
+                .map(|idx| idx as f32 / 10.0 - 1.0)
+                .collect::<Vec<_>>(),
+        };
+        let channel_bias = CpuTensor {
+            shape: vec![2, 3],
+            data: vec![0.25, -0.5, 0.75, -1.0, 0.5, -0.25],
+        };
+        let mut add_channel_bias_cpu_reference = channel_bias_input.clone();
+        add_channel_bias_nchw(&mut add_channel_bias_cpu_reference, &channel_bias)?;
+        let add_channel_bias_gpu_output =
+            add_channel_bias_nchw_hip_on_gpu(&mut gpu, &channel_bias_input, &channel_bias)?;
+        let add_channel_bias_kernel_probe = DiffusionHipKernelProbe {
+            name: "diffusion_add_channel_bias_nchw_f32".to_string(),
+            input_elements: channel_bias_input.data.len() + channel_bias.data.len(),
+            output_bytes: add_channel_bias_gpu_output.data.len() * std::mem::size_of::<f32>(),
+            matched_cpu_reference: add_channel_bias_gpu_output.shape
+                == add_channel_bias_cpu_reference.shape
+                && f32_slices_close(
+                    &add_channel_bias_gpu_output.data,
+                    &add_channel_bias_cpu_reference.data,
+                    1e-6,
+                ),
+        };
+        if !add_channel_bias_kernel_probe.matched_cpu_reference {
+            return Err(DiffusionError::BackendUnavailable(
+                "HIP diffusion channel-bias kernel output differed from CPU reference".to_string(),
+            ));
+        }
+        let layout_input = CpuTensor {
+            shape: vec![2, 3, 2, 4],
+            data: (0..48)
+                .map(|idx| idx as f32 / 11.0 - 1.75)
+                .collect::<Vec<_>>(),
+        };
+        let nchw_to_bsc_cpu_reference = nchw_to_bsc(&layout_input)?;
+        let nchw_to_bsc_gpu_output = nchw_to_bsc_hip_on_gpu(&mut gpu, &layout_input)?;
+        let nchw_to_bsc_kernel_probe = DiffusionHipKernelProbe {
+            name: "diffusion_nchw_to_bsc_f32".to_string(),
+            input_elements: layout_input.data.len(),
+            output_bytes: nchw_to_bsc_gpu_output.data.len() * std::mem::size_of::<f32>(),
+            matched_cpu_reference: nchw_to_bsc_gpu_output.shape == nchw_to_bsc_cpu_reference.shape
+                && nchw_to_bsc_gpu_output.data == nchw_to_bsc_cpu_reference.data,
+        };
+        if !nchw_to_bsc_kernel_probe.matched_cpu_reference {
+            return Err(DiffusionError::BackendUnavailable(
+                "HIP diffusion NCHW-to-BSC kernel output differed from CPU reference".to_string(),
+            ));
+        }
+        let bsc_to_nchw_cpu_reference = bsc_to_nchw(&nchw_to_bsc_cpu_reference, 2, 3, 2, 4)?;
+        let bsc_to_nchw_gpu_output =
+            bsc_to_nchw_hip_on_gpu(&mut gpu, &nchw_to_bsc_cpu_reference, 2, 3, 2, 4)?;
+        let bsc_to_nchw_kernel_probe = DiffusionHipKernelProbe {
+            name: "diffusion_bsc_to_nchw_f32".to_string(),
+            input_elements: nchw_to_bsc_cpu_reference.data.len(),
+            output_bytes: bsc_to_nchw_gpu_output.data.len() * std::mem::size_of::<f32>(),
+            matched_cpu_reference: bsc_to_nchw_gpu_output.shape == bsc_to_nchw_cpu_reference.shape
+                && bsc_to_nchw_gpu_output.data == bsc_to_nchw_cpu_reference.data,
+        };
+        if !bsc_to_nchw_kernel_probe.matched_cpu_reference {
+            return Err(DiffusionError::BackendUnavailable(
+                "HIP diffusion BSC-to-NCHW kernel output differed from CPU reference".to_string(),
+            ));
+        }
         let conv2d_input = CpuTensor {
             shape: vec![1, 2, 3, 4],
             data: (0..24)
@@ -2845,6 +2914,9 @@ impl DiffusionPipeline {
             guidance_kernel_probe,
             scheduler_kernel_probe,
             tensor_add_kernel_probe,
+            add_channel_bias_kernel_probe,
+            nchw_to_bsc_kernel_probe,
+            bsc_to_nchw_kernel_probe,
             conv2d_kernel_probe,
             group_norm_kernel_probe,
             silu_kernel_probe,
@@ -5687,6 +5759,77 @@ extern "C" __global__ void diffusion_upsample_nearest2d_nchw_f32(
 "#;
 
 #[cfg(feature = "rocm")]
+const DIFFUSION_LAYOUT_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void diffusion_add_channel_bias_nchw_f32(
+    const float* input,
+    const float* bias,
+    float* output,
+    int total_elements,
+    int channels,
+    int height,
+    int width
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) {
+        return;
+    }
+    int t = idx / width;
+    t /= height;
+    int c = t % channels;
+    int b = t / channels;
+    output[idx] = input[idx] + bias[b * channels + c];
+}
+
+extern "C" __global__ void diffusion_nchw_to_bsc_f32(
+    const float* input,
+    float* output,
+    int total_elements,
+    int channels,
+    int height,
+    int width
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) {
+        return;
+    }
+    int x = idx % width;
+    int t = idx / width;
+    int y = t % height;
+    t /= height;
+    int c = t % channels;
+    int b = t / channels;
+    int seq = height * width;
+    int s = y * width + x;
+    output[(b * seq + s) * channels + c] = input[idx];
+}
+
+extern "C" __global__ void diffusion_bsc_to_nchw_f32(
+    const float* input,
+    float* output,
+    int total_elements,
+    int channels,
+    int height,
+    int width
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) {
+        return;
+    }
+    int x = idx % width;
+    int t = idx / width;
+    int y = t % height;
+    t /= height;
+    int c = t % channels;
+    int b = t / channels;
+    int seq = height * width;
+    int s = y * width + x;
+    output[idx] = input[(b * seq + s) * channels + c];
+}
+"#;
+
+#[cfg(feature = "rocm")]
 const DIFFUSION_LINEAR_HIP_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 
@@ -6253,6 +6396,228 @@ fn tensor_add_hip_on_gpu(
 fn i32_kernel_dim(label: &str, value: usize) -> DiffusionResult<i32> {
     i32::try_from(value)
         .map_err(|_| DiffusionError::InvalidRequest(format!("{label} value {value} exceeds i32")))
+}
+
+#[cfg(feature = "rocm")]
+fn launch_diffusion_layout_kernel(
+    gpu: &mut rdna_compute::Gpu,
+    function_name: &str,
+    input_gpu: &rdna_compute::GpuTensor,
+    bias_gpu: Option<&rdna_compute::GpuTensor>,
+    output_gpu: &hip_bridge::DeviceBuffer,
+    output_elements: usize,
+    channels: usize,
+    height: usize,
+    width: usize,
+) -> DiffusionResult<()> {
+    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = compiler
+        .compile(function_name, DIFFUSION_LAYOUT_HIP_SRC)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = obj_path
+        .to_str()
+        .ok_or_else(|| {
+            DiffusionError::BackendUnavailable(format!(
+                "compiled diffusion layout kernel {function_name} path is not UTF-8"
+            ))
+        })?
+        .to_string();
+    let module = gpu
+        .hip
+        .module_load(&obj_path)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let function = gpu
+        .hip
+        .module_get_function(&module, function_name)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(input_gpu.buf.as_ptr());
+    if let Some(bias_gpu) = bias_gpu {
+        kernargs.push_ptr(bias_gpu.buf.as_ptr());
+    }
+    kernargs.push_ptr(output_gpu.as_ptr());
+    kernargs.push_i32(i32_kernel_dim("layout output elements", output_elements)?);
+    kernargs.push_i32(i32_kernel_dim("layout channels", channels)?);
+    kernargs.push_i32(i32_kernel_dim("layout height", height)?);
+    kernargs.push_i32(i32_kernel_dim("layout width", width)?);
+    kernargs.pad_to(16);
+    let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+    unsafe {
+        gpu.hip
+            .launch_kernel_blob(
+                &function,
+                grid,
+                [256, 1, 1],
+                0,
+                gpu.active_stream.as_ref(),
+                kernargs.as_mut_slice(),
+            )
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))
+}
+
+#[cfg(feature = "rocm")]
+fn add_channel_bias_nchw_hip_on_gpu(
+    gpu: &mut rdna_compute::Gpu,
+    input: &CpuTensor,
+    bias: &CpuTensor,
+) -> DiffusionResult<CpuTensor> {
+    let [batch, channels, height, width] = shape4(input)?;
+    if bias.shape.as_slice() != [batch, channels] {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "channel bias shape {:?} != [{batch}, {channels}]",
+            bias.shape
+        )));
+    }
+    let output_elements = checked_shape_elements("channel-bias output", &input.shape)?;
+    if output_elements == 0 {
+        return Ok(CpuTensor::zeros(&input.shape));
+    }
+    let output_bytes = output_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata("channel-bias output size overflows".to_string())
+        })?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let input_gpu = gpu
+        .upload_f32(&input.data, &input.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let bias_gpu = gpu
+        .upload_f32(&bias.data, &bias.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = gpu
+        .hip
+        .malloc(output_bytes)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    launch_diffusion_layout_kernel(
+        gpu,
+        "diffusion_add_channel_bias_nchw_f32",
+        &input_gpu,
+        Some(&bias_gpu),
+        &output_gpu,
+        output_elements,
+        channels,
+        height,
+        width,
+    )?;
+    let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(CpuTensor {
+        shape: input.shape.clone(),
+        data,
+    })
+}
+
+#[cfg(feature = "rocm")]
+fn nchw_to_bsc_hip_on_gpu(
+    gpu: &mut rdna_compute::Gpu,
+    input: &CpuTensor,
+) -> DiffusionResult<CpuTensor> {
+    let [batch, channels, height, width] = shape4(input)?;
+    let seq = height
+        .checked_mul(width)
+        .ok_or_else(|| DiffusionError::InvalidMetadata("BSC sequence overflows".to_string()))?;
+    let output_shape = [batch, seq, channels];
+    let output_elements = checked_shape_elements("NCHW-to-BSC output", &output_shape)?;
+    if output_elements == 0 {
+        return Ok(CpuTensor::zeros(&output_shape));
+    }
+    let output_bytes = output_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata("NCHW-to-BSC output size overflows".to_string())
+        })?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let input_gpu = gpu
+        .upload_f32(&input.data, &input.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = gpu
+        .hip
+        .malloc(output_bytes)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    launch_diffusion_layout_kernel(
+        gpu,
+        "diffusion_nchw_to_bsc_f32",
+        &input_gpu,
+        None,
+        &output_gpu,
+        output_elements,
+        channels,
+        height,
+        width,
+    )?;
+    let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(CpuTensor {
+        shape: output_shape.to_vec(),
+        data,
+    })
+}
+
+#[cfg(feature = "rocm")]
+fn bsc_to_nchw_hip_on_gpu(
+    gpu: &mut rdna_compute::Gpu,
+    input: &CpuTensor,
+    batch: usize,
+    channels: usize,
+    height: usize,
+    width: usize,
+) -> DiffusionResult<CpuTensor> {
+    let [input_batch, seq, input_channels] = shape3(input)?;
+    if input_batch != batch || input_channels != channels || seq != height * width {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "BSC tensor shape {:?} cannot reshape to [{batch}, {channels}, {height}, {width}]",
+            input.shape
+        )));
+    }
+    let output_shape = [batch, channels, height, width];
+    let output_elements = checked_shape_elements("BSC-to-NCHW output", &output_shape)?;
+    if output_elements == 0 {
+        return Ok(CpuTensor::zeros(&output_shape));
+    }
+    let output_bytes = output_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata("BSC-to-NCHW output size overflows".to_string())
+        })?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let input_gpu = gpu
+        .upload_f32(&input.data, &input.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = gpu
+        .hip
+        .malloc(output_bytes)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    launch_diffusion_layout_kernel(
+        gpu,
+        "diffusion_bsc_to_nchw_f32",
+        &input_gpu,
+        None,
+        &output_gpu,
+        output_elements,
+        channels,
+        height,
+        width,
+    )?;
+    let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(CpuTensor {
+        shape: output_shape.to_vec(),
+        data,
+    })
 }
 
 #[cfg(feature = "rocm")]
@@ -14236,6 +14601,68 @@ mod tests {
                 "tensor-add mismatch at {index}: hip={actual} cpu={expected}"
             );
         }
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn hip_add_channel_bias_matches_cpu_reference_when_gpu_is_available() {
+        let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!(
+                    "skip: ROCm GPU unavailable for channel-bias kernel parity test: {error}"
+                );
+                return;
+            }
+        };
+        let input = CpuTensor {
+            shape: vec![2, 3, 2, 3],
+            data: (0..36)
+                .map(|idx| idx as f32 / 13.0 - 1.5)
+                .collect::<Vec<_>>(),
+        };
+        let bias = CpuTensor {
+            shape: vec![2, 3],
+            data: vec![0.25, -0.5, 0.75, -1.0, 0.5, -0.25],
+        };
+        let mut cpu = input.clone();
+        add_channel_bias_nchw(&mut cpu, &bias).unwrap();
+        let hip = add_channel_bias_nchw_hip_on_gpu(&mut gpu, &input, &bias).unwrap();
+
+        assert_eq!(hip.shape, cpu.shape);
+        for (index, (actual, expected)) in hip.data.iter().zip(&cpu.data).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1e-6,
+                "channel-bias mismatch at {index}: hip={actual} cpu={expected}"
+            );
+        }
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn hip_nchw_bsc_layout_transforms_match_cpu_reference_when_gpu_is_available() {
+        let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!("skip: ROCm GPU unavailable for layout kernel parity test: {error}");
+                return;
+            }
+        };
+        let input = CpuTensor {
+            shape: vec![2, 3, 2, 4],
+            data: (0..48)
+                .map(|idx| idx as f32 / 17.0 - 1.25)
+                .collect::<Vec<_>>(),
+        };
+
+        let cpu_bsc = nchw_to_bsc(&input).unwrap();
+        let hip_bsc = nchw_to_bsc_hip_on_gpu(&mut gpu, &input).unwrap();
+        assert_eq!(hip_bsc, cpu_bsc);
+
+        let cpu_nchw = bsc_to_nchw(&cpu_bsc, 2, 3, 2, 4).unwrap();
+        let hip_nchw = bsc_to_nchw_hip_on_gpu(&mut gpu, &cpu_bsc, 2, 3, 2, 4).unwrap();
+        assert_eq!(hip_nchw, cpu_nchw);
+        assert_eq!(hip_nchw, input);
     }
 
     #[cfg(feature = "rocm")]
