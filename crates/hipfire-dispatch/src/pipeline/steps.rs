@@ -641,7 +641,18 @@ fn qkv_bias_fold_supported(key: KernelKey, ctx: &DispatchCtx) -> bool {
     if ctx.arch.gemv_dp4a_enabled() {
         return false;
     }
-    matches!(key, KernelKey::FusedQkvHfq4G256)
+    // All per-row 3-way QKV decode keys whose `gpu.fused_qkv_*_with_bias`
+    // variant is wired and GPU-parity-validated (no-bias==0, with-bias==bias;
+    // see examples/test_fused_qkv_bias_parity.rs). HFQ4G256 additionally has the
+    // full three-way model byte-identity proof (see the Phase-1 commit).
+    matches!(
+        key,
+        KernelKey::FusedQkvHfq4G256
+            | KernelKey::FusedQkvMq4G256Lloyd
+            | KernelKey::FusedQkvMq3G256Lloyd
+            | KernelKey::FusedQkvQ4K
+            | KernelKey::FusedQkvQ8_0
+    )
 }
 
 /// If `steps[len..len+3]` are three `BiasAdd` ops whose `x` targets are exactly

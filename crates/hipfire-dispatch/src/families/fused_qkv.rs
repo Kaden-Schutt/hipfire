@@ -156,7 +156,12 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                     hip!(gpu
                         .gemm_qkv_mq3g256_lloyd_wmma(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
                 }
-                None => hip!(gpu.fused_qkv_mq3g256_lloyd(wq, wk, wv, x, q, kout, v, mq, mk, mv, k)),
+                None => {
+                    let (bq, bk, bv) = bias_ptrs(params.bias);
+                    hip!(gpu.fused_qkv_mq3g256_lloyd_with_bias(
+                        wq, wk, wv, x, q, kout, v, mq, mk, mv, k, bq, bk, bv
+                    ))
+                }
             }
         }
         KernelKey::FusedQkvMq4G256Lloyd => {
@@ -171,7 +176,12 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                     hip!(gpu
                         .gemm_qkv_mq4g256_lloyd_wmma(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
                 }
-                None => hip!(gpu.fused_qkv_mq4g256_lloyd(wq, wk, wv, x, q, kout, v, mq, mk, mv, k)),
+                None => {
+                    let (bq, bk, bv) = bias_ptrs(params.bias);
+                    hip!(gpu.fused_qkv_mq4g256_lloyd_with_bias(
+                        wq, wk, wv, x, q, kout, v, mq, mk, mv, k, bq, bk, bv
+                    ))
+                }
             }
         }
         KernelKey::FusedQkvHfq6G256 => {
@@ -196,7 +206,8 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 .map_err(|_| err_wrong_arity(params.kind, 3))?;
             let [mq, mk, mv] =
                 <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
-            hip!(gpu.fused_qkv_q4k(wq, wk, wv, x, q, kout, v, mq, mk, mv, k))
+            let (bq, bk, bv) = bias_ptrs(params.bias);
+            hip!(gpu.fused_qkv_q4k_with_bias(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, bq, bk, bv))
         }
         // ── Q8_0 fused QKV ──
         // None (decode, n=1): scalar `fused_qkv_q8_0` — cross-arch, no dp4a needed.
@@ -214,7 +225,12 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 Some(n) => {
                     hip!(gpu.gemm_qkv_q8_0_wmma(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
                 }
-                None => hip!(gpu.fused_qkv_q8_0(wq, wk, wv, x, q, kout, v, mq, mk, mv, k)),
+                None => {
+                    let (bq, bk, bv) = bias_ptrs(params.bias);
+                    hip!(gpu.fused_qkv_q8_0_with_bias(
+                        wq, wk, wv, x, q, kout, v, mq, mk, mv, k, bq, bk, bv
+                    ))
+                }
             }
         }
         // ── HFQ3G256 fused QKV — prefill-only key (#397 Ship 5.2 slice 3) ──

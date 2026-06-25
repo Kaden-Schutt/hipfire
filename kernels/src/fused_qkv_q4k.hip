@@ -13,7 +13,11 @@ extern "C" __global__ void fused_qkv_q4k(
     float* __restrict__ y_q,
     float* __restrict__ y_k,
     float* __restrict__ y_v,
-    int q_m, int k_m, int v_m, int K
+    int q_m, int k_m, int v_m, int K,
+    // Optional Q/K/V bias (HIPFIRE_FUSE_QKV_BIAS). NULL = pure no-op.
+    const float* __restrict__ bias_q,
+    const float* __restrict__ bias_k,
+    const float* __restrict__ bias_v
 ) {
     const int gid = blockIdx.x;
     const int tid = threadIdx.x;
@@ -22,12 +26,13 @@ extern "C" __global__ void fused_qkv_q4k(
     const unsigned char* A;
     float* y;
     int local_row;
+    const float* bias;
     if (gid < q_m) {
-        A = A_q; y = y_q; local_row = gid;
+        A = A_q; y = y_q; local_row = gid; bias = bias_q;
     } else if (gid < q_m + k_m) {
-        A = A_k; y = y_k; local_row = gid - q_m;
+        A = A_k; y = y_k; local_row = gid - q_m; bias = bias_k;
     } else {
-        A = A_v; y = y_v; local_row = gid - q_m - k_m;
+        A = A_v; y = y_v; local_row = gid - q_m - k_m; bias = bias_v;
     }
 
     const int blocks_per_row = K / 256;
@@ -83,5 +88,5 @@ extern "C" __global__ void fused_qkv_q4k(
     for (int offset = 16; offset > 0; offset >>= 1) {
         sum += __shfl_down(sum, offset);
     }
-    if (tid == 0) y[local_row] = sum;
+    if (tid == 0) y[local_row] = sum + (bias ? bias[local_row] : 0.0f);
 }

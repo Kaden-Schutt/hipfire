@@ -17336,6 +17336,46 @@ impl Gpu {
         v_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        // Null bias = byte-identical to the historical (pre-fold) path.
+        self.fused_qkv_q4k_with_bias(
+            wq,
+            wk,
+            wv,
+            x,
+            yq,
+            yk,
+            yv,
+            q_m,
+            k_m,
+            v_m,
+            k,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    }
+
+    /// `fused_qkv_q4k` with an optional Q/K/V bias folded into the kernel's
+    /// lane-0 store (`HIPFIRE_FUSE_QKV_BIAS`). All-null = byte-identical to the
+    /// unfused path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_qkv_q4k_with_bias(
+        &mut self,
+        wq: &GpuTensor,
+        wk: &GpuTensor,
+        wv: &GpuTensor,
+        x: &GpuTensor,
+        yq: &GpuTensor,
+        yk: &GpuTensor,
+        yv: &GpuTensor,
+        q_m: usize,
+        k_m: usize,
+        v_m: usize,
+        k: usize,
+        bias_q_ptr: *mut c_void,
+        bias_k_ptr: *mut c_void,
+        bias_v_ptr: *mut c_void,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("fused_qkv_q4k", kernels::FUSED_QKV_Q4K_SRC, "fused_qkv_q4k")?;
         let func = &self.functions["fused_qkv_q4k"];
@@ -17351,6 +17391,9 @@ impl Gpu {
         let mut km = k_m as i32;
         let mut vm = v_m as i32;
         let mut kk = k as i32;
+        let mut bq = bias_q_ptr;
+        let mut bk = bias_k_ptr;
+        let mut bv = bias_v_ptr;
 
         let mut params: Vec<*mut c_void> = vec![
             &mut aq as *mut _ as *mut c_void,
@@ -17364,6 +17407,9 @@ impl Gpu {
             &mut km as *mut _ as *mut c_void,
             &mut vm as *mut _ as *mut c_void,
             &mut kk as *mut _ as *mut c_void,
+            &mut bq as *mut _ as *mut c_void,
+            &mut bk as *mut _ as *mut c_void,
+            &mut bv as *mut _ as *mut c_void,
         ];
 
         let grid = (q_m + k_m + v_m) as u32;
@@ -18650,6 +18696,46 @@ impl Gpu {
         v_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        // Null bias = byte-identical to the historical (pre-fold) path.
+        self.fused_qkv_q8_0_with_bias(
+            a_q,
+            a_k,
+            a_v,
+            x,
+            y_q,
+            y_k,
+            y_v,
+            q_m,
+            k_m,
+            v_m,
+            k,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    }
+
+    /// `fused_qkv_q8_0` with an optional Q/K/V bias folded into the kernel's
+    /// lane-0 store (`HIPFIRE_FUSE_QKV_BIAS`). All-null = byte-identical to the
+    /// unfused path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_qkv_q8_0_with_bias(
+        &mut self,
+        a_q: &GpuTensor,
+        a_k: &GpuTensor,
+        a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor,
+        y_k: &GpuTensor,
+        y_v: &GpuTensor,
+        q_m: usize,
+        k_m: usize,
+        v_m: usize,
+        k: usize,
+        bias_q_ptr: *mut c_void,
+        bias_k_ptr: *mut c_void,
+        bias_v_ptr: *mut c_void,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
             "fused_qkv_q8_0",
@@ -18668,6 +18754,9 @@ impl Gpu {
         let k_m_i = k_m as i32;
         let v_m_i = v_m as i32;
         let k_i = k as i32;
+        let bq = bias_q_ptr;
+        let bk = bias_k_ptr;
+        let bv = bias_v_ptr;
         let total = (q_m + k_m + v_m) as u32;
 
         let mut params: Vec<*mut c_void> = vec![
@@ -18682,6 +18771,9 @@ impl Gpu {
             &k_m_i as *const _ as *mut c_void,
             &v_m_i as *const _ as *mut c_void,
             &k_i as *const _ as *mut c_void,
+            &bq as *const _ as *mut c_void,
+            &bk as *const _ as *mut c_void,
+            &bv as *const _ as *mut c_void,
         ];
 
         self.launch_maybe_blob(
@@ -18703,6 +18795,9 @@ impl Gpu {
                 b.push_i32(k_m_i);
                 b.push_i32(v_m_i);
                 b.push_i32(k_i);
+                b.push_ptr(bq);
+                b.push_ptr(bk);
+                b.push_ptr(bv);
                 b
             },
         )
