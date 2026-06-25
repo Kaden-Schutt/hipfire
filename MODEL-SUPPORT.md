@@ -20,7 +20,7 @@ This is the **canonical model-support matrix** for hipfire. It tracks what is
 - **Per-quant × per-GPU-arch kernel coverage** (which formats have tuned
   decode/prefill/WMMA kernels vs generic fallback): see "Kernel coverage" below.
 
-**Last verified:** 2026-06-23 (against `chaingun`).
+**Last verified:** 2026-06-25 (against `chaingun`).
 
 Legend: ✅ full · 🟡 partial / limited · ❌ not implemented (explicitly refused at load/serve) · — not applicable (e.g. expert sharding on a dense arch)
 
@@ -43,6 +43,7 @@ Machine-readable subset consumed by `arch_features` / admission. Edit `docs/mode
 | deepseek4 (9) | ✅ | ❌ | 🟡 | fp32 | ❌ |
 | minimax (10) | 🟡 | ❌ | 🟡 | fp32 | ❌ |
 | lfm2-moe (11) | 🟡 | ❌ | ❌ | fp32 | ❌ |
+| nemotron_h (14) | ✅ | ❌ | ❌ | fp32 | ❌ |
 | gemma3 (12) | ✅ | ❌ | ❌ | fp32+q8 | ❌ |
 | gemma3-vl (13) | ✅ | ❌ | ❌ | fp32+q8 | ✅ |
 | qwen2 (7) | ✅ | ❌ | ❌ | fp32 | ❌ |
@@ -80,6 +81,7 @@ Per-quant overrides of an arch capability (admission consults these before green
 | deepseek4-flash (9) | ✅ | ✅ (own kernels) | ❌ | ❌ | 🟡 native MTP head loads, not wired to spec-serving | 🟡 fp32 only | ✅ | ❌ | ❌ (MoE, unsharded) | ❌ |
 | minimax-m2 (10) | ✅ | ❌ per-token | ❌ | ❌ | 🟡 config plumbing only | 🟡 fp32 only | ✅ | ❌ | ❌ (MoE, unsharded) | ❌ |
 | lfm2-moe (11) | ✅ | ❌ per-token | ❌ | ❌ | ❌ | 🟡 fp32 only | ✅ | ❌ | ❌ (MoE, unsharded) | ❌ |
+| nemotron_h (14) | ✅ | ✅ | ❌ | ❌ | ❌ | 🟡 fp32 only | 🟡 SimpleAr seam | ❌ | ❌ (MoE, unsharded) | ❌ |
 | gemma3 text (12) | ✅ | ✅ | ❌ | ❌ | ❌ | 🟡 fp32 + q8 | ❌ | ❌ | — (dense) | ❌ |
 | gemma3-VL / medgemma (13) | ✅ | ✅ | ❌ | ❌ | ❌ | 🟡 fp32 + q8 | ❌ | ❌ | — (dense) | ✅ |
 | qwen2 (7) | ✅ | ✅ | ❌ | ❌ | ❌ | 🟡 fp32 only | ✅ | ❌ | — (dense) | ❌ |
@@ -118,6 +120,9 @@ and every other arch *explicitly errors* if asked for them:
 - **minimax (10) / lfm2-moe (11)** — solid validated decode + lowered pipeline,
   but **per-token prefill** (no batching → slow long-context ingest) and fp32-only
   KV. Both are recent minimal-AR bring-ups.
+- **nemotron_h (14)** — hybrid Mamba-2 / GQA / ReLU² / MoE AR path with model-level
+  batched prefill and fp32 KV. Missing: server microbatch, DFlash/MTP, KV quant,
+  CASK/PP/EP.
 - **qwen2 (7) / dots-ocr (8)** — basic AR decode + batched prefill, fp32 KV, no
   fast paths.
 - **llama / legacy (0 / 1)** — the original baseline path; functional decode, none

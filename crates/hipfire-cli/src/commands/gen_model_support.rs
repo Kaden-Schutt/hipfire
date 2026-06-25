@@ -10,14 +10,18 @@
 //!   * the matrix chart spliced into `MODEL-SUPPORT.md` between the generated
 //!     markers (the surrounding hand-written prose is preserved).
 //!
-//! With `--check` it regenerates to memory and diffs against the committed files,
-//! exiting non-zero on drift — the freshness gate `tests/no-gpu-ci.sh` runs.
-//! This kills the hand-written `arch_features` ↔ MODEL-SUPPORT.md drift
-//! structurally (same governance pattern as `gen-env-docs`).
+//! With `--check` it validates that every runtime `ARCH_ID_*` appears in the
+//! source matrix, regenerates to memory, and diffs against the committed files,
+//! exiting non-zero on omission or drift — the freshness gate
+//! `tests/no-gpu-ci.sh` runs this. This kills the hand-written `arch_features`
+//! ↔ MODEL-SUPPORT.md drift structurally (same governance pattern as
+//! `gen-env-docs`).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use hipfire_model::KNOWN_RUNTIME_ARCH_IDS;
 use serde::Deserialize;
 
 #[derive(Debug, clap::Args)]
@@ -135,6 +139,9 @@ pub fn run(args: GenModelSupportArgs) -> anyhow::Result<()> {
 fn validate(spec: &Spec) -> anyhow::Result<()> {
     let ok = |m: &str| matches!(m, "full" | "partial" | "none");
     for a in &spec.arch {
+        if a.ids.is_empty() {
+            anyhow::bail!("arch {:?} has no ids", a.label);
+        }
         for (field, v) in [
             ("prefill", &a.prefill),
             ("dflash", &a.dflash),
@@ -159,6 +166,60 @@ fn validate(spec: &Spec) -> anyhow::Result<()> {
             );
         }
     }
+    validate_arch_id_coverage(spec)?;
+    Ok(())
+}
+
+fn validate_arch_id_coverage(spec: &Spec) -> anyhow::Result<()> {
+    let known: BTreeMap<u32, &'static str> = KNOWN_RUNTIME_ARCH_IDS.iter().copied().collect();
+    if known.len() != KNOWN_RUNTIME_ARCH_IDS.len() {
+        anyhow::bail!("KNOWN_RUNTIME_ARCH_IDS contains duplicate arch IDs");
+    }
+
+    let mut seen: BTreeMap<u32, &str> = BTreeMap::new();
+    let mut duplicates = Vec::new();
+    for arch in &spec.arch {
+        for &id in &arch.ids {
+            if let Some(previous_label) = seen.insert(id, arch.label.as_str()) {
+                duplicates.push(format!("{id} ({previous_label}, {})", arch.label));
+            }
+        }
+    }
+    if !duplicates.is_empty() {
+        anyhow::bail!(
+            "docs/model-support.toml contains duplicate arch IDs: {}",
+            duplicates.join(", ")
+        );
+    }
+
+    let seen_ids: BTreeSet<u32> = seen.keys().copied().collect();
+    let known_ids: BTreeSet<u32> = known.keys().copied().collect();
+    let missing = known_ids
+        .difference(&seen_ids)
+        .map(|id| format!("{}({id})", known[id]))
+        .collect::<Vec<_>>();
+    let unknown = seen_ids
+        .difference(&known_ids)
+        .map(|id| format!("{id} ({})", seen[id]))
+        .collect::<Vec<_>>();
+
+    if !missing.is_empty() || !unknown.is_empty() {
+        let mut parts = Vec::new();
+        if !missing.is_empty() {
+            parts.push(format!("missing runtime arch rows: {}", missing.join(", ")));
+        }
+        if !unknown.is_empty() {
+            parts.push(format!(
+                "unknown arch rows: {} (add ARCH_ID_* + KNOWN_RUNTIME_ARCH_IDS if this is served)",
+                unknown.join(", ")
+            ));
+        }
+        anyhow::bail!(
+            "docs/model-support.toml arch coverage mismatch: {}",
+            parts.join("; ")
+        );
+    }
+
     Ok(())
 }
 

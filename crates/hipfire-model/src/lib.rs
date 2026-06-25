@@ -141,7 +141,25 @@ pub const ARCH_ID_DOTS_OCR: u32 = 8;
 pub const ARCH_ID_DEEPSEEK4_FLASH: u32 = 9;
 pub const ARCH_ID_MINIMAX_M2: u32 = 10;
 pub const ARCH_ID_LFM2_MOE: u32 = 11;
+pub const ARCH_ID_GEMMA3_TEXT: u32 = 12;
+pub const ARCH_ID_GEMMA3_VL: u32 = 13;
 pub const ARCH_ID_NEMOTRON_H: u32 = 14;
+
+/// Runtime model arch IDs that must appear in `docs/model-support.toml`.
+pub const KNOWN_RUNTIME_ARCH_IDS: &[(u32, &str)] = &[
+    (ARCH_ID_LLAMA_MISTRAL, "llama"),
+    (ARCH_ID_QWEN3_QWEN2_LEGACY, "qwen3-legacy"),
+    (ARCH_ID_QWEN35_DENSE, "qwen3.5-dense"),
+    (ARCH_ID_QWEN35_MOE, "qwen3.5-moe"),
+    (ARCH_ID_QWEN2, "qwen2"),
+    (ARCH_ID_DOTS_OCR, "dots-ocr"),
+    (ARCH_ID_DEEPSEEK4_FLASH, "deepseek4"),
+    (ARCH_ID_MINIMAX_M2, "minimax"),
+    (ARCH_ID_LFM2_MOE, "lfm2-moe"),
+    (ARCH_ID_GEMMA3_TEXT, "gemma3"),
+    (ARCH_ID_GEMMA3_VL, "gemma3-vl"),
+    (ARCH_ID_NEMOTRON_H, "nemotron_h"),
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModelArchFamily {
@@ -154,6 +172,9 @@ pub enum ModelArchFamily {
     DeepSeek4Flash,
     MiniMaxM2,
     Lfm2Moe,
+    Gemma3Text,
+    Gemma3Vl,
+    NemotronH,
     Unknown,
 }
 
@@ -168,6 +189,9 @@ pub fn model_arch_family(arch_id: u32) -> ModelArchFamily {
         ARCH_ID_DEEPSEEK4_FLASH => ModelArchFamily::DeepSeek4Flash,
         ARCH_ID_MINIMAX_M2 => ModelArchFamily::MiniMaxM2,
         ARCH_ID_LFM2_MOE => ModelArchFamily::Lfm2Moe,
+        ARCH_ID_GEMMA3_TEXT => ModelArchFamily::Gemma3Text,
+        ARCH_ID_GEMMA3_VL => ModelArchFamily::Gemma3Vl,
+        ARCH_ID_NEMOTRON_H => ModelArchFamily::NemotronH,
         _ => ModelArchFamily::Unknown,
     }
 }
@@ -1602,6 +1626,25 @@ mod tests {
         assert!(is_qwen35_family_arch_id(ARCH_ID_QWEN35_DENSE));
         assert!(is_qwen35_family_arch_id(ARCH_ID_QWEN35_MOE));
         assert!(!is_qwen35_family_arch_id(ARCH_ID_QWEN2));
+        assert_eq!(
+            model_arch_family(ARCH_ID_GEMMA3_TEXT),
+            ModelArchFamily::Gemma3Text
+        );
+        assert_eq!(
+            model_arch_family(ARCH_ID_GEMMA3_VL),
+            ModelArchFamily::Gemma3Vl
+        );
+        assert_eq!(
+            model_arch_family(ARCH_ID_NEMOTRON_H),
+            ModelArchFamily::NemotronH
+        );
+        for &(arch_id, label) in KNOWN_RUNTIME_ARCH_IDS {
+            assert_ne!(
+                model_arch_family(arch_id),
+                ModelArchFamily::Unknown,
+                "{label}({arch_id}) should classify to a concrete ModelArchFamily"
+            );
+        }
         assert_eq!(model_arch_family(999), ModelArchFamily::Unknown);
     }
 

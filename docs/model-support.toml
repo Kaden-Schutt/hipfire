@@ -8,7 +8,8 @@
 #   - the matrix chart inside MODEL-SUPPORT.md (between the generated markers)
 #
 # CI freshness gate (tests/no-gpu-ci.sh) runs `gen-model-support --check`, which
-# fails if the committed artifacts have drifted from this file.
+# fails if runtime ARCH_ID_* coverage is missing or committed artifacts have
+# drifted from this file.
 #
 # support marks: "full" | "partial" | "none"  (rendered ✓ / ~ / · in the chart;
 # `full` is the only value admission gating treats as a pass — see is_full()).
@@ -46,6 +47,15 @@ vision = "none"
 ids = [11]
 label = "lfm2-moe"
 prefill = "partial"
+dflash = "none"
+mtp = "none"
+kv = "fp32"
+vision = "none"
+
+[[arch]]
+ids = [14]
+label = "nemotron_h"
+prefill = "full"
 dflash = "none"
 mtp = "none"
 kv = "fp32"

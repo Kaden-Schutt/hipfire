@@ -58,6 +58,17 @@ pub const ARCH_ROWS: &[ArchRow] = &[
         },
     },
     ArchRow {
+        ids: &[14],
+        features: ArchFeatures {
+            label: "nemotron_h",
+            prefill: FeatureSupport::Full,
+            dflash: FeatureSupport::None,
+            mtp: FeatureSupport::None,
+            kv: "fp32",
+            vision: FeatureSupport::None,
+        },
+    },
+    ArchRow {
         ids: &[12],
         features: ArchFeatures {
             label: "gemma3",
