@@ -208,6 +208,7 @@ pub struct DiffusionHipPreflight {
     pub silu_kernel_probe: DiffusionHipKernelProbe,
     pub upsample_kernel_probe: DiffusionHipKernelProbe,
     pub linear_kernel_probe: DiffusionHipKernelProbe,
+    pub layer_norm_kernel_probe: DiffusionHipKernelProbe,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2622,6 +2623,51 @@ impl DiffusionPipeline {
                 "HIP diffusion linear kernel output differed from CPU reference".to_string(),
             ));
         }
+        let layer_norm_input = CpuTensor {
+            shape: vec![3, 4],
+            data: (0..12)
+                .map(|idx| idx as f32 / 5.0 - 1.25)
+                .collect::<Vec<_>>(),
+        };
+        let layer_norm_weight = CpuTensor {
+            shape: vec![4],
+            data: vec![1.0, 0.5, -1.0, 1.5],
+        };
+        let layer_norm_bias = CpuTensor {
+            shape: vec![4],
+            data: vec![0.0, 0.25, -0.5, 0.75],
+        };
+        let layer_norm_cpu_reference = layer_norm(
+            &layer_norm_input,
+            &layer_norm_weight,
+            &layer_norm_bias,
+            1e-5,
+        )?;
+        let layer_norm_gpu_output = layer_norm_hip_on_gpu(
+            &mut gpu,
+            &layer_norm_input,
+            &layer_norm_weight,
+            &layer_norm_bias,
+            1e-5,
+        )?;
+        let layer_norm_kernel_probe = DiffusionHipKernelProbe {
+            name: "diffusion_layer_norm_f32".to_string(),
+            input_elements: layer_norm_input.data.len()
+                + layer_norm_weight.data.len()
+                + layer_norm_bias.data.len(),
+            output_bytes: layer_norm_gpu_output.data.len() * std::mem::size_of::<f32>(),
+            matched_cpu_reference: layer_norm_gpu_output.shape == layer_norm_cpu_reference.shape
+                && f32_slices_close(
+                    &layer_norm_gpu_output.data,
+                    &layer_norm_cpu_reference.data,
+                    1e-5,
+                ),
+        };
+        if !layer_norm_kernel_probe.matched_cpu_reference {
+            return Err(DiffusionError::BackendUnavailable(
+                "HIP diffusion LayerNorm kernel output differed from CPU reference".to_string(),
+            ));
+        }
 
         Ok(DiffusionHipPreflight {
             device_id: gpu.device_id,
@@ -2638,6 +2684,7 @@ impl DiffusionPipeline {
             silu_kernel_probe,
             upsample_kernel_probe,
             linear_kernel_probe,
+            layer_norm_kernel_probe,
         })
     }
 
@@ -5504,6 +5551,43 @@ extern "C" __global__ void diffusion_linear_f32(
 "#;
 
 #[cfg(feature = "rocm")]
+const DIFFUSION_LAYER_NORM_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void diffusion_layer_norm_f32(
+    const float* input,
+    const float* weight,
+    const float* bias,
+    float* output,
+    int total_outputs,
+    int cols,
+    float eps
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_outputs) {
+        return;
+    }
+    int col = idx % cols;
+    int row = idx / cols;
+    int base = row * cols;
+
+    float sum = 0.0f;
+    for (int k = 0; k < cols; ++k) {
+        sum += input[base + k];
+    }
+    float mean = sum / (float)cols;
+
+    float var_sum = 0.0f;
+    for (int k = 0; k < cols; ++k) {
+        float centered = input[base + k] - mean;
+        var_sum += centered * centered;
+    }
+    float inv_std = rsqrtf(var_sum / (float)cols + eps);
+    output[idx] = (input[idx] - mean) * inv_std * weight[col] + bias[col];
+}
+"#;
+
+#[cfg(feature = "rocm")]
 fn rgb_tensor_to_u8_hip_on_gpu(
     gpu: &mut rdna_compute::Gpu,
     tensor: &CpuTensor,
@@ -6274,6 +6358,105 @@ fn linear_optional_bias_hip_on_gpu(
     kernargs.push_i32(i32_kernel_dim("linear input features", in_features)?);
     kernargs.push_i32(i32_kernel_dim("linear output features", out_features)?);
     kernargs.push_i32(if bias.is_some() { 1 } else { 0 });
+    kernargs.pad_to(16);
+    let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+    unsafe {
+        gpu.hip
+            .launch_kernel_blob(
+                &function,
+                grid,
+                [256, 1, 1],
+                0,
+                gpu.active_stream.as_ref(),
+                kernargs.as_mut_slice(),
+            )
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(CpuTensor {
+        shape: output_shape.to_vec(),
+        data,
+    })
+}
+
+#[cfg(feature = "rocm")]
+fn layer_norm_hip_on_gpu(
+    gpu: &mut rdna_compute::Gpu,
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    bias: &CpuTensor,
+    eps: f32,
+) -> DiffusionResult<CpuTensor> {
+    let (rows, cols) = input.rows_cols()?;
+    if weight.shape.as_slice() != [cols] || bias.shape.as_slice() != [cols] {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "layer_norm weight/bias shapes {:?}/{:?} do not match width {cols}",
+            weight.shape, bias.shape
+        )));
+    }
+    let output_shape = [rows, cols];
+    let output_elements = checked_shape_elements("layer_norm output", &output_shape)?;
+    if output_elements == 0 {
+        return Ok(CpuTensor::zeros(&output_shape));
+    }
+    let output_bytes = output_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata("layer_norm output size overflows".to_string())
+        })?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let input_gpu = gpu
+        .upload_f32(&input.data, &input.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let weight_gpu = gpu
+        .upload_f32(&weight.data, &weight.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let bias_gpu = gpu
+        .upload_f32(&bias.data, &bias.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = gpu
+        .hip
+        .malloc(output_bytes)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = compiler
+        .compile("diffusion_layer_norm_f32", DIFFUSION_LAYER_NORM_HIP_SRC)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = obj_path
+        .to_str()
+        .ok_or_else(|| {
+            DiffusionError::BackendUnavailable(
+                "compiled diffusion LayerNorm kernel path is not UTF-8".to_string(),
+            )
+        })?
+        .to_string();
+    let module = gpu
+        .hip
+        .module_load(&obj_path)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let function = gpu
+        .hip
+        .module_get_function(&module, "diffusion_layer_norm_f32")
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(input_gpu.buf.as_ptr());
+    kernargs.push_ptr(weight_gpu.buf.as_ptr());
+    kernargs.push_ptr(bias_gpu.buf.as_ptr());
+    kernargs.push_ptr(output_gpu.as_ptr());
+    kernargs.push_i32(i32_kernel_dim(
+        "layer_norm output elements",
+        output_elements,
+    )?);
+    kernargs.push_i32(i32_kernel_dim("layer_norm width", cols)?);
+    kernargs.push_f32(eps);
     kernargs.pad_to(16);
     let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
     unsafe {
@@ -13274,6 +13457,43 @@ mod tests {
                     "linear mismatch at {index}: hip={actual} cpu={expected}"
                 );
             }
+        }
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn hip_layer_norm_matches_cpu_reference_when_gpu_is_available() {
+        let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!("skip: ROCm GPU unavailable for LayerNorm kernel parity test: {error}");
+                return;
+            }
+        };
+        let input = CpuTensor {
+            shape: vec![4, 5],
+            data: (0..20)
+                .map(|idx| idx as f32 / 6.0 - 1.75)
+                .collect::<Vec<_>>(),
+        };
+        let weight = CpuTensor {
+            shape: vec![5],
+            data: vec![1.0, 0.5, -1.0, 1.5, -0.25],
+        };
+        let bias = CpuTensor {
+            shape: vec![5],
+            data: vec![0.0, 0.25, -0.5, 0.75, -1.0],
+        };
+
+        let cpu = layer_norm(&input, &weight, &bias, 1e-5).unwrap();
+        let hip = layer_norm_hip_on_gpu(&mut gpu, &input, &weight, &bias, 1e-5).unwrap();
+
+        assert_eq!(hip.shape, cpu.shape);
+        for (index, (actual, expected)) in hip.data.iter().zip(&cpu.data).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1e-5,
+                "LayerNorm mismatch at {index}: hip={actual} cpu={expected}"
+            );
         }
     }
 
