@@ -215,9 +215,9 @@ linear projection, f32 LayerNorm, f32 row softmax, f32 3D
 scaled-dot-product attention, f32 CLIP token/position embedding lookup, f32 CLIP
 causal self-attention, GeGLU gate, QuickGELU, and RGB conversion, but full
 generation is not routed through a fully resident GPU runtime yet.
-`txt2img` and `img2img` can opt into `--rocm-device-id` to route currently
-GPU-backed generation boundaries through ROCm: denoise-loop model-input
-scaling, classifier-free guidance, Euler scheduler updates, UNet input
+`txt2img`, `img2img`, and `smoke` can opt into `--rocm-device-id` to route
+currently GPU-backed generation boundaries through ROCm: denoise-loop
+model-input scaling, classifier-free guidance, Euler scheduler updates, UNet input
 centering, CLIP token/position embedding lookup and text encoder tensor stages,
 UNet timestep and SDXL add-time embedding projections, UNet ResNet blocks, UNet
 transformer attention blocks, down/up sampling, channel concatenation, and final
@@ -474,6 +474,7 @@ Run an end-to-end diffusion admission smoke and validate output PNGs
 * `--denoising-strength <DENOISING_STRENGTH>` — Img2img denoising strength
 
   Default value: `0.5`
+* `--rocm-device-id <ROCM_DEVICE_ID>` — Use ROCm for currently GPU-routed generation stages on this device id
 * `--txt2img-only` — Only run txt2img; skip the img2img leg
 * `--skip-masked-img2img` — Skip the masked img2img leg
 

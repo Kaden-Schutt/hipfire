@@ -247,6 +247,9 @@ pub struct DiffusionSmokeArgs {
     /// Img2img denoising strength
     #[arg(long, default_value_t = 0.5)]
     pub denoising_strength: f32,
+    /// Use ROCm for currently GPU-routed generation stages on this device id
+    #[arg(long)]
+    pub rocm_device_id: Option<i32>,
     /// Only run txt2img; skip the img2img leg
     #[arg(long)]
     pub txt2img_only: bool,
@@ -488,8 +491,10 @@ fn run_smoke(args: DiffusionSmokeArgs) -> anyhow::Result<()> {
     }
     fs::create_dir_all(&args.output_dir)?;
     let pipeline = DiffusionPipeline::open_hfq(&args.model)?;
+    let runtime_options = generation_runtime_options(args.rocm_device_id);
     let txt2img_request = smoke_batch_request(&args, args.seed);
-    let txt2img_output = pipeline.generate_batch(txt2img_request)?;
+    let txt2img_output =
+        pipeline.generate_batch_with_runtime_options(txt2img_request, runtime_options)?;
     let txt2img_files = write_png_images(&txt2img_output.images, &args.output_dir.join("txt2img"))?;
     let txt2img_validation = validate_png_files(&txt2img_files, args.width, args.height)?;
 
@@ -503,7 +508,8 @@ fn run_smoke(args: DiffusionSmokeArgs) -> anyhow::Result<()> {
             mask: None,
             denoising_strength: args.denoising_strength,
         };
-        let img2img_output = pipeline.generate_img2img_batch(img2img_request)?;
+        let img2img_output = pipeline
+            .generate_img2img_batch_with_runtime_options(img2img_request, runtime_options)?;
         let img2img_files =
             write_png_images(&img2img_output.images, &args.output_dir.join("img2img"))?;
         let img2img_validation = validate_png_files(&img2img_files, args.width, args.height)?;
@@ -523,7 +529,8 @@ fn run_smoke(args: DiffusionSmokeArgs) -> anyhow::Result<()> {
                 mask: Some(mask),
                 denoising_strength: args.denoising_strength,
             };
-            let masked_output = pipeline.generate_img2img_batch(masked_request)?;
+            let masked_output = pipeline
+                .generate_img2img_batch_with_runtime_options(masked_request, runtime_options)?;
             let masked_files = write_png_images(
                 &masked_output.images,
                 &args.output_dir.join("masked-img2img"),
@@ -545,7 +552,11 @@ fn run_smoke(args: DiffusionSmokeArgs) -> anyhow::Result<()> {
             "status": "pass",
             "model": pipeline.summary().model_name,
             "pipeline": pipeline.summary().pipeline_class,
-            "runtime": inspection.runtime_support.runtime_kind.map(|kind| kind.as_str().to_string()),
+            "runtime": txt2img_output.info.get("runtime").cloned(),
+            "metadata_runtime": inspection.runtime_support.runtime_kind.map(|kind| kind.as_str().to_string()),
+            "runtime_options": {
+                "rocm_device_id": runtime_options.rocm_device_id,
+            },
             "txt2img": {
                 "images": txt2img_files,
                 "validated": txt2img_validation,
@@ -908,6 +919,18 @@ mod tests {
         .to_string();
 
         assert!(error.contains("--negative-prompt"));
+    }
+
+    #[test]
+    fn generation_runtime_options_select_cpu_or_rocm() {
+        assert_eq!(
+            generation_runtime_options(None),
+            DiffusionGenerationRuntimeOptions::cpu_reference()
+        );
+        assert_eq!(
+            generation_runtime_options(Some(2)),
+            DiffusionGenerationRuntimeOptions::rocm_hybrid(2)
+        );
     }
 
     #[test]
