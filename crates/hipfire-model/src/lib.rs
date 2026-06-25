@@ -694,7 +694,10 @@ pub fn detect_sidecars(path: &Path) -> Sidecars {
                     .unwrap_or(false)
             };
             nonempty(v.get("chat_template"))
-                || nonempty(v.get("tokenizer_config").and_then(|tc| tc.get("chat_template")))
+                || nonempty(
+                    v.get("tokenizer_config")
+                        .and_then(|tc| tc.get("chat_template")),
+                )
         })
         .unwrap_or(false);
 
