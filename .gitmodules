@@ -4,3 +4,6 @@
 [submodule "third_party/fsr4-rdna3-optimization"]
 	path = third_party/fsr4-rdna3-optimization
 	url = https://github.com/lhl/fsr4-rdna3-optimization.git
+[submodule "third_party/graphify"]
+	path = third_party/graphify
+	url = https://github.com/safishamsi/graphify.git
