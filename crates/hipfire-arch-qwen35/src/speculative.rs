@@ -2478,7 +2478,25 @@ fn verify_dflash_block_inner(
         }
     }
     let tree_ok_for_graph = !tree_verify_present || tree_graph_enabled;
+    // The captured single-chunk verify forward refuses Q8 (non-asym) KV once
+    // physical_cap exceeds the LDS-resident context limit: its long-context flash
+    // path would `hip.malloc` + `memcpy_htod` inside the captured region (illegal
+    // under stream capture, and it bakes max_ctx_len = physical_cap into the LDS
+    // scalar regardless of the actual decode length), so it returns an error every
+    // cycle — see `forward_prefill_batch_single_chunk_captured` in qwen35.rs. The
+    // caller used to propagate that error and fail the whole decode. Detect the
+    // exact unsupported combination here and SKIP the graph path so verify falls
+    // through to the uncaptured forward (which handles long-context Q8 fine). Asym
+    // KV and physical_cap within the limit stay capture-safe and keep the
+    // verify-graph speedup on every arch. Keep this threshold in sync with
+    // LDS_CTX_LIMIT in qwen35.rs.
+    const VERIFY_GRAPH_Q8_CTX_LIMIT: usize = 15000;
+    let kv = &target.kv_cache;
+    let captured_forward_supports_kv = !(kv.quant_q8
+        && !(kv.quant_asym2 || kv.quant_asym3 || kv.quant_asym4)
+        && kv.physical_cap > VERIFY_GRAPH_Q8_CTX_LIMIT);
     let verify_graph_ok = std::env::var("HIPFIRE_VERIFY_GRAPH").ok().as_deref() != Some("0")
+        && captured_forward_supports_kv
         && tree_ok_for_graph
         && matches!(
             target.weights.embd_format,
