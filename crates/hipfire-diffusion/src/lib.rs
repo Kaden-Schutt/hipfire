@@ -13337,7 +13337,7 @@ fn expand_rgb_batch_for_prompts(
     })
 }
 
-fn resize_rgb_batch_nearest(
+pub fn resize_rgb_batch_nearest(
     image: &RgbImageBatch,
     target_width: u32,
     target_height: u32,
@@ -13351,6 +13351,11 @@ fn resize_rgb_batch_nearest(
     if target_width == 0 || target_height == 0 {
         return Err(DiffusionError::InvalidRequest(
             "target image dimensions must be positive".to_string(),
+        ));
+    }
+    if image.width == 0 || image.height == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "source image dimensions must be positive".to_string(),
         ));
     }
     let source_bytes = image
@@ -13391,6 +13396,109 @@ fn resize_rgb_batch_nearest(
                 data[target_idx..target_idx + 3]
                     .copy_from_slice(&image.data[source_idx..source_idx + 3]);
             }
+        }
+    }
+    Ok(RgbImageBatch {
+        batch: image.batch,
+        width: target_width,
+        height: target_height,
+        data,
+    })
+}
+
+pub fn resize_rgb_batch_to_cover_nearest(
+    image: &RgbImageBatch,
+    target_width: u32,
+    target_height: u32,
+) -> DiffusionResult<RgbImageBatch> {
+    let target_width = usize::try_from(target_width).map_err(|_| {
+        DiffusionError::InvalidRequest("target image width does not fit usize".to_string())
+    })?;
+    let target_height = usize::try_from(target_height).map_err(|_| {
+        DiffusionError::InvalidRequest("target image height does not fit usize".to_string())
+    })?;
+    if target_width == 0 || target_height == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "target image dimensions must be positive".to_string(),
+        ));
+    }
+    if image.width == 0 || image.height == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "source image dimensions must be positive".to_string(),
+        ));
+    }
+
+    let source_w = image.width as u128;
+    let source_h = image.height as u128;
+    let target_w = target_width as u128;
+    let target_h = target_height as u128;
+    let (cover_width, cover_height) = if source_w * target_h < target_w * source_h {
+        let height = ((target_w * source_h) / source_w).max(target_h);
+        (target_w, height)
+    } else {
+        let width = ((target_h * source_w) / source_h).max(target_w);
+        (width, target_h)
+    };
+    let cover_width_u32 = u32::try_from(cover_width).map_err(|_| {
+        DiffusionError::InvalidRequest("cover image width is out of range".to_string())
+    })?;
+    let cover_height_u32 = u32::try_from(cover_height).map_err(|_| {
+        DiffusionError::InvalidRequest("cover image height is out of range".to_string())
+    })?;
+    let resized = resize_rgb_batch_nearest(image, cover_width_u32, cover_height_u32)?;
+    crop_rgb_batch_center(&resized, target_width, target_height)
+}
+
+fn crop_rgb_batch_center(
+    image: &RgbImageBatch,
+    target_width: usize,
+    target_height: usize,
+) -> DiffusionResult<RgbImageBatch> {
+    if target_width == 0 || target_height == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "target image dimensions must be positive".to_string(),
+        ));
+    }
+    if target_width > image.width || target_height > image.height {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "cannot crop image {}x{} to larger target {}x{}",
+            image.width, image.height, target_width, target_height
+        )));
+    }
+    let source_bytes = image
+        .batch
+        .checked_mul(image.width)
+        .and_then(|pixels| pixels.checked_mul(image.height))
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| DiffusionError::InvalidRequest("image dimensions overflow".to_string()))?;
+    if image.data.len() != source_bytes {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "RGB image batch has {} bytes, expected {source_bytes}",
+            image.data.len()
+        )));
+    }
+    if image.width == target_width && image.height == target_height {
+        return Ok(image.clone());
+    }
+    let source_x = (image.width - target_width) / 2;
+    let source_y = (image.height - target_height) / 2;
+    let target_image_bytes = target_width
+        .checked_mul(target_height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| {
+            DiffusionError::InvalidRequest("target image dimensions overflow".to_string())
+        })?;
+    let mut data = vec![0u8; image.batch * target_image_bytes];
+    let source_image_bytes = image.width * image.height * 3;
+    for batch_idx in 0..image.batch {
+        let source_batch_offset = batch_idx * source_image_bytes;
+        let target_batch_offset = batch_idx * target_image_bytes;
+        for y in 0..target_height {
+            let source_row = source_batch_offset + ((source_y + y) * image.width + source_x) * 3;
+            let target_row = target_batch_offset + y * target_width * 3;
+            let bytes = target_width * 3;
+            data[target_row..target_row + bytes]
+                .copy_from_slice(&image.data[source_row..source_row + bytes]);
         }
     }
     Ok(RgbImageBatch {
@@ -19570,6 +19678,36 @@ mod tests {
                 70, 80, 90, 70, 80, 90, //
                 100, 110, 120, 100, 110, 120, //
                 100, 110, 120, 100, 110, 120,
+            ]
+        );
+    }
+
+    #[test]
+    fn rgb_batch_resize_to_cover_center_crops_aspect_mismatch() {
+        let image = RgbImageBatch {
+            batch: 1,
+            width: 2,
+            height: 4,
+            data: vec![
+                10, 10, 10, 10, 10, 10, //
+                20, 20, 20, 20, 20, 20, //
+                30, 30, 30, 30, 30, 30, //
+                40, 40, 40, 40, 40, 40, //
+            ],
+        };
+
+        let resized = resize_rgb_batch_to_cover_nearest(&image, 4, 4).unwrap();
+
+        assert_eq!(resized.batch, 1);
+        assert_eq!(resized.width, 4);
+        assert_eq!(resized.height, 4);
+        assert_eq!(
+            resized.data,
+            vec![
+                20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, //
+                20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, //
+                30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, //
+                30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, //
             ]
         );
     }

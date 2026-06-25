@@ -9,9 +9,10 @@ use clap::{Args, Subcommand};
 #[cfg(feature = "rocm")]
 use hipfire_diffusion::DiffusionHipRuntimeOptions;
 use hipfire_diffusion::{
-    import_diffusers_to_hfq, inspect_hfq_with_runtime_support, DiffusersImportOptions,
-    DiffusionBatchRequest, DiffusionGenerationRuntimeOptions, DiffusionHfqInspection,
-    DiffusionImg2ImgRequest, DiffusionPipeline, DiffusionPrompt, RgbImageBatch,
+    import_diffusers_to_hfq, inspect_hfq_with_runtime_support, resize_rgb_batch_to_cover_nearest,
+    DiffusersImportOptions, DiffusionBatchRequest, DiffusionGenerationRuntimeOptions,
+    DiffusionHfqInspection, DiffusionImg2ImgRequest, DiffusionPipeline, DiffusionPrompt,
+    RgbImageBatch,
 };
 use serde::Serialize;
 
@@ -480,6 +481,13 @@ fn generate_highres_txt2img(
         args.hr_resize_x,
         args.hr_resize_y,
     )?;
+    let init_image = highres_second_pass_init_image(
+        init_image,
+        target_width,
+        target_height,
+        args.hr_resize_x,
+        args.hr_resize_y,
+    )?;
     let mut second_pass_batch = first_pass_request;
     second_pass_batch.width = target_width;
     second_pass_batch.height = target_height;
@@ -516,6 +524,24 @@ fn generate_highres_txt2img(
         );
     }
     Ok(output)
+}
+
+fn highres_second_pass_init_image(
+    init_image: RgbImageBatch,
+    target_width: u32,
+    target_height: u32,
+    hr_resize_x: Option<u32>,
+    hr_resize_y: Option<u32>,
+) -> anyhow::Result<RgbImageBatch> {
+    if hr_resize_x.unwrap_or(0) > 0 && hr_resize_y.unwrap_or(0) > 0 {
+        Ok(resize_rgb_batch_to_cover_nearest(
+            &init_image,
+            target_width,
+            target_height,
+        )?)
+    } else {
+        Ok(init_image)
+    }
 }
 
 fn highres_first_pass_dimensions(
@@ -1224,6 +1250,31 @@ mod tests {
             (6, 3)
         );
         assert!(highres_first_pass_dimensions(0, 2, Some(8), None).is_err());
+    }
+
+    #[test]
+    fn highres_second_pass_init_image_cover_crops_exact_resize() {
+        let image = RgbImageBatch {
+            batch: 1,
+            width: 2,
+            height: 4,
+            data: vec![
+                10, 10, 10, 10, 10, 10, //
+                20, 20, 20, 20, 20, 20, //
+                30, 30, 30, 30, 30, 30, //
+                40, 40, 40, 40, 40, 40, //
+            ],
+        };
+
+        let cropped =
+            highres_second_pass_init_image(image.clone(), 4, 4, Some(4), Some(4)).unwrap();
+        assert_eq!(cropped.width, 4);
+        assert_eq!(cropped.height, 4);
+        assert_eq!(&cropped.data[..12], &[20u8; 12]);
+        assert_eq!(&cropped.data[24..36], &[30u8; 12]);
+
+        let unchanged = highres_second_pass_init_image(image.clone(), 4, 8, Some(4), None).unwrap();
+        assert_eq!(unchanged, image);
     }
 
     #[test]

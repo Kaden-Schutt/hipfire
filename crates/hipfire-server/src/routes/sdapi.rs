@@ -6,9 +6,10 @@ use axum::{
 use base64::Engine;
 use hipfire_config::models_dir;
 use hipfire_diffusion::{
-    inspect_hfq, inspect_hfq_with_runtime_support, DiffusionBatchOutput, DiffusionBatchRequest,
-    DiffusionError, DiffusionGenerationRuntimeOptions, DiffusionHfqInspection,
-    DiffusionImg2ImgRequest, DiffusionPipeline, DiffusionProgress, DiffusionPrompt, RgbImageBatch,
+    inspect_hfq, inspect_hfq_with_runtime_support, resize_rgb_batch_to_cover_nearest,
+    DiffusionBatchOutput, DiffusionBatchRequest, DiffusionError, DiffusionGenerationRuntimeOptions,
+    DiffusionHfqInspection, DiffusionImg2ImgRequest, DiffusionPipeline, DiffusionProgress,
+    DiffusionPrompt, RgbImageBatch,
 };
 use image::ImageEncoder;
 use serde::{Deserialize, Serialize};
@@ -420,7 +421,11 @@ async fn execute_hfq_diffusion_txt2img(
                 continue;
             };
 
-            let first_pass_images = decode_sd_init_images(&first_output.images)?;
+            let first_pass_images = sdapi_highres_second_pass_init_images(
+                &worker_body,
+                decode_sd_init_images(&first_output.images)?,
+                target_dimensions,
+            )?;
             let highres_body = sdapi_highres_second_pass_body(&worker_body, target_dimensions);
             let highres_batch = sd_request_to_diffusion_batch_request(
                 &highres_body,
@@ -1413,6 +1418,18 @@ fn sdapi_highres_second_pass_body(
         highres_body.sampler_name = Some(sampler.to_string());
     }
     highres_body
+}
+
+fn sdapi_highres_second_pass_init_images(
+    body: &SdGenerationRequest,
+    init_images: RgbImageBatch,
+    target_dimensions: (u32, u32),
+) -> Result<RgbImageBatch, DiffusionError> {
+    if body.hr_resize_x.unwrap_or(0) > 0 && body.hr_resize_y.unwrap_or(0) > 0 {
+        resize_rgb_batch_to_cover_nearest(&init_images, target_dimensions.0, target_dimensions.1)
+    } else {
+        Ok(init_images)
+    }
 }
 
 fn sdapi_validate_highres_checkpoint(
@@ -3808,6 +3825,43 @@ mod tests {
         let first_pass = sdapi_txt2img_first_pass_body(&disabled).unwrap();
         assert_eq!(first_pass.width, Some(4));
         assert_eq!(first_pass.height, Some(2));
+    }
+
+    #[test]
+    fn txt2img_highres_second_pass_init_images_cover_crop_exact_resize() {
+        let image = RgbImageBatch {
+            batch: 1,
+            width: 2,
+            height: 4,
+            data: vec![
+                10, 10, 10, 10, 10, 10, //
+                20, 20, 20, 20, 20, 20, //
+                30, 30, 30, 30, 30, 30, //
+                40, 40, 40, 40, 40, 40, //
+            ],
+        };
+        let exact_resize = SdGenerationRequest {
+            enable_hr: Some(true),
+            hr_resize_x: Some(4),
+            hr_resize_y: Some(4),
+            ..empty_request()
+        };
+
+        let cropped =
+            sdapi_highres_second_pass_init_images(&exact_resize, image.clone(), (4, 4)).unwrap();
+        assert_eq!(cropped.width, 4);
+        assert_eq!(cropped.height, 4);
+        assert_eq!(&cropped.data[..12], &[20u8; 12]);
+        assert_eq!(&cropped.data[24..36], &[30u8; 12]);
+
+        let width_only = SdGenerationRequest {
+            enable_hr: Some(true),
+            hr_resize_x: Some(4),
+            ..empty_request()
+        };
+        let unchanged =
+            sdapi_highres_second_pass_init_images(&width_only, image.clone(), (4, 8)).unwrap();
+        assert_eq!(unchanged, image);
     }
 
     #[test]
