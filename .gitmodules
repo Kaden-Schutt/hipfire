@@ -6,7 +6,7 @@
 	url = https://github.com/lhl/fsr4-rdna3-optimization.git
 [submodule "third_party/graphify"]
 	path = third_party/graphify
-	url = https://github.com/safishamsi/graphify.git
+	url = https://github.com/xynexus/graphify.git
 [submodule "third_party/heretic"]
 	path = third_party/heretic
 	url = https://github.com/p-e-w/heretic.git
