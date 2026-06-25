@@ -225,6 +225,10 @@ UNet norm, activation, and conv output, plus final VAE decode graph execution
 and decoded tensor-to-RGB conversion for both modes, img2img/inpaint RGB-to-VAE
 tensor conversion, VAE encode graph execution, VAE moments-to-latents scaling,
 latent mask downsampling, masked RGB preparation, and final latent mask blending.
+Denoise-loop vector stages now share one generation-scoped ROCm context instead
+of initializing a device handle for each model-input scaling, guidance, and
+scheduler step operation; CLIP, UNet, and VAE tensor graph stages still use the
+hybrid tensor-boundary path.
 The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128,
 HFQ4G256, and HFQ6G256 tensor payloads even when the artifact `weight_format`
 records a future quantized format such as `oq4`; OQ/MQ/HFP and other packed

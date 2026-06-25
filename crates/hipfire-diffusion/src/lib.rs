@@ -201,6 +201,59 @@ impl DiffusionGenerationRuntimeOptions {
     }
 }
 
+struct DiffusionGenerationRuntimeContext {
+    options: DiffusionGenerationRuntimeOptions,
+    #[cfg(feature = "rocm")]
+    rocm_gpu: Option<rdna_compute::Gpu>,
+    #[cfg(feature = "rocm")]
+    rocm_gpu_init_count: usize,
+}
+
+impl DiffusionGenerationRuntimeContext {
+    fn new(options: DiffusionGenerationRuntimeOptions) -> Self {
+        Self {
+            options,
+            #[cfg(feature = "rocm")]
+            rocm_gpu: None,
+            #[cfg(feature = "rocm")]
+            rocm_gpu_init_count: 0,
+        }
+    }
+
+    fn rocm_device_id(&self) -> Option<i32> {
+        self.options.rocm_device_id
+    }
+
+    #[cfg(feature = "rocm")]
+    fn with_rocm_gpu<T>(
+        &mut self,
+        f: impl FnOnce(&mut rdna_compute::Gpu) -> DiffusionResult<T>,
+    ) -> DiffusionResult<T> {
+        let Some(device_id) = self.options.rocm_device_id else {
+            return Err(DiffusionError::BackendUnavailable(
+                "ROCm runtime context was requested without a device id".to_string(),
+            ));
+        };
+        if self.rocm_gpu.is_none() {
+            let gpu = rdna_compute::Gpu::init_with_device(device_id)
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            self.rocm_gpu = Some(gpu);
+            self.rocm_gpu_init_count += 1;
+        }
+        let gpu = self.rocm_gpu.as_mut().ok_or_else(|| {
+            DiffusionError::BackendUnavailable(
+                "ROCm runtime context failed to retain initialized GPU".to_string(),
+            )
+        })?;
+        f(gpu)
+    }
+
+    #[cfg(all(feature = "rocm", test))]
+    fn rocm_gpu_init_count(&self) -> usize {
+        self.rocm_gpu_init_count
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffusionHipMemoryPlan {
     pub latent_shape: DiffusionLatentShape,
@@ -1676,12 +1729,13 @@ fn denoise_latents_with_cfg_progress_and_runtime_options(
     }
     let mut scheduler_state = SchedulerStepState::default();
     let mut runtime_kind = DiffusionRuntimeKind::CpuSourceReference;
+    let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
     for step in 0..schedule.timesteps.len() {
-        let (sample, scale_runtime_kind) = scale_model_input_with_runtime_options(
+        let (sample, scale_runtime_kind) = scale_model_input_with_runtime_context(
             schedule,
             &latents.as_nchw_tensor(),
             step,
-            runtime_options,
+            &mut runtime_context,
         )?;
         runtime_kind = merge_runtime_kind(runtime_kind, scale_runtime_kind);
         let model_sample = if let Some(inpaint_conditioning) = inpaint_conditioning {
@@ -1705,20 +1759,20 @@ fn denoise_latents_with_cfg_progress_and_runtime_options(
         )?;
         validate_noise_prediction(&latents, &negative_pred)?;
         validate_noise_prediction(&latents, &positive_pred)?;
-        let (guided, guidance_runtime_kind) = cfg_guidance_with_runtime_options(
+        let (guided, guidance_runtime_kind) = cfg_guidance_with_runtime_context(
             &negative_pred,
             &positive_pred,
             cfg_scale,
-            runtime_options,
+            &mut runtime_context,
         )?;
         runtime_kind = merge_runtime_kind(runtime_kind, guidance_runtime_kind);
-        let step_runtime_kind = scheduler_step_with_runtime_options(
+        let step_runtime_kind = scheduler_step_with_runtime_context(
             schedule,
             &mut latents,
             &guided.data,
             step,
             &mut scheduler_state,
-            runtime_options,
+            &mut runtime_context,
         )?;
         runtime_kind = merge_runtime_kind(runtime_kind, step_runtime_kind);
         if let Some(masked_reference) = masked_reference {
@@ -1947,13 +2001,13 @@ fn rocm_hybrid_unavailable_error() -> DiffusionError {
     )
 }
 
-fn scale_model_input_with_runtime_options(
+fn scale_model_input_with_runtime_context(
     schedule: &DiffusionSchedule,
     sample: &CpuTensor,
     step: usize,
-    runtime_options: DiffusionGenerationRuntimeOptions,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<(CpuTensor, DiffusionRuntimeKind)> {
-    let Some(device_id) = runtime_options.rocm_device_id else {
+    let Some(_device_id) = runtime_context.rocm_device_id() else {
         return Ok((
             schedule.scale_model_input(sample, step)?,
             DiffusionRuntimeKind::CpuSourceReference,
@@ -1970,9 +2024,8 @@ fn scale_model_input_with_runtime_options(
                     DiffusionError::InvalidRequest(format!("missing sigma for step {step}"))
                 })?;
                 let scale = (sigma * sigma + 1.0).sqrt().recip();
-                let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
-                    .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-                let data = scale_model_input_hip_on_gpu(&mut gpu, &sample.data, scale)?;
+                let data = runtime_context
+                    .with_rocm_gpu(|gpu| scale_model_input_hip_on_gpu(gpu, &sample.data, scale))?;
                 Ok((
                     CpuTensor {
                         shape: sample.shape.clone(),
@@ -1983,20 +2036,20 @@ fn scale_model_input_with_runtime_options(
             }
             #[cfg(not(feature = "rocm"))]
             {
-                let _ = device_id;
+                let _ = _device_id;
                 Err(rocm_hybrid_unavailable_error())
             }
         }
     }
 }
 
-fn cfg_guidance_with_runtime_options(
+fn cfg_guidance_with_runtime_context(
     negative_pred: &CpuTensor,
     positive_pred: &CpuTensor,
     cfg_scale: f32,
-    runtime_options: DiffusionGenerationRuntimeOptions,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<(CpuTensor, DiffusionRuntimeKind)> {
-    let Some(device_id) = runtime_options.rocm_device_id else {
+    let Some(_device_id) = runtime_context.rocm_device_id() else {
         return Ok((
             cfg_guidance(negative_pred, positive_pred, cfg_scale)?,
             DiffusionRuntimeKind::CpuSourceReference,
@@ -2010,14 +2063,9 @@ fn cfg_guidance_with_runtime_options(
     }
     #[cfg(feature = "rocm")]
     {
-        let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-        let data = cfg_guidance_hip_on_gpu(
-            &mut gpu,
-            &negative_pred.data,
-            &positive_pred.data,
-            cfg_scale,
-        )?;
+        let data = runtime_context.with_rocm_gpu(|gpu| {
+            cfg_guidance_hip_on_gpu(gpu, &negative_pred.data, &positive_pred.data, cfg_scale)
+        })?;
         Ok((
             CpuTensor {
                 shape: negative_pred.shape.clone(),
@@ -2028,20 +2076,20 @@ fn cfg_guidance_with_runtime_options(
     }
     #[cfg(not(feature = "rocm"))]
     {
-        let _ = device_id;
+        let _ = _device_id;
         Err(rocm_hybrid_unavailable_error())
     }
 }
 
-fn scheduler_step_with_runtime_options(
+fn scheduler_step_with_runtime_context(
     schedule: &DiffusionSchedule,
     latents: &mut LatentBatch,
     noise_pred: &[f32],
     step: usize,
     state: &mut SchedulerStepState,
-    runtime_options: DiffusionGenerationRuntimeOptions,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<DiffusionRuntimeKind> {
-    let Some(device_id) = runtime_options.rocm_device_id else {
+    let Some(_device_id) = runtime_context.rocm_device_id() else {
         schedule.step(latents, noise_pred, step, state)?;
         return Ok(DiffusionRuntimeKind::CpuSourceReference);
     };
@@ -2064,21 +2112,21 @@ fn scheduler_step_with_runtime_options(
         let next_sigma = *schedule.sigmas.get(step + 1).ok_or_else(|| {
             DiffusionError::InvalidRequest(format!("missing next sigma for step {step}"))
         })?;
-        let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-        latents.data = euler_step_hip_on_gpu(
-            &mut gpu,
-            &latents.data,
-            noise_pred,
-            sigma,
-            next_sigma,
-            schedule.prediction_type,
-        )?;
+        latents.data = runtime_context.with_rocm_gpu(|gpu| {
+            euler_step_hip_on_gpu(
+                gpu,
+                &latents.data,
+                noise_pred,
+                sigma,
+                next_sigma,
+                schedule.prediction_type,
+            )
+        })?;
         Ok(DiffusionRuntimeKind::RocmHybridReference)
     }
     #[cfg(not(feature = "rocm"))]
     {
-        let _ = device_id;
+        let _ = _device_id;
         Err(rocm_hybrid_unavailable_error())
     }
 }
@@ -18306,6 +18354,75 @@ mod tests {
         assert_eq!(hip.latents.height, cpu.latents.height);
         assert_eq!(hip.latents.width, cpu.latents.width);
         assert!(f32_slices_close(&hip.latents.data, &cpu.latents.data, 1e-5));
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn hip_denoise_vector_runtime_context_reuses_single_gpu() {
+        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+            eprintln!("skip: ROCm GPU unavailable for denoise context reuse test: {error}");
+            return;
+        }
+        let schedule = DiffusionSchedule {
+            timesteps: vec![1.0],
+            sigmas: vec![1.0, 0.5],
+            prediction_type: SchedulerPredictionType::Epsilon,
+            input_scaling: SchedulerInputScaling::Sigma,
+            solver: SchedulerSolver::Euler,
+            train_timesteps: Vec::new(),
+            alpha_t: Vec::new(),
+            sigma_t: Vec::new(),
+            lambda_t: Vec::new(),
+        };
+        let sample = CpuTensor {
+            shape: vec![1, 1, 2, 2],
+            data: vec![-0.75, -0.25, 0.5, 1.25],
+        };
+        let negative_pred = CpuTensor {
+            shape: sample.shape.clone(),
+            data: vec![0.1, -0.2, 0.3, -0.4],
+        };
+        let positive_pred = CpuTensor {
+            shape: sample.shape.clone(),
+            data: vec![0.4, -0.1, 0.6, -0.2],
+        };
+        let mut latents = LatentBatch {
+            batch: 1,
+            channels: 1,
+            height: 2,
+            width: 2,
+            data: sample.data.clone(),
+        };
+        let mut scheduler_state = SchedulerStepState::default();
+        let mut runtime_context = DiffusionGenerationRuntimeContext::new(
+            DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
+        );
+
+        let (_scaled, scale_kind) =
+            scale_model_input_with_runtime_context(&schedule, &sample, 0, &mut runtime_context)
+                .unwrap();
+        let (guided, guidance_kind) = cfg_guidance_with_runtime_context(
+            &negative_pred,
+            &positive_pred,
+            2.0,
+            &mut runtime_context,
+        )
+        .unwrap();
+        let step_kind = scheduler_step_with_runtime_context(
+            &schedule,
+            &mut latents,
+            &guided.data,
+            0,
+            &mut scheduler_state,
+            &mut runtime_context,
+        )
+        .unwrap();
+
+        assert_eq!(scale_kind, DiffusionRuntimeKind::RocmHybridReference);
+        assert_eq!(guidance_kind, DiffusionRuntimeKind::RocmHybridReference);
+        assert_eq!(step_kind, DiffusionRuntimeKind::RocmHybridReference);
+        assert_eq!(runtime_context.rocm_gpu_init_count(), 1);
+        assert!(latents.data.iter().all(|value| value.is_finite()));
     }
 
     #[cfg(feature = "rocm")]
