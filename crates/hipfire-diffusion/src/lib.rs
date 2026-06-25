@@ -230,6 +230,7 @@ pub struct DiffusionHipPreflight {
     pub scheduler_kernel_probe: DiffusionHipKernelProbe,
     pub center_unet_input_kernel_probe: DiffusionHipKernelProbe,
     pub timestep_embedding_kernel_probe: DiffusionHipKernelProbe,
+    pub clip_token_position_embedding_kernel_probe: DiffusionHipKernelProbe,
     pub tensor_add_kernel_probe: DiffusionHipKernelProbe,
     pub add_channel_bias_kernel_probe: DiffusionHipKernelProbe,
     pub nchw_to_bsc_kernel_probe: DiffusionHipKernelProbe,
@@ -2231,6 +2232,71 @@ fn quick_gelu_with_runtime_options(
     }
 }
 
+fn clip_token_position_embeddings(
+    token_embedding: &CpuTensor,
+    position_embedding: &CpuTensor,
+    tokens: &[u32],
+) -> DiffusionResult<CpuTensor> {
+    let (vocab, hidden) = token_embedding.rows_cols()?;
+    let (max_positions, position_hidden) = position_embedding.rows_cols()?;
+    if position_hidden != hidden {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "CLIP position embedding hidden size {position_hidden} != token hidden size {hidden}"
+        )));
+    }
+    if tokens.len() > max_positions {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "CLIP token length {} exceeds position embedding length {max_positions}",
+            tokens.len()
+        )));
+    }
+    let seq = tokens.len();
+    let mut x = CpuTensor::zeros(&[seq, hidden]);
+    for (pos, &token) in tokens.iter().enumerate() {
+        let token = token as usize;
+        if token >= vocab {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "CLIP token id {token} exceeds vocab {vocab}"
+            )));
+        }
+        let dst = pos * hidden;
+        let token_src = token * hidden;
+        let pos_src = pos * hidden;
+        for col in 0..hidden {
+            x.data[dst + col] =
+                token_embedding.data[token_src + col] + position_embedding.data[pos_src + col];
+        }
+    }
+    Ok(x)
+}
+
+fn clip_token_position_embeddings_with_runtime_options(
+    token_embedding: &CpuTensor,
+    position_embedding: &CpuTensor,
+    tokens: &[u32],
+    runtime_options: DiffusionGenerationRuntimeOptions,
+) -> DiffusionResult<CpuTensor> {
+    let Some(device_id) = runtime_options.rocm_device_id else {
+        return clip_token_position_embeddings(token_embedding, position_embedding, tokens);
+    };
+    #[cfg(feature = "rocm")]
+    {
+        let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+        clip_token_position_embeddings_hip_on_gpu(
+            &mut gpu,
+            token_embedding,
+            position_embedding,
+            tokens,
+        )
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = device_id;
+        Err(rocm_hybrid_unavailable_error())
+    }
+}
+
 fn tensor_add_with_runtime_options(
     a: &CpuTensor,
     b: &CpuTensor,
@@ -3715,6 +3781,51 @@ impl DiffusionPipeline {
                 "HIP diffusion QuickGELU kernel output differed from CPU reference".to_string(),
             ));
         }
+        let clip_token_embedding_probe = CpuTensor {
+            shape: vec![4, 3],
+            data: (0..12)
+                .map(|idx| idx as f32 / 10.0 - 0.4)
+                .collect::<Vec<_>>(),
+        };
+        let clip_position_embedding_probe = CpuTensor {
+            shape: vec![3, 3],
+            data: (0..9)
+                .map(|idx| (idx as f32 % 5.0 - 2.0) / 7.0)
+                .collect::<Vec<_>>(),
+        };
+        let clip_token_probe = vec![0, 3, 1];
+        let clip_token_position_embedding_cpu_reference = clip_token_position_embeddings(
+            &clip_token_embedding_probe,
+            &clip_position_embedding_probe,
+            &clip_token_probe,
+        )?;
+        let clip_token_position_embedding_gpu_output = clip_token_position_embeddings_hip_on_gpu(
+            &mut gpu,
+            &clip_token_embedding_probe,
+            &clip_position_embedding_probe,
+            &clip_token_probe,
+        )?;
+        let clip_token_position_embedding_kernel_probe = DiffusionHipKernelProbe {
+            name: "diffusion_clip_token_position_embedding_f32".to_string(),
+            input_elements: clip_token_embedding_probe.data.len()
+                + clip_position_embedding_probe.data.len()
+                + clip_token_probe.len(),
+            output_bytes: clip_token_position_embedding_gpu_output.data.len()
+                * std::mem::size_of::<f32>(),
+            matched_cpu_reference: clip_token_position_embedding_gpu_output.shape
+                == clip_token_position_embedding_cpu_reference.shape
+                && f32_slices_close(
+                    &clip_token_position_embedding_gpu_output.data,
+                    &clip_token_position_embedding_cpu_reference.data,
+                    1e-6,
+                ),
+        };
+        if !clip_token_position_embedding_kernel_probe.matched_cpu_reference {
+            return Err(DiffusionError::BackendUnavailable(
+                "HIP diffusion CLIP token-position embedding kernel output differed from CPU reference"
+                    .to_string(),
+            ));
+        }
         let upsample_input = CpuTensor {
             shape: vec![1, 2, 2, 3],
             data: (0..12)
@@ -4008,6 +4119,7 @@ impl DiffusionPipeline {
             group_norm_kernel_probe,
             silu_kernel_probe,
             quick_gelu_kernel_probe,
+            clip_token_position_embedding_kernel_probe,
             upsample_kernel_probe,
             linear_kernel_probe,
             layer_norm_kernel_probe,
@@ -7840,6 +7952,29 @@ extern "C" __global__ void diffusion_quick_gelu_f32(
 "#;
 
 #[cfg(feature = "rocm")]
+const DIFFUSION_CLIP_EMBEDDINGS_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void diffusion_clip_token_position_embedding_f32(
+    const float* token_embedding,
+    const float* position_embedding,
+    const unsigned int* tokens,
+    float* output,
+    int total_outputs,
+    int hidden
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_outputs) {
+        return;
+    }
+    int col = idx % hidden;
+    int pos = idx / hidden;
+    unsigned int token = tokens[pos];
+    output[idx] = token_embedding[token * hidden + col] + position_embedding[pos * hidden + col];
+}
+"#;
+
+#[cfg(feature = "rocm")]
 const DIFFUSION_UPSAMPLE_NEAREST2D_HIP_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 
@@ -10040,6 +10175,130 @@ fn quick_gelu_hip_on_gpu(
 }
 
 #[cfg(feature = "rocm")]
+fn clip_token_position_embeddings_hip_on_gpu(
+    gpu: &mut rdna_compute::Gpu,
+    token_embedding: &CpuTensor,
+    position_embedding: &CpuTensor,
+    tokens: &[u32],
+) -> DiffusionResult<CpuTensor> {
+    let (vocab, hidden) = token_embedding.rows_cols()?;
+    let (max_positions, position_hidden) = position_embedding.rows_cols()?;
+    if position_hidden != hidden {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "CLIP position embedding hidden size {position_hidden} != token hidden size {hidden}"
+        )));
+    }
+    if tokens.len() > max_positions {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "CLIP token length {} exceeds position embedding length {max_positions}",
+            tokens.len()
+        )));
+    }
+    for &token in tokens {
+        let token = token as usize;
+        if token >= vocab {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "CLIP token id {token} exceeds vocab {vocab}"
+            )));
+        }
+    }
+    let output_shape = [tokens.len(), hidden];
+    let output_elements =
+        checked_shape_elements("CLIP token-position embedding output", &output_shape)?;
+    if output_elements == 0 {
+        return Ok(CpuTensor::zeros(&output_shape));
+    }
+    let output_bytes = output_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata(
+                "CLIP token-position embedding output size overflows".to_string(),
+            )
+        })?;
+    let token_bytes = tokens
+        .iter()
+        .flat_map(|token| token.to_ne_bytes())
+        .collect::<Vec<_>>();
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let token_embedding_gpu = gpu
+        .upload_f32(&token_embedding.data, &token_embedding.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let position_embedding_gpu = gpu
+        .upload_f32(&position_embedding.data, &position_embedding.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let tokens_gpu = gpu
+        .upload_raw(&token_bytes, &[tokens.len()])
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = gpu
+        .hip
+        .malloc(output_bytes)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = compiler
+        .compile(
+            "diffusion_clip_token_position_embedding_f32",
+            DIFFUSION_CLIP_EMBEDDINGS_HIP_SRC,
+        )
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = obj_path
+        .to_str()
+        .ok_or_else(|| {
+            DiffusionError::BackendUnavailable(
+                "compiled diffusion CLIP embedding kernel path is not UTF-8".to_string(),
+            )
+        })?
+        .to_string();
+    let module = gpu
+        .hip
+        .module_load(&obj_path)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let function = gpu
+        .hip
+        .module_get_function(&module, "diffusion_clip_token_position_embedding_f32")
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(token_embedding_gpu.buf.as_ptr());
+    kernargs.push_ptr(position_embedding_gpu.buf.as_ptr());
+    kernargs.push_ptr(tokens_gpu.buf.as_ptr());
+    kernargs.push_ptr(output_gpu.as_ptr());
+    kernargs.push_i32(i32_kernel_dim(
+        "CLIP token-position embedding output elements",
+        output_elements,
+    )?);
+    kernargs.push_i32(i32_kernel_dim(
+        "CLIP token-position embedding hidden size",
+        hidden,
+    )?);
+    kernargs.pad_to(16);
+    let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+    unsafe {
+        gpu.hip
+            .launch_kernel_blob(
+                &function,
+                grid,
+                [256, 1, 1],
+                0,
+                gpu.active_stream.as_ref(),
+                kernargs.as_mut_slice(),
+            )
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(CpuTensor {
+        shape: output_shape.to_vec(),
+        data,
+    })
+}
+
+#[cfg(feature = "rocm")]
 fn upsample_nearest2d_nchw_hip_on_gpu(
     gpu: &mut rdna_compute::Gpu,
     input: &CpuTensor,
@@ -11356,24 +11615,19 @@ impl ClipTextEncoder {
                 self.max_length
             )));
         }
-        let h = self.hidden_size;
-        let seq = tokens.len();
-        let mut x = CpuTensor::zeros(&[seq, h]);
-        let vocab = self.token_embedding.shape[0];
-        for (pos, &token) in tokens.iter().enumerate() {
-            let token = token as usize;
-            if token >= vocab {
-                return Err(DiffusionError::InvalidRequest(format!(
-                    "CLIP token id {token} exceeds vocab {vocab}"
-                )));
-            }
-            let dst = pos * h;
-            let token_src = token * h;
-            let pos_src = pos * h;
-            for col in 0..h {
-                x.data[dst + col] = self.token_embedding.data[token_src + col]
-                    + self.position_embedding.data[pos_src + col];
-            }
+        let mut x = clip_token_position_embeddings_with_runtime_options(
+            &self.token_embedding,
+            &self.position_embedding,
+            tokens,
+            runtime_options,
+        )?;
+        if x.shape.as_slice() != [tokens.len(), self.hidden_size] {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "CLIP embedding output shape {:?} does not match [{}, {}]",
+                x.shape,
+                tokens.len(),
+                self.hidden_size
+            )));
         }
         for layer in &self.layers {
             x = layer.forward_with_runtime_options(&x, self.n_heads, runtime_options)?;
@@ -19424,6 +19678,68 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn hip_preflight_reports_clip_token_position_embedding_probe() {
+        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+            eprintln!("skip: ROCm GPU unavailable for diffusion preflight test: {error}");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-diffusion-preflight-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("tiny-preflight.hfq");
+        let metadata = tiny_runtime_metadata();
+        write_hfqm_package_mem(
+            &hfq_path,
+            HFQ_ARCH_DIFFUSION,
+            &serde_json::to_string(&metadata).unwrap(),
+            &tiny_complete_runtime_tensors(),
+        )
+        .unwrap();
+        let pipeline = DiffusionPipeline::open_hfq(&hfq_path).unwrap();
+        let request = DiffusionBatchRequest {
+            prompts: vec![DiffusionPrompt {
+                prompt: "a cat".into(),
+                negative_prompt: String::new(),
+                seed: 9,
+                subseed: None,
+            }],
+            width: 2,
+            height: 2,
+            original_width: None,
+            original_height: None,
+            target_width: None,
+            target_height: None,
+            crop_x: 0,
+            crop_y: 0,
+            steps: 1,
+            cfg_scale: 1.0,
+            scheduler: "Euler".into(),
+            subseed_strength: 0.0,
+            send_images: false,
+            save_images: false,
+        };
+
+        let preflight = pipeline
+            .preflight_hip_runtime(&request, DiffusionHipRuntimeOptions { device_id: 0 })
+            .unwrap();
+
+        assert_eq!(
+            preflight.clip_token_position_embedding_kernel_probe.name,
+            "diffusion_clip_token_position_embedding_f32"
+        );
+        assert!(
+            preflight
+                .clip_token_position_embedding_kernel_probe
+                .matched_cpu_reference
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn diffusion_pipeline_runs_quantized_metadata_with_float_tensor_payloads() {
         let dir = std::env::temp_dir().join(format!(
@@ -20500,6 +20816,39 @@ mod tests {
                 assert!(f32_slices_close(&hip.data, &encoded.data, 1e-5));
             }
         }
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn hip_clip_token_position_embeddings_match_cpu_reference() {
+        let token_embedding = CpuTensor {
+            shape: vec![4, 5],
+            data: (0..20).map(|idx| idx as f32 / 13.0 - 0.6).collect(),
+        };
+        let position_embedding = CpuTensor {
+            shape: vec![3, 5],
+            data: (0..15).map(|idx| (idx as f32 % 7.0 - 3.0) / 11.0).collect(),
+        };
+        let tokens = [3, 0, 2];
+        let cpu =
+            clip_token_position_embeddings(&token_embedding, &position_embedding, &tokens).unwrap();
+        let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!("skip: ROCm GPU unavailable for CLIP embedding routing test: {error}");
+                return;
+            }
+        };
+        let hip = clip_token_position_embeddings_hip_on_gpu(
+            &mut gpu,
+            &token_embedding,
+            &position_embedding,
+            &tokens,
+        )
+        .unwrap();
+
+        assert_eq!(hip.shape, cpu.shape);
+        assert!(f32_slices_close(&hip.data, &cpu.data, 1e-6));
     }
 
     #[test]
