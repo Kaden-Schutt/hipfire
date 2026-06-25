@@ -209,6 +209,7 @@ pub struct DiffusionHipPreflight {
     pub upsample_kernel_probe: DiffusionHipKernelProbe,
     pub linear_kernel_probe: DiffusionHipKernelProbe,
     pub layer_norm_kernel_probe: DiffusionHipKernelProbe,
+    pub softmax_kernel_probe: DiffusionHipKernelProbe,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2668,6 +2669,29 @@ impl DiffusionPipeline {
                 "HIP diffusion LayerNorm kernel output differed from CPU reference".to_string(),
             ));
         }
+        let softmax_input = CpuTensor {
+            shape: vec![3, 4],
+            data: vec![
+                1.0, 2.0, 3.0, 4.0, -2.0, -0.5, 0.25, 1.5, 10.0, 9.0, 8.0, 7.0,
+            ],
+        };
+        let mut softmax_cpu_reference = softmax_input.clone();
+        for row in softmax_cpu_reference.data.chunks_mut(4) {
+            softmax_in_place(row);
+        }
+        let softmax_gpu_output = softmax_rows_hip_on_gpu(&mut gpu, &softmax_input)?;
+        let softmax_kernel_probe = DiffusionHipKernelProbe {
+            name: "diffusion_softmax_rows_f32".to_string(),
+            input_elements: softmax_input.data.len(),
+            output_bytes: softmax_gpu_output.data.len() * std::mem::size_of::<f32>(),
+            matched_cpu_reference: softmax_gpu_output.shape == softmax_cpu_reference.shape
+                && f32_slices_close(&softmax_gpu_output.data, &softmax_cpu_reference.data, 1e-6),
+        };
+        if !softmax_kernel_probe.matched_cpu_reference {
+            return Err(DiffusionError::BackendUnavailable(
+                "HIP diffusion softmax kernel output differed from CPU reference".to_string(),
+            ));
+        }
 
         Ok(DiffusionHipPreflight {
             device_id: gpu.device_id,
@@ -2685,6 +2709,7 @@ impl DiffusionPipeline {
             upsample_kernel_probe,
             linear_kernel_probe,
             layer_norm_kernel_probe,
+            softmax_kernel_probe,
         })
     }
 
@@ -5588,6 +5613,40 @@ extern "C" __global__ void diffusion_layer_norm_f32(
 "#;
 
 #[cfg(feature = "rocm")]
+const DIFFUSION_SOFTMAX_ROWS_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void diffusion_softmax_rows_f32(
+    const float* input,
+    float* output,
+    int rows,
+    int cols
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) {
+        return;
+    }
+    int base = row * cols;
+    float max_value = input[base];
+    for (int col = 1; col < cols; ++col) {
+        max_value = fmaxf(max_value, input[base + col]);
+    }
+
+    float sum = 0.0f;
+    for (int col = 0; col < cols; ++col) {
+        float value = expf(input[base + col] - max_value);
+        output[base + col] = value;
+        sum += value;
+    }
+    if (sum > 0.0f) {
+        for (int col = 0; col < cols; ++col) {
+            output[base + col] /= sum;
+        }
+    }
+}
+"#;
+
+#[cfg(feature = "rocm")]
 fn rgb_tensor_to_u8_hip_on_gpu(
     gpu: &mut rdna_compute::Gpu,
     tensor: &CpuTensor,
@@ -6480,6 +6539,83 @@ fn layer_norm_hip_on_gpu(
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
     Ok(CpuTensor {
         shape: output_shape.to_vec(),
+        data,
+    })
+}
+
+#[cfg(feature = "rocm")]
+fn softmax_rows_hip_on_gpu(
+    gpu: &mut rdna_compute::Gpu,
+    input: &CpuTensor,
+) -> DiffusionResult<CpuTensor> {
+    let (rows, cols) = input.rows_cols()?;
+    let output_elements = checked_shape_elements("softmax output", &input.shape)?;
+    if output_elements == 0 {
+        return Ok(CpuTensor::zeros(&input.shape));
+    }
+    let output_bytes = output_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata("softmax output size overflows".to_string())
+        })?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let input_gpu = gpu
+        .upload_f32(&input.data, &input.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = gpu
+        .hip
+        .malloc(output_bytes)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = compiler
+        .compile("diffusion_softmax_rows_f32", DIFFUSION_SOFTMAX_ROWS_HIP_SRC)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = obj_path
+        .to_str()
+        .ok_or_else(|| {
+            DiffusionError::BackendUnavailable(
+                "compiled diffusion softmax kernel path is not UTF-8".to_string(),
+            )
+        })?
+        .to_string();
+    let module = gpu
+        .hip
+        .module_load(&obj_path)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let function = gpu
+        .hip
+        .module_get_function(&module, "diffusion_softmax_rows_f32")
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(input_gpu.buf.as_ptr());
+    kernargs.push_ptr(output_gpu.as_ptr());
+    kernargs.push_i32(i32_kernel_dim("softmax rows", rows)?);
+    kernargs.push_i32(i32_kernel_dim("softmax cols", cols)?);
+    kernargs.pad_to(16);
+    let grid = [((rows as u32).saturating_add(255)) / 256, 1, 1];
+    unsafe {
+        gpu.hip
+            .launch_kernel_blob(
+                &function,
+                grid,
+                [256, 1, 1],
+                0,
+                gpu.active_stream.as_ref(),
+                kernargs.as_mut_slice(),
+            )
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(CpuTensor {
+        shape: input.shape.clone(),
         data,
     })
 }
@@ -13494,6 +13630,42 @@ mod tests {
                 (actual - expected).abs() <= 1e-5,
                 "LayerNorm mismatch at {index}: hip={actual} cpu={expected}"
             );
+        }
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn hip_softmax_rows_matches_cpu_reference_when_gpu_is_available() {
+        let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!("skip: ROCm GPU unavailable for softmax kernel parity test: {error}");
+                return;
+            }
+        };
+        let input = CpuTensor {
+            shape: vec![4, 5],
+            data: vec![
+                1.0, 2.0, 3.0, 4.0, 5.0, -3.0, -1.0, -0.5, 0.25, 2.5, 10.0, 9.5, 8.0, 7.25, 6.0,
+                100.0, 99.0, 98.0, 97.0, 96.0,
+            ],
+        };
+        let mut cpu = input.clone();
+        for row in cpu.data.chunks_mut(5) {
+            softmax_in_place(row);
+        }
+        let hip = softmax_rows_hip_on_gpu(&mut gpu, &input).unwrap();
+
+        assert_eq!(hip.shape, cpu.shape);
+        for (index, (actual, expected)) in hip.data.iter().zip(&cpu.data).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1e-6,
+                "softmax mismatch at {index}: hip={actual} cpu={expected}"
+            );
+        }
+        for row in hip.data.chunks(5) {
+            let sum = row.iter().sum::<f32>();
+            assert!((sum - 1.0).abs() <= 1e-6, "softmax row sum {sum}");
         }
     }
 
