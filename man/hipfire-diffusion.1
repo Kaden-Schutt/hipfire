@@ -8,26 +8,19 @@ hipfire\-diffusion \- Import and inspect diffusion models stored as .hfq artifac
 .SH DESCRIPTION
 Import and inspect diffusion models stored as .hfq artifacts
 .PP
-Runnable .hfq diffusion artifacts currently use the native UNet-family CPU
-reference path for CLIP text conditioning, UNet denoising, VAE decode, and VAE
-encode for img2img. ROCm preflight validates planned device buffers plus
-individual kernels for model-input scaling, classifier-free guidance, Euler
-scheduler updates, centered UNet input, timestep embeddings, RGB-to-VAE tensor
-conversion, VAE moments-to-latents scaling, residual tensor add, NCHW
-channel-bias add, NCHW/BSC layout transforms, NCHW channel concat, 2D/3D
-last-dim concat, f32 NCHW Conv2D, f32 NCHW GroupNorm, SiLU, nearest-neighbor
-upsample, f32 dense linear projection, f32 LayerNorm, f32 row softmax, f32 3D
-scaled-dot-product attention, f32 CLIP causal self-attention, GeGLU gate, and
-RGB conversion, but full generation is not routed through a GPU UNet runtime
-yet. The runtime accepts Q4F16_G64, f16,
-bf16, f32, Q8F16, Q4_K, HFQ4G128, HFQ4G256, and HFQ6G256 tensor payloads even
-when the artifact weight_format records a future quantized format such as oq4;
-OQ/MQ/HFP and other packed payloads still require a matching diffusion
-dequantizer/HIP runtime before they can generate images.
+Runtime note: runnable `.hfq` diffusion artifacts still perform CLIP tokenization as host\-side setup. `txt2img`, `img2img`, and `smoke` can opt into `\-\-rocm\-device\-id` to route currently GPU\-backed generation boundaries through ROCm.
+.PP
+`hipfire serve` exposes the same hybrid path through the Stable Diffusion API extension fields `rocm_device_id` or `hipfire_rocm_device_id` on `/sdapi/v1/txt2img` and `/sdapi/v1/img2img` requests, through the same keys in `override_settings`, or through the persisted `/sdapi/v1/options` value `hipfire_rocm_device_id`.
+.PP
+`/sdapi/v1/progress` tracks active SDAPI sampling steps and returns the final generated PNG in `current_image` after a successful HFQ diffusion request completes. Live per\-step latent preview decoding is not implemented yet.
+.PP
+Img2img and inpaint resize init and mask images to the requested output dimensions before VAE encoding. Txt2img high\-res generation is implemented as a batched first\-pass txt2img generation followed by a second\-pass img2img generation at the high\-res target dimensions.
+.PP
+The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128, HFQ4G256, and HFQ6G256 tensor payloads. Other packed payloads require a matching diffusion dequantizer/runtime implementation.
 .SH OPTIONS
 .TP
 \fB\-h\fR, \fB\-\-help\fR
-Print help
+Print help (see a summary with \*(Aq\-h\*(Aq)
 .SH SUBCOMMANDS
 .TP
 hipfire\-diffusion\-import(1)

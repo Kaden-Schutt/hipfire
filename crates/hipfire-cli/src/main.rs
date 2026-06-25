@@ -36,6 +36,32 @@ enum Command {
     #[command(alias = "gpu-lock")]
     Lock(commands::lock::LockArgs),
     /// Import and inspect diffusion models stored as .hfq artifacts
+    ///
+    /// Runtime note: runnable `.hfq` diffusion artifacts still perform CLIP
+    /// tokenization as host-side setup. `txt2img`, `img2img`, and `smoke` can
+    /// opt into `--rocm-device-id` to route currently GPU-backed generation
+    /// boundaries through ROCm.
+    ///
+    /// `hipfire serve` exposes the same hybrid path through the Stable
+    /// Diffusion API extension fields `rocm_device_id` or
+    /// `hipfire_rocm_device_id` on `/sdapi/v1/txt2img` and
+    /// `/sdapi/v1/img2img` requests, through the same keys in
+    /// `override_settings`, or through the persisted `/sdapi/v1/options` value
+    /// `hipfire_rocm_device_id`.
+    ///
+    /// `/sdapi/v1/progress` tracks active SDAPI sampling steps and returns the
+    /// final generated PNG in `current_image` after a successful HFQ diffusion
+    /// request completes. Live per-step latent preview decoding is not
+    /// implemented yet.
+    ///
+    /// Img2img and inpaint resize init and mask images to the requested output
+    /// dimensions before VAE encoding. Txt2img high-res generation is
+    /// implemented as a batched first-pass txt2img generation followed by a
+    /// second-pass img2img generation at the high-res target dimensions.
+    ///
+    /// The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K,
+    /// HFQ4G128, HFQ4G256, and HFQ6G256 tensor payloads. Other packed payloads
+    /// require a matching diffusion dequantizer/runtime implementation.
     Diffusion(commands::diffusion::DiffusionArgs),
     /// Query the running hipfire admin API for scripts and agents
     #[command(alias = "op")]

@@ -202,74 +202,15 @@ Print lock status: "gpu is free" or "gpu BUSY: <holder>"
 
 Import and inspect diffusion models stored as .hfq artifacts
 
-Runtime note: runnable `.hfq` diffusion artifacts still perform CLIP
-tokenization as host-side setup. ROCm preflight can validate the planned device
-buffers plus individual diffusion
-kernels for model-input scaling, classifier-free guidance, Euler
-scheduler updates, centered UNet input, timestep embeddings, RGB-to-VAE tensor
-conversion, VAE moments-to-latents scaling, latent mask downsampling, masked RGB
-inpaint preparation, latent mask blending, residual tensor add, NCHW channel-bias
-add, NCHW/BSC layout transforms, NCHW channel concat, 2D/3D last-dim concat, f32
-NCHW Conv2D, f32 NCHW GroupNorm, SiLU, nearest-neighbor upsample, f32 dense
-linear projection, f32 LayerNorm, f32 row softmax, f32 3D
-scaled-dot-product attention, f32 CLIP token/position embedding lookup, f32 CLIP
-causal self-attention, GeGLU gate, QuickGELU, and RGB conversion, but full
-generation is not routed through a fully resident GPU runtime yet.
-`txt2img`, `img2img`, and `smoke` can opt into `--rocm-device-id` to route
-currently GPU-backed generation boundaries through ROCm: denoise-loop
-model-input scaling, classifier-free guidance, Euler scheduler updates, UNet input
-centering, CLIP token/position embedding lookup and text encoder tensor stages,
-UNet timestep and SDXL add-time embedding projections, UNet ResNet blocks, UNet
-transformer attention blocks, down/up sampling, channel concatenation, and final
-UNet norm, activation, and conv output, plus final VAE decode graph execution
-and decoded tensor-to-RGB conversion for both modes, img2img/inpaint RGB-to-VAE
-tensor conversion, VAE encode graph execution, VAE moments-to-latents scaling,
-latent mask downsampling, masked RGB preparation, and final latent mask blending.
-Denoise-loop vector stages now share one generation-scoped ROCm context instead
-of initializing a device handle for each model-input scaling, guidance, and
-scheduler step operation. CLIP conditioning also reuses one conditioning-scoped
-ROCm context across token/position embedding lookup, text encoder tensor stages,
-pooled projection, and SDXL hidden-state concatenation. UNet and VAE tensor graph
-stages still use the hybrid tensor-boundary path, but denoise-scoped UNet entry
-stages now reuse the generation-scoped ROCm context for input centering, timestep
-embedding, SDXL add-time embedding, and the SDXL time-add residual merge.
-HFQ-backed UNet and VAE ResNet blocks also have context-aware execution for their
-Conv2D, GroupNorm, SiLU, channel-bias, linear time-projection, shortcut, and
-residual-add stages. UNet down/up/mid traversal now keeps those stages, plus
-channel concatenation, nearest-neighbor upsample, and the final output
-norm/activation/conv, on the generation-scoped context. VAE encode/decode
-traversal now uses the same context seam for RGB/VAE boundary conversion, latent
-scaling, ResNet blocks, final norm/activation/conv, and VAE upsample/downsample
-stages. UNet transformer attention and VAE attention now share that context seam
-for GroupNorm, layout conversion, LayerNorm, QKV/out projections, SDPA, GeGLU,
-and residual-add stages. These are still reference HIP tensor-boundary kernels,
-not fully fused resident attention kernels.
-`hipfire serve` exposes the same hybrid path through the Stable Diffusion API
-extension fields `rocm_device_id` or `hipfire_rocm_device_id` on `/sdapi/v1/txt2img`
-and `/sdapi/v1/img2img` requests, through the same keys in `override_settings`,
-or through the persisted `/sdapi/v1/options` value `hipfire_rocm_device_id`.
-Build the server binary with `--features rocm` for those settings to run; a
-binary without ROCm support returns a not-implemented error instead of silently
-falling back to CPU when ROCm is explicitly requested.
-`/sdapi/v1/progress` tracks active SDAPI sampling steps and, after a successful
-HFQ diffusion request completes, returns the final generated PNG in
-`current_image`. Live per-step latent preview decoding is not implemented yet.
-Img2img and inpaint requests accept init and mask images at the same source
-dimensions and resize them to the requested output width and height before VAE
-encoding, matching SDAPI clients that send source images separately from target
-dimensions.
-`/sdapi/v1/txt2img` accepts the WebUI high-res fields `enable_hr`, `hr_scale`,
-`hr_resize_x`, `hr_resize_y`, and `hr_second_pass_steps` for HFQ diffusion
-models. Hipfire implements this as a batched first-pass txt2img generation
-followed by a second-pass img2img generation at the high-res target dimensions;
-one-sided `hr_resize_x` or `hr_resize_y` preserves the first-pass aspect ratio,
-and setting both uses the exact requested target. WebUI-specific latent upscaler
-selection is not implemented yet.
-The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128,
-HFQ4G256, and HFQ6G256 tensor payloads even when the artifact `weight_format`
-records a future quantized format such as `oq4`; OQ/MQ/HFP and other packed
-payloads still require a matching diffusion dequantizer/HIP runtime before they
-can generate images.
+Runtime note: runnable `.hfq` diffusion artifacts still perform CLIP tokenization as host-side setup. `txt2img`, `img2img`, and `smoke` can opt into `--rocm-device-id` to route currently GPU-backed generation boundaries through ROCm.
+
+`hipfire serve` exposes the same hybrid path through the Stable Diffusion API extension fields `rocm_device_id` or `hipfire_rocm_device_id` on `/sdapi/v1/txt2img` and `/sdapi/v1/img2img` requests, through the same keys in `override_settings`, or through the persisted `/sdapi/v1/options` value `hipfire_rocm_device_id`.
+
+`/sdapi/v1/progress` tracks active SDAPI sampling steps and returns the final generated PNG in `current_image` after a successful HFQ diffusion request completes. Live per-step latent preview decoding is not implemented yet.
+
+Img2img and inpaint resize init and mask images to the requested output dimensions before VAE encoding. Txt2img high-res generation is implemented as a batched first-pass txt2img generation followed by a second-pass img2img generation at the high-res target dimensions.
+
+The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128, HFQ4G256, and HFQ6G256 tensor payloads. Other packed payloads require a matching diffusion dequantizer/runtime implementation.
 
 **Usage:** `hipfire diffusion <COMMAND>`
 
@@ -323,21 +264,7 @@ Inspect a diffusion .hfq artifact and print its server-facing summary
 
 Plan HIP diffusion buffers and optionally run a ROCm device preflight
 
-The preflight command prints a deterministic memory plan for the requested
-resolution, batch, scheduler, and prompt set. Builds compiled with
-`--features rocm` also initialize the selected HIP device, allocate the planned
-buffer classes, run a small host/device roundtrip probe, and launch diffusion
-kernels for model-input scaling, classifier-free guidance, Euler scheduler
-updates, centered UNet input, timestep embeddings, RGB-to-VAE tensor
-conversion, VAE moments-to-latents scaling, residual tensor add, NCHW
-channel-bias add, latent mask downsampling, masked RGB inpaint preparation,
-latent mask blending, NCHW/BSC layout transforms, NCHW channel concat, 2D/3D
-last-dim concat, f32 NCHW Conv2D, f32 NCHW GroupNorm, SiLU, nearest-neighbor
-upsample, f32 dense linear projection, f32 LayerNorm, f32 row softmax, f32 3D
-scaled-dot-product attention, f32 CLIP causal self-attention, GeGLU gate,
-QuickGELU, f32 CLIP token/position embedding lookup, and RGB conversion. Each
-kernel probe is checked against the CPU reference and reported in the JSON
-output.
+The preflight command prints a deterministic memory plan for the requested resolution, batch, scheduler, and prompt set. Builds compiled with `--features rocm` also initialize the selected HIP device, allocate the planned buffer classes, run a host/device roundtrip probe, and launch currently covered diffusion kernel probes against CPU references.
 
 **Usage:** `hipfire diffusion preflight [OPTIONS] --model <MODEL>`
 
@@ -381,6 +308,8 @@ output.
 
 Generate PNG images directly from a diffusion .hfq artifact
 
+With `--enable-hr`, the command first generates the requested base batch, decodes those PNGs as init images, then runs an img2img second pass at `--hr-scale` or the `--hr-resize-x`/`--hr-resize-y` target.
+
 **Usage:** `hipfire diffusion txt2img [OPTIONS] --model <MODEL> --prompt <PROMPT> --output <OUTPUT>`
 
 ###### **Options:**
@@ -412,6 +341,16 @@ Generate PNG images directly from a diffusion .hfq artifact
 * `--batch-size <BATCH_SIZE>` — Batch size when a single prompt is supplied
 
   Default value: `1`
+* `--enable-hr` — Run a high-res second pass by feeding first-pass txt2img results through img2img
+* `--hr-scale <HR_SCALE>` — High-res scale when --hr-resize-x/--hr-resize-y are both omitted or zero
+
+  Default value: `2`
+* `--hr-resize-x <HR_RESIZE_X>` — Exact high-res target width, or aspect-preserving width when used alone
+* `--hr-resize-y <HR_RESIZE_Y>` — Exact high-res target height, or aspect-preserving height when used alone
+* `--hr-second-pass-steps <HR_SECOND_PASS_STEPS>` — Denoising steps for the high-res second pass; defaults to --steps
+* `--hr-denoising-strength <HR_DENOISING_STRENGTH>` — Img2img denoising strength for the high-res second pass
+
+  Default value: `0.75`
 * `--rocm-device-id <ROCM_DEVICE_ID>` — Use ROCm for currently GPU-routed generation stages on this device id
 
 

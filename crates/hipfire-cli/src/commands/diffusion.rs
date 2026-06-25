@@ -33,8 +33,18 @@ pub enum DiffusionCommand {
     /// Inspect a diffusion .hfq artifact and print its server-facing summary
     Inspect(DiffusionInspectArgs),
     /// Plan HIP diffusion buffers and optionally run a ROCm device preflight
+    ///
+    /// The preflight command prints a deterministic memory plan for the
+    /// requested resolution, batch, scheduler, and prompt set. Builds compiled
+    /// with `--features rocm` also initialize the selected HIP device, allocate
+    /// the planned buffer classes, run a host/device roundtrip probe, and
+    /// launch currently covered diffusion kernel probes against CPU references.
     Preflight(DiffusionPreflightArgs),
     /// Generate PNG images directly from a diffusion .hfq artifact
+    ///
+    /// With `--enable-hr`, the command first generates the requested base
+    /// batch, decodes those PNGs as init images, then runs an img2img second
+    /// pass at `--hr-scale` or the `--hr-resize-x`/`--hr-resize-y` target.
     #[command(name = "txt2img", alias = "txt2-img")]
     Txt2Img(DiffusionTxt2ImgArgs),
     /// Generate PNG images from init images with a diffusion .hfq artifact
@@ -152,6 +162,24 @@ pub struct DiffusionTxt2ImgArgs {
     /// Batch size when a single prompt is supplied
     #[arg(long, default_value_t = 1)]
     pub batch_size: usize,
+    /// Run a high-res second pass by feeding first-pass txt2img results through img2img
+    #[arg(long)]
+    pub enable_hr: bool,
+    /// High-res scale when --hr-resize-x/--hr-resize-y are both omitted or zero
+    #[arg(long, default_value_t = 2.0)]
+    pub hr_scale: f64,
+    /// Exact high-res target width, or aspect-preserving width when used alone
+    #[arg(long)]
+    pub hr_resize_x: Option<u32>,
+    /// Exact high-res target height, or aspect-preserving height when used alone
+    #[arg(long)]
+    pub hr_resize_y: Option<u32>,
+    /// Denoising steps for the high-res second pass; defaults to --steps
+    #[arg(long)]
+    pub hr_second_pass_steps: Option<u32>,
+    /// Img2img denoising strength for the high-res second pass
+    #[arg(long, default_value_t = 0.75)]
+    pub hr_denoising_strength: f32,
     /// Use ROCm for currently GPU-routed generation stages on this device id
     #[arg(long)]
     pub rocm_device_id: Option<i32>,
@@ -327,7 +355,7 @@ fn run_preflight(args: DiffusionPreflightArgs) -> anyhow::Result<()> {
         crop_y: 0,
         steps: args.steps,
         cfg_scale: args.cfg_scale,
-        scheduler: args.scheduler,
+        scheduler: args.scheduler.clone(),
         subseed_strength: args.subseed_strength,
         send_images: false,
         save_images: false,
@@ -389,16 +417,18 @@ fn run_txt2img(args: DiffusionTxt2ImgArgs) -> anyhow::Result<()> {
         crop_y: 0,
         steps: args.steps,
         cfg_scale: args.cfg_scale,
-        scheduler: args.scheduler,
+        scheduler: args.scheduler.clone(),
         subseed_strength: args.subseed_strength,
         send_images: true,
         save_images: false,
     };
     let pipeline = DiffusionPipeline::open_hfq(&args.model)?;
-    let output = pipeline.generate_batch_with_runtime_options(
-        request,
-        generation_runtime_options(args.rocm_device_id),
-    )?;
+    let runtime_options = generation_runtime_options(args.rocm_device_id);
+    let output = if args.enable_hr {
+        generate_highres_txt2img(&pipeline, request, &args, runtime_options)?
+    } else {
+        pipeline.generate_batch_with_runtime_options(request, runtime_options)?
+    };
     let files = write_png_images(&output.images, &args.output)?;
     println!(
         "{}",
@@ -410,6 +440,122 @@ fn run_txt2img(args: DiffusionTxt2ImgArgs) -> anyhow::Result<()> {
         }))?
     );
     Ok(())
+}
+
+fn generate_highres_txt2img(
+    pipeline: &DiffusionPipeline,
+    mut first_pass_request: DiffusionBatchRequest,
+    args: &DiffusionTxt2ImgArgs,
+    runtime_options: DiffusionGenerationRuntimeOptions,
+) -> anyhow::Result<hipfire_diffusion::DiffusionBatchOutput> {
+    if !args.hr_denoising_strength.is_finite() || !(0.0..=1.0).contains(&args.hr_denoising_strength)
+    {
+        anyhow::bail!(
+            "--hr-denoising-strength {} must be between 0 and 1",
+            args.hr_denoising_strength
+        );
+    }
+    first_pass_request.send_images = true;
+    let first_pass = pipeline
+        .generate_batch_with_runtime_options(first_pass_request.clone(), runtime_options)?;
+    let init_image = decode_png_images_to_rgb_batch(&first_pass.images)?;
+    let (target_width, target_height) = highres_target_dimensions(
+        first_pass_request.width,
+        first_pass_request.height,
+        args.hr_scale,
+        args.hr_resize_x,
+        args.hr_resize_y,
+    )?;
+    let mut second_pass_batch = first_pass_request;
+    second_pass_batch.width = target_width;
+    second_pass_batch.height = target_height;
+    second_pass_batch.steps = args
+        .hr_second_pass_steps
+        .unwrap_or(second_pass_batch.steps)
+        .max(1);
+    second_pass_batch.send_images = true;
+    let mut output = pipeline.generate_img2img_batch_with_runtime_options(
+        DiffusionImg2ImgRequest {
+            batch: second_pass_batch,
+            init_image,
+            mask: None,
+            denoising_strength: args.hr_denoising_strength,
+        },
+        runtime_options,
+    )?;
+    if let Some(map) = output.info.as_object_mut() {
+        map.insert("mode".to_string(), serde_json::json!("txt2img-hires"));
+        map.insert("highres".to_string(), serde_json::json!(true));
+        map.insert("firstpass_width".to_string(), serde_json::json!(args.width));
+        map.insert(
+            "firstpass_height".to_string(),
+            serde_json::json!(args.height),
+        );
+        map.insert("hr_width".to_string(), serde_json::json!(target_width));
+        map.insert("hr_height".to_string(), serde_json::json!(target_height));
+        map.insert(
+            "hr_second_pass_steps".to_string(),
+            serde_json::json!(args.hr_second_pass_steps.unwrap_or(args.steps).max(1)),
+        );
+    }
+    Ok(output)
+}
+
+fn highres_target_dimensions(
+    base_width: u32,
+    base_height: u32,
+    hr_scale: f64,
+    hr_resize_x: Option<u32>,
+    hr_resize_y: Option<u32>,
+) -> anyhow::Result<(u32, u32)> {
+    if base_width == 0 || base_height == 0 {
+        anyhow::bail!("high-res txt2img requires non-zero base width and height");
+    }
+    let resize_x = hr_resize_x.unwrap_or(0);
+    let resize_y = hr_resize_y.unwrap_or(0);
+    match (resize_x, resize_y) {
+        (0, 0) => {
+            if !hr_scale.is_finite() || hr_scale <= 0.0 {
+                anyhow::bail!("--hr-scale must be positive and finite");
+            }
+            Ok((
+                scaled_highres_dimension(base_width, hr_scale, "width")?,
+                scaled_highres_dimension(base_height, hr_scale, "height")?,
+            ))
+        }
+        (width, 0) => Ok((
+            width,
+            aspect_scaled_dimension(width, base_height, base_width, "height")?,
+        )),
+        (0, height) => Ok((
+            aspect_scaled_dimension(height, base_width, base_height, "width")?,
+            height,
+        )),
+        (width, height) => Ok((width, height)),
+    }
+}
+
+fn scaled_highres_dimension(dimension: u32, scale: f64, label: &str) -> anyhow::Result<u32> {
+    let scaled = (dimension as f64 * scale).round();
+    if scaled < 1.0 || scaled > u32::MAX as f64 {
+        anyhow::bail!("high-res target {label} is out of range");
+    }
+    Ok(scaled as u32)
+}
+
+fn aspect_scaled_dimension(
+    fixed_dimension: u32,
+    scaled_dimension: u32,
+    base_dimension: u32,
+    label: &str,
+) -> anyhow::Result<u32> {
+    let value = (fixed_dimension as u64)
+        .checked_mul(scaled_dimension as u64)
+        .ok_or_else(|| anyhow::anyhow!("high-res target {label} is out of range"))?
+        .checked_div(base_dimension as u64)
+        .unwrap_or(0)
+        .max(1);
+    u32::try_from(value).map_err(|_| anyhow::anyhow!("high-res target {label} is out of range"))
 }
 
 fn run_img2img(args: DiffusionImg2ImgArgs) -> anyhow::Result<()> {
@@ -698,8 +844,49 @@ fn load_rgb_image_batch(paths: &[PathBuf]) -> anyhow::Result<RgbImageBatch> {
 
 fn load_rgb_image(path: &Path) -> anyhow::Result<RgbImageBatch> {
     let bytes = fs::read(path)?;
-    let image = image::load_from_memory(&bytes)
-        .map_err(|error| anyhow::anyhow!("invalid image {:?}: {error}", path))?
+    rgb_image_batch_from_bytes(&bytes, &format!("{path:?}"))
+}
+
+fn decode_png_images_to_rgb_batch(images: &[String]) -> anyhow::Result<RgbImageBatch> {
+    if images.is_empty() {
+        anyhow::bail!("high-res txt2img first pass returned no images");
+    }
+    let mut decoded = Vec::with_capacity(images.len());
+    for (idx, image) in images.iter().enumerate() {
+        let bytes = decode_base64_png(image)?;
+        decoded.push(rgb_image_batch_from_bytes(
+            &bytes,
+            &format!("first-pass image {idx}"),
+        )?);
+    }
+    let width = decoded[0].width;
+    let height = decoded[0].height;
+    let bytes_per_image = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| anyhow::anyhow!("first-pass image dimensions overflow"))?;
+    let mut data = Vec::with_capacity(bytes_per_image * decoded.len());
+    for (idx, image) in decoded.into_iter().enumerate() {
+        if image.width != width || image.height != height {
+            anyhow::bail!(
+                "first-pass image {idx} dimensions {}x{} do not match first image {width}x{height}",
+                image.width,
+                image.height
+            );
+        }
+        data.extend_from_slice(&image.data);
+    }
+    Ok(RgbImageBatch {
+        batch: images.len(),
+        width,
+        height,
+        data,
+    })
+}
+
+fn rgb_image_batch_from_bytes(bytes: &[u8], label: &str) -> anyhow::Result<RgbImageBatch> {
+    let image = image::load_from_memory(bytes)
+        .map_err(|error| anyhow::anyhow!("invalid image {label}: {error}"))?
         .to_rgb8();
     let width = usize::try_from(image.width())?;
     let height = usize::try_from(image.height())?;
@@ -859,6 +1046,7 @@ fn validate_png_file(path: &Path, width: u32, height: u32) -> anyhow::Result<Png
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::ImageEncoder;
 
     fn txt2img_args() -> DiffusionTxt2ImgArgs {
         DiffusionTxt2ImgArgs {
@@ -875,6 +1063,12 @@ mod tests {
             subseed: Vec::new(),
             subseed_strength: 0.0,
             batch_size: 2,
+            enable_hr: false,
+            hr_scale: 2.0,
+            hr_resize_x: None,
+            hr_resize_y: None,
+            hr_second_pass_steps: None,
+            hr_denoising_strength: 0.75,
             rocm_device_id: None,
         }
     }
@@ -942,6 +1136,52 @@ mod tests {
             decode_base64_png(&format!("data:image/png;base64,{encoded}")).unwrap(),
             png
         );
+    }
+
+    #[test]
+    fn highres_target_dimensions_support_scale_and_resize_modes() {
+        assert_eq!(
+            highres_target_dimensions(2, 3, 2.0, None, None).unwrap(),
+            (4, 6)
+        );
+        assert_eq!(
+            highres_target_dimensions(2, 3, 2.0, Some(8), None).unwrap(),
+            (8, 12)
+        );
+        assert_eq!(
+            highres_target_dimensions(2, 3, 2.0, None, Some(9)).unwrap(),
+            (6, 9)
+        );
+        assert_eq!(
+            highres_target_dimensions(2, 3, 2.0, Some(7), Some(5)).unwrap(),
+            (7, 5)
+        );
+        assert!(highres_target_dimensions(2, 3, 0.0, None, None).is_err());
+    }
+
+    #[test]
+    fn decode_png_images_to_rgb_batch_accepts_matching_first_pass_images() {
+        let first = tiny_png_base64(2, 2, 16);
+        let second = tiny_png_base64(2, 2, 128);
+
+        let batch = decode_png_images_to_rgb_batch(&[first, second]).unwrap();
+
+        assert_eq!(batch.batch, 2);
+        assert_eq!(batch.width, 2);
+        assert_eq!(batch.height, 2);
+        assert_eq!(batch.data.len(), 24);
+    }
+
+    #[test]
+    fn decode_png_images_to_rgb_batch_rejects_mismatched_first_pass_images() {
+        let error = decode_png_images_to_rgb_batch(&[
+            tiny_png_base64(2, 2, 16),
+            tiny_png_base64(1, 2, 128),
+        ])
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("do not match first image"));
     }
 
     #[test]
@@ -1047,5 +1287,19 @@ mod tests {
         assert_eq!(&mask.data[6..12], &[255, 255, 255, 255, 255, 255]);
         assert_eq!(validate_png_file(&path, 4, 2).unwrap().dimensions, "4x2");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn tiny_png_base64(width: u32, height: u32, value: u8) -> String {
+        let bytes = (width as usize) * (height as usize) * 3;
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(
+                &vec![value; bytes],
+                width,
+                height,
+                image::ColorType::Rgb8.into(),
+            )
+            .unwrap();
+        base64::engine::general_purpose::STANDARD.encode(png)
     }
 }
