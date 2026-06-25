@@ -427,11 +427,14 @@ async fn execute_hfq_diffusion_txt2img(
                 target_dimensions,
             )?;
             let highres_body = sdapi_highres_second_pass_body(&worker_body, target_dimensions);
-            let highres_batch = sd_request_to_diffusion_batch_request(
+            let mut highres_batch = sd_request_to_diffusion_batch_request(
                 &highres_body,
                 Some(target_dimensions),
                 iter_seed_offset,
             )?;
+            if save_images {
+                highres_batch.send_images = true;
+            }
             let highres_request = DiffusionImg2ImgRequest {
                 batch: highres_batch,
                 init_image: first_pass_images,
@@ -2404,6 +2407,63 @@ mod tests {
             .unwrap();
         assert!(text.contains("Size: 4x4"));
         assert!(text.contains("Mode: txt2img"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn txt2img_highres_route_saves_second_pass_when_send_images_false() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-sdapi-diffusion-highres-save-route-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("tiny-route-diffusion-highres-save.hfq");
+        let output_dir = dir.join("highres-outputs");
+        write_tiny_diffusion_hfq(&hfq_path);
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let body = SdGenerationRequest {
+            prompt: "a highres saved cat".to_string(),
+            model: Some(hfq_path.to_string_lossy().into_owned()),
+            seed: Some(9),
+            steps: Some(1),
+            cfg_scale: Some(1.0),
+            width: Some(2),
+            height: Some(2),
+            send_images: Some(false),
+            save_images: Some(true),
+            denoising_strength: Some(1.0),
+            enable_hr: Some(true),
+            hr_scale: Some(2.0),
+            hr_second_pass_steps: Some(1),
+            override_settings: Some(json!({
+                "outdir_txt2img_samples": output_dir,
+            })),
+            ..empty_request()
+        };
+
+        let response = post_txt2img(State(state), Json(body)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+
+        assert!(body["images"].as_array().unwrap().is_empty());
+        let info = serde_json::from_str::<Value>(body["info"].as_str().unwrap()).unwrap();
+        assert_eq!(info["mode"], "txt2img-hires");
+        assert_eq!(info["save_images"], true);
+        let saved = info["saved_images"].as_array().unwrap();
+        assert_eq!(saved.len(), 1);
+        let saved_path = PathBuf::from(saved[0].as_str().unwrap());
+        assert!(saved_path.is_file());
+        assert!(saved_path.starts_with(output_dir));
+        let bytes = std::fs::read(saved_path).unwrap();
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        let decoded = image::load_from_memory(&bytes).unwrap().to_rgb8();
+        assert_eq!(decoded.dimensions(), (4, 4));
+        let text = extract_png_text_chunk(&bytes, "parameters")
+            .unwrap()
+            .unwrap();
+        assert!(text.contains("a highres saved cat"));
+        assert!(text.contains("Size: 4x4"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
