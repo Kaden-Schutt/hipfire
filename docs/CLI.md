@@ -231,14 +231,17 @@ scheduler step operation. CLIP conditioning also reuses one conditioning-scoped
 ROCm context across token/position embedding lookup, text encoder tensor stages,
 pooled projection, and SDXL hidden-state concatenation. UNet and VAE tensor graph
 stages still use the hybrid tensor-boundary path, but denoise-scoped UNet entry
-stages now reuse the generation ROCm context for input centering, timestep
+stages now reuse the generation-scoped ROCm context for input centering, timestep
 embedding, SDXL add-time embedding, and the SDXL time-add residual merge.
 HFQ-backed UNet and VAE ResNet blocks also have context-aware execution for their
 Conv2D, GroupNorm, SiLU, channel-bias, linear time-projection, shortcut, and
 residual-add stages. UNet down/up/mid traversal now keeps those stages, plus
-channel concatenation and nearest-neighbor upsample, on the generation-scoped
-context while transformer attention remains a hybrid tensor-boundary stage. VAE
-path-level traversal is still being migrated onto the same context seams.
+channel concatenation, nearest-neighbor upsample, and the final output
+norm/activation/conv, on the generation-scoped context. VAE encode/decode
+traversal now uses the same context seam for RGB/VAE boundary conversion, latent
+scaling, ResNet blocks, final norm/activation/conv, and VAE upsample/downsample
+stages. UNet transformer attention and VAE attention remain hybrid
+tensor-boundary stages.
 The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128,
 HFQ4G256, and HFQ6G256 tensor payloads even when the artifact `weight_format`
 records a future quantized format such as `oq4`; OQ/MQ/HFP and other packed

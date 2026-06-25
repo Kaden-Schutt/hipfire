@@ -2183,12 +2183,12 @@ fn timestep_embedding_with_runtime_context(
     }
 }
 
-fn scale_tensor_with_runtime_options(
+fn scale_tensor_with_runtime_context(
     input: &CpuTensor,
     scale: f32,
-    runtime_options: DiffusionGenerationRuntimeOptions,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<CpuTensor> {
-    let Some(device_id) = runtime_options.rocm_device_id else {
+    let Some(_device_id) = runtime_context.rocm_device_id() else {
         return Ok(CpuTensor {
             shape: input.shape.clone(),
             data: input.data.iter().map(|value| value * scale).collect(),
@@ -2196,9 +2196,8 @@ fn scale_tensor_with_runtime_options(
     };
     #[cfg(feature = "rocm")]
     {
-        let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-        let data = scale_model_input_hip_on_gpu(&mut gpu, &input.data, scale)?;
+        let data = runtime_context
+            .with_rocm_gpu(|gpu| scale_model_input_hip_on_gpu(gpu, &input.data, scale))?;
         Ok(CpuTensor {
             shape: input.shape.clone(),
             data,
@@ -2206,7 +2205,7 @@ fn scale_tensor_with_runtime_options(
     }
     #[cfg(not(feature = "rocm"))]
     {
-        let _ = device_id;
+        let _ = _device_id;
         Err(rocm_hybrid_unavailable_error())
     }
 }
@@ -2252,14 +2251,6 @@ fn linear_with_runtime_context(
         return linear(input, weight, bias);
     }
     linear_optional_bias_with_runtime_context(input, weight, Some(bias), runtime_context)
-}
-
-fn silu_with_runtime_options(
-    input: &CpuTensor,
-    runtime_options: DiffusionGenerationRuntimeOptions,
-) -> DiffusionResult<CpuTensor> {
-    let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
-    silu_with_runtime_context(input, &mut runtime_context)
 }
 
 fn silu_with_runtime_context(
@@ -2515,15 +2506,6 @@ fn concat_channels_nchw_with_runtime_context(
     }
 }
 
-fn upsample_nearest2d_nchw_with_runtime_options(
-    input: &CpuTensor,
-    scale: usize,
-    runtime_options: DiffusionGenerationRuntimeOptions,
-) -> DiffusionResult<CpuTensor> {
-    let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
-    upsample_nearest2d_nchw_with_runtime_context(input, scale, &mut runtime_context)
-}
-
 fn upsample_nearest2d_nchw_with_runtime_context(
     input: &CpuTensor,
     scale: usize,
@@ -2547,18 +2529,24 @@ fn nchw_to_bsc_with_runtime_options(
     input: &CpuTensor,
     runtime_options: DiffusionGenerationRuntimeOptions,
 ) -> DiffusionResult<CpuTensor> {
-    let Some(device_id) = runtime_options.rocm_device_id else {
+    let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+    nchw_to_bsc_with_runtime_context(input, &mut runtime_context)
+}
+
+fn nchw_to_bsc_with_runtime_context(
+    input: &CpuTensor,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
+) -> DiffusionResult<CpuTensor> {
+    let Some(_device_id) = runtime_context.rocm_device_id() else {
         return nchw_to_bsc(input);
     };
     #[cfg(feature = "rocm")]
     {
-        let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-        nchw_to_bsc_hip_on_gpu(&mut gpu, input)
+        runtime_context.with_rocm_gpu(|gpu| nchw_to_bsc_hip_on_gpu(gpu, input))
     }
     #[cfg(not(feature = "rocm"))]
     {
-        let _ = device_id;
+        let _ = _device_id;
         Err(rocm_hybrid_unavailable_error())
     }
 }
@@ -2571,18 +2559,29 @@ fn bsc_to_nchw_with_runtime_options(
     width: usize,
     runtime_options: DiffusionGenerationRuntimeOptions,
 ) -> DiffusionResult<CpuTensor> {
-    let Some(device_id) = runtime_options.rocm_device_id else {
+    let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+    bsc_to_nchw_with_runtime_context(input, batch, channels, height, width, &mut runtime_context)
+}
+
+fn bsc_to_nchw_with_runtime_context(
+    input: &CpuTensor,
+    batch: usize,
+    channels: usize,
+    height: usize,
+    width: usize,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
+) -> DiffusionResult<CpuTensor> {
+    let Some(_device_id) = runtime_context.rocm_device_id() else {
         return bsc_to_nchw(input, batch, channels, height, width);
     };
     #[cfg(feature = "rocm")]
     {
-        let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-        bsc_to_nchw_hip_on_gpu(&mut gpu, input, batch, channels, height, width)
+        runtime_context
+            .with_rocm_gpu(|gpu| bsc_to_nchw_hip_on_gpu(gpu, input, batch, channels, height, width))
     }
     #[cfg(not(feature = "rocm"))]
     {
-        let _ = device_id;
+        let _ = _device_id;
         Err(rocm_hybrid_unavailable_error())
     }
 }
@@ -4847,12 +4846,12 @@ impl DiffusionNoiseBackend for NativeUnet2DConditionModel {
 trait DiffusionImageDecoder: Send + Sync {
     fn decode_to_rgb_tensor(&self, latents: &LatentBatch) -> DiffusionResult<CpuTensor>;
 
-    fn decode_to_rgb_tensor_with_runtime_options(
+    fn decode_to_rgb_tensor_with_runtime_context(
         &self,
         latents: &LatentBatch,
-        runtime_options: DiffusionGenerationRuntimeOptions,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<CpuTensor> {
-        let _ = runtime_options;
+        let _ = runtime_context;
         self.decode_to_rgb_tensor(latents)
     }
 }
@@ -4862,12 +4861,12 @@ impl DiffusionImageDecoder for NativeVaeDecoder {
         NativeVaeDecoder::decode_latents(self, latents)
     }
 
-    fn decode_to_rgb_tensor_with_runtime_options(
+    fn decode_to_rgb_tensor_with_runtime_context(
         &self,
         latents: &LatentBatch,
-        runtime_options: DiffusionGenerationRuntimeOptions,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<CpuTensor> {
-        NativeVaeDecoder::decode_latents_with_runtime_options(self, latents, runtime_options)
+        NativeVaeDecoder::decode_latents_with_runtime_context(self, latents, runtime_context)
     }
 }
 
@@ -4876,27 +4875,16 @@ fn decode_to_rgb8_with_runtime_options(
     latents: &LatentBatch,
     runtime_options: DiffusionGenerationRuntimeOptions,
 ) -> DiffusionResult<(RgbImageBatch, DiffusionRuntimeKind)> {
-    let decoded = decoder.decode_to_rgb_tensor_with_runtime_options(latents, runtime_options)?;
-    if let Some(device_id) = runtime_options.rocm_device_id {
-        #[cfg(feature = "rocm")]
-        {
-            let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
-                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-            let rgb = rgb_tensor_to_u8_hip_on_gpu(&mut gpu, &decoded)?;
-            return Ok((rgb, DiffusionRuntimeKind::RocmHybridReference));
-        }
-        #[cfg(not(feature = "rocm"))]
-        {
-            let _ = device_id;
-            return Err(DiffusionError::BackendUnavailable(
-                "ROCm hybrid diffusion generation requested, but hipfire-diffusion was built without the rocm feature".to_string(),
-            ));
-        }
-    }
-    Ok((
-        rgb_tensor_to_u8(&decoded)?,
-        DiffusionRuntimeKind::CpuSourceReference,
-    ))
+    let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+    let decoded =
+        decoder.decode_to_rgb_tensor_with_runtime_context(latents, &mut runtime_context)?;
+    let rgb = rgb_tensor_to_u8_with_runtime_context(&decoded, &mut runtime_context)?;
+    let runtime_kind = if runtime_options.rocm_device_id.is_some() {
+        DiffusionRuntimeKind::RocmHybridReference
+    } else {
+        DiffusionRuntimeKind::CpuSourceReference
+    };
+    Ok((rgb, runtime_kind))
 }
 
 fn encode_to_latents_with_runtime_options(
@@ -7063,7 +7051,6 @@ impl NativeUnet2DConditionModel {
         sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
         runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<CpuTensor> {
-        let runtime_options = runtime_context.options;
         let [batch, _, _, _] = shape4(sample)?;
         if timesteps.len() != batch {
             return Err(DiffusionError::InvalidRequest(format!(
@@ -7129,10 +7116,10 @@ impl NativeUnet2DConditionModel {
         )?;
         let hidden = self
             .conv_norm_out
-            .forward_with_runtime_options(&hidden, runtime_options)?;
+            .forward_with_runtime_context(&hidden, runtime_context)?;
         let hidden = silu_with_runtime_context(&hidden, runtime_context)?;
         self.conv_out
-            .forward_with_runtime_options(&hidden, runtime_options)
+            .forward_with_runtime_context(&hidden, runtime_context)
     }
 
     pub fn denoise_latents(
@@ -7243,24 +7230,34 @@ impl VaeAttentionBlock {
         input: &CpuTensor,
         runtime_options: DiffusionGenerationRuntimeOptions,
     ) -> DiffusionResult<CpuTensor> {
+        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+        self.forward_with_runtime_context(input, &mut runtime_context)
+    }
+
+    fn forward_with_runtime_context(
+        &self,
+        input: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
+        let runtime_options = runtime_context.options;
         let residual = input.clone();
         let [batch, channels, height, width] = shape4(input)?;
         let hidden = self
             .norm
-            .forward_with_runtime_options(input, runtime_options)?;
-        let hidden = nchw_to_bsc_with_runtime_options(&hidden, runtime_options)?;
+            .forward_with_runtime_context(input, runtime_context)?;
+        let hidden = nchw_to_bsc_with_runtime_context(&hidden, runtime_context)?;
         let hidden = self
             .attention
             .forward_with_runtime_options(&hidden, None, runtime_options)?;
-        let hidden = bsc_to_nchw_with_runtime_options(
+        let hidden = bsc_to_nchw_with_runtime_context(
             &hidden,
             batch,
             channels,
             height,
             width,
-            runtime_options,
+            runtime_context,
         )?;
-        tensor_add_with_runtime_options(&hidden, &residual, runtime_options)
+        tensor_add_with_runtime_context(&hidden, &residual, runtime_context)
     }
 }
 
@@ -7314,14 +7311,23 @@ impl VaeEncoderDownBlock {
 
     fn forward_with_runtime_options(
         &self,
-        mut hidden: CpuTensor,
+        hidden: CpuTensor,
         runtime_options: DiffusionGenerationRuntimeOptions,
     ) -> DiffusionResult<CpuTensor> {
+        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+        self.forward_with_runtime_context(hidden, &mut runtime_context)
+    }
+
+    fn forward_with_runtime_context(
+        &self,
+        mut hidden: CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
         for resnet in &self.resnets {
-            hidden = resnet.forward_with_runtime_options(&hidden, runtime_options)?;
+            hidden = resnet.forward_with_runtime_context(&hidden, runtime_context)?;
         }
         if let Some(downsampler) = &self.downsampler {
-            hidden = downsampler.forward_with_runtime_options(&hidden, runtime_options)?;
+            hidden = downsampler.forward_with_runtime_context(&hidden, runtime_context)?;
         }
         Ok(hidden)
     }
@@ -7443,30 +7449,39 @@ impl NativeVaeEncoder {
         image: &CpuTensor,
         runtime_options: DiffusionGenerationRuntimeOptions,
     ) -> DiffusionResult<CpuTensor> {
+        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+        self.encode_tensor_moments_with_runtime_context(image, &mut runtime_context)
+    }
+
+    fn encode_tensor_moments_with_runtime_context(
+        &self,
+        image: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
         let mut hidden = self
             .conv_in
-            .forward_with_runtime_options(image, runtime_options)?;
+            .forward_with_runtime_context(image, runtime_context)?;
         for block in &self.down_blocks {
-            hidden = block.forward_with_runtime_options(hidden, runtime_options)?;
+            hidden = block.forward_with_runtime_context(hidden, runtime_context)?;
         }
         if let Some(resnet) = &self.mid_resnet_0 {
-            hidden = resnet.forward_with_runtime_options(&hidden, runtime_options)?;
+            hidden = resnet.forward_with_runtime_context(&hidden, runtime_context)?;
         }
         if let Some(attention) = &self.mid_attention {
-            hidden = attention.forward_with_runtime_options(&hidden, runtime_options)?;
+            hidden = attention.forward_with_runtime_context(&hidden, runtime_context)?;
         }
         if let Some(resnet) = &self.mid_resnet_1 {
-            hidden = resnet.forward_with_runtime_options(&hidden, runtime_options)?;
+            hidden = resnet.forward_with_runtime_context(&hidden, runtime_context)?;
         }
         hidden = self
             .conv_norm_out
-            .forward_with_runtime_options(&hidden, runtime_options)?;
-        hidden = silu_with_runtime_options(&hidden, runtime_options)?;
+            .forward_with_runtime_context(&hidden, runtime_context)?;
+        hidden = silu_with_runtime_context(&hidden, runtime_context)?;
         hidden = self
             .conv_out
-            .forward_with_runtime_options(&hidden, runtime_options)?;
+            .forward_with_runtime_context(&hidden, runtime_context)?;
         if let Some(quant_conv) = &self.quant_conv {
-            hidden = quant_conv.forward_with_runtime_options(&hidden, runtime_options)?;
+            hidden = quant_conv.forward_with_runtime_context(&hidden, runtime_context)?;
         }
         Ok(hidden)
     }
@@ -7482,23 +7497,19 @@ impl NativeVaeEncoder {
         image: &RgbImageBatch,
         runtime_options: DiffusionGenerationRuntimeOptions,
     ) -> DiffusionResult<LatentBatch> {
-        if runtime_options.rocm_device_id.is_none() {
-            return self.encode_to_latents(image);
-        }
-        #[cfg(feature = "rocm")]
-        {
-            let device_id = runtime_options.rocm_device_id.expect("checked above");
-            let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
-                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-            let image_tensor = rgb_batch_to_vae_tensor_hip_on_gpu(&mut gpu, image)?;
-            let moments =
-                self.encode_tensor_moments_with_runtime_options(&image_tensor, runtime_options)?;
-            vae_moments_to_latents_hip_on_gpu(&mut gpu, &moments, self.scaling_factor)
-        }
-        #[cfg(not(feature = "rocm"))]
-        {
-            Err(rocm_hybrid_unavailable_error())
-        }
+        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+        self.encode_to_latents_with_runtime_context(image, &mut runtime_context)
+    }
+
+    fn encode_to_latents_with_runtime_context(
+        &self,
+        image: &RgbImageBatch,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<LatentBatch> {
+        let image_tensor = rgb_batch_to_vae_tensor_with_runtime_context(image, runtime_context)?;
+        let moments =
+            self.encode_tensor_moments_with_runtime_context(&image_tensor, runtime_context)?;
+        vae_moments_to_latents_with_runtime_context(&moments, self.scaling_factor, runtime_context)
     }
 }
 
@@ -7531,6 +7542,44 @@ fn vae_moments_to_latents(
         width,
         data,
     })
+}
+
+fn rgb_batch_to_vae_tensor_with_runtime_context(
+    image: &RgbImageBatch,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
+) -> DiffusionResult<CpuTensor> {
+    let Some(_device_id) = runtime_context.rocm_device_id() else {
+        return rgb_batch_to_vae_tensor(image);
+    };
+    #[cfg(feature = "rocm")]
+    {
+        runtime_context.with_rocm_gpu(|gpu| rgb_batch_to_vae_tensor_hip_on_gpu(gpu, image))
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = _device_id;
+        Err(rocm_hybrid_unavailable_error())
+    }
+}
+
+fn vae_moments_to_latents_with_runtime_context(
+    moments: &CpuTensor,
+    scaling_factor: f32,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
+) -> DiffusionResult<LatentBatch> {
+    let Some(_device_id) = runtime_context.rocm_device_id() else {
+        return vae_moments_to_latents(moments, scaling_factor);
+    };
+    #[cfg(feature = "rocm")]
+    {
+        runtime_context
+            .with_rocm_gpu(|gpu| vae_moments_to_latents_hip_on_gpu(gpu, moments, scaling_factor))
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = _device_id;
+        Err(rocm_hybrid_unavailable_error())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -7574,15 +7623,24 @@ impl VaeDecoderUpBlock {
 
     fn forward_with_runtime_options(
         &self,
-        mut hidden: CpuTensor,
+        hidden: CpuTensor,
         runtime_options: DiffusionGenerationRuntimeOptions,
     ) -> DiffusionResult<CpuTensor> {
+        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+        self.forward_with_runtime_context(hidden, &mut runtime_context)
+    }
+
+    fn forward_with_runtime_context(
+        &self,
+        mut hidden: CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
         for resnet in &self.resnets {
-            hidden = resnet.forward_with_runtime_options(&hidden, runtime_options)?;
+            hidden = resnet.forward_with_runtime_context(&hidden, runtime_context)?;
         }
         if let Some(upsampler) = &self.upsampler {
-            hidden = upsample_nearest2d_nchw_with_runtime_options(&hidden, 2, runtime_options)?;
-            hidden = upsampler.forward_with_runtime_options(&hidden, runtime_options)?;
+            hidden = upsample_nearest2d_nchw_with_runtime_context(&hidden, 2, runtime_context)?;
+            hidden = upsampler.forward_with_runtime_context(&hidden, runtime_context)?;
         }
         Ok(hidden)
     }
@@ -7706,33 +7764,42 @@ impl NativeVaeDecoder {
         latents: &LatentBatch,
         runtime_options: DiffusionGenerationRuntimeOptions,
     ) -> DiffusionResult<CpuTensor> {
+        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+        self.decode_latents_with_runtime_context(latents, &mut runtime_context)
+    }
+
+    fn decode_latents_with_runtime_context(
+        &self,
+        latents: &LatentBatch,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
         let mut hidden = latents.as_nchw_tensor();
         let scale = self.scaling_factor.max(f32::MIN_POSITIVE);
-        hidden = scale_tensor_with_runtime_options(&hidden, scale.recip(), runtime_options)?;
+        hidden = scale_tensor_with_runtime_context(&hidden, scale.recip(), runtime_context)?;
         if let Some(post_quant_conv) = &self.post_quant_conv {
-            hidden = post_quant_conv.forward_with_runtime_options(&hidden, runtime_options)?;
+            hidden = post_quant_conv.forward_with_runtime_context(&hidden, runtime_context)?;
         }
         hidden = self
             .conv_in
-            .forward_with_runtime_options(&hidden, runtime_options)?;
+            .forward_with_runtime_context(&hidden, runtime_context)?;
         if let Some(resnet) = &self.mid_resnet_0 {
-            hidden = resnet.forward_with_runtime_options(&hidden, runtime_options)?;
+            hidden = resnet.forward_with_runtime_context(&hidden, runtime_context)?;
         }
         if let Some(attention) = &self.mid_attention {
-            hidden = attention.forward_with_runtime_options(&hidden, runtime_options)?;
+            hidden = attention.forward_with_runtime_context(&hidden, runtime_context)?;
         }
         if let Some(resnet) = &self.mid_resnet_1 {
-            hidden = resnet.forward_with_runtime_options(&hidden, runtime_options)?;
+            hidden = resnet.forward_with_runtime_context(&hidden, runtime_context)?;
         }
         for block in &self.up_blocks {
-            hidden = block.forward_with_runtime_options(hidden, runtime_options)?;
+            hidden = block.forward_with_runtime_context(hidden, runtime_context)?;
         }
         hidden = self
             .conv_norm_out
-            .forward_with_runtime_options(&hidden, runtime_options)?;
-        hidden = silu_with_runtime_options(&hidden, runtime_options)?;
+            .forward_with_runtime_context(&hidden, runtime_context)?;
+        hidden = silu_with_runtime_context(&hidden, runtime_context)?;
         self.conv_out
-            .forward_with_runtime_options(&hidden, runtime_options)
+            .forward_with_runtime_context(&hidden, runtime_context)
     }
 
     pub fn decode_to_rgb8(&self, latents: &LatentBatch) -> DiffusionResult<RgbImageBatch> {
@@ -7766,6 +7833,24 @@ pub fn rgb_tensor_to_u8(tensor: &CpuTensor) -> DiffusionResult<RgbImageBatch> {
         height,
         data,
     })
+}
+
+fn rgb_tensor_to_u8_with_runtime_context(
+    tensor: &CpuTensor,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
+) -> DiffusionResult<RgbImageBatch> {
+    let Some(_device_id) = runtime_context.rocm_device_id() else {
+        return rgb_tensor_to_u8(tensor);
+    };
+    #[cfg(feature = "rocm")]
+    {
+        runtime_context.with_rocm_gpu(|gpu| rgb_tensor_to_u8_hip_on_gpu(gpu, tensor))
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = _device_id;
+        Err(rocm_hybrid_unavailable_error())
+    }
 }
 
 #[cfg(feature = "rocm")]
@@ -20778,6 +20863,19 @@ mod tests {
             if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
                 eprintln!("skip: ROCm GPU unavailable for VAE decoder routing test: {error}");
             } else {
+                let mut runtime_context = DiffusionGenerationRuntimeContext::new(
+                    DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
+                );
+                let hip_context_decoded = decoder
+                    .decode_latents_with_runtime_context(&latents, &mut runtime_context)
+                    .unwrap();
+                assert_eq!(runtime_context.rocm_gpu_init_count(), 1);
+                assert_eq!(hip_context_decoded.shape, decoded.shape);
+                assert!(f32_slices_close(
+                    &hip_context_decoded.data,
+                    &decoded.data,
+                    1e-5
+                ));
                 let hip_decoded = decoder
                     .decode_latents_with_runtime_options(
                         &latents,
@@ -20887,6 +20985,22 @@ mod tests {
             if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
                 eprintln!("skip: ROCm GPU unavailable for VAE encoder routing test: {error}");
             } else {
+                let mut runtime_context = DiffusionGenerationRuntimeContext::new(
+                    DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
+                );
+                let hip_context_latents = encoder
+                    .encode_to_latents_with_runtime_context(&image, &mut runtime_context)
+                    .unwrap();
+                assert_eq!(runtime_context.rocm_gpu_init_count(), 1);
+                assert_eq!(hip_context_latents.batch, latents.batch);
+                assert_eq!(hip_context_latents.channels, latents.channels);
+                assert_eq!(hip_context_latents.height, latents.height);
+                assert_eq!(hip_context_latents.width, latents.width);
+                assert!(f32_slices_close(
+                    &hip_context_latents.data,
+                    &latents.data,
+                    1e-5
+                ));
                 let hip_latents = encoder
                     .encode_to_latents_with_runtime_options(
                         &image,
