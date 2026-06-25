@@ -95,6 +95,13 @@ integration + cross-model capture, flagged below.
   unnecessary now (no precision loss, no RAM ceiling). Still: write big-model
   artifacts to a real disk path, not the RAM-backed `/tmp`.
 
+- **Disk-size finding (2026-06-26).** New `.calib.hfq` Hessians default to compact
+  storage: exact F32 diagonal plus BF16 lower strict triangle (`quant_type=130`),
+  still exposed to the quantizer as a logical symmetric `[K,K]` Hessian. This
+  targets ~4× smaller Hessian payloads while preserving the diagonal exactly.
+  Legacy dense F32 Hessian output remains available with
+  `HIPFIRE_CALIB_HESSIAN_STORAGE=full-f32`, and the reader accepts both formats.
+
 - **Daemon `Collect` op — design (review-gated, NOT done autonomously):** the daemon
   (`hipfire-daemon/src/main.rs`, ~9k lines) dispatches via a custom JSON
   message-parser loop (`parse_*_request` at ~8865+), not a clean `match

@@ -4,8 +4,8 @@
 //! The reusable, model-agnostic calibration collector: an [`ActivationCapture`]
 //! that accumulates a per-tensor GPTQ Hessian (`Σ x·xᵀ`) and imatrix diagonal
 //! (`Σ x²`) on-GPU via the `calib_*_reduce_f32` kernels, and drains to HFQ
-//! tensors (`<name>.hessian` [K,K] + `<name>.imatrix` [K], F32 = quant_type 2)
-//! plus an internal-consistency metric (`diag(Σxxᵀ)` must equal `Σx²`).
+//! tensors (`<name>.hessian` [K,K] + `<name>.imatrix` [K]) plus an
+//! internal-consistency metric (`diag(Σxxᵀ)` must equal `Σx²`).
 //!
 //! This is generic (rdna-compute + the HFQ writer only) so it sits in
 //! hipfire-runtime without a cycle on the arch crates. Callers (the
@@ -23,6 +23,41 @@ use std::sync::Mutex;
 /// efficient than per-token (N=1) launches (the tiled GEMM is built for N≥16),
 /// so this is the dominant calibration-throughput lever.
 const FLUSH_BATCH: usize = 256;
+
+/// Calibration-only HFQM quant_type for compact Hessians:
+/// exact F32 diagonal followed by BF16 lower strict triangle.
+const QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32: u8 = 130;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HessianStorage {
+    DenseF32,
+    Bf16TrilDiagF32,
+}
+
+fn hessian_storage_from_env() -> HessianStorage {
+    match std::env::var("HIPFIRE_CALIB_HESSIAN_STORAGE")
+        .ok()
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("f32" | "dense-f32" | "full-f32" | "legacy") => HessianStorage::DenseF32,
+        _ => HessianStorage::Bf16TrilDiagF32,
+    }
+}
+
+fn f32_to_bf16_bits(f: f32) -> u16 {
+    let bits = f.to_bits();
+    if (bits >> 23) & 0xff == 0xff {
+        return (bits >> 16) as u16;
+    }
+    let bias = 0x7fff + ((bits >> 16) & 1);
+    (bits.wrapping_add(bias) >> 16) as u16
+}
+
+fn compact_hessian_bytes(k: usize) -> u64 {
+    (k * 4 + k * (k - 1)) as u64
+}
 
 /// Per-tensor on-GPU accumulators + a small activation row buffer.
 struct Acc {
@@ -154,6 +189,20 @@ impl CalibCollector {
             .collect()
     }
 
+    /// Release all GPU accumulators owned by this collector. Grouped
+    /// calibration runs call this after streaming a part file so the next group
+    /// can reuse the memory instead of waiting for process teardown.
+    pub fn free_gpu(&self, gpu: &mut Gpu) {
+        let mut accs = self.accs.lock().unwrap();
+        for (_, acc) in accs.drain() {
+            let _ = gpu.free_tensor(acc.diag);
+            if let Some(h) = acc.h {
+                let _ = gpu.free_tensor(h);
+            }
+            let _ = gpu.free_tensor(acc.buf);
+        }
+    }
+
     /// Stream the accumulated tensors into an HFQM `.calib.hfq` at `path`,
     /// **one tensor at a time** (download → normalize `/ n_tokens` → write →
     /// drop), so peak host memory is a single Hessian rather than all of them
@@ -175,6 +224,7 @@ impl CalibCollector {
         use std::cell::{Cell, RefCell};
 
         let mut accs = self.accs.lock().unwrap();
+        let hessian_storage = hessian_storage_from_env();
         // Fold any staged activation rows before reading the accumulators.
         for acc in accs.values_mut() {
             acc.flush(gpu);
@@ -194,12 +244,19 @@ impl CalibCollector {
         for name in &names {
             let acc = &accs[name];
             if acc.h.is_some() {
+                let (quant_type, data_len) = match hessian_storage {
+                    HessianStorage::DenseF32 => (2, (acc.k * acc.k * 4) as u64),
+                    HessianStorage::Bf16TrilDiagF32 => (
+                        QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32,
+                        compact_hessian_bytes(acc.k),
+                    ),
+                };
                 entries.push(HfqStreamEntry {
                     name: format!("{name}.hessian"),
-                    quant_type: 2,
+                    quant_type,
                     shape: vec![acc.k as u32, acc.k as u32],
                     group_size: 0,
-                    data_len: (acc.k * acc.k * 4) as u64,
+                    data_len,
                 });
                 plan.push(Plan::Hessian(name.clone()));
             }
@@ -254,7 +311,12 @@ impl CalibCollector {
                             *audit_worst.borrow_mut() = name.clone();
                         }
                     }
-                    write_f32_scaled(w, &h, inv)
+                    match hessian_storage {
+                        HessianStorage::DenseF32 => write_f32_scaled(w, &h, inv),
+                        HessianStorage::Bf16TrilDiagF32 => {
+                            write_hessian_bf16_tril_diag_f32(w, &h, &diag, acc.k, inv)
+                        }
+                    }
                 }
                 Plan::Imatrix(name) => {
                     let acc = &accs[name];
@@ -295,6 +357,39 @@ fn write_f32_scaled(w: &mut dyn std::io::Write, v: &[f32], scale: f32) -> std::i
         if buf.len() >= 16384 {
             w.write_all(&buf)?;
             buf.clear();
+        }
+    }
+    if !buf.is_empty() {
+        w.write_all(&buf)?;
+    }
+    Ok(())
+}
+
+fn write_hessian_bf16_tril_diag_f32(
+    w: &mut dyn std::io::Write,
+    h: &[f32],
+    diag: &[f32],
+    k: usize,
+    scale: f32,
+) -> std::io::Result<()> {
+    assert_eq!(h.len(), k * k);
+    assert_eq!(diag.len(), k);
+    let mut buf: Vec<u8> = Vec::with_capacity(16384);
+    for &x in diag {
+        buf.extend_from_slice(&(x * scale).to_le_bytes());
+        if buf.len() >= 16384 {
+            w.write_all(&buf)?;
+            buf.clear();
+        }
+    }
+    for i in 1..k {
+        for j in 0..i {
+            let bits = f32_to_bf16_bits(h[i * k + j] * scale);
+            buf.extend_from_slice(&bits.to_le_bytes());
+            if buf.len() >= 16384 {
+                w.write_all(&buf)?;
+                buf.clear();
+            }
         }
     }
     if !buf.is_empty() {
@@ -371,4 +466,40 @@ pub fn topk_logits(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
     idx.sort_unstable_by(|&a, &b| logits[b as usize].total_cmp(&logits[a as usize]));
     idx.truncate(k);
     idx.into_iter().map(|i| (i, logits[i as usize])).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bf16_to_f32(bits: u16) -> f32 {
+        f32::from_bits((bits as u32) << 16)
+    }
+
+    #[test]
+    fn compact_hessian_size_matches_diag_plus_lower_triangle() {
+        assert_eq!(compact_hessian_bytes(1), 4);
+        assert_eq!(compact_hessian_bytes(2), 10);
+        assert_eq!(compact_hessian_bytes(3), 18);
+        assert_eq!(compact_hessian_bytes(4096), 16_789_504);
+    }
+
+    #[test]
+    fn compact_hessian_writer_keeps_diag_f32_and_lower_bf16() {
+        let h = [1.0f32, 0.5, -0.25, 0.5, 2.0, 0.75, -0.25, 0.75, 4.0];
+        let diag = [1.0f32, 2.0, 4.0];
+        let mut out = Vec::new();
+        write_hessian_bf16_tril_diag_f32(&mut out, &h, &diag, 3, 1.0).unwrap();
+        assert_eq!(out.len(), compact_hessian_bytes(3) as usize);
+
+        let read_f32 = |off: usize| f32::from_le_bytes(out[off..off + 4].try_into().unwrap());
+        let read_bf16 =
+            |off: usize| bf16_to_f32(u16::from_le_bytes(out[off..off + 2].try_into().unwrap()));
+        assert_eq!(read_f32(0), 1.0);
+        assert_eq!(read_f32(4), 2.0);
+        assert_eq!(read_f32(8), 4.0);
+        assert_eq!(read_bf16(12), 0.5);
+        assert_eq!(read_bf16(14), -0.25);
+        assert_eq!(read_bf16(16), 0.75);
+    }
 }

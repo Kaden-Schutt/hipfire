@@ -5,10 +5,12 @@
 //! (`hipfire_arch_qwen35::qwen35::collect_calibration_artifacts` →
 //! `write_calib_artifacts`, or the `hipfire collect-artifacts` CLI / daemon
 //! `Collect` op). Each dense projection is stored as a `<name>.hessian`
-//! `[K,K]` F32 tensor alongside its `<name>.imatrix`; MoE routed experts are
-//! imatrix-only (their full Hessians don't fit), so they carry no `.hessian`
-//! entry and `get` returns `None` for them (the quantizer then skips LDLQ for
-//! that tensor — exactly the prior behavior).
+//! `[K,K]` tensor alongside its `<name>.imatrix`. Legacy packages store full
+//! row-major F32; compact packages store exact F32 diagonal plus BF16 lower
+//! strict triangle. MoE routed experts are imatrix-only (their full Hessians
+//! don't fit), so they carry no `.hessian` entry and `get` returns `None` for
+//! them (the quantizer then skips LDLQ for that tensor — exactly the prior
+//! behavior).
 //!
 //! This replaced the standalone HFHS `.hessian.bin` sidecar format: the engine
 //! emits one container, the quantizer reads it directly, and there is no second
@@ -38,8 +40,11 @@ use std::path::Path;
 const HFQM_MAGIC: &[u8; 4] = b"HFQM";
 const HFQM_VERSION_SUPPORTED: u32 = 1;
 const HEADER_SIZE: usize = 32;
-/// HFQM `quant_type` byte for F32 tensors (the collector writes Hessians as F32).
+/// HFQM `quant_type` byte for dense F32 tensors.
 const QUANT_TYPE_F32: u8 = 2;
+/// Calibration-only HFQM `quant_type` for compact Hessians:
+/// exact F32 diagonal followed by BF16 lower strict triangle.
+const QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32: u8 = 130;
 /// Suffix the collector appends to a tensor's canonical name for its Hessian.
 const HESSIAN_SUFFIX: &str = ".hessian";
 
@@ -100,6 +105,7 @@ impl From<std::io::Error> for HessianError {
 pub enum HessianDtype {
     F32,
     F64,
+    Bf16TrilDiagF32,
 }
 
 impl HessianDtype {
@@ -107,8 +113,22 @@ impl HessianDtype {
         match self {
             HessianDtype::F32 => 4,
             HessianDtype::F64 => 8,
+            HessianDtype::Bf16TrilDiagF32 => 0,
         }
     }
+}
+
+fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
+fn compact_hessian_bytes(k: usize) -> usize {
+    k * 4 + k * (k - 1)
+}
+
+fn lower_strict_index(i: usize, j: usize) -> usize {
+    debug_assert!(i > j);
+    i * (i - 1) / 2 + j
 }
 
 /// Zero-copy view into one Hessian record in the mmap.
@@ -126,12 +146,8 @@ impl<'a> HessianRef<'a> {
     /// Iterate the Hessian as `f64` values, promoting from FP32 if needed.
     /// The quantizer's Cholesky path uses this — never reads FP32 directly.
     pub fn iter_f64(&self) -> impl Iterator<Item = f64> + '_ {
-        let bytes = self.bytes;
         let n = self.k * self.k;
-        (0..n).map(move |i| match self.dtype {
-            HessianDtype::F32 => LittleEndian::read_f32(&bytes[i * 4..i * 4 + 4]) as f64,
-            HessianDtype::F64 => LittleEndian::read_f64(&bytes[i * 8..i * 8 + 8]),
-        })
+        (0..n).map(move |idx| self.at(idx / self.k, idx % self.k))
     }
 
     /// Read the `[i, j]` entry as f64. O(1).
@@ -145,6 +161,16 @@ impl<'a> HessianRef<'a> {
         match self.dtype {
             HessianDtype::F32 => LittleEndian::read_f32(&self.bytes[off..off + 4]) as f64,
             HessianDtype::F64 => LittleEndian::read_f64(&self.bytes[off..off + 8]),
+            HessianDtype::Bf16TrilDiagF32 => {
+                if i == j {
+                    let off = i * 4;
+                    LittleEndian::read_f32(&self.bytes[off..off + 4]) as f64
+                } else {
+                    let (r, c) = if i > j { (i, j) } else { (j, i) };
+                    let off = self.k * 4 + lower_strict_index(r, c) * 2;
+                    bf16_to_f32(LittleEndian::read_u16(&self.bytes[off..off + 2])) as f64
+                }
+            }
         }
     }
 }
@@ -311,26 +337,42 @@ impl HessianSidecar {
                 });
             }
 
-            // Retain only the dense `.hessian` tensors (F32, [K,K]).
+            // Retain dense `.hessian` tensors in either legacy F32 or compact
+            // BF16-triangle storage. Both expose the same logical [K,K] API.
             let Some(base) = name.strip_suffix(HESSIAN_SUFFIX) else {
                 continue;
             };
-            if quant_type != QUANT_TYPE_F32 || shape.len() != 2 || shape[0] != shape[1] {
+            if shape.len() != 2 || shape[0] != shape[1] {
                 continue;
             }
             let k = shape[0];
-            if k * k * 4 != data_size {
-                return Err(HessianError::InvalidData(format!(
-                    "{name}: K={k} implies {} bytes but data_size={data_size}",
-                    k * k * 4
-                )));
-            }
+            let dtype = match quant_type {
+                QUANT_TYPE_F32 => {
+                    if k * k * 4 != data_size {
+                        return Err(HessianError::InvalidData(format!(
+                            "{name}: dense F32 K={k} implies {} bytes but data_size={data_size}",
+                            k * k * 4
+                        )));
+                    }
+                    HessianDtype::F32
+                }
+                QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32 => {
+                    let expected = compact_hessian_bytes(k);
+                    if expected != data_size {
+                        return Err(HessianError::InvalidData(format!(
+                            "{name}: compact BF16-tril K={k} implies {expected} bytes but data_size={data_size}"
+                        )));
+                    }
+                    HessianDtype::Bf16TrilDiagF32
+                }
+                _ => continue,
+            };
             index.insert(
                 base.to_string(),
                 TensorEntry {
                     name: base.to_string(),
                     k,
-                    dtype: HessianDtype::F32,
+                    dtype,
                     payload_offset,
                     payload_bytes: data_size,
                 },
@@ -503,6 +545,85 @@ mod tests {
         tf
     }
 
+    fn f32_to_bf16_bits(f: f32) -> u16 {
+        let bits = f.to_bits();
+        if (bits >> 23) & 0xff == 0xff {
+            return (bits >> 16) as u16;
+        }
+        let bias = 0x7fff + ((bits >> 16) & 1);
+        (bits.wrapping_add(bias) >> 16) as u16
+    }
+
+    fn make_compact_test_package() -> NamedTempFile {
+        struct Entry {
+            name: &'static str,
+            quant_type: u8,
+            shape: Vec<u32>,
+            data: Vec<u8>,
+        }
+        let mut compact = Vec::new();
+        for v in [1.0f32, 2.0, 4.0] {
+            compact.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [0.5f32, -0.25, 0.75] {
+            compact.extend_from_slice(&f32_to_bf16_bits(v).to_le_bytes());
+        }
+        let entries = vec![
+            Entry {
+                name: "tB.hessian",
+                quant_type: QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32,
+                shape: vec![3, 3],
+                data: compact,
+            },
+            Entry {
+                name: "tB.imatrix",
+                quant_type: 2,
+                shape: vec![3],
+                data: [1.0f32, 2.0, 4.0]
+                    .iter()
+                    .flat_map(|x| x.to_le_bytes())
+                    .collect(),
+            },
+        ];
+
+        let metadata = b"{\"artifact_kind\":\"calibration\"}";
+        let metadata_offset = 32u64;
+        let index_offset = metadata_offset + metadata.len() as u64;
+        let mut index = Vec::new();
+        index.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for e in &entries {
+            index.extend_from_slice(&(e.name.len() as u16).to_le_bytes());
+            index.extend_from_slice(e.name.as_bytes());
+            index.push(e.quant_type);
+            index.push(e.shape.len() as u8);
+            for &d in &e.shape {
+                index.extend_from_slice(&d.to_le_bytes());
+            }
+            index.extend_from_slice(&0u32.to_le_bytes());
+            index.extend_from_slice(&(e.data.len() as u64).to_le_bytes());
+        }
+        let data_start = index_offset + index.len() as u64;
+        let data_offset = (data_start + 4095) & !4095;
+
+        let mut tf = NamedTempFile::new().unwrap();
+        let f = tf.as_file_mut();
+        f.write_all(b"HFQM").unwrap();
+        f.write_all(&1u32.to_le_bytes()).unwrap();
+        f.write_all(&0u32.to_le_bytes()).unwrap();
+        f.write_all(&(entries.len() as u32).to_le_bytes()).unwrap();
+        f.write_all(&metadata_offset.to_le_bytes()).unwrap();
+        f.write_all(&data_offset.to_le_bytes()).unwrap();
+        f.write_all(metadata).unwrap();
+        f.write_all(&index).unwrap();
+        f.write_all(&vec![0u8; (data_offset - data_start) as usize])
+            .unwrap();
+        for e in &entries {
+            f.write_all(&e.data).unwrap();
+        }
+        tf.flush().unwrap();
+        tf
+    }
+
     #[test]
     fn open_and_lookup_roundtrip() {
         let tf = make_test_package();
@@ -521,6 +642,32 @@ mod tests {
         // The query name is the canonical name WITHOUT the `.hessian` suffix.
         assert!(sc.get("tA.hessian", 0).is_none());
         assert!(sc.get("not_there", 0).is_none());
+    }
+
+    #[test]
+    fn open_and_lookup_compact_bf16_tril_roundtrip() {
+        let tf = make_compact_test_package();
+        let sc = HessianSidecar::open(tf.path()).unwrap();
+        assert_eq!(sc.n_tensors(), 1);
+
+        let tb = sc.get("tB", 0).expect("tB missing");
+        assert_eq!(tb.k, 3);
+        assert_eq!(tb.dtype, HessianDtype::Bf16TrilDiagF32);
+        assert_eq!(tb.at(0, 0), 1.0);
+        assert_eq!(tb.at(1, 1), 2.0);
+        assert_eq!(tb.at(2, 2), 4.0);
+        assert_eq!(tb.at(1, 0), 0.5);
+        assert_eq!(tb.at(0, 1), 0.5);
+        assert_eq!(tb.at(2, 0), -0.25);
+        assert_eq!(tb.at(0, 2), -0.25);
+        assert_eq!(tb.at(2, 1), 0.75);
+        assert_eq!(tb.at(1, 2), 0.75);
+        assert_eq!(
+            tb.iter_f64().collect::<Vec<_>>(),
+            vec![1.0, 0.5, -0.25, 0.5, 2.0, 0.75, -0.25, 0.75, 4.0]
+        );
+        HessianSidecar::check_symmetry(&tb, 0.0).unwrap();
+        HessianSidecar::check_positive_diagonal(&tb).unwrap();
     }
 
     #[test]
