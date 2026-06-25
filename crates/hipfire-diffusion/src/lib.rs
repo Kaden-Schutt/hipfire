@@ -201,6 +201,9 @@ pub struct DiffusionHipPreflight {
     pub probe_bytes: usize,
     pub kernel_probe: DiffusionHipKernelProbe,
     pub rgb_to_vae_tensor_kernel_probe: DiffusionHipKernelProbe,
+    pub latent_mask_weights_kernel_probe: DiffusionHipKernelProbe,
+    pub masked_rgb_inpaint_kernel_probe: DiffusionHipKernelProbe,
+    pub blend_latents_with_mask_kernel_probe: DiffusionHipKernelProbe,
     pub model_input_kernel_probe: DiffusionHipKernelProbe,
     pub guidance_kernel_probe: DiffusionHipKernelProbe,
     pub scheduler_kernel_probe: DiffusionHipKernelProbe,
@@ -2417,6 +2420,115 @@ impl DiffusionPipeline {
                 "HIP diffusion RGB-to-VAE kernel output differed from CPU reference".to_string(),
             ));
         }
+        let inpaint_mask_probe = RgbImageBatch {
+            batch: 2,
+            width: 4,
+            height: 4,
+            data: (0..96)
+                .map(|idx| ((idx * 37 + 11) % 256) as u8)
+                .collect::<Vec<_>>(),
+        };
+        let inpaint_image_probe = RgbImageBatch {
+            batch: 2,
+            width: 4,
+            height: 4,
+            data: (0..96)
+                .map(|idx| ((idx * 19 + 5) % 256) as u8)
+                .collect::<Vec<_>>(),
+        };
+        let inpaint_latent_probe = LatentBatch {
+            batch: 2,
+            channels: 2,
+            height: 2,
+            width: 2,
+            data: (0..16)
+                .map(|idx| idx as f32 / 7.0 - 1.0)
+                .collect::<Vec<_>>(),
+        };
+        let latent_mask_weights_cpu_reference =
+            latent_mask_weights_from_rgb_batch(&inpaint_mask_probe, &inpaint_latent_probe)?;
+        let latent_mask_weights_gpu_output = latent_mask_weights_from_rgb_batch_hip_on_gpu(
+            &mut gpu,
+            &inpaint_mask_probe,
+            &inpaint_latent_probe,
+        )?;
+        let latent_mask_weights_kernel_probe = DiffusionHipKernelProbe {
+            name: "diffusion_latent_mask_weights_from_rgb_f32".to_string(),
+            input_elements: inpaint_mask_probe.data.len(),
+            output_bytes: latent_mask_weights_gpu_output.len() * std::mem::size_of::<f32>(),
+            matched_cpu_reference: f32_slices_close(
+                &latent_mask_weights_gpu_output,
+                &latent_mask_weights_cpu_reference,
+                1e-6,
+            ),
+        };
+        if !latent_mask_weights_kernel_probe.matched_cpu_reference {
+            return Err(DiffusionError::BackendUnavailable(
+                "HIP diffusion latent-mask kernel output differed from CPU reference".to_string(),
+            ));
+        }
+        let masked_rgb_inpaint_cpu_reference =
+            masked_rgb_batch_for_inpaint(&inpaint_image_probe, &inpaint_mask_probe)?;
+        let masked_rgb_inpaint_gpu_output = masked_rgb_batch_for_inpaint_hip_on_gpu(
+            &mut gpu,
+            &inpaint_image_probe,
+            &inpaint_mask_probe,
+        )?;
+        let masked_rgb_inpaint_kernel_probe = DiffusionHipKernelProbe {
+            name: "diffusion_masked_rgb_for_inpaint_u8".to_string(),
+            input_elements: inpaint_image_probe.data.len() + inpaint_mask_probe.data.len(),
+            output_bytes: masked_rgb_inpaint_gpu_output.data.len(),
+            matched_cpu_reference: masked_rgb_inpaint_gpu_output
+                == masked_rgb_inpaint_cpu_reference,
+        };
+        if !masked_rgb_inpaint_kernel_probe.matched_cpu_reference {
+            return Err(DiffusionError::BackendUnavailable(
+                "HIP diffusion masked-RGB kernel output differed from CPU reference".to_string(),
+            ));
+        }
+        let generated_latents_probe = LatentBatch {
+            batch: 2,
+            channels: 2,
+            height: 2,
+            width: 2,
+            data: (0..16)
+                .map(|idx| (idx as f32 % 9.0 - 4.0) / 3.0)
+                .collect::<Vec<_>>(),
+        };
+        let mut blend_latents_cpu_reference = generated_latents_probe.clone();
+        blend_latents_with_mask(
+            &mut blend_latents_cpu_reference,
+            &inpaint_latent_probe,
+            &latent_mask_weights_cpu_reference,
+        )?;
+        let blend_latents_gpu_output = blend_latents_with_mask_hip_on_gpu(
+            &mut gpu,
+            &generated_latents_probe,
+            &inpaint_latent_probe,
+            &latent_mask_weights_cpu_reference,
+        )?;
+        let blend_latents_with_mask_kernel_probe = DiffusionHipKernelProbe {
+            name: "diffusion_blend_latents_with_mask_f32".to_string(),
+            input_elements: generated_latents_probe.data.len()
+                + inpaint_latent_probe.data.len()
+                + latent_mask_weights_cpu_reference.len(),
+            output_bytes: blend_latents_gpu_output.data.len() * std::mem::size_of::<f32>(),
+            matched_cpu_reference: blend_latents_gpu_output.batch
+                == blend_latents_cpu_reference.batch
+                && blend_latents_gpu_output.channels == blend_latents_cpu_reference.channels
+                && blend_latents_gpu_output.height == blend_latents_cpu_reference.height
+                && blend_latents_gpu_output.width == blend_latents_cpu_reference.width
+                && f32_slices_close(
+                    &blend_latents_gpu_output.data,
+                    &blend_latents_cpu_reference.data,
+                    1e-6,
+                ),
+        };
+        if !blend_latents_with_mask_kernel_probe.matched_cpu_reference {
+            return Err(DiffusionError::BackendUnavailable(
+                "HIP diffusion latent-blend kernel output differed from CPU reference".to_string(),
+            ));
+        }
         let model_input_sample = vec![-1.0, -0.25, 0.0, 0.5, 1.0, 2.0, -2.0, 0.125];
         let model_input_scale = 0.5;
         let model_input_cpu_reference = model_input_sample
@@ -3117,6 +3229,9 @@ impl DiffusionPipeline {
             probe_bytes: probe.len(),
             kernel_probe,
             rgb_to_vae_tensor_kernel_probe,
+            latent_mask_weights_kernel_probe,
+            masked_rgb_inpaint_kernel_probe,
+            blend_latents_with_mask_kernel_probe,
             model_input_kernel_probe,
             guidance_kernel_probe,
             scheduler_kernel_probe,
@@ -5780,6 +5895,86 @@ extern "C" __global__ void diffusion_vae_moments_to_latents_f32(
 "#;
 
 #[cfg(feature = "rocm")]
+const DIFFUSION_INPAINT_MASK_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+#include <math.h>
+
+extern "C" __global__ void diffusion_latent_mask_weights_from_rgb_f32(
+    const unsigned char* mask,
+    float* output,
+    int total_outputs,
+    int mask_height,
+    int mask_width,
+    int latent_height,
+    int latent_width
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_outputs) {
+        return;
+    }
+    int latent_pixels = latent_height * latent_width;
+    int b = idx / latent_pixels;
+    int rem = idx - b * latent_pixels;
+    int y = rem / latent_width;
+    int x = rem - y * latent_width;
+    int source_y = (y * mask_height) / latent_height;
+    int source_x = (x * mask_width) / latent_width;
+    int max_y = mask_height > 0 ? mask_height - 1 : 0;
+    int max_x = mask_width > 0 ? mask_width - 1 : 0;
+    source_y = source_y < max_y ? source_y : max_y;
+    source_x = source_x < max_x ? source_x : max_x;
+    int mask_idx = (b * mask_height * mask_width + source_y * mask_width + source_x) * 3;
+    float luma = ((float)mask[mask_idx] + (float)mask[mask_idx + 1] + (float)mask[mask_idx + 2])
+        / (3.0f * 255.0f);
+    output[idx] = fminf(fmaxf(luma, 0.0f), 1.0f);
+}
+
+extern "C" __global__ void diffusion_masked_rgb_for_inpaint_u8(
+    const unsigned char* image,
+    const unsigned char* mask,
+    unsigned char* output,
+    int total_pixels
+) {
+    int pixel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pixel >= total_pixels) {
+        return;
+    }
+    int idx = pixel * 3;
+    float weight = ((float)mask[idx] + (float)mask[idx + 1] + (float)mask[idx + 2])
+        / (3.0f * 255.0f);
+    float keep = 1.0f - fminf(fmaxf(weight, 0.0f), 1.0f);
+    output[idx] = (unsigned char)fminf(fmaxf(floorf((float)image[idx] * keep + 0.5f), 0.0f), 255.0f);
+    output[idx + 1] = (unsigned char)fminf(fmaxf(floorf((float)image[idx + 1] * keep + 0.5f), 0.0f), 255.0f);
+    output[idx + 2] = (unsigned char)fminf(fmaxf(floorf((float)image[idx + 2] * keep + 0.5f), 0.0f), 255.0f);
+}
+
+extern "C" __global__ void diffusion_blend_latents_with_mask_f32(
+    const float* generated,
+    const float* init,
+    const float* mask,
+    float* output,
+    int total_outputs,
+    int channels,
+    int height,
+    int width
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_outputs) {
+        return;
+    }
+    int x = idx % width;
+    int t = idx / width;
+    int y = t % height;
+    t /= height;
+    int c = t % channels;
+    int b = t / channels;
+    int mask_idx = (b * height + y) * width + x;
+    float weight = mask[mask_idx];
+    output[idx] = init[idx] * (1.0f - weight) + generated[idx] * weight;
+}
+"#;
+
+#[cfg(feature = "rocm")]
 const DIFFUSION_EULER_STEP_HIP_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 #include <float.h>
@@ -6735,6 +6930,380 @@ fn vae_moments_to_latents_hip_on_gpu(
         channels: latent_channels,
         height,
         width,
+        data,
+    })
+}
+
+#[cfg(feature = "rocm")]
+fn latent_mask_weights_from_rgb_batch_hip_on_gpu(
+    gpu: &mut rdna_compute::Gpu,
+    mask: &RgbImageBatch,
+    latents: &LatentBatch,
+) -> DiffusionResult<Vec<f32>> {
+    if mask.batch != latents.batch {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "mask batch {} != latent batch {}",
+            mask.batch, latents.batch
+        )));
+    }
+    let bytes_per_image = mask
+        .width
+        .checked_mul(mask.height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| DiffusionError::InvalidRequest("mask dimensions overflow".to_string()))?;
+    let expected = bytes_per_image.checked_mul(mask.batch).ok_or_else(|| {
+        DiffusionError::InvalidRequest("mask batch dimensions overflow".to_string())
+    })?;
+    if mask.data.len() != expected {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "mask has {} bytes, expected {expected}",
+            mask.data.len()
+        )));
+    }
+    let output_elements = latents
+        .batch
+        .checked_mul(latents.height)
+        .and_then(|pixels| pixels.checked_mul(latents.width))
+        .ok_or_else(|| DiffusionError::InvalidRequest("latent mask size overflows".to_string()))?;
+    if output_elements == 0 {
+        return Ok(Vec::new());
+    }
+    let output_bytes = output_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata("latent mask output size overflows".to_string())
+        })?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mask_gpu = gpu
+        .hip
+        .malloc(mask.data.len())
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    gpu.hip
+        .memcpy_htod(&mask_gpu, &mask.data)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = gpu
+        .hip
+        .malloc(output_bytes)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = compiler
+        .compile(
+            "diffusion_latent_mask_weights_from_rgb_f32",
+            DIFFUSION_INPAINT_MASK_HIP_SRC,
+        )
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = obj_path
+        .to_str()
+        .ok_or_else(|| {
+            DiffusionError::BackendUnavailable(
+                "compiled diffusion latent-mask kernel path is not UTF-8".to_string(),
+            )
+        })?
+        .to_string();
+    let module = gpu
+        .hip
+        .module_load(&obj_path)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let function = gpu
+        .hip
+        .module_get_function(&module, "diffusion_latent_mask_weights_from_rgb_f32")
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(mask_gpu.as_ptr());
+    kernargs.push_ptr(output_gpu.as_ptr());
+    kernargs.push_i32(i32_kernel_dim(
+        "latent mask output elements",
+        output_elements,
+    )?);
+    kernargs.push_i32(i32_kernel_dim("latent mask source height", mask.height)?);
+    kernargs.push_i32(i32_kernel_dim("latent mask source width", mask.width)?);
+    kernargs.push_i32(i32_kernel_dim("latent mask output height", latents.height)?);
+    kernargs.push_i32(i32_kernel_dim("latent mask output width", latents.width)?);
+    kernargs.pad_to(16);
+    let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+    unsafe {
+        gpu.hip
+            .launch_kernel_blob(
+                &function,
+                grid,
+                [256, 1, 1],
+                0,
+                gpu.active_stream.as_ref(),
+                kernargs.as_mut_slice(),
+            )
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output = download_f32_buffer(gpu, &output_gpu, output_elements)?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    gpu.hip
+        .free(mask_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(output)
+}
+
+#[cfg(feature = "rocm")]
+fn masked_rgb_batch_for_inpaint_hip_on_gpu(
+    gpu: &mut rdna_compute::Gpu,
+    image: &RgbImageBatch,
+    mask: &RgbImageBatch,
+) -> DiffusionResult<RgbImageBatch> {
+    if image.batch != mask.batch || image.width != mask.width || image.height != mask.height {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "inpaint image shape [{}x{}x{}] != mask shape [{}x{}x{}]",
+            image.batch, image.width, image.height, mask.batch, mask.width, mask.height
+        )));
+    }
+    let expected = image
+        .batch
+        .checked_mul(image.width)
+        .and_then(|pixels| pixels.checked_mul(image.height))
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| DiffusionError::InvalidRequest("image dimensions overflow".to_string()))?;
+    if image.data.len() != expected {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "image has {} bytes, expected {expected}",
+            image.data.len()
+        )));
+    }
+    if mask.data.len() != expected {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "mask has {} bytes, expected {expected}",
+            mask.data.len()
+        )));
+    }
+    if expected == 0 {
+        return Ok(RgbImageBatch {
+            batch: image.batch,
+            width: image.width,
+            height: image.height,
+            data: Vec::new(),
+        });
+    }
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let image_gpu = gpu
+        .hip
+        .malloc(image.data.len())
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    gpu.hip
+        .memcpy_htod(&image_gpu, &image.data)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mask_gpu = gpu
+        .hip
+        .malloc(mask.data.len())
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    gpu.hip
+        .memcpy_htod(&mask_gpu, &mask.data)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = gpu
+        .hip
+        .malloc(expected)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = compiler
+        .compile(
+            "diffusion_masked_rgb_for_inpaint_u8",
+            DIFFUSION_INPAINT_MASK_HIP_SRC,
+        )
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = obj_path
+        .to_str()
+        .ok_or_else(|| {
+            DiffusionError::BackendUnavailable(
+                "compiled diffusion masked-RGB kernel path is not UTF-8".to_string(),
+            )
+        })?
+        .to_string();
+    let module = gpu
+        .hip
+        .module_load(&obj_path)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let function = gpu
+        .hip
+        .module_get_function(&module, "diffusion_masked_rgb_for_inpaint_u8")
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let total_pixels = expected / 3;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(image_gpu.as_ptr());
+    kernargs.push_ptr(mask_gpu.as_ptr());
+    kernargs.push_ptr(output_gpu.as_ptr());
+    kernargs.push_i32(i32_kernel_dim("masked RGB pixels", total_pixels)?);
+    kernargs.pad_to(16);
+    let grid = [((total_pixels as u32).saturating_add(255)) / 256, 1, 1];
+    unsafe {
+        gpu.hip
+            .launch_kernel_blob(
+                &function,
+                grid,
+                [256, 1, 1],
+                0,
+                gpu.active_stream.as_ref(),
+                kernargs.as_mut_slice(),
+            )
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut data = vec![0u8; expected];
+    gpu.hip
+        .memcpy_dtoh(&mut data, &output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    gpu.hip
+        .free(mask_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    gpu.hip
+        .free(image_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(RgbImageBatch {
+        batch: image.batch,
+        width: image.width,
+        height: image.height,
+        data,
+    })
+}
+
+#[cfg(feature = "rocm")]
+fn blend_latents_with_mask_hip_on_gpu(
+    gpu: &mut rdna_compute::Gpu,
+    generated: &LatentBatch,
+    init: &LatentBatch,
+    mask_weights: &[f32],
+) -> DiffusionResult<LatentBatch> {
+    if generated.batch != init.batch
+        || generated.channels != init.channels
+        || generated.height != init.height
+        || generated.width != init.width
+    {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "generated latent shape [{}x{}x{}x{}] != init latent shape [{}x{}x{}x{}]",
+            generated.batch,
+            generated.channels,
+            generated.height,
+            generated.width,
+            init.batch,
+            init.channels,
+            init.height,
+            init.width
+        )));
+    }
+    let expected_mask = generated.batch * generated.height * generated.width;
+    if mask_weights.len() != expected_mask {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "latent mask has {} weights, expected {expected_mask}",
+            mask_weights.len()
+        )));
+    }
+    let output_elements = generated
+        .batch
+        .checked_mul(generated.channels)
+        .and_then(|elements| elements.checked_mul(generated.height))
+        .and_then(|elements| elements.checked_mul(generated.width))
+        .ok_or_else(|| {
+            DiffusionError::InvalidRequest("latent output size overflows".to_string())
+        })?;
+    if generated.data.len() != output_elements || init.data.len() != output_elements {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "latent data length mismatch for shape [{}x{}x{}x{}]",
+            generated.batch, generated.channels, generated.height, generated.width
+        )));
+    }
+    if output_elements == 0 {
+        return Ok(generated.clone());
+    }
+    let output_bytes = output_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata("latent blend output size overflows".to_string())
+        })?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let generated_gpu = gpu
+        .upload_f32(&generated.data, &[output_elements])
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let init_gpu = gpu
+        .upload_f32(&init.data, &[output_elements])
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mask_gpu = gpu
+        .upload_f32(mask_weights, &[mask_weights.len()])
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = gpu
+        .hip
+        .malloc(output_bytes)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = compiler
+        .compile(
+            "diffusion_blend_latents_with_mask_f32",
+            DIFFUSION_INPAINT_MASK_HIP_SRC,
+        )
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = obj_path
+        .to_str()
+        .ok_or_else(|| {
+            DiffusionError::BackendUnavailable(
+                "compiled diffusion latent-blend kernel path is not UTF-8".to_string(),
+            )
+        })?
+        .to_string();
+    let module = gpu
+        .hip
+        .module_load(&obj_path)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let function = gpu
+        .hip
+        .module_get_function(&module, "diffusion_blend_latents_with_mask_f32")
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(generated_gpu.buf.as_ptr());
+    kernargs.push_ptr(init_gpu.buf.as_ptr());
+    kernargs.push_ptr(mask_gpu.buf.as_ptr());
+    kernargs.push_ptr(output_gpu.as_ptr());
+    kernargs.push_i32(i32_kernel_dim(
+        "latent blend output elements",
+        output_elements,
+    )?);
+    kernargs.push_i32(i32_kernel_dim("latent blend channels", generated.channels)?);
+    kernargs.push_i32(i32_kernel_dim("latent blend height", generated.height)?);
+    kernargs.push_i32(i32_kernel_dim("latent blend width", generated.width)?);
+    kernargs.pad_to(16);
+    let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+    unsafe {
+        gpu.hip
+            .launch_kernel_blob(
+                &function,
+                grid,
+                [256, 1, 1],
+                0,
+                gpu.active_stream.as_ref(),
+                kernargs.as_mut_slice(),
+            )
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(LatentBatch {
+        batch: generated.batch,
+        channels: generated.channels,
+        height: generated.height,
+        width: generated.width,
         data,
     })
 }
@@ -15381,6 +15950,88 @@ mod tests {
             assert!(
                 (actual - expected).abs() <= 1e-6,
                 "VAE moments-to-latents mismatch at {index}: hip={actual} cpu={expected}"
+            );
+        }
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn hip_inpaint_mask_ops_match_cpu_reference_when_gpu_is_available() {
+        let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!(
+                    "skip: ROCm GPU unavailable for inpaint mask kernel parity test: {error}"
+                );
+                return;
+            }
+        };
+        let image = RgbImageBatch {
+            batch: 2,
+            width: 4,
+            height: 4,
+            data: (0..96)
+                .map(|idx| ((idx * 19 + 5) % 256) as u8)
+                .collect::<Vec<_>>(),
+        };
+        let mask = RgbImageBatch {
+            batch: 2,
+            width: 4,
+            height: 4,
+            data: (0..96)
+                .map(|idx| ((idx * 37 + 11) % 256) as u8)
+                .collect::<Vec<_>>(),
+        };
+        let init_latents = LatentBatch {
+            batch: 2,
+            channels: 2,
+            height: 2,
+            width: 2,
+            data: (0..16)
+                .map(|idx| idx as f32 / 7.0 - 1.0)
+                .collect::<Vec<_>>(),
+        };
+        let generated_latents = LatentBatch {
+            batch: 2,
+            channels: 2,
+            height: 2,
+            width: 2,
+            data: (0..16)
+                .map(|idx| (idx as f32 % 9.0 - 4.0) / 3.0)
+                .collect::<Vec<_>>(),
+        };
+
+        let cpu_weights = latent_mask_weights_from_rgb_batch(&mask, &init_latents).unwrap();
+        let hip_weights =
+            latent_mask_weights_from_rgb_batch_hip_on_gpu(&mut gpu, &mask, &init_latents).unwrap();
+        for (index, (actual, expected)) in hip_weights.iter().zip(&cpu_weights).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1e-6,
+                "latent mask mismatch at {index}: hip={actual} cpu={expected}"
+            );
+        }
+
+        let cpu_masked = masked_rgb_batch_for_inpaint(&image, &mask).unwrap();
+        let hip_masked = masked_rgb_batch_for_inpaint_hip_on_gpu(&mut gpu, &image, &mask).unwrap();
+        assert_eq!(hip_masked, cpu_masked);
+
+        let mut cpu_blend = generated_latents.clone();
+        blend_latents_with_mask(&mut cpu_blend, &init_latents, &cpu_weights).unwrap();
+        let hip_blend = blend_latents_with_mask_hip_on_gpu(
+            &mut gpu,
+            &generated_latents,
+            &init_latents,
+            &cpu_weights,
+        )
+        .unwrap();
+        assert_eq!(hip_blend.batch, cpu_blend.batch);
+        assert_eq!(hip_blend.channels, cpu_blend.channels);
+        assert_eq!(hip_blend.height, cpu_blend.height);
+        assert_eq!(hip_blend.width, cpu_blend.width);
+        for (index, (actual, expected)) in hip_blend.data.iter().zip(&cpu_blend.data).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1e-6,
+                "latent blend mismatch at {index}: hip={actual} cpu={expected}"
             );
         }
     }

@@ -208,11 +208,12 @@ decode, and VAE encode for img2img. ROCm preflight can validate the planned
 device buffers plus individual diffusion kernels for model-input scaling,
 classifier-free guidance, Euler scheduler updates, centered UNet input,
 timestep embeddings, RGB-to-VAE tensor conversion, VAE moments-to-latents
-scaling, residual tensor add, NCHW channel-bias add, NCHW/BSC layout transforms,
-NCHW channel concat, 2D/3D last-dim concat, f32 NCHW Conv2D, f32 NCHW GroupNorm,
-SiLU, nearest-neighbor upsample, f32 dense linear projection, f32 LayerNorm, f32
-row softmax, f32 3D scaled-dot-product attention, f32 CLIP causal
-self-attention, GeGLU gate, and RGB conversion, but full generation is not
+scaling, latent mask downsampling, masked RGB inpaint preparation, latent mask
+blending, residual tensor add, NCHW channel-bias add, NCHW/BSC layout
+transforms, NCHW channel concat, 2D/3D last-dim concat, f32 NCHW Conv2D, f32
+NCHW GroupNorm, SiLU, nearest-neighbor upsample, f32 dense linear projection,
+f32 LayerNorm, f32 row softmax, f32 3D scaled-dot-product attention, f32 CLIP
+causal self-attention, GeGLU gate, and RGB conversion, but full generation is not
 routed through a GPU UNet runtime yet.
 The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128,
 HFQ4G256, and HFQ6G256 tensor payloads even when the artifact `weight_format`
@@ -279,7 +280,8 @@ buffer classes, run a small host/device roundtrip probe, and launch diffusion
 kernels for model-input scaling, classifier-free guidance, Euler scheduler
 updates, centered UNet input, timestep embeddings, RGB-to-VAE tensor
 conversion, VAE moments-to-latents scaling, residual tensor add, NCHW
-channel-bias add, NCHW/BSC layout transforms, NCHW channel concat, 2D/3D
+channel-bias add, latent mask downsampling, masked RGB inpaint preparation,
+latent mask blending, NCHW/BSC layout transforms, NCHW channel concat, 2D/3D
 last-dim concat, f32 NCHW Conv2D, f32 NCHW GroupNorm, SiLU, nearest-neighbor
 upsample, f32 dense linear projection, f32 LayerNorm, f32 row softmax, f32 3D
 scaled-dot-product attention, f32 CLIP causal self-attention, GeGLU gate, and
