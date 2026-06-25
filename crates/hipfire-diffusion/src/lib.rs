@@ -203,6 +203,7 @@ pub struct DiffusionHipPreflight {
     pub model_input_kernel_probe: DiffusionHipKernelProbe,
     pub guidance_kernel_probe: DiffusionHipKernelProbe,
     pub scheduler_kernel_probe: DiffusionHipKernelProbe,
+    pub conv2d_kernel_probe: DiffusionHipKernelProbe,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2456,6 +2457,44 @@ impl DiffusionPipeline {
                 "HIP diffusion scheduler kernel output differed from CPU reference".to_string(),
             ));
         }
+        let conv2d_input = CpuTensor {
+            shape: vec![1, 2, 3, 4],
+            data: (0..24)
+                .map(|idx| idx as f32 / 8.0 - 1.5)
+                .collect::<Vec<_>>(),
+        };
+        let conv2d_weight = CpuTensor {
+            shape: vec![3, 2, 3, 2],
+            data: (0..36)
+                .map(|idx| (idx as f32 % 7.0 - 3.0) / 5.0)
+                .collect::<Vec<_>>(),
+        };
+        let conv2d_bias = CpuTensor {
+            shape: vec![3],
+            data: vec![0.25, -0.5, 0.75],
+        };
+        let conv2d_cpu_reference =
+            conv2d_nchw_with_stride(&conv2d_input, &conv2d_weight, Some(&conv2d_bias), 1, 2)?;
+        let conv2d_gpu_output = conv2d_nchw_hip_on_gpu(
+            &mut gpu,
+            &conv2d_input,
+            &conv2d_weight,
+            Some(&conv2d_bias),
+            1,
+            2,
+        )?;
+        let conv2d_kernel_probe = DiffusionHipKernelProbe {
+            name: "diffusion_conv2d_nchw_f32".to_string(),
+            input_elements: conv2d_input.data.len() + conv2d_weight.data.len(),
+            output_bytes: conv2d_gpu_output.data.len() * std::mem::size_of::<f32>(),
+            matched_cpu_reference: conv2d_gpu_output.shape == conv2d_cpu_reference.shape
+                && f32_slices_close(&conv2d_gpu_output.data, &conv2d_cpu_reference.data, 1e-5),
+        };
+        if !conv2d_kernel_probe.matched_cpu_reference {
+            return Err(DiffusionError::BackendUnavailable(
+                "HIP diffusion Conv2D kernel output differed from CPU reference".to_string(),
+            ));
+        }
 
         Ok(DiffusionHipPreflight {
             device_id: gpu.device_id,
@@ -2467,6 +2506,7 @@ impl DiffusionPipeline {
             model_input_kernel_probe,
             guidance_kernel_probe,
             scheduler_kernel_probe,
+            conv2d_kernel_probe,
         })
     }
 
@@ -5139,6 +5179,64 @@ extern "C" __global__ void diffusion_cfg_guidance_f32(
 "#;
 
 #[cfg(feature = "rocm")]
+const DIFFUSION_CONV2D_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void diffusion_conv2d_nchw_f32(
+    const float* input,
+    const float* weight,
+    const float* bias,
+    float* output,
+    int total_outputs,
+    int batch,
+    int in_channels,
+    int in_h,
+    int in_w,
+    int out_channels,
+    int out_h,
+    int out_w,
+    int kernel_h,
+    int kernel_w,
+    int padding,
+    int stride,
+    int has_bias
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_outputs) {
+        return;
+    }
+    int ox = idx % out_w;
+    int t = idx / out_w;
+    int oy = t % out_h;
+    t /= out_h;
+    int oc = t % out_channels;
+    int b = t / out_channels;
+
+    float acc = has_bias ? bias[oc] : 0.0f;
+    for (int ic = 0; ic < in_channels; ++ic) {
+        for (int ky = 0; ky < kernel_h; ++ky) {
+            int iy_with_pad = oy * stride + ky;
+            if (iy_with_pad < padding || iy_with_pad >= in_h + padding) {
+                continue;
+            }
+            int iy = iy_with_pad - padding;
+            for (int kx = 0; kx < kernel_w; ++kx) {
+                int ix_with_pad = ox * stride + kx;
+                if (ix_with_pad < padding || ix_with_pad >= in_w + padding) {
+                    continue;
+                }
+                int ix = ix_with_pad - padding;
+                int input_idx = ((b * in_channels + ic) * in_h + iy) * in_w + ix;
+                int weight_idx = ((oc * in_channels + ic) * kernel_h + ky) * kernel_w + kx;
+                acc += input[input_idx] * weight[weight_idx];
+            }
+        }
+    }
+    output[idx] = acc;
+}
+"#;
+
+#[cfg(feature = "rocm")]
 fn rgb_tensor_to_u8_hip_on_gpu(
     gpu: &mut rdna_compute::Gpu,
     tensor: &CpuTensor,
@@ -5406,6 +5504,146 @@ fn cfg_guidance_hip_on_gpu(
         .free(output_gpu)
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
     Ok(output)
+}
+
+#[cfg(feature = "rocm")]
+fn i32_kernel_dim(label: &str, value: usize) -> DiffusionResult<i32> {
+    i32::try_from(value)
+        .map_err(|_| DiffusionError::InvalidRequest(format!("{label} value {value} exceeds i32")))
+}
+
+#[cfg(feature = "rocm")]
+fn conv2d_nchw_hip_on_gpu(
+    gpu: &mut rdna_compute::Gpu,
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    bias: Option<&CpuTensor>,
+    padding: usize,
+    stride: usize,
+) -> DiffusionResult<CpuTensor> {
+    if stride == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "conv2d stride must be positive".to_string(),
+        ));
+    }
+    let [batch, in_channels, in_h, in_w] = shape4(input)?;
+    let [out_channels, weight_in_channels, kernel_h, kernel_w] = shape4(weight)?;
+    if in_channels != weight_in_channels {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "conv2d input channels {in_channels} != weight input channels {weight_in_channels}"
+        )));
+    }
+    if let Some(bias) = bias {
+        if bias.shape.as_slice() != [out_channels] {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "conv2d bias shape {:?} != [{out_channels}]",
+                bias.shape
+            )));
+        }
+    }
+    let padded_h = in_h + 2 * padding;
+    let padded_w = in_w + 2 * padding;
+    if kernel_h > padded_h || kernel_w > padded_w {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "conv2d kernel [{kernel_h}, {kernel_w}] is larger than padded input [{padded_h}, {padded_w}]"
+        )));
+    }
+    let out_h = (padded_h - kernel_h) / stride + 1;
+    let out_w = (padded_w - kernel_w) / stride + 1;
+    let output_elements =
+        checked_shape_elements("conv2d output", &[batch, out_channels, out_h, out_w])?;
+    if output_elements == 0 {
+        return Ok(CpuTensor::zeros(&[batch, out_channels, out_h, out_w]));
+    }
+    let output_bytes = output_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata("conv2d output size overflows".to_string())
+        })?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let input_gpu = gpu
+        .upload_f32(&input.data, &input.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let weight_gpu = gpu
+        .upload_f32(&weight.data, &weight.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let bias_gpu = bias
+        .map(|bias| gpu.upload_f32(&bias.data, &bias.shape))
+        .transpose()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = gpu
+        .hip
+        .malloc(output_bytes)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = compiler
+        .compile("diffusion_conv2d_nchw_f32", DIFFUSION_CONV2D_HIP_SRC)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = obj_path
+        .to_str()
+        .ok_or_else(|| {
+            DiffusionError::BackendUnavailable(
+                "compiled diffusion Conv2D kernel path is not UTF-8".to_string(),
+            )
+        })?
+        .to_string();
+    let module = gpu
+        .hip
+        .module_load(&obj_path)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let function = gpu
+        .hip
+        .module_get_function(&module, "diffusion_conv2d_nchw_f32")
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(input_gpu.buf.as_ptr());
+    kernargs.push_ptr(weight_gpu.buf.as_ptr());
+    if let Some(bias_gpu) = bias_gpu.as_ref() {
+        kernargs.push_ptr(bias_gpu.buf.as_ptr());
+    } else {
+        kernargs.push_ptr(std::ptr::null());
+    }
+    kernargs.push_ptr(output_gpu.as_ptr());
+    kernargs.push_i32(i32_kernel_dim("conv2d output elements", output_elements)?);
+    kernargs.push_i32(i32_kernel_dim("conv2d batch", batch)?);
+    kernargs.push_i32(i32_kernel_dim("conv2d input channels", in_channels)?);
+    kernargs.push_i32(i32_kernel_dim("conv2d input height", in_h)?);
+    kernargs.push_i32(i32_kernel_dim("conv2d input width", in_w)?);
+    kernargs.push_i32(i32_kernel_dim("conv2d output channels", out_channels)?);
+    kernargs.push_i32(i32_kernel_dim("conv2d output height", out_h)?);
+    kernargs.push_i32(i32_kernel_dim("conv2d output width", out_w)?);
+    kernargs.push_i32(i32_kernel_dim("conv2d kernel height", kernel_h)?);
+    kernargs.push_i32(i32_kernel_dim("conv2d kernel width", kernel_w)?);
+    kernargs.push_i32(i32_kernel_dim("conv2d padding", padding)?);
+    kernargs.push_i32(i32_kernel_dim("conv2d stride", stride)?);
+    kernargs.push_i32(if bias.is_some() { 1 } else { 0 });
+    kernargs.pad_to(16);
+    let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+    unsafe {
+        gpu.hip
+            .launch_kernel_blob(
+                &function,
+                grid,
+                [256, 1, 1],
+                0,
+                gpu.active_stream.as_ref(),
+                kernargs.as_mut_slice(),
+            )
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(CpuTensor {
+        shape: vec![batch, out_channels, out_h, out_w],
+        data,
+    })
 }
 
 #[cfg(feature = "rocm")]
@@ -12206,6 +12444,46 @@ mod tests {
         let hip_guided =
             cfg_guidance_hip_on_gpu(&mut gpu, &negative, &positive, cfg_scale).unwrap();
         assert!(f32_slices_close(&hip_guided, &cpu_guided.data, 1e-6));
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn hip_conv2d_matches_cpu_reference_when_gpu_is_available() {
+        let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!("skip: ROCm GPU unavailable for Conv2D kernel parity test: {error}");
+                return;
+            }
+        };
+        let input = CpuTensor {
+            shape: vec![2, 2, 3, 4],
+            data: (0..48)
+                .map(|idx| idx as f32 / 11.0 - 2.0)
+                .collect::<Vec<_>>(),
+        };
+        let weight = CpuTensor {
+            shape: vec![3, 2, 3, 2],
+            data: (0..36)
+                .map(|idx| (idx as f32 % 9.0 - 4.0) / 6.0)
+                .collect::<Vec<_>>(),
+        };
+        let bias = CpuTensor {
+            shape: vec![3],
+            data: vec![0.25, -0.5, 0.75],
+        };
+        for bias in [Some(&bias), None] {
+            let cpu = conv2d_nchw_with_stride(&input, &weight, bias, 1, 2).unwrap();
+            let hip = conv2d_nchw_hip_on_gpu(&mut gpu, &input, &weight, bias, 1, 2).unwrap();
+
+            assert_eq!(hip.shape, cpu.shape);
+            for (index, (actual, expected)) in hip.data.iter().zip(&cpu.data).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= 1e-5,
+                    "Conv2D mismatch at {index}: hip={actual} cpu={expected}"
+                );
+            }
+        }
     }
 
     #[test]

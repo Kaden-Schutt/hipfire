@@ -206,12 +206,13 @@ Runtime note: runnable `.hfq` diffusion artifacts currently use the native
 UNet-family CPU reference path for CLIP text conditioning, UNet denoising, VAE
 decode, and VAE encode for img2img. ROCm preflight can validate the planned
 device buffers plus individual diffusion kernels for model-input scaling,
-classifier-free guidance, Euler scheduler updates, and RGB conversion, but full
-generation is not routed through a GPU UNet runtime yet. The runtime accepts
-Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128, HFQ4G256, and HFQ6G256 tensor
-payloads even when the artifact `weight_format` records a future quantized
-format such as `oq4`; OQ/MQ/HFP and other packed payloads still require a
-matching diffusion dequantizer/HIP runtime before they can generate images.
+classifier-free guidance, Euler scheduler updates, f32 NCHW Conv2D, and RGB
+conversion, but full generation is not routed through a GPU UNet runtime yet.
+The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128,
+HFQ4G256, and HFQ6G256 tensor payloads even when the artifact `weight_format`
+records a future quantized format such as `oq4`; OQ/MQ/HFP and other packed
+payloads still require a matching diffusion dequantizer/HIP runtime before they
+can generate images.
 
 **Usage:** `hipfire diffusion <COMMAND>`
 
@@ -270,8 +271,8 @@ resolution, batch, scheduler, and prompt set. Builds compiled with
 `--features rocm` also initialize the selected HIP device, allocate the planned
 buffer classes, run a small host/device roundtrip probe, and launch diffusion
 kernels for model-input scaling, classifier-free guidance, Euler scheduler
-updates, and RGB conversion. Each kernel probe is checked against the CPU
-reference and reported in the JSON output.
+updates, f32 NCHW Conv2D, and RGB conversion. Each kernel probe is checked
+against the CPU reference and reported in the JSON output.
 
 **Usage:** `hipfire diffusion preflight [OPTIONS] --model <MODEL>`
 
