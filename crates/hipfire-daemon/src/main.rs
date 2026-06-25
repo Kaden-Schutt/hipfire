@@ -2996,6 +2996,7 @@ fn main() {
                             12 => "gemma3",
                             13 => "gemma3_vl",
                             14 => "nemotron_h",
+                            15 => "mamba2",
                             _ => "qwen3",
                         };
                         let vl = m.vision_config.is_some()

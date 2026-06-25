@@ -5705,60 +5705,83 @@ fn main() {
         .unwrap_or_else(|_| panic!("Cannot read {}. If using a HuggingFace model ID, ensure it's downloaded: huggingface-cli download {}", config_path.display(), input_dir.display()));
     let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
 
+    let is_mamba2_config = config
+        .get("ssm_cfg")
+        .and_then(|v| v.get("layer"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.eq_ignore_ascii_case("mamba2"))
+        .unwrap_or(false)
+        || config
+            .get("architectures")
+            .and_then(|v| v.as_array())
+            .map(|archs| {
+                archs
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .any(|arch| arch.to_ascii_lowercase().contains("mamba2"))
+            })
+            .unwrap_or(false);
     let arch_str = config
         .get("model_type")
         .and_then(|v| v.as_str())
         .unwrap_or("llama");
-    let auto_arch_id = match arch_str {
-        "llama" => 0u32,
-        "qwen3" | "qwen2" => 1,
-        "qwen3_5" | "qwen3_5_text" => 5,
-        // Qwen3.5 MoE (Qwen3.5-35B-A3B and friends): hybrid LA+FA attention identical
-        // to qwen3_5 dense, but every layer's FFN is MoE with stacked-3D expert
-        // tensors (mlp.experts.gate_up_proj/down_proj are [num_experts, ...]).
-        "qwen3_5_moe" | "qwen3_5_moe_text" => 6,
-        // dots.ocr (Qwen2-VL family layout-extraction VLM): plain Qwen2-1.5B
-        // text decoder + 42-block DotsVisionTransformer with 2-D RoPE,
-        // SwiGLU, RMSNorm. Crate: hipfire-arch-dots-ocr. See docs/plans/
-        // dots-ocr-prd.md.
-        "dots_ocr" => 8,
-        // DeepSeek V4 Flash: 256 routed + 1 shared experts, Hyper-Connections,
-        // compressed-KV indexer, FP8 E4M3 + UE8M0 block-scale storage. See
-        // crates/hipfire-arch-deepseek4. Phase 1 ingest only — no forward
-        // path yet; tensor names ship in DeepSeek V4's native shape (split w1/w2/w3,
-        // per-expert) and are translated when the forward bring-up lands.
-        "deepseek_v4" => 9,
-        // MiniMax-M2 (Mixtral-style MoE): GQA + per-layer QK-norm + partial
-        // rotate_half RoPE; 256 routed experts top-8 sigmoid+e_score_bias, no
-        // shared expert; FP8 E4M3 + F32 weight_scale_inv block-128 storage;
-        // split per-expert w1/w3/w2 (like deepseek_v4). Crate hipfire-arch-minimax.
-        "minimax_m2" => 10,
-        // LFM2.5 (LiquidAI): hybrid short-conv + GQA-attn layers, SwiGLU FFN.
-        //   "lfm2_moe" = A1B (dense MLP head layers + top-4 MoE); per-expert
-        //               pre-split w1/w2/w3 → MQ4G256, everything else → Q8.
-        //   "lfm2"     = dense (Lfm2ForCausalLM, e.g. 350M/1.2B) — no experts,
-        //               every layer dense SwiGLU; the ingest Q8s all tensors.
-        // Crate hipfire-arch-lfm2moe (arch_id 11); loader handles both via
-        // num_dense_layers == num_hidden_layers for the dense variant.
-        "lfm2_moe" | "lfm2" => 11,
-        // Gemma3 (text). `gemma3_text` = Gemma3ForCausalLM (clean
-        // model.layers.* names, e.g. medgemma-27b-text-it); `gemma3` =
-        // Gemma3ForConditionalGeneration (multimodal wrapper — text fields
-        // under text_config, SigLIP vision deferred to arch_id 13). Dense
-        // decoder with the Gemma quirks: (1+w) zero-centered RMSNorm (baked
-        // below), 4 norms/layer, per-head QK-norm, head_dim independent of
-        // dim/n_heads, custom attn scale query_pre_attn_scalar^-0.5, dual-theta
-        // sliding-window interleave, GeGLU gelu-tanh. Crate hipfire-arch-gemma3.
-        // See docs/plans/2026-06-19-gemma3-bringup.md.
-        "gemma3_text" | "gemma3" => 12,
-        // nemotron_h (NVIDIA Nemotron-3): Mamba-2 + GQA-attn + ReLU²-MLP hybrid
-        // (Nano-4B dense; Nano-30B adds MoE). Crate hipfire-arch-nemotron
-        // (arch_id 14). Quantizes the linear projections; keeps conv1d/A_log/D/
-        // dt_bias/norms F16 (see should_quantize).
-        "nemotron_h" => 14,
-        other => {
-            eprintln!("Warning: unknown architecture '{other}', treating as llama");
-            0
+    let auto_arch_id = if is_mamba2_config {
+        15
+    } else {
+        match arch_str {
+            "llama" => 0u32,
+            "qwen3" | "qwen2" => 1,
+            "qwen3_5" | "qwen3_5_text" => 5,
+            // Qwen3.5 MoE (Qwen3.5-35B-A3B and friends): hybrid LA+FA attention identical
+            // to qwen3_5 dense, but every layer's FFN is MoE with stacked-3D expert
+            // tensors (mlp.experts.gate_up_proj/down_proj are [num_experts, ...]).
+            "qwen3_5_moe" | "qwen3_5_moe_text" => 6,
+            // dots.ocr (Qwen2-VL family layout-extraction VLM): plain Qwen2-1.5B
+            // text decoder + 42-block DotsVisionTransformer with 2-D RoPE,
+            // SwiGLU, RMSNorm. Crate: hipfire-arch-dots-ocr. See docs/plans/
+            // dots-ocr-prd.md.
+            "dots_ocr" => 8,
+            // DeepSeek V4 Flash: 256 routed + 1 shared experts, Hyper-Connections,
+            // compressed-KV indexer, FP8 E4M3 + UE8M0 block-scale storage. See
+            // crates/hipfire-arch-deepseek4. Phase 1 ingest only — no forward
+            // path yet; tensor names ship in DeepSeek V4's native shape (split w1/w2/w3,
+            // per-expert) and are translated when the forward bring-up lands.
+            "deepseek_v4" => 9,
+            // MiniMax-M2 (Mixtral-style MoE): GQA + per-layer QK-norm + partial
+            // rotate_half RoPE; 256 routed experts top-8 sigmoid+e_score_bias, no
+            // shared expert; FP8 E4M3 + F32 weight_scale_inv block-128 storage;
+            // split per-expert w1/w3/w2 (like deepseek_v4). Crate hipfire-arch-minimax.
+            "minimax_m2" => 10,
+            // LFM2.5 (LiquidAI): hybrid short-conv + GQA-attn layers, SwiGLU FFN.
+            //   "lfm2_moe" = A1B (dense MLP head layers + top-4 MoE); per-expert
+            //               pre-split w1/w2/w3 → MQ4G256, everything else → Q8.
+            //   "lfm2"     = dense (Lfm2ForCausalLM, e.g. 350M/1.2B) — no experts,
+            //               every layer dense SwiGLU; the ingest Q8s all tensors.
+            // Crate hipfire-arch-lfm2moe (arch_id 11); loader handles both via
+            // num_dense_layers == num_hidden_layers for the dense variant.
+            "lfm2_moe" | "lfm2" => 11,
+            // Gemma3 (text). `gemma3_text` = Gemma3ForCausalLM (clean
+            // model.layers.* names, e.g. medgemma-27b-text-it); `gemma3` =
+            // Gemma3ForConditionalGeneration (multimodal wrapper — text fields
+            // under text_config, SigLIP vision deferred to arch_id 13). Dense
+            // decoder with the Gemma quirks: (1+w) zero-centered RMSNorm (baked
+            // below), 4 norms/layer, per-head QK-norm, head_dim independent of
+            // dim/n_heads, custom attn scale query_pre_attn_scalar^-0.5, dual-theta
+            // sliding-window interleave, GeGLU gelu-tanh. Crate hipfire-arch-gemma3.
+            // See docs/plans/2026-06-19-gemma3-bringup.md.
+            "gemma3_text" | "gemma3" => 12,
+            // nemotron_h (NVIDIA Nemotron-3): Mamba-2 + GQA-attn + ReLU²-MLP hybrid
+            // (Nano-4B dense; Nano-30B adds MoE). Crate hipfire-arch-nemotron
+            // (arch_id 14). Quantizes the linear projections; keeps conv1d/A_log/D/
+            // dt_bias/norms F16 (see should_quantize).
+            "nemotron_h" => 14,
+            // state-spaces Mamba-2: pure Mamba-2 mixer stack. Uses the same
+            // Mamba block machinery as nemotron_h but remains its own served arch.
+            "mamba2" => 15,
+            other => {
+                eprintln!("Warning: unknown architecture '{other}', treating as llama");
+                0
+            }
         }
     };
     // Gemma3 multimodal (Gemma3ForConditionalGeneration) carries a `vision_config`
@@ -5820,6 +5843,9 @@ fn main() {
     }
     if is_lfm2moe {
         eprintln!("  LFM2.5-MoE detected — experts → MQ4G256, expert_bias → F32, all else (conv/attn/dense/router/embed) → Q8.");
+    }
+    if arch_id == 15 {
+        eprintln!("  Mamba-2 detected — pure Mamba mixer stack; recurrence/norm tensors stay plain precision.");
     }
 
     // Extract layer count for K-map edge-layer promotion.

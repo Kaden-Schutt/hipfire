@@ -66,17 +66,30 @@ fn get(src: &dyn ModelSource, name: &str) -> Result<Vec<f32>, String> {
     dequant(&info.dtype, bytes)
 }
 
+/// Read the first available tensor from `names`.
+fn get_any(src: &dyn ModelSource, names: &[&str]) -> Result<Vec<f32>, String> {
+    for name in names {
+        if let Some((info, bytes)) = src.tensor_data(name) {
+            return dequant(&info.dtype, bytes);
+        }
+    }
+    Err(format!("nemotron loader: missing tensor; tried {names:?}"))
+}
+
 /// Load all nemotron_h weights from `src` into host f32 [`NemotronWeights`].
 pub fn load_nemotron_weights(
     src: &dyn ModelSource,
     cfg: &NemotronHConfig,
 ) -> Result<NemotronWeights, String> {
-    let embeddings = get(src, "backbone.embeddings.weight")?;
+    let embeddings = get_any(
+        src,
+        &["backbone.embeddings.weight", "backbone.embedding.weight"],
+    )?;
     let norm_f = get(src, "backbone.norm_f.weight")?;
-    let lm_head = if cfg.tie_word_embeddings {
-        embeddings.clone()
-    } else {
-        get(src, "lm_head.weight")?
+    let lm_head = match get(src, "lm_head.weight") {
+        Ok(w) => w,
+        Err(_) if cfg.tie_word_embeddings => embeddings.clone(),
+        Err(e) => return Err(e),
     };
 
     // Nemotron-H Mamba out-proj scaling is checkpoint-family specific. Dense
@@ -188,6 +201,15 @@ fn hfq_tensor<'a>(hfq: &'a HfqFile, name: &str) -> Result<(u8, Vec<u8>), String>
         .ok_or_else(|| format!("nemotron hfq: missing tensor {name:?}"))?;
     let _ = &info.shape;
     Ok((info.quant_type, data))
+}
+
+pub fn first_hfq_tensor<'a>(hfq: &HfqFile, names: &[&'a str]) -> Result<&'a str, String> {
+    for name in names {
+        if hfq.find_tensor_info(name).is_some() {
+            return Ok(name);
+        }
+    }
+    Err(format!("nemotron hfq: missing tensor; tried {names:?}"))
 }
 
 /// Load one linear weight as a `LinearWeight` (quantized when 4-bit/Q8, else an

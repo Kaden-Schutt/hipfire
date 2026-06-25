@@ -191,7 +191,7 @@ impl NemotronModel {
         cfg: NemotronHConfig,
         max_seq: usize,
     ) -> Result<Self, String> {
-        use crate::loader::{load_embeddings_hfq, load_f32_hfq, load_linear_hfq};
+        use crate::loader::{first_hfq_tensor, load_embeddings_hfq, load_f32_hfq, load_linear_hfq};
         let hidden = cfg.hidden_size;
         let vocab = cfg.vocab_size;
         let dims = cfg.mamba2_dims();
@@ -199,9 +199,17 @@ impl NemotronModel {
         let out_proj_scale = cfg.mamba_out_proj_runtime_scale();
         let e = |x: hip_bridge::HipError| format!("nemotron hfq gpu: {x:?}");
 
-        let embeddings =
-            load_embeddings_hfq(hfq, gpu, "backbone.embeddings.weight", vocab, hidden)?;
-        let lm_head = load_linear_hfq(hfq, gpu, "lm_head.weight", vocab, hidden)?;
+        let embedding_name = first_hfq_tensor(
+            hfq,
+            &["backbone.embeddings.weight", "backbone.embedding.weight"],
+        )?;
+        let embeddings = load_embeddings_hfq(hfq, gpu, embedding_name, vocab, hidden)?;
+        let lm_head_name = match first_hfq_tensor(hfq, &["lm_head.weight"]) {
+            Ok(name) => name,
+            Err(_) if cfg.tie_word_embeddings => embedding_name,
+            Err(e) => return Err(e),
+        };
+        let lm_head = load_linear_hfq(hfq, gpu, lm_head_name, vocab, hidden)?;
         let norm_f = gpu
             .upload_f32(&load_f32_hfq(hfq, "backbone.norm_f.weight")?, &[hidden])
             .map_err(e)?;

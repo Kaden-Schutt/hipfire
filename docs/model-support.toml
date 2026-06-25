@@ -62,6 +62,15 @@ kv = "fp32"
 vision = "none"
 
 [[arch]]
+ids = [15]
+label = "mamba2"
+prefill = "full"
+dflash = "none"
+mtp = "none"
+kv = "no-kv"
+vision = "none"
+
+[[arch]]
 ids = [12]
 label = "gemma3"
 prefill = "full"

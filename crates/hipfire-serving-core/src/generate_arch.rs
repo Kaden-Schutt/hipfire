@@ -1155,12 +1155,12 @@ pub fn generate_qwen2(
 /// `generate()` applied — then prefills those tokens and runs the shared
 /// `decode_loop` (full temperature/top-p sampling via P3.3). Fast paths
 /// (DFlash/MTP/tools-execution) are out of scope here; correctness first.
-/// nemotron_h (arch_id 14) generate path — the same dense-AR `ServingBackend`
-/// seam as `generate_llama`, driving the `NemotronModel` backend. Frames the
-/// prompt (jinja `chat_template` when `HIPFIRE_JINJA_CHAT=1`, else the
-/// hand-rolled `ChatFrame`), prefills the framed tokens (which builds the
-/// per-block Mamba conv/SSM + attention KV state), then runs the shared
-/// `decode_loop`. Fast paths are out of scope; correctness first.
+/// nemotron_h (arch_id 14) / pure Mamba-2 (arch_id 15) generate path — the same
+/// dense-AR `ServingBackend` seam as `generate_llama`, driving the Mamba-capable
+/// `NemotronModel` backend. Frames the prompt (jinja `chat_template` when
+/// `HIPFIRE_JINJA_CHAT=1`, else the hand-rolled `ChatFrame`), prefills the
+/// framed tokens (which builds per-block recurrent/KV state), then runs the
+/// shared `decode_loop`. Fast paths are out of scope; correctness first.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_nemotron(
     m: &mut LoadedModel,
@@ -1188,7 +1188,7 @@ pub fn generate_nemotron(
         emit_error_with_id(
             stdout,
             id,
-            "nemotron backend not loaded (arch 14 not active)".to_string(),
+            "mamba-capable backend not loaded (arch 14/15 not active)".to_string(),
         );
         return;
     }

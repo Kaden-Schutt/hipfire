@@ -1901,9 +1901,9 @@ pub fn generate(
         );
         return;
     }
-    if m.arch_id == 14 {
-        // nemotron_h — routed through the ServingBackend seam (N5b), same dense-AR
-        // path as llama. Fast paths (DFlash/MTP/tools-execution) not on this path.
+    if m.arch_id == 14 || m.arch_id == 15 {
+        // nemotron_h / mamba2 — routed through the Mamba-capable ServingBackend
+        // seam, same dense-AR path as llama. Fast paths are not on this path.
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,

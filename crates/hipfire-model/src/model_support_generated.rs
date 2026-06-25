@@ -69,6 +69,17 @@ pub const ARCH_ROWS: &[ArchRow] = &[
         },
     },
     ArchRow {
+        ids: &[15],
+        features: ArchFeatures {
+            label: "mamba2",
+            prefill: FeatureSupport::Full,
+            dflash: FeatureSupport::None,
+            mtp: FeatureSupport::None,
+            kv: "no-kv",
+            vision: FeatureSupport::None,
+        },
+    },
+    ArchRow {
         ids: &[12],
         features: ArchFeatures {
             label: "gemma3",

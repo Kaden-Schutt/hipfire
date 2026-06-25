@@ -629,19 +629,20 @@ pub fn load_model(
         });
     }
 
-    if hfq.arch_id == 14 {
-        // nemotron_h (Mamba-2 + GQA + ReLU² MLP hybrid) from a quantized (or
-        // bf16) .hfq, driven through the ServingBackend seam (N5b → generate_
-        // nemotron). `from_hfq` loads quantized Q8 / MQ4G256 linear weights via
-        // the dispatched gemv AND plain bf16 tensors (→ f32), so it serves both
-        // quantized and bf16 artifacts; the raw-safetensors f32 path
-        // (NemotronModel::new) lives in load_model_safetensors. Validated vs f32
-        // in examples/hfq_vs_f32.rs (argmax match, cosine 0.99).
+    if hfq.arch_id == 14 || hfq.arch_id == 15 {
+        // nemotron_h (hybrid Mamba-2 + attention/MLP/MoE) and pure Mamba-2
+        // from quantized (or bf16) .hfq artifacts, driven through the same
+        // Mamba-capable ServingBackend seam.
         if draft_path.is_some() {
-            return Err(
-                "DFlash not supported on arch_id=14 (nemotron_h). Reload without a draft."
-                    .to_string(),
-            );
+            return Err(format!(
+                "DFlash not supported on arch_id={} ({}). Reload without a draft.",
+                hfq.arch_id,
+                if hfq.arch_id == 15 {
+                    "mamba2"
+                } else {
+                    "nemotron_h"
+                }
+            ));
         }
         let _ = kv_mode;
         let _ = state_quant_override;
@@ -650,15 +651,29 @@ pub fn load_model(
         let cfg_json = meta
             .get("config")
             .ok_or("nemotron: metadata_json missing 'config'")?;
-        let mut cfg = hipfire_arch_nemotron::NemotronHConfig::from_json(cfg_json)
-            .map_err(|e| format!("nemotron config: {e}"))?;
-        // Chat serving stops on the ChatML turn delimiter `<|im_end|>`, not the
-        // base `eos_token_id` (`</s>` = 2 for Nano).
-        if let Some(im_end) = tokenizer.special_token_id("<|im_end|>") {
+        let mut cfg = if hfq.arch_id == 15 {
+            hipfire_arch_nemotron::NemotronHConfig::from_mamba2_json(cfg_json)
+                .map_err(|e| format!("mamba2 config: {e}"))?
+        } else {
+            hipfire_arch_nemotron::NemotronHConfig::from_json(cfg_json)
+                .map_err(|e| format!("nemotron config: {e}"))?
+        };
+        if hfq.arch_id == 15 {
+            if let Some(eot) = tokenizer.special_token_id("<|endoftext|>") {
+                cfg.eos_token_id = eot;
+            }
+        } else if let Some(im_end) = tokenizer.special_token_id("<|im_end|>") {
+            // Chat serving stops on the ChatML turn delimiter `<|im_end|>`, not
+            // the base `eos_token_id` (`</s>` = 2 for Nano).
             cfg.eos_token_id = im_end;
         }
         eprintln!(
-            "  nemotron_h: hidden={}, layers={} ({} M / {} * / {} - / {} E), vocab={}, eos={}",
+            "  {}: hidden={}, layers={} ({} M / {} * / {} - / {} E), vocab={}, eos={}",
+            if hfq.arch_id == 15 {
+                "mamba2"
+            } else {
+                "nemotron_h"
+            },
             cfg.hidden_size,
             cfg.num_layers,
             cfg.count(hipfire_arch_nemotron::BlockKind::Mamba2),
@@ -669,7 +684,7 @@ pub fn load_model(
             cfg.eos_token_id,
         );
         let model = hipfire_arch_nemotron::model::NemotronModel::from_hfq(gpu, &hfq, cfg, max_seq)
-            .map_err(|e| format!("nemotron NemotronModel::from_hfq: {e}"))?;
+            .map_err(|e| format!("mamba-capable NemotronModel::from_hfq: {e}"))?;
         let chat_template = resolve_chat_template(&hfq, path);
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
@@ -2054,10 +2069,9 @@ pub fn load_model_safetensors(
         });
     }
 
-    if arch_id == 14 {
-        // nemotron_h (Mamba-2 + GQA + ReLU² MLP hybrid) — routed through the
-        // ServingBackend seam (N5b). The full BF16→f32 model lives in
-        // NemotronModel; there are no separate per-arch Option fields.
+    if arch_id == 14 || arch_id == 15 {
+        // nemotron_h (hybrid Mamba-2 + attention/MLP/MoE) and pure Mamba-2 are
+        // routed through the same Mamba-capable ServingBackend seam.
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         // The HFQ-compatible metadata wraps config.json under the "config" key.
@@ -2066,16 +2080,30 @@ pub fn load_model_safetensors(
         let cfg_json = meta
             .get("config")
             .ok_or("nemotron: metadata_json missing 'config'")?;
-        let mut cfg = hipfire_arch_nemotron::NemotronHConfig::from_json(cfg_json)
-            .map_err(|e| format!("nemotron config: {e}"))?;
-        // Chat serving stops on the ChatML turn delimiter `<|im_end|>`, not the
-        // base `eos_token_id` (`</s>` = 2 for Nano). Resolve it from the
-        // tokenizer; fall back to the config eos if the model isn't ChatML.
-        if let Some(im_end) = tokenizer.special_token_id("<|im_end|>") {
+        let mut cfg = if arch_id == 15 {
+            hipfire_arch_nemotron::NemotronHConfig::from_mamba2_json(cfg_json)
+                .map_err(|e| format!("mamba2 config: {e}"))?
+        } else {
+            hipfire_arch_nemotron::NemotronHConfig::from_json(cfg_json)
+                .map_err(|e| format!("nemotron config: {e}"))?
+        };
+        if arch_id == 15 {
+            if let Some(eot) = tokenizer.special_token_id("<|endoftext|>") {
+                cfg.eos_token_id = eot;
+            }
+        } else if let Some(im_end) = tokenizer.special_token_id("<|im_end|>") {
+            // Chat serving stops on the ChatML turn delimiter `<|im_end|>`, not
+            // the base `eos_token_id` (`</s>` = 2 for Nano). Resolve it from the
+            // tokenizer; fall back to the config eos if the model isn't ChatML.
             cfg.eos_token_id = im_end;
         }
         eprintln!(
-            "  nemotron_h: hidden={}, layers={} ({} M / {} * / {} - / {} E), vocab={}, eos={}",
+            "  {}: hidden={}, layers={} ({} M / {} * / {} - / {} E), vocab={}, eos={}",
+            if arch_id == 15 {
+                "mamba2"
+            } else {
+                "nemotron_h"
+            },
             cfg.hidden_size,
             cfg.num_layers,
             cfg.count(hipfire_arch_nemotron::BlockKind::Mamba2),
@@ -2087,7 +2115,7 @@ pub fn load_model_safetensors(
         );
         let weights = hipfire_arch_nemotron::loader::load_nemotron_weights(&source, &cfg)?;
         let model = hipfire_arch_nemotron::model::NemotronModel::new(gpu, cfg, &weights, max_seq)
-            .map_err(|e| format!("nemotron NemotronModel::new: {e:?}"))?;
+            .map_err(|e| format!("mamba-capable NemotronModel::new: {e:?}"))?;
 
         return Ok(LoadedModel {
             arch_id,

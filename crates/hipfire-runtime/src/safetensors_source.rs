@@ -4,7 +4,7 @@
 //! Reads config.json for architecture detection and quantization config.
 //! Mmaps .safetensors files and serves tensor data by name.
 
-use hipfire_model::{ModelSource, QuantConfig, TensorInfo};
+use hipfire_model::{ModelSource, QuantConfig, TensorInfo, ARCH_ID_MAMBA2, ARCH_ID_NEMOTRON_H};
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
@@ -215,8 +215,21 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
         // NemotronHForCausalLM (Mamba-2 + attn + MLP hybrid). Match the "H"
         // hybrid specifically so plain (llama-based) Nemotron isn't caught.
         if arch_lower.contains("nemotronh") {
-            return 14;
+            return ARCH_ID_NEMOTRON_H;
         }
+        if arch_lower.contains("mamba2") {
+            return ARCH_ID_MAMBA2;
+        }
+    }
+
+    if config
+        .get("ssm_cfg")
+        .and_then(|v| v.get("layer"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.eq_ignore_ascii_case("mamba2"))
+        .unwrap_or(false)
+    {
+        return ARCH_ID_MAMBA2;
     }
 
     // Fallback: check model_type
@@ -236,7 +249,8 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
         }
         "qwen3" | "qwen2" => 1,
         "llama" | "mistral" => 0,
-        "nemotron_h" => 14,
+        "nemotron_h" => ARCH_ID_NEMOTRON_H,
+        "mamba2" => ARCH_ID_MAMBA2,
         _ => {
             eprintln!(
                 "warning: unknown model_type '{model_type}', defaulting to arch_id=5 (Qwen3.5)"

@@ -253,6 +253,89 @@ impl NemotronHConfig {
         })
     }
 
+    /// Parse a pure state-spaces Mamba-2 `config.json` into the same residual
+    /// stack representation used by `NemotronModel`. Pure Mamba-2 has only
+    /// Mamba-2 mixer blocks: no attention, no MLP, and no Nemotron residual
+    /// out-proj rescale.
+    pub fn from_mamba2_json(c: &serde_json::Value) -> Result<Self, String> {
+        let raw: RawMamba2Config =
+            serde_json::from_value(c.clone()).map_err(|e| format!("mamba2 config: {e}"))?;
+        if raw.d_model == 0 || raw.n_layer == 0 || raw.vocab_size == 0 {
+            return Err("mamba2 config has zero hidden/layer/vocab dimension".to_string());
+        }
+        if raw.d_intermediate != 0 {
+            return Err(format!(
+                "mamba2 config has unsupported d_intermediate={} (expected 0)",
+                raw.d_intermediate
+            ));
+        }
+        if !raw.attn_layer_idx.is_empty() {
+            return Err(
+                "mamba2 config has attention layers; only pure Mamba-2 is supported".into(),
+            );
+        }
+        if !raw.rms_norm {
+            return Err("mamba2 config without rms_norm is unsupported".to_string());
+        }
+        if let Some(layer) = raw.ssm_cfg.layer.as_deref() {
+            if !layer.eq_ignore_ascii_case("mamba2") {
+                return Err(format!(
+                    "mamba2 config ssm_cfg.layer={layer:?} is unsupported"
+                ));
+            }
+        }
+
+        let d_inner = raw.d_model * raw.ssm_cfg.expand;
+        if d_inner % raw.ssm_cfg.headdim != 0 {
+            return Err(format!(
+                "mamba2 d_inner {d_inner} is not divisible by headdim {}",
+                raw.ssm_cfg.headdim
+            ));
+        }
+        let (dt_min, dt_max) = match raw
+            .ssm_cfg
+            .dt_limit
+            .as_ref()
+            .or(raw.ssm_cfg.time_step_limit.as_ref())
+        {
+            Some(v) if v.len() == 2 => (v[0], v[1]),
+            _ => (0.0f32, f32::INFINITY),
+        };
+
+        let pad = raw.pad_vocab_size_multiple.max(1);
+        let vocab_size = raw.vocab_size.div_ceil(pad) * pad;
+        Ok(Self {
+            hidden_size: raw.d_model,
+            vocab_size,
+            num_layers: raw.n_layer,
+            rms_norm_eps: raw.rms_norm_eps,
+            tie_word_embeddings: raw.tie_embeddings || raw.tie_word_embeddings,
+            eos_token_id: raw.eos_token_id,
+            blocks: vec![BlockKind::Mamba2; raw.n_layer],
+            mamba: Mamba2Config {
+                num_heads: d_inner / raw.ssm_cfg.headdim,
+                head_dim: raw.ssm_cfg.headdim,
+                state_size: raw.ssm_cfg.d_state,
+                n_groups: raw.ssm_cfg.ngroups,
+                conv_kernel: raw.ssm_cfg.d_conv,
+                chunk_size: raw.ssm_cfg.chunk_size,
+                use_conv_bias: raw.ssm_cfg.use_conv_bias,
+                proj_bias: raw.ssm_cfg.proj_bias,
+                dt_min,
+                dt_max,
+            },
+            attn: AttnConfig {
+                num_heads: 0,
+                num_kv_heads: 0,
+                head_dim: 0,
+                bias: false,
+            },
+            mlp_intermediate: 0,
+            mlp_act: String::new(),
+            moe: None,
+        })
+    }
+
     /// Bridge the Mamba-2 mixer shape to the GPU/CPU block dims
     /// ([`block::Mamba2Dims`]), folding in the top-level `hidden_size` and
     /// `rms_norm_eps`.
@@ -277,11 +360,18 @@ impl NemotronHConfig {
     /// HF reference with the stored `out_proj` bytes, so applying the same scale
     /// again collapses the first Mamba block output.
     pub fn mamba_out_proj_runtime_scale(&self) -> f32 {
-        if self.moe.is_some() {
+        if self.moe.is_some() || self.is_pure_mamba2() {
             1.0
         } else {
             1.0f32 / (self.num_layers as f32).sqrt()
         }
+    }
+
+    /// True for state-spaces-style pure Mamba-2 stacks.
+    pub fn is_pure_mamba2(&self) -> bool {
+        self.mlp_intermediate == 0
+            && self.attn.num_heads == 0
+            && self.blocks.iter().all(|b| *b == BlockKind::Mamba2)
     }
 
     /// Number of blocks of each kind.
@@ -370,14 +460,105 @@ struct RawConfig {
     routed_scaling_factor: Option<f32>,
 }
 
+/// Serde shape of state-spaces Mamba-2 `config.json`.
+#[derive(Deserialize)]
+struct RawMamba2Config {
+    #[serde(alias = "hidden_size")]
+    d_model: usize,
+    #[serde(default)]
+    d_intermediate: usize,
+    #[serde(alias = "num_hidden_layers")]
+    n_layer: usize,
+    vocab_size: usize,
+    #[serde(default = "default_eps")]
+    rms_norm_eps: f32,
+    #[serde(default = "default_true")]
+    rms_norm: bool,
+    #[serde(default)]
+    tie_embeddings: bool,
+    #[serde(default)]
+    tie_word_embeddings: bool,
+    #[serde(default = "default_mamba2_eos")]
+    eos_token_id: u32,
+    #[serde(default = "default_mamba2_ssm")]
+    ssm_cfg: RawMamba2SsmConfig,
+    #[serde(default)]
+    attn_layer_idx: Vec<usize>,
+    #[serde(default)]
+    pad_vocab_size_multiple: usize,
+}
+
+#[derive(Deserialize)]
+struct RawMamba2SsmConfig {
+    #[serde(default)]
+    layer: Option<String>,
+    #[serde(default = "default_mamba2_d_state")]
+    d_state: usize,
+    #[serde(default = "default_mamba2_d_conv", alias = "conv_kernel")]
+    d_conv: usize,
+    #[serde(default = "default_mamba2_expand")]
+    expand: usize,
+    #[serde(default = "default_mamba2_head_dim", alias = "head_dim")]
+    headdim: usize,
+    #[serde(default = "default_mamba2_ngroups", alias = "n_groups")]
+    ngroups: usize,
+    #[serde(default = "default_chunk")]
+    chunk_size: usize,
+    #[serde(default = "default_true")]
+    use_conv_bias: bool,
+    #[serde(default)]
+    proj_bias: bool,
+    #[serde(default)]
+    dt_limit: Option<Vec<f32>>,
+    #[serde(default)]
+    time_step_limit: Option<Vec<f32>>,
+}
+
+fn default_mamba2_ssm() -> RawMamba2SsmConfig {
+    RawMamba2SsmConfig {
+        layer: Some("Mamba2".to_string()),
+        d_state: default_mamba2_d_state(),
+        d_conv: default_mamba2_d_conv(),
+        expand: default_mamba2_expand(),
+        headdim: default_mamba2_head_dim(),
+        ngroups: default_mamba2_ngroups(),
+        chunk_size: default_chunk(),
+        use_conv_bias: true,
+        proj_bias: false,
+        dt_limit: None,
+        time_step_limit: None,
+    }
+}
+
 fn default_eps() -> f32 {
     1e-5
+}
+fn default_true() -> bool {
+    true
 }
 fn default_chunk() -> usize {
     256
 }
 fn default_eos() -> u32 {
     2
+}
+fn default_mamba2_eos() -> u32 {
+    0
+}
+fn default_mamba2_d_state() -> usize {
+    128
+}
+fn default_mamba2_d_conv() -> usize {
+    4
+}
+fn default_mamba2_expand() -> usize {
+    2
+}
+fn default_mamba2_head_dim() -> usize {
+    64
+}
+fn default_mamba2_ngroups() -> usize {
+    1
 }
 fn default_dt_min() -> f32 {
     0.001
@@ -492,6 +673,41 @@ mod tests {
             cfg.mamba_out_proj_runtime_scale(),
             1.0f32 / (42.0f32).sqrt()
         );
+    }
+
+    #[test]
+    fn pure_mamba2_config_from_state_spaces_json() {
+        let json = serde_json::json!({
+            "d_model": 768,
+            "d_intermediate": 0,
+            "n_layer": 24,
+            "vocab_size": 50277,
+            "ssm_cfg": { "layer": "Mamba2" },
+            "attn_layer_idx": [],
+            "rms_norm": true,
+            "pad_vocab_size_multiple": 16,
+            "tie_embeddings": true
+        });
+        let cfg = NemotronHConfig::from_mamba2_json(&json).unwrap();
+        assert_eq!(cfg.hidden_size, 768);
+        assert_eq!(cfg.vocab_size, 50288);
+        assert_eq!(cfg.num_layers, 24);
+        assert_eq!(cfg.eos_token_id, 0);
+        assert!(cfg.tie_word_embeddings);
+        assert!(cfg.is_pure_mamba2());
+        assert_eq!(cfg.count(BlockKind::Mamba2), 24);
+        assert_eq!(cfg.mamba.num_heads, 24);
+        assert_eq!(cfg.mamba.head_dim, 64);
+        assert_eq!(cfg.mamba.state_size, 128);
+        assert_eq!(cfg.mamba.n_groups, 1);
+        assert_eq!(cfg.mamba.conv_dim(), 1792);
+        assert_eq!(cfg.mamba.projection_size(), 3352);
+        assert_eq!(cfg.mamba_out_proj_runtime_scale(), 1.0);
+        let prof = cfg.mixer_profile();
+        assert_eq!(prof.n_layers(), 24);
+        assert!(prof.has_recurrent_state());
+        assert!(!prof.needs_kv_cache());
+        assert!(!prof.is_hybrid());
     }
 
     #[test]

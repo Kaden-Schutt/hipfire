@@ -980,6 +980,154 @@ impl MiniMaxTiny {
     }
 }
 
+/// Tiny pure Mamba-2 (arch 15) config. Mirrors state-spaces tensor names:
+/// `backbone.embedding.weight`, `backbone.layers.L.mixer.*`, `backbone.norm_f`.
+struct Mamba2Tiny {
+    hidden: usize,
+    vocab: usize,
+    layers: usize,
+    expand: usize,
+    head_dim: usize,
+    d_state: usize,
+    ngroups: usize,
+    conv_kernel: usize,
+    chunk_size: usize,
+}
+
+impl Mamba2Tiny {
+    fn preset() -> Self {
+        Self {
+            hidden: 256,
+            vocab: 4096,
+            layers: 2,
+            expand: 2,
+            head_dim: 64,
+            d_state: 128,
+            ngroups: 1,
+            conv_kernel: 4,
+            chunk_size: 64,
+        }
+    }
+
+    fn d_inner(&self) -> usize {
+        self.hidden * self.expand
+    }
+
+    fn num_heads(&self) -> usize {
+        self.d_inner() / self.head_dim
+    }
+
+    fn conv_dim(&self) -> usize {
+        self.d_inner() + 2 * self.ngroups * self.d_state
+    }
+
+    fn projection_size(&self) -> usize {
+        self.d_inner() + self.conv_dim() + self.num_heads()
+    }
+
+    fn config_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "architectures": ["Mamba2ForCausalLM"],
+            "d_model": self.hidden,
+            "d_intermediate": 0,
+            "n_layer": self.layers,
+            "vocab_size": self.vocab,
+            "ssm_cfg": {
+                "layer": "Mamba2",
+                "d_state": self.d_state,
+                "d_conv": self.conv_kernel,
+                "expand": self.expand,
+                "headdim": self.head_dim,
+                "ngroups": self.ngroups,
+                "chunk_size": self.chunk_size,
+            },
+            "attn_layer_idx": [],
+            "attn_cfg": {},
+            "rms_norm": true,
+            "residual_in_fp32": true,
+            "fused_add_norm": true,
+            "pad_vocab_size_multiple": 16,
+            "tie_embeddings": true,
+            "rms_norm_eps": 1e-5,
+            "_comment": "hipfire tiny random-init gating fixture — not a real model",
+        })
+    }
+
+    fn manifest(&self) -> Vec<TensorSpec> {
+        let h = self.hidden;
+        let d_inner = self.d_inner();
+        let conv_dim = self.conv_dim();
+        let projection_size = self.projection_size();
+        let heads = self.num_heads();
+        let mut t = Vec::new();
+        t.push(TensorSpec::new(
+            "backbone.embedding.weight",
+            vec![self.vocab, h],
+            Init::Uniform(0.05),
+        ));
+        t.push(TensorSpec::f16(
+            "backbone.norm_f.weight",
+            vec![h],
+            Init::NormOnes,
+        ));
+        t.push(TensorSpec::new(
+            "lm_head.weight",
+            vec![self.vocab, h],
+            Init::Uniform(0.05),
+        ));
+        for i in 0..self.layers {
+            let p = format!("backbone.layers.{i}");
+            let m = format!("{p}.mixer");
+            t.push(TensorSpec::f16(
+                format!("{p}.norm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::new(
+                format!("{m}.in_proj.weight"),
+                vec![projection_size, h],
+                Init::Uniform(0.04),
+            ));
+            t.push(TensorSpec::f16(
+                format!("{m}.conv1d.weight"),
+                vec![conv_dim, 1, self.conv_kernel],
+                Init::Uniform(0.03),
+            ));
+            t.push(TensorSpec::f16(
+                format!("{m}.conv1d.bias"),
+                vec![conv_dim],
+                Init::Zeros,
+            ));
+            t.push(TensorSpec::f16(
+                format!("{m}.A_log"),
+                vec![heads],
+                Init::ALog,
+            ));
+            t.push(TensorSpec::f16(
+                format!("{m}.D"),
+                vec![heads],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::f16(
+                format!("{m}.dt_bias"),
+                vec![heads],
+                Init::Zeros,
+            ));
+            t.push(TensorSpec::f16(
+                format!("{m}.norm.weight"),
+                vec![d_inner],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::new(
+                format!("{m}.out_proj.weight"),
+                vec![h, d_inner],
+                Init::Uniform(0.04),
+            ));
+        }
+        t
+    }
+}
+
 /// Tiny LLaMA / Mistral (arch 0) dense text config — the simplest supported
 /// family: dense full-attention, RMSNorm + SwiGLU, standard 1-D RoPE, GQA, and
 /// (unlike qwen2) NO Q/K/V bias and NO QK-norm. `model_type:"llama"` auto-detects
@@ -1186,6 +1334,10 @@ pub fn emit_fixture(arch: &str, out_dir: &Path, seed: u64) -> Result<(), String>
             let m = MiniMaxTiny::preset();
             (m.config_json(), m.manifest())
         }
+        "mamba2" | "mamba_2" => {
+            let m = Mamba2Tiny::preset();
+            (m.config_json(), m.manifest())
+        }
         "llama" | "mistral" => {
             let m = LlamaTiny::preset();
             (m.config_json(), m.manifest())
@@ -1198,9 +1350,9 @@ pub fn emit_fixture(arch: &str, out_dir: &Path, seed: u64) -> Result<(), String>
             return Err(format!(
                 "--emit-fixture: unsupported arch '{other}'. Supported: qwen3_5 \
                  (arch 5 dense), qwen3_5_moe (arch 6 MoE), qwen2 (arch 7, quantize \
-                 with --arch-id 7), gemma3 (arch 12), minimax (arch 10), llama \
-                 (arch 0), dflash (draft sidecar). Add a tiny preset per arch as \
-                 support lands."
+                 with --arch-id 7), gemma3 (arch 12), minimax (arch 10), mamba2 \
+                 (arch 15), llama (arch 0), dflash (draft sidecar). Add a tiny \
+                 preset per arch as support lands."
             ));
         }
     };
@@ -1357,6 +1509,34 @@ mod tests {
     }
 
     #[test]
+    fn mamba2_manifest_has_state_spaces_names_and_is_tiny() {
+        let m = Mamba2Tiny::preset();
+        let specs = m.manifest();
+        let has = |suf: &str| specs.iter().any(|s| s.name.ends_with(suf));
+        assert!(
+            has("backbone.embedding.weight"),
+            "state-spaces embedding name"
+        );
+        assert!(has("lm_head.weight"), "saved tied head is accepted");
+        assert!(has("mixer.in_proj.weight"));
+        assert!(has("mixer.conv1d.weight"));
+        assert!(has("mixer.A_log"));
+        assert!(has("mixer.D"));
+        assert!(has("mixer.dt_bias"));
+        assert!(has("mixer.norm.weight"));
+        assert!(has("mixer.out_proj.weight"));
+        let in_proj = specs
+            .iter()
+            .find(|s| s.name.ends_with("mixer.in_proj.weight"))
+            .unwrap();
+        assert_eq!(in_proj.shape, vec![m.projection_size(), m.hidden]);
+        assert!(
+            n_params(&specs) < 10_000_000,
+            "mamba2 fixture must stay <10M params"
+        );
+    }
+
+    #[test]
     fn llama_manifest_is_bias_free_and_tiny() {
         let m = LlamaTiny::preset();
         let specs = m.manifest();
@@ -1380,7 +1560,7 @@ mod tests {
     #[test]
     fn emit_new_families_are_deterministic() {
         let base = std::env::temp_dir().join(format!("hipfire-fx-fam-{}", std::process::id()));
-        for arch in ["qwen2", "gemma3", "minimax", "llama"] {
+        for arch in ["qwen2", "gemma3", "minimax", "mamba2", "llama"] {
             let dir = base.join(arch);
             emit_fixture(arch, &dir, 7).unwrap();
             let a = std::fs::read(dir.join("model.safetensors")).unwrap();

@@ -144,6 +144,7 @@ pub const ARCH_ID_LFM2_MOE: u32 = 11;
 pub const ARCH_ID_GEMMA3_TEXT: u32 = 12;
 pub const ARCH_ID_GEMMA3_VL: u32 = 13;
 pub const ARCH_ID_NEMOTRON_H: u32 = 14;
+pub const ARCH_ID_MAMBA2: u32 = 15;
 
 /// Runtime model arch IDs that must appear in `docs/model-support.toml`.
 pub const KNOWN_RUNTIME_ARCH_IDS: &[(u32, &str)] = &[
@@ -159,6 +160,7 @@ pub const KNOWN_RUNTIME_ARCH_IDS: &[(u32, &str)] = &[
     (ARCH_ID_GEMMA3_TEXT, "gemma3"),
     (ARCH_ID_GEMMA3_VL, "gemma3-vl"),
     (ARCH_ID_NEMOTRON_H, "nemotron_h"),
+    (ARCH_ID_MAMBA2, "mamba2"),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -175,6 +177,7 @@ pub enum ModelArchFamily {
     Gemma3Text,
     Gemma3Vl,
     NemotronH,
+    Mamba2,
     Unknown,
 }
 
@@ -192,6 +195,7 @@ pub fn model_arch_family(arch_id: u32) -> ModelArchFamily {
         ARCH_ID_GEMMA3_TEXT => ModelArchFamily::Gemma3Text,
         ARCH_ID_GEMMA3_VL => ModelArchFamily::Gemma3Vl,
         ARCH_ID_NEMOTRON_H => ModelArchFamily::NemotronH,
+        ARCH_ID_MAMBA2 => ModelArchFamily::Mamba2,
         _ => ModelArchFamily::Unknown,
     }
 }
@@ -1638,6 +1642,7 @@ mod tests {
             model_arch_family(ARCH_ID_NEMOTRON_H),
             ModelArchFamily::NemotronH
         );
+        assert_eq!(model_arch_family(ARCH_ID_MAMBA2), ModelArchFamily::Mamba2);
         for &(arch_id, label) in KNOWN_RUNTIME_ARCH_IDS {
             assert_ne!(
                 model_arch_family(arch_id),
