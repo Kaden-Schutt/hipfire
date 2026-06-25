@@ -13,7 +13,7 @@ ReLU²-MLP hybrid).
 | FU2 | HF-reference numeric bisect | **DONE** (committed earlier; Python native-Mamba reference refreshed) |
 | FU3 | quantizer → nemotron_h mq4/q8 .hfq | **DONE** — mq4 protects Nemotron residual writers as q8 |
 | FU4 | loader compat (load .hfq + quantized gemv) + serving | **DONE** |
-| FU5 | N6 batched prefill + q8 SSM state | **mostly done** — q8 state + benchmarks remain |
+| FU5 | N6 batched prefill + q8 SSM state | **mostly done** — batched HFQ benchmark captured; q8 state remains |
 | FU6 | Nano-30B MoE ('E' block) | not started |
 | FU1 | chat-template / coherence | blocked (EOS/Jinja/CLI controls fixed; vLLM reference is coherent; Hipfire/native-HF diverge at first token) |
 
@@ -204,8 +204,14 @@ uses the HFQ4G256 batched GEMM against the rotated weight layout.
 Validation run locally on gfx1151:
 - `test_model_prefill_gpu`: synthetic f32 Mamba/MLP/attention model,
   max|Δlogit|=2.98e-7, argmax match.
-- `test_model_prefill_hfq_gpu`: real `/tmp/nano4b-mq4.hfq`,
+- `test_model_prefill_hfq_gpu`: real `/tmp/nano4b-mq4-protected.hfq`,
   max|Δlogit|=1.29e-5, argmax match.
+- `bench_prefill_hfq_gpu`: release fresh-process protected-mq4 benchmark on
+  gfx1151:
+  - seq=128, warmup=2, iters=5: batched mean=2476.31ms (51.7 tok/s),
+    decode-loop mean=3356.73ms (38.1 tok/s), speedup=1.36x.
+  - seq=256, warmup=1, iters=3: batched mean=5101.45ms (50.2 tok/s),
+    decode-loop mean=6713.97ms (38.1 tok/s), speedup=1.32x.
 - Commit hooks for `211888d7a` and `27f994e00`: rustfmt, clippy, short
   coherence battery (no hard errors), fast agentic gate, and MQ4 speed gate all
   passed. Tiny-fixture golden still drifted on existing Qwen fixtures and
@@ -215,9 +221,9 @@ Validation run locally on gfx1151:
 
 1. **q8 SSM state.** Quantize the Mamba `h` state to q8 between steps (mirror the
    GDN q8-state pattern) to cut state memory/bandwidth. Pairs with the kernels.
-2. **Prefill tok/s benchmark.** Per `docs/methodology/perf-benchmarking.md` (warm
-   cache, fresh-process probe) — quantify the launch-reduction win on f32 and
-   quantized HFQ models.
+2. **(Optional) broaden prefill benchmarks.** Current evidence covers the
+   protected mq4 HFQ artifact on gfx1151. A fuller benchmark-grade sweep can add
+   f32/q8 plus longer prompt lengths.
 3. **(Optional) chunked masked-flash for very long prompts.** The attention
    prefill uses a single masked-flash block (`block_cols=seq`); shared-mem scales
    with seq. Fine for normal prompts; long-context needs block tiling.

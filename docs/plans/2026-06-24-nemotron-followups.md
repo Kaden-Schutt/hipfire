@@ -207,17 +207,22 @@ footprint. Depends on #3.
 **Goal.** Throughput: replace the per-token prefill loop and shrink recurrent
 state bandwidth.
 
-**Current state.** `SimpleAr::prefill` is a sequential `forward_gpu` per prompt
-token (O(prompt_len) launch-bound), all f32; decode is single-token f32. The SSM
-state is f32 `[num_heads·head_dim·state_size]` per Mamba block.
+**Current state.** `SimpleAr::prefill` now routes through
+`NemotronModel::prefill_batched` for f32 and supported HFQ artifacts. The
+protected mq4 HFQ gate matches the per-token decode loop
+(max|Δlogit|=1.29e-5, argmax match). A release fresh-process gfx1151 benchmark
+on `/tmp/nano4b-mq4-protected.hfq` measured:
+- seq=128: batched 51.7 tok/s vs decode-loop 38.1 tok/s, speedup=1.36x.
+- seq=256: batched 50.2 tok/s vs decode-loop 38.1 tok/s, speedup=1.32x.
+
+The remaining bandwidth item is the q8 SSM state:
+`[num_heads·head_dim·state_size]` per Mamba block is still held in f32 between
+steps.
 
 **Approach.**
-1. **Chunked-SSD prefill** (the genuinely-new throughput kernel): implement the
-   Mamba-2 SSD chunk-scan (chunk_size=256, already in config) — intra-chunk via
-   matmuls, inter-chunk via state passing — so a prompt processes in
-   `ceil(len/256)` chunked passes instead of `len` single-token steps. Also batch
-   the conv1d over the whole prompt and run attention prefill via the existing
-   batched/masked flash path instead of per-token.
+1. **Batched prefill** (done for the current N6 path): the Mamba/conv/MLP blocks
+   and NoPE attention now have batched prefill coverage, and HFQ `gemm_seq`
+   supports the protected mq4 path.
 2. **q8 SSM state:** quantize `h` to q8 between steps (mirror the GDN q8-state
    work noted in CLAUDE.md / `pflash.rs` q8 drafter-state). Cuts state
    memory+bandwidth; pairs with the chunked kernel.
@@ -225,14 +230,15 @@ state is f32 `[num_heads·head_dim·state_size]` per Mamba block.
 **Reuse.** qwen35 `pflash` chunked prefill structure; GDN q8-state pattern;
 `attention_*_batched_masked` for the attention blocks; `conv1d` batched variant.
 
-**Risks.** The chunked inter-chunk recurrence **must be bit-faithful to the decode
-recurrence** — the discriminator is gpu-vs-cpu of chunked-prefill logits vs the
-validated per-token `forward` over the same tokens. (See the SSD CPU oracle
-`ssd.rs` / `block.rs` — extend it with the chunked form as the test oracle.)
+**Risks.** Any future true inter-chunk recurrence **must be bit-faithful to the
+decode recurrence** — the discriminator is gpu-vs-cpu of chunked-prefill logits
+vs the validated per-token `forward` over the same tokens. (See the SSD CPU
+oracle `ssd.rs` / `block.rs` — extend it with the chunked form as the test
+oracle.)
 
-**Validation.** (a) chunked-prefill logits == per-token-decode logits
-(gpu-vs-cpu, the existing oracle); (b) prefill tok/s benchmark per
-`docs/methodology/perf-benchmarking.md` (warm cache, fresh-process probe).
+**Validation.** Batched prefill logits now match the per-token decode loop for
+f32 and protected mq4 HFQ. The fresh-process benchmark entrypoint is
+`cargo run --release -p hipfire-arch-nemotron --example bench_prefill_hfq_gpu`.
 
 ---
 
