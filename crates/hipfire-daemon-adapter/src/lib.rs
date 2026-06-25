@@ -765,7 +765,10 @@ pub fn acquire_resource_lease_or_exit() -> ResourceLease {
         .and_then(|raw| raw.parse::<u64>().ok())
         .unwrap_or(0);
     let timeout = (wait_ms > 0).then(|| Duration::from_millis(wait_ms));
-    let gpu_count = resources.iter().filter(|r| r.starts_with("hip-gpu-")).count();
+    let gpu_count = resources
+        .iter()
+        .filter(|r| r.starts_with("hip-gpu-"))
+        .count();
     let mut guards: Vec<hipfire_lock::FlockGuard> = Vec::new();
 
     for resource in &resources {
@@ -782,7 +785,11 @@ pub fn acquire_resource_lease_or_exit() -> ResourceLease {
             Some(t) => guard.lock_blocking(Duration::from_millis(250), Some(t), |holder| {
                 eprintln!(
                     "[hipfire] waiting for resource {resource} (held by {})",
-                    if holder.is_empty() { "another process" } else { holder }
+                    if holder.is_empty() {
+                        "another process"
+                    } else {
+                        holder
+                    }
                 );
             }),
             None => guard.try_lock(),
@@ -800,7 +807,11 @@ pub fn acquire_resource_lease_or_exit() -> ResourceLease {
                 eprintln!(
                     "FATAL: hipfire resource {resource} ({}) is locked by {}",
                     path.display(),
-                    if holder.is_empty() { "another process" } else { &holder }
+                    if holder.is_empty() {
+                        "another process"
+                    } else {
+                        &holder
+                    }
                 );
                 eprintln!(
                     "Set HIPFIRE_RESOURCE_LOCK_WAIT_MS to wait, or HIPFIRE_RESOURCE_LOCK=0 to bypass."

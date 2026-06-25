@@ -1,0 +1,3 @@
+# tiny-state AR hash baselines — gpu_arch family format logit_hash token_hash rel_tol
+# len=128 prompt_len=4 seed=42
+gfx1103 qwen2 fp16 0xf0cda779102d7dae 0xbbb1709e998ffb12 0

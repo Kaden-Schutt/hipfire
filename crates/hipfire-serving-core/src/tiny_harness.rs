@@ -50,7 +50,12 @@ pub enum TinyArch {
 
 impl TinyArch {
     pub fn parse(s: &str) -> Result<Self, String> {
-        match s.trim().to_ascii_lowercase().replace(['-', '.'], "_").as_str() {
+        match s
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', '.'], "_")
+            .as_str()
+        {
             "qwen3_5" | "qwen35" | "qwen3_5_text" => Ok(Self::Qwen35),
             "qwen3_5_moe" | "qwen35moe" | "qwen3_5_moe_text" => Ok(Self::Qwen35Moe),
             "qwen2" => Ok(Self::Qwen2),
@@ -122,11 +127,17 @@ pub enum TinyModel {
 
 impl TinyModel {
     /// Load `path` as `arch`, sizing per-arch state for `max_seq` positions.
-    pub fn load(arch: TinyArch, path: &Path, gpu: &mut Gpu, max_seq: usize) -> Result<Self, String> {
+    pub fn load(
+        arch: TinyArch,
+        path: &Path,
+        gpu: &mut Gpu,
+        max_seq: usize,
+    ) -> Result<Self, String> {
         let mut hfq = HfqFile::open(path).map_err(|e| format!("open {path:?}: {e:?}"))?;
         match arch {
             TinyArch::Qwen35 | TinyArch::Qwen35Moe => {
-                let config = qwen35::config_from_hfq(&hfq).ok_or("qwen35: config_from_hfq failed")?;
+                let config =
+                    qwen35::config_from_hfq(&hfq).ok_or("qwen35: config_from_hfq failed")?;
                 let weights = qwen35::load_weights(&mut hfq, &config, gpu)
                     .map_err(|e| format!("qwen35 load_weights: {e:?}"))?;
                 let kv = KvCache::new_gpu_q8(
@@ -137,10 +148,17 @@ impl TinyModel {
                     max_seq + 16,
                 )
                 .map_err(|e| format!("qwen35 kv: {e:?}"))?;
-                let dn = DeltaNetState::new(gpu, &config).map_err(|e| format!("qwen35 dn: {e:?}"))?;
+                let dn =
+                    DeltaNetState::new(gpu, &config).map_err(|e| format!("qwen35 dn: {e:?}"))?;
                 let scratch = Qwen35Scratch::new(gpu, &config, 64)
                     .map_err(|e| format!("qwen35 scratch: {e:?}"))?;
-                Ok(Self::Qwen35 { config, weights, kv, dn, scratch })
+                Ok(Self::Qwen35 {
+                    config,
+                    weights,
+                    kv,
+                    dn,
+                    scratch,
+                })
             }
             TinyArch::Qwen2 => {
                 let config = qwen2::config_from_hfq(&hfq).ok_or("qwen2: config_from_hfq failed")?;
@@ -148,7 +166,11 @@ impl TinyModel {
                     .map_err(|e| format!("qwen2 load_weights: {e:?}"))?;
                 let state = qwen2::Qwen2State::new_with_max_seq(gpu, &config, max_seq)
                     .map_err(|e| format!("qwen2 state: {e:?}"))?;
-                Ok(Self::Qwen2 { config, weights, state })
+                Ok(Self::Qwen2 {
+                    config,
+                    weights,
+                    state,
+                })
             }
             TinyArch::Gemma3 => {
                 let config =
@@ -157,13 +179,21 @@ impl TinyModel {
                     .map_err(|e| format!("gemma3 load_weights: {e:?}"))?;
                 let state = gemma3::Gemma3State::new_with_max_seq(gpu, &config, max_seq, false)
                     .map_err(|e| format!("gemma3 state: {e:?}"))?;
-                Ok(Self::Gemma3 { config, weights, state })
+                Ok(Self::Gemma3 {
+                    config,
+                    weights,
+                    state,
+                })
             }
             TinyArch::MiniMax => {
                 let config = minimax::MiniMaxConfig::from_hfq(&hfq)?;
                 let weights = minimax::MiniMaxWeights::load(&mut hfq, &config, gpu, None)?;
                 let state = minimax::MiniMaxState::new_with_max_seq(gpu, &config, max_seq)?;
-                Ok(Self::MiniMax { config, weights, state })
+                Ok(Self::MiniMax {
+                    config,
+                    weights,
+                    state,
+                })
             }
             TinyArch::Llama => {
                 let config = hipfire_runtime::hfq::config_from_hfq(&hfq)
@@ -178,9 +208,14 @@ impl TinyModel {
                     max_seq + 16,
                 )
                 .map_err(|e| format!("llama kv: {e:?}"))?;
-                let scratch =
-                    ForwardScratch::new(gpu, &config).map_err(|e| format!("llama scratch: {e:?}"))?;
-                Ok(Self::Llama { config, weights, kv, scratch })
+                let scratch = ForwardScratch::new(gpu, &config)
+                    .map_err(|e| format!("llama scratch: {e:?}"))?;
+                Ok(Self::Llama {
+                    config,
+                    weights,
+                    kv,
+                    scratch,
+                })
             }
         }
     }
@@ -199,27 +234,56 @@ impl TinyModel {
     /// by qwen35/minimax; qwen2/gemma3 self-increment their own position counter,
     /// so callers MUST feed tokens strictly in order from a fresh state (which
     /// `run_logits`/`run_collect` do) — this is not a random-access scorer.
-    pub fn forward_logits(&mut self, gpu: &mut Gpu, token: u32, pos: usize) -> Result<Vec<f32>, String> {
+    pub fn forward_logits(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+        pos: usize,
+    ) -> Result<Vec<f32>, String> {
         match self {
-            Self::Qwen35 { config, weights, kv, dn, scratch } => {
+            Self::Qwen35 {
+                config,
+                weights,
+                kv,
+                dn,
+                scratch,
+            } => {
                 qwen35::forward_scratch(gpu, weights, config, token, pos, kv, dn, scratch)
                     .map_err(|e| format!("qwen35 forward: {e:?}"))?;
-                gpu.download_f32(&scratch.logits).map_err(|e| format!("dl logits: {e:?}"))
+                gpu.download_f32(&scratch.logits)
+                    .map_err(|e| format!("dl logits: {e:?}"))
             }
-            Self::Qwen2 { config, weights, state } => {
+            Self::Qwen2 {
+                config,
+                weights,
+                state,
+            } => {
                 qwen2::forward_step(gpu, weights, config, state, token)
                     .map_err(|e| format!("qwen2 forward: {e:?}"))?;
-                gpu.download_f32(&state.logits).map_err(|e| format!("dl logits: {e:?}"))
+                gpu.download_f32(&state.logits)
+                    .map_err(|e| format!("dl logits: {e:?}"))
             }
-            Self::Gemma3 { config, weights, state } => {
+            Self::Gemma3 {
+                config,
+                weights,
+                state,
+            } => {
                 gemma3::forward::forward_step(gpu, weights, config, state, token)
                     .map_err(|e| format!("gemma3 forward: {e:?}"))?;
-                gpu.download_f32(&state.logits).map_err(|e| format!("dl logits: {e:?}"))
+                gpu.download_f32(&state.logits)
+                    .map_err(|e| format!("dl logits: {e:?}"))
             }
-            Self::MiniMax { config, weights, state } => {
-                minimax::forward::decode_step(config, weights, state, gpu, token, pos as u32)
-            }
-            Self::Llama { config, weights, kv, scratch } => {
+            Self::MiniMax {
+                config,
+                weights,
+                state,
+            } => minimax::forward::decode_step(config, weights, state, gpu, token, pos as u32),
+            Self::Llama {
+                config,
+                weights,
+                kv,
+                scratch,
+            } => {
                 // forward_scratch computes logits into scratch.logits, THEN samples.
                 // We pass greedy/no-op sampling params and read the raw pre-sample
                 // logits (the sampled-token return value is discarded).
@@ -227,7 +291,8 @@ impl TinyModel {
                     gpu, weights, config, token, pos, kv, scratch, 0.0, 1.0, 0, 0, 1.0,
                 )
                 .map_err(|e| format!("llama forward: {e:?}"))?;
-                gpu.download_f32(&scratch.logits).map_err(|e| format!("dl logits: {e:?}"))
+                gpu.download_f32(&scratch.logits)
+                    .map_err(|e| format!("dl logits: {e:?}"))
             }
         }
     }
@@ -358,6 +423,82 @@ pub struct KldOut {
     pub finite: bool,
 }
 
+/// Result of an autoregressive tiny forward pass.
+pub struct ArHashOut {
+    pub logit_hash: u64,
+    pub token_hash: u64,
+    pub n_steps: usize,
+    pub prompt_len: usize,
+    pub last_token: u32,
+}
+
+fn hash_mix(mut h: u64, x: u64) -> u64 {
+    h ^= x;
+    h = h.wrapping_mul(0x1000_0000_01B3);
+    h ^ (h >> 32)
+}
+
+fn argmax(logits: &[f32]) -> u32 {
+    let mut best_i = 0usize;
+    let mut best_v = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_v {
+            best_i = i;
+            best_v = v;
+        }
+    }
+    best_i as u32
+}
+
+/// Free-running greedy decode over a tiny fixture, hashing the full logit vector
+/// and the generated token stream. Unlike [`run_kld`], this grows KV/state using
+/// the model's own argmax outputs after a short deterministic prompt, so it is a
+/// cheap tripwire for position/state/KV/long-tail decode drift.
+pub fn run_ar_hash(
+    arch: TinyArch,
+    model_path: &Path,
+    gpu: &mut Gpu,
+    len: usize,
+    prompt_len: usize,
+    seed: u64,
+) -> Result<ArHashOut, String> {
+    if len == 0 {
+        return Err("ar_hash: --len must be > 0".into());
+    }
+    if prompt_len == 0 || prompt_len > len {
+        return Err("ar_hash: --prompt-len must be in 1..=len".into());
+    }
+
+    let mut model = TinyModel::load(arch, model_path, gpu, len + 16)?;
+    let vocab = model.vocab().max(1) as u32;
+    let prompt = synthetic_tokens(prompt_len, seed);
+    let mut next_token = prompt[0] % vocab;
+    let mut logit_hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut token_hash = 0x9e37_79b9_7f4a_7c15u64;
+
+    for pos in 0..len {
+        let token = if pos < prompt_len {
+            prompt[pos] % vocab
+        } else {
+            next_token
+        };
+        token_hash = hash_mix(token_hash, token as u64);
+        let logits = model.forward_logits(gpu, token, pos)?;
+        for &v in &logits {
+            logit_hash = hash_mix(logit_hash, v.to_bits() as u64);
+        }
+        next_token = argmax(&logits) % vocab;
+    }
+
+    Ok(ArHashOut {
+        logit_hash,
+        token_hash,
+        n_steps: len,
+        prompt_len,
+        last_token: next_token,
+    })
+}
+
 /// Run `model` over `tokens`, returning per-position logits for pos >= warmup.
 fn run_logits(
     arch: TinyArch,
@@ -393,7 +534,11 @@ pub fn run_kld(
     let refs = run_logits(arch, ref_path, gpu, &tokens, warmup)?;
     let cands = run_logits(arch, cand_path, gpu, &tokens, warmup)?;
     if refs.len() != cands.len() || refs.is_empty() {
-        return Err(format!("kld: position mismatch ref={} cand={}", refs.len(), cands.len()));
+        return Err(format!(
+            "kld: position mismatch ref={} cand={}",
+            refs.len(),
+            cands.len()
+        ));
     }
     let mut sum = 0.0f64;
     let mut max = 0.0f64;
@@ -469,7 +614,9 @@ pub fn run_collect(
 
     let n_tensors = collector.len();
     if n_tensors == 0 {
-        return Err("collect: no tensors captured (capture_names empty or weight_gemv not hit)".into());
+        return Err(
+            "collect: no tensors captured (capture_names empty or weight_gemv not hit)".into(),
+        );
     }
     let meta = serde_json::json!({
         "artifact_kind": "calibration",

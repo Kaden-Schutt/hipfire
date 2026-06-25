@@ -185,7 +185,10 @@ fn load_baselines() -> BTreeMap<(String, String, String), (f64, f64)> {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let tol: f64 = f.get(4).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_REL_TOL);
+        let tol: f64 = f
+            .get(4)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_REL_TOL);
         m.insert(
             (f[0].to_string(), f[1].to_string(), f[2].to_string()),
             (mean, tol),
@@ -231,7 +234,10 @@ fn run_quantize(
             .take(2)
             .collect::<Vec<_>>()
             .join(" | ");
-        return Err(format!("quantize {format} exit={:?}: {tail}", out.status.code()));
+        return Err(format!(
+            "quantize {format} exit={:?}: {tail}",
+            out.status.code()
+        ));
     }
     Ok(())
 }
@@ -267,14 +273,27 @@ fn run_kld(probe: &Path, arch: &str, anchor: &Path, cand: &Path) -> Result<KldCe
     let mean = parse_kv(&stdout, "mean_kld")
         .and_then(|s| s.parse().ok())
         .ok_or("probe kld: no mean_kld")?;
-    let max = parse_kv(&stdout, "max_kld").and_then(|s| s.parse().ok()).unwrap_or(mean);
-    let n = parse_kv(&stdout, "n_scored").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let max = parse_kv(&stdout, "max_kld")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(mean);
+    let n = parse_kv(&stdout, "n_scored")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let finite = parse_kv(&stdout, "finite") == Some("true");
-    Ok(KldCell { mean_kld: mean, max_kld: max, n_scored: n, finite })
+    Ok(KldCell {
+        mean_kld: mean,
+        max_kld: max,
+        n_scored: n,
+        finite,
+    })
 }
 
 /// Verdict for a KLD cell. `base` = committed `(mean, rel_tol)` if any.
-fn kld_status(cell: &KldCell, base: Option<(f64, f64)>, record: bool) -> (EvalStatus, Option<String>) {
+fn kld_status(
+    cell: &KldCell,
+    base: Option<(f64, f64)>,
+    record: bool,
+) -> (EvalStatus, Option<String>) {
     if !cell.finite || !cell.mean_kld.is_finite() {
         return (EvalStatus::Fail, Some("non-finite KLD".into()));
     }
@@ -302,7 +321,10 @@ fn kld_status(cell: &KldCell, base: Option<(f64, f64)>, record: bool) -> (EvalSt
         // The hard-fail checks above still catch crashes/NaN/zero-token cells.
         // During `--record` we ARE establishing the baseline this run, so Pass.
         None if record => (EvalStatus::Pass, Some("recording new baseline".into())),
-        None => (EvalStatus::Skip, Some("no committed baseline (run --record)".into())),
+        None => (
+            EvalStatus::Skip,
+            Some("no committed baseline (run --record)".into()),
+        ),
     }
 }
 
@@ -385,11 +407,11 @@ pub(crate) fn tiny_quant_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<Eva
     let mut observed: Vec<(String, String, String, f64)> = Vec::new();
 
     let push = |family: &str,
-                    cell: &str,
-                    status: EvalStatus,
-                    reason: Option<String>,
-                    metrics: BTreeMap<String, Value>,
-                    rows: &mut Vec<EvalResult>| {
+                cell: &str,
+                status: EvalStatus,
+                reason: Option<String>,
+                metrics: BTreeMap<String, Value>,
+                rows: &mut Vec<EvalResult>| {
         let case = format!("{family}/{cell}");
         rows.push(row_for_model(
             BatteryId::TinyQuant,
@@ -463,10 +485,12 @@ pub(crate) fn tiny_quant_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<Eva
         match collect {
             Ok(o) if o.status.success() => {
                 let so = String::from_utf8_lossy(&o.stdout);
-                let n_tensors: usize =
-                    parse_kv(&so, "n_tensors").and_then(|s| s.parse().ok()).unwrap_or(0);
-                let consistency: f64 =
-                    parse_kv(&so, "consistency").and_then(|s| s.parse().ok()).unwrap_or(f64::NAN);
+                let n_tensors: usize = parse_kv(&so, "n_tensors")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                let consistency: f64 = parse_kv(&so, "consistency")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(f64::NAN);
                 let mut m = BTreeMap::new();
                 m.insert("executor".into(), json!("tinyquant"));
                 m.insert("implemented".into(), json!(true));
@@ -477,7 +501,10 @@ pub(crate) fn tiny_quant_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<Eva
                 let (st, rs) = if n_tensors == 0 {
                     (EvalStatus::Fail, Some("collect: 0 tensors captured".into()))
                 } else if !consistency.is_finite() || consistency > 0.05 {
-                    (EvalStatus::Fail, Some(format!("collect: consistency {consistency:.4}")))
+                    (
+                        EvalStatus::Fail,
+                        Some(format!("collect: consistency {consistency:.4}")),
+                    )
                 } else {
                     have_calib = true;
                     (EvalStatus::Pass, None)
@@ -510,7 +537,14 @@ pub(crate) fn tiny_quant_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<Eva
                 let mut m = BTreeMap::new();
                 m.insert("family".into(), json!(fam));
                 m.insert("format".into(), json!(fmt));
-                push(fam, &format!("quantize:{fmt}"), EvalStatus::Fail, Some(e), m, &mut rows);
+                push(
+                    fam,
+                    &format!("quantize:{fmt}"),
+                    EvalStatus::Fail,
+                    Some(e),
+                    m,
+                    &mut rows,
+                );
                 continue;
             }
             match run_kld(&probe, fam, &anchor, &cand) {
@@ -519,7 +553,12 @@ pub(crate) fn tiny_quant_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<Eva
                         .get(&(gpu_arch.clone(), fam.to_string(), fmt.to_string()))
                         .copied();
                     if record && cell.finite {
-                        observed.push((gpu_arch.clone(), fam.to_string(), fmt.to_string(), cell.mean_kld));
+                        observed.push((
+                            gpu_arch.clone(),
+                            fam.to_string(),
+                            fmt.to_string(),
+                            cell.mean_kld,
+                        ));
                     }
                     let (st, rs) = kld_status(&cell, base, record);
                     let m = kld_metrics(fam, fmt, false, &gpu_arch, &cell, base);
@@ -529,7 +568,14 @@ pub(crate) fn tiny_quant_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<Eva
                     let mut m = BTreeMap::new();
                     m.insert("family".into(), json!(fam));
                     m.insert("format".into(), json!(fmt));
-                    push(fam, &format!("kld:{fmt}"), EvalStatus::Fail, Some(e), m, &mut rows);
+                    push(
+                        fam,
+                        &format!("kld:{fmt}"),
+                        EvalStatus::Fail,
+                        Some(e),
+                        m,
+                        &mut rows,
+                    );
                 }
             }
         }
@@ -556,7 +602,14 @@ pub(crate) fn tiny_quant_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<Eva
                 m.insert("family".into(), json!(fam));
                 m.insert("format".into(), json!(fmt));
                 m.insert("calibrated".into(), json!(true));
-                push(fam, &format!("quantize:{fmt}(calib)"), EvalStatus::Fail, Some(e), m, &mut rows);
+                push(
+                    fam,
+                    &format!("quantize:{fmt}(calib)"),
+                    EvalStatus::Fail,
+                    Some(e),
+                    m,
+                    &mut rows,
+                );
                 continue;
             }
             match run_kld(&probe, fam, &anchor, &cand) {
@@ -576,7 +629,14 @@ pub(crate) fn tiny_quant_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<Eva
                     let mut m = BTreeMap::new();
                     m.insert("family".into(), json!(fam));
                     m.insert("format".into(), json!(fmt));
-                    push(fam, &format!("kld:{fmt}(calib)"), EvalStatus::Fail, Some(e), m, &mut rows);
+                    push(
+                        fam,
+                        &format!("kld:{fmt}(calib)"),
+                        EvalStatus::Fail,
+                        Some(e),
+                        m,
+                        &mut rows,
+                    );
                 }
             }
         }
@@ -636,7 +696,9 @@ fn write_baselines(observed: &[(String, String, String, f64)]) -> std::io::Resul
     }
     let mut out = String::new();
     out.push_str("# tiny-quant KLD baselines — gpu_arch family format mean_kld rel_tol\n");
-    out.push_str("# regenerate per GPU: HIPFIRE_TINYQUANT_RECORD=1 ./tests/tiny-quant-gate.sh --record\n");
+    out.push_str(
+        "# regenerate per GPU: HIPFIRE_TINYQUANT_RECORD=1 ./tests/tiny-quant-gate.sh --record\n",
+    );
     let mut all: Vec<String> = kept;
     for (g, fam, fmt, mean) in observed {
         let tol = prior_tol

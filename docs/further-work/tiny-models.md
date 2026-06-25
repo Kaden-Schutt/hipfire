@@ -11,14 +11,19 @@ are the loose ends, roughly in priority order.
 CI (`tests/no-gpu-ci.sh` → `.github/workflows/no-gpu-ci.yml`) gates only the **CPU
 plumbing**: the fixture unit tests + the emit→quantize→arch-detect roundtrip
 (`tests/fixture-roundtrip-nogpu.sh`, all families) + compile-checks of the battery
-and `tiny_quant_probe`. The actual **KLD / collect scoring** — the part that caught
-the cross-arch MoE NaN — runs only when a human types `./tests/tiny-quant-gate.sh`.
+and `tiny_quant_probe`. The pre-commit hook now uses Git's staged path list via
+`tests/tiny-affected-gate.sh` to run the smallest covered `tiny_quant` family set
+first, then escalates to the large coherence battery on failure, missing tiny
+coverage, or inconclusive rows. What is still missing is a **GPU CI / scheduled
+fleet** run of the KLD / collect matrix — the part that caught the cross-arch MoE
+NaN — on validation boxes.
 
 So a future dequant-kernel or quant regression would not be caught automatically.
 
-- **Do:** add a **GPU CI or scheduled fleet job** that runs `tiny-quant-gate.sh` on
-  the validation boxes (gfx1103 + halo/gfx1151). Model it on however the other GPU
-  gates are triggered.
+- **Do:** add a **GPU CI or scheduled fleet job** that runs
+  `tiny-affected-gate.sh --base <protected-branch> --require-coverage` on PRs and
+  `tiny-quant-gate.sh` as a periodic full matrix on the validation boxes
+  (gfx1103 + halo/gfx1151). Model it on however the other GPU gates are triggered.
 - **Don't:** put the GPU matrix in the pre-commit hook — per-commit GPU minutes +
   GPU-lock contention train people to `git commit --no-verify`, which defeats the
   correctness tripwires that legitimately live there.
