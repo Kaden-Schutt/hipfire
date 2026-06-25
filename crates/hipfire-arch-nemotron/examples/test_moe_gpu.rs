@@ -15,17 +15,7 @@ use rdna_compute::Gpu;
 fn main() {
     let mut gpu = Gpu::init().expect("GPU init");
     let hidden = 4usize;
-    let cfg = MoeConfig {
-        n_routed_experts: 4,
-        num_experts_per_tok: 2,
-        intermediate_size: 3,
-        n_shared_experts: 1,
-        shared_expert_intermediate_size: 3,
-        n_group: 1,
-        topk_group: 1,
-        norm_topk_prob: true,
-        routed_scaling_factor: 1.25,
-    };
+    let cfg = tiny_cfg();
     let weights = MoeWeights {
         router: vec![
             1.2, -0.2, 0.1, 0.3, // expert 0
@@ -90,7 +80,57 @@ fn main() {
         .fold(0.0f32, f32::max);
     eprintln!("max|delta|={max_delta:.3e}");
     assert!(max_delta < 2e-5, "MoE GPU mismatch: max delta {max_delta}");
+
+    let seq_x = vec![
+        0.5, 1.25, -0.75, 0.25, //
+        -0.25, 0.75, 0.5, -1.0, //
+        1.0, -0.5, 0.125, 0.625,
+    ];
+    let seq = seq_x.len() / hidden;
+    let seq_cpu = (0..seq)
+        .flat_map(|row| {
+            moe_relu2(
+                &cfg,
+                &weights,
+                &seq_x[row * hidden..(row + 1) * hidden],
+                hidden,
+            )
+        })
+        .collect::<Vec<_>>();
+    let seq_gpu = gpu
+        .upload_f32(&seq_x, &[seq, hidden])
+        .expect("upload seq x");
+    let seq_out = block.prefill(&mut gpu, &seq_gpu, seq).expect("prefill");
+    gpu.hip.device_synchronize().expect("sync prefill");
+    let seq_got = gpu.download_f32(&seq_out).expect("download seq out");
+    let seq_max_delta = seq_got
+        .iter()
+        .zip(&seq_cpu)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("prefill max|delta|={seq_max_delta:.3e}");
+    assert!(
+        seq_max_delta < 2e-5,
+        "MoE GPU prefill mismatch: max delta {seq_max_delta}"
+    );
+
     let _ = gpu.free_tensor(x_gpu);
+    let _ = gpu.free_tensor(seq_gpu);
+    let _ = gpu.free_tensor(seq_out);
     block.free(&mut gpu);
     println!("PASS: Nemotron MoE GPU block matches CPU oracle");
+}
+
+fn tiny_cfg() -> MoeConfig {
+    MoeConfig {
+        n_routed_experts: 4,
+        num_experts_per_tok: 2,
+        intermediate_size: 3,
+        n_shared_experts: 1,
+        shared_expert_intermediate_size: 3,
+        n_group: 1,
+        topk_group: 1,
+        norm_topk_prob: true,
+        routed_scaling_factor: 1.25,
+    }
 }

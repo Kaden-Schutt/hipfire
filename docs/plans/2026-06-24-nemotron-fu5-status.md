@@ -11,10 +11,10 @@ ReLU²-MLP hybrid).
 | FU | Title | State |
 |----|-------|-------|
 | FU2 | HF-reference numeric bisect | **DONE** (committed earlier; Python native-Mamba reference refreshed) |
-| FU3 | quantizer → nemotron_h mq4/q8 .hfq | **DONE** — mq4 protects Nemotron residual writers as q8 |
+| FU3 | quantizer → nemotron_h mq4/q8 .hfq | **DONE** — mq4 protects Nemotron residual writers and Mamba `in_proj` as q8 |
 | FU4 | loader compat (load .hfq + quantized gemv) + serving | **DONE** |
 | FU5 | N6 batched prefill + q8 SSM state | **mostly done** — batched HFQ benchmark captured; q8 state opt-in validated |
-| FU6 | Nano-30B MoE ('E' block) | in progress — 30B MQ4/HFQ artifact built; Mamba scale fix restores closed-think 2+2 |
+| FU6 | Nano-30B MoE ('E' block) | in progress — 30B MQ4/HFQ artifact built; Mamba scale + hybrid MoE prefill restore closed-think 2+2 |
 | FU1 | chat-template / coherence | blocked (EOS/Jinja/CLI controls fixed; vLLM reference is coherent; Hipfire/native-HF diverge at first token) |
 
 ## FU1 update (2026-06-25)
@@ -57,7 +57,8 @@ Validation on gfx1151 still reproduces the FU1 blocker:
   0.999967, mean|delta|=0.01770, max|delta|=0.11181.
 - `hipfire-quantize --format mq4` now protects Nemotron-H residual writers
   (`*.mixer.out_proj.weight`, `*.mixer.down_proj.weight`, `*.mixer.o_proj.weight`)
-  as Q8. On Nano-4B this makes the fresh protected artifact
+  plus Mamba `*.mixer.in_proj.weight` as Q8. On Nano-4B this makes the fresh
+  protected artifact
   `/tmp/nano4b-mq4-protected.hfq` Q8-sized (4.0G) because the remaining linear
   readers already fall back to Q8 on ragged K=3136. The protected artifact
   matches f32 at the closed-think boundary: argmax=11, identical top-5, logit
@@ -172,6 +173,7 @@ piece validated gpu-vs-cpu (or gpu-vs-decode) against an oracle.
 | `0dfec9e4e` | `NemotronAttnGpu::prefill` (NoPE GQA, `attention_f32_batched_masked`) | prefill == decode loop 1.3e-8 |
 | `211888d7a` | `NemotronModel::prefill_batched` + `SimpleAr::prefill` f32 fast path | model prefill == decode loop 2.98e-7, argmax match |
 | `27f994e00` | Quantized `LinearWeight::gemm_seq` (Q8, HFQ4G256, HFQ4G128, MQ4G256 via batched FWHT rotate + HFQ4G256 GEMM) + HFQ batched prefill enable | HFQ model prefill == decode loop 1.29e-5, argmax match |
+| 2026-06-25 MoE prefill slice | `MoeRelu2Gpu::prefill` row-wise composition inside the batched residual contract; MoE models no longer hard-disable `can_batched_prefill()` | MoE block prefill max|Δ|=4.47e-8; real 30B HFQ prefill-vs-decode max|Δlogit|=8.106e-6, argmax 1052 |
 
 Key facts established:
 - `gemm_f32_train(trans_b)` does `out[seq,m] = x[seq,k]·Wᵀ` from the `[m,k]`-stored
@@ -199,7 +201,10 @@ batched path; `forward_gpu`/`decode_step` stay as the per-token decode path.
 `rmsnorm_batched` and `lm_head` on the last position. Quantized `gemm_seq`
 supports Q8, HFQ4G256, HFQ4G128, and MQ4G256; MQ4G256 rotates the whole
 `[seq,k]` activation with `rotate_x_mq_batched`/`rotate_x_mq_awq_batched`, then
-uses the HFQ4G256 batched GEMM against the rotated weight layout.
+uses the HFQ4G256 batched GEMM against the rotated weight layout. MoE blocks
+currently compose the validated decode primitive row-by-row inside the same
+`[seq,hidden]` contract; expert-sorted/grouped MoE prefill remains a throughput
+optimization, not a correctness prerequisite.
 
 Validation run locally on gfx1151:
 - `test_model_prefill_gpu`: synthetic f32 Mamba/MLP/attention model,
@@ -221,6 +226,12 @@ Validation run locally on gfx1151:
     decode-loop mean=3356.73ms (38.1 tok/s), speedup=1.36x.
   - seq=256, warmup=1, iters=3: batched mean=5101.45ms (50.2 tok/s),
     decode-loop mean=6713.97ms (38.1 tok/s), speedup=1.32x.
+- `test_moe_gpu`: isolated MoE block forward and row-wise prefill both match the
+  CPU oracle with max|Δ|=4.47e-8 on gfx1151.
+- `test_load_nano30b_hfq` on the real 30B HFQ artifact now validates
+  prefill-vs-decode: default 2-token smoke max|Δlogit|=6.676e-6, argmax match;
+  full 29-token closed-think 2+2 prompt max|Δlogit|=8.106e-6, final argmax
+  `1052` (`4`).
 - Commit hooks for `211888d7a` and `27f994e00`: rustfmt, clippy, short
   coherence battery (no hard errors), fast agentic gate, and MQ4 speed gate all
   passed. Tiny-fixture golden still drifted on existing Qwen fixtures and
@@ -233,8 +244,9 @@ Validation run locally on gfx1151:
    default correctness floor until longer-generation quality evidence decides
    whether `HIPFIRE_NEMOTRON_SSM_STATE=q8` should become the default.
 2. **(Optional) broaden prefill benchmarks.** Current evidence covers the
-   protected mq4 HFQ artifact on gfx1151. A fuller benchmark-grade sweep can add
-   f32/q8 plus longer prompt lengths.
+   protected mq4 HFQ artifact on gfx1151 plus correctness for the real 30B HFQ
+   artifact. A fuller benchmark-grade sweep can add f32/q8, 30B prompt-length
+   sweeps, and row-wise-MoE vs future expert-sorted MoE comparisons.
 3. **(Optional) chunked masked-flash for very long prompts.** The attention
    prefill uses a single masked-flash block (`block_cols=seq`); shared-mem scales
    with seq. Fine for normal prompts; long-context needs block tiling.
@@ -263,10 +275,13 @@ introduces a new **'E' (MoE) block**. The first bounded slice is now in place:
   base MQ4 router noise.
 - `MoeRelu2Gpu` implements a decode-first correctness path: router GEMV →
   sigmoid → bias-aware top-k/renormalize/scale, shared ReLU² expert, and a
-  simple selected-expert loop using existing `MlpRelu2Gpu` blocks. Batched MoE
-  prefill is intentionally not enabled yet.
+  simple selected-expert loop using existing `MlpRelu2Gpu` blocks. Its prefill
+  path applies that validated primitive row-by-row to materialize `[seq,hidden]`
+  outputs, which unblocks model-level batched prefill for 30B while keeping
+  expert-sorted grouping as a later performance optimization.
 - Validation: `cargo run -p hipfire-arch-nemotron --example test_moe_gpu`
-  passes on gfx1151 with max|Δ|=4.47e-8 against the CPU oracle.
+  passes on gfx1151 with max|Δ|=4.47e-8 against the CPU oracle for both
+  single-row forward and sequence prefill.
 - The real 30B checkpoint was quantized with the rebuilt `hipfire-quantize`
   mq4 policy to
   `/home/sadara/.hipfire/models/nemotron-3-nano-30b-a3b-mq4.hfq`.
@@ -276,17 +291,16 @@ introduces a new **'E' (MoE) block**. The first bounded slice is now in place:
   Artifact sha256:
   `3660ae47c8f7309110d85ee2c013629cb6437b2fdfbb76d41a1a7cb3a49fe2f6`.
 - `test_load_nano30b_hfq` now validates the real HFQ artifact through the
-  Hipfire path: load config + HFQ, assert MoE disables batched prefill, decode
-  a short prompt, and fail on non-finite logits. Local gfx1151 smoke passed:
-  `pos 0 tok 1784: argmax=1044`, `pos 1 tok 8961: argmax=1044`,
-  `PASS: Nemotron 30B HFQ loaded and decoded 2 token(s), final argmax=1044`.
+  Hipfire path: load config + HFQ, assert hybrid batched prefill is available,
+  compare prefill logits against the decode loop, and fail on non-finite logits.
+  Local gfx1151 smoke passed on the default 2-token prompt with max|Δlogit|=
+  `6.676e-6`, argmax match, final argmax=1307.
 - The rebuilt daemon can load/generate/unload the same 30B HFQ artifact through
   the JSONL serving path. Load response reports
   `arch=nemotron_h`, `dim=2688`, `layers=52`, `vocab=131072`, and
   `model_file_bytes=25680997504`; stderr reports the real block mix
-  `(23 M / 6 * / 0 - / 23 E)`. Greedy closed-think 2+2 currently generates an
-  8-token comma loop (`,,,,,,,,`), so serving ingress is wired but coherence is
-  still not validated.
+  `(23 M / 6 * / 0 - / 23 E)`. With the current checkout daemon and the Mamba
+  scale fix, greedy closed-think 2+2 returns `4` in one token.
 - A Lyra real-Mamba Transformers reference for the same 30B checkpoint and the
   same closed-think 2+2 prompt IDs completed on gfx1151:
   `/tmp/nemotron30b_lyra_real_closed2p2.npz` plus
@@ -311,6 +325,9 @@ introduces a new **'E' (MoE) block**. The first bounded slice is now in place:
   `hidden_1` to `hidden_2`, and final logits are close enough to preserve the
   reference top token: HF top-5 `[1052, 31035, 1784, 1050, 31106]`, Hipfire
   top-5 `[1052, 1784, 1050, 31035, 31106]`, logit rel delta `0.0454`.
+- With hybrid MoE prefill enabled, the same 29-token prompt matches the
+  per-token decode loop with max|Δlogit|=`8.106e-6`, prefill argmax=1052, and
+  decode argmax=1052.
 - A rebuilt exploratory artifact with Mamba `in_proj` promoted to Q8,
   `/home/sadara/.hipfire/models/nemotron-3-nano-30b-a3b-inproj-q8-mq4.hfq`
   (sha256
@@ -325,11 +342,12 @@ introduces a new **'E' (MoE) block**. The first bounded slice is now in place:
   arch dispatch.
 
 Remaining FU6 work is throughput and admission-quality evidence at 30B scale:
-add a batched/expert-sorted MoE prefill path if 30B prefill throughput matters,
-and run broader quality/perf evidence before promoting any changed quant policy.
-The current policy is still an ingress policy, not a quality-promoted
-calibration policy; router tensors are Q8-protected, but expert promotion still
-needs router-hit and quality evidence before any "better than baseline" claim.
+replace row-wise MoE prefill with a batched/expert-sorted grouped path if 30B
+prefill throughput matters, and run broader quality/perf evidence before
+promoting any changed quant policy. The current policy is still an ingress
+policy, not a quality-promoted calibration policy; router tensors are
+Q8-protected, but expert promotion still needs router-hit and quality evidence
+before any "better than baseline" claim.
 
 ## FU1 (coherence) — standing blocker
 
@@ -353,8 +371,9 @@ Next useful FU1 work:
 3. Compare Hipfire f32/q8 against vLLM at the generation boundary, then bisect
    the first divergence against the already added per-layer/block hooks.
 4. Treat real 4-bit Nano-4B as a sensitivity issue until calibrated. The current
-   `--format mq4` policy protects projection-back residual writers as q8; an
-   imatrix/AWQ/Lloyd pass is required before claiming true mq4 coherence.
+   `--format mq4` policy protects projection-back residual writers and Mamba
+   `in_proj` as q8; an imatrix/AWQ/Lloyd pass is required before claiming true
+   mq4 coherence.
 5. Only after a coherent reference exists, tune sampling/repeat penalties or
    prompt policy. Current prompt/EOS-only changes do not fix the blocker.
 
@@ -367,8 +386,8 @@ cargo run -p hipfire-arch-nemotron --example test_gated_norm_seq_gpu # gated-nor
 cargo run -p hipfire-arch-nemotron --example test_block_prefill_gpu  # Mamba block
 cargo run -p hipfire-arch-nemotron --example test_mlp_prefill_gpu    # MLP block
 cargo run -p hipfire-arch-nemotron --example test_attn_prefill_gpu   # attention block
-cargo run -p hipfire-arch-nemotron --example test_moe_gpu            # MoE block
-cargo run -p hipfire-arch-nemotron --example test_load_nano30b_hfq   # real 30B HFQ decode
+cargo run -p hipfire-arch-nemotron --example test_moe_gpu            # MoE block + row-wise prefill
+cargo run -p hipfire-arch-nemotron --example test_load_nano30b_hfq   # real 30B HFQ prefill-vs-decode
 cargo run -p hipfire-arch-nemotron --example test_model_prefill_gpu  # full model (FU5 gate)
 cargo run -p hipfire-arch-nemotron --example test_model_prefill_hfq_gpu # full HFQ model
 cargo run -p hipfire-arch-nemotron --example hfq_vs_f32              # FU4 quant loader

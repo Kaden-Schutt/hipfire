@@ -78,9 +78,10 @@ enum Block {
 /// GPU-resident nemotron_h model (decode forward).
 pub struct NemotronModel {
     cfg: NemotronHConfig,
-    /// Whether the batched N6 prefill path can run. Both f32 and the supported
-    /// HFQ linear formats use [`LinearWeight::gemm_seq`]; unsupported future
-    /// quant dtypes fail there with a classifiable capability-gap error.
+    /// Whether the batched N6 prefill path can run. Current Nemotron block
+    /// kinds all expose the prefill contract; unsupported future quant dtypes
+    /// fail inside [`LinearWeight::gemm_seq`] with a classifiable capability-gap
+    /// error.
     batched_prefill: bool,
     embeddings: EmbeddingTable,
     layer_norm: Vec<GpuTensor>,
@@ -105,7 +106,7 @@ impl NemotronModel {
         let hidden = cfg.hidden_size;
         let vocab = cfg.vocab_size;
         let dims = cfg.mamba2_dims();
-        let batched_prefill = !cfg.blocks.iter().any(|b| *b == BlockKind::Moe);
+        let batched_prefill = true;
 
         let embeddings = EmbeddingTable::F32(gpu.upload_f32(&w.embeddings, &[vocab, hidden])?);
         let lm_head = LinearWeight::F32(gpu.upload_f32(&w.lm_head, &[vocab, hidden])?);
@@ -194,7 +195,7 @@ impl NemotronModel {
         let hidden = cfg.hidden_size;
         let vocab = cfg.vocab_size;
         let dims = cfg.mamba2_dims();
-        let batched_prefill = !cfg.blocks.iter().any(|b| *b == BlockKind::Moe);
+        let batched_prefill = true;
         let out_proj_scale = cfg.mamba_out_proj_runtime_scale();
         let e = |x: hip_bridge::HipError| format!("nemotron hfq gpu: {x:?}");
 
@@ -410,8 +411,7 @@ impl NemotronModel {
         Ok(())
     }
 
-    /// Whether the batched N6 prefill ([`Self::prefill_batched`]) is available
-    /// (f32 weights). Quantized models fall back to the per-token loop.
+    /// Whether the batched N6 prefill ([`Self::prefill_batched`]) is available.
     pub fn can_batched_prefill(&self) -> bool {
         self.batched_prefill
     }
@@ -422,7 +422,6 @@ impl NemotronModel {
     /// in `self.logits` and every block's recurrent/KV state at the post-prompt
     /// value — equivalent to `forward_gpu` over `tokens`, but with one launch per
     /// recurrent kernel instead of per token. Assumes fresh state (caller resets).
-    /// F32 weights only; see [`Self::can_batched_prefill`].
     pub fn prefill_batched(&mut self, gpu: &mut Gpu, tokens: &[u32]) -> HipResult<()> {
         const F32B: usize = std::mem::size_of::<f32>();
         let seq = tokens.len();
@@ -444,11 +443,7 @@ impl NemotronModel {
                 Block::Mamba2(b) => b.prefill(gpu, &normed_seq, seq)?,
                 Block::Mlp(b) => b.prefill(gpu, &normed_seq, seq)?,
                 Block::Attn(b) => b.prefill(gpu, &normed_seq, seq)?,
-                Block::Moe(_) => {
-                    return Err(HipError::unsupported(
-                        "nemotron MoE batched prefill is not implemented yet",
-                    ));
-                }
+                Block::Moe(b) => b.prefill(gpu, &normed_seq, seq)?,
             };
             gpu.add_inplace_f32(&h_seq, &out)?;
             let _ = gpu.free_tensor(out);

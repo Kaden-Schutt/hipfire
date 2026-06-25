@@ -4,9 +4,9 @@
 
 //! Serving seam for nemotron_h (arch_id 14): `SimpleAr` + `ServingBackend` on
 //! [`NemotronModel`], routing through the shared `run_simple_ar` → prefill →
-//! `decode_loop` loop (the same dense-AR seam as `LlamaBackend`). Mamba-2 /
-//! attention / MLP are all decode-only single-token forwards, so prefill is a
-//! per-token loop that builds the recurrent + KV state.
+//! `decode_loop` loop (the same dense-AR seam as `LlamaBackend`). Mamba-2,
+//! attention, dense MLP, and MoE blocks expose a model-level batched prefill
+//! contract that builds recurrent/KV state before decode.
 
 use crate::model::NemotronModel;
 use hipfire_runtime::arch::{
@@ -24,13 +24,14 @@ impl SimpleAr for NemotronModel {
         self.reset(gpu)
             .map_err(|e| format!("nemotron reset: {e:?}"))?;
         if self.can_batched_prefill() {
-            // N6 batched prefill (f32): one launch per recurrent kernel instead
-            // of per token. Leaves the last token's logits in `self.logits`.
+            // N6 batched prefill: one launch per recurrent kernel where the
+            // block supports it; MoE currently composes the validated row-wise
+            // primitive. Leaves the last token's logits in `self.logits`.
             return self
                 .prefill_batched(gpu, tokens)
                 .map_err(|e| format!("nemotron batched prefill: {e:?}"));
         }
-        // Quantized models: per-token loop until the batched quant gemm lands.
+        // Capability fallback for unsupported future dtypes.
         for (pos, &t) in tokens.iter().enumerate() {
             self.forward_gpu(gpu, t, pos)
                 .map_err(|e| format!("nemotron prefill forward[{pos}]: {e:?}"))?;

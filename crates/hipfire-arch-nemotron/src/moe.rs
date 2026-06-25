@@ -105,6 +105,7 @@ pub fn moe_relu2(cfg: &MoeConfig, w: &MoeWeights, x: &[f32], hidden: usize) -> V
 
 pub struct MoeRelu2Gpu {
     cfg: MoeConfig,
+    hidden: usize,
     router: LinearWeight,
     expert_bias: GpuTensor,
     shared: MlpRelu2Gpu,
@@ -191,6 +192,7 @@ impl MoeRelu2Gpu {
         }
         Ok(Self {
             cfg,
+            hidden,
             router,
             expert_bias: gpu.upload_f32(expert_bias, &[cfg.n_routed_experts])?,
             shared,
@@ -244,6 +246,25 @@ impl MoeRelu2Gpu {
             gpu.scaled_add_inplace_cpu_scalar_f32(&self.out, expert_out, *weight)?;
         }
         Ok(&self.out)
+    }
+
+    /// Hybrid batched prefill for a `[seq, hidden]` activation buffer.
+    ///
+    /// The surrounding Nemotron prefill path already batches Mamba, attention,
+    /// and dense MLP blocks. This MoE path keeps correctness local by applying
+    /// the validated decode MoE primitive to each row and materializing a
+    /// `[seq, hidden]` output. A later FU6 optimization can replace this with an
+    /// expert-sorted grouped kernel without changing the model-level contract.
+    pub fn prefill(&mut self, gpu: &mut Gpu, x: &GpuTensor, seq: usize) -> HipResult<GpuTensor> {
+        const F32B: usize = std::mem::size_of::<f32>();
+        let hidden = self.hidden;
+        let out = gpu.zeros(&[seq * hidden], DType::F32)?;
+        for row in 0..seq {
+            let x_row = x.sub_offset(row * hidden, hidden);
+            let y = self.forward(gpu, &x_row)?;
+            gpu.memcpy_dtod_at_auto(&out.buf, row * hidden * F32B, &y.buf, 0, hidden * F32B)?;
+        }
+        Ok(out)
     }
 
     pub fn free(self, gpu: &mut Gpu) {
