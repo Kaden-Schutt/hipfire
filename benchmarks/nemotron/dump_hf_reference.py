@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import glob
 import hashlib
+import inspect
 import json
 import struct
 import sys
@@ -252,6 +253,9 @@ def restore_dt_bias(model, model_dir: Path) -> int:
 def patch_native_mamba2(model) -> int:
     from transformers.models.mamba2.modeling_mamba2 import Mamba2Mixer
 
+    native_params = inspect.signature(Mamba2Mixer.torch_forward).parameters
+    accepts_cache_position = "cache_position" in native_params
+
     def native_torch_forward(
         self,
         input_states,
@@ -259,12 +263,16 @@ def patch_native_mamba2(model) -> int:
         cache_position=None,
         attention_mask=None,
     ):
+        kwargs = {
+            "cache_params": cache_params,
+            "attention_mask": attention_mask,
+        }
+        if accepts_cache_position:
+            kwargs["cache_position"] = cache_position
         return Mamba2Mixer.torch_forward(
             self,
             input_states,
-            cache_params=cache_params,
-            cache_position=cache_position,
-            attention_mask=attention_mask,
+            **kwargs,
         )
 
     patched = 0
