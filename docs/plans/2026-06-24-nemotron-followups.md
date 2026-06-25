@@ -6,13 +6,16 @@ original mq4 artifact flips a close Hipfire-f32/q8 `<|im_end|>` boundary into a
 newline loop; q8 tracks Hipfire f32 but still stops immediately or samples
 incoherently. `/home/sadara/vllm0.22.1` is now a coherent external reference for
 the byte-identical closed-think 2+2 prompt: it generates `2 + 2 equals 4.` with
-first token `2`, while Hipfire/native-HF choose immediate `<|im_end|>`.
-`benchmarks/nemotron/dump_hf_reference.py` remains the repeatable local
-Python/native-Mamba first-token and per-layer reference for Hipfire's current
-boundary, and `benchmarks/nemotron/run_vllm_reference.py` captures the vLLM
-reference. `--format mq4` now protects Nemotron residual writers as Q8, so fresh
-Nano-4B protected-mq4 artifacts follow Hipfire f32/Q8 instead of the original
-newline flip. See
+first token `2`, while Hipfire/native-HF choose immediate `<|im_end|>`. The Lyra
+ROCm stack with real installed `mamba_ssm` kernels now corroborates the
+Transformers/Hipfire boundary, so the remaining FU1 question is vLLM-specific
+rather than a broken local Mamba fallback. `benchmarks/nemotron/dump_hf_reference.py`
+remains the repeatable local Python/native-Mamba first-token and per-layer
+reference for Hipfire's current boundary, with `--mamba-import real` available
+for Lyra fast-kernel checks; `benchmarks/nemotron/run_vllm_reference.py` captures
+the vLLM reference. `--format mq4` now protects Nemotron residual writers as Q8,
+so fresh Nano-4B protected-mq4 artifacts follow Hipfire f32/Q8 instead of the
+original newline flip. See
 `docs/plans/2026-06-24-nemotron-fu5-status.md` for the current evidence and
 `docs/plans/2026-06-24-nemotron-h-mamba2.md` for N0–N5.
 This doc plans the six follow-ups, each self-contained and grounded in the
@@ -50,12 +53,14 @@ Hipfire f32 at the first-token boundary and avoids the newline loop, but greedy
 closed-think generation stops immediately and a sampled reasoning-on prompt is
 still incoherent. The local Python/native-Mamba reference now matches Hipfire f32
 on the closed-think 2+2 prompt (top-5 `[11, 1010, 1058, 1050, 1319]`, logit
-relative delta 0.0221). Fresh protected-mq4 artifacts also match that boundary
-because Nemotron residual writers are promoted to Q8. vLLM 0.22.1 gives the
-coherent production-style boundary for the same prompt ids: first-token top-5
-`[1050, 31035, 1052, 2757, 16489]` and generated text `2 + 2 equals 4.`. Treat
-the remaining FU1 task as "bisect vLLM vs Hipfire/native-HF," not as another
-chat-template tweak.
+relative delta 0.0221). A Lyra real-Mamba Transformers run with
+`--mamba-import real --mamba-reference remote` produces the same first-token
+top-5, so the local Mamba fallback is not the cause. Fresh protected-mq4
+artifacts also match that boundary because Nemotron residual writers are
+promoted to Q8. vLLM 0.22.1 gives the coherent production-style boundary for
+the same prompt ids: first-token top-5 `[1050, 31035, 1052, 2757, 16489]` and
+generated text `2 + 2 equals 4.`. Treat the remaining FU1 task as "bisect vLLM
+vs Transformers/Hipfire," not as another chat-template tweak.
 
 **Problem (root-caused).** The N5 serve test stopped after 8 tokens ("We need to
 answer in one sentence.") — an early/odd halt. Cause is concrete:

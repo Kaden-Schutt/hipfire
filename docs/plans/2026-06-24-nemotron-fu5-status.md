@@ -70,6 +70,21 @@ Validation on gfx1151 still reproduces the FU1 blocker:
   path). With byte-identical prompt ids, vLLM generates `2 + 2 equals 4.` and
   first-token top-5 `[1050, 31035, 1052, 2757, 16489]` (`2`, `Four`, `4`, `It`,
   `Two`).
+- The Lyra ROCm stack (`/home/sadara/.venv`, with local `mamba_ssm` and
+  `causal_conv1d` builds on `PYTHONPATH`) now provides a second local
+  Transformers control. `dump_hf_reference.py --mamba-import real
+  --mamba-reference remote` loads `/home/sadara/Models/NVIDIA-Nemotron-3-Nano-4B-BF16`
+  with the actual installed Mamba kernels and writes
+  `/tmp/nemotron_lyra_real_closed2p2.npz`. It still picks immediate
+  `<|im_end|>` for the closed-think 2+2 prompt, with top-5
+  `[11, 1010, 1058, 1050, 1319]`. That matches the prior native/stubbed
+  Transformers reference and Hipfire f32, not vLLM.
+- While validating Lyra, the local Nemotron remote-code cache path needed a small
+  bug fix: `HybridMambaAttentionDynamicCache` did not store `conv_kernel_size`
+  and used `.device` on Python lists for `conv_states`/`ssm_states`. After
+  patching the local model copy and Transformers dynamic-module cache copies,
+  explicit-cache prefill and one-token decode both produce finite logits. This
+  proves the Lyra full-model prefill/decode path is usable for reference work.
 - Q8 serving therefore avoids the newline loop on the closed-think 2+2 prompt,
   but greedy Hipfire/native-HF generation emits 0 tokens because the first token
   is `<|im_end|>`. A reasoning-on sampled haiku prompt still produced incoherent
@@ -78,11 +93,10 @@ Validation on gfx1151 still reproduces the FU1 blocker:
 So FU1 is no longer "do the chat-template work." The immediate conclusion is
 that unprotected mq4 is too lossy for this uncalibrated Nano-4B artifact at a
 close generation boundary; protected mq4/q8 is numerically faithful to Hipfire
-f32 but still follows the wrong boundary relative to vLLM. The refreshed
-Python/native-Mamba reference proves the Hipfire f32 boundary for the
-closed-think prompt, but vLLM shows that boundary is not the intended production
-generation convention. What remains is a vLLM-vs-Hipfire/native-HF bisect to find
-the first divergence.
+f32. Both stubbed/native and real-Mamba Transformers references follow Hipfire's
+immediate-`<|im_end|>` boundary, while vLLM alone follows the coherent
+production-style boundary. What remains is a vLLM-vs-Transformers/Hipfire bisect
+to find the first generation-convention divergence.
 
 ## Local `~/Models` control check (2026-06-25)
 
@@ -261,6 +275,17 @@ python3 benchmarks/nemotron/dump_hf_reference.py --mode jinja --thinking off \
 NEMO_TOKENS='10,25708,1010,11,1010,10,3263,1010,31106,1294,1925,4958,19286,1058,5675,1395,1032,1050,1043,1050,1063,11,1010,10,1503,19464,1010,12,13' \
   CAP_POS=last cargo run -p hipfire-arch-nemotron --example bisect_nano4b -- /tmp/nemo_hipfire_closed2p2.bin
 python3 benchmarks/nemotron/compare_bisect.py /tmp/nemo_hf_ref_closed2p2.npz /tmp/nemo_hipfire_closed2p2.bin 28
+
+# Lyra real-Mamba Transformers control for the same prompt:
+PYTHONPATH=/home/sadara/Lyra/build/mamba/build/lib.linux-x86_64-cpython-314:/home/sadara/Lyra/build/mamba:/home/sadara/Lyra/build/causal-conv1d/build/lib.linux-x86_64-cpython-314:/home/sadara/Lyra/build/causal-conv1d \
+LD_LIBRARY_PATH=/home/sadara/.venv/lib/python3.14/site-packages/_rocm_sdk_core/lib:/home/sadara/.venv/lib/python3.14/site-packages/torch/lib:$LD_LIBRARY_PATH \
+/home/sadara/.venv/bin/python -u benchmarks/nemotron/dump_hf_reference.py \
+  --model /home/sadara/Models/NVIDIA-Nemotron-3-Nano-4B-BF16 \
+  --mode jinja --thinking off \
+  --text 'Answer in one short sentence: What is 2+2?' \
+  --mamba-import real --mamba-reference remote \
+  --dtype bfloat16 --device cuda \
+  --max-new-tokens 1 --out /tmp/nemotron_lyra_real_closed2p2.npz
 
 # Quantizer policy smoke: protected mq4 should no longer flip EOS to newline.
 hipfire-quantize --input <Nano-4B-BF16-snapshot> --output /tmp/nano4b-mq4-protected.hfq --format mq4 --threads 16

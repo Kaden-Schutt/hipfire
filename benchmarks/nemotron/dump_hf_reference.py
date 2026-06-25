@@ -8,10 +8,12 @@
 # same single-turn Jinja ChatML prompt shape Hipfire serves by default, then saves
 # per-layer hidden states plus logits to an .npz consumed by compare_bisect.py.
 #
-# The default `--mamba-reference native` monkeypatches each Nemotron Mamba mixer
-# to call Transformers' maintained Mamba2Mixer.torch_forward. The checkpoint's
-# custom pure-torch fallback has a group-repeat convention that is useful as a
-# negative control but is not the canonical reference Hipfire should chase.
+# The default `--mamba-import stub --mamba-reference native` disables the
+# checkpoint's CUDA/Triton Mamba imports and monkeypatches each Nemotron Mamba
+# mixer to call Transformers' maintained Mamba2Mixer.torch_forward. Use
+# `--mamba-import real --mamba-reference remote` when a known-good mamba_ssm
+# install is available and the checkpoint's remote-code fast path is the thing
+# being checked.
 #
 #   python3 benchmarks/nemotron/dump_hf_reference.py \
 #       --model /srv/huggingface/models--nvidia--NVIDIA-Nemotron-3-Nano-4B-BF16/snapshots/<snap> \
@@ -113,10 +115,6 @@ def _install_mamba_ssm_stub() -> None:
     )
 
 
-_install_mamba_ssm_stub()
-from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
-
-
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description="Dump a Nemotron-H HF/PyTorch reference for Hipfire comparison."
@@ -150,6 +148,12 @@ def parse_args() -> argparse.Namespace:
         choices=["native", "remote"],
         default="native",
         help="native patches Nemotron Mamba mixers to Transformers Mamba2Mixer.torch_forward.",
+    )
+    ap.add_argument(
+        "--mamba-import",
+        choices=["stub", "real"],
+        default="stub",
+        help="stub disables CUDA/Triton mamba-ssm imports; real uses installed mamba-ssm kernels.",
     )
     ap.add_argument(
         "--dtype",
@@ -349,6 +353,11 @@ def generate_greedy(
 
 def main() -> int:
     args = parse_args()
+    if args.mamba_import == "stub":
+        _install_mamba_ssm_stub()
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
     model_dir = Path(args.model)
     if not (model_dir / "config.json").exists():
         print(f"error: model dir not found: {model_dir}", file=sys.stderr)
@@ -432,6 +441,7 @@ def main() -> int:
         "thinking": args.thinking,
         "assistant_prefix": args.assistant_prefix,
         "mamba_reference": args.mamba_reference,
+        "mamba_import": args.mamba_import,
         "dtype": args.dtype,
         "device": args.device,
         "input_ids": input_ids,
