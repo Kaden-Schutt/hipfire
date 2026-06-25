@@ -82,9 +82,9 @@ fn families() -> &'static [FamilyPlan] {
         FamilyPlan {
             arch: "gemma3",
             anchor: "fp16",
-            candidates: &["q8f16", "hfq4"],
+            candidates: &["q8f16", "hfq4", "op4", "op8"],
             quant_flags: &[],
-            calibrated: &[],
+            calibrated: &["op4+"],
         },
         FamilyPlan {
             arch: "minimax",
@@ -211,7 +211,7 @@ fn run_quantize(
     output: &Path,
     format: &str,
     extra_flags: &[&str],
-    qtip_hessian: Option<&Path>,
+    calib: Option<&Path>,
 ) -> Result<(), String> {
     let mut cmd = Command::new(quant);
     cmd.arg("--input")
@@ -223,8 +223,12 @@ fn run_quantize(
     for f in extra_flags {
         cmd.arg(f);
     }
-    if let Some(h) = qtip_hessian {
-        cmd.env("HIPFIRE_QTIP_HESSIAN", h);
+    if let Some(h) = calib {
+        if matches!(format, "op4+" | "op4-4+" | "op4-8+") {
+            cmd.arg("--awq").arg("--ldlq").arg("--hessian").arg(h);
+        } else {
+            cmd.env("HIPFIRE_QTIP_HESSIAN", h);
+        }
     }
     let out = cmd.output().map_err(|e| format!("spawn quantize: {e}"))?;
     if !out.status.success() || !output.exists() {

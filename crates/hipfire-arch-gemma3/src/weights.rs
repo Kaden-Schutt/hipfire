@@ -18,7 +18,7 @@
 //! `docs/plans/2026-06-19-arch-roster-feature-matrix.md`.
 
 use hip_bridge::HipResult;
-use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::hfq::{load_awq_scale, HfqFile};
 use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::weights::{EmbeddingFormat, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -66,21 +66,21 @@ impl Gemma3Weights {
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.token_embd);
         let _ = gpu.free_tensor(self.output_norm);
-        let _ = gpu.free_tensor(self.output.buf);
+        free_weight_tensor(gpu, self.output);
         for l in self.layers {
             let _ = gpu.free_tensor(l.input_norm);
             let _ = gpu.free_tensor(l.q_norm);
             let _ = gpu.free_tensor(l.k_norm);
-            let _ = gpu.free_tensor(l.wq.buf);
-            let _ = gpu.free_tensor(l.wk.buf);
-            let _ = gpu.free_tensor(l.wv.buf);
-            let _ = gpu.free_tensor(l.wo.buf);
+            free_weight_tensor(gpu, l.wq);
+            free_weight_tensor(gpu, l.wk);
+            free_weight_tensor(gpu, l.wv);
+            free_weight_tensor(gpu, l.wo);
             let _ = gpu.free_tensor(l.post_attn_norm);
             let _ = gpu.free_tensor(l.pre_ffn_norm);
             let _ = gpu.free_tensor(l.post_ffn_norm);
-            let _ = gpu.free_tensor(l.w_gate.buf);
-            let _ = gpu.free_tensor(l.w_up.buf);
-            let _ = gpu.free_tensor(l.w_down.buf);
+            free_weight_tensor(gpu, l.w_gate);
+            free_weight_tensor(gpu, l.w_up);
+            free_weight_tensor(gpu, l.w_down);
         }
     }
 }
@@ -214,10 +214,45 @@ fn load_lm_head(
         .unwrap_or_else(|| panic!("gemma3: tensor not found for lm_head: {name}"));
     let m = cfg.vocab_size;
     let k = cfg.hidden_size;
-    let weight = match info.quant_type {
+    let mut weight = match info.quant_type {
         6 => weight_tensor(gpu.upload_raw(&data, &[data.len()])?, DType::HFQ4G256, m, k),
         7 => weight_tensor(gpu.upload_raw(&data, &[data.len()])?, DType::HFQ4G128, m, k),
         3 => weight_tensor(gpu.upload_raw(&data, &[data.len()])?, DType::Q8_0, m, k),
+        33 => {
+            let combined = oq4_to_oq8_combined(&data, m, k);
+            weight_tensor(
+                gpu.upload_raw(&combined, &[combined.len()])?,
+                DType::Oq8G256,
+                m,
+                k,
+            )
+        }
+        34 => {
+            let combined = oq4_pack_arch_combined(&data, m, k);
+            weight_tensor(
+                gpu.upload_raw(&combined, &[combined.len()])?,
+                DType::Oq4G256,
+                m,
+                k,
+            )
+        }
+        35 => {
+            let combined = oq8_combined(&data, m, k);
+            weight_tensor(
+                gpu.upload_raw(&combined, &[combined.len()])?,
+                DType::Oq8G256,
+                m,
+                k,
+            )
+        }
+        37 => {
+            assert_eq!(
+                data.len(),
+                oq4_arch_combined_len(m, k),
+                "gemma3: OP4 arch-packed lm_head has invalid byte length"
+            );
+            weight_tensor(gpu.upload_raw(&data, &[data.len()])?, DType::Oq4G256, m, k)
+        }
         1 => {
             // Promote F16 → F32 on host (see doc above), unless the tied embed
             // is already a packed format (handled by the arms above).
@@ -237,8 +272,13 @@ fn load_lm_head(
                 .collect();
             weight_tensor(gpu.upload_f32(&f32_data, &[m, k])?, DType::F32, m, k)
         }
-        qt => panic!("gemma3: unsupported lm_head quant_type {qt}; handled 1/3/6/7/16."),
+        qt => {
+            panic!("gemma3: unsupported lm_head quant_type {qt}; handled 1/3/6/7/16/33/34/35/37.")
+        }
     };
+    if weight.gpu_dtype.supports_awq_sidecar() {
+        weight.awq_scale = load_awq_scale(hfq, gpu, &name, k);
+    }
     Ok((weight, cfg.tie_word_embeddings))
 }
 
@@ -414,8 +454,15 @@ fn weight_tensor(buf: GpuTensor, gpu_dtype: DType, m: usize, k: usize) -> Weight
     }
 }
 
+fn free_weight_tensor(gpu: &mut Gpu, wt: WeightTensor) {
+    let _ = gpu.free_tensor(wt.buf);
+    if let Some(awq) = wt.awq_scale {
+        let _ = gpu.free_tensor(awq);
+    }
+}
+
 /// Load a linear weight to a `WeightTensor`. Bring-up format set
-/// (F16 / Q8F16 / HFQ4G256 / HFQ4G128); extend for MQ4/MQ6.
+/// (F16 / Q8F16 / HFQ4G256 / HFQ4G128 / OP4 / OP8).
 fn load_weight_tensor(
     hfq: &HfqFile,
     gpu: &Gpu,
@@ -426,11 +473,46 @@ fn load_weight_tensor(
     let (info, data) = hfq
         .tensor_data_vec(name)
         .unwrap_or_else(|| panic!("gemma3: tensor not found: {name}"));
-    let wt = match info.quant_type {
+    let mut wt = match info.quant_type {
         6 => weight_tensor(gpu.upload_raw(&data, &[data.len()])?, DType::HFQ4G256, m, k),
         7 => weight_tensor(gpu.upload_raw(&data, &[data.len()])?, DType::HFQ4G128, m, k),
         3 => weight_tensor(gpu.upload_raw(&data, &[data.len()])?, DType::Q8_0, m, k),
         1 => weight_tensor(gpu.upload_raw(&data, &[data.len()])?, DType::F16, m, k),
+        33 => {
+            let combined = oq4_to_oq8_combined(&data, m, k);
+            weight_tensor(
+                gpu.upload_raw(&combined, &[combined.len()])?,
+                DType::Oq8G256,
+                m,
+                k,
+            )
+        }
+        34 => {
+            let combined = oq4_pack_arch_combined(&data, m, k);
+            weight_tensor(
+                gpu.upload_raw(&combined, &[combined.len()])?,
+                DType::Oq4G256,
+                m,
+                k,
+            )
+        }
+        35 => {
+            let combined = oq8_combined(&data, m, k);
+            weight_tensor(
+                gpu.upload_raw(&combined, &[combined.len()])?,
+                DType::Oq8G256,
+                m,
+                k,
+            )
+        }
+        37 => {
+            assert_eq!(
+                data.len(),
+                oq4_arch_combined_len(m, k),
+                "gemma3: OP4 arch-packed tensor {name} has invalid byte length"
+            );
+            weight_tensor(gpu.upload_raw(&data, &[data.len()])?, DType::Oq4G256, m, k)
+        }
         // bf16 stays bf16 on GPU (the gemm/gemv families dispatch a bf16 path,
         // same as the gemma3-vl bf16 vision tower) — no F32 promotion needed. The
         // *buffer's* dtype must be BF16, not just the WeightTensor's gpu_dtype:
@@ -443,8 +525,116 @@ fn load_weight_tensor(
         }
         qt => panic!(
             "gemma3: unsupported linear quant_type {qt} for {name}; \
-             handled 1 (F16), 3 (Q8F16), 6 (HFQ4G256), 7 (HFQ4G128), 16 (BF16). Extend for MQ4/MQ6."
+             handled 1 (F16), 3 (Q8F16), 6 (HFQ4G256), 7 (HFQ4G128), \
+             16 (BF16), 33/34/35/37 (OP4/OP8). Extend for MQ4/MQ6."
         ),
     };
+    if wt.gpu_dtype.supports_awq_sidecar() {
+        wt.awq_scale = load_awq_scale(hfq, gpu, name, k);
+    }
     Ok(wt)
+}
+
+fn sext4(nib: u8) -> i8 {
+    let v = (nib & 0xf) as i8;
+    if v > 7 {
+        v - 16
+    } else {
+        v
+    }
+}
+
+fn oq4_arch_combined_len(m: usize, k: usize) -> usize {
+    let ng = k / 256;
+    m * (k / 2) + m * ng * 4 + m * ng * (4 + 128)
+}
+
+fn oq4_pack_arch_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
+    const GROUP: usize = 256;
+    const BLOCK: usize = 130;
+    const ILB: usize = 132;
+    assert_eq!(k % GROUP, 0, "OP4 requires K % 256 == 0 (got K={k})");
+    let ng = k / GROUP;
+    let packed_bytes = m * (k / 2);
+    let scales_bytes = m * ng * 4;
+    let expect = m * ng * BLOCK;
+    assert_eq!(
+        data.len(),
+        expect,
+        "OP4 weight byte length {} != M*ng*130 = {expect} (M={m} K={k})",
+        data.len()
+    );
+    let mut out = vec![0u8; packed_bytes + scales_bytes + m * ng * ILB];
+    let scales_base = packed_bytes;
+    let il_base = packed_bytes + scales_bytes;
+    for r in 0..m {
+        for g in 0..ng {
+            let src = (r * ng + g) * BLOCK;
+            let nib_dst = r * (k / 2) + g * (GROUP / 2);
+            out[nib_dst..nib_dst + 128].copy_from_slice(&data[src + 2..src + BLOCK]);
+            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+            let scale_dst = scales_base + (r * ng + g) * 4;
+            out[scale_dst..scale_dst + 4].copy_from_slice(&scale.to_le_bytes());
+            let il_dst = il_base + (r * ng + g) * ILB;
+            out[il_dst..il_dst + 4].copy_from_slice(&scale.to_le_bytes());
+            out[il_dst + 4..il_dst + ILB].copy_from_slice(&data[src + 2..src + BLOCK]);
+        }
+    }
+    out
+}
+
+fn oq4_to_oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
+    const GROUP: usize = 256;
+    const BLOCK: usize = 130;
+    assert_eq!(k % GROUP, 0, "OP4-8 requires K % 256 == 0 (got K={k})");
+    let ng = k / GROUP;
+    let expect = m * ng * BLOCK;
+    assert_eq!(
+        data.len(),
+        expect,
+        "OP4-8 weight byte length {} != M*ng*130 = {expect} (M={m} K={k})",
+        data.len()
+    );
+    let mut combined = vec![0u8; m * k + m * ng * 4];
+    for r in 0..m {
+        for g in 0..ng {
+            let src = (r * ng + g) * BLOCK;
+            let dst = r * k + g * GROUP;
+            for i in 0..128 {
+                let byte = data[src + 2 + i];
+                combined[dst + 2 * i] = sext4(byte & 0xf) as u8;
+                combined[dst + 2 * i + 1] = sext4(byte >> 4) as u8;
+            }
+            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+            let so = m * k + (r * ng + g) * 4;
+            combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
+        }
+    }
+    combined
+}
+
+fn oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
+    const GROUP: usize = 256;
+    const BLOCK: usize = 258;
+    assert_eq!(k % GROUP, 0, "OP8 requires K % 256 == 0 (got K={k})");
+    let ng = k / GROUP;
+    let expect = m * ng * BLOCK;
+    assert_eq!(
+        data.len(),
+        expect,
+        "OP8 weight byte length {} != M*ng*258 = {expect} (M={m} K={k})",
+        data.len()
+    );
+    let mut combined = vec![0u8; m * k + m * ng * 4];
+    for r in 0..m {
+        for g in 0..ng {
+            let src = (r * ng + g) * BLOCK;
+            let dst = r * k + g * GROUP;
+            combined[dst..dst + GROUP].copy_from_slice(&data[src + 2..src + BLOCK]);
+            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+            let so = m * k + (r * ng + g) * 4;
+            combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
+        }
+    }
+    combined
 }

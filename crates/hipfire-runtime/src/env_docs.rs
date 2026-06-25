@@ -213,35 +213,35 @@ pub const ENV_HIPFIRE_ALLOW_MIXED_ARCH: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_ALLOW_MQ2: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ALLOW_MQ2",
     description: "Enabled when set to 1",
-    source: "crates/hipfire-quantize/src/main.rs:5573",
+    source: "crates/hipfire-quantize/src/main.rs:5621",
 };
 
 /// `HIPFIRE_ALLOW_MQ2_LLOYD` — Enabled when set to 1
 pub const ENV_HIPFIRE_ALLOW_MQ2_LLOYD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ALLOW_MQ2_LLOYD",
     description: "Enabled when set to 1",
-    source: "crates/hipfire-quantize/src/main.rs:5608",
+    source: "crates/hipfire-quantize/src/main.rs:5656",
 };
 
 /// `HIPFIRE_ALLOW_MQ3_LLOYD` — Enabled when set to 1
 pub const ENV_HIPFIRE_ALLOW_MQ3_LLOYD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ALLOW_MQ3_LLOYD",
     description: "Enabled when set to 1",
-    source: "crates/hipfire-quantize/src/main.rs:5593",
+    source: "crates/hipfire-quantize/src/main.rs:5641",
 };
 
 /// `HIPFIRE_ALLOW_MQ4_LLOYD` — Enabled when set to 1
 pub const ENV_HIPFIRE_ALLOW_MQ4_LLOYD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ALLOW_MQ4_LLOYD",
     description: "Enabled when set to 1",
-    source: "crates/hipfire-quantize/src/main.rs:5643",
+    source: "crates/hipfire-quantize/src/main.rs:5691",
 };
 
 /// `HIPFIRE_ALLOW_UNIT_IMATRIX` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_ALLOW_UNIT_IMATRIX: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ALLOW_UNIT_IMATRIX",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-quantize/src/main.rs:5237",
+    source: "crates/hipfire-quantize/src/main.rs:5260",
 };
 
 /// `HIPFIRE_ATTN_FLASH` — Honors HIPFIRE_ATTN_FLASH=never|0|off as an explicit override
@@ -255,7 +255,7 @@ pub const ENV_HIPFIRE_ATTN_FLASH: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_AWQ_F1_ONLY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_AWQ_F1_ONLY",
     description: "F1-vs-F2 A/B gate. When \"HIPFIRE_AWQ_F1_ONLY=1\" is set, the F2",
-    source: "crates/hipfire-quantize/src/main.rs:4034",
+    source: "crates/hipfire-quantize/src/main.rs:4057",
 };
 
 /// `HIPFIRE_BASELINE_ARCH` — Runtime variable controlling baseline arch in hipfire
@@ -1383,7 +1383,14 @@ pub const ENV_HIPFIRE_GEMMA3_CALIB_LAYERS_PER_PASS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_GEMMA3_NO_BATCHED_PREFILL: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GEMMA3_NO_BATCHED_PREFILL",
     description: "Runtime variable controlling gemma3 no batched prefill in hipfire",
-    source: "crates/hipfire-arch-gemma3-vl/src/arch.rs:121",
+    source: "crates/hipfire-arch-gemma3/src/arch.rs:100",
+};
+
+/// `HIPFIRE_GEMMA3_PREFILL_MICROBATCH` — Runtime variable controlling gemma3 prefill microbatch in hipfire
+pub const ENV_HIPFIRE_GEMMA3_PREFILL_MICROBATCH: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_GEMMA3_PREFILL_MICROBATCH",
+    description: "Runtime variable controlling gemma3 prefill microbatch in hipfire",
+    source: "crates/hipfire-arch-gemma3/src/arch.rs:106",
 };
 
 /// `HIPFIRE_GEMMA3_VISION_NOWMMA` — Runtime variable controlling gemma3 vision nowmma in hipfire
@@ -1446,7 +1453,7 @@ pub const ENV_HIPFIRE_GFX942_RMSNORM_SPLIT: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_GPTQ_DAMPING: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GPTQ_DAMPING",
     description: "Inject env override since the quantizer reads it at fn entry",
-    source: "crates/hipfire-quantize/src/main.rs:9868",
+    source: "crates/hipfire-quantize/src/main.rs:9916",
 };
 
 /// `HIPFIRE_GPU_SLAB_LOAD` — Runtime variable controlling gpu slab load in hipfire
@@ -1819,7 +1826,7 @@ pub const ENV_HIPFIRE_LFM2_CAPTURE_POSTMIXER: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_LFM2_EXPERT_MQ6: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LFM2_EXPERT_MQ6",
     description: "opt-in via HIPFIRE_LFM2_EXPERT_MQ6 for higher quality), else mq4",
-    source: "crates/hipfire-quantize/src/main.rs:6654",
+    source: "crates/hipfire-quantize/src/main.rs:6702",
 };
 
 /// `HIPFIRE_LFM2_GRAPH` — Interprets "HIPFIRE_LFM2_GRAPH" from environment to select behavior
@@ -1833,14 +1840,14 @@ pub const ENV_HIPFIRE_LFM2_GRAPH: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_LFM2_PROJ_MQ4: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LFM2_PROJ_MQ4",
     description: "Runtime variable controlling lfm2 proj mQ4 in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:6735",
+    source: "crates/hipfire-quantize/src/main.rs:6783",
 };
 
 /// `HIPFIRE_LFM2_PROJ_MQ6` — MQ6 variant (HIPFIRE_LFM2_PROJ_MQ6=1) is the lower-quality-loss
 pub const ENV_HIPFIRE_LFM2_PROJ_MQ6: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LFM2_PROJ_MQ6",
     description: "MQ6 variant (HIPFIRE_LFM2_PROJ_MQ6=1) is the lower-quality-loss",
-    source: "crates/hipfire-quantize/src/main.rs:6734",
+    source: "crates/hipfire-quantize/src/main.rs:6782",
 };
 
 /// `HIPFIRE_LLOYD_FORCE_BASELINE` — Runtime variable controlling lloyd force baseline in hipfire
@@ -1862,7 +1869,7 @@ pub const ENV_HIPFIRE_LLOYD_GFX12: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_LLOYD_K3: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LLOYD_K3",
     description: "Fallback to HFQ2-G128 for non-256-aligned (no rotation)",
-    source: "crates/hipfire-quantize/src/main.rs:8038",
+    source: "crates/hipfire-quantize/src/main.rs:8086",
 };
 
 /// `HIPFIRE_LLOYD_MB4` — Force MB4=0 to skip the size-gated routing
@@ -1954,7 +1961,7 @@ pub const ENV_HIPFIRE_MINIMAX_CAPTURE_POSTATTN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_MINIMAX_DOWN_FORMAT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MINIMAX_DOWN_FORMAT",
     description: "Runtime variable controlling minimax down format in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:6973",
+    source: "crates/hipfire-quantize/src/main.rs:7021",
 };
 
 /// `HIPFIRE_MINIMAX_ENABLE_DOWN_AWQ` — down-AWQ harmful (shared s_down bad approx); opt-in
@@ -1968,21 +1975,21 @@ pub const ENV_HIPFIRE_MINIMAX_ENABLE_DOWN_AWQ: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_MINIMAX_EXPERT_MQ2L: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MINIMAX_EXPERT_MQ2L",
     description: "dispatches expert dtype per-layer (experts[0].gpu_dtype), so the model",
-    source: "crates/hipfire-quantize/src/main.rs:6952",
+    source: "crates/hipfire-quantize/src/main.rs:7000",
 };
 
 /// `HIPFIRE_MINIMAX_EXPERT_MQ3L` — dispatches expert dtype per-layer (experts[0].gpu_dtype), so the model
 pub const ENV_HIPFIRE_MINIMAX_EXPERT_MQ3L: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MINIMAX_EXPERT_MQ3L",
     description: "dispatches expert dtype per-layer (experts[0].gpu_dtype), so the model",
-    source: "crates/hipfire-quantize/src/main.rs:6954",
+    source: "crates/hipfire-quantize/src/main.rs:7002",
 };
 
 /// `HIPFIRE_MINIMAX_EXPERT_MQ6` — _MQ6 hold comma-separated layer ranges ("12-45,50") whose experts are
 pub const ENV_HIPFIRE_MINIMAX_EXPERT_MQ6: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MINIMAX_EXPERT_MQ6",
     description: "_MQ6 hold comma-separated layer ranges (\"12-45,50\") whose experts are",
-    source: "crates/hipfire-quantize/src/main.rs:6950",
+    source: "crates/hipfire-quantize/src/main.rs:6998",
 };
 
 /// `HIPFIRE_MMQ` — Selects behavior from recognized values
@@ -2333,6 +2340,13 @@ pub const ENV_HIPFIRE_OQ4_BATCHED_PREFILL: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_OQ4_BATCHED_PREFILL",
     description: "Environment toggle value controls runtime behavior",
     source: "crates/hipfire-arch-qwen35/src/qwen35.rs:14389",
+};
+
+/// `HIPFIRE_OQ4_PREFILL_ACT_BITS` — Selects behavior from recognized values
+pub const ENV_HIPFIRE_OQ4_PREFILL_ACT_BITS: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_OQ4_PREFILL_ACT_BITS",
+    description: "Selects behavior from recognized values",
+    source: "crates/hipfire-runtime/src/weights.rs:1371",
 };
 
 /// `HIPFIRE_OQ4_TRACE` — Runtime variable controlling oQ4 trace in hipfire
@@ -2836,7 +2850,7 @@ pub const ENV_HIPFIRE_QTIP_EVAL_ST: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QTIP_HESSIAN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QTIP_HESSIAN",
     description: "Runtime variable controlling qtip hessian in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:5046",
+    source: "crates/hipfire-quantize/src/main.rs:5069",
 };
 
 /// `HIPFIRE_QUANTIZE_BIN` — Runtime variable controlling quantize bin in hipfire
@@ -2850,14 +2864,14 @@ pub const ENV_HIPFIRE_QUANTIZE_BIN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QUANT_DIAG_PATH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QUANT_DIAG_PATH",
     description: "Runtime variable controlling quant diag path in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:11593",
+    source: "crates/hipfire-quantize/src/main.rs:11641",
 };
 
 /// `HIPFIRE_QUANT_THREADS` — Runtime variable controlling quant threads in hipfire
 pub const ENV_HIPFIRE_QUANT_THREADS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QUANT_THREADS",
     description: "Runtime variable controlling quant threads in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:4836",
+    source: "crates/hipfire-quantize/src/main.rs:4859",
 };
 
 /// `HIPFIRE_QWEN35_DECODE_BATCH` — Defaults to auto when unset
@@ -3093,154 +3107,154 @@ pub const ENV_HIPFIRE_ROPE_INTERLEAVED_LEGACY: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_RQ2_BULK_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ2_BULK_BITS",
     description: "Runtime variable controlling rq2 bulk bits in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:8723",
+    source: "crates/hipfire-quantize/src/main.rs:8771",
 };
 
 /// `HIPFIRE_RQ2_DAMP` — De-risk B: single shared, foldable residual-stream rotation. With
 pub const ENV_HIPFIRE_RQ2_DAMP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ2_DAMP",
     description: "De-risk B: single shared, foldable residual-stream rotation. With",
-    source: "crates/hipfire-quantize/src/main.rs:8727",
+    source: "crates/hipfire-quantize/src/main.rs:8775",
 };
 
 /// `HIPFIRE_RQ2_PROTECT_FRAC` — Runtime variable controlling rq2 protect frac in hipfire
 pub const ENV_HIPFIRE_RQ2_PROTECT_FRAC: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ2_PROTECT_FRAC",
     description: "Runtime variable controlling rq2 protect frac in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:8719",
+    source: "crates/hipfire-quantize/src/main.rs:8767",
 };
 
 /// `HIPFIRE_RQ2_Q8_EMBED` — Q8 (~20% of params on a tied-embedding 0.8B). With HIPFIRE_RQ2_Q8_EMBED=1,
 pub const ENV_HIPFIRE_RQ2_Q8_EMBED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ2_Q8_EMBED",
     description: "Q8 (~20% of params on a tied-embedding 0.8B). With HIPFIRE_RQ2_Q8_EMBED=1,",
-    source: "crates/hipfire-quantize/src/main.rs:8845",
+    source: "crates/hipfire-quantize/src/main.rs:8893",
 };
 
 /// `HIPFIRE_RQ2_SHARE_RESID` — HIPFIRE_RQ2_SHARE_RESID=1, every k==1024 weight (the d_model residual
 pub const ENV_HIPFIRE_RQ2_SHARE_RESID: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ2_SHARE_RESID",
     description: "HIPFIRE_RQ2_SHARE_RESID=1, every k==1024 weight (the d_model residual",
-    source: "crates/hipfire-quantize/src/main.rs:8741",
+    source: "crates/hipfire-quantize/src/main.rs:8789",
 };
 
 /// `HIPFIRE_RQ3_BULK_BITS` — Runtime variable controlling rq3 bulk bits in hipfire
 pub const ENV_HIPFIRE_RQ3_BULK_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ3_BULK_BITS",
     description: "Runtime variable controlling rq3 bulk bits in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:8882",
+    source: "crates/hipfire-quantize/src/main.rs:8930",
 };
 
 /// `HIPFIRE_RQ3_PROTECT_FRAC` — Runtime variable controlling rq3 protect frac in hipfire
 pub const ENV_HIPFIRE_RQ3_PROTECT_FRAC: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ3_PROTECT_FRAC",
     description: "Runtime variable controlling rq3 protect frac in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:8878",
+    source: "crates/hipfire-quantize/src/main.rs:8926",
 };
 
 /// `HIPFIRE_RQ3_Q8_EMBED` — Iso-bit embed for an honest mq4 comparison (same as roughquant2 de-risk A)
 pub const ENV_HIPFIRE_RQ3_Q8_EMBED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ3_Q8_EMBED",
     description: "Iso-bit embed for an honest mq4 comparison (same as roughquant2 de-risk A)",
-    source: "crates/hipfire-quantize/src/main.rs:8944",
+    source: "crates/hipfire-quantize/src/main.rs:8992",
 };
 
 /// `HIPFIRE_RQ4_BULK` — Bulk codec: "mq4" → real mq4 format (fair mq4+protect-vs-mq4 test, set
 pub const ENV_HIPFIRE_RQ4_BULK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_BULK",
     description: "Bulk codec: \"mq4\" → real mq4 format (fair mq4+protect-vs-mq4 test, set",
-    source: "crates/hipfire-quantize/src/main.rs:8985",
+    source: "crates/hipfire-quantize/src/main.rs:9033",
 };
 
 /// `HIPFIRE_RQ4_BULK_BITS` — Bulk codec: "mq4" → real mq4 format (fair mq4+protect-vs-mq4 test, set
 pub const ENV_HIPFIRE_RQ4_BULK_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_BULK_BITS",
     description: "Bulk codec: \"mq4\" → real mq4 format (fair mq4+protect-vs-mq4 test, set",
-    source: "crates/hipfire-quantize/src/main.rs:8979",
+    source: "crates/hipfire-quantize/src/main.rs:9027",
 };
 
 /// `HIPFIRE_RQ4_DUMP_RANK` — HIPFIRE_RQ4_DUMP_RANK=1: print the residual-channel saliency ranking
 pub const ENV_HIPFIRE_RQ4_DUMP_RANK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_DUMP_RANK",
     description: "HIPFIRE_RQ4_DUMP_RANK=1: print the residual-channel saliency ranking",
-    source: "crates/hipfire-quantize/src/main.rs:9091",
+    source: "crates/hipfire-quantize/src/main.rs:9139",
 };
 
 /// `HIPFIRE_RQ4_INVERT` — HIPFIRE_RQ4_INVERT=1: protect the LOWEST-saliency channels instead of the
 pub const ENV_HIPFIRE_RQ4_INVERT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_INVERT",
     description: "HIPFIRE_RQ4_INVERT=1: protect the LOWEST-saliency channels instead of the",
-    source: "crates/hipfire-quantize/src/main.rs:9109",
+    source: "crates/hipfire-quantize/src/main.rs:9157",
 };
 
 /// `HIPFIRE_RQ4_MQ_BITS` — Uniform bulk bit-width for the mq bulk (4=mq4, 5, 6=mq6). protect_frac=0
 pub const ENV_HIPFIRE_RQ4_MQ_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_MQ_BITS",
     description: "Uniform bulk bit-width for the mq bulk (4=mq4, 5, 6=mq6). protect_frac=0",
-    source: "crates/hipfire-quantize/src/main.rs:8995",
+    source: "crates/hipfire-quantize/src/main.rs:9043",
 };
 
 /// `HIPFIRE_RQ4_OBS_DAMP` — Uniform bulk bit-width for the mq bulk (4=mq4, 5, 6=mq6). protect_frac=0
 pub const ENV_HIPFIRE_RQ4_OBS_DAMP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_OBS_DAMP",
     description: "Uniform bulk bit-width for the mq bulk (4=mq4, 5, 6=mq6). protect_frac=0",
-    source: "crates/hipfire-quantize/src/main.rs:8989",
+    source: "crates/hipfire-quantize/src/main.rs:9037",
 };
 
 /// `HIPFIRE_RQ4_PROTECT_FRAC` — diag(H) residual-channel energy from true residual readers
 pub const ENV_HIPFIRE_RQ4_PROTECT_FRAC: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_PROTECT_FRAC",
     description: "diag(H) residual-channel energy from true residual readers",
-    source: "crates/hipfire-quantize/src/main.rs:9565",
+    source: "crates/hipfire-quantize/src/main.rs:9613",
 };
 
 /// `HIPFIRE_RQ4_PROTECT_Q8` — on diag(H) alone). diag = E[x²] (activation energy); wnorm = ‖W[:,c]‖²
 pub const ENV_HIPFIRE_RQ4_PROTECT_Q8: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_PROTECT_Q8",
     description: "on diag(H) alone). diag = E[x²] (activation energy); wnorm = ‖W[:,c]‖²",
-    source: "crates/hipfire-quantize/src/main.rs:9000",
+    source: "crates/hipfire-quantize/src/main.rs:9048",
 };
 
 /// `HIPFIRE_RQ4_Q8_EMBED` — Enabled when set to 1
 pub const ENV_HIPFIRE_RQ4_Q8_EMBED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_Q8_EMBED",
     description: "Enabled when set to 1",
-    source: "crates/hipfire-quantize/src/main.rs:9351",
+    source: "crates/hipfire-quantize/src/main.rs:9399",
 };
 
 /// `HIPFIRE_RQ4_RANDOM_SEED` — Runtime variable controlling rQ4 random seed in hipfire
 pub const ENV_HIPFIRE_RQ4_RANDOM_SEED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_RANDOM_SEED",
     description: "Runtime variable controlling rQ4 random seed in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:9214",
+    source: "crates/hipfire-quantize/src/main.rs:9262",
 };
 
 /// `HIPFIRE_RQ4_SALIENCY` — (weight energy); product = ‖W[:,c]‖²·E[x²] (output-error contribution)
 pub const ENV_HIPFIRE_RQ4_SALIENCY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_SALIENCY",
     description: "(weight energy); product = ‖W[:,c]‖²·E[x²] (output-error contribution)",
-    source: "crates/hipfire-quantize/src/main.rs:9004",
+    source: "crates/hipfire-quantize/src/main.rs:9052",
 };
 
 /// `HIPFIRE_RQ4_VOID_ONLY` — Runtime variable controlling rQ4 void only in hipfire
 pub const ENV_HIPFIRE_RQ4_VOID_ONLY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_VOID_ONLY",
     description: "Runtime variable controlling rQ4 void only in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:9133",
+    source: "crates/hipfire-quantize/src/main.rs:9181",
 };
 
 /// `HIPFIRE_RQ_BULK_BITS` — Runtime variable controlling rq bulk bits in hipfire
 pub const ENV_HIPFIRE_RQ_BULK_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ_BULK_BITS",
     description: "Runtime variable controlling rq bulk bits in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:8652",
+    source: "crates/hipfire-quantize/src/main.rs:8700",
 };
 
 /// `HIPFIRE_RQ_GROUP` — Runtime variable controlling rq group in hipfire
 pub const ENV_HIPFIRE_RQ_GROUP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ_GROUP",
     description: "Runtime variable controlling rq group in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:8656",
+    source: "crates/hipfire-quantize/src/main.rs:8704",
 };
 
 /// `HIPFIRE_RQ_HAND` — Environment toggle value controls runtime behavior
@@ -3254,7 +3268,7 @@ pub const ENV_HIPFIRE_RQ_HAND: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_RQ_PROTECT_FRAC: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ_PROTECT_FRAC",
     description: "Runtime variable controlling rq protect frac in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:8648",
+    source: "crates/hipfire-quantize/src/main.rs:8696",
 };
 
 /// `HIPFIRE_RUN_EXAMPLE_BIN` — Runtime variable controlling run example bin in hipfire
@@ -3345,21 +3359,21 @@ pub const ENV_HIPFIRE_TARGET_ARCH: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_TIER_RATIO: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TIER_RATIO",
     description: "Runtime variable controlling tier ratio in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:5280",
+    source: "crates/hipfire-quantize/src/main.rs:5303",
 };
 
 /// `HIPFIRE_TINYQUANT_FAMILIES` — Optional comma-separated family allowlist ("HIPFIRE_TINYQUANT_FAMILIES")
 pub const ENV_HIPFIRE_TINYQUANT_FAMILIES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TINYQUANT_FAMILIES",
     description: "Optional comma-separated family allowlist (\"HIPFIRE_TINYQUANT_FAMILIES\")",
-    source: "crates/hipfire-eval/src/executor_tinyquant.rs:366",
+    source: "crates/hipfire-eval/src/executor_tinyquant.rs:370",
 };
 
 /// `HIPFIRE_TINYQUANT_RECORD` — Optional comma-separated family allowlist ("HIPFIRE_TINYQUANT_FAMILIES")
 pub const ENV_HIPFIRE_TINYQUANT_RECORD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TINYQUANT_RECORD",
     description: "Optional comma-separated family allowlist (\"HIPFIRE_TINYQUANT_FAMILIES\")",
-    source: "crates/hipfire-eval/src/executor_tinyquant.rs:360",
+    source: "crates/hipfire-eval/src/executor_tinyquant.rs:364",
 };
 
 /// `HIPFIRE_TINY_QUANT_PROBE_BIN` — Runtime variable controlling tiny quant probe bin in hipfire
@@ -3506,7 +3520,7 @@ pub const ENV_HIPFIRE_XDNA1_LIB: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIP_PATH: EnvVarDoc = EnvVarDoc {
     name: "HIP_PATH",
     description: "fails with \"file not found\". Add well-known candidates as -I flags;",
-    source: "crates/rdna-compute/src/compiler.rs:470",
+    source: "crates/rdna-compute/src/compiler.rs:481",
 };
 
 /// `HIP_VISIBLE_DEVICES` — Used to configure runtime execution by explicitly setting "HIP_VISIBLE_DEVICES"
@@ -3601,11 +3615,18 @@ pub const ENV_QWEN35_TEST_MODEL: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-runtime/examples/test_qwen35_loadQA.rs:22",
 };
 
+/// `ROCM_DEVICE_LIB_PATH` — Runtime variable controlling rocm device lib path in hipfire
+pub const ENV_ROCM_DEVICE_LIB_PATH: EnvVarDoc = EnvVarDoc {
+    name: "ROCM_DEVICE_LIB_PATH",
+    description: "Runtime variable controlling rocm device lib path in hipfire",
+    source: "crates/rdna-compute/src/compiler.rs:469",
+};
+
 /// `ROCM_PATH` — Runtime variable controlling rocm path in hipfire
 pub const ENV_ROCM_PATH: EnvVarDoc = EnvVarDoc {
     name: "ROCM_PATH",
     description: "Runtime variable controlling rocm path in hipfire",
-    source: "crates/rdna-compute/src/compiler.rs:133",
+    source: "crates/rdna-compute/src/compiler.rs:466",
 };
 
 /// `ROCR_VISIBLE_DEVICES` — Runtime variable controlling rocr visible devices in hipfire
@@ -3840,6 +3861,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_GDN_Q8_REG_GFX1151,
     ENV_HIPFIRE_GEMMA3_CALIB_LAYERS_PER_PASS,
     ENV_HIPFIRE_GEMMA3_NO_BATCHED_PREFILL,
+    ENV_HIPFIRE_GEMMA3_PREFILL_MICROBATCH,
     ENV_HIPFIRE_GEMMA3_VISION_NOWMMA,
     ENV_HIPFIRE_GEMM_DUMP,
     ENV_HIPFIRE_GEMV_ROWS,
@@ -3975,6 +3997,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_NPU_SOFTMAX_CONFIGS,
     ENV_HIPFIRE_NPU_TARGETS,
     ENV_HIPFIRE_OQ4_BATCHED_PREFILL,
+    ENV_HIPFIRE_OQ4_PREFILL_ACT_BITS,
     ENV_HIPFIRE_OQ4_TRACE,
     ENV_HIPFIRE_PAGED_MOE_DEBUG,
     ENV_HIPFIRE_PARO_BATCHED,
@@ -4154,6 +4177,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_PATH,
     ENV_PROMPT_MODE,
     ENV_QWEN35_TEST_MODEL,
+    ENV_ROCM_DEVICE_LIB_PATH,
     ENV_ROCM_PATH,
     ENV_ROCR_VISIBLE_DEVICES,
     ENV_TINYLLAMA_GGUF,

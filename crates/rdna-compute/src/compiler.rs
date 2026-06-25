@@ -463,15 +463,31 @@ impl KernelCompiler {
             format!("--offload-arch={arch}"),
             "-O3".into(),
         ];
+        let rocm_path = std::env::var("ROCM_PATH").ok();
+        if let Some(rocm_path) = rocm_path.as_deref() {
+            args.push(format!("--rocm-path={rocm_path}"));
+            let device_lib_path = std::env::var("ROCM_DEVICE_LIB_PATH").ok().or_else(|| {
+                let candidate = Path::new(rocm_path).join("lib/llvm/amdgcn/bitcode");
+                candidate.exists().then(|| candidate.display().to_string())
+            });
+            if let Some(device_lib_path) = device_lib_path {
+                args.push(format!("--rocm-device-lib-path={device_lib_path}"));
+            }
+        }
         // Some hipcc installs (notably V620's CachyOS build of ROCm 7.2) do not
         // auto-inject the HIP include path, so `#include <hip/hip_runtime.h>`
         // fails with "file not found". Add well-known candidates as -I flags;
         // existence-checked so wrong paths on other distros don't leak in.
-        let hip_path = std::env::var("HIP_PATH").unwrap_or_else(|_| "/opt/rocm".to_string());
-        for candidate in [
-            format!("{hip_path}/include"),
-            "/opt/rocm/include".to_string(),
-        ] {
+        let hip_path = std::env::var("HIP_PATH")
+            .ok()
+            .or_else(|| rocm_path.clone())
+            .unwrap_or_else(|| "/opt/rocm".to_string());
+        let mut include_candidates = vec![format!("{hip_path}/include")];
+        if let Some(rocm_path) = rocm_path {
+            include_candidates.push(format!("{rocm_path}/include"));
+        }
+        include_candidates.push("/opt/rocm/include".to_string());
+        for candidate in include_candidates {
             if Path::new(&candidate).join("hip/hip_runtime.h").exists() {
                 // Windows hipcc (hipcc.bat) re-tokenises its argv on the inner
                 // clang.exe command line WITHOUT preserving quoting around

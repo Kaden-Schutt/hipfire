@@ -1361,6 +1361,44 @@ pub fn weight_gemm(
         DType::BF16 => gpu.gemm_bf16_x_bf16_wmma(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G128 => gpu.gemm_hfq4g128(&w.buf, x, y, w.m, w.k, batch_size),
+        DType::Oq4G256 => {
+            const GROUP: usize = 256;
+            assert_eq!(w.k % GROUP, 0, "Oq4G256 weight_gemm: K must be % 256");
+            gpu.ensure_mq_signs()?;
+            let x_rot = gpu.alloc_tensor(&[batch_size * w.k], DType::F32)?;
+            let result = (|| {
+                rotate_x_mq_batched_for(gpu, w, x, &x_rot, w.k, batch_size)?;
+                match std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS").as_deref() {
+                    Ok("8") => {
+                        gpu.gemm_oq4_residual_mmq(&w.buf, &x_rot, y, w.m, w.k, batch_size, false)
+                    }
+                    Ok("16") => gpu
+                        .gemm_oq4_grouped_f16_wmma(&w.buf, &x_rot, y, w.m, w.k, batch_size, GROUP),
+                    _ => gpu.gemm_oq4_grouped_act_batched(&w.buf, &x_rot, y, w.m, w.k, batch_size),
+                }
+            })();
+            gpu.free_tensor(x_rot)?;
+            result
+        }
+        DType::Oq8G256 => {
+            const GROUP: usize = 256;
+            assert_eq!(w.k % GROUP, 0, "Oq8G256 weight_gemm: K must be % 256");
+            let ng = w.k / GROUP;
+            gpu.ensure_mq_signs()?;
+            let x_rot = gpu.alloc_tensor(&[batch_size * w.k], DType::F32)?;
+            let xq = gpu.alloc_tensor(&[batch_size * w.k], DType::Raw)?;
+            let xs = gpu.alloc_tensor(&[batch_size * ng], DType::F32)?;
+            let result = (|| {
+                rotate_x_mq_batched_for(gpu, w, x, &x_rot, w.k, batch_size)?;
+                gpu.quantize_act_oq8(&x_rot, &xq, &xs, batch_size, w.k, GROUP)?;
+                let ws = w.buf.sub_offset(w.m * w.k, w.m * ng * 4);
+                gpu.gemm_oq8_grouped_wmma(&w.buf, &ws, &xq, &xs, y, w.m, w.k, batch_size, GROUP)
+            })();
+            gpu.free_tensor(x_rot)?;
+            gpu.free_tensor(xq)?;
+            gpu.free_tensor(xs)?;
+            result
+        }
         DType::W8A8Ref => {
             // W8A8 reference path. buf = [M*K int8 weights | M f32 per-channel scales].
             // Quantize activations per-token to int8, iu8 WMMA, dequant by w·x scale.

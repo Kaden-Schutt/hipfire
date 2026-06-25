@@ -89,7 +89,30 @@ static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 // runs `ldlq::oq4_ldlq_pack` instead of plain RTN `quantize_oq4g256`. Opened from
 // the `--hessian` path (HFHS-v1, which carries the full [K,K], not just the
 // diagonal AWQ reads). None unless `--ldlq` + `--hessian` are both given.
-static OQ4_LDLQ_HESSIAN: OnceLock<crate::hfhs_diag::HfhsFull> = OnceLock::new();
+enum Oq4LdlqHessian {
+    Hfqm(hessian_io::HessianSidecar),
+    Hfhs(crate::hfhs_diag::HfhsFull),
+}
+
+impl Oq4LdlqHessian {
+    fn k_of(&self, name: &str) -> Option<usize> {
+        match self {
+            Self::Hfqm(sc) => sc.get(name, 0).map(|h| h.k),
+            Self::Hfhs(sc) => sc.k_of(name),
+        }
+    }
+
+    fn get_full(&self, name: &str) -> Option<Vec<f32>> {
+        match self {
+            Self::Hfqm(sc) => sc
+                .get(name, 0)
+                .map(|h| h.iter_f64().map(|v| v as f32).collect()),
+            Self::Hfhs(sc) => sc.get_full(name),
+        }
+    }
+}
+
+static OQ4_LDLQ_HESSIAN: OnceLock<Oq4LdlqHessian> = OnceLock::new();
 
 // Phase A Stage A — AWQ (Activation-aware Weight Quantization, Lin et al
 // 2023). When AWQ_ALPHA is set (via --awq [<alpha>=0.55]), each linear-layer
@@ -5402,24 +5425,40 @@ fn main() {
                 eprintln!("error: --hessian path not found: {}", hpath.display());
                 std::process::exit(1);
             }
-            match hfhs_diag::read_diagonals(&hpath) {
-                Ok(diags) => {
+            match hessian_io::HessianSidecar::open(&hpath) {
+                Ok(sc) => {
                     let mut table: HashMap<String, Vec<f32>> =
-                        HashMap::with_capacity(diags.len() * 2);
-                    for (name, diag) in diags {
-                        table.insert(format!("{name}.weight"), diag.clone());
-                        table.insert(name, diag); // bare-name fallback
+                        HashMap::with_capacity(sc.n_tensors() * 2);
+                    for href in sc.tensors() {
+                        let diag: Vec<f32> = (0..href.k).map(|i| href.at(i, i) as f32).collect();
+                        table.insert(format!("{}.weight", href.name), diag.clone());
+                        table.insert(href.name.to_string(), diag);
                     }
                     let n = table.len();
                     IMATRIX
                         .set(table)
                         .expect("IMATRIX set twice — should not happen");
-                    eprintln!("imatrix derived from hessian diagonals ({hpath:?}): {n} keys");
+                    eprintln!("imatrix derived from HFQM Hessian diagonals ({hpath:?}): {n} keys");
                 }
-                Err(e) => {
-                    eprintln!("error: --hessian read failed ({}): {e}", hpath.display());
-                    std::process::exit(1);
-                }
+                Err(_) => match hfhs_diag::read_diagonals(&hpath) {
+                    Ok(diags) => {
+                        let mut table: HashMap<String, Vec<f32>> =
+                            HashMap::with_capacity(diags.len() * 2);
+                        for (name, diag) in diags {
+                            table.insert(format!("{name}.weight"), diag.clone());
+                            table.insert(name, diag); // bare-name fallback
+                        }
+                        let n = table.len();
+                        IMATRIX
+                            .set(table)
+                            .expect("IMATRIX set twice — should not happen");
+                        eprintln!("imatrix derived from hessian diagonals ({hpath:?}): {n} keys");
+                    }
+                    Err(e) => {
+                        eprintln!("error: --hessian read failed ({}): {e}", hpath.display());
+                        std::process::exit(1);
+                    }
+                },
             }
         }
     }
@@ -5434,19 +5473,28 @@ fn main() {
             .and_then(|i| args.get(i + 1))
             .map(PathBuf::from)
         {
-            Some(hpath) if hpath.exists() => match hfhs_diag::HfhsFull::open(&hpath) {
-                Ok(full) => {
-                    OQ4_LDLQ_HESSIAN
-                        .set(full)
-                        .ok()
-                        .expect("OQ4_LDLQ_HESSIAN set twice");
-                    eprintln!("ldlq: full Hessian index opened ({hpath:?})");
-                }
-                Err(e) => {
-                    eprintln!("error: --ldlq could not open full Hessian ({hpath:?}): {e}");
-                    std::process::exit(1);
-                }
-            },
+            Some(hpath) if hpath.exists() => {
+                let full = match hessian_io::HessianSidecar::open(&hpath) {
+                    Ok(sc) => {
+                        eprintln!("ldlq: HFQM full Hessian index opened ({hpath:?})");
+                        Oq4LdlqHessian::Hfqm(sc)
+                    }
+                    Err(_) => match hfhs_diag::HfhsFull::open(&hpath) {
+                        Ok(sc) => {
+                            eprintln!("ldlq: HFHS full Hessian index opened ({hpath:?})");
+                            Oq4LdlqHessian::Hfhs(sc)
+                        }
+                        Err(e) => {
+                            eprintln!("error: --ldlq could not open full Hessian ({hpath:?}): {e}");
+                            std::process::exit(1);
+                        }
+                    },
+                };
+                OQ4_LDLQ_HESSIAN
+                    .set(full)
+                    .ok()
+                    .expect("OQ4_LDLQ_HESSIAN set twice");
+            }
             _ => {
                 eprintln!("error: --ldlq requires --hessian <HFHS .hessian.bin>");
                 std::process::exit(1);
