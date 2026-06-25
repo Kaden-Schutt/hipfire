@@ -23,6 +23,7 @@ const K: usize = 4096; // 16 groups of 256 (and 128 blocks of 32 for q8_0)
 fn row_bytes(dtype: &str) -> usize {
     match dtype {
         "hfq4g256" => (K / 256) * 136,
+        "hfq6g256" => (K / 256) * 200,
         "mq4g256_lloyd" => (K / 256) * 160,
         "mq3g256_lloyd" => (K / 256) * 112,
         "q4k" => (K / 256) * 144,
@@ -120,6 +121,70 @@ fn run_dtype(
     Ok(p_nb & p_wb)
 }
 
+/// Build `m` rows of HFQ6-G256 weight bytes with FINITE scale/zero (so the GEMV
+/// produces finite, deterministic values) and a deterministic 6-bit data pattern.
+/// Group layout: f32 scale | f32 zero | 192 data bytes (32 lanes × 6 B).
+fn build_hfq6(m: usize, seed: u32) -> Vec<u8> {
+    let groups = K / 256;
+    let mut out = Vec::with_capacity(m * groups * 200);
+    for row in 0..m {
+        for g in 0..groups {
+            let scale = 0.01f32 + ((row * 3 + g * 5 + seed as usize) % 7) as f32 * 0.001;
+            let zero = -0.1f32 + ((row + g) % 5) as f32 * 0.01;
+            out.extend_from_slice(&scale.to_le_bytes());
+            out.extend_from_slice(&zero.to_le_bytes());
+            for b in 0..192usize {
+                let h = row
+                    .wrapping_mul(31)
+                    .wrapping_add(g.wrapping_mul(53))
+                    .wrapping_add(b.wrapping_mul(7))
+                    .wrapping_add(seed as usize);
+                out.push((h & 0xFF) as u8);
+            }
+        }
+    }
+    out
+}
+
+/// Per-row fused_qkv_hfq6g256 (no bias) must be BIT-EXACT with three separate
+/// gemv_hfq6g256 calls (same row math, same accumulation order).
+fn test_hfq6_fused_vs_gemv(gpu: &mut Gpu) -> HipResult<bool> {
+    let wq = gpu.upload_raw(&build_hfq6(Q_M, 1), &[Q_M * (K / 256) * 200])?;
+    let wk = gpu.upload_raw(&build_hfq6(K_M, 2), &[K_M * (K / 256) * 200])?;
+    let wv = gpu.upload_raw(&build_hfq6(V_M, 3), &[V_M * (K / 256) * 200])?;
+    let xv: Vec<f32> = (0..K).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+    let x = gpu.upload_f32(&xv, &[K])?;
+
+    // Fused.
+    let yqf = gpu.zeros(&[Q_M], DType::F32)?;
+    let ykf = gpu.zeros(&[K_M], DType::F32)?;
+    let yvf = gpu.zeros(&[V_M], DType::F32)?;
+    gpu.fused_qkv_hfq6g256(&wq, &wk, &wv, &x, &yqf, &ykf, &yvf, Q_M, K_M, V_M, K)?;
+    let fq = gpu.download_f32(&yqf)?;
+    let fk = gpu.download_f32(&ykf)?;
+    let fv = gpu.download_f32(&yvf)?;
+
+    // Three separate gemv_hfq6g256.
+    let yqg = gpu.zeros(&[Q_M], DType::F32)?;
+    let ykg = gpu.zeros(&[K_M], DType::F32)?;
+    let yvg = gpu.zeros(&[V_M], DType::F32)?;
+    gpu.gemv_hfq6g256(&wq, &x, &yqg, Q_M, K)?;
+    gpu.gemv_hfq6g256(&wk, &x, &ykg, K_M, K)?;
+    gpu.gemv_hfq6g256(&wv, &x, &yvg, V_M, K)?;
+    let gq = gpu.download_f32(&yqg)?;
+    let gk = gpu.download_f32(&ykg)?;
+    let gv = gpu.download_f32(&yvg)?;
+
+    let p = check("hfq6 fused_q == gemv_q", &fq, &gq)
+        & check("hfq6 fused_k == gemv_k", &fk, &gk)
+        & check("hfq6 fused_v == gemv_v", &fv, &gv);
+
+    for t in [wq, wk, wv, x, yqf, ykf, yvf, yqg, ykg, yvg] {
+        gpu.free_tensor(t)?;
+    }
+    Ok(p)
+}
+
 fn main() {
     let mut gpu = Gpu::init().expect("GPU init failed");
     eprintln!("GPU: {}", gpu.arch);
@@ -188,6 +253,23 @@ fn main() {
         g.fused_qkv_q8_0_with_bias(aq, ak, av, x, yq, yk, yv, Q_M, K_M, V_M, K, bq, bk, bv)
     })
     .expect("q8_0");
+
+    println!("--- hfq6g256 (Family B, new per-row kernel) ---");
+    all &= run_dtype(
+        &mut gpu,
+        "hfq6g256",
+        |g, aq, ak, av, x, yq, yk, yv, bias| {
+            let (bq, bk, bv) = ptrs!(bias);
+            g.fused_qkv_hfq6g256_with_bias(aq, ak, av, x, yq, yk, yv, Q_M, K_M, V_M, K, bq, bk, bv)
+        },
+    )
+    .expect("hfq6g256");
+
+    // Family B extra: the per-row fused_qkv_hfq6g256 (no bias) must be bit-exact
+    // with three separate gemv_hfq6g256 calls on REAL (finite, non-zero) weights —
+    // the handover's "validate new fused-per-row == per-row GEMV path" gate.
+    println!("--- hfq6g256 fused == 3×gemv_hfq6g256 (finite weights) ---");
+    all &= test_hfq6_fused_vs_gemv(&mut gpu).expect("hfq6 fused-vs-gemv");
 
     if !all {
         eprintln!("\nFAIL: at least one fused_qkv_*_with_bias kernel failed bias parity");

@@ -3300,6 +3300,11 @@ pub const FUSED_QKV_HFQ4G256_K2048_ALL_BUFFER_SLC_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_qkv_hfq4g256.hip")
 );
 
+// Per-row 3-way fused HFQ6/MQ6-G256 preamble (qwen2-family decode). Authored
+// from gemv_hfq6g256's row body + qkv routing + optional bias epilogue.
+pub const FUSED_QKV_HFQ6G256_SRC: &str =
+    include_str!("../../../kernels/src/fused_qkv_hfq6g256.hip");
+
 // CDNA3 (MI300X / gfx94x) wave64-native 3-way fused preamble — 2 rows per
 // block via warp_id, halved grid. Byte-exact with the wave32 base kernel.
 pub const FUSED_QKV_HFQ4G256_WAVE64_SRC: &str = concat!(
