@@ -652,6 +652,10 @@ fn qkv_bias_fold_supported(key: KernelKey, ctx: &DispatchCtx) -> bool {
             | KernelKey::FusedQkvMq3G256Lloyd
             | KernelKey::FusedQkvQ4K
             | KernelKey::FusedQkvQ8_0
+            // HFQ6/MQ6: the fold switches decode GEMM→per-row (Family B). The
+            // dispatch arm keeps the GEMM unless bias is present, so this only
+            // changes decode when the fold actually fires.
+            | KernelKey::FusedQkvHfq6G256
     )
 }
 

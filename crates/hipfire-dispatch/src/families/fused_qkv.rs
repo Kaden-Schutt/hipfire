@@ -194,9 +194,38 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             match params.batch_size {
                 Some(n) => hip!(gpu.gemm_qkv_hfq6g256(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n)),
                 None if gpu.arch_caps.gemv_dp4a_enabled() => {
+                    // gfx906 dp4a fast-path. No bias params; the fold is guarded
+                    // off for dp4a archs in execute_steps (bias applied separately).
                     hip!(gpu.fused_qkv_hfq6g256_dp4a(wq, wk, wv, x, q, kout, v, mq, mk, mv, k))
                 }
-                None => hip!(gpu.gemm_qkv_hfq6g256(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, 1)),
+                // Decode (n=1). HFQ6 has no per-row decode kernel historically —
+                // it ran the n=1 GEMM. Switching to per-row is a deliberate
+                // GEMM→per-row change (byte-target = 3×gemv_hfq6g256 + 3 bias, NOT
+                // the GEMM) and HFQ6 coherence can't be model-validated on this
+                // box, so it is gated to ONLY when the bias fold actually fires
+                // (Some(bias) ⇒ HIPFIRE_FUSE_QKV_BIAS on + a qwen2 bias model).
+                // With the fold off (bias None), keep the safe historical GEMM.
+                None => match params.bias {
+                    Some([bq, bk, bv]) => hip!(gpu.fused_qkv_hfq6g256_with_bias(
+                        wq,
+                        wk,
+                        wv,
+                        x,
+                        q,
+                        kout,
+                        v,
+                        mq,
+                        mk,
+                        mv,
+                        k,
+                        bq.buf.as_ptr(),
+                        bk.buf.as_ptr(),
+                        bv.buf.as_ptr()
+                    )),
+                    None => {
+                        hip!(gpu.gemm_qkv_hfq6g256(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, 1))
+                    }
+                },
             }
         }
         KernelKey::FusedQkvQ4K => {
