@@ -2242,16 +2242,6 @@ fn linear_optional_bias_with_runtime_context(
     }
 }
 
-fn linear_with_runtime_options(
-    input: &CpuTensor,
-    weight: &CpuTensor,
-    bias: &CpuTensor,
-    runtime_options: DiffusionGenerationRuntimeOptions,
-) -> DiffusionResult<CpuTensor> {
-    let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
-    linear_with_runtime_context(input, weight, bias, &mut runtime_context)
-}
-
 fn linear_with_runtime_context(
     input: &CpuTensor,
     weight: &CpuTensor,
@@ -2439,72 +2429,69 @@ fn concat_last_dim_3d_with_runtime_context(
     }
 }
 
-fn conv2d_with_runtime_options(
+fn conv2d_with_runtime_context(
     input: &CpuTensor,
     weight: &CpuTensor,
     bias: Option<&CpuTensor>,
     padding: usize,
     stride: usize,
-    runtime_options: DiffusionGenerationRuntimeOptions,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<CpuTensor> {
-    let Some(device_id) = runtime_options.rocm_device_id else {
+    let Some(_device_id) = runtime_context.rocm_device_id() else {
         return conv2d_nchw_with_stride(input, weight, bias, padding, stride);
     };
     #[cfg(feature = "rocm")]
     {
-        let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-        conv2d_nchw_hip_on_gpu(&mut gpu, input, weight, bias, padding, stride)
+        runtime_context
+            .with_rocm_gpu(|gpu| conv2d_nchw_hip_on_gpu(gpu, input, weight, bias, padding, stride))
     }
     #[cfg(not(feature = "rocm"))]
     {
-        let _ = device_id;
+        let _ = _device_id;
         Err(rocm_hybrid_unavailable_error())
     }
 }
 
-fn group_norm_with_runtime_options(
+fn group_norm_with_runtime_context(
     input: &CpuTensor,
     weight: &CpuTensor,
     bias: &CpuTensor,
     groups: usize,
     eps: f32,
-    runtime_options: DiffusionGenerationRuntimeOptions,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<CpuTensor> {
-    let Some(device_id) = runtime_options.rocm_device_id else {
+    let Some(_device_id) = runtime_context.rocm_device_id() else {
         return group_norm_nchw(input, weight, bias, groups, eps);
     };
     #[cfg(feature = "rocm")]
     {
-        let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-        group_norm_nchw_hip_on_gpu(&mut gpu, input, weight, bias, groups, eps)
+        runtime_context
+            .with_rocm_gpu(|gpu| group_norm_nchw_hip_on_gpu(gpu, input, weight, bias, groups, eps))
     }
     #[cfg(not(feature = "rocm"))]
     {
-        let _ = device_id;
+        let _ = _device_id;
         Err(rocm_hybrid_unavailable_error())
     }
 }
 
-fn add_channel_bias_nchw_with_runtime_options(
+fn add_channel_bias_nchw_with_runtime_context(
     input: &mut CpuTensor,
     bias: &CpuTensor,
-    runtime_options: DiffusionGenerationRuntimeOptions,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<()> {
-    let Some(device_id) = runtime_options.rocm_device_id else {
+    let Some(_device_id) = runtime_context.rocm_device_id() else {
         return add_channel_bias_nchw(input, bias);
     };
     #[cfg(feature = "rocm")]
     {
-        let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-        *input = add_channel_bias_nchw_hip_on_gpu(&mut gpu, input, bias)?;
+        *input = runtime_context
+            .with_rocm_gpu(|gpu| add_channel_bias_nchw_hip_on_gpu(gpu, input, bias))?;
         Ok(())
     }
     #[cfg(not(feature = "rocm"))]
     {
-        let _ = device_id;
+        let _ = _device_id;
         Err(rocm_hybrid_unavailable_error())
     }
 }
@@ -5510,13 +5497,22 @@ impl Conv2dLayer {
         input: &CpuTensor,
         runtime_options: DiffusionGenerationRuntimeOptions,
     ) -> DiffusionResult<CpuTensor> {
-        conv2d_with_runtime_options(
+        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+        self.forward_with_runtime_context(input, &mut runtime_context)
+    }
+
+    fn forward_with_runtime_context(
+        &self,
+        input: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
+        conv2d_with_runtime_context(
             input,
             &self.weight,
             self.bias.as_ref(),
             self.padding,
             self.stride,
-            runtime_options,
+            runtime_context,
         )
     }
 }
@@ -5554,13 +5550,22 @@ impl GroupNormLayer {
         input: &CpuTensor,
         runtime_options: DiffusionGenerationRuntimeOptions,
     ) -> DiffusionResult<CpuTensor> {
-        group_norm_with_runtime_options(
+        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+        self.forward_with_runtime_context(input, &mut runtime_context)
+    }
+
+    fn forward_with_runtime_context(
+        &self,
+        input: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
+        group_norm_with_runtime_context(
             input,
             &self.weight,
             &self.bias,
             self.groups,
             self.eps,
-            runtime_options,
+            runtime_context,
         )
     }
 }
@@ -5632,26 +5637,35 @@ impl ResnetBlock2D {
         input: &CpuTensor,
         runtime_options: DiffusionGenerationRuntimeOptions,
     ) -> DiffusionResult<CpuTensor> {
+        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+        self.forward_with_runtime_context(input, &mut runtime_context)
+    }
+
+    fn forward_with_runtime_context(
+        &self,
+        input: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
         let hidden = self
             .norm1
-            .forward_with_runtime_options(input, runtime_options)?;
-        let hidden = silu_with_runtime_options(&hidden, runtime_options)?;
+            .forward_with_runtime_context(input, runtime_context)?;
+        let hidden = silu_with_runtime_context(&hidden, runtime_context)?;
         let hidden = self
             .conv1
-            .forward_with_runtime_options(&hidden, runtime_options)?;
+            .forward_with_runtime_context(&hidden, runtime_context)?;
         let hidden = self
             .norm2
-            .forward_with_runtime_options(&hidden, runtime_options)?;
-        let hidden = silu_with_runtime_options(&hidden, runtime_options)?;
+            .forward_with_runtime_context(&hidden, runtime_context)?;
+        let hidden = silu_with_runtime_context(&hidden, runtime_context)?;
         let hidden = self
             .conv2
-            .forward_with_runtime_options(&hidden, runtime_options)?;
+            .forward_with_runtime_context(&hidden, runtime_context)?;
         let residual = if let Some(shortcut) = &self.shortcut {
-            shortcut.forward_with_runtime_options(input, runtime_options)?
+            shortcut.forward_with_runtime_context(input, runtime_context)?
         } else {
             input.clone()
         };
-        tensor_add_with_runtime_options(&hidden, &residual, runtime_options)
+        tensor_add_with_runtime_context(&hidden, &residual, runtime_context)
     }
 }
 
@@ -5734,6 +5748,16 @@ impl UnetResnetBlock2D {
         time_embedding: &CpuTensor,
         runtime_options: DiffusionGenerationRuntimeOptions,
     ) -> DiffusionResult<CpuTensor> {
+        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+        self.forward_with_runtime_context(input, time_embedding, &mut runtime_context)
+    }
+
+    fn forward_with_runtime_context(
+        &self,
+        input: &CpuTensor,
+        time_embedding: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
         let [batch, _, _, _] = shape4(input)?;
         let [time_batch, _] = shape2(time_embedding)?;
         if time_batch != batch {
@@ -5743,31 +5767,31 @@ impl UnetResnetBlock2D {
         }
         let hidden = self
             .norm1
-            .forward_with_runtime_options(input, runtime_options)?;
-        let hidden = silu_with_runtime_options(&hidden, runtime_options)?;
+            .forward_with_runtime_context(input, runtime_context)?;
+        let hidden = silu_with_runtime_context(&hidden, runtime_context)?;
         let mut hidden = self
             .conv1
-            .forward_with_runtime_options(&hidden, runtime_options)?;
-        let projected_time = linear_with_runtime_options(
-            &silu_with_runtime_options(time_embedding, runtime_options)?,
+            .forward_with_runtime_context(&hidden, runtime_context)?;
+        let projected_time = linear_with_runtime_context(
+            &silu_with_runtime_context(time_embedding, runtime_context)?,
             &self.time_emb_proj_weight,
             &self.time_emb_proj_bias,
-            runtime_options,
+            runtime_context,
         )?;
-        add_channel_bias_nchw_with_runtime_options(&mut hidden, &projected_time, runtime_options)?;
+        add_channel_bias_nchw_with_runtime_context(&mut hidden, &projected_time, runtime_context)?;
         let hidden = self
             .norm2
-            .forward_with_runtime_options(&hidden, runtime_options)?;
-        let hidden = silu_with_runtime_options(&hidden, runtime_options)?;
+            .forward_with_runtime_context(&hidden, runtime_context)?;
+        let hidden = silu_with_runtime_context(&hidden, runtime_context)?;
         let hidden = self
             .conv2
-            .forward_with_runtime_options(&hidden, runtime_options)?;
+            .forward_with_runtime_context(&hidden, runtime_context)?;
         let residual = if let Some(shortcut) = &self.shortcut {
-            shortcut.forward_with_runtime_options(input, runtime_options)?
+            shortcut.forward_with_runtime_context(input, runtime_context)?
         } else {
             input.clone()
         };
-        tensor_add_with_runtime_options(&hidden, &residual, runtime_options)
+        tensor_add_with_runtime_context(&hidden, &residual, runtime_context)
     }
 }
 
@@ -17400,6 +17424,23 @@ mod tests {
         let output = block.forward(&input).unwrap();
         assert_eq!(output.shape, input.shape);
         assert_eq!(output.data, input.data);
+
+        #[cfg(feature = "rocm")]
+        {
+            if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+                eprintln!("skip: ROCm GPU unavailable for VAE ResNet context test: {error}");
+            } else {
+                let mut runtime_context = DiffusionGenerationRuntimeContext::new(
+                    DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
+                );
+                let hip = block
+                    .forward_with_runtime_context(&input, &mut runtime_context)
+                    .unwrap();
+                assert_eq!(runtime_context.rocm_gpu_init_count(), 1);
+                assert_eq!(hip.shape, output.shape);
+                assert!(f32_slices_close(&hip.data, &output.data, 1e-5));
+            }
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -17465,6 +17506,23 @@ mod tests {
         assert_eq!(out_a.shape, input.shape);
         assert_eq!(out_b.shape, input.shape);
         assert_ne!(out_a.data, out_b.data);
+
+        #[cfg(feature = "rocm")]
+        {
+            if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+                eprintln!("skip: ROCm GPU unavailable for UNet ResNet context test: {error}");
+            } else {
+                let mut runtime_context = DiffusionGenerationRuntimeContext::new(
+                    DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
+                );
+                let hip = block
+                    .forward_with_runtime_context(&input, &time_b, &mut runtime_context)
+                    .unwrap();
+                assert_eq!(runtime_context.rocm_gpu_init_count(), 1);
+                assert_eq!(hip.shape, out_b.shape);
+                assert!(f32_slices_close(&hip.data, &out_b.data, 1e-5));
+            }
+        }
 
         let bad_time = CpuTensor {
             shape: vec![2, 2],
