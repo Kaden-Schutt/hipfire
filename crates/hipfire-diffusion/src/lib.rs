@@ -205,6 +205,8 @@ pub struct DiffusionHipPreflight {
     pub scheduler_kernel_probe: DiffusionHipKernelProbe,
     pub conv2d_kernel_probe: DiffusionHipKernelProbe,
     pub group_norm_kernel_probe: DiffusionHipKernelProbe,
+    pub silu_kernel_probe: DiffusionHipKernelProbe,
+    pub upsample_kernel_probe: DiffusionHipKernelProbe,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2543,6 +2545,45 @@ impl DiffusionPipeline {
                 "HIP diffusion GroupNorm kernel output differed from CPU reference".to_string(),
             ));
         }
+        let silu_input = CpuTensor {
+            shape: vec![1, 2, 2, 2],
+            data: vec![-4.0, -1.0, -0.25, 0.0, 0.25, 1.0, 2.0, 4.0],
+        };
+        let silu_cpu_reference = tensor_map(&silu_input, silu);
+        let silu_gpu_output = silu_hip_on_gpu(&mut gpu, &silu_input)?;
+        let silu_kernel_probe = DiffusionHipKernelProbe {
+            name: "diffusion_silu_f32".to_string(),
+            input_elements: silu_input.data.len(),
+            output_bytes: silu_gpu_output.data.len() * std::mem::size_of::<f32>(),
+            matched_cpu_reference: silu_gpu_output.shape == silu_cpu_reference.shape
+                && f32_slices_close(&silu_gpu_output.data, &silu_cpu_reference.data, 1e-6),
+        };
+        if !silu_kernel_probe.matched_cpu_reference {
+            return Err(DiffusionError::BackendUnavailable(
+                "HIP diffusion SiLU kernel output differed from CPU reference".to_string(),
+            ));
+        }
+        let upsample_input = CpuTensor {
+            shape: vec![1, 2, 2, 3],
+            data: (0..12)
+                .map(|idx| idx as f32 / 5.0 - 1.0)
+                .collect::<Vec<_>>(),
+        };
+        let upsample_cpu_reference = upsample_nearest2d_nchw(&upsample_input, 2)?;
+        let upsample_gpu_output = upsample_nearest2d_nchw_hip_on_gpu(&mut gpu, &upsample_input, 2)?;
+        let upsample_kernel_probe = DiffusionHipKernelProbe {
+            name: "diffusion_upsample_nearest2d_nchw_f32".to_string(),
+            input_elements: upsample_input.data.len(),
+            output_bytes: upsample_gpu_output.data.len() * std::mem::size_of::<f32>(),
+            matched_cpu_reference: upsample_gpu_output.shape == upsample_cpu_reference.shape
+                && upsample_gpu_output.data == upsample_cpu_reference.data,
+        };
+        if !upsample_kernel_probe.matched_cpu_reference {
+            return Err(DiffusionError::BackendUnavailable(
+                "HIP diffusion nearest-upsample kernel output differed from CPU reference"
+                    .to_string(),
+            ));
+        }
 
         Ok(DiffusionHipPreflight {
             device_id: gpu.device_id,
@@ -2556,6 +2597,8 @@ impl DiffusionPipeline {
             scheduler_kernel_probe,
             conv2d_kernel_probe,
             group_norm_kernel_probe,
+            silu_kernel_probe,
+            upsample_kernel_probe,
         })
     }
 
@@ -5342,6 +5385,56 @@ extern "C" __global__ void diffusion_group_norm_nchw_f32(
 "#;
 
 #[cfg(feature = "rocm")]
+const DIFFUSION_SILU_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void diffusion_silu_f32(
+    const float* input,
+    float* output,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    float value = input[idx];
+    output[idx] = value / (1.0f + expf(-value));
+}
+"#;
+
+#[cfg(feature = "rocm")]
+const DIFFUSION_UPSAMPLE_NEAREST2D_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void diffusion_upsample_nearest2d_nchw_f32(
+    const float* input,
+    float* output,
+    int total_outputs,
+    int channels,
+    int in_h,
+    int in_w,
+    int out_h,
+    int out_w,
+    int scale
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_outputs) {
+        return;
+    }
+    int ox = idx % out_w;
+    int t = idx / out_w;
+    int oy = t % out_h;
+    t /= out_h;
+    int c = t % channels;
+    int b = t / channels;
+    int iy = oy / scale;
+    int ix = ox / scale;
+    int input_idx = ((b * channels + c) * in_h + iy) * in_w + ix;
+    output[idx] = input[input_idx];
+}
+"#;
+
+#[cfg(feature = "rocm")]
 fn rgb_tensor_to_u8_hip_on_gpu(
     gpu: &mut rdna_compute::Gpu,
     tensor: &CpuTensor,
@@ -5857,6 +5950,175 @@ fn group_norm_nchw_hip_on_gpu(
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
     Ok(CpuTensor {
         shape: input.shape.clone(),
+        data,
+    })
+}
+
+#[cfg(feature = "rocm")]
+fn silu_hip_on_gpu(gpu: &mut rdna_compute::Gpu, input: &CpuTensor) -> DiffusionResult<CpuTensor> {
+    let elements = checked_shape_elements("SiLU input", &input.shape)?;
+    if elements == 0 {
+        return Ok(CpuTensor::zeros(&input.shape));
+    }
+    let n = i32_kernel_dim("SiLU elements", elements)?;
+    let output_bytes = elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| DiffusionError::InvalidMetadata("SiLU output size overflows".to_string()))?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let input_gpu = gpu
+        .upload_f32(&input.data, &input.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = gpu
+        .hip
+        .malloc(output_bytes)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = compiler
+        .compile("diffusion_silu_f32", DIFFUSION_SILU_HIP_SRC)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = obj_path
+        .to_str()
+        .ok_or_else(|| {
+            DiffusionError::BackendUnavailable(
+                "compiled diffusion SiLU kernel path is not UTF-8".to_string(),
+            )
+        })?
+        .to_string();
+    let module = gpu
+        .hip
+        .module_load(&obj_path)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let function = gpu
+        .hip
+        .module_get_function(&module, "diffusion_silu_f32")
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(input_gpu.buf.as_ptr());
+    kernargs.push_ptr(output_gpu.as_ptr());
+    kernargs.push_i32(n);
+    kernargs.pad_to(16);
+    let grid = [((elements as u32).saturating_add(255)) / 256, 1, 1];
+    unsafe {
+        gpu.hip
+            .launch_kernel_blob(
+                &function,
+                grid,
+                [256, 1, 1],
+                0,
+                gpu.active_stream.as_ref(),
+                kernargs.as_mut_slice(),
+            )
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let data = download_f32_buffer(gpu, &output_gpu, elements)?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(CpuTensor {
+        shape: input.shape.clone(),
+        data,
+    })
+}
+
+#[cfg(feature = "rocm")]
+fn upsample_nearest2d_nchw_hip_on_gpu(
+    gpu: &mut rdna_compute::Gpu,
+    input: &CpuTensor,
+    scale: usize,
+) -> DiffusionResult<CpuTensor> {
+    if scale == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "upsample scale must be positive".to_string(),
+        ));
+    }
+    let [batch, channels, in_h, in_w] = shape4(input)?;
+    let out_h = in_h.checked_mul(scale).ok_or_else(|| {
+        DiffusionError::InvalidRequest("upsample output height overflows".to_string())
+    })?;
+    let out_w = in_w.checked_mul(scale).ok_or_else(|| {
+        DiffusionError::InvalidRequest("upsample output width overflows".to_string())
+    })?;
+    let output_shape = [batch, channels, out_h, out_w];
+    let output_elements = checked_shape_elements("upsample output", &output_shape)?;
+    if output_elements == 0 {
+        return Ok(CpuTensor::zeros(&output_shape));
+    }
+    let output_bytes = output_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata("upsample output size overflows".to_string())
+        })?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let input_gpu = gpu
+        .upload_f32(&input.data, &input.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = gpu
+        .hip
+        .malloc(output_bytes)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = compiler
+        .compile(
+            "diffusion_upsample_nearest2d_nchw_f32",
+            DIFFUSION_UPSAMPLE_NEAREST2D_HIP_SRC,
+        )
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = obj_path
+        .to_str()
+        .ok_or_else(|| {
+            DiffusionError::BackendUnavailable(
+                "compiled diffusion nearest-upsample kernel path is not UTF-8".to_string(),
+            )
+        })?
+        .to_string();
+    let module = gpu
+        .hip
+        .module_load(&obj_path)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let function = gpu
+        .hip
+        .module_get_function(&module, "diffusion_upsample_nearest2d_nchw_f32")
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(input_gpu.buf.as_ptr());
+    kernargs.push_ptr(output_gpu.as_ptr());
+    kernargs.push_i32(i32_kernel_dim("upsample output elements", output_elements)?);
+    kernargs.push_i32(i32_kernel_dim("upsample channels", channels)?);
+    kernargs.push_i32(i32_kernel_dim("upsample input height", in_h)?);
+    kernargs.push_i32(i32_kernel_dim("upsample input width", in_w)?);
+    kernargs.push_i32(i32_kernel_dim("upsample output height", out_h)?);
+    kernargs.push_i32(i32_kernel_dim("upsample output width", out_w)?);
+    kernargs.push_i32(i32_kernel_dim("upsample scale", scale)?);
+    kernargs.pad_to(16);
+    let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+    unsafe {
+        gpu.hip
+            .launch_kernel_blob(
+                &function,
+                grid,
+                [256, 1, 1],
+                0,
+                gpu.active_stream.as_ref(),
+                kernargs.as_mut_slice(),
+            )
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(CpuTensor {
+        shape: output_shape.to_vec(),
         data,
     })
 }
@@ -12735,6 +12997,64 @@ mod tests {
                 (actual - expected).abs() <= 1e-5,
                 "GroupNorm mismatch at {index}: hip={actual} cpu={expected}"
             );
+        }
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn hip_silu_matches_cpu_reference_when_gpu_is_available() {
+        let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!("skip: ROCm GPU unavailable for SiLU kernel parity test: {error}");
+                return;
+            }
+        };
+        let input = CpuTensor {
+            shape: vec![2, 2, 2, 2],
+            data: vec![
+                -8.0, -4.0, -1.0, -0.25, 0.0, 0.25, 1.0, 4.0, 8.0, 0.5, -0.5, 2.0, -2.0, 3.0, -3.0,
+                0.125,
+            ],
+        };
+
+        let cpu = tensor_map(&input, silu);
+        let hip = silu_hip_on_gpu(&mut gpu, &input).unwrap();
+
+        assert_eq!(hip.shape, cpu.shape);
+        for (index, (actual, expected)) in hip.data.iter().zip(&cpu.data).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1e-6,
+                "SiLU mismatch at {index}: hip={actual} cpu={expected}"
+            );
+        }
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn hip_upsample_nearest2d_matches_cpu_reference_when_gpu_is_available() {
+        let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!(
+                    "skip: ROCm GPU unavailable for nearest-upsample kernel parity test: {error}"
+                );
+                return;
+            }
+        };
+        let input = CpuTensor {
+            shape: vec![2, 2, 2, 3],
+            data: (0..24)
+                .map(|idx| idx as f32 / 7.0 - 1.25)
+                .collect::<Vec<_>>(),
+        };
+
+        for scale in [2, 3] {
+            let cpu = upsample_nearest2d_nchw(&input, scale).unwrap();
+            let hip = upsample_nearest2d_nchw_hip_on_gpu(&mut gpu, &input, scale).unwrap();
+
+            assert_eq!(hip.shape, cpu.shape);
+            assert_eq!(hip.data, cpu.data);
         }
     }
 
