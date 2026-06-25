@@ -2496,23 +2496,21 @@ fn add_channel_bias_nchw_with_runtime_context(
     }
 }
 
-fn concat_channels_nchw_with_runtime_options(
+fn concat_channels_nchw_with_runtime_context(
     a: &CpuTensor,
     b: &CpuTensor,
-    runtime_options: DiffusionGenerationRuntimeOptions,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<CpuTensor> {
-    let Some(device_id) = runtime_options.rocm_device_id else {
+    let Some(_device_id) = runtime_context.rocm_device_id() else {
         return concat_channels_nchw(a, b);
     };
     #[cfg(feature = "rocm")]
     {
-        let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-        concat_channels_nchw_hip_on_gpu(&mut gpu, a, b)
+        runtime_context.with_rocm_gpu(|gpu| concat_channels_nchw_hip_on_gpu(gpu, a, b))
     }
     #[cfg(not(feature = "rocm"))]
     {
-        let _ = device_id;
+        let _ = _device_id;
         Err(rocm_hybrid_unavailable_error())
     }
 }
@@ -2522,18 +2520,25 @@ fn upsample_nearest2d_nchw_with_runtime_options(
     scale: usize,
     runtime_options: DiffusionGenerationRuntimeOptions,
 ) -> DiffusionResult<CpuTensor> {
-    let Some(device_id) = runtime_options.rocm_device_id else {
+    let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+    upsample_nearest2d_nchw_with_runtime_context(input, scale, &mut runtime_context)
+}
+
+fn upsample_nearest2d_nchw_with_runtime_context(
+    input: &CpuTensor,
+    scale: usize,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
+) -> DiffusionResult<CpuTensor> {
+    let Some(_device_id) = runtime_context.rocm_device_id() else {
         return upsample_nearest2d_nchw(input, scale);
     };
     #[cfg(feature = "rocm")]
     {
-        let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-        upsample_nearest2d_nchw_hip_on_gpu(&mut gpu, input, scale)
+        runtime_context.with_rocm_gpu(|gpu| upsample_nearest2d_nchw_hip_on_gpu(gpu, input, scale))
     }
     #[cfg(not(feature = "rocm"))]
     {
-        let _ = device_id;
+        let _ = _device_id;
         Err(rocm_hybrid_unavailable_error())
     }
 }
@@ -6437,15 +6442,32 @@ impl UnetDownBlock2D {
 
     fn forward_with_runtime_options(
         &self,
-        mut hidden: CpuTensor,
+        hidden: CpuTensor,
         time_embedding: &CpuTensor,
         encoder_states: &CpuTensor,
         runtime_options: DiffusionGenerationRuntimeOptions,
     ) -> DiffusionResult<(CpuTensor, Vec<CpuTensor>)> {
+        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+        self.forward_with_runtime_context(
+            hidden,
+            time_embedding,
+            encoder_states,
+            &mut runtime_context,
+        )
+    }
+
+    fn forward_with_runtime_context(
+        &self,
+        mut hidden: CpuTensor,
+        time_embedding: &CpuTensor,
+        encoder_states: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<(CpuTensor, Vec<CpuTensor>)> {
+        let runtime_options = runtime_context.options;
         let mut skips = Vec::new();
         for (idx, resnet) in self.resnets.iter().enumerate() {
             hidden =
-                resnet.forward_with_runtime_options(&hidden, time_embedding, runtime_options)?;
+                resnet.forward_with_runtime_context(&hidden, time_embedding, runtime_context)?;
             if let Some(attention) = self.attentions.get(idx) {
                 hidden = attention.forward_with_runtime_options(
                     &hidden,
@@ -6456,7 +6478,7 @@ impl UnetDownBlock2D {
             skips.push(hidden.clone());
         }
         if let Some(downsampler) = &self.downsampler {
-            hidden = downsampler.forward_with_runtime_options(&hidden, runtime_options)?;
+            hidden = downsampler.forward_with_runtime_context(&hidden, runtime_context)?;
             skips.push(hidden.clone());
         }
         Ok((hidden, skips))
@@ -6537,16 +6559,32 @@ impl UnetDownPath {
         encoder_states: &CpuTensor,
         runtime_options: DiffusionGenerationRuntimeOptions,
     ) -> DiffusionResult<(CpuTensor, Vec<CpuTensor>)> {
+        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+        self.forward_with_runtime_context(
+            sample,
+            time_embedding,
+            encoder_states,
+            &mut runtime_context,
+        )
+    }
+
+    fn forward_with_runtime_context(
+        &self,
+        sample: &CpuTensor,
+        time_embedding: &CpuTensor,
+        encoder_states: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<(CpuTensor, Vec<CpuTensor>)> {
         let mut hidden = self
             .conv_in
-            .forward_with_runtime_options(sample, runtime_options)?;
+            .forward_with_runtime_context(sample, runtime_context)?;
         let mut skips = vec![hidden.clone()];
         for block in &self.blocks {
-            let (next, mut block_skips) = block.forward_with_runtime_options(
+            let (next, mut block_skips) = block.forward_with_runtime_context(
                 hidden,
                 time_embedding,
                 encoder_states,
-                runtime_options,
+                runtime_context,
             )?;
             hidden = next;
             skips.append(&mut block_skips);
@@ -6638,19 +6676,38 @@ impl UnetUpBlock2D {
 
     fn forward_with_runtime_options(
         &self,
-        mut hidden: CpuTensor,
+        hidden: CpuTensor,
         skips: &mut Vec<CpuTensor>,
         time_embedding: &CpuTensor,
         encoder_states: &CpuTensor,
         runtime_options: DiffusionGenerationRuntimeOptions,
     ) -> DiffusionResult<CpuTensor> {
+        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+        self.forward_with_runtime_context(
+            hidden,
+            skips,
+            time_embedding,
+            encoder_states,
+            &mut runtime_context,
+        )
+    }
+
+    fn forward_with_runtime_context(
+        &self,
+        mut hidden: CpuTensor,
+        skips: &mut Vec<CpuTensor>,
+        time_embedding: &CpuTensor,
+        encoder_states: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
+        let runtime_options = runtime_context.options;
         for (idx, resnet) in self.resnets.iter().enumerate() {
             let skip = skips.pop().ok_or_else(|| {
                 DiffusionError::InvalidMetadata("UNet up block ran out of skip tensors".to_string())
             })?;
-            hidden = concat_channels_nchw_with_runtime_options(&hidden, &skip, runtime_options)?;
+            hidden = concat_channels_nchw_with_runtime_context(&hidden, &skip, runtime_context)?;
             hidden =
-                resnet.forward_with_runtime_options(&hidden, time_embedding, runtime_options)?;
+                resnet.forward_with_runtime_context(&hidden, time_embedding, runtime_context)?;
             if let Some(attention) = self.attentions.get(idx) {
                 hidden = attention.forward_with_runtime_options(
                     &hidden,
@@ -6660,8 +6717,8 @@ impl UnetUpBlock2D {
             }
         }
         if let Some(upsampler) = &self.upsampler {
-            hidden = upsample_nearest2d_nchw_with_runtime_options(&hidden, 2, runtime_options)?;
-            hidden = upsampler.forward_with_runtime_options(&hidden, runtime_options)?;
+            hidden = upsample_nearest2d_nchw_with_runtime_context(&hidden, 2, runtime_context)?;
+            hidden = upsampler.forward_with_runtime_context(&hidden, runtime_context)?;
         }
         Ok(hidden)
     }
@@ -6733,19 +6790,37 @@ impl UnetUpPath {
 
     fn forward_with_runtime_options(
         &self,
-        mut hidden: CpuTensor,
+        hidden: CpuTensor,
         skips: &mut Vec<CpuTensor>,
         time_embedding: &CpuTensor,
         encoder_states: &CpuTensor,
         runtime_options: DiffusionGenerationRuntimeOptions,
     ) -> DiffusionResult<CpuTensor> {
+        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+        self.forward_with_runtime_context(
+            hidden,
+            skips,
+            time_embedding,
+            encoder_states,
+            &mut runtime_context,
+        )
+    }
+
+    fn forward_with_runtime_context(
+        &self,
+        mut hidden: CpuTensor,
+        skips: &mut Vec<CpuTensor>,
+        time_embedding: &CpuTensor,
+        encoder_states: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
         for block in &self.blocks {
-            hidden = block.forward_with_runtime_options(
+            hidden = block.forward_with_runtime_context(
                 hidden,
                 skips,
                 time_embedding,
                 encoder_states,
-                runtime_options,
+                runtime_context,
             )?;
         }
         Ok(hidden)
@@ -6831,21 +6906,38 @@ impl UnetMidBlock2DCrossAttn {
 
     fn forward_with_runtime_options(
         &self,
-        mut hidden: CpuTensor,
+        hidden: CpuTensor,
         time_embedding: &CpuTensor,
         encoder_states: &CpuTensor,
         runtime_options: DiffusionGenerationRuntimeOptions,
     ) -> DiffusionResult<CpuTensor> {
+        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+        self.forward_with_runtime_context(
+            hidden,
+            time_embedding,
+            encoder_states,
+            &mut runtime_context,
+        )
+    }
+
+    fn forward_with_runtime_context(
+        &self,
+        mut hidden: CpuTensor,
+        time_embedding: &CpuTensor,
+        encoder_states: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
+        let runtime_options = runtime_context.options;
         hidden =
             self.resnet_0
-                .forward_with_runtime_options(&hidden, time_embedding, runtime_options)?;
+                .forward_with_runtime_context(&hidden, time_embedding, runtime_context)?;
         if let Some(attention) = &self.attention {
             hidden =
                 attention.forward_with_runtime_options(&hidden, encoder_states, runtime_options)?;
         }
         if let Some(resnet) = &self.resnet_1 {
             hidden =
-                resnet.forward_with_runtime_options(&hidden, time_embedding, runtime_options)?;
+                resnet.forward_with_runtime_context(&hidden, time_embedding, runtime_context)?;
         }
         Ok(hidden)
     }
@@ -7012,28 +7104,28 @@ impl NativeUnet2DConditionModel {
             time_embedding =
                 tensor_add_with_runtime_context(&time_embedding, &added, runtime_context)?;
         }
-        let (hidden, mut skips) = self.down_path.forward_with_runtime_options(
+        let (hidden, mut skips) = self.down_path.forward_with_runtime_context(
             &sample,
             &time_embedding,
             encoder_states,
-            runtime_options,
+            runtime_context,
         )?;
         let hidden = if let Some(mid_block) = &self.mid_block {
-            mid_block.forward_with_runtime_options(
+            mid_block.forward_with_runtime_context(
                 hidden,
                 &time_embedding,
                 encoder_states,
-                runtime_options,
+                runtime_context,
             )?
         } else {
             hidden
         };
-        let hidden = self.up_path.forward_with_runtime_options(
+        let hidden = self.up_path.forward_with_runtime_context(
             hidden,
             &mut skips,
             &time_embedding,
             encoder_states,
-            runtime_options,
+            runtime_context,
         )?;
         let hidden = self
             .conv_norm_out
@@ -17644,11 +17736,40 @@ mod tests {
             shape: vec![1, 1, 3],
             data: vec![0.0; 3],
         };
+        #[cfg(feature = "rocm")]
+        let input_for_hip = input.clone();
         let (hidden, skips) = block.forward(input, &time, &encoder).unwrap();
         assert_eq!(skips.len(), 2);
         assert_eq!(skips[0].shape, vec![1, 2, 4, 4]);
         assert_eq!(skips[1].shape, vec![1, 2, 2, 2]);
         assert_eq!(hidden.shape, vec![1, 2, 2, 2]);
+
+        #[cfg(feature = "rocm")]
+        {
+            if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+                eprintln!("skip: ROCm GPU unavailable for UNet down block context test: {error}");
+            } else {
+                let mut runtime_context = DiffusionGenerationRuntimeContext::new(
+                    DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
+                );
+                let (hip_hidden, hip_skips) = block
+                    .forward_with_runtime_context(
+                        input_for_hip,
+                        &time,
+                        &encoder,
+                        &mut runtime_context,
+                    )
+                    .unwrap();
+                assert_eq!(runtime_context.rocm_gpu_init_count(), 1);
+                assert_eq!(hip_hidden.shape, hidden.shape);
+                assert!(f32_slices_close(&hip_hidden.data, &hidden.data, 1e-5));
+                assert_eq!(hip_skips.len(), skips.len());
+                for (hip_skip, cpu_skip) in hip_skips.iter().zip(&skips) {
+                    assert_eq!(hip_skip.shape, cpu_skip.shape);
+                    assert!(f32_slices_close(&hip_skip.data, &cpu_skip.data, 1e-5));
+                }
+            }
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -17747,10 +17868,38 @@ mod tests {
             shape: vec![1, 1, 3],
             data: vec![0.0; 3],
         };
+        #[cfg(feature = "rocm")]
+        let hidden_for_hip = hidden.clone();
+        #[cfg(feature = "rocm")]
+        let mut skips_for_hip = skips.clone();
         let output = block.forward(hidden, &mut skips, &time, &encoder).unwrap();
         assert!(skips.is_empty());
         assert_eq!(output.shape, vec![1, 1, 4, 4]);
         assert_eq!(&output.data[0..4], &[1.0, 1.0, 2.0, 2.0]);
+
+        #[cfg(feature = "rocm")]
+        {
+            if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+                eprintln!("skip: ROCm GPU unavailable for UNet up block context test: {error}");
+            } else {
+                let mut runtime_context = DiffusionGenerationRuntimeContext::new(
+                    DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
+                );
+                let hip_output = block
+                    .forward_with_runtime_context(
+                        hidden_for_hip,
+                        &mut skips_for_hip,
+                        &time,
+                        &encoder,
+                        &mut runtime_context,
+                    )
+                    .unwrap();
+                assert_eq!(runtime_context.rocm_gpu_init_count(), 1);
+                assert!(skips_for_hip.is_empty());
+                assert_eq!(hip_output.shape, output.shape);
+                assert!(f32_slices_close(&hip_output.data, &output.data, 1e-5));
+            }
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -17946,6 +18095,8 @@ mod tests {
             shape: vec![1, 1, 1],
             data: vec![0.0],
         };
+        #[cfg(feature = "rocm")]
+        let input_for_hip = input.clone();
 
         let output = mid_block.forward(input, &time, &encoder).unwrap();
 
@@ -17953,6 +18104,28 @@ mod tests {
         assert!(mid_block.resnet_1.is_some());
         assert_eq!(output.shape, vec![1, 1, 2, 2]);
         assert!(output.data.iter().all(|value| value.is_finite()));
+
+        #[cfg(feature = "rocm")]
+        {
+            if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+                eprintln!("skip: ROCm GPU unavailable for UNet mid block context test: {error}");
+            } else {
+                let mut runtime_context = DiffusionGenerationRuntimeContext::new(
+                    DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
+                );
+                let hip_output = mid_block
+                    .forward_with_runtime_context(
+                        input_for_hip,
+                        &time,
+                        &encoder,
+                        &mut runtime_context,
+                    )
+                    .unwrap();
+                assert_eq!(runtime_context.rocm_gpu_init_count(), 1);
+                assert_eq!(hip_output.shape, output.shape);
+                assert!(f32_slices_close(&hip_output.data, &output.data, 1e-5));
+            }
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

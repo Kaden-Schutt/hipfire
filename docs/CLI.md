@@ -235,8 +235,10 @@ stages now reuse the generation ROCm context for input centering, timestep
 embedding, SDXL add-time embedding, and the SDXL time-add residual merge.
 HFQ-backed UNet and VAE ResNet blocks also have context-aware execution for their
 Conv2D, GroupNorm, SiLU, channel-bias, linear time-projection, shortcut, and
-residual-add stages; path-level UNet/VAE block traversal is being migrated onto
-those context seams incrementally.
+residual-add stages. UNet down/up/mid traversal now keeps those stages, plus
+channel concatenation and nearest-neighbor upsample, on the generation-scoped
+context while transformer attention remains a hybrid tensor-boundary stage. VAE
+path-level traversal is still being migrated onto the same context seams.
 The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128,
 HFQ4G256, and HFQ6G256 tensor payloads even when the artifact `weight_format`
 records a future quantized format such as `oq4`; OQ/MQ/HFP and other packed
