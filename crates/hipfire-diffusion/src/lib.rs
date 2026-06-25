@@ -200,6 +200,7 @@ pub struct DiffusionHipPreflight {
     pub memory_plan: DiffusionHipMemoryPlan,
     pub probe_bytes: usize,
     pub kernel_probe: DiffusionHipKernelProbe,
+    pub rgb_to_vae_tensor_kernel_probe: DiffusionHipKernelProbe,
     pub model_input_kernel_probe: DiffusionHipKernelProbe,
     pub guidance_kernel_probe: DiffusionHipKernelProbe,
     pub scheduler_kernel_probe: DiffusionHipKernelProbe,
@@ -222,6 +223,7 @@ pub struct DiffusionHipPreflight {
     pub sdpa_kernel_probe: DiffusionHipKernelProbe,
     pub clip_causal_attention_kernel_probe: DiffusionHipKernelProbe,
     pub geglu_gate_kernel_probe: DiffusionHipKernelProbe,
+    pub vae_moments_to_latents_kernel_probe: DiffusionHipKernelProbe,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2386,6 +2388,35 @@ impl DiffusionPipeline {
                 "HIP diffusion RGB kernel output differed from CPU reference".to_string(),
             ));
         }
+        let vae_image_probe = RgbImageBatch {
+            batch: 2,
+            width: 2,
+            height: 2,
+            data: vec![
+                0, 128, 255, 255, 0, 128, 32, 64, 96, 192, 224, 16, 10, 20, 30, 40, 50, 60, 70, 80,
+                90, 100, 110, 120,
+            ],
+        };
+        let rgb_to_vae_tensor_cpu_reference = rgb_batch_to_vae_tensor(&vae_image_probe)?;
+        let rgb_to_vae_tensor_gpu_output =
+            rgb_batch_to_vae_tensor_hip_on_gpu(&mut gpu, &vae_image_probe)?;
+        let rgb_to_vae_tensor_kernel_probe = DiffusionHipKernelProbe {
+            name: "diffusion_rgb_u8_to_vae_nchw_f32".to_string(),
+            input_elements: vae_image_probe.data.len(),
+            output_bytes: rgb_to_vae_tensor_gpu_output.data.len() * std::mem::size_of::<f32>(),
+            matched_cpu_reference: rgb_to_vae_tensor_gpu_output.shape
+                == rgb_to_vae_tensor_cpu_reference.shape
+                && f32_slices_close(
+                    &rgb_to_vae_tensor_gpu_output.data,
+                    &rgb_to_vae_tensor_cpu_reference.data,
+                    1e-6,
+                ),
+        };
+        if !rgb_to_vae_tensor_kernel_probe.matched_cpu_reference {
+            return Err(DiffusionError::BackendUnavailable(
+                "HIP diffusion RGB-to-VAE kernel output differed from CPU reference".to_string(),
+            ));
+        }
         let model_input_sample = vec![-1.0, -0.25, 0.0, 0.5, 1.0, 2.0, -2.0, 0.125];
         let model_input_scale = 0.5;
         let model_input_cpu_reference = model_input_sample
@@ -3044,6 +3075,39 @@ impl DiffusionPipeline {
                 "HIP diffusion GeGLU gate kernel output differed from CPU reference".to_string(),
             ));
         }
+        let vae_moments = CpuTensor {
+            shape: vec![2, 4, 2, 2],
+            data: (0..32)
+                .map(|idx| idx as f32 / 9.0 - 1.5)
+                .collect::<Vec<_>>(),
+        };
+        let vae_moments_to_latents_cpu_reference = vae_moments_to_latents(&vae_moments, 0.18215)?;
+        let vae_moments_to_latents_gpu_output =
+            vae_moments_to_latents_hip_on_gpu(&mut gpu, &vae_moments, 0.18215)?;
+        let vae_moments_to_latents_kernel_probe = DiffusionHipKernelProbe {
+            name: "diffusion_vae_moments_to_latents_f32".to_string(),
+            input_elements: vae_moments.data.len(),
+            output_bytes: vae_moments_to_latents_gpu_output.data.len() * std::mem::size_of::<f32>(),
+            matched_cpu_reference: vae_moments_to_latents_gpu_output.batch
+                == vae_moments_to_latents_cpu_reference.batch
+                && vae_moments_to_latents_gpu_output.channels
+                    == vae_moments_to_latents_cpu_reference.channels
+                && vae_moments_to_latents_gpu_output.height
+                    == vae_moments_to_latents_cpu_reference.height
+                && vae_moments_to_latents_gpu_output.width
+                    == vae_moments_to_latents_cpu_reference.width
+                && f32_slices_close(
+                    &vae_moments_to_latents_gpu_output.data,
+                    &vae_moments_to_latents_cpu_reference.data,
+                    1e-6,
+                ),
+        };
+        if !vae_moments_to_latents_kernel_probe.matched_cpu_reference {
+            return Err(DiffusionError::BackendUnavailable(
+                "HIP diffusion VAE moments-to-latents kernel output differed from CPU reference"
+                    .to_string(),
+            ));
+        }
 
         Ok(DiffusionHipPreflight {
             device_id: gpu.device_id,
@@ -3052,6 +3116,7 @@ impl DiffusionPipeline {
             memory_plan,
             probe_bytes: probe.len(),
             kernel_probe,
+            rgb_to_vae_tensor_kernel_probe,
             model_input_kernel_probe,
             guidance_kernel_probe,
             scheduler_kernel_probe,
@@ -3074,6 +3139,7 @@ impl DiffusionPipeline {
             sdpa_kernel_probe,
             clip_causal_attention_kernel_probe,
             geglu_gate_kernel_probe,
+            vae_moments_to_latents_kernel_probe,
         })
     }
 
@@ -5386,34 +5452,39 @@ impl NativeVaeEncoder {
     pub fn encode_to_latents(&self, image: &RgbImageBatch) -> DiffusionResult<LatentBatch> {
         let image = rgb_batch_to_vae_tensor(image)?;
         let moments = self.encode_tensor_moments(&image)?;
-        let [batch, channels, height, width] = shape4(&moments)?;
-        if channels % 2 != 0 {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "VAE encoder moments channel count {channels} is not even"
-            )));
-        }
-        let latent_channels = channels / 2;
-        let mut data = Vec::with_capacity(batch * latent_channels * height * width);
-        let scale = self.scaling_factor.max(f32::MIN_POSITIVE);
-        for b in 0..batch {
-            for c in 0..latent_channels {
-                for y in 0..height {
-                    for x in 0..width {
-                        data.push(
-                            moments.data[nchw_idx(b, c, y, x, channels, height, width)] * scale,
-                        );
-                    }
+        vae_moments_to_latents(&moments, self.scaling_factor)
+    }
+}
+
+fn vae_moments_to_latents(
+    moments: &CpuTensor,
+    scaling_factor: f32,
+) -> DiffusionResult<LatentBatch> {
+    let [batch, channels, height, width] = shape4(moments)?;
+    if channels % 2 != 0 {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "VAE encoder moments channel count {channels} is not even"
+        )));
+    }
+    let latent_channels = channels / 2;
+    let mut data = Vec::with_capacity(batch * latent_channels * height * width);
+    let scale = scaling_factor.max(f32::MIN_POSITIVE);
+    for b in 0..batch {
+        for c in 0..latent_channels {
+            for y in 0..height {
+                for x in 0..width {
+                    data.push(moments.data[nchw_idx(b, c, y, x, channels, height, width)] * scale);
                 }
             }
         }
-        Ok(LatentBatch {
-            batch,
-            channels: latent_channels,
-            height,
-            width,
-            data,
-        })
     }
+    Ok(LatentBatch {
+        batch,
+        channels: latent_channels,
+        height,
+        width,
+        data,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -5655,6 +5726,56 @@ extern "C" __global__ void diffusion_rgb_tensor_to_u8(
         value = fminf(fmaxf(value, 0.0f), 1.0f);
         output[idx * 3 + c] = (unsigned char)floorf(value * 255.0f + 0.5f);
     }
+}
+"#;
+
+#[cfg(feature = "rocm")]
+const DIFFUSION_VAE_BOUNDARY_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void diffusion_rgb_u8_to_vae_nchw_f32(
+    const unsigned char* input,
+    float* output,
+    int total_outputs,
+    int height,
+    int width
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_outputs) {
+        return;
+    }
+    int x = idx % width;
+    int t = idx / width;
+    int y = t % height;
+    t /= height;
+    int c = t % 3;
+    int b = t / 3;
+    int rgb_idx = (b * height * width + y * width + x) * 3 + c;
+    output[idx] = ((float)input[rgb_idx]) / 127.5f - 1.0f;
+}
+
+extern "C" __global__ void diffusion_vae_moments_to_latents_f32(
+    const float* moments,
+    float* output,
+    int total_outputs,
+    int moments_channels,
+    int latent_channels,
+    int height,
+    int width,
+    float scale
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_outputs) {
+        return;
+    }
+    int x = idx % width;
+    int t = idx / width;
+    int y = t % height;
+    t /= height;
+    int c = t % latent_channels;
+    int b = t / latent_channels;
+    int moments_idx = ((b * moments_channels + c) * height + y) * width + x;
+    output[idx] = moments[moments_idx] * scale;
 }
 "#;
 
@@ -6403,6 +6524,217 @@ fn rgb_tensor_to_u8_hip_on_gpu(
         batch,
         width,
         height,
+        data,
+    })
+}
+
+#[cfg(feature = "rocm")]
+fn rgb_batch_to_vae_tensor_hip_on_gpu(
+    gpu: &mut rdna_compute::Gpu,
+    batch: &RgbImageBatch,
+) -> DiffusionResult<CpuTensor> {
+    let bytes_per_image = batch
+        .width
+        .checked_mul(batch.height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| DiffusionError::InvalidRequest("image dimensions overflow".to_string()))?;
+    let expected = bytes_per_image
+        .checked_mul(batch.batch)
+        .ok_or_else(|| DiffusionError::InvalidRequest("image batch size overflows".to_string()))?;
+    if batch.data.len() != expected {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "RGB image batch has {} bytes, expected {expected}",
+            batch.data.len()
+        )));
+    }
+    let output_shape = [batch.batch, 3, batch.height, batch.width];
+    let output_elements = checked_shape_elements("RGB-to-VAE tensor output", &output_shape)?;
+    if output_elements == 0 {
+        return Ok(CpuTensor::zeros(&output_shape));
+    }
+    let output_bytes = output_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata("RGB-to-VAE tensor output size overflows".to_string())
+        })?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let input_gpu = gpu
+        .hip
+        .malloc(batch.data.len())
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    gpu.hip
+        .memcpy_htod(&input_gpu, &batch.data)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = gpu
+        .hip
+        .malloc(output_bytes)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = compiler
+        .compile(
+            "diffusion_rgb_u8_to_vae_nchw_f32",
+            DIFFUSION_VAE_BOUNDARY_HIP_SRC,
+        )
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = obj_path
+        .to_str()
+        .ok_or_else(|| {
+            DiffusionError::BackendUnavailable(
+                "compiled diffusion RGB-to-VAE kernel path is not UTF-8".to_string(),
+            )
+        })?
+        .to_string();
+    let module = gpu
+        .hip
+        .module_load(&obj_path)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let function = gpu
+        .hip
+        .module_get_function(&module, "diffusion_rgb_u8_to_vae_nchw_f32")
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(input_gpu.as_ptr());
+    kernargs.push_ptr(output_gpu.as_ptr());
+    kernargs.push_i32(i32_kernel_dim(
+        "RGB-to-VAE output elements",
+        output_elements,
+    )?);
+    kernargs.push_i32(i32_kernel_dim("RGB-to-VAE height", batch.height)?);
+    kernargs.push_i32(i32_kernel_dim("RGB-to-VAE width", batch.width)?);
+    kernargs.pad_to(16);
+    let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+    unsafe {
+        gpu.hip
+            .launch_kernel_blob(
+                &function,
+                grid,
+                [256, 1, 1],
+                0,
+                gpu.active_stream.as_ref(),
+                kernargs.as_mut_slice(),
+            )
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    gpu.hip
+        .free(input_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(CpuTensor {
+        shape: output_shape.to_vec(),
+        data,
+    })
+}
+
+#[cfg(feature = "rocm")]
+fn vae_moments_to_latents_hip_on_gpu(
+    gpu: &mut rdna_compute::Gpu,
+    moments: &CpuTensor,
+    scaling_factor: f32,
+) -> DiffusionResult<LatentBatch> {
+    let [batch, channels, height, width] = shape4(moments)?;
+    if channels % 2 != 0 {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "VAE encoder moments channel count {channels} is not even"
+        )));
+    }
+    let latent_channels = channels / 2;
+    let output_shape = [batch, latent_channels, height, width];
+    let output_elements = checked_shape_elements("VAE moments-to-latents output", &output_shape)?;
+    if output_elements == 0 {
+        return Ok(LatentBatch {
+            batch,
+            channels: latent_channels,
+            height,
+            width,
+            data: Vec::new(),
+        });
+    }
+    let output_bytes = output_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata(
+                "VAE moments-to-latents output size overflows".to_string(),
+            )
+        })?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let moments_gpu = gpu
+        .upload_f32(&moments.data, &moments.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = gpu
+        .hip
+        .malloc(output_bytes)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = compiler
+        .compile(
+            "diffusion_vae_moments_to_latents_f32",
+            DIFFUSION_VAE_BOUNDARY_HIP_SRC,
+        )
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = obj_path
+        .to_str()
+        .ok_or_else(|| {
+            DiffusionError::BackendUnavailable(
+                "compiled diffusion VAE moments-to-latents kernel path is not UTF-8".to_string(),
+            )
+        })?
+        .to_string();
+    let module = gpu
+        .hip
+        .module_load(&obj_path)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let function = gpu
+        .hip
+        .module_get_function(&module, "diffusion_vae_moments_to_latents_f32")
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(moments_gpu.buf.as_ptr());
+    kernargs.push_ptr(output_gpu.as_ptr());
+    kernargs.push_i32(i32_kernel_dim(
+        "VAE moments-to-latents output elements",
+        output_elements,
+    )?);
+    kernargs.push_i32(i32_kernel_dim("VAE moments channels", channels)?);
+    kernargs.push_i32(i32_kernel_dim("VAE latent channels", latent_channels)?);
+    kernargs.push_i32(i32_kernel_dim("VAE latent height", height)?);
+    kernargs.push_i32(i32_kernel_dim("VAE latent width", width)?);
+    kernargs.push_f32(scaling_factor.max(f32::MIN_POSITIVE));
+    kernargs.pad_to(16);
+    let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+    unsafe {
+        gpu.hip
+            .launch_kernel_blob(
+                &function,
+                grid,
+                [256, 1, 1],
+                0,
+                gpu.active_stream.as_ref(),
+                kernargs.as_mut_slice(),
+            )
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(LatentBatch {
+        batch,
+        channels: latent_channels,
+        height,
+        width,
         data,
     })
 }
@@ -14999,6 +15331,62 @@ mod tests {
 
     #[cfg(feature = "rocm")]
     #[test]
+    fn hip_vae_boundary_transforms_match_cpu_reference_when_gpu_is_available() {
+        let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!(
+                    "skip: ROCm GPU unavailable for VAE boundary kernel parity test: {error}"
+                );
+                return;
+            }
+        };
+        let image = RgbImageBatch {
+            batch: 2,
+            width: 2,
+            height: 2,
+            data: vec![
+                0, 128, 255, 255, 0, 128, 32, 64, 96, 192, 224, 16, 10, 20, 30, 40, 50, 60, 70, 80,
+                90, 100, 110, 120,
+            ],
+        };
+        let cpu_tensor = rgb_batch_to_vae_tensor(&image).unwrap();
+        let hip_tensor = rgb_batch_to_vae_tensor_hip_on_gpu(&mut gpu, &image).unwrap();
+
+        assert_eq!(hip_tensor.shape, cpu_tensor.shape);
+        for (index, (actual, expected)) in hip_tensor.data.iter().zip(&cpu_tensor.data).enumerate()
+        {
+            assert!(
+                (actual - expected).abs() <= 1e-6,
+                "RGB-to-VAE mismatch at {index}: hip={actual} cpu={expected}"
+            );
+        }
+
+        let moments = CpuTensor {
+            shape: vec![2, 4, 2, 2],
+            data: (0..32)
+                .map(|idx| idx as f32 / 9.0 - 1.5)
+                .collect::<Vec<_>>(),
+        };
+        let cpu_latents = vae_moments_to_latents(&moments, 0.18215).unwrap();
+        let hip_latents = vae_moments_to_latents_hip_on_gpu(&mut gpu, &moments, 0.18215).unwrap();
+
+        assert_eq!(hip_latents.batch, cpu_latents.batch);
+        assert_eq!(hip_latents.channels, cpu_latents.channels);
+        assert_eq!(hip_latents.height, cpu_latents.height);
+        assert_eq!(hip_latents.width, cpu_latents.width);
+        for (index, (actual, expected)) in
+            hip_latents.data.iter().zip(&cpu_latents.data).enumerate()
+        {
+            assert!(
+                (actual - expected).abs() <= 1e-6,
+                "VAE moments-to-latents mismatch at {index}: hip={actual} cpu={expected}"
+            );
+        }
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
     fn hip_euler_step_matches_cpu_reference_when_gpu_is_available() {
         let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
             Ok(gpu) => gpu,
@@ -15699,6 +16087,22 @@ mod tests {
         assert!((tensor.data[nchw_idx(0, 1, 0, 0, 3, 1, 2)] - 0.003921628).abs() < 1e-6);
         assert!((tensor.data[nchw_idx(0, 2, 0, 0, 3, 1, 2)] - 1.0).abs() < 1e-6);
         assert!((tensor.data[nchw_idx(0, 0, 0, 1, 3, 1, 2)] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn vae_moments_to_latents_selects_mean_channels_and_scales() {
+        let moments = CpuTensor {
+            shape: vec![1, 4, 1, 2],
+            data: vec![1.0, -2.0, 3.0, -4.0, 10.0, 20.0, 30.0, 40.0],
+        };
+
+        let latents = vae_moments_to_latents(&moments, 0.5).unwrap();
+
+        assert_eq!(latents.batch, 1);
+        assert_eq!(latents.channels, 2);
+        assert_eq!(latents.height, 1);
+        assert_eq!(latents.width, 2);
+        assert_eq!(latents.data, vec![0.5, -1.0, 1.5, -2.0]);
     }
 
     #[test]
