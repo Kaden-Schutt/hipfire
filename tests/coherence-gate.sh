@@ -119,11 +119,10 @@ find_model_file() {
 }
 
 # ── GPU lock ──────────────────────────────────────────────────────────────
-if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
-    # shellcheck disable=SC1090
-    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "coherence-gate" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
-    trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
-fi
+# This gate launches hipfire-daemon for each row. The daemon acquires the
+# canonical hip-gpu-0 resource lease before HIP init, so holding the same
+# lock in this shell would deadlock the gate against its own children.
+# Non-daemon follow-up stages, such as pflash-gate.sh, acquire their own lock.
 
 # ── Test matrix ───────────────────────────────────────────────────────────
 # Format: "model_file|id|prompt|max_tokens[|system_prompt_file]"
@@ -506,9 +505,7 @@ echo "no hard errors — review $OUT for coherence, then commit if satisfied"
 # Optional follow-up stage that asserts PFlash bench wall-clock and
 # verdicts haven't regressed against the committed baseline. Skipped
 # when target/drafter aren't present or when HIPFIRE_SKIP_PFLASH_GATE=1.
-# Release the daemon GPU lock first so pflash-gate.sh can acquire its own.
-"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true
-trap - EXIT
+# pflash-gate.sh acquires its own GPU lock because it runs non-daemon binaries.
 
 if [ "${HIPFIRE_SKIP_PFLASH_GATE:-0}" = "1" ]; then
     echo

@@ -158,7 +158,6 @@ fi
 EXE="./target/release/hipfire-daemon"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 OUT="${HIPFIRE_AGENTIC_GATE_OUT:-/tmp/agentic-gate-$(date +%Y%m%d-%H%M%S).md}"
-HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 
 find_model_file() {
     local name="$1"
@@ -256,15 +255,13 @@ cleanup() {
         kill -9 "$DAEMON_PID" 2>/dev/null
     fi
     DAEMON_PID=""
-    "$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true
 }
 
 # GPU lock
-if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
-    # shellcheck disable=SC1090
-    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "agentic-gate" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
-    trap cleanup EXIT
-fi
+# This gate launches hipfire-daemon. The daemon acquires the canonical
+# hip-gpu-0 resource lease before HIP init, so this shell must not hold the
+# same lock around its child. Non-daemon gates acquire their own lock.
+trap cleanup EXIT
 
 # ---- Build cell list -------------------------------------------------------
 # Each cell: model | system_fixture | thinking_clamp_bool | multi_turn_bool | label

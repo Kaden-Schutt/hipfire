@@ -14,7 +14,7 @@ ReLU²-MLP hybrid).
 | FU3 | quantizer → nemotron_h mq4/q8 .hfq | **DONE** — mq4 protects Nemotron residual writers and Mamba `in_proj` as q8 |
 | FU4 | loader compat (load .hfq + quantized gemv) + serving | **DONE** |
 | FU5 | N6 batched prefill + q8 SSM state | **mostly done** — batched HFQ benchmark captured; q8 state opt-in validated |
-| FU6 | Nano-30B MoE ('E' block) | in progress — 30B MQ4/HFQ artifact built; Mamba scale + hybrid MoE prefill restore closed-think 2+2 |
+| FU6 | Nano-30B MoE ('E' block) | in progress — 30B MQ4/HFQ artifact built; Mamba scale + hybrid MoE prefill restore closed-think 2+2; daemon smoke + speed evidence collected |
 | FU1 | chat-template / coherence | blocked (EOS/Jinja/CLI controls fixed; vLLM reference is coherent; Hipfire/native-HF diverge at first token) |
 
 ## FU1 update (2026-06-25)
@@ -237,6 +237,16 @@ Validation run locally on gfx1151:
   daemon executor, 3 pass / 0 fail / 0 skip (`load_metadata`,
   `finite_greedy_decode`, `multi_turn_reset_recall`). Admission is explicitly
   incomplete because this run has no baseline/reference quality comparison.
+- `hipfire-eval` daemon speed on the real 30B HFQ artifact:
+  `/tmp/nemotron30b-eval-speed-20260625-171038`, commit `db7bc1f9e`, dirty tree
+  only because the timing/evidence patch was under test, daemon executor,
+  2 pass / 0 fail / 0 skip. The SimpleAr/Nemotron daemon path now emits
+  `prefill_ms`, `prefill_tok_s`, `decode_tok_s`, `ttft_ms`, and writes standard
+  runtime evidence under each case's `runtime_evidence_dir`. Observed 249-token
+  prefill: 4108.0/4103.1 ms (60.6 tok/s), 50-token decode:
+  43.30/43.37 tok/s, TTFT 4109.2/4103.5 ms. `performance`, `phase_timings`,
+  `memory`, and launch-count proxy artifacts were collected; admission remains
+  incomplete because quality/baseline evidence is still absent.
 - Commit hooks for `211888d7a` and `27f994e00`: rustfmt, clippy, short
   coherence battery (no hard errors), fast agentic gate, and MQ4 speed gate all
   passed. Tiny-fixture golden still drifted on existing Qwen fixtures and

@@ -19,9 +19,12 @@ use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_prompt as prompt_frame;
-use hipfire_runtime::arch::{decode_loop, GenerateCtx, ServingBackend, SimpleAr};
+use hipfire_runtime::arch::{
+    decode_loop_with_timing, DecodeLoopTiming, GenerateCtx, ServingBackend, SimpleAr,
+};
 
 use crate::events::{emit_committed_event, emit_error_with_id, emit_stream_event};
+use crate::evidence::write_daemon_runtime_oneshot_evidence;
 use crate::model::{effective_raw, LoadedModel};
 use crate::request::ThinkMode;
 
@@ -1175,6 +1178,7 @@ pub fn generate_nemotron(
     assistant_prefix: prompt_frame::AssistantPrefix,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[prompt_frame::Message]>,
+    evidence_dir: Option<&str>,
 ) {
     if m.tokenizer.is_none() {
         emit_error_with_id(stdout, id, "tokenizer not loaded".to_string());
@@ -1271,10 +1275,13 @@ pub fn generate_nemotron(
     let backend = m.nemotron_backend.as_mut().unwrap();
     let eos = backend.eos_token();
 
+    let prefill_t0 = Instant::now();
     if let Err(e) = SimpleAr::prefill(backend, gpu, &prompt_tokens) {
         emit_error_with_id(stdout, id, format!("nemotron prefill: {e}"));
         return;
     }
+    let _ = gpu.hip.device_synchronize();
+    let prefill_ms = prefill_t0.elapsed().as_secs_f64() * 1000.0;
     let n = prompt_tokens.len();
     let no_images: [&[u8]; 0] = [];
     let mut ctx = GenerateCtx {
@@ -1292,10 +1299,38 @@ pub fn generate_nemotron(
         images: &no_images,
         sink: stdout,
     };
-    let result = decode_loop(gpu, backend, tok, eos, &mut ctx, n, n);
+    let result = decode_loop_with_timing(
+        gpu,
+        backend,
+        tok,
+        eos,
+        &mut ctx,
+        n,
+        n,
+        DecodeLoopTiming {
+            prefill_ms: Some(prefill_ms),
+        },
+    );
     drop(ctx);
-    if let Err(e) = result {
-        emit_error_with_id(stdout, id, format!("nemotron decode: {e}"));
+    match result {
+        Ok(outcome) => {
+            if let (Some(dir), Some(prefill_ms), Some(decode_ms)) =
+                (evidence_dir, outcome.prefill_ms, outcome.decode_ms)
+            {
+                write_daemon_runtime_oneshot_evidence(
+                    dir,
+                    m,
+                    gpu,
+                    id,
+                    outcome.prompt_tokens,
+                    outcome.tokens_generated,
+                    prefill_ms / 1000.0,
+                    decode_ms / 1000.0,
+                    outcome.ttft_ms.unwrap_or(prefill_ms),
+                );
+            }
+        }
+        Err(e) => emit_error_with_id(stdout, id, format!("nemotron decode: {e}")),
     }
 }
 
@@ -1316,6 +1351,7 @@ pub fn generate_llama(
     assistant_prefix: prompt_frame::AssistantPrefix,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[prompt_frame::Message]>,
+    evidence_dir: Option<&str>,
 ) {
     if m.tokenizer.is_none() {
         emit_error_with_id(stdout, id, "tokenizer not loaded".to_string());
@@ -1412,10 +1448,13 @@ pub fn generate_llama(
 
     // Pre-tokenized prefill (the framing already produced tokens), then the
     // shared streaming/sampling decode loop.
+    let prefill_t0 = Instant::now();
     if let Err(e) = SimpleAr::prefill(backend, gpu, &prompt_tokens) {
         emit_error_with_id(stdout, id, format!("llama prefill: {e}"));
         return;
     }
+    let _ = gpu.hip.device_synchronize();
+    let prefill_ms = prefill_t0.elapsed().as_secs_f64() * 1000.0;
     let n = prompt_tokens.len();
     let no_images: [&[u8]; 0] = [];
     let mut ctx = GenerateCtx {
@@ -1433,10 +1472,38 @@ pub fn generate_llama(
         images: &no_images,
         sink: stdout,
     };
-    let result = decode_loop(gpu, backend, tok, eos, &mut ctx, n, n);
+    let result = decode_loop_with_timing(
+        gpu,
+        backend,
+        tok,
+        eos,
+        &mut ctx,
+        n,
+        n,
+        DecodeLoopTiming {
+            prefill_ms: Some(prefill_ms),
+        },
+    );
     drop(ctx);
-    if let Err(e) = result {
-        emit_error_with_id(stdout, id, format!("llama decode: {e}"));
+    match result {
+        Ok(outcome) => {
+            if let (Some(dir), Some(prefill_ms), Some(decode_ms)) =
+                (evidence_dir, outcome.prefill_ms, outcome.decode_ms)
+            {
+                write_daemon_runtime_oneshot_evidence(
+                    dir,
+                    m,
+                    gpu,
+                    id,
+                    outcome.prompt_tokens,
+                    outcome.tokens_generated,
+                    prefill_ms / 1000.0,
+                    decode_ms / 1000.0,
+                    outcome.ttft_ms.unwrap_or(prefill_ms),
+                );
+            }
+        }
+        Err(e) => emit_error_with_id(stdout, id, format!("llama decode: {e}")),
     }
 }
 

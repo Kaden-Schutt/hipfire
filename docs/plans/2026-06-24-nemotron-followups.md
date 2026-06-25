@@ -342,8 +342,16 @@ After refreshing the local installed release binaries,
 `env -u HIPFIRE_DAEMON_BIN /home/sadara/.local/bin/hipfire chat --model ...
 --temperature 0 --max-tokens 16 "Answer in one short sentence: What is 2+2?"`
 returns `4` in one token. Lyra real-Mamba BF16 for the same prompt also
-generates `4`; remaining validation is broader quality/perf evidence and
-expert-sorted MoE prefill throughput work.
+generates `4`.
+
+The daemon speed battery now has eval-consumable timing evidence on the real
+30B artifact. `/tmp/nemotron30b-eval-speed-20260625-171038` produced 2 pass /
+0 fail / 0 skip with 249-token prefill at 4108.0/4103.1 ms (60.6 tok/s),
+50-token decode at 43.30/43.37 tok/s, and TTFT 4109.2/4103.5 ms. The
+SimpleAr/Nemotron path now emits the `done` timing fields and writes standard
+runtime evidence (`performance`, `phase_timings`, `memory`, launch-count proxy)
+when the daemon request supplies `evidence_dir`. Remaining validation is broader
+quality/baseline evidence and expert-sorted MoE prefill throughput work.
 Also `MEMEM*E…` has runs like `EM` and `M*` — confirm the flat-block residual
 handles consecutive same-FFN/mixer blocks (it does; each char is its own
 residual block).

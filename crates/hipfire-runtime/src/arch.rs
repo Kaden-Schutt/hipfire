@@ -47,6 +47,7 @@
 
 use crate::hfq::HfqFile;
 use rdna_compute::{Gpu, GpuTensor};
+use std::time::Instant;
 
 /// Bring-up contract for a hipfire architecture.
 ///
@@ -360,6 +361,16 @@ pub struct ServeOutcome {
     pub prompt_tokens: usize,
     pub tokens_generated: usize,
     pub stop_reason: StopReason,
+    pub prefill_ms: Option<f64>,
+    pub decode_ms: Option<f64>,
+    pub ttft_ms: Option<f64>,
+}
+
+/// Optional timing data measured by the caller before entering
+/// [`decode_loop_with_timing`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DecodeLoopTiming {
+    pub prefill_ms: Option<f64>,
 }
 
 /// Serving-infra parameters the daemon owns and hands to a backend's `serve`
@@ -511,6 +522,30 @@ pub fn decode_loop(
     start_pos: usize,
     prompt_tokens: usize,
 ) -> Result<ServeOutcome, String> {
+    decode_loop_with_timing(
+        gpu,
+        backend,
+        tok,
+        eos,
+        ctx,
+        start_pos,
+        prompt_tokens,
+        DecodeLoopTiming::default(),
+    )
+}
+
+/// Like [`decode_loop`], but includes optional caller-measured prefill timing in
+/// the terminal `done` envelope.
+pub fn decode_loop_with_timing(
+    gpu: &mut Gpu,
+    backend: &mut dyn SimpleAr,
+    tok: &crate::tokenizer::Tokenizer,
+    eos: u32,
+    ctx: &mut GenerateCtx,
+    start_pos: usize,
+    prompt_tokens: usize,
+    timing: DecodeLoopTiming,
+) -> Result<ServeOutcome, String> {
     let vocab = backend.vocab_size();
     let window = if ctx.repeat_window == 0 {
         64
@@ -540,6 +575,8 @@ pub fn decode_loop(
 
     let mut pos = start_pos;
     let mut committed: Vec<u32> = Vec::new();
+    let decode_t0 = Instant::now();
+    let mut first_token_ms: Option<f64> = None;
     let mut next = pick_next(
         gpu,
         backend,
@@ -583,6 +620,9 @@ pub fn decode_loop(
         let ev = serde_json::json!({ "type": "token", "id": ctx.id, "text": frag });
         let _ = writeln!(ctx.sink, "{ev}");
         let _ = ctx.sink.flush();
+        if first_token_ms.is_none() {
+            first_token_ms = Some(decode_t0.elapsed().as_secs_f64() * 1000.0);
+        }
         generated += 1;
         committed.push(next);
 
@@ -600,7 +640,35 @@ pub fn decode_loop(
         )?;
     }
 
-    let done = serde_json::json!({ "type": "done", "id": ctx.id, "tokens": generated });
+    let _ = gpu.hip.device_synchronize();
+    let decode_ms = decode_t0.elapsed().as_secs_f64() * 1000.0;
+    let decode_secs = (decode_ms / 1000.0).max(1.0e-9);
+    let decode_tok_s = generated as f64 / decode_secs;
+    let prefill_tok_s = timing
+        .prefill_ms
+        .map(|ms| prompt_tokens as f64 / (ms / 1000.0).max(1.0e-9));
+    let ttft_ms = match (timing.prefill_ms, first_token_ms) {
+        (Some(prefill), Some(first)) => Some(prefill + first),
+        (None, Some(first)) => Some(first),
+        _ => None,
+    };
+    let finish_reason = match stop {
+        StopReason::MaxTokens if generated >= ctx.max_tokens => "length",
+        StopReason::MaxTokens => "stop",
+        StopReason::Eos | StopReason::StopSequence => "stop",
+    };
+    let done = serde_json::json!({
+        "type": "done",
+        "id": ctx.id,
+        "tokens": generated,
+        "tok_s": decode_tok_s,
+        "prefill_tokens": prompt_tokens,
+        "prefill_ms": timing.prefill_ms,
+        "prefill_tok_s": prefill_tok_s,
+        "decode_tok_s": decode_tok_s,
+        "ttft_ms": ttft_ms,
+        "finish_reason": finish_reason,
+    });
     let _ = writeln!(ctx.sink, "{done}");
     let _ = ctx.sink.flush();
 
@@ -608,5 +676,8 @@ pub fn decode_loop(
         prompt_tokens,
         tokens_generated: generated,
         stop_reason: stop,
+        prefill_ms: timing.prefill_ms,
+        decode_ms: Some(decode_ms),
+        ttft_ms,
     })
 }

@@ -1897,6 +1897,7 @@ pub fn generate(
             assistant_prefix,
             tools,
             messages_history,
+            evidence_dir,
         );
         return;
     }
@@ -1926,6 +1927,7 @@ pub fn generate(
             assistant_prefix,
             tools,
             messages_history,
+            evidence_dir,
         );
         return;
     }
