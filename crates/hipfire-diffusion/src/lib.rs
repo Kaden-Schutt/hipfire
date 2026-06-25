@@ -210,6 +210,7 @@ pub struct DiffusionHipPreflight {
     pub linear_kernel_probe: DiffusionHipKernelProbe,
     pub layer_norm_kernel_probe: DiffusionHipKernelProbe,
     pub softmax_kernel_probe: DiffusionHipKernelProbe,
+    pub sdpa_kernel_probe: DiffusionHipKernelProbe,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2692,6 +2693,37 @@ impl DiffusionPipeline {
                 "HIP diffusion softmax kernel output differed from CPU reference".to_string(),
             ));
         }
+        let sdpa_q = CpuTensor {
+            shape: vec![1, 2, 4],
+            data: vec![0.2, -0.4, 0.6, 1.0, -1.2, 0.3, 0.5, -0.7],
+        };
+        let sdpa_k = CpuTensor {
+            shape: vec![1, 3, 4],
+            data: vec![
+                -0.5, 0.25, 0.75, -1.0, 1.25, -0.75, 0.5, 0.0, 0.1, 0.9, -0.3, 0.4,
+            ],
+        };
+        let sdpa_v = CpuTensor {
+            shape: vec![1, 3, 4],
+            data: vec![
+                0.5, -1.0, 0.25, 0.75, -0.4, 0.6, -0.8, 1.2, 1.0, 0.2, -0.5, -0.1,
+            ],
+        };
+        let sdpa_cpu_reference = scaled_dot_product_attention(&sdpa_q, &sdpa_k, &sdpa_v, 2)?;
+        let sdpa_gpu_output =
+            scaled_dot_product_attention_hip_on_gpu(&mut gpu, &sdpa_q, &sdpa_k, &sdpa_v, 2)?;
+        let sdpa_kernel_probe = DiffusionHipKernelProbe {
+            name: "diffusion_sdpa_3d_f32".to_string(),
+            input_elements: sdpa_q.data.len() + sdpa_k.data.len() + sdpa_v.data.len(),
+            output_bytes: sdpa_gpu_output.data.len() * std::mem::size_of::<f32>(),
+            matched_cpu_reference: sdpa_gpu_output.shape == sdpa_cpu_reference.shape
+                && f32_slices_close(&sdpa_gpu_output.data, &sdpa_cpu_reference.data, 1e-5),
+        };
+        if !sdpa_kernel_probe.matched_cpu_reference {
+            return Err(DiffusionError::BackendUnavailable(
+                "HIP diffusion SDPA kernel output differed from CPU reference".to_string(),
+            ));
+        }
 
         Ok(DiffusionHipPreflight {
             device_id: gpu.device_id,
@@ -2710,6 +2742,7 @@ impl DiffusionPipeline {
             linear_kernel_probe,
             layer_norm_kernel_probe,
             softmax_kernel_probe,
+            sdpa_kernel_probe,
         })
     }
 
@@ -5647,6 +5680,65 @@ extern "C" __global__ void diffusion_softmax_rows_f32(
 "#;
 
 #[cfg(feature = "rocm")]
+const DIFFUSION_SDPA_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void diffusion_sdpa_3d_f32(
+    const float* q,
+    const float* k,
+    const float* v,
+    float* output,
+    int total_outputs,
+    int q_seq,
+    int k_seq,
+    int hidden,
+    int heads,
+    int head_dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_outputs) {
+        return;
+    }
+    int d = idx % hidden;
+    int t = idx / hidden;
+    int qi = t % q_seq;
+    int b = t / q_seq;
+    int head = d / head_dim;
+    int head_off = head * head_dim;
+    int local_d = d - head_off;
+    float scale = rsqrtf((float)head_dim);
+
+    float max_score = -INFINITY;
+    for (int ki = 0; ki < k_seq; ++ki) {
+        float dot = 0.0f;
+        for (int hd = 0; hd < head_dim; ++hd) {
+            int q_idx = ((b * q_seq + qi) * hidden) + head_off + hd;
+            int k_idx = ((b * k_seq + ki) * hidden) + head_off + hd;
+            dot += q[q_idx] * k[k_idx];
+        }
+        float score = dot * scale;
+        max_score = fmaxf(max_score, score);
+    }
+
+    float sum = 0.0f;
+    float acc = 0.0f;
+    for (int ki = 0; ki < k_seq; ++ki) {
+        float dot = 0.0f;
+        for (int hd = 0; hd < head_dim; ++hd) {
+            int q_idx = ((b * q_seq + qi) * hidden) + head_off + hd;
+            int k_idx = ((b * k_seq + ki) * hidden) + head_off + hd;
+            dot += q[q_idx] * k[k_idx];
+        }
+        float weight = expf(dot * scale - max_score);
+        int v_idx = ((b * k_seq + ki) * hidden) + head_off + local_d;
+        acc += weight * v[v_idx];
+        sum += weight;
+    }
+    output[idx] = sum > 0.0f ? acc / sum : 0.0f;
+}
+"#;
+
+#[cfg(feature = "rocm")]
 fn rgb_tensor_to_u8_hip_on_gpu(
     gpu: &mut rdna_compute::Gpu,
     tensor: &CpuTensor,
@@ -6616,6 +6708,111 @@ fn softmax_rows_hip_on_gpu(
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
     Ok(CpuTensor {
         shape: input.shape.clone(),
+        data,
+    })
+}
+
+#[cfg(feature = "rocm")]
+fn scaled_dot_product_attention_hip_on_gpu(
+    gpu: &mut rdna_compute::Gpu,
+    q: &CpuTensor,
+    k: &CpuTensor,
+    v: &CpuTensor,
+    heads: usize,
+) -> DiffusionResult<CpuTensor> {
+    let [batch, q_seq, hidden] = shape3(q)?;
+    let [k_batch, k_seq, k_hidden] = shape3(k)?;
+    let [v_batch, v_seq, v_hidden] = shape3(v)?;
+    if batch != k_batch || batch != v_batch || k_seq != v_seq || k_hidden != v_hidden {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "attention q/k/v shapes {:?}/{:?}/{:?} are incompatible",
+            q.shape, k.shape, v.shape
+        )));
+    }
+    if heads == 0 || hidden != k_hidden || hidden % heads != 0 {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "attention hidden size {hidden} is incompatible with key size {k_hidden} and heads {heads}"
+        )));
+    }
+    let head_dim = hidden / heads;
+    let output_shape = [batch, q_seq, hidden];
+    let output_elements = checked_shape_elements("SDPA output", &output_shape)?;
+    if output_elements == 0 {
+        return Ok(CpuTensor::zeros(&output_shape));
+    }
+    let output_bytes = output_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| DiffusionError::InvalidMetadata("SDPA output size overflows".to_string()))?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let q_gpu = gpu
+        .upload_f32(&q.data, &q.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let k_gpu = gpu
+        .upload_f32(&k.data, &k.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let v_gpu = gpu
+        .upload_f32(&v.data, &v.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = gpu
+        .hip
+        .malloc(output_bytes)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = compiler
+        .compile("diffusion_sdpa_3d_f32", DIFFUSION_SDPA_HIP_SRC)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = obj_path
+        .to_str()
+        .ok_or_else(|| {
+            DiffusionError::BackendUnavailable(
+                "compiled diffusion SDPA kernel path is not UTF-8".to_string(),
+            )
+        })?
+        .to_string();
+    let module = gpu
+        .hip
+        .module_load(&obj_path)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let function = gpu
+        .hip
+        .module_get_function(&module, "diffusion_sdpa_3d_f32")
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(q_gpu.buf.as_ptr());
+    kernargs.push_ptr(k_gpu.buf.as_ptr());
+    kernargs.push_ptr(v_gpu.buf.as_ptr());
+    kernargs.push_ptr(output_gpu.as_ptr());
+    kernargs.push_i32(i32_kernel_dim("SDPA output elements", output_elements)?);
+    kernargs.push_i32(i32_kernel_dim("SDPA query sequence", q_seq)?);
+    kernargs.push_i32(i32_kernel_dim("SDPA key sequence", k_seq)?);
+    kernargs.push_i32(i32_kernel_dim("SDPA hidden size", hidden)?);
+    kernargs.push_i32(i32_kernel_dim("SDPA heads", heads)?);
+    kernargs.push_i32(i32_kernel_dim("SDPA head dim", head_dim)?);
+    kernargs.pad_to(16);
+    let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+    unsafe {
+        gpu.hip
+            .launch_kernel_blob(
+                &function,
+                grid,
+                [256, 1, 1],
+                0,
+                gpu.active_stream.as_ref(),
+                kernargs.as_mut_slice(),
+            )
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(CpuTensor {
+        shape: output_shape.to_vec(),
         data,
     })
 }
@@ -13666,6 +13863,50 @@ mod tests {
         for row in hip.data.chunks(5) {
             let sum = row.iter().sum::<f32>();
             assert!((sum - 1.0).abs() <= 1e-6, "softmax row sum {sum}");
+        }
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn hip_sdpa_matches_cpu_reference_when_gpu_is_available() {
+        let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!("skip: ROCm GPU unavailable for SDPA kernel parity test: {error}");
+                return;
+            }
+        };
+        let q = CpuTensor {
+            shape: vec![2, 2, 4],
+            data: vec![
+                0.2, -0.4, 0.6, 1.0, -1.2, 0.3, 0.5, -0.7, 1.0, 0.0, -0.5, 0.25, -0.25, 0.75, -1.0,
+                0.5,
+            ],
+        };
+        let k = CpuTensor {
+            shape: vec![2, 3, 4],
+            data: vec![
+                -0.5, 0.25, 0.75, -1.0, 1.25, -0.75, 0.5, 0.0, 0.1, 0.9, -0.3, 0.4, 0.7, -0.2, 0.3,
+                -0.8, -0.6, 1.1, 0.2, 0.9, 1.5, -1.0, 0.4, -0.1,
+            ],
+        };
+        let v = CpuTensor {
+            shape: vec![2, 3, 4],
+            data: vec![
+                0.5, -1.0, 0.25, 0.75, -0.4, 0.6, -0.8, 1.2, 1.0, 0.2, -0.5, -0.1, -0.9, 0.3, 0.8,
+                -0.2, 0.4, -0.7, 1.1, 0.6, -1.3, 0.5, 0.0, 0.9,
+            ],
+        };
+
+        let cpu = scaled_dot_product_attention(&q, &k, &v, 2).unwrap();
+        let hip = scaled_dot_product_attention_hip_on_gpu(&mut gpu, &q, &k, &v, 2).unwrap();
+
+        assert_eq!(hip.shape, cpu.shape);
+        for (index, (actual, expected)) in hip.data.iter().zip(&cpu.data).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1e-5,
+                "SDPA mismatch at {index}: hip={actual} cpu={expected}"
+            );
         }
     }
 
