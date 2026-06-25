@@ -202,10 +202,10 @@ Print lock status: "gpu is free" or "gpu BUSY: <holder>"
 
 Import and inspect diffusion models stored as .hfq artifacts
 
-Runtime note: runnable `.hfq` diffusion artifacts currently use the native
-CPU reference graph for CLIP text conditioning, VAE decode, and VAE encode for
-img2img. ROCm preflight can validate the planned device buffers plus individual
-diffusion kernels for model-input scaling, classifier-free guidance, Euler
+Runtime note: runnable `.hfq` diffusion artifacts currently use the native CPU
+reference graph for CLIP text conditioning. ROCm preflight can validate the
+planned device buffers plus individual diffusion kernels for model-input
+scaling, classifier-free guidance, Euler
 scheduler updates, centered UNet input, timestep embeddings, RGB-to-VAE tensor
 conversion, VAE moments-to-latents scaling, latent mask downsampling, masked RGB
 inpaint preparation, latent mask blending, residual tensor add, NCHW channel-bias
@@ -221,10 +221,11 @@ scaling, classifier-free guidance, Euler scheduler updates, UNet input
 centering, UNet timestep and SDXL add-time embedding projections, UNet ResNet
 blocks, UNet transformer attention blocks, down/up sampling, channel
 concatenation, and final UNet norm, activation, and conv output, plus final
-decoded tensor-to-RGB conversion for both modes,
-img2img/inpaint RGB-to-VAE tensor conversion, VAE moments-to-latents scaling,
-latent mask downsampling, masked RGB preparation, and final latent mask
-blending. CLIP and VAE graph execution still use the native CPU reference path.
+VAE decode graph execution and decoded tensor-to-RGB conversion for both modes,
+img2img/inpaint RGB-to-VAE tensor conversion, VAE encode graph execution,
+VAE moments-to-latents scaling, latent mask downsampling, masked RGB
+preparation, and final latent mask blending. CLIP text conditioning still uses
+the native CPU reference path.
 The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128,
 HFQ4G256, and HFQ6G256 tensor payloads even when the artifact `weight_format`
 records a future quantized format such as `oq4`; OQ/MQ/HFP and other packed
