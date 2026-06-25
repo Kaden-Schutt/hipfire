@@ -14,7 +14,7 @@ ReLU²-MLP hybrid).
 | FU3 | quantizer → nemotron_h mq4/q8 .hfq | **DONE** — mq4 protects Nemotron residual writers as q8 |
 | FU4 | loader compat (load .hfq + quantized gemv) + serving | **DONE** |
 | FU5 | N6 batched prefill + q8 SSM state | **mostly done** — batched HFQ benchmark captured; q8 state opt-in validated |
-| FU6 | Nano-30B MoE ('E' block) | started — parser/config + isolated decode MoE block validated |
+| FU6 | Nano-30B MoE ('E' block) | in progress — 30B MQ4/HFQ artifact built; Hipfire decode smoke passes |
 | FU1 | chat-template / coherence | blocked (EOS/Jinja/CLI controls fixed; vLLM reference is coherent; Hipfire/native-HF diverge at first token) |
 
 ## FU1 update (2026-06-25)
@@ -239,7 +239,7 @@ Validation run locally on gfx1151:
    prefill uses a single masked-flash block (`block_cols=seq`); shared-mem scales
    with seq. Fine for normal prompts; long-context needs block tiling.
 
-## FU6 (Nano-30B MoE) — started
+## FU6 (Nano-30B MoE) — in progress
 
 Same `nemotron_h` arch but hidden=2688, 52 layers, pattern `MEMEM*EMEM…` →
 introduces a new **'E' (MoE) block**. The first bounded slice is now in place:
@@ -267,11 +267,26 @@ introduces a new **'E' (MoE) block**. The first bounded slice is now in place:
   prefill is intentionally not enabled yet.
 - Validation: `cargo run -p hipfire-arch-nemotron --example test_moe_gpu`
   passes on gfx1151 with max|Δ|=4.47e-8 against the CPU oracle.
+- The real 30B checkpoint was quantized with the rebuilt `hipfire-quantize`
+  mq4 policy to
+  `/home/sadara/.hipfire/models/nemotron-3-nano-30b-a3b-mq4.hfq`.
+  Quantization evidence from `/tmp/nemotron30b-quant.log`:
+  31,577,940,288 total params, 31,576,989,696 quantized params, mean quant
+  error 0.00094749, max quant error 0.05048829, `Done: 25681.0 MB written`.
+  Artifact sha256:
+  `3660ae47c8f7309110d85ee2c013629cb6437b2fdfbb76d41a1a7cb3a49fe2f6`.
+- `test_load_nano30b_hfq` now validates the real HFQ artifact through the
+  Hipfire path: load config + HFQ, assert MoE disables batched prefill, decode
+  a short prompt, and fail on non-finite logits. Local gfx1151 smoke passed:
+  `pos 0 tok 1784: argmax=1044`, `pos 1 tok 8961: argmax=1044`,
+  `PASS: Nemotron 30B HFQ loaded and decoded 2 token(s), final argmax=1044`.
 
-Remaining FU6 work is full-model integration at 30B scale: choose/build the
-actual 30B HFQ format policy (current MQ4G256 falls back to Q8 on many
-Nemotron-H ragged dimensions), load/serve the real A3B checkpoint, and add a
-batched/expert-sorted MoE prefill path if 30B prefill throughput matters.
+Remaining FU6 work is daemon/server integration at 30B scale: route the real
+A3B artifact through the serving surface, collect generation/coherence evidence,
+and add a batched/expert-sorted MoE prefill path if 30B prefill throughput
+matters. The current policy is an ingress policy, not a quality-promoted
+calibration policy; router tensors are Q8-protected, but expert promotion still
+needs router-hit and quality evidence before any "better than baseline" claim.
 
 ## FU1 (coherence) — standing blocker
 
@@ -310,6 +325,7 @@ cargo run -p hipfire-arch-nemotron --example test_block_prefill_gpu  # Mamba blo
 cargo run -p hipfire-arch-nemotron --example test_mlp_prefill_gpu    # MLP block
 cargo run -p hipfire-arch-nemotron --example test_attn_prefill_gpu   # attention block
 cargo run -p hipfire-arch-nemotron --example test_moe_gpu            # MoE block
+cargo run -p hipfire-arch-nemotron --example test_load_nano30b_hfq   # real 30B HFQ decode
 cargo run -p hipfire-arch-nemotron --example test_model_prefill_gpu  # full model (FU5 gate)
 cargo run -p hipfire-arch-nemotron --example test_model_prefill_hfq_gpu # full HFQ model
 cargo run -p hipfire-arch-nemotron --example hfq_vs_f32              # FU4 quant loader

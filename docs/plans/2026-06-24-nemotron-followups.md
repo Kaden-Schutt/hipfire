@@ -263,7 +263,11 @@ isolated decode-first `MoeRelu2Gpu` block are now implemented. The live 30B
 safetensors index uses split 2D per-expert tensors:
 `backbone.layers.L.mixer.experts.E.{up_proj,down_proj}.weight`, plus
 `mixer.gate.weight`, `mixer.gate.e_score_correction_bias`, and
-`mixer.shared_experts.{up_proj,down_proj}.weight`.
+`mixer.shared_experts.{up_proj,down_proj}.weight`. The first full 30B ingress
+artifact now exists at
+`/home/sadara/.hipfire/models/nemotron-3-nano-30b-a3b-mq4.hfq` (sha256
+`3660ae47c8f7309110d85ee2c013629cb6437b2fdfbb76d41a1a7cb3a49fe2f6`,
+25,681.0 MB written).
 
 **Approach.**
 1. **Done:** `BlockKind::Moe` ('E'); `parse_block_pattern`; `mixer_profile`
@@ -275,15 +279,21 @@ safetensors index uses split 2D per-expert tensors:
    experts. This reuses existing `MlpRelu2Gpu` blocks and the existing
    DeepSeek/LFM2-style top-k router primitive. The modeling source confirms
    ReLU² MLP experts, not SwiGLU.
-4. **Started:** loader/model arms for safetensors and HFQ tensor names are wired.
-   `hipfire-quantize` also classifies split Nemotron MoE weights as
-   quantizable, keeps `gate.e_score_correction_bias` out of lossy quantization,
-   and Q8-protects `*.mixer.gate.weight` routers.
-5. **Remaining:** choose/build the actual Nano-30B HFQ artifact policy, run
-   end-to-end load/serve validation, and add a batched expert-sorted MoE prefill
-   path if 30B prefill throughput matters. The artifact policy is still open
-   because current MQ4G256 falls back to Q8 on many Nemotron-H ragged dimensions.
-   Current `can_batched_prefill()` is false when any `E` block is present.
+4. **Done for decode ingress:** loader/model arms for safetensors and HFQ tensor
+   names are wired. `hipfire-quantize` also classifies split Nemotron MoE weights
+   as quantizable, keeps `gate.e_score_correction_bias` out of lossy
+   quantization, and Q8-protects `*.mixer.gate.weight` routers.
+5. **Done for artifact ingress:** rebuilt `hipfire-quantize --format mq4`
+   produced the real Nano-30B HFQ artifact. Quantization summary:
+   31,577,940,288 total params, mean quant error 0.00094749, max quant error
+   0.05048829, 25,681.0 MB written. `test_load_nano30b_hfq` loaded that artifact
+   on gfx1151 and decoded two tokens with finite logits.
+6. **Remaining:** route the real 30B artifact through daemon/server generation,
+   collect coherence evidence, and add a batched expert-sorted MoE prefill path
+   if 30B prefill throughput matters. Current `can_batched_prefill()` is false
+   when any `E` block is present. The artifact policy is still an ingress
+   policy, not a quality-promoted calibration policy; expert promotion needs
+   router-hit and quality deltas.
 
 **Reuse.** qwen35/lfm2moe MoE kernels + routing (the big lever); the existing
 M/*/- blocks unchanged.
@@ -298,10 +308,13 @@ residency; A3B = 3B active so decode is cheap, but BF16 weights are ~63 GB —
 **mq4/q8 HFQ effectively required**, so this pairs with #3/#4).
 
 **Validation.** `cargo run -p hipfire-arch-nemotron --example test_moe_gpu`
-passes on gfx1151 with max|Δ|=4.47e-8 against the CPU oracle. Remaining
-validation: quantize/load Nano-30B HFQ, then serve Nano-30B → coherent. Also
-`MEMEM*E…` has runs like `EM` and `M*` — confirm the flat-block residual handles
-consecutive same-FFN/mixer blocks (it does; each char is its own residual block).
+passes on gfx1151 with max|Δ|=4.47e-8 against the CPU oracle.
+`cargo run -p hipfire-arch-nemotron --example test_load_nano30b_hfq --
+/home/sadara/.hipfire/models/nemotron-3-nano-30b-a3b-mq4.hfq` loads the real
+30B HFQ artifact and decodes two tokens: final argmax=1044. Remaining
+validation: serve Nano-30B → coherent. Also `MEMEM*E…` has runs like `EM` and
+`M*` — confirm the flat-block residual handles consecutive same-FFN/mixer blocks
+(it does; each char is its own residual block).
 
 ---
 
