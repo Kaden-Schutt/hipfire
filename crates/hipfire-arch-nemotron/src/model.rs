@@ -195,7 +195,7 @@ impl NemotronModel {
         let vocab = cfg.vocab_size;
         let dims = cfg.mamba2_dims();
         let batched_prefill = !cfg.blocks.iter().any(|b| *b == BlockKind::Moe);
-        let out_proj_scale = 1.0f32 / (cfg.num_layers as f32).sqrt();
+        let out_proj_scale = cfg.mamba_out_proj_runtime_scale();
         let e = |x: hip_bridge::HipError| format!("nemotron hfq gpu: {x:?}");
 
         let embeddings =

@@ -14,7 +14,7 @@ ReLU²-MLP hybrid).
 | FU3 | quantizer → nemotron_h mq4/q8 .hfq | **DONE** — mq4 protects Nemotron residual writers as q8 |
 | FU4 | loader compat (load .hfq + quantized gemv) + serving | **DONE** |
 | FU5 | N6 batched prefill + q8 SSM state | **mostly done** — batched HFQ benchmark captured; q8 state opt-in validated |
-| FU6 | Nano-30B MoE ('E' block) | in progress — 30B MQ4/HFQ artifact built; Hipfire decode smoke passes |
+| FU6 | Nano-30B MoE ('E' block) | in progress — 30B MQ4/HFQ artifact built; Mamba scale fix restores closed-think 2+2 |
 | FU1 | chat-template / coherence | blocked (EOS/Jinja/CLI controls fixed; vLLM reference is coherent; Hipfire/native-HF diverge at first token) |
 
 ## FU1 update (2026-06-25)
@@ -297,19 +297,39 @@ introduces a new **'E' (MoE) block**. The first bounded slice is now in place:
   top-2 margin 3.125. The run used `torch=2.12.0a0+rocm7.13.0a20260411`,
   `mamba_import=real`, `mamba_reference=remote`, and restored 23 trained
   `dt_bias` tensors.
-- The current 30B HFQ artifact is not close at that boundary:
-  `test_load_nano30b_hfq` over the same 29 prompt IDs reports final argmax
-  `1044` at every position, matching the daemon's comma loop. This makes the
-  immediate FU6 blocker a concrete BF16-reference-vs-HFQ divergence, not a
-  tokenizer or prompt-rendering mismatch.
+- The 30B HFQ-vs-BF16 bisect found the old comma loop's root cause: Hipfire was
+  applying the dense Nano-4B Mamba `out_proj.weight` runtime scale
+  (`1/sqrt(num_layers)`) to the MoE 30B checkpoint. CPU layer-0 reconstruction
+  from safetensors plus the Lyra dump shows Nano-4B matches BF16 with that
+  scale, while Nano-30B-A3B matches BF16 only with no extra runtime scale. The
+  fix is `NemotronHConfig::mamba_out_proj_runtime_scale()`: dense 4B keeps the
+  scale, MoE variants use `1.0`.
+- With the scale fix and the original canonical artifact
+  `/home/sadara/.hipfire/models/nemotron-3-nano-30b-a3b-mq4.hfq`,
+  `test_load_nano30b_hfq` over the same 29 prompt IDs now reports final argmax
+  `1052` (`4`). The HFQ-vs-BF16 bisect moves the first divergence from
+  `hidden_1` to `hidden_2`, and final logits are close enough to preserve the
+  reference top token: HF top-5 `[1052, 31035, 1784, 1050, 31106]`, Hipfire
+  top-5 `[1052, 1784, 1050, 31035, 31106]`, logit rel delta `0.0454`.
+- A rebuilt exploratory artifact with Mamba `in_proj` promoted to Q8,
+  `/home/sadara/.hipfire/models/nemotron-3-nano-30b-a3b-inproj-q8-mq4.hfq`
+  (sha256
+  `49cdf0b534729bebc24ede0b8c243a848cf06b38ac06e61d20c72cdf7e37743f`,
+  25,999.5 MB written), is slightly closer at the same boundary
+  (logit rel delta `0.0386`) but is not required for the basic coherence fix.
+- `HIPFIRE_DAEMON_BIN=target/debug/hipfire-daemon ./target/debug/hipfire chat
+  --model /home/sadara/.hipfire/models/nemotron-3-nano-30b-a3b-mq4.hfq
+  --temperature 0 --max-tokens 16 "Answer in one short sentence: What is 2+2?"`
+  returns `4` in one token. Without `HIPFIRE_DAEMON_BIN`, this checkout can still
+  pick the older installed daemon, which lacks the scale fix and may fail before
+  arch dispatch.
 
-Remaining FU6 work is coherence and throughput at 30B scale: bisect the 30B
-HFQ-vs-BF16 first-token divergence, decide whether the ingress policy is too
-lossy, and add a batched/expert-sorted MoE prefill path if 30B prefill
-throughput matters. The current policy is an ingress policy, not a
-quality-promoted calibration policy; router tensors are Q8-protected, but
-expert promotion still needs router-hit and quality evidence before any "better
-than baseline" claim.
+Remaining FU6 work is throughput and admission-quality evidence at 30B scale:
+add a batched/expert-sorted MoE prefill path if 30B prefill throughput matters,
+and run broader quality/perf evidence before promoting any changed quant policy.
+The current policy is still an ingress policy, not a quality-promoted
+calibration policy; router tensors are Q8-protected, but expert promotion still
+needs router-hit and quality evidence before any "better than baseline" claim.
 
 ## FU1 (coherence) — standing blocker
 

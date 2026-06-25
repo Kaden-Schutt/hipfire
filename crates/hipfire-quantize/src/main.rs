@@ -2757,13 +2757,22 @@ fn is_conv1d_tensor(name: &str) -> bool {
     name.ends_with("conv1d.weight")
 }
 
-/// Nemotron-H projections that write back into the residual stream.
+/// Nemotron-H projections that should stay Q8 in MQ-family artifacts.
 ///
 /// Local Nano-4B evidence (native-Mamba Python reference + Hipfire f32/Q8/MQ4
 /// comparison) shows uncalibrated MQ4 flips the close first-token boundary from
-/// `<|im_end|>` to newline when these projection-back weights are lossy. Keep
-/// them Q8 for base MQ4-family artifacts until an imatrix/AWQ/Lloyd policy is
-/// validated for this arch.
+/// `<|im_end|>` to newline when projection-back weights are lossy. Nano-30B
+/// bring-up also marked `mixer.in_proj.weight` as ingress-sensitive: it
+/// generates the SSM gate, x, B/C, and dt streams, and the Q8 candidate moved
+/// the fixed-scale boundary slightly closer to BF16. Keep both classes Q8 for
+/// base MQ-family artifacts until an imatrix/AWQ/Lloyd policy is validated for
+/// this arch.
+fn is_nemotron_h_mq4_q8_protected(name: &str) -> bool {
+    name.starts_with("backbone.layers.")
+        && (name.ends_with(".mixer.in_proj.weight") || is_nemotron_h_residual_writer(name))
+}
+
+/// Nemotron-H projections that write back into the residual stream.
 fn is_nemotron_h_residual_writer(name: &str) -> bool {
     name.starts_with("backbone.layers.")
         && (name.ends_with(".mixer.out_proj.weight")
@@ -3052,7 +3061,7 @@ fn quantize_hfq_source_tensor(
             )
         }
         HfqInputFormat::Mq4 => {
-            if is_nemotron_h_residual_writer(name) {
+            if is_nemotron_h_mq4_q8_protected(name) {
                 return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
             }
             if k % 256 != 0 {
@@ -7756,7 +7765,7 @@ fn main() {
                     } else if use_mq4_family && is_embed {
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                    } else if use_mq4_family && is_nemotron_h_residual_writer(name) {
+                    } else if use_mq4_family && is_nemotron_h_mq4_q8_protected(name) {
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
                     } else if use_mq4_family {
@@ -11590,32 +11599,25 @@ mod tests {
     }
 
     #[test]
-    fn hfq_input_nemotron_mq4_promotes_residual_writers_to_q8() {
+    fn hfq_input_nemotron_mq4_promotes_sensitive_mamba_paths_to_q8() {
         let raw = f32_slice_to_f16_bytes(&vec![0.125; 2 * 256]);
 
-        let (_, qt, group, label) = quantize_hfq_source_tensor(
-            "backbone.layers.0.mixer.out_proj.weight",
-            &raw,
-            QuantType::F16 as u8,
-            &[2, 256],
-            HfqInputFormat::Mq4,
-        )
-        .unwrap();
-        assert_eq!(qt as u8, QuantType::Q8F16 as u8);
-        assert_eq!(group, 32);
-        assert_eq!(label, "Q8_F16");
-
-        let (_, qt, group, label) = quantize_hfq_source_tensor(
+        for name in [
             "backbone.layers.0.mixer.in_proj.weight",
-            &raw,
-            QuantType::F16 as u8,
-            &[2, 256],
-            HfqInputFormat::Mq4,
-        )
-        .unwrap();
-        assert_eq!(qt as u8, QuantType::MQ4G256 as u8);
-        assert_eq!(group, 256);
-        assert_eq!(label, "MQ4G256");
+            "backbone.layers.0.mixer.out_proj.weight",
+        ] {
+            let (_, qt, group, label) = quantize_hfq_source_tensor(
+                name,
+                &raw,
+                QuantType::F16 as u8,
+                &[2, 256],
+                HfqInputFormat::Mq4,
+            )
+            .unwrap();
+            assert_eq!(qt as u8, QuantType::Q8F16 as u8, "{name}");
+            assert_eq!(group, 32, "{name}");
+            assert_eq!(label, "Q8_F16", "{name}");
+        }
     }
 
     fn roughquant4_test_tensor(name: &str, shape: &[u32]) -> HfqTensor {
@@ -11853,14 +11855,15 @@ mod tests {
         );
 
         for n in [
+            "backbone.layers.0.mixer.in_proj.weight",
             "backbone.layers.0.mixer.out_proj.weight",
             "backbone.layers.1.mixer.down_proj.weight",
             "backbone.layers.12.mixer.o_proj.weight",
         ] {
-            assert!(is_nemotron_h_residual_writer(n), "{n} should be protected");
+            assert!(is_nemotron_h_mq4_q8_protected(n), "{n} should be protected");
         }
-        assert!(!is_nemotron_h_residual_writer(
-            "backbone.layers.0.mixer.in_proj.weight"
+        assert!(!is_nemotron_h_mq4_q8_protected(
+            "backbone.layers.0.mixer.up_proj.weight"
         ));
     }
 

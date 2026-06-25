@@ -290,20 +290,25 @@ artifact now exists at
    on gfx1151 and decoded two tokens with finite logits.
 6. **Done for daemon ingress:** `hipfire-daemon` loads the real 30B HFQ artifact
    via JSONL and reports `arch=nemotron_h`, `dim=2688`, `layers=52`,
-   `vocab=131072`; stderr reports `(23 M / 6 * / 0 - / 23 E)`. Greedy
-   closed-think 2+2 currently emits an 8-token comma loop, so generation is
-   wired but not coherent.
+   `vocab=131072`; stderr reports `(23 M / 6 * / 0 - / 23 E)`.
 7. **Done for 30B BF16 reference boundary:** Lyra real-Mamba Transformers on the
    same prompt IDs generates token `1052` (`4`) with final top-5
-   `[1052, 31035, 1784, 1050, 31106]`. The current Hipfire 30B HFQ artifact
-   returns argmax `1044` at the same final boundary, matching the daemon comma
-   loop.
-8. **Remaining:** bisect the 30B HFQ-vs-BF16 first-token divergence, decide
-   whether this ingress policy is too lossy, and add a batched expert-sorted MoE
-   prefill path if 30B prefill throughput matters. Current
-   `can_batched_prefill()` is false when any `E` block is present. The artifact
-   policy is still an ingress policy, not a quality-promoted calibration policy;
-   expert promotion needs router-hit and quality deltas.
+   `[1052, 31035, 1784, 1050, 31106]`. The current Hipfire 30B HFQ artifact now
+   returns argmax `1052` at the same final boundary after the Mamba out-proj
+   runtime-scale fix.
+8. **Done for the comma-loop root cause:** the first HFQ-vs-BF16 divergence was
+   immediate at `hidden_1` because the MoE 30B checkpoint was double-scaling
+   Mamba `out_proj.weight` by the dense Nano-4B runtime factor
+   `1/sqrt(num_layers)`. `NemotronHConfig::mamba_out_proj_runtime_scale()` keeps
+   the scale for dense Nano-4B and uses `1.0` for MoE variants. With the original
+   canonical artifact, final logits at the closed-think 2+2 boundary have rel
+   delta `0.0454` and preserve the BF16 top token `1052` (`4`).
+9. **Remaining:** add a batched expert-sorted MoE prefill path if 30B prefill
+   throughput matters, and collect broader quality/perf evidence before
+   promoting any quant-policy change. Current `can_batched_prefill()` is false
+   when any `E` block is present. The artifact policy is still an ingress policy,
+   not a quality-promoted calibration policy; expert promotion needs router-hit
+   and quality deltas.
 
 **Reuse.** qwen35/lfm2moe MoE kernels + routing (the big lever); the existing
 M/*/- blocks unchanged.
@@ -321,10 +326,12 @@ residency; A3B = 3B active so decode is cheap, but BF16 weights are ~63 GB —
 passes on gfx1151 with max|Δ|=4.47e-8 against the CPU oracle.
 `cargo run -p hipfire-arch-nemotron --example test_load_nano30b_hfq --
 /home/sadara/.hipfire/models/nemotron-3-nano-30b-a3b-mq4.hfq` loads the real
-30B HFQ artifact and decodes two tokens: final argmax=1044. The daemon JSONL
-path also load/generate/unloads the artifact, but greedy closed-think 2+2 emits
-`,,,,,,,,`. Lyra real-Mamba BF16 for the same prompt generates `4`, so remaining
-validation is first-divergence bisect and a better ingress/calibrated policy.
+30B HFQ artifact and, over the full 29-token closed-think 2+2 prompt, returns
+final argmax=1052 (`4`). With `HIPFIRE_DAEMON_BIN=target/debug/hipfire-daemon`,
+`hipfire chat --model ... --temperature 0 --max-tokens 16 "Answer in one short
+sentence: What is 2+2?"` returns `4` in one token. Lyra real-Mamba BF16 for the
+same prompt also generates `4`; remaining validation is broader quality/perf
+evidence and MoE batched-prefill throughput work.
 Also `MEMEM*E…` has runs like `EM` and `M*` — confirm the flat-block residual
 handles consecutive same-FFN/mixer blocks (it does; each char is its own
 residual block).

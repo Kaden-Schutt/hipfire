@@ -79,13 +79,10 @@ pub fn load_nemotron_weights(
         get(src, "lm_head.weight")?
     };
 
-    // nemotron_h applies the GPT-2 residual-rescale (`_init_weights`,
-    // `rescale_prenorm_residual`) to the Mamba mixer `out_proj.weight` at LOAD:
-    // `out_proj /= sqrt(num_layers)`. The checkpoint stores the un-rescaled
-    // weight, so we must apply it here to match the reference forward (verified
-    // exact vs the HF dump: ratio == sqrt(num_layers)). Only the Mamba
-    // `out_proj` is rescaled — NOT attention `o_proj` or MLP `down_proj`.
-    let out_proj_scale = 1.0f32 / (cfg.num_layers as f32).sqrt();
+    // Nemotron-H Mamba out-proj scaling is checkpoint-family specific. Dense
+    // Nano-4B needs the GPT-style residual rescale applied at load; Nano-30B MoE
+    // already matches the HF reference with stored bytes.
+    let out_proj_scale = cfg.mamba_out_proj_runtime_scale();
 
     let mut layer_norm = Vec::with_capacity(cfg.num_layers);
     let mut blocks = Vec::with_capacity(cfg.num_layers);
