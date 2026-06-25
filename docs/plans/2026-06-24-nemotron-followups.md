@@ -288,12 +288,18 @@ artifact now exists at
    31,577,940,288 total params, mean quant error 0.00094749, max quant error
    0.05048829, 25,681.0 MB written. `test_load_nano30b_hfq` loaded that artifact
    on gfx1151 and decoded two tokens with finite logits.
-6. **Remaining:** route the real 30B artifact through daemon/server generation,
-   collect coherence evidence, and add a batched expert-sorted MoE prefill path
-   if 30B prefill throughput matters. Current `can_batched_prefill()` is false
-   when any `E` block is present. The artifact policy is still an ingress
-   policy, not a quality-promoted calibration policy; expert promotion needs
-   router-hit and quality deltas.
+6. **Done for daemon ingress:** `hipfire-daemon` loads the real 30B HFQ artifact
+   via JSONL and reports `arch=nemotron_h`, `dim=2688`, `layers=52`,
+   `vocab=131072`; stderr reports `(23 M / 6 * / 0 - / 23 E)`. Greedy
+   closed-think 2+2 currently emits an 8-token comma loop, so generation is
+   wired but not coherent.
+7. **Remaining:** compare the comma-loop boundary against a 30B reference,
+   decide whether this ingress policy is too lossy or there is a generation
+   convention mismatch, and add a batched expert-sorted MoE prefill path if 30B
+   prefill throughput matters. Current `can_batched_prefill()` is false when any
+   `E` block is present. The artifact policy is still an ingress policy, not a
+   quality-promoted calibration policy; expert promotion needs router-hit and
+   quality deltas.
 
 **Reuse.** qwen35/lfm2moe MoE kernels + routing (the big lever); the existing
 M/*/- blocks unchanged.
@@ -311,10 +317,12 @@ residency; A3B = 3B active so decode is cheap, but BF16 weights are ~63 GB —
 passes on gfx1151 with max|Δ|=4.47e-8 against the CPU oracle.
 `cargo run -p hipfire-arch-nemotron --example test_load_nano30b_hfq --
 /home/sadara/.hipfire/models/nemotron-3-nano-30b-a3b-mq4.hfq` loads the real
-30B HFQ artifact and decodes two tokens: final argmax=1044. Remaining
-validation: serve Nano-30B → coherent. Also `MEMEM*E…` has runs like `EM` and
-`M*` — confirm the flat-block residual handles consecutive same-FFN/mixer blocks
-(it does; each char is its own residual block).
+30B HFQ artifact and decodes two tokens: final argmax=1044. The daemon JSONL
+path also load/generate/unloads the artifact, but greedy closed-think 2+2 emits
+`,,,,,,,,`; remaining validation is coherent generation against a 30B reference.
+Also `MEMEM*E…` has runs like `EM` and `M*` — confirm the flat-block residual
+handles consecutive same-FFN/mixer blocks (it does; each char is its own
+residual block).
 
 ---
 

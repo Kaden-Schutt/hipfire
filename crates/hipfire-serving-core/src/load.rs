@@ -658,12 +658,13 @@ pub fn load_model(
             cfg.eos_token_id = im_end;
         }
         eprintln!(
-            "  nemotron_h: hidden={}, layers={} ({} M / {} * / {} -), vocab={}, eos={}",
+            "  nemotron_h: hidden={}, layers={} ({} M / {} * / {} - / {} E), vocab={}, eos={}",
             cfg.hidden_size,
             cfg.num_layers,
             cfg.count(hipfire_arch_nemotron::BlockKind::Mamba2),
             cfg.count(hipfire_arch_nemotron::BlockKind::Attention),
             cfg.count(hipfire_arch_nemotron::BlockKind::Mlp),
+            cfg.count(hipfire_arch_nemotron::BlockKind::Moe),
             cfg.vocab_size,
             cfg.eos_token_id,
         );
@@ -2074,12 +2075,13 @@ pub fn load_model_safetensors(
             cfg.eos_token_id = im_end;
         }
         eprintln!(
-            "  nemotron_h: hidden={}, layers={} ({} M / {} * / {} -), vocab={}, eos={}",
+            "  nemotron_h: hidden={}, layers={} ({} M / {} * / {} - / {} E), vocab={}, eos={}",
             cfg.hidden_size,
             cfg.num_layers,
             cfg.count(hipfire_arch_nemotron::BlockKind::Mamba2),
             cfg.count(hipfire_arch_nemotron::BlockKind::Attention),
             cfg.count(hipfire_arch_nemotron::BlockKind::Mlp),
+            cfg.count(hipfire_arch_nemotron::BlockKind::Moe),
             cfg.vocab_size,
             cfg.eos_token_id,
         );

@@ -280,13 +280,21 @@ introduces a new **'E' (MoE) block**. The first bounded slice is now in place:
   a short prompt, and fail on non-finite logits. Local gfx1151 smoke passed:
   `pos 0 tok 1784: argmax=1044`, `pos 1 tok 8961: argmax=1044`,
   `PASS: Nemotron 30B HFQ loaded and decoded 2 token(s), final argmax=1044`.
+- The rebuilt daemon can load/generate/unload the same 30B HFQ artifact through
+  the JSONL serving path. Load response reports
+  `arch=nemotron_h`, `dim=2688`, `layers=52`, `vocab=131072`, and
+  `model_file_bytes=25680997504`; stderr reports the real block mix
+  `(23 M / 6 * / 0 - / 23 E)`. Greedy closed-think 2+2 currently generates an
+  8-token comma loop (`,,,,,,,,`), so serving ingress is wired but coherence is
+  still not validated.
 
-Remaining FU6 work is daemon/server integration at 30B scale: route the real
-A3B artifact through the serving surface, collect generation/coherence evidence,
-and add a batched/expert-sorted MoE prefill path if 30B prefill throughput
-matters. The current policy is an ingress policy, not a quality-promoted
-calibration policy; router tensors are Q8-protected, but expert promotion still
-needs router-hit and quality evidence before any "better than baseline" claim.
+Remaining FU6 work is coherence and throughput at 30B scale: compare the comma
+loop against a reference boundary, decide whether the ingress policy is too
+lossy or a convention mismatch, and add a batched/expert-sorted MoE prefill path
+if 30B prefill throughput matters. The current policy is an ingress policy, not
+a quality-promoted calibration policy; router tensors are Q8-protected, but
+expert promotion still needs router-hit and quality evidence before any "better
+than baseline" claim.
 
 ## FU1 (coherence) — standing blocker
 

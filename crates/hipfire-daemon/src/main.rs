@@ -2731,6 +2731,9 @@ fn main() {
                             (c.dim, c.n_layers, c.vocab_size)
                         } else if let Some(ref c) = m.llama_config {
                             (c.dim, c.n_layers, c.vocab_size)
+                        } else if let Some(ref b) = m.nemotron_backend {
+                            let c = b.config();
+                            (c.hidden_size, c.num_layers, c.vocab_size)
                         } else if let Some(ref c) = m.qwen2_config {
                             (c.hidden_size, c.num_hidden_layers, c.vocab_size)
                         } else if let Some(ref c) = m.dots_ocr_config {
