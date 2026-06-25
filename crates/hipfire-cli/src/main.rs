@@ -54,11 +54,14 @@ enum Command {
     /// request completes. Live per-step latent preview decoding is not
     /// implemented yet.
     ///
-    /// Img2img and inpaint resize init and mask images to the requested output
-    /// dimensions before VAE encoding. Txt2img high-res generation is
-    /// implemented as a batched first-pass txt2img generation followed by a
-    /// second-pass img2img generation at the high-res target dimensions. SDAPI
-    /// high-res requests accept `enable_hr`, `firstphase_width`,
+    /// SDAPI img2img and inpaint resize init and mask images to the requested
+    /// output dimensions before VAE encoding. `resize_mode` supports WebUI
+    /// modes 0 (stretch), 1 (crop and resize), and 2 (resize and fill);
+    /// mode 3 latent upscale is rejected unless no resize is needed. Txt2img
+    /// high-res generation is implemented as a batched first-pass txt2img
+    /// generation followed by a second-pass img2img generation at the high-res
+    /// target dimensions. SDAPI high-res requests accept `enable_hr`,
+    /// `firstphase_width`,
     /// `firstphase_height`, `hr_scale`, `hr_upscaler`, `hr_resize_x`,
     /// `hr_resize_y`, `hr_second_pass_steps`, `hr_checkpoint_name`,
     /// `hr_prompt`, `hr_negative_prompt`, `hr_sampler_name`, and

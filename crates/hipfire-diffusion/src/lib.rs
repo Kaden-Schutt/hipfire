@@ -13449,6 +13449,93 @@ pub fn resize_rgb_batch_to_cover_nearest(
     crop_rgb_batch_center(&resized, target_width, target_height)
 }
 
+pub fn resize_rgb_batch_to_contain_fill_nearest(
+    image: &RgbImageBatch,
+    target_width: u32,
+    target_height: u32,
+) -> DiffusionResult<RgbImageBatch> {
+    let target_width = usize::try_from(target_width).map_err(|_| {
+        DiffusionError::InvalidRequest("target image width does not fit usize".to_string())
+    })?;
+    let target_height = usize::try_from(target_height).map_err(|_| {
+        DiffusionError::InvalidRequest("target image height does not fit usize".to_string())
+    })?;
+    if target_width == 0 || target_height == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "target image dimensions must be positive".to_string(),
+        ));
+    }
+    if image.width == 0 || image.height == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "source image dimensions must be positive".to_string(),
+        ));
+    }
+
+    let source_w = image.width as u128;
+    let source_h = image.height as u128;
+    let target_w = target_width as u128;
+    let target_h = target_height as u128;
+    let (fit_width, fit_height) = if target_w * source_h < source_w * target_h {
+        let height = ((target_w * source_h) / source_w).max(1);
+        (target_w, height)
+    } else {
+        let width = ((target_h * source_w) / source_h).max(1);
+        (width, target_h)
+    };
+    let fit_width = usize::try_from(fit_width).map_err(|_| {
+        DiffusionError::InvalidRequest("contained image width is out of range".to_string())
+    })?;
+    let fit_height = usize::try_from(fit_height).map_err(|_| {
+        DiffusionError::InvalidRequest("contained image height is out of range".to_string())
+    })?;
+    let fit_width_u32 = u32::try_from(fit_width).map_err(|_| {
+        DiffusionError::InvalidRequest("contained image width is out of range".to_string())
+    })?;
+    let fit_height_u32 = u32::try_from(fit_height).map_err(|_| {
+        DiffusionError::InvalidRequest("contained image height is out of range".to_string())
+    })?;
+    let resized = resize_rgb_batch_nearest(image, fit_width_u32, fit_height_u32)?;
+    if fit_width == target_width && fit_height == target_height {
+        return Ok(resized);
+    }
+
+    let paste_x = (target_width - fit_width) / 2;
+    let paste_y = (target_height - fit_height) / 2;
+    let target_image_bytes = target_width
+        .checked_mul(target_height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| {
+            DiffusionError::InvalidRequest("target image dimensions overflow".to_string())
+        })?;
+    let resized_image_bytes = fit_width
+        .checked_mul(fit_height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| {
+            DiffusionError::InvalidRequest("contained image dimensions overflow".to_string())
+        })?;
+    let mut data = vec![0u8; image.batch * target_image_bytes];
+    for batch_idx in 0..image.batch {
+        let resized_batch_offset = batch_idx * resized_image_bytes;
+        let target_batch_offset = batch_idx * target_image_bytes;
+        for y in 0..target_height {
+            let resized_y = y.saturating_sub(paste_y).min(fit_height - 1);
+            for x in 0..target_width {
+                let resized_x = x.saturating_sub(paste_x).min(fit_width - 1);
+                let source_idx = resized_batch_offset + ((resized_y * fit_width + resized_x) * 3);
+                let target_idx = target_batch_offset + ((y * target_width + x) * 3);
+                data[target_idx..target_idx + 3]
+                    .copy_from_slice(&resized.data[source_idx..source_idx + 3]);
+            }
+        }
+    }
+    Ok(RgbImageBatch {
+        batch: image.batch,
+        width: target_width,
+        height: target_height,
+        data,
+    })
+}
+
 fn crop_rgb_batch_center(
     image: &RgbImageBatch,
     target_width: usize,
@@ -19708,6 +19795,36 @@ mod tests {
                 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, //
                 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, //
                 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, //
+            ]
+        );
+    }
+
+    #[test]
+    fn rgb_batch_resize_to_contain_fill_extends_edges() {
+        let image = RgbImageBatch {
+            batch: 1,
+            width: 2,
+            height: 4,
+            data: vec![
+                10, 10, 10, 11, 11, 11, //
+                20, 20, 20, 21, 21, 21, //
+                30, 30, 30, 31, 31, 31, //
+                40, 40, 40, 41, 41, 41, //
+            ],
+        };
+
+        let resized = resize_rgb_batch_to_contain_fill_nearest(&image, 4, 4).unwrap();
+
+        assert_eq!(resized.batch, 1);
+        assert_eq!(resized.width, 4);
+        assert_eq!(resized.height, 4);
+        assert_eq!(
+            resized.data,
+            vec![
+                10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, //
+                20, 20, 20, 20, 20, 20, 21, 21, 21, 21, 21, 21, //
+                30, 30, 30, 30, 30, 30, 31, 31, 31, 31, 31, 31, //
+                40, 40, 40, 40, 40, 40, 41, 41, 41, 41, 41, 41, //
             ]
         );
     }

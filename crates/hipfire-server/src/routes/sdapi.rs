@@ -6,7 +6,8 @@ use axum::{
 use base64::Engine;
 use hipfire_config::models_dir;
 use hipfire_diffusion::{
-    inspect_hfq, inspect_hfq_with_runtime_support, resize_rgb_batch_to_cover_nearest,
+    inspect_hfq, inspect_hfq_with_runtime_support, resize_rgb_batch_nearest,
+    resize_rgb_batch_to_contain_fill_nearest, resize_rgb_batch_to_cover_nearest,
     DiffusionBatchOutput, DiffusionBatchRequest, DiffusionError, DiffusionGenerationRuntimeOptions,
     DiffusionHfqInspection, DiffusionImg2ImgRequest, DiffusionPipeline, DiffusionProgress,
     DiffusionPrompt, RgbImageBatch,
@@ -57,6 +58,7 @@ pub struct SdGenerationRequest {
     pub infotext: Option<String>,
     pub init_images: Option<Vec<String>>,
     pub mask: Option<String>,
+    pub resize_mode: Option<u32>,
     pub include_init_images: Option<bool>,
     pub denoising_strength: Option<f64>,
     pub enable_hr: Option<bool>,
@@ -504,9 +506,12 @@ async fn execute_hfq_diffusion_img2img(
         Ok(image) => image,
         Err(error) => return diffusion_error_response(error),
     };
-    let default_dimensions = Some((init_image.width as u32, init_image.height as u32));
-    let _first_batch = match sd_request_to_diffusion_batch_request(&body, default_dimensions, 0) {
-        Ok(request) => request,
+    let target_dimensions = match sdapi_img2img_target_dimensions(&body, &init_image) {
+        Ok(dimensions) => dimensions,
+        Err(error) => return diffusion_error_response(error),
+    };
+    let init_image = match sdapi_img2img_resize_image(&body, init_image, target_dimensions) {
+        Ok(image) => image,
         Err(error) => return diffusion_error_response(error),
     };
     let mask = match body
@@ -516,6 +521,18 @@ async fn execute_hfq_diffusion_img2img(
         .transpose()
     {
         Ok(mask) => mask,
+        Err(error) => return diffusion_error_response(error),
+    };
+    let mask = match mask
+        .map(|mask| sdapi_img2img_resize_image(&body, mask, target_dimensions))
+        .transpose()
+    {
+        Ok(mask) => mask,
+        Err(error) => return diffusion_error_response(error),
+    };
+    let default_dimensions = Some(target_dimensions);
+    let _first_batch = match sd_request_to_diffusion_batch_request(&body, default_dimensions, 0) {
+        Ok(request) => request,
         Err(error) => return diffusion_error_response(error),
     };
     let pipeline = match cached_diffusion_pipeline(&state, path).await {
@@ -966,6 +983,50 @@ fn sd_request_to_diffusion_batch_request(
         send_images: body.send_images.unwrap_or(true),
         save_images: body.save_images.unwrap_or(false),
     })
+}
+
+fn sdapi_img2img_target_dimensions(
+    body: &SdGenerationRequest,
+    init_image: &RgbImageBatch,
+) -> Result<(u32, u32), DiffusionError> {
+    let init_width = u32::try_from(init_image.width).map_err(|_| {
+        DiffusionError::InvalidRequest("init image width is out of range".to_string())
+    })?;
+    let init_height = u32::try_from(init_image.height).map_err(|_| {
+        DiffusionError::InvalidRequest("init image height is out of range".to_string())
+    })?;
+    Ok((
+        body.width.unwrap_or(init_width),
+        body.height.unwrap_or(init_height),
+    ))
+}
+
+fn sdapi_img2img_resize_image(
+    body: &SdGenerationRequest,
+    image: RgbImageBatch,
+    target_dimensions: (u32, u32),
+) -> Result<RgbImageBatch, DiffusionError> {
+    match body.resize_mode.unwrap_or(0) {
+        0 => resize_rgb_batch_nearest(&image, target_dimensions.0, target_dimensions.1),
+        1 => resize_rgb_batch_to_cover_nearest(&image, target_dimensions.0, target_dimensions.1),
+        2 => resize_rgb_batch_to_contain_fill_nearest(
+            &image,
+            target_dimensions.0,
+            target_dimensions.1,
+        ),
+        3 if image.width == target_dimensions.0 as usize
+            && image.height == target_dimensions.1 as usize =>
+        {
+            Ok(image)
+        }
+        3 => Err(DiffusionError::InvalidRequest(
+            "resize_mode 3 (latent upscale) is not supported for img2img target resizing yet"
+                .to_string(),
+        )),
+        mode => Err(DiffusionError::InvalidRequest(format!(
+            "unsupported img2img resize_mode {mode}; supported values are 0, 1, 2, and 3"
+        ))),
+    }
 }
 
 fn sd_request_generation_runtime_options(
@@ -2802,14 +2863,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn img2img_route_rejects_mask_dimension_mismatch() {
+    async fn img2img_route_resizes_mask_dimension_mismatch() {
         let dir = std::env::temp_dir().join(format!(
-            "hipfire-sdapi-diffusion-img2img-bad-mask-route-test-{}",
+            "hipfire-sdapi-diffusion-img2img-resize-mask-route-test-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let hfq_path = dir.join("tiny-route-diffusion-img2img-bad-mask.hfq");
+        let hfq_path = dir.join("tiny-route-diffusion-img2img-resize-mask.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
         let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
         let body = SdGenerationRequest {
@@ -2828,12 +2889,15 @@ mod tests {
         };
 
         let response = post_img2img(State(state), Json(body)).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("mask dimensions 1x1 do not match init image 2x2"));
+        let images = body["images"].as_array().unwrap();
+        assert_eq!(images.len(), 1);
+        let info = serde_json::from_str::<Value>(body["info"].as_str().unwrap()).unwrap();
+        assert_eq!(info["mode"], "img2img");
+        assert_eq!(info["masked"], true);
+        assert_eq!(info["width"], 2);
+        assert_eq!(info["height"], 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3925,6 +3989,64 @@ mod tests {
     }
 
     #[test]
+    fn img2img_resize_image_applies_webui_resize_modes() {
+        let image = RgbImageBatch {
+            batch: 1,
+            width: 2,
+            height: 4,
+            data: vec![
+                10, 10, 10, 11, 11, 11, //
+                20, 20, 20, 21, 21, 21, //
+                30, 30, 30, 31, 31, 31, //
+                40, 40, 40, 41, 41, 41, //
+            ],
+        };
+
+        let stretch = SdGenerationRequest {
+            resize_mode: Some(0),
+            ..empty_request()
+        };
+        let stretched = sdapi_img2img_resize_image(&stretch, image.clone(), (4, 4)).unwrap();
+        assert_eq!(stretched.width, 4);
+        assert_eq!(stretched.height, 4);
+        assert_eq!(
+            &stretched.data[..12],
+            &[10u8, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11]
+        );
+
+        let crop = SdGenerationRequest {
+            resize_mode: Some(1),
+            ..empty_request()
+        };
+        let cropped = sdapi_img2img_resize_image(&crop, image.clone(), (4, 4)).unwrap();
+        assert_eq!(cropped.width, 4);
+        assert_eq!(cropped.height, 4);
+        assert_eq!(
+            &cropped.data[..12],
+            &[20u8, 20, 20, 20, 20, 20, 21, 21, 21, 21, 21, 21]
+        );
+
+        let fill = SdGenerationRequest {
+            resize_mode: Some(2),
+            ..empty_request()
+        };
+        let filled = sdapi_img2img_resize_image(&fill, image.clone(), (4, 4)).unwrap();
+        assert_eq!(filled.width, 4);
+        assert_eq!(filled.height, 4);
+        assert_eq!(
+            &filled.data[..12],
+            &[10u8, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11]
+        );
+
+        let latent_upscale = SdGenerationRequest {
+            resize_mode: Some(3),
+            ..empty_request()
+        };
+        let error = sdapi_img2img_resize_image(&latent_upscale, image, (4, 4)).unwrap_err();
+        assert!(error.to_string().contains("latent upscale"));
+    }
+
+    #[test]
     fn txt2img_highres_second_pass_body_applies_prompt_and_sampler_overrides() {
         let body = SdGenerationRequest {
             prompt: "base prompt".to_string(),
@@ -4004,6 +4126,7 @@ mod tests {
             infotext: None,
             init_images: None,
             mask: None,
+            resize_mode: None,
             include_init_images: None,
             denoising_strength: None,
             enable_hr: None,

@@ -14,7 +14,7 @@ Runtime note: runnable `.hfq` diffusion artifacts still perform CLIP tokenizatio
 .PP
 `/sdapi/v1/progress` tracks active SDAPI sampling steps and returns the final generated PNG in `current_image` after a successful HFQ diffusion request completes. Live per\-step latent preview decoding is not implemented yet.
 .PP
-Img2img and inpaint resize init and mask images to the requested output dimensions before VAE encoding. Txt2img high\-res generation is implemented as a batched first\-pass txt2img generation followed by a second\-pass img2img generation at the high\-res target dimensions. SDAPI high\-res requests accept `enable_hr`, `firstphase_width`, `firstphase_height`, `hr_scale`, `hr_upscaler`, `hr_resize_x`, `hr_resize_y`, `hr_second_pass_steps`, `hr_checkpoint_name`, `hr_prompt`, `hr_negative_prompt`, `hr_sampler_name`, and `hr_scheduler`.
+SDAPI img2img and inpaint resize init and mask images to the requested output dimensions before VAE encoding. `resize_mode` supports WebUI modes 0 (stretch), 1 (crop and resize), and 2 (resize and fill); mode 3 latent upscale is rejected unless no resize is needed. Txt2img high\-res generation is implemented as a batched first\-pass txt2img generation followed by a second\-pass img2img generation at the high\-res target dimensions. SDAPI high\-res requests accept `enable_hr`, `firstphase_width`, `firstphase_height`, `hr_scale`, `hr_upscaler`, `hr_resize_x`, `hr_resize_y`, `hr_second_pass_steps`, `hr_checkpoint_name`, `hr_prompt`, `hr_negative_prompt`, `hr_sampler_name`, and `hr_scheduler`.
 .PP
 The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128, HFQ4G256, and HFQ6G256 tensor payloads. Other packed payloads require a matching diffusion dequantizer/runtime implementation.
 .SH OPTIONS
