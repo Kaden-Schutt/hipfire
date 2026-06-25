@@ -62,9 +62,11 @@ pub struct SdGenerationRequest {
     pub firstphase_width: Option<u32>,
     pub firstphase_height: Option<u32>,
     pub hr_scale: Option<f64>,
+    pub hr_upscaler: Option<String>,
     pub hr_resize_x: Option<u32>,
     pub hr_resize_y: Option<u32>,
     pub hr_second_pass_steps: Option<u32>,
+    pub hr_checkpoint_name: Option<String>,
     pub hr_sampler_name: Option<String>,
     pub hr_scheduler: Option<String>,
     pub hr_prompt: Option<String>,
@@ -356,6 +358,9 @@ async fn execute_hfq_diffusion_txt2img(
         Ok(pipeline) => pipeline,
         Err(error) => return diffusion_error_response(error),
     };
+    if let Err(error) = sdapi_validate_highres_checkpoint(&body, pipeline.summary()) {
+        return diffusion_error_response(error);
+    }
     let n_iter = sd_request_n_iter(&body);
     let save_images = body.save_images.unwrap_or(false);
     let highres_target = match sdapi_highres_target_dimensions(&first_pass_body) {
@@ -1397,6 +1402,27 @@ fn sdapi_highres_second_pass_body(
     highres_body
 }
 
+fn sdapi_validate_highres_checkpoint(
+    body: &SdGenerationRequest,
+    summary: &hipfire_diffusion::DiffusionModelSummary,
+) -> Result<(), DiffusionError> {
+    if !body.enable_hr.unwrap_or(false) {
+        return Ok(());
+    }
+    let Some(checkpoint) =
+        highres_override_text(body.hr_checkpoint_name.as_deref(), "Use same checkpoint")
+    else {
+        return Ok(());
+    };
+    if diffusion_summary_matches_candidate(summary, checkpoint) {
+        return Ok(());
+    }
+    Err(DiffusionError::InvalidRequest(format!(
+        "hr_checkpoint_name {checkpoint:?} is not supported yet; high-res txt2img currently uses the loaded checkpoint {:?}",
+        summary.title
+    )))
+}
+
 fn highres_override_text<'a>(value: Option<&'a str>, same_label: &str) -> Option<&'a str> {
     value
         .map(str::trim)
@@ -1509,6 +1535,14 @@ fn annotate_highres_txt2img_info(
             "denoising_strength".to_string(),
             json!(body.denoising_strength.unwrap_or(0.75)),
         );
+        if let Some(upscaler) = highres_override_text(body.hr_upscaler.as_deref(), "") {
+            map.insert("hr_upscaler".to_string(), json!(upscaler));
+        }
+        if let Some(checkpoint) =
+            highres_override_text(body.hr_checkpoint_name.as_deref(), "Use same checkpoint")
+        {
+            map.insert("hr_checkpoint_name".to_string(), json!(checkpoint));
+        }
         if let Some(prompt) = highres_override_text(body.hr_prompt.as_deref(), "") {
             map.insert("hr_prompt".to_string(), json!(prompt));
         }
@@ -2296,7 +2330,9 @@ mod tests {
             firstphase_width: Some(2),
             firstphase_height: Some(2),
             hr_scale: Some(2.0),
+            hr_upscaler: Some("Latent".to_string()),
             hr_second_pass_steps: Some(1),
+            hr_checkpoint_name: Some("Use same checkpoint".to_string()),
             hr_prompt: Some("a highres dog".to_string()),
             hr_negative_prompt: Some("blur".to_string()),
             hr_sampler_name: Some("Euler".to_string()),
@@ -2325,6 +2361,8 @@ mod tests {
         assert_eq!(info["hr_height"], 4);
         assert_eq!(info["hr_second_pass_steps"], 1);
         assert_eq!(info["scheduler"], "Euler");
+        assert_eq!(info["hr_upscaler"], "Latent");
+        assert!(info.get("hr_checkpoint_name").is_none());
         assert_eq!(info["hr_prompt"], "a highres dog");
         assert_eq!(info["hr_negative_prompt"], "blur");
         assert_eq!(info["hr_sampler_name"], "Euler");
@@ -2336,6 +2374,39 @@ mod tests {
             .unwrap();
         assert!(text.contains("Size: 4x4"));
         assert!(text.contains("Mode: txt2img"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn txt2img_route_rejects_unsupported_highres_checkpoint_switch() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-sdapi-diffusion-highres-checkpoint-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("tiny-route-diffusion-highres-checkpoint.hfq");
+        write_tiny_diffusion_hfq(&hfq_path);
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let body = SdGenerationRequest {
+            prompt: "a highres cat".to_string(),
+            model: Some(hfq_path.to_string_lossy().into_owned()),
+            steps: Some(1),
+            cfg_scale: Some(1.0),
+            width: Some(2),
+            height: Some(2),
+            enable_hr: Some(true),
+            hr_checkpoint_name: Some("different-model".to_string()),
+            ..empty_request()
+        };
+
+        let response = post_txt2img(State(state), Json(body)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("hr_checkpoint_name"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3771,9 +3842,11 @@ mod tests {
             firstphase_width: None,
             firstphase_height: None,
             hr_scale: None,
+            hr_upscaler: None,
             hr_resize_x: None,
             hr_resize_y: None,
             hr_second_pass_steps: None,
+            hr_checkpoint_name: None,
             hr_sampler_name: None,
             hr_scheduler: None,
             hr_prompt: None,
