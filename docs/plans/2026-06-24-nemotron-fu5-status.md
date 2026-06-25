@@ -232,6 +232,11 @@ Validation run locally on gfx1151:
   prefill-vs-decode: default 2-token smoke max|Δlogit|=6.676e-6, argmax match;
   full 29-token closed-think 2+2 prompt max|Δlogit|=8.106e-6, final argmax
   `1052` (`4`).
+- `hipfire-eval` daemon smoke on the real 30B HFQ artifact:
+  `/tmp/nemotron30b-eval-smoke-20260625-165800`, commit `1753647ee`, clean tree,
+  daemon executor, 3 pass / 0 fail / 0 skip (`load_metadata`,
+  `finite_greedy_decode`, `multi_turn_reset_recall`). Admission is explicitly
+  incomplete because this run has no baseline/reference quality comparison.
 - Commit hooks for `211888d7a` and `27f994e00`: rustfmt, clippy, short
   coherence battery (no hard errors), fast agentic gate, and MQ4 speed gate all
   passed. Tiny-fixture golden still drifted on existing Qwen fixtures and
@@ -328,18 +333,21 @@ introduces a new **'E' (MoE) block**. The first bounded slice is now in place:
 - With hybrid MoE prefill enabled, the same 29-token prompt matches the
   per-token decode loop with max|Δlogit|=`8.106e-6`, prefill argmax=1052, and
   decode argmax=1052.
+- `hipfire-eval` daemon smoke also passes on the real 30B artifact:
+  `/tmp/nemotron30b-eval-smoke-20260625-165800` has 3 pass / 0 fail / 0 skip
+  rows and records `arch=nemotron_h`, `dim=2688`, `layers=52`, `vocab=131072`.
 - A rebuilt exploratory artifact with Mamba `in_proj` promoted to Q8,
   `/home/sadara/.hipfire/models/nemotron-3-nano-30b-a3b-inproj-q8-mq4.hfq`
   (sha256
   `49cdf0b534729bebc24ede0b8c243a848cf06b38ac06e61d20c72cdf7e37743f`,
   25,999.5 MB written), is slightly closer at the same boundary
   (logit rel delta `0.0386`) but is not required for the basic coherence fix.
-- `HIPFIRE_DAEMON_BIN=target/debug/hipfire-daemon ./target/debug/hipfire chat
+- The local installed binaries under `/home/sadara/.hipfire/bin` were refreshed
+  from the release build after the MoE prefill slice. `env -u HIPFIRE_DAEMON_BIN
+  /home/sadara/.local/bin/hipfire chat
   --model /home/sadara/.hipfire/models/nemotron-3-nano-30b-a3b-mq4.hfq
   --temperature 0 --max-tokens 16 "Answer in one short sentence: What is 2+2?"`
-  returns `4` in one token. Without `HIPFIRE_DAEMON_BIN`, this checkout can still
-  pick the older installed daemon, which lacks the scale fix and may fail before
-  arch dispatch.
+  returns `4` in one token without `HIPFIRE_DAEMON_BIN`.
 
 Remaining FU6 work is throughput and admission-quality evidence at 30B scale:
 replace row-wise MoE prefill with a batched/expert-sorted grouped path if 30B
