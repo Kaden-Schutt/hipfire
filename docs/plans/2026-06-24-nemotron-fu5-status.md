@@ -13,7 +13,7 @@ ReLU²-MLP hybrid).
 | FU2 | HF-reference numeric bisect | **DONE** (committed earlier; Python native-Mamba reference refreshed) |
 | FU3 | quantizer → nemotron_h mq4/q8 .hfq | **DONE** — mq4 protects Nemotron residual writers as q8 |
 | FU4 | loader compat (load .hfq + quantized gemv) + serving | **DONE** |
-| FU5 | N6 batched prefill + q8 SSM state | **mostly done** — batched HFQ benchmark captured; q8 state remains |
+| FU5 | N6 batched prefill + q8 SSM state | **mostly done** — batched HFQ benchmark captured; q8 state opt-in validated |
 | FU6 | Nano-30B MoE ('E' block) | not started |
 | FU1 | chat-template / coherence | blocked (EOS/Jinja/CLI controls fixed; vLLM reference is coherent; Hipfire/native-HF diverge at first token) |
 
@@ -206,6 +206,15 @@ Validation run locally on gfx1151:
   max|Δlogit|=2.98e-7, argmax match.
 - `test_model_prefill_hfq_gpu`: real `/tmp/nano4b-mq4-protected.hfq`,
   max|Δlogit|=1.29e-5, argmax match.
+- `test_block_q8_state_gpu`: opt-in Q8 Mamba-2 SSM state
+  (`HIPFIRE_NEMOTRON_SSM_STATE=q8`) preserves the prefill/decode handoff
+  (q8 prefill-vs-q8 decode max|Δ|=2.98e-8) and stays close to the f32-state
+  decode reference (max|Δ|=7.861e-5) on the synthetic block.
+- `HIPFIRE_NEMOTRON_SSM_STATE=q8 test_model_prefill_hfq_gpu`: real
+  `/tmp/nano4b-mq4-protected.hfq`, max|Δlogit|=2.38e-4, argmax match.
+- `HIPFIRE_NEMOTRON_SSM_STATE=q8 hfq_vs_f32`: protected HFQ tracks the
+  safetensors reference with q8 SSM state enabled in both paths:
+  argmax match, logit cosine 0.999910, mean|Δ|=0.03916, max|Δ|=0.30284.
 - `bench_prefill_hfq_gpu`: release fresh-process protected-mq4 benchmark on
   gfx1151:
   - seq=128, warmup=2, iters=5: batched mean=2476.31ms (51.7 tok/s),
@@ -219,8 +228,10 @@ Validation run locally on gfx1151:
 
 ## FU5 — REMAINING
 
-1. **q8 SSM state.** Quantize the Mamba `h` state to q8 between steps (mirror the
-   GDN q8-state pattern) to cut state memory/bandwidth. Pairs with the kernels.
+1. **Default q8 SSM-state promotion.** The opt-in path is implemented and
+   validated through the block and protected-HFQ model gates. Keep FP32 as the
+   default correctness floor until longer-generation quality evidence decides
+   whether `HIPFIRE_NEMOTRON_SSM_STATE=q8` should become the default.
 2. **(Optional) broaden prefill benchmarks.** Current evidence covers the
    protected mq4 HFQ artifact on gfx1151. A fuller benchmark-grade sweep can add
    f32/q8 plus longer prompt lengths.

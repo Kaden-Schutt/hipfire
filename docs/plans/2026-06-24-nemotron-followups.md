@@ -215,17 +215,21 @@ on `/tmp/nano4b-mq4-protected.hfq` measured:
 - seq=128: batched 51.7 tok/s vs decode-loop 38.1 tok/s, speedup=1.36x.
 - seq=256: batched 50.2 tok/s vs decode-loop 38.1 tok/s, speedup=1.32x.
 
-The remaining bandwidth item is the q8 SSM state:
-`[num_heads·head_dim·state_size]` per Mamba block is still held in f32 between
-steps.
+The remaining bandwidth item has an opt-in implementation:
+`HIPFIRE_NEMOTRON_SSM_STATE=q8` stores the Mamba-2 SSM state as int8 plus
+per-row f32 scales. It preserves the prefill/decode handoff on the q8 path
+(synthetic block max|Δ|=2.98e-8; protected HFQ model max|Δlogit|=2.38e-4,
+argmax match) and protected HFQ still tracks safetensors under q8 state
+(cosine 0.999910, argmax match). FP32 remains the default until longer-generation
+quality evidence justifies default promotion.
 
 **Approach.**
 1. **Batched prefill** (done for the current N6 path): the Mamba/conv/MLP blocks
    and NoPE attention now have batched prefill coverage, and HFQ `gemm_seq`
    supports the protected mq4 path.
-2. **q8 SSM state:** quantize `h` to q8 between steps (mirror the GDN q8-state
-   work noted in CLAUDE.md / `pflash.rs` q8 drafter-state). Cuts state
-   memory+bandwidth; pairs with the chunked kernel.
+2. **q8 SSM state** (opt-in done): quantize `h` to q8 between steps (mirror the
+   GDN q8-state pattern) to cut state memory/bandwidth. Remaining decision:
+   default promotion after longer-generation evidence.
 
 **Reuse.** qwen35 `pflash` chunked prefill structure; GDN q8-state pattern;
 `attention_*_batched_masked` for the attention blocks; `conv1d` batched variant.
@@ -237,8 +241,11 @@ oracle `ssd.rs` / `block.rs` — extend it with the chunked form as the test
 oracle.)
 
 **Validation.** Batched prefill logits now match the per-token decode loop for
-f32 and protected mq4 HFQ. The fresh-process benchmark entrypoint is
-`cargo run --release -p hipfire-arch-nemotron --example bench_prefill_hfq_gpu`.
+f32, protected mq4 HFQ, and opt-in q8 SSM state. The fresh-process benchmark
+entrypoint is
+`cargo run --release -p hipfire-arch-nemotron --example bench_prefill_hfq_gpu`;
+the q8-state gate is
+`PATH=/usr/lib/llvm-21/bin:$PATH cargo run -p hipfire-arch-nemotron --example test_block_q8_state_gpu`.
 
 ---
 
