@@ -346,6 +346,11 @@ pub struct SdxlDenoiseConditioning<'a> {
     pub time_ids: &'a CpuTensor,
 }
 
+struct DenoiseLatentsOutput {
+    latents: LatentBatch,
+    runtime_kind: DiffusionRuntimeKind,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StableDiffusionConfig {
     pub pipeline_class: String,
@@ -1606,6 +1611,41 @@ pub fn denoise_latents_with_cfg(
 }
 
 pub fn denoise_latents_with_cfg_progress(
+    latents: LatentBatch,
+    schedule: &DiffusionSchedule,
+    cfg_scale: f32,
+    positive_embeddings: &CpuTensor,
+    negative_embeddings: &CpuTensor,
+    predict_noise: impl FnMut(
+        &CpuTensor,
+        &[f32],
+        &CpuTensor,
+        Option<&SdxlDenoiseConditioning<'_>>,
+    ) -> DiffusionResult<CpuTensor>,
+    positive_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
+    negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
+    inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
+    masked_reference: Option<&MaskedDenoiseReference<'_>>,
+    progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
+) -> DiffusionResult<LatentBatch> {
+    denoise_latents_with_cfg_progress_and_runtime_options(
+        latents,
+        schedule,
+        cfg_scale,
+        positive_embeddings,
+        negative_embeddings,
+        predict_noise,
+        positive_sdxl_conditioning,
+        negative_sdxl_conditioning,
+        inpaint_conditioning,
+        masked_reference,
+        DiffusionGenerationRuntimeOptions::default(),
+        progress,
+    )
+    .map(|output| output.latents)
+}
+
+fn denoise_latents_with_cfg_progress_and_runtime_options(
     mut latents: LatentBatch,
     schedule: &DiffusionSchedule,
     cfg_scale: f32,
@@ -1621,8 +1661,9 @@ pub fn denoise_latents_with_cfg_progress(
     negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
     inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
     masked_reference: Option<&MaskedDenoiseReference<'_>>,
+    runtime_options: DiffusionGenerationRuntimeOptions,
     mut progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
-) -> DiffusionResult<LatentBatch> {
+) -> DiffusionResult<DenoiseLatentsOutput> {
     validate_conditioning_for_latents(&latents, positive_embeddings)?;
     validate_conditioning_for_latents(&latents, negative_embeddings)?;
     if let Some(inpaint_conditioning) = inpaint_conditioning {
@@ -1632,8 +1673,15 @@ pub fn denoise_latents_with_cfg_progress(
         validate_masked_denoise_reference(&latents, masked_reference)?;
     }
     let mut scheduler_state = SchedulerStepState::default();
+    let mut runtime_kind = DiffusionRuntimeKind::CpuSourceReference;
     for step in 0..schedule.timesteps.len() {
-        let sample = schedule.scale_model_input(&latents.as_nchw_tensor(), step)?;
+        let (sample, scale_runtime_kind) = scale_model_input_with_runtime_options(
+            schedule,
+            &latents.as_nchw_tensor(),
+            step,
+            runtime_options,
+        )?;
+        runtime_kind = merge_runtime_kind(runtime_kind, scale_runtime_kind);
         let model_sample = if let Some(inpaint_conditioning) = inpaint_conditioning {
             append_inpaint_conditioning(&sample, inpaint_conditioning)?
         } else {
@@ -1655,8 +1703,22 @@ pub fn denoise_latents_with_cfg_progress(
         )?;
         validate_noise_prediction(&latents, &negative_pred)?;
         validate_noise_prediction(&latents, &positive_pred)?;
-        let guided = cfg_guidance(&negative_pred, &positive_pred, cfg_scale)?;
-        schedule.step(&mut latents, &guided.data, step, &mut scheduler_state)?;
+        let (guided, guidance_runtime_kind) = cfg_guidance_with_runtime_options(
+            &negative_pred,
+            &positive_pred,
+            cfg_scale,
+            runtime_options,
+        )?;
+        runtime_kind = merge_runtime_kind(runtime_kind, guidance_runtime_kind);
+        let step_runtime_kind = scheduler_step_with_runtime_options(
+            schedule,
+            &mut latents,
+            &guided.data,
+            step,
+            &mut scheduler_state,
+            runtime_options,
+        )?;
+        runtime_kind = merge_runtime_kind(runtime_kind, step_runtime_kind);
         if let Some(masked_reference) = masked_reference {
             apply_masked_denoise_reference(&mut latents, masked_reference, step)?;
         }
@@ -1668,7 +1730,10 @@ pub fn denoise_latents_with_cfg_progress(
             })?;
         }
     }
-    Ok(latents)
+    Ok(DenoiseLatentsOutput {
+        latents,
+        runtime_kind,
+    })
 }
 
 fn validate_conditioning_for_latents(
@@ -1870,6 +1935,150 @@ fn cfg_guidance(
             .map(|(negative, positive)| negative + cfg_scale * (positive - negative))
             .collect(),
     })
+}
+
+#[cfg(not(feature = "rocm"))]
+fn rocm_hybrid_unavailable_error() -> DiffusionError {
+    DiffusionError::BackendUnavailable(
+        "ROCm hybrid diffusion generation requested, but hipfire-diffusion was built without the rocm feature"
+            .to_string(),
+    )
+}
+
+fn scale_model_input_with_runtime_options(
+    schedule: &DiffusionSchedule,
+    sample: &CpuTensor,
+    step: usize,
+    runtime_options: DiffusionGenerationRuntimeOptions,
+) -> DiffusionResult<(CpuTensor, DiffusionRuntimeKind)> {
+    let Some(device_id) = runtime_options.rocm_device_id else {
+        return Ok((
+            schedule.scale_model_input(sample, step)?,
+            DiffusionRuntimeKind::CpuSourceReference,
+        ));
+    };
+    match schedule.input_scaling {
+        SchedulerInputScaling::None => {
+            Ok((sample.clone(), DiffusionRuntimeKind::CpuSourceReference))
+        }
+        SchedulerInputScaling::Sigma => {
+            #[cfg(feature = "rocm")]
+            {
+                let sigma = *schedule.sigmas.get(step).ok_or_else(|| {
+                    DiffusionError::InvalidRequest(format!("missing sigma for step {step}"))
+                })?;
+                let scale = (sigma * sigma + 1.0).sqrt().recip();
+                let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
+                    .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+                let data = scale_model_input_hip_on_gpu(&mut gpu, &sample.data, scale)?;
+                Ok((
+                    CpuTensor {
+                        shape: sample.shape.clone(),
+                        data,
+                    },
+                    DiffusionRuntimeKind::RocmHybridReference,
+                ))
+            }
+            #[cfg(not(feature = "rocm"))]
+            {
+                let _ = device_id;
+                Err(rocm_hybrid_unavailable_error())
+            }
+        }
+    }
+}
+
+fn cfg_guidance_with_runtime_options(
+    negative_pred: &CpuTensor,
+    positive_pred: &CpuTensor,
+    cfg_scale: f32,
+    runtime_options: DiffusionGenerationRuntimeOptions,
+) -> DiffusionResult<(CpuTensor, DiffusionRuntimeKind)> {
+    let Some(device_id) = runtime_options.rocm_device_id else {
+        return Ok((
+            cfg_guidance(negative_pred, positive_pred, cfg_scale)?,
+            DiffusionRuntimeKind::CpuSourceReference,
+        ));
+    };
+    if negative_pred.shape != positive_pred.shape {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "CFG prediction shape mismatch {:?} vs {:?}",
+            negative_pred.shape, positive_pred.shape
+        )));
+    }
+    #[cfg(feature = "rocm")]
+    {
+        let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+        let data = cfg_guidance_hip_on_gpu(
+            &mut gpu,
+            &negative_pred.data,
+            &positive_pred.data,
+            cfg_scale,
+        )?;
+        Ok((
+            CpuTensor {
+                shape: negative_pred.shape.clone(),
+                data,
+            },
+            DiffusionRuntimeKind::RocmHybridReference,
+        ))
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = device_id;
+        Err(rocm_hybrid_unavailable_error())
+    }
+}
+
+fn scheduler_step_with_runtime_options(
+    schedule: &DiffusionSchedule,
+    latents: &mut LatentBatch,
+    noise_pred: &[f32],
+    step: usize,
+    state: &mut SchedulerStepState,
+    runtime_options: DiffusionGenerationRuntimeOptions,
+) -> DiffusionResult<DiffusionRuntimeKind> {
+    let Some(device_id) = runtime_options.rocm_device_id else {
+        schedule.step(latents, noise_pred, step, state)?;
+        return Ok(DiffusionRuntimeKind::CpuSourceReference);
+    };
+    if schedule.solver != SchedulerSolver::Euler {
+        schedule.step(latents, noise_pred, step, state)?;
+        return Ok(DiffusionRuntimeKind::CpuSourceReference);
+    }
+    if noise_pred.len() != latents.data.len() {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "noise prediction length {} != latent length {}",
+            noise_pred.len(),
+            latents.data.len()
+        )));
+    }
+    #[cfg(feature = "rocm")]
+    {
+        let sigma = *schedule.sigmas.get(step).ok_or_else(|| {
+            DiffusionError::InvalidRequest(format!("missing sigma for step {step}"))
+        })?;
+        let next_sigma = *schedule.sigmas.get(step + 1).ok_or_else(|| {
+            DiffusionError::InvalidRequest(format!("missing next sigma for step {step}"))
+        })?;
+        let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+        latents.data = euler_step_hip_on_gpu(
+            &mut gpu,
+            &latents.data,
+            noise_pred,
+            sigma,
+            next_sigma,
+            schedule.prediction_type,
+        )?;
+        Ok(DiffusionRuntimeKind::RocmHybridReference)
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = device_id;
+        Err(rocm_hybrid_unavailable_error())
+    }
 }
 
 #[cfg(feature = "rocm")]
@@ -3375,7 +3584,7 @@ impl DiffusionPipeline {
                     .to_string(),
             ));
         }
-        let latents = runtime.noise.denoise_latents(
+        let denoise_output = runtime.noise.denoise_latents(
             plan.latents,
             &plan.schedule,
             request.cfg_scale,
@@ -3385,16 +3594,20 @@ impl DiffusionPipeline {
             negative_sdxl_conditioning.as_ref(),
             None,
             None,
+            runtime_options,
             progress,
         )?;
-        let mut generation_runtime_kind = runtime.kind;
+        let latents = denoise_output.latents;
+        let mut generation_runtime_kind =
+            merge_runtime_kind(runtime.kind, denoise_output.runtime_kind);
         let images = if request.send_images {
             let (rgb, image_runtime_kind) = decode_to_rgb8_with_runtime_options(
                 runtime.decoder.as_ref(),
                 &latents,
                 runtime_options,
             )?;
-            generation_runtime_kind = image_runtime_kind;
+            generation_runtime_kind =
+                merge_runtime_kind(generation_runtime_kind, image_runtime_kind);
             encode_rgb_batch_png_base64(&rgb)?
         } else {
             Vec::new()
@@ -3588,7 +3801,7 @@ impl DiffusionPipeline {
                         source_schedule: &plan.schedule,
                         start_step,
                     });
-            latents = runtime.noise.denoise_latents(
+            let denoise_output = runtime.noise.denoise_latents(
                 latents,
                 &schedule,
                 request.batch.cfg_scale,
@@ -3598,8 +3811,12 @@ impl DiffusionPipeline {
                 negative_sdxl_conditioning.as_ref(),
                 inpaint_conditioning.as_ref(),
                 masked_reference.as_ref(),
+                runtime_options,
                 progress,
             )?;
+            latents = denoise_output.latents;
+            generation_runtime_kind =
+                merge_runtime_kind(generation_runtime_kind, denoise_output.runtime_kind);
         }
         let masked = if let Some(mask_weights) = mask_weights.as_ref() {
             let blend_kind = blend_latents_with_mask_with_runtime_options(
@@ -3619,7 +3836,8 @@ impl DiffusionPipeline {
                 &latents,
                 runtime_options,
             )?;
-            generation_runtime_kind = image_runtime_kind;
+            generation_runtime_kind =
+                merge_runtime_kind(generation_runtime_kind, image_runtime_kind);
             encode_rgb_batch_png_base64(&rgb)?
         } else {
             Vec::new()
@@ -3820,8 +4038,9 @@ trait DiffusionNoiseBackend: Send + Sync {
         negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
         inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
         masked_reference: Option<&MaskedDenoiseReference<'_>>,
+        runtime_options: DiffusionGenerationRuntimeOptions,
         progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
-    ) -> DiffusionResult<LatentBatch>;
+    ) -> DiffusionResult<DenoiseLatentsOutput>;
 }
 
 impl DiffusionNoiseBackend for NativeUnet2DConditionModel {
@@ -3840,9 +4059,10 @@ impl DiffusionNoiseBackend for NativeUnet2DConditionModel {
         negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
         inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
         masked_reference: Option<&MaskedDenoiseReference<'_>>,
+        runtime_options: DiffusionGenerationRuntimeOptions,
         progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
-    ) -> DiffusionResult<LatentBatch> {
-        NativeUnet2DConditionModel::denoise_latents(
+    ) -> DiffusionResult<DenoiseLatentsOutput> {
+        NativeUnet2DConditionModel::denoise_latents_with_runtime_options(
             self,
             latents,
             schedule,
@@ -3853,6 +4073,7 @@ impl DiffusionNoiseBackend for NativeUnet2DConditionModel {
             negative_sdxl_conditioning,
             inpaint_conditioning,
             masked_reference,
+            runtime_options,
             progress,
         )
     }
@@ -5564,7 +5785,37 @@ impl NativeUnet2DConditionModel {
         masked_reference: Option<&MaskedDenoiseReference<'_>>,
         progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
     ) -> DiffusionResult<LatentBatch> {
-        denoise_latents_with_cfg_progress(
+        self.denoise_latents_with_runtime_options(
+            latents,
+            schedule,
+            cfg_scale,
+            positive_embeddings,
+            negative_embeddings,
+            positive_sdxl_conditioning,
+            negative_sdxl_conditioning,
+            inpaint_conditioning,
+            masked_reference,
+            DiffusionGenerationRuntimeOptions::default(),
+            progress,
+        )
+        .map(|output| output.latents)
+    }
+
+    fn denoise_latents_with_runtime_options(
+        &self,
+        latents: LatentBatch,
+        schedule: &DiffusionSchedule,
+        cfg_scale: f32,
+        positive_embeddings: &CpuTensor,
+        negative_embeddings: &CpuTensor,
+        positive_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
+        negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
+        inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
+        masked_reference: Option<&MaskedDenoiseReference<'_>>,
+        runtime_options: DiffusionGenerationRuntimeOptions,
+        progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
+    ) -> DiffusionResult<DenoiseLatentsOutput> {
+        denoise_latents_with_cfg_progress_and_runtime_options(
             latents,
             schedule,
             cfg_scale,
@@ -5582,6 +5833,7 @@ impl NativeUnet2DConditionModel {
             negative_sdxl_conditioning,
             inpaint_conditioning,
             masked_reference,
+            runtime_options,
             progress,
         )
     }
@@ -16377,6 +16629,94 @@ mod tests {
 
     #[cfg(feature = "rocm")]
     #[test]
+    fn hip_denoise_loop_runtime_options_route_vector_stages_when_gpu_is_available() {
+        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+            eprintln!("skip: ROCm GPU unavailable for denoise loop routing test: {error}");
+            return;
+        }
+        let schedule = DiffusionSchedule {
+            timesteps: vec![1.0, 0.0],
+            sigmas: vec![1.0, 0.5, 0.0],
+            prediction_type: SchedulerPredictionType::Epsilon,
+            input_scaling: SchedulerInputScaling::Sigma,
+            solver: SchedulerSolver::Euler,
+            train_timesteps: Vec::new(),
+            alpha_t: Vec::new(),
+            sigma_t: Vec::new(),
+            lambda_t: Vec::new(),
+        };
+        let latents = LatentBatch {
+            batch: 1,
+            channels: 1,
+            height: 2,
+            width: 2,
+            data: vec![-0.75, -0.25, 0.5, 1.25],
+        };
+        let positive_embeddings = CpuTensor {
+            shape: vec![1, 1, 1],
+            data: vec![0.2],
+        };
+        let negative_embeddings = CpuTensor {
+            shape: vec![1, 1, 1],
+            data: vec![-0.1],
+        };
+        let predict_noise =
+            |sample: &CpuTensor,
+             _timesteps: &[f32],
+             encoder_states: &CpuTensor,
+             _sdxl: Option<&SdxlDenoiseConditioning<'_>>| {
+                let bias = encoder_states.data[0];
+                Ok(CpuTensor {
+                    shape: sample.shape.clone(),
+                    data: sample
+                        .data
+                        .iter()
+                        .map(|value| value * 0.25 + bias)
+                        .collect(),
+                })
+            };
+        let cpu = denoise_latents_with_cfg_progress_and_runtime_options(
+            latents.clone(),
+            &schedule,
+            2.0,
+            &positive_embeddings,
+            &negative_embeddings,
+            predict_noise,
+            None,
+            None,
+            None,
+            None,
+            DiffusionGenerationRuntimeOptions::default(),
+            None,
+        )
+        .unwrap();
+        let hip = denoise_latents_with_cfg_progress_and_runtime_options(
+            latents,
+            &schedule,
+            2.0,
+            &positive_embeddings,
+            &negative_embeddings,
+            predict_noise,
+            None,
+            None,
+            None,
+            None,
+            DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(cpu.runtime_kind, DiffusionRuntimeKind::CpuSourceReference);
+        assert_eq!(hip.runtime_kind, DiffusionRuntimeKind::RocmHybridReference);
+        assert_eq!(hip.latents.batch, cpu.latents.batch);
+        assert_eq!(hip.latents.channels, cpu.latents.channels);
+        assert_eq!(hip.latents.height, cpu.latents.height);
+        assert_eq!(hip.latents.width, cpu.latents.width);
+        assert!(f32_slices_close(&hip.latents.data, &cpu.latents.data, 1e-5));
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
     fn hip_center_unet_input_matches_cpu_reference_when_gpu_is_available() {
         let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
             Ok(gpu) => gpu,
@@ -18888,6 +19228,7 @@ mod tests {
                 None,
                 None,
                 None,
+                DiffusionGenerationRuntimeOptions::default(),
                 None,
             )
             .unwrap();
@@ -18896,7 +19237,7 @@ mod tests {
         let hfq = HfqFile::open_index_only(&path).unwrap();
         let decoder = NativeVaeDecoder::from_hfq(&hfq, &pipeline.config.vae).unwrap();
         let phase = std::time::Instant::now();
-        let decoded = decoder.decode_latents(&latents).unwrap();
+        let decoded = decoder.decode_latents(&latents.latents).unwrap();
         eprintln!("phase decode_latents {:?}", phase.elapsed());
 
         let phase = std::time::Instant::now();
@@ -19513,8 +19854,9 @@ mod tests {
             _negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
             _inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
             _masked_reference: Option<&MaskedDenoiseReference<'_>>,
+            _runtime_options: DiffusionGenerationRuntimeOptions,
             mut progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
-        ) -> DiffusionResult<LatentBatch> {
+        ) -> DiffusionResult<DenoiseLatentsOutput> {
             assert_eq!(schedule.timesteps.len(), 2);
             assert_eq!(cfg_scale, 7.0);
             assert_eq!(positive_embeddings.shape[0], latents.batch);
@@ -19531,7 +19873,10 @@ mod tests {
                     })?;
                 }
             }
-            Ok(latents)
+            Ok(DenoiseLatentsOutput {
+                latents,
+                runtime_kind: DiffusionRuntimeKind::CpuSourceReference,
+            })
         }
     }
 
@@ -19555,8 +19900,9 @@ mod tests {
             negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
             _inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
             _masked_reference: Option<&MaskedDenoiseReference<'_>>,
+            _runtime_options: DiffusionGenerationRuntimeOptions,
             _progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
-        ) -> DiffusionResult<LatentBatch> {
+        ) -> DiffusionResult<DenoiseLatentsOutput> {
             assert_eq!(schedule.timesteps.len(), 2);
             assert_eq!(cfg_scale, 7.0);
             assert_eq!(positive_embeddings.shape, vec![1, 4, 4]);
@@ -19573,7 +19919,10 @@ mod tests {
             );
             assert_eq!(negative.time_ids.data, positive.time_ids.data);
             self.called.store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok(latents)
+            Ok(DenoiseLatentsOutput {
+                latents,
+                runtime_kind: DiffusionRuntimeKind::CpuSourceReference,
+            })
         }
     }
 
@@ -19597,8 +19946,9 @@ mod tests {
             _negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
             inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
             _masked_reference: Option<&MaskedDenoiseReference<'_>>,
+            _runtime_options: DiffusionGenerationRuntimeOptions,
             mut progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
-        ) -> DiffusionResult<LatentBatch> {
+        ) -> DiffusionResult<DenoiseLatentsOutput> {
             assert_eq!(schedule.timesteps.len(), 2);
             assert_eq!(cfg_scale, 7.0);
             assert_eq!(positive_embeddings.shape[0], latents.batch);
@@ -19622,7 +19972,10 @@ mod tests {
                     })?;
                 }
             }
-            Ok(latents)
+            Ok(DenoiseLatentsOutput {
+                latents,
+                runtime_kind: DiffusionRuntimeKind::CpuSourceReference,
+            })
         }
     }
 

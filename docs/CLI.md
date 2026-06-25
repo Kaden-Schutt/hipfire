@@ -216,10 +216,11 @@ f32 LayerNorm, f32 row softmax, f32 3D scaled-dot-product attention, f32 CLIP
 causal self-attention, GeGLU gate, and RGB conversion, but full generation is not
 routed through a GPU UNet runtime yet.
 `txt2img` and `img2img` can opt into `--rocm-device-id` to route currently
-GPU-backed generation boundaries through ROCm: final decoded tensor-to-RGB
-conversion for both modes, plus img2img/inpaint RGB-to-VAE tensor conversion,
-VAE moments-to-latents scaling, latent mask downsampling, masked RGB
-preparation, and final latent mask blending. CLIP, UNet, and VAE graph
+GPU-backed generation boundaries through ROCm: denoise-loop model-input
+scaling, classifier-free guidance, Euler scheduler updates, and final decoded
+tensor-to-RGB conversion for both modes, plus img2img/inpaint RGB-to-VAE tensor
+conversion, VAE moments-to-latents scaling, latent mask downsampling, masked
+RGB preparation, and final latent mask blending. CLIP, UNet, and VAE graph
 execution still use the native CPU reference path.
 The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128,
 HFQ4G256, and HFQ6G256 tensor payloads even when the artifact `weight_format`
