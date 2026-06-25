@@ -240,8 +240,10 @@ channel concatenation, nearest-neighbor upsample, and the final output
 norm/activation/conv, on the generation-scoped context. VAE encode/decode
 traversal now uses the same context seam for RGB/VAE boundary conversion, latent
 scaling, ResNet blocks, final norm/activation/conv, and VAE upsample/downsample
-stages. UNet transformer attention and VAE attention remain hybrid
-tensor-boundary stages.
+stages. UNet transformer attention and VAE attention now share that context seam
+for GroupNorm, layout conversion, LayerNorm, QKV/out projections, SDPA, GeGLU,
+and residual-add stages. These are still reference HIP tensor-boundary kernels,
+not fully fused resident attention kernels.
 The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128,
 HFQ4G256, and HFQ6G256 tensor payloads even when the artifact `weight_format`
 records a future quantized format such as `oq4`; OQ/MQ/HFP and other packed
