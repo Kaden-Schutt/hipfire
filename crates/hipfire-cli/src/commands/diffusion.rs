@@ -10,8 +10,8 @@ use clap::{Args, Subcommand};
 use hipfire_diffusion::DiffusionHipRuntimeOptions;
 use hipfire_diffusion::{
     import_diffusers_to_hfq, inspect_hfq_with_runtime_support, DiffusersImportOptions,
-    DiffusionBatchRequest, DiffusionHfqInspection, DiffusionImg2ImgRequest, DiffusionPipeline,
-    DiffusionPrompt, RgbImageBatch,
+    DiffusionBatchRequest, DiffusionGenerationRuntimeOptions, DiffusionHfqInspection,
+    DiffusionImg2ImgRequest, DiffusionPipeline, DiffusionPrompt, RgbImageBatch,
 };
 use serde::Serialize;
 
@@ -152,6 +152,9 @@ pub struct DiffusionTxt2ImgArgs {
     /// Batch size when a single prompt is supplied
     #[arg(long, default_value_t = 1)]
     pub batch_size: usize,
+    /// Use ROCm for currently GPU-routed generation stages on this device id
+    #[arg(long)]
+    pub rocm_device_id: Option<i32>,
 }
 
 #[derive(Debug, Args)]
@@ -204,6 +207,9 @@ pub struct DiffusionImg2ImgArgs {
     /// Img2img denoising strength in [0, 1]
     #[arg(long, default_value_t = 0.75)]
     pub denoising_strength: f32,
+    /// Use ROCm for currently GPU-routed generation stages on this device id
+    #[arg(long)]
+    pub rocm_device_id: Option<i32>,
 }
 
 #[derive(Debug, Args)]
@@ -386,7 +392,10 @@ fn run_txt2img(args: DiffusionTxt2ImgArgs) -> anyhow::Result<()> {
         save_images: false,
     };
     let pipeline = DiffusionPipeline::open_hfq(&args.model)?;
-    let output = pipeline.generate_batch(request)?;
+    let output = pipeline.generate_batch_with_runtime_options(
+        request,
+        generation_runtime_options(args.rocm_device_id),
+    )?;
     let files = write_png_images(&output.images, &args.output)?;
     println!(
         "{}",
@@ -444,7 +453,10 @@ fn run_img2img(args: DiffusionImg2ImgArgs) -> anyhow::Result<()> {
         denoising_strength: args.denoising_strength,
     };
     let pipeline = DiffusionPipeline::open_hfq(&args.model)?;
-    let output = pipeline.generate_img2img_batch(request)?;
+    let output = pipeline.generate_img2img_batch_with_runtime_options(
+        request,
+        generation_runtime_options(args.rocm_device_id),
+    )?;
     let files = write_png_images(&output.images, &args.output)?;
     println!(
         "{}",
@@ -456,6 +468,13 @@ fn run_img2img(args: DiffusionImg2ImgArgs) -> anyhow::Result<()> {
         }))?
     );
     Ok(())
+}
+
+fn generation_runtime_options(rocm_device_id: Option<i32>) -> DiffusionGenerationRuntimeOptions {
+    rocm_device_id.map_or_else(
+        DiffusionGenerationRuntimeOptions::cpu_reference,
+        DiffusionGenerationRuntimeOptions::rocm_hybrid,
+    )
 }
 
 fn run_smoke(args: DiffusionSmokeArgs) -> anyhow::Result<()> {
@@ -845,6 +864,7 @@ mod tests {
             subseed: Vec::new(),
             subseed_strength: 0.0,
             batch_size: 2,
+            rocm_device_id: None,
         }
     }
 

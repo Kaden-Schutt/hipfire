@@ -215,6 +215,9 @@ NCHW GroupNorm, SiLU, nearest-neighbor upsample, f32 dense linear projection,
 f32 LayerNorm, f32 row softmax, f32 3D scaled-dot-product attention, f32 CLIP
 causal self-attention, GeGLU gate, and RGB conversion, but full generation is not
 routed through a GPU UNet runtime yet.
+`txt2img` and `img2img` can opt into `--rocm-device-id` to route the final
+decoded tensor-to-RGB conversion through ROCm; CLIP, UNet, and VAE graph
+execution still use the native CPU reference path.
 The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128,
 HFQ4G256, and HFQ6G256 tensor payloads even when the artifact `weight_format`
 records a future quantized format such as `oq4`; OQ/MQ/HFP and other packed
@@ -361,6 +364,7 @@ Generate PNG images directly from a diffusion .hfq artifact
 * `--batch-size <BATCH_SIZE>` — Batch size when a single prompt is supplied
 
   Default value: `1`
+* `--rocm-device-id <ROCM_DEVICE_ID>` — Use ROCm for currently GPU-routed generation stages on this device id
 
 
 
@@ -400,6 +404,7 @@ Generate PNG images from init images with a diffusion .hfq artifact
 * `--denoising-strength <DENOISING_STRENGTH>` — Img2img denoising strength in [0, 1]
 
   Default value: `0.75`
+* `--rocm-device-id <ROCM_DEVICE_ID>` — Use ROCm for currently GPU-routed generation stages on this device id
 
 
 

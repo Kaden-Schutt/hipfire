@@ -149,12 +149,14 @@ pub struct DiffusionModelSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffusionRuntimeKind {
     CpuSourceReference,
+    RocmHybridReference,
 }
 
 impl DiffusionRuntimeKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::CpuSourceReference => "cpu-source-reference",
+            Self::RocmHybridReference => "rocm-hybrid-reference",
         }
     }
 }
@@ -177,6 +179,25 @@ pub struct DiffusionHipRuntimeOptions {
 impl Default for DiffusionHipRuntimeOptions {
     fn default() -> Self {
         Self { device_id: 0 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffusionGenerationRuntimeOptions {
+    pub rocm_device_id: Option<i32>,
+}
+
+impl DiffusionGenerationRuntimeOptions {
+    pub fn cpu_reference() -> Self {
+        Self {
+            rocm_device_id: None,
+        }
+    }
+
+    pub fn rocm_hybrid(device_id: i32) -> Self {
+        Self {
+            rocm_device_id: Some(device_id),
+        }
     }
 }
 
@@ -3262,7 +3283,7 @@ impl DiffusionPipeline {
         &self,
         request: DiffusionBatchRequest,
     ) -> DiffusionResult<DiffusionBatchOutput> {
-        self.generate_batch_inner(request, None)
+        self.generate_batch_inner(request, DiffusionGenerationRuntimeOptions::default(), None)
     }
 
     pub fn generate_batch_with_progress(
@@ -3270,12 +3291,34 @@ impl DiffusionPipeline {
         request: DiffusionBatchRequest,
         progress: &mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>,
     ) -> DiffusionResult<DiffusionBatchOutput> {
-        self.generate_batch_inner(request, Some(progress))
+        self.generate_batch_inner(
+            request,
+            DiffusionGenerationRuntimeOptions::default(),
+            Some(progress),
+        )
+    }
+
+    pub fn generate_batch_with_runtime_options(
+        &self,
+        request: DiffusionBatchRequest,
+        runtime_options: DiffusionGenerationRuntimeOptions,
+    ) -> DiffusionResult<DiffusionBatchOutput> {
+        self.generate_batch_inner(request, runtime_options, None)
+    }
+
+    pub fn generate_batch_with_progress_and_runtime_options(
+        &self,
+        request: DiffusionBatchRequest,
+        runtime_options: DiffusionGenerationRuntimeOptions,
+        progress: &mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>,
+    ) -> DiffusionResult<DiffusionBatchOutput> {
+        self.generate_batch_inner(request, runtime_options, Some(progress))
     }
 
     fn generate_batch_inner(
         &self,
         request: DiffusionBatchRequest,
+        runtime_options: DiffusionGenerationRuntimeOptions,
         progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
     ) -> DiffusionResult<DiffusionBatchOutput> {
         validate_batch_request(&self.metadata, &request)?;
@@ -3344,8 +3387,14 @@ impl DiffusionPipeline {
             None,
             progress,
         )?;
+        let mut generation_runtime_kind = runtime.kind;
         let images = if request.send_images {
-            let rgb = runtime.decoder.decode_to_rgb8(&latents)?;
+            let (rgb, image_runtime_kind) = decode_to_rgb8_with_runtime_options(
+                runtime.decoder.as_ref(),
+                &latents,
+                runtime_options,
+            )?;
+            generation_runtime_kind = image_runtime_kind;
             encode_rgb_batch_png_base64(&rgb)?
         } else {
             Vec::new()
@@ -3354,7 +3403,7 @@ impl DiffusionPipeline {
             images,
             info: diffusion_generation_info(
                 self.summary(),
-                runtime.kind,
+                generation_runtime_kind,
                 &request,
                 &plan.latent_shape,
             ),
@@ -3365,7 +3414,11 @@ impl DiffusionPipeline {
         &self,
         request: DiffusionImg2ImgRequest,
     ) -> DiffusionResult<DiffusionBatchOutput> {
-        self.generate_img2img_batch_inner(request, None)
+        self.generate_img2img_batch_inner(
+            request,
+            DiffusionGenerationRuntimeOptions::default(),
+            None,
+        )
     }
 
     pub fn generate_img2img_batch_with_progress(
@@ -3373,12 +3426,34 @@ impl DiffusionPipeline {
         request: DiffusionImg2ImgRequest,
         progress: &mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>,
     ) -> DiffusionResult<DiffusionBatchOutput> {
-        self.generate_img2img_batch_inner(request, Some(progress))
+        self.generate_img2img_batch_inner(
+            request,
+            DiffusionGenerationRuntimeOptions::default(),
+            Some(progress),
+        )
+    }
+
+    pub fn generate_img2img_batch_with_runtime_options(
+        &self,
+        request: DiffusionImg2ImgRequest,
+        runtime_options: DiffusionGenerationRuntimeOptions,
+    ) -> DiffusionResult<DiffusionBatchOutput> {
+        self.generate_img2img_batch_inner(request, runtime_options, None)
+    }
+
+    pub fn generate_img2img_batch_with_progress_and_runtime_options(
+        &self,
+        request: DiffusionImg2ImgRequest,
+        runtime_options: DiffusionGenerationRuntimeOptions,
+        progress: &mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>,
+    ) -> DiffusionResult<DiffusionBatchOutput> {
+        self.generate_img2img_batch_inner(request, runtime_options, Some(progress))
     }
 
     fn generate_img2img_batch_inner(
         &self,
         request: DiffusionImg2ImgRequest,
+        runtime_options: DiffusionGenerationRuntimeOptions,
         progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
     ) -> DiffusionResult<DiffusionBatchOutput> {
         validate_img2img_request(&self.metadata, &request)?;
@@ -3523,15 +3598,21 @@ impl DiffusionPipeline {
         } else {
             false
         };
+        let mut generation_runtime_kind = runtime.kind;
         let images = if request.batch.send_images {
-            let rgb = runtime.decoder.decode_to_rgb8(&latents)?;
+            let (rgb, image_runtime_kind) = decode_to_rgb8_with_runtime_options(
+                runtime.decoder.as_ref(),
+                &latents,
+                runtime_options,
+            )?;
+            generation_runtime_kind = image_runtime_kind;
             encode_rgb_batch_png_base64(&rgb)?
         } else {
             Vec::new()
         };
         let mut info = diffusion_generation_info(
             self.summary(),
-            runtime.kind,
+            generation_runtime_kind,
             &request.batch,
             &plan.latent_shape,
         );
@@ -3764,13 +3845,41 @@ impl DiffusionNoiseBackend for NativeUnet2DConditionModel {
 }
 
 trait DiffusionImageDecoder: Send + Sync {
-    fn decode_to_rgb8(&self, latents: &LatentBatch) -> DiffusionResult<RgbImageBatch>;
+    fn decode_to_rgb_tensor(&self, latents: &LatentBatch) -> DiffusionResult<CpuTensor>;
 }
 
 impl DiffusionImageDecoder for NativeVaeDecoder {
-    fn decode_to_rgb8(&self, latents: &LatentBatch) -> DiffusionResult<RgbImageBatch> {
-        NativeVaeDecoder::decode_to_rgb8(self, latents)
+    fn decode_to_rgb_tensor(&self, latents: &LatentBatch) -> DiffusionResult<CpuTensor> {
+        NativeVaeDecoder::decode_latents(self, latents)
     }
+}
+
+fn decode_to_rgb8_with_runtime_options(
+    decoder: &dyn DiffusionImageDecoder,
+    latents: &LatentBatch,
+    runtime_options: DiffusionGenerationRuntimeOptions,
+) -> DiffusionResult<(RgbImageBatch, DiffusionRuntimeKind)> {
+    let decoded = decoder.decode_to_rgb_tensor(latents)?;
+    if let Some(device_id) = runtime_options.rocm_device_id {
+        #[cfg(feature = "rocm")]
+        {
+            let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            let rgb = rgb_tensor_to_u8_hip_on_gpu(&mut gpu, &decoded)?;
+            return Ok((rgb, DiffusionRuntimeKind::RocmHybridReference));
+        }
+        #[cfg(not(feature = "rocm"))]
+        {
+            let _ = device_id;
+            return Err(DiffusionError::BackendUnavailable(
+                "ROCm hybrid diffusion generation requested, but hipfire-diffusion was built without the rocm feature".to_string(),
+            ));
+        }
+    }
+    Ok((
+        rgb_tensor_to_u8(&decoded)?,
+        DiffusionRuntimeKind::CpuSourceReference,
+    ))
 }
 
 struct NativeDiffusionRuntime {
@@ -14176,8 +14285,8 @@ mod tests {
             target_height: None,
             crop_x: 0,
             crop_y: 0,
-            steps: 1,
-            cfg_scale: 1.0,
+            steps: 2,
+            cfg_scale: 7.0,
             scheduler: "Euler".into(),
             subseed_strength: 0.25,
             send_images: true,
@@ -17023,6 +17132,99 @@ mod tests {
     }
 
     #[test]
+    fn runtime_options_default_decode_uses_cpu_rgb_conversion() {
+        let latents = LatentBatch {
+            batch: 1,
+            channels: 1,
+            height: 2,
+            width: 2,
+            data: vec![0.0, 0.25, 0.5, 0.75],
+        };
+        let (rgb, runtime_kind) = decode_to_rgb8_with_runtime_options(
+            &SolidTensorImageDecoder,
+            &latents,
+            DiffusionGenerationRuntimeOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(runtime_kind, DiffusionRuntimeKind::CpuSourceReference);
+        assert_eq!(rgb, SolidTensorImageDecoder::expected_rgb(&latents));
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn runtime_options_rocm_hybrid_decode_matches_cpu_when_gpu_is_available() {
+        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+            eprintln!("skip: ROCm GPU unavailable for hybrid decode test: {error}");
+            return;
+        }
+        let latents = LatentBatch {
+            batch: 2,
+            channels: 1,
+            height: 2,
+            width: 3,
+            data: vec![0.0; 12],
+        };
+        let (rgb, runtime_kind) = decode_to_rgb8_with_runtime_options(
+            &SolidTensorImageDecoder,
+            &latents,
+            DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
+        )
+        .unwrap();
+
+        assert_eq!(runtime_kind, DiffusionRuntimeKind::RocmHybridReference);
+        assert_eq!(rgb, SolidTensorImageDecoder::expected_rgb(&latents));
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn generate_batch_runtime_options_surface_rocm_hybrid_runtime_when_gpu_is_available() {
+        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+            eprintln!("skip: ROCm GPU unavailable for hybrid generation test: {error}");
+            return;
+        }
+        let pipeline = tiny_txt2img_test_pipeline(Box::new(SolidTensorImageDecoder));
+        let request = DiffusionBatchRequest {
+            prompts: vec![DiffusionPrompt {
+                prompt: "a cat".into(),
+                negative_prompt: String::new(),
+                seed: 7,
+                subseed: None,
+            }],
+            width: 2,
+            height: 2,
+            original_width: None,
+            original_height: None,
+            target_width: None,
+            target_height: None,
+            crop_x: 0,
+            crop_y: 0,
+            steps: 2,
+            cfg_scale: 7.0,
+            scheduler: "Euler".into(),
+            subseed_strength: 0.0,
+            send_images: true,
+            save_images: false,
+        };
+
+        let output = pipeline
+            .generate_batch_with_runtime_options(
+                request,
+                DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
+            )
+            .unwrap();
+
+        assert_eq!(output.images.len(), 1);
+        assert_eq!(output.info["runtime"], "rocm-hybrid-reference");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&output.images[0])
+            .unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap().to_rgb8();
+        assert_eq!(decoded.dimensions(), (2, 2));
+        assert_eq!(decoded.get_pixel(0, 0).0, [32, 128, 224]);
+    }
+
+    #[test]
     fn diffusion_pipeline_prepares_secondary_clip_conditioning_when_available() {
         let mut metadata = tiny_runtime_metadata();
         metadata.pipeline.class_name = "StableDiffusionXLPipeline".into();
@@ -19291,21 +19493,122 @@ mod tests {
     struct TestImageDecoder;
 
     impl DiffusionImageDecoder for TestImageDecoder {
-        fn decode_to_rgb8(&self, latents: &LatentBatch) -> DiffusionResult<RgbImageBatch> {
+        fn decode_to_rgb_tensor(&self, latents: &LatentBatch) -> DiffusionResult<CpuTensor> {
             let mut data = Vec::with_capacity(latents.batch * latents.height * latents.width * 3);
             let image_len = latents.len_per_batch();
             for batch in 0..latents.batch {
-                for idx in 0..(latents.height * latents.width) {
-                    let value = (latents.data[batch * image_len + idx] * 255.0).round() as u8;
-                    data.extend_from_slice(&[value, 255u8.saturating_sub(value), value / 2]);
+                let mut red = Vec::with_capacity(latents.height * latents.width);
+                let mut green = Vec::with_capacity(latents.height * latents.width);
+                let mut blue = Vec::with_capacity(latents.height * latents.width);
+                for pixel in 0..(latents.height * latents.width) {
+                    let value = (latents.data[batch * image_len + pixel] * 255.0).round() as u8;
+                    red.push(rgb_byte_to_model_value(value));
+                    green.push(rgb_byte_to_model_value(255u8.saturating_sub(value)));
+                    blue.push(rgb_byte_to_model_value(value / 2));
                 }
+                data.extend(red);
+                data.extend(green);
+                data.extend(blue);
             }
-            Ok(RgbImageBatch {
+            Ok(CpuTensor {
+                shape: vec![latents.batch, 3, latents.height, latents.width],
+                data,
+            })
+        }
+    }
+
+    fn rgb_byte_to_model_value(value: u8) -> f32 {
+        (value as f32) / 127.5 - 1.0
+    }
+
+    struct SolidTensorImageDecoder;
+
+    impl DiffusionImageDecoder for SolidTensorImageDecoder {
+        fn decode_to_rgb_tensor(&self, latents: &LatentBatch) -> DiffusionResult<CpuTensor> {
+            let pixels = latents.batch * latents.height * latents.width;
+            let mut data = Vec::with_capacity(pixels * 3);
+            let pixels_per_batch = latents.height * latents.width;
+            for _ in 0..latents.batch {
+                data.extend(std::iter::repeat(rgb_byte_to_model_value(32)).take(pixels_per_batch));
+                data.extend(std::iter::repeat(rgb_byte_to_model_value(128)).take(pixels_per_batch));
+                data.extend(std::iter::repeat(rgb_byte_to_model_value(224)).take(pixels_per_batch));
+            }
+            Ok(CpuTensor {
+                shape: vec![latents.batch, 3, latents.height, latents.width],
+                data,
+            })
+        }
+    }
+
+    impl SolidTensorImageDecoder {
+        fn expected_rgb(latents: &LatentBatch) -> RgbImageBatch {
+            let pixels = latents.batch * latents.height * latents.width;
+            let mut data = Vec::with_capacity(pixels * 3);
+            for _ in 0..pixels {
+                data.extend_from_slice(&[32, 128, 224]);
+            }
+            RgbImageBatch {
                 batch: latents.batch,
                 width: latents.width,
                 height: latents.height,
                 data,
-            })
+            }
+        }
+    }
+
+    #[cfg(feature = "rocm")]
+    fn tiny_txt2img_test_pipeline(decoder: Box<dyn DiffusionImageDecoder>) -> DiffusionPipeline {
+        let metadata = tiny_runtime_metadata();
+        let config = tiny_runtime_config();
+        let tokenizer = ClipTokenizer::from_bytes(
+            br#"{
+                "<|startoftext|>": 0,
+                "<|endoftext|>": 1,
+                "a</w>": 2,
+                "cat</w>": 3
+            }"#,
+            b"#version: 0.2\n",
+            4,
+        )
+        .unwrap();
+        let text_encoder = ClipTextEncoder {
+            token_embedding: CpuTensor {
+                shape: vec![4, 2],
+                data: vec![0.0, 0.0, 0.2, 0.1, 0.4, 0.3, 0.6, 0.5],
+            },
+            position_embedding: CpuTensor {
+                shape: vec![4, 2],
+                data: vec![0.0; 8],
+            },
+            layers: Vec::new(),
+            final_layer_norm_weight: CpuTensor {
+                shape: vec![2],
+                data: vec![1.0, 1.0],
+            },
+            final_layer_norm_bias: CpuTensor {
+                shape: vec![2],
+                data: vec![0.0, 0.0],
+            },
+            text_projection: None,
+            hidden_size: 2,
+            max_length: 4,
+            n_heads: 1,
+        };
+        DiffusionPipeline {
+            summary: summarize_hfq(Path::new("/tmp/tiny-runtime.hfq"), &metadata),
+            metadata,
+            config,
+            tokenizer: Some(tokenizer),
+            tokenizer_2: None,
+            text_encoder: Some(text_encoder),
+            text_encoder_2: None,
+            native_runtime: Some(NativeDiffusionRuntime {
+                kind: DiffusionRuntimeKind::CpuSourceReference,
+                noise: Box::new(TestNoiseBackend),
+                encoder: None,
+                decoder,
+            }),
+            native_runtime_error: None,
         }
     }
 
