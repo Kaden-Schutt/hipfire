@@ -208,7 +208,7 @@ Runtime note: runnable `.hfq` diffusion artifacts still perform CLIP tokenizatio
 
 `/sdapi/v1/progress` tracks active SDAPI sampling steps and returns the final generated PNG in `current_image` after a successful HFQ diffusion request completes. Live per-step latent preview decoding is not implemented yet.
 
-Img2img and inpaint resize init and mask images to the requested output dimensions before VAE encoding. Txt2img high-res generation is implemented as a batched first-pass txt2img generation followed by a second-pass img2img generation at the high-res target dimensions. SDAPI high-res requests accept `enable_hr`, `hr_scale`, `hr_resize_x`, `hr_resize_y`, `hr_second_pass_steps`, `hr_prompt`, `hr_negative_prompt`, `hr_sampler_name`, and `hr_scheduler`.
+Img2img and inpaint resize init and mask images to the requested output dimensions before VAE encoding. Txt2img high-res generation is implemented as a batched first-pass txt2img generation followed by a second-pass img2img generation at the high-res target dimensions. SDAPI high-res requests accept `enable_hr`, `firstphase_width`, `firstphase_height`, `hr_scale`, `hr_resize_x`, `hr_resize_y`, `hr_second_pass_steps`, `hr_prompt`, `hr_negative_prompt`, `hr_sampler_name`, and `hr_scheduler`.
 
 The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128, HFQ4G256, and HFQ6G256 tensor payloads. Other packed payloads require a matching diffusion dequantizer/runtime implementation.
 
@@ -324,6 +324,8 @@ With `--enable-hr`, the command first generates the requested base batch, decode
 * `--height <HEIGHT>` — Output image height in pixels
 
   Default value: `512`
+* `--firstphase-width <FIRSTPHASE_WIDTH>` — First-pass high-res width before upscale; preserves --width/--height aspect when used alone
+* `--firstphase-height <FIRSTPHASE_HEIGHT>` — First-pass high-res height before upscale; preserves --width/--height aspect when used alone
 * `--steps <STEPS>` — Denoising steps
 
   Default value: `20`

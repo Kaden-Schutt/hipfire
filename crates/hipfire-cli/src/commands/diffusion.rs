@@ -141,6 +141,12 @@ pub struct DiffusionTxt2ImgArgs {
     /// Output image height in pixels
     #[arg(long, default_value_t = 512)]
     pub height: u32,
+    /// First-pass high-res width before upscale; preserves --width/--height aspect when used alone
+    #[arg(long)]
+    pub firstphase_width: Option<u32>,
+    /// First-pass high-res height before upscale; preserves --width/--height aspect when used alone
+    #[arg(long)]
+    pub firstphase_height: Option<u32>,
     /// Denoising steps
     #[arg(long, default_value_t = 20)]
     pub steps: u32,
@@ -455,6 +461,14 @@ fn generate_highres_txt2img(
             args.hr_denoising_strength
         );
     }
+    let (firstpass_width, firstpass_height) = highres_first_pass_dimensions(
+        args.width,
+        args.height,
+        args.firstphase_width,
+        args.firstphase_height,
+    )?;
+    first_pass_request.width = firstpass_width;
+    first_pass_request.height = firstpass_height;
     first_pass_request.send_images = true;
     let first_pass = pipeline
         .generate_batch_with_runtime_options(first_pass_request.clone(), runtime_options)?;
@@ -486,10 +500,13 @@ fn generate_highres_txt2img(
     if let Some(map) = output.info.as_object_mut() {
         map.insert("mode".to_string(), serde_json::json!("txt2img-hires"));
         map.insert("highres".to_string(), serde_json::json!(true));
-        map.insert("firstpass_width".to_string(), serde_json::json!(args.width));
+        map.insert(
+            "firstpass_width".to_string(),
+            serde_json::json!(firstpass_width),
+        );
         map.insert(
             "firstpass_height".to_string(),
-            serde_json::json!(args.height),
+            serde_json::json!(firstpass_height),
         );
         map.insert("hr_width".to_string(), serde_json::json!(target_width));
         map.insert("hr_height".to_string(), serde_json::json!(target_height));
@@ -499,6 +516,33 @@ fn generate_highres_txt2img(
         );
     }
     Ok(output)
+}
+
+fn highres_first_pass_dimensions(
+    base_width: u32,
+    base_height: u32,
+    firstphase_width: Option<u32>,
+    firstphase_height: Option<u32>,
+) -> anyhow::Result<(u32, u32)> {
+    if base_width == 0 || base_height == 0 {
+        anyhow::bail!("high-res txt2img requires non-zero base width and height");
+    }
+    match (
+        firstphase_width.unwrap_or(0),
+        firstphase_height.unwrap_or(0),
+    ) {
+        (0, 0) => Ok((base_width, base_height)),
+        (width, height) if width > 0 && height > 0 => Ok((width, height)),
+        (width, 0) => Ok((
+            width,
+            aspect_scaled_dimension(width, base_height, base_width, "first-pass height")?,
+        )),
+        (0, height) => Ok((
+            aspect_scaled_dimension(height, base_width, base_height, "first-pass width")?,
+            height,
+        )),
+        _ => unreachable!("zero firstphase dimensions are handled by earlier match arms"),
+    }
 }
 
 fn highres_target_dimensions(
@@ -1056,6 +1100,8 @@ mod tests {
             output: PathBuf::from("out.png"),
             width: 64,
             height: 64,
+            firstphase_width: None,
+            firstphase_height: None,
             steps: 1,
             cfg_scale: 1.0,
             scheduler: "Automatic".to_string(),
@@ -1157,6 +1203,27 @@ mod tests {
             (7, 5)
         );
         assert!(highres_target_dimensions(2, 3, 0.0, None, None).is_err());
+    }
+
+    #[test]
+    fn highres_first_pass_dimensions_support_firstphase_modes() {
+        assert_eq!(
+            highres_first_pass_dimensions(4, 2, None, None).unwrap(),
+            (4, 2)
+        );
+        assert_eq!(
+            highres_first_pass_dimensions(4, 2, Some(2), Some(2)).unwrap(),
+            (2, 2)
+        );
+        assert_eq!(
+            highres_first_pass_dimensions(4, 2, Some(8), None).unwrap(),
+            (8, 4)
+        );
+        assert_eq!(
+            highres_first_pass_dimensions(4, 2, None, Some(3)).unwrap(),
+            (6, 3)
+        );
+        assert!(highres_first_pass_dimensions(0, 2, Some(8), None).is_err());
     }
 
     #[test]

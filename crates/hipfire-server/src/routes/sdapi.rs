@@ -59,6 +59,8 @@ pub struct SdGenerationRequest {
     pub include_init_images: Option<bool>,
     pub denoising_strength: Option<f64>,
     pub enable_hr: Option<bool>,
+    pub firstphase_width: Option<u32>,
+    pub firstphase_height: Option<u32>,
     pub hr_scale: Option<f64>,
     pub hr_resize_x: Option<u32>,
     pub hr_resize_y: Option<u32>,
@@ -342,7 +344,11 @@ async fn execute_hfq_diffusion_txt2img(
     body: SdGenerationRequest,
 ) -> Response {
     let original_send_images = body.send_images.unwrap_or(true);
-    let request = match sd_request_to_diffusion_batch_request(&body, None, 0) {
+    let first_pass_body = match sdapi_txt2img_first_pass_body(&body) {
+        Ok(body) => body,
+        Err(error) => return diffusion_error_response(error),
+    };
+    let request = match sd_request_to_diffusion_batch_request(&first_pass_body, None, 0) {
         Ok(request) => request,
         Err(error) => return diffusion_error_response(error),
     };
@@ -352,7 +358,7 @@ async fn execute_hfq_diffusion_txt2img(
     };
     let n_iter = sd_request_n_iter(&body);
     let save_images = body.save_images.unwrap_or(false);
-    let highres_target = match sdapi_highres_target_dimensions(&body) {
+    let highres_target = match sdapi_highres_target_dimensions(&first_pass_body) {
         Ok(target) => target,
         Err(error) => return diffusion_error_response(error),
     };
@@ -369,12 +375,16 @@ async fn execute_hfq_diffusion_txt2img(
     );
     let worker_progress_state = progress_state.clone();
     let worker_body = body.clone();
+    let worker_first_pass_body = first_pass_body.clone();
     let output = match tokio::task::spawn_blocking(move || {
         let mut outputs = Vec::with_capacity(n_iter as usize);
         for iter in 0..n_iter {
             let iter_seed_offset = iter.saturating_mul(batch_size_for_body(&worker_body));
-            let mut iter_request =
-                sd_request_to_diffusion_batch_request(&worker_body, None, iter_seed_offset)?;
+            let mut iter_request = sd_request_to_diffusion_batch_request(
+                &worker_first_pass_body,
+                None,
+                iter_seed_offset,
+            )?;
             if save_images || highres_target.is_some() {
                 iter_request.send_images = true;
             }
@@ -414,7 +424,7 @@ async fn execute_hfq_diffusion_txt2img(
                 denoising_strength: worker_body.denoising_strength.unwrap_or(0.75) as f32,
             };
             let highres_step_offset =
-                base_step_offset.saturating_add(first_output_steps(&worker_body));
+                base_step_offset.saturating_add(first_output_steps(&worker_first_pass_body));
             let mut progress = |progress: DiffusionProgress| {
                 update_sdapi_progress(
                     &worker_progress_state,
@@ -435,6 +445,10 @@ async fn execute_hfq_diffusion_txt2img(
             annotate_highres_txt2img_info(
                 &mut highres_output.info,
                 &worker_body,
+                (
+                    worker_first_pass_body.width.unwrap_or(512),
+                    worker_first_pass_body.height.unwrap_or(512),
+                ),
                 target_dimensions,
             );
             outputs.push(highres_output);
@@ -1294,6 +1308,61 @@ fn sdapi_txt2img_highres_steps(
     }
 }
 
+fn sdapi_txt2img_first_pass_body(
+    body: &SdGenerationRequest,
+) -> Result<SdGenerationRequest, DiffusionError> {
+    let Some((width, height)) = sdapi_highres_first_pass_dimensions(body)? else {
+        return Ok(body.clone());
+    };
+    let mut first_pass_body = body.clone();
+    first_pass_body.width = Some(width);
+    first_pass_body.height = Some(height);
+    Ok(first_pass_body)
+}
+
+fn sdapi_highres_first_pass_dimensions(
+    body: &SdGenerationRequest,
+) -> Result<Option<(u32, u32)>, DiffusionError> {
+    if !body.enable_hr.unwrap_or(false) {
+        return Ok(None);
+    }
+    let firstphase_width = body.firstphase_width.unwrap_or(0);
+    let firstphase_height = body.firstphase_height.unwrap_or(0);
+    match (firstphase_width, firstphase_height) {
+        (0, 0) => Ok(None),
+        (width, height) if width > 0 && height > 0 => Ok(Some((width, height))),
+        (width, 0) => {
+            let base_width = body.width.unwrap_or(512);
+            let base_height = body.height.unwrap_or(512);
+            if base_width == 0 || base_height == 0 {
+                return Err(DiffusionError::InvalidRequest(
+                    "highres txt2img requires non-zero base width and height for firstphase_width"
+                        .to_string(),
+                ));
+            }
+            Ok(Some((
+                width,
+                aspect_scaled_dimension(width, base_height, base_width, "first-pass height")?,
+            )))
+        }
+        (0, height) => {
+            let base_width = body.width.unwrap_or(512);
+            let base_height = body.height.unwrap_or(512);
+            if base_width == 0 || base_height == 0 {
+                return Err(DiffusionError::InvalidRequest(
+                    "highres txt2img requires non-zero base width and height for firstphase_height"
+                        .to_string(),
+                ));
+            }
+            Ok(Some((
+                aspect_scaled_dimension(height, base_width, base_height, "first-pass width")?,
+                height,
+            )))
+        }
+        _ => unreachable!("zero firstphase dimensions are handled by earlier match arms"),
+    }
+}
+
 fn sdapi_highres_second_pass_body(
     body: &SdGenerationRequest,
     target_dimensions: (u32, u32),
@@ -1413,6 +1482,7 @@ fn aspect_scaled_dimension(
 fn annotate_highres_txt2img_info(
     info: &mut Value,
     body: &SdGenerationRequest,
+    first_pass_dimensions: (u32, u32),
     target_dimensions: (u32, u32),
 ) {
     if let Value::Object(map) = info {
@@ -1420,11 +1490,11 @@ fn annotate_highres_txt2img_info(
         map.insert("highres".to_string(), json!(true));
         map.insert(
             "firstpass_width".to_string(),
-            json!(body.width.unwrap_or(512)),
+            json!(first_pass_dimensions.0),
         );
         map.insert(
             "firstpass_height".to_string(),
-            json!(body.height.unwrap_or(512)),
+            json!(first_pass_dimensions.1),
         );
         map.insert("hr_width".to_string(), json!(target_dimensions.0));
         map.insert("hr_height".to_string(), json!(target_dimensions.1));
@@ -2217,12 +2287,14 @@ mod tests {
             model: Some(hfq_path.to_string_lossy().into_owned()),
             steps: Some(1),
             cfg_scale: Some(1.0),
-            width: Some(2),
+            width: Some(4),
             height: Some(2),
             send_images: Some(true),
             save_images: Some(false),
             denoising_strength: Some(1.0),
             enable_hr: Some(true),
+            firstphase_width: Some(2),
+            firstphase_height: Some(2),
             hr_scale: Some(2.0),
             hr_second_pass_steps: Some(1),
             hr_prompt: Some("a highres dog".to_string()),
@@ -3573,6 +3645,47 @@ mod tests {
     }
 
     #[test]
+    fn txt2img_highres_first_pass_body_applies_firstphase_dimensions() {
+        let explicit = SdGenerationRequest {
+            width: Some(4),
+            height: Some(2),
+            enable_hr: Some(true),
+            firstphase_width: Some(2),
+            firstphase_height: Some(2),
+            ..empty_request()
+        };
+        let first_pass = sdapi_txt2img_first_pass_body(&explicit).unwrap();
+        assert_eq!(first_pass.width, Some(2));
+        assert_eq!(first_pass.height, Some(2));
+        assert_eq!(
+            sdapi_highres_target_dimensions(&first_pass).unwrap(),
+            Some((4, 4))
+        );
+
+        let width_only = SdGenerationRequest {
+            width: Some(4),
+            height: Some(2),
+            enable_hr: Some(true),
+            firstphase_width: Some(8),
+            ..empty_request()
+        };
+        let first_pass = sdapi_txt2img_first_pass_body(&width_only).unwrap();
+        assert_eq!(first_pass.width, Some(8));
+        assert_eq!(first_pass.height, Some(4));
+
+        let disabled = SdGenerationRequest {
+            width: Some(4),
+            height: Some(2),
+            firstphase_width: Some(8),
+            firstphase_height: Some(4),
+            ..empty_request()
+        };
+        let first_pass = sdapi_txt2img_first_pass_body(&disabled).unwrap();
+        assert_eq!(first_pass.width, Some(4));
+        assert_eq!(first_pass.height, Some(2));
+    }
+
+    #[test]
     fn txt2img_highres_second_pass_body_applies_prompt_and_sampler_overrides() {
         let body = SdGenerationRequest {
             prompt: "base prompt".to_string(),
@@ -3655,6 +3768,8 @@ mod tests {
             include_init_images: None,
             denoising_strength: None,
             enable_hr: None,
+            firstphase_width: None,
+            firstphase_height: None,
             hr_scale: None,
             hr_resize_x: None,
             hr_resize_y: None,
