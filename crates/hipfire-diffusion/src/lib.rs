@@ -203,6 +203,8 @@ pub struct DiffusionHipPreflight {
     pub model_input_kernel_probe: DiffusionHipKernelProbe,
     pub guidance_kernel_probe: DiffusionHipKernelProbe,
     pub scheduler_kernel_probe: DiffusionHipKernelProbe,
+    pub center_unet_input_kernel_probe: DiffusionHipKernelProbe,
+    pub timestep_embedding_kernel_probe: DiffusionHipKernelProbe,
     pub tensor_add_kernel_probe: DiffusionHipKernelProbe,
     pub add_channel_bias_kernel_probe: DiffusionHipKernelProbe,
     pub nchw_to_bsc_kernel_probe: DiffusionHipKernelProbe,
@@ -2473,6 +2475,56 @@ impl DiffusionPipeline {
                 "HIP diffusion scheduler kernel output differed from CPU reference".to_string(),
             ));
         }
+        let center_input = CpuTensor {
+            shape: vec![1, 2, 2, 2],
+            data: vec![-1.0, -0.25, 0.0, 0.5, 1.0, 2.0, -2.0, 0.125],
+        };
+        let center_unet_input_cpu_reference = maybe_center_unet_input(&center_input, true);
+        let center_unet_input_gpu_output =
+            maybe_center_unet_input_hip_on_gpu(&mut gpu, &center_input, true)?;
+        let center_unet_input_kernel_probe = DiffusionHipKernelProbe {
+            name: "diffusion_center_unet_input_f32".to_string(),
+            input_elements: center_input.data.len(),
+            output_bytes: center_unet_input_gpu_output.data.len() * std::mem::size_of::<f32>(),
+            matched_cpu_reference: center_unet_input_gpu_output.shape
+                == center_unet_input_cpu_reference.shape
+                && center_unet_input_gpu_output.data == center_unet_input_cpu_reference.data,
+        };
+        if !center_unet_input_kernel_probe.matched_cpu_reference {
+            return Err(DiffusionError::BackendUnavailable(
+                "HIP diffusion centered UNet input kernel output differed from CPU reference"
+                    .to_string(),
+            ));
+        }
+        let timestep_values = vec![999.0, 500.5, 0.25];
+        let timestep_embedding_dim = 7;
+        let timestep_embedding_cpu_reference =
+            timestep_embedding(&timestep_values, timestep_embedding_dim, true, 1.0)?;
+        let timestep_embedding_gpu_output = timestep_embedding_hip_on_gpu(
+            &mut gpu,
+            &timestep_values,
+            timestep_embedding_dim,
+            true,
+            1.0,
+        )?;
+        let timestep_embedding_kernel_probe = DiffusionHipKernelProbe {
+            name: "diffusion_timestep_embedding_f32".to_string(),
+            input_elements: timestep_values.len(),
+            output_bytes: timestep_embedding_gpu_output.data.len() * std::mem::size_of::<f32>(),
+            matched_cpu_reference: timestep_embedding_gpu_output.shape
+                == timestep_embedding_cpu_reference.shape
+                && f32_slices_close(
+                    &timestep_embedding_gpu_output.data,
+                    &timestep_embedding_cpu_reference.data,
+                    1e-5,
+                ),
+        };
+        if !timestep_embedding_kernel_probe.matched_cpu_reference {
+            return Err(DiffusionError::BackendUnavailable(
+                "HIP diffusion timestep embedding kernel output differed from CPU reference"
+                    .to_string(),
+            ));
+        }
         let tensor_add_left = CpuTensor {
             shape: vec![1, 2, 2, 3],
             data: (0..12)
@@ -3003,6 +3055,8 @@ impl DiffusionPipeline {
             model_input_kernel_probe,
             guidance_kernel_probe,
             scheduler_kernel_probe,
+            center_unet_input_kernel_probe,
+            timestep_embedding_kernel_probe,
             tensor_add_kernel_probe,
             add_channel_bias_kernel_probe,
             nchw_to_bsc_kernel_probe,
@@ -5685,6 +5739,54 @@ extern "C" __global__ void diffusion_tensor_add_f32(
     }
     output[idx] = a[idx] + b[idx];
 }
+
+extern "C" __global__ void diffusion_center_unet_input_f32(
+    const float* sample,
+    float* output,
+    int n,
+    float unused
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    output[idx] = sample[idx] * 2.0f - 1.0f;
+}
+"#;
+
+#[cfg(feature = "rocm")]
+const DIFFUSION_TIMESTEP_EMBEDDING_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void diffusion_timestep_embedding_f32(
+    const float* timesteps,
+    float* output,
+    int total_outputs,
+    int dim,
+    int half,
+    int flip_sin_to_cos,
+    float freq_shift
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_outputs) {
+        return;
+    }
+    int col = idx % dim;
+    int row = idx / dim;
+    if (half <= 0 || col >= half * 2) {
+        output[idx] = 0.0f;
+        return;
+    }
+    int frequency_idx = col < half ? col : col - half;
+    float denom = fmaxf((float)half - freq_shift, 1.0f);
+    float frequency = expf(-logf(10000.0f) * (float)frequency_idx / denom);
+    float value = timesteps[row] * frequency;
+    if (col < half) {
+        output[idx] = flip_sin_to_cos ? cosf(value) : sinf(value);
+    } else {
+        output[idx] = flip_sin_to_cos ? sinf(value) : cosf(value);
+    }
+}
 "#;
 
 #[cfg(feature = "rocm")]
@@ -6537,6 +6639,60 @@ fn tensor_add_hip_on_gpu(
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
     Ok(CpuTensor {
         shape: a.shape.clone(),
+        data,
+    })
+}
+
+#[cfg(feature = "rocm")]
+fn maybe_center_unet_input_hip_on_gpu(
+    gpu: &mut rdna_compute::Gpu,
+    sample: &CpuTensor,
+    center_input_sample: bool,
+) -> DiffusionResult<CpuTensor> {
+    if !center_input_sample {
+        return Ok(sample.clone());
+    }
+    if sample.data.is_empty() {
+        return Ok(CpuTensor::zeros(&sample.shape));
+    }
+    let n = i32::try_from(sample.data.len()).map_err(|_| {
+        DiffusionError::InvalidRequest(format!(
+            "UNet input length {} exceeds i32",
+            sample.data.len()
+        ))
+    })?;
+    let output_bytes = sample
+        .data
+        .len()
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata("UNet centered input size overflows".to_string())
+        })?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let sample_gpu = gpu
+        .upload_f32(&sample.data, &sample.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = gpu
+        .hip
+        .malloc(output_bytes)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    launch_diffusion_vector_kernel(
+        gpu,
+        "diffusion_center_unet_input_f32",
+        DIFFUSION_DENOISE_VECTOR_HIP_SRC,
+        &output_gpu,
+        &sample_gpu,
+        None,
+        n,
+        0.0,
+    )?;
+    let data = download_f32_buffer(gpu, &output_gpu, sample.data.len())?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(CpuTensor {
+        shape: sample.shape.clone(),
         data,
     })
 }
@@ -7965,6 +8121,103 @@ fn geglu_gate_3d_hip_on_gpu(
     )?);
     kernargs.push_i32(i32_kernel_dim("GeGLU gate inner width", inner)?);
     kernargs.push_i32(i32_kernel_dim("GeGLU gate projected width", width)?);
+    kernargs.pad_to(16);
+    let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+    unsafe {
+        gpu.hip
+            .launch_kernel_blob(
+                &function,
+                grid,
+                [256, 1, 1],
+                0,
+                gpu.active_stream.as_ref(),
+                kernargs.as_mut_slice(),
+            )
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(CpuTensor {
+        shape: output_shape.to_vec(),
+        data,
+    })
+}
+
+#[cfg(feature = "rocm")]
+fn timestep_embedding_hip_on_gpu(
+    gpu: &mut rdna_compute::Gpu,
+    timesteps: &[f32],
+    dim: usize,
+    flip_sin_to_cos: bool,
+    freq_shift: f32,
+) -> DiffusionResult<CpuTensor> {
+    if dim == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "timestep embedding dimension must be positive".to_string(),
+        ));
+    }
+    let output_shape = [timesteps.len(), dim];
+    let output_elements = checked_shape_elements("timestep embedding output", &output_shape)?;
+    if output_elements == 0 {
+        return Ok(CpuTensor::zeros(&output_shape));
+    }
+    let output_bytes = output_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata("timestep embedding output size overflows".to_string())
+        })?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let timesteps_gpu = gpu
+        .upload_f32(timesteps, &[timesteps.len()])
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = gpu
+        .hip
+        .malloc(output_bytes)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = compiler
+        .compile(
+            "diffusion_timestep_embedding_f32",
+            DIFFUSION_TIMESTEP_EMBEDDING_HIP_SRC,
+        )
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = obj_path
+        .to_str()
+        .ok_or_else(|| {
+            DiffusionError::BackendUnavailable(
+                "compiled diffusion timestep embedding kernel path is not UTF-8".to_string(),
+            )
+        })?
+        .to_string();
+    let module = gpu
+        .hip
+        .module_load(&obj_path)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let function = gpu
+        .hip
+        .module_get_function(&module, "diffusion_timestep_embedding_f32")
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(timesteps_gpu.buf.as_ptr());
+    kernargs.push_ptr(output_gpu.as_ptr());
+    kernargs.push_i32(i32_kernel_dim(
+        "timestep embedding output elements",
+        output_elements,
+    )?);
+    kernargs.push_i32(i32_kernel_dim("timestep embedding dimension", dim)?);
+    kernargs.push_i32(i32_kernel_dim(
+        "timestep embedding half dimension",
+        dim / 2,
+    )?);
+    kernargs.push_i32(if flip_sin_to_cos { 1 } else { 0 });
+    kernargs.push_f32(freq_shift);
     kernargs.pad_to(16);
     let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
     unsafe {
@@ -14828,6 +15081,72 @@ mod tests {
         let hip_guided =
             cfg_guidance_hip_on_gpu(&mut gpu, &negative, &positive, cfg_scale).unwrap();
         assert!(f32_slices_close(&hip_guided, &cpu_guided.data, 1e-6));
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn hip_center_unet_input_matches_cpu_reference_when_gpu_is_available() {
+        let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!(
+                    "skip: ROCm GPU unavailable for centered UNet input parity test: {error}"
+                );
+                return;
+            }
+        };
+        let input = CpuTensor {
+            shape: vec![2, 2, 2, 2],
+            data: (0..16)
+                .map(|idx| idx as f32 / 7.0 - 1.0)
+                .collect::<Vec<_>>(),
+        };
+
+        let cpu_centered = maybe_center_unet_input(&input, true);
+        let hip_centered = maybe_center_unet_input_hip_on_gpu(&mut gpu, &input, true).unwrap();
+        assert_eq!(hip_centered, cpu_centered);
+
+        let cpu_passthrough = maybe_center_unet_input(&input, false);
+        let hip_passthrough = maybe_center_unet_input_hip_on_gpu(&mut gpu, &input, false).unwrap();
+        assert_eq!(hip_passthrough, cpu_passthrough);
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn hip_timestep_embedding_matches_cpu_reference_when_gpu_is_available() {
+        let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!("skip: ROCm GPU unavailable for timestep embedding parity test: {error}");
+                return;
+            }
+        };
+        let timesteps = [999.0, 500.5, 0.25];
+        for (dim, flip_sin_to_cos, freq_shift) in [(7, true, 1.0), (6, false, 0.0), (1, true, 0.0)]
+        {
+            let cpu = timestep_embedding(&timesteps, dim, flip_sin_to_cos, freq_shift).unwrap();
+            let hip = timestep_embedding_hip_on_gpu(
+                &mut gpu,
+                &timesteps,
+                dim,
+                flip_sin_to_cos,
+                freq_shift,
+            )
+            .unwrap();
+
+            assert_eq!(hip.shape, cpu.shape);
+            for (index, (actual, expected)) in hip.data.iter().zip(&cpu.data).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= 1e-5,
+                    "timestep embedding mismatch at {index}: dim={dim} flip={flip_sin_to_cos} shift={freq_shift} hip={actual} cpu={expected}"
+                );
+            }
+            if dim % 2 == 1 {
+                for row in 0..timesteps.len() {
+                    assert_eq!(hip.data[row * dim + dim - 1], 0.0);
+                }
+            }
+        }
     }
 
     #[cfg(feature = "rocm")]
