@@ -63,6 +63,10 @@ pub struct SdGenerationRequest {
     pub hr_resize_x: Option<u32>,
     pub hr_resize_y: Option<u32>,
     pub hr_second_pass_steps: Option<u32>,
+    pub hr_sampler_name: Option<String>,
+    pub hr_scheduler: Option<String>,
+    pub hr_prompt: Option<String>,
+    pub hr_negative_prompt: Option<String>,
     pub rocm_device_id: Option<i32>,
     pub hipfire_rocm_device_id: Option<i32>,
     pub override_settings: Option<Value>,
@@ -1305,7 +1309,29 @@ fn sdapi_highres_second_pass_body(
     highres_body.enable_hr = Some(false);
     highres_body.init_images = None;
     highres_body.mask = None;
+    if let Some(prompt) = highres_override_text(body.hr_prompt.as_deref(), "") {
+        highres_body.prompt = prompt.to_string();
+    }
+    if let Some(negative_prompt) = highres_override_text(body.hr_negative_prompt.as_deref(), "") {
+        highres_body.negative_prompt = negative_prompt.to_string();
+    }
+    if let Some(scheduler) =
+        highres_override_text(body.hr_scheduler.as_deref(), "Use same scheduler")
+    {
+        highres_body.scheduler = Some(scheduler.to_string());
+    } else if let Some(sampler) =
+        highres_override_text(body.hr_sampler_name.as_deref(), "Use same sampler")
+    {
+        highres_body.scheduler = None;
+        highres_body.sampler_name = Some(sampler.to_string());
+    }
     highres_body
+}
+
+fn highres_override_text<'a>(value: Option<&'a str>, same_label: &str) -> Option<&'a str> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != same_label)
 }
 
 fn sdapi_highres_target_dimensions(
@@ -1413,6 +1439,23 @@ fn annotate_highres_txt2img_info(
             "denoising_strength".to_string(),
             json!(body.denoising_strength.unwrap_or(0.75)),
         );
+        if let Some(prompt) = highres_override_text(body.hr_prompt.as_deref(), "") {
+            map.insert("hr_prompt".to_string(), json!(prompt));
+        }
+        if let Some(negative_prompt) = highres_override_text(body.hr_negative_prompt.as_deref(), "")
+        {
+            map.insert("hr_negative_prompt".to_string(), json!(negative_prompt));
+        }
+        if let Some(sampler) =
+            highres_override_text(body.hr_sampler_name.as_deref(), "Use same sampler")
+        {
+            map.insert("hr_sampler_name".to_string(), json!(sampler));
+        }
+        if let Some(scheduler) =
+            highres_override_text(body.hr_scheduler.as_deref(), "Use same scheduler")
+        {
+            map.insert("hr_scheduler".to_string(), json!(scheduler));
+        }
     }
 }
 
@@ -2182,6 +2225,9 @@ mod tests {
             enable_hr: Some(true),
             hr_scale: Some(2.0),
             hr_second_pass_steps: Some(1),
+            hr_prompt: Some("a highres dog".to_string()),
+            hr_negative_prompt: Some("blur".to_string()),
+            hr_sampler_name: Some("Euler".to_string()),
             ..empty_request()
         };
 
@@ -2206,6 +2252,10 @@ mod tests {
         assert_eq!(info["hr_width"], 4);
         assert_eq!(info["hr_height"], 4);
         assert_eq!(info["hr_second_pass_steps"], 1);
+        assert_eq!(info["scheduler"], "Euler");
+        assert_eq!(info["hr_prompt"], "a highres dog");
+        assert_eq!(info["hr_negative_prompt"], "blur");
+        assert_eq!(info["hr_sampler_name"], "Euler");
         let Json(progress) = get_progress(State(state.clone())).await;
         assert_eq!(progress["progress"], 1.0);
         assert_eq!(progress["state"]["sampling_steps"], 2);
@@ -3522,6 +3572,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn txt2img_highres_second_pass_body_applies_prompt_and_sampler_overrides() {
+        let body = SdGenerationRequest {
+            prompt: "base prompt".to_string(),
+            negative_prompt: "base negative".to_string(),
+            steps: Some(4),
+            scheduler: Some("DPM++ 2M".to_string()),
+            sampler_name: Some("Euler a".to_string()),
+            enable_hr: Some(true),
+            hr_second_pass_steps: Some(2),
+            hr_prompt: Some("hires prompt".to_string()),
+            hr_negative_prompt: Some("hires negative".to_string()),
+            hr_sampler_name: Some("Euler".to_string()),
+            hr_scheduler: Some("Use same scheduler".to_string()),
+            init_images: Some(vec!["ignored".to_string()]),
+            mask: Some("ignored".to_string()),
+            ..empty_request()
+        };
+
+        let second = sdapi_highres_second_pass_body(&body, (8, 6));
+
+        assert_eq!(second.width, Some(8));
+        assert_eq!(second.height, Some(6));
+        assert_eq!(second.steps, Some(2));
+        assert_eq!(second.enable_hr, Some(false));
+        assert_eq!(second.init_images, None);
+        assert_eq!(second.mask, None);
+        assert_eq!(second.prompt, "hires prompt");
+        assert_eq!(second.negative_prompt, "hires negative");
+        assert_eq!(second.scheduler, None);
+        assert_eq!(second.sampler_name.as_deref(), Some("Euler"));
+    }
+
+    #[test]
+    fn txt2img_highres_second_pass_body_prefers_hr_scheduler_over_hr_sampler() {
+        let body = SdGenerationRequest {
+            prompt: "base prompt".to_string(),
+            scheduler: Some("DPM++ 2M".to_string()),
+            enable_hr: Some(true),
+            hr_sampler_name: Some("Euler".to_string()),
+            hr_scheduler: Some("DDIM".to_string()),
+            ..empty_request()
+        };
+
+        let second = sdapi_highres_second_pass_body(&body, (8, 6));
+        let request = sd_request_to_diffusion_batch_request(&second, None, 0).unwrap();
+
+        assert_eq!(second.scheduler.as_deref(), Some("DDIM"));
+        assert_eq!(request.scheduler, "DDIM");
+    }
+
     fn empty_request() -> SdGenerationRequest {
         SdGenerationRequest {
             prompt: String::new(),
@@ -3558,6 +3659,10 @@ mod tests {
             hr_resize_x: None,
             hr_resize_y: None,
             hr_second_pass_steps: None,
+            hr_sampler_name: None,
+            hr_scheduler: None,
+            hr_prompt: None,
+            hr_negative_prompt: None,
             rocm_device_id: None,
             hipfire_rocm_device_id: None,
             override_settings: None,

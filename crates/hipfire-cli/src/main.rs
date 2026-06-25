@@ -57,7 +57,10 @@ enum Command {
     /// Img2img and inpaint resize init and mask images to the requested output
     /// dimensions before VAE encoding. Txt2img high-res generation is
     /// implemented as a batched first-pass txt2img generation followed by a
-    /// second-pass img2img generation at the high-res target dimensions.
+    /// second-pass img2img generation at the high-res target dimensions. SDAPI
+    /// high-res requests accept `enable_hr`, `hr_scale`, `hr_resize_x`,
+    /// `hr_resize_y`, `hr_second_pass_steps`, `hr_prompt`,
+    /// `hr_negative_prompt`, `hr_sampler_name`, and `hr_scheduler`.
     ///
     /// The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K,
     /// HFQ4G128, HFQ4G256, and HFQ6G256 tensor payloads. Other packed payloads
