@@ -63,6 +63,7 @@ pub struct SdGenerationRequest {
     pub mask_blur_y: Option<Value>,
     pub mask_round: Option<Value>,
     pub inpainting_mask_invert: Option<Value>,
+    pub inpainting_fill: Option<Value>,
     pub resize_mode: Option<u32>,
     pub include_init_images: Option<bool>,
     pub denoising_strength: Option<f64>,
@@ -446,6 +447,7 @@ async fn execute_hfq_diffusion_txt2img(
                 batch: highres_batch,
                 init_image: first_pass_images,
                 mask: None,
+                inpainting_fill: None,
                 denoising_strength: worker_body.denoising_strength.unwrap_or(0.75) as f32,
             };
             let highres_step_offset =
@@ -550,6 +552,10 @@ async fn execute_hfq_diffusion_img2img(
     let n_iter = sd_request_n_iter(&body);
     let save_images = body.save_images.unwrap_or(false);
     let denoising_strength = body.denoising_strength.unwrap_or(0.75) as f32;
+    let inpainting_fill = match sdapi_inpainting_fill(&body) {
+        Ok(inpainting_fill) => inpainting_fill,
+        Err(error) => return diffusion_error_response(error),
+    };
     let sdapi_options = state.sdapi_options.lock().await.clone();
     let runtime_options = sd_request_generation_runtime_options(&body, &sdapi_options);
     let progress_state = state.sdapi_progress.clone();
@@ -576,6 +582,7 @@ async fn execute_hfq_diffusion_img2img(
                 batch: iter_batch,
                 init_image: init_image.clone(),
                 mask: mask.clone(),
+                inpainting_fill,
                 denoising_strength,
             };
             let step_offset = iter as usize * sdapi_img2img_denoise_steps(&worker_body);
@@ -1234,6 +1241,26 @@ fn sdapi_inpainting_mask_invert(body: &SdGenerationRequest) -> bool {
     body.inpainting_mask_invert
         .as_ref()
         .is_some_and(sdapi_value_is_truthy)
+}
+
+fn sdapi_inpainting_fill(body: &SdGenerationRequest) -> Result<Option<u32>, DiffusionError> {
+    let Some(value) = body.inpainting_fill.as_ref() else {
+        return Ok(None);
+    };
+    let mode = match value {
+        Value::Number(value) => value.as_u64().and_then(|value| u32::try_from(value).ok()),
+        Value::String(value) => value.trim().parse::<u32>().ok(),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        DiffusionError::InvalidRequest("inpainting_fill must be 0, 1, 2, or 3".to_string())
+    })?;
+    if mode > 3 {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "inpainting_fill {mode} must be 0, 1, 2, or 3"
+        )));
+    }
+    Ok(Some(mode))
 }
 
 fn sdapi_value_is_truthy(value: &Value) -> bool {
@@ -2984,6 +3011,7 @@ mod tests {
             save_images: Some(false),
             init_images: Some(vec![tiny_png_base64()]),
             mask: Some(tiny_mask_png_base64(2, 2)),
+            inpainting_fill: Some(json!(2)),
             denoising_strength: Some(1.0),
             ..empty_request()
         };
@@ -2997,6 +3025,8 @@ mod tests {
         let info = serde_json::from_str::<Value>(body["info"].as_str().unwrap()).unwrap();
         assert_eq!(info["mode"], "img2img");
         assert_eq!(info["masked"], true);
+        assert_eq!(info["inpainting_fill"], 2);
+        assert_eq!(info["masked_content"], "latent noise");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4317,6 +4347,31 @@ mod tests {
     }
 
     #[test]
+    fn img2img_inpainting_fill_accepts_webui_modes() {
+        assert_eq!(
+            sdapi_inpainting_fill(&SdGenerationRequest {
+                inpainting_fill: Some(json!(2)),
+                ..empty_request()
+            })
+            .unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            sdapi_inpainting_fill(&SdGenerationRequest {
+                inpainting_fill: Some(json!("3")),
+                ..empty_request()
+            })
+            .unwrap(),
+            Some(3)
+        );
+        assert!(sdapi_inpainting_fill(&SdGenerationRequest {
+            inpainting_fill: Some(json!(4)),
+            ..empty_request()
+        })
+        .is_err());
+    }
+
+    #[test]
     fn img2img_mask_options_round_mask_pixels_by_default() {
         let mask = RgbImageBatch {
             batch: 1,
@@ -4457,6 +4512,7 @@ mod tests {
             mask_blur_y: None,
             mask_round: None,
             inpainting_mask_invert: None,
+            inpainting_fill: None,
             resize_mode: None,
             include_init_images: None,
             denoising_strength: None,

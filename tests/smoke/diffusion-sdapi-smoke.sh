@@ -219,10 +219,13 @@ try:
         "mask": make_half_mask_png_b64(width, height),
         "mask_blur": 1,
         "mask_round": True,
+        "inpainting_fill": 2,
     })
     _masked, masked_info = sdapi_request(base_url, "/sdapi/v1/img2img", masked_body, "masked-img2img")
     if masked_info.get("mode") != "img2img" or masked_info.get("masked") is not True:
         raise RuntimeError(f"masked img2img mode/masked info wrong: {masked_info}")
+    if masked_info.get("inpainting_fill") != 2 or masked_info.get("masked_content") != "latent noise":
+        raise RuntimeError(f"masked img2img inpainting_fill info wrong: {masked_info}")
 
     progress = fetch_json(f"{base_url}/sdapi/v1/progress", timeout=10.0)
     if progress.get("state", {}).get("interrupted"):

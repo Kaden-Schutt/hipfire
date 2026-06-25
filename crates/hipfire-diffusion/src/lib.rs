@@ -358,6 +358,8 @@ pub struct DiffusionImg2ImgRequest {
     pub init_image: RgbImageBatch,
     #[serde(default)]
     pub mask: Option<RgbImageBatch>,
+    #[serde(default)]
+    pub inpainting_fill: Option<u32>,
     pub denoising_strength: f32,
 }
 
@@ -4404,18 +4406,18 @@ impl DiffusionPipeline {
         let (init_latents, init_encode_kind) =
             encode_to_latents_with_runtime_options(encoder, &init_image, runtime_options)?;
         generation_runtime_kind = merge_runtime_kind(generation_runtime_kind, init_encode_kind);
-        let mut latents = init_latents.clone();
-        if latents.batch != plan.latent_shape.batch
-            || latents.channels != plan.latent_shape.channels
-            || latents.height != plan.latent_shape.height
-            || latents.width != plan.latent_shape.width
+        let mut denoise_init_latents = init_latents.clone();
+        if denoise_init_latents.batch != plan.latent_shape.batch
+            || denoise_init_latents.channels != plan.latent_shape.channels
+            || denoise_init_latents.height != plan.latent_shape.height
+            || denoise_init_latents.width != plan.latent_shape.width
         {
             return Err(DiffusionError::InvalidRequest(format!(
                 "encoded init latent shape [{}x{}x{}x{}] != requested latent shape [{}x{}x{}x{}]",
-                latents.batch,
-                latents.channels,
-                latents.height,
-                latents.width,
+                denoise_init_latents.batch,
+                denoise_init_latents.channels,
+                denoise_init_latents.height,
+                denoise_init_latents.width,
                 plan.latent_shape.batch,
                 plan.latent_shape.channels,
                 plan.latent_shape.height,
@@ -4437,8 +4439,11 @@ impl DiffusionPipeline {
             None
         };
         let mask_weights = if let Some(mask) = expanded_mask.as_ref() {
-            let (weights, mask_kind) =
-                latent_mask_weights_with_runtime_options(mask, &latents, runtime_options)?;
+            let (weights, mask_kind) = latent_mask_weights_with_runtime_options(
+                mask,
+                &denoise_init_latents,
+                runtime_options,
+            )?;
             generation_runtime_kind = merge_runtime_kind(generation_runtime_kind, mask_kind);
             Some(weights)
         } else {
@@ -4450,7 +4455,7 @@ impl DiffusionPipeline {
                 encoder,
                 &init_image,
                 mask,
-                &latents,
+                &denoise_init_latents,
                 mask_weights.as_deref(),
                 runtime_options,
             )?;
@@ -4459,6 +4464,18 @@ impl DiffusionPipeline {
         } else {
             None
         };
+        let inpainting_fill = request.inpainting_fill.unwrap_or(0);
+        let applied_inpainting_fill = if let Some(mask_weights) = mask_weights.as_ref() {
+            apply_inpainting_fill_to_latents(
+                &mut denoise_init_latents,
+                &plan.latents,
+                mask_weights,
+                inpainting_fill,
+            )?
+        } else {
+            false
+        };
+        let mut latents = denoise_init_latents.clone();
         if !schedule.timesteps.is_empty() {
             let noise = plan.latents;
             plan.schedule
@@ -4467,7 +4484,7 @@ impl DiffusionPipeline {
                 mask_weights
                     .as_ref()
                     .map(|mask_weights| MaskedDenoiseReference {
-                        init_latents: &init_latents,
+                        init_latents: &denoise_init_latents,
                         noise: &noise.data,
                         mask_weights,
                         source_schedule: &plan.schedule,
@@ -4529,6 +4546,20 @@ impl DiffusionPipeline {
             map.insert("start_step".to_string(), json!(start_step));
             map.insert("denoise_steps".to_string(), json!(schedule.timesteps.len()));
             map.insert("masked".to_string(), json!(masked));
+            if request.inpainting_fill.is_some() || applied_inpainting_fill {
+                map.insert("inpainting_fill".to_string(), json!(inpainting_fill));
+            }
+            if applied_inpainting_fill {
+                let masked_content = match inpainting_fill {
+                    2 => "latent noise",
+                    3 => "latent nothing",
+                    _ => unreachable!("only latent inpaint fill modes are applied"),
+                };
+                map.insert(
+                    "masked_content".to_string(),
+                    Value::String(masked_content.to_string()),
+                );
+            }
         }
         Ok(DiffusionBatchOutput { images, info })
     }
@@ -13054,6 +13085,13 @@ fn validate_img2img_request(
             request.denoising_strength
         )));
     }
+    if let Some(inpainting_fill) = request.inpainting_fill {
+        if inpainting_fill > 3 {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "inpainting_fill {inpainting_fill} must be 0, 1, 2, or 3"
+            )));
+        }
+    }
     if request.init_image.batch == 0 {
         return Err(DiffusionError::InvalidRequest(
             "init image batch must be non-empty".to_string(),
@@ -13139,6 +13177,77 @@ fn latent_mask_weights_from_rgb_batch(
         }
     }
     Ok(weights)
+}
+
+fn apply_inpainting_fill_to_latents(
+    init_latents: &mut LatentBatch,
+    noise_latents: &LatentBatch,
+    mask_weights: &[f32],
+    inpainting_fill: u32,
+) -> DiffusionResult<bool> {
+    match inpainting_fill {
+        0 | 1 => return Ok(false),
+        2 | 3 => {}
+        _ => {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "inpainting_fill {inpainting_fill} must be 0, 1, 2, or 3"
+            )));
+        }
+    }
+    if noise_latents.batch != init_latents.batch
+        || noise_latents.channels != init_latents.channels
+        || noise_latents.height != init_latents.height
+        || noise_latents.width != init_latents.width
+    {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "inpainting_fill noise latent shape [{}x{}x{}x{}] != init latent shape [{}x{}x{}x{}]",
+            noise_latents.batch,
+            noise_latents.channels,
+            noise_latents.height,
+            noise_latents.width,
+            init_latents.batch,
+            init_latents.channels,
+            init_latents.height,
+            init_latents.width
+        )));
+    }
+    let expected_weights = init_latents
+        .batch
+        .checked_mul(init_latents.height)
+        .and_then(|value| value.checked_mul(init_latents.width))
+        .ok_or_else(|| {
+            DiffusionError::InvalidRequest("inpainting_fill mask dimensions overflow".to_string())
+        })?;
+    if mask_weights.len() != expected_weights {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "inpainting_fill mask has {} latent weights, expected {expected_weights}",
+            mask_weights.len()
+        )));
+    }
+    for batch in 0..init_latents.batch {
+        for y in 0..init_latents.height {
+            for x in 0..init_latents.width {
+                let mask_idx = (batch * init_latents.height + y) * init_latents.width + x;
+                let weight = mask_weights[mask_idx].clamp(0.0, 1.0);
+                if weight == 0.0 {
+                    continue;
+                }
+                for channel in 0..init_latents.channels {
+                    let idx = ((batch * init_latents.channels + channel) * init_latents.height + y)
+                        * init_latents.width
+                        + x;
+                    let replacement = if inpainting_fill == 2 {
+                        noise_latents.data[idx]
+                    } else {
+                        0.0
+                    };
+                    init_latents.data[idx] =
+                        init_latents.data[idx] * (1.0 - weight) + replacement * weight;
+                }
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn build_inpaint_conditioning_if_supported(
@@ -20419,6 +20528,7 @@ mod tests {
             },
             init_image: tiny_rgb_image_batch(1, 2, 2),
             mask: Some(tiny_mask_image_batch(1, 2, 2)),
+            inpainting_fill: None,
             denoising_strength: 1.0,
         };
 
@@ -20461,6 +20571,7 @@ mod tests {
             },
             init_image: tiny_rgb_image_batch(1, 1, 1),
             mask: Some(tiny_mask_image_batch(1, 1, 1)),
+            inpainting_fill: None,
             denoising_strength: 1.0,
         };
 
@@ -20478,6 +20589,52 @@ mod tests {
         let decoded = image::load_from_memory(&bytes).unwrap().to_rgb8();
         assert_eq!(decoded.dimensions(), (2, 2));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inpainting_fill_latent_noise_replaces_masked_latents() {
+        let mut init = LatentBatch {
+            batch: 1,
+            channels: 2,
+            height: 1,
+            width: 2,
+            data: vec![10.0, 20.0, 30.0, 40.0],
+        };
+        let noise = LatentBatch {
+            batch: 1,
+            channels: 2,
+            height: 1,
+            width: 2,
+            data: vec![1.0, 2.0, 3.0, 4.0],
+        };
+
+        let applied = apply_inpainting_fill_to_latents(&mut init, &noise, &[0.0, 1.0], 2).unwrap();
+
+        assert!(applied);
+        assert_eq!(init.data, vec![10.0, 2.0, 30.0, 4.0]);
+    }
+
+    #[test]
+    fn inpainting_fill_latent_nothing_zeros_masked_latents() {
+        let mut init = LatentBatch {
+            batch: 1,
+            channels: 1,
+            height: 1,
+            width: 2,
+            data: vec![10.0, 20.0],
+        };
+        let noise = LatentBatch {
+            batch: 1,
+            channels: 1,
+            height: 1,
+            width: 2,
+            data: vec![1.0, 2.0],
+        };
+
+        let applied = apply_inpainting_fill_to_latents(&mut init, &noise, &[1.0, 0.25], 3).unwrap();
+
+        assert!(applied);
+        assert_eq!(init.data, vec![0.0, 15.0]);
     }
 
     #[cfg(feature = "rocm")]
@@ -20516,6 +20673,7 @@ mod tests {
             },
             init_image: tiny_rgb_image_batch(1, 2, 2),
             mask: Some(tiny_mask_image_batch(1, 2, 2)),
+            inpainting_fill: None,
             denoising_strength: 1.0,
         };
 
@@ -21121,6 +21279,7 @@ mod tests {
                 ],
             },
             mask: None,
+            inpainting_fill: None,
             denoising_strength: 1.0,
         };
 
@@ -22060,6 +22219,7 @@ mod tests {
             },
             init_image: tiny_rgb_image_batch(1, 64, 64),
             mask: Some(tiny_mask_image_batch(1, 64, 64)),
+            inpainting_fill: None,
             denoising_strength: 1.0,
         };
 
