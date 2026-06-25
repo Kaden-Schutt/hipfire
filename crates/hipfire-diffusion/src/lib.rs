@@ -3515,9 +3515,12 @@ impl DiffusionPipeline {
                 "diffusion HFQ does not contain a usable native VAE encoder".to_string(),
             )
         })?;
+        let mut generation_runtime_kind = runtime.kind;
         let init_image =
             expand_rgb_batch_for_prompts(&request.init_image, request.batch.prompts.len())?;
-        let init_latents = encoder.encode_to_latents(&init_image)?;
+        let (init_latents, init_encode_kind) =
+            encode_to_latents_with_runtime_options(encoder, &init_image, runtime_options)?;
+        generation_runtime_kind = merge_runtime_kind(generation_runtime_kind, init_encode_kind);
         let mut latents = init_latents.clone();
         if latents.batch != plan.latent_shape.batch
             || latents.channels != plan.latent_shape.channels
@@ -3549,19 +3552,25 @@ impl DiffusionPipeline {
             None
         };
         let mask_weights = if let Some(mask) = expanded_mask.as_ref() {
-            Some(latent_mask_weights_from_rgb_batch(mask, &latents)?)
+            let (weights, mask_kind) =
+                latent_mask_weights_with_runtime_options(mask, &latents, runtime_options)?;
+            generation_runtime_kind = merge_runtime_kind(generation_runtime_kind, mask_kind);
+            Some(weights)
         } else {
             None
         };
         let inpaint_conditioning = if let Some(mask) = expanded_mask.as_ref() {
-            build_inpaint_conditioning_if_supported(
+            let (conditioning, inpaint_kind) = build_inpaint_conditioning_if_supported(
                 runtime.noise.as_ref(),
                 encoder,
                 &init_image,
                 mask,
                 &latents,
                 mask_weights.as_deref(),
-            )?
+                runtime_options,
+            )?;
+            generation_runtime_kind = merge_runtime_kind(generation_runtime_kind, inpaint_kind);
+            conditioning
         } else {
             None
         };
@@ -3593,12 +3602,17 @@ impl DiffusionPipeline {
             )?;
         }
         let masked = if let Some(mask_weights) = mask_weights.as_ref() {
-            blend_latents_with_mask(&mut latents, &init_latents, mask_weights)?;
+            let blend_kind = blend_latents_with_mask_with_runtime_options(
+                &mut latents,
+                &init_latents,
+                mask_weights,
+                runtime_options,
+            )?;
+            generation_runtime_kind = merge_runtime_kind(generation_runtime_kind, blend_kind);
             true
         } else {
             false
         };
-        let mut generation_runtime_kind = runtime.kind;
         let images = if request.batch.send_images {
             let (rgb, image_runtime_kind) = decode_to_rgb8_with_runtime_options(
                 runtime.decoder.as_ref(),
@@ -3880,6 +3894,130 @@ fn decode_to_rgb8_with_runtime_options(
         rgb_tensor_to_u8(&decoded)?,
         DiffusionRuntimeKind::CpuSourceReference,
     ))
+}
+
+fn encode_to_latents_with_runtime_options(
+    encoder: &NativeVaeEncoder,
+    image: &RgbImageBatch,
+    runtime_options: DiffusionGenerationRuntimeOptions,
+) -> DiffusionResult<(LatentBatch, DiffusionRuntimeKind)> {
+    if let Some(device_id) = runtime_options.rocm_device_id {
+        #[cfg(feature = "rocm")]
+        {
+            let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            let image_tensor = rgb_batch_to_vae_tensor_hip_on_gpu(&mut gpu, image)?;
+            let moments = encoder.encode_tensor_moments(&image_tensor)?;
+            let latents =
+                vae_moments_to_latents_hip_on_gpu(&mut gpu, &moments, encoder.scaling_factor)?;
+            return Ok((latents, DiffusionRuntimeKind::RocmHybridReference));
+        }
+        #[cfg(not(feature = "rocm"))]
+        {
+            let _ = device_id;
+            return Err(DiffusionError::BackendUnavailable(
+                "ROCm hybrid diffusion generation requested, but hipfire-diffusion was built without the rocm feature".to_string(),
+            ));
+        }
+    }
+    Ok((
+        encoder.encode_to_latents(image)?,
+        DiffusionRuntimeKind::CpuSourceReference,
+    ))
+}
+
+fn latent_mask_weights_with_runtime_options(
+    mask: &RgbImageBatch,
+    latents: &LatentBatch,
+    runtime_options: DiffusionGenerationRuntimeOptions,
+) -> DiffusionResult<(Vec<f32>, DiffusionRuntimeKind)> {
+    if let Some(device_id) = runtime_options.rocm_device_id {
+        #[cfg(feature = "rocm")]
+        {
+            let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            let weights = latent_mask_weights_from_rgb_batch_hip_on_gpu(&mut gpu, mask, latents)?;
+            return Ok((weights, DiffusionRuntimeKind::RocmHybridReference));
+        }
+        #[cfg(not(feature = "rocm"))]
+        {
+            let _ = device_id;
+            return Err(DiffusionError::BackendUnavailable(
+                "ROCm hybrid diffusion generation requested, but hipfire-diffusion was built without the rocm feature".to_string(),
+            ));
+        }
+    }
+    Ok((
+        latent_mask_weights_from_rgb_batch(mask, latents)?,
+        DiffusionRuntimeKind::CpuSourceReference,
+    ))
+}
+
+fn masked_rgb_batch_for_inpaint_with_runtime_options(
+    image: &RgbImageBatch,
+    mask: &RgbImageBatch,
+    runtime_options: DiffusionGenerationRuntimeOptions,
+) -> DiffusionResult<(RgbImageBatch, DiffusionRuntimeKind)> {
+    if let Some(device_id) = runtime_options.rocm_device_id {
+        #[cfg(feature = "rocm")]
+        {
+            let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            let masked = masked_rgb_batch_for_inpaint_hip_on_gpu(&mut gpu, image, mask)?;
+            return Ok((masked, DiffusionRuntimeKind::RocmHybridReference));
+        }
+        #[cfg(not(feature = "rocm"))]
+        {
+            let _ = device_id;
+            return Err(DiffusionError::BackendUnavailable(
+                "ROCm hybrid diffusion generation requested, but hipfire-diffusion was built without the rocm feature".to_string(),
+            ));
+        }
+    }
+    Ok((
+        masked_rgb_batch_for_inpaint(image, mask)?,
+        DiffusionRuntimeKind::CpuSourceReference,
+    ))
+}
+
+fn blend_latents_with_mask_with_runtime_options(
+    generated: &mut LatentBatch,
+    init: &LatentBatch,
+    mask_weights: &[f32],
+    runtime_options: DiffusionGenerationRuntimeOptions,
+) -> DiffusionResult<DiffusionRuntimeKind> {
+    if let Some(device_id) = runtime_options.rocm_device_id {
+        #[cfg(feature = "rocm")]
+        {
+            let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            *generated =
+                blend_latents_with_mask_hip_on_gpu(&mut gpu, generated, init, mask_weights)?;
+            return Ok(DiffusionRuntimeKind::RocmHybridReference);
+        }
+        #[cfg(not(feature = "rocm"))]
+        {
+            let _ = device_id;
+            return Err(DiffusionError::BackendUnavailable(
+                "ROCm hybrid diffusion generation requested, but hipfire-diffusion was built without the rocm feature".to_string(),
+            ));
+        }
+    }
+    blend_latents_with_mask(generated, init, mask_weights)?;
+    Ok(DiffusionRuntimeKind::CpuSourceReference)
+}
+
+fn merge_runtime_kind(
+    current: DiffusionRuntimeKind,
+    observed: DiffusionRuntimeKind,
+) -> DiffusionRuntimeKind {
+    if current == DiffusionRuntimeKind::RocmHybridReference
+        || observed == DiffusionRuntimeKind::RocmHybridReference
+    {
+        DiffusionRuntimeKind::RocmHybridReference
+    } else {
+        DiffusionRuntimeKind::CpuSourceReference
+    }
 }
 
 struct NativeDiffusionRuntime {
@@ -10892,11 +11030,12 @@ fn build_inpaint_conditioning_if_supported(
     mask: &RgbImageBatch,
     latents: &LatentBatch,
     mask_weights: Option<&[f32]>,
-) -> DiffusionResult<Option<InpaintDenoiseConditioning>> {
+    runtime_options: DiffusionGenerationRuntimeOptions,
+) -> DiffusionResult<(Option<InpaintDenoiseConditioning>, DiffusionRuntimeKind)> {
     let base_channels = latents.channels;
     let model_channels = noise.model_input_channels();
     if model_channels == base_channels {
-        return Ok(None);
+        return Ok((None, DiffusionRuntimeKind::CpuSourceReference));
     }
     let inpaint_channels = base_channels
         .checked_mul(2)
@@ -10912,8 +11051,10 @@ fn build_inpaint_conditioning_if_supported(
     let mask_weights = mask_weights.ok_or_else(|| {
         DiffusionError::InvalidRequest("inpaint conditioning requires a mask".to_string())
     })?;
-    let masked_image = masked_rgb_batch_for_inpaint(init_image, mask)?;
-    let masked_image_latents = encoder.encode_to_latents(&masked_image)?;
+    let (masked_image, masked_image_kind) =
+        masked_rgb_batch_for_inpaint_with_runtime_options(init_image, mask, runtime_options)?;
+    let (masked_image_latents, masked_latents_kind) =
+        encode_to_latents_with_runtime_options(encoder, &masked_image, runtime_options)?;
     if masked_image_latents.batch != latents.batch
         || masked_image_latents.channels != latents.channels
         || masked_image_latents.height != latents.height
@@ -10931,10 +11072,13 @@ fn build_inpaint_conditioning_if_supported(
             latents.width
         )));
     }
-    Ok(Some(InpaintDenoiseConditioning {
-        mask_weights: mask_weights.to_vec(),
-        masked_image_latents,
-    }))
+    Ok((
+        Some(InpaintDenoiseConditioning {
+            mask_weights: mask_weights.to_vec(),
+            masked_image_latents,
+        }),
+        merge_runtime_kind(masked_image_kind, masked_latents_kind),
+    ))
 }
 
 fn masked_rgb_batch_for_inpaint(
@@ -17448,77 +17592,10 @@ mod tests {
 
     #[test]
     fn diffusion_pipeline_img2img_uses_inpaint_conditioning_for_inpaint_channel_model() {
-        let dir = std::env::temp_dir().join(format!(
-            "hipfire-diffusion-inpaint-routing-test-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let hfq_path = dir.join("tiny-complete.hfq");
-        let metadata = tiny_runtime_metadata();
-        write_hfqm_package_mem(
-            &hfq_path,
-            HFQ_ARCH_DIFFUSION,
-            &serde_json::to_string(&metadata).unwrap(),
-            &tiny_complete_runtime_tensors(),
-        )
-        .unwrap();
-        let hfq = HfqFile::open_index_only(&hfq_path).unwrap();
-        let config = tiny_runtime_config();
-        let encoder = NativeVaeEncoder::from_hfq(&hfq, &config.vae).unwrap();
-        let tokenizer = ClipTokenizer::from_bytes(
-            br#"{
-                "<|startoftext|>": 0,
-                "<|endoftext|>": 1,
-                "a</w>": 2,
-                "cat</w>": 3
-            }"#,
-            b"#version: 0.2\n",
-            4,
-        )
-        .unwrap();
-        let text_encoder = ClipTextEncoder {
-            token_embedding: CpuTensor {
-                shape: vec![4, 2],
-                data: vec![0.0, 0.0, 0.2, 0.1, 0.4, 0.3, 0.6, 0.5],
-            },
-            position_embedding: CpuTensor {
-                shape: vec![4, 2],
-                data: vec![0.0; 8],
-            },
-            layers: Vec::new(),
-            final_layer_norm_weight: CpuTensor {
-                shape: vec![2],
-                data: vec![1.0, 1.0],
-            },
-            final_layer_norm_bias: CpuTensor {
-                shape: vec![2],
-                data: vec![0.0, 0.0],
-            },
-            text_projection: None,
-            hidden_size: 2,
-            max_length: 4,
-            n_heads: 1,
-        };
-        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let pipeline = DiffusionPipeline {
-            summary: summarize_hfq(Path::new("/tmp/tiny-inpaint.hfq"), &metadata),
-            metadata,
-            config,
-            tokenizer: Some(tokenizer),
-            tokenizer_2: None,
-            text_encoder: Some(text_encoder),
-            text_encoder_2: None,
-            native_runtime: Some(NativeDiffusionRuntime {
-                kind: DiffusionRuntimeKind::CpuSourceReference,
-                noise: Box::new(TestInpaintNoiseBackend {
-                    called: called.clone(),
-                }),
-                encoder: Some(encoder),
-                decoder: Box::new(TestImageDecoder),
-            }),
-            native_runtime_error: None,
-        };
+        let (pipeline, called, dir) = tiny_inpaint_test_pipeline(
+            "hipfire-diffusion-inpaint-routing-test",
+            Box::new(TestImageDecoder),
+        );
         let request = DiffusionImg2ImgRequest {
             batch: DiffusionBatchRequest {
                 prompts: vec![DiffusionPrompt {
@@ -17552,6 +17629,65 @@ mod tests {
         assert!(called.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(output.images.len(), 1);
         assert_eq!(output.info["masked"], true);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn generate_img2img_runtime_options_route_vae_mask_boundaries_when_gpu_is_available() {
+        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+            eprintln!("skip: ROCm GPU unavailable for hybrid img2img generation test: {error}");
+            return;
+        }
+        let (pipeline, called, dir) = tiny_inpaint_test_pipeline(
+            "hipfire-diffusion-inpaint-hybrid-routing-test",
+            Box::new(SolidTensorImageDecoder),
+        );
+        let request = DiffusionImg2ImgRequest {
+            batch: DiffusionBatchRequest {
+                prompts: vec![DiffusionPrompt {
+                    prompt: "a cat".into(),
+                    negative_prompt: String::new(),
+                    seed: 7,
+                    subseed: None,
+                }],
+                width: 2,
+                height: 2,
+                original_width: None,
+                original_height: None,
+                target_width: None,
+                target_height: None,
+                crop_x: 0,
+                crop_y: 0,
+                steps: 2,
+                cfg_scale: 7.0,
+                scheduler: "Euler".into(),
+                subseed_strength: 0.0,
+                send_images: true,
+                save_images: false,
+            },
+            init_image: tiny_rgb_image_batch(1, 2, 2),
+            mask: Some(tiny_mask_image_batch(1, 2, 2)),
+            denoising_strength: 1.0,
+        };
+
+        let output = pipeline
+            .generate_img2img_batch_with_runtime_options(
+                request,
+                DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
+            )
+            .unwrap();
+
+        assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(output.images.len(), 1);
+        assert_eq!(output.info["runtime"], "rocm-hybrid-reference");
+        assert_eq!(output.info["masked"], true);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&output.images[0])
+            .unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap().to_rgb8();
+        assert_eq!(decoded.dimensions(), (2, 2));
+        assert_eq!(decoded.get_pixel(0, 0).0, [32, 128, 224]);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -19610,6 +19746,85 @@ mod tests {
             }),
             native_runtime_error: None,
         }
+    }
+
+    fn tiny_inpaint_test_pipeline(
+        temp_label: &str,
+        decoder: Box<dyn DiffusionImageDecoder>,
+    ) -> (
+        DiffusionPipeline,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        PathBuf,
+    ) {
+        let dir = std::env::temp_dir().join(format!("{temp_label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("tiny-complete.hfq");
+        let metadata = tiny_runtime_metadata();
+        write_hfqm_package_mem(
+            &hfq_path,
+            HFQ_ARCH_DIFFUSION,
+            &serde_json::to_string(&metadata).unwrap(),
+            &tiny_complete_runtime_tensors(),
+        )
+        .unwrap();
+        let hfq = HfqFile::open_index_only(&hfq_path).unwrap();
+        let config = tiny_runtime_config();
+        let encoder = NativeVaeEncoder::from_hfq(&hfq, &config.vae).unwrap();
+        let tokenizer = ClipTokenizer::from_bytes(
+            br#"{
+                "<|startoftext|>": 0,
+                "<|endoftext|>": 1,
+                "a</w>": 2,
+                "cat</w>": 3
+            }"#,
+            b"#version: 0.2\n",
+            4,
+        )
+        .unwrap();
+        let text_encoder = ClipTextEncoder {
+            token_embedding: CpuTensor {
+                shape: vec![4, 2],
+                data: vec![0.0, 0.0, 0.2, 0.1, 0.4, 0.3, 0.6, 0.5],
+            },
+            position_embedding: CpuTensor {
+                shape: vec![4, 2],
+                data: vec![0.0; 8],
+            },
+            layers: Vec::new(),
+            final_layer_norm_weight: CpuTensor {
+                shape: vec![2],
+                data: vec![1.0, 1.0],
+            },
+            final_layer_norm_bias: CpuTensor {
+                shape: vec![2],
+                data: vec![0.0, 0.0],
+            },
+            text_projection: None,
+            hidden_size: 2,
+            max_length: 4,
+            n_heads: 1,
+        };
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pipeline = DiffusionPipeline {
+            summary: summarize_hfq(Path::new("/tmp/tiny-inpaint.hfq"), &metadata),
+            metadata,
+            config,
+            tokenizer: Some(tokenizer),
+            tokenizer_2: None,
+            text_encoder: Some(text_encoder),
+            text_encoder_2: None,
+            native_runtime: Some(NativeDiffusionRuntime {
+                kind: DiffusionRuntimeKind::CpuSourceReference,
+                noise: Box::new(TestInpaintNoiseBackend {
+                    called: called.clone(),
+                }),
+                encoder: Some(encoder),
+                decoder,
+            }),
+            native_runtime_error: None,
+        };
+        (pipeline, called, dir)
     }
 
     fn f32_mem_tensor(name: &str, shape: &[u32], data: &[f32]) -> HfqMemTensor {
