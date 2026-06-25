@@ -2221,6 +2221,118 @@ fn concat_last_dim_2d_with_runtime_options(
     }
 }
 
+fn conv2d_with_runtime_options(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    bias: Option<&CpuTensor>,
+    padding: usize,
+    stride: usize,
+    runtime_options: DiffusionGenerationRuntimeOptions,
+) -> DiffusionResult<CpuTensor> {
+    let Some(device_id) = runtime_options.rocm_device_id else {
+        return conv2d_nchw_with_stride(input, weight, bias, padding, stride);
+    };
+    #[cfg(feature = "rocm")]
+    {
+        let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+        conv2d_nchw_hip_on_gpu(&mut gpu, input, weight, bias, padding, stride)
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = device_id;
+        Err(rocm_hybrid_unavailable_error())
+    }
+}
+
+fn group_norm_with_runtime_options(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    bias: &CpuTensor,
+    groups: usize,
+    eps: f32,
+    runtime_options: DiffusionGenerationRuntimeOptions,
+) -> DiffusionResult<CpuTensor> {
+    let Some(device_id) = runtime_options.rocm_device_id else {
+        return group_norm_nchw(input, weight, bias, groups, eps);
+    };
+    #[cfg(feature = "rocm")]
+    {
+        let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+        group_norm_nchw_hip_on_gpu(&mut gpu, input, weight, bias, groups, eps)
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = device_id;
+        Err(rocm_hybrid_unavailable_error())
+    }
+}
+
+fn add_channel_bias_nchw_with_runtime_options(
+    input: &mut CpuTensor,
+    bias: &CpuTensor,
+    runtime_options: DiffusionGenerationRuntimeOptions,
+) -> DiffusionResult<()> {
+    let Some(device_id) = runtime_options.rocm_device_id else {
+        return add_channel_bias_nchw(input, bias);
+    };
+    #[cfg(feature = "rocm")]
+    {
+        let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+        *input = add_channel_bias_nchw_hip_on_gpu(&mut gpu, input, bias)?;
+        Ok(())
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = device_id;
+        Err(rocm_hybrid_unavailable_error())
+    }
+}
+
+fn concat_channels_nchw_with_runtime_options(
+    a: &CpuTensor,
+    b: &CpuTensor,
+    runtime_options: DiffusionGenerationRuntimeOptions,
+) -> DiffusionResult<CpuTensor> {
+    let Some(device_id) = runtime_options.rocm_device_id else {
+        return concat_channels_nchw(a, b);
+    };
+    #[cfg(feature = "rocm")]
+    {
+        let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+        concat_channels_nchw_hip_on_gpu(&mut gpu, a, b)
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = device_id;
+        Err(rocm_hybrid_unavailable_error())
+    }
+}
+
+fn upsample_nearest2d_nchw_with_runtime_options(
+    input: &CpuTensor,
+    scale: usize,
+    runtime_options: DiffusionGenerationRuntimeOptions,
+) -> DiffusionResult<CpuTensor> {
+    let Some(device_id) = runtime_options.rocm_device_id else {
+        return upsample_nearest2d_nchw(input, scale);
+    };
+    #[cfg(feature = "rocm")]
+    {
+        let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+        upsample_nearest2d_nchw_hip_on_gpu(&mut gpu, input, scale)
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = device_id;
+        Err(rocm_hybrid_unavailable_error())
+    }
+}
+
 #[cfg(feature = "rocm")]
 fn f32_slices_close(actual: &[f32], expected: &[f32], tolerance: f32) -> bool {
     actual.len() == expected.len()
@@ -4868,6 +4980,21 @@ impl Conv2dLayer {
             self.stride,
         )
     }
+
+    fn forward_with_runtime_options(
+        &self,
+        input: &CpuTensor,
+        runtime_options: DiffusionGenerationRuntimeOptions,
+    ) -> DiffusionResult<CpuTensor> {
+        conv2d_with_runtime_options(
+            input,
+            &self.weight,
+            self.bias.as_ref(),
+            self.padding,
+            self.stride,
+            runtime_options,
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -4896,6 +5023,21 @@ impl GroupNormLayer {
 
     pub fn forward(&self, input: &CpuTensor) -> DiffusionResult<CpuTensor> {
         group_norm_nchw(input, &self.weight, &self.bias, self.groups, self.eps)
+    }
+
+    fn forward_with_runtime_options(
+        &self,
+        input: &CpuTensor,
+        runtime_options: DiffusionGenerationRuntimeOptions,
+    ) -> DiffusionResult<CpuTensor> {
+        group_norm_with_runtime_options(
+            input,
+            &self.weight,
+            &self.bias,
+            self.groups,
+            self.eps,
+            runtime_options,
+        )
     }
 }
 
@@ -4958,18 +5100,34 @@ impl ResnetBlock2D {
     }
 
     pub fn forward(&self, input: &CpuTensor) -> DiffusionResult<CpuTensor> {
-        let hidden = self.norm1.forward(input)?;
-        let hidden = tensor_map(&hidden, silu);
-        let hidden = self.conv1.forward(&hidden)?;
-        let hidden = self.norm2.forward(&hidden)?;
-        let hidden = tensor_map(&hidden, silu);
-        let hidden = self.conv2.forward(&hidden)?;
+        self.forward_with_runtime_options(input, DiffusionGenerationRuntimeOptions::default())
+    }
+
+    fn forward_with_runtime_options(
+        &self,
+        input: &CpuTensor,
+        runtime_options: DiffusionGenerationRuntimeOptions,
+    ) -> DiffusionResult<CpuTensor> {
+        let hidden = self
+            .norm1
+            .forward_with_runtime_options(input, runtime_options)?;
+        let hidden = silu_with_runtime_options(&hidden, runtime_options)?;
+        let hidden = self
+            .conv1
+            .forward_with_runtime_options(&hidden, runtime_options)?;
+        let hidden = self
+            .norm2
+            .forward_with_runtime_options(&hidden, runtime_options)?;
+        let hidden = silu_with_runtime_options(&hidden, runtime_options)?;
+        let hidden = self
+            .conv2
+            .forward_with_runtime_options(&hidden, runtime_options)?;
         let residual = if let Some(shortcut) = &self.shortcut {
-            shortcut.forward(input)?
+            shortcut.forward_with_runtime_options(input, runtime_options)?
         } else {
             input.clone()
         };
-        tensor_add(&hidden, &residual)
+        tensor_add_with_runtime_options(&hidden, &residual, runtime_options)
     }
 }
 
@@ -5039,6 +5197,19 @@ impl UnetResnetBlock2D {
         input: &CpuTensor,
         time_embedding: &CpuTensor,
     ) -> DiffusionResult<CpuTensor> {
+        self.forward_with_runtime_options(
+            input,
+            time_embedding,
+            DiffusionGenerationRuntimeOptions::default(),
+        )
+    }
+
+    fn forward_with_runtime_options(
+        &self,
+        input: &CpuTensor,
+        time_embedding: &CpuTensor,
+        runtime_options: DiffusionGenerationRuntimeOptions,
+    ) -> DiffusionResult<CpuTensor> {
         let [batch, _, _, _] = shape4(input)?;
         let [time_batch, _] = shape2(time_embedding)?;
         if time_batch != batch {
@@ -5046,24 +5217,33 @@ impl UnetResnetBlock2D {
                 "UNet ResNet time embedding batch {time_batch} != input batch {batch}"
             )));
         }
-        let hidden = self.norm1.forward(input)?;
-        let hidden = tensor_map(&hidden, silu);
-        let mut hidden = self.conv1.forward(&hidden)?;
-        let projected_time = linear(
-            &tensor_map(time_embedding, silu),
+        let hidden = self
+            .norm1
+            .forward_with_runtime_options(input, runtime_options)?;
+        let hidden = silu_with_runtime_options(&hidden, runtime_options)?;
+        let mut hidden = self
+            .conv1
+            .forward_with_runtime_options(&hidden, runtime_options)?;
+        let projected_time = linear_with_runtime_options(
+            &silu_with_runtime_options(time_embedding, runtime_options)?,
             &self.time_emb_proj_weight,
             &self.time_emb_proj_bias,
+            runtime_options,
         )?;
-        add_channel_bias_nchw(&mut hidden, &projected_time)?;
-        let hidden = self.norm2.forward(&hidden)?;
-        let hidden = tensor_map(&hidden, silu);
-        let hidden = self.conv2.forward(&hidden)?;
+        add_channel_bias_nchw_with_runtime_options(&mut hidden, &projected_time, runtime_options)?;
+        let hidden = self
+            .norm2
+            .forward_with_runtime_options(&hidden, runtime_options)?;
+        let hidden = silu_with_runtime_options(&hidden, runtime_options)?;
+        let hidden = self
+            .conv2
+            .forward_with_runtime_options(&hidden, runtime_options)?;
         let residual = if let Some(shortcut) = &self.shortcut {
-            shortcut.forward(input)?
+            shortcut.forward_with_runtime_options(input, runtime_options)?
         } else {
             input.clone()
         };
-        tensor_add(&hidden, &residual)
+        tensor_add_with_runtime_options(&hidden, &residual, runtime_options)
     }
 }
 
@@ -5533,20 +5713,36 @@ impl UnetDownBlock2D {
 
     pub fn forward(
         &self,
-        mut hidden: CpuTensor,
+        hidden: CpuTensor,
         time_embedding: &CpuTensor,
         encoder_states: &CpuTensor,
     ) -> DiffusionResult<(CpuTensor, Vec<CpuTensor>)> {
+        self.forward_with_runtime_options(
+            hidden,
+            time_embedding,
+            encoder_states,
+            DiffusionGenerationRuntimeOptions::default(),
+        )
+    }
+
+    fn forward_with_runtime_options(
+        &self,
+        mut hidden: CpuTensor,
+        time_embedding: &CpuTensor,
+        encoder_states: &CpuTensor,
+        runtime_options: DiffusionGenerationRuntimeOptions,
+    ) -> DiffusionResult<(CpuTensor, Vec<CpuTensor>)> {
         let mut skips = Vec::new();
         for (idx, resnet) in self.resnets.iter().enumerate() {
-            hidden = resnet.forward(&hidden, time_embedding)?;
+            hidden =
+                resnet.forward_with_runtime_options(&hidden, time_embedding, runtime_options)?;
             if let Some(attention) = self.attentions.get(idx) {
                 hidden = attention.forward(&hidden, encoder_states)?;
             }
             skips.push(hidden.clone());
         }
         if let Some(downsampler) = &self.downsampler {
-            hidden = downsampler.forward(&hidden)?;
+            hidden = downsampler.forward_with_runtime_options(&hidden, runtime_options)?;
             skips.push(hidden.clone());
         }
         Ok((hidden, skips))
@@ -5612,10 +5808,32 @@ impl UnetDownPath {
         time_embedding: &CpuTensor,
         encoder_states: &CpuTensor,
     ) -> DiffusionResult<(CpuTensor, Vec<CpuTensor>)> {
-        let mut hidden = self.conv_in.forward(sample)?;
+        self.forward_with_runtime_options(
+            sample,
+            time_embedding,
+            encoder_states,
+            DiffusionGenerationRuntimeOptions::default(),
+        )
+    }
+
+    fn forward_with_runtime_options(
+        &self,
+        sample: &CpuTensor,
+        time_embedding: &CpuTensor,
+        encoder_states: &CpuTensor,
+        runtime_options: DiffusionGenerationRuntimeOptions,
+    ) -> DiffusionResult<(CpuTensor, Vec<CpuTensor>)> {
+        let mut hidden = self
+            .conv_in
+            .forward_with_runtime_options(sample, runtime_options)?;
         let mut skips = vec![hidden.clone()];
         for block in &self.blocks {
-            let (next, mut block_skips) = block.forward(hidden, time_embedding, encoder_states)?;
+            let (next, mut block_skips) = block.forward_with_runtime_options(
+                hidden,
+                time_embedding,
+                encoder_states,
+                runtime_options,
+            )?;
             hidden = next;
             skips.append(&mut block_skips);
         }
@@ -5690,24 +5908,42 @@ impl UnetUpBlock2D {
 
     pub fn forward(
         &self,
+        hidden: CpuTensor,
+        skips: &mut Vec<CpuTensor>,
+        time_embedding: &CpuTensor,
+        encoder_states: &CpuTensor,
+    ) -> DiffusionResult<CpuTensor> {
+        self.forward_with_runtime_options(
+            hidden,
+            skips,
+            time_embedding,
+            encoder_states,
+            DiffusionGenerationRuntimeOptions::default(),
+        )
+    }
+
+    fn forward_with_runtime_options(
+        &self,
         mut hidden: CpuTensor,
         skips: &mut Vec<CpuTensor>,
         time_embedding: &CpuTensor,
         encoder_states: &CpuTensor,
+        runtime_options: DiffusionGenerationRuntimeOptions,
     ) -> DiffusionResult<CpuTensor> {
         for (idx, resnet) in self.resnets.iter().enumerate() {
             let skip = skips.pop().ok_or_else(|| {
                 DiffusionError::InvalidMetadata("UNet up block ran out of skip tensors".to_string())
             })?;
-            hidden = concat_channels_nchw(&hidden, &skip)?;
-            hidden = resnet.forward(&hidden, time_embedding)?;
+            hidden = concat_channels_nchw_with_runtime_options(&hidden, &skip, runtime_options)?;
+            hidden =
+                resnet.forward_with_runtime_options(&hidden, time_embedding, runtime_options)?;
             if let Some(attention) = self.attentions.get(idx) {
                 hidden = attention.forward(&hidden, encoder_states)?;
             }
         }
         if let Some(upsampler) = &self.upsampler {
-            hidden = upsample_nearest2d_nchw(&hidden, 2)?;
-            hidden = upsampler.forward(&hidden)?;
+            hidden = upsample_nearest2d_nchw_with_runtime_options(&hidden, 2, runtime_options)?;
+            hidden = upsampler.forward_with_runtime_options(&hidden, runtime_options)?;
         }
         Ok(hidden)
     }
@@ -5763,13 +5999,36 @@ impl UnetUpPath {
 
     pub fn forward(
         &self,
-        mut hidden: CpuTensor,
+        hidden: CpuTensor,
         skips: &mut Vec<CpuTensor>,
         time_embedding: &CpuTensor,
         encoder_states: &CpuTensor,
     ) -> DiffusionResult<CpuTensor> {
+        self.forward_with_runtime_options(
+            hidden,
+            skips,
+            time_embedding,
+            encoder_states,
+            DiffusionGenerationRuntimeOptions::default(),
+        )
+    }
+
+    fn forward_with_runtime_options(
+        &self,
+        mut hidden: CpuTensor,
+        skips: &mut Vec<CpuTensor>,
+        time_embedding: &CpuTensor,
+        encoder_states: &CpuTensor,
+        runtime_options: DiffusionGenerationRuntimeOptions,
+    ) -> DiffusionResult<CpuTensor> {
         for block in &self.blocks {
-            hidden = block.forward(hidden, skips, time_embedding, encoder_states)?;
+            hidden = block.forward_with_runtime_options(
+                hidden,
+                skips,
+                time_embedding,
+                encoder_states,
+                runtime_options,
+            )?;
         }
         Ok(hidden)
     }
@@ -5840,16 +6099,34 @@ impl UnetMidBlock2DCrossAttn {
 
     pub fn forward(
         &self,
-        mut hidden: CpuTensor,
+        hidden: CpuTensor,
         time_embedding: &CpuTensor,
         encoder_states: &CpuTensor,
     ) -> DiffusionResult<CpuTensor> {
-        hidden = self.resnet_0.forward(&hidden, time_embedding)?;
+        self.forward_with_runtime_options(
+            hidden,
+            time_embedding,
+            encoder_states,
+            DiffusionGenerationRuntimeOptions::default(),
+        )
+    }
+
+    fn forward_with_runtime_options(
+        &self,
+        mut hidden: CpuTensor,
+        time_embedding: &CpuTensor,
+        encoder_states: &CpuTensor,
+        runtime_options: DiffusionGenerationRuntimeOptions,
+    ) -> DiffusionResult<CpuTensor> {
+        hidden =
+            self.resnet_0
+                .forward_with_runtime_options(&hidden, time_embedding, runtime_options)?;
         if let Some(attention) = &self.attention {
             hidden = attention.forward(&hidden, encoder_states)?;
         }
         if let Some(resnet) = &self.resnet_1 {
-            hidden = resnet.forward(&hidden, time_embedding)?;
+            hidden =
+                resnet.forward_with_runtime_options(&hidden, time_embedding, runtime_options)?;
         }
         Ok(hidden)
     }
@@ -5997,20 +6274,35 @@ impl NativeUnet2DConditionModel {
             time_embedding =
                 tensor_add_with_runtime_options(&time_embedding, &added, runtime_options)?;
         }
-        let (hidden, mut skips) =
-            self.down_path
-                .forward(&sample, &time_embedding, encoder_states)?;
+        let (hidden, mut skips) = self.down_path.forward_with_runtime_options(
+            &sample,
+            &time_embedding,
+            encoder_states,
+            runtime_options,
+        )?;
         let hidden = if let Some(mid_block) = &self.mid_block {
-            mid_block.forward(hidden, &time_embedding, encoder_states)?
+            mid_block.forward_with_runtime_options(
+                hidden,
+                &time_embedding,
+                encoder_states,
+                runtime_options,
+            )?
         } else {
             hidden
         };
+        let hidden = self.up_path.forward_with_runtime_options(
+            hidden,
+            &mut skips,
+            &time_embedding,
+            encoder_states,
+            runtime_options,
+        )?;
         let hidden = self
-            .up_path
-            .forward(hidden, &mut skips, &time_embedding, encoder_states)?;
-        let hidden = self.conv_norm_out.forward(&hidden)?;
-        let hidden = tensor_map(&hidden, silu);
-        self.conv_out.forward(&hidden)
+            .conv_norm_out
+            .forward_with_runtime_options(&hidden, runtime_options)?;
+        let hidden = silu_with_runtime_options(&hidden, runtime_options)?;
+        self.conv_out
+            .forward_with_runtime_options(&hidden, runtime_options)
     }
 
     pub fn denoise_latents(
