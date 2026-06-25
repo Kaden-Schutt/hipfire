@@ -58,6 +58,7 @@ pub struct SdGenerationRequest {
     pub infotext: Option<String>,
     pub init_images: Option<Vec<String>>,
     pub mask: Option<String>,
+    pub inpainting_mask_invert: Option<Value>,
     pub resize_mode: Option<u32>,
     pub include_init_images: Option<bool>,
     pub denoising_strength: Option<f64>,
@@ -524,7 +525,13 @@ async fn execute_hfq_diffusion_img2img(
         Err(error) => return diffusion_error_response(error),
     };
     let mask = match mask
-        .map(|mask| sdapi_img2img_resize_image(&body, mask, target_dimensions))
+        .map(|mask| {
+            sdapi_img2img_resize_image(
+                &body,
+                sdapi_apply_inpainting_mask_options(&body, mask),
+                target_dimensions,
+            )
+        })
         .transpose()
     {
         Ok(mask) => mask,
@@ -1026,6 +1033,52 @@ fn sdapi_img2img_resize_image(
         mode => Err(DiffusionError::InvalidRequest(format!(
             "unsupported img2img resize_mode {mode}; supported values are 0, 1, 2, and 3"
         ))),
+    }
+}
+
+fn sdapi_apply_inpainting_mask_options(
+    body: &SdGenerationRequest,
+    mask: RgbImageBatch,
+) -> RgbImageBatch {
+    if !sdapi_inpainting_mask_invert(body) {
+        return mask;
+    }
+
+    RgbImageBatch {
+        data: mask
+            .data
+            .into_iter()
+            .map(|byte| 255u8.saturating_sub(byte))
+            .collect(),
+        ..mask
+    }
+}
+
+fn sdapi_inpainting_mask_invert(body: &SdGenerationRequest) -> bool {
+    body.inpainting_mask_invert
+        .as_ref()
+        .is_some_and(sdapi_value_is_truthy)
+}
+
+fn sdapi_value_is_truthy(value: &Value) -> bool {
+    match value {
+        Value::Bool(value) => *value,
+        Value::Number(value) => value
+            .as_i64()
+            .map(|value| value != 0)
+            .or_else(|| value.as_u64().map(|value| value != 0))
+            .or_else(|| value.as_f64().map(|value| value != 0.0))
+            .unwrap_or(false),
+        Value::String(value) => {
+            let value = value.trim();
+            value
+                .parse::<f64>()
+                .map(|value| value != 0.0)
+                .unwrap_or_else(|_| {
+                    matches!(value.to_ascii_lowercase().as_str(), "true" | "yes" | "on")
+                })
+        }
+        _ => false,
     }
 }
 
@@ -4047,6 +4100,45 @@ mod tests {
     }
 
     #[test]
+    fn img2img_mask_options_invert_mask_pixels() {
+        let mask = RgbImageBatch {
+            batch: 1,
+            width: 2,
+            height: 1,
+            data: vec![0, 64, 255, 10, 128, 240],
+        };
+
+        let disabled = SdGenerationRequest {
+            inpainting_mask_invert: Some(json!(0)),
+            ..empty_request()
+        };
+        let unchanged = sdapi_apply_inpainting_mask_options(&disabled, mask.clone());
+        assert_eq!(unchanged.data, mask.data);
+
+        let enabled = SdGenerationRequest {
+            inpainting_mask_invert: Some(json!(1)),
+            ..empty_request()
+        };
+        let inverted = sdapi_apply_inpainting_mask_options(&enabled, mask);
+
+        assert_eq!(inverted.width, 2);
+        assert_eq!(inverted.height, 1);
+        assert_eq!(inverted.data, vec![255, 191, 0, 245, 127, 15]);
+        assert!(sdapi_inpainting_mask_invert(&SdGenerationRequest {
+            inpainting_mask_invert: Some(json!(true)),
+            ..empty_request()
+        }));
+        assert!(sdapi_inpainting_mask_invert(&SdGenerationRequest {
+            inpainting_mask_invert: Some(json!("2")),
+            ..empty_request()
+        }));
+        assert!(!sdapi_inpainting_mask_invert(&SdGenerationRequest {
+            inpainting_mask_invert: Some(json!("0")),
+            ..empty_request()
+        }));
+    }
+
+    #[test]
     fn txt2img_highres_second_pass_body_applies_prompt_and_sampler_overrides() {
         let body = SdGenerationRequest {
             prompt: "base prompt".to_string(),
@@ -4126,6 +4218,7 @@ mod tests {
             infotext: None,
             init_images: None,
             mask: None,
+            inpainting_mask_invert: None,
             resize_mode: None,
             include_init_images: None,
             denoising_strength: None,
