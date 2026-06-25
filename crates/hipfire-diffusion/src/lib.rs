@@ -204,6 +204,7 @@ pub struct DiffusionHipPreflight {
     pub guidance_kernel_probe: DiffusionHipKernelProbe,
     pub scheduler_kernel_probe: DiffusionHipKernelProbe,
     pub conv2d_kernel_probe: DiffusionHipKernelProbe,
+    pub group_norm_kernel_probe: DiffusionHipKernelProbe,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2495,6 +2496,53 @@ impl DiffusionPipeline {
                 "HIP diffusion Conv2D kernel output differed from CPU reference".to_string(),
             ));
         }
+        let group_norm_input = CpuTensor {
+            shape: vec![1, 4, 2, 3],
+            data: (0..24)
+                .map(|idx| idx as f32 / 7.0 - 1.5)
+                .collect::<Vec<_>>(),
+        };
+        let group_norm_weight = CpuTensor {
+            shape: vec![4],
+            data: vec![1.0, 0.5, -1.0, 1.5],
+        };
+        let group_norm_bias = CpuTensor {
+            shape: vec![4],
+            data: vec![0.0, 0.25, -0.5, 0.75],
+        };
+        let group_norm_cpu_reference = group_norm_nchw(
+            &group_norm_input,
+            &group_norm_weight,
+            &group_norm_bias,
+            2,
+            1e-5,
+        )?;
+        let group_norm_gpu_output = group_norm_nchw_hip_on_gpu(
+            &mut gpu,
+            &group_norm_input,
+            &group_norm_weight,
+            &group_norm_bias,
+            2,
+            1e-5,
+        )?;
+        let group_norm_kernel_probe = DiffusionHipKernelProbe {
+            name: "diffusion_group_norm_nchw_f32".to_string(),
+            input_elements: group_norm_input.data.len()
+                + group_norm_weight.data.len()
+                + group_norm_bias.data.len(),
+            output_bytes: group_norm_gpu_output.data.len() * std::mem::size_of::<f32>(),
+            matched_cpu_reference: group_norm_gpu_output.shape == group_norm_cpu_reference.shape
+                && f32_slices_close(
+                    &group_norm_gpu_output.data,
+                    &group_norm_cpu_reference.data,
+                    1e-5,
+                ),
+        };
+        if !group_norm_kernel_probe.matched_cpu_reference {
+            return Err(DiffusionError::BackendUnavailable(
+                "HIP diffusion GroupNorm kernel output differed from CPU reference".to_string(),
+            ));
+        }
 
         Ok(DiffusionHipPreflight {
             device_id: gpu.device_id,
@@ -2507,6 +2555,7 @@ impl DiffusionPipeline {
             guidance_kernel_probe,
             scheduler_kernel_probe,
             conv2d_kernel_probe,
+            group_norm_kernel_probe,
         })
     }
 
@@ -5237,6 +5286,62 @@ extern "C" __global__ void diffusion_conv2d_nchw_f32(
 "#;
 
 #[cfg(feature = "rocm")]
+const DIFFUSION_GROUP_NORM_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void diffusion_group_norm_nchw_f32(
+    const float* input,
+    const float* weight,
+    const float* bias,
+    float* output,
+    int total_elements,
+    int channels,
+    int height,
+    int width,
+    int groups,
+    float eps
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) {
+        return;
+    }
+    int t = idx / width;
+    t /= height;
+    int c = t % channels;
+    int b = t / channels;
+    int channels_per_group = channels / groups;
+    int group = c / channels_per_group;
+    int c_start = group * channels_per_group;
+    int c_end = c_start + channels_per_group;
+    int elems_per_group = channels_per_group * height * width;
+
+    float sum = 0.0f;
+    for (int gc = c_start; gc < c_end; ++gc) {
+        for (int gy = 0; gy < height; ++gy) {
+            for (int gx = 0; gx < width; ++gx) {
+                int sample_idx = ((b * channels + gc) * height + gy) * width + gx;
+                sum += input[sample_idx];
+            }
+        }
+    }
+    float mean = sum / (float)elems_per_group;
+
+    float var_sum = 0.0f;
+    for (int gc = c_start; gc < c_end; ++gc) {
+        for (int gy = 0; gy < height; ++gy) {
+            for (int gx = 0; gx < width; ++gx) {
+                int sample_idx = ((b * channels + gc) * height + gy) * width + gx;
+                float centered = input[sample_idx] - mean;
+                var_sum += centered * centered;
+            }
+        }
+    }
+    float inv_std = rsqrtf(var_sum / (float)elems_per_group + eps);
+    output[idx] = (input[idx] - mean) * inv_std * weight[c] + bias[c];
+}
+"#;
+
+#[cfg(feature = "rocm")]
 fn rgb_tensor_to_u8_hip_on_gpu(
     gpu: &mut rdna_compute::Gpu,
     tensor: &CpuTensor,
@@ -5642,6 +5747,116 @@ fn conv2d_nchw_hip_on_gpu(
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
     Ok(CpuTensor {
         shape: vec![batch, out_channels, out_h, out_w],
+        data,
+    })
+}
+
+#[cfg(feature = "rocm")]
+fn group_norm_nchw_hip_on_gpu(
+    gpu: &mut rdna_compute::Gpu,
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    bias: &CpuTensor,
+    groups: usize,
+    eps: f32,
+) -> DiffusionResult<CpuTensor> {
+    let [_batch, channels, height, width] = shape4(input)?;
+    if groups == 0 || channels % groups != 0 {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "group_norm channels {channels} not divisible by groups {groups}"
+        )));
+    }
+    if weight.shape.as_slice() != [channels] || bias.shape.as_slice() != [channels] {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "group_norm weight/bias shapes {:?}/{:?} != [{channels}]",
+            weight.shape, bias.shape
+        )));
+    }
+    let output_elements = checked_shape_elements("group_norm output", &input.shape)?;
+    if output_elements == 0 {
+        return Ok(CpuTensor::zeros(&input.shape));
+    }
+    let output_bytes = output_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata("group_norm output size overflows".to_string())
+        })?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let input_gpu = gpu
+        .upload_f32(&input.data, &input.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let weight_gpu = gpu
+        .upload_f32(&weight.data, &weight.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let bias_gpu = gpu
+        .upload_f32(&bias.data, &bias.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = gpu
+        .hip
+        .malloc(output_bytes)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = compiler
+        .compile(
+            "diffusion_group_norm_nchw_f32",
+            DIFFUSION_GROUP_NORM_HIP_SRC,
+        )
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = obj_path
+        .to_str()
+        .ok_or_else(|| {
+            DiffusionError::BackendUnavailable(
+                "compiled diffusion GroupNorm kernel path is not UTF-8".to_string(),
+            )
+        })?
+        .to_string();
+    let module = gpu
+        .hip
+        .module_load(&obj_path)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let function = gpu
+        .hip
+        .module_get_function(&module, "diffusion_group_norm_nchw_f32")
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(input_gpu.buf.as_ptr());
+    kernargs.push_ptr(weight_gpu.buf.as_ptr());
+    kernargs.push_ptr(bias_gpu.buf.as_ptr());
+    kernargs.push_ptr(output_gpu.as_ptr());
+    kernargs.push_i32(i32_kernel_dim(
+        "group_norm output elements",
+        output_elements,
+    )?);
+    kernargs.push_i32(i32_kernel_dim("group_norm channels", channels)?);
+    kernargs.push_i32(i32_kernel_dim("group_norm height", height)?);
+    kernargs.push_i32(i32_kernel_dim("group_norm width", width)?);
+    kernargs.push_i32(i32_kernel_dim("group_norm groups", groups)?);
+    kernargs.push_f32(eps);
+    kernargs.pad_to(16);
+    let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+    unsafe {
+        gpu.hip
+            .launch_kernel_blob(
+                &function,
+                grid,
+                [256, 1, 1],
+                0,
+                gpu.active_stream.as_ref(),
+                kernargs.as_mut_slice(),
+            )
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(CpuTensor {
+        shape: input.shape.clone(),
         data,
     })
 }
@@ -12483,6 +12698,43 @@ mod tests {
                     "Conv2D mismatch at {index}: hip={actual} cpu={expected}"
                 );
             }
+        }
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn hip_group_norm_matches_cpu_reference_when_gpu_is_available() {
+        let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!("skip: ROCm GPU unavailable for GroupNorm kernel parity test: {error}");
+                return;
+            }
+        };
+        let input = CpuTensor {
+            shape: vec![2, 4, 2, 3],
+            data: (0..48)
+                .map(|idx| idx as f32 / 13.0 - 1.75)
+                .collect::<Vec<_>>(),
+        };
+        let weight = CpuTensor {
+            shape: vec![4],
+            data: vec![1.0, 0.5, -1.0, 1.5],
+        };
+        let bias = CpuTensor {
+            shape: vec![4],
+            data: vec![0.0, 0.25, -0.5, 0.75],
+        };
+
+        let cpu = group_norm_nchw(&input, &weight, &bias, 2, 1e-5).unwrap();
+        let hip = group_norm_nchw_hip_on_gpu(&mut gpu, &input, &weight, &bias, 2, 1e-5).unwrap();
+
+        assert_eq!(hip.shape, cpu.shape);
+        for (index, (actual, expected)) in hip.data.iter().zip(&cpu.data).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1e-5,
+                "GroupNorm mismatch at {index}: hip={actual} cpu={expected}"
+            );
         }
     }
 
