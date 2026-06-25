@@ -202,10 +202,10 @@ Print lock status: "gpu is free" or "gpu BUSY: <holder>"
 
 Import and inspect diffusion models stored as .hfq artifacts
 
-Runtime note: runnable `.hfq` diffusion artifacts currently use the native CPU
-reference graph for CLIP text conditioning. ROCm preflight can validate the
-planned device buffers plus individual diffusion kernels for model-input
-scaling, classifier-free guidance, Euler
+Runtime note: runnable `.hfq` diffusion artifacts still perform CLIP
+tokenization and token/position embedding lookup as host-side setup. ROCm
+preflight can validate the planned device buffers plus individual diffusion
+kernels for model-input scaling, classifier-free guidance, Euler
 scheduler updates, centered UNet input, timestep embeddings, RGB-to-VAE tensor
 conversion, VAE moments-to-latents scaling, latent mask downsampling, masked RGB
 inpaint preparation, latent mask blending, residual tensor add, NCHW channel-bias
@@ -213,19 +213,19 @@ add, NCHW/BSC layout transforms, NCHW channel concat, 2D/3D last-dim concat, f32
 NCHW Conv2D, f32 NCHW GroupNorm, SiLU, nearest-neighbor upsample, f32 dense
 linear projection, f32 LayerNorm, f32 row softmax, f32 3D
 scaled-dot-product attention, f32 CLIP causal self-attention, GeGLU gate, and
-RGB conversion, but full generation is not routed through a fully resident GPU
-runtime yet.
+QuickGELU, and RGB conversion, but full generation is not routed through a
+fully resident GPU runtime yet.
 `txt2img` and `img2img` can opt into `--rocm-device-id` to route currently
 GPU-backed generation boundaries through ROCm: denoise-loop model-input
 scaling, classifier-free guidance, Euler scheduler updates, UNet input
-centering, UNet timestep and SDXL add-time embedding projections, UNet ResNet
+centering, CLIP text encoder tensor stages after token/position embedding
+lookup, UNet timestep and SDXL add-time embedding projections, UNet ResNet
 blocks, UNet transformer attention blocks, down/up sampling, channel
-concatenation, and final UNet norm, activation, and conv output, plus final
-VAE decode graph execution and decoded tensor-to-RGB conversion for both modes,
-img2img/inpaint RGB-to-VAE tensor conversion, VAE encode graph execution,
-VAE moments-to-latents scaling, latent mask downsampling, masked RGB
-preparation, and final latent mask blending. CLIP text conditioning still uses
-the native CPU reference path.
+concatenation, and final UNet norm, activation, and conv output, plus final VAE
+decode graph execution and decoded tensor-to-RGB conversion for both modes,
+img2img/inpaint RGB-to-VAE tensor conversion, VAE encode graph execution, VAE
+moments-to-latents scaling, latent mask downsampling, masked RGB preparation,
+and final latent mask blending.
 The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128,
 HFQ4G256, and HFQ6G256 tensor payloads even when the artifact `weight_format`
 records a future quantized format such as `oq4`; OQ/MQ/HFP and other packed
@@ -295,9 +295,9 @@ channel-bias add, latent mask downsampling, masked RGB inpaint preparation,
 latent mask blending, NCHW/BSC layout transforms, NCHW channel concat, 2D/3D
 last-dim concat, f32 NCHW Conv2D, f32 NCHW GroupNorm, SiLU, nearest-neighbor
 upsample, f32 dense linear projection, f32 LayerNorm, f32 row softmax, f32 3D
-scaled-dot-product attention, f32 CLIP causal self-attention, GeGLU gate, and
-RGB conversion. Each kernel probe is checked against the CPU reference and
-reported in the JSON output.
+scaled-dot-product attention, f32 CLIP causal self-attention, GeGLU gate,
+QuickGELU, and RGB conversion. Each kernel probe is checked against the CPU
+reference and reported in the JSON output.
 
 **Usage:** `hipfire diffusion preflight [OPTIONS] --model <MODEL>`
 

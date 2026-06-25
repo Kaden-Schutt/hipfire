@@ -240,6 +240,7 @@ pub struct DiffusionHipPreflight {
     pub conv2d_kernel_probe: DiffusionHipKernelProbe,
     pub group_norm_kernel_probe: DiffusionHipKernelProbe,
     pub silu_kernel_probe: DiffusionHipKernelProbe,
+    pub quick_gelu_kernel_probe: DiffusionHipKernelProbe,
     pub upsample_kernel_probe: DiffusionHipKernelProbe,
     pub linear_kernel_probe: DiffusionHipKernelProbe,
     pub layer_norm_kernel_probe: DiffusionHipKernelProbe,
@@ -2184,6 +2185,9 @@ fn linear_with_runtime_options(
     bias: &CpuTensor,
     runtime_options: DiffusionGenerationRuntimeOptions,
 ) -> DiffusionResult<CpuTensor> {
+    if runtime_options.rocm_device_id.is_none() {
+        return linear(input, weight, bias);
+    }
     linear_optional_bias_with_runtime_options(input, weight, Some(bias), runtime_options)
 }
 
@@ -2199,6 +2203,26 @@ fn silu_with_runtime_options(
         let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
             .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
         silu_hip_on_gpu(&mut gpu, input)
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = device_id;
+        Err(rocm_hybrid_unavailable_error())
+    }
+}
+
+fn quick_gelu_with_runtime_options(
+    input: &CpuTensor,
+    runtime_options: DiffusionGenerationRuntimeOptions,
+) -> DiffusionResult<CpuTensor> {
+    let Some(device_id) = runtime_options.rocm_device_id else {
+        return Ok(tensor_map(input, quick_gelu));
+    };
+    #[cfg(feature = "rocm")]
+    {
+        let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+        quick_gelu_hip_on_gpu(&mut gpu, input)
     }
     #[cfg(not(feature = "rocm"))]
     {
@@ -2241,6 +2265,27 @@ fn concat_last_dim_2d_with_runtime_options(
         let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
             .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
         concat_last_dim_2d_hip_on_gpu(&mut gpu, a, b)
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = device_id;
+        Err(rocm_hybrid_unavailable_error())
+    }
+}
+
+fn concat_last_dim_3d_with_runtime_options(
+    a: &CpuTensor,
+    b: &CpuTensor,
+    runtime_options: DiffusionGenerationRuntimeOptions,
+) -> DiffusionResult<CpuTensor> {
+    let Some(device_id) = runtime_options.rocm_device_id else {
+        return concat_last_dim_3d(a, b);
+    };
+    #[cfg(feature = "rocm")]
+    {
+        let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+        concat_last_dim_3d_hip_on_gpu(&mut gpu, a, b)
     }
     #[cfg(not(feature = "rocm"))]
     {
@@ -2493,6 +2538,29 @@ fn scaled_dot_product_attention_with_runtime_options(
         let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
             .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
         scaled_dot_product_attention_hip_on_gpu(&mut gpu, q, k, v, heads)
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = device_id;
+        Err(rocm_hybrid_unavailable_error())
+    }
+}
+
+fn clip_causal_self_attention_with_runtime_options(
+    q: &CpuTensor,
+    k: &CpuTensor,
+    v: &CpuTensor,
+    n_heads: usize,
+    runtime_options: DiffusionGenerationRuntimeOptions,
+) -> DiffusionResult<CpuTensor> {
+    let Some(device_id) = runtime_options.rocm_device_id else {
+        return clip_causal_self_attention(q, k, v, n_heads);
+    };
+    #[cfg(feature = "rocm")]
+    {
+        let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+        clip_causal_self_attention_hip_on_gpu(&mut gpu, q, k, v, n_heads)
     }
     #[cfg(not(feature = "rocm"))]
     {
@@ -3625,6 +3693,28 @@ impl DiffusionPipeline {
                 "HIP diffusion SiLU kernel output differed from CPU reference".to_string(),
             ));
         }
+        let quick_gelu_input = CpuTensor {
+            shape: vec![2, 4],
+            data: vec![-4.0, -1.0, -0.25, 0.0, 0.25, 1.0, 2.0, 4.0],
+        };
+        let quick_gelu_cpu_reference = tensor_map(&quick_gelu_input, quick_gelu);
+        let quick_gelu_gpu_output = quick_gelu_hip_on_gpu(&mut gpu, &quick_gelu_input)?;
+        let quick_gelu_kernel_probe = DiffusionHipKernelProbe {
+            name: "diffusion_quick_gelu_f32".to_string(),
+            input_elements: quick_gelu_input.data.len(),
+            output_bytes: quick_gelu_gpu_output.data.len() * std::mem::size_of::<f32>(),
+            matched_cpu_reference: quick_gelu_gpu_output.shape == quick_gelu_cpu_reference.shape
+                && f32_slices_close(
+                    &quick_gelu_gpu_output.data,
+                    &quick_gelu_cpu_reference.data,
+                    1e-6,
+                ),
+        };
+        if !quick_gelu_kernel_probe.matched_cpu_reference {
+            return Err(DiffusionError::BackendUnavailable(
+                "HIP diffusion QuickGELU kernel output differed from CPU reference".to_string(),
+            ));
+        }
         let upsample_input = CpuTensor {
             shape: vec![1, 2, 2, 3],
             data: (0..12)
@@ -3917,6 +4007,7 @@ impl DiffusionPipeline {
             conv2d_kernel_probe,
             group_norm_kernel_probe,
             silu_kernel_probe,
+            quick_gelu_kernel_probe,
             upsample_kernel_probe,
             linear_kernel_probe,
             layer_norm_kernel_probe,
@@ -3972,7 +4063,7 @@ impl DiffusionPipeline {
     ) -> DiffusionResult<DiffusionBatchOutput> {
         validate_batch_request(&self.metadata, &request)?;
         let runtime = self.native_runtime()?;
-        let plan = self.prepare_run_plan(&request)?;
+        let plan = self.prepare_run_plan_with_runtime_options(&request, runtime_options)?;
         let positive_embeddings = plan
             .conditioning
             .prompt_cross_attention_embeddings
@@ -4111,7 +4202,7 @@ impl DiffusionPipeline {
     ) -> DiffusionResult<DiffusionBatchOutput> {
         validate_img2img_request(&self.metadata, &request)?;
         let runtime = self.native_runtime()?;
-        let plan = self.prepare_run_plan(&request.batch)?;
+        let plan = self.prepare_run_plan_with_runtime_options(&request.batch, runtime_options)?;
         let positive_embeddings = plan
             .conditioning
             .prompt_cross_attention_embeddings
@@ -4316,7 +4407,19 @@ impl DiffusionPipeline {
         &self,
         request: &DiffusionBatchRequest,
     ) -> DiffusionResult<DiffusionRunPlan> {
-        let conditioning = self.prepare_conditioning_batch(request)?;
+        self.prepare_run_plan_with_runtime_options(
+            request,
+            DiffusionGenerationRuntimeOptions::default(),
+        )
+    }
+
+    fn prepare_run_plan_with_runtime_options(
+        &self,
+        request: &DiffusionBatchRequest,
+        runtime_options: DiffusionGenerationRuntimeOptions,
+    ) -> DiffusionResult<DiffusionRunPlan> {
+        let conditioning =
+            self.prepare_conditioning_batch_with_runtime_options(request, runtime_options)?;
         let latent_shape = latent_shape_for_request(&self.config, request)?;
         let seeds = request
             .prompts
@@ -4348,6 +4451,17 @@ impl DiffusionPipeline {
     pub fn prepare_conditioning_batch(
         &self,
         request: &DiffusionBatchRequest,
+    ) -> DiffusionResult<DiffusionConditioningBatch> {
+        self.prepare_conditioning_batch_with_runtime_options(
+            request,
+            DiffusionGenerationRuntimeOptions::default(),
+        )
+    }
+
+    fn prepare_conditioning_batch_with_runtime_options(
+        &self,
+        request: &DiffusionBatchRequest,
+        runtime_options: DiffusionGenerationRuntimeOptions,
     ) -> DiffusionResult<DiffusionConditioningBatch> {
         validate_batch_request(&self.metadata, request)?;
         let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
@@ -4389,8 +4503,16 @@ impl DiffusionPipeline {
         let (prompt_embeddings, negative_embeddings) =
             if let Some(text_encoder) = self.text_encoder.as_ref() {
                 (
-                    Some(encode_token_batch(text_encoder, &prompt_tokens)?),
-                    Some(encode_token_batch(text_encoder, &negative_tokens)?),
+                    Some(encode_token_batch_with_runtime_options(
+                        text_encoder,
+                        &prompt_tokens,
+                        runtime_options,
+                    )?),
+                    Some(encode_token_batch_with_runtime_options(
+                        text_encoder,
+                        &negative_tokens,
+                        runtime_options,
+                    )?),
                 )
             } else {
                 (None, None)
@@ -4413,27 +4535,38 @@ impl DiffusionPipeline {
             prompt_tokens_2.as_ref(),
             negative_tokens_2.as_ref(),
         ) {
-            let (prompt_embeddings_2, prompt_pooled_embeddings) = encode_token_batch_with_pooled(
-                text_encoder_2,
-                prompt_tokens_2,
-                tokenizer_2.end_token_id(),
-            )?;
+            let (prompt_embeddings_2, prompt_pooled_embeddings) =
+                encode_token_batch_with_pooled_and_runtime_options(
+                    text_encoder_2,
+                    prompt_tokens_2,
+                    tokenizer_2.end_token_id(),
+                    runtime_options,
+                )?;
             let (negative_embeddings_2, negative_pooled_embeddings) =
-                encode_token_batch_with_pooled(
+                encode_token_batch_with_pooled_and_runtime_options(
                     text_encoder_2,
                     negative_tokens_2,
                     tokenizer_2.end_token_id(),
+                    runtime_options,
                 )?;
             let prompt_cross_attention_embeddings = prompt_embeddings
                 .as_ref()
                 .map(|prompt_embeddings| {
-                    concat_last_dim_3d(prompt_embeddings, &prompt_embeddings_2)
+                    concat_last_dim_3d_with_runtime_options(
+                        prompt_embeddings,
+                        &prompt_embeddings_2,
+                        runtime_options,
+                    )
                 })
                 .transpose()?;
             let negative_cross_attention_embeddings = negative_embeddings
                 .as_ref()
                 .map(|negative_embeddings| {
-                    concat_last_dim_3d(negative_embeddings, &negative_embeddings_2)
+                    concat_last_dim_3d_with_runtime_options(
+                        negative_embeddings,
+                        &negative_embeddings_2,
+                        runtime_options,
+                    )
                 })
                 .transpose()?;
             (
@@ -4860,14 +4993,15 @@ impl StableDiffusionConfig {
     }
 }
 
-fn encode_token_batch(
+fn encode_token_batch_with_runtime_options(
     text_encoder: &ClipTextEncoder,
     token_batch: &[Vec<u32>],
+    runtime_options: DiffusionGenerationRuntimeOptions,
 ) -> DiffusionResult<CpuTensor> {
     let mut encoded = Vec::new();
     let mut shape = None;
     for tokens in token_batch {
-        let tensor = text_encoder.encode_tokens(tokens)?;
+        let tensor = text_encoder.encode_tokens_with_runtime_options(tokens, runtime_options)?;
         let [seq, hidden] = shape2(&tensor)?;
         if let Some((expected_seq, expected_hidden)) = shape {
             if (seq, hidden) != (expected_seq, expected_hidden) {
@@ -4887,18 +5021,19 @@ fn encode_token_batch(
     })
 }
 
-fn encode_token_batch_with_pooled(
+fn encode_token_batch_with_pooled_and_runtime_options(
     text_encoder: &ClipTextEncoder,
     token_batch: &[Vec<u32>],
     end_token: u32,
+    runtime_options: DiffusionGenerationRuntimeOptions,
 ) -> DiffusionResult<(CpuTensor, CpuTensor)> {
     let mut encoded = Vec::new();
     let mut pooled = Vec::new();
     let mut hidden_shape = None;
     let mut pooled_width = None;
     for tokens in token_batch {
-        let (hidden_states, pooled_embedding) =
-            text_encoder.encode_tokens_with_pooled(tokens, end_token)?;
+        let (hidden_states, pooled_embedding) = text_encoder
+            .encode_tokens_with_pooled_and_runtime_options(tokens, end_token, runtime_options)?;
         let [seq, hidden] = shape2(&hidden_states)?;
         if let Some((expected_seq, expected_hidden)) = hidden_shape {
             if (seq, hidden) != (expected_seq, expected_hidden) {
@@ -7687,6 +7822,24 @@ extern "C" __global__ void diffusion_silu_f32(
 "#;
 
 #[cfg(feature = "rocm")]
+const DIFFUSION_QUICK_GELU_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void diffusion_quick_gelu_f32(
+    const float* input,
+    float* output,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    float value = input[idx];
+    output[idx] = value / (1.0f + expf(-1.702f * value));
+}
+"#;
+
+#[cfg(feature = "rocm")]
 const DIFFUSION_UPSAMPLE_NEAREST2D_HIP_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 
@@ -9811,6 +9964,82 @@ fn silu_hip_on_gpu(gpu: &mut rdna_compute::Gpu, input: &CpuTensor) -> DiffusionR
 }
 
 #[cfg(feature = "rocm")]
+fn quick_gelu_hip_on_gpu(
+    gpu: &mut rdna_compute::Gpu,
+    input: &CpuTensor,
+) -> DiffusionResult<CpuTensor> {
+    let elements = checked_shape_elements("QuickGELU input", &input.shape)?;
+    if elements == 0 {
+        return Ok(CpuTensor::zeros(&input.shape));
+    }
+    let n = i32_kernel_dim("QuickGELU elements", elements)?;
+    let output_bytes = elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata("QuickGELU output size overflows".to_string())
+        })?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let input_gpu = gpu
+        .upload_f32(&input.data, &input.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = gpu
+        .hip
+        .malloc(output_bytes)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = compiler
+        .compile("diffusion_quick_gelu_f32", DIFFUSION_QUICK_GELU_HIP_SRC)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = obj_path
+        .to_str()
+        .ok_or_else(|| {
+            DiffusionError::BackendUnavailable(
+                "compiled diffusion QuickGELU kernel path is not UTF-8".to_string(),
+            )
+        })?
+        .to_string();
+    let module = gpu
+        .hip
+        .module_load(&obj_path)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let function = gpu
+        .hip
+        .module_get_function(&module, "diffusion_quick_gelu_f32")
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(input_gpu.buf.as_ptr());
+    kernargs.push_ptr(output_gpu.as_ptr());
+    kernargs.push_i32(n);
+    kernargs.pad_to(16);
+    let grid = [((elements as u32).saturating_add(255)) / 256, 1, 1];
+    unsafe {
+        gpu.hip
+            .launch_kernel_blob(
+                &function,
+                grid,
+                [256, 1, 1],
+                0,
+                gpu.active_stream.as_ref(),
+                kernargs.as_mut_slice(),
+            )
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let data = download_f32_buffer(gpu, &output_gpu, elements)?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(CpuTensor {
+        shape: input.shape.clone(),
+        data,
+    })
+}
+
+#[cfg(feature = "rocm")]
 fn upsample_nearest2d_nchw_hip_on_gpu(
     gpu: &mut rdna_compute::Gpu,
     input: &CpuTensor,
@@ -11072,7 +11301,18 @@ impl ClipTextEncoder {
     }
 
     pub fn encode_tokens(&self, tokens: &[u32]) -> DiffusionResult<CpuTensor> {
-        self.encode_tokens_internal(tokens)
+        self.encode_tokens_with_runtime_options(
+            tokens,
+            DiffusionGenerationRuntimeOptions::default(),
+        )
+    }
+
+    fn encode_tokens_with_runtime_options(
+        &self,
+        tokens: &[u32],
+        runtime_options: DiffusionGenerationRuntimeOptions,
+    ) -> DiffusionResult<CpuTensor> {
+        self.encode_tokens_internal_with_runtime_options(tokens, runtime_options)
     }
 
     pub fn encode_tokens_with_pooled(
@@ -11080,12 +11320,35 @@ impl ClipTextEncoder {
         tokens: &[u32],
         end_token: u32,
     ) -> DiffusionResult<(CpuTensor, Option<Vec<f32>>)> {
-        let hidden_states = self.encode_tokens_internal(tokens)?;
-        let pooled = self.pooled_text_embedding(&hidden_states, tokens, end_token)?;
+        self.encode_tokens_with_pooled_and_runtime_options(
+            tokens,
+            end_token,
+            DiffusionGenerationRuntimeOptions::default(),
+        )
+    }
+
+    fn encode_tokens_with_pooled_and_runtime_options(
+        &self,
+        tokens: &[u32],
+        end_token: u32,
+        runtime_options: DiffusionGenerationRuntimeOptions,
+    ) -> DiffusionResult<(CpuTensor, Option<Vec<f32>>)> {
+        let hidden_states =
+            self.encode_tokens_internal_with_runtime_options(tokens, runtime_options)?;
+        let pooled = self.pooled_text_embedding_with_runtime_options(
+            &hidden_states,
+            tokens,
+            end_token,
+            runtime_options,
+        )?;
         Ok((hidden_states, Some(pooled)))
     }
 
-    fn encode_tokens_internal(&self, tokens: &[u32]) -> DiffusionResult<CpuTensor> {
+    fn encode_tokens_internal_with_runtime_options(
+        &self,
+        tokens: &[u32],
+        runtime_options: DiffusionGenerationRuntimeOptions,
+    ) -> DiffusionResult<CpuTensor> {
         if tokens.len() > self.max_length {
             return Err(DiffusionError::InvalidRequest(format!(
                 "CLIP token length {} exceeds max_length {}",
@@ -11113,21 +11376,23 @@ impl ClipTextEncoder {
             }
         }
         for layer in &self.layers {
-            x = layer.forward(&x, self.n_heads)?;
+            x = layer.forward_with_runtime_options(&x, self.n_heads, runtime_options)?;
         }
-        layer_norm(
+        layer_norm_with_runtime_options(
             &x,
             &self.final_layer_norm_weight,
             &self.final_layer_norm_bias,
             1e-5,
+            runtime_options,
         )
     }
 
-    fn pooled_text_embedding(
+    fn pooled_text_embedding_with_runtime_options(
         &self,
         hidden_states: &CpuTensor,
         tokens: &[u32],
         end_token: u32,
+        runtime_options: DiffusionGenerationRuntimeOptions,
     ) -> DiffusionResult<Vec<f32>> {
         let [seq, hidden] = shape2(hidden_states)?;
         let token_idx = tokens
@@ -11138,7 +11403,7 @@ impl ClipTextEncoder {
         let base = token_idx * hidden;
         let pooled = hidden_states.data[base..base + hidden].to_vec();
         if let Some(projection) = &self.text_projection {
-            matmul_vector(&pooled, projection)
+            matmul_vector_with_runtime_options(&pooled, projection, runtime_options)
         } else {
             Ok(pooled)
         }
@@ -11146,28 +11411,72 @@ impl ClipTextEncoder {
 }
 
 impl ClipEncoderLayer {
-    fn forward(&self, x: &CpuTensor, n_heads: usize) -> DiffusionResult<CpuTensor> {
-        let norm1 = layer_norm(x, &self.layer_norm1_weight, &self.layer_norm1_bias, 1e-5)?;
-        let attn = self.self_attention(&norm1, n_heads)?;
-        let residual1 = tensor_add(x, &attn)?;
-        let norm2 = layer_norm(
+    fn forward_with_runtime_options(
+        &self,
+        x: &CpuTensor,
+        n_heads: usize,
+        runtime_options: DiffusionGenerationRuntimeOptions,
+    ) -> DiffusionResult<CpuTensor> {
+        let norm1 = layer_norm_with_runtime_options(
+            x,
+            &self.layer_norm1_weight,
+            &self.layer_norm1_bias,
+            1e-5,
+            runtime_options,
+        )?;
+        let attn = self.self_attention_with_runtime_options(&norm1, n_heads, runtime_options)?;
+        let residual1 = tensor_add_with_runtime_options(x, &attn, runtime_options)?;
+        let norm2 = layer_norm_with_runtime_options(
             &residual1,
             &self.layer_norm2_weight,
             &self.layer_norm2_bias,
             1e-5,
+            runtime_options,
         )?;
-        let hidden = linear(&norm2, &self.fc1_weight, &self.fc1_bias)?;
-        let activated = tensor_map(&hidden, quick_gelu);
-        let mlp = linear(&activated, &self.fc2_weight, &self.fc2_bias)?;
-        tensor_add(&residual1, &mlp)
+        let hidden =
+            linear_with_runtime_options(&norm2, &self.fc1_weight, &self.fc1_bias, runtime_options)?;
+        let activated = quick_gelu_with_runtime_options(&hidden, runtime_options)?;
+        let mlp = linear_with_runtime_options(
+            &activated,
+            &self.fc2_weight,
+            &self.fc2_bias,
+            runtime_options,
+        )?;
+        tensor_add_with_runtime_options(&residual1, &mlp, runtime_options)
     }
 
-    fn self_attention(&self, x: &CpuTensor, n_heads: usize) -> DiffusionResult<CpuTensor> {
-        let q = linear(x, &self.q_proj_weight, &self.q_proj_bias)?;
-        let k = linear(x, &self.k_proj_weight, &self.k_proj_bias)?;
-        let v = linear(x, &self.v_proj_weight, &self.v_proj_bias)?;
-        let context = clip_causal_self_attention(&q, &k, &v, n_heads)?;
-        linear(&context, &self.out_proj_weight, &self.out_proj_bias)
+    fn self_attention_with_runtime_options(
+        &self,
+        x: &CpuTensor,
+        n_heads: usize,
+        runtime_options: DiffusionGenerationRuntimeOptions,
+    ) -> DiffusionResult<CpuTensor> {
+        let q = linear_with_runtime_options(
+            x,
+            &self.q_proj_weight,
+            &self.q_proj_bias,
+            runtime_options,
+        )?;
+        let k = linear_with_runtime_options(
+            x,
+            &self.k_proj_weight,
+            &self.k_proj_bias,
+            runtime_options,
+        )?;
+        let v = linear_with_runtime_options(
+            x,
+            &self.v_proj_weight,
+            &self.v_proj_bias,
+            runtime_options,
+        )?;
+        let context =
+            clip_causal_self_attention_with_runtime_options(&q, &k, &v, n_heads, runtime_options)?;
+        linear_with_runtime_options(
+            &context,
+            &self.out_proj_weight,
+            &self.out_proj_bias,
+            runtime_options,
+        )
     }
 }
 
@@ -11438,6 +11747,31 @@ fn matmul_vector(vector: &[f32], matrix: &CpuTensor) -> DiffusionResult<Vec<f32>
         vector.len(),
         matrix.shape
     )))
+}
+
+fn matmul_vector_with_runtime_options(
+    vector: &[f32],
+    matrix: &CpuTensor,
+    runtime_options: DiffusionGenerationRuntimeOptions,
+) -> DiffusionResult<Vec<f32>> {
+    let [rows, cols] = shape2(matrix)?;
+    if runtime_options.rocm_device_id.is_some() && vector.len() == cols {
+        let input = CpuTensor {
+            shape: vec![1, cols],
+            data: vector.to_vec(),
+        };
+        let output =
+            linear_optional_bias_with_runtime_options(&input, matrix, None, runtime_options)?;
+        return Ok(output.data);
+    }
+    if runtime_options.rocm_device_id.is_some() && vector.len() != rows {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "vector length {} does not match projection matrix shape {:?}",
+            vector.len(),
+            matrix.shape
+        )));
+    }
+    matmul_vector(vector, matrix)
 }
 
 pub fn conv2d_nchw(
@@ -15588,6 +15922,22 @@ mod tests {
 
         assert_eq!(quick_gelu(0.0), 0.0);
         assert!((quick_gelu(1.0) - 0.845795).abs() < 1e-5);
+
+        #[cfg(feature = "rocm")]
+        {
+            if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+                eprintln!("skip: ROCm GPU unavailable for QuickGELU routing test: {error}");
+            } else {
+                let cpu = tensor_map(&input, quick_gelu);
+                let hip = quick_gelu_with_runtime_options(
+                    &input,
+                    DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
+                )
+                .unwrap();
+                assert_eq!(hip.shape, cpu.shape);
+                assert!(f32_slices_close(&hip.data, &cpu.data, 1e-6));
+            }
+        }
     }
 
     #[test]
@@ -20134,6 +20484,22 @@ mod tests {
         assert_eq!(encoded.shape, vec![2, hidden]);
         assert!(encoded.data.iter().all(|value| value.is_finite()));
         assert!(encoded.data.iter().any(|value| value.abs() > 0.001));
+
+        #[cfg(feature = "rocm")]
+        {
+            if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+                eprintln!("skip: ROCm GPU unavailable for CLIP encoder routing test: {error}");
+            } else {
+                let hip = encoder
+                    .encode_tokens_with_runtime_options(
+                        &[0, 1],
+                        DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
+                    )
+                    .unwrap();
+                assert_eq!(hip.shape, encoded.shape);
+                assert!(f32_slices_close(&hip.data, &encoded.data, 1e-5));
+            }
+        }
     }
 
     #[test]
@@ -20172,6 +20538,25 @@ mod tests {
         assert_eq!(pooled.len(), 2);
         assert!((pooled[0] - 2.0).abs() < 1e-4);
         assert!((pooled[1] + 3.0).abs() < 1e-4);
+
+        #[cfg(feature = "rocm")]
+        {
+            if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+                eprintln!("skip: ROCm GPU unavailable for CLIP pooled routing test: {error}");
+            } else {
+                let (hip_hidden, hip_pooled) = encoder
+                    .encode_tokens_with_pooled_and_runtime_options(
+                        &[0, 1, 2],
+                        1,
+                        DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
+                    )
+                    .unwrap();
+                let hip_pooled = hip_pooled.unwrap();
+                assert_eq!(hip_hidden.shape, hidden.shape);
+                assert!(f32_slices_close(&hip_hidden.data, &hidden.data, 1e-5));
+                assert!(f32_slices_close(&hip_pooled, &pooled, 1e-5));
+            }
+        }
     }
 
     #[test]
