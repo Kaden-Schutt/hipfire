@@ -58,8 +58,9 @@ enum Command {
     /// output dimensions before VAE encoding. `resize_mode` supports WebUI
     /// modes 0 (stretch), 1 (crop and resize), and 2 (resize and fill);
     /// mode 3 latent upscale is rejected unless no resize is needed. Masked
-    /// img2img also honors WebUI's `inpainting_mask_invert` option. Txt2img
-    /// high-res generation is implemented as a batched first-pass txt2img
+    /// img2img also honors WebUI's `inpainting_mask_invert`, `mask_blur`,
+    /// `mask_blur_x`, and `mask_blur_y` options. Txt2img high-res generation is
+    /// implemented as a batched first-pass txt2img
     /// generation followed by a second-pass img2img generation at the high-res
     /// target dimensions. SDAPI high-res requests accept `enable_hr`,
     /// `firstphase_width`,

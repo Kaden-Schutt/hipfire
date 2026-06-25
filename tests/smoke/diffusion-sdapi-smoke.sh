@@ -217,6 +217,7 @@ try:
         "prompt": f"{prompt} masked",
         "seed": seed + 2,
         "mask": make_half_mask_png_b64(width, height),
+        "mask_blur": 1,
     })
     _masked, masked_info = sdapi_request(base_url, "/sdapi/v1/img2img", masked_body, "masked-img2img")
     if masked_info.get("mode") != "img2img" or masked_info.get("masked") is not True:

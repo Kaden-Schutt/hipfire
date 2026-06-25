@@ -58,6 +58,9 @@ pub struct SdGenerationRequest {
     pub infotext: Option<String>,
     pub init_images: Option<Vec<String>>,
     pub mask: Option<String>,
+    pub mask_blur: Option<Value>,
+    pub mask_blur_x: Option<Value>,
+    pub mask_blur_y: Option<Value>,
     pub inpainting_mask_invert: Option<Value>,
     pub resize_mode: Option<u32>,
     pub include_init_images: Option<bool>,
@@ -526,11 +529,8 @@ async fn execute_hfq_diffusion_img2img(
     };
     let mask = match mask
         .map(|mask| {
-            sdapi_img2img_resize_image(
-                &body,
-                sdapi_apply_inpainting_mask_options(&body, mask),
-                target_dimensions,
-            )
+            sdapi_apply_inpainting_mask_options(&body, mask)
+                .and_then(|mask| sdapi_img2img_resize_image(&body, mask, target_dimensions))
         })
         .transpose()
     {
@@ -1039,19 +1039,168 @@ fn sdapi_img2img_resize_image(
 fn sdapi_apply_inpainting_mask_options(
     body: &SdGenerationRequest,
     mask: RgbImageBatch,
-) -> RgbImageBatch {
-    if !sdapi_inpainting_mask_invert(body) {
-        return mask;
+) -> Result<RgbImageBatch, DiffusionError> {
+    let mut mask = if sdapi_inpainting_mask_invert(body) {
+        RgbImageBatch {
+            data: mask
+                .data
+                .into_iter()
+                .map(|byte| 255u8.saturating_sub(byte))
+                .collect(),
+            ..mask
+        }
+    } else {
+        mask
+    };
+    let (blur_x, blur_y) = sdapi_mask_blur_axes(body)?;
+    if blur_x > 0.0 || blur_y > 0.0 {
+        mask = sdapi_blur_mask(mask, blur_x, blur_y)?;
     }
+    Ok(mask)
+}
 
-    RgbImageBatch {
-        data: mask
-            .data
+fn sdapi_mask_blur_axes(body: &SdGenerationRequest) -> Result<(f32, f32), DiffusionError> {
+    let shared = sdapi_optional_nonnegative_f32(body.mask_blur.as_ref(), "mask_blur")?;
+    let blur_x =
+        sdapi_optional_nonnegative_f32(body.mask_blur_x.as_ref(), "mask_blur_x")?.or(shared);
+    let blur_y =
+        sdapi_optional_nonnegative_f32(body.mask_blur_y.as_ref(), "mask_blur_y")?.or(shared);
+    Ok((blur_x.unwrap_or(0.0), blur_y.unwrap_or(0.0)))
+}
+
+fn sdapi_optional_nonnegative_f32(
+    value: Option<&Value>,
+    label: &str,
+) -> Result<Option<f32>, DiffusionError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let parsed = match value {
+        Value::Number(value) => value.as_f64(),
+        Value::String(value) => value.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        DiffusionError::InvalidRequest(format!("{label} must be a non-negative number"))
+    })?;
+    if !parsed.is_finite() || parsed < 0.0 || parsed > f32::MAX as f64 {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "{label} must be a finite non-negative number"
+        )));
+    }
+    Ok(Some(parsed as f32))
+}
+
+fn sdapi_blur_mask(
+    mask: RgbImageBatch,
+    sigma_x: f32,
+    sigma_y: f32,
+) -> Result<RgbImageBatch, DiffusionError> {
+    let expected = mask
+        .batch
+        .checked_mul(mask.width)
+        .and_then(|value| value.checked_mul(mask.height))
+        .and_then(|value| value.checked_mul(3))
+        .ok_or_else(|| DiffusionError::InvalidRequest("mask dimensions overflow".to_string()))?;
+    if mask.data.len() != expected {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "mask data length {} does not match dimensions {}x{}x{}x3",
+            mask.data.len(),
+            mask.batch,
+            mask.width,
+            mask.height
+        )));
+    }
+    let mut data = mask
+        .data
+        .iter()
+        .map(|value| *value as f32)
+        .collect::<Vec<_>>();
+    if sigma_x > 0.0 {
+        data = sdapi_blur_mask_axis(&data, &mask, &sdapi_gaussian_kernel(sigma_x), true);
+    }
+    if sigma_y > 0.0 {
+        data = sdapi_blur_mask_axis(&data, &mask, &sdapi_gaussian_kernel(sigma_y), false);
+    }
+    Ok(RgbImageBatch {
+        data: data
             .into_iter()
-            .map(|byte| 255u8.saturating_sub(byte))
+            .map(|value| value.round().clamp(0.0, 255.0) as u8)
             .collect(),
         ..mask
+    })
+}
+
+fn sdapi_gaussian_kernel(sigma: f32) -> Vec<f32> {
+    let radius = (2.5 * sigma + 0.5) as usize;
+    if radius == 0 {
+        return vec![1.0];
     }
+    let sigma_sq = 2.0 * sigma * sigma;
+    let mut kernel = (0..=(radius * 2))
+        .map(|idx| {
+            let offset = idx as isize - radius as isize;
+            (-(offset * offset) as f32 / sigma_sq).exp()
+        })
+        .collect::<Vec<_>>();
+    let sum: f32 = kernel.iter().sum();
+    if sum > 0.0 {
+        for value in &mut kernel {
+            *value /= sum;
+        }
+    }
+    kernel
+}
+
+fn sdapi_blur_mask_axis(
+    input: &[f32],
+    mask: &RgbImageBatch,
+    kernel: &[f32],
+    horizontal: bool,
+) -> Vec<f32> {
+    if kernel.len() <= 1 {
+        return input.to_vec();
+    }
+    let radius = kernel.len() / 2;
+    let mut output = vec![0.0; input.len()];
+    for batch in 0..mask.batch {
+        for y in 0..mask.height {
+            for x in 0..mask.width {
+                for channel in 0..3 {
+                    let mut acc = 0.0;
+                    for (kernel_idx, weight) in kernel.iter().enumerate() {
+                        let offset = kernel_idx as isize - radius as isize;
+                        let source_x = if horizontal {
+                            (x as isize + offset).clamp(0, mask.width.saturating_sub(1) as isize)
+                                as usize
+                        } else {
+                            x
+                        };
+                        let source_y = if horizontal {
+                            y
+                        } else {
+                            (y as isize + offset).clamp(0, mask.height.saturating_sub(1) as isize)
+                                as usize
+                        };
+                        acc += input[sdapi_rgb_index(mask, batch, source_x, source_y, channel)]
+                            * weight;
+                    }
+                    output[sdapi_rgb_index(mask, batch, x, y, channel)] = acc;
+                }
+            }
+        }
+    }
+    output
+}
+
+fn sdapi_rgb_index(
+    image: &RgbImageBatch,
+    batch: usize,
+    x: usize,
+    y: usize,
+    channel: usize,
+) -> usize {
+    ((batch * image.height + y) * image.width + x) * 3 + channel
 }
 
 fn sdapi_inpainting_mask_invert(body: &SdGenerationRequest) -> bool {
@@ -4112,14 +4261,14 @@ mod tests {
             inpainting_mask_invert: Some(json!(0)),
             ..empty_request()
         };
-        let unchanged = sdapi_apply_inpainting_mask_options(&disabled, mask.clone());
+        let unchanged = sdapi_apply_inpainting_mask_options(&disabled, mask.clone()).unwrap();
         assert_eq!(unchanged.data, mask.data);
 
         let enabled = SdGenerationRequest {
             inpainting_mask_invert: Some(json!(1)),
             ..empty_request()
         };
-        let inverted = sdapi_apply_inpainting_mask_options(&enabled, mask);
+        let inverted = sdapi_apply_inpainting_mask_options(&enabled, mask).unwrap();
 
         assert_eq!(inverted.width, 2);
         assert_eq!(inverted.height, 1);
@@ -4136,6 +4285,42 @@ mod tests {
             inpainting_mask_invert: Some(json!("0")),
             ..empty_request()
         }));
+    }
+
+    #[test]
+    fn img2img_mask_options_blur_mask_pixels() {
+        let mask = RgbImageBatch {
+            batch: 1,
+            width: 3,
+            height: 3,
+            data: vec![
+                0, 0, 0, 0, 0, 0, 0, 0, 0, //
+                0, 0, 0, 255, 255, 255, 0, 0, 0, //
+                0, 0, 0, 0, 0, 0, 0, 0, 0, //
+            ],
+        };
+
+        let horizontal = SdGenerationRequest {
+            mask_blur_x: Some(json!(1)),
+            mask_blur_y: Some(json!(0)),
+            ..empty_request()
+        };
+        let blurred = sdapi_apply_inpainting_mask_options(&horizontal, mask.clone()).unwrap();
+        assert_eq!(&blurred.data[0..9], &[0u8; 9]);
+        assert!(blurred.data[9] > 0);
+        assert!(blurred.data[12] < 255);
+        assert!(blurred.data[15] > 0);
+        assert_eq!(&blurred.data[18..27], &[0u8; 9]);
+
+        let shared = SdGenerationRequest {
+            mask_blur: Some(json!("1")),
+            ..empty_request()
+        };
+        let blurred = sdapi_apply_inpainting_mask_options(&shared, mask).unwrap();
+        assert!(blurred.data[3] > 0);
+        assert!(blurred.data[9] > 0);
+        assert!(blurred.data[12] < 255);
+        assert!(blurred.data[21] > 0);
     }
 
     #[test]
@@ -4218,6 +4403,9 @@ mod tests {
             infotext: None,
             init_images: None,
             mask: None,
+            mask_blur: None,
+            mask_blur_x: None,
+            mask_blur_y: None,
             inpainting_mask_invert: None,
             resize_mode: None,
             include_init_images: None,
