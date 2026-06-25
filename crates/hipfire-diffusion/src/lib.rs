@@ -4399,6 +4399,8 @@ impl DiffusionPipeline {
         let mut generation_runtime_kind = runtime.kind;
         let init_image =
             expand_rgb_batch_for_prompts(&request.init_image, request.batch.prompts.len())?;
+        let init_image =
+            resize_rgb_batch_nearest(&init_image, request.batch.width, request.batch.height)?;
         let (init_latents, init_encode_kind) =
             encode_to_latents_with_runtime_options(encoder, &init_image, runtime_options)?;
         generation_runtime_kind = merge_runtime_kind(generation_runtime_kind, init_encode_kind);
@@ -4425,9 +4427,11 @@ impl DiffusionPipeline {
         let start_step = plan.schedule.timesteps.len().saturating_sub(denoise_steps);
         let schedule = plan.schedule.slice_from_step(start_step)?;
         let expanded_mask = if let Some(mask) = request.mask.as_ref() {
-            Some(expand_rgb_batch_for_prompts(
-                mask,
-                request.batch.prompts.len(),
+            let mask = expand_rgb_batch_for_prompts(mask, request.batch.prompts.len())?;
+            Some(resize_rgb_batch_nearest(
+                &mask,
+                request.batch.width,
+                request.batch.height,
             )?)
         } else {
             None
@@ -13055,6 +13059,11 @@ fn validate_img2img_request(
             "init image batch must be non-empty".to_string(),
         ));
     }
+    if request.init_image.width == 0 || request.init_image.height == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "init image dimensions must be positive".to_string(),
+        ));
+    }
     if request.init_image.batch != 1 && request.init_image.batch != request.batch.prompts.len() {
         return Err(DiffusionError::InvalidRequest(format!(
             "init image batch {} must be 1 or match prompt batch {}",
@@ -13062,21 +13071,15 @@ fn validate_img2img_request(
             request.batch.prompts.len()
         )));
     }
-    if request.init_image.width as u32 != request.batch.width
-        || request.init_image.height as u32 != request.batch.height
-    {
-        return Err(DiffusionError::InvalidRequest(format!(
-            "init image dimensions {}x{} do not match request {}x{}",
-            request.init_image.width,
-            request.init_image.height,
-            request.batch.width,
-            request.batch.height
-        )));
-    }
     if let Some(mask) = &request.mask {
         if mask.batch == 0 {
             return Err(DiffusionError::InvalidRequest(
                 "mask batch must be non-empty".to_string(),
+            ));
+        }
+        if mask.width == 0 || mask.height == 0 {
+            return Err(DiffusionError::InvalidRequest(
+                "mask dimensions must be positive".to_string(),
             ));
         }
         if mask.batch != 1 && mask.batch != request.batch.prompts.len() {
@@ -13330,6 +13333,70 @@ fn expand_rgb_batch_for_prompts(
         batch: target_batch,
         width: image.width,
         height: image.height,
+        data,
+    })
+}
+
+fn resize_rgb_batch_nearest(
+    image: &RgbImageBatch,
+    target_width: u32,
+    target_height: u32,
+) -> DiffusionResult<RgbImageBatch> {
+    let target_width = usize::try_from(target_width).map_err(|_| {
+        DiffusionError::InvalidRequest("target image width does not fit usize".to_string())
+    })?;
+    let target_height = usize::try_from(target_height).map_err(|_| {
+        DiffusionError::InvalidRequest("target image height does not fit usize".to_string())
+    })?;
+    if target_width == 0 || target_height == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "target image dimensions must be positive".to_string(),
+        ));
+    }
+    let source_bytes = image
+        .batch
+        .checked_mul(image.width)
+        .and_then(|pixels| pixels.checked_mul(image.height))
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| DiffusionError::InvalidRequest("image dimensions overflow".to_string()))?;
+    if image.data.len() != source_bytes {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "RGB image batch has {} bytes, expected {source_bytes}",
+            image.data.len()
+        )));
+    }
+    if image.width == target_width && image.height == target_height {
+        return Ok(image.clone());
+    }
+    let target_bytes = image
+        .batch
+        .checked_mul(target_width)
+        .and_then(|pixels| pixels.checked_mul(target_height))
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| {
+            DiffusionError::InvalidRequest("target image dimensions overflow".to_string())
+        })?;
+    let mut data = vec![0u8; target_bytes];
+    let source_image_bytes = image.width * image.height * 3;
+    let target_image_bytes = target_width * target_height * 3;
+    for batch_idx in 0..image.batch {
+        let source_batch_offset = batch_idx * source_image_bytes;
+        let target_batch_offset = batch_idx * target_image_bytes;
+        for y in 0..target_height {
+            let source_y = (y * image.height / target_height).min(image.height.saturating_sub(1));
+            for x in 0..target_width {
+                let source_x = (x * image.width / target_width).min(image.width.saturating_sub(1));
+                let source_idx = source_batch_offset + ((source_y * image.width + source_x) * 3);
+                let target_idx = target_batch_offset + ((y * target_width + x) * 3);
+                data[target_idx..target_idx + 3]
+                    .copy_from_slice(&image.data[source_idx..source_idx + 3]);
+            }
+        }
+    }
+    Ok(RgbImageBatch {
+        batch: image.batch,
+        width: target_width,
+        height: target_height,
         data,
     })
 }
@@ -19474,6 +19541,40 @@ mod tests {
     }
 
     #[test]
+    fn rgb_batch_resize_nearest_preserves_batch_items() {
+        let image = RgbImageBatch {
+            batch: 2,
+            width: 1,
+            height: 2,
+            data: vec![
+                10, 20, 30, //
+                40, 50, 60, //
+                70, 80, 90, //
+                100, 110, 120,
+            ],
+        };
+
+        let resized = resize_rgb_batch_nearest(&image, 2, 4).unwrap();
+
+        assert_eq!(resized.batch, 2);
+        assert_eq!(resized.width, 2);
+        assert_eq!(resized.height, 4);
+        assert_eq!(
+            resized.data,
+            vec![
+                10, 20, 30, 10, 20, 30, //
+                10, 20, 30, 10, 20, 30, //
+                40, 50, 60, 40, 50, 60, //
+                40, 50, 60, 40, 50, 60, //
+                70, 80, 90, 70, 80, 90, //
+                70, 80, 90, 70, 80, 90, //
+                100, 110, 120, 100, 110, 120, //
+                100, 110, 120, 100, 110, 120,
+            ]
+        );
+    }
+
+    #[test]
     fn latent_mask_weights_downsample_rgb_luma_to_latent_shape() {
         let mask = RgbImageBatch {
             batch: 1,
@@ -20071,6 +20172,56 @@ mod tests {
         assert!(called.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(output.images.len(), 1);
         assert_eq!(output.info["masked"], true);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diffusion_pipeline_img2img_resizes_init_and_mask_to_request_dimensions() {
+        let (pipeline, called, dir) = tiny_inpaint_test_pipeline(
+            "hipfire-diffusion-inpaint-resize-routing-test",
+            Box::new(TestImageDecoder),
+        );
+        let request = DiffusionImg2ImgRequest {
+            batch: DiffusionBatchRequest {
+                prompts: vec![DiffusionPrompt {
+                    prompt: "a cat".into(),
+                    negative_prompt: String::new(),
+                    seed: 7,
+                    subseed: None,
+                }],
+                width: 2,
+                height: 2,
+                original_width: None,
+                original_height: None,
+                target_width: None,
+                target_height: None,
+                crop_x: 0,
+                crop_y: 0,
+                steps: 2,
+                cfg_scale: 7.0,
+                scheduler: "Euler".into(),
+                subseed_strength: 0.0,
+                send_images: true,
+                save_images: false,
+            },
+            init_image: tiny_rgb_image_batch(1, 1, 1),
+            mask: Some(tiny_mask_image_batch(1, 1, 1)),
+            denoising_strength: 1.0,
+        };
+
+        let output = pipeline.generate_img2img_batch(request).unwrap();
+
+        assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(output.images.len(), 1);
+        assert_eq!(output.info["mode"], "img2img");
+        assert_eq!(output.info["masked"], true);
+        assert_eq!(output.info["width"], 2);
+        assert_eq!(output.info["height"], 2);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&output.images[0])
+            .unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap().to_rgb8();
+        assert_eq!(decoded.dimensions(), (2, 2));
         let _ = fs::remove_dir_all(&dir);
     }
 

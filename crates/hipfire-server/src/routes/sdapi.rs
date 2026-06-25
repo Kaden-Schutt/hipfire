@@ -2137,6 +2137,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn img2img_route_resizes_init_and_mask_to_requested_dimensions() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-sdapi-diffusion-img2img-resize-route-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("tiny-route-diffusion-img2img-resize.hfq");
+        write_tiny_diffusion_hfq(&hfq_path);
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let body = SdGenerationRequest {
+            prompt: "a cat".to_string(),
+            model: Some(hfq_path.to_string_lossy().into_owned()),
+            steps: Some(1),
+            cfg_scale: Some(1.0),
+            width: Some(2),
+            height: Some(2),
+            send_images: Some(true),
+            save_images: Some(false),
+            init_images: Some(vec![tiny_png_base64_with_dimensions(1, 1)]),
+            mask: Some(tiny_mask_png_base64(1, 1)),
+            denoising_strength: Some(1.0),
+            ..empty_request()
+        };
+
+        let response = post_img2img(State(state), Json(body)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+
+        let images = body["images"].as_array().unwrap();
+        assert_eq!(images.len(), 1);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(images[0].as_str().unwrap())
+            .unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap().to_rgb8();
+        assert_eq!(decoded.dimensions(), (2, 2));
+        let info = serde_json::from_str::<Value>(body["info"].as_str().unwrap()).unwrap();
+        assert_eq!(info["mode"], "img2img");
+        assert_eq!(info["masked"], true);
+        assert_eq!(info["width"], 2);
+        assert_eq!(info["height"], 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn img2img_route_saves_png_when_save_images_true() {
         let dir = std::env::temp_dir().join(format!(
             "hipfire-sdapi-diffusion-img2img-save-route-test-{}",

@@ -254,6 +254,10 @@ falling back to CPU when ROCm is explicitly requested.
 `/sdapi/v1/progress` tracks active SDAPI sampling steps and, after a successful
 HFQ diffusion request completes, returns the final generated PNG in
 `current_image`. Live per-step latent preview decoding is not implemented yet.
+Img2img and inpaint requests accept init and mask images at the same source
+dimensions and resize them to the requested output width and height before VAE
+encoding, matching SDAPI clients that send source images separately from target
+dimensions.
 The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128,
 HFQ4G256, and HFQ6G256 tensor payloads even when the artifact `weight_format`
 records a future quantized format such as `oq4`; OQ/MQ/HFP and other packed
