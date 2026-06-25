@@ -96,9 +96,7 @@ fn main() {
             a
         }
         None => {
-            eprintln!(
-                "could not detect a GPU arch; pass --arch <gfx> (e.g. --arch gfx1103)"
-            );
+            eprintln!("could not detect a GPU arch; pass --arch <gfx> (e.g. --arch gfx1103)");
             std::process::exit(2);
         }
     });
@@ -194,11 +192,12 @@ fn main() {
         );
     }
 
-    write_hfqm_package_mem(&output, hfq.arch_id, &hfq.metadata_json, &out_tensors)
-        .unwrap_or_else(|e| {
+    write_hfqm_package_mem(&output, hfq.arch_id, &hfq.metadata_json, &out_tensors).unwrap_or_else(
+        |e| {
             eprintln!("write {}: {e}", output.display());
             std::process::exit(1);
-        });
+        },
+    );
 
     eprintln!(
         "oq4_repack: {} -> {}\n  repacked {repacked} OQ4 tensor(s) (qt {CANONICAL_OQ4_QT} -> {OQ4_ARCH_PACKED_QT}), copied {copied} other(s)\n  OQ4 weight bytes {canon_bytes} -> {packed_bytes} on disk (combined layout incl. interleaved decode region)",

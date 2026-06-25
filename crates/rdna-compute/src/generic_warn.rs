@@ -109,12 +109,30 @@ mod tests {
         let base = generic_fallback_count();
         // Same tuple three times → counted once.
         for _ in 0..3 {
-            warn_generic_once("gate_up", "W4A8", KernelMode::Prefill, "gfx1103", Quality::Reference);
+            warn_generic_once(
+                "gate_up",
+                "W4A8",
+                KernelMode::Prefill,
+                "gfx1103",
+                Quality::Reference,
+            );
         }
         // A different cell (mode) → a second entry.
-        warn_generic_once("gate_up", "W4A8", KernelMode::Decode, "gfx1103", Quality::Reference);
+        warn_generic_once(
+            "gate_up",
+            "W4A8",
+            KernelMode::Decode,
+            "gfx1103",
+            Quality::Reference,
+        );
         // A different precision → a third.
-        warn_generic_once("qkv", "W4A4", KernelMode::Decode, "gfx1103", Quality::CompletenessOnly);
+        warn_generic_once(
+            "qkv",
+            "W4A4",
+            KernelMode::Decode,
+            "gfx1103",
+            Quality::CompletenessOnly,
+        );
         assert_eq!(generic_fallback_count() - base, 3);
     }
 }

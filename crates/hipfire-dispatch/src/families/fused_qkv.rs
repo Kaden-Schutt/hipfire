@@ -413,9 +413,12 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                     n
                 ))?;
             } else {
-                for (w, y, mm) in
-                    [(wqkv, qkv, mqkv), (wz, z, mz), (w_beta, beta, mbeta), (w_alpha, alpha, malpha)]
-                {
+                for (w, y, mm) in [
+                    (wqkv, qkv, mqkv),
+                    (wz, z, mz),
+                    (w_beta, beta, mbeta),
+                    (w_alpha, alpha, malpha),
+                ] {
                     hip!(gpu.gemm_oq4_grouped_f16_wmma(w, x, y, mm, k, n, GROUP))?;
                 }
             }

@@ -80,10 +80,14 @@ fn main() {
     let yf_dev = gpu.alloc_tensor(&[b * m], DType::F32).unwrap();
 
     // GPU W4A8 path: expand → (W8A8 path).
-    gpu.nibble_expand_int4_to_int8(&wp_dev, &w8_dev, m, k).unwrap();
-    gpu.quantize_act_int8_per_token(&x_dev, &xq_dev, &xs_dev, b, k).unwrap();
-    gpu.gemm_iu8_i32_wmma(&w8_dev, &xq_dev, &yi_dev, m, k, b).unwrap();
-    gpu.dequant_i32_rowcol(&yi_dev, &xs_dev, &ws_dev, &yf_dev, b, m).unwrap();
+    gpu.nibble_expand_int4_to_int8(&wp_dev, &w8_dev, m, k)
+        .unwrap();
+    gpu.quantize_act_int8_per_token(&x_dev, &xq_dev, &xs_dev, b, k)
+        .unwrap();
+    gpu.gemm_iu8_i32_wmma(&w8_dev, &xq_dev, &yi_dev, m, k, b)
+        .unwrap();
+    gpu.dequant_i32_rowcol(&yi_dev, &xs_dev, &ws_dev, &yf_dev, b, m)
+        .unwrap();
     gpu.device_synchronize().unwrap();
 
     // ── Validate the NEW expand kernel EXACTLY: downloaded int8 == codes.

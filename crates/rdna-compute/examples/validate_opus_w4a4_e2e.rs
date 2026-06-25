@@ -61,7 +61,11 @@ fn signs(seed: u32, n: usize) -> Vec<f32> {
     (0..n)
         .map(|_| {
             st = st.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            if (st >> 16) & 1 == 1 { 1.0 } else { -1.0 }
+            if (st >> 16) & 1 == 1 {
+                1.0
+            } else {
+                -1.0
+            }
         })
         .collect()
 }
@@ -98,7 +102,14 @@ fn rotate(m: &mut [f32], rows: usize, k: usize, s1: &[f32], s2: &[f32]) {
         }
     }
 }
-fn smoothquant(x: &[f32], w: &[f32], b: usize, m: usize, k: usize, alpha: f32) -> (Vec<f32>, Vec<f32>) {
+fn smoothquant(
+    x: &[f32],
+    w: &[f32],
+    b: usize,
+    m: usize,
+    k: usize,
+    alpha: f32,
+) -> (Vec<f32>, Vec<f32>) {
     let mut xm = vec![1e-9f32; k];
     let mut wm = vec![1e-9f32; k];
     for r in 0..b {
@@ -111,7 +122,9 @@ fn smoothquant(x: &[f32], w: &[f32], b: usize, m: usize, k: usize, alpha: f32) -
             wm[c] = wm[c].max(w[r * k + c].abs());
         }
     }
-    let s: Vec<f32> = (0..k).map(|c| (xm[c].powf(alpha) / wm[c].powf(1.0 - alpha)).max(1e-6)).collect();
+    let s: Vec<f32> = (0..k)
+        .map(|c| (xm[c].powf(alpha) / wm[c].powf(1.0 - alpha)).max(1e-6))
+        .collect();
     let mut xo = x.to_vec();
     let mut wo = w.to_vec();
     for r in 0..b {
@@ -246,14 +259,22 @@ fn main() {
     let (wp, ws) = quant_w_i4(&wf, m, k, group);
     let wd = gpu.upload_raw(&wp, &[m, k / 2]).unwrap();
     let wsd = gpu
-        .upload_raw(&ws.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(), &[m, ng])
+        .upload_raw(
+            &ws.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
+            &[m, ng],
+        )
         .unwrap();
 
     // Runtime: upload rotated X (f32) → quantize on GPU → grouped GEMM.
     let xd = gpu
-        .upload_raw(&xf.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(), &[b, k])
+        .upload_raw(
+            &xf.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
+            &[b, k],
+        )
         .unwrap();
-    let xqd = gpu.upload_raw(&vec![0u8; b * (k / 2)], &[b, k / 2]).unwrap();
+    let xqd = gpu
+        .upload_raw(&vec![0u8; b * (k / 2)], &[b, k / 2])
+        .unwrap();
     let xsd = gpu.upload_raw(&vec![0u8; b * ng * 4], &[b, ng]).unwrap();
     gpu.quantize_act_oq4(&xd, &xqd, &xsd, b, k, group).unwrap();
 
@@ -265,14 +286,22 @@ fn main() {
 
     let gpu_db = sqnr(&ygpu, &yref);
 
-    println!("validate_opus_w4a4_e2e  M={m} K={k} B={b} group={group} on {}", gpu.arch);
+    println!(
+        "validate_opus_w4a4_e2e  M={m} K={k} B={b} group={group} on {}",
+        gpu.arch
+    );
     println!(
         "dedicated path: SmoothQuant α0.5 → FWHT256 → clip-search W int4 │ \
          GPU quantize_act_oq4(X) → gemm_oq4_grouped_wmma\n"
     );
     println!("  naive W4A4 (raw, grouped)  : {naive_db:6.2} dB   (no SQ, no rotation — the floor)");
-    println!("  Opus W4A4 (GPU dedicated)  : {gpu_db:6.2} dB   ({ng} K-groups, X quantized on-GPU)");
-    println!("  recipe gain                : {:+6.2} dB", gpu_db - naive_db);
+    println!(
+        "  Opus W4A4 (GPU dedicated)  : {gpu_db:6.2} dB   ({ng} K-groups, X quantized on-GPU)"
+    );
+    println!(
+        "  recipe gain                : {:+6.2} dB",
+        gpu_db - naive_db
+    );
     // The recipe must clear a clear margin over naive and land in the ~18-23 dB band.
     let pass = gpu_db > naive_db + 6.0 && gpu_db > 16.0;
     println!(

@@ -19,11 +19,19 @@ fn f16_to_f32(bits: u16) -> f32 {
     let v = if e == 0 {
         (m as f32) * 2f32.powi(-24)
     } else if e == 31 {
-        if m == 0 { f32::INFINITY } else { f32::NAN }
+        if m == 0 {
+            f32::INFINITY
+        } else {
+            f32::NAN
+        }
     } else {
         (1.0 + m as f32 / 1024.0) * 2f32.powi(e as i32 - 15)
     };
-    if s == 1 { -v } else { v }
+    if s == 1 {
+        -v
+    } else {
+        v
+    }
 }
 
 fn lcg_normal(seed: u32, n: usize) -> Vec<f32> {
@@ -72,10 +80,19 @@ fn main() {
 
     let record_bytes = (r * c).div_ceil(2) + r * 2 * 2 + c * 2;
     let td = gpu
-        .upload_raw(&tile.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(), &[r * c])
+        .upload_raw(
+            &tile
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+            &[r * c],
+        )
         .unwrap();
-    let rd = gpu.upload_raw(&vec![0u8; record_bytes], &[record_bytes]).unwrap();
-    gpu.kvarn_quantize_tile(&td, &rd, 1, r, c, record_bytes).unwrap();
+    let rd = gpu
+        .upload_raw(&vec![0u8; record_bytes], &[record_bytes])
+        .unwrap();
+    gpu.kvarn_quantize_tile(&td, &rd, 1, r, c, record_bytes)
+        .unwrap();
     gpu.device_synchronize().unwrap();
     let rec = gpu.download_raw(&rd, record_bytes).unwrap();
 
@@ -102,7 +119,8 @@ fn main() {
 
     // GPU dequant kernel: must match the host dequant of the same record.
     let outd = gpu.upload_raw(&vec![0u8; n * 2], &[n]).unwrap();
-    gpu.kvarn_dequant_tile(&rd, &outd, 1, r, c, record_bytes, 4).unwrap();
+    gpu.kvarn_dequant_tile(&rd, &outd, 1, r, c, record_bytes, 4)
+        .unwrap();
     gpu.device_synchronize().unwrap();
     let outb = gpu.download_raw(&outd, n * 2).unwrap();
     let mut gpu_deq = vec![0.0f32; n];
@@ -117,7 +135,10 @@ fn main() {
     let mut naive = vec![0.0f32; n];
     for ri in 0..r {
         let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-        for ci in 0..c { lo = lo.min(tile[ri * c + ci]); hi = hi.max(tile[ri * c + ci]); }
+        for ci in 0..c {
+            lo = lo.min(tile[ri * c + ci]);
+            hi = hi.max(tile[ri * c + ci]);
+        }
         let sc = ((hi - lo) / 15.0).max(1e-8);
         for ci in 0..c {
             let q = ((tile[ri * c + ci] - lo) / sc).round().clamp(0.0, 15.0);

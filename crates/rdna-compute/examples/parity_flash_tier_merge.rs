@@ -27,7 +27,14 @@ fn lcg(seed: u32, n: usize) -> Vec<f32> {
 
 /// Copy a slot sub-range [s0, s0+ns) out of a [nkv, ns_total, d] buffer into a
 /// fresh contiguous [nkv, ns, d] buffer.
-fn slice_slots(src: &[f32], nkv: usize, ns_total: usize, d: usize, s0: usize, ns: usize) -> Vec<f32> {
+fn slice_slots(
+    src: &[f32],
+    nkv: usize,
+    ns_total: usize,
+    d: usize,
+    s0: usize,
+    ns: usize,
+) -> Vec<f32> {
     let mut out = vec![0.0f32; nkv * ns * d];
     for kv in 0..nkv {
         for s in 0..ns {
@@ -40,10 +47,19 @@ fn slice_slots(src: &[f32], nkv: usize, ns_total: usize, d: usize, s0: usize, ns
 }
 
 fn main() {
-    let nt: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(88);
-    let na: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(nt / 3);
+    let nt: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(88);
+    let na: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(nt / 3);
     let nb = nt - na;
-    assert!(na > 0 && nb > 0, "need both groups non-empty (nt={nt} na={na})");
+    assert!(
+        na > 0 && nb > 0,
+        "need both groups non-empty (nt={nt} na={na})"
+    );
     let (nh, nkv, d) = (8usize, 2usize, 256usize); // qwen3.5-0.8b FA shape
     let scale = 1.0 / (d as f32).sqrt();
 
@@ -66,7 +82,8 @@ fn main() {
         let od = gpu.alloc_tensor(&[nh * d], DType::F32).unwrap();
         let md = gpu.alloc_tensor(&[nh], DType::F32).unwrap();
         let ld = gpu.alloc_tensor(&[nh], DType::F32).unwrap();
-        gpu.attention_cold_slots(&qd, &kd, &vd, &od, &md, &ld, nh, nkv, ns, scale, 0, 0, None).unwrap();
+        gpu.attention_cold_slots(&qd, &kd, &vd, &od, &md, &ld, nh, nkv, ns, scale, 0, 0, None)
+            .unwrap();
         (od, md, ld)
     };
 
@@ -77,7 +94,8 @@ fn main() {
     let omr = gpu.alloc_tensor(&[nh * d], DType::F32).unwrap();
     let mmr = gpu.alloc_tensor(&[nh], DType::F32).unwrap();
     let lmr = gpu.alloc_tensor(&[nh], DType::F32).unwrap();
-    gpu.flash_tier_merge(&oa, &ma, &la, &ob, &mb, &lb, &omr, &mmr, &lmr, nh).unwrap();
+    gpu.flash_tier_merge(&oa, &ma, &la, &ob, &mb, &lb, &omr, &mmr, &lmr, nh)
+        .unwrap();
 
     // Reference: full attention over all nt slots.
     let (of, _mf, _lf) = run_tier(&mut gpu, &k, &v, nt);

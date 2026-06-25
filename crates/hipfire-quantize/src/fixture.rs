@@ -84,6 +84,139 @@ struct TensorSpec {
     dt: Dt,
 }
 
+/// Tiny DFlash draft sidecar fixture. This is not a quality model; it is a
+/// runtime/training artifact shape that can flow through `dflash_convert`.
+struct DflashTiny {
+    hidden: usize,
+    inter: usize,
+    vocab: usize,
+    layers: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+    target_layer_ids: Vec<usize>,
+    num_target_layers: usize,
+}
+
+impl DflashTiny {
+    fn preset() -> Self {
+        Self {
+            hidden: 256,
+            inter: 512,
+            vocab: 4096,
+            layers: 1,
+            n_heads: 2,
+            n_kv_heads: 1,
+            head_dim: 128,
+            block_size: 16,
+            target_layer_ids: vec![0, 1],
+            num_target_layers: 4,
+        }
+    }
+
+    fn config_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "architectures": ["DFlashDraftModel"],
+            "model_type": "dflash",
+            "num_hidden_layers": self.layers,
+            "hidden_size": self.hidden,
+            "intermediate_size": self.inter,
+            "num_attention_heads": self.n_heads,
+            "num_key_value_heads": self.n_kv_heads,
+            "head_dim": self.head_dim,
+            "vocab_size": self.vocab,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000000.0,
+            "block_size": self.block_size,
+            "num_target_layers": self.num_target_layers,
+            "dflash_config": {
+                "mask_token_id": self.vocab - 1,
+                "target_layer_ids": self.target_layer_ids,
+            },
+        })
+    }
+
+    fn manifest(&self) -> Vec<TensorSpec> {
+        let h = self.hidden;
+        let q_dim = self.n_heads * self.head_dim;
+        let kv_dim = self.n_kv_heads * self.head_dim;
+        let num_extract = self.target_layer_ids.len();
+        let mut t = Vec::new();
+        t.push(TensorSpec::new(
+            "fc.weight",
+            vec![h, num_extract * h],
+            Init::Uniform(0.03),
+        ));
+        t.push(TensorSpec::f16(
+            "hidden_norm.weight",
+            vec![h],
+            Init::NormOnes,
+        ));
+        t.push(TensorSpec::f16("norm.weight", vec![h], Init::NormOnes));
+        for i in 0..self.layers {
+            let p = format!("layers.{i}");
+            let sa = format!("{p}.self_attn");
+            t.push(TensorSpec::f16(
+                format!("{p}.input_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.q_proj.weight"),
+                vec![q_dim, h],
+                Init::Uniform(0.03),
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.k_proj.weight"),
+                vec![kv_dim, h],
+                Init::Uniform(0.03),
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.v_proj.weight"),
+                vec![kv_dim, h],
+                Init::Uniform(0.03),
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.o_proj.weight"),
+                vec![h, q_dim],
+                Init::Uniform(0.03),
+            ));
+            t.push(TensorSpec::f16(
+                format!("{sa}.q_norm.weight"),
+                vec![self.head_dim],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::f16(
+                format!("{sa}.k_norm.weight"),
+                vec![self.head_dim],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::f16(
+                format!("{p}.post_attention_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.gate_proj.weight"),
+                vec![self.inter, h],
+                Init::Uniform(0.03),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.up_proj.weight"),
+                vec![self.inter, h],
+                Init::Uniform(0.03),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.down_proj.weight"),
+                vec![h, self.inter],
+                Init::Uniform(0.03),
+            ));
+        }
+        t
+    }
+}
+
 impl TensorSpec {
     /// BF16 tensor (default — weight matrices, and every qwen3.5 tensor).
     fn new(name: impl Into<String>, shape: Vec<usize>, init: Init) -> Self {
@@ -464,22 +597,78 @@ impl Qwen2Tiny {
         let kv_dim = self.n_kv_heads * self.head_dim;
         let mut t = Vec::new();
         // tie_word_embeddings ⇒ no separate lm_head.
-        t.push(TensorSpec::new("model.embed_tokens.weight", vec![self.vocab, h], Init::Uniform(0.05)));
-        t.push(TensorSpec::f16("model.norm.weight", vec![h], Init::NormOnes));
+        t.push(TensorSpec::new(
+            "model.embed_tokens.weight",
+            vec![self.vocab, h],
+            Init::Uniform(0.05),
+        ));
+        t.push(TensorSpec::f16(
+            "model.norm.weight",
+            vec![h],
+            Init::NormOnes,
+        ));
         for i in 0..self.layers {
             let p = format!("model.layers.{i}");
-            t.push(TensorSpec::f16(format!("{p}.input_layernorm.weight"), vec![h], Init::NormOnes));
-            t.push(TensorSpec::new(format!("{p}.self_attn.q_proj.weight"), vec![q_dim, h], Init::Uniform(0.05)));
-            t.push(TensorSpec::f16(format!("{p}.self_attn.q_proj.bias"), vec![q_dim], Init::Uniform(0.02)));
-            t.push(TensorSpec::new(format!("{p}.self_attn.k_proj.weight"), vec![kv_dim, h], Init::Uniform(0.05)));
-            t.push(TensorSpec::f16(format!("{p}.self_attn.k_proj.bias"), vec![kv_dim], Init::Uniform(0.02)));
-            t.push(TensorSpec::new(format!("{p}.self_attn.v_proj.weight"), vec![kv_dim, h], Init::Uniform(0.05)));
-            t.push(TensorSpec::f16(format!("{p}.self_attn.v_proj.bias"), vec![kv_dim], Init::Uniform(0.02)));
-            t.push(TensorSpec::new(format!("{p}.self_attn.o_proj.weight"), vec![h, q_dim], Init::Uniform(0.05)));
-            t.push(TensorSpec::f16(format!("{p}.post_attention_layernorm.weight"), vec![h], Init::NormOnes));
-            t.push(TensorSpec::new(format!("{p}.mlp.gate_proj.weight"), vec![self.inter, h], Init::Uniform(0.05)));
-            t.push(TensorSpec::new(format!("{p}.mlp.up_proj.weight"), vec![self.inter, h], Init::Uniform(0.05)));
-            t.push(TensorSpec::new(format!("{p}.mlp.down_proj.weight"), vec![h, self.inter], Init::Uniform(0.05)));
+            t.push(TensorSpec::f16(
+                format!("{p}.input_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.self_attn.q_proj.weight"),
+                vec![q_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::f16(
+                format!("{p}.self_attn.q_proj.bias"),
+                vec![q_dim],
+                Init::Uniform(0.02),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.self_attn.k_proj.weight"),
+                vec![kv_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::f16(
+                format!("{p}.self_attn.k_proj.bias"),
+                vec![kv_dim],
+                Init::Uniform(0.02),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.self_attn.v_proj.weight"),
+                vec![kv_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::f16(
+                format!("{p}.self_attn.v_proj.bias"),
+                vec![kv_dim],
+                Init::Uniform(0.02),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.self_attn.o_proj.weight"),
+                vec![h, q_dim],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::f16(
+                format!("{p}.post_attention_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.gate_proj.weight"),
+                vec![self.inter, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.up_proj.weight"),
+                vec![self.inter, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.down_proj.weight"),
+                vec![h, self.inter],
+                Init::Uniform(0.05),
+            ));
         }
         t
     }
@@ -547,24 +736,84 @@ impl Gemma3Tiny {
         let kv_dim = self.n_kv_heads * self.head_dim;
         let mut t = Vec::new();
         // tie_word_embeddings ⇒ no separate lm_head.
-        t.push(TensorSpec::new("model.embed_tokens.weight", vec![self.vocab, h], Init::Uniform(0.05)));
-        t.push(TensorSpec::f16("model.norm.weight", vec![h], Init::NormOnes));
+        t.push(TensorSpec::new(
+            "model.embed_tokens.weight",
+            vec![self.vocab, h],
+            Init::Uniform(0.05),
+        ));
+        t.push(TensorSpec::f16(
+            "model.norm.weight",
+            vec![h],
+            Init::NormOnes,
+        ));
         for i in 0..self.layers {
             let p = format!("model.layers.{i}");
             let sa = format!("{p}.self_attn");
-            t.push(TensorSpec::f16(format!("{p}.input_layernorm.weight"), vec![h], Init::NormOnes));
-            t.push(TensorSpec::f16(format!("{sa}.q_norm.weight"), vec![self.head_dim], Init::NormOnes));
-            t.push(TensorSpec::f16(format!("{sa}.k_norm.weight"), vec![self.head_dim], Init::NormOnes));
-            t.push(TensorSpec::new(format!("{sa}.q_proj.weight"), vec![q_dim, h], Init::Uniform(0.05)));
-            t.push(TensorSpec::new(format!("{sa}.k_proj.weight"), vec![kv_dim, h], Init::Uniform(0.05)));
-            t.push(TensorSpec::new(format!("{sa}.v_proj.weight"), vec![kv_dim, h], Init::Uniform(0.05)));
-            t.push(TensorSpec::new(format!("{sa}.o_proj.weight"), vec![h, q_dim], Init::Uniform(0.05)));
-            t.push(TensorSpec::f16(format!("{p}.post_attention_layernorm.weight"), vec![h], Init::NormOnes));
-            t.push(TensorSpec::f16(format!("{p}.pre_feedforward_layernorm.weight"), vec![h], Init::NormOnes));
-            t.push(TensorSpec::f16(format!("{p}.post_feedforward_layernorm.weight"), vec![h], Init::NormOnes));
-            t.push(TensorSpec::new(format!("{p}.mlp.gate_proj.weight"), vec![self.inter, h], Init::Uniform(0.05)));
-            t.push(TensorSpec::new(format!("{p}.mlp.up_proj.weight"), vec![self.inter, h], Init::Uniform(0.05)));
-            t.push(TensorSpec::new(format!("{p}.mlp.down_proj.weight"), vec![h, self.inter], Init::Uniform(0.05)));
+            t.push(TensorSpec::f16(
+                format!("{p}.input_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::f16(
+                format!("{sa}.q_norm.weight"),
+                vec![self.head_dim],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::f16(
+                format!("{sa}.k_norm.weight"),
+                vec![self.head_dim],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.q_proj.weight"),
+                vec![q_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.k_proj.weight"),
+                vec![kv_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.v_proj.weight"),
+                vec![kv_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.o_proj.weight"),
+                vec![h, q_dim],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::f16(
+                format!("{p}.post_attention_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::f16(
+                format!("{p}.pre_feedforward_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::f16(
+                format!("{p}.post_feedforward_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.gate_proj.weight"),
+                vec![self.inter, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.up_proj.weight"),
+                vec![self.inter, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.down_proj.weight"),
+                vec![h, self.inter],
+                Init::Uniform(0.05),
+            ));
         }
         t
     }
@@ -637,30 +886,94 @@ impl MiniMaxTiny {
         let kv_dim = self.n_kv_heads * self.head_dim;
         let mut t = Vec::new();
         // Untied: embed + separate lm_head.
-        t.push(TensorSpec::new("model.embed_tokens.weight", vec![self.vocab, h], Init::Uniform(0.05)));
-        t.push(TensorSpec::f16("model.norm.weight", vec![h], Init::NormOnes));
-        t.push(TensorSpec::new("lm_head.weight", vec![self.vocab, h], Init::Uniform(0.05)));
+        t.push(TensorSpec::new(
+            "model.embed_tokens.weight",
+            vec![self.vocab, h],
+            Init::Uniform(0.05),
+        ));
+        t.push(TensorSpec::f16(
+            "model.norm.weight",
+            vec![h],
+            Init::NormOnes,
+        ));
+        t.push(TensorSpec::new(
+            "lm_head.weight",
+            vec![self.vocab, h],
+            Init::Uniform(0.05),
+        ));
         for i in 0..self.layers {
             let p = format!("model.layers.{i}");
             let sa = format!("{p}.self_attn");
             let moe = format!("{p}.block_sparse_moe");
-            t.push(TensorSpec::f16(format!("{p}.input_layernorm.weight"), vec![h], Init::NormOnes));
-            t.push(TensorSpec::f16(format!("{p}.post_attention_layernorm.weight"), vec![h], Init::NormOnes));
+            t.push(TensorSpec::f16(
+                format!("{p}.input_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::f16(
+                format!("{p}.post_attention_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
             // Per-layer QK-norm on the flat projection (q_dim / kv_dim wide).
-            t.push(TensorSpec::f16(format!("{sa}.q_norm.weight"), vec![q_dim], Init::NormOnes));
-            t.push(TensorSpec::f16(format!("{sa}.k_norm.weight"), vec![kv_dim], Init::NormOnes));
-            t.push(TensorSpec::new(format!("{sa}.q_proj.weight"), vec![q_dim, h], Init::Uniform(0.05)));
-            t.push(TensorSpec::new(format!("{sa}.k_proj.weight"), vec![kv_dim, h], Init::Uniform(0.05)));
-            t.push(TensorSpec::new(format!("{sa}.v_proj.weight"), vec![kv_dim, h], Init::Uniform(0.05)));
-            t.push(TensorSpec::new(format!("{sa}.o_proj.weight"), vec![h, q_dim], Init::Uniform(0.05)));
+            t.push(TensorSpec::f16(
+                format!("{sa}.q_norm.weight"),
+                vec![q_dim],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::f16(
+                format!("{sa}.k_norm.weight"),
+                vec![kv_dim],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.q_proj.weight"),
+                vec![q_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.k_proj.weight"),
+                vec![kv_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.v_proj.weight"),
+                vec![kv_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.o_proj.weight"),
+                vec![h, q_dim],
+                Init::Uniform(0.05),
+            ));
             // Router + per-expert bias (loaded unconditionally by the minimax loader).
-            t.push(TensorSpec::new(format!("{moe}.gate.weight"), vec![self.experts, h], Init::Uniform(0.05)));
-            t.push(TensorSpec::f16(format!("{moe}.e_score_correction_bias"), vec![self.experts], Init::Uniform(0.02)));
+            t.push(TensorSpec::new(
+                format!("{moe}.gate.weight"),
+                vec![self.experts, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::f16(
+                format!("{moe}.e_score_correction_bias"),
+                vec![self.experts],
+                Init::Uniform(0.02),
+            ));
             for e in 0..self.experts {
                 let ep = format!("{moe}.experts.{e}");
-                t.push(TensorSpec::new(format!("{ep}.w1.weight"), vec![self.inter, h], Init::Uniform(0.05)));
-                t.push(TensorSpec::new(format!("{ep}.w3.weight"), vec![self.inter, h], Init::Uniform(0.05)));
-                t.push(TensorSpec::new(format!("{ep}.w2.weight"), vec![h, self.inter], Init::Uniform(0.05)));
+                t.push(TensorSpec::new(
+                    format!("{ep}.w1.weight"),
+                    vec![self.inter, h],
+                    Init::Uniform(0.05),
+                ));
+                t.push(TensorSpec::new(
+                    format!("{ep}.w3.weight"),
+                    vec![self.inter, h],
+                    Init::Uniform(0.05),
+                ));
+                t.push(TensorSpec::new(
+                    format!("{ep}.w2.weight"),
+                    vec![h, self.inter],
+                    Init::Uniform(0.05),
+                ));
             }
         }
         t
@@ -722,22 +1035,70 @@ impl LlamaTiny {
         let kv_dim = self.n_kv_heads * self.head_dim;
         let mut t = Vec::new();
         // Untied: embed + separate lm_head.
-        t.push(TensorSpec::new("model.embed_tokens.weight", vec![self.vocab, h], Init::Uniform(0.05)));
-        t.push(TensorSpec::f16("model.norm.weight", vec![h], Init::NormOnes));
-        t.push(TensorSpec::new("lm_head.weight", vec![self.vocab, h], Init::Uniform(0.05)));
+        t.push(TensorSpec::new(
+            "model.embed_tokens.weight",
+            vec![self.vocab, h],
+            Init::Uniform(0.05),
+        ));
+        t.push(TensorSpec::f16(
+            "model.norm.weight",
+            vec![h],
+            Init::NormOnes,
+        ));
+        t.push(TensorSpec::new(
+            "lm_head.weight",
+            vec![self.vocab, h],
+            Init::Uniform(0.05),
+        ));
         for i in 0..self.layers {
             let p = format!("model.layers.{i}");
             let sa = format!("{p}.self_attn");
-            t.push(TensorSpec::f16(format!("{p}.input_layernorm.weight"), vec![h], Init::NormOnes));
+            t.push(TensorSpec::f16(
+                format!("{p}.input_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
             // No bias, no q_norm/k_norm — the LLaMA loader rejects bias tensors.
-            t.push(TensorSpec::new(format!("{sa}.q_proj.weight"), vec![q_dim, h], Init::Uniform(0.05)));
-            t.push(TensorSpec::new(format!("{sa}.k_proj.weight"), vec![kv_dim, h], Init::Uniform(0.05)));
-            t.push(TensorSpec::new(format!("{sa}.v_proj.weight"), vec![kv_dim, h], Init::Uniform(0.05)));
-            t.push(TensorSpec::new(format!("{sa}.o_proj.weight"), vec![h, q_dim], Init::Uniform(0.05)));
-            t.push(TensorSpec::f16(format!("{p}.post_attention_layernorm.weight"), vec![h], Init::NormOnes));
-            t.push(TensorSpec::new(format!("{p}.mlp.gate_proj.weight"), vec![self.inter, h], Init::Uniform(0.05)));
-            t.push(TensorSpec::new(format!("{p}.mlp.up_proj.weight"), vec![self.inter, h], Init::Uniform(0.05)));
-            t.push(TensorSpec::new(format!("{p}.mlp.down_proj.weight"), vec![h, self.inter], Init::Uniform(0.05)));
+            t.push(TensorSpec::new(
+                format!("{sa}.q_proj.weight"),
+                vec![q_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.k_proj.weight"),
+                vec![kv_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.v_proj.weight"),
+                vec![kv_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.o_proj.weight"),
+                vec![h, q_dim],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::f16(
+                format!("{p}.post_attention_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.gate_proj.weight"),
+                vec![self.inter, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.up_proj.weight"),
+                vec![self.inter, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.down_proj.weight"),
+                vec![h, self.inter],
+                Init::Uniform(0.05),
+            ));
         }
         t
     }
@@ -829,12 +1190,17 @@ pub fn emit_fixture(arch: &str, out_dir: &Path, seed: u64) -> Result<(), String>
             let m = LlamaTiny::preset();
             (m.config_json(), m.manifest())
         }
+        "dflash" | "dflash_draft" | "tiny_dflash" => {
+            let m = DflashTiny::preset();
+            (m.config_json(), m.manifest())
+        }
         other => {
             return Err(format!(
                 "--emit-fixture: unsupported arch '{other}'. Supported: qwen3_5 \
                  (arch 5 dense), qwen3_5_moe (arch 6 MoE), qwen2 (arch 7, quantize \
                  with --arch-id 7), gemma3 (arch 12), minimax (arch 10), llama \
-                 (arch 0). Add a tiny preset per arch as support lands."
+                 (arch 0), dflash (draft sidecar). Add a tiny preset per arch as \
+                 support lands."
             ));
         }
     };
@@ -917,7 +1283,10 @@ mod tests {
 
     /// Total param count for a manifest, for the <10M tiny budget assert.
     fn n_params(specs: &[TensorSpec]) -> usize {
-        specs.iter().map(|s| s.shape.iter().product::<usize>()).sum()
+        specs
+            .iter()
+            .map(|s| s.shape.iter().product::<usize>())
+            .sum()
     }
 
     #[test]
@@ -930,7 +1299,10 @@ mod tests {
         assert!(has("self_attn.v_proj.bias"));
         assert!(has("mlp.gate_proj.weight"), "dense SwiGLU");
         assert!(!has("lm_head.weight"), "tied ⇒ no separate lm_head");
-        assert!(n_params(&specs) < 10_000_000, "qwen2 fixture must stay <10M params");
+        assert!(
+            n_params(&specs) < 10_000_000,
+            "qwen2 fixture must stay <10M params"
+        );
     }
 
     #[test]
@@ -939,10 +1311,20 @@ mod tests {
         let specs = m.manifest();
         let has = |suf: &str| specs.iter().any(|s| s.name.ends_with(suf));
         assert!(has("self_attn.q_norm.weight"), "per-head QK-norm");
-        assert!(has("pre_feedforward_layernorm.weight"), "gemma 4-norm layout");
+        assert!(
+            has("pre_feedforward_layernorm.weight"),
+            "gemma 4-norm layout"
+        );
         assert!(has("post_feedforward_layernorm.weight"));
-        assert_eq!(m.head_dim % 32, 0, "gemma3 head_dim must be %32==0 for q8 KV");
-        assert!(n_params(&specs) < 10_000_000, "gemma3 fixture must stay <10M params");
+        assert_eq!(
+            m.head_dim % 32,
+            0,
+            "gemma3 head_dim must be %32==0 for q8 KV"
+        );
+        assert!(
+            n_params(&specs) < 10_000_000,
+            "gemma3 fixture must stay <10M params"
+        );
     }
 
     #[test]
@@ -952,7 +1334,10 @@ mod tests {
         let has = |suf: &str| specs.iter().any(|s| s.name.ends_with(suf));
         assert!(has("lm_head.weight"), "minimax is untied");
         assert!(has("block_sparse_moe.gate.weight"), "router");
-        assert!(has("block_sparse_moe.e_score_correction_bias"), "routing bias");
+        assert!(
+            has("block_sparse_moe.e_score_correction_bias"),
+            "routing bias"
+        );
         assert!(has("block_sparse_moe.experts.0.w1.weight"), "split experts");
         assert!(has("block_sparse_moe.experts.0.w2.weight"));
         assert!(has("block_sparse_moe.experts.0.w3.weight"));
@@ -960,9 +1345,15 @@ mod tests {
         assert_eq!(m.hidden % 256, 0);
         assert_eq!(m.inter % 256, 0);
         // All experts identical shape (packed-layout uniform-stride requirement).
-        let w1: Vec<_> = specs.iter().filter(|s| s.name.ends_with(".w1.weight")).collect();
+        let w1: Vec<_> = specs
+            .iter()
+            .filter(|s| s.name.ends_with(".w1.weight"))
+            .collect();
         assert!(w1.windows(2).all(|w| w[0].shape == w[1].shape));
-        assert!(n_params(&specs) < 10_000_000, "minimax fixture must stay <10M params");
+        assert!(
+            n_params(&specs) < 10_000_000,
+            "minimax fixture must stay <10M params"
+        );
     }
 
     #[test]
@@ -973,9 +1364,17 @@ mod tests {
         assert!(has("lm_head.weight"), "untied lm_head");
         assert!(has("mlp.gate_proj.weight"), "dense SwiGLU");
         // The LLaMA loader rejects bias + qk-norm tensors — must emit none.
-        assert!(!specs.iter().any(|s| s.name.ends_with(".bias")), "no biases");
-        assert!(!specs.iter().any(|s| s.name.contains("q_norm") || s.name.contains("k_norm")));
-        assert!(n_params(&specs) < 10_000_000, "llama fixture must stay <10M params");
+        assert!(
+            !specs.iter().any(|s| s.name.ends_with(".bias")),
+            "no biases"
+        );
+        assert!(!specs
+            .iter()
+            .any(|s| s.name.contains("q_norm") || s.name.contains("k_norm")));
+        assert!(
+            n_params(&specs) < 10_000_000,
+            "llama fixture must stay <10M params"
+        );
     }
 
     #[test]
@@ -987,7 +1386,10 @@ mod tests {
             let a = std::fs::read(dir.join("model.safetensors")).unwrap();
             emit_fixture(arch, &dir, 7).unwrap();
             let b = std::fs::read(dir.join("model.safetensors")).unwrap();
-            assert_eq!(a, b, "{arch}: same seed must produce byte-identical safetensors");
+            assert_eq!(
+                a, b,
+                "{arch}: same seed must produce byte-identical safetensors"
+            );
         }
         let _ = std::fs::remove_dir_all(&base);
     }

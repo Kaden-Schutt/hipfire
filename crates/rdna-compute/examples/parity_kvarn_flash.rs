@@ -18,11 +18,19 @@ fn f16_to_f32(bits: u16) -> f32 {
     let v = if e == 0 {
         (m as f32) * 2f32.powi(-24)
     } else if e == 31 {
-        if m == 0 { f32::INFINITY } else { f32::NAN }
+        if m == 0 {
+            f32::INFINITY
+        } else {
+            f32::NAN
+        }
     } else {
         (1.0 + m as f32 / 1024.0) * 2f32.powi(e as i32 - 15)
     };
-    if s == 1 { -v } else { v }
+    if s == 1 {
+        -v
+    } else {
+        v
+    }
 }
 
 fn f32_to_f16(x: f32) -> u16 {
@@ -163,21 +171,40 @@ fn main() {
     }
 
     // GPU flash.
-    let qd = gpu.upload_raw(&q.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(), &[n_heads * head_dim]).unwrap();
+    let qd = gpu
+        .upload_raw(
+            &q.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
+            &[n_heads * head_dim],
+        )
+        .unwrap();
     // K is a raw f16 byte buffer; the flash kernel casts buf to _Float16*, so the
     // tensor's nominal dtype is irrelevant (the launcher passes buf.as_ptr()).
-    let kd = gpu.upload_raw(&k_f16.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(), &[max_seq * kv_dim]).unwrap();
+    let kd = gpu
+        .upload_raw(
+            &k_f16
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+            &[max_seq * kv_dim],
+        )
+        .unwrap();
     let vd = gpu.upload_raw(&v_cache, &[max_seq * v_row_stride]).unwrap();
-    let outd = gpu.upload_raw(&vec![0u8; n_heads * head_dim * 4], &[n_heads * head_dim]).unwrap();
-    let posd = gpu.upload_raw(&((seq_len - 1) as i32).to_le_bytes(), &[1]).unwrap();
+    let outd = gpu
+        .upload_raw(&vec![0u8; n_heads * head_dim * 4], &[n_heads * head_dim])
+        .unwrap();
+    let posd = gpu
+        .upload_raw(&((seq_len - 1) as i32).to_le_bytes(), &[1])
+        .unwrap();
     let max_tiles = max_seq.div_ceil(128);
-    let partials = gpu.zeros(&[n_heads * max_tiles * (2 + head_dim)], DType::F32).unwrap();
+    let partials = gpu
+        .zeros(&[n_heads * max_tiles * (2 + head_dim)], DType::F32)
+        .unwrap();
 
     gpu.attention_flash_f16k_q8v_batched_masked(
-        &qd, &kd, &vd, &outd, &posd,
-        n_heads, n_kv_heads, head_dim, max_seq, seq_len, 1,
-        &partials, None, 0, 0,
-    ).unwrap();
+        &qd, &kd, &vd, &outd, &posd, n_heads, n_kv_heads, head_dim, max_seq, seq_len, 1, &partials,
+        None, 0, 0,
+    )
+    .unwrap();
     gpu.device_synchronize().unwrap();
     let got = gpu.download_f32(&outd).unwrap();
 

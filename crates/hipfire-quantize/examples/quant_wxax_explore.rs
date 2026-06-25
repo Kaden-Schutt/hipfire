@@ -39,7 +39,14 @@ fn lcg_gauss(seed: u32, n: usize) -> Vec<f32> {
 
 /// Per-channel (column) outliers along K — the dominant activation-outlier mode
 /// in LLMs (a few feature channels with very large magnitude).
-fn with_channel_outliers(mut w: Vec<f32>, rows: usize, k: usize, n_hot: usize, gain: f32, seed: u32) -> Vec<f32> {
+fn with_channel_outliers(
+    mut w: Vec<f32>,
+    rows: usize,
+    k: usize,
+    n_hot: usize,
+    gain: f32,
+    seed: u32,
+) -> Vec<f32> {
     let mut s = seed ^ 0x9e37_79b9;
     let mut hot = vec![false; k];
     for _ in 0..n_hot {
@@ -61,7 +68,11 @@ fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
     (0..n)
         .map(|_| {
             st = st.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            if (st >> 16) & 1 == 1 { 1.0 } else { -1.0 }
+            if (st >> 16) & 1 == 1 {
+                1.0
+            } else {
+                -1.0
+            }
         })
         .collect()
 }
@@ -140,7 +151,9 @@ fn matmul_out_sqnr(x: &[f32], w: &[f32], yref: &[f32], m: usize, k: usize, b: us
             noise += d * d;
         }
     }
-    if noise <= 0.0 { return f64::INFINITY; }
+    if noise <= 0.0 {
+        return f64::INFINITY;
+    }
     10.0 * (sig / noise).log10()
 }
 

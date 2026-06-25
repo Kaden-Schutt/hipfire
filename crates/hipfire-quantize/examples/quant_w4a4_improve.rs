@@ -58,7 +58,11 @@ fn gen_signs(seed: u32, n: usize) -> Vec<f32> {
     (0..n)
         .map(|_| {
             st = st.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            if (st >> 16) & 1 == 1 { 1.0 } else { -1.0 }
+            if (st >> 16) & 1 == 1 {
+                1.0
+            } else {
+                -1.0
+            }
         })
         .collect()
 }
@@ -163,7 +167,14 @@ fn quant_sym_clipsearch(src: &[f32], rows: usize, k: usize, group: usize, bits: 
 
 /// SmoothQuant per-channel migration: s_j = max_i|X[:,j]|^a / max_i|W[:,j]|^(1-a).
 /// Returns (X/s, W*s); the product X'·W'ᵀ == X·Wᵀ exactly.
-fn smoothquant(x: &[f32], w: &[f32], b: usize, m: usize, k: usize, alpha: f32) -> (Vec<f32>, Vec<f32>) {
+fn smoothquant(
+    x: &[f32],
+    w: &[f32],
+    b: usize,
+    m: usize,
+    k: usize,
+    alpha: f32,
+) -> (Vec<f32>, Vec<f32>) {
     let mut xmax = vec![1e-9f32; k];
     let mut wmax = vec![1e-9f32; k];
     for r in 0..b {
@@ -217,7 +228,10 @@ fn main() {
     let m: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(128);
     let k: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(2048);
     let b: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(64);
-    assert!(k.is_power_of_two(), "K must be power-of-two for full-K Hadamard");
+    assert!(
+        k.is_power_of_two(),
+        "K must be power-of-two for full-K Hadamard"
+    );
 
     let s1 = gen_signs(42, k);
     let s2 = gen_signs(1042, k);
@@ -240,7 +254,10 @@ fn main() {
 
     println!("quant_w4a4_improve  M={m} K={k} B={b}");
     println!("acts: 16 hot ch ×20 ; weights: 8 hot ch ×6\n");
-    println!("{:<46} {:>9} {:>8}", "W4A4 scheme (all fused iu4 unless noted)", "SQNR dB", "Δ base");
+    println!(
+        "{:<46} {:>9} {:>8}",
+        "W4A4 scheme (all fused iu4 unless noted)", "SQNR dB", "Δ base"
+    );
     println!("{}", "-".repeat(66));
 
     let mut base = 0.0f64;
@@ -261,7 +278,13 @@ fn main() {
         rotate_rows(&mut xr, b, k, 256, &s1, &s2);
         let wq = quant_sym(&wr, m, k, 128, 4, 1.0);
         let xq = quant_sym(&xr, b, k, 128, 4, 1.0);
-        emit("0 baseline: FWHT256 + absmax, A=g128", &xq, &wq, true, &mut base);
+        emit(
+            "0 baseline: FWHT256 + absmax, A=g128",
+            &xq,
+            &wq,
+            true,
+            &mut base,
+        );
     }
     // 1) + clip-search scale (W and A)
     {
@@ -291,7 +314,13 @@ fn main() {
         rotate_rows(&mut xr, b, k, k, &s1, &s2);
         let wq = quant_sym_clipsearch(&wr, m, k, 128, 4);
         let xq = quant_sym_clipsearch(&xr, b, k, 32, 4);
-        emit("3 + full-K Hadamard (vs 256) + clip + A=g32", &xq, &wq, false, &mut base);
+        emit(
+            "3 + full-K Hadamard (vs 256) + clip + A=g32",
+            &xq,
+            &wq,
+            false,
+            &mut base,
+        );
     }
     // 4) SmoothQuant migration THEN 256-block rotation + clip + A=g32
     {
@@ -302,7 +331,13 @@ fn main() {
         rotate_rows(&mut xr, b, k, 256, &s1, &s2);
         let wq = quant_sym_clipsearch(&wr, m, k, 128, 4);
         let xq = quant_sym_clipsearch(&xr, b, k, 32, 4);
-        emit("4 + SmoothQuant α0.5 (then FWHT256 + clip + g32)", &xq, &wq, false, &mut base);
+        emit(
+            "4 + SmoothQuant α0.5 (then FWHT256 + clip + g32)",
+            &xq,
+            &wq,
+            false,
+            &mut base,
+        );
     }
     // 5) SmoothQuant + full-K Hadamard + clip + A=g32
     {
@@ -313,7 +348,13 @@ fn main() {
         rotate_rows(&mut xr, b, k, k, &s1, &s2);
         let wq = quant_sym_clipsearch(&wr, m, k, 128, 4);
         let xq = quant_sym_clipsearch(&xr, b, k, 32, 4);
-        emit("5 + SmoothQuant + full-K Hadamard + clip + g32", &xq, &wq, false, &mut base);
+        emit(
+            "5 + SmoothQuant + full-K Hadamard + clip + g32",
+            &xq,
+            &wq,
+            false,
+            &mut base,
+        );
     }
 
     // Reference points (not pure iu4) — context, best recipe applied.
@@ -328,7 +369,10 @@ fn main() {
         let wq = quant_sym_clipsearch(&wr, m, k, 128, 4);
         let xq = quant_sym_clipsearch(&xr, b, k, 32, 8);
         let q = out_sqnr(&xq, &wq, &yref, m, k, b);
-        println!("{:<48} {q:>9.2}  (ref: A8 upcast→iu8)", "  W4A8 + SmoothQuant + full-K + clip");
+        println!(
+            "{:<48} {q:>9.2}  (ref: A8 upcast→iu8)",
+            "  W4A8 + SmoothQuant + full-K + clip"
+        );
     }
     {
         // W8A8 (both 8-bit): the high-precision int ceiling, same front-end.
@@ -340,6 +384,9 @@ fn main() {
         let wq = quant_sym_clipsearch(&wr, m, k, 128, 8);
         let xq = quant_sym_clipsearch(&xr, b, k, 32, 8);
         let q = out_sqnr(&xq, &wq, &yref, m, k, b);
-        println!("{:<48} {q:>9.2}  (ceiling: iu8 wmma)", "  W8A8 + SmoothQuant + full-K + clip");
+        println!(
+            "{:<48} {q:>9.2}  (ceiling: iu8 wmma)",
+            "  W8A8 + SmoothQuant + full-K + clip"
+        );
     }
 }

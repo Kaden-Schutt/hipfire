@@ -28,7 +28,10 @@ fn lcg(seed: u32, n: usize) -> Vec<f32> {
 }
 
 fn main() {
-    let n_tok: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(40);
+    let n_tok: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
     let kv_dim = NKV * HD;
     let scale = 1.0f32 / (HD as f32).sqrt();
 
@@ -52,9 +55,16 @@ fn main() {
     // Optional: exercise the deferred between-turns drain. idle_compact moves hot
     // tokens into cold; the read+oracle below validate it preserves attention.
     if std::env::var("HIPFIRE_KV_HIER_TEST_IDLE").ok().as_deref() == Some("1") {
-        let keep: usize = std::env::var("HIPFIRE_KV_HIER_KEEP").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+        let keep: usize = std::env::var("HIPFIRE_KV_HIER_KEEP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4);
         hier.idle_compact(&mut gpu, keep).unwrap();
-        eprintln!("after idle_compact(keep={keep}): hot_count={} cold_segs={}", hier.hot_count[0], hier.cold[0].len());
+        eprintln!(
+            "after idle_compact(keep={keep}): hot_count={} cold_segs={}",
+            hier.hot_count[0],
+            hier.cold[0].len()
+        );
     }
 
     let q = lcg(7, NH * HD);
@@ -89,12 +99,28 @@ fn main() {
     for seg in &hier.cold[0] {
         let krec_f32 = gpu.download_f32(&seg.k_recs).unwrap();
         let vrec_f32 = gpu.download_f32(&seg.v_recs).unwrap();
-        let krec: Vec<u8> = krec_f32.iter().flat_map(|x| x.to_bits().to_le_bytes()).collect();
-        let vrec: Vec<u8> = vrec_f32.iter().flat_map(|x| x.to_bits().to_le_bytes()).collect();
+        let krec: Vec<u8> = krec_f32
+            .iter()
+            .flat_map(|x| x.to_bits().to_le_bytes())
+            .collect();
+        let vrec: Vec<u8> = vrec_f32
+            .iter()
+            .flat_map(|x| x.to_bits().to_le_bytes())
+            .collect();
         for kv in 0..NKV {
             let off = kv * seg.rec_bytes;
-            let kt = dequantize_tile(&unpack_kvarn_tile_bits(&krec[off..off + seg.rec_bytes], HD, seg.n_slots, seg.bits)); // [HD × n_slots]
-            let vt = dequantize_tile(&unpack_kvarn_tile_bits(&vrec[off..off + seg.rec_bytes], HD, seg.n_slots, seg.bits));
+            let kt = dequantize_tile(&unpack_kvarn_tile_bits(
+                &krec[off..off + seg.rec_bytes],
+                HD,
+                seg.n_slots,
+                seg.bits,
+            )); // [HD × n_slots]
+            let vt = dequantize_tile(&unpack_kvarn_tile_bits(
+                &vrec[off..off + seg.rec_bytes],
+                HD,
+                seg.n_slots,
+                seg.bits,
+            ));
             for s in 0..seg.n_valid {
                 let mut ka = [0.0f32; HD];
                 let mut va = [0.0f32; HD];

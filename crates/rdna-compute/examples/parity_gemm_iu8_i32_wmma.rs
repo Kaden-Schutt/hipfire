@@ -31,7 +31,10 @@ fn main() {
 
     let mut gpu = Gpu::init().unwrap();
     if !gpu.arch_caps.has_wmma_w32() {
-        println!("SKIP gemm_iu8_i32_wmma parity: {} lacks wave32 WMMA", gpu.arch);
+        println!(
+            "SKIP gemm_iu8_i32_wmma parity: {} lacks wave32 WMMA",
+            gpu.arch
+        );
         return;
     }
 
@@ -56,7 +59,8 @@ fn main() {
     let x_dev = gpu.upload_raw(&x_bytes, &[b, k]).unwrap();
     let y_dev = gpu.upload_raw(&vec![0u8; b * m * 4], &[b, m]).unwrap();
 
-    gpu.gemm_iu8_i32_wmma(&a_dev, &x_dev, &y_dev, m, k, b).unwrap();
+    gpu.gemm_iu8_i32_wmma(&a_dev, &x_dev, &y_dev, m, k, b)
+        .unwrap();
     gpu.device_synchronize().unwrap();
 
     let y_bytes = gpu.download_raw(&y_dev, b * m * 4).unwrap();

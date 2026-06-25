@@ -40,12 +40,18 @@ fn main() {
 
     let mut gpu = Gpu::init().unwrap();
     if !gpu.arch_caps.has_wmma_w32() {
-        println!("SKIP parity_gemm_oq4_f16_wmma: {} lacks wave32 WMMA", gpu.arch);
+        println!(
+            "SKIP parity_gemm_oq4_f16_wmma: {} lacks wave32 WMMA",
+            gpu.arch
+        );
         return;
     }
 
     let wnib = lcg(1, m * (k / 2));
-    let wsc: Vec<f32> = lcgf_vals(0x11, m * ng).iter().map(|v| 0.01 + v.abs() * 0.25).collect();
+    let wsc: Vec<f32> = lcgf_vals(0x11, m * ng)
+        .iter()
+        .map(|v| 0.01 + v.abs() * 0.25)
+        .collect();
     let mut wbuf = wnib.clone();
     for s in &wsc {
         wbuf.extend_from_slice(&s.to_le_bytes());
@@ -56,7 +62,8 @@ fn main() {
     let xd = gpu.upload_f32(&x, &[b, k]).unwrap();
     let yd = gpu.alloc_tensor(&[b * m], DType::F32).unwrap();
 
-    gpu.gemm_oq4_grouped_f16_wmma(&wd, &xd, &yd, m, k, b, group).unwrap();
+    gpu.gemm_oq4_grouped_f16_wmma(&wd, &xd, &yd, m, k, b, group)
+        .unwrap();
     gpu.device_synchronize().unwrap();
     let y_gpu = gpu.download_f32(&yd).unwrap(); // [b, m]
 

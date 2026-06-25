@@ -32,17 +32,34 @@ fn lcg(seed: u32, n: usize) -> Vec<f32> {
 }
 
 fn main() {
-    let n_cold_tok: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(400);
+    let n_cold_tok: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(400);
     let scale = 1.0 / (HD as f32).sqrt();
     let kv_dim = NKV * HD;
 
     let q = lcg(1, NH * HD);
     let ck = lcg(2, n_cold_tok * kv_dim);
     let cv = lcg(3, n_cold_tok * kv_dim);
-    let importance: Vec<f32> = (0..n_cold_tok).map(|t| 0.1 + (t as f32 / n_cold_tok as f32)).collect();
+    let importance: Vec<f32> = (0..n_cold_tok)
+        .map(|t| 0.1 + (t as f32 / n_cold_tok as f32))
+        .collect();
 
     // v1 cold tier: rotate=false (no FWHT basis juggling for the GPU read).
-    let cold = compact_cold_kv(&ck, &cv, n_cold_tok, NKV, HD, &importance, 0.125, 4, false, false, 15.0);
+    let cold = compact_cold_kv(
+        &ck,
+        &cv,
+        n_cold_tok,
+        NKV,
+        HD,
+        &importance,
+        0.125,
+        4,
+        false,
+        false,
+        15.0,
+    );
     let nvc = cold.n_valid;
     let ns = cold.n_slots; // padded even — tile width
     let rec_bytes = kvarn_record_bytes(HD, ns);
@@ -90,17 +107,26 @@ fn main() {
 
     // Dequant into channel-major [NKV × HD × ns] f16 scratch (kvarn_dequant_tile
     // emits __half; r=HD, c=ns). 2 bytes/elem.
-    let kdq = gpu.upload_raw(&vec![0u8; NKV * HD * ns * 2], &[NKV * HD * ns]).unwrap();
-    let vdq = gpu.upload_raw(&vec![0u8; NKV * HD * ns * 2], &[NKV * HD * ns]).unwrap();
-    gpu.kvarn_dequant_tile(&krecs_d, &kdq, NKV, HD, ns, rec_bytes, 4).unwrap();
-    gpu.kvarn_dequant_tile(&vrecs_d, &vdq, NKV, HD, ns, rec_bytes, 4).unwrap();
+    let kdq = gpu
+        .upload_raw(&vec![0u8; NKV * HD * ns * 2], &[NKV * HD * ns])
+        .unwrap();
+    let vdq = gpu
+        .upload_raw(&vec![0u8; NKV * HD * ns * 2], &[NKV * HD * ns])
+        .unwrap();
+    gpu.kvarn_dequant_tile(&krecs_d, &kdq, NKV, HD, ns, rec_bytes, 4)
+        .unwrap();
+    gpu.kvarn_dequant_tile(&vrecs_d, &vdq, NKV, HD, ns, rec_bytes, 4)
+        .unwrap();
 
     // Channel-major attention over the nvc valid slots: count = nvc, stride = ns
     // (the padded tile width), so the pad slot (when nvc is odd) is never read.
     let od = gpu.alloc_tensor(&[NH * HD], DType::F32).unwrap();
     let md = gpu.alloc_tensor(&[NH], DType::F32).unwrap();
     let ld = gpu.alloc_tensor(&[NH], DType::F32).unwrap();
-    gpu.attention_cold_slots(&qd, &kdq, &vdq, &od, &md, &ld, NH, NKV, nvc, scale, 1, ns, None).unwrap();
+    gpu.attention_cold_slots(
+        &qd, &kdq, &vdq, &od, &md, &ld, NH, NKV, nvc, scale, 1, ns, None,
+    )
+    .unwrap();
 
     gpu.device_synchronize().unwrap();
     let got = gpu.download_f32(&od).unwrap();

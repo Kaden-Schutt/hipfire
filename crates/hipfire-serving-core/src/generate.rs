@@ -2085,11 +2085,7 @@ pub fn generate(
     // paths (DFlash, MTP) batch-prefill the prompt and would bypass it, leaving the
     // KVarN window/records (and hier hot ring) unpopulated → garbage. Route kvarn
     // models to the plain AR path below (per-token forward_scratch prefill+decode).
-    let kvarn_active = m
-        .kv_cache
-        .as_ref()
-        .map(|c| c.quant_kvarn)
-        .unwrap_or(false);
+    let kvarn_active = m.kv_cache.as_ref().map(|c| c.quant_kvarn).unwrap_or(false);
     if m.dflash.is_some()
         && !kvarn_active
         && temp <= 1e-6
@@ -2672,8 +2668,17 @@ pub fn generate(
                 // proven coherent for kvarn/hier (infer_qwen35). Slower prefill, but
                 // kvarn is a KV-memory mode, not a throughput one.
                 for &tok in &new_tokens {
-                    qwen35::forward_scratch(gpu, weights, config, tok, session.seq_pos, kv, dn, scratch)
-                        .unwrap();
+                    qwen35::forward_scratch(
+                        gpu,
+                        weights,
+                        config,
+                        tok,
+                        session.seq_pos,
+                        kv,
+                        dn,
+                        scratch,
+                    )
+                    .unwrap();
                     session.seq_pos += 1;
                 }
             } else if let Some(ref ev) = m.eviction {

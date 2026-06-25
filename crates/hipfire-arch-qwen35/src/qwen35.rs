@@ -19109,16 +19109,28 @@ fn forward_prefill_chunk(
                         )?;
                     } else {
                         gpu.gemm_oq4_grouped_act_batched(
-                            &layer.wq.buf, &pbs.x_rot_batch, &pbs.fa_q_full_batch,
-                            layer.wq.m, layer.wq.k, n,
+                            &layer.wq.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.fa_q_full_batch,
+                            layer.wq.m,
+                            layer.wq.k,
+                            n,
                         )?;
                         gpu.gemm_oq4_grouped_act_batched(
-                            &layer.wk.buf, &pbs.x_rot_batch, &pbs.fa_k_batch,
-                            layer.wk.m, layer.wk.k, n,
+                            &layer.wk.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.fa_k_batch,
+                            layer.wk.m,
+                            layer.wk.k,
+                            n,
                         )?;
                         gpu.gemm_oq4_grouped_act_batched(
-                            &layer.wv.buf, &pbs.x_rot_batch, &pbs.fa_v_batch,
-                            layer.wv.m, layer.wv.k, n,
+                            &layer.wv.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.fa_v_batch,
+                            layer.wv.m,
+                            layer.wv.k,
+                            n,
                         )?;
                     }
                 } else if qkv_is_q8 && q8_wmma_arch && qkv_same_dtype {

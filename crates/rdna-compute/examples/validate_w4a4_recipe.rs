@@ -61,7 +61,11 @@ fn signs(seed: u32, n: usize) -> Vec<f32> {
     (0..n)
         .map(|_| {
             st = st.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            if (st >> 16) & 1 == 1 { 1.0 } else { -1.0 }
+            if (st >> 16) & 1 == 1 {
+                1.0
+            } else {
+                -1.0
+            }
         })
         .collect()
 }
@@ -98,7 +102,14 @@ fn rotate(m: &mut [f32], rows: usize, k: usize, s1: &[f32], s2: &[f32]) {
         }
     }
 }
-fn smoothquant(x: &[f32], w: &[f32], b: usize, m: usize, k: usize, alpha: f32) -> (Vec<f32>, Vec<f32>) {
+fn smoothquant(
+    x: &[f32],
+    w: &[f32],
+    b: usize,
+    m: usize,
+    k: usize,
+    alpha: f32,
+) -> (Vec<f32>, Vec<f32>) {
     let mut xm = vec![1e-9f32; k];
     let mut wm = vec![1e-9f32; k];
     for r in 0..b {
@@ -111,7 +122,9 @@ fn smoothquant(x: &[f32], w: &[f32], b: usize, m: usize, k: usize, alpha: f32) -
             wm[c] = wm[c].max(w[r * k + c].abs());
         }
     }
-    let s: Vec<f32> = (0..k).map(|c| (xm[c].powf(alpha) / wm[c].powf(1.0 - alpha)).max(1e-6)).collect();
+    let s: Vec<f32> = (0..k)
+        .map(|c| (xm[c].powf(alpha) / wm[c].powf(1.0 - alpha)).max(1e-6))
+        .collect();
     let mut xo = x.to_vec();
     let mut wo = w.to_vec();
     for r in 0..b {
@@ -286,7 +299,10 @@ fn main() {
         max_rel = max_rel.max(d / (ycpu[i].abs() as f64).max(1e-3));
     }
 
-    println!("validate_w4a4_recipe  M={m} K={k} B={b} group={group} on {}", gpu.arch);
+    println!(
+        "validate_w4a4_recipe  M={m} K={k} B={b} group={group} on {}",
+        gpu.arch
+    );
     println!("recipe: SmoothQuant α0.5 → FWHT256 → clip-search int4 (g{group}), fused iu4 WMMA\n");
     println!("  CPU-sim output SQNR : {cpu_db:.2} dB");
     println!("  GPU    output SQNR : {gpu_db:.2} dB   (fused iu4, {ng} K-groups)");
@@ -295,7 +311,11 @@ fn main() {
     println!(
         "\n  {} GPU realizes the recipe ({})",
         if agree { "PASS:" } else { "FAIL:" },
-        if agree { "GPU==CPU, recipe SQNR holds on HW" } else { "GPU/CPU mismatch" }
+        if agree {
+            "GPU==CPU, recipe SQNR holds on HW"
+        } else {
+            "GPU/CPU mismatch"
+        }
     );
     if !agree {
         std::process::exit(1);

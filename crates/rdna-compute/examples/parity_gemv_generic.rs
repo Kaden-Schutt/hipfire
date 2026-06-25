@@ -152,7 +152,12 @@ fn main() {
             mx = mx.max((yg[r] - rf).abs());
             mag = mag.max(rf.abs());
         }
-        report("f16->f32 ", mx, 3.0 * mag * 2f32.powi(-10) + 1e-4, &mut all_pass);
+        report(
+            "f16->f32 ",
+            mx,
+            3.0 * mag * 2f32.powi(-10) + 1e-4,
+            &mut all_pass,
+        );
     }
     // f16 -> f16
     {
@@ -168,7 +173,12 @@ fn main() {
             mx = mx.max((g - rf).abs());
             mag = mag.max(rf.abs());
         }
-        report("f16->f16 ", mx, 3.0 * mag * 2f32.powi(-10) + 1e-4, &mut all_pass);
+        report(
+            "f16->f16 ",
+            mx,
+            3.0 * mag * 2f32.powi(-10) + 1e-4,
+            &mut all_pass,
+        );
     }
     // bf16 -> f32
     {
@@ -183,7 +193,12 @@ fn main() {
             mx = mx.max((yg[r] - rf).abs());
             mag = mag.max(rf.abs());
         }
-        report("bf16->f32", mx, 3.0 * mag * 2f32.powi(-8) + 1e-4, &mut all_pass);
+        report(
+            "bf16->f32",
+            mx,
+            3.0 * mag * 2f32.powi(-8) + 1e-4,
+            &mut all_pass,
+        );
     }
     // bf16 -> bf16
     {
@@ -199,7 +214,12 @@ fn main() {
             mx = mx.max((g - rf).abs());
             mag = mag.max(rf.abs());
         }
-        report("bf16->bf16", mx, 3.0 * mag * 2f32.powi(-8) + 1e-4, &mut all_pass);
+        report(
+            "bf16->bf16",
+            mx,
+            3.0 * mag * 2f32.powi(-8) + 1e-4,
+            &mut all_pass,
+        );
     }
     // iu8 -> i32 (exact)
     {

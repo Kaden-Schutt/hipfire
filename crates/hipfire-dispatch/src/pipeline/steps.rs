@@ -765,7 +765,8 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             if w.dtype == DType::Oq8G256 {
                 // wo/down residual: B=1 gemv_oq8 (no WMMA N-tile waste) into scratch
                 // + add, instead of gemm_oq8 at B=1 (16× wasteful) via WithResidual.
-                gpu.ensure_oq4_scratch().map_err(|e| DispatchError::Hip(e.to_string()))?;
+                gpu.ensure_oq4_scratch()
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
                 let tmp = rdna_compute::GpuTensor {
                     buf: unsafe { gpu.oq4_ytmp.as_ref().unwrap().buf.alias() },
                     shape: vec![w.m],
@@ -806,7 +807,8 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                 return oq4_gemv_into_impl(gpu, w, x, false, residual, true);
             }
             if w.dtype == DType::Oq8G256 {
-                gpu.ensure_oq4_scratch().map_err(|e| DispatchError::Hip(e.to_string()))?;
+                gpu.ensure_oq4_scratch()
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
                 let tmp = rdna_compute::GpuTensor {
                     buf: unsafe { gpu.oq4_ytmp.as_ref().unwrap().buf.alias() },
                     shape: vec![w.m],
@@ -1008,13 +1010,21 @@ fn launch_fused(
             // INTERLEAVED-layout fused decode: one launch over the contiguous
             // [scale][nibbles] region (one coalesced stream/group), appended after
             // the split region by the loader.
-            let il_qkv = wqkv.buf.sub_offset(wqkv.m * (k / 2) + wqkv.m * ng * 4, wqkv.m * ng * 132);
-            let il_z = wz.buf.sub_offset(wz.m * (k / 2) + wz.m * ng * 4, wz.m * ng * 132);
-            let il_b = wb.buf.sub_offset(wb.m * (k / 2) + wb.m * ng * 4, wb.m * ng * 132);
-            let il_a = wa.buf.sub_offset(wa.m * (k / 2) + wa.m * ng * 4, wa.m * ng * 132);
+            let il_qkv = wqkv
+                .buf
+                .sub_offset(wqkv.m * (k / 2) + wqkv.m * ng * 4, wqkv.m * ng * 132);
+            let il_z = wz
+                .buf
+                .sub_offset(wz.m * (k / 2) + wz.m * ng * 4, wz.m * ng * 132);
+            let il_b = wb
+                .buf
+                .sub_offset(wb.m * (k / 2) + wb.m * ng * 4, wb.m * ng * 132);
+            let il_a = wa
+                .buf
+                .sub_offset(wa.m * (k / 2) + wa.m * ng * 4, wa.m * ng * 132);
             gpu.fused_qkvza_oq4_interleaved(
-                &il_qkv, &il_z, &il_b, &il_a, activated, qkv, z, beta, alpha,
-                wqkv.m, wz.m, wb.m, wa.m, k, 256,
+                &il_qkv, &il_z, &il_b, &il_a, activated, qkv, z, beta, alpha, wqkv.m, wz.m, wb.m,
+                wa.m, k, 256,
             )
             .map_err(hip)?;
             Ok(())
@@ -1025,10 +1035,16 @@ fn launch_fused(
             let (wu, up) = gemv_weight_out(&steps[2]);
             let k = wg.k;
             let ng = k / 256;
-            let il_g = wg.buf.sub_offset(wg.m * (k / 2) + wg.m * ng * 4, wg.m * ng * 132);
-            let il_u = wu.buf.sub_offset(wu.m * (k / 2) + wu.m * ng * 4, wu.m * ng * 132);
-            gpu.fused_gate_up_oq4_interleaved(&il_g, &il_u, activated, gate, up, wg.m, wu.m, k, 256)
-                .map_err(hip)?;
+            let il_g = wg
+                .buf
+                .sub_offset(wg.m * (k / 2) + wg.m * ng * 4, wg.m * ng * 132);
+            let il_u = wu
+                .buf
+                .sub_offset(wu.m * (k / 2) + wu.m * ng * 4, wu.m * ng * 132);
+            gpu.fused_gate_up_oq4_interleaved(
+                &il_g, &il_u, activated, gate, up, wg.m, wu.m, k, 256,
+            )
+            .map_err(hip)?;
             Ok(())
         }
         // ── Opus W4A8 (OQ+) fused projections (decode) ───────────────────────
@@ -1045,8 +1061,8 @@ fn launch_fused(
             let (wa, alpha) = gemv_weight_out(&steps[4]);
             let k = wqkv.k;
             gpu.fused_qkvza_oq8_gemv(
-                wqkv.buf, wz.buf, wb.buf, wa.buf, activated, qkv, z, beta, alpha,
-                wqkv.m, wz.m, wb.m, wa.m, k, 256,
+                wqkv.buf, wz.buf, wb.buf, wa.buf, activated, qkv, z, beta, alpha, wqkv.m, wz.m,
+                wb.m, wa.m, k, 256,
             )
             .map_err(hip)?;
             Ok(())

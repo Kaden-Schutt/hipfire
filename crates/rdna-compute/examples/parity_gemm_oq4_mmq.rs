@@ -44,7 +44,10 @@ fn main() {
     }
 
     let wnib = lcg(1, m * (k / 2));
-    let wsc: Vec<f32> = lcgf_vals(0x11, m * ng).iter().map(|v| 0.01 + v.abs() * 0.1).collect();
+    let wsc: Vec<f32> = lcgf_vals(0x11, m * ng)
+        .iter()
+        .map(|v| 0.01 + v.abs() * 0.1)
+        .collect();
     let mut wbuf = wnib.clone();
     for s in &wsc {
         wbuf.extend_from_slice(&s.to_le_bytes());
@@ -56,13 +59,15 @@ fn main() {
 
     // Reference: f16 W4A16 (per-batch-row grouped GEMM).
     let yref = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
-    gpu.gemm_oq4_grouped_f16_wmma(&wd, &xd, &yref, m, k, n, group).unwrap();
+    gpu.gemm_oq4_grouped_f16_wmma(&wd, &xd, &yref, m, k, n, group)
+        .unwrap();
     gpu.device_synchronize().unwrap();
     let y_ref = gpu.download_f32(&yref).unwrap();
 
     // MMQ (int8 q8_1 activation), add=0 (SET).
     let ymmq = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
-    gpu.gemm_oq4_residual_mmq(&wd, &xd, &ymmq, m, k, n, false).unwrap();
+    gpu.gemm_oq4_residual_mmq(&wd, &xd, &ymmq, m, k, n, false)
+        .unwrap();
     gpu.device_synchronize().unwrap();
     let y_mmq = gpu.download_f32(&ymmq).unwrap();
 

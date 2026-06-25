@@ -82,7 +82,8 @@ fn main() {
     let w_dev = gpu.upload_raw(&w_bytes, &[m, k]).unwrap();
     let x_dev = gpu.upload_raw(&x_bytes, &[b, k]).unwrap();
     let y_dev = gpu.upload_raw(&vec![0u8; b * m * 4], &[b, m]).unwrap();
-    gpu.gemm_iu8_i32_wmma(&w_dev, &x_dev, &y_dev, m, k, b).unwrap();
+    gpu.gemm_iu8_i32_wmma(&w_dev, &x_dev, &y_dev, m, k, b)
+        .unwrap();
     gpu.device_synchronize().unwrap();
     let y_bytes = gpu.download_raw(&y_dev, b * m * 4).unwrap();
     let y_i32: Vec<i32> = y_bytes

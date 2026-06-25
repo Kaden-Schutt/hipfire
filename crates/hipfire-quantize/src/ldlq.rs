@@ -251,19 +251,22 @@ pub fn oq4_ldlq_pack(
     let nb = k / 256;
     // FWHT-rotate weights into the same domain (this is the residual we feed).
     let mut residual = vec![0.0f64; m * k];
-    residual.par_chunks_mut(k).enumerate().for_each(|(row, rr)| {
-        let base = row * k;
-        let mut buf = [0.0f32; 256];
-        for b in 0..nb {
-            for c in 0..256 {
-                buf[c] = weights_f32[base + b * 256 + c];
+    residual
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(row, rr)| {
+            let base = row * k;
+            let mut buf = [0.0f32; 256];
+            for b in 0..nb {
+                for c in 0..256 {
+                    buf[c] = weights_f32[base + b * 256 + c];
+                }
+                crate::cpu_fwht_256(&mut buf, signs1, signs2);
+                for c in 0..256 {
+                    rr[b * 256 + c] = buf[c] as f64;
+                }
             }
-            crate::cpu_fwht_256(&mut buf, signs1, signs2);
-            for c in 0..256 {
-                rr[b * 256 + c] = buf[c] as f64;
-            }
-        }
-    });
+        });
 
     const BLOCK_BYTES: usize = 130; // 2 (f16 scale) + 128 nibbles
     let mut out = vec![0u8; m * nb * BLOCK_BYTES];
@@ -289,8 +292,7 @@ pub fn oq4_ldlq_pack(
                 for i in 0..128 {
                     let qlo = (grp[2 * i] * inv).round().clamp(-7.0, 7.0);
                     let qhi = (grp[2 * i + 1] * inv).round().clamp(-7.0, 7.0);
-                    block[2 + i] =
-                        ((qlo as i8 as u8) & 0xf) | (((qhi as i8 as u8) & 0xf) << 4);
+                    block[2 + i] = ((qlo as i8 as u8) & 0xf) | (((qhi as i8 as u8) & 0xf) << 4);
                     let (clo, chi) = (c0 + 2 * i, c0 + 2 * i + 1);
                     let ulo = l[(clo, clo)];
                     let uhi = l[(chi, chi)];
@@ -375,19 +377,22 @@ pub fn oqplus_tiered_ldlq_pack(
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
-    residual.par_chunks_mut(k).enumerate().for_each(|(row, rr)| {
-        let base = row * k;
-        let mut buf = [0.0f32; 256];
-        for b in 0..nb {
-            for c in 0..256 {
-                buf[c] = weights_f32[base + b * 256 + c];
+    residual
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(row, rr)| {
+            let base = row * k;
+            let mut buf = [0.0f32; 256];
+            for b in 0..nb {
+                for c in 0..256 {
+                    buf[c] = weights_f32[base + b * 256 + c];
+                }
+                crate::cpu_fwht_256(&mut buf, signs1, signs2);
+                for c in 0..256 {
+                    rr[b * 256 + c] = buf[c] as f64;
+                }
             }
-            crate::cpu_fwht_256(&mut buf, signs1, signs2);
-            for c in 0..256 {
-                rr[b * 256 + c] = buf[c] as f64;
-            }
-        }
-    });
+        });
 
     const BLOCK_BYTES: usize = 258; // 2 (f16 scale) + 256 int8
     let n_out = ((w8_frac as f64 * 256.0).round() as usize).clamp(1, 256);
@@ -416,7 +421,9 @@ pub fn oqplus_tiered_ldlq_pack(
                 };
                 let mut idx: [usize; 256] = core::array::from_fn(|i| i);
                 idx.sort_unstable_by(|&a, &c| {
-                    gain(c).partial_cmp(&gain(a)).unwrap_or(core::cmp::Ordering::Equal)
+                    gain(c)
+                        .partial_cmp(&gain(a))
+                        .unwrap_or(core::cmp::Ordering::Equal)
                 });
                 let mut is_w8 = [false; 256];
                 for &i in &idx[..n_out] {
@@ -503,19 +510,22 @@ pub fn oqplus_compact_ldlq_pack(
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
-    residual.par_chunks_mut(k).enumerate().for_each(|(row, rr)| {
-        let base = row * k;
-        let mut buf = [0.0f32; 256];
-        for b in 0..nb {
-            for c in 0..256 {
-                buf[c] = weights_f32[base + b * 256 + c];
+    residual
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(row, rr)| {
+            let base = row * k;
+            let mut buf = [0.0f32; 256];
+            for b in 0..nb {
+                for c in 0..256 {
+                    buf[c] = weights_f32[base + b * 256 + c];
+                }
+                crate::cpu_fwht_256(&mut buf, signs1, signs2);
+                for c in 0..256 {
+                    rr[b * 256 + c] = buf[c] as f64;
+                }
             }
-            crate::cpu_fwht_256(&mut buf, signs1, signs2);
-            for c in 0..256 {
-                rr[b * 256 + c] = buf[c] as f64;
-            }
-        }
-    });
+        });
 
     let n_out = ((w8_frac as f64 * 256.0).round() as usize).clamp(1, 255);
     let block_bytes = 130 + 2 * n_out; // [f16][128 nibbles][n_out×(u8 idx, i8 val)]
@@ -543,7 +553,9 @@ pub fn oqplus_compact_ldlq_pack(
                 };
                 let mut idx: [usize; 256] = core::array::from_fn(|i| i);
                 idx.sort_unstable_by(|&a, &c| {
-                    gain(c).partial_cmp(&gain(a)).unwrap_or(core::cmp::Ordering::Equal)
+                    gain(c)
+                        .partial_cmp(&gain(a))
+                        .unwrap_or(core::cmp::Ordering::Equal)
                 });
                 let mut is_w8 = [false; 256];
                 for &i in &idx[..n_out] {

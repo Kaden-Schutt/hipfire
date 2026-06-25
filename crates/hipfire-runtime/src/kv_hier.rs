@@ -125,8 +125,8 @@ pub struct HierKvState {
     /// importance). Filled by the hot read's mass pass; only used when
     /// importance_mode == Attn. Zeroed at reset, shifted on migrate.
     pub attn_mass: Vec<GpuTensor>,
-    pub hot_count: Vec<usize>, // live hot tokens per layer
-    pub migrated: Vec<usize>,  // tokens already moved to cold per layer
+    pub hot_count: Vec<usize>,          // live hot tokens per layer
+    pub migrated: Vec<usize>,           // tokens already moved to cold per layer
     pub cold: Vec<Vec<ColdSegmentGpu>>, // [n_layers][segments]
     scr: Option<HierScratch>,
 }
@@ -141,8 +141,8 @@ impl HierKvState {
         n_kv_heads: usize,
         head_dim: usize,
     ) -> HipResult<Self> {
-        let enabled = std::env::var("HIPFIRE_KV_HIERARCHICAL").ok().as_deref() == Some("1")
-            && head_dim == HD;
+        let enabled =
+            std::env::var("HIPFIRE_KV_HIERARCHICAL").ok().as_deref() == Some("1") && head_dim == HD;
         let hot_budget = std::env::var("HIPFIRE_KV_HOT_BUDGET")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -301,8 +301,18 @@ impl HierKvState {
         let importance: Vec<f32> = (0..mb)
             .map(|t| {
                 let base = t * kv_dim;
-                let kn = || (0..kv_dim).map(|d| ck[base + d] * ck[base + d]).sum::<f32>().sqrt();
-                let vn = || (0..kv_dim).map(|d| cv[base + d] * cv[base + d]).sum::<f32>().sqrt();
+                let kn = || {
+                    (0..kv_dim)
+                        .map(|d| ck[base + d] * ck[base + d])
+                        .sum::<f32>()
+                        .sqrt()
+                };
+                let vn = || {
+                    (0..kv_dim)
+                        .map(|d| cv[base + d] * cv[base + d])
+                        .sum::<f32>()
+                        .sqrt()
+                };
                 match self.importance_mode {
                     ImportanceMode::Uniform => 1.0,
                     ImportanceMode::VNorm => vn(),
@@ -314,8 +324,17 @@ impl HierKvState {
             })
             .collect();
         let cold = compact_cold_kv(
-            &ck, &cv, mb, nkv, HD, &importance, self.core_frac, self.fold_m, false,
-            self.position_local, self.cold_qmax,
+            &ck,
+            &cv,
+            mb,
+            nkv,
+            HD,
+            &importance,
+            self.core_frac,
+            self.fold_m,
+            false,
+            self.position_local,
+            self.cold_qmax,
         );
         let n_slots = cold.n_slots;
         let bits = self.cold_bits;
@@ -349,8 +368,20 @@ impl HierKvState {
             for kv in 0..nkv {
                 let dst = ((kv * hb) * HD) * 4;
                 let src = ((kv * hb + mb) * HD) * 4;
-                gpu.memcpy_dtod_at_auto(&self.hot_k[layer].buf, dst, &self.hot_k[layer].buf, src, rem * HD * 4)?;
-                gpu.memcpy_dtod_at_auto(&self.hot_v[layer].buf, dst, &self.hot_v[layer].buf, src, rem * HD * 4)?;
+                gpu.memcpy_dtod_at_auto(
+                    &self.hot_k[layer].buf,
+                    dst,
+                    &self.hot_k[layer].buf,
+                    src,
+                    rem * HD * 4,
+                )?;
+                gpu.memcpy_dtod_at_auto(
+                    &self.hot_v[layer].buf,
+                    dst,
+                    &self.hot_v[layer].buf,
+                    src,
+                    rem * HD * 4,
+                )?;
             }
         }
         // Mirror the shift for the attention-mass ring (slot s holds token s's mass),
@@ -436,7 +467,11 @@ impl HierKvState {
         let scale = 1.0f32 / (HD as f32).sqrt();
         let nh = self.n_heads;
         let nkv = self.n_kv_heads;
-        let max_seg = self.cold[layer].iter().map(|s| s.n_slots).max().unwrap_or(0);
+        let max_seg = self.cold[layer]
+            .iter()
+            .map(|s| s.n_slots)
+            .max()
+            .unwrap_or(0);
         self.ensure_scratch(gpu, max_seg)?;
         // Take the scratch out to satisfy the borrow checker, then restore.
         let scr = self.scr.take().unwrap();
@@ -467,8 +502,24 @@ impl HierKvState {
 
         // Fold each cold segment: dequant 4-bit → f16, channel-major attend, merge.
         for seg in &self.cold[layer] {
-            gpu.kvarn_dequant_tile(&seg.k_recs, &scr.deq_k, nkv, HD, seg.n_slots, seg.rec_bytes, seg.bits)?;
-            gpu.kvarn_dequant_tile(&seg.v_recs, &scr.deq_v, nkv, HD, seg.n_slots, seg.rec_bytes, seg.bits)?;
+            gpu.kvarn_dequant_tile(
+                &seg.k_recs,
+                &scr.deq_k,
+                nkv,
+                HD,
+                seg.n_slots,
+                seg.rec_bytes,
+                seg.bits,
+            )?;
+            gpu.kvarn_dequant_tile(
+                &seg.v_recs,
+                &scr.deq_v,
+                nkv,
+                HD,
+                seg.n_slots,
+                seg.rec_bytes,
+                seg.bits,
+            )?;
             gpu.attention_cold_slots(
                 q,
                 &scr.deq_k,

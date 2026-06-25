@@ -133,15 +133,21 @@ fn main() {
     // GPU extract (m,l) for A and B from their partials. positions so n_tiles match.
     let pa_d = gpu.upload_f32(&pa, &[NH * ta * STRIDE]).unwrap();
     let pb_d = gpu.upload_f32(&pb, &[NH * tb * STRIDE]).unwrap();
-    let pos_a = gpu.upload_raw(&((ta * TS) as i32 - 1).to_le_bytes(), &[1]).unwrap();
-    let pos_b = gpu.upload_raw(&((tb * TS) as i32 - 1).to_le_bytes(), &[1]).unwrap();
+    let pos_a = gpu
+        .upload_raw(&((ta * TS) as i32 - 1).to_le_bytes(), &[1])
+        .unwrap();
+    let pos_b = gpu
+        .upload_raw(&((tb * TS) as i32 - 1).to_le_bytes(), &[1])
+        .unwrap();
 
     let ma_d = gpu.alloc_tensor(&[NH], DType::F32).unwrap();
     let la_d = gpu.alloc_tensor(&[NH], DType::F32).unwrap();
     let mb_d = gpu.alloc_tensor(&[NH], DType::F32).unwrap();
     let lb_d = gpu.alloc_tensor(&[NH], DType::F32).unwrap();
-    gpu.flash_partials_ml(&pa_d, &pos_a, &ma_d, &la_d, NH, HD, TS, ta, 1, 0, 0, 0).unwrap();
-    gpu.flash_partials_ml(&pb_d, &pos_b, &mb_d, &lb_d, NH, HD, TS, tb, 1, 0, 0, 0).unwrap();
+    gpu.flash_partials_ml(&pa_d, &pos_a, &ma_d, &la_d, NH, HD, TS, ta, 1, 0, 0, 0)
+        .unwrap();
+    gpu.flash_partials_ml(&pb_d, &pos_b, &mb_d, &lb_d, NH, HD, TS, tb, 1, 0, 0, 0)
+        .unwrap();
 
     // Upload the trusted CPU tier outputs, then GPU-merge using the GPU-extracted (m,l).
     let oa_d = gpu.upload_f32(&out_a, &[NH * HD]).unwrap();
@@ -149,8 +155,10 @@ fn main() {
     let om_d = gpu.alloc_tensor(&[NH * HD], DType::F32).unwrap();
     let mm_d = gpu.alloc_tensor(&[NH], DType::F32).unwrap();
     let lm_d = gpu.alloc_tensor(&[NH], DType::F32).unwrap();
-    gpu.flash_tier_merge(&oa_d, &ma_d, &la_d, &ob_d, &mb_d, &lb_d, &om_d, &mm_d, &lm_d, NH)
-        .unwrap();
+    gpu.flash_tier_merge(
+        &oa_d, &ma_d, &la_d, &ob_d, &mb_d, &lb_d, &om_d, &mm_d, &lm_d, NH,
+    )
+    .unwrap();
 
     gpu.device_synchronize().unwrap();
 

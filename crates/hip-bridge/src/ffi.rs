@@ -831,7 +831,12 @@ impl HipRuntime {
         crate::ffi::launch_counters::memcpy_dtod::record(t.elapsed().as_nanos() as u64);
         static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *DUMP.get_or_init(|| std::env::var("HIPFIRE_MEMCPY_DUMP").ok().as_deref() == Some("1")) {
-            eprintln!("memcpy_dtod_at bytes={} at {}:{}", size, loc.file(), loc.line());
+            eprintln!(
+                "memcpy_dtod_at bytes={} at {}:{}",
+                size,
+                loc.file(),
+                loc.line()
+            );
         }
         self.check(code, "hipMemcpy D2D at offset")
     }
@@ -975,7 +980,12 @@ impl HipRuntime {
         crate::ffi::launch_counters::memcpy_dtod::record(t.elapsed().as_nanos() as u64);
         static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *DUMP.get_or_init(|| std::env::var("HIPFIRE_MEMCPY_DUMP").ok().as_deref() == Some("1")) {
-            eprintln!("memcpy_dtod bytes={} at {}:{}", size, loc.file(), loc.line());
+            eprintln!(
+                "memcpy_dtod bytes={} at {}:{}",
+                size,
+                loc.file(),
+                loc.line()
+            );
         }
         self.check(code, "hipMemcpy D2D")
     }

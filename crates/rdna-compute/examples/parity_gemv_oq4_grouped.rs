@@ -41,7 +41,10 @@ fn main() {
 
     // Combined weight buffer [packed nibbles M*(K/2) | f32 scales M*ng].
     let wnib = lcg(1, m * (k / 2));
-    let wsc = lcgf_vals(0x11, m * ng).iter().map(|v| 0.01 + v.abs() * 0.25).collect::<Vec<_>>();
+    let wsc = lcgf_vals(0x11, m * ng)
+        .iter()
+        .map(|v| 0.01 + v.abs() * 0.25)
+        .collect::<Vec<_>>();
     let mut wbuf = wnib.clone();
     for s in &wsc {
         wbuf.extend_from_slice(&s.to_le_bytes());
@@ -57,7 +60,8 @@ fn main() {
     let xd = gpu.upload_raw(&xbytes, &[1, k]).unwrap();
 
     let yg = gpu.upload_raw(&vec![0u8; m * 4], &[1, m]).unwrap();
-    gpu.gemv_oq4_grouped(&wd, &ws, &xd, &yg, m, k, group).unwrap();
+    gpu.gemv_oq4_grouped(&wd, &ws, &xd, &yg, m, k, group)
+        .unwrap();
     gpu.device_synchronize().unwrap();
     let y_gemv = gpu.download_f32(&yg).unwrap();
 
