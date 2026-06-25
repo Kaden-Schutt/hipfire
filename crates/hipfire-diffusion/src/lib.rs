@@ -207,6 +207,9 @@ pub struct DiffusionHipPreflight {
     pub add_channel_bias_kernel_probe: DiffusionHipKernelProbe,
     pub nchw_to_bsc_kernel_probe: DiffusionHipKernelProbe,
     pub bsc_to_nchw_kernel_probe: DiffusionHipKernelProbe,
+    pub concat_channels_kernel_probe: DiffusionHipKernelProbe,
+    pub concat_last_dim_2d_kernel_probe: DiffusionHipKernelProbe,
+    pub concat_last_dim_3d_kernel_probe: DiffusionHipKernelProbe,
     pub conv2d_kernel_probe: DiffusionHipKernelProbe,
     pub group_norm_kernel_probe: DiffusionHipKernelProbe,
     pub silu_kernel_probe: DiffusionHipKernelProbe,
@@ -2567,6 +2570,93 @@ impl DiffusionPipeline {
                 "HIP diffusion BSC-to-NCHW kernel output differed from CPU reference".to_string(),
             ));
         }
+        let concat_channels_left = CpuTensor {
+            shape: vec![1, 2, 2, 3],
+            data: (0..12)
+                .map(|idx| idx as f32 / 7.0 - 0.75)
+                .collect::<Vec<_>>(),
+        };
+        let concat_channels_right = CpuTensor {
+            shape: vec![1, 3, 2, 3],
+            data: (0..18)
+                .map(|idx| (idx as f32 % 11.0 - 5.0) / 6.0)
+                .collect::<Vec<_>>(),
+        };
+        let concat_channels_cpu_reference =
+            concat_channels_nchw(&concat_channels_left, &concat_channels_right)?;
+        let concat_channels_gpu_output = concat_channels_nchw_hip_on_gpu(
+            &mut gpu,
+            &concat_channels_left,
+            &concat_channels_right,
+        )?;
+        let concat_channels_kernel_probe = DiffusionHipKernelProbe {
+            name: "diffusion_concat_channels_nchw_f32".to_string(),
+            input_elements: concat_channels_left.data.len() + concat_channels_right.data.len(),
+            output_bytes: concat_channels_gpu_output.data.len() * std::mem::size_of::<f32>(),
+            matched_cpu_reference: concat_channels_gpu_output.shape
+                == concat_channels_cpu_reference.shape
+                && concat_channels_gpu_output.data == concat_channels_cpu_reference.data,
+        };
+        if !concat_channels_kernel_probe.matched_cpu_reference {
+            return Err(DiffusionError::BackendUnavailable(
+                "HIP diffusion channel-concat kernel output differed from CPU reference"
+                    .to_string(),
+            ));
+        }
+        let concat_2d_left = CpuTensor {
+            shape: vec![3, 2],
+            data: vec![0.25, -0.5, 0.75, 1.0, -1.25, 0.5],
+        };
+        let concat_2d_right = CpuTensor {
+            shape: vec![3, 3],
+            data: vec![-1.0, 0.0, 1.0, 0.5, -0.25, 0.75, 1.25, -0.75, 0.25],
+        };
+        let concat_last_dim_2d_cpu_reference =
+            concat_last_dim_2d(&concat_2d_left, &concat_2d_right)?;
+        let concat_last_dim_2d_gpu_output =
+            concat_last_dim_2d_hip_on_gpu(&mut gpu, &concat_2d_left, &concat_2d_right)?;
+        let concat_last_dim_2d_kernel_probe = DiffusionHipKernelProbe {
+            name: "diffusion_concat_last_dim_2d_f32".to_string(),
+            input_elements: concat_2d_left.data.len() + concat_2d_right.data.len(),
+            output_bytes: concat_last_dim_2d_gpu_output.data.len() * std::mem::size_of::<f32>(),
+            matched_cpu_reference: concat_last_dim_2d_gpu_output.shape
+                == concat_last_dim_2d_cpu_reference.shape
+                && concat_last_dim_2d_gpu_output.data == concat_last_dim_2d_cpu_reference.data,
+        };
+        if !concat_last_dim_2d_kernel_probe.matched_cpu_reference {
+            return Err(DiffusionError::BackendUnavailable(
+                "HIP diffusion 2D last-dim concat kernel output differed from CPU reference"
+                    .to_string(),
+            ));
+        }
+        let concat_3d_left = CpuTensor {
+            shape: vec![2, 2, 2],
+            data: (0..8).map(|idx| idx as f32 / 4.0 - 0.5).collect::<Vec<_>>(),
+        };
+        let concat_3d_right = CpuTensor {
+            shape: vec![2, 2, 3],
+            data: (0..12)
+                .map(|idx| (idx as f32 % 7.0 - 3.0) / 5.0)
+                .collect::<Vec<_>>(),
+        };
+        let concat_last_dim_3d_cpu_reference =
+            concat_last_dim_3d(&concat_3d_left, &concat_3d_right)?;
+        let concat_last_dim_3d_gpu_output =
+            concat_last_dim_3d_hip_on_gpu(&mut gpu, &concat_3d_left, &concat_3d_right)?;
+        let concat_last_dim_3d_kernel_probe = DiffusionHipKernelProbe {
+            name: "diffusion_concat_last_dim_3d_f32".to_string(),
+            input_elements: concat_3d_left.data.len() + concat_3d_right.data.len(),
+            output_bytes: concat_last_dim_3d_gpu_output.data.len() * std::mem::size_of::<f32>(),
+            matched_cpu_reference: concat_last_dim_3d_gpu_output.shape
+                == concat_last_dim_3d_cpu_reference.shape
+                && concat_last_dim_3d_gpu_output.data == concat_last_dim_3d_cpu_reference.data,
+        };
+        if !concat_last_dim_3d_kernel_probe.matched_cpu_reference {
+            return Err(DiffusionError::BackendUnavailable(
+                "HIP diffusion 3D last-dim concat kernel output differed from CPU reference"
+                    .to_string(),
+            ));
+        }
         let conv2d_input = CpuTensor {
             shape: vec![1, 2, 3, 4],
             data: (0..24)
@@ -2917,6 +3007,9 @@ impl DiffusionPipeline {
             add_channel_bias_kernel_probe,
             nchw_to_bsc_kernel_probe,
             bsc_to_nchw_kernel_probe,
+            concat_channels_kernel_probe,
+            concat_last_dim_2d_kernel_probe,
+            concat_last_dim_3d_kernel_probe,
             conv2d_kernel_probe,
             group_norm_kernel_probe,
             silu_kernel_probe,
@@ -5830,6 +5923,62 @@ extern "C" __global__ void diffusion_bsc_to_nchw_f32(
 "#;
 
 #[cfg(feature = "rocm")]
+const DIFFUSION_CONCAT_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void diffusion_concat_channels_nchw_f32(
+    const float* a,
+    const float* b,
+    float* output,
+    int total_outputs,
+    int a_channels,
+    int b_channels,
+    int height,
+    int width
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_outputs) {
+        return;
+    }
+    int out_channels = a_channels + b_channels;
+    int x = idx % width;
+    int t = idx / width;
+    int y = t % height;
+    t /= height;
+    int c = t % out_channels;
+    int batch = t / out_channels;
+    if (c < a_channels) {
+        output[idx] = a[((batch * a_channels + c) * height + y) * width + x];
+    } else {
+        int bc = c - a_channels;
+        output[idx] = b[((batch * b_channels + bc) * height + y) * width + x];
+    }
+}
+
+extern "C" __global__ void diffusion_concat_last_dim_f32(
+    const float* a,
+    const float* b,
+    float* output,
+    int total_outputs,
+    int left_width,
+    int right_width
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_outputs) {
+        return;
+    }
+    int out_width = left_width + right_width;
+    int col = idx % out_width;
+    int row = idx / out_width;
+    if (col < left_width) {
+        output[idx] = a[row * left_width + col];
+    } else {
+        output[idx] = b[row * right_width + (col - left_width)];
+    }
+}
+"#;
+
+#[cfg(feature = "rocm")]
 const DIFFUSION_LINEAR_HIP_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 
@@ -6609,6 +6758,226 @@ fn bsc_to_nchw_hip_on_gpu(
         channels,
         height,
         width,
+    )?;
+    let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(CpuTensor {
+        shape: output_shape.to_vec(),
+        data,
+    })
+}
+
+#[cfg(feature = "rocm")]
+fn launch_diffusion_concat_kernel(
+    gpu: &mut rdna_compute::Gpu,
+    function_name: &str,
+    a_gpu: &rdna_compute::GpuTensor,
+    b_gpu: &rdna_compute::GpuTensor,
+    output_gpu: &hip_bridge::DeviceBuffer,
+    kernargs_tail: impl FnOnce(&mut hip_bridge::KernargBlob) -> DiffusionResult<()>,
+    output_elements: usize,
+) -> DiffusionResult<()> {
+    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = compiler
+        .compile(function_name, DIFFUSION_CONCAT_HIP_SRC)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = obj_path
+        .to_str()
+        .ok_or_else(|| {
+            DiffusionError::BackendUnavailable(format!(
+                "compiled diffusion concat kernel {function_name} path is not UTF-8"
+            ))
+        })?
+        .to_string();
+    let module = gpu
+        .hip
+        .module_load(&obj_path)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let function = gpu
+        .hip
+        .module_get_function(&module, function_name)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(a_gpu.buf.as_ptr());
+    kernargs.push_ptr(b_gpu.buf.as_ptr());
+    kernargs.push_ptr(output_gpu.as_ptr());
+    kernargs.push_i32(i32_kernel_dim("concat output elements", output_elements)?);
+    kernargs_tail(&mut kernargs)?;
+    kernargs.pad_to(16);
+    let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+    unsafe {
+        gpu.hip
+            .launch_kernel_blob(
+                &function,
+                grid,
+                [256, 1, 1],
+                0,
+                gpu.active_stream.as_ref(),
+                kernargs.as_mut_slice(),
+            )
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))
+}
+
+#[cfg(feature = "rocm")]
+fn concat_channels_nchw_hip_on_gpu(
+    gpu: &mut rdna_compute::Gpu,
+    a: &CpuTensor,
+    b: &CpuTensor,
+) -> DiffusionResult<CpuTensor> {
+    let [batch, a_channels, height, width] = shape4(a)?;
+    let [b_batch, b_channels, b_height, b_width] = shape4(b)?;
+    if batch != b_batch || height != b_height || width != b_width {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "cannot concatenate NCHW tensors with shapes {:?} and {:?}",
+            a.shape, b.shape
+        )));
+    }
+    let out_channels = a_channels.checked_add(b_channels).ok_or_else(|| {
+        DiffusionError::InvalidMetadata("concat channel count overflows".to_string())
+    })?;
+    let output_shape = [batch, out_channels, height, width];
+    let output_elements = checked_shape_elements("NCHW channel concat output", &output_shape)?;
+    if output_elements == 0 {
+        return Ok(CpuTensor::zeros(&output_shape));
+    }
+    let output_bytes = output_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata("NCHW channel concat output size overflows".to_string())
+        })?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let a_gpu = gpu
+        .upload_f32(&a.data, &a.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let b_gpu = gpu
+        .upload_f32(&b.data, &b.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = gpu
+        .hip
+        .malloc(output_bytes)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    launch_diffusion_concat_kernel(
+        gpu,
+        "diffusion_concat_channels_nchw_f32",
+        &a_gpu,
+        &b_gpu,
+        &output_gpu,
+        |kernargs| {
+            kernargs.push_i32(i32_kernel_dim("concat left channels", a_channels)?);
+            kernargs.push_i32(i32_kernel_dim("concat right channels", b_channels)?);
+            kernargs.push_i32(i32_kernel_dim("concat height", height)?);
+            kernargs.push_i32(i32_kernel_dim("concat width", width)?);
+            Ok(())
+        },
+        output_elements,
+    )?;
+    let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(CpuTensor {
+        shape: output_shape.to_vec(),
+        data,
+    })
+}
+
+#[cfg(feature = "rocm")]
+fn concat_last_dim_2d_hip_on_gpu(
+    gpu: &mut rdna_compute::Gpu,
+    a: &CpuTensor,
+    b: &CpuTensor,
+) -> DiffusionResult<CpuTensor> {
+    let [rows, left_width] = shape2(a)?;
+    let [b_rows, right_width] = shape2(b)?;
+    if rows != b_rows {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "cannot concatenate 2D tensors with shapes {:?} and {:?}",
+            a.shape, b.shape
+        )));
+    }
+    let output_width = left_width.checked_add(right_width).ok_or_else(|| {
+        DiffusionError::InvalidMetadata("2D concat output width overflows".to_string())
+    })?;
+    concat_last_dim_hip_on_gpu(gpu, a, b, &[rows, output_width], left_width, right_width)
+}
+
+#[cfg(feature = "rocm")]
+fn concat_last_dim_3d_hip_on_gpu(
+    gpu: &mut rdna_compute::Gpu,
+    a: &CpuTensor,
+    b: &CpuTensor,
+) -> DiffusionResult<CpuTensor> {
+    let [batch, seq, left_width] = shape3(a)?;
+    let [b_batch, b_seq, right_width] = shape3(b)?;
+    if batch != b_batch || seq != b_seq {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "cannot concatenate 3D tensors with shapes {:?} and {:?}",
+            a.shape, b.shape
+        )));
+    }
+    let output_width = left_width.checked_add(right_width).ok_or_else(|| {
+        DiffusionError::InvalidMetadata("3D concat output width overflows".to_string())
+    })?;
+    concat_last_dim_hip_on_gpu(
+        gpu,
+        a,
+        b,
+        &[batch, seq, output_width],
+        left_width,
+        right_width,
+    )
+}
+
+#[cfg(feature = "rocm")]
+fn concat_last_dim_hip_on_gpu(
+    gpu: &mut rdna_compute::Gpu,
+    a: &CpuTensor,
+    b: &CpuTensor,
+    output_shape: &[usize],
+    left_width: usize,
+    right_width: usize,
+) -> DiffusionResult<CpuTensor> {
+    let output_elements = checked_shape_elements("last-dim concat output", output_shape)?;
+    if output_elements == 0 {
+        return Ok(CpuTensor::zeros(output_shape));
+    }
+    let output_bytes = output_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata("last-dim concat output size overflows".to_string())
+        })?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let a_gpu = gpu
+        .upload_f32(&a.data, &a.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let b_gpu = gpu
+        .upload_f32(&b.data, &b.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = gpu
+        .hip
+        .malloc(output_bytes)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    launch_diffusion_concat_kernel(
+        gpu,
+        "diffusion_concat_last_dim_f32",
+        &a_gpu,
+        &b_gpu,
+        &output_gpu,
+        |kernargs| {
+            kernargs.push_i32(i32_kernel_dim("concat left width", left_width)?);
+            kernargs.push_i32(i32_kernel_dim("concat right width", right_width)?);
+            Ok(())
+        },
+        output_elements,
     )?;
     let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
     gpu.hip
@@ -14663,6 +15032,74 @@ mod tests {
         let hip_nchw = bsc_to_nchw_hip_on_gpu(&mut gpu, &cpu_bsc, 2, 3, 2, 4).unwrap();
         assert_eq!(hip_nchw, cpu_nchw);
         assert_eq!(hip_nchw, input);
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn hip_concat_channels_matches_cpu_reference_when_gpu_is_available() {
+        let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!(
+                    "skip: ROCm GPU unavailable for channel-concat kernel parity test: {error}"
+                );
+                return;
+            }
+        };
+        let left = CpuTensor {
+            shape: vec![2, 2, 2, 3],
+            data: (0..24)
+                .map(|idx| idx as f32 / 9.0 - 1.0)
+                .collect::<Vec<_>>(),
+        };
+        let right = CpuTensor {
+            shape: vec![2, 3, 2, 3],
+            data: (0..36)
+                .map(|idx| (idx as f32 % 13.0 - 6.0) / 7.0)
+                .collect::<Vec<_>>(),
+        };
+
+        let cpu = concat_channels_nchw(&left, &right).unwrap();
+        let hip = concat_channels_nchw_hip_on_gpu(&mut gpu, &left, &right).unwrap();
+
+        assert_eq!(hip, cpu);
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn hip_concat_last_dim_matches_cpu_reference_when_gpu_is_available() {
+        let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!(
+                    "skip: ROCm GPU unavailable for last-dim concat kernel parity test: {error}"
+                );
+                return;
+            }
+        };
+        let left_2d = CpuTensor {
+            shape: vec![4, 2],
+            data: (0..8).map(|idx| idx as f32 / 5.0 - 0.75).collect(),
+        };
+        let right_2d = CpuTensor {
+            shape: vec![4, 3],
+            data: (0..12).map(|idx| (idx as f32 % 7.0 - 3.0) / 4.0).collect(),
+        };
+        let cpu_2d = concat_last_dim_2d(&left_2d, &right_2d).unwrap();
+        let hip_2d = concat_last_dim_2d_hip_on_gpu(&mut gpu, &left_2d, &right_2d).unwrap();
+        assert_eq!(hip_2d, cpu_2d);
+
+        let left_3d = CpuTensor {
+            shape: vec![2, 3, 2],
+            data: (0..12).map(|idx| idx as f32 / 6.0 - 1.0).collect(),
+        };
+        let right_3d = CpuTensor {
+            shape: vec![2, 3, 4],
+            data: (0..24).map(|idx| (idx as f32 % 11.0 - 5.0) / 8.0).collect(),
+        };
+        let cpu_3d = concat_last_dim_3d(&left_3d, &right_3d).unwrap();
+        let hip_3d = concat_last_dim_3d_hip_on_gpu(&mut gpu, &left_3d, &right_3d).unwrap();
+        assert_eq!(hip_3d, cpu_3d);
     }
 
     #[cfg(feature = "rocm")]
