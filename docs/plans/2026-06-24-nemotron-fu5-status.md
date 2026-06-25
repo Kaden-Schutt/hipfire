@@ -287,12 +287,27 @@ introduces a new **'E' (MoE) block**. The first bounded slice is now in place:
   `(23 M / 6 * / 0 - / 23 E)`. Greedy closed-think 2+2 currently generates an
   8-token comma loop (`,,,,,,,,`), so serving ingress is wired but coherence is
   still not validated.
+- A Lyra real-Mamba Transformers reference for the same 30B checkpoint and the
+  same closed-think 2+2 prompt IDs completed on gfx1151:
+  `/tmp/nemotron30b_lyra_real_closed2p2.npz` plus
+  `/tmp/nemotron30b_lyra_real_closed2p2.meta.json`. The rendered prompt hash is
+  `15b33ada01389ee985aa13f846b8e9f9efcc2a5375e9528da8e5bc313789107a`; the
+  reference final top-5 is `[1052, 31035, 1784, 1050, 31106]`
+  (`4`, `Four`, `The`, `2`, `Answer`) with generated token `1052` (`4`) and
+  top-2 margin 3.125. The run used `torch=2.12.0a0+rocm7.13.0a20260411`,
+  `mamba_import=real`, `mamba_reference=remote`, and restored 23 trained
+  `dt_bias` tensors.
+- The current 30B HFQ artifact is not close at that boundary:
+  `test_load_nano30b_hfq` over the same 29 prompt IDs reports final argmax
+  `1044` at every position, matching the daemon's comma loop. This makes the
+  immediate FU6 blocker a concrete BF16-reference-vs-HFQ divergence, not a
+  tokenizer or prompt-rendering mismatch.
 
-Remaining FU6 work is coherence and throughput at 30B scale: compare the comma
-loop against a reference boundary, decide whether the ingress policy is too
-lossy or a convention mismatch, and add a batched/expert-sorted MoE prefill path
-if 30B prefill throughput matters. The current policy is an ingress policy, not
-a quality-promoted calibration policy; router tensors are Q8-protected, but
+Remaining FU6 work is coherence and throughput at 30B scale: bisect the 30B
+HFQ-vs-BF16 first-token divergence, decide whether the ingress policy is too
+lossy, and add a batched/expert-sorted MoE prefill path if 30B prefill
+throughput matters. The current policy is an ingress policy, not a
+quality-promoted calibration policy; router tensors are Q8-protected, but
 expert promotion still needs router-hit and quality evidence before any "better
 than baseline" claim.
 

@@ -293,13 +293,17 @@ artifact now exists at
    `vocab=131072`; stderr reports `(23 M / 6 * / 0 - / 23 E)`. Greedy
    closed-think 2+2 currently emits an 8-token comma loop, so generation is
    wired but not coherent.
-7. **Remaining:** compare the comma-loop boundary against a 30B reference,
-   decide whether this ingress policy is too lossy or there is a generation
-   convention mismatch, and add a batched expert-sorted MoE prefill path if 30B
-   prefill throughput matters. Current `can_batched_prefill()` is false when any
-   `E` block is present. The artifact policy is still an ingress policy, not a
-   quality-promoted calibration policy; expert promotion needs router-hit and
-   quality deltas.
+7. **Done for 30B BF16 reference boundary:** Lyra real-Mamba Transformers on the
+   same prompt IDs generates token `1052` (`4`) with final top-5
+   `[1052, 31035, 1784, 1050, 31106]`. The current Hipfire 30B HFQ artifact
+   returns argmax `1044` at the same final boundary, matching the daemon comma
+   loop.
+8. **Remaining:** bisect the 30B HFQ-vs-BF16 first-token divergence, decide
+   whether this ingress policy is too lossy, and add a batched expert-sorted MoE
+   prefill path if 30B prefill throughput matters. Current
+   `can_batched_prefill()` is false when any `E` block is present. The artifact
+   policy is still an ingress policy, not a quality-promoted calibration policy;
+   expert promotion needs router-hit and quality deltas.
 
 **Reuse.** qwen35/lfm2moe MoE kernels + routing (the big lever); the existing
 M/*/- blocks unchanged.
@@ -319,7 +323,8 @@ passes on gfx1151 with max|Δ|=4.47e-8 against the CPU oracle.
 /home/sadara/.hipfire/models/nemotron-3-nano-30b-a3b-mq4.hfq` loads the real
 30B HFQ artifact and decodes two tokens: final argmax=1044. The daemon JSONL
 path also load/generate/unloads the artifact, but greedy closed-think 2+2 emits
-`,,,,,,,,`; remaining validation is coherent generation against a 30B reference.
+`,,,,,,,,`. Lyra real-Mamba BF16 for the same prompt generates `4`, so remaining
+validation is first-divergence bisect and a better ingress/calibrated policy.
 Also `MEMEM*E…` has runs like `EM` and `M*` — confirm the flat-block residual
 handles consecutive same-FFN/mixer blocks (it does; each char is its own
 residual block).
