@@ -1,12 +1,12 @@
-//! oq4_repack — repackage a canonical OQ4 `.hfq` into the arch-optimal weight
+//! oq4_repack — repackage a canonical OP4 `.hfq` into the arch-optimal weight
 //! layout ahead of load time.
 //!
-//! Canonical OQ4 stores each weight as quant_type 34 (`[f16 scale][128 nibbles]`
+//! Canonical OP4 stores each weight as quant_type 34 (`[f16 scale][128 nibbles]`
 //! per 256-group, row-contiguous) — the portable, arch-independent form that
 //! ships everywhere. At load the qwen3.5 loader repacks each such tensor into the
 //! arch *combined* device layout (split nibbles + split scales + interleaved
 //! decode records). This tool performs that transform ONCE, writing a derived
-//! `.hfq` whose OQ4 tensors are stored pre-packed as quant_type 37; the loader
+//! `.hfq` whose OP4 tensors are stored pre-packed as quant_type 37; the loader
 //! then uploads them verbatim with no per-load repack.
 //!
 //! Design (matches the "general on disk, arch-optimal in use" split):
@@ -21,8 +21,8 @@
 //!     device allocation — no page-cache shadow copy in the shared pool.
 //!
 //! The transform itself is `hipfire_arch_qwen35::qwen35::oq4_pack_arch_combined`,
-//! the SAME function the loader's qt=34 path calls, so the tool and the loader
-//! can never drift.
+//! the SAME function the loader's qt=34 (OP4) path calls, so the tool and the
+//! loader can never drift.
 //!
 //! Usage:
 //!   oq4_repack <in.hfq> [-o <out.hfq>] [--arch <gfx>]
@@ -34,7 +34,7 @@ use std::path::PathBuf;
 use hipfire_arch_qwen35::qwen35::{oq4_pack_arch_combined, OQ4_ARCH_PACKED_QT};
 use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqFile, HfqMemTensor};
 
-/// Canonical (general, portable) on-disk OQ4 quant_type.
+/// Canonical (general, portable) on-disk OP4 quant_type.
 const CANONICAL_OQ4_QT: u8 = 34;
 
 /// Best-effort live GPU arch probe (e.g. "gfx1103"). Read-only
@@ -102,7 +102,7 @@ fn main() {
     });
 
     // Default output is arch-tagged beside the input: `<stem>.<arch>.hfq`
-    // (e.g. qwen3.5-0.8b-oq4+.hfq -> qwen3.5-0.8b-oq4+.gfx1103.hfq). file_stem
+    // (e.g. qwen3.5-0.8b-op4+.hfq -> qwen3.5-0.8b-op4+.gfx1103.hfq). file_stem
     // strips only the trailing `.hfq`, so dotted model versions survive.
     let output = output.unwrap_or_else(|| {
         let stem = input
@@ -152,11 +152,11 @@ fn main() {
             .unwrap_or_else(|| panic!("tensor data not found: {}", info.name));
 
         if info.quant_type == CANONICAL_OQ4_QT {
-            // OQ4 weight matrices are stored [m, k] = [out, in].
+            // OP4 weight matrices are stored [m, k] = [out, in].
             assert_eq!(
                 info.shape.len(),
                 2,
-                "OQ4 tensor {} expected 2D [m,k], got shape {:?}",
+                "OP4 tensor {} expected 2D [m,k], got shape {:?}",
                 info.name,
                 info.shape
             );
@@ -187,7 +187,7 @@ fn main() {
 
     if repacked == 0 {
         eprintln!(
-            "warning: no OQ4 (quant_type {CANONICAL_OQ4_QT}) tensors found in {} — nothing to repack",
+            "warning: no OP4 (quant_type {CANONICAL_OQ4_QT}) tensors found in {} — nothing to repack",
             input.display()
         );
     }
@@ -200,7 +200,7 @@ fn main() {
     );
 
     eprintln!(
-        "oq4_repack: {} -> {}\n  repacked {repacked} OQ4 tensor(s) (qt {CANONICAL_OQ4_QT} -> {OQ4_ARCH_PACKED_QT}), copied {copied} other(s)\n  OQ4 weight bytes {canon_bytes} -> {packed_bytes} on disk (combined layout incl. interleaved decode region)",
+            "oq4_repack: {} -> {}\n  repacked {repacked} OP4 tensor(s) (qt {CANONICAL_OQ4_QT} -> {OQ4_ARCH_PACKED_QT}), copied {copied} other(s)\n  OP4 weight bytes {canon_bytes} -> {packed_bytes} on disk (combined layout incl. interleaved decode region)",
         input.display(),
         output.display()
     );

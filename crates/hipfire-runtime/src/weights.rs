@@ -338,8 +338,12 @@ mod preflight_tests {
                 "q8" => DType::Q8_0,
                 "mq4" => DType::MQ4G256,
                 "mq6" => DType::MQ6G256,
-                "oq4" => DType::Oq4G256,
-                "oq8" => DType::Oq8G256,
+                "op4" => DType::Oq4G256,
+                "op4-4" => DType::Oq4G256,
+                "op4-4+" => DType::Oq4G256,
+                "op8" => DType::Oq8G256,
+                "op8-16" => DType::Oq8G256,
+                "op4-8+" => DType::Oq4G256,
                 "mq3" => DType::MQ3G256,
                 _ => return None,
             })
@@ -546,10 +550,10 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
         // Weight buffer holds [packed nibbles | per-group f32 scales]; the scale
         // pointer is a sub_offset view (see the qt=32 loader arm).
         DType::Oq4G256 => {
-            // OQ4+ decode (B=1), mq4-style W4A16: FWHT-rotate the activation, then
+            // OP4+ decode (B=1), mq4-style W4A16: FWHT-rotate the activation, then
             // consume the f32 rotated activation DIRECTLY in gemv_oq4_grouped
             // (4-bit-resident weight unpacked inline). No quantize_act_oq4 launch
-            // and no WMMA N-tile waste; reads half the bytes of OQ8+. The iu4 WMMA
+            // and no WMMA N-tile waste; reads half the bytes of OP8+.
             // GEMM stays the batched-prefill path. Matches execute_steps decode.
             const GROUP: usize = 256;
             assert_eq!(w.k % GROUP, 0, "Oq4G256 weight_gemv: K must be % 256");

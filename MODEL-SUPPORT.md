@@ -15,7 +15,7 @@ This is the **canonical model-support matrix** for hipfire. It tracks what is
   family roster (that lives in `docs/plans/2026-06-19-arch-roster-feature-matrix.md`).
 - **Quant formats** and their weight/activation/calibration tradeoffs:
   `docs/quant-formats/opus-mqplus-eval-plan.md`. Canonical names: **Magnum**=MQ4 /
-  **Magnum Plus**=MQ+ (both W4A8) · **Opus Quant**=OQ4 (W4A4) / **Opus Plus**=Opus-A8
+  **Magnum Plus**=MQ+ (both W4A8) · **Opus Quant**=OP4-4 (W4A4) / **Opus Plus**=OP4-8+
   (W4A8). "Plus" = clip-search + SmoothQuant calibration; Opus = symmetric-int4 weights.
 - **Per-quant × per-GPU-arch kernel coverage** (which formats have tuned
   decode/prefill/WMMA kernels vs generic fallback): see "Kernel coverage" below.
@@ -59,8 +59,8 @@ Machine-readable subset consumed by `arch_features` / admission. Edit `docs/mode
 | q8 (Q8 (W8A16)) | 8 | 16 | stable |
 | mq4 (Magnum / MQ4 (W4A16)) | 4 | 16 | stable |
 | mq6 (Magnum / MQ6 (W6A16)) | 6 | 16 | stable |
-| oq4 (Opus / OQ4+ (4-bit-resident; W4A16 decode, W4A4 batched prefill)) | 4 | 4 | opt-in |
-| oq8 (Opus / OQ8+ (W4A8, 4-bit weights int8-resident)) | 4 | 8 | opt-in |
+| op4 (Opus / OP4-4 (4-bit weights / int4 activations)) | 4 | 4 | opt-in |
+| op8 (Opus / OP8-16 (8-bit weights / 8-bit activations)) | 8 | 8 | opt-in |
 | mq3 (Magnum / MQ3 (W3A16, mixed-precision only)) | 3 | 16 | experimental |
 
 ### Intentional gates (generated)
@@ -69,8 +69,8 @@ Per-quant overrides of an arch capability (admission consults these before green
 
 | Arch | Quant | Feature | Support | Note |
 |---|---|---|---|---|
-| 5 | oq4 | prefill | 🟡 | W4A4 (OQ4) batched prefill is parity-gated / opt-in (HIPFIRE WMMA path) |
-| 5 | oq8 | prefill | 🟡 | W8A8 (OQ8) batched-prefill WMMA path is experimental / parity-gated |
+| 5 | op4 | prefill | 🟡 | OP4 (opus) batched prefill is parity-gated / opt-in (HIPFIRE WMMA path) |
+| 5 | op8 | prefill | 🟡 | OP8/OP8-16 route for W8A8-style bm path is experimental / parity-gated |
 <!-- END GENERATED model-support -->
 
 ## Feature matrix vs flagship qwen3.5

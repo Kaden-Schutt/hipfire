@@ -84,7 +84,7 @@ use twox_hash::XxHash64;
 // derive per-channel `RMS_act` for the smoothing-quant scale.
 static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 
-// `--ldlq`: full-Hessian error-feedback (GPTQ/OBS) weight quant for oq4. When
+// `--ldlq`: full-Hessian error-feedback (GPTQ/OBS) weight quant for OP4.
 // set, the Oq4 arm reads the tensor's full [K,K] Hessian from this index and
 // runs `ldlq::oq4_ldlq_pack` instead of plain RTN `quantize_oq4g256`. Opened from
 // the `--hessian` path (HFHS-v1, which carries the full [K,K], not just the
@@ -2930,13 +2930,11 @@ impl HfqInputFormat {
             "mq6" | "mq6g256" => Some(Self::Mq6),
             "mq3" | "mq3g256" => Some(Self::Mq3),
             "qtip3" => Some(Self::Qtip3),
-            "oq4" | "oq4g256" | "opus" => Some(Self::Oq4),
-            "oq+" | "oqplus" | "oq4+" | "opus-plus" | "opusplus" | "opus+" | "opusa8" | "oq4a8" => {
-                Some(Self::OqPlus)
-            }
-            "oq+t" | "oqplus-tiered" | "oq+8" | "opus-plus-tiered" => Some(Self::OqPlusTiered),
-            "oq+c" | "oqplus-compact" | "oq+4" | "opus-plus-compact" => Some(Self::OqPlusCompact),
-            "oq8" | "oq8g256" | "opus8" => Some(Self::Oq8),
+            "op4" | "op4-4" | "op4g256" | "op4+" | "op4-4+" | "op4-8+" => Some(Self::Oq4),
+            "opplus" | "op4-plus" => Some(Self::OqPlus),
+            "op4+t" | "opplus-tiered" | "op4-tiered" => Some(Self::OqPlusTiered),
+            "op4+c" | "opplus-compact" | "op4-compact" => Some(Self::OqPlusCompact),
+            "op8" | "op8-16" | "op8g256" | "op8-plus" => Some(Self::Oq8),
             _ => None,
         }
     }
@@ -4724,7 +4722,7 @@ INPUT SOURCES (--input):
     <file.hfq>    an existing .hfq (e.g. a bf16 .hfq) for requantization.
                   The .hfq-source path supports --format
                   bf16 / fp16 / q8f16 / hfq4 / hfq6 / mq4 / mq6 / mq3 / qtip3 /
-                  oq4 (opus) / oq8 (opus8).
+                  op4 (opus) / op8 (opus8).
                   Other formats (roughquant, lloyd-*, mfp4, …) require a HF/GGUF source.
 
 REQUIRED:
@@ -4734,13 +4732,13 @@ REQUIRED:
 FORMAT (--format <FMT>, default: q8f16):
     Full precision     bf16 (bfloat16) · fp16 (f16/float16) · f32 (oracle/passthrough)
     Production quant   q8f16 (q8) · mq4 (magnum) · mq6 · mq3 · hfq4 · hfq6 · mfp4 (hfp4g32) · q8hfq
-    Opus Quant         oq4 (alias: opus) — 4-bit-resident Opus Quant.
-                       oq4+ is oq4 plus AWQ+LDLQ calibration; it requires
+    Opus Quant         op4 / op4-4 (alias: opus) — 4-bit-resident Opus Quant.
+                       op4+ / op4-4+ is op4 plus AWQ+LDLQ calibration; it requires
                        --awq --ldlq --hessian and should be used only for
                        quality-gated plus artifacts.
-                       oq8 (alias: opus8) — 8-bit Opus Quant.
-    Legacy Opus-A8     oqplus / oq+ / opusplus — older W4A8 experimental tag
-                       (qt=33), distinct from oq4+.
+                       op8 / op8-16 (alias: opus8) — 8-bit Opus Quant.
+    Legacy Opus-A8     opplus / op4-plus — older W4A8 experimental tag
+                       (qt=33), distinct from op4+.
     MoE / routed       mq4-mq6exp · mq4-routed-lloyd-mq-tiered (needs --imatrix) · antirez-mq · …
     Research (gated)   mq2 · lloyd-mq2 · lloyd-mq3 · lloyd-mq4 · qtip3 · qtip3-sim ·
                        roughquant (rq) · roughquant{{2,3,4}}-sim · permute5 (rq5)
@@ -4752,7 +4750,7 @@ OPTIONS:
     --imatrix <PATH>           llama.cpp imatrix GGUF; enables importance-weighted Lloyd and AWQ
     --awq                      activation-aware weight pre-scaling (alpha=0.55); requires --imatrix
     --awq-alpha <F>            enable AWQ at an explicit alpha (overrides the 0.55 default)
-    --ldlq                     oq4 only: full-Hessian (GPTQ/OBS) error-feedback int4
+    --ldlq                     op4 only: full-Hessian (GPTQ/OBS) error-feedback int4
                                weights instead of RTN; requires --hessian. Composes
                                with --awq (smooths activations + rebases the Hessian)
     --chat-template-file <P>   override the embedded chat template (Jinja file)
@@ -4858,25 +4856,21 @@ fn main() {
 
     let format_arg = arg_value(&args, "--format").unwrap_or("q8f16");
     let mut format_storage = normalize_format_flag(format_arg);
-    // OQ4+ is not a separate storage tag: it is OQ4 with the calibrated
-    // AWQ+LDLQ recipe. Normalize it to OQ4, then enforce the required flags
+    // OP4+ is not a separate storage tag: it is OP4 with the calibrated
+    // AWQ+LDLQ recipe. Normalize it to OP4, then enforce the required flags
     // after argument parsing has loaded calibration sidecars.
-    let oq4_plus_recipe = format_storage == "oq4+";
-    if oq4_plus_recipe {
-        format_storage = "oq4".to_string();
+    let op4_plus_recipe = matches!(format_storage.as_str(), "op4+" | "op4-4+" | "op4-8+");
+    if op4_plus_recipe {
+        format_storage = "op4".to_string();
     }
-    // OQ+ / Opus Plus is a distinct W4A8 FORMAT, not the generic `+` (clip+AWQ)
-    // modifier. Canonicalize its `+`-spellings to `oqplus` BEFORE the mq_plus
-    // strip below, so the `+` isn't consumed (which would leave a bare `oq`) and
-    // so calibration-free OQ+ doesn't trip the AWQ-needs-imatrix guard. Clip-search
-    // is unconditional in the Opus codec; AWQ stays opt-in via --awq --imatrix.
-    if matches!(format_storage.as_str(), "oq+" | "opus+") {
-        format_storage = "oqplus".to_string();
-    }
+    // Legacy Opus-A8 is a distinct W4A8 FORMAT, not the generic `+`
+    // clip/AWQ modifier and not calibrated OP4+.
+    let is_legacy_opus_plus = matches!(format_storage.as_str(), "opplus" | "op4-plus");
     // `mqN+` modifier: clip-search + AWQ on top of the base MQ format. Strip the
     // trailing `+` so downstream format matching sees the base (e.g. "mq4"), and
     // enable clip-search globally. AWQ is auto-enabled below.
-    let mq_plus = format_storage.ends_with('+');
+    // MQ+ keeps the generic `+` suffix; calibrated OP4+ was normalized above.
+    let mq_plus = format_storage.ends_with('+') && !op4_plus_recipe && !is_legacy_opus_plus;
     if mq_plus {
         format_storage.pop();
         let _ = MQ_CLIPSEARCH.set(true);
@@ -5079,8 +5073,8 @@ fn main() {
     let use_q4k_all = format == "q4k";
     let use_q4k_q8embed = format == "q4k-q8embed";
     let use_mq8g256 = format == "mq8" || format == "mq8g256";
-    let use_oq4 = format == "oq4" || format == "oq4g256" || format == "opus";
-    let use_oq8 = format == "oq8" || format == "oq8g256" || format == "opus8";
+    let use_oq4 = format == "op4" || format == "op4-4" || format == "op4g256" || format == "opus";
+    let use_oq8 = format == "op8" || format == "op8-16" || format == "op8g256" || format == "opus8";
     // DeepSeek V4 recipe (2026-05-20): routed experts → MQ2-Lloyd, every other
     // 2D weight → Q8F16, with norms/biases/HC matrices falling through
     // to the F16 fallback path via `should_quantize() == false`.
@@ -5430,7 +5424,7 @@ fn main() {
         }
     }
 
-    // --ldlq: full-Hessian error-feedback weight quant (oq4 only, for now).
+    // --ldlq: full-Hessian error-feedback weight quant (op4 only, for now).
     // Loads the full [K,K] payloads from the SAME --hessian HFHS-v1 file the AWQ
     // diagonal came from. Requires --hessian; ignored (with a warning) otherwise.
     if args.iter().any(|a| a == "--ldlq") {
@@ -5478,13 +5472,13 @@ fn main() {
     // in this patch.
     let awq_enabled =
         mq_plus || args.iter().any(|a| a == "--awq") || args.iter().any(|a| a == "--awq-alpha");
-    if oq4_plus_recipe
+    if op4_plus_recipe
         && (!awq_enabled
             || !args.iter().any(|a| a == "--ldlq")
             || !args.iter().any(|a| a == "--hessian"))
     {
         eprintln!(
-            "error: --format oq4+ means calibrated OQ4+ and requires --awq --ldlq --hessian <HFHS .hessian.bin>; use --format oq4 for uncalibrated OQ4"
+            "error: --format op4+ means calibrated OP4+ and requires --awq --ldlq --hessian <calib .hfq>; use --format op4 for uncalibrated OP4"
         );
         std::process::exit(1);
     }
@@ -11727,7 +11721,7 @@ mod tests {
     fn format_flags_are_canonicalized_before_dispatch() {
         assert_eq!(normalize_format_flag(" BF16 "), "bf16");
         assert_eq!(normalize_format_flag("Mq4G256"), "mq4g256");
-        assert_eq!(normalize_format_flag("oq4+"), "oq4+");
+        assert_eq!(normalize_format_flag("op4+"), "op4+");
     }
 
     #[test]
@@ -11738,6 +11732,35 @@ mod tests {
         );
         assert_eq!(HfqInputFormat::from_flag("q8"), Some(HfqInputFormat::Q8F16));
         assert_eq!(HfqInputFormat::from_flag("mq4"), Some(HfqInputFormat::Mq4));
+        assert_eq!(HfqInputFormat::from_flag("op4"), Some(HfqInputFormat::Oq4));
+        assert_eq!(
+            HfqInputFormat::from_flag("op4-4"),
+            Some(HfqInputFormat::Oq4)
+        );
+        assert_eq!(HfqInputFormat::from_flag("op4+"), Some(HfqInputFormat::Oq4));
+        assert_eq!(
+            HfqInputFormat::from_flag("op4-4+"),
+            Some(HfqInputFormat::Oq4)
+        );
+        assert_eq!(
+            HfqInputFormat::from_flag("op4-8+"),
+            Some(HfqInputFormat::Oq4)
+        );
+        assert_eq!(
+            HfqInputFormat::from_flag("op4+t"),
+            Some(HfqInputFormat::OqPlusTiered)
+        );
+        assert_eq!(
+            HfqInputFormat::from_flag("op4+c"),
+            Some(HfqInputFormat::OqPlusCompact)
+        );
+        assert_eq!(HfqInputFormat::from_flag("op8"), Some(HfqInputFormat::Oq8));
+        assert_eq!(
+            HfqInputFormat::from_flag("op8-16"),
+            Some(HfqInputFormat::Oq8)
+        );
+        assert_eq!(HfqInputFormat::from_flag("oq4"), None);
+        assert_eq!(HfqInputFormat::from_flag("oq8"), None);
         assert_eq!(
             HfqInputFormat::from_flag("bf16"),
             Some(HfqInputFormat::Bf16)

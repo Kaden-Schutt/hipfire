@@ -175,16 +175,16 @@ pub const QUANT_TABLE: &[QuantInfo] = &[
         status: "stable",
     },
     QuantInfo {
-        name: "oq4",
-        label: "Opus Quant / OQ4 (4-bit-resident; W4A16 decode, W4A4 batched prefill)",
+        name: "op4",
+        label: "Opus / OP4-4 (4-bit weights / int4 activations)",
         weight_bits: 4,
         act_bits: 4,
         status: "opt-in",
     },
     QuantInfo {
-        name: "oq8",
-        label: "Opus Quant / OQ8",
-        weight_bits: 4,
+        name: "op8",
+        label: "Opus / OP8-16 (8-bit weights / 8-bit activations)",
+        weight_bits: 8,
         act_bits: 8,
         status: "opt-in",
     },
@@ -210,16 +210,16 @@ pub struct GateRow {
 pub const GATE_TABLE: &[GateRow] = &[
     GateRow {
         arch: 5,
-        quant: "oq4",
+        quant: "op4",
         feature: "prefill",
         support: FeatureSupport::Partial,
-        note: "W4A4 (OQ4) batched prefill is parity-gated / opt-in (HIPFIRE WMMA path)",
+        note: "OP4 (opus) batched prefill is parity-gated / opt-in (HIPFIRE WMMA path)",
     },
     GateRow {
         arch: 5,
-        quant: "oq8",
+        quant: "op8",
         feature: "prefill",
         support: FeatureSupport::Partial,
-        note: "W8A8 (OQ8) batched-prefill WMMA path is experimental / parity-gated",
+        note: "OP8/OP8-16 route for W8A8-style bm path is experimental / parity-gated",
     },
 ];

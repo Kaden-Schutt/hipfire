@@ -671,13 +671,14 @@ pub struct Sidecars {
 }
 
 /// Quant/format token of a model display name. Scans `-`-delimited segments for
-/// a known format prefix (mq4, oq4, qtip3, q8, bf16, …) so calibration modifiers
-/// that trail the format (e.g. `oq4-ldlq`) don't mask it; falls back to the last
+/// a known format prefix (mq4, op4, op8, op4-4, op8-16, qtip3, q8, bf16, …) so
+/// calibration modifiers that trail the format (e.g. `op4-ldlq`) don't mask it; falls
+/// back to the last
 /// segment. A bundled `+feature` suffix is stripped.
 pub fn quant_token(display: &str) -> String {
     const FORMATS: &[&str] = &[
-        "bf16", "fp16", "f16", "q8", "mq2", "mq3", "mq4", "mq6", "mq8", "oq4", "oq8", "qtip2",
-        "qtip3", "iu8", "w4a8", "w8a8",
+        "bf16", "fp16", "f16", "q8", "mq2", "mq3", "mq4", "mq6", "mq8", "op4", "op4-4", "op4-8+",
+        "op8", "op8-16", "op4+", "op8+", "qtip2", "qtip3", "iu8", "w4a8", "w8a8",
     ];
     let mut best: Option<&str> = None;
     for seg in display.split('-') {
@@ -687,16 +688,26 @@ pub fn quant_token(display: &str) -> String {
             best = Some(head);
         }
     }
-    best.map(str::to_string).unwrap_or_else(|| {
-        display
-            .rsplit('-')
-            .next()
-            .unwrap_or(display)
-            .split('+')
-            .next()
-            .unwrap_or(display)
-            .to_string()
-    })
+    let token = best
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            display
+                .rsplit('-')
+                .next()
+                .unwrap_or(display)
+                .split('+')
+                .next()
+                .unwrap_or(display)
+                .to_string()
+        })
+        .to_ascii_lowercase();
+    match token.as_str() {
+        "op4" => "op4-4".to_string(),
+        "op8" => "op8-16".to_string(),
+        "op4+" => "op4-4+".to_string(),
+        "op8+" => "op8-16+".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// Detect template + sidecar artifacts for a primary model file (GPU-free:

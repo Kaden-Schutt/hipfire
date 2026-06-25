@@ -6,7 +6,7 @@ quant-type id and artifact), not a flag on MQ4.
 
 **Canonical names (2026-06-23):**
 - **Magnum** = MQ4 · **Magnum Plus** = MQ+ (both W4A8 / iu8; "Plus" = clip-search + SmoothQuant calibration).
-- **Opus Quant** = OQ4 (W4A4 / iu4) · **Opus Plus** = **Opus-A8** (W4A8 / iu8 —
+- **Opus Quant** = OP4-4 (W4A4 / iu4) · **Opus Plus** = **OP4-8+** (W4A8 / iu8 —
   symmetric int4 weights expanded to int8 for `V_WMMA_I32_16X16X16_IU8`).
   "Opus-A8" is the legacy internal name; **Opus Plus** is the canonical name.
 
@@ -29,11 +29,11 @@ its own `HfqInputFormat` keeps it separate from MQ4 per the directive.
 > **Status (2026-06-20):** build order diverged from the "MQ+ first" plan below —
 > **Opus Quant (id 34) was built first** (the W4A4 compute stack was the open
 > question). Shipped: `QuantType::Oq4G256 = 34` + `HfqInputFormat::Oq4`
-> (`--format oq4`, HFQ-source pipeline, rotation-only; AWQ-smooth sidecar TBD),
+> (`--format op4`, `--format op4-4`, HFQ-source pipeline, rotation-only; AWQ-smooth sidecar TBD),
 > `DType::Oq4G256` + qwen35 loader (qt=34), and the **decode** forward dispatch
 > (`weight_gemv` Oq4G256 arm). Validated: e2e GPU capstone 19–22 dB
 > (`validate_opus_w4a4_e2e`), decode parity 15–17 dB rotation-only
-> (`oq4_weight_gemv_parity`), and `qwen3.5-0.8b-oq4.hfq` emits (537.8 MB).
+> (`oq4_weight_gemv_parity`), and `qwen3.5-0.8b-op4-4.hfq` emits (537.8 MB).
 > **Still open:** prefill-batched/all-site routing (fused QKV/gate-up have no
 > Oq4 variant → needs an unfused Oq4 fallback or fused siblings — an
 > architecture decision), then 4B coherence. ids 32 (MQ+) / 33 (Opus Plus / Opus-A8) remain

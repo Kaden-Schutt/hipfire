@@ -82,7 +82,7 @@ Takes a canonical (general, portable) .hfq and writes an arch-tagged
 arch's kernels want — so the model loads with no per-load repack. The canonical
 file is the source of truth and is never modified.
 
-Currently repacks OQ4 (Opus W4A4) tensors into the combined interleaved-decode
+Currently repacks Opus W4A4 (op4 / op4-4) tensors into the combined interleaved-decode
 layout (quant_type 34 -> 37). Other tensors are copied through.
 
 Usage:
@@ -90,7 +90,7 @@ Usage:
 
   --arch defaults to the live GPU (probed read-only). Default output is
   <model>.<arch>.hfq beside the input, e.g.
-    qwen3.5-0.8b-oq4+.hfq -> qwen3.5-0.8b-oq4+.gfx1103.hfq
+    qwen3.5-0.8b-op4.hfq -> qwen3.5-0.8b-op4.gfx1103.hfq
 
 Build runner:
   cargo build --release -p hipfire-runtime --example oq4_repack"#;
