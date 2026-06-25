@@ -61,8 +61,10 @@ enum Command {
     /// img2img also honors WebUI's `inpainting_mask_invert`, `mask_blur`,
     /// `mask_blur_x`, `mask_blur_y`, `mask_round`, and `inpainting_fill`
     /// options; latent noise (2) and latent nothing (3) modes are applied in
-    /// latent space. Txt2img high-res generation is implemented as a batched
-    /// first-pass txt2img
+    /// latent space. WebUI's `inpaint_full_res` and
+    /// `inpaint_full_res_padding` crop masked regions for processing and
+    /// composite the generated crop back onto the init image. Txt2img high-res
+    /// generation is implemented as a batched first-pass txt2img
     /// generation followed by a second-pass img2img generation at the high-res
     /// target dimensions. SDAPI high-res requests accept `enable_hr`,
     /// `firstphase_width`,

@@ -226,6 +226,8 @@ try:
         raise RuntimeError(f"masked img2img mode/masked info wrong: {masked_info}")
     if masked_info.get("inpainting_fill") != 2 or masked_info.get("masked_content") != "latent noise":
         raise RuntimeError(f"masked img2img inpainting_fill info wrong: {masked_info}")
+    if masked_info.get("inpaint_full_res") is not True:
+        raise RuntimeError(f"masked img2img inpaint_full_res info wrong: {masked_info}")
 
     progress = fetch_json(f"{base_url}/sdapi/v1/progress", timeout=10.0)
     if progress.get("state", {}).get("interrupted"):

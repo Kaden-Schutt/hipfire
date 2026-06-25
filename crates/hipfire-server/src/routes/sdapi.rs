@@ -6,11 +6,11 @@ use axum::{
 use base64::Engine;
 use hipfire_config::models_dir;
 use hipfire_diffusion::{
-    inspect_hfq, inspect_hfq_with_runtime_support, resize_rgb_batch_nearest,
-    resize_rgb_batch_to_contain_fill_nearest, resize_rgb_batch_to_cover_nearest,
-    DiffusionBatchOutput, DiffusionBatchRequest, DiffusionError, DiffusionGenerationRuntimeOptions,
-    DiffusionHfqInspection, DiffusionImg2ImgRequest, DiffusionPipeline, DiffusionProgress,
-    DiffusionPrompt, RgbImageBatch,
+    encode_rgb_batch_png_base64, inspect_hfq, inspect_hfq_with_runtime_support,
+    resize_rgb_batch_nearest, resize_rgb_batch_to_contain_fill_nearest,
+    resize_rgb_batch_to_cover_nearest, DiffusionBatchOutput, DiffusionBatchRequest, DiffusionError,
+    DiffusionGenerationRuntimeOptions, DiffusionHfqInspection, DiffusionImg2ImgRequest,
+    DiffusionPipeline, DiffusionProgress, DiffusionPrompt, RgbImageBatch,
 };
 use image::ImageEncoder;
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,30 @@ use crate::routes::chat::{execute_blocking_chat, ChatMessage, ChatRequest};
 use crate::state::{SdapiProgressState, SharedState};
 
 const COMPAT_SAMPLER: &str = "Hipfire";
+
+#[derive(Debug, Clone)]
+struct SdapiInpaintFullResPlan {
+    base_image: RgbImageBatch,
+    overlay_mask: RgbImageBatch,
+    paste_region: SdapiCropRegion,
+    padding: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SdapiCropRegion {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+#[derive(Debug)]
+struct SdapiPreparedImg2Img {
+    init_image: RgbImageBatch,
+    mask: Option<RgbImageBatch>,
+    processing_dimensions: (u32, u32),
+    full_res_plan: Option<SdapiInpaintFullResPlan>,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SdGenerationRequest {
@@ -64,6 +88,8 @@ pub struct SdGenerationRequest {
     pub mask_round: Option<Value>,
     pub inpainting_mask_invert: Option<Value>,
     pub inpainting_fill: Option<Value>,
+    pub inpaint_full_res: Option<Value>,
+    pub inpaint_full_res_padding: Option<Value>,
     pub resize_mode: Option<u32>,
     pub include_init_images: Option<bool>,
     pub denoising_strength: Option<f64>,
@@ -517,10 +543,6 @@ async fn execute_hfq_diffusion_img2img(
         Ok(dimensions) => dimensions,
         Err(error) => return diffusion_error_response(error),
     };
-    let init_image = match sdapi_img2img_resize_image(&body, init_image, target_dimensions) {
-        Ok(image) => image,
-        Err(error) => return diffusion_error_response(error),
-    };
     let mask = match body
         .mask
         .as_ref()
@@ -530,17 +552,11 @@ async fn execute_hfq_diffusion_img2img(
         Ok(mask) => mask,
         Err(error) => return diffusion_error_response(error),
     };
-    let mask = match mask
-        .map(|mask| {
-            sdapi_apply_inpainting_mask_options(&body, mask)
-                .and_then(|mask| sdapi_img2img_resize_image(&body, mask, target_dimensions))
-        })
-        .transpose()
-    {
-        Ok(mask) => mask,
+    let prepared = match sdapi_prepare_img2img_inputs(&body, init_image, mask, target_dimensions) {
+        Ok(prepared) => prepared,
         Err(error) => return diffusion_error_response(error),
     };
-    let default_dimensions = Some(target_dimensions);
+    let default_dimensions = Some(prepared.processing_dimensions);
     let _first_batch = match sd_request_to_diffusion_batch_request(&body, default_dimensions, 0) {
         Ok(request) => request,
         Err(error) => return diffusion_error_response(error),
@@ -567,6 +583,8 @@ async fn execute_hfq_diffusion_img2img(
     );
     let worker_progress_state = progress_state.clone();
     let worker_body = body.clone();
+    let worker_init_image = prepared.init_image.clone();
+    let worker_mask = prepared.mask.clone();
     let output = match tokio::task::spawn_blocking(move || {
         let mut outputs = Vec::with_capacity(n_iter as usize);
         for iter in 0..n_iter {
@@ -580,8 +598,8 @@ async fn execute_hfq_diffusion_img2img(
             }
             let request = DiffusionImg2ImgRequest {
                 batch: iter_batch,
-                init_image: init_image.clone(),
-                mask: mask.clone(),
+                init_image: worker_init_image.clone(),
+                mask: worker_mask.clone(),
                 inpainting_fill,
                 denoising_strength,
             };
@@ -618,6 +636,17 @@ async fn execute_hfq_diffusion_img2img(
         .as_ref()
         .ok()
         .and_then(|output| output.images.first().cloned());
+    let output = output.and_then(|mut output| {
+        if let Some(plan) = prepared.full_res_plan.as_ref() {
+            apply_sdapi_inpaint_full_res_output(&mut output, plan)?;
+        }
+        Ok(output)
+    });
+    let current_image = output
+        .as_ref()
+        .ok()
+        .and_then(|output| output.images.first().cloned())
+        .or(current_image);
     finish_sdapi_progress(&progress_state, output.as_ref().err(), current_image);
     match output {
         Ok(output) => {
@@ -1044,6 +1073,378 @@ fn sdapi_img2img_resize_image(
     }
 }
 
+fn sdapi_prepare_img2img_inputs(
+    body: &SdGenerationRequest,
+    init_image: RgbImageBatch,
+    mask: Option<RgbImageBatch>,
+    target_dimensions: (u32, u32),
+) -> Result<SdapiPreparedImg2Img, DiffusionError> {
+    let Some(mask) = mask else {
+        return Ok(SdapiPreparedImg2Img {
+            init_image: sdapi_img2img_resize_image(body, init_image, target_dimensions)?,
+            mask: None,
+            processing_dimensions: target_dimensions,
+            full_res_plan: None,
+        });
+    };
+    let init_dimensions = (
+        u32::try_from(init_image.width).map_err(|_| {
+            DiffusionError::InvalidRequest("init image width is out of range".to_string())
+        })?,
+        u32::try_from(init_image.height).map_err(|_| {
+            DiffusionError::InvalidRequest("init image height is out of range".to_string())
+        })?,
+    );
+    let mask = sdapi_apply_inpainting_mask_options(body, mask)?;
+    let mask = if mask.width != init_image.width || mask.height != init_image.height {
+        sdapi_img2img_resize_image(body, mask, init_dimensions)?
+    } else {
+        mask
+    };
+    if sdapi_inpaint_full_res(body) {
+        let padding = sdapi_inpaint_full_res_padding(body)?;
+        if let Some(crop_region) = sdapi_mask_crop_region(&mask, padding)? {
+            let crop_region = sdapi_expand_crop_region(
+                crop_region,
+                target_dimensions,
+                (init_image.width, init_image.height),
+            )?;
+            let cropped_init = sdapi_crop_rgb_batch(&init_image, crop_region)?;
+            let cropped_mask = sdapi_crop_rgb_batch(&mask, crop_region)?;
+            return Ok(SdapiPreparedImg2Img {
+                init_image: resize_rgb_batch_to_contain_fill_nearest(
+                    &cropped_init,
+                    target_dimensions.0,
+                    target_dimensions.1,
+                )?,
+                mask: Some(resize_rgb_batch_to_contain_fill_nearest(
+                    &cropped_mask,
+                    target_dimensions.0,
+                    target_dimensions.1,
+                )?),
+                processing_dimensions: target_dimensions,
+                full_res_plan: Some(SdapiInpaintFullResPlan {
+                    base_image: init_image,
+                    overlay_mask: mask,
+                    paste_region: crop_region,
+                    padding,
+                }),
+            });
+        }
+        return Ok(SdapiPreparedImg2Img {
+            init_image: sdapi_img2img_resize_image(body, init_image, target_dimensions)?,
+            mask: None,
+            processing_dimensions: target_dimensions,
+            full_res_plan: None,
+        });
+    }
+    Ok(SdapiPreparedImg2Img {
+        init_image: sdapi_img2img_resize_image(body, init_image, target_dimensions)?,
+        mask: Some(sdapi_img2img_resize_image(body, mask, target_dimensions)?),
+        processing_dimensions: target_dimensions,
+        full_res_plan: None,
+    })
+}
+
+fn apply_sdapi_inpaint_full_res_output(
+    output: &mut DiffusionBatchOutput,
+    plan: &SdapiInpaintFullResPlan,
+) -> Result<(), DiffusionError> {
+    if output.images.is_empty() {
+        if let Value::Object(map) = &mut output.info {
+            map.insert("inpaint_full_res".to_string(), json!(true));
+            map.insert("inpaint_full_res_padding".to_string(), json!(plan.padding));
+            map.insert(
+                "inpaint_full_res_crop".to_string(),
+                json!([
+                    plan.paste_region.x,
+                    plan.paste_region.y,
+                    plan.paste_region.width,
+                    plan.paste_region.height
+                ]),
+            );
+        }
+        return Ok(());
+    }
+    let generated = decode_sd_init_images(&output.images)?;
+    let composited = sdapi_composite_inpaint_full_res(&generated, plan)?;
+    output.images = encode_rgb_batch_png_base64(&composited)?;
+    if let Value::Object(map) = &mut output.info {
+        map.insert("width".to_string(), json!(plan.base_image.width));
+        map.insert("height".to_string(), json!(plan.base_image.height));
+        map.insert("inpaint_full_res".to_string(), json!(true));
+        map.insert("inpaint_full_res_padding".to_string(), json!(plan.padding));
+        map.insert(
+            "inpaint_full_res_crop".to_string(),
+            json!([
+                plan.paste_region.x,
+                plan.paste_region.y,
+                plan.paste_region.width,
+                plan.paste_region.height
+            ]),
+        );
+    }
+    Ok(())
+}
+
+fn sdapi_composite_inpaint_full_res(
+    generated: &RgbImageBatch,
+    plan: &SdapiInpaintFullResPlan,
+) -> Result<RgbImageBatch, DiffusionError> {
+    sdapi_validate_rgb_batch_len(generated, "generated image")?;
+    sdapi_validate_rgb_batch_len(&plan.base_image, "inpaint base image")?;
+    sdapi_validate_rgb_batch_len(&plan.overlay_mask, "inpaint overlay mask")?;
+    if plan.overlay_mask.batch != 1 && plan.overlay_mask.batch != plan.base_image.batch {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "inpaint overlay mask batch {} must be 1 or match base image batch {}",
+            plan.overlay_mask.batch, plan.base_image.batch
+        )));
+    }
+    let paste_width = u32::try_from(plan.paste_region.width).map_err(|_| {
+        DiffusionError::InvalidRequest("inpaint crop width is out of range".to_string())
+    })?;
+    let paste_height = u32::try_from(plan.paste_region.height).map_err(|_| {
+        DiffusionError::InvalidRequest("inpaint crop height is out of range".to_string())
+    })?;
+    let resized_generated =
+        resize_rgb_batch_to_cover_nearest(generated, paste_width, paste_height)?;
+    let base_image_bytes = plan
+        .base_image
+        .width
+        .checked_mul(plan.base_image.height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| {
+            DiffusionError::InvalidRequest("inpaint base image dimensions overflow".to_string())
+        })?;
+    let crop_image_bytes = plan
+        .paste_region
+        .width
+        .checked_mul(plan.paste_region.height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| {
+            DiffusionError::InvalidRequest("inpaint crop dimensions overflow".to_string())
+        })?;
+    let mut data = vec![0u8; generated.batch * base_image_bytes];
+    for image_idx in 0..generated.batch {
+        let base_idx = if plan.base_image.batch == 1 {
+            0
+        } else {
+            image_idx % plan.base_image.batch
+        };
+        let mask_idx = if plan.overlay_mask.batch == 1 {
+            0
+        } else {
+            image_idx % plan.overlay_mask.batch
+        };
+        let output_offset = image_idx * base_image_bytes;
+        let base_offset = base_idx * base_image_bytes;
+        let mask_offset = mask_idx * base_image_bytes;
+        let crop_offset = image_idx * crop_image_bytes;
+        data[output_offset..output_offset + base_image_bytes]
+            .copy_from_slice(&plan.base_image.data[base_offset..base_offset + base_image_bytes]);
+        for y in 0..plan.paste_region.height {
+            let target_y = plan.paste_region.y + y;
+            for x in 0..plan.paste_region.width {
+                let target_x = plan.paste_region.x + x;
+                let full_pixel = (target_y * plan.base_image.width + target_x) * 3;
+                let crop_pixel = (y * plan.paste_region.width + x) * 3;
+                let mask_luma = (plan.overlay_mask.data[mask_offset + full_pixel] as f32
+                    + plan.overlay_mask.data[mask_offset + full_pixel + 1] as f32
+                    + plan.overlay_mask.data[mask_offset + full_pixel + 2] as f32)
+                    / (3.0 * 255.0);
+                let weight = mask_luma.clamp(0.0, 1.0);
+                if weight == 0.0 {
+                    continue;
+                }
+                for channel in 0..3 {
+                    let dst = output_offset + full_pixel + channel;
+                    let base = plan.base_image.data[base_offset + full_pixel + channel] as f32;
+                    let generated =
+                        resized_generated.data[crop_offset + crop_pixel + channel] as f32;
+                    data[dst] = (base * (1.0 - weight) + generated * weight)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    }
+    Ok(RgbImageBatch {
+        batch: generated.batch,
+        width: plan.base_image.width,
+        height: plan.base_image.height,
+        data,
+    })
+}
+
+fn sdapi_mask_crop_region(
+    mask: &RgbImageBatch,
+    padding: u32,
+) -> Result<Option<SdapiCropRegion>, DiffusionError> {
+    sdapi_validate_rgb_batch_len(mask, "mask")?;
+    let mut min_x = mask.width;
+    let mut min_y = mask.height;
+    let mut max_x = 0usize;
+    let mut max_y = 0usize;
+    let mut found = false;
+    let image_bytes = mask.width * mask.height * 3;
+    for batch_idx in 0..mask.batch {
+        let batch_offset = batch_idx * image_bytes;
+        for y in 0..mask.height {
+            for x in 0..mask.width {
+                let idx = batch_offset + (y * mask.width + x) * 3;
+                if mask.data[idx] != 0 || mask.data[idx + 1] != 0 || mask.data[idx + 2] != 0 {
+                    found = true;
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x + 1);
+                    max_y = max_y.max(y + 1);
+                }
+            }
+        }
+    }
+    if !found {
+        return Ok(None);
+    }
+    let padding = usize::try_from(padding).map_err(|_| {
+        DiffusionError::InvalidRequest("inpaint_full_res_padding is out of range".to_string())
+    })?;
+    let x1 = min_x.saturating_sub(padding);
+    let y1 = min_y.saturating_sub(padding);
+    let x2 = max_x.saturating_add(padding).min(mask.width);
+    let y2 = max_y.saturating_add(padding).min(mask.height);
+    Ok(Some(SdapiCropRegion {
+        x: x1,
+        y: y1,
+        width: x2.saturating_sub(x1),
+        height: y2.saturating_sub(y1),
+    }))
+}
+
+fn sdapi_expand_crop_region(
+    region: SdapiCropRegion,
+    processing_dimensions: (u32, u32),
+    image_dimensions: (usize, usize),
+) -> Result<SdapiCropRegion, DiffusionError> {
+    if region.width == 0 || region.height == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "inpaint crop region dimensions must be positive".to_string(),
+        ));
+    }
+    if processing_dimensions.0 == 0 || processing_dimensions.1 == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "inpaint processing dimensions must be positive".to_string(),
+        ));
+    }
+    let image_width = i64::try_from(image_dimensions.0)
+        .map_err(|_| DiffusionError::InvalidRequest("image width is out of range".to_string()))?;
+    let image_height = i64::try_from(image_dimensions.1)
+        .map_err(|_| DiffusionError::InvalidRequest("image height is out of range".to_string()))?;
+    let mut x1 = i64::try_from(region.x)
+        .map_err(|_| DiffusionError::InvalidRequest("crop x is out of range".to_string()))?;
+    let mut y1 = i64::try_from(region.y)
+        .map_err(|_| DiffusionError::InvalidRequest("crop y is out of range".to_string()))?;
+    let mut x2 = i64::try_from(region.x + region.width)
+        .map_err(|_| DiffusionError::InvalidRequest("crop width is out of range".to_string()))?;
+    let mut y2 = i64::try_from(region.y + region.height)
+        .map_err(|_| DiffusionError::InvalidRequest("crop height is out of range".to_string()))?;
+    let ratio_crop_region = (x2 - x1) as f64 / (y2 - y1) as f64;
+    let ratio_processing = processing_dimensions.0 as f64 / processing_dimensions.1 as f64;
+    if ratio_crop_region > ratio_processing {
+        let desired_height = (x2 - x1) as f64 / ratio_processing;
+        let desired_height_diff = (desired_height as i64) - (y2 - y1);
+        y1 -= desired_height_diff / 2;
+        y2 += desired_height_diff - desired_height_diff / 2;
+        if y2 >= image_height {
+            let diff = y2 - image_height;
+            y2 -= diff;
+            y1 -= diff;
+        }
+        if y1 < 0 {
+            y2 -= y1;
+            y1 = 0;
+        }
+        if y2 >= image_height {
+            y2 = image_height;
+        }
+    } else {
+        let desired_width = (y2 - y1) as f64 * ratio_processing;
+        let desired_width_diff = (desired_width as i64) - (x2 - x1);
+        x1 -= desired_width_diff / 2;
+        x2 += desired_width_diff - desired_width_diff / 2;
+        if x2 >= image_width {
+            let diff = x2 - image_width;
+            x2 -= diff;
+            x1 -= diff;
+        }
+        if x1 < 0 {
+            x2 -= x1;
+            x1 = 0;
+        }
+        if x2 >= image_width {
+            x2 = image_width;
+        }
+    }
+    if x2 <= x1 || y2 <= y1 {
+        return Err(DiffusionError::InvalidRequest(
+            "expanded inpaint crop region is empty".to_string(),
+        ));
+    }
+    Ok(SdapiCropRegion {
+        x: usize::try_from(x1)
+            .map_err(|_| DiffusionError::InvalidRequest("crop x is negative".to_string()))?,
+        y: usize::try_from(y1)
+            .map_err(|_| DiffusionError::InvalidRequest("crop y is negative".to_string()))?,
+        width: usize::try_from(x2 - x1).map_err(|_| {
+            DiffusionError::InvalidRequest("crop width is out of range".to_string())
+        })?,
+        height: usize::try_from(y2 - y1).map_err(|_| {
+            DiffusionError::InvalidRequest("crop height is out of range".to_string())
+        })?,
+    })
+}
+
+fn sdapi_crop_rgb_batch(
+    image: &RgbImageBatch,
+    region: SdapiCropRegion,
+) -> Result<RgbImageBatch, DiffusionError> {
+    sdapi_validate_rgb_batch_len(image, "image")?;
+    if region.width == 0 || region.height == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "crop dimensions must be positive".to_string(),
+        ));
+    }
+    if region.x + region.width > image.width || region.y + region.height > image.height {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "crop region {}x{}+{}+{} exceeds image {}x{}",
+            region.width, region.height, region.x, region.y, image.width, image.height
+        )));
+    }
+    let source_image_bytes = image.width * image.height * 3;
+    let target_image_bytes = region
+        .width
+        .checked_mul(region.height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| DiffusionError::InvalidRequest("crop dimensions overflow".to_string()))?;
+    let mut data = vec![0u8; image.batch * target_image_bytes];
+    for batch_idx in 0..image.batch {
+        let source_offset = batch_idx * source_image_bytes;
+        let target_offset = batch_idx * target_image_bytes;
+        for y in 0..region.height {
+            let source_row = source_offset + ((region.y + y) * image.width + region.x) * 3;
+            let target_row = target_offset + y * region.width * 3;
+            let row_bytes = region.width * 3;
+            data[target_row..target_row + row_bytes]
+                .copy_from_slice(&image.data[source_row..source_row + row_bytes]);
+        }
+    }
+    Ok(RgbImageBatch {
+        batch: image.batch,
+        width: region.width,
+        height: region.height,
+        data,
+    })
+}
+
 fn sdapi_apply_inpainting_mask_options(
     body: &SdGenerationRequest,
     mask: RgbImageBatch,
@@ -1261,6 +1662,38 @@ fn sdapi_inpainting_fill(body: &SdGenerationRequest) -> Result<Option<u32>, Diff
         )));
     }
     Ok(Some(mode))
+}
+
+fn sdapi_inpaint_full_res(body: &SdGenerationRequest) -> bool {
+    body.inpaint_full_res
+        .as_ref()
+        .map_or(true, sdapi_value_is_truthy)
+}
+
+fn sdapi_inpaint_full_res_padding(body: &SdGenerationRequest) -> Result<u32, DiffusionError> {
+    Ok(sdapi_optional_nonnegative_u32(
+        body.inpaint_full_res_padding.as_ref(),
+        "inpaint_full_res_padding",
+    )?
+    .unwrap_or(0))
+}
+
+fn sdapi_optional_nonnegative_u32(
+    value: Option<&Value>,
+    label: &str,
+) -> Result<Option<u32>, DiffusionError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let parsed = match value {
+        Value::Number(value) => value.as_u64().and_then(|value| u32::try_from(value).ok()),
+        Value::String(value) => value.trim().parse::<u32>().ok(),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        DiffusionError::InvalidRequest(format!("{label} must be a non-negative integer"))
+    })?;
+    Ok(Some(parsed))
 }
 
 fn sdapi_value_is_truthy(value: &Value) -> bool {
@@ -3052,6 +3485,7 @@ mod tests {
             save_images: Some(false),
             init_images: Some(vec![tiny_png_base64_with_dimensions(1, 1)]),
             mask: Some(tiny_mask_png_base64(1, 1)),
+            inpaint_full_res: Some(json!(false)),
             denoising_strength: Some(1.0),
             ..empty_request()
         };
@@ -3072,6 +3506,56 @@ mod tests {
         assert_eq!(info["masked"], true);
         assert_eq!(info["width"], 2);
         assert_eq!(info["height"], 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn img2img_route_composites_full_res_inpaint_crop() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-sdapi-diffusion-img2img-full-res-inpaint-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("tiny-route-diffusion-img2img-full-res-inpaint.hfq");
+        write_tiny_diffusion_hfq(&hfq_path);
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let body = SdGenerationRequest {
+            prompt: "a cat".to_string(),
+            model: Some(hfq_path.to_string_lossy().into_owned()),
+            steps: Some(1),
+            cfg_scale: Some(1.0),
+            width: Some(2),
+            height: Some(2),
+            send_images: Some(true),
+            save_images: Some(false),
+            init_images: Some(vec![tiny_png_base64_with_dimensions(4, 4)]),
+            mask: Some(rect_mask_png_base64(4, 4, 1, 1, 2, 2)),
+            inpaint_full_res: Some(json!(true)),
+            inpaint_full_res_padding: Some(json!(0)),
+            denoising_strength: Some(1.0),
+            ..empty_request()
+        };
+
+        let response = post_img2img(State(state), Json(body)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+
+        let images = body["images"].as_array().unwrap();
+        assert_eq!(images.len(), 1);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(images[0].as_str().unwrap())
+            .unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap().to_rgb8();
+        assert_eq!(decoded.dimensions(), (4, 4));
+        let info = serde_json::from_str::<Value>(body["info"].as_str().unwrap()).unwrap();
+        assert_eq!(info["mode"], "img2img");
+        assert_eq!(info["masked"], true);
+        assert_eq!(info["width"], 4);
+        assert_eq!(info["height"], 4);
+        assert_eq!(info["inpaint_full_res"], true);
+        assert_eq!(info["inpaint_full_res_padding"], 0);
+        assert_eq!(info["inpaint_full_res_crop"], json!([1, 1, 1, 1]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3599,6 +4083,27 @@ mod tests {
         for idx in 0..(width * height) {
             let value = if idx % 2 == 0 { 255 } else { 0 };
             pixels.extend_from_slice(&[value, value, value]);
+        }
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&pixels, width, height, image::ColorType::Rgb8.into())
+            .unwrap();
+        base64::engine::general_purpose::STANDARD.encode(png)
+    }
+
+    fn rect_mask_png_base64(width: u32, height: u32, x1: u32, y1: u32, x2: u32, y2: u32) -> String {
+        use image::ImageEncoder;
+
+        let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let value = if x >= x1 && x < x2 && y >= y1 && y < y2 {
+                    255
+                } else {
+                    0
+                };
+                pixels.extend_from_slice(&[value, value, value]);
+            }
         }
         let mut png = Vec::new();
         image::codecs::png::PngEncoder::new(&mut png)
@@ -4513,6 +5018,8 @@ mod tests {
             mask_round: None,
             inpainting_mask_invert: None,
             inpainting_fill: None,
+            inpaint_full_res: None,
+            inpaint_full_res_padding: None,
             resize_mode: None,
             include_init_images: None,
             denoising_strength: None,
