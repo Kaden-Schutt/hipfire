@@ -17,7 +17,8 @@
 #   ./tests/tiny-quant-gate.sh --record   # (re)write baselines for THIS gpu
 #
 # Exit: 0 = all cells pass, 1 = a cell failed (crash / non-finite / KLD drift),
-#       2 = could not run (build / GPU lock / binary missing).
+#       2 = could not run (build / GPU lock / binary missing),
+#       3 = cells ran but at least one was skipped/inconclusive.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -27,6 +28,7 @@ RECORD=0
 
 HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 EVAL_BIN="${HIPFIRE_EVAL_BIN:-./target/release/hipfire-eval}"
+export ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
 
 echo "tiny-quant-gate: building..."
 cargo build --release \
@@ -50,12 +52,14 @@ RES="$OUT/results.jsonl"
 
 # Summarize each cell; count fails.
 fail=0
+skip=0
 while IFS= read -r line; do
     status="$(grep -oE '"status":"[a-z]+"' <<<"$line" | head -1 | cut -d'"' -f4)"
     case_id="$(grep -oE '"case_id":"[^"]+"' <<<"$line" | head -1 | cut -d'"' -f4)"
     reason="$(grep -oE '"reason":"[^"]*"' <<<"$line" | head -1 | cut -d'"' -f4)"
     printf '  %-6s %s%s\n' "$status" "$case_id" "${reason:+  — $reason}"
     [ "$status" = "fail" ] && fail=$((fail+1))
+    [ "$status" = "skip" ] && skip=$((skip+1))
 done <"$RES"
 
 if [ "$RECORD" = 1 ]; then
@@ -65,6 +69,10 @@ fi
 if [ "$fail" -gt 0 ]; then
     echo "tiny-quant-gate: FAIL ($fail cell(s) drifted/crashed)"
     exit 1
+fi
+if [ "$skip" -gt 0 ]; then
+    echo "tiny-quant-gate: INCONCLUSIVE ($skip skipped cell(s))"
+    exit 3
 fi
 echo "tiny-quant-gate: PASS"
 exit 0

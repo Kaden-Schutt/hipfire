@@ -51,6 +51,10 @@ echo "== Eval smoke script syntax =="
 bash -n tests/smoke/eval-harness-nogpu-smoke.sh
 bash -n tests/smoke/eval-harness-gpu-smoke.sh
 bash -n tests/smoke/eval-harness-model-eval-smoke.sh
+bash -n tests/tiny-affected-gate.sh
+bash -n tests/tiny-quant-gate.sh
+bash -n tests/tiny-state-gate.sh
+bash -n tests/tiny-spec-gate.sh
 
 echo "== Legacy CLI checks =="
 echo "Legacy CLI support has been removed; no script-runtime checks are run."

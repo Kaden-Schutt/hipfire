@@ -289,6 +289,19 @@ fn daemon_quality_fail_row(
     )
 }
 
+fn attach_kld_possible_false_negative_causes(
+    metrics: &mut BTreeMap<String, Value>,
+    status: EvalStatus,
+    compat_findings: &[String],
+) {
+    if status == EvalStatus::Fail && !compat_findings.is_empty() {
+        metrics.insert(
+            "possible_false_negative_causes".to_string(),
+            json!(compat_findings),
+        );
+    }
+}
+
 fn daemon_quality_row_from_resp(
     config: &EvalConfig,
     ctx: &EvalContext,
@@ -320,12 +333,6 @@ fn daemon_quality_row_from_resp(
             if let Some(v) = resp.ppl {
                 metrics.insert("ppl".to_string(), json!(v));
             }
-            if !resp.compat_findings.is_empty() {
-                metrics.insert(
-                    "compat_findings".to_string(),
-                    json!(resp.compat_findings.clone()),
-                );
-            }
             let finite = resp.mean_kld.map(|v| v.is_finite()).unwrap_or(false);
             let (status, reason) = if !finite {
                 (
@@ -335,6 +342,7 @@ fn daemon_quality_row_from_resp(
             } else {
                 (EvalStatus::Pass, None)
             };
+            attach_kld_possible_false_negative_causes(&mut metrics, status, &resp.compat_findings);
             row_for_model(
                 BatteryId::Quality,
                 None,
@@ -1511,6 +1519,32 @@ fn vision_text_stats(text: &str) -> (f64, f64) {
     let unique_ratio = counts.len() as f64 / total;
     let max_freq = counts.values().copied().max().unwrap_or(0) as f64 / total;
     (unique_ratio, max_freq)
+}
+
+#[cfg(test)]
+mod daemon_quality_tests {
+    use super::*;
+
+    #[test]
+    fn kld_compat_findings_only_surface_as_false_negative_context_on_fail() {
+        let findings = vec![
+            "Warn gpu_arch: ref gfx1151 != run gfx1103 (cross-arch numerics)".to_string(),
+            "Warn config.graph: ref true != run false".to_string(),
+        ];
+
+        let mut pass_metrics = BTreeMap::new();
+        attach_kld_possible_false_negative_causes(&mut pass_metrics, EvalStatus::Pass, &findings);
+        assert!(!pass_metrics.contains_key("possible_false_negative_causes"));
+        assert!(!pass_metrics.contains_key("compat_findings"));
+
+        let mut fail_metrics = BTreeMap::new();
+        attach_kld_possible_false_negative_causes(&mut fail_metrics, EvalStatus::Fail, &findings);
+        assert_eq!(
+            fail_metrics.get("possible_false_negative_causes"),
+            Some(&json!(findings))
+        );
+        assert!(!fail_metrics.contains_key("compat_findings"));
+    }
 }
 
 pub(crate) async fn run_daemon_vision_rows_async(

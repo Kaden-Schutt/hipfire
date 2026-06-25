@@ -2,7 +2,7 @@
 // hipfire — tokenizer-free multi-arch tiny-model probe (KLD + calibration).
 //
 // Drives `hipfire_serving_core::tiny_harness` for the `tiny_quant` eval battery
-// and the tiny-quant gate. Two subcommands:
+// and tiny gates. Three subcommands:
 //
 //   kld     --arch <fam> --ref <bf16.hfq> --cand <quant.hfq> [--len N --warmup W --seed S]
 //           → prints `mean_kld:`, `max_kld:`, `n_scored:`, `finite:` lines.
@@ -10,13 +10,17 @@
 //           → arms the model-agnostic Hessian/imatrix collector, runs the
 //             forward, drains a `.calib.hfq` (HFQM). Prints `n_tensors:`,
 //             `consistency:`, `calib_out:`.
+//   ar-hash --arch <fam> --model <hfq> [--len N --prompt-len P --seed S]
+//           → free-runs greedy decode after a deterministic prompt and prints
+//             `logit_hash:` + `token_hash:`. This grows KV/state and is used by
+//             tiny long-state/KV tripwires.
 //
 // Machine-readable `key: value` stdout lines; the battery parses these. A
 // panic / nonzero exit is the hard-fail signal.
 
 use std::path::Path;
 
-use hipfire_serving_core::tiny_harness::{run_collect, run_kld, TinyArch};
+use hipfire_serving_core::tiny_harness::{run_ar_hash, run_collect, run_kld, TinyArch};
 use rdna_compute::Gpu;
 
 fn flag(args: &[String], name: &str) -> Option<String> {
@@ -95,8 +99,25 @@ fn main() {
             println!("consistency: {:.6}", r.consistency);
             println!("calib_out: {}", r.out_path);
         }
+        "ar-hash" | "ar_hash" => {
+            let prompt_len: usize = flag(&args, "--prompt-len")
+                .map(|s| s.parse().unwrap())
+                .unwrap_or(4);
+            let model = req(&args, "--model");
+            let out = run_ar_hash(arch, Path::new(&model), &mut gpu, len, prompt_len, seed)
+                .unwrap_or_else(|e| {
+                    eprintln!("tiny_quant_probe ar-hash: {e}");
+                    std::process::exit(1);
+                });
+            println!("arch: {}", arch.as_str());
+            println!("logit_hash: 0x{:016x}", out.logit_hash);
+            println!("token_hash: 0x{:016x}", out.token_hash);
+            println!("n_steps: {}", out.n_steps);
+            println!("prompt_len: {}", out.prompt_len);
+            println!("last_token: {}", out.last_token);
+        }
         other => {
-            eprintln!("tiny_quant_probe: unknown subcommand {other:?} (kld|collect)");
+            eprintln!("tiny_quant_probe: unknown subcommand {other:?} (kld|collect|ar-hash)");
             std::process::exit(2);
         }
     }

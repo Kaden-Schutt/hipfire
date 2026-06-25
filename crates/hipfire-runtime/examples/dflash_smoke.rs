@@ -75,7 +75,8 @@ fn main() {
 
     let t1 = Instant::now();
     let mut scratch =
-        DflashScratch::new(&mut gpu, &cfg, block_size, ctx_len).expect("alloc scratch");
+        DflashScratch::new_with_mq(&mut gpu, &cfg, block_size, ctx_len, weights.has_mq)
+            .expect("alloc scratch");
     eprintln!("scratch allocated in {:.3}s", t1.elapsed().as_secs_f64());
 
     // Synthesize a deterministic input: seeded noise for noise_embedding and

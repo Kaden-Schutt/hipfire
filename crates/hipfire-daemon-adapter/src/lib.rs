@@ -801,7 +801,8 @@ pub fn acquire_resource_lease_or_exit() -> ResourceLease {
         .unwrap_or(0);
     // Held guards keep the flock leases alive; dropping the lease releases them
     // (kernel closes the fds). No filesystem cleanup needed.
-    let mut guards = Vec::new();
+    let timeout = (wait_ms > 0).then(|| Duration::from_millis(wait_ms));
+    let mut guards: Vec<hipfire_lock::FlockGuard> = Vec::new();
 
     for resource in &resources {
         let path = resource_lock_path_at(&root, resource);
@@ -809,21 +810,19 @@ pub fn acquire_resource_lease_or_exit() -> ResourceLease {
             Ok(guard) => guard,
             Err(e) => fatal_startup_error(&format!("open {}: {e}", path.display()), None),
         };
-        let acquired = if wait_ms > 0 {
-            guard.lock_blocking(
-                Duration::from_millis(250),
-                Some(Duration::from_millis(wait_ms)),
-                |holder| {
-                    let who = if holder.is_empty() {
+        // wait_ms==0 → single try_lock (fail-fast); wait_ms>0 → block up to timeout.
+        let acquired = match timeout {
+            Some(t) => guard.lock_blocking(Duration::from_millis(250), Some(t), |holder| {
+                eprintln!(
+                    "[hipfire] waiting for resource {resource} (held by {})",
+                    if holder.is_empty() {
                         "another process"
                     } else {
                         holder
-                    };
-                    eprintln!("[hipfire] waiting for resource {resource} held by {who}");
-                },
-            )
-        } else {
-            guard.try_lock()
+                    }
+                );
+            }),
+            None => guard.try_lock(),
         };
         match acquired {
             Ok(true) => {

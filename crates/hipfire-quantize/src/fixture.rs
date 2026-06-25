@@ -84,6 +84,139 @@ struct TensorSpec {
     dt: Dt,
 }
 
+/// Tiny DFlash draft sidecar fixture. This is not a quality model; it is a
+/// runtime/training artifact shape that can flow through `dflash_convert`.
+struct DflashTiny {
+    hidden: usize,
+    inter: usize,
+    vocab: usize,
+    layers: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+    target_layer_ids: Vec<usize>,
+    num_target_layers: usize,
+}
+
+impl DflashTiny {
+    fn preset() -> Self {
+        Self {
+            hidden: 256,
+            inter: 512,
+            vocab: 4096,
+            layers: 1,
+            n_heads: 2,
+            n_kv_heads: 1,
+            head_dim: 128,
+            block_size: 16,
+            target_layer_ids: vec![0, 1],
+            num_target_layers: 4,
+        }
+    }
+
+    fn config_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "architectures": ["DFlashDraftModel"],
+            "model_type": "dflash",
+            "num_hidden_layers": self.layers,
+            "hidden_size": self.hidden,
+            "intermediate_size": self.inter,
+            "num_attention_heads": self.n_heads,
+            "num_key_value_heads": self.n_kv_heads,
+            "head_dim": self.head_dim,
+            "vocab_size": self.vocab,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000000.0,
+            "block_size": self.block_size,
+            "num_target_layers": self.num_target_layers,
+            "dflash_config": {
+                "mask_token_id": self.vocab - 1,
+                "target_layer_ids": self.target_layer_ids,
+            },
+        })
+    }
+
+    fn manifest(&self) -> Vec<TensorSpec> {
+        let h = self.hidden;
+        let q_dim = self.n_heads * self.head_dim;
+        let kv_dim = self.n_kv_heads * self.head_dim;
+        let num_extract = self.target_layer_ids.len();
+        let mut t = Vec::new();
+        t.push(TensorSpec::new(
+            "fc.weight",
+            vec![h, num_extract * h],
+            Init::Uniform(0.03),
+        ));
+        t.push(TensorSpec::f16(
+            "hidden_norm.weight",
+            vec![h],
+            Init::NormOnes,
+        ));
+        t.push(TensorSpec::f16("norm.weight", vec![h], Init::NormOnes));
+        for i in 0..self.layers {
+            let p = format!("layers.{i}");
+            let sa = format!("{p}.self_attn");
+            t.push(TensorSpec::f16(
+                format!("{p}.input_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.q_proj.weight"),
+                vec![q_dim, h],
+                Init::Uniform(0.03),
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.k_proj.weight"),
+                vec![kv_dim, h],
+                Init::Uniform(0.03),
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.v_proj.weight"),
+                vec![kv_dim, h],
+                Init::Uniform(0.03),
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.o_proj.weight"),
+                vec![h, q_dim],
+                Init::Uniform(0.03),
+            ));
+            t.push(TensorSpec::f16(
+                format!("{sa}.q_norm.weight"),
+                vec![self.head_dim],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::f16(
+                format!("{sa}.k_norm.weight"),
+                vec![self.head_dim],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::f16(
+                format!("{p}.post_attention_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.gate_proj.weight"),
+                vec![self.inter, h],
+                Init::Uniform(0.03),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.up_proj.weight"),
+                vec![self.inter, h],
+                Init::Uniform(0.03),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.down_proj.weight"),
+                vec![h, self.inter],
+                Init::Uniform(0.03),
+            ));
+        }
+        t
+    }
+}
+
 impl TensorSpec {
     /// BF16 tensor (default — weight matrices, and every qwen3.5 tensor).
     fn new(name: impl Into<String>, shape: Vec<usize>, init: Init) -> Self {
@@ -1057,12 +1190,17 @@ pub fn emit_fixture(arch: &str, out_dir: &Path, seed: u64) -> Result<(), String>
             let m = LlamaTiny::preset();
             (m.config_json(), m.manifest())
         }
+        "dflash" | "dflash_draft" | "tiny_dflash" => {
+            let m = DflashTiny::preset();
+            (m.config_json(), m.manifest())
+        }
         other => {
             return Err(format!(
                 "--emit-fixture: unsupported arch '{other}'. Supported: qwen3_5 \
                  (arch 5 dense), qwen3_5_moe (arch 6 MoE), qwen2 (arch 7, quantize \
                  with --arch-id 7), gemma3 (arch 12), minimax (arch 10), llama \
-                 (arch 0). Add a tiny preset per arch as support lands."
+                 (arch 0), dflash (draft sidecar). Add a tiny preset per arch as \
+                 support lands."
             ));
         }
     };
