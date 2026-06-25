@@ -207,6 +207,7 @@ pub struct DiffusionHipPreflight {
     pub group_norm_kernel_probe: DiffusionHipKernelProbe,
     pub silu_kernel_probe: DiffusionHipKernelProbe,
     pub upsample_kernel_probe: DiffusionHipKernelProbe,
+    pub linear_kernel_probe: DiffusionHipKernelProbe,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2584,6 +2585,43 @@ impl DiffusionPipeline {
                     .to_string(),
             ));
         }
+        let linear_input = CpuTensor {
+            shape: vec![3, 4],
+            data: (0..12)
+                .map(|idx| idx as f32 / 6.0 - 1.0)
+                .collect::<Vec<_>>(),
+        };
+        let linear_weight = CpuTensor {
+            shape: vec![5, 4],
+            data: (0..20)
+                .map(|idx| (idx as f32 % 11.0 - 5.0) / 7.0)
+                .collect::<Vec<_>>(),
+        };
+        let linear_bias = CpuTensor {
+            shape: vec![5],
+            data: vec![0.0, 0.25, -0.5, 0.75, -1.0],
+        };
+        let linear_cpu_reference = linear(&linear_input, &linear_weight, &linear_bias)?;
+        let linear_gpu_output = linear_optional_bias_hip_on_gpu(
+            &mut gpu,
+            &linear_input,
+            &linear_weight,
+            Some(&linear_bias),
+        )?;
+        let linear_kernel_probe = DiffusionHipKernelProbe {
+            name: "diffusion_linear_f32".to_string(),
+            input_elements: linear_input.data.len()
+                + linear_weight.data.len()
+                + linear_bias.data.len(),
+            output_bytes: linear_gpu_output.data.len() * std::mem::size_of::<f32>(),
+            matched_cpu_reference: linear_gpu_output.shape == linear_cpu_reference.shape
+                && f32_slices_close(&linear_gpu_output.data, &linear_cpu_reference.data, 1e-5),
+        };
+        if !linear_kernel_probe.matched_cpu_reference {
+            return Err(DiffusionError::BackendUnavailable(
+                "HIP diffusion linear kernel output differed from CPU reference".to_string(),
+            ));
+        }
 
         Ok(DiffusionHipPreflight {
             device_id: gpu.device_id,
@@ -2599,6 +2637,7 @@ impl DiffusionPipeline {
             group_norm_kernel_probe,
             silu_kernel_probe,
             upsample_kernel_probe,
+            linear_kernel_probe,
         })
     }
 
@@ -5435,6 +5474,36 @@ extern "C" __global__ void diffusion_upsample_nearest2d_nchw_f32(
 "#;
 
 #[cfg(feature = "rocm")]
+const DIFFUSION_LINEAR_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void diffusion_linear_f32(
+    const float* input,
+    const float* weight,
+    const float* bias,
+    float* output,
+    int total_outputs,
+    int in_features,
+    int out_features,
+    int has_bias
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_outputs) {
+        return;
+    }
+    int out_col = idx % out_features;
+    int row = idx / out_features;
+    int input_row = row * in_features;
+    int weight_row = out_col * in_features;
+    float acc = has_bias ? bias[out_col] : 0.0f;
+    for (int k = 0; k < in_features; ++k) {
+        acc += input[input_row + k] * weight[weight_row + k];
+    }
+    output[idx] = acc;
+}
+"#;
+
+#[cfg(feature = "rocm")]
 fn rgb_tensor_to_u8_hip_on_gpu(
     gpu: &mut rdna_compute::Gpu,
     tensor: &CpuTensor,
@@ -6096,6 +6165,115 @@ fn upsample_nearest2d_nchw_hip_on_gpu(
     kernargs.push_i32(i32_kernel_dim("upsample output height", out_h)?);
     kernargs.push_i32(i32_kernel_dim("upsample output width", out_w)?);
     kernargs.push_i32(i32_kernel_dim("upsample scale", scale)?);
+    kernargs.pad_to(16);
+    let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+    unsafe {
+        gpu.hip
+            .launch_kernel_blob(
+                &function,
+                grid,
+                [256, 1, 1],
+                0,
+                gpu.active_stream.as_ref(),
+                kernargs.as_mut_slice(),
+            )
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(CpuTensor {
+        shape: output_shape.to_vec(),
+        data,
+    })
+}
+
+#[cfg(feature = "rocm")]
+fn linear_optional_bias_hip_on_gpu(
+    gpu: &mut rdna_compute::Gpu,
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    bias: Option<&CpuTensor>,
+) -> DiffusionResult<CpuTensor> {
+    let (rows, in_features) = input.rows_cols()?;
+    let (out_features, weight_in) = weight.rows_cols()?;
+    if in_features != weight_in {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "linear input width {in_features} != weight input width {weight_in}"
+        )));
+    }
+    if let Some(bias) = bias {
+        if bias.shape.as_slice() != [out_features] {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "linear bias shape {:?} != [{out_features}]",
+                bias.shape
+            )));
+        }
+    }
+    let output_shape = [rows, out_features];
+    let output_elements = checked_shape_elements("linear output", &output_shape)?;
+    if output_elements == 0 {
+        return Ok(CpuTensor::zeros(&output_shape));
+    }
+    let output_bytes = output_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata("linear output size overflows".to_string())
+        })?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let input_gpu = gpu
+        .upload_f32(&input.data, &input.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let weight_gpu = gpu
+        .upload_f32(&weight.data, &weight.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let bias_gpu = bias
+        .map(|bias| gpu.upload_f32(&bias.data, &bias.shape))
+        .transpose()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = gpu
+        .hip
+        .malloc(output_bytes)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = compiler
+        .compile("diffusion_linear_f32", DIFFUSION_LINEAR_HIP_SRC)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = obj_path
+        .to_str()
+        .ok_or_else(|| {
+            DiffusionError::BackendUnavailable(
+                "compiled diffusion linear kernel path is not UTF-8".to_string(),
+            )
+        })?
+        .to_string();
+    let module = gpu
+        .hip
+        .module_load(&obj_path)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let function = gpu
+        .hip
+        .module_get_function(&module, "diffusion_linear_f32")
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(input_gpu.buf.as_ptr());
+    kernargs.push_ptr(weight_gpu.buf.as_ptr());
+    if let Some(bias_gpu) = bias_gpu.as_ref() {
+        kernargs.push_ptr(bias_gpu.buf.as_ptr());
+    } else {
+        kernargs.push_ptr(std::ptr::null());
+    }
+    kernargs.push_ptr(output_gpu.as_ptr());
+    kernargs.push_i32(i32_kernel_dim("linear output elements", output_elements)?);
+    kernargs.push_i32(i32_kernel_dim("linear input features", in_features)?);
+    kernargs.push_i32(i32_kernel_dim("linear output features", out_features)?);
+    kernargs.push_i32(if bias.is_some() { 1 } else { 0 });
     kernargs.pad_to(16);
     let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
     unsafe {
@@ -13055,6 +13233,47 @@ mod tests {
 
             assert_eq!(hip.shape, cpu.shape);
             assert_eq!(hip.data, cpu.data);
+        }
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn hip_linear_matches_cpu_reference_when_gpu_is_available() {
+        let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!("skip: ROCm GPU unavailable for linear kernel parity test: {error}");
+                return;
+            }
+        };
+        let input = CpuTensor {
+            shape: vec![4, 3],
+            data: (0..12)
+                .map(|idx| idx as f32 / 5.0 - 1.1)
+                .collect::<Vec<_>>(),
+        };
+        let weight = CpuTensor {
+            shape: vec![5, 3],
+            data: (0..15)
+                .map(|idx| (idx as f32 % 7.0 - 3.0) / 4.0)
+                .collect::<Vec<_>>(),
+        };
+        let bias = CpuTensor {
+            shape: vec![5],
+            data: vec![0.25, -0.5, 0.75, -1.0, 1.25],
+        };
+
+        for bias in [Some(&bias), None] {
+            let cpu = linear_optional_bias(&input, &weight, bias).unwrap();
+            let hip = linear_optional_bias_hip_on_gpu(&mut gpu, &input, &weight, bias).unwrap();
+
+            assert_eq!(hip.shape, cpu.shape);
+            for (index, (actual, expected)) in hip.data.iter().zip(&cpu.data).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= 1e-5,
+                    "linear mismatch at {index}: hip={actual} cpu={expected}"
+                );
+            }
         }
     }
 
