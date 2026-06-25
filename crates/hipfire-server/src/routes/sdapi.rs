@@ -392,7 +392,11 @@ async fn execute_hfq_diffusion_txt2img(
             "diffusion worker task failed: {error}"
         ))),
     };
-    finish_sdapi_progress(&progress_state, output.as_ref().err());
+    let current_image = output
+        .as_ref()
+        .ok()
+        .and_then(|output| output.images.first().cloned());
+    finish_sdapi_progress(&progress_state, output.as_ref().err(), current_image);
     match output {
         Ok(output) => {
             finalize_hfq_diffusion_response(body, output, "txt2img", original_send_images)
@@ -490,7 +494,11 @@ async fn execute_hfq_diffusion_img2img(
             "diffusion worker task failed: {error}"
         ))),
     };
-    finish_sdapi_progress(&progress_state, output.as_ref().err());
+    let current_image = output
+        .as_ref()
+        .ok()
+        .and_then(|output| output.images.first().cloned());
+    finish_sdapi_progress(&progress_state, output.as_ref().err(), current_image);
     match output {
         Ok(output) => {
             finalize_hfq_diffusion_response(body, output, "img2img", original_send_images)
@@ -1158,6 +1166,7 @@ fn update_sdapi_progress(
 fn finish_sdapi_progress(
     progress_state: &Arc<std::sync::Mutex<SdapiProgressState>>,
     error: Option<&DiffusionError>,
+    current_image: Option<String>,
 ) {
     if let Ok(mut progress) = progress_state.lock() {
         progress.active = false;
@@ -1172,6 +1181,7 @@ fn finish_sdapi_progress(
             }
             None => {
                 progress.sampling_step = progress.sampling_steps;
+                progress.current_image = current_image;
                 progress.textinfo = Some("complete".to_string());
             }
         }
@@ -1806,6 +1816,14 @@ mod tests {
             serde_json::from_str::<Value>(body["info"].as_str().unwrap()).unwrap()["backend"],
             "hipfire-diffusion-hfq"
         );
+        let Json(progress) = get_progress(State(state.clone())).await;
+        assert_eq!(progress["progress"], 1.0);
+        assert_eq!(progress["textinfo"], "complete");
+        let current_image = progress["current_image"].as_str().unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(current_image)
+            .unwrap();
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
         {
             let cache = state.diffusion_pipelines.lock().await;
             assert_eq!(cache.len(), 1);
@@ -2978,13 +2996,21 @@ mod tests {
         )
         .unwrap();
 
-        let Json(active) = get_progress(State(state)).await;
+        let Json(active) = get_progress(State(state.clone())).await;
         assert_eq!(active["progress"], 0.5);
         assert_eq!(active["state"]["job"], "txt2img");
         assert_eq!(active["state"]["sampling_step"], 2);
         assert_eq!(active["state"]["sampling_steps"], 4);
         assert_eq!(active["current_task"], "task-123");
         assert_eq!(active["textinfo"], "sampling step 2/4");
+
+        finish_sdapi_progress(&state.sdapi_progress, None, Some("image-b64".to_string()));
+
+        let Json(complete) = get_progress(State(state)).await;
+        assert_eq!(complete["progress"], 1.0);
+        assert_eq!(complete["state"]["sampling_step"], 4);
+        assert_eq!(complete["current_image"], "image-b64");
+        assert_eq!(complete["textinfo"], "complete");
     }
 
     #[tokio::test]
