@@ -1431,6 +1431,48 @@ impl Gpu {
         v_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        // Null bias = byte-identical to the historical (pre-fold) path.
+        self.fused_qkv_mq4g256_lloyd_with_bias(
+            a_q,
+            a_k,
+            a_v,
+            x,
+            y_q,
+            y_k,
+            y_v,
+            q_m,
+            k_m,
+            v_m,
+            k,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    }
+
+    /// `fused_qkv_mq4g256_lloyd` with an optional Q/K/V bias folded into the
+    /// kernel's lane-0 store (`HIPFIRE_FUSE_QKV_BIAS`). All-null = byte-identical
+    /// to the unfused path (fp32 store→add). Both arch siblings (base + gfx1100)
+    /// carry the 3 trailing bias params, so the kernarg ABI matches whichever
+    /// `_for_arch` selects.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_qkv_mq4g256_lloyd_with_bias(
+        &mut self,
+        a_q: &GpuTensor,
+        a_k: &GpuTensor,
+        a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor,
+        y_k: &GpuTensor,
+        y_v: &GpuTensor,
+        q_m: usize,
+        k_m: usize,
+        v_m: usize,
+        k: usize,
+        bias_q_ptr: *mut c_void,
+        bias_k_ptr: *mut c_void,
+        bias_v_ptr: *mut c_void,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         let (src, module) = kernels::fused_qkv_mq4g256_lloyd_for_arch(
             &self.arch_caps,
@@ -1448,6 +1490,9 @@ impl Gpu {
         let k_m_i = k_m as i32;
         let v_m_i = v_m as i32;
         let k_i = k as i32;
+        let bq = bias_q_ptr;
+        let bk = bias_k_ptr;
+        let bv = bias_v_ptr;
         let mut params: Vec<*mut c_void> = vec![
             &aq as *const _ as *mut c_void,
             &ak as *const _ as *mut c_void,
@@ -1460,6 +1505,9 @@ impl Gpu {
             &k_m_i as *const _ as *mut c_void,
             &v_m_i as *const _ as *mut c_void,
             &k_i as *const _ as *mut c_void,
+            &bq as *const _ as *mut c_void,
+            &bk as *const _ as *mut c_void,
+            &bv as *const _ as *mut c_void,
         ];
         let total = (q_m + k_m + v_m) as u32;
         let bytes = crate::profile::gemv_mq4g256_lloyd_bytes(q_m, k)
@@ -1487,6 +1535,9 @@ impl Gpu {
                 b.push_i32(k_m_i);
                 b.push_i32(v_m_i);
                 b.push_i32(k_i);
+                b.push_ptr(bq);
+                b.push_ptr(bk);
+                b.push_ptr(bv);
                 b
             },
         );
@@ -1756,6 +1807,47 @@ impl Gpu {
         v_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        // Null bias = byte-identical to the historical (pre-fold) path.
+        self.fused_qkv_mq3g256_lloyd_with_bias(
+            a_q,
+            a_k,
+            a_v,
+            x,
+            y_q,
+            y_k,
+            y_v,
+            q_m,
+            k_m,
+            v_m,
+            k,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    }
+
+    /// `fused_qkv_mq3g256_lloyd` with an optional Q/K/V bias folded into the
+    /// kernel's lane-0 store (`HIPFIRE_FUSE_QKV_BIAS`). All-null = byte-identical
+    /// to the unfused path. Both arch siblings (base + gfx1100) carry the 3
+    /// trailing bias params.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_qkv_mq3g256_lloyd_with_bias(
+        &mut self,
+        a_q: &GpuTensor,
+        a_k: &GpuTensor,
+        a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor,
+        y_k: &GpuTensor,
+        y_v: &GpuTensor,
+        q_m: usize,
+        k_m: usize,
+        v_m: usize,
+        k: usize,
+        bias_q_ptr: *mut c_void,
+        bias_k_ptr: *mut c_void,
+        bias_v_ptr: *mut c_void,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         let (src, module) = kernels::fused_qkv_mq3g256_lloyd_for_arch(
             &self.arch_caps,
@@ -1773,6 +1865,9 @@ impl Gpu {
         let k_m_i = k_m as i32;
         let v_m_i = v_m as i32;
         let k_i = k as i32;
+        let bq = bias_q_ptr;
+        let bk = bias_k_ptr;
+        let bv = bias_v_ptr;
         let mut params: Vec<*mut c_void> = vec![
             &aq as *const _ as *mut c_void,
             &ak as *const _ as *mut c_void,
@@ -1785,6 +1880,9 @@ impl Gpu {
             &k_m_i as *const _ as *mut c_void,
             &v_m_i as *const _ as *mut c_void,
             &k_i as *const _ as *mut c_void,
+            &bq as *const _ as *mut c_void,
+            &bk as *const _ as *mut c_void,
+            &bv as *const _ as *mut c_void,
         ];
         let total = (q_m + k_m + v_m) as u32;
         // Bandwidth: 3 weight matrices read once each, x shared (read once).
@@ -1813,6 +1911,9 @@ impl Gpu {
                 b.push_i32(k_m_i);
                 b.push_i32(v_m_i);
                 b.push_i32(k_i);
+                b.push_ptr(bq);
+                b.push_ptr(bk);
+                b.push_ptr(bv);
                 b
             },
         );

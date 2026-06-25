@@ -17,7 +17,11 @@ extern "C" __global__ void fused_qkv_mq4g256_lloyd(
     float*       __restrict__ y_k,
     float*       __restrict__ y_v,
     int q_m, int k_m, int v_m,
-    int K
+    int K,
+    // Optional Q/K/V bias (HIPFIRE_FUSE_QKV_BIAS). NULL = pure no-op.
+    const float* __restrict__ bias_q,
+    const float* __restrict__ bias_k,
+    const float* __restrict__ bias_v
 ) {
     const int gid = blockIdx.x;
     const int total_m = q_m + k_m + v_m;
@@ -26,12 +30,13 @@ extern "C" __global__ void fused_qkv_mq4g256_lloyd(
     const char* A;
     float* y;
     int row;
+    const float* bias;
     if (gid < q_m) {
-        A = A_q;  y = y_q;  row = gid;
+        A = A_q;  y = y_q;  row = gid; bias = bias_q;
     } else if (gid < q_m + k_m) {
-        A = A_k;  y = y_k;  row = gid - q_m;
+        A = A_k;  y = y_k;  row = gid - q_m; bias = bias_k;
     } else {
-        A = A_v;  y = y_v;  row = gid - (q_m + k_m);
+        A = A_v;  y = y_v;  row = gid - (q_m + k_m); bias = bias_v;
     }
 
     const int tid = threadIdx.x;
@@ -132,5 +137,5 @@ extern "C" __global__ void fused_qkv_mq4g256_lloyd(
     for (int offset = 16; offset > 0; offset >>= 1)
         acc += __shfl_down(acc, offset);
 
-    if (tid == 0) y[row] = acc;
+    if (tid == 0) y[row] = acc + (bias ? bias[row] : 0.0f);
 }
