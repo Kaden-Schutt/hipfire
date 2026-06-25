@@ -208,8 +208,9 @@ decode, and VAE encode for img2img. ROCm preflight can validate the planned
 device buffers plus individual diffusion kernels for model-input scaling,
 classifier-free guidance, Euler scheduler updates, f32 NCHW Conv2D, f32 NCHW
 GroupNorm, SiLU, nearest-neighbor upsample, f32 dense linear projection, f32
-LayerNorm, f32 row softmax, f32 3D scaled-dot-product attention, and RGB
-conversion, but full generation is not routed through a GPU UNet runtime yet.
+LayerNorm, f32 row softmax, f32 3D scaled-dot-product attention, f32 CLIP
+causal self-attention, and RGB conversion, but full generation is not routed
+through a GPU UNet runtime yet.
 The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128,
 HFQ4G256, and HFQ6G256 tensor payloads even when the artifact `weight_format`
 records a future quantized format such as `oq4`; OQ/MQ/HFP and other packed
@@ -275,8 +276,9 @@ buffer classes, run a small host/device roundtrip probe, and launch diffusion
 kernels for model-input scaling, classifier-free guidance, Euler scheduler
 updates, f32 NCHW Conv2D, f32 NCHW GroupNorm, SiLU, nearest-neighbor upsample,
 f32 dense linear projection, f32 LayerNorm, f32 row softmax, f32 3D
-scaled-dot-product attention, and RGB conversion. Each kernel probe is checked
-against the CPU reference and reported in the JSON output.
+scaled-dot-product attention, f32 CLIP causal self-attention, and RGB
+conversion. Each kernel probe is checked against the CPU reference and reported
+in the JSON output.
 
 **Usage:** `hipfire diffusion preflight [OPTIONS] --model <MODEL>`
 

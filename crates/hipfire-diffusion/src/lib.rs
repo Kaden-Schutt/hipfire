@@ -211,6 +211,7 @@ pub struct DiffusionHipPreflight {
     pub layer_norm_kernel_probe: DiffusionHipKernelProbe,
     pub softmax_kernel_probe: DiffusionHipKernelProbe,
     pub sdpa_kernel_probe: DiffusionHipKernelProbe,
+    pub clip_causal_attention_kernel_probe: DiffusionHipKernelProbe,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2724,6 +2725,56 @@ impl DiffusionPipeline {
                 "HIP diffusion SDPA kernel output differed from CPU reference".to_string(),
             ));
         }
+        let clip_attn_q = CpuTensor {
+            shape: vec![4, 4],
+            data: vec![
+                0.2, -0.4, 0.6, 1.0, -1.2, 0.3, 0.5, -0.7, 1.0, 0.0, -0.5, 0.25, -0.25, 0.75, -1.0,
+                0.5,
+            ],
+        };
+        let clip_attn_k = CpuTensor {
+            shape: vec![4, 4],
+            data: vec![
+                -0.5, 0.25, 0.75, -1.0, 1.25, -0.75, 0.5, 0.0, 0.1, 0.9, -0.3, 0.4, 0.7, -0.2, 0.3,
+                -0.8,
+            ],
+        };
+        let clip_attn_v = CpuTensor {
+            shape: vec![4, 4],
+            data: vec![
+                0.5, -1.0, 0.25, 0.75, -0.4, 0.6, -0.8, 1.2, 1.0, 0.2, -0.5, -0.1, -0.9, 0.3, 0.8,
+                -0.2,
+            ],
+        };
+        let clip_causal_attention_cpu_reference =
+            clip_causal_self_attention(&clip_attn_q, &clip_attn_k, &clip_attn_v, 2)?;
+        let clip_causal_attention_gpu_output = clip_causal_self_attention_hip_on_gpu(
+            &mut gpu,
+            &clip_attn_q,
+            &clip_attn_k,
+            &clip_attn_v,
+            2,
+        )?;
+        let clip_causal_attention_kernel_probe = DiffusionHipKernelProbe {
+            name: "diffusion_clip_causal_attention_f32".to_string(),
+            input_elements: clip_attn_q.data.len()
+                + clip_attn_k.data.len()
+                + clip_attn_v.data.len(),
+            output_bytes: clip_causal_attention_gpu_output.data.len() * std::mem::size_of::<f32>(),
+            matched_cpu_reference: clip_causal_attention_gpu_output.shape
+                == clip_causal_attention_cpu_reference.shape
+                && f32_slices_close(
+                    &clip_causal_attention_gpu_output.data,
+                    &clip_causal_attention_cpu_reference.data,
+                    1e-5,
+                ),
+        };
+        if !clip_causal_attention_kernel_probe.matched_cpu_reference {
+            return Err(DiffusionError::BackendUnavailable(
+                "HIP diffusion CLIP causal attention kernel output differed from CPU reference"
+                    .to_string(),
+            ));
+        }
 
         Ok(DiffusionHipPreflight {
             device_id: gpu.device_id,
@@ -2743,6 +2794,7 @@ impl DiffusionPipeline {
             layer_norm_kernel_probe,
             softmax_kernel_probe,
             sdpa_kernel_probe,
+            clip_causal_attention_kernel_probe,
         })
     }
 
@@ -5739,6 +5791,56 @@ extern "C" __global__ void diffusion_sdpa_3d_f32(
 "#;
 
 #[cfg(feature = "rocm")]
+const DIFFUSION_CLIP_CAUSAL_ATTENTION_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void diffusion_clip_causal_attention_f32(
+    const float* q,
+    const float* k,
+    const float* v,
+    float* output,
+    int total_outputs,
+    int seq,
+    int hidden,
+    int heads,
+    int head_dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_outputs) {
+        return;
+    }
+    int d = idx % hidden;
+    int qi = idx / hidden;
+    int head = d / head_dim;
+    int head_off = head * head_dim;
+    int local_d = d - head_off;
+    float scale = rsqrtf((float)head_dim);
+
+    float max_score = -INFINITY;
+    for (int ki = 0; ki <= qi; ++ki) {
+        float dot = 0.0f;
+        for (int hd = 0; hd < head_dim; ++hd) {
+            dot += q[qi * hidden + head_off + hd] * k[ki * hidden + head_off + hd];
+        }
+        max_score = fmaxf(max_score, dot * scale);
+    }
+
+    float sum = 0.0f;
+    float acc = 0.0f;
+    for (int ki = 0; ki <= qi; ++ki) {
+        float dot = 0.0f;
+        for (int hd = 0; hd < head_dim; ++hd) {
+            dot += q[qi * hidden + head_off + hd] * k[ki * hidden + head_off + hd];
+        }
+        float weight = expf(dot * scale - max_score);
+        acc += weight * v[ki * hidden + head_off + local_d];
+        sum += weight;
+    }
+    output[idx] = sum > 0.0f ? acc / sum : 0.0f;
+}
+"#;
+
+#[cfg(feature = "rocm")]
 fn rgb_tensor_to_u8_hip_on_gpu(
     gpu: &mut rdna_compute::Gpu,
     tensor: &CpuTensor,
@@ -6818,6 +6920,118 @@ fn scaled_dot_product_attention_hip_on_gpu(
 }
 
 #[cfg(feature = "rocm")]
+fn clip_causal_self_attention_hip_on_gpu(
+    gpu: &mut rdna_compute::Gpu,
+    q: &CpuTensor,
+    k: &CpuTensor,
+    v: &CpuTensor,
+    n_heads: usize,
+) -> DiffusionResult<CpuTensor> {
+    let (seq, hidden) = q.rows_cols()?;
+    if k.shape.as_slice() != [seq, hidden] || v.shape.as_slice() != [seq, hidden] {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "CLIP causal attention q/k/v shapes {:?}/{:?}/{:?} are incompatible",
+            q.shape, k.shape, v.shape
+        )));
+    }
+    if n_heads == 0 || hidden % n_heads != 0 {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "CLIP hidden size {hidden} is not divisible by {n_heads} heads"
+        )));
+    }
+    let head_dim = hidden / n_heads;
+    let output_shape = [seq, hidden];
+    let output_elements = checked_shape_elements("CLIP causal attention output", &output_shape)?;
+    if output_elements == 0 {
+        return Ok(CpuTensor::zeros(&output_shape));
+    }
+    let output_bytes = output_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata(
+                "CLIP causal attention output size overflows".to_string(),
+            )
+        })?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let q_gpu = gpu
+        .upload_f32(&q.data, &q.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let k_gpu = gpu
+        .upload_f32(&k.data, &k.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let v_gpu = gpu
+        .upload_f32(&v.data, &v.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = gpu
+        .hip
+        .malloc(output_bytes)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = compiler
+        .compile(
+            "diffusion_clip_causal_attention_f32",
+            DIFFUSION_CLIP_CAUSAL_ATTENTION_HIP_SRC,
+        )
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let obj_path = obj_path
+        .to_str()
+        .ok_or_else(|| {
+            DiffusionError::BackendUnavailable(
+                "compiled diffusion CLIP causal attention kernel path is not UTF-8".to_string(),
+            )
+        })?
+        .to_string();
+    let module = gpu
+        .hip
+        .module_load(&obj_path)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let function = gpu
+        .hip
+        .module_get_function(&module, "diffusion_clip_causal_attention_f32")
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(q_gpu.buf.as_ptr());
+    kernargs.push_ptr(k_gpu.buf.as_ptr());
+    kernargs.push_ptr(v_gpu.buf.as_ptr());
+    kernargs.push_ptr(output_gpu.as_ptr());
+    kernargs.push_i32(i32_kernel_dim(
+        "CLIP causal attention output elements",
+        output_elements,
+    )?);
+    kernargs.push_i32(i32_kernel_dim("CLIP causal attention sequence", seq)?);
+    kernargs.push_i32(i32_kernel_dim("CLIP causal attention hidden size", hidden)?);
+    kernargs.push_i32(i32_kernel_dim("CLIP causal attention heads", n_heads)?);
+    kernargs.push_i32(i32_kernel_dim("CLIP causal attention head dim", head_dim)?);
+    kernargs.pad_to(16);
+    let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+    unsafe {
+        gpu.hip
+            .launch_kernel_blob(
+                &function,
+                grid,
+                [256, 1, 1],
+                0,
+                gpu.active_stream.as_ref(),
+                kernargs.as_mut_slice(),
+            )
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(CpuTensor {
+        shape: output_shape.to_vec(),
+        data,
+    })
+}
+
+#[cfg(feature = "rocm")]
 fn scheduler_prediction_type_id(prediction_type: SchedulerPredictionType) -> i32 {
     match prediction_type {
         SchedulerPredictionType::Epsilon => 0,
@@ -7388,43 +7602,58 @@ impl ClipEncoderLayer {
         let q = linear(x, &self.q_proj_weight, &self.q_proj_bias)?;
         let k = linear(x, &self.k_proj_weight, &self.k_proj_bias)?;
         let v = linear(x, &self.v_proj_weight, &self.v_proj_bias)?;
-        let (seq, hidden) = x.rows_cols()?;
-        if hidden % n_heads != 0 {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "CLIP hidden size {hidden} is not divisible by {n_heads} heads"
-            )));
-        }
-        let head_dim = hidden / n_heads;
-        let scale = (head_dim as f32).sqrt().recip();
-        let mut context = CpuTensor::zeros(&[seq, hidden]);
-        for head in 0..n_heads {
-            let head_off = head * head_dim;
-            for i in 0..seq {
-                let mut scores = vec![0.0f32; seq];
-                for j in 0..seq {
-                    if j > i {
-                        scores[j] = f32::NEG_INFINITY;
-                        continue;
-                    }
-                    let mut dot = 0.0;
-                    for d in 0..head_dim {
-                        dot +=
-                            q.data[i * hidden + head_off + d] * k.data[j * hidden + head_off + d];
-                    }
-                    scores[j] = dot * scale;
-                }
-                softmax_in_place(&mut scores);
-                for d in 0..head_dim {
-                    let mut acc = 0.0;
-                    for j in 0..seq {
-                        acc += scores[j] * v.data[j * hidden + head_off + d];
-                    }
-                    context.data[i * hidden + head_off + d] = acc;
-                }
-            }
-        }
+        let context = clip_causal_self_attention(&q, &k, &v, n_heads)?;
         linear(&context, &self.out_proj_weight, &self.out_proj_bias)
     }
+}
+
+fn clip_causal_self_attention(
+    q: &CpuTensor,
+    k: &CpuTensor,
+    v: &CpuTensor,
+    n_heads: usize,
+) -> DiffusionResult<CpuTensor> {
+    let (seq, hidden) = q.rows_cols()?;
+    if k.shape.as_slice() != [seq, hidden] || v.shape.as_slice() != [seq, hidden] {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "CLIP causal attention q/k/v shapes {:?}/{:?}/{:?} are incompatible",
+            q.shape, k.shape, v.shape
+        )));
+    }
+    if n_heads == 0 || hidden % n_heads != 0 {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "CLIP hidden size {hidden} is not divisible by {n_heads} heads"
+        )));
+    }
+    let head_dim = hidden / n_heads;
+    let scale = (head_dim as f32).sqrt().recip();
+    let mut context = CpuTensor::zeros(&[seq, hidden]);
+    for head in 0..n_heads {
+        let head_off = head * head_dim;
+        for i in 0..seq {
+            let mut scores = vec![0.0f32; seq];
+            for j in 0..seq {
+                if j > i {
+                    scores[j] = f32::NEG_INFINITY;
+                    continue;
+                }
+                let mut dot = 0.0;
+                for d in 0..head_dim {
+                    dot += q.data[i * hidden + head_off + d] * k.data[j * hidden + head_off + d];
+                }
+                scores[j] = dot * scale;
+            }
+            softmax_in_place(&mut scores);
+            for d in 0..head_dim {
+                let mut acc = 0.0;
+                for j in 0..seq {
+                    acc += scores[j] * v.data[j * hidden + head_off + d];
+                }
+                context.data[i * hidden + head_off + d] = acc;
+            }
+        }
+    }
+    Ok(context)
 }
 
 fn linear(input: &CpuTensor, weight: &CpuTensor, bias: &CpuTensor) -> DiffusionResult<CpuTensor> {
@@ -13906,6 +14135,53 @@ mod tests {
             assert!(
                 (actual - expected).abs() <= 1e-5,
                 "SDPA mismatch at {index}: hip={actual} cpu={expected}"
+            );
+        }
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn hip_clip_causal_attention_matches_cpu_reference_when_gpu_is_available() {
+        let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!(
+                    "skip: ROCm GPU unavailable for CLIP causal attention parity test: {error}"
+                );
+                return;
+            }
+        };
+        let q = CpuTensor {
+            shape: vec![4, 4],
+            data: vec![
+                0.2, -0.4, 0.6, 1.0, -1.2, 0.3, 0.5, -0.7, 1.0, 0.0, -0.5, 0.25, -0.25, 0.75, -1.0,
+                0.5,
+            ],
+        };
+        let k = CpuTensor {
+            shape: vec![4, 4],
+            data: vec![
+                -0.5, 0.25, 0.75, -1.0, 1.25, -0.75, 0.5, 0.0, 0.1, 0.9, -0.3, 0.4, 0.7, -0.2, 0.3,
+                -0.8,
+            ],
+        };
+        let v = CpuTensor {
+            shape: vec![4, 4],
+            data: vec![
+                0.5, -1.0, 0.25, 0.75, -0.4, 0.6, -0.8, 1.2, 1.0, 0.2, -0.5, -0.1, -0.9, 0.3, 0.8,
+                -0.2,
+            ],
+        };
+
+        let cpu = clip_causal_self_attention(&q, &k, &v, 2).unwrap();
+        let hip = clip_causal_self_attention_hip_on_gpu(&mut gpu, &q, &k, &v, 2).unwrap();
+
+        assert_eq!(hip.shape, cpu.shape);
+        assert_eq!(&cpu.data[0..4], &v.data[0..4]);
+        for (index, (actual, expected)) in hip.data.iter().zip(&cpu.data).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1e-5,
+                "CLIP causal attention mismatch at {index}: hip={actual} cpu={expected}"
             );
         }
     }
