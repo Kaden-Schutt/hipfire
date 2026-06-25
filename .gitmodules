@@ -7,3 +7,9 @@
 [submodule "third_party/graphify"]
 	path = third_party/graphify
 	url = https://github.com/safishamsi/graphify.git
+[submodule "third_party/heretic"]
+	path = third_party/heretic
+	url = https://github.com/p-e-w/heretic.git
+[submodule "third_party/stable-diffusion-webui"]
+	path = third_party/stable-diffusion-webui
+	url = https://github.com/AUTOMATIC1111/stable-diffusion-webui.git
