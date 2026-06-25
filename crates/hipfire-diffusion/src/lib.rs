@@ -1671,7 +1671,7 @@ pub fn denoise_latents_with_cfg_progress(
     cfg_scale: f32,
     positive_embeddings: &CpuTensor,
     negative_embeddings: &CpuTensor,
-    predict_noise: impl FnMut(
+    mut predict_noise: impl FnMut(
         &CpuTensor,
         &[f32],
         &CpuTensor,
@@ -1689,7 +1689,9 @@ pub fn denoise_latents_with_cfg_progress(
         cfg_scale,
         positive_embeddings,
         negative_embeddings,
-        predict_noise,
+        |sample, timesteps, encoder_states, sdxl_conditioning, _runtime_context| {
+            predict_noise(sample, timesteps, encoder_states, sdxl_conditioning)
+        },
         positive_sdxl_conditioning,
         negative_sdxl_conditioning,
         inpaint_conditioning,
@@ -1711,6 +1713,7 @@ fn denoise_latents_with_cfg_progress_and_runtime_options(
         &[f32],
         &CpuTensor,
         Option<&SdxlDenoiseConditioning<'_>>,
+        &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<CpuTensor>,
     positive_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
     negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
@@ -1750,12 +1753,14 @@ fn denoise_latents_with_cfg_progress_and_runtime_options(
             &timesteps,
             negative_embeddings,
             negative_sdxl_conditioning,
+            &mut runtime_context,
         )?;
         let positive_pred = predict_noise(
             &model_sample,
             &timesteps,
             positive_embeddings,
             positive_sdxl_conditioning,
+            &mut runtime_context,
         )?;
         validate_noise_prediction(&latents, &negative_pred)?;
         validate_noise_prediction(&latents, &positive_pred)?;
@@ -2131,12 +2136,12 @@ fn scheduler_step_with_runtime_context(
     }
 }
 
-fn maybe_center_unet_input_with_runtime_options(
+fn maybe_center_unet_input_with_runtime_context(
     sample: &CpuTensor,
     center_input_sample: bool,
-    runtime_options: DiffusionGenerationRuntimeOptions,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<CpuTensor> {
-    let Some(device_id) = runtime_options.rocm_device_id else {
+    let Some(_device_id) = runtime_context.rocm_device_id() else {
         return Ok(maybe_center_unet_input(sample, center_input_sample));
     };
     if !center_input_sample {
@@ -2144,36 +2149,36 @@ fn maybe_center_unet_input_with_runtime_options(
     }
     #[cfg(feature = "rocm")]
     {
-        let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-        maybe_center_unet_input_hip_on_gpu(&mut gpu, sample, center_input_sample)
+        runtime_context.with_rocm_gpu(|gpu| {
+            maybe_center_unet_input_hip_on_gpu(gpu, sample, center_input_sample)
+        })
     }
     #[cfg(not(feature = "rocm"))]
     {
-        let _ = device_id;
+        let _ = _device_id;
         Err(rocm_hybrid_unavailable_error())
     }
 }
 
-fn timestep_embedding_with_runtime_options(
+fn timestep_embedding_with_runtime_context(
     timesteps: &[f32],
     dim: usize,
     flip_sin_to_cos: bool,
     freq_shift: f32,
-    runtime_options: DiffusionGenerationRuntimeOptions,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<CpuTensor> {
-    let Some(device_id) = runtime_options.rocm_device_id else {
+    let Some(_device_id) = runtime_context.rocm_device_id() else {
         return timestep_embedding(timesteps, dim, flip_sin_to_cos, freq_shift);
     };
     #[cfg(feature = "rocm")]
     {
-        let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-        timestep_embedding_hip_on_gpu(&mut gpu, timesteps, dim, flip_sin_to_cos, freq_shift)
+        runtime_context.with_rocm_gpu(|gpu| {
+            timestep_embedding_hip_on_gpu(gpu, timesteps, dim, flip_sin_to_cos, freq_shift)
+        })
     }
     #[cfg(not(feature = "rocm"))]
     {
-        let _ = device_id;
+        let _ = _device_id;
         Err(rocm_hybrid_unavailable_error())
     }
 }
@@ -2263,18 +2268,24 @@ fn silu_with_runtime_options(
     input: &CpuTensor,
     runtime_options: DiffusionGenerationRuntimeOptions,
 ) -> DiffusionResult<CpuTensor> {
-    let Some(device_id) = runtime_options.rocm_device_id else {
+    let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+    silu_with_runtime_context(input, &mut runtime_context)
+}
+
+fn silu_with_runtime_context(
+    input: &CpuTensor,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
+) -> DiffusionResult<CpuTensor> {
+    let Some(_device_id) = runtime_context.rocm_device_id() else {
         return Ok(tensor_map(input, silu));
     };
     #[cfg(feature = "rocm")]
     {
-        let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-        silu_hip_on_gpu(&mut gpu, input)
+        runtime_context.with_rocm_gpu(|gpu| silu_hip_on_gpu(gpu, input))
     }
     #[cfg(not(feature = "rocm"))]
     {
-        let _ = device_id;
+        let _ = _device_id;
         Err(rocm_hybrid_unavailable_error())
     }
 }
@@ -2390,23 +2401,21 @@ fn tensor_add_with_runtime_context(
     }
 }
 
-fn concat_last_dim_2d_with_runtime_options(
+fn concat_last_dim_2d_with_runtime_context(
     a: &CpuTensor,
     b: &CpuTensor,
-    runtime_options: DiffusionGenerationRuntimeOptions,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<CpuTensor> {
-    let Some(device_id) = runtime_options.rocm_device_id else {
+    let Some(_device_id) = runtime_context.rocm_device_id() else {
         return concat_last_dim_2d(a, b);
     };
     #[cfg(feature = "rocm")]
     {
-        let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-        concat_last_dim_2d_hip_on_gpu(&mut gpu, a, b)
+        runtime_context.with_rocm_gpu(|gpu| concat_last_dim_2d_hip_on_gpu(gpu, a, b))
     }
     #[cfg(not(feature = "rocm"))]
     {
-        let _ = device_id;
+        let _ = _device_id;
         Err(rocm_hybrid_unavailable_error())
     }
 }
@@ -5807,26 +5816,42 @@ impl UnetTimeEmbedding {
         freq_shift: f32,
         runtime_options: DiffusionGenerationRuntimeOptions,
     ) -> DiffusionResult<CpuTensor> {
+        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+        self.forward_with_runtime_context(
+            timesteps,
+            flip_sin_to_cos,
+            freq_shift,
+            &mut runtime_context,
+        )
+    }
+
+    fn forward_with_runtime_context(
+        &self,
+        timesteps: &[f32],
+        flip_sin_to_cos: bool,
+        freq_shift: f32,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
         let (_, embedding_dim) = self.linear_1_weight.rows_cols()?;
-        let input = timestep_embedding_with_runtime_options(
+        let input = timestep_embedding_with_runtime_context(
             timesteps,
             embedding_dim,
             flip_sin_to_cos,
             freq_shift,
-            runtime_options,
+            runtime_context,
         )?;
-        let hidden = linear_with_runtime_options(
+        let hidden = linear_with_runtime_context(
             &input,
             &self.linear_1_weight,
             &self.linear_1_bias,
-            runtime_options,
+            runtime_context,
         )?;
-        let hidden = silu_with_runtime_options(&hidden, runtime_options)?;
-        linear_with_runtime_options(
+        let hidden = silu_with_runtime_context(&hidden, runtime_context)?;
+        linear_with_runtime_context(
             &hidden,
             &self.linear_2_weight,
             &self.linear_2_bias,
-            runtime_options,
+            runtime_context,
         )
     }
 }
@@ -5893,6 +5918,24 @@ impl UnetTextTimeEmbedding {
         freq_shift: f32,
         runtime_options: DiffusionGenerationRuntimeOptions,
     ) -> DiffusionResult<CpuTensor> {
+        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+        self.forward_with_runtime_context(
+            text_embeds,
+            time_ids,
+            flip_sin_to_cos,
+            freq_shift,
+            &mut runtime_context,
+        )
+    }
+
+    fn forward_with_runtime_context(
+        &self,
+        text_embeds: &CpuTensor,
+        time_ids: &CpuTensor,
+        flip_sin_to_cos: bool,
+        freq_shift: f32,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
         let [batch, _] = shape2(text_embeds)?;
         let [time_batch, time_id_count] = shape2(time_ids)?;
         if time_batch != batch {
@@ -5900,12 +5943,12 @@ impl UnetTextTimeEmbedding {
                 "SDXL time_ids batch {time_batch} != text_embeds batch {batch}"
             )));
         }
-        let time_embeds = timestep_embedding_with_runtime_options(
+        let time_embeds = timestep_embedding_with_runtime_context(
             &time_ids.data,
             self.addition_time_embed_dim,
             flip_sin_to_cos,
             freq_shift,
-            runtime_options,
+            runtime_context,
         )?;
         let [flat_time, time_width] = shape2(&time_embeds)?;
         if flat_time != batch * time_id_count {
@@ -5923,19 +5966,19 @@ impl UnetTextTimeEmbedding {
                     .copy_from_slice(&time_embeds.data[src..src + time_width]);
             }
         }
-        let input = concat_last_dim_2d_with_runtime_options(text_embeds, &flat, runtime_options)?;
-        let hidden = linear_with_runtime_options(
+        let input = concat_last_dim_2d_with_runtime_context(text_embeds, &flat, runtime_context)?;
+        let hidden = linear_with_runtime_context(
             &input,
             &self.linear_1_weight,
             &self.linear_1_bias,
-            runtime_options,
+            runtime_context,
         )?;
-        let hidden = silu_with_runtime_options(&hidden, runtime_options)?;
-        linear_with_runtime_options(
+        let hidden = silu_with_runtime_context(&hidden, runtime_context)?;
+        linear_with_runtime_context(
             &hidden,
             &self.linear_2_weight,
             &self.linear_2_bias,
-            runtime_options,
+            runtime_context,
         )
     }
 }
@@ -6886,6 +6929,25 @@ impl NativeUnet2DConditionModel {
         sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
         runtime_options: DiffusionGenerationRuntimeOptions,
     ) -> DiffusionResult<CpuTensor> {
+        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+        self.forward_with_sdxl_conditioning_and_runtime_context(
+            sample,
+            timesteps,
+            encoder_states,
+            sdxl_conditioning,
+            &mut runtime_context,
+        )
+    }
+
+    fn forward_with_sdxl_conditioning_and_runtime_context(
+        &self,
+        sample: &CpuTensor,
+        timesteps: &[f32],
+        encoder_states: &CpuTensor,
+        sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
+        let runtime_options = runtime_context.options;
         let [batch, _, _, _] = shape4(sample)?;
         if timesteps.len() != batch {
             return Err(DiffusionError::InvalidRequest(format!(
@@ -6899,16 +6961,16 @@ impl NativeUnet2DConditionModel {
                 "UNet encoder batch {encoder_batch} != sample batch {batch}"
             )));
         }
-        let sample = maybe_center_unet_input_with_runtime_options(
+        let sample = maybe_center_unet_input_with_runtime_context(
             sample,
             self.center_input_sample,
-            runtime_options,
+            runtime_context,
         )?;
-        let mut time_embedding = self.time_embedding.forward_with_runtime_options(
+        let mut time_embedding = self.time_embedding.forward_with_runtime_context(
             timesteps,
             self.flip_sin_to_cos,
             self.freq_shift,
-            runtime_options,
+            runtime_context,
         )?;
         if let Some(sdxl_conditioning) = sdxl_conditioning {
             let add_embedding = self.add_embedding.as_ref().ok_or_else(|| {
@@ -6916,15 +6978,15 @@ impl NativeUnet2DConditionModel {
                     "SDXL text_time conditioning requires UNet add_embedding weights".to_string(),
                 )
             })?;
-            let added = add_embedding.forward_with_runtime_options(
+            let added = add_embedding.forward_with_runtime_context(
                 sdxl_conditioning.text_embeds,
                 sdxl_conditioning.time_ids,
                 self.flip_sin_to_cos,
                 self.freq_shift,
-                runtime_options,
+                runtime_context,
             )?;
             time_embedding =
-                tensor_add_with_runtime_options(&time_embedding, &added, runtime_options)?;
+                tensor_add_with_runtime_context(&time_embedding, &added, runtime_context)?;
         }
         let (hidden, mut skips) = self.down_path.forward_with_runtime_options(
             &sample,
@@ -6952,7 +7014,7 @@ impl NativeUnet2DConditionModel {
         let hidden = self
             .conv_norm_out
             .forward_with_runtime_options(&hidden, runtime_options)?;
-        let hidden = silu_with_runtime_options(&hidden, runtime_options)?;
+        let hidden = silu_with_runtime_context(&hidden, runtime_context)?;
         self.conv_out
             .forward_with_runtime_options(&hidden, runtime_options)
     }
@@ -7006,13 +7068,13 @@ impl NativeUnet2DConditionModel {
             cfg_scale,
             positive_embeddings,
             negative_embeddings,
-            |sample, timesteps, encoder_states, sdxl_conditioning| {
-                self.forward_with_sdxl_conditioning_and_runtime_options(
+            |sample, timesteps, encoder_states, sdxl_conditioning, runtime_context| {
+                self.forward_with_sdxl_conditioning_and_runtime_context(
                     sample,
                     timesteps,
                     encoder_states,
                     sdxl_conditioning,
-                    runtime_options,
+                    runtime_context,
                 )
             },
             positive_sdxl_conditioning,
@@ -18354,7 +18416,8 @@ mod tests {
             |sample: &CpuTensor,
              _timesteps: &[f32],
              encoder_states: &CpuTensor,
-             _sdxl: Option<&SdxlDenoiseConditioning<'_>>| {
+             _sdxl: Option<&SdxlDenoiseConditioning<'_>>,
+             _runtime_context: &mut DiffusionGenerationRuntimeContext| {
                 let bias = encoder_states.data[0];
                 Ok(CpuTensor {
                     shape: sample.shape.clone(),
@@ -20727,6 +20790,16 @@ mod tests {
                     .unwrap();
                 assert_eq!(hip.shape, output.shape);
                 assert!(f32_slices_close(&hip.data, &output.data, 1e-5));
+
+                let mut runtime_context = DiffusionGenerationRuntimeContext::new(
+                    DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
+                );
+                let hip_context = time_embedding
+                    .forward_with_runtime_context(&[0.0, 1.0], true, 0.0, &mut runtime_context)
+                    .unwrap();
+                assert_eq!(runtime_context.rocm_gpu_init_count(), 1);
+                assert_eq!(hip_context.shape, output.shape);
+                assert!(f32_slices_close(&hip_context.data, &output.data, 1e-5));
             }
         }
         let _ = fs::remove_dir_all(&dir);
