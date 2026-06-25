@@ -32,22 +32,28 @@ extern "C" __global__ void fused_qkv_hfq4g256(
     float*       __restrict__ y_k,
     float*       __restrict__ y_v,
     int q_m, int k_m, int v_m,
-    int K
+    int K,
+    // Optional Q/K/V bias (HIPFIRE_FUSE_QKV_BIAS). NULL = pure no-op, so the
+    // unfused callers that pass null stay byte-identical to the pre-fold path.
+    const float* __restrict__ bias_q,
+    const float* __restrict__ bias_k,
+    const float* __restrict__ bias_v
 ) {
     const int gid = blockIdx.x;
     const int total_m = q_m + k_m + v_m;
     if (gid >= total_m) return;
 
-    // Route to one of the three projections.
+    // Route to one of the three projections (and its matching bias).
     const char* A;
     float* y;
     int row;
+    const float* bias;
     if (gid < q_m) {
-        A = A_q; y = y_q; row = gid;
+        A = A_q; y = y_q; row = gid; bias = bias_q;
     } else if (gid < q_m + k_m) {
-        A = A_k; y = y_k; row = gid - q_m;
+        A = A_k; y = y_k; row = gid - q_m; bias = bias_k;
     } else {
-        A = A_v; y = y_v; row = gid - q_m - k_m;
+        A = A_v; y = y_v; row = gid - q_m - k_m; bias = bias_v;
     }
 
     const int tid = threadIdx.x;
@@ -143,5 +149,7 @@ extern "C" __global__ void fused_qkv_hfq4g256(
     for (int offset = 16; offset > 0; offset >>= 1)
         acc += __shfl_down(acc, offset);
 
-    if (tid == 0) y[row] = acc;
+    // NULL bias is a pure no-op: callers passing null stay byte-identical.
+    // fp32 store→load→add (separate path) == fused fp32 add (same order) → bit-exact.
+    if (tid == 0) y[row] = acc + (bias ? bias[row] : 0.0f);
 }

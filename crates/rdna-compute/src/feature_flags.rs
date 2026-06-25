@@ -108,6 +108,19 @@ pub struct FeatureFlags {
     /// fused-vs-unfused validation. Env: HIPFIRE_FORCE_UNFUSED=1. Single-GPU
     /// decode projection fusions only (see Phase-2a spec §4b honest-scope).
     pub force_unfused: bool,
+
+    /// Fold the 3 separate QKV `BiasAdd` launches (qwen2-family `attention_bias`)
+    /// into the per-row fused-QKV decode kernel's lane-0 store. Eliminates 3 tiny
+    /// overhead-dominated launches/layer. Env: HIPFIRE_FUSE_QKV_BIAS — default ON;
+    /// set `=0` to opt out (for bisection). NULL bias pointers are a kernel no-op,
+    /// so non-bias callers stay byte-identical regardless. Only fires for fused-QKV
+    /// keys whose dispatch arm reads the bias (see `qkv_bias_fold_supported`).
+    pub fuse_qkv_bias: bool,
+
+    /// Diagnostic: log each QKV-bias fold to stderr. Env:
+    /// HIPFIRE_FUSE_QKV_BIAS_DEBUG=1. Default off. Resolved once at init so the
+    /// default-on fold hot path takes no per-launch `env::var` lock.
+    pub fuse_qkv_bias_debug: bool,
 }
 
 impl FeatureFlags {
@@ -270,6 +283,10 @@ impl FeatureFlags {
             force_unfused: std::env::var("HIPFIRE_FORCE_UNFUSED")
                 .map(|v| v == "1")
                 .unwrap_or(false),
+
+            // QKV bias fold — default ON, opt out with HIPFIRE_FUSE_QKV_BIAS=0.
+            fuse_qkv_bias: parse_bool("HIPFIRE_FUSE_QKV_BIAS").unwrap_or(true),
+            fuse_qkv_bias_debug: std::env::var("HIPFIRE_FUSE_QKV_BIAS_DEBUG").as_deref() == Ok("1"),
         }
     }
 
@@ -405,6 +422,8 @@ impl FeatureFlags {
             rdna2_variant: None,
             hipcc_extra_flags: String::new(),
             force_unfused: false,
+            fuse_qkv_bias: true,
+            fuse_qkv_bias_debug: false,
         }
     }
 }
@@ -417,5 +436,11 @@ mod tests {
     fn force_unfused_defaults_false_in_test_ctor() {
         let f = FeatureFlags::from_env_for_test("gfx1151");
         assert!(!f.force_unfused);
+    }
+
+    #[test]
+    fn fuse_qkv_bias_defaults_on_in_test_ctor() {
+        let f = FeatureFlags::from_env_for_test("gfx1151");
+        assert!(f.fuse_qkv_bias);
     }
 }
