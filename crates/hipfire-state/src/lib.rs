@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use hipfire_model::{
     accelerator_inventory_json, is_qwen35_family_arch_id, parse_model_worker_id,
-    AcceleratorInventory, ModelWorkerId,
+    AcceleratorInventory, ModelWorkerId, ARCH_ID_LFM2_MOE, ARCH_ID_MINIMAX_M2, ARCH_ID_NEMOTRON_H,
 };
 
 #[derive(Clone, Debug)]
@@ -31,6 +31,7 @@ pub struct GenericSequenceStateArena {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SequenceStateArenaBackend {
     Qwen35Wrapped,
+    BackendOwned,
     Unsupported,
 }
 
@@ -59,6 +60,7 @@ impl SequenceStateArenaBackend {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Qwen35Wrapped => "qwen35_wrapped",
+            Self::BackendOwned => "backend_owned",
             Self::Unsupported => "unsupported",
         }
     }
@@ -66,6 +68,7 @@ impl SequenceStateArenaBackend {
     pub fn owns_state_pages(self) -> bool {
         match self {
             Self::Qwen35Wrapped => true,
+            Self::BackendOwned => false,
             Self::Unsupported => false,
         }
     }
@@ -79,6 +82,7 @@ impl SequenceStateArenaBackend {
                 SequenceStateArenaOperation::ReleaseState,
                 SequenceStateArenaOperation::DescribeState,
             ],
+            Self::BackendOwned => &[SequenceStateArenaOperation::DescribeState],
             Self::Unsupported => &[],
         }
     }
@@ -86,6 +90,12 @@ impl SequenceStateArenaBackend {
     pub fn for_worker_parts(arch_id: u32, pp: usize) -> Self {
         if is_qwen35_family_arch_id(arch_id) && pp == 1 {
             Self::Qwen35Wrapped
+        } else if matches!(
+            arch_id,
+            ARCH_ID_MINIMAX_M2 | ARCH_ID_LFM2_MOE | ARCH_ID_NEMOTRON_H
+        ) && pp == 1
+        {
+            Self::BackendOwned
         } else {
             Self::Unsupported
         }
@@ -94,6 +104,12 @@ impl SequenceStateArenaBackend {
     pub fn require_supported(self, arch_id: u32, pp: usize, op: &str) -> Result<(), String> {
         match self {
             Self::Qwen35Wrapped => Ok(()),
+            Self::BackendOwned if op == SequenceStateArenaOperation::DescribeState.as_str() => {
+                Ok(())
+            }
+            Self::BackendOwned => Err(format!(
+                "{op} is not supported for backend-owned sequence state (arch_id={arch_id} pp={pp})"
+            )),
             Self::Unsupported => Err(format!(
                 "{op} requires a supported sequence-state arena (arch_id={arch_id} pp={pp})"
             )),
@@ -264,6 +280,8 @@ pub fn validate_checkpoint_logical_position(
 pub enum SequenceStatePageKind {
     Kv,
     DeltaNet,
+    MambaSsm,
+    MambaConv,
     Logits,
     BackendPrivate,
 }
@@ -273,6 +291,8 @@ impl SequenceStatePageKind {
         match self {
             Self::Kv => "attention_kv",
             Self::DeltaNet => "deltanet_recurrent",
+            Self::MambaSsm => "mamba_ssm",
+            Self::MambaConv => "mamba_conv",
             Self::Logits => "logits",
             Self::BackendPrivate => "backend_private",
         }
@@ -282,10 +302,10 @@ impl SequenceStatePageKind {
         match kind {
             "attention_kv" => Some(Self::Kv),
             "deltanet_recurrent" => Some(Self::DeltaNet),
+            "mamba_ssm" => Some(Self::MambaSsm),
+            "mamba_conv" => Some(Self::MambaConv),
             "logits" => Some(Self::Logits),
-            "backend_private" | "architecture_specific" | "mamba_ssm" | "mamba_conv" => {
-                Some(Self::BackendPrivate)
-            }
+            "backend_private" | "architecture_specific" => Some(Self::BackendPrivate),
             _ => None,
         }
     }
@@ -294,9 +314,24 @@ impl SequenceStatePageKind {
         match kind {
             "attention_kv" => Some(Self::Kv),
             "deltanet_recurrent" => Some(Self::DeltaNet),
-            "mamba_ssm" | "mamba_conv" | "architecture_specific" => Some(Self::BackendPrivate),
+            "mamba_ssm" => Some(Self::MambaSsm),
+            "mamba_conv" => Some(Self::MambaConv),
+            "architecture_specific" => Some(Self::BackendPrivate),
             _ => None,
         }
+    }
+}
+
+pub fn canonical_state_kind_label(kind: &str) -> Option<&'static str> {
+    match kind {
+        "kv" | "attention_kv" => Some(SequenceStatePageKind::Kv.as_str()),
+        "deltanet" | "deltanet_recurrent" => Some(SequenceStatePageKind::DeltaNet.as_str()),
+        "mamba_ssm" => Some(SequenceStatePageKind::MambaSsm.as_str()),
+        "mamba_conv" | "short_conv" => Some(SequenceStatePageKind::MambaConv.as_str()),
+        "logits" => Some(SequenceStatePageKind::Logits.as_str()),
+        "architecture_specific" => Some("architecture_specific"),
+        "backend_private" => Some(SequenceStatePageKind::BackendPrivate.as_str()),
+        _ => None,
     }
 }
 
@@ -304,25 +339,34 @@ pub fn generate_state_kinds_include_required(
     state_kinds: &[String],
     required: SequenceStatePageKind,
 ) -> bool {
-    state_kinds.iter().any(|kind| match required {
-        SequenceStatePageKind::Kv => kind == "attention_kv",
-        SequenceStatePageKind::DeltaNet => kind == "deltanet_recurrent",
-        SequenceStatePageKind::BackendPrivate => {
-            matches!(
-                kind.as_str(),
-                "mamba_ssm" | "mamba_conv" | "architecture_specific"
-            )
-        }
-        SequenceStatePageKind::Logits => false,
-    })
+    state_kinds
+        .iter()
+        .any(|kind| match (required, kind.as_str()) {
+            (SequenceStatePageKind::Kv, "attention_kv") => true,
+            (SequenceStatePageKind::DeltaNet, "deltanet_recurrent") => true,
+            (SequenceStatePageKind::MambaSsm, "mamba_ssm") => true,
+            (SequenceStatePageKind::MambaConv, "mamba_conv") => true,
+            (SequenceStatePageKind::BackendPrivate, "architecture_specific") => true,
+            _ => false,
+        })
+}
+
+pub fn normalize_generate_state_kind_set(state_kinds: &[String]) -> Vec<String> {
+    let mut normalized = state_kinds
+        .iter()
+        .map(|kind| {
+            canonical_state_kind_label(kind)
+                .unwrap_or(kind.as_str())
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    normalized
 }
 
 pub fn generate_state_kind_sets_match_exactly(a: &[String], b: &[String]) -> bool {
-    let mut a = a.to_vec();
-    let mut b = b.to_vec();
-    a.sort();
-    b.sort();
-    a == b
+    normalize_generate_state_kind_set(a) == normalize_generate_state_kind_set(b)
 }
 
 pub fn canonical_generate_state_kind_hash_label(state_kinds: &[String]) -> String {
@@ -336,6 +380,31 @@ pub fn qwen35_kv_deltanet_state_kind_labels() -> Vec<&'static str> {
     vec![
         SequenceStatePageKind::Kv.as_str(),
         SequenceStatePageKind::DeltaNet.as_str(),
+    ]
+}
+
+pub fn minimax_state_kind_labels() -> Vec<&'static str> {
+    vec![
+        SequenceStatePageKind::Kv.as_str(),
+        SequenceStatePageKind::Logits.as_str(),
+        SequenceStatePageKind::BackendPrivate.as_str(),
+    ]
+}
+
+pub fn lfm2_state_kind_labels() -> Vec<&'static str> {
+    vec![
+        SequenceStatePageKind::Kv.as_str(),
+        SequenceStatePageKind::Logits.as_str(),
+        SequenceStatePageKind::BackendPrivate.as_str(),
+    ]
+}
+
+pub fn nemotron_h_state_kind_labels() -> Vec<&'static str> {
+    vec![
+        SequenceStatePageKind::Kv.as_str(),
+        SequenceStatePageKind::MambaSsm.as_str(),
+        SequenceStatePageKind::MambaConv.as_str(),
+        SequenceStatePageKind::Logits.as_str(),
     ]
 }
 
@@ -469,6 +538,7 @@ impl SequenceStateAllocatorPolicy {
     ) -> Self {
         let page_ownership = match backend {
             SequenceStateArenaBackend::Unsupported => SequenceStatePageOwnership::Unsupported,
+            SequenceStateArenaBackend::BackendOwned => SequenceStatePageOwnership::BackendWrapped,
             SequenceStateArenaBackend::Qwen35Wrapped => {
                 if descriptors.iter().any(|descriptor| descriptor.owns_pages) {
                     SequenceStatePageOwnership::ArenaOwned
@@ -1223,11 +1293,16 @@ pub fn generic_state_reservation_descriptors(
             let label = match kind {
                 SequenceStatePageKind::Kv => "generic.attention_kv",
                 SequenceStatePageKind::DeltaNet => "generic.deltanet_recurrent",
+                SequenceStatePageKind::MambaSsm => "generic.mamba_ssm",
+                SequenceStatePageKind::MambaConv => "generic.mamba_conv",
                 SequenceStatePageKind::Logits => "generic.logits",
                 SequenceStatePageKind::BackendPrivate => "generic.backend_private",
             };
             let shape = match kind {
-                SequenceStatePageKind::Kv | SequenceStatePageKind::DeltaNet => vec![physical_cap],
+                SequenceStatePageKind::Kv
+                | SequenceStatePageKind::DeltaNet
+                | SequenceStatePageKind::MambaSsm
+                | SequenceStatePageKind::MambaConv => vec![physical_cap],
                 SequenceStatePageKind::Logits | SequenceStatePageKind::BackendPrivate => vec![1],
             };
             SequenceStatePageDescriptor {
@@ -1292,7 +1367,12 @@ pub fn parsed_handle_may_target_loaded_state(handle: &ParsedSequenceStateHandle)
     handle
         .kind
         .as_deref()
-        .map(|kind| matches!(kind, "qwen35_session" | "qwen35_checkpoint"))
+        .map(|kind| {
+            matches!(
+                kind,
+                "qwen35_session" | "qwen35_checkpoint" | "backend_owned_session"
+            )
+        })
         .unwrap_or(true)
 }
 
@@ -1323,7 +1403,8 @@ mod tests {
             vec![
                 SequenceStatePageKind::Kv,
                 SequenceStatePageKind::DeltaNet,
-                SequenceStatePageKind::BackendPrivate
+                SequenceStatePageKind::MambaSsm,
+                SequenceStatePageKind::MambaConv
             ]
         );
 
@@ -1346,11 +1427,11 @@ mod tests {
         );
         assert_eq!(
             SequenceStatePageKind::from_generate_state_kind("mamba_ssm"),
-            Some(SequenceStatePageKind::BackendPrivate)
+            Some(SequenceStatePageKind::MambaSsm)
         );
         assert_eq!(
             SequenceStatePageKind::from_generate_state_kind("mamba_conv"),
-            Some(SequenceStatePageKind::BackendPrivate)
+            Some(SequenceStatePageKind::MambaConv)
         );
         assert_eq!(
             SequenceStatePageKind::from_generate_state_kind("architecture_specific"),
@@ -1386,6 +1467,20 @@ mod tests {
             &["backend_private".to_string()],
             SequenceStatePageKind::BackendPrivate
         ));
+
+        let mamba = vec!["mamba_ssm".to_string(), "mamba_conv".to_string()];
+        assert!(generate_state_kinds_include_required(
+            &mamba,
+            SequenceStatePageKind::MambaSsm
+        ));
+        assert!(generate_state_kinds_include_required(
+            &mamba,
+            SequenceStatePageKind::MambaConv
+        ));
+        assert!(!generate_state_kinds_include_required(
+            &mamba,
+            SequenceStatePageKind::BackendPrivate
+        ));
     }
 
     #[test]
@@ -1400,6 +1495,10 @@ mod tests {
 
         assert!(generate_state_kind_sets_match_exactly(&a, &b));
         assert!(!generate_state_kind_sets_match_exactly(&c, &d));
+        assert!(generate_state_kind_sets_match_exactly(
+            &["kv".to_string(), "deltanet".to_string()],
+            &["attention_kv".to_string(), "deltanet_recurrent".to_string()]
+        ));
     }
 
     #[test]
@@ -1521,10 +1620,7 @@ mod tests {
         assert_eq!(request.reservation_id.as_deref(), Some("reserve-a"));
         assert_eq!(
             request.state_kinds,
-            vec![
-                SequenceStatePageKind::Kv,
-                SequenceStatePageKind::BackendPrivate
-            ]
+            vec![SequenceStatePageKind::Kv, SequenceStatePageKind::MambaSsm]
         );
         assert_eq!(request.physical_cap, 8192);
         assert_eq!(request.ttl_ms, 0);
@@ -1928,6 +2024,31 @@ mod tests {
         assert_eq!(wrapped.spill_target, SequenceStateSpillTarget::Disabled);
         assert!(!wrapped.copy_on_write_attach);
 
+        let backend_owned = SequenceStateAllocatorPolicy::for_backend(
+            SequenceStateArenaBackend::BackendOwned,
+            &[SequenceStatePageDescriptor {
+                session_id: "nemotron:active".to_string(),
+                handle: SequenceStateHandle {
+                    id: "nemotron:active".to_string(),
+                    kind: "backend_owned_session".to_string(),
+                    generation: 0,
+                },
+                kind: SequenceStatePageKind::MambaSsm,
+                label: "nemotron.mamba_ssm".to_string(),
+                logical_position: 1,
+                resident_bytes: 1024,
+                allocation_epoch: 0,
+                owns_pages: false,
+                shape: vec![23, 7680, 128],
+                placement: "hip:arch14:device0".to_string(),
+                role: "active_backend_owned".to_string(),
+            }],
+        );
+        assert_eq!(
+            backend_owned.page_ownership,
+            SequenceStatePageOwnership::BackendWrapped
+        );
+
         let unsupported =
             SequenceStateAllocatorPolicy::for_backend(SequenceStateArenaBackend::Unsupported, &[]);
         assert_eq!(
@@ -2262,6 +2383,14 @@ mod tests {
         .unwrap();
         assert!(!parsed_handle_may_target_generic(&qwen35));
         assert!(parsed_handle_may_target_loaded_state(&qwen35));
+
+        let backend_owned = parse_sequence_state_handle(&serde_json::json!({
+            "id": "nemotron:active",
+            "kind": "backend_owned_session"
+        }))
+        .unwrap();
+        assert!(!parsed_handle_may_target_generic(&backend_owned));
+        assert!(parsed_handle_may_target_loaded_state(&backend_owned));
     }
 
     #[test]
@@ -2278,6 +2407,17 @@ mod tests {
             SequenceStateArenaBackend::for_worker_parts(5, 2),
             SequenceStateArenaBackend::Unsupported
         );
+        assert_eq!(
+            SequenceStateArenaBackend::for_worker_parts(14, 1),
+            SequenceStateArenaBackend::BackendOwned
+        );
+        assert!(SequenceStateArenaBackend::BackendOwned
+            .require_supported(14, 1, "describe_state")
+            .is_ok());
+        assert!(SequenceStateArenaBackend::BackendOwned
+            .require_supported(14, 1, "fork_session_state")
+            .unwrap_err()
+            .contains("not supported for backend-owned sequence state"));
         assert!(SequenceStateArenaBackend::Qwen35Wrapped
             .require_supported(5, 1, "attach_checkpoint")
             .is_ok());

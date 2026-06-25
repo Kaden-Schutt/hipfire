@@ -24,7 +24,7 @@ use hipfire_arch_qwen35::qwen35::{DeltaNetState, LayerType};
 use hipfire_mixer::{MixerKind, MixerProfile};
 use hipfire_model::{
     is_qwen35_family_arch_id, is_qwen35_moe_arch_id, parse_model_worker_id, AcceleratorDeviceInfo,
-    AcceleratorInventory, ModelWorkerId,
+    AcceleratorInventory, ModelWorkerId, ARCH_ID_LFM2_MOE, ARCH_ID_MINIMAX_M2, ARCH_ID_NEMOTRON_H,
 };
 use hipfire_runtime::kv;
 use hipfire_runtime::sequence_state::SequenceState;
@@ -34,12 +34,14 @@ use hipfire_state::{
     validate_checkpoint_logical_position, validate_checkpoint_prefix_hash,
     validate_checkpoint_source_resident, DescribedSequenceState, ModelWorkerRuntimeView,
     ParsedSequenceStateHandle, SequenceStateArenaBackend, SequenceStateCheckpointRequest,
-    SequenceStateForkRequest, SequenceStatePageDescriptor, SequenceStatePageKind,
-    SequenceStatePrefixHash,
+    SequenceStateForkRequest, SequenceStateHandle, SequenceStatePageDescriptor,
+    SequenceStatePageKind, SequenceStatePrefixHash,
 };
 
 use crate::events::write_error;
-use crate::memory::loaded_model_memory_view;
+use crate::memory::{
+    kv_cache_bytes, loaded_model_memory_view, minimax_state_bytes, tensor_bytes, tensor_vec_bytes,
+};
 use crate::model::LoadedModel;
 
 /// Synthetic session id used by the legacy single-session `generate` path (the
@@ -545,6 +547,233 @@ pub fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDe
             });
         }
     }
+    descriptors
+}
+
+pub fn backend_owned_session_id(m: &LoadedModel) -> &'static str {
+    match m.arch_id {
+        ARCH_ID_MINIMAX_M2 => "minimax:active",
+        ARCH_ID_LFM2_MOE => "lfm2:active",
+        ARCH_ID_NEMOTRON_H => "nemotron:active",
+        _ => "backend-owned:active",
+    }
+}
+
+fn backend_owned_sequence_state_handle(m: &LoadedModel) -> SequenceStateHandle {
+    SequenceStateHandle {
+        id: backend_owned_session_id(m).to_string(),
+        kind: "backend_owned_session".to_string(),
+        generation: 0,
+    }
+}
+
+pub fn backend_owned_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescriptor> {
+    match m.arch_id {
+        ARCH_ID_MINIMAX_M2 => minimax_state_page_descriptors(m),
+        ARCH_ID_LFM2_MOE => lfm2_state_page_descriptors(m),
+        ARCH_ID_NEMOTRON_H => nemotron_state_page_descriptors(m),
+        _ => Vec::new(),
+    }
+}
+
+pub fn minimax_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescriptor> {
+    let Some(state) = m.minimax_state.as_ref() else {
+        return Vec::new();
+    };
+    let session_id = backend_owned_session_id(m).to_string();
+    let handle = backend_owned_sequence_state_handle(m);
+    let logical_position = m.seq_pos;
+    let placement = format!("hip:arch{}:device0", m.arch_id);
+    let kv_bytes = kv_cache_bytes(&state.kv);
+    let logits_bytes = tensor_bytes(&state.logits);
+    let private_bytes = minimax_state_bytes(state)
+        .saturating_sub(kv_bytes)
+        .saturating_sub(logits_bytes);
+    vec![
+        SequenceStatePageDescriptor {
+            session_id: session_id.clone(),
+            handle: handle.clone(),
+            kind: SequenceStatePageKind::Kv,
+            label: "minimax.kv_cache".to_string(),
+            logical_position,
+            resident_bytes: kv_bytes,
+            allocation_epoch: handle.generation,
+            owns_pages: false,
+            shape: vec![
+                state.kv.k_gpu.len(),
+                state.kv.physical_cap,
+                state.kv.n_kv_heads,
+                state.kv.head_dim,
+            ],
+            placement: placement.clone(),
+            role: "active_backend_owned".to_string(),
+        },
+        SequenceStatePageDescriptor {
+            session_id: session_id.clone(),
+            handle: handle.clone(),
+            kind: SequenceStatePageKind::Logits,
+            label: "minimax.logits".to_string(),
+            logical_position,
+            resident_bytes: logits_bytes,
+            allocation_epoch: handle.generation,
+            owns_pages: false,
+            shape: state.logits.shape.clone(),
+            placement: placement.clone(),
+            role: "active_backend_owned".to_string(),
+        },
+        SequenceStatePageDescriptor {
+            session_id,
+            handle,
+            kind: SequenceStatePageKind::BackendPrivate,
+            label: "minimax.decode_scratch".to_string(),
+            logical_position,
+            resident_bytes: private_bytes,
+            allocation_epoch: 0,
+            owns_pages: false,
+            shape: vec![1],
+            placement,
+            role: "active_backend_owned".to_string(),
+        },
+    ]
+}
+
+#[cfg(feature = "arch-lfm2moe")]
+pub fn lfm2_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescriptor> {
+    let Some(state) = m.lfm2moe_state.as_ref() else {
+        return Vec::new();
+    };
+    let session_id = backend_owned_session_id(m).to_string();
+    let handle = backend_owned_sequence_state_handle(m);
+    let logical_position = m.seq_pos;
+    let placement = format!("hip:arch{}:device0", m.arch_id);
+    let conv_bytes = tensor_vec_bytes(&state.conv_states);
+    let conv_shape = m
+        .lfm2moe_config
+        .as_ref()
+        .map(|cfg| {
+            vec![
+                state.conv_states.len(),
+                cfg.hidden_size,
+                cfg.conv_kernel_size - 1,
+            ]
+        })
+        .unwrap_or_else(|| vec![state.conv_states.len()]);
+    vec![
+        SequenceStatePageDescriptor {
+            session_id: session_id.clone(),
+            handle: handle.clone(),
+            kind: SequenceStatePageKind::Kv,
+            label: "lfm2.kv_cache".to_string(),
+            logical_position,
+            resident_bytes: kv_cache_bytes(&state.kv),
+            allocation_epoch: handle.generation,
+            owns_pages: false,
+            shape: vec![
+                state.kv.k_gpu.len(),
+                state.kv.physical_cap,
+                state.kv.n_kv_heads,
+                state.kv.head_dim,
+            ],
+            placement: placement.clone(),
+            role: "active_backend_owned".to_string(),
+        },
+        SequenceStatePageDescriptor {
+            session_id: session_id.clone(),
+            handle: handle.clone(),
+            kind: SequenceStatePageKind::BackendPrivate,
+            label: "lfm2.short_conv_state".to_string(),
+            logical_position,
+            resident_bytes: conv_bytes,
+            allocation_epoch: handle.generation,
+            owns_pages: false,
+            shape: conv_shape,
+            placement: placement.clone(),
+            role: "active_backend_owned".to_string(),
+        },
+        SequenceStatePageDescriptor {
+            session_id,
+            handle,
+            kind: SequenceStatePageKind::Logits,
+            label: "lfm2.logits".to_string(),
+            logical_position,
+            resident_bytes: tensor_bytes(&state.logits),
+            allocation_epoch: 0,
+            owns_pages: false,
+            shape: state.logits.shape.clone(),
+            placement,
+            role: "active_backend_owned".to_string(),
+        },
+    ]
+}
+
+#[cfg(not(feature = "arch-lfm2moe"))]
+pub fn lfm2_state_page_descriptors(_m: &LoadedModel) -> Vec<SequenceStatePageDescriptor> {
+    Vec::new()
+}
+
+pub fn nemotron_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescriptor> {
+    let Some(model) = m.nemotron_backend.as_ref() else {
+        return Vec::new();
+    };
+    let session_id = backend_owned_session_id(m).to_string();
+    let handle = backend_owned_sequence_state_handle(m);
+    let logical_position = m.seq_pos;
+    let placement = format!("hip:arch{}:device0", m.arch_id);
+    let mut descriptors = Vec::new();
+    let mut push = |kind: SequenceStatePageKind,
+                    label: &str,
+                    resident_bytes: usize,
+                    shape: Vec<usize>,
+                    placement: String| {
+        descriptors.push(SequenceStatePageDescriptor {
+            session_id: session_id.clone(),
+            handle: handle.clone(),
+            kind,
+            label: label.to_string(),
+            logical_position,
+            resident_bytes,
+            allocation_epoch: handle.generation,
+            owns_pages: false,
+            shape,
+            placement,
+            role: "active_backend_owned".to_string(),
+        });
+    };
+    if let Some((bytes, shape)) = model.attention_kv_state_summary() {
+        push(
+            SequenceStatePageKind::Kv,
+            "nemotron.attention_kv",
+            bytes,
+            shape,
+            placement.clone(),
+        );
+    }
+    if let Some((bytes, shape)) = model.mamba_ssm_state_summary() {
+        push(
+            SequenceStatePageKind::MambaSsm,
+            "nemotron.mamba_ssm",
+            bytes,
+            shape,
+            placement.clone(),
+        );
+    }
+    if let Some((bytes, shape)) = model.mamba_conv_state_summary() {
+        push(
+            SequenceStatePageKind::MambaConv,
+            "nemotron.mamba_conv",
+            bytes,
+            shape,
+            placement.clone(),
+        );
+    }
+    let (bytes, shape) = model.logits_state_summary();
+    push(
+        SequenceStatePageKind::Logits,
+        "nemotron.logits",
+        bytes,
+        shape,
+        placement,
+    );
     descriptors
 }
 
@@ -1246,6 +1475,9 @@ pub fn sequence_state_arena_resident_session_count(
 ) -> usize {
     match arena_backend {
         SequenceStateArenaBackend::Qwen35Wrapped => qwen35_request_session_count(m),
+        SequenceStateArenaBackend::BackendOwned => {
+            usize::from(!sequence_state_arena_page_descriptors(arena_backend, m).is_empty())
+        }
         SequenceStateArenaBackend::Unsupported => 0,
     }
 }
@@ -1256,6 +1488,7 @@ pub fn sequence_state_arena_page_descriptors(
 ) -> Vec<SequenceStatePageDescriptor> {
     match arena_backend {
         SequenceStateArenaBackend::Qwen35Wrapped => qwen35_state_page_descriptors(m),
+        SequenceStateArenaBackend::BackendOwned => backend_owned_state_page_descriptors(m),
         SequenceStateArenaBackend::Unsupported => Vec::new(),
     }
 }
@@ -1267,6 +1500,7 @@ pub fn sequence_state_arena_is_session_resident(
 ) -> bool {
     match arena_backend {
         SequenceStateArenaBackend::Qwen35Wrapped => qwen35_session_resident(m, session_id),
+        SequenceStateArenaBackend::BackendOwned => session_id == backend_owned_session_id(m),
         SequenceStateArenaBackend::Unsupported => false,
     }
 }
@@ -1280,6 +1514,9 @@ pub fn sequence_state_arena_release_sessions(
     ensure_sequence_state_arena_backend_supported(arena_backend, m, "release_sessions")?;
     match arena_backend {
         SequenceStateArenaBackend::Qwen35Wrapped => qwen35_release_sessions(m, gpu, session_ids),
+        SequenceStateArenaBackend::BackendOwned => {
+            unreachable!("backend-owned arena rejected above")
+        }
         SequenceStateArenaBackend::Unsupported => unreachable!("unsupported arena rejected above"),
     }
 }
@@ -1293,6 +1530,9 @@ pub fn sequence_state_arena_activate_session(
     ensure_sequence_state_arena_backend_supported(arena_backend, m, "activate_session")?;
     match arena_backend {
         SequenceStateArenaBackend::Qwen35Wrapped => qwen35_activate_session(m, gpu, session_id),
+        SequenceStateArenaBackend::BackendOwned => {
+            unreachable!("backend-owned arena rejected above")
+        }
         SequenceStateArenaBackend::Unsupported => unreachable!("unsupported arena rejected above"),
     }
 }
@@ -1305,6 +1545,9 @@ pub fn sequence_state_arena_reset_active_session(
     ensure_sequence_state_arena_backend_supported(arena_backend, m, "reset_active_session")?;
     match arena_backend {
         SequenceStateArenaBackend::Qwen35Wrapped => qwen35_reset_active_session(m, gpu),
+        SequenceStateArenaBackend::BackendOwned => {
+            unreachable!("backend-owned arena rejected above")
+        }
         SequenceStateArenaBackend::Unsupported => unreachable!("unsupported arena rejected above"),
     }
 }
@@ -1316,6 +1559,9 @@ pub fn sequence_state_arena_active_logical_position(
     ensure_sequence_state_arena_backend_supported(arena_backend, m, "active_logical_position")?;
     match arena_backend {
         SequenceStateArenaBackend::Qwen35Wrapped => qwen35_active_logical_position(m),
+        SequenceStateArenaBackend::BackendOwned => {
+            unreachable!("backend-owned arena rejected above")
+        }
         SequenceStateArenaBackend::Unsupported => unreachable!("unsupported arena rejected above"),
     }
 }
@@ -1329,6 +1575,9 @@ pub fn sequence_state_arena_fork_session_state(
     ensure_sequence_state_arena_backend_supported(arena_backend, m, "fork_session_state")?;
     match arena_backend {
         SequenceStateArenaBackend::Qwen35Wrapped => qwen35_fork_session_state(m, gpu, request),
+        SequenceStateArenaBackend::BackendOwned => {
+            unreachable!("backend-owned arena rejected above")
+        }
         SequenceStateArenaBackend::Unsupported => unreachable!("unsupported arena rejected above"),
     }
 }
@@ -1343,6 +1592,9 @@ pub fn sequence_state_arena_checkpoint_session_state(
     match arena_backend {
         SequenceStateArenaBackend::Qwen35Wrapped => {
             qwen35_checkpoint_session_state(m, gpu, request)
+        }
+        SequenceStateArenaBackend::BackendOwned => {
+            unreachable!("backend-owned arena rejected above")
         }
         SequenceStateArenaBackend::Unsupported => unreachable!("unsupported arena rejected above"),
     }

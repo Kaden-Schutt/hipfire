@@ -249,6 +249,17 @@ impl NemotronAttnGpu {
         self.hidden
     }
 
+    pub fn kv_state_shape(&self) -> Vec<usize> {
+        vec![self.max_seq, self.cfg.num_kv_heads, self.cfg.head_dim]
+    }
+
+    pub fn kv_state_bytes(&self) -> usize {
+        self.k_cache
+            .buf
+            .size()
+            .saturating_add(self.v_cache.buf.size())
+    }
+
     /// Free all GPU tensors + the pos buffer (consumes the block).
     pub fn free(self, gpu: &mut Gpu) {
         let _ = gpu.hip.free(self.pos_buf);

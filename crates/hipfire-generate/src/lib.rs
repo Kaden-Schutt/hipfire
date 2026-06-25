@@ -8,13 +8,17 @@ pub mod eos_filter;
 pub mod loop_guard;
 pub mod sampler;
 
-use hipfire_model::{has_worker_or_model_identity, is_qwen35_dense_arch_id, is_qwen35_moe_arch_id};
+use hipfire_model::{
+    has_worker_or_model_identity, is_qwen35_dense_arch_id, is_qwen35_moe_arch_id, ARCH_ID_LFM2_MOE,
+    ARCH_ID_MINIMAX_M2, ARCH_ID_NEMOTRON_H,
+};
 use hipfire_prompt::{
     openai_chat_last_user_prompt, openai_chat_messages_to_prompt_messages, Message,
 };
 use hipfire_state::{
-    canonical_generate_state_kind_hash_label, qwen35_kv_deltanet_state_kind_labels,
-    SequenceStatePageKind, SequenceStatePrefixHash,
+    canonical_generate_state_kind_hash_label, lfm2_state_kind_labels, minimax_state_kind_labels,
+    nemotron_h_state_kind_labels, qwen35_kv_deltanet_state_kind_labels, SequenceStatePageKind,
+    SequenceStatePrefixHash,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -1465,6 +1469,18 @@ pub struct Qwen35DecodeBatchSchedulerMetadata {
     pub fallback_reason: &'static str,
 }
 
+pub fn compatible_state_kind_labels_for_arch(arch_id: u32) -> Vec<&'static str> {
+    match arch_id {
+        ARCH_ID_MINIMAX_M2 => minimax_state_kind_labels(),
+        ARCH_ID_LFM2_MOE => lfm2_state_kind_labels(),
+        ARCH_ID_NEMOTRON_H => nemotron_h_state_kind_labels(),
+        _ if is_qwen35_dense_arch_id(arch_id) || is_qwen35_moe_arch_id(arch_id) => {
+            qwen35_kv_deltanet_state_kind_labels()
+        }
+        _ => vec!["attention_kv"],
+    }
+}
+
 pub fn qwen35_decode_batch_scheduler_metadata(
     requested: &str,
     arch_id: u32,
@@ -1497,7 +1513,7 @@ pub fn qwen35_decode_batch_scheduler_metadata(
     Qwen35DecodeBatchSchedulerMetadata {
         selected_backend: backend.as_str(),
         batch_size,
-        compatible_state_kinds: qwen35_kv_deltanet_state_kind_labels(),
+        compatible_state_kinds: compatible_state_kind_labels_for_arch(arch_id),
         cached_prefix_tokens,
         fallback_reason,
     }
@@ -1915,6 +1931,31 @@ mod tests {
 
         let err = validate_generate_batch_prefill(&msg).unwrap_err();
         assert!(err.contains("state_handle.state_kinds contains unsupported kind backend_private"));
+    }
+
+    #[test]
+    fn generate_batch_prefill_accepts_nemotron_mamba_state_kinds() {
+        let msg = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "id": "prefill-1",
+            "batch_id": "batch-1",
+            "worker_key_id": "worker-nemotron",
+            "sessions": [{
+                "id": "req-1",
+                "suffix_tokens": [4, 5],
+                "assistant_prefix": "",
+                "state_handle": {
+                    "state_kinds": ["attention_kv", "mamba_ssm", "mamba_conv"],
+                    "logical_position": 0
+                }
+            }]
+        });
+
+        let envelope = validate_generate_batch_prefill(&msg).unwrap();
+        assert_eq!(
+            envelope.sessions[0].state_handle.state_kinds,
+            vec!["attention_kv", "mamba_ssm", "mamba_conv"]
+        );
     }
 
     #[test]
@@ -2409,6 +2450,22 @@ mod tests {
             8,
         );
         assert_eq!(requested.fallback_reason, "requested_serial_reference");
+    }
+
+    #[test]
+    fn compatible_state_kind_labels_cover_hybrid_arches() {
+        assert_eq!(
+            compatible_state_kind_labels_for_arch(ARCH_ID_MINIMAX_M2),
+            vec!["attention_kv", "logits", "backend_private"]
+        );
+        assert_eq!(
+            compatible_state_kind_labels_for_arch(ARCH_ID_LFM2_MOE),
+            vec!["attention_kv", "logits", "backend_private"]
+        );
+        assert_eq!(
+            compatible_state_kind_labels_for_arch(ARCH_ID_NEMOTRON_H),
+            vec!["attention_kv", "mamba_ssm", "mamba_conv", "logits"]
+        );
     }
 
     #[test]

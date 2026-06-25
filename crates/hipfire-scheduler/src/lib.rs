@@ -10,7 +10,7 @@ use hipfire_model::{
     normalize_model_worker_key, same_model_worker_key, AcceleratorDeviceInfo, AcceleratorInventory,
     ModelWorkerKey,
 };
-use hipfire_state::generate_state_kind_sets_match_exactly;
+use hipfire_state::{generate_state_kind_sets_match_exactly, normalize_generate_state_kind_set};
 use std::collections::{BTreeMap, HashSet};
 
 pub const SCHED_PRIORITY_REALTIME: u8 = 0;
@@ -195,6 +195,9 @@ pub struct ActiveDecodeSession {
     pub worker_key_id: String,
     pub priority: u8,
     pub runtime_state_handle: String,
+    pub state_kinds: Vec<String>,
+    pub cache_mode: String,
+    pub fused_state_batch: bool,
     pub logical_position: usize,
     pub cached_prefix_tokens: usize,
     pub generated_tokens: usize,
@@ -549,11 +552,153 @@ pub fn create_request_session_draft(input: CreateRequestSessionInput) -> Request
     }
 }
 
+fn worker_key_has_feature(worker_key: &ModelWorkerKey, feature: &str) -> bool {
+    worker_key
+        .feature_flags
+        .iter()
+        .any(|flag| flag.eq_ignore_ascii_case(feature))
+}
+
+fn worker_key_family_contains(worker_key: &ModelWorkerKey, needle: &str) -> bool {
+    let needle = needle.to_ascii_lowercase();
+    worker_key.arch_id.to_ascii_lowercase().contains(&needle)
+        || worker_key
+            .artifact_path
+            .to_ascii_lowercase()
+            .contains(&needle)
+        || worker_key
+            .feature_flags
+            .iter()
+            .any(|flag| flag.to_ascii_lowercase().contains(&needle))
+}
+
+fn worker_key_is_qwen35(worker_key: &ModelWorkerKey) -> bool {
+    matches!(worker_key.arch_id.as_str(), "5" | "6")
+        || worker_key_family_contains(worker_key, "qwen35")
+        || worker_key_family_contains(worker_key, "qwen3.5")
+}
+
+fn worker_key_is_state_arena_conservative(worker_key: &ModelWorkerKey) -> bool {
+    matches!(worker_key.arch_id.as_str(), "10" | "11" | "14")
+        || worker_key_family_contains(worker_key, "minimax")
+        || worker_key_family_contains(worker_key, "lfm2")
+        || worker_key_family_contains(worker_key, "nemotron")
+}
+
+fn worker_key_has_hierarchical_kv(worker_key: &ModelWorkerKey) -> bool {
+    let state_mode = worker_key.state_mode.to_ascii_lowercase();
+    state_mode.contains("hier")
+        || state_mode.contains("two_tier")
+        || worker_key_has_feature(worker_key, "hierarchical_kv")
+}
+
+fn state_kinds_have_private_or_mamba(kinds: &[String]) -> bool {
+    let normalized = normalize_generate_state_kind_set(kinds);
+    normalized.iter().any(|kind| {
+        matches!(
+            kind.as_str(),
+            "mamba_ssm" | "mamba_conv" | "backend_private" | "architecture_specific"
+        )
+    })
+}
+
+fn state_kinds_have_mamba(kinds: &[String]) -> bool {
+    let normalized = normalize_generate_state_kind_set(kinds);
+    normalized
+        .iter()
+        .any(|kind| matches!(kind.as_str(), "mamba_ssm" | "mamba_conv"))
+}
+
+fn worker_key_requires_token_ordered_recurrent(worker_key: &ModelWorkerKey) -> bool {
+    let state_mode = worker_key.state_mode.to_ascii_lowercase();
+    state_mode.contains("mamba") || state_mode.contains("lfm2") || state_mode.contains("short_conv")
+}
+
+fn prefill_session_multi_session_batchable(session: &RequestSessionDraft) -> bool {
+    if worker_key_has_feature(&session.worker_key, "multi_session_state_batch")
+        || worker_key_has_feature(&session.worker_key, "fused_state_batch")
+    {
+        return true;
+    }
+    if worker_key_is_qwen35(&session.worker_key) {
+        return true;
+    }
+    if worker_key_is_state_arena_conservative(&session.worker_key)
+        || worker_key_requires_token_ordered_recurrent(&session.worker_key)
+        || state_kinds_have_private_or_mamba(&session.state_handle.state_kinds)
+    {
+        return false;
+    }
+    true
+}
+
 pub fn sessions_compatible_for_prefill(a: &RequestSessionDraft, b: &RequestSessionDraft) -> bool {
     if !same_model_worker_key(&a.worker_key, &b.worker_key) {
         return false;
     }
-    generate_state_kind_sets_match_exactly(&a.state_handle.state_kinds, &b.state_handle.state_kinds)
+    if worker_key_has_hierarchical_kv(&a.worker_key)
+        != worker_key_has_hierarchical_kv(&b.worker_key)
+    {
+        return false;
+    }
+    if !generate_state_kind_sets_match_exactly(
+        &a.state_handle.state_kinds,
+        &b.state_handle.state_kinds,
+    ) {
+        return false;
+    }
+    if !prefill_session_multi_session_batchable(a) || !prefill_session_multi_session_batchable(b) {
+        return a.id == b.id;
+    }
+    true
+}
+
+fn inferred_decode_state_kinds(worker_key_id: &str) -> Vec<String> {
+    let lower = worker_key_id.to_ascii_lowercase();
+    if lower.contains("nemotron") || lower.contains("mamba") {
+        return vec![
+            "attention_kv".to_string(),
+            "mamba_ssm".to_string(),
+            "mamba_conv".to_string(),
+        ];
+    }
+    if lower.contains("lfm2") || lower.contains("minimax") {
+        return vec!["attention_kv".to_string(), "backend_private".to_string()];
+    }
+    if lower.contains("qwen") || lower.contains("deltanet") {
+        return vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()];
+    }
+    Vec::new()
+}
+
+fn decode_state_kinds(session: &ActiveDecodeSession) -> Vec<String> {
+    if session.state_kinds.is_empty() {
+        inferred_decode_state_kinds(&session.worker_key_id)
+    } else {
+        session.state_kinds.clone()
+    }
+}
+
+pub fn decode_sessions_compatible_for_batch(
+    a: &ActiveDecodeSession,
+    b: &ActiveDecodeSession,
+) -> bool {
+    if a.worker_key_id != b.worker_key_id {
+        return false;
+    }
+    if a.cache_mode != b.cache_mode {
+        return false;
+    }
+    let a_kinds = decode_state_kinds(a);
+    let b_kinds = decode_state_kinds(b);
+    if !generate_state_kind_sets_match_exactly(&a_kinds, &b_kinds) {
+        return false;
+    }
+    let requires_singleton = state_kinds_have_mamba(&a_kinds) || state_kinds_have_mamba(&b_kinds);
+    if requires_singleton && !(a.fused_state_batch && b.fused_state_batch) {
+        return a.id == b.id;
+    }
+    true
 }
 
 pub fn worker_device_capability_status(
@@ -961,7 +1106,7 @@ impl PriorityDecodeScheduler {
             let policy = scheduler_policy_for_priority(first.priority, &self.env);
             let compatible = bucket
                 .iter()
-                .filter(|session| session.worker_key_id == first.worker_key_id)
+                .filter(|session| decode_sessions_compatible_for_batch(first, session))
                 .take(policy.max_batch_size)
                 .cloned()
                 .collect::<Vec<_>>();
@@ -1078,11 +1223,32 @@ mod tests {
     }
 
     fn active(id: &str, worker_key_id: &str, priority: u8) -> ActiveDecodeSession {
+        active_with_state(
+            id,
+            worker_key_id,
+            priority,
+            &["attention_kv", "deltanet_recurrent"],
+            "flat",
+            false,
+        )
+    }
+
+    fn active_with_state(
+        id: &str,
+        worker_key_id: &str,
+        priority: u8,
+        state_kinds: &[&str],
+        cache_mode: &str,
+        fused_state_batch: bool,
+    ) -> ActiveDecodeSession {
         ActiveDecodeSession {
             id: id.to_string(),
             worker_key_id: worker_key_id.to_string(),
             priority,
             runtime_state_handle: format!("runtime-{id}"),
+            state_kinds: state_kinds.iter().map(|kind| kind.to_string()).collect(),
+            cache_mode: cache_mode.to_string(),
+            fused_state_batch,
             logical_position: 8,
             cached_prefix_tokens: 8,
             generated_tokens: 0,
@@ -1315,11 +1481,41 @@ mod tests {
             64,
             1,
             nemotron_worker(),
-            &["attention_kv", "mamba_ssm"],
+            &["attention_kv", "mamba_ssm", "mamba_conv"],
             0,
         );
+        let d = session_with(
+            "d",
+            64,
+            1,
+            nemotron_worker(),
+            &["mamba_conv", "attention_kv", "mamba_ssm"],
+            0,
+        );
+        let minimax = ModelWorkerKey {
+            artifact_path: "/models/minimax-m2-mq4.hfq".to_string(),
+            artifact_digest: Some("sha256:minimax".to_string()),
+            arch_id: "10".to_string(),
+            quant_family: "mq4".to_string(),
+            state_mode: "attention_kv".to_string(),
+            max_seq_bucket: 4096,
+            accelerator_kind: None,
+            device_id: None,
+            feature_flags: vec!["prefill_batch".to_string(), "minimax".to_string()],
+        };
+        let e = session_with(
+            "e",
+            64,
+            1,
+            minimax.clone(),
+            &["attention_kv", "backend_private"],
+            0,
+        );
+        let f = session_with("f", 64, 1, minimax, &["backend_private", "attention_kv"], 0);
         assert!(sessions_compatible_for_prefill(&a, &b));
         assert!(!sessions_compatible_for_prefill(&a, &c));
+        assert!(!sessions_compatible_for_prefill(&c, &d));
+        assert!(!sessions_compatible_for_prefill(&e, &f));
     }
 
     #[test]
@@ -1589,5 +1785,66 @@ mod tests {
             .enqueue(active("b", "worker-a", 64))
             .unwrap_err()
             .contains("decode scheduler backpressure"));
+    }
+
+    #[test]
+    fn decode_scheduler_respects_state_fingerprint() {
+        let mut scheduler =
+            PriorityDecodeScheduler::new(env(&[("HIPFIRE_SCHED_PREFILL_BATCH_MAX", "4")]));
+        scheduler
+            .enqueue(active_with_state(
+                "mamba-a",
+                "worker-nemotron",
+                64,
+                &["attention_kv", "mamba_ssm", "mamba_conv"],
+                "flat",
+                false,
+            ))
+            .unwrap();
+        scheduler
+            .enqueue(active_with_state(
+                "mamba-b",
+                "worker-nemotron",
+                64,
+                &["mamba_conv", "attention_kv", "mamba_ssm"],
+                "flat",
+                false,
+            ))
+            .unwrap();
+        assert_eq!(
+            decode_ids(scheduler.next_decode_batch(NextBatchInput { now_ms: 0 })),
+            vec!["mamba-a"]
+        );
+        assert_eq!(
+            decode_ids(scheduler.next_decode_batch(NextBatchInput { now_ms: 0 })),
+            vec!["mamba-b"]
+        );
+
+        let mut fused =
+            PriorityDecodeScheduler::new(env(&[("HIPFIRE_SCHED_PREFILL_BATCH_MAX", "4")]));
+        fused
+            .enqueue(active_with_state(
+                "fused-a",
+                "worker-nemotron",
+                64,
+                &["attention_kv", "mamba_ssm", "mamba_conv"],
+                "flat",
+                true,
+            ))
+            .unwrap();
+        fused
+            .enqueue(active_with_state(
+                "fused-b",
+                "worker-nemotron",
+                64,
+                &["mamba_conv", "attention_kv", "mamba_ssm"],
+                "flat",
+                true,
+            ))
+            .unwrap();
+        assert_eq!(
+            decode_ids(fused.next_decode_batch(NextBatchInput { now_ms: 0 })),
+            vec!["fused-a", "fused-b"]
+        );
     }
 }

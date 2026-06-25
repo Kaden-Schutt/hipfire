@@ -484,6 +484,30 @@ impl Mamba2BlockGpu {
         Ok(())
     }
 
+    pub fn conv_state_shape(&self) -> Vec<usize> {
+        vec![self.dims.conv_dim(), self.dims.conv_kernel - 1]
+    }
+
+    pub fn conv_state_bytes(&self) -> usize {
+        self.conv_state.buf.size()
+    }
+
+    pub fn ssm_state_shape(&self) -> Vec<usize> {
+        vec![
+            self.dims.num_heads * self.dims.head_dim,
+            self.dims.state_size,
+        ]
+    }
+
+    pub fn ssm_state_bytes(&self) -> usize {
+        self.ssm_state.buf.size().saturating_add(
+            self.ssm_state_scales
+                .as_ref()
+                .map(|scales| scales.buf.size())
+                .unwrap_or(0),
+        )
+    }
+
     /// Free all GPU tensors (consumes the block).
     pub fn free(self, gpu: &mut Gpu) {
         self.in_proj.free(gpu);

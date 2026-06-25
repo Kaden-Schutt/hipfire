@@ -539,6 +539,58 @@ impl NemotronModel {
         &self.cfg
     }
 
+    pub fn attention_kv_state_summary(&self) -> Option<(usize, Vec<usize>)> {
+        let mut block_count = 0usize;
+        let mut bytes = 0usize;
+        let mut block_shape = None;
+        for layer in &self.layers {
+            if let Block::Attn(attn) = layer {
+                block_count += 1;
+                bytes = bytes.saturating_add(attn.kv_state_bytes());
+                block_shape.get_or_insert_with(|| attn.kv_state_shape());
+            }
+        }
+        let mut shape = vec![block_count];
+        shape.extend(block_shape?);
+        Some((bytes, shape))
+    }
+
+    pub fn mamba_ssm_state_summary(&self) -> Option<(usize, Vec<usize>)> {
+        let mut block_count = 0usize;
+        let mut bytes = 0usize;
+        let mut block_shape = None;
+        for layer in &self.layers {
+            if let Block::Mamba2(mamba) = layer {
+                block_count += 1;
+                bytes = bytes.saturating_add(mamba.ssm_state_bytes());
+                block_shape.get_or_insert_with(|| mamba.ssm_state_shape());
+            }
+        }
+        let mut shape = vec![block_count];
+        shape.extend(block_shape?);
+        Some((bytes, shape))
+    }
+
+    pub fn mamba_conv_state_summary(&self) -> Option<(usize, Vec<usize>)> {
+        let mut block_count = 0usize;
+        let mut bytes = 0usize;
+        let mut block_shape = None;
+        for layer in &self.layers {
+            if let Block::Mamba2(mamba) = layer {
+                block_count += 1;
+                bytes = bytes.saturating_add(mamba.conv_state_bytes());
+                block_shape.get_or_insert_with(|| mamba.conv_state_shape());
+            }
+        }
+        let mut shape = vec![block_count];
+        shape.extend(block_shape?);
+        Some((bytes, shape))
+    }
+
+    pub fn logits_state_summary(&self) -> (usize, Vec<usize>) {
+        (self.logits.buf.size(), self.logits.shape.clone())
+    }
+
     /// Zero the recurrent state (Mamba conv/SSM) for a fresh generation. The
     /// attention KV caches need no zeroing — they're overwritten per `pos` and
     /// only read over `0..=pos`.
