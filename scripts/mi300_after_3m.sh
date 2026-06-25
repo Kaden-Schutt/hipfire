@@ -9,15 +9,17 @@
 # run so MI300X stays saturated.
 
 set -uo pipefail
+TRIPWIRE_ROOT="${TRIPWIRE_ROOT:-${HOME}}"
 
-export PATH=/opt/rocm/bin:/opt/rocm/lib/llvm/bin:/root/.cargo/bin:$PATH
+
+export PATH=/opt/rocm/bin:/opt/rocm/lib/llvm/bin:${TRIPWIRE_ROOT}/.cargo/bin:$PATH
 export HIP_PATH=/opt/rocm ROCM_PATH=/opt/rocm HIPFIRE_FP16=0
-export HF_HOME=/root/hf_cache
+export HF_HOME=${TRIPWIRE_ROOT}/hf_cache
 
-cd /root/hipfire
+cd ${TRIPWIRE_ROOT}/hipfire
 
 log() {
-    echo "[$(date -u +%FT%TZ)] after-3m: $*" | tee -a /root/chain_status.log
+    echo "[$(date -u +%FT%TZ)] after-3m: $*" | tee -a ${TRIPWIRE_ROOT}/chain_status.log
 }
 
 wait_file_ready() {
@@ -26,10 +28,10 @@ wait_file_ready() {
 
 # Hand off after the last step in the 3M chain
 log "start — waiting for 3.6-A3B 3M sidecar"
-wait_file_ready /root/models/qwen3.6-35b-a3b-mq4-3m.triattn.hfq
+wait_file_ready ${TRIPWIRE_ROOT}/models/qwen3.6-35b-a3b-mq4-3m.triattn.hfq
 log "all cal chain work done; moving to draft training POC"
 
-source /root/pytorch_env/bin/activate
+source ${TRIPWIRE_ROOT}/pytorch_env/bin/activate
 
 # ── POC smoke (100 steps on 4B target) ──────────────────────────────
 log "POC smoke — 100 steps, 4B target, draft_layers=2 batch=1 seq=512"
@@ -38,12 +40,12 @@ python3 scripts/dflash_train_poc.py \
     --draft-layers 2 --block-size 16 \
     --seq-len 512 --batch-size 1 \
     --lr 3e-4 --steps 100 --warmup 10 \
-    --corpus /root/wikitext_calib.txt \
-    --out /root/poc_smoke \
+    --corpus ${TRIPWIRE_ROOT}/wikitext_calib.txt \
+    --out ${TRIPWIRE_ROOT}/poc_smoke \
     --ckpt-every 50 --log-every 10 \
-    > /root/poc_smoke.log 2>&1
+    > ${TRIPWIRE_ROOT}/poc_smoke.log 2>&1
 
-if grep -Eq "^\[done\]" /root/poc_smoke.log; then
+if grep -Eq "^\[done\]" ${TRIPWIRE_ROOT}/poc_smoke.log; then
     log "POC smoke PASS — starting real draft training (10K steps)"
 
     # ── Real training — 5-layer draft matching the reference default ──
@@ -52,10 +54,10 @@ if grep -Eq "^\[done\]" /root/poc_smoke.log; then
         --draft-layers 5 --block-size 16 \
         --seq-len 1024 --batch-size 4 \
         --lr 3e-4 --steps 10000 --warmup 500 \
-        --corpus /root/wikitext_calib.txt \
-        --out /root/draft_b16_4b_10k \
+        --corpus ${TRIPWIRE_ROOT}/wikitext_calib.txt \
+        --out ${TRIPWIRE_ROOT}/draft_b16_4b_10k \
         --ckpt-every 1000 --log-every 50 \
-        > /root/draft_b16_4b_10k.log 2>&1 || log "WARN: real training returned non-zero"
+        > ${TRIPWIRE_ROOT}/draft_b16_4b_10k.log 2>&1 || log "WARN: real training returned non-zero"
     log "real B=16 training run finished"
 
     # ── B=32 variant to unlock task #121 ──────────────────────────────
@@ -64,14 +66,14 @@ if grep -Eq "^\[done\]" /root/poc_smoke.log; then
         --draft-layers 5 --block-size 32 \
         --seq-len 2048 --batch-size 2 \
         --lr 3e-4 --steps 10000 --warmup 500 \
-        --corpus /root/wikitext_calib.txt \
-        --out /root/draft_b32_4b_10k \
+        --corpus ${TRIPWIRE_ROOT}/wikitext_calib.txt \
+        --out ${TRIPWIRE_ROOT}/draft_b32_4b_10k \
         --ckpt-every 1000 --log-every 50 \
-        > /root/draft_b32_4b_10k.log 2>&1 || log "WARN: B=32 training returned non-zero"
+        > ${TRIPWIRE_ROOT}/draft_b32_4b_10k.log 2>&1 || log "WARN: B=32 training returned non-zero"
     log "real B=32 training run finished"
 else
-    log "POC smoke FAILED — see /root/poc_smoke.log; skipping long runs"
-    tail -30 /root/poc_smoke.log | tee -a /root/chain_status.log
+    log "POC smoke FAILED — see ${TRIPWIRE_ROOT}/poc_smoke.log; skipping long runs"
+    tail -30 ${TRIPWIRE_ROOT}/poc_smoke.log | tee -a ${TRIPWIRE_ROOT}/chain_status.log
 fi
 
 log "after-3m chain complete — MI300X again idle, needs more work"

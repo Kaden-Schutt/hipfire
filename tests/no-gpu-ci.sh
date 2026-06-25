@@ -55,6 +55,7 @@ bash -n tests/tiny-affected-gate.sh
 bash -n tests/tiny-quant-gate.sh
 bash -n tests/tiny-state-gate.sh
 bash -n tests/tiny-spec-gate.sh
+bash -n tests/smoke/diffusion-sdapi-smoke.sh
 
 echo "== Legacy CLI checks =="
 echo "Legacy CLI support has been removed; no script-runtime checks are run."

@@ -15,6 +15,11 @@ claims.
 - `eval-harness-model-eval-smoke.sh` runs a candidate-vs-baseline integration
   smoke with generated quality/evidence fixtures plus examples-backed speed
   rows.
+- `diffusion-sdapi-smoke.sh` starts `hipfire serve` and validates the
+  stable-diffusion-webui-compatible HTTP API against a local runnable diffusion
+  `.hfq`: `txt2img`, `img2img`, masked `img2img`, PNG dimensions, `png-info`,
+  options, samplers, and progress. Set `HIPFIRE_DIFFUSION_SMOKE_MODEL` when the
+  default `/tmp/hipfire-tiny-sd-diffusion.hfq` is not present.
 
-`tests/no-gpu-ci.sh` invokes the no-GPU smoke and syntax-checks the GPU smoke
-scripts.
+`tests/no-gpu-ci.sh` invokes the no-GPU smoke and syntax-checks the optional
+model/server smoke scripts.

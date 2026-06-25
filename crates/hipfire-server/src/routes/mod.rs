@@ -6,4 +6,5 @@ pub mod files;
 pub mod health;
 pub mod models;
 pub mod responses;
+pub mod sdapi;
 pub mod training;

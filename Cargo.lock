@@ -1405,10 +1405,12 @@ dependencies = [
  "hipfire-build-info",
  "hipfire-config",
  "hipfire-daemon-adapter",
+ "hipfire-diffusion",
  "hipfire-generate",
  "hipfire-lock",
  "hipfire-model",
  "hipfire-server",
+ "image",
  "indicatif",
  "libc",
  "regex",
@@ -1516,6 +1518,21 @@ name = "hipfire-detect"
 version = "0.3.0"
 dependencies = [
  "md5",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "hipfire-diffusion"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "hip-bridge",
+ "hipfire-runtime",
+ "image",
+ "rdna-compute",
  "regex",
  "serde",
  "serde_json",
@@ -1733,17 +1750,21 @@ dependencies = [
  "anyhow",
  "async-stream",
  "axum",
+ "base64",
  "futures",
  "hipfire-admin-types",
  "hipfire-config",
  "hipfire-daemon-adapter",
+ "hipfire-diffusion",
  "hipfire-generate",
  "hipfire-lock",
  "hipfire-model",
  "hipfire-operator",
  "hipfire-prompt",
+ "hipfire-runtime",
  "hipfire-scheduler",
  "hipfire-state",
+ "image",
  "reqwest",
  "rust-embed",
  "serde",

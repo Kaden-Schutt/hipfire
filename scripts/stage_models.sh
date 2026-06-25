@@ -13,7 +13,7 @@
 # (~7× net DL advantage). Quantization itself is ~30-60s per model.
 #
 # Usage:
-#   bash stage_models.sh [--dir /root/models] [--no-mq6]
+#   bash stage_models.sh [--dir ${TRIPWIRE_ROOT}/models] [--no-mq6]
 #
 # Models staged by default (covering tonight's hermes-cal sweep):
 #   - Qwen/Qwen3.5-4B            → mq4, mq6
@@ -27,10 +27,12 @@
 #   - kai-os/Carnice-27b         → mq4, mq6
 
 set -uo pipefail
+TRIPWIRE_ROOT="${TRIPWIRE_ROOT:-${HOME}}"
 
-MODELS_DIR="/root/models"
+
+MODELS_DIR="${TRIPWIRE_ROOT}/models"
 INCLUDE_MQ6=1
-QUANT_BIN="${HIPFIRE_QUANTIZE:-/root/hipfire/target/release/hipfire-quantize}"
+QUANT_BIN="${HIPFIRE_QUANTIZE:-${TRIPWIRE_ROOT}/hipfire/target/release/hipfire-quantize}"
 
 while [ $# -gt 0 ]; do
     case "$1" in

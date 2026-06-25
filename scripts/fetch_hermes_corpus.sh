@@ -15,15 +15,17 @@
 # Usage:
 #   bash fetch_hermes_corpus.sh [OUT_PATH]
 #
-# Default OUT_PATH: /root/hermes_corpus.txt
+# Default OUT_PATH: ${TRIPWIRE_ROOT}/hermes_corpus.txt
 # Default size: both configs (kimi + glm-5.1), ~14.7k traces, ~100-200 MB.
 #
 # Requires the HF stack installed (pip install huggingface_hub pyarrow).
 # Set HF_TOKEN env var if the dataset is gated (this one isn't as of 2026-04-19).
 
 set -euo pipefail
+TRIPWIRE_ROOT="${TRIPWIRE_ROOT:-${HOME}}"
 
-OUT="${1:-/root/hermes_corpus.txt}"
+
+OUT="${1:-${TRIPWIRE_ROOT}/hermes_corpus.txt}"
 MAX_ROWS="${MAX_ROWS:-0}"   # 0 = all rows
 CONFIGS="${CONFIGS:-kimi,glm-5.1}"
 
@@ -35,8 +37,8 @@ log "max rows: ${MAX_ROWS:-all}"
 
 # Locate a python with HF stack. Prefer pytorch venv if present.
 PY=python3
-if [ -f /root/pytorch_env/bin/python3 ]; then
-    PY=/root/pytorch_env/bin/python3
+if [ -f ${TRIPWIRE_ROOT}/pytorch_env/bin/python3 ]; then
+    PY=${TRIPWIRE_ROOT}/pytorch_env/bin/python3
 fi
 
 "$PY" - "$OUT" "$CONFIGS" "$MAX_ROWS" <<'PY'

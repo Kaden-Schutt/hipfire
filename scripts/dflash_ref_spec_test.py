@@ -13,7 +13,11 @@ with our Qwen3.5 target (e.g. cache layout, position_ids, etc).
 If this gives τ>1, our tau_probe has a reproducible bug to find.
 """
 import sys, torch
-sys.path.insert(0, "/root/hipfire/.dflash-reference")
+import os
+from pathlib import Path
+REPO_ROOT = Path(__file__).resolve().parent.parent
+TRIPWIRE_HIPFIRE_DIR = Path(os.environ.get("TRIPWIRE_HIPFIRE_DIR", str(REPO_ROOT)))
+sys.path.insert(0, str(TRIPWIRE_HIPFIRE_DIR / ".dflash-reference"))
 from dflash.model import DFlashDraftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 

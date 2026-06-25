@@ -15,6 +15,8 @@
 # A failure at any step aborts. Total runtime ~5-10 min.
 
 set -euo pipefail
+TRIPWIRE_ROOT="${TRIPWIRE_ROOT:-${HOME}}"
+
 
 WORK="${WORK:-/workspace}"
 HIPFIRE="${HIPFIRE_DIR:-${WORK}/hipfire}"
@@ -52,7 +54,7 @@ phase "3/5  AR decode finite-logit check (Q3.5-9B mq4)"
 # Need an mq4 HFQ to test against. If we have one, use it; otherwise build a
 # tiny ad-hoc one. The v3_matrix script will build proper ones later.
 test_hfq=""
-for cand in /workspace/models/qwen3.5-9b-mq4.hfq /root/.hipfire/models/qwen3.5-9b-mq4.hfq; do
+for cand in /workspace/models/qwen3.5-9b-mq4.hfq ${TRIPWIRE_ROOT}/.hipfire/models/qwen3.5-9b-mq4.hfq; do
     [ -f "$cand" ] && test_hfq="$cand" && break
 done
 if [ -z "$test_hfq" ]; then

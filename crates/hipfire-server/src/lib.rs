@@ -123,7 +123,77 @@ pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> Rout
             "/v1/chat/completions",
             post(routes::chat::post_chat_completions),
         )
-        .route("/v1/responses", post(routes::responses::post_responses));
+        .route("/v1/responses", post(routes::responses::post_responses))
+        .route("/sdapi/v1/txt2img", post(routes::sdapi::post_txt2img))
+        .route("/sdapi/v1/img2img", post(routes::sdapi::post_img2img))
+        .route(
+            "/sdapi/v1/extra-single-image",
+            post(routes::sdapi::post_extra_single_image),
+        )
+        .route(
+            "/sdapi/v1/extra-batch-images",
+            post(routes::sdapi::post_extra_batch_images),
+        )
+        .route("/sdapi/v1/png-info", post(routes::sdapi::post_png_info))
+        .route("/sdapi/v1/progress", get(routes::sdapi::get_progress))
+        .route(
+            "/sdapi/v1/interrogate",
+            post(routes::sdapi::post_interrogate),
+        )
+        .route("/sdapi/v1/interrupt", post(routes::sdapi::post_interrupt))
+        .route("/sdapi/v1/skip", post(routes::sdapi::post_interrupt))
+        .route("/sdapi/v1/options", get(routes::sdapi::get_options))
+        .route("/sdapi/v1/options", post(routes::sdapi::post_options))
+        .route("/sdapi/v1/cmd-flags", get(routes::sdapi::get_cmd_flags))
+        .route("/sdapi/v1/samplers", get(routes::sdapi::get_samplers))
+        .route("/sdapi/v1/schedulers", get(routes::sdapi::get_schedulers))
+        .route("/sdapi/v1/upscalers", get(routes::sdapi::get_upscalers))
+        .route(
+            "/sdapi/v1/latent-upscale-modes",
+            get(routes::sdapi::get_latent_upscale_modes),
+        )
+        .route("/sdapi/v1/sd-models", get(routes::sdapi::get_sd_models))
+        .route("/sdapi/v1/sd-vae", get(routes::sdapi::get_sd_vae))
+        .route(
+            "/sdapi/v1/hypernetworks",
+            get(routes::sdapi::get_hypernetworks),
+        )
+        .route(
+            "/sdapi/v1/face-restorers",
+            get(routes::sdapi::get_face_restorers),
+        )
+        .route(
+            "/sdapi/v1/realesrgan-models",
+            get(routes::sdapi::get_realesrgan_models),
+        )
+        .route(
+            "/sdapi/v1/prompt-styles",
+            get(routes::sdapi::get_prompt_styles),
+        )
+        .route("/sdapi/v1/embeddings", get(routes::sdapi::get_embeddings))
+        .route(
+            "/sdapi/v1/refresh-embeddings",
+            post(routes::sdapi::post_control_noop),
+        )
+        .route(
+            "/sdapi/v1/refresh-checkpoints",
+            post(routes::sdapi::post_control_noop),
+        )
+        .route(
+            "/sdapi/v1/reload-checkpoint",
+            post(routes::sdapi::post_reload_checkpoint),
+        )
+        .route(
+            "/sdapi/v1/unload-checkpoint",
+            post(routes::sdapi::post_unload_checkpoint),
+        )
+        .route(
+            "/sdapi/v1/refresh-vae",
+            post(routes::sdapi::post_control_noop),
+        )
+        .route("/sdapi/v1/scripts", get(routes::sdapi::get_scripts))
+        .route("/sdapi/v1/script-info", get(routes::sdapi::get_script_info))
+        .route("/sdapi/v1/extensions", get(routes::sdapi::get_extensions));
     let router = match cors_layer(cors_allowed_origins) {
         Some(cors) => router.layer(cors),
         None => router,
@@ -178,6 +248,8 @@ fn request_counts_for_idle(method: &Method, path: &str) -> bool {
         (&Method::POST, "/v1/chat/completions")
             | (&Method::POST, "/v1/responses")
             | (&Method::POST, "/v1/batches")
+            | (&Method::POST, "/sdapi/v1/txt2img")
+            | (&Method::POST, "/sdapi/v1/img2img")
     )
 }
 
@@ -316,6 +388,8 @@ mod tests {
         ));
         assert!(request_counts_for_idle(&Method::POST, "/v1/responses"));
         assert!(request_counts_for_idle(&Method::POST, "/v1/batches"));
+        assert!(request_counts_for_idle(&Method::POST, "/sdapi/v1/txt2img"));
+        assert!(request_counts_for_idle(&Method::POST, "/sdapi/v1/img2img"));
     }
 }
 

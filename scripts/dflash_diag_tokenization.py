@@ -24,21 +24,24 @@ What it prints:
 Usage (no GPU needed):
   python3 scripts/dflash_diag_tokenization.py \
       --target-repo Qwen/Qwen3.5-4B \
-      --corpus /root/calibration_corpus.txt
+      --corpus ${TRIPWIRE_ROOT}/calibration_corpus.txt
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from transformers import AutoTokenizer
+
+TRIPWIRE_ROOT = Path(os.environ.get("TRIPWIRE_ROOT", str(Path.home())))
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--target-repo", default="Qwen/Qwen3.5-4B")
-    p.add_argument("--corpus", default=None,
+    p.add_argument("--corpus", default=str(TRIPWIRE_ROOT / "calibration_corpus.txt"),
                    help="Path to calibration corpus. Skipped if absent.")
     p.add_argument("--sample-prompt",
                    default="Call the get_weather tool for Tokyo and summarize.",

@@ -25,8 +25,8 @@ config, γ).
 Run on MI300X:
   python3 scripts/dflash_diag_iter1_tau.py \
       --target-repo Qwen/Qwen3.5-4B \
-      --draft-dir /root/dflash_4b_agentic \
-      --prompt-file /root/hermes_test_prompt.txt \
+      --draft-dir ${TRIPWIRE_ROOT}/dflash_4b_agentic \
+      --prompt-file ${TRIPWIRE_ROOT}/hermes_test_prompt.txt \
       --max-cycles 1   # and again with --max-cycles 50 for aggregate
 """
 

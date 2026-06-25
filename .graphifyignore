@@ -1,0 +1,26 @@
+*
+
+# Keep Rust sources and Rust/C++/C/HIP kernel ecosystems.
+!*/
+!*.rs
+!*.rslib
+!*.rsh
+!*.rust
+!*.c
+!*.cc
+!*.cpp
+!*.cxx
+!*.cu
+!*.cl
+!*.clcpp
+!*.cuh
+!*.h
+!*.hh
+!*.hpp
+!*.hxx
+!*.inl
+!*.inc
+!*.S
+!*.s
+!*.asm
+!*.hip

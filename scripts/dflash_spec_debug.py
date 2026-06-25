@@ -10,8 +10,13 @@ The goal: figure out why the draft+target loop produces 'useruser...'
 while target.generate alone produces '<think>\\nThinking Process:'.
 """
 import sys, torch
-sys.path.insert(0, "/root/hipfire/scripts")
-sys.path.insert(0, "/root/hipfire/.dflash-reference")
+import os
+from pathlib import Path
+REPO_ROOT = Path(__file__).resolve().parent.parent
+TRIPWIRE_ROOT = Path(os.environ.get("TRIPWIRE_ROOT", str(Path.home())))
+TRIPWIRE_HIPFIRE_DIR = Path(os.environ.get("TRIPWIRE_HIPFIRE_DIR", str(REPO_ROOT)))
+sys.path.insert(0, str(TRIPWIRE_HIPFIRE_DIR / "scripts"))
+sys.path.insert(0, str(TRIPWIRE_HIPFIRE_DIR / ".dflash-reference"))
 from dflash_train_poc import build_draft_config
 from dflash.model import DFlashDraftModel, extract_context_feature, sample
 from safetensors.torch import load_file
@@ -32,8 +37,8 @@ print("[draft] loading z-lab weights...", flush=True)
 cfg = build_draft_config(tgt_cfg, 5, 16, 248070, match_zlab_arch=True)
 draft = DFlashDraftModel(cfg).to(device=device, dtype=dtype)
 sd = load_file(
-    "/root/.cache/huggingface/hub/models--z-lab--Qwen3.5-4B-DFlash/snapshots/"
-    "96899cc270945f554998309580b08a04a05a3187/model.safetensors"
+    str(TRIPWIRE_ROOT / ".cache/huggingface/hub/models--z-lab--Qwen3.5-4B-DFlash/"
+        "snapshots/96899cc270945f554998309580b08a04a05a3187/model.safetensors")
 )
 miss, unex = draft.load_state_dict(sd, strict=False)
 print(f"[draft]   missing={len(miss)} unexpected={len(unex)}", flush=True)

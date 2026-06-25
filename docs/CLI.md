@@ -16,6 +16,13 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire lock acquire`↴](#hipfire-lock-acquire)
 * [`hipfire lock release`↴](#hipfire-lock-release)
 * [`hipfire lock status`↴](#hipfire-lock-status)
+* [`hipfire diffusion`↴](#hipfire-diffusion)
+* [`hipfire diffusion import`↴](#hipfire-diffusion-import)
+* [`hipfire diffusion inspect`↴](#hipfire-diffusion-inspect)
+* [`hipfire diffusion preflight`↴](#hipfire-diffusion-preflight)
+* [`hipfire diffusion txt2img`↴](#hipfire-diffusion-txt2img)
+* [`hipfire diffusion img2img`↴](#hipfire-diffusion-img2img)
+* [`hipfire diffusion smoke`↴](#hipfire-diffusion-smoke)
 * [`hipfire admin`↴](#hipfire-admin)
 * [`hipfire admin status`↴](#hipfire-admin-status)
 * [`hipfire admin chat`↴](#hipfire-admin-chat)
@@ -44,6 +51,7 @@ hipfire LLM inference CLI
 * `collect-artifacts` — Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one model load
 * `repack` — Reshuffle a canonical .hfq into an arch-optimal layout (<model>.<arch>.hfq)
 * `lock` — GPU resource lock for multi-agent coordination (acquire/release/status)
+* `diffusion` — Import and inspect diffusion models stored as .hfq artifacts
 * `admin` — Query the running hipfire admin API for scripts and agents
 
 
@@ -187,6 +195,245 @@ Release the GPU lock (SIGTERM the holder recorded in the lockfile)
 Print lock status: "gpu is free" or "gpu BUSY: <holder>"
 
 **Usage:** `hipfire lock status`
+
+
+
+## `hipfire diffusion`
+
+Import and inspect diffusion models stored as .hfq artifacts
+
+Runtime note: runnable `.hfq` diffusion artifacts currently use the native
+UNet-family CPU reference path for CLIP text conditioning, UNet denoising, VAE
+decode, and VAE encode for img2img. ROCm preflight can validate the planned
+device buffers plus individual diffusion kernels for model-input scaling,
+classifier-free guidance, Euler scheduler updates, and RGB conversion, but full
+generation is not routed through a GPU UNet runtime yet. The runtime accepts
+Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128, HFQ4G256, and HFQ6G256 tensor
+payloads even when the artifact `weight_format` records a future quantized
+format such as `oq4`; OQ/MQ/HFP and other packed payloads still require a
+matching diffusion dequantizer/HIP runtime before they can generate images.
+
+**Usage:** `hipfire diffusion <COMMAND>`
+
+###### **Subcommands:**
+
+* `import` — Convert a Diffusers snapshot or single-file checkpoint into a Hipfire .hfq artifact
+* `inspect` — Inspect a diffusion .hfq artifact and print its server-facing summary
+* `preflight` — Plan HIP diffusion buffers and optionally run a ROCm device preflight
+* `txt2img` — Generate PNG images directly from a diffusion .hfq artifact
+* `img2img` — Generate PNG images from init images with a diffusion .hfq artifact
+* `smoke` — Run an end-to-end diffusion admission smoke and validate output PNGs
+
+
+
+## `hipfire diffusion import`
+
+Convert a Diffusers snapshot or single-file checkpoint into a Hipfire .hfq artifact.
+
+The importer extracts tensors from common Diffusers single-file and sharded safetensors layouts first, then falls back to legacy PyTorch .bin archives or opaque source weight entries when a component cannot be indexed yet.
+
+**Usage:** `hipfire diffusion import [OPTIONS] --output <OUTPUT> <SOURCE>`
+
+###### **Arguments:**
+
+* `<SOURCE>` — Diffusers snapshot directory containing model_index.json, or a .safetensors/.ckpt checkpoint
+
+###### **Options:**
+
+* `-o`, `--output <OUTPUT>` — Output .hfq artifact path
+* `--model-name <MODEL_NAME>` — Model name to store in the diffusion metadata; defaults to the source directory name
+* `--max-batch <MAX_BATCH>` — Maximum batch size declared by the artifact. Runtime kernels may cap this lower initially
+
+  Default value: `1`
+* `--metadata-only` — Import configs/tokenizers only and skip weight indexing for fast planning/inspection
+
+
+
+## `hipfire diffusion inspect`
+
+Inspect a diffusion .hfq artifact and print its server-facing summary
+
+**Usage:** `hipfire diffusion inspect <MODEL>`
+
+###### **Arguments:**
+
+* `<MODEL>` — Diffusion .hfq artifact to inspect
+
+
+
+## `hipfire diffusion preflight`
+
+Plan HIP diffusion buffers and optionally run a ROCm device preflight
+
+The preflight command prints a deterministic memory plan for the requested
+resolution, batch, scheduler, and prompt set. Builds compiled with
+`--features rocm` also initialize the selected HIP device, allocate the planned
+buffer classes, run a small host/device roundtrip probe, and launch diffusion
+kernels for model-input scaling, classifier-free guidance, Euler scheduler
+updates, and RGB conversion. Each kernel probe is checked against the CPU
+reference and reported in the JSON output.
+
+**Usage:** `hipfire diffusion preflight [OPTIONS] --model <MODEL>`
+
+###### **Options:**
+
+* `-m`, `--model <MODEL>` — Diffusion .hfq artifact to inspect
+* `-p`, `--prompt <PROMPT>` — Prompt text. Repeat for batched planning, or use --batch-size with one prompt
+
+  Default value: `hipfire diffusion preflight`
+* `--negative-prompt <NEGATIVE_PROMPT>` — Negative prompt text. Omit for empty negatives, pass once to reuse, or repeat per prompt
+* `--width <WIDTH>` — Output image width in pixels
+
+  Default value: `512`
+* `--height <HEIGHT>` — Output image height in pixels
+
+  Default value: `512`
+* `--steps <STEPS>` — Denoising steps
+
+  Default value: `20`
+* `--cfg-scale <CFG_SCALE>` — Classifier-free guidance scale
+
+  Default value: `7`
+* `--scheduler <SCHEDULER>` — Scheduler/sampler name
+
+  Default value: `Automatic`
+* `--seed <SEED>` — Seed. Omit for zero, pass once to reuse, or repeat per prompt
+* `--subseed <SUBSEED>` — Optional subseed. Pass once to reuse or repeat per prompt
+* `--subseed-strength <SUBSEED_STRENGTH>` — Blend strength for subseed latents
+
+  Default value: `0`
+* `--batch-size <BATCH_SIZE>` — Batch size when a single prompt is supplied
+
+  Default value: `1`
+* `--device-id <DEVICE_ID>` — ROCm device id to preflight when built with --features rocm
+
+  Default value: `0`
+
+
+
+## `hipfire diffusion txt2img`
+
+Generate PNG images directly from a diffusion .hfq artifact
+
+**Usage:** `hipfire diffusion txt2img [OPTIONS] --model <MODEL> --prompt <PROMPT> --output <OUTPUT>`
+
+###### **Options:**
+
+* `-m`, `--model <MODEL>` — Diffusion .hfq artifact to run
+* `-p`, `--prompt <PROMPT>` — Prompt text. Repeat for batched generation, or use --batch-size with one prompt
+* `--negative-prompt <NEGATIVE_PROMPT>` — Negative prompt text. Omit for empty negatives, pass once to reuse, or repeat per prompt
+* `-o`, `--output <OUTPUT>` — Output PNG file for one image, or output directory for batches
+* `--width <WIDTH>` — Output image width in pixels
+
+  Default value: `512`
+* `--height <HEIGHT>` — Output image height in pixels
+
+  Default value: `512`
+* `--steps <STEPS>` — Denoising steps
+
+  Default value: `20`
+* `--cfg-scale <CFG_SCALE>` — Classifier-free guidance scale
+
+  Default value: `7`
+* `--scheduler <SCHEDULER>` — Scheduler/sampler name, such as Automatic, Euler, Euler Karras, DDIM, or DPM++ 2M Karras
+
+  Default value: `Automatic`
+* `--seed <SEED>` — Seed. Omit for zero, pass once to reuse, or repeat per prompt
+* `--subseed <SUBSEED>` — Optional subseed. Pass once to reuse or repeat per prompt
+* `--subseed-strength <SUBSEED_STRENGTH>` — Blend strength for subseed latents
+
+  Default value: `0`
+* `--batch-size <BATCH_SIZE>` — Batch size when a single prompt is supplied
+
+  Default value: `1`
+
+
+
+## `hipfire diffusion img2img`
+
+Generate PNG images from init images with a diffusion .hfq artifact
+
+**Usage:** `hipfire diffusion img2img [OPTIONS] --model <MODEL> --prompt <PROMPT> --init-image <INIT_IMAGE> --output <OUTPUT>`
+
+###### **Options:**
+
+* `-m`, `--model <MODEL>` — Diffusion .hfq artifact to run
+* `-p`, `--prompt <PROMPT>` — Prompt text. Repeat for batched generation, or use --batch-size with one prompt
+* `--negative-prompt <NEGATIVE_PROMPT>` — Negative prompt text. Omit for empty negatives, pass once to reuse, or repeat per prompt
+* `--init-image <INIT_IMAGE>` — Input image path. Repeat for an image batch, or pass once to reuse across prompts
+* `--mask <MASK>` — Optional mask image path for inpaint-capable artifacts
+* `-o`, `--output <OUTPUT>` — Output PNG file for one image, or output directory for batches
+* `--width <WIDTH>` — Output image width in pixels. Defaults to the init image width
+* `--height <HEIGHT>` — Output image height in pixels. Defaults to the init image height
+* `--steps <STEPS>` — Denoising steps
+
+  Default value: `20`
+* `--cfg-scale <CFG_SCALE>` — Classifier-free guidance scale
+
+  Default value: `7`
+* `--scheduler <SCHEDULER>` — Scheduler/sampler name, such as Automatic, Euler, Euler Karras, DDIM, or DPM++ 2M Karras
+
+  Default value: `Automatic`
+* `--seed <SEED>` — Seed. Omit for zero, pass once to reuse, or repeat per prompt
+* `--subseed <SUBSEED>` — Optional subseed. Pass once to reuse or repeat per prompt
+* `--subseed-strength <SUBSEED_STRENGTH>` — Blend strength for subseed latents
+
+  Default value: `0`
+* `--batch-size <BATCH_SIZE>` — Batch size when a single prompt is supplied
+
+  Default value: `1`
+* `--denoising-strength <DENOISING_STRENGTH>` — Img2img denoising strength in [0, 1]
+
+  Default value: `0.75`
+
+
+
+## `hipfire diffusion smoke`
+
+Run an end-to-end diffusion admission smoke and validate output PNGs
+
+The smoke command validates PNG dimensions and rejects visually degenerate
+single-color or near-flat outputs. The JSON report includes per-image pixel
+statistics (`unique_rgb_values`, RGB range, and luma range) for admission
+evidence.
+
+**Usage:** `hipfire diffusion smoke [OPTIONS] --model <MODEL>`
+
+###### **Options:**
+
+* `-m`, `--model <MODEL>` — Diffusion .hfq artifact to run
+* `-p`, `--prompt <PROMPT>` — Prompt text for the smoke run
+
+  Default value: `hipfire diffusion smoke test`
+* `--negative-prompt <NEGATIVE_PROMPT>` — Negative prompt text
+
+  Default value: ``
+* `--output-dir <OUTPUT_DIR>` — Output directory for smoke PNGs
+
+  Default value: `/tmp/hipfire-diffusion-smoke`
+* `--width <WIDTH>` — Output image width in pixels
+
+  Default value: `64`
+* `--height <HEIGHT>` — Output image height in pixels
+
+  Default value: `64`
+* `--steps <STEPS>` — Denoising steps
+
+  Default value: `1`
+* `--cfg-scale <CFG_SCALE>` — Classifier-free guidance scale
+
+  Default value: `1`
+* `--scheduler <SCHEDULER>` — Scheduler/sampler name
+
+  Default value: `Euler`
+* `--seed <SEED>` — Seed
+
+  Default value: `0`
+* `--denoising-strength <DENOISING_STRENGTH>` — Img2img denoising strength
+
+  Default value: `0.5`
+* `--txt2img-only` — Only run txt2img; skip the img2img leg
+* `--skip-masked-img2img` — Skip the masked img2img leg
 
 
 

@@ -13,8 +13,10 @@
 #   start daemon + hipfire serve, configure + invoke hermes-agent.
 
 set -euo pipefail
+TRIPWIRE_ROOT="${TRIPWIRE_ROOT:-${HOME}}"
 
-export PATH=/root/.cargo/bin:/opt/rocm/bin:/opt/rocm/lib/llvm/bin:$PATH
+
+export PATH=${TRIPWIRE_ROOT}/.cargo/bin:/opt/rocm/bin:/opt/rocm/lib/llvm/bin:$PATH
 export HIP_PATH=/opt/rocm
 export ROCM_PATH=/opt/rocm
 export HIPFIRE_FP16=0
@@ -22,7 +24,7 @@ export HIPFIRE_FP16=0
 log() { printf '[hermes-setup] %s\n' "$*"; }
 
 # ── 1. Build hipfire binaries (if missing) ───────────────────────────
-cd /root/hipfire
+cd ${TRIPWIRE_ROOT}/hipfire
 if [ ! -x target/release/hipfire-daemon ]; then
     log "building daemon..."
     cargo build --release --features deltanet -p hipfire-daemon --bin hipfire-daemon 2>&1 | tail -3
@@ -46,8 +48,8 @@ fi
 
 log "────────────────────────────────────────────────────"
 log "STAGE A COMPLETE"
-log "  daemon binary: /root/hipfire/target/release/hipfire-daemon"
-log "  CLI binary:    /root/hipfire/target/release/hipfire"
+log "  daemon binary: ${TRIPWIRE_ROOT}/hipfire/target/release/hipfire-daemon"
+log "  CLI binary:    ${TRIPWIRE_ROOT}/hipfire/target/release/hipfire"
 log "  hermes-agent:  $(command -v hermes || echo NOT_FOUND)"
 log ""
 log "Next — run scripts/hermes_validate_run.sh after current GPU chain drains"

@@ -1,0 +1,46 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH hipfire-diffusion 1  "hipfire-diffusion "
+.SH NAME
+hipfire\-diffusion \- Import and inspect diffusion models stored as .hfq artifacts
+.SH SYNOPSIS
+\fBhipfire\-diffusion\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+Import and inspect diffusion models stored as .hfq artifacts
+.PP
+Runnable .hfq diffusion artifacts currently use the native UNet-family CPU
+reference path for CLIP text conditioning, UNet denoising, VAE decode, and VAE
+encode for img2img. ROCm preflight validates planned device buffers plus
+individual kernels for model-input scaling, classifier-free guidance, Euler
+scheduler updates, and RGB conversion, but full generation is not routed
+through a GPU UNet runtime yet. The runtime accepts Q4F16_G64, f16, bf16, f32,
+Q8F16, Q4_K, HFQ4G128, HFQ4G256, and HFQ6G256 tensor payloads even when the
+artifact weight_format records a future quantized format such as oq4; OQ/MQ/HFP
+and other packed payloads still require a matching diffusion dequantizer/HIP
+runtime before they can generate images.
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH SUBCOMMANDS
+.TP
+hipfire\-diffusion\-import(1)
+Convert a Diffusers snapshot or single\-file checkpoint into a Hipfire .hfq artifact
+.TP
+hipfire\-diffusion\-inspect(1)
+Inspect a diffusion .hfq artifact and print its server\-facing summary
+.TP
+hipfire\-diffusion\-preflight(1)
+Plan HIP diffusion buffers and optionally run a ROCm device preflight
+.TP
+hipfire\-diffusion\-txt2img(1)
+Generate PNG images directly from a diffusion .hfq artifact
+.TP
+hipfire\-diffusion\-img2img(1)
+Generate PNG images from init images with a diffusion .hfq artifact
+.TP
+hipfire\-diffusion\-smoke(1)
+Run an end\-to\-end diffusion admission smoke and validate output PNGs
+.TP
+hipfire\-diffusion\-help(1)
+Print this message or the help of the given subcommand(s)

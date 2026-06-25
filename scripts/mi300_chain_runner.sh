@@ -8,27 +8,29 @@
 #
 # Runs jobs back-to-back so the GPU isn't idle between training runs.
 # Each job block:
-#   - logs to /root/chain_logs/${name}.log
-#   - writes status marker /root/chain_status/${name}.{started,done,failed}
+#   - logs to ${TRIPWIRE_ROOT}/chain_logs/${name}.log
+#   - writes status marker ${TRIPWIRE_ROOT}/chain_status/${name}.{started,done,failed}
 #   - on failure, the chain stops (next jobs NOT started)
 #
 # Usage (on MI300X):
-#   nohup bash /root/hipfire/scripts/mi300_chain_runner.sh \
-#     > /root/chain_runner.log 2>&1 &
+#   nohup bash ${TRIPWIRE_ROOT}/hipfire/scripts/mi300_chain_runner.sh \
+#     > ${TRIPWIRE_ROOT}/chain_runner.log 2>&1 &
 #
 # Set SKIP_UNTIL=<name> to resume after a manual kill (skip completed jobs).
 #
 # After editing this file on the controller, just scp/git-pull + start fresh.
 
 set -uo pipefail
-cd /root/hipfire
+TRIPWIRE_ROOT="${TRIPWIRE_ROOT:-${HOME}}"
 
-LOG_DIR=/root/chain_logs
-STATUS_DIR=/root/chain_status
+cd ${TRIPWIRE_ROOT}/hipfire
+
+LOG_DIR=${TRIPWIRE_ROOT}/chain_logs
+STATUS_DIR=${TRIPWIRE_ROOT}/chain_status
 mkdir -p "$LOG_DIR" "$STATUS_DIR"
 
-PY=/root/pytorch_env/bin/python3
-CORPUS=/root/agentic_corpus.txt
+PY=${TRIPWIRE_ROOT}/pytorch_env/bin/python3
+CORPUS=${TRIPWIRE_ROOT}/agentic_corpus.txt
 SKIP_UNTIL="${SKIP_UNTIL:-}"
 
 SKIPPING=1
@@ -85,13 +87,13 @@ job_9b_scratch_25k() {
         --loss-gamma 3.0 \
         --match-zlab-arch \
         --grad-ckpt-target \
-        --out /root/dflash_9b_scratch_25k
+        --out ${TRIPWIRE_ROOT}/dflash_9b_scratch_25k
 }
 
 job_9b_scratch_convert() {
     ./target/release/dflash_convert \
-        --input /root/dflash_9b_scratch_25k \
-        --output /root/dflash_9b_scratch_25k.hfq \
+        --input ${TRIPWIRE_ROOT}/dflash_9b_scratch_25k \
+        --output ${TRIPWIRE_ROOT}/dflash_9b_scratch_25k.hfq \
         --mq4
 }
 
@@ -106,13 +108,13 @@ job_4b_scratch_25k() {
         --lr 5e-5 --warmup 500 \
         --loss-gamma 3.0 \
         --match-zlab-arch \
-        --out /root/dflash_4b_scratch_25k
+        --out ${TRIPWIRE_ROOT}/dflash_4b_scratch_25k
 }
 
 job_4b_scratch_convert() {
     ./target/release/dflash_convert \
-        --input /root/dflash_4b_scratch_25k \
-        --output /root/dflash_4b_scratch_25k.hfq \
+        --input ${TRIPWIRE_ROOT}/dflash_4b_scratch_25k \
+        --output ${TRIPWIRE_ROOT}/dflash_4b_scratch_25k.hfq \
         --mq4
 }
 
@@ -122,7 +124,7 @@ sidecar_cal() {
     local tgt=$1 sc_out=$2
     # triattn_validate takes the model as a POSITIONAL arg, not --model.
     # Output filename is controlled via --sidecar.
-    /root/hipfire/target/release/examples/triattn_validate \
+    ${TRIPWIRE_ROOT}/hipfire/target/release/examples/triattn_validate \
         "$tgt" \
         --sidecar "$sc_out" \
         --corpus "$CORPUS" \
@@ -134,13 +136,13 @@ job_4b_sidecar_cal() {
     # Uses the existing MQ4 target (not the new draft — sidecars are for
     # the TARGET's attention, not the draft). Produces
     # qwen3.5-4b-mq4.triattn.hfq which pairs with any 4B draft.
-    local tgt=/root/models/qwen3.5-4b-mq4.hfq
+    local tgt=${TRIPWIRE_ROOT}/models/qwen3.5-4b-mq4.hfq
     [ -f "$tgt" ] || { echo "no target at $tgt — stage with stage_models.sh first" >&2; return 3; }
     sidecar_cal "$tgt" "${tgt}.triattn.agentic.bin"
 }
 
 job_9b_sidecar_cal() {
-    local tgt=/root/models/qwen3.5-9b-mq4.hfq
+    local tgt=${TRIPWIRE_ROOT}/models/qwen3.5-9b-mq4.hfq
     [ -f "$tgt" ] || { echo "no target at $tgt — stage with stage_models.sh first" >&2; return 3; }
     sidecar_cal "$tgt" "${tgt}.triattn.agentic.bin"
 }

@@ -1,0 +1,21 @@
+[package]
+name = "hipfire-diffusion"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native diffusion HFQ metadata, import, and batched generation interfaces."
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hipfire-runtime = { path = "../hipfire-runtime", default-features = false }
+rdna-compute = { path = "../rdna-compute", optional = true }
+hip-bridge = { path = "../hip-bridge", optional = true }
+
+[features]
+default = []
+rocm = ["rdna-compute", "hip-bridge"]

@@ -35,13 +35,15 @@
 #   bash fetch_calibration_corpus.sh [OUT_PATH] [--recipe NAME] [--dataset n1,n2]
 #                                    [--max-rows N]
 #
-# Default OUT_PATH: /root/calibration_corpus.txt
+# Default OUT_PATH: ${TRIPWIRE_ROOT}/calibration_corpus.txt
 # Default recipe: agentic
 #
 # Needs: pip install huggingface_hub pyarrow
 # Set HF_TOKEN if any source is gated.
 
 set -euo pipefail
+TRIPWIRE_ROOT="${TRIPWIRE_ROOT:-${HOME}}"
+
 
 OUT="${1:-}"
 RECIPE="agentic"
@@ -52,7 +54,7 @@ MAX_ROWS="${MAX_ROWS:-0}"
 if [ -n "$OUT" ] && [[ "$OUT" != --* ]]; then
     shift
 else
-    OUT="/root/calibration_corpus.txt"
+    OUT="${TRIPWIRE_ROOT}/calibration_corpus.txt"
 fi
 
 while [ $# -gt 0 ]; do
@@ -87,7 +89,7 @@ log "datasets:  $DATASETS"
 log "max_rows:  ${MAX_ROWS:-all}"
 
 PY=python3
-if [ -f /root/pytorch_env/bin/python3 ]; then PY=/root/pytorch_env/bin/python3; fi
+if [ -f ${TRIPWIRE_ROOT}/pytorch_env/bin/python3 ]; then PY=${TRIPWIRE_ROOT}/pytorch_env/bin/python3; fi
 
 "$PY" - "$OUT" "$DATASETS" "$MAX_ROWS" <<'PY'
 import csv, json, os, sys

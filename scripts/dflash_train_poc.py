@@ -46,13 +46,13 @@ Scale knobs:
 
 For a 30-min Qwen3.5-4B validation run at batch=1 K=4 steps=5000:
   bash scripts/amd_quickdeploy.sh
-  bash scripts/fetch_calibration_corpus.sh /root/agent.txt --recipe agentic
+  bash scripts/fetch_calibration_corpus.sh ${TRIPWIRE_ROOT}/agent.txt --recipe agentic
   python3 scripts/dflash_train_poc.py \
       --target-repo Qwen/Qwen3.5-4B \
-      --corpus /root/agent.txt \
+      --corpus ${TRIPWIRE_ROOT}/agent.txt \
       --seq-len 4096 --batch-size 1 --masked-blocks-per-seq 4 \
       --steps 5000 --ckpt-every 1000 \
-      --out /root/dflash_4b_agentic
+      --out ${TRIPWIRE_ROOT}/dflash_4b_agentic
 
 Expect loss 12 → 2-3 by step 5000; if that holds, scale up to 3.6-A3B.
 """
@@ -74,6 +74,10 @@ import torch.nn.functional as F
 from safetensors.torch import save_file
 from torch.optim.lr_scheduler import LambdaLR
 
+# Tripwire-root for non-root environments; allows CI and ad-hoc workstations
+# to own where writable scratch/data lives.
+TRIPWIRE_ROOT = Path(os.environ.get("TRIPWIRE_ROOT", str(Path.home())))
+
 # Pull the reference model.py off .dflash-reference/ without having to
 # `pip install -e` it (avoids transformers-version conflicts).
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -91,8 +95,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--steps", type=int, default=10000)
     p.add_argument("--warmup", type=int, default=500)
-    p.add_argument("--corpus", default="/root/wikitext_calib.txt")
-    p.add_argument("--out", default="/root/dflash_train_poc_out")
+    p.add_argument("--corpus", default=str(TRIPWIRE_ROOT / "wikitext_calib.txt"))
+    p.add_argument("--out", default=str(TRIPWIRE_ROOT / "dflash_train_poc_out"))
     p.add_argument("--ckpt-every", type=int, default=1000)
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--resume", default=None, help="Path to checkpoint safetensors to resume from.")

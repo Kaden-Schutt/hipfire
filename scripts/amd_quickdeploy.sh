@@ -11,16 +11,16 @@
 #   1. Verifies ROCm is installed and parses its minor version.
 #   2. Installs apt prereqs (python3-venv, build tools).
 #   3. Installs rustup if missing; guarantees a stable toolchain.
-#   4. Creates /root/pytorch_env and installs the torch wheel whose ROCm
+#   4. Creates ${TRIPWIRE_ROOT}/pytorch_env and installs the torch wheel whose ROCm
 #      minor version matches the installed stack. Falls back to the closest
 #      supported channel if no exact match exists.
 #   5. Installs the HF training stack (transformers, safetensors, datasets,
 #      accelerate, numpy).
-#   6. Optionally clones/updates hipfire to /root/hipfire and builds the
+#   6. Optionally clones/updates hipfire to ${TRIPWIRE_ROOT}/hipfire and builds the
 #      release binaries under the `deltanet` feature.
 #   7. Detects the number of visible GPUs and echoes the recommended
 #      parallel-calibration launcher command.
-#   8. Bakes HIPFIRE_ROCBLAS_OFF=1 + ROCm PATH into /root/.bashrc so every
+#   8. Bakes HIPFIRE_ROCBLAS_OFF=1 + ROCm PATH into ${TRIPWIRE_ROOT}/.bashrc so every
 #      subsequent shell has the right environment for MQ4 inference
 #      (rocBLAS path is broken under physical_cap eviction on gfx942).
 #
@@ -29,19 +29,21 @@
 #   - Start any long-running workload (caller kicks those explicitly).
 #
 # Usage:
-#   scp scripts/amd_quickdeploy.sh <host>:/root/
-#   ssh <host> 'bash /root/amd_quickdeploy.sh'            # default targets
-#   ssh <host> 'bash /root/amd_quickdeploy.sh --skip-build'
-#   ssh <host> 'bash /root/amd_quickdeploy.sh --repo=git@github.com:user/hipfire.git'
-#   ssh <host> 'bash /root/amd_quickdeploy.sh --branch=dflash'
-#   ssh <host> 'bash /root/amd_quickdeploy.sh --fetch-corpus'  # pull hermes corpus too
+#   scp scripts/amd_quickdeploy.sh <host>:${TRIPWIRE_ROOT}/
+#   ssh <host> 'bash ${TRIPWIRE_ROOT}/amd_quickdeploy.sh'            # default targets
+#   ssh <host> 'bash ${TRIPWIRE_ROOT}/amd_quickdeploy.sh --skip-build'
+#   ssh <host> 'bash ${TRIPWIRE_ROOT}/amd_quickdeploy.sh --repo=git@github.com:user/hipfire.git'
+#   ssh <host> 'bash ${TRIPWIRE_ROOT}/amd_quickdeploy.sh --branch=dflash'
+#   ssh <host> 'bash ${TRIPWIRE_ROOT}/amd_quickdeploy.sh --fetch-corpus'  # pull hermes corpus too
 
 set -euo pipefail
+TRIPWIRE_ROOT="${TRIPWIRE_ROOT:-${HOME}}"
+
 
 REPO_URL="${REPO_URL:-https://github.com/Kaden-Schutt/hipfire.git}"
-REPO_DIR="${REPO_DIR:-/root/hipfire}"
+REPO_DIR="${REPO_DIR:-${TRIPWIRE_ROOT}/hipfire}"
 REPO_BRANCH="${REPO_BRANCH:-dflash}"
-VENV_DIR="${VENV_DIR:-/root/pytorch_env}"
+VENV_DIR="${VENV_DIR:-${TRIPWIRE_ROOT}/pytorch_env}"
 SKIP_BUILD=0
 SKIP_HF=0
 SKIP_TORCH=0
@@ -182,12 +184,12 @@ fi
 # HIPFIRE_ROCBLAS_OFF=1 is required on gfx942 under physical_cap eviction
 # until the rocBLAS stride bug is fixed (task #25). Cheap to set
 # globally — it only affects the rocBLAS MFMA path.
-log "baking env defaults into /root/.bashrc (HIPFIRE_ROCBLAS_OFF=1, ROCm PATH)"
-BASHRC=/root/.bashrc
+log "baking env defaults into ${TRIPWIRE_ROOT}/.bashrc (HIPFIRE_ROCBLAS_OFF=1, ROCm PATH)"
+BASHRC=${TRIPWIRE_ROOT}/.bashrc
 grep -q "HIPFIRE_ROCBLAS_OFF" "$BASHRC" 2>/dev/null || cat >> "$BASHRC" <<'BRC'
 # hipfire deploy defaults
 export HIPFIRE_ROCBLAS_OFF=1
-export PATH=/opt/rocm/bin:/opt/rocm/lib/llvm/bin:/root/.cargo/bin:$PATH
+export PATH=/opt/rocm/bin:/opt/rocm/lib/llvm/bin:${TRIPWIRE_ROOT}/.cargo/bin:$PATH
 export HIP_PATH=/opt/rocm
 export ROCM_PATH=/opt/rocm
 BRC
@@ -205,10 +207,10 @@ if [ "$FETCH_CORPUS" -eq 1 ]; then
     [ -f "$VENV_DIR/bin/activate" ] && source "$VENV_DIR/bin/activate"
     log "fetching blended calibration corpus (agentic + reasoning + chat)..."
     if [ -x "$REPO_DIR/scripts/fetch_calibration_corpus.sh" ]; then
-        "$REPO_DIR/scripts/fetch_calibration_corpus.sh" /root/calibration_corpus.txt --recipe blended
+        "$REPO_DIR/scripts/fetch_calibration_corpus.sh" ${TRIPWIRE_ROOT}/calibration_corpus.txt --recipe blended
     elif [ -x "$REPO_DIR/scripts/fetch_hermes_corpus.sh" ]; then
         log "  new fetch_calibration_corpus.sh not present, falling back to hermes-only"
-        "$REPO_DIR/scripts/fetch_hermes_corpus.sh" /root/calibration_corpus.txt
+        "$REPO_DIR/scripts/fetch_hermes_corpus.sh" ${TRIPWIRE_ROOT}/calibration_corpus.txt
     else
         log "  no fetch script in repo; skipping"
     fi
@@ -228,17 +230,17 @@ log "  1. Stage models — pull safetensors + quantize to mq4/mq6:"
 log "       bash $REPO_DIR/scripts/stage_models.sh"
 log "  2. Fetch calibration corpus (if not done via --fetch-corpus):"
 log "       bash $REPO_DIR/scripts/fetch_calibration_corpus.sh \\"
-log "            /root/calibration_corpus.txt --recipe blended"
+log "            ${TRIPWIRE_ROOT}/calibration_corpus.txt --recipe blended"
 if [ "$N_GPUS" -gt 1 ]; then
 log "  3. Parallel calibrate across all $N_GPUS GPUs:"
 log "       bash $REPO_DIR/scripts/calibrate_multigpu.sh \\"
-log "            --models \$(ls /root/models/*.mq[46] | tr '\\n' ',') \\"
-log "            --corpus /root/calibration_corpus.txt"
+log "            --models \$(ls ${TRIPWIRE_ROOT}/models/*.mq[46] | tr '\\n' ',') \\"
+log "            --corpus ${TRIPWIRE_ROOT}/calibration_corpus.txt"
 else
 log "  3. Single-GPU calibration:"
 log "       $REPO_DIR/target/release/examples/triattn_validate \\"
-log "            /root/models/qwen3.5-9b-mq4.hfq \\"
-log "            --corpus /root/calibration_corpus.txt --max-tokens 1000000 \\"
-log "            --sidecar /root/models/qwen3.5-9b-mq4.triattn.hfq"
+log "            ${TRIPWIRE_ROOT}/models/qwen3.5-9b-mq4.hfq \\"
+log "            --corpus ${TRIPWIRE_ROOT}/calibration_corpus.txt --max-tokens 1000000 \\"
+log "            --sidecar ${TRIPWIRE_ROOT}/models/qwen3.5-9b-mq4.triattn.hfq"
 fi
 log "────────────────────────────────────────────────────"

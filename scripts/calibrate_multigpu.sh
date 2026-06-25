@@ -16,12 +16,12 @@
 #       [--max-tokens 1000000] \
 #       [--chunk-len 1024] \
 #       [--suffix .triattn.bin] \
-#       [--sidecar-dir /root/models] \
-#       [--log-dir /root/calib_logs]
+#       [--sidecar-dir ${TRIPWIRE_ROOT}/models] \
+#       [--log-dir ${TRIPWIRE_ROOT}/calib_logs]
 #
 # --recipe NAME auto-builds a corpus via fetch_calibration_corpus.sh.
 # Recipes: agentic | agentic_xl | reasoning | chat | blended | all.
-# Corpus is cached at /root/calib_corpus_<NAME>.txt for reuse across
+# Corpus is cached at ${TRIPWIRE_ROOT}/calib_corpus_<NAME>.txt for reuse across
 # back-to-back calibration waves.
 #
 # Each model M gets calibrated against --corpus, writing:
@@ -31,6 +31,8 @@
 # Exit codes are non-zero if any job fails; summary prints at the end.
 
 set -uo pipefail
+TRIPWIRE_ROOT="${TRIPWIRE_ROOT:-${HOME}}"
+
 
 MODELS=""
 CORPUS=""
@@ -39,8 +41,8 @@ MAX_TOKENS=1000000
 CHUNK_LEN=1024
 SUFFIX=".triattn.bin"
 SIDECAR_DIR=""
-LOG_DIR=/root/calib_logs
-BIN="${HIPFIRE_BIN:-/root/hipfire/target/release/examples/triattn_validate}"
+LOG_DIR=${TRIPWIRE_ROOT}/calib_logs
+BIN="${HIPFIRE_BIN:-${TRIPWIRE_ROOT}/hipfire/target/release/examples/triattn_validate}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -61,7 +63,7 @@ done
 log() { printf '[calibrate-mg] %s\n' "$*"; }
 
 # --recipe NAME auto-builds a corpus via fetch_calibration_corpus.sh into
-# /root/calib_corpus_<recipe>.txt and uses it as --corpus. Saves the
+# ${TRIPWIRE_ROOT}/calib_corpus_<recipe>.txt and uses it as --corpus. Saves the
 # two-step "fetch + then calibrate" gotcha. Mutually exclusive with
 # --corpus (explicit path wins; refuse if both given to surface user
 # intent).
@@ -70,7 +72,7 @@ if [ -n "$RECIPE" ]; then
         echo "ERROR: --recipe and --corpus are mutually exclusive" >&2
         exit 2
     fi
-    CORPUS="/root/calib_corpus_${RECIPE}.txt"
+    CORPUS="${TRIPWIRE_ROOT}/calib_corpus_${RECIPE}.txt"
     if [ ! -f "$CORPUS" ]; then
         SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
         FETCH="${SCRIPT_DIR}/fetch_calibration_corpus.sh"

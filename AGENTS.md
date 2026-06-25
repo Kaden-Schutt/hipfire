@@ -1,74 +1,115 @@
-# AGENTS.md — hipfire agent instructions
+# AGENTS.md - hipfire repo guidance
 
-For detailed notices, project operating guides, and testing playbooks, see the corresponding sections in `README.md`.
+This file is the repo-wide contract for agents. Keep it small: put
+subsystem-only rules in the nearest nested `AGENTS.md`, keep long procedures in
+skills or docs, and use the task prompt for one-off constraints.
 
-## Project Rules (Core Invariants)
-1. **No Python in the inference hot path.** Python is allowed for tooling, benchmarks, comparison baselines.
-2. **Commit meaningful experiment states.** Document failures explicitly.
-3. **Portability matters.** Every decision should consider: will this work on RDNA2? RDNA3? RDNA4?
-4. **No Vulkan / wgpu / cross-vendor compute backend.** hipfire ships a single HIP/ROCm-direct backend.
-5. **One lock primitive: `hipfire-lock` `flock(2)`. Never roll your own.** Every cross-process mutex (GPU/NPU/CPU resource lease, daemon singleton, any future device or file lock) MUST go through the **one** canonical surface:
-   - **Rust callers** use the `hipfire-lock` crate directly — `FlockGuard` plus the shared path contracts `resource_lock_root()` / `resource_lock_path(resource)` / `gpu_resource_lock_path()` (= `resource_lock_path("hip-gpu-0")`, the canonical single-GPU lock).
-   - **Shell / non-Rust / external callers** use the **`hipfire lock {acquire,release,status}` CLI** (alias `gpu-lock`). It is a thin wrapper over the same `FlockGuard` on `gpu_resource_lock_path()` — the SAME inode the daemon's GPU resource lease uses, so a CLI holder and the daemon coordinate. `acquire` spawns a detached holder that keeps the flock until the watched pid dies. Do NOT reach for `flock(1)`, a sentinel file, or a bespoke lockfile from a script.
+For project background, notices, and detailed playbooks, read `README.md` and
+the relevant docs under `docs/`.
 
-   Do NOT introduce a second mechanism anywhere: no `std::fs::create_dir`-as-mutex, no `owner.json`/pidfile + pid-liveness reclamation, no env-var sentinel, no ad-hoc lockfile, no shell-only mutex, and no *second lock file* for the same resource (the CLI lock and the daemon GPU lease MUST be the same inode). Rationale: `flock` is inode-keyed (one mutex shared across processes/languages) and kernel-released on holder exit (no stale-lock cleanup), and a single primitive+CLI prevents divergent/duplicate locks that silently fail to coordinate — the cautionary cases: the `create_dir` resource-lease that drifted out of sync (fixed in `f24313c09`), the separate `hipfire-gpu.lock` file that did not coordinate with the daemon's `hip-gpu-0` lease (unified when `gpu-lock` was renamed to `lock`), and the removed `scripts/gpu-lock.sh` shell adapter. Need a new lock? Add a path helper to `hipfire-lock` and expose it via the CLI if scripts need it — don't fork the mechanism.
+## Core Invariants
 
-## Branch Policy
-- **Use `chaingun` as the reference branch for all further work.** New work should either happen directly on `chaingun` or be explicitly based on and compared against `chaingun`; do not treat `master` as the active development baseline unless the user says so.
-- **Keep git moving as you work.** Pull/rebase from the `chaingun` reference before starting meaningful changes, commit coherent work states with descriptive messages, and push the active branch regularly. If the worktree contains unrelated user changes, preserve them and only stage/commit the files that belong to the current task.
+- hipfire is Rust + HIP/ROCm-direct inference. Do not put Python in the
+  inference hot path; Python is allowed for tooling, benchmarks, and comparison
+  baselines.
+- Do not add Vulkan, wgpu, or a cross-vendor compute backend. The backend is
+  HIP/ROCm-direct.
+- Treat portability as a design constraint. When touching runtime, dispatch,
+  kernels, or quant formats, ask whether the change works on RDNA2, RDNA3, and
+  RDNA4.
+- Document meaningful experiment results, including failures. Failed approaches
+  are useful when they narrow the search space.
+- Use one lock primitive: `hipfire-lock` `flock(2)`. Rust callers use
+  `FlockGuard` and the shared path helpers. Shell, script, and external callers
+  use `hipfire lock {acquire,release,status}`; `gpu-lock` is only an alias. Do
+  not add sentinel files, pidfile liveness locks, `create_dir` mutexes,
+  alternate lockfiles, or shell-only mutexes.
 
-## Testing & Coherence Gates
-- **Coherence-gate is the canonical correctness gate.** Run `./tests/coherence-gate.sh` after any change touching kernels, quant formats, dispatch, fusion, rotation, rmsnorm, or the spec-decode path.
-- **Model/runtime evidence belongs in `hipfire-eval`.** When adding or repairing speed, coherence, DFlash/DDTree/Path C, PFlash, agentic/tool-call, long-context, quality, or server-runtime admission tests, add or update `hipfire-eval` batteries/suites first. Keep shell gates only as enforcement wrappers where they still provide baseline comparison or hook integration.
-- **Prompt structure dictates τ.** ALWAYS use byte-identical prompts via `benchmarks/prompts/*.txt`.
-- **Run the no-GPU subset.** `./tests/no-gpu-ci.sh` before handing off workflow-only changes.
-- **Resource Lock Protocol** (mechanism per Core Invariant 5 — `hipfire-lock` flock, never a second lock): `hipfire-daemon` acquires `flock(2)` leases (one `<resource>.lock` file per GPU/NPU/CPU resource, via `resource_lock_path()`) under `~/.hipfire/locks/` before HIP init, releasing on exit; the daemon singleton uses the same primitive on `~/.hipfire/daemon.pid`. Override the resource-lock root with `HIPFIRE_RESOURCE_LOCK_DIR`; use `HIPFIRE_RESOURCE_LOCK_WAIT_MS` to wait for busy leases. Non-daemon GPU binaries (cargo `--example` benches, `hipfire eval`, `hipfire-quantize`) do not self-lock — coordinate them with the native CLI mutex `hipfire lock {acquire,release,status}` (alias `gpu-lock`), which flocks `gpu_resource_lock_path()` — the same `hip-gpu-0.lock` inode the daemon's GPU lease holds, so they actually coordinate. The legacy `scripts/gpu-lock.sh` shell adapter has been removed.
+## Branch And Git
 
-## Skills (`.agents/skills/`)
-Reusable how-tos live in `.agents/skills/<name>/`. Each has a `SKILL.md` (and optionally `skill.json`) with full context. Load one by reading its files when the situation matches.
+- Use `chaingun` as the reference branch for further work. New work should
+  happen directly on `chaingun` or be explicitly based on and compared against
+  `chaingun`; do not treat `master` as the active baseline unless the user says
+  so.
+- Before meaningful changes, pull/rebase from the `chaingun` reference when the
+  worktree state allows it.
+- Preserve unrelated user changes. When committing or pushing, stage only files
+  that belong to the current task and use descriptive messages.
 
-| Skill | When to use |
-|-------|-------------|
-| `astrea` | Quant calibration, imatrix-driven experiments, KLD/PPL quality eval |
-| `hipfire-amd-matrix-calculator` | Vendored AMD Matrix Instruction Calculator queries |
-| `hipfire-arch-port` | Porting compute kernels to a new RDNA/CDNA arch |
-| `hipfire-autoheal` | Triage daemon hangs, kernel JIT failures, port conflicts |
-| `hipfire-diag` | GPU diagnostics — interpret results and suggest fixes |
-| `hipfire-eval-harness` | Running or interpreting the unified eval harness |
-| `hipfire-kernel-atlas` | Phase-aware Kernel Atlas rows and ISA Fit View |
-| `hipfire-kernel-tuning` | Optimize HIP kernels — tuning levers, multi-row, WMMA, wave-size |
-| `hipfire-tester` | Bring-up, smoke tests, DFlash opt-in, MQ format checks |
-| `npu-kernel-build` | Compile MLIR-AIE kernels for the XDNA NPU via IRON + aiecc |
-| `rebase-onto-modular` | Port feature branches from pre-0.1.20 master |
-| `run-model` | Load a model and generate tokens via the daemon JSON-lines protocol |
+## Verification
 
-## Hipfire artifact naming convention
-Canonical shape:
-`<family>-<version>-<size>[-<variant>][-<role>]-<format>[+<features>].<ext>`
+- Run `./tests/no-gpu-ci.sh` before handing off workflow-only changes.
+- `./tests/coherence-gate-dflash.sh` is the canonical correctness gate after
+  changes touching kernels, quant formats, dispatch, fusion, rotation, rmsnorm,
+  or the spec-decode path.
+- Model/runtime admission evidence belongs in `hipfire-eval` batteries or
+  suites first. Shell gates should remain enforcement wrappers when they still
+  provide baseline comparison or hook integration.
+- Non-daemon GPU binaries do not self-lock. Coordinate GPU examples, benches,
+  `hipfire eval`, and `hipfire-quantize` with
+  `hipfire lock {acquire,release,status}` unless the called gate already does
+  so.
 
-Rules:
-- Use `.hfq` for hipfire container artifacts, including MQ-family models.
-- Use dotted model versions such as `qwen3.5`.
-- Put calibration / transform modifiers before the quant token: `awq-mq4`, `lloyd-mq3`.
-- Use `+feature` only when bundled: `mq4+mtp`, `mq4+dflash`.
-- Use role sidecars when loaded independently: `.mtp.hfq`, `.dflash.hfq`, `.triattn.hfq`.
-- Use `.triattn.hfq` for TriAttention sidecars even though they are not weight tensors; do not introduce `.triattn.bin` for new files.
-- Role sidecar HFQM headers should use the parent model family's `arch_id` so
-  compatibility checks can reject mismatched families. Use `arch_id = 0` only
-  for artifacts that are intentionally shareable across multiple model families
-  and whose metadata names the shareability contract explicitly.
-- HFQM records package contents in the binary entry index (`name`,
-  `quant_type`, `shape`, `group_size`, byte size/offset). Producers may also
-  mirror this in metadata, for example KLD refs use a `payloads` object, but the
-  index is the authoritative contents table.
-- Do not use dotted quant artifact suffixes. The quant token belongs before
-  the `.hfq` extension with a hyphen separator; Lloyd MQ2 uses
-  `-lloyd-mq2.hfq`.
-- When a script, gate, registry, or doc is found using an older artifact spelling,
-  update it to the canonical naming convention as part of the fix.
-- Backwards compatibility is a separate, explicit decision: add legacy-name
-  fallback only when the task or migration risk calls for it, and document why.
+## Artifact Names
 
----
+Canonical artifact shape:
+
+`<family>[-]<version>-<size-[effective/active]>[-tag1][-tag2...][.feature1[-feature2...]]<.format>[.arch].hfq`
+
+Periods are used to seperate groups known to hipfire.
+Examples:
+LFM2.5-1.2B-Thinking.bf16.hfq
+Qwen3.5-122B-A10B.mtp-vl.lloyd-mq2.hfq
+Gemma-4-8B-E4B-it-heretic-QAT.dflash-triattn.op4+.gfx1151.hfq
+MedGemma-27B-it.triattn.hfq
+
+- `family` and `version` may optionally include a dash. eg. Qwen3.5, Llama-3
+- size with optional active/effective paramaters. eg. 0.8b, 30B-A3B, 8B-E4B, 50M, 2.5T
+- Use `.hfq` for hipfire all container artifacts.
+- Use dotted model versions such as `Qwen3.5`. do not use qwen35 for example.
+- Put calibration or transform modifiers in the feature flags `awq.mq4` or `lloyd-mq3`.
+- Use role sidecars when loaded independently: `.mtp.hfq`, `.dflash.hfq`,
+  `.jinja.`, `.hessian` and `.triattn.hfq`.
+- The quant should detail the weight encoding. eg. Lloyd MQ2 uses `.lloyd-mq2`, magnum `.mq4`
+- `arch` must start with gfx followed by 3 or 4 numbers. eg. gfx906, gfx1103, gfx1151, gfx1201
+- When a script, gate, registry, or doc uses an older format, update it to the
+  canonical naming convention as part of the fix.
+- Remove legacy-name fallback whenever you find it
+
+## Local Routing
+
+When a task primarily targets one of these subtrees, read that subtree's
+`AGENTS.md` before editing even if Codex was started from the repo root.
+
+- `.agents/` owns reusable agent skills and workflow instructions.
+- `benchmarks/` owns prompt corpora, benchmark scripts, baselines, and results.
+- `crates/hipfire-eval/` owns model/runtime evidence batteries and suites.
+- `kernels/` and `crates/rdna-compute/` own HIP kernel and dispatch mechanics.
+- `crates/hipfire-runtime/` owns the inference hot path, model execution, and
+  runtime examples.
+- `scripts/` owns reusable shell workflows and ad hoc benches outside the formal
+  test gate directory.
+- `tests/` owns enforcement wrappers and CI/smoke gates.
+
+Add or tighten nested `AGENTS.md` files when a rule only applies to a subtree.
+
+## Local Overlay
+
+`AGENTS.local.md` is gitignored and may be absent. When present, it contains
+machine-specific guidance such as hostnames, GPU fleet notes, SSH targets, and
+lock pins.
 
 @./AGENTS.local.md
+
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+When the user types `/graphify`, invoke the `skill` tool with `skill: "graphify"` before doing anything else.
+
+Rules:
+- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- Dirty graphify-out/ files are expected after hooks or incremental updates; dirty graph files are not a reason to skip graphify. Only skip graphify if the task is about stale or incorrect graph output, or the user explicitly says not to use it.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).

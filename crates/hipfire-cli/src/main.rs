@@ -35,6 +35,8 @@ enum Command {
     /// GPU resource lock for multi-agent coordination (acquire/release/status)
     #[command(alias = "gpu-lock")]
     Lock(commands::lock::LockArgs),
+    /// Import and inspect diffusion models stored as .hfq artifacts
+    Diffusion(commands::diffusion::DiffusionArgs),
     /// Query the running hipfire admin API for scripts and agents
     #[command(alias = "op")]
     Admin(commands::admin::AdminArgs),
@@ -87,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
         Command::CollectArtifacts(args) => commands::forward::run_collect_artifacts(args),
         Command::Repack(args) => commands::forward::run_repack(args),
         Command::Lock(args) => commands::lock::run(args),
+        Command::Diffusion(args) => commands::diffusion::run(args),
         Command::Admin(args) => commands::admin::run(args, config).await,
         Command::GenDocs(args) => commands::gen_docs::run(args),
         Command::GenConfigSchema(args) => commands::gen_config_schema::run(args),

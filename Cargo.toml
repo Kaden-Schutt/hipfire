@@ -43,6 +43,7 @@ members = [
     "crates/hipfire-quantize",
     "crates/hipfire-kvquant",
     "crates/hipfire-detect",
+    "crates/hipfire-diffusion",
     "crates/hipfire-atlas",
     "crates/hipfire-cli",
     "crates/hipfire-tui",

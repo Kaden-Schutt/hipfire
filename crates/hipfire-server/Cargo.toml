@@ -16,6 +16,7 @@ chat-ui-embed = ["dep:rust-embed"]
 
 [dependencies]
 axum = { version = "0.8", features = ["macros", "multipart"] }
+base64 = "0.22"
 rust-embed = { version = "8", optional = true }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
@@ -34,8 +35,13 @@ hipfire-config = { path = "../hipfire-config" }
 hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
 hipfire-lock = { path = "../hipfire-lock" }
 hipfire-generate = { path = "../hipfire-generate" }
+hipfire-diffusion = { path = "../hipfire-diffusion" }
 hipfire-model = { path = "../hipfire-model" }
 hipfire-operator = { path = "../hipfire-operator" }
 hipfire-prompt = { path = "../hipfire-prompt" }
 hipfire-scheduler = { path = "../hipfire-scheduler" }
 hipfire-state = { path = "../hipfire-state" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[dev-dependencies]
+hipfire-runtime = { path = "../hipfire-runtime", default-features = false }

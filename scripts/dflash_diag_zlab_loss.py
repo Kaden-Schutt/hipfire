@@ -23,7 +23,7 @@ Run on MI300X:
   python3 scripts/dflash_diag_zlab_loss.py \
       --target-repo Qwen/Qwen3.5-4B \
       --zlab-draft-repo z-lab/Qwen3.5-4B-DFlash \
-      --corpus /root/calibration_corpus.txt \
+      --corpus ${TRIPWIRE_ROOT}/calibration_corpus.txt \
       --num-batches 5
 
 Needs ~20GB VRAM (4B target bf16 + 1B draft). ~5 min.
@@ -35,11 +35,13 @@ import argparse
 import random
 import sys
 from pathlib import Path
+import os
 
 import torch
 import torch.nn.functional as F
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+TRIPWIRE_ROOT = Path(os.environ.get("TRIPWIRE_ROOT", str(Path.home())))
 sys.path.insert(0, str(REPO_ROOT / ".dflash-reference"))
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
@@ -51,7 +53,7 @@ def parse_args():
     p.add_argument("--target-repo", default="Qwen/Qwen3.5-4B")
     p.add_argument("--zlab-draft-repo", default="z-lab/Qwen3.5-4B-DFlash",
                    help="HF repo of the z-lab reference draft (or local dir).")
-    p.add_argument("--corpus", default="/root/calibration_corpus.txt")
+    p.add_argument("--corpus", default=str(TRIPWIRE_ROOT / "calibration_corpus.txt"))
     p.add_argument("--seq-len", type=int, default=2048)
     p.add_argument("--masked-blocks-per-seq", type=int, default=4)
     p.add_argument("--block-size", type=int, default=16)

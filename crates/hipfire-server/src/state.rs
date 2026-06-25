@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify};
 
 use hipfire_config::{HipfireConfig, LoadedConfig};
 use hipfire_daemon_adapter::DaemonEngine;
+use hipfire_diffusion::DiffusionPipeline;
 use hipfire_prompt::Message;
 use hipfire_scheduler::{PriorityPrefillScheduler, SchedulerPolicyEnv};
 
@@ -41,6 +42,21 @@ pub struct StoredBatch {
     pub failed_reason: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct SdapiProgressState {
+    pub active: bool,
+    pub interrupted: bool,
+    pub task_id: Option<String>,
+    pub mode: Option<String>,
+    pub prompt: Option<String>,
+    pub sampling_step: usize,
+    pub sampling_steps: usize,
+    pub current_image: Option<String>,
+    pub textinfo: Option<String>,
+    pub started_at_unix_secs: Option<u64>,
+    pub completed_at_unix_secs: Option<u64>,
+}
+
 pub struct AppState {
     /// Serializes all daemon I/O. Phase A: one request at a time.
     pub engine: Mutex<Option<DaemonEngine>>,
@@ -65,6 +81,12 @@ pub struct AppState {
     pub file_order: Mutex<VecDeque<String>>,
     pub batches: Mutex<HashMap<String, StoredBatch>>,
     pub batch_order: Mutex<VecDeque<String>>,
+    /// Opened diffusion HFQ pipelines keyed by resolved model path.
+    pub diffusion_pipelines: Mutex<HashMap<PathBuf, Arc<DiffusionPipeline>>>,
+    /// Stable-Diffusion-WebUI option compatibility values posted to
+    /// `/sdapi/v1/options` that do not map to native Hipfire config fields.
+    pub sdapi_options: Mutex<HashMap<String, serde_json::Value>>,
+    pub sdapi_progress: Arc<StdMutex<SdapiProgressState>>,
     pub last_request_unix_secs: Mutex<u64>,
     pub training_runs_dir: PathBuf,
     /// Local admin bearer secret (`~/.hipfire/admin.secret`); same-box
@@ -108,6 +130,9 @@ impl AppState {
             file_order: Mutex::new(VecDeque::new()),
             batches: Mutex::new(HashMap::new()),
             batch_order: Mutex::new(VecDeque::new()),
+            diffusion_pipelines: Mutex::new(HashMap::new()),
+            sdapi_options: Mutex::new(HashMap::new()),
+            sdapi_progress: Arc::new(StdMutex::new(SdapiProgressState::default())),
             last_request_unix_secs: Mutex::new(now_secs()),
             training_runs_dir,
             admin_secret: hipfire_config::ensure_admin_secret().unwrap_or_default(),
