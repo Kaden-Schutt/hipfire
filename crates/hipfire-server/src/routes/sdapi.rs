@@ -177,6 +177,11 @@ async fn execute_sd_generation(
         return diffusion_backend_missing_response();
     }
 
+    let response_mode = if init_images_base64.is_some() {
+        "img2img"
+    } else {
+        "txt2img"
+    };
     let chat = sd_request_to_chat_request(
         &body,
         init_images_base64.and_then(|images| images.into_iter().next()),
@@ -197,7 +202,7 @@ async fn execute_sd_generation(
             });
             Json(SdGenerationResponse {
                 images: Vec::new(),
-                parameters: body,
+                parameters: sdapi_response_parameters(body, response_mode),
                 info: info.to_string(),
             })
             .into_response()
@@ -617,12 +622,20 @@ fn finalize_hfq_diffusion_response(
     } else {
         Vec::new()
     };
+    let parameters = sdapi_response_parameters(body, mode);
     Json(SdGenerationResponse {
         images,
-        parameters: body,
+        parameters,
         info: output.info.to_string(),
     })
     .into_response()
+}
+
+fn sdapi_response_parameters(mut body: SdGenerationRequest, mode: &str) -> SdGenerationRequest {
+    if mode == "img2img" && !body.include_init_images.unwrap_or(false) {
+        body.init_images = None;
+    }
+    body
 }
 
 fn sdapi_parameters_text(body: &SdGenerationRequest, mode: &str, info: &Value) -> String {
@@ -2450,6 +2463,47 @@ mod tests {
         assert_eq!(info["backend"], "hipfire-diffusion-hfq");
         assert_eq!(info["mode"], "img2img");
         assert_eq!(info["denoise_steps"], 1);
+        assert_eq!(body["parameters"]["init_images"], Value::Null);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn img2img_route_preserves_init_images_when_requested() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-sdapi-diffusion-img2img-include-init-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("tiny-route-diffusion-img2img-include-init.hfq");
+        write_tiny_diffusion_hfq(&hfq_path);
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let init_image = tiny_png_base64();
+        let body = SdGenerationRequest {
+            prompt: "a cat".to_string(),
+            model: Some(hfq_path.to_string_lossy().into_owned()),
+            steps: Some(1),
+            cfg_scale: Some(1.0),
+            width: Some(2),
+            height: Some(2),
+            send_images: Some(false),
+            save_images: Some(false),
+            init_images: Some(vec![init_image.clone()]),
+            include_init_images: Some(true),
+            denoising_strength: Some(1.0),
+            ..empty_request()
+        };
+
+        let response = post_img2img(State(state), Json(body)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+
+        assert!(body["images"].as_array().unwrap().is_empty());
+        assert_eq!(
+            body["parameters"]["init_images"][0].as_str().unwrap(),
+            init_image
+        );
+        assert_eq!(body["parameters"]["include_init_images"], true);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
