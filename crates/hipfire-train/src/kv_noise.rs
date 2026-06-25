@@ -72,7 +72,7 @@ fn quant_vec(v: &mut [f32], bits: u32) {
 fn compress_host(buf: &mut [f32], seq: usize, dim: usize, head_dim: usize, cfg: KvNoiseCfg) {
     let n_head = dim / head_dim;
     let cold_end = seq.saturating_sub(cfg.hot); // tokens [0, cold_end) are cold
-    // CASK merge: replace each cold token's vector by its fold-group mean.
+                                                // CASK merge: replace each cold token's vector by its fold-group mean.
     let mut g = 0;
     while g < cold_end {
         let end = (g + cfg.fold).min(cold_end);

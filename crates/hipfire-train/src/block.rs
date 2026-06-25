@@ -276,9 +276,26 @@ pub struct BlockWeightGrad {
 /// Return one block's saved activations to the pool (GpuTensor has no Drop).
 pub fn free_block_acts(gpu: &mut Gpu, b: BlockActivations) -> HipResult<()> {
     let BlockActivations {
-        xn1, rinv1, hq, hv, q_r, k_r, v, p_all, ctx, x_mid, xn2, rinv2, gate, up, act, pos,
+        xn1,
+        rinv1,
+        hq,
+        hv,
+        q_r,
+        k_r,
+        v,
+        p_all,
+        ctx,
+        x_mid,
+        xn2,
+        rinv2,
+        gate,
+        up,
+        act,
+        pos,
     } = b;
-    for t in [xn1, rinv1, hq, hv, q_r, k_r, v, p_all, ctx, x_mid, xn2, rinv2, gate, up, act, pos] {
+    for t in [
+        xn1, rinv1, hq, hv, q_r, k_r, v, p_all, ctx, x_mid, xn2, rinv2, gate, up, act, pos,
+    ] {
         gpu.free_tensor(t)?;
     }
     Ok(())
@@ -499,7 +516,15 @@ fn block_backward_inner(
         linear_backward_w(gpu, &d_gate, &acts.xn2, &dwgate, seq, h, inter, false)?;
         linear_backward_w(gpu, &d_up, &acts.xn2, &dwup, seq, h, inter, false)?;
         linear_backward_w(gpu, d_x_out, &acts.act, &dwdown, seq, inter, h, false)?;
-        Some(BlockWeightGrad { dwq, dwk, dwv, dwo, dwgate, dwup, dwdown })
+        Some(BlockWeightGrad {
+            dwq,
+            dwk,
+            dwv,
+            dwo,
+            dwgate,
+            dwup,
+            dwdown,
+        })
     } else {
         None
     };
@@ -508,8 +533,24 @@ fn block_backward_inner(
     // this the per-step training graph climbs ~50 MB/layer and OOMs. Only the
     // returned grads (d_x, BlockLoraGrad, BlockWeightGrad) survive.
     for t in [
-        d_act, d_gate, d_up, d_xn2, d_x_mid, d_xmid_norm, d_ctx, d_q_r, d_k_r, d_v, d_q, d_k,
-        d_xn1, d_x_norm, dyl_q, dh_q, dyl_v, dh_v,
+        d_act,
+        d_gate,
+        d_up,
+        d_xn2,
+        d_x_mid,
+        d_xmid_norm,
+        d_ctx,
+        d_q_r,
+        d_k_r,
+        d_v,
+        d_q,
+        d_k,
+        d_xn1,
+        d_x_norm,
+        dyl_q,
+        dh_q,
+        dyl_v,
+        dh_v,
     ] {
         gpu.free_tensor(t)?;
     }

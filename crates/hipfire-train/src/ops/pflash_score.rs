@@ -37,6 +37,8 @@ pub fn pflash_score_backward(
     last_pos: usize,
 ) -> HipResult<GpuTensor> {
     let dk = gpu.zeros(&[n_pos * kv_dim], DType::F32)?;
-    gpu.pflash_score_f32_bwd(k, dscores, &dk, n_pos, kv_dim, block_size, n_blocks, last_pos)?;
+    gpu.pflash_score_f32_bwd(
+        k, dscores, &dk, n_pos, kv_dim, block_size, n_blocks, last_pos,
+    )?;
     Ok(dk)
 }

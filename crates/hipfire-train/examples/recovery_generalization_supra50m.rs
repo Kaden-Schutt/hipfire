@@ -24,9 +24,9 @@ use hipfire_train::model::{
     flatten_norm_grads, flatten_recovery_grads, free_model_acts, model_distill_backward,
     model_distill_backward_tail, model_forward, LlamaModel,
 };
-use hipfire_train::oqplus_quant::oqplus_simquant;
 use hipfire_train::ops::softmax::softmax_forward;
 use hipfire_train::optim::AdamW;
+use hipfire_train::oqplus_quant::oqplus_simquant;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::Path;
 
@@ -41,14 +41,24 @@ const ALPHA: f32 = 32.0;
 const STEPS: usize = 100;
 
 fn envf(key: &str, d: f32) -> f32 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 /// Free a vec of LoRA grads (no Drop on GpuTensor → must free per-iter or the
 /// pool balloons → 719 wedge over many steps).
 fn free_grads(gpu: &mut Gpu, grads: Vec<BlockLoraGrad>) -> Result<(), Box<dyn std::error::Error>> {
     for g in grads {
-        let BlockLoraGrad { daq, dbq, dav, dbv, dnorm1, dnorm2 } = g;
+        let BlockLoraGrad {
+            daq,
+            dbq,
+            dav,
+            dbv,
+            dnorm1,
+            dnorm2,
+        } = g;
         for t in [daq, dbq, dav, dbv, dnorm1, dnorm2] {
             gpu.free_tensor(t)?;
         }
@@ -56,11 +66,19 @@ fn free_grads(gpu: &mut Gpu, grads: Vec<BlockLoraGrad>) -> Result<(), Box<dyn st
     Ok(())
 }
 
-fn oqplus_quantize_linears(gpu: &mut Gpu, w: &mut LlamaWeightsF32) -> Result<(), Box<dyn std::error::Error>> {
+fn oqplus_quantize_linears(
+    gpu: &mut Gpu,
+    w: &mut LlamaWeightsF32,
+) -> Result<(), Box<dyn std::error::Error>> {
     for l in w.layers.iter_mut() {
         for t in [
-            &mut l.q_proj, &mut l.k_proj, &mut l.v_proj, &mut l.o_proj,
-            &mut l.gate_proj, &mut l.up_proj, &mut l.down_proj,
+            &mut l.q_proj,
+            &mut l.k_proj,
+            &mut l.v_proj,
+            &mut l.o_proj,
+            &mut l.gate_proj,
+            &mut l.up_proj,
+            &mut l.down_proj,
         ] {
             let host = gpu.download_f32(t)?;
             let q = oqplus_simquant(&host);
@@ -122,12 +140,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // HIPFIRE_SCORE_TAIL=N → score only the last N query positions (leak-free for
     // KVarN+CASK: tail queries read merged cold keys strictly in their past). 0 =
     // score all positions (only valid when there's no cross-token KV merge).
-    let n_score = std::env::var("HIPFIRE_SCORE_TAIL").ok().and_then(|v| v.parse().ok()).unwrap_or(0usize);
+    let n_score = std::env::var("HIPFIRE_SCORE_TAIL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0usize);
     let per_tok = if n_score > 0 { n_score } else { L };
 
     let mut gpu = Gpu::init().expect("Gpu::init failed");
-    println!("arch: {}  mode={mode}  recover={}  lr={lr}  score_tail={n_score}", gpu.arch,
-        if norms_only { "norms" } else { "lora+norms" });
+    println!(
+        "arch: {}  mode={mode}  recover={}  lr={lr}  score_tail={n_score}",
+        gpu.arch,
+        if norms_only { "norms" } else { "lora+norms" }
+    );
 
     let tok = Tokenizer::from_hf_json(&std::fs::read_to_string(dir.join("tokenizer.json"))?)
         .map_err(|e| format!("tokenizer: {e:?}"))?;
@@ -139,7 +163,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if ids.len() < need {
         return Err(format!("corpus too short: {} < {need} tokens", ids.len()).into());
     }
-    println!("corpus: {} tokens → {TRAIN_CHUNKS} train + {HELDOUT_CHUNKS} held-out chunks of {L}", ids.len());
+    println!(
+        "corpus: {} tokens → {TRAIN_CHUNKS} train + {HELDOUT_CHUNKS} held-out chunks of {L}",
+        ids.len()
+    );
 
     let (cfg, w_teacher) = load_llama_fp32(&mut gpu, dir)?;
     let (_, mut w_student) = load_llama_fp32(&mut gpu, dir)?;
@@ -175,7 +202,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::set_var("HIPFIRE_KVNOISE", "1");
     }
 
-    let sizes = if norms_only { student.norm_param_sizes() } else { student.recovery_param_sizes() };
+    let sizes = if norms_only {
+        student.norm_param_sizes()
+    } else {
+        student.recovery_param_sizes()
+    };
     let mut opt = AdamW::new(&mut gpu, &sizes, lr, 0.9, 0.999, 1e-8, 0.0)?;
 
     let kl0_train;
@@ -229,9 +260,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let rec_train = 100.0 * (kl0_train - last_train) / kl0_train.max(1e-6);
     let rec_held = 100.0 * (kl0_held - last_held) / kl0_held.max(1e-6);
-    println!("\n{mode}: train {kl0_train:.4}→{last_train:.4} ({rec_train:.1}%)  \
-              HELD-OUT {kl0_held:.4}→{last_held:.4} ({rec_held:.1}%)");
-    let gen_ratio = if rec_train.abs() > 1e-3 { 100.0 * rec_held / rec_train } else { 0.0 };
+    println!(
+        "\n{mode}: train {kl0_train:.4}→{last_train:.4} ({rec_train:.1}%)  \
+              HELD-OUT {kl0_held:.4}→{last_held:.4} ({rec_held:.1}%)"
+    );
+    let gen_ratio = if rec_train.abs() > 1e-3 {
+        100.0 * rec_held / rec_train
+    } else {
+        0.0
+    };
     println!("generalization: held-out recovers {gen_ratio:.0}% of the train recovery");
     if rec_held > 40.0 {
         println!("HOLDS — recovery generalizes to unseen text.");

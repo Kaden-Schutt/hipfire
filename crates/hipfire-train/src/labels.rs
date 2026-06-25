@@ -60,13 +60,27 @@ pub fn load_daemon_labels(
     }
     let vocab = u32::from_le_bytes(bytes[4..8].try_into()?) as usize;
     let dim = u32::from_le_bytes(bytes[8..12].try_into()?) as usize;
-    let data: Vec<f32> =
-        bytes[12..].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let data: Vec<f32> = bytes[12..]
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
     if data.len() != vocab * dim {
-        return Err(format!("embed sidecar size mismatch: {} != {}", data.len(), vocab * dim).into());
+        return Err(format!(
+            "embed sidecar size mismatch: {} != {}",
+            data.len(),
+            vocab * dim
+        )
+        .into());
     }
     let embed = gpu.upload_f32(&data, &[vocab, dim])?;
-    Ok(LabelSet { chunks, label_mid, base_shallow, embed, h_t: dim, vocab })
+    Ok(LabelSet {
+        chunks,
+        label_mid,
+        base_shallow,
+        embed,
+        h_t: dim,
+        vocab,
+    })
 }
 
 /// Deterministic Fisher–Yates shuffle of the chunk/label arrays in lockstep,
@@ -81,7 +95,9 @@ pub fn shuffle_in_place(
     let mut s = seed;
     let mut perm: Vec<usize> = (0..chunks.len()).collect();
     for i in (1..perm.len()).rev() {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let j = (s >> 33) as usize % (i + 1);
         perm.swap(i, j);
     }
@@ -99,7 +115,11 @@ pub fn shuffle_in_place(
 /// Save SSM-drafter weights (best-eval snapshot) to a flat container. Minimal:
 /// magic `SDFT` | u32 ver | u32 epoch | u32 n_tensors | (u32 len, f32[len])*.
 /// Resume/AdamW-state persistence is deferred to a later step.
-pub fn save_ssm_drafter_weights(path: &str, weights: &[Vec<f32>], epoch: u32) -> std::io::Result<()> {
+pub fn save_ssm_drafter_weights(
+    path: &str,
+    weights: &[Vec<f32>],
+    epoch: u32,
+) -> std::io::Result<()> {
     use std::io::Write;
     let tmp = format!("{path}.tmp");
     let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);

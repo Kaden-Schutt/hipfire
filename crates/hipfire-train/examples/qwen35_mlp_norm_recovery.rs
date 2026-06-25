@@ -25,11 +25,11 @@
 //!      HIPFIRE_RECOVER_LR (3e-4), HIPFIRE_RECOVER_STEPS (200).
 
 use hipfire_train::hfq_patch::{bf16_bits_to_f32, parse_hfq, HfqEntry};
-use hipfire_train::optim::AdamW;
-use hipfire_train::oqplus_quant::oqplus_simquant;
 use hipfire_train::ops::linear::{linear_backward_x, linear_forward};
 use hipfire_train::ops::rmsnorm::{rmsnorm_backward, rmsnorm_forward};
 use hipfire_train::ops::swiglu::{swiglu_backward, swiglu_forward};
+use hipfire_train::optim::AdamW;
+use hipfire_train::oqplus_quant::oqplus_simquant;
 use rdna_compute::{DType, Gpu};
 use std::collections::HashMap;
 
@@ -39,22 +39,34 @@ fn envs(k: &str, d: &str) -> String {
     std::env::var(k).unwrap_or_else(|_| d.to_string())
 }
 fn envf(k: &str, d: f32) -> f32 {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 fn envu(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 /// Read a bf16-stored tensor from the parsed .hfq bytes as f32.
 fn read_bf16(bytes: &[u8], e: &HfqEntry) -> Result<Vec<f32>, String> {
     if e.quant_type != QT_BF16 {
-        return Err(format!("{}: quant_type {} != bf16(16)", e.name, e.quant_type));
+        return Err(format!(
+            "{}: quant_type {} != bf16(16)",
+            e.name, e.quant_type
+        ));
     }
     let n = e.data_size / 2;
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let off = e.data_offset + i * 2;
-        out.push(bf16_bits_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]])));
+        out.push(bf16_bits_to_f32(u16::from_le_bytes([
+            bytes[off],
+            bytes[off + 1],
+        ])));
     }
     Ok(out)
 }
@@ -82,7 +94,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cap_dir = envs("HIPFIRE_CAP_DIR", "/tmp/residcap");
     let model = envs(
         "HIPFIRE_MODEL",
-        &format!("{}/.hipfire/models/qwen3.5-0.8b-bf16.hfq", std::env::var("HOME").unwrap()),
+        &format!(
+            "{}/.hipfire/models/qwen3.5-0.8b-bf16.hfq",
+            std::env::var("HOME").unwrap()
+        ),
     );
     let lr = envf("HIPFIRE_RECOVER_LR", 3e-4);
     let steps = envu("HIPFIRE_RECOVER_STEPS", 200);
@@ -93,17 +108,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // dims from metadata json — config nests under config.text_config.
     let mj: serde_json::Value = serde_json::from_str(&meta)?;
-    let tc = mj.get("config").and_then(|c| c.get("text_config"))
+    let tc = mj
+        .get("config")
+        .and_then(|c| c.get("text_config"))
         .or_else(|| mj.get("config"))
         .unwrap_or(&mj);
     let getu = |k: &str| -> usize {
-        tc.get(k).or_else(|| mj.get(k)).and_then(|v| v.as_u64()).unwrap_or(0) as usize
+        tc.get(k)
+            .or_else(|| mj.get(k))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize
     };
-    let dim = if getu("dim") > 0 { getu("dim") } else { getu("hidden_size") };
-    let inter = if getu("hidden_dim") > 0 { getu("hidden_dim") } else { getu("intermediate_size") };
-    let n_layers = if getu("n_layers") > 0 { getu("n_layers") } else { getu("num_hidden_layers") };
-    let eps = (tc.get("norm_eps").or_else(|| tc.get("rms_norm_eps"))
-        .and_then(|v| v.as_f64()).unwrap_or(1e-6)) as f32;
+    let dim = if getu("dim") > 0 {
+        getu("dim")
+    } else {
+        getu("hidden_size")
+    };
+    let inter = if getu("hidden_dim") > 0 {
+        getu("hidden_dim")
+    } else {
+        getu("intermediate_size")
+    };
+    let n_layers = if getu("n_layers") > 0 {
+        getu("n_layers")
+    } else {
+        getu("num_hidden_layers")
+    };
+    let eps = (tc
+        .get("norm_eps")
+        .or_else(|| tc.get("rms_norm_eps"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1e-6)) as f32;
     println!("model: dim={dim} inter={inter} layers={n_layers} eps={eps}  lr={lr} steps={steps}");
 
     let mut gpu = Gpu::init().expect("Gpu::init failed");
@@ -139,7 +174,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for (nm, _) in &names {
             match by_name.get(nm.as_str()) {
                 Some(e) if e.quant_type == QT_BF16 => {}
-                _ => { missing = true; }
+                _ => {
+                    missing = true;
+                }
             }
         }
         if missing {
@@ -184,14 +221,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let d_xmid_unused = gpu.zeros(&[rows * dim], DType::F32)?;
 
         // FFN forward parameterized by weights: down(swiglu(gate(norm_γ(x_in)),up)).
-        let run_fwd = |gpu: &mut Gpu, wg: &rdna_compute::GpuTensor, wu: &rdna_compute::GpuTensor, wd: &rdna_compute::GpuTensor|
+        let run_fwd = |gpu: &mut Gpu,
+                       wg: &rdna_compute::GpuTensor,
+                       wu: &rdna_compute::GpuTensor,
+                       wd: &rdna_compute::GpuTensor|
          -> Result<Vec<f32>, Box<dyn std::error::Error>> {
             rmsnorm_forward(gpu, &x_in, &gamma, &yn, &rinv, rows, dim, eps)?;
             linear_forward(gpu, &yn, wg, &g, rows, dim, inter)?;
             linear_forward(gpu, &yn, wu, &u, rows, dim, inter)?;
             swiglu_forward(gpu, &g, &u, &act, rows * inter)?;
             linear_forward(gpu, &act, wd, &mlp, rows, inter, dim)?;
-            gpu.download_f32(&mlp).map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+            gpu.download_f32(&mlp)
+                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
         };
 
         // Teacher target = bf16 FFN output (computed here, not captured).
@@ -199,13 +240,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let wu_bf = gpu.upload_f32(&w_up_h, &[inter, dim])?;
         let wd_bf = gpu.upload_f32(&w_down_h, &[dim, inter])?;
         let ffn_target_h = run_fwd(&mut gpu, &wg_bf, &wu_bf, &wd_bf)?;
-        for t in [wg_bf, wu_bf, wd_bf] { gpu.free_tensor(t)?; }
+        for t in [wg_bf, wu_bf, wd_bf] {
+            gpu.free_tensor(t)?;
+        }
 
         // Student weights = OQ+ sim-quant (HIPFIRE_NO_QUANT=1 → identity sanity check).
-        let q = |w: &[f32]| if std::env::var("HIPFIRE_NO_QUANT").as_deref() == Ok("1") {
-            w.to_vec()
-        } else {
-            oqplus_simquant(w)
+        let q = |w: &[f32]| {
+            if std::env::var("HIPFIRE_NO_QUANT").as_deref() == Ok("1") {
+                w.to_vec()
+            } else {
+                oqplus_simquant(w)
+            }
         };
         let w_gate = gpu.upload_f32(&q(&w_gate_h), &[inter, dim])?;
         let w_up = gpu.upload_f32(&q(&w_up_h), &[inter, dim])?;
@@ -227,7 +272,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             println!(
                 "  DIAG L{i:2}: rel={:.4} cos={:.4}  rows={rows}",
-                mse(&pred, &ffn_target_h) / e.max(1e-12), cos
+                mse(&pred, &ffn_target_h) / e.max(1e-12),
+                cos
             );
         }
         let start_mse = mse(&fwd_ffn(&mut gpu)?, &ffn_target_h);
@@ -238,8 +284,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let pred_h = fwd_ffn(&mut gpu)?;
             last_mse = mse(&pred_h, &ffn_target_h);
             // d_mlp = 2/N·(pred_ffn − ffn_target)
-            let d_mlp_h: Vec<f32> =
-                pred_h.iter().zip(&ffn_target_h).map(|(p, t)| 2.0 * (p - t) / n).collect();
+            let d_mlp_h: Vec<f32> = pred_h
+                .iter()
+                .zip(&ffn_target_h)
+                .map(|(p, t)| 2.0 * (p - t) / n)
+                .collect();
             let d_mlp = gpu.upload_f32(&d_mlp_h, &[rows * dim])?;
             // backward MLP
             linear_backward_x(&mut gpu, &d_mlp, &w_down, &d_act, rows, inter, dim, false)?;
@@ -248,7 +297,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             linear_backward_x(&mut gpu, &d_u, &w_up, &d_yn, rows, dim, inter, true)?;
             // rmsnorm backward → d_gamma (fresh zeros; bwd atomic-accumulates)
             let d_gamma = gpu.zeros(&[dim], DType::F32)?;
-            rmsnorm_backward(&mut gpu, &d_yn, &x_in, &gamma, &rinv, &d_xmid_unused, &d_gamma, rows, dim)?;
+            rmsnorm_backward(
+                &mut gpu,
+                &d_yn,
+                &x_in,
+                &gamma,
+                &rinv,
+                &d_xmid_unused,
+                &d_gamma,
+                rows,
+                dim,
+            )?;
             opt.step(&mut gpu, &[&gamma], &[&d_gamma])?;
             gpu.free_tensor(d_gamma)?;
             gpu.free_tensor(d_mlp)?;
@@ -267,8 +326,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         total_final += last_mse as f64;
         n_done += 1;
 
-        for t in [w_gate, w_up, w_down, x_in, gamma, yn, rinv, g, u, act, mlp,
-                  d_act, d_g, d_u, d_yn, d_xmid_unused] {
+        for t in [
+            w_gate,
+            w_up,
+            w_down,
+            x_in,
+            gamma,
+            yn,
+            rinv,
+            g,
+            u,
+            act,
+            mlp,
+            d_act,
+            d_g,
+            d_u,
+            d_yn,
+            d_xmid_unused,
+        ] {
             gpu.free_tensor(t)?;
         }
     }

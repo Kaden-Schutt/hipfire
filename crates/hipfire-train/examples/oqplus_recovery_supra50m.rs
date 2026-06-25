@@ -18,9 +18,9 @@ use hipfire_train::loader::{load_llama_fp32, LlamaWeightsF32};
 use hipfire_train::model::{
     flatten_recovery_grads, model_distill_backward, model_forward, LlamaModel,
 };
-use hipfire_train::oqplus_quant::oqplus_simquant;
 use hipfire_train::ops::softmax::softmax_forward;
 use hipfire_train::optim::AdamW;
+use hipfire_train::oqplus_quant::oqplus_simquant;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::Path;
 

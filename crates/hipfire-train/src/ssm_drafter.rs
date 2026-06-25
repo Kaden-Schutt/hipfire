@@ -32,8 +32,8 @@ fn clone_tensor(gpu: &mut Gpu, t: &GpuTensor) -> HipResult<GpuTensor> {
 pub struct SsmDrafterConfig {
     pub h_draft: usize, // body hidden width (≪ target)
     pub n_layers: usize,
-    pub inter: usize,   // MLP intermediate
-    pub n_kv: usize,    // scoring K-head geometry (rope)
+    pub inter: usize, // MLP intermediate
+    pub n_kv: usize,  // scoring K-head geometry (rope)
     pub head_dim: usize,
     pub rope_base: f32,
     pub eps: f32,
@@ -42,7 +42,15 @@ pub struct SsmDrafterConfig {
 impl SsmDrafterConfig {
     /// Tiny default: h=512, 3 layers, MLP 2×, scoring K-head 4×64.
     pub fn tiny(rope_base: f32, eps: f32) -> Self {
-        SsmDrafterConfig { h_draft: 512, n_layers: 3, inter: 1024, n_kv: 4, head_dim: 64, rope_base, eps }
+        SsmDrafterConfig {
+            h_draft: 512,
+            n_layers: 3,
+            inter: 1024,
+            n_kv: 4,
+            head_dim: 64,
+            rope_base,
+            eps,
+        }
     }
     pub fn kv_dim(&self) -> usize {
         self.n_kv * self.head_dim
@@ -79,7 +87,9 @@ fn rand_fill(n: usize, seed: u64, scale: f32) -> Vec<f32> {
     let mut s = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let u = ((s >> 33) as f32) / (1u64 << 31) as f32; // ~[0,2)
             (u - 1.0) * scale
         })
@@ -125,14 +135,36 @@ impl SsmDrafter {
             });
         }
 
-        let dims = SsmBlockDims { seq, h: hd, inter: cfg.inter, eps: cfg.eps };
-        Ok(SsmDrafter { embed, h_t, vocab, in_proj, layers, out_norm, wk_score, dims, cfg, seq })
+        let dims = SsmBlockDims {
+            seq,
+            h: hd,
+            inter: cfg.inter,
+            eps: cfg.eps,
+        };
+        Ok(SsmDrafter {
+            embed,
+            h_t,
+            vocab,
+            in_proj,
+            layers,
+            out_norm,
+            wk_score,
+            dims,
+            cfg,
+            seq,
+        })
     }
 
     fn layer_views<'a>(w: &'a SsmLayerWeights) -> SsmBlockWeights<'a> {
         SsmBlockWeights {
-            norm1: &w.norm1, w_u: &w.w_u, w_g: &w.w_g, w_o: &w.w_o,
-            norm2: &w.norm2, wgate: &w.wgate, wup: &w.wup, wdown: &w.wdown,
+            norm1: &w.norm1,
+            w_u: &w.w_u,
+            w_g: &w.w_g,
+            w_o: &w.w_o,
+            norm2: &w.norm2,
+            wgate: &w.wgate,
+            wup: &w.wup,
+            wdown: &w.wdown,
         }
     }
 
@@ -157,7 +189,10 @@ impl SsmDrafter {
     }
 
     pub fn param_sizes(&self) -> Vec<usize> {
-        self.params().iter().map(|t| t.shape.iter().product()).collect()
+        self.params()
+            .iter()
+            .map(|t| t.shape.iter().product())
+            .collect()
     }
 }
 
@@ -201,7 +236,16 @@ impl SsmDrafterGrads {
 }
 
 pub fn free_ssm_drafter_acts(gpu: &mut Gpu, a: SsmDrafterActs) -> HipResult<()> {
-    let SsmDrafterActs { emb, layer_inputs, layer_acts, x_last, xn_out, rinv_out, score_k, pos } = a;
+    let SsmDrafterActs {
+        emb,
+        layer_inputs,
+        layer_acts,
+        x_last,
+        xn_out,
+        rinv_out,
+        score_k,
+        pos,
+    } = a;
     for t in layer_inputs {
         gpu.free_tensor(t)?;
     }
@@ -215,7 +259,12 @@ pub fn free_ssm_drafter_acts(gpu: &mut Gpu, a: SsmDrafterActs) -> HipResult<()> 
 }
 
 pub fn free_ssm_drafter_grads(gpu: &mut Gpu, g: SsmDrafterGrads) -> HipResult<()> {
-    let SsmDrafterGrads { d_in_proj, layers, d_out_norm, d_wk_score } = g;
+    let SsmDrafterGrads {
+        d_in_proj,
+        layers,
+        d_out_norm,
+        d_wk_score,
+    } = g;
     gpu.free_tensor(d_in_proj)?;
     for lg in layers {
         crate::ssm_block::free_ssm_block_grad(gpu, lg)?;
@@ -238,7 +287,17 @@ pub fn ssm_drafter_forward_train(
 
     let emb = gpu.zeros(&[seq * h_t], DType::F32)?;
     for (t, &tok) in token_ids.iter().enumerate() {
-        gpu.strided_copy_2d(&d.embed, tok as usize * h_t, h_t, &emb, t * h_t, h_t, 1, h_t, false)?;
+        gpu.strided_copy_2d(
+            &d.embed,
+            tok as usize * h_t,
+            h_t,
+            &emb,
+            t * h_t,
+            h_t,
+            1,
+            h_t,
+            false,
+        )?;
     }
     let x0 = gpu.zeros(&[seq * hd], DType::F32)?;
     linear_forward(gpu, &emb, &d.in_proj, &x0, seq, h_t, hd)?;
@@ -258,16 +317,43 @@ pub fn ssm_drafter_forward_train(
 
     let xn_out = gpu.zeros(&[seq * hd], DType::F32)?;
     let rinv_out = gpu.zeros(&[seq], DType::F32)?;
-    rmsnorm_forward(gpu, &x_last, &d.out_norm, &xn_out, &rinv_out, seq, hd, d.dims.eps)?;
+    rmsnorm_forward(
+        gpu,
+        &x_last,
+        &d.out_norm,
+        &xn_out,
+        &rinv_out,
+        seq,
+        hd,
+        d.dims.eps,
+    )?;
 
     let ks = gpu.zeros(&[seq * kvd], DType::F32)?;
     linear_forward(gpu, &xn_out, &d.wk_score, &ks, seq, hd, kvd)?;
     let pos = gpu.upload_f32(pos_host, &[seq])?;
     let score_k = gpu.zeros(&[seq * kvd], DType::F32)?;
-    rope_forward(gpu, &ks, &score_k, &pos, seq * n_kv, n_kv, head_dim, d.cfg.rope_base)?;
+    rope_forward(
+        gpu,
+        &ks,
+        &score_k,
+        &pos,
+        seq * n_kv,
+        n_kv,
+        head_dim,
+        d.cfg.rope_base,
+    )?;
     gpu.free_tensor(ks)?;
 
-    Ok(SsmDrafterActs { emb, layer_inputs, layer_acts, x_last, xn_out, rinv_out, score_k, pos })
+    Ok(SsmDrafterActs {
+        emb,
+        layer_inputs,
+        layer_acts,
+        x_last,
+        xn_out,
+        rinv_out,
+        score_k,
+        pos,
+    })
 }
 
 /// Training backward: `dscores` `[n_blocks]` → all param grads.
@@ -284,10 +370,27 @@ pub fn ssm_drafter_backward(
     let (kvd, n_kv, head_dim) = (d.cfg.kv_dim(), d.cfg.n_kv, d.cfg.head_dim);
 
     // score head: dscores → d(score_k) → d(ks) (derope) → wk_score grad + d(xn_out)
-    let d_score_k =
-        pflash_score_backward(gpu, &acts.score_k, dscores, seq, kvd, block_size, n_blocks, last_pos)?;
+    let d_score_k = pflash_score_backward(
+        gpu,
+        &acts.score_k,
+        dscores,
+        seq,
+        kvd,
+        block_size,
+        n_blocks,
+        last_pos,
+    )?;
     let d_ks = gpu.zeros(&[seq * kvd], DType::F32)?;
-    rope_backward(gpu, &d_score_k, &d_ks, &acts.pos, seq * n_kv, n_kv, head_dim, d.cfg.rope_base)?;
+    rope_backward(
+        gpu,
+        &d_score_k,
+        &d_ks,
+        &acts.pos,
+        seq * n_kv,
+        n_kv,
+        head_dim,
+        d.cfg.rope_base,
+    )?;
     let d_wk_score = gpu.zeros(&[kvd * hd], DType::F32)?;
     linear_backward_w(gpu, &d_ks, &acts.xn_out, &d_wk_score, seq, hd, kvd, false)?;
     let d_xn_out = gpu.zeros(&[seq * hd], DType::F32)?;
@@ -298,7 +401,17 @@ pub fn ssm_drafter_backward(
     // out_norm backward → d(x_last)
     let d_x_last = gpu.zeros(&[seq * hd], DType::F32)?;
     let d_out_norm = gpu.zeros(&[hd], DType::F32)?;
-    rmsnorm_backward(gpu, &d_xn_out, &acts.x_last, &d.out_norm, &acts.rinv_out, &d_x_last, &d_out_norm, seq, hd)?;
+    rmsnorm_backward(
+        gpu,
+        &d_xn_out,
+        &acts.x_last,
+        &d.out_norm,
+        &acts.rinv_out,
+        &d_x_last,
+        &d_out_norm,
+        seq,
+        hd,
+    )?;
     gpu.free_tensor(d_xn_out)?;
 
     // SSM blocks in reverse
@@ -306,7 +419,14 @@ pub fn ssm_drafter_backward(
     let mut d_x = d_x_last;
     for i in (0..d.layers.len()).rev() {
         let bw = SsmDrafter::layer_views(&d.layers[i]);
-        let (d_in, wg) = ssm_block_backward(gpu, &d_x, &acts.layer_inputs[i], &bw, &acts.layer_acts[i], &d.dims)?;
+        let (d_in, wg) = ssm_block_backward(
+            gpu,
+            &d_x,
+            &acts.layer_inputs[i],
+            &bw,
+            &acts.layer_acts[i],
+            &d.dims,
+        )?;
         gpu.free_tensor(d_x)?;
         layer_grads.push(wg);
         d_x = d_in;
@@ -318,7 +438,12 @@ pub fn ssm_drafter_backward(
     linear_backward_w(gpu, &d_x, &acts.emb, &d_in_proj, seq, h_t, hd, false)?;
     gpu.free_tensor(d_x)?;
 
-    Ok(SsmDrafterGrads { d_in_proj, layers: layer_grads, d_out_norm, d_wk_score })
+    Ok(SsmDrafterGrads {
+        d_in_proj,
+        layers: layer_grads,
+        d_out_norm,
+        d_wk_score,
+    })
 }
 
 /// Inference forward: return the LAST block's-body scoring K (`[seq*kv_dim]`,

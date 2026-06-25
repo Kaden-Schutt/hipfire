@@ -33,7 +33,9 @@ fn is_quant_target(name: &str, all: bool) -> bool {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: bake_oqplus_sim <in.hfq> <out.hfq> [--layers mlp|all] [--norms tuned.json]");
+        eprintln!(
+            "usage: bake_oqplus_sim <in.hfq> <out.hfq> [--layers mlp|all] [--norms tuned.json]"
+        );
         std::process::exit(1);
     }
     let (inp, outp) = (&args[1], &args[2]);
@@ -42,8 +44,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
-            "--layers" => { all = args.get(i + 1).map(|s| s == "all").unwrap_or(false); i += 2; }
-            "--norms" => { norms_path = args.get(i + 1).cloned(); i += 2; }
+            "--layers" => {
+                all = args.get(i + 1).map(|s| s == "all").unwrap_or(false);
+                i += 2;
+            }
+            "--norms" => {
+                norms_path = args.get(i + 1).cloned();
+                i += 2;
+            }
             _ => i += 1,
         }
     }
@@ -61,7 +69,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut wf = Vec::with_capacity(n);
         for j in 0..n {
             let off = e.data_offset + j * 2;
-            wf.push(bf16_bits_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]])));
+            wf.push(bf16_bits_to_f32(u16::from_le_bytes([
+                bytes[off],
+                bytes[off + 1],
+            ])));
         }
         let q = oqplus_simquant(&wf);
         for (j, &v) in q.iter().enumerate() {
@@ -70,17 +81,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         nq += 1;
     }
-    println!("OQ+ sim-quantized {nq} linears (layers={})", if all { "all" } else { "mlp" });
+    println!(
+        "OQ+ sim-quantized {nq} linears (layers={})",
+        if all { "all" } else { "mlp" }
+    );
 
     // 2) Optionally Path-A patch the post_attention_layernorm weights (store γ−1).
     if let Some(np) = norms_path {
-        let tuned: HashMap<String, Vec<f32>> = serde_json::from_str(&std::fs::read_to_string(&np)?)?;
+        let tuned: HashMap<String, Vec<f32>> =
+            serde_json::from_str(&std::fs::read_to_string(&np)?)?;
         let by_name: HashMap<&str, &_> = entries.iter().map(|e| (e.name.as_str(), e)).collect();
         let mut npatched = 0usize;
         for (name, vals) in &tuned {
-            let Some(e) = by_name.get(name.as_str()) else { continue };
+            let Some(e) = by_name.get(name.as_str()) else {
+                continue;
+            };
             if e.quant_type != QT_BF16 || vals.len() * 2 != e.data_size {
-                return Err(format!("{name}: norm shape/type mismatch (qt {}, len {})", e.quant_type, vals.len()).into());
+                return Err(format!(
+                    "{name}: norm shape/type mismatch (qt {}, len {})",
+                    e.quant_type,
+                    vals.len()
+                )
+                .into());
             }
             for (j, &v) in vals.iter().enumerate() {
                 let off = e.data_offset + j * 2;

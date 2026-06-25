@@ -27,10 +27,16 @@ const TAU: f32 = 0.1;
 const EVAL_EVERY: usize = 15;
 
 fn env_usize(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(d)
 }
 fn env_f32(k: &str, d: f32) -> f32 {
-    std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(d)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -42,14 +48,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n_eval = env_usize("HIPFIRE_PFLASH_NEVAL", N_EVAL);
     // ONE loader, shared with the daemon train_drafter op.
     let mut ls = hipfire_train::labels::load_daemon_labels(&mut gpu, &dlpath, SEQ)?;
-    println!("daemon labels: {} chunks, embed [{}×{}]", ls.chunks.len(), ls.vocab, ls.h_t);
+    println!(
+        "daemon labels: {} chunks, embed [{}×{}]",
+        ls.chunks.len(),
+        ls.vocab,
+        ls.h_t
+    );
     let seed = env_usize("HIPFIRE_PFLASH_SHUFFLE_SEED", 0x5EED) as u64;
-    hipfire_train::labels::shuffle_in_place(&mut ls.chunks, &mut ls.label_mid, &mut ls.base_shallow, seed);
-    let (chunks, label_mid, base_shallow, embed, h_t, vocab) =
-        (ls.chunks, ls.label_mid, ls.base_shallow, ls.embed, ls.h_t, ls.vocab);
+    hipfire_train::labels::shuffle_in_place(
+        &mut ls.chunks,
+        &mut ls.label_mid,
+        &mut ls.base_shallow,
+        seed,
+    );
+    let (chunks, label_mid, base_shallow, embed, h_t, vocab) = (
+        ls.chunks,
+        ls.label_mid,
+        ls.base_shallow,
+        ls.embed,
+        ls.h_t,
+        ls.vocab,
+    );
 
     let n_chunks = chunks.len();
-    let n_train = n_chunks.checked_sub(n_eval).filter(|&t| t > 0)
+    let n_train = n_chunks
+        .checked_sub(n_eval)
+        .filter(|&t| t > 0)
         .unwrap_or_else(|| panic!("n_chunks {n_chunks} ≤ n_eval {n_eval}"));
 
     // ── SSM drafter + shared training loop ──
@@ -71,7 +95,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         report_train: std::env::var("HIPFIRE_PFLASH_REPORT_TRAIN").is_ok(),
     };
 
-    println!("arch: {}  SEQ={SEQ} BLOCK={BLOCK} blocks={nb} train={n_train} eval={n_eval}", gpu.arch);
+    println!(
+        "arch: {}  SEQ={SEQ} BLOCK={BLOCK} blocks={nb} train={n_train} eval={n_eval}",
+        gpu.arch
+    );
     println!("labels: daemon source {dlpath} (real qwen3.5 target)");
     println!(
         "SSM drafter: h={} layers={} inter={} kv={}×{}  params={} ({:.2}M)  epochs={} tau={} lr={} wd={}",
@@ -79,7 +106,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         drafter.param_sizes().len(), nparams as f32 / 1e6, cfg.epochs, cfg.tau, cfg.lr, cfg.wd
     );
 
-    let bar: f32 = (n_train..n_chunks).map(|i| spearman(&base_shallow[i], &label_mid[i])).sum::<f32>()
+    let bar: f32 = (n_train..n_chunks)
+        .map(|i| spearman(&base_shallow[i], &label_mid[i]))
+        .sum::<f32>()
         / n_eval as f32;
     println!("\n  bar  Spearman(shallow, mid)   [eval] = {bar:+.3}  ← drafter must beat this");
     println!("  ref  attention-drafter ceiling       ≈ +0.47  (P5, tuning-resistant)");
@@ -97,7 +126,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Print EVERY eval epoch and FLUSH — block-buffering when piped left
             // prior runs unobservable for hours. Always flush; never gate prints.
             use std::io::Write;
-            let tc = train_corr.map(|t| format!("  train_ρ {t:+.3}")).unwrap_or_default();
+            let tc = train_corr
+                .map(|t| format!("  train_ρ {t:+.3}"))
+                .unwrap_or_default();
             println!("  ep {ep:>3}  train_loss {train_loss:.4}  eval {corr:+.3}{tc}  (best {best:+.3} @ ep {best_ep})");
             let _ = std::io::stdout().flush();
         },
@@ -106,7 +137,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n── SSM drafter result ──");
     println!("  shallow bar       : {:+.3}", report.bar);
     println!("  attn ceiling (P5) : ≈ +0.47");
-    println!("  SSM drafter BEST  : {:+.3} @ ep {}", report.best_eval, report.best_epoch);
+    println!(
+        "  SSM drafter BEST  : {:+.3} @ ep {}",
+        report.best_eval, report.best_epoch
+    );
     if report.best_eval > report.bar {
         println!("  ✓ SSM drafter BEATS the shallow bar");
     } else if report.best_eval > 0.47 {
