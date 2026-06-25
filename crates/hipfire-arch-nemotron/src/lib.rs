@@ -4,8 +4,8 @@
 
 //! `nemotron_h` architecture support (NVIDIA Nemotron-3 family) — a **flat
 //! sequence of residual blocks**, each one of: Mamba-2 SSM mixer (`M`),
-//! GQA attention mixer (`*`), or a dense MLP / FFN (`-`), selected per layer by
-//! the model's `hybrid_override_pattern`. Starting vehicle:
+//! GQA attention mixer (`*`), dense MLP / FFN (`-`), or routed MoE FFN (`E`),
+//! selected per layer by the model's `hybrid_override_pattern`. Starting vehicle:
 //! `NVIDIA-Nemotron-3-Nano-4B` (dense, no MoE) — see
 //! `docs/plans/2026-06-24-nemotron-h-mamba2.md`.
 //!
@@ -21,6 +21,7 @@ pub mod block_gpu;
 pub mod loader;
 pub mod mlp;
 pub mod model;
+pub mod moe;
 pub mod ssd;
 pub mod weight;
 
@@ -38,6 +39,8 @@ pub enum BlockKind {
     Attention,
     /// `-` — dense MLP / feed-forward (ReLU² for Nano); carries no state.
     Mlp,
+    /// `E` — routed MoE feed-forward block; carries no recurrent state.
+    Moe,
 }
 
 impl BlockKind {
@@ -47,6 +50,7 @@ impl BlockKind {
             'M' => Some(BlockKind::Mamba2),
             '*' => Some(BlockKind::Attention),
             '-' => Some(BlockKind::Mlp),
+            'E' => Some(BlockKind::Moe),
             _ => None,
         }
     }
@@ -112,6 +116,29 @@ pub struct AttnConfig {
     pub bias: bool,
 }
 
+/// Routed MoE FFN shape for `E` blocks (Nano-30B A3B).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MoeConfig {
+    /// Number of routed experts (`n_routed_experts`).
+    pub n_routed_experts: usize,
+    /// Top-k experts selected per token (`num_experts_per_tok`).
+    pub num_experts_per_tok: usize,
+    /// Routed expert intermediate width (`moe_intermediate_size`).
+    pub intermediate_size: usize,
+    /// Shared expert count (`n_shared_experts`); Nano-30B uses 1.
+    pub n_shared_experts: usize,
+    /// Shared expert intermediate width (`moe_shared_expert_intermediate_size`).
+    pub shared_expert_intermediate_size: usize,
+    /// Router grouping (`n_group`).
+    pub n_group: usize,
+    /// Number of groups to keep before top-k (`topk_group`).
+    pub topk_group: usize,
+    /// Normalize selected sigmoid scores before applying `routed_scaling_factor`.
+    pub norm_topk_prob: bool,
+    /// Scale applied to selected routed-expert weights.
+    pub routed_scaling_factor: f32,
+}
+
 /// Parsed nemotron_h model config.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NemotronHConfig {
@@ -130,6 +157,8 @@ pub struct NemotronHConfig {
     pub mlp_intermediate: usize,
     /// MLP activation tag (`mlp_hidden_act`, e.g. `"relu2"`).
     pub mlp_act: String,
+    /// Routed MoE configuration. Present when the config has any `E` blocks.
+    pub moe: Option<MoeConfig>,
 }
 
 impl NemotronHConfig {
@@ -151,6 +180,43 @@ impl NemotronHConfig {
                 raw.num_hidden_layers
             ));
         }
+        let has_moe = blocks.iter().any(|b| *b == BlockKind::Moe);
+        let moe = if has_moe {
+            let n_routed_experts = raw
+                .n_routed_experts
+                .ok_or_else(|| "nemotron_h MoE config missing n_routed_experts".to_string())?;
+            let num_experts_per_tok = raw
+                .num_experts_per_tok
+                .ok_or_else(|| "nemotron_h MoE config missing num_experts_per_tok".to_string())?;
+            let intermediate_size = raw
+                .moe_intermediate_size
+                .ok_or_else(|| "nemotron_h MoE config missing moe_intermediate_size".to_string())?;
+            let n_shared_experts = raw.n_shared_experts.unwrap_or(0);
+            let shared_expert_intermediate_size =
+                raw.moe_shared_expert_intermediate_size.unwrap_or(0);
+            if n_routed_experts == 0 || num_experts_per_tok == 0 || intermediate_size == 0 {
+                return Err("nemotron_h MoE config has zero routed dimensions".to_string());
+            }
+            if n_shared_experts > 0 && shared_expert_intermediate_size == 0 {
+                return Err(
+                    "nemotron_h MoE config has shared experts but no shared intermediate size"
+                        .to_string(),
+                );
+            }
+            Some(MoeConfig {
+                n_routed_experts,
+                num_experts_per_tok,
+                intermediate_size,
+                n_shared_experts,
+                shared_expert_intermediate_size,
+                n_group: raw.n_group.unwrap_or(1),
+                topk_group: raw.topk_group.unwrap_or(1),
+                norm_topk_prob: raw.norm_topk_prob.unwrap_or(true),
+                routed_scaling_factor: raw.routed_scaling_factor.unwrap_or(1.0),
+            })
+        } else {
+            None
+        };
         Ok(Self {
             hidden_size: raw.hidden_size,
             vocab_size: raw.vocab_size,
@@ -183,6 +249,7 @@ impl NemotronHConfig {
             },
             mlp_intermediate: raw.intermediate_size,
             mlp_act: raw.mlp_hidden_act,
+            moe,
         })
     }
 
@@ -220,7 +287,7 @@ impl NemotronHConfig {
                 .filter_map(|b| match b {
                     BlockKind::Mamba2 => Some(MixerKind::Mamba2),
                     BlockKind::Attention => Some(MixerKind::FullAttn),
-                    BlockKind::Mlp => None,
+                    BlockKind::Mlp | BlockKind::Moe => None,
                 })
                 .collect(),
         )
@@ -269,6 +336,24 @@ struct RawConfig {
     intermediate_size: usize,
     #[serde(default = "default_act")]
     mlp_hidden_act: String,
+    #[serde(default)]
+    n_routed_experts: Option<usize>,
+    #[serde(default)]
+    num_experts_per_tok: Option<usize>,
+    #[serde(default)]
+    moe_intermediate_size: Option<usize>,
+    #[serde(default)]
+    n_shared_experts: Option<usize>,
+    #[serde(default)]
+    moe_shared_expert_intermediate_size: Option<usize>,
+    #[serde(default)]
+    n_group: Option<usize>,
+    #[serde(default)]
+    topk_group: Option<usize>,
+    #[serde(default)]
+    norm_topk_prob: Option<bool>,
+    #[serde(default)]
+    routed_scaling_factor: Option<f32>,
 }
 
 fn default_eps() -> f32 {
@@ -296,6 +381,8 @@ mod tests {
 
     /// The verified Nemotron-3-Nano-4B `hybrid_override_pattern`.
     const NANO_4B_PATTERN: &str = "M-M-M-MM-M-M*-M-M*-M-M-M*-M-M-MM*-MMM-M-M-";
+    /// The verified Nemotron-3-Nano-30B-A3B `hybrid_override_pattern`.
+    const NANO_30B_PATTERN: &str = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME";
 
     #[test]
     fn parses_nano_4b_pattern() {
@@ -317,7 +404,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_block_char() {
-        assert!(parse_block_pattern("M-E-").is_err()); // 'E' (MoE) not in Nano
+        assert!(parse_block_pattern("M-X-").is_err());
     }
 
     #[test]
@@ -387,5 +474,57 @@ mod tests {
         assert!(prof.needs_kv_cache()); // has attention blocks
         assert!(prof.has_recurrent_state()); // has Mamba2 blocks
         assert!(prof.is_hybrid());
+    }
+
+    #[test]
+    fn parses_nano_30b_moe_config() {
+        let json = serde_json::json!({
+            "model_type": "nemotron_h",
+            "hidden_size": 2688,
+            "vocab_size": 131072,
+            "num_hidden_layers": 52,
+            "rms_norm_eps": 1e-5,
+            "tie_word_embeddings": false,
+            "hybrid_override_pattern": NANO_30B_PATTERN,
+            "mamba_num_heads": 64,
+            "mamba_head_dim": 64,
+            "ssm_state_size": 128,
+            "n_groups": 8,
+            "conv_kernel": 4,
+            "chunk_size": 128,
+            "use_conv_bias": true,
+            "mamba_proj_bias": false,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 2,
+            "head_dim": 128,
+            "attention_bias": false,
+            "intermediate_size": 1856,
+            "mlp_hidden_act": "relu2",
+            "n_routed_experts": 128,
+            "num_experts_per_tok": 6,
+            "moe_intermediate_size": 1856,
+            "n_shared_experts": 1,
+            "moe_shared_expert_intermediate_size": 3712,
+            "n_group": 1,
+            "topk_group": 1,
+            "norm_topk_prob": true,
+            "routed_scaling_factor": 2.5,
+        });
+        let cfg = NemotronHConfig::from_json(&json).unwrap();
+        assert_eq!(cfg.num_layers, 52);
+        assert_eq!(cfg.count(BlockKind::Mamba2), 23);
+        assert_eq!(cfg.count(BlockKind::Attention), 6);
+        assert_eq!(cfg.count(BlockKind::Moe), 23);
+        assert_eq!(cfg.count(BlockKind::Mlp), 0);
+        let moe = cfg.moe.unwrap();
+        assert_eq!(moe.n_routed_experts, 128);
+        assert_eq!(moe.num_experts_per_tok, 6);
+        assert_eq!(moe.intermediate_size, 1856);
+        assert_eq!(moe.n_shared_experts, 1);
+        assert_eq!(moe.shared_expert_intermediate_size, 3712);
+        assert!(moe.norm_topk_prob);
+        assert_eq!(moe.routed_scaling_factor, 2.5);
+        // MoE blocks are FFN blocks, so the mixer profile still only tracks M/*.
+        assert_eq!(cfg.mixer_profile().n_layers(), 29);
     }
 }

@@ -87,6 +87,7 @@ fn main() {
                     o: v(hidden * qd, &mut rng),
                 }
             }
+            BlockKind::Moe => unreachable!("synthetic test config has no MoE blocks"),
         });
     }
     let weights = NemotronWeights {

@@ -14,7 +14,7 @@ ReLU²-MLP hybrid).
 | FU3 | quantizer → nemotron_h mq4/q8 .hfq | **DONE** — mq4 protects Nemotron residual writers as q8 |
 | FU4 | loader compat (load .hfq + quantized gemv) + serving | **DONE** |
 | FU5 | N6 batched prefill + q8 SSM state | **mostly done** — batched HFQ benchmark captured; q8 state opt-in validated |
-| FU6 | Nano-30B MoE ('E' block) | not started |
+| FU6 | Nano-30B MoE ('E' block) | started — parser/config + isolated decode MoE block validated |
 | FU1 | chat-template / coherence | blocked (EOS/Jinja/CLI controls fixed; vLLM reference is coherent; Hipfire/native-HF diverge at first token) |
 
 ## FU1 update (2026-06-25)
@@ -239,11 +239,39 @@ Validation run locally on gfx1151:
    prefill uses a single masked-flash block (`block_cols=seq`); shared-mem scales
    with seq. Fine for normal prompts; long-context needs block tiling.
 
-## FU6 (Nano-30B MoE) — not started
+## FU6 (Nano-30B MoE) — started
 
 Same `nemotron_h` arch but hidden=2688, 52 layers, pattern `MEMEM*EMEM…` →
-introduces a new **'E' (MoE) block**: `BlockKind::Moe` + `NemotronMoeGpu` (router
-+ experts). Source checkpoint in `/srv/huggingface`. Deferred.
+introduces a new **'E' (MoE) block**. The first bounded slice is now in place:
+
+- `BlockKind::Moe` parses `E`; `mixer_profile()` still excludes MoE because it
+  is FFN-only, not recurrent/KV state.
+- `NemotronHConfig` parses the Nano-30B MoE fields:
+  `n_routed_experts=128`, `num_experts_per_tok=6`,
+  `moe_intermediate_size=1856`, `n_shared_experts=1`,
+  `moe_shared_expert_intermediate_size=3712`, `n_group=1`,
+  `topk_group=1`, `norm_topk_prob=true`, `routed_scaling_factor=2.5`.
+- The live safetensors index was checked for the first MoE block. Tensor names
+  are `backbone.layers.1.mixer.gate.weight`,
+  `backbone.layers.1.mixer.gate.e_score_correction_bias`,
+  `backbone.layers.1.mixer.shared_experts.{up_proj,down_proj}.weight`, and
+  split per-expert 2D tensors
+  `backbone.layers.1.mixer.experts.{E}.{up_proj,down_proj}.weight`.
+- `hipfire-quantize` now classifies those split MoE weights as quantizable,
+  keeps the correction-bias sidecar out of lossy quantization, and Q8-protects
+  `*.mixer.gate.weight` routers so top-k expert selection is not decided by
+  base MQ4 router noise.
+- `MoeRelu2Gpu` implements a decode-first correctness path: router GEMV →
+  sigmoid → bias-aware top-k/renormalize/scale, shared ReLU² expert, and a
+  simple selected-expert loop using existing `MlpRelu2Gpu` blocks. Batched MoE
+  prefill is intentionally not enabled yet.
+- Validation: `cargo run -p hipfire-arch-nemotron --example test_moe_gpu`
+  passes on gfx1151 with max|Δ|=4.47e-8 against the CPU oracle.
+
+Remaining FU6 work is full-model integration at 30B scale: choose/build the
+actual 30B HFQ format policy (current MQ4G256 falls back to Q8 on many
+Nemotron-H ragged dimensions), load/serve the real A3B checkpoint, and add a
+batched/expert-sorted MoE prefill path if 30B prefill throughput matters.
 
 ## FU1 (coherence) — standing blocker
 
@@ -281,6 +309,7 @@ cargo run -p hipfire-arch-nemotron --example test_gated_norm_seq_gpu # gated-nor
 cargo run -p hipfire-arch-nemotron --example test_block_prefill_gpu  # Mamba block
 cargo run -p hipfire-arch-nemotron --example test_mlp_prefill_gpu    # MLP block
 cargo run -p hipfire-arch-nemotron --example test_attn_prefill_gpu   # attention block
+cargo run -p hipfire-arch-nemotron --example test_moe_gpu            # MoE block
 cargo run -p hipfire-arch-nemotron --example test_model_prefill_gpu  # full model (FU5 gate)
 cargo run -p hipfire-arch-nemotron --example test_model_prefill_hfq_gpu # full HFQ model
 cargo run -p hipfire-arch-nemotron --example hfq_vs_f32              # FU4 quant loader

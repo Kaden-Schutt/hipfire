@@ -12,6 +12,7 @@
 //! `hybrid_override_pattern`), not the tensor names.
 
 use crate::model::{HostBlock, NemotronWeights};
+use crate::moe::{MoeExpertWeights, MoeWeights};
 use crate::{BlockKind, NemotronHConfig};
 use hipfire_model::ModelSource;
 
@@ -121,6 +122,25 @@ pub fn load_nemotron_weights(
                 v: get(src, &format!("{m}.v_proj.weight"))?,
                 o: get(src, &format!("{m}.o_proj.weight"))?,
             },
+            BlockKind::Moe => {
+                let moe = cfg
+                    .moe
+                    .ok_or_else(|| format!("nemotron loader: MoE block {l} has no MoE config"))?;
+                let mut experts = Vec::with_capacity(moe.n_routed_experts);
+                for expert_idx in 0..moe.n_routed_experts {
+                    experts.push(MoeExpertWeights {
+                        up: get(src, &format!("{m}.experts.{expert_idx}.up_proj.weight"))?,
+                        down: get(src, &format!("{m}.experts.{expert_idx}.down_proj.weight"))?,
+                    });
+                }
+                HostBlock::Moe(Box::new(MoeWeights {
+                    router: get(src, &format!("{m}.gate.weight"))?,
+                    expert_bias: get(src, &format!("{m}.gate.e_score_correction_bias"))?,
+                    shared_up: get(src, &format!("{m}.shared_experts.up_proj.weight"))?,
+                    shared_down: get(src, &format!("{m}.shared_experts.down_proj.weight"))?,
+                    experts,
+                }))
+            }
         };
         blocks.push(block);
     }

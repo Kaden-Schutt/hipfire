@@ -2744,6 +2744,9 @@ fn is_q8_tensor(name: &str) -> bool {
         // both at Q8 even in Q4-bulk modes.
         || name.ends_with("mlp.gate.weight")
         || name.ends_with("mlp.shared_expert_gate.weight")
+        // Nemotron-H Nano-30B A3B: routed MoE router lives under the flat
+        // block's mixer namespace.
+        || name.ends_with(".mixer.gate.weight")
 }
 
 /// Qwen3.5 DeltaNet conv1d weight: `{prefix}.linear_attn.conv1d.weight`,
@@ -5789,7 +5792,12 @@ fn main() {
     // bf16 source. Conv-block + dense-MLP + router + expert_bias get dedicated
     // ingest branches; routed experts → MQ4G256, everything else → Q8.
     let is_lfm2moe = arch_id == 11;
-    let is_moe_like = is_moe || is_deepseek4 || is_minimax || is_lfm2moe;
+    // Nemotron-H (arch_id 14) is dense for Nano-4B and MoE for Nano-30B. The
+    // router-protection rule is harmless for dense 4B because it has no
+    // `.mixer.gate.weight` tensors, and necessary for 30B because router noise
+    // can flip top-k expert selection.
+    let is_nemotron_h = arch_id == 14;
+    let is_moe_like = is_moe || is_deepseek4 || is_minimax || is_lfm2moe || is_nemotron_h;
     // Q8 router: always on for MoE-class models.
     let q8_router = is_moe_like || q8_router_flag;
     if is_moe {
@@ -11809,6 +11817,11 @@ mod tests {
             "backbone.layers.12.mixer.k_proj.weight",
             "backbone.layers.12.mixer.v_proj.weight",
             "backbone.layers.12.mixer.o_proj.weight",
+            "backbone.layers.1.mixer.gate.weight",
+            "backbone.layers.1.mixer.shared_experts.up_proj.weight",
+            "backbone.layers.1.mixer.shared_experts.down_proj.weight",
+            "backbone.layers.1.mixer.experts.0.up_proj.weight",
+            "backbone.layers.1.mixer.experts.0.down_proj.weight",
             "backbone.embeddings.weight",
             "lm_head.weight",
         ] {
@@ -11824,6 +11837,7 @@ mod tests {
             "backbone.layers.0.mixer.norm.weight", // RMSNormGated
             "backbone.layers.0.norm.weight",       // pre-block RMSNorm
             "backbone.norm_f.weight",              // final norm
+            "backbone.layers.1.mixer.gate.e_score_correction_bias",
         ] {
             assert!(!should_quantize(n), "{n} should stay F16");
         }
@@ -11833,6 +11847,10 @@ mod tests {
             QuantLevel::Q8
         );
         assert_eq!(kmap_resolve("lm_head.weight", 42, false), QuantLevel::Q8);
+        assert!(
+            is_q8_tensor("backbone.layers.1.mixer.gate.weight"),
+            "Nemotron MoE router should be Q8-protected"
+        );
 
         for n in [
             "backbone.layers.0.mixer.out_proj.weight",

@@ -257,35 +257,51 @@ the q8-state gate is
 hidden=2688, 52 layers, pattern **`MEMEM*EMEM…`** — introduces a **new block
 char `E` (MoE FFN)** replacing the dense `-` MLP. MoE: `n_routed_experts=128`,
 `num_experts_per_tok=6` (top-6), `moe_intermediate_size=1856`, plus
-`n_shared_experts` / `moe_shared_expert_intermediate_size` (shared expert).
-**Note:** the N0 parser currently *rejects* `'E'` (it's the negative-test char in
-`rejects_unknown_block_char`).
+`n_shared_experts=1` / `moe_shared_expert_intermediate_size=3712` (shared
+expert). `BlockKind::Moe`, MoE config parsing, safetensors name mapping, and an
+isolated decode-first `MoeRelu2Gpu` block are now implemented. The live 30B
+safetensors index uses split 2D per-expert tensors:
+`backbone.layers.L.mixer.experts.E.{up_proj,down_proj}.weight`, plus
+`mixer.gate.weight`, `mixer.gate.e_score_correction_bias`, and
+`mixer.shared_experts.{up_proj,down_proj}.weight`.
 
 **Approach.**
-1. `BlockKind::Moe` ('E'); update `parse_block_pattern`, `mixer_profile`
-   (MLP/MoE are FFN-only, no mixer state), and the rejects-test.
-2. Parse MoE config fields (routed/shared expert counts, top-k, moe_intermediate).
-3. `NemotronMoeGpu` block: router GEMV → top-6 softmax/normalize → expert-indexed
-   gate/up/down GEMVs (relu² or swiglu — **verify the MoE activation from the
-   modeling source**) + shared expert; reuse the `moe_*` dispatch
-   (scalar-indexed expert GEMV, top-k routing) from qwen35 (arch 6) / lfm2moe.
-4. Loader: per-expert weight tensors + router + shared-expert names (read the
-   30B safetensors header for exact `*.mixer.experts.*` / `*.router.*` naming).
-5. Wire into `model.rs` `Block` enum + forward; add an `E` arm.
+1. **Done:** `BlockKind::Moe` ('E'); `parse_block_pattern`; `mixer_profile`
+   treating MLP/MoE as FFN-only; `rejects_unknown_block_char` moved off `E`.
+2. **Done:** parse MoE config fields (routed/shared expert counts, top-k,
+   `moe_intermediate_size`, router grouping and route scaling).
+3. **Done for decode correctness:** `MoeRelu2Gpu` block: router GEMV → sigmoid →
+   bias-aware top-k/normalize/scale, shared ReLU² expert, selected routed ReLU²
+   experts. This reuses existing `MlpRelu2Gpu` blocks and the existing
+   DeepSeek/LFM2-style top-k router primitive. The modeling source confirms
+   ReLU² MLP experts, not SwiGLU.
+4. **Started:** loader/model arms for safetensors and HFQ tensor names are wired.
+   `hipfire-quantize` also classifies split Nemotron MoE weights as
+   quantizable, keeps `gate.e_score_correction_bias` out of lossy quantization,
+   and Q8-protects `*.mixer.gate.weight` routers.
+5. **Remaining:** choose/build the actual Nano-30B HFQ artifact policy, run
+   end-to-end load/serve validation, and add a batched expert-sorted MoE prefill
+   path if 30B prefill throughput matters. The artifact policy is still open
+   because current MQ4G256 falls back to Q8 on many Nemotron-H ragged dimensions.
+   Current `can_batched_prefill()` is false when any `E` block is present.
 
 **Reuse.** qwen35/lfm2moe MoE kernels + routing (the big lever); the existing
 M/*/- blocks unchanged.
 
-**Risks.** MoE routing convention (softmax vs sigmoid gate, top-k
-renormalization, shared-expert add) — verify from `modeling_nemotron_h.py` MoE
-class before trusting. 30B is bigger (needs #3/#4 quantization for comfortable
-residency; A3B = 3B active so decode is cheap, but 30B f32 weights are ~60 GB —
-**mq4 effectively required**, so this pairs with #3/#4).
+**Risks.** The routing convention has been verified from
+`modeling_nemotron_h.py`: sigmoid scores, selection uses
+`score + e_score_correction_bias`, selected scores are normalized when
+`norm_topk_prob=true`, and then scaled by `routed_scaling_factor`. The current
+decode path assumes the observed Nano-30B single-group router (`n_group=1`,
+`topk_group=1`). 30B is bigger (needs #3/#4 quantization for comfortable
+residency; A3B = 3B active so decode is cheap, but BF16 weights are ~63 GB —
+**mq4/q8 HFQ effectively required**, so this pairs with #3/#4).
 
-**Validation.** gpu-vs-cpu the MoE block (new CPU oracle, like the others); then
-serve Nano-30B → coherent. Also `MEMEM*E…` has runs like `EM` and `M*` — confirm
-the flat-block residual handles consecutive same-FFN/mixer blocks (it does; each
-char is its own residual block).
+**Validation.** `cargo run -p hipfire-arch-nemotron --example test_moe_gpu`
+passes on gfx1151 with max|Δ|=4.47e-8 against the CPU oracle. Remaining
+validation: quantize/load Nano-30B HFQ, then serve Nano-30B → coherent. Also
+`MEMEM*E…` has runs like `EM` and `M*` — confirm the flat-block residual handles
+consecutive same-FFN/mixer blocks (it does; each char is its own residual block).
 
 ---
 

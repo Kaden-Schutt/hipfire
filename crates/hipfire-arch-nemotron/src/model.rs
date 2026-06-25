@@ -23,9 +23,10 @@
 use crate::attn::{gqa_attention, NemotronAttnGpu};
 use crate::block::{mamba2_block_decode_step, Mamba2BlockState, Mamba2BlockWeights};
 use crate::mlp::{mlp_relu2, MlpRelu2Gpu};
+use crate::moe::{moe_relu2, MoeRelu2Gpu, MoeWeights};
 use crate::weight::{EmbeddingTable, LinearWeight};
 use crate::{BlockKind, NemotronHConfig};
-use hip_bridge::HipResult;
+use hip_bridge::{HipError, HipResult};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Host-side per-block weights (the loader's target). One per stack layer.
@@ -50,6 +51,7 @@ pub enum HostBlock {
         v: Vec<f32>,
         o: Vec<f32>,
     },
+    Moe(Box<MoeWeights>),
 }
 
 /// Host-side full nemotron_h weights (dequantized f32). Loader target.
@@ -70,6 +72,7 @@ enum Block {
     Mamba2(Box<crate::block_gpu::Mamba2BlockGpu>),
     Mlp(MlpRelu2Gpu),
     Attn(NemotronAttnGpu),
+    Moe(Box<MoeRelu2Gpu>),
 }
 
 /// GPU-resident nemotron_h model (decode forward).
@@ -102,6 +105,7 @@ impl NemotronModel {
         let hidden = cfg.hidden_size;
         let vocab = cfg.vocab_size;
         let dims = cfg.mamba2_dims();
+        let batched_prefill = !cfg.blocks.iter().any(|b| *b == BlockKind::Moe);
 
         let embeddings = EmbeddingTable::F32(gpu.upload_f32(&w.embeddings, &[vocab, hidden])?);
         let lm_head = LinearWeight::F32(gpu.upload_f32(&w.lm_head, &[vocab, hidden])?);
@@ -148,6 +152,12 @@ impl NemotronModel {
                 HostBlock::Attn { q, k, v, o } => Block::Attn(NemotronAttnGpu::new(
                     gpu, cfg.attn, hidden, max_seq, q, k, v, o,
                 )?),
+                HostBlock::Moe(w) => {
+                    let moe = cfg.moe.ok_or_else(|| {
+                        HipError::new(0, "nemotron MoE block present but config has no MoE shape")
+                    })?;
+                    Block::Moe(Box::new(MoeRelu2Gpu::new(gpu, hidden, moe, w)?))
+                }
             };
             layers.push(block);
         }
@@ -161,7 +171,7 @@ impl NemotronModel {
             h: gpu.zeros(&[hidden], DType::F32)?,
             normed: gpu.zeros(&[hidden], DType::F32)?,
             logits: gpu.zeros(&[vocab], DType::F32)?,
-            batched_prefill: true,
+            batched_prefill,
             cfg,
         })
     }
@@ -184,6 +194,7 @@ impl NemotronModel {
         let hidden = cfg.hidden_size;
         let vocab = cfg.vocab_size;
         let dims = cfg.mamba2_dims();
+        let batched_prefill = !cfg.blocks.iter().any(|b| *b == BlockKind::Moe);
         let out_proj_scale = 1.0f32 / (cfg.num_layers as f32).sqrt();
         let e = |x: hip_bridge::HipError| format!("nemotron hfq gpu: {x:?}");
 
@@ -279,6 +290,75 @@ impl NemotronModel {
                             .map_err(e)?,
                     )
                 }
+                BlockKind::Moe => {
+                    let moe = cfg.moe.ok_or_else(|| {
+                        "nemotron hfq gpu: MoE block without MoE config".to_string()
+                    })?;
+                    let router = load_linear_hfq(
+                        hfq,
+                        gpu,
+                        &format!("{m}.gate.weight"),
+                        moe.n_routed_experts,
+                        hidden,
+                    )?;
+                    let expert_bias =
+                        load_f32_hfq(hfq, &format!("{m}.gate.e_score_correction_bias"))?;
+                    let shared_up = load_linear_hfq(
+                        hfq,
+                        gpu,
+                        &format!("{m}.shared_experts.up_proj.weight"),
+                        moe.shared_expert_intermediate_size,
+                        hidden,
+                    )?;
+                    let shared_down = load_linear_hfq(
+                        hfq,
+                        gpu,
+                        &format!("{m}.shared_experts.down_proj.weight"),
+                        hidden,
+                        moe.shared_expert_intermediate_size,
+                    )?;
+                    let shared = MlpRelu2Gpu::new_quant(
+                        gpu,
+                        hidden,
+                        moe.shared_expert_intermediate_size,
+                        shared_up,
+                        shared_down,
+                    )
+                    .map_err(e)?;
+                    let mut experts = Vec::with_capacity(moe.n_routed_experts);
+                    for expert_idx in 0..moe.n_routed_experts {
+                        let up = load_linear_hfq(
+                            hfq,
+                            gpu,
+                            &format!("{m}.experts.{expert_idx}.up_proj.weight"),
+                            moe.intermediate_size,
+                            hidden,
+                        )?;
+                        let down = load_linear_hfq(
+                            hfq,
+                            gpu,
+                            &format!("{m}.experts.{expert_idx}.down_proj.weight"),
+                            hidden,
+                            moe.intermediate_size,
+                        )?;
+                        experts.push(
+                            MlpRelu2Gpu::new_quant(gpu, hidden, moe.intermediate_size, up, down)
+                                .map_err(e)?,
+                        );
+                    }
+                    Block::Moe(Box::new(
+                        MoeRelu2Gpu::new_quant(
+                            gpu,
+                            hidden,
+                            moe,
+                            router,
+                            &expert_bias,
+                            shared,
+                            experts,
+                        )
+                        .map_err(e)?,
+                    ))
+                }
             };
             layers.push(block);
         }
@@ -292,7 +372,7 @@ impl NemotronModel {
             h: gpu.zeros(&[hidden], DType::F32).map_err(e)?,
             normed: gpu.zeros(&[hidden], DType::F32).map_err(e)?,
             logits: gpu.zeros(&[vocab], DType::F32).map_err(e)?,
-            batched_prefill: true,
+            batched_prefill,
             cfg,
         })
     }
@@ -317,6 +397,10 @@ impl NemotronModel {
                 }
                 Block::Attn(b) => {
                     let o = b.forward(gpu, &self.normed, pos)?;
+                    gpu.add_inplace_f32(&self.h, o)?;
+                }
+                Block::Moe(b) => {
+                    let o = b.forward(gpu, &self.normed)?;
                     gpu.add_inplace_f32(&self.h, o)?;
                 }
             }
@@ -360,6 +444,11 @@ impl NemotronModel {
                 Block::Mamba2(b) => b.prefill(gpu, &normed_seq, seq)?,
                 Block::Mlp(b) => b.prefill(gpu, &normed_seq, seq)?,
                 Block::Attn(b) => b.prefill(gpu, &normed_seq, seq)?,
+                Block::Moe(_) => {
+                    return Err(HipError::unsupported(
+                        "nemotron MoE batched prefill is not implemented yet",
+                    ));
+                }
             };
             gpu.add_inplace_f32(&h_seq, &out)?;
             let _ = gpu.free_tensor(out);
@@ -412,6 +501,10 @@ impl NemotronModel {
                 }
                 Block::Attn(b) => {
                     let o = b.forward(gpu, &self.normed, pos)?;
+                    gpu.add_inplace_f32(&self.h, o)?;
+                }
+                Block::Moe(b) => {
+                    let o = b.forward(gpu, &self.normed)?;
                     gpu.add_inplace_f32(&self.h, o)?;
                 }
             }
@@ -471,6 +564,7 @@ impl NemotronModel {
                 Block::Mamba2(m) => m.free(gpu),
                 Block::Mlp(m) => m.free(gpu),
                 Block::Attn(a) => a.free(gpu),
+                Block::Moe(m) => m.free(gpu),
             }
         }
     }
@@ -506,6 +600,7 @@ pub enum CpuBlockState {
         v_hist: Vec<Vec<f32>>,
     },
     Mlp,
+    Moe,
 }
 
 /// Build the per-layer CPU state aligned with `cfg.blocks`.
@@ -520,6 +615,7 @@ pub fn cpu_state(cfg: &NemotronHConfig) -> Vec<CpuBlockState> {
                 v_hist: Vec::new(),
             },
             BlockKind::Mlp => CpuBlockState::Mlp,
+            BlockKind::Moe => CpuBlockState::Moe,
         })
         .collect()
 }
@@ -579,6 +675,12 @@ pub fn forward_cpu(
                 let att =
                     gqa_attention(&qv, k_hist, v_hist, a.num_heads, a.num_kv_heads, a.head_dim);
                 matvec(o, &att, hidden, q_dim)
+            }
+            (HostBlock::Moe(w), CpuBlockState::Moe) => {
+                let moe = cfg
+                    .moe
+                    .expect("nemotron MoE block present but config has no MoE shape");
+                moe_relu2(&moe, w, &hn, hidden)
             }
             _ => unreachable!("block/state kind mismatch at layer {l}"),
         };
