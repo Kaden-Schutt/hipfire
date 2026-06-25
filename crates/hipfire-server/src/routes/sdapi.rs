@@ -61,6 +61,7 @@ pub struct SdGenerationRequest {
     pub mask_blur: Option<Value>,
     pub mask_blur_x: Option<Value>,
     pub mask_blur_y: Option<Value>,
+    pub mask_round: Option<Value>,
     pub inpainting_mask_invert: Option<Value>,
     pub resize_mode: Option<u32>,
     pub include_init_images: Option<bool>,
@@ -1040,6 +1041,11 @@ fn sdapi_apply_inpainting_mask_options(
     body: &SdGenerationRequest,
     mask: RgbImageBatch,
 ) -> Result<RgbImageBatch, DiffusionError> {
+    let mask = if sdapi_mask_round(body) {
+        sdapi_round_mask(mask)?
+    } else {
+        mask
+    };
     let mut mask = if sdapi_inpainting_mask_invert(body) {
         RgbImageBatch {
             data: mask
@@ -1057,6 +1063,22 @@ fn sdapi_apply_inpainting_mask_options(
         mask = sdapi_blur_mask(mask, blur_x, blur_y)?;
     }
     Ok(mask)
+}
+
+fn sdapi_mask_round(body: &SdGenerationRequest) -> bool {
+    body.mask_round.as_ref().map_or(true, sdapi_value_is_truthy)
+}
+
+fn sdapi_round_mask(mask: RgbImageBatch) -> Result<RgbImageBatch, DiffusionError> {
+    sdapi_validate_rgb_batch_len(&mask, "mask")?;
+    Ok(RgbImageBatch {
+        data: mask
+            .data
+            .into_iter()
+            .map(|value| if value > 128 { 255 } else { 0 })
+            .collect(),
+        ..mask
+    })
 }
 
 fn sdapi_mask_blur_axes(body: &SdGenerationRequest) -> Result<(f32, f32), DiffusionError> {
@@ -1096,21 +1118,7 @@ fn sdapi_blur_mask(
     sigma_x: f32,
     sigma_y: f32,
 ) -> Result<RgbImageBatch, DiffusionError> {
-    let expected = mask
-        .batch
-        .checked_mul(mask.width)
-        .and_then(|value| value.checked_mul(mask.height))
-        .and_then(|value| value.checked_mul(3))
-        .ok_or_else(|| DiffusionError::InvalidRequest("mask dimensions overflow".to_string()))?;
-    if mask.data.len() != expected {
-        return Err(DiffusionError::InvalidRequest(format!(
-            "mask data length {} does not match dimensions {}x{}x{}x3",
-            mask.data.len(),
-            mask.batch,
-            mask.width,
-            mask.height
-        )));
-    }
+    sdapi_validate_rgb_batch_len(&mask, "mask")?;
     let mut data = mask
         .data
         .iter()
@@ -1129,6 +1137,25 @@ fn sdapi_blur_mask(
             .collect(),
         ..mask
     })
+}
+
+fn sdapi_validate_rgb_batch_len(image: &RgbImageBatch, label: &str) -> Result<(), DiffusionError> {
+    let expected = image
+        .batch
+        .checked_mul(image.width)
+        .and_then(|value| value.checked_mul(image.height))
+        .and_then(|value| value.checked_mul(3))
+        .ok_or_else(|| DiffusionError::InvalidRequest(format!("{label} dimensions overflow")))?;
+    if image.data.len() != expected {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "{label} data length {} does not match dimensions {}x{}x{}x3",
+            image.data.len(),
+            image.batch,
+            image.width,
+            image.height
+        )));
+    }
+    Ok(())
 }
 
 fn sdapi_gaussian_kernel(sigma: f32) -> Vec<f32> {
@@ -4258,6 +4285,7 @@ mod tests {
         };
 
         let disabled = SdGenerationRequest {
+            mask_round: Some(json!(false)),
             inpainting_mask_invert: Some(json!(0)),
             ..empty_request()
         };
@@ -4265,6 +4293,7 @@ mod tests {
         assert_eq!(unchanged.data, mask.data);
 
         let enabled = SdGenerationRequest {
+            mask_round: Some(json!(false)),
             inpainting_mask_invert: Some(json!(1)),
             ..empty_request()
         };
@@ -4285,6 +4314,26 @@ mod tests {
             inpainting_mask_invert: Some(json!("0")),
             ..empty_request()
         }));
+    }
+
+    #[test]
+    fn img2img_mask_options_round_mask_pixels_by_default() {
+        let mask = RgbImageBatch {
+            batch: 1,
+            width: 2,
+            height: 1,
+            data: vec![0, 64, 128, 129, 200, 255],
+        };
+
+        let rounded = sdapi_apply_inpainting_mask_options(&empty_request(), mask.clone()).unwrap();
+        assert_eq!(rounded.data, vec![0, 0, 0, 255, 255, 255]);
+
+        let disabled = SdGenerationRequest {
+            mask_round: Some(json!(false)),
+            ..empty_request()
+        };
+        let continuous = sdapi_apply_inpainting_mask_options(&disabled, mask).unwrap();
+        assert_eq!(continuous.data, vec![0, 64, 128, 129, 200, 255]);
     }
 
     #[test]
@@ -4406,6 +4455,7 @@ mod tests {
             mask_blur: None,
             mask_blur_x: None,
             mask_blur_y: None,
+            mask_round: None,
             inpainting_mask_invert: None,
             resize_mode: None,
             include_init_images: None,
