@@ -203,10 +203,10 @@ Print lock status: "gpu is free" or "gpu BUSY: <holder>"
 Import and inspect diffusion models stored as .hfq artifacts
 
 Runtime note: runnable `.hfq` diffusion artifacts currently use the native
-UNet-family CPU reference path for CLIP text conditioning, UNet denoising, VAE
-decode, and VAE encode for img2img. ROCm preflight can validate the planned
-device buffers plus individual diffusion kernels for model-input scaling,
-classifier-free guidance, Euler scheduler updates, centered UNet input,
+CPU reference graph for CLIP text conditioning, the deeper UNet down/mid/up
+blocks, VAE decode, and VAE encode for img2img. ROCm preflight can validate the
+planned device buffers plus individual diffusion kernels for model-input
+scaling, classifier-free guidance, Euler scheduler updates, centered UNet input,
 timestep embeddings, RGB-to-VAE tensor conversion, VAE moments-to-latents
 scaling, latent mask downsampling, masked RGB inpaint preparation, latent mask
 blending, residual tensor add, NCHW channel-bias add, NCHW/BSC layout
@@ -217,11 +217,13 @@ causal self-attention, GeGLU gate, and RGB conversion, but full generation is no
 routed through a GPU UNet runtime yet.
 `txt2img` and `img2img` can opt into `--rocm-device-id` to route currently
 GPU-backed generation boundaries through ROCm: denoise-loop model-input
-scaling, classifier-free guidance, Euler scheduler updates, and final decoded
-tensor-to-RGB conversion for both modes, plus img2img/inpaint RGB-to-VAE tensor
-conversion, VAE moments-to-latents scaling, latent mask downsampling, masked
-RGB preparation, and final latent mask blending. CLIP, UNet, and VAE graph
-execution still use the native CPU reference path.
+scaling, classifier-free guidance, Euler scheduler updates, UNet input
+centering, UNet timestep and SDXL add-time embedding projections, and final
+decoded tensor-to-RGB conversion for both modes, plus img2img/inpaint
+RGB-to-VAE tensor conversion, VAE moments-to-latents scaling, latent mask
+downsampling, masked RGB preparation, and final latent mask blending. CLIP, the
+deeper UNet block graph, and VAE graph execution still use the native CPU
+reference path.
 The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128,
 HFQ4G256, and HFQ6G256 tensor payloads even when the artifact `weight_format`
 records a future quantized format such as `oq4`; OQ/MQ/HFP and other packed
