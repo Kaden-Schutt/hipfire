@@ -244,6 +244,13 @@ stages. UNet transformer attention and VAE attention now share that context seam
 for GroupNorm, layout conversion, LayerNorm, QKV/out projections, SDPA, GeGLU,
 and residual-add stages. These are still reference HIP tensor-boundary kernels,
 not fully fused resident attention kernels.
+`hipfire serve` exposes the same hybrid path through the Stable Diffusion API
+extension fields `rocm_device_id` or `hipfire_rocm_device_id` on `/sdapi/v1/txt2img`
+and `/sdapi/v1/img2img` requests, through the same keys in `override_settings`,
+or through the persisted `/sdapi/v1/options` value `hipfire_rocm_device_id`.
+Build the server binary with `--features rocm` for those settings to run; a
+binary without ROCm support returns a not-implemented error instead of silently
+falling back to CPU when ROCm is explicitly requested.
 The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128,
 HFQ4G256, and HFQ6G256 tensor payloads even when the artifact `weight_format`
 records a future quantized format such as `oq4`; OQ/MQ/HFP and other packed

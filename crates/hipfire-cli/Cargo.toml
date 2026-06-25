@@ -14,7 +14,7 @@ path = "src/main.rs"
 # Build the corresponding UI crate with `trunk build` first.
 admin-ui-embed = ["hipfire-server/admin-ui-embed"]
 chat-ui-embed = ["hipfire-server/chat-ui-embed"]
-rocm = ["hipfire-diffusion/rocm"]
+rocm = ["hipfire-diffusion/rocm", "hipfire-server/rocm"]
 
 [dependencies]
 hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }

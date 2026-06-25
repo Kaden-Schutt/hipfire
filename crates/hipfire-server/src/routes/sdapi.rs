@@ -7,8 +7,8 @@ use base64::Engine;
 use hipfire_config::models_dir;
 use hipfire_diffusion::{
     inspect_hfq, inspect_hfq_with_runtime_support, DiffusionBatchOutput, DiffusionBatchRequest,
-    DiffusionError, DiffusionHfqInspection, DiffusionImg2ImgRequest, DiffusionPipeline,
-    DiffusionProgress, DiffusionPrompt, RgbImageBatch,
+    DiffusionError, DiffusionGenerationRuntimeOptions, DiffusionHfqInspection,
+    DiffusionImg2ImgRequest, DiffusionPipeline, DiffusionProgress, DiffusionPrompt, RgbImageBatch,
 };
 use image::ImageEncoder;
 use serde::{Deserialize, Serialize};
@@ -58,6 +58,8 @@ pub struct SdGenerationRequest {
     pub mask: Option<String>,
     pub include_init_images: Option<bool>,
     pub denoising_strength: Option<f64>,
+    pub rocm_device_id: Option<i32>,
+    pub hipfire_rocm_device_id: Option<i32>,
     pub override_settings: Option<Value>,
     pub script_name: Option<String>,
     pub script_args: Option<Value>,
@@ -341,6 +343,8 @@ async fn execute_hfq_diffusion_txt2img(
     };
     let n_iter = sd_request_n_iter(&body);
     let save_images = body.save_images.unwrap_or(false);
+    let sdapi_options = state.sdapi_options.lock().await.clone();
+    let runtime_options = sd_request_generation_runtime_options(&body, &sdapi_options);
     let progress_state = state.sdapi_progress.clone();
     start_sdapi_progress(
         &progress_state,
@@ -373,7 +377,11 @@ async fn execute_hfq_diffusion_txt2img(
                     },
                 )
             };
-            outputs.push(pipeline.generate_batch_with_progress(iter_request, &mut progress)?);
+            outputs.push(pipeline.generate_batch_with_progress_and_runtime_options(
+                iter_request,
+                runtime_options,
+                &mut progress,
+            )?);
         }
         merge_diffusion_outputs(outputs)
     })
@@ -425,6 +433,8 @@ async fn execute_hfq_diffusion_img2img(
     let n_iter = sd_request_n_iter(&body);
     let save_images = body.save_images.unwrap_or(false);
     let denoising_strength = body.denoising_strength.unwrap_or(0.75) as f32;
+    let sdapi_options = state.sdapi_options.lock().await.clone();
+    let runtime_options = sd_request_generation_runtime_options(&body, &sdapi_options);
     let progress_state = state.sdapi_progress.clone();
     start_sdapi_progress(
         &progress_state,
@@ -463,7 +473,13 @@ async fn execute_hfq_diffusion_img2img(
                     },
                 )
             };
-            outputs.push(pipeline.generate_img2img_batch_with_progress(request, &mut progress)?);
+            outputs.push(
+                pipeline.generate_img2img_batch_with_progress_and_runtime_options(
+                    request,
+                    runtime_options,
+                    &mut progress,
+                )?,
+            );
         }
         merge_diffusion_outputs(outputs)
     })
@@ -850,6 +866,42 @@ fn sd_request_to_diffusion_batch_request(
     })
 }
 
+fn sd_request_generation_runtime_options(
+    body: &SdGenerationRequest,
+    stored_options: &std::collections::HashMap<String, Value>,
+) -> DiffusionGenerationRuntimeOptions {
+    let rocm_device_id = body
+        .rocm_device_id
+        .or(body.hipfire_rocm_device_id)
+        .or_else(|| sd_override_i32(body, "rocm_device_id"))
+        .or_else(|| sd_override_i32(body, "hipfire_rocm_device_id"))
+        .or_else(|| sd_stored_i32(stored_options, "rocm_device_id"))
+        .or_else(|| sd_stored_i32(stored_options, "hipfire_rocm_device_id"));
+    rocm_device_id.map_or_else(
+        DiffusionGenerationRuntimeOptions::cpu_reference,
+        DiffusionGenerationRuntimeOptions::rocm_hybrid,
+    )
+}
+
+fn sd_override_i32(body: &SdGenerationRequest, key: &str) -> Option<i32> {
+    body.override_settings
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|settings| settings.get(key))
+        .and_then(value_to_i32)
+}
+
+fn sd_stored_i32(
+    stored_options: &std::collections::HashMap<String, Value>,
+    key: &str,
+) -> Option<i32> {
+    stored_options.get(key).and_then(value_to_i32)
+}
+
+fn value_to_i32(value: &Value) -> Option<i32> {
+    value.as_i64().and_then(|value| i32::try_from(value).ok())
+}
+
 fn batch_size_for_body(body: &SdGenerationRequest) -> u32 {
     body.batch_size.unwrap_or(1).max(1)
 }
@@ -1213,6 +1265,7 @@ fn sdapi_options_json(
         "outdir_txt2img_samples": "/tmp/hipfire-sdapi/txt2img",
         "outdir_img2img_samples": "/tmp/hipfire-sdapi/img2img",
         "hipfire_backend": "diffusion-hfq-or-text-fallback",
+        "hipfire_rocm_device_id": null,
         "hipfire_sdapi_save_images_supported": true,
         "hipfire_notice": "SD API compatibility routes generate PNG images for diffusion HFQ models and fall back to text generation for non-diffusion models.",
     });
@@ -1776,6 +1829,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(not(feature = "rocm"))]
+    #[tokio::test]
+    async fn txt2img_route_rejects_rocm_runtime_when_feature_disabled() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-sdapi-diffusion-route-rocm-disabled-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("tiny-route-diffusion-rocm-disabled.hfq");
+        write_tiny_diffusion_hfq(&hfq_path);
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let body = SdGenerationRequest {
+            prompt: "a cat".to_string(),
+            model: Some(hfq_path.to_string_lossy().into_owned()),
+            steps: Some(1),
+            cfg_scale: Some(1.0),
+            width: Some(2),
+            height: Some(2),
+            send_images: Some(true),
+            save_images: Some(false),
+            rocm_device_id: Some(0),
+            ..empty_request()
+        };
+
+        let response = post_txt2img(State(state), Json(body)).await;
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = response_json(response).await;
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("built without the rocm feature"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn txt2img_route_uses_override_settings_sd_model_checkpoint_for_hfq_model() {
         let dir = std::env::temp_dir().join(format!(
@@ -2161,6 +2249,47 @@ mod tests {
         assert_eq!(info["height"], 64);
     }
 
+    #[cfg(feature = "rocm")]
+    #[tokio::test]
+    #[ignore = "real Tiny-SD ROCm txt2img route smoke; run in release mode under an external timeout"]
+    async fn txt2img_route_returns_rocm_runtime_for_real_tiny_sd_hfq_model() {
+        let hfq_path = tiny_sd_hfq_path();
+        if skip_missing_tiny_sd(&hfq_path) {
+            return;
+        }
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let body = SdGenerationRequest {
+            prompt: "a red robot".to_string(),
+            negative_prompt: String::new(),
+            model: Some(hfq_path.to_string_lossy().into_owned()),
+            seed: Some(123),
+            steps: Some(1),
+            cfg_scale: Some(1.0),
+            width: Some(64),
+            height: Some(64),
+            send_images: Some(true),
+            save_images: Some(false),
+            hipfire_rocm_device_id: Some(0),
+            ..empty_request()
+        };
+
+        let response = post_txt2img(State(state), Json(body)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+
+        let images = body["images"].as_array().unwrap();
+        assert_eq!(images.len(), 1);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(images[0].as_str().unwrap())
+            .unwrap();
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        let info = serde_json::from_str::<Value>(body["info"].as_str().unwrap()).unwrap();
+        assert_eq!(info["backend"], "hipfire-diffusion-hfq");
+        assert_eq!(info["runtime"], "rocm-hybrid-reference");
+        assert_eq!(info["width"], 64);
+        assert_eq!(info["height"], 64);
+    }
+
     #[tokio::test]
     #[ignore = "real Tiny-SD img2img route smoke; run in release mode under an external timeout"]
     async fn img2img_route_returns_png_for_real_tiny_sd_hfq_model() {
@@ -2199,6 +2328,52 @@ mod tests {
         let info = serde_json::from_str::<Value>(body["info"].as_str().unwrap()).unwrap();
         assert_eq!(info["backend"], "hipfire-diffusion-hfq");
         assert_eq!(info["mode"], "img2img");
+        assert_eq!(info["masked"], true);
+        assert_eq!(info["width"], 64);
+        assert_eq!(info["height"], 64);
+    }
+
+    #[cfg(feature = "rocm")]
+    #[tokio::test]
+    #[ignore = "real Tiny-SD ROCm img2img route smoke; run in release mode under an external timeout"]
+    async fn img2img_route_returns_rocm_runtime_for_real_tiny_sd_hfq_model() {
+        let hfq_path = tiny_sd_hfq_path();
+        if skip_missing_tiny_sd(&hfq_path) {
+            return;
+        }
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let body = SdGenerationRequest {
+            prompt: "a red robot".to_string(),
+            negative_prompt: String::new(),
+            model: Some(hfq_path.to_string_lossy().into_owned()),
+            seed: Some(123),
+            steps: Some(1),
+            cfg_scale: Some(1.0),
+            width: Some(64),
+            height: Some(64),
+            send_images: Some(true),
+            save_images: Some(false),
+            init_images: Some(vec![tiny_png_base64_with_dimensions(64, 64)]),
+            mask: Some(tiny_mask_png_base64(64, 64)),
+            denoising_strength: Some(1.0),
+            hipfire_rocm_device_id: Some(0),
+            ..empty_request()
+        };
+
+        let response = post_img2img(State(state), Json(body)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+
+        let images = body["images"].as_array().unwrap();
+        assert_eq!(images.len(), 1);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(images[0].as_str().unwrap())
+            .unwrap();
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        let info = serde_json::from_str::<Value>(body["info"].as_str().unwrap()).unwrap();
+        assert_eq!(info["backend"], "hipfire-diffusion-hfq");
+        assert_eq!(info["mode"], "img2img");
+        assert_eq!(info["runtime"], "rocm-hybrid-reference");
         assert_eq!(info["masked"], true);
         assert_eq!(info["width"], 64);
         assert_eq!(info["height"], 64);
@@ -2531,6 +2706,65 @@ mod tests {
     }
 
     #[test]
+    fn sd_request_generation_runtime_options_select_cpu_or_rocm() {
+        let empty_options = std::collections::HashMap::new();
+        let default = SdGenerationRequest { ..empty_request() };
+        assert_eq!(
+            sd_request_generation_runtime_options(&default, &empty_options),
+            DiffusionGenerationRuntimeOptions::cpu_reference()
+        );
+
+        let direct = SdGenerationRequest {
+            rocm_device_id: Some(2),
+            ..empty_request()
+        };
+        assert_eq!(
+            sd_request_generation_runtime_options(&direct, &empty_options),
+            DiffusionGenerationRuntimeOptions::rocm_hybrid(2)
+        );
+
+        let namespaced = SdGenerationRequest {
+            hipfire_rocm_device_id: Some(3),
+            ..empty_request()
+        };
+        assert_eq!(
+            sd_request_generation_runtime_options(&namespaced, &empty_options),
+            DiffusionGenerationRuntimeOptions::rocm_hybrid(3)
+        );
+
+        let override_settings = SdGenerationRequest {
+            override_settings: Some(json!({
+                "hipfire_rocm_device_id": 4,
+            })),
+            ..empty_request()
+        };
+        assert_eq!(
+            sd_request_generation_runtime_options(&override_settings, &empty_options),
+            DiffusionGenerationRuntimeOptions::rocm_hybrid(4)
+        );
+
+        let direct_wins = SdGenerationRequest {
+            rocm_device_id: Some(5),
+            override_settings: Some(json!({
+                "hipfire_rocm_device_id": 6,
+            })),
+            ..empty_request()
+        };
+        assert_eq!(
+            sd_request_generation_runtime_options(&direct_wins, &empty_options),
+            DiffusionGenerationRuntimeOptions::rocm_hybrid(5)
+        );
+
+        let stored_request = SdGenerationRequest { ..empty_request() };
+        let mut stored_options = std::collections::HashMap::new();
+        stored_options.insert("hipfire_rocm_device_id".to_string(), json!(7));
+        assert_eq!(
+            sd_request_generation_runtime_options(&stored_request, &stored_options),
+            DiffusionGenerationRuntimeOptions::rocm_hybrid(7)
+        );
+    }
+
+    #[test]
     fn diffusion_summary_matches_sdapi_model_identifiers() {
         let summary = hipfire_diffusion::DiffusionModelSummary {
             path: PathBuf::from("/tmp/hipfire-models/tiny-route-diffusion.hfq"),
@@ -2588,6 +2822,7 @@ mod tests {
         assert_eq!(options["samples_format"], "png");
         assert_eq!(options["send_images"], true);
         assert_eq!(options["send_seed"], true);
+        assert_eq!(options["hipfire_rocm_device_id"], Value::Null);
         assert_eq!(options["hipfire_sdapi_save_images_supported"], true);
         assert_eq!(
             options["outdir_txt2img_samples"],
@@ -2643,7 +2878,8 @@ mod tests {
             Json(json!({
                 "send_seed": false,
                 "CLIP_stop_at_last_layers": 2,
-                "samples_filename_pattern": "[seed]-[prompt_words]"
+                "samples_filename_pattern": "[seed]-[prompt_words]",
+                "hipfire_rocm_device_id": 0
             })),
         )
         .await;
@@ -2651,6 +2887,7 @@ mod tests {
         assert_eq!(updated["send_seed"], false);
         assert_eq!(updated["CLIP_stop_at_last_layers"], 2);
         assert_eq!(updated["samples_filename_pattern"], "[seed]-[prompt_words]");
+        assert_eq!(updated["hipfire_rocm_device_id"], 0);
 
         let Json(read_back) = get_options(State(state)).await;
         assert_eq!(read_back["send_seed"], false);
@@ -2659,6 +2896,7 @@ mod tests {
             read_back["samples_filename_pattern"],
             "[seed]-[prompt_words]"
         );
+        assert_eq!(read_back["hipfire_rocm_device_id"], 0);
     }
 
     #[tokio::test]
@@ -2942,6 +3180,8 @@ mod tests {
             mask: None,
             include_init_images: None,
             denoising_strength: None,
+            rocm_device_id: None,
+            hipfire_rocm_device_id: None,
             override_settings: None,
             script_name: None,
             script_args: None,
