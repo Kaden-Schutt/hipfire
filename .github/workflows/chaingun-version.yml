@@ -2,7 +2,7 @@ name: chaingun-version
 
 # Development builds use a Git-derived subpatch identity instead of committing
 # Cargo.toml version bumps on every accepted change. For a checkout described as
-# `v0.2.1-908-g97767a40`, the `908` is the commit count since tag `v0.2.1`.
+# `v0.3.0-908-g97767a40`, the `908` is the commit count since tag `v0.3.0`.
 on:
   push:
     branches: [chaingun]

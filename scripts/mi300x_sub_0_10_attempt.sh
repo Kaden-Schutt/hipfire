@@ -53,9 +53,10 @@ fi
 ok "v3 base: $V3_BASE ($(stat -c%s "$V3_BASE") bytes)"
 ok "imatrix: $IMATRIX ($(stat -c%s "$IMATRIX") bytes)"
 
-# Tools
-[ -x target/release/examples/eval_hipfire ] || die "eval_hipfire not built"
-[ -x target/release/hipfire-quantize ]      || die "hipfire-quantize not built"
+# Tools — KLD scoring drives the daemon kld_eval op (eval_hipfire removed).
+source "$(dirname "$0")/lib/kld_daemon.sh"
+kld_daemon_bin >/dev/null               || die "hipfire-daemon not built"
+[ -x target/release/hipfire-quantize ]  || die "hipfire-quantize not built"
 
 # ── 1. GGUF imatrix → raw-sumsq .npz ───────────────────────────────────────
 phase "1  Convert unsloth GGUF imatrix → raw-sumsq npz"
@@ -159,7 +160,7 @@ $PYTHON scripts/mq4_masked_calib.py iterate \
 
 # ── 4. Per-round KLD eval ─────────────────────────────────────────────────
 phase "4  Per-round KLD eval"
-KLDREF="$WORK/kldref/qwen3.5-9b-bf16.kldref.bin"
+KLDREF="$WORK/kldref/qwen3.5-9b-bf16.kldref"   # hipfire-self HFKREF (built by v3_matrix)
 [ -s "$KLDREF" ] || die "missing kldref at $KLDREF; run v3_matrix first"
 
 for r in "$ITER_OUT"/round_*; do
@@ -168,11 +169,9 @@ for r in "$ITER_OUT"/round_*; do
     [ -f "$model" ] || { echo "    $r: no model.hfq"; continue; }
     out_json="$r/kld-c512-q8.json"
     if [ ! -s "$out_json" ]; then
-        ./target/release/examples/eval_hipfire \
-            --model "$model" \
-            --kldref "$KLDREF" \
-            --kv-mode q8 --ctx 512 --scoring-mode prefill \
-            --emit-json "$out_json" 2>&1 | tail -5 >> "$RUN_DIR/iterate.log"
+        # daemon kld_eval Score: writes .kldseq + returns the metrics JSON (n_ctx=512).
+        KLD_DAEMON_LOG="$RUN_DIR/iterate.log" \
+            kld_score "$model" "$KLDREF" "$r/kld-c512-q8.kldseq" "" q8 512 > "$out_json"
     fi
     kld=$(jq -r '.kld_mean' "$out_json" 2>/dev/null || echo "?")
     ppl=$(jq -r '.ppl' "$out_json" 2>/dev/null || echo "?")

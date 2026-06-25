@@ -1214,7 +1214,7 @@ checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
 name = "hip-bridge"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "libloading",
  "thiserror 2.0.18",
@@ -1222,14 +1222,14 @@ dependencies = [
 
 [[package]]
 name = "hipfire-admin-types"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "hipfire-arch-deepseek4"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
@@ -1241,7 +1241,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-dots-ocr"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-arch-qwen2",
@@ -1254,7 +1254,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-gemma3"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
@@ -1265,7 +1265,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-gemma3-vl"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "fast_image_resize",
  "hip-bridge",
@@ -1292,7 +1292,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-llama"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
@@ -1302,7 +1302,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-minimax"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
@@ -1314,7 +1314,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-nemotron"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
@@ -1328,7 +1328,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen2"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
@@ -1339,7 +1339,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen35"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-cpu",
@@ -1358,7 +1358,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen35-vl"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-runtime",
@@ -1370,7 +1370,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-toy"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-runtime",
@@ -1379,7 +1379,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-atlas"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "regex",
  "serde",
@@ -1388,14 +1388,14 @@ dependencies = [
 
 [[package]]
 name = "hipfire-build-info"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "vergen-gitcl",
 ]
 
 [[package]]
 name = "hipfire-cli"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1424,7 +1424,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-coherence"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hipfire-daemon-adapter",
  "hipfire-detect",
@@ -1433,7 +1433,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-config"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "argon2",
  "dirs",
@@ -1444,14 +1444,14 @@ dependencies = [
 
 [[package]]
 name = "hipfire-cpu"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "hipfire-daemon"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "base64",
  "hip-bridge",
@@ -1483,7 +1483,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-daemon-adapter"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -1501,7 +1501,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-daemon-protocol"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hipfire-generate",
  "hipfire-kld",
@@ -1513,7 +1513,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-detect"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "md5",
  "regex",
@@ -1523,7 +1523,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-dispatch"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "rdna-compute",
@@ -1531,7 +1531,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-dispatch-tests"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hipfire-dispatch",
  "hipfire-runtime",
@@ -1540,13 +1540,14 @@ dependencies = [
 
 [[package]]
 name = "hipfire-eval"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64",
  "csv",
  "hipfire-coherence",
  "hipfire-daemon-adapter",
+ "hipfire-daemon-protocol",
  "hipfire-evidence",
  "hipfire-generate",
  "hipfire-hash",
@@ -1559,7 +1560,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-evidence"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hipfire-hash",
  "hipfire-model",
@@ -1569,7 +1570,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-generate"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hipfire-model",
  "hipfire-prompt",
@@ -1581,11 +1582,11 @@ dependencies = [
 
 [[package]]
 name = "hipfire-hash"
-version = "0.2.1"
+version = "0.3.0"
 
 [[package]]
 name = "hipfire-kld"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1593,32 +1594,32 @@ dependencies = [
 
 [[package]]
 name = "hipfire-kvquant"
-version = "0.2.1"
+version = "0.3.0"
 
 [[package]]
 name = "hipfire-lock"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "hipfire-media"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "image",
 ]
 
 [[package]]
 name = "hipfire-mixer"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "hipfire-model"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "byteorder",
  "hipfire-config",
@@ -1632,7 +1633,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-npu"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hipfire-cpu",
  "hipfire-model",
@@ -1641,7 +1642,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-operator"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1649,7 +1650,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-prompt"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "minijinja",
  "minijinja-contrib",
@@ -1660,7 +1661,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-quantize"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "byteorder",
  "faer",
@@ -1675,7 +1676,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-rocm"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hipfire-cpu",
  "serde_json",
@@ -1683,7 +1684,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-runtime"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "base64",
  "csv",
@@ -1718,7 +1719,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-scheduler"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hipfire-model",
  "hipfire-state",
@@ -1727,7 +1728,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-server"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1757,7 +1758,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-serving-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "base64",
  "hip-bridge",
@@ -1789,7 +1790,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-state"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hipfire-model",
  "serde",
@@ -1798,7 +1799,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-train"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "crossterm",
  "glob",
@@ -1814,7 +1815,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-tui"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -1829,7 +1830,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-vision-cache"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "tempfile",
  "twox-hash",
@@ -1837,7 +1838,7 @@ dependencies = [
 
 [[package]]
 name = "hsa-bridge"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "libloading",
@@ -2998,7 +2999,7 @@ dependencies = [
 
 [[package]]
 name = "rdna-compute"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-kvquant",
@@ -3012,7 +3013,7 @@ checksum = "03251193000f4bd3b042892be858ee50e8b3719f2b08e5833ac4353724632430"
 
 [[package]]
 name = "redline"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "libc",
  "libloading",

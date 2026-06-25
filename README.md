@@ -8,7 +8,7 @@ hipfire chat -m qwen3.5:9b "What is the capital of France?"
 hipfire serve              # OpenAI-compatible API on 0.0.0.0:11435
 ```
 
-Current release: **v0.2.1** — dispatch unification (#397). DeepSeek V4 Flash support landed in v0.2.0. See [CHANGELOG.md](CHANGELOG.md).
+Current release: **v0.3.0** — chaingun runtime, Opus quantization, hierarchical KV, and operator surfaces. DeepSeek V4 Flash support landed in v0.2.0. See [CHANGELOG.md](CHANGELOG.md).
 
 `chaingun` development builds use the Git-derived subpatch identity
 `vX.Y.Z-N-gSHA`, where `N` is the commit count since the release tag. The

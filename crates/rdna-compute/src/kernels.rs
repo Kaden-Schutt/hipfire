@@ -3753,6 +3753,66 @@ pub const GEMM_IU4_I32_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_
 pub const GEMM_OQ4_GROUPED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_oq4_grouped_wmma.hip");
 
+/// OQ4+ batched PREFILL: W4A16 grouped GEMM (4-bit-resident weight dequantized
+/// to f16 inline, f16×f16 WMMA against full-precision f16 activations). The
+/// batched analog of the W4A16 decode GEMV; replaces the W4A4 int4-act path for
+/// OQ4+ prefill (no act-quant → no batched-vs-pertoken divergence amplification).
+/// gfx1100+ wave32 WMMA, zero LDS. See `kernels/src/gemm_oq4_grouped_f16_wmma.hip`.
+pub const GEMM_OQ4_GROUPED_F16_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq4_grouped_f16_wmma.hip");
+
+/// OQ4+ fused QKVZA DECODE (B=1) W4A8 dp4a (v_dot4_i32_iu8 / `__builtin_amdgcn_
+/// sudot4`, RDNA3 dot8-insts) — int8-quantized activation, 4 int8 MACs/instr.
+/// gfx1103/RDNA3 default + a separate gfx1151/RDNA3.5 variant (it carries both
+/// dot1 and dot8; kept separate per the arch-port convention for independent
+/// tuning). Select with `fused_qkvza_oq4_dp4a_for_arch`.
+pub const FUSED_QKVZA_OQ4_DP4A_SRC: &str =
+    include_str!("../../../kernels/src/fused_qkvza_oq4_dp4a.hip");
+
+/// OQ4+ W4A16 decode GEMV with FUSED residual add (Y += W·x, one launch) —
+/// eliminates the separate add_inplace_f32 of the unfused wo/down path (the
+/// standout decode-gap item vs mq4's gemv_hfq4g256_residual). See the .hip file.
+pub const GEMV_OQ4_GROUPED_RESIDUAL_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq4_grouped_residual.hip");
+
+/// OQ4+ W4A16 fused gate+up DECODE (B=1): 2 GEMVs in one launch (blockIdx demux),
+/// cuts the per-token dispatch count vs looping gemv_oq4_grouped. See the .hip.
+pub const FUSED_GATE_UP_OQ4_GEMV_SRC: &str =
+    include_str!("../../../kernels/src/fused_gate_up_oq4_gemv.hip");
+
+/// OQ4+ W4A16 decode GEMV reading the INTERLEAVED group layout ([f32 scale][128
+/// nibbles] contiguous per 256-group) — candidate for a per-arch loader repack to
+/// fix the split-layout's two-stream access pattern. See the .hip.
+pub const GEMV_OQ4_INTERLEAVED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq4_interleaved.hip");
+pub const GEMV_OQ4_INTERLEAVED_RESIDUAL_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq4_interleaved_residual.hip");
+pub const FUSED_QKVZA_OQ4_INTERLEAVED_SRC: &str =
+    include_str!("../../../kernels/src/fused_qkvza_oq4_interleaved.hip");
+pub const FUSED_GATE_UP_OQ4_INTERLEAVED_SRC: &str =
+    include_str!("../../../kernels/src/fused_gate_up_oq4_interleaved.hip");
+pub const FUSED_QKVZA_OQ4_DP4A_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gfx1151/fused_qkvza_oq4_dp4a.gfx1151.hip");
+
+/// Pick the dp4a QKVZA decode kernel source for `arch`. gfx1151 → its own
+/// variant; all other RDNA3+ (gfx1100/1/2/3, gfx12) → the default.
+pub fn fused_qkvza_oq4_dp4a_for_arch(arch: &str) -> &'static str {
+    if arch.starts_with("gfx1151") || arch.starts_with("gfx1150") || arch.starts_with("gfx1152") {
+        FUSED_QKVZA_OQ4_DP4A_GFX1151_SRC
+    } else {
+        FUSED_QKVZA_OQ4_DP4A_SRC
+    }
+}
+
+/// OQ4+ MMQ (int8-WMMA, LDS-staged) batched GEMM — the int8 backend matching
+/// mq4's MMQ (gemm_hfq4g256_residual_mmq). Reuses the shared q8_1 activation
+/// quantizer (quantize_q8_1_mmq_ds4 via ensure_q8_1_mmq_x); only the weight-tile
+/// loader differs (OQ4+ split sign-extended-int4, zp=0). int8-WMMA +
+/// LDS-activation-reuse ≈ 1.5× the f16 path on gfx1103. See
+/// `kernels/src/gemm_oq4_residual_mmq.hip`.
+pub const GEMM_OQ4_RESIDUAL_MMQ_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq4_residual_mmq.hip");
+
 /// Opus Quant W4A4: dynamic per-token/group INT4 activation quantizer (f32 →
 /// signed int4 + per-group scales). Feeds `gemm_oq4_grouped_wmma`. gfx1103
 /// wave32, zero LDS. See `kernels/src/quantize_act_oq4.hip`.
@@ -3786,6 +3846,34 @@ pub const FUSED_QKVZA_OQ4_WMMA_SRC: &str =
 /// Opus Quant W4A4 DECODE GEMV (batch=1): one wave32 per output row, no WMMA
 /// N-tile waste, weight-bandwidth-bound. See `kernels/src/gemv_oq4_grouped.hip`.
 pub const GEMV_OQ4_GROUPED_SRC: &str = include_str!("../../../kernels/src/gemv_oq4_grouped.hip");
+
+/// Opus Quant W8A8 DECODE GEMV (batch=1): int8 generalization of
+/// `gemv_oq4_grouped` — one wave32 per output row, 8 int8/lane (two int32 loads),
+/// no WMMA N-tile waste, weight-bandwidth-bound. See `kernels/src/gemv_oq8_grouped.hip`.
+pub const GEMV_OQ8_GROUPED_SRC: &str = include_str!("../../../kernels/src/gemv_oq8_grouped.hip");
+
+/// OQ+ (W8A8) fused QKVZA: in_proj_qkv/z/beta/alpha grouped-iu8 GEMMs in ONE launch
+/// over a shared int8 activation (int8 generalization of fused_qkvza_oq4_wmma).
+/// gfx1103 wave32, zero LDS. See `kernels/src/fused_qkvza_oq8_wmma.hip`.
+pub const FUSED_QKVZA_OQ8_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/fused_qkvza_oq8_wmma.hip");
+
+/// OQ+ (W8A8) fused Gate+Up: gate_proj + up_proj grouped-iu8 GEMMs in ONE launch
+/// over a shared int8 activation. gfx1103 wave32, zero LDS.
+/// See `kernels/src/fused_gate_up_oq8_wmma.hip`.
+pub const FUSED_GATE_UP_OQ8_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/fused_gate_up_oq8_wmma.hip");
+
+/// OQ+ (W8A8) fused QKVZA DECODE (B=1): one wave32 per output row, blockIdx demux
+/// across the 4 projections — 1 launch, no WMMA N-tile waste (the B=1 decode win).
+/// See `kernels/src/fused_qkvza_oq8_gemv.hip`.
+pub const FUSED_QKVZA_OQ8_GEMV_SRC: &str =
+    include_str!("../../../kernels/src/fused_qkvza_oq8_gemv.hip");
+
+/// OQ+ (W8A8) fused Gate+Up DECODE (B=1): one wave32 per output row, blockIdx demux
+/// gate vs up — 1 launch, no N-tile waste. See `kernels/src/fused_gate_up_oq8_gemv.hip`.
+pub const FUSED_GATE_UP_OQ8_GEMV_SRC: &str =
+    include_str!("../../../kernels/src/fused_gate_up_oq8_gemv.hip");
 
 /// KVarN tile quantizer (Phase D1): log-domain Sinkhorn variance-normalize +
 /// per-row 4-bit affine quantize + pack to the on-device KVarN record. One block

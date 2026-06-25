@@ -5059,17 +5059,16 @@ impl Gpu {
     ) -> HipResult<()> {
         self.launch_gemv_generic("gemv_iu4_i32", kernels::GEMV_IU4_I32_SRC, w, x, y, m, k)
     }
-    /// Opus Quant W4A4 DECODE GEMV (batch=1): one wave32 per output row, no WMMA
-    /// N-tile waste. `w_i4`/`w_scales` are the combined-buffer base + sub_offset
-    /// scale view (same as gemm_oq4_grouped_wmma); `x_i4`/`x_scales` are the
-    /// int4-quantized activation. `group` must be 256.
+    /// Opus Quant W4A16 DECODE GEMV (batch=1): one wave32 per output row, no
+    /// WMMA N-tile waste. `w_i4`/`w_scales` are the combined-buffer base +
+    /// sub_offset scale view; `x_f32` is the full-precision rotated activation.
+    /// `group` must be 256.
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_oq4_grouped(
         &mut self,
         w_i4: &GpuTensor,
         w_scales: &GpuTensor,
-        x_i4: &GpuTensor,
-        x_scales: &GpuTensor,
+        x_f32: &GpuTensor,
         y_f32: &GpuTensor,
         m: usize,
         k: usize,
@@ -5089,8 +5088,7 @@ impl Gpu {
         )?;
         let wp = w_i4.buf.as_ptr();
         let wsp = w_scales.buf.as_ptr();
-        let xp = x_i4.buf.as_ptr();
-        let xsp = x_scales.buf.as_ptr();
+        let xp = x_f32.buf.as_ptr();
         let yp = y_f32.buf.as_ptr();
         let mut mi = m as i32;
         let mut ki = k as i32;
@@ -5099,23 +5097,250 @@ impl Gpu {
             &wp as *const _ as *mut c_void,
             &wsp as *const _ as *mut c_void,
             &xp as *const _ as *mut c_void,
-            &xsp as *const _ as *mut c_void,
             &yp as *const _ as *mut c_void,
             &mut mi as *mut _ as *mut c_void,
             &mut ki as *mut _ as *mut c_void,
             &mut gi as *mut _ as *mut c_void,
         ];
-        let func = &self.functions["gemv_oq4_grouped"];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_oq4_grouped",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(wp);
+                b.push_ptr(wsp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mi);
+                b.push_i32(ki);
+                b.push_i32(gi);
+                b
+            },
+        )
+    }
+
+    /// OQ4+ W4A16 decode GEMV with fused residual add (`y += W*x`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_oq4_grouped_residual(
+        &mut self,
+        w_i4: &GpuTensor,
+        w_scales: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(group, 256, "gemv_oq4_grouped_residual: group must be 256");
+        self.ensure_kernel(
+            "gemv_oq4_grouped_residual",
+            kernels::GEMV_OQ4_GROUPED_RESIDUAL_SRC,
+            "gemv_oq4_grouped_residual",
+        )?;
+        let wp = w_i4.buf.as_ptr();
+        let wsp = w_scales.buf.as_ptr();
+        let xp = x_f32.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &wsp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemv_oq4_grouped_residual",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(wp);
+                b.push_ptr(wsp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mi);
+                b.push_i32(ki);
+                b.push_i32(gi);
+                b
+            },
+        )
+    }
+
+    /// OQ4+ W4A16 decode GEMV over the interleaved layout:
+    /// `[f32 scale][128 nibbles]` per group, with row stride `ng*132` bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_oq4_interleaved(
+        &mut self,
+        w_il: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(group, 256, "gemv_oq4_interleaved: group must be 256");
+        self.ensure_kernel(
+            "gemv_oq4_interleaved",
+            kernels::GEMV_OQ4_INTERLEAVED_SRC,
+            "gemv_oq4_interleaved",
+        )?;
+        let wp = w_il.buf.as_ptr();
+        let xp = x_f32.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemv_oq4_interleaved",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(wp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mi);
+                b.push_i32(ki);
+                b.push_i32(gi);
+                b
+            },
+        )
+    }
+
+    /// OQ4+ interleaved-layout decode GEMV with fused residual (`y += W*x`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_oq4_interleaved_residual(
+        &mut self,
+        w_il: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            group, 256,
+            "gemv_oq4_interleaved_residual: group must be 256"
+        );
+        self.ensure_kernel(
+            "gemv_oq4_interleaved_residual",
+            kernels::GEMV_OQ4_INTERLEAVED_RESIDUAL_SRC,
+            "gemv_oq4_interleaved_residual",
+        )?;
+        let wp = w_il.buf.as_ptr();
+        let xp = x_f32.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemv_oq4_interleaved_residual",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(wp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mi);
+                b.push_i32(ki);
+                b.push_i32(gi);
+                b
+            },
+        )
+    }
+
+    /// Opus Quant W8A16 decode GEMV (batch=1): one wave32 per output row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_oq8_grouped(
+        &mut self,
+        w_i8: &GpuTensor,
+        w_scales: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(group, 256, "gemv_oq8_grouped: group must be 256");
+        assert_eq!(
+            k % group,
+            0,
+            "gemv_oq8_grouped: K must be a multiple of group"
+        );
+        self.ensure_kernel(
+            "gemv_oq8_grouped",
+            kernels::GEMV_OQ8_GROUPED_SRC,
+            "gemv_oq8_grouped",
+        )?;
+        let wp = w_i8.buf.as_ptr();
+        let wsp = w_scales.buf.as_ptr();
+        let xp = x_f32.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &wsp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemv_oq8_grouped",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(wp);
+                b.push_ptr(wsp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mi);
+                b.push_i32(ki);
+                b.push_i32(gi);
+                b
+            },
+        )
     }
     /// y = A_q8_0 * x (quantized GEMV for Q8_0)
     /// F16-weight × F32-input GEMV. y[m] = W_f16[m, k] @ x_f32[k].

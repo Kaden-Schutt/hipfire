@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 hipfire contributors
 // hipfire — see LICENSE and NOTICE in the project root.
-//! Parity for `gemv_oq4_grouped` (decode B=1 GEMV) vs the validated
-//! `gemm_oq4_grouped_wmma` at batch_size=1. Bit-exact expected (identical
-//! integer dots + per-group f32 rescale, just a different tiling).
+//! Parity for `gemv_oq4_grouped` (OQ4+ decode B=1 GEMV, W4A16) vs a CPU oracle.
+//! The kernel unpacks the 4-bit-resident weight inline and multiplies by the
+//! FULL-PRECISION f32 activation (W4A16 decode), so the reference is a direct
+//! f32 dot: y[m] = Σ_g sw[m,g]·Σ_{k∈g} dequant(qw)·x[k].
 //!
 //!   cargo run --release -p rdna-compute --example parity_gemv_oq4_grouped [M K]
 
@@ -18,12 +19,12 @@ fn lcg(seed: u32, n: usize) -> Vec<u8> {
         })
         .collect()
 }
-fn lcgf(seed: u32, n: usize) -> Vec<u8> {
+fn lcgf_vals(seed: u32, n: usize) -> Vec<f32> {
     let mut s = seed.max(1);
     (0..n)
-        .flat_map(|_| {
+        .map(|_| {
             s = s.wrapping_mul(1_103_515_245).wrapping_add(12345) & 0x7fff_ffff;
-            (0.01 + (s as f32 / 2_147_483_648.0) * 0.5).to_le_bytes()
+            -1.0 + (s as f32 / 2_147_483_648.0) * 2.0
         })
         .collect()
 }
@@ -37,38 +38,53 @@ fn main() {
     let ng = k / group;
 
     let mut gpu = Gpu::init().unwrap();
-    if !gpu.arch_caps.has_wmma_w32() {
-        println!(
-            "SKIP parity_gemv_oq4_grouped: {} lacks wave32 WMMA",
-            gpu.arch
-        );
-        return;
-    }
 
     // Combined weight buffer [packed nibbles M*(K/2) | f32 scales M*ng].
-    let mut wbuf = lcg(1, m * (k / 2));
-    wbuf.extend_from_slice(&lcgf(0x11, m * ng));
-    let xq = lcg(2, k / 2);
-    let xs = lcgf(3, ng);
+    let wnib = lcg(1, m * (k / 2));
+    let wsc = lcgf_vals(0x11, m * ng)
+        .iter()
+        .map(|v| 0.01 + v.abs() * 0.25)
+        .collect::<Vec<_>>();
+    let mut wbuf = wnib.clone();
+    for s in &wsc {
+        wbuf.extend_from_slice(&s.to_le_bytes());
+    }
+    let x: Vec<f32> = lcgf_vals(3, k);
 
     let wd = gpu.upload_raw(&wbuf, &[wbuf.len()]).unwrap();
     let ws = wd.sub_offset(m * (k / 2), m * ng * 4);
-    let xqd = gpu.upload_raw(&xq, &[1, k / 2]).unwrap();
-    let xsd = gpu.upload_raw(&xs, &[1, ng]).unwrap();
+    let mut xbytes = Vec::with_capacity(k * 4);
+    for v in &x {
+        xbytes.extend_from_slice(&v.to_le_bytes());
+    }
+    let xd = gpu.upload_raw(&xbytes, &[1, k]).unwrap();
 
-    // GEMV (decode).
     let yg = gpu.upload_raw(&vec![0u8; m * 4], &[1, m]).unwrap();
-    gpu.gemv_oq4_grouped(&wd, &ws, &xqd, &xsd, &yg, m, k, group)
+    gpu.gemv_oq4_grouped(&wd, &ws, &xd, &yg, m, k, group)
         .unwrap();
     gpu.device_synchronize().unwrap();
     let y_gemv = gpu.download_f32(&yg).unwrap();
 
-    // Reference: WMMA grouped GEMM at B=1.
-    let yr = gpu.upload_raw(&vec![0u8; m * 4], &[1, m]).unwrap();
-    gpu.gemm_oq4_grouped_wmma(&wd, &ws, &xqd, &xsd, &yr, m, k, 1, group)
-        .unwrap();
-    gpu.device_synchronize().unwrap();
-    let y_ref = gpu.download_f32(&yr).unwrap();
+    // CPU oracle: W4A16 dot.
+    let sext = |nib: u8| -> i32 {
+        let v = (nib & 0xf) as i32;
+        (v << 28) >> 28
+    };
+    let mut y_ref = vec![0.0f32; m];
+    for row in 0..m {
+        let mut acc = 0.0f32;
+        for g in 0..ng {
+            let mut gsum = 0.0f32;
+            for j in 0..group {
+                let kk = g * group + j;
+                let byte = wnib[row * (k / 2) + kk / 2];
+                let nib = if kk & 1 == 0 { byte & 0xf } else { byte >> 4 };
+                gsum += sext(nib) as f32 * x[kk];
+            }
+            acc += gsum * wsc[row * ng + g];
+        }
+        y_ref[row] = acc;
+    }
 
     let mut max_abs = 0.0f32;
     let mut max_mag = 0.0f32;
@@ -79,7 +95,7 @@ fn main() {
     let tol = 1e-3 * max_mag.max(1.0);
     let pass = max_abs <= tol;
     println!(
-        "parity_gemv_oq4_grouped M={m} K={k} on {}: max_abs={max_abs:.5} (mag={max_mag:.2}) -> {}",
+        "parity_gemv_oq4_grouped (W4A16) M={m} K={k} on {}: max_abs={max_abs:.5} (mag={max_mag:.2}) -> {}",
         gpu.arch,
         if pass { "PASS" } else { "FAIL" }
     );

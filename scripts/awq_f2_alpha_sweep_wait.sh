@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# awq_f2_alpha_sweep_wait.sh — wait for any in-flight eval_hipfire, then
+# awq_f2_alpha_sweep_wait.sh — wait for any in-flight KLD eval daemon, then
 # run the F2 alpha sweep at α∈[0.35..0.65] step 0.05, n=100, KV q8.
 #
 # F2-whitelist is the default in this branch (no HIPFIRE_AWQ_F1_ONLY needed).
@@ -7,8 +7,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# Wait for the running F1/F2 comparison eval to release the GPU.
-until ! pgrep -f "target/release/examples/eval_hipfire" > /dev/null 2>&1; do
+# Wait for the running F1/F2 comparison eval (daemon-driven KLD) to release the GPU.
+until ! pgrep -f "hipfire-daemon" > /dev/null 2>&1; do
     sleep 5
 done
 

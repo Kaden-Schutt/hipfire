@@ -15,6 +15,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod drafter;
 pub mod hfq_patch;
+pub mod kv_noise;
 pub mod labels;
 pub mod loader;
 pub mod model;

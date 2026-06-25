@@ -19,16 +19,20 @@ Q="$ROOT/target/debug/hipfire-quantize"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-# arch → expected auto-detected arch id (from the quantize ingest).
-ARCHS=(qwen3_5 qwen3_5_moe)
-EXPECT_ID=("id=5" "id=6")
+# arch → expected ingest arch id + any extra quantize flags. Qwen2's model_type
+# auto-detects to the LLaMA-family id=1 (which drops Q/K/V bias); --arch-id 7
+# routes it to the dedicated hipfire-arch-qwen2 loader, so we assert the override
+# message ("to 7") instead of an "id=" line.
+ARCHS=(qwen3_5 qwen3_5_moe qwen2 gemma3 minimax llama)
+EXPECT_ID=("id=5" "id=6" "to 7" "id=12" "id=10" "id=0")
+ARCH_FLAGS=("" "" "--arch-id 7" "" "" "")
 
 for i in "${!ARCHS[@]}"; do
     arch="${ARCHS[$i]}"
     want="${EXPECT_ID[$i]}"
     echo "== fixture round-trip: $arch (expect $want) =="
     "$Q" --emit-fixture "$arch" --out "$TMP/$arch" --seed 42
-    out="$("$Q" --input "$TMP/$arch" --output "$TMP/$arch.hfq" --format mq4 2>&1)"
+    out="$("$Q" --input "$TMP/$arch" --output "$TMP/$arch.hfq" --format mq4 ${ARCH_FLAGS[$i]} 2>&1)"
     if ! grep -qiE "Architecture:.*$want" <<<"$out"; then
         echo "FAIL: $arch did not auto-detect $want" >&2
         grep -i architecture <<<"$out" >&2 || true

@@ -155,11 +155,16 @@ with open('${COHORT_DIR}/manifest.json', 'w') as f:
 print(f'  cohort with {len(manifest[\"variants\"])} variants')
 "
 
+# KLD scoring now drives the daemon kld_eval op (hipfire-self HFKREF). The old
+# cross-engine eval_hipfire / `.kldref.bin` path has been removed. KLDREF must be
+# an HFKREF (.kldref) built via `kld_build_ref` (scripts/lib/kld_daemon.sh).
+source "$(dirname "$0")/lib/kld_daemon.sh"
+
 # Build prerequisites once.
 echo "Building prerequisites..."
 cargo build --release --example quant_quality_mse --quiet 2>&1 | tail -3
 if [ -n "$KLDREF" ]; then
-    cargo build --release --example eval_hipfire --features deltanet --quiet 2>&1 | tail -3
+    cargo build --release -p hipfire-daemon --features deltanet --quiet 2>&1 | tail -3
 fi
 
 PROGRESS="${COHORT_DIR}/result-table.md.in-progress"
@@ -279,41 +284,23 @@ else:
     KLD_P99="—"
     PPL_VAL="—"
     if [ -n "$KLDREF" ]; then
-        echo "  [2/4] KLD / PPL via eval_hipfire (kv-mode=${KV_MODE}, scoring=${SCORING_MODE}, max_chunks=${MAX_CHUNKS:-full})..."
+        echo "  [2/4] KLD / PPL via daemon kld_eval (kv-mode=${KV_MODE}, max_chunks=${MAX_CHUNKS:-full})..."
 
-        # Build invocation. eval_hipfire writes HFKSEQ to ${PV}.kldseq;
-        # kld_reduce.py converts to row-level mean/CI/p99/PPL.
-        EVAL_ARGS=(
-            --model "$HFQ_PATH"
-            --ref "$KLDREF"
-            --output "${PV}.kldseq"
-            --kv-mode "$KV_MODE"
-            --scoring-mode "$SCORING_MODE"
-        )
-        if [ -n "$MAX_CHUNKS" ]; then
-            EVAL_ARGS+=(--max-chunks "$MAX_CHUNKS")
-        fi
-
-        # GPU lock — eval_hipfire takes hours; coordinate with other jobs.
-        HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
-        if [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; then
-            "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "quant_cohort-${LABEL}-${VARIANT}" --watch-pid "$$" 2>&1 | tail -1 || true
-        fi
-
+        # The daemon kld_eval Score op writes HFKSEQ to ${PV}.kldseq (kld_reduce.py
+        # still converts it to row-level mean/CI/p99/PPL) AND returns mean_kld/ppl in
+        # its JSON result. The daemon auto-acquires the GPU resource lock, so no
+        # separate gpu-lock wrapper is needed.
         EVAL_START=$(date +%s)
-        if ./target/release/examples/eval_hipfire "${EVAL_ARGS[@]}" \
-                > "${PV}.eval.log" 2>&1; then
+        EVAL_LINE=$(KLD_DAEMON_LOG="${PV}.eval.log" \
+            kld_score "$HFQ_PATH" "$KLDREF" "${PV}.kldseq" "$MAX_CHUNKS" "$KV_MODE")
+        if [ -n "$EVAL_LINE" ] && [ -z "${EVAL_LINE##*kld_evaled*}" ]; then
             EVAL_OK=1
         else
             EVAL_OK=0
-            echo "    eval_hipfire FAILED (log: ${PV}.eval.log)"
+            echo "    daemon kld_eval FAILED (log: ${PV}.eval.log): $EVAL_LINE"
         fi
         EVAL_WALL=$(( $(date +%s) - EVAL_START ))
-        echo "    eval_hipfire wall: ${EVAL_WALL}s"
-
-        if [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; then
-            "$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>&1 | tail -1 || true
-        fi
+        echo "    daemon kld_eval wall: ${EVAL_WALL}s"
 
         if [ "$EVAL_OK" = "1" ] && [ -f "${PV}.kldseq" ]; then
             # Reduce single .kldseq file via the inline reducer pattern.

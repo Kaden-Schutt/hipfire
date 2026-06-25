@@ -292,7 +292,10 @@ fn main() {
     };
 
     let sc = sampler::SamplingConfig::text_thinking();
-    let max_gen = 2048;
+    let max_gen: usize = std::env::var("HIPFIRE_MAX_GEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2048);
 
     let t2 = Instant::now();
     let mut token_history: Vec<u32> = prompt_tokens.clone();

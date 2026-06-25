@@ -79,7 +79,7 @@ fn render_markdown() -> String {
 /// name (`hipfire.1`, `hipfire-<sub>.1`).
 fn render_man_pages() -> anyhow::Result<Vec<(String, Vec<u8>)>> {
     // The binary's runtime `--version` is a dynamic Git-derived identity
-    // (`hipfire_build_info::VERSION`, e.g. `v0.2.1-957-g…`). Pin the *man page*
+    // (`hipfire_build_info::VERSION`, e.g. `v0.3.0-957-g...`). Pin the *man page*
     // to the static crate version so the docs freshness gate stays
     // deterministic — otherwise every commit would render a new `.TH`/VERSION
     // line and the gate could never be satisfied.
@@ -88,7 +88,7 @@ fn render_man_pages() -> anyhow::Result<Vec<(String, Vec<u8>)>> {
 
     let mut root = Vec::new();
     clap_mangen::Man::new(cmd.clone()).render(&mut root)?;
-    out.push(("hipfire.1".to_string(), root));
+    out.push(("hipfire.1".to_string(), trim_trailing_line_ws(root)?));
 
     for sub in cmd.get_subcommands() {
         if sub.is_hide_set() {
@@ -101,9 +101,23 @@ fn render_man_pages() -> anyhow::Result<Vec<(String, Vec<u8>)>> {
         let titled = sub.clone().name(title);
         let mut buf = Vec::new();
         clap_mangen::Man::new(titled).render(&mut buf)?;
-        out.push((file, buf));
+        out.push((file, trim_trailing_line_ws(buf)?));
     }
     Ok(out)
+}
+
+fn trim_trailing_line_ws(bytes: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+    let text = String::from_utf8(bytes)?;
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let (body, newline) = line
+            .strip_suffix('\n')
+            .map(|body| (body, "\n"))
+            .unwrap_or((line, ""));
+        out.push_str(body.trim_end_matches(|c| c == ' ' || c == '\t'));
+        out.push_str(newline);
+    }
+    Ok(out.into_bytes())
 }
 
 fn check_file(path: std::path::PathBuf, expected: impl AsRef<[u8]>, stale: &mut Vec<String>) {

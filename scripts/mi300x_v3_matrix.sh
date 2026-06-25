@@ -7,8 +7,8 @@
 #      → AWQ base HFQ (F1 scope, 184 sidecars on 9B-class)
 #   2. mq4_masked_calib.py quantize --method gptq --gpu 0 --awq-aware-hessian
 #      → GPTQ-corrected v3 HFQ at byte-identical size
-#   3. Generate or reuse <model>-bf16.kldref.bin
-#   4. eval_hipfire → KLD + PPL @ c512 q8 prefill
+#   3. Build or reuse <model>-bf16.kldref (hipfire-self HFKREF)
+#   4. daemon kld_eval → KLD + PPL @ c512 q8
 #   5. coherence_probe --max-tokens 200 → hard/soft fail counts
 #   6. bench: AR decode tok/s (--max 120)
 #
@@ -16,6 +16,13 @@
 # plus a top-level table.md. Idempotent: skips already-quantized models.
 
 set -euo pipefail
+
+# KLD scoring drives the daemon kld_eval op (hipfire-self HFKREF). The cross-engine
+# `.kldref.bin` / eval_hipfire / make_kldref path has been removed. Provide REF_HFQ
+# (a BF16 .hfq) so ensure_kldref can build the HFKREF. NOTE: the tok/s `--bench` and
+# arch-print roles below also used eval_hipfire — migrate those to the daemon
+# `generate` op on the gfx942 box (untested here).
+source "$(dirname "$0")/lib/kld_daemon.sh"
 
 WORK="${WORK:-/workspace}"
 HIPFIRE="${HIPFIRE_DIR:-${WORK}/hipfire}"
@@ -72,37 +79,22 @@ print(snapshot_download(
 "
 }
 
-# Generate kldref.bin from BF16 source if not present.
+# Build the hipfire-self HFKREF from a BF16 .hfq (REF_HFQ) if not present.
 ensure_kldref() {
     local slug="$1" bf16_dir="$2"
     local out_dir="$WORK/kldref"
     mkdir -p "$out_dir"
-    local kldref="$out_dir/${slug}-bf16.kldref.bin"
+    local kldref="$out_dir/${slug}-bf16.kldref"   # hipfire-self HFKREF
     if [ -s "$kldref" ]; then
         ok "kldref cached: $kldref"
         echo "$kldref"
         return
     fi
-    echo "    [kldref] generating from BF16 — this is the slowest single step" >&2
-    if [ ! -x target/release/examples/make_kldref ]; then
-        cargo build --release --example make_kldref -p hipfire-runtime 2>&1 | tail -5 >&2 || \
-            warn "make_kldref not in workspace; computing via PyTorch fallback"
-    fi
-    if [ -x target/release/examples/make_kldref ]; then
-        ./target/release/examples/make_kldref \
-            --bf16 "$bf16_dir" \
-            --calib benchmarks/calib/calib-1m.txt \
-            --ctx "$EVAL_CTX" \
-            --out "$kldref" 2>&1 | tail -5 >&2
-    else
-        # PyTorch fallback for kldref generation
-        $PYTHON scripts/make_kldref_torch.py \
-            --model "$bf16_dir" \
-            --calib benchmarks/calib/calib-1m.txt \
-            --ctx "$EVAL_CTX" \
-            --out "$kldref" 2>&1 | tail -5 >&2 \
-        || die "no kldref generation path available — need make_kldref binary or scripts/make_kldref_torch.py"
-    fi
+    echo "    [kldref] building HFKREF from BF16 via daemon — slowest single step" >&2
+    local ref_hfq="${REF_HFQ:-$bf16_dir}"
+    [ -f "$ref_hfq" ] || die "ensure_kldref: need a BF16 .hfq (set REF_HFQ); got $ref_hfq"
+    kld_build_ref "$ref_hfq" benchmarks/calib/calib-1m.txt "$kldref" "" "$EVAL_KV_MODE" "$EVAL_CTX" >&2 \
+        || die "daemon build_ref failed for $kldref"
     [ -s "$kldref" ] || die "kldref generation failed: $kldref"
     echo "$kldref"
 }
@@ -164,25 +156,19 @@ run_one() {
         ok "stage 2 cached: $v3_out"
     fi
 
-    # Stage 3: ensure kldref.bin
+    # Stage 3: ensure HFKREF
     local bf16_dir
     bf16_dir=$(resolve_snapshot "$repo" "$rev")
     local kldref
     kldref=$(ensure_kldref "$slug" "$bf16_dir")
 
-    # Stage 4: KLD eval (c512 q8 prefill)
+    # Stage 4: KLD eval (c512 q8) via the daemon kld_eval Score op.
     local kld_json="$model_out_dir/kld.json"
     if [ ! -s "$kld_json" ]; then
-        ./target/release/examples/eval_hipfire \
-            --model "$v3_out" \
-            --kldref "$kldref" \
-            --kv-mode "$EVAL_KV_MODE" \
-            --ctx "$EVAL_CTX" \
-            --scoring-mode prefill \
-            --emit-json "$kld_json" \
-            2>&1 | tail -10 | tee "$model_out_dir/kld.log"
+        KLD_DAEMON_LOG="$model_out_dir/kld.log" \
+            kld_score "$v3_out" "$kldref" "$model_out_dir/kld.kldseq" "" "$EVAL_KV_MODE" "$EVAL_CTX" > "$kld_json"
     fi
-    [ -s "$kld_json" ] && ok "KLD eval: $(jq -r '"KLD=" + (.kld_mean|tostring) + " PPL=" + (.ppl|tostring)' "$kld_json")"
+    [ -s "$kld_json" ] && ok "KLD eval: $(jq -r '"KLD=" + (.mean_kld|tostring) + " PPL=" + (.ppl|tostring)' "$kld_json")"
 
     # Stage 5: coherence_probe
     local coh_json="$model_out_dir/coherence.json"
@@ -197,17 +183,15 @@ run_one() {
     fi
     [ -s "$coh_json" ] && ok "coherence: $(jq -r '"hard=" + (.hard_fails|tostring) + " soft=" + (.soft_fails|tostring)' "$coh_json" 2>/dev/null || echo unknown)"
 
-    # Stage 6: tok/s
+    # Stage 6: tok/s — daemon generate `done` event carries decode/prefill tok_s.
     local bench_json="$model_out_dir/bench.json"
     if [ ! -s "$bench_json" ]; then
-        ./target/release/examples/eval_hipfire \
-            --model "$v3_out" \
-            --bench \
-            --max "$BENCH_MAX" \
-            --kv-mode "$EVAL_KV_MODE" \
-            --no-chatml \
-            --emit-json "$bench_json" \
-            2>&1 | tail -10 | tee "$model_out_dir/bench.log" || true
+        local dbin; dbin=$(kld_daemon_bin) && {
+            { printf '{"type":"load","model":"%s","params":{"max_seq":%d,"kv_cache":"%s"}}\n' "$v3_out" $((BENCH_MAX + 512)) "$EVAL_KV_MODE"
+              printf '{"type":"generate","prompt":"Write a long technical essay.","params":{"max_tokens":%d,"temperature":0.0,"no_chatml":true}}\n' "$BENCH_MAX"
+            } | HIPFIRE_RESOURCE_LOCK_WAIT_MS="${HIPFIRE_RESOURCE_LOCK_WAIT_MS:-600000}" "$dbin" 2>"$model_out_dir/bench.log" \
+                | grep '"type":"done"' | tail -1 > "$bench_json" || true
+        }
     fi
     [ -s "$bench_json" ] && ok "bench: $(jq -r '"decode=" + (.decode_tok_s|tostring) + " prefill=" + (.prefill_tok_s|tostring)' "$bench_json" 2>/dev/null || echo unknown)"
 

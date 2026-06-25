@@ -378,6 +378,15 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
     };
 
     let gemv = gemv_family();
+    // Calibration tap: when a Hessian/imatrix collector is armed
+    // (`gpu.active_capture`) and this weight is a known target
+    // (`gpu.capture_names`), accumulate the input activation. Zero-cost
+    // (one `is_none()` branch) and byte-identical to the prior forward when
+    // no collector is armed. Placed before `DispatchCtx::new` borrows `gpu`.
+    // This is the single chokepoint that makes activation capture work for
+    // every arch that routes its linears through `weight_gemv` (qwen2,
+    // gemma3, minimax dense, qwen35 dense) — not just qwen35's fused kernels.
+    gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
     let ctx = DispatchCtx::new(gpu);
     let wr = WeightRef {
         buf: &w.buf,
@@ -537,6 +546,11 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
         // Weight buffer holds [packed nibbles | per-group f32 scales]; the scale
         // pointer is a sub_offset view (see the qt=32 loader arm).
         DType::Oq4G256 => {
+            // OQ4+ decode (B=1), mq4-style W4A16: FWHT-rotate the activation, then
+            // consume the f32 rotated activation DIRECTLY in gemv_oq4_grouped
+            // (4-bit-resident weight unpacked inline). No quantize_act_oq4 launch
+            // and no WMMA N-tile waste; reads half the bytes of OQ8+. The iu4 WMMA
+            // GEMM stays the batched-prefill path. Matches execute_steps decode.
             const GROUP: usize = 256;
             assert_eq!(w.k % GROUP, 0, "Oq4G256 weight_gemv: K must be % 256");
             let ng = w.k / GROUP;
@@ -544,24 +558,9 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
             gpu.ensure_oq4_scratch()?;
             let xr = xr!();
             rotate_x_mq_for(gpu, w, x, &xr, w.k)?;
-            // Persistent int4 activation scratch (B=1) — aliased, NOT per-call
-            // alloc, so the forward stays hipGraph-capture-clean (no hipMalloc/Free
-            // inside the captured region). quantize_act_oq4 fully overwrites xq/xs;
-            // stream-ordered reuse across sequential projections is safe.
-            let xq = GpuTensor {
-                buf: unsafe { gpu.oq4_xq.as_ref().unwrap().buf.alias() },
-                shape: vec![w.k / 2],
-                dtype: DType::Raw,
-            };
-            let xs = GpuTensor {
-                buf: unsafe { gpu.oq4_xs.as_ref().unwrap().buf.alias() },
-                shape: vec![ng],
-                dtype: DType::F32,
-            };
-            gpu.quantize_act_oq4(&xr, &xq, &xs, 1, w.k, GROUP)?;
             // Weight scales view: byte offset M*(K/2) into the combined buffer.
             let ws = w.buf.sub_offset(w.m * (w.k / 2), w.m * ng * 4);
-            gpu.gemm_oq4_grouped_wmma(&w.buf, &ws, &xq, &xs, y, w.m, w.k, 1, GROUP)
+            gpu.gemv_oq4_grouped(&w.buf, &ws, &xr, y, w.m, w.k, GROUP)
         }
         // W8A8 reference (decode = B=1): reuse the weight_gemm path. buf =
         // [M*K int8 | M f32]. Per-vector int8 act-quant, iu8 WMMA (B=1), rowcol dequant.
@@ -593,18 +592,19 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
         // dispatch_ref → run_auto → GemvOq8G256Prerotated in the gemv registry;
         // generate and other direct weight_gemv callers hit this arm.
         DType::Oq8G256 => {
+            // B=1 decode GEMV, mq4-style: FWHT-rotate the activation, then consume
+            // the f32 rotated activation DIRECTLY in gemv_oq8_grouped (int8 weight
+            // dequantized inline — W4A16 decode). No quantize_act_oq8 launch and no
+            // WMMA N-tile waste; matches the execute_steps fused-decode path.
             const GROUP: usize = 256;
             assert_eq!(w.k % GROUP, 0, "Oq8G256 weight_gemv: K must be % 256");
             let ng = w.k / GROUP;
             gpu.ensure_mq_signs()?;
-            gpu.ensure_oq4_scratch()?;
+            gpu.ensure_oq4_scratch()?; // oq4_xr = rotate target
             let xr = xr!();
             rotate_x_mq_for(gpu, w, x, &xr, w.k)?;
-            let xq = gpu.alloc_tensor(&[w.k], DType::Raw)?;
-            let xs = gpu.alloc_tensor(&[ng], DType::F32)?;
-            gpu.quantize_act_oq8(&xr, &xq, &xs, 1, w.k, GROUP)?;
             let ws = w.buf.sub_offset(w.m * w.k, w.m * ng * 4);
-            gpu.gemm_oq8_grouped_wmma(&w.buf, &ws, &xq, &xs, y, w.m, w.k, 1, GROUP)
+            gpu.gemv_oq8_grouped(&w.buf, &ws, &xr, y, w.m, w.k, GROUP)
         }
         // All other FWHT-requiring dtypes (MQ4G256, MQ6G256, MQ3G256, MQ2G256,
         // MQ2G256Lloyd, MQ3G256Lloyd, MQ4G256Lloyd, MFP4G32):

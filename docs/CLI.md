@@ -11,6 +11,7 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire eval`↴](#hipfire-eval)
 * [`hipfire host-profile`↴](#hipfire-host-profile)
 * [`hipfire collect-artifacts`↴](#hipfire-collect-artifacts)
+* [`hipfire repack`↴](#hipfire-repack)
 * [`hipfire lock`↴](#hipfire-lock)
 * [`hipfire lock acquire`↴](#hipfire-lock-acquire)
 * [`hipfire lock release`↴](#hipfire-lock-release)
@@ -41,6 +42,7 @@ hipfire LLM inference CLI
 * `eval` — Run the quant admission/model evaluation harness
 * `host-profile` — Measure host, GPU-copy, and model storage bandwidth
 * `collect-artifacts` — Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one model load
+* `repack` — Reshuffle a canonical .hfq into an arch-optimal layout (<model>.<arch>.hfq)
 * `lock` — GPU resource lock for multi-agent coordination (acquire/release/status)
 * `admin` — Query the running hipfire admin API for scripts and agents
 
@@ -121,6 +123,18 @@ Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one m
 ###### **Arguments:**
 
 * `<ARGS>` — Arguments forwarded to the collect_artifacts runner
+
+
+
+## `hipfire repack`
+
+Reshuffle a canonical .hfq into an arch-optimal layout (<model>.<arch>.hfq)
+
+**Usage:** `hipfire repack [ARGS]...`
+
+###### **Arguments:**
+
+* `<ARGS>` — Arguments forwarded to the oq4_repack runner
 
 
 

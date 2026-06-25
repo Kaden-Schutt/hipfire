@@ -567,6 +567,9 @@ pub(crate) fn result_cache_prompt_paths(battery: BatteryId) -> Vec<&'static str>
             vec!["benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt"]
         }
         BatteryId::Vision => vec!["benchmarks/prompts/vision_describe_image.txt"],
+        // TinyQuant has no committed prompt — its inputs are the seeded presets +
+        // the baselines file, not a corpus.
+        BatteryId::TinyQuant => Vec::new(),
         BatteryId::Barrage | BatteryId::Cask => Vec::new(),
     }
 }
@@ -622,14 +625,23 @@ pub(crate) fn run_battery(
     ctx: &EvalContext,
     datasets: &[DatasetManifestEntry],
 ) -> Vec<EvalResult> {
+    if battery == BatteryId::TinyQuant {
+        // Self-contained pipeline (emit → quantize → collect → KLD), driven by
+        // the `hipfire-quantize` + `tiny_quant_probe` binaries regardless of the
+        // `--executor` mode. Not a daemon/prompt battery, so it bypasses the
+        // executor cascade entirely.
+        return tiny_quant_rows(config, ctx);
+    }
     if battery == BatteryId::Quality {
         if let Some(rows) = quality_json_rows(config, ctx) {
             return rows;
         }
-        if config.executor != EvalExecutorMode::Mock {
-            if let Some(rows) = kld_reference_rows(config, ctx) {
-                return rows;
-            }
+        // Daemon-resident KLD scoring is the ONLY model-backed Quality path: one
+        // resident forward + the shared hipfire-kld core. The standalone eval_hipfire
+        // example (and the cross-engine HFKLDR `.kldref.bin` it read) has been
+        // removed. Mock falls through to mock rows.
+        if !matches!(config.executor, EvalExecutorMode::Mock) {
+            return run_daemon_quality_rows(config, ctx);
         }
     }
     if battery == BatteryId::Speed {
@@ -874,5 +886,7 @@ pub(crate) fn run_battery(
                 None,
             )]
         }
+        // TinyQuant early-returns at the top of `run_battery`; never reaches here.
+        BatteryId::TinyQuant => tiny_quant_rows(config, ctx),
     }
 }

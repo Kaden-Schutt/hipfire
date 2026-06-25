@@ -1333,6 +1333,225 @@ impl Gpu {
             )
         }
     }
+
+    /// OQ4+ batched prefill: W4A16 grouped GEMM. `x_f32` is the f32
+    /// FWHT(+AWQ)-rotated activation batch [B,K]; it is converted to f16 once
+    /// and the 4-bit-resident weight is dequantized to f16 inline.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq4_grouped_f16_wmma(
+        &mut self,
+        w_i4: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(group, 256, "gemm_oq4_grouped_f16_wmma: group must be 256");
+        assert_eq!(
+            k % group,
+            0,
+            "gemm_oq4_grouped_f16_wmma: K must be a multiple of group"
+        );
+        self.ensure_kernel(
+            "gemm_oq4_grouped_f16_wmma",
+            kernels::GEMM_OQ4_GROUPED_F16_WMMA_SRC,
+            "gemm_oq4_grouped_f16_wmma",
+        )?;
+        let x_fp16 = self.ensure_fp16_x(x_f32, batch_size * k)?;
+        let wp = w_i4.buf.as_ptr();
+        let mut xp = x_fp16;
+        let yp = y_f32.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        let grid_x = m.div_ceil(16) as u32;
+        let grid_y = batch_size.div_ceil(16) as u32;
+        let func = &self.functions["gemm_oq4_grouped_f16_wmma"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_x, grid_y, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// OQ4+ MMQ batched GEMM. Quantizes the f32 activation to block_q8_1 once,
+    /// then uses int8 WMMA over the 4-bit-resident weight. `add=false` writes
+    /// `Y = W*x`; `add=true` accumulates `Y += W*x`.
+    pub fn gemm_oq4_residual_mmq(
+        &mut self,
+        w_combined: &GpuTensor,
+        x_f32: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let x_q8_ptr = self.ensure_q8_1_mmq_x(x_f32, n, k)?;
+        self.gemm_oq4_mmq_launch(w_combined, x_q8_ptr, y, m, k, n, add)
+    }
+
+    /// OQ4+ MMQ GEMM over a pre-quantized q8_1 activation pointer.
+    pub fn gemm_oq4_mmq_launch(
+        &mut self,
+        w_combined: &GpuTensor,
+        x_q8_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let kernel_name = if m % 128 == 0 && n % 128 == 0 {
+            if add {
+                "gemm_oq4_residual_mmq_full_add"
+            } else {
+                "gemm_oq4_residual_mmq_full_set"
+            }
+        } else {
+            "gemm_oq4_residual_mmq"
+        };
+        self.ensure_kernel(
+            "gemm_oq4_residual_mmq",
+            kernels::GEMM_OQ4_RESIDUAL_MMQ_SRC,
+            kernel_name,
+        )?;
+        let a_ptr = w_combined.buf.as_ptr();
+        let mut xq_ptr = x_q8_ptr;
+        let y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = n as i32;
+        let mut add_val = if add { 1i32 } else { 0i32 };
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut add_val as *mut _ as *mut c_void,
+        ];
+        const MMQ_X: usize = 128;
+        const MMQ_Y: usize = 128;
+        const MMQ_TILE_Y_K: usize = 36;
+        const MMQ_TILE_X_K: usize = 76;
+        let row_tiles = m.div_ceil(MMQ_Y);
+        let batch_tiles = n.div_ceil(MMQ_X);
+        let shared_mem =
+            ((MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * std::mem::size_of::<i32>()) as u32;
+        self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 8, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(add_val);
+                b
+            },
+        )
+    }
+
+    /// OQ4+ MMQ 4-way QKVZA prefill: quantize once, then one MMQ GEMM per
+    /// projection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq4_qkvza_mmq(
+        &mut self,
+        w_qkv: &GpuTensor,
+        w_z: &GpuTensor,
+        w_beta: &GpuTensor,
+        w_alpha: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        let xq = self.ensure_q8_1_mmq_x(x_f32, n, k)?;
+        self.gemm_oq4_mmq_launch(w_qkv, xq, y_qkv, qkv_m, k, n, false)?;
+        self.gemm_oq4_mmq_launch(w_z, xq, y_z, z_m, k, n, false)?;
+        self.gemm_oq4_mmq_launch(w_beta, xq, y_beta, beta_m, k, n, false)?;
+        self.gemm_oq4_mmq_launch(w_alpha, xq, y_alpha, alpha_m, k, n, false)
+    }
+
+    /// OQ4+ MMQ 2-way gate+up prefill: quantize once, then one MMQ GEMM per
+    /// projection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq4_gate_up_mmq(
+        &mut self,
+        w_gate: &GpuTensor,
+        w_up: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        let xq = self.ensure_q8_1_mmq_x(x_f32, n, k)?;
+        self.gemm_oq4_mmq_launch(w_gate, xq, y_gate, gate_m, k, n, false)?;
+        self.gemm_oq4_mmq_launch(w_up, xq, y_up, up_m, k, n, false)
+    }
+
+    /// OQ4+ MMQ 3-way QKV prefill: quantize once, then one MMQ GEMM per
+    /// projection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq4_qkv_mmq(
+        &mut self,
+        w_q: &GpuTensor,
+        w_k: &GpuTensor,
+        w_v: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_q: &GpuTensor,
+        y_k: &GpuTensor,
+        y_v: &GpuTensor,
+        q_m: usize,
+        k_m: usize,
+        v_m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        let xq = self.ensure_q8_1_mmq_x(x_f32, n, k)?;
+        self.gemm_oq4_mmq_launch(w_q, xq, y_q, q_m, k, n, false)?;
+        self.gemm_oq4_mmq_launch(w_k, xq, y_k, k_m, k, n, false)?;
+        self.gemm_oq4_mmq_launch(w_v, xq, y_v, v_m, k, n, false)
+    }
+
     /// MQ2-Lloyd grouped GEMM (F16 WMMA k2). DeepSeek V4 port of the HFQ4 grouped
     /// pattern. Same scatter pipeline + kernarg layout as
     /// `gemm_hfq4g256_moe_grouped_wmma_k2`; the kernel decodes MQ2-Lloyd's

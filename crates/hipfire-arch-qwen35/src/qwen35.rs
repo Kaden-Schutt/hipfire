@@ -2431,6 +2431,69 @@ fn load_bf16_matrix_weight(gpu: &Gpu, data: &[u8], m: usize, k: usize) -> HipRes
 
 /// Load weight tensor from raw bytes + quant_type (no name lookup needed).
 ///
+/// On-disk quant_type for the arch-packed OQ4 layout produced by the
+/// `oq4_repack` tool. The canonical/general OQ4 form is quant_type 34
+/// (`[f16 scale][128 nibbles]`/group, portable across every arch); 37 means the
+/// tensor data is ALREADY the arch combined device layout from
+/// [`oq4_pack_arch_combined`], so the loader uploads it verbatim with no
+/// transform. The quant_type code IS the layout version: any future change to
+/// the combined layout takes a NEW code, so a stale arch-packed artifact refuses
+/// via the loader's catch-all (honest capability gap) instead of reading as
+/// garbage. The decoded `WeightTensor` is identical to the qt=34 path
+/// (`DType::Oq4G256`) — only the on-disk parse differs.
+pub const OQ4_ARCH_PACKED_QT: u8 = 37;
+
+/// Byte length of the OQ4 arch combined device layout for an `[m, k]` matrix:
+/// `[split nibbles m*(k/2)] [split f32 scales m*ng] [interleaved m*ng*132]`.
+pub fn oq4_arch_combined_len(m: usize, k: usize) -> usize {
+    let ng = k / 256;
+    m * (k / 2) + m * ng * 4 + m * ng * (4 + 128)
+}
+
+/// Repack canonical on-disk OQ4 (quant_type 34: `[f16 scale][128 nibbles]` per
+/// 256-group, row-contiguous) into the arch combined device layout uploaded by
+/// the loader. This is the SINGLE source of truth for that transform — both the
+/// qt=34 load path and the `oq4_repack` tool call it, so they cannot drift.
+///
+/// Output layout (`[m, k]`, `ng = k/256`):
+///   `[split nibbles m*(k/2)]` — for prefill MMQ/f16 (`sub_offset 0`)
+///   `[split f32 scales m*ng]` — prefill weight-scale region
+///   `[interleaved m*ng*132]`  — decode GEMVs: per group `[f32 scale][128 nibbles]`
+///                               contiguous → one coalesced stream (mq4-style).
+pub fn oq4_pack_arch_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
+    const GROUP: usize = 256;
+    const BLOCK: usize = 130; // 2 (f16 scale) + 128 nibbles
+    const ILB: usize = 4 + 128; // [f32 scale][128 nibbles]
+    assert_eq!(k % GROUP, 0, "OQ4G256 requires K % 256 == 0 (got K={k})");
+    let ng = k / GROUP;
+    let packed_bytes = m * (k / 2);
+    let scales_bytes = m * ng * 4;
+    let il_bytes = m * ng * ILB;
+    let expect = m * ng * BLOCK;
+    assert_eq!(
+        data.len(),
+        expect,
+        "OQ4G256 weight byte length {} != M*ng*130 = {expect} (M={m} K={k})",
+        data.len()
+    );
+    let mut combined = vec![0u8; packed_bytes + scales_bytes + il_bytes];
+    let il_base = packed_bytes + scales_bytes;
+    for r in 0..m {
+        for g in 0..ng {
+            let src = (r * ng + g) * BLOCK;
+            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+            let dst = r * (k / 2) + g * (GROUP / 2);
+            combined[dst..dst + 128].copy_from_slice(&data[src + 2..src + BLOCK]);
+            let so = packed_bytes + (r * ng + g) * 4;
+            combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
+            let io = il_base + (r * ng + g) * ILB;
+            combined[io..io + 4].copy_from_slice(&scale.to_le_bytes());
+            combined[io + 4..io + ILB].copy_from_slice(&data[src + 2..src + BLOCK]);
+        }
+    }
+    combined
+}
+
 /// TODO(transformer-extraction): cross-arch duplicate. The Qwen2 variant
 /// in `hipfire-arch-qwen2::qwen2::load_weight_tensor` inlines a subset
 /// of this match (only HFQ4G256, HFQ4G128, F16 — the formats Qwen2 HFQ
@@ -2866,31 +2929,40 @@ fn load_weight_tensor_raw(
             // weights are already FWHT-rotated offline, so the forward FWHT-rotates
             // x to match (shared mq_rotate_x path). AWQ smooth, when present, is
             // applied to x by the wrapper via the awq_scale sidecar.
-            const GROUP: usize = 256;
-            const BLOCK: usize = 130; // 2 (f16 scale) + 128 nibbles
-            assert_eq!(k % GROUP, 0, "OQ4G256 requires K % 256 == 0 (got K={k})");
-            let ng = k / GROUP;
-            let packed_bytes = m * (k / 2);
-            let scales_bytes = m * ng * 4;
-            let expect = m * ng * BLOCK;
+            // Repack the canonical on-disk form to the arch combined device
+            // layout (see `oq4_pack_arch_combined` for the layout doc). The
+            // `oq4_repack` tool can do this transform ahead-of-time and store it
+            // as quant_type 37 (uploaded verbatim below) — same bytes, no per-load
+            // repack. Prefill (MMQ/f16) reads the split region (sub_offset 0);
+            // decode GEMVs read the interleaved region. The +~0.25 GB dual-layout
+            // is the cost while decode is migrated; collapse to interleaved-only
+            // once prefill is moved too. See gemv_oq4_interleaved.
+            let combined = oq4_pack_arch_combined(data, m, k);
+            let buf = gpu.upload_raw(&combined, &[combined.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::Oq4G256,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        37 => {
+            // Arch-packed OQ4 (`oq4_repack` output): the on-disk data IS the arch
+            // combined device layout already, so upload it verbatim — no per-load
+            // transform. Byte-identical to the qt=34 result; the quant_type code
+            // is the layout version (a future layout change takes a new code, so a
+            // stale artifact refuses via the catch-all rather than reading garbage).
+            let expect = oq4_arch_combined_len(m, k);
             assert_eq!(
                 data.len(),
                 expect,
-                "OQ4G256 weight byte length {} != M*ng*130 = {expect} (M={m} K={k})",
+                "OQ4 arch-packed byte length {} != combined len {expect} (M={m} K={k})",
                 data.len()
             );
-            let mut combined = vec![0u8; packed_bytes + scales_bytes];
-            for r in 0..m {
-                for g in 0..ng {
-                    let src = (r * ng + g) * BLOCK;
-                    let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
-                    let dst = r * (k / 2) + g * (GROUP / 2);
-                    combined[dst..dst + 128].copy_from_slice(&data[src + 2..src + BLOCK]);
-                    let so = packed_bytes + (r * ng + g) * 4;
-                    combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
-                }
-            }
-            let buf = gpu.upload_raw(&combined, &[combined.len()])?;
+            let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::Oq4G256,
@@ -8707,7 +8779,19 @@ fn moe_ffn_decode_impl(
             // Per-expert fallback for layers that aren't all-MQ4 or have k != 8.
             for (&expert_idx, &weight) in topk_indices.iter().zip(topk_weights.iter()) {
                 let expert = &ffn.experts[expert_idx];
-                if let Some(xr) = x_rot_local {
+                // The MQ4 pre-rotated GEMV is an MQ4G256-ONLY dequant kernel
+                // (136 B/group). `x_rot_local` is `Some` for *any* rotated
+                // gate_up dtype (`needs_x_rot_local` includes MQ6/mq2-lloyd/paro),
+                // so gating the pre-rotated call on `x_rot_local.is_some()` fed
+                // MQ6G256 gate_up (200 B/group — what `--format mq4`/`mq6` tier
+                // routed experts to) through the MQ4 kernel → misread groups →
+                // NaN logits (the cross-arch qwen3.5-MoE mq4/mq6 NaN). Use the
+                // pre-rotated fast path ONLY for genuine MQ4 gate_up; every other
+                // dtype goes through `weight_gemv`, which dispatches the correct
+                // per-dtype dequant (and applies its own rotation internally).
+                if routed_gate_up_mq4 {
+                    let xr = x_rot_local
+                        .expect("routed_gate_up_mq4 ⇒ needs_x_rot_local ⇒ x_rot_local is Some");
                     gpu.gemv_mq4g256_prerotated(
                         &expert.gate_up.buf,
                         xr,
@@ -9462,6 +9546,11 @@ pub fn forward_scratch(
     // launch-overhead-bound, so eliminating per-launch cost nets ~0 (40.6 vs
     // 41.5 tok/s). Not worth the capture complexity. See
     // project_gfx1103_decode_memcpy_bound memory.
+    // AR-forward hipGraph remains hard-disabled. A 2026-06-25 chaingun merge
+    // smoke on gfx1151 showed HIPFIRE_GRAPH=1 regressed qwen3.5-4b mq4 decode
+    // from the 65.5 tok/s floor to ~54-56 tok/s, while direct mode still passes
+    // the speed gate. Keep the env parser/reporting wired above, but do not use
+    // it to enable AR graph execution until capture/replay is re-qualified.
     let use_graph = false;
     let _ = (graph_enabled, allow_moe, gpu.ar_forward_replay_enabled); // suppress unused warnings
 
@@ -14278,6 +14367,12 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
     // coherence-first rule we do NOT enable a path that degrades output by
     // default; the wiring ships behind this flag for continued root-causing.
     // Decode is unaffected (always per-token oq4, known-good).
+    // OQ4+ batched prefill is now the divergence-free W4A16 path (dequant 4-bit
+    // weight to f16, f16×f16 WMMA, no int4 act-quant) — coherent like mq4, so it
+    // is ON BY DEFAULT for gfx11+ (no longer gated behind HIPFIRE_OQ4_BATCHED_
+    // PREFILL). The old gate existed because the W4A4 int4-act batched path
+    // diverged (flipped greedy argmax); that path is retired for OQ4+ prefill.
+    // Opt OUT with HIPFIRE_OQ4_BATCHED_PREFILL=0 (falls back to per-token prefill).
     let oq4_with_wmma = matches!(dt, DType::Oq4G256)
         && matches!(
             arch,
@@ -14291,7 +14386,7 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
                 | "gfx1200"
                 | "gfx1201"
         )
-        && std::env::var("HIPFIRE_OQ4_BATCHED_PREFILL").as_deref() == Ok("1");
+        && std::env::var("HIPFIRE_OQ4_BATCHED_PREFILL").as_deref() != Ok("0");
 
     // Lloyd-MQ3 (MQ3G256Lloyd) on gfx11: Phase 5 of issue #116 ships the
     // gemm_*_mq3g256_lloyd_wmma family alongside the existing HFQ3 WMMA
@@ -16879,6 +16974,53 @@ fn dump_hidden_localize(
         Ok(p) => p,
         Err(_) => return,
     };
+    use std::io::Write;
+    let path = format!("{prefix}.{tag}");
+    // Activation-capture mode (HIPFIRE_DUMP_HIDDEN_ALL=1): dump EVERY row of `x`
+    // as raw [dim] f32 each (no per-row header) — so one prefill yields n_rows
+    // real-activation samples for an offline rotation/quant study, AND a per-token
+    // decode appends its single row each call → the file accumulates the whole
+    // sequence. This mode IGNORES the single-position POS gate (which only makes
+    // sense for the localize path below); it must fire at every position.
+    if std::env::var("HIPFIRE_DUMP_HIDDEN_ALL").as_deref() == Ok("1") {
+        // Two sub-modes:
+        //  - default: restrict to one target layer (HIPFIRE_DUMP_HIDDEN_LAYER,
+        //    default 0), one file `{prefix}.{tag}` (the kv-compression study path).
+        //  - HIPFIRE_DUMP_HIDDEN_ALLLAYERS=1: capture EVERY layer to per-layer
+        //    files `{prefix}.{tag}.L{layer_idx}` — the Phase-A block-local
+        //    recovery capture (residual-stream in/mid/out for all blocks).
+        let all_layers = std::env::var("HIPFIRE_DUMP_HIDDEN_ALLLAYERS").as_deref() == Ok("1");
+        let layer_path = if all_layers {
+            format!("{path}.L{layer_idx}")
+        } else {
+            let want_layer: usize = std::env::var("HIPFIRE_DUMP_HIDDEN_LAYER")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            if layer_idx != want_layer {
+                return;
+            }
+            path.clone()
+        };
+        if gpu.hip.device_synchronize().is_err() {
+            return;
+        }
+        let all = match gpu.download_f32(x) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&layer_path)
+        {
+            let take = (n_rows * dim).min(all.len());
+            let bytes: Vec<u8> = all[..take].iter().flat_map(|v| v.to_le_bytes()).collect();
+            let _ = f.write_all(&bytes);
+        }
+        return;
+    }
+    // Single-position localize path (PARO batched-vs-pertoken diff).
     let target: usize = std::env::var("HIPFIRE_DUMP_HIDDEN_POS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -16897,31 +17039,6 @@ fn dump_hidden_localize(
         Ok(v) => v,
         Err(_) => return,
     };
-    use std::io::Write;
-    let path = format!("{prefix}.{tag}");
-    // Activation-capture mode (HIPFIRE_DUMP_HIDDEN_ALL=1): dump EVERY row for a
-    // single target layer (HIPFIRE_DUMP_HIDDEN_LAYER) as raw [dim] f32 each — no
-    // per-row header — so one prefill yields n_rows real-activation samples for an
-    // offline rotation/quant study. Otherwise the original single-position localize.
-    if std::env::var("HIPFIRE_DUMP_HIDDEN_ALL").as_deref() == Ok("1") {
-        let want_layer: usize = std::env::var("HIPFIRE_DUMP_HIDDEN_LAYER")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        if layer_idx != want_layer {
-            return;
-        }
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            let take = (n_rows * dim).min(all.len());
-            let bytes: Vec<u8> = all[..take].iter().flat_map(|v| v.to_le_bytes()).collect();
-            let _ = f.write_all(&bytes);
-        }
-        return;
-    }
     let off = row * dim;
     if off + dim > all.len() {
         return;
@@ -18996,39 +19113,56 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if qkv_is_oq4 && qkv_same_dtype {
-                    // Opus W4A4: no fused 3-way oq4 QKV kernel — int4-quantize the
-                    // shared FWHT(+AWQ)-rotated activation and run the grouped-WMMA
-                    // GEMM per projection (q/k/v). The quantize is re-run per call
-                    // (cheap vs the GEMM); all three read the same x_rot_batch.
+                    // OQ4+ batched prefill FA QKV: int8-WMMA MMQ (n>=64) quantizing
+                    // the shared FWHT(+AWQ)-rotated activation to q8_1 ONCE across
+                    // q/k/v; gemm_oq4_qkv_mmq falls back to the f16 grouped path for
+                    // tiny batches internally via gemm_oq4_grouped_act_batched.
                     debug_assert!(
                         matches!(layer.wk.gpu_dtype, DType::Oq4G256)
                             && matches!(layer.wv.gpu_dtype, DType::Oq4G256),
                         "FA qkv Oq4 dispatch requires all of wq/wk/wv to be Oq4G256",
                     );
-                    gpu.gemm_oq4_grouped_act_batched(
-                        &layer.wq.buf,
-                        &pbs.x_rot_batch,
-                        &pbs.fa_q_full_batch,
-                        layer.wq.m,
-                        layer.wq.k,
-                        n,
-                    )?;
-                    gpu.gemm_oq4_grouped_act_batched(
-                        &layer.wk.buf,
-                        &pbs.x_rot_batch,
-                        &pbs.fa_k_batch,
-                        layer.wk.m,
-                        layer.wk.k,
-                        n,
-                    )?;
-                    gpu.gemm_oq4_grouped_act_batched(
-                        &layer.wv.buf,
-                        &pbs.x_rot_batch,
-                        &pbs.fa_v_batch,
-                        layer.wv.m,
-                        layer.wv.k,
-                        n,
-                    )?;
+                    if n >= 64 {
+                        gpu.gemm_oq4_qkv_mmq(
+                            &layer.wq.buf,
+                            &layer.wk.buf,
+                            &layer.wv.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.fa_q_full_batch,
+                            &pbs.fa_k_batch,
+                            &pbs.fa_v_batch,
+                            layer.wq.m,
+                            layer.wk.m,
+                            layer.wv.m,
+                            layer.wq.k,
+                            n,
+                        )?;
+                    } else {
+                        gpu.gemm_oq4_grouped_act_batched(
+                            &layer.wq.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.fa_q_full_batch,
+                            layer.wq.m,
+                            layer.wq.k,
+                            n,
+                        )?;
+                        gpu.gemm_oq4_grouped_act_batched(
+                            &layer.wk.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.fa_k_batch,
+                            layer.wk.m,
+                            layer.wk.k,
+                            n,
+                        )?;
+                        gpu.gemm_oq4_grouped_act_batched(
+                            &layer.wv.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.fa_v_batch,
+                            layer.wv.m,
+                            layer.wv.k,
+                            n,
+                        )?;
+                    }
                 } else if qkv_is_q8 && q8_wmma_arch && qkv_same_dtype {
                     debug_assert!(
                         matches!(layer.wk.gpu_dtype, DType::Q8_0)
@@ -23388,8 +23522,9 @@ fn forward_scratch_layers(
     let _qkv_dim = k_dim * 2 + v_dim;
     // #397 Ship 6 — forward-as-pipeline. When HIPFIRE_FORWARD_LOWERED=1, route
     // single-GPU decode through the lowered super-op executor. Skipped when a
-    // hidden-state ring buffer is active (spec-decode capture engages only the
-    // hand path for now). Default off → the hand arms below run unchanged.
+    // hidden-state ring buffer or GDN tape capture is active (spec-decode
+    // capture engages only the hand path for now). Default off → the hand arms
+    // below run unchanged.
     // RoughQuant corrections are wired into THIS hand path, but the hand path is
     // currently broken (bf16 self-KLD 13.89 vs lowered 0.000 — see
     // docs/roughquant/phase3-real-format-scope.md). Until it is resurrected OR the
@@ -23399,7 +23534,11 @@ fn forward_scratch_layers(
     // coherent. The correction stack stays as a proven, dormant foundation.
     let rq_hand_optin = !weights.rq_corrections.is_empty()
         && std::env::var("HIPFIRE_RQ_HAND").as_deref() == Ok("1");
-    if forward_lowered_enabled() && hidden_rb.is_none() && !rq_hand_optin {
+    if forward_lowered_enabled()
+        && hidden_rb.is_none()
+        && gdn_tape_capture.is_none()
+        && !rq_hand_optin
+    {
         return forward_scratch_layers_lowered(
             gpu,
             weights,
@@ -23993,6 +24132,11 @@ fn forward_scratch_layers(
                     )?;
                 }
 
+                // Phase-A norm-recovery capture: the FFN-norm INPUT (what gate_up
+                // normalizes). The trainer recomputes the bf16 FFN output from this
+                // (so no FFN-output capture is needed — avoids the attention-residual
+                // contamination that the residual-difference targets had).
+                dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "premlp");
                 // ── FFN ──
                 gate_up_via_execute_steps(
                     gpu,
@@ -25065,6 +25209,9 @@ fn forward_scratch_layers(
                     }
                 }
 
+                // Phase-A block-local recovery capture: pre-MLP residual (x_mid)
+                // for full-attention layers (post-attn residual feeding ffn_norm).
+                dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "premlp");
                 // FFN: fused rmsnorm + rotate for w_gate/w_up.
                 let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu,

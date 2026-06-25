@@ -14,6 +14,12 @@ SEARCH_PATHS=(
     docs
     benchmarks
 )
+EXISTING_SEARCH_PATHS=()
+for path in "${SEARCH_PATHS[@]}"; do
+    if [ -e "$path" ]; then
+        EXISTING_SEARCH_PATHS+=("$path")
+    fi
+done
 
 status=0
 
@@ -22,8 +28,8 @@ if rg -n \
     --glob '!target/**' \
     --glob '!**/*.lock' \
     --glob '!scripts/check-artifact-names.sh' \
-    -- '\.(?:hf|mq|mp)[1-8][A-Za-z0-9-]*(?:\b|[.])|\.hfq-(?:hf|mq)[1-8]|\.q[1-8]\.hfq|[-.]hfq[1-8]\.hfq' \
-    "${SEARCH_PATHS[@]}"; then
+    -- '\.(?:hf|mq)[1-8][A-Za-z0-9-]*(?:\b|[.])|\.hfq-(?:hf|mq)[1-8]|\.q[1-8]\.hfq|[-.]hfq[1-8]\.hfq' \
+    "${EXISTING_SEARCH_PATHS[@]}"; then
     status=1
 fi
 
@@ -33,7 +39,7 @@ if rg -n \
     --glob '!**/*.lock' \
     --glob '!scripts/check-artifact-names.sh' \
     -- '(?:qwen3[._-]?[56]|qwen3[56])-[A-Za-z0-9_.-]+-dflash-(?:hf|mq)[1-8]|dflash-(?:hf|mq)[1-8]' \
-    "${SEARCH_PATHS[@]}"; then
+    "${EXISTING_SEARCH_PATHS[@]}"; then
     status=1
 fi
 

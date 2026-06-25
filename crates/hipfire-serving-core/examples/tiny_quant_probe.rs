@@ -1,0 +1,103 @@
+// SPDX-License-Identifier: Apache-2.0
+// hipfire — tokenizer-free multi-arch tiny-model probe (KLD + calibration).
+//
+// Drives `hipfire_serving_core::tiny_harness` for the `tiny_quant` eval battery
+// and the tiny-quant gate. Two subcommands:
+//
+//   kld     --arch <fam> --ref <bf16.hfq> --cand <quant.hfq> [--len N --warmup W --seed S]
+//           → prints `mean_kld:`, `max_kld:`, `n_scored:`, `finite:` lines.
+//   collect --arch <fam> --model <bf16.hfq> --out <calib.hfq> [--len N --seed S]
+//           → arms the model-agnostic Hessian/imatrix collector, runs the
+//             forward, drains a `.calib.hfq` (HFQM). Prints `n_tensors:`,
+//             `consistency:`, `calib_out:`.
+//
+// Machine-readable `key: value` stdout lines; the battery parses these. A
+// panic / nonzero exit is the hard-fail signal.
+
+use std::path::Path;
+
+use hipfire_serving_core::tiny_harness::{run_collect, run_kld, TinyArch};
+use rdna_compute::Gpu;
+
+fn flag(args: &[String], name: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1).cloned())
+}
+
+fn req(args: &[String], name: &str) -> String {
+    flag(args, name).unwrap_or_else(|| {
+        eprintln!("tiny_quant_probe: missing required flag {name}");
+        std::process::exit(2);
+    })
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let sub = args.first().cloned().unwrap_or_default();
+    let arch = TinyArch::parse(&req(&args, "--arch")).unwrap_or_else(|e| {
+        eprintln!("tiny_quant_probe: {e}");
+        std::process::exit(2);
+    });
+    let len: usize = flag(&args, "--len")
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(24);
+    let seed: u64 = flag(&args, "--seed")
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(42);
+
+    let mut gpu = Gpu::init().expect("GPU init");
+    eprintln!("GPU: {}", gpu.arch);
+
+    match sub.as_str() {
+        "kld" => {
+            let warmup: usize = flag(&args, "--warmup")
+                .map(|s| s.parse().unwrap())
+                .unwrap_or(4);
+            let r = req(&args, "--ref");
+            let c = req(&args, "--cand");
+            let out = run_kld(
+                arch,
+                Path::new(&r),
+                Path::new(&c),
+                &mut gpu,
+                len,
+                warmup,
+                seed,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("tiny_quant_probe kld: {e}");
+                std::process::exit(1);
+            });
+            println!("arch: {}", arch.as_str());
+            println!("mean_kld: {:.8}", out.mean_kld);
+            println!("max_kld: {:.8}", out.max_kld);
+            println!("n_scored: {}", out.n_scored);
+            println!("finite: {}", out.finite);
+        }
+        "collect" => {
+            let model = req(&args, "--model");
+            let out = req(&args, "--out");
+            let r = run_collect(
+                arch,
+                Path::new(&model),
+                Path::new(&out),
+                &mut gpu,
+                len,
+                seed,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("tiny_quant_probe collect: {e}");
+                std::process::exit(1);
+            });
+            println!("arch: {}", arch.as_str());
+            println!("n_tensors: {}", r.n_tensors);
+            println!("consistency: {:.6}", r.consistency);
+            println!("calib_out: {}", r.out_path);
+        }
+        other => {
+            eprintln!("tiny_quant_probe: unknown subcommand {other:?} (kld|collect)");
+            std::process::exit(2);
+        }
+    }
+}

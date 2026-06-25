@@ -810,6 +810,7 @@ impl HipRuntime {
     }
 
     /// Copy bytes between GPU buffers with offsets on both sides.
+    #[track_caller]
     pub fn memcpy_dtod_at(
         &self,
         dst: &DeviceBuffer,
@@ -820,6 +821,7 @@ impl HipRuntime {
     ) -> HipResult<()> {
         assert!(dst_offset + size <= dst.size);
         assert!(src_offset + size <= src.size);
+        let loc = std::panic::Location::caller();
         let dst_ptr = unsafe { (dst.ptr as *mut u8).add(dst_offset) as *mut c_void };
         let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
         let t = std::time::Instant::now();
@@ -827,6 +829,15 @@ impl HipRuntime {
             (self.fn_memcpy)(dst_ptr, src_ptr, size, MemcpyKind::DeviceToDevice as c_uint)
         };
         crate::ffi::launch_counters::memcpy_dtod::record(t.elapsed().as_nanos() as u64);
+        static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *DUMP.get_or_init(|| std::env::var("HIPFIRE_MEMCPY_DUMP").ok().as_deref() == Some("1")) {
+            eprintln!(
+                "memcpy_dtod_at bytes={} at {}:{}",
+                size,
+                loc.file(),
+                loc.line()
+            );
+        }
         self.check(code, "hipMemcpy D2D at offset")
     }
 
@@ -948,6 +959,7 @@ impl HipRuntime {
         self.check(code, "hipMemcpy D2H at offset")
     }
 
+    #[track_caller]
     pub fn memcpy_dtod(
         &self,
         dst: &DeviceBuffer,
@@ -955,6 +967,7 @@ impl HipRuntime {
         size: usize,
     ) -> HipResult<()> {
         assert!(size <= dst.size && size <= src.size);
+        let loc = std::panic::Location::caller();
         let t = std::time::Instant::now();
         let code = unsafe {
             (self.fn_memcpy)(
@@ -965,6 +978,15 @@ impl HipRuntime {
             )
         };
         crate::ffi::launch_counters::memcpy_dtod::record(t.elapsed().as_nanos() as u64);
+        static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *DUMP.get_or_init(|| std::env::var("HIPFIRE_MEMCPY_DUMP").ok().as_deref() == Some("1")) {
+            eprintln!(
+                "memcpy_dtod bytes={} at {}:{}",
+                size,
+                loc.file(),
+                loc.line()
+            );
+        }
         self.check(code, "hipMemcpy D2D")
     }
 

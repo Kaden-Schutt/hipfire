@@ -27,13 +27,14 @@ ok()    { printf "    \033[32m✓\033[0m %s\n" "$*"; }
 die()   { printf "    \033[31m✗\033[0m %s\n" "$*" >&2; exit 1; }
 
 # ── 1. Arch detection ──────────────────────────────────────────────────────
+# eval_hipfire was removed; the daemon reports the GPU arch on its stderr at HIP
+# init (and the model arch in the `loaded` event). rocminfo is the canonical probe.
 phase "1/5  GPU arch + binary sanity"
-if [ ! -x target/release/examples/eval_hipfire ]; then
-    die "eval_hipfire binary missing; run bootstrap first"
-fi
-arch_line=$(./target/release/examples/eval_hipfire --print-arch 2>&1 | head -3 || true)
-echo "$arch_line" | sed 's/^/    /'
-echo "$arch_line" | grep -q "gfx942" || die "expected gfx942 in arch output"
+source "$(dirname "$0")/../scripts/lib/kld_daemon.sh"
+kld_daemon_bin >/dev/null || die "hipfire-daemon missing; run bootstrap first"
+arch_line=$(rocminfo 2>/dev/null | grep -m1 -oE "gfx[0-9a-f]+" || true)
+echo "    gpu arch: $arch_line"
+[ "$arch_line" = "gfx942" ] || die "expected gfx942 (got '${arch_line:-none}')"
 ok "detected arch: gfx942"
 
 # ── 2. Dequant byte-correctness (no kernel dispatch — pure unpack) ─────────
@@ -70,13 +71,14 @@ print(snapshot_download(repo_id='Qwen/Qwen3.5-9B', revision='c202236235762e1c871
 fi
 echo "    using $test_hfq"
 
-# Quick forward + sample
-./target/release/examples/eval_hipfire \
-    --model "$test_hfq" \
-    --prompt "The capital of France is" \
-    --max-tokens 16 \
-    --temperature 0 \
-    2>&1 | tail -20 | tee "$WORK/results/smoke_gen.txt"
+# Quick forward + sample via the daemon generate op (eval_hipfire removed).
+DBIN=$(kld_daemon_bin) || die "hipfire-daemon missing"
+{ printf '{"type":"load","model":"%s","params":{"max_seq":256,"kv_cache":"q8"}}\n' "$test_hfq"
+  printf '{"type":"generate","prompt":"The capital of France is","params":{"max_tokens":16,"temperature":0.0}}\n'
+} | HIPFIRE_RESOURCE_LOCK_WAIT_MS="${HIPFIRE_RESOURCE_LOCK_WAIT_MS:-600000}" "$DBIN" 2>/dev/null \
+    | python3 -c 'import json,sys
+print("".join(json.loads(l).get("text","") for l in sys.stdin if l.strip() and json.loads(l).get("type")=="token"))' \
+    | tee "$WORK/results/smoke_gen.txt"
 grep -qE "[A-Za-z]" "$WORK/results/smoke_gen.txt" || die "no alphabetic output in generation"
 grep -qE "Paris|france|capital" -i "$WORK/results/smoke_gen.txt" \
     && ok "model emitted on-topic continuation" \

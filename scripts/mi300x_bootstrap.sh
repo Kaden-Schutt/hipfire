@@ -154,11 +154,11 @@ sh -c '
     cargo build --release -p hipfire-quantize &&
     cargo build --release --features deltanet -p hipfire-daemon --bin hipfire-daemon &&
     cargo build --release --features deltanet -p hipfire-runtime \
-        --example eval_hipfire \
         --example coherence_probe
 ' 2>&1 | tail -20
+# KLD scoring + arch/generation smoke now drive hipfire-daemon (the eval_hipfire
+# example and the cross-engine `.kldref.bin` format have been removed).
 for b in target/release/hipfire-quantize \
-         target/release/examples/eval_hipfire \
          target/release/examples/coherence_probe \
          target/release/hipfire-daemon; do
     [ -x "$b" ] || die "missing binary: $b"

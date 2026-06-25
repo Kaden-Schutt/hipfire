@@ -4,10 +4,14 @@
 
 //! Async daemon JSONL process adapter.
 
+/// Re-exported so resource-lock status consumers (admin API, TUI) can match the
+/// live flock state without a direct `hipfire-lock` dependency.
+pub use hipfire_lock::LockState;
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::future::BoxFuture;
 use hipfire_daemon_protocol::{
@@ -512,14 +516,12 @@ fn repo_root() -> Option<PathBuf> {
     }
 }
 
+/// Held leases for the resources this daemon acquired. Each guard keeps
+/// `flock(2)` on its per-resource lockfile; dropping the lease closes the fds,
+/// which the kernel releases automatically.
 #[derive(Debug)]
-/// Held leases for the resources this daemon acquired. Each is a
-/// [`hipfire_lock::FlockGuard`] keeping `flock(2)` on its per-resource lockfile;
-/// dropping the lease closes the fds, which the kernel releases automatically —
-/// so a crashed daemon never strands a lock (no pid-liveness reclamation hack
-/// needed, unlike the former `create_dir`-as-mutex scheme).
 pub struct ResourceLease {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // held purely for its Drop (releases the flocks)
     guards: Vec<hipfire_lock::FlockGuard>,
 }
 
@@ -669,24 +671,6 @@ pub fn resource_lock_requests() -> Result<Vec<String>, String> {
     Ok(resources)
 }
 
-/// One-line holder string written into a resource lockfile by the holder, for
-/// the status readers (`/admin`, TUI) and the "already locked by …" error.
-fn lock_holder_line(resource: &str) -> String {
-    let command = std::env::args().collect::<Vec<_>>().join(" ");
-    let started_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    format!(
-        "pid={} host={} resource={} started_ms={} cmd={}",
-        std::process::id(),
-        current_hostname(),
-        resource,
-        started_ms,
-        command,
-    )
-}
-
 fn current_hostname() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .or_else(|_| std::fs::read_to_string("/etc/hostname"))
@@ -696,22 +680,67 @@ fn current_hostname() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Acquire `flock(2)` on the per-resource lockfile under `root` (e.g.
-/// `root/hip-gpu-0.lock`). On success returns the held [`FlockGuard`] (caller
-/// keeps it alive to hold the lease); on contention returns the current holder
-/// line. No pid-liveness reclamation is needed — the kernel releases `flock`
-/// when the holder's fd closes (process exit/crash), so a stale file never
-/// blocks acquisition.
+fn resource_lock_path_at(root: &Path, resource: &str) -> PathBuf {
+    root.join(format!("{resource}.lock"))
+}
+
+/// Holder line written into a lease lockfile under the held flock.
+fn lease_holder_line(resource: &str) -> String {
+    format!(
+        "daemon resource={resource} pid={} host={} acquired_epoch={}",
+        std::process::id(),
+        current_hostname(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+}
+
+/// Probe every resource lease lockfile and report (name, path, live flock state).
+/// Enumerates the canonical GPU lock plus any per-resource flock files under
+/// `root`, so the report reflects what is actually held right now.
+pub fn resource_lock_report(root: &Path) -> Vec<(String, PathBuf, hipfire_lock::LockState)> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    let gpu = hipfire_lock::gpu_resource_lock_path();
+    if gpu.exists() {
+        let st = hipfire_lock::probe(&gpu).unwrap_or(hipfire_lock::LockState::Free);
+        seen.insert(gpu.clone());
+        out.push(("hip-gpu-0".to_string(), gpu, st));
+    }
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_file()
+                && p.extension().and_then(|x| x.to_str()) == Some("lock")
+                && seen.insert(p.clone())
+            {
+                let name = p
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let st = hipfire_lock::probe(&p).unwrap_or(hipfire_lock::LockState::Free);
+                out.push((name, p, st));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Acquire `flock(2)` on the per-resource lockfile under `root`. The returned
+/// guard must stay alive for the lease lifetime.
 pub fn try_acquire_resource_lock(
     root: &Path,
     resource: &str,
 ) -> Result<hipfire_lock::FlockGuard, String> {
-    let path = root.join(format!("{resource}.lock"));
+    let path = resource_lock_path_at(root, resource);
     let mut guard = hipfire_lock::FlockGuard::open(&path)
         .map_err(|e| format!("open {}: {e}", path.display()))?;
     match guard.try_lock() {
         Ok(true) => {
-            let _ = guard.write_holder(&lock_holder_line(resource));
+            let _ = guard.write_holder(&lease_holder_line(resource));
             Ok(guard)
         }
         Ok(false) => {
@@ -726,10 +755,8 @@ pub fn try_acquire_resource_lock(
     }
 }
 
-/// Emit a fatal startup error on **both** streams, then exit(1): a structured
-/// `{"type":"error",...}` JSON line on stdout so a JSONL client (e.g. a piped
-/// request stream) sees a real error event instead of just a closed pipe, plus
-/// the human-readable text + optional hint on stderr.
+/// Emit a fatal startup error on both streams: a structured JSONL error on
+/// stdout for daemon clients, plus human-readable text on stderr.
 pub fn fatal_startup_error(message: &str, hint: Option<&str>) -> ! {
     use std::io::Write;
     let event = serde_json::json!({
@@ -772,40 +799,64 @@ pub fn acquire_resource_lease_or_exit() -> ResourceLease {
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .unwrap_or(0);
-    let deadline = Instant::now() + Duration::from_millis(wait_ms);
     // Held guards keep the flock leases alive; dropping the lease releases them
     // (kernel closes the fds). No filesystem cleanup needed.
     let mut guards = Vec::new();
 
     for resource in &resources {
-        loop {
-            match try_acquire_resource_lock(&root, resource) {
-                Ok(guard) => {
-                    guards.push(guard);
-                    break;
-                }
-                Err(_) if wait_ms > 0 && Instant::now() < deadline => {
-                    std::thread::sleep(
-                        Duration::from_millis(250)
-                            .min(deadline.saturating_duration_since(Instant::now())),
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    // Drop already-held guards (releases their flocks) before exit.
-                    drop(guards);
-                    fatal_startup_error(
-                        &e,
-                        Some(
-                            "Set HIPFIRE_RESOURCE_LOCK_WAIT_MS to wait, or HIPFIRE_RESOURCE_LOCK=0 to bypass.",
-                        ),
-                    );
-                }
+        let path = resource_lock_path_at(&root, resource);
+        let mut guard = match hipfire_lock::FlockGuard::open(&path) {
+            Ok(guard) => guard,
+            Err(e) => fatal_startup_error(&format!("open {}: {e}", path.display()), None),
+        };
+        let acquired = if wait_ms > 0 {
+            guard.lock_blocking(
+                Duration::from_millis(250),
+                Some(Duration::from_millis(wait_ms)),
+                |holder| {
+                    let who = if holder.is_empty() {
+                        "another process"
+                    } else {
+                        holder
+                    };
+                    eprintln!("[hipfire] waiting for resource {resource} held by {who}");
+                },
+            )
+        } else {
+            guard.try_lock()
+        };
+        match acquired {
+            Ok(true) => {
+                let _ = guard.write_holder(&lease_holder_line(resource));
+                guards.push(guard);
+            }
+            Ok(false) => {
+                let holder = match hipfire_lock::probe(&path) {
+                    Ok(hipfire_lock::LockState::Busy(holder)) if !holder.is_empty() => holder,
+                    _ => "another process".to_string(),
+                };
+                drop(guards);
+                fatal_startup_error(
+                    &format!(
+                        "hipfire resource {resource} ({}) is locked by {holder}",
+                        path.display()
+                    ),
+                    Some(
+                        "Set HIPFIRE_RESOURCE_LOCK_WAIT_MS to wait, or HIPFIRE_RESOURCE_LOCK=0 to bypass.",
+                    ),
+                );
+            }
+            Err(e) => {
+                drop(guards);
+                fatal_startup_error(
+                    &format!("lock resource {resource} ({}): {e}", path.display()),
+                    None,
+                );
             }
         }
     }
     eprintln!(
-        "[hipfire] resource locks acquired: {}",
+        "[hipfire] resource locks acquired (flock): {}",
         resources.join(", ")
     );
     ResourceLease { guards }

@@ -30,6 +30,8 @@ enum Command {
     HostProfile(commands::forward::HostProfileArgs),
     /// Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one model load
     CollectArtifacts(commands::forward::CollectArtifactsArgs),
+    /// Reshuffle a canonical .hfq into an arch-optimal layout (<model>.<arch>.hfq)
+    Repack(commands::forward::RepackArgs),
     /// GPU resource lock for multi-agent coordination (acquire/release/status)
     #[command(alias = "gpu-lock")]
     Lock(commands::lock::LockArgs),
@@ -83,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Eval(args) => commands::forward::run_eval(args),
         Command::HostProfile(args) => commands::forward::run_host_profile(args),
         Command::CollectArtifacts(args) => commands::forward::run_collect_artifacts(args),
+        Command::Repack(args) => commands::forward::run_repack(args),
         Command::Lock(args) => commands::lock::run(args),
         Command::Admin(args) => commands::admin::run(args, config).await,
         Command::GenDocs(args) => commands::gen_docs::run(args),

@@ -177,6 +177,18 @@ pub fn block_forward(
         dims.rope_base,
     )?;
 
+    // KV-compression sim-noise (KVarN-4bit + CASK merge) on post-RoPE K and V,
+    // forward-only (STE) — no-op unless HIPFIRE_KVNOISE=1. See crate::kv_noise.
+    let (k_r, v) = crate::kv_noise::maybe_compress_kv(
+        gpu,
+        k_r,
+        v,
+        crate::kv_noise::cfg_from_env(),
+        seq,
+        kvd,
+        dims.head_dim,
+    )?;
+
     // attention
     let p_all = gpu.zeros(&[dims.n_heads * seq * seq], DType::F32)?;
     let ctx = gpu.zeros(&[seq * qd], DType::F32)?;

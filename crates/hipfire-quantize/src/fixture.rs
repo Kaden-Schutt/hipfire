@@ -32,6 +32,27 @@ impl SplitMix64 {
     }
 }
 
+/// Storage dtype for a fixture tensor. Weight matrices ship BF16 (the model's
+/// source precision); 1D norm/bias vectors ship F16 because the per-arch
+/// loaders (qwen2/gemma3/minimax) reject BF16 for norms/biases — real
+/// checkpoints keep those at F16/F32, never quantized. This lets the new-family
+/// fixtures quantize directly into loadable models. (qwen3.5's preset keeps
+/// everything BF16 so its committed golden hashes stay byte-identical.)
+#[derive(Clone, Copy)]
+enum Dt {
+    Bf16,
+    F16,
+}
+
+impl Dt {
+    fn st_name(self) -> &'static str {
+        match self {
+            Dt::Bf16 => "BF16",
+            Dt::F16 => "F16",
+        }
+    }
+}
+
 /// f32 → bf16 bits, round-to-nearest-even.
 fn bf16_bits(x: f32) -> u16 {
     let bits = x.to_bits();
@@ -55,19 +76,32 @@ enum Init {
     Zeros,
 }
 
-/// One tensor in the manifest: name, shape, init policy.
+/// One tensor in the manifest: name, shape, init policy, storage dtype.
 struct TensorSpec {
     name: String,
     shape: Vec<usize>,
     init: Init,
+    dt: Dt,
 }
 
 impl TensorSpec {
+    /// BF16 tensor (default — weight matrices, and every qwen3.5 tensor).
     fn new(name: impl Into<String>, shape: Vec<usize>, init: Init) -> Self {
         Self {
             name: name.into(),
             shape,
             init,
+            dt: Dt::Bf16,
+        }
+    }
+
+    /// F16 tensor — used for new-family 1D norm/bias vectors (see [`Dt`]).
+    fn f16(name: impl Into<String>, shape: Vec<usize>, init: Init) -> Self {
+        Self {
+            name: name.into(),
+            shape,
+            init,
+            dt: Dt::F16,
         }
     }
 }
@@ -374,7 +408,570 @@ impl Qwen35Tiny {
     }
 }
 
-/// Generate bf16 little-endian bytes for one tensor.
+/// Tiny Qwen2 (arch 7) dense text config. The distinguishing feature vs LLaMA is
+/// Q/K/V **bias** (attention_bias=true) — routed through the dedicated
+/// hipfire-arch-qwen2 crate, which the LLaMA-default arch_id=1 path silently
+/// drops. The emit-time config carries `model_type:"qwen2"` (auto-detect →
+/// arch_id 1); the quant step must pass `--arch-id 7` to reach the qwen2 loader.
+struct Qwen2Tiny {
+    hidden: usize,
+    inter: usize,
+    vocab: usize,
+    layers: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+}
+
+impl Qwen2Tiny {
+    fn preset() -> Self {
+        Self {
+            hidden: 256,
+            inter: 512,
+            vocab: 4096,
+            layers: 2,
+            n_heads: 2,
+            n_kv_heads: 1,
+            head_dim: 128,
+        }
+    }
+
+    fn config_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "architectures": ["Qwen2ForCausalLM"],
+            "model_type": "qwen2",
+            "hidden_size": self.hidden,
+            "intermediate_size": self.inter,
+            "vocab_size": self.vocab,
+            "num_hidden_layers": self.layers,
+            "num_attention_heads": self.n_heads,
+            "num_key_value_heads": self.n_kv_heads,
+            "head_dim": self.head_dim,
+            "attention_bias": true,
+            "hidden_act": "silu",
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1_000_000.0,
+            "max_position_embeddings": 4096,
+            "tie_word_embeddings": true,
+            "dtype": "bfloat16",
+            "_comment": "hipfire tiny random-init gating fixture — not a real model",
+        })
+    }
+
+    fn manifest(&self) -> Vec<TensorSpec> {
+        let h = self.hidden;
+        let q_dim = self.n_heads * self.head_dim;
+        let kv_dim = self.n_kv_heads * self.head_dim;
+        let mut t = Vec::new();
+        // tie_word_embeddings ⇒ no separate lm_head.
+        t.push(TensorSpec::new(
+            "model.embed_tokens.weight",
+            vec![self.vocab, h],
+            Init::Uniform(0.05),
+        ));
+        t.push(TensorSpec::f16(
+            "model.norm.weight",
+            vec![h],
+            Init::NormOnes,
+        ));
+        for i in 0..self.layers {
+            let p = format!("model.layers.{i}");
+            t.push(TensorSpec::f16(
+                format!("{p}.input_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.self_attn.q_proj.weight"),
+                vec![q_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::f16(
+                format!("{p}.self_attn.q_proj.bias"),
+                vec![q_dim],
+                Init::Uniform(0.02),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.self_attn.k_proj.weight"),
+                vec![kv_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::f16(
+                format!("{p}.self_attn.k_proj.bias"),
+                vec![kv_dim],
+                Init::Uniform(0.02),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.self_attn.v_proj.weight"),
+                vec![kv_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::f16(
+                format!("{p}.self_attn.v_proj.bias"),
+                vec![kv_dim],
+                Init::Uniform(0.02),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.self_attn.o_proj.weight"),
+                vec![h, q_dim],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::f16(
+                format!("{p}.post_attention_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.gate_proj.weight"),
+                vec![self.inter, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.up_proj.weight"),
+                vec![self.inter, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.down_proj.weight"),
+                vec![h, self.inter],
+                Init::Uniform(0.05),
+            ));
+        }
+        t
+    }
+}
+
+/// Tiny Gemma3 (arch 12) dense text config. Exercises the Gemma quirks the
+/// ingest+forward special-case: per-head QK-norm, 4 norms/layer (the
+/// pre/post feed-forward norms), GeGLU, head_dim independent of dim/n_heads,
+/// dual-θ sliding-window interleave, and the (1+w) RMSNorm offset the quantizer
+/// bakes at ingest (arch_id 12). `sliding_window_pattern:2` over 4 layers gives
+/// both local-SWA and global layers.
+struct Gemma3Tiny {
+    hidden: usize,
+    inter: usize,
+    vocab: usize,
+    layers: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    sliding_window_pattern: usize,
+}
+
+impl Gemma3Tiny {
+    fn preset() -> Self {
+        Self {
+            hidden: 256,
+            inter: 512,
+            vocab: 4096,
+            layers: 4,
+            n_heads: 2,
+            n_kv_heads: 1,
+            head_dim: 128, // must be % 32 == 0 for the q8 KV path (forward.rs)
+            sliding_window_pattern: 2,
+        }
+    }
+
+    fn config_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "architectures": ["Gemma3ForCausalLM"],
+            "model_type": "gemma3_text",
+            "hidden_size": self.hidden,
+            "intermediate_size": self.inter,
+            "vocab_size": self.vocab,
+            "num_hidden_layers": self.layers,
+            "num_attention_heads": self.n_heads,
+            "num_key_value_heads": self.n_kv_heads,
+            "head_dim": self.head_dim,
+            "query_pre_attn_scalar": self.head_dim,
+            "sliding_window": 64,
+            "sliding_window_pattern": self.sliding_window_pattern,
+            "rope_theta": 1_000_000.0,
+            "rope_local_base_freq": 10_000.0,
+            "hidden_activation": "gelu_pytorch_tanh",
+            "rms_norm_eps": 1e-6,
+            "max_position_embeddings": 4096,
+            "tie_word_embeddings": true,
+            "dtype": "bfloat16",
+            "_comment": "hipfire tiny random-init gating fixture — not a real model",
+        })
+    }
+
+    fn manifest(&self) -> Vec<TensorSpec> {
+        let h = self.hidden;
+        let q_dim = self.n_heads * self.head_dim;
+        let kv_dim = self.n_kv_heads * self.head_dim;
+        let mut t = Vec::new();
+        // tie_word_embeddings ⇒ no separate lm_head.
+        t.push(TensorSpec::new(
+            "model.embed_tokens.weight",
+            vec![self.vocab, h],
+            Init::Uniform(0.05),
+        ));
+        t.push(TensorSpec::f16(
+            "model.norm.weight",
+            vec![h],
+            Init::NormOnes,
+        ));
+        for i in 0..self.layers {
+            let p = format!("model.layers.{i}");
+            let sa = format!("{p}.self_attn");
+            t.push(TensorSpec::f16(
+                format!("{p}.input_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::f16(
+                format!("{sa}.q_norm.weight"),
+                vec![self.head_dim],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::f16(
+                format!("{sa}.k_norm.weight"),
+                vec![self.head_dim],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.q_proj.weight"),
+                vec![q_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.k_proj.weight"),
+                vec![kv_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.v_proj.weight"),
+                vec![kv_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.o_proj.weight"),
+                vec![h, q_dim],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::f16(
+                format!("{p}.post_attention_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::f16(
+                format!("{p}.pre_feedforward_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::f16(
+                format!("{p}.post_feedforward_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.gate_proj.weight"),
+                vec![self.inter, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.up_proj.weight"),
+                vec![self.inter, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.down_proj.weight"),
+                vec![h, self.inter],
+                Init::Uniform(0.05),
+            ));
+        }
+        t
+    }
+}
+
+/// Tiny MiniMax-M2 (arch 10) Mixtral-style MoE config. Distinct from the
+/// Qwen3.5 MoE: per-expert pre-split `w1/w3/w2` tensors (no stacked-3D),
+/// per-layer flat QK-norm, partial rotate_half RoPE, sigmoid routing with a
+/// per-expert `e_score_correction_bias`, no shared expert, and **untied**
+/// lm_head. Exercises the indexed-MoE GEMV kernel family. Expert input dim
+/// (hidden, inter) must be a multiple of 256 for the mq4/mq6 expert path.
+struct MiniMaxTiny {
+    hidden: usize,
+    inter: usize,
+    vocab: usize,
+    layers: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    experts: usize,
+    experts_per_tok: usize,
+}
+
+impl MiniMaxTiny {
+    fn preset() -> Self {
+        Self {
+            hidden: 256,
+            inter: 256,
+            vocab: 4096,
+            layers: 2,
+            n_heads: 2,
+            n_kv_heads: 1,
+            head_dim: 128,
+            rotary_dim: 32,
+            experts: 8,
+            experts_per_tok: 2,
+        }
+    }
+
+    fn config_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "architectures": ["MiniMaxM2ForCausalLM"],
+            "model_type": "minimax_m2",
+            "hidden_size": self.hidden,
+            "intermediate_size": self.inter,
+            "vocab_size": self.vocab,
+            "num_hidden_layers": self.layers,
+            "num_attention_heads": self.n_heads,
+            "num_key_value_heads": self.n_kv_heads,
+            "head_dim": self.head_dim,
+            "rotary_dim": self.rotary_dim,
+            "num_local_experts": self.experts,
+            "num_experts_per_tok": self.experts_per_tok,
+            "use_qk_norm": true,
+            "use_routing_bias": true,
+            "scoring_func": "sigmoid",
+            "rope_theta": 5_000_000.0,
+            "rms_norm_eps": 1e-6,
+            "max_position_embeddings": 4096,
+            "tie_word_embeddings": false,
+            "dtype": "bfloat16",
+            "_comment": "hipfire tiny random-init gating fixture — not a real model",
+        })
+    }
+
+    fn manifest(&self) -> Vec<TensorSpec> {
+        let h = self.hidden;
+        let q_dim = self.n_heads * self.head_dim;
+        let kv_dim = self.n_kv_heads * self.head_dim;
+        let mut t = Vec::new();
+        // Untied: embed + separate lm_head.
+        t.push(TensorSpec::new(
+            "model.embed_tokens.weight",
+            vec![self.vocab, h],
+            Init::Uniform(0.05),
+        ));
+        t.push(TensorSpec::f16(
+            "model.norm.weight",
+            vec![h],
+            Init::NormOnes,
+        ));
+        t.push(TensorSpec::new(
+            "lm_head.weight",
+            vec![self.vocab, h],
+            Init::Uniform(0.05),
+        ));
+        for i in 0..self.layers {
+            let p = format!("model.layers.{i}");
+            let sa = format!("{p}.self_attn");
+            let moe = format!("{p}.block_sparse_moe");
+            t.push(TensorSpec::f16(
+                format!("{p}.input_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::f16(
+                format!("{p}.post_attention_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            // Per-layer QK-norm on the flat projection (q_dim / kv_dim wide).
+            t.push(TensorSpec::f16(
+                format!("{sa}.q_norm.weight"),
+                vec![q_dim],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::f16(
+                format!("{sa}.k_norm.weight"),
+                vec![kv_dim],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.q_proj.weight"),
+                vec![q_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.k_proj.weight"),
+                vec![kv_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.v_proj.weight"),
+                vec![kv_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.o_proj.weight"),
+                vec![h, q_dim],
+                Init::Uniform(0.05),
+            ));
+            // Router + per-expert bias (loaded unconditionally by the minimax loader).
+            t.push(TensorSpec::new(
+                format!("{moe}.gate.weight"),
+                vec![self.experts, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::f16(
+                format!("{moe}.e_score_correction_bias"),
+                vec![self.experts],
+                Init::Uniform(0.02),
+            ));
+            for e in 0..self.experts {
+                let ep = format!("{moe}.experts.{e}");
+                t.push(TensorSpec::new(
+                    format!("{ep}.w1.weight"),
+                    vec![self.inter, h],
+                    Init::Uniform(0.05),
+                ));
+                t.push(TensorSpec::new(
+                    format!("{ep}.w3.weight"),
+                    vec![self.inter, h],
+                    Init::Uniform(0.05),
+                ));
+                t.push(TensorSpec::new(
+                    format!("{ep}.w2.weight"),
+                    vec![h, self.inter],
+                    Init::Uniform(0.05),
+                ));
+            }
+        }
+        t
+    }
+}
+
+/// Tiny LLaMA / Mistral (arch 0) dense text config — the simplest supported
+/// family: dense full-attention, RMSNorm + SwiGLU, standard 1-D RoPE, GQA, and
+/// (unlike qwen2) NO Q/K/V bias and NO QK-norm. `model_type:"llama"` auto-detects
+/// to arch_id 0 (the LLaMA-family loader rejects bias tensors, so don't emit
+/// any). Untied `lm_head` to exercise the separate output-projection load.
+struct LlamaTiny {
+    hidden: usize,
+    inter: usize,
+    vocab: usize,
+    layers: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+}
+
+impl LlamaTiny {
+    fn preset() -> Self {
+        Self {
+            hidden: 256,
+            inter: 512,
+            vocab: 4096,
+            layers: 2,
+            n_heads: 2,
+            n_kv_heads: 1,
+            head_dim: 128,
+        }
+    }
+
+    fn config_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": self.hidden,
+            "intermediate_size": self.inter,
+            "vocab_size": self.vocab,
+            "num_hidden_layers": self.layers,
+            "num_attention_heads": self.n_heads,
+            "num_key_value_heads": self.n_kv_heads,
+            "head_dim": self.head_dim,
+            "hidden_act": "silu",
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 500_000.0,
+            "max_position_embeddings": 4096,
+            "tie_word_embeddings": false,
+            "dtype": "bfloat16",
+            "_comment": "hipfire tiny random-init gating fixture — not a real model",
+        })
+    }
+
+    fn manifest(&self) -> Vec<TensorSpec> {
+        let h = self.hidden;
+        let q_dim = self.n_heads * self.head_dim;
+        let kv_dim = self.n_kv_heads * self.head_dim;
+        let mut t = Vec::new();
+        // Untied: embed + separate lm_head.
+        t.push(TensorSpec::new(
+            "model.embed_tokens.weight",
+            vec![self.vocab, h],
+            Init::Uniform(0.05),
+        ));
+        t.push(TensorSpec::f16(
+            "model.norm.weight",
+            vec![h],
+            Init::NormOnes,
+        ));
+        t.push(TensorSpec::new(
+            "lm_head.weight",
+            vec![self.vocab, h],
+            Init::Uniform(0.05),
+        ));
+        for i in 0..self.layers {
+            let p = format!("model.layers.{i}");
+            let sa = format!("{p}.self_attn");
+            t.push(TensorSpec::f16(
+                format!("{p}.input_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            // No bias, no q_norm/k_norm — the LLaMA loader rejects bias tensors.
+            t.push(TensorSpec::new(
+                format!("{sa}.q_proj.weight"),
+                vec![q_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.k_proj.weight"),
+                vec![kv_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.v_proj.weight"),
+                vec![kv_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{sa}.o_proj.weight"),
+                vec![h, q_dim],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::f16(
+                format!("{p}.post_attention_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.gate_proj.weight"),
+                vec![self.inter, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.up_proj.weight"),
+                vec![self.inter, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.down_proj.weight"),
+                vec![h, self.inter],
+                Init::Uniform(0.05),
+            ));
+        }
+        t
+    }
+}
+
+/// Generate little-endian bytes for one tensor at its declared dtype.
 fn gen_bytes(spec: &TensorSpec, rng: &mut SplitMix64) -> Vec<u8> {
     let n: usize = spec.shape.iter().product();
     let mut out = Vec::with_capacity(n * 2);
@@ -385,7 +982,11 @@ fn gen_bytes(spec: &TensorSpec, rng: &mut SplitMix64) -> Vec<u8> {
             Init::ALog => -2.0 + rng.next_unit() * 0.5, // exp(A_log) small & positive
             Init::Zeros => 0.0,
         };
-        out.extend_from_slice(&bf16_bits(v).to_le_bytes());
+        let bits = match spec.dt {
+            Dt::Bf16 => bf16_bits(v),
+            Dt::F16 => crate::f32_to_f16(v),
+        };
+        out.extend_from_slice(&bits.to_le_bytes());
     }
     out
 }
@@ -405,7 +1006,7 @@ fn write_safetensors(
         header.insert(
             spec.name.clone(),
             serde_json::json!({
-                "dtype": "BF16",
+                "dtype": spec.dt.st_name(),
                 "shape": spec.shape,
                 "data_offsets": [offset, end],
             }),
@@ -440,11 +1041,28 @@ pub fn emit_fixture(arch: &str, out_dir: &Path, seed: u64) -> Result<(), String>
             let m = Qwen35Tiny::moe_preset();
             (m.config_json(), m.manifest())
         }
+        "qwen2" => {
+            let m = Qwen2Tiny::preset();
+            (m.config_json(), m.manifest())
+        }
+        "gemma3" | "gemma3_text" => {
+            let m = Gemma3Tiny::preset();
+            (m.config_json(), m.manifest())
+        }
+        "minimax" | "minimax_m2" => {
+            let m = MiniMaxTiny::preset();
+            (m.config_json(), m.manifest())
+        }
+        "llama" | "mistral" => {
+            let m = LlamaTiny::preset();
+            (m.config_json(), m.manifest())
+        }
         other => {
             return Err(format!(
                 "--emit-fixture: unsupported arch '{other}'. Supported: qwen3_5 \
-                 (arch 5 dense), qwen3_5_moe (arch 6 MoE). Add a tiny preset per \
-                 arch as support lands."
+                 (arch 5 dense), qwen3_5_moe (arch 6 MoE), qwen2 (arch 7, quantize \
+                 with --arch-id 7), gemma3 (arch 12), minimax (arch 10), llama \
+                 (arch 0). Add a tiny preset per arch as support lands."
             ));
         }
     };
@@ -523,6 +1141,119 @@ mod tests {
             .map(|s| s.shape.iter().product::<usize>())
             .sum();
         assert!(n < 10_000_000, "moe fixture must stay <10M params, got {n}");
+    }
+
+    /// Total param count for a manifest, for the <10M tiny budget assert.
+    fn n_params(specs: &[TensorSpec]) -> usize {
+        specs
+            .iter()
+            .map(|s| s.shape.iter().product::<usize>())
+            .sum()
+    }
+
+    #[test]
+    fn qwen2_manifest_has_qkv_bias_and_is_tiny() {
+        let m = Qwen2Tiny::preset();
+        let specs = m.manifest();
+        let has = |suf: &str| specs.iter().any(|s| s.name.ends_with(suf));
+        assert!(has("self_attn.q_proj.bias"), "qwen2 must carry q bias");
+        assert!(has("self_attn.k_proj.bias"));
+        assert!(has("self_attn.v_proj.bias"));
+        assert!(has("mlp.gate_proj.weight"), "dense SwiGLU");
+        assert!(!has("lm_head.weight"), "tied ⇒ no separate lm_head");
+        assert!(
+            n_params(&specs) < 10_000_000,
+            "qwen2 fixture must stay <10M params"
+        );
+    }
+
+    #[test]
+    fn gemma3_manifest_has_four_norms_and_qk_norm() {
+        let m = Gemma3Tiny::preset();
+        let specs = m.manifest();
+        let has = |suf: &str| specs.iter().any(|s| s.name.ends_with(suf));
+        assert!(has("self_attn.q_norm.weight"), "per-head QK-norm");
+        assert!(
+            has("pre_feedforward_layernorm.weight"),
+            "gemma 4-norm layout"
+        );
+        assert!(has("post_feedforward_layernorm.weight"));
+        assert_eq!(
+            m.head_dim % 32,
+            0,
+            "gemma3 head_dim must be %32==0 for q8 KV"
+        );
+        assert!(
+            n_params(&specs) < 10_000_000,
+            "gemma3 fixture must stay <10M params"
+        );
+    }
+
+    #[test]
+    fn minimax_manifest_has_split_experts_router_bias_and_untied_head() {
+        let m = MiniMaxTiny::preset();
+        let specs = m.manifest();
+        let has = |suf: &str| specs.iter().any(|s| s.name.ends_with(suf));
+        assert!(has("lm_head.weight"), "minimax is untied");
+        assert!(has("block_sparse_moe.gate.weight"), "router");
+        assert!(
+            has("block_sparse_moe.e_score_correction_bias"),
+            "routing bias"
+        );
+        assert!(has("block_sparse_moe.experts.0.w1.weight"), "split experts");
+        assert!(has("block_sparse_moe.experts.0.w2.weight"));
+        assert!(has("block_sparse_moe.experts.0.w3.weight"));
+        // Expert input dims must be a multiple of 256 for the mq4/mq6 expert path.
+        assert_eq!(m.hidden % 256, 0);
+        assert_eq!(m.inter % 256, 0);
+        // All experts identical shape (packed-layout uniform-stride requirement).
+        let w1: Vec<_> = specs
+            .iter()
+            .filter(|s| s.name.ends_with(".w1.weight"))
+            .collect();
+        assert!(w1.windows(2).all(|w| w[0].shape == w[1].shape));
+        assert!(
+            n_params(&specs) < 10_000_000,
+            "minimax fixture must stay <10M params"
+        );
+    }
+
+    #[test]
+    fn llama_manifest_is_bias_free_and_tiny() {
+        let m = LlamaTiny::preset();
+        let specs = m.manifest();
+        let has = |suf: &str| specs.iter().any(|s| s.name.ends_with(suf));
+        assert!(has("lm_head.weight"), "untied lm_head");
+        assert!(has("mlp.gate_proj.weight"), "dense SwiGLU");
+        // The LLaMA loader rejects bias + qk-norm tensors — must emit none.
+        assert!(
+            !specs.iter().any(|s| s.name.ends_with(".bias")),
+            "no biases"
+        );
+        assert!(!specs
+            .iter()
+            .any(|s| s.name.contains("q_norm") || s.name.contains("k_norm")));
+        assert!(
+            n_params(&specs) < 10_000_000,
+            "llama fixture must stay <10M params"
+        );
+    }
+
+    #[test]
+    fn emit_new_families_are_deterministic() {
+        let base = std::env::temp_dir().join(format!("hipfire-fx-fam-{}", std::process::id()));
+        for arch in ["qwen2", "gemma3", "minimax", "llama"] {
+            let dir = base.join(arch);
+            emit_fixture(arch, &dir, 7).unwrap();
+            let a = std::fs::read(dir.join("model.safetensors")).unwrap();
+            emit_fixture(arch, &dir, 7).unwrap();
+            let b = std::fs::read(dir.join("model.safetensors")).unwrap();
+            assert_eq!(
+                a, b,
+                "{arch}: same seed must produce byte-identical safetensors"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

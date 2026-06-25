@@ -273,10 +273,14 @@ where
     }
     // --model is required for a single run, but --models (sweep), --status, and
     // --fetch supply or don't need it; use a placeholder that run_from_env
-    // replaces per sweep iteration.
+    // replaces per sweep iteration. The tiny_quant battery emits + quantizes its
+    // own fixtures, so it needs no --model either.
+    let tiny_quant_only = batteries
+        .as_ref()
+        .is_some_and(|b| !b.is_empty() && b.iter().all(|x| *x == BatteryId::TinyQuant));
     let model = match model {
         Some(m) => m,
-        None if models_spec.is_some() || status || fetch => String::new(),
+        None if models_spec.is_some() || status || fetch || tiny_quant_only => String::new(),
         None => return Err(format!("error: --model is required\n\n{}", usage())),
     };
     let batteries = batteries.unwrap_or_else(|| default_batteries(tier));

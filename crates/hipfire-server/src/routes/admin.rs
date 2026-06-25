@@ -204,22 +204,22 @@ fn count_kernel_files(path: &Path) -> (usize, usize) {
 }
 
 fn resource_lock_statuses(lock_dir: &Path) -> Vec<Value> {
-    let Ok(entries) = fs::read_dir(lock_dir) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            if !path.is_file() {
-                return None;
-            }
-            Some(json!({
-                "name": entry.file_name().to_string_lossy(),
+    // flock(2)-based leases now: report the live kernel lock state (Free/Busy) +
+    // holder line for the shared GPU lock and any per-resource files under lock_dir.
+    use hipfire_daemon_adapter::LockState;
+    hipfire_daemon_adapter::resource_lock_report(lock_dir)
+        .into_iter()
+        .map(|(name, path, state)| {
+            let (held, holder) = match state {
+                LockState::Free => (false, String::new()),
+                LockState::Busy(h) => (true, h),
+            };
+            json!({
+                "name": name,
                 "path": path.display().to_string(),
-                "bytes": fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
-                "content": fs::read_to_string(&path).unwrap_or_default().chars().take(500).collect::<String>(),
-            }))
+                "held": held,
+                "holder": holder,
+            })
         })
         .collect()
 }

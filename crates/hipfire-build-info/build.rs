@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // hipfire — build-time Git-derived version identity. See LICENSE / NOTICE.
 
-//! Emits `VERGEN_GIT_DESCRIBE` (e.g. `v0.2.1-957-g6536c05a`) as a `rustc-env`
+//! Emits `VERGEN_GIT_DESCRIBE` (e.g. `v0.3.0-957-g6536c05a`) as a `rustc-env`
 //! so the binaries can report a dev-build identity from `--version`.
 //!
 //! Uses `vergen-gitcl`, which shells out to the `git` CLI — so the embedded
