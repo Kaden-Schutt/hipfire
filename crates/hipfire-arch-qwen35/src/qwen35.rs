@@ -7292,6 +7292,7 @@ fn run_fused_gate_up_key(
         k,
         rot_scratch: &[],
         batch_size: Some(n),
+        bias: None,
     };
     hipfire_runtime::llama::fused_qkv_family()
         .run(&ctx, gpu, &params)
@@ -7341,6 +7342,7 @@ fn run_fused_qkv_key(
         k,
         rot_scratch: &[],
         batch_size: Some(n),
+        bias: None,
     };
     hipfire_runtime::llama::fused_qkv_family()
         .run(&ctx, gpu, &params)
@@ -7388,6 +7390,7 @@ fn run_fused_qkvza_key(
         k,
         rot_scratch: &[],
         batch_size: Some(n),
+        bias: None,
     };
     hipfire_runtime::llama::fused_qkv_family()
         .run(&ctx, gpu, &params)

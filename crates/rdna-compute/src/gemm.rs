@@ -2361,8 +2361,59 @@ impl Gpu {
         v_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        // Null bias = byte-identical to the historical (pre-fold) path.
+        self.fused_qkv_hfq4g256_with_bias(
+            a_q,
+            a_k,
+            a_v,
+            x,
+            y_q,
+            y_k,
+            y_v,
+            q_m,
+            k_m,
+            v_m,
+            k,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    }
+
+    /// Variant of [`Self::fused_qkv_hfq4g256`] that optionally folds the Q/K/V
+    /// `bias_add` into the kernel's lane-0 store (`HIPFIRE_FUSE_QKV_BIAS`).
+    /// Non-null f32 device pointers `bias_q/k/v` are added inside the kernel;
+    /// passing null for all three is byte-identical to the unfused path
+    /// (fp32 store→load→add of the separate `bias_add` == the fused fp32 add,
+    /// same operand order). Called from `execute_steps` when the fold fires on
+    /// a per-row decode arch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_qkv_hfq4g256_with_bias(
+        &mut self,
+        a_q: &GpuTensor,
+        a_k: &GpuTensor,
+        a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor,
+        y_k: &GpuTensor,
+        y_v: &GpuTensor,
+        q_m: usize,
+        k_m: usize,
+        v_m: usize,
+        k: usize,
+        bias_q_ptr: *mut c_void,
+        bias_k_ptr: *mut c_void,
+        bias_v_ptr: *mut c_void,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         if self.arch_caps.gemv_dp4a_enabled() {
+            // The gfx906 dp4a kernel has no bias parameters. The fold is guarded
+            // off for dp4a archs in `execute_steps` (bias applied separately), so
+            // bias must be null here; assert that invariant defensively.
+            debug_assert!(
+                bias_q_ptr.is_null() && bias_k_ptr.is_null() && bias_v_ptr.is_null(),
+                "fused_qkv_hfq4g256_with_bias: bias must be null on the dp4a path"
+            );
             return self.fused_qkv_hfq4g256_dp4a(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k);
         }
 
@@ -2470,6 +2521,10 @@ impl Gpu {
         let k_m_val = k_m as i32;
         let v_m_val = v_m as i32;
         let k_val = k as i32;
+        // Nullable bias pointers — null is a kernel no-op (byte-identical).
+        let bq = bias_q_ptr;
+        let bk = bias_k_ptr;
+        let bv = bias_v_ptr;
 
         let mut params: Vec<*mut c_void> = vec![
             &aq as *const _ as *mut c_void,
@@ -2483,6 +2538,9 @@ impl Gpu {
             &k_m_val as *const _ as *mut c_void,
             &v_m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
+            &bq as *const _ as *mut c_void,
+            &bk as *const _ as *mut c_void,
+            &bv as *const _ as *mut c_void,
         ];
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
@@ -2503,6 +2561,9 @@ impl Gpu {
                 b.push_i32(k_m_val);
                 b.push_i32(v_m_val);
                 b.push_i32(k_val);
+                b.push_ptr(bq);
+                b.push_ptr(bk);
+                b.push_ptr(bv);
                 b
             });
         if let Some(t) = timer {

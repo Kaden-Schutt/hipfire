@@ -215,6 +215,19 @@ pub struct FeatureFlags {
     /// qwen35 DFlash Q8 WMMA lm_head in verify. **Default ON**; opt out with
     /// `HIPFIRE_DFLASH_Q8_LMHEAD_WMMA` ∈ {0,false,off,no}.
     pub dflash_q8_lmhead_wmma: bool,
+
+    /// Fold the 3 separate QKV `BiasAdd` launches (qwen2-family `attention_bias`)
+    /// into the per-row fused-QKV decode kernel's lane-0 store. Eliminates 3 tiny
+    /// overhead-dominated launches/layer. Env: HIPFIRE_FUSE_QKV_BIAS — default ON;
+    /// set `=0` to opt out (for bisection). NULL bias pointers are a kernel no-op,
+    /// so non-bias callers stay byte-identical regardless. Only fires for fused-QKV
+    /// keys whose dispatch arm reads the bias (see `qkv_bias_fold_supported`).
+    pub fuse_qkv_bias: bool,
+
+    /// Diagnostic: log each QKV-bias fold to stderr. Env:
+    /// HIPFIRE_FUSE_QKV_BIAS_DEBUG=1. Default off. Resolved once at init so the
+    /// default-on fold hot path takes no per-launch `env::var` lock.
+    pub fuse_qkv_bias_debug: bool,
 }
 
 impl FeatureFlags {
@@ -509,6 +522,10 @@ impl FeatureFlags {
                 }
                 Err(_) => true,
             },
+
+            // QKV bias fold — default ON, opt out with HIPFIRE_FUSE_QKV_BIAS=0.
+            fuse_qkv_bias: parse_bool("HIPFIRE_FUSE_QKV_BIAS").unwrap_or(true),
+            fuse_qkv_bias_debug: std::env::var("HIPFIRE_FUSE_QKV_BIAS_DEBUG").as_deref() == Ok("1"),
         }
     }
 
@@ -683,6 +700,8 @@ impl FeatureFlags {
             dflash_fast_sample: true,
             ddtree_logw_cutoff: None,
             dflash_q8_lmhead_wmma: true,
+            fuse_qkv_bias: true,
+            fuse_qkv_bias_debug: false,
         }
     }
 }
@@ -695,5 +714,11 @@ mod tests {
     fn force_unfused_defaults_false_in_test_ctor() {
         let f = FeatureFlags::from_env_for_test("gfx1151");
         assert!(!f.force_unfused);
+    }
+
+    #[test]
+    fn fuse_qkv_bias_defaults_on_in_test_ctor() {
+        let f = FeatureFlags::from_env_for_test("gfx1151");
+        assert!(f.fuse_qkv_bias);
     }
 }

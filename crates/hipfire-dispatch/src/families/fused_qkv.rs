@@ -20,6 +20,13 @@ pub struct FusedQkvParams<'a> {
     /// for `x_rot_up` internally). Empty slice for non-Paro keys; existing arms
     /// ignore it.
     pub rot_scratch: &'a [GpuTensor],
+    /// Optional Q/K/V bias tensors for `HIPFIRE_FUSE_QKV_BIAS`. When `Some`, the
+    /// bias is folded into the per-row fused-QKV decode kernel's lane-0 store
+    /// (eliminating 3 separate `bias_add` launches). Only the 3-way QKV decode
+    /// arms whose kernel has a `_with_bias` variant read this field; all other
+    /// arms (QKVZA, gate+up, Paro, prefill GEMM) ignore it. `None` (the default)
+    /// means no fold — existing callers pass `None` and stay byte-identical.
+    pub bias: Option<[&'a GpuTensor; 3]>,
     /// Batched-prefill row count (`#397 Ship 5.2 slice 2`). `None` = single-token
     /// DECODE: gate+up arms dispatch to the `gpu.fused_gate_up_*` kernels (the
     /// historical behavior; the decode pipeline in `pipeline::steps` passes
@@ -81,6 +88,26 @@ macro_rules! hip {
     };
 }
 
+/// Resolve optional Q/K/V bias tensors to raw device pointers for the
+/// `_with_bias` kernel variants. `None` → all-null (a kernel no-op, byte-identical
+/// to the unfused path).
+fn bias_ptrs(
+    bias: Option<[&GpuTensor; 3]>,
+) -> (
+    *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+) {
+    match bias {
+        Some([bq, bk, bv]) => (bq.buf.as_ptr(), bk.buf.as_ptr(), bv.buf.as_ptr()),
+        None => (
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ),
+    }
+}
+
 fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), DispatchError> {
     let x = params.x;
     let k = params.k;
@@ -105,7 +132,14 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
             match params.batch_size {
                 Some(n) => hip!(gpu.gemm_qkv_hfq4g256(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n)),
-                None => hip!(gpu.fused_qkv_hfq4g256(wq, wk, wv, x, q, kout, v, mq, mk, mv, k)),
+                None => {
+                    // Optionally fold Q/K/V bias (HIPFIRE_FUSE_QKV_BIAS). Null
+                    // pointers are a kernel no-op, so `None` is byte-identical.
+                    let (bq, bk, bv) = bias_ptrs(params.bias);
+                    hip!(gpu.fused_qkv_hfq4g256_with_bias(
+                        wq, wk, wv, x, q, kout, v, mq, mk, mv, k, bq, bk, bv
+                    ))
+                }
             }
         }
         KernelKey::FusedQkvMq3G256Lloyd => {
