@@ -14,6 +14,8 @@
 //!                                              — set a metadata JSON key (all tensors
 //!                                                copied), e.g. embed a jinja2 template
 //!   hfq meta-get <file> [--key <k>]            — dump metadata JSON (or one key)
+//!   hfq rearch <in> <out> --arch-id <id>       — rewrite HFQM header arch_id and
+//!                                                numeric metadata.arch_id
 //!
 //! Examples:
 //!   hfq extract model.calib.hfq just.hessian.hfq --tensor '*.hessian'
@@ -230,12 +232,37 @@ fn main() {
                 println!("{}", hfq.metadata_json);
             }
         }
+        "rearch" => {
+            let inp = argv
+                .get(2)
+                .expect("usage: hfq rearch <in> <out> --arch-id <id>");
+            let out = argv.get(3).expect("out path");
+            let arch: u32 = flag(&argv, "--arch-id")
+                .expect("--arch-id required")
+                .parse()
+                .expect("--arch-id must be a u32");
+            let (_old_arch, meta_json, tensors) = load_all(inp);
+            let mut meta: serde_json::Value =
+                serde_json::from_str(&meta_json).unwrap_or(serde_json::json!({}));
+            let obj = meta.as_object_mut().expect("metadata not an object");
+            obj.insert(
+                "arch_id".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(arch)),
+            );
+            obj.remove("arch_id_semantics");
+            eprintln!(
+                "set header arch_id and metadata.arch_id to {arch} ({} tensors copied) → {out}",
+                tensors.len()
+            );
+            write_hfq(out, arch, &serde_json::to_string(&meta).unwrap(), &tensors).expect("write");
+        }
         _ => {
             eprintln!(
                 "hfq — HFQ container tool\n\
                  usage:\n  hfq list <file>\n  hfq extract <in> <out> --tensor <pat>...\n\
                  \x20 hfq meta-set <in> <out> --key <k> (--value <v> | --value-file <f>)\n\
-                 \x20 hfq meta-get <file> [--key <k>]"
+                 \x20 hfq meta-get <file> [--key <k>]\n\
+                 \x20 hfq rearch <in> <out> --arch-id <id>"
             );
             std::process::exit(1);
         }

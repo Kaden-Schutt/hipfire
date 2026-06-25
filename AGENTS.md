@@ -5,15 +5,14 @@ For detailed notices, project operating guides, and testing playbooks, see the c
 ## Project Rules (Core Invariants)
 1. **No Python in the inference hot path.** Python is allowed for tooling, benchmarks, comparison baselines.
 2. **Commit meaningful experiment states.** Document failures explicitly.
-3. **Portability matters.** Every decision should consider: will this work on RDNA2? RDNA3? RDNA4?
-4. **No Vulkan / wgpu / cross-vendor compute backend.** hipfire ships a single HIP/ROCm-direct backend.
+3. **No Vulkan / wgpu / cross-vendor compute backend.** hipfire ships HIP/ROCm/RDNA/XDNA/Vega20
 
 ## Branch Policy
 - **Use `chaingun` as the reference branch for all further work.** New work should either happen directly on `chaingun` or be explicitly based on and compared against `chaingun`; do not treat `master` as the active development baseline unless the user says so.
 - **Keep git moving as you work.** Pull/rebase from the `chaingun` reference before starting meaningful changes, commit coherent work states with descriptive messages, and push the active branch regularly. If the worktree contains unrelated user changes, preserve them and only stage/commit the files that belong to the current task.
 
 ## Testing & Coherence Gates
-- **Coherence-gate-dflash is the canonical correctness gate.** Run `./tests/coherence-gate-dflash.sh` after any change touching kernels, quant formats, dispatch, fusion, rotation, rmsnorm, or the spec-decode path.
+- **Coherence-gate is the canonical correctness gate.** Run `./tests/coherence-gate.sh` after any change touching kernels, quant formats, dispatch, fusion, rotation, rmsnorm, or the spec-decode path.
 - **Model/runtime evidence belongs in `hipfire-eval`.** When adding or repairing speed, coherence, DFlash/DDTree/Path C, PFlash, agentic/tool-call, long-context, quality, or server-runtime admission tests, add or update `hipfire-eval` batteries/suites first. Keep shell gates only as enforcement wrappers where they still provide baseline comparison or hook integration.
 - **Prompt structure dictates τ.** ALWAYS use byte-identical prompts via `benchmarks/prompts/*.txt`.
 - **Run the no-GPU subset.** `./tests/no-gpu-ci.sh` before handing off workflow-only changes.
@@ -48,6 +47,14 @@ Rules:
 - Use `+feature` only when bundled: `mq4+mtp`, `mq4+dflash`.
 - Use role sidecars when loaded independently: `.mtp.hfq`, `.dflash.hfq`, `.triattn.hfq`.
 - Use `.triattn.hfq` for TriAttention sidecars even though they are not weight tensors; do not introduce `.triattn.bin` for new files.
+- Role sidecar HFQM headers should use the parent model family's `arch_id` so
+  compatibility checks can reject mismatched families. Use `arch_id = 0` only
+  for artifacts that are intentionally shareable across multiple model families
+  and whose metadata names the shareability contract explicitly.
+- HFQM records package contents in the binary entry index (`name`,
+  `quant_type`, `shape`, `group_size`, byte size/offset). Producers may also
+  mirror this in metadata, for example KLD refs use a `payloads` object, but the
+  index is the authoritative contents table.
 - Do not use dotted quant artifact suffixes. The quant token belongs before
   the `.hfq` extension with a hyphen separator; Lloyd MQ2 uses
   `-lloyd-mq2.hfq`.

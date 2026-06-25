@@ -19,10 +19,10 @@ use std::path::Path;
 
 pub const HFQM_MAGIC: &[u8; 4] = b"HFQM";
 pub const HFQM_VERSION: u32 = 1;
-/// Reserved `arch_id` for HFQM containers that are not direct model-weight
-/// packages. KLD references, imatrix captures, CASK/TriAttention centers, and
-/// other sidecar-style artifacts should use this value and describe their
-/// semantics through metadata `artifact_kind` plus named package entries.
+/// Reserved `arch_id` for HFQM containers that are intentionally shareable
+/// across model families. Role sidecars tied to one family should use the
+/// parent model's `arch_id`; use this value only when metadata explicitly
+/// defines a family-independent compatibility contract.
 pub const HFQM_ARCH_NON_WEIGHT_PACKAGE: u32 = 0;
 
 #[derive(Debug, Clone)]
@@ -1972,7 +1972,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_and_reads_non_weight_hfqm_package() {
+    fn writes_and_reads_sidecar_hfqm_package() {
         let payload_a = temp_path("tokens.bin");
         let payload_b = temp_path("values.bin");
         let package_path = temp_path("ref.kldref.hfq");
@@ -1982,6 +1982,7 @@ mod tests {
         let metadata = serde_json::json!({
             "artifact_kind": "hipfire.kldref",
             "package_schema": "hipfire.kldref.v1",
+            "arch_id": 5,
             "n_ctx": 2,
             "n_chunk": 1,
             "top_k": 1
@@ -2005,17 +2006,11 @@ mod tests {
                 data_size: 8,
             },
         ];
-        write_hfqm_package_from_files(
-            &package_path,
-            HFQM_ARCH_NON_WEIGHT_PACKAGE,
-            &metadata,
-            &entries,
-        )
-        .unwrap();
+        write_hfqm_package_from_files(&package_path, 5, &metadata, &entries).unwrap();
 
         let package = HfqPackage::open(&package_path).unwrap();
         assert_eq!(package.version, HFQM_VERSION);
-        assert_eq!(package.arch_id, HFQM_ARCH_NON_WEIGHT_PACKAGE);
+        assert_eq!(package.arch_id, 5);
         assert!(package
             .metadata_json
             .contains("\"artifact_kind\":\"hipfire.kldref\""));

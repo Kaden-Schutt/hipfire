@@ -79,6 +79,196 @@ use qwen35_prefill::*;
 use request::ThinkMode;
 use session::*;
 
+fn invalid_kld_ref(msg: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, msg.into())
+}
+
+fn json_u64(meta: &serde_json::Value, key: &str) -> std::io::Result<u64> {
+    meta.get(key)
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| invalid_kld_ref(format!("HFQM kldref metadata missing integer {key}")))
+}
+
+fn json_usize(meta: &serde_json::Value, key: &str) -> std::io::Result<usize> {
+    json_u64(meta, key).map(|v| v as usize)
+}
+
+fn json_string(meta: &serde_json::Value, key: &str) -> std::io::Result<String> {
+    meta.get(key)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| invalid_kld_ref(format!("HFQM kldref metadata missing string {key}")))
+}
+
+fn json_opt_string(meta: &serde_json::Value, key: &str) -> Option<String> {
+    meta.get(key).and_then(|v| v.as_str()).map(str::to_string)
+}
+
+fn json_opt_bool(meta: &serde_json::Value, key: &str) -> Option<bool> {
+    meta.get(key).and_then(|v| v.as_bool())
+}
+
+fn json_opt_usize(meta: &serde_json::Value, key: &str) -> Option<usize> {
+    meta.get(key).and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+            .map(|n| n as usize)
+    })
+}
+
+fn le_u32_vec(bytes: &[u8], name: &str, expected: usize) -> std::io::Result<Vec<u32>> {
+    if bytes.len() != expected * 4 {
+        return Err(invalid_kld_ref(format!(
+            "HFQM kldref {name} byte length {} != expected {}",
+            bytes.len(),
+            expected * 4
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect())
+}
+
+fn le_f32_vec(bytes: &[u8], name: &str, expected: usize) -> std::io::Result<Vec<f32>> {
+    if bytes.len() != expected * 4 {
+        return Err(invalid_kld_ref(format!(
+            "HFQM kldref {name} byte length {} != expected {}",
+            bytes.len(),
+            expected * 4
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect())
+}
+
+fn hfqm_blob<'a>(
+    package: &'a hipfire_runtime::hfq::HfqPackage,
+    name: &str,
+) -> std::io::Result<&'a [u8]> {
+    package
+        .blob_data(name)
+        .ok_or_else(|| invalid_kld_ref(format!("HFQM kldref missing payload {name}")))
+}
+
+fn read_kld_ref_archive(path: &std::path::Path) -> std::io::Result<hipfire_kld::RefArchive> {
+    let mut magic = [0u8; 4];
+    let mut f = std::fs::File::open(path)?;
+    use std::io::Read;
+    let n = f.read(&mut magic)?;
+    if n == 4 && &magic == hipfire_runtime::hfq::HFQM_MAGIC {
+        return read_hfqm_kld_ref_archive(path);
+    }
+    hipfire_kld::RefArchive::read_file(path)
+}
+
+fn read_hfqm_kld_ref_archive(path: &std::path::Path) -> std::io::Result<hipfire_kld::RefArchive> {
+    let package = hipfire_runtime::hfq::HfqPackage::open(path)?;
+    if package.arch_id == hipfire_runtime::hfq::HFQM_ARCH_NON_WEIGHT_PACKAGE {
+        return Err(invalid_kld_ref(
+            "HFQM kldref arch_id is 0; regenerate the ref with the parent model arch_id",
+        ));
+    }
+    let meta_json: serde_json::Value = serde_json::from_str(&package.metadata_json)
+        .map_err(|e| invalid_kld_ref(format!("HFQM kldref metadata json: {e}")))?;
+    if meta_json.get("artifact_kind").and_then(|v| v.as_str()) != Some("hipfire.kldref") {
+        return Err(invalid_kld_ref(
+            "HFQM package is not artifact_kind=hipfire.kldref",
+        ));
+    }
+    if meta_json.get("package_schema").and_then(|v| v.as_str()) != Some("hipfire.kldref.v1") {
+        return Err(invalid_kld_ref(
+            "HFQM kldref package_schema is not hipfire.kldref.v1",
+        ));
+    }
+    if let Some(meta_arch) = meta_json.get("arch_id").and_then(|v| v.as_u64()) {
+        if meta_arch as u32 != package.arch_id {
+            return Err(invalid_kld_ref(format!(
+                "HFQM kldref metadata arch_id {} != header arch_id {}",
+                meta_arch, package.arch_id
+            )));
+        }
+    }
+
+    let n_ctx = json_usize(&meta_json, "n_ctx")?;
+    let n_vocab = json_usize(&meta_json, "n_vocab")?;
+    let n_chunk = json_usize(&meta_json, "n_chunk")?;
+    let scored_per_chunk = json_usize(&meta_json, "scored_per_chunk")?;
+    let scoring_start = json_usize(&meta_json, "scoring_start")?;
+    let top_k = json_usize(&meta_json, "top_k")?;
+    let total_scored = json_usize(&meta_json, "total_scored")?;
+
+    let tokens = le_u32_vec(
+        hfqm_blob(&package, "kldref.tokens")?,
+        "kldref.tokens",
+        n_chunk * n_ctx,
+    )?;
+    let top_count = n_chunk * scored_per_chunk * top_k;
+    let top_indices = le_u32_vec(
+        hfqm_blob(&package, "kldref.top_indices")?,
+        "kldref.top_indices",
+        top_count,
+    )?;
+    let top_log_probs = le_f32_vec(
+        hfqm_blob(&package, "kldref.top_log_probs")?,
+        "kldref.top_log_probs",
+        top_count,
+    )?;
+    let residual_mass = le_f32_vec(
+        hfqm_blob(&package, "kldref.residual_mass")?,
+        "kldref.residual_mass",
+        n_chunk * scored_per_chunk,
+    )?;
+
+    let mut cfg = hipfire_kld::KldConfig::default();
+    cfg.top_k = top_k;
+    if let Some(kv_mode) = json_opt_string(&meta_json, "kv_mode") {
+        cfg.kv_mode = kv_mode.to_ascii_lowercase();
+    }
+    if let Some(graph) = json_opt_bool(&meta_json, "kld_graph_prefill") {
+        cfg.graph = graph;
+    }
+    cfg.prefill_max_batch = json_opt_usize(&meta_json, "kld_graph_prefill_max_batch")
+        .or_else(|| json_opt_usize(&meta_json, "prefill_max_batch"))
+        .filter(|&v| v >= 2);
+
+    Ok(hipfire_kld::RefArchive {
+        meta: hipfire_kld::RefMeta {
+            schema: json_opt_usize(&meta_json, "schema").unwrap_or(1) as u32,
+            base_model_id: json_string(&meta_json, "base_model_id")?,
+            source_model_sha256: json_string(&meta_json, "source_model_sha256")?,
+            tokenizer_sha256: json_opt_string(&meta_json, "tokenizer_sha256"),
+            arch_id: package.arch_id,
+            n_vocab,
+            n_ctx,
+            n_chunk,
+            scored_per_chunk,
+            scoring_start,
+            top_k,
+            total_scored,
+            slice_path: json_string(&meta_json, "slice")?,
+            slice_md5: json_string(&meta_json, "slice_md5")?,
+            config: cfg,
+            producer: hipfire_kld::ProducerInfo {
+                hipfire_version: json_opt_string(&meta_json, "hipfire_version").unwrap_or_default(),
+                git_commit: json_opt_string(&meta_json, "git_commit"),
+                git_describe: json_opt_string(&meta_json, "git_describe"),
+                git_dirty: json_opt_bool(&meta_json, "git_dirty"),
+                gpu_arch: json_opt_string(&meta_json, "gpu_arch").unwrap_or_default(),
+                producer_cmd: json_opt_string(&meta_json, "producer_cmd"),
+            },
+            payload_codecs: Default::default(),
+            content_sha256: None,
+        },
+        tokens,
+        top_indices,
+        top_log_probs,
+        residual_mass,
+    })
+}
+
 /// Acquire a machine-wide exclusive lock on ~/.hipfire/daemon.pid.
 ///
 /// On Unix: flock(2) is the kernel-level lock. The kernel releases it
@@ -218,6 +408,102 @@ mod generate_batch_prefill_tests {
             dn_quant: qwen35::StateQuant::Q8,
             ..fp32_decode_state_signature()
         }
+    }
+
+    fn u32_payload(values: &[u32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn f32_payload(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn write_tiny_hfqm_kldref(path: &std::path::Path, arch_id: u32) {
+        let metadata = serde_json::json!({
+            "schema": 1,
+            "artifact_kind": "hipfire.kldref",
+            "package_schema": "hipfire.kldref.v1",
+            "base_model_id": "tiny-qwen35",
+            "source_model_sha256": "abc",
+            "arch_id": arch_id,
+            "n_vocab": 16,
+            "n_ctx": 4,
+            "n_chunk": 1,
+            "scored_per_chunk": 2,
+            "scoring_start": 2,
+            "top_k": 1,
+            "total_scored": 2,
+            "slice": "tiny.txt",
+            "slice_md5": "md5",
+            "kv_mode": "Fp32",
+            "kld_graph_prefill": true,
+            "kld_graph_prefill_max_batch": "4",
+            "hipfire_version": "test",
+            "gpu_arch": "gfx-test"
+        })
+        .to_string();
+        let tensors = vec![
+            hipfire_runtime::hfq::HfqMemTensor {
+                name: "kldref.tokens".to_string(),
+                quant_type: 0,
+                shape: vec![1, 4],
+                group_size: 0,
+                data: u32_payload(&[1, 2, 3, 4]),
+            },
+            hipfire_runtime::hfq::HfqMemTensor {
+                name: "kldref.top_indices".to_string(),
+                quant_type: 0,
+                shape: vec![1, 2, 1],
+                group_size: 0,
+                data: u32_payload(&[3, 4]),
+            },
+            hipfire_runtime::hfq::HfqMemTensor {
+                name: "kldref.top_log_probs".to_string(),
+                quant_type: 0,
+                shape: vec![1, 2, 1],
+                group_size: 0,
+                data: f32_payload(&[-0.1, -0.2]),
+            },
+            hipfire_runtime::hfq::HfqMemTensor {
+                name: "kldref.residual_mass".to_string(),
+                quant_type: 0,
+                shape: vec![1, 2],
+                group_size: 0,
+                data: f32_payload(&[0.01, 0.02]),
+            },
+        ];
+        hipfire_runtime::hfq::write_hfqm_package_mem(path, arch_id, &metadata, &tensors).unwrap();
+    }
+
+    #[test]
+    fn daemon_reads_hfqm_kldref_with_parent_arch_id() {
+        let path = std::env::temp_dir().join(format!(
+            "hipfire-daemon-kldref-{}-parent.hfq",
+            std::process::id()
+        ));
+        write_tiny_hfqm_kldref(&path, 5);
+        let archive = read_kld_ref_archive(&path).unwrap();
+        assert_eq!(archive.meta.arch_id, 5);
+        assert_eq!(archive.meta.config.kv_mode, "fp32");
+        assert!(archive.meta.config.graph);
+        assert_eq!(archive.meta.config.prefill_max_batch, Some(4));
+        assert_eq!(archive.tokens, vec![1, 2, 3, 4]);
+        assert_eq!(archive.top_indices, vec![3, 4]);
+        assert_eq!(archive.top_log_probs, vec![-0.1, -0.2]);
+        assert_eq!(archive.residual_mass, vec![0.01, 0.02]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn daemon_rejects_hfqm_kldref_arch_zero() {
+        let path = std::env::temp_dir().join(format!(
+            "hipfire-daemon-kldref-{}-arch0.hfq",
+            std::process::id()
+        ));
+        write_tiny_hfqm_kldref(&path, hipfire_runtime::hfq::HFQM_ARCH_NON_WEIGHT_PACKAGE);
+        let err = read_kld_ref_archive(&path).unwrap_err();
+        assert!(err.to_string().contains("arch_id is 0"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -4641,19 +4927,17 @@ fn main() {
                             );
                             continue;
                         };
-                        let archive =
-                            match hipfire_kld::RefArchive::read_file(std::path::Path::new(&ref_in))
-                            {
-                                Ok(a) => a,
-                                Err(e) => {
-                                    emit_error_with_id(
-                                        &mut stdout,
-                                        "",
-                                        format!("kld_eval: read ref {ref_in}: {e}"),
-                                    );
-                                    continue;
-                                }
-                            };
+                        let archive = match read_kld_ref_archive(std::path::Path::new(&ref_in)) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                emit_error_with_id(
+                                    &mut stdout,
+                                    "",
+                                    format!("kld_eval: read ref {ref_in}: {e}"),
+                                );
+                                continue;
+                            }
+                        };
                         let run = hipfire_kld::RunEnv {
                             git_commit: Some(version.clone()),
                             gpu_arch: gpu.arch.clone(),
