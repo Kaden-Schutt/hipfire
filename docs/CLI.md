@@ -258,6 +258,13 @@ Img2img and inpaint requests accept init and mask images at the same source
 dimensions and resize them to the requested output width and height before VAE
 encoding, matching SDAPI clients that send source images separately from target
 dimensions.
+`/sdapi/v1/txt2img` accepts the WebUI high-res fields `enable_hr`, `hr_scale`,
+`hr_resize_x`, `hr_resize_y`, and `hr_second_pass_steps` for HFQ diffusion
+models. Hipfire implements this as a batched first-pass txt2img generation
+followed by a second-pass img2img generation at the high-res target dimensions;
+one-sided `hr_resize_x` or `hr_resize_y` preserves the first-pass aspect ratio,
+and setting both uses the exact requested target. WebUI-specific latent upscaler
+selection is not implemented yet.
 The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128,
 HFQ4G256, and HFQ6G256 tensor payloads even when the artifact `weight_format`
 records a future quantized format such as `oq4`; OQ/MQ/HFP and other packed

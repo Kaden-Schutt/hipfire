@@ -58,6 +58,11 @@ pub struct SdGenerationRequest {
     pub mask: Option<String>,
     pub include_init_images: Option<bool>,
     pub denoising_strength: Option<f64>,
+    pub enable_hr: Option<bool>,
+    pub hr_scale: Option<f64>,
+    pub hr_resize_x: Option<u32>,
+    pub hr_resize_y: Option<u32>,
+    pub hr_second_pass_steps: Option<u32>,
     pub rocm_device_id: Option<i32>,
     pub hipfire_rocm_device_id: Option<i32>,
     pub override_settings: Option<Value>,
@@ -343,6 +348,12 @@ async fn execute_hfq_diffusion_txt2img(
     };
     let n_iter = sd_request_n_iter(&body);
     let save_images = body.save_images.unwrap_or(false);
+    let highres_target = match sdapi_highres_target_dimensions(&body) {
+        Ok(target) => target,
+        Err(error) => return diffusion_error_response(error),
+    };
+    let iteration_steps =
+        request.steps as usize + sdapi_txt2img_highres_steps(&body, highres_target);
     let sdapi_options = state.sdapi_options.lock().await.clone();
     let runtime_options = sd_request_generation_runtime_options(&body, &sdapi_options);
     let progress_state = state.sdapi_progress.clone();
@@ -350,38 +361,79 @@ async fn execute_hfq_diffusion_txt2img(
         &progress_state,
         &body,
         "txt2img",
-        (request.steps as usize).saturating_mul(n_iter as usize),
+        iteration_steps.saturating_mul(n_iter as usize),
     );
     let worker_progress_state = progress_state.clone();
     let worker_body = body.clone();
     let output = match tokio::task::spawn_blocking(move || {
         let mut outputs = Vec::with_capacity(n_iter as usize);
         for iter in 0..n_iter {
-            let mut iter_request = sd_request_to_diffusion_batch_request(
-                &worker_body,
-                None,
-                iter.saturating_mul(batch_size_for_body(&worker_body)),
-            )?;
-            if save_images {
+            let iter_seed_offset = iter.saturating_mul(batch_size_for_body(&worker_body));
+            let mut iter_request =
+                sd_request_to_diffusion_batch_request(&worker_body, None, iter_seed_offset)?;
+            if save_images || highres_target.is_some() {
                 iter_request.send_images = true;
             }
-            let step_offset = iter as usize * iter_request.steps as usize;
-            let total_steps = iter_request.steps as usize * n_iter as usize;
+            let base_step_offset = iter as usize * iteration_steps;
+            let total_steps = iteration_steps * n_iter as usize;
             let mut progress = |progress: DiffusionProgress| {
                 update_sdapi_progress(
                     &worker_progress_state,
                     DiffusionProgress {
-                        completed_steps: step_offset.saturating_add(progress.completed_steps),
+                        completed_steps: base_step_offset.saturating_add(progress.completed_steps),
                         total_steps,
                         timestep: progress.timestep,
                     },
                 )
             };
-            outputs.push(pipeline.generate_batch_with_progress_and_runtime_options(
+            let first_output = pipeline.generate_batch_with_progress_and_runtime_options(
                 iter_request,
                 runtime_options,
                 &mut progress,
-            )?);
+            )?;
+            let Some(target_dimensions) = highres_target else {
+                outputs.push(first_output);
+                continue;
+            };
+
+            let first_pass_images = decode_sd_init_images(&first_output.images)?;
+            let highres_body = sdapi_highres_second_pass_body(&worker_body, target_dimensions);
+            let highres_batch = sd_request_to_diffusion_batch_request(
+                &highres_body,
+                Some(target_dimensions),
+                iter_seed_offset,
+            )?;
+            let highres_request = DiffusionImg2ImgRequest {
+                batch: highres_batch,
+                init_image: first_pass_images,
+                mask: None,
+                denoising_strength: worker_body.denoising_strength.unwrap_or(0.75) as f32,
+            };
+            let highres_step_offset =
+                base_step_offset.saturating_add(first_output_steps(&worker_body));
+            let mut progress = |progress: DiffusionProgress| {
+                update_sdapi_progress(
+                    &worker_progress_state,
+                    DiffusionProgress {
+                        completed_steps: highres_step_offset
+                            .saturating_add(progress.completed_steps),
+                        total_steps,
+                        timestep: progress.timestep,
+                    },
+                )
+            };
+            let mut highres_output = pipeline
+                .generate_img2img_batch_with_progress_and_runtime_options(
+                    highres_request,
+                    runtime_options,
+                    &mut progress,
+                )?;
+            annotate_highres_txt2img_info(
+                &mut highres_output.info,
+                &worker_body,
+                target_dimensions,
+            );
+            outputs.push(highres_output);
         }
         merge_diffusion_outputs(outputs)
     })
@@ -577,17 +629,15 @@ fn sdapi_parameters_text(body: &SdGenerationRequest, mode: &str, info: &Value) -
             .unwrap_or("DPM++ 2M"),
         body.cfg_scale.unwrap_or(7.0),
         seeds.unwrap_or(-1),
-        body.width
-            .or_else(|| info
-                .get("width")
-                .and_then(Value::as_u64)
-                .map(|value| value as u32))
+        info.get("width")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32)
+            .or(body.width)
             .unwrap_or(512),
-        body.height
-            .or_else(|| info
-                .get("height")
-                .and_then(Value::as_u64)
-                .map(|value| value as u32))
+        info.get("height")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32)
+            .or(body.height)
             .unwrap_or(512),
         body.model.as_deref().unwrap_or(""),
         mode,
@@ -1223,6 +1273,147 @@ fn sdapi_img2img_denoise_steps(body: &SdGenerationRequest) -> usize {
     let steps = body.steps.unwrap_or(20).max(1) as f64;
     let strength = body.denoising_strength.unwrap_or(0.75).clamp(0.0, 1.0);
     (steps * strength).ceil() as usize
+}
+
+fn first_output_steps(body: &SdGenerationRequest) -> usize {
+    body.steps.unwrap_or(20) as usize
+}
+
+fn sdapi_txt2img_highres_steps(
+    body: &SdGenerationRequest,
+    highres_target: Option<(u32, u32)>,
+) -> usize {
+    if highres_target.is_some() {
+        sdapi_img2img_denoise_steps(&sdapi_highres_second_pass_body(body, (1, 1)))
+    } else {
+        0
+    }
+}
+
+fn sdapi_highres_second_pass_body(
+    body: &SdGenerationRequest,
+    target_dimensions: (u32, u32),
+) -> SdGenerationRequest {
+    let mut highres_body = body.clone();
+    highres_body.width = Some(target_dimensions.0);
+    highres_body.height = Some(target_dimensions.1);
+    highres_body.steps = Some(
+        body.hr_second_pass_steps
+            .unwrap_or_else(|| body.steps.unwrap_or(20))
+            .max(1),
+    );
+    highres_body.enable_hr = Some(false);
+    highres_body.init_images = None;
+    highres_body.mask = None;
+    highres_body
+}
+
+fn sdapi_highres_target_dimensions(
+    body: &SdGenerationRequest,
+) -> Result<Option<(u32, u32)>, DiffusionError> {
+    if !body.enable_hr.unwrap_or(false) {
+        return Ok(None);
+    }
+    let base_width = body.width.unwrap_or(512);
+    let base_height = body.height.unwrap_or(512);
+    if base_width == 0 || base_height == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "highres txt2img requires non-zero base width and height".to_string(),
+        ));
+    }
+    let resize_x = body.hr_resize_x.unwrap_or(0);
+    let resize_y = body.hr_resize_y.unwrap_or(0);
+    let target = match (resize_x, resize_y) {
+        (0, 0) => {
+            let scale = body.hr_scale.unwrap_or(2.0);
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(DiffusionError::InvalidRequest(
+                    "highres txt2img requires a positive finite hr_scale".to_string(),
+                ));
+            }
+            (
+                scaled_highres_dimension(base_width, scale, "width")?,
+                scaled_highres_dimension(base_height, scale, "height")?,
+            )
+        }
+        (width, 0) => {
+            if width == 0 {
+                unreachable!("zero width handled by match arm");
+            }
+            (
+                width,
+                aspect_scaled_dimension(width, base_height, base_width, "height")?,
+            )
+        }
+        (0, height) => (
+            aspect_scaled_dimension(height, base_width, base_height, "width")?,
+            height,
+        ),
+        (width, height) => (width, height),
+    };
+    Ok(Some(target))
+}
+
+fn scaled_highres_dimension(
+    dimension: u32,
+    scale: f64,
+    label: &str,
+) -> Result<u32, DiffusionError> {
+    let scaled = (dimension as f64 * scale).round();
+    if scaled < 1.0 || scaled > u32::MAX as f64 {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "highres txt2img target {label} is out of range"
+        )));
+    }
+    Ok(scaled as u32)
+}
+
+fn aspect_scaled_dimension(
+    fixed_dimension: u32,
+    scaled_dimension: u32,
+    base_dimension: u32,
+    label: &str,
+) -> Result<u32, DiffusionError> {
+    let value = (fixed_dimension as u64)
+        .saturating_mul(scaled_dimension as u64)
+        .checked_div(base_dimension as u64)
+        .unwrap_or(0)
+        .max(1);
+    u32::try_from(value).map_err(|_| {
+        DiffusionError::InvalidRequest(format!("highres txt2img target {label} is out of range"))
+    })
+}
+
+fn annotate_highres_txt2img_info(
+    info: &mut Value,
+    body: &SdGenerationRequest,
+    target_dimensions: (u32, u32),
+) {
+    if let Value::Object(map) = info {
+        map.insert("mode".to_string(), json!("txt2img-hires"));
+        map.insert("highres".to_string(), json!(true));
+        map.insert(
+            "firstpass_width".to_string(),
+            json!(body.width.unwrap_or(512)),
+        );
+        map.insert(
+            "firstpass_height".to_string(),
+            json!(body.height.unwrap_or(512)),
+        );
+        map.insert("hr_width".to_string(), json!(target_dimensions.0));
+        map.insert("hr_height".to_string(), json!(target_dimensions.1));
+        map.insert(
+            "hr_second_pass_steps".to_string(),
+            json!(body
+                .hr_second_pass_steps
+                .unwrap_or_else(|| body.steps.unwrap_or(20))
+                .max(1)),
+        );
+        map.insert(
+            "denoising_strength".to_string(),
+            json!(body.denoising_strength.unwrap_or(0.75)),
+        );
+    }
 }
 
 fn sdapi_now_secs() -> u64 {
@@ -1963,6 +2154,65 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(text.contains("a cat"));
+        assert!(text.contains("Mode: txt2img"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn txt2img_route_runs_highres_second_pass_for_direct_diffusion_hfq_model() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-sdapi-diffusion-highres-route-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("tiny-route-diffusion-highres.hfq");
+        write_tiny_diffusion_hfq(&hfq_path);
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let body = SdGenerationRequest {
+            prompt: "a highres cat".to_string(),
+            model: Some(hfq_path.to_string_lossy().into_owned()),
+            steps: Some(1),
+            cfg_scale: Some(1.0),
+            width: Some(2),
+            height: Some(2),
+            send_images: Some(true),
+            save_images: Some(false),
+            denoising_strength: Some(1.0),
+            enable_hr: Some(true),
+            hr_scale: Some(2.0),
+            hr_second_pass_steps: Some(1),
+            ..empty_request()
+        };
+
+        let response = post_txt2img(State(state.clone()), Json(body)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+
+        let images = body["images"].as_array().unwrap();
+        assert_eq!(images.len(), 1);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(images[0].as_str().unwrap())
+            .unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap().to_rgb8();
+        assert_eq!(decoded.dimensions(), (4, 4));
+        let info = serde_json::from_str::<Value>(body["info"].as_str().unwrap()).unwrap();
+        assert_eq!(info["mode"], "txt2img-hires");
+        assert_eq!(info["highres"], true);
+        assert_eq!(info["firstpass_width"], 2);
+        assert_eq!(info["firstpass_height"], 2);
+        assert_eq!(info["width"], 4);
+        assert_eq!(info["height"], 4);
+        assert_eq!(info["hr_width"], 4);
+        assert_eq!(info["hr_height"], 4);
+        assert_eq!(info["hr_second_pass_steps"], 1);
+        let Json(progress) = get_progress(State(state.clone())).await;
+        assert_eq!(progress["progress"], 1.0);
+        assert_eq!(progress["state"]["sampling_steps"], 2);
+        let text = extract_png_text_chunk(&bytes, "parameters")
+            .unwrap()
+            .unwrap();
+        assert!(text.contains("Size: 4x4"));
         assert!(text.contains("Mode: txt2img"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3220,6 +3470,58 @@ mod tests {
         assert_eq!(request.crop_y, 8);
     }
 
+    #[test]
+    fn txt2img_highres_target_uses_scale_and_resize_fields() {
+        let scaled = SdGenerationRequest {
+            width: Some(2),
+            height: Some(3),
+            enable_hr: Some(true),
+            hr_scale: Some(2.0),
+            ..empty_request()
+        };
+        assert_eq!(
+            sdapi_highres_target_dimensions(&scaled).unwrap(),
+            Some((4, 6))
+        );
+
+        let resize_x = SdGenerationRequest {
+            width: Some(2),
+            height: Some(3),
+            enable_hr: Some(true),
+            hr_resize_x: Some(8),
+            ..empty_request()
+        };
+        assert_eq!(
+            sdapi_highres_target_dimensions(&resize_x).unwrap(),
+            Some((8, 12))
+        );
+
+        let resize_y = SdGenerationRequest {
+            width: Some(2),
+            height: Some(3),
+            enable_hr: Some(true),
+            hr_resize_y: Some(9),
+            ..empty_request()
+        };
+        assert_eq!(
+            sdapi_highres_target_dimensions(&resize_y).unwrap(),
+            Some((6, 9))
+        );
+
+        let exact = SdGenerationRequest {
+            width: Some(2),
+            height: Some(3),
+            enable_hr: Some(true),
+            hr_resize_x: Some(7),
+            hr_resize_y: Some(5),
+            ..empty_request()
+        };
+        assert_eq!(
+            sdapi_highres_target_dimensions(&exact).unwrap(),
+            Some((7, 5))
+        );
+    }
+
     fn empty_request() -> SdGenerationRequest {
         SdGenerationRequest {
             prompt: String::new(),
@@ -3251,6 +3553,11 @@ mod tests {
             mask: None,
             include_init_images: None,
             denoising_strength: None,
+            enable_hr: None,
+            hr_scale: None,
+            hr_resize_x: None,
+            hr_resize_y: None,
+            hr_second_pass_steps: None,
             rocm_device_id: None,
             hipfire_rocm_device_id: None,
             override_settings: None,
