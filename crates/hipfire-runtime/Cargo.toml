@@ -40,10 +40,11 @@ description = "Inference orchestrator for RDNA GPUs"
 # block below) which serves both as documentation of which features
 # each example needs and as the gate for downstream library consumers
 # who attempt to build examples through their own build script.
-default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-minimax", "arch-lfm2moe", "arch-dots-ocr", "deltanet"]
+default = ["arch-qwen35", "arch-qwen35-vl", "arch-gemma3", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-minimax", "arch-lfm2moe", "arch-dots-ocr", "deltanet"]
 deltanet = ["rdna-compute/deltanet", "hipfire-dispatch/deltanet"]
 arch-qwen35 = []
 arch-qwen35-vl = []
+arch-gemma3 = []
 arch-llama = []
 arch-qwen2 = []
 arch-deepseek4 = []
@@ -105,6 +106,7 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 [dev-dependencies]
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
+hipfire-arch-gemma3 = { path = "../hipfire-arch-gemma3" }
 hipfire-arch-llama = { path = "../hipfire-arch-llama" }
 hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
 # hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }   # chaingun: needs gpu.graphs (not yet on this branch)
@@ -333,6 +335,10 @@ required-features = ["arch-qwen35", "deltanet"]
 [[example]]
 name = "ep_decode_parity"
 required-features = ["experimental-examples", "arch-qwen35"]
+
+[[example]]
+name = "collect_artifacts"
+required-features = ["arch-qwen35", "arch-gemma3"]
 
 # Tokenizer-parity helper: reads a .hfq's tokenizer + tokenizes a text slice.
 # No GPU / arch features needed (tokenizer is pure CPU).

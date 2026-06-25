@@ -1706,6 +1706,7 @@ dependencies = [
  "base64",
  "csv",
  "hip-bridge",
+ "hipfire-arch-gemma3",
  "hipfire-arch-llama",
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",

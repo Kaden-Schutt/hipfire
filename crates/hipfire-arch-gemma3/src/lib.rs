@@ -25,6 +25,7 @@
 //! 9. **No logit/attn soft-capping** in Gemma3.
 
 pub mod arch;
+pub mod calibration;
 pub mod config;
 pub mod forward;
 pub mod weights;
