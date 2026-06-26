@@ -3556,6 +3556,10 @@ pub async fn get_prompt_styles() -> Json<Value> {
     Json(json!([]))
 }
 
+pub async fn get_loras() -> Json<Value> {
+    Json(json!([]))
+}
+
 pub async fn get_embeddings() -> Json<Value> {
     Json(json!({"loaded": {}, "skipped": {}}))
 }
@@ -5798,6 +5802,15 @@ mod tests {
         assert!(memory["ram"]["total"].is_number() || memory["ram"]["error"].is_string());
         assert_eq!(memory["cuda"]["error"], "unavailable");
         assert_eq!(memory["cuda"]["backend"], "hipfire-rocm");
+    }
+
+    #[tokio::test]
+    async fn loras_endpoint_reports_empty_webui_compatible_list() {
+        let Json(loras) = get_loras().await;
+        assert_eq!(loras, json!([]));
+
+        let Json(refresh) = post_control_noop().await;
+        assert_eq!(refresh, json!({}));
     }
 
     #[tokio::test]

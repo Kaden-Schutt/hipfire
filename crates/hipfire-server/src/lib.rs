@@ -171,6 +171,11 @@ pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> Rout
             "/sdapi/v1/prompt-styles",
             get(routes::sdapi::get_prompt_styles),
         )
+        .route("/sdapi/v1/loras", get(routes::sdapi::get_loras))
+        .route(
+            "/sdapi/v1/refresh-loras",
+            post(routes::sdapi::post_control_noop),
+        )
         .route("/sdapi/v1/embeddings", get(routes::sdapi::get_embeddings))
         .route(
             "/sdapi/v1/refresh-embeddings",

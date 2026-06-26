@@ -216,6 +216,12 @@ try:
     samplers = fetch_json(f"{base_url}/sdapi/v1/samplers", timeout=10.0)
     if not isinstance(samplers, list) or not samplers:
         raise RuntimeError(f"samplers endpoint returned no samplers: {samplers}")
+    loras = fetch_json(f"{base_url}/sdapi/v1/loras", timeout=10.0)
+    if not isinstance(loras, list):
+        raise RuntimeError(f"loras endpoint returned non-list: {loras}")
+    refresh_loras = fetch_json(f"{base_url}/sdapi/v1/refresh-loras", {}, timeout=10.0)
+    if not isinstance(refresh_loras, dict):
+        raise RuntimeError(f"refresh-loras endpoint returned non-object: {refresh_loras}")
 
     txt_body = {
         "model": model,
@@ -287,6 +293,7 @@ try:
         "n_iter": n_iter,
         "images_per_route": expected_images,
         "rocm_device_id": rocm_device_id,
+        "loras": len(loras),
         "txt2img": {"backend": txt_info.get("backend"), "runtime": txt_info.get("runtime")},
         "img2img": {"masked": img_info.get("masked")},
         "masked_img2img": {"masked": masked_info.get("masked")},

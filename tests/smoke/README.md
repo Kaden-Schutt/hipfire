@@ -18,8 +18,9 @@ claims.
 - `diffusion-sdapi-smoke.sh` starts `hipfire serve` and validates the
   stable-diffusion-webui-compatible HTTP API against a local runnable diffusion
   `.hfq`: `txt2img`, `img2img`, masked `img2img`, PNG dimensions, `png-info`,
-  options, samplers, and progress. Set `HIPFIRE_DIFFUSION_SMOKE_MODEL` when the
-  default `/tmp/hipfire-tiny-sd-diffusion.hfq` is not present. Set
+  options, samplers, LoRA metadata, and progress. Set
+  `HIPFIRE_DIFFUSION_SMOKE_MODEL` when the default
+  `/tmp/hipfire-tiny-sd-diffusion.hfq` is not present. Set
   `HIPFIRE_DIFFUSION_SMOKE_BATCH_SIZE` and `HIPFIRE_DIFFUSION_SMOKE_N_ITER` to
   validate WebUI batch and iteration semantics against batch-capable artifacts.
   Set `HIPFIRE_DIFFUSION_SMOKE_ROCM_DEVICE_ID` to validate the hybrid ROCm
