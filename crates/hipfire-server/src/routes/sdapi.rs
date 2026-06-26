@@ -8,10 +8,10 @@ use hipfire_config::models_dir;
 use hipfire_diffusion::{
     encode_rgb_batch_png_base64, inspect_hfq, inspect_hfq_with_runtime_support,
     resize_rgb_batch_nearest, resize_rgb_batch_to_contain_fill_nearest,
-    resize_rgb_batch_to_cover_nearest, DiffusionBatchOutput, DiffusionBatchRequest, DiffusionError,
-    DiffusionGenerationRuntimeOptions, DiffusionHfqInspection, DiffusionImg2ImgRequest,
-    DiffusionImg2ImgResizeMode, DiffusionPipeline, DiffusionProgress, DiffusionPrompt,
-    RgbImageBatch,
+    resize_rgb_batch_to_cover_nearest, CpuTensor, DiffusionBatchOutput, DiffusionBatchRequest,
+    DiffusionError, DiffusionExternalConditioningBatch, DiffusionGenerationRuntimeOptions,
+    DiffusionHfqInspection, DiffusionImg2ImgRequest, DiffusionImg2ImgResizeMode, DiffusionPipeline,
+    DiffusionProgress, DiffusionPrompt, RgbImageBatch,
 };
 use image::{ImageEncoder, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
@@ -122,6 +122,10 @@ pub struct SdGenerationRequest {
     pub hr_scheduler: Option<String>,
     pub hr_prompt: Option<String>,
     pub hr_negative_prompt: Option<String>,
+    pub hipfire_prompt_embeddings: Option<CpuTensor>,
+    pub hipfire_negative_embeddings: Option<CpuTensor>,
+    pub hipfire_prompt_pooled_embeddings: Option<CpuTensor>,
+    pub hipfire_negative_pooled_embeddings: Option<CpuTensor>,
     pub rocm_device_id: Option<i32>,
     pub hipfire_rocm_device_id: Option<i32>,
     pub override_settings: Option<Value>,
@@ -1716,8 +1720,10 @@ fn sd_request_to_diffusion_batch_request(
         .height
         .or_else(|| default_dimensions.map(|dimensions| dimensions.1))
         .unwrap_or(512);
+    let conditioning = sdapi_external_conditioning(body, batch_size as usize)?;
     Ok(DiffusionBatchRequest {
         prompts,
+        conditioning,
         width,
         height,
         original_width: body.original_width,
@@ -1740,6 +1746,121 @@ fn sd_request_to_diffusion_batch_request(
         subseed_strength: body.subseed_strength.unwrap_or(0.0) as f32,
         send_images: body.send_images.unwrap_or(true),
         save_images: body.save_images.unwrap_or(false),
+    })
+}
+
+fn sdapi_external_conditioning(
+    body: &SdGenerationRequest,
+    batch_size: usize,
+) -> Result<Option<DiffusionExternalConditioningBatch>, DiffusionError> {
+    match (
+        body.hipfire_prompt_embeddings.as_ref(),
+        body.hipfire_negative_embeddings.as_ref(),
+    ) {
+        (None, None) => {
+            if body.hipfire_prompt_pooled_embeddings.is_some()
+                || body.hipfire_negative_pooled_embeddings.is_some()
+            {
+                return Err(DiffusionError::InvalidRequest(
+                    "hipfire pooled conditioning requires hipfire_prompt_embeddings and hipfire_negative_embeddings".to_string(),
+                ));
+            }
+            Ok(None)
+        }
+        (Some(prompt), Some(negative)) => {
+            let prompt_embeddings =
+                sdapi_expand_conditioning_batch(prompt.clone(), batch_size, "hipfire_prompt_embeddings")?;
+            let negative_embeddings = sdapi_expand_conditioning_batch(
+                negative.clone(),
+                batch_size,
+                "hipfire_negative_embeddings",
+            )?;
+            let prompt_pooled_embeddings = body
+                .hipfire_prompt_pooled_embeddings
+                .clone()
+                .map(|tensor| {
+                    sdapi_expand_conditioning_batch(
+                        tensor,
+                        batch_size,
+                        "hipfire_prompt_pooled_embeddings",
+                    )
+                })
+                .transpose()?;
+            let negative_pooled_embeddings = body
+                .hipfire_negative_pooled_embeddings
+                .clone()
+                .map(|tensor| {
+                    sdapi_expand_conditioning_batch(
+                        tensor,
+                        batch_size,
+                        "hipfire_negative_pooled_embeddings",
+                    )
+                })
+                .transpose()?;
+            if prompt_pooled_embeddings.is_some() != negative_pooled_embeddings.is_some() {
+                return Err(DiffusionError::InvalidRequest(
+                    "hipfire pooled conditioning requires both hipfire_prompt_pooled_embeddings and hipfire_negative_pooled_embeddings".to_string(),
+                ));
+            }
+            Ok(Some(DiffusionExternalConditioningBatch {
+                prompt_embeddings,
+                negative_embeddings,
+                prompt_pooled_embeddings,
+                negative_pooled_embeddings,
+            }))
+        }
+        _ => Err(DiffusionError::InvalidRequest(
+            "hipfire external conditioning requires both hipfire_prompt_embeddings and hipfire_negative_embeddings".to_string(),
+        )),
+    }
+}
+
+fn sdapi_expand_conditioning_batch(
+    tensor: CpuTensor,
+    batch_size: usize,
+    label: &str,
+) -> Result<CpuTensor, DiffusionError> {
+    let Some(&tensor_batch) = tensor.shape.first() else {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "{label} must have a leading batch dimension"
+        )));
+    };
+    let elements = sdapi_checked_shape_elements(label, &tensor.shape)?;
+    if tensor.data.len() != elements {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "{label} has {} elements but shape {:?} expects {elements}",
+            tensor.data.len(),
+            tensor.shape
+        )));
+    }
+    if tensor_batch == batch_size {
+        return Ok(tensor);
+    }
+    if tensor_batch != 1 {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "{label} batch {tensor_batch} must be 1 or match requested batch_size {batch_size}"
+        )));
+    }
+    let per_batch_elements = elements.checked_div(tensor_batch).ok_or_else(|| {
+        DiffusionError::InvalidRequest(format!("{label} batch dimension must be non-zero"))
+    })?;
+    let total_elements = per_batch_elements.checked_mul(batch_size).ok_or_else(|| {
+        DiffusionError::InvalidRequest(format!("{label} expanded batch overflows"))
+    })?;
+    let mut data = Vec::with_capacity(total_elements);
+    for _ in 0..batch_size {
+        data.extend_from_slice(&tensor.data[..per_batch_elements]);
+    }
+    let mut shape = tensor.shape;
+    shape[0] = batch_size;
+    Ok(CpuTensor { shape, data })
+}
+
+fn sdapi_checked_shape_elements(label: &str, shape: &[usize]) -> Result<usize, DiffusionError> {
+    shape.iter().try_fold(1usize, |acc, &dim| {
+        acc.checked_mul(dim).ok_or_else(|| {
+            DiffusionError::InvalidRequest(format!("{label} shape element count overflows"))
+        })
     })
 }
 
@@ -6875,6 +6996,70 @@ mod tests {
     }
 
     #[test]
+    fn txt2img_request_maps_external_conditioning_to_diffusion_request() {
+        let body = SdGenerationRequest {
+            prompt: "externally encoded prompt".to_string(),
+            batch_size: Some(2),
+            hipfire_prompt_embeddings: Some(CpuTensor {
+                shape: vec![1, 1, 2],
+                data: vec![0.25, -0.25],
+            }),
+            hipfire_negative_embeddings: Some(CpuTensor {
+                shape: vec![1, 1, 2],
+                data: vec![0.0, 0.0],
+            }),
+            hipfire_prompt_pooled_embeddings: Some(CpuTensor {
+                shape: vec![1, 2],
+                data: vec![0.5, -0.5],
+            }),
+            hipfire_negative_pooled_embeddings: Some(CpuTensor {
+                shape: vec![1, 2],
+                data: vec![0.0, 0.0],
+            }),
+            ..empty_request()
+        };
+
+        let request = sd_request_to_diffusion_batch_request(&body, None, 0).unwrap();
+        let conditioning = request.conditioning.unwrap();
+
+        assert_eq!(conditioning.prompt_embeddings.shape, vec![2, 1, 2]);
+        assert_eq!(
+            conditioning.prompt_embeddings.data,
+            vec![0.25, -0.25, 0.25, -0.25]
+        );
+        assert_eq!(conditioning.negative_embeddings.shape, vec![2, 1, 2]);
+        assert_eq!(
+            conditioning.negative_embeddings.data,
+            vec![0.0, 0.0, 0.0, 0.0]
+        );
+        assert_eq!(
+            conditioning.prompt_pooled_embeddings.unwrap().shape,
+            vec![2, 2]
+        );
+        assert_eq!(
+            conditioning.negative_pooled_embeddings.unwrap().data,
+            vec![0.0, 0.0, 0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn txt2img_request_rejects_unpaired_external_conditioning() {
+        let body = SdGenerationRequest {
+            hipfire_prompt_embeddings: Some(CpuTensor {
+                shape: vec![1, 1, 2],
+                data: vec![0.25, -0.25],
+            }),
+            ..empty_request()
+        };
+
+        let error = sd_request_to_diffusion_batch_request(&body, None, 0).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("requires both hipfire_prompt_embeddings"));
+    }
+
+    #[test]
     fn txt2img_request_applies_iteration_seed_offset() {
         let body = SdGenerationRequest {
             prompt: "a small red robot".to_string(),
@@ -7555,6 +7740,10 @@ mod tests {
             hr_scheduler: None,
             hr_prompt: None,
             hr_negative_prompt: None,
+            hipfire_prompt_embeddings: None,
+            hipfire_negative_embeddings: None,
+            hipfire_prompt_pooled_embeddings: None,
+            hipfire_negative_pooled_embeddings: None,
             rocm_device_id: None,
             hipfire_rocm_device_id: None,
             override_settings: None,

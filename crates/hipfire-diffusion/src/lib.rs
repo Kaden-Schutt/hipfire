@@ -355,6 +355,8 @@ pub struct DiffusionHfqInspection {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DiffusionBatchRequest {
     pub prompts: Vec<DiffusionPrompt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditioning: Option<DiffusionExternalConditioningBatch>,
     pub width: u32,
     pub height: u32,
     #[serde(default)]
@@ -380,6 +382,16 @@ pub struct DiffusionBatchRequest {
     pub subseed_strength: f32,
     pub send_images: bool,
     pub save_images: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DiffusionExternalConditioningBatch {
+    pub prompt_embeddings: CpuTensor,
+    pub negative_embeddings: CpuTensor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_pooled_embeddings: Option<CpuTensor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negative_pooled_embeddings: Option<CpuTensor>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -3147,7 +3159,7 @@ fn box_muller_pair(rng: &mut SplitMix64) -> (f32, f32) {
     (radius * theta.cos(), radius * theta.sin())
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CpuTensor {
     pub shape: Vec<usize>,
     pub data: Vec<f32>,
@@ -5135,6 +5147,12 @@ impl DiffusionPipeline {
         runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<DiffusionConditioningBatch> {
         validate_batch_request(&self.metadata, request)?;
+        if let Some(conditioning) = request.conditioning.as_ref() {
+            return Ok(diffusion_conditioning_from_external_batch(
+                conditioning,
+                request.prompts.len(),
+            ));
+        }
         let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
             DiffusionError::BackendUnavailable(
                 "diffusion HFQ does not contain a usable CLIP tokenizer".to_string(),
@@ -5265,6 +5283,34 @@ impl DiffusionPipeline {
             prompt_pooled_embeddings,
             negative_pooled_embeddings,
         })
+    }
+}
+
+fn diffusion_conditioning_from_external_batch(
+    conditioning: &DiffusionExternalConditioningBatch,
+    batch: usize,
+) -> DiffusionConditioningBatch {
+    let prompt_cross_attention_embeddings = conditioning
+        .prompt_pooled_embeddings
+        .as_ref()
+        .map(|_| conditioning.prompt_embeddings.clone());
+    let negative_cross_attention_embeddings = conditioning
+        .negative_pooled_embeddings
+        .as_ref()
+        .map(|_| conditioning.negative_embeddings.clone());
+    DiffusionConditioningBatch {
+        prompt_tokens: vec![Vec::new(); batch],
+        negative_tokens: vec![Vec::new(); batch],
+        prompt_tokens_2: None,
+        negative_tokens_2: None,
+        prompt_embeddings: Some(conditioning.prompt_embeddings.clone()),
+        negative_embeddings: Some(conditioning.negative_embeddings.clone()),
+        prompt_embeddings_2: None,
+        negative_embeddings_2: None,
+        prompt_cross_attention_embeddings,
+        negative_cross_attention_embeddings,
+        prompt_pooled_embeddings: conditioning.prompt_pooled_embeddings.clone(),
+        negative_pooled_embeddings: conditioning.negative_pooled_embeddings.clone(),
     }
 }
 
@@ -15139,6 +15185,134 @@ fn validate_batch_request(
             "steps must be greater than zero".to_string(),
         ));
     }
+    if let Some(conditioning) = request.conditioning.as_ref() {
+        validate_external_conditioning_batch(conditioning, request.prompts.len())?;
+    }
+    Ok(())
+}
+
+fn validate_external_conditioning_batch(
+    conditioning: &DiffusionExternalConditioningBatch,
+    batch: usize,
+) -> DiffusionResult<()> {
+    let prompt_shape = validate_external_conditioning_hidden(
+        "prompt_embeddings",
+        &conditioning.prompt_embeddings,
+        batch,
+    )?;
+    let negative_shape = validate_external_conditioning_hidden(
+        "negative_embeddings",
+        &conditioning.negative_embeddings,
+        batch,
+    )?;
+    if prompt_shape != negative_shape {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "external prompt_embeddings shape {:?} must match negative_embeddings shape {:?}",
+            conditioning.prompt_embeddings.shape, conditioning.negative_embeddings.shape
+        )));
+    }
+    match (
+        conditioning.prompt_pooled_embeddings.as_ref(),
+        conditioning.negative_pooled_embeddings.as_ref(),
+    ) {
+        (Some(prompt), Some(negative)) => {
+            let prompt_shape =
+                validate_external_conditioning_pooled("prompt_pooled_embeddings", prompt, batch)?;
+            let negative_shape = validate_external_conditioning_pooled(
+                "negative_pooled_embeddings",
+                negative,
+                batch,
+            )?;
+            if prompt_shape != negative_shape {
+                return Err(DiffusionError::InvalidRequest(format!(
+                    "external prompt_pooled_embeddings shape {:?} must match negative_pooled_embeddings shape {:?}",
+                    prompt.shape, negative.shape
+                )));
+            }
+        }
+        (None, None) => {}
+        _ => {
+            return Err(DiffusionError::InvalidRequest(
+                "external pooled conditioning requires both prompt_pooled_embeddings and negative_pooled_embeddings".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_external_conditioning_hidden(
+    label: &str,
+    tensor: &CpuTensor,
+    batch: usize,
+) -> DiffusionResult<[usize; 3]> {
+    let shape = match tensor.shape.as_slice() {
+        [tensor_batch, seq, width] => [*tensor_batch, *seq, *width],
+        _ => {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "external {label} must be a 3-D tensor [batch, sequence, width], got {:?}",
+                tensor.shape
+            )));
+        }
+    };
+    validate_external_conditioning_shape(label, &tensor.shape, &tensor.data, batch)?;
+    if shape[1] == 0 || shape[2] == 0 {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "external {label} sequence and width must be non-zero, got {:?}",
+            tensor.shape
+        )));
+    }
+    Ok(shape)
+}
+
+fn validate_external_conditioning_pooled(
+    label: &str,
+    tensor: &CpuTensor,
+    batch: usize,
+) -> DiffusionResult<[usize; 2]> {
+    let shape = match tensor.shape.as_slice() {
+        [tensor_batch, width] => [*tensor_batch, *width],
+        _ => {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "external {label} must be a 2-D tensor [batch, width], got {:?}",
+                tensor.shape
+            )));
+        }
+    };
+    validate_external_conditioning_shape(label, &tensor.shape, &tensor.data, batch)?;
+    if shape[1] == 0 {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "external {label} width must be non-zero, got {:?}",
+            tensor.shape
+        )));
+    }
+    Ok(shape)
+}
+
+fn validate_external_conditioning_shape(
+    label: &str,
+    shape: &[usize],
+    data: &[f32],
+    batch: usize,
+) -> DiffusionResult<()> {
+    if shape.first().copied() != Some(batch) {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "external {label} batch {} must match prompt batch {batch}",
+            shape.first().copied().unwrap_or(0)
+        )));
+    }
+    let elements = checked_shape_elements(&format!("external {label}"), shape)?;
+    if data.len() != elements {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "external {label} has {} elements but shape {:?} expects {elements}",
+            data.len(),
+            shape
+        )));
+    }
+    if data.iter().any(|value| !value.is_finite()) {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "external {label} contains non-finite values"
+        )));
+    }
     Ok(())
 }
 
@@ -15994,26 +16168,17 @@ fn native_runtime_metadata_support_error(metadata: &DiffusionHfqMetadata) -> Opt
             ));
         }
     }
-    let text_encoder_class = metadata
-        .components
-        .get("text_encoder")
-        .and_then(|component| component.class_name.as_deref());
-    if uses_supported_transformer && text_encoder_class.is_none() {
-        return Some(
-            "native transformer runtime currently requires a CLIP-compatible text_encoder component"
-                .to_string(),
-        );
-    }
-    if let Some(text_encoder) = text_encoder_class {
-        if text_encoder != "CLIPTextModel" && text_encoder != "CLIPTextModelWithProjection" {
-            if uses_supported_transformer {
+    if !uses_supported_transformer {
+        let text_encoder_class = metadata
+            .components
+            .get("text_encoder")
+            .and_then(|component| component.class_name.as_deref());
+        if let Some(text_encoder) = text_encoder_class {
+            if text_encoder != "CLIPTextModel" && text_encoder != "CLIPTextModelWithProjection" {
                 return Some(format!(
-                    "native transformer runtime currently requires CLIP-compatible text encoders; artifact text_encoder class {text_encoder:?} is unsupported"
+                    "native diffusion runtime supports CLIP text encoders only; artifact text_encoder class {text_encoder:?} is unsupported"
                 ));
             }
-            return Some(format!(
-                "native diffusion runtime supports CLIP text encoders only; artifact text_encoder class {text_encoder:?} is unsupported"
-            ));
         }
     }
     if !matches!(quantization.activation_format.as_str(), "fp16" | "fp32") {
@@ -19062,6 +19227,8 @@ mod tests {
     fn validates_batched_request_limits() {
         let metadata = minimal_metadata();
         let request = DiffusionBatchRequest {
+            conditioning: None,
+
             prompts: vec![
                 DiffusionPrompt {
                     prompt: "a".into(),
@@ -20583,6 +20750,8 @@ mod tests {
             vae_scale_factor: 1,
         };
         let request = DiffusionBatchRequest {
+            conditioning: None,
+
             prompts: vec![DiffusionPrompt {
                 prompt: "a".into(),
                 negative_prompt: String::new(),
@@ -20635,6 +20804,8 @@ mod tests {
             vae_scale_factor: 1,
         };
         let request = DiffusionBatchRequest {
+            conditioning: None,
+
             prompts: vec![
                 DiffusionPrompt {
                     prompt: "a".into(),
@@ -20927,6 +21098,8 @@ mod tests {
         let mut pipeline = DiffusionPipeline::open_hfq(&hfq_path).unwrap();
         pipeline.config.scheduler = tiny_sd_scheduler_config_for_tests();
         let mut request = DiffusionBatchRequest {
+            conditioning: None,
+
             prompts: vec![DiffusionPrompt {
                 prompt: "a".into(),
                 negative_prompt: String::new(),
@@ -21505,6 +21678,8 @@ mod tests {
             vae_scale_factor: 8,
         };
         let request = DiffusionBatchRequest {
+            conditioning: None,
+
             prompts: vec![DiffusionPrompt {
                 prompt: "a".into(),
                 negative_prompt: String::new(),
@@ -21567,6 +21742,8 @@ mod tests {
             vae_scale_factor: 8,
         };
         let request = DiffusionBatchRequest {
+            conditioning: None,
+
             prompts: vec![
                 DiffusionPrompt {
                     prompt: "a".into(),
@@ -21663,6 +21840,8 @@ mod tests {
             vae_scale_factor: 8,
         };
         let request = DiffusionBatchRequest {
+            conditioning: None,
+
             prompts: vec![DiffusionPrompt {
                 prompt: "a".into(),
                 negative_prompt: String::new(),
@@ -21743,6 +21922,8 @@ mod tests {
             vae_scale_factor: 8,
         };
         let request = DiffusionBatchRequest {
+            conditioning: None,
+
             prompts: vec![DiffusionPrompt {
                 prompt: "a".into(),
                 negative_prompt: String::new(),
@@ -21829,6 +22010,8 @@ mod tests {
             vae_scale_factor: 8,
         };
         let request = DiffusionBatchRequest {
+            conditioning: None,
+
             prompts: vec![DiffusionPrompt {
                 prompt: "a".into(),
                 negative_prompt: String::new(),
@@ -21872,6 +22055,8 @@ mod tests {
     #[test]
     fn sdxl_time_ids_default_to_requested_size_and_crop() {
         let request = DiffusionBatchRequest {
+            conditioning: None,
+
             prompts: vec![
                 DiffusionPrompt {
                     prompt: "a".into(),
@@ -24308,6 +24493,8 @@ mod tests {
             native_runtime_error: None,
         };
         let request = DiffusionBatchRequest {
+            conditioning: None,
+
             prompts: vec![
                 DiffusionPrompt {
                     prompt: "a cat".into(),
@@ -24430,6 +24617,8 @@ mod tests {
         }
         let pipeline = tiny_txt2img_test_pipeline(Box::new(SolidTensorImageDecoder));
         let request = DiffusionBatchRequest {
+            conditioning: None,
+
             prompts: vec![DiffusionPrompt {
                 prompt: "a cat".into(),
                 negative_prompt: String::new(),
@@ -24540,6 +24729,8 @@ mod tests {
             native_runtime_error: Some("dual encoder test".into()),
         };
         let request = DiffusionBatchRequest {
+            conditioning: None,
+
             prompts: vec![DiffusionPrompt {
                 prompt: "a cat".into(),
                 negative_prompt: String::new(),
@@ -24666,6 +24857,8 @@ mod tests {
             native_runtime_error: None,
         };
         let request = DiffusionBatchRequest {
+            conditioning: None,
+
             prompts: vec![DiffusionPrompt {
                 prompt: "a cat".into(),
                 negative_prompt: String::new(),
@@ -24705,6 +24898,8 @@ mod tests {
         );
         let request = DiffusionImg2ImgRequest {
             batch: DiffusionBatchRequest {
+                conditioning: None,
+
                 prompts: vec![DiffusionPrompt {
                     prompt: "a cat".into(),
                     negative_prompt: String::new(),
@@ -24751,6 +24946,8 @@ mod tests {
         );
         let request = DiffusionImg2ImgRequest {
             batch: DiffusionBatchRequest {
+                conditioning: None,
+
                 prompts: vec![DiffusionPrompt {
                     prompt: "a cat".into(),
                     negative_prompt: String::new(),
@@ -24805,6 +25002,8 @@ mod tests {
         );
         let request = DiffusionImg2ImgRequest {
             batch: DiffusionBatchRequest {
+                conditioning: None,
+
                 prompts: vec![DiffusionPrompt {
                     prompt: "a cat".into(),
                     negative_prompt: String::new(),
@@ -24848,6 +25047,91 @@ mod tests {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(&output.images[0])
             .unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap().to_rgb8();
+        assert_eq!(decoded.dimensions(), (2, 2));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diffusion_pipeline_qwen_transformer_accepts_external_conditioning_without_clip() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-diffusion-qwen-external-conditioning-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("tiny-qwen-transformer-external.hfq");
+        let mut metadata = tiny_qwen_transformer_runtime_metadata();
+        metadata.components.remove("text_encoder");
+        let tensors = tiny_qwen_transformer_runtime_tensors()
+            .into_iter()
+            .filter(|tensor| {
+                !tensor.name.starts_with("text_encoder/") && !tensor.name.starts_with("tokenizer/")
+            })
+            .collect::<Vec<_>>();
+        write_hfqm_package_mem(
+            &hfq_path,
+            HFQ_ARCH_DIFFUSION,
+            &serde_json::to_string(&metadata).unwrap(),
+            &tensors,
+        )
+        .unwrap();
+        let inspection = inspect_hfq_with_runtime_support(&hfq_path).unwrap();
+        assert!(inspection.runtime_support.supported);
+        let pipeline = DiffusionPipeline::open_hfq(&hfq_path).unwrap();
+        let mut request = DiffusionBatchRequest {
+            conditioning: None,
+            prompts: vec![DiffusionPrompt {
+                prompt: "a cat".into(),
+                negative_prompt: String::new(),
+                seed: 9,
+                subseed: None,
+            }],
+            width: 2,
+            height: 2,
+            original_width: None,
+            original_height: None,
+            target_width: None,
+            target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
+            crop_x: 0,
+            crop_y: 0,
+            steps: 1,
+            cfg_scale: 1.0,
+            scheduler: "Euler".into(),
+            subseed_strength: 0.0,
+            send_images: true,
+            save_images: false,
+        };
+
+        let prompt_error = pipeline.generate_batch(request.clone()).unwrap_err();
+        assert!(prompt_error
+            .to_string()
+            .contains("does not contain a usable CLIP tokenizer"));
+
+        request.conditioning = Some(DiffusionExternalConditioningBatch {
+            prompt_embeddings: CpuTensor {
+                shape: vec![1, 1, 2],
+                data: vec![0.5, -0.5],
+            },
+            negative_embeddings: CpuTensor {
+                shape: vec![1, 1, 2],
+                data: vec![0.5, -0.5],
+            },
+            prompt_pooled_embeddings: None,
+            negative_pooled_embeddings: None,
+        });
+
+        let output = pipeline.generate_batch(request).unwrap();
+
+        assert_eq!(output.images.len(), 1);
+        assert_eq!(output.info["backend"], "hipfire-diffusion-hfq");
+        assert_eq!(output.info["pipeline"], "QwenImagePipeline");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&output.images[0])
+            .unwrap();
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
         let decoded = image::load_from_memory(&bytes).unwrap().to_rgb8();
         assert_eq!(decoded.dimensions(), (2, 2));
         let _ = fs::remove_dir_all(&dir);
@@ -24939,6 +25223,8 @@ mod tests {
         );
         let request = DiffusionImg2ImgRequest {
             batch: DiffusionBatchRequest {
+                conditioning: None,
+
                 prompts: vec![DiffusionPrompt {
                     prompt: "a cat".into(),
                     negative_prompt: String::new(),
@@ -25008,6 +25294,8 @@ mod tests {
         .unwrap();
         let pipeline = DiffusionPipeline::open_hfq(&hfq_path).unwrap();
         let request = DiffusionBatchRequest {
+            conditioning: None,
+
             prompts: vec![DiffusionPrompt {
                 prompt: "a cat".into(),
                 negative_prompt: String::new(),
@@ -25068,6 +25356,8 @@ mod tests {
         let capabilities = pipeline.runtime_capabilities().unwrap();
         assert_eq!(capabilities.kind, DiffusionRuntimeKind::CpuSourceReference);
         let request = DiffusionBatchRequest {
+            conditioning: None,
+
             prompts: vec![DiffusionPrompt {
                 prompt: "a cat".into(),
                 negative_prompt: String::new(),
@@ -25130,6 +25420,8 @@ mod tests {
         .unwrap();
         let pipeline = DiffusionPipeline::open_hfq(&hfq_path).unwrap();
         let request = DiffusionBatchRequest {
+            conditioning: None,
+
             prompts: vec![DiffusionPrompt {
                 prompt: "a cat".into(),
                 negative_prompt: String::new(),
@@ -25192,6 +25484,8 @@ mod tests {
         let pipeline = DiffusionPipeline::open_hfq(&hfq_path).unwrap();
         assert!(pipeline.native_runtime.is_some());
         let request = DiffusionBatchRequest {
+            conditioning: None,
+
             prompts: vec![DiffusionPrompt {
                 prompt: "a cat".into(),
                 negative_prompt: String::new(),
@@ -25257,6 +25551,8 @@ mod tests {
         let pipeline = DiffusionPipeline::open_hfq(&hfq_path).unwrap();
         assert!(pipeline.native_runtime.is_some());
         let request = DiffusionBatchRequest {
+            conditioning: None,
+
             prompts: vec![DiffusionPrompt {
                 prompt: "a cat".into(),
                 negative_prompt: String::new(),
@@ -25321,6 +25617,8 @@ mod tests {
         let pipeline = DiffusionPipeline::open_hfq(&hfq_path).unwrap();
         assert!(pipeline.native_runtime.is_some());
         let request = DiffusionBatchRequest {
+            conditioning: None,
+
             prompts: vec![DiffusionPrompt {
                 prompt: "a cat".into(),
                 negative_prompt: String::new(),
@@ -25385,6 +25683,8 @@ mod tests {
         let pipeline = DiffusionPipeline::open_hfq(&hfq_path).unwrap();
         assert!(pipeline.native_runtime.is_some());
         let request = DiffusionBatchRequest {
+            conditioning: None,
+
             prompts: vec![DiffusionPrompt {
                 prompt: "a cat".into(),
                 negative_prompt: String::new(),
@@ -25459,6 +25759,8 @@ mod tests {
             let pipeline = DiffusionPipeline::open_hfq(&hfq_path).unwrap();
             assert!(pipeline.native_runtime.is_some());
             let request = DiffusionBatchRequest {
+                conditioning: None,
+
                 prompts: vec![DiffusionPrompt {
                     prompt: "a cat".into(),
                     negative_prompt: String::new(),
@@ -25524,6 +25826,8 @@ mod tests {
         let pipeline = DiffusionPipeline::open_hfq(&hfq_path).unwrap();
         assert!(pipeline.native_runtime.is_some());
         let request = DiffusionBatchRequest {
+            conditioning: None,
+
             prompts: vec![DiffusionPrompt {
                 prompt: "a cat".into(),
                 negative_prompt: String::new(),
@@ -25617,6 +25921,8 @@ mod tests {
         assert!(pipeline.supports_img2img());
         let request = DiffusionImg2ImgRequest {
             batch: DiffusionBatchRequest {
+                conditioning: None,
+
                 prompts: vec![DiffusionPrompt {
                     prompt: "a cat".into(),
                     negative_prompt: String::new(),
@@ -26525,6 +26831,8 @@ mod tests {
         }
         let pipeline = DiffusionPipeline::open_hfq(&path).unwrap();
         let request = DiffusionBatchRequest {
+            conditioning: None,
+
             prompts: vec![DiffusionPrompt {
                 prompt: "a red robot".into(),
                 negative_prompt: String::new(),
@@ -26570,6 +26878,8 @@ mod tests {
         }
         let request = DiffusionImg2ImgRequest {
             batch: DiffusionBatchRequest {
+                conditioning: None,
+
                 prompts: vec![DiffusionPrompt {
                     prompt: "a red robot".into(),
                     negative_prompt: String::new(),
@@ -26617,6 +26927,8 @@ mod tests {
             return;
         }
         let request = DiffusionBatchRequest {
+            conditioning: None,
+
             prompts: vec![DiffusionPrompt {
                 prompt: "a red robot".into(),
                 negative_prompt: String::new(),

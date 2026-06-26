@@ -355,6 +355,7 @@ fn run_preflight(args: DiffusionPreflightArgs) -> anyhow::Result<()> {
     )?;
     let request = DiffusionBatchRequest {
         prompts,
+        conditioning: None,
         width: args.width,
         height: args.height,
         original_width: None,
@@ -419,6 +420,7 @@ fn run_txt2img(args: DiffusionTxt2ImgArgs) -> anyhow::Result<()> {
     )?;
     let request = DiffusionBatchRequest {
         prompts,
+        conditioning: None,
         width: args.width,
         height: args.height,
         original_width: None,
@@ -661,6 +663,7 @@ fn run_img2img(args: DiffusionImg2ImgArgs) -> anyhow::Result<()> {
     let request = DiffusionImg2ImgRequest {
         batch: DiffusionBatchRequest {
             prompts,
+            conditioning: None,
             width,
             height,
             original_width: None,
@@ -805,6 +808,8 @@ fn run_smoke(args: DiffusionSmokeArgs) -> anyhow::Result<()> {
 fn smoke_batch_request(args: &DiffusionSmokeArgs, seed: i64) -> DiffusionBatchRequest {
     let batch_size = args.batch_size.max(1);
     DiffusionBatchRequest {
+        conditioning: None,
+
         prompts: (0..batch_size)
             .map(|idx| DiffusionPrompt {
                 prompt: args.prompt.clone(),
