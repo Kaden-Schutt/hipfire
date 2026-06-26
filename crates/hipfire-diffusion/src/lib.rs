@@ -388,11 +388,12 @@ pub struct DiffusionBatchOutput {
     pub info: Value,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DiffusionProgress {
     pub completed_steps: usize,
     pub total_steps: usize,
     pub timestep: usize,
+    pub preview_latents: Option<LatentBatch>,
 }
 
 pub struct MaskedDenoiseReference<'a> {
@@ -1800,6 +1801,7 @@ fn denoise_latents_with_cfg_progress_and_runtime_options(
                 completed_steps: step + 1,
                 total_steps: schedule.timesteps.len(),
                 timestep: timestep.round().max(0.0) as usize,
+                preview_latents: Some(latents.clone()),
             })?;
         }
     }
@@ -4624,6 +4626,27 @@ impl DiffusionPipeline {
                 },
             ))
         })
+    }
+
+    pub fn decode_preview_latents_png_base64_with_runtime_options(
+        &self,
+        latents: &LatentBatch,
+        runtime_options: DiffusionGenerationRuntimeOptions,
+    ) -> DiffusionResult<String> {
+        let runtime = self.native_runtime()?;
+        let (rgb, _) = decode_to_rgb8_with_runtime_options(
+            runtime.decoder.as_ref(),
+            latents,
+            runtime_options,
+        )?;
+        encode_rgb_batch_png_base64(&rgb)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                DiffusionError::InvalidRequest(
+                    "preview latent batch did not decode any images".to_string(),
+                )
+            })
     }
 
     pub fn prepare_run_plan(
@@ -20295,8 +20318,14 @@ mod tests {
         assert_eq!(progress_events.len(), 2);
         assert_eq!(progress_events[0].completed_steps, 1);
         assert_eq!(progress_events[0].total_steps, 2);
+        let first_preview = progress_events[0].preview_latents.as_ref().unwrap();
+        assert_eq!(first_preview.batch, 2);
+        assert_eq!(first_preview.channels, 1);
+        assert_eq!(first_preview.height, 2);
+        assert_eq!(first_preview.width, 2);
         assert_eq!(progress_events[1].completed_steps, 2);
         assert_eq!(progress_events[1].total_steps, 2);
+        assert!(progress_events[1].preview_latents.is_some());
         assert_eq!(output.info["backend"], "hipfire-diffusion-hfq");
         assert_eq!(output.info["runtime"], "cpu-source-reference");
         assert_eq!(output.info["latent_shape"]["batch"], 2);
@@ -23146,6 +23175,7 @@ mod tests {
                         completed_steps: step + 1,
                         total_steps: schedule.timesteps.len(),
                         timestep: schedule.timesteps[step].round().max(0.0) as usize,
+                        preview_latents: Some(latents.clone()),
                     })?;
                 }
             }
@@ -23245,6 +23275,7 @@ mod tests {
                         completed_steps: step + 1,
                         total_steps: schedule.timesteps.len(),
                         timestep: schedule.timesteps[step].round().max(0.0) as usize,
+                        preview_latents: Some(latents.clone()),
                     })?;
                 }
             }

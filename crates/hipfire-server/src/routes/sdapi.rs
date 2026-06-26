@@ -456,14 +456,18 @@ async fn execute_hfq_diffusion_txt2img(
             let base_step_offset = iter as usize * iteration_steps;
             let total_steps = iteration_steps * n_iter as usize;
             let mut progress = |progress: DiffusionProgress| {
-                update_sdapi_progress(
-                    &worker_progress_state,
-                    DiffusionProgress {
-                        completed_steps: base_step_offset.saturating_add(progress.completed_steps),
-                        total_steps,
-                        timestep: progress.timestep,
-                    },
-                )
+                let progress = DiffusionProgress {
+                    completed_steps: base_step_offset.saturating_add(progress.completed_steps),
+                    total_steps,
+                    timestep: progress.timestep,
+                    preview_latents: progress.preview_latents,
+                };
+                let current_image = sdapi_preview_image_from_progress(
+                    first_pass_pipeline.as_ref(),
+                    runtime_options,
+                    &progress,
+                )?;
+                update_sdapi_progress(&worker_progress_state, progress, current_image)
             };
             let first_output = first_pass_pipeline
                 .generate_batch_with_progress_and_runtime_options(
@@ -501,15 +505,18 @@ async fn execute_hfq_diffusion_txt2img(
             let highres_step_offset =
                 base_step_offset.saturating_add(first_output_steps(&worker_first_pass_body));
             let mut progress = |progress: DiffusionProgress| {
-                update_sdapi_progress(
-                    &worker_progress_state,
-                    DiffusionProgress {
-                        completed_steps: highres_step_offset
-                            .saturating_add(progress.completed_steps),
-                        total_steps,
-                        timestep: progress.timestep,
-                    },
-                )
+                let progress = DiffusionProgress {
+                    completed_steps: highres_step_offset.saturating_add(progress.completed_steps),
+                    total_steps,
+                    timestep: progress.timestep,
+                    preview_latents: progress.preview_latents,
+                };
+                let current_image = sdapi_preview_image_from_progress(
+                    highres_pipeline.as_ref(),
+                    runtime_options,
+                    &progress,
+                )?;
+                update_sdapi_progress(&worker_progress_state, progress, current_image)
             };
             let mut highres_output = highres_pipeline
                 .generate_img2img_batch_with_progress_and_runtime_options(
@@ -630,14 +637,18 @@ async fn execute_hfq_diffusion_img2img(
             let step_offset = iter as usize * sdapi_img2img_denoise_steps(&worker_body);
             let total_steps = sdapi_img2img_denoise_steps(&worker_body) * n_iter as usize;
             let mut progress = |progress: DiffusionProgress| {
-                update_sdapi_progress(
-                    &worker_progress_state,
-                    DiffusionProgress {
-                        completed_steps: step_offset.saturating_add(progress.completed_steps),
-                        total_steps,
-                        timestep: progress.timestep,
-                    },
-                )
+                let progress = DiffusionProgress {
+                    completed_steps: step_offset.saturating_add(progress.completed_steps),
+                    total_steps,
+                    timestep: progress.timestep,
+                    preview_latents: progress.preview_latents,
+                };
+                let current_image = sdapi_preview_image_from_progress(
+                    pipeline.as_ref(),
+                    runtime_options,
+                    &progress,
+                )?;
+                update_sdapi_progress(&worker_progress_state, progress, current_image)
             };
             outputs.push(
                 pipeline.generate_img2img_batch_with_progress_and_runtime_options(
@@ -2589,15 +2600,34 @@ fn start_sdapi_progress(
     }
 }
 
+fn sdapi_preview_image_from_progress(
+    pipeline: &DiffusionPipeline,
+    runtime_options: DiffusionGenerationRuntimeOptions,
+    event: &DiffusionProgress,
+) -> Result<Option<String>, DiffusionError> {
+    event
+        .preview_latents
+        .as_ref()
+        .map(|latents| {
+            pipeline
+                .decode_preview_latents_png_base64_with_runtime_options(latents, runtime_options)
+        })
+        .transpose()
+}
+
 fn update_sdapi_progress(
     progress_state: &Arc<std::sync::Mutex<SdapiProgressState>>,
     event: DiffusionProgress,
+    current_image: Option<String>,
 ) -> Result<(), DiffusionError> {
     let mut progress = progress_state
         .lock()
         .map_err(|error| DiffusionError::Io(format!("SDAPI progress lock poisoned: {error}")))?;
     progress.sampling_step = event.completed_steps;
     progress.sampling_steps = event.total_steps;
+    if current_image.is_some() {
+        progress.current_image = current_image;
+    }
     if progress.interrupted {
         progress.active = false;
         progress.textinfo = Some("interrupted".to_string());
@@ -3494,8 +3524,8 @@ mod tests {
     use hipfire_diffusion::{
         DiffusionBatchMetadata, DiffusionComponentMetadata, DiffusionHfqMetadata,
         DiffusionPipelineMetadata, DiffusionQuantizationMetadata, DiffusionTokenizerMetadata,
-        DIFFUSION_ARTIFACT_KIND, DIFFUSION_SCHEMA_VERSION, HFQ_ARCH_DIFFUSION, QT_DIFFUSION_JSON,
-        QT_DIFFUSION_TENSOR_F32, QT_DIFFUSION_TOKENIZER,
+        LatentBatch, DIFFUSION_ARTIFACT_KIND, DIFFUSION_SCHEMA_VERSION, HFQ_ARCH_DIFFUSION,
+        QT_DIFFUSION_JSON, QT_DIFFUSION_TENSOR_F32, QT_DIFFUSION_TOKENIZER,
     };
     use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
     use std::collections::BTreeMap;
@@ -5392,7 +5422,9 @@ mod tests {
                 completed_steps: 2,
                 total_steps: 4,
                 timestep: 10,
+                preview_latents: None,
             },
+            Some("preview-b64".to_string()),
         )
         .unwrap();
 
@@ -5402,6 +5434,7 @@ mod tests {
         assert_eq!(active["state"]["sampling_step"], 2);
         assert_eq!(active["state"]["sampling_steps"], 4);
         assert_eq!(active["current_task"], "task-123");
+        assert_eq!(active["current_image"], "preview-b64");
         assert_eq!(active["textinfo"], "sampling step 2/4");
 
         finish_sdapi_progress(&state.sdapi_progress, None, Some("image-b64".to_string()));
@@ -5411,6 +5444,57 @@ mod tests {
         assert_eq!(complete["state"]["sampling_step"], 4);
         assert_eq!(complete["current_image"], "image-b64");
         assert_eq!(complete["textinfo"], "complete");
+    }
+
+    #[tokio::test]
+    async fn progress_endpoint_reports_live_preview_image() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-sdapi-progress-preview-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("tiny-route-diffusion-progress-preview.hfq");
+        write_tiny_diffusion_hfq(&hfq_path);
+        let pipeline = DiffusionPipeline::open_hfq(&hfq_path).unwrap();
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let body = SdGenerationRequest {
+            prompt: "a cat".to_string(),
+            force_task_id: Some("task-preview".to_string()),
+            ..empty_request()
+        };
+        let event = DiffusionProgress {
+            completed_steps: 1,
+            total_steps: 2,
+            timestep: 3,
+            preview_latents: Some(LatentBatch {
+                batch: 1,
+                channels: 1,
+                height: 2,
+                width: 2,
+                data: vec![0.0, 0.25, 0.5, 0.75],
+            }),
+        };
+        let preview = sdapi_preview_image_from_progress(
+            &pipeline,
+            DiffusionGenerationRuntimeOptions::default(),
+            &event,
+        )
+        .unwrap()
+        .unwrap();
+
+        start_sdapi_progress(&state.sdapi_progress, &body, "txt2img", 2);
+        update_sdapi_progress(&state.sdapi_progress, event, Some(preview.clone())).unwrap();
+        let Json(active) = get_progress(State(state)).await;
+
+        assert_eq!(active["progress"], 0.5);
+        assert_eq!(active["textinfo"], "sampling step 1/2");
+        assert_eq!(active["current_image"], preview);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(active["current_image"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -5432,7 +5516,9 @@ mod tests {
                 completed_steps: 1,
                 total_steps: 4,
                 timestep: 3,
+                preview_latents: None,
             },
+            None,
         )
         .unwrap_err();
         assert!(matches!(error, DiffusionError::Interrupted(_)));

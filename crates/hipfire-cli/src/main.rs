@@ -52,10 +52,10 @@ enum Command {
     /// and `outdir_img2img_samples` act as generation defaults unless the
     /// request or `override_settings` supplies a more specific value.
     ///
-    /// `/sdapi/v1/progress` tracks active SDAPI sampling steps and returns the
-    /// final generated PNG in `current_image` after a successful HFQ diffusion
-    /// request completes. Live per-step latent preview decoding is not
-    /// implemented yet.
+    /// `/sdapi/v1/progress` tracks active SDAPI sampling steps and updates
+    /// `current_image` with live PNG previews decoded from intermediate
+    /// latents, then leaves the final generated PNG there after a successful
+    /// HFQ diffusion request completes.
     ///
     /// SDAPI sampler fields follow WebUI's split controls: full scheduler names
     /// such as `DDIM` and `DPM++ 2M` are accepted directly, while schedule
