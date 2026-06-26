@@ -50,7 +50,8 @@ enum Command {
     /// requests, through the same keys in `override_settings`, or through the
     /// persisted `/sdapi/v1/options` value `hipfire_rocm_device_id`. Persisted
     /// `/sdapi/v1/options` values for `send_images`, `save_images`,
-    /// `outdir_samples`, `outdir_txt2img_samples`, and `outdir_img2img_samples`
+    /// `outdir_samples`, `outdir_txt2img_samples`, `outdir_img2img_samples`,
+    /// `outdir_grids`, `outdir_txt2img_grids`, and `outdir_img2img_grids`
     /// act as generation defaults unless the request or `override_settings`
     /// supplies a more specific value.
     ///

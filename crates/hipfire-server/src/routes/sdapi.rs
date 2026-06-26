@@ -1045,8 +1045,11 @@ fn sdapi_apply_stored_generation_defaults(
     }
     for key in [
         "outdir_samples",
+        "outdir_grids",
         "outdir_txt2img_samples",
         "outdir_img2img_samples",
+        "outdir_txt2img_grids",
+        "outdir_img2img_grids",
     ] {
         sdapi_apply_stored_override_default(&mut body, stored_options, key);
     }
@@ -1459,7 +1462,7 @@ fn save_sdapi_images_with_kind(
     kind: &str,
     images: &[String],
 ) -> Result<Vec<String>, DiffusionError> {
-    let output_dir = sdapi_output_dir(body, mode);
+    let output_dir = sdapi_output_dir(body, mode, kind);
     fs::create_dir_all(&output_dir).map_err(|error| {
         DiffusionError::Io(format!(
             "failed to create SDAPI output directory {}: {error}",
@@ -1620,10 +1623,28 @@ fn png_crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
-fn sdapi_output_dir(body: &SdGenerationRequest, mode: &str) -> PathBuf {
-    let mode_key = match mode {
-        "img2img" => "outdir_img2img_samples",
-        _ => "outdir_txt2img_samples",
+fn sdapi_output_dir(body: &SdGenerationRequest, mode: &str, kind: &str) -> PathBuf {
+    let (mode_key, kind_key, fallback_dir) = match (mode, kind) {
+        ("img2img", "grid") => (
+            "outdir_img2img_grids",
+            "outdir_grids",
+            "/tmp/hipfire-sdapi/img2img-grids",
+        ),
+        (_, "grid") => (
+            "outdir_txt2img_grids",
+            "outdir_grids",
+            "/tmp/hipfire-sdapi/txt2img-grids",
+        ),
+        ("img2img", _) => (
+            "outdir_img2img_samples",
+            "outdir_samples",
+            "/tmp/hipfire-sdapi/img2img",
+        ),
+        _ => (
+            "outdir_txt2img_samples",
+            "outdir_samples",
+            "/tmp/hipfire-sdapi/txt2img",
+        ),
     };
     body.override_settings
         .as_ref()
@@ -1631,11 +1652,12 @@ fn sdapi_output_dir(body: &SdGenerationRequest, mode: &str) -> PathBuf {
         .and_then(|settings| {
             settings
                 .get(mode_key)
+                .or_else(|| settings.get(kind_key))
                 .or_else(|| settings.get("outdir_samples"))
                 .and_then(Value::as_str)
         })
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/hipfire-sdapi").join(mode))
+        .unwrap_or_else(|| PathBuf::from(fallback_dir))
 }
 
 pub(crate) async fn cached_diffusion_pipeline(
@@ -3451,6 +3473,9 @@ fn sdapi_options_json(
         "outdir_samples": "/tmp/hipfire-sdapi",
         "outdir_txt2img_samples": "/tmp/hipfire-sdapi/txt2img",
         "outdir_img2img_samples": "/tmp/hipfire-sdapi/img2img",
+        "outdir_grids": "/tmp/hipfire-sdapi/grids",
+        "outdir_txt2img_grids": "/tmp/hipfire-sdapi/txt2img-grids",
+        "outdir_img2img_grids": "/tmp/hipfire-sdapi/img2img-grids",
         "hipfire_backend": "diffusion-hfq-or-text-fallback",
         "hipfire_rocm_device_id": null,
         "hipfire_sdapi_save_images_supported": true,
@@ -4557,7 +4582,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-grid-save.hfq");
-        let output_dir = dir.join("outputs");
+        let sample_output_dir = dir.join("sample-outputs");
+        let grid_output_dir = dir.join("grid-outputs");
         write_tiny_diffusion_hfq(&hfq_path);
         let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
         let body = SdGenerationRequest {
@@ -4572,7 +4598,8 @@ mod tests {
             save_images: Some(true),
             do_not_save_samples: Some(true),
             override_settings: Some(json!({
-                "outdir_txt2img_samples": output_dir,
+                "outdir_txt2img_samples": sample_output_dir,
+                "outdir_txt2img_grids": grid_output_dir,
             })),
             ..empty_request()
         };
@@ -4591,6 +4618,8 @@ mod tests {
         assert_eq!(saved.len(), 1);
         let saved_path = PathBuf::from(saved[0].as_str().unwrap());
         assert!(saved_path.is_file());
+        assert!(saved_path.starts_with(&grid_output_dir));
+        assert!(!sample_output_dir.exists());
         assert!(saved_path
             .file_name()
             .unwrap()
@@ -6030,6 +6059,15 @@ mod tests {
             options["outdir_img2img_samples"],
             "/tmp/hipfire-sdapi/img2img"
         );
+        assert_eq!(options["outdir_grids"], "/tmp/hipfire-sdapi/grids");
+        assert_eq!(
+            options["outdir_txt2img_grids"],
+            "/tmp/hipfire-sdapi/txt2img-grids"
+        );
+        assert_eq!(
+            options["outdir_img2img_grids"],
+            "/tmp/hipfire-sdapi/img2img-grids"
+        );
     }
 
     #[tokio::test]
@@ -6176,6 +6214,14 @@ mod tests {
             "outdir_img2img_samples".to_string(),
             json!("/tmp/stored-img2img"),
         );
+        stored.insert(
+            "outdir_txt2img_grids".to_string(),
+            json!("/tmp/stored-txt2img-grids"),
+        );
+        stored.insert(
+            "outdir_img2img_grids".to_string(),
+            json!("/tmp/stored-img2img-grids"),
+        );
 
         let body = sdapi_apply_stored_generation_defaults(empty_request(), &stored);
 
@@ -6184,6 +6230,14 @@ mod tests {
         assert_eq!(
             body.override_settings.as_ref().unwrap()["outdir_txt2img_samples"],
             "/tmp/stored-txt2img"
+        );
+        assert_eq!(
+            body.override_settings.as_ref().unwrap()["outdir_txt2img_grids"],
+            "/tmp/stored-txt2img-grids"
+        );
+        assert_eq!(
+            body.override_settings.as_ref().unwrap()["outdir_img2img_grids"],
+            "/tmp/stored-img2img-grids"
         );
 
         let explicit = sdapi_apply_stored_generation_defaults(
@@ -6203,6 +6257,50 @@ mod tests {
         assert_eq!(
             explicit.override_settings.unwrap()["outdir_txt2img_samples"],
             "/tmp/request-txt2img"
+        );
+    }
+
+    #[test]
+    fn sdapi_output_dir_prefers_mode_specific_grid_directories() {
+        let body = SdGenerationRequest {
+            override_settings: Some(json!({
+                "outdir_samples": "/tmp/samples",
+                "outdir_grids": "/tmp/grids",
+                "outdir_txt2img_samples": "/tmp/txt2img-samples",
+                "outdir_img2img_samples": "/tmp/img2img-samples",
+                "outdir_txt2img_grids": "/tmp/txt2img-grids",
+                "outdir_img2img_grids": "/tmp/img2img-grids",
+            })),
+            ..empty_request()
+        };
+
+        assert_eq!(
+            sdapi_output_dir(&body, "txt2img", "sample"),
+            PathBuf::from("/tmp/txt2img-samples")
+        );
+        assert_eq!(
+            sdapi_output_dir(&body, "img2img", "sample"),
+            PathBuf::from("/tmp/img2img-samples")
+        );
+        assert_eq!(
+            sdapi_output_dir(&body, "txt2img", "grid"),
+            PathBuf::from("/tmp/txt2img-grids")
+        );
+        assert_eq!(
+            sdapi_output_dir(&body, "img2img", "grid"),
+            PathBuf::from("/tmp/img2img-grids")
+        );
+
+        let fallback = SdGenerationRequest {
+            override_settings: Some(json!({
+                "outdir_samples": "/tmp/samples",
+                "outdir_grids": "/tmp/grids",
+            })),
+            ..empty_request()
+        };
+        assert_eq!(
+            sdapi_output_dir(&fallback, "txt2img", "grid"),
+            PathBuf::from("/tmp/grids")
         );
     }
 
