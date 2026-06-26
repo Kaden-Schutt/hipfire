@@ -14550,7 +14550,8 @@ fn single_file_component_class_name(component: &str) -> &'static str {
 
 fn native_entry_for_single_file_tensor(name: &str) -> Option<String> {
     if let Some(rest) = name.strip_prefix("first_stage_model.") {
-        return Some(format!("vae/tensors/{rest}"));
+        let mapped = ldm_vae_native_tensor_name(rest).unwrap_or_else(|| rest.to_string());
+        return Some(format!("vae/tensors/{mapped}"));
     }
     if let Some(rest) = name.strip_prefix("cond_stage_model.transformer.") {
         return Some(format!("text_encoder/tensors/{rest}"));
@@ -14565,6 +14566,103 @@ fn native_entry_for_single_file_tensor(name: &str) -> Option<String> {
         .strip_prefix("model.diffusion_model.")
         .or_else(|| name.strip_prefix("diffusion_model."))?;
     ldm_unet_native_tensor_name(unet_name).map(|mapped| format!("unet/tensors/{mapped}"))
+}
+
+fn ldm_vae_native_tensor_name(name: &str) -> Option<String> {
+    if let Some(rest) = name.strip_prefix("encoder.down.") {
+        return ldm_vae_encoder_down_tensor_name(rest);
+    }
+    if let Some(rest) = name.strip_prefix("encoder.mid.") {
+        return ldm_vae_mid_tensor_name("encoder", rest);
+    }
+    if let Some(rest) = name.strip_prefix("decoder.mid.") {
+        return ldm_vae_mid_tensor_name("decoder", rest);
+    }
+    if let Some(rest) = name.strip_prefix("decoder.up.") {
+        return ldm_vae_decoder_up_tensor_name(rest);
+    }
+    let mapped = match name {
+        "encoder.norm_out.weight" => "encoder.conv_norm_out.weight",
+        "encoder.norm_out.bias" => "encoder.conv_norm_out.bias",
+        "decoder.norm_out.weight" => "decoder.conv_norm_out.weight",
+        "decoder.norm_out.bias" => "decoder.conv_norm_out.bias",
+        _ => return None,
+    };
+    Some(mapped.to_string())
+}
+
+fn ldm_vae_encoder_down_tensor_name(rest: &str) -> Option<String> {
+    let (block_idx, rest) = split_usize_prefix(rest)?;
+    if let Some(rest) = rest.strip_prefix("block.") {
+        let (layer_idx, rest) = split_usize_prefix(rest)?;
+        return map_ldm_vae_resnet_suffix(rest)
+            .map(|suffix| format!("encoder.down_blocks.{block_idx}.resnets.{layer_idx}.{suffix}"));
+    }
+    rest.strip_prefix("downsample.conv.")
+        .map(|suffix| format!("encoder.down_blocks.{block_idx}.downsamplers.0.conv.{suffix}"))
+}
+
+fn ldm_vae_decoder_up_tensor_name(rest: &str) -> Option<String> {
+    const STANDARD_LDM_VAE_MAX_LEVEL: usize = 3;
+    let (ldm_block_idx, rest) = split_usize_prefix(rest)?;
+    let block_idx = STANDARD_LDM_VAE_MAX_LEVEL.checked_sub(ldm_block_idx)?;
+    if let Some(rest) = rest.strip_prefix("block.") {
+        let (layer_idx, rest) = split_usize_prefix(rest)?;
+        return map_ldm_vae_resnet_suffix(rest)
+            .map(|suffix| format!("decoder.up_blocks.{block_idx}.resnets.{layer_idx}.{suffix}"));
+    }
+    rest.strip_prefix("upsample.conv.")
+        .map(|suffix| format!("decoder.up_blocks.{block_idx}.upsamplers.0.conv.{suffix}"))
+}
+
+fn ldm_vae_mid_tensor_name(side: &str, rest: &str) -> Option<String> {
+    if let Some(rest) = rest.strip_prefix("block_1.") {
+        return map_ldm_vae_resnet_suffix(rest)
+            .map(|suffix| format!("{side}.mid_block.resnets.0.{suffix}"));
+    }
+    if let Some(rest) = rest.strip_prefix("attn_1.") {
+        return map_ldm_vae_attention_suffix(rest)
+            .map(|suffix| format!("{side}.mid_block.attentions.0.{suffix}"));
+    }
+    if let Some(rest) = rest.strip_prefix("block_2.") {
+        return map_ldm_vae_resnet_suffix(rest)
+            .map(|suffix| format!("{side}.mid_block.resnets.1.{suffix}"));
+    }
+    None
+}
+
+fn map_ldm_vae_resnet_suffix(rest: &str) -> Option<String> {
+    let mapped = match rest {
+        "norm1.weight" => "norm1.weight",
+        "norm1.bias" => "norm1.bias",
+        "conv1.weight" => "conv1.weight",
+        "conv1.bias" => "conv1.bias",
+        "norm2.weight" => "norm2.weight",
+        "norm2.bias" => "norm2.bias",
+        "conv2.weight" => "conv2.weight",
+        "conv2.bias" => "conv2.bias",
+        "nin_shortcut.weight" => "conv_shortcut.weight",
+        "nin_shortcut.bias" => "conv_shortcut.bias",
+        _ => return None,
+    };
+    Some(mapped.to_string())
+}
+
+fn map_ldm_vae_attention_suffix(rest: &str) -> Option<String> {
+    let mapped = match rest {
+        "norm.weight" => "group_norm.weight",
+        "norm.bias" => "group_norm.bias",
+        "q.weight" => "to_q.weight",
+        "q.bias" => "to_q.bias",
+        "k.weight" => "to_k.weight",
+        "k.bias" => "to_k.bias",
+        "v.weight" => "to_v.weight",
+        "v.bias" => "to_v.bias",
+        "proj_out.weight" => "to_out.0.weight",
+        "proj_out.bias" => "to_out.0.bias",
+        _ => return None,
+    };
+    Some(mapped.to_string())
 }
 
 fn ldm_unet_native_tensor_name(name: &str) -> Option<String> {
@@ -16612,6 +16710,45 @@ mod tests {
     }
 
     #[test]
+    fn ldm_vae_native_tensor_name_maps_standard_sd_blocks() {
+        let cases = [
+            (
+                "encoder.down.0.block.1.norm1.weight",
+                Some("encoder.down_blocks.0.resnets.1.norm1.weight".to_string()),
+            ),
+            (
+                "encoder.down.2.downsample.conv.bias",
+                Some("encoder.down_blocks.2.downsamplers.0.conv.bias".to_string()),
+            ),
+            (
+                "encoder.mid.attn_1.proj_out.weight",
+                Some("encoder.mid_block.attentions.0.to_out.0.weight".to_string()),
+            ),
+            (
+                "decoder.mid.block_2.nin_shortcut.bias",
+                Some("decoder.mid_block.resnets.1.conv_shortcut.bias".to_string()),
+            ),
+            (
+                "decoder.up.3.block.0.conv2.weight",
+                Some("decoder.up_blocks.0.resnets.0.conv2.weight".to_string()),
+            ),
+            (
+                "decoder.up.1.upsample.conv.weight",
+                Some("decoder.up_blocks.2.upsamplers.0.conv.weight".to_string()),
+            ),
+            (
+                "decoder.norm_out.bias",
+                Some("decoder.conv_norm_out.bias".to_string()),
+            ),
+            ("decoder.up.4.block.0.norm1.weight", None),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(ldm_vae_native_tensor_name(input), expected, "{input}");
+        }
+    }
+
+    #[test]
     fn single_file_checkpoint_projection_loads_tiny_native_unet() {
         let dir = std::env::temp_dir().join(format!(
             "hipfire-diffusion-single-file-native-unet-test-{}",
@@ -16635,6 +16772,7 @@ mod tests {
         let hfq = HfqFile::open_index_only(&output).unwrap();
         let config = tiny_runtime_config();
         let unet = NativeUnet2DConditionModel::from_hfq(&hfq, &config.unet).unwrap();
+        let encoder = NativeVaeEncoder::from_hfq(&hfq, &config.vae).unwrap();
         let decoder = NativeVaeDecoder::from_hfq(&hfq, &config.vae).unwrap();
         let sample = CpuTensor {
             shape: vec![1, 1, 2, 2],
@@ -16649,6 +16787,19 @@ mod tests {
 
         assert_eq!(output.shape, sample.shape);
         assert!(output.data.iter().all(|value| value.is_finite()));
+        let latents = encoder
+            .encode_to_latents(&RgbImageBatch {
+                batch: 1,
+                width: 2,
+                height: 2,
+                data: vec![255; 12],
+            })
+            .unwrap();
+        assert_eq!(latents.batch, 1);
+        assert_eq!(latents.channels, 1);
+        assert_eq!(latents.height, 2);
+        assert_eq!(latents.width, 2);
+        assert!(latents.data.iter().all(|value| value.is_finite()));
         let rgb = decoder
             .decode_to_rgb8(&LatentBatch {
                 batch: 1,
@@ -23694,6 +23845,10 @@ mod tests {
 
     fn write_tiny_ldm_unet_safetensors(path: &Path) {
         let identity1 = center_identity_conv(1);
+        let mut vae_encoder_conv_in = vec![0.0; 1 * 3 * 3 * 3];
+        vae_encoder_conv_in[1 * 3 + 1] = 1.0;
+        let mut vae_encoder_conv_out = vec![0.0; 2 * 1 * 3 * 3];
+        vae_encoder_conv_out[1 * 3 + 1] = 1.0;
         let mut tensors = vec![
             f32_safetensors_tensor(
                 "model.diffusion_model.input_blocks.0.0.weight",
@@ -23838,57 +23993,113 @@ mod tests {
             ),
             f32_safetensors_tensor("first_stage_model.post_quant_conv.bias", &[1], &[0.0]),
             f32_safetensors_tensor(
+                "first_stage_model.encoder.conv_in.weight",
+                &[1, 3, 3, 3],
+                &vae_encoder_conv_in,
+            ),
+            f32_safetensors_tensor("first_stage_model.encoder.conv_in.bias", &[1], &[0.0]),
+            f32_safetensors_tensor(
+                "first_stage_model.encoder.down.0.block.0.norm1.weight",
+                &[1],
+                &[1.0],
+            ),
+            f32_safetensors_tensor(
+                "first_stage_model.encoder.down.0.block.0.norm1.bias",
+                &[1],
+                &[0.0],
+            ),
+            f32_safetensors_tensor(
+                "first_stage_model.encoder.down.0.block.0.conv1.weight",
+                &[1, 1, 3, 3],
+                &identity1,
+            ),
+            f32_safetensors_tensor(
+                "first_stage_model.encoder.down.0.block.0.conv1.bias",
+                &[1],
+                &[0.0],
+            ),
+            f32_safetensors_tensor(
+                "first_stage_model.encoder.down.0.block.0.norm2.weight",
+                &[1],
+                &[1.0],
+            ),
+            f32_safetensors_tensor(
+                "first_stage_model.encoder.down.0.block.0.norm2.bias",
+                &[1],
+                &[0.0],
+            ),
+            f32_safetensors_tensor(
+                "first_stage_model.encoder.down.0.block.0.conv2.weight",
+                &[1, 1, 3, 3],
+                &[0.0; 9],
+            ),
+            f32_safetensors_tensor(
+                "first_stage_model.encoder.down.0.block.0.conv2.bias",
+                &[1],
+                &[0.0],
+            ),
+            f32_safetensors_tensor("first_stage_model.encoder.norm_out.weight", &[1], &[1.0]),
+            f32_safetensors_tensor("first_stage_model.encoder.norm_out.bias", &[1], &[0.0]),
+            f32_safetensors_tensor(
+                "first_stage_model.encoder.conv_out.weight",
+                &[2, 1, 3, 3],
+                &vae_encoder_conv_out,
+            ),
+            f32_safetensors_tensor("first_stage_model.encoder.conv_out.bias", &[2], &[0.0, 0.0]),
+            f32_safetensors_tensor(
+                "first_stage_model.quant_conv.weight",
+                &[2, 2, 1, 1],
+                &[1.0, 0.0, 0.0, 1.0],
+            ),
+            f32_safetensors_tensor("first_stage_model.quant_conv.bias", &[2], &[0.0, 0.0]),
+            f32_safetensors_tensor(
                 "first_stage_model.decoder.conv_in.weight",
                 &[1, 1, 3, 3],
                 &identity1,
             ),
             f32_safetensors_tensor("first_stage_model.decoder.conv_in.bias", &[1], &[0.0]),
             f32_safetensors_tensor(
-                "first_stage_model.decoder.up_blocks.0.resnets.0.norm1.weight",
+                "first_stage_model.decoder.up.3.block.0.norm1.weight",
                 &[1],
                 &[1.0],
             ),
             f32_safetensors_tensor(
-                "first_stage_model.decoder.up_blocks.0.resnets.0.norm1.bias",
+                "first_stage_model.decoder.up.3.block.0.norm1.bias",
                 &[1],
                 &[0.0],
             ),
             f32_safetensors_tensor(
-                "first_stage_model.decoder.up_blocks.0.resnets.0.conv1.weight",
+                "first_stage_model.decoder.up.3.block.0.conv1.weight",
                 &[1, 1, 3, 3],
                 &[0.0; 9],
             ),
             f32_safetensors_tensor(
-                "first_stage_model.decoder.up_blocks.0.resnets.0.conv1.bias",
+                "first_stage_model.decoder.up.3.block.0.conv1.bias",
                 &[1],
                 &[0.0],
             ),
             f32_safetensors_tensor(
-                "first_stage_model.decoder.up_blocks.0.resnets.0.norm2.weight",
+                "first_stage_model.decoder.up.3.block.0.norm2.weight",
                 &[1],
                 &[1.0],
             ),
             f32_safetensors_tensor(
-                "first_stage_model.decoder.up_blocks.0.resnets.0.norm2.bias",
+                "first_stage_model.decoder.up.3.block.0.norm2.bias",
                 &[1],
                 &[0.0],
             ),
             f32_safetensors_tensor(
-                "first_stage_model.decoder.up_blocks.0.resnets.0.conv2.weight",
+                "first_stage_model.decoder.up.3.block.0.conv2.weight",
                 &[1, 1, 3, 3],
                 &[0.0; 9],
             ),
             f32_safetensors_tensor(
-                "first_stage_model.decoder.up_blocks.0.resnets.0.conv2.bias",
+                "first_stage_model.decoder.up.3.block.0.conv2.bias",
                 &[1],
                 &[0.0],
             ),
-            f32_safetensors_tensor(
-                "first_stage_model.decoder.conv_norm_out.weight",
-                &[1],
-                &[1.0],
-            ),
-            f32_safetensors_tensor("first_stage_model.decoder.conv_norm_out.bias", &[1], &[0.0]),
+            f32_safetensors_tensor("first_stage_model.decoder.norm_out.weight", &[1], &[1.0]),
+            f32_safetensors_tensor("first_stage_model.decoder.norm_out.bias", &[1], &[0.0]),
             f32_safetensors_tensor(
                 "first_stage_model.decoder.conv_out.weight",
                 &[3, 1, 3, 3],
