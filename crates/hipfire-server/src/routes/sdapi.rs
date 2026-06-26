@@ -3603,6 +3603,16 @@ pub async fn post_control_noop() -> Json<Value> {
     Json(json!({}))
 }
 
+pub async fn post_unsupported_training_endpoint() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "info": "stable-diffusion-webui training and creation endpoints are not implemented by Hipfire's SDAPI compatibility layer",
+        })),
+    )
+        .into_response()
+}
+
 pub async fn post_unsupported() -> Response {
     (
         StatusCode::NOT_IMPLEMENTED,
@@ -5761,6 +5771,18 @@ mod tests {
         assert!(memory["ram"]["total"].is_number() || memory["ram"]["error"].is_string());
         assert_eq!(memory["cuda"]["error"], "unavailable");
         assert_eq!(memory["cuda"]["backend"], "hipfire-rocm");
+    }
+
+    #[tokio::test]
+    async fn unsupported_training_endpoint_returns_webui_info_shape() {
+        let response = post_unsupported_training_endpoint().await;
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = response_json(response).await;
+        assert!(body["info"]
+            .as_str()
+            .unwrap()
+            .contains("training and creation endpoints are not implemented"));
     }
 
     #[test]

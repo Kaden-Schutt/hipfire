@@ -192,6 +192,22 @@ pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> Rout
             "/sdapi/v1/refresh-vae",
             post(routes::sdapi::post_control_noop),
         )
+        .route(
+            "/sdapi/v1/create/embedding",
+            post(routes::sdapi::post_unsupported_training_endpoint),
+        )
+        .route(
+            "/sdapi/v1/create/hypernetwork",
+            post(routes::sdapi::post_unsupported_training_endpoint),
+        )
+        .route(
+            "/sdapi/v1/train/embedding",
+            post(routes::sdapi::post_unsupported_training_endpoint),
+        )
+        .route(
+            "/sdapi/v1/train/hypernetwork",
+            post(routes::sdapi::post_unsupported_training_endpoint),
+        )
         .route("/sdapi/v1/scripts", get(routes::sdapi::get_scripts))
         .route("/sdapi/v1/script-info", get(routes::sdapi::get_script_info))
         .route("/sdapi/v1/extensions", get(routes::sdapi::get_extensions));

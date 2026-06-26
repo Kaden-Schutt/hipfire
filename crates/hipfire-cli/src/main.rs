@@ -57,7 +57,9 @@ enum Command {
     /// latents, then leaves the final generated PNG there after a successful
     /// HFQ diffusion request completes. `/sdapi/v1/memory` returns WebUI-shaped
     /// host RAM stats and marks CUDA memory stats unavailable because Hipfire
-    /// uses HIP/ROCm.
+    /// uses HIP/ROCm. WebUI's create/train embedding and hypernetwork endpoints
+    /// are registered for client compatibility and return an `info` response
+    /// explaining that native training is not implemented by the SDAPI layer.
     ///
     /// SDAPI sampler fields follow WebUI's split controls: full scheduler names
     /// such as `DDIM` and `DPM++ 2M` are accepted directly, while schedule
