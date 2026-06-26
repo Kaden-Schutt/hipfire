@@ -254,6 +254,16 @@ impl DiffusionGenerationRuntimeContext {
     }
 }
 
+fn runtime_kind_for_context(
+    runtime_context: &DiffusionGenerationRuntimeContext,
+) -> DiffusionRuntimeKind {
+    if runtime_context.rocm_device_id().is_some() {
+        DiffusionRuntimeKind::RocmHybridReference
+    } else {
+        DiffusionRuntimeKind::CpuSourceReference
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffusionHipMemoryPlan {
     pub latent_shape: DiffusionLatentShape,
@@ -1914,6 +1924,43 @@ pub fn denoise_latents_with_cfg_progress(
 }
 
 fn denoise_latents_with_cfg_progress_and_runtime_options(
+    latents: LatentBatch,
+    schedule: &DiffusionSchedule,
+    cfg_scale: f32,
+    positive_embeddings: &CpuTensor,
+    negative_embeddings: &CpuTensor,
+    predict_noise: impl FnMut(
+        &CpuTensor,
+        &[f32],
+        &CpuTensor,
+        Option<&SdxlDenoiseConditioning<'_>>,
+        &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor>,
+    positive_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
+    negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
+    inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
+    masked_reference: Option<&MaskedDenoiseReference<'_>>,
+    runtime_options: DiffusionGenerationRuntimeOptions,
+    progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
+) -> DiffusionResult<DenoiseLatentsOutput> {
+    let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+    denoise_latents_with_cfg_progress_and_runtime_context(
+        latents,
+        schedule,
+        cfg_scale,
+        positive_embeddings,
+        negative_embeddings,
+        predict_noise,
+        positive_sdxl_conditioning,
+        negative_sdxl_conditioning,
+        inpaint_conditioning,
+        masked_reference,
+        &mut runtime_context,
+        progress,
+    )
+}
+
+fn denoise_latents_with_cfg_progress_and_runtime_context(
     mut latents: LatentBatch,
     schedule: &DiffusionSchedule,
     cfg_scale: f32,
@@ -1930,7 +1977,7 @@ fn denoise_latents_with_cfg_progress_and_runtime_options(
     negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
     inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
     masked_reference: Option<&MaskedDenoiseReference<'_>>,
-    runtime_options: DiffusionGenerationRuntimeOptions,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
     mut progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
 ) -> DiffusionResult<DenoiseLatentsOutput> {
     validate_conditioning_for_latents(&latents, positive_embeddings)?;
@@ -1943,13 +1990,12 @@ fn denoise_latents_with_cfg_progress_and_runtime_options(
     }
     let mut scheduler_state = SchedulerStepState::default();
     let mut runtime_kind = DiffusionRuntimeKind::CpuSourceReference;
-    let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
     for step in 0..schedule.timesteps.len() {
         let (sample, scale_runtime_kind) = scale_model_input_with_runtime_context(
             schedule,
             &latents.as_nchw_tensor(),
             step,
-            &mut runtime_context,
+            runtime_context,
         )?;
         runtime_kind = merge_runtime_kind(runtime_kind, scale_runtime_kind);
         let model_sample = if let Some(inpaint_conditioning) = inpaint_conditioning {
@@ -1964,14 +2010,14 @@ fn denoise_latents_with_cfg_progress_and_runtime_options(
             &timesteps,
             negative_embeddings,
             negative_sdxl_conditioning,
-            &mut runtime_context,
+            runtime_context,
         )?;
         let positive_pred = predict_noise(
             &model_sample,
             &timesteps,
             positive_embeddings,
             positive_sdxl_conditioning,
-            &mut runtime_context,
+            runtime_context,
         )?;
         validate_noise_prediction(&latents, &negative_pred)?;
         validate_noise_prediction(&latents, &positive_pred)?;
@@ -1979,7 +2025,7 @@ fn denoise_latents_with_cfg_progress_and_runtime_options(
             &negative_pred,
             &positive_pred,
             cfg_scale,
-            &mut runtime_context,
+            runtime_context,
         )?;
         runtime_kind = merge_runtime_kind(runtime_kind, guidance_runtime_kind);
         let step_runtime_kind = scheduler_step_with_runtime_context(
@@ -1988,11 +2034,18 @@ fn denoise_latents_with_cfg_progress_and_runtime_options(
             &guided.data,
             step,
             &mut scheduler_state,
-            &mut runtime_context,
+            runtime_context,
         )?;
         runtime_kind = merge_runtime_kind(runtime_kind, step_runtime_kind);
         if let Some(masked_reference) = masked_reference {
-            apply_masked_denoise_reference(&mut latents, masked_reference, step)?;
+            let masked_reference_runtime_kind =
+                apply_masked_denoise_reference_with_runtime_context(
+                    &mut latents,
+                    masked_reference,
+                    step,
+                    runtime_context,
+                )?;
+            runtime_kind = merge_runtime_kind(runtime_kind, masked_reference_runtime_kind);
         }
         if let Some(progress) = progress.as_deref_mut() {
             progress(DiffusionProgress {
@@ -2154,6 +2207,7 @@ fn validate_masked_denoise_reference(
     Ok(())
 }
 
+#[cfg(test)]
 fn apply_masked_denoise_reference(
     latents: &mut LatentBatch,
     reference: &MaskedDenoiseReference<'_>,
@@ -2169,6 +2223,29 @@ fn apply_masked_denoise_reference(
         )?;
     }
     blend_latents_with_mask(latents, &reference_latents, reference.mask_weights)
+}
+
+fn apply_masked_denoise_reference_with_runtime_context(
+    latents: &mut LatentBatch,
+    reference: &MaskedDenoiseReference<'_>,
+    sliced_step: usize,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
+) -> DiffusionResult<DiffusionRuntimeKind> {
+    let mut reference_latents = reference.init_latents.clone();
+    let source_step = reference.start_step + sliced_step + 1;
+    if source_step < reference.source_schedule.timesteps.len() {
+        reference.source_schedule.add_noise_to_latents(
+            &mut reference_latents,
+            reference.noise,
+            source_step,
+        )?;
+    }
+    blend_latents_with_mask_with_runtime_context(
+        latents,
+        &reference_latents,
+        reference.mask_weights,
+        runtime_context,
+    )
 }
 
 fn validate_noise_prediction(latents: &LatentBatch, noise: &CpuTensor) -> DiffusionResult<()> {
@@ -4412,7 +4489,8 @@ impl DiffusionPipeline {
     ) -> DiffusionResult<DiffusionBatchOutput> {
         validate_batch_request(&self.metadata, &request)?;
         let runtime = self.native_runtime()?;
-        let plan = self.prepare_run_plan_with_runtime_options(&request, runtime_options)?;
+        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+        let plan = self.prepare_run_plan_with_runtime_context(&request, &mut runtime_context)?;
         let positive_embeddings = plan
             .conditioning
             .prompt_cross_attention_embeddings
@@ -4464,7 +4542,7 @@ impl DiffusionPipeline {
                     .to_string(),
             ));
         }
-        let denoise_output = runtime.noise.denoise_latents(
+        let denoise_output = runtime.noise.denoise_latents_with_runtime_context(
             plan.latents,
             &plan.schedule,
             request.cfg_scale,
@@ -4474,17 +4552,17 @@ impl DiffusionPipeline {
             negative_sdxl_conditioning.as_ref(),
             None,
             None,
-            runtime_options,
+            &mut runtime_context,
             progress,
         )?;
         let latents = denoise_output.latents;
         let mut generation_runtime_kind =
             merge_runtime_kind(runtime.kind, denoise_output.runtime_kind);
         let images = if request.send_images {
-            let (rgb, image_runtime_kind) = decode_to_rgb8_with_runtime_options(
+            let (rgb, image_runtime_kind) = decode_to_rgb8_with_runtime_context(
                 runtime.decoder.as_ref(),
                 &latents,
-                runtime_options,
+                &mut runtime_context,
             )?;
             generation_runtime_kind =
                 merge_runtime_kind(generation_runtime_kind, image_runtime_kind);
@@ -4551,7 +4629,9 @@ impl DiffusionPipeline {
     ) -> DiffusionResult<DiffusionBatchOutput> {
         validate_img2img_request(&self.metadata, &request)?;
         let runtime = self.native_runtime()?;
-        let plan = self.prepare_run_plan_with_runtime_options(&request.batch, runtime_options)?;
+        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+        let plan =
+            self.prepare_run_plan_with_runtime_context(&request.batch, &mut runtime_context)?;
         let positive_embeddings = plan
             .conditioning
             .prompt_cross_attention_embeddings
@@ -4620,7 +4700,7 @@ impl DiffusionPipeline {
             DiffusionImg2ImgResizeMode::Latent => expanded_init_image,
         };
         let (encoded_init_latents, init_encode_kind) =
-            encode_to_latents_with_runtime_options(encoder, &init_image, runtime_options)?;
+            encode_to_latents_with_runtime_context(encoder, &init_image, &mut runtime_context)?;
         generation_runtime_kind = merge_runtime_kind(generation_runtime_kind, init_encode_kind);
         let init_latents = match request.resize_mode {
             DiffusionImg2ImgResizeMode::Image => encoded_init_latents,
@@ -4683,10 +4763,10 @@ impl DiffusionPipeline {
             None
         };
         let mask_weights = if let Some(mask) = expanded_mask.as_ref() {
-            let (weights, mask_kind) = latent_mask_weights_with_runtime_options(
+            let (weights, mask_kind) = latent_mask_weights_with_runtime_context(
                 mask,
                 &denoise_init_latents,
-                runtime_options,
+                &mut runtime_context,
             )?;
             generation_runtime_kind = merge_runtime_kind(generation_runtime_kind, mask_kind);
             Some(weights)
@@ -4701,7 +4781,7 @@ impl DiffusionPipeline {
                 mask,
                 &denoise_init_latents,
                 mask_weights.as_deref(),
-                runtime_options,
+                &mut runtime_context,
             )?;
             generation_runtime_kind = merge_runtime_kind(generation_runtime_kind, inpaint_kind);
             conditioning
@@ -4734,7 +4814,7 @@ impl DiffusionPipeline {
                         source_schedule: &plan.schedule,
                         start_step,
                     });
-            let denoise_output = runtime.noise.denoise_latents(
+            let denoise_output = runtime.noise.denoise_latents_with_runtime_context(
                 latents,
                 &schedule,
                 request.batch.cfg_scale,
@@ -4744,7 +4824,7 @@ impl DiffusionPipeline {
                 negative_sdxl_conditioning.as_ref(),
                 inpaint_conditioning.as_ref(),
                 masked_reference.as_ref(),
-                runtime_options,
+                &mut runtime_context,
                 progress,
             )?;
             latents = denoise_output.latents;
@@ -4752,11 +4832,11 @@ impl DiffusionPipeline {
                 merge_runtime_kind(generation_runtime_kind, denoise_output.runtime_kind);
         }
         let masked = if let Some(mask_weights) = mask_weights.as_ref() {
-            let blend_kind = blend_latents_with_mask_with_runtime_options(
+            let blend_kind = blend_latents_with_mask_with_runtime_context(
                 &mut latents,
                 &init_latents,
                 mask_weights,
-                runtime_options,
+                &mut runtime_context,
             )?;
             generation_runtime_kind = merge_runtime_kind(generation_runtime_kind, blend_kind);
             true
@@ -4764,10 +4844,10 @@ impl DiffusionPipeline {
             false
         };
         let images = if request.batch.send_images {
-            let (rgb, image_runtime_kind) = decode_to_rgb8_with_runtime_options(
+            let (rgb, image_runtime_kind) = decode_to_rgb8_with_runtime_context(
                 runtime.decoder.as_ref(),
                 &latents,
-                runtime_options,
+                &mut runtime_context,
             )?;
             generation_runtime_kind =
                 merge_runtime_kind(generation_runtime_kind, image_runtime_kind);
@@ -4862,8 +4942,17 @@ impl DiffusionPipeline {
         request: &DiffusionBatchRequest,
         runtime_options: DiffusionGenerationRuntimeOptions,
     ) -> DiffusionResult<DiffusionRunPlan> {
+        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+        self.prepare_run_plan_with_runtime_context(request, &mut runtime_context)
+    }
+
+    fn prepare_run_plan_with_runtime_context(
+        &self,
+        request: &DiffusionBatchRequest,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<DiffusionRunPlan> {
         let conditioning =
-            self.prepare_conditioning_batch_with_runtime_options(request, runtime_options)?;
+            self.prepare_conditioning_batch_with_runtime_context(request, runtime_context)?;
         let latent_shape = latent_shape_for_request(&self.config, request)?;
         let seeds = request
             .prompts
@@ -4907,8 +4996,16 @@ impl DiffusionPipeline {
         request: &DiffusionBatchRequest,
         runtime_options: DiffusionGenerationRuntimeOptions,
     ) -> DiffusionResult<DiffusionConditioningBatch> {
-        validate_batch_request(&self.metadata, request)?;
         let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
+        self.prepare_conditioning_batch_with_runtime_context(request, &mut runtime_context)
+    }
+
+    fn prepare_conditioning_batch_with_runtime_context(
+        &self,
+        request: &DiffusionBatchRequest,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<DiffusionConditioningBatch> {
+        validate_batch_request(&self.metadata, request)?;
         let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
             DiffusionError::BackendUnavailable(
                 "diffusion HFQ does not contain a usable CLIP tokenizer".to_string(),
@@ -4951,12 +5048,12 @@ impl DiffusionPipeline {
                     Some(encode_token_batch_with_runtime_context(
                         text_encoder,
                         &prompt_tokens,
-                        &mut runtime_context,
+                        runtime_context,
                     )?),
                     Some(encode_token_batch_with_runtime_context(
                         text_encoder,
                         &negative_tokens,
-                        &mut runtime_context,
+                        runtime_context,
                     )?),
                 )
             } else {
@@ -4985,14 +5082,14 @@ impl DiffusionPipeline {
                     text_encoder_2,
                     prompt_tokens_2,
                     tokenizer_2.end_token_id(),
-                    &mut runtime_context,
+                    runtime_context,
                 )?;
             let (negative_embeddings_2, negative_pooled_embeddings) =
                 encode_token_batch_with_pooled_and_runtime_context(
                     text_encoder_2,
                     negative_tokens_2,
                     tokenizer_2.end_token_id(),
-                    &mut runtime_context,
+                    runtime_context,
                 )?;
             let prompt_cross_attention_embeddings = prompt_embeddings
                 .as_ref()
@@ -5000,7 +5097,7 @@ impl DiffusionPipeline {
                     concat_last_dim_3d_with_runtime_context(
                         prompt_embeddings,
                         &prompt_embeddings_2,
-                        &mut runtime_context,
+                        runtime_context,
                     )
                 })
                 .transpose()?;
@@ -5010,7 +5107,7 @@ impl DiffusionPipeline {
                     concat_last_dim_3d_with_runtime_context(
                         negative_embeddings,
                         &negative_embeddings_2,
-                        &mut runtime_context,
+                        runtime_context,
                     )
                 })
                 .transpose()?;
@@ -5045,7 +5142,7 @@ impl DiffusionPipeline {
 trait DiffusionNoiseBackend: Send + Sync {
     fn model_input_channels(&self) -> usize;
 
-    fn denoise_latents(
+    fn denoise_latents_with_runtime_context(
         &self,
         latents: LatentBatch,
         schedule: &DiffusionSchedule,
@@ -5056,7 +5153,7 @@ trait DiffusionNoiseBackend: Send + Sync {
         negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
         inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
         masked_reference: Option<&MaskedDenoiseReference<'_>>,
-        runtime_options: DiffusionGenerationRuntimeOptions,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
         progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
     ) -> DiffusionResult<DenoiseLatentsOutput>;
 }
@@ -5066,7 +5163,7 @@ impl DiffusionNoiseBackend for NativeUnet2DConditionModel {
         self.input_channels()
     }
 
-    fn denoise_latents(
+    fn denoise_latents_with_runtime_context(
         &self,
         latents: LatentBatch,
         schedule: &DiffusionSchedule,
@@ -5077,10 +5174,10 @@ impl DiffusionNoiseBackend for NativeUnet2DConditionModel {
         negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
         inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
         masked_reference: Option<&MaskedDenoiseReference<'_>>,
-        runtime_options: DiffusionGenerationRuntimeOptions,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
         progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
     ) -> DiffusionResult<DenoiseLatentsOutput> {
-        NativeUnet2DConditionModel::denoise_latents_with_runtime_options(
+        NativeUnet2DConditionModel::denoise_latents_with_runtime_context(
             self,
             latents,
             schedule,
@@ -5091,7 +5188,7 @@ impl DiffusionNoiseBackend for NativeUnet2DConditionModel {
             negative_sdxl_conditioning,
             inpaint_conditioning,
             masked_reference,
-            runtime_options,
+            runtime_context,
             progress,
         )
     }
@@ -5130,50 +5227,44 @@ fn decode_to_rgb8_with_runtime_options(
     runtime_options: DiffusionGenerationRuntimeOptions,
 ) -> DiffusionResult<(RgbImageBatch, DiffusionRuntimeKind)> {
     let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
-    let decoded =
-        decoder.decode_to_rgb_tensor_with_runtime_context(latents, &mut runtime_context)?;
-    let rgb = rgb_tensor_to_u8_with_runtime_context(&decoded, &mut runtime_context)?;
-    let runtime_kind = if runtime_options.rocm_device_id.is_some() {
-        DiffusionRuntimeKind::RocmHybridReference
-    } else {
-        DiffusionRuntimeKind::CpuSourceReference
-    };
-    Ok((rgb, runtime_kind))
+    decode_to_rgb8_with_runtime_context(decoder, latents, &mut runtime_context)
 }
 
-fn encode_to_latents_with_runtime_options(
+fn decode_to_rgb8_with_runtime_context(
+    decoder: &dyn DiffusionImageDecoder,
+    latents: &LatentBatch,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
+) -> DiffusionResult<(RgbImageBatch, DiffusionRuntimeKind)> {
+    let decoded = decoder.decode_to_rgb_tensor_with_runtime_context(latents, runtime_context)?;
+    let rgb = rgb_tensor_to_u8_with_runtime_context(&decoded, runtime_context)?;
+    Ok((rgb, runtime_kind_for_context(runtime_context)))
+}
+
+fn encode_to_latents_with_runtime_context(
     encoder: &NativeVaeEncoder,
     image: &RgbImageBatch,
-    runtime_options: DiffusionGenerationRuntimeOptions,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<(LatentBatch, DiffusionRuntimeKind)> {
-    let latents = encoder.encode_to_latents_with_runtime_options(image, runtime_options)?;
-    let runtime_kind = if runtime_options.rocm_device_id.is_some() {
-        DiffusionRuntimeKind::RocmHybridReference
-    } else {
-        DiffusionRuntimeKind::CpuSourceReference
-    };
-    Ok((latents, runtime_kind))
+    let latents = encoder.encode_to_latents_with_runtime_context(image, runtime_context)?;
+    Ok((latents, runtime_kind_for_context(runtime_context)))
 }
 
-fn latent_mask_weights_with_runtime_options(
+fn latent_mask_weights_with_runtime_context(
     mask: &RgbImageBatch,
     latents: &LatentBatch,
-    runtime_options: DiffusionGenerationRuntimeOptions,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<(Vec<f32>, DiffusionRuntimeKind)> {
-    if let Some(device_id) = runtime_options.rocm_device_id {
+    if let Some(_device_id) = runtime_context.rocm_device_id() {
         #[cfg(feature = "rocm")]
         {
-            let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
-                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-            let weights = latent_mask_weights_from_rgb_batch_hip_on_gpu(&mut gpu, mask, latents)?;
+            let weights = runtime_context.with_rocm_gpu(|gpu| {
+                latent_mask_weights_from_rgb_batch_hip_on_gpu(gpu, mask, latents)
+            })?;
             return Ok((weights, DiffusionRuntimeKind::RocmHybridReference));
         }
         #[cfg(not(feature = "rocm"))]
         {
-            let _ = device_id;
-            return Err(DiffusionError::BackendUnavailable(
-                "ROCm hybrid diffusion generation requested, but hipfire-diffusion was built without the rocm feature".to_string(),
-            ));
+            return Err(rocm_hybrid_unavailable_error());
         }
     }
     Ok((
@@ -5182,25 +5273,21 @@ fn latent_mask_weights_with_runtime_options(
     ))
 }
 
-fn masked_rgb_batch_for_inpaint_with_runtime_options(
+fn masked_rgb_batch_for_inpaint_with_runtime_context(
     image: &RgbImageBatch,
     mask: &RgbImageBatch,
-    runtime_options: DiffusionGenerationRuntimeOptions,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<(RgbImageBatch, DiffusionRuntimeKind)> {
-    if let Some(device_id) = runtime_options.rocm_device_id {
+    if let Some(_device_id) = runtime_context.rocm_device_id() {
         #[cfg(feature = "rocm")]
         {
-            let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
-                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-            let masked = masked_rgb_batch_for_inpaint_hip_on_gpu(&mut gpu, image, mask)?;
+            let masked = runtime_context
+                .with_rocm_gpu(|gpu| masked_rgb_batch_for_inpaint_hip_on_gpu(gpu, image, mask))?;
             return Ok((masked, DiffusionRuntimeKind::RocmHybridReference));
         }
         #[cfg(not(feature = "rocm"))]
         {
-            let _ = device_id;
-            return Err(DiffusionError::BackendUnavailable(
-                "ROCm hybrid diffusion generation requested, but hipfire-diffusion was built without the rocm feature".to_string(),
-            ));
+            return Err(rocm_hybrid_unavailable_error());
         }
     }
     Ok((
@@ -5209,27 +5296,23 @@ fn masked_rgb_batch_for_inpaint_with_runtime_options(
     ))
 }
 
-fn blend_latents_with_mask_with_runtime_options(
+fn blend_latents_with_mask_with_runtime_context(
     generated: &mut LatentBatch,
     init: &LatentBatch,
     mask_weights: &[f32],
-    runtime_options: DiffusionGenerationRuntimeOptions,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<DiffusionRuntimeKind> {
-    if let Some(device_id) = runtime_options.rocm_device_id {
+    if let Some(_device_id) = runtime_context.rocm_device_id() {
         #[cfg(feature = "rocm")]
         {
-            let mut gpu = rdna_compute::Gpu::init_with_device(device_id)
-                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-            *generated =
-                blend_latents_with_mask_hip_on_gpu(&mut gpu, generated, init, mask_weights)?;
+            *generated = runtime_context.with_rocm_gpu(|gpu| {
+                blend_latents_with_mask_hip_on_gpu(gpu, generated, init, mask_weights)
+            })?;
             return Ok(DiffusionRuntimeKind::RocmHybridReference);
         }
         #[cfg(not(feature = "rocm"))]
         {
-            let _ = device_id;
-            return Err(DiffusionError::BackendUnavailable(
-                "ROCm hybrid diffusion generation requested, but hipfire-diffusion was built without the rocm feature".to_string(),
-            ));
+            return Err(rocm_hybrid_unavailable_error());
         }
     }
     blend_latents_with_mask(generated, init, mask_weights)?;
@@ -7462,6 +7545,44 @@ impl NativeUnet2DConditionModel {
             progress,
         )
     }
+
+    fn denoise_latents_with_runtime_context(
+        &self,
+        latents: LatentBatch,
+        schedule: &DiffusionSchedule,
+        cfg_scale: f32,
+        positive_embeddings: &CpuTensor,
+        negative_embeddings: &CpuTensor,
+        positive_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
+        negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
+        inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
+        masked_reference: Option<&MaskedDenoiseReference<'_>>,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+        progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
+    ) -> DiffusionResult<DenoiseLatentsOutput> {
+        denoise_latents_with_cfg_progress_and_runtime_context(
+            latents,
+            schedule,
+            cfg_scale,
+            positive_embeddings,
+            negative_embeddings,
+            |sample, timesteps, encoder_states, sdxl_conditioning, runtime_context| {
+                self.forward_with_sdxl_conditioning_and_runtime_context(
+                    sample,
+                    timesteps,
+                    encoder_states,
+                    sdxl_conditioning,
+                    runtime_context,
+                )
+            },
+            positive_sdxl_conditioning,
+            negative_sdxl_conditioning,
+            inpaint_conditioning,
+            masked_reference,
+            runtime_context,
+            progress,
+        )
+    }
 }
 
 fn maybe_center_unet_input(sample: &CpuTensor, center_input_sample: bool) -> CpuTensor {
@@ -7765,6 +7886,7 @@ impl NativeVaeEncoder {
         vae_moments_to_latents(&moments, self.scaling_factor)
     }
 
+    #[cfg(all(test, feature = "rocm"))]
     fn encode_to_latents_with_runtime_options(
         &self,
         image: &RgbImageBatch,
@@ -8985,6 +9107,23 @@ extern "C" __global__ void diffusion_geglu_gate_3d_f32(
 "#;
 
 #[cfg(feature = "rocm")]
+fn ensure_and_launch_diffusion_kernel(
+    gpu: &mut rdna_compute::Gpu,
+    module_name: &str,
+    source: &str,
+    func_name: &str,
+    grid: [u32; 3],
+    block: [u32; 3],
+    shared_mem: u32,
+    kernargs: &mut hip_bridge::KernargBlob,
+) -> DiffusionResult<()> {
+    gpu.ensure_kernel_public(module_name, source, func_name)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    gpu.launch_kernel_blob(func_name, grid, block, shared_mem, kernargs.as_mut_slice())
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))
+}
+
+#[cfg(feature = "rocm")]
 fn rgb_tensor_to_u8_hip_on_gpu(
     gpu: &mut rdna_compute::Gpu,
     tensor: &CpuTensor,
@@ -9009,30 +9148,9 @@ fn rgb_tensor_to_u8_hip_on_gpu(
         .hip
         .malloc(output_bytes)
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = compiler
-        .compile(
-            "diffusion_rgb_tensor_to_u8",
-            DIFFUSION_RGB_TENSOR_TO_U8_HIP_SRC,
-        )
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = obj_path
-        .to_str()
-        .ok_or_else(|| {
-            DiffusionError::BackendUnavailable(
-                "compiled diffusion RGB kernel path is not UTF-8".to_string(),
-            )
-        })?
-        .to_string();
-    let module = gpu
-        .hip
-        .module_load(&obj_path)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let function = gpu
-        .hip
-        .module_get_function(&module, "diffusion_rgb_tensor_to_u8")
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let module_name = "diffusion_rgb_tensor_to_u8";
+    let function_name = "diffusion_rgb_tensor_to_u8";
+    let kernel_source = DIFFUSION_RGB_TENSOR_TO_U8_HIP_SRC;
     let total_pixels = batch
         .checked_mul(height)
         .and_then(|pixels| pixels.checked_mul(width))
@@ -9045,18 +9163,16 @@ fn rgb_tensor_to_u8_hip_on_gpu(
     kernargs.push_i32(width as i32);
     kernargs.pad_to(16);
     let grid = [((total_pixels as u32).saturating_add(255)) / 256, 1, 1];
-    unsafe {
-        gpu.hip
-            .launch_kernel_blob(
-                &function,
-                grid,
-                [256, 1, 1],
-                0,
-                gpu.active_stream.as_ref(),
-                kernargs.as_mut_slice(),
-            )
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    }
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        module_name,
+        kernel_source,
+        function_name,
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
@@ -9117,30 +9233,9 @@ fn rgb_batch_to_vae_tensor_hip_on_gpu(
         .hip
         .malloc(output_bytes)
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = compiler
-        .compile(
-            "diffusion_rgb_u8_to_vae_nchw_f32",
-            DIFFUSION_VAE_BOUNDARY_HIP_SRC,
-        )
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = obj_path
-        .to_str()
-        .ok_or_else(|| {
-            DiffusionError::BackendUnavailable(
-                "compiled diffusion RGB-to-VAE kernel path is not UTF-8".to_string(),
-            )
-        })?
-        .to_string();
-    let module = gpu
-        .hip
-        .module_load(&obj_path)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let function = gpu
-        .hip
-        .module_get_function(&module, "diffusion_rgb_u8_to_vae_nchw_f32")
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let module_name = "diffusion_rgb_u8_to_vae_nchw_f32";
+    let function_name = "diffusion_rgb_u8_to_vae_nchw_f32";
+    let kernel_source = DIFFUSION_VAE_BOUNDARY_HIP_SRC;
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(input_gpu.as_ptr());
     kernargs.push_ptr(output_gpu.as_ptr());
@@ -9152,18 +9247,16 @@ fn rgb_batch_to_vae_tensor_hip_on_gpu(
     kernargs.push_i32(i32_kernel_dim("RGB-to-VAE width", batch.width)?);
     kernargs.pad_to(16);
     let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
-    unsafe {
-        gpu.hip
-            .launch_kernel_blob(
-                &function,
-                grid,
-                [256, 1, 1],
-                0,
-                gpu.active_stream.as_ref(),
-                kernargs.as_mut_slice(),
-            )
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    }
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        module_name,
+        kernel_source,
+        function_name,
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
@@ -9220,30 +9313,9 @@ fn vae_moments_to_latents_hip_on_gpu(
         .hip
         .malloc(output_bytes)
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = compiler
-        .compile(
-            "diffusion_vae_moments_to_latents_f32",
-            DIFFUSION_VAE_BOUNDARY_HIP_SRC,
-        )
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = obj_path
-        .to_str()
-        .ok_or_else(|| {
-            DiffusionError::BackendUnavailable(
-                "compiled diffusion VAE moments-to-latents kernel path is not UTF-8".to_string(),
-            )
-        })?
-        .to_string();
-    let module = gpu
-        .hip
-        .module_load(&obj_path)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let function = gpu
-        .hip
-        .module_get_function(&module, "diffusion_vae_moments_to_latents_f32")
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let module_name = "diffusion_vae_moments_to_latents_f32";
+    let function_name = "diffusion_vae_moments_to_latents_f32";
+    let kernel_source = DIFFUSION_VAE_BOUNDARY_HIP_SRC;
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(moments_gpu.buf.as_ptr());
     kernargs.push_ptr(output_gpu.as_ptr());
@@ -9258,18 +9330,16 @@ fn vae_moments_to_latents_hip_on_gpu(
     kernargs.push_f32(scaling_factor.max(f32::MIN_POSITIVE));
     kernargs.pad_to(16);
     let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
-    unsafe {
-        gpu.hip
-            .launch_kernel_blob(
-                &function,
-                grid,
-                [256, 1, 1],
-                0,
-                gpu.active_stream.as_ref(),
-                kernargs.as_mut_slice(),
-            )
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    }
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        module_name,
+        kernel_source,
+        function_name,
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
@@ -9338,30 +9408,9 @@ fn latent_mask_weights_from_rgb_batch_hip_on_gpu(
         .hip
         .malloc(output_bytes)
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = compiler
-        .compile(
-            "diffusion_latent_mask_weights_from_rgb_f32",
-            DIFFUSION_INPAINT_MASK_HIP_SRC,
-        )
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = obj_path
-        .to_str()
-        .ok_or_else(|| {
-            DiffusionError::BackendUnavailable(
-                "compiled diffusion latent-mask kernel path is not UTF-8".to_string(),
-            )
-        })?
-        .to_string();
-    let module = gpu
-        .hip
-        .module_load(&obj_path)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let function = gpu
-        .hip
-        .module_get_function(&module, "diffusion_latent_mask_weights_from_rgb_f32")
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let module_name = "diffusion_latent_mask_weights_from_rgb_f32";
+    let function_name = "diffusion_latent_mask_weights_from_rgb_f32";
+    let kernel_source = DIFFUSION_INPAINT_MASK_HIP_SRC;
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(mask_gpu.as_ptr());
     kernargs.push_ptr(output_gpu.as_ptr());
@@ -9375,18 +9424,16 @@ fn latent_mask_weights_from_rgb_batch_hip_on_gpu(
     kernargs.push_i32(i32_kernel_dim("latent mask output width", latents.width)?);
     kernargs.pad_to(16);
     let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
-    unsafe {
-        gpu.hip
-            .launch_kernel_blob(
-                &function,
-                grid,
-                [256, 1, 1],
-                0,
-                gpu.active_stream.as_ref(),
-                kernargs.as_mut_slice(),
-            )
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    }
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        module_name,
+        kernel_source,
+        function_name,
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
@@ -9458,30 +9505,9 @@ fn masked_rgb_batch_for_inpaint_hip_on_gpu(
         .hip
         .malloc(expected)
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = compiler
-        .compile(
-            "diffusion_masked_rgb_for_inpaint_u8",
-            DIFFUSION_INPAINT_MASK_HIP_SRC,
-        )
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = obj_path
-        .to_str()
-        .ok_or_else(|| {
-            DiffusionError::BackendUnavailable(
-                "compiled diffusion masked-RGB kernel path is not UTF-8".to_string(),
-            )
-        })?
-        .to_string();
-    let module = gpu
-        .hip
-        .module_load(&obj_path)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let function = gpu
-        .hip
-        .module_get_function(&module, "diffusion_masked_rgb_for_inpaint_u8")
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let module_name = "diffusion_masked_rgb_for_inpaint_u8";
+    let function_name = "diffusion_masked_rgb_for_inpaint_u8";
+    let kernel_source = DIFFUSION_INPAINT_MASK_HIP_SRC;
     let total_pixels = expected / 3;
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(image_gpu.as_ptr());
@@ -9490,18 +9516,16 @@ fn masked_rgb_batch_for_inpaint_hip_on_gpu(
     kernargs.push_i32(i32_kernel_dim("masked RGB pixels", total_pixels)?);
     kernargs.pad_to(16);
     let grid = [((total_pixels as u32).saturating_add(255)) / 256, 1, 1];
-    unsafe {
-        gpu.hip
-            .launch_kernel_blob(
-                &function,
-                grid,
-                [256, 1, 1],
-                0,
-                gpu.active_stream.as_ref(),
-                kernargs.as_mut_slice(),
-            )
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    }
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        module_name,
+        kernel_source,
+        function_name,
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
@@ -9594,30 +9618,9 @@ fn blend_latents_with_mask_hip_on_gpu(
         .hip
         .malloc(output_bytes)
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = compiler
-        .compile(
-            "diffusion_blend_latents_with_mask_f32",
-            DIFFUSION_INPAINT_MASK_HIP_SRC,
-        )
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = obj_path
-        .to_str()
-        .ok_or_else(|| {
-            DiffusionError::BackendUnavailable(
-                "compiled diffusion latent-blend kernel path is not UTF-8".to_string(),
-            )
-        })?
-        .to_string();
-    let module = gpu
-        .hip
-        .module_load(&obj_path)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let function = gpu
-        .hip
-        .module_get_function(&module, "diffusion_blend_latents_with_mask_f32")
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let module_name = "diffusion_blend_latents_with_mask_f32";
+    let function_name = "diffusion_blend_latents_with_mask_f32";
+    let kernel_source = DIFFUSION_INPAINT_MASK_HIP_SRC;
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(generated_gpu.buf.as_ptr());
     kernargs.push_ptr(init_gpu.buf.as_ptr());
@@ -9632,18 +9635,16 @@ fn blend_latents_with_mask_hip_on_gpu(
     kernargs.push_i32(i32_kernel_dim("latent blend width", generated.width)?);
     kernargs.pad_to(16);
     let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
-    unsafe {
-        gpu.hip
-            .launch_kernel_blob(
-                &function,
-                grid,
-                [256, 1, 1],
-                0,
-                gpu.active_stream.as_ref(),
-                kernargs.as_mut_slice(),
-            )
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    }
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        module_name,
+        kernel_source,
+        function_name,
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
@@ -9671,27 +9672,8 @@ fn launch_diffusion_vector_kernel(
     n: i32,
     scalar: f32,
 ) -> DiffusionResult<()> {
-    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = compiler
-        .compile(function_name, source)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = obj_path
-        .to_str()
-        .ok_or_else(|| {
-            DiffusionError::BackendUnavailable(format!(
-                "compiled diffusion kernel {function_name} path is not UTF-8"
-            ))
-        })?
-        .to_string();
-    let module = gpu
-        .hip
-        .module_load(&obj_path)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let function = gpu
-        .hip
-        .module_get_function(&module, function_name)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let module_name = function_name;
+    let kernel_source = source;
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(input_a.buf.as_ptr());
     if let Some(input_b) = input_b {
@@ -9702,18 +9684,16 @@ fn launch_diffusion_vector_kernel(
     kernargs.push_f32(scalar);
     kernargs.pad_to(16);
     let grid = [((n as u32).saturating_add(255)) / 256, 1, 1];
-    unsafe {
-        gpu.hip
-            .launch_kernel_blob(
-                &function,
-                grid,
-                [256, 1, 1],
-                0,
-                gpu.active_stream.as_ref(),
-                kernargs.as_mut_slice(),
-            )
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    }
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        module_name,
+        kernel_source,
+        function_name,
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))
@@ -9968,27 +9948,8 @@ fn launch_diffusion_layout_kernel(
     height: usize,
     width: usize,
 ) -> DiffusionResult<()> {
-    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = compiler
-        .compile(function_name, DIFFUSION_LAYOUT_HIP_SRC)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = obj_path
-        .to_str()
-        .ok_or_else(|| {
-            DiffusionError::BackendUnavailable(format!(
-                "compiled diffusion layout kernel {function_name} path is not UTF-8"
-            ))
-        })?
-        .to_string();
-    let module = gpu
-        .hip
-        .module_load(&obj_path)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let function = gpu
-        .hip
-        .module_get_function(&module, function_name)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let module_name = function_name;
+    let kernel_source = DIFFUSION_LAYOUT_HIP_SRC;
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(input_gpu.buf.as_ptr());
     if let Some(bias_gpu) = bias_gpu {
@@ -10001,18 +9962,16 @@ fn launch_diffusion_layout_kernel(
     kernargs.push_i32(i32_kernel_dim("layout width", width)?);
     kernargs.pad_to(16);
     let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
-    unsafe {
-        gpu.hip
-            .launch_kernel_blob(
-                &function,
-                grid,
-                [256, 1, 1],
-                0,
-                gpu.active_stream.as_ref(),
-                kernargs.as_mut_slice(),
-            )
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    }
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        module_name,
+        kernel_source,
+        function_name,
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))
@@ -10188,27 +10147,8 @@ fn launch_diffusion_concat_kernel(
     kernargs_tail: impl FnOnce(&mut hip_bridge::KernargBlob) -> DiffusionResult<()>,
     output_elements: usize,
 ) -> DiffusionResult<()> {
-    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = compiler
-        .compile(function_name, DIFFUSION_CONCAT_HIP_SRC)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = obj_path
-        .to_str()
-        .ok_or_else(|| {
-            DiffusionError::BackendUnavailable(format!(
-                "compiled diffusion concat kernel {function_name} path is not UTF-8"
-            ))
-        })?
-        .to_string();
-    let module = gpu
-        .hip
-        .module_load(&obj_path)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let function = gpu
-        .hip
-        .module_get_function(&module, function_name)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let module_name = function_name;
+    let kernel_source = DIFFUSION_CONCAT_HIP_SRC;
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(a_gpu.buf.as_ptr());
     kernargs.push_ptr(b_gpu.buf.as_ptr());
@@ -10217,18 +10157,16 @@ fn launch_diffusion_concat_kernel(
     kernargs_tail(&mut kernargs)?;
     kernargs.pad_to(16);
     let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
-    unsafe {
-        gpu.hip
-            .launch_kernel_blob(
-                &function,
-                grid,
-                [256, 1, 1],
-                0,
-                gpu.active_stream.as_ref(),
-                kernargs.as_mut_slice(),
-            )
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    }
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        module_name,
+        kernel_source,
+        function_name,
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))
@@ -10462,27 +10400,9 @@ fn conv2d_nchw_hip_on_gpu(
         .hip
         .malloc(output_bytes)
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = compiler
-        .compile("diffusion_conv2d_nchw_f32", DIFFUSION_CONV2D_HIP_SRC)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = obj_path
-        .to_str()
-        .ok_or_else(|| {
-            DiffusionError::BackendUnavailable(
-                "compiled diffusion Conv2D kernel path is not UTF-8".to_string(),
-            )
-        })?
-        .to_string();
-    let module = gpu
-        .hip
-        .module_load(&obj_path)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let function = gpu
-        .hip
-        .module_get_function(&module, "diffusion_conv2d_nchw_f32")
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let module_name = "diffusion_conv2d_nchw_f32";
+    let function_name = "diffusion_conv2d_nchw_f32";
+    let kernel_source = DIFFUSION_CONV2D_HIP_SRC;
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(input_gpu.buf.as_ptr());
     kernargs.push_ptr(weight_gpu.buf.as_ptr());
@@ -10507,18 +10427,16 @@ fn conv2d_nchw_hip_on_gpu(
     kernargs.push_i32(if bias.is_some() { 1 } else { 0 });
     kernargs.pad_to(16);
     let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
-    unsafe {
-        gpu.hip
-            .launch_kernel_blob(
-                &function,
-                grid,
-                [256, 1, 1],
-                0,
-                gpu.active_stream.as_ref(),
-                kernargs.as_mut_slice(),
-            )
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    }
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        module_name,
+        kernel_source,
+        function_name,
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
@@ -10577,30 +10495,9 @@ fn group_norm_nchw_hip_on_gpu(
         .hip
         .malloc(output_bytes)
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = compiler
-        .compile(
-            "diffusion_group_norm_nchw_f32",
-            DIFFUSION_GROUP_NORM_HIP_SRC,
-        )
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = obj_path
-        .to_str()
-        .ok_or_else(|| {
-            DiffusionError::BackendUnavailable(
-                "compiled diffusion GroupNorm kernel path is not UTF-8".to_string(),
-            )
-        })?
-        .to_string();
-    let module = gpu
-        .hip
-        .module_load(&obj_path)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let function = gpu
-        .hip
-        .module_get_function(&module, "diffusion_group_norm_nchw_f32")
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let module_name = "diffusion_group_norm_nchw_f32";
+    let function_name = "diffusion_group_norm_nchw_f32";
+    let kernel_source = DIFFUSION_GROUP_NORM_HIP_SRC;
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(input_gpu.buf.as_ptr());
     kernargs.push_ptr(weight_gpu.buf.as_ptr());
@@ -10617,18 +10514,16 @@ fn group_norm_nchw_hip_on_gpu(
     kernargs.push_f32(eps);
     kernargs.pad_to(16);
     let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
-    unsafe {
-        gpu.hip
-            .launch_kernel_blob(
-                &function,
-                grid,
-                [256, 1, 1],
-                0,
-                gpu.active_stream.as_ref(),
-                kernargs.as_mut_slice(),
-            )
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    }
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        module_name,
+        kernel_source,
+        function_name,
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
@@ -10661,45 +10556,25 @@ fn silu_hip_on_gpu(gpu: &mut rdna_compute::Gpu, input: &CpuTensor) -> DiffusionR
         .hip
         .malloc(output_bytes)
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = compiler
-        .compile("diffusion_silu_f32", DIFFUSION_SILU_HIP_SRC)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = obj_path
-        .to_str()
-        .ok_or_else(|| {
-            DiffusionError::BackendUnavailable(
-                "compiled diffusion SiLU kernel path is not UTF-8".to_string(),
-            )
-        })?
-        .to_string();
-    let module = gpu
-        .hip
-        .module_load(&obj_path)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let function = gpu
-        .hip
-        .module_get_function(&module, "diffusion_silu_f32")
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let module_name = "diffusion_silu_f32";
+    let function_name = "diffusion_silu_f32";
+    let kernel_source = DIFFUSION_SILU_HIP_SRC;
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(input_gpu.buf.as_ptr());
     kernargs.push_ptr(output_gpu.as_ptr());
     kernargs.push_i32(n);
     kernargs.pad_to(16);
     let grid = [((elements as u32).saturating_add(255)) / 256, 1, 1];
-    unsafe {
-        gpu.hip
-            .launch_kernel_blob(
-                &function,
-                grid,
-                [256, 1, 1],
-                0,
-                gpu.active_stream.as_ref(),
-                kernargs.as_mut_slice(),
-            )
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    }
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        module_name,
+        kernel_source,
+        function_name,
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
@@ -10737,45 +10612,25 @@ fn quick_gelu_hip_on_gpu(
         .hip
         .malloc(output_bytes)
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = compiler
-        .compile("diffusion_quick_gelu_f32", DIFFUSION_QUICK_GELU_HIP_SRC)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = obj_path
-        .to_str()
-        .ok_or_else(|| {
-            DiffusionError::BackendUnavailable(
-                "compiled diffusion QuickGELU kernel path is not UTF-8".to_string(),
-            )
-        })?
-        .to_string();
-    let module = gpu
-        .hip
-        .module_load(&obj_path)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let function = gpu
-        .hip
-        .module_get_function(&module, "diffusion_quick_gelu_f32")
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let module_name = "diffusion_quick_gelu_f32";
+    let function_name = "diffusion_quick_gelu_f32";
+    let kernel_source = DIFFUSION_QUICK_GELU_HIP_SRC;
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(input_gpu.buf.as_ptr());
     kernargs.push_ptr(output_gpu.as_ptr());
     kernargs.push_i32(n);
     kernargs.pad_to(16);
     let grid = [((elements as u32).saturating_add(255)) / 256, 1, 1];
-    unsafe {
-        gpu.hip
-            .launch_kernel_blob(
-                &function,
-                grid,
-                [256, 1, 1],
-                0,
-                gpu.active_stream.as_ref(),
-                kernargs.as_mut_slice(),
-            )
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    }
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        module_name,
+        kernel_source,
+        function_name,
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
@@ -10849,30 +10704,9 @@ fn clip_token_position_embeddings_hip_on_gpu(
         .hip
         .malloc(output_bytes)
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = compiler
-        .compile(
-            "diffusion_clip_token_position_embedding_f32",
-            DIFFUSION_CLIP_EMBEDDINGS_HIP_SRC,
-        )
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = obj_path
-        .to_str()
-        .ok_or_else(|| {
-            DiffusionError::BackendUnavailable(
-                "compiled diffusion CLIP embedding kernel path is not UTF-8".to_string(),
-            )
-        })?
-        .to_string();
-    let module = gpu
-        .hip
-        .module_load(&obj_path)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let function = gpu
-        .hip
-        .module_get_function(&module, "diffusion_clip_token_position_embedding_f32")
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let module_name = "diffusion_clip_token_position_embedding_f32";
+    let function_name = "diffusion_clip_token_position_embedding_f32";
+    let kernel_source = DIFFUSION_CLIP_EMBEDDINGS_HIP_SRC;
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(token_embedding_gpu.buf.as_ptr());
     kernargs.push_ptr(position_embedding_gpu.buf.as_ptr());
@@ -10888,18 +10722,16 @@ fn clip_token_position_embeddings_hip_on_gpu(
     )?);
     kernargs.pad_to(16);
     let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
-    unsafe {
-        gpu.hip
-            .launch_kernel_blob(
-                &function,
-                grid,
-                [256, 1, 1],
-                0,
-                gpu.active_stream.as_ref(),
-                kernargs.as_mut_slice(),
-            )
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    }
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        module_name,
+        kernel_source,
+        function_name,
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
@@ -10950,30 +10782,9 @@ fn upsample_nearest2d_nchw_hip_on_gpu(
         .hip
         .malloc(output_bytes)
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = compiler
-        .compile(
-            "diffusion_upsample_nearest2d_nchw_f32",
-            DIFFUSION_UPSAMPLE_NEAREST2D_HIP_SRC,
-        )
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = obj_path
-        .to_str()
-        .ok_or_else(|| {
-            DiffusionError::BackendUnavailable(
-                "compiled diffusion nearest-upsample kernel path is not UTF-8".to_string(),
-            )
-        })?
-        .to_string();
-    let module = gpu
-        .hip
-        .module_load(&obj_path)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let function = gpu
-        .hip
-        .module_get_function(&module, "diffusion_upsample_nearest2d_nchw_f32")
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let module_name = "diffusion_upsample_nearest2d_nchw_f32";
+    let function_name = "diffusion_upsample_nearest2d_nchw_f32";
+    let kernel_source = DIFFUSION_UPSAMPLE_NEAREST2D_HIP_SRC;
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(input_gpu.buf.as_ptr());
     kernargs.push_ptr(output_gpu.as_ptr());
@@ -10986,18 +10797,16 @@ fn upsample_nearest2d_nchw_hip_on_gpu(
     kernargs.push_i32(i32_kernel_dim("upsample scale", scale)?);
     kernargs.pad_to(16);
     let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
-    unsafe {
-        gpu.hip
-            .launch_kernel_blob(
-                &function,
-                grid,
-                [256, 1, 1],
-                0,
-                gpu.active_stream.as_ref(),
-                kernargs.as_mut_slice(),
-            )
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    }
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        module_name,
+        kernel_source,
+        function_name,
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
@@ -11059,27 +10868,9 @@ fn linear_optional_bias_hip_on_gpu(
         .hip
         .malloc(output_bytes)
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = compiler
-        .compile("diffusion_linear_f32", DIFFUSION_LINEAR_HIP_SRC)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = obj_path
-        .to_str()
-        .ok_or_else(|| {
-            DiffusionError::BackendUnavailable(
-                "compiled diffusion linear kernel path is not UTF-8".to_string(),
-            )
-        })?
-        .to_string();
-    let module = gpu
-        .hip
-        .module_load(&obj_path)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let function = gpu
-        .hip
-        .module_get_function(&module, "diffusion_linear_f32")
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let module_name = "diffusion_linear_f32";
+    let function_name = "diffusion_linear_f32";
+    let kernel_source = DIFFUSION_LINEAR_HIP_SRC;
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(input_gpu.buf.as_ptr());
     kernargs.push_ptr(weight_gpu.buf.as_ptr());
@@ -11095,18 +10886,16 @@ fn linear_optional_bias_hip_on_gpu(
     kernargs.push_i32(if bias.is_some() { 1 } else { 0 });
     kernargs.pad_to(16);
     let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
-    unsafe {
-        gpu.hip
-            .launch_kernel_blob(
-                &function,
-                grid,
-                [256, 1, 1],
-                0,
-                gpu.active_stream.as_ref(),
-                kernargs.as_mut_slice(),
-            )
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    }
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        module_name,
+        kernel_source,
+        function_name,
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
@@ -11160,27 +10949,9 @@ fn layer_norm_hip_on_gpu(
         .hip
         .malloc(output_bytes)
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = compiler
-        .compile("diffusion_layer_norm_f32", DIFFUSION_LAYER_NORM_HIP_SRC)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = obj_path
-        .to_str()
-        .ok_or_else(|| {
-            DiffusionError::BackendUnavailable(
-                "compiled diffusion LayerNorm kernel path is not UTF-8".to_string(),
-            )
-        })?
-        .to_string();
-    let module = gpu
-        .hip
-        .module_load(&obj_path)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let function = gpu
-        .hip
-        .module_get_function(&module, "diffusion_layer_norm_f32")
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let module_name = "diffusion_layer_norm_f32";
+    let function_name = "diffusion_layer_norm_f32";
+    let kernel_source = DIFFUSION_LAYER_NORM_HIP_SRC;
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(input_gpu.buf.as_ptr());
     kernargs.push_ptr(weight_gpu.buf.as_ptr());
@@ -11194,18 +10965,16 @@ fn layer_norm_hip_on_gpu(
     kernargs.push_f32(eps);
     kernargs.pad_to(16);
     let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
-    unsafe {
-        gpu.hip
-            .launch_kernel_blob(
-                &function,
-                grid,
-                [256, 1, 1],
-                0,
-                gpu.active_stream.as_ref(),
-                kernargs.as_mut_slice(),
-            )
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    }
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        module_name,
+        kernel_source,
+        function_name,
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
@@ -11243,27 +11012,9 @@ fn softmax_rows_hip_on_gpu(
         .hip
         .malloc(output_bytes)
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = compiler
-        .compile("diffusion_softmax_rows_f32", DIFFUSION_SOFTMAX_ROWS_HIP_SRC)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = obj_path
-        .to_str()
-        .ok_or_else(|| {
-            DiffusionError::BackendUnavailable(
-                "compiled diffusion softmax kernel path is not UTF-8".to_string(),
-            )
-        })?
-        .to_string();
-    let module = gpu
-        .hip
-        .module_load(&obj_path)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let function = gpu
-        .hip
-        .module_get_function(&module, "diffusion_softmax_rows_f32")
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let module_name = "diffusion_softmax_rows_f32";
+    let function_name = "diffusion_softmax_rows_f32";
+    let kernel_source = DIFFUSION_SOFTMAX_ROWS_HIP_SRC;
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(input_gpu.buf.as_ptr());
     kernargs.push_ptr(output_gpu.as_ptr());
@@ -11271,18 +11022,16 @@ fn softmax_rows_hip_on_gpu(
     kernargs.push_i32(i32_kernel_dim("softmax cols", cols)?);
     kernargs.pad_to(16);
     let grid = [((rows as u32).saturating_add(255)) / 256, 1, 1];
-    unsafe {
-        gpu.hip
-            .launch_kernel_blob(
-                &function,
-                grid,
-                [256, 1, 1],
-                0,
-                gpu.active_stream.as_ref(),
-                kernargs.as_mut_slice(),
-            )
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    }
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        module_name,
+        kernel_source,
+        function_name,
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
@@ -11342,27 +11091,9 @@ fn scaled_dot_product_attention_hip_on_gpu(
         .hip
         .malloc(output_bytes)
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = compiler
-        .compile("diffusion_sdpa_3d_f32", DIFFUSION_SDPA_HIP_SRC)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = obj_path
-        .to_str()
-        .ok_or_else(|| {
-            DiffusionError::BackendUnavailable(
-                "compiled diffusion SDPA kernel path is not UTF-8".to_string(),
-            )
-        })?
-        .to_string();
-    let module = gpu
-        .hip
-        .module_load(&obj_path)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let function = gpu
-        .hip
-        .module_get_function(&module, "diffusion_sdpa_3d_f32")
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let module_name = "diffusion_sdpa_3d_f32";
+    let function_name = "diffusion_sdpa_3d_f32";
+    let kernel_source = DIFFUSION_SDPA_HIP_SRC;
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(q_gpu.buf.as_ptr());
     kernargs.push_ptr(k_gpu.buf.as_ptr());
@@ -11376,18 +11107,16 @@ fn scaled_dot_product_attention_hip_on_gpu(
     kernargs.push_i32(i32_kernel_dim("SDPA head dim", head_dim)?);
     kernargs.pad_to(16);
     let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
-    unsafe {
-        gpu.hip
-            .launch_kernel_blob(
-                &function,
-                grid,
-                [256, 1, 1],
-                0,
-                gpu.active_stream.as_ref(),
-                kernargs.as_mut_slice(),
-            )
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    }
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        module_name,
+        kernel_source,
+        function_name,
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
@@ -11449,30 +11178,9 @@ fn clip_causal_self_attention_hip_on_gpu(
         .hip
         .malloc(output_bytes)
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = compiler
-        .compile(
-            "diffusion_clip_causal_attention_f32",
-            DIFFUSION_CLIP_CAUSAL_ATTENTION_HIP_SRC,
-        )
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = obj_path
-        .to_str()
-        .ok_or_else(|| {
-            DiffusionError::BackendUnavailable(
-                "compiled diffusion CLIP causal attention kernel path is not UTF-8".to_string(),
-            )
-        })?
-        .to_string();
-    let module = gpu
-        .hip
-        .module_load(&obj_path)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let function = gpu
-        .hip
-        .module_get_function(&module, "diffusion_clip_causal_attention_f32")
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let module_name = "diffusion_clip_causal_attention_f32";
+    let function_name = "diffusion_clip_causal_attention_f32";
+    let kernel_source = DIFFUSION_CLIP_CAUSAL_ATTENTION_HIP_SRC;
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(q_gpu.buf.as_ptr());
     kernargs.push_ptr(k_gpu.buf.as_ptr());
@@ -11488,18 +11196,16 @@ fn clip_causal_self_attention_hip_on_gpu(
     kernargs.push_i32(i32_kernel_dim("CLIP causal attention head dim", head_dim)?);
     kernargs.pad_to(16);
     let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
-    unsafe {
-        gpu.hip
-            .launch_kernel_blob(
-                &function,
-                grid,
-                [256, 1, 1],
-                0,
-                gpu.active_stream.as_ref(),
-                kernargs.as_mut_slice(),
-            )
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    }
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        module_name,
+        kernel_source,
+        function_name,
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
@@ -11544,27 +11250,9 @@ fn geglu_gate_3d_hip_on_gpu(
         .hip
         .malloc(output_bytes)
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = compiler
-        .compile("diffusion_geglu_gate_3d_f32", DIFFUSION_GEGLU_GATE_HIP_SRC)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = obj_path
-        .to_str()
-        .ok_or_else(|| {
-            DiffusionError::BackendUnavailable(
-                "compiled diffusion GeGLU gate kernel path is not UTF-8".to_string(),
-            )
-        })?
-        .to_string();
-    let module = gpu
-        .hip
-        .module_load(&obj_path)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let function = gpu
-        .hip
-        .module_get_function(&module, "diffusion_geglu_gate_3d_f32")
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let module_name = "diffusion_geglu_gate_3d_f32";
+    let function_name = "diffusion_geglu_gate_3d_f32";
+    let kernel_source = DIFFUSION_GEGLU_GATE_HIP_SRC;
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(input_gpu.buf.as_ptr());
     kernargs.push_ptr(output_gpu.as_ptr());
@@ -11576,18 +11264,16 @@ fn geglu_gate_3d_hip_on_gpu(
     kernargs.push_i32(i32_kernel_dim("GeGLU gate projected width", width)?);
     kernargs.pad_to(16);
     let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
-    unsafe {
-        gpu.hip
-            .launch_kernel_blob(
-                &function,
-                grid,
-                [256, 1, 1],
-                0,
-                gpu.active_stream.as_ref(),
-                kernargs.as_mut_slice(),
-            )
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    }
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        module_name,
+        kernel_source,
+        function_name,
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
@@ -11633,30 +11319,9 @@ fn timestep_embedding_hip_on_gpu(
         .hip
         .malloc(output_bytes)
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = compiler
-        .compile(
-            "diffusion_timestep_embedding_f32",
-            DIFFUSION_TIMESTEP_EMBEDDING_HIP_SRC,
-        )
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = obj_path
-        .to_str()
-        .ok_or_else(|| {
-            DiffusionError::BackendUnavailable(
-                "compiled diffusion timestep embedding kernel path is not UTF-8".to_string(),
-            )
-        })?
-        .to_string();
-    let module = gpu
-        .hip
-        .module_load(&obj_path)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let function = gpu
-        .hip
-        .module_get_function(&module, "diffusion_timestep_embedding_f32")
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let module_name = "diffusion_timestep_embedding_f32";
+    let function_name = "diffusion_timestep_embedding_f32";
+    let kernel_source = DIFFUSION_TIMESTEP_EMBEDDING_HIP_SRC;
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(timesteps_gpu.buf.as_ptr());
     kernargs.push_ptr(output_gpu.as_ptr());
@@ -11673,18 +11338,16 @@ fn timestep_embedding_hip_on_gpu(
     kernargs.push_f32(freq_shift);
     kernargs.pad_to(16);
     let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
-    unsafe {
-        gpu.hip
-            .launch_kernel_blob(
-                &function,
-                grid,
-                [256, 1, 1],
-                0,
-                gpu.active_stream.as_ref(),
-                kernargs.as_mut_slice(),
-            )
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    }
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        module_name,
+        kernel_source,
+        function_name,
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
@@ -11750,27 +11413,9 @@ fn euler_step_hip_on_gpu(
         .hip
         .malloc(output_bytes)
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, String::new())
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = compiler
-        .compile("diffusion_euler_step_f32", DIFFUSION_EULER_STEP_HIP_SRC)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let obj_path = obj_path
-        .to_str()
-        .ok_or_else(|| {
-            DiffusionError::BackendUnavailable(
-                "compiled diffusion Euler kernel path is not UTF-8".to_string(),
-            )
-        })?
-        .to_string();
-    let module = gpu
-        .hip
-        .module_load(&obj_path)
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    let function = gpu
-        .hip
-        .module_get_function(&module, "diffusion_euler_step_f32")
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let module_name = "diffusion_euler_step_f32";
+    let function_name = "diffusion_euler_step_f32";
+    let kernel_source = DIFFUSION_EULER_STEP_HIP_SRC;
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(sample_gpu.buf.as_ptr());
     kernargs.push_ptr(model_output_gpu.buf.as_ptr());
@@ -11781,18 +11426,16 @@ fn euler_step_hip_on_gpu(
     kernargs.push_i32(scheduler_prediction_type_id(prediction_type));
     kernargs.pad_to(16);
     let grid = [((sample.len() as u32).saturating_add(255)) / 256, 1, 1];
-    unsafe {
-        gpu.hip
-            .launch_kernel_blob(
-                &function,
-                grid,
-                [256, 1, 1],
-                0,
-                gpu.active_stream.as_ref(),
-                kernargs.as_mut_slice(),
-            )
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    }
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        module_name,
+        kernel_source,
+        function_name,
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
@@ -13531,7 +13174,7 @@ fn build_inpaint_conditioning_if_supported(
     mask: &RgbImageBatch,
     latents: &LatentBatch,
     mask_weights: Option<&[f32]>,
-    runtime_options: DiffusionGenerationRuntimeOptions,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<(Option<InpaintDenoiseConditioning>, DiffusionRuntimeKind)> {
     let base_channels = latents.channels;
     let model_channels = noise.model_input_channels();
@@ -13553,9 +13196,9 @@ fn build_inpaint_conditioning_if_supported(
         DiffusionError::InvalidRequest("inpaint conditioning requires a mask".to_string())
     })?;
     let (masked_image, masked_image_kind) =
-        masked_rgb_batch_for_inpaint_with_runtime_options(init_image, mask, runtime_options)?;
+        masked_rgb_batch_for_inpaint_with_runtime_context(init_image, mask, runtime_context)?;
     let (masked_image_latents, masked_latents_kind) =
-        encode_to_latents_with_runtime_options(encoder, &masked_image, runtime_options)?;
+        encode_to_latents_with_runtime_context(encoder, &masked_image, runtime_context)?;
     let masked_image_latents = if masked_image_latents.batch == latents.batch
         && masked_image_latents.channels == latents.channels
         && (masked_image_latents.height != latents.height
@@ -20737,6 +20380,70 @@ mod tests {
         assert_eq!(generated.data, vec![1.0, 20.0, 3.0, 40.0]);
     }
 
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn hip_img2img_boundary_helpers_reuse_single_runtime_context() {
+        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+            eprintln!("skip: ROCm GPU unavailable for img2img boundary reuse test: {error}");
+            return;
+        }
+        let image = RgbImageBatch {
+            batch: 1,
+            width: 4,
+            height: 4,
+            data: (0..48).map(|idx| (idx * 3 % 256) as u8).collect(),
+        };
+        let mask = RgbImageBatch {
+            batch: 1,
+            width: 4,
+            height: 4,
+            data: (0..16)
+                .flat_map(|idx| {
+                    let value = if idx % 3 == 0 { 255 } else { 64 };
+                    [value, value, value]
+                })
+                .collect(),
+        };
+        let init = LatentBatch {
+            batch: 1,
+            channels: 2,
+            height: 2,
+            width: 2,
+            data: (0..8).map(|idx| idx as f32 / 8.0).collect(),
+        };
+        let mut generated = LatentBatch {
+            batch: 1,
+            channels: 2,
+            height: 2,
+            width: 2,
+            data: (0..8).map(|idx| 1.0 - idx as f32 / 8.0).collect(),
+        };
+        let mut runtime_context = DiffusionGenerationRuntimeContext::new(
+            DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
+        );
+
+        let (weights, mask_kind) =
+            latent_mask_weights_with_runtime_context(&mask, &init, &mut runtime_context).unwrap();
+        let (masked, masked_kind) =
+            masked_rgb_batch_for_inpaint_with_runtime_context(&image, &mask, &mut runtime_context)
+                .unwrap();
+        let blend_kind = blend_latents_with_mask_with_runtime_context(
+            &mut generated,
+            &init,
+            &weights,
+            &mut runtime_context,
+        )
+        .unwrap();
+
+        assert_eq!(mask_kind, DiffusionRuntimeKind::RocmHybridReference);
+        assert_eq!(masked_kind, DiffusionRuntimeKind::RocmHybridReference);
+        assert_eq!(blend_kind, DiffusionRuntimeKind::RocmHybridReference);
+        assert_eq!(masked.batch, image.batch);
+        assert_eq!(masked.width, image.width);
+        assert_eq!(masked.height, image.height);
+        assert_eq!(runtime_context.rocm_gpu_init_count(), 1);
+    }
+
     #[test]
     fn masked_denoise_reference_reprojects_noised_init_latents_per_step() {
         let source_schedule = DiffusionSchedule::linear(3).unwrap();
@@ -23067,10 +22774,12 @@ mod tests {
         let runtime = pipeline.native_runtime.as_ref().unwrap();
         let positive = plan.conditioning.prompt_embeddings.as_ref().unwrap();
         let negative = plan.conditioning.negative_embeddings.as_ref().unwrap();
+        let mut runtime_context =
+            DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
         let phase = std::time::Instant::now();
         let latents = runtime
             .noise
-            .denoise_latents(
+            .denoise_latents_with_runtime_context(
                 plan.latents,
                 &plan.schedule,
                 request.cfg_scale,
@@ -23080,7 +22789,7 @@ mod tests {
                 None,
                 None,
                 None,
-                DiffusionGenerationRuntimeOptions::default(),
+                &mut runtime_context,
                 None,
             )
             .unwrap();
@@ -23695,7 +23404,7 @@ mod tests {
             1
         }
 
-        fn denoise_latents(
+        fn denoise_latents_with_runtime_context(
             &self,
             mut latents: LatentBatch,
             schedule: &DiffusionSchedule,
@@ -23706,7 +23415,7 @@ mod tests {
             _negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
             _inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
             _masked_reference: Option<&MaskedDenoiseReference<'_>>,
-            _runtime_options: DiffusionGenerationRuntimeOptions,
+            _runtime_context: &mut DiffusionGenerationRuntimeContext,
             mut progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
         ) -> DiffusionResult<DenoiseLatentsOutput> {
             assert_eq!(schedule.timesteps.len(), 2);
@@ -23742,7 +23451,7 @@ mod tests {
             1
         }
 
-        fn denoise_latents(
+        fn denoise_latents_with_runtime_context(
             &self,
             latents: LatentBatch,
             schedule: &DiffusionSchedule,
@@ -23753,7 +23462,7 @@ mod tests {
             negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
             _inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
             _masked_reference: Option<&MaskedDenoiseReference<'_>>,
-            _runtime_options: DiffusionGenerationRuntimeOptions,
+            _runtime_context: &mut DiffusionGenerationRuntimeContext,
             _progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
         ) -> DiffusionResult<DenoiseLatentsOutput> {
             assert_eq!(schedule.timesteps.len(), 2);
@@ -23788,7 +23497,7 @@ mod tests {
             3
         }
 
-        fn denoise_latents(
+        fn denoise_latents_with_runtime_context(
             &self,
             latents: LatentBatch,
             schedule: &DiffusionSchedule,
@@ -23799,7 +23508,7 @@ mod tests {
             _negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
             inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
             _masked_reference: Option<&MaskedDenoiseReference<'_>>,
-            _runtime_options: DiffusionGenerationRuntimeOptions,
+            _runtime_context: &mut DiffusionGenerationRuntimeContext,
             mut progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
         ) -> DiffusionResult<DenoiseLatentsOutput> {
             assert_eq!(schedule.timesteps.len(), 2);
