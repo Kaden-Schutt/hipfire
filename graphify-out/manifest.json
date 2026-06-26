@@ -185,8 +185,8 @@
     "semantic_hash": ""
   },
   "crates/hipfire-arch-lfm2moe/src/lfm2moe.rs": {
-    "mtime": 1782463349.619643,
-    "ast_hash": "7b6074b1e1ce4094118a9df03a9c61f5",
+    "mtime": 1782493452.9485173,
+    "ast_hash": "a8240ce209d058652a88cc40795adf8d",
     "semantic_hash": ""
   },
   "crates/hipfire-arch-lfm2moe/src/lib.rs": {
@@ -1085,8 +1085,8 @@
     "semantic_hash": ""
   },
   "crates/hipfire-quantize/src/main.rs": {
-    "mtime": 1782491721.615368,
-    "ast_hash": "2ce5b046ef613eed3006b922a315a97b",
+    "mtime": 1782495191.238917,
+    "ast_hash": "d5cca988cd40419eb7886a0ec5b25cc5",
     "semantic_hash": ""
   },
   "crates/hipfire-quantize/src/qtip.rs": {
@@ -1160,8 +1160,8 @@
     "semantic_hash": ""
   },
   "crates/hipfire-runtime/src/env_docs.rs": {
-    "mtime": 1782491844.169279,
-    "ast_hash": "27d1a542571653cd190ab1a075ce9155",
+    "mtime": 1782492428.1179345,
+    "ast_hash": "682d2b01d3dddfd8ac4eb2e08990cf8b",
     "semantic_hash": ""
   },
   "crates/hipfire-runtime/src/eos_filter.rs": {

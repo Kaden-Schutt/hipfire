@@ -30,6 +30,10 @@ fn read_tensor(hfq: &HfqFile, name: &str) -> Result<(u8, Vec<u8>), String> {
     Ok((info.quant_type, data))
 }
 
+fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
 /// Load an LFM2 AWQ shared gate_up-scale sidecar (1D F16, length k) → F32
 /// GpuTensor. Mirror of minimax `load_mm_awq_scale`. Returns None if the
 /// sidecar is absent or malformed, so non-AWQ models load cleanly (the
@@ -75,13 +79,17 @@ fn load_f32(
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
+        16 => data
+            .chunks_exact(2)
+            .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
         3 => {
             // Q8_0: 32-elem blocks [f16 scale | 32 i8]. Dequant to f32.
             dequant_q8_0(&data)
         }
         _ => {
             return Err(format!(
-                "lfm2moe: expected F16/F32/Q8 for {name}, got qt={qt}"
+                "lfm2moe: expected F16/F32/Q8/BF16 for {name}, got qt={qt}"
             ))
         }
     };
@@ -304,9 +312,10 @@ fn upload_wt_raw(
     m: usize,
     k: usize,
 ) -> Result<WeightTensor, String> {
-    let buf = gpu
+    let mut buf = gpu
         .upload_raw(data, &[data.len()])
         .map_err(|e| format!("upload_raw: {e:?}"))?;
+    buf.dtype = dtype;
     Ok(WeightTensor {
         buf,
         gpu_dtype: dtype,
@@ -380,6 +389,7 @@ fn wt_from_raw(
         20 => DType::MQ3G256Lloyd,
         30 => DType::MQ4G256Lloyd,
         1 => DType::F16,
+        16 => DType::BF16,
         other => return Err(format!("unsupported quant_type {other}")),
     };
     upload_wt_raw(gpu, data, dtype, m, k)
