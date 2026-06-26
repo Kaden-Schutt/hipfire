@@ -2020,14 +2020,25 @@ pub fn generate_lfm2moe(
     let _ = stdout.flush();
 }
 
+fn framed_gemma3_prompt(prompt: &str, system_prompt: Option<&str>) -> String {
+    let mut framed = String::from("<bos><start_of_turn>user\n");
+    if let Some(sys) = system_prompt.filter(|s| !s.is_empty()) {
+        // gemma3 has no system role — HF folds system content into the user turn.
+        framed.push_str(sys);
+        framed.push_str("\n\n");
+    }
+    framed.push_str(prompt);
+    framed.push_str("<end_of_turn>\n<start_of_turn>model\n");
+    framed
+}
+
 /// Gemma3 text (arch_id=12, e.g. medgemma-*-text) generate path.
 ///
 /// Frames the gemma chat prompt (bos + user turn + model turn; `<bos>` /
 /// `<start_of_turn>` / `<end_of_turn>` are registered specials that round-trip
-/// through `tok.encode`, so the framed text reproduces the gemma chat template)
-/// and runs the shared `ServingBackend::serve` seam — `run_simple_ar` →
-/// tokenize → prefill (`forward_step`) → `decode_loop`. Greedy; `repeat_penalty`
-/// is honored by `decode_loop`. No vision, tools, or think-budget on this path.
+/// through `tok.encode`, so the framed text reproduces the gemma chat template),
+/// times prefill, then runs the shared decode loop. Greedy; `repeat_penalty` is
+/// honored by `decode_loop`. No vision, tools, or think-budget on this path.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_gemma3(
     m: &mut LoadedModel,
@@ -2042,14 +2053,7 @@ pub fn generate_gemma3(
     repeat_penalty: f32,
     repeat_window: usize,
 ) {
-    let mut framed = String::from("<bos><start_of_turn>user\n");
-    if let Some(sys) = system_prompt.filter(|s| !s.is_empty()) {
-        // gemma3 has no system role — HF folds system content into the user turn.
-        framed.push_str(sys);
-        framed.push_str("\n\n");
-    }
-    framed.push_str(prompt);
-    framed.push_str("<end_of_turn>\n<start_of_turn>model\n");
+    let framed = framed_gemma3_prompt(prompt, system_prompt);
 
     if m.tokenizer.is_none() {
         emit_error_with_id(stdout, id, "tokenizer not loaded".to_string());
@@ -2066,11 +2070,27 @@ pub fn generate_gemma3(
     // Disjoint field borrows: tokenizer (shared) + backend (mut).
     let tok = m.tokenizer.as_ref().unwrap();
     let backend = m.gemma3_text.as_mut().unwrap();
+    let eos = tok
+        .special_token_id("<end_of_turn>")
+        .unwrap_or_else(|| backend.eos_token());
+    let prompt_tokens = tok.encode(&framed);
+    if prompt_tokens.is_empty() {
+        emit_error_with_id(stdout, id, "empty prompt after framing".to_string());
+        return;
+    }
+
+    let prefill_t0 = Instant::now();
+    if let Err(e) = SimpleAr::prefill(backend, gpu, &prompt_tokens) {
+        emit_error_with_id(stdout, id, format!("gemma3 prefill: {e}"));
+        return;
+    }
+    let _ = gpu.hip.device_synchronize();
+    let prefill_ms = prefill_t0.elapsed().as_secs_f64() * 1000.0;
 
     let no_images: [&[u8]; 0] = [];
     let mut ctx = GenerateCtx {
         id,
-        prompt: &framed,
+        prompt: "",
         temperature: temp,
         top_p,
         max_tokens,
@@ -2083,7 +2103,19 @@ pub fn generate_gemma3(
         images: &no_images,
         sink: stdout,
     };
-    let result = backend.serve(gpu, tok, &mut ctx);
+    let n = prompt_tokens.len();
+    let result = decode_loop_with_timing(
+        gpu,
+        backend,
+        tok,
+        eos,
+        &mut ctx,
+        n,
+        n,
+        DecodeLoopTiming {
+            prefill_ms: Some(prefill_ms),
+        },
+    );
     // `ctx` mutably borrows `stdout`; drop before reusing it for errors.
     drop(ctx);
     if let Err(e) = result {
@@ -2111,13 +2143,7 @@ pub fn generate_gemma3_vl_text(
     repeat_penalty: f32,
     repeat_window: usize,
 ) {
-    let mut framed = String::from("<bos><start_of_turn>user\n");
-    if let Some(sys) = system_prompt.filter(|s| !s.is_empty()) {
-        framed.push_str(sys);
-        framed.push_str("\n\n");
-    }
-    framed.push_str(prompt);
-    framed.push_str("<end_of_turn>\n<start_of_turn>model\n");
+    let framed = framed_gemma3_prompt(prompt, system_prompt);
 
     if m.tokenizer.is_none() {
         emit_error_with_id(stdout, id, "tokenizer not loaded".to_string());
@@ -2134,11 +2160,27 @@ pub fn generate_gemma3_vl_text(
 
     let tok = m.tokenizer.as_ref().unwrap();
     let backend = m.gemma3_vl.as_mut().unwrap();
+    let eos = tok
+        .special_token_id("<end_of_turn>")
+        .unwrap_or_else(|| backend.eos_token());
+    let prompt_tokens = tok.encode(&framed);
+    if prompt_tokens.is_empty() {
+        emit_error_with_id(stdout, id, "empty prompt after framing".to_string());
+        return;
+    }
+
+    let prefill_t0 = Instant::now();
+    if let Err(e) = SimpleAr::prefill(backend, gpu, &prompt_tokens) {
+        emit_error_with_id(stdout, id, format!("gemma3-vl prefill: {e}"));
+        return;
+    }
+    let _ = gpu.hip.device_synchronize();
+    let prefill_ms = prefill_t0.elapsed().as_secs_f64() * 1000.0;
 
     let no_images: [&[u8]; 0] = [];
     let mut ctx = GenerateCtx {
         id,
-        prompt: &framed,
+        prompt: "",
         temperature: temp,
         top_p,
         max_tokens,
@@ -2151,7 +2193,19 @@ pub fn generate_gemma3_vl_text(
         images: &no_images,
         sink: stdout,
     };
-    let result = backend.serve(gpu, tok, &mut ctx);
+    let n = prompt_tokens.len();
+    let result = decode_loop_with_timing(
+        gpu,
+        backend,
+        tok,
+        eos,
+        &mut ctx,
+        n,
+        n,
+        DecodeLoopTiming {
+            prefill_ms: Some(prefill_ms),
+        },
+    );
     drop(ctx);
     if let Err(e) = result {
         emit_error_with_id(stdout, id, format!("gemma3-vl serve: {e}"));

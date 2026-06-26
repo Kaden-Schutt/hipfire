@@ -4521,6 +4521,17 @@ fn main() {
                     if let Some(ref mut s) = m.lfm2moe_state {
                         let _ = s.reset(&mut gpu);
                     }
+                    // arch_id=12/13 (Gemma3 text / Gemma3-VL text): rewind the
+                    // backend-owned Gemma decode state. Without this, a reset
+                    // after a distractor turn leaves the internal KV cursor at
+                    // the prior turn and the same prompt produces different
+                    // greedy output.
+                    if let Some(ref mut b) = m.gemma3_text {
+                        b.state.reset();
+                    }
+                    if let Some(ref mut b) = m.gemma3_vl {
+                        b.state.reset();
+                    }
                     let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
                 } else {
                     let _ = writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);

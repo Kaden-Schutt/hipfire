@@ -130,10 +130,7 @@ impl KernelCompiler {
             ));
         }
 
-        let bundler = std::env::var_os("ROCM_PATH")
-            .map(PathBuf::from)
-            .map(|p| p.join("lib/llvm/bin/clang-offload-bundler"))
-            .filter(|p| p.exists())
+        let bundler = Self::find_clang_offload_bundler()
             .unwrap_or_else(|| PathBuf::from("clang-offload-bundler"));
         let parent = obj_path.parent().unwrap_or_else(|| Path::new("."));
         let stem = obj_path
@@ -193,6 +190,37 @@ impl KernelCompiler {
             })?;
         let _ = std::fs::remove_file(&host_path);
         Ok(())
+    }
+
+    fn find_clang_offload_bundler() -> Option<PathBuf> {
+        if let Some(path) = std::env::var_os("ROCM_PATH")
+            .map(PathBuf::from)
+            .map(|p| p.join("lib/llvm/bin/clang-offload-bundler"))
+            .filter(|p| p.exists())
+        {
+            return Some(path);
+        }
+
+        if let Some(path) = std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|p| p.join("clang-offload-bundler"))
+                .find(|p| p.exists())
+        }) {
+            return Some(path);
+        }
+
+        std::fs::read_dir("/usr/lib").ok().and_then(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|name| name.starts_with("llvm-"))
+                })
+                .map(|path| path.join("bin/clang-offload-bundler"))
+                .find(|path| path.exists())
+        })
     }
 
     fn default_kernel_root() -> PathBuf {
