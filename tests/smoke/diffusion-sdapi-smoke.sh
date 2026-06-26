@@ -9,6 +9,8 @@ STEPS="${HIPFIRE_DIFFUSION_SMOKE_STEPS:-1}"
 CFG_SCALE="${HIPFIRE_DIFFUSION_SMOKE_CFG_SCALE:-1.0}"
 SEED="${HIPFIRE_DIFFUSION_SMOKE_SEED:-501}"
 PROMPT="${HIPFIRE_DIFFUSION_SMOKE_PROMPT:-hipfire SDAPI diffusion smoke test}"
+BATCH_SIZE="${HIPFIRE_DIFFUSION_SMOKE_BATCH_SIZE:-1}"
+N_ITER="${HIPFIRE_DIFFUSION_SMOKE_N_ITER:-1}"
 SERVER_SMOKE_LOCK="${HIPFIRE_SERVER_SMOKE_LOCK:-${TMPDIR:-/tmp}/hipfire-server-smoke.lock}"
 SERVER_SMOKE_LOCK_WAIT="${HIPFIRE_SERVER_SMOKE_LOCK_WAIT:-300}"
 
@@ -24,7 +26,7 @@ if [[ ! -f "$MODEL" ]]; then
   exit 2
 fi
 
-python3 - "$ROOT" "$MODEL" "$WIDTH" "$HEIGHT" "$STEPS" "$CFG_SCALE" "$SEED" "$PROMPT" <<'PY'
+python3 - "$ROOT" "$MODEL" "$WIDTH" "$HEIGHT" "$STEPS" "$CFG_SCALE" "$SEED" "$PROMPT" "$BATCH_SIZE" "$N_ITER" <<'PY'
 import base64
 import json
 import os
@@ -40,13 +42,21 @@ import urllib.request
 import zlib
 from typing import Any
 
-root, model, width_s, height_s, steps_s, cfg_scale_s, seed_s, prompt = sys.argv[1:]
+root, model, width_s, height_s, steps_s, cfg_scale_s, seed_s, prompt, batch_size_s, n_iter_s = sys.argv[1:]
 width = int(width_s)
 height = int(height_s)
 steps = int(steps_s)
 cfg_scale = float(cfg_scale_s)
 seed = int(seed_s)
+batch_size = int(batch_size_s)
+n_iter = int(n_iter_s)
+expected_images = batch_size * n_iter
 request_timeout = float(os.environ.get("HIPFIRE_DIFFUSION_SDAPI_SMOKE_REQUEST_TIMEOUT", "420"))
+
+if batch_size < 1:
+    raise RuntimeError(f"batch size must be positive, got {batch_size}")
+if n_iter < 1:
+    raise RuntimeError(f"n_iter must be positive, got {n_iter}")
 
 
 def pick_port() -> int:
@@ -124,6 +134,10 @@ def validate_png(image: str, expected_width: int, expected_height: int, label: s
     return png
 
 
+def expected_seeds(first_seed: int) -> list[int]:
+    return [first_seed + idx for idx in range(expected_images)]
+
+
 def sdapi_request(base_url: str, route: str, body: dict[str, Any], label: str) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
         out = fetch_json(f"{base_url}{route}", body, timeout=request_timeout)
@@ -133,15 +147,18 @@ def sdapi_request(base_url: str, route: str, body: dict[str, Any], label: str) -
     if "error" in out:
         raise RuntimeError(f"{label}: response error: {out['error']}")
     images = out.get("images")
-    if not isinstance(images, list) or len(images) != 1:
-        raise RuntimeError(f"{label}: expected exactly one image, got {out}")
-    validate_png(images[0], width, height, label)
+    if not isinstance(images, list) or len(images) != expected_images:
+        raise RuntimeError(f"{label}: expected {expected_images} image(s), got {out}")
+    for idx, image in enumerate(images):
+        validate_png(image, width, height, f"{label}[{idx}]")
     info_raw = out.get("info")
     if not isinstance(info_raw, str):
         raise RuntimeError(f"{label}: missing SDAPI info string: {out}")
     info = json.loads(info_raw)
     if info.get("backend") != "hipfire-diffusion-hfq":
         raise RuntimeError(f"{label}: unexpected backend info: {info}")
+    if info.get("batch_size") != expected_images:
+        raise RuntimeError(f"{label}: expected merged batch_size {expected_images}, got {info}")
     return out, info
 
 
@@ -191,12 +208,16 @@ try:
         "cfg_scale": cfg_scale,
         "sampler_name": "Euler",
         "seed": seed,
+        "batch_size": batch_size,
+        "n_iter": n_iter,
         "send_images": True,
         "save_images": False,
     }
     txt, txt_info = sdapi_request(base_url, "/sdapi/v1/txt2img", txt_body, "txt2img")
     if txt_info.get("pipeline") != "StableDiffusionPipeline":
         raise RuntimeError(f"txt2img did not use StableDiffusionPipeline: {txt_info}")
+    if txt_info.get("seeds") != expected_seeds(seed):
+        raise RuntimeError(f"txt2img seeds wrong: {txt_info}")
     png_info = fetch_json(f"{base_url}/sdapi/v1/png-info", {"image": txt["images"][0]}, timeout=10.0)
     if prompt not in str(png_info.get("info", "")):
         raise RuntimeError(f"png-info did not include prompt: {png_info}")
@@ -205,12 +226,14 @@ try:
     img_body.update({
         "prompt": f"{prompt} img2img",
         "seed": seed + 1,
-        "init_images": [txt["images"][0]],
+        "init_images": txt["images"][:batch_size],
         "denoising_strength": 0.5,
     })
     _img, img_info = sdapi_request(base_url, "/sdapi/v1/img2img", img_body, "img2img")
     if img_info.get("mode") != "img2img" or img_info.get("masked") is not False:
         raise RuntimeError(f"img2img mode/masked info wrong: {img_info}")
+    if img_info.get("seeds") != expected_seeds(seed + 1):
+        raise RuntimeError(f"img2img seeds wrong: {img_info}")
 
     masked_body = dict(img_body)
     masked_body.update({
@@ -224,6 +247,8 @@ try:
     _masked, masked_info = sdapi_request(base_url, "/sdapi/v1/img2img", masked_body, "masked-img2img")
     if masked_info.get("mode") != "img2img" or masked_info.get("masked") is not True:
         raise RuntimeError(f"masked img2img mode/masked info wrong: {masked_info}")
+    if masked_info.get("seeds") != expected_seeds(seed + 2):
+        raise RuntimeError(f"masked img2img seeds wrong: {masked_info}")
     if masked_info.get("inpainting_fill") != 2 or masked_info.get("masked_content") != "latent noise":
         raise RuntimeError(f"masked img2img inpainting_fill info wrong: {masked_info}")
     if masked_info.get("inpaint_full_res") is not True:
@@ -237,6 +262,9 @@ try:
         "status": "pass",
         "base_url": base_url,
         "model": model,
+        "batch_size": batch_size,
+        "n_iter": n_iter,
+        "images_per_route": expected_images,
         "txt2img": {"backend": txt_info.get("backend"), "runtime": txt_info.get("runtime")},
         "img2img": {"masked": img_info.get("masked")},
         "masked_img2img": {"masked": masked_info.get("masked")},
