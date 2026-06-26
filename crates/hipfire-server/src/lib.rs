@@ -279,36 +279,46 @@ async fn idle_unload_loop(state: SharedState) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
         interval.tick().await;
-        let idle_timeout = {
-            let cfg = state.config.lock().await;
-            u64::from(cfg.idle_timeout)
-        };
-        if idle_timeout == 0 {
-            continue;
-        }
-        let last_request = *state.last_request_unix_secs.lock().await;
-        if now_secs().saturating_sub(last_request) < idle_timeout {
-            continue;
-        }
-        if state.loaded_model_path.lock().await.is_none() {
-            continue;
-        }
+        idle_unload_once(&state).await;
+    }
+}
 
-        let mut engine = state.engine.lock().await;
-        let last_request = *state.last_request_unix_secs.lock().await;
-        if now_secs().saturating_sub(last_request) < idle_timeout {
-            continue;
-        }
-        if state.loaded_model_path.lock().await.is_none() {
-            continue;
-        }
+async fn idle_unload_once(state: &SharedState) -> bool {
+    let idle_timeout = {
+        let cfg = state.config.lock().await;
+        u64::from(cfg.idle_timeout)
+    };
+    if idle_timeout == 0 || !idle_timeout_elapsed(state, idle_timeout).await {
+        return false;
+    }
+    if sdapi_generation_active(state) {
+        return false;
+    }
+
+    let has_daemon_model = state.loaded_model_path.lock().await.is_some();
+    let has_diffusion_pipelines = !state.diffusion_pipelines.lock().await.is_empty();
+    if !has_daemon_model && !has_diffusion_pipelines {
+        return false;
+    }
+
+    let mut engine = state.engine.lock().await;
+    if !idle_timeout_elapsed(state, idle_timeout).await || sdapi_generation_active(state) {
+        return false;
+    }
+
+    let mut unloaded = false;
+    let diffusion_count = clear_diffusion_pipeline_cache(state).await;
+    if diffusion_count > 0 {
+        tracing::info!("idle timeout reached; unloaded {diffusion_count} diffusion pipeline(s)");
+        unloaded = true;
+    }
+
+    if state.loaded_model_path.lock().await.is_some() {
         if let Some(engine) = engine.as_mut() {
             tracing::info!("idle timeout reached; unloading daemon model");
             match engine.unload().await {
                 Ok(()) => {
-                    *state.loaded_model_path.lock().await = None;
-                    *state.loaded_model_cache_capable.lock().await = None;
-                    *state.loaded_model_max_seq.lock().await = None;
+                    clear_loaded_model_state(state).await;
                 }
                 Err(e) => {
                     tracing::warn!("idle unload failed: {e}");
@@ -319,29 +329,54 @@ async fn idle_unload_loop(state: SharedState) {
                                 tracing::warn!(
                                     "failed to respawn daemon after idle unload error: {spawn_err}"
                                 );
-                                *state.loaded_model_path.lock().await = None;
-                                *state.loaded_model_cache_capable.lock().await = None;
-                                *state.loaded_model_max_seq.lock().await = None;
-                                continue;
+                                clear_loaded_model_state(state).await;
+                                return true;
                             }
                         },
                         Err(bin_err) => {
                             tracing::warn!(
                                 "failed to locate daemon after idle unload error: {bin_err}"
                             );
-                            *state.loaded_model_path.lock().await = None;
-                            *state.loaded_model_cache_capable.lock().await = None;
-                            *state.loaded_model_max_seq.lock().await = None;
-                            continue;
+                            clear_loaded_model_state(state).await;
+                            return true;
                         }
                     };
-                    *state.loaded_model_path.lock().await = None;
-                    *state.loaded_model_cache_capable.lock().await = None;
-                    *state.loaded_model_max_seq.lock().await = None;
+                    clear_loaded_model_state(state).await;
                 }
             }
+        } else {
+            clear_loaded_model_state(state).await;
         }
+        unloaded = true;
     }
+
+    unloaded
+}
+
+async fn idle_timeout_elapsed(state: &SharedState, idle_timeout: u64) -> bool {
+    let last_request = *state.last_request_unix_secs.lock().await;
+    now_secs().saturating_sub(last_request) >= idle_timeout
+}
+
+fn sdapi_generation_active(state: &SharedState) -> bool {
+    state
+        .sdapi_progress
+        .lock()
+        .map(|progress| progress.active)
+        .unwrap_or(false)
+}
+
+async fn clear_loaded_model_state(state: &SharedState) {
+    *state.loaded_model_path.lock().await = None;
+    *state.loaded_model_cache_capable.lock().await = None;
+    *state.loaded_model_max_seq.lock().await = None;
+}
+
+async fn clear_diffusion_pipeline_cache(state: &SharedState) -> usize {
+    let mut cache = state.diffusion_pipelines.lock().await;
+    let count = cache.len();
+    cache.clear();
+    count
 }
 
 async fn shutdown_signal(state: SharedState) {
@@ -366,16 +401,18 @@ async fn shutdown_signal(state: SharedState) {
         _ = terminate => {}
     }
 
-    tracing::info!("shutdown signal received; unloading daemon");
+    tracing::info!("shutdown signal received; unloading daemon and diffusion pipelines");
+    let diffusion_count = clear_diffusion_pipeline_cache(&state).await;
+    if diffusion_count > 0 {
+        tracing::info!("unloaded {diffusion_count} diffusion pipeline(s) during shutdown");
+    }
     let mut engine = state.engine.lock().await;
     if let Some(mut engine) = engine.take() {
         if let Err(e) = engine.unload().await {
             tracing::warn!("daemon unload during shutdown failed: {e}");
         }
     }
-    *state.loaded_model_path.lock().await = None;
-    *state.loaded_model_cache_capable.lock().await = None;
-    *state.loaded_model_max_seq.lock().await = None;
+    clear_loaded_model_state(&state).await;
 }
 
 fn now_secs() -> u64 {
@@ -441,6 +478,49 @@ mod tests {
         assert!(state.engine.lock().await.is_none());
         assert!(state.loaded_model_path.lock().await.is_none());
         assert_eq!(state.diffusion_pipelines.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn idle_unload_once_clears_diffusion_cache_without_daemon_model() {
+        let state = metadata_only_diffusion_state("hipfire-diffusion-idle-unload-test").await;
+        *state.last_request_unix_secs.lock().await = now_secs().saturating_sub(10);
+
+        let unloaded = idle_unload_once(&state).await;
+
+        assert!(unloaded);
+        assert!(state.loaded_model_path.lock().await.is_none());
+        assert!(state.diffusion_pipelines.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_unload_once_keeps_diffusion_cache_while_sdapi_generation_is_active() {
+        let state =
+            metadata_only_diffusion_state("hipfire-diffusion-idle-active-generation-test").await;
+        *state.last_request_unix_secs.lock().await = now_secs().saturating_sub(10);
+        state.sdapi_progress.lock().unwrap().active = true;
+
+        let unloaded = idle_unload_once(&state).await;
+
+        assert!(!unloaded);
+        assert_eq!(state.diffusion_pipelines.lock().await.len(), 1);
+    }
+
+    async fn metadata_only_diffusion_state(name: &str) -> SharedState {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("metadata-only-diffusion.hfq");
+        write_metadata_only_diffusion_hfq(&hfq_path);
+
+        let mut config = HipfireConfig {
+            idle_timeout: 1,
+            ..HipfireConfig::default()
+        };
+        config.default_model = Some(hfq_path.to_string_lossy().into_owned());
+        let state = AppState::new(config);
+        prewarm_default_model(&state).await;
+        assert_eq!(state.diffusion_pipelines.lock().await.len(), 1);
+        state
     }
 
     fn write_metadata_only_diffusion_hfq(path: &Path) {
