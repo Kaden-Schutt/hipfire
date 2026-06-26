@@ -410,13 +410,21 @@ async fn execute_hfq_diffusion_txt2img(
         Ok(pipeline) => pipeline,
         Err(error) => return diffusion_error_response(error),
     };
-    if let Err(error) = sdapi_validate_highres_checkpoint(&body, pipeline.summary()) {
-        return diffusion_error_response(error);
-    }
     let n_iter = sd_request_n_iter(&body);
     let save_images = body.save_images.unwrap_or(false);
     let highres_target = match sdapi_highres_target_dimensions(&first_pass_body) {
         Ok(target) => target,
+        Err(error) => return diffusion_error_response(error),
+    };
+    let highres_pipeline = match highres_diffusion_pipeline_for_request(
+        &state,
+        &body,
+        highres_target,
+        &pipeline,
+    )
+    .await
+    {
+        Ok(pipeline) => pipeline,
         Err(error) => return diffusion_error_response(error),
     };
     let iteration_steps =
@@ -432,6 +440,7 @@ async fn execute_hfq_diffusion_txt2img(
     let worker_progress_state = progress_state.clone();
     let worker_body = body.clone();
     let worker_first_pass_body = first_pass_body.clone();
+    let first_pass_pipeline = pipeline.clone();
     let output = match tokio::task::spawn_blocking(move || {
         let mut outputs = Vec::with_capacity(n_iter as usize);
         for iter in 0..n_iter {
@@ -456,11 +465,12 @@ async fn execute_hfq_diffusion_txt2img(
                     },
                 )
             };
-            let first_output = pipeline.generate_batch_with_progress_and_runtime_options(
-                iter_request,
-                runtime_options,
-                &mut progress,
-            )?;
+            let first_output = first_pass_pipeline
+                .generate_batch_with_progress_and_runtime_options(
+                    iter_request,
+                    runtime_options,
+                    &mut progress,
+                )?;
             let Some(target_dimensions) = highres_target else {
                 outputs.push(first_output);
                 continue;
@@ -501,7 +511,7 @@ async fn execute_hfq_diffusion_txt2img(
                     },
                 )
             };
-            let mut highres_output = pipeline
+            let mut highres_output = highres_pipeline
                 .generate_img2img_batch_with_progress_and_runtime_options(
                     highres_request,
                     runtime_options,
@@ -2789,25 +2799,29 @@ fn sdapi_highres_second_pass_init_images(
     }
 }
 
-fn sdapi_validate_highres_checkpoint(
+async fn highres_diffusion_pipeline_for_request(
+    state: &SharedState,
     body: &SdGenerationRequest,
-    summary: &hipfire_diffusion::DiffusionModelSummary,
-) -> Result<(), DiffusionError> {
-    if !body.enable_hr.unwrap_or(false) {
-        return Ok(());
+    highres_target: Option<(u32, u32)>,
+    first_pass_pipeline: &Arc<DiffusionPipeline>,
+) -> Result<Arc<DiffusionPipeline>, DiffusionError> {
+    if highres_target.is_none() || !body.enable_hr.unwrap_or(false) {
+        return Ok(first_pass_pipeline.clone());
     }
     let Some(checkpoint) =
         highres_override_text(body.hr_checkpoint_name.as_deref(), "Use same checkpoint")
     else {
-        return Ok(());
+        return Ok(first_pass_pipeline.clone());
     };
-    if diffusion_summary_matches_candidate(summary, checkpoint) {
-        return Ok(());
+    if diffusion_summary_matches_candidate(first_pass_pipeline.summary(), checkpoint) {
+        return Ok(first_pass_pipeline.clone());
     }
-    Err(DiffusionError::InvalidRequest(format!(
-        "hr_checkpoint_name {checkpoint:?} is not supported yet; high-res txt2img currently uses the loaded checkpoint {:?}",
-        summary.title
-    )))
+    let Some(path) = resolve_diffusion_hfq_for_request(state, Some(checkpoint)).await else {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "hr_checkpoint_name {checkpoint:?} could not be resolved to a diffusion HFQ artifact"
+        )));
+    };
+    cached_diffusion_pipeline(state, path).await
 }
 
 fn highres_override_text<'a>(value: Option<&'a str>, same_label: &str) -> Option<&'a str> {
@@ -3941,7 +3955,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn txt2img_route_rejects_unsupported_highres_checkpoint_switch() {
+    async fn txt2img_route_switches_highres_checkpoint_for_second_pass() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-sdapi-diffusion-highres-checkpoint-switch-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let first_hfq_path = dir.join("tiny-route-diffusion-highres-first.hfq");
+        let second_hfq_path = dir.join("tiny-route-diffusion-highres-second.hfq");
+        write_tiny_diffusion_hfq(&first_hfq_path);
+        write_tiny_diffusion_hfq(&second_hfq_path);
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let checkpoint = second_hfq_path.to_string_lossy().into_owned();
+        let body = SdGenerationRequest {
+            prompt: "a highres cat".to_string(),
+            model: Some(first_hfq_path.to_string_lossy().into_owned()),
+            steps: Some(1),
+            cfg_scale: Some(1.0),
+            width: Some(2),
+            height: Some(2),
+            send_images: Some(true),
+            save_images: Some(false),
+            denoising_strength: Some(1.0),
+            enable_hr: Some(true),
+            hr_scale: Some(2.0),
+            hr_second_pass_steps: Some(1),
+            hr_checkpoint_name: Some(checkpoint.clone()),
+            ..empty_request()
+        };
+
+        let response = post_txt2img(State(state.clone()), Json(body)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+
+        assert_eq!(body["images"].as_array().unwrap().len(), 1);
+        let info = serde_json::from_str::<Value>(body["info"].as_str().unwrap()).unwrap();
+        assert_eq!(info["mode"], "txt2img-hires");
+        assert_eq!(info["highres"], true);
+        assert_eq!(info["hr_checkpoint_name"], checkpoint);
+        assert_eq!(info["width"], 4);
+        assert_eq!(info["height"], 4);
+        {
+            let cache = state.diffusion_pipelines.lock().await;
+            assert_eq!(cache.len(), 2);
+            assert!(cache.contains_key(&first_hfq_path));
+            assert!(cache.contains_key(&second_hfq_path));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn txt2img_route_rejects_unresolved_highres_checkpoint_switch() {
         let dir = std::env::temp_dir().join(format!(
             "hipfire-sdapi-diffusion-highres-checkpoint-test-{}",
             std::process::id()
@@ -3969,7 +4034,7 @@ mod tests {
         assert!(body["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("hr_checkpoint_name"));
+            .contains("could not be resolved"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
