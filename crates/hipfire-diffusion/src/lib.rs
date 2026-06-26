@@ -439,6 +439,7 @@ pub struct StableDiffusionConfig {
     pub text_encoder: TextEncoderConfig,
     pub text_encoder_2: Option<TextEncoderConfig>,
     pub unet: UnetConfig,
+    pub transformer: Option<TransformerDenoiserConfig>,
     pub vae: VaeConfig,
     pub scheduler: SchedulerConfig,
     pub latent_channels: usize,
@@ -478,6 +479,19 @@ pub struct UnetConfig {
     pub addition_embed_type: Option<String>,
     pub addition_time_embed_dim: Option<usize>,
     pub projection_class_embeddings_input_dim: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TransformerDenoiserConfig {
+    pub class_name: String,
+    pub in_channels: Option<usize>,
+    pub out_channels: Option<usize>,
+    pub num_layers: Option<usize>,
+    pub num_attention_heads: Option<usize>,
+    pub attention_head_dim: Option<usize>,
+    pub cross_attention_dim: Option<usize>,
+    pub caption_projection_dim: Option<usize>,
+    pub pooled_projection_dim: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -5417,6 +5431,7 @@ impl StableDiffusionConfig {
         let text_json = component_json(hfq, metadata, "text_encoder")?.unwrap_or_else(|| json!({}));
         let text_2_json = component_json(hfq, metadata, "text_encoder_2")?;
         let unet_json = component_json(hfq, metadata, "unet")?.unwrap_or_else(|| json!({}));
+        let transformer_json = component_json(hfq, metadata, "transformer")?;
         let vae_json = component_json(hfq, metadata, "vae")?.unwrap_or_else(|| json!({}));
         let scheduler_json =
             component_json(hfq, metadata, "scheduler")?.unwrap_or_else(|| json!({}));
@@ -5467,6 +5482,21 @@ impl StableDiffusionConfig {
                 "projection_class_embeddings_input_dim",
             ),
         };
+        let transformer =
+            transformer_json
+                .as_ref()
+                .map(|transformer_json| TransformerDenoiserConfig {
+                    class_name: json_string(transformer_json, "_class_name"),
+                    in_channels: json_usize(transformer_json, "in_channels"),
+                    out_channels: json_usize(transformer_json, "out_channels"),
+                    num_layers: json_usize(transformer_json, "num_layers"),
+                    num_attention_heads: json_usize(transformer_json, "num_attention_heads"),
+                    attention_head_dim: json_usize(transformer_json, "attention_head_dim"),
+                    cross_attention_dim: json_usize(transformer_json, "cross_attention_dim")
+                        .or_else(|| json_usize(transformer_json, "joint_attention_dim")),
+                    caption_projection_dim: json_usize(transformer_json, "caption_projection_dim"),
+                    pooled_projection_dim: json_usize(transformer_json, "pooled_projection_dim"),
+                });
         let vae = VaeConfig {
             class_name: json_string(&vae_json, "_class_name"),
             latent_channels: json_usize(&vae_json, "latent_channels"),
@@ -5533,6 +5563,7 @@ impl StableDiffusionConfig {
             text_encoder,
             text_encoder_2,
             unet,
+            transformer,
             vae,
             scheduler,
             latent_channels,
@@ -5705,9 +5736,12 @@ pub fn diffusion_hip_memory_plan(
         ],
     )?;
     let latent_bytes = checked_bytes("latent", latent_elements, 4)?;
-    let denoise_channels = config
-        .unet
-        .in_channels
+    let transformer_denoise_channels = config
+        .transformer
+        .as_ref()
+        .and_then(|transformer| transformer.in_channels.or(transformer.out_channels));
+    let denoise_channels = transformer_denoise_channels
+        .or(config.unet.in_channels)
         .unwrap_or(config.latent_channels)
         .max(config.latent_channels);
     let denoise_elements = checked_shape_elements(
@@ -5726,8 +5760,15 @@ pub fn diffusion_hip_memory_plan(
         .unwrap_or(77)
         .max(1);
     let cross_attention_dim = config
-        .unet
-        .cross_attention_dim
+        .transformer
+        .as_ref()
+        .and_then(|transformer| {
+            transformer
+                .cross_attention_dim
+                .or(transformer.caption_projection_dim)
+                .or(transformer.pooled_projection_dim)
+        })
+        .or(config.unet.cross_attention_dim)
         .or(config.text_encoder.hidden_size)
         .unwrap_or(768)
         .max(1);
@@ -15898,6 +15939,11 @@ mod tests {
             "FlowMatchEulerDiscreteScheduler"
         );
         assert_eq!(config.latent_channels, 16);
+        let transformer = config.transformer.as_ref().unwrap();
+        assert_eq!(transformer.class_name, "Krea2Transformer2DModel");
+        assert_eq!(transformer.in_channels, Some(64));
+        assert_eq!(transformer.out_channels, Some(16));
+        assert_eq!(transformer.num_layers, Some(28));
         assert_eq!(config.vae.z_dim, Some(16));
         assert_eq!(config.vae.latents_mean, vec![-0.75, 0.25]);
         assert_eq!(config.vae.latents_std, vec![2.0, 1.5]);
@@ -15972,6 +16018,11 @@ mod tests {
         assert_eq!(summary.weight_format, "metadata-only");
         assert_eq!(metadata.quantization.weight_format, "metadata-only");
         assert_eq!(metadata.pipeline.latent_channels, Some(16));
+        let config = StableDiffusionConfig::from_hfq(&hfq, &metadata).unwrap();
+        let transformer = config.transformer.as_ref().unwrap();
+        assert_eq!(transformer.class_name, "QwenImageTransformer2DModel");
+        assert_eq!(transformer.in_channels, Some(64));
+        assert_eq!(transformer.out_channels, Some(16));
         assert!(metadata.components["transformer"].weight_entries.is_empty());
         assert_eq!(
             metadata.components["transformer"].config_entry.as_deref(),
@@ -17090,6 +17141,7 @@ mod tests {
             text_encoder: TextEncoderConfig::default(),
             text_encoder_2: None,
             unet: UnetConfig::default(),
+            transformer: None,
             vae: VaeConfig::default(),
             scheduler: SchedulerConfig::default(),
             latent_channels: 1,
@@ -17141,6 +17193,7 @@ mod tests {
             text_encoder: TextEncoderConfig::default(),
             text_encoder_2: None,
             unet: UnetConfig::default(),
+            transformer: None,
             vae: VaeConfig::default(),
             scheduler: SchedulerConfig::default(),
             latent_channels: 1,
@@ -18010,6 +18063,7 @@ mod tests {
             text_encoder: TextEncoderConfig::default(),
             text_encoder_2: None,
             unet: UnetConfig::default(),
+            transformer: None,
             vae: VaeConfig::default(),
             scheduler: SchedulerConfig::default(),
             latent_channels: 4,
@@ -18071,6 +18125,7 @@ mod tests {
                 cross_attention_dim: Some(48),
                 ..UnetConfig::default()
             },
+            transformer: None,
             vae: VaeConfig::default(),
             scheduler: SchedulerConfig::default(),
             latent_channels: 4,
@@ -18143,12 +18198,85 @@ mod tests {
     }
 
     #[test]
+    fn hip_memory_plan_uses_transformer_denoiser_dimensions() {
+        let config = StableDiffusionConfig {
+            pipeline_class: "QwenImagePipeline".into(),
+            text_encoder: TextEncoderConfig {
+                hidden_size: Some(32),
+                max_position_embeddings: Some(4),
+                ..TextEncoderConfig::default()
+            },
+            text_encoder_2: None,
+            unet: UnetConfig::default(),
+            transformer: Some(TransformerDenoiserConfig {
+                class_name: "QwenImageTransformer2DModel".into(),
+                in_channels: Some(64),
+                out_channels: Some(16),
+                caption_projection_dim: Some(128),
+                ..TransformerDenoiserConfig::default()
+            }),
+            vae: VaeConfig {
+                z_dim: Some(16),
+                ..VaeConfig::default()
+            },
+            scheduler: SchedulerConfig {
+                class_name: "FlowMatchEulerDiscreteScheduler".into(),
+                ..SchedulerConfig::default()
+            },
+            latent_channels: 16,
+            latent_height: None,
+            latent_width: None,
+            vae_scale_factor: 8,
+        };
+        let request = DiffusionBatchRequest {
+            prompts: vec![DiffusionPrompt {
+                prompt: "a".into(),
+                negative_prompt: String::new(),
+                seed: 1,
+                subseed: None,
+            }],
+            width: 64,
+            height: 64,
+            original_width: None,
+            original_height: None,
+            target_width: None,
+            target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
+            crop_x: 0,
+            crop_y: 0,
+            steps: 2,
+            cfg_scale: 1.0,
+            scheduler: "Euler".into(),
+            subseed_strength: 0.0,
+            send_images: true,
+            save_images: false,
+        };
+
+        let plan = diffusion_hip_memory_plan(&config, &request).unwrap();
+
+        assert_eq!(
+            plan.latent_shape,
+            DiffusionLatentShape {
+                batch: 1,
+                channels: 16,
+                height: 8,
+                width: 8
+            }
+        );
+        assert_eq!(plan.latent_bytes, 16 * 8 * 8 * 4);
+        assert_eq!(plan.denoise_input_bytes, 64 * 8 * 8 * 4);
+        assert_eq!(plan.conditioning_bytes, 2 * 4 * 128 * 4);
+    }
+
+    #[test]
     fn hip_memory_plan_rejects_invalid_latent_dimensions() {
         let config = StableDiffusionConfig {
             pipeline_class: "StableDiffusionPipeline".into(),
             text_encoder: TextEncoderConfig::default(),
             text_encoder_2: None,
             unet: UnetConfig::default(),
+            transformer: None,
             vae: VaeConfig::default(),
             scheduler: SchedulerConfig::default(),
             latent_channels: 4,
@@ -23160,6 +23288,7 @@ mod tests {
                 addition_time_embed_dim: None,
                 projection_class_embeddings_input_dim: None,
             },
+            transformer: None,
             vae: VaeConfig {
                 class_name: "AutoencoderKL".into(),
                 latent_channels: Some(1),
