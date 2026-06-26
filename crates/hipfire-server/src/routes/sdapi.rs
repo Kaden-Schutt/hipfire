@@ -771,10 +771,10 @@ fn sdapi_validate_supported_scripts(body: &SdGenerationRequest) -> Result<(), Di
     if body
         .alwayson_scripts
         .as_ref()
-        .is_some_and(|value| !sdapi_script_value_is_empty(value))
+        .is_some_and(|value| !sdapi_alwayson_scripts_are_noop(value))
     {
         return Err(DiffusionError::InvalidRequest(
-            "alwayson_scripts is not supported because Hipfire does not expose SDAPI always-on scripts"
+            "alwayson_scripts contains active or unsupported script payloads; Hipfire accepts only empty or disabled always-on script defaults"
                 .to_string(),
         ));
     }
@@ -789,6 +789,98 @@ fn sdapi_script_value_is_empty(value: &Value) -> bool {
         Value::String(value) => value.trim().is_empty(),
         _ => false,
     }
+}
+
+fn sdapi_alwayson_scripts_are_noop(value: &Value) -> bool {
+    if sdapi_script_value_is_empty(value) {
+        return true;
+    }
+    let Value::Object(scripts) = value else {
+        return false;
+    };
+    scripts.values().all(sdapi_alwayson_script_payload_is_noop)
+}
+
+fn sdapi_alwayson_script_payload_is_noop(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Array(values) => sdapi_alwayson_script_args_are_noop(values),
+        Value::Object(payload) => {
+            if payload.is_empty() {
+                return true;
+            }
+            let args_are_noop = payload
+                .get("args")
+                .is_none_or(sdapi_alwayson_script_args_value_is_noop);
+            args_are_noop
+                && payload.iter().all(|(key, value)| {
+                    key == "args" || sdapi_alwayson_script_control_value_is_noop(key, value)
+                })
+        }
+        _ => sdapi_script_value_is_empty(value),
+    }
+}
+
+fn sdapi_alwayson_script_args_value_is_noop(value: &Value) -> bool {
+    match value {
+        Value::Array(values) => sdapi_alwayson_script_args_are_noop(values),
+        Value::Object(_) => sdapi_alwayson_script_arg_is_disabled(value),
+        _ => sdapi_script_value_is_empty(value),
+    }
+}
+
+fn sdapi_alwayson_script_args_are_noop(values: &[Value]) -> bool {
+    if values.is_empty() {
+        return true;
+    }
+    if values
+        .first()
+        .is_some_and(sdapi_value_is_explicit_disable_flag)
+    {
+        return true;
+    }
+    values.iter().all(sdapi_alwayson_script_arg_is_disabled)
+}
+
+fn sdapi_alwayson_script_arg_is_disabled(value: &Value) -> bool {
+    if sdapi_script_value_is_empty(value) || sdapi_value_is_explicit_disable_flag(value) {
+        return true;
+    }
+    let Value::Object(arg) = value else {
+        return false;
+    };
+    if let Some((_, flag)) = arg
+        .iter()
+        .find(|(key, _)| sdapi_alwayson_script_enable_key(key))
+    {
+        return !sdapi_value_is_truthy(flag);
+    }
+    arg.values().all(sdapi_script_value_is_empty)
+}
+
+fn sdapi_alwayson_script_control_value_is_noop(key: &str, value: &Value) -> bool {
+    if sdapi_alwayson_script_enable_key(key) {
+        return !sdapi_value_is_truthy(value);
+    }
+    sdapi_script_value_is_empty(value)
+}
+
+fn sdapi_alwayson_script_enable_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "enabled"
+            | "enable"
+            | "is_enabled"
+            | "active"
+            | "ad_enabled"
+            | "ad_enable"
+            | "controlnet_enabled"
+    )
+}
+
+fn sdapi_value_is_explicit_disable_flag(value: &Value) -> bool {
+    matches!(value, Value::Bool(_) | Value::Number(_) | Value::String(_))
+        && !sdapi_value_is_truthy(value)
 }
 
 fn sdapi_apply_stored_generation_defaults(
@@ -3303,7 +3395,7 @@ pub async fn post_unsupported() -> Response {
         StatusCode::NOT_IMPLEMENTED,
         Json(json!({
             "error": {
-                "message": "this stable-diffusion-webui endpoint requires an image-processing backend; hipfire serve currently exposes text-generation compatibility only",
+                "message": "this stable-diffusion-webui endpoint is not implemented by Hipfire's SDAPI compatibility layer",
                 "type": "not_implemented_error"
             }
         })),
@@ -3780,6 +3872,37 @@ mod tests {
         assert!(sdapi_validate_supported_scripts(&SdGenerationRequest {
             script_args: Some(json!([])),
             alwayson_scripts: Some(json!({})),
+            ..empty_request()
+        })
+        .is_ok());
+        assert!(sdapi_validate_supported_scripts(&SdGenerationRequest {
+            alwayson_scripts: Some(json!({
+                "controlnet": {
+                    "args": [{
+                        "enabled": false,
+                        "input_image": tiny_png_base64(),
+                        "module": "canny",
+                        "model": "control_v11p_sd15_canny",
+                        "weight": 1.0
+                    }]
+                }
+            })),
+            ..empty_request()
+        })
+        .is_ok());
+        assert!(sdapi_validate_supported_scripts(&SdGenerationRequest {
+            alwayson_scripts: Some(json!({
+                "ADetailer": {
+                    "args": [
+                        false,
+                        {
+                            "ad_model": "face_yolov8n.pt",
+                            "ad_prompt": "portrait",
+                            "ad_confidence": 0.3
+                        }
+                    ]
+                }
+            })),
             ..empty_request()
         })
         .is_ok());

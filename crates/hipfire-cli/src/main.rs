@@ -77,9 +77,10 @@ enum Command {
     /// `inpaint_full_res_padding` crop masked regions for processing and
     /// composite the generated crop back onto the init image. SDAPI requests
     /// can also import common WebUI `infotext` fields when those fields are not
-    /// explicitly set in JSON. Non-empty `script_name`, `script_args`, and
-    /// `alwayson_scripts` payloads are rejected because Hipfire exposes no
-    /// SDAPI scripts. Txt2img high-res
+    /// explicitly set in JSON. Non-empty `script_name` and `script_args`
+    /// payloads are rejected because Hipfire exposes no SDAPI selectable
+    /// scripts. `alwayson_scripts` accepts empty or disabled default extension
+    /// payloads, but active script payloads are rejected. Txt2img high-res
     /// generation is implemented as a batched first-pass txt2img
     /// generation followed by a second-pass img2img generation at the high-res
     /// target dimensions. SDAPI high-res requests accept `enable_hr`,
