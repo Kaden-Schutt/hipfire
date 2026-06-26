@@ -2765,6 +2765,7 @@ fn start_sdapi_progress(
     if let Ok(mut progress) = progress_state.lock() {
         *progress = SdapiProgressState {
             active: true,
+            skipped: false,
             interrupted: false,
             task_id: body
                 .force_task_id
@@ -2857,6 +2858,13 @@ fn interrupt_sdapi_progress(progress_state: &Arc<std::sync::Mutex<SdapiProgressS
     }
 }
 
+fn skip_sdapi_progress(progress_state: &Arc<std::sync::Mutex<SdapiProgressState>>) {
+    if let Ok(mut progress) = progress_state.lock() {
+        progress.skipped = true;
+        progress.textinfo = Some("skip requested".to_string());
+    }
+}
+
 fn sdapi_progress_json(progress: &SdapiProgressState, skip_current_image: bool) -> Value {
     let ratio = if progress.sampling_steps == 0 {
         0.0
@@ -2872,7 +2880,7 @@ fn sdapi_progress_json(progress: &SdapiProgressState, skip_current_image: bool) 
         "progress": ratio,
         "eta_relative": 0.0,
         "state": {
-            "skipped": false,
+            "skipped": progress.skipped,
             "interrupted": progress.interrupted,
             "job": progress.mode,
             "job_count": 1,
@@ -3578,6 +3586,11 @@ pub async fn get_extensions() -> Json<Value> {
 
 pub async fn post_interrupt(State(state): State<SharedState>) -> Json<Value> {
     interrupt_sdapi_progress(&state.sdapi_progress);
+    Json(json!({}))
+}
+
+pub async fn post_skip(State(state): State<SharedState>) -> Json<Value> {
+    skip_sdapi_progress(&state.sdapi_progress);
     Json(json!({}))
 }
 
@@ -6072,6 +6085,7 @@ mod tests {
 
         let Json(idle) = sdapi_progress_response(state.clone(), false).await;
         assert_eq!(idle["progress"], 0.0);
+        assert_eq!(idle["state"]["skipped"], false);
         assert_eq!(idle["state"]["interrupted"], false);
         assert_eq!(idle["current_task"], Value::Null);
 
@@ -6095,6 +6109,7 @@ mod tests {
 
         let Json(active) = sdapi_progress_response(state.clone(), false).await;
         assert_eq!(active["progress"], 0.5);
+        assert_eq!(active["state"]["skipped"], false);
         assert_eq!(active["state"]["job"], "txt2img");
         assert_eq!(active["state"]["sampling_step"], 2);
         assert_eq!(active["state"]["sampling_steps"], 4);
@@ -6228,6 +6243,38 @@ mod tests {
         assert_eq!(progress["state"]["interrupted"], true);
         assert_eq!(progress["state"]["sampling_step"], 1);
         assert_eq!(progress["textinfo"], "interrupted");
+    }
+
+    #[tokio::test]
+    async fn skip_endpoint_marks_sdapi_generation_skipped_without_interrupting() {
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let body = SdGenerationRequest {
+            prompt: "a cat".to_string(),
+            force_task_id: Some("task-skip".to_string()),
+            ..empty_request()
+        };
+        start_sdapi_progress(&state.sdapi_progress, &body, "txt2img", 4);
+
+        let Json(response) = post_skip(State(state.clone())).await;
+        assert_eq!(response, json!({}));
+
+        update_sdapi_progress(
+            &state.sdapi_progress,
+            DiffusionProgress {
+                completed_steps: 1,
+                total_steps: 4,
+                timestep: 3,
+                preview_latents: None,
+            },
+            None,
+        )
+        .unwrap();
+
+        let Json(progress) = sdapi_progress_response(state, false).await;
+        assert_eq!(progress["state"]["skipped"], true);
+        assert_eq!(progress["state"]["interrupted"], false);
+        assert_eq!(progress["state"]["sampling_step"], 1);
+        assert_eq!(progress["textinfo"], "sampling step 1/4");
     }
 
     #[test]

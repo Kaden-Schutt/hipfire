@@ -45,6 +45,7 @@ pub struct StoredBatch {
 #[derive(Clone, Debug, Default)]
 pub struct SdapiProgressState {
     pub active: bool,
+    pub skipped: bool,
     pub interrupted: bool,
     pub task_id: Option<String>,
     pub mode: Option<String>,

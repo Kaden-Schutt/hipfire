@@ -141,7 +141,7 @@ pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> Rout
             post(routes::sdapi::post_interrogate),
         )
         .route("/sdapi/v1/interrupt", post(routes::sdapi::post_interrupt))
-        .route("/sdapi/v1/skip", post(routes::sdapi::post_interrupt))
+        .route("/sdapi/v1/skip", post(routes::sdapi::post_skip))
         .route("/sdapi/v1/options", get(routes::sdapi::get_options))
         .route("/sdapi/v1/options", post(routes::sdapi::post_options))
         .route("/sdapi/v1/memory", get(routes::sdapi::get_memory))

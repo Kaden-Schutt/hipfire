@@ -58,7 +58,10 @@ enum Command {
     /// `current_image` with live PNG previews decoded from intermediate
     /// latents, then leaves the final generated PNG there after a successful
     /// HFQ diffusion request completes; WebUI's `skip_current_image=true`
-    /// progress query suppresses only that response's preview payload.
+    /// progress query suppresses only that response's preview payload. The
+    /// `/sdapi/v1/skip` endpoint records WebUI-compatible skip state without
+    /// interrupting the whole request; `/sdapi/v1/interrupt` is the cancellation
+    /// path.
     /// `/sdapi/v1/memory` returns WebUI-shaped host RAM stats and marks CUDA
     /// memory stats unavailable because Hipfire uses HIP/ROCm. WebUI's
     /// create/train embedding and hypernetwork endpoints are registered for

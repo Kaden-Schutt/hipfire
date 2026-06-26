@@ -231,6 +231,15 @@ try:
             or command_response.get("server_command_supported") is not False
         ):
             raise RuntimeError(f"{command} endpoint returned unexpected response: {command_response}")
+    skip_response = fetch_json(f"{base_url}/sdapi/v1/skip", {}, timeout=10.0)
+    if skip_response != {}:
+        raise RuntimeError(f"skip endpoint returned unexpected response: {skip_response}")
+    skipped_progress = fetch_json(f"{base_url}/sdapi/v1/progress", timeout=10.0)
+    if (
+        skipped_progress.get("state", {}).get("skipped") is not True
+        or skipped_progress.get("state", {}).get("interrupted") is not False
+    ):
+        raise RuntimeError(f"skip endpoint did not mark skipped state without interrupting: {skipped_progress}")
 
     txt_body = {
         "model": model,
@@ -293,6 +302,8 @@ try:
     progress = fetch_json(f"{base_url}/sdapi/v1/progress", timeout=10.0)
     if progress.get("state", {}).get("interrupted"):
         raise RuntimeError(f"progress endpoint reports interrupted after smoke: {progress}")
+    if progress.get("state", {}).get("skipped"):
+        raise RuntimeError(f"progress endpoint kept stale skipped state after generation: {progress}")
 
     log_text = open(log_path, "r", encoding="utf-8", errors="replace").read()
     if "pre-warm load failed" in log_text and "tokenizer not found" in log_text:
@@ -313,6 +324,7 @@ try:
         "rocm_device_id": rocm_device_id,
         "loras": len(loras),
         "server_command_noops": 3,
+        "skip_noop": True,
         "txt2img": {"backend": txt_info.get("backend"), "runtime": txt_info.get("runtime")},
         "img2img": {"masked": img_info.get("masked")},
         "masked_img2img": {"masked": masked_info.get("masked")},
