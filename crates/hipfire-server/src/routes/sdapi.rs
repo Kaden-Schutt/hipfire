@@ -63,13 +63,20 @@ pub struct SdGenerationRequest {
     pub sampler_name: Option<String>,
     pub sampler_index: Option<String>,
     pub scheduler: Option<String>,
+    pub styles: Option<Vec<String>>,
     pub steps: Option<u32>,
     pub cfg_scale: Option<f64>,
     pub seed: Option<i64>,
     pub subseed: Option<i64>,
     pub subseed_strength: Option<f64>,
+    pub seed_resize_from_h: Option<i64>,
+    pub seed_resize_from_w: Option<i64>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    pub restore_faces: Option<bool>,
+    pub tiling: Option<bool>,
+    pub do_not_save_samples: Option<bool>,
+    pub do_not_save_grid: Option<bool>,
     pub original_width: Option<u32>,
     pub original_height: Option<u32>,
     pub target_width: Option<u32>,
@@ -95,6 +102,11 @@ pub struct SdGenerationRequest {
     pub resize_mode: Option<u32>,
     pub include_init_images: Option<bool>,
     pub denoising_strength: Option<f64>,
+    pub eta: Option<f64>,
+    pub s_churn: Option<f64>,
+    pub s_tmax: Option<f64>,
+    pub s_tmin: Option<f64>,
+    pub s_noise: Option<f64>,
     pub enable_hr: Option<bool>,
     pub firstphase_width: Option<u32>,
     pub firstphase_height: Option<u32>,
@@ -111,6 +123,9 @@ pub struct SdGenerationRequest {
     pub rocm_device_id: Option<i32>,
     pub hipfire_rocm_device_id: Option<i32>,
     pub override_settings: Option<Value>,
+    pub override_settings_restore_afterwards: Option<bool>,
+    pub disable_extra_networks: Option<bool>,
+    pub comments: Option<Value>,
     pub script_name: Option<String>,
     pub script_args: Option<Value>,
     pub alwayson_scripts: Option<Value>,
@@ -714,8 +729,12 @@ fn finalize_hfq_diffusion_response(
             "infotexts".to_string(),
             json!(vec![infotext.clone(); output.images.len()]),
         );
+        let ignored_fields = sdapi_ignored_generation_fields(&body);
+        if !ignored_fields.is_empty() {
+            map.insert("ignored_fields".to_string(), json!(ignored_fields));
+        }
     }
-    if body.save_images.unwrap_or(false) {
+    if sdapi_should_save_images(&body) {
         match save_sdapi_images(&body, mode, &output.images) {
             Ok(paths) => {
                 if let Value::Object(map) = &mut output.info {
@@ -738,6 +757,67 @@ fn finalize_hfq_diffusion_response(
         info: output.info.to_string(),
     })
     .into_response()
+}
+
+fn sdapi_should_save_images(body: &SdGenerationRequest) -> bool {
+    body.save_images.unwrap_or(false) && !body.do_not_save_samples.unwrap_or(false)
+}
+
+fn sdapi_ignored_generation_fields(body: &SdGenerationRequest) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if body
+        .styles
+        .as_ref()
+        .is_some_and(|styles| !styles.is_empty())
+    {
+        fields.push("styles");
+    }
+    if body.restore_faces.unwrap_or(false) {
+        fields.push("restore_faces");
+    }
+    if body.tiling.unwrap_or(false) {
+        fields.push("tiling");
+    }
+    if body.do_not_save_grid.unwrap_or(false) {
+        fields.push("do_not_save_grid");
+    }
+    if body.seed_resize_from_w.is_some_and(|value| value > 0)
+        || body.seed_resize_from_h.is_some_and(|value| value > 0)
+    {
+        fields.push("seed_resize_from");
+    }
+    if body.eta.is_some() {
+        fields.push("eta");
+    }
+    if body.s_churn.is_some() {
+        fields.push("s_churn");
+    }
+    if body.s_tmax.is_some() {
+        fields.push("s_tmax");
+    }
+    if body.s_tmin.is_some() {
+        fields.push("s_tmin");
+    }
+    if body.s_noise.is_some() {
+        fields.push("s_noise");
+    }
+    if body
+        .override_settings_restore_afterwards
+        .is_some_and(|value| !value)
+    {
+        fields.push("override_settings_restore_afterwards");
+    }
+    if body.disable_extra_networks.unwrap_or(false) {
+        fields.push("disable_extra_networks");
+    }
+    if body
+        .comments
+        .as_ref()
+        .is_some_and(|value| !sdapi_script_value_is_empty(value))
+    {
+        fields.push("comments");
+    }
+    fields
 }
 
 fn sdapi_response_parameters(mut body: SdGenerationRequest, mode: &str) -> SdGenerationRequest {
@@ -4007,6 +4087,111 @@ mod tests {
             .contains("script_args"));
     }
 
+    #[test]
+    fn generation_request_preserves_common_webui_compatibility_fields() {
+        let body = serde_json::from_value::<SdGenerationRequest>(json!({
+            "prompt": "a cat",
+            "styles": ["cinematic"],
+            "restore_faces": true,
+            "tiling": true,
+            "do_not_save_samples": true,
+            "do_not_save_grid": true,
+            "seed_resize_from_h": 256,
+            "seed_resize_from_w": 128,
+            "eta": 0.5,
+            "s_churn": 0.1,
+            "s_tmax": 2.0,
+            "s_tmin": 0.2,
+            "s_noise": 1.1,
+            "override_settings_restore_afterwards": false,
+            "disable_extra_networks": true,
+            "comments": {"client": "compat"}
+        }))
+        .unwrap();
+
+        assert_eq!(body.styles.as_deref(), Some(&["cinematic".to_string()][..]));
+        assert_eq!(body.restore_faces, Some(true));
+        assert_eq!(body.tiling, Some(true));
+        assert_eq!(body.do_not_save_samples, Some(true));
+        assert_eq!(body.do_not_save_grid, Some(true));
+        assert_eq!(body.seed_resize_from_h, Some(256));
+        assert_eq!(body.seed_resize_from_w, Some(128));
+        assert_eq!(body.eta, Some(0.5));
+        assert_eq!(body.s_churn, Some(0.1));
+        assert_eq!(body.s_tmax, Some(2.0));
+        assert_eq!(body.s_tmin, Some(0.2));
+        assert_eq!(body.s_noise, Some(1.1));
+        assert_eq!(body.override_settings_restore_afterwards, Some(false));
+        assert_eq!(body.disable_extra_networks, Some(true));
+        assert_eq!(body.comments.as_ref().unwrap()["client"], "compat");
+    }
+
+    #[tokio::test]
+    async fn txt2img_route_reports_ignored_common_webui_fields() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-sdapi-webui-ignored-fields-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("tiny-webui-ignored-fields-diffusion.hfq");
+        write_tiny_diffusion_hfq(&hfq_path);
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+
+        let response = post_txt2img(
+            State(state),
+            Json(SdGenerationRequest {
+                prompt: "a styled tiled cat".to_string(),
+                model: Some(hfq_path.to_string_lossy().into_owned()),
+                steps: Some(1),
+                cfg_scale: Some(1.0),
+                width: Some(2),
+                height: Some(2),
+                styles: Some(vec!["cinematic".to_string()]),
+                restore_faces: Some(true),
+                tiling: Some(true),
+                do_not_save_grid: Some(true),
+                seed_resize_from_w: Some(128),
+                seed_resize_from_h: Some(128),
+                eta: Some(0.5),
+                s_churn: Some(0.1),
+                s_tmin: Some(0.0),
+                s_tmax: Some(1.0),
+                s_noise: Some(1.1),
+                override_settings_restore_afterwards: Some(false),
+                disable_extra_networks: Some(true),
+                comments: Some(json!({"client": "compat"})),
+                ..empty_request()
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["parameters"]["styles"], json!(["cinematic"]));
+        assert_eq!(body["parameters"]["restore_faces"], true);
+        assert_eq!(body["parameters"]["tiling"], true);
+        let info = serde_json::from_str::<Value>(body["info"].as_str().unwrap()).unwrap();
+        let ignored = info["ignored_fields"].as_array().unwrap();
+        for field in [
+            "styles",
+            "restore_faces",
+            "tiling",
+            "do_not_save_grid",
+            "seed_resize_from",
+            "eta",
+            "s_churn",
+            "s_tmax",
+            "s_tmin",
+            "s_noise",
+            "override_settings_restore_afterwards",
+            "disable_extra_networks",
+            "comments",
+        ] {
+            assert!(ignored.contains(&json!(field)), "missing {field}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn img2img_route_rejects_unsupported_alwayson_scripts_but_allows_empty_defaults() {
         assert!(sdapi_validate_supported_scripts(&SdGenerationRequest {
@@ -4115,6 +4300,47 @@ mod tests {
             .unwrap();
         assert!(text.contains("a cat"));
         assert!(text.contains("Mode: txt2img"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn txt2img_route_honors_do_not_save_samples() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-sdapi-diffusion-do-not-save-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("tiny-route-diffusion-do-not-save.hfq");
+        let output_dir = dir.join("outputs");
+        write_tiny_diffusion_hfq(&hfq_path);
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let body = SdGenerationRequest {
+            prompt: "a no-save cat".to_string(),
+            model: Some(hfq_path.to_string_lossy().into_owned()),
+            steps: Some(1),
+            cfg_scale: Some(1.0),
+            width: Some(2),
+            height: Some(2),
+            send_images: Some(true),
+            save_images: Some(true),
+            do_not_save_samples: Some(true),
+            override_settings: Some(json!({
+                "outdir_txt2img_samples": output_dir,
+            })),
+            ..empty_request()
+        };
+
+        let response = post_txt2img(State(state), Json(body)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+
+        assert_eq!(body["images"].as_array().unwrap().len(), 1);
+        assert_eq!(body["parameters"]["save_images"], true);
+        assert_eq!(body["parameters"]["do_not_save_samples"], true);
+        let info = serde_json::from_str::<Value>(body["info"].as_str().unwrap()).unwrap();
+        assert!(info.get("saved_images").is_none());
+        assert!(!output_dir.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6562,13 +6788,20 @@ mod tests {
             sampler_name: None,
             sampler_index: None,
             scheduler: None,
+            styles: None,
             steps: None,
             cfg_scale: None,
             seed: None,
             subseed: None,
             subseed_strength: None,
+            seed_resize_from_h: None,
+            seed_resize_from_w: None,
             width: None,
             height: None,
+            restore_faces: None,
+            tiling: None,
+            do_not_save_samples: None,
+            do_not_save_grid: None,
             original_width: None,
             original_height: None,
             target_width: None,
@@ -6594,6 +6827,11 @@ mod tests {
             resize_mode: None,
             include_init_images: None,
             denoising_strength: None,
+            eta: None,
+            s_churn: None,
+            s_tmax: None,
+            s_tmin: None,
+            s_noise: None,
             enable_hr: None,
             firstphase_width: None,
             firstphase_height: None,
@@ -6610,6 +6848,9 @@ mod tests {
             rocm_device_id: None,
             hipfire_rocm_device_id: None,
             override_settings: None,
+            override_settings_restore_afterwards: None,
+            disable_extra_networks: None,
+            comments: None,
             script_name: None,
             script_args: None,
             alwayson_scripts: None,

@@ -71,7 +71,15 @@ enum Command {
     /// init image at its source dimensions, VAE-encodes it, then resizes the
     /// latent tensor to the requested output shape;
     /// `/sdapi/v1/latent-upscale-modes` advertises Hipfire's nearest-neighbor
-    /// latent resize aliases. Masked img2img also honors
+    /// latent resize aliases. Hipfire also accepts common WebUI generation
+    /// fields such as `styles`, `restore_faces`, `tiling`, `do_not_save_samples`,
+    /// `do_not_save_grid`, `seed_resize_from_w`, `seed_resize_from_h`, `eta`,
+    /// `s_churn`, `s_tmin`, `s_tmax`, `s_noise`,
+    /// `override_settings_restore_afterwards`, `disable_extra_networks`, and
+    /// `comments`; fields that do not affect the native runtime are returned in
+    /// response `parameters` and listed in `info.ignored_fields` when active.
+    /// `do_not_save_samples` suppresses disk writes even when `save_images` is
+    /// true. Masked img2img also honors
     /// WebUI's `inpainting_mask_invert`, `mask_blur`,
     /// `mask_blur_x`, `mask_blur_y`, `mask_round`, and `inpainting_fill`
     /// options; default fill (0) is applied in image space before VAE encode,

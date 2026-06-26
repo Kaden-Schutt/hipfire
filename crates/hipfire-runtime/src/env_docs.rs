@@ -178,7 +178,7 @@ pub const ENV_HFQ_TEST_ZP_MAX: EnvVarDoc = EnvVarDoc {
 pub const ENV_HF_HOME: EnvVarDoc = EnvVarDoc {
     name: "HF_HOME",
     description: "Runtime variable controlling hf home in hipfire",
-    source: "crates/hipfire-server/src/routes/sdapi.rs:3588",
+    source: "crates/hipfire-server/src/routes/sdapi.rs:3668",
 };
 
 /// `HIPFIRE_ADAPTIVE_B_DOWN` — Runtime variable controlling adaptive b down in hipfire
@@ -3387,7 +3387,7 @@ pub const ENV_HIPFIRE_TINY_QUANT_PROBE_BIN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_TINY_SD_HFQ: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TINY_SD_HFQ",
     description: "Runtime variable controlling tiny sd hfq in hipfire",
-    source: "crates/hipfire-server/src/routes/sdapi.rs:3761",
+    source: "crates/hipfire-server/src/routes/sdapi.rs:3841",
 };
 
 /// `HIPFIRE_TP_BENCH_ITERS` — Runtime variable controlling tp bench iters in hipfire
@@ -3549,7 +3549,7 @@ pub const ENV_HOSTNAME: EnvVarDoc = EnvVarDoc {
 pub const ENV_HUGGINGFACE_HUB_CACHE: EnvVarDoc = EnvVarDoc {
     name: "HUGGINGFACE_HUB_CACHE",
     description: "Runtime variable controlling huggingface hub cache in hipfire",
-    source: "crates/hipfire-server/src/routes/sdapi.rs:3591",
+    source: "crates/hipfire-server/src/routes/sdapi.rs:3671",
 };
 
 /// `MAX_TOKENS` — Parses "MAX_TOKENS" with fallback defaults
