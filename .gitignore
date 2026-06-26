@@ -16,6 +16,7 @@
 # Dev / dist
 /dev/
 /dist/
+/man/
 
 # Models (large binaries)
 /models/
