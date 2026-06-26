@@ -178,7 +178,7 @@ pub const ENV_HFQ_TEST_ZP_MAX: EnvVarDoc = EnvVarDoc {
 pub const ENV_HF_HOME: EnvVarDoc = EnvVarDoc {
     name: "HF_HOME",
     description: "Runtime variable controlling hf home in hipfire",
-    source: "crates/hipfire-server/src/routes/sdapi.rs:3705",
+    source: "crates/hipfire-server/src/routes/sdapi.rs:3743",
 };
 
 /// `HIPFIRE_ADAPTIVE_B_DOWN` — Runtime variable controlling adaptive b down in hipfire
@@ -1635,7 +1635,7 @@ pub const ENV_HIPFIRE_JINJA_CHAT: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_KERNEL_CACHE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KERNEL_CACHE",
     description: "Overrides the default kernel cache root (\"~/.hipfire/kernels\")",
-    source: "crates/rdna-compute/src/compiler.rs:214",
+    source: "crates/rdna-compute/src/compiler.rs:242",
 };
 
 /// `HIPFIRE_KLD_DIRECT_F16KV_ATTN` — Used to configure runtime execution by explicitly setting "HIPFIRE_KLD_DIRECT_F16KV_ATTN"
@@ -2493,7 +2493,7 @@ pub const ENV_HIPFIRE_PFLASH_DAEMON_LABELS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PFLASH_DEBUG: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PFLASH_DEBUG",
     description: "Runtime variable controlling pflash debug in hipfire",
-    source: "crates/hipfire-serving-core/src/generate.rs:2391",
+    source: "crates/hipfire-serving-core/src/generate.rs:2422",
 };
 
 /// `HIPFIRE_PFLASH_DRAFTER_KV` — Selects behavior from recognized values
@@ -3387,7 +3387,7 @@ pub const ENV_HIPFIRE_TINY_QUANT_PROBE_BIN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_TINY_SD_HFQ: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TINY_SD_HFQ",
     description: "Runtime variable controlling tiny sd hfq in hipfire",
-    source: "crates/hipfire-server/src/routes/sdapi.rs:3878",
+    source: "crates/hipfire-server/src/routes/sdapi.rs:3916",
 };
 
 /// `HIPFIRE_TP_BENCH_ITERS` — Runtime variable controlling tp bench iters in hipfire
@@ -3520,7 +3520,7 @@ pub const ENV_HIPFIRE_XDNA1_LIB: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIP_PATH: EnvVarDoc = EnvVarDoc {
     name: "HIP_PATH",
     description: "fails with \"file not found\". Add well-known candidates as -I flags;",
-    source: "crates/rdna-compute/src/compiler.rs:481",
+    source: "crates/rdna-compute/src/compiler.rs:509",
 };
 
 /// `HIP_VISIBLE_DEVICES` — Used to configure runtime execution by explicitly setting "HIP_VISIBLE_DEVICES"
@@ -3535,7 +3535,7 @@ pub const ENV_HIP_VISIBLE_DEVICES: EnvVarDoc = EnvVarDoc {
 pub const ENV_HOME: EnvVarDoc = EnvVarDoc {
     name: "HOME",
     description: "Runtime variable controlling home in hipfire",
-    source: "crates/rdna-compute/src/compiler.rs:199",
+    source: "crates/rdna-compute/src/compiler.rs:227",
 };
 
 /// `HOSTNAME` — Runtime variable controlling hostname in hipfire
@@ -3549,7 +3549,7 @@ pub const ENV_HOSTNAME: EnvVarDoc = EnvVarDoc {
 pub const ENV_HUGGINGFACE_HUB_CACHE: EnvVarDoc = EnvVarDoc {
     name: "HUGGINGFACE_HUB_CACHE",
     description: "Runtime variable controlling huggingface hub cache in hipfire",
-    source: "crates/hipfire-server/src/routes/sdapi.rs:3708",
+    source: "crates/hipfire-server/src/routes/sdapi.rs:3746",
 };
 
 /// `MAX_TOKENS` — Parses "MAX_TOKENS" with fallback defaults
@@ -3598,7 +3598,7 @@ pub const ENV_NO_NGRAM: EnvVarDoc = EnvVarDoc {
 pub const ENV_PATH: EnvVarDoc = EnvVarDoc {
     name: "PATH",
     description: "Runtime variable controlling path in hipfire",
-    source: "crates/hipfire-eval/src/rocprof.rs:285",
+    source: "crates/rdna-compute/src/compiler.rs:204",
 };
 
 /// `PROMPT_MODE` — Defaults to thinking when unset
@@ -3619,14 +3619,14 @@ pub const ENV_QWEN35_TEST_MODEL: EnvVarDoc = EnvVarDoc {
 pub const ENV_ROCM_DEVICE_LIB_PATH: EnvVarDoc = EnvVarDoc {
     name: "ROCM_DEVICE_LIB_PATH",
     description: "Runtime variable controlling rocm device lib path in hipfire",
-    source: "crates/rdna-compute/src/compiler.rs:469",
+    source: "crates/rdna-compute/src/compiler.rs:497",
 };
 
 /// `ROCM_PATH` — Runtime variable controlling rocm path in hipfire
 pub const ENV_ROCM_PATH: EnvVarDoc = EnvVarDoc {
     name: "ROCM_PATH",
     description: "Runtime variable controlling rocm path in hipfire",
-    source: "crates/rdna-compute/src/compiler.rs:466",
+    source: "crates/rdna-compute/src/compiler.rs:494",
 };
 
 /// `ROCR_VISIBLE_DEVICES` — Runtime variable controlling rocr visible devices in hipfire
@@ -3654,7 +3654,7 @@ pub const ENV_TRIALS: EnvVarDoc = EnvVarDoc {
 pub const ENV_USERPROFILE: EnvVarDoc = EnvVarDoc {
     name: "USERPROFILE",
     description: "Runtime variable controlling userprofile in hipfire",
-    source: "crates/rdna-compute/src/compiler.rs:200",
+    source: "crates/rdna-compute/src/compiler.rs:228",
 };
 
 /// `USE_SAMPLE` — Enabled when set to 1
