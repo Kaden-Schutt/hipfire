@@ -13,3 +13,6 @@
 [submodule "third_party/stable-diffusion-webui"]
 	path = third_party/stable-diffusion-webui
 	url = https://github.com/AUTOMATIC1111/stable-diffusion-webui.git
+[submodule "third_party/moshi"]
+	path = third_party/moshi
+	url = https://github.com/kyutai-labs/moshi.git
