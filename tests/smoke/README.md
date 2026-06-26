@@ -23,6 +23,10 @@ claims.
   `/tmp/hipfire-tiny-sd-diffusion.hfq` is not present. Set
   `HIPFIRE_DIFFUSION_SMOKE_BATCH_SIZE` and `HIPFIRE_DIFFUSION_SMOKE_N_ITER` to
   validate WebUI batch and iteration semantics against batch-capable artifacts.
+  Set `HIPFIRE_DIFFUSION_SMOKE_HIGHRES=1` to add a served high-res txt2img
+  second-pass check; `HIPFIRE_DIFFUSION_SMOKE_HIGHRES_SCALE` defaults to `1.0`
+  so the path is exercised without increasing image dimensions unless
+  `HIPFIRE_DIFFUSION_SMOKE_HIGHRES_WIDTH`/`HEIGHT` or a larger scale is set.
   Set `HIPFIRE_DIFFUSION_SMOKE_ROCM_DEVICE_ID` to validate the hybrid ROCm
   runtime path; the smoke will use a release cargo run with `--features rocm`
   unless `HIPFIRE_DIFFUSION_SDAPI_SMOKE_CARGO_FEATURES` or

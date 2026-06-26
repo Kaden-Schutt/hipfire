@@ -12,6 +12,10 @@ PROMPT="${HIPFIRE_DIFFUSION_SMOKE_PROMPT:-hipfire SDAPI diffusion smoke test}"
 BATCH_SIZE="${HIPFIRE_DIFFUSION_SMOKE_BATCH_SIZE:-1}"
 N_ITER="${HIPFIRE_DIFFUSION_SMOKE_N_ITER:-1}"
 ROCM_DEVICE_ID="${HIPFIRE_DIFFUSION_SMOKE_ROCM_DEVICE_ID:-}"
+HIGHRES="${HIPFIRE_DIFFUSION_SMOKE_HIGHRES:-0}"
+HIGHRES_SCALE="${HIPFIRE_DIFFUSION_SMOKE_HIGHRES_SCALE:-1.0}"
+HIGHRES_WIDTH="${HIPFIRE_DIFFUSION_SMOKE_HIGHRES_WIDTH:-}"
+HIGHRES_HEIGHT="${HIPFIRE_DIFFUSION_SMOKE_HIGHRES_HEIGHT:-}"
 SERVER_SMOKE_LOCK="${HIPFIRE_SERVER_SMOKE_LOCK:-${TMPDIR:-/tmp}/hipfire-server-smoke.lock}"
 SERVER_SMOKE_LOCK_WAIT="${HIPFIRE_SERVER_SMOKE_LOCK_WAIT:-300}"
 
@@ -27,9 +31,10 @@ if [[ ! -f "$MODEL" ]]; then
   exit 2
 fi
 
-python3 - "$ROOT" "$MODEL" "$WIDTH" "$HEIGHT" "$STEPS" "$CFG_SCALE" "$SEED" "$PROMPT" "$BATCH_SIZE" "$N_ITER" "$ROCM_DEVICE_ID" <<'PY'
+python3 - "$ROOT" "$MODEL" "$WIDTH" "$HEIGHT" "$STEPS" "$CFG_SCALE" "$SEED" "$PROMPT" "$BATCH_SIZE" "$N_ITER" "$ROCM_DEVICE_ID" "$HIGHRES" "$HIGHRES_SCALE" "$HIGHRES_WIDTH" "$HIGHRES_HEIGHT" <<'PY'
 import base64
 import json
+import math
 import os
 import shlex
 import socket
@@ -43,7 +48,23 @@ import urllib.request
 import zlib
 from typing import Any
 
-root, model, width_s, height_s, steps_s, cfg_scale_s, seed_s, prompt, batch_size_s, n_iter_s, rocm_device_id_s = sys.argv[1:]
+(
+    root,
+    model,
+    width_s,
+    height_s,
+    steps_s,
+    cfg_scale_s,
+    seed_s,
+    prompt,
+    batch_size_s,
+    n_iter_s,
+    rocm_device_id_s,
+    highres_s,
+    highres_scale_s,
+    highres_width_s,
+    highres_height_s,
+) = sys.argv[1:]
 width = int(width_s)
 height = int(height_s)
 steps = int(steps_s)
@@ -53,12 +74,18 @@ batch_size = int(batch_size_s)
 n_iter = int(n_iter_s)
 expected_images = batch_size * n_iter
 rocm_device_id = int(rocm_device_id_s) if rocm_device_id_s else None
+highres_enabled = highres_s.lower() in ("1", "true", "yes", "on")
+highres_scale = float(highres_scale_s)
+highres_width = int(highres_width_s) if highres_width_s else None
+highres_height = int(highres_height_s) if highres_height_s else None
 request_timeout = float(os.environ.get("HIPFIRE_DIFFUSION_SDAPI_SMOKE_REQUEST_TIMEOUT", "420"))
 
 if batch_size < 1:
     raise RuntimeError(f"batch size must be positive, got {batch_size}")
 if n_iter < 1:
     raise RuntimeError(f"n_iter must be positive, got {n_iter}")
+if highres_enabled and (not math.isfinite(highres_scale) or highres_scale <= 0.0):
+    raise RuntimeError(f"highres scale must be positive, got {highres_scale}")
 
 
 def pick_port() -> int:
@@ -136,11 +163,41 @@ def validate_png(image: str, expected_width: int, expected_height: int, label: s
     return png
 
 
-def expected_seeds(first_seed: int) -> list[int]:
-    return [first_seed + idx for idx in range(expected_images)]
+def expected_seeds(first_seed: int, count: int = expected_images) -> list[int]:
+    return [first_seed + idx for idx in range(count)]
 
 
-def sdapi_request(base_url: str, route: str, body: dict[str, Any], label: str) -> tuple[dict[str, Any], dict[str, Any]]:
+def scaled_highres_dimension(dimension: int, scale: float) -> int:
+    return max(1, int(math.floor((dimension * scale) + 0.5)))
+
+
+def aspect_scaled_dimension(target: int, source_num: int, source_den: int) -> int:
+    return max(1, int(math.floor(((target * source_num) / source_den) + 0.5)))
+
+
+def expected_highres_dimensions() -> tuple[int, int]:
+    if highres_width is not None and highres_height is not None:
+        return highres_width, highres_height
+    if highres_width is not None:
+        return highres_width, aspect_scaled_dimension(highres_width, height, width)
+    if highres_height is not None:
+        return aspect_scaled_dimension(highres_height, width, height), highres_height
+    return (
+        scaled_highres_dimension(width, highres_scale),
+        scaled_highres_dimension(height, highres_scale),
+    )
+
+
+def sdapi_request(
+    base_url: str,
+    route: str,
+    body: dict[str, Any],
+    label: str,
+    *,
+    expected_count: int = expected_images,
+    expected_width: int = width,
+    expected_height: int = height,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
         out = fetch_json(f"{base_url}{route}", body, timeout=request_timeout)
     except urllib.error.HTTPError as err:
@@ -149,18 +206,18 @@ def sdapi_request(base_url: str, route: str, body: dict[str, Any], label: str) -
     if "error" in out:
         raise RuntimeError(f"{label}: response error: {out['error']}")
     images = out.get("images")
-    if not isinstance(images, list) or len(images) != expected_images:
-        raise RuntimeError(f"{label}: expected {expected_images} image(s), got {out}")
+    if not isinstance(images, list) or len(images) != expected_count:
+        raise RuntimeError(f"{label}: expected {expected_count} image(s), got {out}")
     for idx, image in enumerate(images):
-        validate_png(image, width, height, f"{label}[{idx}]")
+        validate_png(image, expected_width, expected_height, f"{label}[{idx}]")
     info_raw = out.get("info")
     if not isinstance(info_raw, str):
         raise RuntimeError(f"{label}: missing SDAPI info string: {out}")
     info = json.loads(info_raw)
     if info.get("backend") != "hipfire-diffusion-hfq":
         raise RuntimeError(f"{label}: unexpected backend info: {info}")
-    if info.get("batch_size") != expected_images:
-        raise RuntimeError(f"{label}: expected merged batch_size {expected_images}, got {info}")
+    if info.get("batch_size") != expected_count:
+        raise RuntimeError(f"{label}: expected merged batch_size {expected_count}, got {info}")
     if rocm_device_id is not None and info.get("runtime") != "rocm-hybrid-reference":
         raise RuntimeError(f"{label}: expected rocm-hybrid-reference runtime, got {info}")
     return out, info
@@ -267,6 +324,39 @@ try:
     if prompt not in str(png_info.get("info", "")):
         raise RuntimeError(f"png-info did not include prompt: {png_info}")
 
+    highres_info = None
+    if highres_enabled:
+        highres_body = dict(txt_body)
+        highres_body.update({
+            "prompt": f"{prompt} highres",
+            "seed": seed + 3,
+            "n_iter": 1,
+            "enable_hr": True,
+            "hr_scale": highres_scale,
+            "hr_second_pass_steps": steps,
+            "denoising_strength": 1.0,
+        })
+        if highres_width is not None:
+            highres_body["hr_resize_x"] = highres_width
+        if highres_height is not None:
+            highres_body["hr_resize_y"] = highres_height
+        expected_highres_width, expected_highres_height = expected_highres_dimensions()
+        _highres, highres_info = sdapi_request(
+            base_url,
+            "/sdapi/v1/txt2img",
+            highres_body,
+            "txt2img-hires",
+            expected_count=batch_size,
+            expected_width=expected_highres_width,
+            expected_height=expected_highres_height,
+        )
+        if highres_info.get("mode") != "txt2img-hires" or highres_info.get("highres") is not True:
+            raise RuntimeError(f"highres txt2img mode/info wrong: {highres_info}")
+        if highres_info.get("seeds") != expected_seeds(seed + 3, batch_size):
+            raise RuntimeError(f"highres txt2img seeds wrong: {highres_info}")
+        if highres_info.get("hr_second_pass_steps") != steps:
+            raise RuntimeError(f"highres txt2img second-pass steps wrong: {highres_info}")
+
     img_body = dict(txt_body)
     img_body.update({
         "prompt": f"{prompt} img2img",
@@ -326,6 +416,15 @@ try:
         "server_command_noops": 3,
         "skip_noop": True,
         "txt2img": {"backend": txt_info.get("backend"), "runtime": txt_info.get("runtime")},
+        "txt2img_highres": (
+            None
+            if highres_info is None
+            else {
+                "mode": highres_info.get("mode"),
+                "width": highres_info.get("width"),
+                "height": highres_info.get("height"),
+            }
+        ),
         "img2img": {"masked": img_info.get("masked")},
         "masked_img2img": {"masked": masked_info.get("masked")},
         "log": log_path,
