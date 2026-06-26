@@ -6744,6 +6744,177 @@ impl NativeTransformerBlock {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+struct NativeTransformerDenoiser {
+    family: TransformerDenoiserFamily,
+    io: NativeTransformerDenoiserIo,
+    timestep_embedding: NativeTransformerTimestepEmbedding,
+    blocks: Vec<NativeTransformerBlock>,
+    heads: usize,
+}
+
+#[allow(dead_code)]
+impl NativeTransformerDenoiser {
+    fn from_hfq(
+        hfq: &HfqFile,
+        config: &StableDiffusionConfig,
+        topology: &TransformerDenoiserWeightTopology,
+    ) -> DiffusionResult<Self> {
+        if !matches!(topology.family, TransformerDenoiserFamily::QwenImage) {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "native transformer denoiser assembly currently supports Qwen image MMDiT only; got {}",
+                topology.diagnostic_label()
+            )));
+        }
+        if topology.block_count == 0 {
+            return Err(DiffusionError::InvalidMetadata(
+                "transformer denoiser contains no transformer_blocks.* weights".to_string(),
+            ));
+        }
+        let transformer = config.transformer.as_ref().ok_or_else(|| {
+            DiffusionError::InvalidMetadata(
+                "transformer denoiser config is required for native transformer assembly"
+                    .to_string(),
+            )
+        })?;
+        let heads = transformer.num_attention_heads.unwrap_or(1);
+        if heads == 0 {
+            return Err(DiffusionError::InvalidMetadata(
+                "transformer num_attention_heads must be positive".to_string(),
+            ));
+        }
+        let io = NativeTransformerDenoiserIo::from_hfq(hfq, config, topology)?;
+        let timestep_embedding =
+            NativeTransformerTimestepEmbedding::from_hfq(hfq, topology.family)?;
+        let mut blocks = Vec::with_capacity(topology.block_count);
+        for block_index in 0..topology.block_count {
+            blocks.push(NativeTransformerBlock::from_hfq(
+                hfq,
+                topology.family,
+                block_index,
+                heads,
+            )?);
+        }
+        Ok(Self {
+            family: topology.family,
+            io,
+            timestep_embedding,
+            blocks,
+            heads,
+        })
+    }
+
+    fn forward_qwen_with_runtime_context(
+        &self,
+        latents: &LatentBatch,
+        timesteps: &[f32],
+        text_hidden: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<LatentBatch> {
+        if !matches!(self.family, TransformerDenoiserFamily::QwenImage) {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "native transformer denoiser family {:?} is not Qwen image MMDiT",
+                self.family
+            )));
+        }
+        if timesteps.len() != latents.batch {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "transformer timestep batch {} != latent batch {}",
+                timesteps.len(),
+                latents.batch
+            )));
+        }
+        let [text_batch, _, _] = shape3(text_hidden)?;
+        if text_batch != latents.batch {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "transformer text hidden batch {text_batch} != latent batch {}",
+                latents.batch
+            )));
+        }
+
+        let mut image_hidden = self
+            .io
+            .project_latents_to_hidden_with_runtime_context(latents, runtime_context)?;
+        let mut text_hidden = text_hidden.clone();
+        let timestep_embedding = self
+            .timestep_embedding
+            .forward_with_runtime_context(timesteps, runtime_context)?;
+        for block in &self.blocks {
+            let (next_image_hidden, next_text_hidden) = block.forward_qwen_with_runtime_context(
+                &image_hidden,
+                &text_hidden,
+                &timestep_embedding,
+                runtime_context,
+            )?;
+            image_hidden = next_image_hidden;
+            text_hidden = next_text_hidden;
+        }
+        self.io.project_hidden_to_latents_with_runtime_context(
+            &image_hidden,
+            latents.batch,
+            latents.height,
+            latents.width,
+            runtime_context,
+        )
+    }
+}
+
+impl DiffusionNoiseBackend for NativeTransformerDenoiser {
+    fn model_input_channels(&self) -> usize {
+        self.io.output_channels
+    }
+
+    fn denoise_latents_with_runtime_context(
+        &self,
+        latents: LatentBatch,
+        schedule: &DiffusionSchedule,
+        cfg_scale: f32,
+        positive_embeddings: &CpuTensor,
+        negative_embeddings: &CpuTensor,
+        positive_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
+        negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
+        inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
+        masked_reference: Option<&MaskedDenoiseReference<'_>>,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+        progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
+    ) -> DiffusionResult<DenoiseLatentsOutput> {
+        if positive_sdxl_conditioning.is_some() || negative_sdxl_conditioning.is_some() {
+            return Err(DiffusionError::InvalidRequest(
+                "Qwen transformer denoiser does not accept SDXL auxiliary conditioning".to_string(),
+            ));
+        }
+        if inpaint_conditioning.is_some() || masked_reference.is_some() {
+            return Err(DiffusionError::InvalidRequest(
+                "Qwen transformer denoiser inpaint conditioning is not implemented".to_string(),
+            ));
+        }
+        denoise_latents_with_cfg_progress_and_runtime_context(
+            latents,
+            schedule,
+            cfg_scale,
+            positive_embeddings,
+            negative_embeddings,
+            |sample, timesteps, encoder_states, _sdxl, runtime_context| {
+                let model_latents = LatentBatch::from_nchw_tensor(sample.clone())?;
+                let prediction = self.forward_qwen_with_runtime_context(
+                    &model_latents,
+                    timesteps,
+                    encoder_states,
+                    runtime_context,
+                )?;
+                Ok(prediction.as_nchw_tensor())
+            },
+            None,
+            None,
+            None,
+            None,
+            runtime_context,
+            progress,
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 enum TransformerModulationStream {
@@ -18627,6 +18798,158 @@ mod tests {
     }
 
     #[test]
+    fn native_transformer_denoiser_runs_qwen_tiny_single_block_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-qwen-transformer-denoiser-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("qwen-transformer-denoiser.hfq");
+        let tensors = qwen_tiny_transformer_denoiser_tensors();
+        let weight_entries = tensors
+            .iter()
+            .map(|tensor| tensor.name.clone())
+            .collect::<Vec<_>>();
+        write_hfqm_package_mem(&path, HFQ_ARCH_DIFFUSION, "{}", &tensors).unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let mut config = tiny_runtime_config();
+        config.latent_channels = 1;
+        config.transformer = Some(TransformerDenoiserConfig {
+            class_name: "QwenImageTransformer2DModel".into(),
+            in_channels: Some(4),
+            out_channels: Some(1),
+            patch_size: Some(2),
+            num_attention_heads: Some(1),
+            ..TransformerDenoiserConfig::default()
+        });
+        let topology = transformer_denoiser_weight_topology(&DiffusionComponentMetadata {
+            class_name: Some("QwenImageTransformer2DModel".to_string()),
+            weight_entries,
+            ..DiffusionComponentMetadata::default()
+        });
+        let denoiser = NativeTransformerDenoiser::from_hfq(&hfq, &config, &topology).unwrap();
+        let latents = LatentBatch {
+            batch: 1,
+            channels: 1,
+            height: 2,
+            width: 2,
+            data: vec![1.0, -1.0, 0.5, -0.5],
+        };
+        let text_hidden = CpuTensor {
+            shape: vec![1, 1, 2],
+            data: vec![0.5, -0.5],
+        };
+        let mut runtime_context =
+            DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+
+        let output = denoiser
+            .forward_qwen_with_runtime_context(&latents, &[0.0], &text_hidden, &mut runtime_context)
+            .unwrap();
+
+        assert_eq!(output.batch, 1);
+        assert_eq!(output.channels, 1);
+        assert_eq!(output.height, 2);
+        assert_eq!(output.width, 2);
+        let expected_hidden = qwen_block_expected_mlp_only(&CpuTensor {
+            shape: vec![1, 1, 2],
+            data: vec![1.0, -1.0],
+        });
+        let expected = vec![
+            expected_hidden[0],
+            expected_hidden[1],
+            expected_hidden[0] + expected_hidden[1],
+            expected_hidden[0] - expected_hidden[1],
+        ];
+        assert_f32_close(&output.data, &expected, 1e-5);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_transformer_denoiser_runs_qwen_cfg_scheduler_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-qwen-transformer-denoise-loop-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("qwen-transformer-denoise-loop.hfq");
+        let tensors = qwen_tiny_transformer_denoiser_tensors();
+        let weight_entries = tensors
+            .iter()
+            .map(|tensor| tensor.name.clone())
+            .collect::<Vec<_>>();
+        write_hfqm_package_mem(&path, HFQ_ARCH_DIFFUSION, "{}", &tensors).unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let mut config = tiny_runtime_config();
+        config.latent_channels = 1;
+        config.transformer = Some(TransformerDenoiserConfig {
+            class_name: "QwenImageTransformer2DModel".into(),
+            in_channels: Some(4),
+            out_channels: Some(1),
+            patch_size: Some(2),
+            num_attention_heads: Some(1),
+            ..TransformerDenoiserConfig::default()
+        });
+        let topology = transformer_denoiser_weight_topology(&DiffusionComponentMetadata {
+            class_name: Some("QwenImageTransformer2DModel".to_string()),
+            weight_entries,
+            ..DiffusionComponentMetadata::default()
+        });
+        let denoiser = NativeTransformerDenoiser::from_hfq(&hfq, &config, &topology).unwrap();
+        let latents = LatentBatch {
+            batch: 1,
+            channels: 1,
+            height: 2,
+            width: 2,
+            data: vec![1.0, -1.0, 0.5, -0.5],
+        };
+        let positive = CpuTensor {
+            shape: vec![1, 1, 2],
+            data: vec![0.5, -0.5],
+        };
+        let negative = CpuTensor {
+            shape: vec![1, 1, 2],
+            data: vec![0.5, -0.5],
+        };
+        let schedule = DiffusionSchedule::linear(1).unwrap();
+        let mut runtime_context =
+            DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+        let mut progress_calls = 0usize;
+
+        let output = denoiser
+            .denoise_latents_with_runtime_context(
+                latents,
+                &schedule,
+                1.0,
+                &positive,
+                &negative,
+                None,
+                None,
+                None,
+                None,
+                &mut runtime_context,
+                Some(&mut |_progress| {
+                    progress_calls += 1;
+                    Ok(())
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(output.latents.batch, 1);
+        assert_eq!(output.latents.channels, 1);
+        assert_eq!(output.latents.height, 2);
+        assert_eq!(output.latents.width, 2);
+        assert!(output.latents.data.iter().all(|value| value.is_finite()));
+        assert_eq!(
+            output.runtime_kind,
+            DiffusionRuntimeKind::CpuSourceReference
+        );
+        assert_eq!(progress_calls, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn inspect_hfq_reports_metadata_runtime_support_without_loading_runtime() {
         let dir = std::env::temp_dir().join(format!(
             "hipfire-diffusion-runtime-support-inspect-test-{}",
@@ -27207,6 +27530,84 @@ mod tests {
                 .flat_map(|value| value.to_le_bytes())
                 .collect::<Vec<_>>(),
         }
+    }
+
+    fn qwen_tiny_transformer_denoiser_tensors() -> Vec<HfqMemTensor> {
+        let block = "transformer/tensors/transformer_blocks.0";
+        let attn = format!("{block}.attn");
+        let time = "transformer/tensors/time_text_embed.timestep_embedder";
+        let identity2 = [1.0, 0.0, 0.0, 1.0];
+        let geglu_identity = [1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0];
+        let silu_one = silu(1.0);
+        let mut modulation_weight = vec![0.0f32; 12 * 2];
+        modulation_weight[10 * 2] = silu_one.recip();
+        modulation_weight[11 * 2] = silu_one.recip();
+        vec![
+            f32_mem_tensor(
+                "transformer/tensors/img_in.weight",
+                &[2, 4],
+                &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            ),
+            f32_mem_tensor("transformer/tensors/img_in.bias", &[2], &[0.0, 0.0]),
+            f32_mem_tensor(
+                "transformer/tensors/proj_out.weight",
+                &[4, 2],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, -1.0],
+            ),
+            f32_mem_tensor("transformer/tensors/proj_out.bias", &[4], &[0.0; 4]),
+            f32_mem_tensor(&format!("{time}.linear_1.weight"), &[2, 2], &identity2),
+            f32_mem_tensor(&format!("{time}.linear_1.bias"), &[2], &[0.0; 2]),
+            f32_mem_tensor(
+                &format!("{time}.linear_2.weight"),
+                &[2, 2],
+                &[silu_one.recip(), 0.0, 0.0, 1.0],
+            ),
+            f32_mem_tensor(&format!("{time}.linear_2.bias"), &[2], &[0.0; 2]),
+            f32_mem_tensor(
+                &format!("{block}.img_mod.1.weight"),
+                &[12, 2],
+                &modulation_weight,
+            ),
+            f32_mem_tensor(&format!("{block}.img_mod.1.bias"), &[12], &[0.0; 12]),
+            f32_mem_tensor(
+                &format!("{block}.txt_mod.1.weight"),
+                &[12, 2],
+                &modulation_weight,
+            ),
+            f32_mem_tensor(&format!("{block}.txt_mod.1.bias"), &[12], &[0.0; 12]),
+            f32_mem_tensor(&format!("{attn}.to_q.weight"), &[2, 2], &identity2),
+            f32_mem_tensor(&format!("{attn}.to_k.weight"), &[2, 2], &identity2),
+            f32_mem_tensor(&format!("{attn}.to_v.weight"), &[2, 2], &identity2),
+            f32_mem_tensor(&format!("{attn}.to_out.0.weight"), &[2, 2], &identity2),
+            f32_mem_tensor(&format!("{attn}.add_q_proj.weight"), &[2, 2], &identity2),
+            f32_mem_tensor(&format!("{attn}.add_k_proj.weight"), &[2, 2], &identity2),
+            f32_mem_tensor(&format!("{attn}.add_v_proj.weight"), &[2, 2], &identity2),
+            f32_mem_tensor(&format!("{attn}.to_add_out.weight"), &[2, 2], &identity2),
+            f32_mem_tensor(
+                &format!("{block}.img_mlp.net.0.proj.weight"),
+                &[4, 2],
+                &geglu_identity,
+            ),
+            f32_mem_tensor(&format!("{block}.img_mlp.net.0.proj.bias"), &[4], &[0.0; 4]),
+            f32_mem_tensor(
+                &format!("{block}.img_mlp.net.2.weight"),
+                &[2, 2],
+                &identity2,
+            ),
+            f32_mem_tensor(&format!("{block}.img_mlp.net.2.bias"), &[2], &[0.0; 2]),
+            f32_mem_tensor(
+                &format!("{block}.txt_mlp.net.0.proj.weight"),
+                &[4, 2],
+                &geglu_identity,
+            ),
+            f32_mem_tensor(&format!("{block}.txt_mlp.net.0.proj.bias"), &[4], &[0.0; 4]),
+            f32_mem_tensor(
+                &format!("{block}.txt_mlp.net.2.weight"),
+                &[2, 2],
+                &identity2,
+            ),
+            f32_mem_tensor(&format!("{block}.txt_mlp.net.2.bias"), &[2], &[0.0; 2]),
+        ]
     }
 
     fn assert_f32_close(actual: &[f32], expected: &[f32], tolerance: f32) {
