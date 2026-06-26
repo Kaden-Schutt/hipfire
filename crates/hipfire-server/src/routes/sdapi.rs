@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Json, Response},
 };
@@ -134,6 +134,12 @@ pub struct SdGenerationRequest {
     pub repeat_penalty: Option<f64>,
     pub max_tokens: Option<u32>,
     pub stop: Option<Value>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct SdapiProgressQuery {
+    #[serde(default)]
+    pub skip_current_image: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2851,11 +2857,16 @@ fn interrupt_sdapi_progress(progress_state: &Arc<std::sync::Mutex<SdapiProgressS
     }
 }
 
-fn sdapi_progress_json(progress: &SdapiProgressState) -> Value {
+fn sdapi_progress_json(progress: &SdapiProgressState, skip_current_image: bool) -> Value {
     let ratio = if progress.sampling_steps == 0 {
         0.0
     } else {
         (progress.sampling_step as f64 / progress.sampling_steps as f64).clamp(0.0, 1.0)
+    };
+    let current_image = if skip_current_image {
+        None
+    } else {
+        progress.current_image.clone()
     };
     json!({
         "progress": ratio,
@@ -2869,7 +2880,7 @@ fn sdapi_progress_json(progress: &SdapiProgressState) -> Value {
             "sampling_step": progress.sampling_step,
             "sampling_steps": progress.sampling_steps,
         },
-        "current_image": progress.current_image,
+        "current_image": current_image,
         "textinfo": progress.textinfo,
         "current_task": progress.task_id,
     })
@@ -3270,13 +3281,20 @@ fn sdapi_png_info_parameters(info: &str) -> Value {
     Value::Object(parameters)
 }
 
-pub async fn get_progress(State(state): State<SharedState>) -> Json<Value> {
+pub async fn get_progress(
+    State(state): State<SharedState>,
+    Query(query): Query<SdapiProgressQuery>,
+) -> Json<Value> {
+    sdapi_progress_response(state, query.skip_current_image).await
+}
+
+async fn sdapi_progress_response(state: SharedState, skip_current_image: bool) -> Json<Value> {
     let progress = state
         .sdapi_progress
         .lock()
         .map(|progress| progress.clone())
         .unwrap_or_default();
-    Json(sdapi_progress_json(&progress))
+    Json(sdapi_progress_json(&progress, skip_current_image))
 }
 
 pub async fn get_options(State(state): State<SharedState>) -> Json<Value> {
@@ -3914,7 +3932,7 @@ mod tests {
             serde_json::from_str::<Value>(body["info"].as_str().unwrap()).unwrap()["backend"],
             "hipfire-diffusion-hfq"
         );
-        let Json(progress) = get_progress(State(state.clone())).await;
+        let Json(progress) = sdapi_progress_response(state.clone(), false).await;
         assert_eq!(progress["progress"], 1.0);
         assert_eq!(progress["textinfo"], "complete");
         let current_image = progress["current_image"].as_str().unwrap();
@@ -4415,7 +4433,7 @@ mod tests {
         assert_eq!(info["hr_prompt"], "a highres dog");
         assert_eq!(info["hr_negative_prompt"], "blur");
         assert_eq!(info["hr_sampler_name"], "Euler");
-        let Json(progress) = get_progress(State(state.clone())).await;
+        let Json(progress) = sdapi_progress_response(state.clone(), false).await;
         assert_eq!(progress["progress"], 1.0);
         assert_eq!(progress["state"]["sampling_steps"], 2);
         let text = extract_png_text_chunk(&bytes, "parameters")
@@ -5894,7 +5912,7 @@ mod tests {
         assert!(saved_path.starts_with(&outdir));
         assert!(saved_path.exists());
 
-        let Json(progress) = get_progress(State(state)).await;
+        let Json(progress) = sdapi_progress_response(state, false).await;
         assert_eq!(progress["textinfo"], "complete");
         assert!(progress["current_image"].as_str().is_some());
         let _ = std::fs::remove_dir_all(&dir);
@@ -5988,7 +6006,7 @@ mod tests {
     async fn progress_endpoint_reports_idle_and_active_sdapi_generation() {
         let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
 
-        let Json(idle) = get_progress(State(state.clone())).await;
+        let Json(idle) = sdapi_progress_response(state.clone(), false).await;
         assert_eq!(idle["progress"], 0.0);
         assert_eq!(idle["state"]["interrupted"], false);
         assert_eq!(idle["current_task"], Value::Null);
@@ -6011,7 +6029,7 @@ mod tests {
         )
         .unwrap();
 
-        let Json(active) = get_progress(State(state.clone())).await;
+        let Json(active) = sdapi_progress_response(state.clone(), false).await;
         assert_eq!(active["progress"], 0.5);
         assert_eq!(active["state"]["job"], "txt2img");
         assert_eq!(active["state"]["sampling_step"], 2);
@@ -6022,11 +6040,47 @@ mod tests {
 
         finish_sdapi_progress(&state.sdapi_progress, None, Some("image-b64".to_string()));
 
-        let Json(complete) = get_progress(State(state)).await;
+        let Json(complete) = sdapi_progress_response(state, false).await;
         assert_eq!(complete["progress"], 1.0);
         assert_eq!(complete["state"]["sampling_step"], 4);
         assert_eq!(complete["current_image"], "image-b64");
         assert_eq!(complete["textinfo"], "complete");
+    }
+
+    #[tokio::test]
+    async fn progress_endpoint_can_skip_current_image_payload() {
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let body = SdGenerationRequest {
+            prompt: "a cat".to_string(),
+            force_task_id: Some("task-no-preview".to_string()),
+            ..empty_request()
+        };
+        start_sdapi_progress(&state.sdapi_progress, &body, "txt2img", 4);
+        update_sdapi_progress(
+            &state.sdapi_progress,
+            DiffusionProgress {
+                completed_steps: 2,
+                total_steps: 4,
+                timestep: 10,
+                preview_latents: None,
+            },
+            Some("preview-b64".to_string()),
+        )
+        .unwrap();
+
+        let Json(without_image) = get_progress(
+            State(state.clone()),
+            Query(SdapiProgressQuery {
+                skip_current_image: true,
+            }),
+        )
+        .await;
+        assert_eq!(without_image["progress"], 0.5);
+        assert_eq!(without_image["current_image"], Value::Null);
+        assert_eq!(without_image["current_task"], "task-no-preview");
+
+        let Json(with_image) = sdapi_progress_response(state, false).await;
+        assert_eq!(with_image["current_image"], "preview-b64");
     }
 
     #[tokio::test]
@@ -6068,7 +6122,7 @@ mod tests {
 
         start_sdapi_progress(&state.sdapi_progress, &body, "txt2img", 2);
         update_sdapi_progress(&state.sdapi_progress, event, Some(preview.clone())).unwrap();
-        let Json(active) = get_progress(State(state)).await;
+        let Json(active) = sdapi_progress_response(state, false).await;
 
         assert_eq!(active["progress"], 0.5);
         assert_eq!(active["textinfo"], "sampling step 1/2");
@@ -6106,7 +6160,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, DiffusionError::Interrupted(_)));
 
-        let Json(progress) = get_progress(State(state)).await;
+        let Json(progress) = sdapi_progress_response(state, false).await;
         assert_eq!(progress["state"]["interrupted"], true);
         assert_eq!(progress["state"]["sampling_step"], 1);
         assert_eq!(progress["textinfo"], "interrupted");
