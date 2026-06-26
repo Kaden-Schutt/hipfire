@@ -63,11 +63,12 @@ enum Command {
     /// or `sampler_index` (for example `Euler` + `Karras` becomes
     /// `Euler Karras`).
     ///
-    /// SDAPI img2img and inpaint resize init and mask images to the requested
-    /// output dimensions before VAE encoding. `resize_mode` supports WebUI
-    /// modes 0 (stretch), 1 (crop and resize), and 2 (resize and fill);
-    /// mode 3 latent upscale is rejected unless no resize is needed. Masked
-    /// img2img also honors WebUI's `inpainting_mask_invert`, `mask_blur`,
+    /// SDAPI img2img and inpaint support WebUI resize modes 0 (stretch), 1
+    /// (crop and resize), 2 (resize and fill), and 3 (latent upscale). Modes
+    /// 0-2 resize init and mask images before VAE encoding; mode 3 keeps the
+    /// init image at its source dimensions, VAE-encodes it, then resizes the
+    /// latent tensor to the requested output shape. Masked img2img also honors
+    /// WebUI's `inpainting_mask_invert`, `mask_blur`,
     /// `mask_blur_x`, `mask_blur_y`, `mask_round`, and `inpainting_fill`
     /// options; default fill (0) is applied in image space before VAE encode,
     /// original (1) leaves init pixels unchanged, and latent noise (2) /

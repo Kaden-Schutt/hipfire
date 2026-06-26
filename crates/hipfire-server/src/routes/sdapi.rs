@@ -10,7 +10,8 @@ use hipfire_diffusion::{
     resize_rgb_batch_nearest, resize_rgb_batch_to_contain_fill_nearest,
     resize_rgb_batch_to_cover_nearest, DiffusionBatchOutput, DiffusionBatchRequest, DiffusionError,
     DiffusionGenerationRuntimeOptions, DiffusionHfqInspection, DiffusionImg2ImgRequest,
-    DiffusionPipeline, DiffusionProgress, DiffusionPrompt, RgbImageBatch,
+    DiffusionImg2ImgResizeMode, DiffusionPipeline, DiffusionProgress, DiffusionPrompt,
+    RgbImageBatch,
 };
 use image::{ImageEncoder, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
@@ -484,6 +485,7 @@ async fn execute_hfq_diffusion_txt2img(
                 init_image: first_pass_images,
                 mask: None,
                 inpainting_fill: None,
+                resize_mode: DiffusionImg2ImgResizeMode::Image,
                 denoising_strength: worker_body.denoising_strength.unwrap_or(0.75) as f32,
             };
             let highres_step_offset =
@@ -612,6 +614,7 @@ async fn execute_hfq_diffusion_img2img(
                 init_image: worker_init_image.clone(),
                 mask: worker_mask.clone(),
                 inpainting_fill,
+                resize_mode: sdapi_img2img_diffusion_resize_mode(&worker_body),
                 denoising_strength,
             };
             let step_offset = iter as usize * sdapi_img2img_denoise_steps(&worker_body);
@@ -1471,18 +1474,18 @@ fn sdapi_img2img_resize_image(
             target_dimensions.0,
             target_dimensions.1,
         ),
-        3 if image.width == target_dimensions.0 as usize
-            && image.height == target_dimensions.1 as usize =>
-        {
-            Ok(image)
-        }
-        3 => Err(DiffusionError::InvalidRequest(
-            "resize_mode 3 (latent upscale) is not supported for img2img target resizing yet"
-                .to_string(),
-        )),
+        3 => Ok(image),
         mode => Err(DiffusionError::InvalidRequest(format!(
             "unsupported img2img resize_mode {mode}; supported values are 0, 1, 2, and 3"
         ))),
+    }
+}
+
+fn sdapi_img2img_diffusion_resize_mode(body: &SdGenerationRequest) -> DiffusionImg2ImgResizeMode {
+    if body.resize_mode == Some(3) {
+        DiffusionImg2ImgResizeMode::Latent
+    } else {
+        DiffusionImg2ImgResizeMode::Image
     }
 }
 
@@ -1512,7 +1515,7 @@ fn sdapi_prepare_img2img_inputs(
     );
     let mask = sdapi_apply_inpainting_mask_options(body, mask)?;
     let mask = if mask.width != init_image.width || mask.height != init_image.height {
-        sdapi_img2img_resize_image(body, mask, init_dimensions)?
+        resize_rgb_batch_nearest(&mask, init_dimensions.0, init_dimensions.1)?
     } else {
         mask
     };
@@ -4232,6 +4235,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn img2img_route_accepts_resize_mode_3_latent_upscale() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-sdapi-diffusion-img2img-latent-upscale-route-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("tiny-route-diffusion-img2img-latent-upscale.hfq");
+        write_tiny_diffusion_hfq(&hfq_path);
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let body = SdGenerationRequest {
+            prompt: "a cat".to_string(),
+            model: Some(hfq_path.to_string_lossy().into_owned()),
+            steps: Some(1),
+            cfg_scale: Some(1.0),
+            width: Some(2),
+            height: Some(2),
+            send_images: Some(true),
+            save_images: Some(false),
+            init_images: Some(vec![tiny_png_base64_with_dimensions(1, 1)]),
+            mask: Some(tiny_mask_png_base64(1, 1)),
+            resize_mode: Some(3),
+            inpaint_full_res: Some(json!(false)),
+            denoising_strength: Some(1.0),
+            ..empty_request()
+        };
+
+        let response = post_img2img(State(state), Json(body)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+
+        let images = body["images"].as_array().unwrap();
+        assert_eq!(images.len(), 1);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(images[0].as_str().unwrap())
+            .unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap().to_rgb8();
+        assert_eq!(decoded.dimensions(), (2, 2));
+        let info = serde_json::from_str::<Value>(body["info"].as_str().unwrap()).unwrap();
+        assert_eq!(info["mode"], "img2img");
+        assert_eq!(info["masked"], true);
+        assert_eq!(info["resize_mode"], "latent");
+        assert_eq!(info["latent_resize"], true);
+        assert_eq!(info["width"], 2);
+        assert_eq!(info["height"], 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn img2img_route_composites_full_res_inpaint_crop() {
         let dir = std::env::temp_dir().join(format!(
             "hipfire-sdapi-diffusion-img2img-full-res-inpaint-test-{}",
@@ -5680,8 +5732,12 @@ mod tests {
             resize_mode: Some(3),
             ..empty_request()
         };
-        let error = sdapi_img2img_resize_image(&latent_upscale, image, (4, 4)).unwrap_err();
-        assert!(error.to_string().contains("latent upscale"));
+        let latent = sdapi_img2img_resize_image(&latent_upscale, image.clone(), (4, 4)).unwrap();
+        assert_eq!(latent, image);
+        assert_eq!(
+            sdapi_img2img_diffusion_resize_mode(&latent_upscale),
+            DiffusionImg2ImgResizeMode::Latent
+        );
     }
 
     #[test]

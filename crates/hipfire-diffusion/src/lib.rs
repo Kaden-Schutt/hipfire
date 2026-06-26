@@ -360,7 +360,17 @@ pub struct DiffusionImg2ImgRequest {
     pub mask: Option<RgbImageBatch>,
     #[serde(default)]
     pub inpainting_fill: Option<u32>,
+    #[serde(default)]
+    pub resize_mode: DiffusionImg2ImgResizeMode,
     pub denoising_strength: f32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffusionImg2ImgResizeMode {
+    #[default]
+    Image,
+    Latent,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -4399,13 +4409,27 @@ impl DiffusionPipeline {
             )
         })?;
         let mut generation_runtime_kind = runtime.kind;
-        let init_image =
+        let expanded_init_image =
             expand_rgb_batch_for_prompts(&request.init_image, request.batch.prompts.len())?;
-        let init_image =
-            resize_rgb_batch_nearest(&init_image, request.batch.width, request.batch.height)?;
-        let (init_latents, init_encode_kind) =
+        let init_image = match request.resize_mode {
+            DiffusionImg2ImgResizeMode::Image => resize_rgb_batch_nearest(
+                &expanded_init_image,
+                request.batch.width,
+                request.batch.height,
+            )?,
+            DiffusionImg2ImgResizeMode::Latent => expanded_init_image,
+        };
+        let (encoded_init_latents, init_encode_kind) =
             encode_to_latents_with_runtime_options(encoder, &init_image, runtime_options)?;
         generation_runtime_kind = merge_runtime_kind(generation_runtime_kind, init_encode_kind);
+        let init_latents = match request.resize_mode {
+            DiffusionImg2ImgResizeMode::Image => encoded_init_latents,
+            DiffusionImg2ImgResizeMode::Latent => resize_latent_batch_nearest(
+                &encoded_init_latents,
+                plan.latent_shape.height,
+                plan.latent_shape.width,
+            )?,
+        };
         let mut denoise_init_latents = init_latents.clone();
         if denoise_init_latents.batch != plan.latent_shape.batch
             || denoise_init_latents.channels != plan.latent_shape.channels
@@ -4430,10 +4454,30 @@ impl DiffusionPipeline {
         let schedule = plan.schedule.slice_from_step(start_step)?;
         let expanded_mask = if let Some(mask) = request.mask.as_ref() {
             let mask = expand_rgb_batch_for_prompts(mask, request.batch.prompts.len())?;
+            let target_width = match request.resize_mode {
+                DiffusionImg2ImgResizeMode::Image => request.batch.width,
+                DiffusionImg2ImgResizeMode::Latent => {
+                    u32::try_from(init_image.width).map_err(|_| {
+                        DiffusionError::InvalidRequest(
+                            "init image width is out of range".to_string(),
+                        )
+                    })?
+                }
+            };
+            let target_height = match request.resize_mode {
+                DiffusionImg2ImgResizeMode::Image => request.batch.height,
+                DiffusionImg2ImgResizeMode::Latent => {
+                    u32::try_from(init_image.height).map_err(|_| {
+                        DiffusionError::InvalidRequest(
+                            "init image height is out of range".to_string(),
+                        )
+                    })?
+                }
+            };
             Some(resize_rgb_batch_nearest(
                 &mask,
-                request.batch.width,
-                request.batch.height,
+                target_width,
+                target_height,
             )?)
         } else {
             None
@@ -4546,6 +4590,13 @@ impl DiffusionPipeline {
             map.insert("start_step".to_string(), json!(start_step));
             map.insert("denoise_steps".to_string(), json!(schedule.timesteps.len()));
             map.insert("masked".to_string(), json!(masked));
+            if request.resize_mode == DiffusionImg2ImgResizeMode::Latent {
+                map.insert(
+                    "resize_mode".to_string(),
+                    Value::String("latent".to_string()),
+                );
+                map.insert("latent_resize".to_string(), json!(true));
+            }
             if request.inpainting_fill.is_some() || applied_inpainting_fill {
                 map.insert("inpainting_fill".to_string(), json!(inpainting_fill));
             }
@@ -13282,6 +13333,15 @@ fn build_inpaint_conditioning_if_supported(
         masked_rgb_batch_for_inpaint_with_runtime_options(init_image, mask, runtime_options)?;
     let (masked_image_latents, masked_latents_kind) =
         encode_to_latents_with_runtime_options(encoder, &masked_image, runtime_options)?;
+    let masked_image_latents = if masked_image_latents.batch == latents.batch
+        && masked_image_latents.channels == latents.channels
+        && (masked_image_latents.height != latents.height
+            || masked_image_latents.width != latents.width)
+    {
+        resize_latent_batch_nearest(&masked_image_latents, latents.height, latents.width)?
+    } else {
+        masked_image_latents
+    };
     if masked_image_latents.batch != latents.batch
         || masked_image_latents.channels != latents.channels
         || masked_image_latents.height != latents.height
@@ -13511,6 +13571,77 @@ pub fn resize_rgb_batch_nearest(
         batch: image.batch,
         width: target_width,
         height: target_height,
+        data,
+    })
+}
+
+fn resize_latent_batch_nearest(
+    latents: &LatentBatch,
+    target_height: usize,
+    target_width: usize,
+) -> DiffusionResult<LatentBatch> {
+    if target_width == 0 || target_height == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "target latent dimensions must be positive".to_string(),
+        ));
+    }
+    if latents.width == 0 || latents.height == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "source latent dimensions must be positive".to_string(),
+        ));
+    }
+    let source_values = latents
+        .batch
+        .checked_mul(latents.channels)
+        .and_then(|values| values.checked_mul(latents.height))
+        .and_then(|values| values.checked_mul(latents.width))
+        .ok_or_else(|| DiffusionError::InvalidRequest("latent dimensions overflow".to_string()))?;
+    if latents.data.len() != source_values {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "latent batch has {} values, expected {source_values}",
+            latents.data.len()
+        )));
+    }
+    if latents.width == target_width && latents.height == target_height {
+        return Ok(latents.clone());
+    }
+    let target_values = latents
+        .batch
+        .checked_mul(latents.channels)
+        .and_then(|values| values.checked_mul(target_height))
+        .and_then(|values| values.checked_mul(target_width))
+        .ok_or_else(|| {
+            DiffusionError::InvalidRequest("target latent dimensions overflow".to_string())
+        })?;
+    let mut data = vec![0.0f32; target_values];
+    let source_image_values = latents.channels * latents.height * latents.width;
+    let target_image_values = latents.channels * target_height * target_width;
+    for batch_idx in 0..latents.batch {
+        let source_batch_offset = batch_idx * source_image_values;
+        let target_batch_offset = batch_idx * target_image_values;
+        for channel in 0..latents.channels {
+            let source_channel_offset =
+                source_batch_offset + channel * latents.height * latents.width;
+            let target_channel_offset =
+                target_batch_offset + channel * target_height * target_width;
+            for y in 0..target_height {
+                let source_y =
+                    (y * latents.height / target_height).min(latents.height.saturating_sub(1));
+                for x in 0..target_width {
+                    let source_x =
+                        (x * latents.width / target_width).min(latents.width.saturating_sub(1));
+                    let source_idx = source_channel_offset + source_y * latents.width + source_x;
+                    let target_idx = target_channel_offset + y * target_width + x;
+                    data[target_idx] = latents.data[source_idx];
+                }
+            }
+        }
+    }
+    Ok(LatentBatch {
+        batch: latents.batch,
+        channels: latents.channels,
+        height: target_height,
+        width: target_width,
         data,
     })
 }
@@ -20529,6 +20660,7 @@ mod tests {
             init_image: tiny_rgb_image_batch(1, 2, 2),
             mask: Some(tiny_mask_image_batch(1, 2, 2)),
             inpainting_fill: None,
+            resize_mode: DiffusionImg2ImgResizeMode::Image,
             denoising_strength: 1.0,
         };
 
@@ -20572,6 +20704,7 @@ mod tests {
             init_image: tiny_rgb_image_batch(1, 1, 1),
             mask: Some(tiny_mask_image_batch(1, 1, 1)),
             inpainting_fill: None,
+            resize_mode: DiffusionImg2ImgResizeMode::Image,
             denoising_strength: 1.0,
         };
 
@@ -20589,6 +20722,87 @@ mod tests {
         let decoded = image::load_from_memory(&bytes).unwrap().to_rgb8();
         assert_eq!(decoded.dimensions(), (2, 2));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diffusion_pipeline_img2img_latent_resize_mode_resizes_encoded_latents() {
+        let (pipeline, called, dir) = tiny_inpaint_test_pipeline(
+            "hipfire-diffusion-inpaint-latent-resize-routing-test",
+            Box::new(TestImageDecoder),
+        );
+        let request = DiffusionImg2ImgRequest {
+            batch: DiffusionBatchRequest {
+                prompts: vec![DiffusionPrompt {
+                    prompt: "a cat".into(),
+                    negative_prompt: String::new(),
+                    seed: 7,
+                    subseed: None,
+                }],
+                width: 2,
+                height: 2,
+                original_width: None,
+                original_height: None,
+                target_width: None,
+                target_height: None,
+                crop_x: 0,
+                crop_y: 0,
+                steps: 2,
+                cfg_scale: 7.0,
+                scheduler: "Euler".into(),
+                subseed_strength: 0.0,
+                send_images: true,
+                save_images: false,
+            },
+            init_image: tiny_rgb_image_batch(1, 1, 1),
+            mask: Some(tiny_mask_image_batch(1, 1, 1)),
+            inpainting_fill: None,
+            resize_mode: DiffusionImg2ImgResizeMode::Latent,
+            denoising_strength: 1.0,
+        };
+
+        let output = pipeline.generate_img2img_batch(request).unwrap();
+
+        assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(output.images.len(), 1);
+        assert_eq!(output.info["mode"], "img2img");
+        assert_eq!(output.info["masked"], true);
+        assert_eq!(output.info["resize_mode"], "latent");
+        assert_eq!(output.info["latent_resize"], true);
+        assert_eq!(output.info["width"], 2);
+        assert_eq!(output.info["height"], 2);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&output.images[0])
+            .unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap().to_rgb8();
+        assert_eq!(decoded.dimensions(), (2, 2));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resize_latent_batch_nearest_resizes_spatial_axes_per_channel() {
+        let latents = LatentBatch {
+            batch: 1,
+            channels: 2,
+            height: 2,
+            width: 2,
+            data: vec![
+                1.0, 2.0, //
+                3.0, 4.0, //
+                10.0, 20.0, //
+                30.0, 40.0,
+            ],
+        };
+
+        let resized = resize_latent_batch_nearest(&latents, 1, 4).unwrap();
+
+        assert_eq!(resized.batch, 1);
+        assert_eq!(resized.channels, 2);
+        assert_eq!(resized.height, 1);
+        assert_eq!(resized.width, 4);
+        assert_eq!(
+            resized.data,
+            vec![1.0, 1.0, 2.0, 2.0, 10.0, 10.0, 20.0, 20.0]
+        );
     }
 
     #[test]
@@ -20674,6 +20888,7 @@ mod tests {
             init_image: tiny_rgb_image_batch(1, 2, 2),
             mask: Some(tiny_mask_image_batch(1, 2, 2)),
             inpainting_fill: None,
+            resize_mode: DiffusionImg2ImgResizeMode::Image,
             denoising_strength: 1.0,
         };
 
@@ -21280,6 +21495,7 @@ mod tests {
             },
             mask: None,
             inpainting_fill: None,
+            resize_mode: DiffusionImg2ImgResizeMode::Image,
             denoising_strength: 1.0,
         };
 
@@ -22220,6 +22436,7 @@ mod tests {
             init_image: tiny_rgb_image_batch(1, 64, 64),
             mask: Some(tiny_mask_image_batch(1, 64, 64)),
             inpainting_fill: None,
+            resize_mode: DiffusionImg2ImgResizeMode::Image,
             denoising_strength: 1.0,
         };
 

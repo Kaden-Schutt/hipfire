@@ -502,6 +502,7 @@ fn generate_highres_txt2img(
             init_image,
             mask: None,
             inpainting_fill: None,
+            resize_mode: Default::default(),
             denoising_strength: args.hr_denoising_strength,
         },
         runtime_options,
@@ -671,6 +672,7 @@ fn run_img2img(args: DiffusionImg2ImgArgs) -> anyhow::Result<()> {
         init_image,
         mask,
         inpainting_fill: None,
+        resize_mode: Default::default(),
         denoising_strength: args.denoising_strength,
     };
     let pipeline = DiffusionPipeline::open_hfq(&args.model)?;
@@ -725,6 +727,7 @@ fn run_smoke(args: DiffusionSmokeArgs) -> anyhow::Result<()> {
             init_image: init_image.clone(),
             mask: None,
             inpainting_fill: None,
+            resize_mode: Default::default(),
             denoising_strength: args.denoising_strength,
         };
         let img2img_output = pipeline
@@ -747,6 +750,7 @@ fn run_smoke(args: DiffusionSmokeArgs) -> anyhow::Result<()> {
                 init_image,
                 mask: Some(mask),
                 inpainting_fill: None,
+                resize_mode: Default::default(),
                 denoising_strength: args.denoising_strength,
             };
             let masked_output = pipeline
