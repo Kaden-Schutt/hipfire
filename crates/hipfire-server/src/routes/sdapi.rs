@@ -1186,6 +1186,10 @@ fn sdapi_infotext_f64(parsed: &SdapiParsedInfotext, key: &str) -> Option<f64> {
 
 fn sdapi_infotext_dimensions(parsed: &SdapiParsedInfotext, key: &str) -> Option<(u32, u32)> {
     let value = sdapi_infotext_value(parsed, key)?;
+    sdapi_infotext_split_dimensions(value)
+}
+
+fn sdapi_infotext_split_dimensions(value: &str) -> Option<(u32, u32)> {
     let (width, height) = value.split_once('x').or_else(|| value.split_once('X'))?;
     Some((width.trim().parse().ok()?, height.trim().parse().ok()?))
 }
@@ -3100,11 +3104,90 @@ pub async fn post_png_info(Json(body): Json<Value>) -> Json<Value> {
         .and_then(|image| decode_base64_image_payload(image).ok())
         .and_then(|bytes| extract_png_text_chunk(&bytes, "parameters").ok().flatten())
         .unwrap_or_default();
+    let parameters = sdapi_png_info_parameters(&info);
     Json(json!({
         "info": info,
         "items": {},
-        "parameters": {},
+        "parameters": parameters,
     }))
+}
+
+fn sdapi_png_info_parameters(info: &str) -> Value {
+    let Some(parsed) = sdapi_parse_infotext(info) else {
+        return json!({});
+    };
+    let mut parameters = serde_json::Map::new();
+    parameters.insert("Prompt".to_string(), json!(parsed.prompt));
+    parameters.insert("Negative prompt".to_string(), json!(parsed.negative_prompt));
+    for (key, value) in parsed.params {
+        if let Some((width, height)) = sdapi_infotext_split_dimensions(&value) {
+            parameters.insert(format!("{key}-1"), json!(width));
+            parameters.insert(format!("{key}-2"), json!(height));
+        } else {
+            parameters.insert(key, json!(value));
+        }
+    }
+    parameters
+        .entry("Clip skip".to_string())
+        .or_insert_with(|| json!("1"));
+    parameters
+        .entry("Hires resize-1".to_string())
+        .or_insert_with(|| json!(0));
+    parameters
+        .entry("Hires resize-2".to_string())
+        .or_insert_with(|| json!(0));
+    parameters
+        .entry("Hires sampler".to_string())
+        .or_insert_with(|| json!("Use same sampler"));
+    parameters
+        .entry("Hires schedule type".to_string())
+        .or_insert_with(|| json!("Use same scheduler"));
+    parameters
+        .entry("Hires checkpoint".to_string())
+        .or_insert_with(|| json!("Use same checkpoint"));
+    parameters
+        .entry("Hires prompt".to_string())
+        .or_insert_with(|| json!(""));
+    parameters
+        .entry("Hires negative prompt".to_string())
+        .or_insert_with(|| json!(""));
+    parameters
+        .entry("Mask mode".to_string())
+        .or_insert_with(|| json!("Inpaint masked"));
+    parameters
+        .entry("Masked content".to_string())
+        .or_insert_with(|| json!("original"));
+    parameters
+        .entry("Inpaint area".to_string())
+        .or_insert_with(|| json!("Whole picture"));
+    parameters
+        .entry("Masked area padding".to_string())
+        .or_insert_with(|| json!(32));
+    parameters
+        .entry("RNG".to_string())
+        .or_insert_with(|| json!("GPU"));
+    parameters
+        .entry("Schedule type".to_string())
+        .or_insert_with(|| json!("Automatic"));
+    parameters
+        .entry("Schedule max sigma".to_string())
+        .or_insert_with(|| json!(0));
+    parameters
+        .entry("Schedule min sigma".to_string())
+        .or_insert_with(|| json!(0));
+    parameters
+        .entry("Schedule rho".to_string())
+        .or_insert_with(|| json!(0));
+    parameters
+        .entry("VAE Encoder".to_string())
+        .or_insert_with(|| json!("Full"));
+    parameters
+        .entry("VAE Decoder".to_string())
+        .or_insert_with(|| json!("Full"));
+    parameters
+        .entry("FP8 weight".to_string())
+        .or_insert_with(|| json!("Disable"));
+    Value::Object(parameters)
 }
 
 pub async fn get_progress(State(state): State<SharedState>) -> Json<Value> {
@@ -3679,6 +3762,13 @@ mod tests {
         let Json(png_info) = post_png_info(Json(json!({"image": image}))).await;
         assert!(png_info["info"].as_str().unwrap().contains("a cat"));
         assert!(png_info["info"].as_str().unwrap().contains("Steps: 1"));
+        assert_eq!(png_info["parameters"]["Prompt"], "a cat");
+        assert_eq!(png_info["parameters"]["Negative prompt"], "");
+        assert_eq!(png_info["parameters"]["Steps"], "1");
+        assert_eq!(png_info["parameters"]["CFG scale"], "1");
+        assert_eq!(png_info["parameters"]["Size-1"], 2);
+        assert_eq!(png_info["parameters"]["Size-2"], 2);
+        assert_eq!(png_info["parameters"]["Schedule type"], "Automatic");
         assert_eq!(body["parameters"]["prompt"], "a cat");
         assert_eq!(
             serde_json::from_str::<Value>(body["info"].as_str().unwrap()).unwrap()["backend"],
@@ -4915,6 +5005,37 @@ mod tests {
             Some("prompt\nSteps: 1".to_string())
         );
         assert!(image::load_from_memory(&annotated).is_ok());
+    }
+
+    #[tokio::test]
+    async fn png_info_returns_structured_generation_parameters() {
+        let image = tiny_png_base64();
+        let bytes = decode_base64_image_payload(&image).unwrap();
+        let infotext = "a cat, cinematic\nNegative prompt: blurry, low quality\nSteps: 8, Sampler: Euler a, CFG scale: 4.5, Seed: 123, Size: 512x768, Hires prompt: \"sharp, detailed\"";
+        let annotated = insert_png_text_chunk(&bytes, "parameters", infotext).unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(annotated);
+
+        let Json(response) = post_png_info(Json(json!({"image": encoded}))).await;
+
+        assert_eq!(response["info"], infotext);
+        assert_eq!(response["parameters"]["Prompt"], "a cat, cinematic");
+        assert_eq!(
+            response["parameters"]["Negative prompt"],
+            "blurry, low quality"
+        );
+        assert_eq!(response["parameters"]["Steps"], "8");
+        assert_eq!(response["parameters"]["Sampler"], "Euler a");
+        assert_eq!(response["parameters"]["CFG scale"], "4.5");
+        assert_eq!(response["parameters"]["Seed"], "123");
+        assert_eq!(response["parameters"]["Size-1"], 512);
+        assert_eq!(response["parameters"]["Size-2"], 768);
+        assert_eq!(response["parameters"]["Hires prompt"], "sharp, detailed");
+        assert_eq!(response["parameters"]["Clip skip"], "1");
+        assert_eq!(
+            response["parameters"]["Hires checkpoint"],
+            "Use same checkpoint"
+        );
+        assert_eq!(response["items"], json!({}));
     }
 
     #[tokio::test]
