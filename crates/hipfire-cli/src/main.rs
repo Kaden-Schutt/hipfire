@@ -60,8 +60,10 @@ enum Command {
     /// mode 3 latent upscale is rejected unless no resize is needed. Masked
     /// img2img also honors WebUI's `inpainting_mask_invert`, `mask_blur`,
     /// `mask_blur_x`, `mask_blur_y`, `mask_round`, and `inpainting_fill`
-    /// options; latent noise (2) and latent nothing (3) modes are applied in
-    /// latent space. WebUI's `inpaint_full_res` and
+    /// options; default fill (0) is applied in image space before VAE encode,
+    /// original (1) leaves init pixels unchanged, and latent noise (2) /
+    /// latent nothing (3) additionally alter masked latents. WebUI's
+    /// `inpaint_full_res` and
     /// `inpaint_full_res_padding` crop masked regions for processing and
     /// composite the generated crop back onto the init image. Txt2img high-res
     /// generation is implemented as a batched first-pass txt2img

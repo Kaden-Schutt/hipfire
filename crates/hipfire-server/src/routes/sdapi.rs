@@ -12,7 +12,7 @@ use hipfire_diffusion::{
     DiffusionGenerationRuntimeOptions, DiffusionHfqInspection, DiffusionImg2ImgRequest,
     DiffusionPipeline, DiffusionProgress, DiffusionPrompt, RgbImageBatch,
 };
-use image::ImageEncoder;
+use image::{ImageEncoder, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
@@ -49,6 +49,7 @@ struct SdapiPreparedImg2Img {
     mask: Option<RgbImageBatch>,
     processing_dimensions: (u32, u32),
     full_res_plan: Option<SdapiInpaintFullResPlan>,
+    image_fill_applied: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -637,6 +638,11 @@ async fn execute_hfq_diffusion_img2img(
         .ok()
         .and_then(|output| output.images.first().cloned());
     let output = output.and_then(|mut output| {
+        sdapi_annotate_img2img_inpainting_info(
+            &mut output,
+            prepared.image_fill_applied,
+            inpainting_fill,
+        );
         if let Some(plan) = prepared.full_res_plan.as_ref() {
             apply_sdapi_inpaint_full_res_output(&mut output, plan)?;
         }
@@ -1085,8 +1091,10 @@ fn sdapi_prepare_img2img_inputs(
             mask: None,
             processing_dimensions: target_dimensions,
             full_res_plan: None,
+            image_fill_applied: false,
         });
     };
+    let inpainting_fill = sdapi_inpainting_fill(body)?;
     let init_dimensions = (
         u32::try_from(init_image.width).map_err(|_| {
             DiffusionError::InvalidRequest("init image width is out of range".to_string())
@@ -1111,17 +1119,23 @@ fn sdapi_prepare_img2img_inputs(
             )?;
             let cropped_init = sdapi_crop_rgb_batch(&init_image, crop_region)?;
             let cropped_mask = sdapi_crop_rgb_batch(&mask, crop_region)?;
-            return Ok(SdapiPreparedImg2Img {
-                init_image: resize_rgb_batch_to_contain_fill_nearest(
+            let prepared_mask = resize_rgb_batch_to_contain_fill_nearest(
+                &cropped_mask,
+                target_dimensions.0,
+                target_dimensions.1,
+            )?;
+            let (prepared_init, image_fill_applied) = sdapi_apply_inpainting_fill_to_init_image(
+                resize_rgb_batch_to_contain_fill_nearest(
                     &cropped_init,
                     target_dimensions.0,
                     target_dimensions.1,
                 )?,
-                mask: Some(resize_rgb_batch_to_contain_fill_nearest(
-                    &cropped_mask,
-                    target_dimensions.0,
-                    target_dimensions.1,
-                )?),
+                &prepared_mask,
+                inpainting_fill,
+            )?;
+            return Ok(SdapiPreparedImg2Img {
+                init_image: prepared_init,
+                mask: Some(prepared_mask),
                 processing_dimensions: target_dimensions,
                 full_res_plan: Some(SdapiInpaintFullResPlan {
                     base_image: init_image,
@@ -1129,6 +1143,7 @@ fn sdapi_prepare_img2img_inputs(
                     paste_region: crop_region,
                     padding,
                 }),
+                image_fill_applied,
             });
         }
         return Ok(SdapiPreparedImg2Img {
@@ -1136,13 +1151,21 @@ fn sdapi_prepare_img2img_inputs(
             mask: None,
             processing_dimensions: target_dimensions,
             full_res_plan: None,
+            image_fill_applied: false,
         });
     }
+    let prepared_mask = sdapi_img2img_resize_image(body, mask, target_dimensions)?;
+    let (prepared_init, image_fill_applied) = sdapi_apply_inpainting_fill_to_init_image(
+        sdapi_img2img_resize_image(body, init_image, target_dimensions)?,
+        &prepared_mask,
+        inpainting_fill,
+    )?;
     Ok(SdapiPreparedImg2Img {
-        init_image: sdapi_img2img_resize_image(body, init_image, target_dimensions)?,
-        mask: Some(sdapi_img2img_resize_image(body, mask, target_dimensions)?),
+        init_image: prepared_init,
+        mask: Some(prepared_mask),
         processing_dimensions: target_dimensions,
         full_res_plan: None,
+        image_fill_applied,
     })
 }
 
@@ -1471,6 +1494,134 @@ fn sdapi_apply_inpainting_mask_options(
         mask = sdapi_blur_mask(mask, blur_x, blur_y)?;
     }
     Ok(mask)
+}
+
+fn sdapi_apply_inpainting_fill_to_init_image(
+    mut init_image: RgbImageBatch,
+    mask: &RgbImageBatch,
+    inpainting_fill: Option<u32>,
+) -> Result<(RgbImageBatch, bool), DiffusionError> {
+    sdapi_validate_rgb_batch_len(&init_image, "init image")?;
+    sdapi_validate_rgb_batch_len(mask, "mask")?;
+    if init_image.width != mask.width || init_image.height != mask.height {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "inpainting_fill mask dimensions {}x{} do not match init image {}x{}",
+            mask.width, mask.height, init_image.width, init_image.height
+        )));
+    }
+    if mask.batch != 1 && mask.batch != init_image.batch {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "inpainting_fill mask batch {} must be 1 or match init image batch {}",
+            mask.batch, init_image.batch
+        )));
+    }
+    let mode = inpainting_fill.unwrap_or(0);
+    if mode == 1 {
+        return Ok((init_image, false));
+    }
+
+    let width = u32::try_from(init_image.width).map_err(|_| {
+        DiffusionError::InvalidRequest("init image width is out of range".to_string())
+    })?;
+    let height = u32::try_from(init_image.height).map_err(|_| {
+        DiffusionError::InvalidRequest("init image height is out of range".to_string())
+    })?;
+    for batch in 0..init_image.batch {
+        let mask_batch = if mask.batch == 1 { 0 } else { batch };
+        let mut masked = RgbaImage::new(width, height);
+        for y in 0..init_image.height {
+            for x in 0..init_image.width {
+                let mask_luma = sdapi_mask_luma(mask, mask_batch, x, y);
+                let alpha = 255u8.saturating_sub(mask_luma);
+                let mut rgba = [0u8; 4];
+                for (channel, value) in rgba.iter_mut().take(3).enumerate() {
+                    let source =
+                        init_image.data[sdapi_rgb_index(&init_image, batch, x, y, channel)];
+                    *value = ((source as u16 * alpha as u16 + 127) / 255) as u8;
+                }
+                rgba[3] = alpha;
+                masked.put_pixel(x as u32, y as u32, Rgba(rgba));
+            }
+        }
+
+        let mut filled = RgbaImage::new(width, height);
+        for (sigma, repeats) in [
+            (256.0f32, 1usize),
+            (64.0, 1),
+            (16.0, 2),
+            (4.0, 4),
+            (2.0, 2),
+            (0.0, 1),
+        ] {
+            let blurred = if sigma == 0.0 {
+                masked.clone()
+            } else {
+                image::imageops::blur(&masked, sigma)
+            };
+            for _ in 0..repeats {
+                sdapi_alpha_composite_premul(&mut filled, &blurred);
+            }
+        }
+
+        for y in 0..init_image.height {
+            for x in 0..init_image.width {
+                let pixel = filled.get_pixel(x as u32, y as u32).0;
+                let alpha = pixel[3] as u16;
+                for (channel, value) in pixel.iter().take(3).enumerate() {
+                    let target = sdapi_rgb_index(&init_image, batch, x, y, channel);
+                    if alpha == 0 {
+                        continue;
+                    }
+                    init_image.data[target] =
+                        ((*value as u16 * 255 + alpha / 2) / alpha).min(255) as u8;
+                }
+            }
+        }
+    }
+
+    Ok((init_image, true))
+}
+
+fn sdapi_alpha_composite_premul(target: &mut RgbaImage, source: &RgbaImage) {
+    for (target_pixel, source_pixel) in target.pixels_mut().zip(source.pixels()) {
+        let source = source_pixel.0;
+        let target = &mut target_pixel.0;
+        let inverse_alpha = 255u16.saturating_sub(source[3] as u16);
+        for channel in 0..3 {
+            target[channel] = (source[channel] as u16
+                + ((target[channel] as u16 * inverse_alpha + 127) / 255))
+                .min(255) as u8;
+        }
+        target[3] =
+            (source[3] as u16 + ((target[3] as u16 * inverse_alpha + 127) / 255)).min(255) as u8;
+    }
+}
+
+fn sdapi_mask_luma(mask: &RgbImageBatch, batch: usize, x: usize, y: usize) -> u8 {
+    let base = sdapi_rgb_index(mask, batch, x, y, 0);
+    ((mask.data[base] as u16 + mask.data[base + 1] as u16 + mask.data[base + 2] as u16 + 1) / 3)
+        as u8
+}
+
+fn sdapi_annotate_img2img_inpainting_info(
+    output: &mut DiffusionBatchOutput,
+    image_fill_applied: bool,
+    inpainting_fill: Option<u32>,
+) {
+    if !image_fill_applied {
+        return;
+    }
+    let Value::Object(map) = &mut output.info else {
+        return;
+    };
+    let mode = inpainting_fill.unwrap_or(0);
+    map.insert("inpainting_fill".to_string(), json!(mode));
+    if mode == 0 {
+        map.insert(
+            "masked_content".to_string(),
+            Value::String("fill".to_string()),
+        );
+    }
 }
 
 fn sdapi_mask_round(body: &SdGenerationRequest) -> bool {
@@ -3506,6 +3657,8 @@ mod tests {
         assert_eq!(info["masked"], true);
         assert_eq!(info["width"], 2);
         assert_eq!(info["height"], 2);
+        assert_eq!(info["inpainting_fill"], 0);
+        assert_eq!(info["masked_content"], "fill");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4930,6 +5083,35 @@ mod tests {
         assert!(blurred.data[9] > 0);
         assert!(blurred.data[12] < 255);
         assert!(blurred.data[21] > 0);
+    }
+
+    #[test]
+    fn img2img_image_fill_uses_webui_default_and_respects_original_mode() {
+        let init_image = RgbImageBatch {
+            batch: 1,
+            width: 3,
+            height: 1,
+            data: vec![255, 0, 0, 0, 255, 0, 0, 0, 255],
+        };
+        let mask = RgbImageBatch {
+            batch: 1,
+            width: 3,
+            height: 1,
+            data: vec![0, 0, 0, 255, 255, 255, 0, 0, 0],
+        };
+
+        let (filled, applied) =
+            sdapi_apply_inpainting_fill_to_init_image(init_image.clone(), &mask, None).unwrap();
+
+        assert!(applied);
+        assert_eq!(&filled.data[0..3], &[255, 0, 0]);
+        assert_eq!(&filled.data[6..9], &[0, 0, 255]);
+        assert_ne!(&filled.data[3..6], &[0, 255, 0]);
+
+        let (original, applied) =
+            sdapi_apply_inpainting_fill_to_init_image(init_image.clone(), &mask, Some(1)).unwrap();
+        assert!(!applied);
+        assert_eq!(original.data, init_image.data);
     }
 
     #[test]
