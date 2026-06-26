@@ -16039,6 +16039,114 @@ mod tests {
     }
 
     #[test]
+    fn imports_qwen_image_edit_transformer_metadata_and_shards() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-diffusion-qwen-image-edit-import-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let source = dir.join("snapshot");
+        fs::create_dir_all(source.join("text_encoder")).unwrap();
+        fs::create_dir_all(source.join("tokenizer")).unwrap();
+        fs::create_dir_all(source.join("transformer")).unwrap();
+        fs::create_dir_all(source.join("vae")).unwrap();
+        fs::create_dir_all(source.join("scheduler")).unwrap();
+        fs::write(
+            source.join("model_index.json"),
+            br#"{"_class_name":"QwenImageEditPipeline","processor":["transformers","Qwen2VLProcessor"],"text_encoder":["transformers","Qwen2_5_VLForConditionalGeneration"],"tokenizer":["transformers","Qwen2Tokenizer"],"transformer":["diffusers","QwenImageTransformer2DModel"],"vae":["diffusers","AutoencoderKLQwenImage"],"scheduler":["diffusers","FlowMatchEulerDiscreteScheduler"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("text_encoder/config.json"),
+            br#"{"_class_name":"Qwen2_5_VLForConditionalGeneration","hidden_size":3584}"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("tokenizer/vocab.json"),
+            br#"{"<|endoftext|>":0}"#,
+        )
+        .unwrap();
+        fs::write(source.join("tokenizer/merges.txt"), b"#version: 0.2\n").unwrap();
+        fs::write(
+            source.join("transformer/config.json"),
+            br#"{"_class_name":"QwenImageTransformer2DModel","in_channels":64,"out_channels":16,"num_layers":60,"num_attention_heads":24,"attention_head_dim":128,"joint_attention_dim":3584}"#,
+        )
+        .unwrap();
+        write_safetensors_fixture(
+            &source.join("transformer/diffusion_pytorch_model-00001-of-00002.safetensors"),
+            &[(
+                "patch_embed.proj.weight",
+                "F32",
+                &[1],
+                &[0x00, 0x00, 0xc0, 0x3f],
+            )],
+        );
+        write_safetensors_fixture(
+            &source.join("transformer/diffusion_pytorch_model-00002-of-00002.safetensors"),
+            &[("norm_out.weight", "F32", &[1], &[0x00, 0x00, 0x20, 0x40])],
+        );
+        fs::write(
+            source.join("transformer/diffusion_pytorch_model.safetensors.index.json"),
+            serde_json::to_vec(&json!({
+                "metadata": {"total_size": 8},
+                "weight_map": {
+                    "patch_embed.proj.weight": "diffusion_pytorch_model-00001-of-00002.safetensors",
+                    "norm_out.weight": "diffusion_pytorch_model-00002-of-00002.safetensors"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            source.join("vae/config.json"),
+            br#"{"_class_name":"AutoencoderKLQwenImage","z_dim":16,"latents_mean":[-0.7571],"latents_std":[2.8184]}"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("scheduler/scheduler_config.json"),
+            br#"{"_class_name":"FlowMatchEulerDiscreteScheduler","num_train_timesteps":1000,"shift":1.0,"shift_terminal":0.02,"use_dynamic_shifting":true,"time_shift_type":"exponential"}"#,
+        )
+        .unwrap();
+
+        let output = dir.join("qwen-image-edit.hfq");
+        let summary = import_diffusers_to_hfq(DiffusersImportOptions {
+            source,
+            output: output.clone(),
+            model_name: Some("qwen-image-edit".into()),
+            max_batch: 2,
+            metadata_only: false,
+        })
+        .unwrap();
+        let hfq = HfqFile::open_index_only(&output).unwrap();
+        let metadata = parse_diffusion_metadata(&hfq.metadata_json).unwrap();
+        let config = StableDiffusionConfig::from_hfq(&hfq, &metadata).unwrap();
+        let transformer = config.transformer.as_ref().unwrap();
+        let entries = &metadata.components["transformer"].weight_entries;
+
+        assert_eq!(summary.pipeline_class, "QwenImageEditPipeline");
+        assert_eq!(metadata.pipeline.latent_channels, Some(16));
+        assert_eq!(metadata.batch.max_batch, 2);
+        assert_eq!(metadata.tokenizer.entries.len(), 2);
+        assert_eq!(transformer.class_name, "QwenImageTransformer2DModel");
+        assert_eq!(transformer.in_channels, Some(64));
+        assert_eq!(transformer.out_channels, Some(16));
+        assert_eq!(transformer.cross_attention_dim, Some(3584));
+        assert_eq!(transformer.num_layers, Some(60));
+        assert_eq!(entries.len(), 2);
+        assert!(entries.contains(&"transformer/tensors/patch_embed.proj.weight".to_string()));
+        assert!(entries.contains(&"transformer/tensors/norm_out.weight".to_string()));
+        let patch_embed =
+            CpuTensor::from_hfq(&hfq, "transformer/tensors/patch_embed.proj.weight").unwrap();
+        let norm_out = CpuTensor::from_hfq(&hfq, "transformer/tensors/norm_out.weight").unwrap();
+        assert_eq!(patch_embed.data, vec![1.5]);
+        assert_eq!(norm_out.data, vec![2.5]);
+        assert!(hfq
+            .tensor_data_vec("transformer/diffusion_pytorch_model.safetensors.index.json")
+            .is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn imports_sdxl_secondary_text_encoder_and_tokenizer_metadata() {
         let dir = std::env::temp_dir().join(format!(
             "hipfire-diffusion-sdxl-import-test-{}",
