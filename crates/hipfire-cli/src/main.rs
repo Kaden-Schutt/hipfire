@@ -47,7 +47,10 @@ enum Command {
     /// `hipfire_rocm_device_id` on `/sdapi/v1/txt2img` and
     /// `/sdapi/v1/img2img` requests, through the same keys in
     /// `override_settings`, or through the persisted `/sdapi/v1/options` value
-    /// `hipfire_rocm_device_id`.
+    /// `hipfire_rocm_device_id`. Persisted `/sdapi/v1/options` values for
+    /// `send_images`, `save_images`, `outdir_samples`, `outdir_txt2img_samples`,
+    /// and `outdir_img2img_samples` act as generation defaults unless the
+    /// request or `override_settings` supplies a more specific value.
     ///
     /// `/sdapi/v1/progress` tracks active SDAPI sampling steps and returns the
     /// final generated PNG in `current_image` after a successful HFQ diffusion

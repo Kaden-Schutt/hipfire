@@ -394,6 +394,8 @@ async fn execute_hfq_diffusion_txt2img(
     path: PathBuf,
     body: SdGenerationRequest,
 ) -> Response {
+    let sdapi_options = state.sdapi_options.lock().await.clone();
+    let body = sdapi_apply_stored_generation_defaults(body, &sdapi_options);
     let original_send_images = body.send_images.unwrap_or(true);
     let first_pass_body = match sdapi_txt2img_first_pass_body(&body) {
         Ok(body) => body,
@@ -418,7 +420,6 @@ async fn execute_hfq_diffusion_txt2img(
     };
     let iteration_steps =
         request.steps as usize + sdapi_txt2img_highres_steps(&body, highres_target);
-    let sdapi_options = state.sdapi_options.lock().await.clone();
     let runtime_options = sd_request_generation_runtime_options(&body, &sdapi_options);
     let progress_state = state.sdapi_progress.clone();
     start_sdapi_progress(
@@ -543,6 +544,8 @@ async fn execute_hfq_diffusion_img2img(
     body: SdGenerationRequest,
     images_base64: Vec<String>,
 ) -> Response {
+    let sdapi_options = state.sdapi_options.lock().await.clone();
+    let body = sdapi_apply_stored_generation_defaults(body, &sdapi_options);
     let original_send_images = body.send_images.unwrap_or(true);
     let init_image = match decode_sd_init_images(&images_base64) {
         Ok(image) => image,
@@ -581,7 +584,6 @@ async fn execute_hfq_diffusion_img2img(
         Ok(inpainting_fill) => inpainting_fill,
         Err(error) => return diffusion_error_response(error),
     };
-    let sdapi_options = state.sdapi_options.lock().await.clone();
     let runtime_options = sd_request_generation_runtime_options(&body, &sdapi_options);
     let progress_state = state.sdapi_progress.clone();
     start_sdapi_progress(
@@ -763,6 +765,47 @@ fn sdapi_script_value_is_empty(value: &Value) -> bool {
         Value::String(value) => value.trim().is_empty(),
         _ => false,
     }
+}
+
+fn sdapi_apply_stored_generation_defaults(
+    mut body: SdGenerationRequest,
+    stored_options: &std::collections::HashMap<String, Value>,
+) -> SdGenerationRequest {
+    if body.send_images.is_none() {
+        body.send_images = sd_stored_bool(stored_options, "send_images");
+    }
+    if body.save_images.is_none() {
+        body.save_images = sd_stored_bool(stored_options, "save_images");
+    }
+    for key in [
+        "outdir_samples",
+        "outdir_txt2img_samples",
+        "outdir_img2img_samples",
+    ] {
+        sdapi_apply_stored_override_default(&mut body, stored_options, key);
+    }
+    body
+}
+
+fn sdapi_apply_stored_override_default(
+    body: &mut SdGenerationRequest,
+    stored_options: &std::collections::HashMap<String, Value>,
+    key: &str,
+) {
+    let Some(value) = stored_options.get(key).cloned() else {
+        return;
+    };
+    if body.override_settings.is_none() {
+        body.override_settings = Some(json!({}));
+    }
+    let Some(settings) = body
+        .override_settings
+        .as_mut()
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    settings.entry(key.to_string()).or_insert(value);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2219,8 +2262,43 @@ fn sd_stored_i32(
     stored_options.get(key).and_then(value_to_i32)
 }
 
+fn sd_stored_bool(
+    stored_options: &std::collections::HashMap<String, Value>,
+    key: &str,
+) -> Option<bool> {
+    stored_options.get(key).and_then(value_to_bool)
+}
+
 fn value_to_i32(value: &Value) -> Option<i32> {
     value.as_i64().and_then(|value| i32::try_from(value).ok())
+}
+
+fn value_to_bool(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(value) => Some(*value),
+        Value::Number(value) => value
+            .as_i64()
+            .map(|value| value != 0)
+            .or_else(|| value.as_u64().map(|value| value != 0))
+            .or_else(|| value.as_f64().map(|value| value != 0.0)),
+        Value::String(value) => {
+            let value = value.trim();
+            if value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("no")
+                || value.eq_ignore_ascii_case("off")
+            {
+                Some(false)
+            } else if value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("yes")
+                || value.eq_ignore_ascii_case("on")
+            {
+                Some(true)
+            } else {
+                value.parse::<f64>().ok().map(|value| value != 0.0)
+            }
+        }
+        _ => None,
+    }
 }
 
 fn batch_size_for_body(body: &SdGenerationRequest) -> u32 {
@@ -4945,6 +5023,106 @@ mod tests {
             "[seed]-[prompt_words]"
         );
         assert_eq!(read_back["hipfire_rocm_device_id"], 0);
+    }
+
+    #[test]
+    fn stored_sdapi_generation_options_apply_as_request_defaults() {
+        let mut stored = std::collections::HashMap::new();
+        stored.insert("send_images".to_string(), json!(false));
+        stored.insert("save_images".to_string(), json!("true"));
+        stored.insert(
+            "outdir_txt2img_samples".to_string(),
+            json!("/tmp/stored-txt2img"),
+        );
+        stored.insert(
+            "outdir_img2img_samples".to_string(),
+            json!("/tmp/stored-img2img"),
+        );
+
+        let body = sdapi_apply_stored_generation_defaults(empty_request(), &stored);
+
+        assert_eq!(body.send_images, Some(false));
+        assert_eq!(body.save_images, Some(true));
+        assert_eq!(
+            body.override_settings.as_ref().unwrap()["outdir_txt2img_samples"],
+            "/tmp/stored-txt2img"
+        );
+
+        let explicit = sdapi_apply_stored_generation_defaults(
+            SdGenerationRequest {
+                send_images: Some(true),
+                save_images: Some(false),
+                override_settings: Some(json!({
+                    "outdir_txt2img_samples": "/tmp/request-txt2img"
+                })),
+                ..empty_request()
+            },
+            &stored,
+        );
+
+        assert_eq!(explicit.send_images, Some(true));
+        assert_eq!(explicit.save_images, Some(false));
+        assert_eq!(
+            explicit.override_settings.unwrap()["outdir_txt2img_samples"],
+            "/tmp/request-txt2img"
+        );
+    }
+
+    #[tokio::test]
+    async fn txt2img_route_uses_stored_send_save_and_output_directory_defaults() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-sdapi-options-generation-defaults-test-{}",
+            std::process::id()
+        ));
+        let outdir = dir.join("txt2img-out");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("tiny-options-defaults-diffusion.hfq");
+        write_tiny_diffusion_hfq(&hfq_path);
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+
+        let Json(updated) = post_options(
+            State(state.clone()),
+            Json(json!({
+                "send_images": false,
+                "save_images": true,
+                "outdir_txt2img_samples": outdir,
+            })),
+        )
+        .await;
+        assert_eq!(updated["send_images"], false);
+        assert_eq!(updated["save_images"], true);
+
+        let response = post_txt2img(
+            State(state.clone()),
+            Json(SdGenerationRequest {
+                prompt: "a stored options cat".to_string(),
+                model: Some(hfq_path.to_string_lossy().into_owned()),
+                steps: Some(1),
+                cfg_scale: Some(1.0),
+                width: Some(2),
+                height: Some(2),
+                ..empty_request()
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+
+        assert_eq!(body["images"].as_array().unwrap().len(), 0);
+        assert_eq!(body["parameters"]["send_images"], false);
+        assert_eq!(body["parameters"]["save_images"], true);
+        let info = serde_json::from_str::<Value>(body["info"].as_str().unwrap()).unwrap();
+        let saved = info["saved_images"].as_array().unwrap();
+        assert_eq!(saved.len(), 1);
+        let saved_path = PathBuf::from(saved[0].as_str().unwrap());
+        assert!(saved_path.starts_with(&outdir));
+        assert!(saved_path.exists());
+
+        let Json(progress) = get_progress(State(state)).await;
+        assert_eq!(progress["textinfo"], "complete");
+        assert!(progress["current_image"].as_str().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
