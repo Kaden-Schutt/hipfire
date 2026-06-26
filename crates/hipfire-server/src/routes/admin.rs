@@ -906,7 +906,7 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
     async function loadChat() {
       if (!chatModelEl.value.trim()) {
         const health = await fetchJson("/health");
-        chatModelEl.value = health.model || "";
+        chatModelEl.value = health.active_model || health.model || "";
       }
       renderChat();
       statusEl.textContent = "chat";
@@ -960,7 +960,7 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
       ]);
       overviewHealthEl.textContent = health.status || "-";
       overviewPidEl.textContent = health.pid || "-";
-      overviewModelEl.textContent = health.model || "none";
+      overviewModelEl.textContent = health.active_model || health.model || "none";
       const runs = training.runs || [];
       overviewTrainingEl.textContent = `${runs.filter(isActiveRun).length} active / ${runs.length} runs`;
       overviewRuntimeEl.replaceChildren(...keyValueRows([
@@ -996,7 +996,7 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
       modelsCountEl.textContent = String(models.length);
       modelsAliasesEl.textContent = String(Object.keys(aliases).length);
       modelsLocalEl.textContent = String(models.filter((m) => m.path || m.file).length);
-      modelsLoadedEl.textContent = health.model || "none";
+      modelsLoadedEl.textContent = health.active_model || health.model || "none";
       modelsRowsEl.replaceChildren(...models.map((model) => {
         const tr = document.createElement("tr");
         const sidecarText = [

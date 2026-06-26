@@ -16,6 +16,10 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
         let loaded = state.loaded_model_path.lock().await;
         loaded.clone()
     };
+    let diffusion = diffusion_health_payload(&state).await;
+    let active_model = loaded
+        .clone()
+        .or_else(|| diffusion_active_model(&diffusion));
     let idle_timeout_sec = {
         let cfg = state.config.lock().await;
         cfg.idle_timeout
@@ -42,6 +46,8 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
     Json(json!({
         "status": "ok",
         "model": loaded,
+        "active_model": active_model,
+        "diffusion": diffusion,
         "idle_timeout_sec": idle_timeout_sec,
         "pid": std::process::id(),
         "prefill_batch": prefill_batch,
@@ -50,6 +56,45 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
         "runtime_workers": runtime_workers_health_payload(&accelerator_inventory),
         "batches": batch_health_payload(&state).await,
     }))
+}
+
+async fn diffusion_health_payload(state: &SharedState) -> Value {
+    let cache = state.diffusion_pipelines.lock().await;
+    let mut models = cache
+        .iter()
+        .map(|(path, pipeline)| {
+            let summary = pipeline.summary();
+            json!({
+                "path": path,
+                "title": summary.title,
+                "model_name": summary.model_name,
+                "pipeline": summary.pipeline_class,
+                "weight_format": summary.weight_format,
+                "max_batch": summary.max_batch,
+            })
+        })
+        .collect::<Vec<_>>();
+    models.sort_by(|left, right| {
+        left["path"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(right["path"].as_str().unwrap_or_default())
+    });
+    json!({
+        "loaded": !models.is_empty(),
+        "pipeline_count": models.len(),
+        "models": models,
+    })
+}
+
+fn diffusion_active_model(diffusion: &Value) -> Option<String> {
+    diffusion
+        .get("models")
+        .and_then(Value::as_array)
+        .and_then(|models| models.first())
+        .and_then(|model| model.get("path"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn scheduler_env_from_process() -> SchedulerPolicyEnv {
@@ -110,6 +155,15 @@ async fn batch_health_payload(state: &SharedState) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State;
+    use hipfire_diffusion::{
+        DiffusionBatchMetadata, DiffusionHfqMetadata, DiffusionPipeline, DiffusionPipelineMetadata,
+        DiffusionQuantizationMetadata, DiffusionTokenizerMetadata, DIFFUSION_ARTIFACT_KIND,
+        DIFFUSION_SCHEMA_VERSION, HFQ_ARCH_DIFFUSION,
+    };
+    use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     #[test]
     fn health_route_uses_disabled_shared_scheduler_payloads() {
@@ -159,5 +213,81 @@ mod tests {
             payload["accelerator_inventory"]["devices"][0]["device_class"],
             "discrete"
         );
+    }
+
+    #[tokio::test]
+    async fn health_reports_cached_diffusion_pipeline_as_active_model() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-health-diffusion-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("metadata-only-diffusion.hfq");
+        write_metadata_only_diffusion_hfq(&hfq_path);
+
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let pipeline = Arc::new(DiffusionPipeline::open_hfq(&hfq_path).unwrap());
+        state
+            .diffusion_pipelines
+            .lock()
+            .await
+            .insert(hfq_path.clone(), pipeline);
+
+        let Json(payload) = get_health(State(state)).await;
+
+        assert_eq!(payload["model"], Value::Null);
+        assert_eq!(
+            payload["active_model"].as_str().unwrap(),
+            hfq_path.to_string_lossy()
+        );
+        assert_eq!(payload["diffusion"]["loaded"], true);
+        assert_eq!(payload["diffusion"]["pipeline_count"], 1);
+        assert_eq!(
+            payload["diffusion"]["models"][0]["model_name"],
+            "metadata-only-diffusion"
+        );
+        assert_eq!(
+            payload["diffusion"]["models"][0]["pipeline"],
+            "StableDiffusionPipeline"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_metadata_only_diffusion_hfq(path: &std::path::Path) {
+        let metadata = DiffusionHfqMetadata {
+            artifact_kind: DIFFUSION_ARTIFACT_KIND.to_string(),
+            schema_version: DIFFUSION_SCHEMA_VERSION,
+            pipeline: DiffusionPipelineMetadata {
+                class_name: "StableDiffusionPipeline".to_string(),
+                source: "/tmp/metadata-only-diffusion".to_string(),
+                model_name: "metadata-only-diffusion".to_string(),
+                latent_channels: Some(4),
+                latent_height: Some(64),
+                latent_width: Some(64),
+                supported_widths: vec![512],
+                supported_heights: vec![512],
+            },
+            tokenizer: DiffusionTokenizerMetadata::default(),
+            tokenizer_2: None,
+            batch: DiffusionBatchMetadata {
+                max_batch: 1,
+                batched_runtime: true,
+            },
+            quantization: DiffusionQuantizationMetadata {
+                weight_format: "metadata-only".to_string(),
+                activation_format: "fp16".to_string(),
+                tensor_roles_version: 1,
+            },
+            components: BTreeMap::new(),
+        };
+        let tensors: Vec<HfqMemTensor> = Vec::new();
+        write_hfqm_package_mem(
+            path,
+            HFQ_ARCH_DIFFUSION,
+            &serde_json::to_string(&metadata).unwrap(),
+            &tensors,
+        )
+        .unwrap();
     }
 }
