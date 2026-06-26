@@ -266,7 +266,7 @@ Inspect a diffusion .hfq artifact and print its server-facing summary
 
 Plan HIP diffusion buffers and optionally run a ROCm device preflight
 
-The preflight command prints a deterministic memory plan for the requested resolution, batch, scheduler, and prompt set. Builds compiled with `--features rocm` also initialize the selected HIP device, allocate the planned buffer classes, run a host/device roundtrip probe, and launch currently covered diffusion kernel probes against CPU references.
+The preflight command prints a deterministic memory plan for the requested resolution, batch, scheduler, and prompt set. For transformer-denoiser artifacts such as Qwen Image and Krea, the plan includes `transformer_denoiser` patch-token geometry so the denoise buffer is planned as `[batch, sequence_length, token_width]` rather than UNet-style NCHW. Builds compiled with `--features rocm` also initialize the selected HIP device, allocate the planned buffer classes, run a host/device roundtrip probe, and launch currently covered diffusion kernel probes against CPU references.
 
 **Usage:** `hipfire diffusion preflight [OPTIONS] --model <MODEL>`
 

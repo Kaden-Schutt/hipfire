@@ -267,6 +267,8 @@ fn runtime_kind_for_context(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffusionHipMemoryPlan {
     pub latent_shape: DiffusionLatentShape,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transformer_denoiser: Option<DiffusionTransformerDenoiserPlan>,
     pub latent_bytes: usize,
     pub denoise_input_bytes: usize,
     pub conditioning_bytes: usize,
@@ -274,6 +276,20 @@ pub struct DiffusionHipMemoryPlan {
     pub rgb_bytes: usize,
     pub scheduler_scratch_bytes: usize,
     pub total_device_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffusionTransformerDenoiserPlan {
+    pub representation: String,
+    pub batch: usize,
+    pub sequence_length: usize,
+    pub token_width: usize,
+    pub patch_size: usize,
+    pub latent_height: usize,
+    pub latent_width: usize,
+    pub patch_height: usize,
+    pub patch_width: usize,
+    pub output_channels: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -486,12 +502,27 @@ pub struct TransformerDenoiserConfig {
     pub class_name: String,
     pub in_channels: Option<usize>,
     pub out_channels: Option<usize>,
+    pub patch_size: Option<usize>,
     pub num_layers: Option<usize>,
     pub num_attention_heads: Option<usize>,
+    pub num_key_value_heads: Option<usize>,
     pub attention_head_dim: Option<usize>,
     pub cross_attention_dim: Option<usize>,
     pub caption_projection_dim: Option<usize>,
     pub pooled_projection_dim: Option<usize>,
+    pub axes_dims_rope: Vec<usize>,
+    pub guidance_embeds: Option<bool>,
+    pub intermediate_size: Option<usize>,
+    pub norm_eps: Option<f32>,
+    pub text_hidden_dim: Option<usize>,
+    pub text_intermediate_size: Option<usize>,
+    pub text_num_attention_heads: Option<usize>,
+    pub text_num_key_value_heads: Option<usize>,
+    pub num_text_layers: Option<usize>,
+    pub num_refiner_text_blocks: Option<usize>,
+    pub num_layerwise_text_blocks: Option<usize>,
+    pub timestep_embed_dim: Option<usize>,
+    pub rope_theta: Option<f32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -5489,13 +5520,45 @@ impl StableDiffusionConfig {
                     class_name: json_string(transformer_json, "_class_name"),
                     in_channels: json_usize(transformer_json, "in_channels"),
                     out_channels: json_usize(transformer_json, "out_channels"),
+                    patch_size: json_usize(transformer_json, "patch_size").or_else(|| {
+                        default_transformer_patch_size(&json_string(
+                            transformer_json,
+                            "_class_name",
+                        ))
+                    }),
                     num_layers: json_usize(transformer_json, "num_layers"),
                     num_attention_heads: json_usize(transformer_json, "num_attention_heads"),
+                    num_key_value_heads: json_usize(transformer_json, "num_key_value_heads"),
                     attention_head_dim: json_usize(transformer_json, "attention_head_dim"),
                     cross_attention_dim: json_usize(transformer_json, "cross_attention_dim")
                         .or_else(|| json_usize(transformer_json, "joint_attention_dim")),
                     caption_projection_dim: json_usize(transformer_json, "caption_projection_dim"),
                     pooled_projection_dim: json_usize(transformer_json, "pooled_projection_dim"),
+                    axes_dims_rope: json_usize_vec(transformer_json, "axes_dims_rope"),
+                    guidance_embeds: json_bool(transformer_json, "guidance_embeds"),
+                    intermediate_size: json_usize(transformer_json, "intermediate_size"),
+                    norm_eps: json_f32(transformer_json, "norm_eps"),
+                    text_hidden_dim: json_usize(transformer_json, "text_hidden_dim"),
+                    text_intermediate_size: json_usize(transformer_json, "text_intermediate_size"),
+                    text_num_attention_heads: json_usize(
+                        transformer_json,
+                        "text_num_attention_heads",
+                    ),
+                    text_num_key_value_heads: json_usize(
+                        transformer_json,
+                        "text_num_key_value_heads",
+                    ),
+                    num_text_layers: json_usize(transformer_json, "num_text_layers"),
+                    num_refiner_text_blocks: json_usize(
+                        transformer_json,
+                        "num_refiner_text_blocks",
+                    ),
+                    num_layerwise_text_blocks: json_usize(
+                        transformer_json,
+                        "num_layerwise_text_blocks",
+                    ),
+                    timestep_embed_dim: json_usize(transformer_json, "timestep_embed_dim"),
+                    rope_theta: json_f32(transformer_json, "rope_theta"),
                 });
         let vae = VaeConfig {
             class_name: json_string(&vae_json, "_class_name"),
@@ -5736,23 +5799,28 @@ pub fn diffusion_hip_memory_plan(
         ],
     )?;
     let latent_bytes = checked_bytes("latent", latent_elements, 4)?;
-    let transformer_denoise_channels = config
-        .transformer
-        .as_ref()
-        .and_then(|transformer| transformer.in_channels.or(transformer.out_channels));
-    let denoise_channels = transformer_denoise_channels
-        .or(config.unet.in_channels)
-        .unwrap_or(config.latent_channels)
-        .max(config.latent_channels);
-    let denoise_elements = checked_shape_elements(
-        "denoise input",
-        &[
-            latent_shape.batch,
-            denoise_channels,
-            latent_shape.height,
-            latent_shape.width,
-        ],
-    )?;
+    let transformer_denoiser = transformer_denoiser_plan(config, &latent_shape)?;
+    let denoise_elements = if let Some(plan) = &transformer_denoiser {
+        checked_shape_elements(
+            "transformer denoise input",
+            &[plan.batch, plan.sequence_length, plan.token_width],
+        )?
+    } else {
+        let denoise_channels = config
+            .unet
+            .in_channels
+            .unwrap_or(config.latent_channels)
+            .max(config.latent_channels);
+        checked_shape_elements(
+            "denoise input",
+            &[
+                latent_shape.batch,
+                denoise_channels,
+                latent_shape.height,
+                latent_shape.width,
+            ],
+        )?
+    };
     let denoise_input_bytes = checked_bytes("denoise input", denoise_elements, 4)?;
     let max_position_embeddings = config
         .text_encoder
@@ -5818,6 +5886,7 @@ pub fn diffusion_hip_memory_plan(
     })?;
     Ok(DiffusionHipMemoryPlan {
         latent_shape,
+        transformer_denoiser,
         latent_bytes,
         denoise_input_bytes,
         conditioning_bytes,
@@ -5826,6 +5895,51 @@ pub fn diffusion_hip_memory_plan(
         scheduler_scratch_bytes,
         total_device_bytes,
     })
+}
+
+fn transformer_denoiser_plan(
+    config: &StableDiffusionConfig,
+    latent_shape: &DiffusionLatentShape,
+) -> DiffusionResult<Option<DiffusionTransformerDenoiserPlan>> {
+    let Some(transformer) = &config.transformer else {
+        return Ok(None);
+    };
+    let patch_size = transformer.patch_size.unwrap_or(1).max(1);
+    if latent_shape.height % patch_size != 0 || latent_shape.width % patch_size != 0 {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "latent shape {}x{} must be divisible by transformer patch_size {patch_size}",
+            latent_shape.width, latent_shape.height
+        )));
+    }
+    let patch_height = latent_shape.height / patch_size;
+    let patch_width = latent_shape.width / patch_size;
+    let sequence_length = patch_height.checked_mul(patch_width).ok_or_else(|| {
+        DiffusionError::InvalidRequest("transformer sequence length overflow".into())
+    })?;
+    let patch_width_channels = latent_shape
+        .channels
+        .checked_mul(patch_size)
+        .and_then(|value| value.checked_mul(patch_size))
+        .ok_or_else(|| {
+            DiffusionError::InvalidRequest("transformer patch token width overflow".into())
+        })?;
+    let token_width = transformer
+        .in_channels
+        .or(transformer.out_channels)
+        .unwrap_or(patch_width_channels)
+        .max(patch_width_channels);
+    Ok(Some(DiffusionTransformerDenoiserPlan {
+        representation: "patch_tokens".to_string(),
+        batch: latent_shape.batch,
+        sequence_length,
+        token_width,
+        patch_size,
+        latent_height: latent_shape.height,
+        latent_width: latent_shape.width,
+        patch_height,
+        patch_width,
+        output_channels: transformer.out_channels.unwrap_or(latent_shape.channels),
+    }))
 }
 
 fn checked_shape_elements(label: &str, dims: &[usize]) -> DiffusionResult<usize> {
@@ -12845,6 +12959,13 @@ fn validate_diffusion_hfq(hfq: &HfqFile, metadata: &DiffusionHfqMetadata) -> Dif
     Ok(())
 }
 
+fn default_transformer_patch_size(class_name: &str) -> Option<usize> {
+    match class_name {
+        "QwenImageTransformer2DModel" | "Krea2Transformer2DModel" => Some(2),
+        _ => None,
+    }
+}
+
 fn component_json(
     hfq: &HfqFile,
     metadata: &DiffusionHfqMetadata,
@@ -15943,6 +16064,7 @@ mod tests {
         assert_eq!(transformer.class_name, "Krea2Transformer2DModel");
         assert_eq!(transformer.in_channels, Some(64));
         assert_eq!(transformer.out_channels, Some(16));
+        assert_eq!(transformer.patch_size, Some(2));
         assert_eq!(transformer.num_layers, Some(28));
         assert_eq!(config.vae.z_dim, Some(16));
         assert_eq!(config.vae.latents_mean, vec![-0.75, 0.25]);
@@ -16069,7 +16191,7 @@ mod tests {
         fs::write(source.join("tokenizer/merges.txt"), b"#version: 0.2\n").unwrap();
         fs::write(
             source.join("transformer/config.json"),
-            br#"{"_class_name":"QwenImageTransformer2DModel","in_channels":64,"out_channels":16,"num_layers":60,"num_attention_heads":24,"attention_head_dim":128,"joint_attention_dim":3584}"#,
+            br#"{"_class_name":"QwenImageTransformer2DModel","in_channels":64,"out_channels":16,"num_layers":60,"num_attention_heads":24,"num_key_value_heads":8,"attention_head_dim":128,"joint_attention_dim":3584,"axes_dims_rope":[16,56,56],"guidance_embeds":false,"patch_size":2,"pooled_projection_dim":768}"#,
         )
         .unwrap();
         write_safetensors_fixture(
@@ -16131,7 +16253,14 @@ mod tests {
         assert_eq!(transformer.in_channels, Some(64));
         assert_eq!(transformer.out_channels, Some(16));
         assert_eq!(transformer.cross_attention_dim, Some(3584));
+        assert_eq!(transformer.patch_size, Some(2));
         assert_eq!(transformer.num_layers, Some(60));
+        assert_eq!(transformer.num_attention_heads, Some(24));
+        assert_eq!(transformer.num_key_value_heads, Some(8));
+        assert_eq!(transformer.attention_head_dim, Some(128));
+        assert_eq!(transformer.axes_dims_rope, vec![16, 56, 56]);
+        assert_eq!(transformer.guidance_embeds, Some(false));
+        assert_eq!(transformer.pooled_projection_dim, Some(768));
         assert_eq!(entries.len(), 2);
         assert!(entries.contains(&"transformer/tensors/patch_embed.proj.weight".to_string()));
         assert!(entries.contains(&"transformer/tensors/norm_out.weight".to_string()));
@@ -18320,6 +18449,7 @@ mod tests {
                 class_name: "QwenImageTransformer2DModel".into(),
                 in_channels: Some(64),
                 out_channels: Some(16),
+                patch_size: Some(2),
                 caption_projection_dim: Some(128),
                 ..TransformerDenoiserConfig::default()
             }),
@@ -18373,8 +18503,78 @@ mod tests {
             }
         );
         assert_eq!(plan.latent_bytes, 16 * 8 * 8 * 4);
-        assert_eq!(plan.denoise_input_bytes, 64 * 8 * 8 * 4);
+        assert_eq!(
+            plan.transformer_denoiser,
+            Some(DiffusionTransformerDenoiserPlan {
+                representation: "patch_tokens".into(),
+                batch: 1,
+                sequence_length: 16,
+                token_width: 64,
+                patch_size: 2,
+                latent_height: 8,
+                latent_width: 8,
+                patch_height: 4,
+                patch_width: 4,
+                output_channels: 16,
+            })
+        );
+        assert_eq!(plan.denoise_input_bytes, 16 * 64 * 4);
         assert_eq!(plan.conditioning_bytes, 2 * 4 * 128 * 4);
+    }
+
+    #[test]
+    fn hip_memory_plan_rejects_transformer_patch_misalignment() {
+        let config = StableDiffusionConfig {
+            pipeline_class: "QwenImagePipeline".into(),
+            text_encoder: TextEncoderConfig::default(),
+            text_encoder_2: None,
+            unet: UnetConfig::default(),
+            transformer: Some(TransformerDenoiserConfig {
+                class_name: "QwenImageTransformer2DModel".into(),
+                in_channels: Some(64),
+                out_channels: Some(16),
+                patch_size: Some(2),
+                ..TransformerDenoiserConfig::default()
+            }),
+            vae: VaeConfig {
+                z_dim: Some(16),
+                ..VaeConfig::default()
+            },
+            scheduler: SchedulerConfig::default(),
+            latent_channels: 16,
+            latent_height: None,
+            latent_width: None,
+            vae_scale_factor: 8,
+        };
+        let request = DiffusionBatchRequest {
+            prompts: vec![DiffusionPrompt {
+                prompt: "a".into(),
+                negative_prompt: String::new(),
+                seed: 1,
+                subseed: None,
+            }],
+            width: 72,
+            height: 64,
+            original_width: None,
+            original_height: None,
+            target_width: None,
+            target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
+            crop_x: 0,
+            crop_y: 0,
+            steps: 2,
+            cfg_scale: 1.0,
+            scheduler: "Euler".into(),
+            subseed_strength: 0.0,
+            send_images: true,
+            save_images: false,
+        };
+
+        let error = diffusion_hip_memory_plan(&config, &request)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("patch_size 2"));
     }
 
     #[test]
