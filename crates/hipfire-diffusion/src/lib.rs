@@ -6264,6 +6264,63 @@ impl NativeTransformerAttentionProjection {
             .map(Some)
     }
 
+    fn attend_image_text_with_runtime_context(
+        &self,
+        image_hidden: &CpuTensor,
+        text_hidden: Option<&CpuTensor>,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<(CpuTensor, Option<CpuTensor>)> {
+        let image_qkv =
+            self.project_image_qkv_with_runtime_context(image_hidden, runtime_context)?;
+        let Some(text_projection) = self.text.as_ref() else {
+            let image_attention = scaled_dot_product_attention_with_runtime_context(
+                &image_qkv.q,
+                &image_qkv.k,
+                &image_qkv.v,
+                self.heads,
+                runtime_context,
+            )?;
+            let image_output =
+                self.project_image_output_with_runtime_context(&image_attention, runtime_context)?;
+            return Ok((image_output, None));
+        };
+
+        let text_hidden = text_hidden.ok_or_else(|| {
+            DiffusionError::InvalidRequest(format!(
+                "transformer block {} {:?} attention requires text hidden states",
+                self.block_index, self.family
+            ))
+        })?;
+        self.validate_hidden_input(text_hidden, TransformerModulationStream::Text)?;
+        let text_qkv = text_projection.project_qkv_with_runtime_context(
+            text_hidden,
+            self.heads,
+            self.head_dim,
+            runtime_context,
+        )?;
+        let joint_k = concat_sequence_3d(&text_qkv.k, &image_qkv.k)?;
+        let joint_v = concat_sequence_3d(&text_qkv.v, &image_qkv.v)?;
+        let image_attention = scaled_dot_product_attention_with_runtime_context(
+            &image_qkv.q,
+            &joint_k,
+            &joint_v,
+            self.heads,
+            runtime_context,
+        )?;
+        let text_attention = scaled_dot_product_attention_with_runtime_context(
+            &text_qkv.q,
+            &joint_k,
+            &joint_v,
+            self.heads,
+            runtime_context,
+        )?;
+        let image_output =
+            self.project_image_output_with_runtime_context(&image_attention, runtime_context)?;
+        let text_output = text_projection
+            .project_output_with_runtime_context(&text_attention, runtime_context)?;
+        Ok((image_output, Some(text_output)))
+    }
+
     fn validate_hidden_input(
         &self,
         hidden: &CpuTensor,
@@ -6418,6 +6475,30 @@ fn rms_norm_attention_heads_3d(
                 }
             }
         }
+    }
+    Ok(out)
+}
+
+#[allow(dead_code)]
+fn concat_sequence_3d(left: &CpuTensor, right: &CpuTensor) -> DiffusionResult<CpuTensor> {
+    let [left_batch, left_seq, left_width] = shape3(left)?;
+    let [right_batch, right_seq, right_width] = shape3(right)?;
+    if left_batch != right_batch || left_width != right_width {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "cannot concatenate BSC tensors with shapes {:?} and {:?}",
+            left.shape, right.shape
+        )));
+    }
+    let mut out = CpuTensor::zeros(&[left_batch, left_seq + right_seq, left_width]);
+    for batch in 0..left_batch {
+        let left_src = batch * left_seq * left_width;
+        let right_src = batch * right_seq * right_width;
+        let dst = batch * (left_seq + right_seq) * left_width;
+        out.data[dst..dst + left_seq * left_width]
+            .copy_from_slice(&left.data[left_src..left_src + left_seq * left_width]);
+        let right_dst = dst + left_seq * left_width;
+        out.data[right_dst..right_dst + right_seq * right_width]
+            .copy_from_slice(&right.data[right_src..right_src + right_seq * right_width]);
     }
     Ok(out)
 }
@@ -17717,6 +17798,118 @@ mod tests {
             .project_text_output_with_runtime_context(&image.v, &mut runtime_context)
             .unwrap()
             .is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_transformer_attention_runs_qwen_joint_image_text_attention() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-qwen-transformer-joint-attn-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("qwen-transformer-joint-attn.hfq");
+        let prefix = "transformer/tensors/transformer_blocks.0.attn";
+        let identity2 = [1.0, 0.0, 0.0, 1.0];
+        write_hfqm_package_mem(
+            &path,
+            HFQ_ARCH_DIFFUSION,
+            "{}",
+            &[
+                f32_mem_tensor(&format!("{prefix}.to_q.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.to_k.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.to_v.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.to_out.0.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.add_q_proj.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.add_k_proj.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.add_v_proj.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.to_add_out.weight"), &[2, 2], &identity2),
+            ],
+        )
+        .unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let attention = NativeTransformerAttentionProjection::from_hfq(
+            &hfq,
+            TransformerDenoiserFamily::QwenImage,
+            0,
+            1,
+        )
+        .unwrap();
+        let image_hidden = CpuTensor {
+            shape: vec![1, 2, 2],
+            data: vec![1.0, 0.0, 0.0, 1.0],
+        };
+        let text_hidden = CpuTensor {
+            shape: vec![1, 1, 2],
+            data: vec![1.0, 1.0],
+        };
+        let joint = concat_sequence_3d(&text_hidden, &image_hidden).unwrap();
+        let expected_image =
+            scaled_dot_product_attention(&image_hidden, &joint, &joint, 1).unwrap();
+        let expected_text = scaled_dot_product_attention(&text_hidden, &joint, &joint, 1).unwrap();
+        let mut runtime_context =
+            DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+
+        let (image_out, text_out) = attention
+            .attend_image_text_with_runtime_context(
+                &image_hidden,
+                Some(&text_hidden),
+                &mut runtime_context,
+            )
+            .unwrap();
+
+        assert_f32_close(&image_out.data, &expected_image.data, 1e-6);
+        assert_f32_close(&text_out.unwrap().data, &expected_text.data, 1e-6);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_transformer_attention_runs_krea_image_self_attention() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-krea-transformer-self-attn-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("krea-transformer-self-attn.hfq");
+        let prefix = "transformer/tensors/transformer_blocks.0.attn";
+        let identity2 = [1.0, 0.0, 0.0, 1.0];
+        write_hfqm_package_mem(
+            &path,
+            HFQ_ARCH_DIFFUSION,
+            "{}",
+            &[
+                f32_mem_tensor(&format!("{prefix}.to_q.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.to_k.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.to_v.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.to_out.0.weight"), &[2, 2], &identity2),
+            ],
+        )
+        .unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let attention = NativeTransformerAttentionProjection::from_hfq(
+            &hfq,
+            TransformerDenoiserFamily::Krea2,
+            0,
+            1,
+        )
+        .unwrap();
+        let image_hidden = CpuTensor {
+            shape: vec![1, 2, 2],
+            data: vec![1.0, 0.0, 0.0, 1.0],
+        };
+        let expected =
+            scaled_dot_product_attention(&image_hidden, &image_hidden, &image_hidden, 1).unwrap();
+        let mut runtime_context =
+            DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+
+        let (image_out, text_out) = attention
+            .attend_image_text_with_runtime_context(&image_hidden, None, &mut runtime_context)
+            .unwrap();
+
+        assert_f32_close(&image_out.data, &expected.data, 1e-6);
+        assert!(text_out.is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 
