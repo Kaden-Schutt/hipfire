@@ -64,6 +64,10 @@ enum Command {
     /// create/train embedding and hypernetwork endpoints are registered for
     /// client compatibility and return an `info` response explaining that
     /// native training is not implemented by the SDAPI layer.
+    /// WebUI's optional server command endpoints (`server-kill`,
+    /// `server-restart`, and `server-stop`) are registered as disabled
+    /// compatibility no-ops so SDAPI clients do not see 404s, but external
+    /// clients cannot stop or restart the Hipfire process through them.
     ///
     /// SDAPI sampler fields follow WebUI's split controls: full scheduler names
     /// such as `DDIM`, `DPM++ 2M`, and `DPM++ 3M` are accepted directly, while schedule

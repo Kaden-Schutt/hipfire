@@ -46,3 +46,4 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 
 [dev-dependencies]
 hipfire-runtime = { path = "../hipfire-runtime", default-features = false }
+tower = "0.5"

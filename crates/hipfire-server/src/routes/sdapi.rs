@@ -3634,6 +3634,27 @@ pub async fn post_control_noop() -> Json<Value> {
     Json(json!({}))
 }
 
+pub async fn post_server_kill_noop() -> Json<Value> {
+    sdapi_server_command_noop("server-kill")
+}
+
+pub async fn post_server_restart_noop() -> Json<Value> {
+    sdapi_server_command_noop("server-restart")
+}
+
+pub async fn post_server_stop_noop() -> Json<Value> {
+    sdapi_server_command_noop("server-stop")
+}
+
+fn sdapi_server_command_noop(command: &str) -> Json<Value> {
+    Json(json!({
+        "success": false,
+        "command": command,
+        "server_command_supported": false,
+        "info": "stable-diffusion-webui server command endpoints are disabled by Hipfire's SDAPI compatibility layer",
+    }))
+}
+
 pub async fn post_unsupported_training_endpoint() -> Response {
     (
         StatusCode::NOT_IMPLEMENTED,
@@ -5823,6 +5844,26 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("training and creation endpoints are not implemented"));
+    }
+
+    #[tokio::test]
+    async fn server_command_endpoints_report_disabled_compatibility_noops() {
+        let Json(kill) = post_server_kill_noop().await;
+        assert_eq!(kill["success"], false);
+        assert_eq!(kill["command"], "server-kill");
+        assert_eq!(kill["server_command_supported"], false);
+        assert!(kill["info"]
+            .as_str()
+            .unwrap()
+            .contains("server command endpoints are disabled"));
+
+        let Json(restart) = post_server_restart_noop().await;
+        assert_eq!(restart["success"], false);
+        assert_eq!(restart["command"], "server-restart");
+
+        let Json(stop) = post_server_stop_noop().await;
+        assert_eq!(stop["success"], false);
+        assert_eq!(stop["command"], "server-stop");
     }
 
     #[test]

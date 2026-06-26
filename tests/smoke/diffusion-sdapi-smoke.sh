@@ -222,6 +222,15 @@ try:
     refresh_loras = fetch_json(f"{base_url}/sdapi/v1/refresh-loras", {}, timeout=10.0)
     if not isinstance(refresh_loras, dict):
         raise RuntimeError(f"refresh-loras endpoint returned non-object: {refresh_loras}")
+    for command in ("server-kill", "server-restart", "server-stop"):
+        command_response = fetch_json(f"{base_url}/sdapi/v1/{command}", {}, timeout=10.0)
+        if (
+            not isinstance(command_response, dict)
+            or command_response.get("success") is not False
+            or command_response.get("command") != command
+            or command_response.get("server_command_supported") is not False
+        ):
+            raise RuntimeError(f"{command} endpoint returned unexpected response: {command_response}")
 
     txt_body = {
         "model": model,
@@ -303,6 +312,7 @@ try:
         "images_per_route": expected_images,
         "rocm_device_id": rocm_device_id,
         "loras": len(loras),
+        "server_command_noops": 3,
         "txt2img": {"backend": txt_info.get("backend"), "runtime": txt_info.get("runtime")},
         "img2img": {"masked": img_info.get("masked")},
         "masked_img2img": {"masked": masked_info.get("masked")},

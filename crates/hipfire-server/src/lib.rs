@@ -215,7 +215,19 @@ pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> Rout
         )
         .route("/sdapi/v1/scripts", get(routes::sdapi::get_scripts))
         .route("/sdapi/v1/script-info", get(routes::sdapi::get_script_info))
-        .route("/sdapi/v1/extensions", get(routes::sdapi::get_extensions));
+        .route("/sdapi/v1/extensions", get(routes::sdapi::get_extensions))
+        .route(
+            "/sdapi/v1/server-kill",
+            post(routes::sdapi::post_server_kill_noop),
+        )
+        .route(
+            "/sdapi/v1/server-restart",
+            post(routes::sdapi::post_server_restart_noop),
+        )
+        .route(
+            "/sdapi/v1/server-stop",
+            post(routes::sdapi::post_server_stop_noop),
+        );
     let router = match cors_layer(cors_allowed_origins) {
         Some(cors) => router.layer(cors),
         None => router,
@@ -431,8 +443,10 @@ mod tests {
         DIFFUSION_SCHEMA_VERSION, HFQ_ARCH_DIFFUSION,
     };
     use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+    use serde_json::Value;
     use std::collections::BTreeMap;
     use std::path::Path;
+    use tower::ServiceExt;
 
     #[test]
     fn cors_layer_disabled_when_no_origins() {
@@ -457,6 +471,42 @@ mod tests {
         assert!(request_counts_for_idle(&Method::POST, "/v1/batches"));
         assert!(request_counts_for_idle(&Method::POST, "/sdapi/v1/txt2img"));
         assert!(request_counts_for_idle(&Method::POST, "/sdapi/v1/img2img"));
+    }
+
+    #[tokio::test]
+    async fn sdapi_server_command_routes_are_registered_as_safe_noops() {
+        let app = build_router(AppState::new(HipfireConfig::default()), &[]);
+
+        for route in [
+            "/sdapi/v1/server-kill",
+            "/sdapi/v1/server-restart",
+            "/sdapi/v1/server-stop",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(route)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["success"], false);
+            assert_eq!(
+                body["command"].as_str().unwrap(),
+                route.trim_start_matches("/sdapi/v1/")
+            );
+            assert_eq!(body["server_command_supported"], false);
+        }
     }
 
     #[tokio::test]
