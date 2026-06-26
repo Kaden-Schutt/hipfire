@@ -5480,6 +5480,7 @@ impl NativeDiffusionRuntime {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 struct NativeTransformerDenoiserIo {
     family: TransformerDenoiserFamily,
     patch_size: usize,
@@ -5494,6 +5495,7 @@ struct NativeTransformerDenoiserIo {
     output_bias: CpuTensor,
 }
 
+#[allow(dead_code)]
 impl NativeTransformerDenoiserIo {
     fn from_hfq(
         hfq: &HfqFile,
@@ -5636,6 +5638,7 @@ impl NativeTransformerDenoiserIo {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 struct NativeTransformerTimestepEmbedding {
     family: TransformerDenoiserFamily,
     linear_1_weight: CpuTensor,
@@ -5646,6 +5649,7 @@ struct NativeTransformerTimestepEmbedding {
     modulation_bias: Option<CpuTensor>,
 }
 
+#[allow(dead_code)]
 impl NativeTransformerTimestepEmbedding {
     fn from_hfq(hfq: &HfqFile, family: TransformerDenoiserFamily) -> DiffusionResult<Self> {
         let prefix = match family {
@@ -5724,6 +5728,7 @@ impl NativeTransformerTimestepEmbedding {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 struct TransformerModulationChunks {
     shift_msa: CpuTensor,
     scale_msa: CpuTensor,
@@ -5734,6 +5739,7 @@ struct TransformerModulationChunks {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 struct NativeTransformerBlockModulation {
     family: TransformerDenoiserFamily,
     block_index: usize,
@@ -5745,6 +5751,7 @@ struct NativeTransformerBlockModulation {
     scale_shift_table: Option<CpuTensor>,
 }
 
+#[allow(dead_code)]
 impl NativeTransformerBlockModulation {
     fn from_hfq(
         hfq: &HfqFile,
@@ -5895,12 +5902,527 @@ impl NativeTransformerBlockModulation {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+struct TransformerAttentionQkv {
+    q: CpuTensor,
+    k: CpuTensor,
+    v: CpuTensor,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+struct TransformerAttentionStreamProjection {
+    stream_label: &'static str,
+    q_weight: CpuTensor,
+    q_bias: Option<CpuTensor>,
+    k_weight: CpuTensor,
+    k_bias: Option<CpuTensor>,
+    v_weight: CpuTensor,
+    v_bias: Option<CpuTensor>,
+    norm_q_weight: Option<CpuTensor>,
+    norm_k_weight: Option<CpuTensor>,
+    out_weight: CpuTensor,
+    out_bias: Option<CpuTensor>,
+}
+
+#[allow(dead_code)]
+impl TransformerAttentionStreamProjection {
+    #[allow(clippy::too_many_arguments)]
+    fn from_hfq(
+        hfq: &HfqFile,
+        stream_label: &'static str,
+        q_weight_entry: &str,
+        q_bias_entry: &str,
+        k_weight_entry: &str,
+        k_bias_entry: &str,
+        v_weight_entry: &str,
+        v_bias_entry: &str,
+        norm_q_entry: &str,
+        norm_k_entry: &str,
+        out_weight_entry: &str,
+        out_bias_entry: &str,
+        required: bool,
+        heads: usize,
+        expected_hidden_width: Option<usize>,
+        expected_inner_width: Option<usize>,
+        expected_head_dim: Option<usize>,
+    ) -> DiffusionResult<Option<Self>> {
+        if hfq.find_tensor_info(q_weight_entry).is_none() {
+            if required {
+                return Err(DiffusionError::InvalidMetadata(format!(
+                    "{stream_label} transformer attention q projection {q_weight_entry:?} is missing"
+                )));
+            }
+            return Ok(None);
+        }
+
+        let stream = Self {
+            stream_label,
+            q_weight: CpuTensor::from_hfq(hfq, q_weight_entry)?,
+            q_bias: optional_tensor(hfq, q_bias_entry)?,
+            k_weight: CpuTensor::from_hfq(hfq, k_weight_entry)?,
+            k_bias: optional_tensor(hfq, k_bias_entry)?,
+            v_weight: CpuTensor::from_hfq(hfq, v_weight_entry)?,
+            v_bias: optional_tensor(hfq, v_bias_entry)?,
+            norm_q_weight: optional_tensor(hfq, norm_q_entry)?,
+            norm_k_weight: optional_tensor(hfq, norm_k_entry)?,
+            out_weight: CpuTensor::from_hfq(hfq, out_weight_entry)?,
+            out_bias: optional_tensor(hfq, out_bias_entry)?,
+        };
+        stream.validate_shapes(
+            heads,
+            expected_hidden_width,
+            expected_inner_width,
+            expected_head_dim,
+        )?;
+        Ok(Some(stream))
+    }
+
+    fn validate_shapes(
+        &self,
+        heads: usize,
+        expected_hidden_width: Option<usize>,
+        expected_inner_width: Option<usize>,
+        expected_head_dim: Option<usize>,
+    ) -> DiffusionResult<(usize, usize, usize)> {
+        if heads == 0 {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "{} transformer attention heads must be positive",
+                self.stream_label
+            )));
+        }
+        let [inner_width, hidden_width] = shape2(&self.q_weight)?;
+        if inner_width == 0 || hidden_width == 0 {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "{} transformer attention q weight shape {:?} is empty",
+                self.stream_label, self.q_weight.shape
+            )));
+        }
+        if let Some(expected) = expected_hidden_width {
+            if hidden_width != expected {
+                return Err(DiffusionError::InvalidMetadata(format!(
+                    "{} transformer attention hidden width {hidden_width} != expected {expected}",
+                    self.stream_label
+                )));
+            }
+        }
+        if let Some(expected) = expected_inner_width {
+            if inner_width != expected {
+                return Err(DiffusionError::InvalidMetadata(format!(
+                    "{} transformer attention inner width {inner_width} != expected {expected}",
+                    self.stream_label
+                )));
+            }
+        }
+        let head_dim = self
+            .norm_q_weight
+            .as_ref()
+            .or(self.norm_k_weight.as_ref())
+            .map(attention_norm_weight_dim)
+            .transpose()?
+            .or(expected_head_dim)
+            .unwrap_or_else(|| inner_width / heads);
+        if head_dim == 0 || inner_width != heads * head_dim {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "{} transformer attention inner width {inner_width} is incompatible with heads {heads} and head_dim {head_dim}",
+                self.stream_label
+            )));
+        }
+        validate_attention_linear_shape(
+            self.stream_label,
+            "k",
+            &self.k_weight,
+            inner_width,
+            hidden_width,
+        )?;
+        validate_attention_linear_shape(
+            self.stream_label,
+            "v",
+            &self.v_weight,
+            inner_width,
+            hidden_width,
+        )?;
+        validate_attention_bias_shape(self.stream_label, "q", self.q_bias.as_ref(), inner_width)?;
+        validate_attention_bias_shape(self.stream_label, "k", self.k_bias.as_ref(), inner_width)?;
+        validate_attention_bias_shape(self.stream_label, "v", self.v_bias.as_ref(), inner_width)?;
+        validate_attention_norm_shape(
+            self.stream_label,
+            "q",
+            self.norm_q_weight.as_ref(),
+            head_dim,
+        )?;
+        validate_attention_norm_shape(
+            self.stream_label,
+            "k",
+            self.norm_k_weight.as_ref(),
+            head_dim,
+        )?;
+        if self.out_weight.shape.as_slice() != [hidden_width, inner_width] {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "{} transformer attention output weight shape {:?} != [{hidden_width}, {inner_width}]",
+                self.stream_label, self.out_weight.shape
+            )));
+        }
+        validate_attention_bias_shape(
+            self.stream_label,
+            "out",
+            self.out_bias.as_ref(),
+            hidden_width,
+        )?;
+        Ok((hidden_width, inner_width, head_dim))
+    }
+
+    fn project_qkv_with_runtime_context(
+        &self,
+        hidden: &CpuTensor,
+        heads: usize,
+        head_dim: usize,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<TransformerAttentionQkv> {
+        let q = linear_3d_with_runtime_context(
+            hidden,
+            &self.q_weight,
+            self.q_bias.as_ref(),
+            runtime_context,
+        )?;
+        let k = linear_3d_with_runtime_context(
+            hidden,
+            &self.k_weight,
+            self.k_bias.as_ref(),
+            runtime_context,
+        )?;
+        let v = linear_3d_with_runtime_context(
+            hidden,
+            &self.v_weight,
+            self.v_bias.as_ref(),
+            runtime_context,
+        )?;
+        let q = maybe_rms_norm_attention_heads_3d(
+            q,
+            self.norm_q_weight.as_ref(),
+            heads,
+            head_dim,
+            1e-6,
+        )?;
+        let k = maybe_rms_norm_attention_heads_3d(
+            k,
+            self.norm_k_weight.as_ref(),
+            heads,
+            head_dim,
+            1e-6,
+        )?;
+        Ok(TransformerAttentionQkv { q, k, v })
+    }
+
+    fn project_output_with_runtime_context(
+        &self,
+        attention: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
+        linear_3d_with_runtime_context(
+            attention,
+            &self.out_weight,
+            self.out_bias.as_ref(),
+            runtime_context,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+struct NativeTransformerAttentionProjection {
+    family: TransformerDenoiserFamily,
+    block_index: usize,
+    heads: usize,
+    head_dim: usize,
+    hidden_width: usize,
+    inner_width: usize,
+    image: TransformerAttentionStreamProjection,
+    text: Option<TransformerAttentionStreamProjection>,
+}
+
+#[allow(dead_code)]
+impl NativeTransformerAttentionProjection {
+    fn from_hfq(
+        hfq: &HfqFile,
+        family: TransformerDenoiserFamily,
+        block_index: usize,
+        heads: usize,
+    ) -> DiffusionResult<Self> {
+        let block_prefix = format!("transformer/tensors/transformer_blocks.{block_index}.attn");
+        let image = TransformerAttentionStreamProjection::from_hfq(
+            hfq,
+            "image",
+            &format!("{block_prefix}.to_q.weight"),
+            &format!("{block_prefix}.to_q.bias"),
+            &format!("{block_prefix}.to_k.weight"),
+            &format!("{block_prefix}.to_k.bias"),
+            &format!("{block_prefix}.to_v.weight"),
+            &format!("{block_prefix}.to_v.bias"),
+            &format!("{block_prefix}.norm_q.weight"),
+            &format!("{block_prefix}.norm_k.weight"),
+            &format!("{block_prefix}.to_out.0.weight"),
+            &format!("{block_prefix}.to_out.0.bias"),
+            true,
+            heads,
+            None,
+            None,
+            None,
+        )?
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata(format!(
+                "transformer block {block_index} image attention stream is missing"
+            ))
+        })?;
+        let (hidden_width, inner_width, head_dim) =
+            image.validate_shapes(heads, None, None, None)?;
+
+        let text_required = matches!(
+            family,
+            TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Unknown
+        );
+        let text = TransformerAttentionStreamProjection::from_hfq(
+            hfq,
+            "text",
+            &format!("{block_prefix}.add_q_proj.weight"),
+            &format!("{block_prefix}.add_q_proj.bias"),
+            &format!("{block_prefix}.add_k_proj.weight"),
+            &format!("{block_prefix}.add_k_proj.bias"),
+            &format!("{block_prefix}.add_v_proj.weight"),
+            &format!("{block_prefix}.add_v_proj.bias"),
+            &format!("{block_prefix}.norm_added_q.weight"),
+            &format!("{block_prefix}.norm_added_k.weight"),
+            &format!("{block_prefix}.to_add_out.weight"),
+            &format!("{block_prefix}.to_add_out.bias"),
+            text_required,
+            heads,
+            Some(hidden_width),
+            Some(inner_width),
+            Some(head_dim),
+        )?;
+
+        Ok(Self {
+            family,
+            block_index,
+            heads,
+            head_dim,
+            hidden_width,
+            inner_width,
+            image,
+            text,
+        })
+    }
+
+    fn project_image_qkv_with_runtime_context(
+        &self,
+        hidden: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<TransformerAttentionQkv> {
+        self.validate_hidden_input(hidden, TransformerModulationStream::Image)?;
+        self.image.project_qkv_with_runtime_context(
+            hidden,
+            self.heads,
+            self.head_dim,
+            runtime_context,
+        )
+    }
+
+    fn project_text_qkv_with_runtime_context(
+        &self,
+        hidden: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<Option<TransformerAttentionQkv>> {
+        self.validate_hidden_input(hidden, TransformerModulationStream::Text)?;
+        let Some(text) = self.text.as_ref() else {
+            return Ok(None);
+        };
+        text.project_qkv_with_runtime_context(hidden, self.heads, self.head_dim, runtime_context)
+            .map(Some)
+    }
+
+    fn project_image_output_with_runtime_context(
+        &self,
+        attention: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
+        self.validate_attention_input(attention, TransformerModulationStream::Image)?;
+        self.image
+            .project_output_with_runtime_context(attention, runtime_context)
+    }
+
+    fn project_text_output_with_runtime_context(
+        &self,
+        attention: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<Option<CpuTensor>> {
+        self.validate_attention_input(attention, TransformerModulationStream::Text)?;
+        let Some(text) = self.text.as_ref() else {
+            return Ok(None);
+        };
+        text.project_output_with_runtime_context(attention, runtime_context)
+            .map(Some)
+    }
+
+    fn validate_hidden_input(
+        &self,
+        hidden: &CpuTensor,
+        stream: TransformerModulationStream,
+    ) -> DiffusionResult<()> {
+        let [_, _, width] = shape3(hidden)?;
+        if width != self.hidden_width {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "transformer block {} {:?} hidden width {width} != expected {}",
+                self.block_index, stream, self.hidden_width
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_attention_input(
+        &self,
+        attention: &CpuTensor,
+        stream: TransformerModulationStream,
+    ) -> DiffusionResult<()> {
+        let [_, _, width] = shape3(attention)?;
+        if width != self.inner_width {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "transformer block {} {:?} attention width {width} != expected {}",
+                self.block_index, stream, self.inner_width
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum TransformerModulationStream {
     Image,
     Text,
 }
 
+#[allow(dead_code)]
+fn attention_norm_weight_dim(weight: &CpuTensor) -> DiffusionResult<usize> {
+    match weight.shape.as_slice() {
+        [dim] if *dim > 0 => Ok(*dim),
+        _ => Err(DiffusionError::InvalidMetadata(format!(
+            "transformer attention norm weight shape {:?} is not [head_dim]",
+            weight.shape
+        ))),
+    }
+}
+
+#[allow(dead_code)]
+fn validate_attention_linear_shape(
+    stream_label: &str,
+    name: &str,
+    weight: &CpuTensor,
+    expected_rows: usize,
+    expected_cols: usize,
+) -> DiffusionResult<()> {
+    if weight.shape.as_slice() != [expected_rows, expected_cols] {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "{stream_label} transformer attention {name} weight shape {:?} != [{expected_rows}, {expected_cols}]",
+            weight.shape
+        )));
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn validate_attention_bias_shape(
+    stream_label: &str,
+    name: &str,
+    bias: Option<&CpuTensor>,
+    expected_width: usize,
+) -> DiffusionResult<()> {
+    if let Some(bias) = bias {
+        if bias.shape.as_slice() != [expected_width] {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "{stream_label} transformer attention {name} bias shape {:?} != [{expected_width}]",
+                bias.shape
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn validate_attention_norm_shape(
+    stream_label: &str,
+    name: &str,
+    weight: Option<&CpuTensor>,
+    head_dim: usize,
+) -> DiffusionResult<()> {
+    if let Some(weight) = weight {
+        if weight.shape.as_slice() != [head_dim] {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "{stream_label} transformer attention {name} norm shape {:?} != [{head_dim}]",
+                weight.shape
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn maybe_rms_norm_attention_heads_3d(
+    input: CpuTensor,
+    weight: Option<&CpuTensor>,
+    heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> DiffusionResult<CpuTensor> {
+    let Some(weight) = weight else {
+        return Ok(input);
+    };
+    rms_norm_attention_heads_3d(&input, weight, heads, head_dim, eps)
+}
+
+#[allow(dead_code)]
+fn rms_norm_attention_heads_3d(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> DiffusionResult<CpuTensor> {
+    let [batch, seq, width] = shape3(input)?;
+    if heads == 0 || head_dim == 0 || width != heads * head_dim {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "attention-head RMSNorm input width {width} is incompatible with heads {heads} and head_dim {head_dim}"
+        )));
+    }
+    if weight.shape.as_slice() != [head_dim] {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "attention-head RMSNorm weight shape {:?} != [{head_dim}]",
+            weight.shape
+        )));
+    }
+    let mut out = CpuTensor::zeros(&[batch, seq, width]);
+    for b in 0..batch {
+        for token in 0..seq {
+            let token_base = (b * seq + token) * width;
+            for head in 0..heads {
+                let head_base = token_base + head * head_dim;
+                let mut square_sum = 0.0f32;
+                for dim in 0..head_dim {
+                    let value = input.data[head_base + dim];
+                    square_sum += value * value;
+                }
+                let inv_rms = (square_sum / head_dim as f32 + eps).sqrt().recip();
+                for dim in 0..head_dim {
+                    out.data[head_base + dim] =
+                        input.data[head_base + dim] * inv_rms * weight.data[dim];
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[allow(dead_code)]
 fn split_modulation_chunks(
     projected: CpuTensor,
     chunk_count: usize,
@@ -12272,6 +12794,7 @@ fn bsc_to_nchw(
     Ok(out)
 }
 
+#[allow(dead_code)]
 fn latent_batch_to_patch_tokens(
     latents: &LatentBatch,
     patch_size: usize,
@@ -12351,6 +12874,7 @@ fn latent_batch_to_patch_tokens(
     Ok(tokens)
 }
 
+#[allow(dead_code)]
 fn patch_tokens_to_latent_batch(
     tokens: &CpuTensor,
     batch: usize,
@@ -17003,6 +17527,196 @@ mod tests {
             out.data,
             vec![1.5, 1.5, 4.0, 6.0, 4.0, 6.25, -0.5, -2.5, -2.0, -2.0, -6.0, -5.75]
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_transformer_attention_projects_qwen_image_and_text_qkv() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-qwen-transformer-attn-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("qwen-transformer-attn.hfq");
+        let prefix = "transformer/tensors/transformer_blocks.0.attn";
+        let identity4 = [
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ];
+        let double_identity4 = [
+            2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0,
+        ];
+        write_hfqm_package_mem(
+            &path,
+            HFQ_ARCH_DIFFUSION,
+            "{}",
+            &[
+                f32_mem_tensor(&format!("{prefix}.to_q.weight"), &[4, 4], &identity4),
+                f32_mem_tensor(&format!("{prefix}.to_q.bias"), &[4], &[0.0, 0.0, 0.0, 0.0]),
+                f32_mem_tensor(&format!("{prefix}.to_k.weight"), &[4, 4], &identity4),
+                f32_mem_tensor(&format!("{prefix}.to_v.weight"), &[4, 4], &identity4),
+                f32_mem_tensor(&format!("{prefix}.norm_q.weight"), &[2], &[1.0, 2.0]),
+                f32_mem_tensor(&format!("{prefix}.norm_k.weight"), &[2], &[0.5, 1.5]),
+                f32_mem_tensor(&format!("{prefix}.to_out.0.weight"), &[4, 4], &identity4),
+                f32_mem_tensor(
+                    &format!("{prefix}.to_out.0.bias"),
+                    &[4],
+                    &[0.25, -0.25, 1.0, -1.0],
+                ),
+                f32_mem_tensor(
+                    &format!("{prefix}.add_q_proj.weight"),
+                    &[4, 4],
+                    &double_identity4,
+                ),
+                f32_mem_tensor(
+                    &format!("{prefix}.add_k_proj.weight"),
+                    &[4, 4],
+                    &double_identity4,
+                ),
+                f32_mem_tensor(
+                    &format!("{prefix}.add_v_proj.weight"),
+                    &[4, 4],
+                    &double_identity4,
+                ),
+                f32_mem_tensor(&format!("{prefix}.norm_added_q.weight"), &[2], &[1.0, 1.0]),
+                f32_mem_tensor(&format!("{prefix}.norm_added_k.weight"), &[2], &[2.0, 1.0]),
+                f32_mem_tensor(&format!("{prefix}.to_add_out.weight"), &[4, 4], &identity4),
+                f32_mem_tensor(
+                    &format!("{prefix}.to_add_out.bias"),
+                    &[4],
+                    &[1.0, 0.0, -1.0, 0.5],
+                ),
+            ],
+        )
+        .unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let attention = NativeTransformerAttentionProjection::from_hfq(
+            &hfq,
+            TransformerDenoiserFamily::QwenImage,
+            0,
+            2,
+        )
+        .unwrap();
+        let hidden = CpuTensor {
+            shape: vec![1, 2, 4],
+            data: vec![3.0, 4.0, 0.0, 5.0, 0.0, 0.0, 6.0, 8.0],
+        };
+        let mut runtime_context =
+            DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+
+        let image = attention
+            .project_image_qkv_with_runtime_context(&hidden, &mut runtime_context)
+            .unwrap();
+        assert_eq!(image.q.shape, vec![1, 2, 4]);
+        assert_f32_close(
+            &image.q.data,
+            &rms_norm_heads_reference(&hidden.data, 2, 2, &[1.0, 2.0]),
+            1e-5,
+        );
+        assert_f32_close(
+            &image.k.data,
+            &rms_norm_heads_reference(&hidden.data, 2, 2, &[0.5, 1.5]),
+            1e-5,
+        );
+        assert_eq!(image.v.data, hidden.data);
+        let image_out = attention
+            .project_image_output_with_runtime_context(&image.v, &mut runtime_context)
+            .unwrap();
+        assert_eq!(image_out.shape, vec![1, 2, 4]);
+        assert_eq!(
+            image_out.data,
+            vec![3.25, 3.75, 1.0, 4.0, 0.25, -0.25, 7.0, 7.0]
+        );
+
+        let text = attention
+            .project_text_qkv_with_runtime_context(&hidden, &mut runtime_context)
+            .unwrap()
+            .unwrap();
+        let doubled = hidden
+            .data
+            .iter()
+            .map(|value| value * 2.0)
+            .collect::<Vec<_>>();
+        assert_f32_close(
+            &text.q.data,
+            &rms_norm_heads_reference(&doubled, 2, 2, &[1.0, 1.0]),
+            1e-5,
+        );
+        assert_f32_close(
+            &text.k.data,
+            &rms_norm_heads_reference(&doubled, 2, 2, &[2.0, 1.0]),
+            1e-5,
+        );
+        assert_eq!(text.v.data, doubled);
+        let text_out = attention
+            .project_text_output_with_runtime_context(&text.v, &mut runtime_context)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            text_out.data,
+            vec![7.0, 8.0, -1.0, 10.5, 1.0, 0.0, 11.0, 16.5]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_transformer_attention_projects_krea_image_qkv_without_text_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-krea-transformer-attn-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("krea-transformer-attn.hfq");
+        let prefix = "transformer/tensors/transformer_blocks.0.attn";
+        let identity4 = [
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ];
+        write_hfqm_package_mem(
+            &path,
+            HFQ_ARCH_DIFFUSION,
+            "{}",
+            &[
+                f32_mem_tensor(&format!("{prefix}.to_q.weight"), &[4, 4], &identity4),
+                f32_mem_tensor(&format!("{prefix}.to_k.weight"), &[4, 4], &identity4),
+                f32_mem_tensor(&format!("{prefix}.to_v.weight"), &[4, 4], &identity4),
+                f32_mem_tensor(&format!("{prefix}.to_out.0.weight"), &[4, 4], &identity4),
+            ],
+        )
+        .unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let attention = NativeTransformerAttentionProjection::from_hfq(
+            &hfq,
+            TransformerDenoiserFamily::Krea2,
+            0,
+            2,
+        )
+        .unwrap();
+        let hidden = CpuTensor {
+            shape: vec![1, 1, 4],
+            data: vec![1.0, -2.0, 3.0, -4.0],
+        };
+        let mut runtime_context =
+            DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+
+        let image = attention
+            .project_image_qkv_with_runtime_context(&hidden, &mut runtime_context)
+            .unwrap();
+        assert_eq!(image.q.data, hidden.data);
+        assert_eq!(image.k.data, hidden.data);
+        assert_eq!(image.v.data, hidden.data);
+        assert!(attention
+            .project_text_qkv_with_runtime_context(&hidden, &mut runtime_context)
+            .unwrap()
+            .is_none());
+        let image_out = attention
+            .project_image_output_with_runtime_context(&image.v, &mut runtime_context)
+            .unwrap();
+        assert_eq!(image_out.data, hidden.data);
+        assert!(attention
+            .project_text_output_with_runtime_context(&image.v, &mut runtime_context)
+            .unwrap()
+            .is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -25587,6 +26301,44 @@ mod tests {
                 .flat_map(|value| value.to_le_bytes())
                 .collect::<Vec<_>>(),
         }
+    }
+
+    fn assert_f32_close(actual: &[f32], expected: &[f32], tolerance: f32) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "mismatch at {index}: actual={actual} expected={expected} tolerance={tolerance}"
+            );
+        }
+    }
+
+    fn rms_norm_heads_reference(
+        data: &[f32],
+        heads: usize,
+        head_dim: usize,
+        weight: &[f32],
+    ) -> Vec<f32> {
+        assert_eq!(weight.len(), head_dim);
+        let width = heads * head_dim;
+        assert_eq!(data.len() % width, 0);
+        let mut out = vec![0.0; data.len()];
+        for token in 0..(data.len() / width) {
+            let token_base = token * width;
+            for head in 0..heads {
+                let head_base = token_base + head * head_dim;
+                let mut square_sum = 0.0f32;
+                for dim in 0..head_dim {
+                    let value = data[head_base + dim];
+                    square_sum += value * value;
+                }
+                let inv_rms = (square_sum / head_dim as f32 + 1e-6).sqrt().recip();
+                for dim in 0..head_dim {
+                    out[head_base + dim] = data[head_base + dim] * inv_rms * weight[dim];
+                }
+            }
+        }
+        out
     }
 
     fn q4f16_g64_mem_tensor(name: &str, shape: &[u32], data: &[f32]) -> HfqMemTensor {
