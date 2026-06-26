@@ -18,6 +18,14 @@ fn samples(n: usize) -> Vec<usize> {
     let cnt = 16.min(n);
     (0..cnt).map(|i| (i * 2654435761) % n).collect()
 }
+// Upload i32 values into an F32-typed tensor as raw bytes (the loss kernels read
+// them as `const int*`); mirrors `dflash_train::upos`.
+fn up_i32(gpu: &mut Gpu, vals: &[i32]) -> GpuTensor {
+    let t = gpu.alloc_tensor(&[vals.len()], DType::F32).unwrap();
+    let bytes: Vec<u8> = vals.iter().flat_map(|p| p.to_le_bytes()).collect();
+    gpu.hip.memcpy_htod(&t.buf, &bytes).unwrap();
+    t
+}
 fn report(name: &str, pairs: &[(f64, f64)]) -> f64 {
     let mut worst = 0f64;
     for (fd, an) in pairs {
@@ -303,6 +311,55 @@ fn main() {
         worst = worst.max(report_host("attn dQ", &dq, &hq));
         worst = worst.max(report_host("attn dK", &dk, &hk));
         worst = worst.max(report_host("attn dV", &dv, &hv));
+    }
+
+    // ---- kl_topk_loss_bwd_f32: dlogits = w·(p − q) for a soft top-K target ----
+    // Decisive: GPU dlogits + per-row loss vs independent f64 host-analytic values.
+    {
+        let (b, v, k) = (4usize, 512usize, 8usize);
+        let logits: Vec<f32> = (0..b * v).map(|i| frand(i) * 2.0).collect();
+        let weights: Vec<f32> = (0..b).map(|i| 0.5 + frand(i + 7).abs()).collect();
+        // distinct top-K ids per row + probs normalized to sum 1 over the support
+        let mut ids = vec![0i32; b * k];
+        let mut probs = vec![0f32; b * k];
+        for r in 0..b {
+            let mut raw = vec![0f32; k];
+            let mut sum = 0f32;
+            for j in 0..k {
+                ids[r * k + j] = ((r * 131 + j * 977) % v) as i32; // distinct within a row
+                raw[j] = frand(r * 31 + j + 3).abs() + 0.1;
+                sum += raw[j];
+            }
+            for j in 0..k { probs[r * k + j] = raw[j] / sum; }
+        }
+        let lg = gpu.upload_f32(&logits, &[b, v]).unwrap();
+        let idg = up_i32(&mut gpu, &ids);
+        let qg = gpu.upload_f32(&probs, &[b, k]).unwrap();
+        let wg = gpu.upload_f32(&weights, &[b]).unwrap();
+        let dlg = gpu.zeros(&[b * v], DType::F32).unwrap();
+        let losg = gpu.zeros(&[b], DType::F32).unwrap();
+        gpu.kl_topk_loss_bwd_f32(&lg, &idg, &qg, &wg, &dlg, &losg, b, v, k).unwrap();
+        let dl = gpu.download_f32(&dlg).unwrap();
+        let los = gpu.download_f32(&losg).unwrap();
+        let mut hdl = vec![0f64; b * v];
+        let mut hlos = vec![0f64; b];
+        for r in 0..b {
+            let row = &logits[r * v..(r + 1) * v];
+            let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+            let z: f64 = row.iter().map(|&x| (x as f64 - mx).exp()).sum();
+            let w = weights[r] as f64;
+            for i in 0..v { hdl[r * v + i] = w * ((row[i] as f64 - mx).exp() / z); }
+            let mut qdot = 0f64;
+            for j in 0..k {
+                let id = ids[r * k + j] as usize;
+                let q = probs[r * k + j] as f64;
+                hdl[r * v + id] -= w * q;
+                qdot += q * row[id] as f64;
+            }
+            hlos[r] = w * ((z.ln() + mx) - qdot);
+        }
+        worst = worst.max(report_host("kl_topk dlogits", &dl, &hdl));
+        worst = worst.max(report_host("kl_topk loss", &los, &hlos));
     }
 
     if worst < 1e-2 {

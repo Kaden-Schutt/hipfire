@@ -2218,6 +2218,27 @@ impl Gpu {
         unsafe { self.hip.launch_kernel(func, [b as u32, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 
+    /// KL-distillation backward against a top-K soft target (per-row weighted).
+    /// `tgt_ids`/`tgt_probs` are `[b, k]` (probs sum to 1 over the K support per
+    /// row, zero-padded). Writes `dlogits = w·(p − q)` and the per-row CE loss.
+    /// Mirrors `ce_loss_bwd_f32` with a soft top-K target instead of a one-hot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kl_topk_loss_bwd_f32(&mut self, logits: &GpuTensor, tgt_ids: &GpuTensor, tgt_probs: &GpuTensor, weights: &GpuTensor, dlogits: &GpuTensor, loss: &GpuTensor, b: usize, v: usize, k: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("dflash_train", kernels::DFLASH_TRAIN_SRC, "kl_topk_loss_bwd_f32")?;
+        let func = &self.functions["kl_topk_loss_bwd_f32"];
+        let mut lp = logits.buf.as_ptr(); let mut idp = tgt_ids.buf.as_ptr(); let mut qp = tgt_probs.buf.as_ptr(); let mut wp = weights.buf.as_ptr();
+        let mut dp = dlogits.buf.as_ptr(); let mut losp = loss.buf.as_ptr();
+        let mut bi = b as i32; let mut vi = v as i32; let mut ki = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut lp as *mut _ as *mut c_void, &mut idp as *mut _ as *mut c_void, &mut qp as *mut _ as *mut c_void, &mut wp as *mut _ as *mut c_void,
+            &mut dp as *mut _ as *mut c_void, &mut losp as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void, &mut vi as *mut _ as *mut c_void, &mut ki as *mut _ as *mut c_void,
+        ];
+        let block = if v >= 256 { 256u32 } else { (v as u32).next_power_of_two().max(1) };
+        unsafe { self.hip.launch_kernel(func, [b as u32, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
     /// AdamW step (fp32 m/v). `bc1`/`bc2` = 1/(1-beta^t) bias-correction (host).
     #[allow(clippy::too_many_arguments)]
     pub fn adam_step_f32(&mut self, w: &GpuTensor, g: &GpuTensor, m: &GpuTensor, v: &GpuTensor, lr: f32, b1: f32, b2: f32, eps: f32, wd: f32, bc1: f32, bc2: f32, n: usize) -> HipResult<()> {

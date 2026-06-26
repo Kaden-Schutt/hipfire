@@ -333,6 +333,65 @@ extern "C" __global__ void ce_loss_bwd_f32(
     if (t == 0) loss[b] = w * (logf(z) + mx - lg[tgt]);
 }
 
+// KL-distillation backward against a top-K soft target, per-row weighted.
+//   Target q is (tgt_ids[b,0..K], tgt_probs[b,0..K]) with Σ_k q_k = 1 over the K
+//   support; zero-padded rows carry q=0. Because Σq=1, the KL gradient collapses
+//   to the soft-target cross-entropy form (the entropy term Σ q·log q is grad-free):
+//     p = softmax(logits_row)
+//     dlogits_i = w_b · (p_i − q_i)        (q_i = target prob if i∈support, else 0)
+//     loss_b    = w_b · ( (log z + mx) − Σ_k q_k·lg[id_k] )   (cross-entropy part)
+// One block per row. Phase A writes w·p over all V; phase B scatters −w·q onto the
+// K support with atomicAdd (ids are distinct; a __syncthreads orders A before B).
+// Non-positive weight -> zero loss + zero grad naturally (same as ce_loss_bwd_f32).
+extern "C" __global__ void kl_topk_loss_bwd_f32(
+    const float* __restrict__ logits,
+    const int* __restrict__ tgt_ids,
+    const float* __restrict__ tgt_probs,
+    const float* __restrict__ weights,
+    float* __restrict__ dlogits,
+    float* __restrict__ loss,
+    int B, int V, int K)
+{
+    int b = blockIdx.x;
+    if (b >= B) return;
+    int t = threadIdx.x, bs = blockDim.x;
+    const float* lg = logits + (size_t)b * V;
+    float w = weights[b];
+    __shared__ float red[256];
+    // max
+    float lm = -INFINITY;
+    for (int i = t; i < V; i += bs) lm = fmaxf(lm, lg[i]);
+    red[t] = lm; __syncthreads();
+    for (int s = bs / 2; s > 0; s >>= 1) { if (t < s) red[t] = fmaxf(red[t], red[t + s]); __syncthreads(); }
+    float mx = red[0]; __syncthreads();
+    // sumexp
+    float ls = 0.0f;
+    for (int i = t; i < V; i += bs) ls += __expf(lg[i] - mx);
+    red[t] = ls; __syncthreads();
+    for (int s = bs / 2; s > 0; s >>= 1) { if (t < s) red[t] += red[t + s]; __syncthreads(); }
+    float z = red[0]; __syncthreads();
+    float invz = 1.0f / z;
+    // phase A: dlogits_i = w · p_i  (plain write over the full row)
+    for (int i = t; i < V; i += bs) {
+        float p = __expf(lg[i] - mx) * invz;
+        dlogits[(size_t)b * V + i] = w * p;
+    }
+    __syncthreads();
+    // phase B: scatter −w·q onto the K support and accumulate Σ q·lg[id]
+    float qdot = 0.0f;
+    for (int j = t; j < K; j += bs) {
+        float q = tgt_probs[(size_t)b * K + j];
+        if (q != 0.0f) {
+            int id = tgt_ids[(size_t)b * K + j];
+            atomicAdd(&dlogits[(size_t)b * V + id], -w * q);
+            qdot += q * lg[id];
+        }
+    }
+    red[t] = qdot; __syncthreads();
+    for (int s = bs / 2; s > 0; s >>= 1) { if (t < s) red[t] += red[t + s]; __syncthreads(); }
+    if (t == 0) loss[b] = w * ((logf(z) + mx) - red[0]);
+}
+
 // AdamW step. Bias-correction factors bc1 = 1/(1-b1^t), bc2 = 1/(1-b2^t) are
 // passed precomputed from the host. Decoupled weight decay `wd`.
 //   m = b1 m + (1-b1) g ;  v = b2 v + (1-b2) g^2

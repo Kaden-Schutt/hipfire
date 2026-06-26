@@ -115,6 +115,97 @@ pub fn load_zlab(gpu: &mut Gpu, cfg: &Cfg, path: &Path) -> std::io::Result<Net> 
     })
 }
 
+/// Deterministic small init in (-1, 1) — same hash as the example warm-start init,
+/// kept lib-local so `load_target_init` needs no rng dependency.
+fn frand(seed: usize) -> f32 { ((seed.wrapping_mul(2654435761) % 2000) as f32 / 1000.0) - 1.0 }
+
+/// Discover the target's FULL-ATTENTION layer indices (those exposing a
+/// `self_attn.q_proj` weight). Qwen3.6-27B is a GatedDeltaNet *hybrid*: only ~1/4
+/// of its layers are full self-attention (layers 3,7,…,63); the rest are
+/// `linear_attn`. The full-attn drafter can only be seeded from these.
+fn target_full_attn_layers(hfq: &hipfire_runtime::hfq::HfqFile) -> Vec<usize> {
+    let mut v: Vec<usize> = hfq.tensors().iter()
+        .filter_map(|t| {
+            let p = t.name.strip_suffix(".self_attn.q_proj.weight")?;
+            p.rsplit_once("layers.").and_then(|(_, s)| s.parse::<usize>().ok())
+        })
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// Target-init loader for the d=5120, z-lab-scale drafter: seeds the 5 (full-attn)
+/// drafter layers from an evenly-strided slice of the **Qwen3.6-27B target's own
+/// full-attention layers**, read and dequantized straight out of the `.hfq` (no
+/// separate pretrained drafter or LFM2 warm-start). Produces the same zlab-shaped
+/// `Net` as `load_zlab`: identity in/out (d == d_tgt), a FRESH `fc` adapter at
+/// native `5·d_tgt` width, the target's final norm, and a frozen identity
+/// `hidden_norm` (z-lab post-fc RMSNorm convention; not an Adam param). Use
+/// `Cfg::zlab_27b()`.
+pub fn load_target_init(gpu: &mut Gpu, cfg: &Cfg, hfq_path: &Path) -> std::io::Result<Net> {
+    use hipfire_runtime::hfq::HfqFile;
+    use hipfire_runtime::weight_backend::dequant_f32;
+    assert!(cfg.is_attn.iter().all(|&a| a), "target-init seeds full-attention layers only");
+    let hfq = HfqFile::open(hfq_path)?;
+    let d = cfg.d;
+    let n = cfg.is_attn.len();
+    // Evenly stride `n` picks across the target's full-attention layers.
+    let fa = target_full_attn_layers(&hfq);
+    assert!(fa.len() >= n, "target has {} full-attn layers (need >= {n})", fa.len());
+    let sel: Vec<usize> = (0..n)
+        .map(|i| fa[if n == 1 { 0 } else { (i * (fa.len() - 1) + (n - 1) / 2) / (n - 1) }])
+        .collect();
+    eprintln!("target-init: seeding {n} drafter layers from full-attn target layers {sel:?} (of {} full-attn / strided)", fa.len());
+    // Resolve a logical `layers.{i}…` rel-name against the qwen `.hfq` prefixes
+    // (canonical `model.language_model.` first, then `model.`, then bare),
+    // dequantize to f32, and upload with the requested 2-D shape.
+    let g = |gpu: &mut Gpu, hfq: &HfqFile, rel: &str, sh: &[usize]| -> GpuTensor {
+        let cands = [format!("model.language_model.{rel}"), format!("model.{rel}"), rel.to_string()];
+        for c in &cands {
+            if let Some((info, bytes)) = hfq.tensor_data_vec(c) {
+                let numel: usize = sh.iter().product();
+                let mut t = dequant_f32(gpu, info.quant_type, &bytes, numel).expect("target dequant");
+                t.shape = sh.to_vec();
+                return t;
+            }
+        }
+        panic!("target .hfq missing tensor {rel}");
+    };
+    let mut layers = Vec::new();
+    for &tl in sel.iter() {
+        let p = format!("layers.{tl}");
+        layers.push(LW {
+            op_norm: g(gpu, &hfq, &format!("{p}.input_layernorm.weight"), &[d]),
+            ffn_norm: g(gpu, &hfq, &format!("{p}.post_attention_layernorm.weight"), &[d]),
+            in_proj: None, conv_w: None, out_proj: None,
+            wq: Some(g(gpu, &hfq, &format!("{p}.self_attn.q_proj.weight"), &[cfg.nh * cfg.hd, d])),
+            wk: Some(g(gpu, &hfq, &format!("{p}.self_attn.k_proj.weight"), &[cfg.nkv * cfg.hd, d])),
+            wv: Some(g(gpu, &hfq, &format!("{p}.self_attn.v_proj.weight"), &[cfg.nkv * cfg.hd, d])),
+            wo: Some(g(gpu, &hfq, &format!("{p}.self_attn.o_proj.weight"), &[d, cfg.nh * cfg.hd])),
+            q_norm: Some(g(gpu, &hfq, &format!("{p}.self_attn.q_norm.weight"), &[cfg.hd])),
+            k_norm: Some(g(gpu, &hfq, &format!("{p}.self_attn.k_norm.weight"), &[cfg.hd])),
+            w_c: None,
+            w1: g(gpu, &hfq, &format!("{p}.mlp.gate_proj.weight"), &[cfg.inter, d]),
+            w3: g(gpu, &hfq, &format!("{p}.mlp.up_proj.weight"), &[cfg.inter, d]),
+            w2: g(gpu, &hfq, &format!("{p}.mlp.down_proj.weight"), &[d, cfg.inter]),
+        });
+    }
+    // identity in/out (drafter natively d == d_tgt)
+    let mut eye = vec![0f32; d * d];
+    for i in 0..d { eye[i * d + i] = 1.0; }
+    let in_proj_v = gpu.upload_f32(&eye, &[d, d]).unwrap();
+    let out_proj_v = gpu.upload_f32(&eye, &[d, d]).unwrap();
+    // fresh fc adapter [d, n_tgt_layers*d_tgt], small deterministic init.
+    let fc_in = cfg.n_tgt_layers * cfg.d_tgt;
+    let sc = 1.0 / (fc_in as f32).sqrt();
+    let fc_h: Vec<f32> = (0..d * fc_in).map(|i| frand(i) * sc).collect();
+    let fc = gpu.upload_f32(&fc_h, &[d, fc_in]).unwrap();
+    let final_norm = g(gpu, &hfq, "norm.weight", &[d]);
+    let hidden_norm = Some(gpu.upload_f32(&vec![1.0f32; d], &[d]).unwrap());
+    Ok(Net { layers, in_proj_v, out_proj_v, fc, final_norm, hidden_norm })
+}
+
 pub fn net_tensors(net: &Net) -> Vec<&GpuTensor> {
     let mut v = Vec::new();
     for l in &net.layers { v.extend(lw_tensors(l)); }
