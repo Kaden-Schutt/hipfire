@@ -112,6 +112,212 @@ fn load_wt(
     wt_from_raw(gpu, qt, &data, m, k).map_err(|e| format!("lfm2moe: load_wt {name}: {e}"))
 }
 
+fn awq_scale_name(weight_name: &str) -> String {
+    match weight_name.strip_suffix(".weight") {
+        Some(stem) => format!("{stem}.awq_scale.weight"),
+        None => format!("{weight_name}.awq_scale.weight"),
+    }
+}
+
+fn load_wt_with_awq(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+) -> Result<WeightTensor, String> {
+    let mut w = load_wt(hfq, gpu, name, m, k)?;
+    let sidecar = awq_scale_name(name);
+    w.awq_scale = load_lfm2_awq_scale(hfq, gpu, &sidecar, k);
+    if w.awq_scale.is_some() {
+        eprintln!("lfm2moe: AWQ scale attached for {name}");
+    }
+    Ok(w)
+}
+
+const OQ_PLUS_QT: u8 = 33;
+const OQ4_QT: u8 = 34;
+const OQ8_QT: u8 = 35;
+const OQ_PLUS_COMPACT_QT: u8 = 36;
+const OQ4_ARCH_PACKED_QT: u8 = 37;
+const OQ_GROUP: usize = 256;
+
+fn oq4_arch_combined_len(m: usize, k: usize) -> usize {
+    let ng = k / OQ_GROUP;
+    m * (k / 2) + m * ng * 4 + m * ng * (4 + 128)
+}
+
+fn sext4(nib: u8) -> i8 {
+    let v = (nib & 0x0f) as i8;
+    if v > 7 {
+        v - 16
+    } else {
+        v
+    }
+}
+
+fn pack_oq4_arch_combined(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
+    const BLOCK: usize = 130; // [f16 scale][128 nibbles]
+    const INTERLEAVED_BLOCK: usize = 132; // [f32 scale][128 nibbles]
+    if k % OQ_GROUP != 0 {
+        return Err(format!("OQ4G256 requires K % 256 == 0 (got K={k})"));
+    }
+    let ng = k / OQ_GROUP;
+    let expect = m * ng * BLOCK;
+    if data.len() != expect {
+        return Err(format!(
+            "OQ4G256 byte length {} != M*ng*130 = {expect} (M={m} K={k})",
+            data.len()
+        ));
+    }
+    let packed_bytes = m * (k / 2);
+    let scales_bytes = m * ng * 4;
+    let il_base = packed_bytes + scales_bytes;
+    let mut out = vec![0u8; oq4_arch_combined_len(m, k)];
+    for r in 0..m {
+        for g in 0..ng {
+            let src = (r * ng + g) * BLOCK;
+            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+            let split_dst = r * (k / 2) + g * (OQ_GROUP / 2);
+            out[split_dst..split_dst + 128].copy_from_slice(&data[src + 2..src + BLOCK]);
+
+            let scale_dst = packed_bytes + (r * ng + g) * 4;
+            out[scale_dst..scale_dst + 4].copy_from_slice(&scale.to_le_bytes());
+
+            let il_dst = il_base + (r * ng + g) * INTERLEAVED_BLOCK;
+            out[il_dst..il_dst + 4].copy_from_slice(&scale.to_le_bytes());
+            out[il_dst + 4..il_dst + INTERLEAVED_BLOCK]
+                .copy_from_slice(&data[src + 2..src + BLOCK]);
+        }
+    }
+    Ok(out)
+}
+
+fn expand_oq_plus_to_oq8(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
+    const BLOCK: usize = 130; // [f16 scale][128 nibbles]
+    if k % OQ_GROUP != 0 {
+        return Err(format!("OQPLUS requires K % 256 == 0 (got K={k})"));
+    }
+    let ng = k / OQ_GROUP;
+    let expect = m * ng * BLOCK;
+    if data.len() != expect {
+        return Err(format!(
+            "OQPLUS byte length {} != M*ng*130 = {expect} (M={m} K={k})",
+            data.len()
+        ));
+    }
+    let weight_bytes = m * k;
+    let mut out = vec![0u8; weight_bytes + m * ng * 4];
+    for r in 0..m {
+        for g in 0..ng {
+            let src = (r * ng + g) * BLOCK;
+            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+            let dst = r * k + g * OQ_GROUP;
+            for i in 0..128 {
+                let byte = data[src + 2 + i];
+                out[dst + 2 * i] = sext4(byte & 0x0f) as u8;
+                out[dst + 2 * i + 1] = sext4(byte >> 4) as u8;
+            }
+            let scale_dst = weight_bytes + (r * ng + g) * 4;
+            out[scale_dst..scale_dst + 4].copy_from_slice(&scale.to_le_bytes());
+        }
+    }
+    Ok(out)
+}
+
+fn pack_oq8(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
+    const BLOCK: usize = 258; // [f16 scale][256 i8]
+    if k % OQ_GROUP != 0 {
+        return Err(format!("OQ8G256 requires K % 256 == 0 (got K={k})"));
+    }
+    let ng = k / OQ_GROUP;
+    let expect = m * ng * BLOCK;
+    if data.len() != expect {
+        return Err(format!(
+            "OQ8G256 byte length {} != M*ng*258 = {expect} (M={m} K={k})",
+            data.len()
+        ));
+    }
+    let weight_bytes = m * k;
+    let mut out = vec![0u8; weight_bytes + m * ng * 4];
+    for r in 0..m {
+        for g in 0..ng {
+            let src = (r * ng + g) * BLOCK;
+            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+            let dst = r * k + g * OQ_GROUP;
+            out[dst..dst + OQ_GROUP].copy_from_slice(&data[src + 2..src + BLOCK]);
+            let scale_dst = weight_bytes + (r * ng + g) * 4;
+            out[scale_dst..scale_dst + 4].copy_from_slice(&scale.to_le_bytes());
+        }
+    }
+    Ok(out)
+}
+
+fn expand_oq_plus_compact_to_oq8(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
+    if k % OQ_GROUP != 0 {
+        return Err(format!("OQ+C requires K % 256 == 0 (got K={k})"));
+    }
+    let ng = k / OQ_GROUP;
+    let n_groups = m * ng;
+    if n_groups == 0 || data.is_empty() || data.len() % n_groups != 0 {
+        return Err(format!(
+            "OQ+C byte length {} not divisible by n_groups {n_groups}",
+            data.len()
+        ));
+    }
+    let block_bytes = data.len() / n_groups;
+    if block_bytes < 132 || (block_bytes - 130) % 2 != 0 {
+        return Err(format!(
+            "OQ+C block_bytes {block_bytes} invalid (expected 130 + 2*N_out)"
+        ));
+    }
+    let n_out = (block_bytes - 130) / 2;
+    let weight_bytes = m * k;
+    let mut out = vec![0u8; weight_bytes + m * ng * 4];
+    for r in 0..m {
+        for g in 0..ng {
+            let src = (r * ng + g) * block_bytes;
+            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+            let dst = r * k + g * OQ_GROUP;
+            for i in 0..128 {
+                let byte = data[src + 2 + i];
+                out[dst + 2 * i] = sext4(byte & 0x0f) as u8;
+                out[dst + 2 * i + 1] = sext4(byte >> 4) as u8;
+            }
+            let tbl = src + 130;
+            for s in 0..n_out {
+                let idx = data[tbl + 2 * s] as usize;
+                let val = data[tbl + 2 * s + 1];
+                out[dst + idx] = val;
+            }
+            let scale_dst = weight_bytes + (r * ng + g) * 4;
+            out[scale_dst..scale_dst + 4].copy_from_slice(&scale.to_le_bytes());
+        }
+    }
+    Ok(out)
+}
+
+fn upload_wt_raw(
+    gpu: &mut Gpu,
+    data: &[u8],
+    dtype: DType,
+    m: usize,
+    k: usize,
+) -> Result<WeightTensor, String> {
+    let buf = gpu
+        .upload_raw(data, &[data.len()])
+        .map_err(|e| format!("upload_raw: {e:?}"))?;
+    Ok(WeightTensor {
+        buf,
+        gpu_dtype: dtype,
+        m,
+        k,
+        row_stride: 0,
+        paro: None,
+        awq_scale: None,
+    })
+}
+
 /// quant_type → DType mapping (mirrors minimax::wt_from_raw); uploads raw
 /// bytes and tags the dtype for kernel dispatch.
 fn wt_from_raw(
@@ -121,6 +327,47 @@ fn wt_from_raw(
     m: usize,
     k: usize,
 ) -> Result<WeightTensor, String> {
+    match qt {
+        OQ_PLUS_QT => {
+            return upload_wt_raw(
+                gpu,
+                &expand_oq_plus_to_oq8(data, m, k)?,
+                DType::Oq8G256,
+                m,
+                k,
+            )
+        }
+        OQ4_QT => {
+            return upload_wt_raw(
+                gpu,
+                &pack_oq4_arch_combined(data, m, k)?,
+                DType::Oq4G256,
+                m,
+                k,
+            )
+        }
+        OQ8_QT => return upload_wt_raw(gpu, &pack_oq8(data, m, k)?, DType::Oq8G256, m, k),
+        OQ_PLUS_COMPACT_QT => {
+            return upload_wt_raw(
+                gpu,
+                &expand_oq_plus_compact_to_oq8(data, m, k)?,
+                DType::Oq8G256,
+                m,
+                k,
+            )
+        }
+        OQ4_ARCH_PACKED_QT => {
+            let expect = oq4_arch_combined_len(m, k);
+            if data.len() != expect {
+                return Err(format!(
+                    "OQ4 arch-packed byte length {} != combined len {expect} (M={m} K={k})",
+                    data.len()
+                ));
+            }
+            return upload_wt_raw(gpu, data, DType::Oq4G256, m, k);
+        }
+        _ => {}
+    }
     let dtype = match qt {
         3 => DType::Q8_0,
         6 => DType::HFQ4G256,
@@ -135,18 +382,7 @@ fn wt_from_raw(
         1 => DType::F16,
         other => return Err(format!("unsupported quant_type {other}")),
     };
-    let buf = gpu
-        .upload_raw(data, &[data.len()])
-        .map_err(|e| format!("upload_raw: {e:?}"))?;
-    Ok(WeightTensor {
-        buf,
-        gpu_dtype: dtype,
-        m,
-        k,
-        row_stride: 0,
-        paro: None,
-        awq_scale: None,
-    })
+    upload_wt_raw(gpu, data, dtype, m, k)
 }
 
 // ──────────────────────────── Weights ────────────────────────────
@@ -261,7 +497,7 @@ impl Lfm2MoeWeights {
             // ── Mixer: conv vs attention ──────────────────────────────────
             let mixer = match cfg.mixer(l) {
                 MixerKind::Conv => {
-                    let in_proj = load_wt(
+                    let in_proj = load_wt_with_awq(
                         hfq,
                         gpu,
                         &format!("{p}.conv.in_proj.weight"),
@@ -275,7 +511,7 @@ impl Lfm2MoeWeights {
                         &format!("{p}.conv.conv.weight"),
                         &[hidden * k_conv],
                     )?;
-                    let out_proj = load_wt(
+                    let out_proj = load_wt_with_awq(
                         hfq,
                         gpu,
                         &format!("{p}.conv.out_proj.weight"),
@@ -292,28 +528,28 @@ impl Lfm2MoeWeights {
                     })
                 }
                 MixerKind::Attention => {
-                    let wq = load_wt(
+                    let wq = load_wt_with_awq(
                         hfq,
                         gpu,
                         &format!("{p}.self_attn.q_proj.weight"),
                         q_dim,
                         hidden,
                     )?;
-                    let wk = load_wt(
+                    let wk = load_wt_with_awq(
                         hfq,
                         gpu,
                         &format!("{p}.self_attn.k_proj.weight"),
                         kv_dim,
                         hidden,
                     )?;
-                    let wv = load_wt(
+                    let wv = load_wt_with_awq(
                         hfq,
                         gpu,
                         &format!("{p}.self_attn.v_proj.weight"),
                         kv_dim,
                         hidden,
                     )?;
-                    let wo = load_wt(
+                    let wo = load_wt_with_awq(
                         hfq,
                         gpu,
                         &format!("{p}.self_attn.out_proj.weight"),
@@ -349,21 +585,21 @@ impl Lfm2MoeWeights {
 
             // ── FFN: dense SwiGLU vs top-4 MoE ────────────────────────────
             let ffn = if cfg.is_dense_ffn(l) {
-                let w1 = load_wt(
+                let w1 = load_wt_with_awq(
                     hfq,
                     gpu,
                     &format!("{p}.feed_forward.w1.weight"),
                     dense_inter,
                     hidden,
                 )?;
-                let w3 = load_wt(
+                let w3 = load_wt_with_awq(
                     hfq,
                     gpu,
                     &format!("{p}.feed_forward.w3.weight"),
                     dense_inter,
                     hidden,
                 )?;
-                let w2 = load_wt(
+                let w2 = load_wt_with_awq(
                     hfq,
                     gpu,
                     &format!("{p}.feed_forward.w2.weight"),
@@ -534,6 +770,15 @@ impl Lfm2MoeState {
         cfg: &Lfm2MoeConfig,
         max_seq: usize,
     ) -> Result<Self, String> {
+        Self::new_with_physical_cap(gpu, cfg, max_seq, max_seq)
+    }
+
+    pub fn new_with_physical_cap(
+        gpu: &mut Gpu,
+        cfg: &Lfm2MoeConfig,
+        max_seq: usize,
+        physical_cap: usize,
+    ) -> Result<Self, String> {
         let hidden = cfg.hidden_size;
         let q_dim = cfg.q_dim();
         let kv_dim = cfg.kv_dim();
@@ -549,8 +794,15 @@ impl Lfm2MoeState {
 
         // KV cache: one slot per ATTENTION layer (conv layers carry no KV).
         let n_attn = cfg.num_attention_layers().max(1);
-        let kv = KvCache::new_gpu_q8(gpu, n_attn, cfg.num_key_value_heads, cfg.head_dim, max_seq)
-            .map_err(|e| format!("lfm2moe: kv cache: {e:?}"))?;
+        let kv = KvCache::new_gpu_q8_capped(
+            gpu,
+            n_attn,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            max_seq,
+            physical_cap,
+        )
+        .map_err(|e| format!("lfm2moe: kv cache: {e:?}"))?;
 
         // Conv-state cache: one [hidden,(K-1)] f32 ring buffer per CONV layer.
         let conv_hist = hidden * (k_conv - 1);
@@ -611,6 +863,7 @@ impl Lfm2MoeState {
     /// Reset for a new sequence: clear conv state and token count.
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.n_tokens = 0;
+        self.kv.compact_offset = 0;
         for cs in &self.conv_states {
             let zeros = vec![0u8; cs.numel() * 4];
             gpu.hip
@@ -618,5 +871,80 @@ impl Lfm2MoeState {
                 .map_err(|e| format!("lfm2moe: reset conv_state: {e:?}"))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn awq_scale_name_matches_quantizer_sidecar_convention() {
+        assert_eq!(
+            awq_scale_name("model.layers.0.feed_forward.w1.weight"),
+            "model.layers.0.feed_forward.w1.awq_scale.weight"
+        );
+        assert_eq!(
+            awq_scale_name("model.layers.0.conv.in_proj.weight"),
+            "model.layers.0.conv.in_proj.awq_scale.weight"
+        );
+    }
+
+    #[test]
+    fn oq4_pack_combined_preserves_split_and_interleaved_regions() {
+        let mut data = vec![0u8; 130];
+        data[0..2].copy_from_slice(&0x3c00u16.to_le_bytes()); // f16 1.0
+        for i in 0..128 {
+            data[2 + i] = i as u8;
+        }
+
+        let packed = pack_oq4_arch_combined(&data, 1, 256).unwrap();
+        assert_eq!(packed.len(), oq4_arch_combined_len(1, 256));
+        assert_eq!(&packed[0..128], &data[2..130]);
+        assert_eq!(&packed[128..132], &1.0f32.to_le_bytes());
+        assert_eq!(&packed[132..136], &1.0f32.to_le_bytes());
+        assert_eq!(&packed[136..264], &data[2..130]);
+    }
+
+    #[test]
+    fn oqplus_expands_signed_nibbles_to_oq8_layout() {
+        let mut data = vec![0u8; 130];
+        data[0..2].copy_from_slice(&0x3c00u16.to_le_bytes()); // f16 1.0
+        data[2] = 0x78; // low nibble -8, high nibble +7
+
+        let expanded = expand_oq_plus_to_oq8(&data, 1, 256).unwrap();
+        assert_eq!(expanded.len(), 256 + 4);
+        assert_eq!(expanded[0] as i8, -8);
+        assert_eq!(expanded[1] as i8, 7);
+        assert_eq!(&expanded[256..260], &1.0f32.to_le_bytes());
+    }
+
+    #[test]
+    fn oq8_repack_moves_scales_after_dense_int8_weights() {
+        let mut data = vec![0u8; 258];
+        data[0..2].copy_from_slice(&0x3800u16.to_le_bytes()); // f16 0.5
+        for i in 0..256 {
+            data[2 + i] = i as u8;
+        }
+
+        let packed = pack_oq8(&data, 1, 256).unwrap();
+        assert_eq!(packed.len(), 256 + 4);
+        assert_eq!(&packed[0..256], &data[2..258]);
+        assert_eq!(&packed[256..260], &0.5f32.to_le_bytes());
+    }
+
+    #[test]
+    fn oqplus_compact_overlays_outliers_after_bulk_expand() {
+        let mut data = vec![0u8; 132];
+        data[0..2].copy_from_slice(&0x3c00u16.to_le_bytes()); // f16 1.0
+        data[2] = 0x11;
+        data[130] = 1;
+        data[131] = (-5i8) as u8;
+
+        let expanded = expand_oq_plus_compact_to_oq8(&data, 1, 256).unwrap();
+        assert_eq!(expanded.len(), 256 + 4);
+        assert_eq!(expanded[0] as i8, 1);
+        assert_eq!(expanded[1] as i8, -5);
+        assert_eq!(&expanded[256..260], &1.0f32.to_le_bytes());
     }
 }

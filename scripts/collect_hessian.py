@@ -73,6 +73,43 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
+def _mask_broken_torchvision_for_text_only_calibration() -> None:
+    """Treat broken torchvision as unavailable for text-only HF model loading.
+
+    Some Transformers releases route generic modeling imports through
+    `processing_utils` → `image_utils`. A mismatched host torchvision can then
+    fail while registering optional image ops even for text-only CausalLM
+    calibration. The Hessian collector does not need torchvision, so make the
+    availability probe return False when importing torchvision itself fails.
+    """
+    try:
+        import torchvision  # noqa: F401
+        return
+    except Exception as exc:  # pragma: no cover - host-package dependent.
+        print(
+            f"      WARN: masking unusable torchvision for text-only calibration: {exc}",
+            file=sys.stderr,
+        )
+
+    for name in list(sys.modules):
+        if name == "torchvision" or name.startswith("torchvision."):
+            del sys.modules[name]
+
+    def _false(*_args, **_kwargs) -> bool:
+        return False
+
+    try:
+        import transformers.utils as tf_utils
+        import transformers.utils.import_utils as import_utils
+
+        import_utils.is_torchvision_available = _false
+        import_utils.is_torchvision_v2_available = _false
+        tf_utils.is_torchvision_available = _false
+        tf_utils.is_torchvision_v2_available = _false
+    except Exception as exc:  # pragma: no cover - defensive best effort.
+        print(f"      WARN: failed to mask torchvision availability: {exc}", file=sys.stderr)
+
+
 # Tensor name patterns that should get GPTQ Hessians. Matches hipfire's
 # AWQ whitelist plus the non-AWQ MQ4 projections (o_proj/out_proj/down_proj).
 # Pattern check is done on the FULL module name (e.g.
@@ -84,8 +121,12 @@ GPTQ_TARGET_SUFFIXES = (
     "o_proj",
     # MLP
     "gate_proj", "up_proj", "down_proj", "gate_up_proj",
+    # LFM2 dense FFN uses short w1/w2/w3 names instead of gate/up/down_proj.
+    "w1", "w2", "w3",
     # Linear-attention (Gated DeltaNet)
     "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b",
+    # LFM2 LIV conv mixer has a plain conv.in_proj module.
+    "in_proj",
     "out_proj",
     # MoE router
     "gate",
@@ -159,6 +200,18 @@ def _translate_to_stored_name(mod_name: str, stored_keys: set[str]) -> str | Non
     # `layers.0.q_proj`).
     matches.sort(key=len, reverse=True)
     return matches[0]
+
+
+def _matches_tensor_filter(stored_name: str, pattern: str | None) -> bool:
+    """Substring filter over canonical stored tensor names.
+
+    The collector stores hook keys without the trailing `.weight`, while humans
+    usually copy names with `.weight` from safetensors or HFQ logs. Accept both.
+    """
+    if not pattern:
+        return True
+    pat = pattern.removesuffix(".weight")
+    return pat in stored_name
 
 
 class HessianAccumulator:
@@ -334,6 +387,10 @@ def main():
                          "final K×K copied to host (VRAM = Σ K²; fits ≤9B on "
                          "big-VRAM boxes). 'cpu': transfer [N,K] + numpy gemm "
                          "(original behavior; use for VRAM-constrained big models).")
+    ap.add_argument("--tensor-filter", default=None,
+                    help="Optional substring over canonical safetensors names "
+                         "(with or without trailing .weight) to collect a small "
+                         "HFHS smoke sidecar.")
     args = ap.parse_args()
 
     print(f"=== Hessian collector — Stage B Phase 1.1 ===")
@@ -351,6 +408,7 @@ def main():
 
     print(f"\n[1/4] Loading tokenizer + model...")
     t0 = time.time()
+    _mask_broken_torchvision_for_text_only_calibration()
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=False)
     # device_map="auto" → HF/accelerate uses meta tensors, skipping the
     # random-init step that would otherwise allocate the full model in
@@ -392,6 +450,8 @@ def main():
                 print(f"  WARN: no safetensors key matches {mod_name!r} — skipping",
                       file=sys.stderr)
                 continue
+            if not _matches_tensor_filter(stored, args.tensor_filter):
+                continue
             if stored != mod_name:
                 name_remap_count += 1
             accs[stored] = HessianAccumulator(stored, K, accum_device=args.accum)
@@ -400,6 +460,9 @@ def main():
           f"→ stored (multimodal-flatten translation)")
     print(f"      registered {len(accs)} hooks "
           f"({len(set(K_ for K_ in [acc.K for acc in accs.values()]))} distinct K dims)")
+    if not accs:
+        detail = f" matching --tensor-filter {args.tensor_filter!r}" if args.tensor_filter else ""
+        raise SystemExit(f"no GPTQ-target Linear modules found{detail}")
     print(f"      K range: {min(acc.K for acc in accs.values())}..{max(acc.K for acc in accs.values())}")
 
     print(f"\n[3/4] Loading calibration corpus + running forward pass...")

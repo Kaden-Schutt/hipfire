@@ -43,6 +43,8 @@ use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 
 use crate::memory::{hfq_model_memory, unknown_model_memory};
 use crate::model::CaskConfig;
+#[cfg(feature = "arch-lfm2moe")]
+use crate::model::Lfm2DflashState;
 use crate::model::{DdtreeState, DflashState, Eviction, LoadedModel};
 use crate::session::{next_qwen35_state_allocation_epoch, QWEN35_LEGACY_SESSION_ID};
 use hipfire_runtime::sequence_state::SequenceState;
@@ -69,6 +71,11 @@ fn require_arch_feature(
         feature,
         support.mark()
     ))
+}
+
+#[cfg(feature = "arch-lfm2moe")]
+fn lfm2_triattn_kv_layer_ids(config: &lfm2moe::config::Lfm2MoeConfig) -> Vec<usize> {
+    (0..config.num_attention_layers()).collect()
 }
 
 /// Resolve the effective chat template for a model: the HFQ-embedded
@@ -400,106 +407,124 @@ pub fn load_model(
     // hfq::load_weights_hfq do at runtime, so the qt we read here is the
     // qt that will end up driving `weights.output.gpu_dtype`.
     if draft_path.is_some() {
-        // Arch-level capability gate FIRST (matrix-backed). DFlash spec-decode
-        // only runs on archs whose matrix marks it Full — the generate() router
-        // requires it. Without this an operator could attach a draft to a
-        // non-DFlash arch, pass the lm_head dtype check below, then silently get
-        // plain AR decode (a no-op draft). Refuse up front with the matrix reason.
-        require_arch_feature(
-            hfq.arch_id,
-            "DFlash spec-decode",
-            arch_features(hfq.arch_id).dflash,
-        )?;
-
-        let lm_qt = hfq
-            .tensor_data("lm_head.weight")
-            .or_else(|| hfq.tensor_data("model.language_model.lm_head.weight"))
-            .or_else(|| hfq.tensor_data("model.language_model.embed_tokens.weight"))
-            .or_else(|| hfq.tensor_data("model.embed_tokens.weight"))
-            .map(|(info, _)| info.quant_type);
-        // MQ3 (qt=17) batched lm_head + WMMA prefill kernels exist on gfx11
-        // only (`gemm_hfq3g256_batched_lmhead` + `is_batchable_la` admits MQ3
-        // for gfx1100/1101/1102/1150/1151). On other archs, MQ3 lm_head still
-        // falls through to per-row GEMV that hangs verify. Whitelist:
-        //   - Always: Q8_0=3, HFQ4G256=6, MQ4G256=13
-        //   - gfx11 only: MQ3G256=17
-        // MQ2 (qt=18) is not yet wired into speculative.rs match arms.
-        // MQ3 WMMA family is ported to gfx11 (RDNA3) and gfx12 (RDNA4).
-        // Keep them grouped under the same flag — the builtin name differs
-        // (_w32 vs _w32_gfx12) but the dispatch wrappers route per-arch.
-        let arch_is_gfx11 = matches!(
-            gpu.arch.as_str(),
-            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
-        );
-        let supported = match lm_qt {
-            Some(3 | 6 | 13) => true,
-            Some(17) => arch_is_gfx11,
-            _ => false,
-        };
-        if !supported {
-            let qt_desc = match lm_qt {
-                Some(qt) => format!("quant_type={qt}"),
-                None => "no lm_head/embed_tokens tensor found at any known name".to_string(),
-            };
-            return Err(format!(
-                "DFlash draft requested but target lm_head {} is not \
-                 supported by speculative.rs's batched GEMM paths on this arch \
-                 ({}). Supported: Q8_0 (qt=3), HFQ4G256 (qt=6), MQ4G256 (qt=13) \
-                 always; MQ3G256 (qt=17) on gfx11 only. Other dtypes \
-                 (MQ2 qt=18, MQ6/MQ8, HFQ3/HFQ2, HFQ4G128, HFQ6, F16, …) fall \
-                 through to a per-row GEMV that hangs verify. Reload without a \
-                 draft, or use an MQ4 / HFQ4 / Q8 target. (PRD Phase 2: extend \
-                 speculative.rs match arms + add gemm_*_batched_lmhead kernels \
-                 for the remaining dtypes.)",
-                qt_desc, gpu.arch
-            ));
-        }
-
-        // Defense-in-depth: refuse if any body weight is MQ2 (qt=18). MQ3
-        // is now allowed on gfx11 dense (arch_id=5) because the WMMA prefill
-        // family (qkvza/qkv/gate_up/residual hfq3) and
-        // `gemm_hfq3g256_batched_lmhead` are wired. MQ3 is REFUSED on:
-        //   - non-gfx11 archs (no batched WMMA prefill kernels)
-        //   - MoE/A3B targets (arch_id=6) — the MoE LA/FA prefill branches
-        //     and `moe_ffn_all_mq4` predicate are MQ4-only; MQ3 weights
-        //     would silently fall through to HFQ4 kernels with the wrong
-        //     104-vs-136 byte stride. (Future: wire MQ3 into the MoE
-        //     batched branches and the MoE FFN expert kernels.)
-        // MQ2 body still has no batched WMMA kernels anywhere.
-        let arch_is_dense_qwen35 = is_qwen35_dense_arch_id(hfq.arch_id);
-        let mq3_supported = arch_is_gfx11 && arch_is_dense_qwen35;
-        let mq_unsupported = hfq
-            .first_tensor_with_quant_type(18)
-            .map(|n| ("MQ2 (qt=18)", n));
-        let mq_unsupported = mq_unsupported.or_else(|| {
-            if !mq3_supported {
-                hfq.first_tensor_with_quant_type(17)
-                    .map(|n| ("MQ3 (qt=17)", n))
-            } else {
-                None
+        if hfq.arch_id == 11 {
+            #[cfg(not(feature = "arch-lfm2moe"))]
+            {
+                return Err(
+                    "LFM2 DFlash draft requested but arch-lfm2moe is not compiled in".to_string(),
+                );
             }
-        });
-        if let Some((qt_label, name)) = mq_unsupported {
-            let arch_reason = if !arch_is_dense_qwen35 && qt_label.starts_with("MQ3") {
-                format!(
-                    "arch_id={} (MoE/A3B-class) has no MQ3 MoE kernels",
-                    hfq.arch_id
-                )
-            } else {
-                format!(
-                    "arch={} lacks the corresponding batched WMMA prefill family",
-                    gpu.arch
-                )
+            if std::env::var("HIPFIRE_LFM2_DFLASH").ok().as_deref() != Some("1") {
+                return Err(
+                    "LFM2 DFlash is experimental; set HIPFIRE_LFM2_DFLASH=1 to load a draft"
+                        .to_string(),
+                );
+            }
+            eprintln!(
+                "  WARNING: LFM2 DFlash is experimental; admission is gated by HIPFIRE_LFM2_DFLASH=1"
+            );
+        } else {
+            // Arch-level capability gate FIRST (matrix-backed). DFlash spec-decode
+            // only runs on archs whose matrix marks it Full — the generate() router
+            // requires it. Without this an operator could attach a draft to a
+            // non-DFlash arch, pass the lm_head dtype check below, then silently get
+            // plain AR decode (a no-op draft). Refuse up front with the matrix reason.
+            require_arch_feature(
+                hfq.arch_id,
+                "DFlash spec-decode",
+                arch_features(hfq.arch_id).dflash,
+            )?;
+
+            let lm_qt = hfq
+                .tensor_data("lm_head.weight")
+                .or_else(|| hfq.tensor_data("model.language_model.lm_head.weight"))
+                .or_else(|| hfq.tensor_data("model.language_model.embed_tokens.weight"))
+                .or_else(|| hfq.tensor_data("model.embed_tokens.weight"))
+                .map(|(info, _)| info.quant_type);
+            // MQ3 (qt=17) batched lm_head + WMMA prefill kernels exist on gfx11
+            // only (`gemm_hfq3g256_batched_lmhead` + `is_batchable_la` admits MQ3
+            // for gfx1100/1101/1102/1150/1151). On other archs, MQ3 lm_head still
+            // falls through to per-row GEMV that hangs verify. Whitelist:
+            //   - Always: Q8_0=3, HFQ4G256=6, MQ4G256=13
+            //   - gfx11 only: MQ3G256=17
+            // MQ2 (qt=18) is not yet wired into speculative.rs match arms.
+            // MQ3 WMMA family is ported to gfx11 (RDNA3) and gfx12 (RDNA4).
+            // Keep them grouped under the same flag — the builtin name differs
+            // (_w32 vs _w32_gfx12) but the dispatch wrappers route per-arch.
+            let arch_is_gfx11 = matches!(
+                gpu.arch.as_str(),
+                "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
+            );
+            let supported = match lm_qt {
+                Some(3 | 6 | 13) => true,
+                Some(17) => arch_is_gfx11,
+                _ => false,
             };
-            return Err(format!(
-                "DFlash draft requested but model contains {qt_label} weight \
-                 `{name}` and {arch_reason}. The prefill fast-path falls back \
-                 to per-token `forward_scratch` for every spec verify cycle \
-                 (or worse, a kernel-stride mismatch on MoE) — defeating \
-                 DFlash's speedup. Reload without a draft, or use an MQ4 / \
-                 HFQ4 / Q8 target. (Future: port MQ3/MQ2 to MoE branches and \
-                 additional archs.)"
-            ));
+            if !supported {
+                let qt_desc = match lm_qt {
+                    Some(qt) => format!("quant_type={qt}"),
+                    None => "no lm_head/embed_tokens tensor found at any known name".to_string(),
+                };
+                return Err(format!(
+                    "DFlash draft requested but target lm_head {} is not \
+                     supported by speculative.rs's batched GEMM paths on this arch \
+                     ({}). Supported: Q8_0 (qt=3), HFQ4G256 (qt=6), MQ4G256 (qt=13) \
+                     always; MQ3G256 (qt=17) on gfx11 only. Other dtypes \
+                     (MQ2 qt=18, MQ6/MQ8, HFQ3/HFQ2, HFQ4G128, HFQ6, F16, …) fall \
+                     through to a per-row GEMV that hangs verify. Reload without a \
+                     draft, or use an MQ4 / HFQ4 / Q8 target. (PRD Phase 2: extend \
+                     speculative.rs match arms + add gemm_*_batched_lmhead kernels \
+                     for the remaining dtypes.)",
+                    qt_desc, gpu.arch
+                ));
+            }
+
+            // Defense-in-depth: refuse if any body weight is MQ2 (qt=18). MQ3
+            // is now allowed on gfx11 dense (arch_id=5) because the WMMA prefill
+            // family (qkvza/qkv/gate_up/residual hfq3) and
+            // `gemm_hfq3g256_batched_lmhead` are wired. MQ3 is REFUSED on:
+            //   - non-gfx11 archs (no batched WMMA prefill kernels)
+            //   - MoE/A3B targets (arch_id=6) — the MoE LA/FA prefill branches
+            //     and `moe_ffn_all_mq4` predicate are MQ4-only; MQ3 weights
+            //     would silently fall through to HFQ4 kernels with the wrong
+            //     104-vs-136 byte stride. (Future: wire MQ3 into the MoE
+            //     batched branches and the MoE FFN expert kernels.)
+            // MQ2 body still has no batched WMMA kernels anywhere.
+            let arch_is_dense_qwen35 = is_qwen35_dense_arch_id(hfq.arch_id);
+            let mq3_supported = arch_is_gfx11 && arch_is_dense_qwen35;
+            let mq_unsupported = hfq
+                .first_tensor_with_quant_type(18)
+                .map(|n| ("MQ2 (qt=18)", n));
+            let mq_unsupported = mq_unsupported.or_else(|| {
+                if !mq3_supported {
+                    hfq.first_tensor_with_quant_type(17)
+                        .map(|n| ("MQ3 (qt=17)", n))
+                } else {
+                    None
+                }
+            });
+            if let Some((qt_label, name)) = mq_unsupported {
+                let arch_reason = if !arch_is_dense_qwen35 && qt_label.starts_with("MQ3") {
+                    format!(
+                        "arch_id={} (MoE/A3B-class) has no MQ3 MoE kernels",
+                        hfq.arch_id
+                    )
+                } else {
+                    format!(
+                        "arch={} lacks the corresponding batched WMMA prefill family",
+                        gpu.arch
+                    )
+                };
+                return Err(format!(
+                    "DFlash draft requested but model contains {qt_label} weight \
+                     `{name}` and {arch_reason}. The prefill fast-path falls back \
+                     to per-token `forward_scratch` for every spec verify cycle \
+                     (or worse, a kernel-stride mismatch on MoE) — defeating \
+                     DFlash's speedup. Reload without a draft, or use an MQ4 / \
+                     HFQ4 / Q8 target. (Future: port MQ3/MQ2 to MoE branches and \
+                     additional archs.)"
+                ));
+            }
         }
     }
 
@@ -623,6 +648,8 @@ pub fn load_model(
             decoded_vocab: None,
             model_path: path.to_string(),
             memory: model_memory,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_dflash: None,
             dflash: None,
             chat_template,
             chat_template_profile,
@@ -750,6 +777,8 @@ pub fn load_model(
             decoded_vocab: None,
             model_path: path.to_string(),
             memory: model_memory,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_dflash: None,
             dflash: None,
             chat_template,
             chat_template_profile,
@@ -849,6 +878,8 @@ pub fn load_model(
             decoded_vocab: None,
             model_path: path.to_string(),
             memory: model_memory,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_dflash: None,
             dflash: None,
             chat_template,
             chat_template_profile,
@@ -952,6 +983,8 @@ pub fn load_model(
             decoded_vocab: None,
             model_path: path.to_string(),
             memory: model_memory,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_dflash: None,
             dflash: None,
             chat_template,
             chat_template_profile,
@@ -1051,6 +1084,8 @@ pub fn load_model(
             decoded_vocab: None,
             model_path: path.to_string(),
             memory: model_memory,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_dflash: None,
             dflash: None,
             chat_template,
             chat_template_profile,
@@ -1171,6 +1206,8 @@ pub fn load_model(
             decoded_vocab: None,
             model_path: path.to_string(),
             memory: model_memory,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_dflash: None,
             dflash: None,
             chat_template,
             chat_template_profile,
@@ -1297,6 +1334,8 @@ pub fn load_model(
             decoded_vocab: None,
             model_path: path.to_string(),
             memory: model_memory,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_dflash: None,
             dflash: None,
             chat_template,
             chat_template_profile,
@@ -1305,13 +1344,16 @@ pub fn load_model(
 
     if hfq.arch_id == 11 {
         // LFM2.5-8B-A1B (hipfire-arch-lfm2moe). Standalone bring-up — no
-        // eviction, no DFlash drafter, no PFlash, no VL, no spec-decode.
+        // DFlash drafter, no PFlash, no VL, no spec-decode. CASK/TriAttention
+        // is wired through the shared KvCache using attention-ordinal sidecar
+        // indices (0..num_attention_layers), because LFM2 stores KV only for
+        // attention layers rather than allocating one KV slot per model layer.
         // Hybrid LIV short-conv + GQA attention feeding a top-4 MoE FFN.
         // config + weights + state come from the crate's direct API
-        // (it does not implement the Architecture trait); prefill + decode
-        // both go through the per-token `lfm2moe::forward::decode_step` in
-        // the generate hot path. There is NO PrefillBatchScratch (no
-        // batched prefill kernel). Structurally mirrors MiniMax (10).
+        // (it does not implement the Architecture trait); generate prefill
+        // routes through `lfm2moe::forward::prefill_batch` and decode through
+        // `lfm2moe::forward::decode_step`. Structurally mirrors MiniMax (10)
+        // while carrying arch-local prefill scratch in the forward module.
         #[cfg(not(feature = "arch-lfm2moe"))]
         {
             let _ = (
@@ -1332,19 +1374,16 @@ pub fn load_model(
         }
         #[cfg(feature = "arch-lfm2moe")]
         {
-            if draft_path.is_some() {
-                return Err("DFlash not supported on arch_id=11 (LFM2.5-MoE). \
-                           Reload without a draft."
-                    .to_string());
-            }
-            if cask.sidecar.is_some() {
-                return Err("CASK eviction not supported on arch_id=11 (LFM2.5-MoE). \
-                           Reload without --cask-sidecar."
-                    .to_string());
-            }
             if pp > 1 {
                 return Err(
                     "pipeline-parallel (pp>1) not supported on arch_id=11 (LFM2.5-MoE)."
+                        .to_string(),
+                );
+            }
+            if draft_path.is_some() && cask.sidecar.is_some() {
+                return Err(
+                    "LFM2 DFlash does not support CASK/TriAttention eviction yet; \
+                     reload without the draft or without the CASK sidecar"
                         .to_string(),
                 );
             }
@@ -1353,8 +1392,100 @@ pub fn load_model(
             let config = lfm2moe::config::Lfm2MoeConfig::from_hfq(&hfq)?;
             let weights = lfm2moe::lfm2moe::Lfm2MoeWeights::load(&mut hfq, &config, gpu)?;
             // Size the KV + conv-state cache to the requested window.
-            let state = lfm2moe::lfm2moe::Lfm2MoeState::new_with_max_seq(gpu, &config, max_seq)
-                .map_err(|e| format!("lfm2moe: Lfm2MoeState::new_with_max_seq failed: {e}"))?;
+            let state = lfm2moe::lfm2moe::Lfm2MoeState::new_with_physical_cap(
+                gpu,
+                &config,
+                max_seq,
+                physical_cap,
+            )
+            .map_err(|e| format!("lfm2moe: Lfm2MoeState::new_with_physical_cap failed: {e}"))?;
+            let lfm2_dflash = if let Some(dp) = draft_path {
+                Some(load_lfm2_dflash_state(
+                    dp,
+                    physical_cap,
+                    &config,
+                    &state,
+                    gpu,
+                )?)
+            } else {
+                None
+            };
+            let eviction = if let Some(ref sidecar_path) = cask.sidecar {
+                let centers = TriAttnCenters::load(Path::new(sidecar_path)).map_err(|e| {
+                    use std::io::ErrorKind;
+                    let p = Path::new(sidecar_path);
+                    let why = match e.kind() {
+                        ErrorKind::NotFound if p.symlink_metadata().is_ok() => {
+                            format!("dangling symlink (target absent): {sidecar_path}")
+                        }
+                        ErrorKind::NotFound => format!("file not found: {sidecar_path}"),
+                        ErrorKind::InvalidData => format!("bad format ({e}): {sidecar_path}"),
+                        ErrorKind::UnexpectedEof => {
+                            format!("truncated/corrupt sidecar: {sidecar_path}")
+                        }
+                        _ => format!("read error ({e}): {sidecar_path}"),
+                    };
+                    format!("lfm2moe cask sidecar load failed — {why} (regen: hipfire sidecar-gen, or HIPFIRE_CASK_OFF=1)")
+                })?;
+                let n_attn = config.num_attention_layers();
+                if centers.n_layers != n_attn
+                    || centers.n_heads != config.num_attention_heads
+                    || centers.head_dim != config.head_dim
+                {
+                    return Err(format!(
+                        "lfm2moe cask sidecar shape mismatch: sidecar layers={} heads={} head_dim={} but model attention_layers={} heads={} head_dim={}. \
+                         LFM2 sidecars must be calibrated with attention-ordinal layer indices.",
+                        centers.n_layers,
+                        centers.n_heads,
+                        centers.head_dim,
+                        n_attn,
+                        config.num_attention_heads,
+                        config.head_dim
+                    ));
+                }
+                if (centers.rope_theta - config.rope_theta).abs()
+                    > (config.rope_theta.abs().max(1.0) * 1e-4)
+                {
+                    return Err(format!(
+                        "lfm2moe cask sidecar rope_theta mismatch: sidecar={} model={}",
+                        centers.rope_theta, config.rope_theta
+                    ));
+                }
+                let fa_layer_ids = lfm2_triattn_kv_layer_ids(&config);
+                let base = EvictionCtx::new(
+                    gpu,
+                    &centers,
+                    fa_layer_ids,
+                    cask.budget,
+                    cask.beta,
+                    config.num_attention_heads,
+                    config.num_key_value_heads,
+                    config.head_dim,
+                    config.head_dim,
+                    config.rope_theta,
+                    physical_cap,
+                )
+                .map_err(|e| format!("lfm2moe build EvictionCtx: {e}"))?;
+                if cask.cask_m_folding {
+                    eprintln!(
+                        "  lfm2moe eviction: CASK α={:.2} m={} budget={} β={} physical_cap={}",
+                        cask.core_frac, cask.fold_m, cask.budget, cask.beta, physical_cap,
+                    );
+                    Some(Eviction::Cask(CaskCtx::new(
+                        base,
+                        cask.core_frac,
+                        cask.fold_m,
+                    )))
+                } else {
+                    eprintln!(
+                        "  lfm2moe eviction: TriAttention (plain drop) budget={} β={} physical_cap={}",
+                        cask.budget, cask.beta, physical_cap,
+                    );
+                    Some(Eviction::Plain(base))
+                }
+            } else {
+                None
+            };
             // Resolve EOS via the tokenizer. LFM2.5 uses the standard
             // ChatML-ish `<|im_end|>`; fall back to common alternates, then 1.
             let eos_tok: u32 = {
@@ -1425,13 +1556,15 @@ pub fn load_model(
                 tokenizer: Some(tokenizer),
                 seq_pos: 0,
                 max_seq,
-                physical_cap: max_seq,
-                eviction: None,
+                physical_cap,
+                eviction,
                 conversation_tokens: Vec::new(),
                 asst_turn_cache: std::collections::HashMap::new(),
                 decoded_vocab: None,
                 model_path: path.to_string(),
                 memory: model_memory,
+                #[cfg(feature = "arch-lfm2moe")]
+                lfm2_dflash,
                 dflash: None,
                 chat_template,
                 chat_template_profile,
@@ -1779,6 +1912,8 @@ pub fn load_model(
             decoded_vocab: None,
             model_path: path.to_string(),
             memory: model_memory,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_dflash: None,
             dflash,
             chat_template,
             chat_template_profile,
@@ -1873,6 +2008,8 @@ pub fn load_model(
             decoded_vocab: None,
             model_path: path.to_string(),
             memory: model_memory,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_dflash: None,
             dflash: None,
             chat_template,
             chat_template_profile,
@@ -2063,6 +2200,8 @@ pub fn load_model_safetensors(
             decoded_vocab: None,
             model_path: path.to_string(),
             memory: model_memory,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_dflash: None,
             dflash: None,
             chat_template,
             chat_template_profile,
@@ -2179,6 +2318,8 @@ pub fn load_model_safetensors(
             decoded_vocab: None,
             model_path: path.to_string(),
             memory: model_memory,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_dflash: None,
             dflash: None,
             chat_template,
             chat_template_profile,
@@ -2313,6 +2454,8 @@ pub fn load_model_safetensors(
         decoded_vocab: None,
         model_path: path.to_string(),
         memory: model_memory,
+        #[cfg(feature = "arch-lfm2moe")]
+        lfm2_dflash: None,
         dflash: None,
         chat_template,
         chat_template_profile,
@@ -2605,6 +2748,8 @@ pub fn load_model_pp(
         decoded_vocab: None,
         model_path: path.to_string(),
         memory: model_memory,
+        #[cfg(feature = "arch-lfm2moe")]
+        lfm2_dflash: None,
         dflash: None,
         chat_template,
         chat_template_profile,
@@ -2726,6 +2871,12 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
         df.draft_weights.free_gpu(gpu);
         df.draft_scratch.free_gpu(gpu);
     }
+    #[cfg(feature = "arch-lfm2moe")]
+    if let Some(df) = m.lfm2_dflash {
+        df.draft_weights.free_gpu(gpu);
+        df.draft_scratch.free_gpu(gpu);
+        df.target_snap.free_gpu(gpu);
+    }
     // Free eviction context (centers + scratch tensors) if active.
     if let Some(ev) = m.eviction {
         ev.free_gpu(gpu);
@@ -2823,6 +2974,53 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // memory.
     gpu.invalidate_graph_state();
     gpu.drain_pool();
+}
+
+/// Load the experimental LFM2 DFlash drafter. Unlike Qwen DFlash, this path
+/// does not allocate DeltaNet/ring-buffer/DDTree state; LFM2 verifies through
+/// its arch-local batched prefill and snapshots KV + short-conv target state.
+#[cfg(feature = "arch-lfm2moe")]
+pub fn load_lfm2_dflash_state(
+    draft_path: &str,
+    ctx_capacity: usize,
+    target_config: &lfm2moe::config::Lfm2MoeConfig,
+    target_state: &lfm2moe::lfm2moe::Lfm2MoeState,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<Lfm2DflashState, String> {
+    let hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("open LFM2 draft: {e}"))?;
+    let draft_config = DflashConfig::from_hfq(&hfq).ok_or("parse LFM2 DflashConfig")?;
+    lfm2moe::validate_dflash_contract(target_config, &draft_config)
+        .map_err(|e| format!("LFM2 DFlash draft contract: {e}"))?;
+    let draft_weights = DflashWeights::load(gpu, &hfq, &draft_config)
+        .map_err(|e| format!("load LFM2 draft weights: {e}"))?;
+    let draft_scratch = DflashScratch::new_with_mq(
+        gpu,
+        &draft_config,
+        draft_config.block_size,
+        ctx_capacity,
+        draft_weights.has_mq,
+    )
+    .map_err(|e| format!("LFM2 draft scratch: {e}"))?;
+    let target_snap =
+        lfm2moe::Lfm2DflashTargetSnapshot::new_for(gpu, target_state, draft_config.block_size)
+            .map_err(|e| format!("LFM2 target snapshot: {e:?}"))?;
+    let target_hidden_host: Vec<f32> =
+        Vec::with_capacity(ctx_capacity * draft_config.num_extract() * draft_config.hidden);
+    let block_size = draft_config.block_size;
+    eprintln!(
+        "  LFM2 DFlash draft loaded: block={} extract_layers={:?} hidden={} ctx_capacity={}",
+        block_size, draft_config.target_layer_ids, draft_config.hidden, ctx_capacity
+    );
+
+    Ok(Lfm2DflashState {
+        draft_config,
+        draft_weights,
+        draft_scratch,
+        target_snap,
+        target_hidden_host,
+        ctx_capacity,
+        block_size,
+    })
 }
 
 /// Load the optional DFlash speculative-decoding drafter for a model: the draft
@@ -3055,5 +3253,23 @@ mod admission_tests {
             "msg: {e}"
         );
         assert!(require_arch_feature(12, "DFlash spec-decode", arch_features(12).dflash).is_err());
+    }
+
+    #[cfg(feature = "arch-lfm2moe")]
+    #[test]
+    fn lfm2_triattn_sidecars_use_attention_ordinal_indices() {
+        let config = lfm2moe::config::Lfm2MoeConfig::from_config_value(&serde_json::json!({
+            "vocab_size": 256,
+            "hidden_size": 64,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "intermediate_size": 128,
+            "layer_types": ["conv", "full_attention", "conv", "full_attention"]
+        }))
+        .unwrap();
+
+        assert_eq!(config.num_attention_layers(), 2);
+        assert_eq!(lfm2_triattn_kv_layer_ids(&config), vec![0, 1]);
     }
 }

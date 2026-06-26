@@ -2953,11 +2953,13 @@ impl HfqInputFormat {
             "mq6" | "mq6g256" => Some(Self::Mq6),
             "mq3" | "mq3g256" => Some(Self::Mq3),
             "qtip3" => Some(Self::Qtip3),
-            "op4" | "op4-4" | "op4g256" | "op4+" | "op4-4+" | "op4-8+" => Some(Self::Oq4),
+            "op4" | "op4-4" | "op4g256" | "op4+" | "op4-4+" | "op4-8+" | "oq4" | "oq4g256" => {
+                Some(Self::Oq4)
+            }
             "opplus" | "op4-plus" => Some(Self::OqPlus),
             "op4+t" | "opplus-tiered" | "op4-tiered" => Some(Self::OqPlusTiered),
             "op4+c" | "opplus-compact" | "op4-compact" => Some(Self::OqPlusCompact),
-            "op8" | "op8-16" | "op8g256" | "op8-plus" => Some(Self::Oq8),
+            "op8" | "op8-16" | "op8g256" | "op8-plus" | "oq8" | "oq8g256" => Some(Self::Oq8),
             _ => None,
         }
     }
@@ -4065,6 +4067,8 @@ fn awq_eligible(name: &str) -> bool {
         // MLP input projections (HF + hipfire-internal naming).
         || name.ends_with("gate_proj.weight")
         || name.ends_with("up_proj.weight")
+        || name.ends_with(".feed_forward.w1.weight")
+        || name.ends_with(".feed_forward.w3.weight")
         || name.ends_with("w_gate.weight")
         || name.ends_with("w_up.weight")
         // MoE fused expert gate+up projection (Qwen3-MoE convention —
@@ -4077,6 +4081,8 @@ fn awq_eligible(name: &str) -> bool {
         // Suffix varies (in_proj_qkv / _z / _a / _b); the substring is
         // anchored enough that no non-linear-attn tensor name should match.
         || name.contains(".in_proj_")
+        // LFM2 LIV conv input projection is named conv.in_proj.
+        || name.ends_with(".conv.in_proj.weight")
         // MoE router (HF naming for Qwen3-MoE / DeepSeek family — single
         // linear projecting post-RMSNorm hidden state to num_experts
         // logits). The quantizer's q8_router rule (set when is_moe)
@@ -4108,6 +4114,7 @@ fn awq_eligible(name: &str) -> bool {
         || name.ends_with("out_proj.weight")
         // MLP down projection (HF + hipfire-internal naming).
         || name.ends_with("down_proj.weight")
+        || name.ends_with(".feed_forward.w2.weight")
         || name.ends_with("w_down.weight");
     f1_match || f2_match
 }
@@ -5096,8 +5103,28 @@ fn main() {
     let use_q4k_all = format == "q4k";
     let use_q4k_q8embed = format == "q4k-q8embed";
     let use_mq8g256 = format == "mq8" || format == "mq8g256";
-    let use_oq4 = format == "op4" || format == "op4-4" || format == "op4g256" || format == "opus";
-    let use_oq8 = format == "op8" || format == "op8-16" || format == "op8g256" || format == "opus8";
+    let use_oq4 = format == "op4"
+        || format == "op4-4"
+        || format == "op4g256"
+        || format == "oq4"
+        || format == "oq4g256"
+        || format == "opus";
+    let use_oq8 = format == "op8"
+        || format == "op8-16"
+        || format == "op8g256"
+        || format == "oq8"
+        || format == "oq8g256"
+        || format == "opus8";
+    let lfm2_oq_format = HfqInputFormat::from_flag(format).filter(|fmt| {
+        matches!(
+            fmt,
+            HfqInputFormat::Oq4
+                | HfqInputFormat::OqPlus
+                | HfqInputFormat::OqPlusTiered
+                | HfqInputFormat::OqPlusCompact
+                | HfqInputFormat::Oq8
+        )
+    });
     // DeepSeek V4 recipe (2026-05-20): routed experts → MQ2-Lloyd, every other
     // 2D weight → Q8F16, with norms/biases/HC matrices falling through
     // to the F16 fallback path via `should_quantize() == false`.
@@ -5910,7 +5937,13 @@ fn main() {
         eprintln!("  MiniMax-M2 detected — per-expert tensors ship pre-split; quantizing each as HFQ4G256 2D weight.");
     }
     if is_lfm2moe {
-        eprintln!("  LFM2.5-MoE detected — experts → MQ4G256, expert_bias → F32, all else (conv/attn/dense/router/embed) → Q8.");
+        if let Some(fmt) = lfm2_oq_format {
+            eprintln!(
+                "  LFM2.5 detected — dense conv/attn/FFN linears → {fmt:?}, routed experts → MQ4G256, expert_bias → F32, router/embed/norm/conv-filter → Q8."
+            );
+        } else {
+            eprintln!("  LFM2.5 detected — experts → MQ4G256, expert_bias → F32, all else (conv/attn/dense/router/embed) → Q8 unless LFM2 projection env knobs are set.");
+        }
     }
     if arch_id == 15 {
         eprintln!("  Mamba-2 detected — pure Mamba mixer stack; recurrence/norm tensors stay plain precision.");
@@ -6295,9 +6328,11 @@ fn main() {
         // Routed experts (A1B only) → MQ4G256; expert_bias → F32; everything else
         // (conv in/out_proj, conv depthwise filter, attn q/k/v/out_proj + qk-norm,
         // dense w1/w2/w3, router gate, operator/ffn/embedding norms, tied embed/
-        // lm_head) → Q8 (qt=3 Q8F16). Dense lfm2 (350M/1.2B) has no experts, so
-        // every tensor takes the final Q8 path. The loader's load_f32 dequantizes
-        // Q8 norms / conv-filter back to F32 on load.
+        // lm_head) → Q8 (qt=3 Q8F16), except explicit OQ formats route the dense
+        // projection/FFN linears through the OQ branch below. Dense lfm2
+        // (350M/1.2B) has no experts, so its large linears can use OQ while
+        // embed/norm/router/conv-filter stay Q8/F32. load_f32 dequantizes Q8
+        // norms / conv-filter back to F32 on load.
         if is_lfm2moe {
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
             if name.contains(".feed_forward.experts.")
@@ -6365,6 +6400,75 @@ fn main() {
                     spilled_len: 0,
                 });
                 st_files[*file_idx].drop_tensor_pages(name);
+                continue;
+            }
+            // OQ route for LFM2 dense linears. This covers both dense LFM2 and
+            // the non-expert linears in LFM2-MoE. Routed experts stay MQ4/MQ6
+            // until the indexed MoE OQ kernels exist; router/embed/norm/conv
+            // filter remain Q8/F32 for their existing runtime paths.
+            let is_lfm2_dense_linear = meta.shape.len() == 2
+                && meta.shape[1] % 256 == 0
+                && (name.ends_with(".conv.in_proj.weight")
+                    || name.ends_with(".conv.out_proj.weight")
+                    || name.ends_with(".self_attn.q_proj.weight")
+                    || name.ends_with(".self_attn.k_proj.weight")
+                    || name.ends_with(".self_attn.v_proj.weight")
+                    || name.ends_with(".self_attn.out_proj.weight")
+                    || name.ends_with(".feed_forward.w1.weight")
+                    || name.ends_with(".feed_forward.w2.weight")
+                    || name.ends_with(".feed_forward.w3.weight"));
+            if let Some(oq_format) = lfm2_oq_format.filter(|_| is_lfm2_dense_linear) {
+                let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                    name,
+                    raw_data,
+                    meta,
+                    &fp8_scale_for,
+                    &st_files,
+                );
+                let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let (q, qt, gs, label) =
+                    quantize_hfq_source_tensor(name, &f32_bytes, 2, &shape, oq_format)
+                        .unwrap_or_else(|e| panic!("lfm2 oq quantize {name}: {e}"));
+                eprintln!(
+                    "  {label:>8}: {} {:?} ({:.1} KB -> {:.1} KB) [LFM2 dense OQ]",
+                    name,
+                    meta.shape,
+                    raw_data.len() as f64 / 1024.0,
+                    q.len() as f64 / 1024.0
+                );
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(),
+                    quant_type: qt,
+                    shape: shape.clone(),
+                    group_size: gs,
+                    data: q,
+                    spilled_len: 0,
+                });
+                if let Some(scales) = OQ4_AWQ_SIDECAR.with(|c| c.borrow_mut().take()) {
+                    let sidecar_name = match name.strip_suffix(".weight") {
+                        Some(stem) => format!("{stem}.awq_scale.weight"),
+                        None => format!("{name}.awq_scale.weight"),
+                    };
+                    let bytes = awq_scales_to_f16_bytes(&scales);
+                    eprintln!(
+                        "    AWQ:    {sidecar_name} [{}] (1D F16, {} B)",
+                        scales.len(),
+                        bytes.len()
+                    );
+                    hfq_tensors.push(HfqTensor {
+                        name: sidecar_name,
+                        quant_type: QuantType::F16,
+                        shape: vec![scales.len() as u32],
+                        group_size: 0,
+                        data: bytes,
+                        spilled_len: 0,
+                    });
+                }
+                quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
+                st_files[*file_idx].drop_tensor_pages(name);
+                if let Some(ref mut s) = spill {
+                    maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                }
                 continue;
             }
             // Dense mq4 (--format mq4): route the big 2D proj/FFN weight matrices
@@ -11807,8 +11911,8 @@ mod tests {
             HfqInputFormat::from_flag("op8-16"),
             Some(HfqInputFormat::Oq8)
         );
-        assert_eq!(HfqInputFormat::from_flag("oq4"), None);
-        assert_eq!(HfqInputFormat::from_flag("oq8"), None);
+        assert_eq!(HfqInputFormat::from_flag("oq4"), Some(HfqInputFormat::Oq4));
+        assert_eq!(HfqInputFormat::from_flag("oq8"), Some(HfqInputFormat::Oq8));
         assert_eq!(
             HfqInputFormat::from_flag("bf16"),
             Some(HfqInputFormat::Bf16)
@@ -11850,6 +11954,21 @@ mod tests {
             assert_eq!(qt as u8, QuantType::Q8F16 as u8, "{name}");
             assert_eq!(group, 32, "{name}");
             assert_eq!(label, "Q8_F16", "{name}");
+        }
+    }
+
+    #[test]
+    fn awq_eligible_includes_lfm2_dense_and_conv_linears() {
+        for name in [
+            "model.layers.0.conv.in_proj.weight",
+            "model.layers.0.conv.out_proj.weight",
+            "model.layers.2.feed_forward.w1.weight",
+            "model.layers.2.feed_forward.w3.weight",
+            "model.layers.2.feed_forward.w2.weight",
+            "model.layers.2.self_attn.q_proj.weight",
+            "model.layers.2.self_attn.out_proj.weight",
+        ] {
+            assert!(awq_eligible(name), "{name}");
         }
     }
 

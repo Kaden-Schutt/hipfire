@@ -1788,14 +1788,13 @@ pub fn generate_minimax(
 
 /// LFM2.5-MoE (arch_id=11) generate path — minimal AR bring-up.
 ///
-/// Structurally identical to `generate_minimax` (prefill = per-token loop,
-/// decode = per-token loop, JSONL `token` / `done` events). Only the arch
-/// types and `forward::decode_step` path differ. Out of scope (and not
-/// wired): spec-decode, MTP, grammar, tool-call parsing/execution, repeat
-/// penalty, multi-GPU, eviction/prefix-cache. Correctness first.
+/// Prefill routes through the arch-local batched prefill path when eligible
+/// (`HIPFIRE_PREFILL_BATCHED=0` falls back inside the arch crate); decode stays
+/// per-token. Out of scope (and not wired): spec-decode, MTP, grammar,
+/// tool-call parsing/execution, repeat penalty, multi-GPU, eviction/prefix-cache.
 #[cfg(feature = "arch-lfm2moe")]
 #[allow(clippy::too_many_arguments)]
-/// LFM2.5-MoE generate path: per-token prefill + decode over the hybrid
+/// LFM2.5-MoE generate path: prompt prefill + decode over the hybrid
 /// conv/attention + top-4 MoE `lfm2moe` forward, streaming events. Gated on the
 /// `arch-lfm2moe` feature.
 pub fn generate_lfm2moe(
@@ -1828,6 +1827,22 @@ pub fn generate_lfm2moe(
             id
         );
         let _ = stdout.flush();
+        return;
+    }
+    if m.lfm2_dflash.is_some() && temp <= 1e-6 {
+        generate_lfm2moe_dflash(
+            m,
+            gpu,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            max_tokens,
+            max_think_tokens,
+            tools,
+            messages_history,
+        );
+        let _ = top_p;
         return;
     }
 
@@ -1912,18 +1927,30 @@ pub fn generate_lfm2moe(
 
     let eos_tok = m.lfm2moe_eos_tok;
 
-    // Capacity guard. No eviction on arch_id=11 — reset the KV + conv-state
-    // cursors when the requested run would overflow the budget.
+    // Capacity guard. Without eviction the physical buffer is the hard cap.
+    // With CASK/TriAttention active, `n_tokens` is the physical cursor and
+    // `compact_offset` carries the logical prefix already compacted away.
     let overflow = {
         let state = m.lfm2moe_state.as_ref().unwrap();
-        state.n_tokens + prompt_ids.len() + max_tokens > state.max_seq
+        let current = if m.eviction.is_some() {
+            state.n_tokens + state.kv.compact_offset
+        } else {
+            state.n_tokens
+        };
+        current + prompt_ids.len() + max_tokens > state.max_seq
     };
     if overflow {
-        let (n, cap) = {
+        let (n, logical, cap) = {
             let state = m.lfm2moe_state.as_ref().unwrap();
-            (state.n_tokens, state.max_seq)
+            (
+                state.n_tokens,
+                state.n_tokens + state.kv.compact_offset,
+                state.max_seq,
+            )
         };
-        eprintln!("[daemon] arch_id=11 context full ({n}/{cap}) — resetting Lfm2MoeState",);
+        eprintln!(
+            "[daemon] arch_id=11 context full (physical={n} logical={logical}/{cap}) — resetting Lfm2MoeState",
+        );
         let _ = m.lfm2moe_state.as_mut().unwrap().reset(gpu);
         m.seq_pos = 0;
         m.conversation_tokens.clear();
@@ -1931,23 +1958,52 @@ pub fn generate_lfm2moe(
 
     let t0 = Instant::now();
 
-    // ── Prefill: decode_step per prompt token. The LAST decode_step's logits
-    // are the predictions for the first generated token. ──
-    let mut last_logits: Vec<f32> = Vec::new();
+    // ── Prefill. The returned logits are the predictions for the first
+    // generated token. ──
+    let mut last_logits: Vec<f32>;
     {
         let cfg = m.lfm2moe_config.as_ref().unwrap();
         let weights = m.lfm2moe_weights.as_ref().unwrap();
         let state = m.lfm2moe_state.as_mut().unwrap();
-        let mut position = state.n_tokens as u32;
-        for &tok in &prompt_ids {
-            match lfm2moe::forward::decode_step(cfg, weights, state, gpu, tok, position) {
+        if let Some(ref ev) = m.eviction {
+            let mut logits = Vec::new();
+            for &tok in &prompt_ids {
+                let position = state.n_tokens as u32;
+                match lfm2moe::forward::decode_step(cfg, weights, state, gpu, tok, position) {
+                    Ok(next_logits) => logits = next_logits,
+                    Err(e) => {
+                        emit_error_with_id(
+                            stdout,
+                            id,
+                            format!("lfm2moe serial prefill failed: {e:?}"),
+                        );
+                        return;
+                    }
+                }
+                match ev.maybe_evict(gpu, &mut state.kv, state.n_tokens) {
+                    Ok(Some(hipfire_runtime::triattn::EvictionResult { new_physical, .. })) => {
+                        state.n_tokens = new_physical;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        emit_error_with_id(
+                            stdout,
+                            id,
+                            format!("lfm2moe prefill eviction failed: {e:?}"),
+                        );
+                        return;
+                    }
+                }
+            }
+            last_logits = logits;
+        } else {
+            match lfm2moe::forward::prefill_batch(cfg, weights, state, gpu, &prompt_ids) {
                 Ok(logits) => last_logits = logits,
                 Err(e) => {
                     emit_error_with_id(stdout, id, format!("lfm2moe prefill failed: {e:?}"));
                     return;
                 }
             }
-            position += 1;
         }
     }
     for &tok in &prompt_ids {
@@ -1992,7 +2048,28 @@ pub fn generate_lfm2moe(
             let weights = m.lfm2moe_weights.as_ref().unwrap();
             let state = m.lfm2moe_state.as_mut().unwrap();
             let position = state.n_tokens as u32;
-            lfm2moe::forward::decode_step(cfg, weights, state, gpu, next_tok, position)
+            let step = lfm2moe::forward::decode_step(cfg, weights, state, gpu, next_tok, position);
+            if step.is_ok() {
+                if let Some(ref ev) = m.eviction {
+                    match ev.maybe_evict(gpu, &mut state.kv, state.n_tokens) {
+                        Ok(Some(hipfire_runtime::triattn::EvictionResult {
+                            new_physical, ..
+                        })) => {
+                            state.n_tokens = new_physical;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            emit_error_with_id(
+                                stdout,
+                                id,
+                                format!("lfm2moe decode eviction failed: {e:?}"),
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+            step
         };
         match step {
             Ok(logits) => last_logits = logits,
@@ -2003,7 +2080,10 @@ pub fn generate_lfm2moe(
         }
     }
 
-    m.seq_pos = m.lfm2moe_state.as_ref().unwrap().n_tokens;
+    m.seq_pos = {
+        let state = m.lfm2moe_state.as_ref().unwrap();
+        state.n_tokens + state.kv.compact_offset
+    };
 
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);
@@ -2019,6 +2099,356 @@ pub fn generate_lfm2moe(
     );
     let _ = stdout.flush();
 }
+
+#[cfg(feature = "arch-lfm2moe")]
+#[allow(clippy::too_many_arguments)]
+fn generate_lfm2moe_dflash(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[prompt_frame::Message]>,
+) {
+    if m.eviction.is_some() {
+        emit_error_with_id(
+            stdout,
+            id,
+            "LFM2 DFlash does not support CASK/TriAttention eviction yet",
+        );
+        return;
+    }
+    let prompt_ids: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        if try_jinja {
+            let template = m.chat_template.as_ref().unwrap();
+            let frame = prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: system_prompt,
+                user: prompt,
+                enable_thinking: max_think_tokens != 1,
+                bos_token: None,
+            };
+            let render_result = if tools.is_some() || messages_history.is_some() {
+                let synthesized: Vec<prompt_frame::Message>;
+                let messages_slice: &[prompt_frame::Message] = match messages_history {
+                    Some(h) => h,
+                    None => {
+                        let mut v = Vec::new();
+                        if let Some(sys) = system_prompt {
+                            v.push(prompt_frame::Message {
+                                role: prompt_frame::Role::System,
+                                content: sys.to_string(),
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                            });
+                        }
+                        v.push(prompt_frame::Message {
+                            role: prompt_frame::Role::User,
+                            content: prompt.to_string(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                        });
+                        synthesized = v;
+                        &synthesized
+                    }
+                };
+                frame.render_messages(messages_slice, tools, None)
+            } else {
+                frame.render()
+            };
+            match render_result {
+                Ok(rendered) => tokenizer.encode(&rendered),
+                Err(e) => {
+                    eprintln!(
+                        "[daemon] jinja render failed in lfm2moe dflash path ({e}) - falling back to Plain"
+                    );
+                    prompt_frame::ChatFrame {
+                        tokenizer,
+                        system: system_prompt,
+                        user: prompt,
+                        assistant_prefix: prompt_frame::AssistantPrefix::Plain,
+                        raw: effective_raw(m),
+                    }
+                    .build()
+                }
+            }
+        } else {
+            prompt_frame::ChatFrame {
+                tokenizer,
+                system: system_prompt,
+                user: prompt,
+                assistant_prefix: prompt_frame::AssistantPrefix::Plain,
+                raw: effective_raw(m),
+            }
+            .build()
+        }
+    };
+    if prompt_ids.is_empty() {
+        emit_error_with_id(stdout, id, "empty prompt after tokenize");
+        return;
+    }
+    if max_tokens == 0 {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"done","id":"{}","tokens":0,"tok_s":0.0,"prefill_ms":0,"total_ms":0,"dflash":true,"cycles":0,"accepted":0,"accept_rate":0.0}}"#,
+            id
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    let (ctx_capacity, block_size) = {
+        let df = m.lfm2_dflash.as_ref().unwrap();
+        (df.ctx_capacity, df.block_size)
+    };
+    let target_capacity = m
+        .lfm2moe_state
+        .as_ref()
+        .map(|s| s.max_seq)
+        .unwrap_or(ctx_capacity);
+    let usable_capacity = ctx_capacity.min(target_capacity);
+    if prompt_ids.len().saturating_add(block_size) > usable_capacity {
+        emit_error_with_id(
+            stdout,
+            id,
+            format!(
+                "LFM2 DFlash prompt ({}) + block ({}) exceeds context capacity {}",
+                prompt_ids.len(),
+                block_size,
+                usable_capacity
+            ),
+        );
+        return;
+    }
+
+    let eos_tok = m.lfm2moe_eos_tok;
+    let t0 = Instant::now();
+    let first_token = {
+        let cfg = m.lfm2moe_config.as_ref().unwrap();
+        let weights = m.lfm2moe_weights.as_ref().unwrap();
+        let state = m.lfm2moe_state.as_mut().unwrap();
+        let df = m.lfm2_dflash.as_mut().unwrap();
+        if let Err(e) = state.reset(gpu) {
+            emit_error_with_id(stdout, id, format!("lfm2moe dflash reset failed: {e}"));
+            return;
+        }
+        df.target_hidden_host.clear();
+        df.draft_scratch.reset_upload_tracking();
+        let mut capture = match lfm2moe::forward::Lfm2HiddenCapture::new(
+            cfg.num_hidden_layers,
+            cfg.hidden_size,
+            df.draft_config.target_layer_ids.clone(),
+        ) {
+            Ok(capture) => capture,
+            Err(e) => {
+                emit_error_with_id(stdout, id, format!("lfm2moe dflash capture: {e}"));
+                return;
+            }
+        };
+        let logits_per_pos = match lfm2moe::forward::prefill_batch_with_hidden_logits(
+            cfg,
+            weights,
+            state,
+            gpu,
+            &prompt_ids,
+            &mut capture,
+        ) {
+            Ok(logits) => logits,
+            Err(e) => {
+                emit_error_with_id(stdout, id, format!("lfm2moe dflash prefill failed: {e}"));
+                return;
+            }
+        };
+        df.target_hidden_host
+            .extend_from_slice(&capture.take_rows());
+        if state.n_tokens != prompt_ids.len() {
+            emit_error_with_id(
+                stdout,
+                id,
+                format!(
+                    "lfm2moe dflash prefill ended at {}, expected {}",
+                    state.n_tokens,
+                    prompt_ids.len()
+                ),
+            );
+            return;
+        }
+        match logits_per_pos.chunks_exact(cfg.vocab_size).last() {
+            Some(row) => lfm2_argmax(row),
+            None => {
+                emit_error_with_id(stdout, id, "lfm2moe dflash prefill returned no logits");
+                return;
+            }
+        }
+    };
+    let prefill_ms = t0.elapsed().as_millis();
+    m.conversation_tokens.clear();
+    m.conversation_tokens.extend_from_slice(&prompt_ids);
+
+    if first_token == eos_tok
+        || m.tokenizer
+            .as_ref()
+            .map(|t| t.is_terminator(first_token))
+            .unwrap_or(false)
+    {
+        let total_ms = t0.elapsed().as_millis().max(1);
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"done","id":"{}","tokens":0,"tok_s":0.0,"prefill_ms":{},"total_ms":{},"dflash":true,"cycles":0,"accepted":0,"accept_rate":0.0}}"#,
+            id, prefill_ms, total_ms
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    let emit_token = |stdout: &mut std::io::Stdout,
+                      id: &str,
+                      token: u32,
+                      ordinal: usize,
+                      elapsed_ms: u64,
+                      tokenizer: &hipfire_model::tokenizer::Tokenizer| {
+        let frag = tokenizer.decode(&[token]);
+        let envelope = serde_json::json!({
+            "type": "token",
+            "id": id,
+            "text": frag,
+        });
+        let _ = writeln!(stdout, "{}", envelope);
+        let _ = stdout.flush();
+        emit_committed_event(stdout, id, token, ordinal, elapsed_ms);
+    };
+
+    {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        emit_token(
+            stdout,
+            id,
+            first_token,
+            0,
+            t0.elapsed().as_millis() as u64,
+            tokenizer,
+        );
+    }
+    m.conversation_tokens.push(first_token);
+
+    let decode_t0 = Instant::now();
+    let mut generated_count = 1usize;
+    let mut position = prompt_ids.len();
+    let mut seed_token = first_token;
+    let mut cycles = 0usize;
+    let mut accepted_total = 0usize;
+    let mut drafted_total = 0usize;
+
+    while generated_count < max_tokens {
+        if position.saturating_add(block_size) > usable_capacity {
+            break;
+        }
+        let step = {
+            let cfg = m.lfm2moe_config.as_ref().unwrap();
+            let weights = m.lfm2moe_weights.as_ref().unwrap();
+            let state = m.lfm2moe_state.as_mut().unwrap();
+            let df = m.lfm2_dflash.as_mut().unwrap();
+            lfm2moe::spec_step_dflash(
+                gpu,
+                weights,
+                cfg,
+                state,
+                &df.draft_weights,
+                &df.draft_config,
+                &mut df.draft_scratch,
+                &mut df.target_hidden_host,
+                &mut df.target_snap,
+                position,
+                seed_token,
+                None,
+                None,
+            )
+        };
+        let step = match step {
+            Ok(step) => step,
+            Err(e) => {
+                emit_error_with_id(stdout, id, format!("lfm2moe dflash spec_step failed: {e}"));
+                break;
+            }
+        };
+        cycles += 1;
+        accepted_total += step.accepted;
+        drafted_total += step.drafted.len().saturating_sub(1);
+
+        let mut hit_eos = false;
+        for &tok in step.committed.iter().skip(1) {
+            if generated_count >= max_tokens {
+                break;
+            }
+            let terminator = {
+                let tokenizer = m.tokenizer.as_ref().unwrap();
+                tok == eos_tok || tokenizer.is_terminator(tok)
+            };
+            if terminator {
+                hit_eos = true;
+                break;
+            }
+            {
+                let tokenizer = m.tokenizer.as_ref().unwrap();
+                emit_token(
+                    stdout,
+                    id,
+                    tok,
+                    generated_count,
+                    t0.elapsed().as_millis() as u64,
+                    tokenizer,
+                );
+            }
+            m.conversation_tokens.push(tok);
+            generated_count += 1;
+        }
+        position += step.advance;
+        seed_token = step.bonus_token;
+        if hit_eos {
+            break;
+        }
+    }
+
+    m.seq_pos = m
+        .lfm2moe_state
+        .as_ref()
+        .map(|s| s.n_tokens)
+        .unwrap_or(position);
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let total_ms = t0.elapsed().as_millis().max(1);
+    let tok_s = (generated_count as f64 * 1000.0) / decode_ms as f64;
+    let accept_rate = if drafted_total > 0 {
+        accepted_total as f64 / drafted_total as f64
+    } else {
+        0.0
+    };
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{},"dflash":true,"cycles":{},"accepted":{},"accept_rate":{:.3}}}"#,
+        id, generated_count, tok_s, prefill_ms, total_ms, cycles, accepted_total, accept_rate,
+    );
+    let _ = stdout.flush();
+}
+
+#[cfg(feature = "arch-lfm2moe")]
+fn lfm2_argmax(row: &[f32]) -> u32 {
+    let mut best_idx = 0usize;
+    let mut best_val = f32::NEG_INFINITY;
+    for (idx, &value) in row.iter().enumerate() {
+        if value > best_val {
+            best_val = value;
+            best_idx = idx;
+        }
+    }
+    best_idx as u32
 
 fn framed_gemma3_prompt(prompt: &str, system_prompt: Option<&str>) -> String {
     let mut framed = String::from("<bos><start_of_turn>user\n");

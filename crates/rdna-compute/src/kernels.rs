@@ -2930,6 +2930,11 @@ pub const CONV1D_DECODE_SRC: &str = include_str!("../../../kernels/src/conv1d_de
 pub const CONV1D_GATED_DECODE_SRC: &str =
     include_str!("../../../kernels/src/conv1d_gated_decode.hip");
 
+/// LFM2 LIV double-gated short-conv prompt/prefill scan. Sequence companion
+/// to `conv1d_gated_decode_f32`; advances the rolling conv state once per
+/// prompt row in one launch. See kernels/src/conv1d_gated_seq.hip.
+pub const CONV1D_GATED_SEQ_SRC: &str = include_str!("../../../kernels/src/conv1d_gated_seq.hip");
+
 /// Gated output norm: rmsnorm(x) * silu(z). Fused single kernel.
 /// x and z are [n_heads × head_dim]. weight is [head_dim] (shared across heads).
 #[cfg(feature = "deltanet")]

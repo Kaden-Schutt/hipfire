@@ -23,15 +23,17 @@ use crate::lfm2moe::{
     AttnWeights, ConvWeights, DenseFfn, Ffn, Lfm2MoeLayerWeights, Lfm2MoeState, Lfm2MoeWeights,
     Mixer, MoeFfn,
 };
+use hip_bridge::HipResult;
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::superop::{
     self, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind, WeightSlot,
 };
 use hipfire_dispatch::types::DispatchError;
 use hipfire_runtime::weights::{
-    fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_for, weight_gemv, weight_gemv_residual,
+    fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for, rotate_x_mq_for, weight_gemm,
+    weight_gemv, weight_gemv_residual,
 };
-use rdna_compute::{DType, Gpu};
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Decode one token; returns the full logits vector.
 ///
@@ -68,6 +70,853 @@ fn graph_enabled() -> bool {
     })
 }
 
+fn stage_position(
+    gpu: &mut Gpu,
+    state: &Lfm2MoeState,
+    position: u32,
+    label: &str,
+) -> Result<(), String> {
+    gpu.hip
+        .memcpy_htod(&state.pos_buf, &(position as i32).to_ne_bytes())
+        .map_err(|e| format!("lfm2moe: htod {label} pos: {e:?}"))
+}
+
+fn stage_logical_rope_position(
+    gpu: &mut Gpu,
+    state: &Lfm2MoeState,
+    physical_position: u32,
+) -> Result<(), String> {
+    if state.kv.compact_offset == 0 {
+        return Ok(());
+    }
+    let logical = physical_position as usize + state.kv.compact_offset;
+    gpu.hip
+        .memcpy_htod(&state.pos_buf, &(logical as i32).to_ne_bytes())
+        .map_err(|e| format!("lfm2moe: htod logical rope pos: {e:?}"))
+}
+
+fn restore_physical_position_after_rope(
+    gpu: &mut Gpu,
+    state: &Lfm2MoeState,
+    physical_position: u32,
+) -> Result<(), String> {
+    if state.kv.compact_offset == 0 {
+        return Ok(());
+    }
+    stage_position(gpu, state, physical_position, "physical")
+}
+
+fn lfm2_triattn_tap_batch(
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    q: &GpuTensor,
+    k: &GpuTensor,
+    n_tokens: usize,
+    n_heads: usize,
+    n_kv: usize,
+    head_dim: usize,
+) -> Result<(), String> {
+    if !hipfire_runtime::triattn::tap_enabled() {
+        return Ok(());
+    }
+    let gpu_handled = hipfire_runtime::triattn::record_prerope_q_batch_gpu_if_applicable(
+        gpu, layer_idx, &q.buf, n_tokens, n_heads, head_dim,
+    )
+    .map_err(|e| format!("lfm2moe triattn tap L{layer_idx}: {e:?}"))?;
+    if gpu_handled {
+        return Ok(());
+    }
+
+    let q_stride = n_heads * head_dim;
+    let q_cpu = gpu
+        .download_f32(q)
+        .map_err(|e| format!("lfm2moe triattn tap L{layer_idx}: download q: {e:?}"))?;
+    if hipfire_runtime::triattn::tap_needs_k() {
+        let k_stride = n_kv * head_dim;
+        let k_cpu = gpu
+            .download_f32(k)
+            .map_err(|e| format!("lfm2moe triattn tap L{layer_idx}: download k: {e:?}"))?;
+        for row in 0..n_tokens {
+            hipfire_runtime::triattn::record_prerope_qk(
+                layer_idx,
+                &q_cpu[row * q_stride..(row + 1) * q_stride],
+                Some(&k_cpu[row * k_stride..(row + 1) * k_stride]),
+            );
+        }
+    } else {
+        for row in 0..n_tokens {
+            hipfire_runtime::triattn::record_prerope_q(
+                layer_idx,
+                &q_cpu[row * q_stride..(row + 1) * q_stride],
+            );
+        }
+    }
+    Ok(())
+}
+
+const LFM2_PREFILL_MAX_BATCH: usize = 256;
+
+/// Host-side capture of selected LFM2 post-layer residual streams.
+///
+/// Rows are appended in DFlash target-hidden layout:
+/// `[position][extract_layer][hidden]`, where `extract_layer` follows the
+/// caller-provided `target_layers` order.
+#[derive(Debug, Clone)]
+pub struct Lfm2HiddenCapture {
+    target_layers: Vec<usize>,
+    hidden: usize,
+    rows: Vec<f32>,
+}
+
+impl Lfm2HiddenCapture {
+    pub fn new(
+        num_target_layers: usize,
+        hidden: usize,
+        target_layers: Vec<usize>,
+    ) -> Result<Self, String> {
+        if hidden == 0 {
+            return Err("lfm2moe hidden capture: hidden must be non-zero".to_string());
+        }
+        if target_layers.is_empty() {
+            return Err("lfm2moe hidden capture: target_layers is empty".to_string());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for &layer in &target_layers {
+            if layer >= num_target_layers {
+                return Err(format!(
+                    "lfm2moe hidden capture: target layer {layer} out of range 0..{num_target_layers}"
+                ));
+            }
+            if !seen.insert(layer) {
+                return Err(format!(
+                    "lfm2moe hidden capture: duplicate target layer {layer}"
+                ));
+            }
+        }
+        Ok(Self {
+            target_layers,
+            hidden,
+            rows: Vec::new(),
+        })
+    }
+
+    pub fn target_layers(&self) -> &[usize] {
+        &self.target_layers
+    }
+
+    pub fn hidden(&self) -> usize {
+        self.hidden
+    }
+
+    pub fn num_extract(&self) -> usize {
+        self.target_layers.len()
+    }
+
+    pub fn rows(&self) -> &[f32] {
+        &self.rows
+    }
+
+    pub fn take_rows(self) -> Vec<f32> {
+        self.rows
+    }
+
+    pub fn clear(&mut self) {
+        self.rows.clear();
+    }
+
+    pub fn position_count(&self) -> usize {
+        self.rows.len() / (self.num_extract() * self.hidden)
+    }
+
+    fn extract_slot(&self, layer_idx: usize) -> Option<usize> {
+        self.target_layers.iter().position(|&l| l == layer_idx)
+    }
+
+    fn append_single_from_all_layers(&mut self, all_layers: &[Vec<f32>]) -> Result<(), String> {
+        for &layer in &self.target_layers {
+            let src = all_layers.get(layer).ok_or_else(|| {
+                format!("lfm2moe hidden capture: missing layer {layer} in decode capture")
+            })?;
+            if src.len() < self.hidden {
+                return Err(format!(
+                    "lfm2moe hidden capture: layer {layer} has {} floats, expected at least {}",
+                    src.len(),
+                    self.hidden
+                ));
+            }
+            let start = src.len() - self.hidden;
+            self.rows
+                .extend_from_slice(&src[start..start + self.hidden]);
+        }
+        Ok(())
+    }
+
+    fn append_interleaved_chunk(
+        &mut self,
+        layer_rows: &[Option<Vec<f32>>],
+        n: usize,
+    ) -> Result<(), String> {
+        if layer_rows.len() != self.num_extract() {
+            return Err(format!(
+                "lfm2moe hidden capture: got {} extracted layer buffers, expected {}",
+                layer_rows.len(),
+                self.num_extract()
+            ));
+        }
+        for (slot, rows) in layer_rows.iter().enumerate() {
+            let Some(rows) = rows else {
+                return Err(format!(
+                    "lfm2moe hidden capture: target layer {} was not captured",
+                    self.target_layers[slot]
+                ));
+            };
+            let expected = n * self.hidden;
+            if rows.len() != expected {
+                return Err(format!(
+                    "lfm2moe hidden capture: layer {} rows have {} floats, expected {}",
+                    self.target_layers[slot],
+                    rows.len(),
+                    expected
+                ));
+            }
+        }
+        self.rows.reserve(n * self.num_extract() * self.hidden);
+        for row in 0..n {
+            let row_start = row * self.hidden;
+            let row_end = row_start + self.hidden;
+            for rows in layer_rows.iter().flatten() {
+                self.rows.extend_from_slice(&rows[row_start..row_end]);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Chunk scratch for LFM2 batched prompt prefill. Rows are token-major.
+struct Lfm2MoePrefillScratch {
+    max_batch: usize,
+    tokens: GpuTensor,
+    positions: GpuTensor,
+    h_batch: GpuTensor,
+    tmp_batch: GpuTensor,
+    conv_bcx_batch: GpuTensor,
+    conv_y_batch: GpuTensor,
+    fa_q_batch: GpuTensor,
+    fa_k_batch: GpuTensor,
+    fa_v_batch: GpuTensor,
+    fa_attn_out_batch: GpuTensor,
+    dense_gate_batch: GpuTensor,
+    dense_up_batch: GpuTensor,
+    dense_act_batch: GpuTensor,
+    ffn_tmp_batch: GpuTensor,
+    ffn_x_rot_batch: GpuTensor,
+    router_logits_batch: GpuTensor,
+    topk_indices_batch: GpuTensor,
+    topk_weights_batch: GpuTensor,
+    gate_batch: GpuTensor,
+    up_batch: GpuTensor,
+    rot_batch: GpuTensor,
+    down_expanded_batch: GpuTensor,
+    proj_out_batch: GpuTensor,
+    flash_partials: GpuTensor,
+}
+
+impl Lfm2MoePrefillScratch {
+    fn new(gpu: &mut Gpu, cfg: &Lfm2MoeConfig, max_batch: usize) -> Result<Self, String> {
+        let hidden = cfg.hidden_size;
+        let q_dim = cfg.q_dim();
+        let kv_dim = cfg.kv_dim();
+        let dense_inter = cfg.intermediate_size;
+        let moe_inter = cfg.moe_intermediate_size;
+        let k_top = cfg.num_experts_per_tok;
+        let max_tiles = cfg.max_position_embeddings.min(8192).div_ceil(128);
+        let partials_size = 16 * cfg.num_attention_heads * max_tiles * (2 + cfg.head_dim);
+        let alloc = |g: &mut Gpu, n: usize, label: &str| -> Result<GpuTensor, String> {
+            g.alloc_tensor(&[n], DType::F32)
+                .map_err(|e| format!("lfm2moe prefill: alloc {label}: {e:?}"))
+        };
+
+        Ok(Self {
+            max_batch,
+            tokens: alloc(gpu, max_batch, "tokens")?,
+            positions: alloc(gpu, max_batch, "positions")?,
+            h_batch: alloc(gpu, max_batch * hidden, "h_batch")?,
+            tmp_batch: alloc(gpu, max_batch * hidden, "tmp_batch")?,
+            conv_bcx_batch: alloc(gpu, max_batch * 3 * hidden, "conv_bcx_batch")?,
+            conv_y_batch: alloc(gpu, max_batch * hidden, "conv_y_batch")?,
+            fa_q_batch: alloc(gpu, max_batch * q_dim, "fa_q_batch")?,
+            fa_k_batch: alloc(gpu, max_batch * kv_dim, "fa_k_batch")?,
+            fa_v_batch: alloc(gpu, max_batch * kv_dim, "fa_v_batch")?,
+            fa_attn_out_batch: alloc(gpu, max_batch * q_dim, "fa_attn_out_batch")?,
+            dense_gate_batch: alloc(gpu, max_batch * dense_inter, "dense_gate_batch")?,
+            dense_up_batch: alloc(gpu, max_batch * dense_inter, "dense_up_batch")?,
+            dense_act_batch: alloc(gpu, max_batch * dense_inter, "dense_act_batch")?,
+            ffn_tmp_batch: alloc(gpu, max_batch * hidden, "ffn_tmp_batch")?,
+            ffn_x_rot_batch: alloc(gpu, max_batch * hidden, "ffn_x_rot_batch")?,
+            router_logits_batch: alloc(gpu, max_batch * cfg.num_experts, "router_logits_batch")?,
+            topk_indices_batch: alloc(gpu, max_batch * k_top, "topk_indices_batch")?,
+            topk_weights_batch: alloc(gpu, max_batch * k_top, "topk_weights_batch")?,
+            gate_batch: alloc(gpu, max_batch * k_top * moe_inter, "gate_batch")?,
+            up_batch: alloc(gpu, max_batch * k_top * moe_inter, "up_batch")?,
+            rot_batch: alloc(gpu, max_batch * k_top * moe_inter, "rot_batch")?,
+            down_expanded_batch: alloc(gpu, max_batch * k_top * hidden, "down_expanded_batch")?,
+            proj_out_batch: alloc(gpu, max_batch * 3 * hidden, "proj_out_batch")?,
+            flash_partials: alloc(gpu, partials_size, "flash_partials")?,
+        })
+    }
+
+    fn free_gpu(self, gpu: &mut Gpu) {
+        for t in [
+            self.tokens,
+            self.positions,
+            self.h_batch,
+            self.tmp_batch,
+            self.conv_bcx_batch,
+            self.conv_y_batch,
+            self.fa_q_batch,
+            self.fa_k_batch,
+            self.fa_v_batch,
+            self.fa_attn_out_batch,
+            self.dense_gate_batch,
+            self.dense_up_batch,
+            self.dense_act_batch,
+            self.ffn_tmp_batch,
+            self.ffn_x_rot_batch,
+            self.router_logits_batch,
+            self.topk_indices_batch,
+            self.topk_weights_batch,
+            self.gate_batch,
+            self.up_batch,
+            self.rot_batch,
+            self.down_expanded_batch,
+            self.proj_out_batch,
+            self.flash_partials,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
+/// Batched prompt prefill for LFM2/LFM2-MoE. Processes `tokens` in chunks,
+/// updates KV/conv state to the post-prompt point, writes the last-token logits
+/// into `state.logits`, and returns those logits on host.
+///
+/// `HIPFIRE_PREFILL_BATCHED=0` preserves the legacy decode-step replay path.
+pub fn prefill_batch(
+    cfg: &Lfm2MoeConfig,
+    weights: &Lfm2MoeWeights,
+    state: &mut Lfm2MoeState,
+    gpu: &mut Gpu,
+    tokens: &[u32],
+) -> Result<Vec<f32>, String> {
+    prefill_batch_impl(cfg, weights, state, gpu, tokens, None, None)
+}
+
+/// Batched prompt prefill plus selected hidden-state extraction for DFlash.
+///
+/// Captures post-layer residuals for `capture.target_layers()` into
+/// `capture.rows()` in `[position][extract_layer][hidden]` order while leaving
+/// logits/KV/conv-state behavior identical to [`prefill_batch`].
+pub fn prefill_batch_with_hidden(
+    cfg: &Lfm2MoeConfig,
+    weights: &Lfm2MoeWeights,
+    state: &mut Lfm2MoeState,
+    gpu: &mut Gpu,
+    tokens: &[u32],
+    capture: &mut Lfm2HiddenCapture,
+) -> Result<Vec<f32>, String> {
+    validate_hidden_capture(cfg, capture)?;
+    prefill_batch_impl(cfg, weights, state, gpu, tokens, Some(capture), None)
+}
+
+/// Batched prompt/verify prefill plus selected hidden-state extraction and
+/// per-position logits.
+///
+/// This is the LFM2 DFlash verify surface: it advances target state exactly as
+/// [`prefill_batch_with_hidden`] does, captures the same DFlash hidden rows,
+/// and returns row-major logits for every token in `tokens`.
+pub fn prefill_batch_with_hidden_logits(
+    cfg: &Lfm2MoeConfig,
+    weights: &Lfm2MoeWeights,
+    state: &mut Lfm2MoeState,
+    gpu: &mut Gpu,
+    tokens: &[u32],
+    capture: &mut Lfm2HiddenCapture,
+) -> Result<Vec<f32>, String> {
+    validate_hidden_capture(cfg, capture)?;
+    let mut logits_per_pos = Vec::with_capacity(tokens.len() * cfg.vocab_size);
+    prefill_batch_impl(
+        cfg,
+        weights,
+        state,
+        gpu,
+        tokens,
+        Some(capture),
+        Some(&mut logits_per_pos),
+    )?;
+    Ok(logits_per_pos)
+}
+
+fn validate_hidden_capture(cfg: &Lfm2MoeConfig, capture: &Lfm2HiddenCapture) -> Result<(), String> {
+    if capture.hidden() != cfg.hidden_size {
+        return Err(format!(
+            "lfm2moe hidden capture: hidden mismatch capture={} model={}",
+            capture.hidden(),
+            cfg.hidden_size
+        ));
+    }
+    for &layer in capture.target_layers() {
+        if layer >= cfg.num_hidden_layers {
+            return Err(format!(
+                "lfm2moe hidden capture: target layer {layer} out of range 0..{}",
+                cfg.num_hidden_layers
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn prefill_batch_impl(
+    cfg: &Lfm2MoeConfig,
+    weights: &Lfm2MoeWeights,
+    state: &mut Lfm2MoeState,
+    gpu: &mut Gpu,
+    tokens: &[u32],
+    mut capture: Option<&mut Lfm2HiddenCapture>,
+    mut logits_per_pos: Option<&mut Vec<f32>>,
+) -> Result<Vec<f32>, String> {
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if !hipfire_runtime::config::get().prefill_batched
+        || tokens.len() < 2
+        || state.kv.compact_offset > 0
+    {
+        let mut logits = Vec::new();
+        let mut position = state.n_tokens as u32;
+        for &tok in tokens {
+            if let Some(cap) = capture.as_deref_mut() {
+                let mut all_layers: Vec<Vec<f32>> = vec![Vec::new(); cfg.num_hidden_layers];
+                decode_step_capture(cfg, weights, state, gpu, tok, position, &mut all_layers)?;
+                cap.append_single_from_all_layers(&all_layers)?;
+                logits = gpu
+                    .download_f32(&state.logits)
+                    .map_err(|e| format!("lfm2moe: download logits: {e:?}"))?;
+            } else {
+                logits = decode_step(cfg, weights, state, gpu, tok, position)?;
+            }
+            if let Some(out) = logits_per_pos.as_deref_mut() {
+                out.extend_from_slice(&logits);
+            }
+            position += 1;
+        }
+        return Ok(logits);
+    }
+
+    let max_batch = LFM2_PREFILL_MAX_BATCH.min(tokens.len());
+    let scratch = Lfm2MoePrefillScratch::new(gpu, cfg, max_batch)?;
+    let mut offset = 0usize;
+    let result = (|| -> Result<(), String> {
+        while offset < tokens.len() {
+            let n = (tokens.len() - offset).min(scratch.max_batch);
+            let start_pos = state.n_tokens;
+            prefill_batch_chunk(
+                cfg,
+                weights,
+                state,
+                gpu,
+                &tokens[offset..offset + n],
+                start_pos,
+                &scratch,
+                capture.as_deref_mut(),
+                logits_per_pos.as_deref_mut(),
+            )?;
+            offset += n;
+        }
+        Ok(())
+    })();
+    scratch.free_gpu(gpu);
+    result?;
+
+    gpu.download_f32(&state.logits)
+        .map_err(|e| format!("lfm2moe prefill: download logits: {e:?}"))
+}
+
+fn upload_i32_rows(gpu: &mut Gpu, dst: &GpuTensor, vals: &[u32]) -> Result<(), String> {
+    let host: Vec<i32> = vals.iter().map(|&v| v as i32).collect();
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 4) };
+    gpu.hip
+        .memcpy_htod(&dst.buf, bytes)
+        .map_err(|e| format!("lfm2moe prefill: upload i32 rows: {e:?}"))
+}
+
+fn lfm2_weight_gemm(
+    gpu: &mut Gpu,
+    w: &hipfire_runtime::weights::WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    batch_size: usize,
+) -> HipResult<()> {
+    if w.gpu_dtype != DType::MQ4G256 {
+        return weight_gemm(gpu, w, x, y, batch_size);
+    }
+
+    gpu.ensure_mq_signs()?;
+    let x_rot = gpu.alloc_tensor(&[batch_size * w.k], DType::F32)?;
+    let result = (|| -> HipResult<()> {
+        rotate_x_mq_batched_for(gpu, w, x, &x_rot, w.k, batch_size)?;
+        gpu.gemm_hfq4g256(&w.buf, &x_rot, y, w.m, w.k, batch_size)
+    })();
+    let _ = gpu.free_tensor(x_rot);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prefill_batch_chunk(
+    cfg: &Lfm2MoeConfig,
+    weights: &Lfm2MoeWeights,
+    state: &mut Lfm2MoeState,
+    gpu: &mut Gpu,
+    tokens: &[u32],
+    start_pos: usize,
+    s: &Lfm2MoePrefillScratch,
+    mut capture: Option<&mut Lfm2HiddenCapture>,
+    mut logits_per_pos: Option<&mut Vec<f32>>,
+) -> Result<(), String> {
+    let n = tokens.len();
+    debug_assert!(n > 0 && n <= s.max_batch);
+    let hidden = cfg.hidden_size;
+    let head_dim = cfg.head_dim;
+    let n_heads = cfg.num_attention_heads;
+    let n_kv = cfg.num_key_value_heads;
+    let moe_inter = cfg.moe_intermediate_size;
+    let n_exp = cfg.num_experts;
+    let k_top = cfg.num_experts_per_tok;
+    let eps = cfg.rms_norm_eps;
+    let mut captured_layer_rows: Option<Vec<Option<Vec<f32>>>> =
+        capture.as_ref().map(|cap| vec![None; cap.num_extract()]);
+
+    upload_i32_rows(gpu, &s.tokens, tokens)?;
+    let positions: Vec<u32> = (0..n).map(|i| (start_pos + i) as u32).collect();
+    upload_i32_rows(gpu, &s.positions, &positions)?;
+    gpu.embedding_lookup_q8_batched(&weights.embed, &s.h_batch, &s.tokens, n, hidden)
+        .map_err(|e| format!("lfm2moe prefill: embedding batch: {e:?}"))?;
+
+    let max_ctx_len = start_pos + n;
+    for (l, layer) in weights.layers.iter().enumerate() {
+        gpu.rmsnorm_batched(
+            &s.h_batch,
+            &layer.operator_norm,
+            &s.tmp_batch,
+            n,
+            hidden,
+            eps,
+        )
+        .map_err(|e| format!("lfm2moe prefill L{l}: operator rmsnorm: {e:?}"))?;
+
+        match &layer.mixer {
+            Mixer::Conv(c) => {
+                lfm2_weight_gemm(gpu, &c.in_proj, &s.tmp_batch, &s.conv_bcx_batch, n)
+                    .map_err(|e| format!("lfm2moe prefill L{l}: conv in_proj: {e:?}"))?;
+                gpu.conv1d_gated_seq_f32(
+                    &s.conv_bcx_batch,
+                    &state.conv_states[c.conv_state_idx],
+                    &c.conv_weight,
+                    &s.conv_y_batch,
+                    n,
+                    hidden,
+                    cfg.conv_kernel_size,
+                )
+                .map_err(|e| format!("lfm2moe prefill L{l}: conv seq: {e:?}"))?;
+                lfm2_weight_gemm(gpu, &c.out_proj, &s.conv_y_batch, &s.proj_out_batch, n)
+                    .map_err(|e| format!("lfm2moe prefill L{l}: conv out_proj: {e:?}"))?;
+                let y = s.proj_out_batch.sub_offset(0, n * hidden);
+                let h = s.h_batch.sub_offset(0, n * hidden);
+                gpu.add_inplace_f32(&h, &y)
+                    .map_err(|e| format!("lfm2moe prefill L{l}: conv residual: {e:?}"))?;
+            }
+            Mixer::Attention(a) => {
+                lfm2_weight_gemm(gpu, &a.wq, &s.tmp_batch, &s.fa_q_batch, n)
+                    .map_err(|e| format!("lfm2moe prefill L{l}: q_proj: {e:?}"))?;
+                lfm2_weight_gemm(gpu, &a.wk, &s.tmp_batch, &s.fa_k_batch, n)
+                    .map_err(|e| format!("lfm2moe prefill L{l}: k_proj: {e:?}"))?;
+                lfm2_weight_gemm(gpu, &a.wv, &s.tmp_batch, &s.fa_v_batch, n)
+                    .map_err(|e| format!("lfm2moe prefill L{l}: v_proj: {e:?}"))?;
+                gpu.rmsnorm_batched(
+                    &s.fa_q_batch,
+                    &a.q_norm,
+                    &s.fa_q_batch,
+                    n * n_heads,
+                    head_dim,
+                    eps,
+                )
+                .map_err(|e| format!("lfm2moe prefill L{l}: q_norm: {e:?}"))?;
+                gpu.rmsnorm_batched(
+                    &s.fa_k_batch,
+                    &a.k_norm,
+                    &s.fa_k_batch,
+                    n * n_kv,
+                    head_dim,
+                    eps,
+                )
+                .map_err(|e| format!("lfm2moe prefill L{l}: k_norm: {e:?}"))?;
+                lfm2_triattn_tap_batch(
+                    gpu,
+                    a.kv_idx,
+                    &s.fa_q_batch,
+                    &s.fa_k_batch,
+                    n,
+                    n_heads,
+                    n_kv,
+                    head_dim,
+                )
+                .map_err(|e| format!("lfm2moe prefill L{l}: {e}"))?;
+                gpu.rope_batched_f32(
+                    &s.fa_q_batch,
+                    &s.fa_k_batch,
+                    &s.positions,
+                    n_heads,
+                    n_kv,
+                    head_dim,
+                    cfg.rope_theta,
+                    n,
+                )
+                .map_err(|e| format!("lfm2moe prefill L{l}: rope: {e:?}"))?;
+                let kv_idx = a.kv_idx;
+                gpu.kv_cache_write_q8_0_batched(
+                    &state.kv.k_gpu[kv_idx],
+                    &s.fa_k_batch,
+                    &s.positions,
+                    n_kv,
+                    head_dim,
+                    n,
+                )
+                .map_err(|e| format!("lfm2moe prefill L{l}: kv write k: {e:?}"))?;
+                gpu.kv_cache_write_q8_0_batched(
+                    &state.kv.v_gpu[kv_idx],
+                    &s.fa_v_batch,
+                    &s.positions,
+                    n_kv,
+                    head_dim,
+                    n,
+                )
+                .map_err(|e| format!("lfm2moe prefill L{l}: kv write v: {e:?}"))?;
+                gpu.attention_q8_0_kv_batched_masked(
+                    &s.fa_q_batch,
+                    &state.kv.k_gpu[kv_idx],
+                    &state.kv.v_gpu[kv_idx],
+                    &s.fa_attn_out_batch,
+                    &s.positions,
+                    n_heads,
+                    n_kv,
+                    head_dim,
+                    state.kv.physical_cap,
+                    max_ctx_len,
+                    n,
+                    None,
+                    0,
+                    0,
+                )
+                .map_err(|e| format!("lfm2moe prefill L{l}: attention: {e:?}"))?;
+                lfm2_weight_gemm(gpu, &a.wo, &s.fa_attn_out_batch, &s.proj_out_batch, n)
+                    .map_err(|e| format!("lfm2moe prefill L{l}: out_proj: {e:?}"))?;
+                let y = s.proj_out_batch.sub_offset(0, n * hidden);
+                let h = s.h_batch.sub_offset(0, n * hidden);
+                gpu.add_inplace_f32(&h, &y)
+                    .map_err(|e| format!("lfm2moe prefill L{l}: attn residual: {e:?}"))?;
+            }
+        }
+
+        gpu.rmsnorm_batched(
+            &s.h_batch,
+            &layer.ffn_norm,
+            &s.ffn_tmp_batch,
+            n,
+            hidden,
+            eps,
+        )
+        .map_err(|e| format!("lfm2moe prefill L{l}: ffn rmsnorm: {e:?}"))?;
+
+        match &layer.ffn {
+            Ffn::Dense(d) => {
+                lfm2_weight_gemm(gpu, &d.w1, &s.ffn_tmp_batch, &s.dense_gate_batch, n)
+                    .map_err(|e| format!("lfm2moe prefill L{l}: dense w1: {e:?}"))?;
+                lfm2_weight_gemm(gpu, &d.w3, &s.ffn_tmp_batch, &s.dense_up_batch, n)
+                    .map_err(|e| format!("lfm2moe prefill L{l}: dense w3: {e:?}"))?;
+                gpu.silu_mul_f32(&s.dense_gate_batch, &s.dense_up_batch, &s.dense_act_batch)
+                    .map_err(|e| format!("lfm2moe prefill L{l}: dense silu_mul: {e:?}"))?;
+                lfm2_weight_gemm(gpu, &d.w2, &s.dense_act_batch, &s.proj_out_batch, n)
+                    .map_err(|e| format!("lfm2moe prefill L{l}: dense w2: {e:?}"))?;
+                let y = s.proj_out_batch.sub_offset(0, n * hidden);
+                let h = s.h_batch.sub_offset(0, n * hidden);
+                gpu.add_inplace_f32(&h, &y)
+                    .map_err(|e| format!("lfm2moe prefill L{l}: dense residual: {e:?}"))?;
+            }
+            Ffn::Moe(m) => {
+                rotate_x_mq_batched_for(
+                    gpu,
+                    &m.experts[0].gate_up,
+                    &s.ffn_tmp_batch,
+                    &s.ffn_x_rot_batch,
+                    hidden,
+                    n,
+                )
+                .map_err(|e| format!("lfm2moe prefill L{l}: ffn rotate: {e:?}"))?;
+                lfm2_weight_gemm(gpu, &m.router, &s.ffn_tmp_batch, &s.router_logits_batch, n)
+                    .map_err(|e| format!("lfm2moe prefill L{l}: router: {e:?}"))?;
+                gpu.sigmoid_f32(&s.router_logits_batch)
+                    .map_err(|e| format!("lfm2moe prefill L{l}: sigmoid: {e:?}"))?;
+                gpu.deepseek4_moe_topk_bias_aware_batched_f32(
+                    &s.router_logits_batch,
+                    &m.expert_bias,
+                    &s.topk_indices_batch,
+                    &s.topk_weights_batch,
+                    n_exp as i32,
+                    k_top as i32,
+                    cfg.routed_scaling_factor,
+                    n as i32,
+                )
+                .map_err(|e| format!("lfm2moe prefill L{l}: topk batched: {e:?}"))?;
+                let experts_mq6 = m.experts[0].gate_up.gpu_dtype == DType::MQ6G256;
+                if experts_mq6 {
+                    gpu.gemv_hfq6g256_moe_gate_up_k8_indexed_batched(
+                        &m.expert_gate_up_ptrs,
+                        &s.topk_indices_batch,
+                        &s.ffn_x_rot_batch,
+                        &s.gate_batch,
+                        &s.up_batch,
+                        2 * moe_inter,
+                        hidden,
+                        k_top,
+                        n,
+                    )
+                    .map_err(|e| format!("lfm2moe prefill L{l}: gate_up(mq6): {e:?}"))?;
+                } else {
+                    gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
+                        &m.expert_gate_up_ptrs,
+                        &s.topk_indices_batch,
+                        &s.ffn_x_rot_batch,
+                        &s.gate_batch,
+                        &s.up_batch,
+                        2 * moe_inter,
+                        hidden,
+                        k_top,
+                        n,
+                    )
+                    .map_err(|e| format!("lfm2moe prefill L{l}: gate_up: {e:?}"))?;
+                }
+                fused_silu_mul_rotate_mq_batched_for(
+                    gpu,
+                    &m.experts[0].down,
+                    &s.gate_batch,
+                    &s.up_batch,
+                    &s.rot_batch,
+                    moe_inter,
+                    n * k_top,
+                )
+                .map_err(|e| format!("lfm2moe prefill L{l}: silu_mul_rotate: {e:?}"))?;
+                if experts_mq6 {
+                    gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
+                        &m.expert_down_ptrs,
+                        &s.topk_indices_batch,
+                        &s.rot_batch,
+                        &s.down_expanded_batch,
+                        hidden,
+                        moe_inter,
+                        k_top,
+                        n,
+                    )
+                    .map_err(|e| format!("lfm2moe prefill L{l}: down(mq6): {e:?}"))?;
+                } else {
+                    gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+                        &m.expert_down_ptrs,
+                        &s.topk_indices_batch,
+                        &s.rot_batch,
+                        &s.down_expanded_batch,
+                        hidden,
+                        moe_inter,
+                        k_top,
+                        n,
+                    )
+                    .map_err(|e| format!("lfm2moe prefill L{l}: down: {e:?}"))?;
+                }
+                gpu.moe_down_combine_k8_batched(
+                    &s.down_expanded_batch,
+                    &s.topk_weights_batch,
+                    &s.h_batch,
+                    hidden,
+                    k_top,
+                    n,
+                )
+                .map_err(|e| format!("lfm2moe prefill L{l}: combine: {e:?}"))?;
+            }
+        }
+
+        if let Some(slot) = capture.as_ref().and_then(|cap| cap.extract_slot(l)) {
+            let h_rows = s.h_batch.sub_offset(0, n * hidden);
+            let rows = gpu
+                .download_f32(&h_rows)
+                .map_err(|e| format!("lfm2moe prefill L{l}: hidden capture: {e:?}"))?;
+            if let Some(ref mut layer_rows) = captured_layer_rows {
+                layer_rows[slot] = Some(rows);
+            }
+        }
+    }
+
+    if let Some(cap) = capture.as_deref_mut() {
+        let layer_rows = captured_layer_rows
+            .take()
+            .expect("capture rows allocated when capture is present");
+        cap.append_interleaved_chunk(&layer_rows, n)?;
+    }
+
+    if let Some(out) = logits_per_pos.as_deref_mut() {
+        let logits_batch = gpu
+            .alloc_tensor(&[n * cfg.vocab_size], DType::F32)
+            .map_err(|e| format!("lfm2moe prefill: alloc all logits: {e:?}"))?;
+        let result = (|| -> Result<Vec<f32>, String> {
+            gpu.rmsnorm_batched(
+                &s.h_batch,
+                &weights.embedding_norm,
+                &s.tmp_batch,
+                n,
+                hidden,
+                eps,
+            )
+            .map_err(|e| format!("lfm2moe prefill: final rmsnorm batch: {e:?}"))?;
+            lfm2_weight_gemm(gpu, &weights.lm_head, &s.tmp_batch, &logits_batch, n)
+                .map_err(|e| format!("lfm2moe prefill: all-row lm_head: {e}"))?;
+            gpu.download_f32(&logits_batch)
+                .map_err(|e| format!("lfm2moe prefill: download all logits: {e:?}"))
+        })();
+        let _ = gpu.free_tensor(logits_batch);
+        out.extend_from_slice(&result?);
+    }
+
+    state.n_tokens = start_pos + n;
+    gpu.hip
+        .memcpy_dtod_at(
+            &state.h.buf,
+            0,
+            &s.h_batch.buf,
+            (n - 1) * hidden * 4,
+            hidden * 4,
+        )
+        .map_err(|e| format!("lfm2moe prefill: copy last hidden: {e:?}"))?;
+    gpu.rmsnorm_f32(
+        &state.h,
+        &weights.embedding_norm,
+        &state.final_norm_buf,
+        eps,
+    )
+    .map_err(|e| format!("lfm2moe prefill: final rmsnorm: {e:?}"))?;
+    weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
+        .map_err(|e| format!("lfm2moe prefill: lm_head: {e}"))?;
+    Ok(())
+}
+
 /// Decode one token, appending each layer's post-residual hidden state
 /// (after the full layer, before the final norm) to `capture[layer]` — used by
 /// the oracle dumper. Set `HIPFIRE_LFM2_CAPTURE_POSTMIXER` to capture the
@@ -95,10 +944,9 @@ fn decode_step_inner(
 ) -> Result<(), String> {
     let hidden = cfg.hidden_size;
 
-    // Device position scalar (i32) for rope / kv-write / attention.
-    gpu.hip
-        .memcpy_htod(&state.pos_buf, &(position as i32).to_ne_bytes())
-        .map_err(|e| format!("lfm2moe: htod pos: {e:?}"))?;
+    // Device position scalar (i32) for kv-write / attention. RoPE temporarily
+    // swaps in logical position when TriAttention compaction is active.
+    stage_position(gpu, state, position, "physical")?;
 
     // Embedding lookup → residual stream h (Q8 table).
     gpu.embedding_lookup_q8(&weights.embed, &state.h, token_id, hidden)
@@ -188,6 +1036,18 @@ fn decode_step_layers_and_head(
                     .map_err(|e| format!("lfm2moe L{l}: k_norm: {e:?}"))?;
 
                 // Full-dim rotate_half RoPE (no partial rotary).
+                lfm2_triattn_tap_batch(
+                    gpu,
+                    a.kv_idx,
+                    &state.fa_q,
+                    &state.fa_k,
+                    1,
+                    n_heads,
+                    n_kv,
+                    head_dim,
+                )
+                .map_err(|e| format!("lfm2moe L{l}: {e}"))?;
+                stage_logical_rope_position(gpu, state, position)?;
                 gpu.rope_f32(
                     &state.fa_q,
                     &state.fa_k,
@@ -198,6 +1058,7 @@ fn decode_step_layers_and_head(
                     cfg.rope_theta,
                 )
                 .map_err(|e| format!("lfm2moe L{l}: rope: {e:?}"))?;
+                restore_physical_position_after_rope(gpu, state, position)?;
 
                 // KV cache write (Q8) + GQA flash attention.
                 let kv_idx = a.kv_idx;
@@ -397,6 +1258,38 @@ fn decode_step_layers_and_head(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hidden_capture_interleaves_positions_then_layers() {
+        let mut cap = Lfm2HiddenCapture::new(6, 2, vec![1, 4]).unwrap();
+        let layer_1 = vec![10.0, 11.0, 20.0, 21.0, 30.0, 31.0];
+        let layer_4 = vec![40.0, 41.0, 50.0, 51.0, 60.0, 61.0];
+        cap.append_interleaved_chunk(&[Some(layer_1), Some(layer_4)], 3)
+            .unwrap();
+
+        assert_eq!(
+            cap.rows(),
+            &[
+                10.0, 11.0, 40.0, 41.0, // position 0, layers 1 then 4
+                20.0, 21.0, 50.0, 51.0, // position 1
+                30.0, 31.0, 60.0, 61.0, // position 2
+            ]
+        );
+        assert_eq!(cap.position_count(), 3);
+    }
+
+    #[test]
+    fn hidden_capture_rejects_duplicate_or_out_of_range_layers() {
+        assert!(Lfm2HiddenCapture::new(4, 8, vec![1, 1]).is_err());
+        assert!(Lfm2HiddenCapture::new(4, 8, vec![4]).is_err());
+        assert!(Lfm2HiddenCapture::new(4, 0, vec![1]).is_err());
+        assert!(Lfm2HiddenCapture::new(4, 8, Vec::new()).is_err());
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // #397 Ship 6 — forward-as-pipeline: LFM2.5 lowered decode (the run_conv slot).
 //
@@ -468,6 +1361,19 @@ fn attn_mixer_block(
         .map_err(|e| format!("lfm2moe L{l}: q_norm: {e:?}"))?;
     gpu.rmsnorm_batched(&state.fa_k, &a.k_norm, &state.fa_k, n_kv, head_dim, eps)
         .map_err(|e| format!("lfm2moe L{l}: k_norm: {e:?}"))?;
+    lfm2_triattn_tap_batch(
+        gpu,
+        a.kv_idx,
+        &state.fa_q,
+        &state.fa_k,
+        1,
+        n_heads,
+        n_kv,
+        head_dim,
+    )
+    .map_err(|e| format!("lfm2moe L{l}: {e}"))?;
+    let physical_position = (seq_len - 1) as u32;
+    stage_logical_rope_position(gpu, state, physical_position)?;
     gpu.rope_f32(
         &state.fa_q,
         &state.fa_k,
@@ -478,6 +1384,7 @@ fn attn_mixer_block(
         cfg.rope_theta,
     )
     .map_err(|e| format!("lfm2moe L{l}: rope: {e:?}"))?;
+    restore_physical_position_after_rope(gpu, state, physical_position)?;
     let kv_idx = a.kv_idx;
     gpu.kv_cache_write_q8_0(
         &state.kv.k_gpu[kv_idx],

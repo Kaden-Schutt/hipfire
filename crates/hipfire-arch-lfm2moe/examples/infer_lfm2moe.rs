@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 //! Minimal LFM2.5-MoE greedy inference — real-model e2e coherence check.
-//! Loads an HFQ, runs prefill + greedy decode via `decode_step`, prints text.
+//! Loads an HFQ, runs batched prefill + greedy decode, prints text.
 //!
 //! Usage: infer_lfm2moe --model <hfq> [--prompt <text>] [--max N]
 
@@ -13,7 +13,7 @@ fn main() {
 #[cfg(feature = "deltanet")]
 fn main() {
     use hipfire_arch_lfm2moe::config::Lfm2MoeConfig;
-    use hipfire_arch_lfm2moe::forward::decode_step;
+    use hipfire_arch_lfm2moe::forward::{decode_step, prefill_batch};
     use hipfire_arch_lfm2moe::lfm2moe::{Lfm2MoeState, Lfm2MoeWeights};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::tokenizer::Tokenizer;
@@ -106,12 +106,10 @@ fn main() {
         bi
     };
 
-    // Prefill (per-token; correctness-first).
+    // Prefill (batched unless HIPFIRE_PREFILL_BATCHED=0).
     let t0 = std::time::Instant::now();
-    let mut logits = Vec::new();
-    for (pos, &t) in prompt_ids.iter().enumerate() {
-        logits = decode_step(&cfg, &weights, &mut state, &mut gpu, t, pos as u32).expect("prefill");
-    }
+    let mut logits =
+        prefill_batch(&cfg, &weights, &mut state, &mut gpu, &prompt_ids).expect("prefill");
     eprintln!(
         "prefill {} tok in {:.2}s",
         prompt_ids.len(),

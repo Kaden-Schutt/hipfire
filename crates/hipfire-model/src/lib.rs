@@ -678,10 +678,11 @@ pub struct Sidecars {
 pub fn quant_token(display: &str) -> String {
     const FORMATS: &[&str] = &[
         "bf16", "fp16", "f16", "q8", "mq2", "mq3", "mq4", "mq6", "mq8", "op4", "op4-4", "op4-8+",
-        "op8", "op8-16", "op4+", "op8+", "qtip2", "qtip3", "iu8", "w4a8", "w8a8",
+        "op8", "op8-16", "op4+", "op8+", "oq4", "oq4+", "oq8", "oq8+", "qtip2", "qtip3", "iu8",
+        "w4a8", "w8a8",
     ];
     let mut best: Option<&str> = None;
-    for seg in display.split('-') {
+    for seg in display.split(['-', '.']) {
         let head = seg.split('+').next().unwrap_or(seg);
         let low = head.to_ascii_lowercase();
         if FORMATS.iter().any(|fmt| low.starts_with(fmt)) {
@@ -1262,59 +1263,116 @@ fn dflash_draft_search_dirs(model_dir: &Path) -> Vec<PathBuf> {
 
 /// Return candidate DFlash draft sidecar filenames for a target model filename.
 pub fn dflash_draft_candidates(filename: &str) -> Vec<String> {
-    let Some((family, version, size, quant)) = parse_qwen_dflash_target(filename) else {
+    let Some(target) = parse_dflash_target(filename) else {
         return Vec::new();
     };
-    let dotted_family = format!("{family}{version}");
-    let mut quants = vec![quant.clone()];
-    if quant == "mq3" {
+
+    let mut quants = vec![target.quant.clone()];
+    if target.family == "qwen3" && target.quant == "mq3" {
         quants.push("mq4".to_string());
-    } else if quant == "mq4" {
+    } else if target.family == "qwen3" && target.quant == "mq4" {
         quants.push("mq3".to_string());
+    } else if target.family == "lfm2" {
+        match target.quant.as_str() {
+            "oq4" => {
+                quants.push("op4".to_string());
+                quants.push("mq4".to_string());
+            }
+            "op4" => {
+                quants.push("oq4".to_string());
+                quants.push("mq4".to_string());
+            }
+            "oq4+" => {
+                quants.push("op4+".to_string());
+                quants.push("mq4".to_string());
+            }
+            "op4+" => {
+                quants.push("oq4+".to_string());
+                quants.push("mq4".to_string());
+            }
+            "oq8" => quants.push("op8".to_string()),
+            "op8" => quants.push("oq8".to_string()),
+            _ => {}
+        }
     }
     let mut out = Vec::new();
     for q in quants {
-        out.push(format!("{dotted_family}-{size}-{q}.dflash.hfq"));
-        out.push(format!("{dotted_family}-{size}-{q}.draft.hfq"));
+        out.push(target.format_candidate(&q, "dflash"));
+        out.push(target.format_candidate(&q, "draft"));
     }
     out
 }
 
-fn parse_qwen_dflash_target(filename: &str) -> Option<(&'static str, String, String, String)> {
-    let mut quant_from_ext = None;
-    let stem = if let Some(stem) = filename.strip_suffix(".hfq") {
-        stem
-    } else if let Some(stem) = filename.strip_suffix("-mq4.hfq") {
-        quant_from_ext = Some("mq4".to_string());
-        stem
-    } else if let Some(stem) = filename.strip_suffix("-mq3.hfq") {
-        quant_from_ext = Some("mq3".to_string());
-        stem
-    } else if let Some(stem) = filename.strip_suffix("-mq6.hfq") {
-        quant_from_ext = Some("mq6".to_string());
-        stem
-    } else {
-        filename
-    };
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DflashDraftTarget {
+    family: &'static str,
+    stem: String,
+    quant: String,
+    separator: char,
+}
+
+impl DflashDraftTarget {
+    fn format_candidate(&self, quant: &str, role: &str) -> String {
+        format!("{}{}{}.{}.hfq", self.stem, self.separator, quant, role)
+    }
+}
+
+fn parse_dflash_target(filename: &str) -> Option<DflashDraftTarget> {
+    let stem = filename.strip_suffix(".hfq").unwrap_or(filename);
+    parse_qwen_dflash_target(stem).or_else(|| parse_lfm2_dflash_target(stem))
+}
+
+fn parse_qwen_dflash_target(stem: &str) -> Option<DflashDraftTarget> {
     let parts: Vec<_> = stem.split('-').collect();
     if parts.len() < 2 || !parts[0].starts_with("qwen3.") {
         return None;
     }
-    let version = parts[0].trim_start_matches("qwen").to_string();
-    let quant = quant_from_ext.or_else(|| {
-        parts
-            .iter()
-            .rev()
-            .find(|part| matches!(**part, "mq3" | "mq4" | "mq6" | "mq8"))
-            .map(|part| (*part).to_string())
-    })?;
+    let quant = parts
+        .iter()
+        .rev()
+        .find(|part| matches!(**part, "mq3" | "mq4" | "mq6" | "mq8"))
+        .map(|part| (*part).to_string())?;
     let quant_idx = parts
         .iter()
         .rposition(|part| *part == quant)
         .unwrap_or(parts.len());
-    let size_end = quant_idx.max(2);
-    let size = parts[1..size_end].join("-");
-    Some(("qwen", version, size, quant))
+    if quant_idx < 2 {
+        return None;
+    }
+    Some(DflashDraftTarget {
+        family: "qwen3",
+        stem: parts[..quant_idx].join("-"),
+        quant,
+        separator: '-',
+    })
+}
+
+fn parse_lfm2_dflash_target(stem: &str) -> Option<DflashDraftTarget> {
+    let lower = stem.to_ascii_lowercase();
+    if !(lower.starts_with("lfm2") || lower.starts_with("liquidai-lfm2")) {
+        return None;
+    }
+    const QUANTS: &[&str] = &[
+        "oq4+", "op4+", "q8f16", "mq3", "mq4", "mq6", "mq8", "oq4", "op4", "oq8", "op8", "q8",
+    ];
+    for quant in QUANTS {
+        for separator in ['-', '.'] {
+            let suffix = format!("{separator}{quant}");
+            if lower.ends_with(&suffix) {
+                let stem_end = stem.len().saturating_sub(suffix.len());
+                if stem_end == 0 {
+                    return None;
+                }
+                return Some(DflashDraftTarget {
+                    family: "lfm2",
+                    stem: stem[..stem_end].to_string(),
+                    quant: (*quant).to_string(),
+                    separator,
+                });
+            }
+        }
+    }
+    None
 }
 
 fn scan_models_dir(dir: &Path, stem: &str) -> Vec<PathBuf> {
@@ -2202,6 +2260,36 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dflash_draft_discovery_uses_lfm2_sidecar_names() {
+        let oq4 = dflash_draft_candidates("LFM2.5-350M-oq4.hfq");
+        assert!(oq4.contains(&"LFM2.5-350M-oq4.dflash.hfq".to_string()));
+        assert!(oq4.contains(&"LFM2.5-350M-op4.dflash.hfq".to_string()));
+        assert!(oq4.contains(&"LFM2.5-350M-mq4.dflash.hfq".to_string()));
+
+        let op4_plus = dflash_draft_candidates("LFM2.5-1.2B-Thinking.op4+.hfq");
+        assert!(op4_plus.contains(&"LFM2.5-1.2B-Thinking.op4+.dflash.hfq".to_string()));
+        assert!(op4_plus.contains(&"LFM2.5-1.2B-Thinking.oq4+.dflash.hfq".to_string()));
+
+        let root = temp_dir("hipfire-lfm2-dflash-draft-discovery");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("LFM2.5-350M-oq4.hfq");
+        let draft = root.join("LFM2.5-350M-oq4.dflash.hfq");
+        fs::write(&target, "target").unwrap();
+        fs::write(&draft, "draft").unwrap();
+
+        assert_eq!(discover_dflash_draft_for_model(&target), Some(draft));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn quant_token_recognizes_lfm2_opus_dotted_quant_names() {
+        assert_eq!(quant_token("LFM2.5-350M-op4+"), "op4");
+        assert_eq!(quant_token("LFM2.5-1.2B-Thinking.op4+"), "op4");
+        assert_eq!(quant_token("LFM2.5-1.2B-Thinking.oq8"), "oq8");
     }
 
     #[test]

@@ -1359,6 +1359,7 @@ pub fn weight_gemm(
     match w.gpu_dtype {
         DType::F16 => gpu.gemm_f16_x_f32_wmma(&w.buf, x, y, w.m, w.k, batch_size),
         DType::BF16 => gpu.gemm_bf16_x_bf16_wmma(&w.buf, x, y, w.m, w.k, batch_size),
+        DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G128 => gpu.gemm_hfq4g128(&w.buf, x, y, w.m, w.k, batch_size),
         DType::Oq4G256 => {
@@ -1368,12 +1369,19 @@ pub fn weight_gemm(
             let x_rot = gpu.alloc_tensor(&[batch_size * w.k], DType::F32)?;
             let result = (|| {
                 rotate_x_mq_batched_for(gpu, w, x, &x_rot, w.k, batch_size)?;
-                match std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS").as_deref() {
-                    Ok("8") => {
+                let act_bits = std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS").ok();
+                match act_bits.as_deref() {
+                    Some("4") => {
+                        gpu.gemm_oq4_grouped_act_batched(&w.buf, &x_rot, y, w.m, w.k, batch_size)
+                    }
+                    Some("8") => {
                         gpu.gemm_oq4_residual_mmq(&w.buf, &x_rot, y, w.m, w.k, batch_size, false)
                     }
-                    Ok("16") => gpu
+                    Some("16") => gpu
                         .gemm_oq4_grouped_f16_wmma(&w.buf, &x_rot, y, w.m, w.k, batch_size, GROUP),
+                    _ if batch_size >= 64 => {
+                        gpu.gemm_oq4_residual_mmq(&w.buf, &x_rot, y, w.m, w.k, batch_size, false)
+                    }
                     _ => gpu.gemm_oq4_grouped_act_batched(&w.buf, &x_rot, y, w.m, w.k, batch_size),
                 }
             })();
