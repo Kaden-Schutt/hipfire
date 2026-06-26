@@ -16,6 +16,7 @@ use hipfire_diffusion::{
 use image::{ImageEncoder, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -3630,32 +3631,59 @@ pub async fn get_latent_upscale_modes() -> Json<Value> {
     ]))
 }
 
-pub async fn get_sd_models() -> Json<Value> {
-    let mut models = discover_diffusion_hfq_models()
+pub async fn get_sd_models(State(state): State<SharedState>) -> Json<Value> {
+    let loaded = {
+        let cache = state.diffusion_pipelines.lock().await;
+        cache
+            .iter()
+            .map(|(path, pipeline)| (path.clone(), pipeline.summary().clone()))
+            .collect::<Vec<_>>()
+    };
+    let mut seen_filenames = HashSet::new();
+    let mut models = loaded
         .into_iter()
-        .map(|inspection| {
-            let model = inspection.summary;
-            let runtime_kind = inspection
-                .runtime_support
-                .runtime_kind
-                .map(|kind| kind.as_str().to_string());
-            json!({
-                "title": model.title,
-                "model_name": model.model_name,
-                "hash": null,
-                "sha256": null,
-                "filename": model.path,
-                "config": model.pipeline_class,
-                "max_batch": model.max_batch,
-                "weight_format": model.weight_format,
-                "runtime_support": {
-                    "metadata_supported": inspection.runtime_support.supported,
-                    "runtime": runtime_kind,
-                    "reason": inspection.runtime_support.reason,
-                },
-            })
+        .map(|(path, summary)| {
+            seen_filenames.insert(path.to_string_lossy().into_owned());
+            match inspect_hfq_with_runtime_support(&path) {
+                Ok(inspection) => {
+                    let runtime_kind = inspection
+                        .runtime_support
+                        .runtime_kind
+                        .map(|kind| kind.as_str().to_string());
+                    diffusion_hfq_model_json(
+                        inspection.summary,
+                        runtime_kind,
+                        inspection.runtime_support.reason,
+                    )
+                }
+                Err(_) => diffusion_hfq_model_json(
+                    summary,
+                    None,
+                    Some("loaded diffusion pipeline could not be re-inspected".to_string()),
+                ),
+            }
         })
         .collect::<Vec<_>>();
+
+    models.extend(
+        discover_diffusion_hfq_models()
+            .into_iter()
+            .filter_map(|inspection| {
+                let filename = inspection.summary.path.to_string_lossy().into_owned();
+                if !seen_filenames.insert(filename) {
+                    return None;
+                }
+                let runtime_kind = inspection
+                    .runtime_support
+                    .runtime_kind
+                    .map(|kind| kind.as_str().to_string());
+                Some(diffusion_hfq_model_json(
+                    inspection.summary,
+                    runtime_kind,
+                    inspection.runtime_support.reason,
+                ))
+            }),
+    );
 
     models.extend(discover_diffusers_models().into_iter().map(|model| {
         json!({
@@ -3694,6 +3722,28 @@ pub async fn get_sd_models() -> Json<Value> {
         })
     }));
     Json(Value::Array(models))
+}
+
+fn diffusion_hfq_model_json(
+    model: hipfire_diffusion::DiffusionModelSummary,
+    runtime_kind: Option<String>,
+    runtime_reason: Option<String>,
+) -> Value {
+    json!({
+        "title": model.title,
+        "model_name": model.model_name,
+        "hash": null,
+        "sha256": null,
+        "filename": model.path,
+        "config": model.pipeline_class,
+        "max_batch": model.max_batch,
+        "weight_format": model.weight_format,
+        "runtime_support": {
+            "metadata_supported": runtime_reason.is_none(),
+            "runtime": runtime_kind,
+            "reason": runtime_reason,
+        },
+    })
 }
 
 pub async fn get_sd_vae() -> Json<Value> {
@@ -6656,6 +6706,43 @@ mod tests {
         assert!(is_supported_diffusion_pipeline("QwenImageEditPipeline"));
         assert!(is_supported_diffusion_pipeline("DiffusionPipeline"));
         assert!(!is_supported_diffusion_pipeline("AutoModelForCausalLM"));
+    }
+
+    #[tokio::test]
+    async fn sd_models_includes_loaded_diffusion_hfq_outside_model_registry() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-sdapi-loaded-sd-models-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("loaded-tiny-diffusion.hfq");
+        write_tiny_diffusion_hfq(&hfq_path);
+        let pipeline = DiffusionPipeline::open_hfq(&hfq_path).unwrap();
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        state
+            .diffusion_pipelines
+            .lock()
+            .await
+            .insert(hfq_path.clone(), Arc::new(pipeline));
+
+        let Json(models) = get_sd_models(State(state)).await;
+        let models = models.as_array().unwrap();
+        let hfq_filename = hfq_path.to_string_lossy();
+        let loaded = models
+            .iter()
+            .find(|model| model["filename"].as_str() == Some(hfq_filename.as_ref()))
+            .unwrap_or_else(|| {
+                panic!("loaded model {hfq_path:?} missing from sd-models: {models:?}")
+            });
+        assert_eq!(loaded["model_name"], "tiny-route");
+        assert_eq!(loaded["config"], "StableDiffusionPipeline");
+        assert_eq!(loaded["max_batch"], 2);
+        assert_eq!(loaded["weight_format"], "source");
+        assert_eq!(loaded["runtime_support"]["metadata_supported"], true);
+        assert_eq!(loaded["runtime_support"]["runtime"], "cpu-source-reference");
+        assert_eq!(loaded["runtime_support"]["reason"], Value::Null);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -270,6 +270,32 @@ try:
     options = fetch_json(f"{base_url}/sdapi/v1/options", timeout=10.0)
     if options.get("sd_model_checkpoint") != model:
         raise RuntimeError(f"options did not report default model {model!r}: {options}")
+    sd_models = fetch_json(f"{base_url}/sdapi/v1/sd-models", timeout=10.0)
+    if not isinstance(sd_models, list) or not sd_models:
+        raise RuntimeError(f"sd-models endpoint returned no models: {sd_models}")
+    active_model = next(
+        (
+            entry
+            for entry in sd_models
+            if isinstance(entry, dict)
+            and (
+                entry.get("filename") == model
+                or os.path.abspath(str(entry.get("filename", ""))) == os.path.abspath(model)
+            )
+        ),
+        None,
+    )
+    if active_model is None:
+        raise RuntimeError(f"sd-models did not include active HFQ model {model!r}: {sd_models}")
+    runtime_support = active_model.get("runtime_support")
+    if not isinstance(runtime_support, dict) or runtime_support.get("metadata_supported") is not True:
+        raise RuntimeError(f"sd-models active model did not report runtime support: {active_model}")
+    if runtime_support.get("runtime") != "cpu-source-reference":
+        raise RuntimeError(f"sd-models active model reported unexpected runtime support: {active_model}")
+    if active_model.get("config") != "StableDiffusionPipeline":
+        raise RuntimeError(f"sd-models active model did not advertise StableDiffusionPipeline: {active_model}")
+    if active_model.get("max_batch", 0) < batch_size:
+        raise RuntimeError(f"sd-models active model max_batch is below requested batch: {active_model}")
     samplers = fetch_json(f"{base_url}/sdapi/v1/samplers", timeout=10.0)
     if not isinstance(samplers, list) or not samplers:
         raise RuntimeError(f"samplers endpoint returned no samplers: {samplers}")
@@ -416,6 +442,13 @@ try:
         "n_iter": n_iter,
         "images_per_route": expected_images,
         "rocm_device_id": rocm_device_id,
+        "sd_models": len(sd_models),
+        "active_model": {
+            "model_name": active_model.get("model_name"),
+            "config": active_model.get("config"),
+            "runtime": runtime_support.get("runtime"),
+            "max_batch": active_model.get("max_batch"),
+        },
         "loras": len(loras),
         "server_command_noops": 3,
         "skip_noop": True,
