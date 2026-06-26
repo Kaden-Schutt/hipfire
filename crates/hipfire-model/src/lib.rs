@@ -11,6 +11,7 @@ pub mod gguf;
 pub mod model_support_generated;
 pub mod tokenizer;
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt::Display;
@@ -670,45 +671,22 @@ pub struct Sidecars {
     pub hessian: bool,
 }
 
-/// Quant/format token of a model display name. Scans `-`-delimited segments for
-/// a known format prefix (mq4, op4, op8, op4-4, op8-16, qtip3, q8, bf16, …) so
-/// calibration modifiers that trail the format (e.g. `op4-ldlq`) don't mask it; falls
-/// back to the last
-/// segment. A bundled `+feature` suffix is stripped.
+/// Quant/format token of a model display name. Scans dotted/dashed groups for
+/// the canonical artifact quant token (`mq*`, `oq*`, `bf16`, `f16`, `fp16`) and
+/// falls back to the last segment for unknown local artifacts.
 pub fn quant_token(display: &str) -> String {
-    const FORMATS: &[&str] = &[
-        "bf16", "fp16", "f16", "q8", "mq2", "mq3", "mq4", "mq6", "mq8", "op4", "op4-4", "op4-8+",
-        "op8", "op8-16", "op4+", "op8+", "oq4", "oq4+", "oq8", "oq8+", "qtip2", "qtip3", "iu8",
-        "w4a8", "w8a8",
-    ];
-    let mut best: Option<&str> = None;
-    for seg in display.split(['-', '.']) {
-        let head = seg.split('+').next().unwrap_or(seg);
-        let low = head.to_ascii_lowercase();
-        if FORMATS.iter().any(|fmt| low.starts_with(fmt)) {
-            best = Some(head);
-        }
-    }
-    let token = best
-        .map(str::to_string)
+    parse_canonical_model_artifact_name(display)
+        .map(|name| name.quant)
         .unwrap_or_else(|| {
             display
-                .rsplit('-')
+                .rsplit(['-', '.'])
                 .next()
                 .unwrap_or(display)
                 .split('+')
                 .next()
                 .unwrap_or(display)
-                .to_string()
+                .to_ascii_lowercase()
         })
-        .to_ascii_lowercase();
-    match token.as_str() {
-        "op4" => "op4-4".to_string(),
-        "op8" => "op8-16".to_string(),
-        "op4+" => "op4-4+".to_string(),
-        "op8+" => "op8-16+".to_string(),
-        other => other.to_string(),
-    }
 }
 
 /// Detect template + sidecar artifacts for a primary model file (GPU-free:
@@ -1029,11 +1007,28 @@ pub struct ModelRegistryAsset {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ModelArtifactName {
+    pub id: String,
+    pub model: String,
+    pub size: Option<String>,
+    pub tags: Vec<String>,
+    pub features: Vec<String>,
+    pub quant: String,
+    pub arch: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LlmModelRegistryEntry {
     pub id: String,
     pub file: String,
     pub path: String,
     pub bytes: u64,
+    pub model: String,
+    pub size: Option<String>,
+    pub tags: Vec<String>,
+    pub features: Vec<String>,
+    pub quant: String,
+    pub arch: Option<String>,
     pub triattn: Vec<ModelRegistryAsset>,
     pub drafts: Vec<ModelRegistryAsset>,
     pub chat_templates: Vec<ModelRegistryAsset>,
@@ -1080,7 +1075,7 @@ pub fn build_llm_registry_in(
     let triattn = scan_registry_assets(triattn_dir, is_triattn_file_name);
     let drafts = scan_registry_assets(drafts_dir, is_draft_file_name);
     let chat_templates = scan_registry_assets(templates_dir, is_chat_template_file_name);
-    let models = list_local_models_in(models_dir)
+    let models = scan_canonical_primary_models(models_dir)
         .into_iter()
         .map(|model| {
             let file = model
@@ -1088,23 +1083,15 @@ pub fn build_llm_registry_in(
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
+            let parsed = parse_canonical_model_artifact_name(&file)
+                .expect("scan_canonical_primary_models only returns parseable model artifacts");
             let mut model_triattn =
                 matching_assets(&triattn, |asset| triattn_matches_model(&asset.file, &file));
-            model_triattn.extend(
-                scan_registry_assets(models_dir, is_triattn_file_name)
-                    .into_iter()
-                    .filter(|asset| triattn_matches_model(&asset.file, &file)),
-            );
             model_triattn.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.path.cmp(&b.path)));
             model_triattn.dedup_by(|a, b| a.path == b.path);
 
             let mut model_drafts =
                 matching_assets(&drafts, |asset| draft_matches_model(&asset.file, &file));
-            model_drafts.extend(
-                scan_registry_assets(models_dir, is_draft_file_name)
-                    .into_iter()
-                    .filter(|asset| draft_matches_model(&asset.file, &file)),
-            );
             model_drafts.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.path.cmp(&b.path)));
             model_drafts.dedup_by(|a, b| a.path == b.path);
 
@@ -1117,6 +1104,12 @@ pub fn build_llm_registry_in(
                 file,
                 path: model.to_string_lossy().to_string(),
                 bytes: file_len(&model),
+                model: parsed.model,
+                size: parsed.size,
+                tags: parsed.tags,
+                features: parsed.features,
+                quant: parsed.quant,
+                arch: parsed.arch,
                 triattn: model_triattn,
                 drafts: model_drafts,
                 chat_templates: model_templates,
@@ -1134,6 +1127,25 @@ pub fn build_llm_registry_in(
         drafts,
         chat_templates,
     }
+}
+
+fn scan_canonical_primary_models(models_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(models_dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(parse_canonical_model_artifact_name)
+                    .is_some()
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 fn scan_registry_assets(dir: &Path, predicate: impl Fn(&str) -> bool) -> Vec<ModelRegistryAsset> {
@@ -1161,6 +1173,7 @@ fn registry_asset(path: PathBuf) -> ModelRegistryAsset {
         .to_string();
     ModelRegistryAsset {
         id: file
+            .trim_end_matches(".jinja")
             .trim_end_matches(".j2")
             .trim_end_matches(".hfq")
             .to_string(),
@@ -1191,45 +1204,190 @@ fn is_triattn_file_name(file: &str) -> bool {
 
 fn is_draft_file_name(file: &str) -> bool {
     let file = file.to_ascii_lowercase();
-    file.ends_with(".dflash.hfq") || file.ends_with(".draft.hfq")
+    file.ends_with(".dflash.hfq")
 }
 
 fn is_chat_template_file_name(file: &str) -> bool {
     let file = file.to_ascii_lowercase();
-    file.ends_with(".j2") || file.ends_with(".jinja") || file.ends_with(".tmpl")
+    file.ends_with(".jinja")
 }
 
 fn triattn_matches_model(sidecar_file: &str, model_file: &str) -> bool {
-    sidecar_file.starts_with(&format!("{model_file}.triattn"))
-        || Path::new(model_file)
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .map(|stem| sidecar_file.starts_with(&format!("{stem}.triattn")))
-            .unwrap_or(false)
+    Path::new(model_file)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| sidecar_file == format!("{stem}.triattn.hfq"))
+        .unwrap_or(false)
 }
 
 fn draft_matches_model(draft_file: &str, model_file: &str) -> bool {
-    dflash_draft_candidates(model_file)
-        .iter()
-        .any(|candidate| candidate == draft_file)
-        || Path::new(model_file)
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .map(|stem| draft_file.starts_with(stem))
-            .unwrap_or(false)
+    Path::new(model_file)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| draft_file == format!("{stem}.dflash.hfq"))
+        .unwrap_or(false)
 }
 
 fn template_matches_model(template_file: &str, model_file: &str) -> bool {
-    template_file == format!("{model_file}.j2")
-        || Path::new(model_file)
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .map(|stem| {
-                template_file == format!("{stem}.j2")
-                    || template_file == format!("{stem}.jinja")
-                    || template_file == format!("{stem}.tmpl")
-            })
-            .unwrap_or(false)
+    Path::new(model_file)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| template_file == format!("{stem}.jinja"))
+        .unwrap_or(false)
+}
+
+pub fn parse_canonical_model_artifact_name(name: &str) -> Option<ModelArtifactName> {
+    let id = name
+        .strip_suffix(".hfq")
+        .or_else(|| name.strip_suffix(".hfq.tmp"))?;
+    if id.contains(':') || is_role_sidecar_name(name) {
+        return None;
+    }
+
+    let mut groups = id.split('.').collect::<Vec<_>>();
+    if groups.is_empty() {
+        return None;
+    }
+
+    let arch = groups
+        .last()
+        .copied()
+        .filter(|group| is_arch_group(group))
+        .map(str::to_string);
+    if arch.is_some() {
+        groups.pop();
+    }
+
+    let (quant_start, quant) = find_canonical_quant_group(&groups)?;
+    let mut prefix_groups = groups[..quant_start].to_vec();
+    let mut features = Vec::new();
+    while prefix_groups
+        .last()
+        .is_some_and(|group| is_feature_group(group))
+    {
+        features.push(prefix_groups.pop().unwrap().to_string());
+    }
+    features.reverse();
+
+    let identity = prefix_groups.join(".");
+    if identity.is_empty() {
+        return None;
+    }
+    let (model, size, tags) = parse_model_identity(&identity)?;
+    Some(ModelArtifactName {
+        id: id.to_string(),
+        model,
+        size,
+        tags,
+        features,
+        quant,
+        arch,
+    })
+}
+
+fn find_canonical_quant_group(groups: &[&str]) -> Option<(usize, String)> {
+    if groups.len() >= 2 {
+        let start = groups.len() - 2;
+        let candidate = groups[start..].join(".");
+        if is_canonical_mixed_quant_group(&candidate) {
+            return Some((start, candidate.to_ascii_lowercase()));
+        }
+    }
+    if let Some(group) = groups.last() {
+        if is_canonical_quant_group(group) {
+            return Some((groups.len() - 1, group.to_ascii_lowercase()));
+        }
+    }
+    None
+}
+
+fn is_canonical_quant_group(group: &str) -> bool {
+    let parts = group.split('-').collect::<Vec<_>>();
+    let token = parts.last().copied().unwrap_or(group).to_ascii_lowercase();
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"^(?:m[q]|o[q])\d+(?:\.\d+)?\+{0,2}$|^(?:bf16|f16|fp16)$").unwrap()
+    });
+    re.is_match(&token)
+        && parts[..parts.len().saturating_sub(1)]
+            .iter()
+            .all(|modifier| is_quant_modifier_segment(modifier))
+}
+
+fn is_quant_modifier_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase())
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
+fn is_canonical_mixed_quant_group(group: &str) -> bool {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"^(?:m[q]|o[q])\d+\.\d+\+{0,2}$").unwrap());
+    re.is_match(&group.to_ascii_lowercase())
+}
+
+fn is_arch_group(group: &str) -> bool {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"^gfx\d{3,4}$").unwrap());
+    re.is_match(group)
+}
+
+fn is_feature_group(group: &str) -> bool {
+    let mut saw_token = false;
+    for token in group.split('-') {
+        saw_token = true;
+        if !matches!(
+            token,
+            "mtp" | "vl" | "dflash" | "triattn" | "jinja" | "hessian"
+        ) {
+            return false;
+        }
+    }
+    saw_token
+}
+
+fn parse_model_identity(identity: &str) -> Option<(String, Option<String>, Vec<String>)> {
+    let parts = identity.split('-').collect::<Vec<_>>();
+    let Some(size_idx) = parts.iter().position(|part| is_size_token(part)) else {
+        return None;
+    };
+    let model = parts[..size_idx].join("-");
+    if model.is_empty() {
+        return None;
+    }
+    let mut size = parts[size_idx].to_string();
+    let mut tag_start = size_idx + 1;
+    if parts
+        .get(tag_start)
+        .is_some_and(|part| is_active_size_token(part))
+    {
+        size.push('-');
+        size.push_str(parts[tag_start]);
+        tag_start += 1;
+    }
+    let tags = parts[tag_start..]
+        .iter()
+        .filter(|tag| !tag.is_empty())
+        .map(|tag| (*tag).to_string())
+        .collect::<Vec<_>>();
+    Some((model, Some(size), tags))
+}
+
+fn is_size_token(token: &str) -> bool {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"^\d+(?:\.\d+)?[kKmMbBtT]$").unwrap());
+    re.is_match(token)
+}
+
+fn is_active_size_token(token: &str) -> bool {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"^[aAeE]\d+(?:\.\d+)?[kKmMbBtT]$").unwrap());
+    re.is_match(token)
 }
 
 /// Discover a DFlash draft sidecar next to a target model artifact.
@@ -1730,6 +1888,41 @@ mod tests {
     }
 
     #[test]
+    fn canonical_model_artifact_name_breaks_down_identity_features_quant_and_arch() {
+        let parsed = parse_canonical_model_artifact_name(
+            "Qwen3.5-122B-A10B-it.mtp-vl.lloyd-mq2.gfx1201.hfq",
+        )
+        .unwrap();
+
+        assert_eq!(parsed.id, "Qwen3.5-122B-A10B-it.mtp-vl.lloyd-mq2.gfx1201");
+        assert_eq!(parsed.model, "Qwen3.5");
+        assert_eq!(parsed.size.as_deref(), Some("122B-A10B"));
+        assert_eq!(parsed.tags, vec!["it"]);
+        assert_eq!(parsed.features, vec!["mtp-vl"]);
+        assert_eq!(parsed.quant, "lloyd-mq2");
+        assert_eq!(parsed.arch.as_deref(), Some("gfx1201"));
+
+        let mixed = parse_canonical_model_artifact_name("Gemma-4-8B.oq4.25++.hfq").unwrap();
+        assert_eq!(mixed.model, "Gemma-4");
+        assert_eq!(mixed.size.as_deref(), Some("8B"));
+        assert_eq!(mixed.quant, "oq4.25++");
+
+        let qwen = parse_canonical_model_artifact_name("Qwen3.5-9B.mq4.hfq").unwrap();
+        assert_eq!(qwen.model, "Qwen3.5");
+        assert_eq!(qwen.size.as_deref(), Some("9B"));
+        assert_eq!(qwen.quant, "mq4");
+    }
+
+    #[test]
+    fn canonical_model_artifact_name_rejects_old_quant_and_role_sidecar_names() {
+        assert!(parse_canonical_model_artifact_name("qwen35-9b-hf4.hfq").is_none());
+        assert!(parse_canonical_model_artifact_name("qwen3.5-9B-mq4.hfq").is_none());
+        assert!(parse_canonical_model_artifact_name("qwen3.5-9B-op4.hfq").is_none());
+        assert!(parse_canonical_model_artifact_name("qwen3.5-9B-q8f16.hfq").is_none());
+        assert!(parse_canonical_model_artifact_name("qwen3.5-9B.mq4.mtp.hfq").is_none());
+    }
+
+    #[test]
     fn quant_rank_prefers_mq4_before_other_variants() {
         let mut names = [
             PathBuf::from("qwen3.5-9b-q8.hfq"),
@@ -1782,21 +1975,48 @@ mod tests {
         fs::create_dir_all(&triattn).unwrap();
         fs::create_dir_all(&drafts).unwrap();
         fs::create_dir_all(&templates).unwrap();
-        fs::write(models.join("qwen3.5-9b-mq4.hfq"), "model").unwrap();
-        fs::write(models.join("qwen3.5-9b-mq4.mtp.hfq"), "mtp").unwrap();
-        fs::write(triattn.join("qwen3.5-9b-mq4.triattn.hfq"), "tri").unwrap();
-        fs::write(drafts.join("qwen3.5-9b-mq4.dflash.hfq"), "draft").unwrap();
-        fs::write(templates.join("qwen3.5-9b-mq4.hfq.j2"), "template").unwrap();
+        fs::write(models.join("Qwen3.5-9B-it.mtp-vl.mq4.hfq"), "model").unwrap();
+        fs::write(models.join("qwen35-9b-hf4.hfq"), "old model").unwrap();
+        fs::write(models.join("Qwen3.5-9B-it.mtp-vl.mq4.mtp.hfq"), "mtp").unwrap();
+        fs::write(
+            models.join("Qwen3.5-9B-it.mtp-vl.mq4.hfq.triattn.hfq"),
+            "old tri",
+        )
+        .unwrap();
+        fs::write(triattn.join("Qwen3.5-9B-it.mtp-vl.mq4.triattn.hfq"), "tri").unwrap();
+        fs::write(drafts.join("Qwen3.5-9B-it.mtp-vl.mq4.dflash.hfq"), "draft").unwrap();
+        fs::write(
+            drafts.join("Qwen3.5-9B-it.mtp-vl.mq4.draft.hfq"),
+            "old draft",
+        )
+        .unwrap();
+        fs::write(templates.join("Qwen3.5-9B-it.mtp-vl.mq4.jinja"), "template").unwrap();
+        fs::write(
+            templates.join("Qwen3.5-9B-it.mtp-vl.mq4.hfq.j2"),
+            "old template",
+        )
+        .unwrap();
 
         let registry = build_llm_registry_in(&models, &triattn, &drafts, &templates);
 
         assert_eq!(registry.model_count(), 1);
         assert_eq!(registry.sidecar_count(), 3);
         let model = &registry.models[0];
-        assert_eq!(model.id, "qwen3.5-9b-mq4");
-        assert_eq!(model.triattn[0].file, "qwen3.5-9b-mq4.triattn.hfq");
-        assert_eq!(model.drafts[0].file, "qwen3.5-9b-mq4.dflash.hfq");
-        assert_eq!(model.chat_templates[0].file, "qwen3.5-9b-mq4.hfq.j2");
+        assert_eq!(model.id, "Qwen3.5-9B-it.mtp-vl.mq4");
+        assert_eq!(model.model, "Qwen3.5");
+        assert_eq!(model.size.as_deref(), Some("9B"));
+        assert_eq!(model.tags, vec!["it"]);
+        assert_eq!(model.features, vec!["mtp-vl"]);
+        assert_eq!(model.quant, "mq4");
+        assert_eq!(
+            model.triattn[0].file,
+            "Qwen3.5-9B-it.mtp-vl.mq4.triattn.hfq"
+        );
+        assert_eq!(model.drafts[0].file, "Qwen3.5-9B-it.mtp-vl.mq4.dflash.hfq");
+        assert_eq!(
+            model.chat_templates[0].file,
+            "Qwen3.5-9B-it.mtp-vl.mq4.jinja"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

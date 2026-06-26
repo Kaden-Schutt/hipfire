@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // hipfire — see LICENSE and NOTICE in the project root.
 //! `hipfire list` — local models as a capability/artifact matrix. Pure
-//! presentation: all detection lives in `hipfire_model::model_card` (shared with
-//! serving admission); this command only renders the cards (no GPU touched).
+//! presentation: inventory comes from the canonical local LLM registry, while
+//! capability detection lives in `hipfire_model::model_card` (GPU-free).
 
-use crate::model::list_local_models;
-use hipfire_model::{model_card, ArchFeatures, FeatureSupport, ModelCard, Sidecars};
+use std::path::Path;
+
+use hipfire_config::models_dir;
+use hipfire_model::{
+    build_local_llm_registry, list_local_models_in, model_card, ArchFeatures, FeatureSupport,
+    LlmModelRegistryEntry, ModelCard, Sidecars,
+};
 
 /// Tick/cross glyph for an on-disk artifact.
 fn yn(v: bool) -> &'static str {
@@ -33,35 +38,138 @@ fn arch_cell(card: &ModelCard) -> String {
     }
 }
 
+fn nonempty_cell(values: &[String]) -> String {
+    if values.is_empty() {
+        "-".to_string()
+    } else {
+        values.join(",")
+    }
+}
+
+fn optional_cell(value: Option<&str>) -> String {
+    value
+        .filter(|value| !value.is_empty())
+        .unwrap_or("-")
+        .to_string()
+}
+
+struct ListRow {
+    model: String,
+    size: String,
+    tags: String,
+    features: String,
+    quant: String,
+    artifact_arch: String,
+    card: ModelCard,
+}
+
+fn card_from_registry_entry(entry: &LlmModelRegistryEntry) -> ModelCard {
+    let mut card = model_card(Path::new(&entry.path));
+    card.quant = entry.quant.clone();
+    card.sidecars.template |= !entry.chat_templates.is_empty();
+    card.sidecars.dflash |= !entry.drafts.is_empty();
+    card.sidecars.triattn |= !entry.triattn.is_empty();
+    card
+}
+
+fn row_from_registry_entry(entry: &LlmModelRegistryEntry) -> ListRow {
+    ListRow {
+        model: entry.model.clone(),
+        size: optional_cell(entry.size.as_deref()),
+        tags: nonempty_cell(&entry.tags),
+        features: nonempty_cell(&entry.features),
+        quant: entry.quant.clone(),
+        artifact_arch: optional_cell(entry.arch.as_deref()),
+        card: card_from_registry_entry(entry),
+    }
+}
+
 pub fn run() {
-    let models = list_local_models();
-    if models.is_empty() {
-        println!("No models found in ~/.hipfire/models/");
+    let registry = build_local_llm_registry();
+    if registry.models.is_empty() {
+        let noncanonical = list_local_models_in(&models_dir()).len();
+        if noncanonical == 0 {
+            println!("No models found in ~/.hipfire/models/");
+        } else {
+            println!(
+                "No canonical models found in ~/.hipfire/models/ ({noncanonical} non-canonical .hfq file(s) ignored)"
+            );
+        }
         return;
     }
 
-    let cards: Vec<ModelCard> = models.iter().map(|p| model_card(p)).collect();
-    let arch_cells: Vec<String> = cards.iter().map(arch_cell).collect();
-
-    let name_w = cards.iter().map(|c| c.name.len()).max().unwrap_or(5).max(5);
-    let quant_w = cards
+    let rows: Vec<ListRow> = registry
+        .models
         .iter()
-        .map(|c| c.quant.len())
+        .map(row_from_registry_entry)
+        .collect();
+    let arch_cells: Vec<String> = rows.iter().map(|row| arch_cell(&row.card)).collect();
+
+    let model_w = rows
+        .iter()
+        .map(|row| row.model.len())
         .max()
         .unwrap_or(5)
         .max(5);
+    let size_w = rows
+        .iter()
+        .map(|row| row.size.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let tags_w = rows
+        .iter()
+        .map(|row| row.tags.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let feat_w = rows
+        .iter()
+        .map(|row| row.features.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let quant_w = rows
+        .iter()
+        .map(|row| row.quant.len())
+        .max()
+        .unwrap_or(5)
+        .max(5);
+    let art_w = rows
+        .iter()
+        .map(|row| row.artifact_arch.len())
+        .max()
+        .unwrap_or(3)
+        .max(3);
     let arch_w = arch_cells.iter().map(|a| a.len()).max().unwrap_or(4).max(4);
 
     // Grouped banner over the tick columns.
     println!(
-        "{:<name_w$}  {:<quant_w$}  {:<arch_w$}  {:^17}   {:^21}",
-        "", "", "", "─ on disk ─", "─ arch features ─"
+        "{:<model_w$}  {:<size_w$}  {:<tags_w$}  {:<feat_w$}  {:<quant_w$}  {:<art_w$}  {:<arch_w$}  {:^17}   {:^21}",
+        "", "", "", "", "", "", "", "─ on disk ─", "─ arch features ─"
     );
     println!(
-        "{:<name_w$}  {:<quant_w$}  {:<arch_w$}  {:>3} {:>3} {:>3} {:>3} {:>4}   {:>4} {:>4} {:>3} {:>7} {:>3}",
-        "MODEL", "QUANT", "ARCH", "tpl", "mtp", "dfl", "tri", "hess", "pfil", "dfl", "mtp", "kv", "vis"
+        "{:<model_w$}  {:<size_w$}  {:<tags_w$}  {:<feat_w$}  {:<quant_w$}  {:<art_w$}  {:<arch_w$}  {:>3} {:>3} {:>3} {:>3} {:>4}   {:>4} {:>4} {:>3} {:>7} {:>3}",
+        "MODEL",
+        "SIZE",
+        "TAGS",
+        "FEAT",
+        "QUANT",
+        "ART",
+        "ARCH",
+        "tpl",
+        "mtp",
+        "dfl",
+        "tri",
+        "hess",
+        "pfil",
+        "dfl",
+        "mtp",
+        "kv",
+        "vis"
     );
-    for (card, arch) in cards.iter().zip(&arch_cells) {
+    for (row, arch) in rows.iter().zip(&arch_cells) {
+        let card = &row.card;
         let Sidecars {
             template,
             mtp,
@@ -78,9 +186,13 @@ pub fn run() {
             ..
         } = card.features;
         println!(
-            "{:<name_w$}  {:<quant_w$}  {:<arch_w$}  {:>3} {:>3} {:>3} {:>3} {:>4}   {:>4} {:>4} {:>3} {:>7} {:>3}",
-            card.name,
-            card.quant,
+            "{:<model_w$}  {:<size_w$}  {:<tags_w$}  {:<feat_w$}  {:<quant_w$}  {:<art_w$}  {:<arch_w$}  {:>3} {:>3} {:>3} {:>3} {:>4}   {:>4} {:>4} {:>3} {:>7} {:>3}",
+            row.model,
+            row.size,
+            row.tags,
+            row.features,
+            row.quant,
+            row.artifact_arch,
             arch,
             yn(template),
             yn(mtp),
@@ -94,6 +206,13 @@ pub fn run() {
             tri(vision),
         );
     }
-    println!("\non disk: tpl=chat template · mtp/dfl/tri=draft/TriAttn sidecar (or bundled) · hess=Hessian/calib");
-    println!("arch features (per MODEL-SUPPORT.md): ✓=full · ~=partial · ·=none · pfil=batched prefill · kv=quant menu");
+    println!(
+        "\nmodel columns: tags/features/quant/artifact arch are parsed from canonical artifact names"
+    );
+    println!(
+        "on disk: tpl=chat template · mtp/dfl/tri=draft/TriAttn sidecar (or bundled) · hess=Hessian/calib"
+    );
+    println!(
+        "arch features (per MODEL-SUPPORT.md): ✓=full · ~=partial · ·=none · pfil=batched prefill · kv=quant menu"
+    );
 }

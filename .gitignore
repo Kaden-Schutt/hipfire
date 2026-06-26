@@ -37,6 +37,7 @@ kernels/compiled/
 # Agent / tool state
 .serena/
 .remember/
+graphify-out/cache/
 .codex
 .sisyphus/
 AGENTS.local.md
