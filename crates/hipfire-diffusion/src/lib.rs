@@ -6623,6 +6623,127 @@ impl NativeTransformerFeedForward {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+struct NativeTransformerBlock {
+    family: TransformerDenoiserFamily,
+    block_index: usize,
+    modulation: NativeTransformerBlockModulation,
+    attention: NativeTransformerAttentionProjection,
+    feed_forward: NativeTransformerFeedForward,
+}
+
+#[allow(dead_code)]
+impl NativeTransformerBlock {
+    fn from_hfq(
+        hfq: &HfqFile,
+        family: TransformerDenoiserFamily,
+        block_index: usize,
+        heads: usize,
+    ) -> DiffusionResult<Self> {
+        Ok(Self {
+            family,
+            block_index,
+            modulation: NativeTransformerBlockModulation::from_hfq(hfq, family, block_index)?,
+            attention: NativeTransformerAttentionProjection::from_hfq(
+                hfq,
+                family,
+                block_index,
+                heads,
+            )?,
+            feed_forward: NativeTransformerFeedForward::from_hfq(hfq, family, block_index)?,
+        })
+    }
+
+    fn forward_qwen_with_runtime_context(
+        &self,
+        image_hidden: &CpuTensor,
+        text_hidden: &CpuTensor,
+        timestep_embedding: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<(CpuTensor, CpuTensor)> {
+        if !matches!(
+            self.family,
+            TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Unknown
+        ) {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "transformer block {} family {:?} is not Qwen-style",
+                self.block_index, self.family
+            )));
+        }
+
+        let image_mod = self.modulation.qwen_image_modulation_with_runtime_context(
+            timestep_embedding,
+            TransformerModulationStream::Image,
+            runtime_context,
+        )?;
+        let text_mod = self.modulation.qwen_image_modulation_with_runtime_context(
+            timestep_embedding,
+            TransformerModulationStream::Text,
+            runtime_context,
+        )?;
+
+        let image_attention_input = modulate_3d(
+            &layer_norm_3d_no_affine_with_runtime_context(image_hidden, 1e-6, runtime_context)?,
+            &image_mod.shift_msa,
+            &image_mod.scale_msa,
+        )?;
+        let text_attention_input = modulate_3d(
+            &layer_norm_3d_no_affine_with_runtime_context(text_hidden, 1e-6, runtime_context)?,
+            &text_mod.shift_msa,
+            &text_mod.scale_msa,
+        )?;
+        let (image_attention, text_attention) =
+            self.attention.attend_image_text_with_runtime_context(
+                &image_attention_input,
+                Some(&text_attention_input),
+                runtime_context,
+            )?;
+        let text_attention = text_attention.ok_or_else(|| {
+            DiffusionError::InvalidMetadata(
+                "Qwen transformer block attention returned no text stream".to_string(),
+            )
+        })?;
+        let image_after_attention =
+            gated_residual_3d(image_hidden, &image_attention, &image_mod.gate_msa)?;
+        let text_after_attention =
+            gated_residual_3d(text_hidden, &text_attention, &text_mod.gate_msa)?;
+
+        let image_mlp_input = modulate_3d(
+            &layer_norm_3d_no_affine_with_runtime_context(
+                &image_after_attention,
+                1e-6,
+                runtime_context,
+            )?,
+            &image_mod.shift_mlp,
+            &image_mod.scale_mlp,
+        )?;
+        let text_mlp_input = modulate_3d(
+            &layer_norm_3d_no_affine_with_runtime_context(
+                &text_after_attention,
+                1e-6,
+                runtime_context,
+            )?,
+            &text_mod.shift_mlp,
+            &text_mod.scale_mlp,
+        )?;
+        let image_mlp = self
+            .feed_forward
+            .forward_image_with_runtime_context(&image_mlp_input, runtime_context)?;
+        let text_mlp = self
+            .feed_forward
+            .forward_text_with_runtime_context(&text_mlp_input, runtime_context)?
+            .ok_or_else(|| {
+                DiffusionError::InvalidMetadata(
+                    "Qwen transformer block feed-forward returned no text stream".to_string(),
+                )
+            })?;
+        let image_out = gated_residual_3d(&image_after_attention, &image_mlp, &image_mod.gate_mlp)?;
+        let text_out = gated_residual_3d(&text_after_attention, &text_mlp, &text_mod.gate_mlp)?;
+        Ok((image_out, text_out))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 enum TransformerModulationStream {
@@ -6779,6 +6900,79 @@ fn swiglu_gate_3d(up: &CpuTensor, gate: &CpuTensor) -> DiffusionResult<CpuTensor
     let mut out = CpuTensor::zeros(&[batch, seq, width]);
     for (dst, (up, gate)) in out.data.iter_mut().zip(up.data.iter().zip(&gate.data)) {
         *dst = *up * silu(*gate);
+    }
+    Ok(out)
+}
+
+#[allow(dead_code)]
+fn layer_norm_3d_no_affine_with_runtime_context(
+    input: &CpuTensor,
+    eps: f32,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
+) -> DiffusionResult<CpuTensor> {
+    let [_, _, width] = shape3(input)?;
+    let weight = CpuTensor {
+        shape: vec![width],
+        data: vec![1.0; width],
+    };
+    let bias = CpuTensor {
+        shape: vec![width],
+        data: vec![0.0; width],
+    };
+    layer_norm_3d_with_runtime_context(input, &weight, &bias, eps, runtime_context)
+}
+
+#[allow(dead_code)]
+fn modulate_3d(
+    input: &CpuTensor,
+    shift: &CpuTensor,
+    scale: &CpuTensor,
+) -> DiffusionResult<CpuTensor> {
+    let [batch, seq, width] = shape3(input)?;
+    if shift.shape.as_slice() != [batch, width] || scale.shape.as_slice() != [batch, width] {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "modulate_3d input shape {:?} requires shift/scale [{batch}, {width}], got {:?}/{:?}",
+            input.shape, shift.shape, scale.shape
+        )));
+    }
+    let mut out = CpuTensor::zeros(&[batch, seq, width]);
+    for b in 0..batch {
+        for s in 0..seq {
+            let token_base = (b * seq + s) * width;
+            let mod_base = b * width;
+            for col in 0..width {
+                out.data[token_base + col] = input.data[token_base + col]
+                    * (1.0 + scale.data[mod_base + col])
+                    + shift.data[mod_base + col];
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[allow(dead_code)]
+fn gated_residual_3d(
+    residual: &CpuTensor,
+    update: &CpuTensor,
+    gate: &CpuTensor,
+) -> DiffusionResult<CpuTensor> {
+    let [batch, seq, width] = shape3(residual)?;
+    if update.shape != residual.shape || gate.shape.as_slice() != [batch, width] {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "gated residual shape mismatch residual/update/gate {:?}/{:?}/{:?}",
+            residual.shape, update.shape, gate.shape
+        )));
+    }
+    let mut out = CpuTensor::zeros(&[batch, seq, width]);
+    for b in 0..batch {
+        for s in 0..seq {
+            let token_base = (b * seq + s) * width;
+            let gate_base = b * width;
+            for col in 0..width {
+                out.data[token_base + col] = residual.data[token_base + col]
+                    + gate.data[gate_base + col] * update.data[token_base + col];
+            }
+        }
     }
     Ok(out)
 }
@@ -18333,6 +18527,106 @@ mod tests {
     }
 
     #[test]
+    fn native_transformer_block_runs_qwen_attention_and_mlp_residuals() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-qwen-transformer-block-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("qwen-transformer-block.hfq");
+        let block = "transformer/tensors/transformer_blocks.0";
+        let attn = format!("{block}.attn");
+        let identity2 = [1.0, 0.0, 0.0, 1.0];
+        let geglu_identity = [1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0];
+        let silu_one = silu(1.0);
+        let mut modulation_weight = vec![0.0f32; 12 * 2];
+        modulation_weight[10 * 2] = silu_one.recip();
+        modulation_weight[11 * 2] = silu_one.recip();
+        let mut tensors = vec![
+            f32_mem_tensor(
+                &format!("{block}.img_mod.1.weight"),
+                &[12, 2],
+                &modulation_weight,
+            ),
+            f32_mem_tensor(&format!("{block}.img_mod.1.bias"), &[12], &[0.0; 12]),
+            f32_mem_tensor(
+                &format!("{block}.txt_mod.1.weight"),
+                &[12, 2],
+                &modulation_weight,
+            ),
+            f32_mem_tensor(&format!("{block}.txt_mod.1.bias"), &[12], &[0.0; 12]),
+            f32_mem_tensor(&format!("{attn}.to_q.weight"), &[2, 2], &identity2),
+            f32_mem_tensor(&format!("{attn}.to_k.weight"), &[2, 2], &identity2),
+            f32_mem_tensor(&format!("{attn}.to_v.weight"), &[2, 2], &identity2),
+            f32_mem_tensor(&format!("{attn}.to_out.0.weight"), &[2, 2], &identity2),
+            f32_mem_tensor(&format!("{attn}.add_q_proj.weight"), &[2, 2], &identity2),
+            f32_mem_tensor(&format!("{attn}.add_k_proj.weight"), &[2, 2], &identity2),
+            f32_mem_tensor(&format!("{attn}.add_v_proj.weight"), &[2, 2], &identity2),
+            f32_mem_tensor(&format!("{attn}.to_add_out.weight"), &[2, 2], &identity2),
+            f32_mem_tensor(
+                &format!("{block}.img_mlp.net.0.proj.weight"),
+                &[4, 2],
+                &geglu_identity,
+            ),
+            f32_mem_tensor(&format!("{block}.img_mlp.net.0.proj.bias"), &[4], &[0.0; 4]),
+            f32_mem_tensor(
+                &format!("{block}.img_mlp.net.2.weight"),
+                &[2, 2],
+                &identity2,
+            ),
+            f32_mem_tensor(&format!("{block}.img_mlp.net.2.bias"), &[2], &[0.0; 2]),
+            f32_mem_tensor(
+                &format!("{block}.txt_mlp.net.0.proj.weight"),
+                &[4, 2],
+                &geglu_identity,
+            ),
+            f32_mem_tensor(&format!("{block}.txt_mlp.net.0.proj.bias"), &[4], &[0.0; 4]),
+            f32_mem_tensor(
+                &format!("{block}.txt_mlp.net.2.weight"),
+                &[2, 2],
+                &identity2,
+            ),
+            f32_mem_tensor(&format!("{block}.txt_mlp.net.2.bias"), &[2], &[0.0; 2]),
+        ];
+        tensors.shrink_to_fit();
+        write_hfqm_package_mem(&path, HFQ_ARCH_DIFFUSION, "{}", &tensors).unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let transformer_block =
+            NativeTransformerBlock::from_hfq(&hfq, TransformerDenoiserFamily::QwenImage, 0, 1)
+                .unwrap();
+        let image_hidden = CpuTensor {
+            shape: vec![1, 1, 2],
+            data: vec![1.0, -1.0],
+        };
+        let text_hidden = CpuTensor {
+            shape: vec![1, 1, 2],
+            data: vec![0.5, -0.5],
+        };
+        let timestep_embedding = CpuTensor {
+            shape: vec![1, 2],
+            data: vec![1.0, 0.0],
+        };
+        let mut runtime_context =
+            DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+
+        let (image_out, text_out) = transformer_block
+            .forward_qwen_with_runtime_context(
+                &image_hidden,
+                &text_hidden,
+                &timestep_embedding,
+                &mut runtime_context,
+            )
+            .unwrap();
+
+        let expected_image = qwen_block_expected_mlp_only(&image_hidden);
+        let expected_text = qwen_block_expected_mlp_only(&text_hidden);
+        assert_f32_close(&image_out.data, &expected_image, 1e-5);
+        assert_f32_close(&text_out.data, &expected_text, 1e-5);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn inspect_hfq_reports_metadata_runtime_support_without_loading_runtime() {
         let dir = std::env::temp_dir().join(format!(
             "hipfire-diffusion-runtime-support-inspect-test-{}",
@@ -26951,6 +27245,19 @@ mod tests {
             }
         }
         out
+    }
+
+    fn qwen_block_expected_mlp_only(hidden: &CpuTensor) -> Vec<f32> {
+        assert_eq!(hidden.shape.as_slice(), &[1, 1, 2]);
+        let mean = (hidden.data[0] + hidden.data[1]) * 0.5;
+        let var = ((hidden.data[0] - mean).powi(2) + (hidden.data[1] - mean).powi(2)) * 0.5;
+        let inv_std = (var + 1e-6).sqrt().recip();
+        let norm0 = (hidden.data[0] - mean) * inv_std;
+        let norm1 = (hidden.data[1] - mean) * inv_std;
+        vec![
+            hidden.data[0] + norm0 * gelu(norm0),
+            hidden.data[1] + norm1 * gelu(norm1),
+        ]
     }
 
     fn q4f16_g64_mem_tensor(name: &str, shape: &[u32], data: &[f32]) -> HfqMemTensor {
