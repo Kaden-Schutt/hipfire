@@ -75,6 +75,7 @@ use std::fs::File;
 use std::hash::Hasher;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use twox_hash::XxHash64;
 
@@ -113,6 +114,69 @@ impl Oq4LdlqHessian {
 }
 
 static OQ4_LDLQ_HESSIAN: OnceLock<Oq4LdlqHessian> = OnceLock::new();
+static LDLQ_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+static LDLQ_SUCCESS: AtomicUsize = AtomicUsize::new(0);
+static LDLQ_MISSING: AtomicUsize = AtomicUsize::new(0);
+static LDLQ_K_MISMATCH: AtomicUsize = AtomicUsize::new(0);
+static LDLQ_PACK_FAILED: AtomicUsize = AtomicUsize::new(0);
+
+fn ldlq_hessian_for_tensor(idx: &Oq4LdlqHessian, name: &str, k: usize) -> Option<Vec<f32>> {
+    LDLQ_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    let key = name.strip_suffix(".weight").unwrap_or(name);
+    let hk = idx.k_of(key).or_else(|| idx.k_of(name));
+    let Some(hk) = hk else {
+        LDLQ_MISSING.fetch_add(1, Ordering::Relaxed);
+        eprintln!("  ldlq: skip {name} (no Hessian entry for {key:?})");
+        return None;
+    };
+    if hk != k {
+        LDLQ_K_MISMATCH.fetch_add(1, Ordering::Relaxed);
+        eprintln!("  ldlq: skip {name} (Hessian K={hk} != weight K={k})");
+        return None;
+    }
+    idx.get_full(key)
+        .or_else(|| idx.get_full(name))
+        .or_else(|| {
+            LDLQ_MISSING.fetch_add(1, Ordering::Relaxed);
+            eprintln!("  ldlq: skip {name} (Hessian entry existed but payload could not be read)");
+            None
+        })
+}
+
+fn ldlq_record_success() {
+    LDLQ_SUCCESS.fetch_add(1, Ordering::Relaxed);
+}
+
+fn ldlq_record_pack_failed(name: &str) {
+    LDLQ_PACK_FAILED.fetch_add(1, Ordering::Relaxed);
+    eprintln!("  ldlq: skip {name} (OBS packer failed; falling back to non-LDLQ quantization)");
+}
+
+fn ldlq_report_and_validate(strict: bool) -> Result<(), String> {
+    let attempts = LDLQ_ATTEMPTS.load(Ordering::Relaxed);
+    if attempts == 0 {
+        if strict {
+            return Err(
+                "calibrated plus format requested, but no LDLQ-eligible tensors were attempted"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    }
+    let success = LDLQ_SUCCESS.load(Ordering::Relaxed);
+    let missing = LDLQ_MISSING.load(Ordering::Relaxed);
+    let k_mismatch = LDLQ_K_MISMATCH.load(Ordering::Relaxed);
+    let pack_failed = LDLQ_PACK_FAILED.load(Ordering::Relaxed);
+    eprintln!(
+        "  LDLQ tensors:     success={success} attempts={attempts} missing={missing} k_mismatch={k_mismatch} pack_failed={pack_failed}"
+    );
+    if strict && success == 0 {
+        return Err(format!(
+            "calibrated plus format requested, but LDLQ applied to zero tensors (attempts={attempts}, missing={missing}, k_mismatch={k_mismatch}, pack_failed={pack_failed})"
+        ));
+    }
+    Ok(())
+}
 
 // Phase A Stage A — AWQ (Activation-aware Weight Quantization, Lin et al
 // 2023). When AWQ_ALPHA is set (via --awq [<alpha>=0.55]), each linear-layer
@@ -3157,13 +3221,7 @@ fn quantize_hfq_source_tensor(
             // unchanged), but compensates each column's int4 error against the
             // off-diagonal Hessian instead of RTN. No AWQ sidecar in this path.
             let ldlq_q = OQ4_LDLQ_HESSIAN.get().and_then(|idx| {
-                let key = name.strip_suffix(".weight").unwrap_or(name);
-                let hk = idx.k_of(key).or_else(|| idx.k_of(name))?;
-                if hk != k {
-                    eprintln!("  ldlq: skip {name} (Hessian K={hk} != weight K={k})");
-                    return None;
-                }
-                let mut h = idx.get_full(key).or_else(|| idx.get_full(name))?;
+                let mut h = ldlq_hessian_for_tensor(idx, name, k)?;
                 // Optional AWQ composition: when --awq is also active, smooth the
                 // activation outliers into the weights (W·diag(s)) AND rebase the
                 // Hessian into the smoothed input space H' = diag(1/s) H diag(1/s),
@@ -3197,12 +3255,15 @@ fn quantize_hfq_source_tensor(
                 let damp = 0.01 * (diag_sum / k as f64).max(1e-12);
                 let out = ldlq::oq4_ldlq_pack(&wbuf, m_dim, k, &h, &signs1, &signs2, damp);
                 if let Some(_) = &out {
+                    ldlq_record_success();
                     if let Some(s) = awq_scales {
                         OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(s));
                         eprintln!("  ldlq+awq: {name} [{m_dim}x{k}] OBS int4 + smooth");
                     } else {
                         eprintln!("  ldlq: {name} [{m_dim}x{k}] OBS error-feedback int4");
                     }
+                } else {
+                    ldlq_record_pack_failed(name);
                 }
                 out
             });
@@ -3241,13 +3302,7 @@ fn quantize_hfq_source_tensor(
             let m_dim = shape[0] as usize;
             let ldlq_q = if format == HfqInputFormat::Oq8Plus {
                 OQ4_LDLQ_HESSIAN.get().and_then(|idx| {
-                    let key = name.strip_suffix(".weight").unwrap_or(name);
-                    let hk = idx.k_of(key).or_else(|| idx.k_of(name))?;
-                    if hk != k {
-                        eprintln!("  ldlq: skip {name} (Hessian K={hk} != weight K={k})");
-                        return None;
-                    }
-                    let mut h = idx.get_full(key).or_else(|| idx.get_full(name))?;
+                    let mut h = ldlq_hessian_for_tensor(idx, name, k)?;
                     let awq_scales = if let (Some(alpha), Some(im)) =
                         (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
                     {
@@ -3276,12 +3331,15 @@ fn quantize_hfq_source_tensor(
                     let damp = 0.01 * (diag_sum / k as f64).max(1e-12);
                     let out = ldlq::oq8_ldlq_pack(&wbuf, m_dim, k, &h, &signs1, &signs2, damp);
                     if out.is_some() {
+                        ldlq_record_success();
                         if let Some(s) = awq_scales {
                             OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(s));
                             eprintln!("  ldlq+awq: {name} [{m_dim}x{k}] OBS int8 + smooth");
                         } else {
                             eprintln!("  ldlq: {name} [{m_dim}x{k}] OBS error-feedback int8");
                         }
+                    } else {
+                        ldlq_record_pack_failed(name);
                     }
                     out
                 })
@@ -3323,13 +3381,7 @@ fn quantize_hfq_source_tensor(
             // layout. Composes AWQ exactly like the Oq4 LDLQ arm (W·s offline +
             // rebase H' = diag(1/s) H diag(1/s) + x/s sidecar).
             let ldlq_q = OQ4_LDLQ_HESSIAN.get().and_then(|idx| {
-                let key = name.strip_suffix(".weight").unwrap_or(name);
-                let hk = idx.k_of(key).or_else(|| idx.k_of(name))?;
-                if hk != k {
-                    eprintln!("  ldlq: skip {name} (Hessian K={hk} != weight K={k})");
-                    return None;
-                }
-                let mut h = idx.get_full(key).or_else(|| idx.get_full(name))?;
+                let mut h = ldlq_hessian_for_tensor(idx, name, k)?;
                 let awq_scales = if let (Some(alpha), Some(im)) =
                     (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
                 {
@@ -3366,12 +3418,15 @@ fn quantize_hfq_source_tensor(
                     )
                 };
                 if out.is_some() {
+                    ldlq_record_success();
                     if let Some(s) = awq_scales {
                         OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(s));
                         eprintln!("  ldlq+awq: {name} [{m_dim}x{k}] tiered OBS int4/int8 + smooth");
                     } else {
                         eprintln!("  ldlq: {name} [{m_dim}x{k}] tiered OBS int4/int8");
                     }
+                } else {
+                    ldlq_record_pack_failed(name);
                 }
                 out
             });
@@ -3624,6 +3679,7 @@ fn run_hfq_source_pipeline(
         }
     );
     eprintln!("  Output size:      {:.1} MB", total_bytes as f64 / 1e6);
+    ldlq_report_and_validate(false)?;
     eprintln!("\nWriting: {}", output.display());
     let metadata_json =
         metadata_with_quantization_hash(metadata, &hfq_tensors, None).map_err(|e| e.to_string())?;
@@ -8426,15 +8482,7 @@ fn main() {
                             let signs2 = gen_fwht_signs(1042, 256);
                             let m_dim = meta.shape[0];
                             let ldlq_q = OQ4_LDLQ_HESSIAN.get().and_then(|idx| {
-                                let key = name.strip_suffix(".weight").unwrap_or(name);
-                                let hk = idx.k_of(key).or_else(|| idx.k_of(name))?;
-                                if hk != k_dim {
-                                    eprintln!(
-                                        "  ldlq: skip {name} (Hessian K={hk} != weight K={k_dim})"
-                                    );
-                                    return None;
-                                }
-                                let mut h = idx.get_full(key).or_else(|| idx.get_full(name))?;
+                                let mut h = ldlq_hessian_for_tensor(idx, name, k_dim)?;
                                 let awq_scales = if let (Some(alpha), Some(im)) =
                                     (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
                                 {
@@ -8468,6 +8516,7 @@ fn main() {
                                     &wbuf, m_dim, k_dim, &h, &signs1, &signs2, damp,
                                 );
                                 if out.is_some() {
+                                    ldlq_record_success();
                                     if let Some(s) = awq_scales {
                                         awq_sidecar_scales = Some(s);
                                         eprintln!(
@@ -8478,6 +8527,8 @@ fn main() {
                                             "  ldlq: {name} [{m_dim}x{k_dim}] OBS error-feedback int4"
                                         );
                                     }
+                                } else {
+                                    ldlq_record_pack_failed(name);
                                 }
                                 out
                             });
@@ -8515,15 +8566,7 @@ fn main() {
                             let m_dim = meta.shape[0];
                             let ldlq_q = if use_oq8_plus {
                                 OQ4_LDLQ_HESSIAN.get().and_then(|idx| {
-                                    let key = name.strip_suffix(".weight").unwrap_or(name);
-                                    let hk = idx.k_of(key).or_else(|| idx.k_of(name))?;
-                                    if hk != k_dim {
-                                        eprintln!(
-                                            "  ldlq: skip {name} (Hessian K={hk} != weight K={k_dim})"
-                                        );
-                                        return None;
-                                    }
-                                    let mut h = idx.get_full(key).or_else(|| idx.get_full(name))?;
+                                    let mut h = ldlq_hessian_for_tensor(idx, name, k_dim)?;
                                     let awq_scales = if let (Some(alpha), Some(im)) =
                                         (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
                                     {
@@ -8559,6 +8602,7 @@ fn main() {
                                         &wbuf, m_dim, k_dim, &h, &signs1, &signs2, damp,
                                     );
                                     if out.is_some() {
+                                        ldlq_record_success();
                                         if let Some(s) = awq_scales {
                                             awq_sidecar_scales = Some(s);
                                             eprintln!(
@@ -8569,6 +8613,8 @@ fn main() {
                                                 "  ldlq: {name} [{m_dim}x{k_dim}] OBS error-feedback int8"
                                             );
                                         }
+                                    } else {
+                                        ldlq_record_pack_failed(name);
                                     }
                                     out
                                 })
@@ -8892,6 +8938,10 @@ fn main() {
     eprintln!("  Mean quant error: {mean_quant_error:.8}");
     eprintln!("  Max quant error:  {max_quant_error:.8}");
     eprintln!("  Output size:      {:.1} MB", total_bytes as f64 / 1e6);
+    if let Err(e) = ldlq_report_and_validate(op4_plus_recipe || op8_plus_recipe) {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
 
     // qtip2-sim post-pass: simulate QTIP-2 on every eligible 2D BF16 weight,
     // branch-independent (operates on the finalized tensor list, so it catches

@@ -59,6 +59,25 @@ fn rotate_hessian(h: &mut [f64], k: usize, signs1: &[f32], signs2: &[f32]) {
     }
 }
 
+fn inv_cholesky_lower_rotated(h: &[f64], k: usize, damp: f64) -> Option<Mat<f64>> {
+    let base = damp.max(1e-12);
+    for mult in [1.0, 10.0, 100.0, 1000.0, 10000.0] {
+        let lambda = base * mult;
+        let hd = Mat::<f64>::from_fn(k, k, |i, j| {
+            h[i * k + j] + if i == j { lambda } else { 0.0 }
+        });
+        let Ok(chol) = hd.llt(Side::Lower) else {
+            continue;
+        };
+        let hinv = chol.solve(Mat::<f64>::identity(k, k));
+        let Ok(chol2) = hinv.llt(Side::Lower) else {
+            continue;
+        };
+        return Some(chol2.L().to_owned());
+    }
+    None
+}
+
 /// QTIP-LDLQ: block-sequential **trellis** quantization with OBS error
 /// feedback. Returns the dequantized weights in the ORIGINAL (un-rotated)
 /// domain — the effective weight a fused QTIP kernel would produce — as
@@ -119,10 +138,7 @@ pub fn qtip_ldlq_dequant_bits(
     // Rotate the Hessian, then L with L·Lᵀ = (H_rot + λI)⁻¹.
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let hd = Mat::<f64>::from_fn(k, k, |i, j| h[i * k + j] + if i == j { damp } else { 0.0 });
-    let chol = hd.llt(Side::Lower).ok()?;
-    let hinv = chol.solve(Mat::<f64>::identity(k, k));
-    let l = hinv.llt(Side::Lower).ok()?.L().to_owned();
+    let l = inv_cholesky_lower_rotated(&h, k, damp)?;
 
     // Rotate the weights into the same domain.
     let nb = k / 256;
@@ -243,10 +259,7 @@ pub fn oq4_ldlq_pack(
 
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let hd = Mat::<f64>::from_fn(k, k, |i, j| h[i * k + j] + if i == j { damp } else { 0.0 });
-    let chol = hd.llt(Side::Lower).ok()?;
-    let hinv = chol.solve(Mat::<f64>::identity(k, k));
-    let l = hinv.llt(Side::Lower).ok()?.L().to_owned();
+    let l = inv_cholesky_lower_rotated(&h, k, damp)?;
 
     let nb = k / 256;
     // FWHT-rotate weights into the same domain (this is the residual we feed).
@@ -361,10 +374,7 @@ pub fn oq8_ldlq_pack(
 
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let hd = Mat::<f64>::from_fn(k, k, |i, j| h[i * k + j] + if i == j { damp } else { 0.0 });
-    let chol = hd.llt(Side::Lower).ok()?;
-    let hinv = chol.solve(Mat::<f64>::identity(k, k));
-    let l = hinv.llt(Side::Lower).ok()?.L().to_owned();
+    let l = inv_cholesky_lower_rotated(&h, k, damp)?;
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
@@ -478,10 +488,7 @@ pub fn oqplus_tiered_ldlq_pack(
 
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let hd = Mat::<f64>::from_fn(k, k, |i, j| h[i * k + j] + if i == j { damp } else { 0.0 });
-    let chol = hd.llt(Side::Lower).ok()?;
-    let hinv = chol.solve(Mat::<f64>::identity(k, k));
-    let l = hinv.llt(Side::Lower).ok()?.L().to_owned();
+    let l = inv_cholesky_lower_rotated(&h, k, damp)?;
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
@@ -611,10 +618,7 @@ pub fn oqplus_compact_ldlq_pack(
 
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let hd = Mat::<f64>::from_fn(k, k, |i, j| h[i * k + j] + if i == j { damp } else { 0.0 });
-    let chol = hd.llt(Side::Lower).ok()?;
-    let hinv = chol.solve(Mat::<f64>::identity(k, k));
-    let l = hinv.llt(Side::Lower).ok()?.L().to_owned();
+    let l = inv_cholesky_lower_rotated(&h, k, damp)?;
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
