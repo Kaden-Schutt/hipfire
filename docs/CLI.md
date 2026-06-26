@@ -435,6 +435,9 @@ Run an end-to-end diffusion admission smoke and validate output PNGs
 * `--seed <SEED>` — Seed
 
   Default value: `0`
+* `--batch-size <BATCH_SIZE>` — Batch size for each smoke leg
+
+  Default value: `1`
 * `--denoising-strength <DENOISING_STRENGTH>` — Img2img denoising strength
 
   Default value: `0.5`

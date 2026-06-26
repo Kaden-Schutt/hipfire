@@ -279,6 +279,9 @@ pub struct DiffusionSmokeArgs {
     /// Seed
     #[arg(long, default_value_t = 0)]
     pub seed: i64,
+    /// Batch size for each smoke leg
+    #[arg(long, default_value_t = 1)]
+    pub batch_size: usize,
     /// Img2img denoising strength
     #[arg(long, default_value_t = 0.5)]
     pub denoising_strength: f32,
@@ -721,7 +724,7 @@ fn run_smoke(args: DiffusionSmokeArgs) -> anyhow::Result<()> {
     let (img2img_report, masked_img2img_report) = if args.txt2img_only {
         (None, None)
     } else {
-        let init_image = load_rgb_image_batch(&[txt2img_files[0].clone()])?;
+        let init_image = load_rgb_image_batch(&txt2img_files)?;
         let img2img_request = DiffusionImg2ImgRequest {
             batch: smoke_batch_request(&args, args.seed.saturating_add(1)),
             init_image: init_image.clone(),
@@ -794,13 +797,16 @@ fn run_smoke(args: DiffusionSmokeArgs) -> anyhow::Result<()> {
 }
 
 fn smoke_batch_request(args: &DiffusionSmokeArgs, seed: i64) -> DiffusionBatchRequest {
+    let batch_size = args.batch_size.max(1);
     DiffusionBatchRequest {
-        prompts: vec![DiffusionPrompt {
-            prompt: args.prompt.clone(),
-            negative_prompt: args.negative_prompt.clone(),
-            seed,
-            subseed: None,
-        }],
+        prompts: (0..batch_size)
+            .map(|idx| DiffusionPrompt {
+                prompt: args.prompt.clone(),
+                negative_prompt: args.negative_prompt.clone(),
+                seed: seed.saturating_add(i64::try_from(idx).unwrap_or(i64::MAX)),
+                subseed: None,
+            })
+            .collect(),
         width: args.width,
         height: args.height,
         original_width: None,
@@ -1151,6 +1157,47 @@ mod tests {
             hr_denoising_strength: 0.75,
             rocm_device_id: None,
         }
+    }
+
+    fn smoke_args() -> DiffusionSmokeArgs {
+        DiffusionSmokeArgs {
+            model: PathBuf::from("model.hfq"),
+            prompt: "a cat".to_string(),
+            negative_prompt: "blur".to_string(),
+            output_dir: PathBuf::from("out"),
+            width: 64,
+            height: 64,
+            steps: 1,
+            cfg_scale: 1.0,
+            scheduler: "Euler".to_string(),
+            seed: 40,
+            batch_size: 3,
+            denoising_strength: 0.5,
+            rocm_device_id: None,
+            txt2img_only: false,
+            skip_masked_img2img: false,
+        }
+    }
+
+    #[test]
+    fn smoke_batch_request_uses_batch_size_and_sequential_seeds() {
+        let args = smoke_args();
+
+        let request = smoke_batch_request(&args, args.seed);
+
+        assert_eq!(request.prompts.len(), 3);
+        assert_eq!(request.prompts[0].seed, 40);
+        assert_eq!(request.prompts[1].seed, 41);
+        assert_eq!(request.prompts[2].seed, 42);
+        assert!(request
+            .prompts
+            .iter()
+            .all(|prompt| prompt.prompt == "a cat"));
+        assert!(request
+            .prompts
+            .iter()
+            .all(|prompt| prompt.negative_prompt == "blur"));
+        assert!(request.send_images);
     }
 
     #[test]
