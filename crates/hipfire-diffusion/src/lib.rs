@@ -5723,6 +5723,222 @@ impl NativeTransformerTimestepEmbedding {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct TransformerModulationChunks {
+    shift_msa: CpuTensor,
+    scale_msa: CpuTensor,
+    gate_msa: CpuTensor,
+    shift_mlp: CpuTensor,
+    scale_mlp: CpuTensor,
+    gate_mlp: CpuTensor,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct NativeTransformerBlockModulation {
+    family: TransformerDenoiserFamily,
+    block_index: usize,
+    hidden_width: usize,
+    img_mod_weight: Option<CpuTensor>,
+    img_mod_bias: Option<CpuTensor>,
+    txt_mod_weight: Option<CpuTensor>,
+    txt_mod_bias: Option<CpuTensor>,
+    scale_shift_table: Option<CpuTensor>,
+}
+
+impl NativeTransformerBlockModulation {
+    fn from_hfq(
+        hfq: &HfqFile,
+        family: TransformerDenoiserFamily,
+        block_index: usize,
+    ) -> DiffusionResult<Self> {
+        let block_prefix = format!("transformer/tensors/transformer_blocks.{block_index}");
+        match family {
+            TransformerDenoiserFamily::Krea2 => {
+                let scale_shift_table =
+                    CpuTensor::from_hfq(hfq, &format!("{block_prefix}.scale_shift_table"))?;
+                let [chunks, hidden_width] = shape2(&scale_shift_table)?;
+                if chunks == 0 || hidden_width == 0 {
+                    return Err(DiffusionError::InvalidMetadata(format!(
+                        "Krea transformer block {block_index} scale_shift_table shape {:?} is empty",
+                        scale_shift_table.shape
+                    )));
+                }
+                Ok(Self {
+                    family,
+                    block_index,
+                    hidden_width,
+                    img_mod_weight: None,
+                    img_mod_bias: None,
+                    txt_mod_weight: None,
+                    txt_mod_bias: None,
+                    scale_shift_table: Some(scale_shift_table),
+                })
+            }
+            TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Unknown => {
+                let img_mod_weight =
+                    CpuTensor::from_hfq(hfq, &format!("{block_prefix}.img_mod.1.weight"))?;
+                let img_mod_bias =
+                    CpuTensor::from_hfq(hfq, &format!("{block_prefix}.img_mod.1.bias"))?;
+                let txt_mod_weight =
+                    CpuTensor::from_hfq(hfq, &format!("{block_prefix}.txt_mod.1.weight"))?;
+                let txt_mod_bias =
+                    CpuTensor::from_hfq(hfq, &format!("{block_prefix}.txt_mod.1.bias"))?;
+                let [img_rows, hidden_width] = shape2(&img_mod_weight)?;
+                let [txt_rows, txt_hidden_width] = shape2(&txt_mod_weight)?;
+                if hidden_width == 0 || img_rows != hidden_width * 6 {
+                    return Err(DiffusionError::InvalidMetadata(format!(
+                        "Qwen transformer block {block_index} img_mod weight shape {:?} is not [6*hidden, hidden]",
+                        img_mod_weight.shape
+                    )));
+                }
+                if txt_hidden_width != hidden_width || txt_rows != hidden_width * 6 {
+                    return Err(DiffusionError::InvalidMetadata(format!(
+                        "Qwen transformer block {block_index} txt_mod weight shape {:?} does not match hidden width {hidden_width}",
+                        txt_mod_weight.shape
+                    )));
+                }
+                if img_mod_bias.shape.as_slice() != [img_rows] {
+                    return Err(DiffusionError::InvalidMetadata(format!(
+                        "Qwen transformer block {block_index} img_mod bias shape {:?} != [{img_rows}]",
+                        img_mod_bias.shape
+                    )));
+                }
+                if txt_mod_bias.shape.as_slice() != [txt_rows] {
+                    return Err(DiffusionError::InvalidMetadata(format!(
+                        "Qwen transformer block {block_index} txt_mod bias shape {:?} != [{txt_rows}]",
+                        txt_mod_bias.shape
+                    )));
+                }
+                Ok(Self {
+                    family,
+                    block_index,
+                    hidden_width,
+                    img_mod_weight: Some(img_mod_weight),
+                    img_mod_bias: Some(img_mod_bias),
+                    txt_mod_weight: Some(txt_mod_weight),
+                    txt_mod_bias: Some(txt_mod_bias),
+                    scale_shift_table: None,
+                })
+            }
+        }
+    }
+
+    fn qwen_image_modulation_with_runtime_context(
+        &self,
+        timestep_embedding: &CpuTensor,
+        stream: TransformerModulationStream,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<TransformerModulationChunks> {
+        if !matches!(
+            self.family,
+            TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Unknown
+        ) {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "transformer block {} family {:?} does not use Qwen image/text modulation",
+                self.block_index, self.family
+            )));
+        }
+        let (weight, bias) = match stream {
+            TransformerModulationStream::Image => {
+                (self.img_mod_weight.as_ref(), self.img_mod_bias.as_ref())
+            }
+            TransformerModulationStream::Text => {
+                (self.txt_mod_weight.as_ref(), self.txt_mod_bias.as_ref())
+            }
+        };
+        let weight = weight.ok_or_else(|| {
+            DiffusionError::InvalidMetadata("Qwen transformer modulation weight is missing".into())
+        })?;
+        let bias = bias.ok_or_else(|| {
+            DiffusionError::InvalidMetadata("Qwen transformer modulation bias is missing".into())
+        })?;
+        let activated = silu_with_runtime_context(timestep_embedding, runtime_context)?;
+        let projected = linear_with_runtime_context(&activated, weight, bias, runtime_context)?;
+        split_modulation_chunks(projected, 6)
+    }
+
+    fn krea_scale_shift_with_runtime_context(
+        &self,
+        time_modulation: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
+        let _ = runtime_context;
+        let table = self.scale_shift_table.as_ref().ok_or_else(|| {
+            DiffusionError::InvalidMetadata("Krea transformer scale_shift_table is missing".into())
+        })?;
+        let [chunks, hidden_width] = shape2(table)?;
+        let [batch, width] = shape2(time_modulation)?;
+        if hidden_width != self.hidden_width {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "Krea transformer block {} hidden width drifted from {} to {hidden_width}",
+                self.block_index, self.hidden_width
+            )));
+        }
+        if width != chunks * hidden_width {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "Krea time modulation width {width} != scale_shift_table chunks*hidden {}",
+                chunks * hidden_width
+            )));
+        }
+        let mut out = CpuTensor::zeros(&[batch, chunks, hidden_width]);
+        for b in 0..batch {
+            for chunk in 0..chunks {
+                for hidden in 0..hidden_width {
+                    let flat = chunk * hidden_width + hidden;
+                    out.data[(b * chunks + chunk) * hidden_width + hidden] = time_modulation.data
+                        [b * width + flat]
+                        + table.data[chunk * hidden_width + hidden];
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransformerModulationStream {
+    Image,
+    Text,
+}
+
+fn split_modulation_chunks(
+    projected: CpuTensor,
+    chunk_count: usize,
+) -> DiffusionResult<TransformerModulationChunks> {
+    if chunk_count != 6 {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "expected 6 modulation chunks, got {chunk_count}"
+        )));
+    }
+    let [batch, width] = shape2(&projected)?;
+    if width % chunk_count != 0 {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "modulation width {width} is not divisible by {chunk_count}"
+        )));
+    }
+    let chunk_width = width / chunk_count;
+    let chunk = |chunk_idx: usize| -> CpuTensor {
+        let mut data = vec![0.0; batch * chunk_width];
+        for b in 0..batch {
+            let src = b * width + chunk_idx * chunk_width;
+            let dst = b * chunk_width;
+            data[dst..dst + chunk_width].copy_from_slice(&projected.data[src..src + chunk_width]);
+        }
+        CpuTensor {
+            shape: vec![batch, chunk_width],
+            data,
+        }
+    };
+    Ok(TransformerModulationChunks {
+        shift_msa: chunk(0),
+        scale_msa: chunk(1),
+        gate_msa: chunk(2),
+        shift_mlp: chunk(3),
+        scale_mlp: chunk(4),
+        gate_mlp: chunk(5),
+    })
+}
+
 fn diffusion_generation_info(
     summary: &DiffusionModelSummary,
     runtime_kind: DiffusionRuntimeKind,
@@ -16650,6 +16866,143 @@ mod tests {
         for (actual, expected) in modulation.data.iter().zip(expected_modulation) {
             assert!((actual - expected).abs() < 1e-6);
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_transformer_block_modulation_splits_qwen_image_and_text_chunks() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-qwen-transformer-mod-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("qwen-transformer-mod.hfq");
+        let mut image_weight = Vec::new();
+        let mut text_weight = Vec::new();
+        for row in 0..12 {
+            image_weight.extend_from_slice(if row % 2 == 0 {
+                &[1.0, 0.0]
+            } else {
+                &[0.0, 1.0]
+            });
+            text_weight.extend_from_slice(if row % 2 == 0 {
+                &[2.0, 0.0]
+            } else {
+                &[0.0, 2.0]
+            });
+        }
+        write_hfqm_package_mem(
+            &path,
+            HFQ_ARCH_DIFFUSION,
+            "{}",
+            &[
+                f32_mem_tensor(
+                    "transformer/tensors/transformer_blocks.0.img_mod.1.weight",
+                    &[12, 2],
+                    &image_weight,
+                ),
+                f32_mem_tensor(
+                    "transformer/tensors/transformer_blocks.0.img_mod.1.bias",
+                    &[12],
+                    &[0.0; 12],
+                ),
+                f32_mem_tensor(
+                    "transformer/tensors/transformer_blocks.0.txt_mod.1.weight",
+                    &[12, 2],
+                    &text_weight,
+                ),
+                f32_mem_tensor(
+                    "transformer/tensors/transformer_blocks.0.txt_mod.1.bias",
+                    &[12],
+                    &[1.0; 12],
+                ),
+            ],
+        )
+        .unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let modulation = NativeTransformerBlockModulation::from_hfq(
+            &hfq,
+            TransformerDenoiserFamily::QwenImage,
+            0,
+        )
+        .unwrap();
+        let timestep = CpuTensor {
+            shape: vec![1, 2],
+            data: vec![1.0, 2.0],
+        };
+        let silu_values = [silu(1.0), silu(2.0)];
+        let mut runtime_context =
+            DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+
+        let image = modulation
+            .qwen_image_modulation_with_runtime_context(
+                &timestep,
+                TransformerModulationStream::Image,
+                &mut runtime_context,
+            )
+            .unwrap();
+        assert_eq!(image.shift_msa.shape, vec![1, 2]);
+        assert!((image.shift_msa.data[0] - silu_values[0]).abs() < 1e-6);
+        assert!((image.shift_msa.data[1] - silu_values[1]).abs() < 1e-6);
+        assert_eq!(image.gate_mlp.shape, vec![1, 2]);
+        assert!((image.gate_mlp.data[0] - silu_values[0]).abs() < 1e-6);
+        assert!((image.gate_mlp.data[1] - silu_values[1]).abs() < 1e-6);
+
+        let text = modulation
+            .qwen_image_modulation_with_runtime_context(
+                &timestep,
+                TransformerModulationStream::Text,
+                &mut runtime_context,
+            )
+            .unwrap();
+        assert!((text.scale_msa.data[0] - (2.0 * silu_values[0] + 1.0)).abs() < 1e-6);
+        assert!((text.scale_msa.data[1] - (2.0 * silu_values[1] + 1.0)).abs() < 1e-6);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_transformer_block_modulation_applies_krea_scale_shift_table() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-krea-transformer-mod-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("krea-transformer-mod.hfq");
+        write_hfqm_package_mem(
+            &path,
+            HFQ_ARCH_DIFFUSION,
+            "{}",
+            &[f32_mem_tensor(
+                "transformer/tensors/transformer_blocks.0.scale_shift_table",
+                &[3, 2],
+                &[0.5, -0.5, 1.0, 2.0, -1.0, 0.25],
+            )],
+        )
+        .unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let modulation =
+            NativeTransformerBlockModulation::from_hfq(&hfq, TransformerDenoiserFamily::Krea2, 0)
+                .unwrap();
+        let time_modulation = CpuTensor {
+            shape: vec![2, 6],
+            data: vec![
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, -1.0, -2.0, -3.0, -4.0, -5.0, -6.0,
+            ],
+        };
+        let mut runtime_context =
+            DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+
+        let out = modulation
+            .krea_scale_shift_with_runtime_context(&time_modulation, &mut runtime_context)
+            .unwrap();
+
+        assert_eq!(out.shape, vec![2, 3, 2]);
+        assert_eq!(
+            out.data,
+            vec![1.5, 1.5, 4.0, 6.0, 4.0, 6.25, -0.5, -2.5, -2.0, -2.0, -6.0, -5.75]
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
