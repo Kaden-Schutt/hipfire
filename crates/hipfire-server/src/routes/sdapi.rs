@@ -67,6 +67,8 @@ pub struct SdGenerationRequest {
     pub styles: Option<Vec<String>>,
     pub steps: Option<u32>,
     pub cfg_scale: Option<f64>,
+    #[serde(default, alias = "distilled_guidance_scale")]
+    pub hipfire_distilled_guidance_scale: Option<f64>,
     pub seed: Option<i64>,
     pub subseed: Option<i64>,
     pub subseed_strength: Option<f64>,
@@ -124,6 +126,8 @@ pub struct SdGenerationRequest {
     pub hr_negative_prompt: Option<String>,
     pub hipfire_prompt_embeddings: Option<CpuTensor>,
     pub hipfire_negative_embeddings: Option<CpuTensor>,
+    pub hipfire_prompt_attention_mask: Option<CpuTensor>,
+    pub hipfire_negative_attention_mask: Option<CpuTensor>,
     pub hipfire_prompt_pooled_embeddings: Option<CpuTensor>,
     pub hipfire_negative_pooled_embeddings: Option<CpuTensor>,
     pub rocm_device_id: Option<i32>,
@@ -1105,6 +1109,10 @@ fn sdapi_apply_infotext_defaults(mut body: SdGenerationRequest) -> SdGenerationR
     if body.cfg_scale.is_none() {
         body.cfg_scale = sdapi_infotext_f64(&parsed, "CFG scale");
     }
+    if body.hipfire_distilled_guidance_scale.is_none() {
+        body.hipfire_distilled_guidance_scale =
+            sdapi_infotext_f64(&parsed, "Hipfire distilled guidance scale");
+    }
     if body.seed.is_none() {
         body.seed = sdapi_infotext_i64(&parsed, "Seed");
     }
@@ -1369,7 +1377,7 @@ fn sdapi_parameters_text(body: &SdGenerationRequest, mode: &str, info: &Value) -
         .and_then(|seeds| seeds.first())
         .and_then(Value::as_i64)
         .or(body.seed);
-    lines.push(format!(
+    let mut parameter_line = format!(
         "Steps: {}, Sampler: {}, CFG scale: {}, Seed: {}, Size: {}x{}, Model: {}, Mode: {}",
         body.steps.unwrap_or(20),
         sdapi_effective_scheduler(body),
@@ -1387,7 +1395,11 @@ fn sdapi_parameters_text(body: &SdGenerationRequest, mode: &str, info: &Value) -
             .unwrap_or(512),
         body.model.as_deref().unwrap_or(""),
         mode,
-    ));
+    );
+    if let Some(scale) = body.hipfire_distilled_guidance_scale {
+        parameter_line.push_str(&format!(", Hipfire distilled guidance scale: {scale}"));
+    }
+    lines.push(parameter_line);
     lines.join("\n")
 }
 
@@ -1742,6 +1754,9 @@ fn sd_request_to_diffusion_batch_request(
         crop_y: body.crop_y.unwrap_or(0),
         steps: body.steps.unwrap_or(20),
         cfg_scale: body.cfg_scale.unwrap_or(7.0) as f32,
+        distilled_guidance_scale: body
+            .hipfire_distilled_guidance_scale
+            .map(|value| value as f32),
         scheduler: sdapi_effective_scheduler(body),
         subseed_strength: body.subseed_strength.unwrap_or(0.0) as f32,
         send_images: body.send_images.unwrap_or(true),
@@ -1760,9 +1775,11 @@ fn sdapi_external_conditioning(
         (None, None) => {
             if body.hipfire_prompt_pooled_embeddings.is_some()
                 || body.hipfire_negative_pooled_embeddings.is_some()
+                || body.hipfire_prompt_attention_mask.is_some()
+                || body.hipfire_negative_attention_mask.is_some()
             {
                 return Err(DiffusionError::InvalidRequest(
-                    "hipfire pooled conditioning requires hipfire_prompt_embeddings and hipfire_negative_embeddings".to_string(),
+                    "hipfire external conditioning sidecars require hipfire_prompt_embeddings and hipfire_negative_embeddings".to_string(),
                 ));
             }
             Ok(None)
@@ -1775,6 +1792,33 @@ fn sdapi_external_conditioning(
                 batch_size,
                 "hipfire_negative_embeddings",
             )?;
+            let prompt_attention_mask = body
+                .hipfire_prompt_attention_mask
+                .clone()
+                .map(|tensor| {
+                    sdapi_expand_conditioning_batch(
+                        tensor,
+                        batch_size,
+                        "hipfire_prompt_attention_mask",
+                    )
+                })
+                .transpose()?;
+            let negative_attention_mask = body
+                .hipfire_negative_attention_mask
+                .clone()
+                .map(|tensor| {
+                    sdapi_expand_conditioning_batch(
+                        tensor,
+                        batch_size,
+                        "hipfire_negative_attention_mask",
+                    )
+                })
+                .transpose()?;
+            if prompt_attention_mask.is_some() != negative_attention_mask.is_some() {
+                return Err(DiffusionError::InvalidRequest(
+                    "hipfire attention-mask conditioning requires both hipfire_prompt_attention_mask and hipfire_negative_attention_mask".to_string(),
+                ));
+            }
             let prompt_pooled_embeddings = body
                 .hipfire_prompt_pooled_embeddings
                 .clone()
@@ -1805,6 +1849,8 @@ fn sdapi_external_conditioning(
             Ok(Some(DiffusionExternalConditioningBatch {
                 prompt_embeddings,
                 negative_embeddings,
+                prompt_attention_mask,
+                negative_attention_mask,
                 prompt_pooled_embeddings,
                 negative_pooled_embeddings,
             }))
@@ -6969,6 +7015,7 @@ mod tests {
             subseed_strength: Some(0.35),
             steps: Some(8),
             cfg_scale: Some(6.5),
+            hipfire_distilled_guidance_scale: Some(4.0),
             width: Some(512),
             height: Some(512),
             seed_resize_from_w: Some(256),
@@ -6990,6 +7037,7 @@ mod tests {
         assert_eq!(request.prompts[0].negative_prompt, "blur");
         assert_eq!(request.steps, 8);
         assert_eq!(request.cfg_scale, 6.5);
+        assert_eq!(request.distilled_guidance_scale, Some(4.0));
         assert_eq!(request.scheduler, "DPM++ 2M");
         assert_eq!(request.seed_resize_from_width, Some(256));
         assert_eq!(request.seed_resize_from_height, Some(128));
@@ -7007,6 +7055,14 @@ mod tests {
             hipfire_negative_embeddings: Some(CpuTensor {
                 shape: vec![1, 1, 2],
                 data: vec![0.0, 0.0],
+            }),
+            hipfire_prompt_attention_mask: Some(CpuTensor {
+                shape: vec![1, 1],
+                data: vec![1.0],
+            }),
+            hipfire_negative_attention_mask: Some(CpuTensor {
+                shape: vec![1, 1],
+                data: vec![0.0],
             }),
             hipfire_prompt_pooled_embeddings: Some(CpuTensor {
                 shape: vec![1, 2],
@@ -7031,6 +7087,14 @@ mod tests {
         assert_eq!(
             conditioning.negative_embeddings.data,
             vec![0.0, 0.0, 0.0, 0.0]
+        );
+        assert_eq!(
+            conditioning.prompt_attention_mask.unwrap().data,
+            vec![1.0, 1.0]
+        );
+        assert_eq!(
+            conditioning.negative_attention_mask.unwrap().data,
+            vec![0.0, 0.0]
         );
         assert_eq!(
             conditioning.prompt_pooled_embeddings.unwrap().shape,
@@ -7503,7 +7567,7 @@ mod tests {
             infotext: Some(
                 "a forest cabin\n\
                  Negative prompt: low quality\n\
-                 Steps: 13, Sampler: Euler a, Schedule type: Karras, CFG scale: 6.5, Seed: 42, Size: 640x384, Denoising strength: 0.45"
+                 Steps: 13, Sampler: Euler a, Schedule type: Karras, CFG scale: 6.5, Hipfire distilled guidance scale: 3.25, Seed: 42, Size: 640x384, Denoising strength: 0.45"
                     .to_string(),
             ),
             ..empty_request()
@@ -7518,6 +7582,7 @@ mod tests {
         assert_eq!(body.scheduler.as_deref(), Some("Karras"));
         assert_eq!(sdapi_effective_scheduler(&body), "Euler a Karras");
         assert_eq!(body.cfg_scale, Some(6.5));
+        assert_eq!(body.hipfire_distilled_guidance_scale, Some(3.25));
         assert_eq!(body.seed, Some(42));
         assert_eq!(body.width, Some(640));
         assert_eq!(body.height, Some(384));
@@ -7603,6 +7668,19 @@ mod tests {
     }
 
     #[test]
+    fn sdapi_distilled_guidance_scale_accepts_short_alias() {
+        let body = serde_json::from_value::<SdGenerationRequest>(json!({
+            "prompt": "a cat",
+            "distilled_guidance_scale": 2.75,
+        }))
+        .unwrap();
+
+        assert_eq!(body.hipfire_distilled_guidance_scale, Some(2.75));
+        let request = sd_request_to_diffusion_batch_request(&body, None, 0).unwrap();
+        assert_eq!(request.distilled_guidance_scale, Some(2.75));
+    }
+
+    #[test]
     fn txt2img_highres_second_pass_body_applies_prompt_and_sampler_overrides() {
         let body = SdGenerationRequest {
             prompt: "base prompt".to_string(),
@@ -7685,6 +7763,7 @@ mod tests {
             styles: None,
             steps: None,
             cfg_scale: None,
+            hipfire_distilled_guidance_scale: None,
             seed: None,
             subseed: None,
             subseed_strength: None,
@@ -7742,6 +7821,8 @@ mod tests {
             hr_negative_prompt: None,
             hipfire_prompt_embeddings: None,
             hipfire_negative_embeddings: None,
+            hipfire_prompt_attention_mask: None,
+            hipfire_negative_attention_mask: None,
             hipfire_prompt_pooled_embeddings: None,
             hipfire_negative_pooled_embeddings: None,
             rocm_device_id: None,

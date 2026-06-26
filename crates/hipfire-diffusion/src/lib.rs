@@ -11,6 +11,7 @@
 use base64::Engine;
 use hipfire_runtime::hfq::{write_hfqm_package_streaming, HfqFile, HfqStreamEntry};
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
+use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -377,6 +378,8 @@ pub struct DiffusionBatchRequest {
     pub crop_y: u32,
     pub steps: u32,
     pub cfg_scale: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distilled_guidance_scale: Option<f32>,
     pub scheduler: String,
     #[serde(default)]
     pub subseed_strength: f32,
@@ -388,6 +391,10 @@ pub struct DiffusionBatchRequest {
 pub struct DiffusionExternalConditioningBatch {
     pub prompt_embeddings: CpuTensor,
     pub negative_embeddings: CpuTensor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_attention_mask: Option<CpuTensor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negative_attention_mask: Option<CpuTensor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_pooled_embeddings: Option<CpuTensor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -730,6 +737,8 @@ pub struct DiffusionConditioningBatch {
     pub negative_embeddings_2: Option<CpuTensor>,
     pub prompt_cross_attention_embeddings: Option<CpuTensor>,
     pub negative_cross_attention_embeddings: Option<CpuTensor>,
+    pub prompt_attention_mask: Option<CpuTensor>,
+    pub negative_attention_mask: Option<CpuTensor>,
     pub prompt_pooled_embeddings: Option<CpuTensor>,
     pub negative_pooled_embeddings: Option<CpuTensor>,
 }
@@ -2024,7 +2033,11 @@ pub fn denoise_latents_with_cfg(
         cfg_scale,
         positive_embeddings,
         negative_embeddings,
-        |sample, timesteps, encoder_states, _sdxl| predict_noise(sample, timesteps, encoder_states),
+        |sample, timesteps, encoder_states, _attention_mask, _sdxl| {
+            predict_noise(sample, timesteps, encoder_states)
+        },
+        None,
+        None,
         None,
         None,
         None,
@@ -2043,8 +2056,11 @@ pub fn denoise_latents_with_cfg_progress(
         &CpuTensor,
         &[f32],
         &CpuTensor,
+        Option<&CpuTensor>,
         Option<&SdxlDenoiseConditioning<'_>>,
     ) -> DiffusionResult<CpuTensor>,
+    positive_attention_mask: Option<&CpuTensor>,
+    negative_attention_mask: Option<&CpuTensor>,
     positive_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
     negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
     inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
@@ -2057,9 +2073,17 @@ pub fn denoise_latents_with_cfg_progress(
         cfg_scale,
         positive_embeddings,
         negative_embeddings,
-        |sample, timesteps, encoder_states, sdxl_conditioning, _runtime_context| {
-            predict_noise(sample, timesteps, encoder_states, sdxl_conditioning)
+        |sample, timesteps, encoder_states, attention_mask, sdxl_conditioning, _runtime_context| {
+            predict_noise(
+                sample,
+                timesteps,
+                encoder_states,
+                attention_mask,
+                sdxl_conditioning,
+            )
         },
+        positive_attention_mask,
+        negative_attention_mask,
         positive_sdxl_conditioning,
         negative_sdxl_conditioning,
         inpaint_conditioning,
@@ -2080,9 +2104,12 @@ fn denoise_latents_with_cfg_progress_and_runtime_options(
         &CpuTensor,
         &[f32],
         &CpuTensor,
+        Option<&CpuTensor>,
         Option<&SdxlDenoiseConditioning<'_>>,
         &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<CpuTensor>,
+    positive_attention_mask: Option<&CpuTensor>,
+    negative_attention_mask: Option<&CpuTensor>,
     positive_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
     negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
     inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
@@ -2098,6 +2125,8 @@ fn denoise_latents_with_cfg_progress_and_runtime_options(
         positive_embeddings,
         negative_embeddings,
         predict_noise,
+        positive_attention_mask,
+        negative_attention_mask,
         positive_sdxl_conditioning,
         negative_sdxl_conditioning,
         inpaint_conditioning,
@@ -2117,9 +2146,12 @@ fn denoise_latents_with_cfg_progress_and_runtime_context(
         &CpuTensor,
         &[f32],
         &CpuTensor,
+        Option<&CpuTensor>,
         Option<&SdxlDenoiseConditioning<'_>>,
         &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<CpuTensor>,
+    positive_attention_mask: Option<&CpuTensor>,
+    negative_attention_mask: Option<&CpuTensor>,
     positive_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
     negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
     inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
@@ -2129,6 +2161,14 @@ fn denoise_latents_with_cfg_progress_and_runtime_context(
 ) -> DiffusionResult<DenoiseLatentsOutput> {
     validate_conditioning_for_latents(&latents, positive_embeddings)?;
     validate_conditioning_for_latents(&latents, negative_embeddings)?;
+    if let Some(mask) = positive_attention_mask {
+        let [batch, seq, _] = shape3(positive_embeddings)?;
+        validate_text_attention_mask(mask, batch, seq, "positive conditioning")?;
+    }
+    if let Some(mask) = negative_attention_mask {
+        let [batch, seq, _] = shape3(negative_embeddings)?;
+        validate_text_attention_mask(mask, batch, seq, "negative conditioning")?;
+    }
     if let Some(inpaint_conditioning) = inpaint_conditioning {
         validate_inpaint_denoise_conditioning(&latents, inpaint_conditioning)?;
     }
@@ -2137,6 +2177,7 @@ fn denoise_latents_with_cfg_progress_and_runtime_context(
     }
     let mut scheduler_state = SchedulerStepState::default();
     let mut runtime_kind = DiffusionRuntimeKind::CpuSourceReference;
+    let cfg_is_identity = classifier_free_guidance_is_identity(cfg_scale);
     for step in 0..schedule.timesteps.len() {
         let (sample, scale_runtime_kind) = scale_model_input_with_runtime_context(
             schedule,
@@ -2152,29 +2193,36 @@ fn denoise_latents_with_cfg_progress_and_runtime_context(
         };
         let timestep = schedule.timesteps[step];
         let timesteps = vec![timestep; latents.batch];
-        let negative_pred = predict_noise(
-            &model_sample,
-            &timesteps,
-            negative_embeddings,
-            negative_sdxl_conditioning,
-            runtime_context,
-        )?;
         let positive_pred = predict_noise(
             &model_sample,
             &timesteps,
             positive_embeddings,
+            positive_attention_mask,
             positive_sdxl_conditioning,
             runtime_context,
         )?;
-        validate_noise_prediction(&latents, &negative_pred)?;
         validate_noise_prediction(&latents, &positive_pred)?;
-        let (guided, guidance_runtime_kind) = cfg_guidance_with_runtime_context(
-            &negative_pred,
-            &positive_pred,
-            cfg_scale,
-            runtime_context,
-        )?;
-        runtime_kind = merge_runtime_kind(runtime_kind, guidance_runtime_kind);
+        let guided = if cfg_is_identity {
+            positive_pred
+        } else {
+            let negative_pred = predict_noise(
+                &model_sample,
+                &timesteps,
+                negative_embeddings,
+                negative_attention_mask,
+                negative_sdxl_conditioning,
+                runtime_context,
+            )?;
+            validate_noise_prediction(&latents, &negative_pred)?;
+            let (guided, guidance_runtime_kind) = cfg_guidance_with_runtime_context(
+                &negative_pred,
+                &positive_pred,
+                cfg_scale,
+                runtime_context,
+            )?;
+            runtime_kind = merge_runtime_kind(runtime_kind, guidance_runtime_kind);
+            guided
+        };
         let step_runtime_kind = scheduler_step_with_runtime_context(
             schedule,
             &mut latents,
@@ -2226,6 +2274,44 @@ fn validate_conditioning_for_latents(
         ));
     }
     Ok(())
+}
+
+fn validate_text_attention_mask(
+    mask: &CpuTensor,
+    batch: usize,
+    seq: usize,
+    context: &str,
+) -> DiffusionResult<()> {
+    let [mask_batch, mask_seq] = shape2(mask)?;
+    if mask_batch != batch || mask_seq != seq {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "{context} attention mask shape {:?} != [{batch}, {seq}]",
+            mask.shape
+        )));
+    }
+    Ok(())
+}
+
+fn qwen_joint_key_mask(
+    text_attention_mask: Option<&CpuTensor>,
+    batch: usize,
+    text_seq: usize,
+    image_seq: usize,
+) -> DiffusionResult<Option<Vec<bool>>> {
+    let Some(mask) = text_attention_mask else {
+        return Ok(None);
+    };
+    validate_text_attention_mask(mask, batch, text_seq, "Qwen text")?;
+    let joint_seq = text_seq.checked_add(image_seq).ok_or_else(|| {
+        DiffusionError::InvalidRequest("Qwen joint attention sequence length overflow".to_string())
+    })?;
+    let mut joint_mask = vec![true; batch * joint_seq];
+    for b in 0..batch {
+        for text_idx in 0..text_seq {
+            joint_mask[b * joint_seq + text_idx] = mask.data[b * text_seq + text_idx] > 0.5;
+        }
+    }
+    Ok(Some(joint_mask))
 }
 
 fn validate_inpaint_denoise_conditioning(
@@ -2432,6 +2518,10 @@ fn cfg_guidance(
             .map(|(negative, positive)| negative + cfg_scale * (positive - negative))
             .collect(),
     })
+}
+
+fn classifier_free_guidance_is_identity(cfg_scale: f32) -> bool {
+    (cfg_scale - 1.0).abs() <= f32::EPSILON
 }
 
 #[cfg(not(feature = "rocm"))]
@@ -3076,6 +3166,20 @@ fn scaled_dot_product_attention_with_runtime_context(
     }
 }
 
+fn scaled_dot_product_attention_with_key_mask_and_runtime_context(
+    q: &CpuTensor,
+    k: &CpuTensor,
+    v: &CpuTensor,
+    heads: usize,
+    key_mask: Option<&[bool]>,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
+) -> DiffusionResult<CpuTensor> {
+    if key_mask.is_none() {
+        return scaled_dot_product_attention_with_runtime_context(q, k, v, heads, runtime_context);
+    }
+    scaled_dot_product_attention_with_key_mask(q, k, v, heads, key_mask)
+}
+
 fn clip_causal_self_attention_with_runtime_context(
     q: &CpuTensor,
     k: &CpuTensor,
@@ -3517,7 +3621,7 @@ impl DiffusionPipeline {
             )
             .ok()
         });
-        let runtime_support_error = native_runtime_metadata_support_error(&metadata);
+        let runtime_support_error = native_runtime_support_error(&hfq, &metadata)?;
         let (native_runtime, native_runtime_error) = if let Some(error) = runtime_support_error {
             (None, Some(error))
         } else {
@@ -4695,6 +4799,8 @@ impl DiffusionPipeline {
             request.cfg_scale,
             positive_embeddings,
             negative_embeddings,
+            plan.conditioning.prompt_attention_mask.as_ref(),
+            plan.conditioning.negative_attention_mask.as_ref(),
             positive_sdxl_conditioning.as_ref(),
             negative_sdxl_conditioning.as_ref(),
             None,
@@ -4967,6 +5073,8 @@ impl DiffusionPipeline {
                 request.batch.cfg_scale,
                 positive_embeddings,
                 negative_embeddings,
+                plan.conditioning.prompt_attention_mask.as_ref(),
+                plan.conditioning.negative_attention_mask.as_ref(),
                 positive_sdxl_conditioning.as_ref(),
                 negative_sdxl_conditioning.as_ref(),
                 inpaint_conditioning.as_ref(),
@@ -5098,9 +5206,9 @@ impl DiffusionPipeline {
         request: &DiffusionBatchRequest,
         runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<DiffusionRunPlan> {
+        let latent_shape = latent_shape_for_request(&self.config, request)?;
         let conditioning =
             self.prepare_conditioning_batch_with_runtime_context(request, runtime_context)?;
-        let latent_shape = latent_shape_for_request(&self.config, request)?;
         let seeds = request
             .prompts
             .iter()
@@ -5163,49 +5271,58 @@ impl DiffusionPipeline {
             .iter()
             .map(|prompt| tokenizer.encode_padded(&prompt.prompt))
             .collect::<Vec<_>>();
-        let negative_tokens = request
-            .prompts
-            .iter()
-            .map(|prompt| tokenizer.encode_padded(&prompt.negative_prompt))
-            .collect::<Vec<_>>();
+        let cfg_is_identity = classifier_free_guidance_is_identity(request.cfg_scale);
+        let negative_tokens = if cfg_is_identity {
+            prompt_tokens.clone()
+        } else {
+            request
+                .prompts
+                .iter()
+                .map(|prompt| tokenizer.encode_padded(&prompt.negative_prompt))
+                .collect::<Vec<_>>()
+        };
         let (prompt_tokens_2, negative_tokens_2) =
             if let Some(tokenizer_2) = self.tokenizer_2.as_ref() {
-                (
-                    Some(
-                        request
-                            .prompts
-                            .iter()
-                            .map(|prompt| tokenizer_2.encode_padded(&prompt.prompt))
-                            .collect::<Vec<_>>(),
-                    ),
-                    Some(
-                        request
-                            .prompts
-                            .iter()
-                            .map(|prompt| tokenizer_2.encode_padded(&prompt.negative_prompt))
-                            .collect::<Vec<_>>(),
-                    ),
-                )
+                let prompt_tokens_2 = request
+                    .prompts
+                    .iter()
+                    .map(|prompt| tokenizer_2.encode_padded(&prompt.prompt))
+                    .collect::<Vec<_>>();
+                let negative_tokens_2 = if cfg_is_identity {
+                    prompt_tokens_2.clone()
+                } else {
+                    request
+                        .prompts
+                        .iter()
+                        .map(|prompt| tokenizer_2.encode_padded(&prompt.negative_prompt))
+                        .collect::<Vec<_>>()
+                };
+                (Some(prompt_tokens_2), Some(negative_tokens_2))
             } else {
                 (None, None)
             };
-        let (prompt_embeddings, negative_embeddings) =
-            if let Some(text_encoder) = self.text_encoder.as_ref() {
-                (
-                    Some(encode_token_batch_with_runtime_context(
-                        text_encoder,
-                        &prompt_tokens,
-                        runtime_context,
-                    )?),
-                    Some(encode_token_batch_with_runtime_context(
-                        text_encoder,
-                        &negative_tokens,
-                        runtime_context,
-                    )?),
+        let prompt_embeddings = self
+            .text_encoder
+            .as_ref()
+            .map(|text_encoder| {
+                encode_token_batch_with_runtime_context(
+                    text_encoder,
+                    &prompt_tokens,
+                    runtime_context,
                 )
-            } else {
-                (None, None)
-            };
+            })
+            .transpose()?;
+        let negative_embeddings = if cfg_is_identity {
+            prompt_embeddings.clone()
+        } else if let Some(text_encoder) = self.text_encoder.as_ref() {
+            Some(encode_token_batch_with_runtime_context(
+                text_encoder,
+                &negative_tokens,
+                runtime_context,
+            )?)
+        } else {
+            None
+        };
         let (
             prompt_embeddings_2,
             negative_embeddings_2,
@@ -5213,16 +5330,10 @@ impl DiffusionPipeline {
             negative_cross_attention_embeddings,
             prompt_pooled_embeddings,
             negative_pooled_embeddings,
-        ) = if let (
-            Some(text_encoder_2),
-            Some(tokenizer_2),
-            Some(prompt_tokens_2),
-            Some(negative_tokens_2),
-        ) = (
+        ) = if let (Some(text_encoder_2), Some(tokenizer_2), Some(prompt_tokens_2)) = (
             self.text_encoder_2.as_ref(),
             self.tokenizer_2.as_ref(),
             prompt_tokens_2.as_ref(),
-            negative_tokens_2.as_ref(),
         ) {
             let (prompt_embeddings_2, prompt_pooled_embeddings) =
                 encode_token_batch_with_pooled_and_runtime_context(
@@ -5231,13 +5342,24 @@ impl DiffusionPipeline {
                     tokenizer_2.end_token_id(),
                     runtime_context,
                 )?;
-            let (negative_embeddings_2, negative_pooled_embeddings) =
+            let (negative_embeddings_2, negative_pooled_embeddings) = if cfg_is_identity {
+                (
+                    prompt_embeddings_2.clone(),
+                    prompt_pooled_embeddings.clone(),
+                )
+            } else {
+                let negative_tokens_2 = negative_tokens_2.as_ref().ok_or_else(|| {
+                    DiffusionError::InvalidRequest(
+                        "secondary negative prompt tokens are missing".to_string(),
+                    )
+                })?;
                 encode_token_batch_with_pooled_and_runtime_context(
                     text_encoder_2,
                     negative_tokens_2,
                     tokenizer_2.end_token_id(),
                     runtime_context,
-                )?;
+                )?
+            };
             let prompt_cross_attention_embeddings = prompt_embeddings
                 .as_ref()
                 .map(|prompt_embeddings| {
@@ -5248,16 +5370,20 @@ impl DiffusionPipeline {
                     )
                 })
                 .transpose()?;
-            let negative_cross_attention_embeddings = negative_embeddings
-                .as_ref()
-                .map(|negative_embeddings| {
-                    concat_last_dim_3d_with_runtime_context(
-                        negative_embeddings,
-                        &negative_embeddings_2,
-                        runtime_context,
-                    )
-                })
-                .transpose()?;
+            let negative_cross_attention_embeddings = if cfg_is_identity {
+                prompt_cross_attention_embeddings.clone()
+            } else {
+                negative_embeddings
+                    .as_ref()
+                    .map(|negative_embeddings| {
+                        concat_last_dim_3d_with_runtime_context(
+                            negative_embeddings,
+                            &negative_embeddings_2,
+                            runtime_context,
+                        )
+                    })
+                    .transpose()?
+            };
             (
                 Some(prompt_embeddings_2),
                 Some(negative_embeddings_2),
@@ -5280,6 +5406,8 @@ impl DiffusionPipeline {
             negative_embeddings_2,
             prompt_cross_attention_embeddings,
             negative_cross_attention_embeddings,
+            prompt_attention_mask: None,
+            negative_attention_mask: None,
             prompt_pooled_embeddings,
             negative_pooled_embeddings,
         })
@@ -5309,6 +5437,8 @@ fn diffusion_conditioning_from_external_batch(
         negative_embeddings_2: None,
         prompt_cross_attention_embeddings,
         negative_cross_attention_embeddings,
+        prompt_attention_mask: conditioning.prompt_attention_mask.clone(),
+        negative_attention_mask: conditioning.negative_attention_mask.clone(),
         prompt_pooled_embeddings: conditioning.prompt_pooled_embeddings.clone(),
         negative_pooled_embeddings: conditioning.negative_pooled_embeddings.clone(),
     }
@@ -5324,6 +5454,8 @@ trait DiffusionNoiseBackend: Send + Sync {
         cfg_scale: f32,
         positive_embeddings: &CpuTensor,
         negative_embeddings: &CpuTensor,
+        positive_attention_mask: Option<&CpuTensor>,
+        negative_attention_mask: Option<&CpuTensor>,
         positive_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
         negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
         inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
@@ -5345,6 +5477,8 @@ impl DiffusionNoiseBackend for NativeUnet2DConditionModel {
         cfg_scale: f32,
         positive_embeddings: &CpuTensor,
         negative_embeddings: &CpuTensor,
+        positive_attention_mask: Option<&CpuTensor>,
+        negative_attention_mask: Option<&CpuTensor>,
         positive_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
         negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
         inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
@@ -5359,6 +5493,8 @@ impl DiffusionNoiseBackend for NativeUnet2DConditionModel {
             cfg_scale,
             positive_embeddings,
             negative_embeddings,
+            positive_attention_mask,
+            negative_attention_mask,
             positive_sdxl_conditioning,
             negative_sdxl_conditioning,
             inpaint_conditioning,
@@ -5550,6 +5686,11 @@ struct NativeTransformerDenoiserIo {
     img_in_bias: CpuTensor,
     output_weight: CpuTensor,
     output_bias: CpuTensor,
+    text_norm_weight: Option<CpuTensor>,
+    text_in_weight: Option<CpuTensor>,
+    text_in_bias: Option<CpuTensor>,
+    output_norm_weight: Option<CpuTensor>,
+    output_norm_bias: Option<CpuTensor>,
 }
 
 #[allow(dead_code)]
@@ -5638,6 +5779,77 @@ impl NativeTransformerDenoiserIo {
                 output_bias.shape
             )));
         }
+        let text_norm_weight = optional_tensor(hfq, "transformer/tensors/txt_norm.weight")?;
+        if let Some(weight) = text_norm_weight.as_ref() {
+            let text_width = transformer
+                .cross_attention_dim
+                .or(transformer.text_hidden_dim)
+                .unwrap_or_else(|| weight.shape.first().copied().unwrap_or(0));
+            if weight.shape.as_slice() != [text_width] {
+                return Err(DiffusionError::InvalidMetadata(format!(
+                    "transformer txt_norm weight shape {:?} != [{text_width}]",
+                    weight.shape
+                )));
+            }
+        }
+        let text_in_weight = optional_tensor(hfq, "transformer/tensors/txt_in.weight")?;
+        let text_in_bias = if text_in_weight.is_some() {
+            Some(CpuTensor::from_hfq(hfq, "transformer/tensors/txt_in.bias")?)
+        } else {
+            None
+        };
+        if let Some(weight) = text_in_weight.as_ref() {
+            let [text_out_width, text_in_width] = shape2(weight)?;
+            if text_out_width != hidden_width {
+                return Err(DiffusionError::InvalidMetadata(format!(
+                    "transformer txt_in output width {text_out_width} != img_in hidden width {hidden_width}"
+                )));
+            }
+            if let Some(norm_weight) = text_norm_weight.as_ref() {
+                if norm_weight.shape.as_slice() != [text_in_width] {
+                    return Err(DiffusionError::InvalidMetadata(format!(
+                        "transformer txt_norm width {:?} != txt_in input width {text_in_width}",
+                        norm_weight.shape
+                    )));
+                }
+            }
+            if text_in_bias.as_ref().map(|bias| bias.shape.as_slice()) != Some(&[hidden_width][..])
+            {
+                return Err(DiffusionError::InvalidMetadata(format!(
+                    "transformer txt_in bias shape {:?} != [{hidden_width}]",
+                    text_in_bias.as_ref().map(|bias| bias.shape.clone())
+                )));
+            }
+        }
+        let output_norm_weight =
+            optional_tensor(hfq, "transformer/tensors/norm_out.linear.weight")?;
+        let output_norm_bias = if output_norm_weight.is_some() {
+            Some(CpuTensor::from_hfq(
+                hfq,
+                "transformer/tensors/norm_out.linear.bias",
+            )?)
+        } else {
+            None
+        };
+        if let Some(weight) = output_norm_weight.as_ref() {
+            let [norm_rows, norm_cols] = shape2(weight)?;
+            if norm_rows != hidden_width * 2 || norm_cols != hidden_width {
+                return Err(DiffusionError::InvalidMetadata(format!(
+                    "transformer norm_out.linear weight shape {:?} != [{}, {hidden_width}]",
+                    weight.shape,
+                    hidden_width * 2
+                )));
+            }
+            if output_norm_bias.as_ref().map(|bias| bias.shape.as_slice())
+                != Some(&[hidden_width * 2][..])
+            {
+                return Err(DiffusionError::InvalidMetadata(format!(
+                    "transformer norm_out.linear bias shape {:?} != [{}]",
+                    output_norm_bias.as_ref().map(|bias| bias.shape.clone()),
+                    hidden_width * 2
+                )));
+            }
+        }
 
         Ok(Self {
             family: topology.family,
@@ -5651,6 +5863,11 @@ impl NativeTransformerDenoiserIo {
             img_in_bias,
             output_weight,
             output_bias,
+            text_norm_weight,
+            text_in_weight,
+            text_in_bias,
+            output_norm_weight,
+            output_norm_bias,
         })
     }
 
@@ -5672,13 +5889,16 @@ impl NativeTransformerDenoiserIo {
     fn project_hidden_to_latents_with_runtime_context(
         &self,
         hidden: &CpuTensor,
+        timestep_embedding: &CpuTensor,
         batch: usize,
         height: usize,
         width: usize,
         runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<LatentBatch> {
+        let hidden =
+            self.output_norm_with_runtime_context(hidden, timestep_embedding, runtime_context)?;
         let tokens = linear_3d_with_runtime_context(
-            hidden,
+            &hidden,
             &self.output_weight,
             Some(&self.output_bias),
             runtime_context,
@@ -5691,6 +5911,92 @@ impl NativeTransformerDenoiserIo {
             width,
             self.patch_size,
         )
+    }
+
+    fn project_text_to_hidden_with_runtime_context(
+        &self,
+        text_hidden: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
+        let [_, _, input_width] = shape3(text_hidden)?;
+        let text_hidden = if let Some(weight) = self.text_norm_weight.as_ref() {
+            if weight.shape.as_slice() != [input_width] {
+                return Err(DiffusionError::InvalidRequest(format!(
+                    "transformer text hidden width {input_width} != txt_norm width {}",
+                    weight.shape.first().copied().unwrap_or(0)
+                )));
+            }
+            rms_norm_3d_with_runtime_context(text_hidden, weight, 1e-6, runtime_context)?
+        } else {
+            text_hidden.clone()
+        };
+        let Some(weight) = self.text_in_weight.as_ref() else {
+            if input_width != self.hidden_width {
+                return Err(DiffusionError::InvalidRequest(format!(
+                    "transformer text hidden width {input_width} != expected hidden width {}; artifact has no txt_in projection",
+                    self.hidden_width
+                )));
+            }
+            return Ok(text_hidden);
+        };
+        let bias = self.text_in_bias.as_ref().ok_or_else(|| {
+            DiffusionError::InvalidMetadata(
+                "transformer txt_in weight is present but bias is missing".to_string(),
+            )
+        })?;
+        linear_3d_with_runtime_context(&text_hidden, weight, Some(bias), runtime_context)
+    }
+
+    fn output_norm_with_runtime_context(
+        &self,
+        hidden: &CpuTensor,
+        timestep_embedding: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
+        let Some(weight) = self.output_norm_weight.as_ref() else {
+            return Ok(hidden.clone());
+        };
+        let bias = self.output_norm_bias.as_ref().ok_or_else(|| {
+            DiffusionError::InvalidMetadata(
+                "transformer norm_out.linear weight is present but bias is missing".to_string(),
+            )
+        })?;
+        let [batch, _, width] = shape3(hidden)?;
+        if width != self.hidden_width {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "transformer output hidden width {width} != expected {}",
+                self.hidden_width
+            )));
+        }
+        let [time_batch, time_width] = shape2(timestep_embedding)?;
+        if time_batch != batch || time_width != self.hidden_width {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "transformer output norm timestep shape {:?} != [{batch}, {}]",
+                timestep_embedding.shape, self.hidden_width
+            )));
+        }
+        let activated = silu_with_runtime_context(timestep_embedding, runtime_context)?;
+        let projected = linear_with_runtime_context(&activated, weight, bias, runtime_context)?;
+        let [projected_batch, projected_width] = shape2(&projected)?;
+        if projected_batch != batch || projected_width != width * 2 {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "transformer output norm projection shape {:?} != [{batch}, {}]",
+                projected.shape,
+                width * 2
+            )));
+        }
+        let normalized =
+            layer_norm_3d_no_affine_with_runtime_context(hidden, 1e-6, runtime_context)?;
+        let mut scale = CpuTensor::zeros(&[batch, width]);
+        let mut shift = CpuTensor::zeros(&[batch, width]);
+        for b in 0..batch {
+            let src = b * projected_width;
+            let dst = b * width;
+            scale.data[dst..dst + width].copy_from_slice(&projected.data[src..src + width]);
+            shift.data[dst..dst + width]
+                .copy_from_slice(&projected.data[src + width..src + projected_width]);
+        }
+        modulate_3d(&normalized, &shift, &scale)
     }
 }
 
@@ -6199,6 +6505,20 @@ struct NativeTransformerAttentionProjection {
     text: Option<TransformerAttentionStreamProjection>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+struct RotaryFrequencies {
+    cos: CpuTensor,
+    sin: CpuTensor,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+struct QwenRotaryEmbeddings {
+    image: RotaryFrequencies,
+    text: RotaryFrequencies,
+}
+
 #[allow(dead_code)]
 impl NativeTransformerAttentionProjection {
     fn from_hfq(
@@ -6325,10 +6645,26 @@ impl NativeTransformerAttentionProjection {
         &self,
         image_hidden: &CpuTensor,
         text_hidden: Option<&CpuTensor>,
+        text_attention_mask: Option<&CpuTensor>,
+        qwen_rotary: Option<&QwenRotaryEmbeddings>,
         runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<(CpuTensor, Option<CpuTensor>)> {
-        let image_qkv =
+        let mut image_qkv =
             self.project_image_qkv_with_runtime_context(image_hidden, runtime_context)?;
+        if let Some(rotary) = qwen_rotary {
+            image_qkv.q = apply_qwen_rotary_embedding(
+                &image_qkv.q,
+                &rotary.image,
+                self.heads,
+                self.head_dim,
+            )?;
+            image_qkv.k = apply_qwen_rotary_embedding(
+                &image_qkv.k,
+                &rotary.image,
+                self.heads,
+                self.head_dim,
+            )?;
+        }
         let Some(text_projection) = self.text.as_ref() else {
             let image_attention = scaled_dot_product_attention_with_runtime_context(
                 &image_qkv.q,
@@ -6349,26 +6685,42 @@ impl NativeTransformerAttentionProjection {
             ))
         })?;
         self.validate_hidden_input(text_hidden, TransformerModulationStream::Text)?;
-        let text_qkv = text_projection.project_qkv_with_runtime_context(
+        let mut text_qkv = text_projection.project_qkv_with_runtime_context(
             text_hidden,
             self.heads,
             self.head_dim,
             runtime_context,
         )?;
+        if let Some(rotary) = qwen_rotary {
+            text_qkv.q =
+                apply_qwen_rotary_embedding(&text_qkv.q, &rotary.text, self.heads, self.head_dim)?;
+            text_qkv.k =
+                apply_qwen_rotary_embedding(&text_qkv.k, &rotary.text, self.heads, self.head_dim)?;
+        }
         let joint_k = concat_sequence_3d(&text_qkv.k, &image_qkv.k)?;
         let joint_v = concat_sequence_3d(&text_qkv.v, &image_qkv.v)?;
-        let image_attention = scaled_dot_product_attention_with_runtime_context(
+        let [batch, image_seq, _] = shape3(&image_qkv.k)?;
+        let [text_batch, text_seq, _] = shape3(&text_qkv.k)?;
+        if text_batch != batch {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "Qwen joint attention text batch {text_batch} != image batch {batch}"
+            )));
+        }
+        let joint_key_mask = qwen_joint_key_mask(text_attention_mask, batch, text_seq, image_seq)?;
+        let image_attention = scaled_dot_product_attention_with_key_mask_and_runtime_context(
             &image_qkv.q,
             &joint_k,
             &joint_v,
             self.heads,
+            joint_key_mask.as_deref(),
             runtime_context,
         )?;
-        let text_attention = scaled_dot_product_attention_with_runtime_context(
+        let text_attention = scaled_dot_product_attention_with_key_mask_and_runtime_context(
             &text_qkv.q,
             &joint_k,
             &joint_v,
             self.heads,
+            joint_key_mask.as_deref(),
             runtime_context,
         )?;
         let image_output =
@@ -6716,7 +7068,9 @@ impl NativeTransformerBlock {
         &self,
         image_hidden: &CpuTensor,
         text_hidden: &CpuTensor,
+        text_attention_mask: Option<&CpuTensor>,
         timestep_embedding: &CpuTensor,
+        qwen_rotary: Option<&QwenRotaryEmbeddings>,
         runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<(CpuTensor, CpuTensor)> {
         if !matches!(
@@ -6754,6 +7108,8 @@ impl NativeTransformerBlock {
             self.attention.attend_image_text_with_runtime_context(
                 &image_attention_input,
                 Some(&text_attention_input),
+                text_attention_mask,
+                qwen_rotary,
                 runtime_context,
             )?;
         let text_attention = text_attention.ok_or_else(|| {
@@ -6809,6 +7165,8 @@ struct NativeTransformerDenoiser {
     timestep_embedding: NativeTransformerTimestepEmbedding,
     blocks: Vec<NativeTransformerBlock>,
     heads: usize,
+    qwen_rope_axes: Option<[usize; 3]>,
+    qwen_rope_theta: f32,
 }
 
 #[allow(dead_code)]
@@ -6835,6 +7193,11 @@ impl NativeTransformerDenoiser {
                     .to_string(),
             )
         })?;
+        if transformer.guidance_embeds.unwrap_or(false) {
+            return Err(DiffusionError::InvalidMetadata(
+                "Qwen guidance-distilled transformer embeddings are not implemented; guidance_embeds=true needs a separate guidance-scale embedding path, not classifier-free guidance".to_string(),
+            ));
+        }
         let heads = transformer.num_attention_heads.unwrap_or(1);
         if heads == 0 {
             return Err(DiffusionError::InvalidMetadata(
@@ -6853,12 +7216,24 @@ impl NativeTransformerDenoiser {
                 heads,
             )?);
         }
+        let head_dim = blocks
+            .first()
+            .map(|block| block.attention.head_dim)
+            .ok_or_else(|| {
+                DiffusionError::InvalidMetadata(
+                    "transformer denoiser contains no attention blocks".to_string(),
+                )
+            })?;
+        let qwen_rope_axes = qwen_rope_axes_from_transformer_config(transformer, head_dim)?;
+        let qwen_rope_theta = transformer.rope_theta.unwrap_or(10_000.0);
         Ok(Self {
             family: topology.family,
             io,
             timestep_embedding,
             blocks,
             heads,
+            qwen_rope_axes,
+            qwen_rope_theta,
         })
     }
 
@@ -6867,6 +7242,7 @@ impl NativeTransformerDenoiser {
         latents: &LatentBatch,
         timesteps: &[f32],
         text_hidden: &CpuTensor,
+        text_attention_mask: Option<&CpuTensor>,
         runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<LatentBatch> {
         if !matches!(self.family, TransformerDenoiserFamily::QwenImage) {
@@ -6893,7 +7269,14 @@ impl NativeTransformerDenoiser {
         let mut image_hidden = self
             .io
             .project_latents_to_hidden_with_runtime_context(latents, runtime_context)?;
-        let mut text_hidden = text_hidden.clone();
+        let mut text_hidden = self
+            .io
+            .project_text_to_hidden_with_runtime_context(text_hidden, runtime_context)?;
+        let [_, text_seq, _] = shape3(&text_hidden)?;
+        if let Some(mask) = text_attention_mask {
+            validate_text_attention_mask(mask, latents.batch, text_seq, "Qwen text")?;
+        }
+        let qwen_rotary = self.qwen_rotary_embeddings(latents, text_seq)?;
         let timestep_embedding = self
             .timestep_embedding
             .forward_with_runtime_context(timesteps, runtime_context)?;
@@ -6901,7 +7284,9 @@ impl NativeTransformerDenoiser {
             let (next_image_hidden, next_text_hidden) = block.forward_qwen_with_runtime_context(
                 &image_hidden,
                 &text_hidden,
+                text_attention_mask,
                 &timestep_embedding,
+                qwen_rotary.as_ref(),
                 runtime_context,
             )?;
             image_hidden = next_image_hidden;
@@ -6909,11 +7294,47 @@ impl NativeTransformerDenoiser {
         }
         self.io.project_hidden_to_latents_with_runtime_context(
             &image_hidden,
+            &timestep_embedding,
             latents.batch,
             latents.height,
             latents.width,
             runtime_context,
         )
+    }
+
+    fn qwen_rotary_embeddings(
+        &self,
+        latents: &LatentBatch,
+        text_seq_len: usize,
+    ) -> DiffusionResult<Option<QwenRotaryEmbeddings>> {
+        let Some(axes) = self.qwen_rope_axes else {
+            return Ok(None);
+        };
+        if latents.height % self.io.patch_size != 0 || latents.width % self.io.patch_size != 0 {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "Qwen RoPE requires latent dimensions {}x{} to be divisible by patch size {}",
+                latents.height, latents.width, self.io.patch_size
+            )));
+        }
+        let grid_height = latents.height / self.io.patch_size;
+        let grid_width = latents.width / self.io.patch_size;
+        let image_seq_len = grid_height.checked_mul(grid_width).ok_or_else(|| {
+            DiffusionError::InvalidRequest("Qwen RoPE image token count overflow".to_string())
+        })?;
+        if image_seq_len == 0 || text_seq_len == 0 {
+            return Err(DiffusionError::InvalidRequest(
+                "Qwen RoPE requires non-empty image and text token sequences".to_string(),
+            ));
+        }
+        Ok(Some(qwen_rotary_embeddings_for_grid(
+            axes,
+            self.qwen_rope_theta,
+            self.blocks[0].attention.head_dim,
+            1,
+            grid_height,
+            grid_width,
+            text_seq_len,
+        )?))
     }
 }
 
@@ -6929,6 +7350,8 @@ impl DiffusionNoiseBackend for NativeTransformerDenoiser {
         cfg_scale: f32,
         positive_embeddings: &CpuTensor,
         negative_embeddings: &CpuTensor,
+        positive_attention_mask: Option<&CpuTensor>,
+        negative_attention_mask: Option<&CpuTensor>,
         positive_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
         negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
         inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
@@ -6952,16 +7375,19 @@ impl DiffusionNoiseBackend for NativeTransformerDenoiser {
             cfg_scale,
             positive_embeddings,
             negative_embeddings,
-            |sample, timesteps, encoder_states, _sdxl, runtime_context| {
+            |sample, timesteps, encoder_states, attention_mask, _sdxl, runtime_context| {
                 let model_latents = LatentBatch::from_nchw_tensor(sample.clone())?;
                 let prediction = self.forward_qwen_with_runtime_context(
                     &model_latents,
                     timesteps,
                     encoder_states,
+                    attention_mask,
                     runtime_context,
                 )?;
                 Ok(prediction.as_nchw_tensor())
             },
+            positive_attention_mask,
+            negative_attention_mask,
             None,
             None,
             None,
@@ -6988,6 +7414,193 @@ fn attention_norm_weight_dim(weight: &CpuTensor) -> DiffusionResult<usize> {
             weight.shape
         ))),
     }
+}
+
+#[allow(dead_code)]
+fn qwen_rope_axes_from_transformer_config(
+    transformer: &TransformerDenoiserConfig,
+    head_dim: usize,
+) -> DiffusionResult<Option<[usize; 3]>> {
+    let axes = if transformer.axes_dims_rope.is_empty() {
+        if head_dim == 128 {
+            vec![16, 56, 56]
+        } else {
+            return Ok(None);
+        }
+    } else {
+        transformer.axes_dims_rope.clone()
+    };
+    if axes.len() != 3 {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "Qwen axes_dims_rope {:?} must contain exactly 3 axes",
+            axes
+        )));
+    }
+    if axes.iter().any(|dim| *dim == 0 || dim % 2 != 0) {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "Qwen axes_dims_rope {:?} must contain non-zero even dimensions",
+            axes
+        )));
+    }
+    let sum = axes.iter().sum::<usize>();
+    if sum != head_dim {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "Qwen axes_dims_rope {:?} sum {sum} != attention head_dim {head_dim}",
+            axes
+        )));
+    }
+    Ok(Some([axes[0], axes[1], axes[2]]))
+}
+
+#[allow(dead_code)]
+fn qwen_rotary_embeddings_for_grid(
+    axes: [usize; 3],
+    theta: f32,
+    head_dim: usize,
+    frame: usize,
+    height: usize,
+    width: usize,
+    text_seq_len: usize,
+) -> DiffusionResult<QwenRotaryEmbeddings> {
+    if frame == 0 || height == 0 || width == 0 || text_seq_len == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "Qwen RoPE requires non-empty frame, height, width, and text sequence".to_string(),
+        ));
+    }
+    if axes.iter().sum::<usize>() != head_dim || head_dim % 2 != 0 {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "Qwen RoPE axes {:?} are incompatible with head_dim {head_dim}",
+            axes
+        )));
+    }
+    if theta <= 0.0 {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "Qwen rope_theta {theta} must be positive"
+        )));
+    }
+
+    let freq_width = head_dim / 2;
+    let image_seq_len = frame
+        .checked_mul(height)
+        .and_then(|value| value.checked_mul(width))
+        .ok_or_else(|| {
+            DiffusionError::InvalidRequest("Qwen RoPE image size overflow".to_string())
+        })?;
+    let mut image_cos = CpuTensor::zeros(&[image_seq_len, freq_width]);
+    let mut image_sin = CpuTensor::zeros(&[image_seq_len, freq_width]);
+    let max_vid_index = height.max(width);
+    let mut token = 0usize;
+    for f in 0..frame {
+        for y in 0..height {
+            for x in 0..width {
+                write_qwen_rope_token(
+                    &mut image_cos.data,
+                    &mut image_sin.data,
+                    token,
+                    freq_width,
+                    axes,
+                    theta,
+                    [f as isize, y as isize, x as isize],
+                );
+                token += 1;
+            }
+        }
+    }
+
+    let mut text_cos = CpuTensor::zeros(&[text_seq_len, freq_width]);
+    let mut text_sin = CpuTensor::zeros(&[text_seq_len, freq_width]);
+    for token in 0..text_seq_len {
+        write_qwen_rope_token(
+            &mut text_cos.data,
+            &mut text_sin.data,
+            token,
+            freq_width,
+            axes,
+            theta,
+            [
+                (max_vid_index + token) as isize,
+                (max_vid_index + token) as isize,
+                (max_vid_index + token) as isize,
+            ],
+        );
+    }
+
+    Ok(QwenRotaryEmbeddings {
+        image: RotaryFrequencies {
+            cos: image_cos,
+            sin: image_sin,
+        },
+        text: RotaryFrequencies {
+            cos: text_cos,
+            sin: text_sin,
+        },
+    })
+}
+
+fn write_qwen_rope_token(
+    cos: &mut [f32],
+    sin: &mut [f32],
+    token: usize,
+    freq_width: usize,
+    axes: [usize; 3],
+    theta: f32,
+    positions: [isize; 3],
+) {
+    let mut dst = token * freq_width;
+    for (axis_index, axis_dim) in axes.into_iter().enumerate() {
+        let axis_freqs = axis_dim / 2;
+        for freq_index in 0..axis_freqs {
+            let exponent = (2 * freq_index) as f32 / axis_dim as f32;
+            let angle = positions[axis_index] as f32 / theta.powf(exponent);
+            cos[dst] = angle.cos();
+            sin[dst] = angle.sin();
+            dst += 1;
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn apply_qwen_rotary_embedding(
+    input: &CpuTensor,
+    freqs: &RotaryFrequencies,
+    heads: usize,
+    head_dim: usize,
+) -> DiffusionResult<CpuTensor> {
+    let [batch, seq, width] = shape3(input)?;
+    if heads == 0 || head_dim == 0 || head_dim % 2 != 0 || width != heads * head_dim {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "Qwen RoPE input width {width} is incompatible with heads {heads} and head_dim {head_dim}"
+        )));
+    }
+    let freq_width = head_dim / 2;
+    if freqs.cos.shape.as_slice() != [seq, freq_width]
+        || freqs.sin.shape.as_slice() != [seq, freq_width]
+    {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "Qwen RoPE frequency shapes {:?}/{:?} != [{seq}, {freq_width}]",
+            freqs.cos.shape, freqs.sin.shape
+        )));
+    }
+    let mut out = CpuTensor::zeros(&[batch, seq, width]);
+    for b in 0..batch {
+        for token in 0..seq {
+            for head in 0..heads {
+                let token_base = (b * seq + token) * width + head * head_dim;
+                let freq_base = token * freq_width;
+                for pair in 0..freq_width {
+                    let real_idx = token_base + pair * 2;
+                    let imag_idx = real_idx + 1;
+                    let real = input.data[real_idx];
+                    let imag = input.data[imag_idx];
+                    let cos = freqs.cos.data[freq_base + pair];
+                    let sin = freqs.sin.data[freq_base + pair];
+                    out.data[real_idx] = real * cos - imag * sin;
+                    out.data[imag_idx] = real * sin + imag * cos;
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[allow(dead_code)]
@@ -7093,6 +7706,40 @@ fn rms_norm_attention_heads_3d(
                     out.data[head_base + dim] =
                         input.data[head_base + dim] * inv_rms * weight.data[dim];
                 }
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[allow(dead_code)]
+fn rms_norm_3d_with_runtime_context(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    eps: f32,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
+) -> DiffusionResult<CpuTensor> {
+    let _ = runtime_context;
+    let [batch, seq, width] = shape3(input)?;
+    if weight.shape.as_slice() != [width] {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "RMSNorm weight shape {:?} != [{width}]",
+            weight.shape
+        )));
+    }
+    let mut out = CpuTensor::zeros(&[batch, seq, width]);
+    for b in 0..batch {
+        for token in 0..seq {
+            let token_base = (b * seq + token) * width;
+            let mut square_sum = 0.0f32;
+            for dim in 0..width {
+                let value = input.data[token_base + dim];
+                square_sum += value * value;
+            }
+            let inv_rms = (square_sum / width as f32 + eps).sqrt().recip();
+            for dim in 0..width {
+                out.data[token_base + dim] =
+                    input.data[token_base + dim] * inv_rms * weight.data[dim];
             }
         }
     }
@@ -7274,7 +7921,7 @@ fn diffusion_generation_info(
     request: &DiffusionBatchRequest,
     latent_shape: &DiffusionLatentShape,
 ) -> Value {
-    json!({
+    let mut info = json!({
         "compat": "stable-diffusion-webui",
         "backend": "hipfire-diffusion-hfq",
         "runtime": runtime_kind.as_str(),
@@ -7298,7 +7945,13 @@ fn diffusion_generation_info(
             "height": latent_shape.height,
             "width": latent_shape.width,
         },
-    })
+    });
+    if let Some(scale) = request.distilled_guidance_scale {
+        if let Some(map) = info.as_object_mut() {
+            map.insert("distilled_guidance_scale".to_string(), json!(scale));
+        }
+    }
+    info
 }
 
 impl StableDiffusionConfig {
@@ -7620,12 +8273,58 @@ pub fn latent_shape_for_request(
             request.width, request.height
         )));
     }
-    Ok(DiffusionLatentShape {
+    let latent_shape = DiffusionLatentShape {
         batch: request.prompts.len(),
         channels: config.latent_channels,
         height: (request.height / scale) as usize,
         width: (request.width / scale) as usize,
-    })
+    };
+    validate_unet_latent_shape_for_request(config, &latent_shape, scale as usize)?;
+    Ok(latent_shape)
+}
+
+fn validate_unet_latent_shape_for_request(
+    config: &StableDiffusionConfig,
+    latent_shape: &DiffusionLatentShape,
+    scale: usize,
+) -> DiffusionResult<()> {
+    if config.transformer.is_some() {
+        return Ok(());
+    }
+    let block_count = unet_down_block_count(&config.unet);
+    let min_side = minimum_unet_latent_side(&config.unet);
+    if min_side <= 1 {
+        return Ok(());
+    }
+    if latent_shape.width < min_side || latent_shape.height < min_side {
+        let min_pixels = min_side.saturating_mul(scale);
+        return Err(DiffusionError::InvalidRequest(format!(
+            "latent shape {}x{} is too small for UNet downsampling depth {}; request at least {}x{} pixels with VAE scale factor {scale}",
+            latent_shape.width,
+            latent_shape.height,
+            block_count.saturating_sub(1),
+            min_pixels,
+            min_pixels
+        )));
+    }
+    Ok(())
+}
+
+fn unet_down_block_count(config: &UnetConfig) -> usize {
+    if config.down_block_types.is_empty() {
+        config.block_out_channels.len()
+    } else {
+        config.down_block_types.len()
+    }
+}
+
+fn minimum_unet_latent_side(config: &UnetConfig) -> usize {
+    let downsample_count = unet_down_block_count(config).saturating_sub(1);
+    if downsample_count >= usize::BITS as usize {
+        usize::MAX
+    } else {
+        1usize << downsample_count
+    }
 }
 
 pub fn diffusion_hip_memory_plan(
@@ -9528,6 +10227,8 @@ impl NativeUnet2DConditionModel {
             cfg_scale,
             positive_embeddings,
             negative_embeddings,
+            None,
+            None,
             positive_sdxl_conditioning,
             negative_sdxl_conditioning,
             inpaint_conditioning,
@@ -9545,6 +10246,8 @@ impl NativeUnet2DConditionModel {
         cfg_scale: f32,
         positive_embeddings: &CpuTensor,
         negative_embeddings: &CpuTensor,
+        positive_attention_mask: Option<&CpuTensor>,
+        negative_attention_mask: Option<&CpuTensor>,
         positive_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
         negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
         inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
@@ -9558,7 +10261,12 @@ impl NativeUnet2DConditionModel {
             cfg_scale,
             positive_embeddings,
             negative_embeddings,
-            |sample, timesteps, encoder_states, sdxl_conditioning, runtime_context| {
+            |sample,
+             timesteps,
+             encoder_states,
+             _attention_mask,
+             sdxl_conditioning,
+             runtime_context| {
                 self.forward_with_sdxl_conditioning_and_runtime_context(
                     sample,
                     timesteps,
@@ -9567,6 +10275,8 @@ impl NativeUnet2DConditionModel {
                     runtime_context,
                 )
             },
+            positive_attention_mask,
+            negative_attention_mask,
             positive_sdxl_conditioning,
             negative_sdxl_conditioning,
             inpaint_conditioning,
@@ -9583,6 +10293,8 @@ impl NativeUnet2DConditionModel {
         cfg_scale: f32,
         positive_embeddings: &CpuTensor,
         negative_embeddings: &CpuTensor,
+        positive_attention_mask: Option<&CpuTensor>,
+        negative_attention_mask: Option<&CpuTensor>,
         positive_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
         negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
         inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
@@ -9596,7 +10308,12 @@ impl NativeUnet2DConditionModel {
             cfg_scale,
             positive_embeddings,
             negative_embeddings,
-            |sample, timesteps, encoder_states, sdxl_conditioning, runtime_context| {
+            |sample,
+             timesteps,
+             encoder_states,
+             _attention_mask,
+             sdxl_conditioning,
+             runtime_context| {
                 self.forward_with_sdxl_conditioning_and_runtime_context(
                     sample,
                     timesteps,
@@ -9605,6 +10322,8 @@ impl NativeUnet2DConditionModel {
                     runtime_context,
                 )
             },
+            positive_attention_mask,
+            negative_attention_mask,
             positive_sdxl_conditioning,
             negative_sdxl_conditioning,
             inpaint_conditioning,
@@ -13818,6 +14537,16 @@ fn scaled_dot_product_attention(
     v: &CpuTensor,
     heads: usize,
 ) -> DiffusionResult<CpuTensor> {
+    scaled_dot_product_attention_with_key_mask(q, k, v, heads, None)
+}
+
+fn scaled_dot_product_attention_with_key_mask(
+    q: &CpuTensor,
+    k: &CpuTensor,
+    v: &CpuTensor,
+    heads: usize,
+    key_mask: Option<&[bool]>,
+) -> DiffusionResult<CpuTensor> {
     let [batch, q_seq, hidden] = shape3(q)?;
     let [k_batch, k_seq, k_hidden] = shape3(k)?;
     let [v_batch, v_seq, v_hidden] = shape3(v)?;
@@ -13832,6 +14561,15 @@ fn scaled_dot_product_attention(
             "attention hidden size {hidden} is incompatible with key size {k_hidden} and heads {heads}"
         )));
     }
+    if let Some(mask) = key_mask {
+        let expected = batch * k_seq;
+        if mask.len() != expected {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "attention key mask has {} entries, expected {expected}",
+                mask.len()
+            )));
+        }
+    }
     let head_dim = hidden / heads;
     let scale = (head_dim as f32).sqrt().recip();
     let mut out = CpuTensor::zeros(&[batch, q_seq, hidden]);
@@ -13840,13 +14578,24 @@ fn scaled_dot_product_attention(
             let head_off = head * head_dim;
             for qi in 0..q_seq {
                 let mut scores = vec![0.0f32; k_seq];
+                let mut has_active_key = false;
                 for ki in 0..k_seq {
+                    if let Some(mask) = key_mask {
+                        if !mask[b * k_seq + ki] {
+                            scores[ki] = f32::NEG_INFINITY;
+                            continue;
+                        }
+                    }
+                    has_active_key = true;
                     let mut dot = 0.0;
                     for d in 0..head_dim {
                         dot += q.data[((b * q_seq + qi) * hidden) + head_off + d]
                             * k.data[((b * k_seq + ki) * hidden) + head_off + d];
                     }
                     scores[ki] = dot * scale;
+                }
+                if !has_active_key {
+                    continue;
                 }
                 softmax_in_place(&mut scores);
                 for d in 0..head_dim {
@@ -14542,11 +15291,15 @@ pub fn conv2d_nchw_with_stride(
     let out_h = (padded_h - kernel_h) / stride + 1;
     let out_w = (padded_w - kernel_w) / stride + 1;
     let mut out = CpuTensor::zeros(&[batch, out_channels, out_h, out_w]);
-    for b in 0..batch {
-        for oc in 0..out_channels {
-            let out_base = ((b * out_channels + oc) * out_h) * out_w;
+    let plane_len = out_h * out_w;
+    out.data
+        .par_chunks_mut(plane_len)
+        .enumerate()
+        .for_each(|(plane_idx, out_plane)| {
+            let b = plane_idx / out_channels;
+            let oc = plane_idx % out_channels;
             if let Some(bias) = bias {
-                out.data[out_base..out_base + out_h * out_w].fill(bias.data[oc]);
+                out_plane.fill(bias.data[oc]);
             }
             for ic in 0..in_channels {
                 let input_base = ((b * in_channels + ic) * in_h) * in_w;
@@ -14559,7 +15312,7 @@ pub fn conv2d_nchw_with_stride(
                         }
                         let iy = iy_with_pad - padding;
                         let input_row = input_base + iy * in_w;
-                        let output_row = out_base + oy * out_w;
+                        let output_row = oy * out_w;
                         for kx in 0..kernel_w {
                             let ix_offset = kx;
                             let weight_value = weight.data[weight_base + ky * kernel_w + kx];
@@ -14572,15 +15325,14 @@ pub fn conv2d_nchw_with_stride(
                                     continue;
                                 }
                                 let ix = ix_with_pad - padding;
-                                out.data[output_row + ox] +=
+                                out_plane[output_row + ox] +=
                                     input.data[input_row + ix] * weight_value;
                             }
                         }
                     }
                 }
             }
-        }
-    }
+        });
     Ok(out)
 }
 
@@ -14892,7 +15644,7 @@ pub fn inspect_hfq_with_runtime_support(
     let hfq = HfqFile::open_index_only(path).map_err(|err| DiffusionError::Io(err.to_string()))?;
     let metadata = parse_diffusion_metadata(&hfq.metadata_json)?;
     validate_diffusion_hfq(&hfq, &metadata)?;
-    let runtime_support = match native_runtime_metadata_support_error(&metadata) {
+    let runtime_support = match native_runtime_support_error(&hfq, &metadata)? {
         Some(reason) => DiffusionRuntimeSupport {
             supported: false,
             runtime_kind: None,
@@ -15183,6 +15935,11 @@ fn validate_batch_request(
     if request.steps == 0 {
         return Err(DiffusionError::InvalidRequest(
             "steps must be greater than zero".to_string(),
+        ));
+    }
+    if request.distilled_guidance_scale.is_some() {
+        return Err(DiffusionError::InvalidRequest(
+            "distilled_guidance_scale is not implemented by the native diffusion denoiser yet; it is distinct from cfg_scale and must not be silently ignored".to_string(),
         ));
     }
     if let Some(conditioning) = request.conditioning.as_ref() {
@@ -16194,6 +16951,36 @@ fn native_runtime_metadata_support_error(metadata: &DiffusionHfqMetadata) -> Opt
         ));
     }
     None
+}
+
+fn native_runtime_support_error(
+    hfq: &HfqFile,
+    metadata: &DiffusionHfqMetadata,
+) -> DiffusionResult<Option<String>> {
+    if let Some(error) = native_runtime_metadata_support_error(metadata) {
+        return Ok(Some(error));
+    }
+    let transformer_topology = metadata
+        .components
+        .get("transformer")
+        .map(transformer_denoiser_weight_topology);
+    let uses_qwen_transformer = transformer_topology
+        .as_ref()
+        .is_some_and(|topology| matches!(topology.family, TransformerDenoiserFamily::QwenImage));
+    if uses_qwen_transformer {
+        let transformer_json = component_json(hfq, metadata, "transformer")?;
+        if transformer_json
+            .as_ref()
+            .and_then(|json| json_bool(json, "guidance_embeds"))
+            .unwrap_or(false)
+        {
+            return Ok(Some(
+                "native transformer runtime does not support Qwen guidance-distilled transformer embeddings yet; guidance_embeds=true needs a separate guidance-scale embedding path, not classifier-free guidance"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Clone)]
@@ -18129,8 +18916,19 @@ mod tests {
             .unwrap();
         assert_eq!(hidden.shape, vec![1, 1, 2]);
         assert_eq!(hidden.data, vec![1.5, 1.5]);
+        let timestep_embedding = CpuTensor {
+            shape: vec![1, 2],
+            data: vec![0.0, 0.0],
+        };
         let output = io
-            .project_hidden_to_latents_with_runtime_context(&hidden, 1, 2, 2, &mut runtime_context)
+            .project_hidden_to_latents_with_runtime_context(
+                &hidden,
+                &timestep_embedding,
+                1,
+                2,
+                2,
+                &mut runtime_context,
+            )
             .unwrap();
         assert_eq!(output.batch, 1);
         assert_eq!(output.channels, 1);
@@ -18208,8 +19006,19 @@ mod tests {
             .unwrap();
         assert_eq!(hidden.shape, vec![1, 1, 2]);
         assert_eq!(hidden.data, vec![3.0, 4.25]);
+        let timestep_embedding = CpuTensor {
+            shape: vec![1, 2],
+            data: vec![0.0, 0.0],
+        };
         let output = io
-            .project_hidden_to_latents_with_runtime_context(&hidden, 1, 2, 2, &mut runtime_context)
+            .project_hidden_to_latents_with_runtime_context(
+                &hidden,
+                &timestep_embedding,
+                1,
+                2,
+                2,
+                &mut runtime_context,
+            )
             .unwrap();
         assert_eq!(output.data, vec![7.25, 2.25, 6.0, 7.5]);
         let _ = fs::remove_dir_all(&dir);
@@ -18732,12 +19541,233 @@ mod tests {
             .attend_image_text_with_runtime_context(
                 &image_hidden,
                 Some(&text_hidden),
+                None,
+                None,
                 &mut runtime_context,
             )
             .unwrap();
 
         assert_f32_close(&image_out.data, &expected_image.data, 1e-6);
         assert_f32_close(&text_out.unwrap().data, &expected_text.data, 1e-6);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scaled_dot_product_attention_respects_key_mask() {
+        let q = CpuTensor {
+            shape: vec![1, 1, 2],
+            data: vec![1.0, 0.0],
+        };
+        let k = CpuTensor {
+            shape: vec![1, 2, 2],
+            data: vec![10.0, 0.0, 0.0, 10.0],
+        };
+        let v = CpuTensor {
+            shape: vec![1, 2, 2],
+            data: vec![3.0, 5.0, 7.0, 11.0],
+        };
+
+        let out = scaled_dot_product_attention_with_key_mask(&q, &k, &v, 1, Some(&[false, true]))
+            .unwrap();
+
+        assert_eq!(out.shape, vec![1, 1, 2]);
+        assert_f32_close(&out.data, &[7.0, 11.0], 1e-6);
+    }
+
+    #[test]
+    fn native_transformer_attention_masks_qwen_text_keys_but_keeps_image_keys() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-qwen-transformer-mask-attn-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("qwen-transformer-mask-attn.hfq");
+        let prefix = "transformer/tensors/transformer_blocks.0.attn";
+        let identity2 = [1.0, 0.0, 0.0, 1.0];
+        write_hfqm_package_mem(
+            &path,
+            HFQ_ARCH_DIFFUSION,
+            "{}",
+            &[
+                f32_mem_tensor(&format!("{prefix}.to_q.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.to_k.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.to_v.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.to_out.0.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.add_q_proj.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.add_k_proj.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.add_v_proj.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.to_add_out.weight"), &[2, 2], &identity2),
+            ],
+        )
+        .unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let attention = NativeTransformerAttentionProjection::from_hfq(
+            &hfq,
+            TransformerDenoiserFamily::QwenImage,
+            0,
+            1,
+        )
+        .unwrap();
+        let image_hidden = CpuTensor {
+            shape: vec![1, 1, 2],
+            data: vec![0.0, 1.0],
+        };
+        let text_hidden = CpuTensor {
+            shape: vec![1, 2, 2],
+            data: vec![1.0, 0.0, 8.0, 0.0],
+        };
+        let text_attention_mask = CpuTensor {
+            shape: vec![1, 2],
+            data: vec![1.0, 0.0],
+        };
+        let joint = concat_sequence_3d(&text_hidden, &image_hidden).unwrap();
+        let expected_mask = [true, false, true];
+        let expected_image = scaled_dot_product_attention_with_key_mask(
+            &image_hidden,
+            &joint,
+            &joint,
+            1,
+            Some(&expected_mask),
+        )
+        .unwrap();
+        let expected_text = scaled_dot_product_attention_with_key_mask(
+            &text_hidden,
+            &joint,
+            &joint,
+            1,
+            Some(&expected_mask),
+        )
+        .unwrap();
+        let unmasked_image =
+            scaled_dot_product_attention(&image_hidden, &joint, &joint, 1).unwrap();
+        let mut runtime_context =
+            DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+
+        let (image_out, text_out) = attention
+            .attend_image_text_with_runtime_context(
+                &image_hidden,
+                Some(&text_hidden),
+                Some(&text_attention_mask),
+                None,
+                &mut runtime_context,
+            )
+            .unwrap();
+
+        assert_f32_close(&image_out.data, &expected_image.data, 1e-6);
+        assert_f32_close(&text_out.unwrap().data, &expected_text.data, 1e-6);
+        assert!(image_out
+            .data
+            .iter()
+            .zip(unmasked_image.data.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-5));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_transformer_attention_applies_qwen_rope_to_image_and_text_qk() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-qwen-transformer-rope-attn-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("qwen-transformer-rope-attn.hfq");
+        let prefix = "transformer/tensors/transformer_blocks.0.attn";
+        let identity6 = (0..36)
+            .map(|idx| {
+                let row = idx / 6;
+                let col = idx % 6;
+                if row == col {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Vec<_>>();
+        write_hfqm_package_mem(
+            &path,
+            HFQ_ARCH_DIFFUSION,
+            "{}",
+            &[
+                f32_mem_tensor(&format!("{prefix}.to_q.weight"), &[6, 6], &identity6),
+                f32_mem_tensor(&format!("{prefix}.to_k.weight"), &[6, 6], &identity6),
+                f32_mem_tensor(&format!("{prefix}.to_v.weight"), &[6, 6], &identity6),
+                f32_mem_tensor(&format!("{prefix}.to_out.0.weight"), &[6, 6], &identity6),
+                f32_mem_tensor(&format!("{prefix}.add_q_proj.weight"), &[6, 6], &identity6),
+                f32_mem_tensor(&format!("{prefix}.add_k_proj.weight"), &[6, 6], &identity6),
+                f32_mem_tensor(&format!("{prefix}.add_v_proj.weight"), &[6, 6], &identity6),
+                f32_mem_tensor(&format!("{prefix}.to_add_out.weight"), &[6, 6], &identity6),
+            ],
+        )
+        .unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let attention = NativeTransformerAttentionProjection::from_hfq(
+            &hfq,
+            TransformerDenoiserFamily::QwenImage,
+            0,
+            1,
+        )
+        .unwrap();
+        let image_hidden = CpuTensor {
+            shape: vec![1, 2, 6],
+            data: vec![
+                1.0, 0.0, 0.0, 1.0, 0.5, -0.5, //
+                -0.25, 0.75, 1.5, -1.0, 2.0, 0.25,
+            ],
+        };
+        let text_hidden = CpuTensor {
+            shape: vec![1, 1, 6],
+            data: vec![0.25, -0.5, 0.75, 1.0, -1.25, 0.5],
+        };
+        let rotary = qwen_rotary_embeddings_for_grid([2, 2, 2], 10_000.0, 6, 1, 1, 2, 1).unwrap();
+        let mut runtime_context =
+            DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+
+        let mut image_qkv = attention
+            .project_image_qkv_with_runtime_context(&image_hidden, &mut runtime_context)
+            .unwrap();
+        image_qkv.q = apply_qwen_rotary_embedding(&image_qkv.q, &rotary.image, 1, 6).unwrap();
+        image_qkv.k = apply_qwen_rotary_embedding(&image_qkv.k, &rotary.image, 1, 6).unwrap();
+        let mut text_qkv = attention
+            .project_text_qkv_with_runtime_context(&text_hidden, &mut runtime_context)
+            .unwrap()
+            .unwrap();
+        text_qkv.q = apply_qwen_rotary_embedding(&text_qkv.q, &rotary.text, 1, 6).unwrap();
+        text_qkv.k = apply_qwen_rotary_embedding(&text_qkv.k, &rotary.text, 1, 6).unwrap();
+        let joint_k = concat_sequence_3d(&text_qkv.k, &image_qkv.k).unwrap();
+        let joint_v = concat_sequence_3d(&text_qkv.v, &image_qkv.v).unwrap();
+        let expected_image =
+            scaled_dot_product_attention(&image_qkv.q, &joint_k, &joint_v, 1).unwrap();
+        let expected_text =
+            scaled_dot_product_attention(&text_qkv.q, &joint_k, &joint_v, 1).unwrap();
+
+        let (image_out, text_out) = attention
+            .attend_image_text_with_runtime_context(
+                &image_hidden,
+                Some(&text_hidden),
+                None,
+                Some(&rotary),
+                &mut runtime_context,
+            )
+            .unwrap();
+        let (no_rope_image, _) = attention
+            .attend_image_text_with_runtime_context(
+                &image_hidden,
+                Some(&text_hidden),
+                None,
+                None,
+                &mut runtime_context,
+            )
+            .unwrap();
+
+        assert_f32_close(&image_out.data, &expected_image.data, 1e-6);
+        assert_f32_close(&text_out.unwrap().data, &expected_text.data, 1e-6);
+        assert!(image_out
+            .data
+            .iter()
+            .zip(no_rope_image.data.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-5));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -18782,7 +19812,13 @@ mod tests {
             DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
 
         let (image_out, text_out) = attention
-            .attend_image_text_with_runtime_context(&image_hidden, None, &mut runtime_context)
+            .attend_image_text_with_runtime_context(
+                &image_hidden,
+                None,
+                None,
+                None,
+                &mut runtime_context,
+            )
             .unwrap();
 
         assert_f32_close(&image_out.data, &expected.data, 1e-6);
@@ -18993,7 +20029,9 @@ mod tests {
             .forward_qwen_with_runtime_context(
                 &image_hidden,
                 &text_hidden,
+                None,
                 &timestep_embedding,
+                None,
                 &mut runtime_context,
             )
             .unwrap();
@@ -19052,7 +20090,13 @@ mod tests {
             DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
 
         let output = denoiser
-            .forward_qwen_with_runtime_context(&latents, &[0.0], &text_hidden, &mut runtime_context)
+            .forward_qwen_with_runtime_context(
+                &latents,
+                &[0.0],
+                &text_hidden,
+                None,
+                &mut runtime_context,
+            )
             .unwrap();
 
         assert_eq!(output.batch, 1);
@@ -19070,6 +20114,136 @@ mod tests {
             expected_hidden[0] - expected_hidden[1],
         ];
         assert_f32_close(&output.data, &expected, 1e-5);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_transformer_denoiser_rejects_qwen_guidance_embeds() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-qwen-guidance-embeds-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("qwen-transformer-guidance-embeds.hfq");
+        let tensors = qwen_tiny_transformer_denoiser_tensors();
+        let weight_entries = tensors
+            .iter()
+            .map(|tensor| tensor.name.clone())
+            .collect::<Vec<_>>();
+        write_hfqm_package_mem(&path, HFQ_ARCH_DIFFUSION, "{}", &tensors).unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let mut config = tiny_runtime_config();
+        config.latent_channels = 1;
+        config.transformer = Some(TransformerDenoiserConfig {
+            class_name: "QwenImageTransformer2DModel".into(),
+            in_channels: Some(4),
+            out_channels: Some(1),
+            patch_size: Some(2),
+            num_attention_heads: Some(1),
+            guidance_embeds: Some(true),
+            ..TransformerDenoiserConfig::default()
+        });
+        let topology = transformer_denoiser_weight_topology(&DiffusionComponentMetadata {
+            class_name: Some("QwenImageTransformer2DModel".to_string()),
+            weight_entries,
+            ..DiffusionComponentMetadata::default()
+        });
+
+        let err = NativeTransformerDenoiser::from_hfq(&hfq, &config, &topology).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("guidance-distilled transformer embeddings are not implemented"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_transformer_denoiser_projects_qwen_text_and_output_norm() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-qwen-transformer-projection-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("qwen-transformer-projection.hfq");
+        let mut tensors = qwen_tiny_transformer_denoiser_tensors();
+        tensors.extend([
+            f32_mem_tensor(
+                "transformer/tensors/txt_norm.weight",
+                &[3],
+                &[1.0, 0.5, 2.0],
+            ),
+            f32_mem_tensor(
+                "transformer/tensors/txt_in.weight",
+                &[2, 3],
+                &[1.0, 0.0, 0.25, 0.0, 1.0, -0.5],
+            ),
+            f32_mem_tensor("transformer/tensors/txt_in.bias", &[2], &[0.1, -0.2]),
+            f32_mem_tensor(
+                "transformer/tensors/norm_out.linear.weight",
+                &[4, 2],
+                &[0.0; 8],
+            ),
+            f32_mem_tensor(
+                "transformer/tensors/norm_out.linear.bias",
+                &[4],
+                &[0.1, -0.2, 0.3, -0.4],
+            ),
+        ]);
+        let weight_entries = tensors
+            .iter()
+            .map(|tensor| tensor.name.clone())
+            .collect::<Vec<_>>();
+        write_hfqm_package_mem(&path, HFQ_ARCH_DIFFUSION, "{}", &tensors).unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let mut config = tiny_runtime_config();
+        config.latent_channels = 1;
+        config.transformer = Some(TransformerDenoiserConfig {
+            class_name: "QwenImageTransformer2DModel".into(),
+            in_channels: Some(4),
+            out_channels: Some(1),
+            patch_size: Some(2),
+            num_attention_heads: Some(1),
+            attention_head_dim: Some(2),
+            cross_attention_dim: Some(3),
+            ..TransformerDenoiserConfig::default()
+        });
+        let topology = transformer_denoiser_weight_topology(&DiffusionComponentMetadata {
+            class_name: Some("QwenImageTransformer2DModel".to_string()),
+            weight_entries,
+            ..DiffusionComponentMetadata::default()
+        });
+        let denoiser = NativeTransformerDenoiser::from_hfq(&hfq, &config, &topology).unwrap();
+        let latents = LatentBatch {
+            batch: 1,
+            channels: 1,
+            height: 2,
+            width: 2,
+            data: vec![1.0, -1.0, 0.5, -0.5],
+        };
+        let text_hidden = CpuTensor {
+            shape: vec![1, 1, 3],
+            data: vec![0.5, -0.5, 2.0],
+        };
+        let mut runtime_context =
+            DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+
+        let output = denoiser
+            .forward_qwen_with_runtime_context(
+                &latents,
+                &[1.0],
+                &text_hidden,
+                None,
+                &mut runtime_context,
+            )
+            .unwrap();
+
+        assert_eq!(output.batch, 1);
+        assert_eq!(output.channels, 1);
+        assert_eq!(output.height, 2);
+        assert_eq!(output.width, 2);
+        assert!(output.data.iter().all(|value| value.is_finite()));
+        assert_ne!(output.data, vec![0.0; 4]);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -19132,6 +20306,8 @@ mod tests {
                 1.0,
                 &positive,
                 &negative,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -19204,6 +20380,52 @@ mod tests {
     }
 
     #[test]
+    fn inspect_hfq_marks_guidance_distilled_qwen_transformer_unsupported() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-diffusion-qwen-guidance-runtime-support-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("tiny-qwen-guidance-distilled.hfq");
+        let metadata = tiny_qwen_transformer_runtime_metadata();
+        let tensors = tiny_qwen_transformer_runtime_tensors()
+            .into_iter()
+            .map(|tensor| {
+                if tensor.name == "transformer/config.json" {
+                    bytes_mem_tensor(
+                        "transformer/config.json",
+                        QT_DIFFUSION_JSON,
+                        br#"{"_class_name":"QwenImageTransformer2DModel","in_channels":4,"out_channels":1,"patch_size":2,"num_layers":1,"num_attention_heads":1,"attention_head_dim":2,"joint_attention_dim":2,"guidance_embeds":true}"#,
+                    )
+                } else {
+                    tensor
+                }
+            })
+            .collect::<Vec<_>>();
+        write_hfqm_package_mem(
+            &hfq_path,
+            HFQ_ARCH_DIFFUSION,
+            &serde_json::to_string(&metadata).unwrap(),
+            &tensors,
+        )
+        .unwrap();
+
+        let inspection = inspect_hfq_with_runtime_support(&hfq_path).unwrap();
+        assert!(!inspection.runtime_support.supported);
+        let reason = inspection.runtime_support.reason.unwrap();
+        assert!(reason.contains("guidance_embeds=true"));
+        assert!(reason.contains("guidance-scale embedding path"));
+
+        let pipeline = DiffusionPipeline::open_hfq(&hfq_path).unwrap();
+        assert!(pipeline.native_runtime.is_none());
+        let runtime_error = pipeline.native_runtime_error.unwrap();
+        assert!(runtime_error.contains("guidance_embeds=true"));
+        assert!(runtime_error.contains("guidance-scale embedding path"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn rejects_non_diffusion_metadata() {
         let err = parse_diffusion_metadata(r#"{"artifact_kind":"llm","schema_version":1,"pipeline":{"class_name":"x","source":"x"}}"#)
             .unwrap_err();
@@ -19255,12 +20477,18 @@ mod tests {
             crop_y: 0,
             steps: 20,
             cfg_scale: 7.0,
+            distilled_guidance_scale: None,
             scheduler: "DPM++ 2M".into(),
             subseed_strength: 0.0,
             send_images: true,
             save_images: false,
         };
         assert!(validate_batch_request(&metadata, &request).is_ok());
+
+        let mut distilled_guidance_request = request.clone();
+        distilled_guidance_request.distilled_guidance_scale = Some(4.0);
+        let err = validate_batch_request(&metadata, &distilled_guidance_request).unwrap_err();
+        assert!(err.to_string().contains("must not be silently ignored"));
     }
 
     #[test]
@@ -20770,6 +21998,7 @@ mod tests {
             crop_y: 0,
             steps: 2,
             cfg_scale: 7.0,
+            distilled_guidance_scale: None,
             scheduler: "Euler".into(),
             subseed_strength: 0.0,
             send_images: true,
@@ -20832,6 +22061,7 @@ mod tests {
             crop_y: 0,
             steps: 2,
             cfg_scale: 7.0,
+            distilled_guidance_scale: None,
             scheduler: "Euler".into(),
             subseed_strength: 0.25,
             send_images: true,
@@ -21118,6 +22348,7 @@ mod tests {
             crop_y: 0,
             steps: 2,
             cfg_scale: 1.0,
+            distilled_guidance_scale: None,
             scheduler: "DPM++ 2M".into(),
             subseed_strength: 0.0,
             send_images: true,
@@ -21410,12 +22641,14 @@ mod tests {
             1.0,
             &positive,
             &negative,
-            |sample, _timesteps, _encoder_states, _sdxl_conditioning| {
+            |sample, _timesteps, _encoder_states, _attention_mask, _sdxl_conditioning| {
                 Ok(CpuTensor {
                     shape: sample.shape.clone(),
                     data: vec![0.0; sample.data.len()],
                 })
             },
+            None,
+            None,
             None,
             None,
             None,
@@ -21578,6 +22811,49 @@ mod tests {
     }
 
     #[test]
+    fn denoise_loop_skips_negative_prediction_when_cfg_is_identity() {
+        let latents = LatentBatch {
+            batch: 1,
+            channels: 1,
+            height: 1,
+            width: 2,
+            data: vec![1.0, -1.0],
+        };
+        let schedule = DiffusionSchedule::linear(1).unwrap();
+        let positive = CpuTensor {
+            shape: vec![1, 1, 1],
+            data: vec![1.0],
+        };
+        let negative = CpuTensor {
+            shape: vec![1, 1, 1],
+            data: vec![0.0],
+        };
+        let mut calls = 0usize;
+        let out = denoise_latents_with_cfg(
+            latents,
+            &schedule,
+            1.0,
+            &positive,
+            &negative,
+            |_sample, _timesteps, encoder| {
+                calls += 1;
+                assert_eq!(encoder.data, positive.data);
+                Ok(CpuTensor {
+                    shape: vec![1, 1, 1, 2],
+                    data: vec![0.75, 0.25],
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls, 1);
+        assert_eq!(out.batch, 1);
+        assert_eq!(out.channels, 1);
+        assert_eq!(out.height, 1);
+        assert_eq!(out.width, 2);
+    }
+
+    #[test]
     fn denoise_loop_uses_scheduler_model_input_scaling() {
         let latents = LatentBatch {
             batch: 1,
@@ -21698,6 +22974,7 @@ mod tests {
             crop_y: 0,
             steps: 20,
             cfg_scale: 7.0,
+            distilled_guidance_scale: None,
             scheduler: "DPM++ 2M".into(),
             subseed_strength: 0.0,
             send_images: true,
@@ -21716,6 +22993,75 @@ mod tests {
 
         config.vae_scale_factor = 7;
         assert!(latent_shape_for_request(&config, &request).is_err());
+    }
+
+    #[test]
+    fn latent_shape_rejects_unet_latents_too_small_for_downsampling_depth() {
+        let mut config = StableDiffusionConfig {
+            pipeline_class: "StableDiffusionPipeline".into(),
+            text_encoder: TextEncoderConfig::default(),
+            text_encoder_2: None,
+            unet: UnetConfig {
+                down_block_types: vec![
+                    "CrossAttnDownBlock2D".into(),
+                    "CrossAttnDownBlock2D".into(),
+                    "CrossAttnDownBlock2D".into(),
+                    "DownBlock2D".into(),
+                ],
+                ..UnetConfig::default()
+            },
+            transformer: None,
+            vae: VaeConfig::default(),
+            scheduler: SchedulerConfig::default(),
+            latent_channels: 4,
+            latent_height: None,
+            latent_width: None,
+            vae_scale_factor: 8,
+        };
+        let mut request = DiffusionBatchRequest {
+            conditioning: None,
+            prompts: vec![DiffusionPrompt {
+                prompt: "a".into(),
+                negative_prompt: String::new(),
+                seed: 1,
+                subseed: None,
+            }],
+            width: 8,
+            height: 8,
+            original_width: None,
+            original_height: None,
+            target_width: None,
+            target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
+            crop_x: 0,
+            crop_y: 0,
+            steps: 20,
+            cfg_scale: 7.0,
+            distilled_guidance_scale: None,
+            scheduler: "DPM++ 2M".into(),
+            subseed_strength: 0.0,
+            send_images: true,
+            save_images: false,
+        };
+
+        let err = latent_shape_for_request(&config, &request).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("too small for UNet downsampling depth 3"));
+
+        request.width = 64;
+        request.height = 64;
+        let shape = latent_shape_for_request(&config, &request).unwrap();
+        assert_eq!(shape.width, 8);
+        assert_eq!(shape.height, 8);
+
+        config.transformer = Some(TransformerDenoiserConfig::default());
+        request.width = 8;
+        request.height = 8;
+        let shape = latent_shape_for_request(&config, &request).unwrap();
+        assert_eq!(shape.width, 1);
+        assert_eq!(shape.height, 1);
     }
 
     #[test]
@@ -21770,6 +23116,7 @@ mod tests {
             crop_y: 0,
             steps: 2,
             cfg_scale: 1.0,
+            distilled_guidance_scale: None,
             scheduler: "Euler".into(),
             subseed_strength: 0.0,
             send_images: true,
@@ -21860,6 +23207,7 @@ mod tests {
             crop_y: 0,
             steps: 2,
             cfg_scale: 1.0,
+            distilled_guidance_scale: None,
             scheduler: "Euler".into(),
             subseed_strength: 0.0,
             send_images: true,
@@ -21942,6 +23290,7 @@ mod tests {
             crop_y: 0,
             steps: 2,
             cfg_scale: 1.0,
+            distilled_guidance_scale: None,
             scheduler: "Euler".into(),
             subseed_strength: 0.0,
             send_images: true,
@@ -22030,6 +23379,7 @@ mod tests {
             crop_y: 0,
             steps: 1,
             cfg_scale: 1.0,
+            distilled_guidance_scale: None,
             scheduler: "Euler".into(),
             subseed_strength: 0.0,
             send_images: true,
@@ -22083,6 +23433,7 @@ mod tests {
             crop_y: 16,
             steps: 1,
             cfg_scale: 7.0,
+            distilled_guidance_scale: None,
             scheduler: "Euler".into(),
             subseed_strength: 0.0,
             send_images: false,
@@ -23374,6 +24725,7 @@ mod tests {
             |sample: &CpuTensor,
              _timesteps: &[f32],
              encoder_states: &CpuTensor,
+             _attention_mask: Option<&CpuTensor>,
              _sdxl: Option<&SdxlDenoiseConditioning<'_>>,
              _runtime_context: &mut DiffusionGenerationRuntimeContext| {
                 let bias = encoder_states.data[0];
@@ -23397,6 +24749,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             DiffusionGenerationRuntimeOptions::default(),
             None,
         )
@@ -23408,6 +24762,8 @@ mod tests {
             &positive_embeddings,
             &negative_embeddings,
             predict_noise,
+            None,
+            None,
             None,
             None,
             None,
@@ -24521,6 +25877,7 @@ mod tests {
             crop_y: 0,
             steps: 2,
             cfg_scale: 7.0,
+            distilled_guidance_scale: None,
             scheduler: "Euler".into(),
             subseed_strength: 0.0,
             send_images: true,
@@ -24637,6 +25994,7 @@ mod tests {
             crop_y: 0,
             steps: 2,
             cfg_scale: 7.0,
+            distilled_guidance_scale: None,
             scheduler: "Euler".into(),
             subseed_strength: 0.0,
             send_images: true,
@@ -24749,6 +26107,7 @@ mod tests {
             crop_y: 0,
             steps: 2,
             cfg_scale: 7.0,
+            distilled_guidance_scale: None,
             scheduler: "Euler".into(),
             subseed_strength: 0.0,
             send_images: false,
@@ -24778,6 +26137,178 @@ mod tests {
                 .shape,
             vec![1, 2]
         );
+    }
+
+    #[test]
+    fn diffusion_pipeline_reuses_positive_conditioning_when_cfg_is_identity() {
+        let mut metadata = tiny_runtime_metadata();
+        metadata.pipeline.class_name = "StableDiffusionXLPipeline".into();
+        metadata.tokenizer_2 = Some(DiffusionTokenizerMetadata {
+            kind: "clip-bpe".into(),
+            max_length: Some(4),
+            entries: vec!["tokenizer_2/vocab.json".into()],
+        });
+        let mut config = tiny_runtime_config();
+        config.pipeline_class = "StableDiffusionXLPipeline".into();
+        config.text_encoder_2 = Some(TextEncoderConfig {
+            class_name: "CLIPTextModelWithProjection".into(),
+            hidden_size: Some(2),
+            intermediate_size: Some(4),
+            num_hidden_layers: Some(0),
+            num_attention_heads: Some(1),
+            max_position_embeddings: Some(4),
+            vocab_size: Some(4),
+        });
+        let tokenizer = ClipTokenizer::from_bytes(
+            br#"{
+                "<|startoftext|>": 0,
+                "<|endoftext|>": 1,
+                "a</w>": 2,
+                "cat</w>": 3
+            }"#,
+            b"#version: 0.2\n",
+            4,
+        )
+        .unwrap();
+        let text_encoder = ClipTextEncoder {
+            token_embedding: CpuTensor {
+                shape: vec![4, 2],
+                data: vec![0.0, 0.0, 0.2, 0.1, 0.4, 0.3, 0.6, 0.5],
+            },
+            position_embedding: CpuTensor {
+                shape: vec![4, 2],
+                data: vec![0.0; 8],
+            },
+            layers: Vec::new(),
+            final_layer_norm_weight: CpuTensor {
+                shape: vec![2],
+                data: vec![1.0, 1.0],
+            },
+            final_layer_norm_bias: CpuTensor {
+                shape: vec![2],
+                data: vec![0.0, 0.0],
+            },
+            text_projection: Some(CpuTensor {
+                shape: vec![2, 2],
+                data: vec![1.0, 0.0, 0.0, 1.0],
+            }),
+            hidden_size: 2,
+            max_length: 4,
+            n_heads: 1,
+        };
+        let pipeline = DiffusionPipeline {
+            summary: summarize_hfq(Path::new("/tmp/tiny-sdxl-runtime.hfq"), &metadata),
+            metadata,
+            config,
+            tokenizer: Some(tokenizer.clone()),
+            tokenizer_2: Some(tokenizer),
+            text_encoder: Some(text_encoder.clone()),
+            text_encoder_2: Some(text_encoder),
+            native_runtime: None,
+            native_runtime_error: Some("dual encoder test".into()),
+        };
+        let request = DiffusionBatchRequest {
+            conditioning: None,
+            prompts: vec![DiffusionPrompt {
+                prompt: "a".into(),
+                negative_prompt: "cat".into(),
+                seed: 7,
+                subseed: None,
+            }],
+            width: 2,
+            height: 2,
+            original_width: None,
+            original_height: None,
+            target_width: None,
+            target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
+            crop_x: 0,
+            crop_y: 0,
+            steps: 2,
+            cfg_scale: 1.0,
+            distilled_guidance_scale: None,
+            scheduler: "Euler".into(),
+            subseed_strength: 0.0,
+            send_images: false,
+            save_images: false,
+        };
+
+        let conditioning = pipeline.prepare_conditioning_batch(&request).unwrap();
+
+        assert_eq!(conditioning.negative_tokens, conditioning.prompt_tokens);
+        assert_eq!(conditioning.negative_tokens_2, conditioning.prompt_tokens_2);
+        assert_eq!(
+            conditioning.negative_embeddings,
+            conditioning.prompt_embeddings
+        );
+        assert_eq!(
+            conditioning.negative_embeddings_2,
+            conditioning.prompt_embeddings_2
+        );
+        assert_eq!(
+            conditioning.negative_cross_attention_embeddings,
+            conditioning.prompt_cross_attention_embeddings
+        );
+        assert_eq!(
+            conditioning.negative_pooled_embeddings,
+            conditioning.prompt_pooled_embeddings
+        );
+    }
+
+    #[test]
+    fn diffusion_pipeline_rejects_tiny_unet_latents_before_conditioning() {
+        let metadata = tiny_runtime_metadata();
+        let mut config = tiny_runtime_config();
+        config.vae_scale_factor = 8;
+        config.unet.down_block_types = vec![
+            "CrossAttnDownBlock2D".into(),
+            "CrossAttnDownBlock2D".into(),
+            "CrossAttnDownBlock2D".into(),
+            "DownBlock2D".into(),
+        ];
+        let pipeline = DiffusionPipeline {
+            summary: summarize_hfq(Path::new("/tmp/tiny-runtime.hfq"), &metadata),
+            metadata,
+            config,
+            tokenizer: None,
+            tokenizer_2: None,
+            text_encoder: None,
+            text_encoder_2: None,
+            native_runtime: None,
+            native_runtime_error: Some("synthetic test".into()),
+        };
+        let request = DiffusionBatchRequest {
+            conditioning: None,
+            prompts: vec![DiffusionPrompt {
+                prompt: "a".into(),
+                negative_prompt: String::new(),
+                seed: 7,
+                subseed: None,
+            }],
+            width: 8,
+            height: 8,
+            original_width: None,
+            original_height: None,
+            target_width: None,
+            target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
+            crop_x: 0,
+            crop_y: 0,
+            steps: 2,
+            cfg_scale: 1.0,
+            distilled_guidance_scale: None,
+            scheduler: "Euler".into(),
+            subseed_strength: 0.0,
+            send_images: false,
+            save_images: false,
+        };
+
+        let err = pipeline.prepare_run_plan(&request).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("too small for UNet downsampling depth 3"));
+        assert!(!message.contains("CLIP tokenizer"));
     }
 
     #[test]
@@ -24877,6 +26408,7 @@ mod tests {
             crop_y: 4,
             steps: 2,
             cfg_scale: 7.0,
+            distilled_guidance_scale: None,
             scheduler: "Euler".into(),
             subseed_strength: 0.0,
             send_images: false,
@@ -24918,6 +26450,7 @@ mod tests {
                 crop_y: 0,
                 steps: 2,
                 cfg_scale: 7.0,
+                distilled_guidance_scale: None,
                 scheduler: "Euler".into(),
                 subseed_strength: 0.0,
                 send_images: true,
@@ -24966,6 +26499,7 @@ mod tests {
                 crop_y: 0,
                 steps: 2,
                 cfg_scale: 7.0,
+                distilled_guidance_scale: None,
                 scheduler: "Euler".into(),
                 subseed_strength: 0.0,
                 send_images: true,
@@ -25022,6 +26556,7 @@ mod tests {
                 crop_y: 0,
                 steps: 2,
                 cfg_scale: 7.0,
+                distilled_guidance_scale: None,
                 scheduler: "Euler".into(),
                 subseed_strength: 0.0,
                 send_images: true,
@@ -25099,6 +26634,7 @@ mod tests {
             crop_y: 0,
             steps: 1,
             cfg_scale: 1.0,
+            distilled_guidance_scale: None,
             scheduler: "Euler".into(),
             subseed_strength: 0.0,
             send_images: true,
@@ -25119,9 +26655,137 @@ mod tests {
                 shape: vec![1, 1, 2],
                 data: vec![0.5, -0.5],
             },
+            prompt_attention_mask: None,
+            negative_attention_mask: None,
             prompt_pooled_embeddings: None,
             negative_pooled_embeddings: None,
         });
+
+        let output = pipeline.generate_batch(request).unwrap();
+
+        assert_eq!(output.images.len(), 1);
+        assert_eq!(output.info["backend"], "hipfire-diffusion-hfq");
+        assert_eq!(output.info["pipeline"], "QwenImagePipeline");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&output.images[0])
+            .unwrap();
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        let decoded = image::load_from_memory(&bytes).unwrap().to_rgb8();
+        assert_eq!(decoded.dimensions(), (2, 2));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diffusion_pipeline_qwen_transformer_projects_external_text_width() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-diffusion-qwen-external-projection-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("tiny-qwen-transformer-external-projection.hfq");
+        let mut metadata = tiny_qwen_transformer_runtime_metadata();
+        metadata.components.remove("text_encoder");
+        let mut tensors = tiny_qwen_transformer_runtime_tensors()
+            .into_iter()
+            .filter(|tensor| {
+                !tensor.name.starts_with("text_encoder/")
+                    && !tensor.name.starts_with("tokenizer/")
+                    && tensor.name != "transformer/config.json"
+            })
+            .collect::<Vec<_>>();
+        tensors.push(bytes_mem_tensor(
+            "transformer/config.json",
+            QT_DIFFUSION_JSON,
+            br#"{"_class_name":"QwenImageTransformer2DModel","in_channels":4,"out_channels":1,"patch_size":2,"num_layers":1,"num_attention_heads":1,"attention_head_dim":2,"joint_attention_dim":3}"#,
+        ));
+        tensors.extend([
+            f32_mem_tensor(
+                "transformer/tensors/txt_norm.weight",
+                &[3],
+                &[1.0, 0.5, 2.0],
+            ),
+            f32_mem_tensor(
+                "transformer/tensors/txt_in.weight",
+                &[2, 3],
+                &[1.0, 0.0, 0.25, 0.0, 1.0, -0.5],
+            ),
+            f32_mem_tensor("transformer/tensors/txt_in.bias", &[2], &[0.1, -0.2]),
+            f32_mem_tensor(
+                "transformer/tensors/norm_out.linear.weight",
+                &[4, 2],
+                &[0.0; 8],
+            ),
+            f32_mem_tensor(
+                "transformer/tensors/norm_out.linear.bias",
+                &[4],
+                &[0.1, -0.2, 0.3, -0.4],
+            ),
+        ]);
+        metadata
+            .components
+            .get_mut("transformer")
+            .unwrap()
+            .weight_entries = tensors
+            .iter()
+            .filter(|tensor| tensor.name.starts_with("transformer/tensors/"))
+            .map(|tensor| tensor.name.clone())
+            .collect();
+        write_hfqm_package_mem(
+            &hfq_path,
+            HFQ_ARCH_DIFFUSION,
+            &serde_json::to_string(&metadata).unwrap(),
+            &tensors,
+        )
+        .unwrap();
+        let inspection = inspect_hfq_with_runtime_support(&hfq_path).unwrap();
+        assert!(inspection.runtime_support.supported);
+        let pipeline = DiffusionPipeline::open_hfq(&hfq_path).unwrap();
+        let request = DiffusionBatchRequest {
+            conditioning: Some(DiffusionExternalConditioningBatch {
+                prompt_embeddings: CpuTensor {
+                    shape: vec![1, 1, 3],
+                    data: vec![0.5, -0.5, 2.0],
+                },
+                negative_embeddings: CpuTensor {
+                    shape: vec![1, 1, 3],
+                    data: vec![-0.25, 0.75, 1.5],
+                },
+                prompt_attention_mask: Some(CpuTensor {
+                    shape: vec![1, 1],
+                    data: vec![1.0],
+                }),
+                negative_attention_mask: Some(CpuTensor {
+                    shape: vec![1, 1],
+                    data: vec![1.0],
+                }),
+                prompt_pooled_embeddings: None,
+                negative_pooled_embeddings: None,
+            }),
+            prompts: vec![DiffusionPrompt {
+                prompt: "a cat".into(),
+                negative_prompt: String::new(),
+                seed: 11,
+                subseed: None,
+            }],
+            width: 2,
+            height: 2,
+            original_width: None,
+            original_height: None,
+            target_width: None,
+            target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
+            crop_x: 0,
+            crop_y: 0,
+            steps: 1,
+            cfg_scale: 1.0,
+            distilled_guidance_scale: None,
+            scheduler: "Euler".into(),
+            subseed_strength: 0.0,
+            send_images: true,
+            save_images: false,
+        };
 
         let output = pipeline.generate_batch(request).unwrap();
 
@@ -25243,6 +26907,7 @@ mod tests {
                 crop_y: 0,
                 steps: 2,
                 cfg_scale: 7.0,
+                distilled_guidance_scale: None,
                 scheduler: "Euler".into(),
                 subseed_strength: 0.0,
                 send_images: true,
@@ -25314,6 +26979,7 @@ mod tests {
             crop_y: 0,
             steps: 1,
             cfg_scale: 1.0,
+            distilled_guidance_scale: None,
             scheduler: "Euler".into(),
             subseed_strength: 0.0,
             send_images: true,
@@ -25376,6 +27042,7 @@ mod tests {
             crop_y: 0,
             steps: 1,
             cfg_scale: 1.0,
+            distilled_guidance_scale: None,
             scheduler: "Euler".into(),
             subseed_strength: 0.0,
             send_images: true,
@@ -25440,6 +27107,7 @@ mod tests {
             crop_y: 0,
             steps: 1,
             cfg_scale: 1.0,
+            distilled_guidance_scale: None,
             scheduler: "Euler".into(),
             subseed_strength: 0.0,
             send_images: false,
@@ -25504,6 +27172,7 @@ mod tests {
             crop_y: 0,
             steps: 1,
             cfg_scale: 1.0,
+            distilled_guidance_scale: None,
             scheduler: "Euler".into(),
             subseed_strength: 0.0,
             send_images: true,
@@ -25571,6 +27240,7 @@ mod tests {
             crop_y: 0,
             steps: 1,
             cfg_scale: 1.0,
+            distilled_guidance_scale: None,
             scheduler: "Euler".into(),
             subseed_strength: 0.0,
             send_images: true,
@@ -25637,6 +27307,7 @@ mod tests {
             crop_y: 0,
             steps: 1,
             cfg_scale: 1.0,
+            distilled_guidance_scale: None,
             scheduler: "Euler".into(),
             subseed_strength: 0.0,
             send_images: true,
@@ -25703,6 +27374,7 @@ mod tests {
             crop_y: 0,
             steps: 1,
             cfg_scale: 1.0,
+            distilled_guidance_scale: None,
             scheduler: "Euler".into(),
             subseed_strength: 0.0,
             send_images: true,
@@ -25779,6 +27451,7 @@ mod tests {
                 crop_y: 0,
                 steps: 1,
                 cfg_scale: 1.0,
+                distilled_guidance_scale: None,
                 scheduler: "Euler".into(),
                 subseed_strength: 0.0,
                 send_images: true,
@@ -25846,6 +27519,7 @@ mod tests {
             crop_y: 0,
             steps: 1,
             cfg_scale: 1.0,
+            distilled_guidance_scale: None,
             scheduler: "Euler".into(),
             subseed_strength: 0.0,
             send_images: true,
@@ -25941,6 +27615,7 @@ mod tests {
                 crop_y: 0,
                 steps: 1,
                 cfg_scale: 1.0,
+                distilled_guidance_scale: None,
                 scheduler: "Euler".into(),
                 subseed_strength: 0.0,
                 send_images: true,
@@ -26851,6 +28526,7 @@ mod tests {
             crop_y: 0,
             steps: 1,
             cfg_scale: 1.0,
+            distilled_guidance_scale: None,
             scheduler: "DPM++ 2M".into(),
             subseed_strength: 0.0,
             send_images: true,
@@ -26862,6 +28538,47 @@ mod tests {
         assert_eq!(output.images.len(), 1);
         assert!(output.images[0].starts_with("iVBORw0KGgo"));
         assert_eq!(output.info["backend"], "hipfire-diffusion-hfq");
+    }
+
+    #[test]
+    #[ignore = "real Tiny-SD HFQ shape guard smoke; requires /tmp/hipfire-tiny-sd-diffusion.hfq"]
+    fn tiny_sd_pipeline_rejects_too_small_unet_latents_when_import_exists() {
+        let path = tiny_sd_hfq_path();
+        if skip_missing_tiny_sd(&path) {
+            return;
+        }
+        let pipeline = DiffusionPipeline::open_hfq(&path).unwrap();
+        let request = DiffusionBatchRequest {
+            conditioning: None,
+            prompts: vec![DiffusionPrompt {
+                prompt: "a red robot".into(),
+                negative_prompt: String::new(),
+                seed: 123,
+                subseed: None,
+            }],
+            width: 8,
+            height: 8,
+            original_width: None,
+            original_height: None,
+            target_width: None,
+            target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
+            crop_x: 0,
+            crop_y: 0,
+            steps: 1,
+            cfg_scale: 1.0,
+            distilled_guidance_scale: None,
+            scheduler: "DPM++ 2M".into(),
+            subseed_strength: 0.0,
+            send_images: true,
+            save_images: false,
+        };
+
+        let err = pipeline.prepare_run_plan(&request).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("too small for UNet downsampling depth"));
     }
 
     #[test]
@@ -26898,6 +28615,7 @@ mod tests {
                 crop_y: 0,
                 steps: 1,
                 cfg_scale: 1.0,
+                distilled_guidance_scale: None,
                 scheduler: "DPM++ 2M".into(),
                 subseed_strength: 0.0,
                 send_images: true,
@@ -26947,6 +28665,7 @@ mod tests {
             crop_y: 0,
             steps: 1,
             cfg_scale: 1.0,
+            distilled_guidance_scale: None,
             scheduler: "DPM++ 2M".into(),
             subseed_strength: 0.0,
             send_images: true,
@@ -26976,6 +28695,8 @@ mod tests {
                 request.cfg_scale,
                 positive,
                 negative,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -27637,6 +29358,8 @@ mod tests {
             cfg_scale: f32,
             positive_embeddings: &CpuTensor,
             negative_embeddings: &CpuTensor,
+            _positive_attention_mask: Option<&CpuTensor>,
+            _negative_attention_mask: Option<&CpuTensor>,
             _positive_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
             _negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
             _inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
@@ -27684,6 +29407,8 @@ mod tests {
             cfg_scale: f32,
             positive_embeddings: &CpuTensor,
             negative_embeddings: &CpuTensor,
+            _positive_attention_mask: Option<&CpuTensor>,
+            _negative_attention_mask: Option<&CpuTensor>,
             positive_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
             negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
             _inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
@@ -27730,6 +29455,8 @@ mod tests {
             cfg_scale: f32,
             positive_embeddings: &CpuTensor,
             negative_embeddings: &CpuTensor,
+            _positive_attention_mask: Option<&CpuTensor>,
+            _negative_attention_mask: Option<&CpuTensor>,
             _positive_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
             _negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
             inpaint_conditioning: Option<&InpaintDenoiseConditioning>,

@@ -266,7 +266,7 @@ Inspect a diffusion .hfq artifact and print its server-facing summary
 
 Plan HIP diffusion buffers and optionally run a ROCm device preflight
 
-The preflight command prints a deterministic memory plan for the requested resolution, batch, scheduler, and prompt set. For transformer-denoiser artifacts such as Qwen Image and Krea, the plan includes `transformer_denoiser` patch-token geometry so the denoise buffer is planned as `[batch, sequence_length, token_width]` rather than UNet-style NCHW. Builds compiled with `--features rocm` also initialize the selected HIP device, allocate the planned buffer classes, run a host/device roundtrip probe, and launch currently covered diffusion kernel probes against CPU references.
+The preflight command prints a deterministic memory plan for the requested resolution, batch, scheduler, and prompt set. Builds compiled with `--features rocm` also initialize the selected HIP device, allocate the planned buffer classes, run a host/device roundtrip probe, and launch currently covered diffusion kernel probes against CPU references.
 
 **Usage:** `hipfire diffusion preflight [OPTIONS] --model <MODEL>`
 
@@ -289,6 +289,7 @@ The preflight command prints a deterministic memory plan for the requested resol
 * `--cfg-scale <CFG_SCALE>` — Classifier-free guidance scale
 
   Default value: `7`
+* `--distilled-guidance-scale <DISTILLED_GUIDANCE_SCALE>` — Guidance-distilled model scale, separate from classifier-free guidance
 * `--scheduler <SCHEDULER>` — Scheduler/sampler name
 
   Default value: `Automatic`
@@ -334,6 +335,7 @@ With `--enable-hr`, the command first generates the requested base batch, decode
 * `--cfg-scale <CFG_SCALE>` — Classifier-free guidance scale
 
   Default value: `7`
+* `--distilled-guidance-scale <DISTILLED_GUIDANCE_SCALE>` — Guidance-distilled model scale, separate from classifier-free guidance
 * `--scheduler <SCHEDULER>` — Scheduler/sampler name, such as Automatic, Euler, Euler Karras, DDIM, DPM++ 2M Karras, or DPM++ 3M Karras
 
   Default value: `Automatic`
@@ -381,6 +383,7 @@ Generate PNG images from init images with a diffusion .hfq artifact
 * `--cfg-scale <CFG_SCALE>` — Classifier-free guidance scale
 
   Default value: `7`
+* `--distilled-guidance-scale <DISTILLED_GUIDANCE_SCALE>` — Guidance-distilled model scale, separate from classifier-free guidance
 * `--scheduler <SCHEDULER>` — Scheduler/sampler name, such as Automatic, Euler, Euler Karras, DDIM, DPM++ 2M Karras, or DPM++ 3M Karras
 
   Default value: `Automatic`
@@ -429,6 +432,7 @@ Run an end-to-end diffusion admission smoke and validate output PNGs
 * `--cfg-scale <CFG_SCALE>` — Classifier-free guidance scale
 
   Default value: `1`
+* `--distilled-guidance-scale <DISTILLED_GUIDANCE_SCALE>` — Guidance-distilled model scale, separate from classifier-free guidance
 * `--scheduler <SCHEDULER>` — Scheduler/sampler name
 
   Default value: `Euler`

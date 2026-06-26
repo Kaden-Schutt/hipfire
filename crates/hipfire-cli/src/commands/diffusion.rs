@@ -102,6 +102,9 @@ pub struct DiffusionPreflightArgs {
     /// Classifier-free guidance scale
     #[arg(long, default_value_t = 7.0)]
     pub cfg_scale: f32,
+    /// Guidance-distilled model scale, separate from classifier-free guidance
+    #[arg(long)]
+    pub distilled_guidance_scale: Option<f32>,
     /// Scheduler/sampler name
     #[arg(long, default_value = "Automatic")]
     pub scheduler: String,
@@ -154,6 +157,9 @@ pub struct DiffusionTxt2ImgArgs {
     /// Classifier-free guidance scale
     #[arg(long, default_value_t = 7.0)]
     pub cfg_scale: f32,
+    /// Guidance-distilled model scale, separate from classifier-free guidance
+    #[arg(long)]
+    pub distilled_guidance_scale: Option<f32>,
     /// Scheduler/sampler name, such as Automatic, Euler, Euler Karras, DDIM, DPM++ 2M Karras, or DPM++ 3M Karras
     #[arg(long, default_value = "Automatic")]
     pub scheduler: String,
@@ -224,6 +230,9 @@ pub struct DiffusionImg2ImgArgs {
     /// Classifier-free guidance scale
     #[arg(long, default_value_t = 7.0)]
     pub cfg_scale: f32,
+    /// Guidance-distilled model scale, separate from classifier-free guidance
+    #[arg(long)]
+    pub distilled_guidance_scale: Option<f32>,
     /// Scheduler/sampler name, such as Automatic, Euler, Euler Karras, DDIM, DPM++ 2M Karras, or DPM++ 3M Karras
     #[arg(long, default_value = "Automatic")]
     pub scheduler: String,
@@ -273,6 +282,9 @@ pub struct DiffusionSmokeArgs {
     /// Classifier-free guidance scale
     #[arg(long, default_value_t = 1.0)]
     pub cfg_scale: f32,
+    /// Guidance-distilled model scale, separate from classifier-free guidance
+    #[arg(long)]
+    pub distilled_guidance_scale: Option<f32>,
     /// Scheduler/sampler name
     #[arg(long, default_value = "Euler")]
     pub scheduler: String,
@@ -368,6 +380,7 @@ fn run_preflight(args: DiffusionPreflightArgs) -> anyhow::Result<()> {
         crop_y: 0,
         steps: args.steps,
         cfg_scale: args.cfg_scale,
+        distilled_guidance_scale: args.distilled_guidance_scale,
         scheduler: args.scheduler.clone(),
         subseed_strength: args.subseed_strength,
         send_images: false,
@@ -433,6 +446,7 @@ fn run_txt2img(args: DiffusionTxt2ImgArgs) -> anyhow::Result<()> {
         crop_y: 0,
         steps: args.steps,
         cfg_scale: args.cfg_scale,
+        distilled_guidance_scale: args.distilled_guidance_scale,
         scheduler: args.scheduler.clone(),
         subseed_strength: args.subseed_strength,
         send_images: true,
@@ -676,6 +690,7 @@ fn run_img2img(args: DiffusionImg2ImgArgs) -> anyhow::Result<()> {
             crop_y: 0,
             steps: args.steps,
             cfg_scale: args.cfg_scale,
+            distilled_guidance_scale: args.distilled_guidance_scale,
             scheduler: args.scheduler,
             subseed_strength: args.subseed_strength,
             send_images: true,
@@ -830,6 +845,7 @@ fn smoke_batch_request(args: &DiffusionSmokeArgs, seed: i64) -> DiffusionBatchRe
         crop_y: 0,
         steps: args.steps,
         cfg_scale: args.cfg_scale,
+        distilled_guidance_scale: args.distilled_guidance_scale,
         scheduler: args.scheduler.clone(),
         subseed_strength: 0.0,
         send_images: true,
@@ -1157,6 +1173,7 @@ mod tests {
             firstphase_height: None,
             steps: 1,
             cfg_scale: 1.0,
+            distilled_guidance_scale: None,
             scheduler: "Automatic".to_string(),
             seed: Vec::new(),
             subseed: Vec::new(),
@@ -1182,6 +1199,7 @@ mod tests {
             height: 64,
             steps: 1,
             cfg_scale: 1.0,
+            distilled_guidance_scale: None,
             scheduler: "Euler".to_string(),
             seed: 40,
             batch_size: 3,

@@ -1532,6 +1532,7 @@ dependencies = [
  "hip-bridge",
  "hipfire-runtime",
  "image",
+ "rayon",
  "rdna-compute",
  "regex",
  "serde",
