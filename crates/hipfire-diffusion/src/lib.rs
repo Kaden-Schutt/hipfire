@@ -14,7 +14,7 @@ use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -523,6 +523,61 @@ pub struct TransformerDenoiserConfig {
     pub num_layerwise_text_blocks: Option<usize>,
     pub timestep_embed_dim: Option<usize>,
     pub rope_theta: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransformerDenoiserFamily {
+    QwenImage,
+    Krea2,
+    Unknown,
+}
+
+impl TransformerDenoiserFamily {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::QwenImage => "qwen-image-mmdit",
+            Self::Krea2 => "krea2-mmdit",
+            Self::Unknown => "unknown-transformer",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TransformerDenoiserWeightTopology {
+    family: TransformerDenoiserFamily,
+    block_count: usize,
+    has_input_projection: bool,
+    has_output_projection: bool,
+    has_text_modulation: bool,
+    has_text_fusion: bool,
+}
+
+impl TransformerDenoiserWeightTopology {
+    fn diagnostic_label(&self) -> String {
+        let mut features = Vec::new();
+        if self.has_input_projection {
+            features.push("img_in");
+        }
+        if self.has_output_projection {
+            features.push("output");
+        }
+        if self.has_text_modulation {
+            features.push("text_modulation");
+        }
+        if self.has_text_fusion {
+            features.push("text_fusion");
+        }
+        let feature_label = if features.is_empty() {
+            "no recognized transformer weights".to_string()
+        } else {
+            features.join(",")
+        };
+        format!(
+            "{} blocks={} features={feature_label}",
+            self.family.as_str(),
+            self.block_count
+        )
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -13125,6 +13180,63 @@ fn default_transformer_patch_size(class_name: &str) -> Option<usize> {
     }
 }
 
+fn transformer_denoiser_weight_topology(
+    component: &DiffusionComponentMetadata,
+) -> TransformerDenoiserWeightTopology {
+    let class_name = component.class_name.as_deref().unwrap_or_default();
+    let mut blocks = BTreeSet::new();
+    let mut has_input_projection = false;
+    let mut has_output_projection = false;
+    let mut has_text_modulation = false;
+    let mut has_text_fusion = false;
+
+    for entry in &component.weight_entries {
+        let name = entry
+            .strip_prefix("transformer/tensors/")
+            .unwrap_or(entry.as_str());
+        has_input_projection |= matches!(name, "img_in.weight" | "img_in.bias");
+        has_output_projection |= matches!(
+            name,
+            "proj_out.weight"
+                | "proj_out.bias"
+                | "norm_out.linear.weight"
+                | "norm_out.linear.bias"
+                | "final_layer.linear.weight"
+                | "final_layer.linear.bias"
+        );
+        has_text_modulation |= name.contains(".txt_mod.")
+            || name.contains(".txt_mlp.")
+            || name.contains(".attn.add_q_proj.")
+            || name.contains(".attn.add_k_proj.")
+            || name.contains(".attn.add_v_proj.");
+        has_text_fusion |= name.starts_with("text_fusion.");
+        if let Some(rest) = name.strip_prefix("transformer_blocks.") {
+            if let Some((idx, _)) = rest.split_once('.') {
+                if let Ok(idx) = idx.parse::<usize>() {
+                    blocks.insert(idx);
+                }
+            }
+        }
+    }
+
+    let family = match class_name {
+        "QwenImageTransformer2DModel" => TransformerDenoiserFamily::QwenImage,
+        "Krea2Transformer2DModel" => TransformerDenoiserFamily::Krea2,
+        _ if has_text_fusion => TransformerDenoiserFamily::Krea2,
+        _ if has_text_modulation => TransformerDenoiserFamily::QwenImage,
+        _ => TransformerDenoiserFamily::Unknown,
+    };
+
+    TransformerDenoiserWeightTopology {
+        family,
+        block_count: blocks.len(),
+        has_input_projection,
+        has_output_projection,
+        has_text_modulation,
+        has_text_fusion,
+    }
+}
+
 fn component_json(
     hfq: &HfqFile,
     metadata: &DiffusionHfqMetadata,
@@ -14083,10 +14195,11 @@ fn native_runtime_metadata_support_error(metadata: &DiffusionHfqMetadata) -> Opt
         );
     }
     if !is_native_unet_pipeline_class(&metadata.pipeline.class_name) {
-        let denoiser = if metadata.components.contains_key("transformer") {
-            "transformer denoiser"
+        let denoiser = if let Some(transformer) = metadata.components.get("transformer") {
+            let topology = transformer_denoiser_weight_topology(transformer);
+            format!("transformer denoiser ({})", topology.diagnostic_label())
         } else {
-            "unsupported denoiser"
+            "unsupported denoiser".to_string()
         };
         return Some(format!(
             "native diffusion runtime currently supports Stable Diffusion UNet-family pipelines only; artifact pipeline {:?} uses a {denoiser} and requires a matching diffusion runtime",
@@ -15953,6 +16066,57 @@ mod tests {
         assert!(error.contains("Stable Diffusion UNet-family"));
         assert!(error.contains("Krea2Pipeline"));
         assert!(error.contains("transformer denoiser"));
+        assert!(error.contains("krea2-mmdit"));
+    }
+
+    #[test]
+    fn transformer_topology_detects_qwen_image_layout() {
+        let topology = transformer_denoiser_weight_topology(&DiffusionComponentMetadata {
+            class_name: Some("QwenImageTransformer2DModel".to_string()),
+            config_entry: Some("transformer/config.json".to_string()),
+            weight_entries: vec![
+                "transformer/tensors/img_in.weight".to_string(),
+                "transformer/tensors/proj_out.weight".to_string(),
+                "transformer/tensors/transformer_blocks.0.attn.add_q_proj.weight".to_string(),
+                "transformer/tensors/transformer_blocks.0.txt_mod.1.weight".to_string(),
+                "transformer/tensors/transformer_blocks.1.img_mlp.net.0.proj.weight".to_string(),
+            ],
+            tensor_roles: Vec::new(),
+        });
+
+        assert_eq!(topology.family, TransformerDenoiserFamily::QwenImage);
+        assert_eq!(topology.block_count, 2);
+        assert!(topology.has_input_projection);
+        assert!(topology.has_output_projection);
+        assert!(topology.has_text_modulation);
+        assert!(!topology.has_text_fusion);
+        assert!(topology
+            .diagnostic_label()
+            .contains("qwen-image-mmdit blocks=2"));
+    }
+
+    #[test]
+    fn transformer_topology_detects_krea2_layout() {
+        let topology = transformer_denoiser_weight_topology(&DiffusionComponentMetadata {
+            class_name: Some("Krea2Transformer2DModel".to_string()),
+            config_entry: Some("transformer/config.json".to_string()),
+            weight_entries: vec![
+                "transformer/tensors/img_in.weight".to_string(),
+                "transformer/tensors/final_layer.linear.weight".to_string(),
+                "transformer/tensors/text_fusion.projector.weight".to_string(),
+                "transformer/tensors/transformer_blocks.0.attn.to_q.weight".to_string(),
+                "transformer/tensors/transformer_blocks.27.ff.down.weight".to_string(),
+            ],
+            tensor_roles: Vec::new(),
+        });
+
+        assert_eq!(topology.family, TransformerDenoiserFamily::Krea2);
+        assert_eq!(topology.block_count, 2);
+        assert!(topology.has_input_projection);
+        assert!(topology.has_output_projection);
+        assert!(!topology.has_text_modulation);
+        assert!(topology.has_text_fusion);
+        assert!(topology.diagnostic_label().contains("krea2-mmdit"));
     }
 
     #[test]
