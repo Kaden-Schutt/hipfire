@@ -88,13 +88,15 @@ enum Command {
     /// generate the initial noise at the requested source dimensions and resize
     /// it to the target latent shape before sampling. Hipfire also accepts
     /// common WebUI generation fields such as `styles`, `restore_faces`,
-    /// `tiling`, `do_not_save_samples`, `do_not_save_grid`, `eta`, `s_churn`,
+    /// `tiling`, `eta`, `s_churn`,
     /// `s_tmin`, `s_tmax`, `s_noise`, `override_settings_restore_afterwards`,
     /// `disable_extra_networks`, and `comments`; fields that do not affect the
     /// native runtime are returned in response `parameters` and listed in
     /// `info.ignored_fields` when active.
     /// `do_not_save_samples` suppresses disk writes even when `save_images` is
-    /// true. Masked img2img also honors
+    /// true. `return_grid` appends a generated batch grid to the response image
+    /// list for multi-image outputs, and `do_not_save_grid` suppresses grid disk
+    /// writes independently of sample writes. Masked img2img also honors
     /// WebUI's `inpainting_mask_invert`, `mask_blur`,
     /// `mask_blur_x`, `mask_blur_y`, `mask_round`, and `inpainting_fill`
     /// options; default fill (0) is applied in image space before VAE encode,

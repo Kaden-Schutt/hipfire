@@ -87,6 +87,7 @@ pub struct SdGenerationRequest {
     pub n_iter: Option<u32>,
     pub send_images: Option<bool>,
     pub save_images: Option<bool>,
+    pub return_grid: Option<bool>,
     pub force_task_id: Option<String>,
     pub infotext: Option<String>,
     pub init_images: Option<Vec<String>>,
@@ -730,25 +731,88 @@ fn finalize_hfq_diffusion_response(
             Err(error) => return diffusion_error_response(error),
         }
     }
+    let sample_count = output.images.len();
+    let grid_image = if sdapi_should_return_grid(&body, sample_count)
+        || sdapi_should_save_grid(&body, sample_count)
+    {
+        match build_sdapi_image_grid(&output.images)
+            .and_then(|grid| encode_rgb_batch_png_base64(&grid))
+            .and_then(|images| annotate_sdapi_images(&images, &infotext))
+            .and_then(|mut images| {
+                images.pop().ok_or_else(|| {
+                    DiffusionError::Io("SDAPI grid encoder produced no image".to_string())
+                })
+            }) {
+            Ok(image) => Some(image),
+            Err(error) => return diffusion_error_response(error),
+        }
+    } else {
+        None
+    };
+
+    let mut saved_paths = Vec::new();
+    let mut sample_images_saved = false;
+    let mut grid_images_saved = false;
+    if sdapi_should_save_images(&body) {
+        match save_sdapi_images_with_kind(&body, mode, "sample", &output.images) {
+            Ok(paths) => {
+                sample_images_saved = !paths.is_empty();
+                saved_paths.extend(paths);
+            }
+            Err(error) => return diffusion_error_response(error),
+        }
+    }
+    if sdapi_should_save_grid(&body, sample_count) {
+        if let Some(image) = grid_image.as_ref() {
+            match save_sdapi_images_with_kind(&body, mode, "grid", std::slice::from_ref(image)) {
+                Ok(paths) => {
+                    grid_images_saved = !paths.is_empty();
+                    saved_paths.extend(paths);
+                }
+                Err(error) => return diffusion_error_response(error),
+            }
+        }
+    }
+
+    if body.return_grid.unwrap_or(false) {
+        if let Some(image) = grid_image {
+            output.images.push(image);
+        }
+    }
+
     if let Value::Object(map) = &mut output.info {
         map.insert(
             "infotexts".to_string(),
             json!(vec![infotext.clone(); output.images.len()]),
         );
+        if body.return_grid.unwrap_or(false) {
+            map.insert(
+                "return_grid".to_string(),
+                json!(output.images.len() > sample_count),
+            );
+        }
+        if sample_count > 1 {
+            map.insert(
+                "grid_images".to_string(),
+                json!(usize::from(output.images.len() > sample_count)),
+            );
+            map.insert("save_grid".to_string(), json!(grid_images_saved));
+        }
+        if !saved_paths.is_empty() {
+            map.insert("saved_images".to_string(), json!(saved_paths));
+            map.insert(
+                "save_images".to_string(),
+                json!(sample_images_saved || grid_images_saved),
+            );
+            map.insert(
+                "sample_images_saved".to_string(),
+                json!(sample_images_saved),
+            );
+            map.insert("grid_images_saved".to_string(), json!(grid_images_saved));
+        }
         let ignored_fields = sdapi_ignored_generation_fields(&body);
         if !ignored_fields.is_empty() {
             map.insert("ignored_fields".to_string(), json!(ignored_fields));
-        }
-    }
-    if sdapi_should_save_images(&body) {
-        match save_sdapi_images(&body, mode, &output.images) {
-            Ok(paths) => {
-                if let Value::Object(map) = &mut output.info {
-                    map.insert("saved_images".to_string(), json!(paths));
-                    map.insert("save_images".to_string(), json!(true));
-                }
-            }
-            Err(error) => return diffusion_error_response(error),
         }
     }
     let images = if original_send_images {
@@ -769,6 +833,14 @@ fn sdapi_should_save_images(body: &SdGenerationRequest) -> bool {
     body.save_images.unwrap_or(false) && !body.do_not_save_samples.unwrap_or(false)
 }
 
+fn sdapi_should_return_grid(body: &SdGenerationRequest, sample_count: usize) -> bool {
+    body.return_grid.unwrap_or(false) && sample_count > 1
+}
+
+fn sdapi_should_save_grid(body: &SdGenerationRequest, sample_count: usize) -> bool {
+    body.save_images.unwrap_or(false) && !body.do_not_save_grid.unwrap_or(false) && sample_count > 1
+}
+
 fn sdapi_ignored_generation_fields(body: &SdGenerationRequest) -> Vec<&'static str> {
     let mut fields = Vec::new();
     if body
@@ -783,9 +855,6 @@ fn sdapi_ignored_generation_fields(body: &SdGenerationRequest) -> Vec<&'static s
     }
     if body.tiling.unwrap_or(false) {
         fields.push("tiling");
-    }
-    if body.do_not_save_grid.unwrap_or(false) {
-        fields.push("do_not_save_grid");
     }
     if body.eta.is_some() {
         fields.push("eta");
@@ -1330,9 +1399,64 @@ fn annotate_sdapi_images(images: &[String], infotext: &str) -> Result<Vec<String
         .collect()
 }
 
-fn save_sdapi_images(
+fn build_sdapi_image_grid(images: &[String]) -> Result<RgbImageBatch, DiffusionError> {
+    if images.len() < 2 {
+        return Err(DiffusionError::InvalidRequest(
+            "SDAPI grid requires at least two images".to_string(),
+        ));
+    }
+    let decoded = decode_sd_init_images(images)?;
+    let cols = (decoded.batch as f64).sqrt().ceil() as usize;
+    let cols = cols.max(1);
+    let rows = decoded.batch.div_ceil(cols);
+    let grid_width = decoded
+        .width
+        .checked_mul(cols)
+        .ok_or_else(|| DiffusionError::InvalidRequest("SDAPI grid width overflows".to_string()))?;
+    let grid_height = decoded
+        .height
+        .checked_mul(rows)
+        .ok_or_else(|| DiffusionError::InvalidRequest("SDAPI grid height overflows".to_string()))?;
+    let grid_len = grid_width
+        .checked_mul(grid_height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| {
+            DiffusionError::InvalidRequest("SDAPI grid image dimensions overflow".to_string())
+        })?;
+    let image_len = decoded
+        .width
+        .checked_mul(decoded.height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| {
+            DiffusionError::InvalidRequest(
+                "SDAPI grid source image dimensions overflow".to_string(),
+            )
+        })?;
+    let mut data = vec![0u8; grid_len];
+    for image_idx in 0..decoded.batch {
+        let row = image_idx / cols;
+        let col = image_idx % cols;
+        let source_offset = image_idx * image_len;
+        for y in 0..decoded.height {
+            let source_row = source_offset + y * decoded.width * 3;
+            let target_row = ((row * decoded.height + y) * grid_width + col * decoded.width) * 3;
+            let bytes = decoded.width * 3;
+            data[target_row..target_row + bytes]
+                .copy_from_slice(&decoded.data[source_row..source_row + bytes]);
+        }
+    }
+    Ok(RgbImageBatch {
+        batch: 1,
+        width: grid_width,
+        height: grid_height,
+        data,
+    })
+}
+
+fn save_sdapi_images_with_kind(
     body: &SdGenerationRequest,
     mode: &str,
+    kind: &str,
     images: &[String],
 ) -> Result<Vec<String>, DiffusionError> {
     let output_dir = sdapi_output_dir(body, mode);
@@ -1359,7 +1483,7 @@ fn save_sdapi_images(
             )));
         }
         let path = output_dir.join(format!(
-            "hipfire-{mode}-{timestamp}-{}-{idx}.png",
+            "hipfire-{mode}-{kind}-{timestamp}-{}-{idx}.png",
             std::process::id()
         ));
         let mut file = fs::File::create(&path).map_err(|error| {
@@ -4254,7 +4378,6 @@ mod tests {
             "styles",
             "restore_faces",
             "tiling",
-            "do_not_save_grid",
             "eta",
             "s_churn",
             "s_tmax",
@@ -4267,6 +4390,7 @@ mod tests {
             assert!(ignored.contains(&json!(field)), "missing {field}");
         }
         assert!(!ignored.contains(&json!("seed_resize_from")));
+        assert!(!ignored.contains(&json!("do_not_save_grid")));
         assert_eq!(info["seed_resize_from_w"], 128);
         assert_eq!(info["seed_resize_from_h"], 128);
         let _ = std::fs::remove_dir_all(&dir);
@@ -4420,6 +4544,101 @@ mod tests {
         assert_eq!(body["parameters"]["do_not_save_samples"], true);
         let info = serde_json::from_str::<Value>(body["info"].as_str().unwrap()).unwrap();
         assert!(info.get("saved_images").is_none());
+        assert!(!output_dir.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn txt2img_route_saves_grid_when_samples_are_suppressed() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-sdapi-diffusion-grid-save-route-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("tiny-route-diffusion-grid-save.hfq");
+        let output_dir = dir.join("outputs");
+        write_tiny_diffusion_hfq(&hfq_path);
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let body = SdGenerationRequest {
+            prompt: "a grid-save cat".to_string(),
+            model: Some(hfq_path.to_string_lossy().into_owned()),
+            steps: Some(1),
+            cfg_scale: Some(1.0),
+            width: Some(2),
+            height: Some(2),
+            batch_size: Some(2),
+            send_images: Some(false),
+            save_images: Some(true),
+            do_not_save_samples: Some(true),
+            override_settings: Some(json!({
+                "outdir_txt2img_samples": output_dir,
+            })),
+            ..empty_request()
+        };
+
+        let response = post_txt2img(State(state), Json(body)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+
+        assert!(body["images"].as_array().unwrap().is_empty());
+        let info = serde_json::from_str::<Value>(body["info"].as_str().unwrap()).unwrap();
+        assert_eq!(info["save_images"], true);
+        assert_eq!(info["sample_images_saved"], false);
+        assert_eq!(info["grid_images_saved"], true);
+        assert_eq!(info["save_grid"], true);
+        let saved = info["saved_images"].as_array().unwrap();
+        assert_eq!(saved.len(), 1);
+        let saved_path = PathBuf::from(saved[0].as_str().unwrap());
+        assert!(saved_path.is_file());
+        assert!(saved_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("-grid-"));
+        let bytes = std::fs::read(saved_path).unwrap();
+        assert_eq!(png_dimensions(&bytes), (4, 2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn txt2img_route_honors_do_not_save_grid() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-sdapi-diffusion-no-grid-save-route-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("tiny-route-diffusion-no-grid-save.hfq");
+        let output_dir = dir.join("outputs");
+        write_tiny_diffusion_hfq(&hfq_path);
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let body = SdGenerationRequest {
+            prompt: "a no-grid-save cat".to_string(),
+            model: Some(hfq_path.to_string_lossy().into_owned()),
+            steps: Some(1),
+            cfg_scale: Some(1.0),
+            width: Some(2),
+            height: Some(2),
+            batch_size: Some(2),
+            send_images: Some(false),
+            save_images: Some(true),
+            do_not_save_samples: Some(true),
+            do_not_save_grid: Some(true),
+            override_settings: Some(json!({
+                "outdir_txt2img_samples": output_dir,
+            })),
+            ..empty_request()
+        };
+
+        let response = post_txt2img(State(state), Json(body)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+
+        assert!(body["images"].as_array().unwrap().is_empty());
+        let info = serde_json::from_str::<Value>(body["info"].as_str().unwrap()).unwrap();
+        assert!(info.get("saved_images").is_none());
+        assert_eq!(info["save_grid"], false);
         assert!(!output_dir.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5302,6 +5521,51 @@ mod tests {
         let info = serde_json::from_str::<Value>(body["info"].as_str().unwrap()).unwrap();
         assert_eq!(info["batch_size"], 2);
         assert_eq!(info["seeds"], json!([10, 11]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn txt2img_route_returns_grid_when_requested_for_batch() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-sdapi-diffusion-return-grid-route-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("tiny-route-diffusion-return-grid.hfq");
+        write_tiny_diffusion_hfq(&hfq_path);
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let body = SdGenerationRequest {
+            prompt: "a grid cat".to_string(),
+            model: Some(hfq_path.to_string_lossy().into_owned()),
+            seed: Some(10),
+            steps: Some(1),
+            cfg_scale: Some(1.0),
+            width: Some(2),
+            height: Some(2),
+            batch_size: Some(2),
+            n_iter: Some(1),
+            send_images: Some(true),
+            save_images: Some(false),
+            return_grid: Some(true),
+            ..empty_request()
+        };
+
+        let response = post_txt2img(State(state), Json(body)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+
+        let images = body["images"].as_array().unwrap();
+        assert_eq!(images.len(), 3);
+        let grid = base64::engine::general_purpose::STANDARD
+            .decode(images[2].as_str().unwrap())
+            .unwrap();
+        assert_eq!(png_dimensions(&grid), (4, 2));
+        let info = serde_json::from_str::<Value>(body["info"].as_str().unwrap()).unwrap();
+        assert_eq!(info["batch_size"], 2);
+        assert_eq!(info["return_grid"], true);
+        assert_eq!(info["grid_images"], 1);
+        assert_eq!(info["infotexts"].as_array().unwrap().len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7008,6 +7272,7 @@ mod tests {
             n_iter: None,
             send_images: None,
             save_images: None,
+            return_grid: None,
             force_task_id: None,
             infotext: None,
             init_images: None,
@@ -7056,6 +7321,15 @@ mod tests {
             max_tokens: None,
             stop: None,
         }
+    }
+
+    fn png_dimensions(bytes: &[u8]) -> (u32, u32) {
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert_eq!(&bytes[12..16], b"IHDR");
+        (
+            u32::from_be_bytes(bytes[16..20].try_into().unwrap()),
+            u32::from_be_bytes(bytes[20..24].try_into().unwrap()),
+        )
     }
 
     fn write_tiny_diffusion_hfq(path: &Path) {
