@@ -37,8 +37,8 @@ use crate::evidence::{
 #[cfg(feature = "arch-lfm2moe")]
 use crate::generate_arch::generate_lfm2moe;
 use crate::generate_arch::{
-    generate_deepseek4, generate_gemma3, generate_llama, generate_minimax, generate_nemotron,
-    generate_qwen2,
+    generate_deepseek4, generate_gemma3, generate_gemma3_vl_text, generate_llama, generate_minimax,
+    generate_nemotron, generate_qwen2,
 };
 use crate::model::{effective_raw, LoadedModel};
 use crate::output_filter::chat_output_filter;
@@ -1977,6 +1977,37 @@ pub fn generate(
             prefill_already_done,
         );
         generate_gemma3(
+            m,
+            gpu,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            temp,
+            top_p,
+            max_tokens,
+            repeat_penalty,
+            repeat_window,
+        );
+        return;
+    }
+    if m.arch_id == 13 {
+        // arch_id=13 (gemma3-vl / full MedGemma) with no media payload. Image and
+        // video requests are routed in the daemon VL branch before calling this
+        // text generate path; plain prompts reuse the VL backend's text-only
+        // `ServingBackend::serve` path with an empty image slice.
+        let _ = (
+            budget_alert_at_tok,
+            budget_alert_text,
+            max_think_tokens,
+            assistant_prefix,
+            pflash_state,
+            pflash_cfg,
+            tools,
+            messages_history,
+            prefill_already_done,
+        );
+        generate_gemma3_vl_text(
             m,
             gpu,
             stdout,

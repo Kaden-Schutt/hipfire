@@ -2090,3 +2090,70 @@ pub fn generate_gemma3(
         emit_error_with_id(stdout, id, format!("gemma3 serve: {e}"));
     }
 }
+
+/// Gemma3-VL text-only generate path (arch_id=13, e.g. full MedGemma).
+///
+/// The image-bearing daemon route lives in `generate_vl_gemma3`; this handles
+/// ordinary text requests against the multimodal artifact by reusing the same
+/// Gemma3 chat framing as arch_id=12 and passing an empty image slice into the
+/// VL backend's `ServingBackend::serve`.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_gemma3_vl_text(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+) {
+    let mut framed = String::from("<bos><start_of_turn>user\n");
+    if let Some(sys) = system_prompt.filter(|s| !s.is_empty()) {
+        framed.push_str(sys);
+        framed.push_str("\n\n");
+    }
+    framed.push_str(prompt);
+    framed.push_str("<end_of_turn>\n<start_of_turn>model\n");
+
+    if m.tokenizer.is_none() {
+        emit_error_with_id(stdout, id, "tokenizer not loaded".to_string());
+        return;
+    }
+    if m.gemma3_vl.is_none() {
+        emit_error_with_id(
+            stdout,
+            id,
+            "gemma3-vl backend not loaded (arch 13 not active)".to_string(),
+        );
+        return;
+    }
+
+    let tok = m.tokenizer.as_ref().unwrap();
+    let backend = m.gemma3_vl.as_mut().unwrap();
+
+    let no_images: [&[u8]; 0] = [];
+    let mut ctx = GenerateCtx {
+        id,
+        prompt: &framed,
+        temperature: temp,
+        top_p,
+        max_tokens,
+        repeat_penalty,
+        repeat_window,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        max_think_tokens: 0,
+        stop_sequences: &[],
+        images: &no_images,
+        sink: stdout,
+    };
+    let result = backend.serve(gpu, tok, &mut ctx);
+    drop(ctx);
+    if let Err(e) = result {
+        emit_error_with_id(stdout, id, format!("gemma3-vl serve: {e}"));
+    }
+}
