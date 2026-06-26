@@ -6354,6 +6354,277 @@ impl NativeTransformerAttentionProjection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
+enum TransformerFeedForwardActivation {
+    GeGlu,
+    SwiGlu,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+struct TransformerFeedForwardStream {
+    stream_label: &'static str,
+    activation: TransformerFeedForwardActivation,
+    hidden_width: usize,
+    inner_width: usize,
+    proj_weight: Option<CpuTensor>,
+    proj_bias: Option<CpuTensor>,
+    up_weight: Option<CpuTensor>,
+    up_bias: Option<CpuTensor>,
+    gate_weight: Option<CpuTensor>,
+    gate_bias: Option<CpuTensor>,
+    down_weight: CpuTensor,
+    down_bias: Option<CpuTensor>,
+}
+
+#[allow(dead_code)]
+impl TransformerFeedForwardStream {
+    fn qwen_geglu_from_hfq(
+        hfq: &HfqFile,
+        stream_label: &'static str,
+        prefix: &str,
+    ) -> DiffusionResult<Self> {
+        let proj_weight = CpuTensor::from_hfq(hfq, &format!("{prefix}.net.0.proj.weight"))?;
+        let proj_bias = CpuTensor::from_hfq(hfq, &format!("{prefix}.net.0.proj.bias"))?;
+        let down_weight = CpuTensor::from_hfq(hfq, &format!("{prefix}.net.2.weight"))?;
+        let down_bias = CpuTensor::from_hfq(hfq, &format!("{prefix}.net.2.bias"))?;
+        let [projected_width, hidden_width] = shape2(&proj_weight)?;
+        if projected_width == 0 || projected_width % 2 != 0 {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "{stream_label} transformer GEGLU projection shape {:?} is not [2*inner, hidden]",
+                proj_weight.shape
+            )));
+        }
+        let inner_width = projected_width / 2;
+        if proj_bias.shape.as_slice() != [projected_width] {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "{stream_label} transformer GEGLU projection bias shape {:?} != [{projected_width}]",
+                proj_bias.shape
+            )));
+        }
+        validate_transformer_ff_down_shape(
+            stream_label,
+            &down_weight,
+            Some(&down_bias),
+            hidden_width,
+            inner_width,
+        )?;
+        Ok(Self {
+            stream_label,
+            activation: TransformerFeedForwardActivation::GeGlu,
+            hidden_width,
+            inner_width,
+            proj_weight: Some(proj_weight),
+            proj_bias: Some(proj_bias),
+            up_weight: None,
+            up_bias: None,
+            gate_weight: None,
+            gate_bias: None,
+            down_weight,
+            down_bias: Some(down_bias),
+        })
+    }
+
+    fn krea_swiglu_from_hfq(
+        hfq: &HfqFile,
+        stream_label: &'static str,
+        prefix: &str,
+    ) -> DiffusionResult<Self> {
+        let up_weight = CpuTensor::from_hfq(hfq, &format!("{prefix}.up.weight"))?;
+        let gate_weight = CpuTensor::from_hfq(hfq, &format!("{prefix}.gate.weight"))?;
+        let down_weight = CpuTensor::from_hfq(hfq, &format!("{prefix}.down.weight"))?;
+        let up_bias = optional_tensor(hfq, &format!("{prefix}.up.bias"))?;
+        let gate_bias = optional_tensor(hfq, &format!("{prefix}.gate.bias"))?;
+        let down_bias = optional_tensor(hfq, &format!("{prefix}.down.bias"))?;
+        let [inner_width, hidden_width] = shape2(&up_weight)?;
+        if inner_width == 0 || hidden_width == 0 {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "{stream_label} transformer SwiGLU up projection shape {:?} is empty",
+                up_weight.shape
+            )));
+        }
+        if gate_weight.shape.as_slice() != [inner_width, hidden_width] {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "{stream_label} transformer SwiGLU gate weight shape {:?} != [{inner_width}, {hidden_width}]",
+                gate_weight.shape
+            )));
+        }
+        validate_attention_bias_shape(stream_label, "ff.up", up_bias.as_ref(), inner_width)?;
+        validate_attention_bias_shape(stream_label, "ff.gate", gate_bias.as_ref(), inner_width)?;
+        validate_transformer_ff_down_shape(
+            stream_label,
+            &down_weight,
+            down_bias.as_ref(),
+            hidden_width,
+            inner_width,
+        )?;
+        Ok(Self {
+            stream_label,
+            activation: TransformerFeedForwardActivation::SwiGlu,
+            hidden_width,
+            inner_width,
+            proj_weight: None,
+            proj_bias: None,
+            up_weight: Some(up_weight),
+            up_bias,
+            gate_weight: Some(gate_weight),
+            gate_bias,
+            down_weight,
+            down_bias,
+        })
+    }
+
+    fn forward_with_runtime_context(
+        &self,
+        hidden: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
+        let [_, _, width] = shape3(hidden)?;
+        if width != self.hidden_width {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "{} transformer feed-forward hidden width {width} != expected {}",
+                self.stream_label, self.hidden_width
+            )));
+        }
+        let activated = match self.activation {
+            TransformerFeedForwardActivation::GeGlu => {
+                let proj_weight = self.proj_weight.as_ref().ok_or_else(|| {
+                    DiffusionError::InvalidMetadata(
+                        "GEGLU transformer feed-forward projection weight is missing".into(),
+                    )
+                })?;
+                let proj_bias = self.proj_bias.as_ref().ok_or_else(|| {
+                    DiffusionError::InvalidMetadata(
+                        "GEGLU transformer feed-forward projection bias is missing".into(),
+                    )
+                })?;
+                let projected = linear_3d_with_runtime_context(
+                    hidden,
+                    proj_weight,
+                    Some(proj_bias),
+                    runtime_context,
+                )?;
+                geglu_gate_3d_with_runtime_context(&projected, runtime_context)?
+            }
+            TransformerFeedForwardActivation::SwiGlu => {
+                let up_weight = self.up_weight.as_ref().ok_or_else(|| {
+                    DiffusionError::InvalidMetadata(
+                        "SwiGLU transformer feed-forward up weight is missing".into(),
+                    )
+                })?;
+                let gate_weight = self.gate_weight.as_ref().ok_or_else(|| {
+                    DiffusionError::InvalidMetadata(
+                        "SwiGLU transformer feed-forward gate weight is missing".into(),
+                    )
+                })?;
+                let up = linear_3d_with_runtime_context(
+                    hidden,
+                    up_weight,
+                    self.up_bias.as_ref(),
+                    runtime_context,
+                )?;
+                let gate = linear_3d_with_runtime_context(
+                    hidden,
+                    gate_weight,
+                    self.gate_bias.as_ref(),
+                    runtime_context,
+                )?;
+                swiglu_gate_3d(&up, &gate)?
+            }
+        };
+        linear_3d_with_runtime_context(
+            &activated,
+            &self.down_weight,
+            self.down_bias.as_ref(),
+            runtime_context,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+struct NativeTransformerFeedForward {
+    family: TransformerDenoiserFamily,
+    block_index: usize,
+    hidden_width: usize,
+    image: TransformerFeedForwardStream,
+    text: Option<TransformerFeedForwardStream>,
+}
+
+#[allow(dead_code)]
+impl NativeTransformerFeedForward {
+    fn from_hfq(
+        hfq: &HfqFile,
+        family: TransformerDenoiserFamily,
+        block_index: usize,
+    ) -> DiffusionResult<Self> {
+        let block_prefix = format!("transformer/tensors/transformer_blocks.{block_index}");
+        match family {
+            TransformerDenoiserFamily::Krea2 => {
+                let image = TransformerFeedForwardStream::krea_swiglu_from_hfq(
+                    hfq,
+                    "image",
+                    &format!("{block_prefix}.ff"),
+                )?;
+                Ok(Self {
+                    family,
+                    block_index,
+                    hidden_width: image.hidden_width,
+                    image,
+                    text: None,
+                })
+            }
+            TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Unknown => {
+                let image = TransformerFeedForwardStream::qwen_geglu_from_hfq(
+                    hfq,
+                    "image",
+                    &format!("{block_prefix}.img_mlp"),
+                )?;
+                let text = TransformerFeedForwardStream::qwen_geglu_from_hfq(
+                    hfq,
+                    "text",
+                    &format!("{block_prefix}.txt_mlp"),
+                )?;
+                if text.hidden_width != image.hidden_width {
+                    return Err(DiffusionError::InvalidMetadata(format!(
+                        "Qwen transformer block {block_index} text MLP hidden width {} != image hidden width {}",
+                        text.hidden_width, image.hidden_width
+                    )));
+                }
+                Ok(Self {
+                    family,
+                    block_index,
+                    hidden_width: image.hidden_width,
+                    image,
+                    text: Some(text),
+                })
+            }
+        }
+    }
+
+    fn forward_image_with_runtime_context(
+        &self,
+        hidden: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
+        self.image
+            .forward_with_runtime_context(hidden, runtime_context)
+    }
+
+    fn forward_text_with_runtime_context(
+        &self,
+        hidden: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<Option<CpuTensor>> {
+        let Some(text) = self.text.as_ref() else {
+            return Ok(None);
+        };
+        text.forward_with_runtime_context(hidden, runtime_context)
+            .map(Some)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum TransformerModulationStream {
     Image,
     Text,
@@ -6475,6 +6746,39 @@ fn rms_norm_attention_heads_3d(
                 }
             }
         }
+    }
+    Ok(out)
+}
+
+#[allow(dead_code)]
+fn validate_transformer_ff_down_shape(
+    stream_label: &str,
+    down_weight: &CpuTensor,
+    down_bias: Option<&CpuTensor>,
+    hidden_width: usize,
+    inner_width: usize,
+) -> DiffusionResult<()> {
+    if down_weight.shape.as_slice() != [hidden_width, inner_width] {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "{stream_label} transformer feed-forward down weight shape {:?} != [{hidden_width}, {inner_width}]",
+            down_weight.shape
+        )));
+    }
+    validate_attention_bias_shape(stream_label, "ff.down", down_bias, hidden_width)
+}
+
+#[allow(dead_code)]
+fn swiglu_gate_3d(up: &CpuTensor, gate: &CpuTensor) -> DiffusionResult<CpuTensor> {
+    if up.shape != gate.shape {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "SwiGLU up/gate shape mismatch {:?} vs {:?}",
+            up.shape, gate.shape
+        )));
+    }
+    let [batch, seq, width] = shape3(up)?;
+    let mut out = CpuTensor::zeros(&[batch, seq, width]);
+    for (dst, (up, gate)) in out.data.iter_mut().zip(up.data.iter().zip(&gate.data)) {
+        *dst = *up * silu(*gate);
     }
     Ok(out)
 }
@@ -17910,6 +18214,121 @@ mod tests {
 
         assert_f32_close(&image_out.data, &expected.data, 1e-6);
         assert!(text_out.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_transformer_feed_forward_runs_qwen_image_and_text_geglu() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-qwen-transformer-ff-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("qwen-transformer-ff.hfq");
+        let block = "transformer/tensors/transformer_blocks.0";
+        let image_proj = [1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0];
+        let text_proj = [2.0, 0.0, 0.0, 2.0, 1.0, 0.0, 0.0, 1.0];
+        let down = [1.0, 0.0, 0.0, 1.0];
+        write_hfqm_package_mem(
+            &path,
+            HFQ_ARCH_DIFFUSION,
+            "{}",
+            &[
+                f32_mem_tensor(
+                    &format!("{block}.img_mlp.net.0.proj.weight"),
+                    &[4, 2],
+                    &image_proj,
+                ),
+                f32_mem_tensor(
+                    &format!("{block}.img_mlp.net.0.proj.bias"),
+                    &[4],
+                    &[0.0, 0.0, 0.0, 0.0],
+                ),
+                f32_mem_tensor(&format!("{block}.img_mlp.net.2.weight"), &[2, 2], &down),
+                f32_mem_tensor(&format!("{block}.img_mlp.net.2.bias"), &[2], &[0.5, -0.5]),
+                f32_mem_tensor(
+                    &format!("{block}.txt_mlp.net.0.proj.weight"),
+                    &[4, 2],
+                    &text_proj,
+                ),
+                f32_mem_tensor(
+                    &format!("{block}.txt_mlp.net.0.proj.bias"),
+                    &[4],
+                    &[0.0, 0.0, 0.0, 0.0],
+                ),
+                f32_mem_tensor(&format!("{block}.txt_mlp.net.2.weight"), &[2, 2], &down),
+                f32_mem_tensor(&format!("{block}.txt_mlp.net.2.bias"), &[2], &[0.0, 0.25]),
+            ],
+        )
+        .unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let ff =
+            NativeTransformerFeedForward::from_hfq(&hfq, TransformerDenoiserFamily::QwenImage, 0)
+                .unwrap();
+        let hidden = CpuTensor {
+            shape: vec![1, 1, 2],
+            data: vec![1.0, 2.0],
+        };
+        let mut runtime_context =
+            DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+
+        let image = ff
+            .forward_image_with_runtime_context(&hidden, &mut runtime_context)
+            .unwrap();
+        let text = ff
+            .forward_text_with_runtime_context(&hidden, &mut runtime_context)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(image.shape, vec![1, 1, 2]);
+        assert_f32_close(&image.data, &[gelu(1.0) + 0.5, 2.0 * gelu(2.0) - 0.5], 1e-6);
+        assert_f32_close(&text.data, &[2.0 * gelu(1.0), 4.0 * gelu(2.0) + 0.25], 1e-6);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_transformer_feed_forward_runs_krea_image_swiglu_without_text_stream() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-krea-transformer-ff-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("krea-transformer-ff.hfq");
+        let prefix = "transformer/tensors/transformer_blocks.0.ff";
+        let identity2 = [1.0, 0.0, 0.0, 1.0];
+        write_hfqm_package_mem(
+            &path,
+            HFQ_ARCH_DIFFUSION,
+            "{}",
+            &[
+                f32_mem_tensor(&format!("{prefix}.up.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.gate.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.down.weight"), &[2, 2], &identity2),
+            ],
+        )
+        .unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let ff = NativeTransformerFeedForward::from_hfq(&hfq, TransformerDenoiserFamily::Krea2, 0)
+            .unwrap();
+        let hidden = CpuTensor {
+            shape: vec![1, 1, 2],
+            data: vec![1.0, 2.0],
+        };
+        let mut runtime_context =
+            DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+
+        let image = ff
+            .forward_image_with_runtime_context(&hidden, &mut runtime_context)
+            .unwrap();
+        let text = ff
+            .forward_text_with_runtime_context(&hidden, &mut runtime_context)
+            .unwrap();
+
+        assert_eq!(image.shape, vec![1, 1, 2]);
+        assert_f32_close(&image.data, &[silu(1.0), 2.0 * silu(2.0)], 1e-6);
+        assert!(text.is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 
