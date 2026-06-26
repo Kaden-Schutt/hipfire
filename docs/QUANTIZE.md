@@ -15,7 +15,7 @@ cargo run --release -p hipfire-quantize -- \
 The output filename should use the canonical artifact convention:
 
 ```text
-<family>[-]<version>-<size[-effective/active]>[-tag1][-tag2...][.feature1[-feature2...]].<format>[.arch].hfq
+<family>[-]<version>-<size[-effective/active]>[-tag1][-tag2...][.feature1[.feature2...]].<format>[.arch].hfq
 ```
 
 Examples:
@@ -46,9 +46,9 @@ Quant tokens describe weight encoding only:
 - Mixed precision includes a decimal place in the bitwidth, for example
   `mq4.5+` or `oq4.25++`.
 
-Do not use `+` for bundled runtime features or sidecars. Encode those as dot
-groups before the quant token, for example `Qwen3.5-9B.mtp-vl.oq4.hfq` or
-`Gemma-4-8B.dflash-triattn.oq4++.gfx1151.hfq`.
+Do not use `+` for bundled runtime features or sidecars. Encode each feature as
+its own dot group before the quant token, for example `Qwen3.5-9B.mtp.vl.oq4.hfq`
+or `Gemma-4-8B.dflash.triattn.oq4++.gfx1151.hfq`.
 
 ## Public Quant Names
 

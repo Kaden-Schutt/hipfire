@@ -1416,17 +1416,10 @@ fn is_arch_group(group: &str) -> bool {
 }
 
 fn is_feature_group(group: &str) -> bool {
-    let mut saw_token = false;
-    for token in group.split('-') {
-        saw_token = true;
-        if !matches!(
-            token,
-            "mtp" | "vl" | "dflash" | "triattn" | "jinja" | "hessian"
-        ) {
-            return false;
-        }
-    }
-    saw_token
+    matches!(
+        group,
+        "mtp" | "vl" | "dflash" | "triattn" | "jinja" | "hessian"
+    )
 }
 
 fn parse_model_identity(identity: &str) -> Option<(String, Option<String>, Vec<String>)> {
@@ -2058,16 +2051,27 @@ mod tests {
     #[test]
     fn canonical_model_artifact_name_breaks_down_identity_features_quant_and_arch() {
         let parsed =
-            parse_canonical_model_artifact_name("Qwen3.5-122B-A10B-it.mtp-vl.mq2l.gfx1201.hfq")
+            parse_canonical_model_artifact_name("Qwen3.5-122B-A10B-it.mtp.vl.mq2l.gfx1201.hfq")
                 .unwrap();
 
-        assert_eq!(parsed.id, "Qwen3.5-122B-A10B-it.mtp-vl.mq2l.gfx1201");
+        assert_eq!(parsed.id, "Qwen3.5-122B-A10B-it.mtp.vl.mq2l.gfx1201");
         assert_eq!(parsed.model, "Qwen3.5");
         assert_eq!(parsed.size.as_deref(), Some("122B-A10B"));
         assert_eq!(parsed.tags, vec!["it"]);
-        assert_eq!(parsed.features, vec!["mtp-vl"]);
+        assert_eq!(parsed.features, vec!["mtp", "vl"]);
         assert_eq!(parsed.quant, "mq2l");
         assert_eq!(parsed.arch.as_deref(), Some("gfx1201"));
+
+        let gemma = parse_canonical_model_artifact_name(
+            "Gemma-4-8B-E4B-it-heretic-QAT.dflash.triattn.oq4++.gfx1151.hfq",
+        )
+        .unwrap();
+        assert_eq!(gemma.model, "Gemma-4");
+        assert_eq!(gemma.size.as_deref(), Some("8B-E4B"));
+        assert_eq!(gemma.tags, vec!["it", "heretic", "QAT"]);
+        assert_eq!(gemma.features, vec!["dflash", "triattn"]);
+        assert_eq!(gemma.quant, "oq4++");
+        assert_eq!(gemma.arch.as_deref(), Some("gfx1151"));
 
         let mixed = parse_canonical_model_artifact_name("Gemma-4-8B.oq4.25++.hfq").unwrap();
         assert_eq!(mixed.model, "Gemma-4");
@@ -2087,6 +2091,10 @@ mod tests {
         assert!(parse_canonical_model_artifact_name("qwen3.5-9B-op4.hfq").is_none());
         assert!(parse_canonical_model_artifact_name("qwen3.5-9B-q8f16.hfq").is_none());
         assert!(parse_canonical_model_artifact_name("qwen3.5-9B.mq4.mtp.hfq").is_none());
+        assert!(parse_canonical_model_artifact_name("qwen3.5-9B.mtp-vl.mq4.hfq").is_none());
+        assert!(
+            parse_canonical_model_artifact_name("Gemma-4-8B.dflash-triattn.oq4++.hfq").is_none()
+        );
     }
 
     #[test]
@@ -2144,24 +2152,24 @@ mod tests {
         fs::create_dir_all(&triattn).unwrap();
         fs::create_dir_all(&drafts).unwrap();
         fs::create_dir_all(&templates).unwrap();
-        fs::write(models.join("Qwen3.5-9B-it.mtp-vl.mq4.hfq"), "model").unwrap();
+        fs::write(models.join("Qwen3.5-9B-it.mtp.vl.mq4.hfq"), "model").unwrap();
         fs::write(models.join("qwen35-9b-hf4.hfq"), "old model").unwrap();
-        fs::write(models.join("Qwen3.5-9B-it.mtp-vl.mq4.mtp.hfq"), "mtp").unwrap();
+        fs::write(models.join("Qwen3.5-9B-it.mtp.vl.mq4.mtp.hfq"), "mtp").unwrap();
         fs::write(
-            models.join("Qwen3.5-9B-it.mtp-vl.mq4.hfq.triattn.hfq"),
+            models.join("Qwen3.5-9B-it.mtp.vl.mq4.hfq.triattn.hfq"),
             "old tri",
         )
         .unwrap();
-        fs::write(triattn.join("Qwen3.5-9B-it.mtp-vl.mq4.triattn.hfq"), "tri").unwrap();
-        fs::write(drafts.join("Qwen3.5-9B-it.mtp-vl.mq4.dflash.hfq"), "draft").unwrap();
+        fs::write(triattn.join("Qwen3.5-9B-it.mtp.vl.mq4.triattn.hfq"), "tri").unwrap();
+        fs::write(drafts.join("Qwen3.5-9B-it.mtp.vl.mq4.dflash.hfq"), "draft").unwrap();
         fs::write(
-            drafts.join("Qwen3.5-9B-it.mtp-vl.mq4.draft.hfq"),
+            drafts.join("Qwen3.5-9B-it.mtp.vl.mq4.draft.hfq"),
             "old draft",
         )
         .unwrap();
-        fs::write(templates.join("Qwen3.5-9B-it.mtp-vl.mq4.jinja"), "template").unwrap();
+        fs::write(templates.join("Qwen3.5-9B-it.mtp.vl.mq4.jinja"), "template").unwrap();
         fs::write(
-            templates.join("Qwen3.5-9B-it.mtp-vl.mq4.hfq.j2"),
+            templates.join("Qwen3.5-9B-it.mtp.vl.mq4.hfq.j2"),
             "old template",
         )
         .unwrap();
@@ -2171,20 +2179,20 @@ mod tests {
         assert_eq!(registry.model_count(), 1);
         assert_eq!(registry.sidecar_count(), 3);
         let model = &registry.models[0];
-        assert_eq!(model.id, "Qwen3.5-9B-it.mtp-vl.mq4");
+        assert_eq!(model.id, "Qwen3.5-9B-it.mtp.vl.mq4");
         assert_eq!(model.model, "Qwen3.5");
         assert_eq!(model.size.as_deref(), Some("9B"));
         assert_eq!(model.tags, vec!["it"]);
-        assert_eq!(model.features, vec!["mtp-vl"]);
+        assert_eq!(model.features, vec!["mtp", "vl"]);
         assert_eq!(model.quant, "mq4");
         assert_eq!(
             model.triattn[0].file,
-            "Qwen3.5-9B-it.mtp-vl.mq4.triattn.hfq"
+            "Qwen3.5-9B-it.mtp.vl.mq4.triattn.hfq"
         );
-        assert_eq!(model.drafts[0].file, "Qwen3.5-9B-it.mtp-vl.mq4.dflash.hfq");
+        assert_eq!(model.drafts[0].file, "Qwen3.5-9B-it.mtp.vl.mq4.dflash.hfq");
         assert_eq!(
             model.chat_templates[0].file,
-            "Qwen3.5-9B-it.mtp-vl.mq4.jinja"
+            "Qwen3.5-9B-it.mtp.vl.mq4.jinja"
         );
 
         let _ = fs::remove_dir_all(root);

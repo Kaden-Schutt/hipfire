@@ -54,13 +54,13 @@ the relevant docs under `docs/`.
 
 Canonical artifact shape:
 
-`<family>[-]<version>-<size[-effective/active]>[-tag1][-tag2...][.feature1[-feature2...]].<format>[.arch].hfq`
+`<family>[-]<version>-<size[-effective/active]>[-tag1][-tag2...][.feature1[.feature2...]].<format>[.arch].hfq`
 
 Periods are used to separate groups known to hipfire.
 Examples:
 - LFM2.5-1.2B-Thinking.bf16.hfq
-- Qwen3.5-122B-A10B.mtp-vl.mq2l.hfq
-- Gemma-4-8B-E4B-it-heretic-QAT.dflash-triattn.oq4++.gfx1151.hfq
+- Qwen3.5-122B-A10B.mtp.vl.mq2l.hfq
+- Gemma-4-8B-E4B-it-heretic-QAT.dflash.triattn.oq4++.gfx1151.hfq
 - MedGemma-27B-it.triattn.hfq
 
 This system allows machine parsing by working backwards:
@@ -90,9 +90,9 @@ Notes:
 - Use dotted model versions such as `Qwen3.5`. do not use qwen35 for example.
 - Put calibration or transform modifiers that are not part of the quant token
   before it. Lloyd is part of the quant token: use `mq3l`, not `lloyd-mq3`.
-- Do not use `+` for bundled roles or feature sidecars. Encode those as dot
-  groups before the quant token, for example `.mtp-vl.mq4.hfq` or
-  `.dflash-triattn.oq4++.hfq`.
+- Do not use `+` for bundled roles or feature sidecars. Encode each feature as
+  its own dot group before the quant token, for example `.mtp.vl.mq4.hfq` or
+  `.dflash.triattn.oq4++.hfq`.
 - Use role sidecars when loaded independently: `.mtp.hfq`, `.dflash.hfq`,
   `.jinja.`, `.hessian` and `.triattn.hfq`.
 - The quant should detail the weight encoding. eg. Lloyd MQ2 uses `.mq2l.hfq`,
