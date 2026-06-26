@@ -1,0 +1,2 @@
+model=/srv/huggingface/_Hipfire/lfm2.5-350m-oq4plus-smoke.hfq
+prompt_path=benchmarks/prompts/merge_sort_thinking_off.txt
