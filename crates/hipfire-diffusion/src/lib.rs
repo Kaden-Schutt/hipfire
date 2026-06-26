@@ -494,6 +494,8 @@ pub struct SchedulerConfig {
     pub solver_type: Option<String>,
     pub lower_order_final: Option<bool>,
     pub thresholding: Option<bool>,
+    pub dynamic_thresholding_ratio: Option<f32>,
+    pub sample_max_value: Option<f32>,
     pub timestep_spacing: Option<String>,
     pub steps_offset: Option<i32>,
     pub use_karras_sigmas: Option<bool>,
@@ -742,7 +744,7 @@ pub struct DiffusionSchedule {
     lambda_t: Vec<f32>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SchedulerSolver {
     Euler,
     FlowMatchEuler,
@@ -755,6 +757,8 @@ pub enum SchedulerSolver {
         solver_type: DpmSolverType,
         lower_order_final: bool,
         thresholding: bool,
+        dynamic_thresholding_ratio: f32,
+        sample_max_value: f32,
     },
 }
 
@@ -817,8 +821,77 @@ impl SchedulerSolver {
             solver_type,
             lower_order_final: config.lower_order_final.unwrap_or(true),
             thresholding: config.thresholding.unwrap_or(false),
+            dynamic_thresholding_ratio: normalize_dynamic_thresholding_ratio(
+                config.dynamic_thresholding_ratio,
+            ),
+            sample_max_value: normalize_dynamic_thresholding_sample_max(config.sample_max_value),
         })
     }
+}
+
+fn normalize_dynamic_thresholding_ratio(value: Option<f32>) -> f32 {
+    match value {
+        Some(value) if value.is_finite() => value.clamp(0.0, 1.0),
+        _ => 0.995,
+    }
+}
+
+fn normalize_dynamic_thresholding_sample_max(value: Option<f32>) -> f32 {
+    match value {
+        Some(value) if value.is_finite() => value.max(1.0),
+        _ => 1.0,
+    }
+}
+
+fn dynamic_threshold_sample(
+    data: &mut [f32],
+    shape: &[usize],
+    ratio: f32,
+    sample_max_value: f32,
+) -> DiffusionResult<()> {
+    let batch = shape.first().copied().ok_or_else(|| {
+        DiffusionError::InvalidMetadata(
+            "DPM-Solver dynamic thresholding requires a batch dimension".to_string(),
+        )
+    })?;
+    if batch == 0 || data.is_empty() {
+        return Ok(());
+    }
+    if !data.len().is_multiple_of(batch) {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "DPM-Solver dynamic thresholding data length {} is not divisible by batch {batch}",
+            data.len()
+        )));
+    }
+    let values_per_batch = data.len() / batch;
+    if values_per_batch == 0 {
+        return Ok(());
+    }
+
+    let ratio = normalize_dynamic_thresholding_ratio(Some(ratio));
+    let sample_max_value = normalize_dynamic_thresholding_sample_max(Some(sample_max_value));
+    let mut sorted_abs = Vec::with_capacity(values_per_batch);
+    for chunk in data.chunks_mut(values_per_batch) {
+        sorted_abs.clear();
+        sorted_abs.extend(chunk.iter().map(|value| value.abs()));
+        sorted_abs.sort_by(|left, right| left.total_cmp(right));
+
+        let threshold = if sorted_abs.len() == 1 {
+            sorted_abs[0]
+        } else {
+            let rank = ratio * (sorted_abs.len() - 1) as f32;
+            let lower = rank.floor() as usize;
+            let upper = rank.ceil() as usize;
+            let frac = rank - lower as f32;
+            sorted_abs[lower] + (sorted_abs[upper] - sorted_abs[lower]) * frac
+        };
+        let threshold = threshold.clamp(1.0, sample_max_value);
+        for value in chunk {
+            *value = value.clamp(-threshold, threshold) / threshold;
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1351,19 +1424,16 @@ impl DiffusionSchedule {
         let SchedulerSolver::DpmSolverMultistep {
             algorithm_type,
             thresholding,
+            dynamic_thresholding_ratio,
+            sample_max_value,
             ..
         } = self.solver
         else {
             return Ok(model_output.to_vec());
         };
-        if thresholding {
-            return Err(DiffusionError::InvalidMetadata(
-                "DPM-Solver dynamic thresholding is not implemented".to_string(),
-            ));
-        }
         let alpha = self.scheduler_alpha(timestep)?;
         let sigma = self.scheduler_sigma(timestep)?;
-        let output = match algorithm_type {
+        let mut output = match algorithm_type {
             DpmSolverAlgorithm::DpmSolverPlusPlus => match self.prediction_type {
                 SchedulerPredictionType::Epsilon => sample
                     .data
@@ -1380,6 +1450,14 @@ impl DiffusionSchedule {
                     .collect(),
             },
         };
+        if thresholding {
+            dynamic_threshold_sample(
+                &mut output,
+                &sample.shape,
+                dynamic_thresholding_ratio,
+                sample_max_value,
+            )?;
+        }
         Ok(output)
     }
 
@@ -5300,6 +5378,8 @@ impl StableDiffusionConfig {
             solver_type: json_optional_string(&scheduler_json, "solver_type"),
             lower_order_final: json_bool(&scheduler_json, "lower_order_final"),
             thresholding: json_bool(&scheduler_json, "thresholding"),
+            dynamic_thresholding_ratio: json_f32(&scheduler_json, "dynamic_thresholding_ratio"),
+            sample_max_value: json_f32(&scheduler_json, "sample_max_value"),
             timestep_spacing: json_optional_string(&scheduler_json, "timestep_spacing"),
             steps_offset: json_i32(&scheduler_json, "steps_offset"),
             use_karras_sigmas: json_bool(&scheduler_json, "use_karras_sigmas"),
@@ -17445,10 +17525,46 @@ mod tests {
                 solver_type: DpmSolverType::Midpoint,
                 lower_order_final: true,
                 thresholding: false,
+                dynamic_thresholding_ratio: 0.995,
+                sample_max_value: 1.0,
             }
         );
         assert_eq!(schedule.input_scaling, SchedulerInputScaling::None);
         assert_eq!(schedule.initial_noise_sigma(), 1.0);
+    }
+
+    #[test]
+    fn dpm_solver_config_preserves_dynamic_thresholding_settings() {
+        let config = SchedulerConfig {
+            class_name: "DPMSolverMultistepScheduler".into(),
+            beta_start: Some(0.00085),
+            beta_end: Some(0.012),
+            beta_schedule: Some("scaled_linear".into()),
+            num_train_timesteps: Some(1000),
+            prediction_type: Some("epsilon".into()),
+            algorithm_type: Some("dpmsolver++".into()),
+            solver_order: Some(2),
+            solver_type: Some("midpoint".into()),
+            thresholding: Some(true),
+            dynamic_thresholding_ratio: Some(0.9),
+            sample_max_value: Some(2.0),
+            ..SchedulerConfig::default()
+        };
+
+        let schedule = DiffusionSchedule::from_config(&config, 2).unwrap();
+
+        assert_eq!(
+            schedule.solver,
+            SchedulerSolver::DpmSolverMultistep {
+                algorithm_type: DpmSolverAlgorithm::DpmSolverPlusPlus,
+                solver_order: 2,
+                solver_type: DpmSolverType::Midpoint,
+                lower_order_final: true,
+                thresholding: true,
+                dynamic_thresholding_ratio: 0.9,
+                sample_max_value: 2.0,
+            }
+        );
     }
 
     #[test]
@@ -17682,6 +17798,8 @@ mod tests {
                 solver_type: DpmSolverType::Midpoint,
                 lower_order_final: false,
                 thresholding: false,
+                dynamic_thresholding_ratio: 0.995,
+                sample_max_value: 1.0,
             },
             train_timesteps: vec![2, 1],
             alpha_t: vec![0.9, 0.8, 0.7],
@@ -17709,6 +17827,43 @@ mod tests {
     }
 
     #[test]
+    fn dpm_solver_dynamic_thresholding_clips_predicted_original_sample() {
+        let schedule = DiffusionSchedule {
+            timesteps: vec![0.0],
+            sigmas: vec![0.0, 0.0],
+            prediction_type: SchedulerPredictionType::Sample,
+            input_scaling: SchedulerInputScaling::None,
+            solver: SchedulerSolver::DpmSolverMultistep {
+                algorithm_type: DpmSolverAlgorithm::DpmSolverPlusPlus,
+                solver_order: 2,
+                solver_type: DpmSolverType::Midpoint,
+                lower_order_final: true,
+                thresholding: true,
+                dynamic_thresholding_ratio: 1.0,
+                sample_max_value: 4.0,
+            },
+            train_timesteps: vec![0],
+            alpha_t: vec![1.0],
+            sigma_t: vec![0.0],
+            lambda_t: vec![0.0],
+        };
+        let sample = CpuTensor {
+            shape: vec![2, 1, 1, 4],
+            data: vec![0.0; 8],
+        };
+        let model_output = [-0.5, 0.5, 2.0, -4.0, 0.2, -3.0, 6.0, -9.0];
+
+        let output = schedule
+            .dpm_convert_model_output(&model_output, 0, &sample)
+            .unwrap();
+
+        assert_eq!(
+            output,
+            vec![-0.125, 0.125, 0.5, -1.0, 0.05, -0.75, 1.0, -1.0]
+        );
+    }
+
+    #[test]
     fn dpm_solver_third_order_update_matches_diffusers_formula() {
         let lambda = |alpha: f32, sigma: f32| alpha.ln() - sigma.ln();
         let schedule = DiffusionSchedule {
@@ -17722,6 +17877,8 @@ mod tests {
                 solver_type: DpmSolverType::Midpoint,
                 lower_order_final: false,
                 thresholding: false,
+                dynamic_thresholding_ratio: 0.995,
+                sample_max_value: 1.0,
             },
             train_timesteps: vec![3, 2, 1],
             alpha_t: vec![0.95, 0.85, 0.75, 0.65],
@@ -17787,6 +17944,8 @@ mod tests {
                 solver_type: DpmSolverType::Midpoint,
                 lower_order_final: false,
                 thresholding: false,
+                dynamic_thresholding_ratio: 0.995,
+                sample_max_value: 1.0,
             },
             train_timesteps: vec![3, 2, 1],
             alpha_t: vec![0.95, 0.85, 0.75, 0.65],
