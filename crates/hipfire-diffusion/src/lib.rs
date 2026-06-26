@@ -5479,6 +5479,162 @@ impl NativeDiffusionRuntime {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct NativeTransformerDenoiserIo {
+    family: TransformerDenoiserFamily,
+    patch_size: usize,
+    input_channels: usize,
+    output_channels: usize,
+    input_token_width: usize,
+    hidden_width: usize,
+    output_token_width: usize,
+    img_in_weight: CpuTensor,
+    img_in_bias: CpuTensor,
+    output_weight: CpuTensor,
+    output_bias: CpuTensor,
+}
+
+impl NativeTransformerDenoiserIo {
+    fn from_hfq(
+        hfq: &HfqFile,
+        config: &StableDiffusionConfig,
+        topology: &TransformerDenoiserWeightTopology,
+    ) -> DiffusionResult<Self> {
+        let transformer = config.transformer.as_ref().ok_or_else(|| {
+            DiffusionError::InvalidMetadata(
+                "transformer denoiser config is required for transformer IO".to_string(),
+            )
+        })?;
+        let patch_size = transformer
+            .patch_size
+            .or_else(|| default_transformer_patch_size(&transformer.class_name))
+            .unwrap_or(1)
+            .max(1);
+        let patch_feature_width = config
+            .latent_channels
+            .checked_mul(patch_size)
+            .and_then(|value| value.checked_mul(patch_size))
+            .ok_or_else(|| {
+                DiffusionError::InvalidMetadata(
+                    "transformer patch feature width overflow".to_string(),
+                )
+            })?;
+        let input_channels = transformer.in_channels.unwrap_or(patch_feature_width);
+        if input_channels < patch_feature_width {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "transformer in_channels {input_channels} is smaller than latent patch feature width {patch_feature_width}"
+            )));
+        }
+        let output_channels = transformer.out_channels.unwrap_or(config.latent_channels);
+        let output_patch_feature_width = output_channels
+            .checked_mul(patch_size)
+            .and_then(|value| value.checked_mul(patch_size))
+            .ok_or_else(|| {
+                DiffusionError::InvalidMetadata(
+                    "transformer output patch feature width overflow".to_string(),
+                )
+            })?;
+
+        let img_in_weight = CpuTensor::from_hfq(hfq, "transformer/tensors/img_in.weight")?;
+        let img_in_bias = CpuTensor::from_hfq(hfq, "transformer/tensors/img_in.bias")?;
+        let [hidden_width, input_token_width] = shape2(&img_in_weight)?;
+        if input_token_width != input_channels {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "transformer img_in input width {input_token_width} != configured in_channels {input_channels}"
+            )));
+        }
+        if img_in_bias.shape.as_slice() != [hidden_width] {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "transformer img_in bias shape {:?} != [{hidden_width}]",
+                img_in_bias.shape
+            )));
+        }
+
+        let (output_weight_entry, output_bias_entry) = match topology.family {
+            TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Unknown => (
+                "transformer/tensors/proj_out.weight",
+                "transformer/tensors/proj_out.bias",
+            ),
+            TransformerDenoiserFamily::Krea2 => (
+                "transformer/tensors/final_layer.linear.weight",
+                "transformer/tensors/final_layer.linear.bias",
+            ),
+        };
+        let output_weight = CpuTensor::from_hfq(hfq, output_weight_entry)?;
+        let output_bias = CpuTensor::from_hfq(hfq, output_bias_entry)?;
+        let [output_token_width, output_hidden_width] = shape2(&output_weight)?;
+        if output_hidden_width != hidden_width {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "transformer output projection input width {output_hidden_width} != img_in hidden width {hidden_width}"
+            )));
+        }
+        if output_token_width < output_patch_feature_width {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "transformer output token width {output_token_width} is smaller than output patch feature width {output_patch_feature_width}"
+            )));
+        }
+        if output_bias.shape.as_slice() != [output_token_width] {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "transformer output projection bias shape {:?} != [{output_token_width}]",
+                output_bias.shape
+            )));
+        }
+
+        Ok(Self {
+            family: topology.family,
+            patch_size,
+            input_channels,
+            output_channels,
+            input_token_width,
+            hidden_width,
+            output_token_width,
+            img_in_weight,
+            img_in_bias,
+            output_weight,
+            output_bias,
+        })
+    }
+
+    fn project_latents_to_hidden_with_runtime_context(
+        &self,
+        latents: &LatentBatch,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
+        let tokens =
+            latent_batch_to_patch_tokens(latents, self.patch_size, self.input_token_width)?;
+        linear_3d_with_runtime_context(
+            &tokens,
+            &self.img_in_weight,
+            Some(&self.img_in_bias),
+            runtime_context,
+        )
+    }
+
+    fn project_hidden_to_latents_with_runtime_context(
+        &self,
+        hidden: &CpuTensor,
+        batch: usize,
+        height: usize,
+        width: usize,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<LatentBatch> {
+        let tokens = linear_3d_with_runtime_context(
+            hidden,
+            &self.output_weight,
+            Some(&self.output_bias),
+            runtime_context,
+        )?;
+        patch_tokens_to_latent_batch(
+            &tokens,
+            batch,
+            self.output_channels,
+            height,
+            width,
+            self.patch_size,
+        )
+    }
+}
+
 fn diffusion_generation_info(
     summary: &DiffusionModelSummary,
     runtime_kind: DiffusionRuntimeKind,
@@ -16117,6 +16273,160 @@ mod tests {
         assert!(!topology.has_text_modulation);
         assert!(topology.has_text_fusion);
         assert!(topology.diagnostic_label().contains("krea2-mmdit"));
+    }
+
+    #[test]
+    fn native_transformer_io_projects_qwen_patch_tokens() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-qwen-transformer-io-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("qwen-transformer-io.hfq");
+        write_hfqm_package_mem(
+            &path,
+            HFQ_ARCH_DIFFUSION,
+            "{}",
+            &[
+                f32_mem_tensor(
+                    "transformer/tensors/img_in.weight",
+                    &[2, 4],
+                    &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                ),
+                f32_mem_tensor("transformer/tensors/img_in.bias", &[2], &[0.5, -0.5]),
+                f32_mem_tensor(
+                    "transformer/tensors/proj_out.weight",
+                    &[4, 2],
+                    &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, -1.0],
+                ),
+                f32_mem_tensor(
+                    "transformer/tensors/proj_out.bias",
+                    &[4],
+                    &[0.0, 0.0, 1.0, -1.0],
+                ),
+            ],
+        )
+        .unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let mut config = tiny_runtime_config();
+        config.transformer = Some(TransformerDenoiserConfig {
+            class_name: "QwenImageTransformer2DModel".into(),
+            in_channels: Some(4),
+            out_channels: Some(1),
+            patch_size: Some(2),
+            ..TransformerDenoiserConfig::default()
+        });
+        config.latent_channels = 1;
+        let topology = transformer_denoiser_weight_topology(&DiffusionComponentMetadata {
+            class_name: Some("QwenImageTransformer2DModel".to_string()),
+            weight_entries: vec![
+                "transformer/tensors/img_in.weight".to_string(),
+                "transformer/tensors/proj_out.weight".to_string(),
+                "transformer/tensors/transformer_blocks.0.txt_mod.1.weight".to_string(),
+            ],
+            ..DiffusionComponentMetadata::default()
+        });
+        let io = NativeTransformerDenoiserIo::from_hfq(&hfq, &config, &topology).unwrap();
+        let latents = LatentBatch {
+            batch: 1,
+            channels: 1,
+            height: 2,
+            width: 2,
+            data: vec![1.0, 2.0, 3.0, 4.0],
+        };
+        let mut runtime_context =
+            DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+
+        let hidden = io
+            .project_latents_to_hidden_with_runtime_context(&latents, &mut runtime_context)
+            .unwrap();
+        assert_eq!(hidden.shape, vec![1, 1, 2]);
+        assert_eq!(hidden.data, vec![1.5, 1.5]);
+        let output = io
+            .project_hidden_to_latents_with_runtime_context(&hidden, 1, 2, 2, &mut runtime_context)
+            .unwrap();
+        assert_eq!(output.batch, 1);
+        assert_eq!(output.channels, 1);
+        assert_eq!(output.height, 2);
+        assert_eq!(output.width, 2);
+        assert_eq!(output.data, vec![1.5, 1.5, 4.0, -1.0]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_transformer_io_projects_krea_final_layer_tokens() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-krea-transformer-io-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("krea-transformer-io.hfq");
+        write_hfqm_package_mem(
+            &path,
+            HFQ_ARCH_DIFFUSION,
+            "{}",
+            &[
+                f32_mem_tensor(
+                    "transformer/tensors/img_in.weight",
+                    &[2, 4],
+                    &[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                ),
+                f32_mem_tensor("transformer/tensors/img_in.bias", &[2], &[0.0, 0.25]),
+                f32_mem_tensor(
+                    "transformer/tensors/final_layer.linear.weight",
+                    &[4, 2],
+                    &[1.0, 1.0, -1.0, 1.0, 2.0, 0.0, 0.0, 2.0],
+                ),
+                f32_mem_tensor(
+                    "transformer/tensors/final_layer.linear.bias",
+                    &[4],
+                    &[0.0, 1.0, 0.0, -1.0],
+                ),
+            ],
+        )
+        .unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let mut config = tiny_runtime_config();
+        config.transformer = Some(TransformerDenoiserConfig {
+            class_name: "Krea2Transformer2DModel".into(),
+            in_channels: Some(4),
+            out_channels: None,
+            patch_size: Some(2),
+            ..TransformerDenoiserConfig::default()
+        });
+        config.latent_channels = 1;
+        let topology = transformer_denoiser_weight_topology(&DiffusionComponentMetadata {
+            class_name: Some("Krea2Transformer2DModel".to_string()),
+            weight_entries: vec![
+                "transformer/tensors/img_in.weight".to_string(),
+                "transformer/tensors/final_layer.linear.weight".to_string(),
+                "transformer/tensors/text_fusion.projector.weight".to_string(),
+            ],
+            ..DiffusionComponentMetadata::default()
+        });
+        let io = NativeTransformerDenoiserIo::from_hfq(&hfq, &config, &topology).unwrap();
+        let latents = LatentBatch {
+            batch: 1,
+            channels: 1,
+            height: 2,
+            width: 2,
+            data: vec![1.0, 2.0, 3.0, 4.0],
+        };
+        let mut runtime_context =
+            DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+
+        let hidden = io
+            .project_latents_to_hidden_with_runtime_context(&latents, &mut runtime_context)
+            .unwrap();
+        assert_eq!(hidden.shape, vec![1, 1, 2]);
+        assert_eq!(hidden.data, vec![3.0, 4.25]);
+        let output = io
+            .project_hidden_to_latents_with_runtime_context(&hidden, 1, 2, 2, &mut runtime_context)
+            .unwrap();
+        assert_eq!(output.data, vec![7.25, 2.25, 6.0, 7.5]);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
