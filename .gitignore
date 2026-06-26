@@ -38,6 +38,13 @@ kernels/compiled/
 .serena/
 .remember/
 graphify-out/cache/
+# Regenerable AST graph — rebuild locally with `graphify update .`.
+# The durable semantic state lives in manifest.json + .graphify_labels.json.
+graphify-out/graph.json
+# Machine-specific generated hooks (embed a local interpreter path).
+# Each user/agent runs `graphify hook install` on their end.
+.githooks/post-commit
+.githooks/post-checkout
 .codex
 .sisyphus/
 AGENTS.local.md
@@ -108,9 +115,11 @@ research/
 .codeinsight+research/
 
 
-# kld_reduce.py outputs when run from repo root
-result-data.json
-result-table.md
+# kld_reduce.py outputs when run from repo root. Anchored to root: the curated
+# benchmark result-*.{json,md} under benchmarks/ must stay tracked (their
+# c50-/.kldseq siblings already are).
+/result-data.json
+/result-table.md
 .rocprofv3/
 
 # Generated hipfire-eval run directories. Curated benchmark writeups under

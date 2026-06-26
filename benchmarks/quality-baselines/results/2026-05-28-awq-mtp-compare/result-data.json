@@ -1,0 +1,26 @@
+[
+  {
+    "variant": "qwen3.5-9b-awq-mtp.mq4",
+    "arch": "gfx1151",
+    "scoring_mode": "prefill-q8-c20",
+    "n_chunks": 20,
+    "mean_kld": 0.17636922852564363,
+    "mean_kld_ci_lo": 0.12977772995802206,
+    "mean_kld_ci_hi": 0.2370224737471747,
+    "p99_kld": 15.767490112444143,
+    "ppl": 9.671009699877981,
+    "notes": ""
+  },
+  {
+    "variant": "qwen3.5-9b.mq4",
+    "arch": "gfx1151",
+    "scoring_mode": "prefill-q8-c20",
+    "n_chunks": 20,
+    "mean_kld": 0.23638529168533035,
+    "mean_kld_ci_lo": 0.17333651458329738,
+    "mean_kld_ci_hi": 0.317591798790774,
+    "p99_kld": 17.16138437962391,
+    "ppl": 9.047422176078824,
+    "notes": ""
+  }
+]
