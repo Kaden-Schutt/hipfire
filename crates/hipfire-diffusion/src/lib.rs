@@ -3509,7 +3509,7 @@ impl DiffusionPipeline {
         let (native_runtime, native_runtime_error) = if let Some(error) = runtime_support_error {
             (None, Some(error))
         } else {
-            match NativeDiffusionRuntime::from_hfq(&hfq, &config) {
+            match NativeDiffusionRuntime::from_hfq(&hfq, &metadata, &config) {
                 Ok(runtime) => (Some(runtime), None),
                 Err(error) => (None, Some(error.to_string())),
             }
@@ -5469,10 +5469,21 @@ struct NativeDiffusionRuntime {
 }
 
 impl NativeDiffusionRuntime {
-    fn from_hfq(hfq: &HfqFile, config: &StableDiffusionConfig) -> DiffusionResult<Self> {
+    fn from_hfq(
+        hfq: &HfqFile,
+        metadata: &DiffusionHfqMetadata,
+        config: &StableDiffusionConfig,
+    ) -> DiffusionResult<Self> {
+        let noise: Box<dyn DiffusionNoiseBackend> =
+            if let Some(transformer) = metadata.components.get("transformer") {
+                let topology = transformer_denoiser_weight_topology(transformer);
+                Box::new(NativeTransformerDenoiser::from_hfq(hfq, config, &topology)?)
+            } else {
+                Box::new(NativeUnet2DConditionModel::from_hfq(hfq, &config.unet)?)
+            };
         Ok(Self {
             kind: DiffusionRuntimeKind::CpuSourceReference,
-            noise: Box::new(NativeUnet2DConditionModel::from_hfq(hfq, &config.unet)?),
+            noise,
             encoder: NativeVaeEncoder::from_hfq(hfq, &config.vae).ok(),
             decoder: Box::new(NativeVaeDecoder::from_hfq(hfq, &config.vae)?),
         })
@@ -15928,27 +15939,48 @@ fn native_runtime_metadata_support_error(metadata: &DiffusionHfqMetadata) -> Opt
                 .to_string(),
         );
     }
-    if !is_native_unet_pipeline_class(&metadata.pipeline.class_name) {
-        let denoiser = if let Some(transformer) = metadata.components.get("transformer") {
-            let topology = transformer_denoiser_weight_topology(transformer);
-            format!("transformer denoiser ({})", topology.diagnostic_label())
-        } else {
-            "unsupported denoiser".to_string()
-        };
+    let transformer_topology = metadata
+        .components
+        .get("transformer")
+        .map(transformer_denoiser_weight_topology);
+    let uses_supported_transformer = transformer_topology
+        .as_ref()
+        .is_some_and(|topology| matches!(topology.family, TransformerDenoiserFamily::QwenImage));
+    if !is_native_unet_pipeline_class(&metadata.pipeline.class_name) && !uses_supported_transformer
+    {
+        let denoiser = transformer_topology
+            .as_ref()
+            .map(|topology| format!("transformer denoiser ({})", topology.diagnostic_label()))
+            .unwrap_or_else(|| "unsupported denoiser".to_string());
         return Some(format!(
             "native diffusion runtime currently supports Stable Diffusion UNet-family pipelines only; artifact pipeline {:?} uses a {denoiser} and requires a matching diffusion runtime",
             metadata.pipeline.class_name
         ));
     }
-    if let Some(unet) = metadata
-        .components
-        .get("unet")
-        .and_then(|component| component.class_name.as_deref())
-    {
-        if unet != "UNet2DConditionModel" {
-            return Some(format!(
-                "native diffusion runtime supports UNet2DConditionModel denoisers only; artifact unet class {unet:?} is unsupported"
-            ));
+    if uses_supported_transformer {
+        if let Some(topology) = transformer_topology.as_ref() {
+            if topology.block_count == 0
+                || !topology.has_input_projection
+                || !topology.has_output_projection
+                || !topology.has_text_modulation
+            {
+                return Some(format!(
+                    "native transformer runtime requires complete Qwen image transformer weights; artifact has {}",
+                    topology.diagnostic_label()
+                ));
+            }
+        }
+    } else {
+        if let Some(unet) = metadata
+            .components
+            .get("unet")
+            .and_then(|component| component.class_name.as_deref())
+        {
+            if unet != "UNet2DConditionModel" {
+                return Some(format!(
+                    "native diffusion runtime supports UNet2DConditionModel denoisers only; artifact unet class {unet:?} is unsupported"
+                ));
+            }
         }
     }
     if let Some(vae) = metadata
@@ -15956,18 +15988,29 @@ fn native_runtime_metadata_support_error(metadata: &DiffusionHfqMetadata) -> Opt
         .get("vae")
         .and_then(|component| component.class_name.as_deref())
     {
-        if vae != "AutoencoderKL" {
+        if vae != "AutoencoderKL" && vae != "AutoencoderKLQwenImage" {
             return Some(format!(
-                "native diffusion runtime supports AutoencoderKL VAEs only; artifact vae class {vae:?} is unsupported"
+                "native diffusion runtime supports AutoencoderKL-family VAEs only; artifact vae class {vae:?} is unsupported"
             ));
         }
     }
-    if let Some(text_encoder) = metadata
+    let text_encoder_class = metadata
         .components
         .get("text_encoder")
-        .and_then(|component| component.class_name.as_deref())
-    {
+        .and_then(|component| component.class_name.as_deref());
+    if uses_supported_transformer && text_encoder_class.is_none() {
+        return Some(
+            "native transformer runtime currently requires a CLIP-compatible text_encoder component"
+                .to_string(),
+        );
+    }
+    if let Some(text_encoder) = text_encoder_class {
         if text_encoder != "CLIPTextModel" && text_encoder != "CLIPTextModelWithProjection" {
+            if uses_supported_transformer {
+                return Some(format!(
+                    "native transformer runtime currently requires CLIP-compatible text encoders; artifact text_encoder class {text_encoder:?} is unsupported"
+                ));
+            }
             return Some(format!(
                 "native diffusion runtime supports CLIP text encoders only; artifact text_encoder class {text_encoder:?} is unsupported"
             ));
@@ -25002,6 +25045,67 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn diffusion_pipeline_open_hfq_generates_png_with_native_tiny_qwen_transformer() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-diffusion-qwen-transformer-pipeline-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("tiny-qwen-transformer.hfq");
+        let metadata = tiny_qwen_transformer_runtime_metadata();
+        write_hfqm_package_mem(
+            &hfq_path,
+            HFQ_ARCH_DIFFUSION,
+            &serde_json::to_string(&metadata).unwrap(),
+            &tiny_qwen_transformer_runtime_tensors(),
+        )
+        .unwrap();
+        let inspection = inspect_hfq_with_runtime_support(&hfq_path).unwrap();
+        assert!(inspection.runtime_support.supported);
+        let pipeline = DiffusionPipeline::open_hfq(&hfq_path).unwrap();
+        let capabilities = pipeline.runtime_capabilities().unwrap();
+        assert_eq!(capabilities.kind, DiffusionRuntimeKind::CpuSourceReference);
+        let request = DiffusionBatchRequest {
+            prompts: vec![DiffusionPrompt {
+                prompt: "a cat".into(),
+                negative_prompt: String::new(),
+                seed: 9,
+                subseed: None,
+            }],
+            width: 2,
+            height: 2,
+            original_width: None,
+            original_height: None,
+            target_width: None,
+            target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
+            crop_x: 0,
+            crop_y: 0,
+            steps: 1,
+            cfg_scale: 1.0,
+            scheduler: "Euler".into(),
+            subseed_strength: 0.0,
+            send_images: true,
+            save_images: false,
+        };
+
+        let output = pipeline.generate_batch(request).unwrap();
+
+        assert_eq!(output.images.len(), 1);
+        assert_eq!(output.info["backend"], "hipfire-diffusion-hfq");
+        assert_eq!(output.info["pipeline"], "QwenImagePipeline");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&output.images[0])
+            .unwrap();
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        let decoded = image::load_from_memory(&bytes).unwrap().to_rgb8();
+        assert_eq!(decoded.dimensions(), (2, 2));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[cfg(feature = "rocm")]
     #[test]
     fn hip_preflight_reports_clip_token_position_embedding_probe() {
@@ -26756,6 +26860,26 @@ mod tests {
         metadata
     }
 
+    fn tiny_qwen_transformer_runtime_metadata() -> DiffusionHfqMetadata {
+        let mut metadata = tiny_runtime_metadata();
+        metadata.pipeline.class_name = "QwenImagePipeline".into();
+        metadata.pipeline.model_name = "tiny-qwen-transformer-runtime".into();
+        metadata.components.remove("unet");
+        metadata.components.insert(
+            "transformer".into(),
+            DiffusionComponentMetadata {
+                class_name: Some("QwenImageTransformer2DModel".into()),
+                config_entry: Some("transformer/config.json".into()),
+                weight_entries: qwen_tiny_transformer_denoiser_tensors()
+                    .iter()
+                    .map(|tensor| tensor.name.clone())
+                    .collect(),
+                tensor_roles: Vec::new(),
+            },
+        );
+        metadata
+    }
+
     fn tiny_runtime_config() -> StableDiffusionConfig {
         StableDiffusionConfig {
             pipeline_class: "StableDiffusionPipeline".into(),
@@ -26809,6 +26933,20 @@ mod tests {
             latent_width: Some(2),
             vae_scale_factor: 1,
         }
+    }
+
+    fn tiny_qwen_transformer_runtime_tensors() -> Vec<HfqMemTensor> {
+        let mut tensors = tiny_complete_runtime_tensors()
+            .into_iter()
+            .filter(|tensor| !tensor.name.starts_with("unet/"))
+            .collect::<Vec<_>>();
+        tensors.push(bytes_mem_tensor(
+            "transformer/config.json",
+            QT_DIFFUSION_JSON,
+            br#"{"_class_name":"QwenImageTransformer2DModel","in_channels":4,"out_channels":1,"patch_size":2,"num_layers":1,"num_attention_heads":1,"attention_head_dim":2,"joint_attention_dim":2}"#,
+        ));
+        tensors.extend(qwen_tiny_transformer_denoiser_tensors());
+        tensors
     }
 
     fn tiny_complete_runtime_tensors() -> Vec<HfqMemTensor> {
