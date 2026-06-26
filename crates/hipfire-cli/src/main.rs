@@ -65,7 +65,9 @@ enum Command {
     /// latent nothing (3) additionally alter masked latents. WebUI's
     /// `inpaint_full_res` and
     /// `inpaint_full_res_padding` crop masked regions for processing and
-    /// composite the generated crop back onto the init image. Txt2img high-res
+    /// composite the generated crop back onto the init image. SDAPI requests
+    /// can also import common WebUI `infotext` fields when those fields are not
+    /// explicitly set in JSON. Txt2img high-res
     /// generation is implemented as a batched first-pass txt2img
     /// generation followed by a second-pass img2img generation at the high-res
     /// target dimensions. SDAPI high-res requests accept `enable_hr`,

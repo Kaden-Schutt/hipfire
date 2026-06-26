@@ -181,6 +181,7 @@ pub async fn post_txt2img(
     State(state): State<SharedState>,
     Json(body): Json<SdGenerationRequest>,
 ) -> Response {
+    let body = sdapi_apply_infotext_defaults(body);
     execute_sd_generation(state, body, None).await
 }
 
@@ -188,6 +189,7 @@ pub async fn post_img2img(
     State(state): State<SharedState>,
     Json(body): Json<SdGenerationRequest>,
 ) -> Response {
+    let body = sdapi_apply_infotext_defaults(body);
     let images = body.init_images.clone().filter(|images| !images.is_empty());
     execute_sd_generation(state, body, images).await
 }
@@ -711,6 +713,272 @@ fn sdapi_response_parameters(mut body: SdGenerationRequest, mode: &str) -> SdGen
         body.init_images = None;
     }
     body
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SdapiParsedInfotext {
+    prompt: String,
+    negative_prompt: String,
+    params: Vec<(String, String)>,
+}
+
+fn sdapi_apply_infotext_defaults(mut body: SdGenerationRequest) -> SdGenerationRequest {
+    let Some(parsed) = body.infotext.as_deref().and_then(sdapi_parse_infotext) else {
+        return body;
+    };
+    if body.prompt.is_empty() && !parsed.prompt.is_empty() {
+        body.prompt = parsed.prompt.clone();
+    }
+    if body.negative_prompt.is_empty() && !parsed.negative_prompt.is_empty() {
+        body.negative_prompt = parsed.negative_prompt.clone();
+    }
+    if body.steps.is_none() {
+        body.steps = sdapi_infotext_u32(&parsed, "Steps");
+    }
+    if body.cfg_scale.is_none() {
+        body.cfg_scale = sdapi_infotext_f64(&parsed, "CFG scale");
+    }
+    if body.seed.is_none() {
+        body.seed = sdapi_infotext_i64(&parsed, "Seed");
+    }
+    if body.width.is_none() || body.height.is_none() {
+        if let Some((width, height)) = sdapi_infotext_dimensions(&parsed, "Size") {
+            body.width.get_or_insert(width);
+            body.height.get_or_insert(height);
+        }
+    }
+    if body.sampler_name.is_none() && body.sampler_index.is_none() {
+        body.sampler_name = sdapi_infotext_string(&parsed, "Sampler");
+    }
+    if body.scheduler.is_none() {
+        if let Some(scheduler) = sdapi_infotext_string(&parsed, "Schedule type")
+            .filter(|scheduler| scheduler != "Automatic")
+        {
+            body.scheduler = Some(scheduler);
+        }
+    }
+    if body.denoising_strength.is_none() {
+        body.denoising_strength = sdapi_infotext_f64(&parsed, "Denoising strength");
+    }
+    let has_highres = parsed
+        .params
+        .iter()
+        .any(|(key, _)| key.starts_with("Hires "));
+    if has_highres && body.enable_hr.is_none() {
+        body.enable_hr = Some(true);
+    }
+    if body.hr_scale.is_none() {
+        body.hr_scale = sdapi_infotext_f64(&parsed, "Hires upscale");
+    }
+    if body.hr_resize_x.is_none() || body.hr_resize_y.is_none() {
+        if let Some((width, height)) = sdapi_infotext_dimensions(&parsed, "Hires resize") {
+            body.hr_resize_x.get_or_insert(width);
+            body.hr_resize_y.get_or_insert(height);
+        }
+    }
+    if body.hr_second_pass_steps.is_none() {
+        body.hr_second_pass_steps = sdapi_infotext_u32(&parsed, "Hires steps");
+    }
+    if body.hr_upscaler.is_none() {
+        body.hr_upscaler = sdapi_infotext_string(&parsed, "Hires upscaler");
+    }
+    if body.hr_checkpoint_name.is_none() {
+        body.hr_checkpoint_name = sdapi_infotext_string(&parsed, "Hires checkpoint");
+    }
+    if body.hr_prompt.is_none() {
+        body.hr_prompt = sdapi_infotext_string(&parsed, "Hires prompt");
+    }
+    if body.hr_negative_prompt.is_none() {
+        body.hr_negative_prompt = sdapi_infotext_string(&parsed, "Hires negative prompt");
+    }
+    if body.hr_sampler_name.is_none() {
+        body.hr_sampler_name = sdapi_infotext_string(&parsed, "Hires sampler");
+    }
+    if body.hr_scheduler.is_none() {
+        body.hr_scheduler = sdapi_infotext_string(&parsed, "Hires schedule type");
+    }
+    if body.inpainting_fill.is_none() {
+        body.inpainting_fill = sdapi_infotext_string(&parsed, "Masked content").and_then(|value| {
+            let mode = match value.to_ascii_lowercase().as_str() {
+                "fill" => 0,
+                "original" => 1,
+                "latent noise" => 2,
+                "latent nothing" => 3,
+                _ => return None,
+            };
+            Some(json!(mode))
+        });
+    }
+    if body.inpainting_mask_invert.is_none() {
+        body.inpainting_mask_invert =
+            sdapi_infotext_string(&parsed, "Mask mode").and_then(|value| {
+                match value.to_ascii_lowercase().as_str() {
+                    "inpaint masked" => Some(json!(false)),
+                    "inpaint not masked" => Some(json!(true)),
+                    _ => None,
+                }
+            });
+    }
+    if body.inpaint_full_res.is_none() {
+        body.inpaint_full_res = sdapi_infotext_string(&parsed, "Inpaint area").and_then(|value| {
+            match value.to_ascii_lowercase().as_str() {
+                "whole picture" => Some(json!(false)),
+                "only masked" => Some(json!(true)),
+                _ => None,
+            }
+        });
+    }
+    if body.inpaint_full_res_padding.is_none() {
+        body.inpaint_full_res_padding =
+            sdapi_infotext_u32(&parsed, "Masked area padding").map(|value| json!(value));
+    }
+    body
+}
+
+fn sdapi_parse_infotext(infotext: &str) -> Option<SdapiParsedInfotext> {
+    let mut lines = infotext.trim().lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
+    let mut params = Vec::new();
+    let last_line = lines.last().map(|line| line.trim()).unwrap_or_default();
+    if sdapi_parse_infotext_params(last_line).len() >= 3 {
+        params = sdapi_parse_infotext_params(last_line);
+        lines.pop();
+    }
+
+    let mut prompt = String::new();
+    let mut negative_prompt = String::new();
+    let mut in_negative_prompt = false;
+    for line in lines {
+        let mut line = line.trim();
+        if let Some(rest) = line.strip_prefix("Negative prompt:") {
+            in_negative_prompt = true;
+            line = rest.trim();
+        }
+        let target = if in_negative_prompt {
+            &mut negative_prompt
+        } else {
+            &mut prompt
+        };
+        if !target.is_empty() && !line.is_empty() {
+            target.push('\n');
+        }
+        target.push_str(line);
+    }
+    Some(SdapiParsedInfotext {
+        prompt,
+        negative_prompt,
+        params,
+    })
+}
+
+fn sdapi_parse_infotext_params(line: &str) -> Vec<(String, String)> {
+    let mut params = Vec::new();
+    for segment in sdapi_split_infotext_param_segments(line) {
+        let Some((key, value)) = segment.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if !key.is_empty() && !value.is_empty() {
+            params.push((key.to_string(), sdapi_unquote_infotext_value(value)));
+        }
+    }
+    params
+}
+
+fn sdapi_split_infotext_param_segments(line: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for ch in line.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_quotes => {
+                current.push(ch);
+                escaped = true;
+            }
+            '"' => {
+                current.push(ch);
+                in_quotes = !in_quotes;
+            }
+            ',' if !in_quotes => {
+                let trimmed = current.trim();
+                if !trimmed.is_empty() {
+                    segments.push(trimmed.to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        segments.push(trimmed.to_string());
+    }
+    segments
+}
+
+fn sdapi_unquote_infotext_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() < 2 || !trimmed.starts_with('"') || !trimmed.ends_with('"') {
+        return trimmed.to_string();
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    let mut out = String::new();
+    let mut escaped = false;
+    for ch in inner.chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    if escaped {
+        out.push('\\');
+    }
+    out
+}
+
+fn sdapi_infotext_value<'a>(parsed: &'a SdapiParsedInfotext, key: &str) -> Option<&'a str> {
+    parsed
+        .params
+        .iter()
+        .find(|(candidate, _)| candidate == key)
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
+}
+
+fn sdapi_infotext_string(parsed: &SdapiParsedInfotext, key: &str) -> Option<String> {
+    sdapi_infotext_value(parsed, key).map(str::to_string)
+}
+
+fn sdapi_infotext_u32(parsed: &SdapiParsedInfotext, key: &str) -> Option<u32> {
+    sdapi_infotext_value(parsed, key)?.parse::<u32>().ok()
+}
+
+fn sdapi_infotext_i64(parsed: &SdapiParsedInfotext, key: &str) -> Option<i64> {
+    sdapi_infotext_value(parsed, key)?.parse::<i64>().ok()
+}
+
+fn sdapi_infotext_f64(parsed: &SdapiParsedInfotext, key: &str) -> Option<f64> {
+    let value = sdapi_infotext_value(parsed, key)?.parse::<f64>().ok()?;
+    value.is_finite().then_some(value)
+}
+
+fn sdapi_infotext_dimensions(parsed: &SdapiParsedInfotext, key: &str) -> Option<(u32, u32)> {
+    let value = sdapi_infotext_value(parsed, key)?;
+    let (width, height) = value.split_once('x').or_else(|| value.split_once('X'))?;
+    Some((width.trim().parse().ok()?, height.trim().parse().ok()?))
 }
 
 fn sdapi_parameters_text(body: &SdGenerationRequest, mode: &str, info: &Value) -> String {
@@ -3192,6 +3460,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn txt2img_route_applies_webui_infotext_defaults() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-sdapi-diffusion-infotext-route-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("tiny-route-diffusion-infotext.hfq");
+        write_tiny_diffusion_hfq(&hfq_path);
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let body = SdGenerationRequest {
+            model: Some(hfq_path.to_string_lossy().into_owned()),
+            send_images: Some(true),
+            save_images: Some(false),
+            infotext: Some(
+                "a copied prompt\n\
+                 Negative prompt: blur\n\
+                 Steps: 1, Sampler: Euler, CFG scale: 1, Seed: 77, Size: 2x2"
+                    .to_string(),
+            ),
+            ..empty_request()
+        };
+
+        let response = post_txt2img(State(state), Json(body)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+
+        assert_eq!(body["images"].as_array().unwrap().len(), 1);
+        assert_eq!(body["parameters"]["prompt"], "a copied prompt");
+        assert_eq!(body["parameters"]["negative_prompt"], "blur");
+        assert_eq!(body["parameters"]["steps"], 1);
+        assert_eq!(body["parameters"]["sampler_name"], "Euler");
+        assert_eq!(body["parameters"]["cfg_scale"], 1.0);
+        assert_eq!(body["parameters"]["seed"], 77);
+        assert_eq!(body["parameters"]["width"], 2);
+        assert_eq!(body["parameters"]["height"], 2);
+        let info = serde_json::from_str::<Value>(body["info"].as_str().unwrap()).unwrap();
+        assert_eq!(info["seeds"], json!([77]));
+        assert_eq!(info["width"], 2);
+        assert_eq!(info["height"], 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn txt2img_route_saves_png_when_save_images_true_and_send_images_false() {
         let dir = std::env::temp_dir().join(format!(
             "hipfire-sdapi-diffusion-save-route-test-{}",
@@ -5112,6 +5424,110 @@ mod tests {
             sdapi_apply_inpainting_fill_to_init_image(init_image.clone(), &mask, Some(1)).unwrap();
         assert!(!applied);
         assert_eq!(original.data, init_image.data);
+    }
+
+    #[test]
+    fn sdapi_infotext_defaults_populate_core_generation_fields() {
+        let body = SdGenerationRequest {
+            infotext: Some(
+                "a forest cabin\n\
+                 Negative prompt: low quality\n\
+                 Steps: 13, Sampler: Euler a, Schedule type: Karras, CFG scale: 6.5, Seed: 42, Size: 640x384, Denoising strength: 0.45"
+                    .to_string(),
+            ),
+            ..empty_request()
+        };
+
+        let body = sdapi_apply_infotext_defaults(body);
+
+        assert_eq!(body.prompt, "a forest cabin");
+        assert_eq!(body.negative_prompt, "low quality");
+        assert_eq!(body.steps, Some(13));
+        assert_eq!(body.sampler_name.as_deref(), Some("Euler a"));
+        assert_eq!(body.scheduler.as_deref(), Some("Karras"));
+        assert_eq!(body.cfg_scale, Some(6.5));
+        assert_eq!(body.seed, Some(42));
+        assert_eq!(body.width, Some(640));
+        assert_eq!(body.height, Some(384));
+        assert_eq!(body.denoising_strength, Some(0.45));
+    }
+
+    #[test]
+    fn sdapi_infotext_defaults_populate_highres_and_inpaint_fields() {
+        let body = SdGenerationRequest {
+            infotext: Some(
+                "prompt\n\
+                 Steps: 20, Sampler: Euler, CFG scale: 7, Seed: 1, Size: 256x256, \
+                 Hires upscale: 1.5, Hires resize: 768x512, Hires steps: 8, \
+                 Hires upscaler: Latent, Hires checkpoint: Use same checkpoint, \
+                 Hires prompt: \"sharp, detailed\", Hires negative prompt: blur, \
+                 Hires sampler: DDIM, Hires schedule type: Use same scheduler, \
+                 Mask mode: Inpaint not masked, Masked content: latent nothing, \
+                 Inpaint area: Only masked, Masked area padding: 24"
+                    .to_string(),
+            ),
+            ..empty_request()
+        };
+
+        let body = sdapi_apply_infotext_defaults(body);
+
+        assert_eq!(body.enable_hr, Some(true));
+        assert_eq!(body.hr_scale, Some(1.5));
+        assert_eq!(body.hr_resize_x, Some(768));
+        assert_eq!(body.hr_resize_y, Some(512));
+        assert_eq!(body.hr_second_pass_steps, Some(8));
+        assert_eq!(body.hr_upscaler.as_deref(), Some("Latent"));
+        assert_eq!(
+            body.hr_checkpoint_name.as_deref(),
+            Some("Use same checkpoint")
+        );
+        assert_eq!(body.hr_prompt.as_deref(), Some("sharp, detailed"));
+        assert_eq!(body.hr_negative_prompt.as_deref(), Some("blur"));
+        assert_eq!(body.hr_sampler_name.as_deref(), Some("DDIM"));
+        assert_eq!(body.hr_scheduler.as_deref(), Some("Use same scheduler"));
+        assert_eq!(body.inpainting_mask_invert, Some(json!(true)));
+        assert_eq!(body.inpainting_fill, Some(json!(3)));
+        assert_eq!(body.inpaint_full_res, Some(json!(true)));
+        assert_eq!(body.inpaint_full_res_padding, Some(json!(24)));
+    }
+
+    #[test]
+    fn sdapi_infotext_defaults_preserve_explicit_request_fields() {
+        let body = SdGenerationRequest {
+            prompt: "explicit".to_string(),
+            steps: Some(3),
+            scheduler: Some("DDIM".to_string()),
+            width: Some(128),
+            infotext: Some(
+                "from infotext\nSteps: 30, Sampler: Euler, Schedule type: Karras, CFG scale: 7, Seed: 2, Size: 512x512"
+                    .to_string(),
+            ),
+            ..empty_request()
+        };
+
+        let body = sdapi_apply_infotext_defaults(body);
+
+        assert_eq!(body.prompt, "explicit");
+        assert_eq!(body.steps, Some(3));
+        assert_eq!(body.scheduler.as_deref(), Some("DDIM"));
+        assert_eq!(body.sampler_name.as_deref(), Some("Euler"));
+        assert_eq!(body.width, Some(128));
+        assert_eq!(body.height, Some(512));
+        assert_eq!(body.cfg_scale, Some(7.0));
+    }
+
+    #[test]
+    fn sdapi_infotext_parser_handles_quoted_commas() {
+        let parsed = sdapi_parse_infotext(
+            "prompt\nSteps: 4, Sampler: Euler, CFG scale: 7, Seed: 9, Size: 64x64, Hires prompt: \"sharp, detailed\"",
+        )
+        .unwrap();
+
+        assert_eq!(parsed.prompt, "prompt");
+        assert_eq!(
+            sdapi_infotext_string(&parsed, "Hires prompt").as_deref(),
+            Some("sharp, detailed")
+        );
     }
 
     #[test]
