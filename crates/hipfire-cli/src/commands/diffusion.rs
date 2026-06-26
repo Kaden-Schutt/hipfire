@@ -154,7 +154,7 @@ pub struct DiffusionTxt2ImgArgs {
     /// Classifier-free guidance scale
     #[arg(long, default_value_t = 7.0)]
     pub cfg_scale: f32,
-    /// Scheduler/sampler name, such as Automatic, Euler, Euler Karras, DDIM, or DPM++ 2M Karras
+    /// Scheduler/sampler name, such as Automatic, Euler, Euler Karras, DDIM, DPM++ 2M Karras, or DPM++ 3M Karras
     #[arg(long, default_value = "Automatic")]
     pub scheduler: String,
     /// Seed. Omit for zero, pass once to reuse, or repeat per prompt.
@@ -224,7 +224,7 @@ pub struct DiffusionImg2ImgArgs {
     /// Classifier-free guidance scale
     #[arg(long, default_value_t = 7.0)]
     pub cfg_scale: f32,
-    /// Scheduler/sampler name, such as Automatic, Euler, Euler Karras, DDIM, or DPM++ 2M Karras
+    /// Scheduler/sampler name, such as Automatic, Euler, Euler Karras, DDIM, DPM++ 2M Karras, or DPM++ 3M Karras
     #[arg(long, default_value = "Automatic")]
     pub scheduler: String,
     /// Seed. Omit for zero, pass once to reuse, or repeat per prompt.

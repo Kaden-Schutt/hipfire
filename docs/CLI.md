@@ -208,7 +208,7 @@ Runtime note: runnable `.hfq` diffusion artifacts still perform CLIP tokenizatio
 
 `/sdapi/v1/progress` tracks active SDAPI sampling steps and updates `current_image` with live PNG previews decoded from intermediate latents, then leaves the final generated PNG there after a successful HFQ diffusion request completes; WebUI's `skip_current_image=true` progress query suppresses only that response's preview payload. `/sdapi/v1/memory` returns WebUI-shaped host RAM stats and marks CUDA memory stats unavailable because Hipfire uses HIP/ROCm. WebUI's create/train embedding and hypernetwork endpoints are registered for client compatibility and return an `info` response explaining that native training is not implemented by the SDAPI layer.
 
-SDAPI sampler fields follow WebUI's split controls: full scheduler names such as `DDIM` and `DPM++ 2M` are accepted directly, while schedule modifiers such as `Automatic` and `Karras` combine with `sampler_name` or `sampler_index` (for example `Euler` + `Karras` becomes `Euler Karras`).
+SDAPI sampler fields follow WebUI's split controls: full scheduler names such as `DDIM`, `DPM++ 2M`, and `DPM++ 3M` are accepted directly, while schedule modifiers such as `Automatic` and `Karras` combine with `sampler_name` or `sampler_index` (for example `Euler` + `Karras` becomes `Euler Karras`).
 
 SDAPI img2img and inpaint support WebUI resize modes 0 (stretch), 1 (crop and resize), 2 (resize and fill), and 3 (latent upscale). Modes 0-2 resize init and mask images before VAE encoding; mode 3 keeps the init image at its source dimensions, VAE-encodes it, then resizes the latent tensor to the requested output shape; `/sdapi/v1/latent-upscale-modes` advertises Hipfire's nearest-neighbor latent resize aliases. Hipfire also accepts common WebUI generation fields such as `styles`, `restore_faces`, `tiling`, `do_not_save_samples`, `do_not_save_grid`, `seed_resize_from_w`, `seed_resize_from_h`, `eta`, `s_churn`, `s_tmin`, `s_tmax`, `s_noise`, `override_settings_restore_afterwards`, `disable_extra_networks`, and `comments`; fields that do not affect the native runtime are returned in response `parameters` and listed in `info.ignored_fields` when active. `do_not_save_samples` suppresses disk writes even when `save_images` is true. Masked img2img also honors WebUI's `inpainting_mask_invert`, `mask_blur`, `mask_blur_x`, `mask_blur_y`, `mask_round`, and `inpainting_fill` options; default fill (0) is applied in image space before VAE encode, original (1) leaves init pixels unchanged, and latent noise (2) / latent nothing (3) additionally alter masked latents. WebUI's `inpaint_full_res` and `inpaint_full_res_padding` crop masked regions for processing and composite the generated crop back onto the init image. SDAPI requests can also import common WebUI `infotext` fields when those fields are not explicitly set in JSON. Non-empty `script_name` and `script_args` payloads are rejected because Hipfire exposes no SDAPI selectable scripts. `alwayson_scripts` accepts empty or disabled default extension payloads, but active script payloads are rejected. Txt2img high-res generation is implemented as a batched first-pass txt2img generation followed by a second-pass img2img generation at the high-res target dimensions. SDAPI high-res requests accept `enable_hr`, `firstphase_width`, `firstphase_height`, `hr_scale`, `hr_upscaler`, `hr_resize_x`, `hr_resize_y`, `hr_second_pass_steps`, `hr_checkpoint_name`, `hr_prompt`, `hr_negative_prompt`, `hr_sampler_name`, and `hr_scheduler`; `hr_checkpoint_name` may point to another resolvable diffusion HFQ artifact for the second pass.
 
@@ -334,7 +334,7 @@ With `--enable-hr`, the command first generates the requested base batch, decode
 * `--cfg-scale <CFG_SCALE>` — Classifier-free guidance scale
 
   Default value: `7`
-* `--scheduler <SCHEDULER>` — Scheduler/sampler name, such as Automatic, Euler, Euler Karras, DDIM, or DPM++ 2M Karras
+* `--scheduler <SCHEDULER>` — Scheduler/sampler name, such as Automatic, Euler, Euler Karras, DDIM, DPM++ 2M Karras, or DPM++ 3M Karras
 
   Default value: `Automatic`
 * `--seed <SEED>` — Seed. Omit for zero, pass once to reuse, or repeat per prompt
@@ -381,7 +381,7 @@ Generate PNG images from init images with a diffusion .hfq artifact
 * `--cfg-scale <CFG_SCALE>` — Classifier-free guidance scale
 
   Default value: `7`
-* `--scheduler <SCHEDULER>` — Scheduler/sampler name, such as Automatic, Euler, Euler Karras, DDIM, or DPM++ 2M Karras
+* `--scheduler <SCHEDULER>` — Scheduler/sampler name, such as Automatic, Euler, Euler Karras, DDIM, DPM++ 2M Karras, or DPM++ 3M Karras
 
   Default value: `Automatic`
 * `--seed <SEED>` — Seed. Omit for zero, pass once to reuse, or repeat per prompt

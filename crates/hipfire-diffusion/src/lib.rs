@@ -524,6 +524,22 @@ impl SchedulerConfig {
         }
         if matches!(
             normalized.as_str(),
+            "dpm++ 3m" | "dpmpp 3m" | "dpm++3m" | "dpmpp3m"
+        ) {
+            let mut config = self.clone();
+            config.class_name = "DPMSolverMultistepScheduler".to_string();
+            config.algorithm_type = Some("dpmsolver++".to_string());
+            config.solver_order = Some(3);
+            config.solver_type = config.solver_type.or_else(|| Some("midpoint".to_string()));
+            config.lower_order_final = config.lower_order_final.or(Some(true));
+            config.thresholding = config.thresholding.or(Some(false));
+            if karras {
+                config.use_karras_sigmas = Some(true);
+            }
+            return Ok(config);
+        }
+        if matches!(
+            normalized.as_str(),
             "euler" | "euler a" | "euler ancestral" | "euler_a"
         ) {
             let mut config = self.clone();
@@ -559,7 +575,7 @@ impl SchedulerConfig {
             return Ok(config);
         }
         Err(DiffusionError::InvalidRequest(format!(
-            "unsupported scheduler {requested:?}; supported schedulers are Automatic, DPM++ 2M, DPM++ 2M Karras, Euler, Euler a, Euler Karras, and DDIM"
+            "unsupported scheduler {requested:?}; supported schedulers are Automatic, DPM++ 2M, DPM++ 2M Karras, DPM++ 3M, DPM++ 3M Karras, Euler, Euler a, Euler Karras, and DDIM"
         )))
     }
 }
@@ -790,9 +806,9 @@ impl SchedulerSolver {
             }
         };
         let solver_order = config.solver_order.unwrap_or(2);
-        if !(1..=2).contains(&solver_order) {
+        if !(1..=3).contains(&solver_order) {
             return Err(DiffusionError::InvalidMetadata(format!(
-                "unsupported DPM-Solver solver_order {solver_order}; only 1 and 2 are implemented"
+                "unsupported DPM-Solver solver_order {solver_order}; only 1, 2, and 3 are implemented"
             )));
         }
         Ok(Self::DpmSolverMultistep {
@@ -1272,33 +1288,52 @@ impl DiffusionSchedule {
             && use_lower_order_final
             && self.train_timesteps.len() < 15;
 
-        let prev_sample = if solver_order == 1 || state.lower_order_nums < 1 || lower_order_final {
-            self.dpm_first_order_update(
-                state.model_outputs.last().unwrap(),
-                timestep,
-                prev_timestep,
-                &sample,
-            )?
-        } else if solver_order == 2 || state.lower_order_nums < 2 || lower_order_second {
-            let previous_timestep =
-                *self
+        let prev_sample =
+            if solver_order == 1 || state.lower_order_nums < 1 || lower_order_final {
+                self.dpm_first_order_update(
+                    state.model_outputs.last().unwrap(),
+                    timestep,
+                    prev_timestep,
+                    &sample,
+                )?
+            } else if solver_order == 2 || state.lower_order_nums < 2 || lower_order_second {
+                let previous_timestep = *self
                     .train_timesteps
                     .get(step.wrapping_sub(1))
                     .ok_or_else(|| {
                         DiffusionError::InvalidRequest("missing previous DPM timestep".to_string())
                     })?;
-            self.dpm_second_order_update(
-                previous_timestep,
-                timestep,
-                prev_timestep,
-                &sample,
-                state,
-            )?
-        } else {
-            return Err(DiffusionError::InvalidMetadata(
-                "third-order DPM-Solver is not implemented".to_string(),
-            ));
-        };
+                self.dpm_second_order_update(
+                    previous_timestep,
+                    timestep,
+                    prev_timestep,
+                    &sample,
+                    state,
+                )?
+            } else {
+                let previous_timestep = *self
+                    .train_timesteps
+                    .get(step.wrapping_sub(1))
+                    .ok_or_else(|| {
+                        DiffusionError::InvalidRequest("missing previous DPM timestep".to_string())
+                    })?;
+                let previous_previous_timestep = *self
+                    .train_timesteps
+                    .get(step.wrapping_sub(2))
+                    .ok_or_else(|| {
+                        DiffusionError::InvalidRequest(
+                            "missing second previous DPM timestep".to_string(),
+                        )
+                    })?;
+                self.dpm_third_order_update(
+                    previous_previous_timestep,
+                    previous_timestep,
+                    timestep,
+                    prev_timestep,
+                    &sample,
+                    state,
+                )?
+            };
 
         latents.data = prev_sample.data;
         if state.lower_order_nums < solver_order {
@@ -1424,6 +1459,91 @@ impl DiffusionSchedule {
                             + (alpha_t * (((-h).exp() - 1.0) / h + 1.0)) * d1
                     }
                 }
+            })
+            .collect();
+        Ok(CpuTensor {
+            shape: sample.shape.clone(),
+            data,
+        })
+    }
+
+    fn dpm_third_order_update(
+        &self,
+        previous_previous_timestep: usize,
+        previous_timestep: usize,
+        timestep: usize,
+        prev_timestep: usize,
+        sample: &CpuTensor,
+        state: &SchedulerStepState,
+    ) -> DiffusionResult<CpuTensor> {
+        let m0 = state.model_outputs.last().ok_or_else(|| {
+            DiffusionError::InvalidRequest("missing current DPM model output".to_string())
+        })?;
+        let m1 = state
+            .model_outputs
+            .get(state.model_outputs.len().saturating_sub(2))
+            .ok_or_else(|| {
+                DiffusionError::InvalidRequest("missing previous DPM model output".to_string())
+            })?;
+        let m2 = state
+            .model_outputs
+            .get(state.model_outputs.len().saturating_sub(3))
+            .ok_or_else(|| {
+                DiffusionError::InvalidRequest(
+                    "missing second previous DPM model output".to_string(),
+                )
+            })?;
+        let lambda_t = self.scheduler_lambda(prev_timestep)?;
+        let lambda_s0 = self.scheduler_lambda(timestep)?;
+        let lambda_s1 = self.scheduler_lambda(previous_timestep)?;
+        let lambda_s2 = self.scheduler_lambda(previous_previous_timestep)?;
+        let alpha_t = self.scheduler_alpha(prev_timestep)?;
+        let sigma_t = self.scheduler_sigma(prev_timestep)?;
+        let sigma_s0 = self.scheduler_sigma(timestep)?;
+        let h = lambda_t - lambda_s0;
+        let h0 = lambda_s0 - lambda_s1;
+        let h1 = lambda_s1 - lambda_s2;
+        if h.abs() <= f32::MIN_POSITIVE
+            || h0.abs() <= f32::MIN_POSITIVE
+            || h1.abs() <= f32::MIN_POSITIVE
+            || (h0 + h1).abs() <= f32::MIN_POSITIVE
+        {
+            return self.dpm_second_order_update(
+                previous_timestep,
+                timestep,
+                prev_timestep,
+                sample,
+                state,
+            );
+        }
+        let r0 = h0 / h;
+        let r1 = h1 / h;
+        if r0.abs() <= f32::MIN_POSITIVE
+            || r1.abs() <= f32::MIN_POSITIVE
+            || (r0 + r1).abs() <= f32::MIN_POSITIVE
+        {
+            return self.dpm_second_order_update(
+                previous_timestep,
+                timestep,
+                prev_timestep,
+                sample,
+                state,
+            );
+        }
+        let exp_neg_h = (-h).exp();
+        let data = sample
+            .data
+            .iter()
+            .zip(m0.iter().zip(m1.iter().zip(m2)))
+            .map(|(sample, (m0, (m1, m2)))| {
+                let d0 = *m0;
+                let d1_0 = (m0 - m1) / r0;
+                let d1_1 = (m1 - m2) / r1;
+                let d1 = d1_0 + (r0 / (r0 + r1)) * (d1_0 - d1_1);
+                let d2 = (d1_0 - d1_1) / (r0 + r1);
+                (sigma_t / sigma_s0) * sample - (alpha_t * (exp_neg_h - 1.0)) * d0
+                    + (alpha_t * ((exp_neg_h - 1.0) / h + 1.0)) * d1
+                    - (alpha_t * ((exp_neg_h - 1.0 + h) / (h * h) - 0.5)) * d2
             })
             .collect();
         Ok(CpuTensor {
@@ -17422,6 +17542,8 @@ mod tests {
 
         let dpm = config.resolve_request_scheduler("DPM++ 2M").unwrap();
         let dpm_karras = config.resolve_request_scheduler("DPM++ 2M Karras").unwrap();
+        let dpm3 = config.resolve_request_scheduler("DPM++ 3M").unwrap();
+        let dpm3_karras = config.resolve_request_scheduler("DPM++ 3M Karras").unwrap();
         let euler = config.resolve_request_scheduler("Euler").unwrap();
         let euler_karras = config.resolve_request_scheduler("Euler Karras").unwrap();
         let euler_a = config.resolve_request_scheduler("Euler a").unwrap();
@@ -17430,6 +17552,11 @@ mod tests {
         assert_eq!(dpm.class_name, "DPMSolverMultistepScheduler");
         assert_eq!(dpm_karras.class_name, "DPMSolverMultistepScheduler");
         assert_eq!(dpm_karras.use_karras_sigmas, Some(true));
+        assert_eq!(dpm3.class_name, "DPMSolverMultistepScheduler");
+        assert_eq!(dpm3.algorithm_type.as_deref(), Some("dpmsolver++"));
+        assert_eq!(dpm3.solver_order, Some(3));
+        assert_eq!(dpm3_karras.solver_order, Some(3));
+        assert_eq!(dpm3_karras.use_karras_sigmas, Some(true));
         assert_eq!(euler.class_name, "EulerDiscreteScheduler");
         assert_eq!(euler.algorithm_type, None);
         assert_eq!(euler_karras.class_name, "EulerDiscreteScheduler");
@@ -17579,6 +17706,116 @@ mod tests {
         assert!(first.is_finite());
         assert!(latents.data[0].is_finite());
         assert_ne!(latents.data[0], first);
+    }
+
+    #[test]
+    fn dpm_solver_third_order_update_matches_diffusers_formula() {
+        let lambda = |alpha: f32, sigma: f32| alpha.ln() - sigma.ln();
+        let schedule = DiffusionSchedule {
+            timesteps: vec![3.0, 2.0, 1.0],
+            sigmas: vec![0.4, 0.3, 0.2, 0.0],
+            prediction_type: SchedulerPredictionType::Sample,
+            input_scaling: SchedulerInputScaling::None,
+            solver: SchedulerSolver::DpmSolverMultistep {
+                algorithm_type: DpmSolverAlgorithm::DpmSolverPlusPlus,
+                solver_order: 3,
+                solver_type: DpmSolverType::Midpoint,
+                lower_order_final: false,
+                thresholding: false,
+            },
+            train_timesteps: vec![3, 2, 1],
+            alpha_t: vec![0.95, 0.85, 0.75, 0.65],
+            sigma_t: vec![0.10, 0.20, 0.30, 0.40],
+            lambda_t: vec![
+                lambda(0.95, 0.10),
+                lambda(0.85, 0.20),
+                lambda(0.75, 0.30),
+                lambda(0.65, 0.40),
+            ],
+        };
+        let sample = CpuTensor {
+            shape: vec![1, 1, 1, 1],
+            data: vec![1.25],
+        };
+        let state = SchedulerStepState {
+            model_outputs: vec![vec![0.20], vec![0.40], vec![0.70]],
+            lower_order_nums: 2,
+        };
+
+        let next = schedule
+            .dpm_third_order_update(3, 2, 1, 0, &sample, &state)
+            .unwrap();
+
+        let lambda_t = schedule.scheduler_lambda(0).unwrap();
+        let lambda_s0 = schedule.scheduler_lambda(1).unwrap();
+        let lambda_s1 = schedule.scheduler_lambda(2).unwrap();
+        let lambda_s2 = schedule.scheduler_lambda(3).unwrap();
+        let h = lambda_t - lambda_s0;
+        let h0 = lambda_s0 - lambda_s1;
+        let h1 = lambda_s1 - lambda_s2;
+        let r0 = h0 / h;
+        let r1 = h1 / h;
+        let m0 = 0.70;
+        let m1 = 0.40;
+        let m2 = 0.20;
+        let d1_0 = (m0 - m1) / r0;
+        let d1_1 = (m1 - m2) / r1;
+        let d1 = d1_0 + (r0 / (r0 + r1)) * (d1_0 - d1_1);
+        let d2 = (d1_0 - d1_1) / (r0 + r1);
+        let exp_neg_h = (-h).exp();
+        let expected = (schedule.scheduler_sigma(0).unwrap()
+            / schedule.scheduler_sigma(1).unwrap())
+            * sample.data[0]
+            - (schedule.scheduler_alpha(0).unwrap() * (exp_neg_h - 1.0)) * m0
+            + (schedule.scheduler_alpha(0).unwrap() * ((exp_neg_h - 1.0) / h + 1.0)) * d1
+            - (schedule.scheduler_alpha(0).unwrap() * ((exp_neg_h - 1.0 + h) / (h * h) - 0.5)) * d2;
+
+        assert!((next.data[0] - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dpm_solver_order_three_step_uses_third_order_history() {
+        let lambda = |alpha: f32, sigma: f32| alpha.ln() - sigma.ln();
+        let schedule = DiffusionSchedule {
+            timesteps: vec![3.0, 2.0, 1.0],
+            sigmas: vec![0.4, 0.3, 0.2, 0.0],
+            prediction_type: SchedulerPredictionType::Sample,
+            input_scaling: SchedulerInputScaling::None,
+            solver: SchedulerSolver::DpmSolverMultistep {
+                algorithm_type: DpmSolverAlgorithm::DpmSolverPlusPlus,
+                solver_order: 3,
+                solver_type: DpmSolverType::Midpoint,
+                lower_order_final: false,
+                thresholding: false,
+            },
+            train_timesteps: vec![3, 2, 1],
+            alpha_t: vec![0.95, 0.85, 0.75, 0.65],
+            sigma_t: vec![0.10, 0.20, 0.30, 0.40],
+            lambda_t: vec![
+                lambda(0.95, 0.10),
+                lambda(0.85, 0.20),
+                lambda(0.75, 0.30),
+                lambda(0.65, 0.40),
+            ],
+        };
+        let mut latents = LatentBatch {
+            batch: 1,
+            channels: 1,
+            height: 1,
+            width: 1,
+            data: vec![1.0],
+        };
+        let mut state = SchedulerStepState::default();
+
+        schedule.step(&mut latents, &[0.20], 0, &mut state).unwrap();
+        schedule.step(&mut latents, &[0.40], 1, &mut state).unwrap();
+        let second = latents.data[0];
+        schedule.step(&mut latents, &[0.70], 2, &mut state).unwrap();
+
+        assert_eq!(state.lower_order_nums, 3);
+        assert_eq!(state.model_outputs.len(), 3);
+        assert!(latents.data[0].is_finite());
+        assert_ne!(latents.data[0], second);
     }
 
     #[test]

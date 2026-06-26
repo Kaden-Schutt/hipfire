@@ -3422,7 +3422,16 @@ pub async fn get_samplers() -> Json<Value> {
     Json(json!([
         {
             "name": COMPAT_SAMPLER,
-            "aliases": ["Euler", "Euler a", "Euler Karras", "DDIM", "DPM++ 2M", "DPM++ 2M Karras"],
+            "aliases": [
+                "Euler",
+                "Euler a",
+                "Euler Karras",
+                "DDIM",
+                "DPM++ 2M",
+                "DPM++ 2M Karras",
+                "DPM++ 3M",
+                "DPM++ 3M Karras"
+            ],
             "options": {},
         }
     ]))
@@ -5968,6 +5977,7 @@ mod tests {
         let aliases = samplers[0]["aliases"].as_array().unwrap();
 
         assert!(aliases.contains(&json!("DPM++ 2M Karras")));
+        assert!(aliases.contains(&json!("DPM++ 3M Karras")));
         assert!(aliases.contains(&json!("Euler Karras")));
         assert!(aliases.contains(&json!("DDIM")));
     }

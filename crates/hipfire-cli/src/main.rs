@@ -64,7 +64,7 @@ enum Command {
     /// native training is not implemented by the SDAPI layer.
     ///
     /// SDAPI sampler fields follow WebUI's split controls: full scheduler names
-    /// such as `DDIM` and `DPM++ 2M` are accepted directly, while schedule
+    /// such as `DDIM`, `DPM++ 2M`, and `DPM++ 3M` are accepted directly, while schedule
     /// modifiers such as `Automatic` and `Karras` combine with `sampler_name`
     /// or `sampler_index` (for example `Euler` + `Karras` becomes
     /// `Euler Karras`).
