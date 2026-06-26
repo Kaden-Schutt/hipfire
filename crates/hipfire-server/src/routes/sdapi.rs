@@ -379,7 +379,7 @@ async fn resolve_diffusion_hfq_for_request(
     resolve_diffusion_hfq_candidate(&candidate)
 }
 
-fn resolve_diffusion_hfq_candidate(candidate: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_diffusion_hfq_candidate(candidate: &str) -> Option<PathBuf> {
     if candidate.is_empty() {
         return None;
     }
@@ -1519,7 +1519,7 @@ fn sdapi_output_dir(body: &SdGenerationRequest, mode: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp/hipfire-sdapi").join(mode))
 }
 
-async fn cached_diffusion_pipeline(
+pub(crate) async fn cached_diffusion_pipeline(
     state: &SharedState,
     path: PathBuf,
 ) -> Result<Arc<DiffusionPipeline>, DiffusionError> {

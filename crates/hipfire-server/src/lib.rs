@@ -388,6 +388,14 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hipfire_diffusion::{
+        DiffusionBatchMetadata, DiffusionHfqMetadata, DiffusionPipelineMetadata,
+        DiffusionQuantizationMetadata, DiffusionTokenizerMetadata, DIFFUSION_ARTIFACT_KIND,
+        DIFFUSION_SCHEMA_VERSION, HFQ_ARCH_DIFFUSION,
+    };
+    use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+    use std::collections::BTreeMap;
+    use std::path::Path;
 
     #[test]
     fn cors_layer_disabled_when_no_origins() {
@@ -413,6 +421,64 @@ mod tests {
         assert!(request_counts_for_idle(&Method::POST, "/sdapi/v1/txt2img"));
         assert!(request_counts_for_idle(&Method::POST, "/sdapi/v1/img2img"));
     }
+
+    #[tokio::test]
+    async fn prewarm_default_model_routes_diffusion_hfq_to_diffusion_cache() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-diffusion-prewarm-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("metadata-only-diffusion.hfq");
+        write_metadata_only_diffusion_hfq(&hfq_path);
+
+        let mut config = HipfireConfig::default();
+        config.default_model = Some(hfq_path.to_string_lossy().into_owned());
+        let state = AppState::new(config);
+
+        prewarm_default_model(&state).await;
+
+        assert!(state.engine.lock().await.is_none());
+        assert!(state.loaded_model_path.lock().await.is_none());
+        assert_eq!(state.diffusion_pipelines.lock().await.len(), 1);
+    }
+
+    fn write_metadata_only_diffusion_hfq(path: &Path) {
+        let metadata = DiffusionHfqMetadata {
+            artifact_kind: DIFFUSION_ARTIFACT_KIND.to_string(),
+            schema_version: DIFFUSION_SCHEMA_VERSION,
+            pipeline: DiffusionPipelineMetadata {
+                class_name: "StableDiffusionPipeline".to_string(),
+                source: "/tmp/metadata-only-diffusion".to_string(),
+                model_name: "metadata-only-diffusion".to_string(),
+                latent_channels: Some(4),
+                latent_height: Some(64),
+                latent_width: Some(64),
+                supported_widths: vec![512],
+                supported_heights: vec![512],
+            },
+            tokenizer: DiffusionTokenizerMetadata::default(),
+            tokenizer_2: None,
+            batch: DiffusionBatchMetadata {
+                max_batch: 1,
+                batched_runtime: true,
+            },
+            quantization: DiffusionQuantizationMetadata {
+                weight_format: "metadata-only".to_string(),
+                activation_format: "fp16".to_string(),
+                tensor_roles_version: 1,
+            },
+            components: BTreeMap::new(),
+        };
+        let tensors: Vec<HfqMemTensor> = Vec::new();
+        write_hfqm_package_mem(
+            path,
+            HFQ_ARCH_DIFFUSION,
+            &serde_json::to_string(&metadata).unwrap(),
+            &tensors,
+        )
+        .unwrap();
+    }
 }
 
 async fn prewarm_default_model(state: &SharedState) {
@@ -425,6 +491,10 @@ async fn prewarm_default_model(state: &SharedState) {
     };
 
     tracing::info!("pre-warming {model}");
+    if prewarm_diffusion_model(state, &model).await {
+        return;
+    }
+
     let required_max_seq = {
         let cfg = state.config.lock().await;
         cfg.max_seq
@@ -460,4 +530,29 @@ async fn prewarm_default_model(state: &SharedState) {
             tracing::warn!("pre-warm load failed: {e}; will load on first request");
         }
     }
+}
+
+async fn prewarm_diffusion_model(state: &SharedState, model: &str) -> bool {
+    let Some(path) = routes::sdapi::resolve_diffusion_hfq_candidate(model) else {
+        return false;
+    };
+
+    match routes::sdapi::cached_diffusion_pipeline(state, path.clone()).await {
+        Ok(pipeline) => {
+            let summary = pipeline.summary();
+            tracing::info!(
+                model = %summary.model_name,
+                pipeline = %summary.pipeline_class,
+                path = %path.display(),
+                "diffusion warm-up complete"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                "diffusion pre-warm failed for {}: {e}; first SDAPI request will retry",
+                path.display()
+            );
+        }
+    }
+    true
 }

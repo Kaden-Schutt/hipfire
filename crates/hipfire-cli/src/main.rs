@@ -42,15 +42,17 @@ enum Command {
     /// opt into `--rocm-device-id` to route currently GPU-backed generation
     /// boundaries through ROCm.
     ///
-    /// `hipfire serve` exposes the same hybrid path through the Stable
+    /// `hipfire serve --model <diffusion.hfq>` pre-warms the resolved diffusion
+    /// pipeline cache directly instead of routing the artifact through the chat
+    /// daemon loader. The server exposes the same hybrid path through the Stable
     /// Diffusion API extension fields `rocm_device_id` or
-    /// `hipfire_rocm_device_id` on `/sdapi/v1/txt2img` and
-    /// `/sdapi/v1/img2img` requests, through the same keys in
-    /// `override_settings`, or through the persisted `/sdapi/v1/options` value
-    /// `hipfire_rocm_device_id`. Persisted `/sdapi/v1/options` values for
-    /// `send_images`, `save_images`, `outdir_samples`, `outdir_txt2img_samples`,
-    /// and `outdir_img2img_samples` act as generation defaults unless the
-    /// request or `override_settings` supplies a more specific value.
+    /// `hipfire_rocm_device_id` on `/sdapi/v1/txt2img` and `/sdapi/v1/img2img`
+    /// requests, through the same keys in `override_settings`, or through the
+    /// persisted `/sdapi/v1/options` value `hipfire_rocm_device_id`. Persisted
+    /// `/sdapi/v1/options` values for `send_images`, `save_images`,
+    /// `outdir_samples`, `outdir_txt2img_samples`, and `outdir_img2img_samples`
+    /// act as generation defaults unless the request or `override_settings`
+    /// supplies a more specific value.
     ///
     /// `/sdapi/v1/progress` tracks active SDAPI sampling steps and updates
     /// `current_image` with live PNG previews decoded from intermediate

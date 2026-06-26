@@ -285,6 +285,15 @@ try:
     if progress.get("state", {}).get("interrupted"):
         raise RuntimeError(f"progress endpoint reports interrupted after smoke: {progress}")
 
+    log_text = open(log_path, "r", encoding="utf-8", errors="replace").read()
+    if "pre-warm load failed" in log_text and "tokenizer not found" in log_text:
+        raise RuntimeError(
+            "diffusion model was routed through the LLM prewarm path; "
+            f"see server log {log_path}"
+        )
+    if "diffusion warm-up complete" not in log_text:
+        raise RuntimeError(f"server log did not record diffusion warm-up; see {log_path}")
+
     print(json.dumps({
         "status": "pass",
         "base_url": base_url,
