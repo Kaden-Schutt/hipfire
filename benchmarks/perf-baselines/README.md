@@ -50,3 +50,17 @@ Speed rows must include `model_id`, normally the canonical `.hfq` stem without
 the extension. Gates match on `model_id` and `prefill_tokens`; `model_size` and
 `format` are metadata for grouping/reporting, not sufficient identity by
 themselves.
+
+## Speed Matrix Scope
+
+`tests/speed-gate.sh` is still a narrow MQ4 regression wrapper. It discovers
+`qwen3.5-{0.8b,4b,9b,27b}-mq4.hfq` under
+`${HIPFIRE_MODELS_DIR:-~/.hipfire/models}` and compares those rows with the
+selected `benchmarks/perf-baselines/<gfx>-*.json` file. It does not currently
+discover Qwen3.6, A3B, 2B, 122B, Lloyd, AWQ, MQ3, or MQ6 artifacts on its own.
+
+For a broader local model sweep, use `hipfire-eval --models` with the speed
+battery and then curate a source-controlled baseline JSON from the resulting
+report. Keep `model_id` equal to the canonical HFQ stem, for example
+`qwen3.6-27b-mq4` or `qwen3.6-35b-a3b-mq4`, so future gates can match by exact
+artifact identity.

@@ -10,7 +10,7 @@ pub struct ServeArgs {
     /// Override bind port
     #[arg(long, short)]
     pub port: Option<u16>,
-    /// Pre-load a model on startup
+    /// Pre-load a model on startup by name, shorthand, alias, or path
     #[arg(long, short)]
     pub model: Option<String>,
     /// Log full raw chat requests and raw model replies.

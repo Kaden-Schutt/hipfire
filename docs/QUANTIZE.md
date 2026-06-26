@@ -24,6 +24,7 @@ Examples:
 Qwen3.5-9B.oq4.hfq
 Qwen3.5-9B.oq4+.hfq
 Qwen3.5-9B.oq4++.hfq
+Qwen3.5-9B.mq4l.hfq
 Qwen3.5-9B.mq4++.gfx1103.hfq
 ```
 
@@ -32,11 +33,13 @@ Qwen3.5-9B.mq4++.gfx1103.hfq
 Quant tokens describe weight encoding only:
 
 ```text
-<family><bitwidth>[+][+]
+<family><bitwidth>[l][+][+]
 ```
 
 - `mq` / `MQ` is affine Magnum Quant.
 - `oq` / `OQ` is symmetric Opus Quant. Do not use `op` for new artifacts.
+- `l` after the bitwidth means Lloyd-Max/codebook MQ encoding, for example
+  `mq4l`. Do not use `lloyd-mq4` for new artifacts.
 - A first `+` means clip-search, SmoothQuant, AWQ, or a comparable
   activation-aware clipping/scaling pass.
 - A second `+` means Hessian/LDLQ error feedback.
@@ -52,6 +55,7 @@ groups before the quant token, for example `Qwen3.5-9B.mtp-vl.oq4.hfq` or
 | Format | Meaning | Quantizer aliases |
 |---|---|---|
 | `mq4` | 4-bit affine Magnum Quant | none |
+| `mq4l` | 4-bit Lloyd-Max/codebook Magnum Quant | legacy `lloyd-mq4` parser path until removed |
 | `mq4+` | `mq4` plus clip-search/SmoothQuant/AWQ-style calibration | none |
 | `mq4++` | `mq4+` plus Hessian/LDLQ error feedback | none |
 | `oq4` | 4-bit symmetric Opus Quant | legacy `op4` parser path, `opus` |
@@ -67,6 +71,8 @@ The Rust code still uses older internal enum names such as `Oq4G256` and
 The plus marks are positional. `oq4+` means activation-aware clipping/scaling
 without Hessian/LDLQ feedback. `oq4++` means the same first-stage calibration
 plus Hessian/LDLQ feedback. Without those inputs, the artifact is plain `oq4`.
+Lloyd-Max/codebook MQ is encoded with the `l` suffix, so the canonical artifact
+token is `mq4l`, not `lloyd-mq4`.
 
 For a quality-gated `oq4+` artifact, provide activation calibration inputs:
 

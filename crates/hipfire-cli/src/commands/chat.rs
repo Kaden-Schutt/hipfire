@@ -13,8 +13,8 @@ use crate::model::find_model;
 
 #[derive(Debug, Args)]
 pub struct ChatArgs {
-    /// Model name, alias, or path. Falls back to the `default_model` config
-    /// value when omitted.
+    /// Model name, shorthand, alias, or path. Falls back to the
+    /// `default_model` config value when omitted.
     #[arg(long, short)]
     pub model: Option<String>,
     /// Prompt text

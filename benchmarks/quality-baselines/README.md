@@ -9,25 +9,49 @@ canary fixture + reference manifest + result tables.
 
 ## Quick-start (regenerate BF16 references, then run an eval)
 
-Current baseline refs should be generated locally as HFQM
-`.kldref.hfq` packages using Hipfire reference execution with
-`--kv-mode fp32` and FP32 DeltaNet state. Do not use downloaded legacy
-`.kldref.bin` refs for new baseline claims; those remain historical
-artifacts until regenerated or repackaged.
+Current checkout note: the historical `build_kld_ref_hipfire` example named in
+older docs is not present. For local HFQ models under `~/.hipfire/models/`, use
+the current first-party paths instead:
+
+- `perplexity --dump-ref` writes a compact `.pkld` top-K reference consumed by
+  the `hipfire-eval --battery perplexity --executor examples` path.
+- `collect_artifacts --kldref` writes a calibration HFQM package that includes
+  `lm_head.kldref_*` tensors alongside Hessian/imatrix artifacts.
+
+Do not use downloaded legacy `.kldref.bin` refs for new baseline claims; those
+remain historical compatibility artifacts until regenerated or repackaged.
+
+```bash
+cargo build --release --features deltanet -p hipfire-runtime \
+  --example perplexity
+
+target/release/examples/perplexity \
+  ~/.hipfire/models/qwen3.5-0.8b-bf16.hfq \
+  benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt \
+  --ctx 2048 --warmup 8 --offset 0 --kv-mode fp32 --top-k 128 \
+  --dump-ref ~/.hipfire/datasets/kldref/qwen3.5-0.8b-bf16.pkld
+```
+
+Then run a candidate against that ref:
+
+```bash
+HIPFIRE_EVAL_PERPLEXITY_CTX=2048 \
+target/release/hipfire-eval \
+  --model ~/.hipfire/models/qwen3.5-0.8b-mq4.hfq \
+  --battery perplexity --executor examples --kv-mode q8 \
+  --kldref ~/.hipfire/datasets/kldref/qwen3.5-0.8b-bf16.pkld
+```
+
+For HFQM calibration bundles instead of `.pkld`, use:
 
 ```bash
 cargo run --release --features deltanet -p hipfire-runtime \
-  --example build_kld_ref_hipfire -- \
+  --example collect_artifacts -- \
   --model ~/.hipfire/models/qwen3.5-0.8b-bf16.hfq \
-  --slice benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt \
-  --top-k 256 \
-  --output benchmarks/quality-baselines/refs/qwen3.5-0.8b-bf16.kldref.hfq \
-  --n-ctx 2048 --kv-mode fp32
+  --corpus benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt \
+  --output ~/.hipfire/datasets/kldref/qwen3.5-0.8b-bf16.calib.hfq \
+  --max-tokens 2048 --kldref
 ```
-
-The package metadata records the source model hash, slice hash, KV mode,
-DeltaNet state precision, top-K shape, and producer command. See
-`docs/hfqm-packages.md`.
 
 ### Legacy download path
 
@@ -67,38 +91,24 @@ benchmarks/quality-baselines/
 ```
 
 The producer / candidate-side binaries are Rust examples in
-`crates/hipfire-runtime/examples/` — `build_kld_ref.rs`,
-`build_kld_ref_hipfire.rs`, `eval_hipfire.rs`, `eval_gguf.rs`,
-`tokenize_slice.rs`. The harness reaches into them via plain
-`cargo run --release --example <name>` invocations; nothing in this
-directory needs to know their paths.
-
-`build_kld_ref.rs` is the historical cross-engine producer: it drives a
-pinned llama.cpp `llama-perplexity` BF16 GGUF and writes legacy HFKLDR.
-For first-party Hipfire references from HFQ/BF16 artifacts, use
-`build_kld_ref_hipfire.rs`, which writes a metadata-rich HFQM package
-documented in `docs/hfqm-packages.md`:
-
-```bash
-cargo run --release --features deltanet -p hipfire-runtime \
-  --example build_kld_ref_hipfire -- \
-  --model ~/.hipfire/models/qwen3.5-0.8b-bf16.hfq \
-  --slice benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt \
-  --top-k 256 \
-  --output benchmarks/quality-baselines/refs/qwen3.5-0.8b-bf16.kldref.hfq \
-  --n-ctx 2048 --kv-mode fp32
-```
+`crates/hipfire-runtime/examples/`. Current local-HFQ quality capture uses
+`perplexity.rs` for PPL/KLD `.pkld` refs and `collect_artifacts.rs` for HFQM
+calibration packages. Older docs and result notes may mention
+`build_kld_ref.rs`, `eval_hipfire.rs`, or `eval_gguf.rs`; those examples are
+not present in this checkout and should be treated as historical context until
+reintroduced.
 
 ## Workflow (overview)
 
-1. **One-time** — generate the slice via `make_slice.sh`, dump BF16
-   references on gfx1151 (via `build_kld_ref.rs`), upload to
-   `hipfire-models/hipfire-eval-refs`, fill `manifest.json` with
-   sha256 + `hf_repo` + producer metadata.
+1. **One-time** — generate the slice via `make_slice.sh`, then generate local
+   BF16 refs from the matching BF16 HFQ artifact using `perplexity --dump-ref`
+   for `.pkld` refs or `collect_artifacts --kldref` for HFQM calibration
+   bundles. Keep legacy `.kldref.bin` entries in `manifest.json` only for
+   historical compatibility.
 
-2. **Per quant variant** — run `eval_hipfire` (hipfire candidates)
-   or `eval_gguf` (GGUF candidates) against the cached reference.
-   Output: a small `<variant>__<arch>.kldseq` file under
+2. **Per quant variant** — run `hipfire-eval --battery perplexity --executor
+   examples` against the cached `.pkld` reference. For legacy result-table
+   workflows, preserve the existing `<variant>__<arch>.kldseq` naming under
    `results/<date>/per-seq/`.
 
 3. **Aggregate** — `kld_reduce.py` reads per-sequence-KLD files,

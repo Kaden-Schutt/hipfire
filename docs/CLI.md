@@ -66,7 +66,7 @@ Start the hipfire HTTP server (OpenAI-compatible)
 
 * `--host <HOST>` — Override bind host
 * `-p`, `--port <PORT>` — Override bind port
-* `-m`, `--model <MODEL>` — Pre-load a model on startup
+* `-m`, `--model <MODEL>` — Pre-load a model on startup by name, shorthand, alias, or path
 * `--debug-chat` — Log full raw chat requests and raw model replies
 
 
@@ -83,7 +83,7 @@ Load a model and generate a response (one-shot)
 
 ###### **Options:**
 
-* `-m`, `--model <MODEL>` — Model name, alias, or path. Falls back to the `default_model` config value when omitted
+* `-m`, `--model <MODEL>` — Model name, shorthand, alias, or path. Falls back to the `default_model` config value when omitted
 * `--max-tokens <MAX_TOKENS>` — Max tokens to generate
 * `--temperature <TEMPERATURE>` — Sampling temperature
 * `--attach <FILE>` — Attach a file to the prompt (repeatable). The type is detected from the extension. Only images are wired today (PNG/JPEG/WebP/GIF/BMP); text, video, and audio are recognized but not yet supported and will error
@@ -258,7 +258,7 @@ Inspect a diffusion .hfq artifact and print its server-facing summary
 
 ###### **Arguments:**
 
-* `<MODEL>` — Diffusion .hfq artifact to inspect
+* `<MODEL>` — Diffusion .hfq artifact to inspect by name, shorthand, alias, or path
 
 
 
@@ -272,7 +272,7 @@ The preflight command prints a deterministic memory plan for the requested resol
 
 ###### **Options:**
 
-* `-m`, `--model <MODEL>` — Diffusion .hfq artifact to inspect
+* `-m`, `--model <MODEL>` — Diffusion .hfq artifact to inspect by name, shorthand, alias, or path
 * `-p`, `--prompt <PROMPT>` — Prompt text. Repeat for batched planning, or use --batch-size with one prompt
 
   Default value: `hipfire diffusion preflight`
@@ -317,7 +317,7 @@ With `--enable-hr`, the command first generates the requested base batch, decode
 
 ###### **Options:**
 
-* `-m`, `--model <MODEL>` — Diffusion .hfq artifact to run
+* `-m`, `--model <MODEL>` — Diffusion .hfq artifact to run by name, shorthand, alias, or path
 * `-p`, `--prompt <PROMPT>` — Prompt text. Repeat for batched generation, or use --batch-size with one prompt
 * `--negative-prompt <NEGATIVE_PROMPT>` — Negative prompt text. Omit for empty negatives, pass once to reuse, or repeat per prompt
 * `-o`, `--output <OUTPUT>` — Output PNG file for one image, or output directory for batches
@@ -369,7 +369,7 @@ Generate PNG images from init images with a diffusion .hfq artifact
 
 ###### **Options:**
 
-* `-m`, `--model <MODEL>` — Diffusion .hfq artifact to run
+* `-m`, `--model <MODEL>` — Diffusion .hfq artifact to run by name, shorthand, alias, or path
 * `-p`, `--prompt <PROMPT>` — Prompt text. Repeat for batched generation, or use --batch-size with one prompt
 * `--negative-prompt <NEGATIVE_PROMPT>` — Negative prompt text. Omit for empty negatives, pass once to reuse, or repeat per prompt
 * `--init-image <INIT_IMAGE>` — Input image path. Repeat for an image batch, or pass once to reuse across prompts
@@ -410,7 +410,7 @@ Run an end-to-end diffusion admission smoke and validate output PNGs
 
 ###### **Options:**
 
-* `-m`, `--model <MODEL>` — Diffusion .hfq artifact to run
+* `-m`, `--model <MODEL>` — Diffusion .hfq artifact to run by name, shorthand, alias, or path
 * `-p`, `--prompt <PROMPT>` — Prompt text for the smoke run
 
   Default value: `hipfire diffusion smoke test`
@@ -497,7 +497,7 @@ Send one non-streaming chat request through /v1/chat/completions
 
 ###### **Options:**
 
-* `--model <MODEL>` — Model tag/path. Defaults to server config when omitted
+* `--model <MODEL>` — Model name, shorthand, alias, or path. Defaults to server config when omitted
 * `--system <SYSTEM>` — Optional system message
 * `--max-tokens <MAX_TOKENS>` — Max tokens to generate
 * `--temperature <TEMPERATURE>` — Sampling temperature
@@ -530,7 +530,7 @@ Resolved runtime config
 
 ###### **Options:**
 
-* `--model <MODEL>` — Resolve config for a specific model tag
+* `--model <MODEL>` — Resolve config for a specific model name, shorthand, alias, or path
 
 
 

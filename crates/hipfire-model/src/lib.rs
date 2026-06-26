@@ -21,9 +21,16 @@ use std::path::{Path, PathBuf};
 
 use hipfire_hash::{file_hash, stable_hash_bytes};
 
-/// Extension preferred order for fuzzy model discovery.
-pub const QUANT_PREFERENCE: &[&str] =
-    &["-mq4", "-hf4", "-mq3", "-lloyd-mq2", "-mq6", "-hf6", "-q8"];
+/// Placeholder speed/quality order for fuzzy model discovery.
+///
+/// This is intentionally a policy guess until the benchmark matrix lands. The
+/// resolver uses it only after exact path/alias/name matches fail, for shorthand
+/// tags such as `lfm2.5:350m`.
+pub const QUANT_PREFERENCE: &[&str] = &[
+    "oq4++", "mq4++", "oq4+", "mq4+", "oq4", "mq4", "mq4l", "oq8++", "mq8++", "oq8+", "mq8+",
+    "oq8", "mq8", "mq3++", "mq3+", "mq3", "mq3l", "mq2l", "mq6++", "mq6+", "mq6", "q8f16", "q8",
+    "bf16", "f16",
+];
 
 /// Metadata about a single tensor in a model source.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -568,8 +575,32 @@ pub fn quant_preference_rank(path: &Path) -> usize {
         .to_lowercase();
     QUANT_PREFERENCE
         .iter()
-        .position(|q| name.contains(q))
+        .position(|q| filename_has_quant_token(&name, q))
         .unwrap_or(QUANT_PREFERENCE.len())
+}
+
+fn filename_has_quant_token(name: &str, quant: &str) -> bool {
+    let stem = name.strip_suffix(".hfq").unwrap_or(name);
+    let mut start = 0;
+    while let Some(rel) = stem[start..].find(quant) {
+        let idx = start + rel;
+        let before = idx == 0
+            || stem[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(|c| matches!(c, '-' | '.'));
+        let after_idx = idx + quant.len();
+        let after = after_idx == stem.len()
+            || stem[after_idx..]
+                .chars()
+                .next()
+                .is_some_and(|c| matches!(c, '-' | '.'));
+        if before && after {
+            return true;
+        }
+        start = after_idx;
+    }
+    false
 }
 
 /// Derive a display name (tag) from a model file path.
@@ -671,26 +702,57 @@ pub struct Sidecars {
     pub hessian: bool,
 }
 
-/// Quant/format token of a model display name. Scans dotted/dashed groups for
-/// the canonical artifact quant token (`mq*`, `oq*`, `bf16`, `f16`, `fp16`) and
-/// falls back to the last segment for unknown local artifacts.
+/// Quant/format token of a model display name. Scans `-`-delimited segments for
+/// a known format prefix (mq4, oq4, mq4l, q8, bf16, ...) so calibration
+/// modifiers that trail the format do not mask it; falls back to the last
+/// segment. A bundled `+feature` suffix is stripped.
 pub fn quant_token(display: &str) -> String {
-    parse_canonical_model_artifact_name(display)
-        .or_else(|| {
-            let artifact = format!("{display}.hfq");
-            parse_canonical_model_artifact_name(&artifact)
-        })
-        .map(|name| name.quant)
+    const FORMATS: &[&str] = &[
+        "bf16", "fp16", "f16", "q8", "mq2l", "mq3l", "mq4l", "mq2", "mq3", "mq4", "mq4+", "mq4++",
+        "mq6", "mq6+", "mq6++", "mq8", "mq8+", "mq8++", "op4", "op4-4", "op4-8+", "op8", "op8-16",
+        "op4+", "op8+", "oq4", "oq4+", "oq4++", "oq8", "oq8+", "oq8++", "qtip2", "qtip3", "iu8",
+        "w4a8", "w8a8",
+    ];
+    let mut best: Option<&str> = None;
+    for seg in display.split(['-', '.']) {
+        let low = seg.to_ascii_lowercase();
+        if let Some(fmt) = FORMATS
+            .iter()
+            .find(|fmt| low == **fmt || low.starts_with(&format!("{fmt}-")))
+        {
+            best = Some(&seg[..fmt.len()]);
+            continue;
+        }
+        let head = seg.split('+').next().unwrap_or(seg);
+        let low = head.to_ascii_lowercase();
+        if FORMATS.iter().any(|fmt| low == **fmt) {
+            best = Some(head);
+        }
+    }
+    let token = best
+        .map(str::to_string)
         .unwrap_or_else(|| {
             display
-                .rsplit(['-', '.'])
+                .rsplit('-')
                 .next()
                 .unwrap_or(display)
                 .split('+')
                 .next()
                 .unwrap_or(display)
-                .to_ascii_lowercase()
+                .to_string()
         })
+        .to_ascii_lowercase();
+    if display.to_ascii_lowercase().starts_with("lfm2.") && matches!(token.as_str(), "op4" | "op4+")
+    {
+        return token.trim_end_matches('+').to_string();
+    }
+    match token.as_str() {
+        "op4" => "op4-4".to_string(),
+        "op8" => "op8-16".to_string(),
+        "op4+" => "op4-4+".to_string(),
+        "op8+" => "op8-16+".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// Detect template + sidecar artifacts for a primary model file (GPU-free:
@@ -962,6 +1024,18 @@ pub fn find_model_in(arg: &str, models_dir: &Path, aliases_path: Option<&Path>) 
         return Some(with_ext);
     }
 
+    let query = ModelLookupQuery::parse(arg);
+    if query.normalized != arg.to_ascii_lowercase() {
+        let normalized = models_dir.join(&query.normalized);
+        if normalized.exists() {
+            return Some(normalized);
+        }
+        let normalized_with_ext = models_dir.join(format!("{}.hfq", query.normalized));
+        if normalized_with_ext.exists() {
+            return Some(normalized_with_ext);
+        }
+    }
+
     if let Some(aliases_path) = aliases_path {
         if let Ok(s) = std::fs::read_to_string(aliases_path) {
             if let Ok(map) = serde_json::from_str::<serde_json::Value>(&s) {
@@ -975,9 +1049,8 @@ pub fn find_model_in(arg: &str, models_dir: &Path, aliases_path: Option<&Path>) 
         }
     }
 
-    let tag_stem = normalize_tag_stem(arg);
-    let mut candidates = scan_models_dir(models_dir, &tag_stem);
-    candidates.sort_by_key(|p| quant_preference_rank(p));
+    let mut candidates = scan_models_dir(models_dir, &query);
+    candidates.sort_by_key(|p| model_candidate_rank(p, &query));
     candidates.into_iter().next()
 }
 
@@ -1310,7 +1383,8 @@ fn is_canonical_quant_group(group: &str) -> bool {
     let token = parts.last().copied().unwrap_or(group).to_ascii_lowercase();
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {
-        Regex::new(r"^(?:m[q]|o[q])\d+(?:\.\d+)?\+{0,2}$|^(?:bf16|f16|fp16)$").unwrap()
+        Regex::new(r"^(?:(?:mq\d+(?:\.\d+)?l?)|(?:oq\d+(?:\.\d+)?))\+{0,2}$|^(?:bf16|f16|fp16)$")
+            .unwrap()
     });
     re.is_match(&token)
         && parts[..parts.len().saturating_sub(1)]
@@ -1520,18 +1594,62 @@ fn parse_lfm2_dflash_target(stem: &str) -> Option<DflashDraftTarget> {
     None
 }
 
-fn scan_models_dir(dir: &Path, stem: &str) -> Vec<PathBuf> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelLookupQuery {
+    normalized: String,
+    base: String,
+    quant: Option<String>,
+}
+
+impl ModelLookupQuery {
+    fn parse(arg: &str) -> Self {
+        let normalized_tag = normalize_tag_stem(arg);
+        let normalized = normalized_tag
+            .strip_suffix(".hfq")
+            .unwrap_or(&normalized_tag)
+            .to_string();
+        let (base, quant) = split_quant_suffix(&normalized)
+            .map(|(base, quant)| (base.to_string(), Some(quant.to_string())))
+            .unwrap_or_else(|| (normalized.clone(), None));
+        Self {
+            normalized,
+            base,
+            quant,
+        }
+    }
+}
+
+fn split_quant_suffix(stem: &str) -> Option<(&str, &str)> {
+    let mut quants: Vec<&str> = QUANT_PREFERENCE.to_vec();
+    quants.sort_by_key(|q| std::cmp::Reverse(q.len()));
+    quants.into_iter().find_map(|quant| {
+        if stem == quant {
+            return None;
+        }
+        for sep in ['-', '.'] {
+            let suffix = format!("{sep}{quant}");
+            if let Some(base) = stem.strip_suffix(&suffix) {
+                if !base.is_empty() {
+                    return Some((base, quant));
+                }
+            }
+        }
+        None
+    })
+}
+
+fn scan_models_dir(dir: &Path, query: &ModelLookupQuery) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        maybe_push_model_candidate(&mut out, &path, stem);
+        maybe_push_model_candidate(&mut out, &path, query);
         if path.is_dir() {
             if let Ok(sub) = std::fs::read_dir(&path) {
                 for se in sub.flatten() {
-                    maybe_push_model_candidate(&mut out, &se.path(), stem);
+                    maybe_push_model_candidate(&mut out, &se.path(), query);
                 }
             }
         }
@@ -1539,15 +1657,78 @@ fn scan_models_dir(dir: &Path, stem: &str) -> Vec<PathBuf> {
     out
 }
 
-fn maybe_push_model_candidate(out: &mut Vec<PathBuf>, path: &Path, stem: &str) {
+fn maybe_push_model_candidate(out: &mut Vec<PathBuf>, path: &Path, query: &ModelLookupQuery) {
     let name = path
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .to_lowercase();
-    if name.ends_with(".hfq") && !is_role_sidecar_name(&name) && name.contains(stem) {
+    if name.ends_with(".hfq")
+        && !is_role_sidecar_name(&name)
+        && model_name_matches_query(&name, query)
+    {
         out.push(path.to_path_buf());
     }
+}
+
+fn model_name_matches_query(name: &str, query: &ModelLookupQuery) -> bool {
+    let stem = name.strip_suffix(".hfq").unwrap_or(name);
+    if stem == query.normalized {
+        return true;
+    }
+    if let Some(want_quant) = &query.quant {
+        let Some((base, quant)) = split_model_quant(stem) else {
+            return false;
+        };
+        return quant == want_quant && base == query.base;
+    }
+    stem == query.base
+        || stem.strip_prefix(&query.base).is_some_and(|rest| {
+            rest.starts_with('-') || rest.starts_with('.') || rest.starts_with('+')
+        })
+}
+
+fn split_model_quant(stem: &str) -> Option<(&str, &str)> {
+    let mut quants: Vec<&str> = QUANT_PREFERENCE.to_vec();
+    quants.sort_by_key(|q| std::cmp::Reverse(q.len()));
+    quants.into_iter().find_map(|quant| {
+        let mut start = 0;
+        while let Some(rel) = stem[start..].find(quant) {
+            let idx = start + rel;
+            let before = idx > 0
+                && stem[..idx]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| matches!(c, '-' | '.'));
+            let after_idx = idx + quant.len();
+            let after = after_idx == stem.len()
+                || stem[after_idx..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| matches!(c, '-' | '.'));
+            if before && after {
+                let base = &stem[..idx - 1];
+                if !base.is_empty() {
+                    return Some((base, quant));
+                }
+            }
+            start = after_idx;
+        }
+        None
+    })
+}
+
+fn model_candidate_rank(path: &Path, query: &ModelLookupQuery) -> (usize, usize, String) {
+    let sort_name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+    let stem = sort_name.strip_suffix(".hfq").unwrap_or(&sort_name);
+    let base_rank = split_model_quant(stem)
+        .map(|(base, _)| usize::from(base != query.base))
+        .unwrap_or_else(|| usize::from(stem != query.base));
+    (quant_preference_rank(path), base_rank, sort_name)
 }
 
 fn find_json_object_end(bytes: &[u8]) -> Option<usize> {
@@ -1876,17 +2057,16 @@ mod tests {
 
     #[test]
     fn canonical_model_artifact_name_breaks_down_identity_features_quant_and_arch() {
-        let parsed = parse_canonical_model_artifact_name(
-            "Qwen3.5-122B-A10B-it.mtp-vl.lloyd-mq2.gfx1201.hfq",
-        )
-        .unwrap();
+        let parsed =
+            parse_canonical_model_artifact_name("Qwen3.5-122B-A10B-it.mtp-vl.mq2l.gfx1201.hfq")
+                .unwrap();
 
-        assert_eq!(parsed.id, "Qwen3.5-122B-A10B-it.mtp-vl.lloyd-mq2.gfx1201");
+        assert_eq!(parsed.id, "Qwen3.5-122B-A10B-it.mtp-vl.mq2l.gfx1201");
         assert_eq!(parsed.model, "Qwen3.5");
         assert_eq!(parsed.size.as_deref(), Some("122B-A10B"));
         assert_eq!(parsed.tags, vec!["it"]);
         assert_eq!(parsed.features, vec!["mtp-vl"]);
-        assert_eq!(parsed.quant, "lloyd-mq2");
+        assert_eq!(parsed.quant, "mq2l");
         assert_eq!(parsed.arch.as_deref(), Some("gfx1201"));
 
         let mixed = parse_canonical_model_artifact_name("Gemma-4-8B.oq4.25++.hfq").unwrap();
@@ -1915,9 +2095,11 @@ mod tests {
             PathBuf::from("qwen3.5-9b-q8.hfq"),
             PathBuf::from("qwen3.5-9b-mq6.hfq"),
             PathBuf::from("qwen3.5-9b-mq4.hfq"),
+            PathBuf::from("qwen3.5-9b-oq4++.hfq"),
         ];
         names.sort_by_key(|path| quant_preference_rank(path));
-        assert_eq!(names[0], PathBuf::from("qwen3.5-9b-mq4.hfq"));
+        assert_eq!(names[0], PathBuf::from("qwen3.5-9b-oq4++.hfq"));
+        assert_eq!(names[1], PathBuf::from("qwen3.5-9b-mq4.hfq"));
     }
 
     #[test]
@@ -2405,11 +2587,17 @@ mod tests {
         let alias_target = root.join("alias-target.hfq");
         let mq6 = models.join("qwen3.5-9b-mq6.hfq");
         let mq4 = nested.join("qwen3.5-9b-mq4.hfq");
+        let lfm_mq6 = models.join("lfm2.5-350m-mq6.hfq");
+        let lfm_oq4pp = models.join("lfm2.5-350m.oq4++.hfq");
+        let lfm_mq4pp = models.join("lfm2.5-350m-mq4++.hfq");
         let sidecar = models.join("qwen3.5-9b-mq4.mtp.hfq");
         fs::write(&direct, "").unwrap();
         fs::write(&alias_target, "").unwrap();
         fs::write(&mq6, "").unwrap();
         fs::write(&mq4, "").unwrap();
+        fs::write(&lfm_mq6, "").unwrap();
+        fs::write(&lfm_oq4pp, "").unwrap();
+        fs::write(&lfm_mq4pp, "").unwrap();
         fs::write(&sidecar, "").unwrap();
         let aliases = root.join("models.json");
         fs::write(
@@ -2430,9 +2618,29 @@ mod tests {
             find_model_in("qwen3.5:9b", &models, Some(&aliases)),
             Some(mq4)
         );
+        assert_eq!(
+            find_model_in("lfm2.5-350m.oq4++.hfq", &models, Some(&aliases)),
+            Some(lfm_oq4pp.clone())
+        );
+        assert_eq!(
+            find_model_in("lfm2.5-350m.oq4++", &models, Some(&aliases)),
+            Some(lfm_oq4pp.clone())
+        );
+        assert_eq!(
+            find_model_in("lfm2.5:350m.oq4++", &models, Some(&aliases)),
+            Some(lfm_oq4pp.clone())
+        );
+        assert_eq!(
+            find_model_in("lfm2.5-350m-mq4++", &models, Some(&aliases)),
+            Some(lfm_mq4pp.clone())
+        );
+        assert_eq!(
+            find_model_in("lfm2.5-350m", &models, Some(&aliases)),
+            Some(lfm_oq4pp.clone())
+        );
 
         let listed = list_local_models_in(&models);
-        assert_eq!(listed, vec![mq6]);
+        assert_eq!(listed, vec![lfm_mq4pp, lfm_mq6, lfm_oq4pp, mq6]);
         assert!(!listed.contains(&sidecar));
 
         let _ = fs::remove_dir_all(root);

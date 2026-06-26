@@ -6,12 +6,17 @@ use std::{
 
 use clap::Args;
 
+use crate::model::find_model;
+
 const EVAL_HELP: &str = r#"hipfire eval - quant admission/model evaluation harness
 
 Usage:
   hipfire eval --model <model> [--tier fast|medium|long|extensive]
   hipfire eval --model <model> --battery smoke,quality,speed
   hipfire eval --model <model> --suite gpqa --fetch-datasets
+
+Model arguments accept local names, shorthand, aliases, or paths. For example,
+lfm2.5:350m resolves to the preferred local quant for lfm2.5-350m.
 
 Build runner:
   cargo build --release -p hipfire-eval"#;
@@ -64,6 +69,8 @@ Usage:
   hipfire collect-artifacts --model <bf16.hfq> --corpus <text> \
       --output <out.calib.hfq> [--max-tokens N] [--kldref]
 
+--model accepts a local name, shorthand, alias, or path.
+
 Build runner:
   cargo build --release -p hipfire-runtime --example collect_artifacts"#;
 
@@ -92,6 +99,8 @@ Usage:
   <model>.<arch>.hfq beside the input, e.g.
     qwen3.5-0.8b-op4.hfq -> qwen3.5-0.8b-op4.gfx1103.hfq
 
+The positional model accepts a local name, shorthand, alias, or path.
+
 Build runner:
   cargo build --release -p hipfire-runtime --example oq4_repack"#;
 
@@ -106,7 +115,7 @@ pub struct RepackArgs {
 pub fn run_eval(args: EvalArgs) -> anyhow::Result<()> {
     run_forwarded(
         Runner::eval(),
-        args.args,
+        resolve_forwarded_model_args(args.args, false),
         "HIPFIRE_EVAL_BIN",
         "hipfire-eval",
         EVAL_HELP,
@@ -128,7 +137,7 @@ pub fn run_host_profile(args: HostProfileArgs) -> anyhow::Result<()> {
 pub fn run_collect_artifacts(args: CollectArtifactsArgs) -> anyhow::Result<()> {
     run_forwarded(
         Runner::collect_artifacts(),
-        args.args,
+        resolve_forwarded_model_args(args.args, false),
         "HIPFIRE_COLLECT_ARTIFACTS_BIN",
         "collect_artifacts",
         COLLECT_ARTIFACTS_HELP,
@@ -139,7 +148,7 @@ pub fn run_collect_artifacts(args: CollectArtifactsArgs) -> anyhow::Result<()> {
 pub fn run_repack(args: RepackArgs) -> anyhow::Result<()> {
     run_forwarded(
         Runner::repack(),
-        args.args,
+        resolve_forwarded_model_args(args.args, true),
         "HIPFIRE_REPACK_BIN",
         "oq4_repack",
         REPACK_HELP,
@@ -182,6 +191,66 @@ fn run_forwarded(
 
 fn is_help(args: &[OsString]) -> bool {
     args.is_empty() || args.iter().any(|arg| arg == "-h" || arg == "--help")
+}
+
+fn resolve_forwarded_model_args(
+    args: Vec<OsString>,
+    resolve_first_positional: bool,
+) -> Vec<OsString> {
+    const MODEL_VALUE_FLAGS: &[&str] = &["--model", "--baseline", "--reference", "--draft"];
+    let mut out = Vec::with_capacity(args.len());
+    let mut resolve_next = false;
+    let mut resolved_positional = false;
+
+    for arg in args {
+        if resolve_next {
+            out.push(resolve_model_os(arg));
+            resolve_next = false;
+            continue;
+        }
+
+        let Some(s) = arg.to_str() else {
+            out.push(arg);
+            continue;
+        };
+
+        if MODEL_VALUE_FLAGS.contains(&s) {
+            out.push(arg);
+            resolve_next = true;
+            continue;
+        }
+
+        if let Some((flag, value)) = s.split_once('=') {
+            if MODEL_VALUE_FLAGS.contains(&flag) {
+                let resolved = resolve_model_str(value);
+                out.push(OsString::from(format!("{flag}={resolved}")));
+                continue;
+            }
+        }
+
+        if resolve_first_positional && !resolved_positional && !s.starts_with('-') {
+            out.push(resolve_model_str(s).into());
+            resolved_positional = true;
+            continue;
+        }
+
+        out.push(arg);
+    }
+
+    out
+}
+
+fn resolve_model_os(arg: OsString) -> OsString {
+    arg.to_str()
+        .map(resolve_model_str)
+        .map(OsString::from)
+        .unwrap_or(arg)
+}
+
+fn resolve_model_str(value: &str) -> String {
+    find_model(value)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| value.to_string())
 }
 
 #[derive(Debug)]
@@ -319,5 +388,39 @@ mod tests {
         assert!(candidates
             .iter()
             .any(|p| p.ends_with("target/debug/examples/collect_artifacts")));
+    }
+
+    #[test]
+    fn forwarded_model_args_resolve_model_like_positions() {
+        assert_eq!(
+            resolve_forwarded_model_args(
+                vec![
+                    OsString::from("--model=missing-model"),
+                    OsString::from("--battery"),
+                    OsString::from("speed"),
+                ],
+                false,
+            ),
+            vec![
+                OsString::from("--model=missing-model"),
+                OsString::from("--battery"),
+                OsString::from("speed"),
+            ]
+        );
+        assert_eq!(
+            resolve_forwarded_model_args(
+                vec![
+                    OsString::from("missing-model"),
+                    OsString::from("--arch"),
+                    OsString::from("gfx1151")
+                ],
+                true,
+            ),
+            vec![
+                OsString::from("missing-model"),
+                OsString::from("--arch"),
+                OsString::from("gfx1151")
+            ]
+        );
     }
 }

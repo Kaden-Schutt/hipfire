@@ -16,6 +16,8 @@ use hipfire_diffusion::{
 };
 use serde::Serialize;
 
+use crate::model::find_model;
+
 #[derive(Debug, Args)]
 pub struct DiffusionArgs {
     #[command(subcommand)]
@@ -75,13 +77,13 @@ pub struct DiffusionImportArgs {
 
 #[derive(Debug, Args)]
 pub struct DiffusionInspectArgs {
-    /// Diffusion .hfq artifact to inspect
+    /// Diffusion .hfq artifact to inspect by name, shorthand, alias, or path
     pub model: PathBuf,
 }
 
 #[derive(Debug, Args)]
 pub struct DiffusionPreflightArgs {
-    /// Diffusion .hfq artifact to inspect
+    /// Diffusion .hfq artifact to inspect by name, shorthand, alias, or path
     #[arg(long, short)]
     pub model: PathBuf,
     /// Prompt text. Repeat for batched planning, or use --batch-size with one prompt.
@@ -127,7 +129,7 @@ pub struct DiffusionPreflightArgs {
 
 #[derive(Debug, Args)]
 pub struct DiffusionTxt2ImgArgs {
-    /// Diffusion .hfq artifact to run
+    /// Diffusion .hfq artifact to run by name, shorthand, alias, or path
     #[arg(long, short)]
     pub model: PathBuf,
     /// Prompt text. Repeat for batched generation, or use --batch-size with one prompt.
@@ -200,7 +202,7 @@ pub struct DiffusionTxt2ImgArgs {
 
 #[derive(Debug, Args)]
 pub struct DiffusionImg2ImgArgs {
-    /// Diffusion .hfq artifact to run
+    /// Diffusion .hfq artifact to run by name, shorthand, alias, or path
     #[arg(long, short)]
     pub model: PathBuf,
     /// Prompt text. Repeat for batched generation, or use --batch-size with one prompt.
@@ -258,7 +260,7 @@ pub struct DiffusionImg2ImgArgs {
 
 #[derive(Debug, Args)]
 pub struct DiffusionSmokeArgs {
-    /// Diffusion .hfq artifact to run
+    /// Diffusion .hfq artifact to run by name, shorthand, alias, or path
     #[arg(long, short)]
     pub model: PathBuf,
     /// Prompt text for the smoke run
@@ -326,7 +328,7 @@ pub fn run(args: DiffusionArgs) -> anyhow::Result<()> {
             Ok(())
         }
         DiffusionCommand::Inspect(args) => {
-            let inspection = inspect_hfq_with_runtime_support(args.model)?;
+            let inspection = inspect_hfq_with_runtime_support(resolve_model_path(args.model))?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&inspection_json(inspection))?
@@ -386,7 +388,8 @@ fn run_preflight(args: DiffusionPreflightArgs) -> anyhow::Result<()> {
         send_images: false,
         save_images: false,
     };
-    let pipeline = DiffusionPipeline::open_hfq(&args.model)?;
+    let model = resolve_model_path(args.model);
+    let pipeline = DiffusionPipeline::open_hfq(&model)?;
     let memory_plan = pipeline.hip_memory_plan(&request)?;
     #[cfg(feature = "rocm")]
     let rocm = match pipeline.preflight_hip_runtime(
@@ -452,7 +455,8 @@ fn run_txt2img(args: DiffusionTxt2ImgArgs) -> anyhow::Result<()> {
         send_images: true,
         save_images: false,
     };
-    let pipeline = DiffusionPipeline::open_hfq(&args.model)?;
+    let model = resolve_model_path(args.model.clone());
+    let pipeline = DiffusionPipeline::open_hfq(&model)?;
     let runtime_options = generation_runtime_options(args.rocm_device_id);
     let output = if args.enable_hr {
         generate_highres_txt2img(&pipeline, request, &args, runtime_options)?
@@ -702,7 +706,8 @@ fn run_img2img(args: DiffusionImg2ImgArgs) -> anyhow::Result<()> {
         resize_mode: Default::default(),
         denoising_strength: args.denoising_strength,
     };
-    let pipeline = DiffusionPipeline::open_hfq(&args.model)?;
+    let model = resolve_model_path(args.model);
+    let pipeline = DiffusionPipeline::open_hfq(&model)?;
     let output = pipeline.generate_img2img_batch_with_runtime_options(
         request,
         generation_runtime_options(args.rocm_device_id),
@@ -727,8 +732,16 @@ fn generation_runtime_options(rocm_device_id: Option<i32>) -> DiffusionGeneratio
     )
 }
 
+fn resolve_model_path(path: PathBuf) -> PathBuf {
+    if path.exists() {
+        return path;
+    }
+    path.to_str().and_then(find_model).unwrap_or(path)
+}
+
 fn run_smoke(args: DiffusionSmokeArgs) -> anyhow::Result<()> {
-    let inspection = inspect_hfq_with_runtime_support(&args.model)?;
+    let model = resolve_model_path(args.model.clone());
+    let inspection = inspect_hfq_with_runtime_support(&model)?;
     if !inspection.runtime_support.supported {
         let reason = inspection
             .runtime_support
@@ -737,7 +750,7 @@ fn run_smoke(args: DiffusionSmokeArgs) -> anyhow::Result<()> {
         anyhow::bail!("diffusion smoke requires a runnable artifact: {reason}");
     }
     fs::create_dir_all(&args.output_dir)?;
-    let pipeline = DiffusionPipeline::open_hfq(&args.model)?;
+    let pipeline = DiffusionPipeline::open_hfq(&model)?;
     let runtime_options = generation_runtime_options(args.rocm_device_id);
     let txt2img_request = smoke_batch_request(&args, args.seed);
     let txt2img_output =

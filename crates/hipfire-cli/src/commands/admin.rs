@@ -1,6 +1,9 @@
 use clap::{Args, Subcommand};
 use hipfire_config::HipfireConfig;
+use hipfire_model::model_display_name;
 use serde_json::{json, Value};
+
+use crate::model::find_model;
 
 #[derive(Debug, Args)]
 pub struct AdminArgs {
@@ -20,7 +23,7 @@ pub enum AdminCommand {
     Status,
     /// Send one non-streaming chat request through /v1/chat/completions
     Chat {
-        /// Model tag/path. Defaults to server config when omitted.
+        /// Model name, shorthand, alias, or path. Defaults to server config when omitted.
         #[arg(long)]
         model: Option<String>,
         /// Optional system message
@@ -48,7 +51,7 @@ pub enum AdminCommand {
     Models,
     /// Resolved runtime config
     Config {
-        /// Resolve config for a specific model tag
+        /// Resolve config for a specific model name, shorthand, alias, or path
         #[arg(long)]
         model: Option<String>,
     },
@@ -139,7 +142,10 @@ pub async fn run(args: AdminArgs, config: HipfireConfig) -> anyhow::Result<()> {
         AdminCommand::Models => client.get("/admin/models/registry").await?,
         AdminCommand::Config { model } => {
             let path = match model {
-                Some(model) => format!("/admin/config/resolved?model={}", url_encode(&model)),
+                Some(model) => {
+                    let model = resolve_model_display_tag(&model);
+                    format!("/admin/config/resolved?model={}", url_encode(&model))
+                }
                 None => "/admin/config/resolved".to_string(),
             };
             client.get(&path).await?
@@ -277,6 +283,12 @@ fn url_encode(value: &str) -> String {
         }
     }
     encoded
+}
+
+fn resolve_model_display_tag(model: &str) -> String {
+    find_model(model)
+        .map(|path| model_display_name(&path))
+        .unwrap_or_else(|| model.to_string())
 }
 
 fn url_encode_path_segment(value: &str) -> String {

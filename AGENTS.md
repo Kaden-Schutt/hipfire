@@ -59,7 +59,7 @@ Canonical artifact shape:
 Periods are used to separate groups known to hipfire.
 Examples:
 - LFM2.5-1.2B-Thinking.bf16.hfq
-- Qwen3.5-122B-A10B.mtp-vl.lloyd-mq2.hfq
+- Qwen3.5-122B-A10B.mtp-vl.mq2l.hfq
 - Gemma-4-8B-E4B-it-heretic-QAT.dflash-triattn.oq4++.gfx1151.hfq
 - MedGemma-27B-it.triattn.hfq
 
@@ -70,31 +70,33 @@ This system allows machine parsing by working backwards:
 
 Quant tokens use this shape:
 
-`<family><bitwidth>[+][+]`
+`<family><bitwidth>[l][+][+]`
 
 - `mq` / `MQ` is affine Magnum Quant.
 - `oq` / `OQ` is symmetric Opus Quant. Do not use `op` for new artifacts.
+- `l` after the bitwidth means Lloyd-Max/codebook MQ encoding, for example
+  `mq4l`. Do not use `lloyd-mq4` for new artifacts.
 - A first `+` means clip-search, SmoothQuant, AWQ, or a comparable
   activation-aware clipping/scaling pass.
 - A second `+` means Hessian/LDLQ error feedback.
 - Mixed-precision formats include a decimal place in the bitwidth, for example
   `mq4.5+` or `oq4.25++`.
-- Examples: `mq4`, `mq4+`, `mq4++`, `oq4`, `oq4+`, `oq4++`.
+- Examples: `mq4`, `mq4+`, `mq4++`, `mq4l`, `oq4`, `oq4+`, `oq4++`.
 
 Notes:
 - `family` and `version` may optionally include a dash. eg. Qwen3.5, Llama-3
 - size with optional active/effective parameters. eg. 0.8b, 30B-A3B, 8B-E4B, 50M, 2.5T
 - Use `.hfq` for all hipfire container artifacts.
 - Use dotted model versions such as `Qwen3.5`. do not use qwen35 for example.
-- Put calibration or transform modifiers that are part of the weight encoding
-  before the quant token: `lloyd-mq3`.
+- Put calibration or transform modifiers that are not part of the quant token
+  before it. Lloyd is part of the quant token: use `mq3l`, not `lloyd-mq3`.
 - Do not use `+` for bundled roles or feature sidecars. Encode those as dot
   groups before the quant token, for example `.mtp-vl.mq4.hfq` or
   `.dflash-triattn.oq4++.hfq`.
 - Use role sidecars when loaded independently: `.mtp.hfq`, `.dflash.hfq`,
   `.jinja.`, `.hessian` and `.triattn.hfq`.
-- The quant should detail the weight encoding. eg. Lloyd MQ2 uses
-  `.lloyd-mq2.hfq`, Magnum uses `.mq4.hfq`
+- The quant should detail the weight encoding. eg. Lloyd MQ2 uses `.mq2l.hfq`,
+  Magnum uses `.mq4.hfq`
 - `arch` must start with gfx followed by 3 or 4 numbers. eg. gfx906, gfx1103, gfx1151, gfx1201
 - When a script, gate, registry, or doc uses an older format, update it to the
   canonical naming convention as part of the fix.
