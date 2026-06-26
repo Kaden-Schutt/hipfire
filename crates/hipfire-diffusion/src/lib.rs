@@ -5635,6 +5635,94 @@ impl NativeTransformerDenoiserIo {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct NativeTransformerTimestepEmbedding {
+    family: TransformerDenoiserFamily,
+    linear_1_weight: CpuTensor,
+    linear_1_bias: CpuTensor,
+    linear_2_weight: CpuTensor,
+    linear_2_bias: CpuTensor,
+    modulation_weight: Option<CpuTensor>,
+    modulation_bias: Option<CpuTensor>,
+}
+
+impl NativeTransformerTimestepEmbedding {
+    fn from_hfq(hfq: &HfqFile, family: TransformerDenoiserFamily) -> DiffusionResult<Self> {
+        let prefix = match family {
+            TransformerDenoiserFamily::Krea2 => "transformer/tensors/time_embed",
+            TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Unknown => {
+                "transformer/tensors/time_text_embed.timestep_embedder"
+            }
+        };
+        let modulation_weight = optional_tensor(hfq, "transformer/tensors/time_mod_proj.weight")?;
+        let modulation_bias = if modulation_weight.is_some() {
+            Some(CpuTensor::from_hfq(
+                hfq,
+                "transformer/tensors/time_mod_proj.bias",
+            )?)
+        } else {
+            None
+        };
+        Ok(Self {
+            family,
+            linear_1_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.linear_1.weight"))?,
+            linear_1_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.linear_1.bias"))?,
+            linear_2_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.linear_2.weight"))?,
+            linear_2_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.linear_2.bias"))?,
+            modulation_weight,
+            modulation_bias,
+        })
+    }
+
+    fn embedding_dim(&self) -> DiffusionResult<usize> {
+        let (_, embedding_dim) = self.linear_1_weight.rows_cols()?;
+        Ok(embedding_dim)
+    }
+
+    fn forward_with_runtime_context(
+        &self,
+        timesteps: &[f32],
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
+        let input = timestep_embedding_with_runtime_context(
+            timesteps,
+            self.embedding_dim()?,
+            true,
+            0.0,
+            runtime_context,
+        )?;
+        let hidden = linear_with_runtime_context(
+            &input,
+            &self.linear_1_weight,
+            &self.linear_1_bias,
+            runtime_context,
+        )?;
+        let hidden = silu_with_runtime_context(&hidden, runtime_context)?;
+        linear_with_runtime_context(
+            &hidden,
+            &self.linear_2_weight,
+            &self.linear_2_bias,
+            runtime_context,
+        )
+    }
+
+    fn modulation_with_runtime_context(
+        &self,
+        timestep_embedding: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<Option<CpuTensor>> {
+        let Some(weight) = self.modulation_weight.as_ref() else {
+            return Ok(None);
+        };
+        let bias = self.modulation_bias.as_ref().ok_or_else(|| {
+            DiffusionError::InvalidMetadata(
+                "transformer time_mod_proj weight is present but bias is missing".to_string(),
+            )
+        })?;
+        linear_with_runtime_context(timestep_embedding, weight, bias, runtime_context).map(Some)
+    }
+}
+
 fn diffusion_generation_info(
     summary: &DiffusionModelSummary,
     runtime_kind: DiffusionRuntimeKind,
@@ -16426,6 +16514,142 @@ mod tests {
             .project_hidden_to_latents_with_runtime_context(&hidden, 1, 2, 2, &mut runtime_context)
             .unwrap();
         assert_eq!(output.data, vec![7.25, 2.25, 6.0, 7.5]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_transformer_timestep_embedding_loads_qwen_layout() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-qwen-transformer-time-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("qwen-transformer-time.hfq");
+        write_hfqm_package_mem(
+            &path,
+            HFQ_ARCH_DIFFUSION,
+            "{}",
+            &[
+                f32_mem_tensor(
+                    "transformer/tensors/time_text_embed.timestep_embedder.linear_1.weight",
+                    &[2, 2],
+                    &[1.0, 0.0, 0.0, 1.0],
+                ),
+                f32_mem_tensor(
+                    "transformer/tensors/time_text_embed.timestep_embedder.linear_1.bias",
+                    &[2],
+                    &[0.0, 0.0],
+                ),
+                f32_mem_tensor(
+                    "transformer/tensors/time_text_embed.timestep_embedder.linear_2.weight",
+                    &[2, 2],
+                    &[1.0, 0.0, 0.0, 1.0],
+                ),
+                f32_mem_tensor(
+                    "transformer/tensors/time_text_embed.timestep_embedder.linear_2.bias",
+                    &[2],
+                    &[0.0, 0.0],
+                ),
+            ],
+        )
+        .unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let embedding = NativeTransformerTimestepEmbedding::from_hfq(
+            &hfq,
+            TransformerDenoiserFamily::QwenImage,
+        )
+        .unwrap();
+        let mut runtime_context =
+            DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+
+        let output = embedding
+            .forward_with_runtime_context(&[0.0], &mut runtime_context)
+            .unwrap();
+        assert_eq!(output.shape, vec![1, 2]);
+        assert!((output.data[0] - silu(1.0)).abs() < 1e-6);
+        assert!(output.data[1].abs() < 1e-6);
+        assert!(embedding
+            .modulation_with_runtime_context(&output, &mut runtime_context)
+            .unwrap()
+            .is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_transformer_timestep_embedding_loads_krea_mod_projection() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-krea-transformer-time-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("krea-transformer-time.hfq");
+        write_hfqm_package_mem(
+            &path,
+            HFQ_ARCH_DIFFUSION,
+            "{}",
+            &[
+                f32_mem_tensor(
+                    "transformer/tensors/time_embed.linear_1.weight",
+                    &[2, 2],
+                    &[1.0, 0.0, 0.0, 1.0],
+                ),
+                f32_mem_tensor(
+                    "transformer/tensors/time_embed.linear_1.bias",
+                    &[2],
+                    &[0.0, 0.0],
+                ),
+                f32_mem_tensor(
+                    "transformer/tensors/time_embed.linear_2.weight",
+                    &[2, 2],
+                    &[1.0, 0.0, 0.0, 2.0],
+                ),
+                f32_mem_tensor(
+                    "transformer/tensors/time_embed.linear_2.bias",
+                    &[2],
+                    &[0.25, -0.5],
+                ),
+                f32_mem_tensor(
+                    "transformer/tensors/time_mod_proj.weight",
+                    &[3, 2],
+                    &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+                ),
+                f32_mem_tensor(
+                    "transformer/tensors/time_mod_proj.bias",
+                    &[3],
+                    &[0.0, 1.0, -1.0],
+                ),
+            ],
+        )
+        .unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let embedding =
+            NativeTransformerTimestepEmbedding::from_hfq(&hfq, TransformerDenoiserFamily::Krea2)
+                .unwrap();
+        let mut runtime_context =
+            DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+
+        let output = embedding
+            .forward_with_runtime_context(&[0.0], &mut runtime_context)
+            .unwrap();
+        let expected = [silu(1.0) + 0.25, -0.5];
+        assert_eq!(output.shape, vec![1, 2]);
+        assert!((output.data[0] - expected[0]).abs() < 1e-6);
+        assert!((output.data[1] - expected[1]).abs() < 1e-6);
+        let modulation = embedding
+            .modulation_with_runtime_context(&output, &mut runtime_context)
+            .unwrap()
+            .unwrap();
+        assert_eq!(modulation.shape, vec![1, 3]);
+        let expected_modulation = [
+            expected[0],
+            expected[1] + 1.0,
+            expected[0] + expected[1] - 1.0,
+        ];
+        for (actual, expected) in modulation.data.iter().zip(expected_modulation) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
