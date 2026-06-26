@@ -64,6 +64,13 @@ Only when the path is one or more `https://github.com/...` URLs, or several loca
 
 ### Step 1 - Ensure graphify is installed
 
+Use the patched graphify build from the repo's `third_party/graphify` git
+submodule, which tracks `xynexus/graphify` with commit
+`a3976c5de751e7f33920e7ba1b24591191e90a99` applied. If the submodule is present,
+run or install graphify from it before building or updating the graph. Do not
+fall back to the public `graphifyy` package when this patched submodule is
+available.
+
 ```bash
 # Detect the correct Python interpreter (handles uv tool, pipx, venv, system installs)
 PYTHON=""

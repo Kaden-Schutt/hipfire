@@ -1,26 +1,15 @@
-*
+/*
 
-# Keep Rust sources and Rust/C++/C/HIP kernel ecosystems.
-!*/
-!*.rs
-!*.rslib
-!*.rsh
-!*.rust
-!*.c
-!*.cc
-!*.cpp
-!*.cxx
-!*.cu
-!*.cl
-!*.clcpp
-!*.cuh
-!*.h
-!*.hh
-!*.hpp
-!*.hxx
-!*.inl
-!*.inc
-!*.S
-!*.s
-!*.asm
-!*.hip
+# Keep only the runtime crates and HIP kernel tree in graphify scans.
+!/crates/
+!/crates/**
+!/kernels/
+!/kernels/**
+
+# Drop generated and validation-heavy material that dominates graph topology.
+/crates/**/target/**
+/crates/**/examples/**
+/crates/**/tests/**
+/crates/**/benches/**
+/crates/**/fixtures/**
+/crates/**/*generated*.rs
