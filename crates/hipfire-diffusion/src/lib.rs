@@ -350,6 +350,10 @@ pub struct DiffusionBatchRequest {
     #[serde(default)]
     pub target_height: Option<u32>,
     #[serde(default)]
+    pub seed_resize_from_width: Option<u32>,
+    #[serde(default)]
+    pub seed_resize_from_height: Option<u32>,
+    #[serde(default)]
     pub crop_x: u32,
     #[serde(default)]
     pub crop_y: u32,
@@ -706,7 +710,43 @@ impl LatentBatch {
     }
 }
 
-fn blend_subseed_latents(latents: &mut LatentBatch, request: &DiffusionBatchRequest) {
+fn seeded_latents_for_request(
+    config: &StableDiffusionConfig,
+    request: &DiffusionBatchRequest,
+    latent_shape: &DiffusionLatentShape,
+    seeds: &[i64],
+) -> DiffusionResult<LatentBatch> {
+    let scale = config.vae_scale_factor.max(1) as u32;
+    let seed_width = request.seed_resize_from_width.unwrap_or(request.width);
+    let seed_height = request.seed_resize_from_height.unwrap_or(request.height);
+    if seed_width == 0 || seed_height == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "seed resize dimensions must be positive".to_string(),
+        ));
+    }
+    if seed_width % scale != 0 || seed_height % scale != 0 {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "seed resize dimensions {seed_width}x{seed_height} must be divisible by VAE scale factor {scale}",
+        )));
+    }
+    let seed_latent_width = (seed_width / scale) as usize;
+    let seed_latent_height = (seed_height / scale) as usize;
+    let latents = LatentBatch::seeded_normal(
+        latent_shape.batch,
+        latent_shape.channels,
+        seed_latent_height,
+        seed_latent_width,
+        seeds,
+    );
+    resize_latent_batch_nearest(&latents, latent_shape.height, latent_shape.width)
+}
+
+fn blend_subseed_latents(
+    config: &StableDiffusionConfig,
+    latents: &mut LatentBatch,
+    request: &DiffusionBatchRequest,
+    latent_shape: &DiffusionLatentShape,
+) -> DiffusionResult<()> {
     let strength = request.subseed_strength.clamp(0.0, 1.0);
     if strength <= 0.0
         || request
@@ -714,20 +754,14 @@ fn blend_subseed_latents(latents: &mut LatentBatch, request: &DiffusionBatchRequ
             .iter()
             .all(|prompt| prompt.subseed.is_none())
     {
-        return;
+        return Ok(());
     }
     let subseeds = request
         .prompts
         .iter()
         .map(|prompt| prompt.subseed.unwrap_or(prompt.seed))
         .collect::<Vec<_>>();
-    let subseed_latents = LatentBatch::seeded_normal(
-        latents.batch,
-        latents.channels,
-        latents.height,
-        latents.width,
-        &subseeds,
-    );
+    let subseed_latents = seeded_latents_for_request(config, request, latent_shape, &subseeds)?;
     let image_len = latents.len_per_batch();
     for (batch_idx, prompt) in request.prompts.iter().enumerate() {
         if prompt.subseed.is_none() {
@@ -739,6 +773,7 @@ fn blend_subseed_latents(latents: &mut LatentBatch, request: &DiffusionBatchRequ
                 latents.data[idx] * (1.0 - strength) + subseed_latents.data[idx] * strength;
         }
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -4959,14 +4994,8 @@ impl DiffusionPipeline {
             .iter()
             .map(|prompt| prompt.seed)
             .collect::<Vec<_>>();
-        let mut latents = LatentBatch::seeded_normal(
-            latent_shape.batch,
-            latent_shape.channels,
-            latent_shape.height,
-            latent_shape.width,
-            &seeds,
-        );
-        blend_subseed_latents(&mut latents, request);
+        let mut latents = seeded_latents_for_request(&self.config, request, &latent_shape, &seeds)?;
+        blend_subseed_latents(&self.config, &mut latents, request, &latent_shape)?;
         let scheduler_config = self
             .config
             .scheduler
@@ -5372,6 +5401,8 @@ fn diffusion_generation_info(
         "seeds": request.prompts.iter().map(|prompt| prompt.seed).collect::<Vec<_>>(),
         "subseeds": request.prompts.iter().map(|prompt| prompt.subseed).collect::<Vec<_>>(),
         "subseed_strength": request.subseed_strength,
+        "seed_resize_from_w": request.seed_resize_from_width,
+        "seed_resize_from_h": request.seed_resize_from_height,
         "latent_shape": {
             "batch": latent_shape.batch,
             "channels": latent_shape.channels,
@@ -15693,6 +15724,8 @@ mod tests {
             original_height: None,
             target_width: None,
             target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
             crop_x: 0,
             crop_y: 0,
             steps: 20,
@@ -17051,10 +17084,70 @@ mod tests {
     }
 
     #[test]
+    fn seed_resize_generates_source_latents_and_resizes_to_target_shape() {
+        let config = StableDiffusionConfig {
+            pipeline_class: "StableDiffusionPipeline".into(),
+            text_encoder: TextEncoderConfig::default(),
+            text_encoder_2: None,
+            unet: UnetConfig::default(),
+            vae: VaeConfig::default(),
+            scheduler: SchedulerConfig::default(),
+            latent_channels: 1,
+            latent_height: None,
+            latent_width: None,
+            vae_scale_factor: 1,
+        };
+        let request = DiffusionBatchRequest {
+            prompts: vec![DiffusionPrompt {
+                prompt: "a".into(),
+                negative_prompt: String::new(),
+                seed: 123,
+                subseed: None,
+            }],
+            width: 2,
+            height: 2,
+            original_width: None,
+            original_height: None,
+            target_width: None,
+            target_height: None,
+            seed_resize_from_width: Some(1),
+            seed_resize_from_height: Some(1),
+            crop_x: 0,
+            crop_y: 0,
+            steps: 2,
+            cfg_scale: 7.0,
+            scheduler: "Euler".into(),
+            subseed_strength: 0.0,
+            send_images: true,
+            save_images: false,
+        };
+        let latent_shape = latent_shape_for_request(&config, &request).unwrap();
+
+        let resized = seeded_latents_for_request(&config, &request, &latent_shape, &[123]).unwrap();
+        let source = LatentBatch::seeded_normal(1, 1, 1, 1, &[123]);
+        let direct = LatentBatch::seeded_normal(1, 1, 2, 2, &[123]);
+
+        assert_eq!(resized, resize_latent_batch_nearest(&source, 2, 2).unwrap());
+        assert_ne!(resized, direct);
+    }
+
+    #[test]
     fn subseed_strength_blends_only_prompt_latents_with_subseeds() {
         let mut latents = LatentBatch::seeded_normal(2, 1, 1, 2, &[10, 20]);
         let original = latents.clone();
         let subseed = LatentBatch::seeded_normal(2, 1, 1, 2, &[30, 20]);
+        let config = StableDiffusionConfig {
+            pipeline_class: "StableDiffusionPipeline".into(),
+            text_encoder: TextEncoderConfig::default(),
+            text_encoder_2: None,
+            unet: UnetConfig::default(),
+            vae: VaeConfig::default(),
+            scheduler: SchedulerConfig::default(),
+            latent_channels: 1,
+            latent_height: None,
+            latent_width: None,
+            vae_scale_factor: 1,
+        };
         let request = DiffusionBatchRequest {
             prompts: vec![
                 DiffusionPrompt {
@@ -17070,12 +17163,14 @@ mod tests {
                     subseed: None,
                 },
             ],
-            width: 8,
-            height: 8,
+            width: 2,
+            height: 1,
             original_width: None,
             original_height: None,
             target_width: None,
             target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
             crop_x: 0,
             crop_y: 0,
             steps: 2,
@@ -17085,8 +17180,9 @@ mod tests {
             send_images: true,
             save_images: false,
         };
+        let latent_shape = latent_shape_for_request(&config, &request).unwrap();
 
-        blend_subseed_latents(&mut latents, &request);
+        blend_subseed_latents(&config, &mut latents, &request, &latent_shape).unwrap();
 
         assert_eq!(latents.batch, 2);
         for idx in 0..2 {
@@ -17357,6 +17453,8 @@ mod tests {
             original_height: None,
             target_width: None,
             target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
             crop_x: 0,
             crop_y: 0,
             steps: 2,
@@ -17932,6 +18030,8 @@ mod tests {
             original_height: None,
             target_width: None,
             target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
             crop_x: 0,
             crop_y: 0,
             steps: 20,
@@ -17999,6 +18099,8 @@ mod tests {
             original_height: None,
             target_width: None,
             target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
             crop_x: 0,
             crop_y: 0,
             steps: 2,
@@ -18067,6 +18169,8 @@ mod tests {
             original_height: None,
             target_width: None,
             target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
             crop_x: 0,
             crop_y: 0,
             steps: 1,
@@ -18116,6 +18220,8 @@ mod tests {
             original_height: Some(768),
             target_width: None,
             target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
             crop_x: 8,
             crop_y: 16,
             steps: 1,
@@ -20550,6 +20656,8 @@ mod tests {
             original_height: None,
             target_width: None,
             target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
             crop_x: 0,
             crop_y: 0,
             steps: 2,
@@ -20662,6 +20770,8 @@ mod tests {
             original_height: None,
             target_width: None,
             target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
             crop_x: 0,
             crop_y: 0,
             steps: 2,
@@ -20770,6 +20880,8 @@ mod tests {
             original_height: None,
             target_width: None,
             target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
             crop_x: 0,
             crop_y: 0,
             steps: 2,
@@ -20894,6 +21006,8 @@ mod tests {
             original_height: Some(256),
             target_width: Some(32),
             target_height: Some(64),
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
             crop_x: 8,
             crop_y: 4,
             steps: 2,
@@ -20931,6 +21045,8 @@ mod tests {
                 original_height: None,
                 target_width: None,
                 target_height: None,
+                seed_resize_from_width: None,
+                seed_resize_from_height: None,
                 crop_x: 0,
                 crop_y: 0,
                 steps: 2,
@@ -20975,6 +21091,8 @@ mod tests {
                 original_height: None,
                 target_width: None,
                 target_height: None,
+                seed_resize_from_width: None,
+                seed_resize_from_height: None,
                 crop_x: 0,
                 crop_y: 0,
                 steps: 2,
@@ -21027,6 +21145,8 @@ mod tests {
                 original_height: None,
                 target_width: None,
                 target_height: None,
+                seed_resize_from_width: None,
+                seed_resize_from_height: None,
                 crop_x: 0,
                 crop_y: 0,
                 steps: 2,
@@ -21159,6 +21279,8 @@ mod tests {
                 original_height: None,
                 target_width: None,
                 target_height: None,
+                seed_resize_from_width: None,
+                seed_resize_from_height: None,
                 crop_x: 0,
                 crop_y: 0,
                 steps: 2,
@@ -21226,6 +21348,8 @@ mod tests {
             original_height: None,
             target_width: None,
             target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
             crop_x: 0,
             crop_y: 0,
             steps: 1,
@@ -21285,6 +21409,8 @@ mod tests {
             original_height: None,
             target_width: None,
             target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
             crop_x: 0,
             crop_y: 0,
             steps: 1,
@@ -21345,6 +21471,8 @@ mod tests {
             original_height: None,
             target_width: None,
             target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
             crop_x: 0,
             crop_y: 0,
             steps: 1,
@@ -21408,6 +21536,8 @@ mod tests {
             original_height: None,
             target_width: None,
             target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
             crop_x: 0,
             crop_y: 0,
             steps: 1,
@@ -21470,6 +21600,8 @@ mod tests {
             original_height: None,
             target_width: None,
             target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
             crop_x: 0,
             crop_y: 0,
             steps: 1,
@@ -21532,6 +21664,8 @@ mod tests {
             original_height: None,
             target_width: None,
             target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
             crop_x: 0,
             crop_y: 0,
             steps: 1,
@@ -21604,6 +21738,8 @@ mod tests {
                 original_height: None,
                 target_width: None,
                 target_height: None,
+                seed_resize_from_width: None,
+                seed_resize_from_height: None,
                 crop_x: 0,
                 crop_y: 0,
                 steps: 1,
@@ -21667,6 +21803,8 @@ mod tests {
             original_height: None,
             target_width: None,
             target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
             crop_x: 0,
             crop_y: 0,
             steps: 1,
@@ -21758,6 +21896,8 @@ mod tests {
                 original_height: None,
                 target_width: None,
                 target_height: None,
+                seed_resize_from_width: None,
+                seed_resize_from_height: None,
                 crop_x: 0,
                 crop_y: 0,
                 steps: 1,
@@ -22664,6 +22804,8 @@ mod tests {
             original_height: None,
             target_width: None,
             target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
             crop_x: 0,
             crop_y: 0,
             steps: 1,
@@ -22707,6 +22849,8 @@ mod tests {
                 original_height: None,
                 target_width: None,
                 target_height: None,
+                seed_resize_from_width: None,
+                seed_resize_from_height: None,
                 crop_x: 0,
                 crop_y: 0,
                 steps: 1,
@@ -22752,6 +22896,8 @@ mod tests {
             original_height: None,
             target_width: None,
             target_height: None,
+            seed_resize_from_width: None,
+            seed_resize_from_height: None,
             crop_x: 0,
             crop_y: 0,
             steps: 1,

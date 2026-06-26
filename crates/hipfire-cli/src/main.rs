@@ -84,13 +84,15 @@ enum Command {
     /// init image at its source dimensions, VAE-encodes it, then resizes the
     /// latent tensor to the requested output shape;
     /// `/sdapi/v1/latent-upscale-modes` advertises Hipfire's nearest-neighbor
-    /// latent resize aliases. Hipfire also accepts common WebUI generation
-    /// fields such as `styles`, `restore_faces`, `tiling`, `do_not_save_samples`,
-    /// `do_not_save_grid`, `seed_resize_from_w`, `seed_resize_from_h`, `eta`,
-    /// `s_churn`, `s_tmin`, `s_tmax`, `s_noise`,
-    /// `override_settings_restore_afterwards`, `disable_extra_networks`, and
-    /// `comments`; fields that do not affect the native runtime are returned in
-    /// response `parameters` and listed in `info.ignored_fields` when active.
+    /// latent resize aliases. `seed_resize_from_w` and `seed_resize_from_h`
+    /// generate the initial noise at the requested source dimensions and resize
+    /// it to the target latent shape before sampling. Hipfire also accepts
+    /// common WebUI generation fields such as `styles`, `restore_faces`,
+    /// `tiling`, `do_not_save_samples`, `do_not_save_grid`, `eta`, `s_churn`,
+    /// `s_tmin`, `s_tmax`, `s_noise`, `override_settings_restore_afterwards`,
+    /// `disable_extra_networks`, and `comments`; fields that do not affect the
+    /// native runtime are returned in response `parameters` and listed in
+    /// `info.ignored_fields` when active.
     /// `do_not_save_samples` suppresses disk writes even when `save_images` is
     /// true. Masked img2img also honors
     /// WebUI's `inpainting_mask_invert`, `mask_blur`,

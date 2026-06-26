@@ -787,11 +787,6 @@ fn sdapi_ignored_generation_fields(body: &SdGenerationRequest) -> Vec<&'static s
     if body.do_not_save_grid.unwrap_or(false) {
         fields.push("do_not_save_grid");
     }
-    if body.seed_resize_from_w.is_some_and(|value| value > 0)
-        || body.seed_resize_from_h.is_some_and(|value| value > 0)
-    {
-        fields.push("seed_resize_from");
-    }
     if body.eta.is_some() {
         fields.push("eta");
     }
@@ -1582,6 +1577,14 @@ fn sd_request_to_diffusion_batch_request(
         original_height: body.original_height,
         target_width: body.target_width,
         target_height: body.target_height,
+        seed_resize_from_width: body
+            .seed_resize_from_w
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0),
+        seed_resize_from_height: body
+            .seed_resize_from_h
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0),
         crop_x: body.crop_x.unwrap_or(0),
         crop_y: body.crop_y.unwrap_or(0),
         steps: body.steps.unwrap_or(20),
@@ -4252,7 +4255,6 @@ mod tests {
             "restore_faces",
             "tiling",
             "do_not_save_grid",
-            "seed_resize_from",
             "eta",
             "s_churn",
             "s_tmax",
@@ -4264,6 +4266,9 @@ mod tests {
         ] {
             assert!(ignored.contains(&json!(field)), "missing {field}");
         }
+        assert!(!ignored.contains(&json!("seed_resize_from")));
+        assert_eq!(info["seed_resize_from_w"], 128);
+        assert_eq!(info["seed_resize_from_h"], 128);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6332,6 +6337,8 @@ mod tests {
             cfg_scale: Some(6.5),
             width: Some(512),
             height: Some(512),
+            seed_resize_from_w: Some(256),
+            seed_resize_from_h: Some(128),
             batch_size: Some(2),
             n_iter: Some(2),
             scheduler: Some("DPM++ 2M".to_string()),
@@ -6350,6 +6357,8 @@ mod tests {
         assert_eq!(request.steps, 8);
         assert_eq!(request.cfg_scale, 6.5);
         assert_eq!(request.scheduler, "DPM++ 2M");
+        assert_eq!(request.seed_resize_from_width, Some(256));
+        assert_eq!(request.seed_resize_from_height, Some(128));
     }
 
     #[test]

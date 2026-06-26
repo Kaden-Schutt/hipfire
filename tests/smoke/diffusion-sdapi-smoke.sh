@@ -308,6 +308,8 @@ try:
         "cfg_scale": cfg_scale,
         "sampler_name": "Euler",
         "seed": seed,
+        "seed_resize_from_w": width,
+        "seed_resize_from_h": height,
         "batch_size": batch_size,
         "n_iter": n_iter,
         "send_images": True,
@@ -320,6 +322,8 @@ try:
         raise RuntimeError(f"txt2img did not use StableDiffusionPipeline: {txt_info}")
     if txt_info.get("seeds") != expected_seeds(seed):
         raise RuntimeError(f"txt2img seeds wrong: {txt_info}")
+    if txt_info.get("seed_resize_from_w") != width or txt_info.get("seed_resize_from_h") != height:
+        raise RuntimeError(f"txt2img seed resize info wrong: {txt_info}")
     png_info = fetch_json(f"{base_url}/sdapi/v1/png-info", {"image": txt["images"][0]}, timeout=10.0)
     if prompt not in str(png_info.get("info", "")):
         raise RuntimeError(f"png-info did not include prompt: {png_info}")
