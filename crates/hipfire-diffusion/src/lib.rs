@@ -11757,6 +11757,165 @@ fn bsc_to_nchw(
     Ok(out)
 }
 
+fn latent_batch_to_patch_tokens(
+    latents: &LatentBatch,
+    patch_size: usize,
+    token_width: usize,
+) -> DiffusionResult<CpuTensor> {
+    if patch_size == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "transformer patch_size must be positive".to_string(),
+        ));
+    }
+    if latents.height % patch_size != 0 || latents.width % patch_size != 0 {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "latent shape {}x{} must be divisible by transformer patch_size {patch_size}",
+            latents.width, latents.height
+        )));
+    }
+    let patch_height = latents.height / patch_size;
+    let patch_width = latents.width / patch_size;
+    let sequence_length = patch_height.checked_mul(patch_width).ok_or_else(|| {
+        DiffusionError::InvalidRequest("transformer sequence length overflow".to_string())
+    })?;
+    let patch_feature_width = latents
+        .channels
+        .checked_mul(patch_size)
+        .and_then(|value| value.checked_mul(patch_size))
+        .ok_or_else(|| {
+            DiffusionError::InvalidRequest("transformer patch token width overflow".to_string())
+        })?;
+    if token_width < patch_feature_width {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "transformer token_width {token_width} is smaller than latent patch feature width {patch_feature_width}"
+        )));
+    }
+    let expected = latents
+        .batch
+        .checked_mul(latents.channels)
+        .and_then(|value| value.checked_mul(latents.height))
+        .and_then(|value| value.checked_mul(latents.width))
+        .ok_or_else(|| {
+            DiffusionError::InvalidRequest("latent element count overflow".to_string())
+        })?;
+    if latents.data.len() != expected {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "latent batch has {} values, expected {expected}",
+            latents.data.len()
+        )));
+    }
+
+    let mut tokens = CpuTensor::zeros(&[latents.batch, sequence_length, token_width]);
+    for batch in 0..latents.batch {
+        for patch_y in 0..patch_height {
+            for patch_x in 0..patch_width {
+                let token = patch_y * patch_width + patch_x;
+                let token_base = (batch * sequence_length + token) * token_width;
+                let mut feature = 0;
+                for channel in 0..latents.channels {
+                    for local_y in 0..patch_size {
+                        for local_x in 0..patch_size {
+                            let y = patch_y * patch_size + local_y;
+                            let x = patch_x * patch_size + local_x;
+                            tokens.data[token_base + feature] = latents.data[nchw_idx(
+                                batch,
+                                channel,
+                                y,
+                                x,
+                                latents.channels,
+                                latents.height,
+                                latents.width,
+                            )];
+                            feature += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(tokens)
+}
+
+fn patch_tokens_to_latent_batch(
+    tokens: &CpuTensor,
+    batch: usize,
+    channels: usize,
+    height: usize,
+    width: usize,
+    patch_size: usize,
+) -> DiffusionResult<LatentBatch> {
+    if patch_size == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "transformer patch_size must be positive".to_string(),
+        ));
+    }
+    if height % patch_size != 0 || width % patch_size != 0 {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "latent shape {width}x{height} must be divisible by transformer patch_size {patch_size}"
+        )));
+    }
+    let patch_height = height / patch_size;
+    let patch_width = width / patch_size;
+    let expected_sequence = patch_height.checked_mul(patch_width).ok_or_else(|| {
+        DiffusionError::InvalidRequest("transformer sequence length overflow".to_string())
+    })?;
+    let patch_feature_width = channels
+        .checked_mul(patch_size)
+        .and_then(|value| value.checked_mul(patch_size))
+        .ok_or_else(|| {
+            DiffusionError::InvalidRequest("transformer patch token width overflow".to_string())
+        })?;
+    let [token_batch, sequence_length, token_width] = shape3(tokens)?;
+    if token_batch != batch || sequence_length != expected_sequence {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "transformer token shape {:?} cannot unpatchify to [{batch}, {channels}, {height}, {width}]",
+            tokens.shape
+        )));
+    }
+    if token_width < patch_feature_width {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "transformer token_width {token_width} is smaller than latent patch feature width {patch_feature_width}"
+        )));
+    }
+
+    let element_count = batch
+        .checked_mul(channels)
+        .and_then(|value| value.checked_mul(height))
+        .and_then(|value| value.checked_mul(width))
+        .ok_or_else(|| {
+            DiffusionError::InvalidRequest("latent element count overflow".to_string())
+        })?;
+    let mut latents = LatentBatch {
+        batch,
+        channels,
+        height,
+        width,
+        data: vec![0.0; element_count],
+    };
+    for batch_idx in 0..batch {
+        for patch_y in 0..patch_height {
+            for patch_x in 0..patch_width {
+                let token = patch_y * patch_width + patch_x;
+                let token_base = (batch_idx * sequence_length + token) * token_width;
+                let mut feature = 0;
+                for channel in 0..channels {
+                    for local_y in 0..patch_size {
+                        for local_x in 0..patch_size {
+                            let y = patch_y * patch_size + local_y;
+                            let x = patch_x * patch_size + local_x;
+                            let latent_idx =
+                                nchw_idx(batch_idx, channel, y, x, channels, height, width);
+                            latents.data[latent_idx] = tokens.data[token_base + feature];
+                            feature += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(latents)
+}
+
 fn optional_tensor(hfq: &HfqFile, entry: &str) -> DiffusionResult<Option<CpuTensor>> {
     if hfq.find_tensor_info(entry).is_some() {
         CpuTensor::from_hfq(hfq, entry).map(Some)
@@ -18575,6 +18734,46 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("patch_size 2"));
+    }
+
+    #[test]
+    fn latent_patch_tokens_roundtrip_and_zero_pad_extra_width() {
+        let latents = LatentBatch {
+            batch: 1,
+            channels: 2,
+            height: 4,
+            width: 4,
+            data: (0..32).map(|idx| idx as f32).collect(),
+        };
+
+        let tokens = latent_batch_to_patch_tokens(&latents, 2, 10).unwrap();
+
+        assert_eq!(tokens.shape, vec![1, 4, 10]);
+        assert_eq!(
+            &tokens.data[0..8],
+            &[0.0, 1.0, 4.0, 5.0, 16.0, 17.0, 20.0, 21.0]
+        );
+        assert_eq!(&tokens.data[8..10], &[0.0, 0.0]);
+        let roundtrip = patch_tokens_to_latent_batch(&tokens, 1, 2, 4, 4, 2).unwrap();
+        assert_eq!(roundtrip, latents);
+    }
+
+    #[test]
+    fn latent_patch_tokens_reject_narrow_token_width() {
+        let latents = LatentBatch {
+            batch: 1,
+            channels: 2,
+            height: 4,
+            width: 4,
+            data: vec![0.0; 32],
+        };
+
+        let error = latent_batch_to_patch_tokens(&latents, 2, 7)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("token_width 7"));
+        assert!(error.contains("patch feature width 8"));
     }
 
     #[test]
