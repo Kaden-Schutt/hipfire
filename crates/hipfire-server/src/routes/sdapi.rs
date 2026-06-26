@@ -182,6 +182,9 @@ pub async fn post_txt2img(
     Json(body): Json<SdGenerationRequest>,
 ) -> Response {
     let body = sdapi_apply_infotext_defaults(body);
+    if let Err(error) = sdapi_validate_supported_scripts(&body) {
+        return diffusion_error_response(error);
+    }
     execute_sd_generation(state, body, None).await
 }
 
@@ -190,6 +193,9 @@ pub async fn post_img2img(
     Json(body): Json<SdGenerationRequest>,
 ) -> Response {
     let body = sdapi_apply_infotext_defaults(body);
+    if let Err(error) = sdapi_validate_supported_scripts(&body) {
+        return diffusion_error_response(error);
+    }
     let images = body.init_images.clone().filter(|images| !images.is_empty());
     execute_sd_generation(state, body, images).await
 }
@@ -713,6 +719,50 @@ fn sdapi_response_parameters(mut body: SdGenerationRequest, mode: &str) -> SdGen
         body.init_images = None;
     }
     body
+}
+
+fn sdapi_validate_supported_scripts(body: &SdGenerationRequest) -> Result<(), DiffusionError> {
+    if body
+        .script_name
+        .as_deref()
+        .is_some_and(|name| !name.trim().is_empty())
+    {
+        return Err(DiffusionError::InvalidRequest(
+            "script_name is not supported because Hipfire does not expose SDAPI selectable scripts"
+                .to_string(),
+        ));
+    }
+    if body
+        .script_args
+        .as_ref()
+        .is_some_and(|value| !sdapi_script_value_is_empty(value))
+    {
+        return Err(DiffusionError::InvalidRequest(
+            "script_args is not supported because Hipfire does not expose SDAPI selectable scripts"
+                .to_string(),
+        ));
+    }
+    if body
+        .alwayson_scripts
+        .as_ref()
+        .is_some_and(|value| !sdapi_script_value_is_empty(value))
+    {
+        return Err(DiffusionError::InvalidRequest(
+            "alwayson_scripts is not supported because Hipfire does not expose SDAPI always-on scripts"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn sdapi_script_value_is_empty(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Array(values) => values.is_empty(),
+        Value::Object(values) => values.is_empty(),
+        Value::String(value) => value.trim().is_empty(),
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3501,6 +3551,74 @@ mod tests {
         assert_eq!(info["width"], 2);
         assert_eq!(info["height"], 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn txt2img_route_rejects_unsupported_selectable_script_payloads() {
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let response = post_txt2img(
+            State(state.clone()),
+            Json(SdGenerationRequest {
+                prompt: "a cat".to_string(),
+                script_name: Some("X/Y/Z plot".to_string()),
+                ..empty_request()
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("script_name"));
+
+        let response = post_txt2img(
+            State(state),
+            Json(SdGenerationRequest {
+                prompt: "a cat".to_string(),
+                script_args: Some(json!(["arg"])),
+                ..empty_request()
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("script_args"));
+    }
+
+    #[tokio::test]
+    async fn img2img_route_rejects_unsupported_alwayson_scripts_but_allows_empty_defaults() {
+        assert!(sdapi_validate_supported_scripts(&SdGenerationRequest {
+            script_args: Some(json!([])),
+            alwayson_scripts: Some(json!({})),
+            ..empty_request()
+        })
+        .is_ok());
+
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let response = post_img2img(
+            State(state),
+            Json(SdGenerationRequest {
+                prompt: "a cat".to_string(),
+                init_images: Some(vec![tiny_png_base64()]),
+                alwayson_scripts: Some(json!({
+                    "controlnet": {
+                        "args": [{"enabled": true}]
+                    }
+                })),
+                ..empty_request()
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("alwayson_scripts"));
     }
 
     #[tokio::test]
