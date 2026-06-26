@@ -11,6 +11,7 @@ SEED="${HIPFIRE_DIFFUSION_SMOKE_SEED:-501}"
 PROMPT="${HIPFIRE_DIFFUSION_SMOKE_PROMPT:-hipfire SDAPI diffusion smoke test}"
 BATCH_SIZE="${HIPFIRE_DIFFUSION_SMOKE_BATCH_SIZE:-1}"
 N_ITER="${HIPFIRE_DIFFUSION_SMOKE_N_ITER:-1}"
+ROCM_DEVICE_ID="${HIPFIRE_DIFFUSION_SMOKE_ROCM_DEVICE_ID:-}"
 SERVER_SMOKE_LOCK="${HIPFIRE_SERVER_SMOKE_LOCK:-${TMPDIR:-/tmp}/hipfire-server-smoke.lock}"
 SERVER_SMOKE_LOCK_WAIT="${HIPFIRE_SERVER_SMOKE_LOCK_WAIT:-300}"
 
@@ -26,7 +27,7 @@ if [[ ! -f "$MODEL" ]]; then
   exit 2
 fi
 
-python3 - "$ROOT" "$MODEL" "$WIDTH" "$HEIGHT" "$STEPS" "$CFG_SCALE" "$SEED" "$PROMPT" "$BATCH_SIZE" "$N_ITER" <<'PY'
+python3 - "$ROOT" "$MODEL" "$WIDTH" "$HEIGHT" "$STEPS" "$CFG_SCALE" "$SEED" "$PROMPT" "$BATCH_SIZE" "$N_ITER" "$ROCM_DEVICE_ID" <<'PY'
 import base64
 import json
 import os
@@ -42,7 +43,7 @@ import urllib.request
 import zlib
 from typing import Any
 
-root, model, width_s, height_s, steps_s, cfg_scale_s, seed_s, prompt, batch_size_s, n_iter_s = sys.argv[1:]
+root, model, width_s, height_s, steps_s, cfg_scale_s, seed_s, prompt, batch_size_s, n_iter_s, rocm_device_id_s = sys.argv[1:]
 width = int(width_s)
 height = int(height_s)
 steps = int(steps_s)
@@ -51,6 +52,7 @@ seed = int(seed_s)
 batch_size = int(batch_size_s)
 n_iter = int(n_iter_s)
 expected_images = batch_size * n_iter
+rocm_device_id = int(rocm_device_id_s) if rocm_device_id_s else None
 request_timeout = float(os.environ.get("HIPFIRE_DIFFUSION_SDAPI_SMOKE_REQUEST_TIMEOUT", "420"))
 
 if batch_size < 1:
@@ -159,6 +161,8 @@ def sdapi_request(base_url: str, route: str, body: dict[str, Any], label: str) -
         raise RuntimeError(f"{label}: unexpected backend info: {info}")
     if info.get("batch_size") != expected_images:
         raise RuntimeError(f"{label}: expected merged batch_size {expected_images}, got {info}")
+    if rocm_device_id is not None and info.get("runtime") != "rocm-hybrid-reference":
+        raise RuntimeError(f"{label}: expected rocm-hybrid-reference runtime, got {info}")
     return out, info
 
 
@@ -170,11 +174,26 @@ env = os.environ.copy()
 env.setdefault("HIPFIRE_NO_PID_FILE", "1")
 
 custom_cmd = os.environ.get("HIPFIRE_DIFFUSION_SDAPI_SMOKE_CMD")
+cargo_features = os.environ.get("HIPFIRE_DIFFUSION_SDAPI_SMOKE_CARGO_FEATURES", "").strip()
+if rocm_device_id is not None and not cargo_features and not custom_cmd:
+    cargo_features = "rocm"
 release_bin = os.path.join(root, "target", "release", "hipfire")
 if custom_cmd:
     cmd = shlex.split(custom_cmd)
 else:
-    if os.path.exists(release_bin) and os.access(release_bin, os.X_OK):
+    if cargo_features:
+        cmd = [
+            "cargo",
+            "run",
+            "-q",
+            "--release",
+            "-p",
+            "hipfire-cli",
+            "--features",
+            cargo_features,
+            "--",
+        ]
+    elif os.path.exists(release_bin) and os.access(release_bin, os.X_OK):
         cmd = [release_bin]
     else:
         cmd = ["cargo", "run", "-q", "--release", "-p", "hipfire-cli", "--"]
@@ -213,6 +232,8 @@ try:
         "send_images": True,
         "save_images": False,
     }
+    if rocm_device_id is not None:
+        txt_body["hipfire_rocm_device_id"] = rocm_device_id
     txt, txt_info = sdapi_request(base_url, "/sdapi/v1/txt2img", txt_body, "txt2img")
     if txt_info.get("pipeline") != "StableDiffusionPipeline":
         raise RuntimeError(f"txt2img did not use StableDiffusionPipeline: {txt_info}")
@@ -265,6 +286,7 @@ try:
         "batch_size": batch_size,
         "n_iter": n_iter,
         "images_per_route": expected_images,
+        "rocm_device_id": rocm_device_id,
         "txt2img": {"backend": txt_info.get("backend"), "runtime": txt_info.get("runtime")},
         "img2img": {"masked": img_info.get("masked")},
         "masked_img2img": {"masked": masked_info.get("masked")},

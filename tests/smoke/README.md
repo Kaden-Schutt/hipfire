@@ -22,6 +22,18 @@ claims.
   default `/tmp/hipfire-tiny-sd-diffusion.hfq` is not present. Set
   `HIPFIRE_DIFFUSION_SMOKE_BATCH_SIZE` and `HIPFIRE_DIFFUSION_SMOKE_N_ITER` to
   validate WebUI batch and iteration semantics against batch-capable artifacts.
+  Set `HIPFIRE_DIFFUSION_SMOKE_ROCM_DEVICE_ID` to validate the hybrid ROCm
+  runtime path; the smoke will use a release cargo run with `--features rocm`
+  unless `HIPFIRE_DIFFUSION_SDAPI_SMOKE_CARGO_FEATURES` or
+  `HIPFIRE_DIFFUSION_SDAPI_SMOKE_CMD` overrides it.
+- `diffusion-tiny-sd-hfq-admission.sh` imports a Tiny-SD HFQ from the local
+  Hugging Face cache when needed, then runs the native CLI diffusion admission
+  smoke. Set `HIPFIRE_DIFFUSION_ADMISSION_ROCM_DEVICE_ID` to validate the
+  hybrid ROCm runtime path; the smoke will use `--features rocm` unless
+  `HIPFIRE_DIFFUSION_ADMISSION_CARGO_FEATURES` overrides it. ROCm liveness
+  checks can narrow the run with `HIPFIRE_DIFFUSION_ADMISSION_BATCH_SIZE=1` and
+  `HIPFIRE_DIFFUSION_ADMISSION_TXT2IMG_ONLY=1`; CPU admission should keep the
+  default full txt2img/img2img/masked-img2img coverage.
 
 `tests/no-gpu-ci.sh` invokes the no-GPU smoke and syntax-checks the optional
 model/server smoke scripts.

@@ -18,6 +18,19 @@ PROMPT="${HIPFIRE_DIFFUSION_ADMISSION_PROMPT:-hipfire Tiny-SD admission smoke}"
 OUTPUT_DIR="${HIPFIRE_DIFFUSION_ADMISSION_OUTPUT_DIR:-${TMPDIR:-/tmp}/hipfire-tiny-sd-admission-smoke}"
 IMPORT_TIMEOUT="${HIPFIRE_DIFFUSION_ADMISSION_IMPORT_TIMEOUT:-900s}"
 SMOKE_TIMEOUT="${HIPFIRE_DIFFUSION_ADMISSION_SMOKE_TIMEOUT:-1200s}"
+ROCM_DEVICE_ID="${HIPFIRE_DIFFUSION_ADMISSION_ROCM_DEVICE_ID:-}"
+CARGO_FEATURES="${HIPFIRE_DIFFUSION_ADMISSION_CARGO_FEATURES:-}"
+TXT2IMG_ONLY="${HIPFIRE_DIFFUSION_ADMISSION_TXT2IMG_ONLY:-0}"
+SKIP_MASKED_IMG2IMG="${HIPFIRE_DIFFUSION_ADMISSION_SKIP_MASKED_IMG2IMG:-0}"
+if [[ -n "$ROCM_DEVICE_ID" && -z "$CARGO_FEATURES" ]]; then
+  CARGO_FEATURES="rocm"
+fi
+
+HIPFIRE_CLI=(cargo run --release -q -p hipfire-cli)
+if [[ -n "$CARGO_FEATURES" ]]; then
+  HIPFIRE_CLI+=(--features "$CARGO_FEATURES")
+fi
+HIPFIRE_CLI+=(--)
 
 find_tiny_sd_source() {
   if [[ -n "$SOURCE" ]]; then
@@ -44,14 +57,26 @@ if [[ ! -f "$MODEL" ]]; then
     exit 2
   fi
   echo "importing Tiny-SD diffusion HFQ from $SOURCE -> $MODEL"
-  timeout "$IMPORT_TIMEOUT" cargo run --release -q -p hipfire-cli -- diffusion import \
+  timeout "$IMPORT_TIMEOUT" "${HIPFIRE_CLI[@]}" diffusion import \
     --max-batch "$BATCH_SIZE" \
     --model-name "$MODEL_NAME" \
     --output "$MODEL" \
     "$SOURCE"
 fi
 
-timeout "$SMOKE_TIMEOUT" cargo run --release -q -p hipfire-cli -- diffusion smoke \
+ROCM_ARGS=()
+if [[ -n "$ROCM_DEVICE_ID" ]]; then
+  ROCM_ARGS=(--rocm-device-id "$ROCM_DEVICE_ID")
+fi
+SMOKE_MODE_ARGS=()
+if [[ "$TXT2IMG_ONLY" = "1" ]]; then
+  SMOKE_MODE_ARGS+=(--txt2img-only)
+fi
+if [[ "$SKIP_MASKED_IMG2IMG" = "1" ]]; then
+  SMOKE_MODE_ARGS+=(--skip-masked-img2img)
+fi
+
+timeout "$SMOKE_TIMEOUT" "${HIPFIRE_CLI[@]}" diffusion smoke \
   --model "$MODEL" \
   --output-dir "$OUTPUT_DIR" \
   --batch-size "$BATCH_SIZE" \
@@ -61,4 +86,6 @@ timeout "$SMOKE_TIMEOUT" cargo run --release -q -p hipfire-cli -- diffusion smok
   --cfg-scale "$CFG_SCALE" \
   --scheduler "$SCHEDULER" \
   --prompt "$PROMPT" \
-  --seed "$SEED"
+  --seed "$SEED" \
+  "${ROCM_ARGS[@]}" \
+  "${SMOKE_MODE_ARGS[@]}"
