@@ -59,8 +59,8 @@ Machine-readable subset consumed by `arch_features` / admission. Edit `docs/mode
 | q8 (Q8 (W8A16)) | 8 | 16 | stable |
 | mq4 (Magnum / MQ4 (W4A16)) | 4 | 16 | stable |
 | mq6 (Magnum / MQ6 (W6A16)) | 6 | 16 | stable |
-| op4 (Opus / OP4-4 (4-bit weights / int4 activations)) | 4 | 4 | opt-in |
-| op8 (Opus / OP8-16 (8-bit weights / 8-bit activations)) | 8 | 8 | opt-in |
+| op4 (Opus Quant / OP4-4 (4-bit weights / int4 activations)) | 4 | 4 | opt-in |
+| op8 (Opus Quant / OP8-16 (8-bit weights / 8-bit activations)) | 8 | 8 | opt-in |
 | mq3 (Magnum / MQ3 (W3A16, mixed-precision only)) | 3 | 16 | experimental |
 
 ### Intentional gates (generated)

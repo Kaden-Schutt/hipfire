@@ -67,10 +67,10 @@ MedGemma-27B-it.triattn.hfq
 - size with optional active/effective paramaters. eg. 0.8b, 30B-A3B, 8B-E4B, 50M, 2.5T
 - Use `.hfq` for hipfire all container artifacts.
 - Use dotted model versions such as `Qwen3.5`. do not use qwen35 for example.
-- Put calibration or transform modifiers before the quant token: `awq-mq4` or `lloyd-mq3`.
+- Put calibration or transform modifiers before the quant token, e.g. `awq-mq4` or `lloyd-mq3`.
 - Use role sidecars when loaded independently: `.mtp.hfq`, `.dflash.hfq`,
   `.jinja.`, `.hessian` and `.triattn.hfq`.
-- The quant should detail the weight encoding. eg. Lloyd MQ2 uses `-lloyd-mq2.hfq`, magnum `-mq4.hfq`
+- The quant should detail the weight encoding. eg. Lloyd MQ2 uses `lloyd-mq2`, magnum `mq4`.
 - `arch` must start with gfx followed by 3 or 4 numbers. eg. gfx906, gfx1103, gfx1151, gfx1201
 - When a script, gate, registry, or doc uses an older format, update it to the
   canonical naming convention as part of the fix.
