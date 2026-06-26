@@ -85,7 +85,7 @@ use twox_hash::XxHash64;
 // derive per-channel `RMS_act` for the smoothing-quant scale.
 static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 
-// `--ldlq`: full-Hessian error-feedback (GPTQ/OBS) weight quant for OP4+/OP8+.
+// `--ldlq`: full-Hessian error-feedback (GPTQ/OBS) weight quant for OQ4++/OQ8++.
 // The calibrated arms read each tensor's full [K,K] Hessian from this index and
 // run the matching `ldlq::*_pack` routine instead of plain RTN. Opened from the
 // `--hessian` path (HFQM or HFHS-v1, carrying full [K,K], not just the diagonal
@@ -2950,6 +2950,32 @@ fn normalize_format_flag(flag: &str) -> String {
     flag.trim().to_ascii_lowercase()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OqCalibrationRecipe {
+    Plain,
+    Awq,
+    AwqLdlq,
+}
+
+fn oq4_calibration_recipe(format: &str) -> OqCalibrationRecipe {
+    match format {
+        "oq4+" => OqCalibrationRecipe::Awq,
+        // Legacy OP plus spellings predate the positional OQ+ / OQ++ taxonomy.
+        // Keep parsing them as the older LDLQ recipe, but emit canonical OQ names
+        // in docs and artifacts.
+        "oq4++" | "op4+" | "op4-4+" | "op4-8+" => OqCalibrationRecipe::AwqLdlq,
+        _ => OqCalibrationRecipe::Plain,
+    }
+}
+
+fn oq8_calibration_recipe(format: &str) -> OqCalibrationRecipe {
+    match format {
+        "oq8+" | "oq8-plus" => OqCalibrationRecipe::Awq,
+        "oq8++" | "op8+" | "op8-16+" | "op8-plus" => OqCalibrationRecipe::AwqLdlq,
+        _ => OqCalibrationRecipe::Plain,
+    }
+}
+
 fn read_chat_template_file(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| {
         eprintln!(
@@ -3018,14 +3044,13 @@ impl HfqInputFormat {
             "mq6" | "mq6g256" => Some(Self::Mq6),
             "mq3" | "mq3g256" => Some(Self::Mq3),
             "qtip3" => Some(Self::Qtip3),
-            "op4" | "op4-4" | "op4g256" | "op4+" | "op4-4+" | "op4-8+" | "oq4" | "oq4g256" => {
-                Some(Self::Oq4)
-            }
+            "op4" | "op4-4" | "op4g256" | "op4+" | "op4-4+" | "op4-8+" | "oq4" | "oq4+"
+            | "oq4++" | "oq4g256" => Some(Self::Oq4),
             "opplus" | "op4-plus" => Some(Self::OqPlus),
             "op4+t" | "opplus-tiered" | "op4-tiered" => Some(Self::OqPlusTiered),
             "op4+c" | "opplus-compact" | "op4-compact" => Some(Self::OqPlusCompact),
             "op8" | "op8-16" | "op8g256" | "oq8" | "oq8g256" => Some(Self::Oq8),
-            "op8+" | "op8-16+" | "op8-plus" => Some(Self::Oq8Plus),
+            "op8+" | "op8-16+" | "op8-plus" | "oq8+" | "oq8++" | "oq8-plus" => Some(Self::Oq8Plus),
             _ => None,
         }
     }
@@ -3291,8 +3316,8 @@ fn quantize_hfq_source_tensor(
             }
         }
         HfqInputFormat::Oq8 | HfqInputFormat::Oq8Plus => {
-            // Opus Quant W8A8. Plain op8 uses RTN; calibrated op8+ composes
-            // AWQ smoothing and full-Hessian LDLQ into the same Oq8G256 wire
+            // Opus Quant W8A8. Plain OQ8 uses RTN; OQ8+ adds AWQ smoothing and
+            // OQ8++ adds full-Hessian LDLQ into the same Oq8G256 wire
             // format/runtime tag. Requires 256-aligned K (FWHT-256); ragged dims
             // fall back to Q8. Loader is qwen35 qt=35; forward int8-quantizes
             // activations and runs the iu8 GEMM.
@@ -4018,6 +4043,63 @@ fn minimax_layer_awq_scales(
     Some((
         compute_awq_scales(&gu, alpha),
         compute_awq_scales(&d, alpha),
+    ))
+}
+
+/// Shared-per-layer AWQ scales for LFM2 routed experts from native HFQM
+/// `<name>.imatrix` vectors. LFM2 captures per selected expert/source tensor
+/// (`...experts.{e}.w1|w2|w3`); the runtime consumes one gate/up scale and one
+/// down scale per layer via expert 0, so aggregate the per-expert activation
+/// energy before computing scales.
+fn lfm2_layer_awq_scales_from_imatrix(n: usize, alpha: f32) -> Option<(Vec<f32>, Vec<f32>)> {
+    let im = IMATRIX.get()?;
+    let prefix = format!("model.layers.{n}.feed_forward.experts.");
+    let mut gate_up: Option<Vec<f32>> = None;
+    let mut down: Option<Vec<f32>> = None;
+    let mut n_gate_up = 0usize;
+    let mut n_down = 0usize;
+
+    for (name, values) in im {
+        if name.ends_with(".weight") || !name.starts_with(&prefix) {
+            continue;
+        }
+        let target = if name.ends_with(".w1") || name.ends_with(".w3") {
+            &mut gate_up
+        } else if name.ends_with(".w2") {
+            &mut down
+        } else {
+            continue;
+        };
+        match target {
+            Some(acc) if acc.len() == values.len() => {
+                for (a, b) in acc.iter_mut().zip(values) {
+                    *a += *b;
+                }
+            }
+            Some(_) => {
+                eprintln!(
+                    "  lfm2 AWQ L{n}: skipped imatrix {name} with mismatched K={}",
+                    values.len()
+                );
+                continue;
+            }
+            slot @ None => {
+                *slot = Some(values.clone());
+            }
+        }
+        if name.ends_with(".w2") {
+            n_down += 1;
+        } else {
+            n_gate_up += 1;
+        }
+    }
+
+    let gate_up = gate_up?;
+    let down = down?;
+    eprintln!("  lfm2 AWQ L{n}: aggregated {n_gate_up} gate/up + {n_down} down imatrix vectors");
+    Some((
+        compute_awq_scales(&gate_up, alpha),
+        compute_awq_scales(&down, alpha),
     ))
 }
 
@@ -4874,7 +4956,7 @@ INPUT SOURCES (--input):
     <file.hfq>    an existing .hfq (e.g. a bf16 .hfq) for requantization.
                   The .hfq-source path supports --format
                   bf16 / fp16 / q8f16 / hfq4 / hfq6 / mq4 / mq6 / mq3 / qtip3 /
-                  op4 (opus) / op4+ / op8 (opus8) / op8+.
+                  oq4 (opus; legacy op4 aliases) / oq4+ / oq8 (opus8) / oq8+.
                   Other formats (roughquant, lloyd-*, mfp4, …) require a HF/GGUF source.
 
 REQUIRED:
@@ -4884,16 +4966,18 @@ REQUIRED:
 FORMAT (--format <FMT>, default: q8f16):
     Full precision     bf16 (bfloat16) · fp16 (f16/float16) · f32 (oracle/passthrough)
     Production quant   q8f16 (q8) · mq4 (magnum) · mq6 · mq3 · hfq4 · hfq6 · mfp4 (hfp4g32) · q8hfq
-    Opus Quant         op4 / op4-4 (alias: opus) — 4-bit-resident Opus Quant.
-                       op4+ / op4-4+ is op4 plus AWQ+LDLQ calibration; it requires
-                       --awq --ldlq --hessian and should be used only for
-                       quality-gated plus artifacts.
-                       op8 / op8-16 (alias: opus8) — 8-bit Opus Quant.
-                       op8+ / op8-16+ is op8 plus AWQ+LDLQ calibration; it
-                       requires --awq --ldlq --hessian and keeps the Oq8G256
-                       W8A8 runtime format.
+    Opus Quant         oq4 / op4 / op4-4 (alias: opus) — 4-bit-resident Opus Quant.
+                       oq4+ is oq4 plus activation-aware AWQ/SmoothQuant
+                       calibration; it requires --imatrix or --hessian.
+                       oq4++ adds full-Hessian LDLQ feedback and requires
+                       --hessian. Legacy op4+ spellings remain aliases for oq4++.
+                       oq8 / op8 / op8-16 (alias: opus8) — 8-bit Opus Quant.
+                       oq8+ is oq8 plus activation-aware AWQ/SmoothQuant
+                       calibration; oq8++ adds full-Hessian LDLQ feedback.
+                       Both keep the Oq8G256 W8A8 runtime format. Legacy op8+
+                       spellings remain aliases for oq8++.
     Legacy Opus-A8     opplus / op4-plus — older W4A8 experimental tag
-                       (qt=33), distinct from op4+.
+                       (qt=33), distinct from oq4+.
     MoE / routed       mq4-mq6exp · mq4-routed-lloyd-mq-tiered (needs --imatrix) · antirez-mq · …
     Research (gated)   mq2 · lloyd-mq2 · lloyd-mq3 · lloyd-mq4 · qtip3 · qtip3-sim ·
                        roughquant (rq) · roughquant{{2,3,4}}-sim · permute5 (rq5)
@@ -4903,9 +4987,10 @@ FORMAT (--format <FMT>, default: q8f16):
 OPTIONS:
     --format <FMT>             quant format (see FORMAT); default q8f16
     --imatrix <PATH>           llama.cpp imatrix GGUF; enables importance-weighted Lloyd and AWQ
-    --awq                      activation-aware weight pre-scaling (alpha=0.55); requires --imatrix
+    --awq                      activation-aware weight pre-scaling (alpha=0.55);
+                               requires --imatrix or --hessian
     --awq-alpha <F>            enable AWQ at an explicit alpha (overrides the 0.55 default)
-    --ldlq                     full-Hessian (GPTQ/OBS) error-feedback for op4+/op8+
+    --ldlq                     full-Hessian (GPTQ/OBS) error-feedback for oq4++/oq8++
                                weights instead of RTN; requires --hessian. Composes
                                with --awq (smooths activations + rebases the Hessian)
     --chat-template-file <P>   override the embedded chat template (Jinja file)
@@ -5011,30 +5096,32 @@ fn main() {
 
     let format_arg = arg_value(&args, "--format").unwrap_or("q8f16");
     let mut format_storage = normalize_format_flag(format_arg);
-    // OP4+ is not a separate storage tag: it is OP4 with the calibrated
-    // AWQ+LDLQ recipe. Normalize it to OP4, then enforce the required flags
+    // OQ4+/OQ4++ are not separate storage tags: they use OQ4 bytes plus
+    // calibration sidecars/packing. Normalize to OQ4, then enforce the recipe
     // after argument parsing has loaded calibration sidecars.
-    let op4_plus_recipe = matches!(format_storage.as_str(), "op4+" | "op4-4+" | "op4-8+");
-    if op4_plus_recipe {
-        format_storage = "op4".to_string();
+    let oq4_recipe = oq4_calibration_recipe(format_storage.as_str());
+    let oq4_plus_recipe = oq4_recipe != OqCalibrationRecipe::Plain;
+    if oq4_plus_recipe {
+        format_storage = "oq4".to_string();
     }
-    // OP8+ is calibrated OP8 (same Oq8G256 runtime format, AWQ+LDLQ recipe).
-    // Keep a distinct dispatch token so the OQ8 branch can run the LDLQ packer.
-    let op8_plus_recipe = matches!(format_storage.as_str(), "op8+" | "op8-16+" | "op8-plus");
-    if op8_plus_recipe {
-        format_storage = "op8+".to_string();
+    // OQ8+/OQ8++ are calibrated OQ8 (same Oq8G256 runtime format). Keep a
+    // distinct dispatch token so the OQ8 branch can run OQ8-specific packing.
+    let oq8_recipe = oq8_calibration_recipe(format_storage.as_str());
+    let oq8_plus_recipe = oq8_recipe != OqCalibrationRecipe::Plain;
+    if oq8_plus_recipe {
+        format_storage = "oq8+".to_string();
     }
+    let oq_plus_recipe = oq4_plus_recipe || oq8_plus_recipe;
+    let oq_ldlq_recipe =
+        oq4_recipe == OqCalibrationRecipe::AwqLdlq || oq8_recipe == OqCalibrationRecipe::AwqLdlq;
     // Legacy Opus-A8 is a distinct W4A8 FORMAT, not the generic `+`
-    // clip/AWQ modifier and not calibrated OP4+.
+    // clip/AWQ modifier and not calibrated OQ4+.
     let is_legacy_opus_plus = matches!(format_storage.as_str(), "opplus" | "op4-plus");
     // `mqN+` modifier: clip-search + AWQ on top of the base MQ format. Strip the
     // trailing `+` so downstream format matching sees the base (e.g. "mq4"), and
     // enable clip-search globally. AWQ is auto-enabled below.
-    // MQ+ keeps the generic `+` suffix; calibrated OP4+ was normalized above.
-    let mq_plus = format_storage.ends_with('+')
-        && !op4_plus_recipe
-        && !op8_plus_recipe
-        && !is_legacy_opus_plus;
+    // MQ+ keeps the generic `+` suffix; calibrated OQ4+ was normalized above.
+    let mq_plus = format_storage.ends_with('+') && !oq_plus_recipe && !is_legacy_opus_plus;
     if mq_plus {
         format_storage.pop();
         let _ = MQ_CLIPSEARCH.set(true);
@@ -5249,7 +5336,12 @@ fn main() {
         || format == "oq8"
         || format == "oq8g256"
         || format == "opus8";
-    let use_oq8_plus = format == "op8+" || format == "op8-16+" || format == "op8-plus";
+    let use_oq8_plus = format == "oq8+"
+        || format == "oq8++"
+        || format == "oq8-plus"
+        || format == "op8+"
+        || format == "op8-16+"
+        || format == "op8-plus";
     let lfm2_oq_format = HfqInputFormat::from_flag(format).filter(|fmt| {
         matches!(
             fmt,
@@ -5571,12 +5663,12 @@ fn main() {
         eprintln!("imatrix loaded from {}", path.display());
     }
 
-    // --hessian <path>: reuse an existing HFHS-v1 *.hessian.bin as the AWQ
-    // activation statistic. The per-input-channel Hessian diagonal
-    // H[j,j] = Σ_token x[j]² IS AWQ's in_sum2[j], so this feeds --awq without a
-    // separate llama.cpp imatrix GGUF. Keyed by the weight tensor name (HFHS
-    // stores the base name; AWQ looks up `<...>.weight`). Ignored if --imatrix
-    // already populated IMATRIX.
+    // --hessian <path>: reuse an existing HFQM `.calib.hfq` or legacy HFHS-v1
+    // *.hessian.bin as the AWQ activation statistic. For HFQM, explicit
+    // `<name>.imatrix` vectors are imported first-class; full-Hessian tensors
+    // also contribute their diagonal because H[j,j] = Σ_token x[j]² is AWQ's
+    // in_sum2[j]. Keyed by the weight tensor name (AWQ looks up
+    // `<...>.weight`). Ignored if --imatrix already populated IMATRIX.
     if IMATRIX.get().is_none() {
         if let Some(hpath) = args
             .iter()
@@ -5590,18 +5682,28 @@ fn main() {
             }
             match hessian_io::HessianSidecar::open(&hpath) {
                 Ok(sc) => {
+                    let n_hessian = sc.n_tensors();
+                    let n_imatrix = sc.n_imatrix_tensors();
                     let mut table: HashMap<String, Vec<f32>> =
-                        HashMap::with_capacity(sc.n_tensors() * 2);
+                        HashMap::with_capacity((n_hessian + n_imatrix) * 2);
                     for href in sc.tensors() {
                         let diag: Vec<f32> = (0..href.k).map(|i| href.at(i, i) as f32).collect();
                         table.insert(format!("{}.weight", href.name), diag.clone());
                         table.insert(href.name.to_string(), diag);
                     }
+                    for iref in sc.imatrices() {
+                        let imatrix: Vec<f32> = iref.iter_f32().collect();
+                        table.insert(format!("{}.weight", iref.name), imatrix.clone());
+                        table.insert(iref.name.to_string(), imatrix);
+                    }
                     let n = table.len();
                     IMATRIX
                         .set(table)
                         .expect("IMATRIX set twice — should not happen");
-                    eprintln!("imatrix derived from HFQM Hessian diagonals ({hpath:?}): {n} keys");
+                    eprintln!(
+                        "imatrix derived from HFQM calibration ({hpath:?}): {n} keys \
+                         ({n_hessian} Hessian diagonals, {n_imatrix} imatrix vectors)"
+                    );
                 }
                 Err(_) => match hfhs_diag::read_diagonals(&hpath) {
                     Ok(diags) => {
@@ -5626,10 +5728,11 @@ fn main() {
         }
     }
 
-    // --ldlq: full-Hessian error-feedback weight quant for calibrated plus
+    // --ldlq / OQ++: full-Hessian error-feedback weight quant for calibrated plus
     // formats. Loads the full [K,K] payloads from the same --hessian file the
     // AWQ diagonal came from. Requires --hessian.
-    if args.iter().any(|a| a == "--ldlq") {
+    let ldlq_requested = oq_ldlq_recipe || args.iter().any(|a| a == "--ldlq");
+    if ldlq_requested {
         match args
             .iter()
             .position(|a| a == "--hessian")
@@ -5659,7 +5762,9 @@ fn main() {
                     .expect("OQ4_LDLQ_HESSIAN set twice");
             }
             _ => {
-                eprintln!("error: --ldlq requires --hessian <HFHS .hessian.bin>");
+                eprintln!(
+                    "error: --format oq4++/oq8++ or --ldlq requires --hessian <HFHS .hessian.bin>"
+                );
                 std::process::exit(1);
             }
         }
@@ -5681,22 +5786,10 @@ fn main() {
     // outlier mitigation techniques" — MR-GPTQ is the right lever there,
     // tracked as Stage C). HFP4/MFP4 are explicitly NOT awq-pre-scaled
     // in this patch.
-    let awq_enabled =
-        mq_plus || args.iter().any(|a| a == "--awq") || args.iter().any(|a| a == "--awq-alpha");
-    if (op4_plus_recipe || op8_plus_recipe)
-        && (!awq_enabled
-            || !args.iter().any(|a| a == "--ldlq")
-            || !args.iter().any(|a| a == "--hessian"))
-    {
-        eprintln!(
-            "error: --format {} means calibrated {} and requires --awq --ldlq --hessian <calib .hfq>; use --format {} for uncalibrated {}",
-            if op8_plus_recipe { "op8+" } else { "op4+" },
-            if op8_plus_recipe { "OP8+" } else { "OP4+" },
-            if op8_plus_recipe { "op8" } else { "op4" },
-            if op8_plus_recipe { "OP8" } else { "OP4" }
-        );
-        std::process::exit(1);
-    }
+    let awq_enabled = mq_plus
+        || oq_plus_recipe
+        || args.iter().any(|a| a == "--awq")
+        || args.iter().any(|a| a == "--awq-alpha");
     let awq_alpha = args
         .iter()
         .position(|a| a == "--awq-alpha")
@@ -5705,7 +5798,10 @@ fn main() {
         .unwrap_or(0.55);
     if awq_enabled {
         if IMATRIX.get().is_none() {
-            eprintln!("error: --awq requires --imatrix (we derive RMS_act per channel from imatrix in_sum2 values)");
+            eprintln!(
+                "error: activation-aware quantization requires --imatrix or --hessian \
+                 (we derive RMS_act per channel from imatrix/Hessian diagonal values)"
+            );
             std::process::exit(1);
         }
         if !(0.0..=1.0).contains(&awq_alpha) {
@@ -6384,6 +6480,11 @@ fn main() {
     let mut mm_awq_cache: std::collections::HashMap<usize, Option<(Vec<f32>, Vec<f32>)>> =
         std::collections::HashMap::new();
     let mut mm_awq_emitted: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    // LFM2 AWQ: native HFQM imatrix vectors aggregate into the same shared
+    // per-layer gate/up + down sidecars the LFM2 runtime consumes.
+    let mut lfm2_awq_cache: std::collections::HashMap<usize, Option<(Vec<f32>, Vec<f32>)>> =
+        std::collections::HashMap::new();
+    let mut lfm2_awq_emitted: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for (name, file_idx) in &all_tensors {
         // --include-prefix filter (highest priority — runs before mtp/vision skips).
         if let Some(ref p) = include_prefix {
@@ -6482,13 +6583,64 @@ fn main() {
                 && meta.shape.len() == 2
                 && meta.shape[1] % 256 == 0
             {
-                let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                let mut f32_data = tensor_to_f32_with_optional_fp8_scale(
                     name,
                     raw_data,
                     meta,
                     &fp8_scale_for,
                     &st_files,
                 );
+                let k = meta.shape[1];
+                let m = meta.shape[0];
+                if awq_enabled {
+                    if let Some(layer_n) = minimax_layer_index(name) {
+                        let alpha = AWQ_ALPHA.get().copied().unwrap_or(0.55);
+                        let entry = lfm2_awq_cache
+                            .entry(layer_n)
+                            .or_insert_with(|| lfm2_layer_awq_scales_from_imatrix(layer_n, alpha));
+                        if let Some((s_gu, s_dn)) = entry.as_ref() {
+                            let scale = if name.ends_with(".w2.weight") {
+                                s_dn
+                            } else {
+                                s_gu
+                            };
+                            if scale.len() == k {
+                                awq_pre_scale_weights(&mut f32_data, m, k, scale);
+                            } else {
+                                eprintln!(
+                                    "  lfm2 AWQ L{layer_n}: scale len {} != k {} ({name}); skipped",
+                                    scale.len(),
+                                    k
+                                );
+                            }
+                            if lfm2_awq_emitted.insert(layer_n) {
+                                hfq_tensors.push(HfqTensor {
+                                    name: format!(
+                                        "model.layers.{layer_n}.feed_forward.awq_scale_gate_up.weight"
+                                    ),
+                                    quant_type: QuantType::F16,
+                                    shape: vec![s_gu.len() as u32],
+                                    group_size: 0,
+                                    data: awq_scales_to_f16_bytes(s_gu),
+                                    spilled_len: 0,
+                                });
+                                hfq_tensors.push(HfqTensor {
+                                    name: format!(
+                                        "model.layers.{layer_n}.feed_forward.awq_scale_down.weight"
+                                    ),
+                                    quant_type: QuantType::F16,
+                                    shape: vec![s_dn.len() as u32],
+                                    group_size: 0,
+                                    data: awq_scales_to_f16_bytes(s_dn),
+                                    spilled_len: 0,
+                                });
+                                eprintln!(
+                                    "  AWQ-LFM: emitted gate_up + down scales for L{layer_n}"
+                                );
+                            }
+                        }
+                    }
+                }
                 let signs1 = gen_fwht_signs(42, 256);
                 let signs2 = gen_fwht_signs(1042, 256);
                 let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
@@ -8938,7 +9090,7 @@ fn main() {
     eprintln!("  Mean quant error: {mean_quant_error:.8}");
     eprintln!("  Max quant error:  {max_quant_error:.8}");
     eprintln!("  Output size:      {:.1} MB", total_bytes as f64 / 1e6);
-    if let Err(e) = ldlq_report_and_validate(op4_plus_recipe || op8_plus_recipe) {
+    if let Err(e) = ldlq_report_and_validate(oq_ldlq_recipe) {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
@@ -12087,6 +12239,25 @@ mod tests {
         assert_eq!(normalize_format_flag(" BF16 "), "bf16");
         assert_eq!(normalize_format_flag("Mq4G256"), "mq4g256");
         assert_eq!(normalize_format_flag("op4+"), "op4+");
+        assert_eq!(normalize_format_flag("OQ4+"), "oq4+");
+    }
+
+    #[test]
+    fn oq_plus_recipe_keeps_awq_and_ldlq_levels_distinct() {
+        assert_eq!(oq4_calibration_recipe("oq4"), OqCalibrationRecipe::Plain);
+        assert_eq!(oq4_calibration_recipe("oq4+"), OqCalibrationRecipe::Awq);
+        assert_eq!(
+            oq4_calibration_recipe("oq4++"),
+            OqCalibrationRecipe::AwqLdlq
+        );
+        assert_eq!(oq4_calibration_recipe("op4+"), OqCalibrationRecipe::AwqLdlq);
+        assert_eq!(oq8_calibration_recipe("oq8"), OqCalibrationRecipe::Plain);
+        assert_eq!(oq8_calibration_recipe("oq8+"), OqCalibrationRecipe::Awq);
+        assert_eq!(
+            oq8_calibration_recipe("oq8++"),
+            OqCalibrationRecipe::AwqLdlq
+        );
+        assert_eq!(oq8_calibration_recipe("op8+"), OqCalibrationRecipe::AwqLdlq);
     }
 
     #[test]
@@ -12125,7 +12296,20 @@ mod tests {
             Some(HfqInputFormat::Oq8)
         );
         assert_eq!(HfqInputFormat::from_flag("oq4"), Some(HfqInputFormat::Oq4));
+        assert_eq!(HfqInputFormat::from_flag("oq4+"), Some(HfqInputFormat::Oq4));
+        assert_eq!(
+            HfqInputFormat::from_flag("oq4++"),
+            Some(HfqInputFormat::Oq4)
+        );
         assert_eq!(HfqInputFormat::from_flag("oq8"), Some(HfqInputFormat::Oq8));
+        assert_eq!(
+            HfqInputFormat::from_flag("oq8+"),
+            Some(HfqInputFormat::Oq8Plus)
+        );
+        assert_eq!(
+            HfqInputFormat::from_flag("oq8++"),
+            Some(HfqInputFormat::Oq8Plus)
+        );
         assert_eq!(
             HfqInputFormat::from_flag("op8+"),
             Some(HfqInputFormat::Oq8Plus)

@@ -355,7 +355,11 @@ pub fn populate(registry: &mut KernelRegistry) {
     registry.register(KernelVariant {
         key: KernelKey::AttnFullF32,
         arch_required: ArchPredicate::HasWmma,
-        shape_gate: Some(ShapePredicate::HeadDimMultipleOf(16)),
+        shape_gate: Some(ShapePredicate::And(&[
+            ShapePredicate::HeadDimMultipleOf(16),
+            ShapePredicate::HeadDimLe(256),
+            ShapePredicate::BatchGe(32),
+        ])),
         steps: &[PipelineOp::Attend],
         has_awq: false,
         tile: TileImpl::DflashWmmaF32,

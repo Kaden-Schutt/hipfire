@@ -58,6 +58,8 @@ groups before the quant token, for example `Qwen3.5-9B.mtp-vl.oq4.hfq` or
 | `oq4+` | `oq4` plus clip-search/SmoothQuant/AWQ-style calibration | none |
 | `oq4++` | `oq4+` plus Hessian/LDLQ error feedback | legacy `op4+` parser path |
 | `oq8` | 8-bit symmetric Opus Quant | legacy `op8` parser path, `opus8` |
+| `oq8+` | `oq8` plus clip-search/SmoothQuant/AWQ-style calibration | none |
+| `oq8++` | `oq8+` plus Hessian/LDLQ error feedback | legacy `op8+` parser path |
 
 The Rust code still uses older internal enum names such as `Oq4G256` and
 `Oq8G256`; those are implementation details.
@@ -66,7 +68,17 @@ The plus marks are positional. `oq4+` means activation-aware clipping/scaling
 without Hessian/LDLQ feedback. `oq4++` means the same first-stage calibration
 plus Hessian/LDLQ feedback. Without those inputs, the artifact is plain `oq4`.
 
-For a quality-gated `oq4++` artifact, provide calibration inputs:
+For a quality-gated `oq4+` artifact, provide activation calibration inputs:
+
+```bash
+cargo run --release -p hipfire-quantize -- \
+  --input <source-model> \
+  --output ~/.hipfire/models/<name>.oq4+.hfq \
+  --format oq4+ \
+  --imatrix <model>.imatrix.gguf
+```
+
+For a quality-gated `oq4++` artifact, provide full-Hessian calibration inputs:
 
 ```bash
 cargo run --release -p hipfire-quantize -- \
@@ -78,15 +90,15 @@ cargo run --release -p hipfire-quantize -- \
   --hessian <model>.hessian.bin
 ```
 
-If the local quantizer parser has not yet been renamed, use the legacy parser
-flag for the same path while keeping the output artifact canonical:
+Legacy parser aliases remain accepted for old scripts, but new commands and
+artifact names should stay canonical:
 
 ```bash
   --format op4    # canonical artifact token oq4
   --format op4+   # canonical artifact token oq4++
 ```
 
-Current caveat: `--ldlq` for Opus Quant reads the legacy HFHS
+Current caveat: `--ldlq` / `oq4++` for Opus Quant reads the legacy HFHS
 `*.hessian.bin` sidecar. The newer unified `*.calib.hfq` collector format is not
 yet wired into this specific OQ4 LDLQ path.
 

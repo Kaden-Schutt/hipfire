@@ -4,11 +4,13 @@ Goal: benchmark all four W4 quant schemes on a real model across **KLD**,
 **perplexity**, and **tok/s**. **MQ+ is kept as a distinct format** (its own
 quant-type id and artifact), not a flag on MQ4.
 
-**Canonical names (2026-06-23):**
-- **Magnum** = MQ4 · **Magnum Plus** = MQ+ (both W4A8 / iu8; "Plus" = clip-search + SmoothQuant calibration).
-- **Opus Quant** = OP4-4 (W4A4 / iu4) · **Opus Plus** = **OP4-8+** (W4A8 / iu8 —
-  symmetric int4 weights expanded to int8 for `V_WMMA_I32_16X16X16_IU8`).
-  "Opus-A8" is the legacy internal name; **Opus Plus** is the canonical name.
+**Canonical names (updated 2026-06-26):**
+- **Magnum** = MQ4 · **Magnum Plus** = MQ4+ (W4A8 / iu8; "Plus" = clip-search
+  plus activation-aware calibration).
+- **Opus Quant** = OQ4 (W4A4 / iu4) or OQ8 (W8A8 / iu8) · **Opus Plus** =
+  OQ4+ / OQ8+ after AWQ/SmoothQuant-style calibration; OQ4++ / OQ8++ add
+  Hessian/LDLQ feedback. Older `OP*` spellings in this plan are historical
+  aliases; new artifacts should use `oq*`.
 
 Anchor model (local): `~/.hipfire/models/qwen3.5-0.8b-bf16.hfq` (reference) and
 `-mq4.hfq` (baseline already runs today).

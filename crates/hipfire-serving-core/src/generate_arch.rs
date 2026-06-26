@@ -1810,6 +1810,8 @@ pub fn generate_lfm2moe(
     max_think_tokens: usize,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[prompt_frame::Message]>,
+    prefill_already_done: bool,
+    prefilled_prompt_tokens: Option<usize>,
 ) {
     if m.tokenizer.is_none() {
         let _ = writeln!(
@@ -1841,6 +1843,8 @@ pub fn generate_lfm2moe(
             max_think_tokens,
             tools,
             messages_history,
+            prefill_already_done,
+            prefilled_prompt_tokens,
         );
         let _ = top_p;
         return;
@@ -1915,7 +1919,7 @@ pub fn generate_lfm2moe(
         }
     };
 
-    if prompt_ids.is_empty() {
+    if prompt_ids.is_empty() && !prefill_already_done {
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"empty prompt after tokenize"}}"#,
@@ -1937,7 +1941,12 @@ pub fn generate_lfm2moe(
         } else {
             state.n_tokens
         };
-        current + prompt_ids.len() + max_tokens > state.max_seq
+        let prefill_budget = if prefill_already_done {
+            0
+        } else {
+            prompt_ids.len()
+        };
+        current + prefill_budget + max_tokens > state.max_seq
     };
     if overflow {
         let (n, logical, cap) = {
@@ -1948,6 +1957,17 @@ pub fn generate_lfm2moe(
                 state.max_seq,
             )
         };
+        if prefill_already_done {
+            emit_error_with_id(
+                stdout,
+                id,
+                format!(
+                    "prefill_already_done request exceeds LFM2 context: logical={} + max_tokens={} > max_seq={}",
+                    logical, max_tokens, cap
+                ),
+            );
+            return;
+        }
         eprintln!(
             "[daemon] arch_id=11 context full (physical={n} logical={logical}/{cap}) — resetting Lfm2MoeState",
         );
@@ -1961,7 +1981,56 @@ pub fn generate_lfm2moe(
     // ── Prefill. The returned logits are the predictions for the first
     // generated token. ──
     let mut last_logits: Vec<f32>;
-    {
+    let prefill_ms: u128;
+    if prefill_already_done {
+        let current_position = {
+            let state = m
+                .lfm2moe_state
+                .as_ref()
+                .expect("lfm2moe_state missing on arch_id=11 generate");
+            state.n_tokens + state.kv.compact_offset
+        };
+        let expected_position = prefilled_prompt_tokens.unwrap_or(prompt_ids.len());
+        if expected_position == 0 {
+            emit_error_with_id(
+                stdout,
+                id,
+                "prefill_already_done requested for LFM2 without a positive prefilled prompt token count",
+            );
+            return;
+        }
+        if current_position != expected_position {
+            emit_error_with_id(
+                stdout,
+                id,
+                format!(
+                    "prefill_already_done requested but active LFM2 session position {} does not match expected prefilled prompt token count {}",
+                    current_position, expected_position
+                ),
+            );
+            return;
+        }
+        let state = m
+            .lfm2moe_state
+            .as_ref()
+            .expect("lfm2moe_state missing on arch_id=11 generate");
+        last_logits = match gpu.download_f32(&state.logits) {
+            Ok(logits) => logits,
+            Err(e) => {
+                emit_error_with_id(
+                    stdout,
+                    id,
+                    format!("lfm2moe prefilled logits download failed: {e:?}"),
+                );
+                return;
+            }
+        };
+        if last_logits.is_empty() {
+            emit_error_with_id(stdout, id, "lfm2moe prefilled logits were empty");
+            return;
+        }
+        prefill_ms = 0;
+    } else {
         let cfg = m.lfm2moe_config.as_ref().unwrap();
         let weights = m.lfm2moe_weights.as_ref().unwrap();
         let state = m.lfm2moe_state.as_mut().unwrap();
@@ -2005,11 +2074,11 @@ pub fn generate_lfm2moe(
                 }
             }
         }
+        for &tok in &prompt_ids {
+            m.conversation_tokens.push(tok);
+        }
+        prefill_ms = t0.elapsed().as_millis();
     }
-    for &tok in &prompt_ids {
-        m.conversation_tokens.push(tok);
-    }
-    let prefill_ms = t0.elapsed().as_millis();
 
     // ── Decode loop. Sample host-side from the running logits vector. ──
     let seed = std::time::SystemTime::now()
@@ -2113,6 +2182,8 @@ fn generate_lfm2moe_dflash(
     max_think_tokens: usize,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[prompt_frame::Message]>,
+    prefill_already_done: bool,
+    prefilled_prompt_tokens: Option<usize>,
 ) {
     if m.eviction.is_some() {
         emit_error_with_id(
@@ -2191,10 +2262,24 @@ fn generate_lfm2moe_dflash(
             .build()
         }
     };
-    if prompt_ids.is_empty() {
+    if prompt_ids.is_empty() && !prefill_already_done {
         emit_error_with_id(stdout, id, "empty prompt after tokenize");
         return;
     }
+    let expected_prefilled_position = if prefill_already_done {
+        let expected = prefilled_prompt_tokens.unwrap_or(prompt_ids.len());
+        if expected == 0 {
+            emit_error_with_id(
+                stdout,
+                id,
+                "prefill_already_done requested for LFM2 DFlash without a positive prefilled prompt token count",
+            );
+            return;
+        }
+        Some(expected)
+    } else {
+        None
+    };
     if max_tokens == 0 {
         let _ = writeln!(
             stdout,
@@ -2215,15 +2300,14 @@ fn generate_lfm2moe_dflash(
         .map(|s| s.max_seq)
         .unwrap_or(ctx_capacity);
     let usable_capacity = ctx_capacity.min(target_capacity);
-    if prompt_ids.len().saturating_add(block_size) > usable_capacity {
+    let starting_position = expected_prefilled_position.unwrap_or(prompt_ids.len());
+    if starting_position.saturating_add(block_size) > usable_capacity {
         emit_error_with_id(
             stdout,
             id,
             format!(
-                "LFM2 DFlash prompt ({}) + block ({}) exceeds context capacity {}",
-                prompt_ids.len(),
-                block_size,
-                usable_capacity
+                "LFM2 DFlash position ({}) + block ({}) exceeds context capacity {}",
+                starting_position, block_size, usable_capacity
             ),
         );
         return;
@@ -2231,7 +2315,71 @@ fn generate_lfm2moe_dflash(
 
     let eos_tok = m.lfm2moe_eos_tok;
     let t0 = Instant::now();
-    let first_token = {
+    let first_token = if let Some(expected_position) = expected_prefilled_position {
+        let current_position = {
+            let state = m.lfm2moe_state.as_ref().unwrap();
+            state.n_tokens + state.kv.compact_offset
+        };
+        if current_position != expected_position {
+            emit_error_with_id(
+                stdout,
+                id,
+                format!(
+                    "prefill_already_done requested but active LFM2 DFlash session position {} does not match expected prefilled prompt token count {}",
+                    current_position, expected_position
+                ),
+            );
+            return;
+        }
+        {
+            let df = m.lfm2_dflash.as_mut().unwrap();
+            let row_floats = df.draft_config.num_extract() * df.draft_config.hidden;
+            let expected_hidden = match expected_position.checked_mul(row_floats) {
+                Some(v) => v,
+                None => {
+                    emit_error_with_id(
+                        stdout,
+                        id,
+                        "lfm2moe dflash prefilled hidden history size overflow",
+                    );
+                    return;
+                }
+            };
+            if df.target_hidden_host.len() != expected_hidden {
+                emit_error_with_id(
+                    stdout,
+                    id,
+                    format!(
+                        "lfm2moe dflash prefilled hidden history has {} floats, expected {} for position {}",
+                        df.target_hidden_host.len(),
+                        expected_hidden,
+                        expected_position
+                    ),
+                );
+                return;
+            }
+            df.draft_scratch.reset_upload_tracking();
+        }
+        let logits = {
+            let state = m.lfm2moe_state.as_ref().unwrap();
+            match gpu.download_f32(&state.logits) {
+                Ok(logits) => logits,
+                Err(e) => {
+                    emit_error_with_id(
+                        stdout,
+                        id,
+                        format!("lfm2moe dflash prefilled logits download failed: {e:?}"),
+                    );
+                    return;
+                }
+            }
+        };
+        if logits.is_empty() {
+            emit_error_with_id(stdout, id, "lfm2moe dflash prefilled logits were empty");
+            return;
+        }
+        lfm2_argmax(&logits)
+    } else {
         let cfg = m.lfm2moe_config.as_ref().unwrap();
         let weights = m.lfm2moe_weights.as_ref().unwrap();
         let state = m.lfm2moe_state.as_mut().unwrap();
@@ -2289,9 +2437,15 @@ fn generate_lfm2moe_dflash(
             }
         }
     };
-    let prefill_ms = t0.elapsed().as_millis();
-    m.conversation_tokens.clear();
-    m.conversation_tokens.extend_from_slice(&prompt_ids);
+    let prefill_ms = if prefill_already_done {
+        0
+    } else {
+        t0.elapsed().as_millis()
+    };
+    if !prefill_already_done {
+        m.conversation_tokens.clear();
+        m.conversation_tokens.extend_from_slice(&prompt_ids);
+    }
 
     if first_token == eos_tok
         || m.tokenizer
@@ -2341,7 +2495,7 @@ fn generate_lfm2moe_dflash(
 
     let decode_t0 = Instant::now();
     let mut generated_count = 1usize;
-    let mut position = prompt_ids.len();
+    let mut position = starting_position;
     let mut seed_token = first_token;
     let mut cycles = 0usize;
     let mut accepted_total = 0usize;
@@ -2449,6 +2603,7 @@ fn lfm2_argmax(row: &[f32]) -> u32 {
         }
     }
     best_idx as u32
+}
 
 fn framed_gemma3_prompt(prompt: &str, system_prompt: Option<&str>) -> String {
     let mut framed = String::from("<bos><start_of_turn>user\n");

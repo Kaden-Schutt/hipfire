@@ -175,15 +175,29 @@ pub const QUANT_TABLE: &[QuantInfo] = &[
         status: "stable",
     },
     QuantInfo {
-        name: "op4",
-        label: "Opus / OP4-4 (4-bit weights / int4 activations)",
+        name: "oq4",
+        label: "Opus Quant / OQ4 (W4A4, int4 activations)",
         weight_bits: 4,
         act_bits: 4,
         status: "opt-in",
     },
     QuantInfo {
-        name: "op8",
-        label: "Opus / OP8-16 (8-bit weights / 8-bit activations)",
+        name: "oq4+",
+        label: "Opus Quant Plus / OQ4+ (W4A8, calibrated OQ4 weights)",
+        weight_bits: 4,
+        act_bits: 8,
+        status: "opt-in",
+    },
+    QuantInfo {
+        name: "oq8",
+        label: "Opus Quant / OQ8 (W8A8, int8 activations)",
+        weight_bits: 8,
+        act_bits: 8,
+        status: "opt-in",
+    },
+    QuantInfo {
+        name: "oq8+",
+        label: "Opus Quant Plus / OQ8+ (W8A8, calibrated OQ8 weights)",
         weight_bits: 8,
         act_bits: 8,
         status: "opt-in",
@@ -208,18 +222,12 @@ pub struct GateRow {
 }
 
 pub const GATE_TABLE: &[GateRow] = &[
-    GateRow {
-        arch: 5,
-        quant: "op4",
-        feature: "prefill",
-        support: FeatureSupport::Partial,
-        note: "OP4 (opus) batched prefill is parity-gated / opt-in (HIPFIRE WMMA path)",
-    },
-    GateRow {
-        arch: 5,
-        quant: "op8",
-        feature: "prefill",
-        support: FeatureSupport::Partial,
-        note: "OP8/OP8-16 route for W8A8-style bm path is experimental / parity-gated",
-    },
+    GateRow { arch: 5, quant: "oq4", feature: "prefill", support: FeatureSupport::Partial, note: "OQ4 W4A4 batched prefill is parity-gated / opt-in (iu4 WMMA path)" },
+    GateRow { arch: 5, quant: "oq4+", feature: "prefill", support: FeatureSupport::Partial, note: "OQ4+ W4A8 prefill uses the int8-activation path; full quality admission is still gated" },
+    GateRow { arch: 5, quant: "oq8", feature: "prefill", support: FeatureSupport::Partial, note: "OQ8 W8A8 route is experimental / parity-gated" },
+    GateRow { arch: 5, quant: "oq8+", feature: "prefill", support: FeatureSupport::Partial, note: "OQ8+ calibrated W8A8 route shares OQ8 kernels; quality admission is still gated" },
+    GateRow { arch: 11, quant: "oq4", feature: "prefill", support: FeatureSupport::Partial, note: "LFM2 OQ4 W4A4 prefill routes through iu4 WMMA; current evidence is 350M smoke/parity" },
+    GateRow { arch: 11, quant: "oq4+", feature: "prefill", support: FeatureSupport::Partial, note: "LFM2 OQ4+ W4A8 prefill routes through int8 activation MMQ; full calibration/quality pending" },
+    GateRow { arch: 11, quant: "oq8", feature: "prefill", support: FeatureSupport::Partial, note: "LFM2 OQ8 W8A8 prefill routes through iu8 WMMA; current evidence is 350M smoke/parity" },
+    GateRow { arch: 11, quant: "oq8+", feature: "prefill", support: FeatureSupport::Partial, note: "LFM2 OQ8+ shares OQ8 runtime kernels; calibrated plus artifact quality is pending" },
 ];

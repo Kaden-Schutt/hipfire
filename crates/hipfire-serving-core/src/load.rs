@@ -631,6 +631,12 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_state: None,
             #[cfg(feature = "arch-lfm2moe")]
+            lfm2_sessions: std::collections::HashMap::new(),
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_active_session_id: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_active_state_allocation_epoch: 0,
+            #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: None,
             dots_ocr_weights: None,
@@ -760,6 +766,12 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_state: None,
             #[cfg(feature = "arch-lfm2moe")]
+            lfm2_sessions: std::collections::HashMap::new(),
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_active_session_id: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_active_state_allocation_epoch: 0,
+            #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: None,
             dots_ocr_weights: None,
@@ -860,6 +872,12 @@ pub fn load_model(
             lfm2moe_weights: None,
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_state: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_sessions: std::collections::HashMap::new(),
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_active_session_id: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_active_state_allocation_epoch: 0,
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: None,
@@ -966,6 +984,12 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_state: None,
             #[cfg(feature = "arch-lfm2moe")]
+            lfm2_sessions: std::collections::HashMap::new(),
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_active_session_id: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_active_state_allocation_epoch: 0,
+            #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: None,
             dots_ocr_weights: None,
@@ -1066,6 +1090,12 @@ pub fn load_model(
             lfm2moe_weights: None,
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_state: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_sessions: std::collections::HashMap::new(),
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_active_session_id: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_active_state_allocation_epoch: 0,
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: Some(config),
@@ -1188,6 +1218,12 @@ pub fn load_model(
             lfm2moe_weights: None,
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_state: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_sessions: std::collections::HashMap::new(),
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_active_session_id: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_active_state_allocation_epoch: 0,
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: None,
@@ -1316,6 +1352,12 @@ pub fn load_model(
             lfm2moe_weights: None,
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_state: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_sessions: std::collections::HashMap::new(),
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_active_session_id: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_active_state_allocation_epoch: 0,
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: None,
@@ -1546,6 +1588,9 @@ pub fn load_model(
                 lfm2moe_config: Some(config),
                 lfm2moe_weights: Some(weights),
                 lfm2moe_state: Some(state),
+                lfm2_sessions: std::collections::HashMap::new(),
+                lfm2_active_session_id: Some(crate::session::LFM2_LEGACY_SESSION_ID.to_string()),
+                lfm2_active_state_allocation_epoch: next_qwen35_state_allocation_epoch(),
                 lfm2moe_eos_tok: eos_tok,
                 dots_ocr_config: None,
                 dots_ocr_weights: None,
@@ -1895,6 +1940,12 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_state: None,
             #[cfg(feature = "arch-lfm2moe")]
+            lfm2_sessions: std::collections::HashMap::new(),
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_active_session_id: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_active_state_allocation_epoch: 0,
+            #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: None,
             dots_ocr_weights: None,
@@ -1990,6 +2041,12 @@ pub fn load_model(
             lfm2moe_weights: None,
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_state: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_sessions: std::collections::HashMap::new(),
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_active_session_id: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_active_state_allocation_epoch: 0,
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: None,
@@ -2185,6 +2242,12 @@ pub fn load_model_safetensors(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_state: None,
             #[cfg(feature = "arch-lfm2moe")]
+            lfm2_sessions: std::collections::HashMap::new(),
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_active_session_id: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_active_state_allocation_epoch: 0,
+            #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             vision_config: None,
             vision_weights: None,
@@ -2302,6 +2365,12 @@ pub fn load_model_safetensors(
             lfm2moe_weights: None,
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_state: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_sessions: std::collections::HashMap::new(),
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_active_session_id: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_active_state_allocation_epoch: 0,
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             vision_config: None,
@@ -2438,6 +2507,12 @@ pub fn load_model_safetensors(
         lfm2moe_weights: None,
         #[cfg(feature = "arch-lfm2moe")]
         lfm2moe_state: None,
+        #[cfg(feature = "arch-lfm2moe")]
+        lfm2_sessions: std::collections::HashMap::new(),
+        #[cfg(feature = "arch-lfm2moe")]
+        lfm2_active_session_id: None,
+        #[cfg(feature = "arch-lfm2moe")]
+        lfm2_active_state_allocation_epoch: 0,
         #[cfg(feature = "arch-lfm2moe")]
         lfm2moe_eos_tok: 0,
         vision_config: None,
@@ -2731,6 +2806,12 @@ pub fn load_model_pp(
         #[cfg(feature = "arch-lfm2moe")]
         lfm2moe_state: None,
         #[cfg(feature = "arch-lfm2moe")]
+        lfm2_sessions: std::collections::HashMap::new(),
+        #[cfg(feature = "arch-lfm2moe")]
+        lfm2_active_session_id: None,
+        #[cfg(feature = "arch-lfm2moe")]
+        lfm2_active_state_allocation_epoch: 0,
+        #[cfg(feature = "arch-lfm2moe")]
         lfm2moe_eos_tok: 0,
         dots_ocr_config: None,
         dots_ocr_weights: None,
@@ -2991,14 +3072,17 @@ pub fn load_lfm2_dflash_state(
     let draft_config = DflashConfig::from_hfq(&hfq).ok_or("parse LFM2 DflashConfig")?;
     lfm2moe::validate_dflash_contract(target_config, &draft_config)
         .map_err(|e| format!("LFM2 DFlash draft contract: {e}"))?;
-    let draft_weights = DflashWeights::load(gpu, &hfq, &draft_config)
+    let use_f16_weights = lfm2moe::lfm2_dflash_use_f16_weights();
+    let draft_weights = DflashWeights::load_with_f16(gpu, &hfq, &draft_config, use_f16_weights)
         .map_err(|e| format!("load LFM2 draft weights: {e}"))?;
-    let draft_scratch = DflashScratch::new_with_mq(
+    let sync_gemm = lfm2moe::lfm2_dflash_sync_gemm();
+    let draft_scratch = DflashScratch::new_with_mq_and_sync(
         gpu,
         &draft_config,
         draft_config.block_size,
         ctx_capacity,
         draft_weights.has_mq,
+        sync_gemm,
     )
     .map_err(|e| format!("LFM2 draft scratch: {e}"))?;
     let target_snap =
@@ -3008,8 +3092,8 @@ pub fn load_lfm2_dflash_state(
         Vec::with_capacity(ctx_capacity * draft_config.num_extract() * draft_config.hidden);
     let block_size = draft_config.block_size;
     eprintln!(
-        "  LFM2 DFlash draft loaded: block={} extract_layers={:?} hidden={} ctx_capacity={}",
-        block_size, draft_config.target_layer_ids, draft_config.hidden, ctx_capacity
+        "  LFM2 DFlash draft loaded: block={} extract_layers={:?} hidden={} ctx_capacity={} f16_weights={} sync_gemm={}",
+        block_size, draft_config.target_layer_ids, draft_config.hidden, ctx_capacity, use_f16_weights, sync_gemm
     );
 
     Ok(Lfm2DflashState {

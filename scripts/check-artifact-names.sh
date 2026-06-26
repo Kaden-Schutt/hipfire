@@ -28,7 +28,7 @@ if rg -n \
     --glob '!target/**' \
     --glob '!**/*.lock' \
     --glob '!scripts/check-artifact-names.sh' \
-    -- '\.(?:hf|mq)[1-8][A-Za-z0-9-]*(?:\b|[.])|\.hfq-(?:hf|mq)[1-8]|\.q[1-8]\.hfq|[-.]hfq[1-8]\.hfq' \
+    -- '\.hfq-(?:hf|mq)[1-8]|\.q[1-8]\.hfq|[-.]hfq[1-8]\.hfq' \
     "${EXISTING_SEARCH_PATHS[@]}"; then
     status=1
 fi

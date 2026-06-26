@@ -36,7 +36,7 @@ use hipfire_generate::{
     validate_generate_batch_decode, validate_generate_batch_prefill,
     validate_prefix_hash_preflight, GenerateVLParams, ImageSource,
 };
-use hipfire_model::{build_local_llm_registry, is_qwen35_family_arch_id};
+use hipfire_model::{build_local_llm_registry, is_qwen35_family_arch_id, ARCH_ID_LFM2_MOE};
 use hipfire_prompt as prompt_frame;
 use hipfire_state::{
     described_sequence_state_json, model_worker_runtime_view_json,
@@ -66,10 +66,14 @@ use dummy::{
 use events::{emit_error_with_id, write_error, MAX_BASE64_ENCODED_LEN};
 use generate::*;
 use generate_vl::{decode_vl_frames, generate_vl, generate_vl_dots_ocr, generate_vl_gemma3};
+#[cfg(feature = "arch-lfm2moe")]
+use hipfire_serving_core::lfm2_prefill;
 use hipfire_serving_core::{
     dummy, events, generate, generate_vl, load, model, output_filter, qwen35_decode,
     qwen35_prefill, request, session,
 };
+#[cfg(feature = "arch-lfm2moe")]
+use lfm2_prefill::*;
 use load::*;
 use model::{CaskConfig, LoadedModel, RAW_OVERRIDE};
 use output_filter::{normalize_daemon_prompt, normalize_request_stop_sequences};
@@ -679,6 +683,40 @@ mod generate_batch_prefill_tests {
     }
 
     #[test]
+    fn validates_lfm2_prefix_hash_preflight_envelope() {
+        let msg = serde_json::json!({
+            "type": "prefix_hash_preflight",
+            "id": "lfm2-prefix-1",
+            "worker_key_id": "lfm2-worker",
+            "boundary_policy": "semantic_chat_template",
+            "session": {
+                "id": "lfm2-req-1",
+                "prompt": "hello",
+                "messages": [
+                    {"role": "user", "content": "hello"}
+                ],
+                "state_handle": {
+                    "state_kinds": ["attention_kv"],
+                    "logical_position": 0
+                },
+                "params": {
+                    "assistant_prefix": "plain"
+                }
+            }
+        });
+
+        let envelope = validate_prefix_hash_preflight(&msg).expect("valid LFM2 preflight");
+        assert_eq!(envelope.id, "lfm2-prefix-1");
+        assert_eq!(envelope.boundary_policy, "semantic_chat_template");
+        assert_eq!(envelope.session.id, "lfm2-req-1");
+        assert_eq!(
+            envelope.session.state_handle.state_kinds,
+            vec!["attention_kv".to_string()]
+        );
+        assert_eq!(envelope.session.assistant_prefix, "plain");
+    }
+
+    #[test]
     fn validates_generate_batch_decode_step_envelope() {
         let msg = serde_json::json!({
             "type": "generate_batch_decode_step",
@@ -820,6 +858,35 @@ mod generate_batch_prefill_tests {
         assert_ne!(base, different_think);
     }
 
+    #[test]
+    fn lfm2_prefix_hash_uses_lfm2_kv_domain() {
+        let kinds = vec!["attention_kv".to_string()];
+        let lfm2 = compute_qwen35_prefix_hash(
+            ARCH_ID_LFM2_MOE,
+            Some("lfm2_q8_kv"),
+            &kinds,
+            "plain",
+            0,
+            &[1, 2, 3],
+        );
+        let lfm2_other_kv = compute_qwen35_prefix_hash(
+            ARCH_ID_LFM2_MOE,
+            Some("q8"),
+            &kinds,
+            "plain",
+            0,
+            &[1, 2, 3],
+        );
+        let qwen_same_label =
+            compute_qwen35_prefix_hash(5, Some("lfm2_q8_kv"), &kinds, "plain", 0, &[1, 2, 3]);
+
+        assert_eq!(lfm2.algorithm, "xxh128");
+        assert_eq!(lfm2.value.len(), 32);
+        assert_eq!(lfm2.prefix_len, 3);
+        assert_ne!(lfm2, lfm2_other_kv);
+        assert_ne!(lfm2, qwen_same_label);
+    }
+
     fn test_prefill_boundary_session(
         id: &str,
         tokens: &[u32],
@@ -902,6 +969,9 @@ mod generate_batch_prefill_tests {
             max_resident_workers: 1,
             resident_workers: 1,
             state_arena_backend: SequenceStateArenaBackend::Qwen35Wrapped,
+            state_arena_operations: SequenceStateArenaBackend::Qwen35Wrapped
+                .supported_operations()
+                .to_vec(),
             resident_sessions: 1,
             state_page_descriptors: vec![
                 SequenceStatePageDescriptor {
@@ -1072,6 +1142,9 @@ mod generate_batch_prefill_tests {
             max_resident_workers: 1,
             resident_workers: 1,
             state_arena_backend: SequenceStateArenaBackend::Unsupported,
+            state_arena_operations: SequenceStateArenaBackend::Unsupported
+                .supported_operations()
+                .to_vec(),
             resident_sessions: 0,
             state_page_descriptors: Vec::new(),
             memory: ModelWorkerMemoryView {
@@ -1244,7 +1317,7 @@ mod generate_batch_prefill_tests {
     }
 
     #[test]
-    fn parsed_state_handle_kind_routes_generic_and_qwen35_surfaces() {
+    fn parsed_state_handle_kind_routes_generic_qwen35_and_lfm2_surfaces() {
         let generic = parse_sequence_state_handle(&serde_json::json!({
             "id": "reserve-a",
             "kind": "generic_reserved_state",
@@ -1263,6 +1336,16 @@ mod generate_batch_prefill_tests {
         assert!(!parsed_handle_may_target_generic(&qwen35));
         assert!(parsed_handle_may_target_loaded_state(&qwen35));
         assert_eq!(qwen35.generation, Some(41));
+
+        let lfm2 = parse_sequence_state_handle(&serde_json::json!({
+            "id": "lfm2-a",
+            "kind": "lfm2_session",
+            "allocation_epoch": 12
+        }))
+        .unwrap();
+        assert!(!parsed_handle_may_target_generic(&lfm2));
+        assert!(parsed_handle_may_target_loaded_state(&lfm2));
+        assert_eq!(lfm2.generation, Some(12));
 
         let legacy = parse_sequence_state_handle(&serde_json::json!("session-a")).unwrap();
         assert!(parsed_handle_may_target_generic(&legacy));
@@ -3355,17 +3438,30 @@ fn main() {
                     .get("prefilled_prompt_tokens")
                     .and_then(|v| v.as_u64())
                     .map(|v| v as usize);
+                #[cfg(feature = "arch-lfm2moe")]
+                let is_lfm2_generate_session = m.arch_id == ARCH_ID_LFM2_MOE && m.pp == 1;
+                #[cfg(not(feature = "arch-lfm2moe"))]
+                let is_lfm2_generate_session = false;
                 if is_qwen35_family_arch_id(m.arch_id) && m.pp == 1 {
                     let target_session_id = session_id.unwrap_or(QWEN35_LEGACY_SESSION_ID);
                     if let Err(e) = qwen35_activate_session(m, &mut gpu, target_session_id) {
                         emit_error_with_id(&mut stdout, id, e);
                         continue;
                     }
+                } else if is_lfm2_generate_session {
+                    #[cfg(feature = "arch-lfm2moe")]
+                    {
+                        let target_session_id = session_id.unwrap_or(LFM2_LEGACY_SESSION_ID);
+                        if let Err(e) = lfm2_activate_session(m, &mut gpu, target_session_id) {
+                            emit_error_with_id(&mut stdout, id, e);
+                            continue;
+                        }
+                    }
                 } else if session_id.is_some() || prefill_already_done {
                     emit_error_with_id(
                         &mut stdout,
                         id,
-                        "session_id/prefill_already_done are only supported for single-GPU qwen35/qwen35-moe",
+                        "session_id/prefill_already_done are only supported for single-GPU qwen35/qwen35-moe/lfm2-moe",
                     );
                     continue;
                 }
@@ -3935,9 +4031,13 @@ fn main() {
                             Some(m) if is_qwen35_family_arch_id(m.arch_id) && m.pp == 1 => {
                                 emit_generate_batch_prefill_ready(&mut stdout, &envelope);
                             }
+                            #[cfg(feature = "arch-lfm2moe")]
+                            Some(m) if m.arch_id == ARCH_ID_LFM2_MOE && m.pp == 1 => {
+                                emit_lfm2_generate_batch_prefill_ready(&mut stdout, &envelope);
+                            }
                             Some(m) => {
                                 let reason = format!(
-                                    "generate_batch_prefill currently supports qwen35/qwen35-moe only (arch_id={})",
+                                    "generate_batch_prefill currently supports qwen35/qwen35-moe and lfm2-moe only (arch_id={})",
                                     m.arch_id
                                 );
                                 emit_generate_batch_prefill_unsupported(
@@ -3977,14 +4077,37 @@ fn main() {
                             continue;
                         }
                     };
-                    if let Err(e) = run_generate_batch_prefill_serial_qwen35(
-                        m,
-                        &mut gpu,
-                        &mut stdout,
-                        &envelope,
-                        pflash_state.is_some(),
-                    ) {
-                        emit_error_with_id(&mut stdout, &envelope.id, e);
+                    if is_qwen35_family_arch_id(m.arch_id) {
+                        if let Err(e) = run_generate_batch_prefill_serial_qwen35(
+                            m,
+                            &mut gpu,
+                            &mut stdout,
+                            &envelope,
+                            pflash_state.is_some(),
+                        ) {
+                            emit_error_with_id(&mut stdout, &envelope.id, e);
+                        }
+                    } else {
+                        #[cfg(feature = "arch-lfm2moe")]
+                        if m.arch_id == ARCH_ID_LFM2_MOE {
+                            if let Err(e) = run_generate_batch_prefill_serial_lfm2(
+                                m,
+                                &mut gpu,
+                                &mut stdout,
+                                &envelope,
+                            ) {
+                                emit_error_with_id(&mut stdout, &envelope.id, e);
+                            }
+                            continue;
+                        }
+                        emit_error_with_id(
+                            &mut stdout,
+                            &envelope.id,
+                            format!(
+                                "generate_batch_prefill currently supports qwen35/qwen35-moe and lfm2-moe only (arch_id={})",
+                                m.arch_id
+                            ),
+                        );
                     }
                 }
                 Err(e) => {
@@ -4028,7 +4151,29 @@ fn main() {
                             continue;
                         }
                     };
-                    if let Err(e) = run_prefix_hash_preflight_qwen35(m, &mut stdout, &envelope) {
+                    let preflight_result = if is_qwen35_family_arch_id(m.arch_id) {
+                        run_prefix_hash_preflight_qwen35(m, &mut stdout, &envelope)
+                    } else {
+                        #[cfg(feature = "arch-lfm2moe")]
+                        {
+                            if m.arch_id == ARCH_ID_LFM2_MOE {
+                                run_prefix_hash_preflight_lfm2(m, &mut stdout, &envelope)
+                            } else {
+                                Err(format!(
+                                    "prefix_hash_preflight currently supports qwen35/qwen35-moe and lfm2-moe only (arch_id={})",
+                                    m.arch_id
+                                ))
+                            }
+                        }
+                        #[cfg(not(feature = "arch-lfm2moe"))]
+                        {
+                            Err(format!(
+                                "prefix_hash_preflight currently supports qwen35/qwen35-moe only (arch_id={})",
+                                m.arch_id
+                            ))
+                        }
+                    };
+                    if let Err(e) = preflight_result {
                         emit_error_with_id(&mut stdout, &envelope.id, e);
                     }
                 }
@@ -4518,8 +4663,19 @@ fn main() {
                     // between turns. reset() also zeroes the rolling conv
                     // states on-GPU, so it takes `gpu` and returns Result.
                     #[cfg(feature = "arch-lfm2moe")]
-                    if let Some(ref mut s) = m.lfm2moe_state {
-                        let _ = s.reset(&mut gpu);
+                    {
+                        if let Some(ref mut s) = m.lfm2moe_state {
+                            let _ = s.reset(&mut gpu);
+                        }
+                        m.lfm2_sessions.clear();
+                        if m.arch_id == ARCH_ID_LFM2_MOE && m.pp == 1 && m.lfm2moe_state.is_some() {
+                            m.lfm2_active_session_id = Some(LFM2_LEGACY_SESSION_ID.to_string());
+                            m.lfm2_active_state_allocation_epoch =
+                                next_qwen35_state_allocation_epoch();
+                        } else {
+                            m.lfm2_active_session_id = None;
+                            m.lfm2_active_state_allocation_epoch = 0;
+                        }
                     }
                     // arch_id=12/13 (Gemma3 text / Gemma3-VL text): rewind the
                     // backend-owned Gemma decode state. Without this, a reset

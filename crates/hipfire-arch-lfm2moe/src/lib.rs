@@ -17,12 +17,18 @@
 //!   * dense MLP   -> Q8 SwiGLU (w1 gate, w3 up, silu_mul, w2 down)
 //!   * LIV conv    -> conv1d_gated_decode_f32 (NEW: K=3, fused B*x / C*conv_out
 //!                    gates + rolling conv-state cache)
+pub mod calibration;
 pub mod config;
 pub mod dflash;
 pub mod forward;
 pub mod lfm2moe;
 
 pub use config::{Lfm2MoeConfig, MixerKind};
+pub use dflash::{
+    lfm2_dflash_sync_gemm, lfm2_dflash_use_f16_weights, spec_step_dflash, validate_dflash_contract,
+    Lfm2DflashDraftLogits, Lfm2DflashSpecStepResult, Lfm2DflashTargetSnapshot,
+    Lfm2DflashVerifyOutput,
+};
 pub use forward::{decode_step, decode_step_capture};
 pub use lfm2moe::{Lfm2MoeState, Lfm2MoeWeights};
 

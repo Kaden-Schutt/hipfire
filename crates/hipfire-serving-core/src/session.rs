@@ -19,6 +19,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(feature = "arch-lfm2moe")]
+use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::{DeltaNetState, LayerType};
 use hipfire_mixer::{MixerKind, MixerProfile};
@@ -33,9 +35,9 @@ use hipfire_state::{
     parsed_handle_may_target_loaded_state, qwen35_sequence_state_handle,
     validate_checkpoint_logical_position, validate_checkpoint_prefix_hash,
     validate_checkpoint_source_resident, DescribedSequenceState, ModelWorkerRuntimeView,
-    ParsedSequenceStateHandle, SequenceStateArenaBackend, SequenceStateCheckpointRequest,
-    SequenceStateForkRequest, SequenceStateHandle, SequenceStatePageDescriptor,
-    SequenceStatePageKind, SequenceStatePrefixHash,
+    ParsedSequenceStateHandle, SequenceStateArenaBackend, SequenceStateArenaOperation,
+    SequenceStateCheckpointRequest, SequenceStateForkRequest, SequenceStateHandle,
+    SequenceStatePageDescriptor, SequenceStatePageKind, SequenceStatePrefixHash,
 };
 
 use crate::events::write_error;
@@ -47,6 +49,8 @@ use crate::model::LoadedModel;
 /// Synthetic session id used by the legacy single-session `generate` path (the
 /// pre-multi-session code that didn't supply its own session id).
 pub const QWEN35_LEGACY_SESSION_ID: &str = "__legacy_generate__";
+#[cfg(feature = "arch-lfm2moe")]
+pub const LFM2_LEGACY_SESSION_ID: &str = "__legacy_generate__";
 /// Worker id assigned when a load message carries no explicit `worker_id`.
 pub const DEFAULT_MODEL_WORKER_ID: &str = "__default__";
 static QWEN35_STATE_ALLOCATION_EPOCH: AtomicU64 = AtomicU64::new(1);
@@ -301,6 +305,213 @@ impl Qwen35RequestSessionState {
     }
 }
 
+#[cfg(feature = "arch-lfm2moe")]
+pub struct Lfm2RequestSessionState {
+    pub seq_pos: usize,
+    pub conversation_tokens: Vec<u32>,
+    pub prefix_hash: Option<SequenceStatePrefixHash>,
+    pub state: lfm2moe::lfm2moe::Lfm2MoeState,
+    pub dflash_target_hidden_host: Option<Vec<f32>>,
+    pub allocation_epoch: u64,
+}
+
+#[cfg(feature = "arch-lfm2moe")]
+impl Lfm2RequestSessionState {
+    pub fn new(
+        gpu: &mut rdna_compute::Gpu,
+        config: &lfm2moe::config::Lfm2MoeConfig,
+        max_seq: usize,
+        physical_cap: usize,
+    ) -> Result<Self, String> {
+        let state = lfm2moe::lfm2moe::Lfm2MoeState::new_with_physical_cap(
+            gpu,
+            config,
+            max_seq,
+            physical_cap,
+        )
+        .map_err(|e| format!("lfm2 session state allocation failed: {e}"))?;
+        Ok(Self {
+            seq_pos: 0,
+            conversation_tokens: Vec::new(),
+            prefix_hash: None,
+            state,
+            dflash_target_hidden_host: None,
+            allocation_epoch: next_qwen35_state_allocation_epoch(),
+        })
+    }
+
+    pub fn take_from_loaded(m: &mut LoadedModel) -> Result<Self, String> {
+        let state = m
+            .lfm2moe_state
+            .take()
+            .ok_or_else(|| "lfm2 active session missing state".to_string())?;
+        Ok(Self {
+            seq_pos: state.n_tokens,
+            conversation_tokens: std::mem::take(&mut m.conversation_tokens),
+            prefix_hash: None,
+            state,
+            dflash_target_hidden_host: m
+                .lfm2_dflash
+                .as_mut()
+                .map(|df| std::mem::take(&mut df.target_hidden_host)),
+            allocation_epoch: m.lfm2_active_state_allocation_epoch,
+        })
+    }
+
+    pub fn restore_into_loaded(self, m: &mut LoadedModel) {
+        m.seq_pos = self.seq_pos;
+        m.conversation_tokens = self.conversation_tokens;
+        m.lfm2moe_state = Some(self.state);
+        if let Some(df) = m.lfm2_dflash.as_mut() {
+            df.target_hidden_host = self.dflash_target_hidden_host.unwrap_or_default();
+        }
+        m.lfm2_active_state_allocation_epoch = self.allocation_epoch;
+    }
+
+    pub fn reset(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+        self.state.reset(gpu)?;
+        self.seq_pos = 0;
+        self.conversation_tokens.clear();
+        self.prefix_hash = None;
+        if let Some(hidden) = self.dflash_target_hidden_host.as_mut() {
+            hidden.clear();
+        }
+        Ok(())
+    }
+
+    fn clone_device_buffer(
+        gpu: &mut rdna_compute::Gpu,
+        buf: &hip_bridge::DeviceBuffer,
+        label: &str,
+    ) -> Result<hip_bridge::DeviceBuffer, String> {
+        let buffer_size = buf.size();
+        gpu.bind_thread()
+            .map_err(|e| format!("clone lfm2 checkpoint {label} bind gpu: {e:?}"))?;
+        let dst = gpu
+            .hip
+            .malloc(buffer_size)
+            .map_err(|e| format!("clone lfm2 checkpoint {label} alloc: {e:?}"))?;
+        gpu.hip
+            .memcpy_dtod_at(&dst, 0, buf, 0, buffer_size)
+            .map_err(|e| format!("clone lfm2 checkpoint {label} copy: {e:?}"))?;
+        Ok(dst)
+    }
+
+    fn clone_state(
+        gpu: &mut rdna_compute::Gpu,
+        state: &lfm2moe::lfm2moe::Lfm2MoeState,
+    ) -> Result<lfm2moe::lfm2moe::Lfm2MoeState, String> {
+        Ok(lfm2moe::lfm2moe::Lfm2MoeState {
+            kv: Qwen35RequestSessionState::clone_kv_cache(gpu, &state.kv)?,
+            conv_states: Qwen35RequestSessionState::clone_gpu_tensor_vec(
+                gpu,
+                &state.conv_states,
+                "lfm2.conv_states",
+            )?,
+            pos_buf: Self::clone_device_buffer(gpu, &state.pos_buf, "lfm2.pos_buf")?,
+            graph_warmed_up: false,
+            max_seq: state.max_seq,
+            n_tokens: state.n_tokens,
+            h: Qwen35RequestSessionState::clone_gpu_tensor(gpu, &state.h, "lfm2.h")?,
+            tmp: Qwen35RequestSessionState::clone_gpu_tensor(gpu, &state.tmp, "lfm2.tmp")?,
+            fa_q: Qwen35RequestSessionState::clone_gpu_tensor(gpu, &state.fa_q, "lfm2.fa_q")?,
+            fa_k: Qwen35RequestSessionState::clone_gpu_tensor(gpu, &state.fa_k, "lfm2.fa_k")?,
+            fa_v: Qwen35RequestSessionState::clone_gpu_tensor(gpu, &state.fa_v, "lfm2.fa_v")?,
+            fa_attn_out: Qwen35RequestSessionState::clone_gpu_tensor(
+                gpu,
+                &state.fa_attn_out,
+                "lfm2.fa_attn_out",
+            )?,
+            conv_bcx: Qwen35RequestSessionState::clone_gpu_tensor(
+                gpu,
+                &state.conv_bcx,
+                "lfm2.conv_bcx",
+            )?,
+            conv_y: Qwen35RequestSessionState::clone_gpu_tensor(gpu, &state.conv_y, "lfm2.conv_y")?,
+            ffn_tmp: Qwen35RequestSessionState::clone_gpu_tensor(
+                gpu,
+                &state.ffn_tmp,
+                "lfm2.ffn_tmp",
+            )?,
+            ffn_x_rot: Qwen35RequestSessionState::clone_gpu_tensor(
+                gpu,
+                &state.ffn_x_rot,
+                "lfm2.ffn_x_rot",
+            )?,
+            dense_gate: Qwen35RequestSessionState::clone_gpu_tensor(
+                gpu,
+                &state.dense_gate,
+                "lfm2.dense_gate",
+            )?,
+            dense_up: Qwen35RequestSessionState::clone_gpu_tensor(
+                gpu,
+                &state.dense_up,
+                "lfm2.dense_up",
+            )?,
+            dense_act: Qwen35RequestSessionState::clone_gpu_tensor(
+                gpu,
+                &state.dense_act,
+                "lfm2.dense_act",
+            )?,
+            router_logits: Qwen35RequestSessionState::clone_gpu_tensor(
+                gpu,
+                &state.router_logits,
+                "lfm2.router_logits",
+            )?,
+            topk_indices: Qwen35RequestSessionState::clone_gpu_tensor(
+                gpu,
+                &state.topk_indices,
+                "lfm2.topk_indices",
+            )?,
+            topk_weights: Qwen35RequestSessionState::clone_gpu_tensor(
+                gpu,
+                &state.topk_weights,
+                "lfm2.topk_weights",
+            )?,
+            gate_batch: Qwen35RequestSessionState::clone_gpu_tensor(
+                gpu,
+                &state.gate_batch,
+                "lfm2.gate_batch",
+            )?,
+            up_batch: Qwen35RequestSessionState::clone_gpu_tensor(
+                gpu,
+                &state.up_batch,
+                "lfm2.up_batch",
+            )?,
+            rot_batch: Qwen35RequestSessionState::clone_gpu_tensor(
+                gpu,
+                &state.rot_batch,
+                "lfm2.rot_batch",
+            )?,
+            down_expanded: Qwen35RequestSessionState::clone_gpu_tensor(
+                gpu,
+                &state.down_expanded,
+                "lfm2.down_expanded",
+            )?,
+            final_norm_buf: Qwen35RequestSessionState::clone_gpu_tensor(
+                gpu,
+                &state.final_norm_buf,
+                "lfm2.final_norm_buf",
+            )?,
+            logits: Qwen35RequestSessionState::clone_gpu_tensor(gpu, &state.logits, "lfm2.logits")?,
+        })
+    }
+
+    pub fn fork_from(
+        gpu: &mut rdna_compute::Gpu,
+        source: &Lfm2RequestSessionState,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            seq_pos: source.seq_pos,
+            conversation_tokens: source.conversation_tokens.clone(),
+            prefix_hash: source.prefix_hash.clone(),
+            state: Self::clone_state(gpu, &source.state)?,
+            dflash_target_hidden_host: source.dflash_target_hidden_host.clone(),
+            allocation_epoch: next_qwen35_state_allocation_epoch(),
+        })
+    }
+}
+
 /// Install a session's unified `SequenceState` as the model's active state.
 pub(crate) fn restore_sequence_state_into_model(m: &mut LoadedModel, ss: SequenceState) {
     m.sequence_state = Some(ss);
@@ -550,6 +761,144 @@ pub fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDe
     descriptors
 }
 
+#[cfg(feature = "arch-lfm2moe")]
+pub fn lfm2_session_resident(m: &LoadedModel, session_id: &str) -> bool {
+    m.lfm2_active_session_id.as_deref() == Some(session_id)
+        || m.lfm2_sessions.contains_key(session_id)
+}
+
+#[cfg(feature = "arch-lfm2moe")]
+pub fn lfm2_request_session_count(m: &LoadedModel) -> usize {
+    let saved = m
+        .lfm2_sessions
+        .keys()
+        .filter(|id| id.as_str() != LFM2_LEGACY_SESSION_ID)
+        .count();
+    let active = usize::from(
+        m.lfm2_active_session_id
+            .as_deref()
+            .is_some_and(|id| id != LFM2_LEGACY_SESSION_ID),
+    );
+    saved + active
+}
+
+#[cfg(feature = "arch-lfm2moe")]
+fn lfm2_push_state_descriptors(
+    m: &LoadedModel,
+    descriptors: &mut Vec<SequenceStatePageDescriptor>,
+    session_id: &str,
+    state: &lfm2moe::lfm2moe::Lfm2MoeState,
+    logical_position: usize,
+    allocation_epoch: u64,
+    role: &str,
+) {
+    if session_id == LFM2_LEGACY_SESSION_ID {
+        return;
+    }
+    let placement = format!("hip:arch{}:device0", m.arch_id);
+    let handle = SequenceStateHandle {
+        id: session_id.to_string(),
+        kind: "lfm2_session".to_string(),
+        generation: allocation_epoch,
+    };
+    descriptors.push(SequenceStatePageDescriptor {
+        session_id: session_id.to_string(),
+        handle: handle.clone(),
+        kind: SequenceStatePageKind::Kv,
+        label: "lfm2.kv_cache".to_string(),
+        logical_position,
+        resident_bytes: kv_cache_bytes(&state.kv),
+        allocation_epoch,
+        owns_pages: true,
+        shape: vec![
+            state.kv.k_gpu.len(),
+            state.kv.physical_cap,
+            state.kv.n_kv_heads,
+            state.kv.head_dim,
+        ],
+        placement: placement.clone(),
+        role: role.to_string(),
+    });
+    let conv_shape = m
+        .lfm2moe_config
+        .as_ref()
+        .map(|cfg| {
+            vec![
+                state.conv_states.len(),
+                cfg.hidden_size,
+                cfg.conv_kernel_size - 1,
+            ]
+        })
+        .unwrap_or_else(|| vec![state.conv_states.len()]);
+    descriptors.push(SequenceStatePageDescriptor {
+        session_id: session_id.to_string(),
+        handle: handle.clone(),
+        kind: SequenceStatePageKind::BackendPrivate,
+        label: "lfm2.short_conv_state".to_string(),
+        logical_position,
+        resident_bytes: tensor_vec_bytes(&state.conv_states),
+        allocation_epoch,
+        owns_pages: true,
+        shape: conv_shape,
+        placement: placement.clone(),
+        role: role.to_string(),
+    });
+    descriptors.push(SequenceStatePageDescriptor {
+        session_id: session_id.to_string(),
+        handle,
+        kind: SequenceStatePageKind::Logits,
+        label: "lfm2.logits".to_string(),
+        logical_position,
+        resident_bytes: tensor_bytes(&state.logits),
+        allocation_epoch,
+        owns_pages: true,
+        shape: state.logits.shape.clone(),
+        placement,
+        role: role.to_string(),
+    });
+}
+
+#[cfg(feature = "arch-lfm2moe")]
+pub fn lfm2_session_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescriptor> {
+    let mut descriptors = Vec::new();
+    for (session_id, session) in &m.lfm2_sessions {
+        lfm2_push_state_descriptors(
+            m,
+            &mut descriptors,
+            session_id,
+            &session.state,
+            session.state.n_tokens + session.state.kv.compact_offset,
+            session.allocation_epoch,
+            "resident",
+        );
+    }
+    if let (Some(active_id), Some(state)) = (
+        m.lfm2_active_session_id.as_deref(),
+        m.lfm2moe_state.as_ref(),
+    ) {
+        lfm2_push_state_descriptors(
+            m,
+            &mut descriptors,
+            active_id,
+            state,
+            state.n_tokens + state.kv.compact_offset,
+            m.lfm2_active_state_allocation_epoch,
+            "active",
+        );
+    }
+    descriptors
+}
+
+#[cfg(not(feature = "arch-lfm2moe"))]
+pub fn lfm2_request_session_count(_m: &LoadedModel) -> usize {
+    0
+}
+
+#[cfg(not(feature = "arch-lfm2moe"))]
+pub fn lfm2_session_page_descriptors(_m: &LoadedModel) -> Vec<SequenceStatePageDescriptor> {
+    Vec::new()
+}
+
 pub fn backend_owned_session_id(m: &LoadedModel) -> &'static str {
     match m.arch_id {
         ARCH_ID_MINIMAX_M2 => "minimax:active",
@@ -791,6 +1140,8 @@ pub fn loaded_model_state_arena_backend(m: &LoadedModel) -> SequenceStateArenaBa
 /// the memory view.
 pub fn loaded_model_worker_runtime_view(m: &LoadedModel) -> ModelWorkerRuntimeView {
     let state_arena_backend = loaded_model_state_arena_backend(m);
+    let state_arena_operations =
+        loaded_model_state_arena_operations(m, state_arena_backend).to_vec();
     let resident_sessions = sequence_state_arena_resident_session_count(state_arena_backend, m);
     let state_page_descriptors = sequence_state_arena_page_descriptors(state_arena_backend, m);
     let memory = loaded_model_memory_view(m, &state_page_descriptors);
@@ -801,9 +1152,29 @@ pub fn loaded_model_worker_runtime_view(m: &LoadedModel) -> ModelWorkerRuntimeVi
         max_resident_workers: 1,
         resident_workers: 1,
         state_arena_backend,
+        state_arena_operations,
         resident_sessions,
         state_page_descriptors,
         memory,
+    }
+}
+
+fn loaded_model_state_arena_operations(
+    m: &LoadedModel,
+    state_arena_backend: SequenceStateArenaBackend,
+) -> &'static [SequenceStateArenaOperation] {
+    if state_arena_backend == SequenceStateArenaBackend::BackendOwned
+        && m.arch_id == ARCH_ID_LFM2_MOE
+        && m.pp == 1
+    {
+        &[
+            SequenceStateArenaOperation::AttachCheckpoint,
+            SequenceStateArenaOperation::ForkCheckpoint,
+            SequenceStateArenaOperation::ReleaseState,
+            SequenceStateArenaOperation::DescribeState,
+        ]
+    } else {
+        state_arena_backend.supported_operations()
     }
 }
 
@@ -824,6 +1195,10 @@ pub fn park_active_model(
     if let Some(m) = model.as_mut() {
         if is_qwen35_family_arch_id(m.arch_id) && m.pp == 1 {
             qwen35_save_active_session(m, gpu)?;
+        }
+        #[cfg(feature = "arch-lfm2moe")]
+        if m.arch_id == ARCH_ID_LFM2_MOE && m.pp == 1 {
+            lfm2_save_active_session(m)?;
         }
     }
     if let Some(m) = model.take() {
@@ -1341,6 +1716,194 @@ pub fn qwen35_activate_session(
     Ok(!existed)
 }
 
+#[cfg(feature = "arch-lfm2moe")]
+pub fn lfm2_save_active_session(m: &mut LoadedModel) -> Result<(), String> {
+    if let Some(active_id) = m.lfm2_active_session_id.take() {
+        let mut session = Lfm2RequestSessionState::take_from_loaded(m)
+            .map_err(|e| format!("failed to save active lfm2 session: {e}"))?;
+        session.seq_pos = session.state.n_tokens;
+        m.lfm2_sessions.insert(active_id, session);
+        m.lfm2_active_state_allocation_epoch = 0;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "arch-lfm2moe")]
+pub fn lfm2_allocate_session_state(
+    m: &LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<Lfm2RequestSessionState, String> {
+    let config = m
+        .lfm2moe_config
+        .as_ref()
+        .ok_or_else(|| "lfm2 config missing".to_string())?;
+    Lfm2RequestSessionState::new(gpu, config, m.max_seq, m.physical_cap)
+}
+
+#[cfg(feature = "arch-lfm2moe")]
+pub fn lfm2_activate_session(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    session_id: &str,
+) -> Result<bool, String> {
+    if m.lfm2_active_session_id.as_deref() == Some(session_id) {
+        return Ok(false);
+    }
+    let existed = m.lfm2_sessions.contains_key(session_id);
+    lfm2_save_active_session(m)?;
+    let session = match m.lfm2_sessions.remove(session_id) {
+        Some(session) => session,
+        None => lfm2_allocate_session_state(m, gpu)?,
+    };
+    session.restore_into_loaded(m);
+    m.lfm2_active_session_id = Some(session_id.to_string());
+    Ok(!existed)
+}
+
+#[cfg(feature = "arch-lfm2moe")]
+pub fn lfm2_reset_active_session(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<(), String> {
+    let state = m
+        .lfm2moe_state
+        .as_mut()
+        .ok_or_else(|| "lfm2 active session missing state".to_string())?;
+    state.reset(gpu)?;
+    if let Some(df) = m.lfm2_dflash.as_mut() {
+        df.target_hidden_host.clear();
+    }
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+    Ok(())
+}
+
+#[cfg(feature = "arch-lfm2moe")]
+pub fn lfm2_active_logical_position(m: &LoadedModel) -> Result<usize, String> {
+    let state = m
+        .lfm2moe_state
+        .as_ref()
+        .ok_or_else(|| "lfm2 active session missing state".to_string())?;
+    Ok(state.n_tokens + state.kv.compact_offset)
+}
+
+#[cfg(feature = "arch-lfm2moe")]
+pub fn lfm2_release_sessions(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    session_ids: &[String],
+) -> Result<usize, String> {
+    if m.arch_id != ARCH_ID_LFM2_MOE || m.pp != 1 {
+        return Err(format!(
+            "release_sessions for LFM2 requires arch_id=11 pp=1 (arch_id={} pp={})",
+            m.arch_id, m.pp
+        ));
+    }
+    let mut released = 0usize;
+    for session_id in session_ids {
+        if session_id == LFM2_LEGACY_SESSION_ID {
+            continue;
+        }
+        if m.lfm2_active_session_id.as_deref() == Some(session_id.as_str()) {
+            lfm2_save_active_session(m)?;
+        }
+        if m.lfm2_sessions.remove(session_id).is_some() {
+            released += 1;
+        }
+    }
+    if m.lfm2_active_session_id.is_none() {
+        let created = lfm2_activate_session(m, gpu, LFM2_LEGACY_SESSION_ID)?;
+        if created {
+            lfm2_reset_active_session(m, gpu)?;
+        }
+    }
+    Ok(released)
+}
+
+#[cfg(feature = "arch-lfm2moe")]
+pub fn lfm2_validate_prefix_hash(
+    m: &LoadedModel,
+    source_session_id: &str,
+    requested: Option<&SequenceStatePrefixHash>,
+) -> Result<(), String> {
+    validate_checkpoint_source_resident(
+        source_session_id,
+        m.lfm2_sessions.contains_key(source_session_id),
+    )?;
+    let source = m
+        .lfm2_sessions
+        .get(source_session_id)
+        .expect("source residency was validated");
+    validate_checkpoint_prefix_hash(source_session_id, source.prefix_hash.as_ref(), requested)
+}
+
+#[cfg(feature = "arch-lfm2moe")]
+pub fn lfm2_fork_session_state(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    request: SequenceStateForkRequest<'_>,
+) -> Result<(), String> {
+    lfm2_save_active_session(m)?;
+    lfm2_validate_prefix_hash(m, request.source_session_id, request.requested_prefix_hash)?;
+    if request.source_session_id == request.dest_session_id {
+        return Ok(());
+    }
+    validate_checkpoint_source_resident(
+        request.source_session_id,
+        m.lfm2_sessions.contains_key(request.source_session_id),
+    )?;
+    let source = m
+        .lfm2_sessions
+        .get(request.source_session_id)
+        .expect("source residency was validated");
+    let forked = Lfm2RequestSessionState::fork_from(gpu, source)?;
+    m.lfm2_sessions
+        .insert(request.dest_session_id.to_string(), forked);
+    Ok(())
+}
+
+#[cfg(feature = "arch-lfm2moe")]
+pub fn lfm2_checkpoint_session_state(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    request: SequenceStateCheckpointRequest<'_>,
+) -> Result<(), String> {
+    if request.source_session_id == request.dest_session_id {
+        return Ok(());
+    }
+    lfm2_save_active_session(m)?;
+    {
+        validate_checkpoint_source_resident(
+            request.source_session_id,
+            m.lfm2_sessions.contains_key(request.source_session_id),
+        )?;
+        let source = m
+            .lfm2_sessions
+            .get(request.source_session_id)
+            .expect("source residency was validated");
+        let logical_position = source.state.n_tokens + source.state.kv.compact_offset;
+        validate_checkpoint_logical_position(
+            request.source_session_id,
+            request.expected_logical_position,
+            logical_position,
+        )?;
+    }
+    if let Some(prefix_hash) = request.checkpoint_prefix_hash {
+        if let Some(source) = m.lfm2_sessions.get_mut(request.source_session_id) {
+            source.prefix_hash = Some(prefix_hash.clone());
+        }
+    }
+    lfm2_fork_session_state(
+        m,
+        gpu,
+        SequenceStateForkRequest {
+            source_session_id: request.source_session_id,
+            dest_session_id: request.dest_session_id,
+            requested_prefix_hash: request.requested_prefix_hash,
+        },
+    )
+}
+
 /// Fork a saved session into a new session id (deep-copying its state), so a
 /// conversation can branch without disturbing the original.
 pub fn qwen35_fork_session_state(
@@ -1476,6 +2039,13 @@ pub fn sequence_state_arena_resident_session_count(
     match arena_backend {
         SequenceStateArenaBackend::Qwen35Wrapped => qwen35_request_session_count(m),
         SequenceStateArenaBackend::BackendOwned => {
+            #[cfg(feature = "arch-lfm2moe")]
+            if m.arch_id == ARCH_ID_LFM2_MOE {
+                let count = lfm2_request_session_count(m);
+                if count > 0 {
+                    return count;
+                }
+            }
             usize::from(!sequence_state_arena_page_descriptors(arena_backend, m).is_empty())
         }
         SequenceStateArenaBackend::Unsupported => 0,
@@ -1488,7 +2058,13 @@ pub fn sequence_state_arena_page_descriptors(
 ) -> Vec<SequenceStatePageDescriptor> {
     match arena_backend {
         SequenceStateArenaBackend::Qwen35Wrapped => qwen35_state_page_descriptors(m),
-        SequenceStateArenaBackend::BackendOwned => backend_owned_state_page_descriptors(m),
+        SequenceStateArenaBackend::BackendOwned => {
+            #[cfg(feature = "arch-lfm2moe")]
+            if m.arch_id == ARCH_ID_LFM2_MOE && lfm2_request_session_count(m) > 0 {
+                return lfm2_session_page_descriptors(m);
+            }
+            backend_owned_state_page_descriptors(m)
+        }
         SequenceStateArenaBackend::Unsupported => Vec::new(),
     }
 }
@@ -1500,7 +2076,13 @@ pub fn sequence_state_arena_is_session_resident(
 ) -> bool {
     match arena_backend {
         SequenceStateArenaBackend::Qwen35Wrapped => qwen35_session_resident(m, session_id),
-        SequenceStateArenaBackend::BackendOwned => session_id == backend_owned_session_id(m),
+        SequenceStateArenaBackend::BackendOwned => {
+            #[cfg(feature = "arch-lfm2moe")]
+            if m.arch_id == ARCH_ID_LFM2_MOE && lfm2_request_session_count(m) > 0 {
+                return lfm2_session_resident(m, session_id);
+            }
+            session_id == backend_owned_session_id(m)
+        }
         SequenceStateArenaBackend::Unsupported => false,
     }
 }
@@ -1511,6 +2093,10 @@ pub fn sequence_state_arena_release_sessions(
     gpu: &mut rdna_compute::Gpu,
     session_ids: &[String],
 ) -> Result<usize, String> {
+    #[cfg(feature = "arch-lfm2moe")]
+    if arena_backend == SequenceStateArenaBackend::BackendOwned && m.arch_id == ARCH_ID_LFM2_MOE {
+        return lfm2_release_sessions(m, gpu, session_ids);
+    }
     ensure_sequence_state_arena_backend_supported(arena_backend, m, "release_sessions")?;
     match arena_backend {
         SequenceStateArenaBackend::Qwen35Wrapped => qwen35_release_sessions(m, gpu, session_ids),
@@ -1572,6 +2158,10 @@ pub fn sequence_state_arena_fork_session_state(
     gpu: &mut rdna_compute::Gpu,
     request: SequenceStateForkRequest<'_>,
 ) -> Result<(), String> {
+    #[cfg(feature = "arch-lfm2moe")]
+    if arena_backend == SequenceStateArenaBackend::BackendOwned && m.arch_id == ARCH_ID_LFM2_MOE {
+        return lfm2_fork_session_state(m, gpu, request);
+    }
     ensure_sequence_state_arena_backend_supported(arena_backend, m, "fork_session_state")?;
     match arena_backend {
         SequenceStateArenaBackend::Qwen35Wrapped => qwen35_fork_session_state(m, gpu, request),
@@ -1588,6 +2178,10 @@ pub fn sequence_state_arena_checkpoint_session_state(
     gpu: &mut rdna_compute::Gpu,
     request: SequenceStateCheckpointRequest<'_>,
 ) -> Result<(), String> {
+    #[cfg(feature = "arch-lfm2moe")]
+    if arena_backend == SequenceStateArenaBackend::BackendOwned && m.arch_id == ARCH_ID_LFM2_MOE {
+        return lfm2_checkpoint_session_state(m, gpu, request);
+    }
     ensure_sequence_state_arena_backend_supported(arena_backend, m, "checkpoint_session_state")?;
     match arena_backend {
         SequenceStateArenaBackend::Qwen35Wrapped => {

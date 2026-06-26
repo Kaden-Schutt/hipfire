@@ -106,6 +106,102 @@ fn restore_physical_position_after_rope(
     stage_position(gpu, state, physical_position, "physical")
 }
 
+fn download_i32_tensor(gpu: &Gpu, tensor: &GpuTensor, len: usize) -> HipResult<Vec<i32>> {
+    gpu.bind_thread()?;
+    let mut data = vec![0i32; len];
+    let bytes = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, len * 4) };
+    gpu.hip.memcpy_dtoh(bytes, &tensor.buf)?;
+    Ok(data)
+}
+
+fn capture_named_activation(
+    gpu: &mut Gpu,
+    tensor_name: &str,
+    input: &GpuTensor,
+    n: usize,
+    k: usize,
+) {
+    if let Some(cap) = gpu.active_capture.clone() {
+        cap.capture(gpu, tensor_name, input, n, k);
+    }
+}
+
+fn validate_moe_expert_index(
+    layer_idx: usize,
+    slot: usize,
+    raw: i32,
+    n_exp: usize,
+) -> Result<usize, String> {
+    if raw < 0 {
+        return Err(format!(
+            "lfm2moe L{layer_idx}: topk slot {slot} produced negative expert id {raw}"
+        ));
+    }
+    let expert = raw as usize;
+    if expert >= n_exp {
+        return Err(format!(
+            "lfm2moe L{layer_idx}: topk slot {slot} expert id {expert} out of range 0..{n_exp}"
+        ));
+    }
+    Ok(expert)
+}
+
+fn maybe_capture_moe_gate_up_inputs(
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    topk_indices: &GpuTensor,
+    x_rot: &GpuTensor,
+    hidden: usize,
+    n_exp: usize,
+    k_top: usize,
+    batch_size: usize,
+) -> Result<Option<Vec<usize>>, String> {
+    if gpu.active_capture.is_none() {
+        return Ok(None);
+    }
+    let total = batch_size * k_top;
+    let raw_indices = download_i32_tensor(gpu, topk_indices, total)
+        .map_err(|e| format!("lfm2moe L{layer_idx}: download topk for capture: {e:?}"))?;
+    let mut indices = Vec::with_capacity(total);
+    for (slot, raw) in raw_indices.into_iter().enumerate() {
+        let expert = validate_moe_expert_index(layer_idx, slot, raw, n_exp)?;
+        let row = slot / k_top;
+        let x_row = x_rot.sub_offset(row * hidden, hidden);
+        let prefix = format!("model.layers.{layer_idx}.feed_forward.experts.{expert}");
+        capture_named_activation(gpu, &format!("{prefix}.w1"), &x_row, 1, hidden);
+        capture_named_activation(gpu, &format!("{prefix}.w3"), &x_row, 1, hidden);
+        indices.push(expert);
+    }
+    Ok(Some(indices))
+}
+
+fn maybe_capture_moe_down_inputs(
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    expert_indices: &[usize],
+    rot_batch: &GpuTensor,
+    moe_inter: usize,
+    k_top: usize,
+    batch_size: usize,
+) -> Result<(), String> {
+    if gpu.active_capture.is_none() {
+        return Ok(());
+    }
+    let expected = batch_size * k_top;
+    if expert_indices.len() != expected {
+        return Err(format!(
+            "lfm2moe L{layer_idx}: capture expert index count {} != expected {expected}",
+            expert_indices.len()
+        ));
+    }
+    for (slot, &expert) in expert_indices.iter().enumerate() {
+        let rot_row = rot_batch.sub_offset(slot * moe_inter, moe_inter);
+        let name = format!("model.layers.{layer_idx}.feed_forward.experts.{expert}.w2");
+        capture_named_activation(gpu, &name, &rot_row, 1, moe_inter);
+    }
+    Ok(())
+}
+
 fn lfm2_triattn_tap_batch(
     gpu: &mut Gpu,
     layer_idx: usize,
@@ -409,7 +505,7 @@ pub fn prefill_batch(
     gpu: &mut Gpu,
     tokens: &[u32],
 ) -> Result<Vec<f32>, String> {
-    prefill_batch_impl(cfg, weights, state, gpu, tokens, None, None)
+    prefill_batch_impl(cfg, weights, state, gpu, tokens, None, None, None)
 }
 
 /// Batched prompt prefill plus selected hidden-state extraction for DFlash.
@@ -426,7 +522,7 @@ pub fn prefill_batch_with_hidden(
     capture: &mut Lfm2HiddenCapture,
 ) -> Result<Vec<f32>, String> {
     validate_hidden_capture(cfg, capture)?;
-    prefill_batch_impl(cfg, weights, state, gpu, tokens, Some(capture), None)
+    prefill_batch_impl(cfg, weights, state, gpu, tokens, Some(capture), None, None)
 }
 
 /// Batched prompt/verify prefill plus selected hidden-state extraction and
@@ -453,6 +549,38 @@ pub fn prefill_batch_with_hidden_logits(
         tokens,
         Some(capture),
         Some(&mut logits_per_pos),
+        None,
+    )?;
+    Ok(logits_per_pos)
+}
+
+/// Batched prompt/verify prefill plus selected DFlash hidden extraction, target
+/// pre-final hidden rows, and per-position logits.
+///
+/// `final_hidden_rows` receives row-major `[tokens, hidden]` post-layer residual
+/// states before the final embedding norm. This is a training-label surface for
+/// the DFlash `fc.weight` projection; normal generation callers should keep using
+/// the lighter helpers above.
+pub fn prefill_batch_with_hidden_logits_and_final_hidden(
+    cfg: &Lfm2MoeConfig,
+    weights: &Lfm2MoeWeights,
+    state: &mut Lfm2MoeState,
+    gpu: &mut Gpu,
+    tokens: &[u32],
+    capture: &mut Lfm2HiddenCapture,
+    final_hidden_rows: &mut Vec<f32>,
+) -> Result<Vec<f32>, String> {
+    validate_hidden_capture(cfg, capture)?;
+    let mut logits_per_pos = Vec::with_capacity(tokens.len() * cfg.vocab_size);
+    prefill_batch_impl(
+        cfg,
+        weights,
+        state,
+        gpu,
+        tokens,
+        Some(capture),
+        Some(&mut logits_per_pos),
+        Some(final_hidden_rows),
     )?;
     Ok(logits_per_pos)
 }
@@ -484,6 +612,7 @@ fn prefill_batch_impl(
     tokens: &[u32],
     mut capture: Option<&mut Lfm2HiddenCapture>,
     mut logits_per_pos: Option<&mut Vec<f32>>,
+    mut final_hidden_rows: Option<&mut Vec<f32>>,
 ) -> Result<Vec<f32>, String> {
     if tokens.is_empty() {
         return Ok(Vec::new());
@@ -509,6 +638,12 @@ fn prefill_batch_impl(
             if let Some(out) = logits_per_pos.as_deref_mut() {
                 out.extend_from_slice(&logits);
             }
+            if let Some(out) = final_hidden_rows.as_deref_mut() {
+                let h = gpu
+                    .download_f32(&state.h)
+                    .map_err(|e| format!("lfm2moe: download final hidden row: {e:?}"))?;
+                out.extend_from_slice(&h);
+            }
             position += 1;
         }
         return Ok(logits);
@@ -531,6 +666,7 @@ fn prefill_batch_impl(
                 &scratch,
                 capture.as_deref_mut(),
                 logits_per_pos.as_deref_mut(),
+                final_hidden_rows.as_deref_mut(),
             )?;
             offset += n;
         }
@@ -584,6 +720,7 @@ fn prefill_batch_chunk(
     s: &Lfm2MoePrefillScratch,
     mut capture: Option<&mut Lfm2HiddenCapture>,
     mut logits_per_pos: Option<&mut Vec<f32>>,
+    mut final_hidden_rows: Option<&mut Vec<f32>>,
 ) -> Result<(), String> {
     let n = tokens.len();
     debug_assert!(n > 0 && n <= s.max_batch);
@@ -779,6 +916,16 @@ fn prefill_batch_chunk(
                     n as i32,
                 )
                 .map_err(|e| format!("lfm2moe prefill L{l}: topk batched: {e:?}"))?;
+                let capture_expert_indices = maybe_capture_moe_gate_up_inputs(
+                    gpu,
+                    l,
+                    &s.topk_indices_batch,
+                    &s.ffn_x_rot_batch,
+                    hidden,
+                    n_exp,
+                    k_top,
+                    n,
+                )?;
                 let experts_mq6 = m.experts[0].gate_up.gpu_dtype == DType::MQ6G256;
                 if experts_mq6 {
                     gpu.gemv_hfq6g256_moe_gate_up_k8_indexed_batched(
@@ -817,6 +964,17 @@ fn prefill_batch_chunk(
                     n * k_top,
                 )
                 .map_err(|e| format!("lfm2moe prefill L{l}: silu_mul_rotate: {e:?}"))?;
+                if let Some(indices) = capture_expert_indices.as_deref() {
+                    maybe_capture_moe_down_inputs(
+                        gpu,
+                        l,
+                        indices,
+                        &s.rot_batch,
+                        moe_inter,
+                        k_top,
+                        n,
+                    )?;
+                }
                 if experts_mq6 {
                     gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
                         &m.expert_down_ptrs,
@@ -870,6 +1028,14 @@ fn prefill_batch_chunk(
             .take()
             .expect("capture rows allocated when capture is present");
         cap.append_interleaved_chunk(&layer_rows, n)?;
+    }
+
+    if let Some(out) = final_hidden_rows.as_deref_mut() {
+        let h_rows = s.h_batch.sub_offset(0, n * hidden);
+        let rows = gpu
+            .download_f32(&h_rows)
+            .map_err(|e| format!("lfm2moe prefill: final hidden capture: {e:?}"))?;
+        out.extend_from_slice(&rows);
     }
 
     if let Some(out) = logits_per_pos.as_deref_mut() {
@@ -1149,6 +1315,16 @@ fn decode_step_layers_and_head(
                     cfg.routed_scaling_factor,
                 )
                 .map_err(|e| format!("lfm2moe L{l}: topk: {e:?}"))?;
+                let capture_expert_indices = maybe_capture_moe_gate_up_inputs(
+                    gpu,
+                    l,
+                    &state.topk_indices,
+                    &state.ffn_x_rot,
+                    hidden,
+                    n_exp,
+                    k_top,
+                    1,
+                )?;
 
                 // gate_up (rotated input, batched k_top) → silu·mul·rotate → down → combine.
                 // Experts are uniform per layer (gate_up/down share dtype). MQ6G256
@@ -1194,6 +1370,17 @@ fn decode_step_layers_and_head(
                     k_top,
                 )
                 .map_err(|e| format!("lfm2moe L{l}: silu_mul_rotate: {e:?}"))?;
+                if let Some(indices) = capture_expert_indices.as_deref() {
+                    maybe_capture_moe_down_inputs(
+                        gpu,
+                        l,
+                        indices,
+                        &state.rot_batch,
+                        moe_inter,
+                        k_top,
+                        1,
+                    )?;
+                }
 
                 if experts_mq6 {
                     gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
@@ -1486,6 +1673,16 @@ fn moe_ffn_block(
         cfg.routed_scaling_factor,
     )
     .map_err(|e| format!("lfm2moe L{l}: topk: {e:?}"))?;
+    let capture_expert_indices = maybe_capture_moe_gate_up_inputs(
+        gpu,
+        l,
+        &state.topk_indices,
+        &state.ffn_x_rot,
+        hidden,
+        n_exp,
+        k_top,
+        1,
+    )?;
     let experts_mq6 = m.experts[0].gate_up.gpu_dtype == DType::MQ6G256;
     if experts_mq6 {
         gpu.gemv_hfq6g256_moe_gate_up_k8_indexed_batched(
@@ -1524,6 +1721,9 @@ fn moe_ffn_block(
         k_top,
     )
     .map_err(|e| format!("lfm2moe L{l}: silu_mul_rotate: {e:?}"))?;
+    if let Some(indices) = capture_expert_indices.as_deref() {
+        maybe_capture_moe_down_inputs(gpu, l, indices, &state.rot_batch, moe_inter, k_top, 1)?;
+    }
     if experts_mq6 {
         gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
             &m.expert_down_ptrs,

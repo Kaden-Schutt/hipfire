@@ -39,6 +39,7 @@ kernels/compiled/
 .remember/
 graphify-out/cache/
 .codex
+/graphify-out/cache/
 .sisyphus/
 AGENTS.local.md
 CLAUDE.local.md

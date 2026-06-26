@@ -15,12 +15,14 @@ This is the **canonical model-support matrix** for hipfire. It tracks what is
   family roster (that lives in `docs/plans/2026-06-19-arch-roster-feature-matrix.md`).
 - **Quant formats** and their weight/activation/calibration tradeoffs:
   `docs/quant-formats/opus-mqplus-eval-plan.md`. Canonical names: **Magnum**=MQ4 /
-  **Magnum Plus**=MQ+ (both W4A8) · **Opus Quant**=OP4-4 (W4A4) / **Opus Plus**=OP4-8+
-  (W4A8). "Plus" = clip-search + SmoothQuant calibration; Opus = symmetric-int4 weights.
+  **Magnum Plus**=MQ4+ · **Opus Quant**=OQ4 (W4A4) / OQ8 (W8A8) and **Opus
+  Plus**=OQ4+ / OQ8+. First plus = clip-search, SmoothQuant/AWQ, or comparable
+  activation-aware calibration; second plus = Hessian/LDLQ feedback. Opus =
+  symmetric quantized weights.
 - **Per-quant × per-GPU-arch kernel coverage** (which formats have tuned
   decode/prefill/WMMA kernels vs generic fallback): see "Kernel coverage" below.
 
-**Last verified:** 2026-06-25 (against `chaingun`).
+**Last verified:** 2026-06-26 (against `chaingun`).
 
 Legend: ✅ full · 🟡 partial / limited · ❌ not implemented (explicitly refused at load/serve) · — not applicable (e.g. expert sharding on a dense arch)
 
@@ -59,8 +61,10 @@ Machine-readable subset consumed by `arch_features` / admission. Edit `docs/mode
 | q8 (Q8 (W8A16)) | 8 | 16 | stable |
 | mq4 (Magnum / MQ4 (W4A16)) | 4 | 16 | stable |
 | mq6 (Magnum / MQ6 (W6A16)) | 6 | 16 | stable |
-| op4 (Opus Quant / OP4-4 (4-bit weights / int4 activations)) | 4 | 4 | opt-in |
-| op8 (Opus Quant / OP8-16 (8-bit weights / 8-bit activations)) | 8 | 8 | opt-in |
+| oq4 (Opus Quant / OQ4 (W4A4, int4 activations)) | 4 | 4 | opt-in |
+| oq4+ (Opus Quant Plus / OQ4+ (W4A8, calibrated OQ4 weights)) | 4 | 8 | opt-in |
+| oq8 (Opus Quant / OQ8 (W8A8, int8 activations)) | 8 | 8 | opt-in |
+| oq8+ (Opus Quant Plus / OQ8+ (W8A8, calibrated OQ8 weights)) | 8 | 8 | opt-in |
 | mq3 (Magnum / MQ3 (W3A16, mixed-precision only)) | 3 | 16 | experimental |
 
 ### Intentional gates (generated)
@@ -69,8 +73,14 @@ Per-quant overrides of an arch capability (admission consults these before green
 
 | Arch | Quant | Feature | Support | Note |
 |---|---|---|---|---|
-| 5 | op4 | prefill | 🟡 | OP4 (opus) batched prefill is parity-gated / opt-in (HIPFIRE WMMA path) |
-| 5 | op8 | prefill | 🟡 | OP8/OP8-16 route for W8A8-style bm path is experimental / parity-gated |
+| 5 | oq4 | prefill | 🟡 | OQ4 W4A4 batched prefill is parity-gated / opt-in (iu4 WMMA path) |
+| 5 | oq4+ | prefill | 🟡 | OQ4+ W4A8 prefill uses the int8-activation path; full quality admission is still gated |
+| 5 | oq8 | prefill | 🟡 | OQ8 W8A8 route is experimental / parity-gated |
+| 5 | oq8+ | prefill | 🟡 | OQ8+ calibrated W8A8 route shares OQ8 kernels; quality admission is still gated |
+| 11 | oq4 | prefill | 🟡 | LFM2 OQ4 W4A4 prefill routes through iu4 WMMA; current evidence is 350M smoke/parity |
+| 11 | oq4+ | prefill | 🟡 | LFM2 OQ4+ W4A8 prefill routes through int8 activation MMQ; full calibration/quality pending |
+| 11 | oq8 | prefill | 🟡 | LFM2 OQ8 W8A8 prefill routes through iu8 WMMA; current evidence is 350M smoke/parity |
+| 11 | oq8+ | prefill | 🟡 | LFM2 OQ8+ shares OQ8 runtime kernels; calibrated plus artifact quality is pending |
 <!-- END GENERATED model-support -->
 
 ## Feature matrix vs flagship qwen3.5
@@ -81,7 +91,7 @@ Per-quant overrides of an arch capability (admission consults these before green
 | qwen3.5-VL (5/6 + splice) | ✅ | ✅ | ✅ (family) | ✅ (family) | ✅ (family) | ✅ full | ✅ | ✅ (family) | ✅ (MoE) | ✅ |
 | deepseek4-flash (9) | ✅ | ✅ (own kernels) | ❌ | ❌ | 🟡 native MTP head loads, not wired to spec-serving | 🟡 fp32 only | ✅ | ❌ | ❌ (MoE, unsharded) | ❌ |
 | minimax-m2 (10) | ✅ | ❌ per-token | ❌ | ❌ | 🟡 config plumbing only | 🟡 fp32 only | ✅ | ❌ | ❌ (MoE, unsharded) | ❌ |
-| lfm2-moe (11) | ✅ | ❌ per-token | ❌ | ❌ | ❌ | 🟡 fp32 only | ✅ | ❌ | ❌ (MoE, unsharded) | ❌ |
+| lfm2-moe (11) | ✅ | 🟡 in-request batched prefill | ❌ | ❌ | ❌ | 🟡 fp32 only | ✅ | ❌ | ❌ (MoE, unsharded) | ❌ |
 | nemotron_h (14) | ✅ | ✅ | ❌ | ❌ | ❌ | 🟡 fp32 only | 🟡 SimpleAr seam | ❌ | ❌ (MoE, unsharded) | ❌ |
 | gemma3 text (12) | ✅ | ✅ | ❌ | ❌ | ❌ | 🟡 fp32 + q8 | ❌ | ❌ | — (dense) | ❌ |
 | gemma3-VL / medgemma (13) | ✅ | ✅ | ❌ | ❌ | ❌ | 🟡 fp32 + q8 | ❌ | ❌ | — (dense) | ✅ |
@@ -118,9 +128,11 @@ and every other arch *explicitly errors* if asked for them:
   quant, CASK/PP.
 - **gemma3-VL (13)** — strongest *multimodal* arch (vision grounding + batched
   prefill + q8 KV), but no spec-decode and no lowered pipeline.
-- **minimax (10) / lfm2-moe (11)** — solid validated decode + lowered pipeline,
-  but **per-token prefill** (no batching → slow long-context ingest) and fp32-only
-  KV. Both are recent minimal-AR bring-ups.
+- **minimax (10)** — solid validated decode + lowered pipeline, but still
+  **per-token prefill** (slow long-context ingest) and fp32-only KV.
+- **lfm2-moe (11)** — decode + lowered pipeline plus in-request batched prefill
+  are routed. OQ4/OQ4+/OQ8/OQ8+ prefill is still partial because current evidence
+  is 350M smoke/parity plus local sidecar experiments, not full admission.
 - **nemotron_h (14)** — hybrid Mamba-2 / GQA / ReLU² / MoE AR path with model-level
   batched prefill and fp32 KV. Missing: server microbatch, DFlash/MTP, KV quant,
   CASK/PP/EP.
@@ -149,8 +161,9 @@ multi-GPU orchestrator drives devices from a single host thread.
 
 ## Biggest gaps to close (flagship-parity order)
 
-1. **Batched prefill for minimax + lfm2** — both per-token today; long-prompt
-   ingest is the visible cost.
+1. **Batched prefill for minimax; broaden/gate LFM2 prefill** — minimax is still
+   per-token, while LFM2 needs multi-model quality/perf admission beyond 350M OQ
+   smoke/parity.
 2. **KV quantization beyond qwen35** — only gemma3 has q8; no asym/FWHT kernels
    for any non-qwen35 arch.
 3. **Spec-decode generalization** — DFlash/MTP are architecturally welded to
@@ -188,7 +201,8 @@ Ground truth: `crates/hipfire-runtime/src/weights.rs` (dispatch arms),
 | MQ8G256 | ✅ | ✅ prerotated | 🟡 | ❌ | q8 weights |
 | MQ6G256 / HFQ6G256 | ✅ (HFQ6 indexed-MoE) | 🟡 | 🟡 | ❌ | lfm2 experts (mq6e) |
 | MQ2G256(-Lloyd) | ✅ | ✅ (Lloyd) | 🟡 | ❌ | minimax MoE |
-| **Oq4G256 (opus)** | ✅ decode only | ❌ | ❌ no prefill arm | ❌ | qwen35 (decode shipped) |
+| **Oq4G256 (opus/OQ4/OQ4+)** | ✅ | ✅ qkvza/gate-up | ✅ W4A4 iu4 WMMA; OQ4+ W4A8 via int8-activation MMQ/F16 WMMA | partial | qwen35, lfm2 |
+| **Oq8G256 (opus/OQ8/OQ8+)** | ✅ | ✅ qkvza/gate-up | ✅ W8A8 iu8 WMMA | partial | qwen35, lfm2 |
 | MFP4G32 | ✅ | — | 🟡 | ❌ | microscaling fp4 |
 | Q4F16 g32/g64 | ✅ | — | 🟡 | ❌ | gguf-ish |
 | Qtip3G256 | 🟡 | — | ❌ | ❌ | trellis |
@@ -203,10 +217,11 @@ tuned variant. wave32 (RDNA) vs wave64 (CDNA/GCN) is auto-selected.
 - The deeply-tuned tier (per-arch WMMA, mb2/mb4 batched prefill, fused QKV/gate-up/
   residual) is **MQ4/MQ3-Lloyd + HFQ4/HFQ3 + HFP4**, and lives in **qwen35** — another
   qwen35 concentration.
-- **Prefill is the coverage cliff:** ~14 formats have decode GEMV, only ~5 have tuned
-  batched prefill; the rest hit `W8A8Ref` generic or have no batched path.
-- **Opus (Oq4) is decode-only** — no prefill kernel yet (eval-plan open item: fused
-  QKV/gate-up have no Oq4 variant).
+- **Prefill is still the coverage cliff:** many formats have decode GEMV, fewer
+  have tuned batched prefill; the rest hit `W8A8Ref` generic or family-specific
+  fallback paths.
+- **Opus is no longer decode-only:** OQ4/OQ4+/OQ8/OQ8+ have batched prefill
+  routes, but non-qwen35 admission is still smoke/parity gated.
 - Non-qwen35 archs mostly run generic/decode paths: lfm2 experts (MQ4/MQ6, HFQ6
   indexed-MoE), minimax (MQ2-Lloyd MoE), gemma3 (bf16/Q8).
 

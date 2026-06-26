@@ -36,6 +36,8 @@ use hipfire_runtime::sequence_state::SequenceState;
 use hipfire_runtime::triattn::EvictionCtx;
 use hipfire_state::ModelArtifactMemory;
 
+#[cfg(feature = "arch-lfm2moe")]
+use crate::session::Lfm2RequestSessionState;
 use crate::session::Qwen35RequestSessionState;
 
 /// CASK/TriAttention params forwarded by the CLI at load time. Zero-initialized
@@ -119,6 +121,20 @@ pub struct DflashState {
     /// the decode loop falls through to `spec_step_dflash` (chain mode).
     /// See `spec_step_ddtree_batched` for the tree-verify path.
     pub ddtree: Option<DdtreeState>,
+}
+
+/// Optional LFM2 DFlash speculative-decoding state. LFM2 has no DeltaNet
+/// recurrent state, so it carries the generic DFlash draft plus an arch-local
+/// target snapshot and host hidden-history rows.
+#[cfg(feature = "arch-lfm2moe")]
+pub struct Lfm2DflashState {
+    pub draft_config: DflashConfig,
+    pub draft_weights: DflashWeights,
+    pub draft_scratch: DflashScratch,
+    pub target_snap: lfm2moe::Lfm2DflashTargetSnapshot,
+    pub target_hidden_host: Vec<f32>,
+    pub ctx_capacity: usize,
+    pub block_size: usize,
 }
 
 /// Side state for DDTree-mode speculative decoding. Allocated alongside
@@ -283,10 +299,18 @@ pub struct LoadedModel {
     pub lfm2moe_weights: Option<lfm2moe::lfm2moe::Lfm2MoeWeights>,
     #[cfg(feature = "arch-lfm2moe")]
     pub lfm2moe_state: Option<lfm2moe::lfm2moe::Lfm2MoeState>,
+    #[cfg(feature = "arch-lfm2moe")]
+    pub lfm2_sessions: std::collections::HashMap<String, Lfm2RequestSessionState>,
+    #[cfg(feature = "arch-lfm2moe")]
+    pub lfm2_active_session_id: Option<String>,
+    #[cfg(feature = "arch-lfm2moe")]
+    pub lfm2_active_state_allocation_epoch: u64,
     /// Cached EOS token id resolved at load time. Falls back to 1 if the
     /// tokenizer lacks the special-token entry.
     #[cfg(feature = "arch-lfm2moe")]
     pub lfm2moe_eos_tok: u32,
+    #[cfg(feature = "arch-lfm2moe")]
+    pub lfm2_dflash: Option<Lfm2DflashState>,
     // dots.ocr state (arch_id=8 — Qwen2-VL family). The text decoder is
     // Qwen2: `dots_ocr_config.text` / `dots_ocr_weights.text` feed
     // `qwen2::forward_step*`, and the per-step decode state reuses the

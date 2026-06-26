@@ -1079,6 +1079,32 @@ fn scalar_floors_resolve_on_non_wmma_archs() {
     }
 }
 
+#[test]
+fn f32_full_attention_small_batch_uses_scalar_on_wmma_archs() {
+    use crate::families::attention::AttentionFamily;
+    let family = AttentionFamily::new();
+    let shape = ShapeInfo {
+        batch_size: 4,
+        head_dim: 64,
+        m: 12,
+        is_tree: false,
+    };
+
+    for &arch in WMMA_ARCHS {
+        let ctx = DispatchCtx::for_test(arch);
+        let resolved = family
+            .resolve(KernelKey::AttnFullF32, &ctx, Some(&shape))
+            .unwrap_or_else(|e| {
+                panic!("AttnFullF32 should resolve for small DFlash B on {arch}: {e:?}")
+            });
+        assert_eq!(
+            resolved.tile,
+            TileImpl::DflashScalar,
+            "small-B DFlash full attention must stay scalar on {arch}"
+        );
+    }
+}
+
 /// C5 verification: AttnFullF16 MUST NOT resolve on non-WMMA archs.
 #[test]
 fn f16_full_attention_rejected_on_non_wmma_archs() {

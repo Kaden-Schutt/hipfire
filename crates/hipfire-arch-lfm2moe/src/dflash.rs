@@ -19,6 +19,21 @@ use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::weights::weight_gemm;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+/// LFM2 DFlash is still experimental on the F16 draft GEMM path. Default to the
+/// stable F16-on-disk -> F32-on-GPU lift unless explicitly opted in.
+pub fn lfm2_dflash_use_f16_weights() -> bool {
+    std::env::var("HIPFIRE_LFM2_DFLASH_F16").ok().as_deref() == Some("1")
+}
+
+/// Synchronize after each draft GEMM by default for LFM2 DFlash bring-up.
+/// Set `HIPFIRE_LFM2_DFLASH_SYNC_GEMM=0` only when validating the async path.
+pub fn lfm2_dflash_sync_gemm() -> bool {
+    std::env::var("HIPFIRE_LFM2_DFLASH_SYNC_GEMM")
+        .ok()
+        .as_deref()
+        != Some("0")
+}
+
 /// Host logits produced by one LFM2 DFlash draft block.
 pub struct Lfm2DflashDraftLogits {
     /// Row-major `[batch, vocab_size]`, where `batch = block_size - 1`.
@@ -409,6 +424,10 @@ pub fn run_dflash_draft_for_logits(
             batch,
         )
         .map_err(|e| format!("lfm2 dflash: target lm_head: {e:?}"))?;
+        if let Some(logit_bias) = draft_weights.logit_bias.as_ref() {
+            gpu.bias_add_f32(&logits_batch, logit_bias, batch, target_cfg.vocab_size)
+                .map_err(|e| format!("lfm2 dflash: logit bias add: {e:?}"))?;
+        }
         gpu.download_f32(&logits_batch)
             .map_err(|e| format!("lfm2 dflash: download logits: {e:?}"))
     })();

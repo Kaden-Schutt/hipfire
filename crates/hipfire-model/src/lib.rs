@@ -676,6 +676,10 @@ pub struct Sidecars {
 /// falls back to the last segment for unknown local artifacts.
 pub fn quant_token(display: &str) -> String {
     parse_canonical_model_artifact_name(display)
+        .or_else(|| {
+            let artifact = format!("{display}.hfq");
+            parse_canonical_model_artifact_name(&artifact)
+        })
         .map(|name| name.quant)
         .unwrap_or_else(|| {
             display
@@ -696,7 +700,7 @@ pub fn detect_sidecars(path: &Path) -> Sidecars {
     let base = full.strip_suffix(".hfq").unwrap_or(&full);
     let sib = |role: &str| Path::new(&format!("{base}.{role}.hfq")).exists();
 
-    // Bundled features ride the `+feature` filename tokens (mq4+mtp, …).
+    // Legacy bundled features used `+feature` filename tokens (mq4+mtp, ...).
     let display = model_display_name(path);
     let bundled: Vec<&str> = display.split('+').skip(1).collect();
     let has_bundled = |needle: &str| bundled.iter().any(|b| b.contains(needle));
@@ -1432,24 +1436,7 @@ pub fn dflash_draft_candidates(filename: &str) -> Vec<String> {
         quants.push("mq3".to_string());
     } else if target.family == "lfm2" {
         match target.quant.as_str() {
-            "oq4" => {
-                quants.push("op4".to_string());
-                quants.push("mq4".to_string());
-            }
-            "op4" => {
-                quants.push("oq4".to_string());
-                quants.push("mq4".to_string());
-            }
-            "oq4+" => {
-                quants.push("op4+".to_string());
-                quants.push("mq4".to_string());
-            }
-            "op4+" => {
-                quants.push("oq4+".to_string());
-                quants.push("mq4".to_string());
-            }
-            "oq8" => quants.push("op8".to_string()),
-            "op8" => quants.push("oq8".to_string()),
+            "oq4" | "oq4+" => quants.push("mq4".to_string()),
             _ => {}
         }
     }
@@ -1511,7 +1498,7 @@ fn parse_lfm2_dflash_target(stem: &str) -> Option<DflashDraftTarget> {
         return None;
     }
     const QUANTS: &[&str] = &[
-        "oq4+", "op4+", "q8f16", "mq3", "mq4", "mq6", "mq8", "oq4", "op4", "oq8", "op8", "q8",
+        "oq4+", "q8f16", "mq3", "mq4", "mq6", "mq8", "oq4", "oq8", "q8",
     ];
     for quant in QUANTS {
         for separator in ['-', '.'] {
@@ -2486,12 +2473,11 @@ mod tests {
     fn dflash_draft_discovery_uses_lfm2_sidecar_names() {
         let oq4 = dflash_draft_candidates("LFM2.5-350M-oq4.hfq");
         assert!(oq4.contains(&"LFM2.5-350M-oq4.dflash.hfq".to_string()));
-        assert!(oq4.contains(&"LFM2.5-350M-op4.dflash.hfq".to_string()));
         assert!(oq4.contains(&"LFM2.5-350M-mq4.dflash.hfq".to_string()));
 
-        let op4_plus = dflash_draft_candidates("LFM2.5-1.2B-Thinking.op4+.hfq");
-        assert!(op4_plus.contains(&"LFM2.5-1.2B-Thinking.op4+.dflash.hfq".to_string()));
-        assert!(op4_plus.contains(&"LFM2.5-1.2B-Thinking.oq4+.dflash.hfq".to_string()));
+        let oq4_plus = dflash_draft_candidates("LFM2.5-1.2B-Thinking.oq4+.hfq");
+        assert!(oq4_plus.contains(&"LFM2.5-1.2B-Thinking.oq4+.dflash.hfq".to_string()));
+        assert!(oq4_plus.contains(&"LFM2.5-1.2B-Thinking.mq4.dflash.hfq".to_string()));
 
         let root = temp_dir("hipfire-lfm2-dflash-draft-discovery");
         fs::create_dir_all(&root).unwrap();
@@ -2507,9 +2493,11 @@ mod tests {
 
     #[test]
     fn quant_token_recognizes_lfm2_opus_dotted_quant_names() {
-        assert_eq!(quant_token("LFM2.5-350M-op4+"), "op4");
-        assert_eq!(quant_token("LFM2.5-1.2B-Thinking.op4+"), "op4");
+        assert_eq!(quant_token("LFM2.5-1.2B-Thinking.oq4+"), "oq4+");
+        assert_eq!(quant_token("LFM2.5-1.2B-Thinking.oq4++.hfq"), "oq4++");
         assert_eq!(quant_token("LFM2.5-1.2B-Thinking.oq8"), "oq8");
+        assert_eq!(quant_token("LFM2.5-1.2B-Thinking.oq8+"), "oq8+");
+        assert_eq!(quant_token("qwen3.5-0.8b-mq4+mtp"), "mq4");
     }
 
     #[test]

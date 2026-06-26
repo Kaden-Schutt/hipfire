@@ -21,6 +21,8 @@ pub mod evidence;
 pub mod generate;
 pub mod generate_arch;
 pub mod generate_vl;
+#[cfg(feature = "arch-lfm2moe")]
+pub mod lfm2_prefill;
 pub mod load;
 pub mod memory;
 pub mod model;

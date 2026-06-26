@@ -2090,12 +2090,11 @@ pub fn generate(
     }
     #[cfg(feature = "arch-lfm2moe")]
     if m.arch_id == 11 {
-        // arch_id=11 (LFM2.5-MoE). Minimal AR bring-up — same shape as the
-        // qwen2 / deepseek4 / minimax short-circuits above. PFlash / DFlash /
-        // VL / multi-GPU / sampler-budget / grammar / tools-execution all
-        // bypass. We honour `system_prompt`, `temp`, `top_p`, and (via
-        // JinjaChatFrame) `messages_history` + `tools` rendering; spec-decode
-        // / MTP / grammar are out of scope for the scaffold.
+        // arch_id=11 (LFM2.5-MoE). LFM2's arch-local path owns AR, deterministic
+        // DFlash, and resident-session decode; VL / multi-GPU / sampler-budget /
+        // grammar / tools-execution still bypass here. We honour `system_prompt`,
+        // `temp`, `top_p`, and (via JinjaChatFrame) `messages_history` + `tools`
+        // rendering; MTP / grammar are out of scope for this scaffold.
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
@@ -2119,6 +2118,8 @@ pub fn generate(
             max_think_tokens,
             tools,
             messages_history,
+            prefill_already_done,
+            prefilled_prompt_tokens,
         );
         return;
     }

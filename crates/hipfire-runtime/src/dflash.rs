@@ -152,6 +152,10 @@ pub struct DflashWeights {
     pub fc: WeightTensor,
     pub hidden_norm: GpuTensor, // [hidden] — F32
     pub norm: GpuTensor,        // [hidden] — F32, final output norm
+    /// Optional vocab-sized additive correction applied by architecture bridges
+    /// after the target `lm_head`. This is a training probe sidecar, not part
+    /// of the upstream DFlash draft architecture.
+    pub logit_bias: Option<GpuTensor>, // [vocab_size] — F32
     pub layers: Vec<DflashLayerWeights>,
     /// True when at least one matrix weight is MQ4G256 — drives whether
     /// the draft_forward path needs to allocate FWHT rotation scratches.
@@ -190,6 +194,39 @@ fn hfq_tensor_f32(
     gpu.upload_f32(&f32_data, &shape)
 }
 
+/// Load an optional F32-only tensor. Returns `None` when the sidecar does not
+/// carry the tensor, preserving compatibility with existing DFlash artifacts.
+fn optional_hfq_tensor_f32(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    shape: Vec<usize>,
+) -> HipResult<Option<GpuTensor>> {
+    let Some((info, data)) = hfq.tensor_data(name) else {
+        return Ok(None);
+    };
+    let f32_data: Vec<f32> = match info.quant_type {
+        1 => data
+            .chunks_exact(2)
+            .map(|c| crate::quant::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        2 => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        q => panic!("dflash: unsupported quant_type {q} for {name}"),
+    };
+    let expected: usize = shape.iter().product();
+    assert_eq!(
+        f32_data.len(),
+        expected,
+        "dflash: shape mismatch for {name}: have {}, expected {}",
+        f32_data.len(),
+        expected,
+    );
+    gpu.upload_f32(&f32_data, &shape).map(Some)
+}
+
 /// Load a matrix tensor as a `WeightTensor` carrying its native dtype.
 /// Supported quant_types:
 ///   1  (F16)      → lifted to F32 on GPU (legacy path).
@@ -206,6 +243,7 @@ fn hfq_weight(
     name: &str,
     m: usize,
     k: usize,
+    use_f16_weights: bool,
 ) -> HipResult<WeightTensor> {
     let (info, data) = hfq
         .tensor_data(name)
@@ -219,8 +257,7 @@ fn hfq_weight(
             //
             // HIPFIRE_DRAFT_F16=0 falls back to the legacy F16→F32 lift for
             // A/B comparison.
-            let use_f16 = crate::config::get().draft_f16;
-            if use_f16 {
+            if use_f16_weights {
                 assert_eq!(
                     data.len(),
                     m * k * 2,
@@ -315,15 +352,27 @@ fn hfq_weight(
 
 impl DflashWeights {
     pub fn load(gpu: &mut Gpu, hfq: &HfqFile, cfg: &DflashConfig) -> HipResult<Self> {
+        Self::load_with_f16(gpu, hfq, cfg, crate::config::get().draft_f16)
+    }
+
+    pub fn load_with_f16(
+        gpu: &mut Gpu,
+        hfq: &HfqFile,
+        cfg: &DflashConfig,
+        use_f16_weights: bool,
+    ) -> HipResult<Self> {
         let fc = hfq_weight(
             hfq,
             gpu,
             "fc.weight",
             cfg.hidden,
             cfg.num_extract() * cfg.hidden,
+            use_f16_weights,
         )?;
         let hidden_norm = hfq_tensor_f32(hfq, gpu, "hidden_norm.weight", vec![cfg.hidden])?;
         let norm = hfq_tensor_f32(hfq, gpu, "norm.weight", vec![cfg.hidden])?;
+        let logit_bias =
+            optional_hfq_tensor_f32(hfq, gpu, "logit_bias.weight", vec![cfg.vocab_size])?;
 
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
@@ -341,6 +390,7 @@ impl DflashWeights {
                     &format!("{p}.self_attn.q_proj.weight"),
                     cfg.q_dim(),
                     cfg.hidden,
+                    use_f16_weights,
                 )?,
                 wk: hfq_weight(
                     hfq,
@@ -348,6 +398,7 @@ impl DflashWeights {
                     &format!("{p}.self_attn.k_proj.weight"),
                     cfg.kv_dim(),
                     cfg.hidden,
+                    use_f16_weights,
                 )?,
                 wv: hfq_weight(
                     hfq,
@@ -355,6 +406,7 @@ impl DflashWeights {
                     &format!("{p}.self_attn.v_proj.weight"),
                     cfg.kv_dim(),
                     cfg.hidden,
+                    use_f16_weights,
                 )?,
                 wo: hfq_weight(
                     hfq,
@@ -362,6 +414,7 @@ impl DflashWeights {
                     &format!("{p}.self_attn.o_proj.weight"),
                     cfg.hidden,
                     cfg.q_dim(),
+                    use_f16_weights,
                 )?,
                 q_norm: hfq_tensor_f32(
                     hfq,
@@ -387,6 +440,7 @@ impl DflashWeights {
                     &format!("{p}.mlp.gate_proj.weight"),
                     cfg.intermediate,
                     cfg.hidden,
+                    use_f16_weights,
                 )?,
                 w_up: hfq_weight(
                     hfq,
@@ -394,6 +448,7 @@ impl DflashWeights {
                     &format!("{p}.mlp.up_proj.weight"),
                     cfg.intermediate,
                     cfg.hidden,
+                    use_f16_weights,
                 )?,
                 w_down: hfq_weight(
                     hfq,
@@ -401,6 +456,7 @@ impl DflashWeights {
                     &format!("{p}.mlp.down_proj.weight"),
                     cfg.hidden,
                     cfg.intermediate,
+                    use_f16_weights,
                 )?,
             };
             layers.push(layer);
@@ -421,6 +477,7 @@ impl DflashWeights {
             fc,
             hidden_norm,
             norm,
+            logit_bias,
             layers,
             has_mq,
         })
@@ -430,6 +487,9 @@ impl DflashWeights {
         let _ = gpu.free_tensor(self.fc.buf);
         let _ = gpu.free_tensor(self.hidden_norm);
         let _ = gpu.free_tensor(self.norm);
+        if let Some(logit_bias) = self.logit_bias {
+            let _ = gpu.free_tensor(logit_bias);
+        }
         for l in self.layers {
             let _ = gpu.free_tensor(l.attn_norm);
             let _ = gpu.free_tensor(l.wq.buf);
@@ -546,6 +606,11 @@ pub struct DflashScratch {
     /// this FFN subgraph does not, so it can replay across DFlash cycles.
     pub draft_ffn_graphs: Vec<HashMap<usize, (Graph, GraphExec, Vec<Vec<u8>>)>>,
     pub draft_ffn_warmed_up: Vec<HashSet<usize>>,
+
+    /// Synchronize after each draft GEMM without emitting profiler lines.
+    /// Experimental arch integrations use this to avoid async kernel hazards
+    /// while keeping the generic DFlash fast path unchanged.
+    pub sync_gemm: bool,
 }
 
 impl DflashScratch {
@@ -567,6 +632,17 @@ impl DflashScratch {
         max_block_size: usize,
         max_ctx_len: usize,
         with_mq: bool,
+    ) -> HipResult<Self> {
+        Self::new_with_mq_and_sync(gpu, cfg, max_block_size, max_ctx_len, with_mq, false)
+    }
+
+    pub fn new_with_mq_and_sync(
+        gpu: &mut Gpu,
+        cfg: &DflashConfig,
+        max_block_size: usize,
+        max_ctx_len: usize,
+        with_mq: bool,
+        sync_gemm: bool,
     ) -> HipResult<Self> {
         let b = max_block_size;
         let l = max_ctx_len;
@@ -654,6 +730,7 @@ impl DflashScratch {
             draft_ctx_cached_rows: 0,
             draft_ffn_graphs,
             draft_ffn_warmed_up,
+            sync_gemm,
         })
     }
 
@@ -738,6 +815,7 @@ fn gemm_dispatch(
     y: &GpuTensor,
     batch: usize,
     mq_x_rot: Option<&GpuTensor>,
+    sync_after: bool,
 ) -> HipResult<()> {
     // Route HFQ4/MQ4 batched paths through the WMMA lm_head helper — the
     // DFlash draft forward's per-layer projections (wq/wk/wv/wo/gate/up/down)
@@ -751,7 +829,7 @@ fn gemm_dispatch(
     // atomic load per call rather than an env lookup.
     static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let dump = *DUMP.get_or_init(|| crate::config::get().draft_gemm_dump);
-    if dump {
+    if dump || sync_after {
         gpu.hip.device_synchronize()?;
     }
     let t0 = if dump {
@@ -845,8 +923,10 @@ fn gemm_dispatch(
         }
         other => panic!("dflash gemm_dispatch: unsupported weight dtype {:?}", other),
     };
-    if let Some(t) = t0 {
+    if result.is_ok() && (dump || sync_after) {
         gpu.hip.device_synchronize()?;
+    }
+    if let Some(t) = t0 {
         let us = t.elapsed().as_micros();
         let weight_bytes = match w.gpu_dtype {
             DType::F32 => w.m * w.k * 4,
@@ -923,6 +1003,7 @@ fn draft_ffn_layer(
         &scratch.gate,
         b,
         scratch.mq_x_rot.as_ref(),
+        scratch.sync_gemm,
     )?;
     gemm_dispatch(
         gpu,
@@ -931,6 +1012,7 @@ fn draft_ffn_layer(
         &scratch.up,
         b,
         scratch.mq_x_rot.as_ref(),
+        scratch.sync_gemm,
     )?;
     gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.gate_up)?;
     gemm_dispatch(
@@ -940,6 +1022,7 @@ fn draft_ffn_layer(
         &scratch.x,
         b,
         scratch.mq_x_rot.as_ref(),
+        scratch.sync_gemm,
     )?;
     if graph_safe {
         gpu.add_f32_graph_safe(&scratch.residual_ffn, &scratch.x, &scratch.x)
@@ -1009,6 +1092,15 @@ fn upload_slice_i32(gpu: &Gpu, dst: &GpuTensor, data: &[i32]) -> HipResult<()> {
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     gpu.hip.memcpy_htod(&dst.buf, bytes)
+}
+
+fn dflash_subphase_sync(gpu: &mut Gpu, enabled: bool, layer: usize, label: &str) -> HipResult<()> {
+    if enabled {
+        eprintln!("[draft-sub] layer={layer} {label}: sync");
+        gpu.hip.device_synchronize()?;
+        eprintln!("[draft-sub] layer={layer} {label}: ok");
+    }
+    Ok(())
 }
 
 /// Run one draft forward. Inputs:
@@ -1182,6 +1274,7 @@ pub fn draft_forward_opts(
             &thp_slice,
             delta,
             scratch.mq_x_rot.as_ref(),
+            scratch.sync_gemm,
         )?;
         gpu.rmsnorm_batched(&thp_slice, &weights.hidden_norm, &thp_slice, delta, h, eps)?;
     }
@@ -1240,6 +1333,7 @@ pub fn draft_forward_opts(
             &scratch.q,
             b,
             scratch.mq_x_rot.as_ref(),
+            scratch.sync_gemm,
         )?;
         gemm_dispatch(
             gpu,
@@ -1248,6 +1342,7 @@ pub fn draft_forward_opts(
             &scratch.k_noise,
             b,
             scratch.mq_x_rot.as_ref(),
+            scratch.sync_gemm,
         )?;
         gemm_dispatch(
             gpu,
@@ -1256,6 +1351,7 @@ pub fn draft_forward_opts(
             &scratch.v_noise,
             b,
             scratch.mq_x_rot.as_ref(),
+            scratch.sync_gemm,
         )?;
 
         // K_ctx / V_ctx — same wk/wv weights but projected over the L
@@ -1281,15 +1377,17 @@ pub fn draft_forward_opts(
             let thp_slice = scratch
                 .target_hidden_proj
                 .sub_offset(src_offset_elems, delta * h);
+            let k_pre_norm = scratch.k_ctx.sub_offset(dst_offset_elems, delta * kvd);
             let k_slot = k_cache_layer.sub_offset(dst_offset_elems, delta * kvd);
             let v_slot = v_cache_layer.sub_offset(dst_offset_elems, delta * kvd);
             gemm_dispatch(
                 gpu,
                 &thp_slice,
                 &layer.wk,
-                &k_slot,
+                &k_pre_norm,
                 delta,
                 scratch.mq_x_rot.as_ref(),
+                scratch.sync_gemm,
             )?;
             gemm_dispatch(
                 gpu,
@@ -1298,16 +1396,18 @@ pub fn draft_forward_opts(
                 &v_slot,
                 delta,
                 scratch.mq_x_rot.as_ref(),
+                scratch.sync_gemm,
             )?;
             // Per-head RMSNorm on K delta rows only. batch = delta × n_kv_heads.
             gpu.rmsnorm_batched(
-                &k_slot,
+                &k_pre_norm,
                 &layer.k_norm,
                 &k_slot,
                 delta * cfg.n_kv_heads,
                 hd,
                 eps,
             )?;
+            dflash_subphase_sync(gpu, dbg, li, "ctx_k_norm")?;
         }
 
         if let Some(t) = t0 {
@@ -1334,6 +1434,7 @@ pub fn draft_forward_opts(
             0,
             noise_bytes,
         )?;
+        dflash_subphase_sync(gpu, dbg, li, "k_cat_copy")?;
         gpu.hip
             .memcpy_dtod_at(&scratch.v_cat.buf, 0, &v_cache_layer.buf, 0, ctx_bytes)?;
         gpu.hip.memcpy_dtod_at(
@@ -1343,6 +1444,7 @@ pub fn draft_forward_opts(
             0,
             noise_bytes,
         )?;
+        dflash_subphase_sync(gpu, dbg, li, "v_cat_copy")?;
 
         // Per-head RMSNorm on Q: each of B*n_heads rows, size head_dim,
         // weight [head_dim].
@@ -1354,6 +1456,7 @@ pub fn draft_forward_opts(
             hd,
             eps,
         )?;
+        dflash_subphase_sync(gpu, dbg, li, "q_norm")?;
         // Per-head RMSNorm on the NOISE tail of K_cat only — the cached
         // prefix was already normed when it was inserted into the layer's
         // k_ctx_cached. batch = B × n_kv_heads, applied to the last B rows
@@ -1369,6 +1472,7 @@ pub fn draft_forward_opts(
                 eps,
             )?;
         }
+        dflash_subphase_sync(gpu, dbg, li, "k_noise_norm")?;
 
         // RoPE. rope_batched_f32 expects q and k at the SAME batch size,
         // rotating at per-row positions. We call it twice with a zero
@@ -1385,6 +1489,7 @@ pub fn draft_forward_opts(
             theta,
             b,
         )?;
+        dflash_subphase_sync(gpu, dbg, li, "rope_q")?;
         // Call 2: rotate K_cat with positions_k. n_heads_q = 0 skips Q.
         gpu.rope_batched_f32(
             &scratch.q, // ignored because n_heads_q = 0
@@ -1396,6 +1501,7 @@ pub fn draft_forward_opts(
             theta,
             tot,
         )?;
+        dflash_subphase_sync(gpu, dbg, li, "rope_k")?;
 
         if let Some(t) = t1 {
             gpu.hip.device_synchronize()?;
@@ -1436,6 +1542,7 @@ pub fn draft_forward_opts(
                 )
                 .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
         };
+        dflash_subphase_sync(gpu, dbg, li, "attention")?;
         if let Some(t) = t2 {
             gpu.hip.device_synchronize()?;
             us_attn_kernel += t.elapsed().as_micros();
@@ -1454,10 +1561,13 @@ pub fn draft_forward_opts(
             &scratch.attn_proj,
             b,
             scratch.mq_x_rot.as_ref(),
+            scratch.sync_gemm,
         )?;
+        dflash_subphase_sync(gpu, dbg, li, "wo")?;
 
         // x = residual_attn + attn_proj
         gpu.add_f32(&scratch.residual_attn, &scratch.attn_proj, &scratch.x)?;
+        dflash_subphase_sync(gpu, dbg, li, "attn_residual_add")?;
 
         // Fixed-shape FFN tail. MoE DFlash can optionally capture this as a
         // per-layer/per-B hipGraph; the attention/context work above is left

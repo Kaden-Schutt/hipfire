@@ -1708,6 +1708,7 @@ dependencies = [
  "csv",
  "hip-bridge",
  "hipfire-arch-gemma3",
+ "hipfire-arch-lfm2moe",
  "hipfire-arch-llama",
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",

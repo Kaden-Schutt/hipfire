@@ -338,12 +338,19 @@ mod preflight_tests {
                 "q8" => DType::Q8_0,
                 "mq4" => DType::MQ4G256,
                 "mq6" => DType::MQ6G256,
+                "oq4" => DType::Oq4G256,
+                "oq4+" => DType::Oq4G256,
+                "oq4++" => DType::Oq4G256,
                 "op4" => DType::Oq4G256,
                 "op4-4" => DType::Oq4G256,
                 "op4-4+" => DType::Oq4G256,
+                "op4-8+" => DType::Oq4G256,
+                "oq8" => DType::Oq8G256,
+                "oq8+" => DType::Oq8G256,
+                "oq8++" => DType::Oq8G256,
                 "op8" => DType::Oq8G256,
                 "op8-16" => DType::Oq8G256,
-                "op4-8+" => DType::Oq4G256,
+                "op8-16+" => DType::Oq8G256,
                 "mq3" => DType::MQ3G256,
                 _ => return None,
             })
@@ -1100,6 +1107,7 @@ pub fn weight_gemv_residual(
 ) -> HipResult<()> {
     match dense_residual_route(w.gpu_dtype) {
         DenseResidualRoute::Hfq6ResidualDirect => {
+            gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
             return gpu.gemv_hfq6g256_residual(&w.buf, x, y, w.m, w.k);
         }
         DenseResidualRoute::Mq6RotateThenHfq6Residual => {
@@ -1116,14 +1124,21 @@ pub fn weight_gemv_residual(
             // consumes x_rot; route via _for helper so its awq_scale (if
             // any) is applied via the AWQ kernel variant.
             rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
+            gpu.maybe_capture_activation(&w.buf, &x_rot_alias, 1, w.k);
             return gpu.gemv_hfq6g256_residual(&w.buf, &x_rot_alias, y, w.m, w.k);
         }
         DenseResidualRoute::Unclassified => {}
     }
 
     match w.gpu_dtype {
-        DType::F16 => gpu.gemv_f16_xf32_residual(&w.buf, x, y, w.m, w.k),
-        DType::HFQ4G256 => gpu.gemv_hfq4g256_residual(&w.buf, x, y, w.m, w.k),
+        DType::F16 => {
+            gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
+            gpu.gemv_f16_xf32_residual(&w.buf, x, y, w.m, w.k)
+        }
+        DType::HFQ4G256 => {
+            gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
+            gpu.gemv_hfq4g256_residual(&w.buf, x, y, w.m, w.k)
+        }
         DType::ParoQ4G128 if std::env::var_os("HIPFIRE_PARO_PREROTATE").is_some() => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
@@ -1131,10 +1146,17 @@ pub fn weight_gemv_residual(
                 shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
+            gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
             gpu.gemv_paro4g128_residual_with_prerotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
         }
-        DType::ParoQ4G128 => gpu.gemv_paro4g128_residual(&w.buf, x, y, w.m, w.k),
-        DType::HFQ3G256 => gpu.gemv_hfq3g256_residual(&w.buf, x, y, w.m, w.k),
+        DType::ParoQ4G128 => {
+            gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
+            gpu.gemv_paro4g128_residual(&w.buf, x, y, w.m, w.k)
+        }
+        DType::HFQ3G256 => {
+            gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
+            gpu.gemv_hfq3g256_residual(&w.buf, x, y, w.m, w.k)
+        }
         DType::MQ4G256 => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
@@ -1146,6 +1168,7 @@ pub fn weight_gemv_residual(
             // consumes x_rot; route via _for helper so its awq_scale (if
             // any) is applied via the AWQ kernel variant.
             rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
+            gpu.maybe_capture_activation(&w.buf, &x_rot_alias, 1, w.k);
             gpu.gemv_hfq4g256_residual(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
         DType::MQ3G256 => {
@@ -1164,6 +1187,7 @@ pub fn weight_gemv_residual(
             // consumes x_rot; route via _for helper so its awq_scale (if
             // any) is applied via the AWQ kernel variant.
             rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
+            gpu.maybe_capture_activation(&w.buf, &x_rot_alias, 1, w.k);
             gpu.gemv_hfq3g256_residual(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
         DType::MQ3G256Lloyd => {
@@ -1182,6 +1206,7 @@ pub fn weight_gemv_residual(
             // consumes x_rot; route via _for helper so its awq_scale (if
             // any) is applied via the AWQ kernel variant.
             rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
+            gpu.maybe_capture_activation(&w.buf, &x_rot_alias, 1, w.k);
             gpu.gemv_mq3g256_lloyd_residual(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
         DType::MQ4G256Lloyd => {
@@ -1194,6 +1219,7 @@ pub fn weight_gemv_residual(
                 dtype: DType::F32,
             };
             rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
+            gpu.maybe_capture_activation(&w.buf, &x_rot_alias, 1, w.k);
             gpu.gemv_mq4g256_lloyd_residual(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
         _ => {

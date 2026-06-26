@@ -15,6 +15,8 @@
 use hipfire_arch_gemma3::calibration as gemma3_calib;
 use hipfire_arch_gemma3::weights as gemma3_weights;
 use hipfire_arch_gemma3::{self as gemma3};
+use hipfire_arch_lfm2moe::calibration as lfm2_calib;
+use hipfire_arch_lfm2moe::{Lfm2MoeConfig, Lfm2MoeWeights};
 use hipfire_arch_qwen35::qwen35::{self, CalibOpts as QwenCalibOpts};
 use rdna_compute::Gpu;
 use std::path::Path;
@@ -123,7 +125,31 @@ fn main() {
                 },
             )
         }
-        other => panic!("collect_artifacts: unsupported arch_id {other}; handled 5/6/12/13"),
+        11 => {
+            let config = Lfm2MoeConfig::from_hfq(&hfq).expect("lfm2 config");
+            let weights = Lfm2MoeWeights::load(&mut hfq, &config, &mut gpu).expect("lfm2 weights");
+            let opts = lfm2_calib::CalibOpts {
+                kldref: want_kldref,
+                kldref_topk: 64,
+            };
+            let summary = lfm2_calib::collect_calibration_artifacts(
+                &mut gpu,
+                &weights,
+                &config,
+                tokens,
+                &opts,
+                Path::new(&output),
+                &provenance,
+            )
+            .expect("collect");
+            (
+                summary.n_hessian,
+                summary.n_imatrix,
+                summary.max_consistency,
+                "lfm2-text",
+            )
+        }
+        other => panic!("collect_artifacts: unsupported arch_id {other}; handled 5/6/11/12/13"),
     };
     eprintln!(
         "collected {n_hessian} hessian + {n_imatrix} imatrix tensors in {:.1}s; mode={mode}; max diag(H)-vs-Σx² rel-err = {:.3e} {}",

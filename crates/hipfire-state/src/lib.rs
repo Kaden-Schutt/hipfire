@@ -125,6 +125,7 @@ pub struct ModelWorkerRuntimeView {
     pub max_resident_workers: usize,
     pub resident_workers: usize,
     pub state_arena_backend: SequenceStateArenaBackend,
+    pub state_arena_operations: Vec<SequenceStateArenaOperation>,
     pub resident_sessions: usize,
     pub state_page_descriptors: Vec<SequenceStatePageDescriptor>,
     pub memory: ModelWorkerMemoryView,
@@ -670,8 +671,7 @@ pub fn model_worker_runtime_view_json(worker: &ModelWorkerRuntimeView) -> serde_
         "state_arena_backend": worker.state_arena_backend.as_str(),
         "state_arena_owns_pages": worker.state_arena_backend.owns_state_pages(),
         "state_arena_operations": worker
-            .state_arena_backend
-            .supported_operations()
+            .state_arena_operations
             .iter()
             .map(|op| op.as_str())
             .collect::<Vec<_>>(),
@@ -1259,7 +1259,7 @@ pub fn parse_release_sessions_request(
         .and_then(|v| v.as_array())
         .ok_or_else(|| "release_sessions.sessions must be an array of session ids".to_string())?
         .iter()
-        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .filter_map(|v| sequence_state_handle_id(v).map(|s| s.to_string()))
         .collect();
     Ok(SequenceStateReleaseSessionsRequest {
         worker_id: worker_id.to_string(),
@@ -1370,7 +1370,7 @@ pub fn parsed_handle_may_target_loaded_state(handle: &ParsedSequenceStateHandle)
         .map(|kind| {
             matches!(
                 kind,
-                "qwen35_session" | "qwen35_checkpoint" | "backend_owned_session"
+                "qwen35_session" | "qwen35_checkpoint" | "lfm2_session" | "backend_owned_session"
             )
         })
         .unwrap_or(true)
@@ -1743,7 +1743,17 @@ mod tests {
         let request = parse_release_sessions_request(
             &serde_json::json!({
                 "type": "release_sessions",
-                "sessions": ["session-a", 7, "session-b", null]
+                "sessions": [
+                    "session-a",
+                    7,
+                    "session-b",
+                    null,
+                    {
+                        "id": "lfm2-a",
+                        "kind": "lfm2_session",
+                        "allocation_epoch": 9
+                    }
+                ]
             }),
             "worker-a",
         )
@@ -1751,7 +1761,11 @@ mod tests {
         assert_eq!(request.worker_id, "worker-a");
         assert_eq!(
             request.sessions,
-            vec!["session-a".to_string(), "session-b".to_string()]
+            vec![
+                "session-a".to_string(),
+                "session-b".to_string(),
+                "lfm2-a".to_string()
+            ]
         );
     }
 
@@ -1828,6 +1842,9 @@ mod tests {
             max_resident_workers: 1,
             resident_workers: 1,
             state_arena_backend: SequenceStateArenaBackend::Qwen35Wrapped,
+            state_arena_operations: SequenceStateArenaBackend::Qwen35Wrapped
+                .supported_operations()
+                .to_vec(),
             resident_sessions: 1,
             state_page_descriptors: vec![SequenceStatePageDescriptor {
                 session_id: "session-a".to_string(),
@@ -1882,6 +1899,43 @@ mod tests {
     }
 
     #[test]
+    fn model_worker_runtime_view_json_uses_explicit_operation_list() {
+        let worker = ModelWorkerRuntimeView {
+            worker_id: ModelWorkerId {
+                value: "worker:arch11:pp1:unknown".to_string(),
+            },
+            max_seq: 4096,
+            physical_cap: 2048,
+            max_resident_workers: 1,
+            resident_workers: 1,
+            state_arena_backend: SequenceStateArenaBackend::BackendOwned,
+            state_arena_operations: vec![
+                SequenceStateArenaOperation::AttachCheckpoint,
+                SequenceStateArenaOperation::ForkCheckpoint,
+                SequenceStateArenaOperation::ReleaseState,
+                SequenceStateArenaOperation::DescribeState,
+            ],
+            resident_sessions: 2,
+            state_page_descriptors: Vec::new(),
+            memory: ModelWorkerMemoryView::default(),
+        };
+
+        let json = model_worker_runtime_view_json(&worker);
+        assert_eq!(json["state_arena_backend"], "backend_owned");
+        assert_eq!(
+            json["state_arena_operations"],
+            serde_json::json!([
+                "attach_checkpoint",
+                "fork_checkpoint",
+                "release_state",
+                "describe_state"
+            ])
+        );
+        assert_eq!(json["state_allocator"]["page_ownership"], "backend_wrapped");
+        assert_eq!(json["state_allocator"]["copy_on_write_attach"], false);
+    }
+
+    #[test]
     fn runtime_workers_health_json_reports_empty_adapter_state() {
         let json = runtime_workers_health_json(&[], 0, None, 0, 0, "none");
 
@@ -1908,6 +1962,9 @@ mod tests {
             max_resident_workers: 2,
             resident_workers: 1,
             state_arena_backend: SequenceStateArenaBackend::Qwen35Wrapped,
+            state_arena_operations: SequenceStateArenaBackend::Qwen35Wrapped
+                .supported_operations()
+                .to_vec(),
             resident_sessions: 1,
             state_page_descriptors: vec![SequenceStatePageDescriptor {
                 session_id: "session-a".to_string(),
@@ -2263,6 +2320,9 @@ mod tests {
             resident_workers: 1,
             max_resident_workers: 2,
             state_arena_backend: SequenceStateArenaBackend::Qwen35Wrapped,
+            state_arena_operations: SequenceStateArenaBackend::Qwen35Wrapped
+                .supported_operations()
+                .to_vec(),
             resident_sessions: 4,
             state_page_descriptors: Vec::new(),
             memory: ModelWorkerMemoryView {
@@ -2391,6 +2451,16 @@ mod tests {
         .unwrap();
         assert!(!parsed_handle_may_target_generic(&backend_owned));
         assert!(parsed_handle_may_target_loaded_state(&backend_owned));
+
+        let lfm2 = parse_sequence_state_handle(&serde_json::json!({
+            "id": "lfm2-a",
+            "kind": "lfm2_session",
+            "allocation_epoch": 11
+        }))
+        .unwrap();
+        assert!(!parsed_handle_may_target_generic(&lfm2));
+        assert!(parsed_handle_may_target_loaded_state(&lfm2));
+        assert_eq!(lfm2.generation, Some(11));
     }
 
     #[test]

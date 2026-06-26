@@ -23,8 +23,8 @@ fn main() {
 fn main() {
     use hipfire_arch_lfm2moe::config::Lfm2MoeConfig;
     use hipfire_arch_lfm2moe::dflash::{
-        run_dflash_draft_for_logits, spec_step_dflash, validate_dflash_contract,
-        verify_dflash_tokens, Lfm2DflashTargetSnapshot,
+        lfm2_dflash_sync_gemm, lfm2_dflash_use_f16_weights, run_dflash_draft_for_logits,
+        spec_step_dflash, validate_dflash_contract, verify_dflash_tokens, Lfm2DflashTargetSnapshot,
     };
     use hipfire_arch_lfm2moe::forward::{prefill_batch_with_hidden, Lfm2HiddenCapture};
     use hipfire_arch_lfm2moe::lfm2moe::{Lfm2MoeState, Lfm2MoeWeights};
@@ -178,16 +178,27 @@ fn main() {
     }
 
     let t_load = Instant::now();
-    let draft_weights =
-        DflashWeights::load(&mut gpu, &draft_hfq, &draft_cfg).expect("draft weights");
-    let mut draft_scratch = DflashScratch::new_with_mq(
+    let draft_weights = DflashWeights::load_with_f16(
+        &mut gpu,
+        &draft_hfq,
+        &draft_cfg,
+        lfm2_dflash_use_f16_weights(),
+    )
+    .expect("draft weights");
+    let mut draft_scratch = DflashScratch::new_with_mq_and_sync(
         &mut gpu,
         &draft_cfg,
         block_size,
         prompt_ids.len(),
         draft_weights.has_mq,
+        lfm2_dflash_sync_gemm(),
     )
     .expect("draft scratch");
+    eprintln!(
+        "draft load mode: f16_weights={} sync_gemm={}",
+        lfm2_dflash_use_f16_weights(),
+        draft_scratch.sync_gemm
+    );
     eprintln!(
         "draft loaded+scratch in {:.2}s",
         t_load.elapsed().as_secs_f64()
@@ -475,8 +486,20 @@ fn run_synthetic_dflash_probe(
         ctx_len * cfg.num_extract() * cfg.hidden
     );
 
-    let weights = DflashWeights::load(gpu, hfq, cfg)?;
-    let mut scratch = DflashScratch::new_with_mq(gpu, cfg, block_size, ctx_len, weights.has_mq)?;
+    let weights = DflashWeights::load_with_f16(
+        gpu,
+        hfq,
+        cfg,
+        hipfire_arch_lfm2moe::dflash::lfm2_dflash_use_f16_weights(),
+    )?;
+    let mut scratch = DflashScratch::new_with_mq_and_sync(
+        gpu,
+        cfg,
+        block_size,
+        ctx_len,
+        weights.has_mq,
+        hipfire_arch_lfm2moe::dflash::lfm2_dflash_sync_gemm(),
+    )?;
 
     let mut rng_state: u64 = 0xD1FEu64;
     let mut rng = || -> f32 {

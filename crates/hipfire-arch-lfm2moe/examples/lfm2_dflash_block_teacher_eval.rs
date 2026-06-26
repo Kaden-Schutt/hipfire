@@ -9,7 +9,8 @@
 //!
 //! Usage:
 //!   lfm2_dflash_block_teacher_eval --model <lfm2.hfq> --draft <lfm2.dflash.hfq>
-//!     --teacher-dump <dir> [--max-blocks N] [--ctx-slice N] [--loss-gamma G]
+//!     --teacher-dump <dir> [--skip-blocks N] [--max-blocks N]
+//!     [--ctx-slice N] [--loss-gamma G]
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -18,7 +19,10 @@ fn main() {
 
 #[cfg(feature = "deltanet")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use hipfire_arch_lfm2moe::dflash::{run_dflash_draft_for_logits, validate_dflash_contract};
+    use hipfire_arch_lfm2moe::dflash::{
+        lfm2_dflash_sync_gemm, lfm2_dflash_use_f16_weights, run_dflash_draft_for_logits,
+        validate_dflash_contract,
+    };
     use hipfire_arch_lfm2moe::{Lfm2MoeConfig, Lfm2MoeWeights};
     use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
     use hipfire_runtime::hfq::HfqFile;
@@ -30,6 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut model: Option<PathBuf> = None;
     let mut draft: Option<PathBuf> = None;
     let mut teacher_dump: Option<PathBuf> = None;
+    let mut skip_blocks = 0usize;
     let mut max_blocks: Option<usize> = None;
     let mut ctx_slice: Option<usize> = None;
     let mut loss_gamma = 3.0f32;
@@ -49,6 +54,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 teacher_dump = Some(PathBuf::from(&argv[i + 1]));
                 i += 2;
             }
+            "--skip-blocks" => {
+                skip_blocks = argv[i + 1].parse()?;
+                i += 2;
+            }
             "--max-blocks" => {
                 max_blocks = Some(argv[i + 1].parse()?);
                 i += 2;
@@ -63,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--help" | "-h" => {
                 eprintln!(
-                    "Usage: lfm2_dflash_block_teacher_eval --model <lfm2.hfq> --draft <lfm2.dflash.hfq> --teacher-dump <dir> [--max-blocks N] [--ctx-slice N] [--loss-gamma G]"
+                    "Usage: lfm2_dflash_block_teacher_eval --model <lfm2.hfq> --draft <lfm2.dflash.hfq> --teacher-dump <dir> [--skip-blocks N] [--max-blocks N] [--ctx-slice N] [--loss-gamma G]"
                 );
                 return Ok(());
             }
@@ -95,23 +104,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    let eval_blocks = max_blocks.unwrap_or(dump.blocks).min(dump.blocks);
+    if skip_blocks >= dump.blocks {
+        return Err(format!(
+            "--skip-blocks {skip_blocks} leaves no blocks in dump with {} blocks",
+            dump.blocks
+        )
+        .into());
+    }
+    let eval_blocks = max_blocks
+        .unwrap_or(dump.blocks - skip_blocks)
+        .min(dump.blocks - skip_blocks);
     if eval_blocks == 0 {
         return Err("no teacher blocks to evaluate".into());
     }
-    let max_ctx = (0..eval_blocks)
+    let end_block = skip_blocks + eval_blocks;
+    let max_ctx = (skip_blocks..end_block)
         .map(|b| ctx_slice.unwrap_or(dump.ctx_lens[b] as usize))
         .max()
         .unwrap_or(1)
         .max(1);
 
     eprintln!(
-        "target hidden={} layers={} vocab={} draft_layers={} teacher_rows={} blocks={} block_size={} max_ctx={}",
+        "target hidden={} layers={} vocab={} draft_layers={} teacher_rows={} block_start={} blocks={} block_size={} max_ctx={}",
         target_cfg.hidden_size,
         target_cfg.num_hidden_layers,
         target_cfg.vocab_size,
         draft_cfg.n_layers,
         dump.rows,
+        skip_blocks,
         eval_blocks,
         block_size,
         max_ctx,
@@ -119,13 +139,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let t_load = Instant::now();
     let target_weights = Lfm2MoeWeights::load(&mut target_hfq, &target_cfg, &mut gpu)?;
-    let draft_weights = DflashWeights::load(&mut gpu, &draft_hfq, &draft_cfg)?;
-    let mut draft_scratch = DflashScratch::new_with_mq(
+    let draft_weights = DflashWeights::load_with_f16(
+        &mut gpu,
+        &draft_hfq,
+        &draft_cfg,
+        lfm2_dflash_use_f16_weights(),
+    )?;
+    let mut draft_scratch = DflashScratch::new_with_mq_and_sync(
         &mut gpu,
         &draft_cfg,
         block_size,
         max_ctx,
         draft_weights.has_mq,
+        lfm2_dflash_sync_gemm(),
     )?;
     eprintln!("loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
@@ -138,15 +164,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut weighted_argmax_hits = 0.0f64;
     let mut weighted_topk_hits = 0.0f64;
     let mut total_weight = 0.0f64;
+    let mut hidden_mse_sum = 0.0f64;
+    let mut hidden_cos_sum = 0.0f64;
+    let mut hidden_rows = 0usize;
     let mut forward_ms = 0.0f64;
 
-    for b in 0..eval_blocks {
+    for b in skip_blocks..end_block {
         let position = dump.positions[b] as usize;
+        let prompt_idx = dump.block_prompt_indices[b] as usize;
         let ctx = ctx_slice
             .unwrap_or(dump.ctx_lens[b] as usize)
             .min(position)
             .max(1);
         let seed_token = dump.seed_tokens[b];
+        let block_features = dump.features_for_block(b)?;
+        draft_scratch.reset_upload_tracking();
         let t = Instant::now();
         let out = run_dflash_draft_for_logits(
             &mut gpu,
@@ -155,7 +187,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &draft_weights,
             &draft_cfg,
             &mut draft_scratch,
-            &dump.features,
+            block_features,
             position,
             seed_token,
             Some(ctx),
@@ -165,6 +197,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         gpu.hip.device_synchronize()?;
         let block_ms = t.elapsed().as_secs_f64() * 1000.0;
         forward_ms += block_ms;
+
+        let hidden_metrics =
+            if let Some(target_norm_hidden) = dump.target_block_norm_hidden.as_ref() {
+                let draft_rows_tensor = draft_scratch
+                    .x
+                    .sub_offset(draft_cfg.hidden, (block_size - 1) * draft_cfg.hidden);
+                let draft_rows = gpu
+                    .download_f32(&draft_rows_tensor)
+                    .map_err(|e| format!("download draft hidden rows: {e:?}"))?;
+                let mut block_mse = 0.0f64;
+                let mut block_cos = 0.0f64;
+                for row in 0..block_size - 1 {
+                    let draft_off = row * draft_cfg.hidden;
+                    let target_off = (b * (block_size - 1) + row) * draft_cfg.hidden;
+                    let draft_row = &draft_rows[draft_off..draft_off + draft_cfg.hidden];
+                    let target_row = &target_norm_hidden[target_off..target_off + draft_cfg.hidden];
+                    block_mse += row_mse(draft_row, target_row);
+                    block_cos += row_cosine(draft_row, target_row);
+                }
+                let n = (block_size - 1) as f64;
+                hidden_mse_sum += block_mse;
+                hidden_cos_sum += block_cos;
+                hidden_rows += block_size - 1;
+                Some((block_mse / n, block_cos / n))
+            } else {
+                None
+            };
 
         let mut block_argmax_hits = 0usize;
         let mut block_topk_hits = 0usize;
@@ -203,6 +262,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             json!({
                 "type": "block",
                 "index": b,
+                "prompt_index": prompt_idx,
                 "position": position,
                 "ctx": ctx,
                 "seed_token": seed_token,
@@ -211,6 +271,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "topk_hits": block_topk_hits,
                 "weighted_ce": block_ce,
                 "forward_ms": block_ms,
+                "hidden_mse": hidden_metrics.map(|m| m.0),
+                "hidden_cosine": hidden_metrics.map(|m| m.1),
                 "draft_first": draft_first,
             })
         );
@@ -222,6 +284,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "{}",
         json!({
             "type": "summary",
+            "block_start": skip_blocks,
             "blocks": eval_blocks,
             "slots": total_slots,
             "argmax_hits": total_argmax_hits,
@@ -233,6 +296,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "weighted_argmax_rate": weighted_argmax_hits / weight_denom,
             "weighted_topk_rate": weighted_topk_hits / weight_denom,
             "weighted_ce": weighted_ce / weight_denom,
+            "hidden_rows": hidden_rows,
+            "hidden_mse": (hidden_rows > 0).then_some(hidden_mse_sum / hidden_rows as f64),
+            "hidden_cosine": (hidden_rows > 0).then_some(hidden_cos_sum / hidden_rows as f64),
             "forward_ms": forward_ms,
         })
     );
@@ -257,6 +323,10 @@ struct TeacherDump {
     target_argmax: Vec<u32>,
     target_topk_ids: Vec<u32>,
     target_topk_logits: Vec<f32>,
+    target_block_norm_hidden: Option<Vec<f32>>,
+    prompt_offsets: Vec<usize>,
+    prompt_lengths: Vec<usize>,
+    block_prompt_indices: Vec<u32>,
     features: Vec<f32>,
 }
 
@@ -275,6 +345,7 @@ impl TeacherDump {
         let rows = value_usize(&meta, "rows")?;
         let hidden = value_usize(&meta, "hidden")?;
         let num_extract = value_usize(&meta, "num_extract")?;
+        let (prompt_offsets, prompt_lengths) = prompt_spans(&meta, rows)?;
         let block_meta = meta
             .get("dflash_blocks")
             .ok_or("teacher dump lacks dflash_blocks")?;
@@ -287,7 +358,13 @@ impl TeacherDump {
         let positions = value_u32_array(block_meta, "positions")?;
         let ctx_lens = value_u32_array(block_meta, "ctx_lens")?;
         let seed_tokens = value_u32_array(block_meta, "seed_tokens")?;
-        if positions.len() != blocks || ctx_lens.len() != blocks || seed_tokens.len() != blocks {
+        let block_prompt_indices =
+            optional_u32_array(block_meta, "prompt_indices")?.unwrap_or_else(|| vec![0; blocks]);
+        if positions.len() != blocks
+            || ctx_lens.len() != blocks
+            || seed_tokens.len() != blocks
+            || block_prompt_indices.len() != blocks
+        {
             return Err("dflash_blocks metadata length mismatch".into());
         }
         let features = read_f32_raw(&path.join("features.f32"))?;
@@ -311,6 +388,22 @@ impl TeacherDump {
         {
             return Err("dflash block topk shape mismatch".into());
         }
+        let target_block_norm_hidden_path = path.join("dflash_block_target_norm_hidden.f32");
+        let target_block_norm_hidden = if target_block_norm_hidden_path.exists() {
+            let rows = read_f32_raw(&target_block_norm_hidden_path)?;
+            let expected = blocks * block_size.saturating_sub(1) * hidden;
+            if rows.len() != expected {
+                return Err(format!(
+                    "{} floats {} != blocks({blocks}) * (block_size({block_size}) - 1) * hidden({hidden})",
+                    target_block_norm_hidden_path.display(),
+                    rows.len()
+                )
+                .into());
+            }
+            Some(rows)
+        } else {
+            None
+        };
         Ok(Self {
             rows,
             hidden,
@@ -325,6 +418,10 @@ impl TeacherDump {
             target_argmax,
             target_topk_ids,
             target_topk_logits,
+            target_block_norm_hidden,
+            prompt_offsets,
+            prompt_lengths,
+            block_prompt_indices,
             features,
         })
     }
@@ -348,17 +445,33 @@ impl TeacherDump {
             )
             .into());
         }
-        for &pos in &self.positions {
+        for (idx, &pos) in self.positions.iter().enumerate() {
             let pos = pos as usize;
-            if pos == 0 || pos + self.block_size > self.rows {
+            let prompt_idx = self.block_prompt_indices[idx] as usize;
+            let prompt_len = *self.prompt_lengths.get(prompt_idx).ok_or_else(|| {
+                format!(
+                    "teacher block {idx} references missing prompt index {}",
+                    self.block_prompt_indices[idx]
+                )
+            })?;
+            if pos == 0 || pos > prompt_len {
                 return Err(format!(
-                    "teacher block position {pos} with block_size {} exceeds rows {}",
-                    self.block_size, self.rows
+                    "teacher block {idx} position {pos} exceeds prompt {prompt_idx} rows {prompt_len}"
                 )
                 .into());
             }
         }
         Ok(())
+    }
+
+    fn features_for_block(&self, block: usize) -> Result<&[f32], Box<dyn std::error::Error>> {
+        let prompt_idx = self.block_prompt_indices[block] as usize;
+        let row_floats = self.num_extract * self.hidden;
+        let offset = self.prompt_offsets[prompt_idx] * row_floats;
+        let len = self.prompt_lengths[prompt_idx] * row_floats;
+        self.features
+            .get(offset..offset + len)
+            .ok_or_else(|| format!("prompt {prompt_idx} feature slice out of range").into())
     }
 }
 
@@ -387,6 +500,58 @@ fn value_u32_array(
             u32::try_from(n).map_err(|_| format!("metadata `{key}` value {n} overflows u32").into())
         })
         .collect()
+}
+
+#[cfg(feature = "deltanet")]
+fn optional_u32_array(
+    v: &serde_json::Value,
+    key: &str,
+) -> Result<Option<Vec<u32>>, Box<dyn std::error::Error>> {
+    if v.get(key).is_none() {
+        return Ok(None);
+    }
+    value_u32_array(v, key).map(Some)
+}
+
+#[cfg(feature = "deltanet")]
+fn optional_usize_array(
+    v: &serde_json::Value,
+    key: &str,
+) -> Result<Option<Vec<usize>>, Box<dyn std::error::Error>> {
+    let Some(arr) = v.get(key) else {
+        return Ok(None);
+    };
+    let arr = arr
+        .as_array()
+        .ok_or_else(|| format!("metadata `{key}` is not an array"))?;
+    arr.iter()
+        .map(|x| {
+            x.as_u64()
+                .map(|n| n as usize)
+                .ok_or_else(|| format!("metadata `{key}` contains a non-unsigned integer").into())
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()
+        .map(Some)
+}
+
+#[cfg(feature = "deltanet")]
+fn prompt_spans(
+    meta: &serde_json::Value,
+    rows: usize,
+) -> Result<(Vec<usize>, Vec<usize>), Box<dyn std::error::Error>> {
+    let offsets = optional_usize_array(meta, "prompt_offsets")?.unwrap_or_else(|| vec![0]);
+    let lengths = optional_usize_array(meta, "prompt_lengths")?.unwrap_or_else(|| vec![rows]);
+    if offsets.len() != lengths.len() || offsets.is_empty() {
+        return Err("prompt_offsets/prompt_lengths metadata mismatch".into());
+    }
+    for (idx, (&offset, &len)) in offsets.iter().zip(&lengths).enumerate() {
+        if len == 0 || offset.checked_add(len).is_none_or(|end| end > rows) {
+            return Err(
+                format!("prompt {idx} span offset={offset} len={len} exceeds rows {rows}").into(),
+            );
+        }
+    }
+    Ok((offsets, lengths))
 }
 
 #[cfg(feature = "deltanet")]
@@ -496,4 +661,36 @@ fn argmax_u32(row: &[f32]) -> u32 {
         }
     }
     best_idx as u32
+}
+
+#[cfg(feature = "deltanet")]
+fn row_mse(a: &[f32], b: &[f32]) -> f64 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut acc = 0.0f64;
+    for (&x, &y) in a.iter().zip(b) {
+        let d = x as f64 - y as f64;
+        acc += d * d;
+    }
+    acc / a.len().max(1) as f64
+}
+
+#[cfg(feature = "deltanet")]
+fn row_cosine(a: &[f32], b: &[f32]) -> f64 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut dot = 0.0f64;
+    let mut aa = 0.0f64;
+    let mut bb = 0.0f64;
+    for (&x, &y) in a.iter().zip(b) {
+        let x = x as f64;
+        let y = y as f64;
+        dot += x * y;
+        aa += x * x;
+        bb += y * y;
+    }
+    let denom = aa.sqrt() * bb.sqrt();
+    if denom > 0.0 && denom.is_finite() {
+        dot / denom
+    } else {
+        0.0
+    }
 }

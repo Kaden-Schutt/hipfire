@@ -19,7 +19,8 @@ fn main() {
 #[cfg(feature = "deltanet")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use hipfire_arch_lfm2moe::dflash::{
-        spec_step_dflash, validate_dflash_contract, Lfm2DflashTargetSnapshot,
+        lfm2_dflash_sync_gemm, lfm2_dflash_use_f16_weights, spec_step_dflash,
+        validate_dflash_contract, Lfm2DflashTargetSnapshot,
     };
     use hipfire_arch_lfm2moe::forward::{prefill_batch_with_hidden_logits, Lfm2HiddenCapture};
     use hipfire_arch_lfm2moe::{Lfm2MoeConfig, Lfm2MoeState, Lfm2MoeWeights};
@@ -178,14 +179,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let t_load = Instant::now();
     let target_weights = Lfm2MoeWeights::load(&mut target_hfq, &target_cfg, &mut gpu)?;
-    let draft_weights = DflashWeights::load(&mut gpu, &draft_hfq, &draft_cfg)?;
+    let draft_weights = DflashWeights::load_with_f16(
+        &mut gpu,
+        &draft_hfq,
+        &draft_cfg,
+        lfm2_dflash_use_f16_weights(),
+    )?;
     let mut state = Lfm2MoeState::new_with_max_seq(&mut gpu, &target_cfg, max_seq)?;
-    let mut draft_scratch = DflashScratch::new_with_mq(
+    let mut draft_scratch = DflashScratch::new_with_mq_and_sync(
         &mut gpu,
         &draft_cfg,
         block_size,
         max_seq,
         draft_weights.has_mq,
+        lfm2_dflash_sync_gemm(),
     )?;
     let mut target_snap = Lfm2DflashTargetSnapshot::new_for(&mut gpu, &state, block_size)?;
     eprintln!("loaded in {:.2}s", t_load.elapsed().as_secs_f64());
@@ -194,6 +201,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut total_cycles = 0usize;
     let mut total_accepted = 0usize;
     let mut total_drafted = 0usize;
+    let mut total_stopped = 0usize;
     let mut total_prefill_ms = 0.0f64;
     let mut total_decode_ms = 0.0f64;
 
@@ -253,7 +261,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut position = prompt_ids.len();
         let mut seed_token = first_token;
         let mut stopped = false;
-        if !ignore_eos && is_terminator(&tokenizer, first_token, eos_extra) {
+        let first_token_is_eos = is_terminator(&tokenizer, first_token, eos_extra);
+        if !ignore_eos && first_token_is_eos {
             stopped = true;
         } else {
             emitted.push(first_token);
@@ -318,6 +327,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "type": "prompt",
                 "index": prompt_idx,
                 "prompt_tokens": prompt_ids.len(),
+                "block": block_size,
+                "ctx_slice": ctx_slice,
+                "first_token": first_token,
+                "first_token_is_eos": first_token_is_eos,
+                "ignore_eos": ignore_eos,
                 "generated": generated,
                 "cycles": cycles,
                 "accepted": accepted,
@@ -335,6 +349,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         total_cycles += cycles;
         total_accepted += accepted;
         total_drafted += drafted;
+        total_stopped += usize::from(stopped);
     }
 
     let accept_rate = if total_drafted > 0 {
@@ -347,11 +362,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         json!({
             "type": "summary",
             "prompts": tokenized.len(),
+            "block": block_size,
+            "ctx_slice": ctx_slice,
+            "ignore_eos": ignore_eos,
             "tokens": total_generated,
             "cycles": total_cycles,
             "accepted": total_accepted,
             "drafted": total_drafted,
             "accept_rate": accept_rate,
+            "stopped_prompts": total_stopped,
             "prefill_ms": total_prefill_ms,
             "decode_ms": total_decode_ms,
         })

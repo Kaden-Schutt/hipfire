@@ -1,0 +1,32 @@
+<|im_start|>user Rust: write a function that adds two i32 values.<|im_end|><|im_start|>assistant
+<|im_start|>user Explain why matrix multiplication is useful for neural networks.<|im_end|><|im_start|>assistant
+<|im_start|>user Give three steps to make tea on a rainy morning.<|im_end|><|im_start|>assistant
+<|im_start|>user Summarize how a GPU runs many threads at once.<|im_end|><|im_start|>assistant
+<|im_start|>user Write a JSON object with name and score fields.<|im_end|><|im_start|>assistant
+<|im_start|>user Describe a tiny robot sorting colored blocks.<|im_end|><|im_start|>assistant
+<|im_start|>user Convert this note into a concise task list: backup logs, rotate keys, restart service.<|im_end|><|im_start|>assistant
+<|im_start|>user What are two risks of skipping tests before release?<|im_end|><|im_start|>assistant
+<|im_start|>user Write a short Rust function that clamps an i32 between min and max.<|im_end|><|im_start|>assistant
+<|im_start|>user Explain the difference between latency and throughput in one paragraph.<|im_end|><|im_start|>assistant
+<|im_start|>user Draft a commit message for fixing an off-by-one error in a tokenizer.<|im_end|><|im_start|>assistant
+<|im_start|>user List four properties of a reliable benchmark prompt corpus.<|im_end|><|im_start|>assistant
+<|im_start|>user Continue this sentence: The safest way to test a kernel change is<|im_end|><|im_start|>assistant
+<|im_start|>user Write pseudocode for binary search over a sorted array.<|im_end|><|im_start|>assistant
+<|im_start|>user Explain why quantization can change model output quality.<|im_end|><|im_start|>assistant
+<|im_start|>user Turn this into a checklist: collect data, train draft, run held-out eval, record results.<|im_end|><|im_start|>assistant
+<|im_start|>user Describe a small city at sunrise in two vivid sentences.<|im_end|><|im_start|>assistant
+<|im_start|>user Write a SQL query that selects name and count from a table named visits.<|im_end|><|im_start|>assistant
+<|im_start|>user Explain speculative decoding to an engineer who knows caches.<|im_end|><|im_start|>assistant
+<|im_start|>user Give two examples of hidden state drift in a draft model.<|im_end|><|im_start|>assistant
+<|im_start|>user Write a haiku about debugging a local inference engine.<|im_end|><|im_start|>assistant
+<|im_start|>user Summarize the tradeoff between smaller weights and more accurate activations.<|im_end|><|im_start|>assistant
+<|im_start|>user Produce a tiny TOML snippet with model name and block size.<|im_end|><|im_start|>assistant
+<|im_start|>user Explain why a held-out split matters for sidecar training.<|im_end|><|im_start|>assistant
+<|im_start|>user Write a one-line bash command that counts files in the current directory.<|im_end|><|im_start|>assistant
+<|im_start|>user Give a polite code review comment for a missing error check.<|im_end|><|im_start|>assistant
+<|im_start|>user Explain what a residual connection does in a transformer block.<|im_end|><|im_start|>assistant
+<|im_start|>user Rewrite this clearly: The thing broke because the input thing was wrong.<|im_end|><|im_start|>assistant
+<|im_start|>user Name three metrics useful for evaluating a draft sidecar.<|im_end|><|im_start|>assistant
+<|im_start|>user Write a compact Python function that reverses words in a string.<|im_end|><|im_start|>assistant
+<|im_start|>user Explain why GPU synchronization can make a benchmark slower but easier to debug.<|im_end|><|im_start|>assistant
+<|im_start|>user Make a short release note for adding LFM2 DFlash evaluation tooling.<|im_end|><|im_start|>assistant

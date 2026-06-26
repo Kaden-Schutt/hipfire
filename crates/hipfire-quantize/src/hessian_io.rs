@@ -23,11 +23,14 @@
 //! - **Zero-copy.** `HessianRef` borrows from the mmap; the caller promotes
 //!   FP32 → FP64 only at Cholesky time.
 //! - **Index built at open.** A `HashMap<name, entry>` over the `.hessian`
-//!   tensors gives O(1) lookup for the quantizer's per-tensor query.
+//!   tensors gives O(1) lookup for the quantizer's per-tensor query, and a
+//!   parallel vector index exposes `.imatrix` entries for AWQ.
 //!
 //! Consumer integration: the quantizer (`HIPFIRE_QTIP_HESSIAN` →
 //! `HessianSidecar::open`) queries `get(tensor_name_without_dot_weight_suffix,
-//! 0)` per LDLQ-target tensor.
+//! 0)` per LDLQ-target tensor. AWQ/import code also iterates `imatrices()` so
+//! imatrix-only routed experts still feed activation-aware quantization even
+//! when LDLQ is unavailable.
 
 #![cfg_attr(not(test), allow(dead_code))]
 
@@ -47,6 +50,8 @@ const QUANT_TYPE_F32: u8 = 2;
 const QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32: u8 = 130;
 /// Suffix the collector appends to a tensor's canonical name for its Hessian.
 const HESSIAN_SUFFIX: &str = ".hessian";
+/// Suffix the collector appends to a tensor's canonical name for its imatrix.
+const IMATRIX_SUFFIX: &str = ".imatrix";
 
 #[derive(Debug)]
 pub enum HessianError {
@@ -175,6 +180,23 @@ impl<'a> HessianRef<'a> {
     }
 }
 
+/// Zero-copy view into one imatrix record in the mmap.
+pub struct ImatrixRef<'a> {
+    pub name: &'a str,
+    pub k: usize,
+    /// F32 vector payload, `K * 4` bytes.
+    pub bytes: &'a [u8],
+}
+
+impl<'a> ImatrixRef<'a> {
+    pub fn iter_f32(&self) -> impl Iterator<Item = f32> + '_ {
+        (0..self.k).map(move |idx| {
+            let off = idx * 4;
+            LittleEndian::read_f32(&self.bytes[off..off + 4])
+        })
+    }
+}
+
 /// Per-Hessian record (computed at open, points into the mmap). `name` is the
 /// canonical tensor name with the `.hessian` suffix stripped — the key the
 /// quantizer queries.
@@ -186,12 +208,22 @@ struct TensorEntry {
     payload_bytes: usize,
 }
 
+/// Per-imatrix record (computed at open, points into the mmap). `name` is the
+/// canonical tensor name with the `.imatrix` suffix stripped.
+struct ImatrixEntry {
+    name: String,
+    k: usize,
+    payload_offset: usize,
+    payload_bytes: usize,
+}
+
 pub struct HessianSidecar {
     // Mmap kept alive for the sidecar's lifetime; all `HessianRef` views
     // borrow from this. `_file` keeps the fd alive on Unix.
     mmap: Mmap,
     _file: File,
     index: HashMap<String, TensorEntry>,
+    imatrix_index: HashMap<String, ImatrixEntry>,
 }
 
 impl std::fmt::Debug for HessianSidecar {
@@ -199,6 +231,7 @@ impl std::fmt::Debug for HessianSidecar {
         f.debug_struct("HessianSidecar")
             .field("mmap_len", &self.mmap.len())
             .field("n_tensors", &self.index.len())
+            .field("n_imatrix_tensors", &self.imatrix_index.len())
             .finish()
     }
 }
@@ -292,8 +325,10 @@ impl HessianSidecar {
         pos += 4;
 
         // Walk the index. Payloads are laid out contiguously from `data_offset`
-        // in index order; only `.hessian` F32 tensors are retained.
+        // in index order; retain `.hessian` tensors for LDLQ and `.imatrix`
+        // vectors for AWQ / activation-aware quantization.
         let mut index = HashMap::new();
+        let mut imatrix_index = HashMap::new();
         let mut cumulative_offset = data_offset;
         for _ in 0..n_entries {
             if pos + 2 > data_offset {
@@ -337,52 +372,75 @@ impl HessianSidecar {
                 });
             }
 
-            // Retain dense `.hessian` tensors in either legacy F32 or compact
-            // BF16-triangle storage. Both expose the same logical [K,K] API.
-            let Some(base) = name.strip_suffix(HESSIAN_SUFFIX) else {
-                continue;
-            };
-            if shape.len() != 2 || shape[0] != shape[1] {
+            if let Some(base) = name.strip_suffix(HESSIAN_SUFFIX) {
+                // Retain dense `.hessian` tensors in either legacy F32 or compact
+                // BF16-triangle storage. Both expose the same logical [K,K] API.
+                if shape.len() != 2 || shape[0] != shape[1] {
+                    continue;
+                }
+                let k = shape[0];
+                let dtype = match quant_type {
+                    QUANT_TYPE_F32 => {
+                        if k * k * 4 != data_size {
+                            return Err(HessianError::InvalidData(format!(
+                                "{name}: dense F32 K={k} implies {} bytes but data_size={data_size}",
+                                k * k * 4
+                            )));
+                        }
+                        HessianDtype::F32
+                    }
+                    QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32 => {
+                        let expected = compact_hessian_bytes(k);
+                        if expected != data_size {
+                            return Err(HessianError::InvalidData(format!(
+                                "{name}: compact BF16-tril K={k} implies {expected} bytes but data_size={data_size}"
+                            )));
+                        }
+                        HessianDtype::Bf16TrilDiagF32
+                    }
+                    _ => continue,
+                };
+                index.insert(
+                    base.to_string(),
+                    TensorEntry {
+                        name: base.to_string(),
+                        k,
+                        dtype,
+                        payload_offset,
+                        payload_bytes: data_size,
+                    },
+                );
                 continue;
             }
-            let k = shape[0];
-            let dtype = match quant_type {
-                QUANT_TYPE_F32 => {
-                    if k * k * 4 != data_size {
-                        return Err(HessianError::InvalidData(format!(
-                            "{name}: dense F32 K={k} implies {} bytes but data_size={data_size}",
-                            k * k * 4
-                        )));
-                    }
-                    HessianDtype::F32
+
+            if let Some(base) = name.strip_suffix(IMATRIX_SUFFIX) {
+                if quant_type != QUANT_TYPE_F32 || shape.len() != 1 {
+                    continue;
                 }
-                QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32 => {
-                    let expected = compact_hessian_bytes(k);
-                    if expected != data_size {
-                        return Err(HessianError::InvalidData(format!(
-                            "{name}: compact BF16-tril K={k} implies {expected} bytes but data_size={data_size}"
-                        )));
-                    }
-                    HessianDtype::Bf16TrilDiagF32
+                let k = shape[0];
+                if k * 4 != data_size {
+                    return Err(HessianError::InvalidData(format!(
+                        "{name}: F32 imatrix K={k} implies {} bytes but data_size={data_size}",
+                        k * 4
+                    )));
                 }
-                _ => continue,
-            };
-            index.insert(
-                base.to_string(),
-                TensorEntry {
-                    name: base.to_string(),
-                    k,
-                    dtype,
-                    payload_offset,
-                    payload_bytes: data_size,
-                },
-            );
+                imatrix_index.insert(
+                    base.to_string(),
+                    ImatrixEntry {
+                        name: base.to_string(),
+                        k,
+                        payload_offset,
+                        payload_bytes: data_size,
+                    },
+                );
+            }
         }
 
         Ok(Self {
             mmap,
             _file: file,
             index,
+            imatrix_index,
         })
     }
 
@@ -417,8 +475,32 @@ impl HessianSidecar {
         })
     }
 
+    /// Look up an imatrix by canonical tensor name (without `.imatrix` suffix).
+    pub fn imatrix(&self, name: &str) -> Option<ImatrixRef<'_>> {
+        let entry = self.imatrix_index.get(name)?;
+        Some(ImatrixRef {
+            name: &entry.name,
+            k: entry.k,
+            bytes: &self.mmap[entry.payload_offset..entry.payload_offset + entry.payload_bytes],
+        })
+    }
+
+    /// Iterate all stored imatrix vectors, including routed experts that do not
+    /// have a full Hessian.
+    pub fn imatrices(&self) -> impl Iterator<Item = ImatrixRef<'_>> + '_ {
+        self.imatrix_index.values().map(|entry| ImatrixRef {
+            name: &entry.name,
+            k: entry.k,
+            bytes: &self.mmap[entry.payload_offset..entry.payload_offset + entry.payload_bytes],
+        })
+    }
+
     pub fn n_tensors(&self) -> usize {
         self.index.len()
+    }
+
+    pub fn n_imatrix_tensors(&self) -> usize {
+        self.imatrix_index.len()
     }
 
     /// Cheap symmetry sanity check on a per-tensor basis. Samples 32 random
@@ -482,7 +564,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     /// Build a minimal HFQM `.calib.hfq` with one `.hessian` tensor (`tA`, K=2)
-    /// plus a non-Hessian `.imatrix` tensor that must be ignored. Mirrors
+    /// plus its sibling `.imatrix` vector. Mirrors
     /// `hipfire_runtime::hfq::write_hfqm_package_mem`.
     fn make_test_package() -> NamedTempFile {
         struct Entry {
@@ -628,8 +710,8 @@ mod tests {
     fn open_and_lookup_roundtrip() {
         let tf = make_test_package();
         let sc = HessianSidecar::open(tf.path()).unwrap();
-        // Only the `.hessian` tensor is indexed; `.imatrix` is ignored.
         assert_eq!(sc.n_tensors(), 1);
+        assert_eq!(sc.n_imatrix_tensors(), 1);
 
         let ta = sc.get("tA", 0).expect("tA missing");
         assert_eq!(ta.k, 2);
@@ -642,6 +724,11 @@ mod tests {
         // The query name is the canonical name WITHOUT the `.hessian` suffix.
         assert!(sc.get("tA.hessian", 0).is_none());
         assert!(sc.get("not_there", 0).is_none());
+
+        let ia = sc.imatrix("tA").expect("tA imatrix missing");
+        assert_eq!(ia.k, 2);
+        assert_eq!(ia.iter_f32().collect::<Vec<_>>(), vec![1.0, 2.0]);
+        assert!(sc.imatrix("tA.imatrix").is_none());
     }
 
     #[test]
@@ -649,6 +736,7 @@ mod tests {
         let tf = make_compact_test_package();
         let sc = HessianSidecar::open(tf.path()).unwrap();
         assert_eq!(sc.n_tensors(), 1);
+        assert_eq!(sc.n_imatrix_tensors(), 1);
 
         let tb = sc.get("tB", 0).expect("tB missing");
         assert_eq!(tb.k, 3);
@@ -668,6 +756,10 @@ mod tests {
         );
         HessianSidecar::check_symmetry(&tb, 0.0).unwrap();
         HessianSidecar::check_positive_diagonal(&tb).unwrap();
+
+        let ib = sc.imatrix("tB").expect("tB imatrix missing");
+        assert_eq!(ib.k, 3);
+        assert_eq!(ib.iter_f32().collect::<Vec<_>>(), vec![1.0, 2.0, 4.0]);
     }
 
     #[test]
