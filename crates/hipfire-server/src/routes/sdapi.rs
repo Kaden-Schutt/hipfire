@@ -4031,6 +4031,7 @@ fn is_supported_diffusion_pipeline(class_name: &str) -> bool {
             | "StableDiffusionXLPipeline"
             | "Krea2Pipeline"
             | "FluxPipeline"
+            | "QwenImagePipeline"
             | "DiffusionPipeline"
     )
 }
@@ -6649,7 +6650,39 @@ mod tests {
         assert!(is_supported_diffusion_pipeline("StableDiffusionPipeline"));
         assert!(is_supported_diffusion_pipeline("StableDiffusionXLPipeline"));
         assert!(is_supported_diffusion_pipeline("Krea2Pipeline"));
+        assert!(is_supported_diffusion_pipeline("FluxPipeline"));
+        assert!(is_supported_diffusion_pipeline("QwenImagePipeline"));
+        assert!(is_supported_diffusion_pipeline("DiffusionPipeline"));
         assert!(!is_supported_diffusion_pipeline("AutoModelForCausalLM"));
+    }
+
+    #[test]
+    fn diffusers_cache_discovery_lists_qwen_image_snapshots() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-sdapi-qwen-image-discovery-test-{}",
+            std::process::id()
+        ));
+        let snapshot = dir
+            .join("models--Qwen--Qwen-Image")
+            .join("snapshots")
+            .join("abc123");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(
+            snapshot.join("model_index.json"),
+            br#"{"_class_name":"QwenImagePipeline"}"#,
+        )
+        .unwrap();
+
+        let mut models = Vec::new();
+        collect_diffusers_models_from_root(&dir, &mut models);
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].title, "Qwen/Qwen-Image:abc123");
+        assert_eq!(models[0].model_name, "Qwen-Image");
+        assert_eq!(models[0].pipeline_class, "QwenImagePipeline");
+        assert_eq!(models[0].path, snapshot.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

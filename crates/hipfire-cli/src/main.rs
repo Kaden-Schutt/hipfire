@@ -41,6 +41,10 @@ enum Command {
     /// tokenization as host-side setup. `txt2img`, `img2img`, and `smoke` can
     /// opt into `--rocm-device-id` to route currently GPU-backed generation
     /// boundaries through ROCm.
+    /// Diffusers cache discovery also lists transformer-denoiser pipelines such
+    /// as Flux, Krea, and Qwen Image so clients can see convertible models, but
+    /// native serving still requires a runnable `.hfq` artifact and a matching
+    /// diffusion runtime.
     ///
     /// `hipfire serve --model <diffusion.hfq>` pre-warms the resolved diffusion
     /// pipeline cache directly instead of routing the artifact through the chat
