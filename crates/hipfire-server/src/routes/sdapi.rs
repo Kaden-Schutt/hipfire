@@ -3310,7 +3310,11 @@ pub async fn get_upscalers() -> Json<Value> {
 }
 
 pub async fn get_latent_upscale_modes() -> Json<Value> {
-    Json(json!([]))
+    Json(json!([
+        {"name": "Latent"},
+        {"name": "Latent (nearest)"},
+        {"name": "Latent (nearest-exact)"},
+    ]))
 }
 
 pub async fn get_sd_models() -> Json<Value> {
@@ -5643,6 +5647,22 @@ mod tests {
 
         assert!(names.contains(&"Automatic"));
         assert!(names.contains(&"Karras"));
+    }
+
+    #[tokio::test]
+    async fn latent_upscale_modes_advertise_supported_nearest_aliases() {
+        let Json(modes) = get_latent_upscale_modes().await;
+        let names = modes
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|mode| mode["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec!["Latent", "Latent (nearest)", "Latent (nearest-exact)"]
+        );
     }
 
     #[tokio::test]

@@ -67,7 +67,9 @@ enum Command {
     /// (crop and resize), 2 (resize and fill), and 3 (latent upscale). Modes
     /// 0-2 resize init and mask images before VAE encoding; mode 3 keeps the
     /// init image at its source dimensions, VAE-encodes it, then resizes the
-    /// latent tensor to the requested output shape. Masked img2img also honors
+    /// latent tensor to the requested output shape;
+    /// `/sdapi/v1/latent-upscale-modes` advertises Hipfire's nearest-neighbor
+    /// latent resize aliases. Masked img2img also honors
     /// WebUI's `inpainting_mask_invert`, `mask_blur`,
     /// `mask_blur_x`, `mask_blur_y`, `mask_round`, and `inpainting_fill`
     /// options; default fill (0) is applied in image space before VAE encode,
