@@ -3262,6 +3262,52 @@ pub async fn post_options(
     Json(sdapi_options_json(cfg.default_model.clone(), &options))
 }
 
+pub async fn get_memory() -> Json<Value> {
+    Json(sdapi_memory_json())
+}
+
+fn sdapi_memory_json() -> Value {
+    json!({
+        "ram": sdapi_ram_memory_json(),
+        "cuda": {
+            "error": "unavailable",
+            "backend": "hipfire-rocm",
+            "message": "Hipfire uses HIP/ROCm; WebUI-compatible CUDA memory stats are not available.",
+        },
+    })
+}
+
+fn sdapi_ram_memory_json() -> Value {
+    match sdapi_linux_memory_snapshot() {
+        Ok((total, rss)) => json!({
+            "free": total.saturating_sub(rss),
+            "used": rss,
+            "total": total,
+        }),
+        Err(error) => json!({"error": error}),
+    }
+}
+
+fn sdapi_linux_memory_snapshot() -> Result<(u64, u64), String> {
+    let meminfo = fs::read_to_string("/proc/meminfo")
+        .map_err(|error| format!("could not read /proc/meminfo: {error}"))?;
+    let total = sdapi_parse_proc_kib_value(&meminfo, "MemTotal")
+        .ok_or_else(|| "MemTotal missing from /proc/meminfo".to_string())?;
+    let status = fs::read_to_string("/proc/self/status")
+        .map_err(|error| format!("could not read /proc/self/status: {error}"))?;
+    let rss = sdapi_parse_proc_kib_value(&status, "VmRSS").unwrap_or(0);
+    Ok((total, rss))
+}
+
+fn sdapi_parse_proc_kib_value(text: &str, key: &str) -> Option<u64> {
+    let prefix = format!("{key}:");
+    text.lines().find_map(|line| {
+        let value = line.strip_prefix(&prefix)?.trim();
+        let kib = value.split_whitespace().next()?.parse::<u64>().ok()?;
+        kib.checked_mul(1024)
+    })
+}
+
 pub async fn get_cmd_flags() -> Json<Value> {
     Json(json!({
         "api": true,
@@ -5479,6 +5525,31 @@ mod tests {
             "[seed]-[prompt_words]"
         );
         assert_eq!(read_back["hipfire_rocm_device_id"], 0);
+    }
+
+    #[tokio::test]
+    async fn memory_endpoint_reports_webui_compatible_shape() {
+        let Json(memory) = get_memory().await;
+
+        assert!(memory["ram"].is_object());
+        assert!(memory["ram"]["total"].is_number() || memory["ram"]["error"].is_string());
+        assert_eq!(memory["cuda"]["error"], "unavailable");
+        assert_eq!(memory["cuda"]["backend"], "hipfire-rocm");
+    }
+
+    #[test]
+    fn proc_kib_parser_returns_bytes_for_memory_lines() {
+        let proc_text = "Name:\thipfire\nMemTotal:       16384 kB\nVmRSS:\t512 kB\n";
+
+        assert_eq!(
+            sdapi_parse_proc_kib_value(proc_text, "MemTotal"),
+            Some(16_777_216)
+        );
+        assert_eq!(
+            sdapi_parse_proc_kib_value(proc_text, "VmRSS"),
+            Some(524_288)
+        );
+        assert_eq!(sdapi_parse_proc_kib_value(proc_text, "Missing"), None);
     }
 
     #[test]

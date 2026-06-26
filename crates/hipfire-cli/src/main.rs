@@ -55,7 +55,9 @@ enum Command {
     /// `/sdapi/v1/progress` tracks active SDAPI sampling steps and updates
     /// `current_image` with live PNG previews decoded from intermediate
     /// latents, then leaves the final generated PNG there after a successful
-    /// HFQ diffusion request completes.
+    /// HFQ diffusion request completes. `/sdapi/v1/memory` returns WebUI-shaped
+    /// host RAM stats and marks CUDA memory stats unavailable because Hipfire
+    /// uses HIP/ROCm.
     ///
     /// SDAPI sampler fields follow WebUI's split controls: full scheduler names
     /// such as `DDIM` and `DPM++ 2M` are accepted directly, while schedule

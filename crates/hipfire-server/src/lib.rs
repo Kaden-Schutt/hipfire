@@ -144,6 +144,7 @@ pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> Rout
         .route("/sdapi/v1/skip", post(routes::sdapi::post_interrupt))
         .route("/sdapi/v1/options", get(routes::sdapi::get_options))
         .route("/sdapi/v1/options", post(routes::sdapi::post_options))
+        .route("/sdapi/v1/memory", get(routes::sdapi::get_memory))
         .route("/sdapi/v1/cmd-flags", get(routes::sdapi::get_cmd_flags))
         .route("/sdapi/v1/samplers", get(routes::sdapi::get_samplers))
         .route("/sdapi/v1/schedulers", get(routes::sdapi::get_schedulers))
