@@ -1094,11 +1094,7 @@ fn sdapi_parameters_text(body: &SdGenerationRequest, mode: &str, info: &Value) -
     lines.push(format!(
         "Steps: {}, Sampler: {}, CFG scale: {}, Seed: {}, Size: {}x{}, Model: {}, Mode: {}",
         body.steps.unwrap_or(20),
-        body.scheduler
-            .as_deref()
-            .or(body.sampler_name.as_deref())
-            .or(body.sampler_index.as_deref())
-            .unwrap_or("DPM++ 2M"),
+        sdapi_effective_scheduler(body),
         body.cfg_scale.unwrap_or(7.0),
         seeds.unwrap_or(-1),
         info.get("width")
@@ -1384,16 +1380,66 @@ fn sd_request_to_diffusion_batch_request(
         crop_y: body.crop_y.unwrap_or(0),
         steps: body.steps.unwrap_or(20),
         cfg_scale: body.cfg_scale.unwrap_or(7.0) as f32,
-        scheduler: body
-            .scheduler
-            .clone()
-            .or_else(|| body.sampler_name.clone())
-            .or_else(|| body.sampler_index.clone())
-            .unwrap_or_else(|| "DPM++ 2M".to_string()),
+        scheduler: sdapi_effective_scheduler(body),
         subseed_strength: body.subseed_strength.unwrap_or(0.0) as f32,
         send_images: body.send_images.unwrap_or(true),
         save_images: body.save_images.unwrap_or(false),
     })
+}
+
+fn sdapi_effective_scheduler(body: &SdGenerationRequest) -> String {
+    let sampler = body
+        .sampler_name
+        .as_deref()
+        .or(body.sampler_index.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let scheduler = body
+        .scheduler
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(scheduler) = scheduler else {
+        return sampler.unwrap_or("DPM++ 2M").to_string();
+    };
+    if sdapi_scheduler_is_automatic(scheduler) {
+        return sampler.unwrap_or("DPM++ 2M").to_string();
+    }
+    if sdapi_scheduler_is_karras(scheduler) {
+        let sampler = sampler.unwrap_or("DPM++ 2M");
+        if normalize_scheduler_name_for_sdapi(sampler).contains("karras") {
+            sampler.to_string()
+        } else {
+            format!("{sampler} Karras")
+        }
+    } else {
+        scheduler.to_string()
+    }
+}
+
+fn sdapi_scheduler_is_automatic(value: &str) -> bool {
+    matches!(
+        normalize_scheduler_name_for_sdapi(value).as_str(),
+        "automatic" | "auto" | "use same scheduler"
+    )
+}
+
+fn sdapi_scheduler_is_karras(value: &str) -> bool {
+    normalize_scheduler_name_for_sdapi(value) == "karras"
+}
+
+fn sdapi_scheduler_is_schedule_modifier(value: &str) -> bool {
+    sdapi_scheduler_is_automatic(value) || sdapi_scheduler_is_karras(value)
+}
+
+fn normalize_scheduler_name_for_sdapi(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .replace('_', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn sdapi_img2img_target_dimensions(
@@ -2707,15 +2753,23 @@ fn sdapi_highres_second_pass_body(
     if let Some(negative_prompt) = highres_override_text(body.hr_negative_prompt.as_deref(), "") {
         highres_body.negative_prompt = negative_prompt.to_string();
     }
+    if let Some(sampler) =
+        highres_override_text(body.hr_sampler_name.as_deref(), "Use same sampler")
+    {
+        highres_body.sampler_name = Some(sampler.to_string());
+        highres_body.sampler_index = None;
+        if highres_body
+            .scheduler
+            .as_deref()
+            .is_some_and(|scheduler| !sdapi_scheduler_is_schedule_modifier(scheduler))
+        {
+            highres_body.scheduler = None;
+        }
+    }
     if let Some(scheduler) =
         highres_override_text(body.hr_scheduler.as_deref(), "Use same scheduler")
     {
         highres_body.scheduler = Some(scheduler.to_string());
-    } else if let Some(sampler) =
-        highres_override_text(body.hr_sampler_name.as_deref(), "Use same sampler")
-    {
-        highres_body.scheduler = None;
-        highres_body.sampler_name = Some(sampler.to_string());
     }
     highres_body
 }
@@ -3014,6 +3068,13 @@ pub async fn get_schedulers() -> Json<Value> {
             "name": "Automatic",
             "label": "Automatic",
             "aliases": [],
+            "default_rho": null,
+            "need_inner_model": false,
+        },
+        {
+            "name": "Karras",
+            "label": "Karras",
+            "aliases": ["karras"],
             "default_rho": null,
             "need_inner_model": false,
         }
@@ -5180,6 +5241,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schedulers_advertise_runtime_supported_schedule_modifiers() {
+        let Json(schedulers) = get_schedulers().await;
+        let names = schedulers
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|scheduler| scheduler["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"Automatic"));
+        assert!(names.contains(&"Karras"));
+    }
+
+    #[tokio::test]
     async fn progress_endpoint_reports_idle_and_active_sdapi_generation() {
         let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
 
@@ -5354,6 +5429,44 @@ mod tests {
         let request = sd_request_to_diffusion_batch_request(&body, None, 0).unwrap();
 
         assert_eq!(request.scheduler, "Euler");
+    }
+
+    #[test]
+    fn txt2img_request_combines_webui_sampler_and_schedule_type() {
+        let body = SdGenerationRequest {
+            prompt: "a small red robot".to_string(),
+            sampler_name: Some("Euler".to_string()),
+            scheduler: Some("Karras".to_string()),
+            ..empty_request()
+        };
+
+        let request = sd_request_to_diffusion_batch_request(&body, None, 0).unwrap();
+
+        assert_eq!(request.scheduler, "Euler Karras");
+
+        let automatic = SdGenerationRequest {
+            sampler_name: Some("DDIM".to_string()),
+            scheduler: Some("Automatic".to_string()),
+            ..empty_request()
+        };
+        assert_eq!(
+            sd_request_to_diffusion_batch_request(&automatic, None, 0)
+                .unwrap()
+                .scheduler,
+            "DDIM"
+        );
+
+        let full_scheduler_wins = SdGenerationRequest {
+            sampler_name: Some("Euler".to_string()),
+            scheduler: Some("DPM++ 2M".to_string()),
+            ..empty_request()
+        };
+        assert_eq!(
+            sd_request_to_diffusion_batch_request(&full_scheduler_wins, None, 0)
+                .unwrap()
+                .scheduler,
+            "DPM++ 2M"
+        );
     }
 
     #[test]
@@ -5741,6 +5854,7 @@ mod tests {
         assert_eq!(body.steps, Some(13));
         assert_eq!(body.sampler_name.as_deref(), Some("Euler a"));
         assert_eq!(body.scheduler.as_deref(), Some("Karras"));
+        assert_eq!(sdapi_effective_scheduler(&body), "Euler a Karras");
         assert_eq!(body.cfg_scale, Some(6.5));
         assert_eq!(body.seed, Some(42));
         assert_eq!(body.width, Some(640));
@@ -5874,7 +5988,28 @@ mod tests {
         let request = sd_request_to_diffusion_batch_request(&second, None, 0).unwrap();
 
         assert_eq!(second.scheduler.as_deref(), Some("DDIM"));
+        assert_eq!(second.sampler_name.as_deref(), Some("Euler"));
         assert_eq!(request.scheduler, "DDIM");
+    }
+
+    #[test]
+    fn txt2img_highres_second_pass_body_combines_hr_sampler_and_karras_schedule() {
+        let body = SdGenerationRequest {
+            prompt: "base prompt".to_string(),
+            sampler_name: Some("DPM++ 2M".to_string()),
+            scheduler: Some("Karras".to_string()),
+            enable_hr: Some(true),
+            hr_sampler_name: Some("Euler".to_string()),
+            hr_scheduler: Some("Use same scheduler".to_string()),
+            ..empty_request()
+        };
+
+        let second = sdapi_highres_second_pass_body(&body, (8, 6));
+        let request = sd_request_to_diffusion_batch_request(&second, None, 0).unwrap();
+
+        assert_eq!(second.sampler_name.as_deref(), Some("Euler"));
+        assert_eq!(second.scheduler.as_deref(), Some("Karras"));
+        assert_eq!(request.scheduler, "Euler Karras");
     }
 
     fn empty_request() -> SdGenerationRequest {

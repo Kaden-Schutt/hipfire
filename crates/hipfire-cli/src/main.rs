@@ -57,6 +57,12 @@ enum Command {
     /// request completes. Live per-step latent preview decoding is not
     /// implemented yet.
     ///
+    /// SDAPI sampler fields follow WebUI's split controls: full scheduler names
+    /// such as `DDIM` and `DPM++ 2M` are accepted directly, while schedule
+    /// modifiers such as `Automatic` and `Karras` combine with `sampler_name`
+    /// or `sampler_index` (for example `Euler` + `Karras` becomes
+    /// `Euler Karras`).
+    ///
     /// SDAPI img2img and inpaint resize init and mask images to the requested
     /// output dimensions before VAE encoding. `resize_mode` supports WebUI
     /// modes 0 (stretch), 1 (crop and resize), and 2 (resize and fill);
