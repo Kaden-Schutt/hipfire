@@ -22,10 +22,10 @@ ROCM_DEVICE_ID="${HIPFIRE_DIFFUSION_ADMISSION_ROCM_DEVICE_ID:-}"
 CARGO_FEATURES="${HIPFIRE_DIFFUSION_ADMISSION_CARGO_FEATURES:-}"
 TXT2IMG_ONLY="${HIPFIRE_DIFFUSION_ADMISSION_TXT2IMG_ONLY:-0}"
 SKIP_MASKED_IMG2IMG="${HIPFIRE_DIFFUSION_ADMISSION_SKIP_MASKED_IMG2IMG:-0}"
-if [[ -n "$ROCM_DEVICE_ID" && -z "$CARGO_FEATURES" ]]; then
-  CARGO_FEATURES="rocm"
-fi
 
+# hipfire is HIP/ROCm-first: the GPU path is always compiled, so no cargo
+# feature is needed to exercise it. CARGO_FEATURES remains an opt-in passthrough
+# for unrelated features.
 HIPFIRE_CLI=(cargo run --release -q -p hipfire-cli)
 if [[ -n "$CARGO_FEATURES" ]]; then
   HIPFIRE_CLI+=(--features "$CARGO_FEATURES")

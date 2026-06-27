@@ -249,6 +249,10 @@ pub async fn serve_loaded(config: LoadedConfig) -> anyhow::Result<()> {
     let cors_allowed_origins = config.config.cors_allowed_origins.clone();
     let state = AppState::new_loaded(config);
 
+    // HIP/ROCm-first: detect the GPU once at daemon launch so diffusion requests
+    // target the same resolved device (CPU reference only via env opt-in).
+    state.resolve_diffusion_runtime_default();
+
     prewarm_default_model(&state).await;
 
     let idle_state = state.clone();

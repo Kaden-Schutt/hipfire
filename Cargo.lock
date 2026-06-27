@@ -1410,6 +1410,7 @@ dependencies = [
  "hipfire-generate",
  "hipfire-lock",
  "hipfire-model",
+ "hipfire-runtime",
  "hipfire-server",
  "image",
  "indicatif",

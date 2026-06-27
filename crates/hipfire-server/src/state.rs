@@ -6,7 +6,7 @@ use tokio::sync::{Mutex, Notify};
 
 use hipfire_config::{HipfireConfig, LoadedConfig};
 use hipfire_daemon_adapter::DaemonEngine;
-use hipfire_diffusion::DiffusionPipeline;
+use hipfire_diffusion::{DiffusionGenerationRuntimeOptions, DiffusionPipeline};
 use hipfire_prompt::Message;
 use hipfire_scheduler::{PriorityPrefillScheduler, SchedulerPolicyEnv};
 
@@ -84,6 +84,12 @@ pub struct AppState {
     pub batch_order: Mutex<VecDeque<String>>,
     /// Opened diffusion HFQ pipelines keyed by resolved model path.
     pub diffusion_pipelines: Mutex<HashMap<PathBuf, Arc<DiffusionPipeline>>>,
+    /// Daemon-resolved default diffusion runtime backend. Resolved once at
+    /// `serve` launch (HIP/ROCm-first: the detected GPU, or the CPU reference
+    /// oracle when `HIPFIRE_DIFFUSION_CPU_REFERENCE` is set). The bare
+    /// constructor leaves this as the CPU reference so unit/route tests run
+    /// without a GPU; a per-request `rocm_device_id` still overrides it.
+    pub diffusion_runtime_default: StdMutex<DiffusionGenerationRuntimeOptions>,
     /// Stable-Diffusion-WebUI option compatibility values posted to
     /// `/sdapi/v1/options` that do not map to native Hipfire config fields.
     pub sdapi_options: Mutex<HashMap<String, serde_json::Value>>,
@@ -132,6 +138,9 @@ impl AppState {
             batches: Mutex::new(HashMap::new()),
             batch_order: Mutex::new(VecDeque::new()),
             diffusion_pipelines: Mutex::new(HashMap::new()),
+            diffusion_runtime_default: StdMutex::new(
+                DiffusionGenerationRuntimeOptions::cpu_reference(),
+            ),
             sdapi_options: Mutex::new(HashMap::new()),
             sdapi_progress: Arc::new(StdMutex::new(SdapiProgressState::default())),
             last_request_unix_secs: Mutex::new(now_secs()),
@@ -139,6 +148,39 @@ impl AppState {
             admin_secret: hipfire_config::ensure_admin_secret().unwrap_or_default(),
             admin_sessions: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Resolve the daemon's default diffusion backend once at `serve` launch.
+    /// HIP/ROCm-first: detect the primary GPU and use it; honor
+    /// `HIPFIRE_DIFFUSION_CPU_REFERENCE` for the CPU oracle; if no GPU is
+    /// available and CPU was not requested, warn and keep the CPU reference so
+    /// the daemon still serves (slowly) rather than failing every request.
+    pub fn resolve_diffusion_runtime_default(&self) {
+        let resolved = if DiffusionGenerationRuntimeOptions::cpu_reference_requested() {
+            eprintln!(
+                "[hipfire] diffusion: HIPFIRE_DIFFUSION_CPU_REFERENCE set; using the CPU reference oracle"
+            );
+            DiffusionGenerationRuntimeOptions::cpu_reference()
+        } else {
+            match hipfire_runtime::multi_gpu::resolve_primary_device(None) {
+                Ok(device) => DiffusionGenerationRuntimeOptions::rocm_hybrid(device),
+                Err(error) => {
+                    eprintln!(
+                        "[hipfire] diffusion: no ROCm device resolved ({error}); falling back to \
+                         the slow CPU reference oracle. Set HIPFIRE_DIFFUSION_CPU_REFERENCE=1 to \
+                         silence this warning."
+                    );
+                    DiffusionGenerationRuntimeOptions::cpu_reference()
+                }
+            }
+        };
+        *self.diffusion_runtime_default.lock().unwrap() = resolved;
+    }
+
+    /// The daemon's resolved default diffusion backend (see
+    /// [`resolve_diffusion_runtime_default`]).
+    pub fn diffusion_runtime_default(&self) -> DiffusionGenerationRuntimeOptions {
+        *self.diffusion_runtime_default.lock().unwrap()
     }
 }
 

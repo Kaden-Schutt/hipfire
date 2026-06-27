@@ -1,22 +1,56 @@
 // SPDX-License-Identifier: Apache-2.0
 // hipfire — see LICENSE and NOTICE in the project root.
 
+use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use base64::Engine;
 use clap::{Args, Subcommand};
-#[cfg(feature = "rocm")]
 use hipfire_diffusion::DiffusionHipRuntimeOptions;
 use hipfire_diffusion::{
     import_diffusers_to_hfq, inspect_hfq_with_runtime_support, resize_rgb_batch_to_cover_nearest,
     DiffusersImportOptions, DiffusionBatchRequest, DiffusionGenerationRuntimeOptions,
-    DiffusionHfqInspection, DiffusionImg2ImgRequest, DiffusionPipeline, DiffusionPrompt,
-    RgbImageBatch,
+    DiffusionHfqInspection, DiffusionImg2ImgRequest, DiffusionPipeline, DiffusionProgress,
+    DiffusionPrompt, DiffusionResult, RgbImageBatch,
 };
 use serde::Serialize;
 
 use crate::model::find_model;
+
+/// Build a denoise progress callback that logs per-step wall-clock timing to
+/// stderr (step index, per-step delta, cumulative elapsed, throughput, and ETA)
+/// so batch generation speed is observable in real time. `images` is the batch
+/// size, reported so the per-step rate can be read as images/step-second.
+fn step_timing_progress(label: &str, images: usize) -> impl FnMut(DiffusionProgress) -> DiffusionResult<()> {
+    let label = label.to_string();
+    // Start the clock now (before generation) so the first reported step includes
+    // model setup and text-encode latency rather than reading as zero.
+    let start = Instant::now();
+    let last = Cell::new(None::<Instant>);
+    move |progress: DiffusionProgress| {
+        let now = Instant::now();
+        let step_dt = last.get().map_or_else(
+            || now.duration_since(start).as_secs_f64(),
+            |t| now.duration_since(t).as_secs_f64(),
+        );
+        last.set(Some(now));
+        let elapsed = now.duration_since(start).as_secs_f64();
+        let done = progress.completed_steps;
+        let total = progress.total_steps.max(1);
+        let rate = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
+        let eta = if rate > 0.0 {
+            (total.saturating_sub(done)) as f64 / rate
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[{label}] step {done}/{total} (batch {images}) +{step_dt:.2}s elapsed {elapsed:.1}s {rate:.3} steps/s ETA {eta:.0}s",
+        );
+        Ok(())
+    }
+}
 
 #[derive(Debug, Args)]
 pub struct DiffusionArgs {
@@ -38,10 +72,10 @@ pub enum DiffusionCommand {
     /// Plan HIP diffusion buffers and optionally run a ROCm device preflight
     ///
     /// The preflight command prints a deterministic memory plan for the
-    /// requested resolution, batch, scheduler, and prompt set. Builds compiled
-    /// with `--features rocm` also initialize the selected HIP device, allocate
-    /// the planned buffer classes, run a host/device roundtrip probe, and
-    /// launch currently covered diffusion kernel probes against CPU references.
+    /// requested resolution, batch, scheduler, and prompt set. When a
+    /// `--device-id` is given it also initializes the selected HIP device,
+    /// allocates the planned buffer classes, runs a host/device roundtrip
+    /// probe, and launches the diffusion kernel probes against CPU references.
     Preflight(DiffusionPreflightArgs),
     /// Generate PNG images directly from a diffusion .hfq artifact
     ///
@@ -122,7 +156,7 @@ pub struct DiffusionPreflightArgs {
     /// Batch size when a single prompt is supplied
     #[arg(long, default_value_t = 1)]
     pub batch_size: usize,
-    /// ROCm device id to preflight when built with --features rocm
+    /// ROCm device id to initialize and preflight (omit for plan-only)
     #[arg(long, default_value_t = 0)]
     pub device_id: i32,
 }
@@ -196,6 +230,9 @@ pub struct DiffusionTxt2ImgArgs {
     #[arg(long, default_value_t = 0.75)]
     pub hr_denoising_strength: f32,
     /// Use ROCm for currently GPU-routed generation stages on this device id
+    /// ROCm device to generate on. Omit to auto-detect (a single GPU is used
+    /// silently; the first of several with a warning). The CPU reference oracle
+    /// is opt-in via the HIPFIRE_DIFFUSION_CPU_REFERENCE environment variable.
     #[arg(long)]
     pub rocm_device_id: Option<i32>,
 }
@@ -254,6 +291,9 @@ pub struct DiffusionImg2ImgArgs {
     #[arg(long, default_value_t = 0.75)]
     pub denoising_strength: f32,
     /// Use ROCm for currently GPU-routed generation stages on this device id
+    /// ROCm device to generate on. Omit to auto-detect (a single GPU is used
+    /// silently; the first of several with a warning). The CPU reference oracle
+    /// is opt-in via the HIPFIRE_DIFFUSION_CPU_REFERENCE environment variable.
     #[arg(long)]
     pub rocm_device_id: Option<i32>,
 }
@@ -300,6 +340,9 @@ pub struct DiffusionSmokeArgs {
     #[arg(long, default_value_t = 0.5)]
     pub denoising_strength: f32,
     /// Use ROCm for currently GPU-routed generation stages on this device id
+    /// ROCm device to generate on. Omit to auto-detect (a single GPU is used
+    /// silently; the first of several with a warning). The CPU reference oracle
+    /// is opt-in via the HIPFIRE_DIFFUSION_CPU_REFERENCE environment variable.
     #[arg(long)]
     pub rocm_device_id: Option<i32>,
     /// Only run txt2img; skip the img2img leg
@@ -391,7 +434,6 @@ fn run_preflight(args: DiffusionPreflightArgs) -> anyhow::Result<()> {
     let model = resolve_model_path(args.model);
     let pipeline = DiffusionPipeline::open_hfq(&model)?;
     let memory_plan = pipeline.hip_memory_plan(&request)?;
-    #[cfg(feature = "rocm")]
     let rocm = match pipeline.preflight_hip_runtime(
         &request,
         DiffusionHipRuntimeOptions {
@@ -407,11 +449,6 @@ fn run_preflight(args: DiffusionPreflightArgs) -> anyhow::Result<()> {
             "reason": error.to_string(),
         }),
     };
-    #[cfg(not(feature = "rocm"))]
-    let rocm = serde_json::json!({
-        "available": false,
-        "reason": "hipfire-cli was built without the rocm feature; rebuild with --features rocm to run device allocation preflight",
-    });
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -457,12 +494,24 @@ fn run_txt2img(args: DiffusionTxt2ImgArgs) -> anyhow::Result<()> {
     };
     let model = resolve_model_path(args.model.clone());
     let pipeline = DiffusionPipeline::open_hfq(&model)?;
-    let runtime_options = generation_runtime_options(args.rocm_device_id);
+    let runtime_options = resolve_runtime_options(args.rocm_device_id)?;
+    let batch_images = request.prompts.len();
+    let wall_start = Instant::now();
     let output = if args.enable_hr {
         generate_highres_txt2img(&pipeline, request, &args, runtime_options)?
     } else {
-        pipeline.generate_batch_with_runtime_options(request, runtime_options)?
+        let mut progress = step_timing_progress("txt2img", batch_images);
+        pipeline.generate_batch_with_progress_and_runtime_options(
+            request,
+            runtime_options,
+            &mut progress,
+        )?
     };
+    let wall = wall_start.elapsed().as_secs_f64();
+    eprintln!(
+        "[txt2img] generated {batch_images} image(s) in {wall:.1}s ({:.2}s/image, includes text-encode + VAE decode)",
+        wall / batch_images.max(1) as f64,
+    );
     let files = write_png_images(&output.images, &args.output)?;
     println!(
         "{}",
@@ -708,9 +757,13 @@ fn run_img2img(args: DiffusionImg2ImgArgs) -> anyhow::Result<()> {
     };
     let model = resolve_model_path(args.model);
     let pipeline = DiffusionPipeline::open_hfq(&model)?;
-    let output = pipeline.generate_img2img_batch_with_runtime_options(
+    let batch_images = request.batch.prompts.len();
+    let runtime_options = resolve_runtime_options(args.rocm_device_id)?;
+    let mut progress = step_timing_progress("img2img", batch_images);
+    let output = pipeline.generate_img2img_batch_with_progress_and_runtime_options(
         request,
-        generation_runtime_options(args.rocm_device_id),
+        runtime_options,
+        &mut progress,
     )?;
     let files = write_png_images(&output.images, &args.output)?;
     println!(
@@ -725,11 +778,24 @@ fn run_img2img(args: DiffusionImg2ImgArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn generation_runtime_options(rocm_device_id: Option<i32>) -> DiffusionGenerationRuntimeOptions {
-    rocm_device_id.map_or_else(
-        DiffusionGenerationRuntimeOptions::cpu_reference,
-        DiffusionGenerationRuntimeOptions::rocm_hybrid,
-    )
+/// Resolve generation runtime options. hipfire is HIP/ROCm-first: the GPU is the
+/// default and is resolved here (explicit `--rocm-device-id` wins; otherwise the
+/// single visible device is used silently, or the first of several with a
+/// warning). The CPU reference oracle is opt-in via `HIPFIRE_DIFFUSION_CPU_REFERENCE`.
+fn resolve_runtime_options(
+    explicit_device: Option<i32>,
+) -> anyhow::Result<DiffusionGenerationRuntimeOptions> {
+    if DiffusionGenerationRuntimeOptions::cpu_reference_requested() {
+        return Ok(DiffusionGenerationRuntimeOptions::cpu_reference());
+    }
+    let device = hipfire_runtime::multi_gpu::resolve_primary_device(explicit_device)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to resolve a ROCm device: {error}; pass --rocm-device-id, or set \
+                 HIPFIRE_DIFFUSION_CPU_REFERENCE=1 to use the slow CPU reference oracle"
+            )
+        })?;
+    Ok(DiffusionGenerationRuntimeOptions::rocm_hybrid(device))
 }
 
 fn resolve_model_path(path: PathBuf) -> PathBuf {
@@ -751,7 +817,7 @@ fn run_smoke(args: DiffusionSmokeArgs) -> anyhow::Result<()> {
     }
     fs::create_dir_all(&args.output_dir)?;
     let pipeline = DiffusionPipeline::open_hfq(&model)?;
-    let runtime_options = generation_runtime_options(args.rocm_device_id);
+    let runtime_options = resolve_runtime_options(args.rocm_device_id)?;
     let txt2img_request = smoke_batch_request(&args, args.seed);
     let txt2img_output =
         pipeline.generate_batch_with_runtime_options(txt2img_request, runtime_options)?;
@@ -1287,14 +1353,14 @@ mod tests {
     }
 
     #[test]
-    fn generation_runtime_options_select_cpu_or_rocm() {
+    fn rocm_hybrid_targets_requested_device() {
+        // Device resolution (CPU env vs ROCm + GPU detection) is covered by the
+        // diffusion and runtime crates; here we only pin the GPU mapping.
         assert_eq!(
-            generation_runtime_options(None),
-            DiffusionGenerationRuntimeOptions::cpu_reference()
-        );
-        assert_eq!(
-            generation_runtime_options(Some(2)),
-            DiffusionGenerationRuntimeOptions::rocm_hybrid(2)
+            DiffusionGenerationRuntimeOptions::rocm_hybrid(2),
+            DiffusionGenerationRuntimeOptions {
+                rocm_device_id: Some(2)
+            }
         );
     }
 

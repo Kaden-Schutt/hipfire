@@ -460,7 +460,8 @@ async fn execute_hfq_diffusion_txt2img(
     };
     let iteration_steps =
         request.steps as usize + sdapi_txt2img_highres_steps(&body, highres_target);
-    let runtime_options = sd_request_generation_runtime_options(&body, &sdapi_options);
+    let runtime_options =
+        sd_request_generation_runtime_options(&body, &sdapi_options, state.diffusion_runtime_default());
     let progress_state = state.sdapi_progress.clone();
     start_sdapi_progress(
         &progress_state,
@@ -634,7 +635,8 @@ async fn execute_hfq_diffusion_img2img(
         Ok(inpainting_fill) => inpainting_fill,
         Err(error) => return diffusion_error_response(error),
     };
-    let runtime_options = sd_request_generation_runtime_options(&body, &sdapi_options);
+    let runtime_options =
+        sd_request_generation_runtime_options(&body, &sdapi_options, state.diffusion_runtime_default());
     let progress_state = state.sdapi_progress.clone();
     start_sdapi_progress(
         &progress_state,
@@ -2802,6 +2804,7 @@ fn sdapi_value_is_truthy(value: &Value) -> bool {
 fn sd_request_generation_runtime_options(
     body: &SdGenerationRequest,
     stored_options: &std::collections::HashMap<String, Value>,
+    daemon_default: DiffusionGenerationRuntimeOptions,
 ) -> DiffusionGenerationRuntimeOptions {
     let rocm_device_id = body
         .rocm_device_id
@@ -2810,10 +2813,10 @@ fn sd_request_generation_runtime_options(
         .or_else(|| sd_override_i32(body, "hipfire_rocm_device_id"))
         .or_else(|| sd_stored_i32(stored_options, "rocm_device_id"))
         .or_else(|| sd_stored_i32(stored_options, "hipfire_rocm_device_id"));
-    rocm_device_id.map_or_else(
-        DiffusionGenerationRuntimeOptions::cpu_reference,
-        DiffusionGenerationRuntimeOptions::rocm_hybrid,
-    )
+    // An explicit per-request device overrides the daemon default; otherwise use
+    // the backend the daemon resolved at launch (GPU by default; CPU only when
+    // HIPFIRE_DIFFUSION_CPU_REFERENCE was set).
+    rocm_device_id.map_or(daemon_default, DiffusionGenerationRuntimeOptions::rocm_hybrid)
 }
 
 fn sd_override_i32(body: &SdGenerationRequest, key: &str) -> Option<i32> {
@@ -4381,41 +4384,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(not(feature = "rocm"))]
-    #[tokio::test]
-    async fn txt2img_route_rejects_rocm_runtime_when_feature_disabled() {
-        let dir = std::env::temp_dir().join(format!(
-            "hipfire-sdapi-diffusion-route-rocm-disabled-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let hfq_path = dir.join("tiny-route-diffusion-rocm-disabled.hfq");
-        write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
-        let body = SdGenerationRequest {
-            prompt: "a cat".to_string(),
-            model: Some(hfq_path.to_string_lossy().into_owned()),
-            steps: Some(1),
-            cfg_scale: Some(1.0),
-            width: Some(2),
-            height: Some(2),
-            send_images: Some(true),
-            save_images: Some(false),
-            rocm_device_id: Some(0),
-            ..empty_request()
-        };
-
-        let response = post_txt2img(State(state), Json(body)).await;
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-        let body = response_json(response).await;
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("built without the rocm feature"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[tokio::test]
     async fn txt2img_route_uses_override_settings_sd_model_checkpoint_for_hfq_model() {
         let dir = std::env::temp_dir().join(format!(
@@ -5598,7 +5566,6 @@ mod tests {
         assert_eq!(info["height"], 64);
     }
 
-    #[cfg(feature = "rocm")]
     #[tokio::test]
     #[ignore = "real Tiny-SD ROCm txt2img route smoke; run in release mode under an external timeout"]
     async fn txt2img_route_returns_rocm_runtime_for_real_tiny_sd_hfq_model() {
@@ -5682,7 +5649,6 @@ mod tests {
         assert_eq!(info["height"], 64);
     }
 
-    #[cfg(feature = "rocm")]
     #[tokio::test]
     #[ignore = "real Tiny-SD ROCm img2img route smoke; run in release mode under an external timeout"]
     async fn img2img_route_returns_rocm_runtime_for_real_tiny_sd_hfq_model() {
@@ -6152,11 +6118,24 @@ mod tests {
     }
 
     #[test]
-    fn sd_request_generation_runtime_options_select_cpu_or_rocm() {
+    fn sd_request_generation_runtime_options_override_else_daemon_default() {
         let empty_options = std::collections::HashMap::new();
+        // The daemon default (resolved at launch) used when nothing is specified.
+        let daemon_default = DiffusionGenerationRuntimeOptions::rocm_hybrid(1);
+
         let default = SdGenerationRequest { ..empty_request() };
         assert_eq!(
-            sd_request_generation_runtime_options(&default, &empty_options),
+            sd_request_generation_runtime_options(&default, &empty_options, daemon_default),
+            daemon_default,
+            "no per-request device falls through to the daemon-resolved default"
+        );
+        // CPU daemon default (e.g. HIPFIRE_DIFFUSION_CPU_REFERENCE set at launch).
+        assert_eq!(
+            sd_request_generation_runtime_options(
+                &default,
+                &empty_options,
+                DiffusionGenerationRuntimeOptions::cpu_reference()
+            ),
             DiffusionGenerationRuntimeOptions::cpu_reference()
         );
 
@@ -6165,7 +6144,7 @@ mod tests {
             ..empty_request()
         };
         assert_eq!(
-            sd_request_generation_runtime_options(&direct, &empty_options),
+            sd_request_generation_runtime_options(&direct, &empty_options, daemon_default),
             DiffusionGenerationRuntimeOptions::rocm_hybrid(2)
         );
 
@@ -6174,7 +6153,7 @@ mod tests {
             ..empty_request()
         };
         assert_eq!(
-            sd_request_generation_runtime_options(&namespaced, &empty_options),
+            sd_request_generation_runtime_options(&namespaced, &empty_options, daemon_default),
             DiffusionGenerationRuntimeOptions::rocm_hybrid(3)
         );
 
@@ -6185,7 +6164,7 @@ mod tests {
             ..empty_request()
         };
         assert_eq!(
-            sd_request_generation_runtime_options(&override_settings, &empty_options),
+            sd_request_generation_runtime_options(&override_settings, &empty_options, daemon_default),
             DiffusionGenerationRuntimeOptions::rocm_hybrid(4)
         );
 
@@ -6197,7 +6176,7 @@ mod tests {
             ..empty_request()
         };
         assert_eq!(
-            sd_request_generation_runtime_options(&direct_wins, &empty_options),
+            sd_request_generation_runtime_options(&direct_wins, &empty_options, daemon_default),
             DiffusionGenerationRuntimeOptions::rocm_hybrid(5)
         );
 
@@ -6205,7 +6184,7 @@ mod tests {
         let mut stored_options = std::collections::HashMap::new();
         stored_options.insert("hipfire_rocm_device_id".to_string(), json!(7));
         assert_eq!(
-            sd_request_generation_runtime_options(&stored_request, &stored_options),
+            sd_request_generation_runtime_options(&stored_request, &stored_options, daemon_default),
             DiffusionGenerationRuntimeOptions::rocm_hybrid(7)
         );
     }

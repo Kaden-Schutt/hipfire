@@ -28,14 +28,16 @@ claims.
   so the path is exercised without increasing image dimensions unless
   `HIPFIRE_DIFFUSION_SMOKE_HIGHRES_WIDTH`/`HEIGHT` or a larger scale is set.
   Set `HIPFIRE_DIFFUSION_SMOKE_ROCM_DEVICE_ID` to validate the hybrid ROCm
-  runtime path; the smoke will use a release cargo run with `--features rocm`
-  unless `HIPFIRE_DIFFUSION_SDAPI_SMOKE_CARGO_FEATURES` or
+  runtime path; the GPU path is always compiled (HIP/ROCm-first), so a release
+  cargo run needs no extra feature unless
+  `HIPFIRE_DIFFUSION_SDAPI_SMOKE_CARGO_FEATURES` or
   `HIPFIRE_DIFFUSION_SDAPI_SMOKE_CMD` overrides it.
 - `diffusion-tiny-sd-hfq-admission.sh` imports a Tiny-SD HFQ from the local
   Hugging Face cache when needed, then runs the native CLI diffusion admission
   smoke. Set `HIPFIRE_DIFFUSION_ADMISSION_ROCM_DEVICE_ID` to validate the
-  hybrid ROCm runtime path; the smoke will use `--features rocm` unless
-  `HIPFIRE_DIFFUSION_ADMISSION_CARGO_FEATURES` overrides it. ROCm liveness
+  hybrid ROCm runtime path; the GPU path is always compiled, so no extra
+  feature is needed unless `HIPFIRE_DIFFUSION_ADMISSION_CARGO_FEATURES`
+  overrides it. ROCm liveness
   checks can narrow the run with `HIPFIRE_DIFFUSION_ADMISSION_BATCH_SIZE=1` and
   `HIPFIRE_DIFFUSION_ADMISSION_TXT2IMG_ONLY=1`; CPU admission should keep the
   default full txt2img/img2img/masked-img2img coverage.

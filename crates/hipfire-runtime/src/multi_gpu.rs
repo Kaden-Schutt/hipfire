@@ -728,6 +728,71 @@ fn resolve_device_ids(n_devices: usize) -> HipResult<Vec<i32>> {
     Ok((0..n_devices as i32).collect())
 }
 
+/// Pure resolution of a single primary device id from the visible device
+/// `count`, an optional `HIPFIRE_DEVICES` value, and an optional explicit
+/// override. Returns the chosen id plus an optional warning the caller should
+/// surface (kept side-effect-free so it is unit-testable without HIP).
+///
+/// Precedence: explicit override → first `HIPFIRE_DEVICES` id → device 0. With
+/// more than one device visible and nothing specified, device 0 is chosen and a
+/// warning is returned so the operator knows a specific GPU was not requested.
+pub fn resolve_primary_device_id(
+    count: i32,
+    hipfire_devices: Option<&str>,
+    explicit: Option<i32>,
+) -> HipResult<(i32, Option<String>)> {
+    if count <= 0 {
+        return Err(HipError::new(0, "no ROCm/HIP GPU devices found"));
+    }
+    let validate = |id: i32| -> HipResult<i32> {
+        if id < 0 || id >= count {
+            Err(HipError::new(
+                0,
+                &format!("device id {id} out of range (count={count})"),
+            ))
+        } else {
+            Ok(id)
+        }
+    };
+    if let Some(id) = explicit {
+        return Ok((validate(id)?, None));
+    }
+    if let Some(first) = hipfire_devices
+        .and_then(|s| s.split(',').map(str::trim).find(|p| !p.is_empty()).map(str::to_string))
+    {
+        let id = first
+            .parse::<i32>()
+            .map_err(|e| HipError::new(0, &format!("HIPFIRE_DEVICES parse: {e}")))?;
+        return Ok((validate(id)?, None));
+    }
+    if count == 1 {
+        return Ok((0, None));
+    }
+    Ok((
+        0,
+        Some(format!(
+            "{count} GPUs visible and no device specified; using device 0. \
+             Set HIPFIRE_DEVICES or pass --rocm-device-id to choose a specific GPU."
+        )),
+    ))
+}
+
+/// Resolve the single primary GPU device id to use, querying HIP for the visible
+/// device count and honoring `HIPFIRE_DEVICES` / `HIP_VISIBLE_DEVICES` plus an
+/// optional explicit override. Emits a warning to stderr when multiple devices
+/// are visible and none was specified. This is the shared entry point both the
+/// AR daemon launch and the diffusion path use so they target the same device.
+pub fn resolve_primary_device(explicit: Option<i32>) -> HipResult<i32> {
+    let hip = hip_bridge::HipRuntime::load()?;
+    let count = hip.device_count()?;
+    let (id, warning) =
+        resolve_primary_device_id(count, crate::config::get().devices.as_deref(), explicit)?;
+    if let Some(warning) = warning {
+        eprintln!("[hipfire] {warning}");
+    }
+    Ok(id)
+}
+
 fn construct_devices(ids: &[i32]) -> HipResult<Vec<Gpu>> {
     let mut devices = Vec::with_capacity(ids.len());
     for &id in ids {
@@ -795,6 +860,42 @@ fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_primary_device_single_is_silent() {
+        assert_eq!(resolve_primary_device_id(1, None, None).unwrap(), (0, None));
+    }
+
+    #[test]
+    fn resolve_primary_device_multi_warns_and_picks_first() {
+        let (id, warning) = resolve_primary_device_id(4, None, None).unwrap();
+        assert_eq!(id, 0);
+        assert!(warning.unwrap().contains("4 GPUs"));
+    }
+
+    #[test]
+    fn resolve_primary_device_explicit_override_is_silent() {
+        assert_eq!(resolve_primary_device_id(4, None, Some(2)).unwrap(), (2, None));
+    }
+
+    #[test]
+    fn resolve_primary_device_honors_hipfire_devices_first_id() {
+        assert_eq!(
+            resolve_primary_device_id(4, Some(" 2 , 3 "), None).unwrap(),
+            (2, None)
+        );
+    }
+
+    #[test]
+    fn resolve_primary_device_no_devices_errors() {
+        assert!(resolve_primary_device_id(0, None, None).is_err());
+    }
+
+    #[test]
+    fn resolve_primary_device_out_of_range_errors() {
+        assert!(resolve_primary_device_id(2, None, Some(5)).is_err());
+        assert!(resolve_primary_device_id(2, Some("9"), None).is_err());
+    }
 
     #[test]
     fn uniform_split_basic() {

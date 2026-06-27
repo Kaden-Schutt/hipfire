@@ -232,8 +232,8 @@ env.setdefault("HIPFIRE_NO_PID_FILE", "1")
 
 custom_cmd = os.environ.get("HIPFIRE_DIFFUSION_SDAPI_SMOKE_CMD")
 cargo_features = os.environ.get("HIPFIRE_DIFFUSION_SDAPI_SMOKE_CARGO_FEATURES", "").strip()
-if rocm_device_id is not None and not cargo_features and not custom_cmd:
-    cargo_features = "rocm"
+# hipfire is HIP/ROCm-first: the GPU path is always compiled, so no cargo feature
+# is needed to exercise it. cargo_features stays an opt-in passthrough.
 release_bin = os.path.join(root, "target", "release", "hipfire")
 if custom_cmd:
     cmd = shlex.split(custom_cmd)

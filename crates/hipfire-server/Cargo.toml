@@ -13,7 +13,6 @@ admin-ui-embed = ["dep:rust-embed"]
 # Embed the prebuilt Leptos chat UI (crates/hipfire-chat-ui/dist) into the
 # binary. OFF by default so normal native checks do not need a wasm toolchain.
 chat-ui-embed = ["dep:rust-embed"]
-rocm = ["hipfire-diffusion/rocm"]
 
 [dependencies]
 axum = { version = "0.8", features = ["macros", "multipart"] }
@@ -37,6 +36,7 @@ hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
 hipfire-lock = { path = "../hipfire-lock" }
 hipfire-generate = { path = "../hipfire-generate" }
 hipfire-diffusion = { path = "../hipfire-diffusion" }
+hipfire-runtime = { path = "../hipfire-runtime", default-features = false }
 hipfire-model = { path = "../hipfire-model" }
 hipfire-operator = { path = "../hipfire-operator" }
 hipfire-prompt = { path = "../hipfire-prompt" }
@@ -45,5 +45,4 @@ hipfire-state = { path = "../hipfire-state" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [dev-dependencies]
-hipfire-runtime = { path = "../hipfire-runtime", default-features = false }
 tower = "0.5"
