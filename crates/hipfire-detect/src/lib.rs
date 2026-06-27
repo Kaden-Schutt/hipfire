@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 pub mod attractor;
 pub mod eos_immediate;
 pub mod ngram;
+pub mod parity;
 pub mod report;
 pub mod self_check;
 pub mod special_leak;

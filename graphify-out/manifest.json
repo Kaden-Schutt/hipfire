@@ -575,8 +575,8 @@
     "semantic_hash": ""
   },
   "crates/hipfire-detect/src/lib.rs": {
-    "mtime": 1781713177.727946,
-    "ast_hash": "3b0c6486ccbd8bd05b555aa96ec40bf0",
+    "mtime": 1782555202.5841832,
+    "ast_hash": "1ec7cae2d23b7baceec6d71e7e756042",
     "semantic_hash": ""
   },
   "crates/hipfire-detect/src/ngram.rs": {
@@ -1160,8 +1160,8 @@
     "semantic_hash": ""
   },
   "crates/hipfire-runtime/src/env_docs.rs": {
-    "mtime": 1782550925.735517,
-    "ast_hash": "682d2b01d3dddfd8ac4eb2e08990cf8b",
+    "mtime": 1782551372.7532063,
+    "ast_hash": "619500ac7d67a8c1a88c30ecd1d67662",
     "semantic_hash": ""
   },
   "crates/hipfire-runtime/src/eos_filter.rs": {
@@ -5785,8 +5785,13 @@
     "semantic_hash": ""
   },
   "crates/hipfire-cli/src/commands/detect.rs": {
-    "mtime": 1782550622.325258,
-    "ast_hash": "05e592d0dfc7e9a27d0e79638d04725a",
+    "mtime": 1782555227.1020114,
+    "ast_hash": "9eab6ba43e80a1875cefde40b18ea3d7",
+    "semantic_hash": ""
+  },
+  "crates/hipfire-detect/src/parity.rs": {
+    "mtime": 1782555198.5728843,
+    "ast_hash": "4f1e49241afe00d4452f52d385b748ac",
     "semantic_hash": ""
   }
 }

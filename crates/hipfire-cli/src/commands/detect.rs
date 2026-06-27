@@ -24,11 +24,12 @@
 use clap::Args;
 use hipfire_detect::{
     attractor::{AttractorFirst128, AttractorLast128, LongStateCollapse},
-    DetectorBank, Event, Severity, Verdict,
+    parity, DetectorBank, Event, Severity, Verdict,
 };
 use regex::Regex;
 use serde_json::{json, Value};
 use std::io::Read;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Source {
@@ -55,9 +56,24 @@ pub struct DetectArgs {
     /// command is a drop-in for the always-exit-0 Python it replaces.
     #[arg(long)]
     exit_code: bool,
+
+    /// Parity mode: file holding the AR-baseline run output (its
+    /// `AR tokens:` line). Requires --parity-dflash. When both are set the
+    /// command compares the two streams instead of reading stdin.
+    #[arg(long, requires = "parity_dflash")]
+    parity_ar: Option<PathBuf>,
+
+    /// Parity mode: file holding the DFlash run output (its `DFlash tokens:`
+    /// line). Requires --parity-ar.
+    #[arg(long, requires = "parity_ar")]
+    parity_dflash: Option<PathBuf>,
 }
 
 pub fn run(args: DetectArgs) -> anyhow::Result<()> {
+    if let (Some(ar_path), Some(df_path)) = (&args.parity_ar, &args.parity_dflash) {
+        return run_parity(ar_path, df_path, args.exit_code);
+    }
+
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
 
@@ -144,6 +160,34 @@ fn finish(ok: bool, exit_code: bool) -> anyhow::Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// AR vs DFlash token-parity comparison (replaces the gate's PARITY_PY). Reads
+/// the `AR tokens:` line from `ar_path` and the `DFlash tokens:` line from
+/// `df_path`, then reports exact-equality with a first-mismatch window.
+fn run_parity(ar_path: &std::path::Path, df_path: &std::path::Path, exit_code: bool) -> anyhow::Result<()> {
+    // Match PARITY_PY: read bytes, lossy-decode, grep the labelled line.
+    let ar_txt = String::from_utf8_lossy(&std::fs::read(ar_path)?).into_owned();
+    let df_txt = String::from_utf8_lossy(&std::fs::read(df_path)?).into_owned();
+
+    let ar = match parse_token_line(&ar_txt, Source::Ar) {
+        Some(v) => v,
+        None => {
+            emit(&json!({ "ok": false, "reason": "missing_ar_tokens" }));
+            return finish(false, exit_code);
+        }
+    };
+    let df = match parse_token_line(&df_txt, Source::Dflash) {
+        Some(v) => v,
+        None => {
+            emit(&json!({ "ok": false, "reason": "missing_dflash_tokens" }));
+            return finish(false, exit_code);
+        }
+    };
+
+    let report = parity::compare(&ar, &df);
+    emit(&serde_json::to_value(&report).expect("serialize parity report"));
+    finish(report.ok(), exit_code)
 }
 
 fn emit(v: &Value) {

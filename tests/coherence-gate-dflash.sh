@@ -300,43 +300,8 @@ if [ ! -x "$HIPFIRE_BIN" ] && ! command -v "$HIPFIRE_BIN" >/dev/null 2>&1; then
     HIPFIRE_BIN="./target/release/hipfire"
 fi
 
-PARITY_PY=$(cat <<'PYEOF'
-import sys, re, json
-if len(sys.argv) != 3:
-    print(json.dumps({"ok": False, "reason": "usage"}))
-    sys.exit(0)
-def tokens(path, label):
-    out = open(path, "rb").read().decode("utf-8", "replace")
-    m = re.search(rf"{label} tokens: \[([^\]]+)\]", out)
-    if not m:
-        return None
-    return [int(x) for x in m.group(1).split(",") if x.strip()]
-ar = tokens(sys.argv[1], "AR")
-df = tokens(sys.argv[2], "DFlash")
-if ar is None:
-    print(json.dumps({"ok": False, "reason": "missing_ar_tokens"}))
-elif df is None:
-    print(json.dumps({"ok": False, "reason": "missing_dflash_tokens"}))
-elif ar == df:
-    print(json.dumps({"ok": True, "tokens": len(df)}))
-else:
-    first = next((i for i, (a, d) in enumerate(zip(ar, df)) if a != d), min(len(ar), len(df)))
-    lo = max(0, first - 4)
-    hi = min(max(len(ar), len(df)), first + 5)
-    print(json.dumps({
-        "ok": False,
-        "reason": "token_mismatch",
-        "first_mismatch": first,
-        "ar_len": len(ar),
-        "dflash_len": len(df),
-        "ar_token": ar[first] if first < len(ar) else None,
-        "dflash_token": df[first] if first < len(df) else None,
-        "window_start": lo,
-        "ar_window": ar[lo:min(hi, len(ar))],
-        "dflash_window": df[lo:min(hi, len(df))],
-    }))
-PYEOF
-)
+# AR↔DFlash token parity now lives in Rust (`hipfire-detect::parity`), run via
+# `hipfire detect --parity-ar <ar_file> --parity-dflash <dflash_file>`.
 
 ROLLBACK_REPLAY_PY=$(cat <<'PYEOF'
 import sys, re, json
@@ -2085,7 +2050,7 @@ for entry in "${tests[@]}"; do
         if [ "$ar_ec" -ne 0 ] || [ -n "$ar_panic" ]; then
             parity="{\"ok\": false, \"reason\": \"ar_run_failed\", \"exit\": $ar_ec}"
         else
-            parity=$(python3 -c "$PARITY_PY" "$ar_out_file" "$out_file")
+            parity=$("$HIPFIRE_BIN" detect --parity-ar "$ar_out_file" --parity-dflash "$out_file")
         fi
     fi
 
