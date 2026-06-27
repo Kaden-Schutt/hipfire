@@ -2699,7 +2699,7 @@ pub(crate) fn group_norm_nchw_resident(
     groups: usize,
     eps: f32,
 ) -> DiffusionResult<rdna_compute::GpuTensor> {
-    let [_batch, channels, height, width] = resident_dims4(&input.shape, "group_norm input")?;
+    let [batch, channels, height, width] = resident_dims4(&input.shape, "group_norm input")?;
     if groups == 0 || channels % groups != 0 {
         return Err(DiffusionError::InvalidMetadata(format!(
             "group_norm channels {channels} not divisible by groups {groups}"
@@ -2717,29 +2717,62 @@ pub(crate) fn group_norm_nchw_resident(
     let weight_ptr = cache.resident_ptr(gpu, weight)?;
     let bias_ptr = cache.resident_ptr(gpu, bias)?;
     let output = alloc_resident_f32(gpu, &input.shape)?;
-    let mut kernargs = hip_bridge::KernargBlob::new();
-    kernargs.push_ptr(input.buf.as_ptr());
-    kernargs.push_ptr(weight_ptr);
-    kernargs.push_ptr(bias_ptr);
-    kernargs.push_ptr(output.buf.as_ptr());
-    kernargs.push_i32(i32_kernel_dim("group_norm output elements", output_elements)?);
-    kernargs.push_i32(i32_kernel_dim("group_norm channels", channels)?);
-    kernargs.push_i32(i32_kernel_dim("group_norm height", height)?);
-    kernargs.push_i32(i32_kernel_dim("group_norm width", width)?);
-    kernargs.push_i32(i32_kernel_dim("group_norm groups", groups)?);
-    kernargs.push_f32(eps);
-    kernargs.pad_to(16);
-    let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+    if output_elements == 0 {
+        return Ok(output);
+    }
+    // Two-pass: a wave-per-group reduction computes mean/inv_std (O(N)), then an
+    // elementwise pass applies the affine transform.
+    let bg = batch.checked_mul(groups).ok_or_else(|| {
+        DiffusionError::InvalidMetadata("group_norm batch*groups overflows".to_string())
+    })?;
+    let mean = alloc_resident_f32(gpu, &[bg])?;
+    let inv_std = alloc_resident_f32(gpu, &[bg])?;
+    let mut stats_args = hip_bridge::KernargBlob::new();
+    stats_args.push_ptr(input.buf.as_ptr());
+    stats_args.push_ptr(mean.buf.as_ptr());
+    stats_args.push_ptr(inv_std.buf.as_ptr());
+    stats_args.push_i32(i32_kernel_dim("group_norm channels", channels)?);
+    stats_args.push_i32(i32_kernel_dim("group_norm height", height)?);
+    stats_args.push_i32(i32_kernel_dim("group_norm width", width)?);
+    stats_args.push_i32(i32_kernel_dim("group_norm groups", groups)?);
+    stats_args.push_f32(eps);
+    stats_args.pad_to(16);
     ensure_and_launch_diffusion_kernel(
         gpu,
-        "diffusion_group_norm_nchw_f32",
-        DIFFUSION_GROUP_NORM_HIP_SRC,
-        "diffusion_group_norm_nchw_f32",
-        grid,
+        "diffusion_group_norm_stats_f32",
+        DIFFUSION_GROUP_NORM_STATS_HIP_SRC,
+        "diffusion_group_norm_stats_f32",
+        [bg as u32, 1, 1],
+        [32, 1, 1],
+        0,
+        &mut stats_args,
+    )?;
+    let mut apply_args = hip_bridge::KernargBlob::new();
+    apply_args.push_ptr(input.buf.as_ptr());
+    apply_args.push_ptr(mean.buf.as_ptr());
+    apply_args.push_ptr(inv_std.buf.as_ptr());
+    apply_args.push_ptr(weight_ptr);
+    apply_args.push_ptr(bias_ptr);
+    apply_args.push_ptr(output.buf.as_ptr());
+    apply_args.push_i32(i32_kernel_dim("group_norm output elements", output_elements)?);
+    apply_args.push_i32(i32_kernel_dim("group_norm channels", channels)?);
+    apply_args.push_i32(i32_kernel_dim("group_norm height", height)?);
+    apply_args.push_i32(i32_kernel_dim("group_norm width", width)?);
+    apply_args.push_i32(i32_kernel_dim("group_norm groups", groups)?);
+    apply_args.pad_to(16);
+    let apply_grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        "diffusion_group_norm_apply_f32",
+        DIFFUSION_GROUP_NORM_APPLY_HIP_SRC,
+        "diffusion_group_norm_apply_f32",
+        apply_grid,
         [256, 1, 1],
         0,
-        &mut kernargs,
+        &mut apply_args,
     )?;
+    free_resident(gpu, mean)?;
+    free_resident(gpu, inv_std)?;
     Ok(output)
 }
 

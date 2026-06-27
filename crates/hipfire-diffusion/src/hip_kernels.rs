@@ -493,6 +493,98 @@ extern "C" __global__ void diffusion_group_norm_nchw_f32(
 }
 "#;
 
+// Phase 3 — two-pass group-norm.
+//
+// The single-kernel `diffusion_group_norm_nchw_f32` above recomputes the full
+// per-group mean and variance reduction *inside every output thread*, i.e.
+// O(N * group_size) ~ O((H*W)^2) per call. At VAE-decode resolutions that
+// dominates wall-clock. These two kernels split it into an O(N) reduction
+// (one wave per (batch, group), pure register + wave-shuffle, no LDS — so it
+// is wedge-safe on gfx1103) followed by an O(N) elementwise apply.
+
+pub(crate) const DIFFUSION_GROUP_NORM_STATS_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+// One wave (32 lanes) per (batch, group). A group's channels are contiguous in
+// NCHW within a batch, so its elements are one contiguous span. Two passes over
+// that span (mean, then sum of squared deviations) match the CPU reference
+// formula and avoid catastrophic cancellation.
+extern "C" __global__ void diffusion_group_norm_stats_f32(
+    const float* input,
+    float* mean_out,
+    float* inv_std_out,
+    int channels,
+    int height,
+    int width,
+    int groups,
+    float eps
+) {
+    int bg = blockIdx.x;                 // 0 .. batch*groups - 1
+    int group = bg % groups;
+    int b = bg / groups;
+    int cpg = channels / groups;
+    long hw = (long)height * (long)width;
+    long group_size = (long)cpg * hw;
+    long base = ((long)b * channels + (long)group * cpg) * hw;
+    int lane = threadIdx.x;              // 0 .. 31
+
+    float s = 0.0f;
+    for (long i = lane; i < group_size; i += 32) {
+        s += input[base + i];
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        s += __shfl_down(s, off);
+    }
+    float total = __shfl(s, 0);
+    float mean = total / (float)group_size;
+
+    float vs = 0.0f;
+    for (long i = lane; i < group_size; i += 32) {
+        float d = input[base + i] - mean;
+        vs += d * d;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        vs += __shfl_down(vs, off);
+    }
+    if (lane == 0) {
+        mean_out[bg] = mean;
+        inv_std_out[bg] = rsqrtf(vs / (float)group_size + eps);
+    }
+}
+"#;
+
+pub(crate) const DIFFUSION_GROUP_NORM_APPLY_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void diffusion_group_norm_apply_f32(
+    const float* input,
+    const float* mean_in,
+    const float* inv_std_in,
+    const float* weight,
+    const float* bias,
+    float* output,
+    int total_elements,
+    int channels,
+    int height,
+    int width,
+    int groups
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) {
+        return;
+    }
+    long hw = (long)height * (long)width;
+    int c = (int)((idx / hw) % channels);
+    int b = (int)(idx / ((long)channels * hw));
+    int cpg = channels / groups;
+    int group = c / cpg;
+    int bg = b * groups + group;
+    float mean = mean_in[bg];
+    float inv_std = inv_std_in[bg];
+    output[idx] = (input[idx] - mean) * inv_std * weight[c] + bias[c];
+}
+"#;
+
 pub(crate) const DIFFUSION_SILU_HIP_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 
