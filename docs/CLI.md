@@ -16,6 +16,7 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire lock acquire`↴](#hipfire-lock-acquire)
 * [`hipfire lock release`↴](#hipfire-lock-release)
 * [`hipfire lock status`↴](#hipfire-lock-status)
+* [`hipfire detect`↴](#hipfire-detect)
 * [`hipfire diffusion`↴](#hipfire-diffusion)
 * [`hipfire diffusion import`↴](#hipfire-diffusion-import)
 * [`hipfire diffusion inspect`↴](#hipfire-diffusion-inspect)
@@ -51,6 +52,7 @@ hipfire LLM inference CLI
 * `collect-artifacts` — Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one model load
 * `repack` — Reshuffle a canonical .hfq into an arch-optimal layout (<model>.<arch>.hfq)
 * `lock` — GPU resource lock for multi-agent coordination (acquire/release/status)
+* `detect` — Run observational coherence detectors over a captured token stream
 * `diffusion` — Import and inspect diffusion models stored as .hfq artifacts
 * `admin` — Query the running hipfire admin API for scripts and agents
 
@@ -106,7 +108,7 @@ Run the quant admission/model evaluation harness
 
 ###### **Arguments:**
 
-* `<ARGS>` — Arguments forwarded to hipfire-eval
+* `<ARGS>` — Arguments forwarded to hipfire-eval. Use positional <model>; common flags include --compare, --reference, --battery, --suite, --benchmark, --runs, --force, and --regenerate
 
 
 
@@ -198,6 +200,44 @@ Print lock status: "gpu is free" or "gpu BUSY: <holder>"
 
 
 
+## `hipfire detect`
+
+Run observational coherence detectors over a captured token stream
+
+Reads the demo/daemon stdout on stdin (the `DFlash tokens: [..]` / `AR tokens: [..]` line) and emits a JSON verdict with `ok` / `soft_warn`. Front-end for the `hipfire-detect` DetectorBank; replaces the Path-A token-attractor Python heredocs in the coherence gates.
+
+**Usage:** `hipfire detect [OPTIONS]`
+
+###### **Options:**
+
+* `--source <SOURCE>` — Which `tokens: [..]` line to read when the stream contains both
+
+  Default value: `auto`
+
+  Possible values:
+  - `auto`:
+    Prefer the `DFlash tokens:` line, fall back to `AR tokens:`
+  - `dflash`:
+    Read only the `DFlash tokens:` line
+  - `ar`:
+    Read only the `AR tokens:` line
+
+* `--path-a` — Run the full Path-A token-attractor family (first-128 + last-128 + long-state collapse) instead of just the first-128 window
+* `--exit-code` — Exit non-zero when a hard fail is detected. Off by default so the command is a drop-in for the always-exit-0 Python it replaces
+* `--parity-ar <PARITY_AR>` — Parity mode: file holding the AR-baseline run output (its `AR tokens:` line). Requires --parity-dflash. When both are set the command compares the two streams instead of reading stdin
+* `--parity-dflash <PARITY_DFLASH>` — Parity mode: file holding the DFlash run output (its `DFlash tokens:` line). Requires --parity-ar
+* `--rollback <ROLLBACK>` — Rollback mode: parse a single-line replay/verify stat summary instead of running detectors. Reads `--file` if given, else stdin
+
+  Possible values:
+  - `replay`:
+    Parse the `rollback_parity:` replay-count line
+  - `verify-graph`:
+    Parse the `verify_graph:` count line
+
+* `--file <FILE>` — Input file for `--rollback` mode (defaults to stdin when omitted)
+
+
+
 ## `hipfire diffusion`
 
 Import and inspect diffusion models stored as .hfq artifacts
@@ -266,7 +306,7 @@ Inspect a diffusion .hfq artifact and print its server-facing summary
 
 Plan HIP diffusion buffers and optionally run a ROCm device preflight
 
-The preflight command prints a deterministic memory plan for the requested resolution, batch, scheduler, and prompt set. Builds compiled with `--features rocm` also initialize the selected HIP device, allocate the planned buffer classes, run a host/device roundtrip probe, and launch currently covered diffusion kernel probes against CPU references.
+The preflight command prints a deterministic memory plan for the requested resolution, batch, scheduler, and prompt set. When a `--device-id` is given it also initializes the selected HIP device, allocates the planned buffer classes, runs a host/device roundtrip probe, and launches the diffusion kernel probes against CPU references.
 
 **Usage:** `hipfire diffusion preflight [OPTIONS] --model <MODEL>`
 
@@ -301,7 +341,7 @@ The preflight command prints a deterministic memory plan for the requested resol
 * `--batch-size <BATCH_SIZE>` — Batch size when a single prompt is supplied
 
   Default value: `1`
-* `--device-id <DEVICE_ID>` — ROCm device id to preflight when built with --features rocm
+* `--device-id <DEVICE_ID>` — ROCm device id to initialize and preflight (omit for plan-only)
 
   Default value: `0`
 
@@ -357,7 +397,7 @@ With `--enable-hr`, the command first generates the requested base batch, decode
 * `--hr-denoising-strength <HR_DENOISING_STRENGTH>` — Img2img denoising strength for the high-res second pass
 
   Default value: `0.75`
-* `--rocm-device-id <ROCM_DEVICE_ID>` — Use ROCm for currently GPU-routed generation stages on this device id
+* `--rocm-device-id <ROCM_DEVICE_ID>` — Use ROCm for currently GPU-routed generation stages on this device id ROCm device to generate on. Omit to auto-detect (a single GPU is used silently; the first of several with a warning). The CPU reference oracle is opt-in via the HIPFIRE_DIFFUSION_CPU_REFERENCE environment variable
 
 
 
@@ -398,7 +438,7 @@ Generate PNG images from init images with a diffusion .hfq artifact
 * `--denoising-strength <DENOISING_STRENGTH>` — Img2img denoising strength in [0, 1]
 
   Default value: `0.75`
-* `--rocm-device-id <ROCM_DEVICE_ID>` — Use ROCm for currently GPU-routed generation stages on this device id
+* `--rocm-device-id <ROCM_DEVICE_ID>` — Use ROCm for currently GPU-routed generation stages on this device id ROCm device to generate on. Omit to auto-detect (a single GPU is used silently; the first of several with a warning). The CPU reference oracle is opt-in via the HIPFIRE_DIFFUSION_CPU_REFERENCE environment variable
 
 
 
@@ -445,7 +485,7 @@ Run an end-to-end diffusion admission smoke and validate output PNGs
 * `--denoising-strength <DENOISING_STRENGTH>` — Img2img denoising strength
 
   Default value: `0.5`
-* `--rocm-device-id <ROCM_DEVICE_ID>` — Use ROCm for currently GPU-routed generation stages on this device id
+* `--rocm-device-id <ROCM_DEVICE_ID>` — Use ROCm for currently GPU-routed generation stages on this device id ROCm device to generate on. Omit to auto-detect (a single GPU is used silently; the first of several with a warning). The CPU reference oracle is opt-in via the HIPFIRE_DIFFUSION_CPU_REFERENCE environment variable
 * `--txt2img-only` — Only run txt2img; skip the img2img leg
 * `--skip-masked-img2img` — Skip the masked img2img leg
 
