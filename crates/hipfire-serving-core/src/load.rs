@@ -1979,15 +1979,42 @@ pub fn load_model(
         use hipfire_runtime::arch::Architecture;
         let config = <Llama as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
         let weights = <Llama as Architecture>::load_weights(&mut hfq, &config, gpu)?;
-        eprintln!("  KV cache: Q8");
-        let kv = kv::KvCache::new_gpu_q8(
-            gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            max_seq,
-        )
-        .map_err(|e| format!("{e}"))?;
+        // Honor the requested kv_mode. LLaMA-family head_dim is typically 64/128,
+        // so the rotated-K asym{2,3,4} caches (head_dim ∈ {128,256}) do not apply
+        // here; surface that as an explicit error rather than silently building a
+        // Q8 cache under an asym label. Supported menu: fp32 | q8.
+        let kv = match kv_mode.as_str() {
+            "fp32" | "f32" => {
+                eprintln!("  KV cache: FP32");
+                kv::KvCache::new_gpu(
+                    gpu,
+                    config.n_layers,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    max_seq,
+                )
+                .map_err(|e| format!("{e}"))?
+            }
+            "q8" | "int8" | "auto" | "" => {
+                eprintln!("  KV cache: Q8");
+                kv::KvCache::new_gpu_q8(
+                    gpu,
+                    config.n_layers,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    max_seq,
+                )
+                .map_err(|e| format!("{e}"))?
+            }
+            other => {
+                return Err(format!(
+                    "kv_mode '{other}' is not supported for the LLaMA arch \
+                     (head_dim={}); rotated-K asym{{2,3,4}} require head_dim ∈ {{128,256}}. \
+                     Use fp32 or q8.",
+                    config.head_dim
+                ));
+            }
+        };
         let scratch = <Llama as Architecture>::new_state(gpu, &config)?;
         // P3.2: assemble the ServingBackend (owns config/weights/scratch/kv); the
         // separate llama_* fields stay None. (HFQ load path — mirrors the

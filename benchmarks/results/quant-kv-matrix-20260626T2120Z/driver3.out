@@ -1,0 +1,236 @@
+[03:05:08] === PHASE 1: non-Hessian formats ===
+[03:05:08] >>> MODEL LFM2.5-350M.bf16.hfq (arch=lfm2 kv='q8')
+[03:05:08] skip model=LFM2.5-350M.bf16.hfq fmt=q8f16 (all kv done)
+[03:05:08] skip model=LFM2.5-350M.bf16.hfq fmt=hfq4 (all kv done)
+[03:05:08] skip model=LFM2.5-350M.bf16.hfq fmt=hfq6 (all kv done)
+[03:05:08] skip model=LFM2.5-350M.bf16.hfq fmt=mq3 (all kv done)
+[03:05:08] skip model=LFM2.5-350M.bf16.hfq fmt=mq4 (all kv done)
+[03:05:08] skip model=LFM2.5-350M.bf16.hfq fmt=mq6 (all kv done)
+[03:05:08] skip model=LFM2.5-350M.bf16.hfq fmt=oq4 (all kv done)
+[03:05:08] skip model=LFM2.5-350M.bf16.hfq fmt=oq8 (all kv done)
+[03:05:08] >>> MODEL qwen3.5-0.8b.bf16.hfq (arch=qwen kv='q8 asym4 asym3 asym2')
+[03:05:08] skip model=qwen3.5-0.8b.bf16.hfq fmt=q8f16 (all kv done)
+[03:05:08] skip model=qwen3.5-0.8b.bf16.hfq fmt=hfq4 (all kv done)
+[03:05:08] skip model=qwen3.5-0.8b.bf16.hfq fmt=hfq6 (all kv done)
+[03:05:08] skip model=qwen3.5-0.8b.bf16.hfq fmt=mq3 (all kv done)
+[03:05:08] skip model=qwen3.5-0.8b.bf16.hfq fmt=mq4 (all kv done)
+[03:05:08] skip model=qwen3.5-0.8b.bf16.hfq fmt=mq6 (all kv done)
+[03:05:08] skip model=qwen3.5-0.8b.bf16.hfq fmt=oq4 (all kv done)
+[03:05:08] skip model=qwen3.5-0.8b.bf16.hfq fmt=oq8 (all kv done)
+[03:05:08] >>> MODEL llama-3.2-1b-instruct.bf16.hfq (arch=llama kv='q8 fp32')
+[03:05:08] skip model=llama-3.2-1b-instruct.bf16.hfq fmt=q8f16 (all kv done)
+[03:05:08] skip model=llama-3.2-1b-instruct.bf16.hfq fmt=hfq4 (all kv done)
+[03:05:08] skip model=llama-3.2-1b-instruct.bf16.hfq fmt=hfq6 (all kv done)
+[03:05:08] skip model=llama-3.2-1b-instruct.bf16.hfq fmt=mq3 (all kv done)
+[03:05:08] skip model=llama-3.2-1b-instruct.bf16.hfq fmt=mq4 (all kv done)
+[03:05:08] skip model=llama-3.2-1b-instruct.bf16.hfq fmt=mq6 (all kv done)
+[03:05:08] skip model=llama-3.2-1b-instruct.bf16.hfq fmt=oq4 (all kv done)
+[03:05:08] skip model=llama-3.2-1b-instruct.bf16.hfq fmt=oq8 (all kv done)
+[03:05:08] >>> MODEL qwen3.5-2b.bf16.hfq (arch=qwen kv='q8 asym4 asym3 asym2')
+[03:05:08] skip model=qwen3.5-2b.bf16.hfq fmt=q8f16 (all kv done)
+[03:05:08] skip model=qwen3.5-2b.bf16.hfq fmt=hfq4 (all kv done)
+[03:05:08] skip model=qwen3.5-2b.bf16.hfq fmt=hfq6 (all kv done)
+[03:05:08] skip model=qwen3.5-2b.bf16.hfq fmt=mq3 (all kv done)
+[03:05:08] skip model=qwen3.5-2b.bf16.hfq fmt=mq4 (all kv done)
+[03:05:08] skip model=qwen3.5-2b.bf16.hfq fmt=mq6 (all kv done)
+[03:05:08] skip model=qwen3.5-2b.bf16.hfq fmt=oq4 (all kv done)
+[03:05:08] skip model=qwen3.5-2b.bf16.hfq fmt=oq8 (all kv done)
+[03:05:08] >>> MODEL qwen3.6-35b-a3b.bf16.hfq (arch=qwen kv='q8 asym4 asym3 asym2')
+[03:05:08] skip model=qwen3.6-35b-a3b.bf16.hfq fmt=q8f16 (all kv done)
+[03:05:08] skip model=qwen3.6-35b-a3b.bf16.hfq fmt=hfq4 (all kv done)
+[03:05:08] skip model=qwen3.6-35b-a3b.bf16.hfq fmt=hfq6 (all kv done)
+[03:05:08] skip model=qwen3.6-35b-a3b.bf16.hfq fmt=mq3 (all kv done)
+[03:05:08] skip model=qwen3.6-35b-a3b.bf16.hfq fmt=mq4 (all kv done)
+[03:05:08] skip model=qwen3.6-35b-a3b.bf16.hfq fmt=mq6 (all kv done)
+[03:05:08] skip model=qwen3.6-35b-a3b.bf16.hfq fmt=oq4 (all kv done)
+[03:05:08] skip model=qwen3.6-35b-a3b.bf16.hfq fmt=oq8 (all kv done)
+[03:05:08] >>> MODEL qwen3.5-4b.bf16.hfq (arch=qwen kv='q8 asym4 asym3 asym2')
+[03:05:08] skip model=qwen3.5-4b.bf16.hfq fmt=q8f16 (all kv done)
+[03:05:08] skip model=qwen3.5-4b.bf16.hfq fmt=hfq4 (all kv done)
+[03:05:08] skip model=qwen3.5-4b.bf16.hfq fmt=hfq6 (all kv done)
+[03:05:08] skip model=qwen3.5-4b.bf16.hfq fmt=mq3 (all kv done)
+[03:05:08] skip model=qwen3.5-4b.bf16.hfq fmt=mq4 (all kv done)
+[03:05:08] skip model=qwen3.5-4b.bf16.hfq fmt=mq6 (all kv done)
+[03:05:08] skip model=qwen3.5-4b.bf16.hfq fmt=oq4 (all kv done)
+[03:05:08] skip model=qwen3.5-4b.bf16.hfq fmt=oq8 (all kv done)
+[03:05:08] >>> MODEL qwen3.5-9b.bf16.hfq (arch=qwen kv='q8 asym4 asym3 asym2')
+[03:05:08] skip model=qwen3.5-9b.bf16.hfq fmt=q8f16 (all kv done)
+[03:05:08] skip model=qwen3.5-9b.bf16.hfq fmt=hfq4 (all kv done)
+[03:05:08] skip model=qwen3.5-9b.bf16.hfq fmt=hfq6 (all kv done)
+[03:05:08] skip model=qwen3.5-9b.bf16.hfq fmt=mq3 (all kv done)
+[03:05:08] skip model=qwen3.5-9b.bf16.hfq fmt=mq4 (all kv done)
+[03:05:08] skip model=qwen3.5-9b.bf16.hfq fmt=mq6 (all kv done)
+[03:05:08] skip model=qwen3.5-9b.bf16.hfq fmt=oq4 (all kv done)
+[03:05:08] skip model=qwen3.5-9b.bf16.hfq fmt=oq8 (all kv done)
+[03:05:08] >>> MODEL qwen3.6-27b.bf16.hfq (arch=qwen kv='q8 asym4 asym3 asym2')
+[03:05:08] skip model=qwen3.6-27b.bf16.hfq fmt=q8f16 (all kv done)
+[03:05:08] skip model=qwen3.6-27b.bf16.hfq fmt=hfq4 (all kv done)
+[03:05:08] skip model=qwen3.6-27b.bf16.hfq fmt=hfq6 (all kv done)
+[03:05:09] skip model=qwen3.6-27b.bf16.hfq fmt=mq3 (all kv done)
+[03:05:09] skip model=qwen3.6-27b.bf16.hfq fmt=mq4 (all kv done)
+[03:05:09] skip model=qwen3.6-27b.bf16.hfq fmt=mq6 (all kv done)
+[03:05:09] skip model=qwen3.6-27b.bf16.hfq fmt=oq4 (all kv done)
+[03:05:09] skip model=qwen3.6-27b.bf16.hfq fmt=oq8 (all kv done)
+[03:05:09] === PHASE 2: Hessian formats (collect-artifacts first) ===
+[03:05:09] >>> HESSIAN MODEL LFM2.5-350M.bf16.hfq
+[03:05:09] collect-artifacts: LFM2.5-350M.bf16.hfq -> LFM2.5-350M.calib.hfq
+[03:05:34] quantize: LFM2.5-350M.bf16.hfq -> oq4+ (free=74GB)
+[03:05:44]   bench: oq4+ kv=q8
+[03:05:45]     -> status=fail tok_s=0.0 decode= prefill_tok_s=
+[03:05:45] prune: /home/sadara/.hipfire/models/matrix/LFM2.5-350M.oq4+.hfq (213M)
+[03:05:45] quantize: LFM2.5-350M.bf16.hfq -> oq4++ (free=74GB)
+[03:06:59]   bench: oq4++ kv=q8
+[03:07:00]     -> status=fail tok_s=0.0 decode= prefill_tok_s=
+[03:07:00] prune: /home/sadara/.hipfire/models/matrix/LFM2.5-350M.oq4++.hfq (213M)
+[03:07:00] quantize: LFM2.5-350M.bf16.hfq -> oq8+ (free=74GB)
+[03:07:08]   bench: oq8+ kv=q8
+[03:07:10]     -> status=fail tok_s=0.0 decode= prefill_tok_s=
+[03:07:10] prune: /home/sadara/.hipfire/models/matrix/LFM2.5-350M.oq8+.hfq (350M)
+[03:07:10] quantize: LFM2.5-350M.bf16.hfq -> oq8++ (free=74GB)
+[03:08:24]   bench: oq8++ kv=q8
+[03:08:25]     -> status=pass tok_s=94.24 decode= prefill_tok_s=
+[03:08:25] prune: /home/sadara/.hipfire/models/matrix/LFM2.5-350M.oq8++.hfq (350M)
+[03:08:25] prune calib: /home/sadara/.hipfire/models/matrix/LFM2.5-350M.calib.hfq
+[03:08:25] >>> HESSIAN MODEL qwen3.5-0.8b.bf16.hfq
+[03:08:25] collect-artifacts: qwen3.5-0.8b.bf16.hfq -> qwen3.5-0.8b.calib.hfq
+[03:09:08] quantize: qwen3.5-0.8b.bf16.hfq -> oq4+ (free=74GB)
+[03:09:25]   bench: oq4+ kv=q8
+[03:09:38]     -> status=pass tok_s=49.3 decode=58.0 prefill_tok_s=1239.3
+[03:09:38]   bench: oq4+ kv=asym4
+[03:09:49]     -> status=pass tok_s=48.5 decode=57.0 prefill_tok_s=1218.9
+[03:09:49]   bench: oq4+ kv=asym3
+[03:10:00]     -> status=pass tok_s=49.9 decode=58.8 prefill_tok_s=1242.4
+[03:10:00]   bench: oq4+ kv=asym2
+[03:10:12]     -> status=pass tok_s=49.0 decode=57.5 prefill_tok_s=1242.9
+[03:10:12] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-0.8b.oq4+.hfq (514M)
+[03:10:12] quantize: qwen3.5-0.8b.bf16.hfq -> oq4++ (free=74GB)
+[03:11:45]   bench: oq4++ kv=q8
+[03:11:56]     -> status=pass tok_s=49.5 decode=58.2 prefill_tok_s=1242.2
+[03:11:56]   bench: oq4++ kv=asym4
+[03:12:08]     -> status=pass tok_s=48.9 decode=57.5 prefill_tok_s=1222.8
+[03:12:08]   bench: oq4++ kv=asym3
+[03:12:20]     -> status=pass tok_s=49.9 decode=58.8 prefill_tok_s=1239.1
+[03:12:20]   bench: oq4++ kv=asym2
+[03:12:32]     -> status=pass tok_s=48.8 decode=57.3 prefill_tok_s=1231.7
+[03:12:32] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-0.8b.oq4++.hfq (514M)
+[03:12:32] quantize: qwen3.5-0.8b.bf16.hfq -> oq8+ (free=74GB)
+[03:12:47]   bench: oq8+ kv=q8
+[03:13:08]     -> status=pass tok_s=11.3 decode=41.2 prefill_tok_s=58.5
+[03:13:08]   bench: oq8+ kv=asym4
+[03:13:29]     -> status=pass tok_s=11.2 decode=40.9 prefill_tok_s=58.1
+[03:13:29]   bench: oq8+ kv=asym3
+[03:13:49]     -> status=pass tok_s=11.4 decode=41.6 prefill_tok_s=59.2
+[03:13:49]   bench: oq8+ kv=asym2
+[03:14:11]     -> status=pass tok_s=11.2 decode=40.9 prefill_tok_s=58.0
+[03:14:11] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-0.8b.oq8+.hfq (752M)
+[03:14:11] quantize: qwen3.5-0.8b.bf16.hfq -> oq8++ (free=74GB)
+[03:15:43]   bench: oq8++ kv=q8
+[03:16:04]     -> status=pass tok_s=11.4 decode=41.3 prefill_tok_s=58.8
+[03:16:04]   bench: oq8++ kv=asym4
+[03:16:25]     -> status=pass tok_s=11.2 decode=40.9 prefill_tok_s=58.1
+[03:16:25]   bench: oq8++ kv=asym3
+[03:16:46]     -> status=pass tok_s=11.4 decode=41.5 prefill_tok_s=59.1
+[03:16:46]   bench: oq8++ kv=asym2
+[03:17:07]     -> status=pass tok_s=11.2 decode=40.7 prefill_tok_s=58.0
+[03:17:07] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-0.8b.oq8++.hfq (752M)
+[03:17:07] prune calib: /home/sadara/.hipfire/models/matrix/qwen3.5-0.8b.calib.hfq
+[03:17:07] >>> HESSIAN MODEL llama-3.2-1b-instruct.bf16.hfq
+[03:17:07] collect-artifacts: llama-3.2-1b-instruct.bf16.hfq -> llama-3.2-1b-instruct.calib.hfq
+[03:17:07] COLLECT FAIL: llama-3.2-1b-instruct.bf16.hfq (see llama-3.2-1b-instruct.calib.log)
+[03:17:07] >>> HESSIAN MODEL qwen3.5-2b.bf16.hfq
+[03:17:07] collect-artifacts: qwen3.5-2b.bf16.hfq -> qwen3.5-2b.calib.hfq
+[03:18:57] quantize: qwen3.5-2b.bf16.hfq -> oq4+ (free=73GB)
+[03:19:45]   bench: oq4+ kv=q8
+[03:20:02]     -> status=pass tok_s=23.1 decode=27.8 prefill_tok_s=514.6
+[03:20:02]   bench: oq4+ kv=asym4
+[03:20:23]     -> status=pass tok_s=22.9 decode=27.6 prefill_tok_s=510.4
+[03:20:23]   bench: oq4+ kv=asym3
+[03:20:38]     -> status=pass tok_s=23.1 decode=27.8 prefill_tok_s=503.2
+[03:20:38]   bench: oq4+ kv=asym2
+[03:20:54]     -> status=pass tok_s=22.8 decode=27.5 prefill_tok_s=503.0
+[03:20:54] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-2b.oq4+.hfq (1.2G)
+[03:20:54] quantize: qwen3.5-2b.bf16.hfq -> oq4++ (free=73GB)
+[03:28:26]   bench: oq4++ kv=q8
+[03:28:42]     -> status=pass tok_s=23.1 decode=27.8 prefill_tok_s=508.9
+[03:28:42]   bench: oq4++ kv=asym4
+[03:28:58]     -> status=pass tok_s=23.0 decode=27.6 prefill_tok_s=518.8
+[03:28:58]   bench: oq4++ kv=asym3
+[03:29:13]     -> status=pass tok_s=23.2 decode=27.9 prefill_tok_s=512.7
+[03:29:13]   bench: oq4++ kv=asym2
+[03:29:28]     -> status=pass tok_s=22.8 decode=27.5 prefill_tok_s=503.8
+[03:29:28] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-2b.oq4++.hfq (1.2G)
+[03:29:28] quantize: qwen3.5-2b.bf16.hfq -> oq8+ (free=73GB)
+[03:30:09]   bench: oq8+ kv=q8
+[03:30:49]     -> status=pass tok_s=4.9 decode=18.7 prefill_tok_s=25.2
+[03:30:49]   bench: oq8+ kv=asym4
+[03:31:26]     -> status=pass tok_s=4.9 decode=18.6 prefill_tok_s=24.9
+[03:31:26]   bench: oq8+ kv=asym3
+[03:32:03]     -> status=pass tok_s=4.8 decode=16.9 prefill_tok_s=25.1
+[03:32:03]   bench: oq8+ kv=asym2
+[03:32:44]     -> status=pass tok_s=3.6 decode=12.2 prefill_tok_s=19.2
+[03:32:44] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-2b.oq8+.hfq (1.9G)
+[03:32:44] quantize: qwen3.5-2b.bf16.hfq -> oq8++ (free=73GB)
+[03:40:16]   bench: oq8++ kv=q8
+[03:40:54]     -> status=pass tok_s=4.9 decode=18.7 prefill_tok_s=25.2
+[03:40:54]   bench: oq8++ kv=asym4
+[03:41:31]     -> status=pass tok_s=4.9 decode=18.7 prefill_tok_s=25.1
+[03:41:31]   bench: oq8++ kv=asym3
+[03:42:13]     -> status=pass tok_s=3.4 decode=11.1 prefill_tok_s=18.4
+[03:42:13]   bench: oq8++ kv=asym2
+[03:43:01]     -> status=pass tok_s=3.0 decode=10.0 prefill_tok_s=15.9
+[03:43:01] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-2b.oq8++.hfq (1.9G)
+[03:43:01] prune calib: /home/sadara/.hipfire/models/matrix/qwen3.5-2b.calib.hfq
+[03:43:01] >>> HESSIAN MODEL qwen3.6-35b-a3b.bf16.hfq
+[03:43:01] collect-artifacts: qwen3.6-35b-a3b.bf16.hfq -> qwen3.6-35b-a3b.calib.hfq
+[03:43:44] COLLECT FAIL: qwen3.6-35b-a3b.bf16.hfq (see qwen3.6-35b-a3b.calib.log)
+[03:43:44] >>> HESSIAN MODEL qwen3.5-4b.bf16.hfq
+[03:43:44] collect-artifacts: qwen3.5-4b.bf16.hfq -> qwen3.5-4b.calib.hfq
+[03:48:53] quantize: qwen3.5-4b.bf16.hfq -> oq4+ (free=70GB)
+[03:50:53]   bench: oq4+ kv=q8
+[03:51:26]     -> status=pass tok_s=11.7 decode=13.9 prefill_tok_s=273.5
+[03:51:26]   bench: oq4+ kv=asym4
+[03:51:49]     -> status=pass tok_s=11.6 decode=13.9 prefill_tok_s=259.3
+[03:51:49]   bench: oq4+ kv=asym3
+[03:52:10]     -> status=pass tok_s=11.7 decode=14.0 prefill_tok_s=273.6
+[03:52:10]   bench: oq4+ kv=asym2
+[03:52:33]     -> status=pass tok_s=11.6 decode=13.9 prefill_tok_s=269.6
+[03:52:33] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-4b.oq4+.hfq (2.4G)
+[03:52:33] quantize: qwen3.5-4b.bf16.hfq -> oq4++ (free=70GB)
+[04:19:41]   bench: oq4++ kv=q8
+[04:20:27]     -> status=pass tok_s=11.7 decode=13.9 prefill_tok_s=272.1
+[04:20:27]   bench: oq4++ kv=asym4
+[04:20:45]     -> status=fail tok_s= decode= prefill_tok_s=
+[04:20:45]   bench: oq4++ kv=asym3
+[04:21:08]     -> status=pass tok_s=11.7 decode=14.0 prefill_tok_s=267.5
+[04:21:08]   bench: oq4++ kv=asym2
+[04:21:31]     -> status=pass tok_s=11.7 decode=13.9 prefill_tok_s=265.8
+[04:21:31] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-4b.oq4++.hfq (2.4G)
+[04:21:31] quantize: qwen3.5-4b.bf16.hfq -> oq8+ (free=70GB)
+[04:23:15]   bench: oq8+ kv=q8
+[04:24:46]     -> status=pass tok_s=2.0 decode=7.5 prefill_tok_s=9.9
+[04:24:46]   bench: oq8+ kv=asym4
+[04:26:41]     -> status=pass tok_s=1.1 decode=4.3 prefill_tok_s=5.5
+[04:26:41]   bench: oq8+ kv=asym3
+[04:28:54]     -> status=pass tok_s=1.0 decode=3.9 prefill_tok_s=4.9
+[04:28:54]   bench: oq8+ kv=asym2
+[04:31:13]     -> status=pass tok_s=0.9 decode=3.9 prefill_tok_s=4.7
+[04:31:13] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-4b.oq8+.hfq (4.0G)
+[04:31:13] quantize: qwen3.5-4b.bf16.hfq -> oq8++ (free=70GB)
+[04:58:24]   bench: oq8++ kv=q8
+[05:00:16]     -> status=pass tok_s=1.2 decode=4.0 prefill_tok_s=6.4
+[05:00:16]   bench: oq8++ kv=asym4
+[05:02:37]     -> status=pass tok_s=0.9 decode=3.9 prefill_tok_s=4.6
+[05:02:37]   bench: oq8++ kv=asym3
+[05:05:03]     -> status=pass tok_s=0.9 decode=3.9 prefill_tok_s=4.6
+[05:05:03]   bench: oq8++ kv=asym2
+[05:07:30]     -> status=pass tok_s=0.9 decode=3.9 prefill_tok_s=4.6
+[05:07:30] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-4b.oq8++.hfq (4.0G)
+[05:07:30] prune calib: /home/sadara/.hipfire/models/matrix/qwen3.5-4b.calib.hfq
+[05:07:30] >>> HESSIAN MODEL qwen3.5-9b.bf16.hfq
+[05:07:30] collect-artifacts: qwen3.5-9b.bf16.hfq -> qwen3.5-9b.calib.hfq
+[05:08:07] COLLECT FAIL: qwen3.5-9b.bf16.hfq (see qwen3.5-9b.calib.log)
+[05:08:07] >>> HESSIAN MODEL qwen3.6-27b.bf16.hfq
+[05:08:07] collect-artifacts: qwen3.6-27b.bf16.hfq -> qwen3.6-27b.calib.hfq
+[05:09:35] COLLECT FAIL: qwen3.6-27b.bf16.hfq (see qwen3.6-27b.calib.log)
+[05:09:35] === MATRIX COMPLETE ===
+[05:09:35] rows: 324  csv=/home/sadara/hipfire/benchmarks/results/quant-kv-matrix-20260626T2120Z/results.csv

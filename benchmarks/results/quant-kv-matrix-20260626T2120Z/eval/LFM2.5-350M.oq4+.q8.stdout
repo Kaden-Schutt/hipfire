@@ -1,0 +1,8 @@
+/home/sadara/hipfire/benchmarks/results/quant-kv-matrix-20260626T2120Z/eval/LFM2.5-350M.oq4+.q8
+admission: incomplete (1 required evidence kind(s) missing)
+results: 0
+findings: 2
+admission findings: 0
+row findings: 2
+  [fail] speed/daemon_prefill_decode_first suite=- item=- reason=daemon speed anchor returned empty, zero-token, or replacement-character output
+  [fail] speed/daemon_prefill_decode_reset suite=- item=- reason=daemon speed anchor returned empty, zero-token, or replacement-character output

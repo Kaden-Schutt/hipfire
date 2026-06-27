@@ -1,0 +1,14 @@
+[hipfire] resource locks acquired (flock): hip-gpu-0
+[2m2026-06-26T21:40:06.539451Z[0m [32m INFO[0m [2mhipfire_runtime::logging[0m[2m:[0m logging initialized [3mcomponent[0m[2m=[0m"daemon" [3msink[0m[2m=[0m"stderr"
+[hipfire-daemon] model registry: 8 model(s), 4 sidecar/template artifact(s) (models=/home/sadara/.hipfire/models, triattn=/home/sadara/.hipfire/triattn, drafts=/home/sadara/.hipfire/drafts, templates=/home/sadara/.hipfire/templates)
+GPU dev 0: gfx1103 (45.1 GB VRAM, HIP 7.14)
+  pre-compiled kernels: /home/sadara/.hipfire/kernels/gfx1103
+  loading token_embd...
+    (Q8 raw, 279 MB)
+  loading output_norm...
+  loading output...
+  loading layer 0/16 ...
+
+thread 'main' (3921908) panicked at crates/hipfire-runtime/src/hfq.rs:1712:14:
+unsupported quant_type 34 for weight model.layers.0.self_attn.q_proj.weight
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

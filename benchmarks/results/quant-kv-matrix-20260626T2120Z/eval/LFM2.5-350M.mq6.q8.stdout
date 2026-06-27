@@ -1,0 +1,8 @@
+/home/sadara/hipfire/benchmarks/results/quant-kv-matrix-20260626T2120Z/eval/LFM2.5-350M.mq6.q8
+admission: measured (no --compare or --reference provided; comparison skipped)
+results: 2
+  [pass] speed/daemon_prefill_decode_first suite=- item=- model=LFM2.5-350M.mq6.hfq elapsed_ms=3891 tok_s=100 prefill_ms=1711 implemented=true max_tokens=64 shared_model_loads=1 text_bytes=1 tokens=1
+  [pass] speed/daemon_prefill_decode_reset suite=- item=- model=LFM2.5-350M.mq6.hfq elapsed_ms=3891 tok_s=111.11 prefill_ms=1701 implemented=true max_tokens=64 shared_model_loads=1 text_bytes=1 tokens=1
+findings: 0
+admission findings: 0
+row findings: 0

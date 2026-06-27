@@ -1,0 +1,516 @@
+[21:25:32] === PHASE 1: non-Hessian formats ===
+[21:25:32] >>> MODEL LFM2.5-350M.bf16.hfq (arch=lfm2 kv='q8')
+[21:25:32] quantize: LFM2.5-350M.bf16.hfq -> q8f16 (free=75GB)
+[21:25:34]   bench: q8f16 kv=q8
+[21:25:38]     -> status=pass tok_s=100.0 decode= prefill_tok_s=
+[21:25:38] prune: /home/sadara/.hipfire/models/matrix/LFM2.5-350M.q8f16.hfq (365M)
+[21:25:38] quantize: LFM2.5-350M.bf16.hfq -> hfq4 (free=75GB)
+[21:25:39]   bench: hfq4 kv=q8
+[21:25:41]     -> status=pass tok_s=153.85 decode= prefill_tok_s=
+[21:25:41] prune: /home/sadara/.hipfire/models/matrix/LFM2.5-350M.hfq4.hfq (219M)
+[21:25:41] quantize: LFM2.5-350M.bf16.hfq -> hfq6 (free=75GB)
+[21:25:42]   bench: hfq6 kv=q8
+[21:25:48]     -> status=pass tok_s=121.95 decode= prefill_tok_s=
+[21:25:48] prune: /home/sadara/.hipfire/models/matrix/LFM2.5-350M.hfq6.hfq (288M)
+[21:25:48] quantize: LFM2.5-350M.bf16.hfq -> mq3 (free=75GB)
+[21:25:49]   bench: mq3 kv=q8
+[21:25:56]     -> status=fail tok_s=169.49 decode= prefill_tok_s=
+[21:25:56] prune: /home/sadara/.hipfire/models/matrix/LFM2.5-350M.mq3.hfq (185M)
+[21:25:56] quantize: LFM2.5-350M.bf16.hfq -> mq4 (free=75GB)
+[21:25:57]   bench: mq4 kv=q8
+[21:25:59]     -> status=pass tok_s=149.53 decode= prefill_tok_s=
+[21:25:59] prune: /home/sadara/.hipfire/models/matrix/LFM2.5-350M.mq4.hfq (219M)
+[21:25:59] quantize: LFM2.5-350M.bf16.hfq -> mq6 (free=75GB)
+[21:26:00]   bench: mq6 kv=q8
+[21:26:04]     -> status=pass tok_s=111.11 decode= prefill_tok_s=
+[21:26:04] prune: /home/sadara/.hipfire/models/matrix/LFM2.5-350M.mq6.hfq (288M)
+[21:26:04] quantize: LFM2.5-350M.bf16.hfq -> oq4 (free=75GB)
+[21:26:12]   bench: oq4 kv=q8
+[21:26:13]     -> status=pass tok_s=135.14 decode= prefill_tok_s=
+[21:26:13] prune: /home/sadara/.hipfire/models/matrix/LFM2.5-350M.oq4.hfq (213M)
+[21:26:13] quantize: LFM2.5-350M.bf16.hfq -> oq8 (free=75GB)
+[21:26:21]   bench: oq8 kv=q8
+[21:26:23]     -> status=fail tok_s=0.0 decode= prefill_tok_s=
+[21:26:23] prune: /home/sadara/.hipfire/models/matrix/LFM2.5-350M.oq8.hfq (350M)
+[21:26:23] >>> MODEL qwen3.5-0.8b.bf16.hfq (arch=qwen kv='q8 asym4 asym3 asym2')
+[21:26:23] quantize: qwen3.5-0.8b.bf16.hfq -> q8f16 (free=75GB)
+[21:26:26]   bench: q8f16 kv=q8
+[21:26:42]     -> status=pass tok_s=33.1 decode=38.8 prefill_tok_s=836.7
+[21:26:42]   bench: q8f16 kv=asym4
+[21:26:57]     -> status=pass tok_s=32.8 decode=38.7 prefill_tok_s=808.7
+[21:26:57]   bench: q8f16 kv=asym3
+[21:27:10]     -> status=pass tok_s=33.4 decode=39.3 prefill_tok_s=835.3
+[21:27:10]   bench: q8f16 kv=asym2
+[21:27:25]     -> status=pass tok_s=33.0 decode=38.8 prefill_tok_s=823.4
+[21:27:25] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-0.8b.q8f16.hfq (777M)
+[21:27:25] quantize: qwen3.5-0.8b.bf16.hfq -> hfq4 (free=75GB)
+[21:27:27]   bench: hfq4 kv=q8
+[21:27:39]     -> status=pass tok_s=51.1 decode=59.8 prefill_tok_s=1319.0
+[21:27:39]   bench: hfq4 kv=asym4
+[21:27:50]     -> status=pass tok_s=50.4 decode=59.1 prefill_tok_s=1285.2
+[21:27:50]   bench: hfq4 kv=asym3
+[21:28:02]     -> status=pass tok_s=52.1 decode=60.6 prefill_tok_s=1389.9
+[21:28:02]   bench: hfq4 kv=asym2
+[21:28:13]     -> status=pass tok_s=50.8 decode=58.9 prefill_tok_s=1376.4
+[21:28:13] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-0.8b.hfq4.hfq (525M)
+[21:28:13] quantize: qwen3.5-0.8b.bf16.hfq -> hfq6 (free=75GB)
+[21:28:16]   bench: hfq6 kv=q8
+[21:28:30]     -> status=pass tok_s=40.8 decode=49.3 prefill_tok_s=893.1
+[21:28:30]   bench: hfq6 kv=asym4
+[21:28:43]     -> status=pass tok_s=40.5 decode=48.9 prefill_tok_s=889.3
+[21:28:43]   bench: hfq6 kv=asym3
+[21:28:55]     -> status=pass tok_s=41.2 decode=49.8 prefill_tok_s=896.6
+[21:28:55]   bench: hfq6 kv=asym2
+[21:29:07]     -> status=pass tok_s=40.4 decode=48.8 prefill_tok_s=882.6
+[21:29:07] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-0.8b.hfq6.hfq (644M)
+[21:29:07] quantize: qwen3.5-0.8b.bf16.hfq -> mq3 (free=75GB)
+[21:29:10]   bench: mq3 kv=q8
+[21:29:24]     -> status=pass tok_s=53.8 decode=64.4 prefill_tok_s=1223.4
+[21:29:24]   bench: mq3 kv=asym4
+[21:29:35]     -> status=pass tok_s=53.5 decode=63.6 prefill_tok_s=1269.3
+[21:29:35]   bench: mq3 kv=asym3
+[21:29:47]     -> status=pass tok_s=54.5 decode=65.2 prefill_tok_s=1241.1
+[21:29:47]   bench: mq3 kv=asym2
+[21:29:57]     -> status=pass tok_s=45.7 decode=65.8 prefill_tok_s=1200.0
+[21:29:57] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-0.8b.mq3.hfq (466M)
+[21:29:57] quantize: qwen3.5-0.8b.bf16.hfq -> mq4 (free=75GB)
+[21:30:00]   bench: mq4 kv=q8
+[21:30:11]     -> status=pass tok_s=50.5 decode=59.4 prefill_tok_s=1276.1
+[21:30:11]   bench: mq4 kv=asym4
+[21:30:23]     -> status=pass tok_s=50.1 decode=58.7 prefill_tok_s=1277.5
+[21:30:23]   bench: mq4 kv=asym3
+[21:30:34]     -> status=pass tok_s=51.2 decode=59.8 prefill_tok_s=1343.2
+[21:30:34]   bench: mq4 kv=asym2
+[21:30:46]     -> status=pass tok_s=50.1 decode=58.5 prefill_tok_s=1312.4
+[21:30:46] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-0.8b.mq4.hfq (525M)
+[21:30:46] quantize: qwen3.5-0.8b.bf16.hfq -> mq6 (free=75GB)
+[21:30:49]   bench: mq6 kv=q8
+[21:31:02]     -> status=pass tok_s=40.7 decode=49.2 prefill_tok_s=891.0
+[21:31:02]   bench: mq6 kv=asym4
+[21:31:15]     -> status=pass tok_s=40.2 decode=48.5 prefill_tok_s=881.8
+[21:31:15]   bench: mq6 kv=asym3
+[21:31:27]     -> status=pass tok_s=40.9 decode=49.5 prefill_tok_s=884.9
+[21:31:27]   bench: mq6 kv=asym2
+[21:31:39]     -> status=pass tok_s=40.2 decode=48.6 prefill_tok_s=876.4
+[21:31:39] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-0.8b.mq6.hfq (644M)
+[21:31:39] quantize: qwen3.5-0.8b.bf16.hfq -> oq4 (free=75GB)
+[21:31:53]   bench: oq4 kv=q8
+[21:32:06]     -> status=pass tok_s=50.5 decode=59.5 prefill_tok_s=1256.0
+[21:32:06]   bench: oq4 kv=asym4
+[21:32:17]     -> status=pass tok_s=50.0 decode=58.8 prefill_tok_s=1249.5
+[21:32:17]   bench: oq4 kv=asym3
+[21:32:29]     -> status=pass tok_s=51.3 decode=60.1 prefill_tok_s=1311.3
+[21:32:29]   bench: oq4 kv=asym2
+[21:32:40]     -> status=pass tok_s=50.2 decode=58.9 prefill_tok_s=1276.4
+[21:32:40] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-0.8b.oq4.hfq (514M)
+[21:32:40] quantize: qwen3.5-0.8b.bf16.hfq -> oq8 (free=75GB)
+[21:32:54]   bench: oq8 kv=q8
+[21:33:17]     -> status=pass tok_s=12.0 decode=43.1 prefill_tok_s=62.2
+[21:33:17]   bench: oq8 kv=asym4
+[21:33:37]     -> status=pass tok_s=11.9 decode=42.7 prefill_tok_s=61.6
+[21:33:37]   bench: oq8 kv=asym3
+[21:33:57]     -> status=pass tok_s=12.1 decode=43.5 prefill_tok_s=62.8
+[21:33:57]   bench: oq8 kv=asym2
+[21:34:18]     -> status=pass tok_s=11.9 decode=42.7 prefill_tok_s=61.7
+[21:34:18] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-0.8b.oq8.hfq (751M)
+[21:34:18] >>> MODEL llama-3.2-1b-instruct.bf16.hfq (arch=llama kv='q8 fp32')
+[21:34:18] quantize: llama-3.2-1b-instruct.bf16.hfq -> q8f16 (free=75GB)
+[21:34:25]   bench: q8f16 kv=q8
+[21:34:41]     -> status=pass tok_s=18.76028226521368 decode=18.76028226521368 prefill_tok_s=464.19883182791375
+[21:34:41]   bench: q8f16 kv=fp32
+[21:35:21]     -> status=pass tok_s=18.52129101537327 decode=18.52129101537327 prefill_tok_s=18.808612718916255
+[21:35:21] prune: /home/sadara/.hipfire/models/matrix/llama-3.2-1b-instruct.q8f16.hfq (1.3G)
+[21:35:21] quantize: llama-3.2-1b-instruct.bf16.hfq -> hfq4 (free=75GB)
+[21:35:25]   bench: hfq4 kv=q8
+[21:35:39]     -> status=pass tok_s=24.17792855563855 decode=24.17792855563855 prefill_tok_s=1001.8899734245616
+[21:35:39]   bench: hfq4 kv=fp32
+[21:36:11]     -> status=pass tok_s=24.2975363377116 decode=24.2975363377116 prefill_tok_s=24.828982304822013
+[21:36:11] prune: /home/sadara/.hipfire/models/matrix/llama-3.2-1b-instruct.hfq4.hfq (770M)
+[21:36:11] quantize: llama-3.2-1b-instruct.bf16.hfq -> hfq6 (free=75GB)
+[21:36:15]   bench: hfq6 kv=q8
+[21:36:30]     -> status=pass tok_s=21.258608982621674 decode=21.258608982621674 prefill_tok_s=552.2982769035418
+[21:36:30]   bench: hfq6 kv=fp32
+[21:37:10]     -> status=pass tok_s=14.380131009653295 decode=14.380131009653295 prefill_tok_s=17.112491986322155
+[21:37:10] prune: /home/sadara/.hipfire/models/matrix/llama-3.2-1b-instruct.hfq6.hfq (1002M)
+[21:37:10] quantize: llama-3.2-1b-instruct.bf16.hfq -> mq3 (free=75GB)
+[21:37:16]   bench: mq3 kv=q8
+[21:37:50]     -> status=pass tok_s=17.968003907151434 decode=17.968003907151434 prefill_tok_s=20.315640821133343
+[21:37:50]   bench: mq3 kv=fp32
+[21:38:30]     -> status=pass tok_s=15.857677656224515 decode=15.857677656224515 prefill_tok_s=17.018988320269894
+[21:38:30] prune: /home/sadara/.hipfire/models/matrix/llama-3.2-1b-instruct.mq3.hfq (654M)
+[21:38:30] quantize: llama-3.2-1b-instruct.bf16.hfq -> mq4 (free=75GB)
+[21:38:35]   bench: mq4 kv=q8
+[21:38:48]     -> status=pass tok_s=24.563763073686765 decode=24.563763073686765 prefill_tok_s=987.6679975392152
+[21:38:48]   bench: mq4 kv=fp32
+[21:39:28]     -> status=pass tok_s=14.61851150023544 decode=14.61851150023544 prefill_tok_s=16.61346926892865
+[21:39:28] prune: /home/sadara/.hipfire/models/matrix/llama-3.2-1b-instruct.mq4.hfq (770M)
+[21:39:28] quantize: llama-3.2-1b-instruct.bf16.hfq -> mq6 (free=74GB)
+[21:39:34]   bench: mq6 kv=q8
+[21:39:35]     -> status=fail tok_s= decode= prefill_tok_s=
+[21:39:35]   bench: mq6 kv=fp32
+[21:39:37]     -> status=fail tok_s= decode= prefill_tok_s=
+[21:39:37] prune: /home/sadara/.hipfire/models/matrix/llama-3.2-1b-instruct.mq6.hfq (1002M)
+[21:39:37] quantize: llama-3.2-1b-instruct.bf16.hfq -> oq4 (free=74GB)
+[21:40:04]   bench: oq4 kv=q8
+[21:40:06]     -> status=fail tok_s= decode= prefill_tok_s=
+[21:40:06]   bench: oq4 kv=fp32
+[21:40:07]     -> status=fail tok_s= decode= prefill_tok_s=
+[21:40:07] prune: /home/sadara/.hipfire/models/matrix/llama-3.2-1b-instruct.oq4.hfq (748M)
+[21:40:07] quantize: llama-3.2-1b-instruct.bf16.hfq -> oq8 (free=74GB)
+[21:40:34]   bench: oq8 kv=q8
+[21:40:36]     -> status=fail tok_s= decode= prefill_tok_s=
+[21:40:36]   bench: oq8 kv=fp32
+[21:40:37]     -> status=fail tok_s= decode= prefill_tok_s=
+[21:40:37] prune: /home/sadara/.hipfire/models/matrix/llama-3.2-1b-instruct.oq8.hfq (1.2G)
+[21:40:37] >>> MODEL qwen3.5-2b.bf16.hfq (arch=qwen kv='q8 asym4 asym3 asym2')
+[21:40:37] quantize: qwen3.5-2b.bf16.hfq -> q8f16 (free=74GB)
+[21:40:48]   bench: q8f16 kv=q8
+[21:41:15]     -> status=pass tok_s=15.1 decode=18.0 prefill_tok_s=348.0
+[21:41:15]   bench: q8f16 kv=asym4
+[21:41:34]     -> status=pass tok_s=15.0 decode=18.0 prefill_tok_s=344.6
+[21:41:34]   bench: q8f16 kv=asym3
+[21:41:53]     -> status=pass tok_s=15.1 decode=18.0 prefill_tok_s=345.2
+[21:41:53]   bench: q8f16 kv=asym2
+[21:42:12]     -> status=pass tok_s=15.0 decode=17.9 prefill_tok_s=343.4
+[21:42:12] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-2b.q8f16.hfq (1.9G)
+[21:42:12] quantize: qwen3.5-2b.bf16.hfq -> hfq4 (free=74GB)
+[21:42:19]   bench: hfq4 kv=q8
+[21:42:30]     -> status=fail tok_s= decode= prefill_tok_s=
+[21:42:30]   bench: hfq4 kv=asym4
+[21:42:45]     -> status=pass tok_s=24.8 decode=28.4 prefill_tok_s=729.3
+[21:42:45]   bench: hfq4 kv=asym3
+[21:42:55]     -> status=fail tok_s= decode= prefill_tok_s=
+[21:42:55]   bench: hfq4 kv=asym2
+[21:43:10]     -> status=pass tok_s=24.8 decode=28.4 prefill_tok_s=728.0
+[21:43:10] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-2b.hfq4.hfq (1.2G)
+[21:43:10] quantize: qwen3.5-2b.bf16.hfq -> hfq6 (free=74GB)
+[21:43:16]   bench: hfq6 kv=q8
+[21:43:38]     -> status=pass tok_s=18.3 decode=22.1 prefill_tok_s=395.6
+[21:43:38]   bench: hfq6 kv=asym4
+[21:43:54]     -> status=pass tok_s=18.2 decode=22.0 prefill_tok_s=397.0
+[21:43:54]   bench: hfq6 kv=asym3
+[21:44:11]     -> status=pass tok_s=18.3 decode=22.1 prefill_tok_s=397.8
+[21:44:11]   bench: hfq6 kv=asym2
+[21:44:27]     -> status=pass tok_s=18.2 decode=21.9 prefill_tok_s=395.2
+[21:44:27] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-2b.hfq6.hfq (1.6G)
+[21:44:27] quantize: qwen3.5-2b.bf16.hfq -> mq3 (free=74GB)
+[21:44:35]   bench: mq3 kv=q8
+[21:44:50]     -> status=pass tok_s=26.6 decode=32.0 prefill_tok_s=581.3
+[21:44:50]   bench: mq3 kv=asym4
+[21:45:04]     -> status=pass tok_s=26.3 decode=31.9 prefill_tok_s=564.9
+[21:45:04]   bench: mq3 kv=asym3
+[21:45:19]     -> status=pass tok_s=26.7 decode=32.2 prefill_tok_s=585.1
+[21:45:19]   bench: mq3 kv=asym2
+[21:45:33]     -> status=pass tok_s=26.4 decode=31.8 prefill_tok_s=577.6
+[21:45:33] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-2b.mq3.hfq (1.1G)
+[21:45:33] quantize: qwen3.5-2b.bf16.hfq -> mq4 (free=74GB)
+[21:45:41]   bench: mq4 kv=q8
+[21:46:02]     -> status=pass tok_s=24.8 decode=28.5 prefill_tok_s=724.7
+[21:46:02]   bench: mq4 kv=asym4
+[21:46:17]     -> status=pass tok_s=24.6 decode=28.3 prefill_tok_s=713.3
+[21:46:17]   bench: mq4 kv=asym3
+[21:46:32]     -> status=pass tok_s=24.9 decode=28.6 prefill_tok_s=716.3
+[21:46:32]   bench: mq4 kv=asym2
+[21:46:47]     -> status=pass tok_s=24.6 decode=28.3 prefill_tok_s=713.5
+[21:46:47] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-2b.mq4.hfq (1.2G)
+[21:46:47] quantize: qwen3.5-2b.bf16.hfq -> mq6 (free=74GB)
+[21:46:56]   bench: mq6 kv=q8
+[21:47:13]     -> status=pass tok_s=18.2 decode=22.0 prefill_tok_s=397.6
+[21:47:13]   bench: mq6 kv=asym4
+[21:47:29]     -> status=pass tok_s=18.1 decode=21.9 prefill_tok_s=391.3
+[21:47:29]   bench: mq6 kv=asym3
+[21:47:47]     -> status=pass tok_s=18.2 decode=22.0 prefill_tok_s=395.2
+[21:47:47]   bench: mq6 kv=asym2
+[21:48:05]     -> status=pass tok_s=18.1 decode=21.9 prefill_tok_s=393.7
+[21:48:05] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-2b.mq6.hfq (1.6G)
+[21:48:05] quantize: qwen3.5-2b.bf16.hfq -> oq4 (free=74GB)
+[21:48:44]   bench: oq4 kv=q8
+[21:49:00]     -> status=pass tok_s=23.1 decode=27.7 prefill_tok_s=512.9
+[21:49:00]   bench: oq4 kv=asym4
+[21:49:16]     -> status=pass tok_s=23.0 decode=27.6 prefill_tok_s=514.8
+[21:49:16]   bench: oq4 kv=asym3
+[21:49:32]     -> status=pass tok_s=23.3 decode=28.0 prefill_tok_s=526.6
+[21:49:32]   bench: oq4 kv=asym2
+[21:49:48]     -> status=pass tok_s=22.8 decode=27.5 prefill_tok_s=502.8
+[21:49:48] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-2b.oq4.hfq (1.2G)
+[21:49:48] quantize: qwen3.5-2b.bf16.hfq -> oq8 (free=74GB)
+[21:50:27]   bench: oq8 kv=q8
+[21:51:20]     -> status=pass tok_s=4.9 decode=18.7 prefill_tok_s=25.2
+[21:51:20]   bench: oq8 kv=asym4
+[21:51:57]     -> status=pass tok_s=4.9 decode=18.6 prefill_tok_s=25.1
+[21:51:57]   bench: oq8 kv=asym3
+[21:52:35]     -> status=pass tok_s=4.9 decode=18.7 prefill_tok_s=25.2
+[21:52:35]   bench: oq8 kv=asym2
+[21:53:11]     -> status=pass tok_s=4.8 decode=17.0 prefill_tok_s=25.1
+[21:53:11] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-2b.oq8.hfq (1.9G)
+[21:53:11] >>> MODEL qwen3.6-35b-a3b.bf16.hfq (arch=qwen kv='q8 asym4 asym3 asym2')
+[21:53:11] quantize: qwen3.6-35b-a3b.bf16.hfq -> q8f16 (free=74GB)
+[21:53:12] QUANT FAIL: qwen3.6-35b-a3b.bf16.hfq q8f16 (see qwen3.6-35b-a3b.q8f16.quant.log)
+[21:53:12] quantize: qwen3.6-35b-a3b.bf16.hfq -> hfq4 (free=74GB)
+[21:53:12] QUANT FAIL: qwen3.6-35b-a3b.bf16.hfq hfq4 (see qwen3.6-35b-a3b.hfq4.quant.log)
+[21:53:12] quantize: qwen3.6-35b-a3b.bf16.hfq -> hfq6 (free=74GB)
+[21:53:12] QUANT FAIL: qwen3.6-35b-a3b.bf16.hfq hfq6 (see qwen3.6-35b-a3b.hfq6.quant.log)
+[21:53:12] quantize: qwen3.6-35b-a3b.bf16.hfq -> mq3 (free=74GB)
+[21:53:12] QUANT FAIL: qwen3.6-35b-a3b.bf16.hfq mq3 (see qwen3.6-35b-a3b.mq3.quant.log)
+[21:53:12] quantize: qwen3.6-35b-a3b.bf16.hfq -> mq4 (free=74GB)
+[21:53:12] QUANT FAIL: qwen3.6-35b-a3b.bf16.hfq mq4 (see qwen3.6-35b-a3b.mq4.quant.log)
+[21:53:12] quantize: qwen3.6-35b-a3b.bf16.hfq -> mq6 (free=74GB)
+[21:53:12] QUANT FAIL: qwen3.6-35b-a3b.bf16.hfq mq6 (see qwen3.6-35b-a3b.mq6.quant.log)
+[21:53:12] quantize: qwen3.6-35b-a3b.bf16.hfq -> oq4 (free=74GB)
+[21:53:12] QUANT FAIL: qwen3.6-35b-a3b.bf16.hfq oq4 (see qwen3.6-35b-a3b.oq4.quant.log)
+[21:53:12] quantize: qwen3.6-35b-a3b.bf16.hfq -> oq8 (free=74GB)
+[21:53:12] QUANT FAIL: qwen3.6-35b-a3b.bf16.hfq oq8 (see qwen3.6-35b-a3b.oq8.quant.log)
+[21:53:12] >>> MODEL qwen3.5-4b.bf16.hfq (arch=qwen kv='q8 asym4 asym3 asym2')
+[21:53:12] quantize: qwen3.5-4b.bf16.hfq -> q8f16 (free=74GB)
+[21:53:45]   bench: q8f16 kv=q8
+[21:54:46]     -> status=pass tok_s=6.9 decode=8.5 prefill_tok_s=138.4
+[21:54:46]   bench: q8f16 kv=asym4
+[21:55:20]     -> status=pass tok_s=6.2 decode=7.7 prefill_tok_s=126.1
+[21:55:20]   bench: q8f16 kv=asym3
+[21:55:53]     -> status=pass tok_s=5.8 decode=7.0 prefill_tok_s=125.7
+[21:55:53]   bench: q8f16 kv=asym2
+[21:56:30]     -> status=pass tok_s=4.2 decode=4.9 prefill_tok_s=105.5
+[21:56:30] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-4b.q8f16.hfq (4.2G)
+[21:56:30] quantize: qwen3.5-4b.bf16.hfq -> hfq4 (free=74GB)
+[21:56:48]   bench: hfq4 kv=q8
+[21:57:27]     -> status=pass tok_s=12.1 decode=14.1 prefill_tok_s=321.5
+[21:57:27]   bench: hfq4 kv=asym4
+[21:57:43]     -> status=fail tok_s= decode= prefill_tok_s=
+[21:57:43]   bench: hfq4 kv=asym3
+[22:17:43]     -> status=fail tok_s= decode= prefill_tok_s=
+[22:17:43]   bench: hfq4 kv=asym2
+[22:37:43]     -> status=fail tok_s= decode= prefill_tok_s=
+[22:37:44] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-4b.hfq4.hfq (2.5G)
+[22:37:44] quantize: qwen3.5-4b.bf16.hfq -> hfq6 (free=74GB)
+[22:38:02]   bench: hfq6 kv=q8
+[22:38:48]     -> status=pass tok_s=8.2 decode=10.2 prefill_tok_s=163.4
+[22:38:48]   bench: hfq6 kv=asym4
+[22:39:15]     -> status=pass tok_s=8.2 decode=10.1 prefill_tok_s=162.4
+[22:39:15]   bench: hfq6 kv=asym3
+[22:39:41]     -> status=pass tok_s=8.2 decode=10.2 prefill_tok_s=163.3
+[22:39:41]   bench: hfq6 kv=asym2
+[22:40:08]     -> status=pass tok_s=8.2 decode=10.1 prefill_tok_s=162.6
+[22:40:08] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-4b.hfq6.hfq (3.3G)
+[22:40:08] quantize: qwen3.5-4b.bf16.hfq -> mq3 (free=74GB)
+[22:40:25]   bench: mq3 kv=q8
+[22:40:57]     -> status=pass tok_s=13.0 decode=16.5 prefill_tok_s=232.0
+[22:40:57]   bench: mq3 kv=asym4
+[22:41:17]     -> status=pass tok_s=13.0 decode=16.5 prefill_tok_s=230.3
+[22:41:17]   bench: mq3 kv=asym3
+[22:41:37]     -> status=pass tok_s=13.1 decode=16.6 prefill_tok_s=231.8
+[22:41:37]   bench: mq3 kv=asym2
+[22:41:57]     -> status=pass tok_s=13.0 decode=16.5 prefill_tok_s=231.6
+[22:41:57] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-4b.mq3.hfq (2.0G)
+[22:41:57] quantize: qwen3.5-4b.bf16.hfq -> mq4 (free=74GB)
+[22:42:14]   bench: mq4 kv=q8
+[22:42:40]     -> status=pass tok_s=12.1 decode=14.1 prefill_tok_s=322.2
+[22:42:40]   bench: mq4 kv=asym4
+[22:43:00]     -> status=pass tok_s=12.1 decode=14.1 prefill_tok_s=317.3
+[22:43:00]   bench: mq4 kv=asym3
+[22:43:21]     -> status=pass tok_s=12.2 decode=14.2 prefill_tok_s=323.5
+[22:43:21]   bench: mq4 kv=asym2
+[22:43:43]     -> status=pass tok_s=12.1 decode=14.1 prefill_tok_s=315.6
+[22:43:43] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-4b.mq4.hfq (2.5G)
+[22:43:43] quantize: qwen3.5-4b.bf16.hfq -> mq6 (free=74GB)
+[22:44:02]   bench: mq6 kv=q8
+[22:44:42]     -> status=pass tok_s=8.2 decode=10.1 prefill_tok_s=162.6
+[22:44:42]   bench: mq6 kv=asym4
+[22:45:10]     -> status=pass tok_s=8.2 decode=10.1 prefill_tok_s=161.3
+[22:45:10]   bench: mq6 kv=asym3
+[22:45:37]     -> status=pass tok_s=8.2 decode=10.2 prefill_tok_s=159.7
+[22:45:37]   bench: mq6 kv=asym2
+[22:46:03]     -> status=pass tok_s=8.2 decode=10.1 prefill_tok_s=161.7
+[22:46:03] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-4b.mq6.hfq (3.3G)
+[22:46:03] quantize: qwen3.5-4b.bf16.hfq -> oq4 (free=74GB)
+[22:47:41]   bench: oq4 kv=q8
+[22:48:25]     -> status=pass tok_s=11.7 decode=13.9 prefill_tok_s=278.2
+[22:48:25]   bench: oq4 kv=asym4
+[22:48:38]     -> status=fail tok_s= decode= prefill_tok_s=
+[22:48:38]   bench: oq4 kv=asym3
+[22:49:00]     -> status=pass tok_s=11.8 decode=14.1 prefill_tok_s=272.3
+[22:49:00]   bench: oq4 kv=asym2
+[22:49:22]     -> status=pass tok_s=11.7 decode=14.0 prefill_tok_s=271.3
+[22:49:22] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-4b.oq4.hfq (2.4G)
+[22:49:22] quantize: qwen3.5-4b.bf16.hfq -> oq8 (free=74GB)
+[22:51:03]   bench: oq8 kv=q8
+[22:52:53]     -> status=pass tok_s=2.0 decode=8.5 prefill_tok_s=9.9
+[22:52:53]   bench: oq8 kv=asym4
+[22:54:27]     -> status=pass tok_s=1.3 decode=5.0 prefill_tok_s=6.7
+[22:54:27]   bench: oq8 kv=asym3
+[22:56:26]     -> status=pass tok_s=1.1 decode=4.4 prefill_tok_s=5.4
+[22:56:26]   bench: oq8 kv=asym2
+[22:58:35]     -> status=pass tok_s=1.0 decode=4.1 prefill_tok_s=5.0
+[22:58:35] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-4b.oq8.hfq (4.0G)
+[22:58:35] >>> MODEL qwen3.5-9b.bf16.hfq (arch=qwen kv='q8 asym4 asym3 asym2')
+[22:58:35] quantize: qwen3.5-9b.bf16.hfq -> q8f16 (free=74GB)
+[22:59:37]   bench: q8f16 kv=q8
+[23:00:56]     -> status=pass tok_s=3.2 decode=4.3 prefill_tok_s=49.2
+[23:00:56]   bench: q8f16 kv=asym4
+[23:02:06]     -> status=pass tok_s=1.8 decode=2.2 prefill_tok_s=41.7
+[23:02:06]   bench: q8f16 kv=asym3
+[23:03:28]     -> status=pass tok_s=1.6 decode=2.0 prefill_tok_s=33.9
+[23:03:28]   bench: q8f16 kv=asym2
+[23:04:54]     -> status=pass tok_s=1.6 decode=1.9 prefill_tok_s=33.0
+[23:04:54] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-9b.q8f16.hfq (8.9G)
+[23:04:54] quantize: qwen3.5-9b.bf16.hfq -> hfq4 (free=74GB)
+[23:05:31]   bench: hfq4 kv=q8
+[23:06:11]     -> status=fail tok_s= decode= prefill_tok_s=
+[23:06:11]   bench: hfq4 kv=asym4
+[23:06:39]     -> status=pass tok_s=7.8 decode=9.1 prefill_tok_s=202.2
+[23:06:39]   bench: hfq4 kv=asym3
+[23:07:07]     -> status=pass tok_s=7.8 decode=9.1 prefill_tok_s=203.7
+[23:07:07]   bench: hfq4 kv=asym2
+[23:07:35]     -> status=pass tok_s=7.8 decode=9.1 prefill_tok_s=203.6
+[23:07:35] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-9b.hfq4.hfq (5.0G)
+[23:07:35] quantize: qwen3.5-9b.bf16.hfq -> hfq6 (free=74GB)
+[23:08:12]   bench: hfq6 kv=q8
+[23:09:19]     -> status=pass tok_s=4.5 decode=5.7 prefill_tok_s=77.8
+[23:09:19]   bench: hfq6 kv=asym4
+[23:10:02]     -> status=pass tok_s=3.9 decode=4.6 prefill_tok_s=93.6
+[23:10:02]   bench: hfq6 kv=asym3
+[23:10:56]     -> status=pass tok_s=2.7 decode=3.2 prefill_tok_s=63.6
+[23:10:56]   bench: hfq6 kv=asym2
+[23:11:53]     -> status=pass tok_s=2.4 decode=2.9 prefill_tok_s=48.3
+[23:11:53] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-9b.hfq6.hfq (6.8G)
+[23:11:53] quantize: qwen3.5-9b.bf16.hfq -> mq3 (free=74GB)
+[23:12:40]   bench: mq3 kv=q8
+[23:13:26]     -> status=pass tok_s=8.2 decode=11.4 prefill_tok_s=111.1
+[23:13:26]   bench: mq3 kv=asym4
+[23:13:53]     -> status=pass tok_s=8.4 decode=11.4 prefill_tok_s=116.9
+[23:13:53]   bench: mq3 kv=asym3
+[23:14:19]     -> status=pass tok_s=8.4 decode=11.5 prefill_tok_s=119.0
+[23:14:19]   bench: mq3 kv=asym2
+[23:14:45]     -> status=pass tok_s=8.1 decode=11.0 prefill_tok_s=118.9
+[23:14:45] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-9b.mq3.hfq (4.1G)
+[23:14:45] quantize: qwen3.5-9b.bf16.hfq -> mq4 (free=74GB)
+[23:15:26]   bench: mq4 kv=q8
+[23:16:23]     -> status=pass tok_s=7.7 decode=9.0 prefill_tok_s=197.9
+[23:16:23]   bench: mq4 kv=asym4
+[23:16:37]     -> status=fail tok_s= decode= prefill_tok_s=
+[23:16:37]   bench: mq4 kv=asym3
+[23:17:05]     -> status=pass tok_s=7.8 decode=9.1 prefill_tok_s=201.8
+[23:17:05]   bench: mq4 kv=asym2
+[23:17:33]     -> status=pass tok_s=7.7 decode=9.0 prefill_tok_s=201.0
+[23:17:33] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-9b.mq4.hfq (5.0G)
+[23:17:33] quantize: qwen3.5-9b.bf16.hfq -> mq6 (free=74GB)
+[23:18:22]   bench: mq6 kv=q8
+[23:19:35]     -> status=pass tok_s=4.4 decode=5.7 prefill_tok_s=76.0
+[23:19:35]   bench: mq6 kv=asym4
+[23:20:16]     -> status=pass tok_s=4.5 decode=5.6 prefill_tok_s=88.7
+[23:20:16]   bench: mq6 kv=asym3
+[23:21:03]     -> status=pass tok_s=3.1 decode=3.8 prefill_tok_s=69.6
+[23:21:03]   bench: mq6 kv=asym2
+[23:21:56]     -> status=pass tok_s=2.7 decode=3.2 prefill_tok_s=59.5
+[23:21:56] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-9b.mq6.hfq (6.8G)
+[23:21:57] quantize: qwen3.5-9b.bf16.hfq -> oq4 (free=74GB)
+[23:25:42]   bench: oq4 kv=q8
+[23:26:42]     -> status=pass tok_s=6.2 decode=8.9 prefill_tok_s=75.3
+[23:26:42]   bench: oq4 kv=asym4
+[23:27:19]     -> status=pass tok_s=6.3 decode=8.9 prefill_tok_s=81.0
+[23:27:19]   bench: oq4 kv=asym3
+[23:27:57]     -> status=pass tok_s=6.2 decode=8.9 prefill_tok_s=78.0
+[23:27:57]   bench: oq4 kv=asym2
+[23:28:34]     -> status=pass tok_s=6.4 decode=8.9 prefill_tok_s=84.2
+[23:28:34] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-9b.oq4.hfq (4.8G)
+[23:28:34] quantize: qwen3.5-9b.bf16.hfq -> oq8 (free=74GB)
+[23:32:26]   bench: oq8 kv=q8
+[23:35:27]     -> status=pass tok_s=0.9 decode=2.9 prefill_tok_s=4.5
+[23:35:27]   bench: oq8 kv=asym4
+[23:39:13]     -> status=pass tok_s=0.6 decode=2.3 prefill_tok_s=2.8
+[23:39:13]   bench: oq8 kv=asym3
+[23:43:27]     -> status=pass tok_s=0.5 decode=2.1 prefill_tok_s=2.5
+[23:43:27]   bench: oq8 kv=asym2
+[23:47:53]     -> status=pass tok_s=0.5 decode=2.1 prefill_tok_s=2.4
+[23:47:53] prune: /home/sadara/.hipfire/models/matrix/qwen3.5-9b.oq8.hfq (8.5G)
+[23:47:53] >>> MODEL qwen3.6-27b.bf16.hfq (arch=qwen kv='q8 asym4 asym3 asym2')
+[23:47:53] quantize: qwen3.6-27b.bf16.hfq -> q8f16 (free=74GB)
+[23:57:20]   bench: q8f16 kv=q8
+[00:00:38]     -> status=pass tok_s=0.7 decode=0.9 prefill_tok_s=12.3
+[00:00:38]   bench: q8f16 kv=asym4
+[00:04:30]     -> status=pass tok_s=0.6 decode=0.7 prefill_tok_s=10.5
+[00:04:30]   bench: q8f16 kv=asym3
+[00:08:32]     -> status=pass tok_s=0.6 decode=0.7 prefill_tok_s=10.1
+[00:08:32]   bench: q8f16 kv=asym2
+[00:12:33]     -> status=pass tok_s=0.6 decode=0.7 prefill_tok_s=10.3
+[00:12:33] prune: /home/sadara/.hipfire/models/matrix/qwen3.6-27b.q8f16.hfq (27G)
+[00:12:33] quantize: qwen3.6-27b.bf16.hfq -> hfq4 (free=74GB)
+[00:17:38]   bench: hfq4 kv=q8
+[00:37:39]     -> status=fail tok_s= decode= prefill_tok_s=
+[00:37:39]   bench: hfq4 kv=asym4
+[00:38:49]     -> status=pass tok_s=2.5 decode=2.9 prefill_tok_s=61.3
+[00:38:49]   bench: hfq4 kv=asym3
+[00:40:05]     -> status=pass tok_s=2.2 decode=2.5 prefill_tok_s=61.9
+[00:40:05]   bench: hfq4 kv=asym2
+[00:41:39]     -> status=pass tok_s=1.4 decode=1.6 prefill_tok_s=60.6
+[00:41:39] prune: /home/sadara/.hipfire/models/matrix/qwen3.6-27b.hfq4.hfq (14G)
+[00:41:39] quantize: qwen3.6-27b.bf16.hfq -> hfq6 (free=74GB)
+[00:47:20]   bench: hfq6 kv=q8
+[00:49:16]     -> status=pass tok_s=1.5 decode=2.0 prefill_tok_s=21.1
+[00:49:16]   bench: hfq6 kv=asym4
+[00:51:49]     -> status=pass tok_s=0.8 decode=1.0 prefill_tok_s=14.6
+[00:51:49]   bench: hfq6 kv=asym3
+[00:54:40]     -> status=pass tok_s=0.8 decode=1.0 prefill_tok_s=13.6
+[00:54:40]   bench: hfq6 kv=asym2
+[00:57:35]     -> status=pass tok_s=0.8 decode=0.9 prefill_tok_s=13.8
+[00:57:35] prune: /home/sadara/.hipfire/models/matrix/qwen3.6-27b.hfq6.hfq (20G)
+[00:57:35] quantize: qwen3.6-27b.bf16.hfq -> mq3 (free=74GB)
+[01:02:34]   bench: mq3 kv=q8
+[01:03:56]     -> status=pass tok_s=2.3 decode=3.6 prefill_tok_s=22.3
+[01:03:56]   bench: mq3 kv=asym4
+[01:05:15]     -> status=pass tok_s=1.7 decode=2.4 prefill_tok_s=23.9
+[01:05:15]   bench: mq3 kv=asym3
+[01:06:55]     -> status=pass tok_s=1.3 decode=1.7 prefill_tok_s=20.0
+[01:06:55]   bench: mq3 kv=asym2
+[01:08:42]     -> status=pass tok_s=1.2 decode=1.6 prefill_tok_s=19.4
+[01:08:42] prune: /home/sadara/.hipfire/models/matrix/qwen3.6-27b.mq3.hfq (11G)
+[01:08:42] quantize: qwen3.6-27b.bf16.hfq -> mq4 (free=74GB)
+[01:13:36]   bench: mq4 kv=q8
+[01:15:09]     -> status=pass tok_s=2.4 decode=2.9 prefill_tok_s=61.0
+[01:15:09]   bench: mq4 kv=asym4
+[01:16:29]     -> status=pass tok_s=1.9 decode=2.1 prefill_tok_s=60.1
+[01:16:29]   bench: mq4 kv=asym3
+[01:18:10]     -> status=pass tok_s=1.3 decode=1.5 prefill_tok_s=60.8
+[01:18:10]   bench: mq4 kv=asym2
+[01:19:56]     -> status=pass tok_s=1.3 decode=1.4 prefill_tok_s=60.5
+[01:19:56] prune: /home/sadara/.hipfire/models/matrix/qwen3.6-27b.mq4.hfq (14G)
+[01:19:56] quantize: qwen3.6-27b.bf16.hfq -> mq6 (free=74GB)
+[01:28:13]   bench: mq6 kv=q8
+[01:30:02]     -> status=pass tok_s=1.5 decode=2.0 prefill_tok_s=22.6
+[01:30:02]   bench: mq6 kv=asym4
+[01:32:33]     -> status=pass tok_s=0.8 decode=1.1 prefill_tok_s=15.2
+[01:32:33]   bench: mq6 kv=asym3
+[01:35:22]     -> status=pass tok_s=0.8 decode=1.0 prefill_tok_s=14.0
+[01:35:22]   bench: mq6 kv=asym2
+[01:38:15]     -> status=pass tok_s=0.7 decode=0.9 prefill_tok_s=13.5
+[01:38:15] prune: /home/sadara/.hipfire/models/matrix/qwen3.6-27b.mq6.hfq (20G)
+[01:38:16] quantize: qwen3.6-27b.bf16.hfq -> oq4 (free=74GB)
+[01:53:15]   bench: oq4 kv=q8
+[01:55:14]     -> status=pass tok_s=2.3 decode=3.7 prefill_tok_s=23.7
+[01:55:14]   bench: oq4 kv=asym4
+[01:56:58]     -> status=pass tok_s=2.3 decode=3.7 prefill_tok_s=23.7
+[01:56:58]   bench: oq4 kv=asym3
+[01:58:32]     -> status=pass tok_s=2.2 decode=3.4 prefill_tok_s=23.7
+[01:58:32]   bench: oq4 kv=asym2
+[02:00:12]     -> status=pass tok_s=1.8 decode=2.5 prefill_tok_s=23.7
+[02:00:12] prune: /home/sadara/.hipfire/models/matrix/qwen3.6-27b.oq4.hfq (14G)
+[02:00:12] quantize: qwen3.6-27b.bf16.hfq -> oq8 (free=74GB)
+[02:16:02]   bench: oq8 kv=q8
+[02:25:59]     -> status=pass tok_s=0.2 decode=0.9 prefill_tok_s=1.0
+[02:25:59]   bench: oq8 kv=asym4
+[02:36:46]     -> status=pass tok_s=0.2 decode=0.9 prefill_tok_s=1.0
+[02:36:46]   bench: oq8 kv=asym3
+[02:47:58]     -> status=pass tok_s=0.2 decode=0.9 prefill_tok_s=0.9
+[02:47:58]   bench: oq8 kv=asym2
+[02:59:21]     -> status=pass tok_s=0.2 decode=0.9 prefill_tok_s=0.9
+[02:59:21] prune: /home/sadara/.hipfire/models/matrix/qwen3.6-27b.oq8.hfq (26G)
+[02:59:21] === PHASE 2: Hessian formats (collect-artifacts first) ===
+[02:59:21] skip Hessian for LFM2.5-350M.bf16.hfq (all done)
+[02:59:21] skip Hessian for qwen3.5-0.8b.bf16.hfq (all done)
+[02:59:21] skip Hessian for llama-3.2-1b-instruct.bf16.hfq (all done)
+[02:59:21] skip Hessian for qwen3.5-2b.bf16.hfq (all done)
+[02:59:21] skip Hessian for qwen3.6-35b-a3b.bf16.hfq (all done)
+[02:59:21] skip Hessian for qwen3.5-4b.bf16.hfq (all done)
+[02:59:21] skip Hessian for qwen3.5-9b.bf16.hfq (all done)
+[02:59:21] skip Hessian for qwen3.6-27b.bf16.hfq (all done)
+[02:59:21] === MATRIX COMPLETE ===
+[02:59:21] rows: 216  csv=/home/sadara/hipfire/benchmarks/results/quant-kv-matrix-20260626T2120Z/results.csv

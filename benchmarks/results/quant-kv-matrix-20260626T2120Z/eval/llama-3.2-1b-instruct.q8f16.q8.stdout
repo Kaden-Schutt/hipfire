@@ -1,0 +1,8 @@
+/home/sadara/hipfire/benchmarks/results/quant-kv-matrix-20260626T2120Z/eval/llama-3.2-1b-instruct.q8f16.q8
+admission: measured (no --compare or --reference provided; comparison skipped)
+results: 2
+  [pass] speed/daemon_prefill_decode_first suite=- item=- model=llama-3.2-1b-instruct.q8f16.hfq elapsed_ms=9552 tok_s=18.712 decode_tok_s=18.712 prefill_tok_s=455.58 ttft_ms=539.09 prefill_ms=537.77 gen_tok_s=18.712 implemented=true
+  [pass] speed/daemon_prefill_decode_reset suite=- item=- model=llama-3.2-1b-instruct.q8f16.hfq elapsed_ms=9552 tok_s=18.76 decode_tok_s=18.76 prefill_tok_s=464.2 ttft_ms=528.09 prefill_ms=527.79 gen_tok_s=18.76 implemented=true
+findings: 0
+admission findings: 0
+row findings: 0

@@ -1,0 +1,8 @@
+/home/sadara/hipfire/benchmarks/results/quant-kv-matrix-20260626T2120Z/eval/llama-3.2-1b-instruct.mq6.q8
+admission: incomplete (1 required evidence kind(s) missing)
+results: 0
+findings: 2
+admission findings: 0
+row findings: 2
+  [fail] speed/daemon_prefill_decode_first suite=- item=- reason=daemon load failed for speed eval model /home/sadara/.hipfire/models/matrix/llama-3.2-1b-instruct.mq6.hfq: daemon stdout closed unexpectedly
+  [fail] speed/daemon_prefill_decode_reset suite=- item=- reason=daemon load failed for speed eval model /home/sadara/.hipfire/models/matrix/llama-3.2-1b-instruct.mq6.hfq: daemon stdout closed unexpectedly
