@@ -252,7 +252,7 @@ macro_rules! load_optional_fn {
 
 impl HipRuntime {
     /// Load the HIP runtime via dlopen.
-    /// Searches standard paths: /opt/rocm/lib, system library path.
+    /// Searches the system library path, then /opt/rocm/lib.
     pub fn load() -> HipResult<Self> {
         #[cfg(target_os = "windows")]
         let lib = unsafe {
@@ -297,12 +297,18 @@ impl HipRuntime {
                 .or_else(|_| Library::new("libamdhip64.so.7"))
                 .or_else(|_| Library::new("libamdhip64.so.6"))
                 .or_else(|_| Library::new("libamdhip64.so.5"))
+                .or_else(|_| Library::new("/opt/rocm/lib/libamdhip64.so"))
+                .or_else(|_| Library::new("/opt/rocm/lib/libamdhip64.so.7"))
+                .or_else(|_| Library::new("/opt/rocm/lib/libamdhip64.so.6"))
+                .or_else(|_| Library::new("/opt/rocm/lib/libamdhip64.so.5"))
                 .map_err(|e| {
                     HipError::new(
                         0,
                         &format!(
                             "failed to dlopen libamdhip64.so: {e}. \
-                             Tried: libamdhip64.so, libamdhip64.so.7, .so.6, .so.5. \
+                             Tried: libamdhip64.so, libamdhip64.so.7, .so.6, .so.5, \
+                             /opt/rocm/lib/libamdhip64.so, /opt/rocm/lib/libamdhip64.so.7, \
+                             /opt/rocm/lib/libamdhip64.so.6, /opt/rocm/lib/libamdhip64.so.5. \
                              Is ROCm installed?"
                         ),
                     )
