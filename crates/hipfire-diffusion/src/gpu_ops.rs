@@ -568,6 +568,7 @@ pub(crate) fn launch_diffusion_vector_kernel(
     input_b: Option<&rdna_compute::GpuTensor>,
     n: i32,
     scalar: f32,
+    synchronize: bool,
 ) -> DiffusionResult<()> {
     let module_name = function_name;
     let kernel_source = source;
@@ -591,9 +592,20 @@ pub(crate) fn launch_diffusion_vector_kernel(
         0,
         &mut kernargs,
     )?;
-    gpu.hip
-        .device_synchronize()
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))
+    maybe_synchronize(gpu, synchronize)
+}
+
+/// Synchronize the device only when the caller round-trips its output to the
+/// host immediately. Resident ops pass `false` and rely on the single
+/// end-of-chain sync in [`download_resident`], collapsing ~200 per-op syncs per
+/// denoise step into one.
+fn maybe_synchronize(gpu: &mut rdna_compute::Gpu, synchronize: bool) -> DiffusionResult<()> {
+    if synchronize {
+        gpu.hip
+            .device_synchronize()
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn download_f32_buffer(
@@ -650,6 +662,7 @@ pub(crate) fn scale_model_input_hip_on_gpu(
         None,
         n,
         scale,
+        true,
     )?;
     let output = download_f32_buffer(gpu, &output_gpu, sample.len())?;
     gpu.hip
@@ -705,6 +718,7 @@ pub(crate) fn cfg_guidance_hip_on_gpu(
         Some(&positive_gpu),
         n,
         cfg_scale,
+        true,
     )?;
     let output = download_f32_buffer(gpu, &output_gpu, negative_pred.len())?;
     gpu.hip
@@ -758,6 +772,7 @@ pub(crate) fn tensor_add_hip_on_gpu(
         Some(&b_gpu),
         n,
         0.0,
+        true,
     )?;
     let data = download_f32_buffer(gpu, &output_gpu, a.data.len())?;
     gpu.hip
@@ -811,6 +826,7 @@ pub(crate) fn maybe_center_unet_input_hip_on_gpu(
         None,
         n,
         0.0,
+        true,
     )?;
     let data = download_f32_buffer(gpu, &output_gpu, sample.data.len())?;
     gpu.hip
@@ -837,6 +853,7 @@ pub(crate) fn launch_diffusion_layout_kernel(
     channels: usize,
     height: usize,
     width: usize,
+    synchronize: bool,
 ) -> DiffusionResult<()> {
     let module_name = function_name;
     let kernel_source = DIFFUSION_LAYOUT_HIP_SRC;
@@ -862,9 +879,7 @@ pub(crate) fn launch_diffusion_layout_kernel(
         0,
         &mut kernargs,
     )?;
-    gpu.hip
-        .device_synchronize()
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))
+    maybe_synchronize(gpu, synchronize)
 }
 
 pub(crate) fn add_channel_bias_nchw_hip_on_gpu(
@@ -910,6 +925,7 @@ pub(crate) fn add_channel_bias_nchw_hip_on_gpu(
         channels,
         height,
         width,
+        true,
     )?;
     let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
     gpu.hip
@@ -958,6 +974,7 @@ pub(crate) fn nchw_to_bsc_hip_on_gpu(
         channels,
         height,
         width,
+        true,
     )?;
     let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
     gpu.hip
@@ -1013,6 +1030,7 @@ pub(crate) fn bsc_to_nchw_hip_on_gpu(
         channels,
         height,
         width,
+        true,
     )?;
     let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
     gpu.hip
@@ -1024,6 +1042,7 @@ pub(crate) fn bsc_to_nchw_hip_on_gpu(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_diffusion_concat_kernel(
     gpu: &mut rdna_compute::Gpu,
     function_name: &str,
@@ -1032,6 +1051,7 @@ pub(crate) fn launch_diffusion_concat_kernel(
     output_gpu: &hip_bridge::DeviceBuffer,
     kernargs_tail: impl FnOnce(&mut hip_bridge::KernargBlob) -> DiffusionResult<()>,
     output_elements: usize,
+    synchronize: bool,
 ) -> DiffusionResult<()> {
     let module_name = function_name;
     let kernel_source = DIFFUSION_CONCAT_HIP_SRC;
@@ -1053,9 +1073,7 @@ pub(crate) fn launch_diffusion_concat_kernel(
         0,
         &mut kernargs,
     )?;
-    gpu.hip
-        .device_synchronize()
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))
+    maybe_synchronize(gpu, synchronize)
 }
 
 pub(crate) fn concat_channels_nchw_hip_on_gpu(
@@ -1110,6 +1128,7 @@ pub(crate) fn concat_channels_nchw_hip_on_gpu(
             Ok(())
         },
         output_elements,
+        true,
     )?;
     let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
     gpu.hip
@@ -1207,6 +1226,7 @@ pub(crate) fn concat_last_dim_hip_on_gpu(
             Ok(())
         },
         output_elements,
+        true,
     )?;
     let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
     gpu.hip
@@ -2381,12 +2401,18 @@ pub(crate) fn clone_resident(
 }
 
 /// Download a resident tensor to a host `CpuTensor` (used once at the end of a
-/// resident forward chain). Does not free `tensor`.
+/// resident forward chain). Does not free `tensor`. This is the single
+/// synchronization point for the resident path: the per-op `device_synchronize`
+/// calls are skipped (the ops run in submission order on one stream), so we sync
+/// once here before reading device memory back to the host.
 pub(crate) fn download_resident(
     gpu: &mut rdna_compute::Gpu,
     tensor: &rdna_compute::GpuTensor,
 ) -> DiffusionResult<CpuTensor> {
     let elements = checked_shape_elements("resident download", &tensor.shape)?;
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
     let data = download_f32_buffer(gpu, &tensor.buf, elements)?;
     Ok(CpuTensor {
         shape: tensor.shape.clone(),
@@ -2493,9 +2519,6 @@ pub(crate) fn conv2d_nchw_resident(
         0,
         &mut kernargs,
     )?;
-    gpu.hip
-        .device_synchronize()
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
     Ok(output)
 }
 
@@ -2550,9 +2573,6 @@ pub(crate) fn group_norm_nchw_resident(
         0,
         &mut kernargs,
     )?;
-    gpu.hip
-        .device_synchronize()
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
     Ok(output)
 }
 
@@ -2582,9 +2602,6 @@ pub(crate) fn silu_resident(
         0,
         &mut kernargs,
     )?;
-    gpu.hip
-        .device_synchronize()
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
     Ok(output)
 }
 
@@ -2614,6 +2631,7 @@ pub(crate) fn tensor_add_resident(
         Some(b),
         n,
         0.0,
+        false,
     )?;
     Ok(output)
 }
@@ -2648,6 +2666,7 @@ pub(crate) fn add_channel_bias_nchw_resident(
         channels,
         height,
         width,
+        false,
     )?;
     Ok(output)
 }
@@ -2697,9 +2716,6 @@ pub(crate) fn upsample_nearest2d_nchw_resident(
         0,
         &mut kernargs,
     )?;
-    gpu.hip
-        .device_synchronize()
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
     Ok(output)
 }
 
@@ -2727,6 +2743,7 @@ pub(crate) fn nchw_to_bsc_resident(
         channels,
         height,
         width,
+        false,
     )?;
     Ok(output)
 }
@@ -2762,6 +2779,7 @@ pub(crate) fn bsc_to_nchw_resident(
         channels,
         height,
         width,
+        false,
     )?;
     Ok(output)
 }
@@ -2833,9 +2851,6 @@ pub(crate) fn linear_optional_bias_resident(
         0,
         &mut kernargs,
     )?;
-    gpu.hip
-        .device_synchronize()
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
     Ok(output)
 }
 
@@ -2890,9 +2905,6 @@ pub(crate) fn scaled_dot_product_attention_resident(
         0,
         &mut kernargs,
     )?;
-    gpu.hip
-        .device_synchronize()
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
     Ok(output)
 }
 
@@ -2942,9 +2954,6 @@ pub(crate) fn layer_norm_resident(
         0,
         &mut kernargs,
     )?;
-    gpu.hip
-        .device_synchronize()
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
     Ok(output)
 }
 
@@ -2984,9 +2993,6 @@ pub(crate) fn geglu_gate_3d_resident(
         0,
         &mut kernargs,
     )?;
-    gpu.hip
-        .device_synchronize()
-        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
     Ok(output)
 }
 
@@ -3027,6 +3033,7 @@ pub(crate) fn concat_channels_nchw_resident(
             Ok(())
         },
         output_elements,
+        false,
     )?;
     Ok(output)
 }
