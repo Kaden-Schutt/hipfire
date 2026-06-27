@@ -2244,6 +2244,172 @@ struct HfqTensor {
     spilled_len: u64,
 }
 
+fn tensor_param_count(t: &HfqTensor) -> u64 {
+    t.shape
+        .iter()
+        .fold(1u64, |acc, &dim| acc.saturating_mul(dim as u64))
+}
+
+fn config_u64_any(config: &serde_json::Value, keys: &[&str]) -> Option<u64> {
+    fn get_from_scope(scope: &serde_json::Value, keys: &[&str]) -> Option<u64> {
+        keys.iter().find_map(|key| scope.get(*key)?.as_u64())
+    }
+
+    get_from_scope(config, keys)
+        .or_else(|| {
+            config
+                .get("text_config")
+                .and_then(|scope| get_from_scope(scope, keys))
+        })
+        .or_else(|| {
+            config
+                .get("moe")
+                .and_then(|scope| get_from_scope(scope, keys))
+        })
+        .or_else(|| {
+            config
+                .get("ffn_config")
+                .and_then(|scope| get_from_scope(scope, keys))
+        })
+}
+
+fn model_config_from_metadata(metadata: &serde_json::Value) -> &serde_json::Value {
+    metadata.get("config").unwrap_or(metadata)
+}
+
+fn routed_moe_config(metadata: &serde_json::Value) -> Option<(u64, u64)> {
+    let config = model_config_from_metadata(metadata);
+    let num_experts = config_u64_any(
+        config,
+        &[
+            "num_experts",
+            "n_routed_experts",
+            "num_local_experts",
+            "n_experts",
+        ],
+    )?;
+    let top_k = config_u64_any(
+        config,
+        &[
+            "num_experts_per_tok",
+            "num_experts_per_token",
+            "n_experts_per_tok",
+            "moe_top_k",
+            "top_k",
+            "num_selected_experts",
+        ],
+    )?;
+    if num_experts == 0 || top_k == 0 {
+        None
+    } else {
+        Some((num_experts, top_k))
+    }
+}
+
+fn is_routed_expert_tensor_name(name: &str) -> bool {
+    if name.contains(".shared_expert") || name.contains(".shared_experts.") {
+        return false;
+    }
+    name.contains(".mlp.experts.")
+        || name.contains(".ffn.experts.")
+        || name.contains(".block_sparse_moe.experts.")
+        || name.contains(".feed_forward.experts.")
+        || name.contains(".mixer.experts.")
+}
+
+fn parameter_counts_metadata(
+    metadata: &serde_json::Value,
+    tensors: &[HfqTensor],
+    total_params: u64,
+    quantized_params: u64,
+    skipped_params: u64,
+) -> serde_json::Value {
+    let mut routed_expert_params = 0u64;
+    for t in tensors {
+        if is_routed_expert_tensor_name(&t.name) {
+            routed_expert_params = routed_expert_params.saturating_add(tensor_param_count(t));
+        }
+    }
+
+    let (active_params, effective_params, moe) = if routed_expert_params > 0 {
+        if let Some((num_experts, top_k)) = routed_moe_config(metadata) {
+            let numerator = routed_expert_params.saturating_mul(top_k);
+            let routed_active = numerator / num_experts;
+            let active = total_params
+                .saturating_sub(routed_expert_params)
+                .saturating_add(routed_active);
+            (
+                active,
+                active,
+                Some(serde_json::json!({
+                    "num_experts": num_experts,
+                    "num_experts_per_tok": top_k,
+                    "routed_expert_params": routed_expert_params,
+                    "routed_expert_active_params": routed_active,
+                    "active_rule": "dense_and_shared_full_plus_routed_top_k_over_num_experts",
+                    "routed_active_fraction": {
+                        "numerator": numerator,
+                        "denominator": num_experts,
+                    },
+                })),
+            )
+        } else {
+            (
+                total_params,
+                total_params,
+                Some(serde_json::json!({
+                    "routed_expert_params": routed_expert_params,
+                    "active_rule": "unknown_top_k_or_num_experts",
+                })),
+            )
+        }
+    } else {
+        (total_params, total_params, None)
+    };
+
+    let source_total_params = total_params.saturating_add(skipped_params);
+    let mut counts = serde_json::json!({
+        "schema": "hipfire.parameter_counts.v1",
+        "total_params": total_params,
+        "source_total_params": source_total_params,
+        "active_params": active_params,
+        "effective_params": effective_params,
+        "quantized_params": quantized_params,
+        "skipped_params": skipped_params,
+    });
+    if let Some(moe) = moe {
+        if let serde_json::Value::Object(ref mut map) = counts {
+            map.insert("moe".to_string(), moe);
+        }
+    }
+    counts
+}
+
+fn insert_parameter_counts_metadata(
+    metadata: &mut serde_json::Value,
+    tensors: &[HfqTensor],
+    total_params: u64,
+    quantized_params: u64,
+    skipped_params: u64,
+) {
+    let counts = parameter_counts_metadata(
+        metadata,
+        tensors,
+        total_params,
+        quantized_params,
+        skipped_params,
+    );
+    if let serde_json::Value::Object(ref mut map) = metadata {
+        map.insert("parameter_counts".to_string(), counts);
+    }
+}
+
+fn insert_quant_format_metadata(metadata: &mut serde_json::Value, format: &str) {
+    if let serde_json::Value::Object(ref mut map) = metadata {
+        map.insert("quant_format".to_string(), serde_json::json!(format));
+    }
+}
+
 struct HfqInputTensor {
     name: String,
     quant_type: u8,
@@ -3604,6 +3770,7 @@ fn run_hfq_source_pipeline(
     input: &Path,
     output: &Path,
     format: HfqInputFormat,
+    format_label: &str,
 ) -> Result<(), String> {
     let hfq = HfqInputFile::open(input).map_err(|e| format!("open HFQ input: {e}"))?;
     eprintln!(
@@ -3712,6 +3879,14 @@ fn run_hfq_source_pipeline(
     eprintln!("  Output size:      {:.1} MB", total_bytes as f64 / 1e6);
     ldlq_report_and_validate(false)?;
     eprintln!("\nWriting: {}", output.display());
+    insert_parameter_counts_metadata(
+        &mut metadata,
+        &hfq_tensors,
+        total_params,
+        quantized_params,
+        0,
+    );
+    insert_quant_format_metadata(&mut metadata, format_label);
     let metadata_json =
         metadata_with_quantization_hash(metadata, &hfq_tensors, None).map_err(|e| e.to_string())?;
     write_hfq(output, hfq.arch_id, &metadata_json, &hfq_tensors, None)
@@ -4567,6 +4742,7 @@ fn run_gguf_pipeline(
     input: &Path,
     output: &Path,
     format: GgufFormat,
+    format_label: &str,
     no_kmap: bool,
     kmap_dense: bool,
     kmap_mode: u8,
@@ -4610,9 +4786,10 @@ fn run_gguf_pipeline(
     // metadata tree under `gguf_meta` for any consumer that wants original
     // values (chat template, vocab, scores, merges, etc.).
     let config_json = config_json_from_gguf(&gguf, &arch_str);
-    let metadata = serde_json::json!({
+    let mut metadata = serde_json::json!({
         "architecture": arch_str,
         "source": "gguf",
+        "quant_format": format_label,
         "config": config_json,
         "gguf_meta": gguf_meta_to_json(&gguf.metadata),
     });
@@ -4942,6 +5119,7 @@ fn run_gguf_pipeline(
         100.0 * total_bytes_out as f64 / total_bytes_in as f64,
     );
 
+    insert_parameter_counts_metadata(&mut metadata, &hfq_tensors, total_params, quant_params, 0);
     let metadata_json = metadata_with_quantization_hash(metadata, &hfq_tensors, None)?;
     write_hfq(output, arch_id, &metadata_json, &hfq_tensors, None)?;
     eprintln!("\nWrote: {}", output.display());
@@ -6012,7 +6190,7 @@ fn main() {
                 std::process::exit(2);
             });
             let out = Path::new(output_path);
-            if let Err(e) = run_hfq_source_pipeline(raw_input, out, hfq_format) {
+            if let Err(e) = run_hfq_source_pipeline(raw_input, out, hfq_format, format) {
                 eprintln!("HFQ input pipeline failed: {e}");
                 std::process::exit(2);
             }
@@ -6027,9 +6205,15 @@ fn main() {
                 std::process::exit(2);
             });
             let out = Path::new(output_path);
-            if let Err(e) =
-                run_gguf_pipeline(raw_input, out, gguf_format, no_kmap, kmap_dense, kmap_mode)
-            {
+            if let Err(e) = run_gguf_pipeline(
+                raw_input,
+                out,
+                gguf_format,
+                format,
+                no_kmap,
+                kmap_dense,
+                kmap_mode,
+            ) {
                 eprintln!("GGUF pipeline failed: {e}");
                 std::process::exit(2);
             }
@@ -6288,6 +6472,7 @@ fn main() {
     // production so it covers the final quantized payload bytes.
     let mut metadata = serde_json::json!({
         "architecture": arch_str,
+        "quant_format": format,
         "config": config,
         "tokenizer": tokenizer_str.as_deref().unwrap_or("{}"),
         "tokenizer_config": tokenizer_config,
@@ -10006,6 +10191,14 @@ fn main() {
         pack_qtip3_real_tensors(&mut hfq_tensors, &qtip_cb, &qtip_s1, &qtip_s2);
     }
 
+    insert_parameter_counts_metadata(
+        &mut metadata,
+        &hfq_tensors,
+        total_params,
+        quantized_params,
+        skipped_params,
+    );
+
     // Write .hfq file
     eprintln!("\nWriting: {}", output_path.display());
     // Final spill before writing
@@ -10064,6 +10257,104 @@ mod xxh64_provenance_tests {
         assert!(hash["producer"].get("git_branch").is_some());
         assert!(hash["producer"].get("git_describe").is_some());
         assert!(hash["producer"].get("git_dirty").is_some());
+    }
+
+    #[test]
+    fn quant_format_is_inserted_into_metadata() {
+        let mut metadata = serde_json::json!({ "architecture": "qwen3" });
+        insert_quant_format_metadata(&mut metadata, "mq4");
+
+        assert_eq!(metadata["quant_format"], "mq4");
+    }
+
+    #[test]
+    fn parameter_counts_metadata_records_dense_counts() {
+        let tensors = vec![
+            HfqTensor {
+                name: "model.layers.0.self_attn.q_proj.weight".to_string(),
+                quant_type: QuantType::MQ4G256,
+                shape: vec![2, 4],
+                group_size: 256,
+                data: vec![],
+                spilled_len: 0,
+            },
+            HfqTensor {
+                name: "model.layers.0.input_layernorm.weight".to_string(),
+                quant_type: QuantType::F16,
+                shape: vec![4],
+                group_size: 0,
+                data: vec![],
+                spilled_len: 0,
+            },
+        ];
+        let metadata = serde_json::json!({
+            "architecture": "qwen3_5",
+            "config": { "hidden_size": 4 },
+        });
+        let counts = parameter_counts_metadata(&metadata, &tensors, 12, 8, 3);
+
+        assert_eq!(counts["schema"], "hipfire.parameter_counts.v1");
+        assert_eq!(counts["total_params"], 12);
+        assert_eq!(counts["source_total_params"], 15);
+        assert_eq!(counts["active_params"], 12);
+        assert_eq!(counts["effective_params"], 12);
+        assert_eq!(counts["quantized_params"], 8);
+        assert_eq!(counts["skipped_params"], 3);
+        assert!(counts.get("moe").is_none());
+    }
+
+    #[test]
+    fn parameter_counts_metadata_scales_routed_moe_by_top_k() {
+        let mut tensors = Vec::new();
+        tensors.push(HfqTensor {
+            name: "model.layers.0.self_attn.q_proj.weight".to_string(),
+            quant_type: QuantType::MQ4G256,
+            shape: vec![10],
+            group_size: 256,
+            data: vec![],
+            spilled_len: 0,
+        });
+        for expert in 0..4 {
+            tensors.push(HfqTensor {
+                name: format!(
+                    "model.language_model.layers.0.mlp.experts.{expert}.gate_up_proj.weight"
+                ),
+                quant_type: QuantType::MQ4G256,
+                shape: vec![3, 5],
+                group_size: 256,
+                data: vec![],
+                spilled_len: 0,
+            });
+            tensors.push(HfqTensor {
+                name: format!(
+                    "model.language_model.layers.0.mlp.experts.{expert}.down_proj.weight"
+                ),
+                quant_type: QuantType::MQ4G256,
+                shape: vec![3, 5],
+                group_size: 256,
+                data: vec![],
+                spilled_len: 0,
+            });
+        }
+        let metadata = serde_json::json!({
+            "architecture": "qwen3_5_moe",
+            "config": {
+                "text_config": {
+                    "num_experts": 4,
+                    "num_experts_per_tok": 2
+                }
+            },
+        });
+        let counts = parameter_counts_metadata(&metadata, &tensors, 130, 120, 0);
+
+        assert_eq!(counts["total_params"], 130);
+        assert_eq!(counts["source_total_params"], 130);
+        assert_eq!(counts["moe"]["routed_expert_params"], 120);
+        assert_eq!(counts["moe"]["routed_expert_active_params"], 60);
+        assert_eq!(counts["active_params"], 70);
+        assert_eq!(counts["effective_params"], 70);
+        assert_eq!(counts["moe"]["num_experts"], 4);
+        assert_eq!(counts["moe"]["num_experts_per_tok"], 2);
     }
 }
 

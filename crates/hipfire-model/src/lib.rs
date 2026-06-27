@@ -79,6 +79,13 @@ pub struct HfqMetadata {
     pub metadata_json: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HfqIndexTensor {
+    name: String,
+    quant_type: u8,
+    shape: Vec<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum HfqTokenizerMetadata {
     HfJson(String),
@@ -811,9 +818,19 @@ pub struct ModelCard {
 /// Build a [`ModelCard`] for a primary model file.
 pub fn model_card(path: &Path) -> ModelCard {
     let name = model_display_name(path);
-    let arch_id = read_hfq_metadata(path).ok().map(|m| m.arch_id);
+    let inventory = read_hfq_inventory(path).ok();
+    let arch_id = inventory.as_ref().map(|(m, _)| m.arch_id);
+    let quant = inventory
+        .as_ref()
+        .and_then(|(m, tensors)| {
+            serde_json::from_str::<Value>(&m.metadata_json)
+                .ok()
+                .and_then(|v| metadata_quant_token(&v))
+                .or_else(|| index_quant_token(tensors))
+        })
+        .unwrap_or_else(|| "unknown".to_string());
     ModelCard {
-        quant: quant_token(&name),
+        quant,
         features: arch_features(arch_id.unwrap_or(u32::MAX)),
         sidecars: detect_sidecars(path),
         arch_id,
@@ -1006,6 +1023,99 @@ pub fn read_hfq_metadata(path: &Path) -> Result<HfqMetadata, String> {
     })
 }
 
+fn read_hfq_inventory(path: &Path) -> Result<(HfqMetadata, Vec<HfqIndexTensor>), String> {
+    let mut f = File::open(path).map_err(|e| format!("open model: {e}"))?;
+    let mut header = [0u8; 32];
+    f.read_exact(&mut header)
+        .map_err(|e| format!("read HFQ header: {e}"))?;
+    if &header[0..4] != b"HFQM" {
+        return Err("not an HFQ container".to_string());
+    }
+    let arch_id = u32::from_le_bytes(header[8..12].try_into().unwrap());
+    let n_tensors = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+    let metadata_offset = u64::from_le_bytes(header[16..24].try_into().unwrap()) as usize;
+    let data_offset = u64::from_le_bytes(header[24..32].try_into().unwrap()) as usize;
+    let span_len = data_offset.saturating_sub(metadata_offset);
+    if span_len == 0 || span_len > 256 * 1024 * 1024 {
+        return Err(format!(
+            "invalid or too-large metadata span: {metadata_offset}..{data_offset}"
+        ));
+    }
+    f.seek(SeekFrom::Start(metadata_offset as u64))
+        .map_err(|e| format!("seek HFQ metadata span: {e}"))?;
+    let mut span = vec![0u8; span_len];
+    f.read_exact(&mut span)
+        .map_err(|e| format!("read HFQ metadata span: {e}"))?;
+    let json_end = find_json_object_end(&span)
+        .ok_or_else(|| "HFQ metadata JSON object was not terminated".to_string())?;
+    let metadata_json = String::from_utf8(span[..json_end].to_vec())
+        .map_err(|e| format!("HFQ metadata is not UTF-8: {e}"))?;
+
+    if n_tensors == 0 && json_end == span.len() {
+        return Ok((
+            HfqMetadata {
+                arch_id,
+                metadata_json,
+            },
+            Vec::new(),
+        ));
+    }
+
+    let mut pos = json_end;
+    if pos + 4 > span.len() {
+        return Err("HFQ index missing tensor count".to_string());
+    }
+    let idx_n = u32::from_le_bytes(span[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    if idx_n != n_tensors {
+        return Err(format!(
+            "HFQ index count {idx_n} != header tensor count {n_tensors}"
+        ));
+    }
+
+    let mut tensors = Vec::with_capacity(idx_n);
+    for _ in 0..idx_n {
+        if pos + 2 > span.len() {
+            return Err("HFQ index truncated at name length".to_string());
+        }
+        let name_len = u16::from_le_bytes(span[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2;
+        if pos + name_len + 2 > span.len() {
+            return Err("HFQ index truncated at name/shape header".to_string());
+        }
+        let name = String::from_utf8(span[pos..pos + name_len].to_vec())
+            .map_err(|e| format!("HFQ tensor name is not UTF-8: {e}"))?;
+        pos += name_len;
+        let quant_type = span[pos];
+        pos += 1;
+        let n_dims = span[pos] as usize;
+        pos += 1;
+        if pos + n_dims * 4 + 12 > span.len() {
+            return Err("HFQ index truncated at shape/data size".to_string());
+        }
+        let mut shape = Vec::with_capacity(n_dims);
+        for _ in 0..n_dims {
+            shape.push(u32::from_le_bytes(span[pos..pos + 4].try_into().unwrap()));
+            pos += 4;
+        }
+        pos += 4; // group_size
+        pos += 8; // data_size
+        tensors.push(HfqIndexTensor {
+            name,
+            quant_type,
+            shape,
+        });
+    }
+
+    Ok((
+        HfqMetadata {
+            arch_id,
+            metadata_json,
+        },
+        tensors,
+    ))
+}
+
 /// Resolve a model identifier to a file path using the standard Hipfire local
 /// lookup order.
 pub fn find_model_in(arg: &str, models_dir: &Path, aliases_path: Option<&Path>) -> Option<PathBuf> {
@@ -1094,6 +1204,22 @@ pub struct ModelArtifactName {
     pub arch: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ModelParameterCounts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_params: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_total_params: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_params: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_params: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantized_params: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped_params: Option<u64>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LlmModelRegistryEntry {
     pub id: String,
@@ -1102,10 +1228,14 @@ pub struct LlmModelRegistryEntry {
     pub bytes: u64,
     pub model: String,
     pub size: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameter_counts: Option<ModelParameterCounts>,
     pub tags: Vec<String>,
     pub features: Vec<String>,
     pub quant: String,
     pub arch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hfq_arch_id: Option<u32>,
     pub triattn: Vec<ModelRegistryAsset>,
     pub drafts: Vec<ModelRegistryAsset>,
     pub chat_templates: Vec<ModelRegistryAsset>,
@@ -1133,6 +1263,295 @@ impl LlmModelRegistry {
     }
 }
 
+fn metadata_u64(value: Option<&Value>) -> Option<u64> {
+    match value? {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn metadata_string(value: Option<&Value>) -> Option<String> {
+    value?
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+}
+
+fn metadata_string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|v| metadata_string(Some(v)))
+        .collect()
+}
+
+fn config_u64_any(config: &Value, keys: &[&str]) -> Option<u64> {
+    fn get_from_scope(scope: &Value, keys: &[&str]) -> Option<u64> {
+        keys.iter().find_map(|key| metadata_u64(scope.get(*key)))
+    }
+
+    get_from_scope(config, keys)
+        .or_else(|| {
+            config
+                .get("text_config")
+                .and_then(|scope| get_from_scope(scope, keys))
+        })
+        .or_else(|| {
+            config
+                .get("moe")
+                .and_then(|scope| get_from_scope(scope, keys))
+        })
+        .or_else(|| {
+            config
+                .get("ffn_config")
+                .and_then(|scope| get_from_scope(scope, keys))
+        })
+}
+
+fn routed_moe_config_from_metadata(metadata: &Value) -> Option<(u64, u64)> {
+    let config = metadata.get("config").unwrap_or(metadata);
+    let num_experts = config_u64_any(
+        config,
+        &[
+            "num_experts",
+            "n_routed_experts",
+            "num_local_experts",
+            "n_experts",
+        ],
+    )?;
+    let top_k = config_u64_any(
+        config,
+        &[
+            "num_experts_per_tok",
+            "num_experts_per_token",
+            "n_experts_per_tok",
+            "moe_top_k",
+            "top_k",
+            "num_selected_experts",
+        ],
+    )?;
+    (num_experts > 0 && top_k > 0).then_some((num_experts, top_k))
+}
+
+fn is_routed_expert_tensor_name(name: &str) -> bool {
+    if name.contains(".shared_expert") || name.contains(".shared_experts.") {
+        return false;
+    }
+    name.contains(".mlp.experts.")
+        || name.contains(".ffn.experts.")
+        || name.contains(".block_sparse_moe.experts.")
+        || name.contains(".feed_forward.experts.")
+        || name.contains(".mixer.experts.")
+}
+
+fn index_tensor_param_count(tensor: &HfqIndexTensor) -> u64 {
+    tensor
+        .shape
+        .iter()
+        .fold(1u64, |acc, &dim| acc.saturating_mul(dim as u64))
+}
+
+pub fn hfq_parameter_counts(metadata: &Value) -> Option<ModelParameterCounts> {
+    let counts = metadata.get("parameter_counts")?;
+    let parsed = ModelParameterCounts {
+        total_params: metadata_u64(counts.get("total_params")),
+        source_total_params: metadata_u64(counts.get("source_total_params")),
+        active_params: metadata_u64(counts.get("active_params")),
+        effective_params: metadata_u64(counts.get("effective_params")),
+        quantized_params: metadata_u64(counts.get("quantized_params")),
+        skipped_params: metadata_u64(counts.get("skipped_params")),
+    };
+    (parsed.total_params.is_some()
+        || parsed.source_total_params.is_some()
+        || parsed.active_params.is_some()
+        || parsed.effective_params.is_some()
+        || parsed.quantized_params.is_some()
+        || parsed.skipped_params.is_some())
+    .then_some(parsed)
+}
+
+fn parameter_counts_from_hfq_index(
+    metadata: &Value,
+    tensors: &[HfqIndexTensor],
+) -> Option<ModelParameterCounts> {
+    let total_params = tensors
+        .iter()
+        .map(index_tensor_param_count)
+        .fold(0u64, u64::saturating_add);
+    if total_params == 0 {
+        return None;
+    }
+    let routed_expert_params = tensors
+        .iter()
+        .filter(|tensor| is_routed_expert_tensor_name(&tensor.name))
+        .map(index_tensor_param_count)
+        .fold(0u64, u64::saturating_add);
+    let effective_params = if routed_expert_params > 0 {
+        if let Some((num_experts, top_k)) = routed_moe_config_from_metadata(metadata) {
+            total_params
+                .saturating_sub(routed_expert_params)
+                .saturating_add(routed_expert_params.saturating_mul(top_k) / num_experts)
+        } else {
+            total_params
+        }
+    } else {
+        total_params
+    };
+
+    Some(ModelParameterCounts {
+        total_params: Some(total_params),
+        source_total_params: Some(total_params),
+        active_params: Some(effective_params),
+        effective_params: Some(effective_params),
+        quantized_params: None,
+        skipped_params: None,
+    })
+}
+
+fn compact_param_count(count: u64) -> String {
+    const UNITS: &[(&str, u64)] = &[
+        ("T", 1_000_000_000_000),
+        ("B", 1_000_000_000),
+        ("M", 1_000_000),
+        ("K", 1_000),
+    ];
+    for &(suffix, base) in UNITS {
+        if count >= base {
+            let whole = count / base;
+            let rem = count % base;
+            if rem == 0 || whole >= 100 {
+                return format!("{whole}{suffix}");
+            }
+            let tenth = (rem * 10 + base / 2) / base;
+            return if tenth == 10 {
+                format!("{}{}", whole + 1, suffix)
+            } else if tenth == 0 {
+                format!("{whole}{suffix}")
+            } else {
+                format!("{whole}.{tenth}{suffix}")
+            };
+        }
+    }
+    count.to_string()
+}
+
+fn parameter_count_size_label(counts: &ModelParameterCounts) -> Option<String> {
+    let total = counts.source_total_params.or(counts.total_params);
+    let effective = counts.effective_params.or(counts.active_params);
+    let active = counts.active_params;
+    match total {
+        Some(total) => {
+            let total_label = compact_param_count(total);
+            if let Some(effective) = effective.filter(|&n| n != total) {
+                Some(format!("{total_label}-E{}", compact_param_count(effective)))
+            } else if let Some(active) = active.filter(|&n| n != total) {
+                Some(format!("{total_label}-A{}", compact_param_count(active)))
+            } else {
+                Some(total_label)
+            }
+        }
+        None => effective
+            .map(|n| format!("E{}", compact_param_count(n)))
+            .or_else(|| active.map(|n| format!("A{}", compact_param_count(n)))),
+    }
+}
+
+fn metadata_model_name(metadata: &Value, fallback_path: &Path) -> String {
+    let config = metadata.get("config").unwrap_or(metadata);
+    let candidates = [
+        metadata.get("model_name"),
+        metadata.get("model_id"),
+        metadata.get("name"),
+        config.get("_name_or_path"),
+        config.get("name_or_path"),
+    ];
+    candidates
+        .into_iter()
+        .filter_map(metadata_string)
+        .filter_map(|name| {
+            let trimmed = name.trim().trim_end_matches(|c| c == '/' || c == '\\');
+            let leaf = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed).trim();
+            (!leaf.is_empty() && leaf != ".").then(|| leaf.to_string())
+        })
+        .next()
+        .unwrap_or_else(|| model_display_name(fallback_path))
+}
+
+fn metadata_quant_token(metadata: &Value) -> Option<String> {
+    [
+        metadata.get("quant_format"),
+        metadata.get("output_quant_format"),
+        metadata.get("quant"),
+        metadata.get("quantization").and_then(|q| q.get("format")),
+        metadata
+            .get("hipfire_quantization")
+            .and_then(|q| q.get("format")),
+    ]
+    .into_iter()
+    .filter_map(metadata_string)
+    .next()
+    .map(|s| s.to_ascii_lowercase())
+}
+
+fn index_quant_token(tensors: &[HfqIndexTensor]) -> Option<String> {
+    let mut params_by_token = std::collections::BTreeMap::<&'static str, u64>::new();
+    for tensor in tensors {
+        let token = match tensor.quant_type {
+            0 => "q4f16",
+            1 => "f16",
+            2 => "f32",
+            3 => "q8",
+            4 => "q4k",
+            5 => "q8hfq",
+            6 | 7 => "hfq4",
+            8 => "hfq6",
+            9 | 10 => "hfq2",
+            11 | 12 => "hfq3",
+            13 => "mq4",
+            14 => "mq8",
+            15 => "mq6",
+            16 => "bf16",
+            17 => "mq3",
+            18 => "mq2",
+            19 => "lloyd-mq2",
+            20 => "lloyd-mq3",
+            21 => "hfp4",
+            24 => "mfp4",
+            28 => "paro4",
+            29 => "paro4t",
+            30 => "lloyd-mq4",
+            31 => "qtip3",
+            33 => "oq4+",
+            34 => "oq4",
+            35 => "oq8",
+            36 => "oq4+c",
+            _ => continue,
+        };
+        let entry = params_by_token.entry(token).or_insert(0);
+        *entry = entry.saturating_add(index_tensor_param_count(tensor));
+    }
+    params_by_token
+        .into_iter()
+        .max_by(|(a_token, a_params), (b_token, b_params)| {
+            a_params.cmp(b_params).then_with(|| b_token.cmp(a_token))
+        })
+        .map(|(token, _)| token.to_string())
+}
+
+fn metadata_artifact_arch(metadata: &Value) -> Option<String> {
+    [
+        metadata.get("artifact_arch"),
+        metadata.get("gpu_arch"),
+        metadata.get("target_arch"),
+    ]
+    .into_iter()
+    .filter_map(metadata_string)
+    .next()
+}
+
 pub fn build_local_llm_registry() -> LlmModelRegistry {
     let hipfire = hipfire_config::hipfire_dir();
     build_llm_registry_in(
@@ -1152,16 +1571,29 @@ pub fn build_llm_registry_in(
     let triattn = scan_registry_assets(triattn_dir, is_triattn_file_name);
     let drafts = scan_registry_assets(drafts_dir, is_draft_file_name);
     let chat_templates = scan_registry_assets(templates_dir, is_chat_template_file_name);
-    let models = scan_canonical_primary_models(models_dir)
+    let models = scan_primary_models(models_dir)
         .into_iter()
-        .map(|model| {
+        .filter_map(|model| {
             let file = model
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            let parsed = parse_canonical_model_artifact_name(&file)
-                .expect("scan_canonical_primary_models only returns parseable model artifacts");
+            let (metadata, tensors) = read_hfq_inventory(&model).ok()?;
+            let metadata_value: Value =
+                serde_json::from_str(&metadata.metadata_json).unwrap_or(Value::Null);
+            let parameter_counts = hfq_parameter_counts(&metadata_value)
+                .or_else(|| parameter_counts_from_hfq_index(&metadata_value, &tensors));
+            let size = parameter_counts
+                .as_ref()
+                .and_then(parameter_count_size_label);
+            let model_name = metadata_model_name(&metadata_value, &model);
+            let tags = metadata_string_array(metadata_value.get("tags"));
+            let features = metadata_string_array(metadata_value.get("features"));
+            let quant = metadata_quant_token(&metadata_value)
+                .or_else(|| index_quant_token(&tensors))
+                .unwrap_or_else(|| "unknown".to_string());
+            let arch = metadata_artifact_arch(&metadata_value);
             let mut model_triattn =
                 matching_assets(&triattn, |asset| triattn_matches_model(&asset.file, &file));
             model_triattn.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.path.cmp(&b.path)));
@@ -1176,21 +1608,23 @@ pub fn build_llm_registry_in(
                 template_matches_model(&asset.file, &file)
             });
 
-            LlmModelRegistryEntry {
+            Some(LlmModelRegistryEntry {
                 id: model_display_name(&model),
                 file,
                 path: model.to_string_lossy().to_string(),
                 bytes: file_len(&model),
-                model: parsed.model,
-                size: parsed.size,
-                tags: parsed.tags,
-                features: parsed.features,
-                quant: parsed.quant,
-                arch: parsed.arch,
+                model: model_name,
+                size,
+                parameter_counts,
+                tags,
+                features,
+                quant,
+                arch,
+                hfq_arch_id: Some(metadata.arch_id),
                 triattn: model_triattn,
                 drafts: model_drafts,
                 chat_templates: model_templates,
-            }
+            })
         })
         .collect::<Vec<_>>();
 
@@ -1206,21 +1640,8 @@ pub fn build_llm_registry_in(
     }
 }
 
-fn scan_canonical_primary_models(models_dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(models_dir) else {
-        return Vec::new();
-    };
-    let mut out: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.is_file()
-                && p.file_name()
-                    .and_then(|name| name.to_str())
-                    .and_then(parse_canonical_model_artifact_name)
-                    .is_some()
-        })
-        .collect();
+fn scan_primary_models(models_dir: &Path) -> Vec<PathBuf> {
+    let mut out = list_local_models_in(models_dir);
     out.sort();
     out
 }
@@ -2152,47 +2573,115 @@ mod tests {
         fs::create_dir_all(&triattn).unwrap();
         fs::create_dir_all(&drafts).unwrap();
         fs::create_dir_all(&templates).unwrap();
-        fs::write(models.join("Qwen3.5-9B-it.mtp.vl.mq4.hfq"), "model").unwrap();
+        let metadata = json!({
+            "architecture": "deepseek4_flash",
+            "quant_format": "mq4",
+            "config": {
+                "_name_or_path": "deepseek-ai/Deepseek-v4-Flash",
+                "model_type": "deepseek_v4",
+            },
+            "parameter_counts": {
+                "schema": "hipfire.parameter_counts.v1",
+                "total_params": 671_000_000_000u64,
+                "active_params": 37_000_000_000u64,
+                "effective_params": 37_000_000_000u64,
+                "quantized_params": 620_000_000_000u64,
+            },
+            "features": ["mtp-vl"],
+            "tags": ["flash"],
+        });
+        write_minimal_hfq(&models.join("Deepseek-v4-Flash.hfq"), &metadata);
         fs::write(models.join("qwen35-9b-hf4.hfq"), "old model").unwrap();
-        fs::write(models.join("Qwen3.5-9B-it.mtp.vl.mq4.mtp.hfq"), "mtp").unwrap();
-        fs::write(
-            models.join("Qwen3.5-9B-it.mtp.vl.mq4.hfq.triattn.hfq"),
-            "old tri",
-        )
-        .unwrap();
-        fs::write(triattn.join("Qwen3.5-9B-it.mtp.vl.mq4.triattn.hfq"), "tri").unwrap();
-        fs::write(drafts.join("Qwen3.5-9B-it.mtp.vl.mq4.dflash.hfq"), "draft").unwrap();
-        fs::write(
-            drafts.join("Qwen3.5-9B-it.mtp.vl.mq4.draft.hfq"),
-            "old draft",
-        )
-        .unwrap();
-        fs::write(templates.join("Qwen3.5-9B-it.mtp.vl.mq4.jinja"), "template").unwrap();
-        fs::write(
-            templates.join("Qwen3.5-9B-it.mtp.vl.mq4.hfq.j2"),
-            "old template",
-        )
-        .unwrap();
+        fs::write(models.join("Deepseek-v4-Flash.mtp.hfq"), "mtp").unwrap();
+        fs::write(models.join("Deepseek-v4-Flash.hfq.triattn.hfq"), "old tri").unwrap();
+        fs::write(triattn.join("Deepseek-v4-Flash.triattn.hfq"), "tri").unwrap();
+        fs::write(drafts.join("Deepseek-v4-Flash.dflash.hfq"), "draft").unwrap();
+        fs::write(drafts.join("Deepseek-v4-Flash.draft.hfq"), "old draft").unwrap();
+        fs::write(templates.join("Deepseek-v4-Flash.jinja"), "template").unwrap();
+        fs::write(templates.join("Deepseek-v4-Flash.hfq.j2"), "old template").unwrap();
 
         let registry = build_llm_registry_in(&models, &triattn, &drafts, &templates);
 
         assert_eq!(registry.model_count(), 1);
         assert_eq!(registry.sidecar_count(), 3);
         let model = &registry.models[0];
-        assert_eq!(model.id, "Qwen3.5-9B-it.mtp.vl.mq4");
-        assert_eq!(model.model, "Qwen3.5");
-        assert_eq!(model.size.as_deref(), Some("9B"));
-        assert_eq!(model.tags, vec!["it"]);
-        assert_eq!(model.features, vec!["mtp", "vl"]);
+        assert_eq!(model.id, "Deepseek-v4-Flash");
+        assert_eq!(model.model, "Deepseek-v4-Flash");
+        assert_eq!(model.size.as_deref(), Some("671B-E37B"));
+        assert_eq!(
+            model
+                .parameter_counts
+                .as_ref()
+                .and_then(|counts| counts.effective_params),
+            Some(37_000_000_000)
+        );
+        assert_eq!(model.tags, vec!["flash"]);
+        assert_eq!(model.features, vec!["mtp-vl"]);
+        assert_eq!(model.quant, "mq4");
+        assert_eq!(model.hfq_arch_id, Some(1));
+        assert_eq!(model.triattn[0].file, "Deepseek-v4-Flash.triattn.hfq");
+        assert_eq!(model.drafts[0].file, "Deepseek-v4-Flash.dflash.hfq");
+        assert_eq!(model.chat_templates[0].file, "Deepseek-v4-Flash.jinja");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn llm_registry_derives_legacy_hfq_size_and_quant_from_index() {
+        let root = temp_dir("hipfire-model-registry-index");
+        let models = root.join("models");
+        let triattn = root.join("triattn");
+        let drafts = root.join("drafts");
+        let templates = root.join("templates");
+        fs::create_dir_all(&models).unwrap();
+        fs::create_dir_all(&triattn).unwrap();
+        fs::create_dir_all(&drafts).unwrap();
+        fs::create_dir_all(&templates).unwrap();
+        let metadata = json!({
+            "architecture": "deepseek4_flash",
+            "config": {
+                "num_experts": 16,
+                "num_experts_per_tok": 1,
+            },
+        });
+        write_index_hfq(
+            &models.join("Deepseek-v4-Flash.hfq"),
+            &metadata,
+            &[
+                (
+                    "model.layers.0.mlp.experts.0.gate_proj.weight",
+                    13,
+                    &[640_000_000, 1],
+                ),
+                (
+                    "model.layers.0.self_attn.q_proj.weight",
+                    16,
+                    &[31_000_000, 1],
+                ),
+            ],
+        );
+
+        let registry = build_llm_registry_in(&models, &triattn, &drafts, &templates);
+
+        assert_eq!(registry.model_count(), 1);
+        let model = &registry.models[0];
+        assert_eq!(model.id, "Deepseek-v4-Flash");
+        assert_eq!(model.model, "Deepseek-v4-Flash");
+        assert_eq!(model.size.as_deref(), Some("671M-E71M"));
         assert_eq!(model.quant, "mq4");
         assert_eq!(
-            model.triattn[0].file,
-            "Qwen3.5-9B-it.mtp.vl.mq4.triattn.hfq"
+            model
+                .parameter_counts
+                .as_ref()
+                .and_then(|counts| counts.total_params),
+            Some(671_000_000)
         );
-        assert_eq!(model.drafts[0].file, "Qwen3.5-9B-it.mtp.vl.mq4.dflash.hfq");
         assert_eq!(
-            model.chat_templates[0].file,
-            "Qwen3.5-9B-it.mtp.vl.mq4.jinja"
+            model
+                .parameter_counts
+                .as_ref()
+                .and_then(|counts| counts.effective_params),
+            Some(71_000_000)
         );
 
         let _ = fs::remove_dir_all(root);
@@ -2771,6 +3260,36 @@ mod tests {
         bytes.extend_from_slice(&metadata_offset.to_le_bytes());
         bytes.extend_from_slice(&data_offset.to_le_bytes());
         bytes.extend_from_slice(&metadata_bytes);
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn write_index_hfq(path: &Path, metadata: &serde_json::Value, tensors: &[(&str, u8, &[u32])]) {
+        let metadata_bytes = serde_json::to_vec(metadata).unwrap();
+        let mut index = Vec::new();
+        index.extend_from_slice(&(tensors.len() as u32).to_le_bytes());
+        for &(name, quant_type, shape) in tensors {
+            let name_bytes = name.as_bytes();
+            index.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            index.extend_from_slice(name_bytes);
+            index.push(quant_type);
+            index.push(shape.len() as u8);
+            for &dim in shape {
+                index.extend_from_slice(&dim.to_le_bytes());
+            }
+            index.extend_from_slice(&0u32.to_le_bytes());
+            index.extend_from_slice(&0u64.to_le_bytes());
+        }
+        let metadata_offset = 32u64;
+        let data_offset = metadata_offset + metadata_bytes.len() as u64 + index.len() as u64;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"HFQM");
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&(tensors.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&metadata_offset.to_le_bytes());
+        bytes.extend_from_slice(&data_offset.to_le_bytes());
+        bytes.extend_from_slice(&metadata_bytes);
+        bytes.extend_from_slice(&index);
         fs::write(path, bytes).unwrap();
     }
 

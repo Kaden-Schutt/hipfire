@@ -8,8 +8,8 @@ use std::path::Path;
 
 use hipfire_config::models_dir;
 use hipfire_model::{
-    build_local_llm_registry, list_local_models_in, model_card, ArchFeatures, FeatureSupport,
-    LlmModelRegistryEntry, ModelCard, Sidecars,
+    build_local_llm_registry, model_card, ArchFeatures, FeatureSupport, LlmModelRegistryEntry,
+    ModelCard, Sidecars,
 };
 
 /// Tick/cross glyph for an on-disk artifact.
@@ -87,14 +87,7 @@ fn row_from_registry_entry(entry: &LlmModelRegistryEntry) -> ListRow {
 pub fn run() {
     let registry = build_local_llm_registry();
     if registry.models.is_empty() {
-        let noncanonical = list_local_models_in(&models_dir()).len();
-        if noncanonical == 0 {
-            println!("No models found in ~/.hipfire/models/");
-        } else {
-            println!(
-                "No canonical models found in ~/.hipfire/models/ ({noncanonical} non-canonical .hfq file(s) ignored)"
-            );
-        }
+        println!("No valid HFQ models found in {}", models_dir().display());
         return;
     }
 
@@ -206,9 +199,7 @@ pub fn run() {
             tri(vision),
         );
     }
-    println!(
-        "\nmodel columns: tags/features/quant/artifact arch are parsed from canonical artifact names"
-    );
+    println!("\nmodel columns: size/quant come from HFQ metadata or index; tags/features/artifact arch come from HFQ metadata");
     println!(
         "on disk: tpl=chat template · mtp/dfl/tri=draft/TriAttn sidecar (or bundled) · hess=Hessian/calib"
     );
