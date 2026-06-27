@@ -1,0 +1,15 @@
+GPU dev 0: gfx1103 (45.1 GB VRAM, HIP 7.14)
+  pre-compiled kernels: /home/sadara/.hipfire/kernels/gfx1103
+gpu: gfx1103
+target hidden=1024 layers=16 vocab=65536 draft_layers=1 teacher_rows=578 block_start=24 blocks=8 block_size=4 max_ctx=22
+lfm2moe: AWQ scale attached for model.layers.0.conv.in_proj.weight
+loaded in 2.75s
+{"type":"block","index":24,"prompt_index":24,"position":20,"ctx":20,"seed_token":523,"slots":3,"argmax_hits":3,"topk_hits":3,"weighted_ce":1.500377973449718,"forward_ms":28.931272,"hidden_mse":8.565963278603341,"hidden_cosine":0.3679543771248022,"draft_first":[509,509,509]}
+{"type":"block","index":25,"prompt_index":25,"position":18,"ctx":18,"seed_token":540,"slots":3,"argmax_hits":0,"topk_hits":3,"weighted_ce":3.147309024051496,"forward_ms":21.261859,"hidden_mse":7.641808420462898,"hidden_cosine":0.2621938432045747,"draft_first":[509,509,509]}
+{"type":"block","index":26,"prompt_index":26,"position":16,"ctx":16,"seed_token":523,"slots":3,"argmax_hits":3,"topk_hits":3,"weighted_ce":0.7649259922012834,"forward_ms":16.952107,"hidden_mse":7.244110566521073,"hidden_cosine":0.3183519034980386,"draft_first":[509,509,509]}
+{"type":"block","index":27,"prompt_index":27,"position":20,"ctx":20,"seed_token":518,"slots":3,"argmax_hits":0,"topk_hits":1,"weighted_ce":1.6429284089350509,"forward_ms":15.520873,"hidden_mse":8.218647216452489,"hidden_cosine":0.29912213608770183,"draft_first":[509,509,509]}
+{"type":"block","index":28,"prompt_index":28,"position":16,"ctx":16,"seed_token":856,"slots":3,"argmax_hits":0,"topk_hits":0,"weighted_ce":2.6783899758867262,"forward_ms":13.49742,"hidden_mse":7.203332616343379,"hidden_cosine":0.263114240677158,"draft_first":[509,509,509]}
+{"type":"block","index":29,"prompt_index":29,"position":18,"ctx":18,"seed_token":523,"slots":3,"argmax_hits":1,"topk_hits":3,"weighted_ce":2.432634650659664,"forward_ms":12.867345,"hidden_mse":7.168025135480041,"hidden_cosine":0.32062735779315893,"draft_first":[523,523,523]}
+{"type":"block","index":30,"prompt_index":30,"position":20,"ctx":20,"seed_token":523,"slots":3,"argmax_hits":0,"topk_hits":2,"weighted_ce":2.2963517235432143,"forward_ms":12.374651,"hidden_mse":6.701400424714522,"hidden_cosine":0.3350929304441536,"draft_first":[523,523,523]}
+{"type":"block","index":31,"prompt_index":31,"position":22,"ctx":22,"seed_token":540,"slots":3,"argmax_hits":0,"topk_hits":0,"weighted_ce":3.583674800312678,"forward_ms":12.272098999999999,"hidden_mse":6.887096278196595,"hidden_cosine":0.278824819633317,"draft_first":[523,523,523]}
+{"type":"summary","block_start":24,"blocks":8,"slots":24,"argmax_hits":7,"token_hits":7,"topk_hits":15,"argmax_rate":0.2916666666666667,"token_rate":0.2916666666666667,"topk_rate":0.625,"weighted_argmax_rate":0.29016523927942633,"weighted_topk_rate":0.6522754550658302,"weighted_ce":2.255824135858777,"hidden_rows":24,"hidden_mse":7.453797992096792,"hidden_cosine":0.3056602010578631,"forward_ms":133.677626}

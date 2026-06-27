@@ -1,0 +1,11 @@
+total 15M
+-rw------- 1 sadara sadara  512 Jun 26 14:30 dflash_block_target_argmax.u32
+-rw------- 1 sadara sadara 384K Jun 26 14:30 dflash_block_target_hidden.f32
+-rw------- 1 sadara sadara 384K Jun 26 14:30 dflash_block_target_norm_hidden.f32
+-rw------- 1 sadara sadara  512 Jun 26 14:30 dflash_block_target_tokens.u32
+-rw------- 1 sadara sadara 4.0K Jun 26 14:30 dflash_block_topk_ids.u32
+-rw------- 1 sadara sadara 4.0K Jun 26 14:30 dflash_block_topk_logits.f32
+-rw------- 1 sadara sadara  12M Jun 26 14:30 features.f32
+-rw------- 1 sadara sadara 2.9K Jun 26 14:30 metadata.json
+-rw------- 1 sadara sadara 2.3K Jun 26 14:30 prompt_tokens.u32
+-rw------- 1 sadara sadara 2.3M Jun 26 14:30 target_hidden.f32

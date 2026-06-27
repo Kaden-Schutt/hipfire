@@ -1,0 +1,1 @@
+-rw------- 1 sadara sadara 26M Jun 26 14:32 /tmp/LFM2.5-350M.dflash.fitnorm-logitgrid-chat32-train24-score8.oq4+.hfq

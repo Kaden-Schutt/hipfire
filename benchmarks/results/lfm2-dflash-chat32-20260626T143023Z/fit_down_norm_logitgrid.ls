@@ -1,0 +1,1 @@
+-rw------- 1 sadara sadara 33M Jun 26 14:38 /tmp/LFM2.5-350M.dflash.fcdownfit-normlogit-chat32-train24-score8.oq4+.hfq

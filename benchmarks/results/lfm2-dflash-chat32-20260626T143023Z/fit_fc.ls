@@ -1,0 +1,1 @@
+-rw------- 1 sadara sadara 25M Jun 26 14:31 /tmp/LFM2.5-350M.dflash.fcfit-chat32.oq4+.hfq
