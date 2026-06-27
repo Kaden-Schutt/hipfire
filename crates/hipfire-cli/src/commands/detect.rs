@@ -24,12 +24,20 @@
 use clap::Args;
 use hipfire_detect::{
     attractor::{AttractorFirst128, AttractorLast128, LongStateCollapse},
-    parity, DetectorBank, Event, Severity, Verdict,
+    parity, rollback, DetectorBank, Event, Severity, Verdict,
 };
 use regex::Regex;
 use serde_json::{json, Value};
 use std::io::Read;
 use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum RollbackKind {
+    /// Parse the `rollback_parity:` replay-count line.
+    Replay,
+    /// Parse the `verify_graph:` count line.
+    VerifyGraph,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Source {
@@ -67,11 +75,23 @@ pub struct DetectArgs {
     /// line). Requires --parity-ar.
     #[arg(long, requires = "parity_ar")]
     parity_dflash: Option<PathBuf>,
+
+    /// Rollback mode: parse a single-line replay/verify stat summary instead
+    /// of running detectors. Reads `--file` if given, else stdin.
+    #[arg(long, value_enum)]
+    rollback: Option<RollbackKind>,
+
+    /// Input file for `--rollback` mode (defaults to stdin when omitted).
+    #[arg(long)]
+    file: Option<PathBuf>,
 }
 
 pub fn run(args: DetectArgs) -> anyhow::Result<()> {
     if let (Some(ar_path), Some(df_path)) = (&args.parity_ar, &args.parity_dflash) {
         return run_parity(ar_path, df_path, args.exit_code);
+    }
+    if let Some(kind) = args.rollback {
+        return run_rollback(kind, args.file.as_deref(), args.exit_code);
     }
 
     let mut input = String::new();
@@ -188,6 +208,31 @@ fn run_parity(ar_path: &std::path::Path, df_path: &std::path::Path, exit_code: b
     let report = parity::compare(&ar, &df);
     emit(&serde_json::to_value(&report).expect("serialize parity report"));
     finish(report.ok(), exit_code)
+}
+
+/// Rollback stat-line parsers (replaces the gate's ROLLBACK_REPLAY_PY /
+/// VERIFY_GRAPH_PY). Reads `file` (lossy-decoded like the Python) or stdin.
+fn run_rollback(kind: RollbackKind, file: Option<&std::path::Path>, exit_code: bool) -> anyhow::Result<()> {
+    let text = match file {
+        Some(path) => String::from_utf8_lossy(&std::fs::read(path)?).into_owned(),
+        None => {
+            let mut s = String::new();
+            std::io::stdin().read_to_string(&mut s)?;
+            s
+        }
+    };
+    let (value, ok) = match kind {
+        RollbackKind::Replay => {
+            let r = rollback::replay_parity(&text);
+            (serde_json::to_value(&r).expect("serialize replay report"), r.ok())
+        }
+        RollbackKind::VerifyGraph => {
+            let r = rollback::verify_graph(&text);
+            (serde_json::to_value(&r).expect("serialize verify_graph report"), r.ok())
+        }
+    };
+    emit(&value);
+    finish(ok, exit_code)
 }
 
 fn emit(v: &Value) {

@@ -303,107 +303,9 @@ fi
 # AR↔DFlash token parity now lives in Rust (`hipfire-detect::parity`), run via
 # `hipfire detect --parity-ar <ar_file> --parity-dflash <dflash_file>`.
 
-ROLLBACK_REPLAY_PY=$(cat <<'PYEOF'
-import sys, re, json
-if len(sys.argv) != 2:
-    print(json.dumps({"ok": False, "reason": "usage"}))
-    sys.exit(0)
-out = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
-m = re.search(
-    r"^rollback_parity: .*replay_gdn_tape=(\d+)(?: replay_batched_prefill=(\d+))? replay_full_prefill=(\d+)(?: replay_prefix_verify=(\d+))?(?: replay_serial_tape=(\d+))?(?: replay_verify_complete=(\d+))?",
-    out,
-    re.MULTILINE,
-)
-if not m:
-    print(json.dumps({"ok": False, "reason": "missing_rollback_parity_stats"}))
-    sys.exit(0)
-gdn = int(m.group(1))
-batched = int(m.group(2) or 0)
-full = int(m.group(3))
-prefix_verify = int(m.group(4) or 0)
-serial_tape = int(m.group(5) or 0)
-verify_complete = int(m.group(6) or 0)
-if gdn != 0:
-    print(json.dumps({
-        "ok": False,
-        "reason": "fast_gdn_tape_replay_is_diagnostic_only",
-        "replay_gdn_tape": gdn,
-        "replay_batched_prefill": batched,
-        "replay_full_prefill": full,
-        "replay_prefix_verify": prefix_verify,
-        "replay_serial_tape": serial_tape,
-        "replay_verify_complete": verify_complete,
-    }))
-elif batched + full + prefix_verify + serial_tape + verify_complete <= 0:
-    print(json.dumps({
-        "ok": False,
-        "reason": "missing_admitted_rollback_replay",
-        "replay_gdn_tape": gdn,
-        "replay_batched_prefill": batched,
-        "replay_full_prefill": full,
-        "replay_prefix_verify": prefix_verify,
-        "replay_serial_tape": serial_tape,
-        "replay_verify_complete": verify_complete,
-    }))
-else:
-    print(json.dumps({
-        "ok": True,
-        "replay_gdn_tape": gdn,
-        "replay_batched_prefill": batched,
-        "replay_full_prefill": full,
-        "replay_prefix_verify": prefix_verify,
-        "replay_serial_tape": serial_tape,
-        "replay_verify_complete": verify_complete,
-    }))
-PYEOF
-)
-
-VERIFY_GRAPH_PY=$(cat <<'PYEOF'
-import sys, re, json
-if len(sys.argv) != 2:
-    print(json.dumps({"ok": False, "reason": "usage"}))
-    sys.exit(0)
-out = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
-m = re.search(
-    r"^verify_graph: direct=(\d+) warmup=(\d+) capture=(\d+) replay=(\d+) not_applicable=(\d+)",
-    out,
-    re.MULTILINE,
-)
-if not m:
-    print(json.dumps({"ok": False, "reason": "missing_verify_graph_stats"}))
-    sys.exit(0)
-direct, warmup, capture, replay, not_applicable = [int(x) for x in m.groups()]
-if direct != 0:
-    print(json.dumps({
-        "ok": False,
-        "reason": "direct_verify_is_diagnostic_only_for_dflash_ar_parity",
-        "direct": direct,
-        "warmup": warmup,
-        "capture": capture,
-        "replay": replay,
-        "not_applicable": not_applicable,
-    }))
-elif capture + replay <= 0:
-    print(json.dumps({
-        "ok": False,
-        "reason": "missing_verify_graph_capture_or_replay",
-        "direct": direct,
-        "warmup": warmup,
-        "capture": capture,
-        "replay": replay,
-        "not_applicable": not_applicable,
-    }))
-else:
-    print(json.dumps({
-        "ok": True,
-        "direct": direct,
-        "warmup": warmup,
-        "capture": capture,
-        "replay": replay,
-        "not_applicable": not_applicable,
-    }))
-PYEOF
-)
+# rollback_parity + verify_graph stat parsing now live in Rust
+# (`hipfire-detect::rollback`), run via `hipfire detect --rollback
+# {replay,verify-graph} --file <out_file>`.
 
 ROLLBACK_LOGIT_COMPARE_PY=$(cat <<'PYEOF'
 import sys, re, json, math
@@ -2089,13 +1991,13 @@ for entry in "${tests[@]}"; do
     rollback_fast_replay_admission="not_checked"
     rollback_serial_tape_admission="not_checked"
     if [ "$AR_PARITY" = "1" ] && [ "$mode" = "dflash" ]; then
-        rollback_replay=$(python3 -c "$ROLLBACK_REPLAY_PY" "$out_file")
+        rollback_replay=$("$HIPFIRE_BIN" detect --rollback replay --file "$out_file")
         rollback_replay_ok=$(echo "$rollback_replay" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok', False))")
         if [ "$rollback_replay_ok" != "True" ]; then
             status="HARD_ERROR (rollback replay: $rollback_replay)"
             hard_errors=$((hard_errors + 1))
         fi
-        verify_graph=$(python3 -c "$VERIFY_GRAPH_PY" "$out_file")
+        verify_graph=$("$HIPFIRE_BIN" detect --rollback verify-graph --file "$out_file")
         verify_graph_ok=$(echo "$verify_graph" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok', False))")
         if [ "$verify_graph_ok" != "True" ]; then
             status="HARD_ERROR (verify graph: $verify_graph)"

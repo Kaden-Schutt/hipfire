@@ -33,6 +33,7 @@ pub mod eos_immediate;
 pub mod ngram;
 pub mod parity;
 pub mod report;
+pub mod rollback;
 pub mod self_check;
 pub mod special_leak;
 pub mod think;
