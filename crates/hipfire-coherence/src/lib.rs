@@ -137,37 +137,82 @@ impl DaemonChild {
 }
 
 pub fn run_coherence(config: &CoherenceRunConfig) -> Result<CoherenceRunOutput, String> {
-    let mut bank = build_detector_bank(&config.profile);
     let daemon = hipfire_daemon_adapter::find_daemon_bin_or_error().map_err(|e| e.to_string())?;
-    let mut child = spawn_daemon(&daemon, config.force_jinja_chat)?;
+    let mut session = CoherenceDaemonSession::load(&daemon, config)?;
+    session.run(config)
+}
 
-    let mut params = serde_json::Map::new();
-    params.insert("max_seq".to_string(), json!(config.max_seq));
-    if let Some(state) = config.state.as_deref() {
-        params.insert("state_quant".to_string(), json!(state));
-    }
-    let load = json!({
-        "type": "load",
-        "model": config.model,
-        "params": Value::Object(params),
-    });
-    send(&mut child, &load)?;
-    let loaded = recv_until(&mut child, |_| {})?;
-    let ty = loaded.get("type").and_then(Value::as_str).unwrap_or("");
-    if ty != "loaded" {
-        shutdown_daemon(&mut child);
-        return Err(format!("expected loaded, got {ty}"));
-    }
+pub struct CoherenceDaemonSession {
+    child: DaemonChild,
+    force_jinja_chat: bool,
+}
 
-    let stats = match drive_generate(&mut child, &mut bank, config) {
-        Ok(stats) => stats,
-        Err(err) => {
-            shutdown_daemon(&mut child);
-            return Err(err);
+impl CoherenceDaemonSession {
+    pub fn load(daemon: &Path, config: &CoherenceRunConfig) -> Result<Self, String> {
+        let mut child = spawn_daemon(daemon, config.force_jinja_chat)?;
+
+        let mut params = serde_json::Map::new();
+        params.insert("max_seq".to_string(), json!(config.max_seq));
+        if let Some(state) = config.state.as_deref() {
+            params.insert("state_quant".to_string(), json!(state));
         }
-    };
-    shutdown_daemon(&mut child);
+        let load = json!({
+            "type": "load",
+            "model": config.model,
+            "params": Value::Object(params),
+        });
+        send(&mut child, &load)?;
+        let loaded = recv_until(&mut child, |_| {})?;
+        let ty = loaded.get("type").and_then(Value::as_str).unwrap_or("");
+        if ty != "loaded" {
+            shutdown_daemon(&mut child);
+            return Err(format!("expected loaded, got {ty}"));
+        }
 
+        Ok(Self {
+            child,
+            force_jinja_chat: config.force_jinja_chat,
+        })
+    }
+
+    pub fn run(&mut self, config: &CoherenceRunConfig) -> Result<CoherenceRunOutput, String> {
+        if config.force_jinja_chat != self.force_jinja_chat {
+            return Err(format!(
+                "coherence session force_jinja_chat={} cannot run request force_jinja_chat={}",
+                self.force_jinja_chat, config.force_jinja_chat
+            ));
+        }
+        self.reset()?;
+
+        let mut bank = build_detector_bank(&config.profile);
+        let stats = drive_generate(&mut self.child, &mut bank, config)?;
+
+        Ok(coherence_output_from_stats(config, bank, stats))
+    }
+
+    pub fn reset(&mut self) -> Result<(), String> {
+        send(&mut self.child, &json!({ "type": "reset" }))?;
+        let reset = recv_until(&mut self.child, |_| {})?;
+        let ty = reset.get("type").and_then(Value::as_str).unwrap_or("");
+        if ty == "reset" {
+            Ok(())
+        } else {
+            Err(format!("expected reset, got {ty}"))
+        }
+    }
+}
+
+impl Drop for CoherenceDaemonSession {
+    fn drop(&mut self) {
+        shutdown_daemon(&mut self.child);
+    }
+}
+
+fn coherence_output_from_stats(
+    config: &CoherenceRunConfig,
+    mut bank: DetectorBank,
+    stats: DoneStats,
+) -> CoherenceRunOutput {
     let finals = bank.finalize();
     let (arch, host) = arch_host();
     let tok_s = if stats.wall_ms > 0 {
@@ -202,7 +247,7 @@ pub fn run_coherence(config: &CoherenceRunConfig) -> Result<CoherenceRunOutput, 
         daemon_ttft_ms: stats.daemon_ttft_ms,
         daemon_tok_s: stats.daemon_tok_s,
     };
-    Ok(CoherenceRunOutput {
+    CoherenceRunOutput {
         report: Report::new(header, finals),
         generated_text: stats.generated_text,
         token_ids: stats.token_ids,
@@ -214,7 +259,7 @@ pub fn run_coherence(config: &CoherenceRunConfig) -> Result<CoherenceRunOutput, 
         state: config.state.clone(),
         tools_present: config.tools.is_some(),
         force_jinja_chat: config.force_jinja_chat,
-    })
+    }
 }
 
 pub fn daemon_binary_available() -> bool {
@@ -446,7 +491,7 @@ where
         };
         visitor(&v);
         match v.get("type").and_then(Value::as_str).unwrap_or("") {
-            "loaded" | "unloaded" | "done" | "error" => return Ok(v),
+            "loaded" | "unloaded" | "done" | "reset" | "error" => return Ok(v),
             _ => {}
         }
     }
