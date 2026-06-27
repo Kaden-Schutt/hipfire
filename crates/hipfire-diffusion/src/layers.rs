@@ -414,6 +414,53 @@ impl UnetResnetBlock2D {
         };
         tensor_add_with_runtime_context(&hidden, &residual, runtime_context)
     }
+
+    /// Phase 1b device-resident UNet resnet block. `input` and `time_embedding`
+    /// are resident (borrowed; the caller owns them). `time_embedding` is the
+    /// raw `[batch, time_dim]` embedding — SiLU + the time projection happen
+    /// here, mirroring the host path.
+    pub(crate) fn forward_resident(
+        &self,
+        input: &rdna_compute::GpuTensor,
+        time_embedding: &rdna_compute::GpuTensor,
+        gpu: &mut rdna_compute::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+        let normed = self.norm1.forward_resident(input, gpu, cache)?;
+        let silued = silu_resident(gpu, &normed)?;
+        free_resident(gpu, normed)?;
+        let hidden = self.conv1.forward_resident(&silued, gpu, cache)?;
+        free_resident(gpu, silued)?;
+        let time_silu = silu_resident(gpu, time_embedding)?;
+        let projected_time = linear_optional_bias_resident(
+            gpu,
+            cache,
+            &time_silu,
+            &self.time_emb_proj_weight,
+            Some(&self.time_emb_proj_bias),
+        )?;
+        free_resident(gpu, time_silu)?;
+        let hidden_biased = add_channel_bias_nchw_resident(gpu, &hidden, &projected_time)?;
+        free_resident(gpu, projected_time)?;
+        free_resident(gpu, hidden)?;
+        let normed = self.norm2.forward_resident(&hidden_biased, gpu, cache)?;
+        free_resident(gpu, hidden_biased)?;
+        let silued = silu_resident(gpu, &normed)?;
+        free_resident(gpu, normed)?;
+        let conv2 = self.conv2.forward_resident(&silued, gpu, cache)?;
+        free_resident(gpu, silued)?;
+        let out = match &self.shortcut {
+            Some(shortcut) => {
+                let residual = shortcut.forward_resident(input, gpu, cache)?;
+                let sum = tensor_add_resident(gpu, &conv2, &residual)?;
+                free_resident(gpu, residual)?;
+                sum
+            }
+            None => tensor_add_resident(gpu, &conv2, input)?,
+        };
+        free_resident(gpu, conv2)?;
+        Ok(out)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -858,6 +905,29 @@ impl GeGluFeedForward {
             runtime_context,
         )
     }
+
+    /// Phase 1b device-resident GeGLU feed-forward over a resident 3D
+    /// `[b, seq, in]` input (borrowed; caller owns it).
+    pub(crate) fn forward_resident(
+        &self,
+        hidden_states: &rdna_compute::GpuTensor,
+        gpu: &mut rdna_compute::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+        let projected = linear_optional_bias_resident(
+            gpu,
+            cache,
+            hidden_states,
+            &self.proj_weight,
+            Some(&self.proj_bias),
+        )?;
+        let gated = geglu_gate_3d_resident(gpu, &projected)?;
+        free_resident(gpu, projected)?;
+        let out =
+            linear_optional_bias_resident(gpu, cache, &gated, &self.out_weight, Some(&self.out_bias))?;
+        free_resident(gpu, gated)?;
+        Ok(out)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -954,6 +1024,44 @@ impl BasicTransformerBlock {
             .feed_forward
             .forward_with_runtime_context(&normed, runtime_context)?;
         tensor_add_with_runtime_context(&hidden_states, &ff, runtime_context)
+    }
+
+    /// Phase 1b device-resident basic transformer block (self-attn → cross-attn
+    /// → GeGLU FF, each with a layer-norm + residual). `hidden_states` and
+    /// `encoder_states` are resident (borrowed; the caller owns them).
+    pub(crate) fn forward_resident(
+        &self,
+        hidden_states: &rdna_compute::GpuTensor,
+        encoder_states: &rdna_compute::GpuTensor,
+        gpu: &mut rdna_compute::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+        let normed =
+            layer_norm_resident(gpu, cache, hidden_states, &self.norm1_weight, &self.norm1_bias, 1e-5)?;
+        let attn = self.attn1.forward_resident(&normed, None, gpu, cache)?;
+        free_resident(gpu, normed)?;
+        let mut hidden = tensor_add_resident(gpu, hidden_states, &attn)?;
+        free_resident(gpu, attn)?;
+
+        let normed =
+            layer_norm_resident(gpu, cache, &hidden, &self.norm2_weight, &self.norm2_bias, 1e-5)?;
+        let attn = self
+            .attn2
+            .forward_resident(&normed, Some(encoder_states), gpu, cache)?;
+        free_resident(gpu, normed)?;
+        let next = tensor_add_resident(gpu, &hidden, &attn)?;
+        free_resident(gpu, attn)?;
+        free_resident(gpu, hidden)?;
+        hidden = next;
+
+        let normed =
+            layer_norm_resident(gpu, cache, &hidden, &self.norm3_weight, &self.norm3_bias, 1e-5)?;
+        let ff = self.feed_forward.forward_resident(&normed, gpu, cache)?;
+        free_resident(gpu, normed)?;
+        let next = tensor_add_resident(gpu, &hidden, &ff)?;
+        free_resident(gpu, ff)?;
+        free_resident(gpu, hidden)?;
+        Ok(next)
     }
 }
 

@@ -5676,6 +5676,232 @@
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Phase 1b: validate the device-resident UNet forward against the CPU
+    /// reference on a 2-channel UNet whose mid block carries a cross-attention
+    /// `Transformer2DModel`. This exercises the resident transformer path the
+    /// `native_unet_forward_runs_synthetic_graph` test does not reach:
+    /// `proj_in` → `nchw_to_bsc` → layer-norm → self-attn → cross-attn → GeGLU
+    /// (`geglu_gate`) → `bsc_to_nchw` → `proj_out`, plus the up-path channel
+    /// concat with two resnets consuming two skips.
+    #[test]
+    fn native_unet_resident_path_matches_cpu_reference_with_cross_attention() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-diffusion-resident-unet-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("resident-unet.hfq");
+        let metadata = minimal_metadata();
+
+        const CH: usize = 2;
+        const TIME_DIM: usize = 2;
+        const CROSS: usize = 2;
+        const INNER: usize = 2;
+
+        // [out, in, 3, 3] center-tap (near-identity) conv.
+        let conv3 = |out_ch: usize, in_ch: usize| -> Vec<f32> {
+            let mut d = vec![0.0f32; out_ch * in_ch * 9];
+            for c in 0..out_ch.min(in_ch) {
+                d[((c * in_ch + c) * 3 + 1) * 3 + 1] = 1.0;
+            }
+            d
+        };
+        // [out, in, 1, 1] near-identity 1x1 conv.
+        let conv1 = |out_ch: usize, in_ch: usize| -> Vec<f32> {
+            let mut d = vec![0.0f32; out_ch * in_ch];
+            for c in 0..out_ch.min(in_ch) {
+                d[c * in_ch + c] = 1.0;
+            }
+            d
+        };
+        // Deterministic small finite [r, c] matrix for linear projections.
+        let mat = |r: usize, c: usize| -> Vec<f32> {
+            (0..r * c)
+                .map(|k| 0.1 * ((k as f32 % 5.0) - 2.0))
+                .collect()
+        };
+
+        // Capture-free tensor builder (so the resnet helper below can take
+        // `&mut Vec` and avoid a closure-capture borrow conflict).
+        let mk = |name: String, shape: Vec<u32>, data: Vec<f32>| -> HfqMemTensor {
+            f32_mem_tensor(&name, &shape, &data)
+        };
+
+        // A UnetResnetBlock2D with zeroed time projection (still exercises the
+        // resident linear + add_channel_bias) and an optional shortcut.
+        let resnet = |v: &mut Vec<HfqMemTensor>,
+                      prefix: &str,
+                      in_ch: usize,
+                      out_ch: usize,
+                      shortcut: bool| {
+            v.push(mk(format!("{prefix}.norm1.weight"), vec![in_ch as u32], vec![1.0; in_ch]));
+            v.push(mk(format!("{prefix}.norm1.bias"), vec![in_ch as u32], vec![0.0; in_ch]));
+            v.push(mk(
+                format!("{prefix}.conv1.weight"),
+                vec![out_ch as u32, in_ch as u32, 3, 3],
+                conv3(out_ch, in_ch),
+            ));
+            v.push(mk(format!("{prefix}.conv1.bias"), vec![out_ch as u32], vec![0.0; out_ch]));
+            v.push(mk(
+                format!("{prefix}.time_emb_proj.weight"),
+                vec![out_ch as u32, TIME_DIM as u32],
+                vec![0.0; out_ch * TIME_DIM],
+            ));
+            v.push(mk(format!("{prefix}.time_emb_proj.bias"), vec![out_ch as u32], vec![0.0; out_ch]));
+            v.push(mk(format!("{prefix}.norm2.weight"), vec![out_ch as u32], vec![1.0; out_ch]));
+            v.push(mk(format!("{prefix}.norm2.bias"), vec![out_ch as u32], vec![0.0; out_ch]));
+            v.push(mk(
+                format!("{prefix}.conv2.weight"),
+                vec![out_ch as u32, out_ch as u32, 3, 3],
+                conv3(out_ch, out_ch),
+            ));
+            v.push(mk(format!("{prefix}.conv2.bias"), vec![out_ch as u32], vec![0.0; out_ch]));
+            if shortcut {
+                v.push(mk(
+                    format!("{prefix}.conv_shortcut.weight"),
+                    vec![out_ch as u32, in_ch as u32, 1, 1],
+                    conv1(out_ch, in_ch),
+                ));
+                v.push(mk(format!("{prefix}.conv_shortcut.bias"), vec![out_ch as u32], vec![0.0; out_ch]));
+            }
+        };
+
+        let mut tensors: Vec<HfqMemTensor> = Vec::new();
+        // conv_in.
+        tensors.push(mk("unet/tensors/conv_in.weight".into(), vec![CH as u32, CH as u32, 3, 3], conv3(CH, CH)));
+        tensors.push(mk("unet/tensors/conv_in.bias".into(), vec![CH as u32], vec![0.0; CH]));
+        // time embedding (dim = TIME_DIM).
+        tensors.push(mk(
+            "unet/tensors/time_embedding.linear_1.weight".into(),
+            vec![TIME_DIM as u32, TIME_DIM as u32],
+            conv1(TIME_DIM, TIME_DIM),
+        ));
+        tensors.push(mk("unet/tensors/time_embedding.linear_1.bias".into(), vec![TIME_DIM as u32], vec![0.0; TIME_DIM]));
+        tensors.push(mk(
+            "unet/tensors/time_embedding.linear_2.weight".into(),
+            vec![TIME_DIM as u32, TIME_DIM as u32],
+            conv1(TIME_DIM, TIME_DIM),
+        ));
+        tensors.push(mk("unet/tensors/time_embedding.linear_2.bias".into(), vec![TIME_DIM as u32], vec![0.0; TIME_DIM]));
+
+        // Down block 0: one resnet, no attention, no downsampler.
+        resnet(&mut tensors, "unet/tensors/down_blocks.0.resnets.0", CH, CH, false);
+
+        // Mid block: resnet0 + cross-attention transformer + resnet1.
+        resnet(&mut tensors, "unet/tensors/mid_block.resnets.0", CH, CH, false);
+        let attn = "unet/tensors/mid_block.attentions.0";
+        tensors.push(mk(format!("{attn}.norm.weight"), vec![CH as u32], vec![1.0; CH]));
+        tensors.push(mk(format!("{attn}.norm.bias"), vec![CH as u32], vec![0.0; CH]));
+        tensors.push(mk(format!("{attn}.proj_in.weight"), vec![CH as u32, CH as u32, 1, 1], conv1(CH, CH)));
+        tensors.push(mk(format!("{attn}.proj_in.bias"), vec![CH as u32], vec![0.0; CH]));
+        let tb = format!("{attn}.transformer_blocks.0");
+        tensors.push(mk(format!("{tb}.norm1.weight"), vec![CH as u32], vec![1.0; CH]));
+        tensors.push(mk(format!("{tb}.norm1.bias"), vec![CH as u32], vec![0.0; CH]));
+        tensors.push(mk(format!("{tb}.attn1.to_q.weight"), vec![CH as u32, CH as u32], mat(CH, CH)));
+        tensors.push(mk(format!("{tb}.attn1.to_k.weight"), vec![CH as u32, CH as u32], mat(CH, CH)));
+        tensors.push(mk(format!("{tb}.attn1.to_v.weight"), vec![CH as u32, CH as u32], mat(CH, CH)));
+        tensors.push(mk(format!("{tb}.attn1.to_out.0.weight"), vec![CH as u32, CH as u32], mat(CH, CH)));
+        tensors.push(mk(format!("{tb}.attn1.to_out.0.bias"), vec![CH as u32], vec![0.0; CH]));
+        tensors.push(mk(format!("{tb}.norm2.weight"), vec![CH as u32], vec![1.0; CH]));
+        tensors.push(mk(format!("{tb}.norm2.bias"), vec![CH as u32], vec![0.0; CH]));
+        tensors.push(mk(format!("{tb}.attn2.to_q.weight"), vec![CH as u32, CH as u32], mat(CH, CH)));
+        tensors.push(mk(format!("{tb}.attn2.to_k.weight"), vec![CH as u32, CROSS as u32], mat(CH, CROSS)));
+        tensors.push(mk(format!("{tb}.attn2.to_v.weight"), vec![CH as u32, CROSS as u32], mat(CH, CROSS)));
+        tensors.push(mk(format!("{tb}.attn2.to_out.0.weight"), vec![CH as u32, CH as u32], mat(CH, CH)));
+        tensors.push(mk(format!("{tb}.attn2.to_out.0.bias"), vec![CH as u32], vec![0.0; CH]));
+        tensors.push(mk(format!("{tb}.norm3.weight"), vec![CH as u32], vec![1.0; CH]));
+        tensors.push(mk(format!("{tb}.norm3.bias"), vec![CH as u32], vec![0.0; CH]));
+        tensors.push(mk(
+            format!("{tb}.ff.net.0.proj.weight"),
+            vec![(2 * INNER) as u32, CH as u32],
+            mat(2 * INNER, CH),
+        ));
+        tensors.push(mk(format!("{tb}.ff.net.0.proj.bias"), vec![(2 * INNER) as u32], vec![0.0; 2 * INNER]));
+        tensors.push(mk(format!("{tb}.ff.net.2.weight"), vec![CH as u32, INNER as u32], mat(CH, INNER)));
+        tensors.push(mk(format!("{tb}.ff.net.2.bias"), vec![CH as u32], vec![0.0; CH]));
+        tensors.push(mk(format!("{attn}.proj_out.weight"), vec![CH as u32, CH as u32, 1, 1], conv1(CH, CH)));
+        tensors.push(mk(format!("{attn}.proj_out.bias"), vec![CH as u32], vec![0.0; CH]));
+        resnet(&mut tensors, "unet/tensors/mid_block.resnets.1", CH, CH, false);
+
+        // Up block 0: two resnets (consume the two skips), each concatenating a
+        // skip onto the channel axis (in = 2*CH), with a shortcut. No upsampler.
+        resnet(&mut tensors, "unet/tensors/up_blocks.0.resnets.0", 2 * CH, CH, true);
+        resnet(&mut tensors, "unet/tensors/up_blocks.0.resnets.1", 2 * CH, CH, true);
+
+        tensors.push(mk("unet/tensors/conv_norm_out.weight".into(), vec![CH as u32], vec![1.0; CH]));
+        tensors.push(mk("unet/tensors/conv_norm_out.bias".into(), vec![CH as u32], vec![0.0; CH]));
+        tensors.push(mk("unet/tensors/conv_out.weight".into(), vec![CH as u32, CH as u32, 3, 3], conv3(CH, CH)));
+        tensors.push(mk("unet/tensors/conv_out.bias".into(), vec![CH as u32], vec![0.0; CH]));
+
+        write_hfqm_package_mem(
+            &hfq_path,
+            HFQ_ARCH_DIFFUSION,
+            &serde_json::to_string(&metadata).unwrap(),
+            &tensors,
+        )
+        .unwrap();
+        let hfq = HfqFile::open_index_only(&hfq_path).unwrap();
+        let config = UnetConfig {
+            class_name: "UNet2DConditionModel".into(),
+            sample_size: Some(2),
+            in_channels: Some(CH),
+            out_channels: Some(CH),
+            cross_attention_dim: Some(CROSS),
+            attention_head_dim: vec![CH],
+            block_out_channels: vec![CH],
+            down_block_types: vec!["DownBlock2D".into()],
+            up_block_types: vec!["UpBlock2D".into()],
+            layers_per_block: Some(1),
+            norm_num_groups: Some(1),
+            norm_eps: Some(1e-5),
+            center_input_sample: false,
+            flip_sin_to_cos: true,
+            freq_shift: 0.0,
+            addition_embed_type: None,
+            addition_time_embed_dim: None,
+            projection_class_embeddings_input_dim: None,
+        };
+        let unet = NativeUnet2DConditionModel::from_hfq(&hfq, &config).unwrap();
+        assert!(unet.mid_block.is_some(), "mid block not loaded");
+        assert!(
+            unet.mid_block.as_ref().unwrap().attention.is_some(),
+            "mid-block cross-attention not loaded"
+        );
+
+        let sample = CpuTensor {
+            shape: vec![1, CH, 2, 2],
+            data: vec![1.0, -2.0, 0.5, 3.0, -0.25, 1.5, 2.0, -1.0],
+        };
+        let encoder = CpuTensor {
+            shape: vec![1, 2, CROSS],
+            data: vec![0.3, -0.6, 0.9, 0.1],
+        };
+        let cpu_output = unet.forward(&sample, &[0.5], &encoder).unwrap();
+        assert!(cpu_output.data.iter().all(|value| value.is_finite()));
+
+        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+            eprintln!("skip: ROCm GPU unavailable for resident UNet cross-attention test: {error}");
+        } else {
+            let resident = unet
+                .forward_with_runtime_options(
+                    &sample,
+                    &[0.5],
+                    &encoder,
+                    DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
+                )
+                .unwrap();
+            assert_eq!(resident.shape, cpu_output.shape);
+            assert!(
+                f32_slices_close(&resident.data, &cpu_output.data, 1e-4),
+                "resident UNet {:?} != cpu reference {:?}",
+                resident.data,
+                cpu_output.data
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn tiny_sd_native_unet_loads_when_import_exists() {
         let path = tiny_sd_hfq_path();

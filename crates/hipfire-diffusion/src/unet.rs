@@ -103,6 +103,39 @@ impl Transformer2DModel {
             .forward_with_runtime_context(&hidden, runtime_context)?;
         tensor_add_with_runtime_context(&hidden, &residual, runtime_context)
     }
+
+    /// Phase 1b device-resident spatial transformer. `input` and `encoder` are
+    /// resident (borrowed; the caller owns them).
+    pub(crate) fn forward_resident(
+        &self,
+        input: &rdna_compute::GpuTensor,
+        encoder_states: &rdna_compute::GpuTensor,
+        gpu: &mut rdna_compute::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+        let normed = self.norm.forward_resident(input, gpu, cache)?;
+        let projected = self.proj_in.forward_resident(&normed, gpu, cache)?;
+        free_resident(gpu, normed)?;
+        let (batch, channels, height, width) = match projected.shape.as_slice() {
+            [b, c, h, w] => (*b, *c, *h, *w),
+            other => {
+                return Err(DiffusionError::InvalidMetadata(format!(
+                    "Transformer2D expected a 4D NCHW tensor, got shape {other:?}"
+                )))
+            }
+        };
+        let bsc = nchw_to_bsc_resident(gpu, &projected)?;
+        free_resident(gpu, projected)?;
+        let blocked = self.block.forward_resident(&bsc, encoder_states, gpu, cache)?;
+        free_resident(gpu, bsc)?;
+        let nchw = bsc_to_nchw_resident(gpu, &blocked, batch, channels, height, width)?;
+        free_resident(gpu, blocked)?;
+        let proj_out = self.proj_out.forward_resident(&nchw, gpu, cache)?;
+        free_resident(gpu, nchw)?;
+        let out = tensor_add_resident(gpu, &proj_out, input)?;
+        free_resident(gpu, proj_out)?;
+        Ok(out)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -233,6 +266,38 @@ impl UnetDownBlock2D {
         }
         Ok((hidden, skips))
     }
+
+    /// Phase 1b device-resident down block. Takes ownership of `hidden`, pushes a
+    /// resident snapshot per layer (and after the downsampler) onto `skips`, and
+    /// returns the resident output. The caller owns and must free every skip.
+    pub(crate) fn forward_resident(
+        &self,
+        mut hidden: rdna_compute::GpuTensor,
+        time_embedding: &rdna_compute::GpuTensor,
+        encoder_states: &rdna_compute::GpuTensor,
+        skips: &mut Vec<rdna_compute::GpuTensor>,
+        gpu: &mut rdna_compute::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+        for (idx, resnet) in self.resnets.iter().enumerate() {
+            let next = resnet.forward_resident(&hidden, time_embedding, gpu, cache)?;
+            free_resident(gpu, hidden)?;
+            hidden = next;
+            if let Some(attention) = self.attentions.get(idx) {
+                let next = attention.forward_resident(&hidden, encoder_states, gpu, cache)?;
+                free_resident(gpu, hidden)?;
+                hidden = next;
+            }
+            skips.push(clone_resident(gpu, &hidden)?);
+        }
+        if let Some(downsampler) = &self.downsampler {
+            let next = downsampler.forward_resident(&hidden, gpu, cache)?;
+            free_resident(gpu, hidden)?;
+            hidden = next;
+            skips.push(clone_resident(gpu, &hidden)?);
+        }
+        Ok(hidden)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -338,6 +403,33 @@ impl UnetDownPath {
             )?;
             hidden = next;
             skips.append(&mut block_skips);
+        }
+        Ok((hidden, skips))
+    }
+
+    /// Phase 1b device-resident down path. Uploads `conv_in`'s output as the
+    /// first skip, then threads the resident hidden through every down block,
+    /// accumulating resident skip snapshots. The caller owns and must free
+    /// every returned skip.
+    pub(crate) fn forward_resident(
+        &self,
+        sample: &rdna_compute::GpuTensor,
+        time_embedding: &rdna_compute::GpuTensor,
+        encoder_states: &rdna_compute::GpuTensor,
+        gpu: &mut rdna_compute::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<(rdna_compute::GpuTensor, Vec<rdna_compute::GpuTensor>)> {
+        let mut hidden = self.conv_in.forward_resident(sample, gpu, cache)?;
+        let mut skips = vec![clone_resident(gpu, &hidden)?];
+        for block in &self.blocks {
+            hidden = block.forward_resident(
+                hidden,
+                time_embedding,
+                encoder_states,
+                &mut skips,
+                gpu,
+                cache,
+            )?;
         }
         Ok((hidden, skips))
     }
@@ -471,6 +563,45 @@ impl UnetUpBlock2D {
         }
         Ok(hidden)
     }
+
+    /// Phase 1b device-resident up block. Takes ownership of `hidden`, pops and
+    /// frees a resident skip per layer (concatenating it on the channel axis),
+    /// and returns the resident output.
+    pub(crate) fn forward_resident(
+        &self,
+        mut hidden: rdna_compute::GpuTensor,
+        skips: &mut Vec<rdna_compute::GpuTensor>,
+        time_embedding: &rdna_compute::GpuTensor,
+        encoder_states: &rdna_compute::GpuTensor,
+        gpu: &mut rdna_compute::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+        for (idx, resnet) in self.resnets.iter().enumerate() {
+            let skip = skips.pop().ok_or_else(|| {
+                DiffusionError::InvalidMetadata("UNet up block ran out of skip tensors".to_string())
+            })?;
+            let concatenated = concat_channels_nchw_resident(gpu, &hidden, &skip)?;
+            free_resident(gpu, hidden)?;
+            free_resident(gpu, skip)?;
+            hidden = concatenated;
+            let next = resnet.forward_resident(&hidden, time_embedding, gpu, cache)?;
+            free_resident(gpu, hidden)?;
+            hidden = next;
+            if let Some(attention) = self.attentions.get(idx) {
+                let next = attention.forward_resident(&hidden, encoder_states, gpu, cache)?;
+                free_resident(gpu, hidden)?;
+                hidden = next;
+            }
+        }
+        if let Some(upsampler) = &self.upsampler {
+            let upsampled = upsample_nearest2d_nchw_resident(gpu, &hidden, 2)?;
+            free_resident(gpu, hidden)?;
+            let convolved = upsampler.forward_resident(&upsampled, gpu, cache)?;
+            free_resident(gpu, upsampled)?;
+            hidden = convolved;
+        }
+        Ok(hidden)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -570,6 +701,30 @@ impl UnetUpPath {
                 time_embedding,
                 encoder_states,
                 runtime_context,
+            )?;
+        }
+        Ok(hidden)
+    }
+
+    /// Phase 1b device-resident up path. Threads the resident hidden through
+    /// every up block, consuming the resident skips accumulated by the down path.
+    pub(crate) fn forward_resident(
+        &self,
+        mut hidden: rdna_compute::GpuTensor,
+        skips: &mut Vec<rdna_compute::GpuTensor>,
+        time_embedding: &rdna_compute::GpuTensor,
+        encoder_states: &rdna_compute::GpuTensor,
+        gpu: &mut rdna_compute::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+        for block in &self.blocks {
+            hidden = block.forward_resident(
+                hidden,
+                skips,
+                time_embedding,
+                encoder_states,
+                gpu,
+                cache,
             )?;
         }
         Ok(hidden)
@@ -686,6 +841,34 @@ impl UnetMidBlock2DCrossAttn {
         if let Some(resnet) = &self.resnet_1 {
             hidden =
                 resnet.forward_with_runtime_context(&hidden, time_embedding, runtime_context)?;
+        }
+        Ok(hidden)
+    }
+
+    /// Phase 1b device-resident mid block (resnet → optional cross-attn →
+    /// optional resnet). Takes ownership of `hidden`.
+    pub(crate) fn forward_resident(
+        &self,
+        mut hidden: rdna_compute::GpuTensor,
+        time_embedding: &rdna_compute::GpuTensor,
+        encoder_states: &rdna_compute::GpuTensor,
+        gpu: &mut rdna_compute::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+        let next = self
+            .resnet_0
+            .forward_resident(&hidden, time_embedding, gpu, cache)?;
+        free_resident(gpu, hidden)?;
+        hidden = next;
+        if let Some(attention) = &self.attention {
+            let next = attention.forward_resident(&hidden, encoder_states, gpu, cache)?;
+            free_resident(gpu, hidden)?;
+            hidden = next;
+        }
+        if let Some(resnet) = &self.resnet_1 {
+            let next = resnet.forward_resident(&hidden, time_embedding, gpu, cache)?;
+            free_resident(gpu, hidden)?;
+            hidden = next;
         }
         Ok(hidden)
     }
@@ -851,6 +1034,18 @@ impl NativeUnet2DConditionModel {
             time_embedding =
                 tensor_add_with_runtime_context(&time_embedding, &added, runtime_context)?;
         }
+        // Phase 1b: when a GPU is present, run the whole denoiser device-resident
+        // — upload the (host-computed) sample, time embedding, and conditioning
+        // once, keep every activation on-device through the down/mid/up paths,
+        // and download only the final noise prediction.
+        if runtime_context.rocm_device_id().is_some() {
+            return self.forward_resident(
+                &sample,
+                &time_embedding,
+                encoder_states,
+                runtime_context,
+            );
+        }
         let (hidden, mut skips) = self.down_path.forward_with_runtime_context(
             &sample,
             &time_embedding,
@@ -880,6 +1075,69 @@ impl NativeUnet2DConditionModel {
         let hidden = silu_with_runtime_context(&hidden, runtime_context)?;
         self.conv_out
             .forward_with_runtime_context(&hidden, runtime_context)
+    }
+
+    /// Phase 1b device-resident UNet forward. `sample_host` and
+    /// `time_embedding_host` are computed on the host by the caller (centering +
+    /// the small time/SDXL embedding, once per forward); everything from
+    /// `conv_in` to `conv_out` runs on-device with no intermediate host
+    /// round-trips. Only the final noise prediction is downloaded.
+    fn forward_resident(
+        &self,
+        sample_host: &CpuTensor,
+        time_embedding_host: &CpuTensor,
+        encoder_states_host: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
+        runtime_context.with_rocm_gpu_weighted(|gpu, cache| {
+            gpu.bind_thread()
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            let sample = gpu
+                .upload_f32(&sample_host.data, &sample_host.shape)
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            let time_embedding = gpu
+                .upload_f32(&time_embedding_host.data, &time_embedding_host.shape)
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            let encoder_states = gpu
+                .upload_f32(&encoder_states_host.data, &encoder_states_host.shape)
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            let (mut hidden, mut skips) = self.down_path.forward_resident(
+                &sample,
+                &time_embedding,
+                &encoder_states,
+                gpu,
+                cache,
+            )?;
+            free_resident(gpu, sample)?;
+            if let Some(mid_block) = &self.mid_block {
+                hidden =
+                    mid_block.forward_resident(hidden, &time_embedding, &encoder_states, gpu, cache)?;
+            }
+            hidden = self.up_path.forward_resident(
+                hidden,
+                &mut skips,
+                &time_embedding,
+                &encoder_states,
+                gpu,
+                cache,
+            )?;
+            // Any skip not consumed by the up path (unbalanced configs) must
+            // still be returned to the pool.
+            for skip in skips.drain(..) {
+                free_resident(gpu, skip)?;
+            }
+            let normed = self.conv_norm_out.forward_resident(&hidden, gpu, cache)?;
+            free_resident(gpu, hidden)?;
+            let silued = silu_resident(gpu, &normed)?;
+            free_resident(gpu, normed)?;
+            let predicted = self.conv_out.forward_resident(&silued, gpu, cache)?;
+            free_resident(gpu, silued)?;
+            let output = download_resident(gpu, &predicted)?;
+            free_resident(gpu, predicted)?;
+            free_resident(gpu, time_embedding)?;
+            free_resident(gpu, encoder_states)?;
+            Ok(output)
+        })
     }
 
     pub fn denoise_latents(
