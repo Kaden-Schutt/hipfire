@@ -33,7 +33,9 @@ pub(crate) fn run_eval_batteries(
     ctx: &EvalContext,
     datasets: &[DatasetManifestEntry],
 ) -> Result<Vec<EvalResult>, String> {
-    if !daemon_shared_model_load_enabled(config) {
+    let daemon_shared_enabled = daemon_shared_model_load_enabled(config);
+    let coherence_shared_enabled = coherence_shared_model_load_enabled(config);
+    if !daemon_shared_enabled && !coherence_shared_enabled {
         let mut results = Vec::new();
         for battery in &config.batteries {
             results.extend(run_battery_cached(*battery, config, ctx, datasets)?);
@@ -42,7 +44,8 @@ pub(crate) fn run_eval_batteries(
     }
 
     let mut rows_by_battery: BTreeMap<BatteryId, Vec<EvalResult>> = BTreeMap::new();
-    let mut shared_misses = Vec::new();
+    let mut daemon_shared_misses = Vec::new();
+    let mut coherence_shared_misses = Vec::new();
     for battery in &config.batteries {
         let key = result_cache_key(*battery, config, ctx, datasets)?;
         let path = result_cache_path(config, &key);
@@ -61,8 +64,10 @@ pub(crate) fn run_eval_batteries(
             }
         }
 
-        if daemon_shared_model_load_battery(*battery) {
-            shared_misses.push((*battery, key, path));
+        if daemon_shared_enabled && daemon_shared_model_load_battery(*battery) {
+            daemon_shared_misses.push((*battery, key, path));
+        } else if coherence_shared_enabled && coherence_shared_model_load_battery(*battery) {
+            coherence_shared_misses.push((*battery, key, path));
         } else {
             rows_by_battery.insert(
                 *battery,
@@ -71,13 +76,33 @@ pub(crate) fn run_eval_batteries(
         }
     }
 
-    if !shared_misses.is_empty() {
-        let shared_batteries = shared_misses
+    if !daemon_shared_misses.is_empty() {
+        let shared_batteries = daemon_shared_misses
             .iter()
             .map(|(battery, _, _)| *battery)
             .collect::<Vec<_>>();
         let mut shared_rows = run_daemon_shared_model_load_rows(config, ctx, &shared_batteries);
-        for (battery, key, path) in shared_misses {
+        for (battery, key, path) in daemon_shared_misses {
+            let rows = shared_rows.remove(&battery).unwrap_or_default();
+            if config.cache_mode.writes() {
+                if let Err(err) = write_result_cache_entry(&path, &key, config.cache_mode, &rows) {
+                    eprintln!(
+                        "warning: failed to write eval result cache {}: {err}",
+                        path.display()
+                    );
+                }
+            }
+            rows_by_battery.insert(battery, rows);
+        }
+    }
+
+    if !coherence_shared_misses.is_empty() {
+        let shared_batteries = coherence_shared_misses
+            .iter()
+            .map(|(battery, _, _)| *battery)
+            .collect::<Vec<_>>();
+        let mut shared_rows = run_examples_shared_coherence_rows(config, ctx, &shared_batteries);
+        for (battery, key, path) in coherence_shared_misses {
             let rows = shared_rows.remove(&battery).unwrap_or_default();
             if config.cache_mode.writes() {
                 if let Err(err) = write_result_cache_entry(&path, &key, config.cache_mode, &rows) {
@@ -107,6 +132,8 @@ pub(crate) fn daemon_shared_model_load_enabled(config: &EvalConfig) -> bool {
     ) && config.runs == 1
         && config.warmup_runs == 0
         && !config.benchmark
+        && config.baseline.is_none()
+        && config.reference.is_none()
         && config
             .batteries
             .iter()
@@ -125,6 +152,30 @@ pub(crate) fn daemon_shared_model_load_battery(battery: BatteryId) -> bool {
         battery,
         BatteryId::Smoke | BatteryId::Speed | BatteryId::Profile
     )
+}
+
+pub(crate) fn coherence_shared_model_load_enabled(config: &EvalConfig) -> bool {
+    matches!(
+        config.executor,
+        EvalExecutorMode::Auto | EvalExecutorMode::Daemon | EvalExecutorMode::Examples
+    ) && config.runs == 1
+        && config.warmup_runs == 0
+        && !config.benchmark
+        && config
+            .batteries
+            .iter()
+            .filter(|battery| coherence_shared_model_load_battery(**battery))
+            .count()
+            > 0
+        && config
+            .batteries
+            .iter()
+            .filter(|battery| coherence_shared_model_load_battery(**battery))
+            .all(|battery| examples_executor_available_for(*battery))
+}
+
+pub(crate) fn coherence_shared_model_load_battery(battery: BatteryId) -> bool {
+    matches!(battery, BatteryId::Coherence | BatteryId::Agentic)
 }
 
 pub(crate) fn daemon_executor_available_for(config: &EvalConfig, battery: BatteryId) -> bool {

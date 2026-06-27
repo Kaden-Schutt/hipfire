@@ -709,6 +709,7 @@ pub fn run_eval(config: EvalConfig) -> Result<(), String> {
         &context,
     )?;
     println!("{}", config.out_dir.display());
+    print!("{}", render_eval_stdout_findings(&admission, &results));
     if config.fail_on_admission && admission.verdict != "promote" {
         return Err(format!(
             "admission verdict {}: {}; artifacts written to {}",
@@ -721,6 +722,255 @@ pub fn run_eval(config: EvalConfig) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+const STDOUT_RESULT_ROW_LIMIT: usize = 12;
+const STDOUT_RESULT_METRIC_LIMIT: usize = 8;
+const STDOUT_ROW_FINDING_LIMIT: usize = 12;
+const STDOUT_METRIC_PRIORITY: &[&str] = &[
+    "tok_s_median",
+    "tok_s",
+    "decode_tok_s_median",
+    "decode_tok_s",
+    "prefill_tok_s_median",
+    "prefill_tok_s",
+    "ttft_ms_median",
+    "ttft_ms",
+    "decode_ms_median",
+    "decode_ms",
+    "prefill_ms_median",
+    "prefill_ms",
+    "accuracy",
+    "mean_kld",
+    "ppl",
+    "perplexity",
+    "sample_count",
+    "total_sample_count",
+    "failed_sample_count",
+    "skipped_sample_count",
+    "cache_hit",
+];
+
+fn render_eval_stdout_findings(admission: &AdmissionArtifact, rows: &[EvalResult]) -> String {
+    let result_rows = stdout_result_rows(rows);
+    let row_findings = rows
+        .iter()
+        .filter(|row| row.status != EvalStatus::Pass)
+        .count();
+    let total_findings = admission.findings.len() + row_findings;
+    let mut body = String::new();
+    body.push_str(&format!("admission: {}", admission.verdict));
+    if let Some(reason) = admission.reason.as_deref() {
+        body.push_str(&format!(" ({reason})"));
+    }
+    body.push('\n');
+    body.push_str(&format!("results: {}\n", result_rows.len()));
+    for row in result_rows.iter().take(STDOUT_RESULT_ROW_LIMIT) {
+        body.push_str(&render_stdout_result_row(row));
+    }
+    if result_rows.len() > STDOUT_RESULT_ROW_LIMIT {
+        body.push_str(&format!(
+            "  ... {} more result row(s); see summary.md and results.jsonl\n",
+            result_rows.len() - STDOUT_RESULT_ROW_LIMIT
+        ));
+    }
+    body.push_str(&format!("findings: {total_findings}\n"));
+    body.push_str(&format!(
+        "admission findings: {}\n",
+        admission.findings.len()
+    ));
+    for finding in &admission.findings {
+        let suite = finding.suite.map(|suite| suite.as_str()).unwrap_or("-");
+        let item = finding.dataset_item_id.as_deref().unwrap_or("-");
+        let relative = finding
+            .relative_delta
+            .map(|delta| format!("{:+.2}%", delta * 100.0))
+            .unwrap_or_else(|| "-".to_string());
+        body.push_str(&format!(
+            "  [{}] {}/{} suite={} item={} metric={} comparator={} direction={} delta={:+.6} relative={}\n",
+            finding.severity,
+            finding.battery.as_str(),
+            finding.case_id,
+            suite,
+            item,
+            finding.metric,
+            finding.comparator,
+            finding.direction,
+            finding.delta,
+            relative
+        ));
+    }
+    body.push_str(&format!("row findings: {row_findings}\n"));
+    let mut rendered_row_findings = 0usize;
+    for row in rows.iter().filter(|row| row.status != EvalStatus::Pass) {
+        if rendered_row_findings >= STDOUT_ROW_FINDING_LIMIT {
+            continue;
+        }
+        let suite = row.suite.map(|suite| suite.as_str()).unwrap_or("-");
+        let item = row.dataset_item_id.as_deref().unwrap_or("-");
+        let reason = row
+            .reason
+            .as_deref()
+            .map(stdout_field)
+            .unwrap_or_else(|| "-".to_string());
+        body.push_str(&format!(
+            "  [{}] {}/{} suite={} item={} reason={}\n",
+            eval_status_str(row.status),
+            row.battery.as_str(),
+            row.case_id,
+            suite,
+            item,
+            reason
+        ));
+        rendered_row_findings += 1;
+    }
+    if row_findings > STDOUT_ROW_FINDING_LIMIT {
+        body.push_str(&format!(
+            "  ... {} more row finding(s); see summary.md and results.jsonl\n",
+            row_findings - STDOUT_ROW_FINDING_LIMIT
+        ));
+    }
+    body
+}
+
+fn stdout_result_rows(rows: &[EvalResult]) -> Vec<&EvalResult> {
+    rows.iter()
+        .filter(|row| row.status == EvalStatus::Pass)
+        .filter(|row| !stdout_has_preferred_aggregate(row, rows))
+        .filter(|row| !stdout_metric_summary(row).is_empty())
+        .collect()
+}
+
+fn stdout_has_preferred_aggregate(row: &EvalResult, rows: &[EvalResult]) -> bool {
+    if row.metrics.get("benchmark_sample").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    rows.iter().any(|aggregate| {
+        aggregate.status == EvalStatus::Pass
+            && aggregate
+                .metrics
+                .get("benchmark_aggregate")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && aggregate
+                .metrics
+                .get("aggregate_source_case_id")
+                .and_then(Value::as_str)
+                == Some(row.case_id.as_str())
+            && aggregate.battery == row.battery
+            && aggregate.suite == row.suite
+            && aggregate.dataset_item_id == row.dataset_item_id
+            && aggregate.model == row.model
+            && aggregate.prompt_hash == row.prompt_hash
+            && aggregate.kv_mode == row.kv_mode
+    })
+}
+
+fn render_stdout_result_row(row: &EvalResult) -> String {
+    let suite = row.suite.map(|suite| suite.as_str()).unwrap_or("-");
+    let item = row.dataset_item_id.as_deref().unwrap_or("-");
+    let model = stdout_model_label(&row.model);
+    let metrics = stdout_metric_summary(row).join(" ");
+    format!(
+        "  [pass] {}/{} suite={} item={} model={} {}\n",
+        row.battery.as_str(),
+        row.case_id,
+        suite,
+        item,
+        model,
+        metrics
+    )
+}
+
+fn stdout_metric_summary(row: &EvalResult) -> Vec<String> {
+    let mut rendered = Vec::new();
+    if row.elapsed_ms > 0 {
+        rendered.push(format!("elapsed_ms={}", row.elapsed_ms));
+    }
+    for key in STDOUT_METRIC_PRIORITY {
+        if rendered.len() >= STDOUT_RESULT_METRIC_LIMIT {
+            return rendered;
+        }
+        if let Some(value) = row.metrics.get(*key).and_then(stdout_metric_value) {
+            rendered.push(format!("{key}={value}"));
+        }
+    }
+    for (key, value) in &row.metrics {
+        if rendered.len() >= STDOUT_RESULT_METRIC_LIMIT {
+            break;
+        }
+        if STDOUT_METRIC_PRIORITY.contains(&key.as_str()) || stdout_metric_excluded(key) {
+            continue;
+        }
+        if let Some(value) = stdout_metric_value(value) {
+            rendered.push(format!("{key}={value}"));
+        }
+    }
+    rendered
+}
+
+fn stdout_metric_excluded(key: &str) -> bool {
+    matches!(
+        key,
+        "aggregate_source_case_id"
+            | "benchmark_aggregate"
+            | "benchmark_sample"
+            | "run_index"
+            | "run_count"
+            | "warmup_runs"
+            | "cache_key"
+            | "cache_path"
+            | "dataset_source"
+            | "dataset_repo_id"
+            | "dataset_revision"
+            | "dataset_digest"
+            | "dataset_license"
+            | "dataset_cache_path"
+    ) || key.ends_with("_hash")
+        || key.ends_with("_path")
+}
+
+fn stdout_metric_value(value: &Value) -> Option<String> {
+    if let Some(value) = value.as_bool() {
+        return Some(value.to_string());
+    }
+    if let Some(value) = value.as_i64() {
+        return Some(value.to_string());
+    }
+    if let Some(value) = value.as_u64() {
+        return Some(value.to_string());
+    }
+    let value = value.as_f64()?;
+    if !value.is_finite() {
+        return None;
+    }
+    Some(format_stdout_float(value))
+}
+
+fn format_stdout_float(value: f64) -> String {
+    let formatted = if value.abs() >= 100.0 {
+        format!("{value:.2}")
+    } else if value.abs() >= 10.0 {
+        format!("{value:.3}")
+    } else {
+        format!("{value:.4}")
+    };
+    formatted
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
+}
+
+fn stdout_model_label(model: &str) -> String {
+    Path::new(model)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(model)
+        .to_string()
+}
+
+fn stdout_field(value: &str) -> String {
+    value.replace('\n', " ").replace('\r', " ")
 }
 
 fn run_passive_profile_collectors(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
@@ -1901,9 +2151,8 @@ mod tests {
     fn parses_broader_cli_surface() {
         let cfg = parse_args_from([
             "hipfire-eval",
-            "--model",
             "candidate.hfq",
-            "--baseline",
+            "--compare",
             "baseline.hfq",
             "--reference",
             "bf16",
@@ -1929,6 +2178,10 @@ mod tests {
             "profiler.json",
             "--evidence-dir",
             "runtime-artifacts",
+            "--compare-variant",
+            "baseline-json",
+            "--performance-compare-variant",
+            "baseline-perf",
         ])
         .unwrap();
         assert_eq!(cfg.tier, EvalTier::Medium);
@@ -1946,6 +2199,27 @@ mod tests {
             vec![PathBuf::from("atlas.json"), PathBuf::from("profiler.json")]
         );
         assert_eq!(cfg.evidence_dirs, vec![PathBuf::from("runtime-artifacts")]);
+        assert_eq!(cfg.baseline_variant.as_deref(), Some("baseline-json"));
+        assert_eq!(
+            cfg.performance_baseline_variant.as_deref(),
+            Some("baseline-perf")
+        );
+    }
+
+    #[test]
+    fn positional_model_is_primary_eval_form() {
+        let cfg = parse_args_from([
+            "hipfire-eval",
+            "candidate.hfq",
+            "--battery",
+            "speed",
+            "--compare",
+            "baseline.hfq",
+        ])
+        .unwrap();
+        assert_eq!(cfg.model, "candidate.hfq");
+        assert_eq!(cfg.baseline.as_deref(), Some("baseline.hfq"));
+        assert_eq!(cfg.batteries, vec![BatteryId::Speed]);
     }
 
     #[test]
@@ -2241,6 +2515,126 @@ mod tests {
             .iter()
             .all(|row| row.metrics.get("executor").and_then(Value::as_str) == Some("daemon")));
         assert!(rows.iter().all(|row| row.status == EvalStatus::Skip));
+    }
+
+    #[test]
+    fn coherence_and_agentic_group_under_shared_daemon_plan() {
+        let _lock = env_lock();
+        let _daemon = ScopedEnv::set("HIPFIRE_DAEMON_BIN", Path::new("/bin/true"));
+        let cfg = parse_args_from([
+            "hipfire-eval",
+            "--model",
+            "missing-local-model.hfq",
+            "--battery",
+            "coherence,agentic",
+            "--no-cache",
+        ])
+        .unwrap();
+        let ctx = EvalContext {
+            commit_sha: None,
+            git_branch: None,
+            git_describe: None,
+            git_dirty: None,
+            binary_hash: None,
+            arch: None,
+            rocm: None,
+            host_profile: test_host_profile(),
+        };
+
+        assert!(coherence_shared_model_load_enabled(&cfg));
+        assert!(!daemon_shared_model_load_enabled(&cfg));
+        let direct_cfg = parse_args_from([
+            "hipfire-eval",
+            "--model",
+            "missing-local-model.hfq",
+            "--executor",
+            "direct",
+            "--battery",
+            "coherence,agentic",
+            "--no-cache",
+        ])
+        .unwrap();
+        assert!(!coherence_shared_model_load_enabled(&direct_cfg));
+        let rows = run_eval_batteries(&cfg, &ctx, &[]).unwrap();
+        assert_eq!(rows.len(), 9);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.battery == BatteryId::Coherence)
+                .count(),
+            5
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.battery == BatteryId::Agentic)
+                .count(),
+            4
+        );
+        assert!(rows.iter().all(|row| row.status == EvalStatus::Skip));
+    }
+
+    #[test]
+    fn daemon_quality_without_reference_skips_before_spawning_daemon() {
+        let _lock = env_lock();
+        let model = temp_path("daemon-quality-no-reference-model.hfq");
+        let out = temp_path("daemon-quality-no-reference-out");
+        let daemon = temp_path("daemon-quality-no-reference-daemon.sh");
+        let sentinel = temp_path("daemon-quality-no-reference-spawned");
+        let _ = fs::remove_file(&model);
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_file(&daemon);
+        let _ = fs::remove_file(&sentinel);
+        fs::write(&model, b"not a real hfq; no load should happen").unwrap();
+        fs::write(
+            &daemon,
+            format!(
+                "#!/bin/sh\nprintf spawned > '{}'\nexit 1\n",
+                sentinel.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&daemon).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&daemon, perms).unwrap();
+        }
+        let _daemon_env = ScopedEnv::set("HIPFIRE_DAEMON_BIN", &daemon);
+        let cfg = parse_args_from([
+            "hipfire-eval",
+            "--model",
+            model.to_str().unwrap(),
+            "--battery",
+            "quality",
+            "--no-cache",
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .unwrap();
+        let ctx = EvalContext {
+            commit_sha: None,
+            git_branch: None,
+            git_describe: None,
+            git_dirty: None,
+            binary_hash: None,
+            arch: None,
+            rocm: None,
+            host_profile: test_host_profile(),
+        };
+
+        let rows = run_battery(BatteryId::Quality, &cfg, &ctx, &[]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, EvalStatus::Skip);
+        assert!(rows[0]
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("no KLD reference"));
+        assert!(!sentinel.exists());
+
+        let _ = fs::remove_file(model);
+        let _ = fs::remove_dir_all(out);
+        let _ = fs::remove_file(daemon);
+        let _ = fs::remove_file(sentinel);
     }
 
     #[test]
@@ -4124,7 +4518,7 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
             schema: 1,
             provenance: run_provenance(&ctx),
             status: EvalStatus::Skip,
-            reason: Some("no --baseline provided".to_string()),
+            reason: Some("no --compare or --reference provided".to_string()),
             baseline: None,
             reference: None,
             cases: Vec::new(),
@@ -4256,7 +4650,7 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
             schema: 1,
             provenance: run_provenance(&ctx),
             status: EvalStatus::Skip,
-            reason: Some("no --baseline provided".to_string()),
+            reason: Some("no --compare or --reference provided".to_string()),
             baseline: None,
             reference: None,
             cases: Vec::new(),
@@ -4369,6 +4763,21 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
         ];
         let comparison = build_comparison_artifact(&cfg, &rows, &ctx);
         let admission = build_admission_artifact(&cfg, &rows, &comparison, &ctx);
+        let stdout = render_eval_stdout_findings(&admission, &rows);
+        assert!(stdout.contains("admission: reject"));
+        assert!(stdout.contains("results: 4"));
+        assert!(
+            stdout.contains("  [pass] speed/decode suite=- item=- model=candidate.hfq tok_s=120")
+        );
+        assert!(
+            stdout.contains("  [pass] speed/decode suite=- item=- model=baseline.hfq tok_s=100")
+        );
+        assert!(stdout.contains("findings: 1"));
+        assert!(stdout.contains("admission findings: 1"));
+        assert!(stdout.contains("row findings: 0"));
+        assert!(stdout.contains(
+            "[reject] quality/canary suite=- item=- metric=mean_kld comparator=baseline direction=regressed delta=+0.030000 relative=+60.00%"
+        ));
         let datasets = vec![DatasetManifestEntry {
             suite: SuiteId::LmEvalMicro,
             source: "builtin".to_string(),
@@ -4474,6 +4883,153 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
     }
 
     #[test]
+    fn stdout_findings_include_row_skips() {
+        let cfg = parse_args_from([
+            "hipfire-eval",
+            "--model",
+            "candidate.hfq",
+            "--battery",
+            "speed",
+        ])
+        .unwrap();
+        let ctx = EvalContext {
+            commit_sha: Some("abc".to_string()),
+            git_branch: Some("evaluation-harness".to_string()),
+            git_describe: Some("v0.2.0-1-gabc".to_string()),
+            git_dirty: Some(false),
+            binary_hash: Some("binhash".to_string()),
+            arch: Some("gfx1151".to_string()),
+            rocm: Some("7.13.26176".to_string()),
+            host_profile: test_host_profile(),
+        };
+        let rows = vec![
+            row_for_model(
+                BatteryId::Speed,
+                None,
+                "daemon_prefill_decode_first",
+                None,
+                EvalStatus::Skip,
+                Some(
+                    "daemon executor requires the model to resolve to a local filesystem path"
+                        .to_string(),
+                ),
+                BTreeMap::new(),
+                &cfg,
+                &ctx,
+                None,
+                0,
+                "candidate.hfq".to_string(),
+            ),
+            row_for_model(
+                BatteryId::Speed,
+                None,
+                "daemon_prefill_decode_reset",
+                None,
+                EvalStatus::Skip,
+                Some(
+                    "daemon executor requires the model to resolve to a local filesystem path"
+                        .to_string(),
+                ),
+                BTreeMap::new(),
+                &cfg,
+                &ctx,
+                None,
+                0,
+                "candidate.hfq".to_string(),
+            ),
+        ];
+        let comparison = build_comparison_artifact(&cfg, &rows, &ctx);
+        let admission = build_admission_artifact(&cfg, &rows, &comparison, &ctx);
+        let stdout = render_eval_stdout_findings(&admission, &rows);
+        assert!(stdout.contains("admission: incomplete"));
+        assert!(stdout.contains("results: 0"));
+        assert!(stdout.contains("findings: 2"));
+        assert!(stdout.contains("admission findings: 0"));
+        assert!(stdout.contains("row findings: 2"));
+        assert!(stdout.contains(
+            "[skip] speed/daemon_prefill_decode_first suite=- item=- reason=daemon executor requires the model to resolve to a local filesystem path"
+        ));
+        assert!(stdout.contains(
+            "[skip] speed/daemon_prefill_decode_reset suite=- item=- reason=daemon executor requires the model to resolve to a local filesystem path"
+        ));
+    }
+
+    #[test]
+    fn stdout_results_prefer_benchmark_aggregates() {
+        let cfg = parse_args_from([
+            "hipfire-eval",
+            "--model",
+            "candidate.hfq",
+            "--battery",
+            "speed",
+            "--runs",
+            "3",
+        ])
+        .unwrap();
+        let ctx = EvalContext {
+            commit_sha: Some("abc".to_string()),
+            git_branch: Some("evaluation-harness".to_string()),
+            git_describe: Some("v0.2.0-1-gabc".to_string()),
+            git_dirty: Some(false),
+            binary_hash: Some("binhash".to_string()),
+            arch: Some("gfx1151".to_string()),
+            rocm: Some("7.13.26176".to_string()),
+            host_profile: test_host_profile(),
+        };
+        let mut rows = Vec::new();
+        for (run_index, tok_s) in [(1, 100.0), (2, 110.0), (3, 120.0)] {
+            rows.push(row_for_model(
+                BatteryId::Speed,
+                None,
+                "decode",
+                None,
+                EvalStatus::Pass,
+                None,
+                BTreeMap::from([
+                    ("benchmark_sample".to_string(), json!(true)),
+                    ("run_index".to_string(), json!(run_index)),
+                    ("run_count".to_string(), json!(3)),
+                    ("tok_s".to_string(), json!(tok_s)),
+                ]),
+                &cfg,
+                &ctx,
+                None,
+                10,
+                "candidate.hfq".to_string(),
+            ));
+        }
+        rows.push(row_for_model(
+            BatteryId::Speed,
+            None,
+            "decode::aggregate",
+            None,
+            EvalStatus::Pass,
+            None,
+            BTreeMap::from([
+                ("benchmark_aggregate".to_string(), json!(true)),
+                ("aggregate_source_case_id".to_string(), json!("decode")),
+                ("sample_count".to_string(), json!(3)),
+                ("total_sample_count".to_string(), json!(3)),
+                ("tok_s_median".to_string(), json!(110.0)),
+                ("tok_s_stddev".to_string(), json!(10.0)),
+            ]),
+            &cfg,
+            &ctx,
+            None,
+            30,
+            "candidate.hfq".to_string(),
+        ));
+        let comparison = build_comparison_artifact(&cfg, &rows, &ctx);
+        let admission = build_admission_artifact(&cfg, &rows, &comparison, &ctx);
+        let stdout = render_eval_stdout_findings(&admission, &rows);
+        assert!(stdout.contains("results: 1"));
+        assert!(stdout.contains(
+            "  [pass] speed/decode::aggregate suite=- item=- model=candidate.hfq elapsed_ms=30 tok_s_median=110 sample_count=3 total_sample_count=3 tok_s_stddev=10"
+        ));
+        assert!(!stdout.contains("  [pass] speed/decode suite=-"));
+    }
+
+    #[test]
     fn summary_includes_empty_dataset_and_artifact_sections() {
         let out = temp_path("summary-empty-sections.md");
         let cfg = parse_args_from([
@@ -4565,7 +5121,7 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
             schema: 1,
             provenance: run_provenance(&ctx),
             status: EvalStatus::Skip,
-            reason: Some("no --baseline provided".to_string()),
+            reason: Some("no --compare or --reference provided".to_string()),
             baseline: None,
             reference: None,
             cases: Vec::new(),
@@ -4703,7 +5259,7 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
             schema: 1,
             provenance: run_provenance(&ctx),
             status: EvalStatus::Skip,
-            reason: Some("no --baseline provided".to_string()),
+            reason: Some("no --compare or --reference provided".to_string()),
             baseline: None,
             reference: None,
             cases: Vec::new(),
@@ -4777,7 +5333,7 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
             schema: 1,
             provenance: run_provenance(&ctx),
             status: EvalStatus::Skip,
-            reason: Some("no --baseline provided".to_string()),
+            reason: Some("no --compare or --reference provided".to_string()),
             baseline: None,
             reference: None,
             cases: Vec::new(),
@@ -4896,7 +5452,7 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
             schema: 1,
             provenance: run_provenance(&ctx),
             status: EvalStatus::Skip,
-            reason: Some("no --baseline provided".to_string()),
+            reason: Some("no --compare or --reference provided".to_string()),
             baseline: None,
             reference: None,
             cases: Vec::new(),
@@ -5036,7 +5592,7 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
             schema: 1,
             provenance: run_provenance(&ctx),
             status: EvalStatus::Skip,
-            reason: Some("no --baseline provided".to_string()),
+            reason: Some("no --compare or --reference provided".to_string()),
             baseline: None,
             reference: None,
             cases: Vec::new(),
@@ -5123,7 +5679,7 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
             schema: 1,
             provenance: run_provenance(&ctx),
             status: EvalStatus::Skip,
-            reason: Some("no --baseline provided".to_string()),
+            reason: Some("no --compare or --reference provided".to_string()),
             baseline: None,
             reference: None,
             cases: Vec::new(),
@@ -5198,7 +5754,7 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
             schema: 1,
             provenance: run_provenance(&ctx),
             status: EvalStatus::Skip,
-            reason: Some("no --baseline provided".to_string()),
+            reason: Some("no --compare or --reference provided".to_string()),
             baseline: None,
             reference: None,
             cases: Vec::new(),
@@ -5277,7 +5833,7 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
             schema: 1,
             provenance: run_provenance(&ctx),
             status: EvalStatus::Skip,
-            reason: Some("no --baseline provided".to_string()),
+            reason: Some("no --compare or --reference provided".to_string()),
             baseline: None,
             reference: None,
             cases: Vec::new(),
@@ -5421,7 +5977,7 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
             schema: 1,
             provenance: run_provenance(&ctx),
             status: EvalStatus::Skip,
-            reason: Some("no --baseline provided".to_string()),
+            reason: Some("no --compare or --reference provided".to_string()),
             baseline: None,
             reference: None,
             cases: Vec::new(),
@@ -5780,7 +6336,7 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
             schema: 1,
             provenance: run_provenance(&ctx),
             status: EvalStatus::Skip,
-            reason: Some("no --baseline provided".to_string()),
+            reason: Some("no --compare or --reference provided".to_string()),
             baseline: None,
             reference: None,
             cases: Vec::new(),
@@ -7065,6 +7621,44 @@ more noise
     }
 
     #[test]
+    fn admission_measures_speed_without_compare() {
+        let cfg = parse_args_from(["hipfire-eval", "candidate.hfq", "--battery", "speed"]).unwrap();
+        let ctx = EvalContext {
+            commit_sha: None,
+            git_branch: None,
+            git_describe: None,
+            git_dirty: None,
+            binary_hash: None,
+            arch: None,
+            rocm: None,
+            host_profile: test_host_profile(),
+        };
+        let rows = vec![row_for_model(
+            BatteryId::Speed,
+            None,
+            "decode",
+            None,
+            EvalStatus::Pass,
+            None,
+            BTreeMap::from([("tok_s".to_string(), json!(120.0))]),
+            &cfg,
+            &ctx,
+            None,
+            0,
+            "candidate.hfq".to_string(),
+        )];
+        let comparison = build_comparison_artifact(&cfg, &rows, &ctx);
+        let admission = build_admission_artifact(&cfg, &rows, &comparison, &ctx);
+        assert_eq!(admission.status, EvalStatus::Pass);
+        assert_eq!(admission.verdict, "measured");
+        assert!(admission
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("no --compare or --reference"));
+    }
+
+    #[test]
     fn admission_accepts_barrage_accuracy_as_quality_evidence() {
         let cfg = parse_args_from([
             "hipfire-eval",
@@ -7518,6 +8112,6 @@ more noise
             .reason
             .as_deref()
             .unwrap_or("")
-            .contains("no --baseline or --reference"));
+            .contains("no --compare or --reference"));
     }
 }

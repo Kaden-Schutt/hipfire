@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 
 use hipfire_generate::{GenerateTextRequest, GenerationSamplingPolicy};
+use hipfire_model::find_model_in;
 
 use crate::*;
 
@@ -67,7 +68,7 @@ pub(crate) fn run_daemon_quality_rows(config: &EvalConfig, ctx: &EvalContext) ->
             config,
             ctx,
             &config.model,
-            "daemon quality executor requires --model to be a local filesystem path",
+            "daemon quality executor requires the model to resolve to a local filesystem path",
         )];
     }
     let Some(bin) = hipfire_daemon_adapter::find_daemon_bin() else {
@@ -120,15 +121,23 @@ pub(crate) async fn run_daemon_quality_rows_async(
 ) -> anyhow::Result<Vec<EvalResult>> {
     use hipfire_daemon_protocol::{KldEvalMode, KldEvalRequest};
 
+    enum ReferencePlan {
+        Existing(String),
+        Build {
+            ref_model: String,
+            corpus: String,
+            ref_out: std::path::PathBuf,
+        },
+    }
+
     let max_seq = 4096; // n_ctx=2048 chunks + headroom
-    let mut engine = hipfire_daemon_adapter::DaemonEngine::spawn(bin).await?;
     let evidence_dir = runtime_evidence_dir(config, "kld_reference_slice", &config.model);
     let _ = fs::create_dir_all(&evidence_dir);
 
     // ── Resolve the reference: an existing HFKREF, else build one resident from
     // the full-precision anchor (`--reference`). ──
-    let ref_path: String = if let Some(p) = config.kldref.as_ref().filter(|p| p.exists()) {
-        p.display().to_string()
+    let ref_plan = if let Some(p) = config.kldref.as_ref().filter(|p| p.exists()) {
+        ReferencePlan::Existing(p.display().to_string())
     } else if let Some(ref_model) = config.reference.as_ref() {
         if !Path::new(ref_model).exists() {
             return Ok(vec![daemon_quality_skip_row(
@@ -147,28 +156,12 @@ pub(crate) async fn run_daemon_quality_rows_async(
                 &format!("KLD corpus slice not found ({KLD_CORPUS_SLICE})"),
             )]);
         };
-        engine
-            .load(ref_model, daemon_kld_load_params(config, max_seq))
-            .await?;
         let ref_out = evidence_dir.join(format!("{}.kldref", model_artifact_stem(ref_model)));
-        let resp = engine
-            .kld_eval(
-                KldEvalRequest {
-                    mode: KldEvalMode::BuildRef,
-                    corpus: Some(corpus),
-                    ref_path: Some(ref_out.display().to_string()),
-                    output: None,
-                    max_chunks: config.quality_max_chunks,
-                    n_ctx: None,
-                    config: None,
-                    capture_hidden_layers: false,
-                    dump_logits: false,
-                },
-                |_| {},
-            )
-            .await?;
-        resp.ref_output
-            .unwrap_or_else(|| ref_out.display().to_string())
+        ReferencePlan::Build {
+            ref_model: ref_model.clone(),
+            corpus,
+            ref_out,
+        }
     } else {
         return Ok(vec![daemon_quality_skip_row(
             config,
@@ -176,6 +169,38 @@ pub(crate) async fn run_daemon_quality_rows_async(
             &config.model,
             "no KLD reference: pass --reference <full-precision model> to build one, or --kldref <ref.kldref>",
         )]);
+    };
+
+    let mut engine = hipfire_daemon_adapter::DaemonEngine::spawn(bin).await?;
+    let ref_path = match ref_plan {
+        ReferencePlan::Existing(path) => path,
+        ReferencePlan::Build {
+            ref_model,
+            corpus,
+            ref_out,
+        } => {
+            engine
+                .load(&ref_model, daemon_kld_load_params(config, max_seq))
+                .await?;
+            let resp = engine
+                .kld_eval(
+                    KldEvalRequest {
+                        mode: KldEvalMode::BuildRef,
+                        corpus: Some(corpus),
+                        ref_path: Some(ref_out.display().to_string()),
+                        output: None,
+                        max_chunks: config.quality_max_chunks,
+                        n_ctx: None,
+                        config: None,
+                        capture_hidden_layers: false,
+                        dump_logits: false,
+                    },
+                    |_| {},
+                )
+                .await?;
+            resp.ref_output
+                .unwrap_or_else(|| ref_out.display().to_string())
+        }
     };
 
     // ── Score each candidate against the resident reference. ──
@@ -380,9 +405,18 @@ pub(crate) async fn load_daemon_eval_session(
     bin: &Path,
     max_seq: usize,
 ) -> anyhow::Result<DaemonEvalSession> {
+    load_daemon_eval_session_for_model(config, bin, max_seq, &config.model).await
+}
+
+pub(crate) async fn load_daemon_eval_session_for_model(
+    config: &EvalConfig,
+    bin: &Path,
+    max_seq: usize,
+    model: &str,
+) -> anyhow::Result<DaemonEvalSession> {
     let mut engine = hipfire_daemon_adapter::DaemonEngine::spawn(bin).await?;
     let loaded = engine
-        .load(&config.model, daemon_model_load_params(config, max_seq))
+        .load(model, daemon_model_load_params(config, max_seq))
         .await?;
     let worker_key_id = loaded.worker_key_id.clone();
     Ok(DaemonEvalSession {
@@ -405,18 +439,18 @@ pub(crate) fn run_daemon_shared_model_load_rows(
                 BatteryId::Smoke => daemon_smoke_skip_rows(
                     config,
                     ctx,
-                    "daemon executor requires --model to be a local filesystem path",
-                    "daemon executor requires --model to be a local filesystem path",
+                    "daemon executor requires the model to resolve to a local filesystem path",
+                    "daemon executor requires the model to resolve to a local filesystem path",
                 ),
                 BatteryId::Speed => daemon_speed_skip_rows(
                     config,
                     ctx,
-                    "daemon executor requires --model to be a local filesystem path",
+                    "daemon executor requires the model to resolve to a local filesystem path",
                 ),
                 BatteryId::Profile => daemon_profile_skip_rows(
                     config,
                     ctx,
-                    "daemon executor requires --model to be a local filesystem path",
+                    "daemon executor requires the model to resolve to a local filesystem path",
                 ),
                 _ => Vec::new(),
             };
@@ -651,27 +685,163 @@ pub(crate) fn daemon_speed_skip_rows(
     ctx: &EvalContext,
     reason: &str,
 ) -> Vec<EvalResult> {
+    daemon_speed_skip_rows_for_model(config, ctx, &config.model, reason)
+}
+
+pub(crate) fn daemon_speed_skip_rows_for_model(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    model: &str,
+    reason: &str,
+) -> Vec<EvalResult> {
     let prompt_ref = prompt("benchmarks/prompts/lru_cache_single_blank.txt");
     daemon_speed_cases()
         .iter()
         .map(|case| {
-            skip_row_with_metrics(
+            row_for_model(
                 BatteryId::Speed,
                 None,
                 case.label,
                 None,
-                reason,
-                config,
-                ctx,
-                prompt_ref.clone(),
+                EvalStatus::Skip,
+                Some(reason.to_string()),
                 BTreeMap::from([
                     ("implemented".to_string(), json!(true)),
                     ("executor".to_string(), json!("daemon")),
                     ("suite".to_string(), json!("daemon_speed_anchor")),
                 ]),
+                config,
+                ctx,
+                prompt_ref.clone(),
+                0,
+                model.to_string(),
             )
         })
         .collect()
+}
+
+pub(crate) fn daemon_speed_base_metrics(
+    worker_key_id: &str,
+    bin: &Path,
+    max_tokens: usize,
+    done: &hipfire_generate::DoneEvent,
+    text: &str,
+    evidence_dir: &Path,
+) -> BTreeMap<String, Value> {
+    let mut metrics = BTreeMap::from([
+        ("implemented".to_string(), json!(true)),
+        ("executor".to_string(), json!("daemon")),
+        ("suite".to_string(), json!("daemon_speed_anchor")),
+        ("shared_model_loads".to_string(), json!(1)),
+        ("worker_key_id".to_string(), json!(worker_key_id)),
+        ("daemon_bin".to_string(), json!(bin.display().to_string())),
+        ("max_tokens".to_string(), json!(max_tokens)),
+        ("tokens".to_string(), json!(done.tokens)),
+        ("text_bytes".to_string(), json!(text.len())),
+        (
+            "runtime_evidence_dir".to_string(),
+            json!(evidence_dir.display().to_string()),
+        ),
+    ]);
+    if let Some(value) = done.tok_s {
+        metrics.insert("tok_s".to_string(), json!(value));
+    }
+    if let Some(value) = done.prefill_tokens {
+        metrics.insert("prefill_tokens".to_string(), json!(value));
+    }
+    if let Some(value) = done.prefill_ms {
+        metrics.insert("prefill_ms".to_string(), json!(value));
+    }
+    if let Some(value) = done.prefill_tok_s {
+        metrics.insert("prefill_tok_s".to_string(), json!(value));
+    }
+    if let Some(value) = done.decode_tok_s {
+        metrics.insert("decode_tok_s".to_string(), json!(value));
+        metrics
+            .entry("gen_tok_s".to_string())
+            .or_insert(json!(value));
+    }
+    if let Some(value) = done.ttft_ms {
+        metrics.insert("ttft_ms".to_string(), json!(value));
+    }
+    metrics
+}
+
+pub(crate) fn daemon_done_has_speed_metric(done: &hipfire_generate::DoneEvent) -> bool {
+    done.tok_s
+        .is_some_and(|value| value.is_finite() && value > 0.0)
+        || done
+            .decode_tok_s
+            .is_some_and(|value| value.is_finite() && value > 0.0)
+}
+
+pub(crate) fn daemon_speed_status_reason(
+    text: &str,
+    done: &hipfire_generate::DoneEvent,
+) -> (EvalStatus, Option<String>) {
+    let finite = !text.is_empty() && !text.contains('\u{fffd}') && done.tokens > 0;
+    if !finite {
+        return (
+            EvalStatus::Fail,
+            Some(
+                "daemon speed anchor returned empty, zero-token, or replacement-character output"
+                    .to_string(),
+            ),
+        );
+    }
+    if !daemon_done_has_speed_metric(done) {
+        return (
+            EvalStatus::Fail,
+            Some("daemon speed anchor did not emit throughput metrics".to_string()),
+        );
+    }
+    (EvalStatus::Pass, None)
+}
+
+pub(crate) fn daemon_speed_failure_rows_for_model(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    bin: &Path,
+    model: &str,
+    reason: &str,
+    elapsed_ms: u128,
+) -> Vec<EvalResult> {
+    daemon_speed_cases()
+        .iter()
+        .map(|case| {
+            row_for_model(
+                BatteryId::Speed,
+                None,
+                case.label,
+                None,
+                EvalStatus::Fail,
+                Some(reason.to_string()),
+                BTreeMap::from([
+                    ("implemented".to_string(), json!(true)),
+                    ("executor".to_string(), json!("daemon")),
+                    ("suite".to_string(), json!("daemon_speed_anchor")),
+                    ("daemon_bin".to_string(), json!(bin.display().to_string())),
+                ]),
+                config,
+                ctx,
+                prompt("benchmarks/prompts/lru_cache_single_blank.txt"),
+                elapsed_ms,
+                model.to_string(),
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn resolve_eval_model_path(model: &str) -> Option<PathBuf> {
+    let models_dir = std::env::var_os("HIPFIRE_MODELS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".hipfire")
+                .join("models")
+        });
+    find_model_in(model, &models_dir, None)
 }
 
 pub(crate) fn daemon_profile_expected_runtime_evidence_kinds() -> Value {
@@ -727,8 +897,8 @@ pub(crate) fn run_daemon_smoke_rows(config: &EvalConfig, ctx: &EvalContext) -> V
         return daemon_smoke_skip_rows(
             config,
             ctx,
-            "daemon executor requires --model to be a local filesystem path",
-            "daemon executor requires --model to be a local filesystem path",
+            "daemon executor requires the model to resolve to a local filesystem path",
+            "daemon executor requires the model to resolve to a local filesystem path",
         );
     }
 
@@ -811,11 +981,11 @@ pub(crate) fn run_daemon_smoke_rows(config: &EvalConfig, ctx: &EvalContext) -> V
 }
 
 pub(crate) fn run_daemon_speed_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
-    if !Path::new(&config.model).exists() {
+    if resolve_eval_model_path(&config.model).is_none() {
         return daemon_speed_skip_rows(
             config,
             ctx,
-            "daemon executor requires --model to be a local filesystem path",
+            "daemon executor requires the model to resolve to a local filesystem path",
         );
     }
 
@@ -881,7 +1051,7 @@ pub(crate) fn run_daemon_profile_rows(config: &EvalConfig, ctx: &EvalContext) ->
         return daemon_profile_skip_rows(
             config,
             ctx,
-            "daemon executor requires --model to be a local filesystem path",
+            "daemon executor requires the model to resolve to a local filesystem path",
         );
     }
 
@@ -1229,8 +1399,86 @@ pub(crate) async fn run_daemon_speed_rows_async(
     bin: &Path,
 ) -> anyhow::Result<Vec<EvalResult>> {
     let max_seq = (config.max_tokens + 2048).max(4096);
-    let mut session = load_daemon_eval_session(config, bin, max_seq).await?;
-    daemon_speed_rows_with_session(config, ctx, bin, &mut session).await
+    let mut rows = Vec::new();
+    let mut session: Option<DaemonEvalSession> = None;
+    let mut session_loaded = false;
+    for model in evaluation_models(config) {
+        let Some(model_path) = resolve_eval_model_path(&model) else {
+            rows.extend(daemon_speed_skip_rows_for_model(
+                config,
+                ctx,
+                &model,
+                "daemon speed executor requires evaluated models to resolve to local filesystem paths",
+            ));
+            continue;
+        };
+        let model_path = model_path.display().to_string();
+        if let Some(active) = session.as_mut() {
+            if session_loaded {
+                if let Err(err) = active.engine.unload().await {
+                    rows.extend(daemon_speed_failure_rows_for_model(
+                        config,
+                        ctx,
+                        bin,
+                        &model,
+                        &format!("daemon unload failed before speed eval model {model}: {err}"),
+                        0,
+                    ));
+                    break;
+                }
+                session_loaded = false;
+            }
+            match active
+                .engine
+                .load(&model_path, daemon_model_load_params(config, max_seq))
+                .await
+            {
+                Ok(loaded) => {
+                    active.worker_key_id = loaded.worker_key_id.clone();
+                    active.loaded = loaded;
+                    active.max_seq = max_seq;
+                    session_loaded = true;
+                }
+                Err(err) => {
+                    rows.extend(daemon_speed_failure_rows_for_model(
+                        config,
+                        ctx,
+                        bin,
+                        &model,
+                        &format!("daemon load failed for speed eval model {model}: {err}"),
+                        0,
+                    ));
+                    continue;
+                }
+            }
+        } else {
+            match load_daemon_eval_session_for_model(config, bin, max_seq, &model_path).await {
+                Ok(active) => {
+                    session = Some(active);
+                    session_loaded = true;
+                }
+                Err(err) => {
+                    rows.extend(daemon_speed_failure_rows_for_model(
+                        config,
+                        ctx,
+                        bin,
+                        &model,
+                        &format!("daemon load failed for speed eval model {model}: {err}"),
+                        0,
+                    ));
+                    continue;
+                }
+            }
+        }
+        let active = session
+            .as_mut()
+            .expect("daemon speed session exists after successful model load");
+        rows.extend(
+            daemon_speed_rows_with_session_for_model(config, ctx, bin, active, &model, &model_path)
+                .await?,
+        );
+    }
+    Ok(rows)
 }
 
 pub(crate) async fn run_daemon_profile_rows_async(
@@ -1249,6 +1497,25 @@ pub(crate) async fn daemon_speed_rows_with_session(
     bin: &Path,
     session: &mut DaemonEvalSession,
 ) -> anyhow::Result<Vec<EvalResult>> {
+    daemon_speed_rows_with_session_for_model(
+        config,
+        ctx,
+        bin,
+        session,
+        &config.model,
+        &config.model,
+    )
+    .await
+}
+
+pub(crate) async fn daemon_speed_rows_with_session_for_model(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    bin: &Path,
+    session: &mut DaemonEvalSession,
+    row_model: &str,
+    loaded_model: &str,
+) -> anyhow::Result<Vec<EvalResult>> {
     let worker_key_id = session.worker_key_id.clone();
     let prompt_path = "benchmarks/prompts/lru_cache_single_blank.txt";
     let prompt_text = read_repo_prompt_text(prompt_path)?;
@@ -1260,7 +1527,7 @@ pub(crate) async fn daemon_speed_rows_with_session(
         let evidence_dir = runtime_evidence_dir(
             config,
             &format!("daemon-speed-{}", case.label),
-            &config.model,
+            loaded_model,
         );
         let request = daemon_generate_request(
             format!("eval-speed-{}", case.label),
@@ -1270,59 +1537,9 @@ pub(crate) async fn daemon_speed_rows_with_session(
             Some(&evidence_dir),
         );
         let (text, done) = session.engine.generate(request).await?;
-        let has_timing = done.prefill_tok_s.is_some() && done.decode_tok_s.is_some();
-        let finite = !text.is_empty() && !text.contains('\u{fffd}') && done.tokens > 0;
-        let status = if finite && has_timing {
-            EvalStatus::Pass
-        } else {
-            EvalStatus::Fail
-        };
-        let reason = if !finite {
-            Some(
-                "daemon speed anchor returned empty, zero-token, or replacement-character output"
-                    .to_string(),
-            )
-        } else if !has_timing {
-            Some("daemon speed anchor did not emit prefill/decode timing metrics".to_string())
-        } else {
-            None
-        };
-        let mut metrics = BTreeMap::from([
-            ("implemented".to_string(), json!(true)),
-            ("executor".to_string(), json!("daemon")),
-            ("suite".to_string(), json!("daemon_speed_anchor")),
-            ("shared_model_loads".to_string(), json!(1)),
-            ("worker_key_id".to_string(), json!(worker_key_id.clone())),
-            ("daemon_bin".to_string(), json!(bin.display().to_string())),
-            ("max_tokens".to_string(), json!(max_tokens)),
-            ("tokens".to_string(), json!(done.tokens)),
-            ("text_bytes".to_string(), json!(text.len())),
-            (
-                "runtime_evidence_dir".to_string(),
-                json!(evidence_dir.display().to_string()),
-            ),
-        ]);
-        if let Some(value) = done.tok_s {
-            metrics.insert("tok_s".to_string(), json!(value));
-        }
-        if let Some(value) = done.prefill_tokens {
-            metrics.insert("prefill_tokens".to_string(), json!(value));
-        }
-        if let Some(value) = done.prefill_ms {
-            metrics.insert("prefill_ms".to_string(), json!(value));
-        }
-        if let Some(value) = done.prefill_tok_s {
-            metrics.insert("prefill_tok_s".to_string(), json!(value));
-        }
-        if let Some(value) = done.decode_tok_s {
-            metrics.insert("decode_tok_s".to_string(), json!(value));
-            metrics
-                .entry("gen_tok_s".to_string())
-                .or_insert(json!(value));
-        }
-        if let Some(value) = done.ttft_ms {
-            metrics.insert("ttft_ms".to_string(), json!(value));
-        }
+        let (status, reason) = daemon_speed_status_reason(&text, &done);
+        let metrics =
+            daemon_speed_base_metrics(&worker_key_id, bin, max_tokens, &done, &text, &evidence_dir);
 
         rows.push(row_for_model(
             BatteryId::Speed,
@@ -1336,7 +1553,7 @@ pub(crate) async fn daemon_speed_rows_with_session(
             ctx,
             prompt(prompt_path),
             0,
-            config.model.clone(),
+            row_model.to_string(),
         ));
     }
 
@@ -1365,7 +1582,7 @@ pub(crate) async fn daemon_profile_rows_with_session(
     );
     let (text, done) = session.engine.generate(request).await?;
     let finite = !text.is_empty() && !text.contains('\u{fffd}') && done.tokens > 0;
-    let has_timing = done.prefill_tok_s.is_some() && done.decode_tok_s.is_some();
+    let has_timing = daemon_done_has_speed_metric(&done);
     let status = if finite && has_timing {
         EvalStatus::Pass
     } else {
@@ -1377,7 +1594,7 @@ pub(crate) async fn daemon_profile_rows_with_session(
                 .to_string(),
         )
     } else if !has_timing {
-        Some("daemon profile anchor did not emit prefill/decode timing metrics".to_string())
+        Some("daemon profile anchor did not emit throughput metrics".to_string())
     } else {
         None
     };
@@ -1450,7 +1667,7 @@ pub(crate) fn run_daemon_vision_rows(config: &EvalConfig, ctx: &EvalContext) -> 
         return vec![vision_skip_row(
             config,
             ctx,
-            "vision battery requires --model to be a local filesystem path",
+            "vision battery requires the model to resolve to a local filesystem path",
         )];
     }
     let Some(bin) = hipfire_daemon_adapter::find_daemon_bin() else {
@@ -1673,6 +1890,57 @@ pub(crate) async fn run_daemon_vision_rows_async(
             0,
         ),
     ])
+}
+
+#[cfg(test)]
+mod daemon_speed_tests {
+    use std::collections::HashMap;
+
+    use hipfire_generate::DoneEvent;
+
+    use super::*;
+
+    #[test]
+    fn tok_s_only_done_event_is_valid_speed_evidence() {
+        let done = DoneEvent {
+            id: "eval-speed".to_string(),
+            tokens: 64,
+            tok_s: Some(27.39),
+            prefill_tokens: None,
+            prefill_ms: Some(292.0),
+            prefill_tok_s: None,
+            decode_tok_s: None,
+            ttft_ms: None,
+            finish_reason: Some("length".to_string()),
+            response_id: None,
+            extra: HashMap::new(),
+        };
+
+        let (status, reason) = daemon_speed_status_reason("non-empty output", &done);
+        assert_eq!(status, EvalStatus::Pass);
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn daemon_speed_skip_rows_preserve_evaluated_model_label() {
+        let cfg = parse_args_from(["hipfire-eval", "candidate.hfq", "--battery", "speed"]).unwrap();
+        let ctx = EvalContext {
+            commit_sha: None,
+            git_branch: None,
+            git_describe: None,
+            git_dirty: None,
+            binary_hash: None,
+            arch: None,
+            rocm: None,
+            host_profile: collect_host_profile(None, HostProfileOverrides::default()),
+        };
+
+        let rows =
+            daemon_speed_skip_rows_for_model(&cfg, &ctx, "compare.hfq", "missing compare model");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.model == "compare.hfq"));
+        assert!(rows.iter().all(|row| row.status == EvalStatus::Skip));
+    }
 }
 
 #[cfg(test)]

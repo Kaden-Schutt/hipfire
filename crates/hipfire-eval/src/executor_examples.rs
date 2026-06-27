@@ -196,54 +196,220 @@ pub(crate) fn coherence_cases() -> &'static [CoherenceCase] {
     ]
 }
 
+#[derive(Clone)]
+struct SharedCoherenceEvalCase {
+    battery: BatteryId,
+    case_id: String,
+    prompt_path: String,
+    prompt_ref: Option<PromptRef>,
+    model: String,
+    max_seq: usize,
+    max_tokens: usize,
+    metrics: BTreeMap<String, Value>,
+    system_path: Option<&'static str>,
+    tools: Option<Value>,
+    assistant_prefix: Option<&'static str>,
+    force_jinja_chat: bool,
+    profile: Option<hipfire_coherence::DetectorProfile>,
+}
+
+impl SharedCoherenceEvalCase {
+    fn load_config(&self, max_seq: usize) -> hipfire_coherence::CoherenceRunConfig {
+        hipfire_coherence::CoherenceRunConfig {
+            model: self.model.clone(),
+            prompt: String::new(),
+            prompt_label: "__shared_load__".to_string(),
+            system: None,
+            tools: None,
+            assistant_prefix: None,
+            force_jinja_chat: self.force_jinja_chat,
+            max_tokens: 1,
+            temperature: 0.0,
+            repeat_penalty: None,
+            repeat_window: None,
+            max_seq,
+            state: None,
+            profile: hipfire_coherence::DetectorProfile::default_for_prompt("", None),
+        }
+    }
+}
+
 pub(crate) fn run_examples_coherence_rows(
     config: &EvalConfig,
     ctx: &EvalContext,
 ) -> Vec<EvalResult> {
+    run_shared_prepared_coherence_cases(config, ctx, coherence_eval_cases(config))
+}
+
+pub(crate) fn run_examples_shared_coherence_rows(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    batteries: &[BatteryId],
+) -> BTreeMap<BatteryId, Vec<EvalResult>> {
+    let mut rows_by_battery = BTreeMap::new();
+    for battery in batteries {
+        rows_by_battery.entry(*battery).or_insert_with(Vec::new);
+    }
+
+    let mut cases = Vec::new();
+    for battery in batteries {
+        match battery {
+            BatteryId::Coherence => cases.extend(coherence_eval_cases(config)),
+            BatteryId::Agentic => cases.extend(agentic_eval_cases(config)),
+            _ => {}
+        }
+    }
+
+    for row in run_shared_prepared_coherence_cases(config, ctx, cases) {
+        rows_by_battery.entry(row.battery).or_default().push(row);
+    }
+    rows_by_battery
+}
+
+fn coherence_eval_cases(config: &EvalConfig) -> Vec<SharedCoherenceEvalCase> {
     coherence_cases()
         .iter()
-        .map(|case| run_examples_coherence_case(config, ctx, *case))
+        .map(|case| {
+            let prompt_ref = if let Some(system_path) = case.system_path {
+                combined_prompt_ref(system_path, case.prompt_path)
+            } else {
+                prompt(case.prompt_path)
+            };
+            let metrics = BTreeMap::from([
+                ("suite".to_string(), json!("coherence_gate")),
+                ("prompt_kind".to_string(), json!(case.label)),
+                (
+                    "detector_profile".to_string(),
+                    json!(if case.system_path.is_some() {
+                        "agentic_toolcall_shape"
+                    } else {
+                        "default_runtime_coherence"
+                    }),
+                ),
+            ]);
+            SharedCoherenceEvalCase {
+                battery: BatteryId::Coherence,
+                case_id: case.label.to_string(),
+                prompt_path: case.prompt_path.to_string(),
+                prompt_ref,
+                model: config.model.clone(),
+                max_seq: (case.max_tokens + 2048).max(4096),
+                max_tokens: case.max_tokens,
+                metrics,
+                system_path: case.system_path,
+                tools: None,
+                assistant_prefix: None,
+                force_jinja_chat: false,
+                profile: None,
+            }
+        })
         .collect()
 }
 
-pub(crate) fn run_examples_coherence_case(
+fn run_shared_prepared_coherence_cases(
     config: &EvalConfig,
     ctx: &EvalContext,
-    case: CoherenceCase,
+    cases: Vec<SharedCoherenceEvalCase>,
+) -> Vec<EvalResult> {
+    let daemon = hipfire_daemon_adapter::find_daemon_bin();
+    let mut max_seq_by_key: BTreeMap<(String, bool), usize> = BTreeMap::new();
+    for case in &cases {
+        if daemon.is_some() && Path::new(&case.model).exists() {
+            let key = (case.model.clone(), case.force_jinja_chat);
+            let max_seq = max_seq_by_key.entry(key).or_insert(0);
+            *max_seq = (*max_seq).max(case.max_seq);
+        }
+    }
+
+    let mut sessions: BTreeMap<
+        (String, bool),
+        Result<hipfire_coherence::CoherenceDaemonSession, String>,
+    > = BTreeMap::new();
+    let mut rows = Vec::new();
+    for case in cases {
+        let Some(daemon) = daemon.as_ref() else {
+            rows.push(run_prepared_daemon_coherence_case(config, ctx, &case, None));
+            continue;
+        };
+        if !Path::new(&case.model).exists() {
+            rows.push(run_prepared_daemon_coherence_case(config, ctx, &case, None));
+            continue;
+        }
+
+        let key = (case.model.clone(), case.force_jinja_chat);
+        let max_seq = *max_seq_by_key.get(&key).unwrap_or(&case.max_seq);
+        let entry = sessions.entry(key).or_insert_with(|| {
+            hipfire_coherence::CoherenceDaemonSession::load(daemon, &case.load_config(max_seq))
+        });
+        match entry {
+            Ok(session) => rows.push(run_prepared_daemon_coherence_case(
+                config,
+                ctx,
+                &case,
+                Some(session),
+            )),
+            Err(err) => rows.push(prepared_daemon_coherence_failure_row(
+                config,
+                ctx,
+                &case,
+                &format!("shared daemon coherence session failed: {err}"),
+            )),
+        }
+    }
+    rows
+}
+
+fn run_prepared_daemon_coherence_case(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    case: &SharedCoherenceEvalCase,
+    session: Option<&mut hipfire_coherence::CoherenceDaemonSession>,
 ) -> EvalResult {
-    let prompt_ref = if let Some(system_path) = case.system_path {
-        combined_prompt_ref(system_path, case.prompt_path)
-    } else {
-        prompt(case.prompt_path)
-    };
-    let metrics = BTreeMap::from([
-        ("suite".to_string(), json!("coherence_gate")),
-        ("prompt_kind".to_string(), json!(case.label)),
-        (
-            "detector_profile".to_string(),
-            json!(if case.system_path.is_some() {
-                "agentic_toolcall_shape"
-            } else {
-                "default_runtime_coherence"
-            }),
-        ),
-    ]);
-    run_daemon_coherence_anchor(
-        BatteryId::Coherence,
-        case.label,
-        case.prompt_path,
-        prompt_ref,
+    run_daemon_coherence_anchor_inner(
+        case.battery,
+        &case.case_id,
+        &case.prompt_path,
+        case.prompt_ref.clone(),
         config,
         ctx,
-        config.model.clone(),
-        Some((case.max_tokens + 2048).max(4096)),
+        case.model.clone(),
+        Some(case.max_seq),
         Some(case.max_tokens),
-        metrics,
+        case.metrics.clone(),
         case.system_path,
+        case.tools.clone(),
+        case.assistant_prefix,
+        case.force_jinja_chat,
+        case.profile.clone(),
+        session,
+    )
+}
+
+fn prepared_daemon_coherence_failure_row(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    case: &SharedCoherenceEvalCase,
+    reason: &str,
+) -> EvalResult {
+    let mut metrics = case.metrics.clone();
+    metrics.insert("executor".to_string(), json!("daemon"));
+    metrics.insert("runtime_path".to_string(), json!("daemon_jsonl"));
+    metrics.insert("implemented".to_string(), json!(true));
+    metrics.insert("shared_coherence_session".to_string(), json!(true));
+    metrics.insert("force_jinja_chat".to_string(), json!(case.force_jinja_chat));
+    row_for_model(
+        case.battery,
         None,
+        &case.case_id,
         None,
-        false,
-        None,
+        EvalStatus::Fail,
+        Some(reason.to_string()),
+        metrics,
+        config,
+        ctx,
+        case.prompt_ref.clone(),
+        0,
+        case.model.clone(),
     )
 }
 
@@ -373,7 +539,7 @@ pub(crate) fn run_examples_calibrate_model(
         );
     }
     if !Path::new(&model).exists() {
-        return skip("collect_artifacts requires --model to be a local filesystem path");
+        return skip("collect_artifacts requires the model to resolve to a local filesystem path");
     }
     let Some(bin) = resolve_collect_artifacts_bin() else {
         return skip("collect_artifacts example binary not found; build with `cargo build --release -p hipfire-runtime --example collect_artifacts`");
@@ -580,7 +746,7 @@ pub(crate) fn run_examples_perplexity_model(
     };
 
     if !Path::new(&model).exists() {
-        return skip("perplexity requires --model to be a local filesystem path");
+        return skip("perplexity requires the model to resolve to a local filesystem path");
     }
     let Some(bin) = resolve_perplexity_bin() else {
         return skip("perplexity example binary not found; build with `cargo build --release -p hipfire-runtime --example perplexity`");
@@ -770,7 +936,8 @@ pub(crate) fn run_examples_qwen35_speed_model(
                 None,
                 EvalStatus::Skip,
                 Some(
-                    "bench_qwen35_speed requires --model to be a local filesystem path".to_string(),
+                    "bench_qwen35_speed requires the model to resolve to a local filesystem path"
+                        .to_string(),
                 ),
                 {
                     let mut m = base_metrics.clone();
@@ -1254,69 +1421,49 @@ pub(crate) fn agentic_cases() -> &'static [AgenticCase] {
 }
 
 pub(crate) fn run_examples_agentic_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
-    let mut rows = evaluation_models(config)
+    run_shared_prepared_coherence_cases(config, ctx, agentic_eval_cases(config))
+}
+
+fn agentic_eval_cases(config: &EvalConfig) -> Vec<SharedCoherenceEvalCase> {
+    let prompt_path = "benchmarks/prompts/agentic_user_read.txt";
+    let mut cases = evaluation_models(config)
         .into_iter()
         .flat_map(|model| {
-            agentic_cases()
-                .iter()
-                .map(move |case| run_examples_agentic_case(config, ctx, model.clone(), *case))
+            agentic_cases().iter().map(move |case| {
+                let mut metrics = BTreeMap::from([
+                    ("suite".to_string(), json!("agentic_tool_call")),
+                    ("system_prompt".to_string(), json!(case.system_path)),
+                    ("user_prompt".to_string(), json!(prompt_path)),
+                    ("thinking_clamped".to_string(), json!(case.thinking_clamped)),
+                    (
+                        "detector_profile".to_string(),
+                        json!("agentic_toolcall_shape"),
+                    ),
+                ]);
+                if case.thinking_clamped {
+                    metrics.insert("max_think_tokens".to_string(), json!(1));
+                }
+                let mut profile = hipfire_coherence::DetectorProfile::default_for_prompt("", None);
+                profile.agentic = true;
+                SharedCoherenceEvalCase {
+                    battery: BatteryId::Agentic,
+                    case_id: case.label.to_string(),
+                    prompt_path: prompt_path.to_string(),
+                    prompt_ref: combined_prompt_ref(case.system_path, prompt_path),
+                    model: model.clone(),
+                    max_seq: 4096,
+                    max_tokens: case.max_tokens,
+                    metrics,
+                    system_path: Some(case.system_path),
+                    tools: None,
+                    assistant_prefix: None,
+                    force_jinja_chat: false,
+                    profile: Some(profile),
+                }
+            })
         })
         .collect::<Vec<_>>();
-    rows.push(run_examples_agentic_jinja_tools_case(
-        config,
-        ctx,
-        config.model.clone(),
-    ));
-    rows
-}
 
-pub(crate) fn run_examples_agentic_case(
-    config: &EvalConfig,
-    ctx: &EvalContext,
-    model: String,
-    case: AgenticCase,
-) -> EvalResult {
-    let prompt_path = "benchmarks/prompts/agentic_user_read.txt";
-    let prompt_ref = combined_prompt_ref(case.system_path, prompt_path);
-    let mut metrics = BTreeMap::from([
-        ("suite".to_string(), json!("agentic_tool_call")),
-        ("system_prompt".to_string(), json!(case.system_path)),
-        ("user_prompt".to_string(), json!(prompt_path)),
-        ("thinking_clamped".to_string(), json!(case.thinking_clamped)),
-        (
-            "detector_profile".to_string(),
-            json!("agentic_toolcall_shape"),
-        ),
-    ]);
-    if case.thinking_clamped {
-        metrics.insert("max_think_tokens".to_string(), json!(1));
-    }
-    let mut profile = hipfire_coherence::DetectorProfile::default_for_prompt("", None);
-    profile.agentic = true;
-    run_daemon_coherence_anchor(
-        BatteryId::Agentic,
-        case.label,
-        prompt_path,
-        prompt_ref,
-        config,
-        ctx,
-        model,
-        Some(4096),
-        Some(case.max_tokens),
-        metrics,
-        Some(case.system_path),
-        None,
-        None,
-        false,
-        Some(profile),
-    )
-}
-
-pub(crate) fn run_examples_agentic_jinja_tools_case(
-    config: &EvalConfig,
-    ctx: &EvalContext,
-    model: String,
-) -> EvalResult {
     let prompt_path = "benchmarks/prompts/agentic_jinja_tools_user.txt";
     let system_path = "benchmarks/prompts/agentic_jinja_tools_system.txt";
     let tools = json!([
@@ -1343,38 +1490,35 @@ pub(crate) fn run_examples_agentic_jinja_tools_case(
             }
         }
     ]);
-    let prompt_ref = structured_tools_prompt_ref(system_path, prompt_path, &tools);
-    let metrics = BTreeMap::from([
-        ("suite".to_string(), json!("agentic_jinja_tools")),
-        ("system_prompt".to_string(), json!(system_path)),
-        ("user_prompt".to_string(), json!(prompt_path)),
-        ("tools_count".to_string(), json!(1.0)),
-        ("force_jinja_chat".to_string(), json!(true)),
-        ("assistant_prefix".to_string(), json!("closed_think")),
-        (
-            "detector_profile".to_string(),
-            json!("agentic_structured_tools"),
-        ),
-    ]);
     let mut profile = hipfire_coherence::DetectorProfile::default_for_prompt("", None);
     profile.agentic = true;
-    run_daemon_coherence_anchor(
-        BatteryId::Agentic,
-        "agentic_jinja_structured_tools",
-        prompt_path,
-        prompt_ref,
-        config,
-        ctx,
-        model,
-        Some(1024),
-        Some(192),
-        metrics,
-        Some(system_path),
-        Some(tools),
-        Some("closed_think"),
-        true,
-        Some(profile),
-    )
+    cases.push(SharedCoherenceEvalCase {
+        battery: BatteryId::Agentic,
+        case_id: "agentic_jinja_structured_tools".to_string(),
+        prompt_path: prompt_path.to_string(),
+        prompt_ref: structured_tools_prompt_ref(system_path, prompt_path, &tools),
+        model: config.model.clone(),
+        max_seq: 1024,
+        max_tokens: 192,
+        metrics: BTreeMap::from([
+            ("suite".to_string(), json!("agentic_jinja_tools")),
+            ("system_prompt".to_string(), json!(system_path)),
+            ("user_prompt".to_string(), json!(prompt_path)),
+            ("tools_count".to_string(), json!(1.0)),
+            ("force_jinja_chat".to_string(), json!(true)),
+            ("assistant_prefix".to_string(), json!("closed_think")),
+            (
+                "detector_profile".to_string(),
+                json!("agentic_structured_tools"),
+            ),
+        ]),
+        system_path: Some(system_path),
+        tools: Some(tools),
+        assistant_prefix: Some("closed_think"),
+        force_jinja_chat: true,
+        profile: Some(profile),
+    });
+    cases
 }
 
 #[derive(Clone, Copy)]
@@ -1894,7 +2038,7 @@ pub(crate) fn run_examples_pflash_case(
             None,
             EvalStatus::Skip,
             Some(
-                "pflash examples executor requires --model to be a local filesystem path"
+                "pflash examples executor requires the model to resolve to a local filesystem path"
                     .to_string(),
             ),
             base_metrics,
@@ -2105,16 +2249,59 @@ pub(crate) fn run_daemon_coherence_anchor(
     model: String,
     max_seq: Option<usize>,
     max_tokens: Option<usize>,
-    mut metrics: BTreeMap<String, Value>,
+    metrics: BTreeMap<String, Value>,
     system_path: Option<&str>,
     tools: Option<Value>,
     assistant_prefix: Option<&str>,
     force_jinja_chat: bool,
     profile: Option<hipfire_coherence::DetectorProfile>,
 ) -> EvalResult {
+    run_daemon_coherence_anchor_inner(
+        battery,
+        case_id,
+        prompt_path,
+        prompt_ref,
+        config,
+        ctx,
+        model,
+        max_seq,
+        max_tokens,
+        metrics,
+        system_path,
+        tools,
+        assistant_prefix,
+        force_jinja_chat,
+        profile,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_daemon_coherence_anchor_inner(
+    battery: BatteryId,
+    case_id: &str,
+    prompt_path: &str,
+    prompt_ref: Option<PromptRef>,
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    model: String,
+    max_seq: Option<usize>,
+    max_tokens: Option<usize>,
+    mut metrics: BTreeMap<String, Value>,
+    system_path: Option<&str>,
+    tools: Option<Value>,
+    assistant_prefix: Option<&str>,
+    force_jinja_chat: bool,
+    profile: Option<hipfire_coherence::DetectorProfile>,
+    session: Option<&mut hipfire_coherence::CoherenceDaemonSession>,
+) -> EvalResult {
+    let shared_session = session.is_some();
     metrics.insert("executor".to_string(), json!("daemon"));
     metrics.insert("runtime_path".to_string(), json!("daemon_jsonl"));
     metrics.insert("implemented".to_string(), json!(true));
+    if shared_session {
+        metrics.insert("shared_coherence_session".to_string(), json!(true));
+    }
     if !Path::new(&model).exists() {
         return row_for_model(
             battery,
@@ -2123,7 +2310,7 @@ pub(crate) fn run_daemon_coherence_anchor(
             None,
             EvalStatus::Skip,
             Some(
-                "daemon coherence executor requires --model to be a local filesystem path"
+                "daemon coherence executor requires the model to resolve to a local filesystem path"
                     .to_string(),
             ),
             metrics,
@@ -2247,7 +2434,11 @@ pub(crate) fn run_daemon_coherence_anchor(
         profile,
     };
     let started = SystemTime::now();
-    let output = match hipfire_coherence::run_coherence(&run_config) {
+    let output_result = match session {
+        Some(session) => session.run(&run_config),
+        None => hipfire_coherence::run_coherence(&run_config),
+    };
+    let output = match output_result {
         Ok(output) => output,
         Err(err) => {
             return row_for_model(
@@ -3072,7 +3263,10 @@ pub(crate) fn run_examples_humaneval_item(
             "humaneval_completion_native",
             Some(item.item_id),
             EvalStatus::Skip,
-            Some("examples executor requires --model to be a local filesystem path".to_string()),
+            Some(
+                "examples executor requires the model to resolve to a local filesystem path"
+                    .to_string(),
+            ),
             metrics,
             config,
             ctx,
@@ -3986,7 +4180,7 @@ pub(crate) fn run_direct_session_reset_recall(
             None,
             EvalStatus::Skip,
             Some(
-                "direct session executor requires --model to be a local filesystem path"
+                "direct session executor requires the model to resolve to a local filesystem path"
                     .to_string(),
             ),
             base_metrics(),

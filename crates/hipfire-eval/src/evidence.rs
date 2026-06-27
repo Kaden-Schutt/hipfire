@@ -563,7 +563,7 @@ pub(crate) fn build_comparison_artifact(
             schema: 1,
             provenance: run_provenance(ctx),
             status: EvalStatus::Skip,
-            reason: Some("no --baseline or --reference provided".to_string()),
+            reason: Some("no --compare or --reference provided".to_string()),
             baseline: None,
             reference: None,
             cases,
@@ -719,18 +719,6 @@ pub(crate) fn build_admission_artifact(
         .iter()
         .filter(|e| e.status != EvalStatus::Pass)
         .count();
-    if config.baseline.is_none() {
-        return AdmissionArtifact {
-            schema: 1,
-            provenance: run_provenance(ctx),
-            status: EvalStatus::Skip,
-            verdict: "incomplete".to_string(),
-            reason: Some("admission requires --baseline for candidate comparison".to_string()),
-            required_evidence,
-            observed_evidence,
-            findings: Vec::new(),
-        };
-    }
     if missing > 0 {
         return AdmissionArtifact {
             schema: 1,
@@ -738,6 +726,18 @@ pub(crate) fn build_admission_artifact(
             status: EvalStatus::Skip,
             verdict: "incomplete".to_string(),
             reason: Some(format!("{missing} required evidence kind(s) missing")),
+            required_evidence,
+            observed_evidence,
+            findings: Vec::new(),
+        };
+    }
+    if config.baseline.is_none() && config.reference.is_none() {
+        return AdmissionArtifact {
+            schema: 1,
+            provenance: run_provenance(ctx),
+            status: EvalStatus::Pass,
+            verdict: "measured".to_string(),
+            reason: Some("no --compare or --reference provided; comparison skipped".to_string()),
             required_evidence,
             observed_evidence,
             findings: Vec::new(),
@@ -796,6 +796,9 @@ pub(crate) fn required_evidence_row_matches(
 ) -> bool {
     if kind == "quality" {
         return has_quality_metric(row);
+    }
+    if kind == "performance" {
+        return batteries.contains(&row.battery) && has_performance_metric(&row.metrics);
     }
     batteries.contains(&row.battery)
 }

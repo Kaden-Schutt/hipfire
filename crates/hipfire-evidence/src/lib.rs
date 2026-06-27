@@ -1396,20 +1396,30 @@ pub fn admission_metric_is_quality(battery: &str, metric: &str) -> bool {
 pub fn required_admission_evidence_requirements(
     selected_batteries: impl IntoIterator<Item = impl AsRef<str>>,
 ) -> Vec<AdmissionEvidenceRequirement> {
-    let mut required = vec![
-        AdmissionEvidenceRequirement {
+    let selected = selected_batteries
+        .into_iter()
+        .map(|battery| battery.as_ref().to_string())
+        .collect::<Vec<_>>();
+    let mut required = Vec::new();
+    if selected
+        .iter()
+        .any(|battery| matches!(battery.as_str(), "quality" | "barrage"))
+    {
+        required.push(AdmissionEvidenceRequirement {
             kind: "quality",
             batteries: vec!["quality"],
-        },
-        AdmissionEvidenceRequirement {
+        });
+    }
+    if selected
+        .iter()
+        .any(|battery| matches!(battery.as_str(), "speed" | "dflash" | "pflash"))
+    {
+        required.push(AdmissionEvidenceRequirement {
             kind: "performance",
             batteries: vec!["speed", "dflash", "pflash"],
-        },
-    ];
-    if selected_batteries
-        .into_iter()
-        .any(|battery| battery.as_ref() == "barrage")
-    {
+        });
+    }
+    if selected.iter().any(|battery| battery == "barrage") {
         required.push(AdmissionEvidenceRequirement {
             kind: "barrage",
             batteries: vec!["barrage"],
@@ -2327,10 +2337,19 @@ mod tests {
             ]
         );
 
+        let speed_only = required_admission_evidence_requirements(["speed"]);
+        assert_eq!(
+            speed_only,
+            vec![AdmissionEvidenceRequirement {
+                kind: "performance",
+                batteries: vec!["speed", "dflash", "pflash"],
+            }]
+        );
+
         let with_barrage = required_admission_evidence_requirements(["quality", "barrage"]);
-        assert_eq!(with_barrage.len(), 3);
-        assert_eq!(with_barrage[2].kind, "barrage");
-        assert_eq!(with_barrage[2].batteries, vec!["barrage"]);
+        assert_eq!(with_barrage.len(), 2);
+        assert_eq!(with_barrage[1].kind, "barrage");
+        assert_eq!(with_barrage[1].batteries, vec!["barrage"]);
     }
 
     #[test]

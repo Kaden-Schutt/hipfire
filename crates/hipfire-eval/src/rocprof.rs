@@ -46,7 +46,7 @@ pub(crate) fn run_rocprof_speed_anchor(config: &EvalConfig, ctx: &EvalContext) -
             None,
             "rocprof_speed_anchor",
             None,
-            "passive rocprof collection requires --model to be a local filesystem path",
+            "passive rocprof collection requires the model to resolve to a local filesystem path",
             config,
             ctx,
             prompt_ref,

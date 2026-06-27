@@ -90,8 +90,8 @@ where
                 draft = Some(take_value(&argv, i, "--draft")?);
                 i += 2;
             }
-            "--baseline" => {
-                baseline = Some(take_value(&argv, i, "--baseline")?);
+            "--compare" | "--baseline" => {
+                baseline = Some(take_value(&argv, i, argv[i].as_str())?);
                 i += 2;
             }
             "--reference" => {
@@ -167,8 +167,8 @@ where
                 candidate_variant = Some(take_value(&argv, i, "--candidate-variant")?);
                 i += 2;
             }
-            "--baseline-variant" => {
-                baseline_variant = Some(take_value(&argv, i, "--baseline-variant")?);
+            "--compare-variant" | "--baseline-variant" => {
+                baseline_variant = Some(take_value(&argv, i, argv[i].as_str())?);
                 i += 2;
             }
             "--reference-variant" => {
@@ -180,9 +180,8 @@ where
                     Some(take_value(&argv, i, "--performance-candidate-variant")?);
                 i += 2;
             }
-            "--performance-baseline-variant" => {
-                performance_baseline_variant =
-                    Some(take_value(&argv, i, "--performance-baseline-variant")?);
+            "--performance-compare-variant" | "--performance-baseline-variant" => {
+                performance_baseline_variant = Some(take_value(&argv, i, argv[i].as_str())?);
                 i += 2;
             }
             "--performance-reference-variant" => {
@@ -258,6 +257,13 @@ where
                 fail_on_admission = true;
                 i += 1;
             }
+            other if !other.starts_with('-') && model.is_none() && models_spec.is_none() => {
+                model = Some(other.to_string());
+                i += 1;
+            }
+            other if !other.starts_with('-') => {
+                return Err(format!("unexpected positional arg: {other}\n\n{}", usage()));
+            }
             other => return Err(format!("unknown arg: {other}\n\n{}", usage())),
         }
     }
@@ -271,17 +277,17 @@ where
     if runs == 0 {
         return Err("--runs must be at least 1".to_string());
     }
-    // --model is required for a single run, but --models (sweep), --status, and
+    // A model argument is required for a single run, but --models (sweep), --status, and
     // --fetch supply or don't need it; use a placeholder that run_from_env
     // replaces per sweep iteration. The tiny_quant battery emits + quantizes its
-    // own fixtures, so it needs no --model either.
+    // own fixtures, so it needs no model argument either.
     let tiny_quant_only = batteries
         .as_ref()
         .is_some_and(|b| !b.is_empty() && b.iter().all(|x| *x == BatteryId::TinyQuant));
     let model = match model {
         Some(m) => m,
         None if models_spec.is_some() || status || fetch || tiny_quant_only => String::new(),
-        None => return Err(format!("error: --model is required\n\n{}", usage())),
+        None => return Err(format!("error: <model> is required\n\n{}", usage())),
     };
     let batteries = batteries.unwrap_or_else(|| default_batteries(tier));
     if suites.is_empty() && batteries.contains(&BatteryId::Barrage) {
@@ -343,16 +349,18 @@ where
 }
 
 pub fn usage() -> String {
-    "Usage:\n  hipfire-eval --model <model> [--tier fast|medium|long|extensive]\n\n\
+    "Usage:\n  hipfire-eval <model> [--tier fast|medium|long|extensive]\n  hipfire-eval --models <glob|csv> [--tier fast|medium|long|extensive]\n\n\
      Options:\n\
        --version                print Hipfire eval runner version/git metadata\n\
+       --model <model>          deprecated alias for positional <model>\n\
        --models <glob|csv>      sweep many SKUs from the model dir (e.g. 'qwen3.5,qwen3.6' or 'qwen3.5-9b-*'); per-model out dirs + a cross-model rollup\n\
        --dry-run                plan only: resolve models/batteries/cache/artifacts and report (no tests run, nothing fetched/generated)\n\
        --status                 print cache/dataset/hardware status and exit\n\
        --fetch                  ensure datasets are present (HF fetch), then exit\n\
        --battery <a,b>          smoke,coherence,quality,retrieval,speed,dflash,pflash,agentic,runtime,prompt_shape,structured,barrage,longctx,vision,cask,profile,perplexity,calibrate\n\
        --suite <a,b>            gpqa,lm_eval_micro,humaneval,deep_swe,swe_bench,ruler,nolima,needle_chain,niah,sequential_niah\n\
-       --baseline <model>       baseline quantized model for candidate comparison\n\
+       --compare <model>        model to compare against the candidate\n\
+       --baseline <model>       deprecated alias for --compare\n\
        --reference <model>      higher precision reference model or fixture\n\
        --out <dir>              output directory\n\
        --draft <path>           DFlash draft artifact\n\
@@ -366,11 +374,13 @@ pub fn usage() -> String {
        --performance-json <path> ingest benchmark/perf JSON for speed battery\n\
        --evidence-json <path>   ingest profiler/runtime evidence JSON; repeatable\n\
        --evidence-dir <dir>     ingest standard runtime evidence JSON files from a directory; repeatable\n\
-       --candidate-variant <v>  quality-json variant for --model (default: model stem)\n\
-       --baseline-variant <v>   quality-json variant for --baseline (default: baseline stem)\n\
+       --candidate-variant <v>  quality-json variant for candidate (default: model stem)\n\
+       --compare-variant <v>    quality-json variant for --compare (default: compare stem)\n\
+       --baseline-variant <v>   deprecated alias for --compare-variant\n\
        --reference-variant <v>  quality-json variant for --reference (default: reference stem)\n\
-       --performance-candidate-variant <v> performance-json variant for --model\n\
-       --performance-baseline-variant <v>  performance-json variant for --baseline\n\
+       --performance-candidate-variant <v> performance-json variant for candidate\n\
+       --performance-compare-variant <v>   performance-json variant for --compare\n\
+       --performance-baseline-variant <v>  deprecated alias for --performance-compare-variant\n\
        --performance-reference-variant <v> performance-json variant for --reference\n\
        --executor <auto|none|examples|daemon|direct|mock> execution backend (default: auto; daemon uses the JSONL adapter; examples/direct run Hipfire example binaries; mock is no-GPU test-only)\n\
        --fetch-datasets         opt in to Hugging Face dataset fetches\n\

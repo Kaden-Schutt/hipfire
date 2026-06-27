@@ -11,9 +11,25 @@ use crate::model::find_model;
 const EVAL_HELP: &str = r#"hipfire eval - quant admission/model evaluation harness
 
 Usage:
-  hipfire eval --model <model> [--tier fast|medium|long|extensive]
-  hipfire eval --model <model> --battery smoke,quality,speed
-  hipfire eval --model <model> --suite gpqa --fetch-datasets
+  hipfire eval <model> [--tier fast|medium|long|extensive]
+  hipfire eval <candidate> --compare <model> --battery quality,speed
+  hipfire eval <model> --battery smoke,quality,speed
+  hipfire eval <model> --suite gpqa --fetch-datasets
+
+Common options:
+  <model>                   Candidate model to evaluate
+  --model <model>           Deprecated alias for positional <model>
+  --compare <model>         Model to compare against the candidate
+  --baseline <model>        Deprecated alias for --compare
+  --reference <model>       Higher precision reference model or fixture
+  --battery <a,b>           Batteries such as smoke,quality,speed,barrage
+  --suite <a,b>             Dataset/eval suites such as gpqa,lm_eval_micro
+  --benchmark               Run repeated samples and emit aggregate rows
+  --runs <N>                Repeat each scored battery N times
+  --force                   Ignore cache hits for this run
+  --regenerate              Delete and replace matching cached rows
+  --out <dir>               Output directory for manifest/results/summary
+  --fail-on-admission       Exit non-zero unless admission verdict is promote
 
 Model arguments accept local names, shorthand, aliases, or paths. For example,
 lfm2.5:350m resolves to the preferred local quant for lfm2.5-350m.
@@ -45,7 +61,7 @@ Build runner:
 #[derive(Debug, Args)]
 #[command(disable_help_flag = true, trailing_var_arg = true)]
 pub struct EvalArgs {
-    /// Arguments forwarded to hipfire-eval
+    /// Arguments forwarded to hipfire-eval. Use positional <model>; common flags include --compare, --reference, --battery, --suite, --benchmark, --runs, --force, and --regenerate.
     #[arg(allow_hyphen_values = true)]
     pub args: Vec<OsString>,
 }
@@ -349,6 +365,14 @@ mod tests {
             OsString::from("--model"),
             OsString::from("qwen")
         ]));
+    }
+
+    #[test]
+    fn eval_help_documents_compare_and_benchmark_options() {
+        assert!(EVAL_HELP.contains("--compare <model>"));
+        assert!(EVAL_HELP.contains("--baseline <model>"));
+        assert!(EVAL_HELP.contains("--benchmark"));
+        assert!(EVAL_HELP.contains("--runs <N>"));
     }
 
     #[test]
