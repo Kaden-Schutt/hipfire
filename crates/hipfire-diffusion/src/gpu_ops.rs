@@ -2522,6 +2522,173 @@ pub(crate) fn conv2d_nchw_resident(
     Ok(output)
 }
 
+/// Phase 3 device-resident NCHW conv via im2col + WMMA GEMM. Lowers the
+/// activation to a column matrix, runs `Gpu::gemm_f16_wmma` (F16 weights, F32
+/// activations cast lane-side, F32 accumulate) once per batch — whose `[OC,
+/// OH*OW]` output lands directly as the NCHW slice — then adds bias. Falls back
+/// to the direct F32 conv on architectures without wave32 WMMA (e.g. RDNA2).
+///
+/// Precision: the GEMM inputs are F16 (the accumulator is F32), so results match
+/// the F32 reference only to ~F16 tolerance, not 1e-5. This is the standard
+/// SD/DiT inference tradeoff and is gated accordingly.
+pub(crate) fn conv2d_nchw_wmma_resident(
+    gpu: &mut rdna_compute::Gpu,
+    cache: &mut RocmWeightCache,
+    input: &rdna_compute::GpuTensor,
+    weight: &CpuTensor,
+    bias: Option<&CpuTensor>,
+    padding: usize,
+    stride: usize,
+) -> DiffusionResult<rdna_compute::GpuTensor> {
+    if stride == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "conv2d stride must be positive".to_string(),
+        ));
+    }
+    // No matrix cores (RDNA2 etc.) → keep the portable direct-conv path.
+    if !gpu.arch_caps.has_wmma_w32() {
+        return conv2d_nchw_resident(gpu, cache, input, weight, bias, padding, stride);
+    }
+    let [batch, in_channels, in_h, in_w] = resident_dims4(&input.shape, "conv2d(wmma) input")?;
+    let [out_channels, weight_in_channels, kernel_h, kernel_w] = shape4(weight)?;
+    if in_channels != weight_in_channels {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "conv2d input channels {in_channels} != weight input channels {weight_in_channels}"
+        )));
+    }
+    if let Some(bias) = bias {
+        if bias.shape.as_slice() != [out_channels] {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "conv2d bias shape {:?} != [{out_channels}]",
+                bias.shape
+            )));
+        }
+    }
+    let padded_h = in_h + 2 * padding;
+    let padded_w = in_w + 2 * padding;
+    if kernel_h > padded_h || kernel_w > padded_w {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "conv2d kernel [{kernel_h}, {kernel_w}] is larger than padded input [{padded_h}, {padded_w}]"
+        )));
+    }
+    let out_h = (padded_h - kernel_h) / stride + 1;
+    let out_w = (padded_w - kernel_w) / stride + 1;
+    let output_shape = [batch, out_channels, out_h, out_w];
+    let output_elements = checked_shape_elements("conv2d output", &output_shape)?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output = alloc_resident_f32(gpu, &output_shape)?;
+    if output_elements == 0 {
+        return Ok(output);
+    }
+    let k_dim = in_channels
+        .checked_mul(kernel_h)
+        .and_then(|v| v.checked_mul(kernel_w))
+        .ok_or_else(|| DiffusionError::InvalidMetadata("conv2d K dim overflows".to_string()))?;
+    let spatial = out_h
+        .checked_mul(out_w)
+        .ok_or_else(|| DiffusionError::InvalidMetadata("conv2d spatial overflows".to_string()))?;
+
+    // Resident F16 weight [OC, K] and resident F32 bias.
+    let weight_f16_ptr = cache.resident_f16_ptr(gpu, weight)?;
+    let bias_ptr = match bias {
+        Some(bias) => Some(cache.resident_ptr(gpu, bias)?),
+        None => None,
+    };
+
+    // im2col → [B*OH*OW, K].
+    let col_rows = batch
+        .checked_mul(spatial)
+        .ok_or_else(|| DiffusionError::InvalidMetadata("im2col row count overflows".to_string()))?;
+    let col = alloc_resident_f32(gpu, &[col_rows, k_dim])?;
+    let col_total = checked_shape_elements("im2col output", &[col_rows, k_dim])?;
+    let mut im2col_args = hip_bridge::KernargBlob::new();
+    im2col_args.push_ptr(input.buf.as_ptr());
+    im2col_args.push_ptr(col.buf.as_ptr());
+    im2col_args.push_i32(i32_kernel_dim("im2col elements", col_total)?);
+    im2col_args.push_i32(i32_kernel_dim("im2col in channels", in_channels)?);
+    im2col_args.push_i32(i32_kernel_dim("im2col in height", in_h)?);
+    im2col_args.push_i32(i32_kernel_dim("im2col in width", in_w)?);
+    im2col_args.push_i32(i32_kernel_dim("im2col out height", out_h)?);
+    im2col_args.push_i32(i32_kernel_dim("im2col out width", out_w)?);
+    im2col_args.push_i32(i32_kernel_dim("im2col kernel height", kernel_h)?);
+    im2col_args.push_i32(i32_kernel_dim("im2col kernel width", kernel_w)?);
+    im2col_args.push_i32(i32_kernel_dim("im2col padding", padding)?);
+    im2col_args.push_i32(i32_kernel_dim("im2col stride", stride)?);
+    im2col_args.push_i32(i32_kernel_dim("im2col K", k_dim)?);
+    im2col_args.pad_to(16);
+    let im2col_grid = [((col_total as u32).saturating_add(255)) / 256, 1, 1];
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        "diffusion_im2col_nchw_f32",
+        DIFFUSION_IM2COL_NCHW_HIP_SRC,
+        "diffusion_im2col_nchw_f32",
+        im2col_grid,
+        [256, 1, 1],
+        0,
+        &mut im2col_args,
+    )?;
+
+    // Per-batch GEMM: Y_b[OC, OH*OW] = W_f16[OC, K] @ X_b[OH*OW, K]^T, written
+    // directly into the NCHW output slice for batch b.
+    let weight_bytes = out_channels
+        .checked_mul(k_dim)
+        .and_then(|v| v.checked_mul(std::mem::size_of::<i16>()))
+        .ok_or_else(|| DiffusionError::InvalidMetadata("f16 weight size overflows".to_string()))?;
+    let weight_tensor = rdna_compute::GpuTensor {
+        buf: unsafe { hip_bridge::DeviceBuffer::from_raw(weight_f16_ptr, weight_bytes) },
+        shape: vec![out_channels, k_dim],
+        dtype: rdna_compute::DType::F16,
+    };
+    let f32_size = std::mem::size_of::<f32>();
+    let col_base = col.buf.as_ptr() as *mut u8;
+    let out_base = output.buf.as_ptr() as *mut u8;
+    let x_stride_bytes = spatial * k_dim * f32_size;
+    let y_stride_bytes = out_channels * spatial * f32_size;
+    let x_bytes = spatial * k_dim * f32_size;
+    let y_bytes = out_channels * spatial * f32_size;
+    for b in 0..batch {
+        let x_ptr = unsafe { col_base.add(b * x_stride_bytes) } as *mut std::ffi::c_void;
+        let y_ptr = unsafe { out_base.add(b * y_stride_bytes) } as *mut std::ffi::c_void;
+        let x_b = rdna_compute::GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(x_ptr, x_bytes) },
+            shape: vec![spatial, k_dim],
+            dtype: rdna_compute::DType::F32,
+        };
+        let y_b = rdna_compute::GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(y_ptr, y_bytes) },
+            shape: vec![out_channels, spatial],
+            dtype: rdna_compute::DType::F32,
+        };
+        gpu.gemm_f16_wmma(&weight_tensor, &x_b, &y_b, out_channels, k_dim, spatial)
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    }
+    free_resident(gpu, col)?;
+
+    // Per-output-channel bias.
+    if let Some(bias_ptr) = bias_ptr {
+        let mut bias_args = hip_bridge::KernargBlob::new();
+        bias_args.push_ptr(output.buf.as_ptr());
+        bias_args.push_ptr(bias_ptr);
+        bias_args.push_i32(i32_kernel_dim("conv bias elements", output_elements)?);
+        bias_args.push_i32(i32_kernel_dim("conv bias spatial", spatial)?);
+        bias_args.push_i32(i32_kernel_dim("conv bias out channels", out_channels)?);
+        bias_args.pad_to(16);
+        let bias_grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+        ensure_and_launch_diffusion_kernel(
+            gpu,
+            "diffusion_conv_bias_nchw_f32",
+            DIFFUSION_CONV_BIAS_NCHW_HIP_SRC,
+            "diffusion_conv_bias_nchw_f32",
+            bias_grid,
+            [256, 1, 1],
+            0,
+            &mut bias_args,
+        )?;
+    }
+    Ok(output)
+}
+
 /// Device-resident NCHW group-norm. Weight/bias are uploaded once via `cache`.
 pub(crate) fn group_norm_nchw_resident(
     gpu: &mut rdna_compute::Gpu,

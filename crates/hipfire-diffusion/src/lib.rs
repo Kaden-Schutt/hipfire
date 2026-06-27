@@ -244,6 +244,10 @@ fn cpu_reference_env_enabled(value: Option<&str>) -> bool {
 #[derive(Default)]
 struct RocmWeightCache {
     entries: std::collections::HashMap<(usize, usize), rdna_compute::GpuTensor>,
+    /// F16 copies of weights, for the Phase 3 WMMA-GEMM convolution path. Keyed
+    /// the same way as `entries`; populated lazily by converting the resident
+    /// F32 weight once.
+    f16_entries: std::collections::HashMap<(usize, usize), rdna_compute::GpuTensor>,
 }
 
 impl RocmWeightCache {
@@ -264,6 +268,50 @@ impl RocmWeightCache {
             .entries
             .get(&key)
             .expect("weight just inserted")
+            .buf
+            .as_ptr())
+    }
+
+    /// Return the raw device pointer to an F16 copy of `tensor`, converting the
+    /// (resident) F32 weight once on first use. The F16 buffer holds the same
+    /// element count as `tensor`; the caller wraps it in a non-owning
+    /// [`rdna_compute::GpuTensor`] for the GEMM.
+    fn resident_f16_ptr(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        tensor: &CpuTensor,
+    ) -> DiffusionResult<*mut std::ffi::c_void> {
+        let key = (tensor.data.as_ptr() as usize, tensor.data.len());
+        if !self.f16_entries.contains_key(&key) {
+            let f32_ptr = self.resident_ptr(gpu, tensor)?;
+            let n = tensor.data.len();
+            let f16 = gpu
+                .alloc_tensor(&[n], rdna_compute::DType::F16)
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            let mut kernargs = hip_bridge::KernargBlob::new();
+            kernargs.push_ptr(f32_ptr);
+            kernargs.push_ptr(f16.buf.as_ptr());
+            kernargs.push_i32(i32_kernel_dim("f32->f16 element count", n)?);
+            kernargs.pad_to(16);
+            let grid = [((n as u32).saturating_add(255)) / 256, 1, 1];
+            // No sync: the convert runs on the same stream as, and is enqueued
+            // before, the GEMM that reads the F16 buffer.
+            ensure_and_launch_diffusion_kernel(
+                gpu,
+                "diffusion_f32_to_f16",
+                DIFFUSION_F32_TO_F16_HIP_SRC,
+                "diffusion_f32_to_f16",
+                grid,
+                [256, 1, 1],
+                0,
+                &mut kernargs,
+            )?;
+            self.f16_entries.insert(key, f16);
+        }
+        Ok(self
+            .f16_entries
+            .get(&key)
+            .expect("f16 weight just inserted")
             .buf
             .as_ptr())
     }

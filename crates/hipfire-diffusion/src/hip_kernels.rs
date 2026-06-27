@@ -346,6 +346,98 @@ extern "C" __global__ void diffusion_conv2d_nchw_f32(
 }
 "#;
 
+// Phase 3 — im2col + WMMA-GEMM convolution.
+//
+// The naive direct conv above is one thread per output element with an
+// in_channels*kh*kw inner loop; it is the dominant cost of the VAE decode
+// (high-resolution convs). These three kernels feed the matrix-core GEMM
+// (`Gpu::gemm_f16_wmma`, the no-LDS register-tiled WMMA kernel) instead:
+//   1. im2col lowers the activation into a [B*OH*OW, IC*KH*KW] column matrix,
+//   2. the conv weight is reshaped [OC, IC*KH*KW] and cast to F16 (once, cached),
+//   3. per batch, gemm computes Y[OC, OH*OW] = W_f16 @ X^T — which is exactly the
+//      NCHW output slice for that batch, so no transpose is needed,
+//   4. a per-output-channel bias is added.
+
+pub(crate) const DIFFUSION_IM2COL_NCHW_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+// Lower NCHW input into a column matrix col[B*OH*OW, K], K = IC*KH*KW.
+// Row r = (b*OH + oy)*OW + ox; column c = (ic*KH + ky)*KW + kx.
+extern "C" __global__ void diffusion_im2col_nchw_f32(
+    const float* input,
+    float* col,
+    int total,
+    int in_channels,
+    int in_h,
+    int in_w,
+    int out_h,
+    int out_w,
+    int kernel_h,
+    int kernel_w,
+    int padding,
+    int stride,
+    int k_dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) {
+        return;
+    }
+    int c = idx % k_dim;
+    int row = idx / k_dim;
+    int ox = row % out_w;
+    int t = row / out_w;
+    int oy = t % out_h;
+    int b = t / out_h;
+    int kx = c % kernel_w;
+    int t2 = c / kernel_w;
+    int ky = t2 % kernel_h;
+    int ic = t2 / kernel_h;
+    int iy = oy * stride - padding + ky;
+    int ix = ox * stride - padding + kx;
+    float v = 0.0f;
+    if (iy >= 0 && iy < in_h && ix >= 0 && ix < in_w) {
+        v = input[((b * in_channels + ic) * in_h + iy) * in_w + ix];
+    }
+    col[idx] = v;
+}
+"#;
+
+pub(crate) const DIFFUSION_F32_TO_F16_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+
+extern "C" __global__ void diffusion_f32_to_f16(
+    const float* input,
+    _Float16* output,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = (_Float16)input[idx];
+    }
+}
+"#;
+
+pub(crate) const DIFFUSION_CONV_BIAS_NCHW_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+// Add a per-output-channel bias to an NCHW output [B, OC, OH*OW].
+extern "C" __global__ void diffusion_conv_bias_nchw_f32(
+    float* output,
+    const float* bias,
+    int total,
+    int spatial,
+    int out_channels
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) {
+        return;
+    }
+    int oc = (idx / spatial) % out_channels;
+    output[idx] += bias[oc];
+}
+"#;
+
 pub(crate) const DIFFUSION_GROUP_NORM_HIP_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 

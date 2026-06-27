@@ -5664,7 +5664,8 @@
                     )
                     .unwrap();
                 assert_eq!(hip.shape, output.shape);
-                assert!(f32_slices_close(&hip.data, &output.data, 1e-4));
+                // F16 WMMA-GEMM conv (Phase 3) → F16 tolerance.
+                assert!(f32_slices_close(&hip.data, &output.data, 5e-3));
             }
         }
 
@@ -5892,14 +5893,94 @@
                 )
                 .unwrap();
             assert_eq!(resident.shape, cpu_output.shape);
+            // F16 WMMA-GEMM conv (Phase 3) → F16 tolerance, not 1e-4.
             assert!(
-                f32_slices_close(&resident.data, &cpu_output.data, 1e-4),
+                f32_slices_close(&resident.data, &cpu_output.data, 5e-3),
                 "resident UNet {:?} != cpu reference {:?}",
                 resident.data,
                 cpu_output.data
             );
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Phase 3: the im2col + WMMA-GEMM conv must match the F32 direct-conv CPU
+    /// reference to F16 tolerance, across a 3x3 stride-1 pad-1 conv (batch 2, so
+    /// the per-batch GEMM offset logic is exercised) and a 1x1 conv (the
+    /// post_quant/proj/shortcut shape, K = in_channels).
+    #[test]
+    fn wmma_conv2d_resident_matches_cpu_reference_to_f16_tolerance() {
+        let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!("skip: ROCm GPU unavailable for WMMA conv test: {error}");
+                return;
+            }
+        };
+        if !gpu.arch_caps.has_wmma_w32() {
+            eprintln!("skip: device has no wave32 WMMA; WMMA conv falls back to direct conv");
+            return;
+        }
+
+        // Deterministic small finite tensor filler in [-1, 1].
+        let fill = |n: usize, seed: f32| -> Vec<f32> {
+            (0..n)
+                .map(|k| (((k as f32 + seed) % 13.0) - 6.0) / 6.0)
+                .collect()
+        };
+
+        // case = (batch, in_ch, ih, iw, out_ch, kh, kw, padding, stride)
+        let cases = [
+            (2usize, 4usize, 5usize, 5usize, 6usize, 3usize, 3usize, 1usize, 1usize),
+            (1, 8, 4, 4, 8, 1, 1, 0, 1),
+            (2, 3, 6, 6, 5, 3, 3, 1, 2),
+        ];
+        for (case_idx, (b, ic, ih, iw, oc, kh, kw, pad, stride)) in cases.into_iter().enumerate() {
+            let input = CpuTensor {
+                shape: vec![b, ic, ih, iw],
+                data: fill(b * ic * ih * iw, case_idx as f32 * 7.0 + 1.0),
+            };
+            let weight = CpuTensor {
+                shape: vec![oc, ic, kh, kw],
+                data: fill(oc * ic * kh * kw, case_idx as f32 * 3.0 + 2.0),
+            };
+            let bias = CpuTensor {
+                shape: vec![oc],
+                data: fill(oc, case_idx as f32 + 0.5),
+            };
+            let cpu = conv2d_nchw_with_stride(&input, &weight, Some(&bias), pad, stride).unwrap();
+
+            let mut cache = RocmWeightCache::default();
+            let input_gpu = gpu.upload_f32(&input.data, &input.shape).unwrap();
+            let out_gpu = conv2d_nchw_wmma_resident(
+                &mut gpu,
+                &mut cache,
+                &input_gpu,
+                &weight,
+                Some(&bias),
+                pad,
+                stride,
+            )
+            .unwrap();
+            let hip = download_resident(&mut gpu, &out_gpu).unwrap();
+            free_resident(&mut gpu, out_gpu).unwrap();
+            free_resident(&mut gpu, input_gpu).unwrap();
+
+            assert_eq!(hip.shape, cpu.shape, "case {case_idx} shape");
+            // F16 inputs (F32 accumulate): tolerance scales with output magnitude.
+            let max_mag = cpu
+                .data
+                .iter()
+                .fold(0.0f32, |acc, value| acc.max(value.abs()))
+                .max(1.0);
+            let tol = 1e-2 * max_mag;
+            for (i, (h, c)) in hip.data.iter().zip(cpu.data.iter()).enumerate() {
+                assert!(
+                    (h - c).abs() <= tol,
+                    "case {case_idx} elem {i}: wmma {h} vs cpu {c} (tol {tol})"
+                );
+            }
+        }
     }
 
     #[test]
@@ -9352,10 +9433,12 @@
                     .unwrap();
                 assert_eq!(runtime_context.rocm_gpu_init_count(), 1);
                 assert_eq!(hip_context_decoded.shape, decoded.shape);
+                // F16 WMMA-GEMM conv (Phase 3): match the F32 reference to F16
+                // tolerance, not 1e-5.
                 assert!(f32_slices_close(
                     &hip_context_decoded.data,
                     &decoded.data,
-                    1e-5
+                    5e-3
                 ));
                 let hip_decoded = decoder
                     .decode_latents_with_runtime_options(
@@ -9364,7 +9447,7 @@
                     )
                     .unwrap();
                 assert_eq!(hip_decoded.shape, decoded.shape);
-                assert!(f32_slices_close(&hip_decoded.data, &decoded.data, 1e-5));
+                assert!(f32_slices_close(&hip_decoded.data, &decoded.data, 5e-3));
                 let (hip_image, runtime_kind) = decode_to_rgb8_with_runtime_options(
                     &decoder,
                     &latents,
@@ -9372,7 +9455,17 @@
                 )
                 .unwrap();
                 assert_eq!(runtime_kind, DiffusionRuntimeKind::RocmHybridReference);
-                assert_eq!(hip_image, image);
+                // The F16 conv may shift a u8 pixel by ±1 vs the F32 reference.
+                assert_eq!(hip_image.batch, image.batch);
+                assert_eq!(hip_image.width, image.width);
+                assert_eq!(hip_image.height, image.height);
+                assert_eq!(hip_image.data.len(), image.data.len());
+                for (h, c) in hip_image.data.iter().zip(image.data.iter()) {
+                    assert!(
+                        (*h as i16 - *c as i16).abs() <= 2,
+                        "rgb8 pixel {h} vs {c}"
+                    );
+                }
             }
         }
         let _ = fs::remove_dir_all(&dir);
@@ -9529,8 +9622,9 @@
                 .decode_latents_with_runtime_context(&latents, &mut runtime_context)
                 .unwrap();
             assert_eq!(resident_decoded.shape, cpu_decoded.shape);
+            // F16 WMMA-GEMM conv (Phase 3) → F16 tolerance, not 1e-4.
             assert!(
-                f32_slices_close(&resident_decoded.data, &cpu_decoded.data, 1e-4),
+                f32_slices_close(&resident_decoded.data, &cpu_decoded.data, 5e-3),
                 "resident decode {:?} != cpu reference {:?}",
                 resident_decoded.data,
                 cpu_decoded.data

@@ -76,15 +76,17 @@ impl Conv2dLayer {
         )
     }
 
-    /// Phase 1b device-resident conv: consumes a resident input, returns a
-    /// resident output. Does not free `input` (the caller owns it).
+    /// Phase 1b/3 device-resident conv: consumes a resident input, returns a
+    /// resident output. Does not free `input` (the caller owns it). Uses the
+    /// Phase 3 im2col + WMMA-GEMM path (with an internal direct-conv fallback on
+    /// architectures without wave32 WMMA).
     pub(crate) fn forward_resident(
         &self,
         input: &rdna_compute::GpuTensor,
         gpu: &mut rdna_compute::Gpu,
         cache: &mut RocmWeightCache,
     ) -> DiffusionResult<rdna_compute::GpuTensor> {
-        conv2d_nchw_resident(
+        conv2d_nchw_wmma_resident(
             gpu,
             cache,
             input,
