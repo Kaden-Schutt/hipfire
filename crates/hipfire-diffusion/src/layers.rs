@@ -75,6 +75,25 @@ impl Conv2dLayer {
             runtime_context,
         )
     }
+
+    /// Phase 1b device-resident conv: consumes a resident input, returns a
+    /// resident output. Does not free `input` (the caller owns it).
+    pub(crate) fn forward_resident(
+        &self,
+        input: &rdna_compute::GpuTensor,
+        gpu: &mut rdna_compute::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+        conv2d_nchw_resident(
+            gpu,
+            cache,
+            input,
+            &self.weight,
+            self.bias.as_ref(),
+            self.padding,
+            self.stride,
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -117,6 +136,24 @@ impl GroupNormLayer {
             self.groups,
             self.eps,
             runtime_context,
+        )
+    }
+
+    /// Phase 1b device-resident group-norm. Does not free `input`.
+    pub(crate) fn forward_resident(
+        &self,
+        input: &rdna_compute::GpuTensor,
+        gpu: &mut rdna_compute::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+        group_norm_nchw_resident(
+            gpu,
+            cache,
+            input,
+            &self.weight,
+            &self.bias,
+            self.groups,
+            self.eps,
         )
     }
 }
@@ -217,6 +254,39 @@ impl ResnetBlock2D {
             input.clone()
         };
         tensor_add_with_runtime_context(&hidden, &residual, runtime_context)
+    }
+
+    /// Phase 1b device-resident resnet block. Consumes a resident `input`
+    /// (borrowed; the caller owns it) and returns a resident output, freeing
+    /// every internal intermediate back to the pool.
+    pub(crate) fn forward_resident(
+        &self,
+        input: &rdna_compute::GpuTensor,
+        gpu: &mut rdna_compute::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+        let hidden = self.norm1.forward_resident(input, gpu, cache)?;
+        let silued = silu_resident(gpu, &hidden)?;
+        free_resident(gpu, hidden)?;
+        let conv1 = self.conv1.forward_resident(&silued, gpu, cache)?;
+        free_resident(gpu, silued)?;
+        let hidden = self.norm2.forward_resident(&conv1, gpu, cache)?;
+        free_resident(gpu, conv1)?;
+        let silued = silu_resident(gpu, &hidden)?;
+        free_resident(gpu, hidden)?;
+        let conv2 = self.conv2.forward_resident(&silued, gpu, cache)?;
+        free_resident(gpu, silued)?;
+        let out = match &self.shortcut {
+            Some(shortcut) => {
+                let residual = shortcut.forward_resident(input, gpu, cache)?;
+                let sum = tensor_add_resident(gpu, &conv2, &residual)?;
+                free_resident(gpu, residual)?;
+                sum
+            }
+            None => tensor_add_resident(gpu, &conv2, input)?,
+        };
+        free_resident(gpu, conv2)?;
+        Ok(out)
     }
 }
 
@@ -685,6 +755,53 @@ impl AttentionLayer {
             self.to_out_bias.as_ref(),
             runtime_context,
         )
+    }
+
+    /// Phase 1b device-resident attention. `hidden`/`encoder` are resident 3D
+    /// `[b, seq, hidden]` tensors (borrowed; caller owns them). Self-attention
+    /// when `encoder` is `None`.
+    pub(crate) fn forward_resident(
+        &self,
+        hidden_states: &rdna_compute::GpuTensor,
+        encoder_states: Option<&rdna_compute::GpuTensor>,
+        gpu: &mut rdna_compute::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+        let context = encoder_states.unwrap_or(hidden_states);
+        let q = linear_optional_bias_resident(
+            gpu,
+            cache,
+            hidden_states,
+            &self.to_q_weight,
+            self.to_q_bias.as_ref(),
+        )?;
+        let k = linear_optional_bias_resident(
+            gpu,
+            cache,
+            context,
+            &self.to_k_weight,
+            self.to_k_bias.as_ref(),
+        )?;
+        let v = linear_optional_bias_resident(
+            gpu,
+            cache,
+            context,
+            &self.to_v_weight,
+            self.to_v_bias.as_ref(),
+        )?;
+        let attended = scaled_dot_product_attention_resident(gpu, &q, &k, &v, self.heads)?;
+        free_resident(gpu, q)?;
+        free_resident(gpu, k)?;
+        free_resident(gpu, v)?;
+        let out = linear_optional_bias_resident(
+            gpu,
+            cache,
+            &attended,
+            &self.to_out_weight,
+            self.to_out_bias.as_ref(),
+        )?;
+        free_resident(gpu, attended)?;
+        Ok(out)
     }
 }
 

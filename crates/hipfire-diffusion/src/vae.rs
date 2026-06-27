@@ -63,6 +63,34 @@ impl VaeAttentionBlock {
         )?;
         tensor_add_with_runtime_context(&hidden, &residual, runtime_context)
     }
+
+    /// Phase 1b device-resident VAE self-attention block. Borrows the resident
+    /// `input` (the caller owns it) and returns a resident output.
+    pub(crate) fn forward_resident(
+        &self,
+        input: &rdna_compute::GpuTensor,
+        gpu: &mut rdna_compute::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+        let (batch, channels, height, width) = match input.shape.as_slice() {
+            [b, c, h, w] => (*b, *c, *h, *w),
+            other => {
+                return Err(DiffusionError::InvalidMetadata(format!(
+                    "VAE attention expected a 4D NCHW tensor, got shape {other:?}"
+                )))
+            }
+        };
+        let normed = self.norm.forward_resident(input, gpu, cache)?;
+        let bsc = nchw_to_bsc_resident(gpu, &normed)?;
+        free_resident(gpu, normed)?;
+        let attended = self.attention.forward_resident(&bsc, None, gpu, cache)?;
+        free_resident(gpu, bsc)?;
+        let back = bsc_to_nchw_resident(gpu, &attended, batch, channels, height, width)?;
+        free_resident(gpu, attended)?;
+        let out = tensor_add_resident(gpu, &back, input)?;
+        free_resident(gpu, back)?;
+        Ok(out)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -540,6 +568,29 @@ impl VaeDecoderUpBlock {
         }
         Ok(hidden)
     }
+
+    /// Phase 1b device-resident up block. Takes ownership of the resident
+    /// `hidden`, freeing each intermediate as the chain advances.
+    pub(crate) fn forward_resident(
+        &self,
+        mut hidden: rdna_compute::GpuTensor,
+        gpu: &mut rdna_compute::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+        for resnet in &self.resnets {
+            let next = resnet.forward_resident(&hidden, gpu, cache)?;
+            free_resident(gpu, hidden)?;
+            hidden = next;
+        }
+        if let Some(upsampler) = &self.upsampler {
+            let upsampled = upsample_nearest2d_nchw_resident(gpu, &hidden, 2)?;
+            free_resident(gpu, hidden)?;
+            let convolved = upsampler.forward_resident(&upsampled, gpu, cache)?;
+            free_resident(gpu, upsampled)?;
+            hidden = convolved;
+        }
+        Ok(hidden)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -671,6 +722,12 @@ impl NativeVaeDecoder {
     ) -> DiffusionResult<CpuTensor> {
         let mut hidden = latents.as_nchw_tensor();
         hidden = denormalize_decode_latents(&hidden, &self.latent_norm, runtime_context)?;
+        // Phase 1b: when a GPU is present, keep the whole decode device-resident —
+        // upload once here, run the op chain on-device, download once at the end —
+        // instead of round-tripping every activation through the host.
+        if runtime_context.rocm_device_id().is_some() {
+            return self.decode_latents_resident(hidden, runtime_context);
+        }
         if let Some(post_quant_conv) = &self.post_quant_conv {
             hidden = post_quant_conv.forward_with_runtime_context(&hidden, runtime_context)?;
         }
@@ -695,6 +752,62 @@ impl NativeVaeDecoder {
         hidden = silu_with_runtime_context(&hidden, runtime_context)?;
         self.conv_out
             .forward_with_runtime_context(&hidden, runtime_context)
+    }
+
+    /// Phase 1b device-resident decode. `hidden_host` is the denormalized latent
+    /// (already on host); it is uploaded once, the full decoder runs with every
+    /// activation staying on-device, and only the final RGB-space tensor is
+    /// downloaded. Every resident intermediate is freed back to the pool.
+    fn decode_latents_resident(
+        &self,
+        hidden_host: CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
+        runtime_context.with_rocm_gpu_weighted(|gpu, cache| {
+            gpu.bind_thread()
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            let mut hidden = gpu
+                .upload_f32(&hidden_host.data, &hidden_host.shape)
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            if let Some(post_quant_conv) = &self.post_quant_conv {
+                let next = post_quant_conv.forward_resident(&hidden, gpu, cache)?;
+                free_resident(gpu, hidden)?;
+                hidden = next;
+            }
+            let next = self.conv_in.forward_resident(&hidden, gpu, cache)?;
+            free_resident(gpu, hidden)?;
+            hidden = next;
+            if let Some(resnet) = &self.mid_resnet_0 {
+                let next = resnet.forward_resident(&hidden, gpu, cache)?;
+                free_resident(gpu, hidden)?;
+                hidden = next;
+            }
+            if let Some(attention) = &self.mid_attention {
+                let next = attention.forward_resident(&hidden, gpu, cache)?;
+                free_resident(gpu, hidden)?;
+                hidden = next;
+            }
+            if let Some(resnet) = &self.mid_resnet_1 {
+                let next = resnet.forward_resident(&hidden, gpu, cache)?;
+                free_resident(gpu, hidden)?;
+                hidden = next;
+            }
+            for block in &self.up_blocks {
+                hidden = block.forward_resident(hidden, gpu, cache)?;
+            }
+            let next = self.conv_norm_out.forward_resident(&hidden, gpu, cache)?;
+            free_resident(gpu, hidden)?;
+            hidden = next;
+            let next = silu_resident(gpu, &hidden)?;
+            free_resident(gpu, hidden)?;
+            hidden = next;
+            let next = self.conv_out.forward_resident(&hidden, gpu, cache)?;
+            free_resident(gpu, hidden)?;
+            hidden = next;
+            let output = download_resident(gpu, &hidden)?;
+            free_resident(gpu, hidden)?;
+            Ok(output)
+        })
     }
 
     pub fn decode_to_rgb8(&self, latents: &LatentBatch) -> DiffusionResult<RgbImageBatch> {

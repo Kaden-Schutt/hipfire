@@ -9152,6 +9152,167 @@
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Phase 1b: exercise the full device-resident VAE decode path against the
+    /// CPU reference on a decoder that hits every resident op — including the
+    /// ones the basic decoder test above does not: the mid-block self-attention
+    /// (`nchw_to_bsc` → linear q/k/v → SDPA → out-proj → `bsc_to_nchw`), a resnet
+    /// `conv_shortcut`, and an up-block nearest-neighbour upsampler.
+    #[test]
+    fn native_vae_decoder_resident_path_matches_cpu_reference() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-diffusion-resident-vae-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let hfq_path = dir.join("resident-vae.hfq");
+        let metadata = minimal_metadata();
+
+        // 2-channel decoder so group-norm (1 group over 2 channels) and the
+        // attention projections are non-trivial.
+        let conv33 = center_identity_conv(2); // [2,2,3,3] identity
+        let conv11 = vec![1.0, 0.0, 0.0, 1.0]; // [2,2,1,1] identity
+        // conv_out maps 2 -> 3 channels; each output channel reads input
+        // channel (o % 2) center tap. [3,2,3,3].
+        let mut conv_out = vec![0.0f32; 3 * 2 * 3 * 3];
+        for o in 0..3usize {
+            let i = o % 2;
+            conv_out[(((o * 2 + i) * 3 + 1) * 3) + 1] = 1.0;
+        }
+        // Distinct, finite attention projections (not identity) so q/k/v/out are
+        // all genuinely exercised; correctness only needs CPU and GPU to agree.
+        let proj_q = vec![0.5, 0.1, -0.2, 0.7];
+        let proj_k = vec![0.3, -0.4, 0.6, 0.2];
+        let proj_v = vec![0.8, 0.05, 0.15, -0.3];
+        let proj_out = vec![0.4, 0.2, -0.1, 0.9];
+
+        let mid_r0 = "vae/tensors/decoder.mid_block.resnets.0";
+        let mid_attn = "vae/tensors/decoder.mid_block.attentions.0";
+        let mid_r1 = "vae/tensors/decoder.mid_block.resnets.1";
+        let up_r0 = "vae/tensors/decoder.up_blocks.0.resnets.0";
+
+        let tensors = vec![
+            f32_mem_tensor("vae/tensors/post_quant_conv.weight", &[2, 2, 1, 1], &conv11),
+            f32_mem_tensor("vae/tensors/post_quant_conv.bias", &[2], &[0.0, 0.0]),
+            f32_mem_tensor("vae/tensors/decoder.conv_in.weight", &[2, 2, 3, 3], &conv33),
+            f32_mem_tensor("vae/tensors/decoder.conv_in.bias", &[2], &[0.0, 0.0]),
+            // mid resnet 0 — WITH a conv_shortcut to exercise the shortcut path.
+            f32_mem_tensor(&format!("{mid_r0}.norm1.weight"), &[2], &[1.0, 1.0]),
+            f32_mem_tensor(&format!("{mid_r0}.norm1.bias"), &[2], &[0.0, 0.0]),
+            f32_mem_tensor(&format!("{mid_r0}.conv1.weight"), &[2, 2, 3, 3], &conv33),
+            f32_mem_tensor(&format!("{mid_r0}.conv1.bias"), &[2], &[0.0, 0.0]),
+            f32_mem_tensor(&format!("{mid_r0}.norm2.weight"), &[2], &[1.0, 1.0]),
+            f32_mem_tensor(&format!("{mid_r0}.norm2.bias"), &[2], &[0.0, 0.0]),
+            f32_mem_tensor(&format!("{mid_r0}.conv2.weight"), &[2, 2, 3, 3], &conv33),
+            f32_mem_tensor(&format!("{mid_r0}.conv2.bias"), &[2], &[0.0, 0.0]),
+            f32_mem_tensor(
+                &format!("{mid_r0}.conv_shortcut.weight"),
+                &[2, 2, 1, 1],
+                &conv11,
+            ),
+            f32_mem_tensor(&format!("{mid_r0}.conv_shortcut.bias"), &[2], &[0.0, 0.0]),
+            // mid attention.
+            f32_mem_tensor(&format!("{mid_attn}.group_norm.weight"), &[2], &[1.0, 1.0]),
+            f32_mem_tensor(&format!("{mid_attn}.group_norm.bias"), &[2], &[0.0, 0.0]),
+            f32_mem_tensor(&format!("{mid_attn}.to_q.weight"), &[2, 2], &proj_q),
+            f32_mem_tensor(&format!("{mid_attn}.to_k.weight"), &[2, 2], &proj_k),
+            f32_mem_tensor(&format!("{mid_attn}.to_v.weight"), &[2, 2], &proj_v),
+            f32_mem_tensor(&format!("{mid_attn}.to_out.0.weight"), &[2, 2], &proj_out),
+            f32_mem_tensor(&format!("{mid_attn}.to_out.0.bias"), &[2], &[0.0, 0.0]),
+            // mid resnet 1 — no shortcut.
+            f32_mem_tensor(&format!("{mid_r1}.norm1.weight"), &[2], &[1.0, 1.0]),
+            f32_mem_tensor(&format!("{mid_r1}.norm1.bias"), &[2], &[0.0, 0.0]),
+            f32_mem_tensor(&format!("{mid_r1}.conv1.weight"), &[2, 2, 3, 3], &conv33),
+            f32_mem_tensor(&format!("{mid_r1}.conv1.bias"), &[2], &[0.0, 0.0]),
+            f32_mem_tensor(&format!("{mid_r1}.norm2.weight"), &[2], &[1.0, 1.0]),
+            f32_mem_tensor(&format!("{mid_r1}.norm2.bias"), &[2], &[0.0, 0.0]),
+            f32_mem_tensor(&format!("{mid_r1}.conv2.weight"), &[2, 2, 3, 3], &conv33),
+            f32_mem_tensor(&format!("{mid_r1}.conv2.bias"), &[2], &[0.0, 0.0]),
+            // up block 0 — one resnet plus an upsampler conv.
+            f32_mem_tensor(&format!("{up_r0}.norm1.weight"), &[2], &[1.0, 1.0]),
+            f32_mem_tensor(&format!("{up_r0}.norm1.bias"), &[2], &[0.0, 0.0]),
+            f32_mem_tensor(&format!("{up_r0}.conv1.weight"), &[2, 2, 3, 3], &conv33),
+            f32_mem_tensor(&format!("{up_r0}.conv1.bias"), &[2], &[0.0, 0.0]),
+            f32_mem_tensor(&format!("{up_r0}.norm2.weight"), &[2], &[1.0, 1.0]),
+            f32_mem_tensor(&format!("{up_r0}.norm2.bias"), &[2], &[0.0, 0.0]),
+            f32_mem_tensor(&format!("{up_r0}.conv2.weight"), &[2, 2, 3, 3], &conv33),
+            f32_mem_tensor(&format!("{up_r0}.conv2.bias"), &[2], &[0.0, 0.0]),
+            f32_mem_tensor(
+                "vae/tensors/decoder.up_blocks.0.upsamplers.0.conv.weight",
+                &[2, 2, 3, 3],
+                &conv33,
+            ),
+            f32_mem_tensor(
+                "vae/tensors/decoder.up_blocks.0.upsamplers.0.conv.bias",
+                &[2],
+                &[0.0, 0.0],
+            ),
+            f32_mem_tensor("vae/tensors/decoder.conv_norm_out.weight", &[2], &[1.0, 1.0]),
+            f32_mem_tensor("vae/tensors/decoder.conv_norm_out.bias", &[2], &[0.0, 0.0]),
+            f32_mem_tensor("vae/tensors/decoder.conv_out.weight", &[3, 2, 3, 3], &conv_out),
+            f32_mem_tensor("vae/tensors/decoder.conv_out.bias", &[3], &[0.0, 0.0, 0.0]),
+        ];
+        write_hfqm_package_mem(
+            &hfq_path,
+            HFQ_ARCH_DIFFUSION,
+            &serde_json::to_string(&metadata).unwrap(),
+            &tensors,
+        )
+        .unwrap();
+        let hfq = HfqFile::open_index_only(&hfq_path).unwrap();
+        let config = VaeConfig {
+            class_name: "AutoencoderKL".into(),
+            latent_channels: Some(2),
+            z_dim: None,
+            scaling_factor: Some(1.0),
+            shift_factor: None,
+            latents_mean: Vec::new(),
+            latents_std: Vec::new(),
+            block_out_channels: vec![2],
+            down_block_types: Vec::new(),
+            up_block_types: vec!["UpDecoderBlock2D".into()],
+            norm_num_groups: Some(1),
+            norm_eps: Some(1e-6),
+        };
+        let decoder = NativeVaeDecoder::from_hfq(&hfq, &config).unwrap();
+        // Confirm the fixture actually built the optional blocks we mean to test.
+        assert!(decoder.mid_attention.is_some(), "mid attention not loaded");
+        assert!(decoder.mid_resnet_0.is_some(), "mid resnet 0 not loaded");
+        assert!(
+            decoder.up_blocks[0].upsampler.is_some(),
+            "up-block upsampler not loaded"
+        );
+
+        let latents = LatentBatch {
+            batch: 1,
+            channels: 2,
+            height: 2,
+            width: 2,
+            data: vec![0.0, 0.5, -0.5, 1.0, 0.25, -0.75, 0.9, -0.1],
+        };
+        let cpu_decoded = decoder.decode_latents(&latents).unwrap();
+        assert!(cpu_decoded.data.iter().all(|value| value.is_finite()));
+
+        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+            eprintln!("skip: ROCm GPU unavailable for resident VAE decode test: {error}");
+        } else {
+            let mut runtime_context = DiffusionGenerationRuntimeContext::new(
+                DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
+            );
+            let resident_decoded = decoder
+                .decode_latents_with_runtime_context(&latents, &mut runtime_context)
+                .unwrap();
+            assert_eq!(resident_decoded.shape, cpu_decoded.shape);
+            assert!(
+                f32_slices_close(&resident_decoded.data, &cpu_decoded.data, 1e-4),
+                "resident decode {:?} != cpu reference {:?}",
+                resident_decoded.data,
+                cpu_decoded.data
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn native_vae_encoder_encodes_synthetic_image_to_latents() {
         let dir = std::env::temp_dir().join(format!(
