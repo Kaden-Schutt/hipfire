@@ -3037,3 +3037,93 @@ pub(crate) fn concat_channels_nchw_resident(
     )?;
     Ok(output)
 }
+
+/// Device-resident QuickGELU (`x * sigmoid(1.702 * x)`).
+pub(crate) fn quick_gelu_resident(
+    gpu: &mut rdna_compute::Gpu,
+    input: &rdna_compute::GpuTensor,
+) -> DiffusionResult<rdna_compute::GpuTensor> {
+    let elements = checked_shape_elements("QuickGELU input", &input.shape)?;
+    let n = i32_kernel_dim("QuickGELU elements", elements)?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output = alloc_resident_f32(gpu, &input.shape)?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(input.buf.as_ptr());
+    kernargs.push_ptr(output.buf.as_ptr());
+    kernargs.push_i32(n);
+    kernargs.pad_to(16);
+    let grid = [((elements as u32).saturating_add(255)) / 256, 1, 1];
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        "diffusion_quick_gelu_f32",
+        DIFFUSION_QUICK_GELU_HIP_SRC,
+        "diffusion_quick_gelu_f32",
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
+    Ok(output)
+}
+
+/// Device-resident CLIP causal self-attention over 2D `[seq, hidden]` q/k/v.
+pub(crate) fn clip_causal_self_attention_resident(
+    gpu: &mut rdna_compute::Gpu,
+    q: &rdna_compute::GpuTensor,
+    k: &rdna_compute::GpuTensor,
+    v: &rdna_compute::GpuTensor,
+    n_heads: usize,
+) -> DiffusionResult<rdna_compute::GpuTensor> {
+    let (seq, hidden) = match q.shape.as_slice() {
+        [s, h] => (*s, *h),
+        other => {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "CLIP causal attention expected a 2D tensor, got shape {other:?}"
+            )))
+        }
+    };
+    if k.shape.as_slice() != [seq, hidden] || v.shape.as_slice() != [seq, hidden] {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "CLIP causal attention q/k/v shapes {:?}/{:?}/{:?} are incompatible",
+            q.shape, k.shape, v.shape
+        )));
+    }
+    if n_heads == 0 || hidden % n_heads != 0 {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "CLIP hidden size {hidden} is not divisible by {n_heads} heads"
+        )));
+    }
+    let head_dim = hidden / n_heads;
+    let output_shape = [seq, hidden];
+    let output_elements = checked_shape_elements("CLIP causal attention output", &output_shape)?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output = alloc_resident_f32(gpu, &output_shape)?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(q.buf.as_ptr());
+    kernargs.push_ptr(k.buf.as_ptr());
+    kernargs.push_ptr(v.buf.as_ptr());
+    kernargs.push_ptr(output.buf.as_ptr());
+    kernargs.push_i32(i32_kernel_dim(
+        "CLIP causal attention output elements",
+        output_elements,
+    )?);
+    kernargs.push_i32(i32_kernel_dim("CLIP causal attention sequence", seq)?);
+    kernargs.push_i32(i32_kernel_dim("CLIP causal attention hidden size", hidden)?);
+    kernargs.push_i32(i32_kernel_dim("CLIP causal attention heads", n_heads)?);
+    kernargs.push_i32(i32_kernel_dim("CLIP causal attention head dim", head_dim)?);
+    kernargs.pad_to(16);
+    let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        "diffusion_clip_causal_attention_f32",
+        DIFFUSION_CLIP_CAUSAL_ATTENTION_HIP_SRC,
+        "diffusion_clip_causal_attention_f32",
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
+    Ok(output)
+}

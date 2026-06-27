@@ -5668,6 +5668,12 @@ impl ClipTextEncoder {
                 self.max_length
             )));
         }
+        // Phase 1b: when a GPU is present, keep the whole transformer stack
+        // device-resident — upload the embedded tokens once, run the 12 encoder
+        // layers + final layer-norm on-device, download once.
+        if runtime_context.rocm_device_id().is_some() {
+            return self.encode_resident(tokens, runtime_context);
+        }
         let mut x = clip_token_position_embeddings_with_runtime_context(
             &self.token_embedding,
             &self.position_embedding,
@@ -5692,6 +5698,54 @@ impl ClipTextEncoder {
             1e-5,
             runtime_context,
         )
+    }
+
+    /// Phase 1b device-resident CLIP encode. The token+position embedding gather
+    /// is a cheap host op (and avoids re-uploading the ~vocab×hidden embedding
+    /// table to the device every call); its result uploads once, the encoder
+    /// layers + final layer-norm run device-resident, and only the final
+    /// hidden states download.
+    fn encode_resident(
+        &self,
+        tokens: &[u32],
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
+        let x_host = clip_token_position_embeddings(
+            &self.token_embedding,
+            &self.position_embedding,
+            tokens,
+        )?;
+        if x_host.shape.as_slice() != [tokens.len(), self.hidden_size] {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "CLIP embedding output shape {:?} does not match [{}, {}]",
+                x_host.shape,
+                tokens.len(),
+                self.hidden_size
+            )));
+        }
+        let n_heads = self.n_heads;
+        runtime_context.with_rocm_gpu_weighted(|gpu, cache| {
+            gpu.bind_thread()
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            let mut x = gpu
+                .upload_f32(&x_host.data, &x_host.shape)
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            for layer in &self.layers {
+                x = layer.forward_resident(x, n_heads, gpu, cache)?;
+            }
+            let normed = layer_norm_resident(
+                gpu,
+                cache,
+                &x,
+                &self.final_layer_norm_weight,
+                &self.final_layer_norm_bias,
+                1e-5,
+            )?;
+            free_resident(gpu, x)?;
+            let output = download_resident(gpu, &normed)?;
+            free_resident(gpu, normed)?;
+            Ok(output)
+        })
     }
 
     fn pooled_text_embedding_with_runtime_context(
@@ -5784,6 +5838,83 @@ impl ClipEncoderLayer {
             &self.out_proj_bias,
             runtime_context,
         )
+    }
+
+    /// Phase 1b device-resident CLIP encoder layer (LN → causal self-attn →
+    /// residual → LN → fc1 → QuickGELU → fc2 → residual). Takes ownership of the
+    /// resident `x` and frees it once the residual no longer needs it.
+    fn forward_resident(
+        &self,
+        x: rdna_compute::GpuTensor,
+        n_heads: usize,
+        gpu: &mut rdna_compute::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+        let norm1 = layer_norm_resident(
+            gpu,
+            cache,
+            &x,
+            &self.layer_norm1_weight,
+            &self.layer_norm1_bias,
+            1e-5,
+        )?;
+        let attn = self.self_attention_resident(&norm1, n_heads, gpu, cache)?;
+        free_resident(gpu, norm1)?;
+        let residual1 = tensor_add_resident(gpu, &x, &attn)?;
+        free_resident(gpu, x)?;
+        free_resident(gpu, attn)?;
+        let norm2 = layer_norm_resident(
+            gpu,
+            cache,
+            &residual1,
+            &self.layer_norm2_weight,
+            &self.layer_norm2_bias,
+            1e-5,
+        )?;
+        let hidden =
+            linear_optional_bias_resident(gpu, cache, &norm2, &self.fc1_weight, Some(&self.fc1_bias))?;
+        free_resident(gpu, norm2)?;
+        let activated = quick_gelu_resident(gpu, &hidden)?;
+        free_resident(gpu, hidden)?;
+        let mlp = linear_optional_bias_resident(
+            gpu,
+            cache,
+            &activated,
+            &self.fc2_weight,
+            Some(&self.fc2_bias),
+        )?;
+        free_resident(gpu, activated)?;
+        let out = tensor_add_resident(gpu, &residual1, &mlp)?;
+        free_resident(gpu, residual1)?;
+        free_resident(gpu, mlp)?;
+        Ok(out)
+    }
+
+    /// Phase 1b device-resident CLIP self-attention (q/k/v projections → causal
+    /// attention → out projection). `x` is resident (borrowed; caller owns it).
+    fn self_attention_resident(
+        &self,
+        x: &rdna_compute::GpuTensor,
+        n_heads: usize,
+        gpu: &mut rdna_compute::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+        let q = linear_optional_bias_resident(gpu, cache, x, &self.q_proj_weight, Some(&self.q_proj_bias))?;
+        let k = linear_optional_bias_resident(gpu, cache, x, &self.k_proj_weight, Some(&self.k_proj_bias))?;
+        let v = linear_optional_bias_resident(gpu, cache, x, &self.v_proj_weight, Some(&self.v_proj_bias))?;
+        let context = clip_causal_self_attention_resident(gpu, &q, &k, &v, n_heads)?;
+        free_resident(gpu, q)?;
+        free_resident(gpu, k)?;
+        free_resident(gpu, v)?;
+        let out = linear_optional_bias_resident(
+            gpu,
+            cache,
+            &context,
+            &self.out_proj_weight,
+            Some(&self.out_proj_bias),
+        )?;
+        free_resident(gpu, context)?;
+        Ok(out)
     }
 }
 

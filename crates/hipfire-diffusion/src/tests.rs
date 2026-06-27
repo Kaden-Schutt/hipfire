@@ -10143,6 +10143,98 @@
         ));
     }
 
+    /// Phase 1b: validate the device-resident CLIP encode against the CPU
+    /// reference with *non-trivial* weights, so the resident causal self-attention
+    /// and QuickGELU are exercised numerically (the `zero_clip_layer` routing
+    /// tests above act as identity layers and don't reach those paths).
+    #[test]
+    fn hip_clip_text_encoder_resident_matches_cpu_reference_with_nonzero_weights() {
+        const HIDDEN: usize = 12;
+        const HEADS: usize = 3;
+        // Deterministic small finite [r, c] matrix.
+        let mat = |r: usize, c: usize, seed: f32| -> CpuTensor {
+            CpuTensor {
+                shape: vec![r, c],
+                data: (0..r * c)
+                    .map(|k| 0.05 * (((k as f32 + seed) % 7.0) - 3.0))
+                    .collect(),
+            }
+        };
+        let vecf = |n: usize, seed: f32| -> CpuTensor {
+            CpuTensor {
+                shape: vec![n],
+                data: (0..n).map(|k| 0.02 * ((k as f32 + seed) % 5.0 - 2.0)).collect(),
+            }
+        };
+        let ones = CpuTensor {
+            shape: vec![HIDDEN],
+            data: vec![1.0; HIDDEN],
+        };
+        let zeros = CpuTensor {
+            shape: vec![HIDDEN],
+            data: vec![0.0; HIDDEN],
+        };
+        let layer = |seed: f32| ClipEncoderLayer {
+            q_proj_weight: mat(HIDDEN, HIDDEN, seed),
+            q_proj_bias: vecf(HIDDEN, seed + 1.0),
+            k_proj_weight: mat(HIDDEN, HIDDEN, seed + 2.0),
+            k_proj_bias: vecf(HIDDEN, seed + 3.0),
+            v_proj_weight: mat(HIDDEN, HIDDEN, seed + 4.0),
+            v_proj_bias: vecf(HIDDEN, seed + 5.0),
+            out_proj_weight: mat(HIDDEN, HIDDEN, seed + 6.0),
+            out_proj_bias: vecf(HIDDEN, seed + 7.0),
+            layer_norm1_weight: ones.clone(),
+            layer_norm1_bias: zeros.clone(),
+            fc1_weight: mat(HIDDEN, HIDDEN, seed + 8.0),
+            fc1_bias: vecf(HIDDEN, seed + 9.0),
+            fc2_weight: mat(HIDDEN, HIDDEN, seed + 10.0),
+            fc2_bias: vecf(HIDDEN, seed + 11.0),
+            layer_norm2_weight: ones.clone(),
+            layer_norm2_bias: zeros.clone(),
+        };
+        let encoder = ClipTextEncoder {
+            token_embedding: CpuTensor {
+                shape: vec![4, HIDDEN],
+                data: (0..4 * HIDDEN).map(|idx| (idx as f32 % 9.0 - 4.0) * 0.1).collect(),
+            },
+            position_embedding: CpuTensor {
+                shape: vec![3, HIDDEN],
+                data: (0..3 * HIDDEN).map(|idx| (idx as f32 % 5.0 - 2.0) * 0.05).collect(),
+            },
+            layers: vec![layer(0.0), layer(13.0)],
+            final_layer_norm_weight: ones.clone(),
+            final_layer_norm_bias: zeros.clone(),
+            text_projection: None,
+            hidden_size: HIDDEN,
+            max_length: 3,
+            n_heads: HEADS,
+        };
+        let tokens = [2u32, 0, 3];
+        let cpu = encoder.encode_tokens(&tokens).unwrap();
+        assert!(cpu.data.iter().all(|value| value.is_finite()));
+        // The layers are non-identity: the encoded output must differ from a bare
+        // embedding + final-norm, confirming attention/MLP actually contributed.
+        assert!(cpu.data.iter().any(|value| value.abs() > 0.01));
+
+        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+            eprintln!("skip: ROCm GPU unavailable for resident CLIP encode test: {error}");
+        } else {
+            let resident = encoder
+                .encode_tokens_with_runtime_options(
+                    &tokens,
+                    DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
+                )
+                .unwrap();
+            assert_eq!(resident.shape, cpu.shape);
+            assert!(
+                f32_slices_close(&resident.data, &cpu.data, 1e-4),
+                "resident CLIP encode {:?} != cpu reference {:?}",
+                resident.data,
+                cpu.data
+            );
+        }
+    }
+
     #[test]
     fn hip_clip_token_position_embeddings_match_cpu_reference() {
         let token_embedding = CpuTensor {
