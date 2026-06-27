@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod chat;
+pub mod detect;
 pub mod diffusion;
 pub mod forward;
 pub mod gen_config_schema;

@@ -1,0 +1,197 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! `hipfire detect` — run the observational coherence detectors over a captured
+//! token stream and emit a JSON verdict.
+//!
+//! This is the CLI front-end for the `hipfire-detect` `DetectorBank`. It exists
+//! so shell gates stop re-implementing the Path-A token-attractor detector as
+//! copy-pasted Python heredocs (the old `DETECT_PY` in
+//! `coherence-gate-dflash.sh` / `path-c-smoke.sh`). The detector logic — and the
+//! `self_check` anti-rot harness that guards it — now lives in one place: Rust.
+//!
+//! Input: the demo/daemon stdout on stdin. Token IDs are read from the
+//! `DFlash tokens: [..]` / `AR tokens: [..]` line the runtime prints. Output: a
+//! single JSON line carrying `ok` / `soft_warn` (the keys the gates already
+//! parse) plus a per-detector breakdown.
+//!
+//! By default only the first-128-window attractor runs, matching the old
+//! `DETECT_PY` semantics exactly. `--path-a` opts into the fuller token-id
+//! attractor family (first-128 + last-128 + long-state collapse) that the Rust
+//! port adds over the shell original.
+
+use clap::Args;
+use hipfire_detect::{
+    attractor::{AttractorFirst128, AttractorLast128, LongStateCollapse},
+    DetectorBank, Event, Severity, Verdict,
+};
+use regex::Regex;
+use serde_json::{json, Value};
+use std::io::Read;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Source {
+    /// Prefer the `DFlash tokens:` line, fall back to `AR tokens:`.
+    Auto,
+    /// Read only the `DFlash tokens:` line.
+    Dflash,
+    /// Read only the `AR tokens:` line.
+    Ar,
+}
+
+#[derive(Debug, Args)]
+pub struct DetectArgs {
+    /// Which `tokens: [..]` line to read when the stream contains both.
+    #[arg(long, value_enum, default_value_t = Source::Auto)]
+    source: Source,
+
+    /// Run the full Path-A token-attractor family (first-128 + last-128 +
+    /// long-state collapse) instead of just the first-128 window.
+    #[arg(long)]
+    path_a: bool,
+
+    /// Exit non-zero when a hard fail is detected. Off by default so the
+    /// command is a drop-in for the always-exit-0 Python it replaces.
+    #[arg(long)]
+    exit_code: bool,
+}
+
+pub fn run(args: DetectArgs) -> anyhow::Result<()> {
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input)?;
+
+    let toks = match parse_token_line(&input, args.source) {
+        None => {
+            emit(&json!({ "ok": false, "soft_warn": false, "reason": "no_tokens_line" }));
+            return finish(false, args.exit_code);
+        }
+        Some(t) if t.is_empty() => {
+            emit(&json!({ "ok": false, "soft_warn": false, "reason": "zero_tokens" }));
+            return finish(false, args.exit_code);
+        }
+        Some(t) => t,
+    };
+
+    let mut bank = DetectorBank::new();
+    bank.add(Box::new(AttractorFirst128::new()));
+    if args.path_a {
+        bank.add(Box::new(AttractorLast128::new()));
+        bank.add(Box::new(LongStateCollapse::new()));
+    }
+
+    // The attractor detectors consume `Event::Committed` (token ids) and do
+    // their own EOT trim + short-window suppression — feed the raw stream.
+    for (pos, tok_id) in toks.iter().enumerate() {
+        bank.observe(&Event::Committed {
+            tok_id: *tok_id,
+            pos,
+            t_ms: pos as u64,
+        });
+    }
+    bank.observe(&Event::Done {
+        total_tokens: toks.len(),
+        total_visible_bytes: 0,
+        wall_ms: 0,
+        ttft_ms: 0,
+    });
+
+    let mut hard_fails = 0usize;
+    let mut soft_warns = 0usize;
+    let detectors: Vec<Value> = bank
+        .finalize()
+        .into_iter()
+        .map(|(name, verdict)| {
+            let (status, detail) = match &verdict {
+                Verdict::Ok => ("pass", None),
+                Verdict::Skip { reason } => ("skip", Some(reason.clone())),
+                Verdict::Fired {
+                    severity: Severity::Warn,
+                    detail,
+                } => {
+                    soft_warns += 1;
+                    ("warn", Some(detail.clone()))
+                }
+                Verdict::Fired {
+                    severity: Severity::Fail,
+                    detail,
+                } => {
+                    hard_fails += 1;
+                    ("fail", Some(detail.clone()))
+                }
+            };
+            json!({ "detector": name, "status": status, "detail": detail })
+        })
+        .collect();
+
+    let ok = hard_fails == 0;
+    // soft_warn mirrors the old DETECT_PY: a soft signal only when not already
+    // a hard fail.
+    let soft_warn = ok && soft_warns > 0;
+    emit(&json!({
+        "ok": ok,
+        "soft_warn": soft_warn,
+        "hard_fails": hard_fails,
+        "soft_warns": soft_warns,
+        "total": toks.len(),
+        "detectors": detectors,
+    }));
+    finish(ok, args.exit_code)
+}
+
+fn finish(ok: bool, exit_code: bool) -> anyhow::Result<()> {
+    if exit_code && !ok {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn emit(v: &Value) {
+    println!("{}", serde_json::to_string(v).expect("serialize verdict"));
+}
+
+/// Extract the token-id list from a `DFlash tokens: [..]` / `AR tokens: [..]`
+/// line. Mirrors the old `DETECT_PY` regex + `src = m or ar_m` preference.
+fn parse_token_line(input: &str, source: Source) -> Option<Vec<u32>> {
+    let dflash = Regex::new(r"DFlash tokens: \[([^\]]+)\]").expect("static regex");
+    let ar = Regex::new(r"AR tokens: \[([^\]]+)\]").expect("static regex");
+    let caps = match source {
+        Source::Dflash => dflash.captures(input),
+        Source::Ar => ar.captures(input),
+        Source::Auto => dflash.captures(input).or_else(|| ar.captures(input)),
+    }?;
+    let list = caps.get(1)?.as_str();
+    Some(
+        list.split(',')
+            .filter_map(|s| s.trim().parse::<u32>().ok())
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_dflash_line() {
+        let s = "noise\nDFlash tokens: [1, 2, 3, 4]\nmore";
+        assert_eq!(parse_token_line(s, Source::Auto), Some(vec![1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn auto_prefers_dflash_over_ar() {
+        let s = "AR tokens: [9, 9]\nDFlash tokens: [1, 2, 3]";
+        assert_eq!(parse_token_line(s, Source::Auto), Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn ar_source_reads_ar_line() {
+        let s = "AR tokens: [9, 8, 7]\nDFlash tokens: [1, 2, 3]";
+        assert_eq!(parse_token_line(s, Source::Ar), Some(vec![9, 8, 7]));
+    }
+
+    #[test]
+    fn missing_line_is_none() {
+        assert_eq!(parse_token_line("no tokens here", Source::Auto), None);
+    }
+}

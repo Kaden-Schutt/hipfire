@@ -1405,6 +1405,7 @@ dependencies = [
  "hipfire-build-info",
  "hipfire-config",
  "hipfire-daemon-adapter",
+ "hipfire-detect",
  "hipfire-diffusion",
  "hipfire-generate",
  "hipfire-lock",

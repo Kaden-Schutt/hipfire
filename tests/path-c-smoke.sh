@@ -204,47 +204,15 @@ if [ "$GRAPH_AB" -eq 1 ]; then
 fi
 
 # ── Detector (same logic as coherence-gate-dflash.sh) ────────────────────
-DETECT_PY=$(cat <<'PYEOF'
-import sys, re, json, collections
-EOT_IDS = {248044, 248046}
-out = sys.stdin.read()
-m = re.search(r"DFlash tokens: \[([^\]]+)\]", out)
-ar_m = re.search(r"AR tokens: \[([^\]]+)\]", out)
-src = m or ar_m
-if not src:
-    print(json.dumps({"ok": False, "reason": "no_tokens_line"}))
-    sys.exit(0)
-toks = [int(x) for x in src.group(1).split(",") if x.strip()]
-if not toks:
-    print(json.dumps({"ok": False, "reason": "zero_tokens"}))
-    sys.exit(0)
-trimmed = toks
-for i, t in enumerate(toks):
-    if t in EOT_IDS:
-        trimmed = toks[:i]
-        break
-window = trimmed[:128]
-if len(window) < 16:
-    print(json.dumps({"ok": True, "total": len(window), "reason": "short_window_ok"}))
-    sys.exit(0)
-counter = collections.Counter(window)
-unique = len(counter)
-total = len(window)
-unique_ratio = unique / total
-max_tok, max_count = counter.most_common(1)[0]
-max_freq = max_count / total
-hard_fail = max_freq > 0.50 or unique_ratio < 0.15
-soft_warn = (max_freq > 0.40 or unique_ratio < 0.30) and not hard_fail
-print(json.dumps({
-    "ok": not hard_fail,
-    "soft_warn": soft_warn,
-    "total": total, "unique": unique,
-    "unique_ratio": round(unique_ratio, 3),
-    "max_freq": round(max_freq, 3),
-    "max_tok": max_tok, "max_count": max_count,
-}))
-PYEOF
-)
+HIPFIRE_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
+if [ ! -x "$HIPFIRE_BIN" ] && ! command -v "$HIPFIRE_BIN" >/dev/null 2>&1; then
+    echo "path-c-smoke: building hipfire CLI for the token-attractor detector..." >&2
+    cargo build --release -p hipfire-cli --bin hipfire >&2 || {
+        echo "path-c-smoke: hipfire build failed" >&2
+        exit 2
+    }
+    HIPFIRE_BIN="./target/release/hipfire"
+fi
 
 # ── Run ──────────────────────────────────────────────────────────────────
 hard_errors=0
@@ -318,7 +286,7 @@ for entry in "${TESTS[@]}"; do
     wall=$(python3 -c "print(f'{$t1 - $t0:.1f}')")
 
     panic=$(grep -aE 'panicked|thread.*panicked|FATAL|error: ' "$out_file" | head -1)
-    detect=$(python3 -c "$DETECT_PY" < "$out_file")
+    detect=$("$HIPFIRE_BIN" detect --source auto < "$out_file")
     detect_ok=$(echo "$detect" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('ok',False))")
     detect_warn=$(echo "$detect" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('soft_warn',False))")
 

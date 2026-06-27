@@ -505,8 +505,8 @@
     "semantic_hash": ""
   },
   "crates/hipfire-cli/src/commands/mod.rs": {
-    "mtime": 1782403536.3085191,
-    "ast_hash": "60c5a370de576f7a1981d62599427204",
+    "mtime": 1782550627.1056323,
+    "ast_hash": "cf71c983359423515b36eac63948afdd",
     "semantic_hash": ""
   },
   "crates/hipfire-cli/src/commands/serve.rs": {
@@ -515,8 +515,8 @@
     "semantic_hash": ""
   },
   "crates/hipfire-cli/src/main.rs": {
-    "mtime": 1782489007.0025804,
-    "ast_hash": "3567dea131910dd4116204c60728f2b6",
+    "mtime": 1782550632.2740371,
+    "ast_hash": "90a972d96defb0653b39762d1469d5fa",
     "semantic_hash": ""
   },
   "crates/hipfire-cli/src/model.rs": {
@@ -1160,7 +1160,7 @@
     "semantic_hash": ""
   },
   "crates/hipfire-runtime/src/env_docs.rs": {
-    "mtime": 1782495455.951414,
+    "mtime": 1782550925.735517,
     "ast_hash": "682d2b01d3dddfd8ac4eb2e08990cf8b",
     "semantic_hash": ""
   },
@@ -5782,6 +5782,11 @@
   "graphify-out/memory/query_20260626_040837_what_is_the_status_of_the_diffusion_code__i_need_a.md": {
     "mtime": 1782446917.2105746,
     "ast_hash": "f710ed3db7f2acd576638f63dcedbbcd",
+    "semantic_hash": ""
+  },
+  "crates/hipfire-cli/src/commands/detect.rs": {
+    "mtime": 1782550622.325258,
+    "ast_hash": "05e592d0dfc7e9a27d0e79638d04725a",
     "semantic_hash": ""
   }
 }

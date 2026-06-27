@@ -35,6 +35,13 @@ enum Command {
     /// GPU resource lock for multi-agent coordination (acquire/release/status)
     #[command(alias = "gpu-lock")]
     Lock(commands::lock::LockArgs),
+    /// Run observational coherence detectors over a captured token stream
+    ///
+    /// Reads the demo/daemon stdout on stdin (the `DFlash tokens: [..]` /
+    /// `AR tokens: [..]` line) and emits a JSON verdict with `ok` / `soft_warn`.
+    /// Front-end for the `hipfire-detect` DetectorBank; replaces the Path-A
+    /// token-attractor Python heredocs in the coherence gates.
+    Detect(commands::detect::DetectArgs),
     /// Import and inspect diffusion models stored as .hfq artifacts
     ///
     /// Runtime note: runnable `.hfq` diffusion artifacts still perform CLIP
@@ -181,6 +188,7 @@ async fn main() -> anyhow::Result<()> {
         Command::CollectArtifacts(args) => commands::forward::run_collect_artifacts(args),
         Command::Repack(args) => commands::forward::run_repack(args),
         Command::Lock(args) => commands::lock::run(args),
+        Command::Detect(args) => commands::detect::run(args),
         Command::Diffusion(args) => commands::diffusion::run(args),
         Command::Admin(args) => commands::admin::run(args, config).await,
         Command::GenDocs(args) => commands::gen_docs::run(args),
