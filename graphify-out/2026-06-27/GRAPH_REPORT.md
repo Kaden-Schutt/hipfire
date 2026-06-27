@@ -1,16 +1,16 @@
 # Graph Report - hipfire  (2026-06-27)
 
 ## Corpus Check
-- 1167 files · ~1,824,519 words
+- 1167 files · ~1,825,587 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 16972 nodes · 41101 edges · 572 communities (499 shown, 73 thin omitted)
-- Extraction: 96% EXTRACTED · 4% INFERRED · 0% AMBIGUOUS · INFERRED: 1766 edges (avg confidence: 0.8)
+- 16984 nodes · 41155 edges · 576 communities (504 shown, 72 thin omitted)
+- Extraction: 96% EXTRACTED · 4% INFERRED · 0% AMBIGUOUS · INFERRED: 1779 edges (avg confidence: 0.8)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `9307c933`
+- Built from commit: `62575a99`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -520,6 +520,10 @@
 - [[_COMMUNITY_Community 552|Community 552]]
 - [[_COMMUNITY_Community 553|Community 553]]
 - [[_COMMUNITY_Community 554|Community 554]]
+- [[_COMMUNITY_Community 555|Community 555]]
+- [[_COMMUNITY_Community 556|Community 556]]
+- [[_COMMUNITY_Community 557|Community 557]]
+- [[_COMMUNITY_Community 558|Community 558]]
 - [[_COMMUNITY_Community 574|Community 574]]
 - [[_COMMUNITY_Community 575|Community 575]]
 - [[_COMMUNITY_Community 579|Community 579]]
@@ -530,10 +534,10 @@
 
 ## God Nodes (most connected - your core abstractions)
 1. `HipResult` - 1527 edges
-2. `GpuTensor` - 1316 edges
-3. `Gpu` - 1224 edges
-4. `DiffusionResult` - 434 edges
-5. `CpuTensor` - 273 edges
+2. `GpuTensor` - 1320 edges
+3. `Gpu` - 1228 edges
+4. `DiffusionResult` - 439 edges
+5. `CpuTensor` - 274 edges
 6. `HfqFile` - 241 edges
 7. `LoadedModel` - 179 edges
 8. `KvCache` - 156 edges
@@ -543,13 +547,13 @@
 ## Surprising Connections (you probably didn't know these)
 - `decode_bf16_and_f32_shadow()` --calls--> `decode_w_down_shadow()`  [INFERRED]
   crates/hipfire-arch-qwen35/src/ffn_bf16.rs → crates/hipfire-cpu/src/lib.rs
+- `sequence_state_descriptor_lookup_binds_qwen35_epoch_handles()` --calls--> `describe_sequence_state_descriptors()`  [INFERRED]
+  crates/hipfire-daemon/src/main.rs → crates/hipfire-state/src/lib.rs
 - `denoise_progress_callback_can_interrupt_generation()` --calls--> `denoise_latents_with_cfg_progress()`  [INFERRED]
   crates/hipfire-diffusion/src/tests.rs → crates/hipfire-diffusion/src/lib.rs
 - `hip_denoise_loop_runtime_options_route_vector_stages_when_gpu_is_available()` --calls--> `denoise_latents_with_cfg_progress_and_runtime_options()`  [INFERRED]
   crates/hipfire-diffusion/src/tests.rs → crates/hipfire-diffusion/src/lib.rs
 - `append_inpaint_conditioning_concatenates_latents_mask_and_masked_latents()` --calls--> `append_inpaint_conditioning()`  [INFERRED]
-  crates/hipfire-diffusion/src/tests.rs → crates/hipfire-diffusion/src/lib.rs
-- `rgb_batch_to_vae_tensor_maps_pixels_to_model_range()` --calls--> `rgb_batch_to_vae_tensor()`  [INFERRED]
   crates/hipfire-diffusion/src/tests.rs → crates/hipfire-diffusion/src/lib.rs
 
 ## Import Cycles
@@ -559,11 +563,11 @@
 - 1-file cycle: `crates/hipfire-arch-qwen35/src/arch.rs -> crates/hipfire-arch-qwen35/src/arch.rs`
 - 2-file cycle: `crates/hipfire-serving-core/src/model.rs -> crates/hipfire-serving-core/src/session.rs -> crates/hipfire-serving-core/src/model.rs`
 
-## Communities (572 total, 73 thin omitted)
+## Communities (576 total, 72 thin omitted)
 
 ### Community 0 - "GPU Attention Operations"
 Cohesion: 0.00
-Nodes (684): Per-decode GPU scratch + F32 KV cache. `tmp` (size `hidden_size`) is reused for , Gpu::layernorm_batched(), LayerNorm with bias (batched): out = gamma * (x - mean) / sqrt(var + eps) + beta, Gpu::attention_causal_batched(), Gpu::attention_cold_slots(), Gpu::attention_dflash_wmma_m64_n128_f16kv_f32(), Gpu::attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32(), Gpu::attention_dflash_wmma_m64_n128_f16kv_v3_f32() (+676 more)
+Nodes (757): Gpu::swiglu_train_bwd(), Gpu, Gpu::attention_causal_batched(), Gpu::attention_cold_slots(), Gpu::attention_dflash_f32(), Gpu::attention_dflash_wmma_causal_f32(), Gpu::attention_dflash_wmma_m32_f32(), Gpu::attention_dflash_wmma_m64_n128_f16kv_f32() (+749 more)
 
 ### Community 1 - "GEMV Quantized Kernels"
 Cohesion: 0.00
@@ -571,11 +575,11 @@ Nodes (3): hip::runtime, Why: at vision-encoder shapes (B=L=N_patches≈20k, hea
 
 ### Community 2 - "Fused Lloyd Quantization"
 Cohesion: 0.02
-Nodes (98): debug_gdn_requant_frame, Gpu, Gpu::bind_thread_or_warn(), Gpu::clear_last_error(), Gpu::debug_gdn_requant_frame(), Gpu::debug_set_gdn_requant_frame(), Gpu::drain_pool(), Gpu::drop() (+90 more)
+Nodes (121): debug_gdn_requant_frame, ActivationCapture, Gpu, Gpu::bind_thread_or_warn(), Gpu::clear_last_error(), Gpu::debug_gdn_requant_frame(), Gpu::debug_set_gdn_requant_frame(), Gpu::drain_pool() (+113 more)
 
 ### Community 3 - "DeepSeek4 GPU Operations"
-Cohesion: 0.09
-Nodes (40): arch::id::lfm2::moe, qwen35::materialize::batch::prefill::prompt, compute_lfm2_prefix_hash(), lfm2_boundary_checkpoint_session_id(), lfm2_materialize_prefill_tokens(), lfm2_prefill_active_session_tokens(), lfm2_prefill_session_done_json(), lfm2_prefill_with_boundary_checkpoints() (+32 more)
+Cohesion: 0.07
+Nodes (47): arch::id::lfm2::moe, qwen35::materialize::batch::prefill::prompt, compute_lfm2_prefix_hash(), emit_lfm2_generate_batch_prefill_ready(), lfm2_boundary_checkpoint_session_id(), lfm2_materialize_prefill_tokens(), lfm2_prefill_active_session_tokens(), lfm2_prefill_session_done_json() (+39 more)
 
 ### Community 4 - "Layer Weights Scoring"
 Cohesion: 0.01
@@ -583,63 +587,63 @@ Nodes (4): Rationale: doing the FP16->FP8 conversion inside the GEMM inner loop,
 
 ### Community 5 - "Diffusion Pipeline"
 Cohesion: 0.03
-Nodes (180): concat_last_dim_3d_hip_on_gpu(), AttentionLayer, AttentionLayer::forward(), AttentionLayer::forward_with_runtime_context(), AttentionLayer::forward_with_runtime_options(), BasicTransformerBlock, BasicTransformerBlock::forward(), BasicTransformerBlock::forward_with_runtime_context() (+172 more)
+Nodes (192): concat_last_dim_2d_hip_on_gpu(), concat_last_dim_3d_hip_on_gpu(), AttentionLayer, AttentionLayer::forward(), AttentionLayer::forward_with_runtime_context(), AttentionLayer::forward_with_runtime_options(), BasicTransformerBlock, BasicTransformerBlock::forward() (+184 more)
 
 ### Community 6 - "CPU Transformer Layers"
 Cohesion: 0.02
-Nodes (185): block, cross::entropy, Gpu::pflash_score_f32_bwd(), PFlash importance backward (fp32 training twin). `dscores`:`[n_blocks]`, `dk`:`[, distill::kl, gated::scan, LayerWeights, linear (+177 more)
+Nodes (199): block, cross::entropy, Gpu::pflash_score_f32_bwd(), Gpu::pflash_score_f32_fwd(), PFlash per-block cosine-importance forward (fp32 training twin). `k`:`[n_pos*kv_, PFlash importance backward (fp32 training twin). `dscores`:`[n_blocks]`, `dk`:`[, distill::kl, gated::scan (+191 more)
 
 ### Community 7 - "Vision ViT Encoder"
-Cohesion: 0.02
-Nodes (189): bytes_mem_tensor(), f32_mem_tensor(), HfqMemTensor, One in-memory tensor for [`write_hfqm_package_mem`]., Streaming HFQM writer: write the header + metadata + index up front (payload siz, Write an HFQM container from in-memory tensors. Thin wrapper over [`write_hfqm_p, write_hfqm_package_mem(), write_hfqm_package_streaming() (+181 more)
+Cohesion: 0.03
+Nodes (174): bytes_mem_tensor(), f32_mem_tensor(), combine_parts(), HfqMemTensor, One in-memory tensor for [`write_hfqm_package_mem`]., Streaming HFQM writer: write the header + metadata + index up front (payload siz, Write an HFQM container from in-memory tensors. Thin wrapper over [`write_hfqm_p, write_hfqm_package_mem() (+166 more)
 
 ### Community 8 - "Diffusion SDAPI Server"
 Cohesion: 0.03
-Nodes (158): discovery, hipfire::diffusion, annotate_highres_txt2img_info(), aspect_scaled_dimension(), batch_size_for_body(), cached_diffusion_pipeline(), center_identity_conv(), checkpoint_discovery_lists_single_file_models() (+150 more)
+Nodes (116): DecodeError, discovery, hipfire::diffusion, annotate_sdapi_images(), center_identity_conv(), checkpoint_discovery_lists_single_file_models(), collect_checkpoint_models_from_root(), collect_diffusers_models_from_root() (+108 more)
 
 ### Community 9 - "DFlash spec-decode"
 Cohesion: 0.02
-Nodes (130): attnparams, ffn::bf16, hfqmodulekind, kv::tier, align_down(), align_up(), align_up_usize(), alloc_and_upload_i32_table() (+122 more)
+Nodes (184): attnparams, ffn::bf16, hfqmodulekind, align_down(), align_up(), align_up_usize(), AlignedLoadBuffer, AlignedLoadBuffer::as_mut_slice() (+176 more)
 
 ### Community 10 - "Model Loading State"
 Cohesion: 0.03
-Nodes (118): Create a non-owning alias to the same GPU memory. The alias must not outlive the, Gpu::triattn_accumulate(), Gpu::memcpy_dtod_at_auto(), Gpu::memcpy_dtod_auto(), Gpu::memcpy_htod_auto(), D→D copy with offsets that picks async (on the active stream) when a stream is s, D→D copy (whole buffer) that picks async on the active stream when set., H→D copy that picks async on the active stream when capturing. During hipGraph c (+110 more)
+Nodes (109): Create a non-owning alias to the same GPU memory. The alias must not outlive the, Gpu::triattn_accumulate(), Gpu::memcpy_dtod_at_auto(), Gpu::memcpy_dtod_auto(), Gpu::memcpy_htod_auto(), D→D copy with offsets that picks async (on the active stream) when a stream is s, D→D copy (whole buffer) that picks async on the active stream when set., H→D copy that picks async on the active stream when capturing. During hipGraph c (+101 more)
 
 ### Community 11 - "Eval Metrics Profiling"
-Cohesion: 0.05
-Nodes (157): EvalResult, run_battery(), external_evidence_context(), external_evidence_records(), external_evidence_records_from_path(), runtime_evidence_dirs_from_results(), attach_kld_possible_false_negative_causes(), coherent_text_scores_high_unique_low_freq() (+149 more)
+Cohesion: 0.04
+Nodes (161): EvalResult, evidence_artifact_value(), external_evidence_context(), external_evidence_records(), external_evidence_records_from_path(), runtime_evidence_dirs_from_results(), attach_kld_possible_false_negative_causes(), coherent_text_scores_high_unique_low_freq() (+153 more)
 
 ### Community 12 - "Eval Framework Core"
 Cohesion: 0.04
-Nodes (130): AdmissionArtifact, ComparisonArtifact, Shared framework for the `hipfire-eval` runner. This module establishes the stab, write_minimal_hfq(), datasets, driver, executor::daemon, executor::examples (+122 more)
+Nodes (123): ComparisonArtifact, Shared framework for the `hipfire-eval` runner. This module establishes the stab, write_minimal_hfq(), datasets, driver, executor::daemon, executor::examples, executor::mock (+115 more)
 
 ### Community 13 - "REST Health CORS"
 Cohesion: 0.03
-Nodes (104): dim, Q4_K embedding lookup: dequantize one row on GPU, output F32. table is raw Q4_K , Embed one text token (format-dispatched lookup + Gemma √hidden scale) into `dest, load_dflash_state(), Load the optional DFlash speculative-decoding drafter for a model: the draft wei, LoadedModel::dn_state(), LoadedModel::dn_state_mut(), Active session's DeltaNet recurrent state, if any. (+96 more)
+Nodes (101): dim, Q4_K embedding lookup: dequantize one row on GPU, output F32. table is raw Q4_K , ensure_rank_streams, run_layer_program_ep, EP (Ship 6 substrate-EP) replicated N-rank decode forward for ONE token. Mirror , EP (Ship 6 substrate-EP) replicated N-rank decode forward for ONE token. Mirror , Embed one text token (format-dispatched lookup + Gemma √hidden scale) into `dest, LoadedModel::dn_state() (+93 more)
 
 ### Community 14 - "Quantization Codecs"
 Cohesion: 0.03
-Nodes (86): model_hash(), Metadata about a single tensor in a model source., Normalize a user-facing model tag into the fuzzy filename search stem., Shared model artifact identity helpers and model-source contracts., read_hfq_metadata(), hipfire::hash, canonical_model_artifact_name_breaks_down_identity_features_quant_and_arch(), compact_param_count() (+78 more)
+Nodes (84): model_hash(), Metadata about a single tensor in a model source., Normalize a user-facing model tag into the fuzzy filename search stem., Shared model artifact identity helpers and model-source contracts., read_hfq_metadata(), hipfire::hash, canonical_model_artifact_name_breaks_down_identity_features_quant_and_arch(), compact_param_count() (+76 more)
 
 ### Community 15 - "Sequence State Management"
 Cohesion: 0.03
-Nodes (116): Shared sequence-state handles, descriptors, and reservation helpers., allocator_policy_reports_backend_wrapped_and_unsupported_modes(), arena_policy_follows_runtime_shape(), checkpoint_logical_position_validation_accepts_match(), checkpoint_logical_position_validation_reports_mismatch(), checkpoint_source_resident_validation_accepts_resident_source(), checkpoint_source_resident_validation_reports_missing_source(), compatible_state_kind_labels_for_arch() (+108 more)
+Nodes (108): Shared sequence-state handles, descriptors, and reservation helpers., allocator_policy_reports_backend_wrapped_and_unsupported_modes(), arena_policy_follows_runtime_shape(), checkpoint_logical_position_validation_accepts_match(), checkpoint_logical_position_validation_reports_mismatch(), checkpoint_source_resident_validation_accepts_resident_source(), checkpoint_source_resident_validation_reports_missing_source(), compatible_state_kind_labels_for_arch() (+100 more)
 
 ### Community 16 - "Kernel Profiling"
 Cohesion: 0.03
-Nodes (111): ComparisonArtifact, AdmissionArtifact, AdmissionEvidence, ComparisonArtifact, Evidence provenance helpers shared by Hipfire eval and gate tooling., read_hfq_metadata(), temp_dir(), evidence_artifact_value() (+103 more)
+Nodes (108): ComparisonArtifact, AdmissionArtifact, AdmissionEvidence, ComparisonArtifact, Evidence provenance helpers shared by Hipfire eval and gate tooling., read_hfq_metadata(), temp_dir(), evidence_records() (+100 more)
 
 ### Community 17 - "Model Identity Hash"
 Cohesion: 0.03
-Nodes (50): codecs, hipfire::kvquant, MetaValue, block_stats_mq2(), block_stats_mq3(), chat_template_override_creates_minimal_config_when_missing(), chat_template_override_replaces_existing_template(), chat_template_override_replaces_non_object_config_with_minimal_object() (+42 more)
+Nodes (49): codecs, hipfire::kvquant, block_stats_mq2(), block_stats_mq3(), chat_template_override_creates_minimal_config_when_missing(), chat_template_override_replaces_existing_template(), chat_template_override_replaces_non_object_config_with_minimal_object(), classify() (+41 more)
 
 ### Community 18 - "Chat REST API"
 Cohesion: 0.01
-Nodes (190): Gpu, Gpu::gemv_bf16_bf16(), Gpu::gemv_bf16_f32(), Gpu::gemv_f16_f16(), Gpu::gemv_f16_f32(), Gpu::gemv_f16_xf32(), Gpu::gemv_f16_xf32_residual(), Gpu::gemv_f16_xf32_residual_batched() (+182 more)
+Nodes (392): attention_dflash_f32, Gpu, Gpu::add_f32(), Gpu::add_f32_graph_safe(), Gpu::add_inplace_f32(), Gpu::alpha_gate_f32(), Gpu::apply_rope_2d_vision_f32(), Gpu::gelu_mul_f32() (+384 more)
 
 ### Community 19 - "Generation Request Protocol"
 Cohesion: 0.04
-Nodes (107): PromptMessage, PromptToolCall, Role, AssistantDelta, attach_cask_policy(), blocking_chat_buffered_for_tests(), blocking_chat_preflight_error(), blocking_chat_preflight_maps_early_errors_to_http_statuses() (+99 more)
+Nodes (114): IntoResponse, PromptMessage, PromptToolCall, Role, AssistantDelta, attach_cask_policy(), blocking_chat(), blocking_chat_buffered_for_tests() (+106 more)
 
 ### Community 20 - "End-of-sequence detection"
 Cohesion: 0.02
@@ -647,27 +651,27 @@ Nodes (25): load_s4x16_from_hfq4(), shift_u4_to_s4(), bf16_to_f32(), gemv_bf16_m
 
 ### Community 21 - "HFQ Tensor Loading"
 Cohesion: 0.03
-Nodes (179): Diffusion model support for HFQ-backed Hipfire serving. This crate owns the stab, gpu::ops, hip_kernels, layers, quant::decode, scheduler, ROCm/HIP GPU boundary ops for diffusion. GPU code always compiles (the CPU refer, add_component() (+171 more)
+Nodes (119): Diffusion model support for HFQ-backed Hipfire serving. This crate owns the stab, gpu::ops, hip_kernels, layers, quant::decode, scheduler, ROCm/HIP GPU boundary ops for diffusion. GPU code always compiles (the CPU refer, add_component() (+111 more)
 
 ### Community 22 - "HFQ Memory Container"
 Cohesion: 0.03
-Nodes (90): affine_clipsearch(), dequant_hfp4g32_row(), dequant_mq4g256(), dequant_oq4g256(), dequant_oq8g256(), e2m1_round(), quantize_hfp4g32_2d(), quantize_hfp4g32_row() (+82 more)
+Nodes (88): affine_clipsearch(), dequant_hfp4g32_row(), dequant_mq4g256(), dequant_oq4g256(), dequant_oq8g256(), e2m1_round(), quantize_hfp4g32_2d(), quantize_hfp4g32_row() (+80 more)
 
 ### Community 23 - "Tensor Loading Helpers"
 Cohesion: 0.03
-Nodes (75): moeprefillresolution, pipeline, always_variant(), ctx_gfx906(), ctx_rdna1(), ctx_rdna2(), ctx_rdna3(), ctx_rdna4() (+67 more)
+Nodes (73): moeprefillresolution, pipeline, always_variant(), ctx_gfx906(), ctx_rdna1(), ctx_rdna2(), ctx_rdna3(), ctx_rdna4() (+65 more)
 
 ### Community 24 - "MoE Prefill Testing"
 Cohesion: 0.04
-Nodes (37): BPE tokenizer loaded from GGUF metadata. Supports encode (text → token IDs) and , reverse, collapse_newline_runs(), cow_borrowed_when_no_runs(), default_on_collapses_when_env_unset(), env_lock(), explicit_zero_opts_out(), gpt2_char_to_byte() (+29 more)
+Nodes (35): BPE tokenizer loaded from GGUF metadata. Supports encode (text → token IDs) and , reverse, collapse_newline_runs(), cow_borrowed_when_no_runs(), default_on_collapses_when_env_unset(), env_lock(), explicit_zero_opts_out(), line_endings_preserves_multibyte_utf8() (+27 more)
 
 ### Community 25 - "HFQ File Mapping"
-Cohesion: 0.07
-Nodes (59): model::worker::runtime::view::json, GenerateBatchDecodeEnvelope, GenerateBatchDecodeSession, is_qwen35_dense_arch_id(), is_qwen35_moe_arch_id(), plan_generate_batch_prefill_qwen35(), qwen35_decode_batch_requested_auto(), qwen35_decode_batch_scheduler_metadata() (+51 more)
+Cohesion: 0.06
+Nodes (66): model::worker::runtime::view::json, GenerateBatchDecodeEnvelope, GenerateBatchDecodeSession, is_qwen35_dense_arch_id(), is_qwen35_moe_arch_id(), model_arch_family(), ModelArchFamily, plan_generate_batch_prefill_qwen35() (+58 more)
 
 ### Community 26 - "HSA Runtime Wrapper"
-Cohesion: 0.05
-Nodes (105): main(), DEFAULT_MODEL_WORKER_ID, release_lfm2_prefill_sessions(), run_generate_batch_prefill_serial_lfm2(), generate_state_kinds_include_required(), is_qwen35_family_arch_id(), parsed_handle_may_target_generic(), parsed_handle_may_target_loaded_state() (+97 more)
+Cohesion: 0.04
+Nodes (136): main(), DEFAULT_MODEL_WORKER_ID, kv, release_lfm2_prefill_sessions(), run_prefix_hash_preflight_lfm2(), describe_sequence_state_descriptors(), describe_state_done_json(), described_sequence_state_json() (+128 more)
 
 ### Community 27 - "Generation Output Filter"
 Cohesion: 0.03
@@ -675,11 +679,11 @@ Nodes (81): main(), HfqTensor, arg_value(), awq_eligible(), awq_scales_to_f16_by
 
 ### Community 28 - "Operator REST API"
 Cohesion: 0.05
-Nodes (55): Typed generation request, event, and batch-plan contracts., ToolCall, hipfire::model, build_qwen35_fused_dense_prefill_batch_contract(), canonical_generate_state_kind_hash_label(), compute_qwen35_prefix_hash(), ErrorEvent, GenerateBatchPrefillPlan (+47 more)
+Nodes (52): Typed generation request, event, and batch-plan contracts., ToolCall, hipfire::model, build_qwen35_fused_dense_prefill_batch_contract(), canonical_generate_state_kind_hash_label(), compute_qwen35_prefix_hash(), ErrorEvent, GenerateBatchPrefillPlan (+44 more)
 
 ### Community 29 - "Gemma3 Decode Backend"
 Cohesion: 0.04
-Nodes (91): Chooses what goes after the assistant role-and-newline opener., Compatibility re-export for generation output filtering. The implementation live, Per-generation evidence writers (runtime one-shot timings + MoE router histogram, dev, emit_stream_event, eos::filter, generate_deepseek4, hipfire::evidence (+83 more)
+Nodes (92): Chooses what goes after the assistant role-and-newline opener., Compatibility re-export for generation output filtering. The implementation live, Per-generation evidence writers (runtime one-shot timings + MoE router histogram, dev, emit_stream_event, eos::filter, events, generate_deepseek4 (+84 more)
 
 ### Community 30 - "Model Prefill Loading"
 Cohesion: 0.03
@@ -690,32 +694,32 @@ Cohesion: 0.25
 Nodes (8): Pure predicate for the `HIPFIRE_DIFFUSION_CPU_REFERENCE` toggle: unset, empty, `, cpu_reference_env_enabled(), DiffusionGenerationRuntimeOptions::cpu_reference(), DiffusionGenerationRuntimeOptions::cpu_reference_requested(), DiffusionGenerationRuntimeOptions::for_device(), DiffusionGenerationRuntimeOptions::rocm_hybrid(), Build runtime options for the daemon-resolved `device_id`. hipfire is HIP/ROCm-f, Whether the CPU reference oracle was requested via `HIPFIRE_DIFFUSION_CPU_REFERE
 
 ### Community 32 - "DP4A/MMQ GEMM"
-Cohesion: 0.03
-Nodes (79): hipfire engine daemon — JSON lines over stdin/stdout. The Rust server/CLI spawns, dummy, generate, generate::vl, hipfire::generate, hipfire::serving::core, hipfire::state, lfm2::prefill (+71 more)
+Cohesion: 0.04
+Nodes (76): hipfire engine daemon — JSON lines over stdin/stdout. The Rust server/CLI spawns, dummy, generate, generate::vl, hipfire::generate, hipfire::serving::core, hipfire::state, lfm2::prefill (+68 more)
 
 ### Community 33 - "Codec Dequantization"
-Cohesion: 0.02
-Nodes (85): ctrl, Gpu, Gpu::compressor_add_ape_batched_f32(), Gpu::compressor_overlap_concat_f32(), Gpu::compressor_ring_write_batched_f32(), Gpu::compressor_softmax_pool_f32(), Gpu::compressor_softmax_pool_f32_buf(), Gpu::deepseek4_attn_pos0() (+77 more)
+Cohesion: 0.03
+Nodes (81): ctrl, Gpu, Gpu::compressor_add_ape_batched_f32(), Gpu::compressor_overlap_concat_f32(), Gpu::compressor_ring_write_batched_f32(), Gpu::compressor_softmax_pool_f32(), Gpu::compressor_softmax_pool_f32_buf(), Gpu::deepseek4_attn_pos0() (+73 more)
 
 ### Community 34 - "Quantization Utilities"
-Cohesion: 0.18
-Nodes (45): empty_request(), extract_png_text_chunk(), img2img_route_accepts_one_init_image_per_batch_item(), img2img_route_accepts_resize_mode_3_latent_upscale(), img2img_route_applies_mask_for_direct_diffusion_hfq_model(), img2img_route_composites_full_res_inpaint_crop(), img2img_route_preserves_init_images_when_requested(), img2img_route_rejects_unsupported_alwayson_scripts_but_allows_empty_defaults() (+37 more)
+Cohesion: 0.12
+Nodes (60): diffusion_error_response(), empty_request(), extract_png_text_chunk(), img2img_route_accepts_one_init_image_per_batch_item(), img2img_route_accepts_resize_mode_3_latent_upscale(), img2img_route_applies_mask_for_direct_diffusion_hfq_model(), img2img_route_composites_full_res_inpaint_crop(), img2img_route_preserves_init_images_when_requested() (+52 more)
 
 ### Community 35 - "Daemon JSON Interface"
 Cohesion: 0.05
-Nodes (78): apply_encode, `true` when decode reduces to a single reciprocal scale (the SD/SDXL fast path t, encode_to_latents_with_runtime_context, Conv2dLayer, Conv2dLayer::from_hfq(), Conv2dLayer::from_hfq_with_stride(), GroupNormLayer, GroupNormLayer::from_hfq() (+70 more)
+Nodes (71): apply_encode, `true` when decode reduces to a single reciprocal scale (the SD/SDXL fast path t, encode_to_latents_with_runtime_context, Conv2dLayer, Conv2dLayer::from_hfq(), Conv2dLayer::from_hfq_with_stride(), GroupNormLayer, GroupNormLayer::from_hfq() (+63 more)
 
 ### Community 36 - "Model Artifact Registry"
-Cohesion: 0.03
-Nodes (110): `Gemma3VlBackend` — the multimodal (`arch_id = 13`) serving backend. Unlike the , Serving seam for nemotron_h (arch_id 14): `SimpleAr` + `ServingBackend` on [`Nem, The bring-up contract for a hipfire architecture. Implement this trait in your a, Compatibility re-export for the tokenizer implementation. Tokenizer parsing, enc, decode_loop, load_vl, run_simple_ar, sample (+102 more)
+Cohesion: 0.04
+Nodes (75): `Gemma3VlBackend` — the multimodal (`arch_id = 13`) serving backend. Unlike the , The bring-up contract for a hipfire architecture. Implement this trait in your a, decode_loop, load_vl, run_simple_ar, sample, serve, ArchCaps (+67 more)
 
 ### Community 37 - "Token Continuation Masking"
 Cohesion: 0.05
-Nodes (78): fused::qkv, dp4a_eligible(), execute_steps(), FusedPattern, gemv_steps_uniform(), gemv_steps_uniform_raw(), gemv_weight_out(), GemvInput (+70 more)
+Nodes (79): fused::qkv, dp4a_eligible(), execute_steps(), FusedPattern, gemv_steps_uniform(), gemv_steps_uniform_raw(), gemv_weight_out(), GemvInput (+71 more)
 
 ### Community 38 - "GGUF Tokenizer"
-Cohesion: 0.19
-Nodes (13): commit(), `<think>` block detectors. Both run on the visible-text stream (`Event::Token`) , Hard-fails when an open `<think>` is not closed after the configured stall budge, think_empty_silent_on_real_content(), think_empty_warns_on_whitespace_interior(), think_empty_warns_on_zero_content(), think_stall_fires_when_budget_exceeded(), think_stall_silent_when_closed_in_time() (+5 more)
+Cohesion: 0.18
+Nodes (12): commit(), Hard-fails when an empty `<think></think>` pair appears., `<think>` block detectors. Both run on the visible-text stream (`Event::Token`) , think_empty_silent_on_real_content(), think_empty_warns_on_whitespace_interior(), think_empty_warns_on_zero_content(), think_stall_fires_when_budget_exceeded(), think_stall_silent_when_closed_in_time() (+4 more)
 
 ### Community 39 - "Speculative Decoding"
 Cohesion: 0.10
@@ -723,55 +727,55 @@ Nodes (32): dflash_contract_accepts_matching_lfm2_shape(), dflash_contract_rejec
 
 ### Community 40 - "File management"
 Cohesion: 0.03
-Nodes (88): Qwen2 model family dispatch tests. arch_id=7. Simplest bring-up: F32-only KV cac, F24, all_registered_tile_variants_have_dispatch_arms(), AttentionFamily, AttentionFamily::new(), AttentionFamily::registry(), AttentionFamily::resolve(), AttentionFamily::run_attention() (+80 more)
+Nodes (89): Qwen2 model family dispatch tests. arch_id=7. Simplest bring-up: F32-only KV cac, Default, F24, all_registered_tile_variants_have_dispatch_arms(), AttentionFamily, AttentionFamily::new(), AttentionFamily::registry(), AttentionFamily::resolve() (+81 more)
 
 ### Community 41 - "HIP FFI Bindings"
 Cohesion: 0.06
-Nodes (64): ArchCaps, fused_gate_up_arch_dispatch(), fused_gate_up_mq3g256_lloyd_for_arch(), fused_gate_up_mq4g256_lloyd_for_arch(), fused_qkv_arch_dispatch(), fused_qkv_mq3g256_lloyd_for_arch(), fused_qkv_mq4g256_lloyd_for_arch(), fused_qkvza_arch_dispatch() (+56 more)
+Nodes (74): ArchCaps, fused_gate_up_arch_dispatch(), fused_gate_up_mq3g256_lloyd_for_arch(), fused_gate_up_mq4g256_lloyd_for_arch(), fused_qkv_arch_dispatch(), fused_qkv_mq3g256_lloyd_for_arch(), fused_qkv_mq4g256_lloyd_for_arch(), fused_qkvza_arch_dispatch() (+66 more)
 
 ### Community 42 - "Gemma3-VL Image Loader"
-Cohesion: 0.08
-Nodes (40): BudgetExhausted, Expert, ExpertModuleKey, find_module_tensor_rel_ptr(), Evict residents from the LRU front (least-recently-used) until at least `need_by, Free all resident tensors back to the GPU pool. Called on model teardown so VRAM, Get the resident tensor for `id`. Returns `None` if not resident (caller should , Insert an already-resident weight. Used by the loader for always-resident weight (+32 more)
+Cohesion: 0.07
+Nodes (48): BudgetExhausted, Expert, ByteRange, ExpertModuleKey, find_module_tensor_rel_ptr(), Evict residents from the LRU front (least-recently-used) until at least `need_by, Free all resident tensors back to the GPU pool. Called on model teardown so VRAM, Get the resident tensor for `id`. Returns `None` if not resident (caller should  (+40 more)
 
 ### Community 43 - "GEMV Dispatch Logic"
 Cohesion: 0.03
-Nodes (118): DType::size(), Gpu::adamw_step(), Gpu::alloc_tensor(), Gpu::begin_graph_capture(), Gpu::begin_replay_graph_capture(), Gpu::begin_verify_graph_capture(), Gpu::bench_iu_wmma_gfx1151(), Gpu::bf16_round_trip_f32() (+110 more)
+Nodes (112): DType::size(), Gpu::adamw_step(), Gpu::alloc_tensor(), Gpu::begin_graph_capture(), Gpu::begin_replay_graph_capture(), Gpu::begin_verify_graph_capture(), Gpu::bench_iu_wmma_gfx1151(), Gpu::bf16_round_trip_f32() (+104 more)
 
 ### Community 44 - "Qwen2 Attention Dispatch"
-Cohesion: 0.05
-Nodes (80): build_capture_names(), CalibOpts, CalibOpts::default(), CalibSummary, f32_bytes(), kldref_extra(), put(), [`Gemma3Config`] and the HFQ-metadata parser. The quantizer embeds the full orig (+72 more)
+Cohesion: 0.04
+Nodes (89): build_capture_names(), CalibOpts, CalibOpts::default(), CalibSummary, f32_bytes(), kldref_extra(), put(), [`Gemma3Config`] and the HFQ-metadata parser. The quantizer embeds the full orig (+81 more)
 
 ### Community 45 - "Calibration Options"
 Cohesion: 0.05
-Nodes (77): head_dim, hidden_size, n_rot, One decode step. Reads `hidden` `[hidden_size]`, updates conv+ssm state in place, One Mamba-2 mixer block decode step. Returns the `[hidden_size]` mixer output; u, Phase 2 read reference (CPU): combined two-tier causal attention for one query (, kpost_per_band(), Compute per-band norms and phases of a post-RoPE K vector. `k_post` is `[head_di (+69 more)
+Nodes (71): head_dim, n_rot, Phase 2 read reference (CPU): combined two-tier causal attention for one query (, attn_gate_handle_for(), attn_gate_handles(), attn_gate_run(), FnCreate, FnDestroy (+63 more)
 
 ### Community 46 - "Qwen2 Model Backend"
 Cohesion: 0.05
-Nodes (78): Decode one token, appending each layer's post-residual hidden state (pre final-n, Qwen2 model types: Config / Weights / State, plus the [`forward_step`] / [`forwa, How the embedding table is stored on GPU., Fused KVarN flash (Phase D2): like `attention_flash_f16k_q8v_batched_masked` but, End-to-end KVarN KV-write + attention for a contiguous run of `n` tokens at abso, gemv::family, layer, Qwen2Backend::new() (+70 more)
+Nodes (78): Qwen2 model types: Config / Weights / State, plus the [`forward_step`] / [`forwa, How the embedding table is stored on GPU., from_hfq, gemv::family, load, Qwen2Backend::new(), dots.ocr model types: `DotsOcrConfig`, `DotsOcrWeights`, and the free-function e, - [`DotsOcrConfig::from_hfq`] — full parser landing soon. Stub currently returns (+70 more)
 
 ### Community 47 - "Architecture Implementations"
-Cohesion: 0.07
-Nodes (49): decode_step_body(), DeepSeek V4 forward pass — skeleton. Layout-only: the function signatures and pe, DeepSeek V4 GEMV dispatch: switch kernel based on weight dtype. - `DType::MQ4G25, apply_tail_rope(), attn_pos0(), attn_stub(), bias_aware_topk_falls_back_zero_bias(), bias_aware_topk_handles_k_geq_n() (+41 more)
+Cohesion: 0.04
+Nodes (173): decode_step(), decode_step_body(), decode_step_body_lowered(), decode_step_with_graph(), forward_ep(), forward_prefill_batch(), `HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS` — cap on the compressed-KV scan length., DeepSeek V4 forward pass — skeleton. Layout-only: the function signatures and pe (+165 more)
 
 ### Community 48 - "Mamba-2 Decode State"
-Cohesion: 0.05
-Nodes (63): Range, attn_ranges_tp2(), contiguous_assignment_blocks(), deltanet_ranges_27b_tp2(), deltanet_ranges_tp4_and_08b(), deltanet_validate_rejects_split_gqa_group(), dense_has_no_experts(), dense_model_no_experts() (+55 more)
+Cohesion: 0.16
+Nodes (17): contiguous_assignment_blocks(), deltanet_validate_rejects_split_gqa_group(), dense_has_no_experts(), dense_model_no_experts(), expert_assign_contiguous_a3b_tp4(), expert_assign_stride_a3b_tp4(), experts_per_rank_splits_evenly(), Routed experts owned by `rank`, ascending. (+9 more)
 
 ### Community 49 - "HFQ input loading"
-Cohesion: 0.07
-Nodes (58): Priority scheduling and session batching policy shared by control planes., model::worker::key::id, active(), active_with_state(), ActiveDecodeSession, clamp_scheduler_priority(), clamp_scheduler_priority_f64(), decode_ids() (+50 more)
+Cohesion: 0.06
+Nodes (67): Priority scheduling and session batching policy shared by control planes., model::worker::key::id, active(), active_with_state(), ActiveDecodeSession, canonical_state_kind_label(), clamp_scheduler_priority(), clamp_scheduler_priority_f64() (+59 more)
 
 ### Community 50 - "Image preprocessing"
-Cohesion: 0.09
-Nodes (33): as_any, mixerkind, recurrent_as, empty_profile_has_neither(), MockRecurrent, MockRecurrent::as_any_mut(), MockRecurrent::reset(), pure_ssm_shape_has_no_kv() (+25 more)
+Cohesion: 0.04
+Nodes (72): as_any, Build a profile from a per-layer kind list., Total decoder layers., Does any layer carry recurrent state (short-conv / DeltaNet / Mamba-2)? True for, A hybrid stack mixes attention and recurrent mixers (qwen35 LA/FA, nemotron_h, l, The token-mixer kind of a single decoder layer. This is the per-layer axis the h, The per-layer token-mixer taxonomy and sequence-state *shape* for the hipfire fa, Does this mixer maintain a KV cache? Only the attention variants do; recurrent m (+64 more)
 
 ### Community 51 - "DeepSeek4 Execution"
 Cohesion: 0.04
-Nodes (68): caskctx, Config, `Architecture` trait implementation for Qwen3.5. This is the canary arch impleme, State, Weights, Look up the capability summary for an HFQ arch_id. Backed by the generated `ARCH, Runtime facts inferred from a resolved HF chat template by rendering controlled , The daemon's in-memory model representation and its satellites. `LoadedModel` is (+60 more)
+Nodes (73): caskctx, Config, `Architecture` trait implementation for Qwen3.5. This is the canary arch impleme, State, Weights, Look up the capability summary for an HFQ arch_id. Backed by the generated `ARCH, Runtime facts inferred from a resolved HF chat template by rendering controlled , The daemon's in-memory model representation and its satellites. `LoadedModel` is (+65 more)
 
 ### Community 52 - "Drafter Tokenizer"
-Cohesion: 0.03
-Nodes (68): attention, Generic kernel-dispatch family accessors and dispatch-type re-exports. Process-g, DType, DType::supports_awq_sidecar(), Whether a `WeightTensor` of this dtype should have the `<weight>.awq_scale.weigh, MoeDtypes, MoeFamily, MoeFamily::registry() (+60 more)
+Cohesion: 0.04
+Nodes (48): DType, DType::supports_awq_sidecar(), Whether a `WeightTensor` of this dtype should have the `<weight>.awq_scale.weigh, MoeDtypes, MoeFamily::run(), MoePrefillResolution, MoePrefillResolution::resolve(), MoePrefillRouting (+40 more)
 
 ### Community 53 - "QTIP Beam Encoding"
 Cohesion: 0.07
@@ -779,19 +783,19 @@ Nodes (67): beam_encode_group(), beam_encode_group_bits(), beam_encode_group_v2(
 
 ### Community 54 - "GPU Token Sampling Dispatch"
 Cohesion: 0.04
-Nodes (69): Gpu, Gpu::gemm_hfq3g256_batched_lmhead(), Gpu::gemm_hfq3g256_moe_grouped_wmma(), Gpu::gemm_hfq3g256_residual(), Gpu::gemm_hfq3g256_residual_dot2(), Gpu::gemm_hfq3g256_residual_fp16(), Gpu::gemm_hfq3g256_residual_mmq(), Gpu::gemm_hfq3g256_residual_mmq_x16() (+61 more)
+Nodes (67): Gpu, Gpu::gemm_hfq3g256_batched_lmhead(), Gpu::gemm_hfq3g256_moe_grouped_wmma(), Gpu::gemm_hfq3g256_residual(), Gpu::gemm_hfq3g256_residual_dot2(), Gpu::gemm_hfq3g256_residual_fp16(), Gpu::gemm_hfq3g256_residual_mmq(), Gpu::gemm_hfq3g256_residual_mmq_x16() (+59 more)
 
 ### Community 55 - "Dots OCR arch"
 Cohesion: 0.06
 Nodes (56): Per-GPU telemetry snapshot. Every metric is independently optional so a missing , App(), hipfire admin console — Leptos CSR app. Phase 3 milestone: a live GPU panel back, App(), hipfire browser chat console — Leptos CSR app. This stays browser-heavy by desig, FileList, gloo::file, hipfire::admin::types (+48 more)
 
 ### Community 56 - "Qwen2/DotsOcr Architecture"
-Cohesion: 0.10
-Nodes (22): axum, AxumPath, local::llm::registry, model::display::name, chat_index_has_clear_nonembedded_message(), chat_index_serves_embedded_shell(), ChatUiDist, content_type() (+14 more)
+Cohesion: 0.07
+Nodes (48): axum, AxumPath, local::llm::registry, Multipart, Response, chat_index_has_clear_nonembedded_message(), chat_index_serves_embedded_shell(), ChatUiDist (+40 more)
 
 ### Community 57 - "Kernel Dispatch Core"
-Cohesion: 0.40
-Nodes (4): BoundaryEvent, Gpus::wait_boundary(), Stream-event handoff returned by `Gpus::boundary_copy`. When the src device has , Stream-event handoff: makes dst's active stream (or null) wait on the completion
+Cohesion: 0.07
+Nodes (46): is::batchable::la, Llama::forward_scratch_layers(), LlamaBackend::new(), apply_rope_cpu(), apply_rope_cpu_pub(), forward(), forward_early_exit(), forward_logits_gpu() (+38 more)
 
 ### Community 58 - "KLD scoring codecs"
 Cohesion: 0.04
@@ -799,159 +803,159 @@ Nodes (32): Elementwise + activation kernels (silu/gelu/sigmoid/swiglu, scale/ad
 
 ### Community 59 - "Dataset Hash Stability"
 Cohesion: 0.08
-Nodes (64): EscapeKind, ForwardBindings, OpBinding, Irregular/stateful ops that don't map onto a single fused kernel. Each is a type, Pre-resolved binding for one super-op. Pure POD (indices + key + flavor) — no bo, Per-kind handlers the executor calls, implemented ARCH-SIDE (where the live weig, Execute one lowered layer program: a tight, branch-predictable loop over the pre, Deepseek4Bindings<'a> (+56 more)
+Nodes (61): EscapeKind, ForwardBindings, OpBinding, Irregular/stateful ops that don't map onto a single fused kernel. Each is a type, Pre-resolved binding for one super-op. Pure POD (indices + key + flavor) — no bo, Per-kind handlers the executor calls, implemented ARCH-SIDE (where the live weig, Execute one lowered layer program: a tight, branch-predictable loop over the pre, Deepseek4Bindings<'a> (+53 more)
 
 ### Community 60 - "MTP Speculative Proposal"
-Cohesion: 0.03
-Nodes (102): f16::to::f32, DeepseekV4Config::from_hfq(), DflashConfig::from_hfq(), hfq_weight(), Load a matrix tensor as a `WeightTensor` carrying its native dtype. Supported qu, Parse from an HFQ file's metadata JSON. Expects the top-level `dflash` object wr, config_from_hfq(), config_from_safetensors_llama() (+94 more)
+Cohesion: 0.04
+Nodes (85): LlamaConfig, DeepseekV4Config::from_hfq(), hfq_weight(), Load a matrix tensor as a `WeightTensor` carrying its native dtype. Supported qu, config_from_hfq(), config_from_safetensors_llama(), CountingWriter<'_, W>, CountingWriter<'_, W>::flush() (+77 more)
 
 ### Community 61 - "WMMA GEMM kernels"
-Cohesion: 0.05
-Nodes (60): Clone, check_rotation_tag(), dispatch_residual(), dispatch_swiglu_residual(), GemvFamily, GemvFamily::registry(), GemvFamily::resolve(), GemvFamily::rotate() (+52 more)
+Cohesion: 0.06
+Nodes (57): Clone, check_rotation_tag(), dispatch_residual(), dispatch_swiglu_residual(), GemvFamily, GemvFamily::registry(), GemvFamily::rotate(), GemvFamily::run() (+49 more)
 
 ### Community 62 - "GQA Attention"
 Cohesion: 0.05
-Nodes (54): Active spin wait (HSA `LT` condition, HSA_WAIT_STATE_ACTIVE). Lower wakeup laten, Allocate `size` bytes from this pool. Returned pointer lives until `free` or the, Enumerate agents and return the first CPU agent., hsa-bridge: thin Rust wrapper around libhsa-runtime64.so. Purpose: bypass HIP's , Drop, ffi, HsaQueue, ptr (+46 more)
+Nodes (58): Active spin wait (HSA `LT` condition, HSA_WAIT_STATE_ACTIVE). Lower wakeup laten, Allocate `size` bytes from this pool. Returned pointer lives until `free` or the, Enumerate agents and return the first CPU agent., hsa-bridge: thin Rust wrapper around libhsa-runtime64.so. Purpose: bypass HIP's , Drop, ffi, HsaQueue, ptr (+50 more)
 
 ### Community 63 - "Gemma3-VL Backend"
 Cohesion: 0.07
 Nodes (39): Gpu::profile(), Profile all compiled kernels: hardware caps + ISA metadata + occupancy., arch_spec(), ArchSpec, decode_sgprs(), decode_vgprs(), GpuCapability, GpuCapability::detect() (+31 more)
 
 ### Community 64 - "MoE Architecture Support"
-Cohesion: 0.05
-Nodes (56): f32_to_fp16_bits(), quantize_mq2g256_lloyd(), quantize_mq2g256_lloyd_k3(), quantize_mq3g256_lloyd(), quantize_mq4g256_lloyd(), Encode an f32 to IEEE-754 fp16 bits (round-to-nearest-even, no NaN/Inf preservat, MagnumQuant HFQ3-G256-Lloyd: per-block 8-entry fp16 codebook fitted via Lloyd's , MagnumQuant HFQ4-G256-Lloyd: per-block 16-entry fp16 codebook fitted via Lloyd's (+48 more)
+Cohesion: 0.06
+Nodes (52): f32_to_fp16_bits(), quantize_mq2g256_lloyd(), quantize_mq2g256_lloyd_k3(), quantize_mq3g256_lloyd(), quantize_mq4g256_lloyd(), Encode an f32 to IEEE-754 fp16 bits (round-to-nearest-even, no NaN/Inf preservat, MagnumQuant HFQ3-G256-Lloyd: per-block 8-entry fp16 codebook fitted via Lloyd's , MagnumQuant HFQ4-G256-Lloyd: per-block 16-entry fp16 codebook fitted via Lloyd's (+44 more)
 
 ### Community 65 - "GEMM Dispatch Family"
-Cohesion: 0.10
-Nodes (52): barrage_prompt_artifact_rows(), build_gpqa_item(), builtin_barrage_items(), builtin_barrage_materialized_items(), builtin_dataset_entry(), BuiltinBarrageItem, collect_gpqa_csv_paths(), collect_humaneval_jsonl_paths() (+44 more)
+Cohesion: 0.09
+Nodes (60): barrage_prompt_artifact_rows(), build_gpqa_item(), builtin_barrage_items(), builtin_barrage_materialized_items(), builtin_dataset_entry(), BuiltinBarrageItem, collect_gpqa_csv_paths(), collect_humaneval_jsonl_paths() (+52 more)
 
 ### Community 66 - "Superop Execution"
 Cohesion: 0.12
-Nodes (20): decode_base64_png(), decode_png_images_to_rgb_batch(), decode_png_images_to_rgb_batch_accepts_matching_first_pass_images(), decode_png_images_to_rgb_batch_rejects_mismatched_first_pass_images(), DiffusionArgs, DiffusionCommand, DiffusionImportArgs, DiffusionInspectArgs (+12 more)
+Nodes (21): decode_base64_png(), decode_png_images_to_rgb_batch(), decode_png_images_to_rgb_batch_accepts_matching_first_pass_images(), decode_png_images_to_rgb_batch_rejects_mismatched_first_pass_images(), DiffusionArgs, DiffusionCommand, DiffusionImportArgs, DiffusionInspectArgs (+13 more)
 
 ### Community 67 - "Fused Kernel Dispatch"
-Cohesion: 0.07
-Nodes (42): AttentionLayer::from_hfq(), ClipTextEncoder, ClipTextEncoder::encode_tokens(), ClipTextEncoder::encode_tokens_with_pooled(), ClipTextEncoder::encode_tokens_with_pooled_and_runtime_context(), ClipTextEncoder::encode_tokens_with_pooled_and_runtime_options(), ClipTextEncoder::encode_tokens_with_runtime_context(), ClipTextEncoder::encode_tokens_with_runtime_options() (+34 more)
+Cohesion: 0.04
+Nodes (121): AttentionLayer::from_hfq(), BasicTransformerBlock::from_hfq(), GeGluFeedForward::from_hfq(), UnetTextTimeEmbedding::from_hfq(), blend_subseed_latents(), build_sdxl_denoise_conditioning(), checked_bytes(), ClipTextEncoder (+113 more)
 
 ### Community 69 - "GPU Memory Operations"
-Cohesion: 0.08
-Nodes (32): Display, Error, UnsupportedTreeTier::fmt(), Formatter, emit_git_describe(), main(), Emits `VERGEN_GIT_DESCRIBE` (e.g. `v0.3.0-957-g6536c05a`) as a `rustc-env` so th, HsaError (+24 more)
+Cohesion: 0.05
+Nodes (38): Re-export memory copy direction for callers., Error, UnsupportedTreeTier::fmt(), Formatter, emit_git_describe(), main(), Emits `VERGEN_GIT_DESCRIBE` (e.g. `v0.3.0-957-g6536c05a`) as a `rustc-env` so th, launch::counters (+30 more)
 
 ### Community 70 - "Llama Decode Loop"
-Cohesion: 0.08
-Nodes (54): build_dense_prefill_session_batch_execution_plan(), deltanet_state_gate_keys_on_redundancy(), dense_prefill_session_batch_host_pointer_tables(), dense_prefill_session_batch_pointer_table_plan(), dense_prefill_session_batch_pointer_table_shape(), dense_prefill_session_batch_prefix_tokens_positions(), dense_session_fused_prefix_contract_accepts_dense_fp32_state(), dense_session_fused_prefix_contract_rejects_moe_and_quantized_state() (+46 more)
+Cohesion: 0.05
+Nodes (46): alloc_k_v_filtered, new_gpu_asym2, new_gpu_asym3, new_gpu_asym4, new_gpu_fwht4, new_gpu_q8_filtered, KvCache::gen_fwht_signs(), KvCache::gen_givens_angles() (+38 more)
 
 ### Community 71 - "DeepSeek4 State Management"
 Cohesion: 0.05
-Nodes (85): DecodeError, Json, local_llm_registry(), Query, Response, get_admin_diagnostics(), get_admin_logs(), get_admin_stats() (+77 more)
+Nodes (68): Json, local_llm_registry(), Query, get_admin_diagnostics(), get_admin_logs(), get_admin_stats(), get_config_schema(), get_resolved_config() (+60 more)
 
 ### Community 72 - "Web Chat UI"
-Cohesion: 0.05
-Nodes (47): cpu_fwht_256(), f16_to_f32(), gen_fwht_signs(), HfqInTensor, main(), quantize_mq4g256(), read_hfq(), write_hfq() (+39 more)
+Cohesion: 0.07
+Nodes (30): Quantization config parsed from HFQ metadata or HF config.json., File, read::as, QuantConfig, bytes_to_f32(), decode_hfq_tensor(), load_llama_fp32(), load_llama_from_hfq() (+22 more)
 
 ### Community 73 - "Daemon protocol"
 Cohesion: 0.08
-Nodes (47): collect::default::host::profile, Measured host capability profiling for eval reports. This runner complements sta, Function, HipRuntime::module_get_function(), Handle to a specific kernel function within a module., BandwidthRecord, build_profile(), cpu_memcpy_record() (+39 more)
+Nodes (46): collect::default::host::profile, Measured host capability profiling for eval reports. This runner complements sta, Function, HipRuntime::module_get_function(), Handle to a specific kernel function within a module., BandwidthRecord, build_profile(), cpu_memcpy_record() (+38 more)
 
 ### Community 74 - "CLIP Diffusion Encoding"
 Cohesion: 0.05
 Nodes (25): ArchCaps, ArchCaps::is_gfx1010(), ArchCaps::is_gfx1011(), ArchCaps::is_gfx1012(), ArchCaps::is_gfx1030(), ArchCaps::is_gfx1031(), ArchCaps::is_gfx1032(), ArchCaps::is_gfx1100() (+17 more)
 
 ### Community 75 - "LFM2 MoE Configuration"
-Cohesion: 0.06
-Nodes (51): c_int, c_uint, c_void, FFI bindings to libamdhip64.so via dlopen. No link-time dependency — runtime loa, Gpu::invalidate_x_caches_for(), Invalidate any `ensure_*_x` caches whose source pointer matches `dst_ptr`. Must , Library, HipEvent (+43 more)
+Cohesion: 0.05
+Nodes (59): c_int, c_uint, c_void, FFI bindings to libamdhip64.so via dlopen. No link-time dependency — runtime loa, Gpu::invalidate_x_caches_for(), Invalidate any `ensure_*_x` caches whose source pointer matches `dst_ptr`. Must , libloading, Library (+51 more)
 
 ### Community 76 - "DeepSeek V4 forward"
 Cohesion: 0.05
-Nodes (57): Config, Canonical family marker. Reserved in docs/architecture-ids.md (next free after D, `Architecture` trait impl for MiniMax-M2 (arch_id = 10). Thin marker + delegatio, State, Weights, decode_step(), decode_step_body(), decode_step_body_lowered() (+49 more)
+Nodes (59): Config, Canonical family marker. Reserved in docs/architecture-ids.md (next free after D, `Architecture` trait impl for MiniMax-M2 (arch_id = 10). Thin marker + delegatio, State, Weights, decode_step(), decode_step_body(), decode_step_body_lowered() (+51 more)
 
 ### Community 77 - "RCCL collective ops"
 Cohesion: 0.08
 Nodes (47): ep_add_into_residual, Fn, ActFlavor, AttnFlavor, dispatch_super_op(), fk(), LayerProgram, lower_layer() (+39 more)
 
 ### Community 78 - "HFQ tensor loading"
-Cohesion: 0.06
-Nodes (51): Serde types shared between the hipfire server (`hipfire-server`) and the WASM ad, main(), `hipfire-atlas` CLI — corpus inspection, legacy stdout parsing, render-fit, sugg, run(), fs, hipfire::atlas, IntoIterator, serde (+43 more)
+Cohesion: 0.07
+Nodes (39): Kernel Atlas: typed schema + JSONL writer + analysis helpers for the hipfire ben, main(), `hipfire-atlas` CLI — corpus inspection, legacy stdout parsing, render-fit, sugg, run(), fs, hipfire::atlas, parse, cmd_count() (+31 more)
 
 ### Community 79 - "Configuration Paths"
-Cohesion: 0.04
-Nodes (87): hfq, abort_draft_ffn_graph_capture(), begin_draft_ffn_graph_capture(), DflashLayerWeights, draft_ffn_layer(), draft_ffn_layer_maybe_graph(), gemm_dispatch(), hfq_tensor_f32() (+79 more)
+Cohesion: 0.03
+Nodes (90): block_size, hip::bridge, abort_draft_ffn_graph_capture(), begin_draft_ffn_graph_capture(), dflash_subphase_sync(), DflashConfig, DflashConfig::from_hfq(), DflashConfig::kv_dim() (+82 more)
 
 ### Community 80 - "TUI Chat Application"
 Cohesion: 0.12
 Nodes (15): make_caps(), ArchCaps::new(), cdna3_942(), default_flags(), force_generic_disables_arch_getters_but_keeps_derived_caps(), gcn5(), gfx1103_is_rdna3(), gfx1150_is_rdna3_and_rdna3p5() (+7 more)
 
 ### Community 81 - "Architecture Capabilities"
-Cohesion: 0.04
-Nodes (79): ext, hipfire::runtime, apply_eviction_retain_to_draft(), argmax_u32_with_margin(), compact_target_hidden_host(), compact_target_hidden_host_empty_mask_is_noop(), compact_target_hidden_host_keeps_selected_rows(), compare_delta_net_layer_to_snapshot() (+71 more)
+Cohesion: 0.02
+Nodes (176): assemble_into, delta_layer_idx, DeepSeek V4 compressor batched ring-buffer write. Single launch scatters B posit, Path 2 unscatter combine for gate_up. Reads Y_grouped[m_total × 2*mi] and writes, hipfire::runtime, replay_gdn, slot, DflashWeights (+168 more)
 
 ### Community 82 - "PFlash Scoring"
 Cohesion: 0.12
-Nodes (24): decode_step(), decode_step_capture(), decode_step_with_graph(), Decode one token; returns the full logits vector. Routes to the hipGraph capture, decode_step_inner(), graph_enabled(), Lfm2HiddenCapture, Lfm2HiddenCapture::append_single_from_all_layers() (+16 more)
+Nodes (24): decode_step(), decode_step_capture(), decode_step_with_graph(), Decode one token; returns the full logits vector. Routes to the hipGraph capture, decode_step_inner(), hidden_capture_interleaves_positions_then_layers(), Lfm2HiddenCapture, Lfm2HiddenCapture::append_interleaved_chunk() (+16 more)
 
 ### Community 83 - "Diffusion operations"
-Cohesion: 0.04
-Nodes (81): main(), Path to the argon2id hash of the `/admin` console password, written by `hipfire , Read the local admin bearer secret if it exists. Read-only: never creates the fi, Load the stored argon2id password hash, if a password has been set., Shared CLI/server configuration and local filesystem paths., admin_password_hash_round_trips(), admin_password_path(), admin_secret_path() (+73 more)
+Cohesion: 0.05
+Nodes (68): Path to the argon2id hash of the `/admin` console password, written by `hipfire , Read the local admin bearer secret if it exists. Read-only: never creates the fi, Load the stored argon2id password hash, if a password has been set., Shared CLI/server configuration and local filesystem paths., admin_password_hash_round_trips(), admin_password_path(), admin_secret_path(), ConfigDiagnostic (+60 more)
 
 ### Community 84 - "GGUF input reading"
-Cohesion: 0.06
-Nodes (63): new_for_config, DaemonMoeRouterHistogramGuard, DaemonMoeRouterHistogramGuard::start(), DaemonMoeRouterHistogramGuard::take(), alias_raw_tensor(), default_state_quant(), deltanet_state_fp32_below(), deltanet_state_redundancy() (+55 more)
+Cohesion: 0.08
+Nodes (49): alias_raw_tensor(), bf16_bytes_to_f32(), bf16_native_weight_arch(), bf16_weight_load_mode_from_env(), Bf16WeightLoadMode, gpu_slab_load_enabled(), hfq_plain_tensor_as_f32(), load_any_as_f32() (+41 more)
 
 ### Community 85 - "Qwen2 Model Backend"
-Cohesion: 0.06
-Nodes (47): DeepSeek V4 fused MoE down GEMV with scaled residual add. Atomically accumulates, DeepSeek V4 indexer-extended attention K/V gather. Reads from `main_kv_cache` [N, DeepSeek V4 hash-routed MoE: GPU-side tid2eid lookup + score gather + softmax-no, Fused SwiGLU + FWHT rotation. Reads gate/up, computes silu(gate[k])*up[k] on the, Fused GEMM + bias: Y[N,M] = X[N,K] @ W_f16[M,K]^T + bias[M]. Replaces gemm_f16 +, y = A * x (matrix-vector multiply, A is [M, K], x is [K], y is [M]), Generic GEMV F16×F16 → F32: `w` [M,K], `x` [K], `y` [M]. gfx1103 wave32., Generic GEMV F16×F16 → F16: `w` [M,K], `x` [K], `y` [M]. gfx1103 wave32. (+39 more)
+Cohesion: 0.11
+Nodes (25): DeepSeek V4 fused MoE down GEMV with scaled residual add. Atomically accumulates, DeepSeek V4 indexer-extended attention K/V gather. Reads from `main_kv_cache` [N, Fused SwiGLU + FWHT rotation. Reads gate/up, computes silu(gate[k])*up[k] on the, Fused GEMM + bias: Y[N,M] = X[N,K] @ W_f16[M,K]^T + bias[M]. Replaces gemm_f16 +, y = A * x (matrix-vector multiply, A is [M, K], x is [K], y is [M]), Generic GEMV F16×F16 → F32: `w` [M,K], `x` [K], `y` [M]. gfx1103 wave32., Generic GEMV F16×F16 → F16: `w` [M,K], `x` [K], `y` [M]. gfx1103 wave32., Generic GEMV BF16×BF16 → F32: `w` [M,K], `x` [K], `y` [M]. gfx1103 wave32. (+17 more)
 
 ### Community 86 - "GGUF file parsing"
 Cohesion: 0.07
 Nodes (41): Resolved model chat template plus the source selected by the load-time precedenc, ChatML prompt framing — single source of truth for assembling the token sequence, ToolCall, assistant_turn_fingerprint(), assistant_turn_fingerprint_matches_prompt_history_identity_policy(), canonical_json(), ChatTemplateSource, closed_think_falls_back_to_plain_when_tokens_missing() (+33 more)
 
 ### Community 87 - "HFQ metadata encoding"
-Cohesion: 0.06
-Nodes (59): HFQ4-G128 batched GEMV with fused per-token sigmoid-scaled residual. y_batch[tok, ensure_compressed_logits, MtpComposeTreeState::new(), detect_bundled_mtp_offset(), load_mtp_head(), load_mtp_head_at_offset(), load_mtp_head_bundled(), load_mtp_moe_ffn() (+51 more)
+Cohesion: 0.04
+Nodes (81): ensure_compressed_logits, free_gpu, new_for_slot_with_kv_mode, next_token, MtpComposeState::new(), Allocate per-generation MTP buffers. Caller still allocates and owns dflash-side, detect_bundled_mtp_offset(), embed_lookup_into() (+73 more)
 
 ### Community 88 - "Layer mixer profiles"
 Cohesion: 0.07
-Nodes (44): Debug, memmap2, NamedTempFile, bf16_to_f32(), compact_hessian_bytes(), f32_to_bf16_bits(), HessianDtype, HessianDtype::size_bytes() (+36 more)
+Nodes (41): Debug, memmap2, NamedTempFile, bf16_to_f32(), compact_hessian_bytes(), f32_to_bf16_bits(), HessianDtype, HessianDtype::size_bytes() (+33 more)
 
 ### Community 89 - "HTTP authentication"
-Cohesion: 0.11
-Nodes (24): args, run(), ServeArgs, config::schema, find::model::in, ConfigState::load(), ConfigState::probe_host(), default_to_string() (+16 more)
+Cohesion: 0.14
+Nodes (20): config::schema, find::model::in, ConfigState::load(), default_to_string(), defaults(), load_remote_resolved(), load_remote_schema(), probe_host_for() (+12 more)
 
 ### Community 90 - "Batch management"
-Cohesion: 0.07
-Nodes (31): hashmap, dummy_generate_delay_ms(), dummy_prefill_delay_ms(), DummyModelState, DummyModelState::consume_prefill_session(), DummyModelState::generate(), DummyModelState::prompt_token_count(), DummyModelState::release_sessions() (+23 more)
+Cohesion: 0.11
+Nodes (23): dummy_generate_delay_ms(), dummy_prefill_delay_ms(), DummyModelState, DummyModelState::consume_prefill_session(), DummyModelState::generate(), DummyModelState::prompt_token_count(), DummyModelState::release_sessions(), DummyModelState::reset() (+15 more)
 
 ### Community 91 - "Qwen3.5 Decode Batch"
 Cohesion: 0.06
 Nodes (21): extract_first_json_object(), Gemma4NativeParser, Gemma4NativeParser::parse(), HermesJsonParser, HermesJsonParser::parse(), parse_one_hermes(), parse_one_qwen35_xml(), ParsedToolCall (+13 more)
 
 ### Community 92 - "Tool Call Parsing"
-Cohesion: 0.09
-Nodes (37): AdmissionEvidence, Evidence, provenance, comparison, and admission artifact assembly. Builds the ru, AdmissionArtifact, AdmissionEvidence, EvidenceAdmissionEvidence, Into, artifact_index_context(), artifact_index_entry() (+29 more)
+Cohesion: 0.08
+Nodes (41): AdmissionArtifact, AdmissionEvidence, Evidence, provenance, comparison, and admission artifact assembly. Builds the ru, AdmissionArtifact, AdmissionEvidence, EvidenceAdmissionEvidence, Into, admission_artifact_value() (+33 more)
 
 ### Community 93 - "Host Performance Profiling"
 Cohesion: 0.08
-Nodes (43): Ask the daemon to abort a running request. This is fire-and-forget by protocol d, Send `ping` and wait for `pong`., Send `kld_eval` (build a KLD reference and/or score the resident model against o, Send `generate` and collect all tokens. Returns (text, done)., controlled_stream_can_stop_without_waiting_for_done(), DaemonEngine, DaemonEngine::abort(), DaemonEngine::collect() (+35 more)
+Nodes (42): Ask the daemon to abort a running request. This is fire-and-forget by protocol d, Send `ping` and wait for `pong`., Send `kld_eval` (build a KLD reference and/or score the resident model against o, Send `generate` and collect all tokens. Returns (text, done)., F, controlled_stream_can_stop_without_waiting_for_done(), DaemonEngine, DaemonEngine::abort() (+34 more)
 
 ### Community 94 - "GEMM kernels"
 Cohesion: 0.06
 Nodes (35): Gpu, Gpu::gemm_bf16_bf16_wmma(), Gpu::gemm_bf16_x_bf16_wmma(), Gpu::gemm_bf16_x_bf16_wmma_labeled(), Gpu::gemm_f16(), Gpu::gemm_f16_batched_lmhead(), Gpu::gemm_f16_bias(), Gpu::gemm_f16_f16_wmma() (+27 more)
 
 ### Community 95 - "Backend Selection Oracle"
-Cohesion: 0.06
-Nodes (44): accept_len, Alpha gate compute: alpha[i] = softplus(alpha[i] + dt_bias[i]) * (-exp(a_log[i]), Fused `y[i] += c * x[i]` with a CPU-supplied scalar. Merges the (scale_f32 + add, Fused `y[i] += c_buf[0] * x[i]` where `c_buf` is a 1-element GPU tensor. Used by, DeepSeek V4 SwiGLU with swiglu_limit clamp. out[i] = silu(min(gate[i], L)) * cla, Phase 3 — Apply α scaling to the 24-element HC control vector after `hc_compute_, Phase A Stage A — AWQ-aware variant of fused_rmsnorm_rotate_mq. After computing , Phase A Stage A — F2 AWQ-aware variant of `fused_silu_mul_rotate_mq`. After comp (+36 more)
+Cohesion: 0.05
+Nodes (51): accept_len, current, Alpha gate compute: alpha[i] = softplus(alpha[i] + dt_bias[i]) * (-exp(a_log[i]), Fused `y[i] += c * x[i]` with a CPU-supplied scalar. Merges the (scale_f32 + add, Fused `y[i] += c_buf[0] * x[i]` where `c_buf` is a 1-element GPU tensor. Used by, DeepSeek V4 SwiGLU with swiglu_limit clamp. out[i] = silu(min(gate[i], L)) * cla, Phase 3 — Apply α scaling to the 24-element HC control vector after `hc_compute_, Phase A Stage A — AWQ-aware variant of fused_rmsnorm_rotate_mq. After computing  (+43 more)
 
 ### Community 96 - "DeepSeek4 Batched Ops"
-Cohesion: 0.07
-Nodes (50): decode_step(), decode_step_body_lowered(), decode_step_with_graph(), forward_ep(), forward_prefill_batch(), `HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS` — cap on the compressed-KV scan length., DeepseekV4LayerWeights::new_empty(), DeepseekV4State (+42 more)
+Cohesion: 0.09
+Nodes (26): attention, Generic kernel-dispatch family accessors and dispatch-type re-exports. Process-g, MoeFamily, MoeFamily::registry(), MoeFamily::run_bias_aware(), MoeFamily::run_bias_aware_prefill(), MoeFamily::run_prefill(), Run a single-token deepseek4 bias-aware MoE decode step (k=6, MQ2-Lloyd routed e (+18 more)
 
 ### Community 97 - "Hessian Quantization IO"
-Cohesion: 0.05
-Nodes (134): Like [`with_rocm_gpu`], but also exposes the device weight cache so weight-beari, FnOnce, add_channel_bias_nchw_hip_on_gpu(), add_channel_bias_nchw_resident(), alloc_resident_f32(), bsc_to_nchw_hip_on_gpu(), bsc_to_nchw_resident(), cfg_guidance_hip_on_gpu() (+126 more)
+Cohesion: 0.04
+Nodes (141): Like [`with_rocm_gpu`], but also exposes the device weight cache so weight-beari, FnOnce, add_channel_bias_nchw_hip_on_gpu(), add_channel_bias_nchw_resident(), alloc_resident_f32(), bsc_to_nchw_hip_on_gpu(), bsc_to_nchw_resident(), cfg_guidance_hip_on_gpu() (+133 more)
 
 ### Community 98 - "GPU Memory Management"
-Cohesion: 0.09
-Nodes (24): Typed LFM2.5-MoE shape constants., Lfm2MoeConfig, Lfm2MoeConfig::from_config_value(), Lfm2MoeConfig::from_hfq(), Lfm2MoeConfig::is_dense_ffn(), Lfm2MoeConfig::kv_dim(), Lfm2MoeConfig::mixer(), Lfm2MoeConfig::num_attention_layers() (+16 more)
+Cohesion: 0.10
+Nodes (22): Typed LFM2.5-MoE shape constants., Lfm2MoeConfig, Lfm2MoeConfig::from_config_value(), Lfm2MoeConfig::from_hfq(), Lfm2MoeConfig::is_dense_ffn(), Lfm2MoeConfig::kv_dim(), Lfm2MoeConfig::mixer(), Lfm2MoeConfig::num_attention_layers() (+14 more)
 
 ### Community 99 - "Attractor Token Samplers"
 Cohesion: 0.06
@@ -959,23 +963,23 @@ Nodes (34): Serde shape of the relevant `config.json` keys., `nemotron_h` archit
 
 ### Community 100 - "Chat Attachment Handling"
 Cohesion: 0.06
-Nodes (41): probe(), Truncate the lockfile and write a single holder line (e.g. a pid or a `pid host , The holder line currently in the lockfile, if any (trimmed)., Open (creating if needed, mode `0600`, parent dirs created) the lockfile at `pat, Reusable `flock(2)` file-lock primitive. The single home for hipfire's `flock`-b, Try to take `LOCK_EX | LOCK_NB`. `Ok(true)` = acquired (the guard now holds it),, Duration, lock_blocking (+33 more)
+Nodes (38): Bundle a trunk MQ4 HFQ file with an MTP HFQ sidecar into a single `mq4+mtp.hfq` , Output layout: Design notes: - The trunk loader (`HfqFile::open`) reads only as , probe(), Truncate the lockfile and write a single holder line (e.g. a pid or a `pid host , The holder line currently in the lockfile, if any (trimmed)., Open (creating if needed, mode `0600`, parent dirs created) the lockfile at `pat, Reusable `flock(2)` file-lock primitive. The single home for hipfire's `flock`-b, Try to take `LOCK_EX | LOCK_NB`. `Ok(true)` = acquired (the guard now holds it), (+30 more)
 
 ### Community 101 - "Expert Resident Cache"
 Cohesion: 0.05
-Nodes (45): Gpu, Gpu::gemm_hfp4g32_residual(), Gpu::gemm_hfp4g32_residual_wmma(), Gpu::gemm_iu4_i32_wmma(), Gpu::gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync(), Gpu::gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(), Gpu::gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2(), Gpu::gemm_mq3g256_lloyd_residual_wmma() (+37 more)
+Nodes (47): Gpu, Gpu::gemm_hfp4g32_moe_grouped_wmma(), Gpu::gemm_hfp4g32_residual(), Gpu::gemm_hfp4g32_residual_wmma(), Gpu::gemm_iu4_i32_wmma(), Gpu::gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload(), Gpu::gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(), Gpu::gemm_mq3g256_lloyd_residual_wmma() (+39 more)
 
 ### Community 102 - "KV Cache Transforms"
 Cohesion: 0.12
 Nodes (39): asym2_fwht(), asym2_givens(), asym3_fwht(), asym3_givens(), asym4_fwht(), asym4_givens(), batched_asym2_causal(), batched_asym2_fwht_tree_rejected() (+31 more)
 
 ### Community 103 - "DDTree Heap Structure"
-Cohesion: 0.05
-Nodes (49): config_from_metadata_json, Config, `Architecture` trait impl for the Qwen2 dense text decoder. The five required tr, Zero-sized type marker for the Qwen2 arch., arch_id = 7 for the Qwen2 family. Note: `arch_id = 1` is nominally "plain Qwen3/, State, Weights, hipfire-arch-qwen2: plain Qwen2 dense text decoder. Implements [`hipfire_runtime (+41 more)
+Cohesion: 0.07
+Nodes (34): Config, `Architecture` bring-up triple for Gemma3 (`arch_id = 12`) and the `Gemma3Backen, State, Weights, Config, `Architecture` trait impl for the Qwen2 dense text decoder. The five required tr, Zero-sized type marker for the Qwen2 arch., arch_id = 7 for the Qwen2 family. Note: `arch_id = 1` is nominally "plain Qwen3/ (+26 more)
 
 ### Community 104 - "RoPE kernels"
 Cohesion: 0.05
-Nodes (67): mtp_head, new_for_slot, MtpKvMode, The MTP head has a single attention block, so its KV cache is one per-layer K + , abort_mtp_proposal_graph_capture(), assemble_greedy_accept_from_gpu_result(), begin_mtp_proposal_graph_capture(), build_trunk_spine_verify_tokens() (+59 more)
+Nodes (66): mtp_head, new_for_slot, abort_mtp_proposal_graph_capture(), assemble_greedy_accept_from_gpu_result(), begin_mtp_proposal_graph_capture(), build_trunk_spine_verify_tokens(), default_mtp_p_min(), destroy_mtp_proposal_graph() (+58 more)
 
 ### Community 105 - "DeepSeek V4 bindings"
 Cohesion: 0.15
@@ -987,19 +991,19 @@ Nodes (40): allowed_continuations, is_free, is_token_allowed, Matcher, Matcher::
 
 ### Community 107 - "LFM2 MoE loading"
 Cohesion: 0.11
-Nodes (33): AsRef, Open a fresh JSONL file for writing, truncating any existing content. Use this w, truncate_jsonl(), compare_runs(), detail_combines_summary_recent_events_and_errors(), event_reader_preserves_unknown_events_and_malformed_lines(), infer_stale(), list_runs_handles_empty_missing_and_sorts_active_first() (+25 more)
+Nodes (31): AsRef, compare_runs(), detail_combines_summary_recent_events_and_errors(), event_reader_preserves_unknown_events_and_malformed_lines(), infer_stale(), list_runs_handles_empty_missing_and_sorts_active_first(), list_training_runs(), load_training_run_detail() (+23 more)
 
 ### Community 108 - "Environment documentation"
 Cohesion: 0.10
-Nodes (28): clap, Stable hashing primitives shared by model identity and evidence contracts., load::config::bundle, command_digest(), file_hash(), Fnv64, Fnv64::finish(), Fnv64::new() (+20 more)
+Nodes (27): clap, Stable hashing primitives shared by model identity and evidence contracts., load::config::bundle, command_digest(), file_hash(), Fnv64, Fnv64::finish(), Fnv64::new() (+19 more)
 
 ### Community 109 - "Training run management"
 Cohesion: 0.06
-Nodes (12): codec, hipfire-kld — the pure, GPU-independent KLD scoring core. This crate is the sing, f32, hfkseq, math, meta, score_position, kld_tile_topk_lse_f32() (+4 more)
+Nodes (11): hipfire-kld — the pure, GPU-independent KLD scoring core. This crate is the sing, f32, hfkseq, math, meta, score_position, kld_tile_topk_lse_f32(), less_pair() (+3 more)
 
 ### Community 110 - "Coherence detection"
-Cohesion: 0.11
-Nodes (38): check_file(), collapse_ws(), collect_env_data(), collect_existing_descs(), comment_re(), coverage_gaps(), doc_only_entries(), env_read_re() (+30 more)
+Cohesion: 0.05
+Nodes (63): check_file(), collapse_ws(), collect_env_data(), collect_existing_descs(), comment_re(), coverage_gaps(), doc_only_entries(), env_read_re() (+55 more)
 
 ### Community 111 - "Error Versioning"
 Cohesion: 0.07
@@ -1007,19 +1011,19 @@ Nodes (36): Config, Pick an unused `arch_id` for a real arch — reserve one in 
 
 ### Community 112 - "Architecture implementation"
 Cohesion: 0.09
-Nodes (37): advanced_k_fwht3_floor(), advanced_v_only_floor_has_no_k_step(), balanced_pattern_shape_and_thresholds(), cap_is_min_of_two_buffers_and_v_bound_at_start(), cap_min(), conservative_only_v_to_lloyd4(), k_buf_bytes_per_layer(), KMode (+29 more)
+Nodes (36): advanced_k_fwht3_floor(), advanced_v_only_floor_has_no_k_step(), balanced_pattern_shape_and_thresholds(), cap_is_min_of_two_buffers_and_v_bound_at_start(), cap_min(), conservative_only_v_to_lloyd4(), k_buf_bytes_per_layer(), KMode (+28 more)
 
 ### Community 113 - "Flock File Locking"
 Cohesion: 0.10
-Nodes (33): Minimal GGUF file parser. Reads header, metadata, tensor info. Memory-maps the f, GgmlType, GgmlType::block_bytes(), GgmlType::block_size(), GgmlType::from_u32(), GgmlType::tensor_bytes(), GgufFile, GgufFile::find_tensor() (+25 more)
+Nodes (34): Minimal GGUF file parser. Reads header, metadata, tensor info. Memory-maps the f, Mmap, GgmlType, GgmlType::block_bytes(), GgmlType::block_size(), GgmlType::from_u32(), GgmlType::tensor_bytes(), GgufFile (+26 more)
 
 ### Community 114 - "ChatML Prompt Framing"
 Cohesion: 0.12
 Nodes (39): build_cached_history, Build the prompt token sequence for a single-turn request., render_messages, build_cached_history_jinja(), build_multi_turn_two_turn_history(), build_with_user_tokens_matches_build_when_tokens_match_string(), ChatFrame<'a>, ChatFrame<'a>::build() (+31 more)
 
 ### Community 115 - "HFQ gemm kernels"
-Cohesion: 0.04
-Nodes (90): arch, build_rope_2d_tables, clip_normalise, Config, `Architecture` trait impl for dots.ocr (Qwen2-VL family). Single-arch pattern — , Zero-sized type marker for the dots.ocr arch., State, Weights (+82 more)
+Cohesion: 0.05
+Nodes (52): Config, `Architecture` trait impl for dots.ocr (Qwen2-VL family). Single-arch pattern — , Zero-sized type marker for the dots.ocr arch., State, Weights, DotsOcr, DotsOcr::arch_id(), DotsOcr::config_from_hfq() (+44 more)
 
 ### Community 116 - "PARO gemv kernels"
 Cohesion: 0.08
@@ -1038,12 +1042,12 @@ Cohesion: 0.12
 Nodes (33): Args, bf16_to_f32(), cpu_fwht_256(), dtype_size(), f16_to_f32(), f32_slice_to_f32_bytes(), f32_to_f16(), find_safetensors() (+25 more)
 
 ### Community 120 - "Fixture checking"
-Cohesion: 0.13
-Nodes (35): routes, batch_error_jsonl(), batch_json(), batch_json_includes_openai_counts(), BatchEntry, batches_state_max(), BatchValidationError, cancel_batch() (+27 more)
+Cohesion: 0.15
+Nodes (27): routes, batch_error_jsonl(), batch_json(), batch_json_includes_openai_counts(), BatchEntry, batches_state_max(), BatchValidationError, CreateBatchRequest (+19 more)
 
 ### Community 121 - "GEMV Execution Family"
-Cohesion: 0.01
-Nodes (288): forward_prefill_batch(), Gpu, Gpu::embedding_lookup(), Gpu::embedding_lookup_f32_batched(), Gpu::embedding_lookup_hfq4g128(), Gpu::embedding_lookup_hfq4g256(), Gpu::embedding_lookup_hfq4g256_batched(), Gpu::embedding_lookup_q4k() (+280 more)
+Cohesion: 0.02
+Nodes (180): ext, generic::warn, attn_mixer_block(), capture_named_activation(), conv_mixer_block(), decode_step_layers_and_head(), dense_gate_up_block(), download_i32_tensor() (+172 more)
 
 ### Community 122 - "MiniMax-M2 Architecture"
 Cohesion: 0.07
@@ -1051,7 +1055,7 @@ Nodes (42): btreemap, crate, serde::json, mock_bool_metric(), mock_metric(), Moc
 
 ### Community 123 - "LFM2 MoE Prefill"
 Cohesion: 0.09
-Nodes (31): E, libloading, rank, NcclComm, Number of communicators (== n_devices passed to `init_all`)., RCCL runtime version (NCCL_VERSION_CODE format: major*1000 + minor*100 + patch)., Translate a `ncclResult_t` to a human-readable string via librccl., Begin a group of collective calls (typical TP usage: wrap N per-rank `all_reduce (+23 more)
+Nodes (31): E, rank, NcclComm, Number of communicators (== n_devices passed to `init_all`)., RCCL runtime version (NCCL_VERSION_CODE format: major*1000 + minor*100 + patch)., Translate a `ncclResult_t` to a human-readable string via librccl., Begin a group of collective calls (typical TP usage: wrap N per-rank `all_reduce, Convenience: run `f` inside a `group_start`/`group_end` pair. If `f` returns Err (+23 more)
 
 ### Community 124 - "GPU casting kernels"
 Cohesion: 0.09
@@ -1059,31 +1063,31 @@ Nodes (33): KernargBlob, KernargBlob::align_to(), KernargBlob::as_bytes(), Kerna
 
 ### Community 125 - "Kernel arguments"
 Cohesion: 0.12
-Nodes (30): Mamba2BlockGpu::new(), Mamba2BlockGpu::new_with_state_quant(), Mamba2StateQuant, Mamba2StateQuant::from_env(), Upload `w` (host f32 slices) and allocate state + scratch. State starts at zero , mamba2_block_decode_step(), Mamba2BlockState, Mamba2BlockState::zeros() (+22 more)
+Nodes (29): Mamba2BlockGpu::new(), Mamba2BlockGpu::new_with_state_quant(), Upload `w` (host f32 slices) and allocate state + scratch. State starts at zero , mamba2_block_decode_step(), Mamba2BlockState, Mamba2BlockState::zeros(), Mamba2BlockWeights, Mamba2Dims (+21 more)
 
 ### Community 126 - "Dispatch coverage tests"
-Cohesion: 0.08
-Nodes (52): RgbaImage, annotate_sdapi_images(), apply_sdapi_inpaint_full_res_output(), build_sdapi_image_grid(), decode_sd_init_image(), decode_sd_init_images(), find_png_iend_offset(), img2img_image_fill_uses_webui_default_and_respects_original_mode() (+44 more)
+Cohesion: 0.05
+Nodes (92): RgbaImage, annotate_highres_txt2img_info(), apply_sdapi_inpaint_full_res_output(), aspect_scaled_dimension(), batch_size_for_body(), build_sdapi_image_grid(), cached_diffusion_pipeline(), decode_sd_init_image() (+84 more)
 
 ### Community 127 - "Daemon Control Interface"
 Cohesion: 0.06
 Nodes (33): refcell, attention_f32_kv_bytes(), attention_q8_0_kv_bytes(), conv1d_silu_bytes(), elementwise1_bytes(), elementwise_bytes(), gated_delta_net_f32_bytes(), gated_norm_bytes() (+25 more)
 
 ### Community 128 - "DeepSeek4 Decode State"
-Cohesion: 0.11
-Nodes (41): build_ddtree_tree(), build_ddtree_tree_with_cutoff(), DdBranch, DdNode, DdTree, DdTree::num_nodes(), deeper_tree_maintains_heap_order(), empty_tree_has_root_only_visibility() (+33 more)
+Cohesion: 0.14
+Nodes (33): build_ddtree_tree(), DdBranch, deeper_tree_maintains_heap_order(), empty_tree_has_root_only_visibility(), enumerate_branches(), enumerate_branches_chain_only_tree_has_no_branches(), enumerate_branches_chains_descend_smallest_index_first(), enumerate_branches_empty_tree_returns_empty() (+25 more)
 
 ### Community 129 - "Operation profiling"
-Cohesion: 0.20
-Nodes (17): ids(), PrefillBatchSelection, PreviewPrefillBatchInput, PriorityPrefillScheduler, PriorityPrefillScheduler::enqueue(), PriorityPrefillScheduler::enqueue_if_absent(), PriorityPrefillScheduler::has_queued(), PriorityPrefillScheduler::has_queued_higher_priority() (+9 more)
+Cohesion: 0.18
+Nodes (22): PrefillBatchSelection, PreviewPrefillBatchInput, PriorityPrefillScheduler, PriorityPrefillScheduler::aging_ms(), PriorityPrefillScheduler::enqueue(), PriorityPrefillScheduler::enqueue_if_absent(), PriorityPrefillScheduler::has_queued(), PriorityPrefillScheduler::has_queued_higher_priority() (+14 more)
 
 ### Community 130 - "Loop Guard Policy"
 Cohesion: 0.08
-Nodes (37): chat::output::filter, decode::vl::frames, encode_image, engine, events, evidence, generate::arch, generate::lfm2moe (+29 more)
+Nodes (34): chat::output::filter, decode::vl::frames, encode_image, engine, evidence, generate::arch, generate::lfm2moe, hipfire::arch::qwen35::vl (+26 more)
 
 ### Community 131 - "Serving Architecture"
-Cohesion: 0.05
-Nodes (69): compact::cold::kv, conv, quantize_tile(), kv_dim, kvarn, attn(), attn_slots(), cold_tier_reconstruction_preserves_attention() (+61 more)
+Cohesion: 0.12
+Nodes (32): conv, quantize_tile(), Balanced, balancing_beats_naive_per_row_4bit(), cos_sim(), dequantize_tile(), imbalance(), kvarn_tile_record_roundtrips() (+24 more)
 
 ### Community 132 - "MQ4 Draft Quantization"
 Cohesion: 0.22
@@ -1095,15 +1099,15 @@ Nodes (26): NPU module opt-in contracts. This crate intentionally does not own X
 
 ### Community 134 - "DFlash conversion"
 Cohesion: 0.03
-Nodes (72): batch_size, Gpu, Gpu::kv_cache_write(), Gpu::kv_cache_write_asym4_fused(), Gpu::kv_cache_write_f32_batched(), Gpu::kv_cache_write_f32_routed_batched(), Gpu::kv_cache_write_fwht3_fused(), Gpu::kv_cache_write_hfq4() (+64 more)
+Nodes (64): batch_size, Gpu, Gpu::kv_cache_write(), Gpu::kv_cache_write_f32_batched(), Gpu::kv_cache_write_f32_routed_batched(), Gpu::kv_cache_write_hfq4(), Gpu::kv_cache_write_hfq8(), Gpu::kv_cache_write_int8() (+56 more)
 
 ### Community 135 - "Response handling"
-Cohesion: 0.06
-Nodes (33): MiniMax-M2 forward pass (free functions — hot-path static dispatch). Per-layer p, MoE, attention_keys_resolve_on_fleet_archs(), confirmed_oproj_dtypes_have_a_plan(), f16_full_attention_rejected_on_non_wmma_archs(), fleet_dtypes_resolve_on_every_target_arch(), fleet_ops_have_a_dispatch_plan(), full_attention_keys_resolve_on_fleet_archs() (+25 more)
+Cohesion: 0.07
+Nodes (31): attention_keys_resolve_on_fleet_archs(), confirmed_oproj_dtypes_have_a_plan(), f16_full_attention_rejected_on_non_wmma_archs(), fleet_dtypes_resolve_on_every_target_arch(), fleet_ops_have_a_dispatch_plan(), full_attention_keys_resolve_on_fleet_archs(), fused_qkv_keys_resolve_on_fleet_archs(), has_dispatch_plan() (+23 more)
 
 ### Community 136 - "KVARN quantization"
-Cohesion: 0.12
-Nodes (29): benchmark_aggregate_metrics(), benchmark_aggregate_rows(), benchmark_group_key(), benchmark_metric_excluded(), coherence_shared_model_load_battery(), coherence_shared_model_load_enabled(), daemon_executor_available_for(), daemon_shared_model_load_battery() (+21 more)
+Cohesion: 0.11
+Nodes (30): benchmark_aggregate_metrics(), benchmark_aggregate_rows(), benchmark_group_key(), benchmark_metric_excluded(), coherence_shared_model_load_battery(), coherence_shared_model_load_enabled(), daemon_executor_available_for(), daemon_shared_model_load_battery() (+22 more)
 
 ### Community 137 - "Nemotron Decode Backend"
 Cohesion: 0.11
@@ -1114,40 +1118,40 @@ Cohesion: 0.16
 Nodes (25): collect_artifacts_candidates_resolve_the_example_path(), CollectArtifactsArgs, eval_candidates_include_env_release_and_install_locations(), EvalArgs, host_profile_candidates_include_debug_binary(), HostProfileArgs, is_help(), RepackArgs (+17 more)
 
 ### Community 139 - "Weight paging"
-Cohesion: 0.07
-Nodes (47): Per-side patch count: `image_size / patch_size` (896/14 = 64)., [`SigLipConfig`] (the vision tower) and [`Gemma3VlConfig`] (vision + projector +, preprocess_image(), preprocess_image_bytes(), Load a gemma3 multimodal model from `hfq`: text decoder (under `language_model.`, fast::image::resize, hipfire::arch::gemma3, backend_cfg() (+39 more)
+Cohesion: 0.05
+Nodes (70): Per-side patch count: `image_size / patch_size` (896/14 = 64)., [`SigLipConfig`] (the vision tower) and [`Gemma3VlConfig`] (vision + projector +, preprocess_image(), preprocess_image_bytes(), Load a gemma3 multimodal model from `hfq`: text decoder (under `language_model.`, f16::to::f32, fast::image::resize, hipfire::arch::gemma3 (+62 more)
 
 ### Community 140 - "HSA FFI bindings"
-Cohesion: 0.09
-Nodes (36): BufReader, Child, ChildStdout, Shared coherence detector policy and report serialization helpers., F, hipfire::detect, arch_host(), build_detector_bank() (+28 more)
+Cohesion: 0.13
+Nodes (28): Shared coherence detector policy and report serialization helpers., arch_host(), build_detector_bank(), coherence_output_from_stats(), CoherenceDaemonSession, CoherenceDaemonSession::drop(), CoherenceDaemonSession::load(), CoherenceDaemonSession::reset() (+20 more)
 
 ### Community 141 - "MTP tree spec-decode"
 Cohesion: 0.16
 Nodes (23): diff_stats_json(), attention_wo_invocation_records_projection_shape_and_gate_state(), dense_ffn_evidence_records_backend_module_drift_and_fallback(), attention_wo_invocation_records_projection_shape_and_gate_state(), attention_wo_residual_invocation_from_shape(), backend_selection_json(), BackendSelection, BackendSelection::new() (+15 more)
 
 ### Community 142 - "Admission Evidence"
-Cohesion: 0.05
-Nodes (38): Probe, One detector. Consumes `Event`s, produces a final `Verdict` once the stream fini, Holds a slice of detectors and dispatches events to all of them., Severity of a detector's finding., A detector's verdict., AttractorFirst128, AttractorFirst128::finalize(), AttractorFirst128::observe() (+30 more)
+Cohesion: 0.08
+Nodes (23): A detector's verdict., d, DeepSeek V4 Compressor softmax-weighted pool. Compresses `T` window positions of, Phase 3 — Input mapping: x_in[d] = sum_s(A[s] * streams[s, d]). A is sigmoid-bou, Phase 3 — Mix 4 residual streams via gating matrix + transform output. `x_out[s,, s, AttractorFirst128, AttractorFirst128::finalize() (+15 more)
 
 ### Community 143 - "Admin Console UI"
-Cohesion: 0.13
-Nodes (25): cors, CorsLayer, Router, serviceext, build_router(), clear_diffusion_pipeline_cache(), clear_loaded_model_state(), cors_layer() (+17 more)
+Cohesion: 0.12
+Nodes (27): cors, CorsLayer, Method, Router, serviceext, build_router(), clear_diffusion_pipeline_cache(), clear_loaded_model_state() (+19 more)
 
 ### Community 144 - "KLD reference"
-Cohesion: 0.09
-Nodes (25): Config, Type marker for DeepSeek V4 Flash. `arch_id = 9` — next free slot after `8 = Qwe, `Architecture` trait impl for DeepSeek V4 Flash (`arch_id = 9`). DeepSeek V4 div, State, Weights, deepseek4, deepseekv4, DeepseekV4 (+17 more)
+Cohesion: 0.11
+Nodes (23): Config, Type marker for DeepSeek V4 Flash. `arch_id = 9` — next free slot after `8 = Qwe, `Architecture` trait impl for DeepSeek V4 Flash (`arch_id = 9`). DeepSeek V4 div, State, Weights, DeepseekV4, DeepseekV4::config_from_hfq(), DeepseekV4::load_weights() (+15 more)
 
 ### Community 145 - "GEMM MMQ kernels"
-Cohesion: 0.08
-Nodes (45): extract_patches(), preprocess_dynamic_image(), preprocess_image(), preprocess_image_bytes(), smart_resize(), IMAGE_FACTOR, MAX_RATIO, PATCH_SIZE (+37 more)
+Cohesion: 0.12
+Nodes (30): extract_patches(), preprocess_dynamic_image(), preprocess_image(), preprocess_image_bytes(), smart_resize(), RgbImage, clip_normalise(), clip_normalise_applies_per_channel_mean_std() (+22 more)
 
 ### Community 146 - "Grammar matching"
 Cohesion: 0.06
 Nodes (92): AtomicBool, Build a denoise progress callback that logs per-step wall-clock timing to stderr, step_timing_progress(), FnMut, blend_latents_with_mask_hip_on_gpu(), append_inpaint_conditioning(), apply_inpainting_fill_to_latents(), apply_masked_denoise_reference() (+84 more)
 
 ### Community 147 - "Givens rotation kernels"
-Cohesion: 0.11
-Nodes (29): Host hardware profile collection. Builds a `HostProfile` from KFD topology (`/sy, daemon_speed_skip_rows_preserve_evaluated_model_label(), amdgpu_vram_type_name(), AmdgpuDeviceDeinitialize, AmdgpuDeviceHandle, AmdgpuDeviceInitialize, AmdgpuGpuInfo, AmdgpuHeapInfo (+21 more)
+Cohesion: 0.10
+Nodes (33): Host hardware profile collection. Builds a `HostProfile` from KFD topology (`/sy, amdgpu_vram_type_name(), AmdgpuDeviceDeinitialize, AmdgpuDeviceHandle, AmdgpuDeviceInitialize, AmdgpuGpuInfo, AmdgpuHeapInfo, AmdgpuQueryGpuInfo (+25 more)
 
 ### Community 148 - "DeepSeek V4 arch"
 Cohesion: 0.14
@@ -1158,12 +1162,12 @@ Cohesion: 0.08
 Nodes (22): float2, block_q8_1_mmq, block_q8_1_mmq::ds4, block_q8_1_mmq::qs, gate_up_mmq_body_templated(), load_hfq4_tile_streaming(), load_q8_1_tile_coalesced(), vec_dot_dp4a_streaming() (+14 more)
 
 ### Community 150 - "Activation kernels"
-Cohesion: 0.11
-Nodes (32): check_moe_decode_batch_size(), check_moe_decode_supported(), dispatch_fused(), dispatch_grouped_lloyd(), execute_pipeline(), find_fused(), GroupedLloydVariant, moe_gemv_plain() (+24 more)
+Cohesion: 0.10
+Nodes (34): check_moe_decode_batch_size(), check_moe_decode_supported(), dispatch_fused(), dispatch_grouped_gemm(), dispatch_grouped_lloyd(), execute_pipeline(), find_fused(), GroupedLloydVariant (+26 more)
 
 ### Community 151 - "LFM2.5 MoE Configuration"
-Cohesion: 0.10
-Nodes (49): mtp_layer_idx, DeepseekV4::load_weights_host_only_walk(), DeepseekV4Config, DeepseekV4Weights, DeepseekV4Weights::resolve_layer(), DeepSeek V4 weights — fully populated: global embeddings + norms, per-layer LoRA, apply_tail_rope_batched(), attention_block_batched_mixed() (+41 more)
+Cohesion: 0.14
+Nodes (26): awq_scale_name(), bf16_to_f32(), dequant_q8_0(), expand_oq_plus_compact_to_oq8(), expand_oq_plus_to_oq8(), Lfm2MoeWeights::load(), load_f32(), load_lfm2_awq_scale() (+18 more)
 
 ### Community 152 - "GPU buffer management"
 Cohesion: 0.07
@@ -1174,24 +1178,24 @@ Cohesion: 0.12
 Nodes (29): commandext, defaulthasher, hash, hsaco_is_elf_path(), KernelCompiler, KernelCompiler::cache_valid(), KernelCompiler::compile(), KernelCompiler::compile_batch() (+21 more)
 
 ### Community 154 - "MoE dispatch family"
-Cohesion: 0.05
-Nodes (48): attn, Parsed nemotron_h model config., nemotron_h full model decode forward (N4) — composes the three validated per-blo, mlp, prefill_batched, NemotronHConfig, NemotronHConfig::is_pure_mamba2(), NemotronHConfig::mamba_out_proj_runtime_scale() (+40 more)
+Cohesion: 0.06
+Nodes (37): attn, Serving seam for nemotron_h (arch_id 14): `SimpleAr` + `ServingBackend` on [`Nem, Parsed nemotron_h model config., nemotron_h full model decode forward (N4) — composes the three validated per-blo, mlp, prefill_batched, NemotronHConfig, NemotronHConfig::is_pure_mamba2() (+29 more)
 
 ### Community 155 - "Architecture Feature Support"
-Cohesion: 0.27
-Nodes (9): mlp::relu2, cpu_moe_relu2_routes_topk_and_shared_expert(), matvec(), moe_relu2(), MoeExpertWeights, MoeWeights, nemotron_h routed MoE (`E`) block. This is the decode-first correctness path for, CPU reference for a routed ReLU2 MoE block. (+1 more)
+Cohesion: 0.13
+Nodes (21): mlp::relu2, MoeConfig, Routed MoE FFN shape for `E` blocks (Nano-30B A3B)., MlpRelu2Gpu, MlpRelu2Gpu::free(), MlpRelu2Gpu::new(), Free all GPU tensors (consumes the block)., GPU-resident ReLU² MLP block (`up`/`down` weights + reused scratch). (+13 more)
 
 ### Community 156 - "Nemotron Mamba Config"
-Cohesion: 0.08
-Nodes (53): start_background_serve(), KeyEvent, Line, Paragraph, Receiver, App, App::exec_control(), App::handle_chat_key() (+45 more)
+Cohesion: 0.13
+Nodes (39): KeyEvent, Line, Paragraph, App, App::handle_chat_key(), App::handle_home_key(), App::handle_models_key(), App::handle_settings_key() (+31 more)
 
 ### Community 157 - "Gated linear recurrence"
-Cohesion: 0.09
-Nodes (30): Async daemon JSONL process adapter., Emit a fatal startup error on both streams: a structured JSONL error on stdout f, repo_root(), hipfire::daemon::protocol, acquire_resource_lease_or_exit(), daemon_binary_candidates_include_env_home_and_repo_targets(), discover_npu_lock_ids(), fatal_startup_error() (+22 more)
+Cohesion: 0.07
+Nodes (38): Collect, Async daemon JSONL process adapter., Emit a fatal startup error on both streams: a structured JSONL error on stdout f, repo_root(), Result of a [`DaemonRequest::Collect`] op., hipfire::daemon::protocol, process, acquire_resource_lease_or_exit() (+30 more)
 
 ### Community 158 - "Cache eviction"
 Cohesion: 0.13
-Nodes (27): Body, HeaderMap, HeaderName, headervalue, Method, Next, admin_gate(), bearer_token() (+19 more)
+Nodes (28): Body, HeaderMap, HeaderName, headervalue, authorize_admin(), Attach the local admin bearer secret to a request bound for a gated `/admin/*` e, Next, Request (+20 more)
 
 ### Community 159 - "HFQ4 Residual MMQ GEMM Kernel"
 Cohesion: 0.12
@@ -1203,11 +1207,11 @@ Nodes (6): cpu_relu2_mlp_basic(), matvec(), mlp_relu2(), Row-major matvec `out[i
 
 ### Community 161 - "RDNA Compute Dispatch"
 Cohesion: 0.08
-Nodes (31): arch_cell(), card_from_registry_entry(), ListRow, nonempty_cell(), optional_cell(), Tick/cross glyph for an on-disk artifact., Glyph for a tri-state arch-feature support level., `hipfire list` — local models as a capability/artifact matrix. Pure presentation (+23 more)
+Nodes (36): arch_cell(), card_from_registry_entry(), ListRow, nonempty_cell(), optional_cell(), Tick/cross glyph for an on-disk artifact., `hipfire list` — local models as a capability/artifact matrix. Pure presentation, row_from_registry_entry() (+28 more)
 
 ### Community 162 - "DFlash configuration"
-Cohesion: 0.15
-Nodes (20): format_bytes(), group_key(), is_selectable_model_file(), list_local_models(), LocalModel, ModelEntry, ModelListItem, ModelRow (+12 more)
+Cohesion: 0.09
+Nodes (35): ConfigState, ConfigState::probe_host(), HipfirePaths, format_bytes(), group_key(), is_selectable_model_file(), list_local_models(), load_remote_registry() (+27 more)
 
 ### Community 163 - "Hardware profiling"
 Cohesion: 0.11
@@ -1218,32 +1222,32 @@ Cohesion: 0.08
 Nodes (27): compute_damped_inv_cholesky_upper_satisfies_identity(), compute_damped_inv_cholesky_upper_with_permutation(), diag_condition_handles_zero_diag_with_damping(), diag_condition_lower_bound(), diag_condition_lower_bound_well_conditioned(), inverse_perm(), inverse_perm_roundtrip(), obs_propagation_ratios_match_direct_h_inv() (+19 more)
 
 ### Community 165 - "Loop guard"
-Cohesion: 0.12
-Nodes (22): btreeset, ConfigSchemaFormat, GenConfigSchemaArgs, mutability_label(), `hipfire gen-config-schema` (hidden) - render the shared config schema as machin, render_markdown(), render_toml(), requirement_label() (+14 more)
+Cohesion: 0.13
+Nodes (21): btreeset, ConfigSchemaFormat, GenConfigSchemaArgs, mutability_label(), `hipfire gen-config-schema` (hidden) - render the shared config schema as machin, render_markdown(), render_toml(), requirement_label() (+13 more)
 
 ### Community 166 - "Benchmark driver"
-Cohesion: 0.14
-Nodes (21): c_char, FFI bindings to libhsa-runtime64.so via dlopen. Covers only the subset needed fo, HsaStatus, HsaAgentHandle, HsaCodeObjectReaderHandle, HsaExecutableHandle, HsaExecutableSymbolHandle, HsaKernelDispatchPacket (+13 more)
+Cohesion: 0.11
+Nodes (27): c_char, FFI bindings to libhsa-runtime64.so via dlopen. Covers only the subset needed fo, fmt, check(), HsaError, HsaError::fmt(), HsaError::new(), HsaStatus (+19 more)
 
 ### Community 167 - "GPTQ quantization"
-Cohesion: 0.13
-Nodes (26): chat, ChatMessage, infallible, mpsc, execute_responses(), load_responses_context(), prepare_response_messages(), prompt_message_to_chat_message() (+18 more)
+Cohesion: 0.10
+Nodes (24): chat, infallible, mpsc, error_status(), response_created_json(), response_item_to_message(), response_json(), response_json_matches_openai_responses_shape() (+16 more)
 
 ### Community 168 - "Config schema generation"
-Cohesion: 0.13
-Nodes (19): Client, AdminArgs, AdminClient, AdminClient::authed(), AdminClient::get(), AdminClient::new(), AdminClient::post_json(), AdminCommand (+11 more)
+Cohesion: 0.12
+Nodes (21): Client, AdminArgs, AdminClient, AdminClient::authed(), AdminClient::get(), AdminClient::new(), AdminClient::post_json(), AdminCommand (+13 more)
 
 ### Community 169 - "Argument parsing"
 Cohesion: 0.12
-Nodes (25): compat, archive_round_trips_lossless(), block_accessor_scores_self_to_zero(), bytes_to_f32s(), bytes_to_u32s(), f32s_to_bytes(), Scored positions per chunk (derived from the metadata)., View of the reference block for chunk `c`, scored index `j`. (+17 more)
+Nodes (26): codec, compat, archive_round_trips_lossless(), block_accessor_scores_self_to_zero(), bytes_to_f32s(), bytes_to_u32s(), f32s_to_bytes(), Scored positions per chunk (derived from the metadata). (+18 more)
 
 ### Community 170 - "Admin interface"
 Cohesion: 0.16
 Nodes (16): extract_layer, hidden, moe_intermediate, position, q_lora_rank, One decode step at absolute position `pos` (0-based). Reads `x` `[hidden]`, writ, Run one LFM2 DFlash draft block and return target-lm_head logits for draft rows , Lfm2HiddenCapture::extract_slot() (+8 more)
 
 ### Community 171 - "Nemotron model"
-Cohesion: 0.10
-Nodes (17): Html, AdminLogsQuery, candidate_log_files(), config_schema_json(), config_schema_route_exposes_schema_fields(), count_kernel_files(), get_admin_index(), kernel_cache_statuses() (+9 more)
+Cohesion: 0.09
+Nodes (18): Html, AdminLogsQuery, candidate_log_files(), config_schema_json(), config_schema_route_exposes_schema_fields(), count_kernel_files(), get_admin_index(), kernel_cache_statuses() (+10 more)
 
 ### Community 172 - "Opus Quant GEMM"
 Cohesion: 0.09
@@ -1254,108 +1258,108 @@ Cohesion: 0.19
 Nodes (11): LlamaConfig, LlamaConfig::from_dir(), LlamaConfig::from_hfq_metadata(), LlamaConfig::from_json_value(), LlamaConfig::q_dim(), Read and validate `<dir>/config.json`., Minimal LLaMA-family config for the training path. Parsed straight from a Huggin, Parse from a `.hfq` HFQM metadata JSON string. The quantizer stores the HF confi (+3 more)
 
 ### Community 174 - "Build Configuration"
-Cohesion: 0.07
-Nodes (28): High-level compute dispatch — builds PM4 internally, handles kernarg layout. Use, hsaco, CommandBuffer, CommandBuffer::as_bytes(), CommandBuffer::barrier(), CommandBuffer::dispatch(), CommandBuffer::dispatch_with_lds(), Device::load_module() (+20 more)
+Cohesion: 0.10
+Nodes (24): High-level compute dispatch — builds PM4 internally, handles kernarg layout. Use, hsaco, CommandBuffer, CommandBuffer::as_bytes(), CommandBuffer::barrier(), CommandBuffer::dispatch(), CommandBuffer::dispatch_with_lds(), Device::load_module() (+16 more)
 
 ### Community 175 - "HFQ3 GEMM Variants"
 Cohesion: 0.18
 Nodes (17): load_tensor_f32(), Load tensor from GGUF as f32, dequantizing if needed., convert_q4k_to_q4f16_g32(), convert_q4k_to_q4f16_g64(), dequantize_q4_0(), dequantize_q4_k(), dequantize_q6_k(), dequantize_q8_0() (+9 more)
 
 ### Community 176 - "NPU module admission"
-Cohesion: 0.16
-Nodes (9): Bf16Tensor, is_gptq_target(), load_bf16_model(), Returns true if a tensor name matches the GPTQ-target whitelist that the calibra, BF16 HuggingFace safetensors model loader scaffold (Tier 1 foundation). Stretch , A single BF16 weight tensor on the device. Mirrors the structure of `rdna_comput, All BF16 weights for a single model, indexed by HF key. The `TrunkBF16` name fol, Load a BF16 HuggingFace model directory into GPU memory. Scaffold — returns `uni (+1 more)
+Cohesion: 0.08
+Nodes (20): hashmap, Bf16Tensor, is_gptq_target(), load_bf16_model(), Returns true if a tensor name matches the GPTQ-target whitelist that the calibra, BF16 HuggingFace safetensors model loader scaffold (Tier 1 foundation). Stretch , A single BF16 weight tensor on the device. Mirrors the structure of `rdna_comput, All BF16 weights for a single model, indexed by HF key. The `TrunkBF16` name fol (+12 more)
 
 ### Community 177 - "Compute dispatch"
 Cohesion: 0.13
-Nodes (29): block_size, dflash_subphase_sync(), DflashConfig, DflashConfig::kv_dim(), DflashConfig::num_extract(), DflashConfig::q_dim(), DflashScratch::new(), DflashScratch::new_with_mq() (+21 more)
+Nodes (19): Probe, One detector. Consumes `Event`s, produces a final `Verdict` once the stream fini, Holds a slice of detectors and dispatches events to all of them., Severity of a detector's finding., bank_collects_finals(), Detector, DetectorBank, DetectorBank::add() (+11 more)
 
 ### Community 178 - "DeepSeek4 Fused Kernels"
-Cohesion: 0.09
-Nodes (25): align_down(), align_up(), AlignedHostBuffer, AlignedHostBuffer::as_mut_slice(), AlignedHostBuffer::as_slice(), DirectH2DTransport, DirectH2DTransport::ensure_staging(), DirectH2DTransport::fetch() (+17 more)
+Cohesion: 0.07
+Nodes (33): AlignedHostBuffer, AlignedHostBuffer::as_mut_slice(), AlignedHostBuffer::as_slice(), DirectH2DTransport, DirectH2DTransport::ensure_staging(), DirectH2DTransport::fetch(), DirectH2DTransport::next_handle(), DirectH2DTransport::open() (+25 more)
 
 ### Community 179 - "BF16 Model Loading"
-Cohesion: 0.08
-Nodes (28): abs_q_f, TriAttention importance scoring over a Q8 post-RoPE K cache. Produces one score , q_f, accumulator_means_one_sample(), BandAccumulator, BandAccumulator::add(), BandAccumulator::finalize(), compute_retain_indices() (+20 more)
+Cohesion: 0.14
+Nodes (15): TriAttention importance scoring over a Q8 post-RoPE K cache. Produces one score , q_f, accumulator_means_one_sample(), BandAccumulator::add(), compute_retain_indices(), kpost_per_band(), mrl_constant_vectors_is_one(), mrl_uniform_directions_is_zero() (+7 more)
 
 ### Community 180 - "KV cache allocation"
 Cohesion: 0.15
 Nodes (24): begin_timer, profile, ProfileEntry, Stop profiling and return the collected entries. Returns None if profiling was n, compute_coverage(), parse_rocprof_stats_csv(), parse_rocprof_stats_csv_text(), ProfileReport (+16 more)
 
 ### Community 181 - "Hidden state buffering"
-Cohesion: 0.13
-Nodes (18): arc, calibration, build_capture_names(), CalibOpts, CalibSummary, f32_bytes(), kldref_extra(), put() (+10 more)
+Cohesion: 0.11
+Nodes (20): calibration, build_capture_names(), CalibOpts, CalibSummary, f32_bytes(), kldref_extra(), put(), decode::step (+12 more)
 
 ### Community 182 - "Profiling integration"
 Cohesion: 0.22
 Nodes (9): ColdSegmentGpu, HierKvState, HierKvState::append_token(), HierKvState::ensure_scratch(), HierKvState::reset(), HierKvState::two_tier_read(), Reset all per-layer tier state for a new sequence (pos==0). Hot ring buffers are, Two-tier decode read for one layer: hot (raw f32) ⊕ all cold segments, all folde (+1 more)
 
 ### Community 183 - "Coherence detection"
-Cohesion: 0.05
-Nodes (46): IEEE half → f32 (handles subnormals/inf/nan)., hip::bridge, Fused cross-entropy (logsoftmax + NLL) with `ignore_index` masking. Forward and , KL distillation loss (soft-target cross-entropy). One fused call: per-row `loss , rdna::compute, seq_len, gqa_attention(), CPU reference: causal GQA attention (NoPE) for one query against the full `[seq_ (+38 more)
+Cohesion: 0.15
+Nodes (22): IEEE half → f32 (handles subnormals/inf/nan)., dequant(), dequant_qt(), f16_to_f32(), first_hfq_tensor(), get(), get_any(), hfq_tensor() (+14 more)
 
 ### Community 184 - "Request Scheduling"
 Cohesion: 0.08
 Nodes (26): Gpu, Gpu::moe_down_combine_grouped_k8(), Gpu::moe_down_combine_k8_batched(), Gpu::moe_gate_up_unscatter_k8(), Gpu::moe_scatter_histogram_k8(), Gpu::moe_scatter_offsets_k8(), Gpu::moe_scatter_permute_k8(), Gpu::moe_softmax_topk_renorm_k8() (+18 more)
 
 ### Community 185 - "Architecture capabilities"
-Cohesion: 0.21
-Nodes (13): gpt2_meta_full_bytes(), Build a SentencePiece-mode meta JSON. Skips byte-coverage check., Build a GPT-2-mode meta JSON. Triggers byte-coverage check. `tokens` becomes `[b, Load tokenizer from a JSON-serialized GGUF metadata tree. Mirrors `from_gguf` fi, rejects_metadata_missing_tokens(), rejects_missing_byte_symbol_for_gpt2(), rejects_missing_merge_operand_left(), rejects_missing_merge_operand_right() (+5 more)
+Cohesion: 0.17
+Nodes (18): ArchEntry, check_file(), GateEntry, GenModelSupportArgs, QuantEntry, Reject malformed support marks early with a clear message (otherwise a typo woul, Replace the content between the generated markers (exclusive), preserving the ma, `hipfire gen-model-support` (hidden) — render the model-support matrix from its  (+10 more)
 
 ### Community 186 - "DSML Tool Parsing"
 Cohesion: 0.14
 Nodes (23): solve, inv_cholesky_lower(), inv_cholesky_lower_rotated(), inv_cholesky_reconstructs_inverse(), Lcg, oq4_ldlq_pack(), oq8_ldlq_pack(), oqplus_compact_ldlq_pack() (+15 more)
 
 ### Community 187 - "Model memory accounting"
-Cohesion: 0.09
-Nodes (33): Build a profile from a per-layer kind list., Total decoder layers., Does any layer carry recurrent state (short-conv / DeltaNet / Mamba-2)? True for, A hybrid stack mixes attention and recurrent mixers (qwen35 LA/FA, nemotron_h, l, The token-mixer kind of a single decoder layer. This is the per-layer axis the h, The per-layer token-mixer taxonomy and sequence-state *shape* for the hipfire fa, Does this mixer maintain a KV cache? Only the attention variants do; recurrent m, kv_layer_mask_matches_uses_kv() (+25 more)
+Cohesion: 0.25
+Nodes (19): attn(), attn_slots(), cold_tier_reconstruction_preserves_attention(), ColdTier, ColdTier::bytes(), ColdTier::dequant_head(), ColdTier::two_tier_attend(), compact_cold_kv() (+11 more)
 
 ### Community 188 - "Config resolution"
 Cohesion: 0.09
 Nodes (4): make_caps(), atoms_are_exclusive(), mmq_on_gfx906_at_small_batch(), mmq_on_rdna3_at_128()
 
 ### Community 189 - "TriAttn Band-Center Statistics"
-Cohesion: 0.06
-Nodes (60): AtomicU64, A cached projected-embedding block: `n_rows × n_cols` row-major `f32`., A content-addressed, on-disk LRU cache for projected vision embeddings., Total payload bytes currently held., Drop every entry and the manifest., Evict the least-recently-accessed entries until within budget, never removing `k, Read + validate a payload file. `Ok(None)` on a missing / corrupt entry., Content-addressed, on-disk LRU cache for **projected vision embeddings**. The Si (+52 more)
+Cohesion: 0.07
+Nodes (53): A cached projected-embedding block: `n_rows × n_cols` row-major `f32`., Evict the least-recently-accessed entries until within budget, never removing `k, Read + validate a payload file. `Ok(None)` on a missing / corrupt entry., Content-addressed, on-disk LRU cache for **projected vision embeddings**. The Si, Goal-4 evidence for Goal 1: a hit returns exactly what a miss would have encoded, Build a key from the namespace (vision-config / arch identity) and the submitted, hasher, CachedEmbedding (+45 more)
 
 ### Community 190 - "Calibration Data Collection"
 Cohesion: 0.05
-Nodes (45): HFQ3-G256 sister of `gemm_hfq4g256_residual_wmma` (basic WMMA variant). Same WMM, RoughQuant reader gather: `dst[j] = src[idx[j]]` for j<n_idx, 0 for the power-of, RoughQuant writer scatter-add: `y[idx[j]] += c[j]` for j<n_idx., GgufFile, j, gfx12 (RDNA4) sister of `gemm_hfq4g256_residual_wmma` (specifically the `_k2` va, Row-major matvec: `out[i] = Σ_j w[i*in + j] * x[j]`, `w` is `[out, in]`., Linearize a DDTree into a verify-ready `(tokens, positions, mask_block)` triple  (+37 more)
+Nodes (44): HFQ3-G256 sister of `gemm_hfq4g256_residual_wmma` (basic WMMA variant). Same WMM, RoughQuant reader gather: `dst[j] = src[idx[j]]` for j<n_idx, 0 for the power-of, RoughQuant writer scatter-add: `y[idx[j]] += c[j]` for j<n_idx., GgufFile, j, gfx12 (RDNA4) sister of `gemm_hfq4g256_residual_wmma` (specifically the `_k2` va, Linearize a DDTree into a verify-ready `(tokens, positions, mask_block)` triple , LlamaConfig::from_gguf() (+36 more)
 
 ### Community 191 - "AQL queue management"
-Cohesion: 0.14
-Nodes (23): open, HfqFile::modules(), HfqFile::open(), HfqFile::open_at_offset(), HfqFile::open_index_only(), HfqFile::open_index_only_at_offset(), classify_always_resident_tensor(), ExpertKey (+15 more)
+Cohesion: 0.13
+Nodes (24): open, HfqFile::modules(), HfqFile::open(), HfqFile::open_at_offset(), HfqFile::open_index_only(), HfqFile::open_index_only_at_offset(), classify_always_resident_tensor(), ExpertKey (+16 more)
 
 ### Community 192 - "Admin client"
-Cohesion: 0.15
-Nodes (35): HipfireConfig::resolve_for_model(), LoadedConfig, LoadedConfig::refresh(), LoadedConfig::resolve_for_model(), LoadedConfig::with_additional_layer(), Merge per-model overrides for `tag` on top of global config., resolve_typed_config_document(), resolve_typed_config_document_with_layers() (+27 more)
+Cohesion: 0.16
+Nodes (32): profile::report, schema, LoadedConfig::resolve_for_model(), resolve_typed_config_document(), resolve_typed_config_document_with_layers(), resolve_typed_config_documents_with_layers(), resolve_typed_config_layers(), ResolvedTypedConfig (+24 more)
 
 ### Community 193 - "Image encoding"
-Cohesion: 0.21
-Nodes (13): DetectArgs, emit(), finish(), parse_token_line(), AR vs DFlash token-parity comparison (replaces the gate's PARITY_PY). Reads the , Rollback stat-line parsers (replaces the gate's ROLLBACK_REPLAY_PY / VERIFY_GRAP, Extract the token-id list from a `DFlash tokens: [..]` / `AR tokens: [..]` line., `hipfire detect` — run the observational coherence detectors over a captured tok (+5 more)
+Cohesion: 0.15
+Nodes (17): args, DetectArgs, emit(), finish(), parse_token_line(), AR vs DFlash token-parity comparison (replaces the gate's PARITY_PY). Reads the , Rollback stat-line parsers (replaces the gate's ROLLBACK_REPLAY_PY / VERIFY_GRAP, Extract the token-id list from a `DFlash tokens: [..]` / `AR tokens: [..]` line. (+9 more)
 
 ### Community 194 - "Arch capability tests"
-Cohesion: 0.16
-Nodes (21): clone_gpu_tensor, Lfm2RequestSessionState, Lfm2RequestSessionState::clone_device_buffer(), Lfm2RequestSessionState::clone_state(), Lfm2RequestSessionState::fork_from(), Lfm2RequestSessionState::reset(), Lfm2RequestSessionState::restore_into_loaded(), Lfm2RequestSessionState::take_from_loaded() (+13 more)
+Cohesion: 0.11
+Nodes (27): clone_gpu_tensor, Lfm2RequestSessionState, Lfm2RequestSessionState::clone_device_buffer(), Lfm2RequestSessionState::clone_state(), Lfm2RequestSessionState::fork_from(), Lfm2RequestSessionState::reset(), Lfm2RequestSessionState::restore_into_loaded(), Lfm2RequestSessionState::take_from_loaded() (+19 more)
 
 ### Community 195 - "Request session state"
-Cohesion: 0.18
-Nodes (19): bypass_below_threshold_in_auto(), bypass_on_tokenizer_mismatch(), bypass_vision_and_tool_call(), bypass_when_drafter_unavailable_at_threshold(), bypass_when_off(), cfg_auto(), decide_bypass(), no_bypass_when_always_with_loaded_drafter_over_threshold() (+11 more)
+Cohesion: 0.16
+Nodes (19): bypass_below_threshold_in_auto(), bypass_on_tokenizer_mismatch(), bypass_vision_and_tool_call(), bypass_when_drafter_unavailable_at_threshold(), bypass_when_off(), BypassReason, cfg_auto(), decide_bypass() (+11 more)
 
 ### Community 196 - "OQ4 Weight Dispatch"
 Cohesion: 0.09
-Nodes (31): IntoResponse, Multipart, Notify, resolve_diffusion_runtime_default, create_file(), error(), file_json(), file_json_omits_content() (+23 more)
+Nodes (33): main(), Notify, resolve_diffusion_runtime_default, config_path(), config_value_map(), hipfire_dir(), HipfireConfig, HipfireConfig::resolve_for_model() (+25 more)
 
 ### Community 197 - "Image Patching Pipeline"
-Cohesion: 0.08
-Nodes (17): Collect, Result of a [`DaemonRequest::Collect`] op., What a [`KldEvalRequest`] does against the resident model — without reload., Daemon JSONL protocol contracts., Daemon-resident KLD evaluation: reference build and/or candidate scoring against, hipfire::prompt, KldEval, CollectRequest (+9 more)
+Cohesion: 0.06
+Nodes (26): BoxFuture, BufReader, Child, ChildStdin, ChildStdout, What a [`KldEvalRequest`] does against the resident model — without reload., Daemon JSONL protocol contracts., Daemon-resident KLD evaluation: reference build and/or candidate scoring against (+18 more)
 
 ### Community 198 - "KLD Configuration"
-Cohesion: 0.06
-Nodes (34): attn_split_pad_f16kv, cast_f32_to_f16, Gpu, Gpu::attn_unpad(), Gpu::cast_f32_to_bf16(), Gpu::cast_f32_to_f16(), Gpu::cross_entropy_loss(), Gpu::cross_entropy_train() (+26 more)
+Cohesion: 0.05
+Nodes (38): attn_split_pad_f16kv, cast_f32_to_f16, Gpu, Gpu::attn_unpad(), Gpu::cast_f32_to_bf16(), Gpu::cast_f32_to_f16(), Gpu::cross_entropy_loss(), Gpu::cross_entropy_train() (+30 more)
 
 ### Community 199 - "Daemon requests"
 Cohesion: 0.15
-Nodes (16): CLI argument parsing and run defaults. `parse_args_from` builds an `EvalConfig` , default_batteries(), default_output_dir(), default_result_cache(), default_suites(), parse_args_from(), parse_f64(), parse_u32() (+8 more)
+Nodes (17): CLI argument parsing and run defaults. `parse_args_from` builds an `EvalConfig` , default_batteries(), default_output_dir(), default_result_cache(), default_suites(), parse_args_from(), parse_csv(), parse_f64() (+9 more)
 
 ### Community 200 - "System Status Diagnostics"
 Cohesion: 0.20
@@ -1371,11 +1375,11 @@ Nodes (21): KldConfig, KldConfig::to_env_pairs(), The exact `(key, value)` envir
 
 ### Community 203 - "ROCm Backend Contracts"
 Cohesion: 0.09
-Nodes (32): Config, `Architecture` trait implementation for the Qwen3.5-VL vision tower. Mirrors PR , State, Weights, Qwen35Vl, Qwen35Vl::config_from_hfq(), Qwen35Vl::load_weights(), Qwen35Vl::new_state() (+24 more)
+Nodes (33): Config, `Architecture` trait implementation for the Qwen3.5-VL vision tower. Mirrors PR , State, Weights, qwen35::vl, Qwen35Vl, Qwen35Vl::config_from_hfq(), Qwen35Vl::load_weights() (+25 more)
 
 ### Community 204 - "Hessian Accumulation"
-Cohesion: 0.10
-Nodes (32): apply_speed_baseline(), env_truthy(), load_speed_baseline(), speed_model_id(), speed_model_size(), SpeedBaseline, SpeedBaselineCheck, model_artifact_stem() (+24 more)
+Cohesion: 0.16
+Nodes (22): cell_block_reason(), CellPlan, dry_run_inputs(), eval_context(), expand_models(), glob_match(), ModelPlan, plan_model() (+14 more)
 
 ### Community 205 - "Video Decoding"
 Cohesion: 0.13
@@ -1386,172 +1390,172 @@ Cohesion: 0.12
 Nodes (20): path, decode_frames(), decode_frames_roundtrip(), ensure_ffmpeg(), is_video(), probe_color_range(), `color_range` reported by the first video stream, lowercased (e.g. `"tv"`, `"pc", Build the `-vf` scale filter: keep native size (`iw:ih`), and expand the luma ra (+12 more)
 
 ### Community 207 - "Kernel Atlas Tool"
-Cohesion: 0.12
-Nodes (28): attn_mixer_block(), capture_named_activation(), decode_step_layers_and_head(), decode_step_layers_and_head_lowered(), download_i32_tensor(), hidden_capture_interleaves_positions_then_layers(), lfm2_forward_lowered_enabled(), lfm2_lower_variant() (+20 more)
+Cohesion: 0.10
+Nodes (23): decode_step_layers_and_head_lowered(), dense_down_block(), graph_enabled(), lfm2_forward_lowered_enabled(), lfm2_lower_variant(), lfm2_variant_of(), lfm2_variant_shapes(), Lfm2MoeBindings (+15 more)
 
 ### Community 208 - "EOS Stream Filtering"
-Cohesion: 0.20
-Nodes (23): Read, bytemuck_f32(), load_drafter(), load_labels(), `Some((chunks, label_mid, base_shallow))` iff the file exists, is v2, and its ke, Load weights + AdamW state into an already-constructed drafter/optimizer (same c, Checkpoint / resume for the PFlash drafter trainer. Two artifacts: - **Label cac, Stores the token CHUNKS alongside the labels so a HIT reuses the exact corpus th (+15 more)
+Cohesion: 0.12
+Nodes (30): Read, bytemuck_f32(), load_drafter(), load_labels(), `Some((chunks, label_mid, base_shallow))` iff the file exists, is v2, and its ke, Load weights + AdamW state into an already-constructed drafter/optimizer (same c, Checkpoint / resume for the PFlash drafter trainer. Two artifacts: - **Label cac, Stores the token CHUNKS alongside the labels so a HIT reuses the exact corpus th (+22 more)
 
 ### Community 209 - "Mamba-2 SSD ops"
 Cohesion: 0.13
 Nodes (21): HsacoModule, HsacoModule::from_bytes(), HsacoModule::from_file(), i64_le(), KernelMeta, KernelMeta::sgpr_count(), KernelMeta::vgpr_count(), LoadSegment (+13 more)
 
 ### Community 210 - "Think Tag Validation"
-Cohesion: 0.15
-Nodes (15): dequantize_e4m3_f32scale_to_f32(), dequantize_e4m3_ue8m0_to_f32(), e4m3_to_f32(), Advise the kernel to drop page cache for a tensor's data region. On UMA systems , Helper for the main quantize loop: convert one tensor's raw bytes to f32, transp, Dequantize a paired E4M3 weight + UE8M0 scale tensor to f32. `weight_shape` is t, Dequantize FP8 E4M3 weights paired with an F32 block-[128,128] `weight_scale_inv, SafetensorsFile (+7 more)
+Cohesion: 0.10
+Nodes (21): dequantize_e2m1_ue8m0_to_f32(), dequantize_e4m3_f32scale_to_f32(), dequantize_e4m3_ue8m0_to_f32(), e2m1_dequant_applies_ue8m0_scale(), e2m1_dequant_unpacks_nibbles_and_doubles_logical_cols(), e2m1_to_f32(), e4m3_to_f32(), Advise the kernel to drop page cache for a tensor's data region. On UMA systems  (+13 more)
 
 ### Community 211 - "Benchmark CLI Parsing"
-Cohesion: 0.07
-Nodes (29): b, SWA visibility staging — BATCHED. For each batch position b at absolute position, Batched causal attention with Q8_0 quantized KV cache. Processes N queries in on, Batched causal attention with unquantized FP32 KV cache. Processes N queries in , HC split + finalize — BATCHED. Per-batch position: applies sigmoid to c[b, 0..4], DeepSeek V4 indexer score — BATCHED. Per batch position b scores every compresse, Batched twin of `hash_router_normalize_f32_buf` — for the prefill `ffn_batched` , Batched 2-way fused HFQ4-G256 GEMM for the FFN preamble (gate + up). Processes N (+21 more)
+Cohesion: 0.05
+Nodes (42): b, Fused `y[row, col] += sigmoid(c_buf[row]) * x[row, col]`. Used by batched MoE sh, Routed batched attention with a KVarN K cache + Q8_0 V (microbatching). Per-row , SWA visibility staging — BATCHED. For each batch position b at absolute position, Batched causal attention with Q8_0 quantized KV cache. Processes N queries in on, Batched causal attention with unquantized FP32 KV cache. Processes N queries in , HC split + finalize — BATCHED. Per-batch position: applies sigmoid to c[b, 0..4], DeepSeek V4 indexer score — BATCHED. Per batch position b scores every compresse (+34 more)
 
 ### Community 212 - "AdamW Optimizer"
-Cohesion: 0.16
-Nodes (16): acquire(), clear_cloexec(), hold(), LockAction, LockArgs, lockfile_path(), pid_alive(), Non-blocking probe via the shared primitive: free if we can take the lock. (+8 more)
+Cohesion: 0.17
+Nodes (15): acquire(), clear_cloexec(), hold(), LockAction, LockArgs, lockfile_path(), pid_alive(), Non-blocking probe via the shared primitive: free if we can take the lock. (+7 more)
 
 ### Community 213 - "MTP Weight View"
-Cohesion: 0.14
-Nodes (17): main(), run(), crossterm, CrosstermBackend, hipfire, authorize_admin(), Attach the local admin bearer secret to a request bound for a gated `/admin/*` e, ratatui (+9 more)
+Cohesion: 0.09
+Nodes (26): main(), run(), crossterm, CrosstermBackend, hipfire, Send SIGTERM to the given PIDs (graceful stop). Returns how many signals were di, start_background_serve(), stop_pids() (+18 more)
 
 ### Community 214 - "Quantized Dequantization"
-Cohesion: 0.10
-Nodes (39): Stable identity for routing requests to a compatible loaded model worker., canonical_state_kind_label(), create_request_session_draft(), CreateRequestSessionInput, generate_state_kind_sets_match_exactly(), model_worker_key_id(), ModelWorkerKey, nemotron_worker() (+31 more)
+Cohesion: 0.14
+Nodes (25): Stable identity for routing requests to a compatible loaded model worker., create_request_session_draft(), CreateRequestSessionInput, model_worker_key_id(), ModelWorkerKey, normalize_feature_flags(), normalize_model_worker_key(), prefill_session_multi_session_batchable() (+17 more)
 
 ### Community 215 - "CPU Router Transport"
-Cohesion: 0.08
-Nodes (35): flush, mutex, bf16_to_f32(), CalibCollector, CalibCollector::capture(), CalibCollector::free_gpu(), CalibCollector::is_empty(), CalibCollector::len() (+27 more)
+Cohesion: 0.11
+Nodes (28): flush, mutex, bf16_to_f32(), CalibCollector, CalibCollector::capture(), CalibCollector::free_gpu(), CalibCollector::is_empty(), CalibCollector::len() (+20 more)
 
 ### Community 216 - "LDLQ operations"
 Cohesion: 0.16
 Nodes (19): hipfire::npu, config(), decode_bf16_and_f32_shadow(), dense_ffn_backend_preference_for_mode(), dense_ffn_invocation_and_output_bind_contract_to_backend_decision(), dense_ffn_invocation_can_use_production_weight_shape_without_bf16_shadow(), dense_ffn_mode_maps_xdna1_to_npu_opt_in_preference(), enabled() (+11 more)
 
 ### Community 217 - "HSACO Kernel Metadata"
-Cohesion: 0.14
-Nodes (15): Parse the `verify_graph:` line and apply the gate's two-tier policy., Verdict for the `rollback_parity:` replay-count line., Parse the `rollback_parity:` line and apply the gate's two-tier policy., Rollback-replay stat parsers. These read the single-line stat summaries the DFla, Verdict for the `verify_graph:` count line., replay_admitted_ok_has_no_reason(), replay_all_zero_is_missing_admitted(), replay_gdn_nonzero_is_diagnostic_only() (+7 more)
+Cohesion: 0.11
+Nodes (20): EP (Ship 6 substrate-EP, ported from tp-mtp-prototype Stage 3e): shard a MoE lay, Shard every MoE layer of a replicated `Qwen35Weights` to `rank`, calling [`shard, shard_all_moe_layers(), shard_moe_experts(), True for the single-rank degenerate case., KV heads present per rank: all of them when replicated, else split., Value heads owned per rank (`n_value_heads / tp_size`)., Key heads owned per rank (`n_key_heads / tp_size`). (+12 more)
 
 ### Community 218 - "GEMV Kernel Selection"
 Cohesion: 0.13
-Nodes (26): kv, ModelWorkerMemoryView, deltanet_state_bytes(), kv_cache_bytes(), llama_scratch_bytes(), loaded_model_memory_view(), loaded_model_runtime_base_bytes(), minimax_state_bytes() (+18 more)
+Nodes (18): EvictionCtx::new(), Download + convert to the same TriAttnCenters format the CPU path produces. Uses, Dispatch the GPU accumulate kernel for one chunk's worth of Q. Called from the f, True if any tap is active., True only when the active tap actually consumes K (`Capture`). The `Calibrate` a, Upload centers and pre-size scratch. `fa_layer_ids` must match the layer indices, Full Q-side calibration: per (layer, head, band) centers. Layout: `centers[layer, record_prerope_q_batch_gpu_if_applicable() (+10 more)
 
 ### Community 219 - "Gemma3 Configuration"
-Cohesion: 0.09
-Nodes (35): hipfire::arch::gemma3::as::gemma3, argmax(), ArHashOut, CollectOut, hash_mix(), KldOut, log_softmax(), Load `path` as `arch`, sizing per-arch state for `max_seq` positions. (+27 more)
+Cohesion: 0.13
+Nodes (20): CollectOut, Load `path` as `arch`, sizing per-arch state for `max_seq` positions., Forward one token, returning the host logits (`[vocab]`). `pos` is honored by qw, Map each captured linear's device-buffer pointer → its checkpoint tensor name (m, Which arch family a fixture belongs to. Parsed from the `--arch` flag (the calle, Run `model` over `tokens`, returning per-position logits for pos >= warmup., Result of a [`run_collect`] pass., Arm the model-agnostic [`CalibCollector`], run the bf16 forward over the synthet (+12 more)
 
 ### Community 220 - "Model Support Generation"
 Cohesion: 0.09
 Nodes (31): attach_image(), AttachKind, ChatArgs, classify_attachment(), classify_attachment_by_extension(), generate_request_from_prompt(), generate_request_from_prompt_preserves_structured_boundary(), load_params_from_config() (+23 more)
 
 ### Community 221 - "File Locking"
-Cohesion: 0.12
-Nodes (9): rdna-compute: Kernel compilation, caching, and dispatch for RDNA GPUs., dispatch, gemv::src, FeatureFlags, FeatureFlags::from_env_for_test(), force_unfused_defaults_false_in_test_ctor(), Mb4Mode, Test-only constructor: reads no env vars, uses defaults for the given arch. Prov (+1 more)
+Cohesion: 0.11
+Nodes (10): arc, rdna-compute: Kernel compilation, caching, and dispatch for RDNA GPUs., dispatch, gemv::src, FeatureFlags, FeatureFlags::from_env_for_test(), force_unfused_defaults_false_in_test_ctor(), Mb4Mode (+2 more)
 
 ### Community 222 - "SigLIP vision config"
 Cohesion: 0.14
 Nodes (19): LoopGuard, LoopGuard::check(), LoopGuard::enabled(), LoopGuard::new(), LoopGuard::off(), LoopGuard::window_len(), Why the guard signalled a stop., Construct with explicit threshold and window. `threshold = 0` disables the guard (+11 more)
 
 ### Community 223 - "GPU Graph Management"
-Cohesion: 0.11
-Nodes (19): Fused `y[row, col] += sigmoid(c_buf[row]) * x[row, col]`. Used by batched MoE sh, Routed batched attention with a KVarN K cache + Q8_0 V (microbatching). Per-row , Batched HFQ4-G256 GEMM: y[b][row] = A[row] · x[b] for all batch elements. x: [ba, HFQ3-G256 sister of `gemm_hfq4g256_batched_lmhead`. Same FP16-X cache stomp + ze, Batched HFQ6-G256 GEMM with fused residual add: for b in 0..batch_size: y[b][row, Batched HFQ4-G256 GEMM with fused residual add: for b in 0..batch_size: y[b][row, MQ4-Lloyd GEMV with fused residual add: y[row] += A[row] · x. Mirrors gemv_mq3g2, MQ3-Lloyd GEMV with fused residual add: y[row] += A[row] · x. Used by `weight_ge (+11 more)
+Cohesion: 0.17
+Nodes (17): hipfire::arch::gemma3::as::gemma3, hipfire::arch::minimax::as::minimax, argmax(), ArHashOut, hash_mix(), KldOut, log_softmax(), A fixed synthetic token-ID stream valid for any tiny fixture vocab (mod 100). Mi (+9 more)
 
 ### Community 224 - "AMD KFD Interface"
-Cohesion: 0.09
-Nodes (32): ConfigState, HipfirePaths, load_remote_registry(), non_empty_array(), RegistryState::load(), detect_gpu_lines(), endpoint_urls(), kernel_cache_lines() (+24 more)
+Cohesion: 0.12
+Nodes (22): detect_gpu_lines(), endpoint_urls(), kernel_cache_lines(), log_tail_lines(), parse_etc_hosts(), pids_by_comm(), probe_health(), Read the local system hostname (`/etc/hostname`, then `$HOSTNAME`). (+14 more)
 
 ### Community 225 - "gfx906 GEMM Variants"
-Cohesion: 0.12
-Nodes (18): Gpu, Gpu::gemm_bf16_x_bf16_wmma_gfx1151_m128_labeled(), Gpu::gemm_f16_moe_grouped_wmma_gfx1151(), Gpu::gemm_hfq4g128_mmq_gfx1151(), Gpu::gemm_hfq4g256_mmq_gfx1151(), Gpu::gemm_hfq4g256_mmq_gfx1151_prequant(), Gpu::gemm_hfq4g256_moe_grouped_mmq_gfx1151(), Gpu::gemm_hfq4g256_moe_grouped_mmq_k4_gfx1151() (+10 more)
+Cohesion: 0.11
+Nodes (20): Gpu, Gpu::gemm_bf16_x_bf16_wmma_gfx1151_m128_labeled(), Gpu::gemm_hfq4g128_mmq_gfx1151(), Gpu::gemm_hfq4g256_mmq_gfx1151(), Gpu::gemm_hfq4g256_mmq_gfx1151_prequant(), Gpu::gemm_hfq4g256_moe_grouped_mmq_k4_gfx1151(), Gpu::gemm_hfq4g256_moe_grouped_mmq_k8_4w_gfx1151(), Gpu::gemm_hfq4g256_moe_grouped_mmq_k8_gfx1151() (+12 more)
 
 ### Community 226 - "Loop Detection Guard"
-Cohesion: 0.08
-Nodes (25): attn_scale, config, Config, `Architecture` bring-up triple for Gemma3 (`arch_id = 12`) and the `Gemma3Backen, State, Weights, Gemma3 (text) architecture — `arch_id = 12`. A dense, full-attention-only decode, embed_scale (+17 more)
+Cohesion: 0.12
+Nodes (13): attn_scale, config, Gemma3 (text) architecture — `arch_id = 12`. A dense, full-attention-only decode, Gemma3 multimodal (`Gemma3ForConditionalGeneration`) — `arch_id = 13`. Pipeline , embed_scale, forward, is_global_layer, loader (+5 more)
 
 ### Community 227 - "Dense FFN Module"
 Cohesion: 0.18
 Nodes (18): AmdgpuBoAllocRequest, AmdgpuBoHandle, AmdgpuBoListHandle, AmdgpuContext, AmdgpuDeviceHandle, AmdgpuGpuInfo, AmdgpuGpuVaRange, AmdgpuVaHandle (+10 more)
 
 ### Community 228 - "MoE Router Decoding"
-Cohesion: 0.16
-Nodes (15): all_zeros_row_safe(), cpu_fwht_128(), encode_mq4g128_from_fp16(), EncodedMQ4G128, encoder_produces_expected_byte_count(), matching_prefixes_on_gfx1151(), Decide whether to apply MQ4G128 encoding to a weight at load time. Returns `true, Critical: encode → dequant → undo-FWHT (apply forward FWHT a second time) → shou (+7 more)
+Cohesion: 0.15
+Nodes (16): quant, all_zeros_row_safe(), cpu_fwht_128(), encode_mq4g128_from_fp16(), EncodedMQ4G128, encoder_produces_expected_byte_count(), matching_prefixes_on_gfx1151(), Decide whether to apply MQ4G128 encoding to a weight at load time. Returns `true (+8 more)
 
 ### Community 229 - "Kernel Compilation"
-Cohesion: 0.11
-Nodes (21): cstr, fmt, io_err(), check(), HipError, HipError::fmt(), HipError::from_code(), HipError::is_unsupported() (+13 more)
+Cohesion: 0.14
+Nodes (17): cstr, Display, io_err(), HipError, HipError::from_code(), HipError::is_unsupported(), HipError::new(), HipError::unsupported() (+9 more)
 
 ### Community 230 - "AMD DRM Context"
-Cohesion: 0.33
-Nodes (6): encode_long_input_pq_stress(), gpt2_pretok_re(), GPT-2 BPE encoding (for Qwen3, etc.) Implementation: O(N log N) priority-queue B, BPE-encode a single pre-tokenized chunk (byte slice from `gpt2_pretok_re().find_, Tokenizer::encode_gpt2_bpe(), Tokenizer::encode_gpt2_chunk()
+Cohesion: 0.13
+Nodes (15): byte_to_gpt2_char(), encode_empty_and_single(), encode_full_cascade(), encode_leftmost_on_tie_priority(), encode_long_input_pq_stress(), encode_no_merges(), encode_partial_merge(), gpt2_pretok_re() (+7 more)
 
 ### Community 231 - "Test fixtures"
-Cohesion: 0.13
-Nodes (22): block_scores_well_formed_rejects_nan_inf_and_all_zero(), coalesce(), CompressedPrompt, drafter_vram_estimate_bytes(), hfq_parameter_count(), load_drafter(), parse_drafter_state_quant(), PflashTimings (+14 more)
+Cohesion: 0.07
+Nodes (48): block_scores_well_formed_rejects_nan_inf_and_all_zero(), BlockScores, BlockScores::well_formed(), coalesce(), CompressedPrompt, compute_scores_batched(), compute_scores_batched_gpu(), compute_scores_cpu() (+40 more)
 
 ### Community 232 - "KV Cache Compression"
 Cohesion: 0.16
 Nodes (15): atomicu32, apply_special_token_attractor_block(), apply_unclosed_attractor_block(), attractor_block_at_threshold(), attractor_block_below_threshold(), attractor_block_oob_token_is_noop(), attractor_block_pure_repeat(), attractor_block_window_scoped() (+7 more)
 
 ### Community 233 - "Worker-Key Model Compatibility"
-Cohesion: 0.14
-Nodes (23): normalize_scheduler_name(), SchedulerConfig, SchedulerConfig::resolve_request_scheduler(), betas_for_alpha_bar(), DiffusionSchedule::flow_match_euler(), DiffusionSchedule::from_config(), DiffusionSchedule::linear(), dpm_solver_train_timesteps() (+15 more)
+Cohesion: 0.16
+Nodes (21): SchedulerConfig, betas_for_alpha_bar(), DiffusionSchedule::flow_match_euler(), DiffusionSchedule::from_config(), DiffusionSchedule::linear(), dpm_solver_train_timesteps(), DpmSolverAlgorithm, DpmSolverType (+13 more)
 
 ### Community 234 - "Token Attractor Blocks"
 Cohesion: 0.13
 Nodes (22): extract_patches(), preprocess_dynamic_image(), smart_resize(), DynamicImage, ImageError, extract_patches_locks_layout_and_order_4x4(), extract_patches_rejects_indivisible_grid(), extract_patches_supports_sms_4() (+14 more)
 
 ### Community 235 - "Jinja Chat Rendering"
-Cohesion: 0.11
-Nodes (22): Tree-aware variant of `conv1d_silu_split_f32_n`. `parent_indices[t]` is the line, Tree-aware variant of `gated_delta_net_q8_batch_seq`. Per-token S-tile persist-w, Gated linear-recurrence scan forward (fp32). `g`,`u`,`h_out`: `[seq*D]` row-majo, Gated linear-recurrence scan backward (fp32). Given `d_hout`=dL/dh[t] for every , dl, n_tokens, Backward: given `d_hout` `[seq*D]` (dL/dh[t]), produce `(d_g, d_u)` `[seq*D]`. `, Gated linear-recurrence scan (fp32 training twin) — the token-mixer for the GLA- (+14 more)
+Cohesion: 0.13
+Nodes (18): Tree-aware variant of `conv1d_silu_split_f32_n`. `parent_indices[t]` is the line, Tree-aware variant of `gated_delta_net_q8_batch_seq`. Per-token S-tile persist-w, Gated linear-recurrence scan forward (fp32). `g`,`u`,`h_out`: `[seq*D]` row-majo, Gated linear-recurrence scan backward (fp32). Given `d_hout`=dL/dh[t] for every , dl, n_tokens, Backward: given `d_hout` `[seq*D]` (dL/dh[t]), produce `(d_g, d_u)` `[seq*D]`. `, Gated linear-recurrence scan (fp32 training twin) — the token-mixer for the GLA- (+10 more)
 
 ### Community 236 - "EOS Filter Config"
-Cohesion: 0.03
-Nodes (60): Gpu, Gpu::add_f32(), Gpu::add_f32_graph_safe(), Gpu::add_inplace_f32(), Gpu::alpha_gate_f32(), Gpu::apply_rope_2d_vision_f32(), Gpu::gelu_mul_f32(), Gpu::gelu_tanh_f32() (+52 more)
+Cohesion: 0.07
+Nodes (34): Elementwise sigmoid backward (fp32). `out` is the saved forward output; `d_x = d, Training SwiGLU forward (fp32): `out = silu(gate)*up`, all `[n]`., Training SwiGLU backward (fp32). Produces `d_gate`,`d_up` `[n]`., Elementwise sigmoid forward (fp32). `x`→`out` `[n]`., Batched RMSNorm: normalize `batch` vectors of length `n` independently. x and ou, DeepSeek V4 indexer scoring — combined across heads with relu gating. `scores[n], Batched HFQ4-G256 embedding lookup. Dequantizes N rows in a single launch, readi, N-batched variant of `gemv_hfq4g256_residual_sigmoid_scaled_gpu`. `x_batch` is [ (+26 more)
 
 ### Community 237 - "Mamba Prefill Convolution"
 Cohesion: 0.09
-Nodes (23): build_byte_to_id(), byte_to_gpt2_char(), encode_empty_and_single(), encode_full_cascade(), encode_leftmost_on_tie_priority(), encode_no_merges(), encode_partial_merge(), gemma_style_tokenizer_is_not_gpt2_despite_stray_g_token() (+15 more)
+Nodes (32): build_byte_to_id(), gemma_style_tokenizer_is_not_gpt2_despite_stray_g_token(), gpt2_meta_full_bytes(), json_has_component_type(), Build a SentencePiece-mode meta JSON. Skips byte-coverage check., Build a GPT-2-mode meta JSON. Triggers byte-coverage check. `tokens` becomes `[b, Resolve a list of `(left_string, right_string)` merge pairs into a rank-ordered , For GPT-2 BPE tokenizers: build the byte → token-id lookup table by running ever (+24 more)
 
 ### Community 238 - "HFQ Module Table & Experts"
 Cohesion: 0.08
-Nodes (59): feed, finish, Reasoning, continues_past_param_without_string_attr(), drain(), escape_tool_result_body(), malformed_tool_call_passes_through_at_finish(), new_in_think_treats_stream_as_reasoning_until_close() (+51 more)
+Nodes (60): feed, finish, Reasoning, continues_past_param_without_string_attr(), drain(), escape_tool_result_body(), malformed_tool_call_passes_through_at_finish(), new_in_think_treats_stream_as_reasoning_until_close() (+52 more)
 
 ### Community 239 - "KLD Scoring Math"
 Cohesion: 0.19
 Nodes (17): kld_is_positive_for_different_distribution(), log_z(), nll_of_argmax_is_smallest(), PositionScore, Log-partition `log Z = log Σ_i exp(logit_i)`, computed in fp64 with the standard, THE invariant the whole refactor enforces: scoring a candidate against a referen, Top-K log-softmax reduction of a full logit row — the reference-side representat, Pure fp64 reduction + KLD scoring math. Faithful extraction of the two implement (+9 more)
 
 ### Community 240 - "Report Generation"
-Cohesion: 0.23
-Nodes (15): header(), json_renders(), markdown_renders(), md5_is_stable(), overall_fail(), overall_ok(), pipe_in_detail_escaped(), prompt_md5() (+7 more)
+Cohesion: 0.22
+Nodes (17): header(), json_renders(), markdown_renders(), md5_is_stable(), overall_fail(), overall_ok(), pipe_in_detail_escaped(), prompt_md5() (+9 more)
 
 ### Community 241 - "Hessian Matrix Storage"
-Cohesion: 0.07
-Nodes (40): hfq::modules, AttnRole, ByteRange, ExpertRole, ExpertShape, ModulePagerStats, NormKind, open_hfq() (+32 more)
+Cohesion: 0.08
+Nodes (37): hfq::modules, align_down(), align_up(), AttnRole, DirectH2DTransport::read_into_staging(), ExpertRole, ModulePagerStats, NormKind (+29 more)
 
 ### Community 242 - "Bitpacking Codec"
 Cohesion: 0.12
 Nodes (17): atomic, c_ulong, AqlPacket, kfd_ior(), kfd_iow(), kfd_iowr(), KfdAcquireVmArgs, KfdAllocMemoryArgs (+9 more)
 
 ### Community 243 - "MQ4G128 Codec"
-Cohesion: 0.06
-Nodes (37): new_for_slot_with_kv_mode, MtpComposeState::new(), Allocate per-generation MTP buffers. Caller still allocates and owns dflash-side, argmax_u32(), mtp_probe_step(), MtpProbeState::update_mask(), MtpProbeStats, Eq 4: `mask <- (1 - λ) * mask + λ * just_committed_embed`. (+29 more)
+Cohesion: 0.15
+Nodes (12): argmax_u32(), mtp_probe_step(), MtpProbeState::update_mask(), MtpProbeStats, Eq 4: `mask <- (1 - λ) * mask + λ * just_committed_embed`., Per-cycle counters. τ = `(committed_real + committed_speculative) / cycles`. Bas, Run one MTP probe cycle. Returns `(committed_tokens, eos_hit)` where `committed_, Qualcomm-style training-free MTP probe (arXiv 2603.17942). v1 — engine-surface v (+4 more)
 
 ### Community 244 - "Generic Fallback Warning"
 Cohesion: 0.14
 Nodes (14): BitpackedIdx, RawF32, RawU32, bitpack(), bitpack_edge_widths(), bitpack_ratio(), bitpack_round_trips_at_vocab_width(), bits_for_vocab() (+6 more)
 
 ### Community 245 - "Cache Eviction"
-Cohesion: 0.07
-Nodes (38): ArchEntry, check_file(), GateEntry, GenModelSupportArgs, QuantEntry, Reject malformed support marks early with a clear message (otherwise a typo woul, Replace the content between the generated markers (exclusive), preserving the ma, `hipfire gen-model-support` (hidden) — render the model-support matrix from its  (+30 more)
+Cohesion: 0.11
+Nodes (20): construct_devices(), Gpus::from_parts(), Gpus::init_layers(), Gpus::init_tp(), Gpus::init_uniform(), preflight_vram_with_opts(), Explicit escape hatch for asymmetric VRAM / hand-tuned splits. Keeps arch-mismat, Tensor-parallel constructor: bring up `tp_size` devices that each run *every** l (+12 more)
 
 ### Community 246 - "Special Token Leak"
-Cohesion: 0.13
-Nodes (21): dflash_batched_lm_head_supported(), dflash_download_verify_argmax(), dflash_enqueue_verify_lm_head(), dflash_enqueue_verify_lm_head_argmax(), dflash_verify_graph_enabled_from_env_value(), DflashVerifyOutput, HiddenStateRingBuffer::commit_staging_to_ring(), Persistent per-decode-cycle scratch for the target verify pass and the draft lm_ (+13 more)
+Cohesion: 0.24
+Nodes (13): Serde types shared between the hipfire server (`hipfire-server`) and the WASM ad, serde, CommandResult, eval_task(), eval_task_file(), EvalResult, run_shell(), generated_id() (+5 more)
 
 ### Community 247 - "Daemon Transport"
 Cohesion: 0.19
 Nodes (16): CompletenessOnly, hashset, dedups_per_tuple_and_counts(), enabled(), generic_fallback_count(), KernelMode, Quality, Forward shape the kernel runs in. Decode = single-token (GEMV-shaped); Prefill = (+8 more)
 
 ### Community 248 - "FWHT GPTQ Quantization"
-Cohesion: 0.13
-Nodes (10): moe_resolve_k8_mq4_indexable_uses_gpu_topk(), moe_resolve_k_ne_8_falls_back_to_cpu(), moe_resolve_mq6_indexable(), moe_resolve_needs_x_rot_local_when_gate_side_mq4(), moe_resolve_no_rotation_when_all_f32(), moe_resolve_non_indexable_routed_falls_back(), moe_resolve_paro_indexable(), moe_resolve_paro_without_sidecar_falls_back() (+2 more)
+Cohesion: 0.12
+Nodes (12): MiniMax-M2 forward pass (free functions — hot-path static dispatch). Per-layer p, MoE, moe_resolve_k8_mq4_indexable_uses_gpu_topk(), moe_resolve_k_ne_8_falls_back_to_cpu(), moe_resolve_mq6_indexable(), moe_resolve_needs_x_rot_local_when_gate_side_mq4(), moe_resolve_no_rotation_when_all_f32(), moe_resolve_non_indexable_routed_falls_back() (+4 more)
 
 ### Community 249 - "Tensor Parallel Sharding"
 Cohesion: 0.21
@@ -1566,44 +1570,44 @@ Cohesion: 0.18
 Nodes (4): deserialize, LFM2.5-MoE config, parsed from the HFQ `metadata_json` envelope (which carries t, RawLfm2MoeConfig, RawRope
 
 ### Community 252 - "Training kernels"
-Cohesion: 0.19
-Nodes (14): Item, Iterator, HessianSidecar::imatrices(), HessianSidecar::tensors(), ImatrixRef<'a>, ImatrixRef<'a>::iter_f32(), Iterate all stored Hessians. Used for bulk validation passes (e.g. symmetry / PS, Iterate all stored imatrix vectors, including routed experts that do not have a  (+6 more)
+Cohesion: 0.16
+Nodes (17): Item, Iterator, HessianRef<'a>, HessianRef<'a>::iter_f64(), HessianSidecar::imatrices(), HessianSidecar::tensors(), ImatrixRef<'a>, ImatrixRef<'a>::iter_f32() (+9 more)
 
 ### Community 253 - "Speculative Decoding"
-Cohesion: 0.11
-Nodes (28): quant, aggregate_scores(), aggregate_z_score_max_gqa(), CaskCtx, CaskCtx::free_gpu(), CaskCtx::maybe_evict(), CaskCtx::new(), dequant_q8_row() (+20 more)
+Cohesion: 0.12
+Nodes (27): aggregate_scores(), aggregate_z_score_max_gqa(), CaskCtx, CaskCtx::free_gpu(), CaskCtx::maybe_evict(), CaskCtx::new(), dequant_q8_row(), dequant_requant_q8_near_exact() (+19 more)
 
 ### Community 254 - "Tiny model fixtures"
 Cohesion: 0.14
 Nodes (18): apply_fwht_per_256_to_weights_f64(), BlockGrid, compute_frozen_block_grids(), frozen_grid_matches_quantize_mq4g256_formula(), fwht_per_256_weights_preserves_parseval(), gptq_pipeline_identity_matches_rtn_on_rotated(), gptq_pipeline_mq4g256(), pack_mq4g256_from_rotated_f64() (+10 more)
 
 ### Community 255 - "Multi-GPU Device Splitting"
-Cohesion: 0.13
-Nodes (18): resolve_model_display_tag(), build_llm_registry_in(), draft_matches_model(), file_len(), LlmModelRegistry, LlmModelRegistryEntry, matching_assets(), metadata_artifact_arch() (+10 more)
+Cohesion: 0.18
+Nodes (15): build_rope_2d_tables(), hand_computed_2x2_head8(), inv_freq_endpoints_match_formula(), n_patches(), patch_enumeration_matches_dots_ocr_reshape_permute(), Convenience: number of patches a (grid_h, grid_w) image will produce., Construct hpos/wpos arrays the way dots.ocr does in `get_pos_ids_by_grid`, then , Hand-compute cos/sin for a 2×2 grid with sm=2, head_dim=8, theta=10000 and verif (+7 more)
 
 ### Community 256 - "Speed Benchmark Harness"
 Cohesion: 0.13
 Nodes (25): Deterministic CPU oracle backends and module evidence contracts., dense_ffn_contract_names_oracle_gpu_and_opt_in_npu_backends(), tiny_swiglu_down_bf16_cpu(), attention_wo_module_id(), attention_wo_residual_contract_from_shape(), bf16_bits_to_f32(), Bf16DownShadow, decode_bf16_and_f32_shadow() (+17 more)
 
 ### Community 257 - "Band Accumulator"
-Cohesion: 0.18
-Nodes (8): HipRuntime::host_malloc(), HostBuffer, HostBuffer::as_mut_slice(), HostBuffer::raw_ptr(), HIP page-locked host allocation., Caller must ensure no GPU operation is concurrently reading this host allocation, Alias for `as_mut_ptr` used by the TP/RCCL collective callers (which take a raw , Allocate page-locked host memory through HIP. This is the staging allocation to 
+Cohesion: 0.11
+Nodes (16): Send, Event, HipRuntime::event_create(), HipRuntime::host_malloc(), HipRuntime::module_load(), HipRuntime::module_load_data(), HostBuffer, HostBuffer::as_mut_slice() (+8 more)
 
 ### Community 258 - "HFQ Module Streaming"
-Cohesion: 0.24
-Nodes (9): f32_to_bf16_bits(), HfqEntry, is_norm(), parse_hfq(), patch_norms_inplace(), Is this tensor one of the RMSNorm weights recovery tunes?, Patch a parsed HFQM byte buffer in place: overwrite each BF16 norm tensor named , Minimal `.hfq` (HFQM container) reader + in-place norm patcher for Path-A export (+1 more)
+Cohesion: 0.14
+Nodes (16): Range, Q heads owned per rank (`n_heads / tp_size`). Caller must have `validate`d divis, Half-open Q-head range owned by `rank`., Half-open KV-head range present on `rank`. Full set when replicated., Half-open VALUE-head range owned by `rank`., Half-open KEY-head range owned by `rank` (q + k blocks of wqkv)., Row range of the gated `wq` (`[n_heads·head_dim·2, dim]`) owned by `rank`. Each , Column range of `wo` (`[dim, n_heads·head_dim]`) consumed by `rank` (one `head_d (+8 more)
 
 ### Community 259 - "Generate Request Building"
-Cohesion: 0.10
-Nodes (27): hfq_quantization_hash_metadata(), HfqTensor, insert_parameter_counts_metadata(), is_routed_expert_tensor_name(), maybe_spill(), metadata_with_quantization_hash(), parameter_counts_metadata(), parameter_counts_metadata_records_dense_counts() (+19 more)
+Cohesion: 0.12
+Nodes (23): BufWriter, hfq_quantization_hash_metadata(), HfqTensor, maybe_spill(), metadata_with_quantization_hash(), quantization_hash_is_inserted_into_metadata(), QuantType, Streaming tensor spill file. When the quantizer accumulates more than `SPILL_THR (+15 more)
 
 ### Community 260 - "TUI Main Program"
-Cohesion: 0.08
-Nodes (39): Gpu, Gpu::gemm_gate_up_hfp4g32(), Gpu::gemm_gate_up_hfp4g32_wmma(), Gpu::gemm_gate_up_hfq2g256(), Gpu::gemm_gate_up_hfq3g256(), Gpu::gemm_gate_up_hfq3g256_dot2(), Gpu::gemm_gate_up_hfq3g256_dp4a(), Gpu::gemm_gate_up_hfq3g256_fp16() (+31 more)
+Cohesion: 0.18
+Nodes (11): Fused cross-entropy (logsoftmax + NLL) with `ignore_index` masking. Forward and , KL distillation loss (soft-target cross-entropy). One fused call: per-row `loss , rdna::compute, cfg_from_env(), compress_host(), KvNoiseCfg, quant_vec(), KV-compression sim-noise for recovery-FT probes (KVarN-4bit + CASK merge). Injec (+3 more)
 
 ### Community 261 - "Embedding Cache LRU"
-Cohesion: 0.13
-Nodes (16): AqlQueue, AqlQueue::dispatch(), AqlQueue::dispatch_and_wait(), AqlQueue::kfd_alloc(), AqlQueue::kfd_alloc_userptr(), AqlQueue::kfd_map(), AqlQueue::new(), KfdUserAlloc (+8 more)
+Cohesion: 0.07
+Nodes (29): AtomicU64, Hit/miss counters (cheap, lock-free), for the cache-hit observability the pipeli, A content-addressed, on-disk LRU cache for projected vision embeddings., Total payload bytes currently held., Drop every entry and the manifest., AqlQueue, AqlQueue::dispatch(), AqlQueue::dispatch_and_wait() (+21 more)
 
 ### Community 262 - "KLD Environment Config"
 Cohesion: 0.15
@@ -1614,12 +1618,12 @@ Cohesion: 0.15
 Nodes (16): ev(), first_128_clean_passes(), first_128_eot_trims(), first_128_path_a_attractor_fails(), first_128_short_window_skipped(), last_128_attractor_at_tail_fails(), last_128_clean_diverse_tail_ok(), last_128_soft_warn_at_max_freq_above_0_4() (+8 more)
 
 ### Community 264 - "Opus Quant Activation"
-Cohesion: 0.25
-Nodes (10): clone_tensor_peer(), clone_tensor_same(), peer_clone_2d(), peer_clone_tensor(), Cross-device variant of [`peer_clone_tensor`]: requires distinct `src_gpu` and `, Convenience: clone an `[m, k]` tensor of arbitrary dtype. Asserts the source sha, Allocate a same-shape, same-dtype tensor on `dst_gpu` and peer-copy the bytes fr, NOTE: this same-device branch is no longer reachable from new (+2 more)
+Cohesion: 0.16
+Nodes (14): NemotronModel::forward(), NemotronModel::forward_capture(), NemotronModel::forward_gpu(), NemotronModel::logits_tensor(), NemotronModel::prefill_batched(), Decode one token at `pos`, leaving the `[vocab]` logits in `self.logits` *on the, Batched N6 prefill: process the whole prompt through the residual stream in batc, Like `forward_gpu`, but downloads the residual-stream hidden state after the emb (+6 more)
 
 ### Community 265 - "Cholesky Decomposition"
-Cohesion: 0.18
-Nodes (18): ensure_rank_streams, layer_idx, run_layer_program_ep, mtp_capture_hidden(), mtp_forward(), mtp_forward_ep(), mtp_head(), mtp_head_compute() (+10 more)
+Cohesion: 0.17
+Nodes (12): la_idx, new_for_config, GdnTapeShards, GdnTapeShards::assemble_into(), GdnTapeShards::free_gpu(), GdnTapeShards::new(), GdnTapeShards::replay_gdn_multi(), GdnTapeShards::shard_mut() (+4 more)
 
 ### Community 266 - "Mixer Architecture"
 Cohesion: 0.25
@@ -1630,12 +1634,12 @@ Cohesion: 0.17
 Nodes (16): Mat, cholesky_dampens_singular_matrix(), cholesky_succeeds_on_spd(), cholesky_terminates_on_singular_h_with_zero_initial_damp(), cholesky_with_adaptive_damping(), CholeskyError, clamped_initial_damp(), compute_damped_inv_cholesky_upper() (+8 more)
 
 ### Community 268 - "PM4 Command Builder"
-Cohesion: 0.07
-Nodes (26): bf16_bits(), DflashTiny, emit_fixture(), emit_is_deterministic_for_seed(), emit_new_families_are_deterministic(), Gemma3Tiny, gen_bytes(), MiniMaxTiny (+18 more)
+Cohesion: 0.15
+Nodes (9): emit_fixture(), emit_is_deterministic_for_seed(), emit_new_families_are_deterministic(), moe_manifest_has_experts_router_shared_and_is_tiny(), n_params(), Qwen35Tiny::moe_preset(), Emit a tiny random-init fixture for `arch` into `out_dir` (created if absent). W, Total param count for a manifest, for the <10M tiny budget assert. (+1 more)
 
 ### Community 269 - "Tool-Call Validation"
-Cohesion: 0.17
-Nodes (13): Config, `Architecture` trait implementation for the LLaMA family. Mirrors PR 8's qwen35 , State, Weights, hipfire-arch-llama: LLaMA / Mistral / plain-Qwen3 architecture. This crate imple, dtype::rotation::plan, Llama, Llama::config_from_hfq() (+5 more)
+Cohesion: 0.07
+Nodes (42): arch, build_rope_2d_tables, clip_normalise, config_from_metadata_json, hipfire-arch-dots-ocr: dots.ocr layout-analysis VLM. Implements [`hipfire_runtim, Config, `Architecture` trait implementation for the LLaMA family. Mirrors PR 8's qwen35 , State (+34 more)
 
 ### Community 270 - "Redline Phase Status"
 Cohesion: 0.20
@@ -1650,24 +1654,24 @@ Cohesion: 0.23
 Nodes (14): clean_tool_call_passes(), malformed_json_hard_fail(), missing_arguments_field_hard_fail(), missing_name_field_hard_fail(), Tool-call shape detector — port of `scripts/agentic-gate.sh:487-509`. Runs four , run(), stacked_openers_hard_fail(), tok() (+6 more)
 
 ### Community 273 - "Checkpoint management"
-Cohesion: 0.19
-Nodes (14): compute_topk, CpuRouter::compute_topk(), CpuRouter::from_f32_weights(), deterministic_weights(), Result of [`CpuRouter::compute_topk`]. Indices are u16 because hipfire's MoE con, Construct from already-dequantized F32 weights. The loader is responsible for co, CPU-side router replica (MAD-93 v0.1). Replicates the per-layer MoE router GEMV , The router is small: for Qwen3.5-MoE-A3B it's `[256, 2048]` per layer ≈ 256 KB s (+6 more)
+Cohesion: 0.16
+Nodes (17): compute_topk, CpuRouter, CpuRouter::compute_topk(), CpuRouter::from_f32_weights(), deterministic_weights(), Result of [`CpuRouter::compute_topk`]. Indices are u16 because hipfire's MoE con, Per-layer router weight in F32 plus optional sigmoid/softmax-normed weights for , Construct from already-dequantized F32 weights. The loader is responsible for co (+9 more)
 
 ### Community 274 - "Non-GEMV Analysis"
-Cohesion: 0.16
-Nodes (18): CpuRouter, Per-layer router weight in F32 plus optional sigmoid/softmax-normed weights for , PreadH2DTransport, PreadH2DTransport::fetch(), PreadH2DTransport::open(), PreadH2DTransport::path(), PreadH2DTransport::pread_into_staging(), Abstraction over how the pager moves bytes from host storage to VRAM. *This is t (+10 more)
+Cohesion: 0.17
+Nodes (9): LlamaBackend, LlamaBackend::caps(), LlamaBackend::decode_step(), LlamaBackend::logits(), LlamaBackend::prefill(), LlamaBackend::reset_session(), LlamaBackend::unload(), Serving backend for the dense LLaMA / Mistral / plain-Qwen3 family (arch_id 0/1) (+1 more)
 
 ### Community 275 - "Admin authentication"
-Cohesion: 0.25
-Nodes (14): DiffusionImg2ImgArgs, DiffusionPreflightArgs, load_rgb_image(), load_rgb_image_batch(), load_rgb_image_batch_decodes_png_and_rejects_shape_mismatch(), Resolve generation runtime options. hipfire is HIP/ROCm-first: the GPU is the de, resolve_model_path(), resolve_runtime_options() (+6 more)
+Cohesion: 0.28
+Nodes (13): DiffusionImg2ImgArgs, load_rgb_image(), load_rgb_image_batch(), load_rgb_image_batch_decodes_png_and_rejects_shape_mismatch(), Resolve generation runtime options. hipfire is HIP/ROCm-first: the GPU is the de, resolve_model_path(), resolve_runtime_options(), run() (+5 more)
 
 ### Community 276 - "Vision Embedding Cache"
 Cohesion: 0.35
 Nodes (11): repo_root(), examples_executor_available_for(), home_dir(), newest_existing_path(), resolve_bench_qwen35_speed_bin(), resolve_collect_artifacts_bin(), resolve_dflash_spec_demo_bin(), resolve_host_profile_bin() (+3 more)
 
 ### Community 277 - "Vision Patch Extraction"
-Cohesion: 0.17
-Nodes (19): Event, sse_json_event(), done(), EosImmediate, EosImmediate::default(), EosImmediate::finalize(), EosImmediate::new(), EosImmediate::observe() (+11 more)
+Cohesion: 0.18
+Nodes (18): Event, sse_error(), done(), EosImmediate, EosImmediate::default(), EosImmediate::new(), EosImmediate::observe(), no_done_event_skipped() (+10 more)
 
 ### Community 278 - "CPU MoE Router"
 Cohesion: 0.20
@@ -1678,8 +1682,8 @@ Cohesion: 0.10
 Nodes (21): fa_layer_idx, MutexGuard, capture_finish_token(), install_capture(), install_tap(), install_tap_gpu(), Per-token raw capture of pre-RoPE Q and K across all FA layers. Populated by the, Call after each full forward pass (one token) to commit the captured rows to the (+13 more)
 
 ### Community 280 - "Model Checkpoint Discovery"
-Cohesion: 0.05
-Nodes (45): c, Per-row temperature-scaled softmax probability gather. For each row `r` in `[0, , Calibration: `acc[c] += Σ_n x[n,c]²` (per-column sum-of-squares, the imatrix / d, Per-row top-K + log-sum-exp over `[B × vocab]` f32 logits. Writes `top_idx[B × K, kh, kw, r, Normalise an RGB u8 image to CHW f32 with CLIP mean/std. Input: `rgb` is a tight (+37 more)
+Cohesion: 0.15
+Nodes (14): c, Per-row temperature-scaled softmax probability gather. For each row `r` in `[0, , Calibration: `acc[c] += Σ_n x[n,c]²` (per-column sum-of-squares, the imatrix / d, Per-row top-K + log-sum-exp over `[B × vocab]` f32 logits. Writes `top_idx[B × K, kh, kw, r, Normalise an RGB u8 image to CHW f32 with CLIP mean/std. Input: `rgb` is a tight (+6 more)
 
 ### Community 281 - "MQ4 Quantization"
 Cohesion: 0.19
@@ -1694,8 +1698,8 @@ Cohesion: 0.14
 Nodes (13): 0. DONE — MQ6-experts QUALITY lever (opt-in): `HIPFIRE_LFM2_EXPERT_MQ6=1`, 0. DONE — proj-MQ4 perf lever (+7.2%, opt-in): `HIPFIRE_LFM2_PROJ_MQ4=1`, 1. Perf: further tuning (task #9) — baseline 241 tok/s (Q8) / 259 (proj-MQ4 opt-in), 2. Quality: KLD vs llama.cpp / higher-precision sweep, 3. Prefill batching (perf, larger win for long prompts), 4. Coherence gate entry (task #8), 5. Spec-decode / DFlash (optional, large effort), Architecture recap (ground truth: transformers lfm2_moe + repo config.json) (+5 more)
 
 ### Community 284 - "HFQ Container Tools"
-Cohesion: 0.20
-Nodes (10): for_compressed_mtp, for_full_vocab_mtp, MirroredTrunkWeights, MirroredTrunkWeights::drafter_bytes(), MirroredTrunkWeights::free_gpu(), MirroredTrunkWeights::token_embd_dtype(), Hetero-MTP view of the trunk weights that the MTP head's per-step forward path a, Free the drafter-side clones. Pass the SAME `drafter_gpu` instance that allocate (+2 more)
+Cohesion: 0.24
+Nodes (11): bf16_bits(), gen_bytes(), Generate little-endian bytes for one tensor at its declared dtype., Write a safetensors file: [u64 LE header len][JSON header][concatenated data]., Deterministic splitmix64 → reproducible fixtures across machines., Uniform f32 in [-1, 1)., f32 → bf16 bits, round-to-nearest-even., SplitMix64 (+3 more)
 
 ### Community 285 - "LFM2 Hidden Capture"
 Cohesion: 0.14
@@ -1706,12 +1710,12 @@ Cohesion: 0.14
 Nodes (13): 9B MQ4 non-GEMV breakdown by category, Diagnosis: dispatch latency dominates, not memory traffic, Files, Method, Non-GEMV cost analysis (gfx1100, RX 7900 XTX), Per-kernel detail (9B MQ4, 16 measured forwards), Per-model breakdown (16 measured forwards each), Recommendation (+5 more)
 
 ### Community 287 - "QTIP Quantization"
-Cohesion: 0.18
-Nodes (9): AdamW, AdamW::load_state(), AdamW::new(), AdamW::save_state(), bytemuck_f32(), Restore optimizer state from host buffers (resume). Sizes/order must match const, Allocate zeroed moment state for params of the given element counts. The order o, AdamW optimizer (fp32, decoupled weight decay) for the training path. Owns the p (+1 more)
+Cohesion: 0.20
+Nodes (10): Glyph for a tri-state arch-feature support level., tri(), ArchFeatures, FeatureSupport, FeatureSupport::is_full(), FeatureSupport::mark(), Tri-state support level for an arch capability., Compact ASCII mark: `y`/`~`/`-`/`?`. (+2 more)
 
 ### Community 288 - "Gemma3 Architecture"
-Cohesion: 0.22
-Nodes (9): Full-model calibration accumulator. One bank of BandAccumulators per (layer, hea, Feed one pre-RoPE Q sample: `q` is [n_heads × head_dim] interleaved (band f = co, Feed a batch of samples at once. `q_batch` is [batch × n_heads × head_dim]., Remove and return the calibration tap, disabling the global hook., take_tap(), TriAttnCalibState, TriAttnCalibState::add_batch(), TriAttnCalibState::add_sample() (+1 more)
+Cohesion: 0.13
+Nodes (15): BandAccumulator, BandAccumulator::finalize(), CPU-side accumulator for a single (layer, head, band) triple. Sums complex q_f a, Full-model calibration accumulator. One bank of BandAccumulators per (layer, hea, Feed one pre-RoPE Q sample: `q` is [n_heads × head_dim] interleaved (band f = co, Feed a batch of samples at once. `q_batch` is [batch × n_heads × head_dim]., Remove and return the calibration tap, disabling the global hook., Called from the FA layer pre-RoPE point. `q` is `[n_heads × head_dim]` pre-RoPE  (+7 more)
 
 ### Community 289 - "Sampling Policy Config"
 Cohesion: 0.10
@@ -1722,36 +1726,36 @@ Cohesion: 0.24
 Nodes (13): ChunkResult, decode(), encode(), One scored chunk's aggregate KLD statistics., Serialize chunk results into the HFKSEQ v2 byte layout., Parse the HFKSEQ v2 byte layout., `HFKSEQ` — the per-sequence KLD result file consumed by `kld_reduce.py`. Layout , Write HFKSEQ to a path (creates parent dirs). (+5 more)
 
 ### Community 291 - "Fused GateUp Kernels"
-Cohesion: 0.27
-Nodes (10): gemv_hfp4g32_for_arch(), gemv_hfq3g256_for_arch(), gemv_hfq3g256_residual_for_arch(), gemv_hfq4g256_residual_for_arch(), module_names_are_valid_identifiers(), HFP4-G32 GEMV arch dispatch. v1: gfx1100 variant is the byte-exact baseline (cur, Same arch dispatch as `gemv_hfq4g256_for_arch` but returns the residual variant , Returns the HFQ3-G256 GEMV kernel source AND module name for the given arch. gfx (+2 more)
+Cohesion: 0.20
+Nodes (10): kv_dim, HierKvState::idle_compact(), HierKvState::migrate_n(), Append one token's K/V (`fa_k`/`fa_v` = [kv_dim] head-major) into the hot ring a, Migrate the oldest `n_req` hot tokens into ONE new cold segment, then shift the , Deferred between-turns compaction (the "deferred-hierarchical" thesis). Run in t, kvarn_record_bytes(), kvarn_record_bytes_bits() (+2 more)
 
 ### Community 292 - "Fused QKV Kernels"
-Cohesion: 0.20
-Nodes (17): grammar, PrefillBatchScratch, advance_matcher_token(), apply_grammar_mask(), logits_argmax(), One acceptance window of speculative decoding., Standalone helper: compute argmax of a [vocab] logits vector. Used by `speculati, Caller-owned grammar state for tool-call constrained speculative decode. The dae (+9 more)
+Cohesion: 0.17
+Nodes (10): deepseek4, deepseekv4, grammar, hipfire-arch-deepseek4: DeepSeek V4 Flash architecture. DeepSeek V4 Flash archit, advance_matcher_token(), apply_grammar_mask(), Caller-owned grammar state for tool-call constrained speculative decode. The dae, DeepSeek V4 speculative decoding via the built-in MTP head (DeepSeek V3 §4 Multi (+2 more)
 
 ### Community 293 - "NPU/CPU FFN Backend"
-Cohesion: 0.11
-Nodes (28): GQA attention mixer shape for the `*` blocks., NemotronAttnGpu::new(), NemotronAttnGpu::new_quant(), HFQ path: q/k/v/o are pre-built quantized [`LinearWeight`]s., Mamba2BlockGpu::assemble(), Mamba2BlockGpu::new_quant(), HFQ path: `in_proj`/`out_proj` are pre-built quantized [`LinearWeight`]s; the re, AttnConfig (+20 more)
+Cohesion: 0.12
+Nodes (23): GQA attention mixer shape for the `*` blocks., seq_len, gqa_attention(), NemotronAttnGpu::new(), NemotronAttnGpu::new_quant(), HFQ path: q/k/v/o are pre-built quantized [`LinearWeight`]s., CPU reference: causal GQA attention (NoPE) for one query against the full `[seq_, nemotron_h GQA attention (`*`) block — **NoPE** decode + KV cache. Confirmed fro (+15 more)
 
 ### Community 294 - "MTP Forward Pass"
-Cohesion: 0.20
-Nodes (10): compare(), match_serializes_to_minimal_shape(), mismatch_reports_first_index_and_window(), ParityReport, prefix_mismatch_uses_shorter_len(), Result of comparing an AR token stream against a DFlash token stream., Compare an AR baseline token stream against a DFlash stream. On divergence, `fir, AR vs DFlash token-parity comparison. Unlike the single-stream `Detector`s, pari (+2 more)
+Cohesion: 0.18
+Nodes (11): serialize, compare(), match_serializes_to_minimal_shape(), mismatch_reports_first_index_and_window(), ParityReport, prefix_mismatch_uses_shorter_len(), Result of comparing an AR token stream against a DFlash token stream., Compare an AR baseline token stream against a DFlash stream. On divergence, `fir (+3 more)
 
 ### Community 295 - "HFQ File I/O"
 Cohesion: 0.24
 Nodes (13): beam_encode_group_bits(), build_codebook(), cpu_fwht_256(), decode_1mad(), decode_group_bits(), gen_fwht_signs(), group_scale(), optimal_scale_bits() (+5 more)
 
 ### Community 296 - "Step Timing Detection"
-Cohesion: 0.12
-Nodes (25): BandCenter, BandCenter::magnitude(), BandCenter::mrl(), BandCenter::phase(), EvictionCtx::new(), RoPE frequency ω_f = θ^{-2f/d_rot} where d_rot = partial_rotary_factor × head_di, Download + convert to the same TriAttnCenters format the CPU path produces. Uses, Trigonometric series score for one key at position `p_k` vs query at position `p (+17 more)
+Cohesion: 0.18
+Nodes (16): abs_q_f, BandCenter, BandCenter::magnitude(), BandCenter::mrl(), BandCenter::phase(), RoPE frequency ω_f = θ^{-2f/d_rot} where d_rot = partial_rotary_factor × head_di, Q-side centers for one (layer, head, band) triple. Stored fields use pre-RoPE se, Trigonometric series score for one key at position `p_k` vs query at position `p (+8 more)
 
 ### Community 297 - "Vision Image Encoding"
-Cohesion: 0.11
-Nodes (14): Default, DiffusionBatchMetadata, LoopGuardMirror, LoopGuardMirror::check_trailing(), LoopGuardMirror::finalize(), LoopGuardMirror::new(), LoopGuardMirror::observe(), LoopGuardMirror::with() (+6 more)
+Cohesion: 0.28
+Nodes (7): LoopGuardMirror, LoopGuardMirror::check_trailing(), LoopGuardMirror::finalize(), LoopGuardMirror::new(), LoopGuardMirror::observe(), LoopGuardMirror::with(), Observational mirror of `crates/hipfire-runtime/src/loop_guard.rs`. Fires `Warn`
 
 ### Community 298 - "CLI Documentation"
-Cohesion: 0.22
-Nodes (9): `vision_forward`: SigLIP ViT over a `[num_patches, 3·patch²]` patch tensor → `[n, Run the SigLIP encoder. `patches` is row-major `[num_patches, 3·patch²]` (im2col, linear_bf16(), linear_f32(), maybe_dump_stage(), Debug: when `HIPFIRE_VISION_DUMP=<dir>` is set, write a vision-tower stage to `<, Batched linear `Y[n, out] = X[n, in] · W[out, in]ᵀ + bias`, F32. `gemm_f32_batch, BF16-weight linear `Y[n, out] = X[n, in] · W[out, in]ᵀ + bias`. `gemm_bf16_x_bf1 (+1 more)
+Cohesion: 0.40
+Nodes (5): `vision_forward`: SigLIP ViT over a `[num_patches, 3·patch²]` patch tensor → `[n, Run the SigLIP encoder. `patches` is row-major `[num_patches, 3·patch²]` (im2col, maybe_dump_stage(), Debug: when `HIPFIRE_VISION_DUMP=<dir>` is set, write a vision-tower stage to `<, vision_forward()
 
 ### Community 299 - "GEMV Type Variants"
 Cohesion: 0.15
@@ -1766,8 +1770,8 @@ Cohesion: 0.28
 Nodes (12): hipfire::scheduler, accelerator_inventory_json(), accelerator_inventory_json_reports_empty_contract_state(), AcceleratorInventory, AcceleratorInventory::not_probed(), server_accelerator_inventory(), server_prefill_scheduler_from_state(), server_prefill_scheduler_preserves_unprobed_compatibility() (+4 more)
 
 ### Community 302 - "HFQ Patch Parse"
-Cohesion: 0.06
-Nodes (38): cell, collections, Load the current write index with relaxed ordering., Get a mutable pointer to the packet slot for this index (indices wrap modulo que, ActivationCapture, gen_fwht_signs(), mq_signs_128_deterministic(), Activation-capture hook for the hipfire-native calibration path. The field on `G (+30 more)
+Cohesion: 0.10
+Nodes (20): cell, collections, Load the current write index with relaxed ordering., Get a mutable pointer to the packet slot for this index (indices wrap modulo que, gen_fwht_signs(), mq_signs_128_deterministic(), High-level GPU dispatch interface. Manages compiled kernels, provides typed tens, Generate `n` FWHT sign values (+1.0 / -1.0) from a simple LCG seeded with `seed` (+12 more)
 
 ### Community 303 - "HIP Kernel Compilation"
 Cohesion: 0.29
@@ -1775,23 +1779,23 @@ Nodes (8): aspect_scaled_dimension(), DiffusionTxt2ImgArgs, generate_highres_txt
 
 ### Community 304 - "Nemotron-H Forward Pass"
 Cohesion: 0.15
-Nodes (9): gemm::gate::up::hfq4g256::mmq::gfx906::body, gemm_gate_up_hfq4g256_mmq_gfx906_full_set_x16(), gemm_gate_up_hfq4g256_mmq_gfx906_x16(), gemm_gate_up_hfq4g256_mmq_gfx906_full_set_x16_y64(), gemm_gate_up_hfq4g256_mmq_gfx906_x16_y64(), gemm_gate_up_hfq4g256_mmq_gfx906_full_set_x32(), gemm_gate_up_hfq4g256_mmq_gfx906_x32(), gemm_gate_up_hfq4g256_mmq_gfx906_full_set_x64() (+1 more)
+Nodes (9): gemm::gate::up::hfq4g256::mmq::gfx906::body, gemm_gate_up_hfq4g256_mmq_gfx906_full_set_x16(), gemm_gate_up_hfq4g256_mmq_gfx906_x16(), gemm_gate_up_hfq4g256_mmq_gfx906_full_set_x16_y64(), gemm_gate_up_hfq4g256_mmq_gfx906_x16_y64(), gemm_gate_up_hfq4g256_mmq_gfx906_full_set_x32_y64(), gemm_gate_up_hfq4g256_mmq_gfx906_x32_y64(), gemm_gate_up_hfq4g256_mmq_gfx906_full_set_x64() (+1 more)
 
 ### Community 305 - "MTP Speculative State"
 Cohesion: 0.15
 Nodes (9): gemm::qkv::hfq4g256::mmq::gfx906::body, gemm_qkv_hfq4g256_mmq_gfx906_full_set_x16(), gemm_qkv_hfq4g256_mmq_gfx906_x16(), gemm_qkv_hfq4g256_mmq_gfx906_full_set_x32(), gemm_qkv_hfq4g256_mmq_gfx906_x32(), gemm_qkv_hfq4g256_mmq_gfx906_full_set_x64(), gemm_qkv_hfq4g256_mmq_gfx906_x64(), gemm_qkv_hfq4g256_mmq_gfx906_full_set_x8() (+1 more)
 
 ### Community 306 - "Token Sampling"
-Cohesion: 0.32
-Nodes (13): InInvokeBody, InInvokeName, InParamAttr, InParamBody, InParamName, InToolCalls, out, Matcher::is_free() (+5 more)
+Cohesion: 0.29
+Nodes (14): InInvokeBody, InInvokeName, InParamAttr, InParamBody, InParamName, InToolCalls, out, Matcher::is_free() (+6 more)
 
 ### Community 307 - "Training Tensor"
 Cohesion: 0.21
 Nodes (13): (), ConvStateParams, DeltaNetBatchParams, DeltaNetStepParams, Qwen35ModelExt, Parameters for a single-token DeltaNet state update. The gated delta net recurre, Parameters for batched sequential DeltaNet updates (prefill path). Q, K, V, gate, Parameters for DeltaNet conv-state ring-buffer management. (+5 more)
 
 ### Community 308 - "Whitespace Detection"
-Cohesion: 0.06
-Nodes (51): assemble_into, delta_layer_idx, replay_gdn, DdtreeState, DflashState, Side state for DDTree-mode speculative decoding. Allocated alongside the rest of, Optional DFlash speculative-decoding state. Populated when `load` supplies a mat, argmax_u32() (+43 more)
+Cohesion: 0.44
+Nodes (8): cpu_fwht_256(), f16_to_f32(), gen_fwht_signs(), HfqInTensor, main(), quantize_mq4g256(), read_hfq(), write_hfq()
 
 ### Community 309 - "Gemma3 VL Architecture"
 Cohesion: 0.26
@@ -1818,32 +1822,36 @@ Cohesion: 0.24
 Nodes (11): cli, commandfactory, check_file(), GenDocsArgs, `hipfire gen-docs` (hidden) — render the CLI's clap definitions into committed u, The full Markdown command reference, from the clap `Cli` definition., One roff man page for the root command and one per subcommand, keyed by file nam, render_man_pages() (+3 more)
 
 ### Community 315 - "MLP block assembly"
-Cohesion: 0.26
-Nodes (10): clip_byte_encoder(), ClipTokenizer, ClipTokenizer::bpe(), ClipTokenizer::encode_padded(), ClipTokenizer::from_bytes(), ClipTokenizer::from_hfq_file(), ClipTokenizer::from_hfq_file_with_prefix(), ClipTokenizer::tokenize() (+2 more)
+Cohesion: 0.22
+Nodes (8): compact::cold::kv, kvarn, HierKvState::from_env(), ImportanceMode, ImportanceMode::from_str(), Read `HIPFIRE_KV_HIERARCHICAL` / `HIPFIRE_KV_HOT_BUDGET` / `HIPFIRE_KV_MIGRATE_B, Deferred-hierarchical KV cache (Phase 2b sub-task 4c, flag-gated). When `HIPFIRE, Per-token importance proxy used to rank/weight cold compaction.
 
 ### Community 316 - "Quantization Level Mapping"
-Cohesion: 0.16
-Nodes (16): BlockScores, BlockScores::well_formed(), compute_scores_batched(), compute_scores_batched_gpu(), compute_scores_cpu(), dequant_q8_kv_position(), drafter_prefill(), DrafterModel::score_layer_idx() (+8 more)
+Cohesion: 0.25
+Nodes (8): DeepSeek V4 hash-routed MoE: GPU-side tid2eid lookup + score gather + softmax-no, idx, indices, n_exp, DeepseekV4Weights::free_gpu(), Look up the layer-shaped weight bundle by index. Resolves to `layers[idx]` for t, Routed-expert dispatch (DeepSeek V4 top-6 MoE). Accumulates `routed_scaling _fac, One-token MoE FFN: router → top-K → shared expert + top-K routed, added into `x_
 
 ### Community 317 - "Kernel Benchmark Parsing"
-Cohesion: 0.19
-Nodes (12): BoxFuture, BufWriter, ChildStdin, DaemonRequest, DaemonResponse, DaemonTransport, MockTransport, MockTransport::recv_response() (+4 more)
+Cohesion: 0.29
+Nodes (4): KernargBuilder, KernargBuilder::write_ptr(), KernargBuilder::write_u64(), Build a kernarg byte buffer from typed arguments. Each arg is written at the cor
+
+### Community 318 - "BF16 FFN Operations"
+Cohesion: 0.20
+Nodes (10): Gpu, Gpu::conv1d_bias_silu_decode_f32(), Gpu::conv1d_bias_silu_seq_f32(), Gpu::conv1d_decode_f32(), Gpu::conv1d_gated_seq_f32(), Mamba-2 xBC short-conv **prefill** scan (N6): process a whole `seq_len` prompt i, 1D causal conv (kernel_size=4) for decode. Updates ring buffer state., LFM2 LIV double-gated short-conv prefill scan. Processes `seq_len` rows from `bc (+2 more)
 
 ### Community 319 - "FWHT Sign Generation"
 Cohesion: 0.15
-Nodes (19): d, DeepSeek V4 Compressor softmax-weighted pool. Compresses `T` window positions of, Phase 3 — Input mapping: x_in[d] = sum_s(A[s] * streams[s, d]). A is sigmoid-bou, Phase 3 — Mix 4 residual streams via gating matrix + transform output. `x_out[s,, loop::guard::constants, s, Verdict::skip(), Verdict::warn() (+11 more)
+Nodes (15): loop::guard::constants, ev(), loop_guard_mirror_fires_on_4gram_repeat(), loop_guard_mirror_only_counts_trailing_window(), loop_guard_mirror_silent_below_threshold(), ngram_clean_back_half_ok(), ngram_dense_back_half_warns(), ngram_short_stream_ok() (+7 more)
 
 ### Community 320 - "MTP Probe Metrics"
 Cohesion: 0.17
 Nodes (11): Burst dispatch — N launches back-to-back, sync once at the end, Files added / changed in this branch, Measurements (gfx1100, RX 7900 XTX, vector_add 256 elements), Net savings if we ported the engine to HSA, Recommendation for the user, Redline Phase 2 — HSA dispatch result & strategic re-read, Single dispatch — sync after every call, The strategic implication (+3 more)
 
 ### Community 321 - "GPU Memory Pooling"
-Cohesion: 0.17
-Nodes (17): DflashTiny::manifest(), Dt, Gemma3Tiny::manifest(), Init, LlamaTiny::manifest(), MiniMaxTiny::manifest(), Qwen2Tiny, Qwen2Tiny::manifest() (+9 more)
+Cohesion: 0.35
+Nodes (12): DflashTiny::manifest(), Gemma3Tiny::manifest(), Init, LlamaTiny::manifest(), MiniMaxTiny::manifest(), Qwen2Tiny::manifest(), BF16 tensor (default — weight matrices, and every qwen3.5 tensor)., How a tensor's elements are initialized. (+4 more)
 
 ### Community 322 - "Diffusion Prompt Building"
-Cohesion: 0.22
-Nodes (12): dl_ab, block_q8_1_mmq, block_q8_1_mmq::ds4, block_q8_1_mmq::qs, gemm_hfq4g256_residual_mmq(), gemm_hfq4g256_residual_mmq_full_add(), gemm_hfq4g256_residual_mmq_full_body(), gemm_hfq4g256_residual_mmq_full_set() (+4 more)
+Cohesion: 0.27
+Nodes (9): block_q8_1_mmq, block_q8_1_mmq::ds4, block_q8_1_mmq::qs, gemm_hfq4g256_residual_mmq(), gemm_hfq4g256_residual_mmq_full_add(), gemm_hfq4g256_residual_mmq_full_body(), gemm_hfq4g256_residual_mmq_full_set(), quantize_q8_1_mmq_ds4() (+1 more)
 
 ### Community 323 - "DeepSeek V4 Config"
 Cohesion: 0.17
@@ -1854,24 +1862,24 @@ Cohesion: 0.30
 Nodes (11): CpuTensor::from_hfq(), decode_bf16_slice(), decode_f16_slice(), decode_f32_slice(), decode_hfq4_slice(), decode_hfq6_g256_slice(), decode_q4_k_slice(), decode_q4f16_g64_slice() (+3 more)
 
 ### Community 325 - "Grammar-Guided Decoding"
-Cohesion: 0.17
-Nodes (15): Kernel Atlas: typed schema + JSONL writer + analysis helpers for the hipfire ben, parse, profile::report, schema, bench_rows_from_output(), classify_kernel_op(), dflash_row_from_output(), KernelOp (+7 more)
+Cohesion: 0.20
+Nodes (14): IntoIterator, bench_rows_from_output(), classify_kernel_op(), dflash_row_from_output(), KernelOp, parse_bench_summary(), parse_dflash_summary(), parse_profile_sections() (+6 more)
 
 ### Community 326 - "Accelerator inventory"
 Cohesion: 0.27
 Nodes (11): all_nan_logits_return_zero_without_panic(), greedy_nan_logits_do_not_win(), xorshift64* PRNG. Reproducible from a seed; non-zero seed forces a canonical spl, Sample next token from `logits`. - `temp <= 0`: greedy argmax (deterministic; ig, Sampler for DeepSeek V4. Pure greedy argmax on a quantized instruct model falls , sample_token(), sampled_path_drops_nan_logits(), Xorshift (+3 more)
 
 ### Community 328 - "PFlash FWHT Scoring"
-Cohesion: 0.20
-Nodes (9): Wrap an existing fp32 GPU buffer as a frozen (no-grad) leaf., Wrap an fp32 GPU buffer as a trainable leaf and allocate its grad., Number of logical elements., Ensure a zero-initialized grad buffer exists (for activations whose grad is accu, TrainTensor, TrainTensor::ensure_grad(), TrainTensor::frozen(), TrainTensor::numel() (+1 more)
+Cohesion: 0.17
+Nodes (10): Wrap an existing fp32 GPU buffer as a frozen (no-grad) leaf., `TrainTensor`: an fp32 GPU tensor with an optional gradient buffer. The training, Wrap an fp32 GPU buffer as a trainable leaf and allocate its grad., Number of logical elements., Ensure a zero-initialized grad buffer exists (for activations whose grad is accu, TrainTensor, TrainTensor::ensure_grad(), TrainTensor::frozen() (+2 more)
 
 ### Community 329 - "Nemotron Serving"
-Cohesion: 0.18
-Nodes (14): forward_chunk_scored(), kld_build_ref(), kld_eval_self_score(), kld_mean_f32(), kld_p99_f32(), kld_score(), KldEvalOutcome, KldRefPayloads (+6 more)
+Cohesion: 0.48
+Nodes (7): PATCH_SIZE, SPATIAL_MERGE_SIZE, Extract patches from a CHW f32 image in the dots.ocr / HF `Qwen2VLImageProcessor, - `chw`: `[3 * h * w]` f32 buffer in CHW order, already smart-resized so `h` and, `Vec<f32>` of length `N_patches * (3 * PATCH_SIZE * PATCH_SIZE)` where `N_patche, - `chw.len() != 3 * h * w` - `h % PATCH_SIZE != 0` or `w % PATCH_SIZE != 0` - `(, Input contract is `[3, h, w]` (single frame). For `TEMPORAL_PATCH_SIZE > 1` the 
 
 ### Community 330 - "MoE & MLP Forward Hidden States"
-Cohesion: 0.35
-Nodes (10): done(), empty_skipped_to_avoid_double_count(), Whitespace-only output detector — hard-fails when visible text is all whitespace, real_content_passes(), tok(), whitespace_only_fails(), WhitespaceOnly, WhitespaceOnly::default() (+2 more)
+Cohesion: 0.31
+Nodes (11): done(), empty_skipped_to_avoid_double_count(), Whitespace-only output detector — hard-fails when visible text is all whitespace, real_content_passes(), tok(), whitespace_only_fails(), WhitespaceOnly, WhitespaceOnly::default() (+3 more)
 
 ### Community 331 - "KVarN KV Cache"
 Cohesion: 0.31
@@ -1890,44 +1898,48 @@ Cohesion: 0.24
 Nodes (11): Kwargs, CountingWriter, Wraps a writer and counts bytes written, to verify a streaming producer emitted , hf_tojson(), HfJsonFormatter, HfJsonFormatter::begin_array_value(), HfJsonFormatter::begin_object_key(), HfJsonFormatter::begin_object_value() (+3 more)
 
 ### Community 335 - "Llama Model Loading"
-Cohesion: 0.20
-Nodes (10): len, LabelSet, load_daemon_labels(), Save SSM-drafter weights (best-eval snapshot) to a flat container. Minimal: magi, A loaded label set: per-chunk tokens + mid/shallow block scores + the shared (fr, Load daemon `pflash_labels` JSONL + its `<jsonl>.embed.bin` (`QEMB`) sidecar. Ea, PFlash drafter label IO — shared by the standalone `ssm_drafter_train` example a, Deterministic Fisher–Yates shuffle of the chunk/label arrays in lockstep, BEFORE (+2 more)
+Cohesion: 0.33
+Nodes (5): Hard-fails when an open `<think>` is not closed after the configured stall budge, ThinkStall, ThinkStall::finalize(), ThinkStall::observe(), ThinkStall::rescan()
 
 ### Community 336 - "Kernel Profiling"
 Cohesion: 0.18
 Nodes (10): AQL Dispatch Packet (64 bytes), AQL User-Mode Queue Research, Chosen Approach: KFD AQL Queue (Option A), Completion, FINDING: KFD AQL Not Feasible on gfx1010, Key Difference from PM4 Path, KFD Ioctl Sequence, Memory Interop (+2 more)
 
 ### Community 337 - "MOE Scatter Pipeline"
-Cohesion: 0.29
-Nodes (7): Gpu, Gpu::rmsnorm_batched(), Gpu::rmsnorm_f32(), Gpu::rmsnorm_f32_at_slot_buf(), Gpu::rmsnorm_train_fwd(), out = rmsnorm(x, weight, eps), HIP-graphs-safe in-place RMSNorm at `base + slot_buf[0] * n`. -1 sentinel → no-o
+Cohesion: 0.33
+Nodes (6): Decode one token, appending each layer's post-residual hidden state (pre final-n, Fused KVarN flash (Phase D2): like `attention_flash_f16k_q8v_batched_masked` but, End-to-end KVarN KV-write + attention for a contiguous run of `n` tokens at abso, layer, Decode one token, appending each layer's post-residual hidden state (after the f, Qwen2 per-decode GPU scratch (KV cache + per-step workspace). Rev 3: real. Mirro
 
 ### Community 338 - "Chat Template Resolution"
-Cohesion: 0.57
-Nodes (6): anyhow, ChatEvent, ChatMessage, stream_chat(), stream_chat_inner(), Sender
+Cohesion: 0.21
+Nodes (11): anyhow, ChatMessage, ChatEvent, ChatMessage, stream_chat(), stream_chat_inner(), Receiver, prompt_message_to_chat_message() (+3 more)
 
 ### Community 339 - "HFQ4 Residual MMQ"
-Cohesion: 0.23
-Nodes (11): dl_d, block_q8_1_mmq, block_q8_1_mmq::ds4, block_q8_1_mmq::qs, gemm_oq4_residual_mmq(), gemm_oq4_residual_mmq_full_add(), gemm_oq4_residual_mmq_full_body(), gemm_oq4_residual_mmq_full_set() (+3 more)
+Cohesion: 0.29
+Nodes (8): block_q8_1_mmq, block_q8_1_mmq::ds4, block_q8_1_mmq::qs, gemm_oq4_residual_mmq(), gemm_oq4_residual_mmq_full_add(), gemm_oq4_residual_mmq_full_body(), gemm_oq4_residual_mmq_full_set(), vec_dot_q8_1_q8_1_mma()
 
 ### Community 340 - "HFQ4 MFMA gfx942"
 Cohesion: 0.24
 Nodes (11): dflash_draft_candidates(), dflash_draft_discovery_uses_lfm2_sidecar_names(), dflash_draft_search_dirs(), DflashDraftTarget, DflashDraftTarget::format_candidate(), discover_dflash_draft_for_model(), parse_dflash_target(), parse_lfm2_dflash_target() (+3 more)
 
 ### Community 341 - "Matrix Tile"
-Cohesion: 0.19
-Nodes (10): gemm_seq, NemotronAttnGpu, NemotronAttnGpu::forward(), NemotronAttnGpu::prefill(), Batched prefill over a whole `seq`-token prompt (N6), starting at position 0. q/, GPU-resident GQA attention block (q/k/v/o weights + KV cache + scratch)., Mamba2BlockGpu::prefill(), Prefill a whole `seq`-token prompt in batched form (N6), advancing the conv + SS (+2 more)
+Cohesion: 0.43
+Nodes (7): gemm_seq, NemotronAttnGpu::prefill(), Batched prefill over a whole `seq`-token prompt (N6), starting at position 0. q/, Mamba2BlockGpu::prefill(), Prefill a whole `seq`-token prompt in batched form (N6), advancing the conv + SS, MlpRelu2Gpu::prefill(), Batched prefill: `out[seq, hidden] = down @ relu2(up @ x)` over a whole prompt. 
 
 ### Community 342 - "GPU Graph Capture"
-Cohesion: 0.21
-Nodes (11): GpuPool, GpuPool::alloc(), GpuPool::bucket_key(), GpuPool::drain(), GpuPool::free(), A pool of GPU buffers, bucketed by size. Requesting a buffer returns one from th, Free-list bucket key. Buffers group by power-of-2 bucket so a decode-hot scratch, Get a buffer of at least `size` bytes. Reuses from the free-list if a pooled buf (+3 more)
+Cohesion: 0.25
+Nodes (10): GpuPool, GpuPool::alloc(), GpuPool::bucket_key(), GpuPool::drain(), GpuPool::free(), A pool of GPU buffers, bucketed by size. Requesting a buffer returns one from th, Free-list bucket key. Buffers group by power-of-2 bucket so a decode-hot scratch, Get a buffer of at least `size` bytes. Reuses from the free-list if a pooled buf (+2 more)
 
 ### Community 343 - "Mamba2 Tiny Config"
 Cohesion: 0.33
 Nodes (7): build_diffusion_prompts(), expand_i64s(), expand_optional_i64s(), expand_strings(), txt2img_args(), txt2img_prompt_builder_rejects_mismatched_repeated_fields(), txt2img_prompt_builder_repeats_single_prompt_for_batch()
 
 ### Community 344 - "Qwen3.5 Tiny Config"
-Cohesion: 0.22
-Nodes (8): CompressRatio, parses_real_deepseek4_config_json(), Raw upstream JSON shape — only the fields we read. Used to drive `from_hfq`. We , Verify the parser handles the actual released DeepSeek V4 config.json (snapshot , Per-layer compression mode for the indexer / KV path. `compress_ratios` in `conf, Config / Weights / State types for DeepSeek V4 Flash. `DeepseekV4Config` mirrors, RawDeepseekV4Config, RawYarnScaling
+Cohesion: 0.40
+Nodes (6): dl_ab, dl_d, mma_i8(), tile, mma_i8(), tile
+
+### Community 345 - "Matrix Tile"
+Cohesion: 0.20
+Nodes (10): build_ddtree_tree_with_cutoff(), DdNode, DdTree, DdTree::ancestors_of(), DdTree::num_nodes(), Same as `build_ddtree_tree`, but also stops expansion when the next heap-pop can, A tree node. Index 0 is implicit (the "root" = seed/anchor token the caller alre, A speculative-verification tree. Fields match the reference's Python layout — ca (+2 more)
 
 ### Community 346 - "KV Cache Management"
 Cohesion: 0.27
@@ -1954,8 +1966,8 @@ Cohesion: 0.33
 Nodes (7): block_q8_1_mmq, gemm_hfq4g256_residual_mmq_gfx906_full_add_x16(), gemm_hfq4g256_residual_mmq_gfx906_full_set_x16(), gemm_hfq4g256_residual_mmq_gfx906_x16(), gemm_hfq4g256_residual_mmq_gfx906_full_add_x56(), gemm_hfq4g256_residual_mmq_gfx906_full_set_x56(), gemm_hfq4g256_residual_mmq_gfx906_x56()
 
 ### Community 352 - "Batched KV Operations"
-Cohesion: 0.22
-Nodes (7): Re-export memory copy direction for callers., launch::counters, rccl, MemcpyKind, MemoryType, hip-bridge: Safe Rust FFI to AMD HIP runtime via dlopen. Modeled after rustane's, Mirrors `hipMemoryType`. FFI stores raw `u32`; use `from_raw` to convert.
+Cohesion: 0.33
+Nodes (6): l, ratio:, Per-layer state for the compressed-KV indexer (Phase 2, Lever 3). Active only on, DeepSeek V4 Compressor decode step (phase 3b scaffold — not yet wired). Implemen, Pure-SWA batched attention block (compress_ratio == 0 layers). Stages: 1. Lazy-a, Mixed-attention batched dispatch (compress_ratio > 0 layers). DeepSeek V4's comp
 
 ### Community 353 - "Top-K Indexing"
 Cohesion: 0.47
@@ -1970,12 +1982,12 @@ Cohesion: 0.22
 Nodes (5): gemm_hfq4g256_residual_mfma_gfx942(), gemm_hfq4g256_residual_mfma_v2_gfx942(), gemm_hfq4g256_residual_mfma_v3_gfx942(), gemm_hfq4g256_residual_mfma_v4_gfx942(), half_t
 
 ### Community 356 - "Matrix Tile"
-Cohesion: 0.18
-Nodes (11): emit_clamps_out_of_bounds_spans(), emit_compressed(), emit_concatenates_in_order(), maybe_compress_prompt(), PflashDecision, Emit the compressed token stream by gathering the tokens from every kept span in, Hint about what kind of request this is, for bypass decisions., Stable hex md5 of a slice of u32 token ids (LE bytes). Used for the `source_md5` (+3 more)
+Cohesion: 0.40
+Nodes (5): new_gpu_kvarn, KvCache::kvarn_k_record_bytes(), KvCache::new_gpu_kvarn_capped(), Byte length of one KVarN K record (`[head_dim × GROUP]` tile): packed 4-bit code, Same as [`new_gpu_kvarn`] with an explicit `physical_cap`. Eviction-aware.
 
 ### Community 357 - "Matrix Tile"
-Cohesion: 0.02
-Nodes (139): alloc_k_v_filtered, la_idx, new_gpu_asym2, new_gpu_asym3, new_gpu_asym4, new_gpu_fwht4, new_gpu_kvarn, new_gpu_q8 (+131 more)
+Cohesion: 0.05
+Nodes (72): alloc_kv_per_layer_multi(), alloc_kv_with_scales_per_layer_multi(), KvCache, KvCache::free_gpu(), KvCache::free_gpu_multi(), KvCache::is_boundary(), KvCache::new_gpu(), KvCache::new_gpu_asym2_capped_multi() (+64 more)
 
 ### Community 358 - "AWQ Rescaling"
 Cohesion: 0.47
@@ -1986,8 +1998,8 @@ Cohesion: 0.38
 Nodes (9): find_python(), main(), run_attn_gate_build(), run_build(), run_headnorm_build(), run_headnorm_rope_build(), run_rope_build(), run_softmax_build() (+1 more)
 
 ### Community 360 - "Diffusion High-Res"
-Cohesion: 0.08
-Nodes (25): quantize_hfq4g128(), quantize_hfq4g256(), MagnumQuant HFQ4-G256: FWHT-rotated 4-bit quantization., Quantize F32 weights to HFQ4-G128: flat 4-bit with 128-weight groups. Block: [f3, gguf_is_embed_tensor(), gguf_is_norm_tensor(), gguf_to_safetensors_name(), GgufFormat (+17 more)
+Cohesion: 0.07
+Nodes (27): quantize_hfq4g128(), quantize_hfq4g256(), quantize_hfq6g256(), MagnumQuant HFQ4-G256: FWHT-rotated 4-bit quantization., Quantize F32 weights to HFQ6-G256: 6-bit with 256-weight groups. Block: [f32 sca, Quantize F32 weights to HFQ4-G128: flat 4-bit with 128-weight groups. Block: [f3, gguf_is_embed_tensor(), gguf_is_norm_tensor() (+19 more)
 
 ### Community 361 - "CPU Sampling"
 Cohesion: 0.50
@@ -2002,8 +2014,8 @@ Cohesion: 0.22
 Nodes (9): apply_repeat_penalty_candidates(), argmax(), Sample the next token from logits using argmax (greedy)., Apply the repeat penalty in-place to a specific subset of (token_id, value) cand, Sample from a pre-selected candidate set instead of the full logits. Accepts (ca, Simple deterministic-seeded RNG (xorshift32). Not crypto-quality, fine for sampl, sample_top_p(), sample_top_p_from_candidates() (+1 more)
 
 ### Community 364 - "TriAttention capturing"
-Cohesion: 0.25
-Nodes (8): NgramCache, NgramCache::observe(), NgramCache::observe_many(), NgramCache::predict(), Rolling bigram n-gram cache. Keyed by the last two committed tokens `(a, b)`; va, Record the triple `(a, b) → c` in the cache., Predict `c` from last-two `(a, b)` if the max-count next-token reaches `min_coun, Record every consecutive triple in a slice of committed tokens. Caller supplies 
+Cohesion: 0.40
+Nodes (5): new_gpu_q8, KvCache::new_gpu_q8(), KvCache::new_gpu_q8_capped(), Create Q8_0 quantized KV cache (GGML Q8_0 format). 3.76x smaller than FP32. Bloc, Same as [`new_gpu_q8`] with an explicit physical_cap. Eviction-aware.
 
 ### Community 365 - "BF16 MFMA"
 Cohesion: 0.25
@@ -2046,8 +2058,8 @@ Cohesion: 0.50
 Nodes (4): block_q8_1_mmq, block_q8_1_mmq::ds4, block_q8_1_mmq::qs, gemm_hfq6g256_residual_wave64_dp4a()
 
 ### Community 376 - "PCA Weight Rotation"
-Cohesion: 0.50
-Nodes (4): DeepSeek V4 compressor batched ring-buffer write. Single launch scatters B posit, Path 2 unscatter combine for gate_up. Reads Y_grouped[m_total × 2*mi] and writes, slot, DDTree speculative step (Ringel & Romano 2026, our hybrid-arch port). Flow per c
+Cohesion: 0.40
+Nodes (5): Gpu, Gpu::gemm_hfq4g256_moe_grouped_mmq_gfx11_dgpu(), Gpu::gemv_hfp4g32_dot2_gfx11(), gfx11 (RDNA3) v_dot2_f32_f16 decode-path GEMV for HFP4G32. Takes F32 x and conve, gfx11 dGPU i8 MMQ MoE grouped GEMM (gfx1100/1101/1102/1103 — 7900 XTX, 7800/7700
 
 ### Community 377 - "Gate-Up GEMM"
 Cohesion: 0.25
@@ -2074,12 +2086,12 @@ Cohesion: 0.29
 Nodes (8): block_idx_for(), gptq_identity_hessian_equals_rtn(), gptq_improves_activation_weighted_reconstruction(), quantize_mq4_element(), *GPTQ identity test:** when `H = I`, GPTQ should reduce to plain RTN (round-to-n, *GPTQ reconstruction test:** for a well-conditioned diagonal-dominant H, GPTQ's , Per-element asymmetric MQ4 quantize step. Mirrors the formula in `quantize_mq4g2, Map (row, original_col) of a weight matrix → its frozen-grid index. In the row-m
 
 ### Community 383 - "Embedding Lookup"
-Cohesion: 0.50
-Nodes (4): project(), ProjectorWeights, Project the SigLIP encoder output to `mm_tokens_per_image` image embeddings. `vi, GPU-resident projector weights.
+Cohesion: 0.40
+Nodes (5): CalibCollector::tensor_descriptors(), CalibTensorDesc, Per-tensor descriptors (no GPU work): `name`, whether it has a full Hessian, `k`, Per-tensor descriptor from [`CalibCollector::tensor_descriptors`]., tensor_descriptors
 
 ### Community 384 - "MoE GEMM gfx12"
-Cohesion: 0.25
-Nodes (8): Eviction, Eviction::beta(), Eviction::budget(), Eviction::free_gpu(), Eviction policy wrapper — dispatches to plain TriAttention or CASK m-folding., Protected-core budget (slots kept before eviction begins)., Recency window (`beta`) preserved alongside the budget., Release the policy's GPU-side scratch on unload.
+Cohesion: 0.40
+Nodes (5): EmbeddingTable, EmbeddingTable::free(), EmbeddingTable::lookup(), The token embedding table — plain f32 (safetensors) or Q8 (HFQ). Looked up by ro, Copy/dequantize the embedding row for `token` into `out` `[dim]`.
 
 ### Community 385 - "Kernel Argument Builder"
 Cohesion: 0.25
@@ -2098,8 +2110,8 @@ Cohesion: 0.25
 Nodes (7): Aggregated metrics for a sequence of speculative decode steps., Mean accepted draft tokens per cycle. This is τ from the Leviathan paper., Mean committed tokens per cycle (tau + 1 on average, since each cycle always com, SpecStats, SpecStats::mean_committed(), SpecStats::record(), SpecStats::tau()
 
 ### Community 389 - "HFQ3 Metrics"
-Cohesion: 0.33
-Nodes (6): DeltaNet, FullAttn, kv_layer_mask, MixerProfile::kv_layer_indices(), Indices of the KV-backed (attention) layers, in layer order — the full-attention, Per-layer token-mixer profile for a qwen3.5 hybrid stack: `FullAttention` layers
+Cohesion: 0.50
+Nodes (4): hidden_size, One decode step. Reads `hidden` `[hidden_size]`, updates conv+ssm state in place, One Mamba-2 mixer block decode step. Returns the `[hidden_size]` mixer output; u, Per-layer Gemma3 weights. No biases (attention_bias=false). The four norms and t
 
 ### Community 390 - "HFQ4-G128 Metrics"
 Cohesion: 0.33
@@ -2118,8 +2130,8 @@ Cohesion: 0.29
 Nodes (6): ① Cache-on ≡ cache-off byte-identity — BLOCKED (the gold-standard gate), ②③ Real-forward A/B (qwen3.5-9b-mq4.hfq, temp 0 greedy, daemon stdin one-shot), ④ Render-vs-HF byte audit (GPU-free) — minijinja vs transformers jinja2, froggeric chat-template durability verification — 2026-06-09, The one real divergence: `| tojson` (tool paths only, NOT froggeric-specific), Verdict
 
 ### Community 394 - "HFQ4 Residual GEMV"
-Cohesion: 0.33
-Nodes (5): DeltaNetTape, DeltaNetTape::new_for(), DeltaNetTape::restore_from(), DeltaNetTape::save_at(), A series of `n_slots` `DeltaNetSnapshot` slots, used by the tape-replay rollback
+Cohesion: 0.67
+Nodes (4): IMAGE_FACTOR, MAX_RATIO, Smart-resize per `dots_ocr/utils/image_utils.py:smart_resize`. Returns the resiz, Returns `Err` if the input aspect ratio exceeds [`MAX_RATIO`] — rejects patholog
 
 ### Community 395 - "Stable Diffusion API"
 Cohesion: 0.33
@@ -2130,28 +2142,20 @@ Cohesion: 0.29
 Nodes (6): Barrier Sequence, Compute Barrier Research — GFX10 (gfx1010), RELEASE_MEM Packet (GFX10 Compute), Source: Linux kernel gfx_v10_0.c, WAIT_REG_MEM Packet, What Previous Attempts Got Wrong
 
 ### Community 398 - "Token Decode Pipeline"
-Cohesion: 0.50
-Nodes (4): Hit/miss counters (cheap, lock-free), for the cache-hit observability the pipeli, CacheStats, Snapshot of the hit/miss counters., VisionCache::stats()
-
-### Community 399 - "I-Major Tile Structure"
-Cohesion: 0.50
-Nodes (4): ParoQuant Givens rotation: apply learned pairwise rotations + channel scaling to, hidden_dim, HiddenStateRingBuffer::write_at_head(), Copy `x` (shape `[hidden_dim]`) into the ring buffer slot for the given extracti
+Cohesion: 0.67
+Nodes (4): MetaValue, gguf_meta_to_json(), mv_to_json(), Translate the GGUF metadata HashMap into a JSON object that ends up in the `.hfq
 
 ### Community 400 - "Fast Hadamard Transform"
 Cohesion: 0.50
 Nodes (3): gemm_hfq4g256_residual_mmq_gfx906_full_add_x8(), gemm_hfq4g256_residual_mmq_gfx906_full_set_x8(), gemm_hfq4g256_residual_mmq_gfx906_x8()
 
-### Community 402 - "Gate-Up Quantized GEMM"
-Cohesion: 0.03
-Nodes (65): attention_dflash_f32, attention_dflash_wmma_f32, Gpu, Gpu::attention_dflash_f32(), Gpu::attention_dflash_wmma_causal_f32(), Gpu::attention_dflash_wmma_f32(), Gpu::attention_dflash_wmma_m32_f32(), Gpu::attention_dflash_wmma_m64_n128_f16kv_v2_f32() (+57 more)
-
 ### Community 403 - "HFQ Package Loading"
-Cohesion: 0.50
-Nodes (4): is_audio_tts_padding(), Vocab / special-token slot strings that are legitimately allowed to differ betwe, Stable hash of the §5.3-relevant tokenizer state, EXCLUDING the audio/TTS paddin, tokenizer_compat_signature()
+Cohesion: 0.05
+Nodes (45): Compatibility re-export for the tokenizer implementation. Tokenizer parsing, enc, hfq_parameter_count(), is_audio_tts_padding(), load_drafter(), Vocab / special-token slot strings that are legitimately allowed to differ betwe, Stable hash of the §5.3-relevant tokenizer state, EXCLUDING the audio/TTS paddin, Compare drafter vs target tokenizers for compression compatibility. PRD §5.3 con, tokenizer_compat_signature() (+37 more)
 
 ### Community 404 - "Qwen2 Architecture Docs"
 Cohesion: 0.50
-Nodes (3): HeatClass, HeatClass::from_rank(), Heat-class buckets keyed off BPE merge rank. Lower rank = earlier merge = more c
+Nodes (3): Dt, F16 tensor — used for new-family 1D norm/bias vectors (see [`Dt`])., Storage dtype for a fixture tensor. Weight matrices ship BF16 (the model's sourc
 
 ### Community 405 - "HFQ4 Residual GEMM Body"
 Cohesion: 0.33
@@ -2210,8 +2214,8 @@ Cohesion: 0.18
 Nodes (10): gqa_forward(), Forward. `scale` is typically `1/sqrt(d)`. Scratch `scores`,`p`: `[seq*seq]`; `c, Single-head causal scaled-dot-product attention (fp32). Composed from the verifi, GQA forward. Writes `ctx` `[seq*q_dim]` and saves `p_all` `[n_heads*seq*seq]`. `, sdpa_forward(), `ds_i = p_i (dy_i − Σ_j dy_j p_j)`. `p` is the saved forward output., Row-softmax: `p = softmax(s)` along the last dim. Forward writes `p` into `y`; b, softmax_backward() (+2 more)
 
 ### Community 427 - "KV Compression Noise"
-Cohesion: 0.40
-Nodes (5): Gpu, Gpu::gemm_hfq4g256_mmq_set_gfx906(), Gpu::gemm_hfq4g256_residual_mmq_gfx906(), gfx906 dp4a MMQ residual GEMM. Wave-native topology (block 64×2, tile 128×64) pe, Set-mode (add=0) variant of the gfx906 MMQ kernel.
+Cohesion: 0.29
+Nodes (7): Gpu, Gpu::gemm_gate_up_hfq4g256_mmq_gfx906_prequant(), Gpu::gemm_hfq4g256_mmq_set_gfx906(), Gpu::gemm_hfq4g256_residual_mmq_gfx906(), gfx906 dp4a MMQ residual GEMM. Wave-native topology (block 64×2, tile 128×64) pe, Set-mode (add=0) variant of the gfx906 MMQ kernel., Pre-quantized X variant — caller passes the Q8_1 scratch pointer produced by an 
 
 ### Community 428 - "Min-Heap f32"
 Cohesion: 0.50
@@ -2266,8 +2270,8 @@ Cohesion: 0.50
 Nodes (3): gemm_hfq4g256_residual_mmq_gfx906_full_add_x64(), gemm_hfq4g256_residual_mmq_gfx906_full_set_x64(), gemm_hfq4g256_residual_mmq_gfx906_x64()
 
 ### Community 457 - "gfx1030 Gate-Up GEMM"
-Cohesion: 0.32
-Nodes (7): build_capture_names(), CalibOpts, CalibSummary, collect_calibration_artifacts(), Options for [`collect_calibration_artifacts`]., Summary of a calibration pass after the `.calib.hfq` has been streamed to disk. , write_streaming
+Cohesion: 0.12
+Nodes (18): DaemonMoeRouterHistogramGuard, DaemonMoeRouterHistogramGuard::start(), DaemonMoeRouterHistogramGuard::take(), build_capture_names(), CalibOpts, CalibSummary, collect_calibration_artifacts(), moe_router_histogram_records_top1_topk_weights_and_drops() (+10 more)
 
 ### Community 465 - "Diffusion Smoke Test"
 Cohesion: 0.83
@@ -2313,29 +2317,49 @@ Nodes (3): sigmoidf(), swiglu_train_bwd(), swiglu_train_fwd()
 Cohesion: 0.67
 Nodes (3): CPU top-K per row on a log-softmax-normalized logits matrix. Produces the `(top_, topk_from_logits(), topk_log_probs_are_normalized()
 
-### Community 534 - "Community 534"
-Cohesion: 0.33
-Nodes (6): d_inner, Gpu, Gpu::mamba2_gated_norm_f32(), Gpu::mamba2_gated_norm_seq_f32(), Mamba-2 `RMSNormGated` (gate-then-group-RMSNorm): `out = group_rmsnorm(y * silu(, Mamba-2 `RMSNormGated` **prefill** form (N6): batched gate-then-group- RMSNorm o
+### Community 551 - "Community 551"
+Cohesion: 0.50
+Nodes (4): PreprocessedImage::n_patches(), PreprocessedImage::n_visual_tokens(), Total patches before the merger (= `grid_h * grid_w`)., Total visual tokens after the merger (`= n_patches / SM^2`).
+
+### Community 552 - "Community 552"
+Cohesion: 0.50
+Nodes (4): Gpus::all_reduce_sum_f32(), Gpus::ensure_rccl(), Lazily initialize RCCL communicators across all devices owned by this `Gpus`. Ca, All-reduce-sum of f32 buffers across all ranks. `buffers[r]` must be a device po
+
+### Community 553 - "Community 553"
+Cohesion: 0.50
+Nodes (4): deltanet_ranges_27b_tp2(), deltanet_ranges_tp4_and_08b(), Validate DeltaNet head geometry: both head counts split evenly and the value/key, ShardConfig::validate_deltanet()
+
+### Community 554 - "Community 554"
+Cohesion: 0.50
+Nodes (4): ExpertAssign, ExpertAssign::from_env(), Routed-expert → rank assignment policy (A3B MoE, Stage 5). `Stride` (default) lo, Resolve from `HIPFIRE_TP_EXPERT_ASSIGN` (`contiguous` | `stride`). Default `Stri
+
+### Community 556 - "Community 556"
+Cohesion: 0.67
+Nodes (3): attn_ranges_tp2(), Validate the head geometry against this shard config. Call at model load once `n, ShardConfig::validate()
+
+### Community 557 - "Community 557"
+Cohesion: 0.67
+Nodes (3): TP=1 degenerate config — byte-identical to the single-card path., ShardConfig::single(), single_is_degenerate()
 
 ## Knowledge Gaps
 - **238 isolated node(s):** `RawMiniMaxConfig`, `MoeScratchRef<'a>`, `AtlasRow`, `DiffusionImportArgs`, `DiffusionInspectArgs` (+233 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **73 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **72 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `Gpu` connect `Fused Lloyd Quantization` to `GPU Attention Operations`, `DeepSeek4 GPU Operations`, `Diffusion Pipeline`, `CPU Transformer Layers`, `DFlash spec-decode`, `Model Loading State`, `REST Health CORS`, `Community 525`, `Community 536`, `HFQ File Mapping`, `HSA Runtime Wrapper`, `Operator REST API`, `Gemma3 Decode Backend`, `Model Artifact Registry`, `Token Continuation Masking`, `Speculative Decoding`, `File management`, `HIP FFI Bindings`, `Gemma3-VL Image Loader`, `GEMV Dispatch Logic`, `Qwen2 Attention Dispatch`, `Qwen2 Model Backend`, `Architecture Implementations`, `Image preprocessing`, `DeepSeek4 Execution`, `Drafter Tokenizer`, `KLD scoring codecs`, `Dataset Hash Stability`, `MTP Speculative Proposal`, `WMMA GEMM kernels`, `GQA Attention`, `Gemma3-VL Backend`, `Llama Decode Loop`, `Web Chat UI`, `Daemon protocol`, `LFM2 MoE Configuration`, `DeepSeek V4 forward`, `RCCL collective ops`, `Configuration Paths`, `Architecture Capabilities`, `PFlash Scoring`, `GGUF input reading`, `Qwen2 Model Backend`, `HFQ metadata encoding`, `Backend Selection Oracle`, `DeepSeek4 Batched Ops`, `Hessian Quantization IO`, `GPU Memory Management`, `DDTree Heap Structure`, `RoPE kernels`, `Error Versioning`, `Architecture implementation`, `HFQ gemm kernels`, `MTP extraction`, `GEMV Execution Family`, `Kernel arguments`, `Loop Guard Policy`, `Serving Architecture`, `Weight paging`, `KLD reference`, `Grammar matching`, `Activation kernels`, `LFM2.5 MoE Configuration`, `Dots OCR config`, `MoE dispatch family`, `HFQ4 Residual MMQ GEMM Kernel`, `NPU module admission`, `Compute dispatch`, `DeepSeek4 Fused Kernels`, `BF16 Model Loading`, `Hidden state buffering`, `Profiling integration`, `Coherence detection`, `Arch capability tests`, `System Status Diagnostics`, `ROCm Backend Contracts`, `Kernel Atlas Tool`, `EOS Stream Filtering`, `CPU Router Transport`, `Gemma3 Configuration`, `File Locking`, `Loop Detection Guard`, `Test fixtures`, `EOS Filter Config`, `MQ4G128 Codec`, `Cache Eviction`, `Special Token Leak`, `Speculative Decoding`, `KLD Environment Config`, `Opus Quant Activation`, `Cholesky Decomposition`, `Mixer Architecture`, `Tool-Call Validation`, `Non-GEMV Analysis`, `Model Checkpoint Discovery`, `HFQ Container Tools`, `QTIP Quantization`, `Fused QKV Kernels`, `NPU/CPU FFN Backend`, `Step Timing Detection`, `CLI Documentation`, `HFQ Patch Parse`, `Training Tensor`, `Whitespace Detection`, `Quantization Level Mapping`, `PFlash FWHT Scoring`, `Nemotron Serving`, `Reference Block Format`, `Llama Model Loading`, `Matrix Tile`, `GPU Graph Capture`, `MTP Probe State`, `Matrix Tile`, `Matrix Tile`, `Prompt Lookup Decoding`, `Embedding Lookup`, `MoE GEMM gfx12`, `HFQ4-G128 Metrics`, `GPU Access Control`, `HFQ4 Residual GEMV`, `I-Major Tile Structure`, `gfx906 GEMM x8`, `QKVZA HFQ4 GEMM`, `gfx1030 Gate-Up GEMM`?**
-  _High betweenness centrality (0.173) - this node is a cross-community bridge._
-- **Why does `HipResult` connect `GEMV Execution Family` to `GPU Attention Operations`, `Fused Lloyd Quantization`, `CPU Transformer Layers`, `DFlash spec-decode`, `Model Loading State`, `REST Health CORS`, `Chat REST API`, `Community 534`, `Codec Dequantization`, `Token Continuation Masking`, `Speculative Decoding`, `File management`, `Gemma3-VL Image Loader`, `GEMV Dispatch Logic`, `Qwen2 Attention Dispatch`, `Qwen2 Model Backend`, `Image preprocessing`, `DeepSeek4 Execution`, `GPU Token Sampling Dispatch`, `Kernel Dispatch Core`, `KLD scoring codecs`, `MTP Speculative Proposal`, `WMMA GEMM kernels`, `Llama Decode Loop`, `Daemon protocol`, `LFM2 MoE Configuration`, `Configuration Paths`, `Architecture Capabilities`, `GGUF input reading`, `HFQ metadata encoding`, `GEMM kernels`, `Backend Selection Oracle`, `Expert Resident Cache`, `RoPE kernels`, `Architecture implementation`, `HFQ gemm kernels`, `Kernel arguments`, `Serving Architecture`, `DFlash conversion`, `Dots OCR config`, `MoE dispatch family`, `HFQ4 Residual MMQ GEMM Kernel`, `Host-to-device transport`, `NPU module admission`, `Compute dispatch`, `DeepSeek4 Fused Kernels`, `BF16 Model Loading`, `Hidden state buffering`, `Profiling integration`, `Coherence detection`, `Request Scheduling`, `KLD Configuration`, `ROCm Backend Contracts`, `Kernel Atlas Tool`, `EOS Stream Filtering`, `gfx906 GEMM Variants`, `Kernel Compilation`, `Test fixtures`, `Jinja Chat Rendering`, `EOS Filter Config`, `Hessian Matrix Storage`, `MQ4G128 Codec`, `Cache Eviction`, `Special Token Leak`, `Speculative Decoding`, `Speed Benchmark Harness`, `Band Accumulator`, `TUI Main Program`, `Opus Quant Activation`, `Mixer Architecture`, `Tool-Call Validation`, `Non-GEMV Analysis`, `Vision Patch Extraction`, `Model Checkpoint Discovery`, `QTIP Quantization`, `NPU/CPU FFN Backend`, `Step Timing Detection`, `CLI Documentation`, `HFQ Patch Parse`, `Whitespace Detection`, `HSA Dispatch Research`, `Quantization Level Mapping`, `PFlash FWHT Scoring`, `Nemotron Serving`, `MOE Scatter Pipeline`, `Matrix Tile`, `GPU Graph Capture`, `Matrix Tile`, `Matrix Tile`, `Embedding Lookup`, `HFQ4-G128 Metrics`, `GPU Access Control`, `HFQ4 Residual GEMV`, `I-Major Tile Structure`, `Gate-Up Quantized GEMM`, `gfx906 GEMM x8`, `KV Compression Noise`, `QKVZA HFQ4 GEMM`, `gfx1030 Gate-Up GEMM`?**
-  _High betweenness centrality (0.170) - this node is a cross-community bridge._
-- **Why does `GpuTensor` connect `GPU Attention Operations` to `Fused Lloyd Quantization`, `CPU Transformer Layers`, `DFlash spec-decode`, `Model Loading State`, `REST Health CORS`, `Community 525`, `Chat REST API`, `Community 534`, `Tensor Loading Helpers`, `Community 536`, `HFQ File Mapping`, `Community 539`, `Codec Dequantization`, `Model Artifact Registry`, `Token Continuation Masking`, `Speculative Decoding`, `File management`, `Community 554`, `GEMV Dispatch Logic`, `Qwen2 Attention Dispatch`, `Gemma3-VL Image Loader`, `Qwen2 Model Backend`, `Architecture Implementations`, `Drafter Tokenizer`, `GPU Token Sampling Dispatch`, `Dataset Hash Stability`, `MTP Speculative Proposal`, `WMMA GEMM kernels`, `Llama Decode Loop`, `Web Chat UI`, `DeepSeek V4 forward`, `RCCL collective ops`, `Configuration Paths`, `Architecture Capabilities`, `PFlash Scoring`, `GGUF input reading`, `HFQ metadata encoding`, `GEMM kernels`, `DeepSeek4 Batched Ops`, `Hessian Quantization IO`, `Expert Resident Cache`, `DDTree Heap Structure`, `HFQ gemm kernels`, `MTP extraction`, `GEMV Execution Family`, `DFlash conversion`, `KLD reference`, `Activation kernels`, `LFM2.5 MoE Configuration`, `MoE dispatch family`, `HFQ4 Residual MMQ GEMM Kernel`, `NPU module admission`, `Compute dispatch`, `DeepSeek4 Fused Kernels`, `Profiling integration`, `Coherence detection`, `Request Scheduling`, `Arch capability tests`, `KLD Configuration`, `ROCm Backend Contracts`, `Kernel Atlas Tool`, `CPU Router Transport`, `GEMV Kernel Selection`, `gfx906 GEMM Variants`, `EOS Filter Config`, `Hessian Matrix Storage`, `Special Token Leak`, `TUI Main Program`, `Opus Quant Activation`, `Cholesky Decomposition`, `Non-GEMV Analysis`, `Model Checkpoint Discovery`, `HFQ Container Tools`, `QTIP Quantization`, `Fused QKV Kernels`, `NPU/CPU FFN Backend`, `CLI Documentation`, `HFQ Patch Parse`, `Training Tensor`, `Whitespace Detection`, `HSA Dispatch Research`, `PFlash FWHT Scoring`, `Reference Block Format`, `Llama Model Loading`, `MOE Scatter Pipeline`, `Matrix Tile`, `Matrix Tile`, `Prompt Lookup Decoding`, `Embedding Lookup`, `I-Major Tile Structure`, `Gate-Up Quantized GEMM`, `gfx906 GEMM x8`, `KV Compression Noise`?**
-  _High betweenness centrality (0.088) - this node is a cross-community bridge._
+- **Why does `HipResult` connect `Chat REST API` to `GPU Attention Operations`, `Fused Lloyd Quantization`, `CPU Transformer Layers`, `DFlash spec-decode`, `Model Loading State`, `REST Health CORS`, `Codec Dequantization`, `Speculative Decoding`, `Community 552`, `File management`, `Gemma3-VL Image Loader`, `GEMV Dispatch Logic`, `Qwen2 Attention Dispatch`, `Qwen2 Model Backend`, `Image preprocessing`, `DeepSeek4 Execution`, `GPU Token Sampling Dispatch`, `Kernel Dispatch Core`, `KLD scoring codecs`, `Dataset Hash Stability`, `MTP Speculative Proposal`, `GQA Attention`, `Llama Decode Loop`, `Daemon protocol`, `LFM2 MoE Configuration`, `Configuration Paths`, `Architecture Capabilities`, `GGUF input reading`, `HFQ metadata encoding`, `GEMM kernels`, `Backend Selection Oracle`, `Expert Resident Cache`, `RoPE kernels`, `Architecture implementation`, `HFQ gemm kernels`, `GEMV Execution Family`, `Kernel arguments`, `DFlash conversion`, `Weight paging`, `Dots OCR config`, `MoE dispatch family`, `Architecture Feature Support`, `HFQ4 Residual MMQ GEMM Kernel`, `Host-to-device transport`, `NPU module admission`, `DeepSeek4 Fused Kernels`, `BF16 Model Loading`, `Hidden state buffering`, `Profiling integration`, `Request Scheduling`, `KLD Configuration`, `ROCm Backend Contracts`, `Kernel Atlas Tool`, `EOS Stream Filtering`, `HSACO Kernel Metadata`, `GEMV Kernel Selection`, `gfx906 GEMM Variants`, `Kernel Compilation`, `Test fixtures`, `Jinja Chat Rendering`, `EOS Filter Config`, `Hessian Matrix Storage`, `MQ4G128 Codec`, `Cache Eviction`, `Speculative Decoding`, `Speed Benchmark Harness`, `Band Accumulator`, `Opus Quant Activation`, `Cholesky Decomposition`, `Mixer Architecture`, `Tool-Call Validation`, `Vision Patch Extraction`, `Model Checkpoint Discovery`, `Fused GateUp Kernels`, `NPU/CPU FFN Backend`, `CLI Documentation`, `HSA Dispatch Research`, `MLP block assembly`, `BF16 FFN Operations`, `PFlash FWHT Scoring`, `Matrix Tile`, `GPU Graph Capture`, `Matrix Tile`, `Matrix Tile`, `TriAttention capturing`, `PCA Weight Rotation`, `MoE GEMM gfx12`, `HFQ4-G128 Metrics`, `GPU Access Control`, `HFQ Package Loading`, `gfx906 GEMM x8`, `KV Compression Noise`, `QKVZA HFQ4 GEMM`, `gfx1030 Gate-Up GEMM`?**
+  _High betweenness centrality (0.175) - this node is a cross-community bridge._
+- **Why does `Gpu` connect `Fused Lloyd Quantization` to `GPU Attention Operations`, `DeepSeek4 GPU Operations`, `Diffusion Pipeline`, `CPU Transformer Layers`, `DFlash spec-decode`, `Model Loading State`, `REST Health CORS`, `Community 525`, `Chat REST API`, `HFQ File Mapping`, `HSA Runtime Wrapper`, `Operator REST API`, `Gemma3 Decode Backend`, `Model Artifact Registry`, `Token Continuation Masking`, `Speculative Decoding`, `File management`, `HIP FFI Bindings`, `Gemma3-VL Image Loader`, `GEMV Dispatch Logic`, `Qwen2 Attention Dispatch`, `Qwen2 Model Backend`, `Architecture Implementations`, `Image preprocessing`, `DeepSeek4 Execution`, `Drafter Tokenizer`, `Kernel Dispatch Core`, `KLD scoring codecs`, `Dataset Hash Stability`, `MTP Speculative Proposal`, `WMMA GEMM kernels`, `GQA Attention`, `Gemma3-VL Backend`, `GPU Memory Operations`, `Llama Decode Loop`, `Web Chat UI`, `Daemon protocol`, `LFM2 MoE Configuration`, `DeepSeek V4 forward`, `RCCL collective ops`, `Configuration Paths`, `Architecture Capabilities`, `PFlash Scoring`, `GGUF input reading`, `HFQ metadata encoding`, `Backend Selection Oracle`, `DeepSeek4 Batched Ops`, `Hessian Quantization IO`, `GPU Memory Management`, `DDTree Heap Structure`, `RoPE kernels`, `Error Versioning`, `Architecture implementation`, `HFQ gemm kernels`, `MTP extraction`, `GEMV Execution Family`, `Kernel arguments`, `Loop Guard Policy`, `Weight paging`, `KLD reference`, `Grammar matching`, `Activation kernels`, `LFM2.5 MoE Configuration`, `Dots OCR config`, `MoE dispatch family`, `Architecture Feature Support`, `HFQ4 Residual MMQ GEMM Kernel`, `NPU module admission`, `DeepSeek4 Fused Kernels`, `Hidden state buffering`, `Profiling integration`, `Coherence detection`, `Arch capability tests`, `KLD Configuration`, `System Status Diagnostics`, `ROCm Backend Contracts`, `Kernel Atlas Tool`, `EOS Stream Filtering`, `CPU Router Transport`, `HSACO Kernel Metadata`, `GEMV Kernel Selection`, `Gemma3 Configuration`, `File Locking`, `GPU Graph Management`, `Test fixtures`, `EOS Filter Config`, `MQ4G128 Codec`, `Cache Eviction`, `Speculative Decoding`, `Band Accumulator`, `KLD Environment Config`, `Opus Quant Activation`, `Mixer Architecture`, `Tool-Call Validation`, `Non-GEMV Analysis`, `Fused GateUp Kernels`, `Fused QKV Kernels`, `NPU/CPU FFN Backend`, `CLI Documentation`, `HFQ Patch Parse`, `Training Tensor`, `MLP block assembly`, `Quantization Level Mapping`, `PFlash FWHT Scoring`, `Reference Block Format`, `Matrix Tile`, `GPU Graph Capture`, `MTP Probe State`, `Matrix Tile`, `Matrix Tile`, `Prompt Lookup Decoding`, `TriAttention capturing`, `MoE GEMM gfx12`, `HFQ4-G128 Metrics`, `GPU Access Control`, `HFQ Package Loading`, `gfx906 GEMM x8`, `QKVZA HFQ4 GEMM`, `gfx1030 Gate-Up GEMM`?**
+  _High betweenness centrality (0.160) - this node is a cross-community bridge._
+- **Why does `GpuTensor` connect `GPU Attention Operations` to `Fused Lloyd Quantization`, `CPU Transformer Layers`, `DFlash spec-decode`, `Model Loading State`, `REST Health CORS`, `Community 525`, `Chat REST API`, `Tensor Loading Helpers`, `HFQ File Mapping`, `HSA Runtime Wrapper`, `Community 539`, `Codec Dequantization`, `Model Artifact Registry`, `Token Continuation Masking`, `Speculative Decoding`, `File management`, `Gemma3-VL Image Loader`, `GEMV Dispatch Logic`, `Qwen2 Attention Dispatch`, `Qwen2 Model Backend`, `Architecture Implementations`, `Drafter Tokenizer`, `GPU Token Sampling Dispatch`, `Kernel Dispatch Core`, `Dataset Hash Stability`, `MTP Speculative Proposal`, `WMMA GEMM kernels`, `GPU Memory Operations`, `Web Chat UI`, `DeepSeek V4 forward`, `RCCL collective ops`, `Configuration Paths`, `Architecture Capabilities`, `PFlash Scoring`, `GGUF input reading`, `HFQ metadata encoding`, `GEMM kernels`, `Hessian Quantization IO`, `Expert Resident Cache`, `RoPE kernels`, `HFQ gemm kernels`, `MTP extraction`, `GEMV Execution Family`, `DFlash conversion`, `Weight paging`, `KLD reference`, `Activation kernels`, `LFM2.5 MoE Configuration`, `MoE dispatch family`, `Architecture Feature Support`, `HFQ4 Residual MMQ GEMM Kernel`, `NPU module admission`, `DeepSeek4 Fused Kernels`, `Profiling integration`, `Request Scheduling`, `Arch capability tests`, `KLD Configuration`, `ROCm Backend Contracts`, `Kernel Atlas Tool`, `EOS Stream Filtering`, `CPU Router Transport`, `gfx906 GEMM Variants`, `EOS Filter Config`, `Hessian Matrix Storage`, `Opus Quant Activation`, `Non-GEMV Analysis`, `CLI Documentation`, `HFQ Patch Parse`, `Training Tensor`, `HSA Dispatch Research`, `BF16 FFN Operations`, `PFlash FWHT Scoring`, `Reference Block Format`, `Matrix Tile`, `Matrix Tile`, `Prompt Lookup Decoding`, `PCA Weight Rotation`, `MoE GEMM gfx12`, `gfx906 GEMM x8`, `KV Compression Noise`?**
+  _High betweenness centrality (0.076) - this node is a cross-community bridge._
 - **What connects `Error types for HIP runtime operations.`, `HIP operation result.`, `Build an "unsupported dispatch route" error — a capability gap, not a crash. `co` to the rest of the system?**
-  _3489 weakly-connected nodes found - possible documentation gaps or missing edges._
+  _3495 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `GPU Attention Operations` be split into smaller, more focused modules?**
-  _Cohesion score 0.003999729976035373 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.003914724703144783 - nodes in this community are weakly interconnected._
 - **Should `GEMV Quantized Kernels` be split into smaller, more focused modules?**
   _Cohesion score 0.0038910505836575876 - nodes in this community are weakly interconnected._
 - **Should `Fused Lloyd Quantization` be split into smaller, more focused modules?**
-  _Cohesion score 0.02143928035982009 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.018246272547179646 - nodes in this community are weakly interconnected._
