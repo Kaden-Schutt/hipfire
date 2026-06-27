@@ -5795,8 +5795,8 @@
     "semantic_hash": ""
   },
   "crates/hipfire-diffusion/src/gpu_ops.rs": {
-    "mtime": 1782571847.5583086,
-    "ast_hash": "c1bf4f65bdbe9c1d933ed860082e90b1",
+    "mtime": 1782573835.5561244,
+    "ast_hash": "689151a00bec3020fa2266b1792f147f",
     "semantic_hash": ""
   },
   "crates/hipfire-diffusion/src/hip_kernels.rs": {
