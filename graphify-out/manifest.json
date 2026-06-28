@@ -5815,8 +5815,8 @@
     "semantic_hash": ""
   },
   "crates/hipfire-diffusion/src/tests.rs": {
-    "mtime": 1782655883.1058948,
-    "ast_hash": "94c0192b015f2ae6843f622e4098e316",
+    "mtime": 1782656663.346377,
+    "ast_hash": "dc934f5e35f3bdd877d6dcdd06177a59",
     "semantic_hash": ""
   },
   "crates/hipfire-diffusion/src/tokenizer.rs": {

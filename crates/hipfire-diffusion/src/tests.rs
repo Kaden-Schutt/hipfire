@@ -6351,6 +6351,96 @@
         assert!(rel_l2 < 0.06, "oq4 W4A16 relL2 too high ({rel_l2:.4})");
     }
 
+    // Shared scaffold for the oq4 activation-precision ladder parity tests:
+    // builds W[m,k]/X[batch,k], the full-precision CPU Y=X@Wᵀ, and the GPU
+    // oq4-packed weight + rotated activation. Returns None if no GPU.
+    fn oq4_gpu_parity_fixture(
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> Option<(rdna_compute::Gpu, rdna_compute::GpuTensor, rdna_compute::GpuTensor, Vec<f32>)> {
+        let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skip: ROCm GPU unavailable: {e}");
+                return None;
+            }
+        };
+        if !gpu.arch_caps.has_wmma_w32() {
+            eprintln!("skip: no wave32 WMMA");
+            return None;
+        }
+        let w: Vec<f32> = (0..m * k).map(|i| (((i * 37) % 101) as f32 - 50.0) * 0.01).collect();
+        let x: Vec<f32> = (0..batch * k).map(|i| (((i * 13) % 97) as f32 - 48.0) * 0.02).collect();
+        let mut yref = vec![0f32; batch * m];
+        for b in 0..batch {
+            for o in 0..m {
+                let mut acc = 0f32;
+                for kk in 0..k {
+                    acc += x[b * k + kk] * w[o * k + kk];
+                }
+                yref[b * m + o] = acc;
+            }
+        }
+        let signs1 = hipfire_quantize::gen_fwht_signs(OQ_FWHT_SEED1, 256);
+        let signs2 = hipfire_quantize::gen_fwht_signs(OQ_FWHT_SEED2, 256);
+        let oq4 = hipfire_quantize::codecs::quantize_oq4g256(&w, &signs1, &signs2);
+        let packed = pack_oq4_arch_combined(&oq4, m, k);
+        let w_dev = gpu.upload_raw(&packed, &[packed.len()]).unwrap();
+        let x_dev = gpu.upload_f32(&x, &[batch * k]).unwrap();
+        let x_rot = gpu.alloc_tensor(&[batch * k], rdna_compute::DType::F32).unwrap();
+        gpu.rotate_x_mq_batched(&x_dev, &x_rot, k, batch).unwrap();
+        Some((gpu, w_dev, x_rot, yref))
+    }
+
+    fn corr_rel_l2(reference: &[f32], got: &[f32]) -> (f64, f64) {
+        let (mut dot, mut na, mut nb, mut err) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for (a, b) in reference.iter().zip(got) {
+            dot += (*a as f64) * (*b as f64);
+            na += (*a as f64) * (*a as f64);
+            nb += (*b as f64) * (*b as f64);
+            err += ((*a - *b) as f64).powi(2);
+        }
+        (dot / (na.sqrt() * nb.sqrt()), (err / na).sqrt())
+    }
+
+    #[test]
+    fn oq4_w4a8_gpu_matches_cpu_reference_when_gpu_is_available() {
+        // W4A8: oq4 weight, activation quantized to q8_1 (int8 WMMA over 4-bit).
+        let (m, k, batch) = (256usize, 512usize, 8usize);
+        let Some((mut gpu, w_dev, x_rot, yref)) = oq4_gpu_parity_fixture(m, k, batch) else {
+            return;
+        };
+        let y_dev = gpu.alloc_tensor(&[batch * m], rdna_compute::DType::F32).unwrap();
+        gpu.gemm_oq4_residual_mmq(&w_dev, &x_rot, &y_dev, m, k, batch, false)
+            .unwrap();
+        gpu.hip.device_synchronize().unwrap();
+        let y = gpu.download_f32(&y_dev).unwrap();
+        let (corr, rel_l2) = corr_rel_l2(&yref, &y);
+        eprintln!("[oq4-w4a8] corr={corr:.5} relL2={rel_l2:.4}");
+        assert!(corr > 0.99, "W4A8 corr too low ({corr:.4})");
+        assert!(rel_l2 < 0.10, "W4A8 relL2 too high ({rel_l2:.4})");
+    }
+
+    #[test]
+    fn oq4_w4a4_gpu_matches_cpu_reference_when_gpu_is_available() {
+        // W4A4: oq4 weight, activation quantized to int4 (int4 WMMA, 2x on gfx1103).
+        // Lossiest rung — validate the kernel RUNS and is roughly correct (a
+        // rotation/layout bug gives corr~0), not high-fidelity.
+        let (m, k, batch) = (256usize, 512usize, 8usize);
+        let Some((mut gpu, w_dev, x_rot, yref)) = oq4_gpu_parity_fixture(m, k, batch) else {
+            return;
+        };
+        let y_dev = gpu.alloc_tensor(&[batch * m], rdna_compute::DType::F32).unwrap();
+        gpu.gemm_oq4_grouped_act_batched(&w_dev, &x_rot, &y_dev, m, k, batch)
+            .unwrap();
+        gpu.hip.device_synchronize().unwrap();
+        let y = gpu.download_f32(&y_dev).unwrap();
+        let (corr, rel_l2) = corr_rel_l2(&yref, &y);
+        eprintln!("[oq4-w4a4] corr={corr:.5} relL2={rel_l2:.4}");
+        assert!(corr > 0.9, "W4A4 corr too low ({corr:.4}) — rotation/layout bug?");
+    }
+
     #[test]
     fn oq4_arch_combined_pack_layout_is_correct() {
         // Pack canonical oq4g256 into the W4A16 arch-combined device layout and
