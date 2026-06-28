@@ -6132,6 +6132,61 @@
     }
 
     #[test]
+    fn pytorch_contiguous_detection_matches_torch_semantics() {
+        // Standard contiguous OIHW conv weight.
+        let shape = [2u32, 3, 3, 3];
+        let contiguous = [27i64, 9, 3, 1];
+        assert!(pytorch_tensor_is_contiguous(&shape, &contiguous));
+        // channels_last (OHWI physical order) carries OIHW size with permuted
+        // strides; this must be detected as non-contiguous.
+        let channels_last = [27i64, 1, 9, 3];
+        assert!(!pytorch_tensor_is_contiguous(&shape, &channels_last));
+        // Size-1 dims carry arbitrary strides and must not break detection.
+        let shape1 = [4u32, 1, 1, 1];
+        assert!(pytorch_tensor_is_contiguous(&shape1, &[1i64, 1, 1, 1]));
+        assert!(pytorch_tensor_is_contiguous(&shape1, &[1i64, 4, 4, 4]));
+        // Missing/empty stride metadata is treated as already contiguous.
+        assert!(pytorch_tensor_is_contiguous(&shape, &[]));
+    }
+
+    #[test]
+    fn channels_last_storage_reorders_to_contiguous_oihw() {
+        // Logical OIHW reference values (row-major) we want to recover.
+        let (o, i, h, w) = (2usize, 3, 2, 2);
+        let oihw: Vec<f32> = (0..(o * i * h * w)).map(|v| v as f32).collect();
+        // Build the physical channels_last storage: OHWI element order.
+        let mut storage_f32 = vec![0f32; o * i * h * w];
+        let mut p = 0usize;
+        for oo in 0..o {
+            for hh in 0..h {
+                for ww in 0..w {
+                    for ii in 0..i {
+                        let logical = ((oo * i + ii) * h + hh) * w + ww;
+                        storage_f32[p] = oihw[logical];
+                        p += 1;
+                    }
+                }
+            }
+        }
+        let storage: Vec<u8> = storage_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let shape = [o as u32, i as u32, h as u32, w as u32];
+        // channels_last strides for an OIHW-sized tensor.
+        let stride = [
+            (i * h * w) as i64,
+            1,
+            (i * w) as i64,
+            i as i64,
+        ];
+        assert!(!pytorch_tensor_is_contiguous(&shape, &stride));
+        let bytes = reorder_pytorch_storage_to_contiguous(&storage, &shape, &stride, 0, 4).unwrap();
+        let recovered: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(recovered, oihw);
+    }
+
+    #[test]
     fn tiny_sd_native_unet_loads_when_import_exists() {
         let path = tiny_sd_hfq_path();
         if skip_missing_tiny_sd(&path) {

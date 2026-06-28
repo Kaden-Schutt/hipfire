@@ -8883,15 +8883,36 @@ fn add_component(
                                 quant_format: None,
                             });
                             metadata.weight_entries.push(entry_name.clone());
+                            let source = if pytorch_tensor_is_contiguous(
+                                &tensor.shape,
+                                &tensor.stride,
+                            ) {
+                                DiffusionImportSource::ZipMember {
+                                    archive_path: weight_path.clone(),
+                                    member_name: tensor.member_name,
+                                }
+                            } else {
+                                // Non-contiguous storage (e.g. channels_last conv
+                                // weights). Materialize the tensor in contiguous
+                                // row-major order so downstream layout matches the
+                                // logical shape.
+                                let archive = MiniZipArchive::open(&weight_path)?;
+                                let storage = archive.read_entry(&tensor.member_name)?;
+                                let data = reorder_pytorch_storage_to_contiguous(
+                                    &storage,
+                                    &tensor.shape,
+                                    &tensor.stride,
+                                    tensor.storage_offset,
+                                    pytorch_dtype_elem_size(&tensor.dtype),
+                                )?;
+                                DiffusionImportSource::Inline(data)
+                            };
                             entries.push(DiffusionImportEntry {
                                 name: entry_name,
                                 quant_type: tensor.quant_type,
                                 shape: tensor.shape,
                                 group_size: 0,
-                                source: DiffusionImportSource::ZipMember {
-                                    archive_path: weight_path.clone(),
-                                    member_name: tensor.member_name,
-                                },
+                                source,
                             });
                         }
                     }
@@ -9046,6 +9067,8 @@ struct PytorchTensorEntry {
     dtype: String,
     quant_type: u8,
     shape: Vec<u32>,
+    stride: Vec<i64>,
+    storage_offset: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -9207,6 +9230,84 @@ fn safetensors_dtype_info(dtype: &str) -> Option<(&'static str, u8, u64)> {
     }
 }
 
+fn pytorch_dtype_elem_size(dtype: &str) -> usize {
+    match dtype {
+        "F32" => 4,
+        "F16" | "BF16" => 2,
+        _ => 4,
+    }
+}
+
+/// Mirrors PyTorch's `is_contiguous`: a tensor is contiguous when, walking the
+/// dims from innermost to outermost, each stride equals the running product of
+/// the inner sizes. Size-1 (and empty) dims carry arbitrary strides and are
+/// skipped, exactly as PyTorch does.
+fn pytorch_tensor_is_contiguous(shape: &[u32], stride: &[i64]) -> bool {
+    if stride.is_empty() {
+        return true;
+    }
+    if stride.len() != shape.len() {
+        return true;
+    }
+    let mut expected: i64 = 1;
+    for dim in (0..shape.len()).rev() {
+        let size = shape[dim] as i64;
+        if size <= 1 {
+            continue;
+        }
+        if stride[dim] != expected {
+            return false;
+        }
+        expected *= size;
+    }
+    true
+}
+
+/// Gather a strided PyTorch storage into a contiguous row-major byte buffer for
+/// `shape`. Handles any stride layout (channels_last conv weights in practice).
+fn reorder_pytorch_storage_to_contiguous(
+    storage: &[u8],
+    shape: &[u32],
+    stride: &[i64],
+    storage_offset: i64,
+    elem_size: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let ndim = shape.len();
+    if stride.len() != ndim {
+        anyhow::bail!(
+            "pytorch tensor stride rank {} != shape rank {ndim}",
+            stride.len()
+        );
+    }
+    let count: usize = shape.iter().map(|&dim| dim as usize).product();
+    let mut out = vec![0u8; count * elem_size];
+    let mut index = vec![0usize; ndim];
+    for linear in 0..count {
+        let mut physical = storage_offset;
+        for dim in 0..ndim {
+            physical += index[dim] as i64 * stride[dim];
+        }
+        if physical < 0 {
+            anyhow::bail!("pytorch tensor negative element offset");
+        }
+        let src = physical as usize * elem_size;
+        let dst = linear * elem_size;
+        let src_end = src
+            .checked_add(elem_size)
+            .filter(|end| *end <= storage.len())
+            .ok_or_else(|| anyhow::anyhow!("pytorch tensor element out of storage bounds"))?;
+        out[dst..dst + elem_size].copy_from_slice(&storage[src..src_end]);
+        for dim in (0..ndim).rev() {
+            index[dim] += 1;
+            if index[dim] < shape[dim] as usize {
+                break;
+            }
+            index[dim] = 0;
+        }
+    }
+    Ok(out)
+}
+
 fn parse_pytorch_state_dict(path: &Path) -> anyhow::Result<Vec<PytorchTensorEntry>> {
     let archive = MiniZipArchive::open(path)?;
     let data_pkl_name = archive
@@ -9234,6 +9335,8 @@ fn parse_pytorch_state_dict(path: &Path) -> anyhow::Result<Vec<PytorchTensorEntr
             dtype: tensor.dtype,
             quant_type: tensor.quant_type,
             shape: tensor.shape,
+            stride: tensor.stride,
+            storage_offset: tensor.storage_offset,
         })
         .collect())
 }
@@ -9245,6 +9348,8 @@ struct ParsedPytorchTensor {
     dtype: String,
     quant_type: u8,
     shape: Vec<u32>,
+    stride: Vec<i64>,
+    storage_offset: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -9420,12 +9525,24 @@ fn tensor_from_rebuild_args(args: PickleValue) -> Option<ParsedPytorchTensor> {
         .into_iter()
         .map(|dim| dim as u32)
         .collect();
+    // `_rebuild_tensor_v2(storage, storage_offset, size, stride, ...)`. We must
+    // honor `storage_offset` and `stride`: tensors saved in a non-contiguous
+    // memory format (e.g. channels_last conv weights) keep a logical OIHW `size`
+    // while the underlying storage is physically reordered. Ignoring the stride
+    // loads such weights transposed.
+    let storage_offset = match items.get(1) {
+        Some(PickleValue::Int(value)) => *value,
+        _ => 0,
+    };
+    let stride = items.get(3).and_then(tuple_ints).unwrap_or_default();
     Some(ParsedPytorchTensor {
         name: String::new(),
         storage_key: storage.0,
         dtype: storage.1,
         quant_type: storage.2,
         shape,
+        stride,
+        storage_offset,
     })
 }
 

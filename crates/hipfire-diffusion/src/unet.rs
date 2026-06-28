@@ -334,13 +334,19 @@ impl UnetDownPath {
                 .get(block_idx)
                 .copied()
                 .unwrap_or_else(|| config.block_out_channels.last().copied().unwrap_or(1));
-            let head_dim = config
+            // diffusers semantics: the `attention_head_dim` config value is the
+            // NUMBER of attention heads (num_attention_heads), not the per-head
+            // dimension. SD1.5 ships attention_head_dim=8 meaning 8 heads, so the
+            // per-head dim is channels/8 (40/80/160 here). The downstream SDPA
+            // derives head_dim = hidden/heads, so we pass the head COUNT.
+            let heads = config
                 .attention_head_dim
                 .get(block_idx)
                 .copied()
                 .or_else(|| config.attention_head_dim.first().copied())
-                .unwrap_or(channels);
-            let heads = (channels / head_dim.max(1)).max(1);
+                .filter(|&h| h > 0)
+                .unwrap_or(8)
+                .min(channels.max(1));
             blocks.push(UnetDownBlock2D::from_hfq(
                 hfq,
                 block_idx,
@@ -632,15 +638,17 @@ impl UnetUpPath {
                 .nth(block_idx)
                 .copied()
                 .unwrap_or_else(|| config.block_out_channels.first().copied().unwrap_or(1));
-            let head_dim = config
+            // `attention_head_dim` config value is the head COUNT (see down path).
+            let heads = config
                 .attention_head_dim
                 .iter()
                 .rev()
                 .nth(block_idx)
                 .copied()
                 .or_else(|| config.attention_head_dim.first().copied())
-                .unwrap_or(channels);
-            let heads = (channels / head_dim.max(1)).max(1);
+                .filter(|&h| h > 0)
+                .unwrap_or(8)
+                .min(channels.max(1));
             blocks.push(UnetUpBlock2D::from_hfq(
                 hfq,
                 block_idx,
@@ -751,13 +759,15 @@ impl UnetMidBlock2DCrossAttn {
         let norm_groups = config.norm_num_groups.unwrap_or(32);
         let norm_eps = config.norm_eps.unwrap_or(1e-5);
         let channels = config.block_out_channels.last().copied().unwrap_or(1);
-        let head_dim = config
+        // `attention_head_dim` config value is the head COUNT (see down path).
+        let heads = config
             .attention_head_dim
             .last()
             .copied()
             .or_else(|| config.attention_head_dim.first().copied())
-            .unwrap_or(channels);
-        let heads = (channels / head_dim.max(1)).max(1);
+            .filter(|&h| h > 0)
+            .unwrap_or(8)
+            .min(channels.max(1));
         let attention_prefix = format!("{prefix}.attentions.0");
         let attention = if hfq
             .find_tensor_info(&format!("{attention_prefix}.norm.weight"))
