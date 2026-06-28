@@ -358,47 +358,97 @@ extern "C" __global__ void diffusion_conv2d_nchw_f32(
 //      NCHW output slice for that batch, so no transpose is needed,
 //   4. a per-output-channel bias is added.
 
-pub(crate) const DIFFUSION_IM2COL_NCHW_HIP_SRC: &str = r#"
+// Implicit-GEMM convolution: a WMMA GEMM that gathers the im2col columns from
+// the NCHW input on the fly instead of materializing a [B*OH*OW, K] column
+// matrix. This is the fused replacement for a separate im2col kernel + generic
+// gemm_f16_wmma — it removes the column-matrix allocation and its write+read
+// memory traffic.
+//
+// Per batch slice (blockIdx.z = b): Y_b[OC, OH*OW] = W_f16[OC, K] @ X_bᵀ where
+// X_b[n, c] is the im2col value for output position n=(oy,ox) and tap
+// c=(ic,ky,kx): input[b, ic, oy*stride-pad+ky, ox*stride-pad+kx] (0 if OOB).
+// Y_b[OC, OH*OW] lands directly as the NCHW output slice for batch b.
+//
+// WMMA layout matches gemm_f16_wmma (validated with the AMD matrix calculator):
+// A lane t holds row t cols 0..15; D[reg j][lane t] -> (2j+(t>>4), t&15).
+pub(crate) const DIFFUSION_CONV2D_IMPLICIT_WMMA_HIP_SRC: &str = r#"
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 
-// Lower NCHW input into a column matrix col[B*OH*OW, K], K = IC*KH*KW.
-// Row r = (b*OH + oy)*OW + ox; column c = (ic*KH + ky)*KW + kx.
-extern "C" __global__ void diffusion_im2col_nchw_f32(
-    const float* input,
-    float* col,
-    int total,
-    int in_channels,
-    int in_h,
-    int in_w,
-    int out_h,
-    int out_w,
-    int kernel_h,
-    int kernel_w,
-    int padding,
-    int stride,
-    int k_dim
+typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
+typedef float    __attribute__((ext_vector_type(8)))  float8_t;
+
+__launch_bounds__(32, 2)
+extern "C" __global__ void diffusion_conv2d_implicit_wmma_f16(
+    const _Float16* __restrict__ W,     // [OC, K] f16, K = IC*KH*KW
+    const float*    __restrict__ input, // [B, IC, IH, IW] f32
+    float*          __restrict__ Y,     // [B, OC, OH*OW] f32
+    int OC, int K, int OHW,
+    int IC, int IH, int IW, int OH, int OW,
+    int KH, int KW, int pad, int stride
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) {
-        return;
+    const int row_start = blockIdx.x * 16;   // output channels
+    const int col_start = blockIdx.y * 16;   // output positions n
+    const int b = blockIdx.z;
+    const int tid = threadIdx.x;
+    if (row_start >= OC || col_start >= OHW) return;
+
+    const _Float16* Wb = W;                              // weights shared across batch
+    const float* in_b = input + (long long)b * IC * IH * IW;
+    float* Yb = Y + (long long)b * OC * OHW;
+
+    const int my_a_row = row_start + (tid & 15);         // output channel
+    const int my_b_row = col_start + (tid & 15);         // output position n
+    const bool a_in = (my_a_row < OC);
+    const bool b_in = (my_b_row < OHW);
+    const int oy = b_in ? (my_b_row / OW) : 0;
+    const int ox = b_in ? (my_b_row % OW) : 0;
+
+    float8_t acc = {0,0,0,0,0,0,0,0};
+
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        half16_t a;
+        if (a_in) {
+            const _Float16* src = Wb + (long long)my_a_row * K + k0;
+            #pragma unroll
+            for (int j = 0; j < 16; j++) a[j] = (k0 + j < K) ? src[j] : (_Float16)0.0f;
+        } else {
+            #pragma unroll
+            for (int j = 0; j < 16; j++) a[j] = (_Float16)0.0f;
+        }
+
+        half16_t bb;
+        #pragma unroll
+        for (int j = 0; j < 16; j++) {
+            _Float16 val = (_Float16)0.0f;
+            int c = k0 + j;
+            if (b_in && c < K) {
+                int kx = c % KW;
+                int t = c / KW;
+                int ky = t % KH;
+                int ic = t / KH;
+                int iy = oy * stride - pad + ky;
+                int ix = ox * stride - pad + kx;
+                if (iy >= 0 && iy < IH && ix >= 0 && ix < IW) {
+                    val = (_Float16)in_b[((long long)ic * IH + iy) * IW + ix];
+                }
+            }
+            bb[j] = val;
+        }
+
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bb, acc);
     }
-    int c = idx % k_dim;
-    int row = idx / k_dim;
-    int ox = row % out_w;
-    int t = row / out_w;
-    int oy = t % out_h;
-    int b = t / out_h;
-    int kx = c % kernel_w;
-    int t2 = c / kernel_w;
-    int ky = t2 % kernel_h;
-    int ic = t2 / kernel_h;
-    int iy = oy * stride - padding + ky;
-    int ix = ox * stride - padding + kx;
-    float v = 0.0f;
-    if (iy >= 0 && iy < in_h && ix >= 0 && ix < in_w) {
-        v = input[((b * in_channels + ic) * in_h + iy) * in_w + ix];
+
+    const int out_col = col_start + (tid & 15);
+    if (out_col < OHW) {
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int out_row = row_start + 2 * j + (tid >> 4);
+            if (out_row < OC) {
+                Yb[(long long)out_row * OHW + out_col] = acc[j];
+            }
+        }
     }
-    col[idx] = v;
 }
 "#;
 
