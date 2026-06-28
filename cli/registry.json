@@ -106,6 +106,13 @@
       "file": "qwen3.6-35b-a3b.mq2",
       "size_gb": 11.6,
       "min_vram_gb": 14,
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5
+      },
       "desc": "Floor SKU \u2014 smallest, coherent but degraded."
     },
     "qwen3.6:35b-a3b-mq3p": {
@@ -116,6 +123,13 @@
       "file": "qwen3.6-35b-a3b.mq3p",
       "size_gb": 17.2,
       "min_vram_gb": 20,
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5
+      },
       "desc": "MQ3+P graded \u2014 MQ4 quality at MQ3 size."
     },
     "qwen3.6:35b-a3b-mq4p": {
@@ -126,6 +140,13 @@
       "file": "qwen3.6-35b-a3b.mq4p",
       "size_gb": 19.8,
       "min_vram_gb": 22,
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5
+      },
       "desc": "MQ4+P graded \u2014 robust 4-bit default, beats uniform MQ4."
     },
     "qwen3.6:35b-a3b-mfp4": {
@@ -136,6 +157,13 @@
       "file": "qwen3.6-35b-a3b.mfp4",
       "size_gb": 20.2,
       "min_vram_gb": 22,
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5
+      },
       "desc": "MFP4-E8 vector quant \u2014 the 4-bit quality leader."
     },
     "qwen3.6:35b-a3b-mq5": {
@@ -146,6 +174,13 @@
       "file": "qwen3.6-35b-a3b.mq5",
       "size_gb": 23.7,
       "min_vram_gb": 26,
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5
+      },
       "desc": "Quality SKU \u2014 ~80% MQ4->f32."
     },
     "qwen3.6:35b-a3b-mq6": {
@@ -156,6 +191,13 @@
       "file": "qwen3.6-35b-a3b.mq6",
       "size_gb": 27.7,
       "min_vram_gb": 30,
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5
+      },
       "desc": "Max quality; needs 30GB+."
     },
     "qwen3.6:35b-a3b-mq4": {
@@ -166,6 +208,13 @@
       "file": "qwen3.6-35b-a3b.mq4",
       "size_gb": 19.4,
       "min_vram_gb": 22,
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5
+      },
       "desc": "MQ4 with Q8 attention + router (uniform MQ4 routed experts) - quality-protected 4-bit default; Q8 protects the precision-sensitive attention. ~122 tok/s decode (gfx1100)."
     },
     "qwen3.6:35b-a3b-mq4r": {
@@ -176,6 +225,13 @@
       "file": "qwen3.6-35b-a3b.mq4r",
       "size_gb": 18.7,
       "min_vram_gb": 22,
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5
+      },
       "desc": "MQ4 redline - uniform MQ4 everything incl. attention, fused gate path. Fastest 4-bit (~149 tok/s decode, +21% vs mq4), lower quality (unprotected attention)."
     },
     "qwen3.6:27b": {
@@ -184,6 +240,12 @@
       "size_gb": 15.0,
       "min_vram_gb": 16,
       "default_kv_mode": "q8",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0
+      },
       "desc": "44 tok/s AR / 185 tok/s w/ draft on code",
       "triattn": {
         "file": "qwen3.6-27b.mq4.triattn.blended_v3.bin"
@@ -244,6 +306,12 @@
       "file": "qwen3.6-27b.mq3",
       "size_gb": 10.7,
       "min_vram_gb": 12,
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0
+      },
       "desc": "MQ3 alpha \u2014 fits 128K asym3 ctx on 24 GB. Pairs well with mq4 DFlash draft (126 tok/s \u03c4=7.0)."
     },
     "qwen3.5:27b-draft-mq3": {
@@ -258,6 +326,12 @@
       "file": "qwen36-27b-dflash-mq3.hfq",
       "size_gb": 0.67,
       "min_vram_gb": 12,
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0
+      },
       "desc": "MQ3 DFlash draft for qwen3.6:27b. Pairs with target/mq3 or target/mq4."
     },
     "qwen3:0.6b": {
@@ -308,6 +382,12 @@
       "file": "qwen36-27b-dflash-mq4.hfq",
       "size_gb": 0.92,
       "min_vram_gb": 16,
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0
+      },
       "desc": "DFlash draft for qwen3.6:27b \u2014 pairs with target for ~4\u00d7 decode on code (refreshed 2026-04-27 from z-lab@0919688)"
     },
     "carnice:9b": {

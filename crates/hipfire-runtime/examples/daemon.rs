@@ -6940,34 +6940,28 @@ fn generate(
             hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink
         );
 
-    // ── Qwen3.5/3.6 native-MTP serve path (opt-in) ─────────────────────
+    // ── Qwen3.5/3.6 native-MTP serve path (config-driven) ──────────────────
     //
-    // Routed BEFORE the DFlash fast path so an operator who opts in gets MTP
-    // (durable on prose, ≥1.15× AR every genre; proven 27B-3.6 K=3 p_min=0.4
-    // compressed-serial). Gated tightly so the DEFAULT path (DFlash/AR) is
-    // unchanged: requires the env opt-in `HIPFIRE_QWEN_MTP=1`, a loaded MTP
-    // head (`m.qwen35_mtp_head`), greedy (temp≈0; MTP serve v1 is greedy/
-    // argmax-match), a qwen3.5/3.6 trunk (arch 5/6), single-GPU, and no
-    // budgeted-thinking (which needs the AR </think> splice). Anything not
-    // satisfying ALL of these falls through to the existing DFlash/AR routing.
+    // Routed BEFORE the DFlash fast path. Engages when the CONFIG asks for MTP
+    // (`m.mtp_mode == "on"`, set via `hipfire config` / the TUI); the DEFAULT
+    // (mtp_mode auto/off) stays AR/DFlash — unchanged out of the box. The
+    // `HIPFIRE_QWEN_MTP` env is a power-user override (=1 force on, =0 force
+    // off). Also requires a loaded MTP head (`m.qwen35_mtp_head`), a qwen3.5/3.6
+    // trunk (arch 5/6), single-GPU, and no budgeted-thinking (which needs the AR
+    // </think> splice). Anything else falls through to the existing DFlash/AR
+    // routing.
     //
-    // SAMPLED (temp>0) MTP is now distribution-preserving and reachable here,
-    // but gated behind an opt-in env flag until the temp>0 coherence battery
-    // validates it. The arch layer's F5 DFlash-convention fix (mtp_spec.rs:
-    // independent per-side nuclei + sample_residual) makes the temp>0 branch
-    // lossless: draft + target each truncate to their own top_p nucleus, the
-    // accept ratio is computed against the truncated distributions, and the
-    // bonus is drawn from the renormalized residual (no longer the lossy
-    // un-truncated / sample_top_p(trunk) posture). Gating:
-    //   * greedy (temp <= 1e-6) → ALWAYS routes to MTP (default, unchanged), or
-    //   * sampled (temp > 0) → routes to MTP only when `HIPFIRE_MTP_SAMPLED=1`.
-    //     temp + top_p + top_k + min_p are all plumbed through and honored on the
-    //     sampled MTP path (top_k+top_p lossless on both nuclei; min_p applied via
-    //     the mtp_spec cutoff), so no sampling knob forces a fall-through here.
-    // With HIPFIRE_MTP_SAMPLED unset, a temp>0 MTP-opted-in request still falls
-    // through to DFlash (lossless sampled-spec) or AR exactly as before.
-    let qwen_mtp_opt_in = std::env::var("HIPFIRE_QWEN_MTP").ok().as_deref() == Some("1");
-    let mtp_sampled_on = std::env::var("HIPFIRE_MTP_SAMPLED").ok().as_deref() == Some("1");
+    // SAMPLED (temp>0) MTP is distribution-preserving (mtp_spec.rs F5 fix:
+    // independent per-side nuclei + sample_residual) AND coherence-validated on
+    // a3b (5-genre sampled battery clean — τ 2.05–3.17, unique-token ratios
+    // 0.48–0.81, no attractor), so it is ALLOWED BY DEFAULT when MTP is on.
+    // `HIPFIRE_MTP_SAMPLED=0` forces a temp>0 request back to DFlash/AR.
+    let qwen_mtp_on = match std::env::var("HIPFIRE_QWEN_MTP").ok().as_deref() {
+        Some("1") => true,       // power-user force-on
+        Some("0") => false,      // power-user force-off
+        _ => m.mtp_mode == "on", // config-driven (hipfire config / TUI); default AR
+    };
+    let mtp_sampled_on = std::env::var("HIPFIRE_MTP_SAMPLED").ok().as_deref() != Some("0");
     // Sampled MTP honors temp + top_p + top_k: the residual-accept sampler
     // applies the SAME top_k+top_p nucleus to BOTH the draft and target sides
     // (see mtp_sampled_accept / the draft truncation), so it stays lossless ==
@@ -6977,7 +6971,7 @@ fn generate(
     // into the nuclei — this is what lets a model whose card recommends top_k
     // (qwen3.6 A3B ships top_k=20) keep its recipe AND get the MTP speedup,
     // instead of silently dropping top_k/min_p or losing MTP.
-    if qwen_mtp_opt_in
+    if qwen_mtp_on
         && m.qwen35_mtp_head.is_some()
         && (temp <= 1e-6 || mtp_sampled_on)
         && (m.arch_id == 5 || m.arch_id == 6)
