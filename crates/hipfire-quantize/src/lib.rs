@@ -25,8 +25,12 @@ pub mod codecs;
 pub mod gptq;
 pub mod gguf_input;
 pub mod hessian_io;
+#[allow(dead_code)]
 pub mod hfhs_diag;
+#[allow(dead_code)]
 pub mod ldlq;
+// QTIP encoder core: some helpers are not yet wired into the dispatch.
+#[allow(dead_code)]
 pub mod qtip;
 pub mod roughquant;
 pub mod fixture;

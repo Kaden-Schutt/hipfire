@@ -1924,6 +1924,7 @@ fn linear_optional_bias_with_runtime_context(
     runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<CpuTensor> {
     let Some(_device_id) = runtime_context.rocm_device_id() else {
+        calib_observe_linear(weight, input);
         return linear_optional_bias(input, weight, bias);
     };
     {
@@ -1933,6 +1934,23 @@ fn linear_optional_bias_with_runtime_context(
     }
 }
 
+/// Fold a linear layer's input activations into the calibration accumulators
+/// (no-op unless a calibration run is armed). `weight` is `[out, in]`; the input
+/// is row-major `[rows, in]`.
+fn calib_observe_linear(weight: &CpuTensor, input: &CpuTensor) {
+    if !quant_calib::calib_active() {
+        return;
+    }
+    let Some(&k) = weight.shape.get(1) else {
+        return;
+    };
+    if k == 0 || input.data.is_empty() || input.data.len() % k != 0 {
+        return;
+    }
+    let rows = input.data.len() / k;
+    quant_calib::calib_observe_matrix(weight.data.as_ptr() as usize, &input.data, rows, k);
+}
+
 fn linear_with_runtime_context(
     input: &CpuTensor,
     weight: &CpuTensor,
@@ -1940,6 +1958,7 @@ fn linear_with_runtime_context(
     runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<CpuTensor> {
     if runtime_context.rocm_device_id().is_none() {
+        calib_observe_linear(weight, input);
         return linear(input, weight, bias);
     }
     linear_optional_bias_with_runtime_context(input, weight, Some(bias), runtime_context)
@@ -2381,6 +2400,12 @@ impl CpuTensor {
                 data.len()
             )));
         }
+        // Register this weight's data pointer for activation calibration (no-op
+        // unless a calibration run is armed). The Vec buffer is stable across the
+        // move into `Self`, so the pointer matches what the forward sees.
+        if quant_calib::calib_active() {
+            quant_calib::calib_register(data.as_ptr() as usize, name);
+        }
         Ok(Self {
             shape: info.shape.iter().map(|&dim| dim as usize).collect(),
             data,
@@ -2412,6 +2437,12 @@ use quant_decode::*;
 mod quant_encode;
 pub use quant_encode::{
     quantize_diffusion_hfq, DiffusionQuantFormat, DiffusionQuantizeSummary,
+};
+
+mod quant_calib;
+pub use quant_calib::{
+    calib_active, calib_begin, calib_finish_and_write, calib_observed_count,
+    calibrate_diffusion_hfq, CalibrateSummary,
 };
 #[cfg(test)]
 use quant_encode::{encode_q4f16_g64, encode_q4k, encode_q8f16};

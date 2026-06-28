@@ -10,8 +10,9 @@ use base64::Engine;
 use clap::{Args, Subcommand};
 use hipfire_diffusion::DiffusionHipRuntimeOptions;
 use hipfire_diffusion::{
-    import_diffusers_to_hfq, inspect_hfq_with_runtime_support, quantize_diffusion_hfq,
-    resize_rgb_batch_to_cover_nearest, DiffusersImportOptions, DiffusionBatchRequest,
+    calibrate_diffusion_hfq, import_diffusers_to_hfq, inspect_hfq_with_runtime_support,
+    quantize_diffusion_hfq, resize_rgb_batch_to_cover_nearest, DiffusersImportOptions,
+    DiffusionBatchRequest,
     DiffusionGenerationRuntimeOptions, DiffusionHfqInspection, DiffusionImg2ImgRequest,
     DiffusionPipeline, DiffusionProgress, DiffusionPrompt, DiffusionQuantFormat, DiffusionResult,
     RgbImageBatch,
@@ -97,6 +98,37 @@ pub enum DiffusionCommand {
     /// copies every other entry (biases, norms, configs, tokenizers) verbatim.
     /// Decoding is per-tensor by quant_type, so the output loads unchanged.
     Quantize(DiffusionQuantizeArgs),
+    /// Run an activation-calibration pass and write a .calib.hfq sidecar
+    ///
+    /// Generates a few CPU-reference denoise steps over sample prompts, capturing
+    /// per-weight activation statistics (imatrix + per-linear Hessian). The
+    /// resulting .calib.hfq feeds `quantize --format oq4++ --calib`.
+    Calibrate(DiffusionCalibrateArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DiffusionCalibrateArgs {
+    /// Source diffusion .hfq artifact to calibrate
+    pub model: PathBuf,
+    /// Output .calib.hfq sidecar path
+    #[arg(long, short)]
+    pub output: PathBuf,
+    /// Calibration prompts (repeatable); defaults to a small built-in set
+    #[arg(long = "prompt", short)]
+    pub prompts: Vec<String>,
+    /// Denoise steps per prompt
+    #[arg(long, default_value_t = 4)]
+    pub steps: u32,
+    #[arg(long, default_value_t = 256)]
+    pub width: u32,
+    #[arg(long, default_value_t = 256)]
+    pub height: u32,
+    /// CFG scale (>1 captures both conditional and unconditional activations)
+    #[arg(long, default_value_t = 7.5)]
+    pub cfg_scale: f32,
+    /// Max linear input dim K to capture a full [K,K] Hessian for (else imatrix only)
+    #[arg(long, default_value_t = 2048)]
+    pub hessian_max_k: usize,
 }
 
 #[derive(Debug, Args)]
@@ -403,7 +435,43 @@ pub fn run(args: DiffusionArgs) -> anyhow::Result<()> {
         DiffusionCommand::Img2Img(args) => run_img2img(args),
         DiffusionCommand::Smoke(args) => run_smoke(args),
         DiffusionCommand::Quantize(args) => run_quantize(args),
+        DiffusionCommand::Calibrate(args) => run_calibrate(args),
     }
+}
+
+fn run_calibrate(args: DiffusionCalibrateArgs) -> anyhow::Result<()> {
+    let prompts = if args.prompts.is_empty() {
+        vec![
+            "a photograph of an astronaut riding a horse".to_string(),
+            "portrait photo of a man, detailed face, studio lighting".to_string(),
+            "a landscape painting of mountains at sunset".to_string(),
+        ]
+    } else {
+        args.prompts.clone()
+    };
+    let summary = calibrate_diffusion_hfq(
+        &args.model,
+        &args.output,
+        &prompts,
+        args.steps,
+        args.width,
+        args.height,
+        args.cfg_scale,
+        args.hessian_max_k,
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "model": args.model,
+            "output": args.output,
+            "prompts": prompts.len(),
+            "steps": args.steps,
+            "observed_tensors": summary.observed_tensors,
+            "hessians": summary.hessians,
+            "imatrices": summary.imatrices,
+        }))?
+    );
+    Ok(())
 }
 
 fn run_quantize(args: DiffusionQuantizeArgs) -> anyhow::Result<()> {

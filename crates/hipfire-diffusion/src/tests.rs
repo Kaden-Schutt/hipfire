@@ -6196,6 +6196,32 @@
     ///   (1) global weight SQNR vs the source (the encoder's direct objective),
     ///   (2) single-pass UNet eps error at a fixed deterministic input (the
     ///       functional error of the quantized weights, no trajectory amplification).
+    /// Validate a calibration sidecar (env `HIPFIRE_QUANT_CALIB`): every Hessian
+    /// must be readable, symmetric, and PSD (non-negative diagonal). Confirms the
+    /// Phase-1 diffusion CPU collector writes a sidecar the quantizer's
+    /// `HessianSidecar` reader (in hipfire-quantize) consumes correctly.
+    #[test]
+    fn calib_sidecar_is_valid() {
+        use hipfire_quantize::hessian_io::HessianSidecar;
+        let Ok(path) = std::env::var("HIPFIRE_QUANT_CALIB") else {
+            return;
+        };
+        let sc = HessianSidecar::open(std::path::Path::new(&path)).unwrap();
+        let (mut hessians, mut imatrices) = (0usize, 0usize);
+        for h in sc.tensors() {
+            HessianSidecar::check_symmetry(&h, 1e-4).unwrap();
+            HessianSidecar::check_positive_diagonal(&h).unwrap();
+            assert_eq!(h.k % 256, 0, "{}: K not 256-aligned", h.name);
+            hessians += 1;
+        }
+        for im in sc.imatrices() {
+            assert!(im.iter_f32().all(|v| v >= 0.0), "{}: negative imatrix", im.name);
+            imatrices += 1;
+        }
+        eprintln!("[calib-valid] hessians={hessians} imatrices={imatrices} (all symmetric+PSD)");
+        assert!(hessians > 0 && imatrices > 0);
+    }
+
     #[test]
     fn quant_fidelity_report() {
         let Ok(src_path) = std::env::var("HIPFIRE_QUANT_SRC") else {
