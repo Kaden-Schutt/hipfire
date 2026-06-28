@@ -360,11 +360,14 @@ impl NemotronHConfig {
     /// HF reference with the stored `out_proj` bytes, so applying the same scale
     /// again collapses the first Mamba block output.
     pub fn mamba_out_proj_runtime_scale(&self) -> f32 {
-        if self.moe.is_some() || self.is_pure_mamba2() {
-            1.0
-        } else {
-            1.0f32 / (self.num_layers as f32).sqrt()
-        }
+        // No runtime rescale. The 1/sqrt(num_layers) GPT-style residual rescale
+        // is an INIT-only op in transformers (rescale_prenorm_residual); a loaded
+        // from_pretrained checkpoint already has it baked in, so re-applying it
+        // collapses the Mamba mixer output ~sqrt(num_layers)x. CONFIRMED on dense
+        // Nano-4B (q8) 2026-06-28: with 1/sqrt(42) the daemon served the
+        // newline/`(` attractor; with 1.0 it serves coherently ("...the answer:
+        // Paris."). MoE (30B) and pure-Mamba2 were already 1.0.
+        1.0
     }
 
     /// True for state-spaces-style pure Mamba-2 stacks.
