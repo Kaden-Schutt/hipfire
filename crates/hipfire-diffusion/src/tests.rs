@@ -4066,18 +4066,24 @@
             2.0,
             &positive,
             &negative,
+            // Batch-aware mock: batched CFG fuses the uncond/cond passes into one
+            // call with encoder rows [positive; negative], so emit a prediction
+            // per batch row (negative row value 0.0 -> [0.25,-0.25], else
+            // positive -> [0.75,0.25]). Same per-row predictions as before.
             |_sample, _timesteps, encoder| {
-                if encoder.data[0] == 0.0 {
-                    Ok(CpuTensor {
-                        shape: vec![1, 1, 1, 2],
-                        data: vec![0.25, -0.25],
-                    })
-                } else {
-                    Ok(CpuTensor {
-                        shape: vec![1, 1, 1, 2],
-                        data: vec![0.75, 0.25],
-                    })
+                let rows = encoder.shape[0];
+                let mut data = Vec::with_capacity(rows * 2);
+                for r in 0..rows {
+                    if encoder.data[r] == 0.0 {
+                        data.extend_from_slice(&[0.25, -0.25]);
+                    } else {
+                        data.extend_from_slice(&[0.75, 0.25]);
+                    }
                 }
+                Ok(CpuTensor {
+                    shape: vec![rows, 1, 1, 2],
+                    data,
+                })
             },
         )
         .unwrap();

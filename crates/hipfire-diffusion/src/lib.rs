@@ -1270,6 +1270,49 @@ fn denoise_latents_with_cfg_progress_and_runtime_options(
     )
 }
 
+/// Concatenate two tensors along the leading (batch) dimension. The trailing
+/// dims must match; the data is simply appended (both are batch-major
+/// row-major). Used to fuse the CFG uncond/cond passes into one batch-2N forward.
+fn concat_batch_dim(a: &CpuTensor, b: &CpuTensor) -> DiffusionResult<CpuTensor> {
+    if a.shape.len() != b.shape.len() || a.shape.is_empty() || a.shape[1..] != b.shape[1..] {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "cannot concatenate along batch: shapes {:?} and {:?}",
+            a.shape, b.shape
+        )));
+    }
+    let mut shape = a.shape.clone();
+    shape[0] = a.shape[0] + b.shape[0];
+    let mut data = Vec::with_capacity(a.data.len() + b.data.len());
+    data.extend_from_slice(&a.data);
+    data.extend_from_slice(&b.data);
+    Ok(CpuTensor { shape, data })
+}
+
+/// Split a batched CFG prediction `[2N, ...]` back into the positive `[0..N]`
+/// and negative `[N..2N]` halves.
+fn split_batched_cfg_prediction(
+    batched: &CpuTensor,
+) -> DiffusionResult<(CpuTensor, CpuTensor)> {
+    if batched.shape.first().copied().unwrap_or(0) % 2 != 0 || batched.shape.is_empty() {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "batched CFG prediction must have an even leading dim, got {:?}",
+            batched.shape
+        )));
+    }
+    let mut half_shape = batched.shape.clone();
+    half_shape[0] = batched.shape[0] / 2;
+    let half = batched.data.len() / 2;
+    let positive = CpuTensor {
+        shape: half_shape.clone(),
+        data: batched.data[..half].to_vec(),
+    };
+    let negative = CpuTensor {
+        shape: half_shape,
+        data: batched.data[half..].to_vec(),
+    };
+    Ok((positive, negative))
+}
+
 fn denoise_latents_with_cfg_progress_and_runtime_context(
     mut latents: LatentBatch,
     schedule: &DiffusionSchedule,
@@ -1327,18 +1370,65 @@ fn denoise_latents_with_cfg_progress_and_runtime_context(
         };
         let timestep = schedule.timesteps[step];
         let timesteps = vec![timestep; latents.batch];
-        let positive_pred = predict_noise(
-            &model_sample,
-            &timesteps,
-            positive_embeddings,
-            positive_attention_mask,
-            positive_sdxl_conditioning,
-            runtime_context,
-        )?;
-        validate_noise_prediction(&latents, &positive_pred)?;
+        // Batched CFG: when guidance is active and neither pass needs SDXL
+        // conditioning (and the attention masks are batchable), run the uncond
+        // and cond passes as one batch-2N forward — `[positive; negative]` —
+        // instead of two sequential forwards. Halves launches and feeds bigger
+        // GEMMs. SDXL / mixed-mask cases fall back to the sequential path.
+        let masks_batchable = positive_attention_mask.is_none() == negative_attention_mask.is_none();
+        let batched_cfg = !cfg_is_identity
+            && positive_sdxl_conditioning.is_none()
+            && negative_sdxl_conditioning.is_none()
+            && masks_batchable;
         let guided = if cfg_is_identity {
+            let positive_pred = predict_noise(
+                &model_sample,
+                &timesteps,
+                positive_embeddings,
+                positive_attention_mask,
+                positive_sdxl_conditioning,
+                runtime_context,
+            )?;
+            validate_noise_prediction(&latents, &positive_pred)?;
             positive_pred
+        } else if batched_cfg {
+            let batched_sample = concat_batch_dim(&model_sample, &model_sample)?;
+            let mut batched_timesteps = timesteps.clone();
+            batched_timesteps.extend_from_slice(&timesteps);
+            let batched_encoder = concat_batch_dim(positive_embeddings, negative_embeddings)?;
+            let batched_mask = match (positive_attention_mask, negative_attention_mask) {
+                (Some(p), Some(n)) => Some(concat_batch_dim(p, n)?),
+                _ => None,
+            };
+            let batched_pred = predict_noise(
+                &batched_sample,
+                &batched_timesteps,
+                &batched_encoder,
+                batched_mask.as_ref(),
+                None,
+                runtime_context,
+            )?;
+            let (positive_pred, negative_pred) = split_batched_cfg_prediction(&batched_pred)?;
+            validate_noise_prediction(&latents, &positive_pred)?;
+            validate_noise_prediction(&latents, &negative_pred)?;
+            let (guided, guidance_runtime_kind) = cfg_guidance_with_runtime_context(
+                &negative_pred,
+                &positive_pred,
+                cfg_scale,
+                runtime_context,
+            )?;
+            runtime_kind = merge_runtime_kind(runtime_kind, guidance_runtime_kind);
+            guided
         } else {
+            let positive_pred = predict_noise(
+                &model_sample,
+                &timesteps,
+                positive_embeddings,
+                positive_attention_mask,
+                positive_sdxl_conditioning,
+                runtime_context,
+            )?;
+            validate_noise_prediction(&latents, &positive_pred)?;
             let negative_pred = predict_noise(
                 &model_sample,
                 &timesteps,
