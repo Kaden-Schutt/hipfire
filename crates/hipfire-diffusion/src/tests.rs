@@ -6187,6 +6187,44 @@
     }
 
     #[test]
+    fn q8f16_encoder_round_trips_through_decoder() {
+        // Mixed-magnitude data spanning >1 group (32) with negatives and zeros.
+        let data: Vec<f32> = (0..100)
+            .map(|i| ((i as f32 - 50.0) * 0.013).sin() * (1.0 + (i % 7) as f32))
+            .collect();
+        let bytes = encode_q8f16(&data);
+        assert_eq!(bytes.len(), data.len().div_ceil(32) * 34);
+        let decoded = decode_q8f16_slice("t", &bytes, data.len()).unwrap();
+        // q8_0 step is max_abs/127; per-group error is bounded by half a step.
+        for group in data.chunks(32) {
+            let max_abs = group.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+            let step = (max_abs / 127.0).max(1e-6);
+            let base = data.iter().position(|v| (*v - group[0]).abs() < 1e-12).unwrap();
+            for (k, &orig) in group.iter().enumerate() {
+                assert!((decoded[base + k] - orig).abs() <= step * 0.5 + 1e-4);
+            }
+        }
+    }
+
+    #[test]
+    fn q4f16_g64_encoder_round_trips_through_decoder() {
+        let data: Vec<f32> = (0..200).map(|i| (i as f32 - 100.0) * 0.02).collect();
+        let bytes = encode_q4f16_g64(&data);
+        assert_eq!(bytes.len(), data.len().div_ceil(64) * 36);
+        let decoded = decode_q4f16_g64_slice("t", &bytes, data.len()).unwrap();
+        // 4-bit affine over each 64-group: error bounded by half a (range/15) step.
+        for group in data.chunks(64) {
+            let min = group.iter().copied().fold(f32::INFINITY, f32::min);
+            let max = group.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let step = ((max - min) / 15.0).max(1e-6);
+            let base = data.iter().position(|v| (*v - group[0]).abs() < 1e-12).unwrap();
+            for (k, &orig) in group.iter().enumerate() {
+                assert!((decoded[base + k] - orig).abs() <= step * 0.5 + 1e-2);
+            }
+        }
+    }
+
+    #[test]
     fn tiny_sd_native_unet_loads_when_import_exists() {
         let path = tiny_sd_hfq_path();
         if skip_missing_tiny_sd(&path) {

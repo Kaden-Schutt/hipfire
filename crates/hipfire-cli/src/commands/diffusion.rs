@@ -10,10 +10,11 @@ use base64::Engine;
 use clap::{Args, Subcommand};
 use hipfire_diffusion::DiffusionHipRuntimeOptions;
 use hipfire_diffusion::{
-    import_diffusers_to_hfq, inspect_hfq_with_runtime_support, resize_rgb_batch_to_cover_nearest,
-    DiffusersImportOptions, DiffusionBatchRequest, DiffusionGenerationRuntimeOptions,
-    DiffusionHfqInspection, DiffusionImg2ImgRequest, DiffusionPipeline, DiffusionProgress,
-    DiffusionPrompt, DiffusionResult, RgbImageBatch,
+    import_diffusers_to_hfq, inspect_hfq_with_runtime_support, quantize_diffusion_hfq,
+    resize_rgb_batch_to_cover_nearest, DiffusersImportOptions, DiffusionBatchRequest,
+    DiffusionGenerationRuntimeOptions, DiffusionHfqInspection, DiffusionImg2ImgRequest,
+    DiffusionPipeline, DiffusionProgress, DiffusionPrompt, DiffusionQuantFormat, DiffusionResult,
+    RgbImageBatch,
 };
 use serde::Serialize;
 
@@ -89,6 +90,25 @@ pub enum DiffusionCommand {
     Img2Img(DiffusionImg2ImgArgs),
     /// Run an end-to-end diffusion admission smoke and validate output PNGs
     Smoke(DiffusionSmokeArgs),
+    /// Re-encode the weight tensors of a source .hfq into a packed quant format
+    ///
+    /// Reads an existing diffusion .hfq (weights stored as f32/f16/bf16 source),
+    /// re-encodes the large 2D+ `.weight` tensors into the requested format, and
+    /// copies every other entry (biases, norms, configs, tokenizers) verbatim.
+    /// Decoding is per-tensor by quant_type, so the output loads unchanged.
+    Quantize(DiffusionQuantizeArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DiffusionQuantizeArgs {
+    /// Source diffusion .hfq artifact (typically `weight_format: source`)
+    pub source: PathBuf,
+    /// Output quantized .hfq artifact path
+    #[arg(long, short)]
+    pub output: PathBuf,
+    /// Quant format: `q8` (q8_0, int8 group-32) or `q4` (Q4F16_G64, affine 4-bit group-64)
+    #[arg(long, default_value = "q8")]
+    pub format: String,
 }
 
 #[derive(Debug, Args)]
@@ -382,7 +402,37 @@ pub fn run(args: DiffusionArgs) -> anyhow::Result<()> {
         DiffusionCommand::Txt2Img(args) => run_txt2img(args),
         DiffusionCommand::Img2Img(args) => run_img2img(args),
         DiffusionCommand::Smoke(args) => run_smoke(args),
+        DiffusionCommand::Quantize(args) => run_quantize(args),
     }
+}
+
+fn run_quantize(args: DiffusionQuantizeArgs) -> anyhow::Result<()> {
+    let format = DiffusionQuantFormat::parse(&args.format).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown quant format {:?}; expected one of: q8, q4",
+            args.format
+        )
+    })?;
+    let summary = quantize_diffusion_hfq(&args.source, &args.output, format)?;
+    let ratio = if summary.output_bytes > 0 {
+        summary.source_bytes as f64 / summary.output_bytes as f64
+    } else {
+        0.0
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "source": args.source,
+            "output": args.output,
+            "format": args.format,
+            "quantized_tensors": summary.quantized_tensors,
+            "copied_tensors": summary.copied_tensors,
+            "source_bytes": summary.source_bytes,
+            "output_bytes": summary.output_bytes,
+            "compression_ratio": (ratio * 100.0).round() / 100.0,
+        }))?
+    );
+    Ok(())
 }
 
 fn inspection_json(inspection: DiffusionHfqInspection) -> serde_json::Value {

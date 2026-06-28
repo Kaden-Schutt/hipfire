@@ -207,7 +207,6 @@ pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {
     f32::from_bits(f32_bits)
 }
 
-#[cfg(test)]
 pub(crate) fn f32_to_f16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;

@@ -465,8 +465,8 @@
     "semantic_hash": ""
   },
   "crates/hipfire-cli/src/commands/diffusion.rs": {
-    "mtime": 1782565339.2377057,
-    "ast_hash": "fc400f06dbbd5fa05ac483fab885983e",
+    "mtime": 1782640526.1889915,
+    "ast_hash": "f49c35433ef7f0efd1e07b034ca9a3f1",
     "semantic_hash": ""
   },
   "crates/hipfire-cli/src/commands/forward.rs": {
@@ -620,8 +620,8 @@
     "semantic_hash": ""
   },
   "crates/hipfire-diffusion/src/lib.rs": {
-    "mtime": 1782637955.3737469,
-    "ast_hash": "ebd61e25cb985e5de8d1a4edb1ec2bfd",
+    "mtime": 1782640977.2815628,
+    "ast_hash": "2be1c520ef09f37a0d5af7c7d44931cd",
     "semantic_hash": ""
   },
   "crates/hipfire-dispatch-tests/src/arch_caps.rs": {
@@ -5805,8 +5805,8 @@
     "semantic_hash": ""
   },
   "crates/hipfire-diffusion/src/quant_decode.rs": {
-    "mtime": 1782565172.5111065,
-    "ast_hash": "c2542e51f93849595241c61e3f701421",
+    "mtime": 1782640372.4568756,
+    "ast_hash": "84c6f34193890ea2f79a5056a630fcf6",
     "semantic_hash": ""
   },
   "crates/hipfire-diffusion/src/scheduler.rs": {
@@ -5815,8 +5815,8 @@
     "semantic_hash": ""
   },
   "crates/hipfire-diffusion/src/tests.rs": {
-    "mtime": 1782637955.3756104,
-    "ast_hash": "21cc71e89630e5650f40a205ea4e6aab",
+    "mtime": 1782640955.5818553,
+    "ast_hash": "226ded8315fd7c58faf3b94405031c79",
     "semantic_hash": ""
   },
   "crates/hipfire-diffusion/src/tokenizer.rs": {
@@ -5842,6 +5842,11 @@
   "crates/hipfire-diffusion/src/vae.rs": {
     "mtime": 1782571140.7705438,
     "ast_hash": "0340aff69a09ac84daa2967a8d988d5a",
+    "semantic_hash": ""
+  },
+  "crates/hipfire-diffusion/src/quant_encode.rs": {
+    "mtime": 1782640409.803818,
+    "ast_hash": "f1b0a0f3f128911fe2052d9e882d3e4c",
     "semantic_hash": ""
   }
 }

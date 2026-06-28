@@ -2409,6 +2409,13 @@ impl CpuTensor {
 mod quant_decode;
 use quant_decode::*;
 
+mod quant_encode;
+pub use quant_encode::{
+    quantize_diffusion_hfq, DiffusionQuantFormat, DiffusionQuantizeSummary,
+};
+#[cfg(test)]
+use quant_encode::{encode_q4f16_g64, encode_q8f16};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffusionError {
     InvalidMetadata(String),
