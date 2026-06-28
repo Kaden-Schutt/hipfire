@@ -30,6 +30,7 @@
 pub mod archive;
 pub mod codec;
 pub mod config;
+pub mod eval;
 pub mod hfkseq;
 pub mod math;
 pub mod meta;
@@ -38,6 +39,7 @@ pub mod refblock;
 pub use archive::RefArchive;
 pub use codec::BlobCodec;
 pub use config::KldConfig;
+pub use eval::{KldEvalOutcome, KldRefPayloads};
 pub use hfkseq::ChunkResult;
 pub use math::{log_z, score_position, top_k_log_softmax, PositionScore, TopKReduction};
 pub use meta::{compat, CompatReport, Mismatch, ProducerInfo, RefMeta, RunEnv, Severity};
