@@ -10,6 +10,11 @@
 //! the informational `weight_format` string.
 
 use super::*;
+use crate::quant_decode::{OQ_FWHT_SEED1, OQ_FWHT_SEED2};
+use hipfire_quantize::codecs::{quantize_oq4g256, quantize_oq8g256};
+use hipfire_quantize::gen_fwht_signs;
+pub use hipfire_quantize::hessian_io::HessianSidecar;
+use hipfire_quantize::ldlq::oq4_ldlq_pack;
 use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqFile, HfqMemTensor};
 use std::path::Path;
 
@@ -30,6 +35,15 @@ pub enum DiffusionQuantFormat {
     /// with its own 6-bit scale+min under a per-superblock f16 d/dmin. Reuses the
     /// hipfire LLM-path codec; finer/hierarchical vs the flat group-64 affine.
     Q4K,
+    /// Opus Quant 4-bit (FWHT-rotated, 256-group), RTN. Linears -> oq4, convs ->
+    /// oq8 (convs are sensitive and have no Hessian). Data-free.
+    Oq4,
+    /// Opus Quant 4-bit, activation-calibrated: linears use LDLQ Hessian error
+    /// feedback (oq4_ldlq_pack) when a `.calib.hfq` Hessian is available, else
+    /// fall back to oq4 RTN; convs -> oq8. Requires `--calib`.
+    Oq4PlusPlus,
+    /// Opus Quant 8-bit (FWHT-rotated, 256-group), RTN. Near-lossless.
+    Oq8,
 }
 
 impl DiffusionQuantFormat {
@@ -37,10 +51,19 @@ impl DiffusionQuantFormat {
         match value.to_ascii_lowercase().replace(['-', '_'], "").as_str() {
             "q8" | "q8f16" | "q80" => Some(Self::Q8F16),
             "q4" | "q4f16" | "q4f16g64" => Some(Self::Q4F16G64),
-            "q4+" | "q4c" | "q4clip" | "oq4+" | "q4f16g64clip" => Some(Self::Q4F16G64Clip),
+            "q4+" | "q4c" | "q4clip" | "q4f16g64clip" => Some(Self::Q4F16G64Clip),
             "q4k" | "q4_k" => Some(Self::Q4K),
+            "oq4" => Some(Self::Oq4),
+            "oq4+" | "oq4++" => Some(Self::Oq4PlusPlus),
+            "oq8" => Some(Self::Oq8),
             _ => None,
         }
+    }
+
+    /// Opus formats are FWHT-rotated, 256-group, and quantize per-tensor (linears
+    /// vs convs differ), so they bypass the single-format `encode`/`quant_type`.
+    fn is_opus(self) -> bool {
+        matches!(self, Self::Oq4 | Self::Oq4PlusPlus | Self::Oq8)
     }
 
     fn quant_type(self) -> u8 {
@@ -48,6 +71,7 @@ impl DiffusionQuantFormat {
             Self::Q8F16 => QT_DIFFUSION_TENSOR_Q8F16,
             Self::Q4F16G64 | Self::Q4F16G64Clip => QT_DIFFUSION_TENSOR_Q4F16_G64,
             Self::Q4K => QT_DIFFUSION_TENSOR_Q4_K,
+            Self::Oq4 | Self::Oq4PlusPlus | Self::Oq8 => QT_DIFFUSION_TENSOR_OQ4_G256,
         }
     }
 
@@ -55,7 +79,7 @@ impl DiffusionQuantFormat {
         match self {
             Self::Q8F16 => 32,
             Self::Q4F16G64 | Self::Q4F16G64Clip => 64,
-            Self::Q4K => 256,
+            Self::Q4K | Self::Oq4 | Self::Oq4PlusPlus | Self::Oq8 => 256,
         }
     }
 
@@ -65,6 +89,9 @@ impl DiffusionQuantFormat {
             Self::Q4F16G64 => "q4",
             Self::Q4F16G64Clip => "q4+",
             Self::Q4K => "q4k",
+            Self::Oq4 => "oq4",
+            Self::Oq4PlusPlus => "oq4++",
+            Self::Oq8 => "oq8",
         }
     }
 
@@ -74,8 +101,51 @@ impl DiffusionQuantFormat {
             Self::Q4F16G64 => encode_q4f16_g64(data),
             Self::Q4F16G64Clip => encode_q4f16_g64_clipsearch(data),
             Self::Q4K => encode_q4k(data),
+            // Opus formats are handled per-tensor in quantize_diffusion_hfq.
+            Self::Oq4 | Self::Oq4PlusPlus | Self::Oq8 => unreachable!("opus uses encode_opus_tensor"),
         }
     }
+}
+
+/// Per-tensor Opus (oq4/oq8) encoding with optional LDLQ calibration.
+/// Returns `(quant_type, group_size, bytes, ldlq_used)`. Convs (rank-4) and full
+/// `oq8` runs go to oq8; linears go to oq4 (LDLQ when a Hessian is available,
+/// else RTN).
+#[allow(clippy::too_many_arguments)]
+fn encode_opus_tensor(
+    format: DiffusionQuantFormat,
+    name: &str,
+    shape: &[u32],
+    data: &[f32],
+    calib: Option<&HessianSidecar>,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> (u8, u32, Vec<u8>, bool) {
+    let is_conv = shape.len() == 4;
+    if is_conv || matches!(format, DiffusionQuantFormat::Oq8) {
+        let bytes = quantize_oq8g256(data, signs1, signs2);
+        return (QT_DIFFUSION_TENSOR_OQ8_G256, 256, bytes, false);
+    }
+    // Linear (rank-2) at oq4 / oq4++.
+    let m = shape[0] as usize;
+    let k = shape[1] as usize;
+    if matches!(format, DiffusionQuantFormat::Oq4PlusPlus) && k % 256 == 0 && m * k == data.len() {
+        if let Some(sc) = calib {
+            let base = name.strip_suffix(".weight").unwrap_or(name);
+            if let Some(href) = sc.get(base, 0) {
+                if href.k == k {
+                    let h: Vec<f32> = (0..k * k).map(|i| href.at(i / k, i % k) as f32).collect();
+                    let diag: f64 = (0..k).map(|i| h[i * k + i] as f64).sum();
+                    let damp = 0.01 * (diag / k as f64).max(1e-12);
+                    if let Some(packed) = oq4_ldlq_pack(data, m, k, &h, signs1, signs2, damp) {
+                        return (QT_DIFFUSION_TENSOR_OQ4_G256, 256, packed, true);
+                    }
+                }
+            }
+        }
+    }
+    let bytes = quantize_oq4g256(data, signs1, signs2);
+    (QT_DIFFUSION_TENSOR_OQ4_G256, 256, bytes, false)
 }
 
 /// q8_0 encoder: groups of 32, symmetric int8, `scale = max_abs / 127`, stored
@@ -294,21 +364,34 @@ fn is_quantizable_weight(name: &str, shape: &[u32]) -> bool {
 pub struct DiffusionQuantizeSummary {
     pub quantized_tensors: usize,
     pub copied_tensors: usize,
+    /// Linears packed with LDLQ Hessian error feedback (Opus calibrated path).
+    pub ldlq_tensors: usize,
     pub source_bytes: u64,
     pub output_bytes: u64,
 }
 
 /// Re-encode the weight tensors of `source` into `format`, copying all other
-/// entries verbatim, and write the result to `output`.
+/// entries verbatim, and write the result to `output`. For the Opus formats
+/// (`oq4`/`oq4++`/`oq8`), `calib` (a `.calib.hfq` opened via `HessianSidecar`)
+/// supplies per-linear Hessians for LDLQ error feedback.
 pub fn quantize_diffusion_hfq(
     source: &Path,
     output: &Path,
     format: DiffusionQuantFormat,
+    calib: Option<&HessianSidecar>,
 ) -> anyhow::Result<DiffusionQuantizeSummary> {
     let hfq = HfqFile::open(source)?;
     let mut summary = DiffusionQuantizeSummary {
         source_bytes: std::fs::metadata(source)?.len(),
         ..Default::default()
+    };
+    let (signs1, signs2) = if format.is_opus() {
+        (
+            gen_fwht_signs(OQ_FWHT_SEED1, 256),
+            gen_fwht_signs(OQ_FWHT_SEED2, 256),
+        )
+    } else {
+        (Vec::new(), Vec::new())
     };
 
     let names: Vec<String> = hfq.tensors().iter().map(|t| t.name.clone()).collect();
@@ -320,12 +403,27 @@ pub fn quantize_diffusion_hfq(
         if is_quantizable_weight(name, &info.shape) {
             let decoded = CpuTensor::from_hfq(&hfq, name)
                 .map_err(|e| anyhow::anyhow!("decode {name:?}: {e}"))?;
+            let (quant_type, group_size, data) = if format.is_opus() {
+                let (qt, gs, bytes, ldlq) = encode_opus_tensor(
+                    format, name, &info.shape, &decoded.data, calib, &signs1, &signs2,
+                );
+                if ldlq {
+                    summary.ldlq_tensors += 1;
+                }
+                (qt, gs, bytes)
+            } else {
+                (
+                    format.quant_type(),
+                    format.group_size(),
+                    format.encode(&decoded.data),
+                )
+            };
             out_tensors.push(HfqMemTensor {
                 name: name.clone(),
-                quant_type: format.quant_type(),
+                quant_type,
                 shape: info.shape.clone(),
-                group_size: format.group_size(),
-                data: format.encode(&decoded.data),
+                group_size,
+                data,
             });
             summary.quantized_tensors += 1;
         } else {
@@ -346,6 +444,12 @@ pub fn quantize_diffusion_hfq(
     write_hfqm_package_mem(output, hfq.arch_id, &metadata_json, &out_tensors)?;
     summary.output_bytes = std::fs::metadata(output)?.len();
     Ok(summary)
+}
+
+/// Open a `.calib.hfq` sidecar for use as the `calib` argument to
+/// [`quantize_diffusion_hfq`].
+pub fn open_calib_sidecar(path: &Path) -> anyhow::Result<HessianSidecar> {
+    HessianSidecar::open(path).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 fn rewrite_weight_format(metadata_json: &str, label: &str) -> String {

@@ -138,9 +138,12 @@ pub struct DiffusionQuantizeArgs {
     /// Output quantized .hfq artifact path
     #[arg(long, short)]
     pub output: PathBuf,
-    /// Quant format: `q8` (q8_0, int8 group-32) or `q4` (Q4F16_G64, affine 4-bit group-64)
+    /// Quant format: q8, q4, q4k, q4+ (data-free) or oq4/oq4++/oq8 (Opus, calibrated)
     #[arg(long, default_value = "q8")]
     pub format: String,
+    /// Optional .calib.hfq sidecar (from `diffusion calibrate`); enables oq4++ LDLQ
+    #[arg(long)]
+    pub calib: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -477,11 +480,18 @@ fn run_calibrate(args: DiffusionCalibrateArgs) -> anyhow::Result<()> {
 fn run_quantize(args: DiffusionQuantizeArgs) -> anyhow::Result<()> {
     let format = DiffusionQuantFormat::parse(&args.format).ok_or_else(|| {
         anyhow::anyhow!(
-            "unknown quant format {:?}; expected one of: q8, q4",
+            "unknown quant format {:?}; expected one of: q8, q4, q4k, q4+, oq4, oq4++, oq8",
             args.format
         )
     })?;
-    let summary = quantize_diffusion_hfq(&args.source, &args.output, format)?;
+    let calib = match &args.calib {
+        Some(path) => Some(
+            hipfire_diffusion::open_calib_sidecar(path)
+                .map_err(|e| anyhow::anyhow!("open calib {path:?}: {e}"))?,
+        ),
+        None => None,
+    };
+    let summary = quantize_diffusion_hfq(&args.source, &args.output, format, calib.as_ref())?;
     let ratio = if summary.output_bytes > 0 {
         summary.source_bytes as f64 / summary.output_bytes as f64
     } else {
@@ -495,6 +505,7 @@ fn run_quantize(args: DiffusionQuantizeArgs) -> anyhow::Result<()> {
             "format": args.format,
             "quantized_tensors": summary.quantized_tensors,
             "copied_tensors": summary.copied_tensors,
+            "ldlq_tensors": summary.ldlq_tensors,
             "source_bytes": summary.source_bytes,
             "output_bytes": summary.output_bytes,
             "compression_ratio": (ratio * 100.0).round() / 100.0,
