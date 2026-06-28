@@ -3151,6 +3151,50 @@ pub(crate) fn scaled_dot_product_attention_resident(
     gpu.bind_thread()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
     let output = alloc_resident_f32(gpu, &output_shape)?;
+    if output_elements == 0 {
+        return Ok(output);
+    }
+
+    // Flash path: one wave per (batch, head, query), online softmax, no LDS, no
+    // seq×seq materialization. Capped at 16 channels/lane = head_dim 512; above
+    // that, fall back to the naive kernel.
+    const FLASH_MAX_HEAD_DIM: usize = 512;
+    if head_dim <= FLASH_MAX_HEAD_DIM {
+        let waves = batch
+            .checked_mul(heads)
+            .and_then(|v| v.checked_mul(q_seq))
+            .ok_or_else(|| {
+                DiffusionError::InvalidMetadata("SDPA wave count overflows".to_string())
+            })?;
+        const WAVES_PER_BLOCK: usize = 8; // 256 threads / 32
+        let mut kernargs = hip_bridge::KernargBlob::new();
+        kernargs.push_ptr(q.buf.as_ptr());
+        kernargs.push_ptr(k.buf.as_ptr());
+        kernargs.push_ptr(v.buf.as_ptr());
+        kernargs.push_ptr(output.buf.as_ptr());
+        kernargs.push_i32(i32_kernel_dim("flash batch", batch)?);
+        kernargs.push_i32(i32_kernel_dim("flash query sequence", q_seq)?);
+        kernargs.push_i32(i32_kernel_dim("flash key sequence", k_seq)?);
+        kernargs.push_i32(i32_kernel_dim("flash hidden size", hidden)?);
+        kernargs.push_i32(i32_kernel_dim("flash heads", heads)?);
+        kernargs.push_i32(i32_kernel_dim("flash head dim", head_dim)?);
+        kernargs.pad_to(16);
+        let blocks = waves.div_ceil(WAVES_PER_BLOCK);
+        let grid = [i32_kernel_dim("flash grid", blocks)? as u32, 1, 1];
+        ensure_and_launch_diffusion_kernel(
+            gpu,
+            "diffusion_flash_attention_f32",
+            DIFFUSION_FLASH_ATTENTION_HIP_SRC,
+            "diffusion_flash_attention_f32",
+            grid,
+            [(WAVES_PER_BLOCK * 32) as u32, 1, 1],
+            0,
+            &mut kernargs,
+        )?;
+        return Ok(output);
+    }
+
+    // Fallback: naive SDPA for very large head_dim (> 512).
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(q.buf.as_ptr());
     kernargs.push_ptr(k.buf.as_ptr());

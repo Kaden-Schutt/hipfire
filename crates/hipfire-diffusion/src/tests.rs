@@ -6062,6 +6062,69 @@
         }
     }
 
+    /// Phase 3: the flash-attention kernel (online softmax, no seq×seq matrix)
+    /// must match the naive SDPA / CPU reference. F32 throughout, so the tolerance
+    /// is tight. Covers self-attn, cross-attn (q_seq != k_seq), a head_dim that is
+    /// not a multiple of the wave width, and a single-head VAE-style shape.
+    #[test]
+    fn flash_attention_resident_matches_cpu_reference() {
+        let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!("skip: ROCm GPU unavailable for flash attention test: {error}");
+                return;
+            }
+        };
+        let fill = |n: usize, seed: f32| -> Vec<f32> {
+            (0..n)
+                .map(|kk| (((kk as f32 + seed) % 17.0) - 8.0) / 8.0)
+                .collect()
+        };
+        // (batch, heads, head_dim, q_seq, k_seq)
+        let cases = [
+            (2usize, 2usize, 40usize, 16usize, 16usize), // self-attn, head_dim 40 (>32)
+            (2, 2, 24, 10, 5),                            // cross-attn, q_seq != k_seq
+            (1, 4, 20, 12, 12),                           // head_dim 20 (< wave width)
+            (2, 1, 64, 9, 9),                             // single head, head_dim 64
+        ];
+        for (idx, (b, heads, head_dim, q_seq, k_seq)) in cases.into_iter().enumerate() {
+            let hidden = heads * head_dim;
+            let q = CpuTensor {
+                shape: vec![b, q_seq, hidden],
+                data: fill(b * q_seq * hidden, idx as f32 * 7.0 + 1.0),
+            };
+            let k = CpuTensor {
+                shape: vec![b, k_seq, hidden],
+                data: fill(b * k_seq * hidden, idx as f32 * 5.0 + 2.0),
+            };
+            let v = CpuTensor {
+                shape: vec![b, k_seq, hidden],
+                data: fill(b * k_seq * hidden, idx as f32 * 3.0 + 3.0),
+            };
+            let cpu = scaled_dot_product_attention(&q, &k, &v, heads).unwrap();
+
+            let q_gpu = gpu.upload_f32(&q.data, &q.shape).unwrap();
+            let k_gpu = gpu.upload_f32(&k.data, &k.shape).unwrap();
+            let v_gpu = gpu.upload_f32(&v.data, &v.shape).unwrap();
+            let out_gpu =
+                scaled_dot_product_attention_resident(&mut gpu, &q_gpu, &k_gpu, &v_gpu, heads)
+                    .unwrap();
+            let hip = download_resident(&mut gpu, &out_gpu).unwrap();
+            free_resident(&mut gpu, out_gpu).unwrap();
+            free_resident(&mut gpu, q_gpu).unwrap();
+            free_resident(&mut gpu, k_gpu).unwrap();
+            free_resident(&mut gpu, v_gpu).unwrap();
+
+            assert_eq!(hip.shape, cpu.shape, "case {idx} shape");
+            assert!(
+                f32_slices_close(&hip.data, &cpu.data, 1e-3),
+                "case {idx}: flash {:?} != cpu {:?}",
+                &hip.data[..hip.data.len().min(8)],
+                &cpu.data[..cpu.data.len().min(8)]
+            );
+        }
+    }
+
     #[test]
     fn tiny_sd_native_unet_loads_when_import_exists() {
         let path = tiny_sd_hfq_path();

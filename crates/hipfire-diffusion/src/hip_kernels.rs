@@ -914,6 +914,94 @@ extern "C" __global__ void diffusion_softmax_rows_f32(
 }
 "#;
 
+// Phase 3 — flash-style attention (online softmax, no seq×seq materialization).
+//
+// The naive `diffusion_sdpa_3d_f32` below is one thread per output element and
+// recomputes the full QKᵀ score row once PER output channel AND twice (a max
+// pass then a sum pass) — ~2·head_dim× redundant. This kernel assigns one wave
+// (32 lanes) to each (batch, head, query): the lanes split head_dim, compute
+// each score once via a wave-shuffle dot reduction, and stream keys with an
+// online-softmax running (max, sum, accumulator). No LDS (pure registers +
+// `__shfl` → wedge-safe on gfx1103), F32 throughout (matches the reference
+// closely). head_dim is capped at 16 channels/lane = 512; the host falls back
+// to the naive kernel above that.
+pub(crate) const DIFFUSION_FLASH_ATTENTION_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+#define FLASH_ACC_MAX 16
+
+extern "C" __global__ void diffusion_flash_attention_f32(
+    const float* q,
+    const float* k,
+    const float* v,
+    float* output,
+    int batch,
+    int q_seq,
+    int k_seq,
+    int hidden,
+    int heads,
+    int head_dim
+) {
+    int lane = threadIdx.x & 31;
+    int wave = threadIdx.x >> 5;
+    int waves_per_block = blockDim.x >> 5;
+    int gid = blockIdx.x * waves_per_block + wave;
+    int total = batch * heads * q_seq;
+    if (gid >= total) {
+        return;
+    }
+    int qi = gid % q_seq;
+    int t = gid / q_seq;
+    int head = t % heads;
+    int b = t / heads;
+    int head_off = head * head_dim;
+    float scale = rsqrtf((float)head_dim);
+    long qbase = ((long)(b * q_seq + qi) * hidden) + head_off;
+
+    float qreg[FLASH_ACC_MAX];
+    float acc[FLASH_ACC_MAX];
+    int np = 0;
+    for (int c = lane; c < head_dim; c += 32) {
+        qreg[np] = q[qbase + c];
+        acc[np] = 0.0f;
+        np++;
+    }
+
+    float m = -INFINITY;
+    float l = 0.0f;
+    for (int ki = 0; ki < k_seq; ++ki) {
+        long kbase = ((long)(b * k_seq + ki) * hidden) + head_off;
+        float part = 0.0f;
+        int ii = 0;
+        for (int c = lane; c < head_dim; c += 32) {
+            part += qreg[ii] * k[kbase + c];
+            ii++;
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            part += __shfl_down(part, off);
+        }
+        float s = __shfl(part, 0) * scale;
+        float new_m = fmaxf(m, s);
+        float corr = expf(m - new_m);
+        float p = expf(s - new_m);
+        l = l * corr + p;
+        long vbase = ((long)(b * k_seq + ki) * hidden) + head_off;
+        ii = 0;
+        for (int c = lane; c < head_dim; c += 32) {
+            acc[ii] = acc[ii] * corr + p * v[vbase + c];
+            ii++;
+        }
+        m = new_m;
+    }
+    float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    int ii = 0;
+    for (int c = lane; c < head_dim; c += 32) {
+        output[qbase + c] = acc[ii] * inv;
+        ii++;
+    }
+}
+"#;
+
 pub(crate) const DIFFUSION_SDPA_HIP_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 
