@@ -2950,6 +2950,10 @@ pub const MAMBA2_SSD_SEQ_SRC: &str = include_str!("../../../kernels/src/mamba2_s
 pub const MAMBA2_SSD_DECODE_Q8_SRC: &str =
     include_str!("../../../kernels/src/mamba2_ssd_decode_q8.hip");
 pub const MAMBA2_SSD_SEQ_Q8_SRC: &str = include_str!("../../../kernels/src/mamba2_ssd_seq_q8.hip");
+pub const MAMBA2_SSD_CHUNK_SRC: &str =
+    include_str!("../../../kernels/src/mamba2_ssd_chunk_f32.hip");
+pub const MAMBA2_SSD_CHUNK_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/mamba2_ssd_chunk_wmma.hip");
 pub const RELU2_SRC: &str = include_str!("../../../kernels/src/relu2.hip");
 pub const MAMBA2_GATED_NORM_SRC: &str = include_str!("../../../kernels/src/mamba2_gated_norm.hip");
 pub const MAMBA2_GATED_NORM_SEQ_SRC: &str =
