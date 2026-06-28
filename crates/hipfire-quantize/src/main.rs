@@ -34,40 +34,20 @@
 //!   - an existing `.hfq` file (e.g. a bf16 `.hfq`) for requantization;
 //!     the `.hfq`-source path supports --format bf16/fp16/q8f16/hfq4/hfq6/mq4/mq6/mq3/qtip3.
 
-mod gguf_input;
-// QTIP (Phase C1) encoder core — wired into the quantize dispatch in a
-// follow-up increment; allow dead_code until then.
-#[allow(dead_code)]
-mod qtip;
-// QTIP-LDLQ (Phase C1e) — output-aware trellis encode.
-#[allow(dead_code)]
-mod ldlq;
-// HFQM `.calib.hfq` Hessian reader (wired for QTIP-LDLQ).
-#[allow(dead_code)]
-mod hessian_io;
-// Retired HFHS-v1 sidecar reader — diagonal-only, to bridge an existing
-// *.hessian.bin into AWQ's in_sum2 (SmoothQuant per-channel stat) for MQ+.
-#[allow(dead_code)]
-mod hfhs_diag;
-// Pure quantization codecs (decomposed from this file). Behavior locked by the
-// codec_golden battery below.
-mod codecs;
+// The quantization modules now live in the crate library (`lib.rs`) so other
+// crates (hipfire-diffusion) can reuse the codecs / LDLQ packers / Hessian I/O.
+// Re-export them here so this binary's existing bare (`codecs::…`) and
+// `crate::…` / `super::…` (test modules) references keep resolving unchanged.
+pub use hipfire_quantize::{
+    codecs, fixture, gguf_input, gptq, hessian_io, hfhs_diag, ldlq, qtip, roughquant,
+};
 #[allow(unused_imports)]
 use codecs::*;
-// KVarN (Phase D) — variance-normalized 4-bit KV, clean-room CPU core.
-#[allow(dead_code)]
-// KVarN codec + deferred KV-compaction now live in the leaf `hipfire-kvquant`
-// crate (so the engine read path can share them). Re-export at the crate root so
-// the existing `crate::kvarn` / `crate::{cpu_fwht_256,gen_fwht_signs,f16_to_f32,
-// f32_to_f16}` references across this bin (codecs.rs, qtip.rs, ldlq.rs, main.rs)
-// keep resolving unchanged.
+// Clip-search toggle + FWHT/f16 helpers now live in the library too.
+pub use hipfire_quantize::{mq_clipsearch_enabled, set_mq_clipsearch};
 pub use hipfire_kvquant::conv::{f16_to_f32, f32_to_f16};
 pub use hipfire_kvquant::fwht::{cpu_fwht_256, gen_fwht_signs};
 pub use hipfire_kvquant::{kv_compact, kvarn};
-// Tiny random-init model fixtures for fast kernel/plumbing gating.
-mod fixture;
-// RoughQuant Phase 2 — PCA rotation into the activation-Hessian eigenbasis.
-mod roughquant;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -241,12 +221,8 @@ thread_local! {
 // MQ+ clip-search: when set (by an `mqN+` format), MQ codecs use the MSE-optimal
 // clip-searched affine range instead of plain min/max. Off by default, so the
 // baseline MQ path (and its golden hashes) is unchanged.
-static MQ_CLIPSEARCH: OnceLock<bool> = OnceLock::new();
-
-/// Whether the `mqN+` clip-search variant is active for MQ codecs.
-pub(crate) fn mq_clipsearch_enabled() -> bool {
-    MQ_CLIPSEARCH.get().copied().unwrap_or(false)
-}
+// `MQ_CLIPSEARCH` + `mq_clipsearch_enabled`/`set_mq_clipsearch` now live in the
+// library (re-exported above) so the codecs and this binary share one toggle.
 
 // ─── Safetensors Parser ─────────────────────────────────────────────────────
 
@@ -5314,7 +5290,7 @@ fn main() {
     let mq_plus = format_storage.ends_with('+') && !oq_plus_recipe && !is_legacy_opus_plus;
     if mq_plus {
         format_storage.pop();
-        let _ = MQ_CLIPSEARCH.set(true);
+        set_mq_clipsearch(true);
         eprintln!("mq+ modifier: clip-search enabled; AWQ auto-on (needs --hessian/--imatrix)");
     }
     let format = format_storage.as_str();

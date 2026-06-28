@@ -15,7 +15,7 @@ use crate::{cpu_fwht_256, f16_to_f32, f32_to_f16};
 /// Block: [f32 scale][f32 zero][96B packed 3-bit] = 104 bytes per 256 weights (0.406 B/w).
 /// Packing: 8 weights × 3 bits = 24 bits = 3 bytes per thread-group.
 /// Little-endian bitstream within each 3-byte chunk.
-pub(crate) fn quantize_hfq3g256(f32_data: &[f32]) -> Vec<u8> {
+pub fn quantize_hfq3g256(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 256;
     let block_bytes = 104; // 8 metadata + 96 packed 3-bit
     let n = f32_data.len();
@@ -79,7 +79,7 @@ pub(crate) fn quantize_hfq3g256(f32_data: &[f32]) -> Vec<u8> {
 
 /// Quantize F32 weights to HFQ3-G128: 3-bit with 128-weight groups (finer granularity).
 /// Block: [f32 scale][f32 zero][48B packed 3-bit] = 56 bytes per 128 weights (0.4375 B/w).
-pub(crate) fn quantize_hfq3g128(f32_data: &[f32]) -> Vec<u8> {
+pub fn quantize_hfq3g128(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 128;
     let block_bytes = 56; // 8 metadata + 48 packed 3-bit
     let n = f32_data.len();
@@ -132,7 +132,7 @@ pub(crate) fn quantize_hfq3g128(f32_data: &[f32]) -> Vec<u8> {
 
 /// Quantize F32 weights to HFQ2-G256: 2-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][64B packed 2-bit] = 72 bytes per 256 weights (0.281 B/w).
-pub(crate) fn quantize_hfq2g256(f32_data: &[f32]) -> Vec<u8> {
+pub fn quantize_hfq2g256(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 256;
     let block_bytes = 72; // 8 metadata + 64 packed
     let n = f32_data.len();
@@ -178,7 +178,7 @@ pub(crate) fn quantize_hfq2g256(f32_data: &[f32]) -> Vec<u8> {
 
 /// Quantize F32 weights to HFQ2-G128: 2-bit with 128-weight groups (finer granularity).
 /// Block: [f32 scale][f32 zero][32B packed 2-bit] = 40 bytes per 128 weights (0.3125 B/w).
-pub(crate) fn quantize_hfq2g128(f32_data: &[f32]) -> Vec<u8> {
+pub fn quantize_hfq2g128(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 128;
     let block_bytes = 40;
     let n = f32_data.len();
@@ -223,7 +223,7 @@ pub(crate) fn quantize_hfq2g128(f32_data: &[f32]) -> Vec<u8> {
 
 /// Quantize F32 weights to HFQ6-G256: 6-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][192B packed 6-bit] = 200 bytes per 256 weights (0.78125 B/w).
-pub(crate) fn quantize_hfq6g256(f32_data: &[f32]) -> Vec<u8> {
+pub fn quantize_hfq6g256(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 256;
     let block_bytes = 200; // 8 (scale+zero) + 192 (packed 6-bit)
     let n = f32_data.len();
@@ -285,7 +285,7 @@ pub(crate) fn quantize_hfq6g256(f32_data: &[f32]) -> Vec<u8> {
 /// Quantize F32 weights to HFQ4-G128: flat 4-bit with 128-weight groups.
 /// Block: [f32 scale][f32 zero][64B nibbles] = 72 bytes per 128 weights (0.5625 B/w).
 /// 14 VGPRs, 100% occupancy. Better quality for small K dimensions.
-pub(crate) fn quantize_hfq4g128(f32_data: &[f32]) -> Vec<u8> {
+pub fn quantize_hfq4g128(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 128;
     let block_bytes = 72;
     let n = f32_data.len();
@@ -336,7 +336,7 @@ pub(crate) fn quantize_hfq4g128(f32_data: &[f32]) -> Vec<u8> {
 // ─── MQ-family (FWHT-rotated) codecs ───
 /// Same binary format as HFQ4-G256 (136 bytes/group) — the rotation is baked
 /// into the weights. The GEMV kernel rotates x instead of inverse-rotating w.
-pub(crate) fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+pub fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     // mqN+ modifier: route to the clip-searched variant (identical byte layout).
     if crate::mq_clipsearch_enabled() {
         return quantize_mq4g256_clipsearch(f32_data, signs1, signs2);
@@ -388,7 +388,7 @@ pub(crate) fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32])
 /// same kernel/dtype as MQ4 — only the chosen scale/min differ. Pairs with AWQ
 /// (activation-aware pre-scaling) to form the MQ4+ format. See
 /// `docs/kernels/quant-exploration-gfx1103.md` (E4/E6).
-pub(crate) fn quantize_mq4g256_clipsearch(
+pub fn quantize_mq4g256_clipsearch(
     f32_data: &[f32],
     signs1: &[f32],
     signs2: &[f32],
@@ -480,7 +480,7 @@ fn affine_clipsearch(group: &[f32], levels: f32) -> (f32, f32) {
 
 /// MSE-optimal symmetric clip of a signed-int scale. `qmax` = 2^(bits−1) − 1.
 /// Returns the scale for dequant `q·scale`. For the symmetric mqN+ codecs (MQ8).
-pub(crate) fn symmetric_clipsearch(group: &[f32], qmax: f32) -> f32 {
+pub fn symmetric_clipsearch(group: &[f32], qmax: f32) -> f32 {
     const CLIP_GRID: [f32; 9] = [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6];
     let amax = group.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
     let (mut best_scale, mut best_err) = (amax / qmax, f32::INFINITY);
@@ -506,7 +506,7 @@ pub(crate) fn symmetric_clipsearch(group: &[f32], qmax: f32) -> f32 {
 }
 
 /// MQ6+ : MQ6G256 with clip-searched affine range (identical 200-byte layout).
-pub(crate) fn quantize_mq6g256_clipsearch(
+pub fn quantize_mq6g256_clipsearch(
     f32_data: &[f32],
     signs1: &[f32],
     signs2: &[f32],
@@ -539,7 +539,7 @@ pub(crate) fn quantize_mq6g256_clipsearch(
 }
 
 /// MQ3+ : MQ3G256 with clip-searched affine range (identical 104-byte layout).
-pub(crate) fn quantize_mq3g256_clipsearch(
+pub fn quantize_mq3g256_clipsearch(
     f32_data: &[f32],
     signs1: &[f32],
     signs2: &[f32],
@@ -578,7 +578,7 @@ pub(crate) fn quantize_mq3g256_clipsearch(
 }
 
 /// MQ2+ : MQ2G256 with clip-searched affine range (identical 72-byte layout).
-pub(crate) fn quantize_mq2g256_clipsearch(
+pub fn quantize_mq2g256_clipsearch(
     f32_data: &[f32],
     signs1: &[f32],
     signs2: &[f32],
@@ -611,7 +611,7 @@ pub(crate) fn quantize_mq2g256_clipsearch(
 }
 
 /// MQ8+ : MQ8G256 with clip-searched symmetric int8 scale (identical 258-byte layout).
-pub(crate) fn quantize_mq8g256_clipsearch(
+pub fn quantize_mq8g256_clipsearch(
     f32_data: &[f32],
     signs1: &[f32],
     signs2: &[f32],
@@ -647,7 +647,7 @@ pub(crate) fn quantize_mq8g256_clipsearch(
 /// `gemv_iu4_i32` consume — so this format feeds the fused-iu4 path (Opus Quant
 /// W4A4) directly, and the int8-activation variant (Opus-A8) by upcasting the
 /// signed nibbles to int8 for the iu8 path. Dequant: `scale · sext4(nibble)`.
-pub(crate) fn quantize_oq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+pub fn quantize_oq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     let (group_size, block_bytes) = (256usize, 130usize); // 2 (f16 scale) + 128 nibbles
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
@@ -677,10 +677,11 @@ pub(crate) fn quantize_oq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32])
 
 /// Dequantize OQ4G256 (round-trip oracle for the Opus codec / tests).
 /// `[f16 scale][128 signed nibbles]` per 256-group → `scale·sext4`, inverse FWHT.
-/// Test-only oracle (its sole caller is the `oq4_roundtrip_comparable_to_mq4`
-/// test); gated on `cfg(test)` so non-test builds don't compile it as dead code.
-#[cfg(test)]
-pub(crate) fn dequant_oq4g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
+/// Reference oq4g256 decoder (inverse FWHT with swapped signs). Part of the
+/// library API: reused as the round-trip oracle by hipfire-diffusion's oq4 CPU
+/// decoder parity tests.
+#[allow(dead_code)]
+pub fn dequant_oq4g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
     let (group_size, block_bytes) = (256usize, 130usize);
     let n_blocks = n.div_ceil(group_size);
     let mut out = Vec::with_capacity(n_blocks * group_size);
@@ -716,7 +717,7 @@ pub(crate) fn dequant_oq4g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f
 /// [`quantize_oq4g256`] — the nibble packing disappears (one byte per weight) and
 /// it feeds the iu8 grouped-WMMA path (Opus Quant W8A8) for near-lossless,
 /// matrix-core-fast inference.
-pub(crate) fn quantize_oq8g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+pub fn quantize_oq8g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     let (group_size, block_bytes) = (256usize, 258usize); // 2 (f16 scale) + 256 int8
     let n = f32_data.len();
     let n_blocks = n.div_ceil(group_size);
@@ -752,7 +753,7 @@ pub(crate) fn quantize_oq8g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32])
 /// W8A8 forward consume it UNCHANGED — "top X% stored as W8A8, same WMMA as the
 /// rest". Storage here is int8 (a faithful quality probe of the compute scheme);
 /// the compact int4-bulk + sparse-int8-outlier encoding (~4 b/w) is a follow-up.
-pub(crate) fn quantize_oqplus_tiered(
+pub fn quantize_oqplus_tiered(
     f32_data: &[f32],
     signs1: &[f32],
     signs2: &[f32],
@@ -822,7 +823,7 @@ pub(crate) fn quantize_oqplus_tiered(
 /// expands nibbles→int8, overlays the outliers, and dispatches the iu8 W8A8
 /// kernel. Nibble slots at outlier positions still hold the int4 clamp (graceful
 /// fallback). For `w8_frac=0.01`: N_out=3 → 136 B/group ≈ 4.25 b/w.
-pub(crate) fn quantize_oqplus_compact(
+pub fn quantize_oqplus_compact(
     f32_data: &[f32],
     signs1: &[f32],
     signs2: &[f32],
@@ -880,10 +881,9 @@ pub(crate) fn quantize_oqplus_compact(
 
 /// Dequantize OQ8G256 (round-trip oracle for the Opus W8A8 codec / tests).
 /// `[f16 scale][256 signed int8]` per 256-group → `scale·q`, inverse FWHT.
-/// Test-only oracle; gated on `cfg(test)` so non-test builds don't compile it as
-/// dead code.
-#[cfg(test)]
-pub(crate) fn dequant_oq8g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
+/// Reference oq8g256 decoder; part of the library API (diffusion oq8 parity).
+#[allow(dead_code)]
+pub fn dequant_oq8g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
     let (group_size, block_bytes) = (256usize, 258usize);
     let n_blocks = n.div_ceil(group_size);
     let mut out = Vec::with_capacity(n_blocks * group_size);
@@ -912,7 +912,7 @@ pub(crate) fn dequant_oq8g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f
 /// the protected-channel correction residual `R = W − dequant(mq4(W))`, so adding
 /// `R_S·x_S` to the kernel's mq4 output yields the EXACT bf16 contribution for the
 /// protected channels (the kernel and this dequant agree bit-for-bit).
-pub(crate) fn dequant_mq4g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
+pub fn dequant_mq4g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
     let group = 256usize;
     let block = 136usize;
     let n_blocks = n.div_ceil(group);
@@ -944,7 +944,7 @@ pub(crate) fn dequant_mq4g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f
 /// MagnumQuant MQ6-G256: FWHT-rotated 6-bit quantization.
 /// Same binary format as HFQ6-G256 (200 bytes/group) — the rotation is baked
 /// into the weights. The GEMV kernel rotates x instead of inverse-rotating w.
-pub(crate) fn quantize_mq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+pub fn quantize_mq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     if crate::mq_clipsearch_enabled() {
         return quantize_mq6g256_clipsearch(f32_data, signs1, signs2);
     }
@@ -1002,7 +1002,7 @@ pub(crate) fn quantize_mq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32])
 /// Format: [f16 scale][int8 × 256] = 258 bytes per 256 weights (1.008 B/w).
 /// Symmetric: scale = max(abs(group)) / 127, q = round(val / scale), no zero-point.
 /// Target: dp4a (v_dot4_i32_iu8) on gfx1100 for 4x VALU throughput.
-pub(crate) fn quantize_mq8g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+pub fn quantize_mq8g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     if crate::mq_clipsearch_enabled() {
         return quantize_mq8g256_clipsearch(f32_data, signs1, signs2);
     }
@@ -1048,7 +1048,7 @@ pub(crate) fn quantize_mq8g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32])
 // ─── HFQ4-G256 + HFP4/MFP4 (FP4) codecs ───
 /// MagnumQuant HFQ4-G256: FWHT-rotated 4-bit quantization.
 
-pub(crate) fn quantize_hfq4g256(f32_data: &[f32]) -> Vec<u8> {
+pub fn quantize_hfq4g256(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 256;
     let block_bytes = 136;
     let n = f32_data.len();
@@ -1108,13 +1108,13 @@ pub(crate) fn quantize_hfq4g256(f32_data: &[f32]) -> Vec<u8> {
 
 /// OCP E2M1 magnitude lattice (signed 4-bit FP). 16 codes: {±0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}.
 /// Order: positive 0..7, then negative 0..7 (mirrors hardware-canonical sign-magnitude packing).
-pub(crate) const E2M1_LUT: [f32; 16] = [
+pub const E2M1_LUT: [f32; 16] = [
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 ];
 
 /// E2M1 round-to-nearest in the 16-code lattice. Returns the nibble (0..15).
 /// Ties broken away from zero (consistent with FP rounding).
-pub(crate) fn e2m1_round(x: f32) -> u8 {
+pub fn e2m1_round(x: f32) -> u8 {
     let mut best_idx = 0u8;
     let mut best_err = f32::INFINITY;
     for (i, &code) in E2M1_LUT.iter().enumerate() {
@@ -1133,7 +1133,7 @@ pub(crate) fn e2m1_round(x: f32) -> u8 {
 ///
 /// K must be a multiple of 32 (hipfire model dims always satisfy this).
 /// Returns 16-B header + (K/32) × 17-B blocks = 16 + 17 * (K/32) bytes.
-pub(crate) fn quantize_hfp4g32_row(row: &[f32]) -> Vec<u8> {
+pub fn quantize_hfp4g32_row(row: &[f32]) -> Vec<u8> {
     assert!(
         row.len() % 32 == 0,
         "HFP4G32 requires K%32 == 0, got K={}",
@@ -1222,7 +1222,7 @@ pub(crate) fn quantize_hfp4g32_row(row: &[f32]) -> Vec<u8> {
 /// the K%256 limit is a kernel-side constraint that v2 will lift. Refusing here
 /// makes the failure mode "quantize rejects bad input" rather than "runtime
 /// panics on first dispatch with a tensor a previous step already accepted."
-pub(crate) fn quantize_hfp4g32_2d(f32_data: &[f32], m: usize, k: usize) -> Vec<u8> {
+pub fn quantize_hfp4g32_2d(f32_data: &[f32], m: usize, k: usize) -> Vec<u8> {
     assert_eq!(
         f32_data.len(),
         m * k,
@@ -1251,7 +1251,7 @@ pub(crate) fn quantize_hfp4g32_2d(f32_data: &[f32], m: usize, k: usize) -> Vec<u
 /// Sets per-row `format_flags` to `0x05` (bit 0 = rotation present, bits 2-3 = 01
 /// = offline FWHT). This is metadata only — the kernel can still consume the
 /// row as plain HFP4G32 because the rotation is baked into the codes.
-pub(crate) fn quantize_mfp4g32_2d(
+pub fn quantize_mfp4g32_2d(
     f32_data: &[f32],
     m: usize,
     k: usize,
@@ -1296,7 +1296,7 @@ pub(crate) fn quantize_mfp4g32_2d(
 /// CPU reference dequantization for HFP4G32 — bit-exact mirror of `gemv_hfp4g32.hip`'s dequant.
 /// Returns the K reconstructed FP32 weights for one row.
 #[allow(dead_code)] // used by tests + future round-trip diagnostics
-pub(crate) fn dequant_hfp4g32_row(packed: &[u8], k: usize) -> Vec<f32> {
+pub fn dequant_hfp4g32_row(packed: &[u8], k: usize) -> Vec<f32> {
     assert!(k % 32 == 0, "HFP4G32 requires K%32 == 0");
     let n_blocks = k / 32;
     assert_eq!(
@@ -1331,7 +1331,7 @@ pub(crate) fn dequant_hfp4g32_row(packed: &[u8], k: usize) -> Vec<f32> {
 /// Quantize F32 weights to Q4_F16_G64 format.
 /// Group size 64: 36 bytes per 64 elements (0.5625 bytes/weight).
 /// Block: f16 scale (2B) + f16 min (2B) + u8[32] packed nibbles (32B).
-pub(crate) fn quantize_q4f16_g64(f32_data: &[f32]) -> Vec<u8> {
+pub fn quantize_q4f16_g64(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 64;
     let block_bytes = 36;
     let n = f32_data.len();
@@ -1378,7 +1378,7 @@ pub(crate) fn quantize_q4f16_g64(f32_data: &[f32]) -> Vec<u8> {
 /// Quantize F32 weights to Q4_K format (144 bytes per 256 elements, 0.5625 B/w).
 /// GGML-compatible block layout: f16 d + f16 dmin + 12B packed scales + 128B nibbles.
 /// This produces blocks that work with the existing gemv_q4k kernel.
-pub(crate) fn quantize_q4k(f32_data: &[f32]) -> Vec<u8> {
+pub fn quantize_q4k(f32_data: &[f32]) -> Vec<u8> {
     let super_block_size = 256;
     let block_bytes = 144;
     let n = f32_data.len();
@@ -1495,7 +1495,7 @@ pub(crate) fn quantize_q4k(f32_data: &[f32]) -> Vec<u8> {
 /// Quantize to Q4-as-Q8: 4-bit precision (range [-8,7]) stored in Q8_0 format.
 /// Same storage as Q8 (34 bytes per 32 elements, 1.0625 B/w) but values use only 4 bits.
 /// Gets Q8 kernel speed (82% peak BW) with 4-bit quality. Best for VRAM-fitting models.
-pub(crate) fn quantize_q4_as_q8(f32_data: &[f32]) -> Vec<u8> {
+pub fn quantize_q4_as_q8(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 32;
     let block_bytes = 34;
     let n = f32_data.len();
@@ -1527,7 +1527,7 @@ pub(crate) fn quantize_q4_as_q8(f32_data: &[f32]) -> Vec<u8> {
 /// Quantize F32 weights to Q8_0 format (compatible with GGML Q8_0).
 /// Block: f16 scale (2B) + 32 × int8 = 34 bytes per 32 elements (1.0625 bytes/weight).
 /// Symmetric quantization: scale = max(|w|) / 127, q = round(w / scale).
-pub(crate) fn quantize_q8f16(f32_data: &[f32]) -> Vec<u8> {
+pub fn quantize_q8f16(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 32;
     let block_bytes = 34;
     let n = f32_data.len();
@@ -1561,7 +1561,7 @@ pub(crate) fn quantize_q8f16(f32_data: &[f32]) -> Vec<u8> {
 /// Quantize F32 weights to Q8_HFQ format (split-metadata, 128B-aligned rows).
 /// Row layout: [f16 scales × n_groups | int8 values × K | padding to 128B].
 /// Returns (data, row_stride). Same 1.0625 B/w as Q8_0 for K=2048/4096 (zero padding waste).
-pub(crate) fn quantize_q8hfq(f32_data: &[f32], m: usize, k: usize) -> (Vec<u8>, usize) {
+pub fn quantize_q8hfq(f32_data: &[f32], m: usize, k: usize) -> (Vec<u8>, usize) {
     let group_size = 32;
     let n_groups = k / group_size;
     let scales_bytes = n_groups * 2;
@@ -1602,7 +1602,7 @@ pub(crate) fn quantize_q8hfq(f32_data: &[f32], m: usize, k: usize) -> (Vec<u8>, 
 /// MagnumQuant MQ3-G256: FWHT-rotated 3-bit quantization.
 /// Same binary format as HFQ3-G256 (104 bytes/group). Rotation is baked into
 /// the weights via cpu_fwht_256; the GEMV kernel rotates x instead.
-pub(crate) fn quantize_mq3g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+pub fn quantize_mq3g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     if crate::mq_clipsearch_enabled() {
         return quantize_mq3g256_clipsearch(f32_data, signs1, signs2);
     }
@@ -1659,7 +1659,7 @@ pub(crate) fn quantize_mq3g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32])
 /// MagnumQuant MQ2-G256: FWHT-rotated 2-bit quantization.
 /// Same binary format as HFQ2-G256 (72 bytes/group). Rotation is baked into
 /// the weights via cpu_fwht_256; the GEMV kernel rotates x instead.
-pub(crate) fn quantize_mq2g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+pub fn quantize_mq2g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     if crate::mq_clipsearch_enabled() {
         return quantize_mq2g256_clipsearch(f32_data, signs1, signs2);
     }
@@ -1708,7 +1708,7 @@ pub(crate) fn quantize_mq2g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32])
 /// Encode an f32 to IEEE-754 fp16 bits (round-to-nearest-even, no NaN/Inf preservation
 /// beyond the trivial case — block centroids are bounded means of fp32 weights so
 /// the simple path is safe).
-pub(crate) fn f32_to_fp16_bits(v: f32) -> u16 {
+pub fn f32_to_fp16_bits(v: f32) -> u16 {
     let bits = v.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
     let mut exp = ((bits >> 23) & 0xFF) as i32;
@@ -1758,7 +1758,7 @@ pub(crate) fn f32_to_fp16_bits(v: f32) -> u16 {
 /// Lloyd's algorithm. 16 B header (8 fp16) + 96 B packed 3-bit indices = 112 B/group
 /// (vs uniform MQ3's 104 B — only +7.7% bandwidth). Direct extension of MQ2-Lloyd
 /// with K=8; targets sub-9B MQ3 collapse rescue (#114) and 9B MQ3 → MQ4 ppl gap.
-pub(crate) fn quantize_mq3g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+pub fn quantize_mq3g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     use rayon::prelude::*;
     let group_size = 256;
     let block_bytes = 112;
@@ -1887,7 +1887,7 @@ pub(crate) fn quantize_mq3g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &
 /// `benchmarks/results/devlog_20260506_lloyd_mq4_extension.md`) is that the
 /// 16-centroid placement narrows the MQ4 → MQ6 ppl gap at lower bandwidth
 /// than uniform MQ6 (200 B/group).
-pub(crate) fn quantize_mq4g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+pub fn quantize_mq4g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     use rayon::prelude::*;
     let group_size = 256;
     let block_bytes = 160;
@@ -1996,7 +1996,7 @@ pub(crate) fn quantize_mq4g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &
 }
 
 // ─── MQ2-Lloyd codecs ───
-pub(crate) fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+pub fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     use rayon::prelude::*;
     let group_size = 256;
     let block_bytes = 72;
@@ -2140,7 +2140,7 @@ pub(crate) fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &
 /// 72 B/group (true 1.58-bpw packing — 5 ternary/byte — is a mechanical
 /// follow-up once coherence is established). Gated by HIPFIRE_LLOYD_K3=1 on the
 /// `--format lloyd-mq2` path. Output DType = MQ2G256Lloyd (kernel-agnostic to K).
-pub(crate) fn quantize_mq2g256_lloyd_k3(
+pub fn quantize_mq2g256_lloyd_k3(
     f32_data: &[f32],
     signs1: &[f32],
     signs2: &[f32],
