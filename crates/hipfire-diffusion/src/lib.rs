@@ -2414,7 +2414,7 @@ pub use quant_encode::{
     quantize_diffusion_hfq, DiffusionQuantFormat, DiffusionQuantizeSummary,
 };
 #[cfg(test)]
-use quant_encode::{encode_q4f16_g64, encode_q8f16};
+use quant_encode::{encode_q4f16_g64, encode_q4k, encode_q8f16};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffusionError {

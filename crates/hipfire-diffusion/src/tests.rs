@@ -6186,6 +6186,110 @@
         assert_eq!(recovered, oihw);
     }
 
+    /// Quantization fidelity harness (env-gated; not part of normal CI).
+    ///
+    /// `HIPFIRE_QUANT_SRC=<f16 source.hfq>` and
+    /// `HIPFIRE_QUANT_CANDS=path1=label1,path2=label2,...` enable it. For each
+    /// candidate it reports two metrics that — unlike image-space PSNR against a
+    /// reference image — are NOT confounded by the chaotic multi-step denoise
+    /// trajectory:
+    ///   (1) global weight SQNR vs the source (the encoder's direct objective),
+    ///   (2) single-pass UNet eps error at a fixed deterministic input (the
+    ///       functional error of the quantized weights, no trajectory amplification).
+    #[test]
+    fn quant_fidelity_report() {
+        let Ok(src_path) = std::env::var("HIPFIRE_QUANT_SRC") else {
+            return;
+        };
+        let Ok(cands) = std::env::var("HIPFIRE_QUANT_CANDS") else {
+            return;
+        };
+        let src = HfqFile::open(std::path::Path::new(&src_path)).unwrap();
+        let weight_names: Vec<String> = src
+            .tensors()
+            .iter()
+            .filter(|t| t.name.ends_with(".weight") && t.shape.len() >= 2)
+            .map(|t| t.name.clone())
+            .collect();
+
+        // Deterministic UNet input (matches the diffusers reference harness).
+        let sample = CpuTensor {
+            shape: vec![1, 4, 32, 32],
+            data: (0..4 * 32 * 32).map(|i| (0.1 * ((i % 97) as f32)).sin()).collect(),
+        };
+        let enc = CpuTensor {
+            shape: vec![1, 77, 768],
+            data: (0..77 * 768).map(|i| (0.1 * ((i % 89) as f32)).cos()).collect(),
+        };
+        let run_unet = |hfq: &HfqFile| -> Vec<f32> {
+            let metadata = parse_diffusion_metadata(&hfq.metadata_json).unwrap();
+            let config = StableDiffusionConfig::from_hfq(hfq, &metadata).unwrap();
+            let unet = NativeUnet2DConditionModel::from_hfq(hfq, &config.unet).unwrap();
+            unet.forward_with_runtime_options(
+                &sample,
+                &[999.0],
+                &enc,
+                DiffusionGenerationRuntimeOptions::cpu_reference(),
+            )
+            .unwrap()
+            .data
+        };
+        let src_eps = run_unet(&src);
+
+        for spec in cands.split(',') {
+            let (path, label) = spec.split_once('=').unwrap_or((spec, spec));
+            let cand = HfqFile::open(std::path::Path::new(path)).unwrap();
+            // (1) weight SQNR vs source, aggregated over all weight tensors.
+            let (mut sig, mut noise) = (0.0f64, 0.0f64);
+            for name in &weight_names {
+                let a = CpuTensor::from_hfq(&src, name).unwrap().data;
+                let b = CpuTensor::from_hfq(&cand, name).unwrap().data;
+                for (x, y) in a.iter().zip(b.iter()) {
+                    sig += (*x as f64) * (*x as f64);
+                    noise += ((*x - *y) as f64) * ((*x - *y) as f64);
+                }
+            }
+            let sqnr = if noise > 0.0 { 10.0 * (sig / noise).log10() } else { f64::INFINITY };
+            // (2) single-pass eps functional error vs source.
+            let cand_eps = run_unet(&cand);
+            let (mut dot, mut na, mut nb, mut err) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            for (x, y) in src_eps.iter().zip(cand_eps.iter()) {
+                dot += (*x as f64) * (*y as f64);
+                na += (*x as f64) * (*x as f64);
+                nb += (*y as f64) * (*y as f64);
+                err += ((*x - *y) as f64) * ((*x - *y) as f64);
+            }
+            let corr = dot / (na.sqrt() * nb.sqrt());
+            let rel_l2 = (err / na).sqrt();
+            eprintln!(
+                "[quant-fidelity] {label:12}: weight_SQNR={sqnr:6.2} dB | eps_corr={corr:.5} eps_relL2={rel_l2:.4}"
+            );
+        }
+    }
+
+    #[test]
+    fn q4k_encoder_round_trips_through_diffusion_decoder() {
+        // The Q4_K encoder is ported from hipfire-quantize but the decoder is
+        // hipfire_runtime::quant::dequantize_q4_k (a different crate) — this guards
+        // that their byte layouts agree, otherwise reused Q4_K weights are garbage.
+        let data: Vec<f32> = (0..512)
+            .map(|i| ((i as f32 - 256.0) * 0.011).sin() * (1.0 + (i % 11) as f32 * 0.3))
+            .collect();
+        let bytes = encode_q4k(&data);
+        assert_eq!(bytes.len(), data.len().div_ceil(256) * 144);
+        let decoded = decode_q4_k_slice("t", &bytes, data.len()).unwrap();
+        let mut sig = 0.0f64;
+        let mut noise = 0.0f64;
+        for (x, y) in data.iter().zip(decoded.iter()) {
+            sig += (*x as f64) * (*x as f64);
+            noise += ((*x - *y) as f64) * ((*x - *y) as f64);
+        }
+        let sqnr = 10.0 * (sig / noise).log10();
+        // A correctly-laid-out 4-bit k-quant lands ~20+ dB on this data; a layout
+        // mismatch would be near 0 dB (uncorrelated). 15 dB cleanly separates them.
+        assert!(sqnr > 15.0, "Q4_K round-trip SQNR too low ({sqnr:.1} dB) — layout mismatch?");
+    }
+
     #[test]
     fn q8f16_encoder_round_trips_through_decoder() {
         // Mixed-magnitude data spanning >1 group (32) with negatives and zeros.
