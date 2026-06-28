@@ -111,6 +111,7 @@ hipfire-arch-llama = { path = "../hipfire-arch-llama" }
 hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
 hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
 hipfire-arch-zaya = { path = "../hipfire-arch-zaya" }
+hipfire-arch-nemotron = { path = "../hipfire-arch-nemotron" }
 # hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }    # chaingun: needs gpu.graphs (not yet on this branch)
 # hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" } # chaingun: needs swa_topk_wmma methods (not yet on this branch)
 # hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }  # chaingun: unclosed delimiter from merge

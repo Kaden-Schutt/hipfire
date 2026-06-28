@@ -212,6 +212,44 @@ pub fn first_hfq_tensor<'a>(hfq: &HfqFile, names: &[&'a str]) -> Result<&'a str,
     Err(format!("nemotron hfq: missing tensor; tried {names:?}"))
 }
 
+/// Repack the on-disk row-major grouped OQ4 (qt=34) bytes into the arch-combined
+/// `Oq4G256` layout the dispatch/gemm expect (nibbles + per-group f32 scales +
+/// interleaved scale+nibble blocks). Self-contained copy of the canonical packer
+/// (per the gemma3 loader convention — no cross-arch dep). `M`=rows, `K`=cols.
+fn oq4_pack_arch_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
+    const GROUP: usize = 256;
+    const BLOCK: usize = 130;
+    const ILB: usize = 132;
+    assert_eq!(k % GROUP, 0, "OQ4 requires K % 256 == 0 (got K={k})");
+    let ng = k / GROUP;
+    let packed_bytes = m * (k / 2);
+    let scales_bytes = m * ng * 4;
+    let expect = m * ng * BLOCK;
+    assert_eq!(
+        data.len(),
+        expect,
+        "OQ4 weight byte length {} != M*ng*130 = {expect} (M={m} K={k})",
+        data.len()
+    );
+    let mut out = vec![0u8; packed_bytes + scales_bytes + m * ng * ILB];
+    let scales_base = packed_bytes;
+    let il_base = packed_bytes + scales_bytes;
+    for r in 0..m {
+        for g in 0..ng {
+            let src = (r * ng + g) * BLOCK;
+            let nib_dst = r * (k / 2) + g * (GROUP / 2);
+            out[nib_dst..nib_dst + 128].copy_from_slice(&data[src + 2..src + BLOCK]);
+            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+            let scale_dst = scales_base + (r * ng + g) * 4;
+            out[scale_dst..scale_dst + 4].copy_from_slice(&scale.to_le_bytes());
+            let il_dst = il_base + (r * ng + g) * ILB;
+            out[il_dst..il_dst + 4].copy_from_slice(&scale.to_le_bytes());
+            out[il_dst + 4..il_dst + ILB].copy_from_slice(&data[src + 2..src + BLOCK]);
+        }
+    }
+    out
+}
+
 /// Load one linear weight as a `LinearWeight` (quantized when 4-bit/Q8, else an
 /// F32 upload). `m`=out rows, `k`=in cols. The nemotron HFQ has no awq sidecars,
 /// so MQ4's FWHT rotation is applied automatically by the dispatched gemv.
@@ -223,6 +261,32 @@ pub fn load_linear_hfq(
     k: usize,
 ) -> Result<LinearWeight, String> {
     let (qt, data) = hfq_tensor(hfq, name)?;
+    // OQ4 (Opus Quant, symmetric W4): qt=34 is the row-major grouped on-disk form
+    // that needs the arch-combined repack; qt=37 is already arch-packed. Both
+    // dispatch as `DType::Oq4G256` (gemv via the shared dispatch, batched prefill
+    // via `hipfire_runtime::weights::weight_gemm`). Mirrors the hfq.rs LLaMA loader.
+    if qt == 34 || qt == 37 {
+        let packed = if qt == 34 {
+            oq4_pack_arch_combined(&data, m, k)
+        } else {
+            data
+        };
+        let buf = gpu
+            .upload_raw(&packed, &[packed.len()])
+            .map_err(|e| format!("nemotron hfq oq4 upload {name}: {e:?}"))?;
+        // oq4+/oq4++ carry a per-input-channel `<name>.awq_scale.weight` sidecar
+        // the dispatch applies to activations; plain oq4 has none (→ None).
+        let awq_scale = hipfire_runtime::hfq::load_awq_scale(hfq, gpu, name, k);
+        return Ok(LinearWeight::Quant(Box::new(WeightTensor {
+            buf,
+            gpu_dtype: DType::Oq4G256,
+            m,
+            k,
+            row_stride: 0,
+            paro: None,
+            awq_scale,
+        })));
+    }
     if let Some(dtype) = linear_dtype(qt) {
         let buf = gpu
             .upload_raw(&data, &[data.len()])

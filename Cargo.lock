@@ -1318,6 +1318,7 @@ version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
+ "hipfire-kld",
  "hipfire-mixer",
  "hipfire-model",
  "hipfire-runtime",
@@ -1478,6 +1479,7 @@ dependencies = [
  "hipfire-arch-lfm2moe",
  "hipfire-arch-llama",
  "hipfire-arch-minimax",
+ "hipfire-arch-nemotron",
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
@@ -1726,6 +1728,7 @@ dependencies = [
  "hipfire-arch-gemma3",
  "hipfire-arch-lfm2moe",
  "hipfire-arch-llama",
+ "hipfire-arch-nemotron",
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",

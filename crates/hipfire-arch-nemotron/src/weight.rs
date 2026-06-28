@@ -29,9 +29,28 @@ impl LinearWeight {
     /// `out = W · x`. F32 uses `gemv_f32`; Quant routes through the dispatched
     /// gemv (auto-rotates for MQ-family, plain for HFQ/Q8).
     pub fn gemv(&self, gpu: &mut Gpu, x: &GpuTensor, out: &GpuTensor) -> HipResult<()> {
+        // Calibration tap: when a Hessian/imatrix collector is armed
+        // (`gpu.active_capture`) and this weight is a capture target
+        // (`gpu.capture_names`, keyed by weight-buffer ptr — see [`Self::buf_ptr`]
+        // and `calibration::build_capture_names`), accumulate the input
+        // activation. Zero-cost when no collector is armed. nemotron linears
+        // bypass the runtime `weight_gemv` chokepoint, so the tap lives here.
         match self {
-            LinearWeight::F32(w) => gpu.gemv_f32(w, x, out),
+            LinearWeight::F32(w) => {
+                let k = x.shape.iter().product::<usize>().max(1);
+                gpu.maybe_capture_activation(w, x, 1, k);
+                gpu.gemv_f32(w, x, out)
+            }
             LinearWeight::Quant(wt) => {
+                // OQ4/OQ8 (Opus Quant) decode: FWHT rotation + AWQ activation
+                // scaling live in the shared weight_gemv (which also self-taps for
+                // calibration). The MQ4/HFQ/Q8 execute_steps dispatch below does
+                // not apply the OQ rotation/AWQ, so OQ takes the shared path
+                // (mirrors the OQ4 prefill arm delegating to weight_gemm).
+                if matches!(wt.gpu_dtype, DType::Oq4G256 | DType::Oq8G256) {
+                    return hipfire_runtime::weights::weight_gemv(gpu, wt, x, out);
+                }
+                gpu.maybe_capture_activation(&wt.buf, x, 1, wt.k);
                 let ctx = DispatchCtx::new(gpu);
                 execute_steps(
                     gpu,
@@ -44,6 +63,15 @@ impl LinearWeight {
                 )
                 .map_err(|e| HipError::new(0, &format!("nemotron quant gemv: {e}")))
             }
+        }
+    }
+
+    /// Weight-buffer pointer — the key the calibration capture map uses; must
+    /// match the pointer `maybe_capture_activation` derives in [`Self::gemv`].
+    pub(crate) fn buf_ptr(&self) -> usize {
+        match self {
+            LinearWeight::F32(w) => w.buf.as_ptr() as usize,
+            LinearWeight::Quant(wt) => wt.buf.buf.as_ptr() as usize,
         }
     }
 
@@ -87,6 +115,9 @@ impl LinearWeight {
                         let _ = gpu.free_tensor(x_rot);
                         res
                     }
+                    // OQ4 batched prefill (rotation + act-bit/batch heuristics) is
+                    // already implemented canonically in the shared weight_gemm.
+                    DType::Oq4G256 => hipfire_runtime::weights::weight_gemm(gpu, wt, x, out, seq),
                     other => Err(HipError::unsupported(&format!(
                         "nemotron prefill: no quantized batched gemm for {other:?}"
                     ))),

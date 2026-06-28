@@ -18,6 +18,8 @@ pub mod arch;
 pub mod attn;
 pub mod block;
 pub mod block_gpu;
+pub mod calibration;
+pub mod kld;
 pub mod loader;
 pub mod mlp;
 pub mod model;
