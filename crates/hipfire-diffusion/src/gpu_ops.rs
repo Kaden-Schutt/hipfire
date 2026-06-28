@@ -2998,6 +2998,64 @@ pub(crate) fn linear_optional_bias_resident(
         return Ok(output);
     }
 
+    // Progressive precision schedule: when an oq4 rung is active and the input
+    // dim is 256-aligned (the oq4 GEMM constraint), run the linear at reduced
+    // precision (oq4 weight + FWHT-rotated activation). Other linears (e.g.
+    // in=320/640) and the F16 setting fall through to the f16 WMMA path.
+    if cache.linear_precision != LinearPrecision::F16
+        && in_features % 256 == 0
+        && gpu.arch_caps.has_wmma_w32()
+    {
+        let precision = cache.linear_precision;
+        let w_ptr = cache.resident_oq4_ptr(gpu, weight, out_features, in_features)?;
+        let packed_len = oq4_arch_combined_len(out_features, in_features);
+        let w_view = rdna_compute::GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(w_ptr, packed_len) },
+            shape: vec![packed_len],
+            dtype: rdna_compute::DType::Raw,
+        };
+        let x_rot = gpu
+            .alloc_tensor(&[total], rdna_compute::DType::F32)
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+        gpu.rotate_x_mq_batched(input, &x_rot, in_features, rows)
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+        let launched = match precision {
+            LinearPrecision::W4A16 => gpu.gemm_oq4_grouped_f16_wmma(
+                &w_view, &x_rot, &output, out_features, in_features, rows, 256,
+            ),
+            LinearPrecision::W4A8 => gpu.gemm_oq4_residual_mmq(
+                &w_view, &x_rot, &output, out_features, in_features, rows, false,
+            ),
+            LinearPrecision::W4A4 => gpu.gemm_oq4_grouped_act_batched(
+                &w_view, &x_rot, &output, out_features, in_features, rows,
+            ),
+            LinearPrecision::F16 => unreachable!("F16 handled by the fall-through path"),
+        };
+        launched.map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+        free_resident(gpu, x_rot)?;
+        if let Some(bias) = bias {
+            let bias_ptr = cache.resident_ptr(gpu, bias)?;
+            let mut bias_args = hip_bridge::KernargBlob::new();
+            bias_args.push_ptr(output.buf.as_ptr());
+            bias_args.push_ptr(bias_ptr);
+            bias_args.push_i32(i32_kernel_dim("linear bias elements", output_elements)?);
+            bias_args.push_i32(i32_kernel_dim("linear out features", out_features)?);
+            bias_args.pad_to(16);
+            let bias_grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+            ensure_and_launch_diffusion_kernel(
+                gpu,
+                "diffusion_row_bias_f32",
+                DIFFUSION_ROW_BIAS_HIP_SRC,
+                "diffusion_row_bias_f32",
+                bias_grid,
+                [256, 1, 1],
+                0,
+                &mut bias_args,
+            )?;
+        }
+        return Ok(output);
+    }
+
     if gpu.arch_caps.has_wmma_w32() {
         // Phase 3 WMMA path. gemm_f16_wmma computes Y[M,N] = W_f16[M,K] @ X_f32[N,K]^T.
         // Mapping M=rows, K=in, N=out with the *activation* as the F16 W operand

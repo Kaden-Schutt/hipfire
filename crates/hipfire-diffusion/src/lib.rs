@@ -246,6 +246,24 @@ fn cpu_reference_env_enabled(value: Option<&str>) -> bool {
 /// the pipeline runtime and are not moved mid-generation). The cache lives for one
 /// generation (the runtime context is created per `generate_*` call), so resident
 /// buffers are released when the GPU/context tears down.
+/// Per-step activation precision for the resident linear path. The progressive
+/// schedule (set per denoise step) walks from cheap/lossy (W4A4) on the early,
+/// high-noise steps to full precision (F16) on the final steps. All oq4 rungs
+/// consume the same resident oq4-packed weight + FWHT-rotated activation; they
+/// only apply to linears with `in % 256 == 0` (others fall back to F16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LinearPrecision {
+    /// f16 weight × f16 activation (the Phase-3 WMMA path).
+    #[default]
+    F16,
+    /// oq4 weight dequant→f16 × f16 activation (memory-bandwidth win).
+    W4A16,
+    /// oq4 weight × int8 (q8_1) activation.
+    W4A8,
+    /// oq4 weight × int4 activation (2× matrix rate on gfx1103).
+    W4A4,
+}
+
 #[derive(Default)]
 struct RocmWeightCache {
     entries: std::collections::HashMap<(usize, usize), rdna_compute::GpuTensor>,
@@ -253,6 +271,11 @@ struct RocmWeightCache {
     /// the same way as `entries`; populated lazily by converting the resident
     /// F32 weight once.
     f16_entries: std::collections::HashMap<(usize, usize), rdna_compute::GpuTensor>,
+    /// oq4 arch-combined device buffers, for the W4A* schedule rungs. Keyed the
+    /// same way; built once by quantize_oq4g256 → pack_oq4_arch_combined → upload.
+    oq4_entries: std::collections::HashMap<(usize, usize), rdna_compute::GpuTensor>,
+    /// Active activation precision for the resident linear path this step.
+    linear_precision: LinearPrecision,
 }
 
 impl RocmWeightCache {
@@ -317,6 +340,37 @@ impl RocmWeightCache {
             .f16_entries
             .get(&key)
             .expect("f16 weight just inserted")
+            .buf
+            .as_ptr())
+    }
+
+    /// Return the device pointer to the oq4 arch-combined buffer for `tensor`
+    /// (`[m, k]`, `k % 256 == 0`), building it once: quantize the resident f32
+    /// weight to oq4g256 (FWHT-rotated), repack to the arch combined layout, and
+    /// upload. Consumed by the W4A* GEMM kernels. The returned buffer is
+    /// `pack_oq4_arch_combined`-sized.
+    fn resident_oq4_ptr(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        tensor: &CpuTensor,
+        m: usize,
+        k: usize,
+    ) -> DiffusionResult<*mut std::ffi::c_void> {
+        let key = (tensor.data.as_ptr() as usize, tensor.data.len());
+        if !self.oq4_entries.contains_key(&key) {
+            let signs1 = hipfire_quantize::gen_fwht_signs(quant_decode::OQ_FWHT_SEED1, 256);
+            let signs2 = hipfire_quantize::gen_fwht_signs(quant_decode::OQ_FWHT_SEED2, 256);
+            let oq4 = hipfire_quantize::codecs::quantize_oq4g256(&tensor.data, &signs1, &signs2);
+            let packed = quant_encode::pack_oq4_arch_combined(&oq4, m, k);
+            let resident = gpu
+                .upload_raw(&packed, &[packed.len()])
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            self.oq4_entries.insert(key, resident);
+        }
+        Ok(self
+            .oq4_entries
+            .get(&key)
+            .expect("oq4 weight just inserted")
             .buf
             .as_ptr())
     }
@@ -1318,6 +1372,37 @@ fn split_batched_cfg_prediction(
     Ok((positive, negative))
 }
 
+/// Resolve the resident-linear activation precision for denoise `step` of
+/// `total`, from the progressive schedule. Env-driven (opt-in; default is all
+/// F16, so behavior is unchanged unless set):
+///   `HIPFIRE_DIFFUSION_W4A4_UNTIL` — fraction of steps (0..1) to run at W4A4
+///   `HIPFIRE_DIFFUSION_W4A8_UNTIL` — fraction (0..1) to run at W4A8 (after W4A4)
+/// e.g. `W4A4_UNTIL=0.5 W4A8_UNTIL=0.8` → first 50% W4A4, next 30% W4A8, last
+/// 20% F16. Only affects linears with `in % 256 == 0`; others stay F16.
+fn linear_precision_for_step(step: usize, total: usize) -> LinearPrecision {
+    let frac_env = |name: &str| -> f32 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0)
+    };
+    let w4a4_until = frac_env("HIPFIRE_DIFFUSION_W4A4_UNTIL");
+    let w4a8_until = frac_env("HIPFIRE_DIFFUSION_W4A8_UNTIL").max(w4a4_until);
+    let frac = if total <= 1 {
+        0.0
+    } else {
+        step as f32 / total as f32
+    };
+    if frac < w4a4_until {
+        LinearPrecision::W4A4
+    } else if frac < w4a8_until {
+        LinearPrecision::W4A8
+    } else {
+        LinearPrecision::F16
+    }
+}
+
 fn denoise_latents_with_cfg_progress_and_runtime_context(
     mut latents: LatentBatch,
     schedule: &DiffusionSchedule,
@@ -1360,7 +1445,12 @@ fn denoise_latents_with_cfg_progress_and_runtime_context(
     let mut scheduler_state = SchedulerStepState::default();
     let mut runtime_kind = DiffusionRuntimeKind::CpuSourceReference;
     let cfg_is_identity = classifier_free_guidance_is_identity(cfg_scale);
-    for step in 0..schedule.timesteps.len() {
+    let total_steps = schedule.timesteps.len();
+    for step in 0..total_steps {
+        // Progressive precision schedule: pick the resident-linear activation
+        // precision for this step (early/high-noise steps tolerate cheaper rungs).
+        runtime_context.rocm_weights.linear_precision =
+            linear_precision_for_step(step, total_steps);
         let (sample, scale_runtime_kind) = scale_model_input_with_runtime_context(
             schedule,
             &latents.as_nchw_tensor(),
@@ -2443,8 +2533,8 @@ use quant_decode::*;
 
 mod quant_encode;
 pub use quant_encode::{
-    open_calib_sidecar, pack_oq4_arch_combined, quantize_diffusion_hfq, DiffusionQuantFormat,
-    DiffusionQuantizeSummary, HessianSidecar,
+    oq4_arch_combined_len, open_calib_sidecar, pack_oq4_arch_combined, quantize_diffusion_hfq,
+    DiffusionQuantFormat, DiffusionQuantizeSummary, HessianSidecar,
 };
 
 mod quant_calib;

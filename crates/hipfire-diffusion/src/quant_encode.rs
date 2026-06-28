@@ -456,6 +456,12 @@ pub fn quantize_diffusion_hfq(
 /// Output (`[m,k]`, `ng=k/256`): `[nibbles m*(k/2)] [f32 scales m*ng]
 /// [interleaved m*ng*132]`. The W4A16 GEMM reads the first two regions; the
 /// interleaved tail is for decode GEMVs (kept for layout parity).
+/// Byte length of [`pack_oq4_arch_combined`]'s output for an `[m, k]` matrix.
+pub fn oq4_arch_combined_len(m: usize, k: usize) -> usize {
+    let ng = k / 256;
+    m * (k / 2) + m * ng * 4 + m * ng * (4 + 128)
+}
+
 pub fn pack_oq4_arch_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
     use crate::quant_decode::f16_bits_to_f32;
     const GROUP: usize = 256;
