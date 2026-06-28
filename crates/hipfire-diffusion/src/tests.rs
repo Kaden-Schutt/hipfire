@@ -6294,6 +6294,103 @@
     }
 
     #[test]
+    fn oq4_w4a16_gpu_matches_cpu_reference_when_gpu_is_available() {
+        // Phase 4a: validate the W4A16 quantized-compute chain on-device:
+        // oq4g256 weight -> pack_oq4_arch_combined -> rotate_x_mq_batched(act)
+        // -> gemm_oq4_grouped_f16_wmma, vs the full-precision CPU Y = X @ Wᵀ.
+        let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skip: ROCm GPU unavailable for oq4 W4A16 parity: {e}");
+                return;
+            }
+        };
+        if !gpu.arch_caps.has_wmma_w32() {
+            eprintln!("skip: no wave32 WMMA");
+            return;
+        }
+        let (m, k, batch) = (256usize, 512usize, 8usize); // out, in, rows; k%256==0
+        let w: Vec<f32> = (0..m * k).map(|i| (((i * 37) % 101) as f32 - 50.0) * 0.01).collect();
+        let x: Vec<f32> = (0..batch * k).map(|i| (((i * 13) % 97) as f32 - 48.0) * 0.02).collect();
+        // CPU reference Y[batch, m] = X @ Wᵀ.
+        let mut yref = vec![0f32; batch * m];
+        for b in 0..batch {
+            for o in 0..m {
+                let mut acc = 0f32;
+                for kk in 0..k {
+                    acc += x[b * k + kk] * w[o * k + kk];
+                }
+                yref[b * m + o] = acc;
+            }
+        }
+        let signs1 = hipfire_quantize::gen_fwht_signs(OQ_FWHT_SEED1, 256);
+        let signs2 = hipfire_quantize::gen_fwht_signs(OQ_FWHT_SEED2, 256);
+        let oq4 = hipfire_quantize::codecs::quantize_oq4g256(&w, &signs1, &signs2);
+        let packed = pack_oq4_arch_combined(&oq4, m, k);
+        let w_dev = gpu.upload_raw(&packed, &[packed.len()]).unwrap();
+        let x_dev = gpu.upload_f32(&x, &[batch * k]).unwrap();
+        let x_rot = gpu.alloc_tensor(&[batch * k], rdna_compute::DType::F32).unwrap();
+        gpu.rotate_x_mq_batched(&x_dev, &x_rot, k, batch).unwrap();
+        let y_dev = gpu.alloc_tensor(&[batch * m], rdna_compute::DType::F32).unwrap();
+        gpu.gemm_oq4_grouped_f16_wmma(&w_dev, &x_rot, &y_dev, m, k, batch, 256)
+            .unwrap();
+        gpu.hip.device_synchronize().unwrap();
+        let y = gpu.download_f32(&y_dev).unwrap();
+        // 4-bit weight quant: expect high correlation + small relative L2.
+        let (mut dot, mut na, mut nb, mut err) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for (a, b) in yref.iter().zip(&y) {
+            dot += (*a as f64) * (*b as f64);
+            na += (*a as f64) * (*a as f64);
+            nb += (*b as f64) * (*b as f64);
+            err += ((*a - *b) as f64).powi(2);
+        }
+        let corr = dot / (na.sqrt() * nb.sqrt());
+        let rel_l2 = (err / na).sqrt();
+        eprintln!("[oq4-w4a16] corr={corr:.5} relL2={rel_l2:.4}");
+        assert!(corr > 0.99, "oq4 W4A16 corr too low ({corr:.4}) — rotation/layout bug?");
+        assert!(rel_l2 < 0.06, "oq4 W4A16 relL2 too high ({rel_l2:.4})");
+    }
+
+    #[test]
+    fn oq4_arch_combined_pack_layout_is_correct() {
+        // Pack canonical oq4g256 into the W4A16 arch-combined device layout and
+        // verify the byte regions (nibbles + f32 scales) match the source — guards
+        // the layout fed to gemm_oq4_grouped_f16_wmma (Phase 4 W4A16).
+        let signs1 = hipfire_quantize::gen_fwht_signs(OQ_FWHT_SEED1, 256);
+        let signs2 = hipfire_quantize::gen_fwht_signs(OQ_FWHT_SEED2, 256);
+        let (m, k) = (2usize, 512usize);
+        let ng = k / 256;
+        let data: Vec<f32> = (0..m * k).map(|i| ((i % 97) as f32 - 48.0) * 0.02).collect();
+        let oq4 = hipfire_quantize::codecs::quantize_oq4g256(&data, &signs1, &signs2);
+        assert_eq!(oq4.len(), m * ng * 130);
+        let combined = pack_oq4_arch_combined(&oq4, m, k);
+        let packed_bytes = m * (k / 2);
+        let scales_bytes = m * ng * 4;
+        assert_eq!(combined.len(), packed_bytes + scales_bytes + m * ng * 132);
+        for r in 0..m {
+            for g in 0..ng {
+                let src = (r * ng + g) * 130;
+                // nibble region
+                let dst = r * (k / 2) + g * 128;
+                assert_eq!(&combined[dst..dst + 128], &oq4[src + 2..src + 130]);
+                // f32 scale region == f16->f32 of the source f16 scale
+                let want = crate::quant_decode::f16_bits_to_f32(u16::from_le_bytes([
+                    oq4[src],
+                    oq4[src + 1],
+                ]));
+                let so = packed_bytes + (r * ng + g) * 4;
+                let got = f32::from_le_bytes([
+                    combined[so],
+                    combined[so + 1],
+                    combined[so + 2],
+                    combined[so + 3],
+                ]);
+                assert_eq!(got, want);
+            }
+        }
+    }
+
+    #[test]
     fn oq4_oq8_round_trip_through_diffusion_decoder() {
         // Encode with the hipfire-quantize oq codecs, decode with the diffusion
         // CPU decoders. Guards that the diffusion decode (incl. inverse FWHT with
