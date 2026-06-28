@@ -5144,9 +5144,9 @@ FORMAT (--format <FMT>):
 
 OPTIONS:
     --imatrix <PATH>           llama.cpp imatrix GGUF; enables importance-weighted Lloyd and AWQ
-    --awq                      activation-aware weight pre-scaling (alpha=0.55);
-                               requires --imatrix or --hessian
-    --awq-alpha <F>            enable AWQ at an explicit alpha (overrides the 0.55 default)
+    --awq                      activation-aware weight pre-scaling (default alpha=0.55,
+                               nemotron_h=0.1); requires --imatrix or --hessian
+    --awq-alpha <F>            enable AWQ at an explicit alpha (overrides the per-arch default)
     --ldlq                     full-Hessian (GPTQ/OBS) error-feedback for oq4++/oq8++
                                weights instead of RTN; requires --hessian. Composes
                                with --awq (smooths activations + rebases the Hessian)
@@ -5954,29 +5954,21 @@ fn main() {
         || oq_plus_recipe
         || args.iter().any(|a| a == "--awq")
         || args.iter().any(|a| a == "--awq-alpha");
-    let awq_alpha = args
+    // Explicit `--awq-alpha <f>` always wins. When absent, the default is
+    // resolved *after* arch detection (see the per-arch `AWQ_ALPHA.set` below),
+    // because nemotron_h's Mamba activations need a much lower alpha than the
+    // transformer default. Nothing between here and that point reads AWQ_ALPHA.
+    let awq_alpha_explicit = args
         .iter()
         .position(|a| a == "--awq-alpha")
         .and_then(|i| args.get(i + 1))
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(0.55);
-    if awq_enabled {
-        if IMATRIX.get().is_none() {
-            eprintln!(
-                "error: activation-aware quantization requires --imatrix or --hessian \
-                 (we derive RMS_act per channel from imatrix/Hessian diagonal values)"
-            );
-            std::process::exit(1);
-        }
-        if !(0.0..=1.0).contains(&awq_alpha) {
-            eprintln!(
-                "warning: --awq-alpha {awq_alpha} outside typical [0, 1] range; using anyway"
-            );
-        }
-        AWQ_ALPHA
-            .set(awq_alpha)
-            .expect("AWQ_ALPHA set twice — should not happen");
-        eprintln!("AWQ pre-scaling: ENABLED (alpha={awq_alpha}, formula: s[j]=(RMS_act[j])^alpha, geo-mean normalized to 1)");
+        .and_then(|s| s.parse::<f32>().ok());
+    if awq_enabled && IMATRIX.get().is_none() {
+        eprintln!(
+            "error: activation-aware quantization requires --imatrix or --hessian \
+             (we derive RMS_act per channel from imatrix/Hessian diagonal values)"
+        );
+        std::process::exit(1);
     }
     // --sq-split [<frac>]: outlier-aware SmoothQuant (separate geo-mean
     // normalization for the top-frac activation-energy channels vs the bulk).
@@ -6337,6 +6329,32 @@ fn main() {
     // `.mixer.gate.weight` tensors, and necessary for 30B because router noise
     // can flip top-k expert selection.
     let is_nemotron_h = arch_id == 14;
+    // Resolve the AWQ alpha now that the arch is known. The hipfire F2 sweep
+    // winner (0.55) suits transformer attention/MLP activations, but
+    // nemotron_h's Mamba-2 mixer projections have a far heavier-tailed
+    // activation distribution: a 2026-06-28 KLD sweep on Nano-4B oq4+ (vs a Q8
+    // ref) found 0.55 → garbage (KLD 5.89), with a clean minimum at 0.1
+    // (KLD 0.0105, beating plain oq4's 0.015). Neighbours: 0.05→0.0120,
+    // 0.15→0.0108, 0.2→0.0175. So default nemotron_h to 0.1. An explicit
+    // `--awq-alpha` always overrides.
+    if awq_enabled {
+        let default_alpha = if is_nemotron_h { 0.1f32 } else { 0.55f32 };
+        let awq_alpha = awq_alpha_explicit.unwrap_or(default_alpha);
+        if !(0.0..=1.0).contains(&awq_alpha) {
+            eprintln!(
+                "warning: --awq-alpha {awq_alpha} outside typical [0, 1] range; using anyway"
+            );
+        }
+        AWQ_ALPHA
+            .set(awq_alpha)
+            .expect("AWQ_ALPHA set twice — should not happen");
+        let note = if awq_alpha_explicit.is_none() && is_nemotron_h {
+            " [nemotron_h default; transformer default is 0.55]"
+        } else {
+            ""
+        };
+        eprintln!("AWQ pre-scaling: ENABLED (alpha={awq_alpha}{note}, formula: s[j]=(RMS_act[j])^alpha, geo-mean normalized to 1)");
+    }
     let is_moe_like = is_moe || is_deepseek4 || is_minimax || is_lfm2moe || is_nemotron_h;
     // Q8 router: always on for MoE-class models.
     let q8_router = is_moe_like || q8_router_flag;
