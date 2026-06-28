@@ -5795,13 +5795,13 @@
     "semantic_hash": ""
   },
   "crates/hipfire-diffusion/src/gpu_ops.rs": {
-    "mtime": 1782607916.5007985,
-    "ast_hash": "93b37bcedb67ed6c2ff18502e59793e7",
+    "mtime": 1782609110.2704217,
+    "ast_hash": "4c00e90adb746a6cbc99ee9166f5d772",
     "semantic_hash": ""
   },
   "crates/hipfire-diffusion/src/hip_kernels.rs": {
-    "mtime": 1782607883.3855057,
-    "ast_hash": "111b9d66013b74834d39dc5cc735b429",
+    "mtime": 1782609078.1498902,
+    "ast_hash": "82fb6719b6dadb0e2e6dbdb7906d1dae",
     "semantic_hash": ""
   },
   "crates/hipfire-diffusion/src/quant_decode.rs": {
@@ -5815,8 +5815,8 @@
     "semantic_hash": ""
   },
   "crates/hipfire-diffusion/src/tests.rs": {
-    "mtime": 1782608137.9123356,
-    "ast_hash": "735974d2a00a1ba07a46b29c21e82afd",
+    "mtime": 1782609154.7789268,
+    "ast_hash": "4d4c5bbfaf67547c4a1f25f3efa948b9",
     "semantic_hash": ""
   },
   "crates/hipfire-diffusion/src/tokenizer.rs": {
