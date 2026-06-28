@@ -3022,14 +3022,83 @@ pub(crate) fn linear_optional_bias_resident(
         .last_mut()
         .expect("input shape checked non-empty above") = out_features;
     let output_elements = checked_shape_elements("linear output", &output_shape)?;
+    let rows = total / in_features;
     gpu.bind_thread()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output = alloc_resident_f32(gpu, &output_shape)?;
+    if output_elements == 0 {
+        return Ok(output);
+    }
+
+    if gpu.arch_caps.has_wmma_w32() {
+        // Phase 3 WMMA path. gemm_f16_wmma computes Y[M,N] = W_f16[M,K] @ X_f32[N,K]^T.
+        // Mapping M=rows, K=in, N=out with the *activation* as the F16 W operand
+        // and the F32 weight as the X operand (cast lane-side) yields
+        // Y[rows, out] directly — the linear's natural layout, no transpose.
+        let act_f16 = gpu
+            .alloc_tensor(&[total], rdna_compute::DType::F16)
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+        let mut convert_args = hip_bridge::KernargBlob::new();
+        convert_args.push_ptr(input.buf.as_ptr());
+        convert_args.push_ptr(act_f16.buf.as_ptr());
+        convert_args.push_i32(i32_kernel_dim("linear activation elements", total)?);
+        convert_args.pad_to(16);
+        let convert_grid = [((total as u32).saturating_add(255)) / 256, 1, 1];
+        ensure_and_launch_diffusion_kernel(
+            gpu,
+            "diffusion_f32_to_f16",
+            DIFFUSION_F32_TO_F16_HIP_SRC,
+            "diffusion_f32_to_f16",
+            convert_grid,
+            [256, 1, 1],
+            0,
+            &mut convert_args,
+        )?;
+        // Resident F32 weight, wrapped as a non-owning X[out, in] operand.
+        let weight_ptr = cache.resident_ptr(gpu, weight)?;
+        let weight_bytes = out_features
+            .checked_mul(in_features)
+            .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| {
+                DiffusionError::InvalidMetadata("linear weight size overflows".to_string())
+            })?;
+        let weight_view = rdna_compute::GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(weight_ptr, weight_bytes) },
+            shape: vec![out_features, in_features],
+            dtype: rdna_compute::DType::F32,
+        };
+        gpu.gemm_f16_wmma(&act_f16, &weight_view, &output, rows, in_features, out_features)
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+        free_resident(gpu, act_f16)?;
+        if let Some(bias) = bias {
+            let bias_ptr = cache.resident_ptr(gpu, bias)?;
+            let mut bias_args = hip_bridge::KernargBlob::new();
+            bias_args.push_ptr(output.buf.as_ptr());
+            bias_args.push_ptr(bias_ptr);
+            bias_args.push_i32(i32_kernel_dim("linear bias elements", output_elements)?);
+            bias_args.push_i32(i32_kernel_dim("linear out features", out_features)?);
+            bias_args.pad_to(16);
+            let bias_grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+            ensure_and_launch_diffusion_kernel(
+                gpu,
+                "diffusion_row_bias_f32",
+                DIFFUSION_ROW_BIAS_HIP_SRC,
+                "diffusion_row_bias_f32",
+                bias_grid,
+                [256, 1, 1],
+                0,
+                &mut bias_args,
+            )?;
+        }
+        return Ok(output);
+    }
+
+    // Fallback for architectures without wave32 WMMA: the naive direct linear.
     let weight_ptr = cache.resident_ptr(gpu, weight)?;
     let bias_ptr = match bias {
         Some(bias) => cache.resident_ptr(gpu, bias)?,
         None => std::ptr::null_mut(),
     };
-    let output = alloc_resident_f32(gpu, &output_shape)?;
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(input.buf.as_ptr());
     kernargs.push_ptr(weight_ptr);

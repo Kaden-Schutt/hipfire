@@ -5983,6 +5983,85 @@
         }
     }
 
+    /// Phase 3: the WMMA linear (`linear_optional_bias_resident`) must match the
+    /// F32 CPU reference to F16 tolerance, across 2D and 3D inputs and with/without
+    /// bias. This isolates the op the chain tests exercise only indirectly.
+    #[test]
+    fn wmma_linear_resident_matches_cpu_reference_to_f16_tolerance() {
+        let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!("skip: ROCm GPU unavailable for WMMA linear test: {error}");
+                return;
+            }
+        };
+        if !gpu.arch_caps.has_wmma_w32() {
+            eprintln!("skip: device has no wave32 WMMA; linear falls back to naive path");
+            return;
+        }
+        let fill = |n: usize, seed: f32| -> Vec<f32> {
+            (0..n)
+                .map(|k| (((k as f32 + seed) % 11.0) - 5.0) / 5.0)
+                .collect()
+        };
+        // (input_shape, in_features, out_features, with_bias)
+        let cases: [(Vec<usize>, usize, usize, bool); 4] = [
+            (vec![20, 16], 16, 24, true),
+            (vec![20, 16], 16, 24, false),
+            (vec![2, 10, 32], 32, 48, true),
+            (vec![3, 7, 48], 48, 16, true),
+        ];
+        for (idx, (in_shape, in_f, out_f, with_bias)) in cases.into_iter().enumerate() {
+            let total: usize = in_shape.iter().product();
+            let input = CpuTensor {
+                shape: in_shape.clone(),
+                data: fill(total, idx as f32 * 5.0 + 1.0),
+            };
+            let weight = CpuTensor {
+                shape: vec![out_f, in_f],
+                data: fill(out_f * in_f, idx as f32 * 3.0 + 2.0),
+            };
+            let bias = CpuTensor {
+                shape: vec![out_f],
+                data: fill(out_f, idx as f32 + 0.5),
+            };
+            let bias_ref = if with_bias { Some(&bias) } else { None };
+            // CPU reference works on 2D [rows, in]; the resident op accepts N-D and
+            // flattens internally, so compare flat data against a flattened ref.
+            let flat_input = CpuTensor {
+                shape: vec![total / in_f, in_f],
+                data: input.data.clone(),
+            };
+            let cpu = linear_optional_bias(&flat_input, &weight, bias_ref).unwrap();
+            let mut expected_shape = in_shape.clone();
+            *expected_shape.last_mut().unwrap() = out_f;
+
+            let mut cache = RocmWeightCache::default();
+            let input_gpu = gpu.upload_f32(&input.data, &input.shape).unwrap();
+            let out_gpu =
+                linear_optional_bias_resident(&mut gpu, &mut cache, &input_gpu, &weight, bias_ref)
+                    .unwrap();
+            let hip = download_resident(&mut gpu, &out_gpu).unwrap();
+            free_resident(&mut gpu, out_gpu).unwrap();
+            free_resident(&mut gpu, input_gpu).unwrap();
+
+            assert_eq!(hip.shape, expected_shape, "case {idx} shape");
+            assert_eq!(hip.data.len(), cpu.data.len(), "case {idx} len");
+            let max_mag = cpu
+                .data
+                .iter()
+                .fold(0.0f32, |acc, value| acc.max(value.abs()))
+                .max(1.0);
+            let tol = 1e-2 * max_mag;
+            for (i, (h, c)) in hip.data.iter().zip(cpu.data.iter()).enumerate() {
+                assert!(
+                    (h - c).abs() <= tol,
+                    "case {idx} elem {i}: wmma {h} vs cpu {c} (tol {tol})"
+                );
+            }
+        }
+    }
+
     #[test]
     fn tiny_sd_native_unet_loads_when_import_exists() {
         let path = tiny_sd_hfq_path();
@@ -10320,8 +10399,10 @@
                 )
                 .unwrap();
             assert_eq!(resident.shape, cpu.shape);
+            // The encoder linears now run through the F16 WMMA GEMM (Phase 3), so
+            // match the F32 reference to F16 tolerance, not 1e-4.
             assert!(
-                f32_slices_close(&resident.data, &cpu.data, 1e-4),
+                f32_slices_close(&resident.data, &cpu.data, 5e-3),
                 "resident CLIP encode {:?} != cpu reference {:?}",
                 resident.data,
                 cpu.data

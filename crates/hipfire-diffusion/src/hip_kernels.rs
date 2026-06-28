@@ -502,6 +502,25 @@ extern "C" __global__ void diffusion_group_norm_nchw_f32(
 // (one wave per (batch, group), pure register + wave-shuffle, no LDS — so it
 // is wedge-safe on gfx1103) followed by an O(N) elementwise apply.
 
+// Phase 3 — per-row bias for the WMMA linear. The WMMA GEMM writes
+// Y[rows, out_features] row-major with no bias; this adds bias[out] to every row.
+pub(crate) const DIFFUSION_ROW_BIAS_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void diffusion_row_bias_f32(
+    float* output,
+    const float* bias,
+    int total,
+    int out_features
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) {
+        return;
+    }
+    output[idx] += bias[idx % out_features];
+}
+"#;
+
 pub(crate) const DIFFUSION_GROUP_NORM_STATS_HIP_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 
