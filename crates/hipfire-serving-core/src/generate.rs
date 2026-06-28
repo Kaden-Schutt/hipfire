@@ -38,7 +38,7 @@ use crate::evidence::{
 use crate::generate_arch::generate_lfm2moe;
 use crate::generate_arch::{
     generate_deepseek4, generate_gemma3, generate_gemma3_vl_text, generate_llama, generate_minimax,
-    generate_nemotron, generate_qwen2,
+    generate_nemotron, generate_qwen2, generate_zaya,
 };
 use crate::model::{effective_raw, LoadedModel};
 use crate::output_filter::chat_output_filter;
@@ -1882,6 +1882,36 @@ pub fn generate(
             prefill_already_done,
         );
         generate_llama(
+            m,
+            gpu,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            temp,
+            top_p,
+            max_tokens,
+            repeat_penalty,
+            repeat_window,
+            max_think_tokens,
+            assistant_prefix,
+            tools,
+            messages_history,
+            evidence_dir,
+        );
+        return;
+    }
+    if m.arch_id == 16 {
+        // ZAYA1 — CCA attention + EDA/MoD MoE, routed through the shared
+        // ServingBackend seam (same dense-AR path as nemotron). No fast paths.
+        let _ = (
+            budget_alert_at_tok,
+            budget_alert_text,
+            pflash_state,
+            pflash_cfg,
+            prefill_already_done,
+        );
+        generate_zaya(
             m,
             gpu,
             stdout,

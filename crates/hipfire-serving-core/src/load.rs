@@ -608,10 +608,112 @@ pub fn load_model(
             llama_kv: None,
             llama_backend: None,
             nemotron_backend: None,
+            zaya_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
             qwen2_backend: Some(qwen2_backend),
+            deepseek4_config: None,
+            deepseek4_weights: None,
+            deepseek4_state: None,
+            deepseek4_pbs: None,
+            deepseek4_eos_tok: 0,
+            mtp_mode: "auto".to_string(),
+            mtp_k: 3,
+            mtp_weights_present: false,
+            minimax_config: None,
+            minimax_weights: None,
+            minimax_state: None,
+            minimax_eos_tok: 0,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2moe_config: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2moe_weights: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2moe_state: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_sessions: std::collections::HashMap::new(),
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_active_session_id: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_active_state_allocation_epoch: 0,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2moe_eos_tok: 0,
+            dots_ocr_config: None,
+            dots_ocr_weights: None,
+            vision_config: None,
+            vision_weights: None,
+            gemma3_vl: None,
+            gemma3_text: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0,
+            max_seq,
+            physical_cap: max_seq,
+            eviction: None,
+            conversation_tokens: Vec::new(),
+            asst_turn_cache: std::collections::HashMap::new(),
+            decoded_vocab: None,
+            model_path: path.to_string(),
+            memory: model_memory,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_dflash: None,
+            dflash: None,
+            chat_template,
+            chat_template_profile,
+        });
+    }
+
+    if hfq.arch_id == 16 {
+        // ZAYA1 (CCA attention + EDA/MoD-routed MoE). Served through the shared
+        // ServingBackend seam on ZayaModel (O(1) KV-cache decode).
+        if draft_path.is_some() {
+            return Err("DFlash not supported on arch_id=16 (zaya).".to_string());
+        }
+        let _ = kv_mode;
+        let _ = state_quant_override;
+        let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
+            .map_err(|e| format!("zaya metadata parse: {e}"))?;
+        let cfg_json = meta
+            .get("config")
+            .ok_or("zaya: metadata_json missing 'config'")?;
+        let cfg = hipfire_arch_zaya::ZayaConfig::from_json(cfg_json)
+            .map_err(|e| format!("zaya config: {e}"))?;
+        eprintln!(
+            "  zaya: hidden={}, blocks={}, experts={}, vocab={}, eos={}",
+            cfg.hidden_size, cfg.num_blocks, cfg.moe.num_experts, cfg.vocab_size, cfg.eos_token_id,
+        );
+        let model = hipfire_arch_zaya::arch::ZayaModel::from_hfq(gpu, &hfq, cfg, max_seq)
+            .map_err(|e| format!("ZayaModel::from_hfq: {e}"))?;
+        let chat_template = resolve_chat_template(&hfq, path);
+        let (chat_template, chat_template_profile) =
+            profile_chat_template(chat_template, Some(&tokenizer));
+        return Ok(LoadedModel {
+            arch_id: hfq.arch_id,
+            pp: 1,
+            pp_gpus: None,
+            pp_scratch_set: None,
+            pp_dn_la_to_device: None,
+            q35_config: None,
+            q35_weights: None,
+            q35_scratch: None,
+            sequence_state: None,
+            q35_kv_mode: None,
+            q35_state_quant: None,
+            q35_sessions: std::collections::HashMap::new(),
+            q35_active_session_id: None,
+            q35_active_state_allocation_epoch: 0,
+            q35_active_prefilled_generated_suffix_len: 0,
+            llama_config: None,
+            llama_weights: None,
+            llama_scratch: None,
+            llama_kv: None,
+            llama_backend: None,
+            nemotron_backend: None,
+            zaya_backend: Some(model),
+            qwen2_config: None,
+            qwen2_weights: None,
+            qwen2_state: None,
+            qwen2_backend: None,
             deepseek4_config: None,
             deepseek4_weights: None,
             deepseek4_state: None,
@@ -743,6 +845,7 @@ pub fn load_model(
             llama_kv: None,
             llama_backend: None,
             nemotron_backend: Some(model),
+            zaya_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
@@ -850,6 +953,7 @@ pub fn load_model(
             llama_kv: None,
             llama_backend: None,
             nemotron_backend: None,
+            zaya_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
@@ -961,6 +1065,7 @@ pub fn load_model(
             llama_kv: None,
             llama_backend: None,
             nemotron_backend: None,
+            zaya_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
@@ -1068,6 +1173,7 @@ pub fn load_model(
             llama_kv: None,
             llama_backend: None,
             nemotron_backend: None,
+            zaya_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: Some(state),
@@ -1196,6 +1302,7 @@ pub fn load_model(
             llama_kv: None,
             llama_backend: None,
             nemotron_backend: None,
+            zaya_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
@@ -1330,6 +1437,7 @@ pub fn load_model(
             llama_kv: None,
             llama_backend: None,
             nemotron_backend: None,
+            zaya_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
@@ -1569,6 +1677,7 @@ pub fn load_model(
                 llama_kv: None,
                 llama_backend: None,
                 nemotron_backend: None,
+                zaya_backend: None,
                 qwen2_config: None,
                 qwen2_weights: None,
                 qwen2_state: None,
@@ -1917,6 +2026,7 @@ pub fn load_model(
             llama_kv: None,
             llama_backend: None,
             nemotron_backend: None,
+            zaya_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
@@ -2046,6 +2156,7 @@ pub fn load_model(
             llama_kv: None,
             llama_backend: Some(llama_backend),
             nemotron_backend: None,
+            zaya_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
@@ -2250,6 +2361,7 @@ pub fn load_model_safetensors(
             llama_kv: None,
             llama_backend: Some(llama_backend),
             nemotron_backend: None,
+            zaya_backend: None,
             deepseek4_config: None,
             deepseek4_weights: None,
             deepseek4_state: None,
@@ -2374,6 +2486,7 @@ pub fn load_model_safetensors(
             llama_kv: None,
             llama_backend: None,
             nemotron_backend: Some(model),
+            zaya_backend: None,
             deepseek4_config: None,
             deepseek4_weights: None,
             deepseek4_state: None,
@@ -2516,6 +2629,7 @@ pub fn load_model_safetensors(
         llama_kv: None,
         llama_backend: None,
         nemotron_backend: None,
+        zaya_backend: None,
         deepseek4_config: None,
         deepseek4_weights: None,
         deepseek4_state: None,
@@ -2810,6 +2924,7 @@ pub fn load_model_pp(
         llama_kv: None,
         llama_backend: None,
         nemotron_backend: None,
+        zaya_backend: None,
         qwen2_config: None,
         qwen2_weights: None,
         qwen2_state: None,

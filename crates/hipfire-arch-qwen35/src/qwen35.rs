@@ -4921,14 +4921,11 @@ impl Default for CalibOpts {
 }
 
 /// Summary of a calibration pass after the `.calib.hfq` has been streamed to
-/// disk. The tensors themselves are NOT returned — they are written one at a
-/// time (see [`CalibCollector::write_streaming`]) so a 9B's ~32 GB of Hessians
-/// never sits in host RAM at once.
-pub struct CalibSummary {
-    pub n_hessian: usize,
-    pub n_imatrix: usize,
-    pub max_consistency: f32,
-}
+/// disk (re-exported from the shared driver). The tensors themselves are NOT
+/// returned — they are written one at a time (see
+/// [`CalibCollector::write_streaming`]) so a 9B's ~32 GB of Hessians never sits
+/// in host RAM at once.
+pub use hipfire_runtime::calibration::CalibSummary;
 
 /// FullAttention layer indices, in order. (LinearAttention/DeltaNet layers are
 /// SSM and do not populate the KV cache's `k_gpu`, so PFlash scoring — and the
@@ -5369,162 +5366,142 @@ pub fn collect_calibration_artifacts(
     output: &std::path::Path,
     provenance: &[(&str, serde_json::Value)],
 ) -> HipResult<CalibSummary> {
-    use hipfire_runtime::calibration::{logsumexp, topk_logits, CalibCollector};
+    use hipfire_runtime::calibration::{collect, logsumexp, topk_logits, CalibForward};
     use hipfire_runtime::hfq::HfqMemTensor;
 
+    let is_moe = config.num_experts > 0;
     // Routed MoE experts are imatrix-only: a full per-expert Hessian
     // (num_experts × n_layers × [K,K]) does not fit (~196 GB for A3B), but the
     // imatrix is ~100 MB and is the importance signal quant needs. Dense
-    // projections (attention + router + shared expert) keep full Hessians.
-    let collector = std::sync::Arc::new(CalibCollector::with_imatrix_only(vec![
-        ".experts.".to_string()
-    ]));
-    gpu.capture_names = build_capture_names(weights);
-    gpu.active_capture = Some(collector.clone());
-
-    let is_moe = config.num_experts > 0;
-    if is_moe {
-        reset_moe_router_histogram(config.num_experts, config.num_experts_per_tok);
-    }
-
-    let n_tok = tokens.len();
-    let mut kv = kv::KvCache::new_gpu(
+    // projections (attention + router + shared expert) keep full Hessians. The
+    // shared driver owns the collector + streaming; the closure runs the engine
+    // forward and returns the qwen-specific extras (router histogram + KLDREF).
+    collect(
         gpu,
-        config.n_layers,
-        config.n_kv_heads,
-        config.head_dim,
-        n_tok + 16,
-    )?;
-    let mut dn = DeltaNetState::new(gpu, config)?;
-    let scratch = Qwen35Scratch::new(gpu, config, 64)?;
+        0,
+        build_capture_names(weights),
+        vec![".experts.".to_string()],
+        output,
+        provenance,
+        |gpu| {
+            if is_moe {
+                reset_moe_router_histogram(config.num_experts, config.num_experts_per_tok);
+            }
+            let n_tok = tokens.len();
+            let mut kv = kv::KvCache::new_gpu(
+                gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                n_tok + 16,
+            )
+            .map_err(|e| format!("qwen35 calib kv: {e}"))?;
+            let mut dn =
+                DeltaNetState::new(gpu, config).map_err(|e| format!("qwen35 calib dn: {e}"))?;
+            let scratch = Qwen35Scratch::new(gpu, config, 64)
+                .map_err(|e| format!("qwen35 calib scratch: {e}"))?;
 
-    let mut kldref: Vec<(f32, Vec<(u32, f32)>)> = Vec::new();
-    for (pos, &tok) in tokens.iter().enumerate() {
-        forward_scratch(gpu, weights, config, tok, pos, &mut kv, &mut dn, &scratch)?;
-        if opts.kldref {
-            let lg = gpu.download_f32(&scratch.logits)?;
-            kldref.push((logsumexp(&lg), topk_logits(&lg, opts.kldref_topk)));
-        }
-    }
-    gpu.active_capture = None;
-    gpu.capture_names = std::collections::HashMap::new();
-
-    let f32_bytes = |v: &[f32]| -> Vec<u8> {
-        let mut b = Vec::with_capacity(v.len() * 4);
-        for &x in v {
-            b.extend_from_slice(&x.to_le_bytes());
-        }
-        b
-    };
-
-    // Descriptors are cheap (no GPU download): counts + per-tensor token map for
-    // the metadata, which the HFQM layout requires written BEFORE the payloads.
-    let descriptors = collector.tensor_descriptors();
-    // Every captured tensor emits `.imatrix`; dense projections also emit
-    // `.hessian` (MoE routed experts are imatrix-only).
-    let n_hessian = descriptors.iter().filter(|d| d.has_hessian).count();
-    let n_imatrix = descriptors.len();
-    let mut per_tensor_tokens = serde_json::Map::new();
-    for d in &descriptors {
-        per_tensor_tokens.insert(d.name.clone(), serde_json::json!(d.n_tokens));
-    }
-    let mut artifacts = vec![serde_json::json!("hessian"), serde_json::json!("imatrix")];
-
-    // MoE router histogram (summed co-occurrence = scheduler-affinity signal).
-    let mut meta = serde_json::json!({
-        "artifact_kind": "calibration",
-        "n_hessian": n_hessian,
-        "n_imatrix": n_imatrix,
-        "per_tensor_tokens": serde_json::Value::Object(per_tensor_tokens),
-    });
-    if is_moe {
-        if let Some(h) = take_moe_router_histogram() {
-            let mut cooc: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
-            for l in &h.per_layer {
-                for (&k, &v) in &l.cooccurrence {
-                    *cooc.entry(k).or_insert(0) += v;
+            let mut kldref: Vec<(f32, Vec<(u32, f32)>)> = Vec::new();
+            for (pos, &tok) in tokens.iter().enumerate() {
+                forward_scratch(gpu, weights, config, tok, pos, &mut kv, &mut dn, &scratch)
+                    .map_err(|e| format!("qwen35 calib forward: {e}"))?;
+                if opts.kldref {
+                    let lg = gpu
+                        .download_f32(&scratch.logits)
+                        .map_err(|e| format!("qwen35 calib logits: {e}"))?;
+                    kldref.push((logsumexp(&lg), topk_logits(&lg, opts.kldref_topk)));
                 }
             }
-            let mut pairs: Vec<(u64, u64)> = cooc.into_iter().collect();
-            pairs.sort_by(|a, b| b.1.cmp(&a.1));
-            pairs.truncate(64);
-            let ne = h.num_experts as u64;
-            let cooc_json: Vec<serde_json::Value> = pairs
-                .iter()
-                .map(|(key, cnt)| serde_json::json!([key / ne, key % ne, cnt]))
-                .collect();
-            meta.as_object_mut().unwrap().insert(
-                "moe_router_histogram".to_string(),
-                serde_json::json!({
-                    "num_experts": h.num_experts,
-                    "k_top": h.k_top,
-                    "routed_tokens": h.routed_tokens,
-                    "routed_slots": h.routed_slots,
-                    "top1_histogram": h.top1_histogram,
-                    "topk_histogram": h.topk_histogram,
-                    "per_layer_topk": h.per_layer.iter().map(|l| serde_json::json!(l.topk_histogram)).collect::<Vec<_>>(),
-                    "top_cooccurrence": cooc_json,
-                }),
-            );
-            artifacts.push(serde_json::json!("moe_router_histogram"));
-        }
-    }
 
-    // KLDREF tensors — small, already in host RAM; passed as `extra` to the
-    // streaming writer (the big Hessians stream straight from GPU).
-    let mut extra: Vec<HfqMemTensor> = Vec::new();
-    if !kldref.is_empty() {
-        let np = kldref.len();
-        let kk = kldref[0].1.len();
-        let (mut idx_v, mut lg_v, mut lz_v) = (Vec::new(), Vec::new(), Vec::new());
-        for (logz, tk) in &kldref {
-            lz_v.push(*logz);
-            for j in 0..kk {
-                let (i, l) = tk.get(j).copied().unwrap_or((0, f32::NEG_INFINITY));
-                idx_v.push(i as f32);
-                lg_v.push(l);
+            let f32_bytes = |v: &[f32]| -> Vec<u8> {
+                let mut b = Vec::with_capacity(v.len() * 4);
+                for &x in v {
+                    b.extend_from_slice(&x.to_le_bytes());
+                }
+                b
+            };
+
+            let mut extra_meta: Vec<(String, serde_json::Value)> = Vec::new();
+            let mut artifacts = vec![serde_json::json!("hessian"), serde_json::json!("imatrix")];
+
+            // MoE router histogram (summed co-occurrence = scheduler-affinity signal).
+            if is_moe {
+                if let Some(h) = take_moe_router_histogram() {
+                    let mut cooc: std::collections::HashMap<u64, u64> =
+                        std::collections::HashMap::new();
+                    for l in &h.per_layer {
+                        for (&k, &v) in &l.cooccurrence {
+                            *cooc.entry(k).or_insert(0) += v;
+                        }
+                    }
+                    let mut pairs: Vec<(u64, u64)> = cooc.into_iter().collect();
+                    pairs.sort_by(|a, b| b.1.cmp(&a.1));
+                    pairs.truncate(64);
+                    let ne = h.num_experts as u64;
+                    let cooc_json: Vec<serde_json::Value> = pairs
+                        .iter()
+                        .map(|(key, cnt)| serde_json::json!([key / ne, key % ne, cnt]))
+                        .collect();
+                    extra_meta.push((
+                        "moe_router_histogram".to_string(),
+                        serde_json::json!({
+                            "num_experts": h.num_experts,
+                            "k_top": h.k_top,
+                            "routed_tokens": h.routed_tokens,
+                            "routed_slots": h.routed_slots,
+                            "top1_histogram": h.top1_histogram,
+                            "topk_histogram": h.topk_histogram,
+                            "per_layer_topk": h.per_layer.iter().map(|l| serde_json::json!(l.topk_histogram)).collect::<Vec<_>>(),
+                            "top_cooccurrence": cooc_json,
+                        }),
+                    ));
+                    artifacts.push(serde_json::json!("moe_router_histogram"));
+                }
             }
-        }
-        for (nm, shape, data) in [
-            ("lm_head.kldref_idx", vec![np as u32, kk as u32], idx_v),
-            ("lm_head.kldref_logit", vec![np as u32, kk as u32], lg_v),
-            ("lm_head.kldref_logz", vec![np as u32], lz_v),
-        ] {
-            extra.push(HfqMemTensor {
-                name: nm.to_string(),
-                quant_type: 2,
-                shape,
-                group_size: 0,
-                data: f32_bytes(&data),
-            });
-        }
-        meta.as_object_mut().unwrap().insert(
-            "kldref".to_string(),
-            serde_json::json!({ "n_positions": np, "top_k": kk }),
-        );
-        artifacts.push(serde_json::json!("kldref"));
-    }
-    meta.as_object_mut()
-        .unwrap()
-        .insert("artifacts".to_string(), serde_json::Value::Array(artifacts));
 
-    // Caller-known provenance (source_model, corpus, n_calib_tokens) layered
-    // onto the technical metadata, then the package is streamed to `output`.
-    if let Some(obj) = meta.as_object_mut() {
-        for (k, v) in provenance {
-            obj.insert((*k).to_string(), v.clone());
-        }
-    }
-    let metadata_json = serde_json::to_string(&meta).unwrap();
-    let max_consistency = collector
-        .write_streaming(gpu, output, 0, &metadata_json, &extra)
-        .map_err(|e| HipError::new(0, &format!("write .calib.hfq: {e}")))?;
+            // KLDREF tensors — small, already in host RAM; passed as `extra` to the
+            // streaming writer (the big Hessians stream straight from GPU).
+            let mut extra_tensors: Vec<HfqMemTensor> = Vec::new();
+            if !kldref.is_empty() {
+                let np = kldref.len();
+                let kk = kldref[0].1.len();
+                let (mut idx_v, mut lg_v, mut lz_v) = (Vec::new(), Vec::new(), Vec::new());
+                for (logz, tk) in &kldref {
+                    lz_v.push(*logz);
+                    for j in 0..kk {
+                        let (i, l) = tk.get(j).copied().unwrap_or((0, f32::NEG_INFINITY));
+                        idx_v.push(i as f32);
+                        lg_v.push(l);
+                    }
+                }
+                for (nm, shape, data) in [
+                    ("lm_head.kldref_idx", vec![np as u32, kk as u32], idx_v),
+                    ("lm_head.kldref_logit", vec![np as u32, kk as u32], lg_v),
+                    ("lm_head.kldref_logz", vec![np as u32], lz_v),
+                ] {
+                    extra_tensors.push(HfqMemTensor {
+                        name: nm.to_string(),
+                        quant_type: 2,
+                        shape,
+                        group_size: 0,
+                        data: f32_bytes(&data),
+                    });
+                }
+                extra_meta.push((
+                    "kldref".to_string(),
+                    serde_json::json!({ "n_positions": np, "top_k": kk }),
+                ));
+                artifacts.push(serde_json::json!("kldref"));
+            }
+            extra_meta.push(("artifacts".to_string(), serde_json::Value::Array(artifacts)));
 
-    Ok(CalibSummary {
-        n_hessian,
-        n_imatrix,
-        max_consistency,
-    })
+            Ok(CalibForward {
+                extra_tensors,
+                extra_meta,
+            })
+        },
+    )
+    .map_err(|e| HipError::new(0, &e))
 }
 
 pub fn load_weights(

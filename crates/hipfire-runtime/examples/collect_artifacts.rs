@@ -18,6 +18,7 @@ use hipfire_arch_gemma3::{self as gemma3};
 use hipfire_arch_lfm2moe::calibration as lfm2_calib;
 use hipfire_arch_lfm2moe::{Lfm2MoeConfig, Lfm2MoeWeights};
 use hipfire_arch_qwen35::qwen35::{self, CalibOpts as QwenCalibOpts};
+use hipfire_arch_zaya::{calibration as zaya_calib, ZayaConfig};
 use rdna_compute::Gpu;
 use std::path::Path;
 
@@ -149,7 +150,35 @@ fn main() {
                 "lfm2-text",
             )
         }
-        other => panic!("collect_artifacts: unsupported arch_id {other}; handled 5/6/11/12/13"),
+        16 => {
+            let meta: serde_json::Value =
+                serde_json::from_str(&hfq.metadata_json).expect("zaya metadata");
+            let cfg_json = meta.get("config").unwrap_or(&meta);
+            let config = ZayaConfig::from_json(cfg_json).expect("zaya config");
+            let weights = hipfire_arch_zaya::gpu::ZayaGpuWeights::load(&hfq, &mut gpu, &config)
+                .expect("zaya weights");
+            let opts = zaya_calib::CalibOpts {
+                kldref: want_kldref,
+                kldref_topk: 64,
+            };
+            let summary = zaya_calib::collect_calibration_artifacts(
+                &mut gpu,
+                &weights,
+                &config,
+                tokens,
+                &opts,
+                Path::new(&output),
+                &provenance,
+            )
+            .expect("collect");
+            (
+                summary.n_hessian,
+                summary.n_imatrix,
+                summary.max_consistency,
+                "zaya",
+            )
+        }
+        other => panic!("collect_artifacts: unsupported arch_id {other}; handled 5/6/11/12/13/16"),
     };
     eprintln!(
         "collected {n_hessian} hessian + {n_imatrix} imatrix tensors in {:.1}s; mode={mode}; max diag(H)-vs-Σx² rel-err = {:.3e} {}",

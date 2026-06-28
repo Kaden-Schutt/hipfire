@@ -3080,6 +3080,7 @@ fn main() {
                             13 => "gemma3_vl",
                             14 => "nemotron_h",
                             15 => "mamba2",
+                            16 => "zaya",
                             _ => "qwen3",
                         };
                         let vl = m.vision_config.is_some()
@@ -5567,6 +5568,7 @@ fn main() {
                         10 => "minimax_m2",
                         11 => "lfm2moe",
                         14 => "nemotron_h",
+                        16 => "zaya",
                         _ => "qwen3",
                     })
                     .unwrap_or("none");

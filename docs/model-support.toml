@@ -70,6 +70,18 @@ mtp = "none"
 kv = "no-kv"
 vision = "none"
 
+# ZAYA1 (CCA attention + EDA/MoD-routed MoE). Bring-up: config + taxonomy only
+# (Z0); no servable forward path yet — every capability is "none" until the
+# mixer/MoE land.
+[[arch]]
+ids = [16]
+label = "zaya"
+prefill = "none"
+dflash = "none"
+mtp = "none"
+kv = "none"
+vision = "none"
+
 [[arch]]
 ids = [12]
 label = "gemma3"

@@ -41,6 +41,7 @@ mod quant;
 mod rocblas;
 mod rope;
 mod sampling;
+mod zaya_cca;
 
 /// Per-group byte size of the MQ3-Lloyd quantization layout.
 ///

@@ -2,14 +2,13 @@
 // hipfire — Gemma3 text-decoder calibration collection. See LICENSE / NOTICE.
 
 use hip_bridge::{HipError, HipResult};
-use hipfire_runtime::calibration::{logsumexp, topk_logits, CalibCollector};
-use hipfire_runtime::hfq::{
-    write_hfqm_package_streaming, HfqMemTensor, HfqPackage, HfqStreamEntry,
-};
+use hipfire_runtime::calibration::{collect_grouped, logsumexp, topk_logits, CalibForward};
+use hipfire_runtime::hfq::HfqMemTensor;
 use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::weights::WeightTensor;
 use rdna_compute::Gpu;
-use std::path::{Path, PathBuf};
+
+pub use hipfire_runtime::calibration::CalibSummary;
 
 use crate::config::Gemma3Config;
 use crate::forward::{forward_step, Gemma3State};
@@ -29,13 +28,6 @@ impl Default for CalibOpts {
             kldref_topk: 64,
         }
     }
-}
-
-/// Summary of a calibration pass after the `.calib.hfq` has been streamed.
-pub struct CalibSummary {
-    pub n_hessian: usize,
-    pub n_imatrix: usize,
-    pub max_consistency: f32,
 }
 
 fn put(
@@ -98,14 +90,6 @@ fn layers_per_pass() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&v| v > 0)
         .unwrap_or(4)
-}
-
-fn part_path(output: &Path, group_idx: usize) -> PathBuf {
-    let file_name = output
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("gemma3.calib.hfq");
-    output.with_file_name(format!(".{file_name}.part-{group_idx:03}.hfq"))
 }
 
 fn run_text_forward_for_capture(
@@ -185,167 +169,59 @@ pub fn collect_calibration_artifacts_text_only(
     prefix: &str,
     provenance: &[(&str, serde_json::Value)],
 ) -> HipResult<CalibSummary> {
-    let group = layers_per_pass();
-    let mut kldref: Vec<(f32, Vec<(u32, f32)>)> = Vec::new();
-    let mut part_paths = Vec::new();
-    let mut all_descriptors = Vec::new();
-    let mut max_consistency = 0.0f32;
+    let mut static_meta: Vec<(&str, serde_json::Value)> = provenance.to_vec();
+    static_meta.push(("text_only", serde_json::json!(true)));
+    static_meta.push(("text_prefix", serde_json::json!(prefix)));
 
-    for (group_idx, start) in (0..config.num_hidden_layers).step_by(group).enumerate() {
-        let end = (start + group).min(config.num_hidden_layers);
-        eprintln!(
-            "gemma3 calib: capturing layers {}..{} of {}",
-            start, end, config.num_hidden_layers
-        );
-        let collector = std::sync::Arc::new(CalibCollector::default());
-        gpu.capture_names = build_capture_names_for_layers(weights, prefix, start, end);
-        gpu.active_capture = Some(collector.clone());
-
-        let run_result = run_text_forward_for_capture(
-            gpu,
-            weights,
-            config,
-            tokens,
-            opts,
-            group_idx == 0,
-            &mut kldref,
-        );
-
-        gpu.active_capture = None;
-        gpu.capture_names = std::collections::HashMap::new();
-        run_result?;
-
-        let descriptors = collector.tensor_descriptors();
-        if descriptors.is_empty() {
-            return Err(HipError::new(
-                0,
-                &format!("gemma3 calib: no tensors captured for layers {start}..{end}"),
-            ));
-        }
-
-        let part = part_path(output, group_idx);
-        let part_meta = serde_json::json!({
-            "artifact_kind": "calibration-part",
-            "text_only": true,
-            "text_prefix": prefix,
-            "layer_start": start,
-            "layer_end": end,
-        })
-        .to_string();
-        let write_result = collector
-            .write_streaming(gpu, &part, 0, &part_meta, &[])
-            .map_err(|e| HipError::new(0, &format!("write part .calib.hfq: {e}")));
-        collector.free_gpu(gpu);
-        let consistency = write_result?;
-        max_consistency = max_consistency.max(consistency);
-        all_descriptors.extend(descriptors);
-        part_paths.push(part);
-    }
-
-    let n_hessian = all_descriptors.iter().filter(|d| d.has_hessian).count();
-    let n_imatrix = all_descriptors.len();
-    let mut per_tensor_tokens = serde_json::Map::new();
-    for d in &all_descriptors {
-        per_tensor_tokens.insert(d.name.clone(), serde_json::json!(d.n_tokens));
-    }
-
-    let mut artifacts = vec![serde_json::json!("hessian"), serde_json::json!("imatrix")];
-    let mut meta = serde_json::json!({
-        "artifact_kind": "calibration",
-        "text_only": true,
-        "text_prefix": prefix,
-        "layers_per_pass": group,
-        "n_hessian": n_hessian,
-        "n_imatrix": n_imatrix,
-        "per_tensor_tokens": serde_json::Value::Object(per_tensor_tokens),
-    });
-
-    let extra = kldref_extra(&kldref);
-    if !kldref.is_empty() {
-        let np = kldref.len();
-        let kk = kldref[0].1.len();
-        meta.as_object_mut().unwrap().insert(
-            "kldref".to_string(),
-            serde_json::json!({ "n_positions": np, "top_k": kk }),
-        );
-        artifacts.push(serde_json::json!("kldref"));
-    }
-
-    if let Some(obj) = meta.as_object_mut() {
-        obj.insert("artifacts".to_string(), serde_json::Value::Array(artifacts));
-        for (k, v) in provenance {
-            obj.insert((*k).to_string(), v.clone());
-        }
-    }
-    let metadata_json = serde_json::to_string(&meta).unwrap();
-    combine_parts(output, &metadata_json, &part_paths, &extra)
-        .map_err(|e| HipError::new(0, &format!("combine .calib.hfq: {e}")))?;
-    for part in part_paths {
-        let _ = std::fs::remove_file(part);
-    }
-
-    Ok(CalibSummary {
-        n_hessian,
-        n_imatrix,
-        max_consistency,
-    })
-}
-
-fn combine_parts(
-    output: &Path,
-    metadata_json: &str,
-    part_paths: &[PathBuf],
-    extra: &[HfqMemTensor],
-) -> std::io::Result<()> {
-    enum Plan {
-        Part { package_idx: usize, name: String },
-        Extra { extra_idx: usize },
-    }
-
-    let mut packages = Vec::with_capacity(part_paths.len());
-    let mut entries = Vec::new();
-    let mut plan = Vec::new();
-    for part in part_paths {
-        let package = HfqPackage::open(part)?;
-        let package_idx = packages.len();
-        for e in package.entries() {
-            entries.push(HfqStreamEntry {
-                name: e.name.clone(),
-                quant_type: e.quant_type,
-                shape: e.shape.clone(),
-                group_size: e.group_size,
-                data_len: e.data_size as u64,
-            });
-            plan.push(Plan::Part {
-                package_idx,
-                name: e.name.clone(),
-            });
-        }
-        packages.push(package);
-    }
-    for (extra_idx, t) in extra.iter().enumerate() {
-        entries.push(HfqStreamEntry {
-            name: t.name.clone(),
-            quant_type: t.quant_type,
-            shape: t.shape.clone(),
-            group_size: t.group_size,
-            data_len: t.data.len() as u64,
-        });
-        plan.push(Plan::Extra { extra_idx });
-    }
-
-    write_hfqm_package_streaming(output, 0, metadata_json, &entries, |i, w| match &plan[i] {
-        Plan::Part { package_idx, name } => {
-            let data = packages[*package_idx].blob_data(name).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("part tensor not found: {name}"),
-                )
-            })?;
-            w.write_all(data)
-        }
-        Plan::Extra { extra_idx } => w.write_all(&extra[*extra_idx].data),
-    })
+    // Gemma3 is dense (no MoE) so every captured tensor wants a full Hessian, but
+    // all layers at once do not fit — the grouped driver re-runs the forward per
+    // layer-group and concatenates the parts. KLDREF is captured once (group 0).
+    collect_grouped(
+        gpu,
+        0,
+        config.num_hidden_layers,
+        layers_per_pass(),
+        Vec::new(),
+        output,
+        &static_meta,
+        |start, end| build_capture_names_for_layers(weights, prefix, start, end),
+        |gpu, group_idx| {
+            let mut kldref: Vec<(f32, Vec<(u32, f32)>)> = Vec::new();
+            run_text_forward_for_capture(
+                gpu,
+                weights,
+                config,
+                tokens,
+                opts,
+                group_idx == 0,
+                &mut kldref,
+            )
+            .map_err(|e| format!("gemma3 calib forward: {e}"))?;
+            let mut extra_meta: Vec<(String, serde_json::Value)> = Vec::new();
+            let extra_tensors = if group_idx == 0 {
+                if !kldref.is_empty() {
+                    let np = kldref.len();
+                    let kk = kldref[0].1.len();
+                    extra_meta.push((
+                        "kldref".to_string(),
+                        serde_json::json!({ "n_positions": np, "top_k": kk }),
+                    ));
+                    extra_meta.push((
+                        "artifacts".to_string(),
+                        serde_json::json!(["hessian", "imatrix", "kldref"]),
+                    ));
+                }
+                kldref_extra(&kldref)
+            } else {
+                Vec::new()
+            };
+            Ok(CalibForward {
+                extra_tensors,
+                extra_meta,
+            })
+        },
+    )
+    .map_err(|e| HipError::new(0, &e))
 }
 
 #[cfg(test)]

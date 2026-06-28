@@ -47,6 +47,7 @@ Machine-readable subset consumed by `arch_features` / admission. Edit `docs/mode
 | lfm2-moe (11) | 🟡 | ❌ | ❌ | fp32 | ❌ |
 | nemotron_h (14) | ✅ | ❌ | ❌ | fp32 | ❌ |
 | mamba2 (15) | ✅ | ❌ | ❌ | no-kv | ❌ |
+| zaya (16) | ❌ | ❌ | ❌ | none | ❌ |
 | gemma3 (12) | ✅ | ❌ | ❌ | fp32+q8 | ❌ |
 | gemma3-vl (13) | ✅ | ❌ | ❌ | fp32+q8 | ✅ |
 | qwen2 (7) | ✅ | ❌ | ❌ | fp32 | ❌ |

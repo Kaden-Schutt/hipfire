@@ -340,12 +340,308 @@ impl CalibCollector {
     }
 }
 
+/// Memory-bounded variant of [`collect`] for dense arches whose full Hessians
+/// for ALL layers do not fit at once. Captures the layers in groups of
+/// `group_size` — each group re-runs the arch forward but registers only that
+/// group's tensors, streams a part file, and frees the GPU accumulators before
+/// the next group — then concatenates the parts (plus any `extra_tensors` the
+/// forward returned, e.g. KLDREF) into the final `.calib.hfq` at `output`.
+///
+/// Seams: `capture_names_for(start, end)` builds the capture map for one layer
+/// range; `forward(gpu, group_idx)` runs the model over the calibration tokens
+/// for that group (it may return [`CalibForward`] extras — typically only on
+/// `group_idx == 0`, since the extras are written once into the combined file).
+#[allow(clippy::too_many_arguments)]
+pub fn collect_grouped<C, F>(
+    gpu: &mut Gpu,
+    arch_id: u32,
+    num_layers: usize,
+    group_size: usize,
+    imatrix_only: Vec<String>,
+    output: &std::path::Path,
+    static_meta: &[(&str, serde_json::Value)],
+    mut capture_names_for: C,
+    mut forward: F,
+) -> Result<CalibSummary, String>
+where
+    C: FnMut(usize, usize) -> HashMap<usize, String>,
+    F: FnMut(&mut Gpu, usize) -> Result<CalibForward, String>,
+{
+    let group = group_size.max(1);
+    let mut part_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut all_descriptors: Vec<CalibTensorDesc> = Vec::new();
+    let mut extra_tensors: Vec<HfqMemTensor> = Vec::new();
+    let mut extra_meta: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut max_consistency = 0.0f32;
+
+    for (group_idx, start) in (0..num_layers).step_by(group).enumerate() {
+        let end = (start + group).min(num_layers);
+        let collector = std::sync::Arc::new(if imatrix_only.is_empty() {
+            CalibCollector::new()
+        } else {
+            CalibCollector::with_imatrix_only(imatrix_only.clone())
+        });
+        gpu.capture_names = capture_names_for(start, end);
+        gpu.active_capture = Some(collector.clone());
+
+        let out = forward(gpu, group_idx);
+        gpu.active_capture = None;
+        gpu.capture_names = HashMap::new();
+        let mut out = out?;
+
+        let descriptors = collector.tensor_descriptors();
+        if descriptors.is_empty() {
+            return Err(format!(
+                "calib: no tensors captured for layers {start}..{end}"
+            ));
+        }
+        let part = calib_part_path(output, group_idx);
+        let part_meta = serde_json::json!({
+            "artifact_kind": "calibration-part",
+            "layer_start": start,
+            "layer_end": end,
+        })
+        .to_string();
+        let consistency = collector
+            .write_streaming(gpu, &part, arch_id, &part_meta, &[])
+            .map_err(|e| format!("calib write part {}: {e}", part.display()))?;
+        collector.free_gpu(gpu);
+        max_consistency = max_consistency.max(consistency);
+        all_descriptors.extend(descriptors);
+        part_paths.push(part);
+        extra_tensors.append(&mut out.extra_tensors);
+        extra_meta.append(&mut out.extra_meta);
+    }
+
+    let n_hessian = all_descriptors.iter().filter(|d| d.has_hessian).count();
+    let n_imatrix = all_descriptors.len();
+    let mut per_tensor_tokens = serde_json::Map::new();
+    for d in &all_descriptors {
+        per_tensor_tokens.insert(d.name.clone(), serde_json::json!(d.n_tokens));
+    }
+    let mut meta = serde_json::json!({
+        "artifact_kind": "calibration",
+        "layers_per_pass": group,
+        "n_hessian": n_hessian,
+        "n_imatrix": n_imatrix,
+        "per_tensor_tokens": serde_json::Value::Object(per_tensor_tokens),
+        "artifacts": ["hessian", "imatrix"],
+    });
+    if let Some(obj) = meta.as_object_mut() {
+        for (k, v) in static_meta {
+            obj.insert((*k).to_string(), v.clone());
+        }
+        for (k, v) in &extra_meta {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    let metadata_json = serde_json::to_string(&meta).unwrap();
+    combine_calib_parts(output, arch_id, &metadata_json, &part_paths, &extra_tensors)
+        .map_err(|e| format!("calib combine {}: {e}", output.display()))?;
+    for part in part_paths {
+        let _ = std::fs::remove_file(part);
+    }
+
+    Ok(CalibSummary {
+        n_hessian,
+        n_imatrix,
+        max_consistency,
+    })
+}
+
+/// Temp part path for a grouped calibration pass: `.<name>.part-NNN.hfq` beside
+/// `output`.
+fn calib_part_path(output: &std::path::Path, group_idx: usize) -> std::path::PathBuf {
+    let file_name = output
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("calib.hfq");
+    output.with_file_name(format!(".{file_name}.part-{group_idx:03}.hfq"))
+}
+
+/// Concatenate the per-group part packages (+ in-RAM `extra` tensors) into the
+/// final combined `.calib.hfq`, streaming each part's blobs through without
+/// materializing them all at once.
+fn combine_calib_parts(
+    output: &std::path::Path,
+    arch_id: u32,
+    metadata_json: &str,
+    part_paths: &[std::path::PathBuf],
+    extra: &[HfqMemTensor],
+) -> std::io::Result<()> {
+    use crate::hfq::{write_hfqm_package_streaming, HfqPackage, HfqStreamEntry};
+    enum Plan {
+        Part { package_idx: usize, name: String },
+        Extra { extra_idx: usize },
+    }
+    let mut packages = Vec::with_capacity(part_paths.len());
+    let mut entries = Vec::new();
+    let mut plan = Vec::new();
+    for part in part_paths {
+        let package = HfqPackage::open(part)?;
+        let package_idx = packages.len();
+        for e in package.entries() {
+            entries.push(HfqStreamEntry {
+                name: e.name.clone(),
+                quant_type: e.quant_type,
+                shape: e.shape.clone(),
+                group_size: e.group_size,
+                data_len: e.data_size as u64,
+            });
+            plan.push(Plan::Part {
+                package_idx,
+                name: e.name.clone(),
+            });
+        }
+        packages.push(package);
+    }
+    for (extra_idx, t) in extra.iter().enumerate() {
+        entries.push(HfqStreamEntry {
+            name: t.name.clone(),
+            quant_type: t.quant_type,
+            shape: t.shape.clone(),
+            group_size: t.group_size,
+            data_len: t.data.len() as u64,
+        });
+        plan.push(Plan::Extra { extra_idx });
+    }
+    write_hfqm_package_streaming(
+        output,
+        arch_id,
+        metadata_json,
+        &entries,
+        |i, w| match &plan[i] {
+            Plan::Part { package_idx, name } => {
+                let data = packages[*package_idx].blob_data(name).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("part tensor not found: {name}"),
+                    )
+                })?;
+                w.write_all(data)
+            }
+            Plan::Extra { extra_idx } => w.write_all(&extra[*extra_idx].data),
+        },
+    )
+}
+
 /// Per-tensor descriptor from [`CalibCollector::tensor_descriptors`].
 pub struct CalibTensorDesc {
     pub name: String,
     pub has_hessian: bool,
     pub k: usize,
     pub n_tokens: u64,
+}
+
+/// Result of a calibration-collection pass — the three fields every arch's
+/// public collector reports back to the `collect_artifacts` CLI / daemon.
+pub struct CalibSummary {
+    pub n_hessian: usize,
+    pub n_imatrix: usize,
+    pub max_consistency: f32,
+}
+
+/// Outputs of an arch's capturing forward that the driver folds into the
+/// streamed package. `extra_tensors` are small, already-in-RAM tensors (KLDREF
+/// reference, MoE router histogram) appended to the `.calib.hfq`; `extra_meta`
+/// are metadata fields known only AFTER the forward (e.g. KLDREF position/top-k
+/// counts, the `artifacts` list when KLDREF is present). Both default empty for
+/// arches that capture nothing beyond the Hessian/imatrix.
+#[derive(Default)]
+pub struct CalibForward {
+    pub extra_tensors: Vec<HfqMemTensor>,
+    pub extra_meta: Vec<(String, serde_json::Value)>,
+}
+
+/// General single-pass calibration-collection driver — the orchestration every
+/// arch shares. Arms the [`CalibCollector`] as `gpu.active_capture`, runs the
+/// arch's capturing `forward`, reads the descriptors, builds the standard
+/// metadata, streams the HFQM `.calib.hfq`, and releases the GPU accumulators.
+///
+/// The arch supplies only its seams:
+/// - `capture_names`: weight-buffer-addr → canonical tensor name (sans
+///   `.weight`, so the quantizer joins `<name>.{hessian,imatrix}` to the source
+///   weight). MoE routed experts are registered INDIVIDUALLY
+///   (`…experts.{e}.gate_up_proj`) so the per-tensor consumer path matches them
+///   uniformly across arches.
+/// - `imatrix_only`: name substrings whose tensors skip the full [K,K] Hessian
+///   and keep only the imatrix (e.g. `[".experts."]` — per-expert Hessians do
+///   not fit).
+/// - `static_meta`: provenance + arch-constant metadata fields.
+/// - `forward`: runs the model over the calibration tokens (the
+///   `gpu.maybe_capture_activation` taps fire inside it) and returns any
+///   [`CalibForward`] extras it produced.
+pub fn collect<F>(
+    gpu: &mut Gpu,
+    arch_id: u32,
+    capture_names: HashMap<usize, String>,
+    imatrix_only: Vec<String>,
+    output: &std::path::Path,
+    static_meta: &[(&str, serde_json::Value)],
+    forward: F,
+) -> Result<CalibSummary, String>
+where
+    F: FnOnce(&mut Gpu) -> Result<CalibForward, String>,
+{
+    let collector = std::sync::Arc::new(if imatrix_only.is_empty() {
+        CalibCollector::new()
+    } else {
+        CalibCollector::with_imatrix_only(imatrix_only)
+    });
+    gpu.capture_names = capture_names;
+    gpu.active_capture = Some(collector.clone());
+
+    // Run the arch forward, then ALWAYS disarm the capture before propagating
+    // any error (a half-armed `gpu` would mis-capture a later forward).
+    let forward_out = forward(gpu);
+    gpu.active_capture = None;
+    gpu.capture_names = HashMap::new();
+    let forward_out = forward_out?;
+
+    let descriptors = collector.tensor_descriptors();
+    if descriptors.is_empty() {
+        return Err("calib: no tensors captured (check capture_names wiring)".to_string());
+    }
+    let n_hessian = descriptors.iter().filter(|d| d.has_hessian).count();
+    let n_imatrix = descriptors.len();
+    let mut per_tensor_tokens = serde_json::Map::new();
+    for d in &descriptors {
+        per_tensor_tokens.insert(d.name.clone(), serde_json::json!(d.n_tokens));
+    }
+    let mut meta = serde_json::json!({
+        "artifact_kind": "calibration",
+        "n_hessian": n_hessian,
+        "n_imatrix": n_imatrix,
+        "per_tensor_tokens": serde_json::Value::Object(per_tensor_tokens),
+        "artifacts": ["hessian", "imatrix"],
+    });
+    if let Some(obj) = meta.as_object_mut() {
+        // static_meta first, then forward extras (so a dynamic field — e.g. the
+        // KLDREF-augmented `artifacts` list — overrides the static default).
+        for (k, v) in static_meta {
+            obj.insert((*k).to_string(), v.clone());
+        }
+        for (k, v) in &forward_out.extra_meta {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    let metadata_json = serde_json::to_string(&meta).unwrap();
+    let max_consistency = collector
+        .write_streaming(
+            gpu,
+            output,
+            arch_id,
+            &metadata_json,
+            &forward_out.extra_tensors,
+        )
+        .map_err(|e| format!("calib write {}: {e}", output.display()))?;
+    collector.free_gpu(gpu);
+
+    Ok(CalibSummary {
+        n_hessian,
+        n_imatrix,
+        max_consistency,
+    })
 }
 
 /// Stream `v * scale` as little-endian f32 to `w` in bounded chunks (so a

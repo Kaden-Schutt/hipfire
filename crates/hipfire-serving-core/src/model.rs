@@ -237,6 +237,10 @@ pub struct LoadedModel {
     /// `NemotronModel` owns its own weights + per-block recurrent/KV state;
     /// there are no separate `nemotron_*` Option fields. N5b.
     pub nemotron_backend: Option<hipfire_arch_nemotron::model::NemotronModel>,
+    /// Assembled ZAYA1 serving backend (arch_id 16 — hipfire-arch-zaya). CCA
+    /// attention + EDA/MoD-routed MoE; owns its GPU weights + rolling sequence.
+    /// Driven through the shared `ServingBackend::serve` seam. None on other archs.
+    pub zaya_backend: Option<hipfire_arch_zaya::arch::ZayaModel>,
     // Qwen2 state (arch_id=7 — hipfire-arch-qwen2 standalone). The
     // KV cache lives inside Qwen2State, so there's no separate
     // qwen2_kv field. None on every other arch path.

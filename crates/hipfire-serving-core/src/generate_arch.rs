@@ -1335,6 +1335,179 @@ pub fn generate_nemotron(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn generate_zaya(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    max_think_tokens: usize,
+    assistant_prefix: prompt_frame::AssistantPrefix,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[prompt_frame::Message]>,
+    evidence_dir: Option<&str>,
+) {
+    if m.tokenizer.is_none() {
+        emit_error_with_id(stdout, id, "tokenizer not loaded".to_string());
+        return;
+    }
+    if m.zaya_backend.is_none() {
+        emit_error_with_id(
+            stdout,
+            id,
+            "zaya backend not loaded (arch 16 not active)".to_string(),
+        );
+        return;
+    }
+
+    // Frame the prompt up front (releases the shared `m` borrows before the
+    // backend `&mut` borrow below). Same scaffold as generate_llama.
+    let raw = effective_raw(m);
+    let prompt_tokens: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        // nemotron_h ships a correct ChatML jinja template (`<|im_start|>` /
+        // `<|im_end|>`), so default to it when present (opt out with
+        // HIPFIRE_JINJA_CHAT=0). The hand-rolled Plain ChatFrame is the fallback.
+        let try_jinja = m.chat_template.is_some()
+            && std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        if try_jinja {
+            let template = m.chat_template.as_ref().unwrap();
+            let frame = prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: system_prompt,
+                user: prompt,
+                enable_thinking: max_think_tokens != 1,
+                bos_token: None,
+            };
+            let rendered = if tools.is_some() || messages_history.is_some() {
+                let synthesized: Vec<prompt_frame::Message>;
+                let messages_slice: &[prompt_frame::Message] = match messages_history {
+                    Some(mh) => mh,
+                    None => {
+                        let mut v = Vec::new();
+                        if let Some(sys) = system_prompt {
+                            v.push(prompt_frame::Message {
+                                role: prompt_frame::Role::System,
+                                content: sys.to_string(),
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                            });
+                        }
+                        v.push(prompt_frame::Message {
+                            role: prompt_frame::Role::User,
+                            content: prompt.to_string(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                        });
+                        synthesized = v;
+                        &synthesized
+                    }
+                };
+                frame.render_messages(messages_slice, tools, None)
+            } else {
+                frame.render()
+            };
+            match rendered {
+                Ok(text) => tokenizer.encode(&text),
+                Err(e) => {
+                    eprintln!("[daemon] zaya jinja render failed ({e}) — Plain fallback");
+                    prompt_frame::ChatFrame {
+                        tokenizer,
+                        system: system_prompt,
+                        user: prompt,
+                        assistant_prefix,
+                        raw,
+                    }
+                    .build()
+                }
+            }
+        } else {
+            prompt_frame::ChatFrame {
+                tokenizer,
+                system: system_prompt,
+                user: prompt,
+                assistant_prefix,
+                raw,
+            }
+            .build()
+        }
+    };
+    if prompt_tokens.is_empty() {
+        emit_error_with_id(stdout, id, "empty prompt after framing".to_string());
+        return;
+    }
+
+    let tok = m.tokenizer.as_ref().unwrap();
+    let backend = m.zaya_backend.as_mut().unwrap();
+    let eos = backend.eos_token();
+
+    let prefill_t0 = Instant::now();
+    if let Err(e) = SimpleAr::prefill(backend, gpu, &prompt_tokens) {
+        emit_error_with_id(stdout, id, format!("zaya prefill: {e}"));
+        return;
+    }
+    let _ = gpu.hip.device_synchronize();
+    let prefill_ms = prefill_t0.elapsed().as_secs_f64() * 1000.0;
+    let n = prompt_tokens.len();
+    let no_images: [&[u8]; 0] = [];
+    let mut ctx = GenerateCtx {
+        id,
+        prompt: "", // unused: prefill already consumed the framed tokens
+        temperature: temp,
+        top_p,
+        max_tokens,
+        repeat_penalty,
+        repeat_window,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        max_think_tokens: 0,
+        stop_sequences: &[],
+        images: &no_images,
+        sink: stdout,
+    };
+    let result = decode_loop_with_timing(
+        gpu,
+        backend,
+        tok,
+        eos,
+        &mut ctx,
+        n,
+        n,
+        DecodeLoopTiming {
+            prefill_ms: Some(prefill_ms),
+        },
+    );
+    drop(ctx);
+    match result {
+        Ok(outcome) => {
+            if let (Some(dir), Some(prefill_ms), Some(decode_ms)) =
+                (evidence_dir, outcome.prefill_ms, outcome.decode_ms)
+            {
+                write_daemon_runtime_oneshot_evidence(
+                    dir,
+                    m,
+                    gpu,
+                    id,
+                    outcome.prompt_tokens,
+                    outcome.tokens_generated,
+                    prefill_ms / 1000.0,
+                    decode_ms / 1000.0,
+                    outcome.ttft_ms.unwrap_or(prefill_ms),
+                );
+            }
+        }
+        Err(e) => emit_error_with_id(stdout, id, format!("zaya decode: {e}")),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn generate_llama(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,

@@ -2923,6 +2923,12 @@ pub const ROPE_PARTIAL_HALFSPLIT_BATCHED_SRC: &str =
 #[cfg(feature = "deltanet")]
 pub const CONV1D_DECODE_SRC: &str = include_str!("../../../kernels/src/conv1d_decode.hip");
 
+/// ZAYA1 CCA + EDA/MoD custom elementwise kernels (grouped causal conv1d, q/k
+/// residual mix, conv-residual add, compositional value, L2 qk-norm + temp,
+/// exact GELU, affine residual merge, EDA cross-layer add). All register-only
+/// (no LDS). See kernels/src/zaya_cca.hip.
+pub const ZAYA_CCA_SRC: &str = include_str!("../../../kernels/src/zaya_cca.hip");
+
 /// LFM2 LIV double-gated short-conv, single-token decode (runtime kernel_size).
 /// Fuses the B*x pre-gate, depthwise causal conv, C*conv_out post-gate, and the
 /// rolling conv-state ring-buffer advance into one launch. conv_bias is always

@@ -6,8 +6,10 @@ csv_path = sys.argv[1] if len(sys.argv) > 1 else "results.csv"
 rows = list(csv.DictReader(open(csv_path)))
 
 def num(x):
-    try: return float(x)
-    except: return None
+    try:
+        return float(x)
+    except Exception:
+        return None
 
 # Order models by the canonical sweep order.
 model_order = ["LFM2.5-350M.bf16.hfq","qwen3.5-0.8b.bf16.hfq","llama-3.2-1b-instruct.bf16.hfq",

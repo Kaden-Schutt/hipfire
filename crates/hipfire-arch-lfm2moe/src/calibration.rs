@@ -5,13 +5,14 @@ use crate::config::Lfm2MoeConfig;
 use crate::forward::decode_step;
 use crate::lfm2moe::{Ffn, Lfm2MoeState, Lfm2MoeWeights, Mixer};
 use hip_bridge::{HipError, HipResult};
-use hipfire_runtime::calibration::{logsumexp, topk_logits, CalibCollector};
+use hipfire_runtime::calibration::{collect, logsumexp, topk_logits, CalibForward};
 use hipfire_runtime::hfq::HfqMemTensor;
 use hipfire_runtime::weights::WeightTensor;
 use rdna_compute::Gpu;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+
+pub use hipfire_runtime::calibration::CalibSummary;
 
 /// Options for [`collect_calibration_artifacts`].
 pub struct CalibOpts {
@@ -27,13 +28,6 @@ impl Default for CalibOpts {
             kldref_topk: 64,
         }
     }
-}
-
-/// Summary of a calibration pass after the `.calib.hfq` has been streamed.
-pub struct CalibSummary {
-    pub n_hessian: usize,
-    pub n_imatrix: usize,
-    pub max_consistency: f32,
 }
 
 fn put(m: &mut HashMap<usize, String>, wt: &WeightTensor, name: impl Into<String>) {
@@ -132,88 +126,59 @@ pub fn collect_calibration_artifacts(
     output: &Path,
     provenance: &[(&str, serde_json::Value)],
 ) -> HipResult<CalibSummary> {
-    let collector = Arc::new(CalibCollector::with_imatrix_only(vec![
-        ".feed_forward.experts.".to_string(),
-    ]));
-    gpu.capture_names = build_capture_names(weights);
-    gpu.active_capture = Some(collector.clone());
+    let mut static_meta: Vec<(&str, serde_json::Value)> = provenance.to_vec();
+    static_meta.push(("arch", serde_json::json!("lfm2")));
+    static_meta.push(("text_only", serde_json::json!(true)));
+    static_meta.push((
+        "captures",
+        serde_json::json!("decode_step_weight_gemv+routed_expert_indexed_tap"),
+    ));
+    static_meta.push((
+        "routed_expert_capture",
+        serde_json::json!("imatrix-only-selected-experts"),
+    ));
 
-    let mut state = Lfm2MoeState::new(gpu, config)
-        .map_err(|e| HipError::new(0, &format!("lfm2 calib state: {e}")))?;
-    let mut kldref: Vec<(f32, Vec<(u32, f32)>)> = Vec::new();
-    let mut run_result: HipResult<()> = Ok(());
-    for (pos, &tok) in tokens.iter().enumerate() {
-        match decode_step(config, weights, &mut state, gpu, tok, pos as u32) {
-            Ok(logits) => {
+    // Routed experts are imatrix-only (full per-expert Hessians do not fit for
+    // the 8B-A1B); the decode loop also taps the lm-head logits for KLDREF.
+    collect(
+        gpu,
+        crate::ARCH_ID,
+        build_capture_names(weights),
+        vec![".feed_forward.experts.".to_string()],
+        output,
+        &static_meta,
+        |gpu| {
+            let mut state =
+                Lfm2MoeState::new(gpu, config).map_err(|e| format!("lfm2 calib state: {e}"))?;
+            let mut kldref: Vec<(f32, Vec<(u32, f32)>)> = Vec::new();
+            for (pos, &tok) in tokens.iter().enumerate() {
+                let logits = decode_step(config, weights, &mut state, gpu, tok, pos as u32)
+                    .map_err(|e| format!("lfm2 calib decode: {e}"))?;
                 if opts.kldref {
                     kldref.push((logsumexp(&logits), topk_logits(&logits, opts.kldref_topk)));
                 }
             }
-            Err(e) => {
-                run_result = Err(HipError::new(0, &format!("lfm2 calib decode: {e}")));
-                break;
+            let extra_tensors = kldref_extra(&kldref);
+            let mut extra_meta: Vec<(String, serde_json::Value)> = Vec::new();
+            if !kldref.is_empty() {
+                let np = kldref.len();
+                let kk = kldref[0].1.len();
+                extra_meta.push((
+                    "kldref".to_string(),
+                    serde_json::json!({ "n_positions": np, "top_k": kk }),
+                ));
+                extra_meta.push((
+                    "artifacts".to_string(),
+                    serde_json::json!(["hessian", "imatrix", "kldref"]),
+                ));
             }
-        }
-    }
-    gpu.active_capture = None;
-    gpu.capture_names = HashMap::new();
-    run_result?;
-
-    let descriptors = collector.tensor_descriptors();
-    if descriptors.is_empty() {
-        return Err(HipError::new(
-            0,
-            "lfm2 calib: no tensors captured (capture_names empty or weight_gemv not hit)",
-        ));
-    }
-
-    let n_hessian = descriptors.iter().filter(|d| d.has_hessian).count();
-    let n_imatrix = descriptors.len();
-    let mut per_tensor_tokens = serde_json::Map::new();
-    for d in &descriptors {
-        per_tensor_tokens.insert(d.name.clone(), serde_json::json!(d.n_tokens));
-    }
-
-    let mut artifacts = vec![serde_json::json!("hessian"), serde_json::json!("imatrix")];
-    let mut meta = serde_json::json!({
-        "artifact_kind": "calibration",
-        "arch": "lfm2",
-        "text_only": true,
-        "captures": "decode_step_weight_gemv+routed_expert_indexed_tap",
-        "routed_expert_capture": "imatrix-only-selected-experts",
-        "n_hessian": n_hessian,
-        "n_imatrix": n_imatrix,
-        "per_tensor_tokens": serde_json::Value::Object(per_tensor_tokens),
-    });
-
-    let extra = kldref_extra(&kldref);
-    if !kldref.is_empty() {
-        let np = kldref.len();
-        let kk = kldref[0].1.len();
-        meta.as_object_mut().unwrap().insert(
-            "kldref".to_string(),
-            serde_json::json!({ "n_positions": np, "top_k": kk }),
-        );
-        artifacts.push(serde_json::json!("kldref"));
-    }
-
-    if let Some(obj) = meta.as_object_mut() {
-        obj.insert("artifacts".to_string(), serde_json::Value::Array(artifacts));
-        for (k, v) in provenance {
-            obj.insert((*k).to_string(), v.clone());
-        }
-    }
-    let metadata_json = serde_json::to_string(&meta).unwrap();
-    let max_consistency = collector
-        .write_streaming(gpu, output, crate::ARCH_ID, &metadata_json, &extra)
-        .map_err(|e| HipError::new(0, &format!("write .calib.hfq: {e}")))?;
-    collector.free_gpu(gpu);
-
-    Ok(CalibSummary {
-        n_hessian,
-        n_imatrix,
-        max_consistency,
-    })
+            Ok(CalibForward {
+                extra_tensors,
+                extra_meta,
+            })
+        },
+    )
+    .map_err(|e| HipError::new(0, &e))
 }
 
 #[cfg(test)]

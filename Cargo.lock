@@ -1378,6 +1378,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-zaya"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-dispatch",
+ "hipfire-mixer",
+ "hipfire-model",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-atlas"
 version = "0.3.0"
 dependencies = [
@@ -1715,6 +1729,7 @@ dependencies = [
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
+ "hipfire-arch-zaya",
  "hipfire-atlas",
  "hipfire-coherence",
  "hipfire-detect",
@@ -1800,6 +1815,7 @@ dependencies = [
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
+ "hipfire-arch-zaya",
  "hipfire-evidence",
  "hipfire-generate",
  "hipfire-media",

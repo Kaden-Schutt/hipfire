@@ -2954,6 +2954,12 @@ fn should_quantize(name: &str) -> bool {
     if name.contains("conv1d") {
         return false;
     }
+    // ZAYA1 CCA conv_qk filters (`self_attn.qkv_proj.conv_qk_{depthwise,grouped}.weight`,
+    // shapes [conv_ch, 1, K] / [conv_ch, in_per_group, K]) are short causal convs run
+    // by a custom f32 kernel, not a 2D linear — keep them F16.
+    if name.contains("conv_qk") {
+        return false;
+    }
     // Quantize everything including embeddings (Q8 embedding saves ~2.3GB for 8B models)
     name.contains("weight")
 }
@@ -3424,17 +3430,7 @@ fn quantize_hfq_source_tensor(
                 // Hessian into the smoothed input space H' = diag(1/s) H diag(1/s),
                 // so the OBS feedback minimizes the SMOOTHED output error. Runtime
                 // divides x/s via the awq_scale sidecar → (W·s)·(x/s) = W·x.
-                let awq_scales = if let (Some(alpha), Some(im)) =
-                    (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
-                {
-                    if alpha > 0.0 && awq_eligible(name) {
-                        Some(compute_awq_scales(im, alpha))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                let awq_scales = awq_scales_for(name);
                 let wbuf: std::borrow::Cow<[f32]> = if let Some(s) = &awq_scales {
                     let mut scaled = f32_data.clone();
                     awq_pre_scale_weights(&mut scaled, m_dim, k, s);
@@ -3466,18 +3462,11 @@ fn quantize_hfq_source_tensor(
             });
             let q = if let Some(q) = ldlq_q {
                 q
-            } else if let (Some(alpha), Some(im)) =
-                (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
-            {
-                if alpha > 0.0 && awq_eligible(name) {
-                    let scales = compute_awq_scales(im, alpha);
-                    let mut scaled = f32_data.clone();
-                    awq_pre_scale_weights(&mut scaled, m_dim, k, &scales);
-                    OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(scales));
-                    quantize_oq4g256(&scaled, &signs1, &signs2)
-                } else {
-                    quantize_oq4g256(&f32_data, &signs1, &signs2)
-                }
+            } else if let Some(scales) = awq_scales_for(name) {
+                let mut scaled = f32_data.clone();
+                awq_pre_scale_weights(&mut scaled, m_dim, k, &scales);
+                OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(scales));
+                quantize_oq4g256(&scaled, &signs1, &signs2)
             } else {
                 quantize_oq4g256(&f32_data, &signs1, &signs2)
             };
@@ -3500,17 +3489,7 @@ fn quantize_hfq_source_tensor(
             let ldlq_q = if format == HfqInputFormat::Oq8Plus {
                 OQ4_LDLQ_HESSIAN.get().and_then(|idx| {
                     let mut h = ldlq_hessian_for_tensor(idx, name, k)?;
-                    let awq_scales = if let (Some(alpha), Some(im)) =
-                        (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
-                    {
-                        if alpha > 0.0 && awq_eligible(name) {
-                            Some(compute_awq_scales(im, alpha))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
+                    let awq_scales = awq_scales_for(name);
                     let wbuf: std::borrow::Cow<[f32]> = if let Some(s) = &awq_scales {
                         let mut scaled = f32_data.clone();
                         awq_pre_scale_weights(&mut scaled, m_dim, k, s);
@@ -3545,18 +3524,11 @@ fn quantize_hfq_source_tensor(
             };
             let q = if let Some(q) = ldlq_q {
                 q
-            } else if let (Some(alpha), Some(im)) =
-                (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
-            {
-                if alpha > 0.0 && awq_eligible(name) {
-                    let scales = compute_awq_scales(im, alpha);
-                    let mut scaled = f32_data.clone();
-                    awq_pre_scale_weights(&mut scaled, m_dim, k, &scales);
-                    OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(scales));
-                    quantize_oq8g256(&scaled, &signs1, &signs2)
-                } else {
-                    quantize_oq8g256(&f32_data, &signs1, &signs2)
-                }
+            } else if let Some(scales) = awq_scales_for(name) {
+                let mut scaled = f32_data.clone();
+                awq_pre_scale_weights(&mut scaled, m_dim, k, &scales);
+                OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(scales));
+                quantize_oq8g256(&scaled, &signs1, &signs2)
             } else {
                 quantize_oq8g256(&f32_data, &signs1, &signs2)
             };
@@ -3579,17 +3551,7 @@ fn quantize_hfq_source_tensor(
             // rebase H' = diag(1/s) H diag(1/s) + x/s sidecar).
             let ldlq_q = OQ4_LDLQ_HESSIAN.get().and_then(|idx| {
                 let mut h = ldlq_hessian_for_tensor(idx, name, k)?;
-                let awq_scales = if let (Some(alpha), Some(im)) =
-                    (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
-                {
-                    if alpha > 0.0 && awq_eligible(name) {
-                        Some(compute_awq_scales(im, alpha))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                let awq_scales = awq_scales_for(name);
                 let wbuf: std::borrow::Cow<[f32]> = if let Some(s) = &awq_scales {
                     let mut scaled = f32_data.clone();
                     awq_pre_scale_weights(&mut scaled, m_dim, k, s);
@@ -3629,28 +3591,19 @@ fn quantize_hfq_source_tensor(
             });
             let q = if let Some(q) = ldlq_q {
                 q
-            } else if let (Some(alpha), Some(im)) =
-                (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
-            {
-                if alpha > 0.0 && awq_eligible(name) {
-                    let scales = compute_awq_scales(im, alpha);
+            } else {
+                let scaled = awq_scales_for(name).map(|scales| {
                     let mut scaled = f32_data.clone();
                     awq_pre_scale_weights(&mut scaled, m_dim, k, &scales);
                     OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(scales));
-                    if compact {
-                        quantize_oqplus_compact(&scaled, &signs1, &signs2, w8_frac)
-                    } else {
-                        quantize_oqplus_tiered(&scaled, &signs1, &signs2, w8_frac)
-                    }
-                } else if compact {
-                    quantize_oqplus_compact(&f32_data, &signs1, &signs2, w8_frac)
+                    scaled
+                });
+                let w: &[f32] = scaled.as_deref().unwrap_or(&f32_data);
+                if compact {
+                    quantize_oqplus_compact(w, &signs1, &signs2, w8_frac)
                 } else {
-                    quantize_oqplus_tiered(&f32_data, &signs1, &signs2, w8_frac)
+                    quantize_oqplus_tiered(w, &signs1, &signs2, w8_frac)
                 }
-            } else if compact {
-                quantize_oqplus_compact(&f32_data, &signs1, &signs2, w8_frac)
-            } else {
-                quantize_oqplus_tiered(&f32_data, &signs1, &signs2, w8_frac)
             };
             // OQ+C → compact qt=36 layout; OQ+T → int8 Oq8 qt=35 layout.
             if compact {
@@ -4379,6 +4332,26 @@ fn compute_awq_scales(in_sum2: &[f32], alpha: f32) -> Vec<f32> {
         .zip(offset)
         .map(|(l, m)| ((l - m).exp() as f32).clamp(AWQ_SCALE_MIN, AWQ_SCALE_MAX))
         .collect()
+}
+
+/// SmoothQuant/AWQ per-input-channel scales for `name`, or `None` when the
+/// active recipe does not apply AWQ to this tensor. This is the single guard
+/// every weight path shares — extracted so dense projections AND routed experts
+/// (`…experts.{e}.gate_up_proj.weight`) flow through ONE arch-agnostic, name-keyed
+/// path instead of per-format / per-arch copies.
+///
+/// AWQ is on iff a `+` recipe set [`AWQ_ALPHA`] (alpha > 0), the tensor is
+/// [`awq_eligible`], and a per-input-channel imatrix (`<name>.imatrix`, from
+/// `--hessian`/`--imatrix`) is present. Does NOT touch the weights — the caller
+/// folds `W·diag(s)` ([`awq_pre_scale_weights`]) and emits the `<name>.awq_scale`
+/// sidecar; the LDLQ paths additionally rebase the Hessian by `1/(s_i·s_j)`.
+fn awq_scales_for(name: &str) -> Option<Vec<f32>> {
+    let alpha = AWQ_ALPHA.get().copied()?;
+    if alpha <= 0.0 || !awq_eligible(name) {
+        return None;
+    }
+    let im = imatrix_weights_for(name)?;
+    Some(compute_awq_scales(im, alpha))
 }
 
 /// Apply AWQ pre-scaling to a row-major [m, k] weight tensor in place:
@@ -6305,6 +6278,11 @@ fn main() {
             // state-spaces Mamba-2: pure Mamba-2 mixer stack. Uses the same
             // Mamba block machinery as nemotron_h but remains its own served arch.
             "mamba2" => 15,
+            // Zyphra ZAYA1 (CCA attention + EDA/MoD-routed MoE). Crate
+            // hipfire-arch-zaya (arch_id 16). Native checkpoint stores experts as
+            // stacked 3D `mlp.experts.{gate_up,down}_proj`, like Qwen3.5-MoE, so it
+            // rides the same is_moe 3D-split path below.
+            "zaya" => 16,
             other => {
                 eprintln!("Warning: unknown architecture '{other}', treating as llama");
                 0
@@ -6332,7 +6310,10 @@ fn main() {
     } else {
         eprintln!("Architecture: {arch_str} (id={arch_id})");
     }
-    let is_moe = arch_id == 6;
+    // arch_id 6 = Qwen3.5-MoE, 16 = ZAYA1: both store routed experts as stacked 3D
+    // `mlp.experts.{gate_up,down}_proj` tensors that the ingest path must split
+    // per-expert (see the 3D split gated on `is_moe`).
+    let is_moe = arch_id == 6 || arch_id == 16;
     // DeepSeek V4 (arch_id=9 post-2026-05-26 upstream merge that promoted
     // Qwen2-dense to 7 and dots.ocr to 8) is also MoE but ships per-expert
     // separate 2D tensors (`layers.L.ffn.experts.E.{w1,w2,w3}.weight`)
@@ -7603,12 +7584,28 @@ fn main() {
             let parent_owned = parent.to_string();
             let inner_shape_clone = inner_shape.clone();
             let base_owned = base_name.to_string();
-            let mut new_tensors: Vec<HfqTensor> = (0..n_experts)
+            // `HIPFIRE_NO_EXPERT_AWQ=1` suppresses per-expert AWQ smoothing (the
+            // experts fall back to plain MQ4/MQ8) — an A/B knob for measuring the
+            // expert-AWQ quality delta; does not affect dense tensors.
+            let no_expert_awq = std::env::var("HIPFIRE_NO_EXPERT_AWQ").ok().as_deref() == Some("1");
+            let nested: Vec<Vec<HfqTensor>> = (0..n_experts)
                 .into_par_iter()
                 .map(|x| {
                     let slice_off = x * inner_bytes;
                     let slice = &raw_data[slice_off..slice_off + inner_bytes];
-                    let f32_slice = to_f32(slice, &dtype);
+                    let mut f32_slice = to_f32(slice, &dtype);
+                    let expert_name = format!("{parent_owned}{x}.{base_owned}.weight");
+                    // mq4+ / oq-calibrated experts: SmoothQuant/AWQ from the per-expert
+                    // imatrix via the shared name-keyed path. Gated on AWQ_ALPHA (only the
+                    // `+` recipes set it) so base mq4/oq4 experts are byte-identical to
+                    // before; applied only in the plain MQ4/MQ8 arms below (the Lloyd/MQ6
+                    // arms calibrate their own way). Skipped on a length mismatch.
+                    let expert_awq: Option<Vec<f32>> = if no_expert_awq {
+                        None
+                    } else {
+                        awq_scales_for(&expert_name).filter(|s| s.len() == inner_k)
+                    };
+                    let m_expert = inner_shape_clone[0] as usize;
                     let (quantized, qt, gs) = if use_bf16 && dtype == "BF16" {
                         (slice.to_vec(), QuantType::BF16, 0u32)
                     } else if use_fp16 || use_bf16 {
@@ -7663,25 +7660,52 @@ fn main() {
                         let q = quantize_hfq4g256(&f32_slice);
                         (q, QuantType::HFQ4G256, 256u32)
                     } else if use_mq8g256 && supports_g256 {
+                        if let Some(s) = &expert_awq {
+                            awq_pre_scale_weights(&mut f32_slice, m_expert, inner_k, s);
+                        }
                         let q = quantize_mq8g256(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ8G256, 256u32)
                     } else if supports_g256 {
+                        if let Some(s) = &expert_awq {
+                            awq_pre_scale_weights(&mut f32_slice, m_expert, inner_k, s);
+                        }
                         let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ4G256, 256u32)
                     } else {
                         let q = quantize_hfq4g128(&f32_slice);
                         (q, QuantType::HFQ4G128, 128u32)
                     };
-                    HfqTensor {
-                        name: format!("{parent_owned}{x}.{base_owned}.weight"),
+                    let mut produced = vec![HfqTensor {
+                        name: expert_name.clone(),
                         quant_type: qt,
                         shape: inner_shape_clone.clone(),
                         group_size: gs,
                         data: quantized,
                         spilled_len: 0,
+                    }];
+                    // Emit the per-expert AWQ sidecar only when scales were actually
+                    // applied (the plain MQ4/MQ8 arms). The loader attaches it because
+                    // MQ4G256/MQ8G256 `supports_awq_sidecar()`; the gemv divides x/s.
+                    if let Some(s) = expert_awq {
+                        if matches!(qt, QuantType::MQ4G256 | QuantType::MQ8G256) {
+                            let sidecar_name = expert_name
+                                .strip_suffix(".weight")
+                                .map(|st| format!("{st}.awq_scale.weight"))
+                                .unwrap_or_else(|| format!("{expert_name}.awq_scale.weight"));
+                            produced.push(HfqTensor {
+                                name: sidecar_name,
+                                quant_type: QuantType::F16,
+                                shape: vec![s.len() as u32],
+                                group_size: 0,
+                                data: awq_scales_to_f16_bytes(&s),
+                                spilled_len: 0,
+                            });
+                        }
                     }
+                    produced
                 })
-                .collect();
+                .collect::<Vec<Vec<HfqTensor>>>();
+            let mut new_tensors: Vec<HfqTensor> = nested.into_iter().flatten().collect();
             quantized_params += inner_n as u64 * n_experts as u64;
             // Single eprintln to summarize the whole expert sweep.
             let label = if use_bf16 && meta.dtype == "BF16" {
