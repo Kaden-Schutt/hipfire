@@ -6294,6 +6294,39 @@
     }
 
     #[test]
+    fn oq4_oq8_round_trip_through_diffusion_decoder() {
+        // Encode with the hipfire-quantize oq codecs, decode with the diffusion
+        // CPU decoders. Guards that the diffusion decode (incl. inverse FWHT with
+        // the regenerated deterministic sign vectors) matches the encoder layout.
+        let signs1 = hipfire_quantize::gen_fwht_signs(OQ_FWHT_SEED1, 256);
+        let signs2 = hipfire_quantize::gen_fwht_signs(OQ_FWHT_SEED2, 256);
+        let data: Vec<f32> = (0..512)
+            .map(|i| ((i as f32 - 256.0) * 0.013).sin() * (1.0 + (i % 13) as f32 * 0.2))
+            .collect();
+        let sqnr = |orig: &[f32], rec: &[f32]| {
+            let (mut s, mut e) = (0.0f64, 0.0f64);
+            for (x, y) in orig.iter().zip(rec) {
+                s += (*x as f64) * (*x as f64);
+                e += ((*x - *y) as f64) * ((*x - *y) as f64);
+            }
+            10.0 * (s / e).log10()
+        };
+
+        let oq4 = hipfire_quantize::codecs::quantize_oq4g256(&data, &signs1, &signs2);
+        assert_eq!(oq4.len(), data.len().div_ceil(256) * 130);
+        let dec4 = decode_oq4g256_slice("t", &oq4, data.len()).unwrap();
+        let s4 = sqnr(&data, &dec4);
+        assert!(s4 > 15.0, "oq4 round-trip SQNR too low ({s4:.1} dB) — layout mismatch?");
+
+        let oq8 = hipfire_quantize::codecs::quantize_oq8g256(&data, &signs1, &signs2);
+        assert_eq!(oq8.len(), data.len().div_ceil(256) * 258);
+        let dec8 = decode_oq8g256_slice("t", &oq8, data.len()).unwrap();
+        let s8 = sqnr(&data, &dec8);
+        assert!(s8 > 30.0, "oq8 round-trip SQNR too low ({s8:.1} dB)");
+        assert!(s8 > s4, "oq8 ({s8:.1}) should beat oq4 ({s4:.1})");
+    }
+
+    #[test]
     fn q4k_encoder_round_trips_through_diffusion_decoder() {
         // The Q4_K encoder is ported from hipfire-quantize but the decoder is
         // hipfire_runtime::quant::dequantize_q4_k (a different crate) — this guards

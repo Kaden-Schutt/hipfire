@@ -37,6 +37,11 @@ pub const QT_DIFFUSION_TENSOR_Q4_K: u8 = 4;
 pub const QT_DIFFUSION_TENSOR_HFQ4_G256: u8 = 6;
 pub const QT_DIFFUSION_TENSOR_HFQ4_G128: u8 = 7;
 pub const QT_DIFFUSION_TENSOR_HFQ6_G256: u8 = 8;
+/// Opus Quant 4-bit, 256-group, FWHT-rotated (130 B/block: f16 scale + 128
+/// nibbles, range [-7,7]). Calibrated via hipfire_quantize::ldlq::oq4_ldlq_pack.
+pub const QT_DIFFUSION_TENSOR_OQ4_G256: u8 = 9;
+/// Opus Quant 8-bit, 256-group, FWHT-rotated (258 B/block: f16 scale + 256 i8).
+pub const QT_DIFFUSION_TENSOR_OQ8_G256: u8 = 10;
 pub const QT_DIFFUSION_TENSOR_BF16: u8 = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2388,9 +2393,11 @@ impl CpuTensor {
                 decode_hfq4_slice(name, &bytes, elem_count, 128, 72, "HFQ4G128")?
             }
             QT_DIFFUSION_TENSOR_HFQ6_G256 => decode_hfq6_g256_slice(name, &bytes, elem_count)?,
+            QT_DIFFUSION_TENSOR_OQ4_G256 => decode_oq4g256_slice(name, &bytes, elem_count)?,
+            QT_DIFFUSION_TENSOR_OQ8_G256 => decode_oq8g256_slice(name, &bytes, elem_count)?,
             other => {
                 return Err(DiffusionError::InvalidMetadata(format!(
-                    "tensor {name:?} has unsupported quant_type {other}; native diffusion tensor decoding currently supports Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G256, HFQ4G128, and HFQ6G256 tensor payloads. Other packed or quantized payloads require a diffusion dequantizer/runtime implementation"
+                    "tensor {name:?} has unsupported quant_type {other}; native diffusion tensor decoding currently supports Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G256, HFQ4G128, HFQ6G256, OQ4G256, and OQ8G256 tensor payloads. Other packed or quantized payloads require a diffusion dequantizer/runtime implementation"
                 )))
             }
         };

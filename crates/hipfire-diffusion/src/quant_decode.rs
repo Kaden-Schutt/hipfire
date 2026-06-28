@@ -175,6 +175,55 @@ pub(crate) fn decode_hfq6_g256_slice(
     Ok(out)
 }
 
+/// FWHT sign-vector seeds for the Opus Quant (oq4/oq8) rotated formats. These
+/// are the fixed seeds the hipfire-quantize encoders use
+/// (`gen_fwht_signs(42,256)` / `gen_fwht_signs(1042,256)`); decode regenerates
+/// them and applies the inverse rotation. Shared with the diffusion oq encoders.
+pub(crate) const OQ_FWHT_SEED1: u32 = 42;
+pub(crate) const OQ_FWHT_SEED2: u32 = 1042;
+
+/// Decode the FWHT-rotated oq4g256 format (130 B / 256-block). Reuses the
+/// hipfire-quantize reference decoder (single source of truth for the layout),
+/// regenerating the deterministic FWHT sign vectors.
+pub(crate) fn decode_oq4g256_slice(
+    name: &str,
+    bytes: &[u8],
+    elem_count: usize,
+) -> DiffusionResult<Vec<f32>> {
+    let expected_bytes = elem_count.div_ceil(256) * 130;
+    if bytes.len() < expected_bytes {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "OQ4_G256 tensor {name:?} has {} bytes but shape requires at least {expected_bytes}",
+            bytes.len()
+        )));
+    }
+    let signs1 = hipfire_quantize::gen_fwht_signs(OQ_FWHT_SEED1, 256);
+    let signs2 = hipfire_quantize::gen_fwht_signs(OQ_FWHT_SEED2, 256);
+    Ok(hipfire_quantize::codecs::dequant_oq4g256(
+        bytes, elem_count, &signs1, &signs2,
+    ))
+}
+
+/// Decode the FWHT-rotated oq8g256 format (258 B / 256-block).
+pub(crate) fn decode_oq8g256_slice(
+    name: &str,
+    bytes: &[u8],
+    elem_count: usize,
+) -> DiffusionResult<Vec<f32>> {
+    let expected_bytes = elem_count.div_ceil(256) * 258;
+    if bytes.len() < expected_bytes {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "OQ8_G256 tensor {name:?} has {} bytes but shape requires at least {expected_bytes}",
+            bytes.len()
+        )));
+    }
+    let signs1 = hipfire_quantize::gen_fwht_signs(OQ_FWHT_SEED1, 256);
+    let signs2 = hipfire_quantize::gen_fwht_signs(OQ_FWHT_SEED2, 256);
+    Ok(hipfire_quantize::codecs::dequant_oq8g256(
+        bytes, elem_count, &signs1, &signs2,
+    ))
+}
+
 pub(crate) fn decode_f32_slice(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(4)
