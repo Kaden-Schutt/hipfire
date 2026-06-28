@@ -895,6 +895,57 @@ extern "C" __global__ void diffusion_linear_f32(
 }
 "#;
 
+// Phase 3 — wave-per-row layer-norm. The naive kernel below recomputes the full
+// per-row mean+variance reduction inside every output thread (O(rows*cols^2)).
+// This assigns one wave (32 lanes) per row: lanes stride over cols, reduce via
+// __shfl for mean then variance, and write the row's outputs — O(rows*cols), no
+// LDS (wedge-safe on gfx1103). Used by the resident path; the naive kernel stays
+// for the preflight probe.
+pub(crate) const DIFFUSION_LAYER_NORM_ROWS_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void diffusion_layer_norm_rows_f32(
+    const float* input,
+    const float* weight,
+    const float* bias,
+    float* output,
+    int rows,
+    int cols,
+    float eps
+) {
+    int lane = threadIdx.x & 31;
+    int wave = threadIdx.x >> 5;
+    int row = blockIdx.x * (blockDim.x >> 5) + wave;
+    if (row >= rows) {
+        return;
+    }
+    long base = (long)row * cols;
+
+    float s = 0.0f;
+    for (int c = lane; c < cols; c += 32) {
+        s += input[base + c];
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        s += __shfl_down(s, off);
+    }
+    float mean = __shfl(s, 0) / (float)cols;
+
+    float vs = 0.0f;
+    for (int c = lane; c < cols; c += 32) {
+        float d = input[base + c] - mean;
+        vs += d * d;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        vs += __shfl_down(vs, off);
+    }
+    float inv_std = rsqrtf(__shfl(vs, 0) / (float)cols + eps);
+
+    for (int c = lane; c < cols; c += 32) {
+        output[base + c] = (input[base + c] - mean) * inv_std * weight[c] + bias[c];
+    }
+}
+"#;
+
 pub(crate) const DIFFUSION_LAYER_NORM_HIP_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 

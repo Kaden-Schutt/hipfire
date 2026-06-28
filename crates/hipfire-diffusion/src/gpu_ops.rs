@@ -3212,26 +3212,33 @@ pub(crate) fn layer_norm_resident(
     let output_elements = checked_shape_elements("layer_norm output", &input.shape)?;
     gpu.bind_thread()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output = alloc_resident_f32(gpu, &input.shape)?;
+    if output_elements == 0 || width == 0 {
+        return Ok(output);
+    }
     let weight_ptr = cache.resident_ptr(gpu, weight)?;
     let bias_ptr = cache.resident_ptr(gpu, bias)?;
-    let output = alloc_resident_f32(gpu, &input.shape)?;
+    // Wave-per-row two-pass normalization (O(rows*cols), no LDS).
+    let rows = output_elements / width;
+    const WAVES_PER_BLOCK: usize = 8;
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(input.buf.as_ptr());
     kernargs.push_ptr(weight_ptr);
     kernargs.push_ptr(bias_ptr);
     kernargs.push_ptr(output.buf.as_ptr());
-    kernargs.push_i32(i32_kernel_dim("layer_norm output elements", output_elements)?);
+    kernargs.push_i32(i32_kernel_dim("layer_norm rows", rows)?);
     kernargs.push_i32(i32_kernel_dim("layer_norm width", width)?);
     kernargs.push_f32(eps);
     kernargs.pad_to(16);
-    let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+    let blocks = rows.div_ceil(WAVES_PER_BLOCK);
+    let grid = [i32_kernel_dim("layer_norm grid", blocks)? as u32, 1, 1];
     ensure_and_launch_diffusion_kernel(
         gpu,
-        "diffusion_layer_norm_f32",
-        DIFFUSION_LAYER_NORM_HIP_SRC,
-        "diffusion_layer_norm_f32",
+        "diffusion_layer_norm_rows_f32",
+        DIFFUSION_LAYER_NORM_ROWS_HIP_SRC,
+        "diffusion_layer_norm_rows_f32",
         grid,
-        [256, 1, 1],
+        [(WAVES_PER_BLOCK * 32) as u32, 1, 1],
         0,
         &mut kernargs,
     )?;
