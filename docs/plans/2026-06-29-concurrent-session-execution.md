@@ -98,17 +98,25 @@ the `SequenceState` ownership question — we are building it now, not deferring
   `lfm2_prefill.rs`, `qwen35_prefill.rs`, `generate_arch.rs` (minimax etc.) and
   the generic `generate.rs` — ~91 `m.seq_pos` sites plus `conversation_tokens`.
   So C1 touches every arch's live hot path and needs multi-arch GPU validation
-  (not just qwen35/lfm2). Sub-steps:
-  - **C1a — accessor indirection (safe, behavior-preserving).** Add
-    `seq_pos()` / `set_seq_pos()` / `bump_seq_pos()` (+ `conversation_tokens*`)
-    to `LoadedModel`; migrate the ~91 `m.seq_pos` sites (S0-style mechanical
-    rename). The field stays; call sites are decoupled from it. Gate: workspace
-    build + coherence on ≥2 arches.
-  - **C1b — relocate behind the accessor.** Change the accessor internals to
-    read/write the *active session's* cursor (the saved session structs already
-    carry `seq_pos`/`conversation_tokens`), eliminating the working-copy field +
-    the take/restore swap of it. Validate coherence + multi-turn across
-    qwen35 / lfm2 / minimax / VL.
+  (not just qwen35/lfm2). Sub-steps (as built):
+  - **C1a — group into `SessionCursor` (DONE, 4a7619af8).** NOT accessor methods:
+    those borrow the whole `*m` and break the pervasive disjoint field borrows the
+    generation loop holds (`let tok = m.tokenizer…` across a seq_pos write) — 29
+    borrow conflicts, reverted. Instead grouped `LoadedModel::{seq_pos,
+    conversation_tokens}` → `cursor: SessionCursor`; `m.cursor.seq_pos` is a plain
+    field path, preserving disjoint borrows. 0 conflicts.
+  - **C1b-1 — unify the per-session structs to `cursor: SessionCursor`
+    (DONE, 6c84bbf32).** Qwen35/Lfm2RequestSessionState carry the same cursor
+    type; the swap moves one value. coherence-gate green (qwen35 + lfm2).
+  - **C1b-2 — eliminate the `m.cursor` working copy + swap: FOLDS INTO C2.** The
+    active session is decomposed into `LoadedModel` fields on activate
+    (`restore_into_loaded`: session.cursor→m.cursor, session.sequence_state→
+    m.sequence_state) and recomposed on save. Eliminating the working copy means
+    the forward reads the active session's cursor DIRECTLY — i.e. the active
+    session stays a cohesive resident struct (`m.<active>.cursor` /
+    `…sequence_state`) instead of decomposed. That forward-hot-path restructure
+    IS C2 (residency). So C1a + C1b-1 are the cursor PREP (done); the elimination
+    lands with C2.
 - **C2 — concurrent residency, serial step.** N sessions resident (arena reserve),
   decode them round-robin (no shared slot). Validate two concurrent sessions
   produce identical output to two serial runs.
