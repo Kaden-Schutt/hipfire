@@ -8990,15 +8990,14 @@ pub fn prefill_with_mtp_fill(
 
         // 2. Capture the last position's stream for the head on the last
         //    chunk, BEFORE mtp_forward_batched overwrites streams_batch.
-        let last_stream_pre_mtp: Option<rdna_compute::GpuTensor> = if is_last_chunk {
+        let last_stream_pre_mtp: Option<rdna_compute::OwnedTensor> = if is_last_chunk {
             let off = (chunk_size - 1) * stream_len;
             let src = pbs.streams_batch.sub_offset(off, stream_len);
-            let mut snap = gpu
-                .alloc_tensor(&[cfg.hc_mult, cfg.hidden_size], rdna_compute::DType::F32)
+            let snap = gpu
+                .alloc_owned(&[cfg.hc_mult, cfg.hidden_size], rdna_compute::DType::F32)
                 .map_err(|e| format!("alloc head_input_snap: {e:?}"))?;
             gpu.memcpy_dtod_auto(&snap.buf, &src.buf, stream_len * 4)
                 .map_err(|e| format!("d2d streams[last] → head_input_snap: {e:?}"))?;
-            snap.shape = vec![cfg.hc_mult, cfg.hidden_size];
             Some(snap)
         } else {
             None
@@ -9046,10 +9045,18 @@ pub fn prefill_with_mtp_fill(
                 let dst = pbs.streams_batch.sub_offset(off, stream_len);
                 gpu.memcpy_dtod_auto(&dst.buf, &snap.buf, stream_len * 4)
                     .map_err(|e| format!("d2d restore streams[last] for head: {e:?}"))?;
+                // `snap` (OwnedTensor) drops here on both the success and the `?`
+                // error path, enqueueing its pooled buffer to the deferred-free
+                // mailbox; reclaimed at the end of this chunk-loop iteration.
             }
             last_logits =
                 final_norm_and_head_last_batched(cfg, weights, state, pbs, gpu, chunk_size)?;
         }
+
+        // Return any `OwnedTensor` scratch (the `last_stream_pre_mtp` snapshot)
+        // dropped during this iteration to the pool. Self-gates on live graph
+        // state, so it is safe inside captured/spec paths.
+        gpu.reclaim_pending();
     }
     Ok(last_logits)
 }

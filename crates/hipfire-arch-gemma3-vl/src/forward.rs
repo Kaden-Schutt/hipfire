@@ -17,9 +17,21 @@
 //!
 //! Output `[num_patches=4096, hidden=1152]` feeds the multimodal projector
 //! (avg-pool → `mm_soft_emb_norm` → `mm_input_projection`), the next phase.
+//!
+//! ## Scratch lifetime (RAII via `OwnedTensor`)
+//!
+//! Every per-call scratch tensor is an [`OwnedTensor`]: dropping it (on success
+//! OR on any `?`-propagated error) enqueues its pooled buffer into the `Gpu`'s
+//! deferred-free mailbox. There are therefore NO manual `free_tensor` calls and
+//! NO error-path bookkeeping: plain `?` is leak-free. `gpu.reclaim_pending()` at
+//! the bottom of EACH layer-loop iteration returns that layer's scratch to the
+//! pool for reuse in the next layer (peak VRAM stays flat across all layers); a
+//! final `reclaim_pending()` returns the residual stream + patch-embed scratch.
+//! The only non-owned allocation is `out` — the result escapes to the caller, so
+//! it is a plain `GpuTensor` that never enters the mailbox.
 
 use hip_bridge::HipResult;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor, OwnedTensor};
 
 use crate::config::SigLipConfig;
 use crate::vision::SigLipWeights;
@@ -54,6 +66,9 @@ pub(crate) fn maybe_dump_stage(gpu: &mut Gpu, t: &GpuTensor, name: &str, shape: 
 /// scrambled every patch embedding: the patch-embed conv came out as the
 /// transpose of the correct values, breaking vision grounding entirely. Bisected
 /// against the HF SigLIP reference — see benchmarks/vision/diff_dumps.py.)
+///
+/// Returns an [`OwnedTensor`]: the caller owns the result and it frees itself on
+/// drop. `&y` deref-coerces to `&GpuTensor` at the kernel call sites.
 fn linear_f32(
     gpu: &mut Gpu,
     w: &GpuTensor,
@@ -62,8 +77,8 @@ fn linear_f32(
     out_dim: usize,
     in_dim: usize,
     n: usize,
-) -> HipResult<GpuTensor> {
-    let y = gpu.alloc_tensor(&[n * out_dim], DType::F32)?;
+) -> HipResult<OwnedTensor> {
+    let y = gpu.alloc_owned(&[n * out_dim], DType::F32)?;
     gpu.gemm_f32_batched(w, x, &y, out_dim, in_dim, n)?;
     gpu.bias_add_f32(&y, bias, n, out_dim)?;
     Ok(y)
@@ -76,6 +91,8 @@ fn linear_f32(
 /// already `[n, out]` (no transpose). On unified-memory gfx1151 this halves
 /// weight bandwidth — the dominant cost — and uses the WMMA units f32 GEMM
 /// can't. 108 of these run per image, so it's the tower's hot loop.
+///
+/// Returns an [`OwnedTensor`] (frees itself on drop). See `linear_f32`.
 fn linear_bf16(
     gpu: &mut Gpu,
     w_bf16: &GpuTensor,
@@ -84,8 +101,8 @@ fn linear_bf16(
     out_dim: usize,
     in_dim: usize,
     n: usize,
-) -> HipResult<GpuTensor> {
-    let y = gpu.alloc_tensor(&[n * out_dim], DType::F32)?;
+) -> HipResult<OwnedTensor> {
+    let y = gpu.alloc_owned(&[n * out_dim], DType::F32)?;
     gpu.gemm_bf16_x_bf16_wmma(w_bf16, x, &y, out_dim, in_dim, n)?;
     gpu.bias_add_f32(&y, bias, n, out_dim)?;
     Ok(y)
@@ -138,7 +155,7 @@ pub fn vision_forward(
     }
 
     // Patch embedding: linear(patch_embed_w [h, patch_dim]) + bias → [n, h].
-    let x_patches = gpu.upload_f32(patches, &[n * patch_dim])?;
+    let x_patches = gpu.upload_owned_f32(patches, &[n * patch_dim])?;
     maybe_dump_stage(gpu, &x_patches, "patches_raw", &[n, patch_dim]);
     let x = timed!(
         0,
@@ -152,7 +169,8 @@ pub fn vision_forward(
             n,
         )
     );
-    gpu.free_tensor(x_patches)?;
+    drop(x_patches); // scratch consumed — enqueue for the boundary reclaim.
+
     // + learned position embedding (fixed grid, direct add — no interpolation).
     timed!(3, gpu.add_inplace_f32(&x, &weights.pos_embed));
     // HF's `embeddings` hook captures patch+position embedding together; match it.
@@ -160,20 +178,23 @@ pub fn vision_forward(
 
     for (li, lw) in weights.layers.iter().enumerate() {
         // ── self-attention block (LN1 → attn → residual) ──
-        let tmp = gpu.alloc_tensor(&[n * h], DType::F32)?;
+        // Per-iteration scratch is `OwnedTensor`: it drops at the end of this
+        // loop body (or instantly on a `?` error), enqueueing for reclaim. No
+        // explicit frees, and any early `?` is leak-free.
+        let tmp = gpu.alloc_owned(&[n * h], DType::F32)?;
         timed!(
             2,
             gpu.layernorm_batched(&x, &lw.ln1_w, &lw.ln1_b, &tmp, n, h, eps)
         );
         let qkv = timed!(0, linear_bf16(gpu, &lw.qkv_w, &tmp, &lw.qkv_b, 3 * h, h, n));
-        gpu.free_tensor(tmp)?;
+        drop(tmp);
         // Bidirectional attention (no causal mask). Fast path on WMMA archs
         // (RDNA3/3.5/4): the f16-KV matrix-core flash, which needs head_dim=128 —
         // split the fused qkv into padded q(f32)/k(f16)/v(f16), run, then unpad
         // (~22× the generic kernel on this shape; zero-padded dims contribute
         // nothing to QKᵀ/PV). Fallback on non-WMMA archs: the generic bf16 flash
         // over the fused qkv directly.
-        let attn_out = gpu.alloc_tensor(&[n * h], DType::F32)?;
+        let attn_out = gpu.alloc_owned(&[n * h], DType::F32)?;
         // WMMA f16-KV flash by default (fast path). After the q-prescale fix
         // (correct 1/sqrt(head_dim) scale despite the kernel's fixed 1/sqrt(hdp))
         // this path is numerically equivalent to the generic bf16 flash —
@@ -186,9 +207,9 @@ pub fn vision_forward(
                 != Some("1");
         if use_wmma {
             let hdp = 128usize;
-            let q_pad = gpu.alloc_tensor(&[n * num_heads * hdp], DType::F32)?;
-            let k_pad = gpu.alloc_tensor(&[n * num_heads * hdp], DType::F16)?;
-            let v_pad = gpu.alloc_tensor(&[n * num_heads * hdp], DType::F16)?;
+            let q_pad = gpu.alloc_owned(&[n * num_heads * hdp], DType::F32)?;
+            let k_pad = gpu.alloc_owned(&[n * num_heads * hdp], DType::F16)?;
+            let v_pad = gpu.alloc_owned(&[n * num_heads * hdp], DType::F16)?;
             // The WMMA flash below bakes a fixed 1/sqrt(hdp) softmax scale, but
             // SigLIP's real head_dim (e.g. 72) != hdp (128). Pre-scale Q by
             // sqrt(hdp/head_dim) so the effective scale is the correct
@@ -201,42 +222,40 @@ pub fn vision_forward(
                     &qkv, &q_pad, &k_pad, &v_pad, n, h, num_heads, head_dim, hdp, q_scale,
                 )
             );
-            gpu.free_tensor(qkv)?;
-            let attn_pad = gpu.alloc_tensor(&[n * num_heads * hdp], DType::F32)?;
+            drop(qkv);
+            let attn_pad = gpu.alloc_owned(&[n * num_heads * hdp], DType::F32)?;
             timed!(
                 1,
                 gpu.attention_dflash_wmma_m64_n128_f16kv_v3_f32(
                     &q_pad, &k_pad, &v_pad, &attn_pad, n, n, num_heads, num_heads, hdp,
                 )
             );
-            gpu.free_tensor(q_pad)?;
-            gpu.free_tensor(k_pad)?;
-            gpu.free_tensor(v_pad)?;
+            drop(q_pad);
+            drop(k_pad);
+            drop(v_pad);
             timed!(
                 1,
                 gpu.attn_unpad(&attn_pad, &attn_out, n, num_heads, head_dim, hdp)
             );
-            gpu.free_tensor(attn_pad)?;
         } else {
-            let qkv_bf16 = gpu.alloc_tensor(&[n * 3 * h], DType::BF16)?;
+            let qkv_bf16 = gpu.alloc_owned(&[n * 3 * h], DType::BF16)?;
             timed!(1, gpu.cast_f32_to_bf16(&qkv, &qkv_bf16));
-            gpu.free_tensor(qkv)?;
+            drop(qkv);
             timed!(
                 1,
                 gpu.flash_attn_bf16(&qkv_bf16, &attn_out, n, h, num_heads, head_dim)
             );
-            gpu.free_tensor(qkv_bf16)?;
         }
         let proj = timed!(
             0,
             linear_bf16(gpu, &lw.out_w, &attn_out, &lw.out_b, h, h, n)
         );
-        gpu.free_tensor(attn_out)?;
+        drop(attn_out);
         timed!(3, gpu.add_inplace_f32(&x, &proj));
-        gpu.free_tensor(proj)?;
+        drop(proj);
 
         // ── MLP block (LN2 → fc1 → gelu-tanh → fc2 → residual) ──
-        let tmp2 = gpu.alloc_tensor(&[n * h], DType::F32)?;
+        let tmp2 = gpu.alloc_owned(&[n * h], DType::F32)?;
         timed!(
             2,
             gpu.layernorm_batched(&x, &lw.ln2_w, &lw.ln2_b, &tmp2, n, h, eps)
@@ -245,13 +264,19 @@ pub fn vision_forward(
             0,
             linear_bf16(gpu, &lw.fc1_w, &tmp2, &lw.fc1_b, inter, h, n)
         );
-        gpu.free_tensor(tmp2)?;
+        drop(tmp2);
         timed!(3, gpu.gelu_tanh_f32(&fc1, &fc1, n * inter));
         let fc2 = timed!(0, linear_bf16(gpu, &lw.fc2_w, &fc1, &lw.fc2_b, h, inter, n));
-        gpu.free_tensor(fc1)?;
+        drop(fc1);
         timed!(3, gpu.add_inplace_f32(&x, &fc2));
-        gpu.free_tensor(fc2)?;
+        drop(fc2);
         maybe_dump_stage(gpu, &x, &format!("block_{li:02}"), &[n, h]);
+        // Per-iteration reclaim: this layer's scratch (tmp/qkv/q_pad/…/fc2) goes
+        // back to the pool so the next layer reuses it — peak VRAM stays flat
+        // across the encoder's layers instead of growing with depth. No-op while
+        // a graph is live (self-gated); the residual stream `x` is still alive,
+        // so it is never reclaimed here.
+        gpu.reclaim_pending();
     }
 
     if profile {
@@ -265,10 +290,14 @@ pub fn vision_forward(
         );
     }
 
-    // Final post_layernorm → [n, h].
+    // Final post_layernorm → [n, h]. `out` is a PLAIN `GpuTensor` (not owned):
+    // it escapes to the caller, who frees it, so it must never enter the mailbox.
     let out = gpu.alloc_tensor(&[n * h], DType::F32)?;
     gpu.layernorm_batched(&x, &weights.post_ln_w, &weights.post_ln_b, &out, n, h, eps)?;
-    gpu.free_tensor(x)?;
+    drop(x); // residual stream scratch — enqueue before the reclaim below.
     maybe_dump_stage(gpu, &out, "pre_merger", &[n, h]);
+    // Boundary reclaim: return the residual stream `x` (and anything still queued)
+    // to the pool. No-op under capture.
+    gpu.reclaim_pending();
     Ok(out)
 }

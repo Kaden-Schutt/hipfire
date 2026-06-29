@@ -62,13 +62,22 @@ impl Gemma3VlBackend {
         let patches = preprocess_image_bytes(bytes, &self.vl_cfg.vision)?;
         let vis = vision_forward(gpu, &self.weights.vision, &self.vl_cfg.vision, &patches)
             .map_err(|e| format!("gemma3-vl: vision_forward: {e:?}"))?;
-        let img_embeds_gpu = project(gpu, &self.weights.projector, &self.vl_cfg, &vis)
-            .map_err(|e| format!("gemma3-vl: project: {e:?}"))?;
+        let img_embeds_gpu = match project(gpu, &self.weights.projector, &self.vl_cfg, &vis) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = gpu.free_tensor(vis);
+                return Err(format!("gemma3-vl: project: {e:?}"));
+            }
+        };
         gpu.free_tensor(vis)
             .map_err(|e| format!("gemma3-vl: free vis: {e:?}"))?;
-        let img_embeds = gpu
-            .download_f32(&img_embeds_gpu)
-            .map_err(|e| format!("gemma3-vl: download img_embeds: {e:?}"))?;
+        let img_embeds = match gpu.download_f32(&img_embeds_gpu) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = gpu.free_tensor(img_embeds_gpu);
+                return Err(format!("gemma3-vl: download img_embeds: {e:?}"));
+            }
+        };
         gpu.free_tensor(img_embeds_gpu)
             .map_err(|e| format!("gemma3-vl: free img_embeds: {e:?}"))?;
         Ok(img_embeds)
@@ -124,12 +133,17 @@ impl Gemma3VlBackend {
                 != Some("1");
 
         if batched {
+            // `x_batch`/`img_gpu` are per-call scratch held as `OwnedTensor`: each
+            // drops itself into the deferred-free mailbox on every exit (success
+            // OR any `?` error), so the splice loop + batched prefill use plain
+            // `?` (no IIFE, no error-path frees) and the `reclaim_pending()` after
+            // the branch returns both buffers to the pool before `decode_loop`.
             let dim = self.text_cfg.hidden_size; // == th for gemma3-vl
             let x_batch = gpu
-                .alloc_tensor(&[m * dim], DType::F32)
+                .alloc_owned(&[m * dim], DType::F32)
                 .map_err(|e| format!("gemma3-vl prefill x_batch alloc: {e:?}"))?;
             let img_gpu = gpu
-                .upload_f32(
+                .upload_owned_f32(
                     img_embeds,
                     &[n_images.max(1) * self.vl_cfg.mm_tokens_per_image * th],
                 )
@@ -169,8 +183,6 @@ impl Gemma3VlBackend {
                 0,
             )
             .map_err(|e| format!("gemma3-vl batched prefill: {e:?}"))?;
-            let _ = gpu.free_tensor(x_batch);
-            let _ = gpu.free_tensor(img_gpu);
         } else {
             let mut img_row = 0usize;
             for &id in &stream {
@@ -192,6 +204,11 @@ impl Gemma3VlBackend {
             }
         }
 
+        // Boundary reclaim: the batched branch's `x_batch`/`img_gpu` have dropped
+        // out of scope by here; return their buffers to the pool before the
+        // decode loop allocates its own scratch. No-op under graph capture and
+        // when the non-batched branch (which allocates no owned scratch) ran.
+        gpu.reclaim_pending();
         decode_loop(gpu, self, tok, eos, ctx, m, m)
     }
 }

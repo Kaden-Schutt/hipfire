@@ -18,7 +18,7 @@ use hipfire_runtime::calibration::{logsumexp, topk_logits};
 use hipfire_runtime::hfq::{load_awq_scale, HfqFile};
 use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::weights::WeightTensor;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor, OwnedTensor};
 
 /// quant_type byte → quantized linear `DType` (None ⇒ a plain precision handled
 /// by `dequant_qt`). Matches the hipfire-quantize QuantType discriminants.
@@ -592,10 +592,17 @@ fn z(gpu: &mut Gpu, n: usize) -> Result<GpuTensor, String> {
         .map_err(|e| format!("zaya alloc: {e:?}"))
 }
 
-/// 2D `[rows, d]` allocation — required for tensors fed to `rmsnorm_f32`, which
-/// reads `batch = shape[0]` and `n = shape.last()`.
-fn z2(gpu: &mut Gpu, rows: usize, d: usize) -> Result<GpuTensor, String> {
-    gpu.zeros(&[rows, d], DType::F32)
+/// RAII (`OwnedTensor`) analog of `z`: a uniquely-pooled 1D scratch buffer that
+/// returns itself to the deferred-free mailbox on drop (see `OwnedTensor`).
+fn zo(gpu: &mut Gpu, n: usize) -> Result<OwnedTensor, String> {
+    gpu.zeros_owned(&[n], DType::F32)
+        .map_err(|e| format!("zaya alloc: {e:?}"))
+}
+
+/// RAII analog of `z` for 2D `[rows, d]` scratch — required for tensors fed to
+/// `rmsnorm_f32`, which reads `batch = shape[0]` and `n = shape.last()`.
+fn z2o(gpu: &mut Gpu, rows: usize, d: usize) -> Result<OwnedTensor, String> {
+    gpu.zeros_owned(&[rows, d], DType::F32)
         .map_err(|e| format!("zaya alloc: {e:?}"))
 }
 
@@ -688,7 +695,7 @@ pub fn gpu_forward_serve(
     let attn_scale = 1.0 / (hd as f32).sqrt();
     let l2_scale = (hd as f32).sqrt();
 
-    let hidden = z2(gpu, s, h)?;
+    let hidden = z2o(gpu, s, h)?;
     for t in 0..s {
         let row = hidden.sub_offset(t * h, h);
         w.embed.embed_lookup(gpu, &row, ids[t], h)?;
@@ -697,32 +704,33 @@ pub fn gpu_forward_serve(
     gpu.zaya_affine_input_f32(&hidden, &hidden, &w.in_scale, &w.in_bias, h, s * h)
         .map_err(|e| format!("{e:?}"))?;
 
-    let normed = z2(gpu, s, h)?;
-    let q = z(gpu, s * q_dim)?;
-    let k = z(gpu, s * k_dim)?;
-    let vcur = z(gpu, s * v_half)?;
-    let vdel = z(gpu, s * v_half)?;
-    let qres = z(gpu, s * nq * hd)?;
-    let kres = z(gpu, s * nkv * hd)?;
-    let stream = z(gpu, conv_ch * (s + pad))?;
-    let dw = z(gpu, conv_ch * dw_len)?;
-    let gw = z(gpu, conv_ch * s)?;
-    let query = z(gpu, s * nq * hd)?;
-    let key = z(gpu, s * nkv * hd)?;
-    let value = z(gpu, s * nkv * hd)?;
-    let ctx = z(gpu, s * q_dim)?;
-    let attn_out = z(gpu, s * h)?;
-    let g_res2 = z2(gpu, s, h)?;
-    let rhid = z2(gpu, s, rh)?;
-    let rnormed = z2(gpu, s, rh)?;
-    let a1 = z2(gpu, s, rh)?;
-    let a2 = z2(gpu, s, rh)?;
-    let rlogits = z(gpu, s * n_route)?;
-    let moe_out = z(gpu, s * h)?;
-    let gate_up = z(gpu, 2 * moe_int)?;
-    let act = z(gpu, moe_int)?;
-    let down_t = z(gpu, h)?;
-    let router_state = z(gpu, s * rh)?;
+    let normed = z2o(gpu, s, h)?;
+    let q = zo(gpu, s * q_dim)?;
+    let k = zo(gpu, s * k_dim)?;
+    let vcur = zo(gpu, s * v_half)?;
+    let vdel = zo(gpu, s * v_half)?;
+    let qres = zo(gpu, s * nq * hd)?;
+    let kres = zo(gpu, s * nkv * hd)?;
+    let stream = zo(gpu, conv_ch * (s + pad))?;
+    let dw = zo(gpu, conv_ch * dw_len)?;
+    let gw = zo(gpu, conv_ch * s)?;
+    let query = zo(gpu, s * nq * hd)?;
+    let key = zo(gpu, s * nkv * hd)?;
+    let value = zo(gpu, s * nkv * hd)?;
+    let ctx = zo(gpu, s * q_dim)?;
+    let attn_out = zo(gpu, s * h)?;
+    let g_res2 = z2o(gpu, s, h)?;
+    let rhid = z2o(gpu, s, rh)?;
+    let rnormed = z2o(gpu, s, rh)?;
+    let a1 = z2o(gpu, s, rh)?;
+    let a2 = z2o(gpu, s, rh)?;
+    let rlogits = zo(gpu, s * n_route)?;
+    let moe_out = zo(gpu, s * h)?;
+    let gate_up = zo(gpu, 2 * moe_int)?;
+    let act = zo(gpu, moe_int)?;
+    let down_t = zo(gpu, h)?;
+    let router_state = zo(gpu, s * rh)?;
+    let fnorm = z2o(gpu, s, h)?;
 
     for (li, lw) in w.layers.iter().enumerate() {
         gpu.rmsnorm_f32(&hidden, &lw.input_ln, &normed, eps)
@@ -883,50 +891,18 @@ pub fn gpu_forward_serve(
             s * h,
         )
         .map_err(|e| format!("{e:?}"))?;
+        gpu.reclaim_pending();
     }
 
     // final norm on the last row → tied lm_head → logits_out [vocab]
-    let fnorm = z2(gpu, s, h)?;
     gpu.rmsnorm_f32(&hidden, &w.norm, &fnorm, eps)
         .map_err(|e| format!("{e:?}"))?;
     let last = fnorm.sub_offset((s - 1) * h, h);
     w.embed
         .gemv(gpu, &last, logits_out)
         .map_err(|e| format!("zaya lm_head: {e}"))?;
-    // Return all scratch to the pool (no DeviceBuffer Drop); reused next call.
-    for t in [
-        hidden,
-        normed,
-        q,
-        k,
-        vcur,
-        vdel,
-        qres,
-        kres,
-        stream,
-        dw,
-        gw,
-        query,
-        key,
-        value,
-        ctx,
-        attn_out,
-        g_res2,
-        rhid,
-        rnormed,
-        a1,
-        a2,
-        rlogits,
-        moe_out,
-        gate_up,
-        act,
-        down_t,
-        router_state,
-        fnorm,
-    ] {
-        let _ = gpu.free_tensor(t);
-    }
     state.pos = s;
+    gpu.reclaim_pending();
     Ok(())
 }
 
@@ -999,7 +975,7 @@ pub fn gpu_forward_calib(
     let attn_scale = 1.0 / (hd as f32).sqrt();
     let l2_scale = (hd as f32).sqrt();
 
-    let hidden = z2(gpu, s, h)?;
+    let hidden = z2o(gpu, s, h)?;
     for t in 0..s {
         let row = hidden.sub_offset(t * h, h);
         w.embed.embed_lookup(gpu, &row, ids[t], h)?;
@@ -1007,32 +983,33 @@ pub fn gpu_forward_calib(
     gpu.zaya_affine_input_f32(&hidden, &hidden, &w.in_scale, &w.in_bias, h, s * h)
         .map_err(|e| format!("{e:?}"))?;
 
-    let normed = z2(gpu, s, h)?;
-    let q = z(gpu, s * q_dim)?;
-    let k = z(gpu, s * k_dim)?;
-    let vcur = z(gpu, s * v_half)?;
-    let vdel = z(gpu, s * v_half)?;
-    let qres = z(gpu, s * nq * hd)?;
-    let kres = z(gpu, s * nkv * hd)?;
-    let stream = z(gpu, conv_ch * (s + pad))?;
-    let dw = z(gpu, conv_ch * dw_len)?;
-    let gw = z(gpu, conv_ch * s)?;
-    let query = z(gpu, s * nq * hd)?;
-    let key = z(gpu, s * nkv * hd)?;
-    let value = z(gpu, s * nkv * hd)?;
-    let ctx = z(gpu, s * q_dim)?;
-    let attn_out = z(gpu, s * h)?;
-    let g_res2 = z2(gpu, s, h)?;
-    let rhid = z2(gpu, s, rh)?;
-    let rnormed = z2(gpu, s, rh)?;
-    let a1 = z2(gpu, s, rh)?;
-    let a2 = z2(gpu, s, rh)?;
-    let rlogits = z(gpu, s * n_route)?;
-    let moe_out = z(gpu, s * h)?;
-    let gate_up = z(gpu, 2 * moe_int)?;
-    let act = z(gpu, moe_int)?;
-    let down_t = z(gpu, h)?;
-    let router_state = z(gpu, s * rh)?;
+    let normed = z2o(gpu, s, h)?;
+    let q = zo(gpu, s * q_dim)?;
+    let k = zo(gpu, s * k_dim)?;
+    let vcur = zo(gpu, s * v_half)?;
+    let vdel = zo(gpu, s * v_half)?;
+    let qres = zo(gpu, s * nq * hd)?;
+    let kres = zo(gpu, s * nkv * hd)?;
+    let stream = zo(gpu, conv_ch * (s + pad))?;
+    let dw = zo(gpu, conv_ch * dw_len)?;
+    let gw = zo(gpu, conv_ch * s)?;
+    let query = zo(gpu, s * nq * hd)?;
+    let key = zo(gpu, s * nkv * hd)?;
+    let value = zo(gpu, s * nkv * hd)?;
+    let ctx = zo(gpu, s * q_dim)?;
+    let attn_out = zo(gpu, s * h)?;
+    let g_res2 = z2o(gpu, s, h)?;
+    let rhid = z2o(gpu, s, rh)?;
+    let rnormed = z2o(gpu, s, rh)?;
+    let a1 = z2o(gpu, s, rh)?;
+    let a2 = z2o(gpu, s, rh)?;
+    let rlogits = zo(gpu, s * n_route)?;
+    let moe_out = zo(gpu, s * h)?;
+    let gate_up = zo(gpu, 2 * moe_int)?;
+    let act = zo(gpu, moe_int)?;
+    let down_t = zo(gpu, h)?;
+    let router_state = zo(gpu, s * rh)?;
+    let fnorm = z2o(gpu, s, h)?;
 
     for (li, lw) in w.layers.iter().enumerate() {
         gpu.rmsnorm_f32(&hidden, &lw.input_ln, &normed, eps)
@@ -1190,9 +1167,9 @@ pub fn gpu_forward_calib(
             s * h,
         )
         .map_err(|e| format!("{e:?}"))?;
+        gpu.reclaim_pending();
     }
 
-    let fnorm = z2(gpu, s, h)?;
     gpu.rmsnorm_f32(&hidden, &w.norm, &fnorm, eps)
         .map_err(|e| format!("{e:?}"))?;
     // capture the tied lm_head input (no gemv needed for the imatrix/Hessian).
@@ -1202,10 +1179,9 @@ pub fn gpu_forward_calib(
     // only the per-position logZ + top-k (a compact bf16 reference). The full
     // [s, vocab] host buffer is dropped here, so peak host memory is one row.
     let kldref = if let Some(topk) = kldref_topk {
-        let logits = z(gpu, s * cfg.vocab_size)?;
+        let logits = zo(gpu, s * cfg.vocab_size)?;
         gemv_seq(gpu, &w.embed, &fnorm, &logits, s, cfg.vocab_size, h)?;
         let host = gpu.download_f32(&logits).map_err(|e| format!("{e:?}"))?;
-        let _ = gpu.free_tensor(logits);
         let v = cfg.vocab_size;
         (0..s)
             .map(|p| {
@@ -1217,38 +1193,7 @@ pub fn gpu_forward_calib(
         Vec::new()
     };
 
-    for t in [
-        hidden,
-        normed,
-        q,
-        k,
-        vcur,
-        vdel,
-        qres,
-        kres,
-        stream,
-        dw,
-        gw,
-        query,
-        key,
-        value,
-        ctx,
-        attn_out,
-        g_res2,
-        rhid,
-        rnormed,
-        a1,
-        a2,
-        rlogits,
-        moe_out,
-        gate_up,
-        act,
-        down_t,
-        router_state,
-        fnorm,
-    ] {
-        let _ = gpu.free_tensor(t);
-    }
+    gpu.reclaim_pending();
     Ok(kldref)
 }
 
@@ -1288,7 +1233,7 @@ pub fn gpu_decode(
     let attn_scale = 1.0 / (hd as f32).sqrt();
     let l2_scale = (hd as f32).sqrt();
 
-    let hidden = z2(gpu, 1, h)?;
+    let hidden = z2o(gpu, 1, h)?;
     {
         let row = hidden.sub_offset(0, h);
         w.embed.embed_lookup(gpu, &row, token, h)?;
@@ -1298,34 +1243,35 @@ pub fn gpu_decode(
         .map_err(|e| format!("{e:?}"))?;
 
     // single-token scratch (s = 1)
-    let normed = z2(gpu, 1, h)?;
-    let q = z(gpu, q_dim)?;
-    let k = z(gpu, k_dim)?;
-    let vcur = z(gpu, v_half)?;
-    let vdel = z(gpu, v_half)?;
-    let qres = z(gpu, nq * hd)?;
-    let kres = z(gpu, nkv * hd)?;
-    let cur_qk = z(gpu, conv_ch)?;
-    let window = z(gpu, conv_ch * (pad + 1))?;
-    let dw = z(gpu, conv_ch * (pad + 1 - a.conv_depthwise_kernel + 1))?;
-    let gw = z(gpu, conv_ch)?;
-    let query = z(gpu, nq * hd)?;
-    let key = z(gpu, nkv * hd)?;
-    let value = z(gpu, nkv * hd)?;
-    let ctx = z(gpu, q_dim)?;
-    let attn_out = z(gpu, h)?;
-    let g_res2 = z2(gpu, 1, h)?;
-    let rhid = z2(gpu, 1, rh)?;
-    let rnormed = z2(gpu, 1, rh)?;
-    let a1 = z2(gpu, 1, rh)?;
-    let a2 = z2(gpu, 1, rh)?;
-    let rlogits = z(gpu, n_route)?;
-    let moe_out = z(gpu, h)?;
-    let gate_up = z(gpu, 2 * moe_int)?;
-    let act = z(gpu, moe_int)?;
-    let down_t = z(gpu, h)?;
-    let router_state = z(gpu, rh)?;
+    let normed = z2o(gpu, 1, h)?;
+    let q = zo(gpu, q_dim)?;
+    let k = zo(gpu, k_dim)?;
+    let vcur = zo(gpu, v_half)?;
+    let vdel = zo(gpu, v_half)?;
+    let qres = zo(gpu, nq * hd)?;
+    let kres = zo(gpu, nkv * hd)?;
+    let cur_qk = zo(gpu, conv_ch)?;
+    let window = zo(gpu, conv_ch * (pad + 1))?;
+    let dw = zo(gpu, conv_ch * (pad + 1 - a.conv_depthwise_kernel + 1))?;
+    let gw = zo(gpu, conv_ch)?;
+    let query = zo(gpu, nq * hd)?;
+    let key = zo(gpu, nkv * hd)?;
+    let value = zo(gpu, nkv * hd)?;
+    let ctx = zo(gpu, q_dim)?;
+    let attn_out = zo(gpu, h)?;
+    let g_res2 = z2o(gpu, 1, h)?;
+    let rhid = z2o(gpu, 1, rh)?;
+    let rnormed = z2o(gpu, 1, rh)?;
+    let a1 = z2o(gpu, 1, rh)?;
+    let a2 = z2o(gpu, 1, rh)?;
+    let rlogits = zo(gpu, n_route)?;
+    let moe_out = zo(gpu, h)?;
+    let gate_up = zo(gpu, 2 * moe_int)?;
+    let act = zo(gpu, moe_int)?;
+    let down_t = zo(gpu, h)?;
+    let router_state = zo(gpu, rh)?;
     let dw_len = pad + 1 - a.conv_depthwise_kernel + 1;
+    let fnorm = z2o(gpu, 1, h)?;
 
     for (li, lw) in w.layers.iter().enumerate() {
         gpu.rmsnorm_f32(&hidden, &lw.input_ln, &normed, eps)
@@ -1489,49 +1435,16 @@ pub fn gpu_decode(
             h,
         )
         .map_err(|e| format!("{e:?}"))?;
+        gpu.reclaim_pending();
     }
 
-    let fnorm = z2(gpu, 1, h)?;
     gpu.rmsnorm_f32(&hidden, &w.norm, &fnorm, eps)
         .map_err(|e| format!("{e:?}"))?;
     w.embed
         .gemv(gpu, &fnorm, logits_out)
         .map_err(|e| format!("zaya lm_head: {e}"))?;
-    // Return all scratch to the pool (no DeviceBuffer Drop); reused next decode step.
-    for t in [
-        hidden,
-        normed,
-        q,
-        k,
-        vcur,
-        vdel,
-        qres,
-        kres,
-        cur_qk,
-        window,
-        dw,
-        gw,
-        query,
-        key,
-        value,
-        ctx,
-        attn_out,
-        g_res2,
-        rhid,
-        rnormed,
-        a1,
-        a2,
-        rlogits,
-        moe_out,
-        gate_up,
-        act,
-        down_t,
-        router_state,
-        fnorm,
-    ] {
-        let _ = gpu.free_tensor(t);
-    }
     state.pos = pos + 1;
+    gpu.reclaim_pending();
     Ok(())
 }
 
@@ -1559,7 +1472,7 @@ pub fn gpu_forward_prefill(
     let pad = (a.conv_depthwise_kernel - 1) + (a.conv_grouped_kernel - 1);
 
     // ids → device i32, embed gather → input affine.
-    let hidden = z2(gpu, s, h)?;
+    let hidden = z2o(gpu, s, h)?;
     for t in 0..s {
         let row = hidden.sub_offset(t * h, h);
         w.embed.embed_lookup(gpu, &row, ids[t], h)?;
@@ -1570,43 +1483,45 @@ pub fn gpu_forward_prefill(
     let trace_embed = gpu.download_f32(&hidden).map_err(|e| format!("{e:?}"))?;
 
     let mut block_traces = Vec::with_capacity(cfg.num_blocks);
-    let mut router_state: Option<GpuTensor> = None;
 
     // reusable scratch
-    let normed = z2(gpu, s, h)?;
-    let q = z(gpu, s * q_dim)?;
-    let k = z(gpu, s * k_dim)?;
-    let vcur = z(gpu, s * v_half)?;
-    let vdel = z(gpu, s * v_half)?;
-    let qres = z(gpu, s * nq * hd)?;
-    let kres = z(gpu, s * nkv * hd)?;
-    let stream = z(gpu, conv_ch * (s + pad))?;
-    let dw = z(gpu, conv_ch * (s + pad - a.conv_depthwise_kernel + 1))?;
-    let gw = z(gpu, conv_ch * s)?;
-    let query = z(gpu, s * nq * hd)?;
-    let key = z(gpu, s * nkv * hd)?;
-    let value = z(gpu, s * nkv * hd)?;
-    let ctx = z(gpu, s * q_dim)?;
-    let attn_out = z(gpu, s * h)?;
-    let rhid = z2(gpu, s, rh)?;
-    let rnormed = z2(gpu, s, rh)?;
-    let a1 = z(gpu, s * rh)?;
-    let a2 = z(gpu, s * rh)?;
-    let rlogits = z(gpu, s * n_route)?;
-    let moe_out = z(gpu, s * h)?;
-    let gate_up = z(gpu, 2 * moe_int)?;
-    let act = z(gpu, moe_int)?;
-    let down_t = z(gpu, h)?;
+    let normed = z2o(gpu, s, h)?;
+    let q = zo(gpu, s * q_dim)?;
+    let k = zo(gpu, s * k_dim)?;
+    let vcur = zo(gpu, s * v_half)?;
+    let vdel = zo(gpu, s * v_half)?;
+    let qres = zo(gpu, s * nq * hd)?;
+    let kres = zo(gpu, s * nkv * hd)?;
+    let stream = zo(gpu, conv_ch * (s + pad))?;
+    let dw = zo(gpu, conv_ch * (s + pad - a.conv_depthwise_kernel + 1))?;
+    let gw = zo(gpu, conv_ch * s)?;
+    let query = zo(gpu, s * nq * hd)?;
+    let key = zo(gpu, s * nkv * hd)?;
+    let value = zo(gpu, s * nkv * hd)?;
+    let ctx = zo(gpu, s * q_dim)?;
+    let attn_out = zo(gpu, s * h)?;
+    let rhid = z2o(gpu, s, rh)?;
+    let rnormed = z2o(gpu, s, rh)?;
+    let a1 = zo(gpu, s * rh)?;
+    let a2 = zo(gpu, s * rh)?;
+    let rlogits = zo(gpu, s * n_route)?;
+    let moe_out = zo(gpu, s * h)?;
+    let gate_up = zo(gpu, 2 * moe_int)?;
+    let act = zo(gpu, moe_int)?;
+    let down_t = zo(gpu, h)?;
+    // Hoisted out of the layer loop (matches gpu_forward_serve/_calib): the
+    // post-attention residual scratch and the cross-layer router state are fully
+    // overwritten each layer, so one allocation reused across blocks suffices —
+    // no per-layer alloc churn, no leak.
+    let g_res2 = z2o(gpu, s, h)?;
+    let router_state = zo(gpu, s * rh)?;
     let attn_scale = 1.0 / (hd as f32).sqrt();
     let l2_scale = (hd as f32).sqrt();
     let dw_len = s + pad - a.conv_depthwise_kernel + 1;
+    let fnorm = z2o(gpu, s, h)?;
+    let logits = zo(gpu, s * cfg.vocab_size)?;
 
     for (li, lw) in w.layers.iter().enumerate() {
-        let residual = gpu.download_f32(&hidden).map_err(|e| format!("{e:?}"))?; // keep host copy for affine residual source
-        let g_residual = gpu
-            .upload_f32(&residual, &[s * h])
-            .map_err(|e| format!("{e:?}"))?;
-
         gpu.rmsnorm_f32(&hidden, &lw.input_ln, &normed, eps)
             .map_err(|e| format!("{e:?}"))?;
         // CCA projections
@@ -1668,12 +1583,13 @@ pub fn gpu_forward_prefill(
         gpu.zaya_gqa_attn_f32(&ctx, &query, &key, &value, s, nq, nkv, hd, attn_scale)
             .map_err(|e| format!("{e:?}"))?;
         gemv_seq(gpu, &lw.o_proj, &ctx, &attn_out, s, h, q_dim)?;
-        // residual = post_attention_residual_scale(attn_out, residual)
-        let g_res2 = z2(gpu, s, h)?;
+        // residual = post_attention_residual_scale(attn_out, residual). `hidden`
+        // is still the block input here (only overwritten by the post-MLP affine
+        // below), so it is the residual source — no host round-trip needed.
         gpu.zaya_affine_residual_f32(
             &g_res2,
             &attn_out,
-            &g_residual,
+            &hidden,
             &lw.pa_rs[0],
             &lw.pa_rs[1],
             &lw.pa_rs[2],
@@ -1691,19 +1607,14 @@ pub fn gpu_forward_prefill(
         gpu.zaya_bias_add_f32(&rhid, &lw.down_proj_b, rh, s * rh)
             .map_err(|e| format!("{e:?}"))?;
         if li != 0 {
-            if let (Some(scale), Some(prev)) =
-                (lw.router_states_scale.as_ref(), router_state.as_ref())
-            {
-                gpu.zaya_eda_add_f32(&rhid, prev, scale, rh, s * rh)
+            if let Some(scale) = lw.router_states_scale.as_ref() {
+                gpu.zaya_eda_add_f32(&rhid, &router_state, scale, rh, s * rh)
                     .map_err(|e| format!("{e:?}"))?;
             }
         }
-        // save next router state (copy of rhid)
-        let rhid_host = gpu.download_f32(&rhid).map_err(|e| format!("{e:?}"))?;
-        router_state = Some(
-            gpu.upload_f32(&rhid_host, &[s * rh])
-                .map_err(|e| format!("{e:?}"))?,
-        );
+        // save next router state via an on-device copy (no host round-trip).
+        gpu.zaya_write_at_f32(&router_state, &rhid, 0, s * rh)
+            .map_err(|e| format!("{e:?}"))?;
         // router_mlp
         gpu.rmsnorm_f32(&rhid, &lw.rnorm_w, &rnormed, eps)
             .map_err(|e| format!("{e:?}"))?;
@@ -1773,17 +1684,17 @@ pub fn gpu_forward_prefill(
         .map_err(|e| format!("{e:?}"))?;
         block_traces.push(gpu.download_f32(&hidden).map_err(|e| format!("{e:?}"))?);
         let _ = li;
+        gpu.reclaim_pending();
     }
 
     // final norm + tied lm_head
-    let fnorm = z2(gpu, s, h)?;
     gpu.rmsnorm_f32(&hidden, &w.norm, &fnorm, eps)
         .map_err(|e| format!("{e:?}"))?;
     let final_norm = gpu.download_f32(&fnorm).map_err(|e| format!("{e:?}"))?;
-    let logits = z(gpu, s * cfg.vocab_size)?;
     gemv_seq(gpu, &w.embed, &fnorm, &logits, s, cfg.vocab_size, h)?;
     let logits_host = gpu.download_f32(&logits).map_err(|e| format!("{e:?}"))?;
 
+    gpu.reclaim_pending();
     Ok(GpuTrace {
         embed_scaled: trace_embed,
         block: block_traces,
