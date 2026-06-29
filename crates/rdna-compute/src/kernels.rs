@@ -1202,6 +1202,17 @@ pub const GEMV_OQ4G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
 pub const GEMV_OQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
     include_str!("../../../kernels/src/gemv_oq4g256_moe_down_k8_indexed_batched_expanded.hip");
 
+/// OQ8G256 (Opus Quant W8 experts) indexed MoE GEMV family — the int8 runtime
+/// weight that OQ+ magnitude-tiered (OqPlusCompact, top-w8_frac int8 outliers)
+/// experts expand to at load. 260 B/group `[f32 scale | 256 int8]`, dequant
+/// `w = sc * (int8)`. Same indexed dispatch as the OQ4/HFQ4 siblings.
+pub const GEMV_OQ8G256_MOE_GATE_UP_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq8g256_moe_gate_up_indexed.hip");
+pub const GEMV_OQ8G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq8g256_moe_gate_up_indexed_batched.hip");
+pub const GEMV_OQ8G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq8g256_moe_down_k8_indexed_batched_expanded.hip");
+
 /// gfx1151 two-row probe for the atomic-free batched indexed MoE down path.
 /// Same math/output contract as
 /// `GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC`, but packs two

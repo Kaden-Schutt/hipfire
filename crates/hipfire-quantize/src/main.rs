@@ -7444,13 +7444,28 @@ fn main() {
                 // indexed gemv_oq4g256_moe_* kernels. Takes precedence over the MQ
                 // env knobs (which target MQ-base models). Per-expert LDLQ does not
                 // apply (no per-expert Hessian); AWQ pre-scaling above still holds.
+                //
+                // `--w8-top <frac>` promotes the top-frac (e.g. 0.01 = 1%) magnitude
+                // weights per group to int8 via OqPlusCompact (int4 bulk + sparse
+                // int8 outliers; loader expands to Oq8G256 → gemv_oq8g256_moe_*). The
+                // "important expert weights → OQ8++" tier from
+                // docs/plans/2026-06-23-oqplus-activation-quality.md.
                 let mm_oq4 = lfm2_oq_format.is_some();
+                let mm_w8_frac = OQPLUS_W8_FRAC.get().copied();
                 let (q, qt, label) = if mm_oq4 {
-                    (
-                        quantize_oq4g256(&f32_data, &signs1, &signs2),
-                        QuantType::Oq4G256,
-                        "OQ4-MM",
-                    )
+                    if let Some(frac) = mm_w8_frac {
+                        (
+                            quantize_oqplus_compact(&f32_data, &signs1, &signs2, frac),
+                            QuantType::OqPlusCompact,
+                            "OQ+C-MM",
+                        )
+                    } else {
+                        (
+                            quantize_oq4g256(&f32_data, &signs1, &signs2),
+                            QuantType::Oq4G256,
+                            "OQ4-MM",
+                        )
+                    }
                 } else if let Some(df) = down_fmt.as_deref() {
                     match df {
                         "mq6" => (

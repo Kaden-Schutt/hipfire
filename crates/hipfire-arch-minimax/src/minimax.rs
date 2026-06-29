@@ -206,7 +206,18 @@ fn load_mm_awq_scale(hfq: &HfqFile, gpu: &mut Gpu, name: &str, k: usize) -> Opti
 // the Opus iu8 grouped-WMMA kernel family `weight_gemv` already dispatches.
 const OQ4_QT: u8 = 34;
 const OQ8_QT: u8 = 35;
+const OQPLUS_COMPACT_QT: u8 = 36;
 const OQ_GROUP: usize = 256;
+
+/// Sign-extend a 4-bit nibble (0..15 → -8..7).
+fn sext4(nib: u8) -> i8 {
+    let v = (nib & 0x0f) as i8;
+    if v > 7 {
+        v - 16
+    } else {
+        v
+    }
+}
 
 fn oq4_arch_combined_len(m: usize, k: usize) -> usize {
     let ng = k / OQ_GROUP;
@@ -327,6 +338,56 @@ fn oq4_ondisk_to_moe_blocks(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, 
         let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
         out[dst..dst + 4].copy_from_slice(&scale.to_le_bytes());
         out[dst + 4..dst + DST_BLK].copy_from_slice(&data[src + 2..src + SRC_BLK]);
+    }
+    Ok(out)
+}
+
+/// Expand one expert's on-disk OqPlusCompact tensor (qt=36; per group
+/// `[f16 scale | 128 int4 nibbles | N_out × (u8 idx, i8 val)]`, 130 + 2·N_out B)
+/// into the OQ8 indexed-MoE kernel layout (260 B `[f32 scale | 256 int8]`). The
+/// int4 bulk is sign-extended into int8 and the sparse int8 outliers overlaid —
+/// this is the "top-w8_frac weights → int8" tier expanded to a uniform int8
+/// runtime weight `gemv_oq8g256_moe_*` reads. N_out is derived from the block
+/// stride (uniform across a layer's experts at a fixed w8_frac).
+fn oqplus_compact_to_moe_oq8_blocks(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
+    const DST_BLK: usize = 260; // [f32 scale | 256 int8]
+    if k % OQ_GROUP != 0 {
+        return Err(format!("OQ+C expert requires K % 256 == 0 (got K={k})"));
+    }
+    let ng = k / OQ_GROUP;
+    let n_groups = m * ng;
+    if n_groups == 0 || data.is_empty() || data.len() % n_groups != 0 {
+        return Err(format!(
+            "OQ+C expert byte length {} not divisible by n_groups {n_groups} (M={m} K={k})",
+            data.len()
+        ));
+    }
+    let block_bytes = data.len() / n_groups;
+    if block_bytes < 132 || (block_bytes - 130) % 2 != 0 {
+        return Err(format!(
+            "OQ+C expert block_bytes {block_bytes} invalid (expected 130 + 2·N_out)"
+        ));
+    }
+    let n_out = (block_bytes - 130) / 2;
+    let mut out = vec![0u8; n_groups * DST_BLK];
+    for blk in 0..n_groups {
+        let src = blk * block_bytes;
+        let dst = blk * DST_BLK;
+        let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+        out[dst..dst + 4].copy_from_slice(&scale.to_le_bytes());
+        // int4 bulk → int8 (the kernel reads bytes as signed char).
+        for i in 0..128 {
+            let byte = data[src + 2 + i];
+            out[dst + 4 + 2 * i] = sext4(byte & 0x0f) as u8;
+            out[dst + 4 + 2 * i + 1] = sext4(byte >> 4) as u8;
+        }
+        // Overlay the sparse int8 outliers.
+        let tbl = src + 130;
+        for s in 0..n_out {
+            let idx = data[tbl + 2 * s] as usize;
+            let val = data[tbl + 2 * s + 1];
+            out[dst + 4 + idx] = val;
+        }
     }
     Ok(out)
 }
@@ -564,14 +625,22 @@ impl MiniMaxWeights {
                 let (qt1, w1) = read_tensor(hfq, &format!("{ep}.w1.weight"))?;
                 let (_qt3, w3) = read_tensor(hfq, &format!("{ep}.w3.weight"))?;
                 let (qt2, w2) = read_tensor(hfq, &format!("{ep}.w2.weight"))?;
-                // OQ4 experts ship as on-disk OQ4G256 (130 B blocks); repack each
-                // into the 132 B indexed-MoE kernel layout before fusing. w1/w3 are
+                // OQ experts ship on-disk and are repacked per expert into the
+                // indexed-MoE kernel layout before fusing. OQ4G256 (130 B) → 132 B
+                // int4 blocks; OqPlusCompact (qt=36) expands int4-bulk+int8-outliers
+                // → 260 B int8 blocks (top-w8_frac → int8 tier). w1/w3 are
                 // [inter, hidden]; w2 is [hidden, inter].
                 let (w1, w3, w2) = if qt1 == OQ4_QT {
                     (
                         oq4_ondisk_to_moe_blocks(&w1, inter, hidden)?,
                         oq4_ondisk_to_moe_blocks(&w3, inter, hidden)?,
                         oq4_ondisk_to_moe_blocks(&w2, hidden, inter)?,
+                    )
+                } else if qt1 == OQPLUS_COMPACT_QT {
+                    (
+                        oqplus_compact_to_moe_oq8_blocks(&w1, inter, hidden)?,
+                        oqplus_compact_to_moe_oq8_blocks(&w3, inter, hidden)?,
+                        oqplus_compact_to_moe_oq8_blocks(&w2, hidden, inter)?,
                     )
                 } else {
                     (w1, w3, w2)
@@ -617,12 +686,16 @@ impl MiniMaxWeights {
             // repack. Other dtypes (MQ*) are byte-identical on disk → kernel.
             let mut gate_up = if qt_gu == OQ4_QT {
                 upload_wt_oq(gpu, &gu_combined, DType::Oq4G256, 2 * inter, hidden)
+            } else if qt_gu == OQPLUS_COMPACT_QT {
+                upload_wt_oq(gpu, &gu_combined, DType::Oq8G256, 2 * inter, hidden)
             } else {
                 wt_from_raw(gpu, qt_gu, &gu_combined, 2 * inter, hidden)
             }
             .map_err(|e2| format!("minimax: pack gate_up L{l}: {e2}"))?;
             let mut down = if qt_dn == OQ4_QT {
                 upload_wt_oq(gpu, &dn_combined, DType::Oq4G256, hidden, inter)
+            } else if qt_dn == OQPLUS_COMPACT_QT {
+                upload_wt_oq(gpu, &dn_combined, DType::Oq8G256, hidden, inter)
             } else {
                 wt_from_raw(gpu, qt_dn, &dn_combined, hidden, inter)
             }
