@@ -17,15 +17,53 @@
     .wrap { width: min(1100px, 100%); margin: 0 auto; padding: 20px 24px 40px; }
     h1 { font-size: 18px; font-weight: 650; margin: 0 0 4px; }
     .sub { color: var(--muted); font-size: 12px; margin: 0 0 18px; }
+    .section { font-size: 12px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); margin: 22px 0 10px; }
     .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
     .card { border: 1px solid var(--line); background: var(--panel); border-radius: 10px; padding: 14px 16px; }
-    .card h2 { margin: 0 0 10px; font-size: 14px; color: var(--accent); }
+    .card .head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0 0 10px; }
+    .card h2 { margin: 0; font-size: 14px; color: var(--accent); }
+    .badge { font-size: 10px; font-weight: 600; letter-spacing: .03em; text-transform: uppercase; color: var(--muted);
+             border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; white-space: nowrap; }
+    .badge.apu { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
     .metric { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid var(--line); }
     .metric:last-child { border-bottom: 0; }
     .metric .k { color: var(--muted); }
     .metric .v { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    /* Reusable memory-pool row: label + used/total + percent + fill bar. */
+    .memrow { margin: 8px 0; }
+    .memrow.primary .memhead .k { color: var(--text); font-weight: 600; }
+    .memrow.muted .memhead .k, .memrow.muted .memhead .v { color: var(--muted); }
+    .memhead { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+    .memhead .k { color: var(--muted); }
+    .memhead .v { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .memhead .pct { color: var(--muted); margin-left: 6px; }
     .bar { height: 6px; border-radius: 4px; background: var(--line); margin-top: 6px; overflow: hidden; }
     .bar > span { display: block; height: 100%; background: var(--accent); }
+    .bar[data-level="warn"] > span { background: var(--warn); }
+    .bar[data-level="crit"] > span { background: #ef4444; }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+    .chip { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 6px; padding: 2px 7px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    /* Usage trend sparklines: one rolling-window SVG per metric. */
+    .trend { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+    .trend .tlabel { font-size: 10px; text-transform: uppercase; letter-spacing: .03em; color: var(--muted);
+                     width: 30px; flex: none; }
+    .spark { flex: 1; height: 26px; display: block; }
+    .spark .area { stroke: none; fill: color-mix(in srgb, var(--accent) 16%, transparent); }
+    .spark .line { fill: none; stroke: var(--accent); stroke-width: 1.4; vector-effect: non-scaling-stroke; }
+    .spark.warn .area { fill: color-mix(in srgb, var(--warn) 16%, transparent); }
+    .spark.warn .line { stroke: var(--warn); }
+    .spark.crit .area { fill: color-mix(in srgb, #ef4444 18%, transparent); }
+    .spark.crit .line { stroke: #ef4444; }
+    .stale { color: var(--warn); font-size: 11px; margin-left: 8px; }
+    .badge.crit { color: #ef4444; border-color: color-mix(in srgb, #ef4444 50%, var(--line)); }
+    /* GPU-process table */
+    table.clients { width: 100%; border-collapse: collapse; font-size: 12px; }
+    table.clients th { text-align: left; color: var(--muted); font-weight: 600; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+    table.clients td { padding: 4px 8px; border-bottom: 1px solid var(--line); }
+    table.clients tr:last-child td { border-bottom: 0; }
+    table.clients .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    table.clients .num { text-align: right; }
     .err { color: var(--warn); }
   </style>
 </head>

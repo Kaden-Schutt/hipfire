@@ -1790,6 +1790,7 @@ dependencies = [
  "hipfire-runtime",
  "hipfire-scheduler",
  "hipfire-state",
+ "hipfire-sysinfo",
  "image",
  "reqwest",
  "rust-embed",
@@ -1844,6 +1845,14 @@ dependencies = [
  "hipfire-model",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "hipfire-sysinfo"
+version = "0.3.0"
+dependencies = [
+ "hipfire-admin-types",
+ "hipfire-xdna",
 ]
 
 [[package]]
