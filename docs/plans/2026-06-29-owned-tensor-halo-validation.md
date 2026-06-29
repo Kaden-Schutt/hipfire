@@ -36,7 +36,10 @@ That yields three behaviors the validation must each hit:
 
 ```bash
 cd <hipfire repo on halo>
-export HIP_VISIBLE_DEVICES=1          # gfx1151 is HIP device 1 on halo
+export HIP_VISIBLE_DEVICES=0          # gfx1151 is HIP device 0 on halo (single-GPU APU;
+                                      # =1 selects a nonexistent device → hipInit code 100
+                                      # "no ROCm-capable device". card1 is the DRM node, not
+                                      # the HIP index. Verified on halo 2026-06-29.)
 git rev-parse --abbrev-ref HEAD       # confirm the OwnedTensor branch is checked out
 
 # Build the CLI (provides `hipfire lock` + `hipfire detect` + `hipfire eval`/`chat`):
@@ -73,9 +76,9 @@ Already green in-session; re-run on halo's toolchain as a baseline.
 
 ### qwen35 spec-decode (R3) — the primary correctness gate
 ```bash
-HIP_VISIBLE_DEVICES=1 HIPFIRE_DIR=$HOME/.hipfire ./tests/coherence-gate-dflash.sh          # short: 4 cases
-HIP_VISIBLE_DEVICES=1 HIPFIRE_DIR=$HOME/.hipfire ./tests/coherence-gate-dflash.sh --fast    # 2 cases, ~1 min
-HIP_VISIBLE_DEVICES=1 HIPFIRE_DIR=$HOME/.hipfire ./tests/coherence-gate-dflash.sh --full     # + ddtree b22-k4, b8-k2
+HIP_VISIBLE_DEVICES=0 HIPFIRE_DIR=$HOME/.hipfire ./tests/coherence-gate-dflash.sh          # short: 4 cases
+HIP_VISIBLE_DEVICES=0 HIPFIRE_DIR=$HOME/.hipfire ./tests/coherence-gate-dflash.sh --fast    # 2 cases, ~1 min
+HIP_VISIBLE_DEVICES=0 HIPFIRE_DIR=$HOME/.hipfire ./tests/coherence-gate-dflash.sh --full     # + ddtree b22-k4, b8-k2
 ```
 - Self-acquires the GPU lock; auto-rebuilds `dflash_spec_demo` (`--features deltanet`).
 - Needs a 27B target+draft pair under `~/.hipfire/models` + `~/.hipfire/drafts`
@@ -130,7 +133,7 @@ cargo run --release -p hipfire-arch-zaya --example generate -- <zaya.hfq> 32
 ### R3 — replay-graph spec-decode (reclaim gated; watch peak VRAM)
 ```bash
 # Canonical (see §2). Manual single run (wrap in lock yourself):
-HIP_VISIBLE_DEVICES=1 ./target/release/examples/dflash_spec_demo \
+HIP_VISIBLE_DEVICES=0 ./target/release/examples/dflash_spec_demo \
   --target ~/.hipfire/models/qwen3.6-27b-mq4.hfq --draft ~/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq \
   --prompt 'The Roman Empire, at its height, stretched from' --max 192
 ```
@@ -156,10 +159,10 @@ reclaimed too early).
 Strongest signal for a lifetime-only change is bit/KLD parity vs the *pre-migration*
 build. Pin the lock, then:
 ```bash
-HIP_VISIBLE_DEVICES=1 ./target/release/hipfire eval <model>.hfq \
+HIP_VISIBLE_DEVICES=0 ./target/release/hipfire eval <model>.hfq \
   --compare <model>.hfq --battery coherence,quality,speed
 # higher-precision reference comparison (KLD wired via eval `kldref`):
-HIP_VISIBLE_DEVICES=1 ./target/release/hipfire eval <candidate>.hfq --reference <bf16-or-q8>.hfq --battery coherence,perplexity
+HIP_VISIBLE_DEVICES=0 ./target/release/hipfire eval <candidate>.hfq --reference <bf16-or-q8>.hfq --battery coherence,perplexity
 ```
 Cleanest A/B: build the pre-change commit into a second checkout, run the same
 prompt set through both, and `diff` the emitted token ids / logits. `gpu_golden`
@@ -184,21 +187,42 @@ measure indirectly:
 - Compare the R3 `vram_used_mb` against an R1/R2 run of the same model; a large,
   step-monotonic delta in R3 is the held-scratch cost.
 
-> ⚠ **APU measurement caveat (must confirm on halo first).** On gfx1151,
-> `hipMemGetInfo` / `rocm-smi --showmeminfo vram` / sysfs `mem_info_vram_total`
-> report only the small dedicated **carveout**, not the GTT pool the runtime
-> actually allocates from (`crates/hipfire-server/src/telemetry.rs:3-6`). So the
-> printed "VRAM used" may **not move** when scratch is held in GTT. The node that
-> would actually show GTT occupancy is `mem_info_gtt_used`, which the repo reads
-> **nowhere** (only `mem_info_gtt_total`). Before trusting §5, check on halo whether
-> these move across model load:
+> ✅ **APU measurement: RESOLVED on halo (verified 2026-06-29).** `mem_info_gtt_used`
+> **exists** on `card1` and **does** track real occupancy, so §5 is directly
+> measurable — no need to fall back to code-reading. Caveats that still hold:
+> - `hipMemGetInfo` / `rocm-smi --showmeminfo vram` / sysfs `mem_info_vram_total`
+>   report only the **512 MiB dedicated carveout** (`mem_info_vram_total` =
+>   536870912 on halo), *not* the pool the runtime uses. Don't trust the "VRAM"
+>   readouts; they won't move when scratch is held.
+> - **gfx1151 has no real VRAM — it's a UMA APU.** `mem_info_gtt_total` =
+>   128,849,018,880 bytes = **exactly 120.00 GiB**, and that pool **is system RAM**
+>   (BIOS caps GTT at a round 120 GiB out of `MemTotal` ≈ 124.94 GiB, leaving ~5 GiB
+>   + the 512 MiB carveout for the kernel). Mind the units: HIP/`dflash_spec_demo`
+>   print this as **"free 128.85 GB"** (bytes ÷ 10⁹), which looks *larger* than the
+>   "128 GB" sticker but is the **same 120 GiB** — it never exceeds RAM. That number
+>   is the GTT *ceiling*, **not** a discrete GPU budget; real headroom is
+>   `free`/`available` RAM minus everything else (~109 GiB in practice). So the §5
+>   "8 GB-class budget" phrasing above does **not** apply to halo; the constraint is
+>   the shared 120 GiB GTT, and large *contiguous* hipMalloc is the real hazard
+>   (see the 397B deadlock note), not aggregate peak.
+>
+> Working sampler (used in the in-session validation): poll the GTT node at ~20 Hz
+> for the run's duration and record base/high-water (deltas are what matter — the
+> node reports absolute bytes):
 > ```bash
-> cat /sys/class/drm/card*/device/mem_info_gtt_used /sys/class/drm/card*/device/mem_info_gtt_total
+> NODE=/sys/class/drm/card1/device/mem_info_gtt_used
+> base=$(cat $NODE); hi=$base
+> ( CMD & pid=$!; while kill -0 $pid 2>/dev/null; do
+>     v=$(cat $NODE); [ "$v" -gt "$hi" ] && hi=$v; sleep 0.05; done
+>   echo "base=$((base/1048576))MB high=$((hi/1048576))MB delta=$(((hi-base)/1048576))MB" )
 > ```
-> If `mem_info_gtt_used` exists and tracks occupancy, sample it in a `while` loop
-> during an R3 run to catch the held-scratch high-water. If neither VRAM nor GTT
-> readouts move, the held-scratch concern is only provable by code reading
-> (the gate at `mod.rs:2281`) and the practical risk is low.
+> In-session result: R1 (direct) and R2 (captured) hit the **same** peak (2954 MB,
+> qwen35-4b); R3 (27B spec-decode) peaked at 17076 MB with only a **+544 MB**
+> post-load drift that plateaus — the held-scratch cost is bounded, not monotonic.
+> `rocprofv3 --memory-allocation-trace` corroborates: R1 and R2 emit byte-identical
+> driver allocations (359 allocs / 2670 MB), and pool-level reclaim (return to the
+> free-list, not the driver) is invisible to it by design, so GTT sampling is the
+> right high-water probe.
 
 **If peak proves too high** on a constrained config: drain at graph-invalidation
 points, or keep manual frees on the specific R3 (spec-decode) transients — those
@@ -224,8 +248,10 @@ sites are noted in the design doc and were the lowest-value conversions anyway.
   (`/home/sadara/zaya1-8b-native.*`); the bf16 model + fp32 golden dump must be
   staged on halo for `gpu_golden`. `gpu_forward_calib` (zaya) is the calibration
   path, reached via `hipfire collect-artifacts` (exact invocation unconfirmed).
-- **APU VRAM observability** (§5 caveat) — confirm which sysfs/HIP node actually
-  reflects GTT occupancy before relying on the VRAM arm.
+- ~~**APU VRAM observability** (§5 caveat)~~ — **RESOLVED 2026-06-29**:
+  `mem_info_gtt_used` (card1) tracks occupancy; the `mem_info_vram_*` / `hipMemGetInfo`
+  nodes only see the 512 MiB carveout. Sample the GTT node (recipe in §5). The
+  120 GiB "VRAM" HIP reports is shared system RAM, not a discrete budget.
 - **Follow-up (not part of this validation):** deepseek4 `attention_block_*`
   `debug_max`/`debug_sumexp` pre-existing dev-gated (`HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT`)
   pool leak.
