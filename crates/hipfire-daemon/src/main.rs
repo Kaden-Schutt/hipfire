@@ -4558,8 +4558,8 @@ fn main() {
                 // RoPE phase restarts from zero for the fresh conversation.
                 if let Some(ref mut m) = model {
                     generic_state_arena.release_worker(&target_worker_id);
-                    m.seq_pos = 0;
-                    m.conversation_tokens.clear();
+                    m.cursor.seq_pos = 0;
+                    m.cursor.conversation_tokens.clear();
                     m.q35_registry.sessions.clear();
                     m.q35_registry.active_session_id = if is_qwen35_family_arch_id(m.arch_id)
                         && m.pp == 1
@@ -5821,8 +5821,8 @@ fn main() {
 
                 // Reset state BEFORE timing so we're measuring cold prefill, not
                 // prefill-on-top-of-prior-state.
-                m.seq_pos = 0;
-                m.conversation_tokens.clear();
+                m.cursor.seq_pos = 0;
+                m.cursor.conversation_tokens.clear();
                 if let Some(dn) = m
                     .sequence_state
                     .as_ref()
@@ -5994,8 +5994,8 @@ fn main() {
 
                 // Reset state AFTER measurement — we've written N KV slots and a
                 // DeltaNet state that the next real request must not inherit.
-                m.seq_pos = 0;
-                m.conversation_tokens.clear();
+                m.cursor.seq_pos = 0;
+                m.cursor.conversation_tokens.clear();
                 if let Some(dn) = m
                     .sequence_state
                     .as_ref()

@@ -39,6 +39,7 @@ use hipfire_state::ModelArtifactMemory;
 #[cfg(feature = "arch-lfm2moe")]
 use crate::session::Lfm2RequestSessionState;
 use crate::session::Qwen35RequestSessionState;
+use crate::session::SessionCursor;
 use crate::session::SessionRegistry;
 
 /// CASK/TriAttention params forwarded by the CLI at load time. Zero-initialized
@@ -350,7 +351,11 @@ pub struct LoadedModel {
     // passed to `forward_scratch(..., pos, ...)`). With no eviction, physical
     // == absolute, so seq_pos simply grows. Under eviction, seq_pos is bounded
     // to `physical_cap`; absolute position = seq_pos + kv.compact_offset.
-    pub seq_pos: usize,
+    //
+    // C1a: `seq_pos` + `conversation_tokens` are grouped into `cursor`
+    // (`SessionCursor`) — the active session's working cursor as one relocatable,
+    // disjoint-borrowable value (see `SessionCursor`).
+    pub cursor: SessionCursor,
     /// Advertised context window — client-facing capacity, the upper bound on
     /// absolute conversation length. Without eviction this equals
     /// `physical_cap` (the buffer size); under eviction it can be much larger.
@@ -364,7 +369,6 @@ pub struct LoadedModel {
     /// and every decode-forward so the physical cache stays bounded by
     /// `physical_cap` even when `max_seq` advertises a much larger window.
     pub eviction: Option<Eviction>,
-    pub conversation_tokens: Vec<u32>, // full token history for repeat penalty
 
     /// Per-turn token cache for V4F prefix-cache stability.
     ///
