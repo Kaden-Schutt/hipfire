@@ -21,9 +21,15 @@
 //! `moe_scatter/unscatter/down_combine_k8` family.
 
 pub mod arch;
+pub mod calibration;
 pub mod forward;
 pub mod kld;
 pub mod minimax;
+
+/// MiniMax-M2 architecture id (see `docs/architecture-ids.md` and
+/// `hipfire_model::ARCH_ID_MINIMAX_M2`). Mirrors `crate::ARCH_ID` in the other
+/// arch crates so calibration tags the `.calib.hfq` consistently.
+pub const ARCH_ID: u32 = 10;
 
 pub use arch::MiniMaxM2;
 pub use minimax::{
