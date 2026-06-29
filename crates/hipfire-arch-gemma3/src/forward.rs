@@ -357,6 +357,9 @@ fn forward_after_x(
         // post_feedforward_layernorm, also inside the residual.
         gpu.rmsnorm_f32(&state.o, &layer.post_ffn_norm, &state.tmp, eps)?;
         gpu.add_f32(&state.x, &state.tmp, &state.x)?;
+        // Block-boundary steering/abliteration hook (no-op unless a session is
+        // active). `state.x` is the settled post-residual stream — fusion-proof.
+        hipfire_steer::maybe_steer_block(gpu, &state.x, layer_idx)?;
         maybe_dump_lm(
             gpu,
             &state.x,
@@ -533,6 +536,9 @@ pub fn forward_prefill_batch(
         weight_gemm(gpu, &layer.w_down, &ffn, &o, m)?;
         gpu.rmsnorm_batched(&o, &layer.post_ffn_norm, &tmp, m, dim, eps)?;
         gpu.add_f32(x_batch, &tmp, x_batch)?;
+        // Block-boundary steering/abliteration hook (no-op unless active).
+        // Prefill convention: capture folds the last position, apply hits all.
+        hipfire_steer::maybe_steer_block_batched(gpu, x_batch, layer_idx, m, dim)?;
     }
 
     // Final norm + lm_head on the LAST position only (the next-token logits).

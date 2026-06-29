@@ -1259,6 +1259,7 @@ dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
  "hipfire-runtime",
+ "hipfire-steer",
  "rdna-compute",
  "serde_json",
 ]
@@ -1863,6 +1864,14 @@ dependencies = [
  "hipfire-model",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "hipfire-steer"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "rdna-compute",
 ]
 
 [[package]]

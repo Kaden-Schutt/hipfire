@@ -1,0 +1,16 @@
+[package]
+name = "hipfire-steer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Refusal-direction steering / abliteration: derive per-block contrastive directions from +/- residual captures and apply them at the block-boundary residual (additive steer or projective ablate) on the quantized inference path. No LoRA, no quant round-trip. See docs/plans/2026-06-29-refusal-direction-steering.md."
+
+# Phase 1 (MVP) status: crate skeleton + block-boundary hook. Capture and the
+# host round-trip reference apply are functional; on-GPU apply, hipfire-kld
+# scoring, and the search loop are the remaining Phase 2-4 work.
+
+[dependencies]
+rdna-compute = { path = "../rdna-compute" }
+hip-bridge = { path = "../hip-bridge" }
+# Phase 3 will add: hipfire-kld (capability-damage objective), hipfire-eval
+# (refusal-marker / classifier objective + driver).
