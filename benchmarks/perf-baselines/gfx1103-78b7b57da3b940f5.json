@@ -1,0 +1,18 @@
+{
+  "schema": "hipfire.perf_baseline.v1",
+  "arch": "gfx1103",
+  "hardware_profile_hash": "fnv64:78b7b57da3b940f5",
+  "hardware_profile_hash_source": "eval-emitted",
+  "captured_on": "2026-06-29",
+  "captured_in_commit": "34674e7fe41bf7f0debedbc7c0f067b599e37d6e",
+  "captured_via": "hipfire eval --battery speed on nix2 (host_profile_hash harvested from a qwen3.5-0.8b run)",
+  "tolerance_pct": 5.0,
+  "hardware": {
+    "gfx": "gfx1103",
+    "notes": "nix2 — Phoenix APU, RDNA3, 64GB UMA. Speed rows intentionally empty: the qwen3.5-{0.8b,4b,9b,27b}-mq4 artifacts that tests/speed-gate.sh benchmarks are NOT present on this box (it holds mq4+/oq4/medgemma variants instead), so no MQ4 rows could be measured here. The gate skips absent models; this file exists so select_baseline resolves on gfx1103 instead of failing closed. Populate real rows when the MQ4 artifacts are present (recapture overwrites this same filename — the hash is the real host profile, so no multiple-baseline collision)."
+  },
+  "baselines": {
+    "speed": [],
+    "pflash_niah": []
+  }
+}
