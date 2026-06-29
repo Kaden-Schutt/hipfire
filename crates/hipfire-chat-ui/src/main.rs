@@ -8,17 +8,12 @@
 use std::rc::Rc;
 
 use gloo_file::{futures::read_as_data_url, File};
-use gloo_net::http::Request as HttpRequest;
-use js_sys::{Reflect, Uint8Array};
+use hipfire_web_ui::{get_json, post_json, sse_post};
 use leptos::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use wasm_bindgen::{JsCast, JsValue};
-use wasm_bindgen_futures::JsFuture;
-use web_sys::{
-    AbortController, DragEvent, HtmlTextAreaElement, KeyboardEvent, ReadableStreamDefaultReader,
-    Request, RequestInit, RequestMode, Response, SubmitEvent, TextDecodeOptions,
-};
+use wasm_bindgen::JsCast;
+use web_sys::{AbortController, DragEvent, HtmlTextAreaElement, KeyboardEvent, SubmitEvent};
 
 #[derive(Clone, Debug, PartialEq)]
 struct UiMessage {
@@ -153,6 +148,9 @@ fn App() -> impl IntoView {
     let (status, set_status) = signal("Ready".to_string());
     let (settings_open, set_settings_open) = signal(false);
     let (usage, set_usage) = signal(None::<Usage>);
+    // Responses API server-side conversation state: the last response id, sent
+    // as previous_response_id so the server reconstructs prior context.
+    let (last_response_id, set_last_response_id) = signal(None::<String>);
     // In-flight abort handle, so the Stop button can cancel a stream.
     let abort = StoredValue::new(None::<AbortController>);
     let messages_ref = NodeRef::<leptos::html::Main>::new();
@@ -230,7 +228,13 @@ fn App() -> impl IntoView {
         set_status.set("Generating".to_string());
 
         let cfg = settings.get_untracked();
-        let (url, body) = build_request(&request_messages, &cfg);
+        // Responses API chains via previous_response_id; chat replays history.
+        let prev = if cfg.api == ApiKind::Responses {
+            last_response_id.get_untracked()
+        } else {
+            None
+        };
+        let (url, body) = build_request(&request_messages, &cfg, prev.as_deref());
         let use_stream = cfg.stream;
         let api = cfg.api;
 
@@ -238,9 +242,9 @@ fn App() -> impl IntoView {
             let result = if use_stream {
                 let controller = AbortController::new().ok();
                 abort.set_value(controller.clone());
-                stream_completion(url, body, controller, set_messages, assistant_index, set_status, set_usage).await
+                stream_completion(url, body, controller, set_messages, assistant_index, set_status, set_usage, set_last_response_id).await
             } else {
-                fetch_completion(url, body, api, set_usage).await.map(|content| {
+                fetch_completion(url, body, api, set_usage, set_last_response_id).await.map(|content| {
                     set_messages.update(|items| {
                         if let Some(message) = items.get_mut(assistant_index) {
                             message.content = content;
@@ -259,6 +263,11 @@ fn App() -> impl IntoView {
                     if aborted {
                         set_status.set("Stopped".to_string());
                     } else {
+                        // Drop stale conversation state so the next turn restarts
+                        // fresh rather than chaining off a failed/expired id.
+                        if api == ApiKind::Responses {
+                            set_last_response_id.set(None);
+                        }
                         set_messages.update(|items| {
                             if let Some(message) = items.get_mut(assistant_index) {
                                 message.role = "error".to_string();
@@ -323,6 +332,7 @@ fn App() -> impl IntoView {
                         set_messages.set(Vec::new());
                         set_attachments.set(Vec::new());
                         set_usage.set(None);
+                        set_last_response_id.set(None);
                         set_status.set("Ready".to_string());
                     }>"Clear"</button>
                 </div>
@@ -473,7 +483,7 @@ fn SettingsDrawer(
                 </select>
             </label>
             {move || (settings.get().api == ApiKind::Responses)
-                .then(|| view! { <p class="hint">"Responses API is text-only — image attachments are ignored."</p> })}
+                .then(|| view! { <p class="hint">"Responses keeps conversation state server-side (previous_response_id)."</p> })}
             <label>"Model"
                 <input list="model-list" autocomplete="off" placeholder="default"
                     prop:value=move || settings.get().model
@@ -516,36 +526,50 @@ fn SettingsDrawer(
 }
 
 /// Pick the endpoint and build the matching request body for the active API.
-fn build_request(messages: &[UiMessage], cfg: &Settings) -> (&'static str, Value) {
+/// `prev_id` (Responses only) chains server-side state via previous_response_id.
+fn build_request(messages: &[UiMessage], cfg: &Settings, prev_id: Option<&str>) -> (&'static str, Value) {
     let body = match cfg.api {
         ApiKind::Chat => chat_request_body(messages, cfg),
-        ApiKind::Responses => responses_request_body(messages, cfg),
+        ApiKind::Responses => responses_request_body(messages, cfg, prev_id),
     };
     (cfg.api.url(), body)
 }
 
-/// Build a `/v1/responses` body. Uses `input` (an array of role/content items)
-/// instead of `messages`, `max_output_tokens` instead of `max_tokens`, and
-/// carries the system prompt as a leading `system` item (no top-level field).
-/// Content is plain text — the endpoint drops image parts.
-fn responses_request_body(messages: &[UiMessage], cfg: &Settings) -> Value {
+/// Build a `/v1/responses` body. Uses `input` (role/content items) instead of
+/// `messages` and `max_output_tokens` instead of `max_tokens`. Content goes
+/// through `chat_message_content`, so the last user turn's images ride along as
+/// `image_url` parts (vision). When `prev_id` is set the server already holds
+/// prior context, so only the newest user turn is sent.
+fn responses_request_body(messages: &[UiMessage], cfg: &Settings, prev_id: Option<&str>) -> Value {
+    let last_user_index = messages.iter().rposition(|m| m.role == "user");
     let mut input: Vec<Value> = Vec::new();
-    let system = cfg.system.trim();
-    if !system.is_empty() {
-        input.push(json!({"role": "system", "content": system}));
+    if prev_id.is_none() {
+        let system = cfg.system.trim();
+        if !system.is_empty() {
+            input.push(json!({"role": "system", "content": system}));
+        }
+        input.extend(
+            messages
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m.role == "user" || m.role == "assistant")
+                .map(|(idx, m)| {
+                    json!({"role": m.role, "content": chat_message_content(m, Some(idx) == last_user_index)})
+                }),
+        );
+    } else if let Some(idx) = last_user_index {
+        // Continuing: server reconstructs history; send only the new user turn.
+        input.push(json!({"role": "user", "content": chat_message_content(&messages[idx], true)}));
     }
-    input.extend(
-        messages
-            .iter()
-            .filter(|m| m.role == "user" || m.role == "assistant")
-            .map(|m| json!({"role": m.role, "content": m.content})),
-    );
     let mut body = json!({
         "input": input,
         "max_output_tokens": cfg.max_tokens.parse::<u32>().unwrap_or(512).max(1),
         "stream": cfg.stream,
         "chat_template_kwargs": {"enable_thinking": !cfg.reasoning_effort.is_empty()},
     });
+    if let Some(id) = prev_id {
+        body["previous_response_id"] = json!(id);
+    }
     set_if_num(&mut body, "temperature", &cfg.temperature);
     set_if_num(&mut body, "top_p", &cfg.top_p);
     set_if_num(&mut body, "repeat_penalty", &cfg.repeat_penalty);
@@ -712,18 +736,7 @@ fn files_to_vec(files: web_sys::FileList) -> Vec<web_sys::File> {
 }
 
 async fn fetch_models() -> Result<Vec<ModelItem>, String> {
-    let resp = HttpRequest::get("/v1/models")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    if !resp.ok() {
-        return Err(format!("/v1/models returned HTTP {}", resp.status()));
-    }
-    let envelope = resp
-        .json::<ModelsEnvelope>()
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(envelope.data)
+    get_json::<ModelsEnvelope>("/v1/models").await.map(|e| e.data)
 }
 
 async fn fetch_completion(
@@ -731,20 +744,20 @@ async fn fetch_completion(
     body: Value,
     api: ApiKind,
     set_usage: WriteSignal<Option<Usage>>,
+    set_response_id: WriteSignal<Option<String>>,
 ) -> Result<String, String> {
-    let resp = HttpRequest::post(url)
-        .json(&body)
-        .map_err(|e| e.to_string())?
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    let status = resp.status();
-    let payload = resp.json::<Value>().await.map_err(|e| e.to_string())?;
-    if status >= 400 || payload.get("error").is_some() {
-        return Err(error_message(&payload).unwrap_or_else(|| format!("HTTP {status}")));
+    let result = post_json(url, &body).await?;
+    let payload = result.payload;
+    if result.status >= 400 || payload.get("error").is_some() {
+        return Err(error_message(&payload).unwrap_or_else(|| format!("HTTP {}", result.status)));
     }
     if let Some(u) = parse_usage(&payload) {
         set_usage.set(Some(u));
+    }
+    if api == ApiKind::Responses {
+        if let Some(id) = payload["id"].as_str() {
+            set_response_id.set(Some(id.to_string()));
+        }
     }
     let content = match api {
         // Responses exposes the full text via the `output_text` convenience field.
@@ -766,129 +779,62 @@ async fn stream_completion(
     assistant_index: usize,
     set_status: WriteSignal<String>,
     set_usage: WriteSignal<Option<Usage>>,
+    set_response_id: WriteSignal<Option<String>>,
 ) -> Result<(), String> {
-    let opts = RequestInit::new();
-    opts.set_method("POST");
-    opts.set_mode(RequestMode::SameOrigin);
-    if let Some(c) = &controller {
-        opts.set_signal(Some(&c.signal()));
-    }
-    let serialized = serde_json::to_string(&body).map_err(|e| e.to_string())?;
-    opts.set_body(&JsValue::from_str(&serialized));
-    let request = Request::new_with_str_and_init(url, &opts).map_err(js_error)?;
-    request
-        .headers()
-        .set("Content-Type", "application/json")
-        .map_err(js_error)?;
-
-    let window = web_sys::window().ok_or_else(|| "window unavailable".to_string())?;
-    let resp = JsFuture::from(window.fetch_with_request(&request))
-        .await
-        .map_err(js_error)?
-        .dyn_into::<Response>()
-        .map_err(js_error)?;
-    if !resp.ok() {
-        return Err(format!("HTTP {}", resp.status()));
-    }
-    let stream = resp
-        .body()
-        .ok_or_else(|| "response body stream unavailable".to_string())?;
-    let reader = stream
-        .get_reader()
-        .dyn_into::<ReadableStreamDefaultReader>()
-        .map_err(|e| js_error(e.into()))?;
-    let decoder = web_sys::TextDecoder::new().map_err(js_error)?;
-    let decode_opts = TextDecodeOptions::new();
-    decode_opts.set_stream(true);
-    let mut buffer = String::new();
-
-    loop {
-        let chunk = JsFuture::from(reader.read()).await.map_err(js_error)?;
-        let done = Reflect::get(&chunk, &JsValue::from_str("done"))
-            .map_err(js_error)?
-            .as_bool()
-            .unwrap_or(false);
-        if done {
-            break;
-        }
-        let value = Reflect::get(&chunk, &JsValue::from_str("value")).map_err(js_error)?;
-        let bytes = Uint8Array::new(&value);
-        let mut bytes_vec = vec![0; bytes.length() as usize];
-        bytes.copy_to(&mut bytes_vec);
-        let text = decoder
-            .decode_with_u8_array_and_options(&bytes_vec, &decode_opts)
-            .map_err(js_error)?;
-        buffer.push_str(&text);
-        consume_sse_buffer(&mut buffer, set_messages, assistant_index, set_status, set_usage)?;
-    }
-    if !buffer.trim().is_empty() {
-        let event = std::mem::take(&mut buffer);
-        consume_sse_event(&event, set_messages, assistant_index, set_status, set_usage)?;
-    }
-    Ok(())
+    let signal = controller.as_ref().map(|c| c.signal());
+    sse_post(url, &body, signal.as_ref(), |data| {
+        handle_sse_data(data, set_messages, assistant_index, set_status, set_usage, set_response_id)
+    })
+    .await
 }
 
-fn consume_sse_buffer(
-    buffer: &mut String,
+/// Interpret one SSE `data:` payload — handles both the Chat Completions and
+/// Responses event shapes and routes content/reasoning/usage into the signals.
+fn handle_sse_data(
+    data: &str,
     set_messages: WriteSignal<Vec<UiMessage>>,
     assistant_index: usize,
     set_status: WriteSignal<String>,
     set_usage: WriteSignal<Option<Usage>>,
+    set_response_id: WriteSignal<Option<String>>,
 ) -> Result<(), String> {
-    while let Some(split) = buffer.find("\n\n") {
-        let event = buffer[..split].to_string();
-        buffer.drain(..split + 2);
-        consume_sse_event(&event, set_messages, assistant_index, set_status, set_usage)?;
+    let payload: Value = serde_json::from_str(data).map_err(|e| e.to_string())?;
+    if payload.get("error").is_some() {
+        return Err(error_message(&payload).unwrap_or_else(|| "request failed".to_string()));
     }
-    Ok(())
-}
-
-fn consume_sse_event(
-    event: &str,
-    set_messages: WriteSignal<Vec<UiMessage>>,
-    assistant_index: usize,
-    set_status: WriteSignal<String>,
-    set_usage: WriteSignal<Option<Usage>>,
-) -> Result<(), String> {
-    for line in event.lines() {
-        let Some(data) = line.strip_prefix("data:") else {
-            continue;
-        };
-        let data = data.trim_start();
-        if data.is_empty() || data == "[DONE]" {
-            continue;
-        }
-        let payload: Value = serde_json::from_str(data).map_err(|e| e.to_string())?;
-        if payload.get("error").is_some() {
-            return Err(error_message(&payload).unwrap_or_else(|| "request failed".to_string()));
-        }
-        if let Some(u) = parse_usage(&payload) {
-            set_usage.set(Some(u));
-        }
-        // Responses API: typed events carry the token in `delta`.
-        if let Some(kind) = payload["type"].as_str() {
-            if kind.starts_with("response.") {
-                if kind == "response.output_text.delta" {
-                    if let Some(content) = payload["delta"].as_str() {
-                        append_content(set_messages, assistant_index, content);
-                    }
-                }
-                continue;
+    if let Some(u) = parse_usage(&payload) {
+        set_usage.set(Some(u));
+    }
+    // Responses API: typed events carry the token in `delta`; events also carry
+    // the response id for server-side state chaining.
+    if let Some(kind) = payload["type"].as_str() {
+        if kind.starts_with("response.") {
+            if let Some(id) = payload["response_id"]
+                .as_str()
+                .or_else(|| payload["response"]["id"].as_str())
+            {
+                set_response_id.set(Some(id.to_string()));
             }
-        }
-        // Chat Completions API: token in `choices[0].delta.{content,reasoning_content}`.
-        let delta = &payload["choices"][0]["delta"];
-        if let Some(content) = delta["content"].as_str() {
-            append_content(set_messages, assistant_index, content);
-        }
-        if let Some(reasoning) = delta["reasoning_content"].as_str() {
-            set_status.set("Thinking".to_string());
-            set_messages.update(|items| {
-                if let Some(message) = items.get_mut(assistant_index) {
-                    message.reasoning.push_str(reasoning);
+            if kind == "response.output_text.delta" {
+                if let Some(content) = payload["delta"].as_str() {
+                    append_content(set_messages, assistant_index, content);
                 }
-            });
+            }
+            return Ok(());
         }
+    }
+    // Chat Completions API: token in `choices[0].delta.{content,reasoning_content}`.
+    let delta = &payload["choices"][0]["delta"];
+    if let Some(content) = delta["content"].as_str() {
+        append_content(set_messages, assistant_index, content);
+    }
+    if let Some(reasoning) = delta["reasoning_content"].as_str() {
+        set_status.set("Thinking".to_string());
+        set_messages.update(|items| {
+            if let Some(message) = items.get_mut(assistant_index) {
+                message.reasoning.push_str(reasoning);
+            }
+        });
     }
     Ok(())
 }
@@ -924,15 +870,4 @@ fn parse_usage(payload: &Value) -> Option<Usage> {
 
 fn error_message(payload: &Value) -> Option<String> {
     payload["error"]["message"].as_str().map(str::to_string)
-}
-
-fn js_error(value: JsValue) -> String {
-    value
-        .as_string()
-        .or_else(|| {
-            js_sys::JSON::stringify(&value)
-                .ok()
-                .and_then(|s| s.as_string())
-        })
-        .unwrap_or_else(|| "JavaScript error".to_string())
 }

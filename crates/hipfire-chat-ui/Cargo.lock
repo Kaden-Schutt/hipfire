@@ -497,9 +497,23 @@ dependencies = [
  "console_error_panic_hook",
  "gloo-file",
  "gloo-net",
+ "hipfire-web-ui",
  "js-sys",
  "leptos",
  "pulldown-cmark",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
+name = "hipfire-web-ui"
+version = "0.3.0"
+dependencies = [
+ "gloo-net",
+ "js-sys",
  "serde",
  "serde_json",
  "wasm-bindgen",

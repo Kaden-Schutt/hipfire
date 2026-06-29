@@ -498,15 +498,5 @@ fn chip(value: Option<f64>, prefix: &str, unit: &str) -> AnyView {
 }
 
 async fn fetch_stats() -> Result<AdminStats, String> {
-    let resp = gloo_net::http::Request::get("/admin/stats")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    if resp.status() == 401 {
-        return Err("authentication required — sign in at /admin".to_string());
-    }
-    if !resp.ok() {
-        return Err(format!("/admin/stats returned HTTP {}", resp.status()));
-    }
-    resp.json::<AdminStats>().await.map_err(|e| e.to_string())
+    hipfire_web_ui::get_json::<AdminStats>("/admin/stats").await
 }

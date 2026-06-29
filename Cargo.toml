@@ -64,6 +64,7 @@ members = [
 exclude = [
     "crates/hipfire-admin-ui",
     "crates/hipfire-chat-ui",
+    "crates/hipfire-web-ui",
 ]
 
 [workspace.package]

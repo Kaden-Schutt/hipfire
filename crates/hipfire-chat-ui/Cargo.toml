@@ -10,6 +10,7 @@ description = "Leptos (WASM) browser chat console for hipfire - built standalone
 
 [dependencies]
 leptos = { version = "0.7", features = ["csr"] }
+hipfire-web-ui = { path = "../hipfire-web-ui" }
 gloo-file = { version = "0.4", features = ["futures"] }
 gloo-net = { version = "0.6", features = ["http"] }
 console_error_panic_hook = "0.1"

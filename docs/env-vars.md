@@ -441,7 +441,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_RESOURCE_LOCK_DIR` | HIPFIRE_RESOURCE_LOCK_DIR overrides the daemon resource-lock root directory | `crates/hipfire-lock/src/lib.rs:213` |
 | `HIPFIRE_RESOURCE_LOCK_NPUS` | HIPFIRE_RESOURCE_LOCK_NPUS=1 leases every detected NPU; comma lists lease explicit NPU IDs | `crates/hipfire-daemon-adapter/src/lib.rs:630` |
 | `HIPFIRE_RESOURCE_LOCK_WAIT_MS` | HIPFIRE_RESOURCE_LOCK_WAIT_MS waits for busy daemon resource leases before failing startup | `crates/hipfire-daemon-adapter/src/lib.rs:798` |
-| `HIPFIRE_RESPONSES_STATE_MAX` | Runtime variable controlling responses state max in hipfire | `crates/hipfire-server/src/routes/responses.rs:660` |
+| `HIPFIRE_RESPONSES_STATE_MAX` | Runtime variable controlling responses state max in hipfire | `crates/hipfire-server/src/routes/responses.rs:714` |
 | `HIPFIRE_ROCBLAS_ALL_ARCHS` | Runtime variable controlling rocblas all archs in hipfire | `crates/rdna-compute/src/feature_flags.rs:303` |
 | `HIPFIRE_ROCBLAS_OFF` | Enabled when set to 1 | `crates/rdna-compute/src/feature_flags.rs:305` |
 | `HIPFIRE_ROCPROF_BIN` | Runtime variable controlling rocprof bin in hipfire | `crates/hipfire-eval/src/rocprof.rs:275` |

@@ -11,7 +11,7 @@ description = "Leptos (WASM) admin console for hipfire — built standalone via 
 [dependencies]
 leptos = { version = "0.7", features = ["csr"] }
 hipfire-admin-types = { path = "../hipfire-admin-types" }
-gloo-net = { version = "0.6", features = ["http"] }
+hipfire-web-ui = { path = "../hipfire-web-ui" }
 gloo-timers = { version = "0.3", features = ["futures"] }
 console_error_panic_hook = "0.1"
 serde = { version = "1", features = ["derive"] }
