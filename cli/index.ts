@@ -370,7 +370,10 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   cask_beta: 128,
   cask_core_frac: 0.5,
   cask_fold_m: 2,
-  cask_auto_attach: true,
+  // default-false since 2026-06-28: opt-in only (a stray <model>.triattn.bin
+  // was silently collapsing the KV window, breaking dense MTP/DFlash long-ctx).
+  // Enable via `config set cask_auto_attach true` or an explicit cask_sidecar.
+  cask_auto_attach: false,
   // Default ON since 2026-04-26: collapses \n{3,} → \n\n at engine entry,
   // +24% τ on PEP-8-style code prompts (159→196 tok/s on 27B-3.5 LRU DFlash).
   // Set false (or HIPFIRE_NORMALIZE_PROMPT=0) to opt out.
@@ -1027,7 +1030,16 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   // HIPFIRE_CASK_OFF=1 is an ops escape hatch: forces no auto-attach
   // regardless of per-model/global config, so a missing/dangling sidecar
   // can never fatally crash serve load. Pairs with cask_auto_attach=false.
-  const caskForcedOff = process.env.HIPFIRE_CASK_OFF === "1";
+  //
+  // Spec-decode guard (2026-06-28): TriAttention/CASK eviction is not yet
+  // validated with a speculator — the eviction window starves the KV that
+  // MTP/DFlash need, so force cask off whenever one is active. Revisit when
+  // TriAttention+spec is validated (out of scope for the config-driven MTP PR).
+  const specDecodeActive = !!params.draft || params.mtp_mode === "on";
+  const caskForcedOff = process.env.HIPFIRE_CASK_OFF === "1" || specDecodeActive;
+  if (specDecodeActive && resolved.cask_sidecar && resolved.cask_sidecar.length > 0) {
+    console.error(`[hipfire] cask_sidecar set but a speculator (MTP/DFlash) is active — TriAttention disabled for this load (not yet validated with spec-decode).`);
+  }
   if (
     !caskForcedOff &&
     (!resolved.cask_sidecar || resolved.cask_sidecar.length === 0) &&
@@ -1077,7 +1089,7 @@ function buildLoadMessage(path: string, tag?: string | null): any {
     console.error(`[hipfire]   ${resolved.cask ? 'CASK m-folding' : 'drop-eviction'} budget=${resolved.cask_budget} β=${resolved.cask_beta}  (override: hipfire config cask-profile <off|balanced|conservative|aggressive-vram>)`);
   }
 
-  if (resolved.cask_sidecar && resolved.cask_sidecar.length > 0) {
+  if (!caskForcedOff && resolved.cask_sidecar && resolved.cask_sidecar.length > 0) {
     if (existsSync(resolved.cask_sidecar)) {
       params.cask_sidecar = resolved.cask_sidecar;
       params.cask = resolved.cask;
